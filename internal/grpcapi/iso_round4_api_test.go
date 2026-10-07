@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -115,18 +116,32 @@ func TestISORound4_ADeadDirectoryOnAnotherFilesystemIsNotRead(t *testing.T) {
 	if !ok {
 		t.Skip("the library's mount is not in the mount table")
 	}
-	mounts := func(dev string, points ...string) func() ([]mountEntry, error) {
+	mountsOpt := func(dev, opts string, points ...string) func() ([]mountEntry, error) {
 		return func() ([]mountEntry, error) {
 			out := append([]mountEntry(nil), real...)
 			for _, p := range points {
-				out = append(out, mountEntry{point: p, dev: dev, fstype: "nfs4"})
+				out = append(out, mountEntry{point: p, dev: dev, fstype: "nfs4", options: opts})
 			}
 			return out, nil
 		}
 	}
+	mounts := func(dev string, points ...string) func() ([]mountEntry, error) {
+		return mountsOpt(dev, "rw", points...)
+	}
 	isoMountInfo = mounts("0:999", hung)
 	if _, err := s.PrepareHardwareForStart(context.Background(), vmRecord(t, s, "v")); err != nil || wasRead(hung) {
 		t.Fatalf("start with another tenant's dead NFS directory on another filesystem: %v (read: %v)", err, wasRead(hung))
+	}
+	// Below the mount point of a mount that follows links, a link inside the
+	// export could name a local directory: it is skipped only on a
+	// nosymfollow mount (m-r4-1).
+	isoMountInfo = mountsOpt("0:999", "rw,nosymfollow", root)
+	if _, err := s.PrepareHardwareForStart(context.Background(), vmRecord(t, s, "v")); err != nil || wasRead(hung) {
+		t.Fatalf("start with a dead directory below a nosymfollow mount's point: %v (read: %v)", err, wasRead(hung))
+	}
+	isoMountInfo = mounts("0:999", root)
+	if _, err := s.PrepareHardwareForStart(context.Background(), vmRecord(t, s, "v")); status.Code(err) != codes.FailedPrecondition || !wasRead(hung) {
+		t.Fatalf("start with a dead directory below the point of a mount that follows links: got %v (read %v), want FailedPrecondition", err, wasRead(hung))
 	}
 	// On the library's own device it is read, and fails closed.
 	isoMountInfo = mounts(libMount.dev, hung)
@@ -141,9 +156,10 @@ func TestISORound4_ADeadDirectoryOnAnotherFilesystemIsNotRead(t *testing.T) {
 	}
 }
 
-// N-C2: a USB stick under /run/media and an ISO in a home directory work for
-// an Admin's create, a main-era VM's start and a move; a key, a key renamed
-// .iso, an ISO in a dot-directory and a file swapped after the check do not.
+// N-C2: a USB stick under /run/media, an ISO in a home directory and one in a
+// dot-directory the Admin names work for an Admin's create, a main-era VM's
+// start and a move; a key, a key renamed .iso, a link into a dot-directory and
+// a file swapped after the check do not.
 func TestISORound4_UserDataRootsHoldISOsAndNothingElse(t *testing.T) {
 	s, fake, _ := isoServer(t)
 	root := t.TempDir()
@@ -173,7 +189,14 @@ func TestISORound4_UserDataRootsHoldISOsAndNothingElse(t *testing.T) {
 		InstallerIsoPaths: []string{virtio}, InstallerIsoRuntime: true}); err != nil {
 		t.Fatalf("a live move (a drain) of that VM onto this host: %v", err)
 	}
-	for i, p := range []string{key, renamed, dotISO} {
+	dotLink := filepath.Join(home, "u", "isos", "cached.iso")
+	if err := os.Symlink(dotISO, dotLink); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateVM(adminCtx(), isoCreate("dotok", dotISO, "")); err != nil {
+		t.Errorf("admin create with an ISO in a dot-directory the Admin names: %v", err)
+	}
+	for i, p := range []string{key, renamed, dotLink} {
 		name := "bad" + string(rune('a'+i))
 		if _, err := s.CreateVM(adminCtx(), isoCreate(name, p, "")); status.Code(err) != codes.InvalidArgument {
 			t.Errorf("admin create with %s: got %v, want InvalidArgument", p, err)
@@ -266,5 +289,76 @@ func TestISORound4_ThePinIsShownAsOne(t *testing.T) {
 	}
 	if strings.HasPrefix(m.GetSetBy(), "pin:") || !strings.Contains(m.GetSetBy(), "pinned") {
 		t.Fatalf("set_by = %q", m.GetSetBy())
+	}
+}
+
+// NEW-4: a caller naming many directories under a filesystem that does not
+// answer cannot pile up blocked reads: at most isoMaxReadsInFlight run at once
+// process-wide, and once a read on a network mount has timed out, every new
+// read on that mount fails closed at once.
+func TestISORound4_BlockedReadsAreBounded(t *testing.T) {
+	block := make(chan struct{})
+	root := t.TempDir()
+	var mu sync.Mutex
+	calls := 0
+	origP, origM, origT, origCap := isoDirProbe, isoMountInfo, isoDirProbeTimeout, isoMaxReadsInFlight
+	t.Cleanup(func() {
+		close(block)
+		isoDirProbe, isoMountInfo, isoDirProbeTimeout, isoMaxReadsInFlight = origP, origM, origT, origCap
+	})
+	isoDirProbeTimeout = 100 * time.Millisecond
+	isoMaxReadsInFlight = 8
+	isoDirProbe = func(p string) (string, os.FileInfo, error) {
+		if strings.HasPrefix(p, root+"/") {
+			mu.Lock()
+			calls++
+			mu.Unlock()
+			<-block
+		}
+		return origP(p)
+	}
+	ncalls := func() int { mu.Lock(); defer mu.Unlock(); return calls }
+
+	// Not on a network mount: the process-wide cap.
+	local := filepath.Join(root, "local")
+	var wg sync.WaitGroup
+	start := time.Now()
+	for i := 0; i < 1000; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if _, err := probeDir(filepath.Join(local, "d", strconv.Itoa(i))); err == nil {
+				t.Error("a read of an unanswering directory answered")
+			}
+		}(i)
+	}
+	wg.Wait()
+	if n := ncalls(); n > 8 {
+		t.Fatalf("%d reads of distinct unanswering directories are blocked; want at most the cap, 8", n)
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("1000 reads took %s", d)
+	}
+	if _, err := probeDir(filepath.Join(local, "another")); err == nil || !strings.Contains(err.Error(), "already waiting") {
+		t.Fatalf("a read past the cap: %v, want a refusal saying reads are waiting", err)
+	}
+
+	// On a network mount: one read on it times out, the next fails at once.
+	isoMaxReadsInFlight = 64
+	nfs := filepath.Join(root, "nfs")
+	isoMountInfo = func() ([]mountEntry, error) {
+		return []mountEntry{{point: "/", dev: "8:1", fstype: "ext4"}, {point: nfs, dev: "0:77", fstype: "nfs4", options: "rw"}}, nil
+	}
+	before := ncalls()
+	if _, err := probeDir(filepath.Join(nfs, "a")); err == nil {
+		t.Fatal("a read of an unanswering mount answered")
+	}
+	for i := 0; i < 100; i++ {
+		if _, err := probeDir(filepath.Join(nfs, "b", strconv.Itoa(i))); err == nil || !strings.Contains(err.Error(), "did not answer") {
+			t.Fatalf("a read on a mount that did not answer: %v", err)
+		}
+	}
+	if n := ncalls() - before; n != 1 {
+		t.Fatalf("%d reads are blocked on the one unanswering mount; want 1", n)
 	}
 }

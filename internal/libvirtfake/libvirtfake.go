@@ -242,6 +242,10 @@ type Fake struct {
 	// for one guest's readiness rather than one device's.
 	HonorUnplugOnRequest int
 
+	// savedImageXML is the definition each memory snapshot's saved image
+	// carries (SetSavedImageXML).
+	savedImageXML map[string]string
+
 	// pendingUnplug holds live-view removals that a deferred unplug has requested but
 	// the guest has not yet acknowledged, per domain, in request order.
 	pendingUnplug map[string][]func()
@@ -1470,16 +1474,48 @@ func (f *Fake) cutoverDisks(domain, snapname string) {
 	}
 }
 
-func (f *Fake) RevertToLiveSnapshot(domainName, snapshotName, vmstatePath string, restorePreDefine func() error) error {
+// SetSavedImageXML sets the definition a memory snapshot's saved image at
+// vmstatePath carries (default: the domain's definition when reverted).
+func (f *Fake) SetSavedImageXML(vmstatePath, xml string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.savedImageXML == nil {
+		f.savedImageXML = map[string]string{}
+	}
+	f.savedImageXML[vmstatePath] = xml
+}
+
+func (f *Fake) RevertToLiveSnapshot(domainName, snapshotName, vmstatePath string, restorePreDefine func() error, rewriteSaved func(savedXML string) (string, error)) error {
 	f.mu.Lock()
 	if _, ok := f.snapshots[domainName][snapshotName]; !ok {
 		f.mu.Unlock()
 		return fmt.Errorf("libvirtfake: no snapshot %q for %q", snapshotName, domainName)
 	}
-	f.record("revert-live", domainName, snapshotName)
+	saved, ok := f.savedImageXML[vmstatePath]
+	if !ok {
+		saved = f.xml[domainName]
+	}
 	f.mu.Unlock()
+	restoreXML := ""
+	if rewriteSaved != nil {
+		rewritten, err := rewriteSaved(saved)
+		if err != nil {
+			return err
+		}
+		if rewritten != saved {
+			restoreXML, saved = rewritten, rewritten
+		}
+	}
 	if restorePreDefine != nil {
-		return restorePreDefine()
+		if err := restorePreDefine(); err != nil {
+			return err
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.record("revert-live", domainName, snapshotName+" dxml="+restoreXML)
+	if saved != "" {
+		f.xml[domainName] = saved
 	}
 	return nil
 }

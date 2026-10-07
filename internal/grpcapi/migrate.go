@@ -1205,6 +1205,9 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 			return nil, status.Errorf(codes.Internal, "stat disk stub %s: %v", stub.Path, err)
 		}
 	}
+	if s.isoResolvedWithheld {
+		isoResolved = nil
+	}
 	resp := &pb.EnsureDisksResponse{InstallerIsoWarning: isoWarning, InstallerIsoResolved: isoResolved}
 	var made []string // created by this call: removed again if a later one fails
 	undo := func() {
@@ -2074,6 +2077,13 @@ func (s *Server) ensureDisksOnTargetISO(ctx context.Context, targetHost, vmName 
 		s.recordVMEvent(ctx, vmName, "vm.migrate.iso_warning", "warn", w)
 	}
 	var remap map[string]string
+	if runtime && len(isoPaths) > 0 && len(resp.GetInstallerIsoResolved()) == 0 {
+		// A target on this build answers every listed path. None: a target
+		// older than that, whose qemu opens the paths it is handed, unjudged,
+		// as on main. Hand it what main handed it — the path the VM was given —
+		// so a link that names another file there is followed there.
+		remap = s.olderTargetISORemap(ctx, vmName, isoPaths)
+	}
 	if runtime {
 		for from, to := range resp.GetInstallerIsoResolved() {
 			if from == to || to == "" {
@@ -2087,6 +2097,36 @@ func (s *Server) ensureDisksOnTargetISO(ctx context.Context, targetHost, vmName 
 		}
 	}
 	return resp.GetCreatedPaths(), wantTLS && resp.GetMigrationTlsReady(), remap, nil
+}
+
+// olderTargetISORemap points, for a runtime move to an older target, the CD-ROM
+// that is the VM's host-path ISO back at the path the VM was given (spec.Iso),
+// which this host's start had pointed at the file it resolved to here. A pool
+// ISO is left as it is: its path is a library's file, never a link.
+func (s *Server) olderTargetISORemap(ctx context.Context, vmName string, isoPaths []string) map[string]string {
+	vm, err := corrosion.GetVM(ctx, s.db, vmName)
+	if err != nil || vm == nil {
+		return nil
+	}
+	spec := vmSpecFor(vm)
+	iso := spec.GetIso()
+	if !filepath.IsAbs(iso) || (spec.GetIsoScope() != "" && spec.GetIsoScope() != isoScopeHostPath) {
+		return nil
+	}
+	resolved, _ := filepath.EvalSymlinks(iso)
+	var remap map[string]string
+	for _, p := range isoPaths {
+		if p == iso || (len(isoPaths) > 1 && p != resolved) {
+			continue
+		}
+		if remap == nil {
+			remap = map[string]string{}
+		}
+		remap[p] = iso
+		slog.Info("migration: an older target opens the installer ISO by the path the VM was given, as before",
+			"vm", vmName, "here", p, "there", iso)
+	}
+	return remap
 }
 
 // judgedISOSHA256 is, for the installer CD-ROM path that is the VM's pool ISO

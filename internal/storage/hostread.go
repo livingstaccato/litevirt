@@ -37,9 +37,10 @@ var secretRoots = []string{
 // downloaded into a home directory, a USB stick udisks mounts under
 // /run/media — next to things no guest may read (~/.ssh, ~/.gnupg, the
 // runtime directories under /run). A file under one is a file a guest may be
-// given only when it is an optical disc image (OpticalImageAt), it is a
-// regular file, and no component of its path starts with a dot; everything
-// else under them is refused like a secret root. /var/run is /run.
+// given only when it is an optical disc image (OpticalImageAt) and a regular
+// file, reached without a link leading into a dot-directory the path as named
+// does not name (introducedDotComponent); everything else under them is
+// refused like a secret root. /var/run is /run.
 var userDataRoots = []string{"/home", "/run", "/var/run"}
 
 // SetUserDataRootsForTest replaces the user-data roots and returns what
@@ -63,8 +64,9 @@ const ISOLibraryDir = "pools/isos"
 // under a secret system directory, anything in or below the daemon's PKI
 // directory, and anything in its data directory outside disks/, mounts/ and
 // pools/isos/ (state.db, cloudinit/, nvram/, imports/, images/ …). Under a
-// user-data root (/home, /run) only an optical disc image outside any
-// dot-directory passes (userDataRoots). The path is judged as written and
+// user-data root (/home, /run) only an optical disc image passes, and not one
+// a link reaches through a dot-directory the named path does not name
+// (userDataRoots). The path is judged as written and
 // after resolving symlinks, so a link at an innocent name does not reach a
 // refused file. It must also exist and be a regular file once resolved: a
 // device, directory or FIFO is never an ISO.
@@ -117,31 +119,44 @@ func underUserDataRoot(cand string) bool {
 	return false
 }
 
-// hasDotComponent reports a path component that starts with a dot: ~/.ssh,
-// ~/.gnupg, ~/.config, ~/.local and their like hold keys and tokens.
-func hasDotComponent(p string) bool {
+// dotComponents returns the path components that start with a dot.
+func dotComponents(p string) map[string]bool {
+	out := map[string]bool{}
 	for _, c := range strings.Split(filepath.Clean(p), string(filepath.Separator)) {
 		if strings.HasPrefix(c, ".") {
-			return true
+			out[c] = true
 		}
 	}
-	return false
+	return out
 }
 
-// checkUserDataFile is the rule for a file under a user-data root: no
-// dot-directory (or dot-file) anywhere in its path as written or resolved,
-// and the file the resolved path opens — opened without following a link,
-// and confirmed to be that path — is a regular file carrying an ISO 9660 or
-// UDF volume signature. A key, a token or a database carries none.
+// introducedDotComponent returns a dot-directory (or dot-file) that resolved,
+// the path named resolved, has and named does not: a link leading into
+// ~/.ssh, ~/.gnupg or ~/.config, where keys and tokens live. A dot-directory
+// the path names itself (~/.local/share/libvirt/images) is what whoever named
+// it meant.
+func introducedDotComponent(named, resolved string) string {
+	have := dotComponents(named)
+	for c := range dotComponents(resolved) {
+		if !have[c] {
+			return c
+		}
+	}
+	return ""
+}
+
+// checkUserDataFile is the rule for a file under a user-data root: no link on
+// the way to it leads into a dot-directory the path as named does not name,
+// and the file the resolved path opens — opened without following a link, and
+// confirmed to be that path — is a regular file carrying an ISO 9660 or UDF
+// volume signature. A key, a token or a database carries none.
 func checkUserDataFile(p string) error {
 	resolved, err := filepath.EvalSymlinks(p)
 	if err != nil {
 		return fmt.Errorf("%q: %w", p, err)
 	}
-	for _, form := range []string{p, resolved} {
-		if hasDotComponent(form) {
-			return fmt.Errorf("%q is under a home or runtime directory and inside a dot-directory (%s), where keys and tokens live; only an ISO image outside those may be attached", p, form)
-		}
+	if c := introducedDotComponent(p, resolved); c != "" {
+		return fmt.Errorf("%q is a link into %s (%s), a dot-directory under a home or runtime directory, where keys and tokens live", p, c, resolved)
 	}
 	f, err := os.OpenFile(resolved, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
@@ -206,21 +221,15 @@ func CheckReadPathLexical(p, dataDir, pkiDir string) error {
 	if err := checkReadPathLexical(p); err != nil {
 		return err
 	}
-	if err := refuseSecretPath(p, p, dataDir, pkiDir); err != nil {
-		return err
-	}
-	if underUserDataRoot(p) && hasDotComponent(p) {
-		return fmt.Errorf("%q is under a home or runtime directory and inside a dot-directory, where keys and tokens live", p)
-	}
-	return nil
+	return refuseSecretPath(p, p, dataDir, pkiDir)
 }
 
 // CheckRefusedReadPath refuses only the protected places — what no caller may
 // name, judged as written and after resolving symlinks on this host — without
 // insisting the path be absolute, clean or present. It is for a path stored
 // before these checks existed, where anything else is not this check's to
-// reject. Under a user-data root that is a dot-directory; a present file
-// there is judged in full by CheckReadFile.
+// reject. Under a user-data root that is a link into a dot-directory the path
+// does not name; a present file there is judged in full by CheckReadFile.
 func CheckRefusedReadPath(p, dataDir, pkiDir string) error {
 	if p == "" || !filepath.IsAbs(p) {
 		return nil
@@ -229,8 +238,10 @@ func CheckRefusedReadPath(p, dataDir, pkiDir string) error {
 		if err := refuseSecretPath(p, cand, dataDir, pkiDir); err != nil {
 			return err
 		}
-		if underUserDataRoot(cand) && hasDotComponent(cand) {
-			return fmt.Errorf("%q is under a home or runtime directory and inside a dot-directory, where keys and tokens live", p)
+		if underUserDataRoot(cand) {
+			if c := introducedDotComponent(p, cand); c != "" {
+				return fmt.Errorf("%q is a link into %s, a dot-directory under a home or runtime directory, where keys and tokens live", p, c)
+			}
 		}
 	}
 	return nil

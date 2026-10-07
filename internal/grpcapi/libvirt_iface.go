@@ -105,7 +105,7 @@ type LibvirtBackend interface {
 	// Live/RAM snapshots (#3): capture guest RAM into vmstatePath alongside the
 	// external disk snapshot, and revert both to the snapshot instant.
 	CreateLiveSnapshot(domainName, snapshotName, vmstatePath string, captureSuspended func() error) (diskBytes, vmstateBytes int64, err error)
-	RevertToLiveSnapshot(domainName, snapshotName, vmstatePath string, restorePreDefine func() error) error
+	RevertToLiveSnapshot(domainName, snapshotName, vmstatePath string, restorePreDefine func() error, rewriteSaved func(savedXML string) (string, error)) error
 	// DomainDiskSources returns target-dev → live source-file. Used to reconcile
 	// vm_disks.path after a snapshot op moves the domain onto an overlay
 	// (<disk>.<snapname>), so backup/migration/restart use the real active disk.

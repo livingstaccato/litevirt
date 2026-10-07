@@ -10,7 +10,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -93,38 +92,89 @@ type deadlineFlight struct {
 	done     chan struct{}
 	val      any
 	err      error
-	timedOut atomic.Bool // a caller gave up on it: answer "did not answer" until it returns
+	group    string // the network mount it reads, if any
+	timedOut bool   // a caller gave up on it: answer "did not answer" until it returns (under deadlineFlights)
 }
+
+// isoMaxReadsInFlight caps the deadlined reads running at once, process-wide.
+// Each one that blocks in the kernel holds an OS thread until the filesystem
+// answers, and the Go runtime aborts at 10,000; past the cap a new read is
+// refused at once (fail closed), so no caller — whatever directories it names
+// — can pile them up.
+var isoMaxReadsInFlight = 64
 
 var deadlineFlights = struct {
 	sync.Mutex
-	m map[string]*deadlineFlight
-}{m: map[string]*deadlineFlight{}}
+	m        map[string]*deadlineFlight
+	inFlight int
+	// stuck counts, per network mount, the reads that timed out and have not
+	// returned: while one has, every new read on that mount is answered "did
+	// not answer" at once.
+	stuck map[string]int
+}{m: map[string]*deadlineFlight{}, stuck: map[string]int{}}
+
+// errTooManyReads is the fail-closed answer once isoMaxReadsInFlight reads are
+// waiting.
+type errTooManyReads struct{ dir string }
+
+func (e errTooManyReads) Error() string {
+	return fmt.Sprintf("directory %s was not read: %d reads are already waiting on filesystems that do not answer", e.dir, isoMaxReadsInFlight)
+}
+
+// errMountNotAnswering is the fail-closed answer for a directory on a network
+// mount another read of which has timed out and not returned.
+type errMountNotAnswering struct{ dir, mount string }
+
+func (e errMountNotAnswering) Error() string {
+	return fmt.Sprintf("directory %s is on %s, which did not answer within %s", e.dir, e.mount, isoDirProbeTimeout)
+}
 
 // deadlined runs fn for key under isoDirProbeTimeout, at most one at a time
 // per key: a caller asking while one runs waits on that one. Once a caller has
 // given up on it, every later caller is answered errDirProbeTimeout at once
-// until fn returns. A blocked fn holds its goroutine (in the kernel, an OS
-// thread) until the filesystem answers; this bounds them to one per key.
-func deadlined(ctx context.Context, key, what string, fn func() (any, error)) (any, error) {
+// until fn returns — and, with group (the network mount the read is on), so is
+// every new read on that mount. No more than isoMaxReadsInFlight run at once.
+// A blocked fn holds its goroutine (in the kernel, an OS thread) until the
+// filesystem answers; together these bound them.
+func deadlined(ctx context.Context, key, group, what string, fn func() (any, error)) (any, error) {
 	deadlineFlights.Lock()
 	f, ok := deadlineFlights.m[key]
-	if ok && f.timedOut.Load() {
+	switch {
+	case ok && f.timedOut:
 		deadlineFlights.Unlock()
 		return nil, errDirProbeTimeout{dir: what}
-	}
-	if !ok {
-		f = &deadlineFlight{done: make(chan struct{})}
+	case !ok && group != "" && deadlineFlights.stuck[group] > 0:
+		deadlineFlights.Unlock()
+		return nil, errMountNotAnswering{dir: what, mount: group}
+	case !ok && deadlineFlights.inFlight >= isoMaxReadsInFlight:
+		deadlineFlights.Unlock()
+		return nil, errTooManyReads{dir: what}
+	case !ok:
+		f = &deadlineFlight{done: make(chan struct{}), group: group}
 		deadlineFlights.m[key] = f
+		deadlineFlights.inFlight++
 		go func() {
-			v, err := fn()
-			f.val, f.err = v, err
-			deadlineFlights.Lock()
-			if deadlineFlights.m[key] == f {
-				delete(deadlineFlights.m, key)
-			}
-			deadlineFlights.Unlock()
-			close(f.done)
+			var v any
+			var err error
+			defer func() {
+				if r := recover(); r != nil {
+					v, err = nil, fmt.Errorf("reading %s failed: %v", what, r)
+				}
+				f.val, f.err = v, err
+				deadlineFlights.Lock()
+				if deadlineFlights.m[key] == f {
+					delete(deadlineFlights.m, key)
+				}
+				deadlineFlights.inFlight--
+				if f.timedOut && f.group != "" {
+					if deadlineFlights.stuck[f.group]--; deadlineFlights.stuck[f.group] <= 0 {
+						delete(deadlineFlights.stuck, f.group)
+					}
+				}
+				deadlineFlights.Unlock()
+				close(f.done)
+			}()
+			v, err = fn()
 		}()
 	}
 	deadlineFlights.Unlock()
@@ -134,7 +184,20 @@ func deadlined(ctx context.Context, key, what string, fn func() (any, error)) (a
 	case <-f.done:
 		return f.val, f.err
 	case <-t.C:
-		f.timedOut.Store(true)
+		deadlineFlights.Lock()
+		select {
+		case <-f.done: // returned meanwhile
+			deadlineFlights.Unlock()
+			return f.val, f.err
+		default:
+		}
+		if !f.timedOut {
+			f.timedOut = true
+			if f.group != "" {
+				deadlineFlights.stuck[f.group]++
+			}
+		}
+		deadlineFlights.Unlock()
 		return nil, errDirProbeTimeout{dir: what}
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -144,10 +207,24 @@ func deadlined(ctx context.Context, key, what string, fn func() (any, error)) (a
 // probeDir is probeDirCtx with no caller context.
 func probeDir(p string) (dirProbe, error) { return probeDirCtx(context.Background(), p) }
 
-// probeDirCtx resolves and stats p under the deadline (deadlined). A missing
-// directory is (zero, nil): it maps nothing. Any other error fails closed.
+// networkMountOf is the mount point of the network (or FUSE) filesystem a
+// lexical path is on, by the mount table; "" for any other.
+func networkMountOf(p string) string {
+	mounts, err := isoMountInfo()
+	if err != nil {
+		return ""
+	}
+	if m, ok := mountOf(mounts, filepath.Clean(p)); ok && isNetworkFS(m.fstype) {
+		return m.point
+	}
+	return ""
+}
+
+// probeDirCtx resolves and stats p under the deadline (deadlined), grouped by
+// the network mount it is on. A missing directory is (zero, nil): it maps
+// nothing. Any other error fails closed.
 func probeDirCtx(ctx context.Context, p string) (dirProbe, error) {
-	v, err := deadlined(ctx, "probe:"+p, p, func() (any, error) {
+	v, err := deadlined(ctx, "probe:"+p, networkMountOf(p), p, func() (any, error) {
 		r, fi, err := isoDirProbe(p)
 		if err != nil {
 			if os.IsNotExist(err) || errors.Is(err, syscall.ENOTDIR) {
@@ -171,19 +248,46 @@ func isDaemonNFSMount(p corrosion.StoragePoolRecord) bool {
 
 // mountEntry is one line of /proc/self/mountinfo.
 type mountEntry struct {
-	point  string // mount point
-	dev    string // major:minor of the filesystem
-	fstype string
+	point   string // mount point
+	dev     string // major:minor of the filesystem
+	fstype  string
+	options string // per-mount options (nosymfollow …)
 }
 
-// isoMountInfo reads this process's mount table. A variable so a test can add
-// a mount. Reading /proc/self/mountinfo never touches a mounted filesystem.
-var isoMountInfo = func() ([]mountEntry, error) {
-	b, err := os.ReadFile("/proc/self/mountinfo")
-	if err != nil {
-		return nil, err
+// noSymfollow reports a mount that follows no symlink in it (nosymfollow).
+func (m mountEntry) noSymfollow() bool {
+	for _, o := range strings.Split(m.options, ",") {
+		if o == "nosymfollow" {
+			return true
+		}
 	}
-	return parseMountInfo(string(b)), nil
+	return false
+}
+
+// isoMountInfo reads this process's mount table (cached for a second: every
+// directory read consults it). A variable so a test can add a mount. Reading
+// /proc/self/mountinfo never touches a mounted filesystem.
+var isoMountInfo = cachedMountInfo
+
+var mountInfoCache struct {
+	sync.Mutex
+	at     time.Time
+	mounts []mountEntry
+	err    error
+}
+
+func cachedMountInfo() ([]mountEntry, error) {
+	mountInfoCache.Lock()
+	defer mountInfoCache.Unlock()
+	if time.Since(mountInfoCache.at) < time.Second {
+		return mountInfoCache.mounts, mountInfoCache.err
+	}
+	b, err := os.ReadFile("/proc/self/mountinfo")
+	mountInfoCache.at, mountInfoCache.mounts, mountInfoCache.err = time.Now(), nil, err
+	if err == nil {
+		mountInfoCache.mounts = parseMountInfo(string(b))
+	}
+	return mountInfoCache.mounts, mountInfoCache.err
 }
 
 // parseMountInfo parses mountinfo lines: "id parent major:minor root point
@@ -205,7 +309,7 @@ func parseMountInfo(s string) []mountEntry {
 		if sep < 0 || sep+1 >= len(f) {
 			continue
 		}
-		out = append(out, mountEntry{point: unescapeMountField(f[4]), dev: f[2], fstype: f[sep+1]})
+		out = append(out, mountEntry{point: unescapeMountField(f[4]), dev: f[2], fstype: f[sep+1], options: f[5]})
 	}
 	return out
 }
@@ -257,8 +361,11 @@ func isNetworkFS(fstype string) bool {
 
 // onAnotherNetworkFS reports, without touching it, that pool directory pd is
 // on a network filesystem other than the one target (a resolved directory) is
-// on, reached with no link above that filesystem's mount point — so it cannot
-// be target, and need not be read. Anything it cannot tell is false (read it).
+// on, reached with no link — so it cannot be target, and need not be read:
+// no link above that filesystem's mount point, and either pd is the mount
+// point itself (a mount point is never a link) or the mount follows no link
+// (nosymfollow). A link inside a network export could otherwise name a local
+// directory. Anything it cannot tell is false (read it).
 func onAnotherNetworkFS(ctx context.Context, mounts []mountEntry, target, pd string) bool {
 	if len(mounts) == 0 || target == "" {
 		return false
@@ -269,6 +376,9 @@ func onAnotherNetworkFS(ctx context.Context, mounts []mountEntry, target, pd str
 	}
 	pm, ok := mountOf(mounts, pd)
 	if !ok || !isNetworkFS(pm.fstype) || pm.dev == tm.dev || pm.point == "/" {
+		return false
+	}
+	if filepath.Clean(pd) != pm.point && !pm.noSymfollow() {
 		return false
 	}
 	parent := filepath.Dir(pm.point)

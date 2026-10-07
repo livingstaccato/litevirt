@@ -350,13 +350,35 @@ func (s *Server) verifyVMISOForStart(vm *corrosion.VMRecord) error {
 	if err != nil {
 		return nil
 	}
-	cdroms := s.domainInstallerISOs(vm.Name, domXML)
-	if len(cdroms) == 0 {
+	updated, err := s.judgedCDROMDefinition(vm, domXML)
+	if err != nil {
+		return err
+	}
+	if updated == domXML {
 		return nil
+	}
+	if err := s.virt.DefineDomain(updated); err != nil {
+		return status.Errorf(codes.Internal, "point %s's installer CD-ROM at this host's file: %v", vm.Name, err)
+	}
+	slog.Info("installer ISO: domain pointed at the file resolved on this host", "vm", vm.Name, "iso", vmSpecFor(vm).GetIso())
+	return nil
+}
+
+// judgedCDROMDefinition judges, on this host, the installer CD-ROMs a domain
+// definition of vm carries (installerISOResolution) and returns the definition
+// with each pointed at the file judged here (unchanged when they all are). It
+// serves a start's defined domain and a memory snapshot's saved image alike.
+func (s *Server) judgedCDROMDefinition(vm *corrosion.VMRecord, domXML string) (string, error) {
+	cdroms, err := s.domainInstallerISOsErr(vm.Name, domXML)
+	if err != nil {
+		return "", status.Errorf(codes.FailedPrecondition, "cannot read the installer CD-ROMs of VM %q: %v", vm.Name, err)
+	}
+	if len(cdroms) == 0 {
+		return domXML, nil
 	}
 	resolved, _, err := s.installerISOResolution(context.Background(), vm, vmSpecFor(vm), cdroms, "", false)
 	if err != nil {
-		return err
+		return "", err
 	}
 	remap := map[string]string{}
 	for from, to := range resolved {
@@ -365,17 +387,13 @@ func (s *Server) verifyVMISOForStart(vm *corrosion.VMRecord) error {
 		}
 	}
 	if len(remap) == 0 {
-		return nil
+		return domXML, nil
 	}
 	updated, _, err := lv.RewriteCDROMSources(domXML, remap)
 	if err != nil {
-		return status.Errorf(codes.Internal, "point %s's installer CD-ROM at this host's file: %v", vm.Name, err)
+		return "", status.Errorf(codes.Internal, "point %s's installer CD-ROM at this host's file: %v", vm.Name, err)
 	}
-	if err := s.virt.DefineDomain(updated); err != nil {
-		return status.Errorf(codes.Internal, "point %s's installer CD-ROM at this host's file: %v", vm.Name, err)
-	}
-	slog.Info("installer ISO: domain pointed at the file resolved on this host", "vm", vm.Name, "iso", vmSpecFor(vm).GetIso())
-	return nil
+	return updated, nil
 }
 
 // installerISOResolution resolves, on this host, the installer CD-ROMs a VM's

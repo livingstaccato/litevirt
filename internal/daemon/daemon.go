@@ -1922,24 +1922,33 @@ func (d *Daemon) ensureGlobalISOLibrary(ctx context.Context) {
 	}
 }
 
-// runISOLibrarySync runs a sync pass of the global ISO library every 30s, and
-// every 5 minutes sweeps this host's installer-ISO records of VMs that no
-// longer exist.
+// runISOLibrarySync runs a sync pass of the global ISO library every 30s, and,
+// on a ticker of its own (a sync pass can wait long on hashing), sweeps this
+// host's installer-ISO records of VMs that no longer exist every 5 minutes.
 func (d *Daemon) runISOLibrarySync(ctx context.Context, svc *grpcapi.Server) {
+	go func() {
+		t := time.NewTicker(5 * time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if err := svc.SweepISOIdentities(ctx); err != nil {
+					slog.Warn("installer ISO records: sweep", "error", err)
+				}
+			}
+		}
+	}()
 	t := time.NewTicker(30 * time.Second)
 	defer t.Stop()
-	for pass := 0; ; pass++ {
+	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
 			if err := svc.SyncISOLibrary(ctx); err != nil {
 				slog.Warn("global ISO library: sync", "error", err)
-			}
-			if pass%10 == 0 {
-				if err := svc.SweepISOIdentities(ctx); err != nil {
-					slog.Warn("installer ISO records: sweep", "error", err)
-				}
 			}
 		}
 	}

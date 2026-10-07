@@ -706,7 +706,7 @@ func (s *Server) listLibrary(ctx context.Context, p corrosion.StoragePoolRecord)
 			return nil
 		}
 	}
-	v, err := deadlined(ctx, "list:"+dir, dir, func() (any, error) {
+	v, err := deadlined(ctx, "list:"+dir, networkMountOf(dir), dir, func() (any, error) {
 		if isoBeforeList != nil {
 			isoBeforeList(dir)
 		}

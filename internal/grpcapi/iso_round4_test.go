@@ -153,12 +153,13 @@ func TestISORound4_AnISOUnderHomeWorks(t *testing.T) {
 	}
 }
 
-// N-C2, red: under /home only an optical image outside dot-directories is a
-// file a guest may be given.
+// N-C2, red: under /home only an optical image is a file a guest may be given,
+// and not through a link into a dot-directory the path does not name; an ISO
+// in a dot-directory the Admin names (libvirt's session pool) works.
 func TestISORound4_HomeIsStillNotReadable(t *testing.T) {
 	s, _, _ := isoServer(t)
 	d := homeTestDir(t)
-	for _, sub := range []string{".ssh", ".cache", "isos"} {
+	for _, sub := range []string{".ssh", ".cache", "isos", ".local/share/libvirt/images"} {
 		if err := os.MkdirAll(filepath.Join(d, sub), 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -173,10 +174,21 @@ func TestISORound4_HomeIsStillNotReadable(t *testing.T) {
 	if err := os.Symlink(key, link); err != nil {
 		t.Fatal(err)
 	}
-	for i, p := range []string{key, keyISO, dotISO, link} {
+	dotLink := filepath.Join(d, "isos", "cached.iso")
+	if err := os.Symlink(dotISO, dotLink); err != nil {
+		t.Fatal(err)
+	}
+	for i, p := range []string{key, keyISO, link, dotLink} {
 		name := "bad" + string(rune('a'+i))
 		if _, err := s.CreateVM(adminCtx(), isoCreate(name, p, "")); status.Code(err) != codes.InvalidArgument {
 			t.Errorf("admin create with %s: got %v, want InvalidArgument", p, err)
+		}
+	}
+	session := filepath.Join(d, ".local", "share", "libvirt", "images", "x.iso")
+	writeLibFile(t, session, opticalImage("session"))
+	for i, p := range []string{session, dotISO} {
+		if _, err := s.CreateVM(adminCtx(), isoCreate("ok"+string(rune('a'+i)), p, "")); err != nil {
+			t.Errorf("admin create with %s (a dot-directory the Admin names): %v", p, err)
 		}
 	}
 }

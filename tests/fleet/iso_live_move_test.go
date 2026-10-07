@@ -156,3 +156,57 @@ func TestFleet_ADrainLandsOnTheTargetsISO(t *testing.T) {
 		t.Fatalf("libvirt migrate = %q; want the destination definition pointed at the target's file (%s)", note, want)
 	}
 }
+
+// NEW-1: a new source moving a VM live to a target older than
+// installer_iso_resolved (main) hands that target the path the VM was given —
+// the link, which its qemu follows there as on main — not this host's
+// resolved file, which the target may not have.
+//
+// Mutation: drop the older-target fallback in ensureDisksOnTargetISO — the
+// migrate call carries no cdroms and the test goes red.
+func TestFleet_ALiveMoveToAnOlderTargetCarriesTheLink(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	defer c.Stop()
+	src, dst := c.Nodes[0], c.Nodes[1]
+	for _, n := range c.Nodes {
+		setHostCapacity(t, c, n.Name, 64, 65536, nil)
+	}
+	dir := filepath.Join(c.tmpRoot, "virtio")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	real := filepath.Join(dir, "virtio-win-0.1.240.iso")
+	if err := os.WriteFile(real, []byte("CD001 virtio"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "virtio-win.iso")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := filepath.EvalSymlinks(real)
+	if err != nil {
+		t.Fatal(err)
+	}
+	link, _ = filepath.Abs(link)
+	spec, _ := json.Marshal(&pb.VMSpec{Name: "win", Cpu: 1, MemoryMib: 256, Iso: link, IsoScope: "hostpath"})
+	if err := corrosion.InsertVM(ctx, src.DB, corrosion.VMRecord{
+		Name: "win", HostName: src.Name, State: "running", Spec: string(spec), CPUActual: 1, MemActual: 256,
+	}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	// After a start on this build the domain carries the resolved file.
+	dom := `<domain type='kvm'><name>win</name><memory unit='MiB'>256</memory><vcpu>1</vcpu><devices>` +
+		`<disk type='file' device='cdrom'><source file='` + resolved + `'/><target dev='sda' bus='sata'/><readonly/></disk></devices></domain>`
+	src.Virt.SetInactiveXML("win", dom)
+	src.Virt.SetActiveXML("win", dom)
+	src.Virt.SetState("win", "running")
+
+	dst.Server.AnswerEnsureDisksAsAnOlderTargetForTest(true)
+	if err := migrateAt(t, c, src, "win", dst.Name); err != nil {
+		t.Fatalf("live move to an older target: %v", err)
+	}
+	if note, want := lastMigrateNote(src), "cdroms="+resolved+"->"+link; !strings.Contains(note, want) {
+		t.Fatalf("libvirt migrate = %q; want the older target handed the link the VM was given (%s)", note, want)
+	}
+}

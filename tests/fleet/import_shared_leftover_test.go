@@ -35,6 +35,7 @@ func stubQemuImgFleet(t *testing.T) {
 	dir := t.TempDir()
 	shim := "#!/bin/sh\n" +
 		"if [ \"$1\" = info ]; then echo '{\"format\":\"raw\",\"virtual-size\":1048576}'; exit 0; fi\n" +
+		"if [ \"$1\" = measure ]; then echo '{\"required\":134217728,\"fully-allocated\":134217728}'; exit 0; fi\n" +
 		"prev=\"\"; last=\"\"\n" +
 		"for a; do prev=\"$last\"; last=\"$a\"; done\n" +
 		"cp \"$prev\" \"$last\"\n"

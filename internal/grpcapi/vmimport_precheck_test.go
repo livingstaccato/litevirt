@@ -239,7 +239,7 @@ func TestPrivateImportDisk_KeepsAnOutsideDiskSparse(t *testing.T) {
 	}
 	f.Close()
 	importDir := t.TempDir()
-	cp, err := privateImportDisk(context.Background(), src, importDir, 1<<40)
+	cp, err := privateImportDisk(context.Background(), src, importDir, 1<<40, nil)
 	if err != nil {
 		t.Fatalf("privateImportDisk: %v", err)
 	}
@@ -269,7 +269,7 @@ func TestPrivateImportDisk_StopsWhenTheImportIsCancelled(t *testing.T) {
 	importDir := t.TempDir()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := privateImportDisk(ctx, src, importDir, 1<<40); err == nil {
+	if _, err := privateImportDisk(ctx, src, importDir, 1<<40, nil); err == nil {
 		t.Fatal("a cancelled import copied the disk anyway")
 	}
 	if left, _ := os.ReadDir(importDir); len(left) != 0 {
@@ -310,7 +310,7 @@ func TestPrivateImportDisk_StopsAtItsLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	importDir := t.TempDir()
-	if _, err := privateImportDisk(context.Background(), src, importDir, 1<<20); err == nil {
+	if _, err := privateImportDisk(context.Background(), src, importDir, 1<<20, nil); err == nil {
 		t.Fatal("a disk past its limit was copied")
 	}
 	if left, _ := os.ReadDir(importDir); len(left) != 0 {

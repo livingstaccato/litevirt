@@ -17,9 +17,9 @@ import (
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
-// The conversion writes a disk the size of its capacity into the pool, after
-// the quota admitted it; the filesystem has to hold it with the headroom a
-// cold migration also keeps, or the import is refused before writing.
+// The conversion writes what qemu-img measures into the pool, after the
+// quota admitted it; the filesystem has to hold it with the headroom a cold
+// migration also keeps, or the import is refused before writing.
 func TestImportVM_RefusedWhenThePoolFilesystemCannotHoldTheDisk(t *testing.T) {
 	s := testServer(t)
 	s.dataDir = t.TempDir()
@@ -27,10 +27,19 @@ func TestImportVM_RefusedWhenThePoolFilesystemCannotHoldTheDisk(t *testing.T) {
 	s.virt = libvirtfake.New()
 	quotaProject(t, s, "acme", corrosion.ProjectQuotaRecord{DiskGiBLimit: 4, NICLimit: 2})
 	s.diskSpaceOverride = func(string) (uint64, uint64, error) { return 2 << 30, 10 << 30, nil }
-
-	err := importSmallVM(t, s, "imp-short", "acme", 512, false)
+	// A 1 GiB disk full of data: the conversion writes all of it.
+	thinQemuImg(t, 1<<30, 1<<30+1<<20)
+	raw := t.TempDir() + "/disk0.raw"
+	if err := writeFileHelper(raw, make([]byte, 1<<20)); err != nil {
+		t.Fatal(err)
+	}
+	err := s.ImportVM(&fakeImportStream{ctx: adminCtx(), frames: []*pb.ImportVMRequest{{
+		Name: "imp-short", SourceFormat: "proxmox", Project: "acme",
+		Chunk:   []byte("name: imp-short\ncores: 1\nmemory: 512\nscsi0: local-lvm:imp-short-disk-0,size=1G\n"),
+		DiskMap: map[string]string{"scsi0": raw},
+	}}})
 	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "free") {
-		t.Fatalf("import of a 1 GiB disk into a filesystem with 1 GiB above its headroom: %v, want a free-space refusal", err)
+		t.Fatalf("import of a disk measured at 1 GiB into a filesystem with 1 GiB above its headroom: %v, want a free-space refusal", err)
 	}
 	if rec, _ := corrosion.GetVM(context.Background(), s.db, "imp-short"); rec != nil {
 		t.Fatal("a refused import persisted a row")
@@ -58,6 +67,7 @@ func progressQemuImg(t *testing.T) {
 	dir := t.TempDir()
 	shim := "#!/bin/sh\n" +
 		"if [ \"$1\" = info ]; then echo '{\"format\":\"raw\",\"virtual-size\":1048576}'; exit 0; fi\n" +
+		"if [ \"$1\" = measure ]; then echo '{\"required\":134217728,\"fully-allocated\":134217728}'; exit 0; fi\n" +
 		"printf '    (50.00/100%%)\\r'\n" +
 		"prev=\"\"; last=\"\"\n" +
 		"for a; do prev=\"$last\"; last=\"$a\"; done\n" +

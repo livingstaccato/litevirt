@@ -245,20 +245,19 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 			cleanupDisks()
 			return status.Error(codes.FailedPrecondition, err.Error())
 		}
-		// The conversion writes up to the disk's limit, plus its qcow2
-		// tables, into the pool, and a disk from outside the import directory
-		// is first copied privately. Each is reserved on its own filesystem;
-		// on a shared one the two add up.
-		limit := uint64(importSourceLimit(d.CapacityBytes))
-		if !inImportDir(importDir, d.LocalPath) {
-			if err := space.reserve(importDir, limit, "a private copy of disk "+d.Name); err != nil {
-				cleanupDisks()
-				return err
-			}
+		// What the import writes is reserved, not what the disk declares: a
+		// disk from outside the import directory is first copied privately,
+		// sparse, so it is charged the source's allocated blocks; the
+		// conversion is charged what qemu-img measures it will write (a thin
+		// 1 TiB disk holding 40 GiB writes about 40 GiB). Each is reserved on
+		// its own filesystem, just before it is written; on a shared one the
+		// two add up. The declared capacity stays the quota's bound only.
+		diskName := d.Name
+		writes.privateCopy = func(n uint64) error {
+			return space.reserve(importDir, n, "a private copy of disk "+diskName)
 		}
-		if err := space.reserve(poolDir, limit+limit/4096+16<<20, "converting disk "+d.Name); err != nil {
-			cleanupDisks()
-			return err
+		writes.converting = func(n uint64) error {
+			return space.reserve(poolDir, n, "converting disk "+diskName)
 		}
 		if err := convertForeignDisk(ctx, d.LocalPath, d.Format, dst, importDir, importSourceLimit(d.CapacityBytes), func(pct float32) {
 			select {
@@ -946,8 +945,30 @@ type importDiskWrites struct {
 	// copying is a placement that has to copy n bytes (a pool with neither
 	// link() nor RENAME_NOREPLACE): an error refuses it.
 	copying func(n uint64) error
+	// privateCopy reserves n bytes in the import directory for the private
+	// copy of a disk from outside it (the source's allocated blocks), before
+	// the copy begins: an error refuses it.
+	privateCopy func(n uint64) error
+	// converting reserves n bytes in the pool for the conversion (what
+	// qemu-img measure says it writes), before it begins: an error refuses
+	// it.
+	converting func(n uint64) error
 	// discarded is a file it created that is gone, or no longer its own.
 	discarded func(p string)
+}
+
+func (w *importDiskWrites) reservePrivateCopy(n uint64) error {
+	if w != nil && w.privateCopy != nil {
+		return w.privateCopy(n)
+	}
+	return nil
+}
+
+func (w *importDiskWrites) reserveConversion(n uint64) error {
+	if w != nil && w.converting != nil {
+		return w.converting(n)
+	}
+	return nil
 }
 
 func (w *importDiskWrites) didCreate(p string) {
@@ -1046,7 +1067,7 @@ func convertForeignDisk(ctx context.Context, src, srcFormat, dst, allowedDir str
 	if err := refuseExistingFile(dst); err != nil {
 		return err
 	}
-	private, err := privateImportDisk(ctx, src, allowedDir, maxSrcBytes)
+	private, err := privateImportDisk(ctx, src, allowedDir, maxSrcBytes, w.reservePrivateCopy)
 	if err != nil {
 		return err
 	}
@@ -1066,10 +1087,17 @@ func convertForeignDisk(ctx context.Context, src, srcFormat, dst, allowedDir str
 	}
 	// The conversion writes up to the image's virtual size, which a
 	// compressed image can make far larger than its file.
-	if vs, err := qemuVirtualSize(ctx, src, srcFormat); err != nil {
+	vs, err := qemuVirtualSize(ctx, src, srcFormat)
+	if err != nil {
 		return err
-	} else if vs > uint64(maxSrcBytes) {
+	}
+	if vs > uint64(maxSrcBytes) {
 		return fmt.Errorf("disk's virtual size is %d bytes, more than the %d bytes the import was admitted for", vs, maxSrcBytes)
+	}
+	// Reserve what the conversion will write, judged on the checked private
+	// copy in the format it is converted from.
+	if err := w.reserveConversion(importConvertNeed(ctx, src, srcFormat, vs)); err != nil {
+		return err
 	}
 
 	// A fresh name of its own, never a fixed "<dst>.tmp" another writer to

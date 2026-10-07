@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"syscall"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -17,6 +18,7 @@ import (
 	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/safename"
 	"github.com/litevirt/litevirt/internal/vmimport"
+	"log/slog"
 )
 
 // A foreign disk reaches qemu-img as root. qemu-img opens whatever the disk's
@@ -137,7 +139,10 @@ func staticDiskFormat(file string) (string, error) {
 // before qemu-img opens it. It is copied into importDir, opened without
 // following a link, and must be a plain file; the copy is what is checked and
 // converted.
-func privateImportDisk(ctx context.Context, src, importDir string, limit int64) (string, error) {
+//
+// reserve, when set, is asked for the room the copy takes in importDir — the
+// source's allocated blocks, since the copy is sparse — before it is written.
+func privateImportDisk(ctx context.Context, src, importDir string, limit int64, reserve func(uint64) error) (string, error) {
 	// importDir and everything under it is written by the daemon alone, so a
 	// plain file named inside it (as written, or as resolved) is already
 	// private.
@@ -160,6 +165,11 @@ func privateImportDisk(ctx context.Context, src, importDir string, limit int64) 
 	if !fi.Mode().IsRegular() {
 		return "", fmt.Errorf("disk %s is not a plain file", filepath.Base(src))
 	}
+	if reserve != nil {
+		if err := reserve(privateCopyNeed(fi)); err != nil {
+			return "", err
+		}
+	}
 	out, err := os.CreateTemp(importDir, "disk-*")
 	if err != nil {
 		return "", err
@@ -176,6 +186,23 @@ func privateImportDisk(ctx context.Context, src, importDir string, limit int64) 
 	return out.Name(), nil
 }
 
+// privateCopyNeed is what copySparse writes for the source fi describes: its
+// allocated blocks (it leaves every hole a hole), never more than its length.
+// A filesystem that reports no blocks for a non-empty file is charged its
+// length.
+func privateCopyNeed(fi os.FileInfo) uint64 {
+	size := uint64(max(fi.Size(), 0))
+	alloc := size
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok && st.Blocks > 0 {
+		alloc = min(uint64(st.Blocks)*512, size)
+	}
+	// copySparse writes a partly-zero grain whole: the last one may round up.
+	return min(size, alloc+copySparseGrain)
+}
+
+// copySparseGrain is the run of zeros copySparse leaves a hole.
+const copySparseGrain = 64 << 10
+
 // copySparse copies in to out leaving every all-zero chunk a hole, so a thin
 // disk costs its data rather than its virtual size in the import directory,
 // which usually shares a filesystem with state.db. It stops when ctx ends, and
@@ -190,12 +217,15 @@ func copySparse(ctx context.Context, out, in *os.File, limit int64) error {
 		}
 		n, rerr := io.ReadFull(in, buf)
 		if n > 0 {
-			if allZero(buf[:n]) {
-				if _, err := out.Seek(int64(n), io.SeekCurrent); err != nil {
+			for g := 0; g < n; g += copySparseGrain {
+				chunk := buf[g:min(g+copySparseGrain, n)]
+				if allZero(chunk) {
+					if _, err := out.Seek(int64(len(chunk)), io.SeekCurrent); err != nil {
+						return err
+					}
+				} else if _, err := out.Write(chunk); err != nil {
 					return err
 				}
-			} else if _, err := out.Write(buf[:n]); err != nil {
-				return err
 			}
 			off += int64(n)
 			if off > limit {
@@ -249,6 +279,40 @@ func bindImportDiskSizes(fv *vmimport.ForeignVM) error {
 		}
 	}
 	return nil
+}
+
+// importConvertSlack is room kept above what qemu-img measure says a
+// conversion writes.
+const importConvertSlack = 16 << 20
+
+// importConvertNeed is what converting file (opened as format, of virtual
+// size virtual) to qcow2 writes into the pool: what qemu-img measure says
+// the qcow2 needs — the data it holds and the tables for it, not its
+// capacity. Without an answer from measure, it is the whole virtual size
+// with its tables.
+func importConvertNeed(ctx context.Context, file, format string, virtual uint64) uint64 {
+	req, err := qemuMeasure(ctx, file, format)
+	if err == nil {
+		return req + importConvertSlack
+	}
+	slog.Warn("import: qemu-img measure failed; reserving the disk's whole virtual size for its conversion", "disk", filepath.Base(file), "error", err)
+	return coldFlattenEstimate(virtual, virtual)
+}
+
+// qemuMeasure is the bytes qemu-img says a qcow2 converted from file, opened
+// as format (never probed), needs. file has passed the header check.
+func qemuMeasure(ctx context.Context, file, format string) (uint64, error) {
+	out, err := exec.CommandContext(ctx, "qemu-img", "measure", "--output=json", "-O", "qcow2", "-f", format, "--", file).Output()
+	if err != nil {
+		return 0, fmt.Errorf("measure %s: %w", filepath.Base(file), err)
+	}
+	var m struct {
+		Required *uint64 `json:"required"`
+	}
+	if err := json.Unmarshal(out, &m); err != nil || m.Required == nil {
+		return 0, fmt.Errorf("measure %s: unreadable qemu-img measure output", filepath.Base(file))
+	}
+	return *m.Required, nil
 }
 
 // qemuVirtualSize is the virtual size qemu-img reports for a disk that has

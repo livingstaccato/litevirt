@@ -55,9 +55,12 @@ func TestProtoNumbers_TheIntegratedBranchesDoNotCollide(t *testing.T) {
 		t.Fatal("no LiteVirt service")
 	}
 	for _, rpc := range []protoreflect.Name{
-		"PushReplica", "ListReplicas", "PruneReplicas", "PruneImages", // disk-files-project-isolation
-		"ImportLeftoverStatus", // import-host-path-reads
-		"ListISOs", "PullISO", "GetISOLibraryMode", "SetISOLibraryMode", "FetchISOLibraryFile", // vm-host-path-reads-confined
+		// disk-files-project-isolation
+		"PushReplica", "ListReplicas", "PruneReplicas", "PruneImages",
+		// import-host-path-reads
+		"ImportLeftoverStatus",
+		// vm-host-path-reads-confined
+		"ListISOs", "PullISO", "GetISOLibraryMode", "SetISOLibraryMode", "FetchISOLibraryFile",
 	} {
 		if svc.Methods().ByName(rpc) == nil {
 			t.Errorf("RPC %s is missing", rpc)

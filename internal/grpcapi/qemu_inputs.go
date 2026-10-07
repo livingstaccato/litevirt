@@ -193,7 +193,7 @@ func (s *Server) diskChainRule(ctx context.Context, d corrosion.DiskRecord) chai
 }
 
 func (s *Server) newDiskChain(ctx context.Context, d corrosion.DiskRecord) *diskChain {
-	c := &diskChain{s: s, ctx: ctx, d: d, projects: map[string]string{}, uploads: map[string]poolRecords{}}
+	c := &diskChain{s: s, ctx: ctx, d: d, projects: map[string]string{}, uploads: map[string]poolRecords{}, recorded: map[string]corrosion.DiskRecord{}}
 	c.project = c.projectOf(d.VMName)
 	c.self = resolvedOr(s.hostDiskFile(d.Path))
 	c.images = s.rootsAsFound(filepath.Join(s.dataDir, "images"))
@@ -226,6 +226,10 @@ type diskChain struct {
 	own      []string
 	projects map[string]string      // vm → normalized project ("" unknown)
 	uploads  map[string]poolRecords // directory → its pool upload records
+	// recorded maps a file accepted as a layer's recorded backing_disk — a
+	// linked clone's source disk — and the snapshot bases under it, to that
+	// disk's row: the source's own chain is judged as its start judges it.
+	recorded map[string]corrosion.DiskRecord
 }
 
 func (c *diskChain) judge(layer, resolved, format string) error {
@@ -242,6 +246,10 @@ func (c *diskChain) judge(layer, resolved, format string) error {
 		return nil // its own backing, if any, is judged next, as an image-store layer
 	}
 	if c.recordedBacking(layer, resolved) {
+		for _, r := range c.rowsAt(resolved) {
+			c.recorded[resolved] = r
+			break
+		}
 		return nil
 	}
 	if c.userUpload(layer) {
@@ -347,19 +355,36 @@ func (c *diskChain) userUpload(layer string) bool {
 // naming exactly that name beside d's file, a file no record gives anyone —
 // no upload record but a peer's, no replica record — and no other project's
 // VM disk (live or kept) uses.
+//
+// The same holds for the disk under a linked clone (a layer an earlier layer
+// recorded as its backing_disk, which the clone was authorized to read whole
+// when it was made): that disk's own base, as its own start judges it — the
+// name its row records, beside its file, used by no VM disk outside its VM's
+// project. An earlier build's clone of such a disk reads it that way, as qemu
+// did there.
 func (c *diskChain) legacyPoolBase(layer, resolved string) bool {
-	if resolved == c.self || (layer != c.self && !c.ownLayer(layer)) {
+	if resolved == c.self {
 		return false
 	}
-	named := false
-	for _, r := range c.rowsOf(layer) {
-		img := r.BackingImage
-		if img == "" || filepath.IsAbs(img) || !filepath.IsLocal(img) {
-			continue
+	named, project := false, c.project
+	switch {
+	case layer == c.self || c.ownLayer(layer):
+		for _, r := range c.rowsOf(layer) {
+			if img, ok := relativeImageName(r.BackingImage); ok && resolvedOr(filepath.Join(filepath.Dir(c.self), img)) == resolved {
+				named = true
+				break
+			}
 		}
-		if resolvedOr(filepath.Join(filepath.Dir(c.self), img)) == resolved {
-			named = true
+	default:
+		r, ok := c.recorded[layer]
+		if !ok {
 			break
+		}
+		src := resolvedOr(c.s.hostDiskFile(r.Path))
+		if img, ok := relativeImageName(r.BackingImage); ok && resolvedOr(filepath.Join(filepath.Dir(src), img)) == resolved {
+			if project = c.projectOf(r.VMName); project != "" {
+				named = true
+			}
 		}
 	}
 	if !named {
@@ -373,7 +398,16 @@ func (c *diskChain) legacyPoolBase(layer, resolved string) bool {
 	if _, ok := replicaRecordFor(resolved); ok {
 		return false
 	}
-	return !c.s.usedByOtherProject(c.ctx, c.s.recordPath(resolved), replicaKey{VM: c.d.VMName, Disk: c.d.DiskName, Project: c.project})
+	return !c.s.usedByOtherProject(c.ctx, c.s.recordPath(resolved), replicaKey{VM: c.d.VMName, Disk: c.d.DiskName, Project: project})
+}
+
+// relativeImageName is a row's backing_image when it is a bare relative name
+// (how an earlier build's pool disk named its image in its header).
+func relativeImageName(img string) (string, bool) {
+	if img == "" || filepath.IsAbs(img) || !filepath.IsLocal(img) {
+		return "", false
+	}
+	return img, true
 }
 
 // snapshotBase reports the base an external disk-only snapshot of d's VM
@@ -386,19 +420,36 @@ func (c *diskChain) legacyPoolBase(layer, resolved string) bool {
 // the base must not be claimed by any other VM's disk row or another
 // project's replica record.
 func (c *diskChain) snapshotBase(layer, resolved string) bool {
+	if c.snapshotBaseOf(layer, resolved, c.self, c.d.VMName, c.project) {
+		return true
+	}
+	// Under a linked clone, its source disk's own snapshot bases.
+	if r, ok := c.recorded[layer]; ok {
+		if project := c.projectOf(r.VMName); project != "" &&
+			c.snapshotBaseOf(layer, resolved, resolvedOr(c.s.hostDiskFile(r.Path)), r.VMName, project) {
+			c.recorded[resolved] = r
+			return true
+		}
+	}
+	return false
+}
+
+// snapshotBaseOf is snapshotBase for the disk whose file is self, of VM vm
+// in project.
+func (c *diskChain) snapshotBaseOf(layer, resolved, self, vm, project string) bool {
 	if filepath.Dir(layer) != filepath.Dir(resolved) || layer == resolved {
 		return false
 	}
 	stem := func(p string) string { b := filepath.Base(p); return strings.TrimSuffix(b, filepath.Ext(b)) }
-	if stem(layer) != stem(c.self) || stem(resolved) != stem(c.self) {
+	if stem(layer) != stem(self) || stem(resolved) != stem(self) {
 		return false
 	}
 	for _, r := range c.rowsAt(resolved) {
-		if r.VMName != c.d.VMName {
+		if r.VMName != vm {
 			return false
 		}
 	}
-	if rec, ok := replicaRecordFor(resolved); ok && tenancy.NormalizeProject(rec.Project) != c.project {
+	if rec, ok := replicaRecordFor(resolved); ok && tenancy.NormalizeProject(rec.Project) != project {
 		return false
 	}
 	return true

@@ -107,14 +107,17 @@ VM was created:
   answering, on a hard mount). The daemon's own NFS mount directories are
   never read for this. A directory on a network filesystem other than the
   one the ISO's directory is on is told apart by `/proc/self/mountinfo`
-  without being read (unless a link above its mount point leads elsewhere),
-  so another project's dead NFS server does not stop this VM. Any other
+  without being read, when it is that filesystem's mount point or the mount
+  is `nosymfollow` (and no link above the mount point leads elsewhere), so
+  another project's dead NFS server does not stop this VM. Any other
   directory is read under a 3-second deadline, one read per directory at a
   time; one that does not answer, or answers with an error other than "no
   such directory", refuses the start (or create, or move) saying which pool
-  did not answer. Until a read that timed out returns, the next question
-  about that directory is answered at once, so a dead directory holds one
-  blocked thread, not one per start.
+  did not answer. A read that blocks holds a thread until the filesystem
+  answers, so they are bounded: once a read on a network mount has timed
+  out, every new read on that mount is refused at once until it returns, and
+  no more than 64 reads wait at a time on the whole host — past that a read
+  is refused at once, saying so.
 - Each time a host judges the ISO by that full rule and it passes — at the
   create, at a start, as a migration target — the host records which file it
   was (in `<data_dir>/iso-identity`, by the VM's uuid and project: resolved
@@ -128,9 +131,10 @@ VM was created:
   the source sends the sha256 of the file it judged for the VM, and the
   target admits a file with those very bytes (the guest gets what it already
   had) and records it; any other file there is refused. The hash is computed
-  once per file version (device, inode, size, mtime). A VM that arrives
-  without a source to ask (a failover) is judged by the full rule until
-  per-file ownership comes with the storage pools change. A host's records
+  once per file version (device, inode, size, mtime). A VM restored from a
+  backup, or failed over, is defined without its installer CD-ROM (as before
+  this release: only a create attaches one), so it starts whatever another
+  project's pools map. A host's records
   go when the VM is deleted or its create fails, and a sweep every five
   minutes removes those of VMs that no longer exist. No pool may be created
   in `<data_dir>/iso-identity`.
@@ -141,7 +145,10 @@ VM was created:
   library in another directory, is followed there — judges it, and returns
   it, and the source hands libvirt a destination definition whose CD-ROM is
   that file. A target where it does not resolve, or where the file it
-  resolves to is refused, refuses the move. A **stopped** VM may move to a host that does not
+  resolves to is refused, refuses the move. A target on an older release
+  judges nothing and returns nothing; the source then hands it the path the
+  VM was given (an Admin's link), which its qemu follows there, as before.
+  A **stopped** VM may move to a host that does not
   have its ISO or library yet: the move is accepted with a warning, and the VM
   will not start there until the ISO is present (upload or pull it, or wait for
   the library to sync); the warning is logged and recorded as a VM event
@@ -305,10 +312,14 @@ Under `/home` and `/run` (`/var/run`) — where an ISO downloaded into a home
 directory, or a USB stick udisks mounts under `/run/media`, lives next to
 `~/.ssh` and runtime secrets — a file is given to a guest only when it is an
 optical disc image: a regular file carrying an ISO 9660 or UDF volume
-signature (read from the opened file, not judged by its name), with no path
-component, as named or as resolved, starting with a dot. So
-`/home/u/isos/virtio-win.iso` and `/run/media/u/STICK/win11.iso` work, and
-`~/.ssh/id_rsa`, a key renamed `.iso`, or an ISO inside `~/.cache` do not.
+signature (read from the opened file, not judged by its name), not reached
+through a link into a dot-directory the path does not name itself. So
+`/home/u/isos/virtio-win.iso`, `/run/media/u/STICK/win11.iso` and libvirt's
+session pool `~/.local/share/libvirt/images/x.iso` work, and `~/.ssh/id_rsa`,
+a key renamed `.iso`, or `~/isos/x.iso` linking into `~/.ssh` do not. The rule
+keeps keys and tokens out, not secrets packaged as ISOs: a cloud-init seed or
+an `autounattend` ISO in a home directory is a file the Admin names on
+purpose.
 
 A refusal at start fails with `FailedPrecondition` and an ERROR log naming the
 VM and the file, and the VM stays down. What is judged is the CD-ROM the VM's
@@ -324,7 +335,9 @@ the file against its own filesystem.
 ### Known limits
 
 - **qemu reopens the path.** The last check opens the file without following a
-  link, then closes it; qemu opens the path again when the VM starts. In a
+  link, then closes it; qemu opens the path again when the VM starts (and a
+  memory snapshot's revert reopens the file its saved image names, which is
+  judged the same way first). In a
   local library only the daemon (root) writes, so nothing else can swap the
   file in between. A library on NFS needs the pool mounted `nosymfollow`
   (the hardened-mount rule for directory pools on NFS), or the NFS server can
@@ -340,9 +353,15 @@ the file against its own filesystem.
   content checks in [auth.md](auth.md)).
 - **VMs created before `iso_scope`** with an absolute path are judged as the
   file they name on every host, as before.
-- **A memory snapshot's restore** reopens the CD-ROM path its saved image
-  holds. For a snapshot taken on this release that is the resolved file the
-  start judged; for one taken before, it may be the link the VM was given.
+- **A file the directory's owner can replace.** The checks judge the file
+  they open; libvirt (which relabels the file for qemu) and qemu then open
+  the path again. Whoever owns the directory — a local user under `/home`,
+  say — can swap the name for a link to another file in between, and that
+  start then gets whatever it names, past the refused places, as with any
+  path before these checks. A library directory only the daemon writes, and
+  `/run/media` on vfat or exfat (no links), are not exposed. Handing qemu the
+  judged file itself (libvirt's fd passing) is the fix that removes the
+  window.
 - **A live migration from an older source** carries the source's domain as
   it is: the target judges what it would open, and refuses a pool ISO it
   cannot resolve there.

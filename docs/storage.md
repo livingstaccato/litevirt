@@ -752,6 +752,14 @@ file.
 The entry node checks authority before forwarding; the owning host resolves
 the file against its own filesystem.
 
+`lv rebuild <vm>` and a recreate-class rolling update create the VM again
+from its spec, and keep its installer ISO as it was classified at its create:
+a host path (an Admin's, or one stored before `iso_scope`) stays one, judged
+on the host as at every start, whoever runs the rebuild; a pool ISO is judged
+again as its recorded kind. Anything the new create would refuse that the
+teardown does not change — the ISO included — is refused first, and the VM is
+left as it was.
+
 ### Known limits
 
 - **qemu reopens the path.** The last check opens the file without following a

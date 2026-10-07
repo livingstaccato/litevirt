@@ -80,6 +80,27 @@ func (s *Server) authorizeVMISO(ctx context.Context, project, host string, spec 
 	if iso == "" {
 		return nil
 	}
+	// A VM re-created (rebuilt, or recreated by a rolling update) keeps the
+	// ISO it has, as it was classified (recreateISOGrant): a host path stays
+	// one — the owner judges the file in full at the create, as at every
+	// start (resolveVMISO) — and a pool ISO is judged again as its recorded
+	// kind.
+	if g, ok := recreateISOGrantFor(ctx, iso, project); ok {
+		if g.hostPath() {
+			if filepath.Clean(iso) != iso {
+				return status.Errorf(codes.InvalidArgument,
+					"iso %q must be an absolute, clean path on the target host", iso)
+			}
+			if err := storage.CheckReadPathLexical(iso, s.dataDir, s.pkiDir); err != nil {
+				return status.Errorf(codes.InvalidArgument, "iso: %v", err)
+			}
+			spec.IsoScope = g.scope
+			return nil
+		}
+		if trusted == "" {
+			trusted = g.scope
+		}
+	}
 	poolScope := func(pool, file string) error {
 		kind, err := s.authorizeISORef(ctx, project, host, pool, file)
 		if err != nil {

@@ -281,7 +281,11 @@ func (s *Server) resolveISOForVM(ctx context.Context, project, scope, pool, file
 	}
 	path := filepath.Join(dir, file)
 	if _, err := os.Lstat(path); os.IsNotExist(err) {
-		return "", isoAbsent(status.Errorf(codes.FailedPrecondition, "iso %s/%s: there is no such file on this host (%s)", pool, file, s.hostName))
+		up, ok := s.isoPoolUpload(ctx, project, pool, dir, file)
+		if !ok {
+			return "", isoAbsent(status.Errorf(codes.FailedPrecondition, "iso %s/%s: there is no such file on this host (%s)", pool, file, s.hostName))
+		}
+		path = up
 	}
 	if err := s.checkVMISOFile(path); err != nil {
 		return "", err
@@ -349,6 +353,23 @@ func (s *Server) isoFileOwnershipAllows(ctx context.Context, project, pool, file
 	}
 	s.recordISOIdentity(key, tenancy.NormalizeProject(project), path)
 	return nil
+}
+
+// isoPoolUpload is the file a reference names in a pool on <data_dir>/disks
+// (an older cluster's default pool) when it is not in the directory itself: a
+// user's upload there lands in disks/uploads, out of the VM disks' namespace
+// (poolUploadDir). It is the pool's file only by the pools' per-file
+// ownership records (isoFileOwnedByPool), never by its place: disks/uploads
+// is every pool on disks/'s upload directory.
+func (s *Server) isoPoolUpload(ctx context.Context, project, pool, dir, file string) (string, bool) {
+	if !storage.IsDataDirDisks(dir, s.dataDir) {
+		return "", false
+	}
+	up := filepath.Join(s.poolUploadDir(dir), file)
+	if _, err := os.Lstat(up); err != nil {
+		return "", false
+	}
+	return up, s.isoFileOwnedByPool(ctx, project, pool, up)
 }
 
 // isoFileOwnedByPool reports whether the pools' per-file ownership records

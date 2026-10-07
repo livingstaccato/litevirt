@@ -707,8 +707,9 @@ for the UI's Browse dialog, and a sync pass gives up on it the same way.
 
 Some files are refused to everyone, Admin included, judged as written and after
 resolving symlinks: the PKI directory, anything in the data directory outside
-`pools/` and `mounts/` (`state.db`, `disks/`, `cloudinit/`, `nvram/`, …; the
-global library `pools/isos/` is under `pools/`), and anything under `/boot`,
+`pools/`, `mounts/` and `disks/uploads/` (`state.db`, the VM disks in
+`disks/`, `cloudinit/`, `nvram/`, …; the global library `pools/isos/` is under
+`pools/`), and anything under `/boot`,
 `/dev`, `/etc`, `/proc`, `/root`, `/sys`, `/var/backups`, `/var/spool`,
 `/var/lib/lxc`, `/var/lib/libvirt/qemu` or `/var/lib/libvirt/swtpm`. `/usr` is
 allowed (`virtio-win` installs there).

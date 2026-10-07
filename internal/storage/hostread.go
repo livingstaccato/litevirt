@@ -62,9 +62,9 @@ const ISOLibraryDir = "pools/isos"
 // CheckReadFile refuses a host file no VM may be given to read: a relative or
 // unclean path (one that still carries a "." or ".." to resolve), anything
 // under a secret system directory, anything in or below the daemon's PKI
-// directory, and anything in its data directory outside pools/ and mounts/
-// (state.db, cloudinit/, nvram/, imports/, images/ …; the global ISO library,
-// pools/isos/, is under pools/). Under a user-data root (/home, /run) only an
+// directory, and anything in its data directory outside pools/, mounts/ and
+// disks/uploads/ (state.db, cloudinit/, nvram/, imports/, images/, the VM
+// disks in disks/ …; the global ISO library, pools/isos/, is under pools/). Under a user-data root (/home, /run) only an
 // optical disc image passes, and not one a link reaches through a
 // dot-directory the named path does not name (userDataRoots). The path is
 // judged as written and after resolving symlinks, so a link at an innocent
@@ -277,10 +277,22 @@ func refuseSecretPath(p, cand, dataDir, pkiDir string) error {
 	}
 	if dataDir != "" {
 		for _, d := range pathForms(dataDir) {
-			if within(d, cand) && !inPoolArea(d, cand) {
-				return fmt.Errorf("%q is inside the daemon's data directory %s; only its pools/ and mounts/ hold pool content", p, dataDir)
+			if within(d, cand) && !inPoolArea(d, cand) && !inDiskUploads(d, cand) {
+				return fmt.Errorf("%q is inside the daemon's data directory %s; only its pools/, mounts/ and disks/uploads/ hold pool content", p, dataDir)
 			}
 		}
 	}
 	return nil
+}
+
+// DataDirDiskUploads is where users' uploads into a pool on <data_dir>/disks
+// land (an older cluster's default pool): out of the VM disks' namespace, and
+// readable pool content like pools/ — whose file it is, the caller decides by
+// its upload record.
+const DataDirDiskUploads = "disks/uploads"
+
+// inDiskUploads reports whether p is strictly inside <dataDir>/disks/uploads.
+func inDiskUploads(dataDir, p string) bool {
+	up := filepath.Join(dataDir, DataDirDiskUploads)
+	return within(up, p) && filepath.Clean(p) != up
 }

@@ -528,3 +528,18 @@ func (s *Server) pinBackupBase(id *pbsstore.BaseIdentity) error {
 	}
 	return s.imageStore().Pin(id.Path)
 }
+
+// pinBackupBaseOrWarn pins the backup's base (pinBackupBase). A pin that
+// cannot be written never fails the backup — the backup is still whole —
+// but the base is then unprotected from a prune, so it is said loudly: a
+// WARN log, a warning in the backup's progress, and a VM event.
+func (s *Server) pinBackupBaseOrWarn(ctx context.Context, vm string, id *pbsstore.BaseIdentity, send func(*pb.BackupSnapshotProgress) error) {
+	err := s.pinBackupBase(id)
+	if err == nil {
+		return
+	}
+	msg := fmt.Sprintf("warning: could not pin the base %s this backup was taken on (%v); a prune of the image's unused versions on this host may remove it, and a restore of this backup would then have no base", id.Path, err)
+	slog.Warn("backup: pinning the base the backup is taken on failed", "vm", vm, "base", id.Path, "error", err)
+	_ = send(&pb.BackupSnapshotProgress{Phase: pb.BackupSnapshotProgress_SNAPSHOT, Status: msg})
+	s.recordVMEvent(ctx, vm, "backup.base_unpinned", "warning", msg)
+}

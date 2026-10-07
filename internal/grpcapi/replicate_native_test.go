@@ -106,7 +106,7 @@ func TestReplicateVolume_NativeZFSWorksIntoAFreshDataset(t *testing.T) {
 		}
 		if strings.HasPrefix(c, "zfs set") {
 			set++
-			if !strings.HasPrefix(c, "zfs set -- litevirt:") || !strings.HasSuffix(c, " "+dst) {
+			if !strings.HasPrefix(c, "zfs set litevirt:") || !strings.HasSuffix(c, " "+dst) {
 				t.Errorf("record argv %q", c)
 			}
 		}

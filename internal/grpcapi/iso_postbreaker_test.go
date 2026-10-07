@@ -77,7 +77,14 @@ func TestISOPostBreaker_ReadBudgetsAreNotShared(t *testing.T) {
 	var mu sync.Mutex
 	calls := map[string]int{}
 	origP, origM, origT := isoDirProbe, isoMountInfo, isoDirProbeTimeout
-	t.Cleanup(func() { close(block); isoDirProbe, isoMountInfo, isoDirProbeTimeout = origP, origM, origT })
+	// Every burst's reads are let go and waited for before the seams are put
+	// back: a read still in flight reads them.
+	var reads sync.WaitGroup
+	t.Cleanup(func() {
+		close(block)
+		reads.Wait()
+		isoDirProbe, isoMountInfo, isoDirProbeTimeout = origP, origM, origT
+	})
 	isoDirProbeTimeout = 2 * time.Second // the whole burst runs inside it
 	var mounts []mountEntry
 	for i := 0; i < 40; i++ {
@@ -102,13 +109,11 @@ func TestISOPostBreaker_ReadBudgetsAreNotShared(t *testing.T) {
 		return n
 	}
 	burst := func(ctx context.Context, n int, dir func(i int) string) {
-		var wg sync.WaitGroup
 		for i := 0; i < n; i++ {
-			wg.Add(1)
-			go func(i int) { defer wg.Done(); _, _ = probeDirCtx(ctx, dir(i)) }(i)
+			reads.Add(1)
+			go func(i int) { defer reads.Done(); _, _ = probeDirCtx(ctx, dir(i)) }(i)
 		}
 		time.Sleep(200 * time.Millisecond) // every read has started or been refused
-		_ = wg.Wait
 	}
 	b := withReadProject(context.Background(), "b")
 

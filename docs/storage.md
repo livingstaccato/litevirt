@@ -357,7 +357,16 @@ Deleting a VM sweeps its leftover `<vm>-<disk>.qcow2` files from
 A replication run's replicas (`<vm>-<disk>-<time>.qcow2`) were never among
 what the sweep removes: they are kept when their VM is deleted. Remove them
 with a delete of the pool content (the VM's project's operators, or an admin)
-once the VM is gone.
+once the VM is gone. That holds for a replica in the pool's replica area too
+(`<pool>/.replicas/<owner>/<disk>-<time>.<ext>`): a listing shows it, under
+its file name with the VM beside it (`replica_vm`), to whoever reads the VM —
+a deleted VM's too, whose tombstone still says whose it was — and a delete of
+that name removes the file and its record. When replicas of several VMs share
+the name (one schedule's fan-out run writes them at one time), the delete
+names the VM as well (`replica_vm` on `DeleteStoragePoolContent`) and is
+refused without it. Only the VM's project's readers (holding
+`storage.content.write` on the pool) or an admin delete one, and never one a
+disk on any host uses (a `--no-localize` promotion's backing).
 
 A user's upload into a pool on `<data_dir>/disks` lands in
 `<data_dir>/disks/uploads/` and is listed with the pool's other content: the VM
@@ -365,7 +374,8 @@ disks' own names (`<vm>-<disk>.qcow2`) are never taken by an upload, so
 creating, deleting or migrating a VM never meets one, and the VM-disk debris
 sweep never removes a recorded upload. A name in both directories is the
 upload, to the listing and to a delete alike. Replicas are not uploads in this
-sense: they land in `<data_dir>/disks` itself, where promotion reads them.
+sense: replication runs write them into the pool's replica area, and older
+replicas stay in `<data_dir>/disks` itself, where promotion reads them too.
 Files uploaded there by an older build stay where they are.
 
 Installer media — an `.iso`, plain or compressed (`.iso.gz`, `.iso.xz`,

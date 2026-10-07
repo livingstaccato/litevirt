@@ -19236,10 +19236,15 @@ func (x *PushReplicaResponse) GetSizeBytes() int64 {
 // VM disk on any host uses is refused. (Replicas are pruned with the
 // peer-only PruneReplicas, by record, not through this.)
 type DeleteStoragePoolContentRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	PoolName      string                 `protobuf:"bytes,1,opt,name=pool_name,json=poolName,proto3" json:"pool_name,omitempty"`
-	Host          string                 `protobuf:"bytes,2,opt,name=host,proto3" json:"host,omitempty"` // optional — defaults to caller's host
-	Filename      string                 `protobuf:"bytes,3,opt,name=filename,proto3" json:"filename,omitempty"`
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	PoolName string                 `protobuf:"bytes,1,opt,name=pool_name,json=poolName,proto3" json:"pool_name,omitempty"`
+	Host     string                 `protobuf:"bytes,2,opt,name=host,proto3" json:"host,omitempty"` // optional — defaults to caller's host
+	Filename string                 `protobuf:"bytes,3,opt,name=filename,proto3" json:"filename,omitempty"`
+	// A replica in the pool's replica area, as a listing shows it: the VM it
+	// is a replica of (StoragePoolContent.replica_vm). Optional while only one
+	// replica the caller may delete has that file name; needed when replicas
+	// of several VMs share it (one schedule's fan-out run).
+	ReplicaVm     string `protobuf:"bytes,4,opt,name=replica_vm,json=replicaVm,proto3" json:"replica_vm,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -19291,6 +19296,13 @@ func (x *DeleteStoragePoolContentRequest) GetHost() string {
 func (x *DeleteStoragePoolContentRequest) GetFilename() string {
 	if x != nil {
 		return x.Filename
+	}
+	return ""
+}
+
+func (x *DeleteStoragePoolContentRequest) GetReplicaVm() string {
+	if x != nil {
+		return x.ReplicaVm
 	}
 	return ""
 }
@@ -34998,11 +35010,13 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x13PushReplicaResponse\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x12\x1d\n" +
 	"\n" +
-	"size_bytes\x18\x02 \x01(\x03R\tsizeBytes\"n\n" +
+	"size_bytes\x18\x02 \x01(\x03R\tsizeBytes\"\x8d\x01\n" +
 	"\x1fDeleteStoragePoolContentRequest\x12\x1b\n" +
 	"\tpool_name\x18\x01 \x01(\tR\bpoolName\x12\x12\n" +
 	"\x04host\x18\x02 \x01(\tR\x04host\x12\x1a\n" +
-	"\bfilename\x18\x03 \x01(\tR\bfilename\"\xb4\x01\n" +
+	"\bfilename\x18\x03 \x01(\tR\bfilename\x12\x1d\n" +
+	"\n" +
+	"replica_vm\x18\x04 \x01(\tR\treplicaVm\"\xb4\x01\n" +
 	"\bISOEntry\x12\x10\n" +
 	"\x03ref\x18\x01 \x01(\tR\x03ref\x12\x12\n" +
 	"\x04pool\x18\x02 \x01(\tR\x04pool\x12\x18\n" +

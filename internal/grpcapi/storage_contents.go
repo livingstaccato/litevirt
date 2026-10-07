@@ -185,12 +185,18 @@ func (s *Server) poolContents(ctx context.Context, rec corrosion.StoragePoolReco
 }
 
 // appendReadableReplicas adds to a user's pool listing the replicas of every
-// VM the user may read (canReadVMRecord), each from its records in the pool's
-// replica area on host — never another project's, never a file by name.
+// VM the user may read (canReadVMRecord), live or deleted, each from its
+// records in the pool's replica area on host — never another project's, never
+// a file by name.
 func (s *Server) appendReadableReplicas(ctx context.Context, resp *pb.ListStoragePoolContentsResponse, pool, host string) {
 	vms, err := corrosion.ListVMs(ctx, s.db, "", "")
 	if err != nil {
 		return
+	}
+	// A deleted VM's replicas stay its project's (its tombstone says whose),
+	// listed so they can be found and deleted.
+	if gone, err := corrosion.ListDeletedVMs(ctx, s.db); err == nil {
+		vms = append(vms, gone...)
 	}
 	for i := range vms {
 		vm := &vms[i]
@@ -218,6 +224,11 @@ func (s *Server) DeleteStoragePoolContent(ctx context.Context, req *pb.DeleteSto
 	}
 	if err := safename.ValidateName(req.Filename); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "filename: %v", err)
+	}
+	if req.ReplicaVm != "" {
+		if err := safename.ValidateName(req.ReplicaVm); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "replica_vm: %v", err)
+		}
 	}
 	host := req.Host
 	if host == "" {
@@ -289,6 +300,19 @@ func (s *Server) DeleteStoragePoolContent(ctx context.Context, req *pb.DeleteSto
 			target = p
 		}
 	}
+	// A replica in the pool's replica area, as the listing shows it: named
+	// with its VM, or by a file name no file at the pool's top level has.
+	if req.ReplicaVm != "" || existing == "" {
+		if handled, err := s.deleteAreaReplica(ctx, dir, caller, req.Filename, req.ReplicaVm); handled || err != nil {
+			if err != nil {
+				return nil, err
+			}
+			return &emptypb.Empty{}, nil
+		}
+		if req.ReplicaVm != "" {
+			return nil, status.Errorf(codes.NotFound, "%q is not a replica of vm %q in pool %q", req.Filename, req.ReplicaVm, req.PoolName)
+		}
+	}
 	if target == "" {
 		target = existing
 	}
@@ -344,6 +368,97 @@ func (s *Server) DeleteStoragePoolContent(ctx context.Context, req *pb.DeleteSto
 		slog.Warn("pool content deleted but its upload record was not dropped", "pool", req.PoolName, "file", req.Filename, "error", err)
 	}
 	return &emptypb.Empty{}, nil
+}
+
+// deleteAreaReplica deletes the replica file of dir's replica area (of VM vm,
+// when named): a recorded replica — its record beside it, naming exactly this
+// file, in the owner directory its own project and VM hash to — that the
+// caller may delete. That is any, for an admin (storage.hostpath at the root)
+// or the daemon; for a user, a replica of a VM the user reads, in that VM's
+// project: its live row or, for a deleted VM, its tombstone — the same rule as
+// a replica at the pool's top level (poolFileConfinement.ownership). The RPC
+// has already required storage.content.write on the pool. Never a file a disk
+// on any host references. The record goes first, so a failure leaves an
+// unrecorded file nothing selects. handled is false when no recorded replica
+// in the area has that name: the request is then judged as before.
+func (s *Server) deleteAreaReplica(ctx context.Context, dir string, caller poolContentCaller, file, vm string) (bool, error) {
+	if caller.view == viewReplicas {
+		return false, nil // the daemon prunes through PruneReplicas
+	}
+	var mine []string
+	found := false
+	for _, p := range areaReplicasNamed(dir, file) {
+		r, ok := replicaRecordFor(p)
+		if !ok || (vm != "" && r.VM != vm) {
+			continue
+		}
+		found = true
+		if caller.view == viewAll || s.callerReadsReplicaVM(ctx, caller.ctx, r) {
+			mine = append(mine, p)
+		}
+	}
+	switch {
+	case !found:
+		return false, nil
+	case len(mine) == 0:
+		return true, status.Errorf(codes.NotFound, "%q is not in the pool", file)
+	case len(mine) > 1:
+		return true, status.Errorf(codes.FailedPrecondition,
+			"%q names replicas of more than one VM in the pool; name the VM (replica_vm, as the listing shows it)", file)
+	}
+	path := mine[0]
+	owners, err := s.diskReferencesAnyHost(ctx, path)
+	if err != nil {
+		return true, status.Errorf(codes.Internal, "check disk use: %v", err)
+	}
+	if len(owners) > 0 {
+		return true, status.Errorf(codes.FailedPrecondition,
+			"%q is in use by VM %q disk %q; it is not pool content to delete", file, owners[0].VMName, owners[0].DiskName)
+	}
+	if err := os.Remove(path + ".json"); err != nil && !os.IsNotExist(err) {
+		return true, status.Errorf(codes.Internal, "delete the replica's record: %v", err)
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return true, status.Errorf(codes.Internal, "delete: %v", err)
+	}
+	return true, nil
+}
+
+// areaReplicasNamed returns the files called file in the owner directories of
+// dir's replica area: real directories only (a symlink at the area or an
+// owner directory is never followed), and regular files only.
+func areaReplicasNamed(dir, file string) []string {
+	area := filepath.Join(dir, replicaAreaDir)
+	if fi, err := os.Lstat(area); err != nil || !fi.IsDir() {
+		return nil
+	}
+	ents, err := os.ReadDir(area)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, e := range ents {
+		if !e.IsDir() {
+			continue
+		}
+		p := filepath.Join(area, e.Name(), file)
+		if fi, err := os.Lstat(p); err == nil && fi.Mode().IsRegular() {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// callerReadsReplicaVM reports whether the user of uctx reads the VM r is a
+// replica of, and that VM — live, or its tombstone — is still r's project's: a
+// record made for an earlier VM of the same name in another project gives
+// this one's readers nothing.
+func (s *Server) callerReadsReplicaVM(ctx, uctx context.Context, r replicaRecord) bool {
+	vm, err := corrosion.GetVMIncludingDeleted(ctx, s.db, r.VM)
+	if err != nil || vm == nil || !sameProject(vm.Project, r.Project) {
+		return false
+	}
+	return s.RequirePerm(uctx, vmRBACPath(vm), "vm.read", "viewer") == nil
 }
 
 // UploadStoragePoolContent streams a file into a file-based pool. The first

@@ -253,3 +253,27 @@ func TestFinalPools_PoolDeleteForceAlwaysSucceeds(t *testing.T) {
 			poolGone(t, s, "dr2"), present(left), present(used), present(used+".json"))
 	}
 }
+
+// m1: the executor's "an admin may name any file" recheck is the operator's,
+// carried by the bearer the entry node relays — not the relaying node's host
+// certificate, which authenticates as admin.
+func TestFinalPools_RelayedNamedPromoteIsJudgedAsTheOperator(t *testing.T) {
+	f := newPoolFixture(t)
+	peer := bareEntryPeer(t, f.s)
+	relayed := forwardedAs(t, f.s, peer, "alice")
+	if f.s.namedReplicaAdmin(relayed) {
+		t.Fatalf("a promote relayed for alice (an operator of project a) is judged as an admin")
+	}
+	ctx := context.Background()
+	vm, _ := corrosion.GetVM(ctx, f.s.db, "web")
+	disks, _ := corrosion.GetVMDisks(ctx, f.s.db, "web")
+	err := f.s.doPromoteLocal(relayed, &pb.PromoteReplicaRequest{VmName: "web", Replica: bReplicaQcow, NewName: "stolen", NoLocalize: true},
+		vm, &disks[0], "dr", bReplicaQcow, false, func(*pb.PromoteReplicaProgress) error { return nil })
+	if status.Code(err) != codes.NotFound {
+		t.Errorf("a relayed named promote of project b's file for alice: got %v, want NotFound", err)
+	}
+	if rec, _ := corrosion.GetVM(ctx, f.s.db, "stolen"); rec != nil {
+		t.Errorf("a VM was promoted from project b's file: %+v", rec)
+	}
+	f.assertBIntact(t)
+}

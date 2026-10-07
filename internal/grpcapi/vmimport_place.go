@@ -65,6 +65,10 @@ func placementUnsupported(err error) bool {
 // act while it runs.
 var placeCopy = copySparse
 
+// placeRename is the rename copyIntoPlace puts its copy in place with; a
+// variable so a test can stand in a filesystem whose rename cannot replace.
+var placeRename = os.Rename
+
 // removeIfSame removes p only while it is still the file fi describes: a file
 // another flow put at the name meanwhile keeps it.
 func removeIfSame(p string, fi os.FileInfo) error {
@@ -141,33 +145,51 @@ func copyIntoPlace(ctx context.Context, src, dst string, w *importDiskWrites) er
 		return err
 	}
 	_ = os.Chtimes(temp, fi.ModTime(), fi.ModTime())
+	cur, err := os.Lstat(temp)
+	if err != nil || !os.SameFile(cur, tfi) {
+		w.discard(temp)
+		return fmt.Errorf("the copy at %s is no longer the file written; left in place", temp)
+	}
+	// Recorded for dst first (a durable write), so the moments between
+	// taking the name and putting the copy there hold no slow step.
+	w.willPlace(dst, cur)
 	// Take dst's name exclusively, then put the copy there.
 	hold, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, fi.Mode().Perm())
 	if err != nil {
+		w.discard(dst)
 		dropTemp()
 		return err
 	}
 	hfi, err := hold.Stat()
 	hold.Close()
 	if err != nil {
+		w.discard(dst)
 		dropTemp()
 		return err
 	}
-	cur, err := os.Lstat(temp)
-	if err != nil || !os.SameFile(cur, tfi) {
-		_ = removeIfSame(dst, hfi)
-		w.discard(temp)
-		return fmt.Errorf("the copy at %s is no longer the file written; left in place", temp)
-	}
-	w.willPlace(dst, cur)
 	if now, err := os.Lstat(dst); err != nil || !os.SameFile(now, hfi) {
+		w.discard(dst)
 		dropTemp()
 		return fmt.Errorf("%s was replaced while the copy took its name: %w", dst, os.ErrExist)
 	}
-	if err := os.Rename(temp, dst); err != nil {
-		_ = removeIfSame(dst, hfi)
-		dropTemp()
-		return err
+	if err := placeRename(temp, dst); err != nil {
+		// A filesystem whose rename cannot replace a file (SFTP without
+		// the OpenSSH extensions): free the name of the empty placeholder
+		// and rename once more. There that rename cannot replace a file
+		// either, which is what this path needs.
+		if ctx.Err() != nil || removeIfSame(dst, hfi) != nil {
+			w.discard(dst)
+			dropTemp()
+			return err
+		}
+		if err2 := placeRename(temp, dst); err2 != nil {
+			w.discard(dst)
+			dropTemp()
+			if errors.Is(err2, syscall.EEXIST) {
+				return fmt.Errorf("%v; %s appeared meanwhile: %w", err, dst, os.ErrExist)
+			}
+			return fmt.Errorf("%v; and onto the free name: %w", err, err2)
+		}
 	}
 	w.discard(temp)
 	// The copy is placed. Its source goes only while its name still holds

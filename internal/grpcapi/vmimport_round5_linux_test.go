@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -431,5 +432,33 @@ func TestImportLeftoverStatus_AnswersFromItsRecordOnly(t *testing.T) {
 	}
 	if _, err := s.ImportLeftoverStatus(peer, &pb.ImportLeftoverStatusRequest{Pool: "nope"}); status.Code(err) != codes.NotFound {
 		t.Errorf("an unknown pool: %v, want NotFound", err)
+	}
+}
+
+// N-C1. A filesystem whose rename cannot replace a file (sshfs against an
+// SFTP server without the OpenSSH extensions, which also has no link() and
+// so takes the copy path) still takes imports: the copy is renamed onto the
+// name once its empty placeholder is removed, a rename that there cannot
+// replace anything either.
+func TestImportVM_APoolWhoseRenameCannotReplaceTakesImports(t *testing.T) {
+	noLinkNoRenameNoReplace(t)
+	saved := placeRename
+	t.Cleanup(func() { placeRename = saved })
+	placeRename = func(o, n string) error {
+		if _, err := os.Lstat(n); err == nil {
+			return &os.LinkError{Op: "rename", Old: o, New: n, Err: syscall.EEXIST}
+		}
+		return saved(o, n)
+	}
+	s, dst := orphanFixture(t, "web")
+	if err := importAs(s, t, "web"); err != nil {
+		t.Fatalf("an import into a pool whose rename cannot replace: %v", err)
+	}
+	fi, err := os.Stat(dst)
+	if err != nil || fi.Size() == 0 {
+		t.Fatalf("the disk was not placed: %v %v", fi, err)
+	}
+	if left, _ := filepath.Glob(filepath.Join(filepath.Dir(dst), ".web-root.qcow2.place-*")); len(left) != 0 {
+		t.Fatalf("the copy's temp name is left: %v", left)
 	}
 }

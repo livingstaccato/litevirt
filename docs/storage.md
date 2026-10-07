@@ -402,47 +402,314 @@ authority checks above hold only once every node runs this release.
 
 ## Installer ISOs
 
-A VM's installer ISO (`VMSpec.iso`, the **Installer ISO** field of the UI's
-create form) is a file on the target host that the guest reads as a CD-ROM.
-Naming one is reading that file, so it is gated like any other host path:
+A VM's installer ISO is a file on the target host that the guest reads as a
+CD-ROM. A VM names it from an **ISO library**, by pool and file name, never by
+host path:
 
-- **A pool ISO** — a plain `.iso` file (no leading dot) directly in a
-  file-based pool's directory on the target host, which is what the content
-  browser lists and uploads. The caller needs `storage.content.read` on the
-  pool, and the VM's project must be allowed to use it (a global pool, or one
-  the project owns). A symlink in the pool directory is never pool content.
-- **Any other host path** needs `storage.hostpath` at `/`, which only the Admin
-  role holds. Upload the ISO to a pool instead.
+```yaml
+vms:
+  win-1:
+    iso: isos/virtio-win.iso        # the global library
+  build-1:
+    iso: acme-isos/debian-12.iso    # project acme's own library
+```
+
+The host resolves the reference to the file of that name directly in the
+pool's directory, when the VM is created and again at every start (restart
+policy, health restarts, a snapshot restore, a replace cutover, and a
+migration target before the VM lands there). The file must be a plain file:
+not a symlink, not a second hard link to some other file, and not anywhere
+`storage.CheckReadFile` refuses (below). The last check before the VM starts
+opens the file without following a link and confirms it is the same file at
+the same path; qemu then opens the path itself (see the known limits below). The daemon writes every file a library holds — an upload, a
+pull, a sync — so a link there is never one of them, and a library write never
+replaces a file already there (remove it first with `lv iso rm`).
+
+Pools are per host, and two hosts can each have a pool of the same name. So
+the authority is judged wherever the reference is resolved, not only where the
+VM was created:
+
+- The create records which kind of pool the ISO is in (`VMSpec.iso_scope`):
+  the global library, another pool with no project, or a pool the VM's project
+  owns (or, for an Admin's host path, that). On any host where the reference
+  resolves to a pool of another kind, the VM does not start there.
+- On every host, every pool mapping that directory must be global or the VM's
+  project's. Directories are compared as the file is opened — with symlinks
+  resolved, and by the directory's identity — so neither a pool whose target
+  is a link (or `/proc/self/root/…`) to another pool's directory nor a bind
+  mount of it gets past the check. The pool the reference names must be
+  global or the VM's project's on that host, file or no file: a same-named
+  pool of another project on the host a VM moved to is not its library.
+- Reading another pool's directory can block (an NFS server that stopped
+  answering, on a hard mount). The daemon's own NFS mount directories are
+  never read for this. A directory on a network filesystem other than the
+  one the ISO's directory is on is told apart by `/proc/self/mountinfo`
+  without being read, when it is that filesystem's mount point or the mount
+  is `nosymfollow` (and no link above the mount point leads elsewhere), so
+  another project's dead NFS server does not stop this VM. Any other
+  directory is read under a 3-second deadline, one read per directory at a
+  time; one that does not answer, or answers with an error other than "no
+  such directory", refuses the start (or create, or move) saying which pool
+  did not answer. A read that blocks holds a thread until the filesystem
+  answers, so they are bounded, and in shares no project can spend for
+  another: at most 4 reads at a time on one network mount (and none once one
+  there has timed out, until it returns), at most 16 for one project (or for
+  the daemon's own sync), at most 64 in all of which 16 are kept for
+  directories not on a network mount. Past a bound the read is refused at
+  once, saying which bound. A non-admin's absolute path whose directory is
+  not, as written, a pool's directory is refused before anything is read.
+- Each time a host judges the ISO by that full rule and it passes — at the
+  create, at a start, as a migration target — the host records which file it
+  was (in `<data_dir>/iso-identity`, by the VM's uuid and project: resolved
+  path, inode, size and mtime; not the device number, which a ZFS, btrfs, NFS
+  or LVM mount can renumber across a reboot). A later start of that unchanged
+  file on that host keeps working even if another project's pool has since
+  come to share the directory — another project's ordinary `lv pool create`
+  cannot stop a VM that started before, on the host it was created on or one
+  it moved to. A file put there since is judged by the full rule. On a VM's
+  first arrival by migration on a host where the directory is already shared,
+  the source sends the sha256 of the file it judged for the VM, and the
+  target admits a file with those very bytes (the guest gets what it already
+  had) and records it; any other file there is refused. The hash is computed
+  once per file version (device, inode, size, mtime). A VM restored from a
+  backup, or failed over, is defined without its installer CD-ROM (as before
+  this release: only a create attaches one), so it starts whatever another
+  project's pools map. A host's records
+  go when the VM is deleted or its create fails, and a sweep every five
+  minutes removes those of VMs that no longer exist. No pool may be created
+  in `<data_dir>/iso-identity`.
+- A **running** VM's live migration (`lv migrate`, or a drain) lands on the
+  target's own file: the target resolves the VM's ISO on its own filesystem
+  — through its pool, or an Admin's host path resolved there, so a
+  `virtio-win.iso` link that names another version on the target, or a
+  library in another directory, is followed there — judges it, and returns
+  it, and the source hands libvirt a destination definition whose CD-ROM is
+  that file. A target where it does not resolve, or where the file it
+  resolves to is refused, refuses the move. A target on an older release
+  judges nothing and returns nothing; the source then hands it the path the
+  VM was given (an Admin's link), which its qemu follows there, as before.
+  A stopped or cold move (`--cold`, every Secure Boot or vTPM VM, a drain of
+  a VM with a host-local disk) always ships an Admin's host-path ISO as the
+  path the VM was given: a target on this release resolves and judges it at
+  its start, and one on an older release follows the link, as before.
+  A **stopped** VM may move to a host that does not
+  have its ISO or library yet: the move is accepted with a warning, and the VM
+  will not start there until the ISO is present (upload or pull it, or wait for
+  the library to sync); the warning is logged and recorded as a VM event
+  (`vm.migrate.iso_warning`, in `lv events`). A stopped VM's domain is pointed
+  at the target's file when it starts. A target where the pool of that name is
+  another project's, or of another kind, refuses the move, file or no file.
+  The source lists the CD-ROMs of the running domain for a running VM, and a
+  migration whose running domain cannot be read stops.
+
+### The global library
+
+Every host has a pool named `isos` with no project, at `<data_dir>/pools/isos`,
+which the daemon creates when the host has none. Every project may boot from
+it. Only an Admin writes it (`storage.library.write` at `/`): an upload in the
+UI's Browse dialog or `lv iso pull` (below).
+
+The global library is not just any pool called `isos`. In sync mode it is the
+daemon's pool at `<data_dir>/pools/isos`; in shared mode it is the global
+`isos` pool the Admin put on shared storage — setting the mode to `shared` is
+the designation. Creating, replacing, retargeting or deleting a global `isos`
+pool needs `storage.hostpath` at `/` (Admin), not `storage.pool.write`. No
+other pool may be created in, above or below its directory, and an `isos` pool
+may not be put on a directory another pool maps.
+
+Where its files live is the cluster setting `iso_library_mode`, shown and
+changed with `lv cluster iso-library-mode`:
+
+- **`sync`**: every host keeps a local copy. An upload or pull
+  to one host records the file's sha256 in replicated state, and every other
+  host copies it from a host that has it and keeps it only if it hashes to
+  that record (every 30 seconds). A VM starts from a global-library ISO only
+  on a host whose copy matches; elsewhere the start fails with
+  `FailedPrecondition` until it has synced. `lv iso ls --host <h>` shows the
+  state of each file on `<h>`. Removing a file records the removal, and every
+  host removes its copy.
+- **`shared`**: the `isos` pool is on storage every host mounts, so every host
+  sees the same files and nothing is copied. Set it up by creating the pool
+  over the built-in one on every host, with the same export:
+  `lv pool create isos --driver nfs --source nas:/export/isos --option content=iso --host <h>`.
+
+With the setting never set, a cluster where some host already has an `isos`
+pool the daemon did not make (an NFS share, say) is in **`shared`** mode, so
+its files keep working as they are; any other cluster is in **`sync`** mode.
+An Admin's absolute host path (below) is never subject to the mode.
+
+Switching:
+
+- **to `shared`**: create the shared `isos` pool on every host (above), copy
+  the files you need into it, then run `lv cluster iso-library-mode shared`.
+- **to `sync`**: run `lv cluster iso-library-mode sync` against a host whose
+  library holds the files you want. Setting the mode starts a new generation
+  of library records: the earlier records, removals included, stop counting,
+  and every host records the ISOs its own library holds that the new
+  generation has no record of — the connected host at once, the others on
+  their next sync pass. So the records describe the files as they are. A file
+  two hosts hold under one name with different content ends up recorded as
+  whichever host's record replicates last (last writer wins), and every other
+  host's copy is then replaced by that one.
+
+Changing the mode needs the admin role and refuses until every host runs a
+release that knows it (`failover_scope_v1` latched). In sync mode an upload or
+pull to the global library is refused for the same reason until then.
+
+The records live in the replicated `cluster_policies` table, beside the
+failover scope:
+
+- `iso_library_mode` — the mode; its update time is the record generation.
+- `iso_library/<file>` — a file's sha256 and size, or its removal (a
+  tombstone, so a host that was down when the file was removed deletes its
+  copy rather than offering it back), stamped with its generation. A file
+  added again replaces its tombstone.
+- `iso_library_host/<host>` — the generation and the newest record a host has
+  applied.
+
+A tombstone every host holding the library has applied — that exact version,
+by each host's per-record ack — and every record of an earlier generation, is
+collected by the host that wrote it: it becomes an empty row (the table has no
+replicated delete, and adding one would be a new statement shape for every
+peer to decode). The key is read again just before, and left alone if it
+changed, so a file added again in the meantime keeps its record. The first
+time an Admin creates, replaces or deletes a global `isos` pool with no mode
+ever set, the mode in force is written first (pinned), so the change cannot
+flip it silently; a pin keeps the records made while the mode was implicit,
+so no start is refused meanwhile. Every sync pass also records the library
+files a host holds that have no current record (a tombstone is collected only
+once every host has removed the file, so such a file was added again).
+
+### Project libraries
+
+A project library is any file-based pool a project owns with the option
+`content=iso`:
+
+```bash
+lv pool create acme-isos --driver dir --target /srv/acme-isos --project acme --option content=iso
+```
+
+The project's operators upload to it (`storage.content.write`) and may pull
+into it from a URL, and only that project's VMs may boot from it, on any host.
+Only `.iso` files go into a library. A library whose directory another
+project's pool also maps lists nothing from it (the files may be that
+project's); give a library a directory of its own.
+
+A library on NFS relies on the pool being mounted `nosymfollow` (with
+`nodev,nosuid`), so the NFS server cannot answer the open with a link; see the
+hardened-mount rule for directory pools on NFS.
+
+### Filling a library
+
+- **Upload**: the UI's Browse dialog, or `UploadStoragePoolContent`.
+- **From a URL**: `lv iso pull isos/debian-12.iso --url https://… --checksum <sha256>`,
+  under the image-pull limits (http/https only, the redirect checks,
+  `max_image_bytes`, `image_pull_timeout_sec` and the
+  `image_pull_blocked_cidrs` policy).
+- **From a host path** (Admin, `storage.hostpath` at `/`, since it reads that
+  file): `lv iso pull isos/virtio-win.iso --from-host-path /usr/share/virtio-win/virtio-win.iso`.
+  The file is copied, never linked, so naming a symlink is fine; the source is
+  judged like any file a guest could be given.
+
+`lv iso ls` lists what a caller may name on a host: its projects' libraries
+first, then the global library. A library whose directory does not answer
+within the 3-second deadline (a dead NFS server) is listed as `<pool>/` with
+the state `unavailable`, rather than holding the listing up; the same goes
+for the UI's Browse dialog, and a sync pass gives up on it the same way.
+`lv iso rm <pool>/<file>.iso` removes one.
+
+### Host paths and earlier specs
+
+- An **Admin** may still name an absolute host path (`storage.hostpath` at
+  `/`). It may be a link or pass through one — virtio-win ships
+  `/usr/share/virtio-win/virtio-win.iso` as a link to a versioned file, and
+  `/var/lib/libvirt/images` is often a link to a data disk. The path is
+  resolved once, at create and again at every start, the file it names is
+  judged (not in a refused place, as named or as resolved; a regular file; no
+  link left in the resolved path), and the domain is given the resolved file,
+  so qemu never follows a link. The spec keeps the path as named, so an
+  updated package's new versioned file is picked up at the next start. A hard
+  link is accepted where `fs.protected_hardlinks=1` (the kernel then stops a
+  user linking a file they do not own; systemd's sysctl defaults set it, the
+  kernel's own default is 0, so check it on hosts without systemd, such as
+  Alpine), and refused, saying so, where it is 0.
+- A **non-admin** may not. An absolute path that names a `.iso` directly in a
+  pool directory — what earlier specs stored — is taken as that pool's
+  reference, provided the caller may read the pool and the VM's project may
+  use it (every pool sharing that directory included). It is stored as
+  written and resolved through its pool, with the same per-host checks as a
+  reference, the library record included. A VM created before `iso_scope` was
+  recorded is treated as a host path (above), as it was before: it keeps
+  starting, links and all.
+- A reference may also name a pool that is not a library (a global pool, or
+  one the VM's project owns), as earlier pool paths could; it is not listed by
+  `lv iso ls`, and the same checks apply.
 
 Some files are refused to everyone, Admin included, judged as written and after
 resolving symlinks: the PKI directory, anything in the data directory outside
-`pools/` and `mounts/` (`state.db`, `disks/`, `cloudinit/`, `nvram/`, …), and anything
-under `/boot`, `/dev`, `/etc`, `/home`, `/proc`, `/root`, `/run`, `/sys`,
-`/var/backups`, `/var/run`, `/var/spool`, `/var/lib/lxc`,
-`/var/lib/libvirt/qemu` or `/var/lib/libvirt/swtpm`. `/usr` is allowed
-(`virtio-win` installs there).
+`pools/` and `mounts/` (`state.db`, `disks/`, `cloudinit/`, `nvram/`, …; the
+global library `pools/isos/` is under `pools/`), and anything under `/boot`,
+`/dev`, `/etc`, `/proc`, `/root`, `/sys`, `/var/backups`, `/var/spool`,
+`/var/lib/lxc`, `/var/lib/libvirt/qemu` or `/var/lib/libvirt/swtpm`. `/usr` is
+allowed (`virtio-win` installs there).
 
-The ISO must be the file itself: an absolute, clean path (no `.` or `..`) with
-no symlink anywhere along it, naming a regular file with a single hard link.
-Name the real file rather than a link to it (`virtio-win.iso` is often a link
-to a versioned file).
+Under `/home` and `/run` (`/var/run`) — where an ISO downloaded into a home
+directory, or a USB stick udisks mounts under `/run/media`, lives next to
+`~/.ssh` and runtime secrets — a file is given to a guest only when it is an
+optical disc image: a regular file carrying an ISO 9660 or UDF volume
+signature (read from the opened file, not judged by its name), not reached
+through a link into a dot-directory the path does not name itself. So
+`/home/u/isos/virtio-win.iso`, `/run/media/u/STICK/win11.iso` and libvirt's
+session pool `~/.local/share/libvirt/images/x.iso` work, and `~/.ssh/id_rsa`,
+a key renamed `.iso`, or `~/isos/x.iso` linking into `~/.ssh` do not. The rule
+keeps keys and tokens out, not secrets packaged as ISOs: a cloud-init seed or
+an `autounattend` ISO in a home directory is a file the Admin names on
+purpose.
 
-The entry node checks authority before forwarding; the owning host checks the
-file against its own filesystem. An entry node on an older build forwards
-without the authority check, and an owner on an older build has no
-filesystem check, so the pool route is only as strong as the oldest host
-involved until every host runs this build (as with the other content checks
-in [auth.md](auth.md)).
-
-qemu opens the ISO again at every start, so the host judges it again each
-time it hands the file to qemu: every start (restart policy and health
-restarts included), a snapshot restore, a replace cutover, and a migration
-target before the VM lands there. What is judged is the CD-ROM the VM's
+A refusal at start fails with `FailedPrecondition` and an ERROR log naming the
+VM and the file, and the VM stays down. What is judged is the CD-ROM the VM's
 domain actually carries, so a VM whose domain was redefined without its
-installer CD-ROM starts even after the ISO is gone. A refusal fails with
-`FailedPrecondition` and an ERROR log naming the VM and the file, and the VM
-stays down; nothing is rewritten. Replace the file with a plain `.iso`, or
-recreate the VM without it.
+installer CD-ROM starts even after the ISO is gone. When a library file lives
+at a different path on the starting host than where the domain was defined
+(a library pool on another directory), the domain is pointed at this host's
+file.
+
+The entry node checks authority before forwarding; the owning host resolves
+the file against its own filesystem.
+
+### Known limits
+
+- **qemu reopens the path.** The last check opens the file without following a
+  link, then closes it; qemu opens the path again when the VM starts (and a
+  memory snapshot's revert reopens the file its saved image names, which is
+  judged the same way first). In a
+  local library only the daemon (root) writes, so nothing else can swap the
+  file in between. A library on NFS needs the pool mounted `nosymfollow`
+  (the hardened-mount rule for directory pools on NFS), or the NFS server can
+  answer qemu's lookup with a link.
+- **Mixed versions fail open, as before this release.** Until every host runs
+  this build: an entry node on an older build forwards without the authority
+  check (a non-admin's absolute path then arrives as the peer's and is
+  recorded as a host path); an older migration target ignores the CD-ROM paths
+  the source lists and judges nothing, and an older source lists none, so the
+  target skips the running-VM path check; an older owner rewriting a spec
+  drops `iso_scope`, which makes the VM's ISO a legacy, file-only one. None of
+  these is weaker than a release without these checks (as with the other
+  content checks in [auth.md](auth.md)).
+- **VMs created before `iso_scope`** with an absolute path are judged as the
+  file they name on every host, as before.
+- **A file the directory's owner can replace.** The checks judge the file
+  they open; libvirt (which relabels the file for qemu) and qemu then open
+  the path again. Whoever owns the directory — a local user under `/home`,
+  say — can swap the name for a link to another file in between, and that
+  start then gets whatever it names, past the refused places, as with any
+  path before these checks. A library directory only the daemon writes, and
+  `/run/media` on vfat or exfat (no links), are not exposed. Handing qemu the
+  judged file itself (libvirt's fd passing) is the fix that removes the
+  window.
+- **A live migration from an older source** carries the source's domain as
+  it is: the target judges what it would open, and refuses a pool ISO it
+  cannot resolve there.
 
 ## Compose example
 

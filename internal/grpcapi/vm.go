@@ -85,6 +85,11 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	if err != nil {
 		return nil, err
 	}
+	// iso_scope is server-owned: a client's is dropped, and only a forwarded
+	// leg (a peer) carries the entry node's classification to the owner.
+	if sc := req.GetSpec().GetIsoScope(); sc != "" && s.requirePeerCert(ctx) == nil {
+		spec.IsoScope = sc
+	}
 	req = proto.Clone(req).(*pb.CreateVMRequest)
 	req.Spec = spec
 	if spec.Name == "" {
@@ -303,11 +308,10 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		}
 	}
 	// Installer ISO: the guest reads it, so naming it is reading that host file.
-	// Gated here, after placement, because a pool ISO is judged against the
-	// SELECTED host's pools; it runs on the entry node (as the user) and again
-	// on the owner (see authorizeVMISO).
-	isoInPool, err := s.authorizeVMISO(ctx, project, targetHost, spec.Iso)
-	if err != nil {
+	// Gated here, after placement, because a library reference is judged
+	// against the SELECTED host's pools; it runs on the entry node (as the
+	// user) and again on the owner (see authorizeVMISO).
+	if err := s.authorizeVMISO(ctx, project, targetHost, spec); err != nil {
 		return nil, err
 	}
 	if targetHost != s.hostName {
@@ -317,8 +321,24 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		}
 		return s.forwardCreateVM(ctx, req, targetHost)
 	}
-	// The owner's own filesystem decides what the ISO path really is.
-	if err := s.checkVMISOFile(spec.Iso, isoInPool); err != nil {
+	// Stable domain identity (G1): persisted in the spec so libvirt's default
+	// swtpm path (/var/lib/libvirt/swtpm/<uuid>/) is deterministic across the VM's
+	// life — letting vTPM state be located + carried without an explicit <source>.
+	// UUID is SERVER-OWNED on create: always mint fresh, ignoring any caller-
+	// supplied value, so a client can't bind a new VM to existing swtpm state.
+	// Restore/migrate set the preserved UUID via their own record-building paths.
+	// Minted before the ISO is resolved, so the host's ISO identity record is
+	// keyed by it (never by the name, which a deleted namesake may have used),
+	// and removed again if the create fails.
+	spec.Uuid = uuid.NewString()
+	defer func() {
+		if retErr != nil {
+			s.forgetISOIdentity(isoIdentityKey(spec.Name, spec))
+		}
+	}()
+	// The owner's own filesystem decides which file the ISO is.
+	isoPath, err := s.resolveVMISO(ctx, project, spec)
+	if err != nil {
 		return nil, err
 	}
 
@@ -345,13 +365,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 
 	slog.Info("creating VM", "name", spec.Name, "image", spec.Image, "cpu", spec.Cpu, "memory", spec.MemoryMib)
 
-	// Stable domain identity (G1): persisted in the spec so libvirt's default
-	// swtpm path (/var/lib/libvirt/swtpm/<uuid>/) is deterministic across the VM's
-	// life — letting vTPM state be located + carried without an explicit <source>.
-	// UUID is SERVER-OWNED on create: always mint fresh, ignoring any caller-
-	// supplied value, so a client can't bind a new VM to existing swtpm state.
-	// Restore/migrate set the preserved UUID via their own record-building paths.
-	spec.Uuid = uuid.NewString()
+	// (spec.Uuid was minted above, before the ISO was resolved.)
 	// (Cpu/MemoryMib were defaulted before admission — see normalizeVMSpecResources.)
 
 	// Prepare disks — track created paths for cleanup on failure.
@@ -504,12 +518,13 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 
 	// Installer ISO: attach as a read-only CDROM and boot from it by default so
 	// the guest can install an OS (xmlgen renders IsISO disks as <cdrom>). The
-	// path is on the target host. Persisted in the spec JSON, so it survives.
-	// authorizeVMISO and checkVMISOFile admitted it above.
+	// spec.Iso (a library reference, or an admin's host path) is persisted in
+	// the spec JSON; the domain carries the file it resolved to on this host,
+	// which authorizeVMISO and resolveVMISO admitted above.
 	if spec.Iso != "" {
 		diskConfigs = append(diskConfigs, lv.DiskConfig{
 			Name:  "installer",
-			Path:  spec.Iso,
+			Path:  isoPath,
 			IsISO: true,
 		})
 		if spec.Boot == "" {
@@ -862,9 +877,12 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 
 	// The ISO was judged before admission; an image pull can run in between,
 	// and qemu opens it at this boot, so it is judged again now.
-	if err := s.checkVMISOFile(spec.Iso, isoInPool); err != nil {
+	if again, err := s.resolveVMISO(ctx, project, spec); err != nil || again != isoPath {
 		claims.releaseAll(ctx)
 		cleanupDisks()
+		if err == nil {
+			err = status.Errorf(codes.FailedPrecondition, "iso %q now resolves to %s, not %s; retry the create", spec.Iso, again, isoPath)
+		}
 		return nil, err
 	}
 
@@ -2167,6 +2185,13 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// files that no longer exist. Returning keeps the delete retryable — the only
 	// destructive step so far is the stop above.
 	var undefErr error
+	defer func() {
+		// The host's record of the ISO file it judged for this VM goes with
+		// the VM, once its domain is gone.
+		if !s.virt.DomainExists(req.Name) {
+			s.forgetVMISOIdentity(req.Name, vm.Spec)
+		}
+	}()
 	if req.KeepDisks {
 		undefErr = s.virt.UndefineDomainPreservingState(req.Name)
 	} else if err := s.virt.UndefineDomain(req.Name, true); err != nil {
@@ -3149,6 +3174,8 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	// old name-keyed NVRAM + old-UUID swtpm tree would otherwise be orphaned (G1).
 	lv.WipeFirmwareState(s.dataDir, req.Name, spec.Uuid)
 	os.Remove(lv.CloudInitISOPath(s.dataDir, req.Name))
+	// The rebuilt VM gets a fresh uuid: the ISO record of the old one goes.
+	s.forgetVMISOIdentity(req.Name, vm.Spec)
 
 	// Tombstone old records (they'll be replaced by CreateVM). This must not be
 	// best-effort: the disks and firmware state are already gone above, and if

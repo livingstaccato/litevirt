@@ -49,6 +49,10 @@ type Server struct {
 	// SupersededDisks (superseded_disks.go).
 	supersededRetentionDays int
 
+	// isoLib holds the ISO library's per-host state: the sha256 cache of
+	// library files and the one-sync-pass-at-a-time lock (iso_library.go).
+	isoLib isoLibraryState
+
 	// Admission-gate local-inventory cache (see localInventoryCached).
 	invCacheMu sync.Mutex
 	invCache   runtimeInventory
@@ -288,6 +292,10 @@ type Server struct {
 	// (internal/pki InstallQemuMigrationTLS) and reports whether they are in
 	// place. nil means never: a storage copy then falls to the plaintext guard.
 	migrationTLS func() (bool, error)
+	// isoResolvedWithheld makes EnsureDisks answer as a target older than
+	// installer_iso_resolved does (no map), for tests of a new source against
+	// a main target.
+	isoResolvedWithheld bool
 	// enfCanonicalIdentity is this node's kill-switch for natural-key identity
 	// resolution (snapshots/container_snapshots); gated by this flag AND the
 	// CanonicalIdentityV1 latch. Advertised CONDITIONALLY on this flag (like
@@ -1235,6 +1243,10 @@ func (s *Server) SetAllowUnencryptedStorageMigration(on bool) { s.allowPlaintext
 // credentials for QEMU and reports whether they are ready. It runs on the
 // source before a storage copy and on the target in EnsureDisks.
 func (s *Server) SetMigrationTLS(fn func() (bool, error)) { s.migrationTLS = fn }
+
+// AnswerEnsureDisksAsAnOlderTargetForTest makes this host's EnsureDisks return
+// no installer_iso_resolved, as a target on main does.
+func (s *Server) AnswerEnsureDisksAsAnOlderTargetForTest(v bool) { s.isoResolvedWithheld = v }
 
 // migrationTLSReady runs the hook. An error means not ready; it is logged, not
 // returned, because the caller decides between refusing and the plaintext

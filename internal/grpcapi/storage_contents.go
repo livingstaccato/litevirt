@@ -2,6 +2,8 @@ package grpcapi
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"io"
 	"log/slog"
 	"os"
@@ -81,9 +83,20 @@ func (s *Server) ListStoragePoolContents(ctx context.Context, req *pb.ListStorag
 		return client.ListStoragePoolContents(fctx, req)
 	}
 
+	contents, err := s.poolContents(ctx, rec)
+	if err != nil {
+		return nil, err
+	}
+	return &pb.ListStoragePoolContentsResponse{Contents: contents}, nil
+}
+
+// poolContents lists the files of a pool on this host, sorted by name: the
+// one listing of pool content, which the content browser and the ISO library
+// listing (listLibrary) both go through. Block-backed pools have no browsable
+// file directory and list nothing.
+func (s *Server) poolContents(ctx context.Context, rec corrosion.StoragePoolRecord) ([]*pb.StoragePoolContent, error) {
 	if !isFileBasedDriver(rec.Driver) {
-		// Block-backed pool: no browsable file directory.
-		return &pb.ListStoragePoolContentsResponse{}, nil
+		return nil, nil
 	}
 	ref := StoragePoolRef{Driver: rec.Driver, Source: rec.Source, Target: rec.Target, Options: rec.Options}
 	// A refused pool — a directory no pool may use, one shared with another
@@ -111,7 +124,7 @@ func (s *Server) ListStoragePoolContents(ctx context.Context, req *pb.ListStorag
 		// host lists every file and the caller matches by name.
 		_ = grpc.SetHeader(ctx, metadata.Pairs(replicaListingMDKey, "matched"))
 	}
-	resp := &pb.ListStoragePoolContentsResponse{}
+	var out []*pb.StoragePoolContent
 	seen := map[string]bool{}
 	for _, d := range s.poolContentDirs(dir) {
 		entries, err := os.ReadDir(d)
@@ -135,14 +148,14 @@ func (s *Server) ListStoragePoolContents(ctx context.Context, req *pb.ListStorag
 			// pool's content: a legacy target-less local pool shares <data_dir>/disks
 			// with every local VM disk on the host. Unknown ownership hides it.
 			owners, oerr := s.liveDiskOwners(ctx, s.hostName, path)
-			if oerr != nil || slices.ContainsFunc(owners, func(d corrosion.DiskRecord) bool { return d.StorageVolume != req.PoolName }) {
+			if oerr != nil || slices.ContainsFunc(owners, func(d corrosion.DiskRecord) bool { return d.StorageVolume != rec.Name }) {
 				continue
 			}
 			if !conf.visible(ctx, path) {
 				continue
 			}
 			seen[name] = true
-			resp.Contents = append(resp.Contents, &pb.StoragePoolContent{
+			out = append(out, &pb.StoragePoolContent{
 				Name:       name,
 				Path:       path,
 				SizeBytes:  info.Size(),
@@ -151,8 +164,8 @@ func (s *Server) ListStoragePoolContents(ctx context.Context, req *pb.ListStorag
 			})
 		}
 	}
-	sort.Slice(resp.Contents, func(i, j int) bool { return resp.Contents[i].Name < resp.Contents[j].Name })
-	return resp, nil
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
 }
 
 // DeleteStoragePoolContent removes one file from a file-based pool (forwarded
@@ -179,7 +192,7 @@ func (s *Server) DeleteStoragePoolContent(ctx context.Context, req *pb.DeleteSto
 		return nil, status.Errorf(codes.NotFound, "pool %q not on host %q", req.PoolName, host)
 	}
 	if s.requirePeerCert(ctx) != nil {
-		if err := s.RequirePerm(ctx, poolRBACPathFor(rec.Project, req.PoolName), "storage.content.write", "operator"); err != nil {
+		if err := s.authorizeLibraryWrite(ctx, rec); err != nil {
 			return nil, err
 		}
 	}
@@ -267,6 +280,20 @@ func (s *Server) DeleteStoragePoolContent(ctx context.Context, req *pb.DeleteSto
 		return nil, status.Errorf(codes.PermissionDenied,
 			"%q is shared library content, not the caller's own; deleting it needs %s at the cluster root", req.Filename, verbStorageHostPath)
 	}
+	// A sync-mode global library removes the file from every host: record the
+	// removal (once the name is known good) before removing the file here, so
+	// no host offers its copy back.
+	if s.isGlobalISOLibrary(ctx, rec) && isISOName(req.Filename) {
+		mode, merr := corrosion.GetISOLibraryMode(ctx, s.db)
+		if merr != nil {
+			return nil, status.Errorf(codes.FailedPrecondition, "read the ISO library mode: %v", merr)
+		}
+		if mode.Value == corrosion.ISOLibrarySync {
+			if perr := corrosion.PutISOCatalogEntry(ctx, s.db, corrosion.ISOCatalogEntry{Name: req.Filename, Deleted: true, Origin: s.hostName}, callerUsername(ctx)); perr != nil {
+				return nil, status.Errorf(codes.FailedPrecondition, "record the removal of %s from the ISO library: %v", req.Filename, perr)
+			}
+		}
+	}
 	// os.Remove deletes a symlink itself (not its target), so this can't be
 	// redirected to delete an arbitrary file outside the pool.
 	if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
@@ -317,9 +344,13 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 	// Authorize BEFORE creating a temp file or reading any further frame (peer calls
 	// skip tenant RBAC). A denied upload writes nothing and drains no chunks.
 	if s.requirePeerCert(ctx) != nil {
-		if err := s.RequirePerm(ctx, poolRBACPathFor(rec.Project, first.PoolName), "storage.content.write", "operator"); err != nil {
+		if err := s.authorizeLibraryWrite(ctx, rec); err != nil {
 			return err
 		}
+	}
+	// A library holds ISOs, and a VM can only name a .iso there.
+	if s.isISOLibrary(ctx, rec) && !isISOName(first.Filename) {
+		return status.Errorf(codes.InvalidArgument, "pool %q is an ISO library; only .iso files go in it", first.PoolName)
 	}
 
 	// Remote pool: proxy the stream to the owning host.
@@ -362,6 +393,12 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 	if !isFileBasedDriver(rec.Driver) {
 		return status.Errorf(codes.FailedPrecondition, "pool %q is not file-based", first.PoolName)
 	}
+	if err := s.globalLibraryWritable(ctx, rec); err != nil {
+		return err
+	}
+	// A library file is never replaced (a VM may boot it): refuse a taken name
+	// before reading a byte. The publish below is no-replace too.
+	library := s.isISOLibrary(ctx, rec)
 	poolDir, err := s.poolWriteDir(ctx, rec)
 	if err != nil {
 		return err
@@ -387,6 +424,13 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 	if err != nil {
 		return status.Errorf(codes.InvalidArgument, "%v", err)
 	}
+	if library {
+		if p, jerr := safename.SafeJoin(dir, first.Filename); jerr == nil {
+			if _, lerr := os.Lstat(p); lerr == nil {
+				return errLibraryFileExists(first.Filename)
+			}
+		}
+	}
 	// Refuse a taken name — in any of the pool's content directories —
 	// before streaming anything; publishNoClobber below refuses it again
 	// atomically.
@@ -402,6 +446,7 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return status.Errorf(codes.Internal, "mkdir: %v", err)
 	}
+	hasher := sha256.New()
 	tmp, err := os.CreateTemp(dir, ".upload-*.tmp")
 	if err != nil {
 		return status.Errorf(codes.Internal, "create temp: %v", err)
@@ -420,6 +465,7 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 		}
 		n, err := tmp.Write(b)
 		total += int64(n)
+		hasher.Write(b[:n])
 		return err
 	}
 	if err := writeChunk(first.Chunk); err != nil {
@@ -465,7 +511,14 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 			unmarkUpload(dest)
 		}
 	}
-	if err := publishNoClobber(tmpName, dest, first.Filename); err != nil {
+	if library {
+		if err := publishLibraryFile(tmpName, dest, first.Filename, false); err != nil {
+			if marked && !lexists(dest) {
+				unmarkUpload(dest)
+			}
+			return err
+		}
+	} else if err := publishNoClobber(tmpName, dest, first.Filename); err != nil {
 		if marked && !lexists(dest) {
 			unmarkUpload(dest)
 		}
@@ -500,6 +553,16 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 	if recErr != nil {
 		withdraw()
 		return status.Errorf(codes.Internal, "record upload: %v", recErr)
+	}
+	if s.isGlobalISOLibrary(ctx, rec) {
+		sum := hex.EncodeToString(hasher.Sum(nil))
+		if fi, lerr := os.Lstat(dest); lerr == nil {
+			s.rememberISOHash(dest, fi, sum)
+		}
+		if err := s.recordLibraryFile(ctx, rec, first.Filename, dest, sum, total); err != nil {
+			withdraw()
+			return err
+		}
 	}
 	return stream.SendAndClose(&pb.UploadStoragePoolContentResponse{Path: dest, SizeBytes: total})
 }

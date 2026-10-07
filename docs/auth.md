@@ -143,10 +143,14 @@ binding can:
   an admin created — disks on a `zfs` or `lvm-thin` pool included — needs only
   the project's ordinary VM and disk permissions. See
   [storage.md](storage.md#host-paths).
-- **Installer ISOs** (`VMSpec.iso`) are a read of a host file by the guest. A
-  plain `.iso` in a file-based pool needs `storage.content.read` on that pool;
-  any other host path needs `storage.hostpath` at `/`, which only Admin holds.
-  See [storage.md](storage.md#installer-isos).
+- **Installer ISOs** (`VMSpec.iso`) are a read of a host file by the guest, so a
+  VM names one from a library as `pool/file.iso`. The global library `isos` is
+  open to every VM and written only with `storage.library.write` at `/` (Admin);
+  any other pool needs `storage.content.read` on it (and its project's VMs only),
+  and is written with `storage.content.write`. A pool the host refuses offers
+  no ISO. An absolute host path needs `storage.hostpath` at `/`, which only
+  Admin holds, as does `lv iso pull --from-host-path`. See
+  [storage.md](storage.md#installer-isos).
 - **Security groups** (`sg.write`: `lv sg create/rm/rule-add/rule-rm`) are
   cluster-global, bound to NICs by name, and checked at `/`. Admin and
   NetworkAdmin hold `sg.write`; Operator holds only `sg.read`. Binding groups to

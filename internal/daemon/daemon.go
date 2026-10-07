@@ -1496,6 +1496,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// importing claim state first where this node is a member of it (§4.4).
 	go d.runVoterAdoption(ctx, svc)
 
+	// The global ISO library in sync mode: bring this host's copy of every
+	// library file to the recorded version (iso_library.go).
+	go d.runISOLibrarySync(ctx, svc)
+
 	// Peer self-upgrade: a daemon that comes back on an old binary (e.g. it was
 	// down during a cluster upgrade) pulls the newer binary from a healthy peer
 	// and re-execs. Default on; disable with auto_upgrade.from_peer: false.
@@ -1945,6 +1949,75 @@ func (d *Daemon) registerStoragePools(ctx context.Context) {
 		}
 	}
 	d.refreshDirPoolExports(ctx, configured)
+	d.ensureGlobalISOLibrary(ctx)
+}
+
+// ensureGlobalISOLibrary gives this host the built-in global ISO library pool
+// ("isos", no project, <data_dir>/pools/isos) when it has no pool of that name. An
+// operator who puts the library on shared storage replaces the row with
+// `lv pool create isos --driver nfs ... --option content=iso` on each host,
+// which this then leaves alone.
+func (d *Daemon) ensureGlobalISOLibrary(ctx context.Context) {
+	if d.db == nil {
+		return
+	}
+	if rec, ok, err := corrosion.GetStoragePool(ctx, d.db, d.cfg.HostName, grpcapi.GlobalISOLibraryName); err != nil || ok {
+		if ok && rec.Project != "" {
+			slog.Warn("global ISO library: this host has a project-owned pool named isos, so it has no global library; rename that pool",
+				"host", d.cfg.HostName, "project", rec.Project)
+		} else if ok && !corrosion.IsBuiltinISOLibraryRow(rec) {
+			slog.Info("global ISO library: this host's isos pool is not the daemon's (shared storage, say); it is the global library only in shared mode",
+				"host", d.cfg.HostName, "target", rec.Target)
+		}
+		return
+	}
+	dir := filepath.Join(d.cfg.DataDir, storage.ISOLibraryDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		slog.Warn("global ISO library: create directory", "dir", dir, "error", err)
+		return
+	}
+	if err := corrosion.UpsertStoragePool(ctx, d.db, corrosion.StoragePoolRecord{
+		HostName: d.cfg.HostName,
+		Name:     grpcapi.GlobalISOLibraryName,
+		Driver:   "dir",
+		Target:   dir,
+		Options:  grpcapi.GlobalISOLibraryOptions(),
+		State:    "active",
+	}); err != nil {
+		slog.Warn("global ISO library: register pool", "error", err)
+	}
+}
+
+// runISOLibrarySync runs a sync pass of the global ISO library every 30s, and,
+// on a ticker of its own (a sync pass can wait long on hashing), sweeps this
+// host's installer-ISO records of VMs that no longer exist every 5 minutes.
+func (d *Daemon) runISOLibrarySync(ctx context.Context, svc *grpcapi.Server) {
+	go func() {
+		t := time.NewTicker(5 * time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if err := svc.SweepISOIdentities(ctx); err != nil {
+					slog.Warn("installer ISO records: sweep", "error", err)
+				}
+			}
+		}
+	}()
+	t := time.NewTicker(30 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if err := svc.SyncISOLibrary(ctx); err != nil {
+				slog.Warn("global ISO library: sync", "error", err)
+			}
+		}
+	}
 }
 
 // refreshDirPoolExports records, on this host's directory pools created

@@ -435,7 +435,14 @@ type VMSpec struct {
 	// any other mode. Additive and mixed-version safe: an older peer ignores it,
 	// and an older entry node simply never sets it (a custom-mode spec is
 	// refused at validation rather than rendered without a model).
-	CpuModel      string `protobuf:"bytes,42,opt,name=cpu_model,json=cpuModel,proto3" json:"cpu_model,omitempty"`
+	CpuModel string `protobuf:"bytes,42,opt,name=cpu_model,json=cpuModel,proto3" json:"cpu_model,omitempty"`
+	// iso_scope is server-owned: which kind of pool the owner resolved iso to
+	// at create — "global" (the global ISO library), "pool" (another pool with
+	// no project), "project" (a pool the VM's project owns) or "hostpath" (an
+	// Admin's absolute path). Every host that resolves iso later (a start, a
+	// migration target) refuses a pool of another kind, so a same-named pool
+	// elsewhere cannot stand in for it. Empty on VMs created before it existed.
+	IsoScope      string `protobuf:"bytes,43,opt,name=iso_scope,json=isoScope,proto3" json:"iso_scope,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -760,6 +767,13 @@ func (x *VMSpec) GetOnHostFailure() string {
 func (x *VMSpec) GetCpuModel() string {
 	if x != nil {
 		return x.CpuModel
+	}
+	return ""
+}
+
+func (x *VMSpec) GetIsoScope() string {
+	if x != nil {
+		return x.IsoScope
 	}
 	return ""
 }
@@ -5694,7 +5708,7 @@ var File_litevirt_v1_types_proto protoreflect.FileDescriptor
 
 const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\n" +
-	"\x17litevirt/v1/types.proto\x12\vlitevirt.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1bgoogle/protobuf/empty.proto\"\xd9\f\n" +
+	"\x17litevirt/v1/types.proto\x12\vlitevirt.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1bgoogle/protobuf/empty.proto\"\x8a\r\n" +
 	"\x06VMSpec\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1d\n" +
 	"\n" +
@@ -5744,10 +5758,11 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\x04uuid\x18' \x01(\tR\x04uuid\x12\x17\n" +
 	"\amax_cpu\x18( \x01(\x05R\x06maxCpu\x12&\n" +
 	"\x0fon_host_failure\x18) \x01(\tR\ronHostFailure\x12\x1b\n" +
-	"\tcpu_model\x18* \x01(\tR\bcpuModel\x1a9\n" +
+	"\tcpu_model\x18* \x01(\tR\bcpuModel\x12\x1b\n" +
+	"\tiso_scope\x18+ \x01(\tR\bisoScope\x1a9\n" +
 	"\vLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xb5\x01\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b,\x10-R\fiso_identity\"\xb5\x01\n" +
 	"\bDiskSpec\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x12\n" +
 	"\x04size\x18\x02 \x01(\tR\x04size\x12\x10\n" +

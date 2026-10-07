@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"testing"
 
 	"google.golang.org/grpc/codes"
@@ -28,7 +29,9 @@ func isoVMStopped(t *testing.T, s *Server, name string) (iso, hostFile string) {
 	dir := isoPool(t, s, "isos-"+name, "")
 	iso = filepath.Join(dir, "install.iso")
 	writeISO(t, iso)
-	if _, err := s.CreateVM(adminCtx(), isoCreate(name, iso, "")); err != nil {
+	// Named by reference: a pool's file is judged strictly (no link, one
+	// link) at every start, unlike an Admin's host path (resolveHostISO).
+	if _, err := s.CreateVM(adminCtx(), isoCreate(name, "isos-"+name+"/install.iso", "")); err != nil {
 		t.Fatalf("CreateVM %s: %v", name, err)
 	}
 	if err := s.db.Execute(context.Background(), `UPDATE vms SET state = 'stopped' WHERE name = ?`, name); err != nil {
@@ -183,10 +186,13 @@ func TestVMISO_SharedPoolDirectoryNeedsEveryRow(t *testing.T) {
 	}
 }
 
-// The file itself can stay a plain, singly-linked file while a directory
-// above it is swapped for a link to somewhere else; the path is judged whole.
-func TestVMISOStart_PreflightRefusesASymlinkedParentDirectory(t *testing.T) {
-	s, _, _ := isoServer(t)
+// An Admin's host path is resolved again at every start from the path the VM
+// was given (resolveHostISO): a directory above it swapped for a link to
+// somewhere else is followed, the file there judged in full, and the domain
+// pointed at it — as /var/lib/libvirt/images → /data/images worked on main.
+// A swap that lands in a refused place is refused.
+func TestVMISOStart_AHostPathsParentDirectoryIsResolvedAgain(t *testing.T) {
+	s, fake, key := isoServer(t)
 	root := t.TempDir()
 	dir := filepath.Join(root, "media")
 	if err := os.Mkdir(dir, 0o755); err != nil {
@@ -211,10 +217,23 @@ func TestVMISOStart_PreflightRefusesASymlinkedParentDirectory(t *testing.T) {
 	if err := os.Symlink(elsewhere, dir); err != nil {
 		t.Fatal(err)
 	}
-
-	_, err := s.PrepareHardwareForStart(context.Background(), vmRecord(t, s, "parent"))
-	if status.Code(err) != codes.FailedPrecondition {
-		t.Fatalf("start with a directory above the ISO swapped for a link: got %v, want FailedPrecondition", err)
+	if _, err := s.PrepareHardwareForStart(context.Background(), vmRecord(t, s, "parent")); err != nil {
+		t.Fatalf("start with the directory above the ISO now a link: %v", err)
+	}
+	if x := fake.DefinedXML("parent"); !strings.Contains(x, filepath.Join(elsewhere, "install.iso")) {
+		t.Fatalf("the domain was not pointed at the resolved file:\n%s", x)
+	}
+	if err := os.Remove(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Dir(key), dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(key, filepath.Join(filepath.Dir(key), "install.iso")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PrepareHardwareForStart(context.Background(), vmRecord(t, s, "parent")); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("start with the directory swapped for a link into the PKI directory: got %v, want FailedPrecondition", err)
 	}
 }
 

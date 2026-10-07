@@ -20,8 +20,10 @@ func fileBasedPoolDriver(driver string) bool {
 	return false
 }
 
-// handleISOBrowserModal renders the storage content browser used to pick an ISO
-// (or any file) from a file-based pool into a form field. The opener passes
+// handleISOBrowserModal renders the ISO picker: the ISO libraries the caller
+// may use (ListISOs — project libraries, then the global one), each picked as
+// its pool/file.iso reference, and below them the storage content browser for
+// browsing or uploading into a pool. The opener passes
 // ?field=<input-name> so we can target the right input on selection.
 func (s *Server) handleISOBrowserModal(w http.ResponseWriter, r *http.Request) {
 	field := r.URL.Query().Get("field")
@@ -35,7 +37,13 @@ func (s *Server) handleISOBrowserModal(w http.ResponseWriter, r *http.Request) {
 			fp = append(fp, p)
 		}
 	}
-	s.renderFragment(w, "iso_browser_modal.html", map[string]any{"Pools": fp, "Field": field})
+	data := map[string]any{"Pools": fp, "Field": field}
+	if isos, err := s.grpc.ListISOs(s.uiBearerCtx(r), &pb.ListISOsRequest{Host: r.URL.Query().Get("host")}); err != nil {
+		data["ISOError"] = err.Error()
+	} else {
+		data["ISOs"] = isos.GetIsos()
+	}
+	s.renderFragment(w, "iso_browser_modal.html", data)
 }
 
 // handleStorageContents renders the file list of one pool. poolref is

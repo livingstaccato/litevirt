@@ -372,10 +372,11 @@ Deleting a pool on its own directory (`<data_dir>/pools/<name>`) removes the
 daemon's own directories in it first: the replica area's empty directories,
 and the upload markers (`.litevirt-uploads`) of uploads no longer there. A
 pool still holding replicas or files is refused, naming them; with `--force`
-it is deleted anyway, as it always was: the replicas in its area go with it
-(not one a disk uses), and any other file stays where it is, in the
-directory, which is then kept — and a new pool of that name is refused the
-directory until it is emptied.
+it is deleted anyway, as it always was, and no file is deleted: the replicas
+in its area (which may be a VM's only copy while its host is down) and any
+other file stay where they are, the log names them, and the directory is
+kept — a new pool of that name is refused the directory until it is emptied.
+Delete the replicas you no longer want by name (`DeleteStoragePoolContent`) first.
 
 A user's upload into a pool on `<data_dir>/disks` lands in
 `<data_dir>/disks/uploads/` and is listed with the pool's other content: the VM

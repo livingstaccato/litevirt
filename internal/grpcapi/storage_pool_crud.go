@@ -308,22 +308,24 @@ func (s *Server) DeleteStoragePool(ctx context.Context, req *pb.DeleteStoragePoo
 	// A pool's own <data_dir>/pools/<name> goes with it — but never with files
 	// in it: the next pool of this name, in any project, would inherit them.
 	// The daemon's own directories in it — the replica area, the upload
-	// markers — are not files anyone left there: emptied of what is the
-	// daemon's to remove (all replicas with --force; stale markers) and
-	// removed. --force deletes the pool even with files left, as it always
-	// did; they stay in the directory, which is then kept (and a new pool of
-	// this name is refused it while it holds them).
+	// markers — are not files anyone left there: their empty directories and
+	// stale markers are removed. No replica is ever deleted here, with
+	// --force or without: --force deletes the pool even with files left, as
+	// it always did (main's --force only passed the reference guard), and
+	// what is left — replicas included — stays in the directory, which is
+	// then kept (and a new pool of this name is refused it while it holds
+	// them).
 	ownDir := ""
 	if (rec.Driver == "local" || rec.Driver == "") && rec.Target == localPoolDir(s.dataDir, rec.Name) {
 		ownDir = rec.Target
-		s.cleanDaemonPoolDirs(ctx, ownDir, req.Force)
+		kept := s.cleanDaemonPoolDirs(ownDir)
 		if left := dirEntriesSample(ownDir, 5); len(left) > 0 {
 			if !req.Force {
 				return nil, status.Errorf(codes.FailedPrecondition,
-					"pool %q still holds files in %s (%s); delete them first, or delete the pool with --force (the files stay)", req.Name, ownDir, strings.Join(left, ", "))
+					"pool %q still holds files in %s (%s); delete them first, or delete the pool with --force (the files stay)", req.Name, ownDir, strings.Join(append(left, kept...), ", "))
 			}
-			slog.Warn("storage pool deleted with files left in its directory; the directory is kept",
-				"pool", req.Name, "dir", ownDir, "files", left)
+			slog.Warn("storage pool deleted with files left in its directory; the directory and every file in it are kept",
+				"pool", req.Name, "dir", ownDir, "files", left, "replicas", kept)
 			ownDir = ""
 		}
 	}
@@ -358,20 +360,19 @@ func (s *Server) DeleteStoragePool(ctx context.Context, req *pb.DeleteStoragePoo
 	return &pb.DeleteStoragePoolResponse{}, nil
 }
 
-// cleanDaemonPoolDirs empties and removes the daemon's own directories in a
-// pool's directory before the pool is deleted:
+// cleanDaemonPoolDirs removes the daemon's own directories in a pool's
+// directory before the pool is deleted, as far as they hold nothing:
 //
-//   - the replica area (.replicas): its empty owner directories always, and
-//     with force every recorded replica and leftover temp in it — never a file
-//     a disk on any host references (a --no-localize promotion's backing),
-//     which keeps its record and its directories;
+//   - the replica area (.replicas): its empty owner directories, and the area
+//     once empty. A replica is never removed here — not with --force either:
+//     a replica may be a VM's only copy (its host down, not yet promoted);
 //   - the upload markers (.litevirt-uploads): every marker whose upload is no
 //     longer there.
 //
 // Only real directories are entered (a symlink there is never followed), and
-// each directory is removed only once empty. Failures are logged; whatever
-// is left keeps the pool directory non-empty.
-func (s *Server) cleanDaemonPoolDirs(ctx context.Context, dir string, force bool) {
+// each directory is removed only once empty. It returns the area files kept
+// (owner/name, at most a few), for the caller to name.
+func (s *Server) cleanDaemonPoolDirs(dir string) (kept []string) {
 	realDir := func(p string) bool {
 		fi, err := os.Lstat(p)
 		return err == nil && fi.IsDir()
@@ -384,8 +385,10 @@ func (s *Server) cleanDaemonPoolDirs(ctx context.Context, dir string, force bool
 			if !o.IsDir() || !realDir(od) {
 				continue
 			}
-			if force {
-				s.removeAreaOwnerFiles(ctx, od)
+			for _, f := range dirEntriesSample(od, 5) {
+				if len(kept) < 5 && !strings.HasPrefix(f, "and ") {
+					kept = append(kept, filepath.Join(replicaAreaDir, o.Name(), f))
+				}
 			}
 			_ = os.Remove(od) // only once empty
 		}
@@ -401,41 +404,7 @@ func (s *Server) cleanDaemonPoolDirs(ctx context.Context, dir string, force bool
 		}
 		_ = os.Remove(markers)
 	}
-}
-
-// removeAreaOwnerFiles removes, from one owner directory of a replica area,
-// every replica no disk references (record first, then the file), every
-// record left without its file, and every leftover ".repl-*.tmp".
-func (s *Server) removeAreaOwnerFiles(ctx context.Context, od string) {
-	ents, err := os.ReadDir(od)
-	if err != nil {
-		return
-	}
-	for _, e := range ents {
-		name := e.Name()
-		p := filepath.Join(od, name)
-		if !e.Type().IsRegular() {
-			continue
-		}
-		switch {
-		case strings.HasPrefix(name, ".repl-") && strings.HasSuffix(name, ".tmp"):
-			_ = os.Remove(p)
-		case strings.HasSuffix(name, ".json"):
-			if _, err := os.Lstat(strings.TrimSuffix(p, ".json")); errors.Is(err, fs.ErrNotExist) {
-				_ = os.Remove(p)
-			}
-		default:
-			owners, err := s.diskReferencesAnyHost(ctx, p)
-			if err != nil || len(owners) > 0 {
-				slog.Warn("pool delete: a replica a disk uses is kept", "path", p, "error", err)
-				continue
-			}
-			if err := os.Remove(p + ".json"); err != nil && !errors.Is(err, fs.ErrNotExist) {
-				continue
-			}
-			_ = os.Remove(p)
-		}
-	}
+	return kept
 }
 
 // GetStoragePool returns one pool's full details. Used by `lv pool inspect`.

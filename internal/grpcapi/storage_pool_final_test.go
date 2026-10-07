@@ -210,10 +210,10 @@ func TestFinalPools_PoolDeleteCleansTheDaemonsEmptyDirectories(t *testing.T) {
 	}
 }
 
-// C4: replicas still in the area refuse a plain delete (they are data) and
-// go with --force — except one a disk uses, which is kept. --force always
-// deletes the pool, as on main; files someone left stay, and so does the
-// directory holding them.
+// C4: replicas still in the area refuse a plain delete (they are data).
+// --force always deletes the pool, as on main, and — as on main, where
+// --force only passed the reference guard — deletes no replica and no file:
+// they stay, and so does the directory holding them.
 func TestFinalPools_PoolDeleteForceAlwaysSucceeds(t *testing.T) {
 	s := newPoolTestServer(t)
 	dir := ownPool(t, s, "dr")
@@ -227,8 +227,9 @@ func TestFinalPools_PoolDeleteForceAlwaysSucceeds(t *testing.T) {
 	if _, err := s.DeleteStoragePool(adminCtx(), &pb.DeleteStoragePoolRequest{Name: "dr", Force: true}); err != nil {
 		t.Fatalf("--force: %v", err)
 	}
-	if present(rep) || present(dir) || !poolGone(t, s, "dr") {
-		t.Fatalf("--force: replica present=%v, dir present=%v, row gone=%v", present(rep), present(dir), poolGone(t, s, "dr"))
+	if !present(rep) || !present(rep+".json") || !present(dir) || !poolGone(t, s, "dr") {
+		t.Fatalf("--force: replica present=%v, its record=%v, dir present=%v, row gone=%v",
+			present(rep), present(rep+".json"), present(dir), poolGone(t, s, "dr"))
 	}
 
 	// A file someone left, and a replica a disk uses: the pool is deleted,
@@ -251,6 +252,62 @@ func TestFinalPools_PoolDeleteForceAlwaysSucceeds(t *testing.T) {
 	if !poolGone(t, s, "dr2") || !present(left) || !present(used) || !present(used+".json") {
 		t.Fatalf("--force with files left: row gone=%v, left file=%v, used replica=%v, its record=%v",
 			poolGone(t, s, "dr2"), present(left), present(used), present(used+".json"))
+	}
+}
+
+// C-B (final-rereview-integrate-3.md): the DR pool of a VM whose host is down
+// is the target of its replication schedule, so a delete needs --force — as
+// on main (DeleteStoragePool@3e4ba50b:160-235 touched no file; --force only
+// passed poolReferenceGuard). The VM's replicas, its only copy until it is
+// promoted, survive the delete. What --force does clean is the daemon's own:
+// an empty owner directory and a stale upload marker.
+func TestFinalPools_PoolDeleteForceKeepsADownHostsReplicas(t *testing.T) {
+	s := newPoolTestServer(t)
+	ctx := context.Background()
+	dir := ownPool(t, s, "dr")
+	if err := corrosion.InsertVM(ctx, s.db,
+		corrosion.VMRecord{Name: "web", HostName: "host-down", State: "running", Project: "acme"}, nil,
+		[]corrosion.DiskRecord{{VMName: "web", DiskName: "root", HostName: "host-down", Path: "/var/lib/litevirt/disks/web-root.qcow2", SizeBytes: 1 << 20, StorageType: "local"}},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.UpsertBackupSchedule(ctx, s.db, corrosion.BackupScheduleRecord{
+		VMName: "web", Repo: "dr", Type: "replication", TargetPool: "dr", TargetHost: s.hostName, KeepReplicas: 3, Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	reps := []string{
+		areaReplica(t, dir, "acme", "web", "root", "20261007-120000"),
+		areaReplica(t, dir, "acme", "web", "root", "20261007-130000"),
+	}
+	emptyOwner := replicaOwnerDir(dir, "acme", "gone")
+	if err := os.MkdirAll(emptyOwner, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(dir, uploadMarkerDir, "gone.iso")
+	if err := os.MkdirAll(filepath.Dir(marker), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(marker, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.DeleteStoragePool(adminCtx(), &pb.DeleteStoragePoolRequest{Name: "dr"}); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("deleting a replication target without --force: got %v, want FailedPrecondition", err)
+	}
+	if _, err := s.DeleteStoragePool(adminCtx(), &pb.DeleteStoragePoolRequest{Name: "dr", Force: true}); err != nil {
+		t.Fatalf("--force: %v", err)
+	}
+	if !poolGone(t, s, "dr") {
+		t.Fatalf("--force did not delete the pool")
+	}
+	for _, r := range reps {
+		if !present(r) || !present(r+".json") {
+			t.Errorf("pool rm --force deleted the down host's VM's DR replica %s (file %v, record %v)", filepath.Base(r), present(r), present(r+".json"))
+		}
+	}
+	if present(emptyOwner) || present(marker) {
+		t.Errorf("--force left the daemon's own debris: empty owner dir %v, stale marker %v", present(emptyOwner), present(marker))
 	}
 }
 

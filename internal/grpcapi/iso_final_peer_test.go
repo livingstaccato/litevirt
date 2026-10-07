@@ -2,6 +2,9 @@ package grpcapi
 
 import (
 	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -137,5 +140,37 @@ func TestISOFinal_AListedPathIsReadUnderTheBudget(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("EnsureDisks blocked on a listed path that does not answer")
+	}
+}
+
+// I-2, a pool ISO named by its absolute path: an older target is handed that
+// path, through the pool directory's link, not the file it resolved to here;
+// a CD-ROM that is not the pool's file is left alone.
+//
+// Mutation: return nil for a pool scope in olderTargetISORemap — red.
+func TestISOFinal_AnOlderTargetGetsAnAbsolutePoolISOAsWritten(t *testing.T) {
+	s, fake, _ := isoServer(t)
+	real := t.TempDir()
+	writeLibFile(t, filepath.Join(real, "x.iso"), isoBody)
+	link := filepath.Join(t.TempDir(), "images")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.UpsertStoragePool(context.Background(), s.db, corrosion.StoragePoolRecord{
+		HostName: s.hostName, Name: "images", Driver: "dir", Target: link, State: "active",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	legacyVM(t, s, fake, "v", filepath.Join(link, "x.iso"))
+	spec := vmSpecFor(vmRecord(t, s, "v"))
+	spec.IsoScope = isoScopePool
+	b, _ := json.Marshal(spec)
+	if err := s.db.Execute(context.Background(), `UPDATE vms SET spec = ? WHERE name = 'v'`, string(b)); err != nil {
+		t.Fatal(err)
+	}
+	resolved := filepath.Join(mustEval(t, real), "x.iso")
+	got := s.olderTargetISORemap(context.Background(), "v", "older-host", []string{resolved, "/srv/other.iso"})
+	if len(got) != 1 || got[resolved] != filepath.Join(link, "x.iso") {
+		t.Fatalf("remap = %v, want only %s -> %s", got, resolved, filepath.Join(link, "x.iso"))
 	}
 }

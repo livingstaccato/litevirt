@@ -1579,11 +1579,13 @@ func (s *Server) coldMigrateStoppedVM(ctx context.Context, vm *corrosion.VMRecor
 		return status.Errorf(codes.FailedPrecondition,
 			"cannot dump domain XML for %q (it must be defined to migrate it cold): %v", vm.Name, err)
 	}
-	// An Admin's host-path ISO goes as the path the VM was given, not as the
-	// file it resolved to on this host: a target on this build resolves and
-	// judges that path at its start (and points the domain at its own file); a
-	// target on an older build has its qemu follow the link there, as before.
-	if remap := s.olderTargetISORemap(ctx, vm.Name, s.domainInstallerISOs(vm.Name, domXML)); len(remap) > 0 {
+	// The VM's installer ISO goes as the path as written (a host path as the
+	// VM was given it, a pool's file through the pool's directory as the
+	// target names it), not as the file it resolved to on this host: a target
+	// on this build resolves and judges it at its start (and points the domain
+	// at its own file); a target on an older build has its qemu follow the
+	// link there, as before.
+	if remap := s.olderTargetISORemap(ctx, vm.Name, targetHost.Name, s.domainInstallerISOs(vm.Name, domXML)); len(remap) > 0 {
 		rewritten, _, rerr := lv.RewriteCDROMSources(domXML, remap)
 		if rerr != nil {
 			return status.Errorf(codes.FailedPrecondition, "point the installer CD-ROM of VM %q back at the path it was given: %v", vm.Name, rerr)
@@ -2093,7 +2095,7 @@ func (s *Server) ensureDisksOnTargetISO(ctx context.Context, targetHost, vmName 
 		// older than that, whose qemu opens the paths it is handed, unjudged,
 		// as on main. Hand it what main handed it — the path the VM was given —
 		// so a link that names another file there is followed there.
-		remap = s.olderTargetISORemap(ctx, vmName, isoPaths)
+		remap = s.olderTargetISORemap(ctx, vmName, targetHost, isoPaths)
 	}
 	if runtime {
 		for from, to := range resp.GetInstallerIsoResolved() {
@@ -2110,34 +2112,93 @@ func (s *Server) ensureDisksOnTargetISO(ctx context.Context, targetHost, vmName 
 	return resp.GetCreatedPaths(), wantTLS && resp.GetMigrationTlsReady(), remap, nil
 }
 
-// olderTargetISORemap points, for a runtime move to an older target, the CD-ROM
-// that is the VM's host-path ISO back at the path the VM was given (spec.Iso),
-// which this host's start had pointed at the file it resolved to here. A pool
-// ISO is left as it is: its path is a library's file, never a link.
-func (s *Server) olderTargetISORemap(ctx context.Context, vmName string, isoPaths []string) map[string]string {
+// olderTargetISORemap points, for a move to an older target, the CD-ROM that
+// is the VM's installer ISO back at the path as written, which this host's
+// start had pointed at the file it resolved to here. A target on main opens
+// the path it is handed, following its own links, as main to main did:
+//
+//   - a host path ISO (an Admin's, or a VM's from before iso_scope): the path
+//     the VM was given (spec.Iso);
+//   - a pool ISO named by its absolute path: that path;
+//   - a pool reference: the file in the pool's directory as the target's row
+//     for that pool names it (this host's, when the target has none).
+//
+// A pool ISO is remapped only from the file it resolved to here through its
+// directory: a pool directory that is a link naming another directory on
+// each host (/var/lib/libvirt/images on a data disk) is then followed on the
+// target. A target on this build re-resolves either path itself.
+func (s *Server) olderTargetISORemap(ctx context.Context, vmName, targetHost string, isoPaths []string) map[string]string {
 	vm, err := corrosion.GetVM(ctx, s.db, vmName)
 	if err != nil || vm == nil {
 		return nil
 	}
 	spec := vmSpecFor(vm)
-	iso := spec.GetIso()
-	if !filepath.IsAbs(iso) || (spec.GetIsoScope() != "" && spec.GetIsoScope() != isoScopeHostPath) {
+	iso, scope := spec.GetIso(), spec.GetIsoScope()
+	if iso == "" {
 		return nil
 	}
-	resolved, _ := filepath.EvalSymlinks(iso)
 	var remap map[string]string
-	for _, p := range isoPaths {
-		if p == iso || (len(isoPaths) > 1 && p != resolved) {
-			continue
-		}
+	add := func(from, to string) {
 		if remap == nil {
 			remap = map[string]string{}
 		}
-		remap[p] = iso
-		slog.Info("migration: an older target opens the installer ISO by the path the VM was given, as before",
-			"vm", vmName, "here", p, "there", iso)
+		remap[from] = to
+		slog.Info("migration: an older target opens the installer ISO by the path as written, as before",
+			"vm", vmName, "here", from, "there", to)
+	}
+	if filepath.IsAbs(iso) && (scope == "" || scope == isoScopeHostPath) {
+		resolved, _ := filepath.EvalSymlinks(iso)
+		for _, p := range isoPaths {
+			if p == iso || (len(isoPaths) > 1 && p != resolved) {
+				continue
+			}
+			add(p, iso)
+		}
+		return remap
+	}
+	here, written := iso, iso
+	if !filepath.IsAbs(iso) {
+		pool, file, ok := parseISORef(iso)
+		if !ok {
+			return nil
+		}
+		if here, ok = s.lexicalPoolFile(ctx, s.hostName, pool, file); !ok {
+			return nil
+		}
+		written = here
+		if there, ok := s.lexicalPoolFile(ctx, targetHost, pool, file); ok {
+			written = there
+		}
+	}
+	rdir, err := filepath.EvalSymlinks(filepath.Dir(here))
+	if err != nil {
+		return nil
+	}
+	resolvedHere := filepath.Join(rdir, filepath.Base(here))
+	for _, p := range isoPaths {
+		if p == written || p != resolvedHere {
+			continue
+		}
+		add(p, written)
 	}
 	return remap
+}
+
+// lexicalPoolFile is file in pool's directory on host as the pool's row
+// names it, links and all.
+func (s *Server) lexicalPoolFile(ctx context.Context, host, pool, file string) (string, bool) {
+	if host == "" {
+		return "", false
+	}
+	rec, ok, err := corrosion.GetStoragePool(ctx, s.db, host, pool)
+	if err != nil || !ok || !isFileBasedDriver(rec.Driver) {
+		return "", false
+	}
+	pd, err := fileBasedPoolDir(s.dataDir, StoragePoolRef{Driver: rec.Driver, Source: rec.Source, Target: rec.Target})
+	if err != nil || pd == "" {
+		return "", false
+	}
+	return filepath.Join(filepath.Clean(pd), file), true
 }
 
 // judgedISOSHA256 is, for the installer CD-ROM path that is the VM's pool ISO

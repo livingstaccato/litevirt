@@ -1,6 +1,7 @@
 package grpcapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -90,13 +91,15 @@ func recordReplicaForTest(t *testing.T, s *Server, pool, vm, project, disk, path
 	file := filepath.Join(s.dataDir, "pool-uploads.json")
 	m := map[string]map[string]any{}
 	if b, err := os.ReadFile(file); err == nil {
-		if err := json.Unmarshal(b, &m); err != nil {
+		dec := json.NewDecoder(bytes.NewReader(b))
+		dec.UseNumber() // mtime_ns does not survive a float64
+		if err := dec.Decode(&m); err != nil {
 			t.Fatal(err)
 		}
 	}
 	m[filepath.Clean(path)] = map[string]any{
 		"pool": pool, "project": project, "vm": vm, "disk": disk,
-		"dev": id.dev, "ino": id.ino, "size": id.size, "mtime_ns": id.mtimeNs,
+		"ino": id.ino, "size": id.size, "mtime_ns": id.mtimeNs,
 	}
 	b, err := json.Marshal(m)
 	if err != nil {

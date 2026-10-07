@@ -51,16 +51,20 @@ import (
 // it: nothing in a pool directory is trusted to say whose a file is.
 const poolUploadsFile = "pool-uploads.json"
 
-// poolUpload is one upload's record, bound to the file — its device and
+// poolUpload is one upload's record, bound to the file at its path — its
 // inode, size and modification time — so a file deleted and recreated under
-// the same name, rewritten, or put at a reused inode number is not the
-// upload. A published upload is never written again.
+// the same name, or rewritten, is not the upload. Not to its device number,
+// which a reboot or remount may change. A published upload is never written
+// again.
 //
-// A replica the daemon places (replication's upload, push or local copy, a
-// replicate-volume copy) is recorded the same way with VM and Disk set: it is
-// a replica of that VM's disk, and Project is the VM's project, not the
-// pool's. A user's upload names its uploader (Uploader, user@realm); an older
-// node's upload, which carries no identity, is marked Peer.
+// A replica the daemon places (replication's upload, push or local copy) is
+// recorded the same way with VM and Disk set: it is a replica of that VM's
+// disk, and Project is the VM's project, not the pool's. A replicate-volume
+// copy is recorded so too, marked Copy: it is the operator's, of that VM's
+// disk, never a replication run's — never pruned, nor chosen as the newest
+// replica or an increment's base, and promoted only when named. A user's
+// upload names its uploader (Uploader, user@realm); an older node's upload,
+// which carries no identity, is marked Peer.
 //
 // A file on shared storage also has its record in the replicated rows
 // (pool_records.go); read from there it is bound by size and modification
@@ -69,21 +73,33 @@ type poolUpload struct {
 	Pool     string `json:"pool"`
 	Project  string `json:"project"`
 	VM       string `json:"vm,omitempty"`
+	VMUUID   string `json:"vm_uuid,omitempty"`
 	Disk     string `json:"disk,omitempty"`
+	Copy     bool   `json:"copy,omitempty"`
 	Uploader string `json:"uploader,omitempty"`
 	Peer     bool   `json:"peer,omitempty"`
-	Dev      uint64 `json:"dev"`
-	Ino      uint64 `json:"ino"`
+	Ino      uint64 `json:"ino,omitempty"`
 	Size     int64  `json:"size"`
 	MtimeNs  int64  `json:"mtime_ns"`
 	shared   bool
 }
 
+// poolRecords is every record of each file (by cleaned path): this host's
+// first, then each host's replicated one. A file is recorded when any of
+// them still describes it.
+type poolRecords map[string][]poolUpload
+
 // fileID is what binds an upload record to one file.
 type fileID struct {
-	dev, ino uint64
-	size     int64
-	mtimeNs  int64
+	ino     uint64
+	size    int64
+	mtimeNs int64
+}
+
+// describedBy reports whether record u still describes the file: the size
+// and modification time it had, and for this host's record the same inode.
+func (id fileID) describedBy(u poolUpload) bool {
+	return id.size == u.Size && id.mtimeNs == u.MtimeNs && (u.shared || id.ino == u.Ino)
 }
 
 func fileIdentity(path string) (fileID, error) {
@@ -95,7 +111,7 @@ func fileIdentity(path string) (fileID, error) {
 	if !ok || !fi.Mode().IsRegular() {
 		return fileID{}, fmt.Errorf("%s is not a regular file", path)
 	}
-	return fileID{dev: uint64(st.Dev), ino: uint64(st.Ino), size: fi.Size(), mtimeNs: fi.ModTime().UnixNano()}, nil
+	return fileID{ino: uint64(st.Ino), size: fi.Size(), mtimeNs: fi.ModTime().UnixNano()}, nil
 }
 
 func (s *Server) readPoolUploads() (map[string]poolUpload, error) {
@@ -151,37 +167,74 @@ func (s *Server) recordPeerUpload(ctx context.Context, pool, path string) error 
 
 // recordPoolReplica records path, in pool, as a replica of k's disk.
 func (s *Server) recordPoolReplica(ctx context.Context, pool string, k replicaKey, path string) error {
-	return s.writePoolUploadRecord(ctx, path, poolUpload{Pool: pool, Project: k.Project, VM: k.VM, Disk: k.Disk})
+	return s.writePoolUploadRecord(ctx, path, poolUpload{Pool: pool, Project: k.Project, VM: k.VM, VMUUID: s.vmUUIDOf(ctx, k), Disk: k.Disk})
 }
 
+// recordPoolCopy records path, in pool, as a replicate-volume copy of k's
+// disk: the VM's project's, promotable when named, never a replica a
+// replication run made.
+func (s *Server) recordPoolCopy(ctx context.Context, pool string, k replicaKey, path string) error {
+	return s.writePoolUploadRecord(ctx, path, poolUpload{Pool: pool, Project: k.Project, VM: k.VM, VMUUID: s.vmUUIDOf(ctx, k), Disk: k.Disk, Copy: true})
+}
+
+// vmUUIDOf is k's VM's incarnation uuid: k's own, or the live row's when it
+// is k's project's; "" when neither says.
+func (s *Server) vmUUIDOf(ctx context.Context, k replicaKey) string {
+	if k.UUID != "" {
+		return k.UUID
+	}
+	vm, err := corrosion.GetVM(ctx, s.db, k.VM)
+	if err != nil || vm == nil || !sameProject(vm.Project, k.Project) {
+		return ""
+	}
+	uuid, _ := vmSpecUUID(vm.Spec)
+	return uuid
+}
+
+// writePoolUploadRecord records path here and, on shared storage, for the
+// cluster. Either failing records nothing: the caller removes the file.
 func (s *Server) writePoolUploadRecord(ctx context.Context, path string, u poolUpload) error {
 	id, err := fileIdentity(path)
 	if err != nil {
 		return err
 	}
-	u.Dev, u.Ino, u.Size, u.MtimeNs = id.dev, id.ino, id.size, id.mtimeNs
+	u.Ino, u.Size, u.MtimeNs = id.ino, id.size, id.mtimeNs
 	s.poolUploadsMu.Lock()
 	defer s.poolUploadsMu.Unlock()
 	m, err := s.readPoolUploads()
 	if err != nil {
 		return err
 	}
-	m[filepath.Clean(path)] = u
+	key := filepath.Clean(path)
+	prev, had := m[key]
+	m[key] = u
 	if err := s.writePoolUploads(m); err != nil {
 		return err
 	}
-	s.shareRecord(ctx, path, u, false)
+	if err := s.shareRecord(ctx, path, u); err != nil {
+		if had {
+			m[key] = prev
+		} else {
+			delete(m, key)
+		}
+		_ = s.writePoolUploads(m)
+		return err
+	}
 	return nil
 }
 
 // loadPoolUploads reads this host's records, and the replicated records of
 // the files in dirs that are on shared storage.
-func (s *Server) loadPoolUploads(ctx context.Context, dirs ...string) (map[string]poolUpload, error) {
+func (s *Server) loadPoolUploads(ctx context.Context, dirs ...string) (poolRecords, error) {
 	s.poolUploadsMu.Lock()
-	m, err := s.readPoolUploads()
+	local, err := s.readPoolUploads()
 	s.poolUploadsMu.Unlock()
 	if err != nil {
 		return nil, err
+	}
+	m := make(poolRecords, len(local))
+	for p, u := range local {
+		m[p] = []poolUpload{u}
 	}
 	for _, d := range dirs {
 		if err := s.addSharedRecords(ctx, m, d); err != nil {
@@ -191,16 +244,9 @@ func (s *Server) loadPoolUploads(ctx context.Context, dirs ...string) (map[strin
 	return m, nil
 }
 
-// forgetPoolUpload drops path's record, if any, here and on shared storage.
+// forgetPoolUpload drops path's record, if any, here and from this host's
+// replicated rows.
 func (s *Server) forgetPoolUpload(ctx context.Context, path string) error {
-	m, err := s.loadPoolUploads(ctx, filepath.Dir(path))
-	if err != nil {
-		return err
-	}
-	u, ok := m[filepath.Clean(path)]
-	if !ok {
-		return nil
-	}
 	s.poolUploadsMu.Lock()
 	defer s.poolUploadsMu.Unlock()
 	local, err := s.readPoolUploads()
@@ -213,33 +259,66 @@ func (s *Server) forgetPoolUpload(ctx context.Context, path string) error {
 			return err
 		}
 	}
-	s.shareRecord(ctx, path, u, true)
-	return nil
+	return s.forgetShared(ctx, path)
 }
 
-// poolUploadOf returns path's upload record when it still describes the file
-// there now: the same file (device and inode, for this host's record), with
-// the size and modification time it had.
-func (s *Server) poolUploadOf(uploads map[string]poolUpload, path string) (poolUpload, bool) {
-	u, ok := uploads[filepath.Clean(path)]
-	if !ok {
-		return poolUpload{}, false
+// recState is what a file's records say of it.
+type recState int
+
+const (
+	recNone    recState = iota // no record names the path
+	recMatched                 // a record still describes the file
+	recStale                   // records name the path, none describes the file now
+)
+
+// recordState returns the first of path's records that still describes the
+// file there now (the same inode, for this host's record, with the size and
+// modification time it had), and which case it is.
+func (s *Server) recordState(uploads poolRecords, path string) (poolUpload, recState) {
+	recs := uploads[filepath.Clean(path)]
+	if len(recs) == 0 {
+		return poolUpload{}, recNone
 	}
 	id, err := fileIdentity(path)
-	if err != nil || id.size != u.Size || id.mtimeNs != u.MtimeNs || (!u.shared && (id.dev != u.Dev || id.ino != u.Ino)) {
-		return poolUpload{}, false
+	if err != nil {
+		return poolUpload{}, recStale
 	}
-	return u, true
+	for _, u := range recs {
+		if id.describedBy(u) {
+			return u, recMatched
+		}
+	}
+	return poolUpload{}, recStale
 }
 
-// recordOf returns path's record when it still describes the file there.
-func (s *Server) recordOf(ctx context.Context, path string) (poolUpload, bool, error) {
+// matchedRecords returns every record of path that still describes the file.
+func (s *Server) matchedRecords(uploads poolRecords, path string) []poolUpload {
+	id, err := fileIdentity(path)
+	if err != nil {
+		return nil
+	}
+	var out []poolUpload
+	for _, u := range uploads[filepath.Clean(path)] {
+		if id.describedBy(u) {
+			out = append(out, u)
+		}
+	}
+	return out
+}
+
+// poolUploadOf returns path's record when one still describes the file.
+func (s *Server) poolUploadOf(uploads poolRecords, path string) (poolUpload, bool) {
+	u, st := s.recordState(uploads, path)
+	return u, st == recMatched
+}
+
+// recordsOf returns path's records that still describe the file there.
+func (s *Server) recordsOf(ctx context.Context, path string) ([]poolUpload, error) {
 	m, err := s.loadPoolUploads(ctx, filepath.Dir(path))
 	if err != nil {
-		return poolUpload{}, false, err
+		return nil, err
 	}
-	u, ok := s.poolUploadOf(m, path)
-	return u, ok, nil
+	return s.matchedRecords(m, path), nil
 }
 
 // poolUploadsSubdir is where a user's uploads into a pool on
@@ -314,6 +393,10 @@ const (
 	replicaVMMDKey      = "x-litevirt-replica-vm"
 	replicaDiskMDKey    = "x-litevirt-replica-disk"
 	replicaProjectMDKey = "x-litevirt-replica-project"
+	// The VM's incarnation uuid, which keys its replicas' replicated record
+	// (an older node does not send it; the pool's host then reads it from
+	// the VM's row).
+	replicaVMUUIDMDKey = "x-litevirt-replica-vm-uuid"
 	// A manual promotion's operator-named replica, and whether the operator
 	// is an admin (storage.hostpath at the root) who may name any file. Set
 	// by the entry node, which authenticated the operator.
@@ -337,6 +420,9 @@ func withPoolContentViewAll(ctx context.Context) context.Context {
 func withReplicaContentView(ctx context.Context, k replicaKey, named string, admin bool) context.Context {
 	kv := []string{poolContentViewMDKey, "replicas",
 		replicaVMMDKey, k.VM, replicaDiskMDKey, k.Disk, replicaProjectMDKey, k.Project}
+	if k.UUID != "" {
+		kv = append(kv, replicaVMUUIDMDKey, k.UUID)
+	}
 	if named != "" {
 		kv = append(kv, replicaNamedMDKey, named)
 		if admin {
@@ -456,7 +542,8 @@ func mdOne(md metadata.MD, key string) string {
 // must agree. (A deleted VM of the same name in another project, whose
 // successor has not replicated here yet, does not refuse the call.)
 func (s *Server) replicaKeyFromMD(ctx context.Context, md metadata.MD) (replicaKey, error) {
-	k := replicaKey{VM: mdOne(md, replicaVMMDKey), Disk: mdOne(md, replicaDiskMDKey), Project: tenancy.NormalizeProject(mdOne(md, replicaProjectMDKey))}
+	k := replicaKey{VM: mdOne(md, replicaVMMDKey), Disk: mdOne(md, replicaDiskMDKey), Project: tenancy.NormalizeProject(mdOne(md, replicaProjectMDKey)),
+		UUID: mdOne(md, replicaVMUUIDMDKey)}
 	if k.VM == "" || k.Disk == "" {
 		return replicaKey{}, status.Error(codes.InvalidArgument, "a replica content call names no VM and disk")
 	}
@@ -505,7 +592,7 @@ type poolFileConfinement struct {
 	rec     corrosion.StoragePoolRecord
 	dir     string // the pool's own directory
 	caller  poolContentCaller
-	uploads map[string]poolUpload
+	uploads poolRecords
 	vmOK    map[string]bool // VM name → caller may read it
 }
 

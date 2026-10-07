@@ -568,9 +568,11 @@ type Server struct {
 	// poolUploadsMu serializes the read-modify-write of <data_dir>/pool-uploads.json
 	// (storage_pool_confine.go).
 	poolUploadsMu sync.Mutex
-	// poolRecordsEpochAt caches the pool-file records epoch once every host
-	// has begun recording (pool_records.go); it never changes after.
-	poolRecordsEpochAt atomic.Pointer[time.Time]
+	// epochCache caches each shared store's records epoch (store id →
+	// epochEntry), and storesMarked the stores this host has marked
+	// (pool_records.go).
+	epochCache   sync.Map
+	storesMarked sync.Map
 
 	// migrationStubs is what EnsureDisks created on this host as a migration
 	// target: the only disk files this host hands to a mirror or removes after

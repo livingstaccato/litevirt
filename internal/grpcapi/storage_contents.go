@@ -247,8 +247,12 @@ func (s *Server) DeleteStoragePoolContent(ctx context.Context, req *pb.DeleteSto
 		return nil, status.Errorf(codes.NotFound, "%q is not in pool %q", req.Filename, req.PoolName)
 	}
 	// Never a file a live disk uses — this pool's or, in a directory shared
-	// with other disks, anyone's.
+	// with other disks, anyone's; and for the daemon's pruning on shared
+	// storage, any host's (a promotion there may keep it as a backing file).
 	owners, err := s.liveDiskOwners(ctx, s.hostName, target)
+	if caller.view == viewReplicas {
+		owners, err = s.replicaUsers(ctx, target)
+	}
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "check disk use: %v", err)
 	}
@@ -376,7 +380,7 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 		dir = s.poolUploadDir(poolDir)
 	}
 	if caller.view == viewReplicas && !replicaNameIs(first.Filename, caller.replica) {
-		return status.Errorf(codes.InvalidArgument, "%q is not a replica name of vm %q disk %q", first.Filename, caller.replica.VM, caller.replica.Disk)
+		return notAReplicaName(first.Filename, caller.replica)
 	}
 	dest, err := safename.SafeJoin(dir, first.Filename)
 	if err != nil {

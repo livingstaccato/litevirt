@@ -501,8 +501,8 @@ func (s *Server) findReplicaHost(ctx context.Context, req *pb.PromoteReplicaRequ
 			continue
 		}
 		byHost[h] = names
-		// Timestamped suffix sorts lexically oldest→newest.
-		if len(names) > 0 && names[len(names)-1] > bestName {
+		// Each host's list is oldest first, by the run time in the names.
+		if len(names) > 0 && (bestName == "" || replicaOlder(bestName, names[len(names)-1])) {
 			bestName, bestHost = names[len(names)-1], h
 		}
 	}

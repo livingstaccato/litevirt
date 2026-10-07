@@ -110,7 +110,7 @@ func (s *Server) PushReplicaIncrement(stream pb.LiteVirt_PushReplicaIncrementSer
 	if caller.view == viewReplicas {
 		k := caller.replica
 		if !replicaNameIs(first.Filename, k) {
-			return status.Errorf(codes.InvalidArgument, "%q is not a replica name of vm %q disk %q", first.Filename, k.VM, k.Disk)
+			return notAReplicaName(first.Filename, k)
 		}
 		if first.Base != "" {
 			uploads, uerr := s.loadPoolUploads(ctx, dir)

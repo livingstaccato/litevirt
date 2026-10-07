@@ -209,15 +209,24 @@ func (s *Server) replicateLocalWith(ctx context.Context, sched corrosion.BackupS
 		})
 		return fmt.Errorf("replicate %s: %w", src.DiskName, err)
 	}
-	// The record is what makes it this VM's to promote and prune. Without one
-	// it is still matched by its exact name, so a failed write only warns.
-	pruned := 0
+	// The record is what makes it this VM's to promote and prune: on shared
+	// storage, an unrecorded file made now is never matched by its name on
+	// another host. A replica that cannot be recorded is withdrawn and the
+	// run fails, to be retried, rather than left unpromotable.
+	recErr := errors.New("its VM's row cannot be read")
 	if known {
-		if err := s.recordPoolReplica(ctx, sched.TargetPool, k, dstPath); err != nil {
-			slog.Warn("replication: replica written but not recorded", "vm", sched.VMName, "replica", dstPath, "error", err)
-		}
-		pruned = s.pruneLocalReplicas(ctx, dstDir, k, sched.KeepReplicas)
+		recErr = s.recordPoolReplica(ctx, sched.TargetPool, k, dstPath)
 	}
+	if recErr != nil {
+		_ = os.Remove(dstPath)
+		s.recordVMEvent(ctx, sched.VMName, "disk.replicated", "error", fmt.Sprintf("%s → %s: replica not recorded: %v", src.DiskName, sched.TargetPool, recErr))
+		s.notify(ctx, notify.Notification{
+			Kind: "replication.failed", Severity: notify.SevError, Subject: sched.VMName,
+			Detail: fmt.Sprintf("%s → %s: the replica could not be recorded and was withdrawn: %v", src.DiskName, sched.TargetPool, recErr),
+		})
+		return fmt.Errorf("replicate %s: record the replica: %w", src.DiskName, recErr)
+	}
+	pruned := s.pruneLocalReplicas(ctx, dstDir, k, sched.KeepReplicas)
 	detail := fmt.Sprintf("%s → %s (%s)", src.DiskName, sched.TargetPool, ts)
 	if pruned > 0 {
 		detail += fmt.Sprintf(", pruned %d old", pruned)
@@ -427,12 +436,14 @@ func (s *Server) advanceReplicationCheckpoint(ctx context.Context, vmName, repo,
 }
 
 // newestRawReplica returns the newest raw replica of k's disk in the target
-// pool on host, or "" if none. Used as the fork base for an incremental push.
-// Uses replicaNames (RBAC-free), since the scheduler runs unauthenticated.
+// pool on host, or "" if none. Used as the fork base for an incremental push:
+// only a replica a run made (never an operator's copy, whatever its name),
+// newest by its run time. Uses replicaNames (RBAC-free), since the scheduler
+// runs unauthenticated.
 func (s *Server) newestRawReplica(ctx context.Context, pool, host string, k replicaKey) string {
 	best := ""
 	for _, n := range s.replicaNames(ctx, pool, host, k, "", false) {
-		if strings.HasSuffix(n, ".raw") && n > best {
+		if strings.HasSuffix(n, ".raw") && (best == "" || replicaOlder(best, n)) {
 			best = n
 		}
 	}
@@ -460,8 +471,10 @@ func (s *Server) applyIncrementLocal(ctx context.Context, pool, newName, base st
 	if err != nil {
 		return err
 	}
+	// Unrecorded, it would be unpromotable: withdrawn, and the run fails.
 	if err := s.recordPoolReplica(ctx, pool, k, dest); err != nil {
-		slog.Warn("replication: replica written but not recorded", "vm", k.VM, "replica", dest, "error", err)
+		_ = os.Remove(dest)
+		return fmt.Errorf("record replica %s: %w", filepath.Base(dest), err)
 	}
 	return nil
 }
@@ -589,22 +602,23 @@ func isSharedDriver(driver string) bool {
 }
 
 // pruneLocalReplicas keeps the newest keepN replicas of k's disk in dir
-// (localReplicaNames: by record, or an unrecorded file by its exact name),
-// deleting older ones — never one a live disk uses (a promotion that kept the
-// replica as its backing file), as a remote prune's delete refuses too.
-// keepN <= 0 keeps all. Returns the count deleted.
+// (localReplicaNames: by record, or an unrecorded file by its exact name;
+// never an operator's copy), deleting older ones — never one a live disk uses
+// (a promotion that kept the replica as its backing file; on shared storage,
+// on any host), as a remote prune's delete refuses too. keepN <= 0 keeps
+// all. Returns the count deleted.
 func (s *Server) pruneLocalReplicas(ctx context.Context, dir string, k replicaKey, keepN int) int {
 	if keepN <= 0 {
 		return 0
 	}
-	names := s.localReplicaNames(ctx, dir, k, "", false) // timestamped suffix sorts oldest→newest
+	names := s.localReplicaNames(ctx, dir, k, "", false) // oldest first
 	if len(names) <= keepN {
 		return 0
 	}
 	deleted := 0
 	for _, n := range names[:len(names)-keepN] {
 		p := filepath.Join(dir, n)
-		if owners, err := s.liveDiskOwners(ctx, s.hostName, p); err != nil || len(owners) > 0 {
+		if owners, err := s.replicaUsers(ctx, p); err != nil || len(owners) > 0 {
 			continue
 		}
 		if os.Remove(p) == nil {
@@ -615,6 +629,15 @@ func (s *Server) pruneLocalReplicas(ctx context.Context, dir string, k replicaKe
 		}
 	}
 	return deleted
+}
+
+// replicaUsers returns the live disks that use the replica at path: this
+// host's, and on shared storage every host's.
+func (s *Server) replicaUsers(ctx context.Context, path string) ([]corrosion.DiskRecord, error) {
+	if sharedStoreOf(filepath.Dir(path)).Shared {
+		return corrosion.DisksReferencingPath(ctx, s.db, path)
+	}
+	return s.liveDiskOwners(ctx, s.hostName, path)
 }
 
 // replicaKeyFor is the replica key of vmName's disk, in the VM's project;

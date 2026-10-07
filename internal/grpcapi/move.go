@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -583,10 +584,14 @@ func (s *Server) deleteDiskAtRecordedLocation(ctx context.Context, d *corrosion.
 func (s *Server) protectedDiskPathsFrom(ctx context.Context, vmName string, candidates []string) map[string]bool {
 	keep := make(map[string]bool, len(candidates))
 	for _, path := range candidates {
-		// An upload (an older one, from before uploads into <data_dir>/disks
-		// went to disks/uploads), or a recorded replica, is a project's file,
-		// not a VM's debris, whatever its name. Unreadable records protect.
-		if _, recorded, rerr := s.recordOf(ctx, path); recorded || rerr != nil {
+		// A user's upload (an older one, from before uploads into
+		// <data_dir>/disks went to disks/uploads) is a project's file, not a
+		// VM's debris, whatever its name. Unreadable records protect. A
+		// replica's or replicate-volume copy's record does not: the sweep
+		// takes what it always took (a run's replicas, stamped, are never
+		// among its candidates).
+		recs, rerr := s.recordsOf(ctx, path)
+		if rerr != nil || slices.ContainsFunc(recs, func(u poolUpload) bool { return u.VM == "" && !u.Peer }) {
 			keep[path] = true
 			continue
 		}

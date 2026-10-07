@@ -35,18 +35,29 @@ import (
 // no VM of another project has a disk that writes the same name, and no disk
 // of another project's VM uses the file.
 //
+// A file whose records all went stale (the file changed since) is matched by
+// its name in the same way: a record only ever adds proof.
+//
+// A replicate-volume copy is recorded as the operator's copy of the disk, not
+// as a replica: pruning, the newest replica and an increment's base never
+// take it. Replicas are ordered by the run time their names carry.
+//
 // A replica an operator names for a manual promotion (explicitReplicaOK) may
-// also be an upload the VM's project owns, or a pre-records file named
-// <vm>-<disk>-<anything>; an admin may name any file in the pool.
+// also be such a copy, an upload the VM's project owns, or a pre-records file
+// named <vm>-<disk>-<anything>; an admin may name any file in the pool.
 
 // replicaKey names one VM's disk, in its project, whose replicas a call is
 // about.
 type replicaKey struct {
 	VM, Disk, Project string
+	// UUID is the VM's incarnation uuid when known. It keys the replicated
+	// record of the replicas (pool_records.go), never their matching.
+	UUID string
 }
 
 func replicaKeyOf(vm *corrosion.VMRecord, disk string) replicaKey {
-	return replicaKey{VM: vm.Name, Disk: disk, Project: tenancy.NormalizeProject(vm.Project)}
+	uuid, _ := vmSpecUUID(vm.Spec)
+	return replicaKey{VM: vm.Name, Disk: disk, Project: tenancy.NormalizeProject(vm.Project), UUID: uuid}
 }
 
 // sameProject compares projects as stored ("" is the default project).
@@ -75,19 +86,56 @@ func replicaStem(name string) (string, bool) {
 // <prefix> ("<vm>-<disk>"). A stamp beyond now plus replicaStampSkew does not
 // parse.
 func replicaNamePrefix(name string) (string, bool) {
+	p, _, future, ok := parseReplicaName(name)
+	return p, ok && !future
+}
+
+// parseReplicaName parses <prefix>-<YYYYMMDD-HHMMSS>.<qcow2|raw> from the
+// right, whenever the stamp is (future: beyond now plus replicaStampSkew).
+func parseReplicaName(name string) (prefix string, ts time.Time, future, ok bool) {
 	base, ok := replicaStem(name)
 	if !ok {
-		return "", false
+		return "", time.Time{}, false, false
 	}
 	n := len(base) - len(replicaStampLayout)
 	if n < 4 || base[n-1] != '-' {
-		return "", false
+		return "", time.Time{}, false, false
 	}
 	ts, err := time.Parse(replicaStampLayout, base[n:])
-	if err != nil || ts.After(time.Now().Add(replicaStampSkew)) {
-		return "", false
+	if err != nil {
+		return "", time.Time{}, false, false
 	}
-	return base[:n-1], true
+	return base[:n-1], ts, ts.After(time.Now().Add(replicaStampSkew)), true
+}
+
+// notAReplicaName is the refusal of a replica upload or push whose name is not
+// one of k's disk's, saying so when only its stamp is wrong: beyond this
+// host's clock, which is the replicating host's clock being ahead.
+func notAReplicaName(name string, k replicaKey) error {
+	if p, ts, future, ok := parseReplicaName(name); ok && future && p == k.VM+"-"+k.Disk {
+		return status.Errorf(codes.InvalidArgument,
+			"%q is stamped %s, in the future by more than %s of this host's clock: the replicating host's clock is ahead",
+			name, ts.Format(time.RFC3339), replicaStampSkew)
+	}
+	return status.Errorf(codes.InvalidArgument, "%q is not a replica name of vm %q disk %q", name, k.VM, k.Disk)
+}
+
+// replicaOlder orders replicas by the run time their names carry (a name
+// with none first, then by name): replicas of one disk by age.
+func replicaOlder(a, b string) bool {
+	ta, oka := replicaTimestamp(a)
+	tb, okb := replicaTimestamp(b)
+	switch {
+	case oka && okb && !ta.Equal(tb):
+		return ta.Before(tb)
+	case oka != okb:
+		return okb
+	}
+	return a < b
+}
+
+func sortReplicasOldestFirst(names []string) {
+	sort.SliceStable(names, func(i, j int) bool { return replicaOlder(names[i], names[j]) })
 }
 
 // replicaNameIs reports whether name is exactly a replica name of k's disk.
@@ -187,17 +235,19 @@ func (s *Server) usedByOtherProject(ctx context.Context, path string, k replicaK
 	return false
 }
 
-// isReplicaFor reports whether the file at path is a replica of k's disk: by
-// its record when it has one, and otherwise by its exact name, as a replica
-// made before records (see the comment at the top of this file). An older
-// node's upload (a Peer record) was placed by a node, not a user: it is
-// matched by name like an unrecorded file, whenever it was made.
-func (s *Server) isReplicaFor(ctx context.Context, uploads map[string]poolUpload, path string, k replicaKey) bool {
-	u, recorded := s.poolUploadOf(uploads, path)
+// isReplicaFor reports whether the file at path is a replica a replication
+// run made of k's disk: by its record when one still describes it (a copy is
+// not), and otherwise by its exact name, as a replica made before records
+// (see the comment at the top of this file). An older node's upload (a Peer
+// record) was placed by a node, not a user, and a file whose records are all
+// stale was changed since: both are matched by name like a file from before
+// records, whenever they were made.
+func (s *Server) isReplicaFor(ctx context.Context, uploads poolRecords, path string, k replicaKey) bool {
+	u, st := s.recordState(uploads, path)
 	switch {
-	case recorded && !u.Peer:
-		return u.VM == k.VM && u.Disk == k.Disk && sameProject(u.Project, k.Project)
-	case !recorded && !s.isLegacyUnrecorded(ctx, path):
+	case st == recMatched && !u.Peer:
+		return !u.Copy && u.VM == k.VM && u.Disk == k.Disk && sameProject(u.Project, k.Project)
+	case st == recNone && !s.isLegacyUnrecorded(ctx, path):
 		return false
 	}
 	name := filepath.Base(path)
@@ -206,11 +256,12 @@ func (s *Server) isReplicaFor(ctx context.Context, uploads map[string]poolUpload
 
 // explicitReplicaOK reports whether a manual promotion may use the file at
 // path, named by the operator, as k's disk: any regular file for an admin
-// (storage.hostpath at the root); otherwise a replica of it (isReplicaFor),
-// an upload its project owns (uploadIsProjects), or a file from before
-// records named <vm>-<disk>-<anything>.<qcow2|raw> that no other project's
-// VM and disk could have written. Never another project's upload.
-func (s *Server) explicitReplicaOK(ctx context.Context, uploads map[string]poolUpload, path string, k replicaKey, admin bool) bool {
+// (storage.hostpath at the root); otherwise a replica of it (isReplicaFor), a
+// replicate-volume copy of it, an upload its project owns
+// (uploadIsProjects), or a file from before records (or whose records are
+// stale) named <vm>-<disk>-<anything>.<qcow2|raw> that no other project's VM
+// and disk could have written. Never another project's upload.
+func (s *Server) explicitReplicaOK(ctx context.Context, uploads poolRecords, path string, k replicaKey, admin bool) bool {
 	fi, err := os.Lstat(path)
 	if err != nil || !fi.Mode().IsRegular() {
 		return false
@@ -218,13 +269,14 @@ func (s *Server) explicitReplicaOK(ctx context.Context, uploads map[string]poolU
 	if admin || s.isReplicaFor(ctx, uploads, path, k) {
 		return true
 	}
-	u, recorded := s.poolUploadOf(uploads, path)
+	u, st := s.recordState(uploads, path)
 	switch {
-	case recorded && u.VM != "":
-		return false // another disk's replica
-	case recorded && !u.Peer:
+	case st == recMatched && u.VM != "":
+		// k's disk's copy; never another disk's replica or copy.
+		return u.Copy && u.VM == k.VM && u.Disk == k.Disk && sameProject(u.Project, k.Project)
+	case st == recMatched && !u.Peer:
 		return s.uploadIsProjects(ctx, u, k)
-	case !recorded && !s.isLegacyUnrecorded(ctx, path):
+	case st == recNone && !s.isLegacyUnrecorded(ctx, path):
 		return false
 	}
 	name := filepath.Base(path)
@@ -274,8 +326,8 @@ func lexists(p string) bool {
 	return err == nil
 }
 
-// localReplicaNames lists the replicas of k's disk in dir, oldest first (the
-// stamp sorts lexically). With named, it is that one file when a manual
+// localReplicaNames lists the replicas of k's disk in dir, oldest first (by
+// the run time in their names). With named, it is that one file when a manual
 // promotion may use it (explicitReplicaOK), or none.
 func (s *Server) localReplicaNames(ctx context.Context, dir string, k replicaKey, named string, admin bool) []string {
 	uploads, err := s.loadPoolUploads(ctx, s.poolContentDirs(dir)...)
@@ -301,7 +353,7 @@ func (s *Server) localReplicaNames(ctx context.Context, dir string, k replicaKey
 			names = append(names, e.Name())
 		}
 	}
-	sort.Strings(names)
+	sortReplicasOldestFirst(names)
 	return names
 }
 
@@ -363,7 +415,7 @@ func (s *Server) remoteReplicaNames(ctx context.Context, client pb.LiteVirtClien
 			names = append(names, n)
 		}
 	}
-	sort.Strings(names)
+	sortReplicasOldestFirst(names)
 	return names
 }
 

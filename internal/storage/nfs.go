@@ -147,6 +147,7 @@ type mountEntry struct {
 	flags  []string
 	fstype string
 	source string
+	super  []string // the filesystem's own options (NFS and CIFS: addr=…)
 }
 
 // mounts parses mountinfo, in order (a later mount on the same point is on top).
@@ -165,6 +166,9 @@ func mounts() ([]mountEntry, error) {
 		// Optional fields end at "-"; filesystem type and source follow it.
 		if i := slices.Index(f[6:], "-"); i >= 0 && len(f) > 6+i+2 {
 			e.fstype, e.source = f[6+i+1], unescapeMountInfo(f[6+i+2])
+			if len(f) > 6+i+3 {
+				e.super = strings.Split(f[6+i+3], ",")
+			}
 		}
 		out = append(out, e)
 	}

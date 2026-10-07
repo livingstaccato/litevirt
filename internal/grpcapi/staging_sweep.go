@@ -103,9 +103,9 @@ func hasStagingPrefix(name string) bool {
 // build's publishReplica left behind (isLegacyReplicaPartial).
 //
 // It is also where a starting daemon records that this host has begun
-// recording pool files (markPoolRecordsStarted, pool_records.go).
+// recording pool files (MarkPoolRecords, pool_records.go).
 func (s *Server) SweepStaleStaging(ctx context.Context) {
-	s.markPoolRecordsStarted(ctx)
+	s.MarkPoolRecords(ctx)
 	dirs := map[string]struct{}{
 		filepath.Join(s.dataDir, "images"): {},
 		filepath.Join(s.dataDir, "disks"):  {},

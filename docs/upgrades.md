@@ -701,8 +701,9 @@ by its exact `<vm>-<disk>-<YYYYMMDD-HHMMSS>` name (docs/storage.md). A failover
 coordinator or replication run on a host not yet upgraded still lists, prunes
 and promotes by name prefix, as before, against every host — upgraded ones
 answer it as they always did. That ends when the coordinator's host is
-upgraded. The records epoch, after which a file with no record is never taken
-by its name, starts only once every host has started this release.
+upgraded. The records epoch, after which a file with no record on shared
+storage is never taken by its name, starts only once every host has started
+this release and every host holding a pool on that storage has noted it.
 
 ### The voter set becomes explicit after the roll
 

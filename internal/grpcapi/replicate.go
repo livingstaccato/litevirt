@@ -191,12 +191,14 @@ func (s *Server) ReplicateVolume(req *pb.ReplicateVolumeRequest, stream grpc.Ser
 	if err := convertQcow2(ctx, src.Path, dstPath, emit); err != nil {
 		return status.Errorf(codes.Internal, "qemu-img convert: %v", err)
 	}
-	// A copy into the pool's directory is a replica of the disk, whatever it
-	// is named: recorded as the VM's, it is promotable by name as before.
+	// A copy into the pool's directory is the operator's copy of the disk,
+	// whatever it is named: recorded as the VM's project's, promotable by
+	// name, and never taken for a replication run's replica — not pruned,
+	// not the newest, not an increment's base.
 	if filepath.Dir(dstPath) == filepath.Clean(dstDir) {
 		if k, ok := s.replicaKeyFor(ctx, req.VmName, req.DiskName); ok {
-			if err := s.recordPoolReplica(ctx, req.TargetPool, k, dstPath); err != nil {
-				slog.Warn("replicate: copy written but not recorded as the VM's replica", "path", dstPath, "error", err)
+			if err := s.recordPoolCopy(ctx, req.TargetPool, k, dstPath); err != nil {
+				slog.Warn("replicate: copy written but not recorded as the VM's; an admin can still promote it by name", "path", dstPath, "error", err)
 			}
 		}
 	}

@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -247,11 +248,74 @@ func (s *Server) isReplicaFor(ctx context.Context, uploads poolRecords, path str
 	switch {
 	case st == recMatched && !u.Peer:
 		return !u.Copy && u.VM == k.VM && u.Disk == k.Disk && sameProject(u.Project, k.Project)
-	case st == recNone && !s.isLegacyUnrecorded(ctx, path):
+	case st == recNone && !s.isLegacyUnrecorded(ctx, path) && !s.lateReplicaOK(ctx, path, k):
 		return false
 	}
 	name := filepath.Base(path)
 	return replicaNameIs(name, k) && !s.replicaNameClaimedElsewhere(ctx, name, k) && !s.usedByOtherProject(ctx, path, k)
+}
+
+// lateReplicaOK reports whether an unrecorded file on shared storage, made
+// after its records epoch, is a replica of k's disk whose record has not
+// arrived: its writer, the VM's host, stopped answering (a partition: it kept
+// writing to the store, its records did not reach this side) before the
+// record could replicate. All of: the name is exactly k's runner name (the
+// caller then applies the claimed-elsewhere and other-project checks), no
+// record of any host names the file (the caller's recNone), the VM's host is
+// not live, that host has a replica row for this VM disk on this store, and
+// the file is newer — by stamp and modification time — than every entry of
+// that row and no newer than the host was last seen answering.
+func (s *Server) lateReplicaOK(ctx context.Context, path string, k replicaKey) bool {
+	name := filepath.Base(path)
+	_, ts, future, ok := parseReplicaName(name)
+	if !ok || future || !replicaNameIs(name, k) {
+		return false
+	}
+	vm, err := corrosion.GetVM(ctx, s.db, k.VM)
+	if err != nil || vm == nil || !sameProject(vm.Project, k.Project) || vm.HostName == "" || vm.HostName == s.hostName {
+		return false
+	}
+	writer := vm.HostName
+	last, healthy, err := corrosion.HostLastSeen(ctx, s.db, writer)
+	if err != nil || last.IsZero() {
+		return false
+	}
+	if hr, err := corrosion.GetHost(ctx, s.db, writer); err != nil || (healthy && (hr == nil || hr.State != "fenced")) {
+		return false // live, or unknown
+	}
+	st := sharedStoreOf(filepath.Dir(path))
+	if st.ID == "" {
+		return false
+	}
+	rows, err := corrosion.ListPoolRecords(ctx, s.db, replicaRowPrefix(st.ID, writer))
+	if err != nil {
+		return false
+	}
+	found := false
+	var newestStamp time.Time
+	var newestMtime int64
+	for _, v := range rows {
+		var row replicaRow
+		if json.Unmarshal([]byte(v), &row) != nil || row.VM != k.VM || row.Disk != k.Disk || !sameProject(row.Project, k.Project) {
+			continue
+		}
+		found = true
+		for n, f := range row.Files {
+			if f.Copy {
+				continue
+			}
+			if t, ok := replicaTimestamp(n); ok && t.After(newestStamp) {
+				newestStamp = t
+			}
+			newestMtime = max(newestMtime, f.MtimeNs)
+		}
+	}
+	fi, err := os.Lstat(path)
+	if !found || err != nil || !ts.After(newestStamp) || fi.ModTime().UnixNano() <= newestMtime {
+		return false
+	}
+	limit := last.Add(replicaStampSkew)
+	return !fi.ModTime().After(limit) && !ts.After(limit)
 }
 
 // explicitReplicaOK reports whether a manual promotion may use the file at

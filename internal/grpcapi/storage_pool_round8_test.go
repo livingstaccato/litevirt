@@ -206,9 +206,9 @@ func TestPoolRound8_AStaleRecordNeverRefusesAReplica(t *testing.T) {
 	if got := h1.replicaNames(context.Background(), "shared", "", k, "", false); len(got) != 1 {
 		t.Errorf("after a remount h1 sees cvm's replicas %v, want the one it wrote", got)
 	}
-	// h1's own record no longer describes the file (another inode); the
-	// shared record, by size and time, still does, and is not shadowed.
-	setRecordField(t, h1, "ino", 1)
+	// h1's own record no longer describes the file (a local record that
+	// went stale); the shared record still does, and is not shadowed.
+	setRecordField(t, h1, "mtime_ns", 1)
 	if got := h1.replicaNames(context.Background(), "shared", "", k, "", false); len(got) != 1 {
 		t.Errorf("a stale local record shadows the valid shared one: h1 sees %v", got)
 	}
@@ -320,13 +320,14 @@ func TestPoolRound8_ACephFSPoolFailsOverViaAnotherHost(t *testing.T) {
 	}
 }
 
-// C3: one NFS export spelled two ways — a name on h1, its address on h2 —
-// is one export: h2 holds h1's records.
-func TestPoolRound8_AnNFSExportSpelledTwoWaysIsOne(t *testing.T) {
-	src := map[string]string{"h1": "nas:/shared", "h2": "10.0.0.5:/shared"}
+// C3, NC1: an NFS export behind round-robin DNS (SmartConnect) is one
+// store however the name resolved: each host connected to another address,
+// and h2 holds h1's records.
+func TestPoolRound8_ADNSBalancedNASIsOneStore(t *testing.T) {
+	addr := map[string]string{"h1": "10.0.0.5", "h2": "10.0.0.6"}
 	h1, h2, ms := twoHostsOnMount(t, func(host, dir string) string {
-		return fmt.Sprintf("40 1 0:60 / %s rw,nosuid,nodev,noexec,nosymfollow,relatime - nfs4 %s rw,vers=4.2,addr=10.0.0.5", dir, src[host])
-	}, map[string]map[string]string{"h1": {"nfs_export": src["h1"]}, "h2": {"nfs_export": src["h2"]}})
+		return fmt.Sprintf("40 1 0:60 / %s rw,nosuid,nodev,noexec,nosymfollow,relatime - nfs4 isilon:/ifs/vm rw,vers=4.2,addr=%s", dir, addr[host])
+	}, map[string]map[string]string{"h1": {"nfs_export": "isilon:/ifs/vm"}, "h2": {"nfs_export": "isilon:/ifs/vm"}})
 	replicateOnH1(t, h1, ms)
 	ms.as("h2")
 	reps := stampedReplicas(t, ms.dir, "cvm-root")
@@ -338,7 +339,7 @@ func TestPoolRound8_AnNFSExportSpelledTwoWaysIsOne(t *testing.T) {
 		t.Fatalf("cvm's replicas = %v", reps)
 	}
 	if u, ok := h2.poolUploadOf(m, filepath.Join(ms.dir, reps[0])); !ok || u.VM != "cvm" {
-		t.Errorf("h2 does not hold h1's record made under another spelling: %+v %v", u, ok)
+		t.Errorf("h2 does not hold h1's record made through another address: %+v %v", u, ok)
 	}
 }
 
@@ -376,23 +377,54 @@ func TestPoolRound8_WithoutVisibleSharedRecordsAReplicaIsMatchedByName(t *testin
 // I1: a replica whose record cannot be written fails the run and is not left
 // behind, unpromotable.
 func TestPoolRound8_AReplicaThatCannotBeRecordedFailsTheRun(t *testing.T) {
-	s, own := ownPoolServer(t)
-	insertReplicationSchedule(t, s, "web", "pa")
+	h1, _, dir := twoHostsOnOneExport(t)
+	insertPromotableVM(t, h1, "web", "acme", "h1", "root")
+	if _, ok := h1.storeRecordsEpoch(context.Background(), sharedStoreOf(dir).ID); !ok {
+		t.Fatal("the store's records epoch is not known")
+	}
 	// The records file cannot be read or written.
-	if err := os.Mkdir(filepath.Join(s.dataDir, "pool-uploads.json"), 0o755); err != nil {
+	if err := os.Mkdir(filepath.Join(h1.dataDir, "pool-uploads.json"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	sched, _ := s.replicationScheduleForVM(adminCtx(), "web")
-	if err := s.RunReplication(adminCtx(), sched, time.Now()); err == nil {
+	sched := corrosion.BackupScheduleRecord{
+		VMName: "web", Scope: "vm", Repo: "shared", Cron: "0 0 * * *", Enabled: true,
+		Type: "replication", TargetPool: "shared", TargetHost: "h1", KeepReplicas: 2,
+	}
+	if err := h1.RunReplication(adminCtx(), sched, time.Now()); err == nil {
 		t.Errorf("a full replication whose replica was not recorded succeeded")
 	}
 	k := replicaKey{VM: "web", Disk: "root", Project: "acme"}
 	name := "web-root-" + stampAgo(0) + ".raw"
-	if err := s.applyIncrementLocal(context.Background(), "pa", name, "", 4096, bytes.NewReader(make([]byte, 4096)), [][2]int64{{0, 4096}}, k); err == nil {
+	if err := h1.applyIncrementLocal(context.Background(), "shared", name, "", 4096, bytes.NewReader(make([]byte, 4096)), [][2]int64{{0, 4096}}, k); err == nil {
 		t.Errorf("an incremental replica that was not recorded was applied")
 	}
-	if got := stampedReplicas(t, own, "web-root"); len(got) != 0 {
+	if got := stampedReplicas(t, dir, "web-root"); len(got) != 0 {
 		t.Errorf("unrecorded replicas left behind: %v", got)
+	}
+}
+
+// m-a: where an unrecorded replica is matched by its name anyway (a local
+// pool), a record that cannot be written does not stop replication: the
+// replica stays and promotes, as on main.
+func TestPoolRound8_AnUnrecordableReplicaOnALocalPoolIsKept(t *testing.T) {
+	s, own := ownPoolServer(t)
+	insertReplicationSchedule(t, s, "web", "pa")
+	if err := os.Mkdir(filepath.Join(s.dataDir, "pool-uploads.json"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sched, _ := s.replicationScheduleForVM(adminCtx(), "web")
+	if err := s.RunReplication(adminCtx(), sched, time.Now()); err != nil {
+		t.Fatalf("replication on a local pool with an unwritable records file: %v", err)
+	}
+	got := stampedReplicas(t, own, "web-root")
+	if len(got) != 1 {
+		t.Fatalf("web's replicas = %v, want the one the run made", got)
+	}
+	if err := os.Remove(filepath.Join(s.dataDir, "pool-uploads.json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AutoPromoteReplica(context.Background(), "web", "", 0); err != nil || !promotedFrom(own, "web", got[0]) {
+		t.Errorf("the unrecorded replica was not promoted: %v", err)
 	}
 }
 
@@ -577,6 +609,9 @@ func TestPoolRound8_AReplicaThatCannotBeSharedFailsTheRun(t *testing.T) {
 	}
 	if err := corrosion.UpsertBackupSchedule(adminCtx(), h1.db, sched); err != nil {
 		t.Fatal(err)
+	}
+	if _, ok := h1.storeRecordsEpoch(context.Background(), sharedStoreOf(dir).ID); !ok {
+		t.Fatal("the store's records epoch is not known")
 	}
 	// Every write to the replicated rows fails from here on.
 	if err := h1.db.Execute(context.Background(), `CREATE TRIGGER no_pool_rows BEFORE INSERT ON cluster_policies BEGIN SELECT RAISE(ABORT, 'refused'); END`); err != nil {

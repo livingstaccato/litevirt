@@ -240,19 +240,26 @@ same name — `bvm` with a disk `root-20261006` and `bvm-root` with a disk
 while another project's VM `web` without a disk `prod-root` does not stop
 `web-prod`'s `web-prod-root-…` replicas from being `web-prod`'s. Promotion
 boots, and pruning deletes, nothing else; pruning never deletes a replica a
-live disk uses (on shared storage, a live disk on any host). Replicas are
+live disk uses (on shared storage, a live disk on any host — matched by the
+file's name, since another host may mount the store at another path). Replicas are
 ordered by the run time in their names, newest last: the newest is the one
 failover promotes, pruning keeps the newest `keep_replicas`, and an incremental
 replica forks from the newest raw one. When the replica promotion picked is
 missing or unreadable on its host, it tries the next-older one there; a
 replica the operator named is never swapped. A replication run whose replica
 cannot be recorded (a full data directory, the replicated rows not writable)
-removes it and fails, raising `replication.failed`, and the next run retries.
+on a shared store where an unrecorded file would not be matched by its name
+removes it and fails, raising `replication.failed`, and the next run retries;
+anywhere else the replica stays, matched by its name, and the failure is
+logged. A `replicate-volume` copy that cannot be recorded stays, and the
+command's final status says so.
 
 Records only ever add proof. A record bound to a file that has since changed
 (rewritten, or replaced by hand) no longer says whose it is, and the file is
-matched by its name as if it had none; a reboot or remount does not change a
-record's binding.
+matched by its name as if it had none. A record is bound to its path, size
+and modification time only, so a reboot, a remount (CIFS `noserverino`, FUSE)
+or a copy of the data directory and its pools (`rsync -a`, `cp -a`, a
+restore) keeps every upload its project's.
 
 A replica an operator names for a manual promotion (`--replica`) may also be
 a file the VM's project owns by record — an upload into one of its pools, or
@@ -271,9 +278,9 @@ On shared storage — a pool directory on an NFS, CephFS, GlusterFS or CIFS/SMB
 mount other hosts mount too — the record of each upload and replica is also
 kept cluster-wide (in the replicated `cluster_policies` table, once
 `failover_scope_v1` has latched), so every host matches a file the same way.
-The records are keyed by the storage's identity, computed the same way on
-every host however it spells the mount: an NFS or CIFS export by the server
-address the kernel connected to (`addr=`) and the path below the export, a
+The records are keyed by the storage's identity: an NFS or CIFS export by the
+server as the mount names it (lower-cased; never the address it resolved to,
+which round-robin DNS or a re-IP changes) and the path below the export, a
 CephFS directory by the cluster's filesystem id and its path, a GlusterFS one
 by its volume name and path. Each host writes only its own rows — one per
 store for its uploads, one per VM disk (keyed by the VM's project and uuid,
@@ -282,13 +289,16 @@ reused in another project therefore inherits nothing. A row holds only files
 that exist, so the rows do not grow with history; on a `keep_replicas: 0`
 schedule a VM disk's row lists every replica kept.
 
-Each host notes when it began recording, and when it began sharing its
-records of each store its pools are on; a host retries these until the
-replicated rows are writable, so a new cluster needs no restart. Once every
-host has, and every host holding a pool on a store has noted that store
-under the same identity, a file there with no record that was modified after
-that moment was not put there by any host's daemon: it is never taken for a
-replica by its name. Everywhere else — a local directory, a network
+Each host notes when it began recording, and which store each of its pools
+is on now and since when, rewriting that whenever it changes (a remount, a
+re-IP, a kernel upgrade that changes the CephFS id); a host retries these
+until the replicated rows are writable, so a new cluster needs no restart.
+Once every host has, and every host holding a pool on a store is on that
+store under the same identity now, a file there with no record that was modified after
+the last of those moves was not put there by any host's daemon: it is never
+taken for a replica by its name. While any host holding the pool is on
+another identity (mid re-IP, or spelling the server differently), files are
+matched by name. Everywhere else — a local directory, a network
 filesystem whose identity cannot be told (OCFS2, GFS2, virtiofs, other FUSE
 mounts), an export two hosts spell differently with no `addr=` to reconcile
 them, a store some host has not noted yet, or while `failover_scope_v1` has
@@ -296,9 +306,19 @@ not latched — files with no record are matched by name as described above.
 Spell an NFS server the same on every host to keep its records shared.
 
 A replica's record on shared storage reaches another host as fast as the
-cluster replicates: a host that fails the moment it wrote one may leave its
-newest replica unrecorded elsewhere, and failover then takes the newest one
-that is recorded.
+cluster replicates. A host cut off from the others (a partition) may keep
+writing replicas to the store whose records never arrive. Failover still
+takes such a replica when its name is exactly the VM disk's runner name, no
+upload record names it, the VM's host is fenced or no longer answering, that
+host has recorded replicas of this disk on the store, and the file is newer
+than every one of them and no newer than the moment that host was last seen
+answering (plus ten minutes of clock skew); the VM's events then name the
+replica as promoted without its record. A file planted by anyone else is
+outside those bounds and is refused.
+
+On a store without an identity, a file recorded on another host has no
+record here: a project's own disk-image upload made through one host is
+listed for the project only through that host.
 
 Deleting a VM sweeps its leftover `<vm>-<disk>.qcow2` files from
 `<data_dir>/disks` as before, a default-named `replicate-volume` copy

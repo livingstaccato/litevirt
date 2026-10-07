@@ -569,10 +569,10 @@ type Server struct {
 	// (storage_pool_confine.go).
 	poolUploadsMu sync.Mutex
 	// epochCache caches each shared store's records epoch (store id →
-	// epochEntry), and storesMarked the stores this host has marked
+	// epochEntry); hostStoresMu serializes this host's stores row
 	// (pool_records.go).
 	epochCache   sync.Map
-	storesMarked sync.Map
+	hostStoresMu sync.Mutex
 
 	// migrationStubs is what EnsureDisks created on this host as a migration
 	// target: the only disk files this host hands to a mirror or removes after

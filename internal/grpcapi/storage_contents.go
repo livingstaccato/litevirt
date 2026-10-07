@@ -470,6 +470,13 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 	default:
 		recErr = s.recordPeerUpload(ctx, rec.Name, dest)
 	}
+	// A replica that cannot be recorded stays where it would be matched by
+	// its name anyway (not a shared store whose records epoch is known), as
+	// before records; a user's upload is theirs only by its record.
+	if recErr != nil && caller.view == viewReplicas && s.isLegacyUnrecorded(ctx, dest) {
+		slog.Warn("replica upload not recorded; it is matched by its name", "path", dest, "error", recErr)
+		recErr = nil
+	}
 	if recErr != nil {
 		_ = os.Remove(dest)
 		return status.Errorf(codes.Internal, "record upload: %v", recErr)

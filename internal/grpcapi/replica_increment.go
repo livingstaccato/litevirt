@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -158,8 +159,13 @@ func (s *Server) PushReplicaIncrement(stream pb.LiteVirt_PushReplicaIncrementSer
 	}
 	if caller.view == viewReplicas {
 		if err := s.recordPoolReplica(ctx, rec.Name, caller.replica, dest); err != nil {
-			_ = os.Remove(dest)
-			return status.Errorf(codes.Internal, "record replica: %v", err)
+			// Matched by its name where an unrecorded file is (see
+			// UploadStoragePoolContent); withdrawn where it would not be.
+			if !s.isLegacyUnrecorded(ctx, dest) {
+				_ = os.Remove(dest)
+				return status.Errorf(codes.Internal, "record replica: %v", err)
+			}
+			slog.Warn("replica push not recorded; it is matched by its name", "path", dest, "error", err)
 		}
 	}
 	return stream.SendAndClose(&pb.PushReplicaIncrementResponse{Path: dest, BytesWritten: written})

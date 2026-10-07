@@ -96,7 +96,9 @@ func (s *Server) shareRecord(ctx context.Context, path string, u poolUpload) err
 	if st.ID == "" || !s.db.MayWriteClusterPolicy() {
 		return nil
 	}
-	s.markStore(ctx, st.ID)
+	if err := s.refreshHostStores(ctx); err != nil {
+		return err
+	}
 	if u.VM != "" {
 		key := replicaRowKey(st.ID, s.hostName, u)
 		return s.updateRow(ctx, key, func(v string) (string, error) {
@@ -118,7 +120,6 @@ func (s *Server) shareRecord(ctx context.Context, path string, u poolUpload) err
 		if row.Files == nil {
 			row.Files = map[string]poolUpload{}
 		}
-		u.Ino = 0
 		row.Files[name] = u
 		dropGone(dir, row.Files)
 		b, err := json.Marshal(row)
@@ -244,7 +245,7 @@ func (s *Server) addSharedRecords(ctx context.Context, m poolRecords, dir string
 			if strings.Contains(name, "/") || u.VM != "" {
 				continue
 			}
-			u.shared, u.Ino = true, 0
+			u.shared = true
 			p := filepath.Join(dir, name)
 			m[p] = append(m[p], u)
 		}
@@ -282,10 +283,10 @@ func sortedKeys[T any](m map[string]T) []string {
 }
 
 // MarkPoolRecords records that this host has begun recording pool files, and
-// sharing its records of each store one of its pools is on. It runs at start
-// and then periodically (RunPoolRecordsMarker): on a new cluster the
+// which shared stores its pools are on now (refreshHostStores). It runs at
+// start and then periodically (RunPoolRecordsMarker): on a new cluster the
 // replicated rows are not writable at first start (failover_scope_v1 has not
-// latched yet), and a mark dropped then is written once they are.
+// latched yet), and a remount may move a pool to another store identity.
 func (s *Server) MarkPoolRecords(ctx context.Context) {
 	if !s.db.MayWriteClusterPolicy() {
 		return
@@ -293,23 +294,57 @@ func (s *Server) MarkPoolRecords(ctx context.Context) {
 	if err := corrosion.MarkPoolRecordsHost(ctx, s.db, s.hostName, time.Now()); err != nil {
 		slog.Warn("pool file records: start not recorded", "error", err)
 	}
-	for _, id := range s.localStores(ctx) {
-		s.markStore(ctx, id)
+	if err := s.refreshHostStores(ctx); err != nil {
+		slog.Warn("pool file records: this host's stores not recorded", "error", err)
 	}
 }
 
-// markStore records, once, that this host shares its records of store id.
-func (s *Server) markStore(ctx context.Context, id string) {
-	if _, done := s.storesMarked.Load(id); done {
-		return
+// hostStoreEntry is, for one of a host's pools, the identities of the
+// stores its content directories are on now, and since when.
+type hostStoreEntry struct {
+	IDs   []string  `json:"ids"`
+	Since time.Time `json:"since"`
+}
+
+func hostStoresKey(host string) string { return corrosion.PoolRecordsHostStoresPrefix + host }
+
+// refreshHostStores rewrites this host's row of which stores its pools are on
+// when that changed. A pool whose stores changed gets a new Since: the host
+// shares its records of a store only from when it moved onto it, and
+// whatever it wrote elsewhere meanwhile is recorded under the other identity.
+func (s *Server) refreshHostStores(ctx context.Context) error {
+	cur := s.localPoolStoreIDs(ctx)
+	s.hostStoresMu.Lock()
+	defer s.hostStoresMu.Unlock()
+	v, _, err := corrosion.GetPoolRecord(ctx, s.db, hostStoresKey(s.hostName))
+	if err != nil {
+		return err
 	}
-	if err := corrosion.MarkPoolRecordsExport(ctx, s.db, storeSeg(id), s.hostName, time.Now()); err != nil {
-		if !errors.Is(err, corrosion.ErrClusterPolicyGateClosed) {
-			slog.Warn("pool file records: sharing not recorded", "store", id, "error", err)
+	old := map[string]hostStoreEntry{}
+	_ = json.Unmarshal([]byte(v), &old)
+	next := make(map[string]hostStoreEntry, len(cur))
+	changed := len(old) != len(cur)
+	now := time.Now().UTC()
+	for pool, ids := range cur {
+		if e, ok := old[pool]; ok && slices.Equal(e.IDs, ids) {
+			next[pool] = e
+			continue
 		}
-		return
+		next[pool] = hostStoreEntry{IDs: ids, Since: now}
+		changed = true
 	}
-	s.storesMarked.Store(id, true)
+	if !changed {
+		return nil
+	}
+	b, err := json.Marshal(next)
+	if err != nil {
+		return err
+	}
+	s.epochCache.Clear()
+	if err := corrosion.SetPoolRecord(ctx, s.db, hostStoresKey(s.hostName), string(b), s.hostName); err != nil && !errors.Is(err, corrosion.ErrClusterPolicyGateClosed) {
+		return err
+	}
+	return nil
 }
 
 // poolRecordsMarkInterval is how often a running daemon retries its marks.
@@ -330,18 +365,10 @@ func (s *Server) RunPoolRecordsMarker(ctx context.Context) {
 	}
 }
 
-// localStores lists the identities of the shared stores this host's file
-// pools' content directories are on, with the names of the pools on each.
-func (s *Server) localStores(ctx context.Context) []string {
-	var out []string
-	for id := range s.localStorePools(ctx) {
-		out = append(out, id)
-	}
-	sort.Strings(out)
-	return out
-}
-
-func (s *Server) localStorePools(ctx context.Context) map[string][]string {
+// localPoolStoreIDs maps each of this host's file pools to the identities of
+// the shared stores its content directories are on now (sorted; none for a
+// pool on local or unidentified storage).
+func (s *Server) localPoolStoreIDs(ctx context.Context) map[string][]string {
 	out := map[string][]string{}
 	pools, err := corrosion.ListStoragePoolsForHost(ctx, s.db, s.hostName)
 	if err != nil {
@@ -355,11 +382,14 @@ func (s *Server) localStorePools(ctx context.Context) map[string][]string {
 		if err != nil {
 			continue
 		}
+		ids := []string{}
 		for _, d := range s.poolContentDirs(dir) {
-			if id := sharedStoreOf(d).ID; id != "" && !slices.Contains(out[id], p.Name) {
-				out[id] = append(out[id], p.Name)
+			if id := sharedStoreOf(d).ID; id != "" && !slices.Contains(ids, id) {
+				ids = append(ids, id)
 			}
 		}
+		sort.Strings(ids)
+		out[p.Name] = ids
 	}
 	return out
 }
@@ -380,11 +410,13 @@ var (
 )
 
 // storeRecordsEpoch is when the shared records of store id became complete:
-// the later of the cluster's records epoch (every host records) and the mark
-// of every host holding a pool on that store (every such host shares its
-// records of it under this identity). False while that is not known: the
-// rows are not writable, a host has not marked, or a host holding the pool
-// identifies the store differently (it never marks this identity).
+// the later of the cluster's records epoch (every host records) and the
+// moment every host holding a pool on that store last moved onto it, as
+// each host's current row says (refreshHostStores). False while that is not
+// known: the rows are not writable, or some such host is not on this
+// identity now (it identifies the store differently, or is mid-move), or has
+// not said yet. The epoch is recomputed, never kept: a host adding a pool
+// there moves it later, which only lets more files be matched by name.
 func (s *Server) storeRecordsEpoch(ctx context.Context, id string) (time.Time, bool) {
 	now := time.Now()
 	if v, ok := s.epochCache.Load(id); ok {
@@ -410,25 +442,36 @@ func (s *Server) computeStoreRecordsEpoch(ctx context.Context, id string) (time.
 	if err != nil || !ok {
 		return time.Time{}, false
 	}
-	pools := s.localStorePools(ctx)[id]
+	var pools []string
+	for pool, ids := range s.localPoolStoreIDs(ctx) {
+		if slices.Contains(ids, id) {
+			pools = append(pools, pool)
+		}
+	}
 	if len(pools) == 0 {
 		return time.Time{}, false
 	}
-	hosts, err := corrosion.HostsWithAnyPool(ctx, s.db, pools)
-	if err != nil || len(hosts) == 0 {
+	holders, err := corrosion.HostsWithPools(ctx, s.db, pools)
+	if err != nil || len(holders) == 0 {
 		return time.Time{}, false
 	}
-	marks, err := corrosion.PoolRecordsExportMarks(ctx, s.db, storeSeg(id))
+	rows, err := corrosion.ListPoolRecords(ctx, s.db, corrosion.PoolRecordsHostStoresPrefix)
 	if err != nil {
 		return time.Time{}, false
 	}
-	for _, h := range hosts {
-		t, ok := marks[h]
-		if !ok {
+	for host, held := range holders {
+		cur := map[string]hostStoreEntry{}
+		if json.Unmarshal([]byte(rows[hostStoresKey(host)]), &cur) != nil {
 			return time.Time{}, false
 		}
-		if t.After(epoch) {
-			epoch = t
+		for _, pool := range held {
+			e, ok := cur[pool]
+			if !ok || !slices.Contains(e.IDs, id) {
+				return time.Time{}, false
+			}
+			if e.Since.After(epoch) {
+				epoch = e.Since
+			}
 		}
 	}
 	return epoch, true

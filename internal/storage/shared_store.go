@@ -16,11 +16,14 @@ import (
 type SharedStore struct {
 	// Shared: a network or cluster filesystem. Unknown counts as shared.
 	Shared bool
-	// ID is the directory's identity on that storage, the same on every host
-	// that mounts it however that host spells the source: the server's
-	// address where the kernel reports it (NFS and CIFS addr=), the
-	// cluster's filesystem id (CephFS), the volume name (GlusterFS), plus the
-	// path below the export. "" when it cannot be told.
+	// ID is the directory's identity on that storage, computed the same way
+	// on every host that mounts it the same way: the server as spelled in the
+	// mount source, canonicalised (NFS, CIFS), the cluster's filesystem id
+	// (CephFS), the volume name (GlusterFS), plus the path below the export.
+	// Not the address the kernel connected to: behind round-robin DNS or
+	// after a re-IP that changes from mount to mount. Two spellings of one
+	// server are two identities, so neither host sees the other's records
+	// and both match by name. "" when it cannot be told.
 	ID string
 }
 
@@ -67,9 +70,6 @@ func sharedStoreOfMount(e mountEntry, rel, dir string) SharedStore {
 		if err != nil {
 			return SharedStore{Shared: true}
 		}
-		if a, ok := canonicalAddr(superOption(e.super, "addr")); ok {
-			exp.Server = a
-		}
 		exp.Path = below(exp.Path)
 		return SharedStore{Shared: true, ID: "nfs:" + exp.String()}
 	case e.fstype == "ceph":
@@ -88,10 +88,10 @@ func sharedStoreOfMount(e mountEntry, rel, dir string) SharedStore {
 			return SharedStore{Shared: true}
 		}
 		share, sub, _ := strings.Cut(sharePath, "/")
-		if a, ok := canonicalAddr(superOption(e.super, "addr")); ok {
+		if a, ok := canonicalAddr(server); ok {
 			server = a
 		} else {
-			server = strings.ToLower(server)
+			server = strings.ToLower(strings.TrimSuffix(server, "."))
 		}
 		return SharedStore{Shared: true, ID: "cifs:" + server + "/" + strings.ToLower(share) + below(sub)}
 	case e.fstype == "fuse.glusterfs" || e.fstype == "glusterfs":
@@ -130,15 +130,6 @@ func networkMagic(m uint32) bool {
 	return false
 }
 
-func superOption(opts []string, key string) string {
-	for _, o := range opts {
-		if v, ok := strings.CutPrefix(o, key+"="); ok {
-			return v
-		}
-	}
-	return ""
-}
-
 func canonicalAddr(s string) (string, bool) {
 	a, err := netip.ParseAddr(strings.Trim(s, "[]"))
 	if err != nil {
@@ -157,4 +148,13 @@ func cephSourcePath(src string) (string, bool) {
 		return src[i+1:], true
 	}
 	return "", false
+}
+
+// OverrideStatfsForTest replaces how a directory's filesystem magic and
+// f_fsid are read, for tests in other packages. It returns the restore
+// function.
+func OverrideStatfsForTest(f func(path string) (uint32, string, error)) func() {
+	prev := statfsInfo
+	statfsInfo = f
+	return func() { statfsInfo = prev }
 }

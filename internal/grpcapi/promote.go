@@ -703,6 +703,14 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	if err := replicaReadable(replicaPath); err != nil {
 		return status.Errorf(codes.NotFound, "%s: %q on %q: %v", errReplicaUnavailable, replica, s.hostName, err)
 	}
+	// A replica taken although its record had not arrived from its writer
+	// (lateReplicaOK) is said so, by name, on the VM's events.
+	if uploads, err := s.loadPoolUploads(ctx, filepath.Dir(replicaPath)); err == nil {
+		if _, st := s.recordState(uploads, replicaPath); st == recNone && !s.isLegacyUnrecorded(ctx, replicaPath) {
+			s.recordVMEvent(ctx, vm.Name, "replica.unrecorded", "warning", fmt.Sprintf(
+				"promoting %s, whose record had not arrived from %s, the VM's host, before it stopped answering", replica, vm.HostName))
+		}
+	}
 
 	targetName := vm.Name
 	renamed := false

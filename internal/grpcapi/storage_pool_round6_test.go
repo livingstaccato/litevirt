@@ -99,7 +99,7 @@ func recordReplicaForTest(t *testing.T, s *Server, pool, vm, project, disk, path
 	}
 	m[filepath.Clean(path)] = map[string]any{
 		"pool": pool, "project": project, "vm": vm, "disk": disk,
-		"ino": id.ino, "size": id.size, "mtime_ns": id.mtimeNs,
+		"size": id.size, "mtime_ns": id.mtimeNs,
 	}
 	b, err := json.Marshal(m)
 	if err != nil {

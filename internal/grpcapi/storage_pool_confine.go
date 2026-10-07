@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -52,9 +51,9 @@ import (
 const poolUploadsFile = "pool-uploads.json"
 
 // poolUpload is one upload's record, bound to the file at its path — its
-// inode, size and modification time — so a file deleted and recreated under
-// the same name, or rewritten, is not the upload. Not to its device number,
-// which a reboot or remount may change. A published upload is never written
+// size and modification time — so a file deleted and recreated under the same
+// name, or rewritten, is not the upload. Not to its device or inode number,
+// which a reboot, a remount or a copy of the data directory may change. A published upload is never written
 // again.
 //
 // A replica the daemon places (replication's upload, push or local copy) is
@@ -78,7 +77,6 @@ type poolUpload struct {
 	Copy     bool   `json:"copy,omitempty"`
 	Uploader string `json:"uploader,omitempty"`
 	Peer     bool   `json:"peer,omitempty"`
-	Ino      uint64 `json:"ino,omitempty"`
 	Size     int64  `json:"size"`
 	MtimeNs  int64  `json:"mtime_ns"`
 	shared   bool
@@ -91,15 +89,18 @@ type poolRecords map[string][]poolUpload
 
 // fileID is what binds an upload record to one file.
 type fileID struct {
-	ino     uint64
 	size    int64
 	mtimeNs int64
 }
 
-// describedBy reports whether record u still describes the file: the size
-// and modification time it had, and for this host's record the same inode.
+// describedBy reports whether record u (bound to its path) still describes
+// the file there: the size and modification time it had. Not its inode,
+// which a copy of the data directory (rsync -a, cp -a, a restore) or a remount
+// of a filesystem without stable inode numbers (CIFS noserverino, FUSE)
+// changes; the modification time is the daemon's write time, which a user
+// cannot choose.
 func (id fileID) describedBy(u poolUpload) bool {
-	return id.size == u.Size && id.mtimeNs == u.MtimeNs && (u.shared || id.ino == u.Ino)
+	return id.size == u.Size && id.mtimeNs == u.MtimeNs
 }
 
 func fileIdentity(path string) (fileID, error) {
@@ -107,11 +108,10 @@ func fileIdentity(path string) (fileID, error) {
 	if err != nil {
 		return fileID{}, err
 	}
-	st, ok := fi.Sys().(*syscall.Stat_t)
-	if !ok || !fi.Mode().IsRegular() {
+	if !fi.Mode().IsRegular() {
 		return fileID{}, fmt.Errorf("%s is not a regular file", path)
 	}
-	return fileID{ino: uint64(st.Ino), size: fi.Size(), mtimeNs: fi.ModTime().UnixNano()}, nil
+	return fileID{size: fi.Size(), mtimeNs: fi.ModTime().UnixNano()}, nil
 }
 
 func (s *Server) readPoolUploads() (map[string]poolUpload, error) {
@@ -198,7 +198,7 @@ func (s *Server) writePoolUploadRecord(ctx context.Context, path string, u poolU
 	if err != nil {
 		return err
 	}
-	u.Ino, u.Size, u.MtimeNs = id.ino, id.size, id.mtimeNs
+	u.Size, u.MtimeNs = id.size, id.mtimeNs
 	s.poolUploadsMu.Lock()
 	defer s.poolUploadsMu.Unlock()
 	m, err := s.readPoolUploads()

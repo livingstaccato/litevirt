@@ -209,13 +209,19 @@ func (s *Server) replicateLocalWith(ctx context.Context, sched corrosion.BackupS
 		})
 		return fmt.Errorf("replicate %s: %w", src.DiskName, err)
 	}
-	// The record is what makes it this VM's to promote and prune: on shared
-	// storage, an unrecorded file made now is never matched by its name on
-	// another host. A replica that cannot be recorded is withdrawn and the
-	// run fails, to be retried, rather than left unpromotable.
+	// The record is what makes it this VM's to promote and prune. Where an
+	// unrecorded file made now is never matched by its name (a shared store
+	// whose records epoch is known), a replica that cannot be recorded is
+	// withdrawn and the run fails, to be retried, rather than left
+	// unpromotable; elsewhere it is matched by its exact name, as before
+	// records, and the failure only warns.
 	recErr := errors.New("its VM's row cannot be read")
 	if known {
 		recErr = s.recordPoolReplica(ctx, sched.TargetPool, k, dstPath)
+	}
+	if recErr != nil && s.isLegacyUnrecorded(ctx, dstPath) {
+		slog.Warn("replication: replica written but not recorded; it is matched by its name", "vm", sched.VMName, "replica", dstPath, "error", recErr)
+		recErr = nil
 	}
 	if recErr != nil {
 		_ = os.Remove(dstPath)
@@ -471,8 +477,13 @@ func (s *Server) applyIncrementLocal(ctx context.Context, pool, newName, base st
 	if err != nil {
 		return err
 	}
-	// Unrecorded, it would be unpromotable: withdrawn, and the run fails.
+	// Unrecorded where that makes it unpromotable: withdrawn, and the run
+	// fails (see replicateLocalWith).
 	if err := s.recordPoolReplica(ctx, pool, k, dest); err != nil {
+		if s.isLegacyUnrecorded(ctx, dest) {
+			slog.Warn("replication: replica written but not recorded; it is matched by its name", "vm", k.VM, "replica", dest, "error", err)
+			return nil
+		}
 		_ = os.Remove(dest)
 		return fmt.Errorf("record replica %s: %w", filepath.Base(dest), err)
 	}
@@ -632,12 +643,29 @@ func (s *Server) pruneLocalReplicas(ctx context.Context, dir string, k replicaKe
 }
 
 // replicaUsers returns the live disks that use the replica at path: this
-// host's, and on shared storage every host's.
+// host's, and on shared storage every host's. Another host may mount the
+// store elsewhere, where the same file has another path; this host cannot see
+// its mounts, so any live disk on another host whose file or backing file has
+// this file's name counts (replica names carry their VM, disk and run time,
+// so this keeps more, never fewer).
 func (s *Server) replicaUsers(ctx context.Context, path string) ([]corrosion.DiskRecord, error) {
-	if sharedStoreOf(filepath.Dir(path)).Shared {
-		return corrosion.DisksReferencingPath(ctx, s.db, path)
+	if !sharedStoreOf(filepath.Dir(path)).Shared {
+		return s.liveDiskOwners(ctx, s.hostName, path)
 	}
-	return s.liveDiskOwners(ctx, s.hostName, path)
+	refs, err := corrosion.DisksReferencingPath(ctx, s.db, path)
+	if err != nil {
+		return nil, err
+	}
+	named, err := corrosion.DisksReferencingName(ctx, s.db, filepath.Base(path))
+	if err != nil {
+		return nil, err
+	}
+	for _, d := range named {
+		if d.HostName != s.hostName {
+			refs = append(refs, d)
+		}
+	}
+	return refs, nil
 }
 
 // replicaKeyFor is the replica key of vmName's disk, in the VM's project;

@@ -23,12 +23,14 @@ package corrosion
 //     (and replicate-volume copies) of one VM's disk that host placed there.
 //   - pool_records_host/<host>: when this host began recording, written at
 //     start (and retried until the gate opens).
-//   - pool_records_export/<store>/<host>: when this host began sharing its
-//     records of that store.
+//   - pool_records_hoststores/<host>: which stores this host's pools are on
+//     now, and since when, per pool: rewritten whenever that changes (a
+//     remount elsewhere, a re-IP, a pool added), so a host is counted for a
+//     store only while it is on it, from when it last moved onto it.
 //   - pool_records_epoch: when every host of the cluster had begun recording.
 //
-// A store's records are complete from the later of the epoch and the marks
-// of every host that has a pool on it. A file made after that with no record
+// A store's records are complete from the later of the epoch and the moment
+// every host holding a pool on it moved onto it (and while each still is). A file made after that with no record
 // was made by no recording host's daemon and is never taken for a replica by
 // its name. Where that moment is not known — a host has not marked, or this
 // host cannot identify the store — files are matched by name, as before
@@ -44,11 +46,11 @@ import (
 )
 
 const (
-	PoolUploadKeyPrefix        = "pool_upload/"
-	PoolReplicasKeyPrefix      = "pool_replicas/"
-	PoolRecordsExportKeyPrefix = "pool_records_export/"
-	poolRecordsHostKeyPrefix   = "pool_records_host/"
-	poolRecordsEpochKey        = "pool_records_epoch"
+	PoolUploadKeyPrefix         = "pool_upload/"
+	PoolReplicasKeyPrefix       = "pool_replicas/"
+	PoolRecordsHostStoresPrefix = "pool_records_hoststores/"
+	poolRecordsHostKeyPrefix    = "pool_records_host/"
+	poolRecordsEpochKey         = "pool_records_epoch"
 )
 
 // SetPoolRecord writes one pool-file record row. It refuses with
@@ -92,42 +94,10 @@ func MarkPoolRecordsHost(ctx context.Context, c *Client, host string, at time.Ti
 	return markOnce(ctx, c, poolRecordsHostKeyPrefix+host, host, at)
 }
 
-// MarkPoolRecordsExport records that host has begun sharing its records of
-// the store whose key segment is store, once.
-func MarkPoolRecordsExport(ctx context.Context, c *Client, store, host string, at time.Time) error {
-	return markOnce(ctx, c, PoolRecordsExportKeyPrefix+store+"/"+host, host, at)
-}
-
-func markOnce(ctx context.Context, c *Client, key, host string, at time.Time) error {
-	if _, ok, err := GetPoolRecord(ctx, c, key); err != nil || ok {
-		return err
-	}
-	return SetPoolRecord(ctx, c, key, at.UTC().Format(time.RFC3339Nano), host)
-}
-
-// PoolRecordsExportMarks returns, by host, when each host began sharing its
-// records of store.
-func PoolRecordsExportMarks(ctx context.Context, c *Client, store string) (map[string]time.Time, error) {
-	prefix := PoolRecordsExportKeyPrefix + store + "/"
-	rows, err := ListPoolRecords(ctx, c, prefix)
-	if err != nil {
-		return nil, err
-	}
-	out := make(map[string]time.Time, len(rows))
-	for k, v := range rows {
-		host := strings.TrimPrefix(k, prefix)
-		if t, err := time.Parse(time.RFC3339Nano, v); err == nil && !strings.Contains(host, "/") {
-			out[host] = t
-		}
-	}
-	return out, nil
-}
-
-// HostsWithAnyPool returns the hosts (not deleted, in any state) holding a
-// pool named one of names.
-func HostsWithAnyPool(ctx context.Context, c *Client, names []string) ([]string, error) {
-	seen := map[string]bool{}
-	var out []string
+// HostsWithPools returns, by host (not deleted, in any state), which of the
+// pools named in names it holds.
+func HostsWithPools(ctx context.Context, c *Client, names []string) (map[string][]string, error) {
+	out := map[string][]string{}
 	for _, n := range names {
 		rows, err := c.Query(ctx,
 			`SELECT sp.host_name FROM storage_pools sp JOIN hosts h ON h.name = sp.host_name
@@ -136,10 +106,8 @@ func HostsWithAnyPool(ctx context.Context, c *Client, names []string) ([]string,
 			return nil, err
 		}
 		for _, r := range rows {
-			if h := r.String("host_name"); !seen[h] {
-				seen[h] = true
-				out = append(out, h)
-			}
+			h := r.String("host_name")
+			out[h] = append(out[h], n)
 		}
 	}
 	return out, nil
@@ -193,4 +161,50 @@ func readPoolRecordsEpoch(ctx context.Context, c *Client) (time.Time, bool, erro
 	}
 	t, perr := time.Parse(time.RFC3339Nano, v)
 	return t, perr == nil, nil
+}
+
+func markOnce(ctx context.Context, c *Client, key, host string, at time.Time) error {
+	if _, ok, err := GetPoolRecord(ctx, c, key); err != nil || ok {
+		return err
+	}
+	return SetPoolRecord(ctx, c, key, at.UTC().Format(time.RFC3339Nano), host)
+}
+
+// HostLastSeen is the latest moment any observer saw host answer
+// (host_health.last_seen), and whether any observer reports it healthy now.
+func HostLastSeen(ctx context.Context, c *Client, host string) (last time.Time, healthy bool, err error) {
+	rows, err := c.Query(ctx, `SELECT status, last_seen FROM host_health WHERE target = ? AND deleted_at IS NULL`, host)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	for _, r := range rows {
+		if r.String("status") == "healthy" {
+			healthy = true
+		}
+		if t, ok := ParseUpdatedAt(r.String("last_seen")); ok && t.After(last) {
+			last = t
+		}
+	}
+	return last, healthy, nil
+}
+
+// DisksReferencingName returns the live disk rows, on any host, whose file,
+// backing image or backing disk has the base name name: on storage several
+// hosts mount at different paths, the same file is a different path on each.
+func DisksReferencingName(ctx context.Context, c *Client, name string) ([]DiskRecord, error) {
+	pat := "%/" + strings.NewReplacer(`\`, `\\`, "%", `\%`, "_", `\_`).Replace(name)
+	rows, err := c.Query(ctx,
+		`SELECT vm_name, disk_name, host_name, path, backing_image, backing_disk
+		 FROM vm_disks
+		 WHERE (path LIKE ? ESCAPE '\' OR backing_image LIKE ? ESCAPE '\' OR backing_disk LIKE ? ESCAPE '\') AND deleted_at IS NULL`,
+		pat, pat, pat)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]DiskRecord, len(rows))
+	for i, r := range rows {
+		out[i] = DiskRecord{VMName: r.String("vm_name"), DiskName: r.String("disk_name"), HostName: r.String("host_name"),
+			Path: r.String("path"), BackingImage: r.String("backing_image"), BackingDisk: r.String("backing_disk")}
+	}
+	return out, nil
 }

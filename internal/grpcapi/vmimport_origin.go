@@ -43,7 +43,7 @@ func (s *Server) importLeftover(p string, fi os.FileInfo) bool {
 	if !ok || !rec.matches(fi) {
 		return false
 	}
-	if rec.Instance == importDaemonInstance && s.importRunning(rec.ImportID) {
+	if !s.importPlacementDead(rec) {
 		return false
 	}
 	if o, ok := getImportOrigin(p); ok && o != s.hostName+"/"+rec.Instance+"/"+rec.ImportID {

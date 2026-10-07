@@ -3501,6 +3501,14 @@ service LiteVirt {
     // ever terminates a capacity operation targeting the local host.
     rpc ReserveHostCapacity(ReserveHostCapacityRequest) returns (ReserveHostCapacityResponse);
     rpc ReleaseHostCapacity(ReleaseHostCapacityRequest) returns (google.protobuf.Empty);
+
+    // ── Import leftovers on shared pools (peer-only) ──
+    //
+    // A host re-importing over a file in a pool it shares with other hosts asks
+    // them whether their own placement record shows that file as a leftover of
+    // a dead import of theirs, unchanged since. The answer comes from the
+    // answering host's record alone: it never opens a path the caller names.
+    rpc ImportLeftoverStatus(ImportLeftoverStatusRequest) returns (ImportLeftoverStatusResponse);
 }
 
 // Pre-flight check before `lv host upgrade`. Surfaces in-flight work,
@@ -4150,4 +4158,29 @@ message FenceEvent {
     string assurance = 4;
     string timestamp = 5;  // RFC3339
     string detail = 6;
+}
+
+// ── Import leftovers on shared pools ──
+//
+// Appended at the end of the file, like the fence messages above, so existing
+// message indexes stay stable.
+// One file in the pool, as the asking host sees it.
+message ImportLeftoverFile {
+    // A plain file name in the pool's directory: no '/', not "." or "..".
+    string name     = 1;
+    uint64 ino      = 2;
+    int64  size     = 3;
+    int64  mtime_ns = 4;
+    // 0 where the asking host's platform reports none.
+    int64  ctime_ns = 5;
+}
+message ImportLeftoverStatusRequest {
+    // The pool, by name, as both hosts know it (a shared pool).
+    string pool = 1;
+    repeated ImportLeftoverFile files = 2;
+}
+message ImportLeftoverStatusResponse {
+    // The names, among those asked, that the answering host's record shows a
+    // dead import of its own left there, in exactly the asked state.
+    repeated string dead = 1;
 }

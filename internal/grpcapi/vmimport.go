@@ -196,6 +196,9 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 	if err != nil {
 		return err
 	}
+	// Records of earlier daemons' imports into this pool that nothing is left
+	// for go, off this import's path (a hung pool stalls only the prune).
+	s.startImportPlacementPrune(poolDir)
 	// A pool that can place a disk only by copying it holds it twice for a
 	// moment: the second copy is reserved like the first, once the
 	// conversion's own unwritten reservation is dropped.
@@ -238,7 +241,7 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 		// A file already at the name is never replaced. One that something
 		// records is refused; an orphan (a crashed import's output) is moved
 		// aside and kept.
-		if err := s.clearImportDiskName(ctx, name, importID, d.Name, dst); err != nil {
+		if err := s.clearImportDiskName(ctx, first.TargetPool, name, importID, d.Name, dst); err != nil {
 			cleanupDisks()
 			return status.Error(codes.FailedPrecondition, err.Error())
 		}
@@ -922,17 +925,19 @@ func importRecords(fv *vmimport.ForeignVM, name, host string) ([]corrosion.DiskR
 // so its import can measure them and record them as its own. Every field is
 // optional, and a nil *importDiskWrites is told nothing.
 type importDiskWrites struct {
-	// created is a scratch file the conversion just created, before its
-	// first byte.
+	// created is a file the import just created in the pool — a conversion's
+	// scratch file, or a copy on its way to its name — before its first byte.
 	created func(p string)
-	// placing is the finished, flushed scratch file tmp about to take dst's
-	// name.
-	placing func(tmp, dst string)
-	// placed is tmp now placed at dst: dst is the import's file.
+	// placing is the finished, flushed file fi describes about to take
+	// dst's name.
+	placing func(dst string, fi os.FileInfo)
+	// placed is tmp's disk now placed at dst: dst is the import's file.
 	placed func(tmp, dst string)
 	// copying is a placement that has to copy n bytes (a pool with neither
 	// link() nor RENAME_NOREPLACE): an error refuses it.
 	copying func(n uint64) error
+	// discarded is a file it created that is gone, or no longer its own.
+	discarded func(p string)
 }
 
 func (w *importDiskWrites) didCreate(p string) {
@@ -941,9 +946,9 @@ func (w *importDiskWrites) didCreate(p string) {
 	}
 }
 
-func (w *importDiskWrites) willPlace(tmp, dst string) {
+func (w *importDiskWrites) willPlace(dst string, fi os.FileInfo) {
 	if w != nil && w.placing != nil {
-		w.placing(tmp, dst)
+		w.placing(dst, fi)
 	}
 }
 
@@ -960,20 +965,26 @@ func (w *importDiskWrites) copy(n uint64) error {
 	return nil
 }
 
+func (w *importDiskWrites) discard(p string) {
+	if w != nil && w.discarded != nil {
+		w.discarded(p)
+	}
+}
+
 // importWritesFor is what the import importID does with each file it writes
 // into a pool: measures it in space, sets its origin xattr where the pool
 // keeps one, and records it in this host's placement record (see
-// vmimport_placement.go). A scratch file is recorded when it is created; a
-// placed disk is recorded before it takes its name, in the state it is placed
-// in, so a crash at any point leaves no unrecorded disk of the import, and
-// again once placed if placing made it another file (a copy). forget drops
-// every record the import wrote. The caller sets copying.
+// vmimport_placement.go). A scratch file or a copy on its way to its name is
+// recorded when it is created; a placed disk is recorded before it takes its
+// name, in the state it is placed in, so a crash at any point leaves no
+// unrecorded file of the import, and again once placed, its change time
+// bound too. forget drops every record the import wrote. The caller sets
+// copying.
 func (s *Server) importWritesFor(importID string, space *importReservation) (w *importDiskWrites, forget func()) {
-	s.pruneImportPlacements()
 	origin := s.importOriginFor(importID)
 	var recorded []string
-	record := func(p string, fi os.FileInfo, scratch bool) {
-		if err := s.recordImportPlacement(p, fi, importID, scratch); err != nil {
+	record := func(p string, fi os.FileInfo, scratch, withCtime bool) {
+		if err := s.recordImportPlacementBound(p, fi, importID, scratch, withCtime); err != nil {
 			slog.Warn("import: could not record a file it writes; a leftover of it is judged by age", "path", p, "error", err)
 			return
 		}
@@ -984,23 +995,18 @@ func (s *Server) importWritesFor(importID string, space *importReservation) (w *
 			space.track(p)
 			_ = setImportOrigin(p, origin)
 			if fi, err := os.Lstat(p); err == nil {
-				record(p, fi, true)
+				record(p, fi, true, false)
 			}
 		},
-		placing: func(tmp, dst string) {
-			if fi, err := os.Lstat(tmp); err == nil {
-				record(dst, fi, false)
-			}
-		},
+		placing: func(dst string, fi os.FileInfo) { record(dst, fi, false, false) },
 		placed: func(tmp, dst string) {
 			space.track(dst)
 			s.forgetImportPlacement(tmp, importID)
 			if fi, err := os.Lstat(dst); err == nil {
-				if rec, ok := s.importPlacementOf(dst); !ok || !rec.matches(fi) {
-					record(dst, fi, false)
-				}
+				record(dst, fi, false, true)
 			}
 		},
+		discarded: func(p string) { s.forgetImportPlacement(p, importID) },
 	}
 	return w, func() {
 		for _, p := range recorded {
@@ -1104,9 +1110,11 @@ func convertForeignDisk(ctx context.Context, src, srcFormat, dst, allowedDir str
 		_ = os.Remove(tmp)
 		return fmt.Errorf("flush converted disk: %w", err)
 	}
-	w.willPlace(tmp, dst)
+	if fi, err := os.Lstat(tmp); err == nil {
+		w.willPlace(dst, fi)
+	}
 	// Never over a file already there: another VM's disk keeps its bytes.
-	if err := placeNoReplace(ctx, tmp, dst, w.copy); err != nil {
+	if err := placeNoReplace(ctx, tmp, dst, w); err != nil {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("finalize converted disk: %w", err)
 	}

@@ -168,10 +168,11 @@ func moveOrphanAside(p string) (string, error) {
 	return aside, nil
 }
 
-// freshSibling names a file beside dst that a flow writing dst's VM may be
-// writing now: one whose name starts like dst's up to any '-' (a VM's other
+// freshSiblings names every file beside dst that a flow writing dst's VM may
+// be writing now: one whose name starts like dst's up to any '-' (a VM's other
 // disks; disk names may hold '-'), or another host's conversion scratch file
-// for such a name, modified within importOrphanMinAge, that nothing records.
+// or partial copy for such a name, modified within importOrphanMinAge, that
+// nothing records.
 // A multi-disk create, clone or import leaves its first disks quiet while it
 // writes the next, and records them only at its end.
 //
@@ -181,7 +182,7 @@ func moveOrphanAside(p string) (string, error) {
 // deleted VM's kept disk) or an image records — a running VM's disk changes
 // all the time; and a file named for an existing VM whose name does not
 // prefix dst's (that VM's replica, for now — nothing of its writes dst).
-func (s *Server) freshSibling(ctx context.Context, dst, importID string) (string, error) {
+func (s *Server) freshSiblings(ctx context.Context, dst, importID string) ([]importSibling, error) {
 	dir, base := filepath.Dir(dst), filepath.Base(dst)
 	lb := strings.ToLower(base)
 	var prefixes []string
@@ -191,17 +192,13 @@ func (s *Server) freshSibling(ctx context.Context, dst, importID string) (string
 		}
 	}
 	if len(prefixes) == 0 {
-		return "", nil
+		return nil, nil
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	type sibling struct {
-		name, path string
-		fi         os.FileInfo
-	}
-	var fresh []sibling
+	var fresh []importSibling
 	for _, e := range entries {
 		name := e.Name()
 		ln := strings.ToLower(name)
@@ -210,7 +207,7 @@ func (s *Server) freshSibling(ctx context.Context, dst, importID string) (string
 		}
 		match := false
 		for _, p := range prefixes {
-			if strings.HasPrefix(ln, p) || (strings.HasPrefix(ln, "."+p) && strings.Contains(ln, ".convert-")) {
+			if strings.HasPrefix(ln, p) || (strings.HasPrefix(ln, "."+p) && (strings.Contains(ln, ".convert-") || strings.Contains(ln, ".place-"))) {
 				match = true
 				break
 			}
@@ -231,26 +228,33 @@ func (s *Server) freshSibling(ctx context.Context, dst, importID string) (string
 		if n, id, ok := s.importRunningFile(p, info); ok && (id == importID || !strings.HasPrefix(lb, strings.ToLower(n)+"-")) {
 			continue
 		}
-		fresh = append(fresh, sibling{name, p, info})
+		fresh = append(fresh, importSibling{name, p, info})
 	}
 	if len(fresh) == 0 {
-		return "", nil
+		return nil, nil
 	}
 	recorded, err := s.pathsRecordedLike(ctx, prefixes[0])
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	vms, err := corrosion.ListVMs(ctx, s.db, "", "")
 	if err != nil {
-		return "", err
+		return nil, err
 	}
+	var out []importSibling
 	for _, f := range fresh {
 		if recordedAmong(recorded, f.path, f.fi) || namedForAnotherVM(vms, strings.ToLower(f.name), lb) {
 			continue
 		}
-		return f.name, nil
+		out = append(out, f)
 	}
-	return "", nil
+	return out, nil
+}
+
+// importSibling is a file beside a disk's name.
+type importSibling struct {
+	name, path string
+	fi         os.FileInfo
 }
 
 // pathsRecordedLike is every path a disk row (live or kept) or an image
@@ -323,13 +327,15 @@ func (s *Server) liveVMNamedLike(ctx context.Context, dst string) (string, error
 	return "", nil
 }
 
-// clearImportDiskName makes way for a converted disk at dst. A file there is
-// an orphan — a crashed import's output, moved aside and kept — only when
-// nothing records it, nothing in flight may be creating it, nothing beside it
-// is still being written, and either this host's placement record shows it a
-// dead import's leftover, unchanged since, or it is named for no existing VM
-// and has been quiet for importOrphanMinAge. Anything else refuses the import.
-func (s *Server) clearImportDiskName(ctx context.Context, importName, importID, disk, dst string) error {
+// clearImportDiskName makes way for a converted disk at dst in pool. A file
+// there is an orphan — a crashed import's output, moved aside and kept — only
+// when nothing records it, nothing in flight may be creating it, nothing
+// beside it is still being written, and either a placement record shows it a
+// dead import's leftover, unchanged since (this host's, or that of a host
+// sharing the pool, asked), or it is named for no existing VM and has been
+// quiet for importOrphanMinAge. Anything else refuses the import.
+func (s *Server) clearImportDiskName(ctx context.Context, pool, importName, importID, disk, dst string) error {
+	s.removeDeadPartialCopies(dst)
 	fi, err := os.Lstat(dst)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
@@ -355,31 +361,64 @@ func (s *Server) clearImportDiskName(ctx context.Context, importName, importID, 
 	if busy != "" {
 		return refuse("may still be being created by " + busy + "; retry once it finishes")
 	}
-	// A leftover of an import of this host that is no longer running, that
-	// nothing has written since, is nobody's now: not a replica or a hotplug
-	// file of the VM it is named like, and not still being written.
+	// A leftover of an import that is no longer running, that nothing has
+	// written since, is nobody's now: not a replica or a hotplug file of the
+	// VM it is named like, and not still being written.
 	leftover := s.importLeftover(dst, fi)
+	liveVM := ""
 	if !leftover {
-		vm, err := s.liveVMNamedLike(ctx, dst)
-		if err != nil {
+		if liveVM, err = s.liveVMNamedLike(ctx, dst); err != nil {
 			return refuse(fmt.Sprintf("the VMs whose disks it may be could not be read (%v); retry", err))
 		}
-		if vm != "" {
-			return refuse(fmt.Sprintf("is named like the disks of VM %s, which exists", vm))
-		}
 	}
-	sib, err := s.freshSibling(ctx, dst, importID)
+	sibs, err := s.freshSiblings(ctx, dst, importID)
 	if err != nil {
 		return refuse(fmt.Sprintf("what is being written beside it could not be read (%v); retry", err))
 	}
-	if sib != "" {
-		return refuse(fmt.Sprintf("%s beside it was written in the last %s, so the flow writing them may still be running; retry once it is quiet",
-			sib, importOrphanMinAge))
+	age := orphanNow().Sub(fi.ModTime())
+	fresh := age < importOrphanMinAge
+	// What this host cannot prove, a host sharing the pool may: a leftover of
+	// its own dead import (it crashed there; this is the re-import).
+	var unasked []string
+	ask := sibs
+	if !leftover && (liveVM != "" || fresh) {
+		ask = append([]importSibling{{filepath.Base(dst), dst, fi}}, sibs...)
+	}
+	if len(ask) > 0 {
+		var dead map[string]bool
+		dead, unasked = s.peerDeadImportFiles(ctx, pool, ask)
+		if !leftover && dead[filepath.Base(dst)] {
+			leftover, liveVM = true, ""
+		}
+		var still []importSibling
+		for _, sb := range sibs {
+			if !dead[sb.name] {
+				still = append(still, sb)
+			} else if isPartialCopyOf(sb.name, filepath.Base(dst)) {
+				_ = removeIfSame(sb.path, sb.fi) // a dead import's partial copy
+			}
+		}
+		sibs = still
+	}
+	notAsked := ""
+	if len(unasked) > 0 {
+		notAsked = fmt.Sprintf(" (%s, sharing the pool, could not be asked whether it is their crashed import's)", strings.Join(unasked, ", "))
+	}
+	if liveVM != "" {
+		return refuse(fmt.Sprintf("is named like the disks of VM %s, which exists%s", liveVM, notAsked))
+	}
+	if len(sibs) > 0 {
+		return refuse(fmt.Sprintf("%s beside it was written in the last %s, so the flow writing them may still be running%s; retry once it is quiet",
+			sibs[0].name, importOrphanMinAge, notAsked))
 	}
 	// Anything else has to have gone quiet.
-	if age := orphanNow().Sub(fi.ModTime()); age < importOrphanMinAge && !leftover {
-		return refuse(fmt.Sprintf("was written %s ago, so it may still be being created; "+
-			"a leftover nothing records is moved aside once it is %s old — retry then", age.Round(time.Second), importOrphanMinAge))
+	if fresh && !leftover {
+		return refuse(fmt.Sprintf("was written %s ago, so it may still be being created%s; "+
+			"a leftover nothing records is moved aside once it is %s old — retry then", age.Round(time.Second), notAsked, importOrphanMinAge))
+	}
+	// Judged on fi: it must still be that file, in that state, as it moves.
+	if now, err := os.Lstat(dst); err != nil || !sameFileState(fi, now) {
+		return refuse("changed while it was being judged; retry")
 	}
 	aside, err := moveOrphanAside(dst)
 	if err != nil {
@@ -388,4 +427,37 @@ func (s *Server) clearImportDiskName(ctx context.Context, importName, importID, 
 	slog.Warn("import: moved aside a file at a converted disk's name that no disk, image or VM records and nothing is creating",
 		"host", s.hostName, "path", dst, "kept_as", aside, "modified", fi.ModTime(), "dead_import_leftover", leftover)
 	return nil
+}
+
+// sameFileState reports whether a and b are one file in one state.
+func sameFileState(a, b os.FileInfo) bool {
+	return os.SameFile(a, b) && a.Size() == b.Size() && a.ModTime().Equal(b.ModTime()) && fileCtimeNs(a) == fileCtimeNs(b)
+}
+
+// isPartialCopyOf reports whether name is a copy on its way to base's name.
+func isPartialCopyOf(name, base string) bool {
+	return strings.HasPrefix(strings.ToLower(name), "."+strings.ToLower(base)+".place-")
+}
+
+// removeDeadPartialCopies removes the copies on their way to dst's name that
+// this host's dead imports left (a crash mid-copy on a pool with neither
+// link() nor RENAME_NOREPLACE): partial, at names no flow writes, and
+// nobody's.
+func (s *Server) removeDeadPartialCopies(dst string) {
+	matches, _ := filepath.Glob(filepath.Join(filepath.Dir(dst), "."+globEscape(filepath.Base(dst))+".place-*"))
+	for _, p := range matches {
+		fi, err := os.Lstat(p)
+		if err != nil || !s.importLeftover(p, fi) {
+			continue
+		}
+		if err := removeIfSame(p, fi); err == nil {
+			s.forgetImportPlacement(p, "")
+			slog.Info("import: removed a dead import's partial copy", "host", s.hostName, "path", p)
+		}
+	}
+}
+
+// globEscape quotes s for filepath.Glob.
+func globEscape(s string) string {
+	return strings.NewReplacer(`\`, `\\`, "*", `\*`, "?", `\?`, "[", `\[`).Replace(s)
 }

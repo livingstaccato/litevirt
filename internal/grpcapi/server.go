@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/netip"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -564,6 +565,13 @@ type Server struct {
 	// Guarded by storagePoolsMu because the daemon rewrites it while RPCs read.
 	storagePoolsMu sync.RWMutex
 	storagePools   map[string]StoragePoolRef
+
+	// importPrunes is the pool directories whose placement-record prune is
+	// running (vmimport_placement.go). Zero value ready.
+	importPrunes sync.Map
+	// placementLstatOverride is a TEST SEAM for the prune's stat; nil in
+	// production.
+	placementLstatOverride func(string) (os.FileInfo, error)
 
 	// migrationStubs is what EnsureDisks created on this host as a migration
 	// target: the only disk files this host hands to a mirror or removes after

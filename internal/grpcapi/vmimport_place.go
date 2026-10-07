@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"math"
 	"os"
+	"path/filepath"
 	"syscall"
 )
 
@@ -15,17 +16,16 @@ import (
 // errors.Is(err, os.ErrExist), and keeps its bytes.
 //
 // A hard link is tried first, then renameat2(RENAME_NOREPLACE). A filesystem
-// that has neither (some FUSE filesystems) gets the file copied into a dst
-// created exclusively (O_EXCL, never following a link), which cannot replace a
-// file either; it costs a second write where nothing cheaper is safe. That
-// write is announced to copying first, with its size, and a copying error
-// refuses it; the copy stops when ctx ends.
-func placeNoReplace(ctx context.Context, src, dst string, copying func(n uint64) error) error {
+// that has neither (some FUSE filesystems) gets the file copied (see
+// copyIntoPlace), which cannot replace a file either; it costs a second write
+// where nothing cheaper is safe. w, when set, is told of the copy as of any
+// file the import writes.
+func placeNoReplace(ctx context.Context, src, dst string, w *importDiskWrites) error {
 	unsupported, err := linkOrRenameNoReplace(src, dst)
 	if !unsupported {
 		return err
 	}
-	if cerr := copyExclusive(ctx, src, dst, copying); cerr != nil {
+	if cerr := copyIntoPlace(ctx, src, dst, w); cerr != nil {
 		return fmt.Errorf("%v, and copying: %w", err, cerr)
 	}
 	return nil
@@ -61,7 +61,7 @@ func placementUnsupported(err error) bool {
 	return false
 }
 
-// placeCopy copies a file's bytes for copyExclusive; a variable so a test can
+// placeCopy copies a file's bytes for copyIntoPlace; a variable so a test can
 // act while it runs.
 var placeCopy = copySparse
 
@@ -78,12 +78,20 @@ func removeIfSame(p string, fi os.FileInfo) error {
 	return os.Remove(p)
 }
 
-// copyExclusive copies src into a new file dst, keeping holes, its
-// modification time and its import origin, and then removes src. A dst that
-// exists is never opened. The copy is announced to copying before dst is
-// created, and stops when ctx ends. Neither name is removed once another file
-// has taken it.
-func copyExclusive(ctx context.Context, src, dst string, copying func(n uint64) error) error {
+// copyIntoPlace copies src to dst on a filesystem with neither link() nor
+// RENAME_NOREPLACE. The copy is announced to w (copying) with its size first,
+// and stops when ctx ends.
+//
+// It is written into a fresh temp name beside dst, created exclusively and
+// recorded (w.created) before its first byte, so a crash mid-copy leaves a
+// partial at a name no flow writes, which a re-import knows dead and removes.
+// Only the finished, flushed copy takes dst's name: dst is first created
+// empty and exclusively (an existing dst is ErrExist, and never opened), the
+// copy's state is recorded for dst (w.placing), and the copy is renamed over
+// that empty file while dst still is it. dst is never written in place.
+//
+// Neither src nor a temp is removed once another file has taken its name.
+func copyIntoPlace(ctx context.Context, src, dst string, w *importDiskWrites) error {
 	in, err := os.OpenFile(src, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return err
@@ -96,24 +104,31 @@ func copyExclusive(ctx context.Context, src, dst string, copying func(n uint64) 
 	if !fi.Mode().IsRegular() {
 		return fmt.Errorf("%s is not a plain file", src)
 	}
-	if copying != nil {
-		if err := copying(uint64(fi.Size())); err != nil {
-			return err
-		}
+	if err := w.copy(uint64(fi.Size())); err != nil {
+		return err
 	}
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, fi.Mode().Perm())
+	out, err := os.CreateTemp(filepath.Dir(dst), "."+filepath.Base(dst)+".place-*")
 	if err != nil {
 		return err
 	}
-	ofi, err := out.Stat()
+	temp := out.Name()
+	tfi, err := out.Stat()
 	if err != nil {
 		out.Close()
 		return err // created exclusively, but not known well enough to remove
 	}
+	w.didCreate(temp)
+	dropTemp := func() {
+		_ = removeIfSame(temp, tfi)
+		w.discard(temp)
+	}
 	fail := func(err error) error {
 		out.Close()
-		_ = removeIfSame(dst, ofi)
+		dropTemp()
 		return err
+	}
+	if err := out.Chmod(fi.Mode().Perm()); err != nil {
+		return fail(err)
 	}
 	if err := placeCopy(ctx, out, in, math.MaxInt64); err != nil {
 		return fail(err)
@@ -122,13 +137,39 @@ func copyExclusive(ctx context.Context, src, dst string, copying func(n uint64) 
 		return fail(err)
 	}
 	if err := out.Close(); err != nil {
-		_ = removeIfSame(dst, ofi)
+		dropTemp()
 		return err
 	}
-	if o, ok := getImportOrigin(src); ok {
-		_ = setImportOrigin(dst, o)
+	_ = os.Chtimes(temp, fi.ModTime(), fi.ModTime())
+	// Take dst's name exclusively, then put the copy there.
+	hold, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, fi.Mode().Perm())
+	if err != nil {
+		dropTemp()
+		return err
 	}
-	_ = os.Chtimes(dst, fi.ModTime(), fi.ModTime())
+	hfi, err := hold.Stat()
+	hold.Close()
+	if err != nil {
+		dropTemp()
+		return err
+	}
+	cur, err := os.Lstat(temp)
+	if err != nil || !os.SameFile(cur, tfi) {
+		_ = removeIfSame(dst, hfi)
+		w.discard(temp)
+		return fmt.Errorf("the copy at %s is no longer the file written; left in place", temp)
+	}
+	w.willPlace(dst, cur)
+	if now, err := os.Lstat(dst); err != nil || !os.SameFile(now, hfi) {
+		dropTemp()
+		return fmt.Errorf("%s was replaced while the copy took its name: %w", dst, os.ErrExist)
+	}
+	if err := os.Rename(temp, dst); err != nil {
+		_ = removeIfSame(dst, hfi)
+		dropTemp()
+		return err
+	}
+	w.discard(temp)
 	// The copy is placed. Its source goes only while its name still holds
 	// the file copied: a file another flow put there meanwhile is theirs.
 	if err := removeIfSame(src, fi); err != nil {

@@ -105,9 +105,16 @@ VM was created:
   pool of another project on the host a VM moved to is not its library.
 - Reading another pool's directory can block (an NFS server that stopped
   answering, on a hard mount). The daemon's own NFS mount directories are
-  never read for this; any other is read under a 3-second deadline, and one
-  that does not answer refuses the start (or create, or move) saying which
-  pool did not answer — it never hangs.
+  never read for this. A directory on a network filesystem other than the
+  one the ISO's directory is on is told apart by `/proc/self/mountinfo`
+  without being read (unless a link above its mount point leads elsewhere),
+  so another project's dead NFS server does not stop this VM. Any other
+  directory is read under a 3-second deadline, one read per directory at a
+  time; one that does not answer, or answers with an error other than "no
+  such directory", refuses the start (or create, or move) saying which pool
+  did not answer. Until a read that timed out returns, the next question
+  about that directory is answered at once, so a dead directory holds one
+  blocked thread, not one per start.
 - Each time a host judges the ISO by that full rule and it passes — at the
   create, at a start, as a migration target — the host records which file it
   was (in `<data_dir>/iso-identity`, by the VM's uuid and project: resolved
@@ -116,15 +123,25 @@ VM was created:
   file on that host keeps working even if another project's pool has since
   come to share the directory — another project's ordinary `lv pool create`
   cannot stop a VM that started before, on the host it was created on or one
-  it moved to. A file put there since is judged by the full rule. A VM's
-  first arrival on a host where the directory is already shared is judged by
-  the full rule (refused) until per-file ownership comes with the storage
-  pools change.
-- A **running** VM's CD-ROM path cannot change in a migration (libvirt hands
-  qemu on the target the source's path), so the target must resolve the
-  reference to that very path, and a target without the pool or the file
-  refuses; otherwise migrate it stopped, or give the library the same
-  directory on both hosts. A **stopped** VM may move to a host that does not
+  it moved to. A file put there since is judged by the full rule. On a VM's
+  first arrival by migration on a host where the directory is already shared,
+  the source sends the sha256 of the file it judged for the VM, and the
+  target admits a file with those very bytes (the guest gets what it already
+  had) and records it; any other file there is refused. The hash is computed
+  once per file version (device, inode, size, mtime). A VM that arrives
+  without a source to ask (a failover) is judged by the full rule until
+  per-file ownership comes with the storage pools change. A host's records
+  go when the VM is deleted or its create fails, and a sweep every five
+  minutes removes those of VMs that no longer exist. No pool may be created
+  in `<data_dir>/iso-identity`.
+- A **running** VM's live migration (`lv migrate`, or a drain) lands on the
+  target's own file: the target resolves the VM's ISO on its own filesystem
+  — through its pool, or an Admin's host path resolved there, so a
+  `virtio-win.iso` link that names another version on the target, or a
+  library in another directory, is followed there — judges it, and returns
+  it, and the source hands libvirt a destination definition whose CD-ROM is
+  that file. A target where it does not resolve, or where the file it
+  resolves to is refused, refuses the move. A **stopped** VM may move to a host that does not
   have its ISO or library yet: the move is accepted with a warning, and the VM
   will not start there until the ISO is present (upload or pull it, or wait for
   the library to sync); the warning is logged and recorded as a VM event
@@ -206,8 +223,11 @@ replicated delete, and adding one would be a new statement shape for every
 peer to decode). The key is read again just before, and left alone if it
 changed, so a file added again in the meantime keeps its record. The first
 time an Admin creates, replaces or deletes a global `isos` pool with no mode
-ever set, the mode in force is written first, so the change cannot flip it
-silently.
+ever set, the mode in force is written first (pinned), so the change cannot
+flip it silently; a pin keeps the records made while the mode was implicit,
+so no start is refused meanwhile. Every sync pass also records the library
+files a host holds that have no current record (a tombstone is collected only
+once every host has removed the file, so such a file was added again).
 
 ### Project libraries
 
@@ -241,7 +261,11 @@ hardened-mount rule for directory pools on NFS.
   judged like any file a guest could be given.
 
 `lv iso ls` lists what a caller may name on a host: its projects' libraries
-first, then the global library. `lv iso rm <pool>/<file>.iso` removes one.
+first, then the global library. A library whose directory does not answer
+within the 3-second deadline (a dead NFS server) is listed as `<pool>/` with
+the state `unavailable`, rather than holding the listing up; the same goes
+for the UI's Browse dialog, and a sync pass gives up on it the same way.
+`lv iso rm <pool>/<file>.iso` removes one.
 
 ### Host paths and earlier specs
 
@@ -254,9 +278,10 @@ first, then the global library. `lv iso rm <pool>/<file>.iso` removes one.
   link left in the resolved path), and the domain is given the resolved file,
   so qemu never follows a link. The spec keeps the path as named, so an
   updated package's new versioned file is picked up at the next start. A hard
-  link is accepted where `fs.protected_hardlinks=1` (the default; the kernel
-  then stops a user linking a file they do not own), and refused, saying so,
-  where it is 0.
+  link is accepted where `fs.protected_hardlinks=1` (the kernel then stops a
+  user linking a file they do not own; systemd's sysctl defaults set it, the
+  kernel's own default is 0, so check it on hosts without systemd, such as
+  Alpine), and refused, saying so, where it is 0.
 - A **non-admin** may not. An absolute path that names a `.iso` directly in a
   pool directory — what earlier specs stored — is taken as that pool's
   reference, provided the caller may read the pool and the VM's project may
@@ -272,9 +297,18 @@ first, then the global library. `lv iso rm <pool>/<file>.iso` removes one.
 Some files are refused to everyone, Admin included, judged as written and after
 resolving symlinks: the PKI directory, anything in the data directory outside
 `disks/`, `mounts/` and `pools/isos/` (`state.db`, `cloudinit/`, `nvram/`, …), and
-anything under `/boot`, `/dev`, `/etc`, `/home`, `/proc`, `/root`, `/run`,
-`/sys`, `/var/backups`, `/var/run`, `/var/spool`, `/var/lib/lxc`,
-`/var/lib/libvirt/qemu` or `/var/lib/libvirt/swtpm`.
+anything under `/boot`, `/dev`, `/etc`, `/proc`, `/root`, `/sys`,
+`/var/backups`, `/var/spool`, `/var/lib/lxc`, `/var/lib/libvirt/qemu` or
+`/var/lib/libvirt/swtpm`.
+
+Under `/home` and `/run` (`/var/run`) — where an ISO downloaded into a home
+directory, or a USB stick udisks mounts under `/run/media`, lives next to
+`~/.ssh` and runtime secrets — a file is given to a guest only when it is an
+optical disc image: a regular file carrying an ISO 9660 or UDF volume
+signature (read from the opened file, not judged by its name), with no path
+component, as named or as resolved, starting with a dot. So
+`/home/u/isos/virtio-win.iso` and `/run/media/u/STICK/win11.iso` work, and
+`~/.ssh/id_rsa`, a key renamed `.iso`, or an ISO inside `~/.cache` do not.
 
 A refusal at start fails with `FailedPrecondition` and an ERROR log naming the
 VM and the file, and the VM stays down. What is judged is the CD-ROM the VM's
@@ -306,6 +340,12 @@ the file against its own filesystem.
   content checks in [auth.md](auth.md)).
 - **VMs created before `iso_scope`** with an absolute path are judged as the
   file they name on every host, as before.
+- **A memory snapshot's restore** reopens the CD-ROM path its saved image
+  holds. For a snapshot taken on this release that is the resolved file the
+  start judged; for one taken before, it may be the link the VM was given.
+- **A live migration from an older source** carries the source's domain as
+  it is: the target judges what it would open, and refuses a pool ISO it
+  cannot resolve there.
 
 ## Compose example
 

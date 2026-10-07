@@ -1579,6 +1579,17 @@ func (s *Server) coldMigrateStoppedVM(ctx context.Context, vm *corrosion.VMRecor
 		return status.Errorf(codes.FailedPrecondition,
 			"cannot dump domain XML for %q (it must be defined to migrate it cold): %v", vm.Name, err)
 	}
+	// An Admin's host-path ISO goes as the path the VM was given, not as the
+	// file it resolved to on this host: a target on this build resolves and
+	// judges that path at its start (and points the domain at its own file); a
+	// target on an older build has its qemu follow the link there, as before.
+	if remap := s.olderTargetISORemap(ctx, vm.Name, s.domainInstallerISOs(vm.Name, domXML)); len(remap) > 0 {
+		rewritten, _, rerr := lv.RewriteCDROMSources(domXML, remap)
+		if rerr != nil {
+			return status.Errorf(codes.FailedPrecondition, "point the installer CD-ROM of VM %q back at the path it was given: %v", vm.Name, rerr)
+		}
+		domXML = rewritten
+	}
 	_ = send(pb.MigratePhase_MIGRATE_COPYING, 0, 0)
 
 	// Host-local disks first: the source keeps its own copy until the handoff

@@ -238,6 +238,7 @@ func (s *Server) isoRefForPath(ctx context.Context, host, p string) (string, boo
 // on a migration target, is the sha256 of the file the source judged for the
 // VM (isoFileOwnershipAllows).
 func (s *Server) resolveISOForVM(ctx context.Context, project, scope, pool, file string, libraryCheck bool, key, wantSHA string) (string, error) {
+	ctx = withReadProject(ctx, project)
 	rec, ok, err := corrosion.GetStoragePool(ctx, s.db, s.hostName, pool)
 	if err != nil {
 		return "", status.Errorf(codes.Internal, "iso: look up pool %q: %v", pool, err)
@@ -683,6 +684,9 @@ func (s *Server) ListISOs(ctx context.Context, req *pb.ListISOsRequest) (*pb.Lis
 // not answer (a dead NFS server) is listed as one "unavailable" entry, never
 // waited on.
 func (s *Server) listLibrary(ctx context.Context, p corrosion.StoragePoolRecord) []*pb.ISOEntry {
+	if p.Project != "" {
+		ctx = withReadProject(ctx, p.Project)
+	}
 	unavailable := func(err error) []*pb.ISOEntry {
 		slog.Warn("iso library: a library directory did not answer", "pool", p.Name, "host", s.hostName, "error", err)
 		return []*pb.ISOEntry{{Ref: p.Name + "/", Pool: p.Name, Project: p.Project, Global: s.isGlobalISOLibrary(ctx, p), SyncState: "unavailable"}}

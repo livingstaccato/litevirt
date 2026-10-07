@@ -19,6 +19,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/safename"
+	"github.com/litevirt/litevirt/internal/tenancy"
 )
 
 // ── which pools map a directory ──
@@ -93,32 +94,66 @@ type deadlineFlight struct {
 	val      any
 	err      error
 	group    string // the network mount it reads, if any
+	project  string // the project whose budget it counts against
 	timedOut bool   // a caller gave up on it: answer "did not answer" until it returns (under deadlineFlights)
 }
 
-// isoMaxReadsInFlight caps the deadlined reads running at once, process-wide.
-// Each one that blocks in the kernel holds an OS thread until the filesystem
-// answers, and the Go runtime aborts at 10,000; past the cap a new read is
-// refused at once (fail closed), so no caller — whatever directories it names
-// — can pile them up.
-var isoMaxReadsInFlight = 64
+// The deadlined reads that can be running at once. Each one that blocks in the
+// kernel holds an OS thread until the filesystem answers, and the Go runtime
+// aborts at 10,000; past a bound a new read is refused at once (fail closed).
+// The bounds are layered so that no project can spend another's:
+//
+//   - isoMaxReadsInFlight in all;
+//   - of which isoReservedLocalReads only for reads not on a network mount
+//     (where nearly every library and pool directory is), which a network
+//     mount that stops answering can never take;
+//   - isoMaxReadsPerMount on one network mount, counted from the moment each
+//     read starts (not once one has timed out);
+//   - isoMaxReadsPerProject for one project (the caller's, or the VM's;
+//     readProject), and the same for reads no project asked for (the sync
+//     loop).
+var (
+	isoMaxReadsInFlight   = 64
+	isoReservedLocalReads = 16
+	isoMaxReadsPerMount   = 4
+	isoMaxReadsPerProject = 16
+)
 
 var deadlineFlights = struct {
 	sync.Mutex
 	m        map[string]*deadlineFlight
 	inFlight int
+	network  int            // flights on a network mount
+	perMount map[string]int // flights per network mount
+	perProj  map[string]int // flights per project
 	// stuck counts, per network mount, the reads that timed out and have not
 	// returned: while one has, every new read on that mount is answered "did
 	// not answer" at once.
 	stuck map[string]int
-}{m: map[string]*deadlineFlight{}, stuck: map[string]int{}}
+}{m: map[string]*deadlineFlight{}, stuck: map[string]int{}, perMount: map[string]int{}, perProj: map[string]int{}}
 
-// errTooManyReads is the fail-closed answer once isoMaxReadsInFlight reads are
-// waiting.
-type errTooManyReads struct{ dir string }
+// readProjectKey carries, in a context, the project a read is done for.
+type readProjectKey struct{}
+
+// withReadProject marks ctx's reads as done for project.
+func withReadProject(ctx context.Context, project string) context.Context {
+	return context.WithValue(ctx, readProjectKey{}, "project:"+tenancy.NormalizeProject(project))
+}
+
+// readProject is the budget a read counts against: its project, or "system".
+func readProject(ctx context.Context) string {
+	if p, ok := ctx.Value(readProjectKey{}).(string); ok && p != "" {
+		return p
+	}
+	return "system"
+}
+
+// errTooManyReads is the fail-closed answer once a bound on waiting reads is
+// reached.
+type errTooManyReads struct{ dir, what string }
 
 func (e errTooManyReads) Error() string {
-	return fmt.Sprintf("directory %s was not read: %d reads are already waiting on filesystems that do not answer", e.dir, isoMaxReadsInFlight)
+	return fmt.Sprintf("directory %s was not read: %s are already waiting on filesystems that do not answer", e.dir, e.what)
 }
 
 // errMountNotAnswering is the fail-closed answer for a directory on a network
@@ -148,11 +183,25 @@ func deadlined(ctx context.Context, key, group, what string, fn func() (any, err
 		return nil, errMountNotAnswering{dir: what, mount: group}
 	case !ok && deadlineFlights.inFlight >= isoMaxReadsInFlight:
 		deadlineFlights.Unlock()
-		return nil, errTooManyReads{dir: what}
+		return nil, errTooManyReads{dir: what, what: fmt.Sprintf("%d reads", isoMaxReadsInFlight)}
+	case !ok && group != "" && deadlineFlights.network >= isoMaxReadsInFlight-isoReservedLocalReads:
+		deadlineFlights.Unlock()
+		return nil, errTooManyReads{dir: what, what: fmt.Sprintf("%d reads on network filesystems", isoMaxReadsInFlight-isoReservedLocalReads)}
+	case !ok && group != "" && deadlineFlights.perMount[group] >= isoMaxReadsPerMount:
+		deadlineFlights.Unlock()
+		return nil, errTooManyReads{dir: what, what: fmt.Sprintf("%d reads on %s", isoMaxReadsPerMount, group)}
+	case !ok && deadlineFlights.perProj[readProject(ctx)] >= isoMaxReadsPerProject:
+		deadlineFlights.Unlock()
+		return nil, errTooManyReads{dir: what, what: fmt.Sprintf("%d reads for %s", isoMaxReadsPerProject, readProject(ctx))}
 	case !ok:
-		f = &deadlineFlight{done: make(chan struct{}), group: group}
+		f = &deadlineFlight{done: make(chan struct{}), group: group, project: readProject(ctx)}
 		deadlineFlights.m[key] = f
 		deadlineFlights.inFlight++
+		deadlineFlights.perProj[f.project]++
+		if group != "" {
+			deadlineFlights.network++
+			deadlineFlights.perMount[group]++
+		}
 		go func() {
 			var v any
 			var err error
@@ -166,6 +215,15 @@ func deadlined(ctx context.Context, key, group, what string, fn func() (any, err
 					delete(deadlineFlights.m, key)
 				}
 				deadlineFlights.inFlight--
+				if deadlineFlights.perProj[f.project]--; deadlineFlights.perProj[f.project] <= 0 {
+					delete(deadlineFlights.perProj, f.project)
+				}
+				if f.group != "" {
+					deadlineFlights.network--
+					if deadlineFlights.perMount[f.group]--; deadlineFlights.perMount[f.group] <= 0 {
+						delete(deadlineFlights.perMount, f.group)
+					}
+				}
 				if f.timedOut && f.group != "" {
 					if deadlineFlights.stuck[f.group]--; deadlineFlights.stuck[f.group] <= 0 {
 						delete(deadlineFlights.stuck, f.group)

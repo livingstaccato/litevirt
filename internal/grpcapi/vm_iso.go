@@ -77,6 +77,7 @@ func (s *Server) isoPoolFor(ctx context.Context, host, iso string) ([]corrosion.
 // reference and stored as written, so a compose file that names it does not
 // differ from what was stored.
 func (s *Server) authorizeVMISO(ctx context.Context, project, host string, spec *pb.VMSpec) error {
+	ctx = withReadProject(ctx, project)
 	iso := spec.GetIso()
 	trusted := spec.GetIsoScope()
 	spec.IsoScope = ""
@@ -117,6 +118,20 @@ func (s *Server) authorizeVMISO(ctx context.Context, project, host string, spec 
 	if perr != nil && status.Code(perr) != codes.PermissionDenied {
 		return perr
 	}
+	// A path that names no pool's directory is refused before anything is
+	// read: a non-admin cannot have the host read a directory merely by naming
+	// it, so the reads stay bounded by the pools, not by requests.
+	named, nerr := s.isoDirNamesAPool(ctx, host, iso)
+	if nerr != nil {
+		return nerr
+	}
+	if !named {
+		return status.Errorf(codes.PermissionDenied,
+			"iso %q is a host path on %s; attaching an arbitrary host file lets the guest read it, "+
+				"so it needs %s at the cluster root (the Admin role on /). Name an ISO from a library instead, "+
+				"as <pool>/<file>.iso (`lv iso ls` lists them)",
+			iso, host, verbISOHostPath)
+	}
 	ref, ok, rerr := s.isoRefForPath(ctx, host, iso)
 	if rerr != nil {
 		return rerr
@@ -130,6 +145,26 @@ func (s *Server) authorizeVMISO(ctx context.Context, project, host string, spec 
 			"so it needs %s at the cluster root (the Admin role on /). Name an ISO from a library instead, "+
 			"as <pool>/<file>.iso (`lv iso ls` lists them)",
 		iso, host, verbISOHostPath)
+}
+
+// isoDirNamesAPool reports, from the replicated pool rows alone and without
+// touching the filesystem, whether iso's directory is, as written, the
+// directory of a file-based pool on host.
+func (s *Server) isoDirNamesAPool(ctx context.Context, host, iso string) (bool, error) {
+	pools, err := corrosion.ListStoragePoolsForHost(ctx, s.db, host)
+	if err != nil {
+		return false, status.Errorf(codes.Internal, "list pools on %s: %v", host, err)
+	}
+	dir := filepath.Dir(filepath.Clean(iso))
+	for _, p := range pools {
+		if !isFileBasedDriver(p.Driver) {
+			continue
+		}
+		if pd, perr := fileBasedPoolDir(s.dataDir, StoragePoolRef{Driver: p.Driver, Source: p.Source, Target: p.Target}); perr == nil && pd != "" && filepath.Clean(pd) == dir {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // resolveSpecISO is this host's resolution of a VM's ISO through its pool: a

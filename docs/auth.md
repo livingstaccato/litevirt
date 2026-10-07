@@ -136,8 +136,10 @@ binding can:
   keyring), any network-backed pool (`nfs`, `ceph`, `iscsi`), any pool on
   host block storage (`zfs`, `lvm-thin`), a compose
   `backup-repos:` path, a custom absolute `repo_path`, and any `target_path` on
-  a restore or `ReplicateVolume` RPC (a bare name included) all need it, because the daemon reads and writes
-  there as root. Only `Admin` holds it (through `*`): `Operator` holds
+  a restore or `ReplicateVolume` RPC (a bare name included), and an import's
+  `--server-path` or `--disk-map` outside `<data_dir>/imports/staging` all need
+  it, because the daemon reads and writes there as root (the legacy `admin`
+  role keeps it too, as before). Only `Admin` holds it (through `*`): `Operator` holds
   `storage.pool.write` but not this, at any path. A custom role gets it by
   naming it or `storage.*`. Without bindings the floor is `admin`. Using a pool
   an admin created — disks on a `zfs` or `lvm-thin` pool included — needs only

@@ -655,9 +655,11 @@ func (s *Server) resolveStagedPath(ctx context.Context, p string) (string, error
 				"path %q is outside the import staging root (%s); a forwarded import may not name a host path — "+
 					"stage the file under %s, or run the import against %s directly as an admin", p, stagingRoot, stagingRoot, s.hostName)
 		}
-		if err := RequireRole(ctx, "admin"); err != nil {
+		// The storage host-path verb, as every host path in storage; the
+		// admin role keeps it, as on main.
+		if s.RequirePerm(ctx, "/", verbStorageHostPath, "admin") != nil && RequireRole(ctx, "admin") != nil {
 			return "", status.Errorf(codes.PermissionDenied,
-				"path %q is outside the import staging root (%s); reading an arbitrary host path requires the admin role", p, stagingRoot)
+				"path %q is outside the import staging root (%s); reading an arbitrary host path needs %s at the cluster root (the Admin role on /)", p, stagingRoot, verbStorageHostPath)
 		}
 	}
 	return resolved, nil

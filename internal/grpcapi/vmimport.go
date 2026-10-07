@@ -15,6 +15,7 @@ import (
 	"sync"
 
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	"github.com/google/uuid"
@@ -71,10 +72,20 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 
 	// Forward to the destination host without consuming more of the stream, so
 	// bytes land directly on the host that will own the VM (a concurrent stream
-	// proxy). The target re-runs the checks below for itself, but it sees this
-	// node as an admin peer, not as the caller: so a forwarded import never
-	// names a host path outside the staging root (resolveStagedPath).
+	// proxy). The target re-runs the checks below for itself. It sees this
+	// node as an admin peer, so a host path outside the staging root is
+	// judged there as the caller, by the bearer this node relays
+	// (resolveStagedPath, forwardedImportCaller).
 	if first.TargetHost != "" && first.TargetHost != s.hostName {
+		// A caller with no bearer to relay reaches the target as this
+		// node, an admin: only an admin may be forwarded so. (Every
+		// bearerless identity is an admin or refused, so this refuses
+		// nothing that reaches here; it keeps forwardedImportCaller's
+		// reading true if that ever changes.)
+		if !hasBearer(ctx) && s.RequirePerm(ctx, "/", verbStorageHostPath, "admin") != nil && RequireRole(ctx, "admin") != nil {
+			return status.Error(codes.PermissionDenied,
+				"this caller has no identity to carry to the target host; run the import against "+first.TargetHost+" directly, or sign in")
+		}
 		return s.proxyImportVM(ctx, stream, first)
 	}
 
@@ -646,13 +657,15 @@ func (s *Server) resolveStagedPath(ctx context.Context, p string) (string, error
 	if !safename.Contains(stagingRoot, resolved) {
 		// Outside the staging root → privileged. A request that reached this
 		// host from a peer is a forwarded import (--target-host): the peer
-		// authenticates as admin here whoever called the entry node, so a
-		// forwarded import never names a host path. An admin connects to the
-		// target host itself for that.
+		// authenticates as admin here whoever called the entry node, so the
+		// forwarded import is judged as the caller of the entry node
+		// (forwardedImportCaller), never as the peer.
 		if callerPrincipalKind(ctx) == principalKindPeer {
-			return "", status.Errorf(codes.PermissionDenied,
-				"path %q is outside the import staging root (%s); a forwarded import may not name a host path — "+
-					"stage the file under %s, or run the import against %s directly as an admin", p, stagingRoot, stagingRoot, s.hostName)
+			uctx, err := s.forwardedImportCaller(ctx)
+			if err != nil {
+				return "", err
+			}
+			ctx = uctx
 		}
 		// The storage host-path verb, as every host path in storage; the
 		// admin role keeps it, as on main.
@@ -662,6 +675,40 @@ func (s *Server) resolveStagedPath(ctx context.Context, p string) (string, error
 		}
 	}
 	return resolved, nil
+}
+
+// forwardedImportCaller is who a peer's forwarded import is for, judged for
+// a host path as on its entry node:
+//
+//   - promoted already by forwarded identity: that user;
+//   - carrying the entry caller's bearer (pki.FwdBearerMDKey, which every
+//     entry node relays, a main build's included): that user, authenticated
+//     here whether or not forwarded identity is enforced cluster-wide;
+//   - no bearer: the entry node's caller had none, so it was an admin by
+//     certificate (a CLI certificate, on-node root, or a peer itself): the
+//     peer's own admin identity stands, as on main. A user who is not an
+//     admin always has a bearer, and it is always relayed.
+//
+// The same reading as a forwarded content call (poolContentCallerOf).
+func (s *Server) forwardedImportCaller(ctx context.Context) (context.Context, error) {
+	if callerAuthMethod(ctx) != authMethodMTLS {
+		return ctx, nil
+	}
+	if fwd := fwdBearerFromCtx(ctx); fwd != "" {
+		return s.awaitForwardedBearer(ctx, fwd)
+	}
+	return ctx, nil
+}
+
+// hasBearer reports whether the caller presented a bearer, which PeerDial
+// relays to a peer (pki.FwdBearerMDKey).
+func hasBearer(ctx context.Context) bool {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return false
+	}
+	a := md.Get("authorization")
+	return len(a) > 0 && a[0] != ""
 }
 
 // parseImportSource dispatches to the right adapter. auto sniffs by content.

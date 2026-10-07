@@ -245,7 +245,8 @@ func (s *Server) replicateCrossHost(ctx context.Context, sched corrosion.BackupS
 	}
 	defer closeConn()
 
-	if err := proveReplicaRecords(ctx, client, sched.TargetPool, targetHost, rec.Project, rec.VM); err != nil {
+	legacy, err := proveReplicaRecords(ctx, client, sched.TargetPool, targetHost, rec.Project, rec.VM)
+	if err != nil {
 		s.recordVMEvent(ctx, sched.VMName, "disk.replicated", "error", fmt.Sprintf("%s → %s@%s: %v", src.DiskName, sched.TargetPool, targetHost, err))
 		return err
 	}
@@ -268,14 +269,26 @@ func (s *Server) replicateCrossHost(ctx context.Context, sched corrosion.BackupS
 		return fmt.Errorf("local scratch replicate: %w", err)
 	}
 
-	if err := streamReplicaToPool(ctx, client, scratch, sched.TargetPool, targetHost, rec); err != nil {
+	sent := rec.File
+	if legacy {
+		// A receiver on an older build: main's upload of a runner-named file
+		// to its pool's top level, which it keeps and promotes as main did.
+		sent = legacyReplicaName(rec.VM, rec.Disk, rec.Taken, rec.Format)
+		err = streamLegacyReplica(ctx, client, scratch, sched.TargetPool, targetHost, replicaKeyOf(vm, src.DiskName), sent)
+	} else {
+		err = streamReplicaToPool(ctx, client, scratch, sched.TargetPool, targetHost, rec)
+	}
+	if err != nil {
 		s.recordVMEvent(ctx, sched.VMName, "disk.replicated", "error", fmt.Sprintf("%s → %s@%s: upload: %v", src.DiskName, sched.TargetPool, targetHost, err))
 		return fmt.Errorf("stream to %q: %w", targetHost, err)
 	}
 
-	pruned := s.pruneReplicasAnywhere(ctx, sched.TargetPool, targetHost, vm.Project, sched.VMName, src.DiskName, key, sched.KeepReplicas)
+	pruned := 0
+	if !legacy {
+		pruned = s.pruneReplicasAnywhere(ctx, sched.TargetPool, targetHost, vm.Project, sched.VMName, src.DiskName, key, sched.KeepReplicas)
+	}
 	pruned += s.pruneEarlierReplicasAnywhere(ctx, sched.TargetPool, targetHost, vm, src.DiskName, sched.KeepReplicas)
-	detail := fmt.Sprintf("%s → %s@%s (%s)", src.DiskName, sched.TargetPool, targetHost, rec.File)
+	detail := fmt.Sprintf("%s → %s@%s (%s)", src.DiskName, sched.TargetPool, targetHost, sent)
 	if pruned > 0 {
 		detail += fmt.Sprintf(", pruned %d old", pruned)
 	}
@@ -303,6 +316,42 @@ func streamReplicaToPool(ctx context.Context, client pb.LiteVirtClient, path, po
 		n, rerr := f.Read(buf)
 		if n > 0 {
 			if err := up.Send(&pb.PushReplicaRequest{Chunk: buf[:n]}); err != nil {
+				return err
+			}
+		}
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			return rerr
+		}
+	}
+	_, err = up.CloseAndRecv()
+	return err
+}
+
+// streamLegacyReplica sends a local file to an older build's pool as main's
+// runner did: an upload of the runner name to the pool's top level. The
+// content call says it is the daemon's, about k's replicas, so a receiver
+// that knows the marker records it as k's replica.
+func streamLegacyReplica(ctx context.Context, client pb.LiteVirtClient, path, pool, host string, k replicaKey, name string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	up, err := client.UploadStoragePoolContent(withReplicaContentView(ctx, k, "", false))
+	if err != nil {
+		return err
+	}
+	if err := up.Send(&pb.UploadStoragePoolContentRequest{PoolName: pool, Host: host, Filename: name}); err != nil {
+		return err
+	}
+	buf := make([]byte, 1<<20)
+	for {
+		n, rerr := f.Read(buf)
+		if n > 0 {
+			if err := up.Send(&pb.UploadStoragePoolContentRequest{Chunk: buf[:n]}); err != nil {
 				return err
 			}
 		}
@@ -357,7 +406,22 @@ func (s *Server) pruneTopLevelReplicasRemote(ctx context.Context, client pb.Lite
 // fall back to a full qcow2 copy.
 func (s *Server) replicateIncremental(ctx context.Context, sched corrosion.BackupScheduleRecord, vm *corrosion.VMRecord, src *corrosion.DiskRecord, targetHost, ts string) error {
 	key := replicaScheduleKey(sched)
-	base := s.newestRawReplica(ctx, sched.TargetPool, targetHost, vm.Project, sched.VMName, src.DiskName, key)
+	// A receiver on an older build keeps main's top-level replicas: the
+	// fork base is the newest of those, and the push is main's.
+	legacy := false
+	if targetHost != s.hostName {
+		l, err := s.replicaReceiverLegacy(ctx, targetHost, sched.TargetPool, vm.Project, sched.VMName)
+		if err != nil {
+			return err
+		}
+		legacy = l
+	}
+	var base string
+	if legacy {
+		base = s.newestLegacyRawReplica(ctx, sched.TargetPool, targetHost, replicaKeyOf(vm, src.DiskName))
+	} else {
+		base = s.newestRawReplica(ctx, sched.TargetPool, targetHost, vm.Project, sched.VMName, src.DiskName, key)
+	}
 	// Read the anchor from the per-VM replication_checkpoints table keyed by the
 	// REAL vm (sched.VMName), NOT sched.LastCheckpoint — for fan-out scopes the
 	// schedule row's vm_name is a sentinel, so sched.LastCheckpoint is always
@@ -413,7 +477,10 @@ func (s *Server) replicateIncremental(ctx context.Context, sched corrosion.Backu
 	}
 	committed = true // newCP is now the recorded anchor — keep it
 
-	pruned := s.pruneReplicasAnywhere(ctx, sched.TargetPool, targetHost, vm.Project, sched.VMName, src.DiskName, key, sched.KeepReplicas)
+	pruned := 0
+	if !legacy {
+		pruned = s.pruneReplicasAnywhere(ctx, sched.TargetPool, targetHost, vm.Project, sched.VMName, src.DiskName, key, sched.KeepReplicas)
+	}
 	pruned += s.pruneEarlierReplicasAnywhere(ctx, sched.TargetPool, targetHost, vm, src.DiskName, sched.KeepReplicas)
 	mode := "full"
 	if base != "" {
@@ -457,6 +524,35 @@ func (s *Server) newestRawReplica(ctx context.Context, pool, host, project, vm, 
 	for _, r := range s.replicaRecordsOn(ctx, pool, host, project, vm) { // oldest first
 		if r.Disk == disk && r.Schedule == schedule && r.Format == "raw" {
 			best = r.File
+		}
+	}
+	return best
+}
+
+// replicaReceiverLegacy reports whether host is on a build that predates
+// replica records (proveReplicaRecords).
+func (s *Server) replicaReceiverLegacy(ctx context.Context, host, pool, project, vm string) (bool, error) {
+	client, closeConn, err := s.dialPeer(ctx, host)
+	if err != nil {
+		return false, fmt.Errorf("reach host %q: %w", host, err)
+	}
+	defer closeConn()
+	return proveReplicaRecords(ctx, client, pool, host, project, vm)
+}
+
+// newestLegacyRawReplica is the newest raw top-level replica of k's disk in
+// pool on host (an older build's: remoteReplicaNames matches it by its exact
+// runner name, never one another project's VM could have written), or "".
+func (s *Server) newestLegacyRawReplica(ctx context.Context, pool, host string, k replicaKey) string {
+	client, closeConn, err := s.dialPeer(ctx, host)
+	if err != nil {
+		return ""
+	}
+	defer closeConn()
+	best := ""
+	for _, n := range s.remoteReplicaNames(ctx, client, pool, host, k, "", false) { // oldest first
+		if strings.HasSuffix(n, ".raw") {
+			best = n
 		}
 	}
 	return best
@@ -517,18 +613,25 @@ func (s *Server) applyIncrementRemote(ctx context.Context, host, pool string, re
 	}
 	defer closeConn()
 	// An older receiver's PushReplicaIncrement ignores the record and writes
-	// the bytes as a bare name in the pool: prove it records replicas first.
-	if err := proveReplicaRecords(ctx, client, pool, host, rec.Project, rec.VM); err != nil {
+	// the bytes as a bare name in its pool: to one, the push is main's — the
+	// runner name at the top level, forked from base, a top-level replica
+	// there (replicateIncremental chose it so).
+	legacy, err := proveReplicaRecords(ctx, client, pool, host, rec.Project, rec.VM)
+	if err != nil {
 		return err
 	}
 	up, err := client.PushReplicaIncrement(ctx)
 	if err != nil {
 		return err
 	}
-	if err := up.Send(&pb.PushReplicaIncrementRequest{
+	hdr := &pb.PushReplicaIncrementRequest{
 		PoolName: pool, Host: host, Filename: rec.File, Base: base, TotalSize: totalSize,
 		Replica: rec.toPB(),
-	}); err != nil {
+	}
+	if legacy {
+		hdr.Filename, hdr.Replica = legacyReplicaName(rec.VM, rec.Disk, rec.Taken, rec.Format), nil
+	}
+	if err := up.Send(hdr); err != nil {
 		return err
 	}
 	if err := forEachExtentChunk(r, extents, totalSize, func(off int64, data []byte) error {
@@ -540,7 +643,7 @@ func (s *Server) applyIncrementRemote(ctx context.Context, host, pool string, re
 	if err != nil {
 		return err
 	}
-	if !resp.GetReplicaRecorded() {
+	if !legacy && !resp.GetReplicaRecorded() {
 		return fmt.Errorf("host %q wrote the increment without recording it as a replica", host)
 	}
 	return nil
@@ -597,6 +700,13 @@ func (s *Server) pruneEarlierReplicasAnywhere(ctx context.Context, pool, host st
 		}
 	}
 	keep := max(keepN-inArea, 0)
+	// A host on an older build cannot see the replica area: if it coordinates
+	// a failover, the top-level replicas are all it can promote. While any
+	// host may be one, they are kept as main kept them (keepN), never cut for
+	// the area's.
+	if keep < keepN && !s.everyHostListsReplicas(ctx) {
+		keep = keepN
+	}
 	k := replicaKeyOf(vm, disk)
 	if host == s.hostName {
 		dir, err := s.replicaPoolDir(ctx, pool)

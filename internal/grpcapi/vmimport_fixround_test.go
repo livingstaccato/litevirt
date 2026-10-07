@@ -195,6 +195,7 @@ func TestImportVM_AnExistingDiskInThePoolIsNeverReplaced(t *testing.T) {
 	shim := "#!/bin/sh\n" +
 		"echo \"$1\" >> '" + calls + "'\n" +
 		"if [ \"$1\" = info ]; then echo '{\"format\":\"raw\",\"virtual-size\":1048576}'; exit 0; fi\n" +
+		"if [ \"$1\" = measure ]; then echo '{\"required\":134217728,\"fully-allocated\":134217728}'; exit 0; fi\n" +
 		"prev=\"\"; last=\"\"\n" +
 		"for a; do prev=\"$last\"; last=\"$a\"; done\n" +
 		"cp \"$prev\" \"$last\"\n"
@@ -477,6 +478,7 @@ func appearingQemuImg(t *testing.T) {
 	dir := t.TempDir()
 	shim := "#!/bin/sh\n" +
 		"if [ \"$1\" = info ]; then echo '{\"format\":\"raw\",\"virtual-size\":1048576}'; exit 0; fi\n" +
+		"if [ \"$1\" = measure ]; then echo '{\"required\":134217728,\"fully-allocated\":134217728}'; exit 0; fi\n" +
 		"prev=\"\"; last=\"\"\n" +
 		"for a; do prev=\"$last\"; last=\"$a\"; done\n" +
 		"d=$(dirname \"$last\"); b=$(basename \"$last\"); b=${b#.}; b=${b%%.convert-*}\n" +

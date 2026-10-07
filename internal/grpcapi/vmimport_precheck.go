@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"syscall"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -17,6 +18,7 @@ import (
 	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/safename"
 	"github.com/litevirt/litevirt/internal/vmimport"
+	"log/slog"
 )
 
 // A foreign disk reaches qemu-img as root. qemu-img opens whatever the disk's
@@ -28,7 +30,7 @@ import (
 
 // importDiskFormats are the formats an import converts. Each is one whose
 // every file reference the header check understands.
-var importDiskFormats = map[string]bool{"raw": true, "qcow2": true, "vmdk": true, "vpc": true}
+var importDiskFormats = map[string]bool{"raw": true, "qcow2": true, "vmdk": true, "vpc": true, "vdi": true, "vhdx": true}
 
 // vmdk4GDAtEnd is the grain-directory offset of a stream-optimized VMDK whose
 // real header is the footer at the end of the file.
@@ -45,9 +47,176 @@ func precheckDiskHeader(file, format string) error {
 		return qcow2.AssertNoExternalData(file)
 	case "vmdk":
 		return assertSparseVMDK(file)
+	case "vdi":
+		return assertStandaloneVDI(file)
+	case "vhdx":
+		return assertStandaloneVHDX(file)
 	}
 	// raw and vpc name no other file.
 	return nil
+}
+
+// VDI header (qemu block/vdi.c, VirtualBox VDICore.h): all little-endian.
+const (
+	vdiSignature     = 0xbeda107f
+	vdiVersion1_1    = 0x00010001
+	vdiTypeDynamic   = 1
+	vdiTypeStatic    = 2
+	vdiOffSignature  = 0x40
+	vdiOffVersion    = 0x44
+	vdiOffImageType  = 0x4c
+	vdiOffUUIDParent = 0x1b8
+	vdiHeaderLen     = 0x1c8
+)
+
+// assertStandaloneVDI accepts a VDI that is a whole disk: a fixed or dynamic
+// image with no parent. qemu's vdi driver opens no other file, and refuses a
+// differencing or undo image itself; litevirt says why first.
+func assertStandaloneVDI(file string) error {
+	f, err := os.Open(file)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	h := make([]byte, vdiHeaderLen)
+	if _, err := io.ReadFull(f, h); err != nil {
+		return fmt.Errorf("not a VDI image: short header")
+	}
+	le := binary.LittleEndian
+	if le.Uint32(h[vdiOffSignature:]) != vdiSignature {
+		return fmt.Errorf("not a VDI image: bad signature")
+	}
+	if v := le.Uint32(h[vdiOffVersion:]); v != vdiVersion1_1 {
+		return fmt.Errorf("VDI version %#x is not imported; convert the disk to qcow2 first", v)
+	}
+	switch t := le.Uint32(h[vdiOffImageType:]); t {
+	case vdiTypeDynamic, vdiTypeStatic:
+	default:
+		return fmt.Errorf("VDI image type %d is a differencing (or undo) image that depends on a parent; "+
+			"merge it into its base in VirtualBox (or clone it to a standalone disk) and import that", t)
+	}
+	if !allZero(h[vdiOffUUIDParent : vdiOffUUIDParent+16]) {
+		return fmt.Errorf("VDI image names a parent image; merge it into its base in VirtualBox (or clone it to a standalone disk) and import that")
+	}
+	return nil
+}
+
+// VHDX layout (MS-VHDX): the region tables at 192 KiB and 256 KiB, and in the
+// metadata region a table of items. GUIDs are in their on-disk (mixed-endian)
+// byte order.
+var (
+	vhdxRegionMetadata = []byte{0x06, 0xa2, 0x7c, 0x8b, 0x90, 0x47, 0x9a, 0x4b, 0xb8, 0xfe, 0x57, 0x5f, 0x05, 0x0f, 0x88, 0x6e}
+	vhdxItemFileParams = []byte{0x37, 0x67, 0xa1, 0xca, 0x36, 0xfa, 0x43, 0x4d, 0xb3, 0xb6, 0x33, 0xf0, 0xaa, 0x44, 0xe7, 0x6b}
+	vhdxItemParentLoc  = []byte{0x2d, 0x5f, 0xd3, 0xa8, 0x0b, 0xb3, 0x4d, 0x45, 0xab, 0xf7, 0xd3, 0xd8, 0x48, 0x34, 0xab, 0x0c}
+)
+
+const (
+	vhdxRegionTable1   = 192 << 10
+	vhdxRegionTable2   = 256 << 10
+	vhdxMaxEntries     = 2047
+	vhdxHasParent      = 1 << 1
+	vhdxMetaTableBytes = 64 << 10
+)
+
+// assertStandaloneVHDX accepts a VHDX that is a whole disk: no metadata
+// region in either region table names a parent locator or sets HasParent in
+// its file parameters. qemu's vhdx driver follows no parent (it refuses a
+// differencing image); litevirt says why first, and refuses a file whose
+// region tables it cannot read.
+func assertStandaloneVHDX(file string) error {
+	f, err := os.Open(file)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	head := make([]byte, 8)
+	if _, err := io.ReadFull(f, head); err != nil || !bytes.Equal(head, []byte("vhdxfile")) {
+		return fmt.Errorf("not a VHDX image: bad file identifier")
+	}
+	differencing := fmt.Errorf("VHDX image is a differencing disk that depends on a parent; " +
+		"merge it into its parent in Hyper-V (or convert it to a standalone disk) and import that")
+	read := 0
+	for _, off := range []int64{vhdxRegionTable1, vhdxRegionTable2} {
+		meta, ok, err := vhdxMetadataRegion(f, off)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			continue
+		}
+		read++
+		parent, err := vhdxNamesParent(f, meta)
+		if err != nil {
+			return err
+		}
+		if parent {
+			return differencing
+		}
+	}
+	if read == 0 {
+		return fmt.Errorf("VHDX image has no readable region table with a metadata region")
+	}
+	return nil
+}
+
+// vhdxMetadataRegion is the file offset of the metadata region the region
+// table at off names; ok is false when no table is there.
+func vhdxMetadataRegion(f *os.File, off int64) (meta int64, ok bool, err error) {
+	h := make([]byte, 16)
+	if _, err := f.ReadAt(h, off); err != nil {
+		return 0, false, nil
+	}
+	if !bytes.Equal(h[:4], []byte("regi")) {
+		return 0, false, nil
+	}
+	n := binary.LittleEndian.Uint32(h[8:12])
+	if n > vhdxMaxEntries {
+		return 0, false, fmt.Errorf("VHDX region table has %d entries", n)
+	}
+	entries := make([]byte, 32*int(n))
+	if _, err := f.ReadAt(entries, off+16); err != nil {
+		return 0, false, fmt.Errorf("VHDX region table: %w", err)
+	}
+	for i := 0; i < int(n); i++ {
+		e := entries[i*32 : (i+1)*32]
+		if bytes.Equal(e[:16], vhdxRegionMetadata) {
+			return int64(binary.LittleEndian.Uint64(e[16:24])), true, nil
+		}
+	}
+	return 0, false, nil
+}
+
+// vhdxNamesParent reports whether the metadata region at meta holds a parent
+// locator, or file parameters with HasParent set.
+func vhdxNamesParent(f *os.File, meta int64) (bool, error) {
+	t := make([]byte, vhdxMetaTableBytes)
+	if _, err := f.ReadAt(t, meta); err != nil {
+		return false, fmt.Errorf("VHDX metadata table: %w", err)
+	}
+	if !bytes.Equal(t[:8], []byte("metadata")) {
+		return false, fmt.Errorf("VHDX metadata table: bad signature")
+	}
+	n := int(binary.LittleEndian.Uint16(t[10:12]))
+	if n > vhdxMaxEntries {
+		return false, fmt.Errorf("VHDX metadata table has %d entries", n)
+	}
+	for i := 0; i < n; i++ {
+		e := t[32+i*32 : 32+(i+1)*32]
+		switch {
+		case bytes.Equal(e[:16], vhdxItemParentLoc):
+			return true, nil
+		case bytes.Equal(e[:16], vhdxItemFileParams):
+			itemOff := binary.LittleEndian.Uint32(e[16:20])
+			p := make([]byte, 8)
+			if _, err := f.ReadAt(p, meta+int64(itemOff)); err != nil {
+				return false, fmt.Errorf("VHDX file parameters: %w", err)
+			}
+			if binary.LittleEndian.Uint32(p[4:8])&vhdxHasParent != 0 {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
 }
 
 // assertSparseVMDK accepts only a single-file sparse VMDK: a VMDK4 header with
@@ -114,12 +283,14 @@ func staticDiskFormat(file string) (string, error) {
 		return "vpc", nil
 	case bytes.Contains(head, []byte("# Disk DescriptorFile")):
 		return "", fmt.Errorf("a VMDK descriptor names other files; convert the disk to qcow2 first")
-	case bytes.HasPrefix(head, []byte("vhdxfile")),
-		bytes.HasPrefix(head, []byte("QED\x00")),
-		len(head) >= 0x44 && binary.LittleEndian.Uint32(head[0x40:0x44]) == 0xbeda107f:
-		// Converted as raw these would copy their container bytes into a
-		// disk that does not boot.
-		return "", fmt.Errorf("disk is VHDX, QED or VDI, which the import does not convert; convert it to qcow2 or raw first")
+	case bytes.HasPrefix(head, []byte("vhdxfile")):
+		return "vhdx", nil
+	case len(head) >= 0x44 && binary.LittleEndian.Uint32(head[0x40:0x44]) == vdiSignature:
+		return "vdi", nil
+	case bytes.HasPrefix(head, []byte("QED\x00")):
+		// Converted as raw it would copy its container bytes into a disk
+		// that does not boot, and its backing file is not parsed here.
+		return "", fmt.Errorf("disk is QED, which the import does not convert; convert it to qcow2 or raw first")
 	}
 	if fi, err := f.Stat(); err == nil && fi.Size() >= 512 {
 		foot := make([]byte, 8)
@@ -137,7 +308,10 @@ func staticDiskFormat(file string) (string, error) {
 // before qemu-img opens it. It is copied into importDir, opened without
 // following a link, and must be a plain file; the copy is what is checked and
 // converted.
-func privateImportDisk(ctx context.Context, src, importDir string, limit int64) (string, error) {
+//
+// reserve, when set, is asked for the room the copy takes in importDir — the
+// source's allocated blocks, since the copy is sparse — before it is written.
+func privateImportDisk(ctx context.Context, src, importDir string, limit int64, reserve func(uint64) error) (string, error) {
 	// importDir and everything under it is written by the daemon alone, so a
 	// plain file named inside it (as written, or as resolved) is already
 	// private.
@@ -160,6 +334,11 @@ func privateImportDisk(ctx context.Context, src, importDir string, limit int64) 
 	if !fi.Mode().IsRegular() {
 		return "", fmt.Errorf("disk %s is not a plain file", filepath.Base(src))
 	}
+	if reserve != nil {
+		if err := reserve(privateCopyNeed(fi)); err != nil {
+			return "", err
+		}
+	}
 	out, err := os.CreateTemp(importDir, "disk-*")
 	if err != nil {
 		return "", err
@@ -176,6 +355,23 @@ func privateImportDisk(ctx context.Context, src, importDir string, limit int64) 
 	return out.Name(), nil
 }
 
+// privateCopyNeed is what copySparse writes for the source fi describes: its
+// allocated blocks (it leaves every hole a hole), never more than its length.
+// A filesystem that reports no blocks for a non-empty file is charged its
+// length.
+func privateCopyNeed(fi os.FileInfo) uint64 {
+	size := uint64(max(fi.Size(), 0))
+	alloc := size
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok && st.Blocks > 0 {
+		alloc = min(uint64(st.Blocks)*512, size)
+	}
+	// copySparse writes a partly-zero grain whole: the last one may round up.
+	return min(size, alloc+copySparseGrain)
+}
+
+// copySparseGrain is the run of zeros copySparse leaves a hole.
+const copySparseGrain = 64 << 10
+
 // copySparse copies in to out leaving every all-zero chunk a hole, so a thin
 // disk costs its data rather than its virtual size in the import directory,
 // which usually shares a filesystem with state.db. It stops when ctx ends, and
@@ -190,12 +386,15 @@ func copySparse(ctx context.Context, out, in *os.File, limit int64) error {
 		}
 		n, rerr := io.ReadFull(in, buf)
 		if n > 0 {
-			if allZero(buf[:n]) {
-				if _, err := out.Seek(int64(n), io.SeekCurrent); err != nil {
+			for g := 0; g < n; g += copySparseGrain {
+				chunk := buf[g:min(g+copySparseGrain, n)]
+				if allZero(chunk) {
+					if _, err := out.Seek(int64(len(chunk)), io.SeekCurrent); err != nil {
+						return err
+					}
+				} else if _, err := out.Write(chunk); err != nil {
 					return err
 				}
-			} else if _, err := out.Write(buf[:n]); err != nil {
-				return err
 			}
 			off += int64(n)
 			if off > limit {
@@ -249,6 +448,40 @@ func bindImportDiskSizes(fv *vmimport.ForeignVM) error {
 		}
 	}
 	return nil
+}
+
+// importConvertSlack is room kept above what qemu-img measure says a
+// conversion writes.
+const importConvertSlack = 16 << 20
+
+// importConvertNeed is what converting file (opened as format, of virtual
+// size virtual) to qcow2 writes into the pool: what qemu-img measure says
+// the qcow2 needs — the data it holds and the tables for it, not its
+// capacity. Without an answer from measure, it is the whole virtual size
+// with its tables.
+func importConvertNeed(ctx context.Context, file, format string, virtual uint64) uint64 {
+	req, err := qemuMeasure(ctx, file, format)
+	if err == nil {
+		return req + importConvertSlack
+	}
+	slog.Warn("import: qemu-img measure failed; reserving the disk's whole virtual size for its conversion", "disk", filepath.Base(file), "error", err)
+	return coldFlattenEstimate(virtual, virtual)
+}
+
+// qemuMeasure is the bytes qemu-img says a qcow2 converted from file, opened
+// as format (never probed), needs. file has passed the header check.
+func qemuMeasure(ctx context.Context, file, format string) (uint64, error) {
+	out, err := exec.CommandContext(ctx, "qemu-img", "measure", "--output=json", "-O", "qcow2", "-f", format, "--", file).Output()
+	if err != nil {
+		return 0, fmt.Errorf("measure %s: %w", filepath.Base(file), err)
+	}
+	var m struct {
+		Required *uint64 `json:"required"`
+	}
+	if err := json.Unmarshal(out, &m); err != nil || m.Required == nil {
+		return 0, fmt.Errorf("measure %s: unreadable qemu-img measure output", filepath.Base(file))
+	}
+	return *m.Required, nil
 }
 
 // qemuVirtualSize is the virtual size qemu-img reports for a disk that has

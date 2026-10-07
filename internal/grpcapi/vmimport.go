@@ -15,6 +15,7 @@ import (
 	"sync"
 
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	"github.com/google/uuid"
@@ -71,10 +72,20 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 
 	// Forward to the destination host without consuming more of the stream, so
 	// bytes land directly on the host that will own the VM (a concurrent stream
-	// proxy). The target re-runs the checks below for itself, but it sees this
-	// node as an admin peer, not as the caller: so a forwarded import never
-	// names a host path outside the staging root (resolveStagedPath).
+	// proxy). The target re-runs the checks below for itself. It sees this
+	// node as an admin peer, so a host path outside the staging root is
+	// judged there as the caller, by the bearer this node relays
+	// (resolveStagedPath, forwardedImportCaller).
 	if first.TargetHost != "" && first.TargetHost != s.hostName {
+		// A caller with no bearer to relay reaches the target as this
+		// node, an admin: only an admin may be forwarded so. (Every
+		// bearerless identity is an admin or refused, so this refuses
+		// nothing that reaches here; it keeps forwardedImportCaller's
+		// reading true if that ever changes.)
+		if !hasBearer(ctx) && s.RequirePerm(ctx, "/", verbStorageHostPath, "admin") != nil && RequireRole(ctx, "admin") != nil {
+			return status.Error(codes.PermissionDenied,
+				"this caller has no identity to carry to the target host; run the import against "+first.TargetHost+" directly, or sign in")
+		}
 		return s.proxyImportVM(ctx, stream, first)
 	}
 
@@ -245,20 +256,19 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 			cleanupDisks()
 			return status.Error(codes.FailedPrecondition, err.Error())
 		}
-		// The conversion writes up to the disk's limit, plus its qcow2
-		// tables, into the pool, and a disk from outside the import directory
-		// is first copied privately. Each is reserved on its own filesystem;
-		// on a shared one the two add up.
-		limit := uint64(importSourceLimit(d.CapacityBytes))
-		if !inImportDir(importDir, d.LocalPath) {
-			if err := space.reserve(importDir, limit, "a private copy of disk "+d.Name); err != nil {
-				cleanupDisks()
-				return err
-			}
+		// What the import writes is reserved, not what the disk declares: a
+		// disk from outside the import directory is first copied privately,
+		// sparse, so it is charged the source's allocated blocks; the
+		// conversion is charged what qemu-img measures it will write (a thin
+		// 1 TiB disk holding 40 GiB writes about 40 GiB). Each is reserved on
+		// its own filesystem, just before it is written; on a shared one the
+		// two add up. The declared capacity stays the quota's bound only.
+		diskName := d.Name
+		writes.privateCopy = func(n uint64) error {
+			return space.reserve(importDir, n, "a private copy of disk "+diskName)
 		}
-		if err := space.reserve(poolDir, limit+limit/4096+16<<20, "converting disk "+d.Name); err != nil {
-			cleanupDisks()
-			return err
+		writes.converting = func(n uint64) error {
+			return space.reserve(poolDir, n, "converting disk "+diskName)
 		}
 		if err := convertForeignDisk(ctx, d.LocalPath, d.Format, dst, importDir, importSourceLimit(d.CapacityBytes), func(pct float32) {
 			select {
@@ -647,13 +657,15 @@ func (s *Server) resolveStagedPath(ctx context.Context, p string) (string, error
 	if !safename.Contains(stagingRoot, resolved) {
 		// Outside the staging root → privileged. A request that reached this
 		// host from a peer is a forwarded import (--target-host): the peer
-		// authenticates as admin here whoever called the entry node, so a
-		// forwarded import never names a host path. An admin connects to the
-		// target host itself for that.
+		// authenticates as admin here whoever called the entry node, so the
+		// forwarded import is judged as the caller of the entry node
+		// (forwardedImportCaller), never as the peer.
 		if callerPrincipalKind(ctx) == principalKindPeer {
-			return "", status.Errorf(codes.PermissionDenied,
-				"path %q is outside the import staging root (%s); a forwarded import may not name a host path — "+
-					"stage the file under %s, or run the import against %s directly as an admin", p, stagingRoot, stagingRoot, s.hostName)
+			uctx, err := s.forwardedImportCaller(ctx)
+			if err != nil {
+				return "", err
+			}
+			ctx = uctx
 		}
 		// The storage host-path verb, as every host path in storage; the
 		// admin role keeps it, as on main.
@@ -663,6 +675,40 @@ func (s *Server) resolveStagedPath(ctx context.Context, p string) (string, error
 		}
 	}
 	return resolved, nil
+}
+
+// forwardedImportCaller is who a peer's forwarded import is for, judged for
+// a host path as on its entry node:
+//
+//   - promoted already by forwarded identity: that user;
+//   - carrying the entry caller's bearer (pki.FwdBearerMDKey, which every
+//     entry node relays, a main build's included): that user, authenticated
+//     here whether or not forwarded identity is enforced cluster-wide;
+//   - no bearer: the entry node's caller had none, so it was an admin by
+//     certificate (a CLI certificate, on-node root, or a peer itself): the
+//     peer's own admin identity stands, as on main. A user who is not an
+//     admin always has a bearer, and it is always relayed.
+//
+// The same reading as a forwarded content call (poolContentCallerOf).
+func (s *Server) forwardedImportCaller(ctx context.Context) (context.Context, error) {
+	if callerAuthMethod(ctx) != authMethodMTLS {
+		return ctx, nil
+	}
+	if fwd := fwdBearerFromCtx(ctx); fwd != "" {
+		return s.awaitForwardedBearer(ctx, fwd)
+	}
+	return ctx, nil
+}
+
+// hasBearer reports whether the caller presented a bearer, which PeerDial
+// relays to a peer (pki.FwdBearerMDKey).
+func hasBearer(ctx context.Context) bool {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return false
+	}
+	a := md.Get("authorization")
+	return len(a) > 0 && a[0] != ""
 }
 
 // parseImportSource dispatches to the right adapter. auto sniffs by content.
@@ -946,8 +992,30 @@ type importDiskWrites struct {
 	// copying is a placement that has to copy n bytes (a pool with neither
 	// link() nor RENAME_NOREPLACE): an error refuses it.
 	copying func(n uint64) error
+	// privateCopy reserves n bytes in the import directory for the private
+	// copy of a disk from outside it (the source's allocated blocks), before
+	// the copy begins: an error refuses it.
+	privateCopy func(n uint64) error
+	// converting reserves n bytes in the pool for the conversion (what
+	// qemu-img measure says it writes), before it begins: an error refuses
+	// it.
+	converting func(n uint64) error
 	// discarded is a file it created that is gone, or no longer its own.
 	discarded func(p string)
+}
+
+func (w *importDiskWrites) reservePrivateCopy(n uint64) error {
+	if w != nil && w.privateCopy != nil {
+		return w.privateCopy(n)
+	}
+	return nil
+}
+
+func (w *importDiskWrites) reserveConversion(n uint64) error {
+	if w != nil && w.converting != nil {
+		return w.converting(n)
+	}
+	return nil
 }
 
 func (w *importDiskWrites) didCreate(p string) {
@@ -1046,7 +1114,7 @@ func convertForeignDisk(ctx context.Context, src, srcFormat, dst, allowedDir str
 	if err := refuseExistingFile(dst); err != nil {
 		return err
 	}
-	private, err := privateImportDisk(ctx, src, allowedDir, maxSrcBytes)
+	private, err := privateImportDisk(ctx, src, allowedDir, maxSrcBytes, w.reservePrivateCopy)
 	if err != nil {
 		return err
 	}
@@ -1066,10 +1134,17 @@ func convertForeignDisk(ctx context.Context, src, srcFormat, dst, allowedDir str
 	}
 	// The conversion writes up to the image's virtual size, which a
 	// compressed image can make far larger than its file.
-	if vs, err := qemuVirtualSize(ctx, src, srcFormat); err != nil {
+	vs, err := qemuVirtualSize(ctx, src, srcFormat)
+	if err != nil {
 		return err
-	} else if vs > uint64(maxSrcBytes) {
+	}
+	if vs > uint64(maxSrcBytes) {
 		return fmt.Errorf("disk's virtual size is %d bytes, more than the %d bytes the import was admitted for", vs, maxSrcBytes)
+	}
+	// Reserve what the conversion will write, judged on the checked private
+	// copy in the format it is converted from.
+	if err := w.reserveConversion(importConvertNeed(ctx, src, srcFormat, vs)); err != nil {
+		return err
 	}
 
 	// A fresh name of its own, never a fixed "<dst>.tmp" another writer to

@@ -193,7 +193,7 @@ func (s *Server) diskChainRule(ctx context.Context, d corrosion.DiskRecord) chai
 }
 
 func (s *Server) newDiskChain(ctx context.Context, d corrosion.DiskRecord) *diskChain {
-	c := &diskChain{s: s, ctx: ctx, d: d, projects: map[string]string{}}
+	c := &diskChain{s: s, ctx: ctx, d: d, projects: map[string]string{}, uploads: map[string]poolRecords{}}
 	c.project = c.projectOf(d.VMName)
 	c.self = resolvedOr(s.hostDiskFile(d.Path))
 	c.images = s.rootsAsFound(filepath.Join(s.dataDir, "images"))
@@ -224,7 +224,8 @@ type diskChain struct {
 	pools    []string
 	shared   []string // this host's shared (nfs) pool directories
 	own      []string
-	projects map[string]string // vm → normalized project ("" unknown)
+	projects map[string]string      // vm → normalized project ("" unknown)
+	uploads  map[string]poolRecords // directory → its pool upload records
 }
 
 func (c *diskChain) judge(layer, resolved, format string) error {
@@ -243,6 +244,16 @@ func (c *diskChain) judge(layer, resolved, format string) error {
 	if c.recordedBacking(layer, resolved) {
 		return nil
 	}
+	if c.userUpload(layer) {
+		// An upload's header is its uploader's to write: what it names is
+		// judged by record, never by the directory it is in — a pool every
+		// project uses holds other projects' files too.
+		if format == "raw" || !c.ownedByProject(resolved) {
+			return fmt.Errorf("%s is a file a user uploaded; it may name only an image or a file project %q owns by record, not %q",
+				layer, c.project, resolved)
+		}
+		return nil
+	}
 	if format == "raw" {
 		if c.legacyPromotedRaw(layer, resolved) {
 			return nil
@@ -252,7 +263,7 @@ func (c *diskChain) judge(layer, resolved, format string) error {
 	if withinAny(resolved, c.pools) {
 		return nil
 	}
-	if withinAny(resolved, c.own) && (c.ownedByProject(resolved) || c.snapshotBase(layer, resolved)) {
+	if withinAny(resolved, c.own) && (c.ownedByProject(resolved) || c.snapshotBase(layer, resolved) || c.legacyPoolBase(layer, resolved)) {
 		return nil
 	}
 	return fmt.Errorf("backing %q is outside the image store and every pool project %q may use, and is not a file that project owns by record",
@@ -271,8 +282,9 @@ func (c *diskChain) recordedBacking(layer, resolved string) bool {
 }
 
 // ownedByProject reports a file the VM's project owns by record: some disk
-// row's own file, of a VM in that project, or that project's recorded
-// replica.
+// row's own file, of a VM in that project, that project's recorded replica,
+// or a file a user of that project uploaded (its pool upload record still
+// describes it).
 func (c *diskChain) ownedByProject(resolved string) bool {
 	if c.project == "" {
 		return false
@@ -285,7 +297,83 @@ func (c *diskChain) ownedByProject(resolved string) bool {
 	if rec, ok := replicaRecordFor(resolved); ok && tenancy.NormalizeProject(rec.Project) == c.project {
 		return true
 	}
+	if id, err := fileIdentity(resolved); err == nil {
+		for _, u := range c.uploadRecords(resolved) {
+			if !u.Peer && u.VM == "" && sameProject(u.Project, c.project) && id.describedBy(u) {
+				return true
+			}
+		}
+	}
 	return false
+}
+
+// uploadRecords is every pool upload record (this host's, and its
+// directory's shared ones) that names the file at resolved, whether or not
+// it still describes it.
+func (c *diskChain) uploadRecords(resolved string) []poolUpload {
+	dir := filepath.Dir(resolved)
+	m, ok := c.uploads[dir]
+	if !ok {
+		m, _ = c.s.loadPoolUploads(c.ctx, dir)
+		c.uploads[dir] = m
+	}
+	var out []poolUpload
+	for p, recs := range m {
+		if filepath.Base(p) == filepath.Base(resolved) && (resolvedOr(p) == resolved || resolvedOr(c.s.hostDiskFile(p)) == resolved) {
+			out = append(out, recs...)
+		}
+	}
+	return out
+}
+
+// userUpload reports a layer a user uploaded: a pool upload record that is
+// a user's — not an older node's (Peer), a replica's or a copy's — names
+// it, current or stale (a file changed since it was uploaded is still the
+// uploader's writing).
+func (c *diskChain) userUpload(layer string) bool {
+	for _, u := range c.uploadRecords(layer) {
+		if !u.Peer && u.VM == "" {
+			return true
+		}
+	}
+	return false
+}
+
+// legacyPoolBase accepts the image an earlier build's pool root disk is an
+// overlay on: its header named the image by the relative name the VM's spec
+// gave (recorded as the disk's backing_image), which qemu finds beside the
+// disk, and nothing recorded the file. So: a layer of d's own (its file, or
+// a snapshot base of it) whose row records backing_image as a relative name,
+// naming exactly that name beside d's file, a file no record gives anyone —
+// no upload record but a peer's, no replica record — and no other project's
+// VM disk (live or kept) uses.
+func (c *diskChain) legacyPoolBase(layer, resolved string) bool {
+	if resolved == c.self || (layer != c.self && !c.ownLayer(layer)) {
+		return false
+	}
+	named := false
+	for _, r := range c.rowsOf(layer) {
+		img := r.BackingImage
+		if img == "" || filepath.IsAbs(img) || !filepath.IsLocal(img) {
+			continue
+		}
+		if resolvedOr(filepath.Join(filepath.Dir(c.self), img)) == resolved {
+			named = true
+			break
+		}
+	}
+	if !named {
+		return false
+	}
+	for _, u := range c.uploadRecords(resolved) {
+		if !u.Peer {
+			return false
+		}
+	}
+	if _, ok := replicaRecordFor(resolved); ok {
+		return false
+	}
+	return !c.s.usedByOtherProject(c.ctx, c.s.recordPath(resolved), replicaKey{VM: c.d.VMName, Disk: c.d.DiskName, Project: c.project})
 }
 
 // snapshotBase reports the base an external disk-only snapshot of d's VM

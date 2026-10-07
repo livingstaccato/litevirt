@@ -239,7 +239,7 @@ func TestPrivateImportDisk_KeepsAnOutsideDiskSparse(t *testing.T) {
 	}
 	f.Close()
 	importDir := t.TempDir()
-	cp, err := privateImportDisk(context.Background(), src, importDir, 1<<40)
+	cp, err := privateImportDisk(context.Background(), src, importDir, 1<<40, nil)
 	if err != nil {
 		t.Fatalf("privateImportDisk: %v", err)
 	}
@@ -269,7 +269,7 @@ func TestPrivateImportDisk_StopsWhenTheImportIsCancelled(t *testing.T) {
 	importDir := t.TempDir()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := privateImportDisk(ctx, src, importDir, 1<<40); err == nil {
+	if _, err := privateImportDisk(ctx, src, importDir, 1<<40, nil); err == nil {
 		t.Fatal("a cancelled import copied the disk anyway")
 	}
 	if left, _ := os.ReadDir(importDir); len(left) != 0 {
@@ -279,20 +279,31 @@ func TestPrivateImportDisk_StopsWhenTheImportIsCancelled(t *testing.T) {
 
 // A disk whose header says it is a format the import does not convert is
 // refused, not converted byte for byte as raw into a disk that will not boot.
+// VHDX and VDI are read as themselves (I-1), and converted as such.
 func TestStaticDiskFormat_RefusesAFormatItRecognisesButDoesNotImport(t *testing.T) {
 	vdi := make([]byte, 4096)
 	binary.LittleEndian.PutUint32(vdi[0x40:], 0xbeda107f)
-	for name, head := range map[string][]byte{
-		"vhdx": append([]byte("vhdxfile"), make([]byte, 4088)...),
-		"qed":  append([]byte("QED\x00"), make([]byte, 4092)...),
-		"vdi":  vdi,
+	for name, c := range map[string]struct {
+		head []byte
+		want string
+	}{
+		"vhdx": {append([]byte("vhdxfile"), make([]byte, 4088)...), "vhdx"},
+		"qed":  {append([]byte("QED\x00"), make([]byte, 4092)...), ""},
+		"vdi":  {vdi, "vdi"},
 	} {
 		p := filepath.Join(t.TempDir(), "disk."+name)
-		if err := os.WriteFile(p, head, 0o600); err != nil {
+		if err := os.WriteFile(p, c.head, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if f, err := staticDiskFormat(p); err == nil {
-			t.Errorf("%s header: read as %q, want refusal", name, f)
+		f, err := staticDiskFormat(p)
+		if c.want == "" {
+			if err == nil {
+				t.Errorf("%s header: read as %q, want refusal", name, f)
+			}
+			continue
+		}
+		if err != nil || f != c.want {
+			t.Errorf("%s header: read as %q (%v), want %q", name, f, err, c.want)
 		}
 	}
 }
@@ -310,7 +321,7 @@ func TestPrivateImportDisk_StopsAtItsLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	importDir := t.TempDir()
-	if _, err := privateImportDisk(context.Background(), src, importDir, 1<<20); err == nil {
+	if _, err := privateImportDisk(context.Background(), src, importDir, 1<<20, nil); err == nil {
 		t.Fatal("a disk past its limit was copied")
 	}
 	if left, _ := os.ReadDir(importDir); len(left) != 0 {

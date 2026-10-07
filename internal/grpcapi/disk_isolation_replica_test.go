@@ -171,12 +171,13 @@ func TestPushReplicaIncrement_BaseMustBeARecordedReplica(t *testing.T) {
 	if err := f.s.PushReplicaIncrement(st); status.Code(err) != codes.FailedPrecondition {
 		t.Errorf("push forked from B's raw file: got %v, want FailedPrecondition", err)
 	}
-	// And a push without a record is refused outright.
+	// And a push without a record (an older build's) forks only from a
+	// top-level replica of the same disk, never B's raw file.
 	st = &fakePushStream{ctx: peerCtxFor(t, f.s, "peer-host2"), msgs: []*pb.PushReplicaIncrementRequest{
-		{PoolName: "dr", Filename: "web-1-20261009-000000.raw", TotalSize: 1 << 16},
+		{PoolName: "dr", Filename: "web-1-20260909-000000.raw", Base: bReplicaRaw, TotalSize: 1 << 16},
 	}}
-	if err := f.s.PushReplicaIncrement(st); status.Code(err) != codes.InvalidArgument {
-		t.Errorf("push without a replica record: got %v, want InvalidArgument", err)
+	if err := f.s.PushReplicaIncrement(st); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("record-less push forked from B's raw file: got %v, want FailedPrecondition", err)
 	}
 	if recs, _ := listReplicaRecords(f.dr, "a", "web"); len(recs) != 0 {
 		t.Errorf("a refused push recorded %+v", recs)

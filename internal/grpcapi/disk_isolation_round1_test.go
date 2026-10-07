@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"testing"
 
-	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protowire"
@@ -204,65 +203,6 @@ func TestRestoreInPlace_SeesDiskReferencesFromOtherHosts(t *testing.T) {
 	}
 	if after, _ := os.ReadFile(own); !bytes.Equal(before, after) {
 		t.Error("the shared base was replaced")
-	}
-}
-
-// I2. A receiver on an older build has no ListReplicas, and its
-// PushReplicaIncrement (and upload) would write the bytes as a bare name in
-// its pool root, where they are an orphan or, worse, match another project's
-// old by-name replica set. The sender proves the receiver records replicas
-// before it sends a single byte.
-type oldReceiver struct {
-	pb.LiteVirtClient
-	sent int
-}
-
-func (o *oldReceiver) ListReplicas(context.Context, *pb.ListReplicasRequest, ...grpc.CallOption) (*pb.ListReplicasResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "unknown method ListReplicas")
-}
-func (o *oldReceiver) PushReplica(context.Context, ...grpc.CallOption) (grpc.ClientStreamingClient[pb.PushReplicaRequest, pb.PushReplicaResponse], error) {
-	return &countingStream[pb.PushReplicaRequest, pb.PushReplicaResponse]{n: &o.sent}, nil
-}
-func (o *oldReceiver) PushReplicaIncrement(context.Context, ...grpc.CallOption) (grpc.ClientStreamingClient[pb.PushReplicaIncrementRequest, pb.PushReplicaIncrementResponse], error) {
-	return &countingStream[pb.PushReplicaIncrementRequest, pb.PushReplicaIncrementResponse]{n: &o.sent}, nil
-}
-func (o *oldReceiver) UploadStoragePoolContent(context.Context, ...grpc.CallOption) (grpc.ClientStreamingClient[pb.UploadStoragePoolContentRequest, pb.UploadStoragePoolContentResponse], error) {
-	return &countingStream[pb.UploadStoragePoolContentRequest, pb.UploadStoragePoolContentResponse]{n: &o.sent}, nil
-}
-
-type countingStream[Req, Resp any] struct {
-	grpc.ClientStream
-	n *int
-}
-
-func (c *countingStream[Req, Resp]) Send(*Req) error { *c.n++; return nil }
-func (c *countingStream[Req, Resp]) CloseAndRecv() (*Resp, error) {
-	var r Resp
-	return &r, nil
-}
-
-func TestReplicationToAnOldReceiverSendsNothing(t *testing.T) {
-	f := newPoolFixture(t)
-	old := &oldReceiver{}
-	f.s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {
-		return old, func() {}, nil
-	}
-	ctx := context.Background()
-
-	rec := newReplicaRecord("a", "web", "1", "web/dr", "20261010-000000", "raw")
-	if err := f.s.applyIncrementRemote(ctx, "old-host", "dr", rec, "", 4,
-		bytes.NewReader([]byte("data")), [][2]int64{{0, 4}}); err == nil {
-		t.Error("an incremental push to a receiver that cannot record replicas succeeded")
-	}
-	vm, _ := corrosion.GetVM(ctx, f.s.db, "web")
-	disks, _ := corrosion.GetVMDisks(ctx, f.s.db, "web")
-	if err := f.s.replicateCrossHost(ctx, corrosion.BackupScheduleRecord{
-		VMName: "web", Repo: "dr", Type: "replication", TargetPool: "dr", KeepReplicas: 1,
-	}, vm, &disks[0], "old-host", "20261010-000000"); err == nil {
-		t.Error("a full replica to a receiver that cannot record replicas succeeded")
-	}
-	if old.sent != 0 {
-		t.Errorf("%d message(s) were sent to a receiver that cannot record replicas; want none", old.sent)
 	}
 }
 

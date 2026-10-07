@@ -433,7 +433,8 @@ is refused (`FailedPrecondition` for a create or clone), never overwritten and
 never cleaned up by the failed create. Choose another VM or disk name.
 
 Reading a disk's backing chain — a full clone, an image built from a VM, a
-cold migration's flatten, a move or copy with qemu-img — follows each layer's
+cold migration's flatten, a move or copy with qemu-img, and every VM start
+(qemu and libvirt follow the chain too) — follows each layer's
 DECLARED backing format, never a guess: a backing declared `raw` (a
 `--no-localize` promoted VM's replica, which is guest content) is read as
 raw and never parsed for a header the guest may have written; a backing with
@@ -462,13 +463,22 @@ resolved through symlinks, before anything opens it, and is accepted only as:
   project may use (global, or owned by that project), or the disk's own pool;
 - in `<data_dir>/disks` (which holds every project's disks) or the disk's own
   directory, only a file the VM's project owns by record — a disk of one of
-  its VMs, or its recorded replica — or the base an external snapshot of the
-  VM left beside its overlay: same directory, the disk's own `<vm>-<disk>`
-  stem, claimed by no other VM's row. This holds after the snapshot is
-  reverted or deleted too, when the disk stays on an overlay named after it.
+  its VMs, its recorded replica, or a file one of its users uploaded — or the
+  base an external snapshot of the VM left beside its overlay: same
+  directory, the disk's own `<vm>-<disk>` stem, claimed by no other VM's row.
+  This holds after the snapshot is reverted or deleted too, when the disk
+  stays on an overlay named after it. A pool root disk an earlier build made
+  names its image by the relative name the VM was created from (recorded as
+  its `backing_image`), which qemu finds beside the disk: that file is
+  accepted too, when no upload or replica record and no other project's VM
+  disk claims it.
 
-Another project's file is refused wherever it sits, unless a record ties it
-to the layer naming it. A move, a restore or a copy that leaves a disk
+A layer a user uploaded into a pool is the uploader's to write, header
+included: what it names is accepted only as an image or a file the VM's
+project owns by record, never for the directory it is in. Another project's
+file is refused wherever it sits, unless a record ties it to the layer naming
+it. At a start, a backing that is missing or refused refuses the start
+(`FailedPrecondition`), naming the disk and the layer. A move, a restore or a copy that leaves a disk
 standalone clears its record's backing fields.
 
 Content operations never reach a file a live VM disk uses: a listing leaves

@@ -26,6 +26,7 @@ func gatedQemuImg(t *testing.T, gate string) {
 	dir := t.TempDir()
 	shim := "#!/bin/sh\n" +
 		"if [ \"$1\" = info ]; then echo '{\"format\":\"raw\",\"virtual-size\":1048576}'; exit 0; fi\n" +
+		"if [ \"$1\" = measure ]; then echo '{\"required\":134217728,\"fully-allocated\":134217728}'; exit 0; fi\n" +
 		"touch '" + gate + "'/arrived.$$\n" +
 		"i=0\n" +
 		"while [ ! -e '" + gate + "'/go ]; do i=$((i+1)); [ $i -gt 400 ] && exit 1; sleep 0.05; done\n" +
@@ -62,11 +63,12 @@ func openGate(t *testing.T, gate string) {
 }
 
 // oneDiskNeed is what a smallImportFrame import reserves while it converts
-// its one disk: a private copy of the mapped file and the converted output
-// with its qcow2 tables.
+// its one disk: a private copy of the mapped 1 MiB file (its allocated
+// blocks) and what the stubs' qemu-img measure says the conversion writes
+// (128 MiB: more than an upload step, so a conversion's reservation, not an
+// upload's, is what decides whether two imports fit together).
 func oneDiskNeed() uint64 {
-	l := uint64(importSourceLimit(1 << 20))
-	return 2*l + l/4096 + 16<<20
+	return 1<<20 + 128<<20 + importConvertSlack
 }
 
 // concurrentImportServer is a server whose import filesystem has room, above

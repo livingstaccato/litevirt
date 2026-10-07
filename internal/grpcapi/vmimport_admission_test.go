@@ -60,6 +60,7 @@ func stubQemuImg(t *testing.T) {
 		"# backing-file-free raw image; 'convert' copies SRC (second-to-last\n" +
 		"# arg) to DST (last arg).\n" +
 		"if [ \"$1\" = info ]; then echo '{\"format\":\"raw\",\"virtual-size\":1048576}'; exit 0; fi\n" +
+		"if [ \"$1\" = measure ]; then echo '{\"required\":134217728,\"fully-allocated\":134217728}'; exit 0; fi\n" +
 		"prev=\"\"; last=\"\"\n" +
 		"for a; do prev=\"$last\"; last=\"$a\"; done\n" +
 		"cp \"$prev\" \"$last\"\n"

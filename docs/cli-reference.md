@@ -590,15 +590,25 @@ lv import dump.vma.zst --from vma --server-path /srv/stage/dump.vma.zst --name a
 
 `--server-path`, `--disk-map` and any disk a Proxmox `.conf` names must be
 under the target host's import staging root (`<data_dir>/imports/staging`).
-A path outside it needs an admin connected to the target host itself: an
-import forwarded with `--target-host` never names a host path, because the
-target sees the entry node, not the caller. Every file a foreign disk makes
-qemu open (backing files, VMDK extents, a data file) must sit beside the disk
-or in the import directory.
+A path outside it needs an admin (`storage.hostpath` at the root). An import
+forwarded with `--target-host` is judged on the target as its caller — by the
+session the entry node relays, or as an admin when the caller signed in with
+an admin certificate — so an admin's forwarded `--server-path` works and an
+operator's is refused. Every file a foreign disk makes qemu open (backing
+files, VMDK extents, a data file) must sit beside the disk or in the import
+directory.
+
+Disk formats: raw, qcow2, VMDK (a single-file sparse or stream-optimized
+disk), VHD, VHDX and VDI, each read from its header when the source does not
+declare it and converted with that format named, never probed. A differencing
+VHDX or VDI depends on a parent and is refused; merge it into its base first.
+QED and VMDK descriptors are refused; convert them to qcow2 first.
 
 Several imports can run on one host at once. Before each write — an upload
-(reserved 64 MiB at a time), unpacking an OVA or VMA, copying a mapped disk,
-converting a disk into the pool — an import reserves the bytes it will write,
+(reserved 64 MiB at a time), unpacking an OVA, a VMA's device data as it
+arrives, copying a mapped disk (its allocated blocks; the copy is sparse),
+converting a disk into the pool (what `qemu-img measure` says the qcow2
+needs, not the disk's capacity) — an import reserves the bytes it will write,
 and is admitted only if that filesystem has room for them on top of what the
 running imports writing to the same filesystem have reserved and its free space
 does not yet show written, while still keeping the free headroom a cold

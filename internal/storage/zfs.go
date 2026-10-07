@@ -31,6 +31,9 @@ type zfsDriver struct {
 
 func (d *zfsDriver) String() string { return "zfs" }
 
+// zfsPipe runs the send | recv pipeline; tests replace it.
+var zfsPipe = pipeCmds
+
 // zfs runs a zfs subcommand through the driver's runner (real exec by default).
 func (d *zfsDriver) zfs(ctx context.Context, args ...string) ([]byte, error) {
 	run := d.run
@@ -129,14 +132,22 @@ func (d *zfsDriver) Replicate(ctx context.Context, opts ReplicateOptions) (err e
 	// Never -F: a forced receive rolls back or replaces whatever dataset has
 	// the name. Without it, zfs refuses an existing destination itself.
 	recvArgs := []string{"recv", "--", opts.DstRef}
-	if _, perr := pipeCmds(ctx, opts.SSHTarget, "zfs", sendArgs, "zfs", recvArgs); perr != nil {
+	if _, perr := zfsPipe(ctx, opts.SSHTarget, "zfs", sendArgs, "zfs", recvArgs); perr != nil {
 		return fmt.Errorf("zfs replicate %s → %s: %w", opts.SrcRef, opts.DstRef, perr)
 	}
 	received = true
-	// Record first: a recorded copy is what a failure below may leave.
+	// Record first: a recorded copy is what a failure below may leave. `zfs
+	// set` takes no "--": OpenZFS up to 2.1 parses its arguments without
+	// getopt and refuses any argument starting with "-" (GrowBlockVolume says
+	// the same). Neither the property ("litevirt:…") nor DstRef (a dataset
+	// under the pool's, never starting with "-") can be taken for an option.
+	// A property that cannot be written is warned about and the copy is
+	// kept: it is the data the operator asked for, and the deferred cleanup
+	// must never destroy it for a missing label.
 	for _, k := range sortedKeys(opts.Record) {
-		if out, serr := d.zfs(ctx, "set", "--", "litevirt:"+k+"="+opts.Record[k], opts.DstRef); serr != nil {
-			return fmt.Errorf("zfs replicate → %s: record %s: %w: %s", opts.DstRef, k, serr, out)
+		if out, serr := d.zfs(ctx, "set", "litevirt:"+k+"="+opts.Record[k], opts.DstRef); serr != nil {
+			slog.Warn("zfs replicate: the received copy is kept, but its owner property was not written",
+				"dataset", opts.DstRef, "property", "litevirt:"+k, "error", serr, "output", strings.TrimSpace(string(out)))
 		}
 	}
 	// Roll the "prev" pointer for the next incremental. A silent failure here

@@ -33,14 +33,12 @@ func plantDeadLeftover(t *testing.T, s *Server, p, body string, scratch bool) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dev, ino, size, mtime, ok := fileState(fi)
+	rec, ok := placementOf(p, fi, "imp-1", scratch, !scratch)
 	if !ok {
 		t.Fatal("no file identity")
 	}
-	if err := s.writeImportPlacement(importPlacement{
-		Path: filepath.Clean(p), Dev: dev, Ino: ino, Size: size, MtimeNs: mtime,
-		ImportID: "imp-1", Instance: deadImportInstance, Scratch: scratch,
-	}); err != nil {
+	rec.Instance = deadImportInstance
+	if err := s.writeImportPlacement(rec); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -230,7 +228,7 @@ func TestImportWrites_ADiskIsRecordedBeforeAndAfterItsPlacement(t *testing.T) {
 				t.Fatal(err)
 			}
 			rec, ok := s.importPlacementOf(dst)
-			if !ok || !rec.matches(fi) || rec.ImportID != "imp-9" || rec.Scratch {
+			if !ok || !rec.matches(fi) || rec.ImportID != "imp-9" || rec.Scratch || rec.CtimeNs == 0 {
 				t.Fatalf("the placed disk's record: %+v (%v)", rec, ok)
 			}
 			forget()
@@ -255,7 +253,14 @@ func TestImportVM_AnImportThatEndsLeavesNoRecords(t *testing.T) {
 	if err := importAs(s, t, "web"); err != nil {
 		t.Fatal(err)
 	}
-	left, _ := filepath.Glob(filepath.Join(s.dataDir, importPlacementDirName, "*"))
+	// The prune runs off the import's path.
+	var left []string
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+		left, _ = filepath.Glob(filepath.Join(s.dataDir, importPlacementDirName, "*"))
+		if len(left) == 1 {
+			break
+		}
+	}
 	if _, ok := s.importPlacementOf(kept); !ok || len(left) != 1 {
 		t.Fatalf("records left: %v, want only %s's", left, kept)
 	}
@@ -276,10 +281,7 @@ func TestImportWrites_ARunningImportsRecordOfADiskNotPlacedYetStays(t *testing.T
 	if err := s.recordImportPlacement(dst, fi, "imp-running", false); err != nil {
 		t.Fatal(err)
 	}
-	space := s.reserveImportSpace(t.TempDir())
-	defer space.release()
-	_, forget := s.importWritesFor("imp-other", space)
-	defer forget()
+	s.pruneImportPlacementsIn(filepath.Dir(dst), time.Now().Add(time.Minute))
 	if _, ok := s.importPlacementOf(dst); !ok {
 		t.Fatal("a running import's record of a disk it is about to place was dropped")
 	}
@@ -402,7 +404,7 @@ func TestImportVM_ARecordedDiskBesideALeftoverDoesNotHoldIt(t *testing.T) {
 // But a fresh sibling nothing records — another host's conversion, a create
 // still writing — holds it, a running VM beside it or not.
 func TestImportVM_AnUnrecordedFreshSiblingStillHoldsALeftover(t *testing.T) {
-	for _, sib := range []string{"web-3-data.qcow2", ".web-3-data.qcow2.convert-abc", "web-9-root.qcow2.tmp"} {
+	for _, sib := range []string{"web-3-data.qcow2", ".web-3-data.qcow2.convert-abc", ".web-3-data.qcow2.place-abc", "web-9-root.qcow2.tmp"} {
 		t.Run(sib, func(t *testing.T) {
 			s, dst := orphanFixture(t, "web-3")
 			dir := filepath.Dir(dst)
@@ -488,8 +490,8 @@ func TestPlaceNoReplace_ACopyNeverRemovesAFileThatTookTheSourcesName(t *testing.
 	}
 }
 
-// A failed copy removes its destination only while it is still the file the
-// copy created.
+// A failed copy removes its temp only while it is still the file the copy
+// created, and never takes the disk's name.
 func TestPlaceNoReplace_AFailedCopyNeverRemovesAFileThatTookItsName(t *testing.T) {
 	noLinkNoRenameNoReplace(t)
 	dir := t.TempDir()
@@ -499,12 +501,14 @@ func TestPlaceNoReplace_AFailedCopyNeverRemovesAFileThatTookItsName(t *testing.T
 	}
 	saved := placeCopy
 	t.Cleanup(func() { placeCopy = saved })
-	placeCopy = func(context.Context, *os.File, *os.File, int64) error {
+	var temp string
+	placeCopy = func(_ context.Context, out *os.File, _ *os.File, _ int64) error {
+		temp = out.Name()
 		theirs := filepath.Join(dir, "theirs")
 		if werr := os.WriteFile(theirs, []byte("theirs"), 0o600); werr != nil {
 			t.Fatal(werr)
 		}
-		if rerr := os.Rename(theirs, dst); rerr != nil {
+		if rerr := os.Rename(theirs, temp); rerr != nil {
 			t.Fatal(rerr)
 		}
 		return errors.New("disk full")
@@ -512,8 +516,11 @@ func TestPlaceNoReplace_AFailedCopyNeverRemovesAFileThatTookItsName(t *testing.T
 	if err := placeNoReplace(context.Background(), src, dst, nil); err == nil {
 		t.Fatal("a failed copy reported success")
 	}
-	if b, _ := os.ReadFile(dst); string(b) != "theirs" {
-		t.Fatalf("the file that took the name now holds %q", b)
+	if b, _ := os.ReadFile(temp); string(b) != "theirs" {
+		t.Fatalf("the file that took the copy's name now holds %q", b)
+	}
+	if _, err := os.Lstat(dst); !os.IsNotExist(err) {
+		t.Fatalf("a failed copy left the disk's name taken: %v", err)
 	}
 	if b, _ := os.ReadFile(src); string(b) != "ours" {
 		t.Fatalf("the source now holds %q", b)
@@ -540,11 +547,11 @@ func TestPlaceNoReplace_ACopyStopsWithItsContextAndIsReservedFirst(t *testing.T)
 			} else {
 				copying = func(n uint64) error { asked = n; return errors.New("no room") }
 			}
-			if err := placeNoReplace(ctx, src, dst, copying); err == nil {
+			if err := placeNoReplace(ctx, src, dst, &importDiskWrites{copying: copying}); err == nil {
 				t.Fatal("placed")
 			}
-			if _, err := os.Lstat(dst); !os.IsNotExist(err) {
-				t.Fatalf("the destination was left: %v", err)
+			if left, _ := filepath.Glob(filepath.Join(dir, "*a.qcow2*")); len(left) != 0 {
+				t.Fatalf("the destination or its copy was left: %v", left)
 			}
 			if b, _ := os.ReadFile(src); string(b) != "ours, 13 byte" {
 				t.Fatalf("the source holds %q", b)

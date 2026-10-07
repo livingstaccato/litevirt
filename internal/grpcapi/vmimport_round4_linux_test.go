@@ -593,10 +593,10 @@ func TestImportVM_ACopiedPlacementIsReserved(t *testing.T) {
 				scratch, _ := filepath.Glob(filepath.Join(poolDir, ".imp-tight-root.qcow2.convert-*"))
 				for _, p := range scratch {
 					if fi, err := os.Stat(p); err == nil && fi.Size() > 0 {
-						return coldDiskHeadroom(total), total, nil
+						return 0, total, nil
 					}
 				}
-				return coldDiskHeadroom(total) + 10*oneDiskNeed(), total, nil
+				return 10 * oneDiskNeed(), total, nil
 			}
 			err = importAs(s, t, "imp-tight")
 			if !fallback {

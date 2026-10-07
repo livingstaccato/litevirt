@@ -18,15 +18,15 @@ import (
 )
 
 // The conversion writes what qemu-img measures into the pool, after the
-// quota admitted it; the filesystem has to hold it with the headroom a cold
-// migration also keeps, or the import is refused before writing.
+// quota admitted it; the filesystem has to hold it, or the import is refused
+// before writing.
 func TestImportVM_RefusedWhenThePoolFilesystemCannotHoldTheDisk(t *testing.T) {
 	s := testServer(t)
 	s.dataDir = t.TempDir()
 	admissionHost(t, s)
 	s.virt = libvirtfake.New()
 	quotaProject(t, s, "acme", corrosion.ProjectQuotaRecord{DiskGiBLimit: 4, NICLimit: 2})
-	s.diskSpaceOverride = func(string) (uint64, uint64, error) { return 2 << 30, 10 << 30, nil }
+	s.diskSpaceOverride = func(string) (uint64, uint64, error) { return 512 << 20, 10 << 30, nil }
 	// A 1 GiB disk full of data: the conversion writes all of it.
 	thinQemuImg(t, 1<<30, 1<<30+1<<20)
 	raw := t.TempDir() + "/disk0.raw"
@@ -39,7 +39,7 @@ func TestImportVM_RefusedWhenThePoolFilesystemCannotHoldTheDisk(t *testing.T) {
 		DiskMap: map[string]string{"scsi0": raw},
 	}}})
 	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "free") {
-		t.Fatalf("import of a disk measured at 1 GiB into a filesystem with 1 GiB above its headroom: %v, want a free-space refusal", err)
+		t.Fatalf("import of a disk measured at 1 GiB into a filesystem with 512 MiB free: %v, want a free-space refusal", err)
 	}
 	if rec, _ := corrosion.GetVM(context.Background(), s.db, "imp-short"); rec != nil {
 		t.Fatal("a refused import persisted a row")
@@ -112,7 +112,7 @@ func TestImportVM_AClientThatStopsReadingDoesNotHoldOtherImports(t *testing.T) {
 			// Room for one import's disk at a time: what the first reserved
 			// must be released before it waits on its client.
 			s.diskSpaceOverride = func(string) (uint64, uint64, error) {
-				return coldDiskHeadroom(100<<30) + 3*oneDiskNeed()/2, 100 << 30, nil
+				return 3 * oneDiskNeed() / 2, 100 << 30, nil
 			}
 
 			stuck := &stuckStream{
@@ -197,4 +197,35 @@ func heldImports(s *Server) int {
 	s.importSpace.mu.Lock()
 	defer s.importSpace.mu.Unlock()
 	return len(s.importSpace.held)
+}
+
+// I-A (final-rereview-integrate-3.md): main (3e4ba50b) checked no free space
+// for an import — vmimport.go:201-240 reserved project quota and host cpu/mem
+// only — so an import that fits was imported. One measuring 10 GiB into a pool
+// on a 2 TiB filesystem with 50 GiB free fits, and is admitted: the
+// reservation is what the import writes, with no margin a cold migration
+// keeps (64 GiB there) on top.
+func TestImportVM_AnImportThatFitsANearlyFullFilesystemIsAdmitted(t *testing.T) {
+	s := testServer(t)
+	s.dataDir = t.TempDir()
+	admissionHost(t, s)
+	s.virt = libvirtfake.New()
+	quotaProject(t, s, "acme", corrosion.ProjectQuotaRecord{DiskGiBLimit: 64, NICLimit: 2})
+	s.diskSpaceOverride = func(string) (uint64, uint64, error) { return 50 << 30, 2 << 40, nil }
+	thinQemuImg(t, 10<<30, 10<<30)
+	raw := t.TempDir() + "/disk0.raw"
+	if err := writeFileHelper(raw, make([]byte, 1<<20)); err != nil {
+		t.Fatal(err)
+	}
+	err := s.ImportVM(&fakeImportStream{ctx: adminCtx(), frames: []*pb.ImportVMRequest{{
+		Name: "imp-fits", SourceFormat: "proxmox", Project: "acme",
+		Chunk:   []byte("name: imp-fits\ncores: 1\nmemory: 512\nscsi0: local-lvm:imp-fits-disk-0,size=10G\n"),
+		DiskMap: map[string]string{"scsi0": raw},
+	}}})
+	if err != nil {
+		t.Fatalf("import of a disk measured at 10 GiB into a filesystem with 50 GiB free (main imported it): %v", err)
+	}
+	if rec, _ := corrosion.GetVM(context.Background(), s.db, "imp-fits"); rec == nil {
+		t.Fatal("the admitted import persisted no row")
+	}
 }

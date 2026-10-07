@@ -12,7 +12,7 @@ import (
 
 const spaceTestTotal = 100 << 30
 
-// spaceTestServer's filesystem has room bytes free above its headroom, less
+// spaceTestServer's filesystem has room bytes free, less
 // whatever the files under dirs occupy, the way writing into a real
 // filesystem uses up its free space.
 func spaceTestServer(t *testing.T, room uint64, dirs ...string) *Server {
@@ -29,7 +29,7 @@ func spaceTestServer(t *testing.T, room uint64, dirs ...string) *Server {
 				return nil
 			})
 		}
-		return coldDiskHeadroom(spaceTestTotal) + room - used, spaceTestTotal, nil
+		return room - used, spaceTestTotal, nil
 	}
 	return s
 }
@@ -61,18 +61,18 @@ func refusedForReservation(t *testing.T, err error) {
 	}
 }
 
-// A lone import may use the free space down to the headroom a cold migration
-// also keeps, and no further.
-func TestImportSpace_LeavesTheHeadroomFree(t *testing.T) {
+// A lone import may use the free space, and no more: no margin is kept above
+// what it writes (main checked none at all; I-A).
+func TestImportSpace_UsesTheFreeSpaceAndNoMore(t *testing.T) {
 	dir := t.TempDir()
 	s := spaceTestServer(t, 64<<20)
 	r := s.reserveImportSpace(dir)
 	defer r.release()
 	if err := r.reserve(dir, 64<<20+1, "x"); err == nil {
-		t.Fatal("a reservation reached into the headroom")
+		t.Fatal("a reservation of more than the free space was admitted")
 	}
 	if err := r.reserve(dir, 64<<20, "x"); err != nil {
-		t.Fatalf("a reservation of exactly the room above the headroom: %v", err)
+		t.Fatalf("a reservation of exactly the free space: %v", err)
 	}
 }
 

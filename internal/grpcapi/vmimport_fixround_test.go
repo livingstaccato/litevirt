@@ -18,8 +18,7 @@ import (
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
-// uploadImportServer's import filesystem has room bytes free above its
-// headroom, less what the files under its imports directory occupy.
+// uploadImportServer's import filesystem has room bytes free, less what the files under its imports directory occupy.
 func uploadImportServer(t *testing.T, room uint64) *Server {
 	t.Helper()
 	s := testServer(t)
@@ -36,7 +35,7 @@ func uploadImportServer(t *testing.T, room uint64) *Server {
 			}
 			return nil
 		})
-		return coldDiskHeadroom(spaceTestTotal) + room - min(room, used), spaceTestTotal, nil
+		return room - min(room, used), spaceTestTotal, nil
 	}
 	return s
 }
@@ -90,7 +89,7 @@ func TestImportSpace_AllocatedBytesTheFreeSpaceDoesNotShowYetStayReserved(t *tes
 	a, b := t.TempDir(), t.TempDir()
 	s := &Server{hostName: "test-host"}
 	s.diskSpaceOverride = func(string) (uint64, uint64, error) {
-		return coldDiskHeadroom(spaceTestTotal) + 10<<20, spaceTestTotal, nil // never drops
+		return 10 << 20, spaceTestTotal, nil // never drops
 	}
 	ra := s.reserveImportSpace(a)
 	defer ra.release()
@@ -111,7 +110,7 @@ func TestImportSpace_ReservationsCountOnlyOnTheirOwnFilesystem(t *testing.T) {
 	a, a2, b, unknown := t.TempDir(), t.TempDir(), t.TempDir(), t.TempDir()
 	s := &Server{hostName: "test-host"}
 	s.diskSpaceOverride = func(string) (uint64, uint64, error) {
-		return coldDiskHeadroom(spaceTestTotal) + 10<<20, spaceTestTotal, nil
+		return 10 << 20, spaceTestTotal, nil
 	}
 	s.fsKeyOverride = func(dir string) string {
 		switch dir {
@@ -330,13 +329,13 @@ func TestImportVM_ADiskThatAppearsDuringTheConversionIsNotReplaced(t *testing.T)
 	}
 }
 
-// sharedSpaceServer's one filesystem ("fs") has room bytes above its headroom
+// sharedSpaceServer's one filesystem ("fs") has room bytes free
 // less *used, which a test moves by hand: what the free space shows, not what
 // blocks the files hold.
 func sharedSpaceServer(room uint64, used *int64) *Server {
 	s := &Server{hostName: "test-host"}
 	s.diskSpaceOverride = func(string) (uint64, uint64, error) {
-		return uint64(int64(coldDiskHeadroom(spaceTestTotal)+room) - *used), spaceTestTotal, nil
+		return uint64(int64(room) - *used), spaceTestTotal, nil
 	}
 	s.fsKeyOverride = func(string) string { return "fs" }
 	return s

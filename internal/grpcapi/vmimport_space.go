@@ -471,9 +471,12 @@ type fsKey string
 func sameSpace(a, b fsKey) bool { return a == "" || b == "" || a == b }
 
 // reserve claims n more bytes for the import to write into dir. It refuses
-// when dir's filesystem, less the headroom a cold migration also keeps,
-// cannot hold what the imports on this host have reserved there and the free
-// space does not yet show written, this one included, plus n.
+// when dir's filesystem cannot hold what the imports on this host have
+// reserved there and the free space does not yet show written, this one
+// included, plus n. It keeps no margin beyond that: main (3e4ba50b) checked
+// no free space for an import at all (vmimport.go:201-240 reserved project
+// quota and host cpu/mem only), so an import that fits — however full the
+// filesystem is otherwise — was imported, and is admitted here.
 func (r *importReservation) reserve(dir string, n uint64, what string) error {
 	r.refreshMu.Lock()
 	key := r.keyLocked(dir)
@@ -484,7 +487,7 @@ func (r *importReservation) reserve(dir string, n uint64, what string) error {
 	if r.released {
 		return status.Errorf(codes.Internal, "%s: the import's space reservation was already released", what)
 	}
-	avail, fsTotal, err := r.s.diskSpaceWithin(dir, importStatfsTimeout)
+	avail, _, err := r.s.diskSpaceWithin(dir, importStatfsTimeout)
 	if err != nil {
 		return status.Errorf(codes.FailedPrecondition, "%s: cannot read the free space on %s: %v", what, r.s.hostName, err)
 	}
@@ -496,12 +499,10 @@ func (r *importReservation) reserve(dir string, n uint64, what string) error {
 			outstanding = satAdd(outstanding, l.outstandingLocked(k))
 		}
 	}
-	headroom := coldDiskHeadroom(fsTotal)
-	if avail < satAdd(satAdd(headroom, outstanding), n) {
+	if avail < satAdd(outstanding, n) {
 		return status.Errorf(codes.FailedPrecondition,
-			"%s needs %d MiB more on %s, which has %d MiB free there, of which running imports writing to the same filesystem have reserved %d MiB not yet written; "+
-				"an import leaves at least %d MiB free there",
-			what, n>>20, r.s.hostName, avail>>20, outstanding>>20, headroom>>20)
+			"%s needs %d MiB more on %s, which has %d MiB free there, of which running imports writing to the same filesystem have reserved %d MiB not yet written",
+			what, n>>20, r.s.hostName, avail>>20, outstanding>>20)
 	}
 	sh := r.shares[key]
 	if sh == nil {

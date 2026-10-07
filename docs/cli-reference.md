@@ -611,8 +611,9 @@ converting a disk into the pool (what `qemu-img measure` says the qcow2
 needs, not the disk's capacity) — an import reserves the bytes it will write,
 and is admitted only if that filesystem has room for them on top of what the
 running imports writing to the same filesystem have reserved and its free space
-does not yet show written, while still keeping the free headroom a cold
-migration keeps (5% of the filesystem, between 1 and 64 GiB). Imports into
+does not yet show written. No margin is kept beyond that (unlike a cold
+migration's headroom): an import that fits is imported, however full the
+filesystem is otherwise, as before these checks existed. Imports into
 unrelated storage do not count against each other; btrfs subvolumes, datasets
 of one ZFS pool and exports of one NFS server (by address) count as one
 filesystem, and one litevirt cannot identify counts as shared with every other.

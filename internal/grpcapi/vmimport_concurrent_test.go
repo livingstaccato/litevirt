@@ -71,8 +71,8 @@ func oneDiskNeed() uint64 {
 	return 1<<20 + 128<<20 + importConvertSlack
 }
 
-// concurrentImportServer is a server whose import filesystem has room, above
-// its headroom, for room bytes.
+// concurrentImportServer is a server whose import filesystem has room for
+// room bytes.
 func concurrentImportServer(t *testing.T, room uint64) *Server {
 	t.Helper()
 	s := testServer(t)
@@ -80,7 +80,7 @@ func concurrentImportServer(t *testing.T, room uint64) *Server {
 	admissionHost(t, s)
 	s.virt = libvirtfake.New()
 	const total = 100 << 30
-	s.diskSpaceOverride = func(string) (uint64, uint64, error) { return coldDiskHeadroom(total) + room, total, nil }
+	s.diskSpaceOverride = func(string) (uint64, uint64, error) { return room, total, nil }
 	return s
 }
 
@@ -186,7 +186,7 @@ func TestImportVM_AnArchiveReservesWhatItUnpacks(t *testing.T) {
 	if err := os.WriteFile(staged, ova.Bytes(), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	// 3 MiB left above the headroom; another import holds 2 of them.
+	// 3 MiB free; another import holds 2 of them.
 	other := s.reserveImportSpace(t.TempDir())
 	defer other.release()
 	if err := other.reserve(s.dataDir, 2<<20, "another import"); err != nil {

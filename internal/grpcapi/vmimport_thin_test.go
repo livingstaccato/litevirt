@@ -58,9 +58,9 @@ func TestImportVM_AThinDiskReservesWhatItWritesNotItsCapacity(t *testing.T) {
 			s.dataDir = t.TempDir()
 			admissionHost(t, s)
 			s.virt = libvirtfake.New()
-			// 500 GiB free above the headroom an import leaves.
+			// 500 GiB free.
 			s.diskSpaceOverride = func(string) (uint64, uint64, error) {
-				return coldDiskHeadroom(total) + 500*gib, total, nil
+				return 500 * gib, total, nil
 			}
 			thinQemuImg(t, tib, c.required)
 			raw := t.TempDir() + "/disk0.raw"

@@ -3,13 +3,16 @@ package grpcapi
 import (
 	"context"
 	"path/filepath"
+	"slices"
 
 	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/placement"
 	"github.com/litevirt/litevirt/internal/tenancy"
 )
 
@@ -32,6 +35,14 @@ import (
 //     rather than refused because the rebuilding caller is not an Admin. The
 //     VM already reads that file; re-creating it gives nothing new. A pool
 //     ISO is judged again, held to the kind recorded at its create.
+
+//
+// The grant lives in this process only: a create that placement sent to
+// another host would arrive there without it, and an owner judging the
+// relayed caller (auth.forwarded_identity) would refuse the ISO after the
+// teardown. So a VM re-created with an installer ISO is re-created on this
+// host — the one whose preflight judged the ISO, and whose file a host path
+// names (recreatePinnedHere) — or refused before anything is torn down.
 
 // recreateISOGrantKey carries a recreateISOGrant in a context. Only this
 // process sets it, so a caller cannot.
@@ -123,4 +134,50 @@ func (s *Server) recreatePreflight(ctx context.Context, in *pb.VMSpec, host stri
 		}
 	}
 	return nil
+}
+
+// recreatePinnedHere reports whether the create that re-creates cur (nil: a
+// new VM, nothing torn down) from in must run on this host, and refuses —
+// before any teardown — one that placement would not admit here.
+//
+// It must when in names an installer ISO: the preflight judged that ISO here
+// (a host path names this host's file, and this process holds the grant that
+// carries its classification into the create), and a judgement made here
+// says nothing about another host. A pool (library) ISO is pinned the same
+// way, rather than placed freely and judged against rows of a host the
+// preflight did not see: one judgement, by the host that creates the VM, is
+// the one that cannot be refused after the teardown.
+//
+// Placement is checked as the create's own pinned check (ValidatePinned),
+// with what cur holds here released (it is torn down first). The devices,
+// the per-node limit and anti-affinity with itself are left out while cur is
+// on this host: until the teardown they count cur itself, which the create
+// replaces. A spec pinned to another host is refused: it cannot be re-created
+// where its ISO was judged.
+func (s *Server) recreatePinnedHere(ctx context.Context, in *pb.VMSpec, cur *corrosion.VMRecord) (bool, error) {
+	if in.GetIso() == "" {
+		return false, nil
+	}
+	spec, err := normalizeCreateVMSpec(in, s.defaultCPUModeCfg)
+	if err != nil {
+		return false, err
+	}
+	compose.NormalizeVMSpecResources(spec)
+	if pin := spec.GetPlacement().GetHost(); pin != "" && pin != s.hostName {
+		return true, status.Errorf(codes.FailedPrecondition,
+			"its spec pins it to %s, but its installer ISO %q was judged here, on %s; migrate it to %s first",
+			pin, spec.GetIso(), s.hostName, pin)
+	}
+	req := s.createVMPlacementRequest(ctx, spec, false)
+	if cur != nil && cur.HostName == s.hostName {
+		req.Replaces = placement.VMAllocation(*cur)
+		req.Devices, req.MaxPerNode = nil, 0
+		req.AntiAffinity = slices.DeleteFunc(slices.Clone(req.AntiAffinity), func(n string) bool { return n == spec.Name || n == cur.Name })
+	}
+	if err := placement.ValidatePinned(ctx, s.db, req, s.hostName); err != nil {
+		return true, status.Errorf(codes.FailedPrecondition,
+			"it must be re-created on %s, where its installer ISO %q was judged, and placement does not admit it there: %v",
+			s.hostName, spec.GetIso(), err)
+	}
+	return true, nil
 }

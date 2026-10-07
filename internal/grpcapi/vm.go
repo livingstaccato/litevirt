@@ -3192,6 +3192,14 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 		st := status.Convert(err)
 		return nil, status.Errorf(st.Code(), "cannot rebuild %q: %s; nothing was changed", req.Name, st.Message())
 	}
+	// A VM with an installer ISO is re-created here, where that ISO was
+	// judged and the grant holds — never sent to a host that has neither
+	// (recreatePinnedHere) — or refused now, with the VM intact.
+	pinned, err := s.recreatePinnedHere(rctx, spec, vm)
+	if err != nil {
+		st := status.Convert(err)
+		return nil, status.Errorf(st.Code(), "cannot rebuild %q: %s; nothing was changed", req.Name, st.Message())
+	}
 
 	// Stop and undefine the current domain.
 	if vm.State == "running" {
@@ -3232,6 +3240,9 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	// Recreate the VM using the stored spec.
 	slog.Info("rebuilding VM", "name", req.Name)
 	s.recordVMEvent(ctx, req.Name, "vm.rebuilt", "ok", "image="+spec.Image)
+	if pinned {
+		return s.createVM(rctx, &pb.CreateVMRequest{Spec: spec}, &resolvedCreateVMDecision{resolvedHost: s.hostName})
+	}
 	return s.CreateVM(rctx, &pb.CreateVMRequest{Spec: spec})
 }
 

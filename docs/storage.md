@@ -111,13 +111,26 @@ NFS pools are always mounted `nosuid,nodev,noexec,nosharecache,nosymfollow`,
 whatever `options=` says. `nosharecache` gives each pool's mount its own
 superblock, so two pools on one server each report their own export as the
 mount source. `nosymfollow` needs Linux 5.10+ and a mount.nfs that passes
-it on; where it is missing the mount is refused, with an error saying so, rather
-than made weaker. An export that is already mounted without these flags — mounted
-by hand, or by an earlier build — is never remounted: the pool is refused
-(nothing lists, reads or writes it) and the daemon logs an ERROR at start and
-on each refusal, until the export is unmounted and litevirt mounts it again.
-The same holds when the pool's mount point holds anything but the pool's own
-export (compared in canonical form) — another export left there by a deleted
+it on; on a 5.10+ kernel a mount.nfs that refuses it fails the mount, with an
+error saying so, rather than making it weaker. On a kernel before 5.10 (RHEL 8,
+Ubuntu 20.04, Debian 10) there is no `nosymfollow`: the pool is mounted with
+the other options and used, the daemon logs a WARN once per mount point, and
+every open litevirt itself makes of the pool's content (records, uploads,
+replicas, temps) follows no symlink on the export — `openat2`
+`RESOLVE_NO_SYMLINKS`, or a component-by-component `O_NOFOLLOW` walk on a
+kernel without it — and a pool path is not handed to `qemu-img` through one.
+An export that is already mounted without these flags — mounted by an earlier
+build (`vers=4,hard,intr`), or by hand — is hardened in place, at daemon start
+and at the pool's first use: `mount -o remount,bind,<its flags plus
+nosuid,nodev,noexec,nosymfollow> -- <mount point>` changes only that mount's
+flags, so nothing is unmounted and VMs running from the pool are untouched
+(the remount keeps the mount's own flags, so a read-only mount stays
+read-only). Only when that remount fails, or leaves a flag missing, is the
+pool refused (nothing lists, reads or writes it), with an ERROR at start and
+on each refusal, until it is remounted with them or unmounted and mounted again
+by litevirt. A pool whose mount point holds anything but the pool's own
+export (compared in canonical form) is refused the same way and never
+remounted — another export left there by a deleted
 pool (deleting a pool with `--target` never unmounts it), the same server's
 parent export, or a mount made by hand. Disk files the daemon creates in a pool
 are created exclusively and never through a symlink. Pool names may not start

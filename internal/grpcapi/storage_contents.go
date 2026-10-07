@@ -16,6 +16,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/safename"
+	"github.com/litevirt/litevirt/internal/storage"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -495,7 +496,7 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 		return status.Errorf(codes.Internal, "mkdir: %v", err)
 	}
 	hasher := sha256.New()
-	tmp, err := os.CreateTemp(dir, ".upload-*.tmp")
+	tmp, err := storage.CreatePoolTemp(dir, ".upload-*.tmp")
 	if err != nil {
 		return status.Errorf(codes.Internal, "create temp: %v", err)
 	}
@@ -631,7 +632,7 @@ func receiveFileNoClobber(dir string, dirMode os.FileMode, filename string, next
 	if err := os.MkdirAll(dir, dirMode); err != nil {
 		return "", 0, status.Errorf(codes.Internal, "mkdir: %v", err)
 	}
-	tmp, err := os.CreateTemp(dir, ".upload-*.tmp")
+	tmp, err := storage.CreatePoolTemp(dir, ".upload-*.tmp")
 	if err != nil {
 		return "", 0, status.Errorf(codes.Internal, "create temp: %v", err)
 	}

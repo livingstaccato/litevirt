@@ -214,6 +214,7 @@ func TestNFSBackingOf(t *testing.T) {
 // refused, the refusal saying which are missing (and only those) — and not
 // naming the export.
 func TestCheckNFSBackingHardenedNamesWhatIsMissing(t *testing.T) {
+	kernelNosymfollow(t, true)
 	dir := t.TempDir()
 	mountInfoWith(t, dir, "rw,nosuid,relatime", "nfs", "nas:/secret-tenant")
 	err := CheckNFSBackingHardened(filepath.Join(dir, "pool"))

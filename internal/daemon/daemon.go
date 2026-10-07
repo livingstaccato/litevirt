@@ -2110,10 +2110,12 @@ func nfsExportOfDirPool(dataDir string, p StoragePoolConfig) string {
 	return b.Export.String()
 }
 
-// hardenNFSPoolMounts reports, at ERROR, every NFS pool of this host whose
-// mount point holds another export, or holds its export mounted without
-// nosuid,nodev,noexec,nosymfollow (by hand, or by an earlier build). Nothing is remounted: the server's pool check refuses such a
-// pool outright until it is unmounted and litevirt mounts it again.
+// hardenNFSPoolMounts hardens in place, at start, every NFS pool of this host
+// whose own export is mounted without nosuid,nodev,noexec,nosymfollow (by
+// hand, or by an earlier build): a bind remount changes only that mount's
+// flags, so the VMs running from it are untouched. It reports, at ERROR, a
+// pool whose mount point holds another export, or whose remount failed: the
+// server's pool check refuses such a pool until that is fixed.
 func (d *Daemon) hardenNFSPoolMounts(ctx context.Context) {
 	var cfgs []storage.Config
 	for _, p := range d.cfg.StoragePools {
@@ -2129,7 +2131,7 @@ func (d *Daemon) hardenNFSPoolMounts(ctx context.Context) {
 			continue
 		}
 		if err := storage.CheckNFSMountHardened(d.cfg.DataDir, c); err != nil {
-			slog.Error("NFS pool's mount point holds another export, or its export mounted without nosuid,nodev,noexec,nosymfollow; the pool is refused until litevirt mounts it again",
+			slog.Error("NFS pool's mount point holds another export, or its export is mounted without nosuid,nodev,noexec,nosymfollow and could not be hardened in place; the pool is refused",
 				"source", c.Source, "target", c.Target, "error", err)
 		}
 	}

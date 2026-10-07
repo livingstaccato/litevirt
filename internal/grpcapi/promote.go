@@ -26,6 +26,7 @@ import (
 	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/randid"
 	"github.com/litevirt/litevirt/internal/scheduler"
+	"github.com/litevirt/litevirt/internal/storage"
 )
 
 // PromoteReplica brings an inert replica online for disaster recovery: it
@@ -1031,7 +1032,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			// A fresh, unpredictable temp (O_EXCL): qemu-img convert follows a
 			// symlink at its output, so the name must not be one anything
 			// else could have planted.
-			tf, terr := os.CreateTemp(poolDir, ".promote-*.tmp")
+			tf, terr := storage.CreatePoolTemp(poolDir, ".promote-*.tmp")
 			if terr != nil {
 				return status.Errorf(codes.Internal, "create live-disk temp: %v", terr)
 			}

@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/qcow2"
@@ -110,32 +111,58 @@ func (d *nfsDriver) Prepare(ctx context.Context) error {
 	}
 	alreadyMounted := err == nil
 	if alreadyMounted {
-		// Mounted before this build, or by hand: it may lack the hardening.
-		return d.ensureHardened()
+		// Mounted before this build, or by hand: it may lack the hardening,
+		// which is then applied to that mount in place.
+		return d.ensureHardened(commandCtx, run)
 	}
 	mountOpts := "vers=4,hard,intr"
 	if extra, ok := d.opts["options"]; ok {
 		mountOpts = extra
 	}
-	// nosymfollow is required, not best-effort: without it a symlink the
-	// server plants is followed as root in the host's namespace by anything
-	// that opens a pool file by name (qemu-img, qemu). A kernel or mount.nfs
-	// that cannot do it gets no NFS pool.
-	mountOpts = hardenNFSOptions(mountOpts) + ",nosymfollow"
+	// nosymfollow wherever the kernel has it (Linux 5.10+), and then it is
+	// required: without it a symlink the server plants is followed as root in
+	// the host's namespace by anything that opens a pool file by name. A
+	// kernel without it mounts the pool with the other options, and the
+	// daemon's own opens of pool content follow no symlink on the export
+	// (OpenPoolFile).
+	mountOpts = hardenNFSOptions(mountOpts)
+	if kernelHasNosymfollow() {
+		mountOpts += ",nosymfollow"
+	} else {
+		warnNoNosymfollow(d.mountDir)
+	}
 	out, err := run(commandCtx, "mount", "-t", "nfs", "-o", mountOpts, "--", d.source, d.mountDir)
 	if err != nil {
 		if commandCtx.Err() != nil {
 			return nfsCommandError("mount nfs", d.source, commandCtx.Err(), out)
 		}
-		return fmt.Errorf("%w (an NFS pool is mounted nosuid,nodev,noexec,nosymfollow; nosymfollow needs Linux 5.10+ and a mount.nfs that passes it on)",
-			nfsCommandError("mount nfs", d.source, err, out))
+		return fmt.Errorf("%w (an NFS pool is mounted %s; nosymfollow needs a mount.nfs that passes it on)",
+			nfsCommandError("mount nfs", d.source, err, out), strings.Join(requiredNFSFlags(), ","))
 	}
 	slog.Info("NFS mounted", "source", d.source, "mountpoint", d.mountDir, "options", mountOpts)
 	return nil
 }
 
-// nfsRequiredFlags are the per-mount flags every NFS pool's mount must carry.
-var nfsRequiredFlags = []string{"nosuid", "nodev", "noexec", "nosymfollow"}
+// requiredNFSFlags are the per-mount flags every NFS pool's mount must carry:
+// nosuid, nodev, noexec, and nosymfollow on a kernel that has it (5.10+).
+func requiredNFSFlags() []string {
+	if kernelHasNosymfollow() {
+		return []string{"nosuid", "nodev", "noexec", "nosymfollow"}
+	}
+	return []string{"nosuid", "nodev", "noexec"}
+}
+
+// warnedNoNosymfollow: the mount points already warned about, so the warning
+// is said once per mount point, not at every use of the pool.
+var warnedNoNosymfollow sync.Map
+
+func warnNoNosymfollow(dir string) {
+	if _, seen := warnedNoNosymfollow.LoadOrStore(dir, true); seen {
+		return
+	}
+	slog.Warn("this kernel has no nosymfollow (Linux 5.10+); the NFS pool is mounted nosuid,nodev,noexec only, and litevirt opens its content following no symlink on the export — qemu and qemu-img are handed no path through one, but upgrade the kernel to have the kernel refuse them too",
+		"mountpoint", dir)
+}
 
 // readMountInfo returns /proc/self/mountinfo; tests replace it.
 var readMountInfo = func() ([]byte, error) { return os.ReadFile("/proc/self/mountinfo") }
@@ -217,7 +244,7 @@ func unescapeMountInfo(s string) string {
 
 func missingNFSFlags(flags []string) []string {
 	var miss []string
-	for _, f := range nfsRequiredFlags {
+	for _, f := range requiredNFSFlags() {
 		if !slices.Contains(flags, f) {
 			miss = append(miss, f)
 		}
@@ -225,13 +252,18 @@ func missingNFSFlags(flags []string) []string {
 	return miss
 }
 
+// perMountFlags are the options of mountinfo's per-mount field that a bind
+// remount sets. A bind remount replaces all of them, so the ones the mount
+// has are passed again beside the hardening (a read-only mount stays so).
+var perMountFlags = []string{"ro", "rw", "nosuid", "nodev", "noexec", "noatime", "nodiratime", "relatime", "strictatime", "nosymfollow"}
+
 // ensureHardened refuses an existing mount at d.mountDir that is not this
-// pool's export, or that lacks any of nfsRequiredFlags. It does not remount:
-// litevirt uses only a mount it made itself, of the pool's own export with
-// those flags, so anything else there (another export left by a deleted pool,
-// a mount made by hand, or by an earlier build) must be unmounted and is then
-// mounted again by Prepare.
-func (d *nfsDriver) ensureHardened() error {
+// pool's export. This pool's export mounted without the hardening — by an
+// earlier build (vers=4,hard,intr only), or by hand — is hardened in place: a
+// bind remount (MS_REMOUNT|MS_BIND) changes only that mount's per-mount
+// flags, so open files and running VMs on it are untouched. It is refused
+// only when that remount fails, or leaves a flag missing.
+func (d *nfsDriver) ensureHardened(ctx context.Context, run cmdRunner) error {
 	m, mounted, err := mountAt(d.mountDir)
 	if err != nil {
 		return fmt.Errorf("read mount options of %s: %w", d.mountDir, err)
@@ -250,14 +282,42 @@ func (d *nfsDriver) ensureHardened() error {
 		return fmt.Errorf("%s has %s mounted, not this pool's export %s; unmount it (umount %s) and litevirt mounts the pool's export there",
 			d.mountDir, mountedWhat(m), d.source, d.mountDir)
 	}
-	flags := m.flags
-	if miss := missingNFSFlags(flags); len(miss) > 0 {
-		slog.Error("NFS pool is mounted without the required options; the pool is refused until it is unmounted and mounted again by litevirt",
-			"mountpoint", d.mountDir, "missing", miss)
-		return fmt.Errorf("NFS mount at %s lacks %s; unmount it (umount %s) and litevirt mounts it again with them",
-			d.mountDir, strings.Join(miss, ","), d.mountDir)
+	if !kernelHasNosymfollow() {
+		warnNoNosymfollow(d.mountDir)
 	}
-	return nil
+	miss := missingNFSFlags(m.flags)
+	if len(miss) == 0 {
+		return nil
+	}
+	var opts []string
+	for _, f := range perMountFlags {
+		if slices.Contains(m.flags, f) || slices.Contains(miss, f) {
+			opts = append(opts, f)
+		}
+	}
+	if run == nil {
+		run = realCmd
+	}
+	out, rerr := run(ctx, "mount", "-o", "remount,bind,"+strings.Join(opts, ","), "--", d.mountDir)
+	if rerr == nil {
+		if m2, ok, err := mountAt(d.mountDir); err == nil && ok {
+			if left := missingNFSFlags(m2.flags); len(left) == 0 {
+				slog.Warn("NFS pool was mounted without the required options; hardened in place",
+					"mountpoint", d.mountDir, "added", miss)
+				return nil
+			} else {
+				rerr = fmt.Errorf("the remount left %s missing", strings.Join(left, ","))
+			}
+		} else if err != nil {
+			rerr = err
+		} else {
+			rerr = errors.New("the mount is gone after the remount")
+		}
+	}
+	slog.Error("NFS pool is mounted without the required options and could not be hardened in place; the pool is refused",
+		"mountpoint", d.mountDir, "missing", miss, "error", rerr, "output", trimmedNFSCommandOutput(out))
+	return fmt.Errorf("NFS mount at %s lacks %s and remounting it with them failed (%v); remount it with %s, or unmount it (umount %s) and litevirt mounts it again with them",
+		d.mountDir, strings.Join(miss, ","), rerr, strings.Join(requiredNFSFlags(), ","), d.mountDir)
 }
 
 func isNFSFstype(t string) bool { return t == "nfs" || t == "nfs4" }
@@ -269,10 +329,15 @@ func mountedWhat(m mountEntry) string {
 	return fmt.Sprintf("%q (%s)", m.source, m.fstype)
 }
 
+// nfsCheckRun runs the in-place remount CheckNFSMountHardened may do; tests
+// replace it (nil: the real command).
+var nfsCheckRun cmdRunner
+
 // CheckNFSMountHardened refuses an NFS pool whose mount point holds anything
-// but its own export (ensureHardened), or holds it mounted without
-// nosuid,nodev,noexec,nosymfollow. A pool that is not mounted passes (Prepare
-// mounts it with them). Not an NFS config: nil.
+// but its own export (ensureHardened). Its own export mounted without
+// nosuid,nodev,noexec,nosymfollow is hardened in place first, and refused only
+// if that fails. A pool that is not mounted passes (Prepare mounts it with
+// them). Not an NFS config: nil.
 func CheckNFSMountHardened(dataDir string, cfg Config) error {
 	if !strings.EqualFold(cfg.Driver, "nfs") {
 		return nil
@@ -287,7 +352,9 @@ func CheckNFSMountHardened(dataDir string, cfg Config) error {
 	} else if !mounted {
 		return nil
 	}
-	return d.ensureHardened()
+	ctx, cancel := context.WithTimeout(context.Background(), defaultNFSCommandTimeout)
+	defer cancel()
+	return d.ensureHardened(ctx, nfsCheckRun)
 }
 
 // MountTable is a snapshot of this host's mount table, read once and judged
@@ -377,6 +444,23 @@ func OverrideMountInfoForTest(mountinfo func() ([]byte, error)) func() {
 	prev := readMountInfo
 	readMountInfo = mountinfo
 	return func() { readMountInfo = prev }
+}
+
+// OverrideNFSRemountForTest replaces how CheckNFSMountHardened runs the
+// in-place remount, for tests in other packages. It returns the restore
+// function.
+func OverrideNFSRemountForTest(run func(ctx context.Context, name string, args ...string) ([]byte, error)) func() {
+	prev := nfsCheckRun
+	nfsCheckRun = run
+	return func() { nfsCheckRun = prev }
+}
+
+// OverrideNosymfollowSupportForTest makes the kernel appear to have (or lack)
+// nosymfollow, for tests in other packages. It returns the restore function.
+func OverrideNosymfollowSupportForTest(has bool) func() {
+	prev := kernelHasNosymfollow
+	kernelHasNosymfollow = func() bool { return has }
+	return func() { kernelHasNosymfollow = prev }
 }
 
 func (d *nfsDriver) commandContext(ctx context.Context) (context.Context, context.CancelFunc, error) {

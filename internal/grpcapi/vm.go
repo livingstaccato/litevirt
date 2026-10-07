@@ -4527,16 +4527,14 @@ func resolveStopTimeout(reqTimeout int32, specJSON string) int32 {
 	return 30
 }
 
-// verifyImageBasesForStart refuses a start of vm whose local disk is an
-// overlay on an image-store base that names a file outside the store, VMDK
-// extents or an external data file (image.Store.AssertBase). A layered image
-// whose whole chain stays in the store passes, as on main. Disks on other
-// hosts, absent files and backings outside the image store are not this
-// check's: the base is what an image import or pull let in.
+// verifyImageBasesForStart refuses a start of vm whose local disk has a
+// backing chain qemu must not open: any layer the disk chain rule refuses
+// (verifyDiskChainForStart), or an image-store base that names a file
+// outside the store, VMDK extents or an external data file
+// (image.Store.AssertBase). A layered image whose whole chain stays in the
+// store passes, as on main. Disks on other hosts and absent files are not
+// this check's.
 func (s *Server) verifyImageBasesForStart(ctx context.Context, vm *corrosion.VMRecord) error {
-	if s.images == nil {
-		return nil
-	}
 	disks, err := corrosion.GetVMDisks(ctx, s.db, vm.Name)
 	if err != nil {
 		return status.Errorf(codes.Internal, "read disks of %q: %v", vm.Name, err)
@@ -4550,11 +4548,16 @@ func (s *Server) verifyImageBasesForStart(ctx context.Context, vm *corrosion.VMR
 		if err != nil || info.BackingFile == "" {
 			continue
 		}
+		// The whole chain, layer by layer, by the rule every copy path
+		// judges it by (verifyDiskChainForStart).
+		if err := s.verifyDiskChainForStart(ctx, vm, d, file); err != nil {
+			return err
+		}
 		b := info.BackingFile
 		if !filepath.IsAbs(b) {
 			b = filepath.Join(filepath.Dir(file), b)
 		}
-		if !s.images.Contains(b) {
+		if s.images == nil || !s.images.Contains(b) {
 			continue
 		}
 		if err := s.images.AssertBase(b); err != nil {

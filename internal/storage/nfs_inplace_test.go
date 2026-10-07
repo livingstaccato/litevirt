@@ -118,22 +118,63 @@ func TestCheckNFSMountHardenedRemountsInPlace(t *testing.T) {
 	}
 }
 
-// A remount the kernel accepts but that leaves a flag off (a mount.nfs or
-// kernel that drops nosymfollow on 5.10+) is refused, not trusted.
+// A remount the kernel accepts is read back: one that leaves nosuid, nodev
+// or noexec off is refused, not trusted. One that takes those but drops
+// nosymfollow (a 5.10+ kernel under a mount that does not pass the option on)
+// leaves the pool as on a kernel without nosymfollow: accepted, its content
+// opened following no symlink on the export, and not remounted at every use.
 func TestNFSInPlaceRemountIsVerified(t *testing.T) {
+	kernelNosymfollow(t, true)
+	for _, tc := range []struct {
+		drop    string
+		wantErr bool
+	}{{",noexec", true}, {",nosymfollow", false}} {
+		t.Run(tc.drop, func(t *testing.T) {
+			dir := t.TempDir()
+			m := newLiveMountTable(t, dir, "rw,relatime")
+			run := func(ctx context.Context, cmd string, args ...string) ([]byte, error) {
+				if _, err := m.run(ctx, cmd, args...); err != nil || cmd != "mount" {
+					return nil, err
+				}
+				m.flags = strings.ReplaceAll(m.flags, tc.drop, "")
+				return nil, nil
+			}
+			d := &nfsDriver{source: "nas:/x", targetOverride: dir, opts: map[string]string{}, run: run}
+			err := d.Prepare(context.Background())
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("Prepare after a remount that dropped %s = %v, wantErr %v", tc.drop, err, tc.wantErr)
+			}
+			if tc.wantErr {
+				return
+			}
+			n := len(m.remounts)
+			defer OverrideNFSRemountForTest(run)()
+			if err := CheckNFSMountHardened(t.TempDir(), Config{Driver: "nfs", Source: "nas:/x", Target: dir}); err != nil || len(m.remounts) != n {
+				t.Fatalf("pool check: %v, remounts %q (want none more)", err, m.remounts[n:])
+			}
+		})
+	}
+}
+
+// A remount that refuses nosymfollow itself is retried once without it, and
+// the pool is then as on a kernel without nosymfollow.
+func TestNFSInPlaceRemountWithoutNosymfollowOption(t *testing.T) {
 	kernelNosymfollow(t, true)
 	dir := t.TempDir()
 	m := newLiveMountTable(t, dir, "rw,relatime")
 	run := func(ctx context.Context, cmd string, args ...string) ([]byte, error) {
-		if _, err := m.run(ctx, cmd, args...); err != nil {
-			return nil, err
+		if cmd == "mount" && strings.Contains(args[1], "nosymfollow") {
+			m.remounts = append(m.remounts, args[1])
+			return []byte("mount: bad option"), errors.New("exit status 32")
 		}
-		m.flags = strings.ReplaceAll(m.flags, ",nosymfollow", "")
-		return nil, nil
+		return m.run(ctx, cmd, args...)
 	}
 	d := &nfsDriver{source: "nas:/x", targetOverride: dir, opts: map[string]string{}, run: run}
-	if err := d.Prepare(context.Background()); err == nil || !strings.Contains(err.Error(), "nosymfollow") {
-		t.Fatalf("Prepare after a remount that dropped nosymfollow = %v, want a refusal", err)
+	if err := d.Prepare(context.Background()); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	if m.flags != "rw,nosuid,nodev,noexec,relatime" {
+		t.Fatalf("flags = %q, want the other options applied", m.flags)
 	}
 }
 

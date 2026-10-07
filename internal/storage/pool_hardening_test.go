@@ -51,29 +51,43 @@ func TestNFSMountIsHardened(t *testing.T) {
 	}
 }
 
-// nosymfollow is required on a kernel that has it (5.10+). A mount.nfs that
-// refuses it there gets no NFS pool: the mount fails with a message naming
-// why, and is not retried weaker.
-func TestNFSMountRequiresNosymfollow(t *testing.T) {
+// nosymfollow is asked for on a kernel that has it (5.10+). A mount.nfs that
+// refuses the option mounts the pool without it, as on an older kernel, once;
+// any other failure is not retried.
+func TestNFSMountRetriesWithoutNosymfollowOnlyForTheOption(t *testing.T) {
 	kernelNosymfollow(t, true)
-	var mounts []string
-	d := &nfsDriver{source: "server:/export", targetOverride: t.TempDir(), opts: map[string]string{},
-		run: func(_ context.Context, cmd string, args ...string) ([]byte, error) {
-			if cmd == "mountpoint" {
-				return nil, errors.New("not mounted")
+	for _, tc := range []struct {
+		name    string
+		out     string
+		wantErr bool
+		mounts  int
+	}{
+		{"option refused", "mount.nfs: an incorrect mount option was specified", false, 2},
+		{"server down", "mount.nfs: Connection timed out", true, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var mounts []string
+			d := &nfsDriver{source: "server:/export", targetOverride: t.TempDir(), opts: map[string]string{},
+				run: func(_ context.Context, cmd string, args ...string) ([]byte, error) {
+					if cmd == "mountpoint" {
+						return nil, errors.New("not mounted")
+					}
+					mounts = append(mounts, args[3])
+					if tc.wantErr || strings.Contains(args[3], "nosymfollow") {
+						return []byte(tc.out), errors.New("exit 32")
+					}
+					return nil, nil
+				}}
+			err := d.Prepare(context.Background())
+			if (err != nil) != tc.wantErr || len(mounts) != tc.mounts {
+				t.Fatalf("Prepare = %v, mounts %q; want err %v after %d attempts", err, mounts, tc.wantErr, tc.mounts)
 			}
-			mounts = append(mounts, args[3])
-			if strings.Contains(args[3], "nosymfollow") {
-				return []byte("mount.nfs: an incorrect mount option was specified"), errors.New("exit 32")
+			for _, want := range []string{"nosuid", "nodev", "noexec"} {
+				if !hasOpt(strings.Split(mounts[len(mounts)-1], ","), want) {
+					t.Errorf("mount options %q lack %s", mounts[len(mounts)-1], want)
+				}
 			}
-			return nil, nil
-		}}
-	err := d.Prepare(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "nosymfollow") {
-		t.Fatalf("Prepare = %v, want a refusal naming nosymfollow", err)
-	}
-	if len(mounts) != 1 {
-		t.Fatalf("mounts = %q, want exactly one attempt and no weaker retry", mounts)
+		})
 	}
 }
 

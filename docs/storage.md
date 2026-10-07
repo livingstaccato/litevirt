@@ -110,11 +110,11 @@ an absolute path for btrfs, nothing for local and dir — so no value can reach
 NFS pools are always mounted `nosuid,nodev,noexec,nosharecache,nosymfollow`,
 whatever `options=` says. `nosharecache` gives each pool's mount its own
 superblock, so two pools on one server each report their own export as the
-mount source. `nosymfollow` needs Linux 5.10+ and a mount.nfs that passes
-it on; on a 5.10+ kernel a mount.nfs that refuses it fails the mount, with an
-error saying so, rather than making it weaker. On a kernel before 5.10 (RHEL 8,
-Ubuntu 20.04, Debian 10) there is no `nosymfollow`: the pool is mounted with
-the other options and used, the daemon logs a WARN once per mount point, and
+mount source. `nosymfollow` needs Linux 5.10+ and a mount (mount.nfs,
+util-linux) that passes it on. Where it is not available — a kernel before
+5.10 (RHEL 8, Ubuntu 20.04, Debian 10), or a mount that refuses or drops the
+option — the pool is mounted (or hardened) with the other options and used,
+the daemon logs a WARN once per mount point, and
 every open litevirt itself makes of the pool's content (records, uploads,
 replicas, temps) follows no symlink on the export — `openat2`
 `RESOLVE_NO_SYMLINKS`, or a component-by-component `O_NOFOLLOW` walk on a

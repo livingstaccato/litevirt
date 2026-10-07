@@ -299,7 +299,7 @@ func TestISOAuthority_RuntimeMigrationIsPointedAtTheTargetsFile(t *testing.T) {
 	s, _ := stubTarget(t)
 	_, here := libraryVM(t, s, "mig", "acme")
 	run := func(paths []string, runtime bool) (*pb.EnsureDisksResponse, error) {
-		return s.EnsureDisks(adminCtx(), &pb.EnsureDisksRequest{VmName: "mig",
+		return s.EnsureDisks(isoSourcePeer(t, s, "mig"), &pb.EnsureDisksRequest{VmName: "mig",
 			InstallerIsoListed: true, InstallerIsoPaths: paths, InstallerIsoRuntime: runtime})
 	}
 	if r, err := run([]string{here}, true); err != nil || r.GetInstallerIsoResolved()[here] != here {
@@ -330,7 +330,7 @@ func TestISOAuthority_RuntimeMigrationTargetWithoutThePoolRefuses(t *testing.T) 
 	}
 	theirs := filepath.Join(disks, "foo.iso") // another project's upload on this host
 	writeLibFile(t, theirs, "B's file")
-	_, err := s.EnsureDisks(adminCtx(), &pb.EnsureDisksRequest{VmName: "mig",
+	_, err := s.EnsureDisks(isoSourcePeer(t, s, "mig"), &pb.EnsureDisksRequest{VmName: "mig",
 		InstallerIsoListed: true, InstallerIsoPaths: []string{theirs}, InstallerIsoRuntime: true})
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("live migration to a host without a-lib: got %v, want FailedPrecondition", err)
@@ -347,11 +347,11 @@ func TestISOAuthority_MigrationTargetJudgesAnAdminPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	req := &pb.EnsureDisksRequest{VmName: "mig", InstallerIsoListed: true, InstallerIsoPaths: []string{p}, InstallerIsoRuntime: true}
-	if _, err := s.EnsureDisks(adminCtx(), req); status.Code(err) != codes.FailedPrecondition {
+	if _, err := s.EnsureDisks(isoSourcePeer(t, s, "mig"), req); status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("admin path missing on the target: got %v, want FailedPrecondition", err)
 	}
 	writeLibFile(t, p, isoBody)
-	if _, err := s.EnsureDisks(adminCtx(), req); err != nil {
+	if _, err := s.EnsureDisks(isoSourcePeer(t, s, "mig"), req); err != nil {
 		t.Fatalf("admin path present on the target: %v", err)
 	}
 }

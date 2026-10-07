@@ -40,7 +40,7 @@ func TestISORound4_AFirstArrivalIsAdmittedAsTheSameBytes(t *testing.T) {
 		if sum != "" {
 			req.InstallerIsoSha256 = map[string]string{src: sum}
 		}
-		_, err := s.EnsureDisks(adminCtx(), req)
+		_, err := s.EnsureDisks(isoSourcePeer(t, s, "mig"), req)
 		return err
 	}
 	for _, runtime := range []bool{true, false} {
@@ -185,7 +185,7 @@ func TestISORound4_UserDataRootsHoldISOsAndNothingElse(t *testing.T) {
 	if _, err := s.PrepareHardwareForStart(context.Background(), vmRecord(t, s, "old")); err != nil {
 		t.Fatalf("start of a main-era VM whose ISO is in a home directory: %v", err)
 	}
-	if _, err := s.EnsureDisks(adminCtx(), &pb.EnsureDisksRequest{VmName: "old", InstallerIsoListed: true,
+	if _, err := s.EnsureDisks(isoSourcePeer(t, s, "old"), &pb.EnsureDisksRequest{VmName: "old", InstallerIsoListed: true,
 		InstallerIsoPaths: []string{virtio}, InstallerIsoRuntime: true}); err != nil {
 		t.Fatalf("a live move (a drain) of that VM onto this host: %v", err)
 	}

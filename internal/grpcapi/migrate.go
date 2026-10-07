@@ -1179,7 +1179,7 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 	// it, so this host judges it before the migration may proceed, and for a
 	// runtime move names the file here the destination definition is to carry.
 	if rec, gErr := corrosion.GetVM(ctx, s.db, req.VmName); gErr == nil && rec != nil {
-		w, resolved, err := s.verifyIncomingVMISO(rec, req)
+		w, resolved, err := s.verifyIncomingVMISO(ctx, rec, req)
 		if err != nil {
 			return nil, err
 		}

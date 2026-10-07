@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -21,6 +22,7 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/qcow2"
+	"github.com/litevirt/litevirt/internal/randid"
 	"github.com/litevirt/litevirt/internal/safename"
 	"github.com/litevirt/litevirt/internal/tenancy"
 	"github.com/litevirt/litevirt/internal/vmimport"
@@ -85,7 +87,6 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 		return status.Errorf(codes.AlreadyExists,
 			"VM %q already exists (on host %s) — choose a different --name or remove it first", name, existing.HostName)
 	}
-
 	// ── Stage the source into a temp import dir (always cleaned up) ──
 	if err := os.MkdirAll(filepath.Join(s.dataDir, "imports"), 0o755); err != nil {
 		return status.Errorf(codes.Internal, "prepare import dir: %v", err)
@@ -94,29 +95,31 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 	if err != nil {
 		return status.Errorf(codes.Internal, "create import dir: %v", err)
 	}
+	// From the upload to the last converted disk the import writes, alongside
+	// any other import on the host: each write reserves its bytes first, and
+	// every other import's check on the same filesystem counts what this one
+	// has reserved and not yet written. The reservation is released before
+	// anything waits on the client, so a client that stops reading holds no
+	// other import's room. (While the upload waits for its next chunk it
+	// holds only what it has written and not yet flushed.)
+	space := s.reserveImportSpace(importDir)
+	defer space.release()
 	defer os.RemoveAll(importDir)
 
-	srcPath, err := s.stageImportSource(ctx, stream, first, importDir)
+	srcPath, err := s.stageImportSource(ctx, stream, first, importDir, space)
 	if err != nil {
 		return err
 	}
-
-	// From here to the last converted disk the import writes; one import at a
-	// time per host, so its free-space checks hold. Nothing that waits on the
-	// client happens while it is held: a client that stops reading would hold
-	// every other import on the host.
-	releaseWrites, err := s.acquireImportWrites(ctx)
-	if err != nil {
-		return err
-	}
-	defer releaseWrites()
+	space.begin()
 
 	// ── Parse via the source adapter → ForeignVM ──
-	fv, err := s.parseImportSource(ctx, first.SourceFormat, srcPath, importDir)
+	fv, err := s.parseImportSource(ctx, first.SourceFormat, srcPath, importDir, space.totals(importDir, "unpacking the source"))
 	if err != nil {
 		return status.Errorf(codes.InvalidArgument, "parse source: %v", err)
 	}
 	fv.Name = name
+	// What the extraction reserved and left sparse it never writes.
+	space.begin()
 
 	// Resolve foreign networks → bridges + MAC policy (also surfaced by --inspect).
 	if err := s.applyImportNetworks(fv, first); err != nil {
@@ -126,10 +129,26 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 	if first.Inspect {
 		// Nothing unpacked is needed to describe the source; free it before
 		// waiting on the client.
-		releaseWrites()
+		space.release()
 		_ = os.RemoveAll(importDir)
 		return s.sendImportInspect(stream, fv, project)
 	}
+
+	// The row is written only at the end; until then the name is held here,
+	// or two imports of one name would write the same files into the pool.
+	// (An --inspect writes nothing there, and does not take it.)
+	importID := randid.New()
+	releaseName, err := s.claimImportNameAs(name, importID)
+	if err != nil {
+		return err
+	}
+	defer releaseName()
+	// Each file the import writes into the pool is measured, and recorded as
+	// its own, from before its first byte (importWritesFor). The records go
+	// when the import ends, either way: by then its disks are a row's, or
+	// removed. Only a crash leaves them, to show its leftovers dead.
+	writes, forgetWrites := s.importWritesFor(importID, space)
+	defer forgetWrites()
 
 	// An import does not claim. importRecords builds the NIC rows straight from
 	// the foreign hypervisor's NICs, so importing onto a NetBox-bound network
@@ -177,6 +196,16 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 	if err != nil {
 		return err
 	}
+	// Records of earlier daemons' imports into this pool that nothing is left
+	// for go, off this import's path (a hung pool stalls only the prune).
+	s.startImportPlacementPrune(poolDir)
+	// A pool that can place a disk only by copying it holds it twice for a
+	// moment: the second copy is reserved like the first, once the
+	// conversion's own unwritten reservation is dropped.
+	writes.copying = func(n uint64) error {
+		space.begin()
+		return space.reserve(poolDir, n, "copying a converted disk into place (the pool has neither link() nor RENAME_NOREPLACE)")
+	}
 	var convertedPaths []string
 	cleanupDisks := func() {
 		for _, p := range convertedPaths {
@@ -185,7 +214,7 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 	}
 	// Convert progress goes to the client from its own goroutine, and is
 	// dropped while a send is still pending: the conversion never waits on the
-	// client while it holds the import writes.
+	// client while it holds a reservation.
 	progress := make(chan *pb.ImportVMProgress, 1)
 	progressSent := make(chan struct{})
 	go func() {
@@ -209,23 +238,25 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 		dst := lv.DiskPath(poolDir, name, d.Name) // poolDir/<vm>-<disk>.qcow2 (poolDir already the disks dir)
 		dst = filepath.Join(poolDir, name+"-"+d.Name+".qcow2")
 		curDisk := d.Name
-		// The conversion writes up to the disk's limit into the pool, and a
-		// disk from outside the import directory is first copied privately.
+		// A file already at the name is never replaced. One that something
+		// records is refused; an orphan (a crashed import's output) is moved
+		// aside and kept.
+		if err := s.clearImportDiskName(ctx, first.TargetPool, name, importID, d.Name, dst); err != nil {
+			cleanupDisks()
+			return status.Error(codes.FailedPrecondition, err.Error())
+		}
+		// The conversion writes up to the disk's limit, plus its qcow2
+		// tables, into the pool, and a disk from outside the import directory
+		// is first copied privately. Each is reserved on its own filesystem;
+		// on a shared one the two add up.
 		limit := uint64(importSourceLimit(d.CapacityBytes))
-		need := limit
 		if !inImportDir(importDir, d.LocalPath) {
-			if err := s.requireImportSpace(importDir, limit, "a private copy of disk "+d.Name); err != nil {
+			if err := space.reserve(importDir, limit, "a private copy of disk "+d.Name); err != nil {
 				cleanupDisks()
 				return err
 			}
-			// The copy lives until its conversion is done. Charged against
-			// the pool as well, whatever filesystem it is on: a btrfs
-			// subvolume or ZFS dataset has its own device number but shares
-			// the free space, and too much charged is a refusal where too
-			// little is a full disk.
-			need += limit
 		}
-		if err := s.requireImportSpace(poolDir, need, "converting disk "+d.Name); err != nil {
+		if err := space.reserve(poolDir, limit+limit/4096+16<<20, "converting disk "+d.Name); err != nil {
 			cleanupDisks()
 			return err
 		}
@@ -234,11 +265,24 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 			case progress <- &pb.ImportVMProgress{Phase: "convert", ConvertPct: pct, CurrentDisk: curDisk}:
 			default:
 			}
-		}); err != nil {
+		}, writes); err != nil {
 			cleanupDisks()
+			if errors.Is(err, os.ErrExist) {
+				return status.Errorf(codes.FailedPrecondition,
+					"disk %q: %s appeared in the pool during the conversion; an import never replaces a file there", d.Name, dst)
+			}
+			// A refused reservation (the copy a pool without link() needs)
+			// keeps its code.
+			var st interface{ GRPCStatus() *status.Status }
+			if errors.As(err, &st) && st.GRPCStatus().Code() == codes.FailedPrecondition {
+				return status.Errorf(codes.FailedPrecondition, "convert disk %q: %v", d.Name, err)
+			}
 			return status.Errorf(codes.Internal, "convert disk %q: %v", d.Name, err)
 		}
 		convertedPaths = append(convertedPaths, dst)
+		// The disk is written and flushed; what it reserved and left sparse
+		// it never writes.
+		space.begin()
 		d.LocalPath = dst
 		// Authoritative size from the converted qcow2.
 		if info, e := qcow2.Info(dst); e == nil && info.VirtualSize > 0 {
@@ -248,9 +292,9 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 			d.CapacityBytes = info.VirtualSize
 		}
 	}
-	// The writes are done; let the next import write, and free the unpacked
-	// source, before anything here waits on this one's client again.
-	releaseWrites()
+	// The writes are done; drop what is left of the reservation, and free the
+	// unpacked source, before anything here waits on this one's client again.
+	space.release()
 	_ = os.RemoveAll(importDir)
 
 	// Re-check quota against the real converted sizes before committing.
@@ -516,7 +560,10 @@ func (s *Server) proxyImportVM(ctx context.Context, stream pb.LiteVirt_ImportVMS
 // stageImportSource lands the source artifact under importDir and returns its
 // path. source_path (a file/dir already on THIS host) skips the upload; otherwise
 // the streamed chunks are written to importDir/source.
-func (s *Server) stageImportSource(ctx context.Context, stream pb.LiteVirt_ImportVMServer, first *pb.ImportVMRequest, importDir string) (string, error) {
+//
+// Each chunk is reserved before it is written, so an upload larger than the
+// room left is refused as it arrives.
+func (s *Server) stageImportSource(ctx context.Context, stream pb.LiteVirt_ImportVMServer, first *pb.ImportVMRequest, importDir string, space *importReservation) (string, error) {
 	if first.SourcePath != "" {
 		return s.resolveStagedPath(ctx, first.SourcePath)
 	}
@@ -529,9 +576,21 @@ func (s *Server) stageImportSource(ctx context.Context, stream pb.LiteVirt_Impor
 	defer f.Close()
 
 	var total int64
+	var reserved uint64
 	write := func(chunk []byte) error {
 		if len(chunk) == 0 {
 			return nil
+		}
+		if total+int64(len(chunk)) > maxRestoreBytes {
+			return status.Errorf(codes.ResourceExhausted, "import upload exceeded the %d-byte ceiling", maxRestoreBytes)
+		}
+		// Reserved a step at a time, so no more than a step is held
+		// unwritten while the client sends the next chunk.
+		for uint64(total)+uint64(len(chunk)) > reserved {
+			if err := space.reserve(importDir, importUploadStep, "uploading the source"); err != nil {
+				return err
+			}
+			reserved += importUploadStep
 		}
 		n, werr := f.Write(chunk)
 		if werr != nil {
@@ -602,7 +661,8 @@ func (s *Server) resolveStagedPath(ctx context.Context, p string) (string, error
 }
 
 // parseImportSource dispatches to the right adapter. auto sniffs by content.
-func (s *Server) parseImportSource(ctx context.Context, format, srcPath, importDir string) (*vmimport.ForeignVM, error) {
+// An archive reserves what it unpacks into importDir through reserve.
+func (s *Server) parseImportSource(ctx context.Context, format, srcPath, importDir string, reserve vmimport.Reserve) (*vmimport.ForeignVM, error) {
 	format = strings.ToLower(strings.TrimSpace(format))
 	if format == "" || format == "auto" {
 		format = sniffImportFormat(srcPath)
@@ -627,7 +687,7 @@ func (s *Server) parseImportSource(ctx context.Context, format, srcPath, importD
 			return nil, err
 		}
 		defer f.Close()
-		ovfPath, err := vmimport.UnpackOVA(f, importDir, int64(min(s.importExtractBudget(importDir), 1<<62)))
+		ovfPath, err := vmimport.UnpackOVA(f, importDir, reserve)
 		if err != nil {
 			return nil, err
 		}
@@ -648,7 +708,7 @@ func (s *Server) parseImportSource(ctx context.Context, format, srcPath, importD
 			return nil, err
 		}
 		defer f.Close()
-		return vmimport.ParseVMA(ctx, f, importDir, s.importExtractBudget(importDir))
+		return vmimport.ParseVMA(ctx, f, importDir, reserve)
 	default:
 		return nil, fmt.Errorf("unrecognized source format (use --from ova|ovf|proxmox|vma)")
 	}
@@ -866,12 +926,109 @@ func importRecords(fv *vmimport.ForeignVM, name, host string) ([]corrosion.DiskR
 
 // ── disk conversion ──
 
+// importDiskWrites is told of the files a disk conversion writes in the pool,
+// so its import can measure them and record them as its own. Every field is
+// optional, and a nil *importDiskWrites is told nothing.
+type importDiskWrites struct {
+	// created is a file the import just created in the pool — a conversion's
+	// scratch file, or a copy on its way to its name — before its first byte.
+	created func(p string)
+	// placing is the finished, flushed file fi describes about to take
+	// dst's name.
+	placing func(dst string, fi os.FileInfo)
+	// placed is tmp's disk now placed at dst: dst is the import's file.
+	placed func(tmp, dst string)
+	// copying is a placement that has to copy n bytes (a pool with neither
+	// link() nor RENAME_NOREPLACE): an error refuses it.
+	copying func(n uint64) error
+	// discarded is a file it created that is gone, or no longer its own.
+	discarded func(p string)
+}
+
+func (w *importDiskWrites) didCreate(p string) {
+	if w != nil && w.created != nil {
+		w.created(p)
+	}
+}
+
+func (w *importDiskWrites) willPlace(dst string, fi os.FileInfo) {
+	if w != nil && w.placing != nil {
+		w.placing(dst, fi)
+	}
+}
+
+func (w *importDiskWrites) didPlace(tmp, dst string) {
+	if w != nil && w.placed != nil {
+		w.placed(tmp, dst)
+	}
+}
+
+func (w *importDiskWrites) copy(n uint64) error {
+	if w != nil && w.copying != nil {
+		return w.copying(n)
+	}
+	return nil
+}
+
+func (w *importDiskWrites) discard(p string) {
+	if w != nil && w.discarded != nil {
+		w.discarded(p)
+	}
+}
+
+// importWritesFor is what the import importID does with each file it writes
+// into a pool: measures it in space, sets its origin xattr where the pool
+// keeps one, and records it in this host's placement record (see
+// vmimport_placement.go). A scratch file or a copy on its way to its name is
+// recorded when it is created; a placed disk is recorded before it takes its
+// name, in the state it is placed in, so a crash at any point leaves no
+// unrecorded file of the import, and again once placed, its change time
+// bound too. forget drops every record the import wrote. The caller sets
+// copying.
+func (s *Server) importWritesFor(importID string, space *importReservation) (w *importDiskWrites, forget func()) {
+	origin := s.importOriginFor(importID)
+	var recorded []string
+	record := func(p string, fi os.FileInfo, scratch, withCtime bool) {
+		if err := s.recordImportPlacementBound(p, fi, importID, scratch, withCtime); err != nil {
+			slog.Warn("import: could not record a file it writes; a leftover of it is judged by age", "path", p, "error", err)
+			return
+		}
+		recorded = append(recorded, p)
+	}
+	w = &importDiskWrites{
+		created: func(p string) {
+			space.track(p)
+			_ = setImportOrigin(p, origin)
+			if fi, err := os.Lstat(p); err == nil {
+				record(p, fi, true, false)
+			}
+		},
+		placing: func(dst string, fi os.FileInfo) { record(dst, fi, false, false) },
+		placed: func(tmp, dst string) {
+			space.track(dst)
+			s.forgetImportPlacement(tmp, importID)
+			if fi, err := os.Lstat(dst); err == nil {
+				record(dst, fi, false, true)
+			}
+		},
+		discarded: func(p string) { s.forgetImportPlacement(p, importID) },
+	}
+	return w, func() {
+		for _, p := range recorded {
+			s.forgetImportPlacement(p, importID)
+		}
+	}
+}
+
 // convertForeignDisk converts a foreign-format disk to qcow2 at dst using
 // qemu-img. It HARD-FAILS if qemu-img is absent (the byte-copy fallback used
 // elsewhere would dump foreign bytes into a qcow2-named file and corrupt it) and
 // rejects any external backing-file / out-of-dir extent reference BEFORE invoking
 // qemu-img (a malicious descriptor would otherwise make qemu-img read host files).
-func convertForeignDisk(ctx context.Context, src, srcFormat, dst, allowedDir string, maxSrcBytes int64, emit func(pct float32)) error {
+//
+// w, when set, is told of each file the conversion writes in dst's directory
+// (see importDiskWrites).
+func convertForeignDisk(ctx context.Context, src, srcFormat, dst, allowedDir string, maxSrcBytes int64, emit func(pct float32), w *importDiskWrites) error {
 	if !qemuImgAvailable() {
 		return fmt.Errorf("qemu-img not found on PATH (required to import/convert foreign disks)")
 	}
@@ -911,6 +1068,7 @@ func convertForeignDisk(ctx context.Context, src, srcFormat, dst, allowedDir str
 	}
 	tmp := tf.Name()
 	tf.Close()
+	w.didCreate(tmp)
 	finished := false
 	defer func() {
 		if !finished {
@@ -950,10 +1108,25 @@ func convertForeignDisk(ctx context.Context, src, srcFormat, dst, allowedDir str
 		_ = os.Remove(tmp)
 		return err
 	}
-	if err := os.Rename(tmp, dst); err != nil {
+	// Flushed before it is placed: the import's reservation stops counting
+	// it once it has its name, so its bytes must be gone from the free space
+	// by then.
+	if err := syncFile(tmp); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("flush converted disk: %w", err)
+	}
+	if fi, err := os.Lstat(tmp); err == nil {
+		w.willPlace(dst, fi)
+	}
+	// Never over a file already there: another VM's disk keeps its bytes.
+	if err := placeNoReplace(ctx, tmp, dst, w); err != nil {
+		_ = os.Remove(tmp)
 		return fmt.Errorf("finalize converted disk: %w", err)
 	}
 	finished = true
+	// The disk is the import's own file under its new name, and stays
+	// measured as such.
+	w.didPlace(tmp, dst)
 	return nil
 }
 

@@ -50,7 +50,7 @@ func refusedUnopened(t *testing.T, src, format string) {
 	calls := fakeQemuImg(t)
 	importDir := filepath.Dir(src)
 	dst := filepath.Join(t.TempDir(), "out.qcow2")
-	if err := convertForeignDisk(context.Background(), src, format, dst, importDir, 1<<40, nil); err == nil {
+	if err := convertForeignDisk(context.Background(), src, format, dst, importDir, 1<<40, nil, nil); err == nil {
 		t.Fatalf("convert %s as %q: got nil, want refusal", filepath.Base(src), format)
 	}
 	if c := calls(); len(c) != 0 {
@@ -137,7 +137,7 @@ func TestConvertForeignDisk_AnUndeclaredDiskIsNeverProbedByQemu(t *testing.T) {
 	if err := os.WriteFile(p, make([]byte, 4096), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := convertForeignDisk(context.Background(), p, "", filepath.Join(t.TempDir(), "out.qcow2"), dir, 1<<40, nil); err != nil {
+	if err := convertForeignDisk(context.Background(), p, "", filepath.Join(t.TempDir(), "out.qcow2"), dir, 1<<40, nil, nil); err != nil {
 		t.Fatalf("convert: %v", err)
 	}
 	c := calls()
@@ -163,7 +163,7 @@ func TestConvertForeignDisk_ConvertsAPrivateCopyOfAnOutsideDisk(t *testing.T) {
 	if err := os.WriteFile(src, make([]byte, 4096), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := convertForeignDisk(context.Background(), src, "raw", filepath.Join(t.TempDir(), "out.qcow2"), importDir, 1<<40, nil); err != nil {
+	if err := convertForeignDisk(context.Background(), src, "raw", filepath.Join(t.TempDir(), "out.qcow2"), importDir, 1<<40, nil, nil); err != nil {
 		t.Fatalf("convert: %v", err)
 	}
 	c := calls()
@@ -194,7 +194,7 @@ func TestConvertForeignDisk_RefusesAnOutsideDiskReachedThroughALink(t *testing.T
 		if runtime.GOOS != "linux" && strings.Contains(src, "/dir/") {
 			continue // only the final component is checked off Linux
 		}
-		err := convertForeignDisk(context.Background(), src, "raw", filepath.Join(t.TempDir(), "out.qcow2"), t.TempDir(), 1<<40, nil)
+		err := convertForeignDisk(context.Background(), src, "raw", filepath.Join(t.TempDir(), "out.qcow2"), t.TempDir(), 1<<40, nil, nil)
 		if err == nil {
 			t.Fatalf("%s: a disk reached through a link was converted, want refusal", src)
 		}
@@ -212,7 +212,7 @@ func TestConvertForeignDisk_RefusesAnOutsideDiskThatIsNotAPlainFile(t *testing.T
 	}
 	// Outside the import directory, so it reaches the private copy; a FIFO
 	// must be refused there without the open blocking on a writer.
-	err := convertForeignDisk(context.Background(), fifo, "raw", filepath.Join(t.TempDir(), "out.qcow2"), t.TempDir(), 1<<40, nil)
+	err := convertForeignDisk(context.Background(), fifo, "raw", filepath.Join(t.TempDir(), "out.qcow2"), t.TempDir(), 1<<40, nil, nil)
 	if err == nil {
 		t.Fatal("a FIFO was converted, want refusal")
 	}

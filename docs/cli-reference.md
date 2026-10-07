@@ -571,6 +571,76 @@ target sees the entry node, not the caller. Every file a foreign disk makes
 qemu open (backing files, VMDK extents, a data file) must sit beside the disk
 or in the import directory.
 
+Several imports can run on one host at once. Before each write — an upload
+(reserved 64 MiB at a time), unpacking an OVA or VMA, copying a mapped disk,
+converting a disk into the pool — an import reserves the bytes it will write,
+and is admitted only if that filesystem has room for them on top of what the
+running imports writing to the same filesystem have reserved and its free space
+does not yet show written, while still keeping the free headroom a cold
+migration keeps (5% of the filesystem, between 1 and 64 GiB). Imports into
+unrelated storage do not count against each other; btrfs subvolumes, datasets
+of one ZFS pool and exports of one NFS server (by address) count as one
+filesystem, and one litevirt cannot identify counts as shared with every other.
+A reservation shrinks as the filesystem's free space shows the import's writes,
+and is released when it finishes or fails, so an import that does not fit
+beside the others is refused with the space it needs and what the others hold;
+retry it when they finish. Two imports of the same VM name on one host do not
+run at once (`--inspect` is not held back), and an import never replaces a file
+already at its disk's name in the pool. A file there is taken for a crashed
+earlier import's leftover — moved aside to `<name>.orphan-<unix time>`, kept,
+and logged, after which the import goes ahead — only when all of these hold:
+
+- no disk (of a live VM, kept from a deleted one, or under a kept snapshot)
+  and no image records it;
+- no operation in flight (a create, clone, restore or disk attach) names a VM
+  whose disks would be named like it, and no other import on the host does;
+- it is a dead import's leftover (below), or both: no VM exists whose name
+  followed by `-` begins the file's name, and it has not been modified in the
+  last 15 minutes;
+- no file beside it whose name begins like its own up to any `-` (so for
+  `web-3-root.qcow2`, any `web-*` file), and no other host's conversion
+  scratch file or partial copy for such a name, has been modified in the last 15 minutes —
+  except files a disk row or an image records (a running VM's own disks, such
+  as `web-1`'s beside an import of `web-3`, never hold it back), files named
+  for an existing VM whose name does not begin the leftover's the same way,
+  files of another import running on the same host under a name that does
+  not begin the leftover's, and dead imports' leftovers (below).
+
+**A dead import's leftover.** Every file an import writes into a pool is
+recorded on its host, in `<data_dir>/import-placements/`: its path, which file
+it is (its inode), and the size, modification time and (once placed) change
+time it was left with, under the import and the daemon process that wrote it.
+The device number is not part of it, so the record survives a reboot or a
+remount of the pool. A file whose record names an import that is no longer
+running on that host (the daemon stopped or restarted mid-import; an import
+that ends drops its records), and which still has that inode, size and
+times, is that import's leftover at once, without the 15-minute wait and
+whatever VM it is named like. The record works on every filesystem, NFS
+without user xattrs and FUSE included; where the pool keeps user xattrs, the
+file also carries its origin in `user.litevirt.import-origin`, which must then
+name the same import. A file written since its import left it — rewritten in
+place by a replication into that path, say, even with its modification time
+set back — is not a leftover by its record: it waits out the 15 minutes like
+any file whose origin is unknown.
+
+The record is the importing host's own. A re-import on another host into a
+pool several hosts share (the first host is being drained, say) asks the other
+hosts that have the pool, over their peer connection, whether their record
+shows each file it cannot prove — the leftover and the fresh files beside it —
+as their dead import's, in exactly the state it sees; it takes a file for a
+leftover only on a yes. A host that does not answer within a few seconds
+leaves the file judged by age, and the refusal names it. The default pool
+(`<data_dir>/disks`) is each host's own and asks no one.
+
+Any other file there refuses the import, saying why. On a pool with neither
+hard links nor a rename that cannot replace a file (some FUSE filesystems), a
+converted disk is copied into place: into a recorded temp name beside the
+disk (`.<name>.place-<random>`), and only the finished copy takes the disk's
+name, so a crash mid-copy leaves a partial at the temp name that the next
+import of that name removes at once. That second copy is reserved like the
+first, and a leftover there is moved aside to
+`<name>.orphan-<unix time>-<random>`.
+
 ## Snapshots
 
 ```bash

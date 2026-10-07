@@ -37,65 +37,6 @@ func TestImportVM_RefusedWhenThePoolFilesystemCannotHoldTheDisk(t *testing.T) {
 	}
 }
 
-// Imports on one host write one at a time: each checks free space before it
-// writes, and two that checked together would both pass against space only one
-// of them can have.
-func TestImportVM_WaitsForAnotherImportsWrites(t *testing.T) {
-	s := testServer(t)
-	s.dataDir = t.TempDir()
-	admissionHost(t, s)
-	s.virt = libvirtfake.New()
-	stubQemuImg(t)
-	release, err := s.acquireImportWrites(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer release()
-
-	raw := t.TempDir() + "/disk0.raw"
-	if err := writeFileHelper(raw, make([]byte, 1<<20)); err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithTimeout(adminCtx(), 300*time.Millisecond)
-	defer cancel()
-	st := &fakeImportStream{ctx: ctx, frames: []*pb.ImportVMRequest{{
-		Name: "imp-wait", SourceFormat: "proxmox",
-		Chunk:   []byte("name: imp-wait\ncores: 1\nmemory: 512\nscsi0: local-lvm:imp-wait-disk-0,size=1M\n"),
-		DiskMap: map[string]string{"scsi0": raw},
-	}}}
-	if err := s.ImportVM(st); status.Code(err) != codes.Aborted || !strings.Contains(err.Error(), "another import") {
-		t.Fatalf("import while another held the writes: %v, want it to wait for the slot and give up", err)
-	}
-	if rec, _ := corrosion.GetVM(context.Background(), s.db, "imp-wait"); rec != nil {
-		t.Fatal("an import that never got to write persisted a row")
-	}
-}
-
-func TestAcquireImportWrites_OneHolderAtATime(t *testing.T) {
-	s := &Server{}
-	release, err := s.acquireImportWrites(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
-	if _, err := s.acquireImportWrites(ctx); err == nil {
-		t.Fatal("a second import acquired the writes while the first held them")
-	}
-	release()
-	release() // releasing twice must not free a slot someone else holds
-	r2, err := s.acquireImportWrites(context.Background())
-	if err != nil {
-		t.Fatalf("after release: %v", err)
-	}
-	ctx3, cancel3 := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel3()
-	if _, err := s.acquireImportWrites(ctx3); err == nil {
-		t.Fatal("a double release let two imports hold the writes")
-	}
-	r2()
-}
-
 // stuckStream is a client that stops reading: Send blocks until the test ends.
 type stuckStream struct {
 	fakeImportStream
@@ -143,8 +84,9 @@ func smallImportFrame(t *testing.T, name string, inspect bool) *pb.ImportVMReque
 	}
 }
 
-// A client that stops reading its progress must not hold the host's import
-// writes: every other import on the host would wait for it forever.
+// A client that stops reading its progress must not hold the disk space its
+// import reserved: every other import on the host would be refused for as long
+// as it does not read.
 func TestImportVM_AClientThatStopsReadingDoesNotHoldOtherImports(t *testing.T) {
 	for _, inspect := range []bool{false, true} {
 		name := "stuck"
@@ -157,6 +99,11 @@ func TestImportVM_AClientThatStopsReadingDoesNotHoldOtherImports(t *testing.T) {
 			admissionHost(t, s)
 			s.virt = libvirtfake.New()
 			progressQemuImg(t)
+			// Room for one import's disk at a time: what the first reserved
+			// must be released before it waits on its client.
+			s.diskSpaceOverride = func(string) (uint64, uint64, error) {
+				return coldDiskHeadroom(100<<30) + 3*oneDiskNeed()/2, 100 << 30, nil
+			}
 
 			stuck := &stuckStream{
 				fakeImportStream: fakeImportStream{ctx: adminCtx(), frames: []*pb.ImportVMRequest{smallImportFrame(t, "imp-a", inspect)}},
@@ -171,6 +118,15 @@ func TestImportVM_AClientThatStopsReadingDoesNotHoldOtherImports(t *testing.T) {
 			case <-time.After(20 * time.Second):
 				t.Fatal("the first import never sent to its client")
 			}
+			// Its writes finish while its client is not reading; once they
+			// do, it holds no reservation.
+			deadline := time.Now().Add(10 * time.Second)
+			for heldImports(s) != 0 {
+				if time.Now().After(deadline) {
+					t.Fatal("an import waiting on its client still holds its reservation")
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
 
 			ctx, cancel := context.WithTimeout(adminCtx(), 10*time.Second)
 			defer cancel()
@@ -180,7 +136,7 @@ func TestImportVM_AClientThatStopsReadingDoesNotHoldOtherImports(t *testing.T) {
 			}
 
 			// Nor does it keep its unpacked source on disk while it waits.
-			deadline := time.Now().Add(10 * time.Second)
+			deadline = time.Now().Add(10 * time.Second)
 			for {
 				left, _ := filepath.Glob(filepath.Join(s.dataDir, "imports", "imp-a-*"))
 				if len(left) == 0 {
@@ -218,10 +174,17 @@ func TestConvertForeignDisk_RefusesAnImageLargerThanItsLimit(t *testing.T) {
 	if err := writeFileHelper(src, make([]byte, 4096)); err != nil {
 		t.Fatal(err)
 	}
-	if err := convertForeignDisk(context.Background(), src, "raw", filepath.Join(t.TempDir(), "out.qcow2"), dir, 1<<30, nil); err == nil {
+	if err := convertForeignDisk(context.Background(), src, "raw", filepath.Join(t.TempDir(), "out.qcow2"), dir, 1<<30, nil, nil); err == nil {
 		t.Fatal("an image whose virtual size is 32 TiB converted under a 1 GiB limit")
 	}
 	if b, _ := os.ReadFile(log); strings.Contains(string(b), "convert") {
 		t.Fatalf("qemu-img convert ran on an image past its limit: %s", b)
 	}
+}
+
+// heldImports is how many imports on s hold a reservation.
+func heldImports(s *Server) int {
+	s.importSpace.mu.Lock()
+	defer s.importSpace.mu.Unlock()
+	return len(s.importSpace.held)
 }

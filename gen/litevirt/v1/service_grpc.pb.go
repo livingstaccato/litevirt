@@ -303,6 +303,7 @@ const (
 	LiteVirt_ReleaseProjectCapacity_FullMethodName     = "/litevirt.v1.LiteVirt/ReleaseProjectCapacity"
 	LiteVirt_ReserveHostCapacity_FullMethodName        = "/litevirt.v1.LiteVirt/ReserveHostCapacity"
 	LiteVirt_ReleaseHostCapacity_FullMethodName        = "/litevirt.v1.LiteVirt/ReleaseHostCapacity"
+	LiteVirt_ImportLeftoverStatus_FullMethodName       = "/litevirt.v1.LiteVirt/ImportLeftoverStatus"
 )
 
 // LiteVirtClient is the client API for LiteVirt service.
@@ -872,6 +873,13 @@ type LiteVirtClient interface {
 	// ever terminates a capacity operation targeting the local host.
 	ReserveHostCapacity(ctx context.Context, in *ReserveHostCapacityRequest, opts ...grpc.CallOption) (*ReserveHostCapacityResponse, error)
 	ReleaseHostCapacity(ctx context.Context, in *ReleaseHostCapacityRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// ── Import leftovers on shared pools (peer-only) ──
+	//
+	// A host re-importing over a file in a pool it shares with other hosts asks
+	// them whether their own placement record shows that file as a leftover of
+	// a dead import of theirs, unchanged since. The answer comes from the
+	// answering host's record alone: it never opens a path the caller names.
+	ImportLeftoverStatus(ctx context.Context, in *ImportLeftoverStatusRequest, opts ...grpc.CallOption) (*ImportLeftoverStatusResponse, error)
 }
 
 type liteVirtClient struct {
@@ -4006,6 +4014,16 @@ func (c *liteVirtClient) ReleaseHostCapacity(ctx context.Context, in *ReleaseHos
 	return out, nil
 }
 
+func (c *liteVirtClient) ImportLeftoverStatus(ctx context.Context, in *ImportLeftoverStatusRequest, opts ...grpc.CallOption) (*ImportLeftoverStatusResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ImportLeftoverStatusResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_ImportLeftoverStatus_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // LiteVirtServer is the server API for LiteVirt service.
 // All implementations must embed UnimplementedLiteVirtServer
 // for forward compatibility.
@@ -4573,6 +4591,13 @@ type LiteVirtServer interface {
 	// ever terminates a capacity operation targeting the local host.
 	ReserveHostCapacity(context.Context, *ReserveHostCapacityRequest) (*ReserveHostCapacityResponse, error)
 	ReleaseHostCapacity(context.Context, *ReleaseHostCapacityRequest) (*emptypb.Empty, error)
+	// ── Import leftovers on shared pools (peer-only) ──
+	//
+	// A host re-importing over a file in a pool it shares with other hosts asks
+	// them whether their own placement record shows that file as a leftover of
+	// a dead import of theirs, unchanged since. The answer comes from the
+	// answering host's record alone: it never opens a path the caller names.
+	ImportLeftoverStatus(context.Context, *ImportLeftoverStatusRequest) (*ImportLeftoverStatusResponse, error)
 	mustEmbedUnimplementedLiteVirtServer()
 }
 
@@ -5431,6 +5456,9 @@ func (UnimplementedLiteVirtServer) ReserveHostCapacity(context.Context, *Reserve
 }
 func (UnimplementedLiteVirtServer) ReleaseHostCapacity(context.Context, *ReleaseHostCapacityRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method ReleaseHostCapacity not implemented")
+}
+func (UnimplementedLiteVirtServer) ImportLeftoverStatus(context.Context, *ImportLeftoverStatusRequest) (*ImportLeftoverStatusResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ImportLeftoverStatus not implemented")
 }
 func (UnimplementedLiteVirtServer) mustEmbedUnimplementedLiteVirtServer() {}
 func (UnimplementedLiteVirtServer) testEmbeddedByValue()                  {}
@@ -10223,6 +10251,24 @@ func _LiteVirt_ReleaseHostCapacity_Handler(srv interface{}, ctx context.Context,
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_ImportLeftoverStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ImportLeftoverStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ImportLeftoverStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ImportLeftoverStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ImportLeftoverStatus(ctx, req.(*ImportLeftoverStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // LiteVirt_ServiceDesc is the grpc.ServiceDesc for LiteVirt service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -11201,6 +11247,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ReleaseHostCapacity",
 			Handler:    _LiteVirt_ReleaseHostCapacity_Handler,
+		},
+		{
+			MethodName: "ImportLeftoverStatus",
+			Handler:    _LiteVirt_ImportLeftoverStatus_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

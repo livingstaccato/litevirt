@@ -240,7 +240,7 @@ func TestParseVMA_RawEndToEnd(t *testing.T) {
 	vma, devData := buildSyntheticVMA(t)
 	dest := t.TempDir()
 
-	fv, err := ParseVMA(context.Background(), bytes.NewReader(vma), dest, 1<<40)
+	fv, err := ParseVMA(context.Background(), bytes.NewReader(vma), dest, Budget(1<<40))
 	if err != nil {
 		t.Fatalf("ParseVMA: %v", err)
 	}
@@ -318,7 +318,7 @@ func TestParseVMA_ZstdRoundTrip(t *testing.T) {
 	}
 
 	dest := t.TempDir()
-	fv, err := ParseVMA(context.Background(), bytes.NewReader(buf.Bytes()), dest, 1<<40)
+	fv, err := ParseVMA(context.Background(), bytes.NewReader(buf.Bytes()), dest, Budget(1<<40))
 	if err != nil {
 		t.Fatalf("ParseVMA(.vma.zst): %v", err)
 	}
@@ -336,14 +336,14 @@ func TestParseVMA_ZstdRoundTrip(t *testing.T) {
 
 func TestParseVMA_RejectsBadMagic(t *testing.T) {
 	// gzip wrapper is detected, but a bogus magic inside should error cleanly.
-	if _, err := ParseVMA(context.Background(), bytes.NewReader([]byte("not a vma stream at all")), t.TempDir(), 1<<40); err == nil {
+	if _, err := ParseVMA(context.Background(), bytes.NewReader([]byte("not a vma stream at all")), t.TempDir(), Budget(1<<40)); err == nil {
 		t.Error("expected an error for a non-VMA stream")
 	}
 }
 
 func TestParseVMA_RejectsLZO(t *testing.T) {
 	lzo := append([]byte{0x89, 'L', 'Z', 'O'}, make([]byte, 16)...)
-	_, err := ParseVMA(context.Background(), bytes.NewReader(lzo), t.TempDir(), 1<<40)
+	_, err := ParseVMA(context.Background(), bytes.NewReader(lzo), t.TempDir(), Budget(1<<40))
 	if err == nil || !bytes.Contains([]byte(err.Error()), []byte("lzo")) {
 		t.Errorf("want an lzo-unsupported error, got %v", err)
 	}
@@ -353,7 +353,7 @@ func TestParseVMA_MissingConf(t *testing.T) {
 	b := newVMABuilder()
 	b.addDevice(1, "drive-scsi0", vmaClusterSize)
 	vma, _ := b.build()
-	if _, err := ParseVMA(context.Background(), bytes.NewReader(vma), t.TempDir(), 1<<40); err == nil {
+	if _, err := ParseVMA(context.Background(), bytes.NewReader(vma), t.TempDir(), Budget(1<<40)); err == nil {
 		t.Error("expected an error when qemu-server.conf is absent")
 	}
 }
@@ -367,7 +367,7 @@ func TestParseVMA_FullClusterPath(t *testing.T) {
 	vma, devData := b.build()
 
 	dest := t.TempDir()
-	fv, err := ParseVMA(context.Background(), bytes.NewReader(vma), dest, 1<<40)
+	fv, err := ParseVMA(context.Background(), bytes.NewReader(vma), dest, Budget(1<<40))
 	if err != nil {
 		t.Fatalf("ParseVMA: %v", err)
 	}

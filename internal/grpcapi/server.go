@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/netip"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -581,6 +582,12 @@ type Server struct {
 	// (pool_records.go).
 	epochCache   sync.Map
 	hostStoresMu sync.Mutex
+	// importPrunes is the pool directories whose placement-record prune is
+	// running (vmimport_placement.go). Zero value ready.
+	importPrunes sync.Map
+	// placementLstatOverride is a TEST SEAM for the prune's stat; nil in
+	// production.
+	placementLstatOverride func(string) (os.FileInfo, error)
 
 	// migrationStubs is what EnsureDisks created on this host as a migration
 	// target: the only disk files this host hands to a mirror or removes after
@@ -619,11 +626,13 @@ type Server struct {
 	// migration's disk copy (diskSpace). Nil in production.
 	diskSpaceOverride func(dir string) (avail, total uint64, err error)
 
-	// importWriteSlot admits one import's disk-writing phase at a time on this
-	// host (acquireImportWrites), so the free-space checks before each write
-	// are not glances two imports pass together. Made on first use.
-	importWriteSlot chan struct{}
-	importWriteOnce sync.Once
+	// importSpace holds the disk space each running import on this host has
+	// reserved and not yet written (reserveImportSpace), so the free-space
+	// checks before each write are not glances two imports pass together.
+	importSpace importSpaceLedger
+	// fsKeyOverride is a TEST SEAM naming the filesystem a directory is on,
+	// for the import space ledger (importFSKey). Nil in production.
+	fsKeyOverride func(dir string) string
 
 	// firmwareTargets is what EnsureFirmwareState defined on this host as a
 	// cold firmware migration target, by attempt: the only domains

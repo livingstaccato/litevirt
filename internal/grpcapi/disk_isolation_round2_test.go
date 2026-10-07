@@ -274,11 +274,12 @@ func TestPoolIdentity_NFSIsTheExport(t *testing.T) {
 }
 
 // The receiver is proved BEFORE the full replica's local copy is made: a run
-// against a host that cannot record replicas spends nothing on it. The source
-// here cannot even be copied, so a copy-first order fails on the copy.
+// against a host that cannot say whether it records replicas spends nothing
+// on it. The source here cannot even be copied, so a copy-first order fails
+// on the copy.
 func TestReplicateCrossHost_ProvesTheReceiverBeforeCopying(t *testing.T) {
 	f := newPoolFixture(t)
-	old := &oldReceiver{}
+	old := &unsureReceiver{}
 	f.s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {
 		return old, func() {}, nil
 	}

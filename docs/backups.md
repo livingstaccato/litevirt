@@ -280,12 +280,17 @@ RPC reaches the area: uploads refuse dotted names, listings skip directories.
 A cross-host replica is sent with its record over the peer-only `PushReplica`
 (incremental ones over `PushReplicaIncrement`, which also carries the record),
 and pruned on the peer through the peer-only `PruneReplicas`. Before a byte is
-sent, the sender asks the receiver for the VM's records (`ListReplicas`); a
-receiver that cannot answer — an older build — is refused, so no replica ever
-lands unrecorded in its pool. During a roll, replication to hosts not yet
-upgraded therefore stops until they are; and a sender still on the older build
-prunes the new hosts' pools by name until it is upgraded too. A pruned
-replica is never one a VM disk on any host references.
+sent, the sender asks the receiver for the VM's records (`ListReplicas`). A
+receiver on an older build (it has no `ListReplicas`) is sent the replica the
+way that build receives one: a `<vm>-<disk>-<time>.<ext>` file at its pool's
+top level (an upload, or an incremental push forked from its newest top-level
+raw replica of the disk), which its failover promotes as before; it is pruned
+there by name, to `--keep`. A receiver that cannot answer at all is sent
+nothing. During a roll, a new host also takes an older sender's record-less
+incremental push, at the pool's top level, only under the exact
+`<vm>-<disk>-<time>.raw` name of one VM disk on the cluster and forked only
+from a top-level raw replica of that disk. A pruned replica is never one a VM
+disk on any host references.
 
 The owner directory is keyed by project and VM name: a VM deleted and
 re-created under the same name in the same project inherits the earlier VM's
@@ -300,7 +305,10 @@ promotable: promotion and failover choose the newest of a disk's replicas from
 both places, a top-level one by its pool record, or an unrecorded one by its
 exact name ([storage.md](storage.md#uploads)). A run's `--keep` counts them
 after the area's: once the area holds `keep` replicas of the disk, the
-top-level ones are pruned too (never one a VM disk uses).
+top-level ones are pruned too (never one a VM disk uses) — but only once every
+host answers `ListReplicas`. While any host is on an older build, or cannot
+be asked, the top-level replicas are kept to `keep` as that build kept them,
+since its failover coordinator sees nothing else.
 
 Manage it from the **Replication** section of the `/schedules` UI or the CLI:
 

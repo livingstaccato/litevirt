@@ -220,14 +220,27 @@ func TestISORound4_OneProbeInFlightPerDirectory(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	start := time.Now()
-	for i := 0; i < 100; i++ {
-		if _, err := probeDir(dead); err == nil {
-			t.Fatal("a probe of an unanswering directory answered")
+	// From here a probe that is not answered from the cache would wait for
+	// the blocked one for an hour: the later probes must all return at once,
+	// whatever the machine's speed (the race detector slows each tenfold).
+	isoDirProbeTimeout = time.Hour
+	later := make(chan error, 1)
+	go func() {
+		for i := 0; i < 100; i++ {
+			if _, err := probeDir(dead); err == nil {
+				later <- errors.New("a probe of an unanswering directory answered")
+				return
+			}
 		}
-	}
-	if d := time.Since(start); d > isoDirProbeTimeout {
-		t.Errorf("100 later probes took %s: the failure was not answered from the cache", d)
+		later <- nil
+	}()
+	select {
+	case err := <-later:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("100 later probes waited for the blocked one: the failure was not answered from the cache")
 	}
 	if n := calls.Load(); n != 1 {
 		t.Fatalf("%d probes of the one unanswering directory are blocked; want 1", n)

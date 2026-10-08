@@ -20,6 +20,53 @@ const (
 	domainSavePaused  = 4 // VIR_DOMAIN_SAVE_PAUSED  — save/restore as paused
 )
 
+// snapshotAPI is the part of libvirt the snapshot reverts and delete use. It
+// is *golibvirt.Libvirt in production; the tests run the same code against a
+// model of libvirt 10.0's external-snapshot rules.
+type snapshotAPI interface {
+	DomainLookupByName(name string) (golibvirt.Domain, error)
+	DomainGetState(dom golibvirt.Domain, flags uint32) (int32, int32, error)
+	DomainGetXMLDesc(dom golibvirt.Domain, flags golibvirt.DomainXMLFlags) (string, error)
+	DomainDestroy(dom golibvirt.Domain) error
+	DomainUndefineFlags(dom golibvirt.Domain, flags golibvirt.DomainUndefineFlagsValues) error
+	DomainDefineXML(xml string) (golibvirt.Domain, error)
+	DomainCreate(dom golibvirt.Domain) error
+	DomainResume(dom golibvirt.Domain) error
+	DomainRestoreFlags(from string, dxml golibvirt.OptString, flags uint32) error
+	DomainSaveImageGetXMLDesc(file string, flags uint32) (string, error)
+	DomainSnapshotLookupByName(dom golibvirt.Domain, name string, flags uint32) (golibvirt.DomainSnapshot, error)
+	DomainSnapshotGetXMLDesc(snap golibvirt.DomainSnapshot, flags uint32) (string, error)
+	DomainSnapshotCreateXML(dom golibvirt.Domain, xml string, flags uint32) (golibvirt.DomainSnapshot, error)
+	DomainSnapshotDelete(snap golibvirt.DomainSnapshot, flags golibvirt.DomainSnapshotDeleteFlags) error
+	DomainSnapshotCurrent(dom golibvirt.Domain, flags uint32) (golibvirt.DomainSnapshot, error)
+	DomainSnapshotNumChildren(snap golibvirt.DomainSnapshot, flags uint32) (int32, error)
+}
+
+var _ snapshotAPI = (*golibvirt.Libvirt)(nil)
+
+// How long a revert waits for an undefine to land, per poll and once after.
+// Variables so the tests run without the real waits.
+var (
+	revertUndefinePoll   = 250 * time.Millisecond
+	revertUndefineSettle = time.Second
+)
+
+func startDomain(v snapshotAPI, name string) error {
+	dom, err := v.DomainLookupByName(name)
+	if err != nil {
+		return fmt.Errorf("lookup domain %s: %w", name, err)
+	}
+	if err := v.DomainCreate(dom); err != nil {
+		return fmt.Errorf("start domain %s: %w", name, err)
+	}
+	return nil
+}
+
+func domainExists(v snapshotAPI, name string) bool {
+	_, err := v.DomainLookupByName(name)
+	return err == nil
+}
+
 // CreateSnapshot takes an external disk-only snapshot of a VM.
 // External snapshots work with UEFI/pflash firmware (no qcow2 nvram required).
 // Returns the allocation size (bytes) of the disk at the time of the snapshot.
@@ -75,19 +122,23 @@ func (c *Client) ListSnapshots(domainName string) ([]string, error) {
 // the snapshot's sidecar right before the domain is redefined, so reverted disks
 // and firmware are a consistent set (G1).
 func (c *Client) RevertToSnapshot(domainName, snapshotName string, restorePreDefine func() error) error {
-	dom, err := c.virt.DomainLookupByName(domainName)
+	return revertToSnapshot(c.virt, domainName, snapshotName, restorePreDefine)
+}
+
+func revertToSnapshot(v snapshotAPI, domainName, snapshotName string, restorePreDefine func() error) error {
+	dom, err := v.DomainLookupByName(domainName)
 	if err != nil {
 		return fmt.Errorf("lookup domain %q: %w", domainName, err)
 	}
 
-	snap, err := c.virt.DomainSnapshotLookupByName(dom, snapshotName, 0)
+	snap, err := v.DomainSnapshotLookupByName(dom, snapshotName, 0)
 	if err != nil {
 		return fmt.Errorf("snapshot %q not found: %w", snapshotName, err)
 	}
 
 	// The snapshot XML embeds the <domain> as it was at snapshot time — its disk
 	// <source file/> entries are the (frozen) base paths.
-	snapXML, err := c.virt.DomainSnapshotGetXMLDesc(snap, 0)
+	snapXML, err := v.DomainSnapshotGetXMLDesc(snap, 0)
 	if err != nil {
 		return fmt.Errorf("get snapshot XML: %w", err)
 	}
@@ -97,7 +148,7 @@ func (c *Client) RevertToSnapshot(domainName, snapshotName string, restorePreDef
 	}
 
 	// Current (live) domain XML has the overlay paths the snapshot cut over to.
-	domXML, err := c.virt.DomainGetXMLDesc(dom, 0)
+	domXML, err := v.DomainGetXMLDesc(dom, 0)
 	if err != nil {
 		return fmt.Errorf("get domain XML: %w", err)
 	}
@@ -116,23 +167,23 @@ func (c *Client) RevertToSnapshot(domainName, snapshotName string, restorePreDef
 
 	// Inactive XML still references the overlay paths — redefine with it
 	// unchanged after the overlays are reset (no path swap).
-	inactiveXML, err := c.virt.DomainGetXMLDesc(dom, golibvirt.DomainXMLInactive)
+	inactiveXML, err := v.DomainGetXMLDesc(dom, golibvirt.DomainXMLInactive)
 	if err != nil {
 		inactiveXML = domXML
 	}
 
 	// Destroy the running domain — but skip if it's already shut off, so
 	// reverting a STOPPED VM works instead of erroring "domain is not running".
-	if st, _, sErr := c.virt.DomainGetState(dom, 0); sErr == nil && st != int32(golibvirt.DomainShutoff) {
-		if err := c.virt.DomainDestroy(dom); err != nil {
+	if st, _, sErr := v.DomainGetState(dom, 0); sErr == nil && st != int32(golibvirt.DomainShutoff) {
+		if err := v.DomainDestroy(dom); err != nil {
 			return fmt.Errorf("destroy domain before revert: %w", err)
 		}
 		for i := 0; i < 30; i++ {
-			dom2, lookupErr := c.virt.DomainLookupByName(domainName)
+			dom2, lookupErr := v.DomainLookupByName(domainName)
 			if lookupErr != nil {
 				break
 			}
-			state, _, _ := c.virt.DomainGetState(dom2, 0)
+			state, _, _ := v.DomainGetState(dom2, 0)
 			if state == int32(golibvirt.DomainShutoff) {
 				break
 			}
@@ -142,17 +193,17 @@ func (c *Client) RevertToSnapshot(domainName, snapshotName string, restorePreDef
 
 	// Delete snapshot metadata (we manage overlay files ourselves) and undefine
 	// to release virtlockd locks.
-	_ = c.virt.DomainSnapshotDelete(snap, golibvirt.DomainSnapshotDeleteMetadataOnly)
-	if d, e := c.virt.DomainLookupByName(domainName); e == nil {
-		_ = c.virt.DomainUndefineFlags(d, golibvirt.DomainUndefineFlagsValues(golibvirt.DomainUndefineKeepNvram|golibvirt.DomainUndefineKeepTpm))
+	_ = v.DomainSnapshotDelete(snap, golibvirt.DomainSnapshotDeleteMetadataOnly)
+	if d, e := v.DomainLookupByName(domainName); e == nil {
+		_ = v.DomainUndefineFlags(d, golibvirt.DomainUndefineFlagsValues(golibvirt.DomainUndefineKeepNvram|golibvirt.DomainUndefineKeepTpm))
 	}
 	for i := 0; i < 20; i++ {
-		time.Sleep(250 * time.Millisecond)
-		if !c.DomainExists(domainName) {
+		time.Sleep(revertUndefinePoll)
+		if !domainExists(v, domainName) {
 			break
 		}
 	}
-	time.Sleep(time.Second)
+	time.Sleep(revertUndefineSettle)
 
 	// Disk revert: reset each overlay to an empty qcow2 over its frozen base.
 	// All post-snapshot writes (in the old overlay) are discarded.
@@ -171,7 +222,7 @@ func (c *Client) RevertToSnapshot(domainName, snapshotName string, restorePreDef
 	}
 
 	// Redefine with the original (overlay-pointing) XML.
-	if _, err := c.virt.DomainDefineXML(inactiveXML); err != nil {
+	if _, err := v.DomainDefineXML(inactiveXML); err != nil {
 		return fmt.Errorf("redefine domain after revert: %w", err)
 	}
 
@@ -182,22 +233,22 @@ func (c *Client) RevertToSnapshot(domainName, snapshotName string, restorePreDef
 	// the snapshot survives even if the start below fails and the operator
 	// retries. The overlay is freshly reset over the same base, so the recorded
 	// point still holds. Best-effort.
-	if redom, lerr := c.virt.DomainLookupByName(domainName); lerr == nil {
-		_, _ = c.virt.DomainSnapshotCreateXML(redom, snapXML, uint32(golibvirt.DomainSnapshotCreateRedefine))
+	if redom, lerr := v.DomainLookupByName(domainName); lerr == nil {
+		_, _ = v.DomainSnapshotCreateXML(redom, snapXML, uint32(golibvirt.DomainSnapshotCreateRedefine))
 	}
 
 	// Start, retrying on any residual lock-release race (the base stays
 	// read-only now, so this should not normally trigger).
 	var startErr error
 	for i := 0; i < 10; i++ {
-		if startErr = c.StartDomain(domainName); startErr == nil {
+		if startErr = startDomain(v, domainName); startErr == nil {
 			return nil
 		}
 		if !strings.Contains(startErr.Error(), "lock") {
 			return fmt.Errorf("start domain %s after revert: %w", domainName, startErr)
 		}
-		if d, e := c.virt.DomainLookupByName(domainName); e == nil {
-			_ = c.virt.DomainDestroy(d) // drop any partial lock; keeps the definition
+		if d, e := v.DomainLookupByName(domainName); e == nil {
+			_ = v.DomainDestroy(d) // drop any partial lock; keeps the definition
 		}
 		time.Sleep(2 * time.Second)
 	}
@@ -285,17 +336,21 @@ func (c *Client) waitBlockJobReady(dom golibvirt.Domain, dev string) error {
 
 // DeleteSnapshot removes a named snapshot from a domain.
 func (c *Client) DeleteSnapshot(domainName, snapshotName string) error {
-	dom, err := c.virt.DomainLookupByName(domainName)
+	return deleteSnapshot(c.virt, domainName, snapshotName)
+}
+
+func deleteSnapshot(v snapshotAPI, domainName, snapshotName string) error {
+	dom, err := v.DomainLookupByName(domainName)
 	if err != nil {
 		return fmt.Errorf("lookup domain %q: %w", domainName, err)
 	}
 
-	snap, err := c.virt.DomainSnapshotLookupByName(dom, snapshotName, 0)
+	snap, err := v.DomainSnapshotLookupByName(dom, snapshotName, 0)
 	if err != nil {
 		return fmt.Errorf("snapshot %q not found: %w", snapshotName, err)
 	}
 
-	return c.virt.DomainSnapshotDelete(snap, golibvirt.DomainSnapshotDeleteFlags(0))
+	return v.DomainSnapshotDelete(snap, golibvirt.DomainSnapshotDeleteFlags(0))
 }
 
 // CreateLiveSnapshot captures both the guest's disks AND its RAM/CPU state at a
@@ -399,20 +454,24 @@ func (c *Client) CreateLiveSnapshot(domainName, snapshotName, vmstatePath string
 // at the files judged on this host): it is passed to the restore as its
 // replacement XML and defined persistently. An error refuses the revert.
 func (c *Client) RevertToLiveSnapshot(domainName, snapshotName, vmstatePath string, restorePreDefine func() error, rewriteSaved func(savedXML string) (string, error)) error {
+	return revertToLiveSnapshot(c.virt, domainName, snapshotName, vmstatePath, restorePreDefine, rewriteSaved)
+}
+
+func revertToLiveSnapshot(v snapshotAPI, domainName, snapshotName, vmstatePath string, restorePreDefine func() error, rewriteSaved func(savedXML string) (string, error)) error {
 	// Pre-flight: never start tearing the VM down if the RAM image is gone.
 	if _, err := os.Stat(vmstatePath); err != nil {
 		return fmt.Errorf("vmstate image %q missing — cannot restore memory snapshot: %w", vmstatePath, err)
 	}
 
-	dom, err := c.virt.DomainLookupByName(domainName)
+	dom, err := v.DomainLookupByName(domainName)
 	if err != nil {
 		return fmt.Errorf("lookup domain %q: %w", domainName, err)
 	}
-	snap, err := c.virt.DomainSnapshotLookupByName(dom, snapshotName, 0)
+	snap, err := v.DomainSnapshotLookupByName(dom, snapshotName, 0)
 	if err != nil {
 		return fmt.Errorf("snapshot %q not found: %w", snapshotName, err)
 	}
-	snapXML, err := c.virt.DomainSnapshotGetXMLDesc(snap, 0)
+	snapXML, err := v.DomainSnapshotGetXMLDesc(snap, 0)
 	if err != nil {
 		return fmt.Errorf("get snapshot XML: %w", err)
 	}
@@ -420,7 +479,7 @@ func (c *Client) RevertToLiveSnapshot(domainName, snapshotName, vmstatePath stri
 	if len(origDisks) == 0 {
 		return fmt.Errorf("snapshot %q: no disk sources found in snapshot XML", snapshotName)
 	}
-	domXML, err := c.virt.DomainGetXMLDesc(dom, 0)
+	domXML, err := v.DomainGetXMLDesc(dom, 0)
 	if err != nil {
 		return fmt.Errorf("get domain XML: %w", err)
 	}
@@ -440,7 +499,7 @@ func (c *Client) RevertToLiveSnapshot(domainName, snapshotName, vmstatePath stri
 
 	// The saved image's domain XML references the overlay paths — keep it as-is
 	// for the persistent redefine after restore.
-	savedXML, err := c.virt.DomainSaveImageGetXMLDesc(vmstatePath, 0)
+	savedXML, err := v.DomainSaveImageGetXMLDesc(vmstatePath, 0)
 	if err != nil {
 		return fmt.Errorf("read saved image XML: %w", err)
 	}
@@ -448,7 +507,7 @@ func (c *Client) RevertToLiveSnapshot(domainName, snapshotName, vmstatePath stri
 	if rewriteSaved != nil {
 		// Secure: the replacement must keep the graphics password the saved
 		// image carries.
-		secure, err := c.virt.DomainSaveImageGetXMLDesc(vmstatePath, uint32(golibvirt.DomainSaveImageXMLSecure))
+		secure, err := v.DomainSaveImageGetXMLDesc(vmstatePath, uint32(golibvirt.DomainSaveImageXMLSecure))
 		if err != nil {
 			return fmt.Errorf("read saved image XML: %w", err)
 		}
@@ -462,15 +521,15 @@ func (c *Client) RevertToLiveSnapshot(domainName, snapshotName, vmstatePath stri
 	}
 
 	// Destroy the running domain and wait for shutoff.
-	if err := c.virt.DomainDestroy(dom); err != nil {
+	if err := v.DomainDestroy(dom); err != nil {
 		return fmt.Errorf("destroy domain before revert: %w", err)
 	}
 	for i := 0; i < 30; i++ {
-		dom2, lookupErr := c.virt.DomainLookupByName(domainName)
+		dom2, lookupErr := v.DomainLookupByName(domainName)
 		if lookupErr != nil {
 			break
 		}
-		st, _, _ := c.virt.DomainGetState(dom2, 0)
+		st, _, _ := v.DomainGetState(dom2, 0)
 		if st == int32(golibvirt.DomainShutoff) {
 			break
 		}
@@ -478,18 +537,18 @@ func (c *Client) RevertToLiveSnapshot(domainName, snapshotName, vmstatePath stri
 	}
 
 	// Delete snapshot metadata (we manage the overlay files ourselves).
-	_ = c.virt.DomainSnapshotDelete(snap, golibvirt.DomainSnapshotDeleteMetadataOnly)
+	_ = v.DomainSnapshotDelete(snap, golibvirt.DomainSnapshotDeleteMetadataOnly)
 
 	// Undefine to release virtlockd locks (mirrors the disk-only revert).
-	dom, _ = c.virt.DomainLookupByName(domainName)
-	_ = c.virt.DomainUndefineFlags(dom, golibvirt.DomainUndefineFlagsValues(golibvirt.DomainUndefineKeepNvram|golibvirt.DomainUndefineKeepTpm))
+	dom, _ = v.DomainLookupByName(domainName)
+	_ = v.DomainUndefineFlags(dom, golibvirt.DomainUndefineFlagsValues(golibvirt.DomainUndefineKeepNvram|golibvirt.DomainUndefineKeepTpm))
 	for i := 0; i < 20; i++ {
-		time.Sleep(250 * time.Millisecond)
-		if !c.DomainExists(domainName) {
+		time.Sleep(revertUndefinePoll)
+		if !domainExists(v, domainName) {
 			break
 		}
 	}
-	time.Sleep(time.Second)
+	time.Sleep(revertUndefineSettle)
 
 	// Reset each overlay to empty over its (frozen) base — this is the disk
 	// revert: all post-snapshot writes (in the old overlay) are discarded.
@@ -512,10 +571,10 @@ func (c *Client) RevertToLiveSnapshot(domainName, snapshotName, vmstatePath stri
 	// needed for them; the chain is overlay→base→image with no file opened
 	// twice. Its CD-ROMs are the files judged here (rewriteSaved), when they
 	// differ.
-	if err := c.restoreWithRetry(domainName, vmstatePath, restoreXML); err != nil {
+	if err := restoreWithRetry(v, domainName, vmstatePath, restoreXML); err != nil {
 		return fmt.Errorf("restore guest memory: %w", err)
 	}
-	if _, err := c.virt.DomainDefineXML(savedXML); err != nil {
+	if _, err := v.DomainDefineXML(savedXML); err != nil {
 		// Running instance is fine; it just isn't persistent yet. Surface it so
 		// the operator knows a stop would lose the definition.
 		return fmt.Errorf("revert restored the running VM but re-defining it persistently failed: %w", err)
@@ -525,8 +584,8 @@ func (c *Client) RevertToLiveSnapshot(domainName, snapshotName, vmstatePath stri
 	// (best-effort) so the snapshot stays revertible AND deletable — the overlay
 	// is freshly reset over the same base, so the recorded snapshot point still
 	// holds. A failure here is non-fatal: the revert already succeeded.
-	if redom, lerr := c.virt.DomainLookupByName(domainName); lerr == nil {
-		_, _ = c.virt.DomainSnapshotCreateXML(redom, snapXML, uint32(golibvirt.DomainSnapshotCreateRedefine))
+	if redom, lerr := v.DomainLookupByName(domainName); lerr == nil {
+		_, _ = v.DomainSnapshotCreateXML(redom, snapXML, uint32(golibvirt.DomainSnapshotCreateRedefine))
 	}
 	return nil
 }
@@ -561,6 +620,10 @@ func resetOverlay(overlay, base string) error {
 // attempts we destroy any partial domain and wait for the lease to release —
 // sanlock/lockd leases can take longer than a single second.
 func (c *Client) restoreWithRetry(domainName, vmstatePath, dxml string) error {
+	return restoreWithRetry(c.virt, domainName, vmstatePath, dxml)
+}
+
+func restoreWithRetry(v snapshotAPI, domainName, vmstatePath, dxml string) error {
 	var dxmlOpt golibvirt.OptString
 	if dxml != "" {
 		dxmlOpt = golibvirt.OptString{dxml}
@@ -572,7 +635,7 @@ func (c *Client) restoreWithRetry(domainName, vmstatePath, dxml string) error {
 	// resume into a separate, retried DomainResume lets the lease settle.
 	var err error
 	for i := 0; i < 8; i++ {
-		err = c.virt.DomainRestoreFlags(vmstatePath, dxmlOpt, uint32(domainSavePaused))
+		err = v.DomainRestoreFlags(vmstatePath, dxmlOpt, uint32(domainSavePaused))
 		if err == nil {
 			break
 		}
@@ -580,19 +643,19 @@ func (c *Client) restoreWithRetry(domainName, vmstatePath, dxml string) error {
 		if !strings.Contains(msg, "lock") && !strings.Contains(msg, "already") {
 			return err
 		}
-		c.forceRemoveDomain(domainName) // clear any partial domain holding the lock
+		forceRemoveDomain(v, domainName) // clear any partial domain holding the lock
 		time.Sleep(3 * time.Second)
 	}
 	if err != nil {
 		return err
 	}
 	// The domain is restored and paused, holding its disk locks. Resume the CPU.
-	dom, lerr := c.virt.DomainLookupByName(domainName)
+	dom, lerr := v.DomainLookupByName(domainName)
 	if lerr != nil {
 		return fmt.Errorf("lookup restored domain: %w", lerr)
 	}
 	for i := 0; i < 6; i++ {
-		if err = c.virt.DomainResume(dom); err == nil {
+		if err = v.DomainResume(dom); err == nil {
 			return nil
 		}
 		if !strings.Contains(err.Error(), "lock") {
@@ -605,14 +668,14 @@ func (c *Client) restoreWithRetry(domainName, vmstatePath, dxml string) error {
 
 // forceRemoveDomain destroys (if up) and undefines (if defined) a domain so a
 // subsequent restore starts from a clean slate and the disk lease is released.
-func (c *Client) forceRemoveDomain(domainName string) {
-	d, e := c.virt.DomainLookupByName(domainName)
+func forceRemoveDomain(v snapshotAPI, domainName string) {
+	d, e := v.DomainLookupByName(domainName)
 	if e != nil {
 		return
 	}
-	_ = c.virt.DomainDestroy(d) // no-op/err if already shut off
-	if d2, e2 := c.virt.DomainLookupByName(domainName); e2 == nil {
-		_ = c.virt.DomainUndefineFlags(d2, golibvirt.DomainUndefineFlagsValues(golibvirt.DomainUndefineKeepNvram|golibvirt.DomainUndefineKeepTpm))
+	_ = v.DomainDestroy(d) // no-op/err if already shut off
+	if d2, e2 := v.DomainLookupByName(domainName); e2 == nil {
+		_ = v.DomainUndefineFlags(d2, golibvirt.DomainUndefineFlagsValues(golibvirt.DomainUndefineKeepNvram|golibvirt.DomainUndefineKeepTpm))
 	}
 }
 

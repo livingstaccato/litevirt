@@ -20,7 +20,11 @@ only.
 Tracing/OTLP export is **inert until you configure an endpoint**. With no
 endpoint:
 
-- logs still emit locally as structured JSON (via the default `slog` logger),
+- logs still emit locally through a plain stdlib `slog` handler — console
+  text by default (`log_format: json` for structured) — never the vendor
+  logger and never Go's own stock `slog.Default()`, so the level and every
+  attr stay real record fields instead of being folded into the message
+  text, and `token=` capability lines are never vendor-redacted,
 - traces are no-ops,
 - **no otel handler is attached to any gRPC path** — zero overhead.
 
@@ -70,9 +74,12 @@ honored directly if you prefer them.
 ### Turning export off
 
 The endpoint **is** the switch: with no endpoint resolved, nothing exports, no
-otel handler attaches to any gRPC path, and local logging stays on the stock
-handler. But env wins over config — clearing `telemetry.otlp_endpoint` in
-`config.yaml` does **not** disable export while `LITEVIRT_OTEL_ENDPOINT` (or
+otel handler attaches to any gRPC path, and local logging stays on a plain
+stdlib handler — never the vendor logger, and never Go's own stock
+`slog.Default()`, which would fold the level into the message text and lose
+it to anything downstream. But env wins over config — clearing
+`telemetry.otlp_endpoint` in `config.yaml` does **not** disable export while
+`LITEVIRT_OTEL_ENDPOINT` (or
 `OTEL_EXPORTER_OTLP_ENDPOINT`) is still set in the daemon's environment, e.g. in
 the systemd unit. To turn export off, clear the config field **and** any
 endpoint env vars, then restart the daemon.

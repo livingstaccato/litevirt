@@ -6,6 +6,8 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/litevirt/litevirt/internal/testkit/slogtest"
 )
 
 // TestBootstrapDefaultLogger_RealWarnKeepsLevelAndAttrs reproduces the real
@@ -17,8 +19,12 @@ import (
 // the text, attrs stringified after it — with no distinct level=/attr
 // fields for anything downstream to parse.
 func TestBootstrapDefaultLogger_RealWarnKeepsLevelAndAttrs(t *testing.T) {
-	before := slog.Default()
-	t.Cleanup(func() { slog.SetDefault(before) })
+	// bootstrapDefaultLogger calls slog.SetDefault itself, so this must save
+	// and restore around it, not just save/restore slog.Default() — see
+	// internal/testkit/slogtest's doc for why a naive restore here would
+	// permanently misroute stdlib log's output for the rest of this test
+	// binary whenever slog.Default() starts out as Go's stock handler.
+	slogtest.SaveRestore(t)
 
 	r, w, err := os.Pipe()
 	if err != nil {

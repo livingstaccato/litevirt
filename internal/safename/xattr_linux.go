@@ -10,7 +10,6 @@ import (
 
 var lsetxattr = func(p, name string, v []byte) error { return unix.Lsetxattr(p, name, v, 0) }
 
-
 // cannotStoreHere reports whether err says this attribute cannot be stored on
 // this filesystem — dropped as main dropped every attribute — rather than a
 // real failure: no support (ENOTSUP), no xattr space (ENOSPC, E2BIG, ERANGE),

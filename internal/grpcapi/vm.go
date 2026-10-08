@@ -1995,6 +1995,12 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		s.audit(ctx, "vm.delete", req.Name, "permission denied", "denied")
 		return nil, err
 	}
+	// A bound delete (a stack teardown) deletes only the VM it was bound
+	// to. Checked on every host the delete reaches, against that host's row
+	// under the lock, before anything is forwarded or torn down.
+	if err := checkDeleteBinding(req, vm); err != nil {
+		return nil, err
+	}
 
 	// localOnly: this is a peer-search probe from another node's DeleteVM. Such a
 	// probe must NOT proxy back to the recorded host or re-fan-out to peers —

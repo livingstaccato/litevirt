@@ -225,7 +225,19 @@ message StartVMRequest   { string name = 1;
     bool allow_overcommit = 2; }
 message StopVMRequest    { string name = 1; bool force = 2; int32 timeout = 3; }
 message RestartVMRequest { string name = 1; }
-message DeleteVMRequest    { string name = 1; bool keep_disks = 2; }
+message DeleteVMRequest    {
+    string name = 1;
+    bool keep_disks = 2;
+    // Binds the delete to the VM its caller saw; every host the delete
+    // reaches checks its own row under the VM's lock and deletes nothing on a
+    // mismatch (FailedPrecondition). Empty = unbound (an operator's delete).
+    // expected_stack: the row must record this stack (vms.stack_name, stamped
+    // when the stack created it) — a stack teardown deletes only its members.
+    string expected_stack = 3;
+    // expected_created_at: the row must be this incarnation (vms.created_at,
+    // exactly as recorded).
+    string expected_created_at = 4;
+}
 
 // RepairVMOwner re-stamps a VM's ownership (host_name + running state) with a
 // fresh timestamp on the host that actually runs it — the narrow, audited repair

@@ -2,13 +2,16 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 
@@ -320,7 +323,12 @@ func (s *Server) RestoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotReq
 			return nil, status.Errorf(codes.Unavailable, "cannot reach host %s: %v", vm.HostName, err)
 		}
 		defer conn.Close()
-		return client.RestoreSnapshot(ctx, req)
+		var hdr metadata.MD
+		vm, err := client.RestoreSnapshot(ctx, req, grpc.Header(&hdr))
+		if w := hdr.Get(RestoreWarningHeader); len(w) > 0 {
+			_ = grpc.SetHeader(ctx, metadata.Pairs(RestoreWarningHeader, w[0]))
+		}
+		return vm, err
 	}
 
 	// A revert can bring the domain back running with its installer ISO; it
@@ -397,13 +405,13 @@ func (s *Server) RestoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotReq
 		// reopens: its installer CD-ROMs are judged here and pointed at the
 		// files judged, before anything is torn down.
 		rewriteSaved := func(savedXML string) (string, error) { return s.judgedCDROMDefinition(vm, savedXML) }
-		if err := s.virt.RevertToLiveSnapshot(req.VmName, req.SnapshotName, snap.VMStatePath, restoreFW, rewriteSaved); err != nil {
+		if err := s.notCurrentRestore(ctx, req, s.virt.RevertToLiveSnapshot(req.VmName, req.SnapshotName, snap.VMStatePath, restoreFW, rewriteSaved)); err != nil {
 			if status.Code(err) == codes.FailedPrecondition {
 				return nil, err
 			}
 			return nil, status.Errorf(codes.Internal, "revert to memory snapshot: %v", err)
 		}
-	} else if err := s.virt.RevertToSnapshot(req.VmName, req.SnapshotName, restoreFW); err != nil {
+	} else if err := s.notCurrentRestore(ctx, req, s.virt.RevertToSnapshot(req.VmName, req.SnapshotName, restoreFW)); err != nil {
 		return nil, status.Errorf(codes.Internal, "revert to snapshot: %v", err)
 	}
 
@@ -420,6 +428,27 @@ func (s *Server) RestoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotReq
 	slog.Info("snapshot restored", "vm", req.VmName, "snapshot", req.SnapshotName)
 	s.recordVMEvent(ctx, req.VmName, "snapshot.restored", "ok", req.SnapshotName)
 	return s.vmToProto(ctx, req.VmName)
+}
+
+// RestoreWarningHeader is the response header RestoreSnapshot says, on a
+// restore that succeeded, what it could not do (lv snapshot restore prints it).
+const RestoreWarningHeader = "x-litevirt-restore-warning"
+
+// notCurrentRestore passes a revert's error through, except a
+// RestoredNotCurrentError: the restore succeeded, but libvirt would not hold
+// the snapshot as current, so a later delete keeps its files rather than
+// merging them. That is said to the caller (RestoreWarningHeader), recorded
+// as the VM's event snapshot.restore-not-current, and logged — never only
+// logged, so an operator can tell the restore fix did not apply here.
+func (s *Server) notCurrentRestore(ctx context.Context, req *pb.RestoreSnapshotRequest, err error) error {
+	var nc *lv.RestoredNotCurrentError
+	if !errors.As(err, &nc) {
+		return err
+	}
+	slog.Error("snapshot restore: the snapshot is not libvirt's current one", "vm", req.VmName, "snapshot", req.SnapshotName, "error", nc)
+	s.recordVMEvent(ctx, req.VmName, "snapshot.restore-not-current", "warning", nc.Error())
+	_ = grpc.SetHeader(ctx, metadata.Pairs(RestoreWarningHeader, nc.Error()))
+	return nil
 }
 
 func (s *Server) DeleteSnapshot(ctx context.Context, req *pb.DeleteSnapshotRequest) (*emptypb.Empty, error) {

@@ -199,6 +199,9 @@ type Fake struct {
 	// OnRevertSnapshot runs inside RevertToSnapshot and RevertToLiveSnapshot,
 	// while the revert holds the domain down, as libvirt's revert does.
 	OnRevertSnapshot func(domain, snap string)
+	// RevertNotCurrent makes a revert succeed but report that libvirt would
+	// not take the snapshot back as current (libvirt.RestoredNotCurrentError).
+	RevertNotCurrent bool
 	// snapshotFiles is, per domain and snapshot, the files the snapshot's
 	// overlay cutover named: each disk's overlay and the disk it was taken of.
 	snapshotFiles         map[string]map[string][]string
@@ -1398,13 +1401,18 @@ func (f *Fake) RevertToSnapshot(domainName, snapshotName string, restorePreDefin
 		return fmt.Errorf("libvirtfake: no snapshot %q for %q", snapshotName, domainName)
 	}
 	f.record("revert", domainName, snapshotName)
-	hook := f.OnRevertSnapshot
+	hook, notCurrent := f.OnRevertSnapshot, f.RevertNotCurrent
 	f.mu.Unlock()
 	if hook != nil {
 		hook(domainName, snapshotName)
 	}
 	if restorePreDefine != nil {
-		return restorePreDefine()
+		if err := restorePreDefine(); err != nil {
+			return err
+		}
+	}
+	if notCurrent {
+		return &libvirt.RestoredNotCurrentError{Snapshot: snapshotName, Registered: true, Err: errors.New("libvirtfake: CURRENT refused")}
 	}
 	return nil
 }
@@ -1552,6 +1560,9 @@ func (f *Fake) RevertToLiveSnapshot(domainName, snapshotName, vmstatePath string
 	f.record("revert-live", domainName, snapshotName+" dxml="+restoreXML)
 	if saved != "" {
 		f.xml[domainName] = saved
+	}
+	if f.RevertNotCurrent {
+		return &libvirt.RestoredNotCurrentError{Snapshot: snapshotName, Registered: true, Err: errors.New("libvirtfake: CURRENT refused")}
 	}
 	return nil
 }

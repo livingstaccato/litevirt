@@ -235,15 +235,16 @@ func revertToSnapshot(v snapshotAPI, domainName, snapshotName string, restorePre
 	// name" — permanently unrevertable. Doing it here (before the start) means
 	// the snapshot survives even if the start below fails and the operator
 	// retries. The overlay is freshly reset over the same base, so the recorded
-	// point still holds. Best-effort.
-	reregisterSnapshot(v, domainName, snapshotName, snapXML)
+	// point still holds. A revert that could not register it as current is
+	// reported once the domain is back (RestoredNotCurrentError).
+	notCurrent := reregisterSnapshot(v, domainName, snapshotName, snapXML)
 
 	// Start, retrying on any residual lock-release race (the base stays
 	// read-only now, so this should not normally trigger).
 	var startErr error
 	for i := 0; i < 10; i++ {
 		if startErr = startDomain(v, domainName); startErr == nil {
-			return nil
+			return notCurrent
 		}
 		if !strings.Contains(startErr.Error(), "lock") {
 			return fmt.Errorf("start domain %s after revert: %w", domainName, startErr)
@@ -701,10 +702,34 @@ func revertToLiveSnapshot(v snapshotAPI, domainName, snapshotName, vmstatePath s
 	// The undefine above dropped the libvirt snapshot metadata. Re-register it
 	// (best-effort) so the snapshot stays revertible AND deletable — the overlay
 	// is freshly reset over the same base, so the recorded snapshot point still
-	// holds. A failure here is non-fatal: the revert already succeeded.
-	reregisterSnapshot(v, domainName, snapshotName, snapXML)
-	return nil
+	// holds. A failure here does not fail the revert, which already
+	// succeeded; it is reported as a RestoredNotCurrentError.
+	return reregisterSnapshot(v, domainName, snapshotName, snapXML)
 }
+
+// RestoredNotCurrentError is what a revert returns when the domain is
+// restored and running but its snapshot could not be registered again as
+// libvirt's current snapshot: registered plain (Registered), or not at all.
+// The restore itself succeeded. A later delete of the snapshot then keeps
+// its files rather than letting libvirt merge it (deleteSnapshot's guards),
+// so nothing is lost, but the chain is not reclaimed — which an operator
+// must be able to see rather than find in a log.
+type RestoredNotCurrentError struct {
+	Snapshot   string
+	Registered bool
+	Err        error
+}
+
+func (e *RestoredNotCurrentError) Error() string {
+	if e.Registered {
+		return fmt.Sprintf("snapshot %q was restored, but libvirt refused to make it its current snapshot (%v); "+
+			"it is registered as a plain snapshot, and deleting it will keep its files instead of merging them", e.Snapshot, e.Err)
+	}
+	return fmt.Sprintf("snapshot %q was restored, but libvirt refused to register it again (%v); "+
+		"libvirt no longer holds it, and deleting it removes only its record", e.Snapshot, e.Err)
+}
+
+func (e *RestoredNotCurrentError) Unwrap() error { return e.Err }
 
 // reregisterSnapshot defines a reverted snapshot's metadata again, as
 // libvirt's CURRENT snapshot. The revert dropped it with a METADATA_ONLY
@@ -722,25 +747,28 @@ func revertToLiveSnapshot(v snapshotAPI, domainName, snapshotName, vmstatePath s
 // snapshot, restore, delete unlinked the VM's root disk). Redefined current,
 // a delete merges: the overlay is committed into the base and removed.
 //
-// Best-effort, as before; a redefine libvirt refuses as current is retried
-// as a plain one so the snapshot is not lost, and deleteSnapshot's guard
-// keeps the files of a snapshot left non-current.
-func reregisterSnapshot(v snapshotAPI, domainName, snapshotName, snapXML string) {
+// A redefine libvirt refuses as current is retried as a plain one so the
+// snapshot is not lost, and deleteSnapshot's guards keep the files of a
+// snapshot left non-current. Either way short of current is returned as a
+// RestoredNotCurrentError (nil when it is current).
+func reregisterSnapshot(v snapshotAPI, domainName, snapshotName, snapXML string) error {
 	redom, err := v.DomainLookupByName(domainName)
 	if err != nil {
-		slog.Warn("snapshot revert: domain not found to re-register the snapshot", "vm", domainName, "snapshot", snapshotName, "error", err)
-		return
+		slog.Error("snapshot revert: domain not found to re-register the snapshot", "vm", domainName, "snapshot", snapshotName, "error", err)
+		return &RestoredNotCurrentError{Snapshot: snapshotName, Err: err}
 	}
 	_, err = v.DomainSnapshotCreateXML(redom, snapXML,
 		uint32(golibvirt.DomainSnapshotCreateRedefine|golibvirt.DomainSnapshotCreateCurrent))
 	if err == nil {
-		return
+		return nil
 	}
-	slog.Warn("snapshot revert: re-registering the snapshot as current failed; registering it plain",
+	slog.Error("snapshot revert: re-registering the snapshot as current failed; registering it plain",
 		"vm", domainName, "snapshot", snapshotName, "error", err)
-	if _, err := v.DomainSnapshotCreateXML(redom, snapXML, uint32(golibvirt.DomainSnapshotCreateRedefine)); err != nil {
-		slog.Warn("snapshot revert: re-registering the snapshot failed", "vm", domainName, "snapshot", snapshotName, "error", err)
+	if _, perr := v.DomainSnapshotCreateXML(redom, snapXML, uint32(golibvirt.DomainSnapshotCreateRedefine)); perr != nil {
+		slog.Error("snapshot revert: re-registering the snapshot failed", "vm", domainName, "snapshot", snapshotName, "error", perr)
+		return &RestoredNotCurrentError{Snapshot: snapshotName, Err: fmt.Errorf("%v; plain: %w", err, perr)}
 	}
+	return &RestoredNotCurrentError{Snapshot: snapshotName, Registered: true, Err: err}
 }
 
 // resetOverlay recreates overlay as a fresh, empty qcow2 backed by base,

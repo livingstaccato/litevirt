@@ -1,6 +1,7 @@
 package libvirt
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -387,4 +388,48 @@ func TestSnapshotDelete_RestoreOlderThenDeleteBoth(t *testing.T) {
 			m.requireWhole(map[byte]bool{markA: true, markB: false})
 		})
 	}
+}
+
+// A libvirt that refuses REDEFINE|CURRENT (review I-1): the revert still
+// succeeds and the snapshot is registered plain, but the revert says so with
+// a RestoredNotCurrentError instead of hiding it in a log line, so the
+// operator can tell the fix did not apply. Guard (a) then keeps the delete
+// from unlinking anything: the VM stays whole.
+func TestRevert_ARefusedCurrentIsReported(t *testing.T) {
+	check := func(t *testing.T, err error) {
+		t.Helper()
+		var nc *RestoredNotCurrentError
+		if !errors.As(err, &nc) {
+			t.Fatalf("revert returned %v, want a RestoredNotCurrentError", err)
+		}
+		if nc.Snapshot != "m1" || !nc.Registered {
+			t.Fatalf("RestoredNotCurrentError %+v, want snapshot m1 registered plain", nc)
+		}
+	}
+	t.Run("disk", func(t *testing.T) {
+		m := newLibvirt10(t)
+		m.refuseCurrent = true
+		m.write(markA, 1)
+		m.snapshot("m1")
+		m.write(markB, 2)
+		check(t, revertToSnapshot(m, "vm", "m1", nil))
+		if m.state() != golibvirt.DomainRunning {
+			t.Fatal("the reverted domain is not running")
+		}
+		if _, err := m.DomainSnapshotLookupByName(golibvirt.Domain{Name: "vm"}, "m1", 0); err != nil {
+			t.Fatalf("m1 is not registered after the revert: %v", err)
+		}
+		m.rm("m1")
+		m.requireWhole(map[byte]bool{markA: true, markB: false})
+	})
+	t.Run("memory", func(t *testing.T) {
+		m := newLibvirt10(t)
+		m.refuseCurrent = true
+		m.write(markA, 1)
+		save := m.memorySnapshot("m1")
+		m.write(markB, 2)
+		check(t, revertToLiveSnapshot(m, "vm", "m1", save, nil, nil))
+		m.rm("m1")
+		m.requireWhole(map[byte]bool{markA: true, markB: false})
+	})
 }

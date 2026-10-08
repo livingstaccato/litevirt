@@ -3,9 +3,11 @@ package grpcapi
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -100,5 +102,39 @@ func TestRestoreSnapshot_RefusedWhileAStartHoldsTheLease(t *testing.T) {
 		if e.Op == "revert" || e.Op == "revert-live" {
 			t.Fatal("the revert ran while a start held the VM's start lease")
 		}
+	}
+}
+
+// A restore libvirt would not take back as current (review I-1) succeeds,
+// and says so: in the response header lv prints, and as the VM's event
+// snapshot.restore-not-current — not only in the daemon's log.
+func TestRestoreSnapshot_ANotCurrentRestoreIsReported(t *testing.T) {
+	for _, typ := range []string{"disk", "memory"} {
+		t.Run(typ, func(t *testing.T) {
+			s := lockTestServer(t)
+			fake := seedRestorableVM(t, s, typ)
+			fake.RevertNotCurrent = true
+			h := &headerCapture{}
+			ctx := grpc.NewContextWithServerTransportStream(adminCtx(), h)
+			if _, err := s.RestoreSnapshot(ctx, &pb.RestoreSnapshotRequest{VmName: "rs", SnapshotName: "s1"}); err != nil {
+				t.Fatalf("RestoreSnapshot: %v (the revert itself succeeded)", err)
+			}
+			if w := h.md.Get(RestoreWarningHeader); len(w) != 1 || !strings.Contains(w[0], "current") {
+				t.Errorf("response header %s = %v, want the not-current warning", RestoreWarningHeader, w)
+			}
+			evs, err := corrosion.ListVMEvents(adminCtx(), s.db, "rs", 50, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			found := false
+			for _, e := range evs {
+				if e.Type == "snapshot.restore-not-current" {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("no snapshot.restore-not-current event among %+v", evs)
+			}
+		})
 	}
 }

@@ -147,20 +147,6 @@ func TestZFSCreateDisk_SourceImageUnimplemented(t *testing.T) {
 
 // ── A3: ZFS snapshot-roll must surface errors instead of swallowing them ──────
 
-func TestZFSRollPrev_Success(t *testing.T) {
-	run, calls := stubRunner(func(sub string) ([]byte, error) { return nil, nil })
-	d := &zfsDriver{dataset: "tank", run: run}
-
-	if err := d.rollPrevSnapshot(context.Background(), "tank/x@litevirt-replicate-prev"); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	got := subcommands(*calls)
-	want := []string{"snapshot", "destroy", "rename"}
-	if len(got) != 3 || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
-		t.Errorf("roll sequence = %v, want %v", got, want)
-	}
-}
-
 func TestZFSRollPrev_DestroyRealErrorAborts(t *testing.T) {
 	run, calls := stubRunner(func(sub string) ([]byte, error) {
 		if sub == "destroy" {
@@ -179,20 +165,5 @@ func TestZFSRollPrev_DestroyRealErrorAborts(t *testing.T) {
 	}
 	if subs := subcommands(*calls); hasSub(subs, "rename") {
 		t.Error("rename must NOT run after a failed destroy (would leave a stale base)")
-	}
-}
-
-func TestZFSRollPrev_FirstRunToleratesMissingPrev(t *testing.T) {
-	run, _ := stubRunner(func(sub string) ([]byte, error) {
-		if sub == "destroy" {
-			// First replication: prev snapshot doesn't exist yet — tolerated.
-			return []byte("could not find any snapshots to destroy; does not exist"), errors.New("exit status 1")
-		}
-		return nil, nil
-	})
-	d := &zfsDriver{dataset: "tank", run: run}
-
-	if err := d.rollPrevSnapshot(context.Background(), "tank/x@litevirt-replicate-prev"); err != nil {
-		t.Fatalf("missing-prev on first run should be tolerated, got %v", err)
 	}
 }

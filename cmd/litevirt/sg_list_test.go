@@ -12,6 +12,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/cli"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/grpcapi"
 )
@@ -207,5 +208,55 @@ func TestSGCLI_ListingsFallBackOnlyWhenTheDaemonCannotAnswer(t *testing.T) {
 				t.Errorf("lv sg rule-ls sg-web fell back and listed %q, want r-web only", out)
 			}
 		})
+	}
+}
+
+// When the CLI has no credentials to connect with at all — no LV_HOST, no
+// readable PKI bundle — no daemon ever saw the request, so nothing refused it.
+// On a node the listings then read the local database, as they always did
+// before they went through the daemon: only someone who can already read that
+// file gets anything from it.
+func TestSGCLI_ListingsFallBackWhenTheCLICannotConnect(t *testing.T) {
+	origConnect := cli.Connect
+	cli.Connect = func(context.Context) (pb.LiteVirtClient, func(), error) {
+		return nil, nil, errors.New("load local TLS config from /etc/litevirt/pki: permission denied")
+	}
+	t.Cleanup(func() { cli.Connect = origConnect })
+	localDB(t, seedSGListing)
+
+	out, stderr, err := runSGCLIErr(t, "ls")
+	if err != nil {
+		t.Fatalf("lv sg ls with no credentials on a node: %v", err)
+	}
+	if !strings.Contains(out, "sg-web") || !strings.Contains(out, "sg-db") {
+		t.Errorf("lv sg ls fell back but listed %q", out)
+	}
+	if !strings.Contains(stderr, "local database") {
+		t.Errorf("lv sg ls read the local database without saying so; stderr = %q", stderr)
+	}
+	out, _, err = runSGCLIErr(t, "rule-ls", "sg-db")
+	if err != nil {
+		t.Fatalf("lv sg rule-ls with no credentials on a node: %v", err)
+	}
+	if !strings.Contains(out, "r-db") || strings.Contains(out, "r-web") {
+		t.Errorf("lv sg rule-ls sg-db fell back and listed %q, want r-db only", out)
+	}
+}
+
+// Off a node, with no credentials, neither path can answer; the error names
+// why the CLI could not reach a daemon, not only that the local read failed.
+func TestSGCLI_ListingsWithNoDaemonAndNoLocalDatabaseSayWhy(t *testing.T) {
+	origConnect := cli.Connect
+	cli.Connect = func(context.Context) (pb.LiteVirtClient, func(), error) {
+		return nil, nil, errors.New("LV_HOST not set")
+	}
+	t.Cleanup(func() { cli.Connect = origConnect })
+	origDB := openClusterDB
+	openClusterDB = func() (*corrosion.Client, error) { return nil, errors.New("must run on a litevirt node") }
+	t.Cleanup(func() { openClusterDB = origDB })
+
+	_, _, err := runSGCLIErr(t, "ls")
+	if err == nil || !strings.Contains(err.Error(), "LV_HOST not set") || !strings.Contains(err.Error(), "must run on a litevirt node") {
+		t.Errorf("lv sg ls with neither a daemon nor a local database: err = %v, want both reasons", err)
 	}
 }

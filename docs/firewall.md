@@ -233,8 +233,9 @@ litevirtd; they do not fall back to writing the database.
 
 `lv sg ls` and `lv sg rule-ls`, and the web UI, read security groups through
 the `ListSecurityGroups` RPC with the caller's credential. The CLI reads the
-node's local database instead only when the daemon cannot answer at all: it is
-down, or it predates the RPC. It says so on stderr when it does. A refusal is
+node's local database instead only when no daemon answered: the CLI has no
+credentials to connect with, the daemon is down, or it predates the RPC. It
+says so on stderr when it does. A refusal is
 never routed around that way. The RPC checks the `sg.read` verb
 at `/` (every built-in role with `*.read` or `sg.read` holds it; with no role
 bindings, any viewer), so a token scoped to a project, or a grant below the

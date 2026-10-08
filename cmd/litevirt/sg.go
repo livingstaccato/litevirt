@@ -138,29 +138,40 @@ func newSGListCmd() *cobra.Command {
 
 // listSecurityGroups reads security groups through ListSecurityGroups, so the
 // daemon decides what the caller's credential may see — the same RPC the web
-// UI reads through. It reads the local database instead only when the daemon
-// cannot answer at all: it is down (Unavailable) or predates the RPC
-// (Unimplemented). That keeps a listing that worked on a node working through a
-// rolling upgrade or a daemon outage, and it opens nothing new: the local
-// database is readable only by whoever could already read the file. A refusal is
-// the daemon's answer and is returned as it is, never routed around.
+// UI reads through. It reads the local database instead only when no daemon
+// answered: the CLI had nothing to connect with (no LV_HOST, no readable PKI
+// bundle), the daemon is down (Unavailable), or it predates the RPC
+// (Unimplemented). That keeps a listing that worked on a node working — before
+// the RPC it always read the local database — and it opens nothing new: the
+// local database is readable only by whoever could already read the file. A
+// refusal is the daemon's answer and is returned as it is, never routed around.
 func listSecurityGroups(cmd *cobra.Command, req *pb.ListSecurityGroupsRequest) (*pb.ListSecurityGroupsResponse, error) {
 	var resp *pb.ListSecurityGroupsResponse
+	asked := false
 	err := withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+		asked = true
 		var err error
 		resp, err = c.ListSecurityGroups(ctx, req)
 		return err
 	})
-	switch status.Code(err) {
-	case codes.OK:
+	var why string
+	switch {
+	case err == nil:
 		return resp, nil
-	case codes.Unavailable, codes.Unimplemented:
-		fmt.Fprintf(cmd.ErrOrStderr(), "litevirtd could not answer (%s); reading this node's local database instead.\n",
-			status.Convert(err).Message())
-		return listSecurityGroupsLocal(cmd.Context(), req)
+	case !asked:
+		// withClient failed before any RPC: no daemon saw the request.
+		why = "the CLI could not connect: " + err.Error()
+	case status.Code(err) == codes.Unavailable || status.Code(err) == codes.Unimplemented:
+		why = "litevirtd could not answer: " + status.Convert(err).Message()
 	default:
 		return nil, err
 	}
+	fmt.Fprintf(cmd.ErrOrStderr(), "%s; reading this node's local database instead.\n", why)
+	local, lerr := listSecurityGroupsLocal(cmd.Context(), req)
+	if lerr != nil {
+		return nil, fmt.Errorf("%s; and the local database could not be read either: %w", why, lerr)
+	}
+	return local, nil
 }
 
 // listSecurityGroupsLocal is listSecurityGroups' daemon-unreachable path.

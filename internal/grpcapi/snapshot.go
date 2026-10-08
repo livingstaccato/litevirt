@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -454,6 +455,29 @@ func (s *Server) DeleteSnapshot(ctx context.Context, req *pb.DeleteSnapshotReque
 	// otherwise the VM is left stranded on an untracked overlay chain (G1).
 	flattenable := snap == nil || snap.Type != "memory" || snap.State == "error"
 	flatten := vm.State == "running" && len(existing) <= 1 && flattenable
+
+	// Both the flatten and libvirt's delete merge the snapshot's overlay into
+	// the disk it was taken of and remove the overlay. Another VM backing on
+	// either file — a linked clone of this one — would lose its disk, so the
+	// delete is refused while one does. A snapshot libvirt no longer holds is
+	// deleted as a record only, touching no file.
+	if files, ferr := s.virt.SnapshotDiskFiles(req.VmName, req.SnapshotName); ferr != nil && !lv.IsNotFound(ferr) {
+		return nil, status.Errorf(codes.Internal,
+			"cannot read which disk files snapshot %q of %q merges, so it is not deleted: %v", req.SnapshotName, req.VmName, ferr)
+	} else if ferr == nil {
+		users, uerr := s.snapshotFileUsers(ctx, req.VmName, files)
+		if uerr != nil {
+			return nil, status.Errorf(codes.Internal,
+				"cannot determine whether other VMs back on snapshot %q of %q, so it is not deleted: %v", req.SnapshotName, req.VmName, uerr)
+		}
+		if len(users) > 0 {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"snapshot %q of %q is not deleted: %s back(s) on its disk files (%s), which the delete would merge "+
+					"into or remove. Delete those VMs, or re-create them as independent copies with "+
+					"`lv clone <source> <name> --mode full`, first",
+				req.SnapshotName, req.VmName, strings.Join(users, ", "), strings.Join(files, ", "))
+		}
+	}
 
 	var delErr error
 	if flatten {

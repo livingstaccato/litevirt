@@ -196,8 +196,11 @@ type Fake struct {
 	// FailCreateLiveSnapshot fires AFTER the disk overlay has cut over, modeling a
 	// RAM-save/capture failure that leaves the VM on an overlay.
 	FailCreateLiveSnapshot func(domain, snap string) error
-	FailDomainState        func(name string) error
-	FailDomainStateReason  func(name string) error
+	// snapshotFiles is, per domain and snapshot, the files the snapshot's
+	// overlay cutover named: each disk's overlay and the disk it was taken of.
+	snapshotFiles         map[string]map[string][]string
+	FailDomainState       func(name string) error
+	FailDomainStateReason func(name string) error
 	// FailHasManagedSaveImage makes HasManagedSaveImage unreadable, for the
 	// fail-closed paths that must not treat "cannot tell" as "no saved RAM".
 	FailHasManagedSaveImage func(name string) error
@@ -1469,9 +1472,31 @@ func (f *Fake) cutoverDisks(domain, snapname string) {
 	if f.diskSources[domain] == nil {
 		f.diskSources[domain] = map[string]string{"vda": "/var/lib/litevirt/disks/" + domain + "-root.qcow2"}
 	}
-	for dev, src := range f.diskSources[domain] {
-		f.diskSources[domain][dev] = strings.TrimSuffix(src, filepath.Ext(src)) + "." + snapname
+	if f.snapshotFiles == nil {
+		f.snapshotFiles = map[string]map[string][]string{}
 	}
+	if f.snapshotFiles[domain] == nil {
+		f.snapshotFiles[domain] = map[string][]string{}
+	}
+	var files []string
+	for dev, src := range f.diskSources[domain] {
+		ov := strings.TrimSuffix(src, filepath.Ext(src)) + "." + snapname
+		f.diskSources[domain][dev] = ov
+		files = append(files, ov, src)
+	}
+	sort.Strings(files)
+	f.snapshotFiles[domain][snapname] = files
+}
+
+// SnapshotDiskFiles returns the overlay and base of each disk the snapshot
+// cut over, as recorded at its creation.
+func (f *Fake) SnapshotDiskFiles(domainName, snapshotName string) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.snapshots[domainName][snapshotName]; !ok {
+		return nil, fmt.Errorf("libvirtfake: no domain snapshot with matching name %q for %q", snapshotName, domainName)
+	}
+	return append([]string(nil), f.snapshotFiles[domainName][snapshotName]...), nil
 }
 
 // SetSavedImageXML sets the definition a memory snapshot's saved image at

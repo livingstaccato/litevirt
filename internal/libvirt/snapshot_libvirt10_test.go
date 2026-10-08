@@ -245,3 +245,25 @@ func TestSnapshotDelete_ANonCurrentLeafKeepsItsFiles(t *testing.T) {
 	}
 	m.requireWhole(map[byte]bool{markA: true, markB: true})
 }
+
+// SnapshotDiskFiles names each external disk's overlay and the disk it was
+// taken of, which a delete commits into, and nothing for a disk the snapshot
+// left alone (the model's sdb, snapshot='no').
+func TestSnapshotDiskFiles_OverlayAndBase(t *testing.T) {
+	m := newLibvirt10(t)
+	root := m.active()
+	m.snapshot("s1")
+	s1 := m.active()
+	m.snapshot("s2")
+	got, err := snapshotDiskFiles(m, "vm", "s2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{s1, m.active()}
+	if len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("files of s2 = %v, want %v", got, want)
+	}
+	if got, _ := snapshotDiskFiles(m, "vm", "s1"); len(got) != 2 || got[0] != root || got[1] != s1 {
+		t.Fatalf("files of s1 = %v, want [%s %s]", got, root, s1)
+	}
+}

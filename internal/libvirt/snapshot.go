@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"time"
 
@@ -748,6 +749,70 @@ func forceRemoveDomain(v snapshotAPI, domainName string) {
 	if d2, e2 := v.DomainLookupByName(domainName); e2 == nil {
 		_ = v.DomainUndefineFlags(d2, golibvirt.DomainUndefineFlagsValues(golibvirt.DomainUndefineKeepNvram|golibvirt.DomainUndefineKeepTpm))
 	}
+}
+
+// SnapshotDiskFiles returns the files a delete of the snapshot may merge or
+// remove: for each disk the snapshot made an external overlay of, the
+// overlay (its <disks> source) and the disk it was taken of (its <domain>
+// source), which libvirt commits the overlay into. Sorted, without repeats.
+func (c *Client) SnapshotDiskFiles(domainName, snapshotName string) ([]string, error) {
+	return snapshotDiskFiles(c.virt, domainName, snapshotName)
+}
+
+func snapshotDiskFiles(v snapshotAPI, domainName, snapshotName string) ([]string, error) {
+	dom, err := v.DomainLookupByName(domainName)
+	if err != nil {
+		return nil, fmt.Errorf("lookup domain %q: %w", domainName, err)
+	}
+	snap, err := v.DomainSnapshotLookupByName(dom, snapshotName, 0)
+	if err != nil {
+		return nil, fmt.Errorf("snapshot %q not found: %w", snapshotName, err)
+	}
+	snapXML, err := v.DomainSnapshotGetXMLDesc(snap, 0)
+	if err != nil {
+		return nil, fmt.Errorf("get snapshot XML: %w", err)
+	}
+	bases := parseSnapshotDomainDisks(snapXML)
+	seen := map[string]bool{}
+	var out []string
+	add := func(p string) {
+		if p != "" && !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	for dev, overlay := range parseSnapshotOverlays(snapXML) {
+		add(overlay)
+		add(bases[dev])
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// parseSnapshotOverlays extracts, from a snapshot's <disks>, each external
+// disk's overlay: target dev → file. Disks with snapshot='no' have none.
+func parseSnapshotOverlays(snapXML string) map[string]string {
+	var snap struct {
+		Disks struct {
+			Disk []struct {
+				Name     string `xml:"name,attr"`
+				Snapshot string `xml:"snapshot,attr"`
+				Source   struct {
+					File string `xml:"file,attr"`
+				} `xml:"source"`
+			} `xml:"disk"`
+		} `xml:"disks"`
+	}
+	if err := xml.Unmarshal([]byte(snapXML), &snap); err != nil {
+		return nil
+	}
+	m := map[string]string{}
+	for _, d := range snap.Disks.Disk {
+		if d.Snapshot == "external" && d.Name != "" && d.Source.File != "" {
+			m[d.Name] = d.Source.File
+		}
+	}
+	return m
 }
 
 // parseSnapshotDomainDisks extracts the original disk paths from the <domain>

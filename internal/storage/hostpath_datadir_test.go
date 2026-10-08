@@ -280,3 +280,35 @@ func TestDataDirOwned_CoversEverythingTheDaemonCreates(t *testing.T) {
 		t.Fatalf("the scan found only %d data-dir children; it no longer reads the code", seen)
 	}
 }
+
+// CheckDaemonStatePath is the pool rule for one file a restore or copy
+// writes (lab5-trims-review A-P1): the daemon's own state is refused, and
+// everything else an admin names — disks/, a pool, an ordinary child of the
+// data dir, a sibling of it, any other host path — passes.
+func TestCheckDaemonStatePath(t *testing.T) {
+	data := t.TempDir()
+	pki := filepath.Join(t.TempDir(), "pki")
+	for _, p := range []string{
+		filepath.Join(data, "pending-audit", "x.json"),
+		filepath.Join(data, "split_brain_activated.voter_config_v1"),
+		filepath.Join(data, "vms", "web", "owner_epoch"),
+		filepath.Join(data, "state.db-wal"),
+		filepath.Join(data, ".audit-seeded.json.tmp"),
+		filepath.Join(pki, "host.key"),
+		data, filepath.Dir(data), "/var/lib/litevirt/state.db", "/var/lib/litevirt-gitops/repo/x",
+	} {
+		if err := CheckDaemonStatePath(p, data, pki); err == nil {
+			t.Errorf("%s allowed", p)
+		}
+	}
+	for _, p := range []string{
+		filepath.Join(data, "disks", "web-root.img"),
+		filepath.Join(data, "pools", "p", "x.qcow2"),
+		filepath.Join(data, "rc5pool", "x.img"),
+		"/var/lib/litevirt/rc5pool/x.img", "/var/lib/litevirt-labtest/x.img", "/root/x.img", "/srv/x.img",
+	} {
+		if err := CheckDaemonStatePath(p, data, pki); err != nil {
+			t.Errorf("%s: %v", p, err)
+		}
+	}
+}

@@ -340,6 +340,49 @@ func CheckWriteRoot(p, dataDir, pkiDir string) error {
 	return nil
 }
 
+// CheckDaemonStatePath refuses a file path to be written that is the daemon's
+// own state, whoever asks: in or below the PKI directory or a litevirt state
+// root, the data directory (configured or default) or a directory containing
+// it, or in or below a child of the data directory the daemon owns
+// (dataDirOwned). It is the pool rule for one file (a restore or copy
+// target_path): anywhere else — disks/, a pool, an ordinary child of the data
+// directory, any other host path — passes. Judged by path components, as
+// written and after resolving symlinks through the deepest existing parent,
+// so the parent directories a write would create cannot land in daemon state
+// either.
+func CheckDaemonStatePath(p, dataDir, pkiDir string) error {
+	if !filepath.IsAbs(p) {
+		return fmt.Errorf("%q is not an absolute path", p)
+	}
+	for _, cand := range pathForms(p) {
+		if pkiDir != "" {
+			for _, d := range pathForms(pkiDir) {
+				if within(d, cand) {
+					return fmt.Errorf("%q is in the daemon's PKI directory %s", p, pkiDir)
+				}
+			}
+		}
+		for _, root := range litevirtStateRoots {
+			for _, r := range pathForms(root) {
+				if within(r, cand) {
+					return fmt.Errorf("%q is under %s, litevirt state", p, root)
+				}
+			}
+		}
+		for _, dd := range dataDirsToJudge(dataDir) {
+			for _, d := range pathForms(dd) {
+				if within(cand, d) {
+					return fmt.Errorf("%q is the daemon's data directory %s or contains it", p, dd)
+				}
+				if first, _, ok := dataDirChild(d, cand); ok && dataDirChildOwned(first) {
+					return fmt.Errorf("%q is the daemon's own state (%s in its data directory %s)", p, first, dd)
+				}
+			}
+		}
+	}
+	return nil
+}
+
 // CheckConfig refuses a Source or option that is not in its driver's strict
 // form (ValidateSource), applies CheckWriteRoot to every directory the
 // configuration writes into, and refuses an NFS source that would derive a

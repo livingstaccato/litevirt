@@ -13,6 +13,7 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/pbsstore"
 	"github.com/litevirt/litevirt/internal/safename"
+	"github.com/litevirt/litevirt/internal/storage"
 	"github.com/litevirt/litevirt/internal/tenancy"
 )
 
@@ -155,6 +156,11 @@ func (s *Server) resolveRestoreTarget(ctx context.Context, targetPath, defaultDi
 		if err := s.RequirePerm(ctx, "/", verbStorageHostPath, "admin"); err != nil {
 			return "", status.Error(codes.PermissionDenied,
 				"a custom absolute target_path requires the admin role; otherwise pass a bare filename to write under the pool")
+		}
+		// Never the daemon's own state, for an admin too — judged before
+		// anything (the file, its parent directories) is created.
+		if err := storage.CheckDaemonStatePath(targetPath, s.dataDir, s.pkiDir); err != nil {
+			return "", status.Errorf(codes.InvalidArgument, "target_path: %v", err)
 		}
 		return targetPath, nil
 	}

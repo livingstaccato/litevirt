@@ -1513,6 +1513,14 @@ func (f *Fake) cutoverDisks(domain, snapname string) {
 	f.snapshotFiles[domain][snapname] = files
 }
 
+// SetFailDomainDiskSources sets FailDomainDiskSources under the fake's lock,
+// for a test that changes it while the server may be reading it.
+func (f *Fake) SetFailDomainDiskSources(fn func(domain string) error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.FailDomainDiskSources = fn
+}
+
 // DomainDiskFormats returns the disks of the domain's definition as source
 // file → driver type; a domain the fake has no definition of is not found.
 func (f *Fake) DomainDiskFormats(domainName string) (map[string]string, error) {

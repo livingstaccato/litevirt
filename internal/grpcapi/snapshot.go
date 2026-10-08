@@ -477,23 +477,62 @@ func (s *Server) restoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotReq
 		}
 		time.Sleep(time.Duration(attempt+1) * 200 * time.Millisecond)
 	}
-	if recErr != nil {
-		s.recordVMEvent(ctx, req.VmName, "snapshot.restore-path-unrecorded", "error", recErr.Error())
-		return nil, status.Errorf(codes.Internal,
-			"snapshot %q of %q was restored, but recording the VM's disk path failed: %v; "+
-				"the record may still name a later snapshot's file — restore %q again to record it, "+
-				"before migrating or redefining the VM", req.SnapshotName, req.VmName, recErr, req.SnapshotName)
-	}
 
 	// After revert, VM may be running or paused depending on snapshot type. A lost
 	// "running" write is low-harm (the reconciler heals from libvirt), so record
 	// best-effort with retry rather than failing an already-completed restore.
+	// Written whether or not the path was recorded: the restore happened and
+	// the VM runs (re-review R3-M1).
 	if err := s.persistVMState(ctx, req.VmName, "running", "restored from "+req.SnapshotName, corrosion.OpVMState); err != nil {
 		slog.Error("snapshot restore: recording running state failed — reconciler will heal", "vm", req.VmName, "error", err)
+	}
+	if recErr != nil {
+		// Never "restore again": that would discard what the VM has written
+		// since. The daemon keeps trying to record the path itself; reading
+		// it back (lv inspect) says when it has, and taking a snapshot
+		// records it too, losing nothing.
+		s.recordVMEvent(ctx, req.VmName, "snapshot.restore-path-unrecorded", "error",
+			recErr.Error()+"; retrying in the background — do not migrate or redefine the VM until its disk path is recorded")
+		go s.recordRestoredDiskPath(req.VmName, req.SnapshotName)
+		return nil, status.Errorf(codes.Internal,
+			"snapshot %q of %q was restored and the VM is running, but recording its disk path failed: %v. "+
+				"The daemon keeps retrying; until `lv inspect %s` shows the disk on the file the VM runs on, "+
+				"do not migrate or redefine it. Taking a snapshot (`lv snapshot create %s <name>`) also records the path. "+
+				"Do not restore the snapshot to fix this: that discards what the VM has written since",
+			req.SnapshotName, req.VmName, recErr, req.VmName, req.VmName)
 	}
 	slog.Info("snapshot restored", "vm", req.VmName, "snapshot", req.SnapshotName)
 	s.recordVMEvent(ctx, req.VmName, "snapshot.restored", "ok", req.SnapshotName)
 	return s.vmToProto(ctx, req.VmName)
+}
+
+// How long, and how often, the daemon retries recording a restored VM's disk
+// path after the restore's own attempts failed. Variables for the tests.
+var (
+	pathRecordRetryEvery = 30 * time.Second
+	pathRecordRetryFor   = 15 * time.Minute
+)
+
+// recordRestoredDiskPath keeps trying to bring a restored VM's disk record
+// to the file it runs on, under the VM's lock, until it succeeds or
+// pathRecordRetryFor has passed, and says which as the VM's event.
+func (s *Server) recordRestoredDiskPath(vmName, snapshotName string) {
+	ctx := context.Background()
+	deadline := time.Now().Add(pathRecordRetryFor)
+	for time.Now().Before(deadline) {
+		time.Sleep(pathRecordRetryEvery)
+		unlock := s.lockVM(vmName)
+		err := s.reconcileDiskPathsErr(ctx, vmName)
+		unlock()
+		if err == nil {
+			slog.Info("snapshot restore: disk path recorded on retry", "vm", vmName, "snapshot", snapshotName)
+			s.recordVMEvent(ctx, vmName, "snapshot.restore-path-recorded", "ok", snapshotName)
+			return
+		}
+	}
+	slog.Error("snapshot restore: disk path still not recorded; take a snapshot to record it", "vm", vmName, "snapshot", snapshotName)
+	s.recordVMEvent(ctx, vmName, "snapshot.restore-path-unrecorded", "error",
+		"retries ended; `lv snapshot create "+vmName+" <name>` records the path — do not migrate or redefine the VM until it is")
 }
 
 // RestoreWarningHeader is the response header RestoreSnapshot says, on a

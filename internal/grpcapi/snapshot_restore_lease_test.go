@@ -235,20 +235,54 @@ func TestRestoreSnapshot_RefusedWhileALiveHolderHasTheLease(t *testing.T) {
 	}
 }
 
-// Re-review R2-M2: a restore of an older snapshot moves the VM to a new
-// overlay, so a record that could not be brought along names a later
-// snapshot's layer. Such a restore fails loudly — naming what to do —
-// rather than reporting success over a record anything working from it
-// (a cold migration's copy, a define from the record) would act on.
-func TestRestoreSnapshot_FailsWhenTheDiskPathCannotBeRecorded(t *testing.T) {
+// Re-review R2-M2 and R3-M1: a restore of an older snapshot moves the VM to
+// a new overlay, so a record that could not be brought along names a later
+// snapshot's layer. The restore did happen and the VM runs: its running
+// state is recorded all the same, the error says so and names safe
+// actions — never "restore again", which would throw away what the VM has
+// written since — and the daemon keeps trying to record the path itself.
+func TestRestoreSnapshot_AnUnrecordedDiskPathStillRecordsTheRunningVM(t *testing.T) {
+	oldEvery, oldFor := pathRecordRetryEvery, pathRecordRetryFor
+	pathRecordRetryEvery, pathRecordRetryFor = 20*time.Millisecond, 10*time.Second
+	t.Cleanup(func() { pathRecordRetryEvery, pathRecordRetryFor = oldEvery, oldFor })
+
 	s := lockTestServer(t)
 	fake := seedRestorableVM(t, s, "disk")
+	if err := corrosion.UpdateVMState(adminCtx(), s.db, "rs", "stopped", ""); err != nil {
+		t.Fatal(err)
+	}
 	fake.OnRevertSnapshot = func(domain, snap string) {
-		fake.FailDomainDiskSources = func(string) error { return errors.New("libvirt connection lost") }
+		fake.SetFailDomainDiskSources(func(string) error { return errors.New("libvirt connection lost") })
 	}
 	_, err := s.RestoreSnapshot(adminCtx(), &pb.RestoreSnapshotRequest{VmName: "rs", SnapshotName: "s1"})
 	if status.Code(err) != codes.Internal || !strings.Contains(err.Error(), "disk path") {
 		t.Fatalf("RestoreSnapshot = %v, want an error saying the disk path was not recorded", err)
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "again") || !strings.Contains(msg, "lv inspect rs") || !strings.Contains(msg, "lv snapshot create rs") {
+		t.Errorf("the error does not name only safe actions: %s", msg)
+	}
+	if vm, _ := corrosion.GetVM(adminCtx(), s.db, "rs"); vm == nil || vm.State != "running" {
+		t.Fatalf("the restored VM is recorded %v, want running", vm)
+	}
+	// Once libvirt answers again, the daemon records the path itself.
+	fake.SetFailDomainDiskSources(nil)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		evs, _ := corrosion.ListVMEvents(adminCtx(), s.db, "rs", 50, "")
+		found := false
+		for _, e := range evs {
+			if e.Type == "snapshot.restore-path-recorded" {
+				found = true
+			}
+		}
+		if found {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the daemon did not record the path after libvirt answered again; events %+v", evs)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 

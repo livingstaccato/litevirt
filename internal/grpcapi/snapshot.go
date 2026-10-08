@@ -439,43 +439,40 @@ func (s *Server) DeleteSnapshot(ctx context.Context, req *pb.DeleteSnapshotReque
 	// Fetch the record first so we know whether to clean up a vmstate file.
 	snap, _ := corrosion.GetSnapshot(ctx, s.db, req.VmName, req.SnapshotName)
 
-	// Flatten when removing the LAST snapshot of a running, disk-type VM: a plain
-	// metadata-only delete leaves the VM on its overlay (the backing chain
-	// persists), which both blocks migration and lets the chain grow on every
-	// snapshot+delete cycle. FlattenSnapshot block-commits the overlay down into
-	// its base so the disk collapses to a single standalone file. Memory
-	// snapshots (own revert/RAM mechanism) and multi-snapshot chains keep the
-	// metadata-only delete; a flatten failure falls back to it too, so the
-	// snapshot is always removable.
+	// Deleting the VM's LAST snapshot merges its disk chain back down, running
+	// or stopped, disk or memory snapshot: the active layer (and any layer
+	// between) is committed into the lowest layer of the chain no other VM
+	// uses, and the layers above it are removed (FlattenSnapshot; running:
+	// block-commit + pivot, stopped: qemu-img commit + redefine). Without
+	// it every create/rm cycle leaves a layer, and after about 16 a start
+	// refuses the chain (review I-1; main merged too, through libvirt >= 9).
+	// A memory snapshot's RAM image is removed below anyway, so nothing still
+	// needs its overlay.
 	//
-	// The metadata-only delete (s.virt.DeleteSnapshot) touches no disk file:
-	// every file stays where every chain — this VM's later layers, its other
-	// snapshots' bases, a linked clone's — expects it. Only a flatten merges
-	// and removes, and only when nothing else is layered on the chain.
+	// Not merged, so every file stays where every chain expects it — the
+	// metadata-only delete touches no disk file:
+	//   - while another snapshot remains (its frozen layers must not change);
+	//   - for a layer another VM uses (a linked clone of it, recorded or found
+	//     by its header), or anything above such a layer;
+	//   - when any chain involved cannot be read (unknown is "used");
+	//   - when the VM is in any other state, or the merge fails before
+	//     writing (the fallback below).
 	existing, _ := corrosion.ListSnapshots(ctx, s.db, req.VmName)
-	// An errored snapshot (e.g. a failed --with-memory capture that still cut the
-	// disk overlay over) has no usable RAM image — its only residue is the disk
-	// overlay, so it must be flattened on delete even though Type=="memory";
-	// otherwise the VM is left stranded on an untracked overlay chain (G1).
-	flattenable := snap == nil || snap.Type != "memory" || snap.State == "error"
-	flatten := vm.State == "running" && len(existing) <= 1 && flattenable
-	// A flatten writes this VM's overlay into the snapshot's base and removes
-	// the overlay. Another VM layered on any file of this VM's chain — a
-	// linked clone, of this build or an earlier one — would lose its disk,
-	// so the files are kept instead: the metadata-only delete below touches
-	// no file. "Cannot tell" keeps them too.
-	if flatten {
-		if deps, err := s.vmChainDependents(ctx, req.VmName); err != nil || len(deps) > 0 {
-			slog.Info("delete snapshot: keeping the disk chain — other VMs are layered on it",
-				"vm", req.VmName, "snap", req.SnapshotName, "dependents", deps, "error", err)
-			flatten = false
+	var bases map[string]string
+	if len(existing) <= 1 && (vm.State == "running" || vm.State == "stopped") {
+		b, err := s.snapshotMergeBases(ctx, req.VmName)
+		if err != nil {
+			slog.Warn("delete snapshot: not merging the disk chain — what depends on it is unknown",
+				"vm", req.VmName, "snap", req.SnapshotName, "error", err)
+		} else {
+			bases = b
 		}
 	}
 
 	var delErr error
-	if flatten {
-		if delErr = s.virt.FlattenSnapshot(req.VmName, req.SnapshotName); delErr != nil {
-			slog.Warn("delete snapshot: flatten failed, falling back to metadata-only",
+	if len(bases) > 0 {
+		if delErr = s.virt.FlattenSnapshot(req.VmName, req.SnapshotName, bases); delErr != nil {
+			slog.Warn("delete snapshot: merge failed, falling back to metadata-only",
 				"vm", req.VmName, "snap", req.SnapshotName, "error", delErr)
 			delErr = s.virt.DeleteSnapshot(req.VmName, req.SnapshotName)
 		}

@@ -1,6 +1,7 @@
 package e2e
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -110,8 +111,9 @@ func TestLab_SnapshotDeleteKeepsALinkedClonesBacking(t *testing.T) {
 	if out, err := l.lv(h, "clone", src, clone, "--mode", "linked"); err != nil {
 		t.Fatalf("linked clone %s → %s: %v\n%s", src, clone, err, out)
 	}
+	// No delete that worked is refused: the snapshot goes, its files stay.
 	if out, err := l.lv(h, "snapshot", "rm", src, "s1"); err != nil {
-		t.Logf("snapshot rm %s s1 refused (allowed, the clone's backing is what matters): %v\n%s", src, err, out)
+		t.Fatalf("snapshot rm %s s1 was refused: %v\n%s", src, err, out)
 	}
 	if out, err := l.lv(h, "start", clone); err != nil {
 		t.Fatalf("the linked clone %s cannot start after its source's snapshot was deleted: %v\n%s", clone, err, out)
@@ -121,4 +123,54 @@ func TestLab_SnapshotDeleteKeepsALinkedClonesBacking(t *testing.T) {
 		t.Fatalf("%s is not running on any node", clone)
 	}
 	requireChainWhole(l, at, activeDisk(l, at, clone), "clone after rm s1")
+}
+
+// chainDepth is how many files make up disk's backing chain on host.
+func chainDepth(l *lab, host, disk string) int {
+	l.t.Helper()
+	out := l.mustSSH(host, 60*time.Second, "qemu-img info -U --backing-chain "+shellQuote(disk))
+	return strings.Count(out, "image: ")
+}
+
+// Review I-1: snapshot create/rm cycles — running and stopped, disk and
+// memory — leave the chain as deep as they found it, and the VM still
+// starts. Without the merge, a layer per cycle took the chain past the
+// 16 a start accepts.
+func TestLab_SnapshotCreateRmCyclesKeepTheChainDepth(t *testing.T) {
+	l := newLab(t)
+	h := labUpHosts(l, 1)[0]
+	vm := l.createVMs(h, "snapcyc", h)[h]
+	want := chainDepth(l, h, activeDisk(l, h, vm))
+	cycle := func(name string, args ...string) {
+		t.Helper()
+		if out, err := l.lv(h, append([]string{"snapshot", "create", vm, name}, args...)...); err != nil {
+			t.Fatalf("snapshot create %s %s: %v\n%s", vm, name, err, out)
+		}
+		if out, err := l.lv(h, "snapshot", "rm", vm, name); err != nil {
+			t.Fatalf("snapshot rm %s %s: %v\n%s", vm, name, err, out)
+		}
+		if got := chainDepth(l, h, activeDisk(l, h, vm)); got != want {
+			t.Fatalf("after %s the chain is %d deep, want %d", name, got, want)
+		}
+	}
+	for i := 0; i < 20; i++ {
+		cycle(fmt.Sprintf("run%d", i))
+	}
+	for i := 0; i < 3; i++ {
+		cycle(fmt.Sprintf("mem%d", i), "--memory")
+	}
+	l.mustLV(h, "stop", vm)
+	if !l.waitDomainState(h, vm, "shut off", 3*time.Minute) {
+		t.Fatalf("%s did not stop", vm)
+	}
+	for i := 0; i < 20; i++ {
+		cycle(fmt.Sprintf("off%d", i))
+	}
+	if out, err := l.lv(h, "start", vm); err != nil {
+		t.Fatalf("%s cannot be started after the cycles: %v\n%s", vm, err, out)
+	}
+	if !l.waitDomainState(h, vm, "running", 3*time.Minute) {
+		t.Fatalf("%s is not running after its start", vm)
+	}
+	requireChainWhole(l, h, activeDisk(l, h, vm), "after the cycles")
 }

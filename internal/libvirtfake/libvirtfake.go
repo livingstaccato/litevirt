@@ -58,6 +58,9 @@ type Event struct {
 
 // Fake satisfies grpcapi.LibvirtBackend.
 type Fake struct {
+	// FlattenBases records the bases each FlattenSnapshot call was given.
+	FlattenBases []map[string]string
+
 	execStdout, execStderr string
 	execExitCode           int32
 	mu                     sync.Mutex
@@ -1405,13 +1408,26 @@ func (f *Fake) DeleteSnapshot(domainName, snapshotName string) error {
 	f.record("snapshot-delete", domainName, snapshotName)
 	return nil
 }
-func (f *Fake) FlattenSnapshot(domainName, snapshotName string) error {
+
+// FlattenSnapshot models the merge: each disk named in bases is put back on
+// its base, as a block-commit's pivot (or an offline commit's redefine)
+// leaves the domain. FlattenBases records what each call was given.
+func (f *Fake) FlattenSnapshot(domainName, snapshotName string, bases map[string]string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, ok := f.snapshots[domainName][snapshotName]; !ok {
 		return fmt.Errorf("libvirtfake: no snapshot %q for %q", snapshotName, domainName)
 	}
 	delete(f.snapshots[domainName], snapshotName)
+	if len(bases) > 0 && f.diskSources[domainName] == nil {
+		f.diskSources[domainName] = map[string]string{}
+	}
+	cp := map[string]string{}
+	for dev, b := range bases {
+		f.diskSources[domainName][dev] = b
+		cp[dev] = b
+	}
+	f.FlattenBases = append(f.FlattenBases, cp)
 	f.record("snapshot-flatten", domainName, snapshotName)
 	return nil
 }

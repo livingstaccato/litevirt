@@ -3,6 +3,7 @@ package libvirt
 import (
 	"encoding/xml"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"strings"
@@ -204,62 +205,111 @@ func (c *Client) RevertToSnapshot(domainName, snapshotName string, restorePreDef
 	return fmt.Errorf("start domain %s after revert (disk lock not released after retries): %w", domainName, startErr)
 }
 
-// FlattenSnapshot live-merges (block-commit) each disk's active overlay down
-// into the named snapshot's base, then deletes the snapshot metadata. After
-// this the running VM is on a single standalone disk (the snapshot's base, now
-// holding all current data) — no backing chain — so it can be migrated and the
-// chain stops growing across snapshot+delete cycles.
+// FlattenSnapshot merges each disk's active layer down into bases[dev] and
+// then deletes the snapshot's metadata. bases names, per disk, the layer to
+// merge into — the caller (grpcapi) picks the lowest layer of the chain no
+// other VM uses, so nothing another chain reads is written or removed; a
+// disk not in bases is left as it is. Every layer above its base is removed
+// once the domain is on the base, so a snapshot create/rm cycle leaves the
+// chain as deep as it was.
 //
-// We commit only down to THIS snapshot's base (not to the bottom of the chain),
-// so a shared/lower base image (e.g. the OS image other VMs share) is never
-// touched. RUNNING domains only.
-func (c *Client) FlattenSnapshot(domainName, snapshotName string) error {
+//   - running: an active-layer block-commit bounded at the base, then a
+//     pivot onto it (qemu writes; nothing else opens the files);
+//   - shut off: qemu-img commit into the base, then the persistent
+//     definition is repointed at it.
+//
+// Any other state, or a base that is not in the disk's chain, is an error
+// before anything is written; the caller then deletes the metadata only.
+func (c *Client) FlattenSnapshot(domainName, snapshotName string, bases map[string]string) error {
 	dom, err := c.virt.DomainLookupByName(domainName)
 	if err != nil {
 		return fmt.Errorf("lookup domain %q: %w", domainName, err)
 	}
-	if st, _, sErr := c.virt.DomainGetState(dom, 0); sErr != nil || st != int32(golibvirt.DomainRunning) {
-		return fmt.Errorf("flatten requires a running domain")
+	st, _, sErr := c.virt.DomainGetState(dom, 0)
+	if sErr != nil {
+		return fmt.Errorf("domain state: %w", sErr)
+	}
+	running := st == int32(golibvirt.DomainRunning)
+	if !running && st != int32(golibvirt.DomainShutoff) {
+		return fmt.Errorf("flatten requires a running or shut-off domain")
 	}
 	snap, err := c.virt.DomainSnapshotLookupByName(dom, snapshotName, 0)
 	if err != nil {
 		return fmt.Errorf("snapshot %q not found: %w", snapshotName, err)
 	}
-	snapXML, err := c.virt.DomainSnapshotGetXMLDesc(snap, 0)
-	if err != nil {
-		return fmt.Errorf("get snapshot XML: %w", err)
+	flags := golibvirt.DomainXMLFlags(0)
+	if !running {
+		// Secure: the redefinition must keep the graphics password.
+		flags = golibvirt.DomainXMLInactive | golibvirt.DomainXMLSecure
 	}
-	base := parseSnapshotDomainDisks(snapXML) // dev → base (commit target)
-	domXML, err := c.virt.DomainGetXMLDesc(dom, 0)
+	domXML, err := c.virt.DomainGetXMLDesc(dom, flags)
 	if err != nil {
 		return fmt.Errorf("get domain XML: %w", err)
 	}
-	cur := parseDomainDiskSources(domXML) // dev → overlay (active)
+	cur := parseDomainDiskSources(domXML) // dev → active layer
 
-	for dev, basePath := range base {
-		overlay, ok := cur[dev]
-		if !ok || overlay == basePath {
-			continue // disk has no overlay to merge
+	type merge struct {
+		dev, top, base string
+		above          []string
+	}
+	var merges []merge
+	for dev, base := range bases {
+		top, ok := cur[dev]
+		if !ok {
+			return fmt.Errorf("disk %s is not in the domain", dev)
 		}
-		// Active-layer commit: merge the active overlay DOWN into basePath. base
-		// is set so the commit stops at this snapshot's base (lower layers, e.g.
-		// a shared OS image, are untouched); empty top = the active layer.
-		if err := c.virt.DomainBlockCommit(dom, dev,
-			golibvirt.OptString{basePath}, golibvirt.OptString{}, 0,
-			golibvirt.DomainBlockCommitActive); err != nil {
-			return fmt.Errorf("block-commit %s: %w", dev, err)
+		if resolvedPath(top) == resolvedPath(base) {
+			continue
 		}
-		if err := c.waitBlockJobReady(dom, dev); err != nil {
-			return fmt.Errorf("block-commit %s sync: %w", dev, err)
+		// Judged before anything is written: base must be in this chain.
+		above, err := layersAbove(top, base)
+		if err != nil {
+			return fmt.Errorf("disk %s: %w", dev, err)
 		}
-		// Pivot the active layer onto base, ending the job.
-		if err := c.virt.DomainBlockJobAbort(dom, dev, golibvirt.DomainBlockJobAbortPivot); err != nil {
-			return fmt.Errorf("pivot %s onto base: %w", dev, err)
+		merges = append(merges, merge{dev: dev, top: top, base: base, above: above})
+	}
+
+	if running {
+		for _, m := range merges {
+			// Active-layer commit bounded at the base: layers under it (a
+			// shared image, another VM's disk) are untouched.
+			if err := c.virt.DomainBlockCommit(dom, m.dev,
+				golibvirt.OptString{m.base}, golibvirt.OptString{}, 0,
+				golibvirt.DomainBlockCommitActive); err != nil {
+				return fmt.Errorf("block-commit %s: %w", m.dev, err)
+			}
+			if err := c.waitBlockJobReady(dom, m.dev); err != nil {
+				return fmt.Errorf("block-commit %s sync: %w", m.dev, err)
+			}
+			if err := c.virt.DomainBlockJobAbort(dom, m.dev, golibvirt.DomainBlockJobAbortPivot); err != nil {
+				return fmt.Errorf("pivot %s onto base: %w", m.dev, err)
+			}
 		}
-		os.Remove(overlay) // committed overlay is no longer referenced
+	} else if len(merges) > 0 {
+		newXML := domXML
+		for _, m := range merges {
+			if _, err := commitLayersOffline(m.top, m.base); err != nil {
+				return fmt.Errorf("disk %s: %w", m.dev, err)
+			}
+			out, changed, err := RewriteDiskSourceFile(newXML, m.dev, m.top, m.base)
+			if err != nil || !changed {
+				return fmt.Errorf("repoint disk %s at %s (changed=%v): %v", m.dev, m.base, changed, err)
+			}
+			newXML = out
+		}
+		// The data is in each base and every top still reads the same over
+		// it, so a failure here leaves a consistent (deeper) chain.
+		if _, err := c.virt.DomainDefineXML(newXML); err != nil {
+			return fmt.Errorf("redefine the domain on its merged disks: %w", err)
+		}
 	}
 
 	_ = c.virt.DomainSnapshotDelete(snap, golibvirt.DomainSnapshotDeleteMetadataOnly)
+	for _, m := range merges {
+		for _, err := range removeMergedLayers(m.above) {
+			slog.Warn("snapshot flatten: a merged layer could not be removed", "vm", domainName, "disk", m.dev, "error", err)
+		}
+	}
 	return nil
 }
 

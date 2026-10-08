@@ -98,12 +98,11 @@ type LibvirtBackend interface {
 	// DeleteSnapshot removes the snapshot's metadata only: it never merges,
 	// moves or deletes a disk file (see libvirt.Client.DeleteSnapshot).
 	DeleteSnapshot(domainName, snapshotName string) error
-	// FlattenSnapshot live-merges each disk's active overlay down into the named
-	// snapshot's base (block-commit + pivot), then drops the snapshot metadata —
-	// leaving the running VM on a single standalone disk (no backing chain). Used
-	// when deleting the last snapshot so the disk stops growing a chain and stays
-	// migratable. Running domains only.
-	FlattenSnapshot(domainName, snapshotName string) error
+	// FlattenSnapshot merges each disk's active layer down into bases[dev]
+	// (running: block-commit + pivot; shut off: qemu-img commit + redefine),
+	// removes the layers above, and drops the snapshot metadata. The caller
+	// picks bases no other VM uses (snapshotMergeBases).
+	FlattenSnapshot(domainName, snapshotName string, bases map[string]string) error
 	// Live/RAM snapshots (#3): capture guest RAM into vmstatePath alongside the
 	// external disk snapshot, and revert both to the snapshot instant.
 	CreateLiveSnapshot(domainName, snapshotName, vmstatePath string, captureSuspended func() error) (diskBytes, vmstateBytes int64, err error)

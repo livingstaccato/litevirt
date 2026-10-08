@@ -26,6 +26,7 @@ func newSnapDependentsFixture(t *testing.T) *snapDependentsFixture {
 	needQemuImg(t)
 	ctx := adminCtx()
 	s, fake := newDiskPathTestServer(t)
+	s.dataDir = t.TempDir()
 	dir := t.TempDir()
 	f := &snapDependentsFixture{s: s, fake: fake, dir: dir,
 		base:    filepath.Join(dir, "src-root.qcow2"),
@@ -44,6 +45,7 @@ func newSnapDependentsFixture(t *testing.T) *snapDependentsFixture {
 	}); err != nil {
 		t.Fatalf("InsertSnapshot: %v", err)
 	}
+	fake.SetDiskSource("src", "vda", f.base)
 	if _, err := fake.CreateSnapshot("src", "s1"); err != nil {
 		t.Fatalf("fake CreateSnapshot: %v", err)
 	}
@@ -130,4 +132,59 @@ func TestDeleteSnapshot_UnrecordedCloneFoundByItsHeaderKeepsTheFiles(t *testing.
 	f.cloneOn(t, f.overlay, "")
 	f.deleteS1(t)
 	f.requireNotFlattened(t)
+}
+
+// Review M-6c: a disk on this host whose file cannot be read (a pool not
+// mounted, lab line 69) and whose record names no backing may be a clone of
+// any layer: it counts as dependent, and nothing is merged or removed.
+func TestDeleteSnapshot_UnreadableDiskCountsAsDependent(t *testing.T) {
+	f := newSnapDependentsFixture(t)
+	if err := corrosion.InsertVM(adminCtx(), f.s.db,
+		corrosion.VMRecord{Name: "clone", HostName: "host-a", State: "stopped"}, nil,
+		[]corrosion.DiskRecord{{VMName: "clone", DiskName: "root", HostName: "host-a",
+			Path: filepath.Join(f.dir, "unmounted", "clone-root.qcow2"), StorageType: "local"}},
+	); err != nil {
+		t.Fatal(err)
+	}
+	f.deleteS1(t)
+	f.requireNotFlattened(t)
+}
+
+// A VM that is itself a linked clone (its own disk backs on another VM's)
+// still merges its snapshot layers — down to its own disk, never into the
+// disk it shares.
+func TestDeleteSnapshot_ALinkedCloneMergesDownToItsOwnDisk(t *testing.T) {
+	needQemuImg(t)
+	ctx := adminCtx()
+	s, fake := newDiskPathTestServer(t)
+	s.dataDir = t.TempDir()
+	dir := t.TempDir()
+	tmpl := filepath.Join(dir, "tmpl-root.qcow2")
+	own := filepath.Join(dir, "lc-root.qcow2")
+	top := filepath.Join(dir, "lc-root.s1")
+	runQemuImg(t, "create", "-q", "-f", "qcow2", tmpl, "1M")
+	runQemuImg(t, "create", "-q", "-f", "qcow2", "-F", "qcow2", "-b", tmpl, own)
+	runQemuImg(t, "create", "-q", "-f", "qcow2", "-F", "qcow2", "-b", own, top)
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{Name: "tmpl", HostName: "host-a", State: "stopped"}, nil,
+		[]corrosion.DiskRecord{{VMName: "tmpl", DiskName: "root", HostName: "host-a", Path: tmpl, StorageType: "local"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{Name: "lc", HostName: "host-a", State: "running"}, nil,
+		[]corrosion.DiskRecord{{VMName: "lc", DiskName: "root", HostName: "host-a", Path: top, StorageType: "local", BackingDisk: tmpl}}); err != nil {
+		t.Fatal(err)
+	}
+	fake.SetDiskSource("lc", "vda", own)
+	if _, err := fake.CreateSnapshot("lc", "s1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertSnapshot(ctx, s.db, corrosion.SnapshotRecord{ID: "lc-s1", VMName: "lc", HostName: "host-a", Name: "s1", State: "ok", Type: "disk"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DeleteSnapshot(ctx, &pb.DeleteSnapshotRequest{VmName: "lc", SnapshotName: "s1"}); err != nil {
+		t.Fatal(err)
+	}
+	srcs, _ := fake.DomainDiskSources("lc")
+	if srcs["vda"] != own {
+		t.Fatalf("the linked clone is on %s, want merged down onto its own disk %s (never into %s)", srcs["vda"], own, tmpl)
+	}
 }

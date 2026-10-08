@@ -102,6 +102,7 @@ func TestCreateSnapshot_FailedLiveCaptureRecordsErrorAndFlattens(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 	fake.SetState("lvm", libvirtfake.StateRunning)
+	realSnapChain(t, fake, "lvm", "s1")
 	fake.FailCreateLiveSnapshot = func(_, _ string) error { return errors.New("ram save boom") }
 
 	if _, err := s.CreateSnapshot(ctx, &pb.CreateSnapshotRequest{VmName: "lvm", Name: "s1", WithMemory: true}); err == nil {

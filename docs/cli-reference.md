@@ -689,15 +689,20 @@ lv snapshot restore <vm> <name>           # repeatable; memory snapshots are hos
 lv snapshot rm <vm> <name>
 ```
 
-`lv snapshot rm` never deletes a disk file that anything still backs on. It
-removes the snapshot's record. Only when it deletes the **last** snapshot of a
-**running** VM, a disk-only snapshot, with no other VM layered on any file of
-the VM's chain (a linked clone), does it also merge the VM's overlay into the
-snapshot's base and remove the overlay (layers under that base stay). In every
-other case — another snapshot remains, the VM is stopped, the snapshot is a
-memory snapshot, or a linked clone backs on the chain — every file stays where
-it is: the VM keeps its backing chain, and **the space the deleted snapshot
-held is not reclaimed**.
+`lv snapshot rm` never deletes or writes a disk file that anything else still
+uses. Deleting a VM's **last** snapshot, running or stopped, disk or memory,
+merges the VM's disk back down: the active layer, and any layer under it, is
+committed into the lowest layer of the chain no other VM uses (running: a
+block-commit; stopped: `qemu-img commit` and the definition repointed), and the
+layers above are removed — so a create/rm cycle leaves the chain as deep as it
+was. A layer a linked clone uses, and everything under it, is never written;
+when a chain involved cannot be read, nothing is merged.
+
+Deleting a snapshot while another remains keeps every file (the remaining
+snapshot's frozen layers must not change); its layer is merged when the last
+one is deleted. A VM start refuses a chain deeper than 16 layers and names the
+way out: delete the snapshots, or, with none left, `lv snapshot create <vm>
+merge` then `lv snapshot rm <vm> merge`.
 
 ## Memory ballooning
 

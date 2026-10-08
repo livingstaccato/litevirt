@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -17,6 +18,9 @@ import (
 // maxBackingDepth bounds a pre-checked backing chain, and an import's chain
 // walk (a legitimate foreign disk has at most a handful of snapshots).
 const maxBackingDepth = 16
+
+// errChainTooDeep is precheckChain's refusal of a chain past maxBackingDepth.
+var errChainTooDeep = errors.New("backing chain deeper than")
 
 // chainRule judges one backing file of a chain before anything opens it:
 // layer (the file naming it, resolved through symlinks) names resolved
@@ -73,7 +77,7 @@ func precheckChain(path string, rule chainRule) ([]string, error) {
 	}
 	for depth := 0; ; depth++ {
 		if depth > maxBackingDepth {
-			return nil, fmt.Errorf("backing chain deeper than %d", maxBackingDepth)
+			return nil, fmt.Errorf("%w %d", errChainTooDeep, maxBackingDepth)
 		}
 		// A regular file only, judged by stat before anything opens it (a
 		// FIFO would block the open, a device is no image).

@@ -689,6 +689,10 @@ lv snapshot restore <vm> <name>           # repeatable; memory snapshots are hos
 lv snapshot rm <vm> <name>
 ```
 
+A new snapshot's name may not contain `.`: libvirt names its overlay
+`<disk>.<name>`, and a dot would split the disk's name. A snapshot that already
+has one can still be restored and deleted.
+
 `lv snapshot rm` lets libvirt merge the snapshot's overlay into the disk it
 was taken of and remove the overlay; deleting the last disk-only snapshot of a
 running VM does the same with a block commit of its own. A restore leaves the

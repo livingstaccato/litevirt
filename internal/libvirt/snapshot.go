@@ -3,6 +3,7 @@ package libvirt
 import (
 	"encoding/xml"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"strings"
@@ -233,9 +234,7 @@ func revertToSnapshot(v snapshotAPI, domainName, snapshotName string, restorePre
 	// the snapshot survives even if the start below fails and the operator
 	// retries. The overlay is freshly reset over the same base, so the recorded
 	// point still holds. Best-effort.
-	if redom, lerr := v.DomainLookupByName(domainName); lerr == nil {
-		_, _ = v.DomainSnapshotCreateXML(redom, snapXML, uint32(golibvirt.DomainSnapshotCreateRedefine))
-	}
+	reregisterSnapshot(v, domainName, snapshotName, snapXML)
 
 	// Start, retrying on any residual lock-release race (the base stays
 	// read-only now, so this should not normally trigger).
@@ -584,10 +583,44 @@ func revertToLiveSnapshot(v snapshotAPI, domainName, snapshotName, vmstatePath s
 	// (best-effort) so the snapshot stays revertible AND deletable — the overlay
 	// is freshly reset over the same base, so the recorded snapshot point still
 	// holds. A failure here is non-fatal: the revert already succeeded.
-	if redom, lerr := v.DomainLookupByName(domainName); lerr == nil {
-		_, _ = v.DomainSnapshotCreateXML(redom, snapXML, uint32(golibvirt.DomainSnapshotCreateRedefine))
-	}
+	reregisterSnapshot(v, domainName, snapshotName, snapXML)
 	return nil
+}
+
+// reregisterSnapshot defines a reverted snapshot's metadata again, as
+// libvirt's CURRENT snapshot. The revert dropped it with a METADATA_ONLY
+// delete, which moved libvirt's current snapshot to its parent (or to none),
+// and the domain now runs on the snapshot's own overlay, freshly reset: it is
+// the snapshot the domain's state descends from, which is what "current"
+// means to libvirt.
+//
+// It matters because libvirt >= 9 decides on "current" alone how a later
+// plain delete treats the files (qemuSnapshotDeleteExternalPrepare): a
+// snapshot that is not current and has no children is taken for a leaf with
+// no overlay, and the disk its <domain> names — the base under the VM's live
+// overlay — is unlinked without a chain check. Redefined without CURRENT,
+// every restored snapshot became that (snapshot-repro.md: one memory
+// snapshot, restore, delete unlinked the VM's root disk). Redefined current,
+// a delete merges: the overlay is committed into the base and removed.
+//
+// Best-effort, as before; a redefine libvirt refuses as current is retried
+// as a plain one so the snapshot is not lost.
+func reregisterSnapshot(v snapshotAPI, domainName, snapshotName, snapXML string) {
+	redom, err := v.DomainLookupByName(domainName)
+	if err != nil {
+		slog.Warn("snapshot revert: domain not found to re-register the snapshot", "vm", domainName, "snapshot", snapshotName, "error", err)
+		return
+	}
+	_, err = v.DomainSnapshotCreateXML(redom, snapXML,
+		uint32(golibvirt.DomainSnapshotCreateRedefine|golibvirt.DomainSnapshotCreateCurrent))
+	if err == nil {
+		return
+	}
+	slog.Warn("snapshot revert: re-registering the snapshot as current failed; registering it plain",
+		"vm", domainName, "snapshot", snapshotName, "error", err)
+	if _, err := v.DomainSnapshotCreateXML(redom, snapXML, uint32(golibvirt.DomainSnapshotCreateRedefine)); err != nil {
+		slog.Warn("snapshot revert: re-registering the snapshot failed", "vm", domainName, "snapshot", snapshotName, "error", err)
+	}
 }
 
 // resetOverlay recreates overlay as a fresh, empty qcow2 backed by base,

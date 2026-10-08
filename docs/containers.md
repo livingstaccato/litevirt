@@ -63,12 +63,13 @@ paths:
   `<data_dir>/oci/<name>` or its `rootfs/`, the directory `lv ct pull --dest
   <name>` staged. A deeper path, or a library name that is a link out of the
   library, is not an item.
-- A library item belongs to the **project that pulled it** (`lv ct pull
-  --project <p>`, default `_default`), recorded on the pulling host in
-  `<data_dir>/oci-owners/<name>`. A caller without the Admin role may create a
-  container from it, or pull over it, only in that project; through a
-  forwarding node too. An image pulled before owners were recorded has no
-  record and stays usable by every project, as it was — nothing is backfilled.
+- `lv ct pull --project <p>` makes a library item **that project's**, recorded
+  on the pulling host in `<data_dir>/oci-owners/<name>`; `<p>` must be a
+  project the caller may create containers in. A caller without the Admin
+  role may then create a container from it, or pull over it, only in that
+  project; through a forwarding node too. A pull **without** `--project`
+  records no owner, and the image is everyone's, as on earlier releases — as
+  is every image pulled before owners were recorded (nothing is backfilled).
   The Admin may use any image.
 - Any other host path (`--template /srv/rootfs`, `rootfs:<path>`, a relative
   path, an absolute `lv ct pull --dest`, a local `oci:` source) needs

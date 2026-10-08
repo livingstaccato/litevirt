@@ -313,7 +313,7 @@ lv ct snapshot revert <name> <snapshot>                # roll back (stop → res
 lv ct snapshot rm <name> <snapshot>                    # delete a snapshot
 lv ct template <name> [--revert]                       # convert a stopped ct to a clone template
 lv ct clone <source> <new-name> [--project p] [--start] # full-copy clone with a fresh identity
-lv ct pull <image> --dest <name> [--project p]       # stage an OCI image; p owns it (non-admins of other projects may not use it)
+lv ct pull <image> --dest <name> [--project p]       # stage an OCI image; with --project only p (and Admin) may use it
 lv ct inspect <name> [--host h]                        # placement, limits, privilege mode, confinement
 lv ct convert <name> --unprivileged [--confinement default]  # stopped ct → an id range of its own
 lv ct convert <name> --confinement default|legacy      # change confinement (legacy: Admin only)

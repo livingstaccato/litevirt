@@ -534,7 +534,7 @@ func newCTPullCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&dest, "dest", "", "Destination rootfs directory")
 	cmd.Flags().StringVar(&tag, "tag", "", "Override image tag")
-	cmd.Flags().StringVar(&project, "project", "", "Project that owns the pulled image (default: _default); only it may create containers from it")
+	cmd.Flags().StringVar(&project, "project", "", "Project that owns the pulled image; only it (and Admin) may create containers from it (default: none, every project may)")
 	cmd.Flags().StringVar(&host, "host", "", "Target host")
 	cmd.Flags().BoolVar(&useLocal, "local", false, "Use the host-local runtime")
 	cmd.Flags().StringVarP(&username, "username", "u", "", "registry username for an ad-hoc authenticated pull")

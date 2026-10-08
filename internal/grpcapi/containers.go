@@ -724,6 +724,13 @@ func (s *Server) PullOCIImage(ctx context.Context, req *pb.PullOCIImageRequest) 
 		if _, err := safename.CanonicalProjectName(req.Project); err != nil {
 			return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 		}
+		// --project makes the image that project's, and is the project the
+		// pull-over rule checks: it must be one the caller may create
+		// containers in, judged here where the caller is real.
+		if err := s.RequirePerm(ctx, projectRBACBase(req.Project)+"/containers", "ct.create", "operator"); err != nil {
+			return nil, status.Errorf(codes.PermissionDenied,
+				"--project %q: you cannot create containers in that project, so you cannot pull an image for it", req.Project)
+		}
 	}
 	// Dest is where umoci unpacks the (untrusted) image rootfs as root, and a
 	// local oci: source is read as root — both are host-path primitives. A bare
@@ -798,7 +805,9 @@ func (s *Server) PullOCIImage(ctx context.Context, req *pb.PullOCIImageRequest) 
 	if err := s.containerRuntime.PullOCIImage(ctx, req.Image, req.Dest, req.Tag, req.Username, req.Password); err != nil {
 		return nil, status.Errorf(codes.Internal, "pull oci: %v", err)
 	}
-	if item != "" && s.dataDir != "" {
+	// Only an explicit --project makes the image a project's; without one it
+	// is everyone's, as on main.
+	if item != "" && s.dataDir != "" && req.Project != "" {
 		if err := s.writeOCIOwner(item, tenancy.NormalizeProject(req.Project)); err != nil {
 			slog.Warn("oci pull: could not record the image's owner; it stays usable by every project", "image", item, "error", err)
 		}

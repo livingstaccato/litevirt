@@ -13,6 +13,8 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/auth"
+	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
 // An OCI library item belongs to the project that pulled it. A non-admin may
@@ -95,5 +97,65 @@ func TestOCILibrary_ForwardCarriesTheOwnerRule(t *testing.T) {
 	_, _ = s.CreateContainer(adminCtx(), &pb.CreateContainerRequest{Name: "d", HostName: "host-b", Template: "download", Distro: "alpine"})
 	if len(peer.strict) != 3 || !peer.strict[0] || !peer.strict[1] || peer.strict[2] {
 		t.Fatalf("forwarded owner marks = %v, want [true true false]", peer.strict)
+	}
+}
+
+// A pull without --project records no owner: the image is everyone's, as on
+// main.
+func TestOCILibrary_PullWithoutProjectIsGlobal(t *testing.T) {
+	s, _ := ctPathServer(t)
+	if _, err := s.PullOCIImage(ctOperatorCtx(), &pb.PullOCIImageRequest{Image: "nginx:1", Dest: "nginx"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(s.dataDir, ociOwnersDir, "nginx")); !os.IsNotExist(err) {
+		t.Fatalf("a pull without --project recorded an owner: %v", err)
+	}
+	item := mkCTRootfs(t, filepath.Join(s.dataDir, "oci", "nginx", "rootfs"))
+	if _, err := s.CreateContainer(ctOperatorCtx(), &pb.CreateContainerRequest{Name: "w", Template: item, Project: "acme"}); err != nil {
+		t.Fatalf("acme from a global image: %v", err)
+	}
+}
+
+// --project is the caller's: naming a project the caller cannot create
+// containers in is refused, so the pull-over rule cannot be passed by naming
+// the owner's project.
+func TestOCILibrary_PullProjectIsBoundToTheCaller(t *testing.T) {
+	s, _ := ctPathServer(t)
+	ctx := context.Background()
+	if err := corrosion.InsertUser(ctx, s.db, "bob", "operator", "x"); err != nil {
+		t.Fatal(err)
+	}
+	if err := auth.SeedBuiltinRoles(ctx, s.db); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertRole(ctx, s.db, corrosion.RoleRecord{Name: "Puller", Verbs: []string{"image.pull"}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range []corrosion.RoleBindingRecord{
+		{ID: "bob-pull", Path: "/", Role: "Puller", Principal: "user:bob@local", Propagate: true},
+		{ID: "bob-beta", Path: "/projects/beta", Role: "Operator", Principal: "user:bob@local", Propagate: true},
+	} {
+		if err := corrosion.InsertRoleBinding(ctx, s.db, b); err != nil {
+			t.Fatal(err)
+		}
+	}
+	engine := auth.NewEngine(s.db)
+	if err := engine.Reload(ctx); err != nil {
+		t.Fatal(err)
+	}
+	s.SetAuthEngine(engine)
+	bob := context.WithValue(context.WithValue(context.Background(), ctxKeyUsername, "bob"), ctxKeyRole, "operator")
+
+	if _, err := s.PullOCIImage(bob, &pb.PullOCIImageRequest{Image: "x:1", Dest: "acmeimg", Project: "acme"}); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("bob pulling for acme: %v", err)
+	}
+	if err := s.writeOCIOwner("theirs", "acme"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PullOCIImage(bob, &pb.PullOCIImageRequest{Image: "x:1", Dest: "theirs", Project: "acme"}); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("bob pulling over acme's image as acme: %v", err)
+	}
+	if _, err := s.PullOCIImage(bob, &pb.PullOCIImageRequest{Image: "x:1", Dest: "betaimg", Project: "beta"}); err != nil {
+		t.Fatalf("bob pulling for beta: %v", err)
 	}
 }

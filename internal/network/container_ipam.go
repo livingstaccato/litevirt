@@ -17,7 +17,17 @@ import (
 // it's ours, so we never overwrite it (the read-back returns reserved=false and
 // the caller degrades to a blank IP). Cross-host lease MOVES are done explicitly
 // by the mover, which knows the full prior owner.
+//
+// The lease is keyed on the bare host address (LeaseAddr): "10.0.0.5/24" and
+// "10.0.0.5" are one address, so they are one lease. Live rows written before
+// that normalisation can still be keyed with a prefix, so they are checked here
+// at read time — a live lease on the same host address held by anyone else
+// refuses the reserve — rather than rewritten.
 func ReserveContainerIP(ctx context.Context, db *corrosion.Client, network, ip, mac, host, ctName string) (bool, error) {
+	ip = LeaseAddr(ip)
+	if taken, err := hostAddrHeldByOther(ctx, db, network, ip, "ct", host, ctName); err != nil || taken {
+		return false, err
+	}
 	now := db.NowTS()
 	allocAt := time.Now().UTC().Format(time.RFC3339)
 	// Resurrect a tombstone, or idempotently refresh OUR OWN live lease; never
@@ -156,4 +166,28 @@ func ReserveContainerNICs(ctx context.Context, db *corrosion.Client, host, ctNam
 		}
 	}
 	return unreserved, firstErr
+}
+
+// hostAddrHeldByOther reports whether a LIVE lease on network names the same
+// host address as ip under any spelling, and is owned by someone other than
+// (kind, host, name). It is the read-time half of the non-aliasing guarantee:
+// the (network, ip) primary key only catches an identical spelling.
+func hostAddrHeldByOther(ctx context.Context, db *corrosion.Client, network, ip, ownerKind, ownerHost, name string) (bool, error) {
+	rows, err := db.Query(ctx,
+		`SELECT ip, vm_name, COALESCE(owner_kind, 'vm') AS owner_kind, COALESCE(owner_host, '') AS owner_host
+		 FROM ip_allocations WHERE network = ? AND deleted_at IS NULL`, network)
+	if err != nil {
+		return false, err
+	}
+	want := LeaseAddr(ip)
+	for _, r := range rows {
+		if LeaseAddr(r.String("ip")) != want {
+			continue
+		}
+		if r.String("vm_name") == name && r.String("owner_kind") == ownerKind && r.String("owner_host") == ownerHost {
+			continue
+		}
+		return true, nil
+	}
+	return false, nil
 }

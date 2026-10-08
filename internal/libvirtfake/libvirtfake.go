@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/litevirt/litevirt/internal/libvirt"
+	"github.com/litevirt/litevirt/internal/qcow2"
 )
 
 // State describes a single domain's lifecycle. Mirrors what
@@ -1413,7 +1414,9 @@ func (f *Fake) DeleteSnapshot(domainName, snapshotName string) error {
 
 // FlattenSnapshot models the merge: each disk named in bases is put back on
 // its base, as a block-commit's pivot (or an offline commit's redefine)
-// leaves the domain. FlattenBases records what each call was given.
+// leaves the domain, and the layers above it are given back — found by
+// walking real qcow2 headers from the old top when the files exist, as the
+// real merge does. FlattenBases records what each call was given.
 func (f *Fake) FlattenSnapshot(domainName, snapshotName string, bases map[string]string) ([]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -1425,13 +1428,44 @@ func (f *Fake) FlattenSnapshot(domainName, snapshotName string, bases map[string
 		f.diskSources[domainName] = map[string]string{}
 	}
 	cp := map[string]string{}
+	var above []string
 	for dev, b := range bases {
+		above = append(above, layersAboveIfFiles(f.diskSources[domainName][dev], b)...)
 		f.diskSources[domainName][dev] = b
 		cp[dev] = b
 	}
 	f.FlattenBases = append(f.FlattenBases, cp)
 	f.record("snapshot-flatten", domainName, snapshotName)
-	return nil, nil
+	return above, nil
+}
+
+// layersAboveIfFiles is top and every layer of its qcow2 chain above base,
+// resolved — or nothing, when the chain cannot be walked to base.
+func layersAboveIfFiles(top, base string) []string {
+	resolved := func(p string) string {
+		if r, err := filepath.EvalSymlinks(p); err == nil {
+			return r
+		}
+		return filepath.Clean(p)
+	}
+	want := resolved(base)
+	var out []string
+	for p, i := top, 0; p != "" && i < 256; i++ {
+		if resolved(p) == want {
+			return out
+		}
+		info, err := qcow2.Info(p)
+		if err != nil {
+			return nil
+		}
+		out = append(out, resolved(p))
+		b := info.BackingFile
+		if b != "" && !filepath.IsAbs(b) {
+			b = filepath.Join(filepath.Dir(p), b)
+		}
+		p = b
+	}
+	return nil
 }
 
 func (f *Fake) CreateLiveSnapshot(domainName, snapshotName, vmstatePath string, captureSuspended func() error) (diskBytes, vmstateBytes int64, err error) {

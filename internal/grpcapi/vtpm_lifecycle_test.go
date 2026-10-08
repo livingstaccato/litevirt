@@ -96,13 +96,14 @@ func TestCreateSnapshot_FailedLiveCaptureRecordsErrorAndFlattens(t *testing.T) {
 	s.virt = fake
 	s.dataDir = t.TempDir()
 	ctx := adminCtx()
+	base, _ := realSnapChain(t, fake, "lvm", "s1")
+	// The merge judges a disk by the VM's record of it.
 	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
 		Name: "lvm", HostName: s.hostName, Spec: `{"name":"lvm"}`, State: "running",
-	}, nil, nil); err != nil {
+	}, nil, []corrosion.DiskRecord{{VMName: "lvm", DiskName: "root", HostName: s.hostName, Path: base, StorageType: "local"}}); err != nil {
 		t.Fatalf("InsertVM: %v", err)
 	}
 	fake.SetState("lvm", libvirtfake.StateRunning)
-	realSnapChain(t, fake, "lvm", "s1")
 	fake.FailCreateLiveSnapshot = func(_, _ string) error { return errors.New("ram save boom") }
 
 	if _, err := s.CreateSnapshot(ctx, &pb.CreateSnapshotRequest{VmName: "lvm", Name: "s1", WithMemory: true}); err == nil {

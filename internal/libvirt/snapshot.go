@@ -205,21 +205,30 @@ func (c *Client) RevertToSnapshot(domainName, snapshotName string, restorePreDef
 	return fmt.Errorf("start domain %s after revert (disk lock not released after retries): %w", domainName, startErr)
 }
 
-// FlattenSnapshot merges each disk's active layer down into bases[dev] and
-// then deletes the snapshot's metadata. bases names, per disk, the layer to
-// merge into — the caller (grpcapi) picks the lowest layer of the chain no
-// other VM uses, so nothing another chain reads is written or removed; a
-// disk not in bases is left as it is. Every layer above its base is removed
-// once the domain is on the base, so a snapshot create/rm cycle leaves the
-// chain as deep as it was.
+// FlattenSnapshot deletes the snapshot's libvirt metadata, then merges each
+// disk's active layer down into bases[dev], and returns the layers the
+// domain no longer uses — for the caller to remove once its own record
+// names the base too. bases names, per disk, the layer to merge into, as the
+// disk's chain spells it: the caller (grpcapi) picks it within the VM's own
+// snapshot layers, so nothing another chain reads is written or removed; a
+// disk not in bases is left as it is.
 //
 //   - running: an active-layer block-commit bounded at the base, then a
 //     pivot onto it (qemu writes; nothing else opens the files);
 //   - shut off: qemu-img commit into the base, then the persistent
 //     definition is repointed at it.
 //
-// Any other state, or a base that is not in the disk's chain, is an error
-// before anything is written; the caller then deletes the metadata only.
+// Order. Every base is judged first (in the disk's chain, every layer above
+// it plain qcow2); nothing is written when one is not. The metadata goes
+// next, before any byte of the frozen layer changes: a revert can never
+// reach a snapshot whose frozen layer holds later data. The layers are given
+// up only once the persistent definition names every base — libvirt
+// rewrites it on a pivot only when the live and persistent sources match —
+// and are kept, with a WARN, when it does not.
+//
+// Any other state is an error before anything is written. A failure after
+// the metadata delete returns the error and gives up nothing: each disk
+// still reads its current data, from its top or (pivoted) its base.
 func (c *Client) FlattenSnapshot(domainName, snapshotName string, bases map[string]string) ([]string, error) {
 	return flattenSnapshot(c.virt, domainName, snapshotName, bases)
 }
@@ -247,10 +256,6 @@ func flattenSnapshot(v flattenAPI, domainName, snapshotName string, bases map[st
 	running := st == int32(golibvirt.DomainRunning)
 	if !running && st != int32(golibvirt.DomainShutoff) {
 		return nil, fmt.Errorf("flatten requires a running or shut-off domain")
-	}
-	snap, err := v.DomainSnapshotLookupByName(dom, snapshotName, 0)
-	if err != nil {
-		return nil, fmt.Errorf("snapshot %q not found: %w", snapshotName, err)
 	}
 	flags := golibvirt.DomainXMLFlags(0)
 	if !running {
@@ -282,6 +287,15 @@ func flattenSnapshot(v flattenAPI, domainName, snapshotName string, bases map[st
 			return nil, fmt.Errorf("disk %s: %w", dev, err)
 		}
 		merges = append(merges, merge{dev: dev, top: top, base: base, above: above})
+	}
+
+	// The metadata first (review M-3). A snapshot already gone is fine.
+	if snap, err := v.DomainSnapshotLookupByName(dom, snapshotName, 0); err == nil {
+		if err := v.DomainSnapshotDelete(snap, golibvirt.DomainSnapshotDeleteMetadataOnly); err != nil {
+			return nil, fmt.Errorf("delete snapshot %q metadata: %w", snapshotName, err)
+		}
+	} else if !IsNotFound(err) {
+		return nil, fmt.Errorf("snapshot %q: %w", snapshotName, err)
 	}
 
 	if running {
@@ -318,16 +332,41 @@ func flattenSnapshot(v flattenAPI, domainName, snapshotName string, bases map[st
 			return nil, fmt.Errorf("redefine the domain on its merged disks: %w", err)
 		}
 	}
-
-	_ = v.DomainSnapshotDelete(snap, golibvirt.DomainSnapshotDeleteMetadataOnly)
-	var removed []string
-	for _, m := range merges {
-		for _, err := range removeMergedLayers(m.above) {
-			slog.Warn("snapshot flatten: a merged layer could not be removed", "vm", domainName, "disk", m.dev, "error", err)
-		}
-		removed = append(removed, m.above...)
+	if len(merges) == 0 {
+		return nil, nil
 	}
-	return removed, nil
+
+	// Review M-2: give up nothing the persistent definition still names.
+	inactive, err := v.DomainGetXMLDesc(dom, golibvirt.DomainXMLInactive)
+	if err != nil {
+		slog.Warn("snapshot flatten: cannot read the persistent definition — the merged layers are kept",
+			"vm", domainName, "error", err)
+		return nil, nil
+	}
+	persistent := parseDomainDiskSources(inactive)
+	var removable []string
+	for _, m := range merges {
+		if resolvedPath(persistent[m.dev]) != resolvedPath(m.base) {
+			slog.Warn("snapshot flatten: the persistent definition does not name the merged base — its layers are kept",
+				"vm", domainName, "disk", m.dev, "base", m.base, "persistent", persistent[m.dev], "layers", m.above)
+			continue
+		}
+		removable = append(removable, m.above...)
+	}
+	named := map[string]bool{}
+	for _, src := range persistent {
+		named[resolvedPath(src)] = true
+	}
+	var out []string
+	for _, l := range removable {
+		if named[resolvedPath(l)] {
+			slog.Warn("snapshot flatten: the persistent definition still names a merged layer — it is kept",
+				"vm", domainName, "layer", l)
+			continue
+		}
+		out = append(out, l)
+	}
+	return out, nil
 }
 
 // waitBlockJobReady polls a disk's block job until it has synced (cur >= end),

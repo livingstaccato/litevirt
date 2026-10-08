@@ -62,15 +62,15 @@ func (s *Server) verifyDiskChainForStart(ctx context.Context, vm *corrosion.VMRe
 	}
 	if _, err := precheckChain(file, rule); err != nil && !errors.Is(err, errReachedImageStore) {
 		if errors.Is(err, errChainTooDeep) {
-			slog.Error("start refused: a disk's backing chain is too deep", "vm", vm.Name, "disk", d.DiskName, "file", file, "error", err)
+			held := s.chainHolders(ctx, vm.Name, file)
+			slog.Error("start refused: a disk's backing chain is too deep", "vm", vm.Name, "disk", d.DiskName, "file", file, "held_by", held, "error", err)
 			return status.Errorf(codes.FailedPrecondition,
 				"disk %q of %q (%s) cannot be started: its %v layers. Each snapshot deleted while another "+
-					"remained, or while another VM used the disk's layers, left one in the chain. Delete the VM's "+
-					"snapshots (`lv snapshot rm %s <name>`): deleting the last one merges every layer no other VM "+
-					"uses, running or stopped. With none left, `lv snapshot create %s merge` then "+
-					"`lv snapshot rm %s merge` does it. A linked clone of this VM keeps the layers it uses: delete "+
-					"it, or re-create it with `lv clone <source> <name> --mode full`, first",
-				d.DiskName, vm.Name, filepath.Base(file), err, vm.Name, vm.Name, vm.Name)
+					"remained, or while something else needed the disk's layers, left one in the chain. Delete the "+
+					"VM's snapshots (`lv snapshot rm %s <name>`): deleting the last one merges this VM's own snapshot "+
+					"layers down to its disk, running or stopped, except layers something else needs. With none left, "+
+					"`lv snapshot create %s merge` then `lv snapshot rm %s merge` does it. %s",
+				d.DiskName, vm.Name, filepath.Base(file), err, vm.Name, vm.Name, vm.Name, held)
 		}
 		slog.Error("start refused: a disk's backing chain names a file the VM may not read", "vm", vm.Name, "disk", d.DiskName, "file", file, "error", err)
 		return status.Errorf(codes.FailedPrecondition,

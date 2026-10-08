@@ -691,18 +691,24 @@ lv snapshot rm <vm> <name>
 
 `lv snapshot rm` never deletes or writes a disk file that anything else still
 uses. Deleting a VM's **last** snapshot, running or stopped, disk or memory,
-merges the VM's disk back down: the active layer, and any layer under it, is
-committed into the lowest layer of the chain no other VM uses (running: a
-block-commit; stopped: `qemu-img commit` and the definition repointed), and the
-layers above are removed — so a create/rm cycle leaves the chain as deep as it
-was. A layer a linked clone uses, and everything under it, is never written;
-when a chain involved cannot be read, nothing is merged.
+merges the VM's own snapshot layers back down: the active layer, and any of
+the VM's snapshot layers under it, is committed into the lowest of them that
+nothing else needs — the VM's own disk at most (running: a block-commit;
+stopped: `qemu-img commit` and the definition repointed) — and the layers above
+are removed, so a create/rm cycle leaves the chain as deep as it was. A merge
+never writes below the VM's own disk: a pool's shared image, a template, a
+promoted VM's replica and the image store are never written. A layer a linked
+clone uses, a layer another libvirt snapshot froze (recorded or not), and
+everything under either, is never written; when a chain involved cannot be
+read, nothing is merged.
 
 Deleting a snapshot while another remains keeps every file (the remaining
 snapshot's frozen layers must not change); its layer is merged when the last
 one is deleted. A VM start refuses a chain deeper than 16 layers and names the
 way out: delete the snapshots, or, with none left, `lv snapshot create <vm>
-merge` then `lv snapshot rm <vm> merge`.
+merge` then `lv snapshot rm <vm> merge`; and it names any VM layered on the
+chain, which keeps its layers until it is deleted or re-created as a full
+clone.
 
 ## Memory ballooning
 

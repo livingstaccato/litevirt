@@ -42,12 +42,17 @@ func (s *Server) reconcileDiskPaths(ctx context.Context, vmName string) {
 	if err != nil {
 		return
 	}
+	// The directory is compared resolved: a record and a domain may name one
+	// directory through different symlinks (review I-4).
+	key := func(p string) string {
+		return filepath.Join(resolvedOr(filepath.Dir(s.hostDiskFile(p))), diskStem(filepath.Base(p)))
+	}
 	liveByStem := make(map[string]string, len(live))
 	for _, src := range live {
-		liveByStem[diskStem(src)] = src
+		liveByStem[key(src)] = src
 	}
 	for _, d := range disks {
-		src, ok := liveByStem[diskStem(d.Path)]
+		src, ok := liveByStem[key(d.Path)]
 		if !ok || src == d.Path {
 			continue
 		}

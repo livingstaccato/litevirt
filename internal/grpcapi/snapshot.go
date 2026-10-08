@@ -441,8 +441,9 @@ func (s *Server) DeleteSnapshot(ctx context.Context, req *pb.DeleteSnapshotReque
 
 	// Deleting the VM's LAST snapshot merges its disk chain back down, running
 	// or stopped, disk or memory snapshot: the active layer (and any layer
-	// between) is committed into the lowest layer of the chain no other VM
-	// uses, and the layers above it are removed (FlattenSnapshot; running:
+	// between) is committed into the lowest of this VM's own snapshot layers
+	// that nothing else needs — its own disk, at most (snapshotMergeBases) —
+	// and the layers above it are removed (FlattenSnapshot; running:
 	// block-commit + pivot, stopped: qemu-img commit + redefine). Without
 	// it every create/rm cycle leaves a layer, and after about 16 a start
 	// refuses the chain (review I-1; main merged too, through libvirt >= 9).
@@ -457,23 +458,34 @@ func (s *Server) DeleteSnapshot(ctx context.Context, req *pb.DeleteSnapshotReque
 	//   - when any chain involved cannot be read (unknown is "used");
 	//   - when the VM is in any other state, or the merge fails before
 	//     writing (the fallback below).
+	//
+	// Order: FlattenSnapshot drops libvirt's metadata before it writes, and
+	// gives back the layers the domain no longer names; the record is moved
+	// onto the base, and only then are those layers removed. A crash at any
+	// point leaves a domain and a record on a file that reads the VM's data.
 	existing, _ := corrosion.ListSnapshots(ctx, s.db, req.VmName)
-	var bases map[string]string
+	var targets map[string]mergeTarget
 	if len(existing) <= 1 && (vm.State == "running" || vm.State == "stopped") {
 		b, err := s.snapshotMergeBases(ctx, req.VmName, req.SnapshotName)
 		if err != nil {
 			slog.Warn("delete snapshot: not merging the disk chain — what depends on it is unknown",
 				"vm", req.VmName, "snap", req.SnapshotName, "error", err)
 		} else {
-			bases = b
+			targets = b
 		}
 	}
 
 	var delErr error
-	if len(bases) > 0 {
-		if _, delErr = s.virt.FlattenSnapshot(req.VmName, req.SnapshotName, bases); delErr != nil {
+	var merged []string
+	if len(targets) > 0 {
+		bases := map[string]string{}
+		for dev, t := range targets {
+			bases[dev] = t.base
+		}
+		if merged, delErr = s.virt.FlattenSnapshot(req.VmName, req.SnapshotName, bases); delErr != nil {
 			slog.Warn("delete snapshot: merge failed, falling back to metadata-only",
 				"vm", req.VmName, "snap", req.SnapshotName, "error", delErr)
+			merged = nil
 			delErr = s.virt.DeleteSnapshot(req.VmName, req.SnapshotName)
 		}
 	} else {
@@ -507,8 +519,12 @@ func (s *Server) DeleteSnapshot(ctx context.Context, req *pb.DeleteSnapshotReque
 
 	// Deleting an external snapshot makes libvirt consolidate the chain, often
 	// leaving the active disk named after the (now-gone) snapshot — reconcile
-	// the recorded path to whatever the live domain ended up on.
+	// the recorded path to whatever the live domain ended up on. A merged
+	// disk's record is moved onto its base by the record it was judged by,
+	// before any layer it no longer needs is removed.
+	s.recordMergedBases(ctx, req.VmName, targets)
 	s.reconcileDiskPaths(ctx, req.VmName)
+	s.removeMergedLayers(ctx, req.VmName, merged)
 
 	slog.Info("snapshot deleted", "vm", req.VmName, "snapshot", req.SnapshotName)
 	s.recordVMEvent(ctx, req.VmName, "snapshot.deleted", "ok", req.SnapshotName)

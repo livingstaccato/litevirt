@@ -1,8 +1,8 @@
 package libvirt
 
 import (
+	"encoding/xml"
 	"fmt"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -87,18 +87,6 @@ func commitLayersOffline(top, base string) ([]string, error) {
 	return above, nil
 }
 
-// removeMergedLayers removes layers a merge left unused, logging (not
-// failing on) a file that will not go: the merge is complete either way.
-func removeMergedLayers(layers []string) []error {
-	var errs []error
-	for _, l := range layers {
-		if err := os.Remove(l); err != nil && !os.IsNotExist(err) {
-			errs = append(errs, err)
-		}
-	}
-	return errs
-}
-
 // SnapshotBaseFiles lists every snapshot libvirt holds for the domain with
 // the files its embedded domain's disks were on (the layers it froze). The
 // snapshot metadata belongs to the domain, so it is the same list whether the
@@ -129,11 +117,41 @@ func snapshotBaseFiles(v snapshotListAPI, domainName string) (map[string][]strin
 		if err != nil {
 			return nil, fmt.Errorf("snapshot %q of %q: %w", sn.Name, domainName, err)
 		}
-		files := []string{}
-		for _, f := range parseSnapshotDomainDisks(x) {
-			files = append(files, f)
+		files, err := snapshotFrozenSources(x)
+		if err != nil {
+			return nil, fmt.Errorf("snapshot %q of %q: %w", sn.Name, domainName, err)
 		}
 		out[sn.Name] = files
 	}
 	return out, nil
+}
+
+// snapshotFrozenSources is every disk source (a file or a block device) of
+// the domain a snapshot's XML embeds — the layers it froze. XML that does not
+// parse is an error, never "froze nothing" (review M-4).
+func snapshotFrozenSources(snapXML string) ([]string, error) {
+	var snap struct {
+		Domain struct {
+			Devices struct {
+				Disks []struct {
+					Source struct {
+						File string `xml:"file,attr"`
+						Dev  string `xml:"dev,attr"`
+					} `xml:"source"`
+				} `xml:"disk"`
+			} `xml:"devices"`
+		} `xml:"domain"`
+	}
+	if err := xml.Unmarshal([]byte(snapXML), &snap); err != nil {
+		return nil, fmt.Errorf("parse snapshot XML: %w", err)
+	}
+	files := []string{}
+	for _, d := range snap.Domain.Devices.Disks {
+		for _, f := range []string{d.Source.File, d.Source.Dev} {
+			if f != "" {
+				files = append(files, f)
+			}
+		}
+	}
+	return files, nil
 }

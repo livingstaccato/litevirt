@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -64,6 +65,14 @@ func TestDeleteSnapshot_CreateRmCyclesKeepTheChainDepth(t *testing.T) {
 				disks, _ := corrosion.GetVMDisks(context.Background(), s.db, "cyc")
 				if len(disks) != 1 || disks[0].Path != root {
 					t.Fatalf("cycle %d: recorded disks %+v, want the root at %s", i, disks, root)
+				}
+				// The merged overlay is removed once the domain and the
+				// record are on the root; the root stays.
+				if _, err := os.Stat(overlay); !os.IsNotExist(err) {
+					t.Fatalf("cycle %d: the merged overlay %s is still there (%v)", i, overlay, err)
+				}
+				if _, err := os.Stat(root); err != nil {
+					t.Fatalf("cycle %d: the root is gone: %v", i, err)
 				}
 			}
 		})

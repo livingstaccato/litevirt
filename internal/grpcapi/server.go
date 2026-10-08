@@ -667,7 +667,7 @@ type Server struct {
 	lxcStore string
 
 	recreateSecMu sync.Mutex
-	recreateSec   map[string]corrosion.ContainerCreateSpec
+	recreateSec   map[string]recreatedMember
 
 	// admissionMu makes this node a single serialization point for its
 	// reserve-then-verify decisions: it is held from a provisional claim's

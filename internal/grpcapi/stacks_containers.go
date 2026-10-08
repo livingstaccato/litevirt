@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"strings"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/compose/planner"
@@ -17,7 +20,11 @@ import (
 // the deploy executor for OpDelete and the delete half of an OpUpdate recreate.
 func (s *Server) deleteWorkload(ctx context.Context, a planner.VMAction) error {
 	if a.IsContainer && a.Kind == planner.OpUpdate {
-		s.rememberRecreatedSecurity(ctx, a)
+		// Judged before anything is deleted: a refused recreate leaves the
+		// member running as it is.
+		if err := s.rememberRecreatedSecurity(ctx, a); err != nil {
+			return err
+		}
 	}
 	if a.IsContainer {
 		_, err := s.DeleteContainer(ctx, &pb.DeleteContainerRequest{HostName: a.TargetHost, Name: a.VMName, Force: true})
@@ -160,7 +167,7 @@ func securityInherited(ctx context.Context) bool {
 
 // rememberRecreatedSecurity records the outgoing container's security before
 // a recreate deletes it.
-func (s *Server) rememberRecreatedSecurity(ctx context.Context, a planner.VMAction) {
+func (s *Server) rememberRecreatedSecurity(ctx context.Context, a planner.VMAction) error {
 	var rec *corrosion.ContainerRecord
 	if a.TargetHost != "" {
 		rec, _ = corrosion.GetContainer(ctx, s.db, a.TargetHost, a.VMName)
@@ -171,33 +178,82 @@ func (s *Server) rememberRecreatedSecurity(ctx context.Context, a planner.VMActi
 		}
 	}
 	if rec == nil {
-		return
+		return nil
+	}
+	if err := s.mayKeepMemberSecurity(ctx, a.VMName, rec.Project, corrosion.DecodeCreateSpec(rec.CreateSpec)); err != nil {
+		return err
 	}
 	s.recreateSecMu.Lock()
 	defer s.recreateSecMu.Unlock()
 	if s.recreateSec == nil {
-		s.recreateSec = map[string]corrosion.ContainerCreateSpec{}
+		s.recreateSec = map[string]recreatedMember{}
 	}
-	s.recreateSec[a.VMName] = corrosion.DecodeCreateSpec(rec.CreateSpec)
+	s.recreateSec[a.VMName] = recreatedMember{spec: corrosion.DecodeCreateSpec(rec.CreateSpec), project: rec.Project}
+	return nil
+}
+
+// mayKeepMemberSecurity refuses a caller recreating a privileged or
+// legacy-confined member who could not create one (not Admin) and holds no
+// ct.exec on the member (root inside it already). Dropping the member to
+// unprivileged instead would break the workload behind their back.
+func (s *Server) mayKeepMemberSecurity(ctx context.Context, name, project string, spec corrosion.ContainerCreateSpec) error {
+	privileged := spec.IDMapBase == 0
+	if !privileged && spec.Confinement == lxc.ConfinementDefault {
+		return nil
+	}
+	if RequireRole(ctx, "admin") == nil {
+		return nil
+	}
+	if err := s.RequirePerm(ctx, ctRBACPathFor(project, name), "ct.exec", "operator"); err != nil {
+		what := "legacy-confined"
+		if privileged {
+			what = "privileged"
+		}
+		return status.Errorf(codes.PermissionDenied,
+			"container %q is %s; recreating it keeps that, which needs the Admin role or ct.exec on it (root inside it already): "+
+				"ask an Admin to deploy this change, or move it over first with lv ct convert --unprivileged --confinement default %s",
+			name, what, name)
+	}
+	return nil
+}
+
+// recreatedMember is what a recreate remembers of the container it replaces.
+type recreatedMember struct {
+	spec    corrosion.ContainerCreateSpec
+	project string
 }
 
 // inheritRecreatedSecurity applies a recreate's remembered security to req
 // when the stack file states none, and returns the context to create with.
-func (s *Server) inheritRecreatedSecurity(ctx context.Context, a planner.VMAction, d *compose.VMDef, req *pb.CreateContainerRequest) context.Context {
+//
+// Carrying a privileged or legacy-confined member over is allowed only to a
+// caller who could create one (Admin) or who holds ct.exec on the member being
+// replaced — root inside it already. Anyone else is refused, by name: dropping
+// the member to unprivileged instead would break the workload behind their
+// back.
+func (s *Server) inheritRecreatedSecurity(ctx context.Context, a planner.VMAction, d *compose.VMDef, req *pb.CreateContainerRequest) (context.Context, error) {
 	if a.Kind != planner.OpUpdate {
-		return ctx
+		return ctx, nil
 	}
 	s.recreateSecMu.Lock()
-	spec, ok := s.recreateSec[a.VMName]
+	m, ok := s.recreateSec[a.VMName]
 	delete(s.recreateSec, a.VMName)
 	s.recreateSecMu.Unlock()
 	if !ok || d.Privileged || d.Confinement != "" {
-		return ctx
+		return ctx, nil
 	}
-	req.Privileged = spec.IDMapBase == 0
-	req.Confinement = spec.Confinement
+	req.Privileged = m.spec.IDMapBase == 0
+	req.Confinement = m.spec.Confinement
 	if req.Confinement == "" {
 		req.Confinement = lxc.ConfinementLegacy
 	}
-	return withInheritedSecurity(ctx)
+	if !req.Privileged && req.Confinement == lxc.ConfinementDefault {
+		return ctx, nil
+	}
+	// Checked before the delete too (rememberRecreatedSecurity); again here,
+	// where the carried-over opt-out is granted.
+	if err := s.mayKeepMemberSecurity(ctx, a.VMName, m.project, m.spec); err != nil {
+		return ctx, err
+	}
+	return withInheritedSecurity(ctx), nil
 }

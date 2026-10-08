@@ -450,7 +450,10 @@ func (s *Server) deployCreatePlanned(ctx context.Context, action planner.VMActio
 			if err != nil {
 				return err
 			}
-			createCtx := s.inheritRecreatedSecurity(ctx, action, vmDef, ctReq)
+			createCtx, err := s.inheritRecreatedSecurity(ctx, action, vmDef, ctReq)
+			if err != nil {
+				return fmt.Errorf("create container %q: %w", action.VMName, err)
+			}
 			if _, err := s.CreateContainer(createCtx, ctReq); err != nil {
 				return fmt.Errorf("create container %q: %w", action.VMName, err)
 			}

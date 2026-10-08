@@ -1,6 +1,7 @@
 package grpcapi
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -229,5 +230,22 @@ func TestRestoreSnapshot_RefusedWhileALiveHolderHasTheLease(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// Re-review R2-M2: a restore of an older snapshot moves the VM to a new
+// overlay, so a record that could not be brought along names a later
+// snapshot's layer. Such a restore fails loudly — naming what to do —
+// rather than reporting success over a record anything working from it
+// (a cold migration's copy, a define from the record) would act on.
+func TestRestoreSnapshot_FailsWhenTheDiskPathCannotBeRecorded(t *testing.T) {
+	s := lockTestServer(t)
+	fake := seedRestorableVM(t, s, "disk")
+	fake.OnRevertSnapshot = func(domain, snap string) {
+		fake.FailDomainDiskSources = func(string) error { return errors.New("libvirt connection lost") }
+	}
+	_, err := s.RestoreSnapshot(adminCtx(), &pb.RestoreSnapshotRequest{VmName: "rs", SnapshotName: "s1"})
+	if status.Code(err) != codes.Internal || !strings.Contains(err.Error(), "disk path") {
+		t.Fatalf("RestoreSnapshot = %v, want an error saying the disk path was not recorded", err)
 	}
 }

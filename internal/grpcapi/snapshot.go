@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -452,7 +453,25 @@ func (s *Server) RestoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotReq
 
 	// Revert may leave the domain on an overlay (memory revert resets it in
 	// place; disk-only revert restores the original) — reconcile either way.
-	s.reconcileDiskPaths(ctx, req.VmName)
+	// A restore of an older snapshot moves the VM to a new overlay, so a
+	// record left behind names a later snapshot's layer, which a cold
+	// migration's copy or a define from the record would run the VM on
+	// (re-review R2-M2). It is retried, and a restore whose record could not
+	// be brought along fails loudly instead of reporting success.
+	var recErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if recErr = s.reconcileDiskPathsErr(ctx, req.VmName); recErr == nil {
+			break
+		}
+		time.Sleep(time.Duration(attempt+1) * 200 * time.Millisecond)
+	}
+	if recErr != nil {
+		s.recordVMEvent(ctx, req.VmName, "snapshot.restore-path-unrecorded", "error", recErr.Error())
+		return nil, status.Errorf(codes.Internal,
+			"snapshot %q of %q was restored, but recording the VM's disk path failed: %v; "+
+				"the record may still name a later snapshot's file — restore %q again to record it, "+
+				"before migrating or redefining the VM", req.SnapshotName, req.VmName, recErr, req.SnapshotName)
+	}
 
 	// After revert, VM may be running or paused depending on snapshot type. A lost
 	// "running" write is low-harm (the reconciler heals from libvirt), so record

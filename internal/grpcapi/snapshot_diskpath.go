@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"path/filepath"
 	"strings"
@@ -30,18 +31,25 @@ func diskStem(p string) string {
 // touches disk contents. Matching is by filename stem so it holds whether the
 // extension is .qcow2 (canonical) or .<snapname> (overlay).
 func (s *Server) reconcileDiskPaths(ctx context.Context, vmName string) {
+	_ = s.reconcileDiskPathsErr(ctx, vmName)
+}
+
+// reconcileDiskPathsErr is reconcileDiskPaths, reporting whether every
+// recorded path could be brought to the live source.
+func (s *Server) reconcileDiskPathsErr(ctx context.Context, vmName string) error {
 	if s.virt == nil || s.db == nil {
-		return
+		return nil
 	}
 	live, err := s.virt.DomainDiskSources(vmName)
 	if err != nil {
 		slog.Warn("snapshot: read live disk sources for reconcile failed", "vm", vmName, "error", err)
-		return
+		return fmt.Errorf("read the domain's disk sources: %w", err)
 	}
 	disks, err := corrosion.GetVMDisks(ctx, s.db, vmName)
 	if err != nil {
-		return
+		return fmt.Errorf("read the VM's disk records: %w", err)
 	}
+	var firstErr error
 	liveByStem := make(map[string]string, len(live))
 	for _, src := range live {
 		liveByStem[diskStem(src)] = src
@@ -53,9 +61,13 @@ func (s *Server) reconcileDiskPaths(ctx context.Context, vmName string) {
 		}
 		if err := corrosion.UpdateVMDiskPath(ctx, s.db, vmName, d.DiskName, src); err != nil {
 			slog.Warn("snapshot: reconcile disk path failed", "vm", vmName, "disk", d.DiskName, "error", err)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("record disk %s at %s: %w", d.DiskName, src, err)
+			}
 			continue
 		}
 		slog.Info("snapshot: reconciled disk path to live source",
 			"vm", vmName, "disk", d.DiskName, "from", d.Path, "to", src)
 	}
+	return firstErr
 }

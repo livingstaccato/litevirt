@@ -199,6 +199,9 @@ type Fake struct {
 	// OnRevertSnapshot runs inside RevertToSnapshot and RevertToLiveSnapshot,
 	// while the revert holds the domain down, as libvirt's revert does.
 	OnRevertSnapshot func(domain, snap string)
+	// FailDomainDiskSources, when set, runs at the start of
+	// DomainDiskSources and its error is returned.
+	FailDomainDiskSources func(domain string) error
 	// RevertNotCurrent makes a revert succeed but report that libvirt would
 	// not take the snapshot back as current (libvirt.RestoredNotCurrentError).
 	RevertNotCurrent bool
@@ -1473,6 +1476,11 @@ func (f *Fake) SetDiskSource(domain, dev, src string) {
 func (f *Fake) DomainDiskSources(domain string) (map[string]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if fail := f.FailDomainDiskSources; fail != nil {
+		if err := fail(domain); err != nil {
+			return nil, err
+		}
+	}
 	out := map[string]string{}
 	for k, v := range f.diskSources[domain] {
 		out[k] = v

@@ -295,6 +295,12 @@ func (f *fakeCTRuntime) RevertContainer(_ context.Context, name string, r io.Rea
 		f.reverted = map[string][]byte{}
 	}
 	f.reverted[name] = data
+	if sec, ok := f.revertSecurity[name]; ok {
+		if f.security == nil {
+			f.security = map[string]lxc.Security{}
+		}
+		f.security[name] = sec
+	}
 	return nil
 }
 func (f *fakeCTRuntime) CloneContainer(_ context.Context, src, dst string) error {

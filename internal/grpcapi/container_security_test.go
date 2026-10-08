@@ -256,3 +256,47 @@ func TestPrepareContainerTarget_PeerOnly(t *testing.T) {
 		t.Fatalf("operator call: %v", err)
 	}
 }
+
+// A revert to a snapshot taken before the container was converted lays down
+// the snapshot's privileged config; the container keeps its CURRENT mode and
+// range, taken from the row, never from the snapshot.
+func TestRevertContainerSnapshot_KeepsTheCurrentPrivilegeMode(t *testing.T) {
+	s, rt := secServer(t)
+	const base = 1_000_196_608
+	seedSecCT(t, s, rt, "web", "stopped", corrosion.ContainerCreateSpec{Template: "download", IDMapBase: base, Confinement: lxc.ConfinementDefault})
+	if _, err := s.SnapshotContainer(adminCtx(), &pb.SnapshotContainerRequest{Name: "web", HostName: "host-a", Snapshot: "pre"}); err != nil {
+		t.Fatal(err)
+	}
+	rt.security = map[string]lxc.Security{"web": {IDMap: &lxc.IDMap{Base: base, Size: lxc.IDMapSize}, Confinement: lxc.ConfinementDefault}}
+	rt.revertSecurity = map[string]lxc.Security{"web": {Confinement: lxc.ConfinementLegacy}} // the snapshot's config
+	if _, err := s.RevertContainerSnapshot(adminCtx(), &pb.RevertContainerSnapshotRequest{Name: "web", HostName: "host-a", Snapshot: "pre"}); err != nil {
+		t.Fatal(err)
+	}
+	sec := rt.security["web"]
+	if sec.IDMap == nil || sec.IDMap.Base != base || sec.Confinement != lxc.ConfinementDefault {
+		t.Fatalf("after revert the container is %+v (idmap %+v), want unprivileged at %d with default confinement", sec, sec.IDMap, base)
+	}
+}
+
+// The revert's restart is a start: an overlapping range refuses it.
+func TestRevertContainerSnapshot_RestartRunsTheOverlapCheck(t *testing.T) {
+	s, rt := secServer(t)
+	seedSecCT(t, s, rt, "a", "running", corrosion.ContainerCreateSpec{Template: "download", IDMapBase: 1_000_000_000})
+	seedSecCT(t, s, rt, "b", "running", corrosion.ContainerCreateSpec{Template: "download", IDMapBase: 1_000_000_000})
+	if _, err := s.SnapshotContainer(adminCtx(), &pb.SnapshotContainerRequest{Name: "b", HostName: "host-a", Snapshot: "s"}); err != nil {
+		t.Fatal(err)
+	}
+	rt.listNames = []string{"a", "b"}
+	rt.security = map[string]lxc.Security{
+		"a": {IDMap: &lxc.IDMap{Base: 1_000_000_000, Size: lxc.IDMapSize}},
+		"b": {IDMap: &lxc.IDMap{Base: 1_000_000_000, Size: lxc.IDMapSize}},
+	}
+	before := len(rt.startCalls)
+	_, err := s.RevertContainerSnapshot(adminCtx(), &pb.RevertContainerSnapshotRequest{Name: "b", HostName: "host-a", Snapshot: "s"})
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "lv ct convert") {
+		t.Fatalf("revert restart in an overlapping range: %v", err)
+	}
+	if len(rt.startCalls) != before {
+		t.Fatal("restarted anyway")
+	}
+}

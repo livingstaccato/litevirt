@@ -453,3 +453,44 @@ func (s *Server) prepareMigrateTarget(ctx context.Context, target string, rec *c
 	}
 	return nil
 }
+
+// keepRecordedSecurity makes a container's on-disk config carry the privilege
+// mode, range and confinement its row records, converting it back when a
+// restore of an older copy (a snapshot revert) laid down different ones. The
+// row is the authority: it is what lv ct inspect and lv doctor report and what
+// range allocation counts. A row from an earlier build records nothing, and
+// whatever the copy carries stays. A privileged row over an unprivileged copy
+// cannot be undone by a convert (it only tightens) and is left, logged.
+func (s *Server) keepRecordedSecurity(ctx context.Context, rec *corrosion.ContainerRecord) error {
+	sc, ok := s.containerRuntime.(containerSecurer)
+	if !ok {
+		return nil
+	}
+	spec := corrosion.DecodeCreateSpec(rec.CreateSpec)
+	if spec.IDMapBase == 0 && spec.Confinement == "" {
+		return nil
+	}
+	cur, err := sc.ContainerSecurity(rec.Name)
+	if err != nil {
+		return status.Errorf(codes.Internal, "read the restored container's security: %v", err)
+	}
+	var to lxc.ConvertOpts
+	if spec.IDMapBase != 0 && (cur.IDMap == nil || cur.IDMap.Base != spec.IDMapBase) {
+		to.IDMap = &lxc.IDMap{Base: spec.IDMapBase, Size: lxc.IDMapSize}
+	}
+	if spec.IDMapBase == 0 && cur.IDMap != nil {
+		slog.Warn("container: the restored copy is unprivileged but the container is recorded privileged; left unprivileged",
+			"container", rec.Name, "range", cur.IDMap.Base)
+	}
+	if spec.Confinement != "" && cur.Confinement != spec.Confinement {
+		to.Confinement = spec.Confinement
+	}
+	if to.IDMap == nil && to.Confinement == "" {
+		return nil
+	}
+	if err := sc.ConvertContainerSecurity(ctx, rec.Name, to); err != nil {
+		return status.Errorf(codes.Internal,
+			"restore the container's recorded privilege mode after the revert: %v (it refuses to start until lv ct convert finishes)", err)
+	}
+	return nil
+}

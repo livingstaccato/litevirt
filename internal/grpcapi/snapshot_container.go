@@ -286,7 +286,17 @@ func (s *Server) RevertContainerSnapshot(ctx context.Context, req *pb.RevertCont
 		return nil, status.Errorf(codes.Internal, "revert: %v", err)
 	}
 	s.reportDroppedAttrs(ctx, req.Name, "snapshot.revert")
+	// The snapshot's config carries the privilege mode and range it was taken
+	// with; the container keeps the ones it has now (the row's).
+	if err := s.keepRecordedSecurity(ctx, rec); err != nil {
+		s.audit(ctx, "ct.snapshot.revert", req.Name, "project="+project, "error")
+		return nil, err
+	}
 	if wasRunning {
+		if err := s.refuseOverlappingRange(ctx, req.Name); err != nil {
+			s.audit(ctx, "ct.snapshot.revert", req.Name, "project="+project+" (restart refused: id range overlap)", "error")
+			return nil, err
+		}
 		if err := s.containerRuntime.StartContainer(ctx, req.Name); err != nil {
 			s.audit(ctx, "ct.snapshot.revert", req.Name, "project="+project+" (restart failed)", "error")
 			return nil, status.Errorf(codes.Internal, "reverted but restart failed: %v", err)

@@ -627,6 +627,11 @@ lv ct snapshot rm web before-upgrade
 A snapshot freezes a running container (for a consistent point-in-time), tars
 its on-disk dir, and stores it **host-local** under `{dataDir}/ct-snapshots`.
 
+- **Revert keeps the container's current security.** A snapshot taken before
+  `lv ct convert` carries the old privileged config; the revert converts the
+  restored copy back to the privilege mode, range and confinement the
+  container has now (its record), so it never silently runs privileged again.
+  The restart refuses an overlapping id range like `lv ct start`.
 - **Revert** stops the container (replacing the rootfs requires it stopped),
   restores the snapshot in place, and restarts it if it had been running. The
   restore is **crash-safe** — the live dir is set aside and rolled back if the

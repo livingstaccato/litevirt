@@ -350,8 +350,7 @@ func TestPrepareContainerTarget_ValidatesTheRange(t *testing.T) {
 		{IdmapBase: 1, IdmapSize: 1 << 30, Name: "moving", SourceHost: "peer-1"},                 // the host's own ids
 		{IdmapBase: slot(3), IdmapSize: 1 << 20, Name: "moving", SourceHost: "peer-1"},           // not a container range
 		{IdmapBase: slot(3) + 1, IdmapSize: lxc.IDMapSize, Name: "moving", SourceHost: "peer-1"}, // misaligned
-		{IdmapBase: slot(defaultIDMapRanges), IdmapSize: lxc.IDMapSize, Name: "moving", SourceHost: "peer-1"},
-		{IdmapBase: slot(5), IdmapSize: lxc.IDMapSize, Name: "moving", SourceHost: "peer-1"}, // other's range
+		{IdmapBase: slot(5), IdmapSize: lxc.IDMapSize, Name: "moving", SourceHost: "peer-1"},     // other's range
 	} {
 		if _, err := s.PrepareContainerTarget(peer, bad); err == nil {
 			t.Errorf("accepted %+v", bad)
@@ -386,5 +385,30 @@ func TestAllocateIDMapBase_AConvertMarkersRangeIsTaken(t *testing.T) {
 	}
 	if got == first {
 		t.Fatalf("allocated %d, the range an unfinished convert of another container holds", got)
+	}
+}
+
+// A range outside the target's configured span (a backup restored from
+// another cluster, nodes with different settings) is prepared when it is a
+// free, aligned slot there; only a real overlap is refused.
+func TestPrepareContainerTarget_AcceptsAFreeSlotOutsideTheSpan(t *testing.T) {
+	s := newPeerAuthServer(t)
+	rt := &ensureRecorder{fakeCTRuntime: &fakeCTRuntime{}}
+	s.SetContainerRuntime(rt)
+	ctx := context.Background()
+	outside := int64(500_000_000) // another cluster's range, below this span
+	if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{HostName: "self", Name: "near", State: "running",
+		CreateSpec: corrosion.EncodeCreateSpec(corrosion.ContainerCreateSpec{Template: "download", IDMapBase: outside + 2*lxc.IDMapSize})}); err != nil {
+		t.Fatal(err)
+	}
+	peer := mtlsAdminCtx("peer-1")
+	if _, err := s.PrepareContainerTarget(peer, &pb.PrepareContainerTargetRequest{IdmapBase: outside, IdmapSize: lxc.IDMapSize, Name: "m", SourceHost: "peer-1"}); err != nil {
+		t.Fatalf("a free aligned slot outside the span: %v", err)
+	}
+	if _, err := s.PrepareContainerTarget(peer, &pb.PrepareContainerTargetRequest{IdmapBase: outside + 2*lxc.IDMapSize, IdmapSize: lxc.IDMapSize, Name: "m", SourceHost: "peer-1"}); err == nil {
+		t.Fatal("a slot another container records was prepared")
+	}
+	if len(rt.got) != 1 || rt.got[0] != outside {
+		t.Fatalf("ensured %v", rt.got)
 	}
 }

@@ -542,20 +542,30 @@ func (s *Server) revertKeepingSecurity(ctx context.Context, rec *corrosion.Conta
 	return rc.RevertContainerConverting(ctx, rec.Name, r, to)
 }
 
-// validatePreparedRange admits only a container range: lxc.IDMapSize ids at a
-// slot of the configured span, which no container other than the one being
-// migrated records. A trusted peer is not thereby trusted to append any
-// root: line to /etc/subuid.
+// validatePreparedRange admits only a container-shaped range that is free
+// here: exactly lxc.IDMapSize ids above the host's own ids and below the
+// 32-bit limit (a slot of this host's span when inside it), overlapping no range another
+// container records (a row other than the migrating one's) or runs with on
+// this host's disk. It need not lie in this host's configured span: a backup
+// restored from another cluster keeps its range, and nodes can be configured
+// differently; only an overlap would put two containers in one range. A
+// trusted peer is not thereby trusted to append any root: line to
+// /etc/subuid.
 func (s *Server) validatePreparedRange(ctx context.Context, req *pb.PrepareContainerTargetRequest) error {
-	base, n := s.idmapConfig()
 	if req.IdmapSize != lxc.IDMapSize {
 		return status.Errorf(codes.InvalidArgument, "idmap_size %d: a container range is %d ids", req.IdmapSize, lxc.IDMapSize)
 	}
-	off := req.IdmapBase - base
-	if req.IdmapBase < base || off%lxc.IDMapSize != 0 || off/lxc.IDMapSize >= int64(n) {
+	if req.IdmapBase < lxc.IDMapSize || req.IdmapBase > 4294967295-lxc.IDMapSize {
 		return status.Errorf(codes.InvalidArgument,
-			"idmap_base %d is not a container range of this cluster (%d ranges from %d)", req.IdmapBase, n, base)
+			"idmap_base %d is not a container range (%d ids above the host's own ids, within 32 bits)", req.IdmapBase, lxc.IDMapSize)
 	}
+	// Inside this host's span a range is one of its slots; outside it (another
+	// cluster's or another configuration's range) only freedom is required.
+	cfgBase, n := s.idmapConfig()
+	if req.IdmapBase >= cfgBase && req.IdmapBase < cfgBase+int64(n)*lxc.IDMapSize && (req.IdmapBase-cfgBase)%lxc.IDMapSize != 0 {
+		return status.Errorf(codes.InvalidArgument, "idmap_base %d is inside this host's span but not one of its slots", req.IdmapBase)
+	}
+	overlaps := func(b int64) bool { return b < req.IdmapBase+lxc.IDMapSize && req.IdmapBase < b+lxc.IDMapSize }
 	rows, err := corrosion.ListContainers(ctx, s.db, "")
 	if err != nil {
 		return status.Errorf(codes.Unavailable, "read container id ranges: %v", err)
@@ -564,9 +574,18 @@ func (s *Server) validatePreparedRange(ctx context.Context, req *pb.PrepareConta
 		if r.HostName == req.SourceHost && r.Name == req.Name {
 			continue
 		}
-		if corrosion.DecodeCreateSpec(r.CreateSpec).IDMapBase == req.IdmapBase {
+		if b := corrosion.DecodeCreateSpec(r.CreateSpec).IDMapBase; b != 0 && overlaps(b) {
 			return status.Errorf(codes.FailedPrecondition,
-				"id range %d is container %s/%s's; it cannot be prepared for %s", req.IdmapBase, r.HostName, r.Name, req.Name)
+				"id range %d overlaps container %s/%s's; it cannot be prepared for %s (give it a fresh range first: lv ct convert --unprivileged %s)",
+				req.IdmapBase, r.HostName, r.Name, req.Name, req.Name)
+		}
+	}
+	for n, sec := range s.localContainerSecurity(ctx) {
+		if n == req.Name {
+			continue
+		}
+		if sec.IDMap != nil && overlaps(sec.IDMap.Base) {
+			return status.Errorf(codes.FailedPrecondition, "id range %d overlaps container %q's on this host", req.IdmapBase, n)
 		}
 	}
 	return nil

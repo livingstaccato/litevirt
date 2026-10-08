@@ -114,6 +114,11 @@ func TestContainerHardening_UnprivilegedByDefault(t *testing.T) {
 			t.Errorf("rootfs /etc/passwd stat %+v (%v), want owner %d: the rootfs was not shifted", st, err, base)
 		}
 	}
+	if fi, err := os.Stat(ctDir(name)); err != nil || fi.Mode().Perm() != 0o770 {
+		t.Errorf("%s: %v %v, want 0770 (no traversal by other host users)", ctDir(name), fi.Mode().Perm(), err)
+	} else if st, ok := fi.Sys().(*syscall.Stat_t); !ok || int64(st.Uid) != base {
+		t.Errorf("%s owned by %v, want the mapped root %d", ctDir(name), st, base)
+	}
 	if out := lv(t, "ct", "inspect", name, "--host", localHost); !strings.Contains(out, "Privileged:") || !strings.Contains(out, "no (ids "+strconv.FormatInt(base, 10)) {
 		t.Errorf("inspect does not report the range:\n%s", out)
 	}

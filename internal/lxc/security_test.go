@@ -130,6 +130,9 @@ func TestCreate_UnprivilegedMapsAndShifts(t *testing.T) {
 	uid, gid := os.Getuid(), os.Getgid()
 	var shifted, outside int
 	for _, c := range *calls {
+		if c.path == filepath.Dir(rootfs) {
+			continue // the container directory, given to its mapped root
+		}
 		if !strings.HasPrefix(c.path, rootfs) {
 			outside++
 			continue
@@ -159,8 +162,10 @@ func TestCreate_UnprivilegedIDMappedMount(t *testing.T) {
 		t.Fatal(err)
 	}
 	mustContain(t, readCfg(t, r, "c1"), "lxc.rootfs.options = idmap=container\n")
-	if len(*calls) != 0 {
-		t.Fatalf("an idmapped rootfs was chowned: %+v", *calls)
+	for _, c := range *calls {
+		if strings.HasPrefix(c.path, filepath.Join(r.Lxcpath, "c1", "rootfs")) {
+			t.Fatalf("an idmapped rootfs was chowned: %+v", *calls)
+		}
 	}
 	if sec, _ := r.Security("c1"); !sec.IDMappedMount {
 		t.Fatalf("Security = %+v", sec)

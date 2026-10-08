@@ -355,6 +355,9 @@ func (r *LxcRunner) Convert(_ context.Context, name string, to ConvertOpts) erro
 	if err := r.applySecurity(name, confinement, from, idmap, idmapped && idmap != nil); err != nil {
 		return err
 	}
+	if err := r.secureContainerDir(name); err != nil {
+		return err
+	}
 	if err := os.Remove(filepath.Join(dir, convertMarkerFile)); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
@@ -479,4 +482,27 @@ func covered(p string, idmap *IDMap) bool {
 		}
 	}
 	return false
+}
+
+// secureContainerDir makes <lxcpath>/<name> untraversable by other host users,
+// as LXC makes a container directory: 0770, owned by the container's mapped
+// root when it is unprivileged (the container reaches its rootfs through it)
+// and left root's otherwise. A rootfs may hold setuid binaries and file
+// capabilities (a restore keeps them), and a host user who could reach one
+// under the directory could run it.
+func (r *LxcRunner) secureContainerDir(name string) error {
+	dir := filepath.Join(r.lxcpath(), name)
+	sec, err := r.Security(name)
+	if err != nil {
+		return err
+	}
+	if sec.IDMap != nil {
+		if err := lchown(dir, int(sec.IDMap.Base), int(sec.IDMap.Base)); err != nil {
+			return fmt.Errorf("give container %q's directory to its mapped root: %w", name, err)
+		}
+	}
+	if err := os.Chmod(dir, 0o770); err != nil {
+		return fmt.Errorf("container %q directory mode: %w", name, err)
+	}
+	return nil
 }

@@ -339,6 +339,10 @@ func (r *LxcRunner) Create(ctx context.Context, opts CreateOpts) (*Container, er
 		_ = os.RemoveAll(filepath.Join(r.lxcpath(), opts.Name))
 		return nil, err
 	}
+	if err := r.secureContainerDir(opts.Name); err != nil {
+		_ = os.RemoveAll(filepath.Join(r.lxcpath(), opts.Name))
+		return nil, err
+	}
 	return &Container{
 		Name:      opts.Name,
 		State:     StateStopped,
@@ -388,6 +392,10 @@ func (r *LxcRunner) createFromRootfs(ctx context.Context, opts CreateOpts, rootf
 		return nil, fmt.Errorf("apply container network/resource config for %q: %w", opts.Name, err)
 	}
 	if err := r.shiftNewRootfs(opts); err != nil {
+		_ = os.RemoveAll(containerDir)
+		return nil, err
+	}
+	if err := r.secureContainerDir(opts.Name); err != nil {
 		_ = os.RemoveAll(containerDir)
 		return nil, err
 	}
@@ -778,6 +786,9 @@ func (r *LxcRunner) importContainer(ctx context.Context, name string, src io.Rea
 	if err := r.rewriteRootFSPath(name); err != nil {
 		return rollback(err)
 	}
+	if err := r.secureContainerDir(name); err != nil {
+		return rollback(err)
+	}
 	if backup != "" {
 		_ = os.RemoveAll(backup) // success — drop the old copy
 	}
@@ -807,6 +818,10 @@ func (r *LxcRunner) CloneContainer(ctx context.Context, src, dst string) error {
 		return err
 	}
 	if err := r.cloneFreshIdentity(dst); err != nil {
+		_ = os.RemoveAll(dstDir)
+		return err
+	}
+	if err := r.secureContainerDir(dst); err != nil {
 		_ = os.RemoveAll(dstDir)
 		return err
 	}

@@ -481,6 +481,13 @@ How it works and what to expect:
   it comes back in the same range. `trusted.*` attributes are not taken from an
   archive. A capability, label or ACL the target filesystem refuses fails the
   restore rather than land a file with different access.
+- **The container's directory is closed to other host users.** A restored
+  rootfs carries its setuid binaries and capabilities back onto the host's disk
+  under `<lxcpath>/<name>/rootfs`, the same exposure the source host had. So
+  every create, clone, restore, migrate and convert leaves `<lxcpath>/<name>`
+  mode `0770` — owned by the container's mapped root when it is unprivileged
+  (the container reaches its rootfs through it, as LXC itself arranges), and by
+  root otherwise — and no other host user can reach the rootfs.
 - **Quota.** A container's backup footprint draws down the **same `backup_gib`
   project budget** as VM backups.
 

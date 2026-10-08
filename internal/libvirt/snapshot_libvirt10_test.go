@@ -1,6 +1,7 @@
 package libvirt
 
 import (
+	"os"
 	"testing"
 
 	golibvirt "github.com/digitalocean/go-libvirt"
@@ -212,6 +213,35 @@ func TestSnapshotDelete_WithoutRestoreLibvirtMerges(t *testing.T) {
 	}
 	if got := m.active(); got != root {
 		t.Fatalf("after 20 cycles the domain is on %s, want %s", got, root)
+	}
+	m.requireWhole(map[byte]bool{markA: true, markB: true})
+}
+
+// Guard (a): a snapshot libvirt holds as a non-current leaf — as every
+// restore by an earlier build left one — is deleted as metadata only. libvirt
+// would unlink the disk it was taken of, which is under the VM's live layer.
+func TestSnapshotDelete_ANonCurrentLeafKeepsItsFiles(t *testing.T) {
+	m := newLibvirt10(t)
+	root := m.active()
+	m.write(markA, 1)
+	m.snapshot("m1")
+	m.write(markB, 2)
+	// What an earlier build's restore left: the metadata dropped and
+	// redefined without CURRENT, so m1 is a leaf that is not current.
+	snap, _ := m.DomainSnapshotLookupByName(golibvirt.Domain{Name: "vm"}, "m1", 0)
+	x, _ := m.DomainSnapshotGetXMLDesc(snap, 0)
+	if err := m.DomainSnapshotDelete(snap, golibvirt.DomainSnapshotDeleteMetadataOnly); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.DomainSnapshotCreateXML(golibvirt.Domain{Name: "vm"}, x, uint32(golibvirt.DomainSnapshotCreateRedefine)); err != nil {
+		t.Fatal(err)
+	}
+	if currentOf(t, m) != "" {
+		t.Fatal("setup: m1 is current")
+	}
+	m.rm("m1")
+	if _, err := os.Stat(root); err != nil {
+		t.Fatalf("the VM's root disk %s is gone: %v", root, err)
 	}
 	m.requireWhole(map[byte]bool{markA: true, markB: true})
 }

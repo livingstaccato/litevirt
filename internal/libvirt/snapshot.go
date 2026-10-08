@@ -349,7 +349,44 @@ func deleteSnapshot(v snapshotAPI, domainName, snapshotName string) error {
 		return fmt.Errorf("snapshot %q not found: %w", snapshotName, err)
 	}
 
+	// libvirt's own external-snapshot delete does the work, except in the one
+	// case where libvirt deletes without merging: a snapshot that is not
+	// libvirt's current one and has no children. libvirt >= 9 takes it for a
+	// leaf with no overlay and unlinks the disk the snapshot was taken of,
+	// with no chain check (qemuSnapshotDeleteExternalPrepare, merge=false).
+	// litevirt's snapshots always have an overlay: in every such delete the
+	// lab reproduced (snapshot-repro.md, scenarios 1, 2a-2c and the minimal
+	// one) that disk was the backing file of the VM's live layer, and its
+	// data was lost. An earlier build's restore leaves every restored
+	// snapshot this way. Its files are kept and only the metadata goes: the
+	// VM stays on its chain, which costs disk space and nothing else.
+	//
+	// Making the snapshot current first, so libvirt merges it, is not done:
+	// it would move libvirt's current pointer off whatever snapshot holds it,
+	// and libvirt decides the next delete on that pointer.
+	if leafNotCurrent(v, dom, snap) {
+		slog.Warn("snapshot delete: libvirt does not hold this snapshot as current and it has no children, "+
+			"so libvirt would unlink the disk it was taken of, under the VM's live layer; "+
+			"deleting its metadata only and keeping its files",
+			"vm", domainName, "snapshot", snapshotName)
+		return v.DomainSnapshotDelete(snap, golibvirt.DomainSnapshotDeleteMetadataOnly)
+	}
 	return v.DomainSnapshotDelete(snap, golibvirt.DomainSnapshotDeleteFlags(0))
+}
+
+// leafNotCurrent reports a snapshot libvirt would delete without merging:
+// not libvirt's current snapshot, and without children. Anything it cannot
+// confirm counts as that, so libvirt is never left to unlink on a guess.
+func leafNotCurrent(v snapshotAPI, dom golibvirt.Domain, snap golibvirt.DomainSnapshot) bool {
+	n, err := v.DomainSnapshotNumChildren(snap, 0)
+	if err != nil {
+		return true
+	}
+	if n > 0 {
+		return false
+	}
+	cur, err := v.DomainSnapshotCurrent(dom, 0)
+	return err != nil || cur.Name != snap.Name
 }
 
 // CreateLiveSnapshot captures both the guest's disks AND its RAM/CPU state at a
@@ -604,7 +641,8 @@ func revertToLiveSnapshot(v snapshotAPI, domainName, snapshotName, vmstatePath s
 // a delete merges: the overlay is committed into the base and removed.
 //
 // Best-effort, as before; a redefine libvirt refuses as current is retried
-// as a plain one so the snapshot is not lost.
+// as a plain one so the snapshot is not lost, and deleteSnapshot's guard
+// keeps the files of a snapshot left non-current.
 func reregisterSnapshot(v snapshotAPI, domainName, snapshotName, snapXML string) {
 	redom, err := v.DomainLookupByName(domainName)
 	if err != nil {

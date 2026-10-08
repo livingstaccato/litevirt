@@ -571,7 +571,11 @@ func (c *diskChain) rowsOf(layer string) []corrosion.DiskRecord {
 // ownLayer reports a file beside d's file with d's file's stem, not recorded
 // as another project's replica.
 func (c *diskChain) ownLayer(layer string) bool {
-	if layer == c.self || filepath.Dir(layer) != filepath.Dir(c.self) || diskStem(layer) != diskStem(c.self) {
+	if layer == c.self || filepath.Dir(layer) != filepath.Dir(c.self) {
+		return false
+	}
+	// By the VM's snapshot names: a dotted one (v1.2) is not cut at its dot.
+	if names := c.s.snapshotNamesOf(c.ctx, c.d.VMName); diskStemNamed(layer, names) != diskStemNamed(c.self, names) {
 		return false
 	}
 	if rec, ok := replicaRecordFor(layer); ok && tenancy.NormalizeProject(rec.Project) != c.project {

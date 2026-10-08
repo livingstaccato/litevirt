@@ -165,11 +165,10 @@ func (s *Server) ownDiskLayers(ctx context.Context, vmName string) []string {
 		slog.Warn("delete: cannot list the VM's disks; its snapshot overlays are kept", "vm", vmName, "error", err)
 		return nil
 	}
+	names := s.snapshotNamesOf(ctx, vmName)
 	snapNames := map[string]bool{}
-	if snaps, err := corrosion.ListSnapshots(ctx, s.db, vmName); err == nil {
-		for _, sn := range snaps {
-			snapNames[sn.Name] = true
-		}
+	for _, n := range names {
+		snapNames[n] = true
 	}
 	recorded := map[string]bool{}
 	for _, d := range disks {
@@ -190,14 +189,14 @@ func (s *Server) ownDiskLayers(ctx context.Context, vmName string) []string {
 		if d.Path == "" || !d.DeleteWithVM || !filepath.IsAbs(file) {
 			continue
 		}
-		stem := filepath.Base(diskStem(file))
+		stem := filepath.Base(diskStemNamed(file, names))
 		rest, ok := strings.CutPrefix(stem, vmName+"-")
 		if !ok || rest == "" || strings.Contains(rest, "-") {
 			continue
 		}
 		dir := filepath.Dir(file)
 		own := func(p string) bool {
-			return filepath.Dir(p) == dir && filepath.Base(diskStem(p)) == stem
+			return filepath.Dir(p) == dir && filepath.Base(diskStemNamed(p, names)) == stem
 		}
 		chain := map[string]bool{file: true}
 		top := s.diskFormatOf(self, d.Path, formats)
@@ -240,7 +239,7 @@ func (s *Server) ownDiskLayers(ctx context.Context, vmName string) []string {
 				if b != "" && !filepath.IsAbs(b) {
 					b = filepath.Join(dir, b)
 				}
-				named := snapNames[strings.TrimPrefix(filepath.Ext(m), ".")]
+				named := snapNames[strings.TrimPrefix(filepath.Base(m), stem+".")]
 				if named || (b != "" && info.BackingFormat == "qcow2" && chain[filepath.Clean(b)]) {
 					chain[m], changed = true, true
 					add(m)

@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	golibvirt "github.com/digitalocean/go-libvirt"
@@ -674,4 +675,28 @@ func TestRevert_AnOlderMemorySnapshotAgainAndBack(t *testing.T) {
 		t.Fatal(err)
 	}
 	check("after a stop and start", map[byte]bool{markA: true, markB: true, markC: false})
+}
+
+// Re-review R2-M3: a snapshot name with a dot (v1.2) is created, restored
+// while a later snapshot exists, restored again and deleted like any
+// other; the restore's overlay keeps the disk's name
+// (vm-root.v1.2-r<time>), not a name cut at the dot.
+func TestRevert_ADottedSnapshotName(t *testing.T) {
+	m := newLibvirt10(t)
+	m.write(markA, 1)
+	m.snapshot("v1.2")
+	m.write(markB, 2)
+	m.snapshot("v2")
+	m.revert("v1.2")
+	got := filepath.Base(m.active())
+	if !strings.HasPrefix(got, "vm-root.v1.2-r") {
+		t.Fatalf("restoring v1.2 runs on %s, want vm-root.v1.2-r<time>", got)
+	}
+	m.revert("v1.2")
+	if filepath.Base(m.active()) != got {
+		t.Fatalf("the second restore runs on %s, want %s reused", filepath.Base(m.active()), got)
+	}
+	m.rm("v2")
+	m.rm("v1.2")
+	m.requireWhole(map[byte]bool{markA: true, markB: false})
 }

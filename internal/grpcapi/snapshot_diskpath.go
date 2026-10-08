@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -16,6 +17,56 @@ import (
 // so the stem is the disk's stable identity across snapshot operations.
 func diskStem(p string) string {
 	return strings.TrimSuffix(p, filepath.Ext(p))
+}
+
+// diskStemNamed is diskStem knowing the VM's snapshot names. libvirt names
+// a snapshot's overlay <stem>.<snapshot>, and a restore of an older snapshot
+// names its overlay <stem>.<snapshot>-r<time>; a snapshot name with a dot
+// (v1.2) would be cut at the wrong dot by diskStem (re-review R2-M3). A
+// known name — the longest that fits — is cut off whole; anything else is
+// cut as diskStem cuts it, and so reads as a different disk, which keeps
+// it (no record is moved to it, no file of it is taken).
+func diskStemNamed(p string, snapNames []string) string {
+	dir, base := filepath.Dir(p), filepath.Base(p)
+	names := append([]string(nil), snapNames...)
+	sort.Slice(names, func(i, j int) bool { return len(names[i]) > len(names[j]) })
+	for _, n := range names {
+		if n == "" {
+			continue
+		}
+		if i := strings.LastIndex(base, "."+n+"-r"); i > 0 && revertSuffix(base[i+len(n)+3:]) {
+			return filepath.Join(dir, base[:i])
+		}
+		if stem, ok := strings.CutSuffix(base, "."+n); ok && stem != "" {
+			return filepath.Join(dir, stem)
+		}
+	}
+	return diskStem(p)
+}
+
+// revertSuffix reports the <time>[-<n>] a restore's overlay name ends in.
+func revertSuffix(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if (c < '0' || c > '9') && c != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+// snapshotNamesOf is vm's snapshot names, plus extra (a snapshot just
+// deleted, whose overlay may still be the recorded path).
+func (s *Server) snapshotNamesOf(ctx context.Context, vm string, extra ...string) []string {
+	names := append([]string(nil), extra...)
+	if snaps, err := corrosion.ListSnapshots(ctx, s.db, vm); err == nil {
+		for _, sn := range snaps {
+			names = append(names, sn.Name)
+		}
+	}
+	return names
 }
 
 // reconcileDiskPaths syncs the recorded vm_disks.path to the live domain's
@@ -30,13 +81,13 @@ func diskStem(p string) string {
 // A failure only leaves the path stale — the prior behaviour — and never
 // touches disk contents. Matching is by filename stem so it holds whether the
 // extension is .qcow2 (canonical) or .<snapname> (overlay).
-func (s *Server) reconcileDiskPaths(ctx context.Context, vmName string) {
-	_ = s.reconcileDiskPathsErr(ctx, vmName)
+func (s *Server) reconcileDiskPaths(ctx context.Context, vmName string, extraSnaps ...string) {
+	_ = s.reconcileDiskPathsErr(ctx, vmName, extraSnaps...)
 }
 
 // reconcileDiskPathsErr is reconcileDiskPaths, reporting whether every
 // recorded path could be brought to the live source.
-func (s *Server) reconcileDiskPathsErr(ctx context.Context, vmName string) error {
+func (s *Server) reconcileDiskPathsErr(ctx context.Context, vmName string, extraSnaps ...string) error {
 	if s.virt == nil || s.db == nil {
 		return nil
 	}
@@ -50,12 +101,13 @@ func (s *Server) reconcileDiskPathsErr(ctx context.Context, vmName string) error
 		return fmt.Errorf("read the VM's disk records: %w", err)
 	}
 	var firstErr error
+	names := s.snapshotNamesOf(ctx, vmName, extraSnaps...)
 	liveByStem := make(map[string]string, len(live))
 	for _, src := range live {
-		liveByStem[diskStem(src)] = src
+		liveByStem[diskStemNamed(src, names)] = src
 	}
 	for _, d := range disks {
-		src, ok := liveByStem[diskStem(d.Path)]
+		src, ok := liveByStem[diskStemNamed(d.Path, names)]
 		if !ok || src == d.Path {
 			continue
 		}

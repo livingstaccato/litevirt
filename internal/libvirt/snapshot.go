@@ -846,7 +846,17 @@ func planRevert(snapXML string, live map[string]string, snapshotName string) []r
 // overlay ov take: <stem>.<snapshot>-r. The stem is the disk's, so the disk
 // keeps its name for everything that matches by stem.
 func revertOverlayPrefix(ov, snapshotName string) string {
-	return strings.TrimSuffix(ov, filepath.Ext(ov)) + "." + snapshotName + "-r"
+	return overlayStem(ov, snapshotName) + "." + snapshotName + "-r"
+}
+
+// overlayStem is the disk stem of the snapshot's overlay ov. libvirt names
+// it <stem>.<snapshot>, so the snapshot's name is cut off whole — a name
+// with a dot (v1.2) would otherwise split the stem (re-review R2-M3).
+func overlayStem(ov, snapshotName string) string {
+	if stem, ok := strings.CutSuffix(ov, "."+snapshotName); ok && filepath.Base(stem) != "" {
+		return stem
+	}
+	return strings.TrimSuffix(ov, filepath.Ext(ov))
 }
 
 // isRevertOverlay reports that layer is an overlay an earlier revert to

@@ -620,8 +620,9 @@ func (s *Server) DeleteSnapshot(ctx context.Context, req *pb.DeleteSnapshotReque
 
 	// Deleting an external snapshot makes libvirt consolidate the chain, often
 	// leaving the active disk named after the (now-gone) snapshot — reconcile
-	// the recorded path to whatever the live domain ended up on.
-	s.reconcileDiskPaths(ctx, req.VmName)
+	// the recorded path to whatever the live domain ended up on. The deleted
+	// snapshot's name still names the recorded overlay.
+	s.reconcileDiskPaths(ctx, req.VmName, req.SnapshotName)
 
 	slog.Info("snapshot deleted", "vm", req.VmName, "snapshot", req.SnapshotName)
 	s.recordVMEvent(ctx, req.VmName, "snapshot.deleted", "ok", req.SnapshotName)

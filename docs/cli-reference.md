@@ -705,6 +705,13 @@ rather than unlink. Two cases keep every file:
   the VM's live chain. Restoring an older snapshot while a later one exists
   leaves the restored one so: its overlay file stays on disk, unused.
 
+Restoring an older snapshot while a later one exists puts the VM on a new
+overlay (`<disk>.<snapshot>-r<time>`) directly on the disk that snapshot was
+taken of, in libvirt's definition and in the image headers alike. The later
+snapshot's files are left as they were, outside the VM's chain, so it can
+still be restored. Restoring the same snapshot again reuses that overlay.
+Files left outside the chain this way are removed when the VM is deleted.
+
 The refusal for a linked clone comes first, and applies to these metadata-only
 deletes too.
 

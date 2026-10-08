@@ -1,6 +1,7 @@
 package e2e
 
 import (
+	"encoding/xml"
 	"fmt"
 	"strings"
 	"testing"
@@ -289,22 +290,107 @@ func TestLab_SnapshotScenario3_LinkedCloneOnTheSnapshot(t *testing.T) {
 	requireSnapVMWhole(l, h, src, map[byte]bool{snapMarkA: true})
 }
 
-// Restoring an older snapshot while a later one exists (review I-2): the
-// restored snapshot's overlay drops out of the live chain, so libvirt can
-// never merge it. Both deletes go through as metadata only, and the VM keeps
-// the restored data.
-func TestLab_SnapshotRestoreOlderThenDeleteBoth(t *testing.T) {
-	l := newLab(t)
-	h, vm := snapTestVM(l, "snapold")
-	snapWrite(l, h, vm, snapMarkA)
-	snapCreate(l, h, vm, "d1", false)
-	snapWrite(l, h, vm, snapMarkB)
-	snapCreate(l, h, vm, "d2", false)
-	snapRestore(l, h, vm, "d1")
-	snapRm(l, h, vm, "d2")
-	snapRm(l, h, vm, "d1")
-	if out := l.mustLV(h, "snapshot", "ls", vm); strings.Contains(out, "d1") || strings.Contains(out, "d2") {
-		t.Fatalf("snapshots left after both deletes:\n%s", out)
+// snapXMLChain is the chain libvirt has for the domain's vda in its live
+// XML: the source, then each <backingStore> under it. libvirt opens that
+// chain as written, so it is what the guest reads.
+func snapXMLChain(l *lab, host, vm string) []string {
+	l.t.Helper()
+	type bs struct {
+		Source struct {
+			File string `xml:"file,attr"`
+		} `xml:"source"`
+		BackingStore *bs `xml:"backingStore"`
 	}
-	requireSnapVMWhole(l, h, vm, map[byte]bool{snapMarkA: true, snapMarkB: false})
+	var dom struct {
+		Devices struct {
+			Disks []struct {
+				Source struct {
+					File string `xml:"file,attr"`
+				} `xml:"source"`
+				Target struct {
+					Dev string `xml:"dev,attr"`
+				} `xml:"target"`
+				BackingStore *bs `xml:"backingStore"`
+			} `xml:"disk"`
+		} `xml:"devices"`
+	}
+	out := l.mustSSH(host, 30*time.Second, "virsh -c qemu:///system dumpxml "+shellQuote(vm))
+	if err := xml.Unmarshal([]byte(out), &dom); err != nil {
+		l.t.Fatalf("%s's XML: %v", vm, err)
+	}
+	for _, d := range dom.Devices.Disks {
+		if d.Target.Dev == "vda" {
+			chain := []string{d.Source.File}
+			for b := d.BackingStore; b != nil && b.Source.File != ""; b = b.BackingStore {
+				chain = append(chain, b.Source.File)
+			}
+			return chain
+		}
+	}
+	l.t.Fatalf("%s has no vda in its XML", vm)
+	return nil
+}
+
+// snapHeaderChain is the chain of file read from the image headers with
+// qemu-img --backing-chain.
+func snapHeaderChain(l *lab, host, file string) []string {
+	l.t.Helper()
+	out := l.mustSSH(host, 60*time.Second, "qemu-img info -U --backing-chain "+shellQuote(file)+" | sed -n 's/^image: //p'")
+	return strings.Fields(out)
+}
+
+// requireRestoredOnto checks, right after a restore of a snapshot taken of
+// base, that the VM runs on a fresh overlay directly on base — in libvirt's
+// live XML and in the image headers alike — and on no file in later.
+func requireRestoredOnto(l *lab, host, vm, base string, later ...string) {
+	l.t.Helper()
+	x := snapXMLChain(l, host, vm)
+	h := snapHeaderChain(l, host, x[0])
+	if len(x) < 2 || x[1] != base || len(h) < 2 || h[1] != base {
+		l.t.Fatalf("%s after the restore: libvirt opens %v and the headers say %v, want a new overlay directly on %s", vm, x, h, base)
+	}
+	for _, f := range later {
+		for _, c := range append(x, h...) {
+			if c == f {
+				l.t.Fatalf("%s after the restore still uses %s, a later snapshot's file: libvirt %v, headers %v", vm, f, x, h)
+			}
+		}
+	}
+	l.mark("snap: %s restored onto %s (libvirt %v)", vm, base, x)
+}
+
+// Restoring an older snapshot while a later one exists (snapshot-lab.md,
+// Round 1 row 5): the VM must read exactly the older snapshot's state, in
+// the chain libvirt opens; the later snapshot must still restore its own;
+// and both deletes then go through.
+func TestLab_SnapshotRestoreOlderThenDeleteBoth(t *testing.T) {
+	for _, memory := range []bool{false, true} {
+		t.Run(map[bool]string{false: "disk", true: "memory"}[memory], func(t *testing.T) {
+			l := newLab(t)
+			h, vm := snapTestVM(l, "snapold")
+			root := snapActiveDisk(l, h, vm)
+			snapWrite(l, h, vm, snapMarkA)
+			snapCreate(l, h, vm, "s1", memory)
+			s1 := snapActiveDisk(l, h, vm)
+			snapWrite(l, h, vm, snapMarkB)
+			snapCreate(l, h, vm, "s2", memory)
+			s2 := snapActiveDisk(l, h, vm)
+
+			snapRestore(l, h, vm, "s1")
+			requireRestoredOnto(l, h, vm, root, s1, s2)
+			requireSnapVMWhole(l, h, vm, map[byte]bool{snapMarkA: true, snapMarkB: false})
+
+			snapRestore(l, h, vm, "s2")
+			requireRestoredOnto(l, h, vm, s1, s2)
+			requireSnapVMWhole(l, h, vm, map[byte]bool{snapMarkA: true, snapMarkB: true})
+
+			snapRestore(l, h, vm, "s1")
+			snapRm(l, h, vm, "s2")
+			snapRm(l, h, vm, "s1")
+			if out := l.mustLV(h, "snapshot", "ls", vm); strings.Contains(out, "s1") || strings.Contains(out, "s2") {
+				t.Fatalf("snapshots left after both deletes:\n%s", out)
+			}
+			requireSnapVMWhole(l, h, vm, map[byte]bool{snapMarkA: true, snapMarkB: false})
+		})
+	}
 }

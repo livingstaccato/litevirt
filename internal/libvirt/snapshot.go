@@ -1,13 +1,16 @@
 package libvirt
 
 import (
+	"bytes"
 	"encoding/xml"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -157,22 +160,26 @@ func revertToSnapshot(v snapshotAPI, domainName, snapshotName string, restorePre
 	}
 	currentDisks := parseDomainDiskSources(domXML) // dev → overlay (live)
 
-	// Each changed disk: reset overlay (live) → empty over base (frozen).
-	type overlayReset struct{ overlay, base string }
-	var resets []overlayReset
-	for dev, base := range origDisks {
-		overlay, ok := currentDisks[dev]
-		if !ok || overlay == base {
-			continue
-		}
-		resets = append(resets, overlayReset{overlay: overlay, base: base})
-	}
+	// Each changed disk: an empty overlay over its base (frozen) — the live
+	// layer reset in place, or a new one when the snapshot is not the
+	// newest (planRevert).
+	resets := planRevert(snapXML, currentDisks, snapshotName)
 
 	// Inactive XML still references the overlay paths — redefine with it
-	// unchanged after the overlays are reset (no path swap).
+	// unchanged after the overlays are reset (no path swap), except a disk
+	// moved to a new overlay, which is repointed there with its old
+	// <backingStore> dropped: libvirt would open that chain as written.
 	inactiveXML, err := v.DomainGetXMLDesc(dom, golibvirt.DomainXMLInactive)
 	if err != nil {
 		inactiveXML = domXML
+	}
+	for _, r := range resets {
+		if r.target == r.live {
+			continue
+		}
+		if inactiveXML, err = repointRevertedDisk(inactiveXML, r.dev, r.target); err != nil {
+			return fmt.Errorf("revert disk %s onto %s: %w", r.dev, r.target, err)
+		}
 	}
 
 	// Destroy the running domain — but skip if it's already shut off, so
@@ -211,8 +218,8 @@ func revertToSnapshot(v snapshotAPI, domainName, snapshotName string, restorePre
 	// Disk revert: reset each overlay to an empty qcow2 over its frozen base.
 	// All post-snapshot writes (in the old overlay) are discarded.
 	for _, r := range resets {
-		if err := resetOverlay(r.overlay, r.base); err != nil {
-			return fmt.Errorf("reset overlay %q: %w", r.overlay, err)
+		if err := resetOverlay(r.target, r.base); err != nil {
+			return fmt.Errorf("reset overlay %q: %w", r.target, err)
 		}
 	}
 
@@ -613,17 +620,10 @@ func revertToLiveSnapshot(v snapshotAPI, domainName, snapshotName, vmstatePath s
 	}
 	currentDisks := parseDomainDiskSources(domXML)
 
-	// Each changed disk: overlay (live) → base (frozen at snapshot). We reset the
-	// overlay to a fresh empty qcow2 backed by the base.
-	type overlayReset struct{ overlay, base string }
-	var resets []overlayReset
-	for dev, base := range origDisks {
-		overlay, ok := currentDisks[dev]
-		if !ok || overlay == base {
-			continue
-		}
-		resets = append(resets, overlayReset{overlay: overlay, base: base})
-	}
+	// Each changed disk: an empty overlay over its base (frozen at snapshot)
+	// — the live layer reset in place, or a new one when the snapshot is not
+	// the newest (planRevert).
+	resets := planRevert(snapXML, currentDisks, snapshotName)
 
 	// The saved image's domain XML references the overlay paths — keep it as-is
 	// for the persistent redefine after restore.
@@ -646,6 +646,25 @@ func revertToLiveSnapshot(v snapshotAPI, domainName, snapshotName, vmstatePath s
 		if rewritten != secure {
 			restoreXML, savedXML = rewritten, rewritten
 		}
+	}
+	// The saved image names the overlays the snapshot made. A disk moved to
+	// a new overlay is restored onto it instead, with the old chain dropped,
+	// or the RAM would come back over a disk holding later writes.
+	for _, r := range resets {
+		if r.target == r.live {
+			continue
+		}
+		if restoreXML == "" {
+			secure, err := v.DomainSaveImageGetXMLDesc(vmstatePath, uint32(golibvirt.DomainSaveImageXMLSecure))
+			if err != nil {
+				return fmt.Errorf("read saved image XML: %w", err)
+			}
+			restoreXML = secure
+		}
+		if restoreXML, err = repointRevertedDisk(restoreXML, r.dev, r.target); err != nil {
+			return fmt.Errorf("revert disk %s onto %s: %w", r.dev, r.target, err)
+		}
+		savedXML = restoreXML
 	}
 
 	// Destroy the running domain and wait for shutoff.
@@ -681,8 +700,8 @@ func revertToLiveSnapshot(v snapshotAPI, domainName, snapshotName, vmstatePath s
 	// Reset each overlay to empty over its (frozen) base — this is the disk
 	// revert: all post-snapshot writes (in the old overlay) are discarded.
 	for _, r := range resets {
-		if err := resetOverlay(r.overlay, r.base); err != nil {
-			return fmt.Errorf("reset overlay %q: %w", r.overlay, err)
+		if err := resetOverlay(r.target, r.base); err != nil {
+			return fmt.Errorf("reset overlay %q: %w", r.target, err)
 		}
 	}
 
@@ -778,6 +797,187 @@ func reregisterSnapshot(v snapshotAPI, domainName, snapshotName, snapXML string)
 		return &RestoredNotCurrentError{Snapshot: snapshotName, Err: fmt.Errorf("%v; plain: %w", err, perr)}
 	}
 	return &RestoredNotCurrentError{Snapshot: snapshotName, Registered: true, Err: err}
+}
+
+// revertStep is what a revert does to one disk: it runs afterwards on
+// target, an empty overlay directly on base, the disk the snapshot was taken
+// of. target is the live layer, reset in place, when that is the snapshot's
+// own overlay (the snapshot is the newest), or an overlay this revert made
+// earlier on the same base. Otherwise — an older snapshot restored while a
+// later one exists — the live layer and the snapshot's own overlay both
+// belong to later snapshots (the latter is a later snapshot's base), so
+// neither is touched, and target is a new file beside them.
+type revertStep struct {
+	dev, base, live, target string
+}
+
+// planRevert plans the revert of each disk the snapshot changed.
+//
+// Resetting the live layer when the snapshot is not the newest — what the
+// revert did — reset the newest overlay over the older snapshot's base, but
+// the domain's XML still carried the old <backingStore> chain, which libvirt
+// opens as written: the guest kept every write since the older snapshot
+// (snapshot-lab.md, Round 1 row 5), and a memory revert came back on the
+// snapshot's own overlay, holding later writes, under its RAM.
+func planRevert(snapXML string, live map[string]string, snapshotName string) []revertStep {
+	overlays := parseSnapshotOverlays(snapXML)
+	var out []revertStep
+	for dev, base := range parseSnapshotDomainDisks(snapXML) {
+		l, ok := live[dev]
+		if !ok || l == base {
+			continue
+		}
+		step := revertStep{dev: dev, base: base, live: l, target: l}
+		if ov := overlays[dev]; ov != "" && l != ov && !isRevertOverlay(l, ov, snapshotName, base) {
+			step.target = newRevertOverlayPath(ov, snapshotName)
+		}
+		out = append(out, step)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].dev < out[j].dev })
+	return out
+}
+
+// revertOverlayPrefix is the name a revert's new overlays of the snapshot's
+// overlay ov take: <stem>.<snapshot>-r. The stem is the disk's, so the disk
+// keeps its name for everything that matches by stem.
+func revertOverlayPrefix(ov, snapshotName string) string {
+	return strings.TrimSuffix(ov, filepath.Ext(ov)) + "." + snapshotName + "-r"
+}
+
+// isRevertOverlay reports that layer is an overlay an earlier revert to
+// this snapshot made, still directly on base (no snapshot since): it is
+// reset in place rather than another one made.
+func isRevertOverlay(layer, ov, snapshotName, base string) bool {
+	if !strings.HasPrefix(layer, revertOverlayPrefix(ov, snapshotName)) {
+		return false
+	}
+	info, err := qcow2.Info(layer)
+	if err != nil {
+		return false
+	}
+	b := info.BackingFile
+	if b != "" && !filepath.IsAbs(b) {
+		b = filepath.Join(filepath.Dir(layer), b)
+	}
+	return filepath.Clean(b) == filepath.Clean(base)
+}
+
+// newRevertOverlayPath is a new file name for a revert's overlay.
+func newRevertOverlayPath(ov, snapshotName string) string {
+	p := revertOverlayPrefix(ov, snapshotName) + strconv.FormatInt(time.Now().Unix(), 10)
+	for i, c := 1, p; ; i++ {
+		if _, err := os.Lstat(c); os.IsNotExist(err) {
+			return c
+		}
+		c = fmt.Sprintf("%s-%d", p, i)
+	}
+}
+
+// repointRevertedDisk points the disk with target dev at file and drops the
+// <backingStore> chain under it, so libvirt probes the new overlay's chain
+// from its header instead of opening the old one as written. Namespaced XML
+// is refused, as RewriteDiskSourceFile refuses it.
+func repointRevertedDisk(domXML, dev, file string) (string, error) {
+	if hasXMLNamespace(domXML) {
+		return "", fmt.Errorf("domain XML carries XML namespaces; not rewriting it")
+	}
+	var v struct {
+		Devices struct {
+			Disks []struct {
+				Target struct {
+					Dev string `xml:"dev,attr"`
+				} `xml:"target"`
+			} `xml:"disk"`
+		} `xml:"devices"`
+	}
+	if err := xml.Unmarshal([]byte(domXML), &v); err != nil {
+		return "", fmt.Errorf("parse domain XML: %w", err)
+	}
+	match := -1
+	for i, d := range v.Devices.Disks {
+		if d.Target.Dev == dev {
+			match = i
+		}
+	}
+	if match < 0 {
+		return "", fmt.Errorf("no disk %s in the domain XML", dev)
+	}
+	dec := xml.NewDecoder(strings.NewReader(domXML))
+	var buf bytes.Buffer
+	enc := xml.NewEncoder(&buf)
+	var stack []string
+	diskIndex, diskDepth, skip, rewrote := -1, -1, 0, false
+	for {
+		tok, err := dec.Token()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", fmt.Errorf("decode domain XML: %w", err)
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			parent := ""
+			if len(stack) > 0 {
+				parent = stack[len(stack)-1]
+			}
+			stack = append(stack, t.Name.Local)
+			if skip > 0 {
+				skip++
+				continue
+			}
+			if t.Name.Local == "disk" && parent == "devices" {
+				diskIndex++
+				if diskIndex == match {
+					diskDepth = len(stack) - 1
+				}
+			}
+			if diskDepth >= 0 && parent == "disk" && len(stack)-2 == diskDepth {
+				switch t.Name.Local {
+				case "backingStore":
+					skip = 1
+					continue
+				case "source":
+					t = t.Copy()
+					for i := range t.Attr {
+						if t.Attr[i].Name.Local == "file" {
+							t.Attr[i].Value = file
+							rewrote = true
+						}
+					}
+				}
+			}
+			if err := enc.EncodeToken(t); err != nil {
+				return "", err
+			}
+		case xml.EndElement:
+			stack = stack[:len(stack)-1]
+			if skip > 0 {
+				skip--
+				continue
+			}
+			if err := enc.EncodeToken(t); err != nil {
+				return "", err
+			}
+			if diskDepth >= 0 && len(stack) == diskDepth {
+				diskDepth = -1
+			}
+		default:
+			if skip > 0 {
+				continue
+			}
+			if err := enc.EncodeToken(xml.CopyToken(tok)); err != nil {
+				return "", err
+			}
+		}
+	}
+	if err := enc.Flush(); err != nil {
+		return "", err
+	}
+	if !rewrote {
+		return "", fmt.Errorf("disk %s has no <source file=> to repoint", dev)
+	}
+	return buf.String(), nil
 }
 
 // resetOverlay recreates overlay as a fresh, empty qcow2 backed by base,

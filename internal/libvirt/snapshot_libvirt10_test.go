@@ -18,6 +18,7 @@ import (
 const (
 	markA = 0xaa
 	markB = 0xbb
+	markC = 0xcc
 )
 
 func currentOf(t *testing.T, m *libvirt10) string {
@@ -82,7 +83,7 @@ func (m *libvirt10) requireWhole(want map[byte]bool) {
 		m.t.Fatalf("the domain does not start (libvirt unlinked %v): %v", m.unlinks, err)
 	}
 	for p, present := range want {
-		if got := m.has(p, map[byte]int{markA: 1, markB: 2}[p]); got != present {
+		if got := m.has(p, map[byte]int{markA: 1, markB: 2, markC: 3}[p]); got != present {
 			m.t.Errorf("marker 0x%02x present=%v, want %v (active %s, unlinked %v)", p, got, present, m.active(), m.unlinks)
 		}
 	}
@@ -479,5 +480,139 @@ func TestQcow2Chain_ABlockDeviceBaseEndsTheChain(t *testing.T) {
 	}
 	if len(layers) != 2 || layers[0] != ov || layers[1] != dev {
 		t.Fatalf("chain %v, want [%s %s]", layers, ov, dev)
+	}
+}
+
+// Restoring an older snapshot while a later one exists (snapshot-lab.md,
+// Round 1 row 5): the domain must then read exactly the older snapshot's
+// state — in the chain qemu opens, which libvirt takes from the XML's
+// <backingStore> when the XML gives one — in the running domain and after a
+// stop and start, and the later snapshot must still restore its own state.
+func TestRevert_AnOlderSnapshotRestoresItsState(t *testing.T) {
+	for _, kind := range []string{"disk", "memory"} {
+		for _, state := range []golibvirt.DomainState{golibvirt.DomainRunning, golibvirt.DomainShutoff} {
+			if kind == "memory" && state == golibvirt.DomainShutoff {
+				continue // a memory snapshot needs a running VM
+			}
+			name := kind + map[golibvirt.DomainState]string{golibvirt.DomainRunning: "/running", golibvirt.DomainShutoff: "/stopped"}[state]
+			t.Run(name, func(t *testing.T) {
+				m := newLibvirt10(t)
+				m.setState(state)
+				root := m.active()
+				saves := map[string]string{}
+				take := func(n string) {
+					if kind == "memory" {
+						saves[n] = m.memorySnapshot(n)
+					} else {
+						m.snapshot(n)
+					}
+				}
+				restore := func(n string) {
+					if kind == "memory" {
+						m.revertLive(n, saves[n])
+					} else {
+						m.revert(n)
+					}
+				}
+				check := func(when string, want map[byte]bool) {
+					t.Helper()
+					for p, present := range want {
+						if got := m.has(p, map[byte]int{markA: 1, markB: 2, markC: 3}[p]); got != present {
+							t.Errorf("%s: marker 0x%02x present=%v, want %v (qemu opens %s)", when, p, got, present, m.qemuSpec("vda"))
+						}
+					}
+				}
+				m.write(markA, 1)
+				take("s1")
+				s1 := m.active()
+				m.write(markB, 2)
+				take("s2")
+				m.write(markC, 3)
+
+				restore("s1")
+				chain, err := m.dom.effective("vda")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(chain) != 2 || chain[1] != root {
+					t.Errorf("after restoring s1 qemu opens %v, want a fresh overlay directly on %s", chain, root)
+				}
+				check("after restoring s1", map[byte]bool{markA: true, markB: false, markC: false})
+				if err := m.stopAndStart(); err != nil {
+					t.Fatal(err)
+				}
+				check("after restoring s1 and a stop and start", map[byte]bool{markA: true, markB: false, markC: false})
+				if _, err := os.Stat(s1); err != nil {
+					t.Fatalf("s2's base %s is gone: %v", s1, err)
+				}
+
+				restore("s2")
+				check("after restoring s2", map[byte]bool{markA: true, markB: true, markC: false})
+			})
+		}
+	}
+}
+
+// Restoring the older snapshot again resets the overlay the first restore
+// made, rather than leaving one more file each time; the later snapshot's
+// overlay and base stay where they were.
+func TestRevert_AnOlderSnapshotAgainReusesItsOverlay(t *testing.T) {
+	m := newLibvirt10(t)
+	m.write(markA, 1)
+	m.snapshot("s1")
+	s1 := m.active()
+	m.write(markB, 2)
+	m.snapshot("s2")
+	s2 := m.active()
+	m.revert("s1")
+	first := m.active()
+	if first == s1 || first == s2 {
+		t.Fatalf("restoring s1 runs the VM on %s, a later snapshot's file", first)
+	}
+	m.write(markC, 3)
+	m.revert("s1")
+	if got := m.active(); got != first {
+		t.Fatalf("the second restore runs on %s, want the first restore's overlay %s reset", got, first)
+	}
+	m.requireWhole(map[byte]bool{markA: true, markB: false, markC: false})
+	for _, p := range []string{s1, s2} {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("s2's file %s is gone: %v", p, err)
+		}
+	}
+	matches, _ := filepath.Glob(filepath.Join(m.dir, "vm-root.s1-r*"))
+	if len(matches) != 1 {
+		t.Errorf("restore overlays %v, want one", matches)
+	}
+}
+
+// repointRevertedDisk moves one disk onto the new overlay and drops its
+// <backingStore> chain, as libvirt writes it; every other disk is left as
+// it was, chain included.
+func TestRepointRevertedDisk(t *testing.T) {
+	in := `<domain type='kvm'><name>vm</name><devices>` +
+		`<disk type='file' device='disk'><driver name='qemu' type='qcow2'/><source file='/d/vm-root.s2' index='3'/>` +
+		`<backingStore type='file' index='2'><format type='qcow2'/><source file='/d/vm-root.s1'/>` +
+		`<backingStore type='file' index='1'><format type='qcow2'/><source file='/d/vm-root.qcow2'/><backingStore/></backingStore></backingStore>` +
+		`<target dev='vda' bus='virtio'/></disk>` +
+		`<disk type='file' device='disk'><source file='/d/vm-data.s2'/><backingStore type='file'><format type='qcow2'/><source file='/d/vm-data.qcow2'/></backingStore><target dev='vdb' bus='virtio'/></disk>` +
+		`<disk type='file' device='cdrom'><source file='/c/vm.iso'/><target dev='sda' bus='sata'/></disk>` +
+		`</devices></domain>`
+	out, err := repointRevertedDisk(in, "vda", "/d/vm-root.s1-r1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := parseDomainDiskSources(out); got["vda"] != "/d/vm-root.s1-r1" || got["vdb"] != "/d/vm-data.s2" || got["sda"] != "/c/vm.iso" {
+		t.Fatalf("disk sources %v", got)
+	}
+	chains := xmlBackingChains(out)
+	if len(chains["vda"]) != 0 {
+		t.Errorf("vda keeps a backingStore chain %v", chains["vda"])
+	}
+	if len(chains["vdb"]) != 1 || chains["vdb"][0] != "/d/vm-data.qcow2" {
+		t.Errorf("vdb's chain changed: %v", chains["vdb"])
+	}
+	if _, err := repointRevertedDisk(in, "vdz", "/x"); err == nil {
+		t.Error("a missing disk was not an error")
 	}
 }

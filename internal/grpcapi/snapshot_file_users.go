@@ -212,26 +212,33 @@ func (s *Server) ownDiskLayers(ctx context.Context, vmName string) []string {
 			add(b)
 			path = b
 		}
+		// Out-of-chain siblings: an overlay a restore of an older snapshot
+		// left, and the later snapshots' layers above it, each backing into
+		// the chain or into one already taken — so repeated until no more.
 		matches, _ := filepath.Glob(filepath.Join(dir, globEscape(stem)+".*"))
-		for _, m := range matches {
-			m = filepath.Clean(m)
-			if chain[m] || !own(m) {
-				continue
-			}
-			if fi, err := os.Lstat(m); err != nil || !fi.Mode().IsRegular() {
-				continue
-			}
-			info, err := qcow2.Info(m)
-			if err != nil {
-				continue // not a qcow2: a user's file, an ISO, a raw image
-			}
-			b := info.BackingFile
-			if b != "" && !filepath.IsAbs(b) {
-				b = filepath.Join(dir, b)
-			}
-			named := snapNames[strings.TrimPrefix(filepath.Ext(m), ".")]
-			if named || (b != "" && info.BackingFormat == "qcow2" && chain[filepath.Clean(b)]) {
-				add(m)
+		for changed := true; changed; {
+			changed = false
+			for _, m := range matches {
+				m = filepath.Clean(m)
+				if chain[m] || !own(m) {
+					continue
+				}
+				if fi, err := os.Lstat(m); err != nil || !fi.Mode().IsRegular() {
+					continue
+				}
+				info, err := qcow2.Info(m)
+				if err != nil {
+					continue // not a qcow2: a user's file, an ISO, a raw image
+				}
+				b := info.BackingFile
+				if b != "" && !filepath.IsAbs(b) {
+					b = filepath.Join(dir, b)
+				}
+				named := snapNames[strings.TrimPrefix(filepath.Ext(m), ".")]
+				if named || (b != "" && info.BackingFormat == "qcow2" && chain[filepath.Clean(b)]) {
+					chain[m], changed = true, true
+					add(m)
+				}
 			}
 		}
 	}

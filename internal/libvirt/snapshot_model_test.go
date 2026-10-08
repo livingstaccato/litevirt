@@ -53,8 +53,14 @@ type libvirt10 struct {
 }
 
 type modelDomain struct {
-	name       string
-	disks      map[string]string // dev → active layer
+	name  string
+	disks map[string]string // dev → active layer
+	// backing is, per dev, the chain under the active layer that the
+	// domain's XML spelled out in <backingStore>. libvirt 10.0 takes a
+	// chain given in the XML as is, and qemu opens it, whatever the image
+	// headers say (snapshot-lab.md, Round 1 row 5). Without one, the chain
+	// is probed from the headers.
+	backing    map[string][]string
 	state      golibvirt.DomainState
 	persistent bool
 }
@@ -163,13 +169,82 @@ func (m *libvirt10) DomainGetState(dom golibvirt.Domain, _ uint32) (int32, int32
 }
 
 func domainXMLOf(name string, disks map[string]string) string {
+	return domainXMLWithChains(name, disks, nil)
+}
+
+// domainXMLWithChains is domainXMLOf with each disk's chain under its
+// source written out as nested <backingStore>, as libvirt's XML has it.
+func domainXMLWithChains(name string, disks map[string]string, chains map[string][]string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "<domain type='kvm'><name>%s</name><devices>", name)
 	for _, dev := range sortedKeys(disks) {
-		fmt.Fprintf(&b, "<disk type='file' device='disk'><driver name='qemu' type='qcow2'/><source file='%s'/><target dev='%s' bus='virtio'/></disk>", disks[dev], dev)
+		fmt.Fprintf(&b, "<disk type='file' device='disk'><driver name='qemu' type='%s'/><source file='%s'/>", fmtOf(disks[dev]), disks[dev])
+		for _, l := range chains[dev] {
+			fmt.Fprintf(&b, "<backingStore type='file'><format type='%s'/><source file='%s'/>", fmtOf(l), l)
+		}
+		b.WriteString(strings.Repeat("</backingStore>", len(chains[dev])))
+		fmt.Fprintf(&b, "<target dev='%s' bus='virtio'/></disk>", dev)
 	}
 	b.WriteString("</devices></domain>")
 	return b.String()
+}
+
+// xmlBackingChains is, per target dev, the files of the disk's nested
+// <backingStore> elements, for each disk that has any.
+func xmlBackingChains(x string) map[string][]string {
+	type bs struct {
+		Source struct {
+			File string `xml:"file,attr"`
+		} `xml:"source"`
+		BackingStore *bs `xml:"backingStore"`
+	}
+	var v struct {
+		Devices struct {
+			Disks []struct {
+				Target struct {
+					Dev string `xml:"dev,attr"`
+				} `xml:"target"`
+				BackingStore *bs `xml:"backingStore"`
+			} `xml:"disk"`
+		} `xml:"devices"`
+	}
+	if err := xml.Unmarshal([]byte(x), &v); err != nil {
+		return nil
+	}
+	out := map[string][]string{}
+	for _, d := range v.Devices.Disks {
+		for b := d.BackingStore; b != nil && b.Source.File != ""; b = b.BackingStore {
+			out[d.Target.Dev] = append(out[d.Target.Dev], b.Source.File)
+		}
+	}
+	return out
+}
+
+// effective is the chain qemu opens for dev: the XML's when it gave one,
+// probed from the headers otherwise. Every layer must exist.
+func (d *modelDomain) effective(dev string) ([]string, error) {
+	top := d.disks[dev]
+	if over := d.backing[dev]; len(over) > 0 {
+		out := append([]string{top}, over...)
+		for _, l := range out {
+			if _, err := os.Stat(l); err != nil {
+				return nil, fmt.Errorf("Could not open '%s': %w", l, err)
+			}
+		}
+		return out, nil
+	}
+	return chain(top)
+}
+
+// chainsOf is every dev's effective chain under its active layer.
+func (d *modelDomain) chainsOf() map[string][]string {
+	out := map[string][]string{}
+	for dev := range d.disks {
+		if c, err := d.effective(dev); err == nil && len(c) > 1 {
+			out[dev] = c[1:]
+		}
+	}
+	return out
 }
 
 func sortedKeys(m map[string]string) []string {
@@ -188,7 +263,7 @@ func (m *libvirt10) DomainGetXMLDesc(dom golibvirt.Domain, _ golibvirt.DomainXML
 	if err != nil {
 		return "", err
 	}
-	return domainXMLOf(d.name, d.disks), nil
+	return domainXMLWithChains(d.name, d.disks, d.chainsOf()), nil
 }
 
 func (m *libvirt10) DomainDestroy(dom golibvirt.Domain) error {
@@ -232,9 +307,9 @@ func (m *libvirt10) DomainDefineXML(x string) (golibvirt.Domain, error) {
 	name := xmlName(x)
 	disks := parseDomainDiskSources(x)
 	if m.dom != nil && m.dom.name == name {
-		m.dom.disks, m.dom.persistent = disks, true
+		m.dom.disks, m.dom.backing, m.dom.persistent = disks, xmlBackingChains(x), true
 	} else {
-		m.dom = &modelDomain{name: name, disks: disks, state: golibvirt.DomainShutoff, persistent: true}
+		m.dom = &modelDomain{name: name, disks: disks, backing: xmlBackingChains(x), state: golibvirt.DomainShutoff, persistent: true}
 	}
 	return golibvirt.Domain{Name: name}, nil
 }
@@ -282,7 +357,7 @@ func fmtOf(p string) string {
 
 func (m *libvirt10) openDisks(d *modelDomain) error {
 	for _, dev := range sortedKeys(d.disks) {
-		if _, err := chain(d.disks[dev]); err != nil {
+		if _, err := d.effective(dev); err != nil {
 			return fmt.Errorf("internal error: qemu unexpectedly closed the monitor: %s: %v", dev, err)
 		}
 	}
@@ -334,7 +409,7 @@ func (m *libvirt10) DomainRestoreFlags(from string, dxml golibvirt.OptString, _ 
 	if m.dom != nil && m.dom.name == name && m.dom.state != golibvirt.DomainShutoff {
 		return fmt.Errorf("Requested operation is not valid: domain '%s' is already active", name)
 	}
-	d := &modelDomain{name: name, disks: parseDomainDiskSources(x), state: golibvirt.DomainPaused}
+	d := &modelDomain{name: name, disks: parseDomainDiskSources(x), backing: xmlBackingChains(x), state: golibvirt.DomainPaused}
 	if m.dom != nil && m.dom.name == name {
 		d.persistent = m.dom.persistent
 	}
@@ -456,6 +531,9 @@ func (m *libvirt10) DomainSnapshotCreateXML(dom golibvirt.Domain, x string, flag
 		s.overlays[dev], s.bases[dev] = ov, src
 	}
 	for dev, ov := range s.overlays {
+		if over := d.backing[dev]; len(over) > 0 {
+			d.backing[dev] = append([]string{d.disks[dev]}, over...)
+		}
 		d.disks[dev] = ov
 	}
 	m.snaps[name] = s
@@ -519,7 +597,7 @@ func (m *libvirt10) DomainSnapshotDelete(snap golibvirt.DomainSnapshot, flags go
 	var merges []merge
 	for _, dev := range sortedKeys(s.overlays) {
 		ov, base := s.overlays[dev], s.bases[dev]
-		live, err := chain(m.dom.disks[dev])
+		live, err := m.dom.effective(dev)
 		if err != nil {
 			return fmt.Errorf("operation failed: %v", err)
 		}
@@ -551,6 +629,7 @@ func (m *libvirt10) DomainSnapshotDelete(snap golibvirt.DomainSnapshot, flags go
 		if err := os.Remove(mg.ov); err != nil {
 			return err
 		}
+		delete(m.dom.backing, mg.dev) // probed from the headers again
 		m.touched = append(m.touched, mg.ov, mg.base)
 		for _, c := range kids {
 			c.bases[mg.dev] = mg.base
@@ -638,8 +717,8 @@ func (m *libvirt10) write(pattern byte, off int) {
 // has reports whether the domain's disk reads pattern at off MiB.
 func (m *libvirt10) has(pattern byte, off int) bool {
 	m.t.Helper()
-	out, err := exec.Command("qemu-io", "-r", "-f", fmtOf(m.active()), "-c",
-		fmt.Sprintf("read -P 0x%02x %dM 64k", pattern, off), m.active()).CombinedOutput()
+	out, err := exec.Command("qemu-io", "-r", "-c",
+		fmt.Sprintf("read -P 0x%02x %dM 64k", pattern, off), m.qemuSpec("vda")).CombinedOutput()
 	return err == nil && !strings.Contains(string(out), "Pattern verification failed") &&
 		!strings.Contains(string(out), "Could not open")
 }
@@ -672,8 +751,36 @@ func (m *libvirt10) writeOn(dev string, pattern byte, off int) {
 
 func (m *libvirt10) hasOn(dev string, pattern byte, off int) bool {
 	m.t.Helper()
-	out, err := exec.Command("qemu-io", "-r", "-f", "qcow2", "-c",
-		fmt.Sprintf("read -P 0x%02x %dM 64k", pattern, off), m.activeOf(dev)).CombinedOutput()
+	out, err := exec.Command("qemu-io", "-r", "-c",
+		fmt.Sprintf("read -P 0x%02x %dM 64k", pattern, off), m.qemuSpec(dev)).CombinedOutput()
 	return err == nil && !strings.Contains(string(out), "Pattern verification failed") &&
 		!strings.Contains(string(out), "Could not open")
+}
+
+// qemuSpec is a json: image spec of dev's effective chain — what qemu
+// opens, which is the XML's chain when the domain's XML gave one.
+func (m *libvirt10) qemuSpec(dev string) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.dom == nil {
+		return "missing"
+	}
+	layers, err := m.dom.effective(dev)
+	if err != nil || len(layers) == 0 {
+		return "missing"
+	}
+	var spec func(i int) string
+	spec = func(i int) string {
+		f := fmtOf(layers[i])
+		js := fmt.Sprintf(`{"driver":%q,"file":{"driver":"file","filename":%q}`, f, layers[i])
+		if f == "qcow2" {
+			if i+1 < len(layers) {
+				js += `,"backing":` + spec(i+1)
+			} else {
+				js += `,"backing":null`
+			}
+		}
+		return js + "}"
+	}
+	return "json:" + spec(0)
 }

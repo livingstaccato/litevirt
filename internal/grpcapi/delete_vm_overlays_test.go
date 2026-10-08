@@ -154,9 +154,10 @@ func fileThere(p string) bool { _, err := os.Stat(p); return err == nil }
 // recorded clone backs on.
 func TestDeleteVM_RemovesOnlyItsOwnLayers(t *testing.T) {
 	f := newOverlayDeleteFixture(t, true)
-	stray := f.file(t, "web-root.m0", f.root) // a restored-older leftover: backs into the chain
-	iso := f.file(t, "web-root.iso", "")      // an ISO put here before uploads moved
-	img := f.file(t, "web-root.img", "")      // a raw image
+	stray := f.file(t, "web-root.m0", f.root)  // a restored-older leftover: backs into the chain
+	strayUp := f.file(t, "web-root.k9", stray) // a later snapshot's layer above it, listed first
+	iso := f.file(t, "web-root.iso", "")       // an ISO put here before uploads moved
+	img := f.file(t, "web-root.img", "")       // a raw image
 	otherBase := filepath.Join(f.dir, "other-base.qcow2")
 	runQemuImg(t, "create", "-q", "-f", "qcow2", otherBase, "1M")
 	foreign := f.file(t, "web-root.bak", otherBase) // a qcow2 that does not back into the chain
@@ -172,7 +173,7 @@ func TestDeleteVM_RemovesOnlyItsOwnLayers(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.delete(t)
-	for _, p := range []string{f.m2, f.m1, stray} {
+	for _, p := range []string{f.m2, f.m1, stray, strayUp} {
 		if fileThere(p) {
 			t.Errorf("%s, the VM's own layer, outlived it", filepath.Base(p))
 		}

@@ -8,6 +8,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/litevirt/litevirt/internal/testkit/slogtest"
 )
 
 // recordingHandler keeps every slog record so a test can read back what the
@@ -52,9 +54,7 @@ func (h *recordingHandler) leftArmed(t *testing.T) map[string]slog.Value {
 func captureSlog(t *testing.T) *recordingHandler {
 	t.Helper()
 	h := &recordingHandler{}
-	prev := slog.Default()
-	slog.SetDefault(slog.New(h))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	slogtest.Swap(t, slog.New(h))
 	return h
 }
 

@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/litevirt/litevirt/internal/testkit/slogtest"
 )
 
 func localClient(t *testing.T, dir string) *Client {
@@ -398,9 +400,7 @@ func TestAuditSeeded_AMarkerWithoutANonceGetsOneAtTheNextStart(t *testing.T) {
 func TestAuditSeeded_TheAssertNonceIsNeverLoggedOrAudited(t *testing.T) {
 	ctx := context.Background()
 	buf := &syncBuf{}
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	slogtest.Swap(t, slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 
 	dir := t.TempDir()
 	c := undecidedReplica(t, dir)

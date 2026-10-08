@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/litevirt/litevirt/internal/testkit/slogtest"
 )
 
 // The mirror's startup line has to name the cadence the mirror actually runs at.
@@ -30,9 +32,7 @@ func TestMirrorStartLogsTheEffectiveInterval(t *testing.T) {
 	})
 
 	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	slogtest.Swap(t, slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
 	// Cancelled immediately: the goroutine the start spawns must not outlive the
 	// test, and the line under test is written before it is spawned.
@@ -64,9 +64,7 @@ func TestMirrorStartLogsAConfiguredInterval(t *testing.T) {
 	})
 
 	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	slogtest.Swap(t, slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

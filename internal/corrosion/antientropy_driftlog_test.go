@@ -9,6 +9,7 @@ import (
 	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/testkit/slogtest"
 )
 
 type syncBuf struct {
@@ -36,9 +37,7 @@ func (s *syncBuf) count(sub string) int {
 // repeat — the hourly reminder is silent.
 func TestDriftLog_ARepeatedDriftIsLoggedOnce(t *testing.T) {
 	buf := &syncBuf{}
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	slogtest.Swap(t, slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
 	now := time.Unix(1_800_000_000, 0)
 	d := &driftLog{now: func() time.Time { return now }}

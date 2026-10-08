@@ -9,6 +9,7 @@ import (
 
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
+	"github.com/litevirt/litevirt/internal/testkit/slogtest"
 )
 
 const guestCPUXML = `<cpu mode='custom' match='exact' check='full'><model fallback='forbid'>EPYC-Milan</model><feature policy='require' name='topoext'/></cpu>`
@@ -35,9 +36,7 @@ func TestSourceRunsGuestCPU(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var buf bytes.Buffer
-			prev := slog.Default()
-			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
-			t.Cleanup(func() { slog.SetDefault(prev) })
+			slogtest.Swap(t, slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
 			fake := libvirtfake.New()
 			v := tc.verdict

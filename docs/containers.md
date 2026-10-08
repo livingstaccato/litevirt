@@ -526,6 +526,18 @@ A new container is **unprivileged** and **confined** by default.
   template or its includes. An unprivileged container also includes LXC's
   `userns.conf` (before the drop list, which it would otherwise reset).
 
+- **Root's subordinate ranges.** When the host hands out subordinate ids
+  (`newuidmap` is installed) LXC insists that root's mappings lie inside root's
+  ranges in `/etc/subuid` and `/etc/subgid`. When no `root:` line covers a new
+  container's range, the daemon appends one line, `root:<idmap_base>:<span>`
+  (the whole configured span, so it is added once). The append never rewrites
+  or removes a line, its own or anyone's (a last line without a newline gets
+  one first); it checks again under the lock, so racing creates and daemons
+  add the line once; and it takes the lock shadow's own tools use
+  (`/etc/subuid.lock`, created exclusively and removed afterwards), waiting up
+  to ten seconds for `usermod` or `useradd` and never removing their lock. A
+  host with no subordinate-id tooling and no files is not touched.
+
 The opt-outs restore what earlier releases did, and are the **Admin's**:
 
 ```bash

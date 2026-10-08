@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Container security: confinement, user-namespace mapping and the pids limit.
@@ -423,12 +424,23 @@ var (
 	subIDsWanted  = func() bool { _, err := exec.LookPath("newuidmap"); return err == nil }
 	subIDsMu      sync.Mutex
 	subIDsEnsured = map[int64]bool{}
+	// subIDLockWait is how long an append waits for shadow's lock file.
+	subIDLockWait = 10 * time.Second
 )
 
-// ensureRootSubIDs makes root's subordinate ranges cover idmap, appending a
-// line to each file when no existing root range does. Lines are only ever
-// appended, never rewritten. Nothing is written on a host that hands out no
-// ranges and has no files.
+// ensureRootSubIDs makes root's subordinate ranges cover idmap, appending one
+// line "root:<base>:<span>" to /etc/subuid and /etc/subgid when no root range
+// in the file covers it. The append is:
+//   - append-only: every existing line, the daemon's or anyone's, is kept byte
+//     for byte (a last line with no newline gets one before ours), and nothing
+//     is ever rewritten or removed;
+//   - idempotent: the covering check runs again under the lock, so concurrent
+//     creates and daemons add the line once;
+//   - locked the way shadow's tools lock the file (usermod, useradd): an
+//     exclusive <file>.lock, created O_EXCL and removed afterwards; another
+//     tool's lock is waited for, never removed;
+//   - skipped on a host that hands out no ranges (no newuidmap) and has no
+//     file.
 func (r *LxcRunner) ensureRootSubIDs(idmap *IDMap) error {
 	subIDsMu.Lock()
 	defer subIDsMu.Unlock()
@@ -446,19 +458,61 @@ func (r *LxcRunner) ensureRootSubIDs(idmap *IDMap) error {
 		if covered(p, idmap) {
 			continue
 		}
-		f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
-		if err != nil {
-			return fmt.Errorf("add root's subordinate range to %s: %w", p, err)
-		}
-		_, werr := fmt.Fprintf(f, "root:%d:%d\n", span.Base, span.Size)
-		if cerr := f.Close(); werr == nil {
-			werr = cerr
-		}
-		if werr != nil {
-			return fmt.Errorf("add root's subordinate range to %s: %w", p, werr)
+		if err := appendSubIDLocked(p, idmap, span); err != nil {
+			return err
 		}
 	}
 	subIDsEnsured[idmap.Base] = true
+	return nil
+}
+
+// appendSubIDLocked appends root's span to the subid file p under shadow's
+// lock, unless a root range there covers idmap by then.
+func appendSubIDLocked(p string, idmap, span *IDMap) error {
+	lock := p + ".lock"
+	deadline := time.Now().Add(subIDLockWait)
+	var lf *os.File
+	for {
+		f, err := os.OpenFile(lock, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err == nil {
+			lf = f
+			break
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			return fmt.Errorf("lock %s: %w", p, err)
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("lock %s: %s is held by another tool; root's subordinate range was not added", p, lock)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	fmt.Fprintf(lf, "%d\n", os.Getpid())
+	_ = lf.Close()
+	defer os.Remove(lock)
+	if covered(p, idmap) {
+		return nil
+	}
+	f, err := os.OpenFile(p, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o644)
+	if err != nil {
+		return fmt.Errorf("add root's subordinate range to %s: %w", p, err)
+	}
+	line := fmt.Sprintf("root:%d:%d\n", span.Base, span.Size)
+	if fi, serr := f.Stat(); serr == nil && fi.Size() > 0 {
+		last := make([]byte, 1)
+		if _, rerr := f.ReadAt(last, fi.Size()-1); rerr == nil && last[0] != '\n' {
+			line = "\n" + line
+		}
+	}
+	_, werr := f.WriteString(line)
+	if serr := f.Sync(); werr == nil {
+		werr = serr
+	}
+	if cerr := f.Close(); werr == nil {
+		werr = cerr
+	}
+	if werr != nil {
+		return fmt.Errorf("add root's subordinate range to %s: %w", p, werr)
+	}
 	return nil
 }
 

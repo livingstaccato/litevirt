@@ -641,7 +641,8 @@ containers:
   # starting at idmap_base. Ranges are allocated cluster-wide, so set BOTH the
   # same on every node. The daemon appends root:<base>:<span> to /etc/subuid and
   # /etc/subgid when no root range covers a container's (LXC requires it when
-  # the host hands out subordinate ranges); it never rewrites a line.
+  # the host hands out subordinate ranges): once, under shadow's lock file, and
+  # it never rewrites or removes a line (docs/containers.md, "Security").
   idmap_base: 1000000000
   idmap_ranges: 30000
   # How an unprivileged container's rootfs is mapped: auto (an idmapped mount

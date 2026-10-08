@@ -366,3 +366,22 @@ func TestComposeUp_ValidationErrorsNameTheFile(t *testing.T) {
 		t.Error("an invalid compose file was deployed")
 	}
 }
+
+// Review M-3: a VM the teardown reports "deleting" and then "kept" (found
+// not to be the stack's at delete time) is no deletion: it is not in the
+// "N of M" count, and its reason is printed.
+func TestComposeDown_KeptAtDeleteTimeIsNotCounted(t *testing.T) {
+	spy := &deployClient{teardown: []*pb.DeleteProgress{
+		{VmName: "ha1", Status: "deleting"},
+		{VmName: "ha1", Status: "kept", Error: `not created by this stack; left alone: VM "ha1" names stack ""`},
+		{VmName: "ha2", Status: "deleting"},
+		{VmName: "ha2", Status: "error", Error: "an operation is in progress"},
+	}}
+	out, err := runComposeCLI(t, spy, false, "", "down", "-y")
+	if err == nil || !strings.Contains(err.Error(), `stack "hb": 1 of 1 deletions failed (ha2)`) {
+		t.Fatalf("error = %v, want 1 of 1 (the kept VM is not a deletion)", err)
+	}
+	if !strings.Contains(out, "kept ha1: not created by this stack") {
+		t.Errorf("the kept VM's reason is not printed:\n%s", out)
+	}
+}

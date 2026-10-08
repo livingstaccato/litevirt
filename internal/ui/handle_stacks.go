@@ -218,6 +218,18 @@ func (s *Server) handleDestroyStack(w http.ResponseWriter, r *http.Request) {
 		// a deletion and not a failure. Said by name, with why.
 		if p.Status == "kept" {
 			kept = append(kept, p.VmName+" ("+p.Error+")")
+			// Reported "deleting" first and then found not to be the
+			// stack's: no deletion, so not in the count.
+			if seenItem[p.VmName] {
+				delete(seenItem, p.VmName)
+				var rest []string
+				for _, x := range seen {
+					if x != p.VmName {
+						rest = append(rest, x)
+					}
+				}
+				seen = rest
+			}
 			continue
 		}
 		item := p.VmName

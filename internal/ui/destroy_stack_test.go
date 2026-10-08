@@ -118,3 +118,20 @@ func TestHandler_DestroyStack_NamesEachKeptVMAndWhy(t *testing.T) {
 		}
 	})
 }
+
+// Review M-3: a VM reported "deleting" and then "kept" is not counted.
+func TestHandler_DestroyStack_KeptAtDeleteTimeIsNotCounted(t *testing.T) {
+	mock := newDefaultMock()
+	mock.deleteStackFrames = []*pb.DeleteProgress{
+		{VmName: "ha1", Status: "deleting"},
+		{VmName: "ha1", Status: "kept", Error: "not created by this stack; left alone"},
+		{VmName: "ha2", Status: "deleting"},
+		{VmName: "ha2", Status: "error", Error: "boom"},
+	}
+	trig := destroyStack(t, mock).Header.Get("HX-Trigger")
+	for _, want := range []string{"1 of 1", "ha1 (not created by this stack"} {
+		if !strings.Contains(trig, want) {
+			t.Errorf("toast %s does not mention %q", trig, want)
+		}
+	}
+}

@@ -43,3 +43,23 @@ func TestStackReconciler_DeletesBoundToTheListedIncarnation(t *testing.T) {
 			got.GetExpectedStack(), got.GetExpectedCreatedAt(), "app", row.CreatedAt)
 	}
 }
+
+// Review M-2, the background half: the reconciler keeps a stack network a
+// VM the stack did not create still uses.
+func TestStackReconciler_KeepsANetworkAForeignVMUses(t *testing.T) {
+	db := seedDeletingStack(t, false, false)
+	if err := corrosion.InsertVM(context.Background(), db,
+		corrosion.VMRecord{Name: "ui-vm", HostName: "node-1", State: "running", Spec: "{}"},
+		[]corrosion.InterfaceRecord{{VMName: "ui-vm", NetworkName: "app_lan", MAC: "52:54:00:00:00:02"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	c := &recordingStackCleaner{}
+	r := NewStackReconciler("node-0", db)
+	r.SetCleaner(c)
+	r.reconcile(context.Background())
+	for _, n := range c.deprovisioned {
+		if n == "app_lan" {
+			t.Fatal("the reconciler deprovisioned app_lan under ui-vm, a VM the stack did not create")
+		}
+	}
+}

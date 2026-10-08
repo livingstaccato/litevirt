@@ -1173,6 +1173,14 @@ message CreateContainerRequest {
     string confinement = 17;
 }
 
+// PrepareContainerTargetRequest is a migrate's preflight on the TARGET (peer
+// only): before the source is stopped, the target ensures root's subordinate
+// range covers the container's id range (LXC refuses to start it otherwise).
+message PrepareContainerTargetRequest {
+    int64 idmap_base = 1;
+    int64 idmap_size = 2;
+}
+
 // ConvertContainerRequest changes a STOPPED container's security settings in
 // place (lv ct convert). unprivileged moves a privileged container into an id
 // range of its own (or an unprivileged one into a fresh range); confinement
@@ -3391,6 +3399,7 @@ service LiteVirt {
     rpc ConvertContainerToTemplate(ConvertContainerToTemplateRequest) returns (Container);
     rpc CloneContainer(CloneContainerRequest)                         returns (Container);
     rpc ConvertContainer(ConvertContainerRequest)                     returns (Container);
+    rpc PrepareContainerTarget(PrepareContainerTargetRequest)         returns (google.protobuf.Empty);
 
     // ── Stats ──
     rpc GetVMStats(GetVMStatsRequest)       returns (VMStats);

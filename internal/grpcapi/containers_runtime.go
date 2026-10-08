@@ -160,3 +160,12 @@ func (a *LXCRuntimeAdapter) TakeDroppedAttrs(name string) ([]string, error) {
 	}
 	return nil, nil
 }
+
+// EnsureContainerIDRange passes through root's subordinate-range ensure
+// (lxc.LxcRunner.EnsureRootSubIDs).
+func (a *LXCRuntimeAdapter) EnsureContainerIDRange(base, size int64) error {
+	if e, ok := a.Inner.(interface{ EnsureRootSubIDs(*lxc.IDMap) error }); ok {
+		return e.EnsureRootSubIDs(&lxc.IDMap{Base: base, Size: size})
+	}
+	return nil
+}

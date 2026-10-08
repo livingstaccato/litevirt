@@ -248,3 +248,11 @@ func TestAllocateIDMapBase_LedgerAndDisk(t *testing.T) {
 		t.Fatalf("allocated %d: taken (a=%d b=%d stray=%d)", c, a, b, rt.security["stray"].IDMap.Base)
 	}
 }
+
+// PrepareContainerTarget is peer only.
+func TestPrepareContainerTarget_PeerOnly(t *testing.T) {
+	s, _ := secServer(t)
+	if _, err := s.PrepareContainerTarget(adminCtx(), &pb.PrepareContainerTargetRequest{IdmapBase: 1_000_000_000, IdmapSize: lxc.IDMapSize}); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("operator call: %v", err)
+	}
+}

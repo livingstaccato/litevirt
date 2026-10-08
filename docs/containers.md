@@ -708,6 +708,13 @@ to image-recreate (without managed-NIC reconstruction).
 
 ## Cold migration
 
+Before the source is stopped, a migrate asks the target to give root the
+subordinate range for an unprivileged container's id range (the peer-only
+`PrepareContainerTarget`). A target that cannot — its `/etc/subuid` is locked
+or not writable — refuses the migrate while the source still runs, untouched.
+A target older than this release cannot be asked; the migrate proceeds and the
+target's own start ensures the range.
+
 ```bash
 # Move a container to another host. The repo must be reachable from BOTH hosts.
 lv ct migrate web docker-02 --repo /srv/shared/backups

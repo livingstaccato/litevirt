@@ -14,6 +14,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -402,4 +403,53 @@ func (s *Server) reportDroppedAttrs(ctx context.Context, name, op string) {
 	if s.events != nil {
 		s.events.Publish(events.Event{Action: "ct.attrs.dropped", Target: name, Detail: detail})
 	}
+}
+
+// idRangeEnsurer is the runtime half of PrepareContainerTarget.
+type idRangeEnsurer interface {
+	EnsureContainerIDRange(base, size int64) error
+}
+
+// PrepareContainerTarget is a migrate's preflight on the target, peer only:
+// root's subordinate range is made to cover the container's id range here,
+// before the source is stopped, so a target that cannot take it refuses the
+// migrate while the source still runs untouched.
+func (s *Server) PrepareContainerTarget(ctx context.Context, req *pb.PrepareContainerTargetRequest) (*emptypb.Empty, error) {
+	if err := s.requirePeerCert(ctx); err != nil {
+		return nil, err
+	}
+	if req.IdmapBase <= 0 || req.IdmapSize <= 0 {
+		return nil, status.Error(codes.InvalidArgument, "idmap_base and idmap_size required")
+	}
+	e, ok := s.containerRuntime.(idRangeEnsurer)
+	if !ok {
+		return &emptypb.Empty{}, nil
+	}
+	if err := e.EnsureContainerIDRange(req.IdmapBase, req.IdmapSize); err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "host %q cannot give root the subordinate range %d+%d: %v", s.hostName, req.IdmapBase, req.IdmapSize, err)
+	}
+	return &emptypb.Empty{}, nil
+}
+
+// prepareMigrateTarget runs PrepareContainerTarget on target for an
+// unprivileged container. An older target (Unimplemented) cannot do it and is
+// not refused: its start will say so, as before.
+func (s *Server) prepareMigrateTarget(ctx context.Context, target string, rec *corrosion.ContainerRecord) error {
+	base := corrosion.DecodeCreateSpec(rec.CreateSpec).IDMapBase
+	if base == 0 {
+		return nil
+	}
+	c, closer, err := s.dialPeer(ctx, target)
+	if err != nil {
+		return status.Errorf(codes.Unavailable, "reach target %q to prepare it: %v", target, err)
+	}
+	defer closer()
+	if _, err := c.PrepareContainerTarget(ctx, &pb.PrepareContainerTargetRequest{IdmapBase: base, IdmapSize: lxc.IDMapSize}); err != nil {
+		if status.Code(err) == codes.Unimplemented {
+			slog.Warn("migrate: the target predates PrepareContainerTarget; root's subordinate range there is not ensured", "target", target, "container", rec.Name)
+			return nil
+		}
+		return status.Errorf(codes.FailedPrecondition, "migrate refused before the source was touched: prepare target %q: %v", target, err)
+	}
+	return nil
 }

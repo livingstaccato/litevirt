@@ -2,6 +2,7 @@ package fleet
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -69,5 +70,41 @@ func TestContainerMigrate_KeepsPrivilegeMode(t *testing.T) {
 	after := corrosion.DecodeCreateSpec(moved.CreateSpec)
 	if after.IDMapBase != before.IDMapBase || after.Confinement != before.Confinement {
 		t.Fatalf("migrated as %+v, created as %+v", after, before)
+	}
+}
+
+// A migrate prepares the target before it touches the source: the target
+// gets root's subordinate range for the container's id range first, and a
+// target that cannot take it refuses the migrate with the source still
+// running and untouched.
+func TestContainerMigrate_PreparesTheTargetsSubIDsFirst(t *testing.T) {
+	c := ctMigrateCluster(t)
+	src, dst := c.Nodes[0], c.Nodes[1]
+	ctx := context.Background()
+	const name = "ct-subid"
+	createContainer(t, c, src, name)
+	row, _ := corrosion.GetContainer(ctx, src.DB, src.Name, name)
+	base := corrosion.DecodeCreateSpec(row.CreateSpec).IDMapBase
+
+	dst.CT.FailEnsureIDRange(errors.New("subuid locked"))
+	if err := runMigrate(t, c, src, dst, name, stagingRepo(t)); err == nil {
+		t.Fatal("migrate onto a target that cannot take the range succeeded")
+	}
+	if n := len(src.CT.ExportCalls()); n != 0 {
+		t.Fatalf("the source was archived (%d exports) before the target was ready", n)
+	}
+	if got := src.CT.State(name); got != "stopped" && got != "running" {
+		t.Fatalf("source state %q", got)
+	}
+	if len(src.CT.StopCalls()) != 0 {
+		t.Fatalf("the source was stopped: %v", src.CT.StopCalls())
+	}
+
+	dst.CT.FailEnsureIDRange(nil)
+	if err := runMigrate(t, c, src, dst, name, stagingRepo(t)); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	if got := dst.CT.EnsuredIDRanges(); len(got) == 0 || got[0] != base {
+		t.Fatalf("target ensured %v, want [%d]", got, base)
 	}
 }

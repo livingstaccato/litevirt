@@ -73,6 +73,9 @@ type CTFake struct {
 	// called with, so a scenario can cancel the caller and wait for that
 	// cancellation to reach the source daemon mid-archive.
 	onExportCtx func(ctx context.Context)
+
+	ensureIDRangeErr error
+	ensuredRanges    []int64
 }
 
 // NewCTFake returns a container runtime rooted at dir. The directory is
@@ -622,4 +625,30 @@ func (f *CTFake) ConvertContainerSecurity(_ context.Context, name string, to lxc
 	}
 	cfg := strings.TrimRight(strings.Join(keep, "\n"), "\n") + "\n" + lxc.SecurityConfig(sec.Confinement, sec.IDMap)
 	return os.WriteFile(cfgPath, []byte(cfg), 0o644)
+}
+
+// FailEnsureIDRange makes EnsureContainerIDRange fail with err (nil clears).
+func (f *CTFake) FailEnsureIDRange(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ensureIDRangeErr = err
+}
+
+// EnsuredIDRanges returns the bases EnsureContainerIDRange was asked for.
+func (f *CTFake) EnsuredIDRanges() []int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]int64(nil), f.ensuredRanges...)
+}
+
+// EnsureContainerIDRange is the target half of a migrate's preflight: root's
+// subordinate range for base (the real runtime appends it to /etc/subuid).
+func (f *CTFake) EnsureContainerIDRange(base, size int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.ensureIDRangeErr != nil {
+		return f.ensureIDRangeErr
+	}
+	f.ensuredRanges = append(f.ensuredRanges, base)
+	return nil
 }

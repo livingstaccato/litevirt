@@ -573,3 +573,7 @@ func secureContainerDirAt(dir string) error {
 	}
 	return nil
 }
+
+// EnsureRootSubIDs is ensureRootSubIDs for a migrate's preflight on the
+// target host.
+func (r *LxcRunner) EnsureRootSubIDs(idmap *IDMap) error { return r.ensureRootSubIDs(idmap) }

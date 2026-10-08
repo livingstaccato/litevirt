@@ -468,7 +468,8 @@ stall and the recovery at the merge level. It has not yet been reproduced on a f
 The fix is a deterministic id per triple. It is **planned, not implemented**:
 [design/canonical-registry-credentials.md](design/canonical-registry-credentials.md). An
 earlier opt-in, `enforcement.canonical_registry`, was removed on 2026-10-04. It only
-advertised a token for a writer that never shipped. A config that still sets it is ignored.
+advertised a token for a writer that never shipped. A config that still sets it still loads;
+the key is ignored, and the daemon logs a WARN naming it at startup.
 A node that latched its `canonical_registry_v1` token keeps the marker. This build
 recognises the marker as a retired token and does not quarantine the node.
 

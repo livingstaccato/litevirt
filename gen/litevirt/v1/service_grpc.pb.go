@@ -308,6 +308,7 @@ const (
 	LiteVirt_ReserveHostCapacity_FullMethodName        = "/litevirt.v1.LiteVirt/ReserveHostCapacity"
 	LiteVirt_ReleaseHostCapacity_FullMethodName        = "/litevirt.v1.LiteVirt/ReleaseHostCapacity"
 	LiteVirt_ImportLeftoverStatus_FullMethodName       = "/litevirt.v1.LiteVirt/ImportLeftoverStatus"
+	LiteVirt_PreflightRecreateVM_FullMethodName        = "/litevirt.v1.LiteVirt/PreflightRecreateVM"
 )
 
 // LiteVirtClient is the client API for LiteVirt service.
@@ -892,6 +893,15 @@ type LiteVirtClient interface {
 	// a dead import of theirs, unchanged since. The answer comes from the
 	// answering host's record alone: it never opens a path the caller names.
 	ImportLeftoverStatus(ctx context.Context, in *ImportLeftoverStatusRequest, opts ...grpc.CallOption) (*ImportLeftoverStatusResponse, error)
+	// ── Re-create judgement (peer-only) ──
+	//
+	// A rebuild or a rolling recreate of a VM with an installer ISO places the
+	// new VM before it tears the old one down, and asks the host placement
+	// chose to judge the spec as its create there will — as the relayed
+	// caller, with the VM's own ISO grant — so a refusal leaves the VM intact.
+	// A host on an older build answers Unimplemented; its create judges no
+	// installer ISO.
+	PreflightRecreateVM(ctx context.Context, in *PreflightRecreateVMRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 }
 
 type liteVirtClient struct {
@@ -4079,6 +4089,16 @@ func (c *liteVirtClient) ImportLeftoverStatus(ctx context.Context, in *ImportLef
 	return out, nil
 }
 
+func (c *liteVirtClient) PreflightRecreateVM(ctx context.Context, in *PreflightRecreateVMRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, LiteVirt_PreflightRecreateVM_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // LiteVirtServer is the server API for LiteVirt service.
 // All implementations must embed UnimplementedLiteVirtServer
 // for forward compatibility.
@@ -4661,6 +4681,15 @@ type LiteVirtServer interface {
 	// a dead import of theirs, unchanged since. The answer comes from the
 	// answering host's record alone: it never opens a path the caller names.
 	ImportLeftoverStatus(context.Context, *ImportLeftoverStatusRequest) (*ImportLeftoverStatusResponse, error)
+	// ── Re-create judgement (peer-only) ──
+	//
+	// A rebuild or a rolling recreate of a VM with an installer ISO places the
+	// new VM before it tears the old one down, and asks the host placement
+	// chose to judge the spec as its create there will — as the relayed
+	// caller, with the VM's own ISO grant — so a refusal leaves the VM intact.
+	// A host on an older build answers Unimplemented; its create judges no
+	// installer ISO.
+	PreflightRecreateVM(context.Context, *PreflightRecreateVMRequest) (*emptypb.Empty, error)
 	mustEmbedUnimplementedLiteVirtServer()
 }
 
@@ -5534,6 +5563,9 @@ func (UnimplementedLiteVirtServer) ReleaseHostCapacity(context.Context, *Release
 }
 func (UnimplementedLiteVirtServer) ImportLeftoverStatus(context.Context, *ImportLeftoverStatusRequest) (*ImportLeftoverStatusResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ImportLeftoverStatus not implemented")
+}
+func (UnimplementedLiteVirtServer) PreflightRecreateVM(context.Context, *PreflightRecreateVMRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method PreflightRecreateVM not implemented")
 }
 func (UnimplementedLiteVirtServer) mustEmbedUnimplementedLiteVirtServer() {}
 func (UnimplementedLiteVirtServer) testEmbeddedByValue()                  {}
@@ -10405,6 +10437,24 @@ func _LiteVirt_ImportLeftoverStatus_Handler(srv interface{}, ctx context.Context
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_PreflightRecreateVM_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PreflightRecreateVMRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).PreflightRecreateVM(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_PreflightRecreateVM_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).PreflightRecreateVM(ctx, req.(*PreflightRecreateVMRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // LiteVirt_ServiceDesc is the grpc.ServiceDesc for LiteVirt service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -11399,6 +11449,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ImportLeftoverStatus",
 			Handler:    _LiteVirt_ImportLeftoverStatus_Handler,
+		},
+		{
+			MethodName: "PreflightRecreateVM",
+			Handler:    _LiteVirt_PreflightRecreateVM_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

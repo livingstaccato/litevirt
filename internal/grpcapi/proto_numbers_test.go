@@ -61,6 +61,8 @@ func TestProtoNumbers_TheIntegratedBranchesDoNotCollide(t *testing.T) {
 		"ImportLeftoverStatus",
 		// vm-host-path-reads-confined
 		"ListISOs", "PullISO", "GetISOLibraryMode", "SetISOLibraryMode", "FetchISOLibraryFile",
+		// a re-create's judgement on the host placement chose
+		"PreflightRecreateVM",
 	} {
 		if svc.Methods().ByName(rpc) == nil {
 			t.Errorf("RPC %s is missing", rpc)

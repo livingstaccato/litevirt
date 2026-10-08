@@ -83,6 +83,9 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	if req == nil {
 		return nil, status.Error(codes.InvalidArgument, "request is required")
 	}
+	// A re-create forwarded here by the host that tears the VM down carries
+	// the VM's own installer ISO grant; only a peer host's is honoured.
+	ctx = s.acceptRecreateISOGrantMD(ctx)
 	spec, err := normalizeCreateVMSpec(req.GetSpec(), s.defaultCPUModeCfg)
 	if err != nil {
 		return nil, err
@@ -317,7 +320,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		return nil, err
 	}
 	if targetHost != s.hostName {
-		if decision != nil {
+		if decision != nil && !decision.placedHere {
 			return nil, status.Errorf(codes.FailedPrecondition,
 				"resolved create owner %q does not match local host %q", targetHost, s.hostName)
 		}
@@ -3183,20 +3186,23 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 
 	// BEFORE anything destructive: everything the create below would refuse
 	// that the teardown does not change — the installer ISO included, judged
-	// here as the create will judge it — is refused now, with the VM intact.
+	// as the create will judge it — is refused now, with the VM intact.
 	// The VM's own ISO is carried into the create as it was classified
 	// (recreateISOGrant), so one its starts accept is not refused for want
-	// of an Admin's authority.
+	// of an Admin's authority. A VM with an installer ISO is placed now, as
+	// main placed it after the teardown, and judged by the host placement
+	// chose (judgeRecreateOn); the create below goes to that host.
 	rctx := withRecreateISOGrant(ctx, vm)
-	if err := s.recreatePreflight(rctx, spec, s.hostName); err != nil {
-		st := status.Convert(err)
-		return nil, status.Errorf(st.Code(), "cannot rebuild %q: %s; nothing was changed", req.Name, st.Message())
+	host, placed := s.hostName, false
+	if spec.GetIso() != "" {
+		h, err := s.placeRecreate(rctx, spec, vm)
+		if err != nil {
+			st := status.Convert(err)
+			return nil, status.Errorf(st.Code(), "cannot rebuild %q: %s; nothing was changed", req.Name, st.Message())
+		}
+		host, placed = h, true
 	}
-	// A VM with an installer ISO is re-created here, where that ISO was
-	// judged and the grant holds — never sent to a host that has neither
-	// (recreatePinnedHere) — or refused now, with the VM intact.
-	pinned, err := s.recreatePinnedHere(rctx, spec, vm)
-	if err != nil {
+	if err := s.judgeRecreateOn(rctx, spec, host); err != nil {
 		st := status.Convert(err)
 		return nil, status.Errorf(st.Code(), "cannot rebuild %q: %s; nothing was changed", req.Name, st.Message())
 	}
@@ -3240,8 +3246,8 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	// Recreate the VM using the stored spec.
 	slog.Info("rebuilding VM", "name", req.Name)
 	s.recordVMEvent(ctx, req.Name, "vm.rebuilt", "ok", "image="+spec.Image)
-	if pinned {
-		return s.createVM(rctx, &pb.CreateVMRequest{Spec: spec}, &resolvedCreateVMDecision{resolvedHost: s.hostName})
+	if placed {
+		return s.createVM(rctx, &pb.CreateVMRequest{Spec: spec}, &resolvedCreateVMDecision{resolvedHost: host, placedHere: true})
 	}
 	return s.CreateVM(rctx, &pb.CreateVMRequest{Spec: spec})
 }

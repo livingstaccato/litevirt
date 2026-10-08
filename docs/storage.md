@@ -801,12 +801,15 @@ a host path (an Admin's, or one stored before `iso_scope`) stays one, judged
 on the host as at every start, whoever runs the rebuild; a pool ISO is judged
 again as its recorded kind. Anything the new create would refuse that the
 teardown does not change — the ISO included — is refused first, and the VM is
-left as it was. A VM with an installer ISO is created again on the host that
-judged that ISO — the VM's own host for `lv rebuild`, the node running the
-rollout for a rolling update — never placed on another host, which would judge
-it without that classification. When that host cannot take the VM (it is not
-active, lacks capacity once the VM's own share is released, or the spec pins
-the VM elsewhere), the rebuild is refused before anything is torn down.
+left as it was. A VM with an installer ISO is placed before the teardown, by
+the same placement rules a create uses (its spec's pin and labels included,
+the VM's own share released), so it lands where it would have after the
+teardown — on another host when its own is in maintenance or full, and never
+on the node running a rollout for that reason alone. The host chosen then
+judges the ISO as its create will, for the same caller and with the same
+classification; if it would refuse (it does not have the file, say), the
+rebuild is refused before anything is torn down. A chosen host on an older
+build, which judges no installer ISO at its create, is not asked.
 
 ### Known limits
 

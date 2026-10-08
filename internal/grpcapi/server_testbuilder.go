@@ -122,3 +122,11 @@ func (s *Server) ForgetNetworkReconcileForTests() {
 	defer s.netReconcile.mu.Unlock()
 	s.netReconcile.applied, s.netReconcile.torn, s.netReconcile.lastErr = nil, nil, nil
 }
+
+// RecreateVMForTest runs the rolling engine's recreate of name to desired
+// (serverOps.RecreateVM) on this server, with ctx as the deploy's caller. A
+// compose file never carries an installer ISO into a desired spec, so a fleet
+// scenario about re-creating an ISO VM drives this entry point directly.
+func (s *Server) RecreateVMForTest(ctx context.Context, name string, desired *pb.VMSpec) error {
+	return (&serverOps{s: s}).RecreateVM(ctx, name, desired)
+}

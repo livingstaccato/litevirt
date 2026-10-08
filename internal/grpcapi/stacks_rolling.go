@@ -39,9 +39,10 @@ var _ rolling.Ops = (*serverOps)(nil)
 // has, it is carried into the create as it was classified (recreateISOGrant),
 // as a compose file's unchanged volume is. Before the delete, everything the
 // create would refuse that the delete does not change is refused, so a
-// refusal leaves the target as it was (recreatePreflight). A spec with an
-// installer ISO is re-created on this host, never sent to one that does not
-// hold the grant (recreatePinnedHere).
+// refusal leaves the target as it was (recreatePreflight). A target with an
+// installer ISO is placed before the delete, as main placed it after, judged
+// by the host placement chose, and created there (placeRecreate,
+// judgeRecreateOn) — never put on this node for running the rollout.
 func (o *serverOps) recreateAs(ctx context.Context, target, source string, desired *pb.VMSpec) error {
 	if desired == nil {
 		return fmt.Errorf("recreate %q: no desired spec", target)
@@ -51,33 +52,36 @@ func (o *serverOps) recreateAs(ctx context.Context, target, source string, desir
 	if src, err := corrosion.GetVM(ctx, o.s.db, source); err == nil && src != nil {
 		ctx = withRecreateISOGrant(ctx, src)
 	}
-	cur, err := corrosion.GetVM(ctx, o.s.db, target)
-	if err != nil {
-		cur = nil
-	}
-	// A spec with an installer ISO is re-created on this host, where the
-	// preflight judges that ISO and the grant holds (recreatePinnedHere);
-	// any other on the target's host, as before.
-	pinned, perr := o.s.recreatePinnedHere(ctx, spec, cur)
-	if perr == nil && cur != nil {
+	var decision *resolvedCreateVMDecision
+	if cur, err := corrosion.GetVM(ctx, o.s.db, target); err == nil && cur != nil {
 		host := cur.HostName
-		if pinned {
-			host = o.s.hostName
+		var perr error
+		if spec.GetIso() != "" {
+			if host, perr = o.s.placeRecreate(ctx, spec, cur); perr == nil {
+				decision = &resolvedCreateVMDecision{resolvedHost: host, placedHere: true}
+			}
 		}
-		perr = o.s.recreatePreflight(ctx, spec, host)
-	}
-	if perr != nil {
-		st := status.Convert(perr)
-		return status.Errorf(st.Code(), "recreate %s: %s; nothing was deleted", target, st.Message())
+		if perr == nil {
+			if decision != nil {
+				perr = o.s.judgeRecreateOn(ctx, spec, host)
+			} else {
+				perr = o.s.recreatePreflight(ctx, spec, host)
+			}
+		}
+		if perr != nil {
+			st := status.Convert(perr)
+			return status.Errorf(st.Code(), "recreate %s: %s; nothing was deleted", target, st.Message())
+		}
 	}
 	if _, err := o.s.DeleteVM(ctx, &pb.DeleteVMRequest{Name: target}); err != nil && status.Code(err) != codes.NotFound {
 		return fmt.Errorf("delete %s before recreate: %w", target, err)
 	}
-	if pinned {
-		_, err = o.s.createVM(ctx, &pb.CreateVMRequest{Spec: spec}, &resolvedCreateVMDecision{resolvedHost: o.s.hostName})
-		return err
+	var err error
+	if decision != nil {
+		_, err = o.s.createVM(ctx, &pb.CreateVMRequest{Spec: spec}, decision)
+	} else {
+		_, err = o.s.CreateVM(ctx, &pb.CreateVMRequest{Spec: spec})
 	}
-	_, err = o.s.CreateVM(ctx, &pb.CreateVMRequest{Spec: spec})
 	return err
 }
 

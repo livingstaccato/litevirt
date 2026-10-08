@@ -3724,6 +3724,16 @@ service LiteVirt {
     // a dead import of theirs, unchanged since. The answer comes from the
     // answering host's record alone: it never opens a path the caller names.
     rpc ImportLeftoverStatus(ImportLeftoverStatusRequest) returns (ImportLeftoverStatusResponse);
+
+    // ── Re-create judgement (peer-only) ──
+    //
+    // A rebuild or a rolling recreate of a VM with an installer ISO places the
+    // new VM before it tears the old one down, and asks the host placement
+    // chose to judge the spec as its create there will — as the relayed
+    // caller, with the VM's own ISO grant — so a refusal leaves the VM intact.
+    // A host on an older build answers Unimplemented; its create judges no
+    // installer ISO.
+    rpc PreflightRecreateVM(PreflightRecreateVMRequest) returns (google.protobuf.Empty);
 }
 
 // Pre-flight check before `lv host upgrade`. Surfaces in-flight work,
@@ -4398,4 +4408,10 @@ message ImportLeftoverStatusResponse {
     // The names, among those asked, that the answering host's record shows a
     // dead import of its own left there, in exactly the asked state.
     repeated string dead = 1;
+}
+
+// PreflightRecreateVMRequest is the spec of a VM about to be re-created on the
+// answering host, as the asking host classified it (iso_scope included).
+message PreflightRecreateVMRequest {
+    VMSpec spec = 1;
 }

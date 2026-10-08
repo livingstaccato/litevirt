@@ -281,7 +281,7 @@ func (s *Server) RevertContainerSnapshot(ctx context.Context, req *pb.RevertCont
 			s.noteStateWriteFail(corrosion.OpContainerState, werr)
 		}
 	}
-	if err := s.containerRuntime.RevertContainer(ctx, req.Name, f); err != nil {
+	if err := s.revertKeepingSecurity(ctx, rec, f); err != nil {
 		s.audit(ctx, "ct.snapshot.revert", req.Name, "project="+project, "error")
 		return nil, status.Errorf(codes.Internal, "revert: %v", err)
 	}

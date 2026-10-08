@@ -169,3 +169,14 @@ func (a *LXCRuntimeAdapter) EnsureContainerIDRange(base, size int64) error {
 	}
 	return nil
 }
+
+// RevertContainerConverting passes through a revert that marks the restored
+// copy converting to `to` (lxc.LxcRunner); a runtime without it reverts.
+func (a *LXCRuntimeAdapter) RevertContainerConverting(ctx context.Context, name string, r io.Reader, to lxc.ConvertOpts) error {
+	if rc, ok := a.Inner.(interface {
+		RevertContainerConverting(context.Context, string, io.Reader, lxc.ConvertOpts) error
+	}); ok {
+		return rc.RevertContainerConverting(ctx, name, r, to)
+	}
+	return a.Inner.RevertContainer(ctx, name, r)
+}

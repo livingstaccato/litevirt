@@ -583,7 +583,9 @@ security block and records the new settings. A marker in the container's
 directory is written first and removed last, so a convert that is interrupted
 (a crash, a full disk) leaves a container that `lv ct start` refuses until the
 same convert is run again, which finishes the job (it only moves ids still in
-the old range). `--confinement` alone changes the profile and touches no file;
+the old range). The re-run finishes to the range the interrupted convert
+recorded, whatever range it would otherwise be given, so the rootfs never ends
+up split across two ranges. `--confinement` alone changes the profile and touches no file;
 `--confinement legacy` is the Admin's.
 
 **Every move keeps the mode.** Migrate, backup, restore and host-loss
@@ -638,7 +640,11 @@ its on-disk dir, and stores it **host-local** under `{dataDir}/ct-snapshots`.
   `lv ct convert` carries the old privileged config; the revert converts the
   restored copy back to the privilege mode, range and confinement the
   container has now (its record), so it never silently runs privileged again.
-  The restart refuses an overlapping id range like `lv ct start`.
+  The restart refuses an overlapping id range like `lv ct start`. The restored copy is
+  marked converting before it is swapped in, so a crash between the swap and
+  the convert leaves a container that refuses to start (naming `lv ct
+  convert`, which resumes to the recorded range), never one running with the
+  snapshot's older mode.
 - **Revert** stops the container (replacing the rootfs requires it stopped),
   restores the snapshot in place, and restarts it if it had been running. The
   restore is **crash-safe** — the live dir is set aside and rolled back if the

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -55,6 +56,9 @@ type Security struct {
 	IDMap         *IDMap // nil = privileged
 	IDMappedMount bool   // the rootfs is an idmapped mount; its files are not shifted
 	Converting    bool   // an lv ct convert was interrupted; start refuses
+	// ConvertTo is the target an interrupted convert recorded (with
+	// Converting): the next convert finishes to it.
+	ConvertTo *ConvertOpts
 }
 
 // Securer is the optional runtime capability behind container security.
@@ -223,8 +227,12 @@ func (r *LxcRunner) Security(name string) (Security, error) {
 		return Security{}, fmt.Errorf("read container config %s: %w", cfg, err)
 	}
 	sec := parseSecurity(string(b))
-	if _, err := os.Stat(filepath.Join(r.lxcpath(), name, convertMarkerFile)); err == nil {
+	if b, err := os.ReadFile(filepath.Join(r.lxcpath(), name, convertMarkerFile)); err == nil {
 		sec.Converting = true
+		var to ConvertOpts
+		if json.Unmarshal(b, &to) == nil {
+			sec.ConvertTo = &to
+		}
 	}
 	return sec, nil
 }
@@ -327,11 +335,29 @@ type ConvertOpts struct {
 // last, so an interrupted convert leaves a container start refuses, and running
 // the same convert again finishes it (the shift moves only ids still in the
 // old range).
-func (r *LxcRunner) Convert(_ context.Context, name string, to ConvertOpts) error {
+func (r *LxcRunner) Convert(ctx context.Context, name string, to ConvertOpts) error {
 	sec, err := r.Security(name)
 	if err != nil {
 		return err
 	}
+	// An interrupted convert is finished to the target it recorded: part of
+	// the rootfs is already there, and a different range would strand those
+	// files outside the container's map. A different request is applied once
+	// that is done (only a confinement can still change: a range is fixed).
+	if sec.Converting && sec.ConvertTo != nil {
+		rec := *sec.ConvertTo
+		if err := r.convertTo(name, sec, rec); err != nil {
+			return err
+		}
+		if to.Confinement != "" && to.Confinement != rec.Confinement {
+			return r.Convert(ctx, name, ConvertOpts{Confinement: to.Confinement})
+		}
+		return nil
+	}
+	return r.convertTo(name, sec, to)
+}
+
+func (r *LxcRunner) convertTo(name string, sec Security, to ConvertOpts) error {
 	dir := filepath.Join(r.lxcpath(), name)
 	marker, _ := json.Marshal(to)
 	if err := os.WriteFile(filepath.Join(dir, convertMarkerFile), marker, 0o600); err != nil {
@@ -577,3 +603,12 @@ func secureContainerDirAt(dir string) error {
 // EnsureRootSubIDs is ensureRootSubIDs for a migrate's preflight on the
 // target host.
 func (r *LxcRunner) EnsureRootSubIDs(idmap *IDMap) error { return r.ensureRootSubIDs(idmap) }
+
+// RevertContainerConverting is RevertContainer for a container whose current
+// security (to) the snapshot may not carry: when the snapshot's config
+// differs, the restored copy is marked converting to `to` before it is
+// swapped into place, so a crash before the caller's Convert leaves a
+// container that refuses to start until lv ct convert finishes it.
+func (r *LxcRunner) RevertContainerConverting(ctx context.Context, name string, src io.Reader, to ConvertOpts) error {
+	return r.importContainerMarked(ctx, name, src, true, &to)
+}

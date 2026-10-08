@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -304,7 +305,15 @@ func (s *Server) ConvertContainer(ctx context.Context, req *pb.ConvertContainerR
 	}
 	spec := corrosion.DecodeCreateSpec(rec.CreateSpec)
 	to := lxc.ConvertOpts{Confinement: req.Confinement}
-	if req.Unprivileged {
+	// An interrupted convert is finished to the range it recorded, never a
+	// fresh one: part of the rootfs is already there (the runtime resumes to
+	// it whatever we ask, so the row must name it too).
+	if cur, cerr := sc.ContainerSecurity(req.Name); cerr == nil && cur.Converting && cur.ConvertTo != nil && cur.ConvertTo.IDMap != nil {
+		to.IDMap = cur.ConvertTo.IDMap
+		if to.Confinement == "" {
+			to.Confinement = cur.ConvertTo.Confinement
+		}
+	} else if req.Unprivileged {
 		base, aerr := s.allocateIDMapBase(ctx, req.Name)
 		if aerr != nil {
 			return nil, aerr
@@ -493,7 +502,32 @@ func (s *Server) keepRecordedSecurity(ctx context.Context, rec *corrosion.Contai
 	}
 	if err := sc.ConvertContainerSecurity(ctx, rec.Name, to); err != nil {
 		return status.Errorf(codes.Internal,
-			"restore the container's recorded privilege mode after the revert: %v (it refuses to start until lv ct convert finishes)", err)
+			"restore the container's recorded privilege mode after the revert: %v (it refuses to start until this finishes: run the revert again, or lv ct convert --unprivileged %s, which resumes to the recorded range)", err, rec.Name)
 	}
 	return nil
+}
+
+// revertConverter is the runtime half of a revert that marks the restored
+// copy converting to the container's recorded security before the swap
+// (lxc.LxcRunner.RevertContainerConverting).
+type revertConverter interface {
+	RevertContainerConverting(ctx context.Context, name string, r io.Reader, to lxc.ConvertOpts) error
+}
+
+// revertKeepingSecurity reverts rec from r. When the row records a security
+// and the runtime can, the restored copy is marked converting to it before it
+// is swapped in, so a crash before keepRecordedSecurity's convert leaves a
+// container that refuses to start (and lv ct convert resumes to the recorded
+// range), never one running with the snapshot's older mode.
+func (s *Server) revertKeepingSecurity(ctx context.Context, rec *corrosion.ContainerRecord, r io.Reader) error {
+	spec := corrosion.DecodeCreateSpec(rec.CreateSpec)
+	rc, ok := s.containerRuntime.(revertConverter)
+	if !ok || (spec.IDMapBase == 0 && spec.Confinement == "") {
+		return s.containerRuntime.RevertContainer(ctx, rec.Name, r)
+	}
+	to := lxc.ConvertOpts{Confinement: spec.Confinement}
+	if spec.IDMapBase != 0 {
+		to.IDMap = &lxc.IDMap{Base: spec.IDMapBase, Size: lxc.IDMapSize}
+	}
+	return rc.RevertContainerConverting(ctx, rec.Name, r, to)
 }

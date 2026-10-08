@@ -300,3 +300,21 @@ func TestRevertContainerSnapshot_RestartRunsTheOverlapCheck(t *testing.T) {
 		t.Fatal("restarted anyway")
 	}
 }
+
+// The revert hands the runtime the container's recorded security, so the
+// restored copy is marked converting before the swap (a crash before the
+// convert leaves a container that refuses to start, not a privileged one).
+func TestRevertContainerSnapshot_MarksTheCopyBeforeTheSwap(t *testing.T) {
+	s, rt := secServer(t)
+	const base = 1_000_262_144
+	seedSecCT(t, s, rt, "web", "stopped", corrosion.ContainerCreateSpec{Template: "download", IDMapBase: base, Confinement: lxc.ConfinementDefault})
+	if _, err := s.SnapshotContainer(adminCtx(), &pb.SnapshotContainerRequest{Name: "web", HostName: "host-a", Snapshot: "pre"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RevertContainerSnapshot(adminCtx(), &pb.RevertContainerSnapshotRequest{Name: "web", HostName: "host-a", Snapshot: "pre"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(rt.revertMarks) != 1 || rt.revertMarks[0].IDMap == nil || rt.revertMarks[0].IDMap.Base != base || rt.revertMarks[0].Confinement != lxc.ConfinementDefault {
+		t.Fatalf("revert marks = %+v, want the row's range and confinement", rt.revertMarks)
+	}
+}

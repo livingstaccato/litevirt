@@ -22,8 +22,12 @@ type chownCall struct {
 	uid, gid int
 }
 
-// lchown is os.Lchown; a variable so tests run without root.
-var lchown = os.Lchown
+// lchown is os.Lchown, and lookupOwner reads an entry's owner; variables so
+// tests run without root (UseOwnershipOverlayForTest).
+var (
+	lchown      = os.Lchown
+	lookupOwner = func(_ string, fi fs.FileInfo) (int, int) { return ownerOf(fi) }
+)
 
 func setChownForTest(fn func(string, int, int) error) (restore func()) {
 	old := lchown
@@ -59,7 +63,7 @@ func shiftTree(root string, from, to *IDMap) error {
 		if err != nil {
 			return err
 		}
-		uid, gid := ownerOf(fi)
+		uid, gid := lookupOwner(p, fi)
 		if uid < 0 {
 			return fmt.Errorf("%s: no owner", p)
 		}

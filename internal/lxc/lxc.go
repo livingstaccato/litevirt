@@ -759,6 +759,12 @@ func (r *LxcRunner) ContainerExists(name string) (bool, error) {
 // unprivileged container here, on the host it lands on. Attributes the
 // filesystem does not support are dropped and recorded (droppedAttrsFile).
 func (r *LxcRunner) importContainer(ctx context.Context, name string, src io.Reader, replace bool) error {
+	return r.importContainerMarked(ctx, name, src, replace, nil)
+}
+
+// importContainerMarked is importContainer that, with markTo, marks the
+// staged copy converting to markTo when its config's security differs.
+func (r *LxcRunner) importContainerMarked(ctx context.Context, name string, src io.Reader, replace bool, markTo *ConvertOpts) error {
 	// The name becomes <lxcpath>/<name>; validate it before it composes a path.
 	if err := safename.ValidateContainerName(name); err != nil {
 		return err
@@ -798,6 +804,14 @@ func (r *LxcRunner) importContainer(ctx context.Context, name string, src io.Rea
 	}
 	if err := secureContainerDirAt(staged); err != nil {
 		return err
+	}
+	if markTo != nil {
+		if b, rerr := os.ReadFile(filepath.Join(staged, "config")); rerr == nil && securityDiffers(parseSecurity(string(b)), *markTo) {
+			m, _ := json.Marshal(markTo)
+			if err := os.WriteFile(filepath.Join(staged, convertMarkerFile), m, 0o600); err != nil {
+				return fmt.Errorf("mark the restored copy of %s converting: %w", name, err)
+			}
+		}
 	}
 	var backup string
 	if _, err := os.Stat(dir); err == nil {
@@ -1463,4 +1477,12 @@ func (r *LxcRunner) shiftNewRootfs(opts CreateOpts) error {
 		return fmt.Errorf("shift %s into ids %d-%d: %w", rootfs, opts.IDMap.Base, opts.IDMap.Base+opts.IDMap.Size-1, err)
 	}
 	return nil
+}
+
+// securityDiffers reports whether sec is not what `to` asks for.
+func securityDiffers(sec Security, to ConvertOpts) bool {
+	if to.IDMap != nil && (sec.IDMap == nil || sec.IDMap.Base != to.IDMap.Base) {
+		return true
+	}
+	return to.Confinement != "" && to.Confinement != sec.Confinement
 }

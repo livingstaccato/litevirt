@@ -65,6 +65,8 @@ type fakeCTRuntime struct {
 	// revertSecurity is the security a RevertContainer lays down (the
 	// snapshot's own config), per container.
 	revertSecurity map[string]lxc.Security
+	// revertMarks records RevertContainerConverting's targets.
+	revertMarks []lxc.ConvertOpts
 
 	// B0 day-2 primitives: rootfs path a test wants returned, plus freeze/unfreeze
 	// call tracking so backup/snapshot tests can assert quiesce + unfreeze.
@@ -302,6 +304,12 @@ func (f *fakeCTRuntime) RevertContainer(_ context.Context, name string, r io.Rea
 		f.security[name] = sec
 	}
 	return nil
+}
+func (f *fakeCTRuntime) RevertContainerConverting(ctx context.Context, name string, r io.Reader, to lxc.ConvertOpts) error {
+	f.mu.Lock()
+	f.revertMarks = append(f.revertMarks, to)
+	f.mu.Unlock()
+	return f.RevertContainer(ctx, name, r)
 }
 func (f *fakeCTRuntime) CloneContainer(_ context.Context, src, dst string) error {
 	f.mu.Lock()

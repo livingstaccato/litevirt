@@ -467,6 +467,11 @@ its on-disk dir, and stores it **host-local** under `{dataDir}/ct-snapshots`.
   snapshot extract fails, so a corrupt snapshot can never lose the container.
 - **Host-local**, like the container itself; snapshot ops run on the owning host
   (the daemon forwards there automatically).
+- **Private to root.** A snapshot is the container's whole rootfs, its
+  `/etc/shadow` included, so the tar is written `0600` in `0700` directories
+  (`ct-snapshots/` and `ct-snapshots/<container>/`). A snapshot an earlier
+  release wrote world-readable is narrowed the next time it is listed, reverted
+  or snapshotted beside; nothing sweeps the others.
 - Snapshots are full copies today (no dedup); **COW acceleration** on
   btrfs/zfs/lvm-thin rootfs is a planned follow-up. For space-efficient,
   off-host point-in-time copies use `lv ct backup` (dedup chunk store).

@@ -22,6 +22,30 @@ func ctSnapshotPath(dataDir, ctName, snap string) string {
 	return filepath.Join(dataDir, containerSnapshotDir, ctName, snap+".tar")
 }
 
+// A snapshot tar is the container's whole rootfs, /etc/shadow included, so it
+// is readable by root alone: 0600 in 0700 directories. An earlier build wrote
+// 0644 in 0755 directories; makeSnapshotPrivate tightens one the next time it
+// is used (create, list, revert) — nothing sweeps the rest.
+
+// makeSnapshotPrivate sets the snapshot directories under dataDir for ctName
+// to 0700 and, when path is set and exists, the tar to 0600. A path outside
+// this container's snapshot directory (a hand-edited record) is left alone.
+func makeSnapshotPrivate(dataDir, ctName, path string) {
+	top := filepath.Join(dataDir, containerSnapshotDir)
+	dir := filepath.Join(top, ctName)
+	for _, d := range []string{top, dir} {
+		if fi, err := os.Lstat(d); err == nil && fi.IsDir() && fi.Mode().Perm() != 0o700 {
+			_ = os.Chmod(d, 0o700)
+		}
+	}
+	if path == "" || filepath.Dir(path) != dir {
+		return
+	}
+	if fi, err := os.Lstat(path); err == nil && fi.Mode().IsRegular() && fi.Mode().Perm() != 0o600 {
+		_ = os.Chmod(path, 0o600)
+	}
+}
+
 // SnapshotContainer takes a point-in-time snapshot of a container: freeze (if
 // running) → tar the on-disk dir → store host-local under dataDir, recording it
 // in container_snapshots. Runs on the owning host (forwards there if the
@@ -74,9 +98,10 @@ func (s *Server) SnapshotContainer(ctx context.Context, req *pb.SnapshotContaine
 	defer unlock()
 
 	path := ctSnapshotPath(s.dataDir, req.Name, req.Snapshot)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, status.Errorf(codes.Internal, "prepare snapshot dir: %v", err)
 	}
+	makeSnapshotPrivate(s.dataDir, req.Name, "")
 
 	// Quiesce a running container so the tar is a consistent point-in-time;
 	// always unfreeze, even on failure.
@@ -86,8 +111,13 @@ func (s *Server) SnapshotContainer(ctx context.Context, req *pb.SnapshotContaine
 		}
 	}
 
-	f, err := os.Create(path)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
+		return nil, status.Errorf(codes.Internal, "create snapshot file: %v", err)
+	}
+	if err := f.Chmod(0o600); err != nil { // the umask never widens it, and an old file is narrowed
+		_ = f.Close()
+		_ = os.Remove(path)
 		return nil, status.Errorf(codes.Internal, "create snapshot file: %v", err)
 	}
 	exportErr := s.containerRuntime.ExportContainer(ctx, req.Name, f)
@@ -162,6 +192,9 @@ func (s *Server) ListContainerSnapshots(ctx context.Context, req *pb.ListContain
 	}
 	resp := &pb.ListContainerSnapshotsResponse{}
 	for _, sn := range snaps {
+		if host == s.hostName {
+			makeSnapshotPrivate(s.dataDir, req.Name, sn.Path)
+		}
 		resp.Snapshots = append(resp.Snapshots, &pb.ContainerSnapshot{
 			Id: sn.ID, CtName: sn.CtName, HostName: sn.HostName, Name: sn.Name,
 			State: sn.State, SizeBytes: sn.SizeBytes, Type: sn.Type, CreatedAt: sn.CreatedAt,
@@ -214,6 +247,7 @@ func (s *Server) RevertContainerSnapshot(ctx context.Context, req *pb.RevertCont
 	unlock := s.lockVM("ct/" + req.Name)
 	defer unlock()
 
+	makeSnapshotPrivate(s.dataDir, req.Name, snap.Path)
 	f, err := os.Open(snap.Path)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "open snapshot data (%s): %v", snap.Path, err)

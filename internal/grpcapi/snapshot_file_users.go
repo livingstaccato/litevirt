@@ -2,9 +2,12 @@ package grpcapi
 
 import (
 	"context"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
+	"strings"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/qcow2"
@@ -89,4 +92,109 @@ func chainReaches(file string, hit func(string) bool) bool {
 		path = b
 	}
 	return false
+}
+
+// headerUsersKeep reports whether a file vmName's delete would remove must
+// be kept because another VM's disk reaches it through its qcow2 header
+// chain or its recorded backing_disk (snapshotFileUsers). "Cannot tell"
+// keeps it.
+func (s *Server) headerUsersKeep(ctx context.Context, vmName, path string) bool {
+	users, err := s.snapshotFileUsers(ctx, vmName, []string{path})
+	if err != nil {
+		slog.Error("delete: cannot tell whether another VM backs on a disk file; keeping it",
+			"vm", vmName, "path", path, "error", err)
+		return true
+	}
+	if len(users) > 0 {
+		slog.Warn("delete: another VM backs on a disk file of this VM; keeping it",
+			"vm", vmName, "path", path, "users", users)
+		return true
+	}
+	return false
+}
+
+// ownDiskLayers lists the files of vmName's disks on this host other than
+// the recorded ones, which their rows free: every layer of each recorded
+// disk's qcow2 chain that has the disk's name (<vm>-<disk>.<anything>, in
+// the disk's directory — snapshot overlays and the disk they were taken
+// of), and every other file of that name there (an overlay a restore of an
+// older snapshot left out of the chain). A disk name with a dash is skipped,
+// as the debris sweep skips it: <vm>-<a>-<b> can be another VM's disk. Read
+// before anything is deleted, since the chain is read from the files.
+func (s *Server) ownDiskLayers(ctx context.Context, vmName string) []string {
+	disks, err := corrosion.GetVMDisks(ctx, s.db, vmName)
+	if err != nil {
+		slog.Warn("delete: cannot list the VM's disks; its snapshot overlays are kept", "vm", vmName, "error", err)
+		return nil
+	}
+	recorded := map[string]bool{}
+	for _, d := range disks {
+		recorded[filepath.Clean(s.hostDiskFile(d.Path))] = true
+	}
+	seen := map[string]bool{}
+	var out []string
+	add := func(p string) {
+		p = filepath.Clean(p)
+		if !recorded[p] && !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	for _, d := range disks {
+		file := s.hostDiskFile(d.Path)
+		if d.Path == "" || !filepath.IsAbs(file) {
+			continue
+		}
+		stem := filepath.Base(diskStem(file))
+		rest, ok := strings.CutPrefix(stem, vmName+"-")
+		if !ok || rest == "" || strings.Contains(rest, "-") {
+			continue
+		}
+		dir := filepath.Dir(file)
+		own := func(p string) bool {
+			return filepath.Dir(filepath.Clean(p)) == dir && filepath.Base(diskStem(p)) == stem
+		}
+		path := file
+		for depth := 0; depth <= maxBackingDepth; depth++ {
+			info, err := qcow2.Info(path)
+			if err != nil || info.BackingFile == "" || looksLikeProtocol(info.BackingFile) {
+				break
+			}
+			b := info.BackingFile
+			if !filepath.IsAbs(b) {
+				b = filepath.Join(filepath.Dir(path), b)
+			}
+			if !own(b) {
+				break
+			}
+			add(b)
+			path = b
+		}
+		matches, _ := filepath.Glob(filepath.Join(dir, globEscape(stem)+".*"))
+		for _, m := range matches {
+			if fi, err := os.Lstat(m); err == nil && fi.Mode().IsRegular() && own(m) {
+				add(m)
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// removeOwnDiskLayers removes files ownDiskLayers listed, except one another
+// VM names in its record or reaches through its qcow2 chain.
+func (s *Server) removeOwnDiskLayers(ctx context.Context, vmName string, files []string) {
+	for _, f := range files {
+		refs, err := corrosion.DisksReferencingPath(ctx, s.db, f)
+		if err != nil {
+			slog.Warn("delete: cannot tell whether a snapshot overlay is referenced; keeping it", "vm", vmName, "path", f, "error", err)
+			continue
+		}
+		if slices.ContainsFunc(refs, func(r corrosion.DiskRecord) bool { return r.VMName != vmName }) || s.headerUsersKeep(ctx, vmName, f) {
+			continue
+		}
+		if err := os.Remove(f); err != nil && !os.IsNotExist(err) {
+			slog.Warn("delete: remove snapshot overlay", "vm", vmName, "path", f, "error", err)
+		}
+	}
 }

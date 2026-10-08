@@ -621,11 +621,19 @@ func (s *Server) protectedDiskPathsFrom(ctx context.Context, vmName string, cand
 				break
 			}
 		}
+		// A clone whose record does not say what it backs on is found by its
+		// qcow2 header, as the snapshot guards find it.
+		if !keep[path] && s.headerUsersKeep(ctx, vmName, path) {
+			keep[path] = true
+		}
 	}
 	return keep
 }
 
 func (s *Server) diskPathReferencedByOtherVM(ctx context.Context, vmName string, d *corrosion.DiskRecord) bool {
+	if s.headerUsersKeep(ctx, vmName, s.hostDiskFile(d.Path)) {
+		return true
+	}
 	refs, err := corrosion.DisksReferencingPath(ctx, s.db, d.Path)
 	if err != nil {
 		slog.Warn("delete: shared-disk check failed; keeping disk to avoid removing a shared volume",

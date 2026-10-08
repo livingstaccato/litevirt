@@ -623,6 +623,9 @@ func (s *Server) RestoreFromBackup(req *pb.RestoreFromBackupRequest, stream grpc
 		if named, ownDisk, err = s.resolveRestoreFromTarget(ctx, req.TargetPath, disksDir, req.VmName, req.DiskName); err != nil {
 			return err
 		}
+		if ownDisk && s.restoreTargetResolvedHook != nil {
+			s.restoreTargetResolvedHook(req.VmName)
+		}
 	}
 	repoPath, err := s.resolveBackupRepoPath(ctx, req.RepoPath)
 	if err != nil {

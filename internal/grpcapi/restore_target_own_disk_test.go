@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -113,4 +114,41 @@ func TestRestoreFromBackup_TargetPathOnAnyOtherFileIsRefusedNamingInPlace(t *tes
 	if after, _ := os.ReadFile(own); !bytes.Equal(before, after) {
 		t.Error("an operator's target_path replaced the disk")
 	}
+}
+
+// The match is re-checked under the VM lock: when the disk's record moves to
+// another file between the target_path match and the lock, the restore is
+// refused and neither file is written — the named file is no longer that
+// disk's own, and the file the record now names was never the one named.
+//
+// Mutation: drop the re-check in RestoreFromBackup — red (the restore
+// replaces the record's new file instead).
+func TestRestoreFromBackup_TargetPathRecordMovedBeforeTheLockIsRefused(t *testing.T) {
+	f := newRestoreFixture(t)
+	f.s.virt = libvirtfake.New()
+	ctx := context.Background()
+	disks, _ := corrosion.GetVMDisks(ctx, f.s.db, "web")
+	named := disks[0].Path
+	moved := filepath.Join(filepath.Dir(named), "web-root-moved.qcow2")
+	if err := os.WriteFile(moved, []byte("the disk's file now"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	namedBefore, _ := os.ReadFile(named)
+	movedBefore, _ := os.ReadFile(moved)
+	f.s.restoreTargetResolvedHook = func(vm string) {
+		if err := corrosion.UpdateVMDiskPath(ctx, f.s.db, vm, "root", moved); err != nil {
+			t.Errorf("UpdateVMDiskPath: %v", err)
+		}
+	}
+	err := restoreTargetPath(adminCtx(), f, "web", restoreTS, named)
+	if status.Code(err) != codes.AlreadyExists || !strings.Contains(err.Error(), "--in-place") {
+		t.Errorf("record moved before the lock: got %v, want AlreadyExists naming --in-place", err)
+	}
+	if after, _ := os.ReadFile(named); !bytes.Equal(after, namedBefore) {
+		t.Error("the named file, no longer the disk's own, was replaced")
+	}
+	if after, _ := os.ReadFile(moved); !bytes.Equal(after, movedBefore) {
+		t.Error("the record's new file, never named, was replaced")
+	}
+	f.assertVictimIntact(t)
 }

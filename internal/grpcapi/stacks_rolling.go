@@ -74,7 +74,11 @@ func (o *serverOps) recreateAs(ctx context.Context, target, source string, desir
 			return status.Errorf(st.Code(), "recreate %s: %s; nothing was deleted", target, st.Message())
 		}
 	}
-	dctx, deleted := withDeletedVMSink(ctx, target)
+	var curCreated string
+	if cur != nil {
+		curCreated = cur.CreatedAt
+	}
+	dctx, deleted := withDeletedVMSink(ctx, target, curCreated)
 	_, derr := o.s.DeleteVM(dctx, &pb.DeleteVMRequest{Name: target})
 	if derr != nil && status.Code(derr) != codes.NotFound {
 		return fmt.Errorf("delete %s before recreate: %w", target, derr)

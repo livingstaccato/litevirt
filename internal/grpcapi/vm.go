@@ -3265,7 +3265,8 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	// the row-deleting path's, not the binding's, and a rebuild must not be the
 	// one place it is missing.
 	s.releaseNICLeasesBestEffort(ctx, vm, "rebuild")
-	if err := corrosion.DeleteVM(ctx, s.db, req.Name); err != nil {
+	deleted, err := corrosion.DeleteVMReporting(ctx, s.db, req.Name)
+	if err != nil {
 		return nil, status.Errorf(codes.Internal, "rebuild: tombstone old records: %v", err)
 	}
 
@@ -3275,7 +3276,13 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	// names (vm_recreate_replaces.go).
 	slog.Info("rebuilding VM", "name", req.Name)
 	s.recordVMEvent(ctx, req.Name, "vm.rebuilt", "ok", "image="+spec.Image)
-	rctx = withReplacedVM(rctx, vm)
+	// The VM replaced is the row the delete actually tombstoned (its guard
+	// re-reads under the CAS); nil only when the row was already gone.
+	if deleted != nil {
+		rctx = withReplacedVM(rctx, deleted)
+	} else {
+		rctx = withReplacedVM(rctx, vm)
+	}
 	var out *pb.VM
 	if placed {
 		out, err = s.createVM(rctx, &pb.CreateVMRequest{Spec: spec}, &resolvedCreateVMDecision{resolvedHost: host, placedHere: true})

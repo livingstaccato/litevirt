@@ -106,14 +106,18 @@ func withReplacedSnapshot(ctx context.Context, name string, snap corrosion.VMDel
 type deletedVMSinkKey struct{}
 
 // deletedVMSink receives the row a DeleteVM tombstoned, as its guard saw it.
+// It takes a report only of createdAt, the incarnation of the caller's own
+// copy: the owner's view may be ahead of that copy on the authority axes, but
+// a report of another incarnation is not the VM the caller meant to replace.
 type deletedVMSink struct {
-	name string
-	snap *corrosion.VMDeleteSnapshot
+	name, createdAt string
+	snap            *corrosion.VMDeleteSnapshot
 }
 
-// withDeletedVMSink returns ctx with a sink for the delete of name.
-func withDeletedVMSink(ctx context.Context, name string) (context.Context, *deletedVMSink) {
-	sink := &deletedVMSink{name: name}
+// withDeletedVMSink returns ctx with a sink for the delete of name, whose
+// incarnation in the caller's copy is createdAt.
+func withDeletedVMSink(ctx context.Context, name, createdAt string) (context.Context, *deletedVMSink) {
+	sink := &deletedVMSink{name: name, createdAt: createdAt}
 	return context.WithValue(ctx, deletedVMSinkKey{}, sink), sink
 }
 
@@ -129,7 +133,8 @@ func (s *Server) reportDeletedVM(ctx context.Context, row *corrosion.VMRecord) {
 		return
 	}
 	snap := corrosion.SnapshotForDelete(*row)
-	if sink, ok := ctx.Value(deletedVMSinkKey{}).(*deletedVMSink); ok && sink.name == row.Name {
+	if sink, ok := ctx.Value(deletedVMSinkKey{}).(*deletedVMSink); ok && sink.name == row.Name &&
+		sink.createdAt != "" && snap.CreatedAt == sink.createdAt {
 		sink.snap = &snap
 	}
 	if s.requirePeerCert(ctx) != nil {
@@ -158,7 +163,7 @@ func acceptDeletedVMHeader(ctx context.Context, name string, hdr metadata.MD) {
 	}
 	var w replacedVMWire
 	if err := json.Unmarshal([]byte(vals[0]), &w); err != nil || w.Name != name || w.CreatedAt == "" ||
-		w.HostName == "" || w.IdentityHash == "" {
+		w.CreatedAt != sink.createdAt || w.HostName == "" || w.IdentityHash == "" {
 		return
 	}
 	sink.snap = &corrosion.VMDeleteSnapshot{

@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -278,5 +279,121 @@ func TestRecreateFailedAfterTeardown_NamesWhatIsGoneAndKeepsTheSpec(t *testing.T
 	kept := &pb.VMSpec{}
 	if err := protojson.Unmarshal(b, kept); err != nil || kept.GetName() != "vm1" || kept.GetCpu() != 3 {
 		t.Fatalf("kept spec %s = %s (%v); want the rebuild's", path, b, err)
+	}
+}
+
+// headerStream captures the response headers a handler sets.
+type headerStream struct{ hdr metadata.MD }
+
+func (h *headerStream) Method() string { return "/litevirt.v1.LiteVirt/DeleteVM" }
+func (h *headerStream) SetHeader(md metadata.MD) error {
+	h.hdr = metadata.Join(h.hdr, md)
+	return nil
+}
+func (h *headerStream) SendHeader(md metadata.MD) error { return h.SetHeader(md) }
+func (h *headerStream) SetTrailer(metadata.MD) error    { return nil }
+
+// The row a DeleteVM tombstoned goes back in a response header only to a
+// verified peer host or the node's local root — never to a user, an Admin
+// included, nor to a client certificate.
+//
+// Mutation: drop the requirePeerCert check in reportDeletedVM — red.
+func TestDeletedVMHeader_OnlyTowardAPeerOrLocalRoot(t *testing.T) {
+	s, _ := provableCreateServer(t)
+	peer := peerHostCtx(t, s, "host-a")
+	localRoot := context.WithValue(peer, ctxKeyPrincipalKind, principalKindLocalRoot)
+	client := context.WithValue(peer, ctxKeyPrincipalKind, principalKindClient)
+	for _, tc := range []struct {
+		name string
+		ctx  context.Context
+		want bool
+	}{
+		{"admin", adminCtx(), false},
+		{"client-cert", client, false},
+		{"peer", peer, true},
+		{"local-root", localRoot, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			vm := "vm-" + tc.name
+			if _, err := s.CreateVM(adminCtx(), disklessCreateRequest(vm)); err != nil {
+				t.Fatal(err)
+			}
+			row := vmRecord(t, s, vm)
+			st := &headerStream{}
+			if _, err := s.DeleteVM(grpc.NewContextWithServerTransportStream(tc.ctx, st), &pb.DeleteVMRequest{Name: vm}); err != nil {
+				t.Fatalf("DeleteVM as %s: %v", tc.name, err)
+			}
+			vals := st.hdr.Get(deletedVMMD)
+			if !tc.want {
+				if len(vals) != 0 {
+					t.Fatalf("DeleteVM answering %s set %s: %v", tc.name, deletedVMMD, vals)
+				}
+				return
+			}
+			var w replacedVMWire
+			if len(vals) != 1 || json.Unmarshal([]byte(vals[0]), &w) != nil || w.Name != vm ||
+				w.CreatedAt != row.CreatedAt || w.HostName != row.HostName || w.OwnerEpoch != row.OwnerEpoch ||
+				w.IdentityHash != corrosion.VMIdentityHash(*row) {
+				t.Fatalf("DeleteVM answering %s: header %v, want the tombstoned row %+v", tc.name, vals, row)
+			}
+		})
+	}
+}
+
+// The forwarding node takes the owner's report only when it is whole, names
+// the VM, and is the incarnation of its own copy; anything else is ignored and
+// the recreate falls back to that copy.
+//
+// Mutation: drop the created_at match in acceptDeletedVMHeader — red.
+func TestAcceptDeletedVMHeader_TakesOnlyAWholeReportOfItsOwnIncarnation(t *testing.T) {
+	const mine = "2026-10-08T10:00:00.000000001Z"
+	whole := func(mut func(w *replacedVMWire)) metadata.MD {
+		w := replacedVMWire{Name: "vm1", CreatedAt: mine, HostName: "host-a", OwnerEpoch: 3, SpecGeneration: 1, IdentityHash: "abc"}
+		if mut != nil {
+			mut(&w)
+		}
+		b, _ := json.Marshal(w)
+		return metadata.Pairs(deletedVMMD, string(b))
+	}
+	for _, tc := range []struct {
+		name string
+		hdr  metadata.MD
+		want bool
+	}{
+		{"whole and mine", whole(nil), true},
+		{"malformed", metadata.Pairs(deletedVMMD, "{not json"), false},
+		{"another incarnation", whole(func(w *replacedVMWire) { w.CreatedAt = "2026-10-08T11:00:00Z" }), false},
+		{"another VM", whole(func(w *replacedVMWire) { w.Name = "vm2" }), false},
+		{"no identity", whole(func(w *replacedVMWire) { w.IdentityHash = "" }), false},
+		{"no host", whole(func(w *replacedVMWire) { w.HostName = "" }), false},
+		{"two reports", metadata.Join(whole(nil), whole(nil)), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, sink := withDeletedVMSink(context.Background(), "vm1", mine)
+			acceptDeletedVMHeader(ctx, "vm1", tc.hdr)
+			if got := sink.snap != nil; got != tc.want {
+				t.Fatalf("report taken = %v, want %v (%+v)", got, tc.want, sink.snap)
+			}
+			if tc.want && (sink.snap.OwnerEpoch != 3 || sink.snap.HostName != "host-a") {
+				t.Fatalf("report taken as %+v", sink.snap)
+			}
+		})
+	}
+}
+
+// The in-process report obeys the same rule: a row of another incarnation
+// than the caller's copy is not taken.
+func TestReportDeletedVM_InProcessTakesOnlyItsOwnIncarnation(t *testing.T) {
+	s, _ := provableCreateServer(t)
+	row := &corrosion.VMRecord{Name: "vm1", HostName: "host-a", CreatedAt: "2026-10-08T11:00:00Z", Spec: "{}"}
+	ctx, sink := withDeletedVMSink(adminCtx(), "vm1", "2026-10-08T10:00:00Z")
+	s.reportDeletedVM(ctx, row)
+	if sink.snap != nil {
+		t.Fatalf("a deleted row of another incarnation was taken: %+v", sink.snap)
+	}
+	ctx, sink = withDeletedVMSink(adminCtx(), "vm1", row.CreatedAt)
+	s.reportDeletedVM(ctx, row)
+	if sink.snap == nil || sink.snap.CreatedAt != row.CreatedAt {
+		t.Fatalf("the deleted row of its own incarnation was not taken: %+v", sink.snap)
 	}
 }

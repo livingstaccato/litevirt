@@ -187,3 +187,67 @@ func TestContainerOpLog_Migrate(t *testing.T) {
 	}
 	logs.must(t, "ERROR", "container migrate failed", map[string]string{"name": "ct1", "target": "host-b", "code": "Internal"})
 }
+
+// A caller refused by RBAC writes no op line: the line starts only after
+// authorization.
+func TestContainerOpLog_DeniedCallerWritesNothing(t *testing.T) {
+	s, _ := snapTestServer(t, "running")
+	other := grantUser(t, s, "mallory", "/projects/beta", "Operator")
+	logs := captureOpLog(t)
+	if _, err := s.SnapshotContainer(other, &pb.SnapshotContainerRequest{Name: "ct1", HostName: "host-a", Snapshot: "s1"}); err == nil {
+		t.Fatal("out-of-project snapshot succeeded")
+	}
+	if rec := logs.record("container snapshot started", nil); rec != nil {
+		t.Fatalf("a denied caller wrote an op line: %v", rec)
+	}
+}
+
+// The node that forwards a call to the container's owner logs nothing for
+// it; the owner logs it once, where it runs.
+func TestContainerOpLog_ForwardingNodeLogsNothing(t *testing.T) {
+	s := testServer(t)
+	s.hostName = "host-a"
+	s.dataDir = t.TempDir()
+	s.SetContainerRuntime(&fakeCTRuntime{})
+	if err := corrosion.UpsertContainer(context.Background(), s.db, corrosion.ContainerRecord{
+		HostName: "host-b", Name: "ctb", State: "running", Project: "acme",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	logs := captureOpLog(t)
+	_, _ = s.SnapshotContainer(adminCtx(), &pb.SnapshotContainerRequest{Name: "ctb", Snapshot: "s1"})
+	_, _ = s.RevertContainerSnapshot(adminCtx(), &pb.RevertContainerSnapshotRequest{Name: "ctb", Snapshot: "s1"})
+	_, _ = s.DeleteContainerSnapshot(adminCtx(), &pb.DeleteContainerSnapshotRequest{Name: "ctb", Snapshot: "s1"})
+	for _, op := range []string{"snapshot", "snapshot revert", "snapshot delete"} {
+		if rec := logs.record("container "+op+" started", nil); rec != nil {
+			t.Fatalf("the forwarding node logged %q: %v", op, rec)
+		}
+	}
+}
+
+// Each operation logs its start and its outcome exactly once.
+func TestContainerOpLog_EachLineOnce(t *testing.T) {
+	s, _ := snapTestServer(t, "running")
+	logs := captureOpLog(t)
+	if _, err := s.SnapshotContainer(adminCtx(), &pb.SnapshotContainerRequest{Name: "ct1", HostName: "host-a", Snapshot: "s1"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, msg := range []string{"container snapshot started", "container snapshot completed"} {
+		if n := logs.count(msg); n != 1 {
+			t.Fatalf("%q logged %d times, want 1", msg, n)
+		}
+	}
+}
+
+func (c *opLogCapture) count(msg string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := 0
+	for _, line := range strings.Split(c.buf.String(), "\n") {
+		var rec map[string]any
+		if json.Unmarshal([]byte(line), &rec) == nil && rec["msg"] == msg {
+			n++
+		}
+	}
+	return n
+}

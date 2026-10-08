@@ -60,6 +60,17 @@ func captureDaemonStderrEnv(t *testing.T, cfg Config, emit func()) []string {
 	return strings.Split(strings.TrimSpace(string(bytes.TrimSpace(out))), "\n")
 }
 
+// countWith counts the lines containing needle.
+func countWith(lines []string, needle string) int {
+	n := 0
+	for _, l := range lines {
+		if strings.Contains(l, needle) {
+			n++
+		}
+	}
+	return n
+}
+
 func lineWith(lines []string, needle string) string {
 	for _, l := range lines {
 		if strings.Contains(l, needle) {
@@ -117,10 +128,10 @@ func TestDaemonLog_DefaultConsole_RecordsAreStructured(t *testing.T) {
 		{"lease drifted", "WARN", "ct", "lxt4"},
 		{"container created", "INFO", "name", "lxt3"},
 	} {
-		line := lineWith(lines, c.msg)
-		if line == "" {
-			t.Fatalf("no journal line for %q in %q", c.msg, lines)
+		if n := countWith(lines, c.msg); n != 1 {
+			t.Fatalf("%d journal lines for %q, want exactly 1: %q", n, c.msg, lines)
 		}
+		line := lineWith(lines, c.msg)
 		f := logfmtFields(line)
 		if f["level"] != c.level {
 			t.Errorf("%q: level=%q, want %q (line %q)", c.msg, f["level"], c.level, line)
@@ -139,6 +150,9 @@ func TestDaemonLog_JSON_RecordsAreStructured(t *testing.T) {
 	lines := captureDaemonStderr(t, Config{ServiceName: "litevirt", LogFormat: "json"}, func() {
 		slog.Error("container deleted", "name", "lxt2", "host", "node-3")
 	})
+	if n := countWith(lines, "container deleted"); n != 1 {
+		t.Fatalf("%d JSON records for one call, want 1: %q", n, lines)
+	}
 	line := lineWith(lines, "container deleted")
 	var rec map[string]any
 	if err := json.Unmarshal([]byte(line), &rec); err != nil {
@@ -156,6 +170,9 @@ func TestDaemonLog_StdlibLogIsOneRecord(t *testing.T) {
 	lines := captureDaemonStderr(t, Config{ServiceName: "litevirt"}, func() {
 		log.Print("stdlib says hello")
 	})
+	if n := countWith(lines, "stdlib says hello"); n != 1 {
+		t.Fatalf("%d lines for one log.Print, want 1: %q", n, lines)
+	}
 	line := lineWith(lines, "stdlib says hello")
 	f := logfmtFields(line)
 	if f["message"] != "stdlib says hello" {

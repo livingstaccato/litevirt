@@ -140,19 +140,32 @@ func (s *Server) headerUsersKeep(ctx context.Context, vmName, path string) bool 
 	return false
 }
 
-// ownDiskLayers lists the files of vmName's disks on this host other than
-// the recorded ones, which their rows free: every layer of each recorded
-// disk's qcow2 chain that has the disk's name (<vm>-<disk>.<anything>, in
-// the disk's directory — snapshot overlays and the disk they were taken
-// of), and every other file of that name there (an overlay a restore of an
-// older snapshot left out of the chain). A disk name with a dash is skipped,
-// as the debris sweep skips it: <vm>-<a>-<b> can be another VM's disk. Read
-// before anything is deleted, since the chain is read from the files.
+// ownDiskLayers lists the files of vmName's disks on this host that its
+// rows do not free, and that are certainly its own (re-review R1-C1):
+//   - a layer of a recorded disk's own chain: below the recorded file, each
+//     layer its parent's header declares qcow2, as long as it has the disk's
+//     name (<vm>-<disk>.<anything>, in the disk's directory) — the snapshot
+//     overlays between the live layer and the disk they were taken of;
+//   - a qcow2 file of the disk's name beside it whose own header backs into
+//     that chain, or whose extension names one of the VM's snapshots: an
+//     overlay a restore of an older snapshot left out of the chain.
+//
+// Nothing of a disk recorded delete_with_vm=false, and nothing of a disk
+// whose name has a dash (<vm>-<a>-<b> can be another VM's disk, as the
+// debris sweep reasons). removeOwnDiskLayers then spares uploads and files
+// other VMs use. Read before anything is deleted, since the chain is read
+// from the files.
 func (s *Server) ownDiskLayers(ctx context.Context, vmName string) []string {
 	disks, err := corrosion.GetVMDisks(ctx, s.db, vmName)
 	if err != nil {
 		slog.Warn("delete: cannot list the VM's disks; its snapshot overlays are kept", "vm", vmName, "error", err)
 		return nil
+	}
+	snapNames := map[string]bool{}
+	if snaps, err := corrosion.ListSnapshots(ctx, s.db, vmName); err == nil {
+		for _, sn := range snaps {
+			snapNames[sn.Name] = true
+		}
 	}
 	recorded := map[string]bool{}
 	for _, d := range disks {
@@ -161,15 +174,14 @@ func (s *Server) ownDiskLayers(ctx context.Context, vmName string) []string {
 	seen := map[string]bool{}
 	var out []string
 	add := func(p string) {
-		p = filepath.Clean(p)
 		if !recorded[p] && !seen[p] {
 			seen[p] = true
 			out = append(out, p)
 		}
 	}
 	for _, d := range disks {
-		file := s.hostDiskFile(d.Path)
-		if d.Path == "" || !filepath.IsAbs(file) {
+		file := filepath.Clean(s.hostDiskFile(d.Path))
+		if d.Path == "" || !d.DeleteWithVM || !filepath.IsAbs(file) {
 			continue
 		}
 		stem := filepath.Base(diskStem(file))
@@ -179,27 +191,46 @@ func (s *Server) ownDiskLayers(ctx context.Context, vmName string) []string {
 		}
 		dir := filepath.Dir(file)
 		own := func(p string) bool {
-			return filepath.Dir(filepath.Clean(p)) == dir && filepath.Base(diskStem(p)) == stem
+			return filepath.Dir(p) == dir && filepath.Base(diskStem(p)) == stem
 		}
-		path := file
-		for depth := 0; depth <= maxBackingDepth; depth++ {
+		chain := map[string]bool{file: true}
+		path, parse := file, s.namedQcow2(ctx, vmName, file)
+		for depth := 0; parse && depth <= maxBackingDepth; depth++ {
 			info, err := qcow2.Info(path)
-			if err != nil || info.BackingFile == "" || looksLikeProtocol(info.BackingFile) {
+			if err != nil || info.BackingFile == "" || looksLikeProtocol(info.BackingFile) || info.BackingFormat != "qcow2" {
 				break
 			}
 			b := info.BackingFile
 			if !filepath.IsAbs(b) {
 				b = filepath.Join(filepath.Dir(path), b)
 			}
+			b = filepath.Clean(b)
 			if !own(b) {
 				break
 			}
+			chain[b] = true
 			add(b)
 			path = b
 		}
 		matches, _ := filepath.Glob(filepath.Join(dir, globEscape(stem)+".*"))
 		for _, m := range matches {
-			if fi, err := os.Lstat(m); err == nil && fi.Mode().IsRegular() && own(m) {
+			m = filepath.Clean(m)
+			if chain[m] || !own(m) {
+				continue
+			}
+			if fi, err := os.Lstat(m); err != nil || !fi.Mode().IsRegular() {
+				continue
+			}
+			info, err := qcow2.Info(m)
+			if err != nil {
+				continue // not a qcow2: a user's file, an ISO, a raw image
+			}
+			b := info.BackingFile
+			if b != "" && !filepath.IsAbs(b) {
+				b = filepath.Join(dir, b)
+			}
+			named := snapNames[strings.TrimPrefix(filepath.Ext(m), ".")]
+			if named || (b != "" && info.BackingFormat == "qcow2" && chain[filepath.Clean(b)]) {
 				add(m)
 			}
 		}
@@ -212,6 +243,11 @@ func (s *Server) ownDiskLayers(ctx context.Context, vmName string) []string {
 // VM names in its record or reaches through its qcow2 chain.
 func (s *Server) removeOwnDiskLayers(ctx context.Context, vmName string, files []string) {
 	for _, f := range files {
+		// A user's upload is a project's file whatever its name; unreadable
+		// records protect, as for the debris sweep (protectedDiskPathsFrom).
+		if recs, rerr := s.recordsOf(ctx, f); rerr != nil || slices.ContainsFunc(recs, func(u poolUpload) bool { return u.VM == "" && !u.Peer }) {
+			continue
+		}
 		refs, err := corrosion.DisksReferencingPath(ctx, s.db, f)
 		if err != nil {
 			slog.Warn("delete: cannot tell whether a snapshot overlay is referenced; keeping it", "vm", vmName, "path", f, "error", err)

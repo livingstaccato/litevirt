@@ -151,7 +151,10 @@ var dataDirPoolAreas = []string{"mounts", "pools"}
 // The list is everything the daemon creates there, from the code;
 // TestDataDirOwned_CoversEverythingTheDaemonCreates fails on a join onto the
 // data directory, or a path hardcoded under /var/lib/litevirt, that it does
-// not cover.
+// not cover. It cannot see a child built inside a helper that takes the data
+// directory under another parameter name (nowts.hwm, corrosion/hwm.go
+// newHWMStore(dir)): those were found by sweeping every function the data
+// directory is passed to, and a new one needs adding here by hand.
 var dataDirOwned = []string{
 	"state.db",               // corrosion/client.go NewClient, NewLocalClient (and -wal/-shm, dataDirOwnedPrefixes)
 	"pki",                    // the daemon's PKI when pki_dir is put in the data directory
@@ -160,7 +163,6 @@ var dataDirOwned = []string{
 	"imports",                // vmimport.go: import work dirs and imports/staging (--server-path)
 	"import-placements",      // vmimport_placement.go importPlacementDirName
 	"iso-identity",           // iso_identity.go isoIdentityDir
-	"isos",                   // the global ISO library before it moved to pools/isos (8401e43f..54e58ed9)
 	"cloudinit",              // libvirt/xmlgen.go CloudInitISOPath; migrate.go, vm_iso.go
 	"nvram",                  // libvirt/xmlgen.go NvramPath; vtpmstate.go retainedMarkerPath
 	"vmstate",                // libvirt/xmlgen.go VMStatePath (saved memory state)

@@ -53,7 +53,8 @@ func TestCheckReadFile_RefusedAndAllowed(t *testing.T) {
 }
 
 // The built-in global ISO library lives at <data_dir>/pools/isos, and a guest
-// may be given a file there; the rest of the data directory stays refused.
+// may be given a file there. <data_dir>/isos is not the daemon's: it is an
+// ordinary child (a main-era admin pool may be there), so it is allowed too.
 func TestCheckReadFile_TheGlobalISOLibraryDirectory(t *testing.T) {
 	data := t.TempDir()
 	for _, d := range []string{filepath.Join(data, ISOLibraryDir), filepath.Join(data, "isos"), filepath.Join(data, "pools", "other")} {
@@ -70,8 +71,8 @@ func TestCheckReadFile_TheGlobalISOLibraryDirectory(t *testing.T) {
 	if err := CheckReadFile(lib, data, ""); err != nil {
 		t.Errorf("the global library file refused: %v", err)
 	}
-	if err := CheckReadFile(filepath.Join(data, "isos", "x.iso"), data, ""); err == nil {
-		t.Error("<data_dir>/isos allowed; the library is pools/isos")
+	if err := CheckReadFile(filepath.Join(data, "isos", "x.iso"), data, ""); err != nil {
+		t.Errorf("<data_dir>/isos, an ordinary child of the data dir, refused: %v", err)
 	}
 	// The library is itself a pool in its own directory under pools/, so the
 	// directory is a write root; another pool over it is refused when it is

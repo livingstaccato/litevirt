@@ -31,9 +31,18 @@ func storageDataDirOwned() []string { return storage.DataDirOwned() }
 // pools/ and mounts/ hold pools): nothing lists, reads or writes it —
 // recreate the pool`.
 func TestPoolDataDirChild_AMainEraPoolThereWorksAgain(t *testing.T) {
+	// isos: a plausible main-era name for an admin ISO pool, which no
+	// released build ever owned (lab5-trims-review A-I1).
+	for _, child := range []string{"rc5pool", "isos"} {
+		t.Run(child, func(t *testing.T) { mainEraDataDirPool(t, child) })
+	}
+}
+
+func mainEraDataDirPool(t *testing.T, child string) {
+	t.Helper()
 	s, _, _ := isoServer(t)
 	pat := acmeOperator(t, s)
-	dir := filepath.Join(s.dataDir, "rc5pool")
+	dir := filepath.Join(s.dataDir, child)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -44,7 +53,7 @@ func TestPoolDataDirChild_AMainEraPoolThereWorksAgain(t *testing.T) {
 		t.Fatal("the pool does not resolve")
 	}
 	if err := s.checkPoolForWrite(t.Context(), "rc5pool", ref); err != nil {
-		t.Fatalf("the main-era pool at <data_dir>/rc5pool is refused: %v", err)
+		t.Fatalf("the main-era pool at <data_dir>/%s is refused: %v", child, err)
 	}
 	if _, err := s.ListStoragePoolContents(adminCtx(), &pb.ListStoragePoolContentsRequest{PoolName: "rc5pool"}); err != nil {
 		t.Fatalf("listing it: %v", err)

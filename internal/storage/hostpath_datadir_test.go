@@ -29,14 +29,17 @@ func TestCheckWriteRoot_AnOrdinaryChildOfTheDataDirIsAHostPath(t *testing.T) {
 		filepath.Join(data, "rc5pool"),
 		filepath.Join(data, "rc5pool", "deeper"),
 		filepath.Join(data, "rc5-backup-repo"),
+		filepath.Join(data, "isos"), // a main-era admin ISO pool; the library is pools/isos
 	} {
 		if err := CheckWriteRoot(p, data, ""); err != nil {
 			t.Errorf("%s: %v", p, err)
 		}
 	}
 	// The default data dir: lexical only, nothing there needs to exist.
-	if err := CheckWriteRoot("/var/lib/litevirt/rc5pool", "/var/lib/litevirt", "/etc/litevirt/pki"); err != nil {
-		t.Errorf("/var/lib/litevirt/rc5pool with the default data dir: %v", err)
+	for _, p := range []string{"/var/lib/litevirt/rc5pool", "/var/lib/litevirt/isos"} {
+		if err := CheckWriteRoot(p, "/var/lib/litevirt", "/etc/litevirt/pki"); err != nil {
+			t.Errorf("%s with the default data dir: %v", p, err)
+		}
 	}
 }
 

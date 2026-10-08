@@ -271,7 +271,17 @@ lxc.net.0.hwaddr = 52:1a:2b:3c:4d:5e
 lxc.net.0.flags = up
 lxc.net.0.name = eth0
 lxc.net.0.ipv4.address = 10.0.0.6/24
+lxc.net.0.ipv4.gateway = 10.0.0.1
 ```
+
+On a managed network with a subnet, the address in the container's config
+always carries the subnet's prefix, and the first such NIC gets the subnet's
+first host as its gateway — in the config and in the guest's interfaces file
+(`gateway 10.0.0.1`). That holds for an auto-allocated address, for a bare
+static `ip=10.0.0.6`, and for a host-loss recreate. LXC reads a bare address
+classfully, so without the prefix `172.16.77.2` became a `/8` route over all of
+`172.0.0.0/8`, with no default route. The interface row and the IPAM lease keep
+the address as allocated.
 
 ### Managed-NIC identity, IPAM, DNS, security groups, load balancing
 

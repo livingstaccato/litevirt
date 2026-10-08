@@ -86,6 +86,9 @@ type NetworkAttach struct {
 	IP     string // optional static IP; empty = DHCP / RA
 	MAC    string // optional fixed MAC; empty = OS-generated
 	Veth   string // optional deterministic host-side veth name (lxc.net.N.veth.pair); ≤15 bytes
+	// Gateway is an optional bare IPv4 default gateway (lxc.net.N.ipv4.gateway),
+	// also written into the guest's ifupdown stanza for a static NIC.
+	Gateway string
 }
 
 // ExecResult captures the outcome of lxc-attach.
@@ -1070,6 +1073,9 @@ func configureGuestStaticIP(rootfs string, nics []NetworkAttach) error {
 		fmt.Fprintf(&b, "iface %s inet static\n    address %s\n", name, addr)
 		if netmask != "" {
 			fmt.Fprintf(&b, "    netmask %s\n", netmask)
+		}
+		if n.Gateway != "" {
+			fmt.Fprintf(&b, "    gateway %s\n", n.Gateway)
 		}
 		b.WriteString("\n")
 	}

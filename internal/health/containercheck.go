@@ -344,6 +344,7 @@ func (c *ContainerChecker) recreateRelocated(ctx context.Context, ct corrosion.C
 		}
 	}
 	var ifs []corrosion.ContainerInterfaceRecord
+	haveGateway := false
 	for i, n := range spec.Networks {
 		if n.NetworkName == "" {
 			opts.Network = append(opts.Network, lxc.NetworkAttach{Name: n.Name, Bridge: n.Bridge, IP: n.IP, MAC: n.MAC})
@@ -359,7 +360,14 @@ func (c *ContainerChecker) recreateRelocated(ctx context.Context, ct corrosion.C
 				ip = "" // couldn't claim → don't put it on-disk
 			}
 		}
-		opts.Network = append(opts.Network, lxc.NetworkAttach{Name: n.Name, Bridge: n.Bridge, IP: ip, MAC: n.MAC, Veth: veth})
+		// The runtime NIC carries the subnet's prefix and gateway, as at create
+		// (network.ContainerAddress); the row keeps the address IPAM holds.
+		runIP, gw := network.ContainerAddress(ip, c.networkSubnet(ctx, n.NetworkName))
+		if haveGateway {
+			gw = ""
+		}
+		haveGateway = haveGateway || gw != ""
+		opts.Network = append(opts.Network, lxc.NetworkAttach{Name: n.Name, Bridge: n.Bridge, IP: runIP, MAC: n.MAC, Veth: veth, Gateway: gw})
 		ifs = append(ifs, corrosion.ContainerInterfaceRecord{
 			HostName: c.hostName, CtName: ct.Name, NetworkName: n.NetworkName, Ordinal: i,
 			MAC: n.MAC, IP: ip, VethDevice: veth, SecurityGroups: n.SecurityGroups,
@@ -810,4 +818,18 @@ func ctAttemptCount(rs *corrosion.ContainerRestartState) int {
 		return 0
 	}
 	return rs.AttemptCount
+}
+
+// networkSubnet is the subnet a managed network's record declares ("" when it
+// has none or cannot be read: the NIC then keeps its address as stored).
+func (c *ContainerChecker) networkSubnet(ctx context.Context, name string) string {
+	nr, err := corrosion.GetNetwork(ctx, c.db, name)
+	if err != nil || nr == nil {
+		return ""
+	}
+	var def struct{ Subnet string }
+	if json.Unmarshal([]byte(nr.Config), &def) != nil {
+		return ""
+	}
+	return def.Subnet
 }

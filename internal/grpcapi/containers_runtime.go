@@ -22,7 +22,7 @@ func NewLXCRuntimeAdapter(inner lxc.Runtime) *LXCRuntimeAdapter {
 func (a *LXCRuntimeAdapter) CreateContainer(ctx context.Context, opts CreateContainerOpts) (*ContainerInfo, error) {
 	nics := make([]lxc.NetworkAttach, 0, len(opts.Networks))
 	for _, n := range opts.Networks {
-		nics = append(nics, lxc.NetworkAttach{Name: n.Name, Bridge: n.Bridge, IP: n.IP, MAC: n.MAC, Veth: n.Veth})
+		nics = append(nics, lxc.NetworkAttach{Name: n.Name, Bridge: n.Bridge, IP: n.IP, MAC: n.MAC, Veth: n.Veth, Gateway: n.Gateway})
 	}
 	c, err := a.Inner.Create(ctx, lxc.CreateOpts{
 		Name: opts.Name, Template: opts.Template,

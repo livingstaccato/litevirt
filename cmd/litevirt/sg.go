@@ -140,11 +140,12 @@ func newSGListCmd() *cobra.Command {
 // daemon decides what the caller's credential may see — the same RPC the web
 // UI reads through. It reads the local database instead only when no daemon
 // answered: the CLI had nothing to connect with (no LV_HOST, no readable PKI
-// bundle), the daemon is down (Unavailable), or it predates the RPC
-// (Unimplemented). That keeps a listing that worked on a node working — before
+// bundle), the daemon is down (Unavailable), it predates the RPC
+// (Unimplemented), or it did not accept the credential (Unauthenticated). That keeps a listing that worked on a node working — before
 // the RPC it always read the local database — and it opens nothing new: the
 // local database is readable only by whoever could already read the file. A
-// refusal is the daemon's answer and is returned as it is, never routed around.
+// refusal of an authenticated caller (PermissionDenied) is the daemon's answer
+// and is returned as it is, never routed around.
 func listSecurityGroups(cmd *cobra.Command, req *pb.ListSecurityGroupsRequest) (*pb.ListSecurityGroupsResponse, error) {
 	var resp *pb.ListSecurityGroupsResponse
 	asked := false
@@ -163,6 +164,10 @@ func listSecurityGroups(cmd *cobra.Command, req *pb.ListSecurityGroupsRequest) (
 		why = "the CLI could not connect: " + err.Error()
 	case status.Code(err) == codes.Unavailable || status.Code(err) == codes.Unimplemented:
 		why = "litevirtd could not answer: " + status.Convert(err).Message()
+	case status.Code(err) == codes.Unauthenticated:
+		// The daemon did not accept the credential (a revoked session, an
+		// expired token), so it never judged what the caller may see.
+		why = "litevirtd did not accept the CLI's credential: " + status.Convert(err).Message()
 	default:
 		return nil, err
 	}

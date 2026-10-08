@@ -177,13 +177,23 @@ func (unavailableSGServer) ListSecurityGroups(context.Context, *pb.ListSecurityG
 	return nil, status.Error(codes.Unavailable, "connection refused")
 }
 
+// unauthenticatedSGServer answers ListSecurityGroups as a daemon that does not
+// accept the CLI's credential (a revoked `lv login` session, an expired token).
+type unauthenticatedSGServer struct{ pb.UnimplementedLiteVirtServer }
+
+func (unauthenticatedSGServer) ListSecurityGroups(context.Context, *pb.ListSecurityGroupsRequest) (*pb.ListSecurityGroupsResponse, error) {
+	return nil, status.Error(codes.Unauthenticated, "session revoked")
+}
+
 // A daemon that predates ListSecurityGroups, or one that is down, cannot answer;
+// one that does not accept the credential has not judged the caller at all;
 // on a node the listings then read the local database as they always did, and
 // say so on stderr, rather than refusing a listing that used to work.
 func TestSGCLI_ListingsFallBackOnlyWhenTheDaemonCannotAnswer(t *testing.T) {
 	for name, srv := range map[string]pb.LiteVirtServer{
-		"old daemon (Unimplemented)": pb.UnimplementedLiteVirtServer{},
-		"daemon down (Unavailable)":  unavailableSGServer{},
+		"old daemon (Unimplemented)":                pb.UnimplementedLiteVirtServer{},
+		"daemon down (Unavailable)":                 unavailableSGServer{},
+		"credential not accepted (Unauthenticated)": unauthenticatedSGServer{},
 	} {
 		t.Run(name, func(t *testing.T) {
 			sgCLIDaemon(t, srv, nil, "")

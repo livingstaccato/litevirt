@@ -1179,22 +1179,61 @@ func DeleteVM(ctx context.Context, c *Client, name string) error {
 	return deleteOutcomeError(outcome, false)
 }
 
-// ErrVMIncarnationMismatch means the live row of a VM name is not the
-// incarnation the caller named: another VM holds the name now.
-var ErrVMIncarnationMismatch = errors.New("corrosion: the live VM row is another incarnation")
+// ErrVMIncarnationMismatch means the live row of a VM name is not one the
+// caller's delete snapshot covers: another incarnation holds the name, or the
+// row has moved past what the deleter saw.
+var ErrVMIncarnationMismatch = errors.New("corrosion: the live VM row is not the one the delete saw")
 
-// DeleteVMIncarnation is DeleteVM restricted to one incarnation of name: the
-// live row whose created_at is createdAt (the incarnation identity, see
-// incarnationTombstoneDecision). It tombstones that row and nothing else —
-// a live row of another incarnation is ErrVMIncarnationMismatch, and no live
-// row is the idempotent nil. The statements are DeleteVM's own, so a
-// receiver applies them exactly as it applies a DeleteVM.
+// VMDeleteSnapshot is a VM row as a delete saw it: its incarnation
+// (created_at) and the fields that delete's guard binds (vmDeleteMutationGuard).
+type VMDeleteSnapshot struct {
+	CreatedAt      string
+	HostName       string
+	OwnerEpoch     int64
+	SpecGeneration int64
+	IdentityHash   string
+}
+
+// SnapshotForDelete is vm as a delete of it sees it.
+func SnapshotForDelete(vm VMRecord) VMDeleteSnapshot {
+	return VMDeleteSnapshot{
+		CreatedAt: vm.CreatedAt, HostName: vm.HostName, OwnerEpoch: vm.OwnerEpoch,
+		SpecGeneration: vm.SpecGeneration, IdentityHash: vmCreateIdentityHash(vm),
+	}
+}
+
+// Covers reports whether row is a copy of the snapshot's row that the delete
+// it was taken for kills: the same incarnation, and not ahead of it on any
+// authority axis. A row at the snapshot's own epoch and generation must be the
+// snapshot's row exactly (host and identity); a row at a lower epoch or
+// generation is an older copy of it. A row with a higher epoch (an ownership
+// move the deleter had not seen) or a higher generation is not covered: the
+// deleter's tombstone, guarded by its own view, would not have killed it.
+func (s VMDeleteSnapshot) Covers(row VMRecord) bool {
+	if s.CreatedAt == "" || row.CreatedAt != s.CreatedAt {
+		return false
+	}
+	if row.OwnerEpoch > s.OwnerEpoch || row.SpecGeneration > s.SpecGeneration {
+		return false
+	}
+	if row.OwnerEpoch == s.OwnerEpoch && row.SpecGeneration == s.SpecGeneration {
+		return row.HostName == s.HostName && vmCreateIdentityHash(row) == s.IdentityHash
+	}
+	return true
+}
+
+// DeleteVMIncarnation is DeleteVM restricted to a row snap covers. It
+// tombstones that row and nothing else — a live row snap does not cover is
+// ErrVMIncarnationMismatch, and no live row is the idempotent nil. The
+// statements are DeleteVM's own, so a receiver applies them exactly as it
+// applies a DeleteVM.
 //
 // It is for a host whose replica still holds a VM that another host has
-// already tombstoned — a delete is terminal for its incarnation, so this
-// host retiring its copy writes nothing the cluster has not already decided.
-func DeleteVMIncarnation(ctx context.Context, c *Client, name, createdAt string) error {
-	if createdAt == "" {
+// already tombstoned, as that host saw it — a delete is terminal for its
+// incarnation, so this host retiring its copy writes nothing the cluster has
+// not already decided.
+func DeleteVMIncarnation(ctx context.Context, c *Client, name string, snap VMDeleteSnapshot) error {
+	if snap.CreatedAt == "" {
 		return ErrVMIncarnationMismatch
 	}
 	mismatch := false
@@ -1203,7 +1242,7 @@ func DeleteVMIncarnation(ctx context.Context, c *Client, name, createdAt string)
 		if err != nil {
 			return deleteContended, err
 		}
-		mismatch = vm != nil && vm.CreatedAt != createdAt
+		mismatch = vm != nil && !snap.Covers(*vm)
 		if vm == nil || mismatch {
 			return deleteAbsent, nil
 		}

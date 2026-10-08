@@ -27,14 +27,18 @@ package fleet
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
 // raceLag is how long a push from the deleting host is held before the
@@ -334,10 +338,94 @@ func TestFleet_ARebuildOntoAnOlderHostBehindOnTheTombstoneKeepsTheVM(t *testing.
 		n1.HookUnary("CreateVM", older)
 		n1.HookUnary("ExecuteCreateVM", older)
 	}
+	// node-0's tombstone reaches node-1 neither directly nor relayed through
+	// node-2 for a second, so only the entry's retry can carry the create.
 	c.SetLinkFault(n0, n1, LinkFault{Delay: time.Second})
+	c.SetLinkFault(c.Nodes[2], n1, LinkFault{Delay: time.Second})
 
 	if _, err := c.SelfClient(n0).RebuildVM(context.Background(), &pb.RebuildVMRequest{Name: "web"}); err != nil {
 		t.Fatalf("rebuild onto an older host behind on the tombstone: %v; %s", err, whereIs(c, "web"))
 	}
 	assertReCreated(t, c, "web", before, n1)
+}
+
+// The deleter acts on a stale view: a failover moved the VM to node-1, where
+// it runs, and node-0 has not heard. A rebuild run on node-0 tears down
+// node-0's leftover and forwards the create to node-1 (the spec pin). node-0's
+// tombstone is guarded by its own view and does not kill node-1's row; node-1
+// must not retire it either, nor touch the running domain. The rebuild is
+// refused there, as on main, and the VM on node-1 survives.
+//
+// Red against 709113aa: node-1 retired its row after the wait and the create
+// destroyed and redefined its running domain.
+func TestFleet_AStaleRebuildNeverTakesTheVMAFailoverMovedToTheTarget(t *testing.T) {
+	c := newRebuildRaceFleet(t)
+	n0, n1, n2 := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	seedVM(t, c, n0, &pb.VMSpec{
+		Name: "web", Cpu: 1, MemoryMib: 256, Placement: &pb.PlacementSpec{Host: n1.Name},
+	})
+	n1.Server.SetReplacedTombstoneWaitForTest(500 * time.Millisecond)
+	n0.Server.SetReplacedTombstoneWaitForTest(500 * time.Millisecond)
+	// node-0 hears nothing from here on.
+	c.SetLinkFault(n1, n0, LinkFault{Block: true})
+	c.SetLinkFault(n2, n0, LinkFault{Block: true})
+	ctx := context.Background()
+	if err := corrosion.TransferVMOwnerFresh(ctx, n1.DB, "web", n1.Name, "running"); err != nil {
+		t.Fatalf("failover to %s: %v", n1.Name, err)
+	}
+	xml := `<domain><name>web</name><uuid>5d1c4b2a-0e9f-4a7b-8c6d-1f2e3a4b5c6d</uuid></domain>`
+	if err := n1.Virt.DefineDomain(xml); err != nil {
+		t.Fatal(err)
+	}
+	n1.Virt.SetState("web", libvirtfake.StateRunning)
+	moved, _ := corrosion.GetVM(ctx, n1.DB, "web")
+
+	_, err := c.SelfClient(n0).RebuildVM(ctx, &pb.RebuildVMRequest{Name: "web"})
+	if status.Code(err) != codes.AlreadyExists {
+		t.Errorf("stale rebuild onto the host a failover moved the VM to: got %v, want AlreadyExists", err)
+	}
+	if got := n1.Virt.DefinedXML("web"); got != xml {
+		t.Fatalf("the running VM on %s was replaced: domain now %s", n1.Name, got)
+	}
+	if st, _ := n1.Virt.RawState("web"); st != libvirtfake.StateRunning {
+		t.Fatalf("the VM on %s is no longer running: %v", n1.Name, st)
+	}
+	c.SetLinkFault(n0, n1, LinkFault{})
+	time.Sleep(2 * time.Second)
+	rec, err := corrosion.GetVM(ctx, n1.DB, "web")
+	if err != nil || rec == nil || rec.CreatedAt != moved.CreatedAt || rec.HostName != n1.Name || rec.OwnerEpoch != moved.OwnerEpoch {
+		t.Fatalf("the failed-over VM's row on %s: %+v (%v); want it as the failover left it: %+v", n1.Name, rec, err, moved)
+	}
+}
+
+// A rolling recreate whose delete finds the VM already gone (someone else
+// deleted it; this node's replica has not heard) deleted nothing. It names no
+// replaced VM, so the stale row here is refused as on main — nothing is
+// re-created on this node's stale word — and the error claims no teardown.
+//
+// Red against 709113aa: the create named the VM as replaced, retired the
+// stale row and re-created a VM someone had deleted.
+func TestFleet_ARecreateWhoseDeleteFoundNothingNamesNoReplacedVM(t *testing.T) {
+	c := newRebuildRaceFleet(t)
+	n0, n1, n2 := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	seedVM(t, c, n0, &pb.VMSpec{Name: "web", Cpu: 1, MemoryMib: 256})
+	n2.Server.SetReplacedTombstoneWaitForTest(500 * time.Millisecond)
+	c.SetLinkFault(n0, n2, LinkFault{Block: true})
+	c.SetLinkFault(n1, n2, LinkFault{Block: true})
+	ctx := context.Background()
+	if err := corrosion.DeleteVM(ctx, n0.DB, "web"); err != nil {
+		t.Fatal(err)
+	}
+	if err := n0.Virt.UndefineDomain("web", false); err != nil {
+		t.Fatal(err)
+	}
+
+	err := recreateOn(t, n2, c.SelfClient(n2), "web", &pb.VMSpec{Name: "web", Cpu: 2, MemoryMib: 256,
+		Placement: &pb.PlacementSpec{Host: n2.Name}})
+	if status.Code(err) != codes.AlreadyExists || strings.Contains(err.Error(), "torn down") {
+		t.Fatalf("recreate whose delete found the VM gone: got %v, want AlreadyExists claiming no teardown", err)
+	}
+	if n2.Virt.DomainExists("web") {
+		t.Fatalf("a VM someone deleted was re-created on %s", n2.Name)
+	}
 }

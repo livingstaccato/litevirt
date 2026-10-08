@@ -496,6 +496,10 @@ func createBeginGuardMatches(ctx context.Context, tx *sql.Tx, guard *MutationGua
 		guard.SpecGeneration > generation, nil
 }
 
+// VMIdentityHash is the identity hash a VM delete guard binds (see
+// vmDeleteMutationGuard): name, stack, host, spec, project and template flag.
+func VMIdentityHash(vm VMRecord) string { return vmCreateIdentityHash(vm) }
+
 func vmCreateIdentityHash(vm VMRecord) string {
 	return hashIdentity(
 		vm.Name, vm.StackName, vm.HostName, vm.Spec, projectOrDefault(vm.Project),

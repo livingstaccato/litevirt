@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +16,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 )
 
 // A re-create forwarded here names the VM it replaces (vm_recreate_replaces.go).
@@ -23,10 +25,16 @@ import (
 // (tests/fleet/rebuild_forward_race_test.go); these pin what a single process
 // can reach: whose word is taken, and that only that one incarnation is.
 
-// replacesMD is the incoming metadata a peer re-creating VM name, whose
-// incarnation it deleted is createdAt, hands the host it forwards to.
-func replacesMD(ctx context.Context, name, createdAt string) context.Context {
-	b, _ := json.Marshal(replacedVMWire{Name: name, CreatedAt: createdAt})
+// replacesMD is the incoming metadata a peer re-creating VM name hands the
+// host it forwards to: the row it deleted, as its delete guard saw it (the
+// guard's host, owner epoch, spec generation and identity hash), with the
+// incarnation set to createdAt.
+func replacesMD(ctx context.Context, deleted *corrosion.VMRecord, createdAt string) context.Context {
+	b, _ := json.Marshal(map[string]any{
+		"name": deleted.Name, "created_at": createdAt,
+		"host_name": deleted.HostName, "owner_epoch": deleted.OwnerEpoch,
+		"spec_generation": deleted.SpecGeneration, "identity_hash": corrosion.VMIdentityHash(*deleted),
+	})
 	return metadata.NewIncomingContext(ctx, metadata.Pairs(replacedVMMD, string(b)))
 }
 
@@ -61,7 +69,7 @@ func staleReplacedRow(t *testing.T, s *Server, name string) *corrosion.VMRecord 
 func TestReplacedVM_ThisHostsStaleCopyOfThatIncarnationIsRetired(t *testing.T) {
 	s, _ := provableCreateServer(t)
 	old := staleReplacedRow(t, s, "vm1")
-	ctx := replacesMD(peerHostCtx(t, s, "host-a"), "vm1", old.CreatedAt)
+	ctx := replacesMD(peerHostCtx(t, s, "host-a"), old, old.CreatedAt)
 	if _, err := s.CreateVM(ctx, disklessCreateRequest("vm1")); err != nil {
 		t.Fatalf("a peer's re-create of the incarnation it deleted, stale here: %v", err)
 	}
@@ -78,7 +86,7 @@ func TestReplacedVM_ThisHostsStaleCopyOfThatIncarnationIsRetired(t *testing.T) {
 func TestReplacedVM_AnotherIncarnationIsStillRefused(t *testing.T) {
 	s, _ := provableCreateServer(t)
 	old := staleReplacedRow(t, s, "vm1")
-	ctx := replacesMD(peerHostCtx(t, s, "host-a"), "vm1", "2001-01-01T00:00:00.000000001Z")
+	ctx := replacesMD(peerHostCtx(t, s, "host-a"), old, "2001-01-01T00:00:00.000000001Z")
 	if _, err := s.CreateVM(ctx, disklessCreateRequest("vm1")); status.Code(err) != codes.AlreadyExists {
 		t.Fatalf("a re-create naming another incarnation than the live one: got %v, want AlreadyExists", err)
 	}
@@ -95,7 +103,7 @@ func TestReplacedVM_AnotherIncarnationIsStillRefused(t *testing.T) {
 func TestReplacedVM_OnlyAPeerHostNamesOne(t *testing.T) {
 	s, _ := provableCreateServer(t)
 	old := staleReplacedRow(t, s, "vm1")
-	if _, err := s.CreateVM(replacesMD(adminCtx(), "vm1", old.CreatedAt), disklessCreateRequest("vm1")); status.Code(err) != codes.AlreadyExists {
+	if _, err := s.CreateVM(replacesMD(adminCtx(), old, old.CreatedAt), disklessCreateRequest("vm1")); status.Code(err) != codes.AlreadyExists {
 		t.Fatalf("an Admin's create naming the live VM as replaced: got %v, want AlreadyExists", err)
 	}
 	if rec := vmRecord(t, s, "vm1"); rec.CreatedAt != old.CreatedAt {
@@ -109,12 +117,139 @@ func TestReplacedVM_IsForItsOwnNameOnly(t *testing.T) {
 	s, _ := provableCreateServer(t)
 	old := staleReplacedRow(t, s, "vm1")
 	other := staleReplacedRow(t, s, "vm2")
-	ctx := replacesMD(peerHostCtx(t, s, "host-a"), "vm1", old.CreatedAt)
+	ctx := replacesMD(peerHostCtx(t, s, "host-a"), old, old.CreatedAt)
 	if _, err := s.CreateVM(ctx, disklessCreateRequest("vm2")); status.Code(err) != codes.AlreadyExists {
 		t.Fatalf("a re-create of vm2 carrying vm1's marker: got %v, want AlreadyExists", err)
 	}
 	if rec := vmRecord(t, s, "vm2"); rec.CreatedAt != other.CreatedAt {
 		t.Fatal("vm2 was replaced on vm1's marker")
+	}
+}
+
+// The deleter's tombstone is guarded by its view of the row (host, owner
+// epoch, spec generation, identity), and does not kill a row that has moved
+// past that view — a failover that moved the VM here, say. The host does not
+// retire such a row on the deleter's word either: refused, as on main, and
+// the row is left as it is.
+//
+// Mutation: drop the snapshot check in settleReplacedVM — red.
+func TestReplacedVM_ARowAheadOfTheDeletersViewIsRefused(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		move func(t *testing.T, s *Server, snap *corrosion.VMRecord)
+	}{
+		{"moved here by a failover", func(t *testing.T, s *Server, _ *corrosion.VMRecord) {
+			if err := corrosion.TransferVMOwnerFresh(context.Background(), s.db, "vm1", s.hostName, "running"); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"on another host at the same epoch", func(t *testing.T, s *Server, snap *corrosion.VMRecord) {
+			snap.HostName = "host-z"
+		}},
+		{"a newer spec generation", func(t *testing.T, s *Server, snap *corrosion.VMRecord) {
+			snap.SpecGeneration--
+		}},
+		{"another identity at the same authority", func(t *testing.T, s *Server, snap *corrosion.VMRecord) {
+			snap.Spec = `{"name":"vm1","uuid":"ffffffff-7d2f-4c55-9a1b-5e6f7a8b9c0d"}`
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _ := provableCreateServer(t)
+			old := staleReplacedRow(t, s, "vm1")
+			snap := *old
+			tc.move(t, s, &snap)
+			before := vmRecord(t, s, "vm1")
+			ctx := replacesMD(peerHostCtx(t, s, "host-a"), &snap, old.CreatedAt)
+			if _, err := s.CreateVM(ctx, disklessCreateRequest("vm1")); status.Code(err) != codes.AlreadyExists {
+				t.Fatalf("a re-create whose deleter saw an older row: got %v, want AlreadyExists", err)
+			}
+			if rec := vmRecord(t, s, "vm1"); rec.CreatedAt != before.CreatedAt || rec.HostName != before.HostName ||
+				rec.OwnerEpoch != before.OwnerEpoch {
+				t.Fatalf("the row ahead of the deleter's view changed: %+v, was %+v", rec, before)
+			}
+		})
+	}
+}
+
+// A host that has a domain of the name never settles it: in the case the
+// marker exists for, the VM did not run here. Refused, domain untouched.
+//
+// Mutation: drop the domain check in settleReplacedVM — red.
+func TestReplacedVM_ALocalDomainIsNeverSettled(t *testing.T) {
+	s, fake := provableCreateServer(t)
+	old := staleReplacedRow(t, s, "vm1")
+	xml := `<domain><name>vm1</name><uuid>0b9a3c1e-7d2f-4c55-9a1b-5e6f7a8b9c0d</uuid></domain>`
+	if err := fake.DefineDomain(xml); err != nil {
+		t.Fatal(err)
+	}
+	ctx := replacesMD(peerHostCtx(t, s, "host-a"), old, old.CreatedAt)
+	if _, err := s.CreateVM(ctx, disklessCreateRequest("vm1")); status.Code(err) != codes.AlreadyExists {
+		t.Fatalf("a re-create where this host has the VM's domain: got %v, want AlreadyExists", err)
+	}
+	if fake.DefinedXML("vm1") != xml {
+		t.Fatalf("the local domain was replaced: %s", fake.DefinedXML("vm1"))
+	}
+	if rec := vmRecord(t, s, "vm1"); rec.CreatedAt != old.CreatedAt {
+		t.Fatal("the row was retired")
+	}
+}
+
+// Retiring the stale copy cleans up as DeleteVM's stale-record path does: the
+// name's owner-epoch marker on this host goes with the row. Observed through a
+// create that fails after the retire (a pin to a host that does not exist).
+//
+// Mutation: drop the marker removal from the retire — red.
+func TestReplacedVM_TheRetireDropsTheOwnerEpochMarker(t *testing.T) {
+	s, _ := provableCreateServer(t)
+	old := staleReplacedRow(t, s, "vm1")
+	if err := health.WriteVMOwnerEpochMarker(s.dataDir, "vm1", 7); err != nil {
+		t.Fatal(err)
+	}
+	req := disklessCreateRequest("vm1")
+	req.Spec.Placement = &pb.PlacementSpec{Host: "nowhere"}
+	ctx := replacesMD(peerHostCtx(t, s, "host-a"), old, old.CreatedAt)
+	if _, err := s.CreateVM(ctx, req); err == nil {
+		t.Fatal("a create pinned to a host that does not exist succeeded")
+	}
+	if rec, _ := corrosion.GetVM(context.Background(), s.db, "vm1"); rec != nil {
+		t.Fatalf("the stale row was not retired: %+v", rec)
+	}
+	if _, ok, _ := health.ReadVMOwnerEpochMarker(s.dataDir, "vm1"); ok {
+		t.Fatal("the retired VM's owner-epoch marker is still on this host")
+	}
+}
+
+// Kept specs never overwrite each other, however fast they come, and the
+// directory is bounded: the newest recreateKeepMax files, none older than
+// recreateKeepMaxAge.
+//
+// Mutation: second-resolution names without a unique part — red.
+func TestKeepRecreateSpec_UniqueAndBounded(t *testing.T) {
+	s, _ := provableCreateServer(t)
+	dir := filepath.Join(s.dataDir, "recreate-failed")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stale := filepath.Join(dir, "ancient-rebuild.json")
+	if err := os.WriteFile(stale, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	long := time.Now().Add(-31 * 24 * time.Hour)
+	if err := os.Chtimes(stale, long, long); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		s.keepRecreateSpec("rebuild", "vm1", &pb.VMSpec{Name: "vm1", Cpu: int32(i + 1)})
+	}
+	ents, _ := os.ReadDir(dir)
+	if len(ents) != 3 {
+		t.Fatalf("after three kept specs in one second and one 31 days old: %d files, want 3 (unique, aged out)", len(ents))
+	}
+	for i := 0; i < 60; i++ {
+		s.keepRecreateSpec("rebuild", "vm1", &pb.VMSpec{Name: "vm1"})
+	}
+	if ents, _ = os.ReadDir(dir); len(ents) != 50 {
+		t.Fatalf("after 63 kept specs: %d files, want the newest 50", len(ents))
 	}
 }
 

@@ -32,7 +32,16 @@ func TestRestoreContainer_LocalRootCLIIsAnOperatorRestore(t *testing.T) {
 	if err := corrosion.InsertHost(context.Background(), s.db, corrosion.HostRecord{Name: "self", Address: "127.0.0.1", State: "active"}); err != nil {
 		t.Fatal(err)
 	}
-	rs := &progressStream[pb.RestoreContainerProgress]{ctx: localRootCtx("self")}
+	// Through the real classification: the host certificate over loopback is
+	// local root (classifyBearerlessMTLS), not a peer.
+	authed, err := s.authenticate(mtlsPeerCtx("self", tcpAddr("127.0.0.1"), ""))
+	if err != nil {
+		t.Fatalf("authenticate: %v", err)
+	}
+	if callerPrincipalKind(authed) != principalKindLocalRoot {
+		t.Fatalf("the host certificate over loopback classified as %q", callerPrincipalKind(authed))
+	}
+	rs := &progressStream[pb.RestoreContainerProgress]{ctx: authed}
 	if err := s.RestoreContainer(&pb.RestoreContainerRequest{Name: "ct1", RepoPath: repo, Timestamp: ts}, rs); err != nil {
 		t.Fatalf("local-root restore: %v", err)
 	}
@@ -48,7 +57,11 @@ func TestRestoreContainer_LocalRootCLIIsAnOperatorRestore(t *testing.T) {
 func TestRestoreContainer_RemotePeerWithoutProofStillRefused(t *testing.T) {
 	s, _, repo, ts, _, _ := setupProofRestore(t)
 	s.gate = fakeServerGate{execOK: true, enforced: true}
-	rs := &progressStream[pb.RestoreContainerProgress]{ctx: mtlsAdminCtx("peer-1")}
+	authed, aerr := s.authenticate(mtlsPeerCtx("peer-1", tcpAddr("10.0.0.9"), ""))
+	if aerr != nil || callerPrincipalKind(authed) != principalKindPeer {
+		t.Fatalf("authenticate peer: %v kind=%q", aerr, callerPrincipalKind(authed))
+	}
+	rs := &progressStream[pb.RestoreContainerProgress]{ctx: authed}
 	err := s.RestoreContainer(&pb.RestoreContainerRequest{Name: "ct1", RepoPath: repo, Timestamp: ts}, rs)
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("peer restore without proof: %v", err)

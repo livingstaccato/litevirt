@@ -71,6 +71,15 @@ func TestContainerMigrate_KeepsPrivilegeMode(t *testing.T) {
 	if after.IDMapBase != before.IDMapBase || after.Confinement != before.Confinement {
 		t.Fatalf("migrated as %+v, created as %+v", after, before)
 	}
+	// And the config the target would start the container with says the
+	// same: the row is not the only half.
+	sec, err := dst.CT.ContainerSecurity(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sec.IDMap == nil || sec.IDMap.Base != before.IDMapBase || sec.Confinement != before.Confinement {
+		t.Fatalf("target config security %+v (idmap %+v), want range %d %s", sec, sec.IDMap, before.IDMapBase, before.Confinement)
+	}
 }
 
 // A migrate prepares the target before it touches the source: the target

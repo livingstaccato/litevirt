@@ -206,9 +206,9 @@ func (c *Client) RevertToSnapshot(domainName, snapshotName string, restorePreDef
 }
 
 // FlattenSnapshot deletes the snapshot's libvirt metadata, then merges each
-// disk's active layer down into bases[dev], and returns the layers the
-// domain no longer uses — for the caller to remove once its own record
-// names the base too. bases names, per disk, the layer to merge into, as the
+// disk's active layer down into bases[dev], and returns, per disk whose
+// persistent definition names its base, the layers the domain no longer
+// uses — for the caller to remove once its own record names the base too. bases names, per disk, the layer to merge into, as the
 // disk's chain spells it: the caller (grpcapi) picks it within the VM's own
 // snapshot layers, so nothing another chain reads is written or removed; a
 // disk not in bases is left as it is.
@@ -221,15 +221,15 @@ func (c *Client) RevertToSnapshot(domainName, snapshotName string, restorePreDef
 // Order. Every base is judged first (in the disk's chain, every layer above
 // it plain qcow2); nothing is written when one is not. The metadata goes
 // next, before any byte of the frozen layer changes: a revert can never
-// reach a snapshot whose frozen layer holds later data. The layers are given
-// up only once the persistent definition names every base — libvirt
-// rewrites it on a pivot only when the live and persistent sources match —
-// and are kept, with a WARN, when it does not.
+// reach a snapshot whose frozen layer holds later data. A disk's layers are
+// given up only once the persistent definition names its base — repointed
+// here when the pivot left it on a merged layer (settleMerges); when that
+// fails they are kept and marked, so a start booting them refuses.
 //
 // Any other state is an error before anything is written. A failure after
 // the metadata delete returns the error and gives up nothing: each disk
 // still reads its current data, from its top or (pivoted) its base.
-func (c *Client) FlattenSnapshot(domainName, snapshotName string, bases map[string]string) ([]string, error) {
+func (c *Client) FlattenSnapshot(domainName, snapshotName string, bases map[string]string) (map[string][]string, error) {
 	return flattenSnapshot(c.virt, domainName, snapshotName, bases)
 }
 
@@ -244,7 +244,7 @@ type flattenAPI interface {
 	DomainDefineXML(xml string) (golibvirt.Domain, error)
 }
 
-func flattenSnapshot(v flattenAPI, domainName, snapshotName string, bases map[string]string) ([]string, error) {
+func flattenSnapshot(v flattenAPI, domainName, snapshotName string, bases map[string]string) (map[string][]string, error) {
 	dom, err := v.DomainLookupByName(domainName)
 	if err != nil {
 		return nil, fmt.Errorf("lookup domain %q: %w", domainName, err)
@@ -268,11 +268,7 @@ func flattenSnapshot(v flattenAPI, domainName, snapshotName string, bases map[st
 	}
 	cur := parseDomainDiskSources(domXML) // dev → active layer
 
-	type merge struct {
-		dev, top, base string
-		above          []string
-	}
-	var merges []merge
+	var merges []mergedDisk
 	for dev, base := range bases {
 		top, ok := cur[dev]
 		if !ok {
@@ -286,7 +282,7 @@ func flattenSnapshot(v flattenAPI, domainName, snapshotName string, bases map[st
 		if err != nil {
 			return nil, fmt.Errorf("disk %s: %w", dev, err)
 		}
-		merges = append(merges, merge{dev: dev, top: top, base: base, above: above})
+		merges = append(merges, mergedDisk{dev: dev, top: top, base: base, above: above})
 	}
 
 	// The metadata first (review M-3). A snapshot already gone is fine.
@@ -299,19 +295,28 @@ func flattenSnapshot(v flattenAPI, domainName, snapshotName string, bases map[st
 	}
 
 	if running {
-		for _, m := range merges {
+		for i, m := range merges {
 			// Active-layer commit bounded at the base: layers under it (a
 			// shared image, another VM's disk) are untouched.
-			if err := v.DomainBlockCommit(dom, m.dev,
+			err := v.DomainBlockCommit(dom, m.dev,
 				golibvirt.OptString{m.base}, golibvirt.OptString{}, 0,
-				golibvirt.DomainBlockCommitActive); err != nil {
+				golibvirt.DomainBlockCommitActive)
+			if err == nil {
+				if err = waitBlockJobReady(v, dom, m.dev); err != nil {
+					err = fmt.Errorf("sync: %w", err)
+				}
+			}
+			if err == nil {
+				if err = v.DomainBlockJobAbort(dom, m.dev, golibvirt.DomainBlockJobAbortPivot); err != nil {
+					err = fmt.Errorf("pivot onto base: %w", err)
+				}
+			}
+			if err != nil {
+				// The disks already pivoted run on their bases: their
+				// persistent definition must say so too, or a cold start
+				// boots stale data. Nothing is given up.
+				settleMerges(v, dom, domainName, merges[:i])
 				return nil, fmt.Errorf("block-commit %s: %w", m.dev, err)
-			}
-			if err := waitBlockJobReady(v, dom, m.dev); err != nil {
-				return nil, fmt.Errorf("block-commit %s sync: %w", m.dev, err)
-			}
-			if err := v.DomainBlockJobAbort(dom, m.dev, golibvirt.DomainBlockJobAbortPivot); err != nil {
-				return nil, fmt.Errorf("pivot %s onto base: %w", m.dev, err)
 			}
 		}
 	} else if len(merges) > 0 {
@@ -335,39 +340,119 @@ func flattenSnapshot(v flattenAPI, domainName, snapshotName string, bases map[st
 	if len(merges) == 0 {
 		return nil, nil
 	}
+	return settleMerges(v, dom, domainName, merges), nil
+}
 
-	// Review M-2: give up nothing the persistent definition still names.
-	inactive, err := v.DomainGetXMLDesc(dom, golibvirt.DomainXMLInactive)
-	if err != nil {
-		slog.Warn("snapshot flatten: cannot read the persistent definition — the merged layers are kept",
-			"vm", domainName, "error", err)
-		return nil, nil
+// mergedDisk is one disk a flatten merged: its active layer (top) was
+// committed into base, and above are the layers that held its data.
+type mergedDisk struct {
+	dev, top, base string
+	above          []string
+}
+
+// settleMerges makes the persistent definition name each merged disk's base
+// and returns, per disk it does, the layers given up (re-review 2, I-B).
+//
+// libvirt rewrites the persistent definition on a pivot only when its
+// source and the live one match, and only logs a failed config save. A
+// definition still naming a merged layer is repointed here
+// (RewriteDiskSourceFile on the secure inactive XML, then DomainDefineXML)
+// before anything is given up. When that cannot be done the disk's layers
+// are all kept and each is marked (MergedLayerMarker): its data is now in
+// base, so a start that would boot one of them must refuse, never run the
+// guest on stale data.
+func settleMerges(v flattenAPI, dom golibvirt.Domain, domainName string, merges []mergedDisk) map[string][]string {
+	if len(merges) == 0 {
+		return nil
 	}
-	persistent := parseDomainDiskSources(inactive)
-	var removable []string
-	for _, m := range merges {
-		if resolvedPath(persistent[m.dev]) != resolvedPath(m.base) {
-			slog.Warn("snapshot flatten: the persistent definition does not name the merged base — its layers are kept",
-				"vm", domainName, "disk", m.dev, "base", m.base, "persistent", persistent[m.dev], "layers", m.above)
-			continue
+	read := func() (string, map[string]string, error) {
+		x, err := v.DomainGetXMLDesc(dom, golibvirt.DomainXMLInactive|golibvirt.DomainXMLSecure)
+		if err != nil {
+			return "", nil, err
 		}
-		removable = append(removable, m.above...)
+		return x, parseDomainDiskSources(x), nil
+	}
+	inactive, persistent, err := read()
+	if err == nil {
+		newXML, repoint := inactive, false
+		for _, m := range merges {
+			p := persistent[m.dev]
+			if resolvedPath(p) == resolvedPath(m.base) || !inLayers(p, m.above) {
+				continue
+			}
+			out, changed, rerr := RewriteDiskSourceFile(newXML, m.dev, p, m.base)
+			if rerr != nil || !changed {
+				slog.Error("snapshot flatten: cannot repoint the persistent definition at the merged base",
+					"vm", domainName, "disk", m.dev, "base", m.base, "persistent", p, "error", rerr)
+				continue
+			}
+			newXML, repoint = out, true
+		}
+		if repoint {
+			if _, derr := v.DomainDefineXML(newXML); derr != nil {
+				slog.Error("snapshot flatten: redefining the domain on its merged bases failed",
+					"vm", domainName, "error", derr)
+			}
+			inactive, persistent, err = read()
+		}
+	}
+	if err != nil {
+		slog.Error("snapshot flatten: cannot read the persistent definition — the merged layers are kept and marked",
+			"vm", domainName, "error", err)
 	}
 	named := map[string]bool{}
 	for _, src := range persistent {
 		named[resolvedPath(src)] = true
 	}
-	var out []string
-	for _, l := range removable {
-		if named[resolvedPath(l)] {
-			slog.Warn("snapshot flatten: the persistent definition still names a merged layer — it is kept",
-				"vm", domainName, "layer", l)
+	out := map[string][]string{}
+	for _, m := range merges {
+		settled := err == nil && resolvedPath(persistent[m.dev]) == resolvedPath(m.base)
+		for _, l := range m.above {
+			if named[resolvedPath(l)] {
+				settled = false
+			}
+		}
+		if settled {
+			out[m.dev] = m.above
 			continue
 		}
-		out = append(out, l)
+		slog.Error("snapshot flatten: the persistent definition does not name the merged base — its layers are kept, and a start booting them is refused",
+			"vm", domainName, "disk", m.dev, "base", m.base, "persistent", persistent[m.dev], "layers", m.above)
+		for _, l := range m.above {
+			if werr := os.WriteFile(MergedLayerMarker(l), []byte(m.base+"\n"), 0o644); werr != nil {
+				slog.Error("snapshot flatten: cannot mark a merged layer", "vm", domainName, "layer", l, "error", werr)
+			}
+		}
 	}
-	return out, nil
+	return out
 }
+
+func inLayers(p string, layers []string) bool {
+	rp := resolvedPath(p)
+	for _, l := range layers {
+		if resolvedPath(l) == rp {
+			return true
+		}
+	}
+	return false
+}
+
+// MergedLayerMarker is the file beside a layer that says its data was merged
+// into another file (its content names that file) while something may still
+// name the layer: a start that would boot it is refused.
+func MergedLayerMarker(layer string) string { return layer + ".lv-merged" }
+
+// MergedInto reads layer's marker: the file its data was merged into.
+func MergedInto(layer string) (string, bool) {
+	b, err := os.ReadFile(MergedLayerMarker(layer))
+	if err != nil {
+		return "", false
+	}
+	return strings.TrimSpace(string(b)), true
+}
+
+// DomainDiskFiles is a domain XML's disks as target dev → source file.
+func DomainDiskFiles(domXML string) map[string]string { return parseDomainDiskSources(domXML) }
 
 // waitBlockJobReady polls a disk's block job until it has synced (cur >= end),
 // the point at which an active-layer commit is ready to pivot. Returns when the

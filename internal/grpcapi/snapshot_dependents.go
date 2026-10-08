@@ -3,14 +3,20 @@ package grpcapi
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	"github.com/litevirt/litevirt/internal/corrosion"
+	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/qcow2"
 )
 
@@ -62,7 +68,8 @@ func walkChain(name, host string, images []string, spell func(string) string) ([
 		}
 		fi, err := os.Stat(path)
 		if err != nil {
-			return out, fmt.Errorf("%w: %s: %v", errLayerUnknown, path, err)
+			// %w twice: a missing file (fs.ErrNotExist) is told apart.
+			return out, fmt.Errorf("%w: %s: %w", errLayerUnknown, path, err)
 		}
 		out = append(out, chainLayer{name: name, file: path})
 		if !fi.Mode().IsRegular() {
@@ -110,28 +117,25 @@ func hasQcow2Magic(path string) (bool, error) {
 	return binary.BigEndian.Uint32(m[:]) == qcow2.Magic, nil
 }
 
-// diskOnSharedStorage reports a disk whose file every host that mounts its
-// storage sees at the same path. A row typed shared ("nfs", ...) with a file
-// path but no storage pool is not one: an earlier build recorded a clone of
-// a shared VM with its source's storage type although CloneVM writes the
-// clone's file to <data_dir>/disks on the source's host (review I-3). It is
-// judged here, at read time, so no row needs rewriting.
-func diskOnSharedStorage(d corrosion.DiskRecord) bool {
-	if !corrosion.DiskIsShared(d) {
-		return false
-	}
-	return d.StorageVolume != "" || !strings.HasPrefix(d.Path, "/")
-}
-
 // layerUsers maps each file another VM's disk uses — its recorded
 // backing_disk, and every layer of its disk file's chain — to those VMs.
-// The chains walked are this host's disks, and another host's disks on
-// shared storage that record no backing_disk (an earlier build's, which may
-// be layered on anything). Another host's disk that records its
-// backing_disk uses exactly that, whether or not its file is visible here.
-// A disk that cannot be read fails the whole answer (errLayerUnknown): a
-// disk whose chain is unknown may back on any layer, so the caller must
-// neither merge nor remove anything.
+//
+// A merge writes and removes only the deleting VM's own snapshot layers
+// (snapshotMergeBases), so only a disk that could back on them matters, and
+// every build records backing_disk for the one kind that does, a linked
+// clone (re-review 2, I-A):
+//   - another host's disk, and a disk on shared storage, are judged by their
+//     recorded backing_disk alone — never by whether this host can read
+//     them (an NFS pool another host mounted, an earlier build's clone
+//     recorded "nfs");
+//   - a disk of this host whose file is not there has no header, so it backs
+//     on nothing beyond its backing_disk (a VM in error whose disk was never
+//     made, a pool not mounted);
+//   - a disk of this host that is there is walked by its headers, which also
+//     finds a clone whose record names no backing. One that cannot be read
+//     (an unreadable header, a permission error) fails the whole answer
+//     (errLayerUnknown): it may back on any layer, so the caller must
+//     neither merge nor remove anything.
 func (s *Server) layerUsers(ctx context.Context, vmName string, images []string) (map[string][]string, error) {
 	vms, err := corrosion.ListVMs(ctx, s.db, "", "")
 	if err != nil {
@@ -159,14 +163,14 @@ func (s *Server) layerUsers(ctx context.Context, vmName string, images []string)
 				add(filepath.Clean(d.BackingDisk), vm.Name)
 				add(resolvedOr(s.hostDiskFile(d.BackingDisk)), vm.Name)
 			}
-			if remote := d.HostName != "" && d.HostName != s.hostName; remote && (!diskOnSharedStorage(d) || d.BackingDisk != "") {
+			if remote := d.HostName != "" && d.HostName != s.hostName; remote || corrosion.DiskIsShared(d) {
 				continue
 			}
 			if !strings.HasPrefix(d.Path, "/") {
 				continue // not a file path (an rbd name, say): no local chain
 			}
 			layers, err := diskLayers(s.hostDiskFile(d.Path), images)
-			if err != nil {
+			if err != nil && !errors.Is(err, fs.ErrNotExist) {
 				return nil, fmt.Errorf("disk %q of %q: %w", d.DiskName, vm.Name, err)
 			}
 			for _, l := range layers {
@@ -373,8 +377,12 @@ func (s *Server) domainPathOf(p string) string {
 // domain now names for it, when that file is the merge's base (compared
 // resolved): the record names the same file as the domain, in the domain's
 // spelling, whatever the directory's symlinks (review I-4).
-func (s *Server) recordMergedBases(ctx context.Context, vmName string, targets map[string]mergeTarget) {
-	if len(targets) == 0 {
+//
+// Only a disk the merge settled (merged lists it: its persistent definition
+// names the base) is moved. One whose definition could not be repointed
+// keeps its record on the old top, which its definition still names.
+func (s *Server) recordMergedBases(ctx context.Context, vmName string, targets map[string]mergeTarget, merged map[string][]string) {
+	if len(merged) == 0 {
 		return
 	}
 	live, err := s.virt.DomainDiskSources(vmName)
@@ -383,6 +391,9 @@ func (s *Server) recordMergedBases(ctx context.Context, vmName string, targets m
 		return
 	}
 	for dev, t := range targets {
+		if _, ok := merged[dev]; !ok {
+			continue
+		}
 		src := live[dev]
 		if src == "" || resolvedOr(s.hostDiskFile(src)) != resolvedOr(s.hostDiskFile(t.base)) {
 			continue // not merged (a fallback): the domain is where it was
@@ -396,7 +407,11 @@ func (s *Server) recordMergedBases(ctx context.Context, vmName string, targets m
 // removeMergedLayers removes the layers a merge gave back, keeping (with a
 // WARN) any that a record of the VM or the domain still names: a layer is
 // removed only once nothing of this VM points at it.
-func (s *Server) removeMergedLayers(ctx context.Context, vmName string, layers []string) {
+func (s *Server) removeMergedLayers(ctx context.Context, vmName string, merged map[string][]string) {
+	var layers []string
+	for _, ls := range merged {
+		layers = append(layers, ls...)
+	}
 	if len(layers) == 0 {
 		return
 	}
@@ -457,4 +472,89 @@ func (s *Server) chainHolders(ctx context.Context, vmName, file string) string {
 	}
 	return fmt.Sprintf("Its layers are held by %s, layered on them: delete it, or re-create it with "+
 		"`lv clone <source> <name> --mode full`, first.", strings.Join(holders, ", "))
+}
+
+// overlayName is the file libvirt names an external snapshot snap of a disk
+// on src: src's basename with the text after its last '.' replaced by snap,
+// or with ".snap" appended when it has none.
+func overlayName(src, snap string) string {
+	base := filepath.Base(src)
+	if i := strings.LastIndexByte(base, '.'); i > 0 {
+		base = base[:i]
+	}
+	return filepath.Join(filepath.Dir(src), base+"."+snap)
+}
+
+// clearLeftoverOverlays removes, before snapshot snap of vmName is taken, a
+// file already at the name libvirt will give the snapshot's overlay — what a
+// failed merge leaves — when nothing uses it: no VM's record or chain
+// (layerUsers over every VM, this one too), no source of this domain, live
+// or persistent, and no layer a snapshot of it froze. A file that is used,
+// or whose use cannot be told, is kept, and the create is refused naming it
+// (libvirt would refuse it too).
+func (s *Server) clearLeftoverOverlays(ctx context.Context, vmName, snap string) error {
+	srcs := map[string]bool{}
+	if live, err := s.virt.DomainDiskSources(vmName); err == nil {
+		for _, p := range live {
+			srcs[p] = true
+		}
+	}
+	if x, err := s.virt.DumpXMLInactive(vmName); err == nil {
+		for _, p := range lv.DomainDiskFiles(x) {
+			srcs[p] = true
+		}
+	}
+	var leftovers []string
+	named := map[string]bool{}
+	for src := range srcs {
+		if !strings.HasPrefix(src, "/") {
+			continue
+		}
+		named[resolvedOr(s.hostDiskFile(src))] = true
+		ov := overlayName(src, snap)
+		if _, err := os.Lstat(s.hostDiskFile(ov)); err == nil {
+			leftovers = append(leftovers, ov)
+		}
+	}
+	if len(leftovers) == 0 {
+		return nil
+	}
+	images := s.rootsAsFound(filepath.Join(s.dataDir, "images"))
+	users, uerr := s.layerUsers(ctx, "", images)
+	held, herr := s.virt.SnapshotBaseFiles(vmName)
+	frozen := map[string]bool{}
+	for _, files := range held {
+		for _, f := range files {
+			frozen[resolvedOr(s.hostDiskFile(f))] = true
+		}
+	}
+	for _, ov := range leftovers {
+		file := resolvedOr(s.hostDiskFile(ov))
+		why := ""
+		switch {
+		case uerr != nil:
+			why = "what uses it cannot be told: " + uerr.Error()
+		case herr != nil:
+			why = "the VM's snapshots cannot be listed: " + herr.Error()
+		case named[file]:
+			why = "the VM's definition names it"
+		case len(users[file]) > 0:
+			why = "used by " + strings.Join(users[file], ", ")
+		case frozen[file]:
+			why = "a snapshot of the VM froze it"
+		}
+		if why != "" {
+			return status.Errorf(codes.FailedPrecondition,
+				"snapshot %q of %q: its overlay would be %s, which is already there and kept (%s); choose another snapshot name",
+				snap, vmName, ov, why)
+		}
+		if err := os.Remove(file); err != nil && !os.IsNotExist(err) {
+			return status.Errorf(codes.FailedPrecondition,
+				"snapshot %q of %q: remove the unused leftover %s: %v", snap, vmName, ov, err)
+		}
+		_ = os.Remove(lv.MergedLayerMarker(file))
+		slog.Warn("snapshot create: removed an unused leftover at the overlay's name (a failed merge's)",
+			"vm", vmName, "snapshot", snap, "file", ov)
+	}
+	return nil
 }

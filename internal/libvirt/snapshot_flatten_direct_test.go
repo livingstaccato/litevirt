@@ -221,24 +221,29 @@ func TestFlattenSnapshot_DropsTheMetadataBeforeWritingTheBase(t *testing.T) {
 	}
 }
 
-// Review M-2: after a running pivot, the persistent definition must name
-// the base before any layer above it is given up. libvirt rewrites it only
-// when the live and persistent sources match; when it did not, the next
-// start would open a removed file. The layers are kept (and a WARN said).
-func TestFlattenSnapshot_RunningKeepsTheLayersTheDefinitionStillNames(t *testing.T) {
+// Review M-2 / re-review 2 I-B: after a running pivot that left the
+// persistent definition on the top, the merge repoints it; when it cannot
+// (the define fails), every layer is kept and marked as merged into the
+// base, so a start that would boot one refuses instead of running the guest
+// on stale data.
+func TestFlattenSnapshot_RunningKeepsAndMarksTheLayersWhenTheDefinitionCannotBeRepointed(t *testing.T) {
 	needQemuTools(t)
 	chains := chainFixture(t, t.TempDir(), "vda")
 	v := newScripted(golibvirt.DomainRunning, chains)
 	v.pivotKeepsConfig = true
+	v.defineErr = errors.New("define refused")
 	removable, err := flattenSnapshot(v, "vm", "s1", basesOf(chains))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(removable) != 0 {
-		t.Fatalf("layers %v given up while the persistent definition still names %s", removable, chains["vda"][0])
+	if l := flattenLayers(removable); len(l) != 0 {
+		t.Fatalf("layers %v given up while the persistent definition still names %s", l, chains["vda"][0])
 	}
 	if !exists(chains["vda"][0]) {
 		t.Fatal("the top the persistent definition names was removed")
+	}
+	if into, ok := MergedInto(chains["vda"][0]); !ok || into != chains["vda"][1] {
+		t.Fatalf("the kept top is not marked as merged into %s (marker %q, %v)", chains["vda"][1], into, ok)
 	}
 }
 
@@ -252,8 +257,8 @@ func TestFlattenSnapshot_RunningGivesUpTheLayersOnceBothDefinitionsNameTheBase(t
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(removable) != 1 || removable[0] != resolvedPath(chains["vda"][0]) {
-		t.Fatalf("removable = %v, want [%s]", removable, chains["vda"][0])
+	if l := flattenLayers(removable); len(l) != 1 || l[0] != resolvedPath(chains["vda"][0]) {
+		t.Fatalf("removable = %v, want [%s]", l, chains["vda"][0])
 	}
 	if got := parseDomainDiskSources(v.inac)["vda"]; got != chains["vda"][1] {
 		t.Fatalf("persistent definition names %s, want the base", got)
@@ -281,8 +286,8 @@ func TestFlattenSnapshot_OfflineCommitsRepointsAndDefines(t *testing.T) {
 		}
 		run(t, "qemu-io", "-f", "qcow2", "-c", fmt.Sprintf("read -P %d 0 4k", i+7), chains[dev][1])
 	}
-	if len(removable) != 2 {
-		t.Fatalf("removable = %v, want both tops", removable)
+	if l := flattenLayers(removable); len(l) != 2 {
+		t.Fatalf("removable = %v, want both tops", l)
 	}
 }
 
@@ -295,7 +300,7 @@ func TestFlattenSnapshot_OfflineDefineFailureGivesUpNothing(t *testing.T) {
 	v := newScripted(golibvirt.DomainShutoff, chains)
 	v.defineErr = errors.New("define refused")
 	removable, err := flattenSnapshot(v, "vm", "s1", basesOf(chains))
-	if err == nil || len(removable) != 0 {
+	if err == nil || len(flattenLayers(removable)) != 0 {
 		t.Fatalf("flatten = %v, %v; want an error and nothing given up", removable, err)
 	}
 	for i, dev := range []string{"vda", "vdb"} {
@@ -315,7 +320,7 @@ func TestFlattenSnapshot_RunningMultiDiskPartialFailureGivesUpNothing(t *testing
 	v.commitErr = map[string]error{"vdb": errors.New("commit refused")}
 	v.commitErr["vda"] = nil
 	removable, err := flattenSnapshot(v, "vm", "s1", basesOf(chains))
-	if err == nil || len(removable) != 0 {
+	if err == nil || len(flattenLayers(removable)) != 0 {
 		t.Fatalf("flatten = %v, %v; want an error and nothing given up", removable, err)
 	}
 	for _, dev := range []string{"vda", "vdb"} {

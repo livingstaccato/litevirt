@@ -42,13 +42,12 @@ func depthOf(t *testing.T, file string) int {
 	return n
 }
 
-// A stopped VM's last snapshot is merged offline: each create/rm cycle
-// commits the overlay's data into the base and leaves the chain as deep as
-// it was. The base has a backing of its own (an image, as a VM's disk
-// does), so the depth is measured, not a constant: the commit must stop at
-// the base, never reach the image, and never leave a layer. Twenty cycles,
-// every write kept.
-func TestCommitLayersOffline_TwentyCyclesKeepDepthAndData(t *testing.T) {
+// commitLayersOffline, twenty times over one base that sits on an image:
+// every commit stops at the base (the image never changes, the base keeps
+// its one backing) and every write is kept. Whether the domain's chain
+// stays at its depth across cycles is decided by the repoint, measured in
+// TestFlattenSnapshot_TwentyOfflineCyclesKeepTheDomainsChainAtItsDepth.
+func TestCommitLayersOffline_TwentyCommitsStopAtTheBaseAndKeepEveryWrite(t *testing.T) {
 	needQemuTools(t)
 	dir := t.TempDir()
 	img := filepath.Join(dir, "image.qcow2")

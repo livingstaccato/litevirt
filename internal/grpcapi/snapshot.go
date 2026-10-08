@@ -147,6 +147,13 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotReque
 		return nil
 	}
 
+	// A merge that failed after libvirt's metadata went can leave the
+	// overlay this snapshot would be given; libvirt refuses to create over
+	// it. Removed when nothing uses it (re-review 2, m-5).
+	if err := s.clearLeftoverOverlays(ctx, req.VmName, req.Name); err != nil {
+		return nil, err
+	}
+
 	snapType := "disk"
 	var sizeBytes, vmstateBytes int64
 	var vmstatePath string
@@ -476,7 +483,7 @@ func (s *Server) DeleteSnapshot(ctx context.Context, req *pb.DeleteSnapshotReque
 	}
 
 	var delErr error
-	var merged []string
+	var merged map[string][]string
 	if len(targets) > 0 {
 		bases := map[string]string{}
 		for dev, t := range targets {
@@ -522,7 +529,7 @@ func (s *Server) DeleteSnapshot(ctx context.Context, req *pb.DeleteSnapshotReque
 	// the recorded path to whatever the live domain ended up on. A merged
 	// disk's record is moved onto its base by the record it was judged by,
 	// before any layer it no longer needs is removed.
-	s.recordMergedBases(ctx, req.VmName, targets)
+	s.recordMergedBases(ctx, req.VmName, targets, merged)
 	s.reconcileDiskPaths(ctx, req.VmName)
 	s.removeMergedLayers(ctx, req.VmName, merged)
 

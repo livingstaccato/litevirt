@@ -134,15 +134,21 @@ func TestDeleteSnapshot_UnrecordedCloneFoundByItsHeaderKeepsTheFiles(t *testing.
 	f.requireNotFlattened(t)
 }
 
-// Review M-6c: a disk on this host whose file cannot be read (a pool not
-// mounted, lab line 69) and whose record names no backing may be a clone of
-// any layer: it counts as dependent, and nothing is merged or removed.
-func TestDeleteSnapshot_UnreadableDiskCountsAsDependent(t *testing.T) {
+// Review M-6c: a disk on this host whose file is there but whose header
+// cannot be read, and whose record names no backing, may be a clone of any
+// layer: it counts as dependent, and nothing is merged or removed. (A disk
+// whose file is not there at all has no header, so it backs on nothing —
+// re-review 2, I-A.)
+func TestDeleteSnapshot_ADiskWhoseHeaderCannotBeReadCountsAsDependent(t *testing.T) {
 	f := newSnapDependentsFixture(t)
+	bad := filepath.Join(f.dir, "clone-root.qcow2")
+	// qcow2 magic, then a version no reader knows.
+	if err := os.WriteFile(bad, append([]byte{'Q', 'F', 'I', 0xfb, 0, 0, 0, 99}, make([]byte, 504)...), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	if err := corrosion.InsertVM(adminCtx(), f.s.db,
 		corrosion.VMRecord{Name: "clone", HostName: "host-a", State: "stopped"}, nil,
-		[]corrosion.DiskRecord{{VMName: "clone", DiskName: "root", HostName: "host-a",
-			Path: filepath.Join(f.dir, "unmounted", "clone-root.qcow2"), StorageType: "local"}},
+		[]corrosion.DiskRecord{{VMName: "clone", DiskName: "root", HostName: "host-a", Path: bad, StorageType: "local"}},
 	); err != nil {
 		t.Fatal(err)
 	}

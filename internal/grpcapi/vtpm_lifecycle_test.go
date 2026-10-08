@@ -96,7 +96,12 @@ func TestCreateSnapshot_FailedLiveCaptureRecordsErrorAndFlattens(t *testing.T) {
 	s.virt = fake
 	s.dataDir = t.TempDir()
 	ctx := adminCtx()
-	base, _ := realSnapChain(t, fake, "lvm", "s1")
+	base, overlay := realSnapChain(t, fake, "lvm", "s1")
+	// libvirt makes the overlay as it cuts over, not before: a file already
+	// at its name is a leftover CreateSnapshot clears.
+	if err := os.Remove(overlay); err != nil {
+		t.Fatal(err)
+	}
 	// The merge judges a disk by the VM's record of it.
 	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
 		Name: "lvm", HostName: s.hostName, Spec: `{"name":"lvm"}`, State: "running",
@@ -109,6 +114,7 @@ func TestCreateSnapshot_FailedLiveCaptureRecordsErrorAndFlattens(t *testing.T) {
 	if _, err := s.CreateSnapshot(ctx, &pb.CreateSnapshotRequest{VmName: "lvm", Name: "s1", WithMemory: true}); err == nil {
 		t.Fatal("expected CreateSnapshot to fail when the RAM save fails")
 	}
+	runQemuImg(t, "create", "-q", "-f", "qcow2", "-F", "qcow2", "-b", base, overlay)
 	// The errored snapshot must be recorded (visible + deletable), not dropped.
 	snap, _ := corrosion.GetSnapshot(ctx, s.db, "lvm", "s1")
 	if snap == nil || snap.State != "error" {

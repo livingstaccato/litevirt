@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	lv "github.com/litevirt/litevirt/internal/libvirt"
 )
 
 // diskStem strips a disk path's file extension. litevirt names a data disk
@@ -52,6 +53,13 @@ func (s *Server) reconcileDiskPaths(ctx context.Context, vmName string) {
 		liveByStem[key(src)] = src
 	}
 	for _, d := range disks {
+		// A record on a layer marked merged stays there: its persistent
+		// definition still names that layer, and a start refuses it
+		// (libvirt.MergedLayerMarker). Moving the record onto the live base
+		// would hide the mismatch from that check.
+		if _, merged := lv.MergedInto(s.hostDiskFile(d.Path)); merged {
+			continue
+		}
 		src, ok := liveByStem[key(d.Path)]
 		if !ok || src == d.Path {
 			continue

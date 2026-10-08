@@ -19,6 +19,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -61,6 +62,11 @@ type Event struct {
 type Fake struct {
 	// FlattenBases records the bases each FlattenSnapshot call was given.
 	FlattenBases []map[string]string
+	// FlattenLeavesConfig: FlattenSnapshot merges but the persistent
+	// definition keeps naming each old top (see FlattenSnapshot).
+	FlattenLeavesConfig bool
+	// FailFlattenSnapshot, when set, is FlattenSnapshot's error.
+	FailFlattenSnapshot error
 	// snapBases: domain → snapshot → the files its disks were on at cutover.
 	snapBases map[string]map[string][]string
 
@@ -1414,29 +1420,43 @@ func (f *Fake) DeleteSnapshot(domainName, snapshotName string) error {
 
 // FlattenSnapshot models the merge: each disk named in bases is put back on
 // its base, as a block-commit's pivot (or an offline commit's redefine)
-// leaves the domain, and the layers above it are given back — found by
-// walking real qcow2 headers from the old top when the files exist, as the
-// real merge does. FlattenBases records what each call was given.
-func (f *Fake) FlattenSnapshot(domainName, snapshotName string, bases map[string]string) ([]string, error) {
+// leaves the domain, and the layers above it are given back per disk —
+// found by walking real qcow2 headers from the old top when the files
+// exist, as the real merge does. With FlattenLeavesConfig set it models a
+// pivot whose persistent definition could not be repointed: no disk is
+// given back, and each layer is marked (libvirt.MergedLayerMarker).
+// FailFlattenSnapshot fails the call before anything moves.
+// FlattenBases records what each call was given.
+func (f *Fake) FlattenSnapshot(domainName, snapshotName string, bases map[string]string) (map[string][]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, ok := f.snapshots[domainName][snapshotName]; !ok {
 		return nil, fmt.Errorf("libvirtfake: no snapshot %q for %q", snapshotName, domainName)
 	}
 	delete(f.snapshots[domainName], snapshotName)
+	if f.FailFlattenSnapshot != nil {
+		return nil, f.FailFlattenSnapshot
+	}
 	if len(bases) > 0 && f.diskSources[domainName] == nil {
 		f.diskSources[domainName] = map[string]string{}
 	}
 	cp := map[string]string{}
-	var above []string
+	out := map[string][]string{}
 	for dev, b := range bases {
-		above = append(above, layersAboveIfFiles(f.diskSources[domainName][dev], b)...)
+		above := layersAboveIfFiles(f.diskSources[domainName][dev], b)
 		f.diskSources[domainName][dev] = b
 		cp[dev] = b
+		if f.FlattenLeavesConfig {
+			for _, l := range above {
+				_ = os.WriteFile(libvirt.MergedLayerMarker(l), []byte(b+"\n"), 0o644)
+			}
+			continue
+		}
+		out[dev] = above
 	}
 	f.FlattenBases = append(f.FlattenBases, cp)
 	f.record("snapshot-flatten", domainName, snapshotName)
-	return above, nil
+	return out, nil
 }
 
 // layersAboveIfFiles is top and every layer of its qcow2 chain above base,

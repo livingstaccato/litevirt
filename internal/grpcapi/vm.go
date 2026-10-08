@@ -4570,6 +4570,9 @@ func resolveStopTimeout(reqTimeout int32, specJSON string) int32 {
 // store passes, as on main. Disks on other hosts and absent files are not
 // this check's.
 func (s *Server) verifyImageBasesForStart(ctx context.Context, vm *corrosion.VMRecord) error {
+	if err := s.refuseMergedLayerBoot(vm); err != nil {
+		return err
+	}
 	disks, err := corrosion.GetVMDisks(ctx, s.db, vm.Name)
 	if err != nil {
 		return status.Errorf(codes.Internal, "read disks of %q: %v", vm.Name, err)

@@ -699,8 +699,12 @@ are removed, so a create/rm cycle leaves the chain as deep as it was. A merge
 never writes below the VM's own disk: a pool's shared image, a template, a
 promoted VM's replica and the image store are never written. A layer a linked
 clone uses, a layer another libvirt snapshot froze (recorded or not), and
-everything under either, is never written; when a chain involved cannot be
-read, nothing is merged.
+everything under either, is never written. A disk on another host or on shared
+storage counts by the backing it records (a linked clone always records one),
+and a disk whose file is missing uses nothing; when a disk of this host is there
+but its chain cannot be read, nothing is merged. If the VM ran and its
+definition could not be pointed at the merged disk, the layers are kept and its
+next start is refused with how to repoint it, rather than booting stale data.
 
 Deleting a snapshot while another remains keeps every file (the remaining
 snapshot's frozen layers must not change); its layer is merged when the last
@@ -849,6 +853,13 @@ lv clone <source> <new-name>       # Clone a template or stopped VM into a new V
   [--start]                        # start the clone after creation
   [--snapshot <name>]              # clone from this snapshot of the source
 ```
+
+A clone's own disk is a file in `<data_dir>/disks` on the source's host, and is
+recorded as local storage whatever the source's storage. Auto mode still links
+a clone of a shared-storage VM's clone, as it always has: a disk counts as
+shared when it is on shared storage or is a clone of one that is. `lv clone`
+prints the mode it used and why; auto copies in full only from local storage,
+or when a disk is not a file a clone can back on.
 
 ## GitOps
 

@@ -98,11 +98,14 @@ type LibvirtBackend interface {
 	// DeleteSnapshot removes the snapshot's metadata only: it never merges,
 	// moves or deletes a disk file (see libvirt.Client.DeleteSnapshot).
 	DeleteSnapshot(domainName, snapshotName string) error
-	// FlattenSnapshot merges each disk's active layer down into bases[dev]
-	// (running: block-commit + pivot; shut off: qemu-img commit + redefine),
-	// removes the layers above, and drops the snapshot metadata. The caller
-	// picks bases no other VM uses (snapshotMergeBases).
-	FlattenSnapshot(domainName, snapshotName string, bases map[string]string) ([]string, error)
+	// FlattenSnapshot drops the snapshot metadata, then merges each disk's
+	// active layer down into bases[dev] (running: block-commit + pivot; shut
+	// off: qemu-img commit + redefine). It returns, per disk whose persistent
+	// definition names its base, the layers above it, for the caller to
+	// remove; a disk not listed keeps its layers (marked when the definition
+	// still names one: libvirt.MergedLayerMarker). The caller picks the bases
+	// (snapshotMergeBases).
+	FlattenSnapshot(domainName, snapshotName string, bases map[string]string) (map[string][]string, error)
 	// SnapshotBaseFiles lists every snapshot libvirt holds for the domain
 	// (its own metadata, recorded by litevirt or not) with the files its
 	// embedded domain's disks were on — the layers it froze.

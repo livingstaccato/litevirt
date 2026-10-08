@@ -240,23 +240,3 @@ func TestDeleteSnapshot_AnotherHostsCloneRecordedNFSDoesNotStopMerging(t *testin
 		t.Fatalf("the domain is on %s: another host's clone stopped the merge", got)
 	}
 }
-
-// A remote row on shared storage that names no backing (an earlier build's)
-// and cannot be read here still stops the merge: it may back on anything.
-func TestDeleteSnapshot_AnUnreadableSharedDiskWithNoBackingStillStopsMerging(t *testing.T) {
-	needQemuImg(t)
-	dir := t.TempDir()
-	root := filepath.Join(dir, "m-root.qcow2")
-	runQemuImg(t, "create", "-q", "-f", "qcow2", root, "1M")
-	f := newMergeFixture(t, "m", "running", root, corrosion.DiskRecord{})
-	if err := corrosion.InsertVM(adminCtx(), f.s.db, corrosion.VMRecord{Name: "nfsvm", HostName: "host-b", State: "stopped"}, nil,
-		[]corrosion.DiskRecord{{VMName: "nfsvm", DiskName: "root", HostName: "host-b",
-			Path: filepath.Join(dir, "unmounted", "nfsvm-root.qcow2"), StorageType: "nfs", StorageVolume: "nfs1"}}); err != nil {
-		t.Fatal(err)
-	}
-	f.snap(t, "s1", true)
-	f.rm(t, "s1")
-	if len(f.fake.FlattenBases) != 0 {
-		t.Fatalf("merged %v although a shared disk's chain could not be read", f.fake.FlattenBases)
-	}
-}

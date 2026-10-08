@@ -28,8 +28,9 @@ const (
 	backupForeign   = "foreign"
 )
 
-// backupProbeTimeout bounds one peer's answer to ProbeContainerBackups.
-const backupProbeTimeout = 5 * time.Second
+// backupProbeTimeout bounds one host's answer: a peer's ProbeContainerBackups,
+// and this host's own probe. A var only so a test can shorten it.
+var backupProbeTimeout = 5 * time.Second
 
 // backupProbeConcurrency caps how many repo probes run at once on a host,
 // for inspects from any number of callers and peers.
@@ -217,9 +218,15 @@ func (s *Server) resolveContainerBackups(ctx context.Context, rec *corrosion.Con
 
 	// This host first: the common case (a local repo, or a shared one) needs
 	// no peer at all.
+	//
+	// Bounded like a peer's answer (backupProbeTimeout), whatever deadline the
+	// caller has — a CLI has none. The walk runs on its own goroutine because
+	// file reads on a hung network mount ignore ctx: the inspect answers at
+	// the deadline with the entries unknown, and the walk finishes (or not)
+	// in the background, holding only its probe slot.
 	if s.db != nil {
-		for _, repo := range pending {
-			apply(s.hostName, s.probeContainerBackupRepo(ctx, rec.Name, project, repo))
+		for _, p := range s.probeLocalBounded(ctx, rec.Name, project, pending) {
+			apply(s.hostName, p)
 		}
 	}
 	var left []string
@@ -333,4 +340,36 @@ func filterContainerBackups(d *pb.ContainerDetail, admin bool) *pb.ContainerDeta
 	}
 	d.Backups = kept
 	return d
+}
+
+// probeLocalBounded probes repos on this host within backupProbeTimeout. A
+// repo not answered by then is reported unreadable (so it stays unknown).
+func (s *Server) probeLocalBounded(ctx context.Context, name, project string, repos []string) []*pb.ContainerBackupProbe {
+	lctx, cancel := context.WithTimeout(ctx, backupProbeTimeout)
+	defer cancel()
+	results := make(chan *pb.ContainerBackupProbe, len(repos))
+	go func() {
+		for _, repo := range repos {
+			results <- s.probeContainerBackupRepo(lctx, name, project, repo)
+		}
+	}()
+	got := make(map[string]*pb.ContainerBackupProbe, len(repos))
+	for len(got) < len(repos) {
+		select {
+		case p := <-results:
+			got[p.Repo] = p
+		case <-lctx.Done():
+			for _, repo := range repos {
+				if _, ok := got[repo]; !ok {
+					got[repo] = &pb.ContainerBackupProbe{Repo: repo, Unreadable: true,
+						Detail: fmt.Sprintf("probe on %s did not finish in %s", s.hostName, backupProbeTimeout)}
+				}
+			}
+		}
+	}
+	out := make([]*pb.ContainerBackupProbe, 0, len(repos))
+	for _, repo := range repos {
+		out = append(out, got[repo])
+	}
+	return out
 }

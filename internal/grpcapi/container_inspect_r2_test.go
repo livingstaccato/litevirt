@@ -246,3 +246,40 @@ func TestInspectContainer_NoPeerDialWhenResolvedLocally(t *testing.T) {
 		t.Fatal("a peer was asked although every entry resolved locally")
 	}
 }
+
+// n3: the local probe has its own deadline, so an inspect from a caller with
+// no deadline (the CLI) cannot hang on a hung repo walk or a full set of
+// probe slots: the entry comes back unknown.
+func TestInspectContainer_LocalProbeHasADeadline(t *testing.T) {
+	s := inspectTestServer(t, "")
+	repo := ctTestRepo(t)
+	putCTManifest(t, repo, "ct1", "acme", "2026-10-08T10:00:00Z")
+	if err := corrosion.UpsertContainerBackup(context.Background(), s.db, "acme", "ct1", repo, 10); err != nil {
+		t.Fatal(err)
+	}
+	prev := backupProbeTimeout
+	backupProbeTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { backupProbeTimeout = prev })
+	slots := s.backupProbeSlots()
+	for i := 0; i < cap(slots); i++ {
+		slots <- struct{}{}
+	}
+	t.Cleanup(func() {
+		for i := 0; i < cap(slots); i++ {
+			<-slots
+		}
+	})
+	done := make(chan *pb.ContainerDetail, 1)
+	go func() {
+		d, _ := s.InspectContainer(adminCtx(), &pb.InspectContainerRequest{Name: "ct1"})
+		done <- d
+	}()
+	select {
+	case d := <-done:
+		if d == nil || len(d.GetBackups()) != 1 || d.GetBackups()[0].GetStatus() != "unknown" {
+			t.Fatalf("inspect with a stuck local probe = %+v, want the entry unknown", d.GetBackups())
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("inspect without a caller deadline hung on the local probe")
+	}
+}

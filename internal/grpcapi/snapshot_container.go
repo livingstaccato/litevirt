@@ -321,6 +321,11 @@ func (s *Server) DeleteContainerSnapshot(ctx context.Context, req *pb.DeleteCont
 	if err := corrosion.DeleteContainerSnapshot(ctx, s.db, host, req.Name, req.Snapshot); err != nil {
 		return nil, status.Errorf(codes.Internal, "tombstone snapshot: %v", err)
 	}
+	// The last snapshot gone, its directory goes too. os.Remove only removes
+	// an empty directory, so one still holding a snapshot is kept.
+	if s.dataDir != "" {
+		_ = os.Remove(filepath.Join(s.dataDir, containerSnapshotDir, req.Name))
+	}
 	s.audit(ctx, "ct.snapshot.delete", req.Name, fmt.Sprintf("project=%s snapshot=%s", project, req.Snapshot), "ok")
 	return &emptypb.Empty{}, nil
 }

@@ -374,7 +374,7 @@ func applyXattrs(target string, hdr *tar.Header, mode os.FileMode) ([]string, er
 		if err == nil {
 			continue
 		}
-		if !errorsIsNotSupported(err) {
+		if !cannotStoreHere(name, err) {
 			return dropped, fmt.Errorf("rootfs tar: set %s on %q: %w", name, hdr.Name, err)
 		}
 		dropped = append(dropped, hdr.Name+" "+name)

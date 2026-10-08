@@ -493,13 +493,18 @@ How it works and what to expect:
   each file's owner (a chown clears setuid and capabilities). An unprivileged
   container's archive carries its shifted owners and re-rooted capabilities, so
   it comes back in the same range. `trusted.*` attributes are not taken from an
-  archive. A target filesystem that does not support an attribute (ZFS with
-  `acltype=off`, NFS) does not fail the restore or migrate, as on earlier
-  releases: what it takes is applied and what it does not is dropped, listed
+  archive. An attribute the target cannot store does not fail the restore or
+  migrate, as on earlier releases: no support for it (ZFS with `acltype=off`,
+  NFS), no room for it (`ENOSPC`, `E2BIG`, `ERANGE`: ext4 keeps a file's
+  attributes in one block), an SELinux label the target's policy does not
+  know, or IMA/EVM appraisal refusing a foreign signature. What it takes is
+  applied and what it cannot store is dropped, listed
   in a `ct.attrs.dropped` event, the audit log and a warning. A dropped ACL
   never widens access: the file's group bits narrow to the ACL's own group
-  entry. A dropped capability or label only removes privilege. Any other
-  failure to set an attribute still fails the restore. A directory's metadata
+  entry. A dropped capability or label only removes privilege. A dropped
+  *default* ACL cannot be narrowed: files later created in that directory get
+  the umask's permissions, as on earlier releases. Any other failure — an I/O
+  error, or `EPERM` setting a file capability — still fails the restore. A directory's metadata
   (its default ACL included) is applied after its contents, so files do not
   inherit an ACL the archive did not record for them.
 - **Laid down privately.** The archive is extracted into a `0700` staging

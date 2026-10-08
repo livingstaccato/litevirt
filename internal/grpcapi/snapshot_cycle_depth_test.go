@@ -96,3 +96,48 @@ func TestStartChain_TooDeepNamesTheFix(t *testing.T) {
 		}
 	}
 }
+
+// Round-2 concern 2: libvirt may hold a snapshot litevirt has no record of
+// (left by an earlier failure). Its frozen layer — the disk its domain was
+// on — must not be merged away: the merge stops above it, and the snapshot
+// is named in a WARN.
+func TestDeleteSnapshot_AnUnrecordedLibvirtSnapshotKeepsItsLayer(t *testing.T) {
+	needQemuImg(t)
+	ctx := adminCtx()
+	s, fake := newDiskPathTestServer(t)
+	s.dataDir = t.TempDir()
+	dir := t.TempDir()
+	root := filepath.Join(dir, "un-root.qcow2")
+	orphan := filepath.Join(dir, "un-root.orphan")
+	top := filepath.Join(dir, "un-root.s1")
+	runQemuImg(t, "create", "-q", "-f", "qcow2", root, "1M")
+	runQemuImg(t, "create", "-q", "-f", "qcow2", "-F", "qcow2", "-b", root, orphan)
+	runQemuImg(t, "create", "-q", "-f", "qcow2", "-F", "qcow2", "-b", orphan, top)
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{Name: "un", HostName: "host-a", State: "running"}, nil,
+		[]corrosion.DiskRecord{{VMName: "un", DiskName: "root", HostName: "host-a", Path: root, StorageType: "local"}}); err != nil {
+		t.Fatal(err)
+	}
+	fake.SetDiskSource("un", "vda", root)
+	// libvirt's own snapshot, with no litevirt record.
+	if _, err := fake.CreateSnapshot("un", "orphan"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fake.CreateSnapshot("un", "s1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertSnapshot(ctx, s.db, corrosion.SnapshotRecord{ID: "un-s1", VMName: "un", HostName: "host-a", Name: "s1", State: "ok", Type: "disk"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DeleteSnapshot(ctx, &pb.DeleteSnapshotRequest{VmName: "un", SnapshotName: "s1"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range fake.FlattenBases {
+		if b["vda"] == root {
+			t.Fatalf("merged into %s, the frozen layer of libvirt snapshot \"orphan\" that litevirt has no record of", root)
+		}
+	}
+	srcs, _ := fake.DomainDiskSources("un")
+	if srcs["vda"] != orphan {
+		t.Fatalf("the domain is on %s, want merged down onto %s and no further", srcs["vda"], orphan)
+	}
+}

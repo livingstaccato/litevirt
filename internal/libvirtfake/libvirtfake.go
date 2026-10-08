@@ -60,6 +60,8 @@ type Event struct {
 type Fake struct {
 	// FlattenBases records the bases each FlattenSnapshot call was given.
 	FlattenBases []map[string]string
+	// snapBases: domain → snapshot → the files its disks were on at cutover.
+	snapBases map[string]map[string][]string
 
 	execStdout, execStderr string
 	execExitCode           int32
@@ -1485,6 +1487,17 @@ func (f *Fake) cutoverDisks(domain, snapname string) {
 	if f.diskSources[domain] == nil {
 		f.diskSources[domain] = map[string]string{"vda": "/var/lib/litevirt/disks/" + domain + "-root.qcow2"}
 	}
+	if f.snapBases == nil {
+		f.snapBases = map[string]map[string][]string{}
+	}
+	if f.snapBases[domain] == nil {
+		f.snapBases[domain] = map[string][]string{}
+	}
+	var frozen []string
+	for _, src := range f.diskSources[domain] {
+		frozen = append(frozen, src)
+	}
+	f.snapBases[domain][snapname] = frozen
 	for dev, src := range f.diskSources[domain] {
 		f.diskSources[domain][dev] = strings.TrimSuffix(src, filepath.Ext(src)) + "." + snapname
 	}
@@ -1991,4 +2004,15 @@ func (f *Fake) AbortedMigrations(name string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.abortedMigrations[name]
+}
+
+// SnapshotBaseFiles lists the domain's snapshots with the files each froze.
+func (f *Fake) SnapshotBaseFiles(domainName string) (map[string][]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := map[string][]string{}
+	for name := range f.snapshots[domainName] {
+		out[name] = append([]string(nil), f.snapBases[domainName][name]...)
+	}
+	return out, nil
 }

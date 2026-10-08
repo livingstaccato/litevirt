@@ -96,3 +96,31 @@ func removeMergedLayers(layers []string) []error {
 	}
 	return errs
 }
+
+// SnapshotBaseFiles lists every snapshot libvirt holds for the domain with
+// the files its embedded domain's disks were on (the layers it froze). The
+// snapshot metadata belongs to the domain, so it is the same list whether the
+// domain runs or not.
+func (c *Client) SnapshotBaseFiles(domainName string) (map[string][]string, error) {
+	dom, err := c.virt.DomainLookupByName(domainName)
+	if err != nil {
+		return nil, fmt.Errorf("lookup domain %q: %w", domainName, err)
+	}
+	snaps, _, err := c.virt.DomainListAllSnapshots(dom, -1, 0)
+	if err != nil {
+		return nil, fmt.Errorf("list snapshots of %q: %w", domainName, err)
+	}
+	out := map[string][]string{}
+	for _, sn := range snaps {
+		x, err := c.virt.DomainSnapshotGetXMLDesc(sn, 0)
+		if err != nil {
+			return nil, fmt.Errorf("snapshot %q of %q: %w", sn.Name, domainName, err)
+		}
+		files := []string{}
+		for _, f := range parseSnapshotDomainDisks(x) {
+			files = append(files, f)
+		}
+		out[sn.Name] = files
+	}
+	return out, nil
+}

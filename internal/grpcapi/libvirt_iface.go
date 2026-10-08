@@ -103,6 +103,10 @@ type LibvirtBackend interface {
 	// removes the layers above, and drops the snapshot metadata. The caller
 	// picks bases no other VM uses (snapshotMergeBases).
 	FlattenSnapshot(domainName, snapshotName string, bases map[string]string) error
+	// SnapshotBaseFiles lists every snapshot libvirt holds for the domain
+	// (its own metadata, recorded by litevirt or not) with the files its
+	// embedded domain's disks were on — the layers it froze.
+	SnapshotBaseFiles(domainName string) (map[string][]string, error)
 	// Live/RAM snapshots (#3): capture guest RAM into vmstatePath alongside the
 	// external disk snapshot, and revert both to the snapshot instant.
 	CreateLiveSnapshot(domainName, snapshotName, vmstatePath string, captureSuspended func() error) (diskBytes, vmstateBytes int64, err error)

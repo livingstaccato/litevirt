@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -143,7 +144,12 @@ func (s *Server) layerUsers(ctx context.Context, vmName string, images []string)
 //
 // Any layer that cannot be read, here or in another VM's chain, is an error:
 // nothing is merged when what depends on a layer is unknown.
-func (s *Server) snapshotMergeBases(ctx context.Context, vmName string) (map[string]string, error) {
+//
+// A snapshot libvirt holds that litevirt has no record of (other than
+// deleting, the one being deleted) uses the layers it froze: they, and
+// everything under them, are kept, and the snapshot is named in a WARN. An
+// error listing libvirt's snapshots is an error here too.
+func (s *Server) snapshotMergeBases(ctx context.Context, vmName, deleting string) (map[string]string, error) {
 	images := s.rootsAsFound(filepath.Join(s.dataDir, "images"))
 	srcs, err := s.virt.DomainDiskSources(vmName)
 	if err != nil {
@@ -152,6 +158,30 @@ func (s *Server) snapshotMergeBases(ctx context.Context, vmName string) (map[str
 	users, err := s.layerUsers(ctx, vmName, images)
 	if err != nil {
 		return nil, err
+	}
+	recorded, err := corrosion.ListSnapshots(ctx, s.db, vmName)
+	if err != nil {
+		return nil, err
+	}
+	known := map[string]bool{deleting: true}
+	for _, r := range recorded {
+		known[r.Name] = true
+	}
+	held, err := s.virt.SnapshotBaseFiles(vmName)
+	if err != nil {
+		return nil, fmt.Errorf("list libvirt's snapshots: %w", err)
+	}
+	for name, files := range held {
+		if known[name] {
+			continue
+		}
+		slog.Warn("snapshot merge: libvirt holds a snapshot litevirt has no record of — its layers are kept",
+			"vm", vmName, "libvirt_snapshot", name, "layers", files)
+		for _, f := range files {
+			if strings.HasPrefix(f, "/") {
+				users[resolvedOr(s.hostDiskFile(f))] = append(users[resolvedOr(s.hostDiskFile(f))], "libvirt snapshot "+name)
+			}
+		}
 	}
 	bases := map[string]string{}
 	for dev, top := range srcs {

@@ -460,7 +460,7 @@ func (s *Server) DeleteSnapshot(ctx context.Context, req *pb.DeleteSnapshotReque
 	existing, _ := corrosion.ListSnapshots(ctx, s.db, req.VmName)
 	var bases map[string]string
 	if len(existing) <= 1 && (vm.State == "running" || vm.State == "stopped") {
-		b, err := s.snapshotMergeBases(ctx, req.VmName)
+		b, err := s.snapshotMergeBases(ctx, req.VmName, req.SnapshotName)
 		if err != nil {
 			slog.Warn("delete snapshot: not merging the disk chain — what depends on it is unknown",
 				"vm", req.VmName, "snap", req.SnapshotName, "error", err)

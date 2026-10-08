@@ -907,19 +907,12 @@ func cmdErr(bin, name string, stderr []byte, err error) error {
 // lxc-create unchanged. A directory holding an OCI/umoci bundle (a "rootfs/"
 // subdir) is descended into.
 func resolveRootfs(template string) (path string, ok bool, err error) {
-	p := template
-	explicit := false
-	if strings.HasPrefix(p, "rootfs:") {
-		p, explicit = strings.TrimPrefix(p, "rootfs:"), true
-	}
-	// Only a path-shaped value is a rootfs candidate; a bare name is a
-	// template name for lxc-create.
-	if !explicit && !strings.HasPrefix(p, "/") && !strings.HasPrefix(p, "./") && !strings.HasPrefix(p, "../") {
-		return "", false, nil
-	}
-	abs, aerr := filepath.Abs(p)
+	abs, isPath, aerr := TemplatePath(template)
 	if aerr != nil {
-		return "", false, fmt.Errorf("resolve rootfs path %q: %w", p, aerr)
+		return "", false, aerr
+	}
+	if !isPath {
+		return "", false, nil
 	}
 	if !isDir(abs) {
 		return "", false, fmt.Errorf("rootfs template %q is not an existing directory", template)
@@ -932,6 +925,30 @@ func resolveRootfs(template string) (path string, ok bool, err error) {
 	}
 	if !looksLikeRootfs(abs) {
 		return "", false, fmt.Errorf("rootfs template %q does not look like a root filesystem (no bin//etc//usr/…)", template)
+	}
+	return abs, true, nil
+}
+
+// TemplatePath says whether a create template names a host directory (a
+// pre-extracted rootfs) and, if so, which one, as an absolute path — the path
+// resolveRootfs would read. "rootfs:<p>", an absolute path, and "./" or "../"
+// relative paths (resolved against the daemon's working directory) are paths;
+// "download" and any other bare name are lxc-create template names. Nothing is
+// read from disk, so a caller can judge the path before anything touches it.
+func TemplatePath(template string) (path string, isPath bool, err error) {
+	p := template
+	explicit := false
+	if strings.HasPrefix(p, "rootfs:") {
+		p, explicit = strings.TrimPrefix(p, "rootfs:"), true
+	}
+	// Only a path-shaped value is a rootfs candidate; a bare name is a
+	// template name for lxc-create.
+	if !explicit && !strings.HasPrefix(p, "/") && !strings.HasPrefix(p, "./") && !strings.HasPrefix(p, "../") {
+		return "", false, nil
+	}
+	abs, aerr := filepath.Abs(p)
+	if aerr != nil {
+		return "", true, fmt.Errorf("resolve rootfs path %q: %w", p, aerr)
 	}
 	return abs, true, nil
 }

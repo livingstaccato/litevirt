@@ -81,6 +81,12 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		s.audit(ctx, "ct.create", req.Name, "project="+tenancy.NormalizeProject(req.Project), "denied")
 		return nil, err
 	}
+	// A host-path template needs the host-path authority (judged here, where
+	// the caller is real); the reading host refuses protected places below.
+	if err := s.authorizeContainerTemplate(ctx, req.Template); err != nil {
+		s.audit(ctx, "ct.create", req.Name, "template="+req.Template, "denied")
+		return nil, err
+	}
 	// Idempotency: replay a completed create on a lost-response retry (see CreateVM).
 	// Placed before the forward so a retry replays without re-forwarding; recorded
 	// on success across all return paths.
@@ -120,6 +126,10 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		return nil, status.Error(codes.Unavailable, "container runtime not wired on this host")
 	}
 	if err := s.refuseNoContainerRuntime(ctx, s.hostName); err != nil {
+		return nil, err
+	}
+	if err := s.checkContainerTemplate(req.Template); err != nil {
+		s.audit(ctx, "ct.create", req.Name, "template="+req.Template, "denied")
 		return nil, err
 	}
 
@@ -713,6 +723,9 @@ func (s *Server) PullOCIImage(ctx context.Context, req *pb.PullOCIImageRequest) 
 			return nil, status.Errorf(codes.InvalidArgument, "invalid --dest: %v", err)
 		}
 		req.Dest = resolved
+	}
+	if err := s.checkOCIPullPaths(req.Image, req.Dest); err != nil {
+		return nil, err
 	}
 	if err := s.containerRuntime.PullOCIImage(ctx, req.Image, req.Dest, req.Tag, req.Username, req.Password); err != nil {
 		return nil, status.Errorf(codes.Internal, "pull oci: %v", err)

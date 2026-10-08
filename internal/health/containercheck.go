@@ -16,6 +16,7 @@ import (
 	"github.com/litevirt/litevirt/internal/events"
 	"github.com/litevirt/litevirt/internal/lxc"
 	"github.com/litevirt/litevirt/internal/network"
+	"github.com/litevirt/litevirt/internal/storage"
 )
 
 const containerCheckInterval = 15 * time.Second
@@ -80,6 +81,9 @@ type ContainerChecker struct {
 	// (<root>/<name>/owner_epoch). Empty disables marker writes (fixture
 	// checkers that predate markers); the daemon wires the real path.
 	containersRoot string
+	// dataDir / pkiDir are the daemon's own directories, which a relocation's
+	// rootfs template may not name (storage.CheckReadDir). See SetDaemonDirs.
+	dataDir, pkiDir string
 
 	// replicaCaughtUp, orphans and onOrphans serve the orphan-runtime report
 	// (orphan_runtime.go). A nil replicaCaughtUp is unwired and trusted.
@@ -99,6 +103,12 @@ func (c *ContainerChecker) SetEventBus(bus *events.Bus) { c.bus = bus }
 
 // SetContainersRoot wires the directory Phase 4 owner-epoch markers live under.
 func (c *ContainerChecker) SetContainersRoot(root string) { c.containersRoot = root }
+
+// SetDaemonDirs wires the daemon's data and PKI directories, which a
+// relocation recreate refuses as a rootfs template.
+func (c *ContainerChecker) SetDaemonDirs(dataDir, pkiDir string) {
+	c.dataDir, c.pkiDir = dataDir, pkiDir
+}
 
 // SetGuardedContainerRekeyActive injects the cheap configured+latch decision
 // used to select modern guarded re-key WAL shapes.
@@ -317,6 +327,21 @@ func (c *ContainerChecker) recreateRelocated(ctx context.Context, ct corrosion.C
 	if spec.Template != "" {
 		opts.Template = spec.Template
 		opts.Distro, opts.Release, opts.Arch = spec.Distro, spec.Release, spec.Arch
+	}
+	// The template is a host path the recreating host reads, judged here by
+	// the same backstop the create's reading host applied: a protected place
+	// is refused whoever created the container. The row stays pending, so an
+	// operator sees it and nothing is copied.
+	if p, isPath, perr := lxc.TemplatePath(opts.Template); isPath {
+		if perr == nil {
+			perr = storage.CheckReadDir(p, c.dataDir, c.pkiDir)
+		}
+		if perr != nil {
+			slog.Error("containercheck: relocate-recreate refused: its rootfs template is a protected host path",
+				"container", ct.Name, "template", opts.Template, "error", perr)
+			c.publish("ct.relocate.failed", ct.Name, perr.Error())
+			return
+		}
 	}
 	var ifs []corrosion.ContainerInterfaceRecord
 	for i, n := range spec.Networks {

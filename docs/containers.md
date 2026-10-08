@@ -28,17 +28,17 @@ Three reasons:
 ## CLI quickstart
 
 ```
-# Pull an image into the container's directory. umoci unpacks the flattened
-# rootfs to <dest>/rootfs, so point --dest at /var/lib/lxc/<name>.
+# Pull an image into the daemon's OCI library. A bare --dest name stages the
+# image under <data_dir>/oci/<name> on the host that unpacks it.
 # (add --local to unpack on the host you're on, without the daemon)
-lv ct pull docker.io/library/nginx:1.27 --dest /var/lib/lxc/web
+lv ct pull docker.io/library/nginx:1.27 --dest nginx
 
-# Create the container from the unpacked rootfs. --template accepts the bundle
+# Create the container from the library item. --template accepts the bundle
 # dir (descends into rootfs/) or a rootfs path; the LXC config is generated.
 # The template rootfs is COPIED into the container's own <lxcpath>/<name>/rootfs,
 # so the pulled template stays intact — reuse it for many containers, and
 # `lv ct rm` only removes that container's copy, never the template.
-lv ct create web --template /var/lib/lxc/web
+lv ct create web --template /var/lib/litevirt/oci/nginx
 
 # Start, exec, stop, delete
 lv ct start web
@@ -46,6 +46,34 @@ lv ct exec web -- nginx -t
 lv ct stop web --timeout 10
 lv ct rm web
 ```
+
+### Host paths a container is given
+
+A rootfs template is copied whole into the new container, and a local
+`oci:<dir>` source is unpacked by root, so naming either is reading a host
+directory as root. Container inputs follow the same rules as a VM's host
+paths:
+
+- Anyone with `ct.create` may name an **OCI library item**: exactly
+  `<data_dir>/oci/<name>` or its `rootfs/`, the directory `lv ct pull --dest
+  <name>` staged. A deeper path, or a library name that is a link out of the
+  library, is not an item.
+- Any other host path (`--template /srv/rootfs`, `rootfs:<path>`, a relative
+  path, an absolute `lv ct pull --dest`, a local `oci:` source) needs
+  `storage.hostpath` at the cluster root — the Admin role.
+- Whoever asks, a template or OCI source may not be under, or contain, a
+  directory that holds host secrets or live state (`/etc`, `/boot`, `/dev`,
+  `/proc`, `/sys`, `/var/backups`, `/var/spool`, `/var/lib/lxc`, libvirt's
+  per-domain state), the daemon's PKI directory, or its data directory apart
+  from `pools/`, `mounts/`, `disks/uploads/` and `oci/`. `/home`, `/root` and
+  `/run` themselves, a whole home directory, and a link into a dot-directory
+  are refused too. An absolute pull `--dest` follows the pool rule for a
+  directory the daemon writes into, except that the OCI library itself is the
+  daemon's own. A template name (`download`, `busybox`) may not contain `/`;
+  name a path as `rootfs:<path>`.
+- A host-loss relocation that recreates a container from its template judges
+  the template again on the recreating host. A refused template leaves the
+  container pending, with a `ct.relocate.failed` event, and copies nothing.
 
 For a download-template container (no OCI image required):
 
@@ -116,7 +144,7 @@ lv registry ls
 lv registry rm ghcr.io
 
 # Pull a private image — credentials are resolved automatically
-lv ct pull ghcr.io/acme/api:1.4 --dest /var/lib/lxc/api
+lv ct pull ghcr.io/acme/api:1.4 --dest api
 ```
 
 The registry argument is a host (`docker.io`, `ghcr.io`,
@@ -129,7 +157,7 @@ is no daemon to resolve a stored credential:
 
 ```
 echo "$TOKEN" | lv ct pull ghcr.io/acme/api:1.4 \
-    --dest /var/lib/lxc/api --username me --password-stdin
+    --dest api --username me --password-stdin
 ```
 
 Credentials can also be managed from the web UI at **Account → Registry

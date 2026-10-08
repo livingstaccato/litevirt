@@ -236,8 +236,10 @@ removes them. Placement is **LXC-aware** — containers are only scheduled onto
 hosts that advertise the container runtime, so they never land on a node that
 can't run them. Image forms: `kind: lxc` takes a download template (`image:
 "alpine:3.21"`) or a rootfs path; an OCI **registry ref** must be pre-pulled
-today (`lv ct pull <ref> --dest <rootfs-dir>`, then set `image:` to that rootfs
-path). Each container is given its own copy of the rootfs, so one pull backs any
+today (`lv ct pull <ref> --dest <name>`, then set `image:` to the library item
+`<data_dir>/oci/<name>`; any other rootfs path is a host path the deploying
+caller needs the Admin role to name — see "Host paths a container is given" in
+[containers.md](containers.md)). Each container is given its own copy of the rootfs, so one pull backs any
 number of containers and `compose down` leaves the pulled template untouched.
 Remaining follow-ups: OCI registry-ref auto-pull; in-place reconfigure
 (cpu/mem changes recreate the container rather than live-tuning); and full

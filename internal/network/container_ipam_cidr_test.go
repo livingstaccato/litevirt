@@ -1,7 +1,12 @@
 package network
 
 import (
+	"bytes"
 	"context"
+	"log"
+	"log/slog"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -106,4 +111,79 @@ func insertLegacyLease(t *testing.T, db *corrosion.Client, netName, ip, owner st
 		netName, ip, owner, db.NowTS()); err != nil {
 		t.Fatalf("insert legacy lease: %v", err)
 	}
+}
+
+// M1: two containers that already shared one address on main (rows
+// "172.16.77.50/24" and "172.16.77.50") must each keep it when rebuilt —
+// restore or relocation — after the upgrade, with a WARN about the duplicate.
+// Only a NEW allocation of the address is refused.
+func TestReserveContainerNICs_LegacyAliasSurvivesRebuild(t *testing.T) {
+	ctx := context.Background()
+	db := cidrTestDB(t)
+	insertLegacyLease(t, db, "lxtnet", "172.16.77.50/24", "lxt3")
+	insertLegacyLease(t, db, "lxtnet", "172.16.77.50", "lxt4")
+
+	// lxt3 is removed and restored: its lease is released, lxt4's stays.
+	if err := ReleaseContainerLeases(ctx, db, "node-3", "lxt3"); err != nil {
+		t.Fatal(err)
+	}
+	logs := captureWarn(t)
+	unreserved, err := ReserveContainerNICs(ctx, db, "node-3", "lxt3", []corrosion.ContainerInterfaceRecord{
+		{NetworkName: "lxtnet", IP: "172.16.77.50/24", MAC: "mac-3"},
+	})
+	if err != nil || unreserved != 0 {
+		t.Fatalf("rebuild of a container in a pre-existing alias lost its address: unreserved=%d err=%v", unreserved, err)
+	}
+	if ok, _ := ipLeaseHeldBy(ctx, db, "lxtnet", "172.16.77.50", "ct", "node-3", "lxt3"); !ok {
+		t.Fatal("lxt3 does not hold its lease after the rebuild")
+	}
+	if !strings.Contains(logs.String(), "level=WARN") || !strings.Contains(logs.String(), "lxt4") {
+		t.Fatalf("no WARN naming the other holder: %q", logs.String())
+	}
+
+	// A new container asking for the address is still refused, in either spelling.
+	for _, ip := range []string{"172.16.77.50", "172.16.77.50/24"} {
+		if ok, err := ReserveContainerIP(ctx, db, "lxtnet", ip, "mac-9", "node-3", "lxt9"); err != nil || ok {
+			t.Fatalf("new allocation of %s over the alias: ok=%v err=%v", ip, ok, err)
+		}
+	}
+}
+
+// A rebuild whose address is held by another owner under the SAME spelling
+// was refused on main, and still is.
+func TestReserveContainerNICs_SameSpellingConflictStillRefused(t *testing.T) {
+	ctx := context.Background()
+	db := cidrTestDB(t)
+	insertLegacyLease(t, db, "lxtnet", "172.16.77.50", "lxt4")
+	logs := captureWarn(t)
+	unreserved, _ := ReserveContainerNICs(ctx, db, "node-3", "lxt3", []corrosion.ContainerInterfaceRecord{
+		{NetworkName: "lxtnet", IP: "172.16.77.50", MAC: "mac-3"},
+	})
+	if unreserved != 1 {
+		t.Fatalf("rebuild over a same-spelling live lease: unreserved=%d, want 1", unreserved)
+	}
+	if strings.Contains(logs.String(), "keeping it for this rebuild") {
+		t.Fatalf("a refused rebuild claimed to keep the address: %q", logs.String())
+	}
+}
+
+type warnBuf struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (w *warnBuf) Write(p []byte) (int, error) { w.mu.Lock(); defer w.mu.Unlock(); return w.b.Write(p) }
+func (w *warnBuf) String() string              { w.mu.Lock(); defer w.mu.Unlock(); return w.b.String() }
+
+func captureWarn(t *testing.T) *warnBuf {
+	t.Helper()
+	w := &warnBuf{}
+	prev, prevW, prevF := slog.Default(), log.Writer(), log.Flags()
+	slog.SetDefault(slog.New(slog.NewTextHandler(w, nil)))
+	t.Cleanup(func() {
+		slog.SetDefault(prev)
+		log.SetOutput(prevW)
+		log.SetFlags(prevF)
+	})
+	return w
 }

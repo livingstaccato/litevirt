@@ -327,7 +327,7 @@ func (c *ContainerChecker) recreateRelocated(ctx context.Context, ct corrosion.C
 		veth := corrosion.ContainerVethName(ct.Name, i)
 		ip := n.IP
 		if ip != "" {
-			if ok, rerr := network.ReserveContainerIP(ctx, c.db, n.NetworkName, ip, n.MAC, c.hostName, ct.Name); rerr != nil || !ok {
+			if ok, rerr := network.ReserveContainerIPForRebuild(ctx, c.db, n.NetworkName, ip, n.MAC, c.hostName, ct.Name); rerr != nil || !ok {
 				if rerr != nil {
 					slog.Warn("containercheck: relocate IP reserve errored; using DHCP", "container", ct.Name, "ip", ip, "error", rerr)
 				}

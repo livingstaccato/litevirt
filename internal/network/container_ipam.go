@@ -3,6 +3,7 @@ package network
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -25,9 +26,52 @@ import (
 // refuses the reserve — rather than rewritten.
 func ReserveContainerIP(ctx context.Context, db *corrosion.Client, network, ip, mac, host, ctName string) (bool, error) {
 	ip = LeaseAddr(ip)
-	if taken, err := hostAddrHeldByOther(ctx, db, network, ip, "ct", host, ctName); err != nil || taken {
+	if others, err := hostAddrHoldersOther(ctx, db, network, ip, "ct", host, ctName); err != nil || len(others) > 0 {
 		return false, err
 	}
+	return reserveContainerLease(ctx, db, network, ip, mac, host, ctName)
+}
+
+// ReserveContainerIPForRebuild re-reserves an address a container ALREADY had
+// (its own create spec or interface row): a restore, a relocation. It refuses
+// what a rebuild was refused before this release — the same address text held
+// live by another owner — but not an alias that release allowed: another owner
+// holding the same host address under a DIFFERENT spelling ("x/24" vs "x").
+// Two workloads in that state both kept their address on every rebuild, and
+// refusing it now would strip a static address from a running workload on its
+// next restore or failover. The duplicate is kept, under this container's own
+// spelling, and logged as a WARN naming both owners so an operator can
+// reassign one. A NEW allocation (ReserveContainerIP) is always refused.
+func ReserveContainerIPForRebuild(ctx context.Context, db *corrosion.Client, network, ip, mac, host, ctName string) (bool, error) {
+	raw := strings.TrimSpace(ip)
+	norm := LeaseAddr(raw)
+	others, err := hostAddrHoldersOther(ctx, db, network, norm, "ct", host, ctName)
+	if err != nil {
+		return false, err
+	}
+	if len(others) == 0 {
+		return reserveContainerLease(ctx, db, network, norm, mac, host, ctName)
+	}
+	for _, o := range others {
+		if o.IP == raw {
+			// The same text held by another owner: refused before this
+			// release too, and not a duplicate this rebuild keeps.
+			return false, nil
+		}
+	}
+	for _, o := range others {
+		slog.Warn("container IP is shared with another workload (allowed before this release); "+
+			"keeping it for this rebuild — reassign one of them",
+			"network", network, "ip", norm, "ct", ctName, "host", host,
+			"other", o.Name, "other_kind", o.Kind, "other_host", o.Host)
+	}
+	return reserveContainerLease(ctx, db, network, raw, mac, host, ctName)
+}
+
+// reserveContainerLease writes (or resurrects, or idempotently refreshes) the
+// lease keyed key for (ct, host, ctName), never touching a live lease of
+// another owner, and reports whether this owner holds it afterwards.
+func reserveContainerLease(ctx context.Context, db *corrosion.Client, network, ip, mac, host, ctName string) (bool, error) {
 	now := db.NowTS()
 	allocAt := time.Now().UTC().Format(time.RFC3339)
 	// Resurrect a tombstone, or idempotently refresh OUR OWN live lease; never
@@ -148,7 +192,7 @@ func ReserveContainerNICs(ctx context.Context, db *corrosion.Client, host, ctNam
 		if ifc.IP == "" {
 			continue
 		}
-		reserved, err := ReserveContainerIP(ctx, db, ifc.NetworkName, ifc.IP, ifc.MAC, host, ctName)
+		reserved, err := ReserveContainerIPForRebuild(ctx, db, ifc.NetworkName, ifc.IP, ifc.MAC, host, ctName)
 		if err != nil {
 			if firstErr == nil {
 				firstErr = err
@@ -168,26 +212,33 @@ func ReserveContainerNICs(ctx context.Context, db *corrosion.Client, host, ctNam
 	return unreserved, firstErr
 }
 
-// hostAddrHeldByOther reports whether a LIVE lease on network names the same
-// host address as ip under any spelling, and is owned by someone other than
+// leaseHolder is one live lease's owner and its stored address text.
+type leaseHolder struct {
+	IP, Name, Kind, Host string
+}
+
+// hostAddrHoldersOther returns the LIVE leases on network that name the same
+// host address as ip under any spelling and are owned by someone other than
 // (kind, host, name). It is the read-time half of the non-aliasing guarantee:
 // the (network, ip) primary key only catches an identical spelling.
-func hostAddrHeldByOther(ctx context.Context, db *corrosion.Client, network, ip, ownerKind, ownerHost, name string) (bool, error) {
+func hostAddrHoldersOther(ctx context.Context, db *corrosion.Client, network, ip, ownerKind, ownerHost, name string) ([]leaseHolder, error) {
 	rows, err := db.Query(ctx,
 		`SELECT ip, vm_name, COALESCE(owner_kind, 'vm') AS owner_kind, COALESCE(owner_host, '') AS owner_host
 		 FROM ip_allocations WHERE network = ? AND deleted_at IS NULL`, network)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	want := LeaseAddr(ip)
+	var out []leaseHolder
 	for _, r := range rows {
 		if LeaseAddr(r.String("ip")) != want {
 			continue
 		}
-		if r.String("vm_name") == name && r.String("owner_kind") == ownerKind && r.String("owner_host") == ownerHost {
+		h := leaseHolder{IP: r.String("ip"), Name: r.String("vm_name"), Kind: r.String("owner_kind"), Host: r.String("owner_host")}
+		if h.Name == name && h.Kind == ownerKind && h.Host == ownerHost {
 			continue
 		}
-		return true, nil
+		out = append(out, h)
 	}
-	return false, nil
+	return out, nil
 }

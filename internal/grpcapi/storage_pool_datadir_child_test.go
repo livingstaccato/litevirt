@@ -103,3 +103,21 @@ func TestPoolDataDirChild_CreateThereIsAnAdminsHostPath(t *testing.T) {
 		})
 	}
 }
+
+// lab-recheck-5 line 76: a sibling of the data directory
+// (/var/lib/litevirt-labtest) is an ordinary host path now, so naming it
+// still takes storage.hostpath: a project operator is refused before anything
+// on the host is looked at.
+func TestPoolDataDirChild_ASiblingStillNeedsHostPathAuthority(t *testing.T) {
+	s := newPoolTestServer(t)
+	pat := hostPathEngineCtx(t, s, "pat", "Operator", projectRBACBase("acme"))
+	for name, req := range map[string]*pb.CreateStoragePoolRequest{
+		"btrfs source": {Driver: "btrfs", Source: "/var/lib/litevirt-labtest/btrfs"},
+		"dir target":   {Driver: "dir", Target: "/var/lib/litevirt-labtest/x"},
+	} {
+		req.Name, req.Project = "p", "acme"
+		if _, err := s.CreateStoragePool(pat, req); status.Code(err) != codes.PermissionDenied {
+			t.Errorf("%s: a project operator naming /var/lib/litevirt-labtest: got %v, want PermissionDenied", name, err)
+		}
+	}
+}

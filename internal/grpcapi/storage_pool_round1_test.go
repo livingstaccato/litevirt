@@ -184,7 +184,7 @@ func TestPoolContents_NewTargetlessLocalPoolGetsItsOwnDirectory(t *testing.T) {
 // Minor: more directories refused to everyone.
 func TestPoolHostPath_MoreProtectedDirectories(t *testing.T) {
 	s := newPoolTestServer(t)
-	for _, target := range []string{"/home/someone/vms", "/var/lib/libvirt/images", "/var/lib/litevirt-old/disks"} {
+	for _, target := range []string{"/home/someone/vms", "/var/lib/libvirt/images", "/var/lib/litevirt-gitops/repo", "/var/lib/litevirt/state.db"} {
 		t.Run(target, func(t *testing.T) {
 			if _, err := s.CreateStoragePool(adminCtx(), &pb.CreateStoragePoolRequest{Name: "p", Driver: "local", Target: target}); status.Code(err) != codes.InvalidArgument {
 				t.Fatalf("got %v, want InvalidArgument", err)

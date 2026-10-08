@@ -120,11 +120,19 @@ var systemRoots = []string{
 	"/var/lib/libvirt", "/var/run", "/var/spool",
 }
 
-// litevirtVarLibPrefix refuses /var/lib/litevirt and every /var/lib/litevirt-*
-// (an old or side-by-side install's state, /var/lib/litevirt-gitops) outside
-// the configured data directory, which is judged child by child
-// (dataDirChildRefusal).
-const litevirtVarLibPrefix = "litevirt"
+// defaultDataDir is the daemon's default data_dir (daemon/config.go). It is
+// judged like the configured data directory whatever data_dir says: the
+// backup session's scratch and socket directories are hardcoded under it
+// (libvirt/backup_session.go), and an install that moved its data_dir may
+// have left its state there. It is compared by whole path components —
+// /var/lib/litevirt or /var/lib/litevirt/… — never as a string prefix, so a
+// sibling such as /var/lib/litevirt-labtest is an ordinary host path.
+const defaultDataDir = "/var/lib/litevirt"
+
+// litevirtStateRoots are other directories of litevirt's own state outside
+// the data directory, refused with everything in them: the gitops working
+// tree's default home (gitops.go Config.LocalDir, `lv gitops --local-dir`).
+var litevirtStateRoots = []string{"/var/lib/litevirt-gitops"}
 
 // dataDirPoolAreas are the parts of the daemon's data directory a pool may
 // live in: mounts/ holds the NFS mounts the daemon makes itself, and
@@ -181,15 +189,17 @@ var dataDirOwned = []string{
 	"genesis-pending",        // daemon.go genesisMarkerName; host_init.go genesisMarkerScript
 	"pool-uploads.json",      // storage_pool_confine.go poolUploadsFile
 	"nowts.hwm",              // corrosion/hwm.go (and nowts.hwm.lock)
+	"split_brain_activated",  // health/capability.go ActivationMarkerBase (markers are .<token>)
 }
 
-// dataDirOwnedPrefixes are owned by name prefix: state.db's WAL, SHM and
-// journal; one capability latch per token (health/capability.go
-// ActivationMarkerPrefix, split_brain_activated.<token>); nowts.hwm.lock; and
+// dataDirOwnedPrefixes are owned by name prefix, each judged within one path
+// component: state.db's WAL, SHM and journal (state.db-wal); one capability
+// latch per token (health/capability.go ActivationMarkerPrefix,
+// split_brain_activated.<token>); nowts.hwm.lock; and
 // every dot-name, which is how the daemon names its temp files there
 // (secretfile.Write's .<name>.tmp, storage_pool_confine.go's
 // .pool-uploads.json-*).
-var dataDirOwnedPrefixes = []string{"state.db", "split_brain_activated", "nowts.hwm", "."}
+var dataDirOwnedPrefixes = []string{"state.db-", "split_brain_activated.", "nowts.hwm.", "."}
 
 // DataDirOwned returns the exact names of dataDirOwned.
 func DataDirOwned() []string { return slices.Clone(dataDirOwned) }
@@ -300,8 +310,12 @@ func CheckWriteRoot(p, dataDir, pkiDir string) error {
 				}
 			}
 		}
-		if underLitevirtVarLib(cand) && !inAnyDataDir(dataDir, cand) {
-			return fmt.Errorf("%q is under /var/lib/%s*, litevirt state", p, litevirtVarLibPrefix)
+		for _, root := range litevirtStateRoots {
+			for _, r := range pathForms(root) {
+				if within(r, cand) {
+					return fmt.Errorf("%q is under %s, litevirt state", p, root)
+				}
+			}
 		}
 		if pkiDir != "" {
 			for _, d := range pathForms(pkiDir) {
@@ -310,12 +324,12 @@ func CheckWriteRoot(p, dataDir, pkiDir string) error {
 				}
 			}
 		}
-		if dataDir != "" {
-			for _, d := range pathForms(dataDir) {
+		for _, dd := range dataDirsToJudge(dataDir) {
+			for _, d := range pathForms(dd) {
 				if within(cand, d) {
-					return fmt.Errorf("%q is the daemon's data directory %s or contains it", p, dataDir)
+					return fmt.Errorf("%q is the daemon's data directory %s or contains it", p, dd)
 				}
-				if err := dataDirChildRefusal(p, d, cand, dataDir); err != nil {
+				if err := dataDirChildRefusal(p, d, cand, dd); err != nil {
 					return err
 				}
 			}
@@ -417,27 +431,13 @@ func DirsOverlap(a, b string) bool {
 	return false
 }
 
-func underLitevirtVarLib(p string) bool {
-	rel, err := filepath.Rel("/var/lib", p)
-	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
-		return false
+// dataDirsToJudge is the configured data directory and defaultDataDir.
+func dataDirsToJudge(dataDir string) []string {
+	out := []string{defaultDataDir}
+	if dataDir != "" && filepath.Clean(dataDir) != defaultDataDir {
+		out = append(out, dataDir)
 	}
-	first, _, _ := strings.Cut(rel, string(filepath.Separator))
-	return strings.HasPrefix(first, litevirtVarLibPrefix)
-}
-
-// inAnyDataDir reports whether p is the data directory or inside it, judged
-// against the data directory as written and resolved.
-func inAnyDataDir(dataDir, p string) bool {
-	if dataDir == "" {
-		return false
-	}
-	for _, d := range pathForms(dataDir) {
-		if within(d, p) {
-			return true
-		}
-	}
-	return false
+	return out
 }
 
 // The strict forms a pool's Source and identifying options must take. Each

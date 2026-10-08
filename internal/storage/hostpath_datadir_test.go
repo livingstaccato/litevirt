@@ -76,17 +76,49 @@ func TestCheckWriteRoot_TheDaemonsOwnStateIsRefusedToEveryone(t *testing.T) {
 			t.Errorf("%s (a link into <data_dir>/pki) allowed", p)
 		}
 	}
-	// Default layout, lexically: another install's state stays refused, and
-	// so do the paths the daemon hardcodes under /var/lib/litevirt.
-	for _, p := range []string{"/var/lib/litevirt-gitops/repo", "/var/lib/litevirt-old/x",
-		"/var/lib/litevirt/backup-scratch", "/var/lib/litevirt/backup-sock", "/var/lib/litevirt/state.db"} {
-		if err := CheckWriteRoot(p, "/var/lib/litevirt", "/etc/litevirt/pki"); err == nil {
-			t.Errorf("%s allowed with the default data dir", p)
+	// Default layout, lexically: the gitops working tree's default home and
+	// the paths the daemon hardcodes under /var/lib/litevirt stay refused —
+	// with the data dir there or elsewhere, since they do not follow it.
+	for _, dd := range []string{"/var/lib/litevirt", data} {
+		for _, p := range []string{"/var/lib/litevirt-gitops", "/var/lib/litevirt-gitops/repo",
+			"/var/lib/litevirt/backup-scratch", "/var/lib/litevirt/backup-sock", "/var/lib/litevirt/state.db",
+			"/var/lib/litevirt", "/var/lib"} {
+			if err := CheckWriteRoot(p, dd, "/etc/litevirt/pki"); err == nil {
+				t.Errorf("%s allowed with data dir %s", p, dd)
+			}
 		}
 	}
-	// With the data dir elsewhere, /var/lib/litevirt is still litevirt state.
-	if err := CheckWriteRoot("/var/lib/litevirt/rc5pool", data, ""); err == nil {
-		t.Error("/var/lib/litevirt/rc5pool allowed when it is not the data dir")
+}
+
+// lab-recheck-5 line 76: a btrfs pool source /var/lib/litevirt-labtest/btrfs
+// was refused as "under /var/lib/litevirt*, litevirt state" — a string-prefix
+// match that caught a SIBLING of the data directory. The data directory is
+// judged by whole path components: <data_dir> itself or <data_dir>/…; a
+// sibling whose name merely starts the same is an ordinary host path, as on
+// main. (Only an admin may name it; that is grpcapi's authority check.)
+//
+// Red against 63ea3a06: `"/var/lib/litevirt-labtest/btrfs" is under
+// /var/lib/litevirt*, litevirt state`.
+func TestCheckWriteRoot_ASiblingOfTheDataDirIsNotInsideIt(t *testing.T) {
+	for _, dd := range []string{"/var/lib/litevirt", t.TempDir()} {
+		for _, p := range []string{"/var/lib/litevirt-labtest/btrfs", "/var/lib/litevirt-labtest",
+			"/var/lib/litevirt2/x", "/var/lib/litevirt.old/x"} {
+			if err := CheckWriteRoot(p, dd, "/etc/litevirt/pki"); err != nil {
+				t.Errorf("%s (data dir %s): %v", p, dd, err)
+			}
+		}
+		if err := CheckConfig(Config{Driver: "btrfs", Source: "/var/lib/litevirt-labtest/btrfs"}, dd, "/etc/litevirt/pki"); err != nil {
+			t.Errorf("btrfs source /var/lib/litevirt-labtest/btrfs (data dir %s): %v", dd, err)
+		}
+	}
+	// The same with a data dir of any name: its sibling is not inside it.
+	base := t.TempDir()
+	data := filepath.Join(base, "litevirt")
+	if err := CheckWriteRoot(filepath.Join(base, "litevirt-labtest", "x"), data, ""); err != nil {
+		t.Errorf("a sibling of the data dir: %v", err)
+	}
+	if err := CheckWriteRoot(filepath.Join(data, "pki"), data, ""); err == nil {
+		t.Error("<data_dir>/pki allowed")
 	}
 }
 

@@ -139,10 +139,9 @@ with `-`.
 Some directories are refused to everyone, `Admin` included: the filesystem
 root; anything under `/bin`, `/boot`, `/dev`, `/etc`, `/home`, `/lib*`,
 `/proc`, `/root`, `/run`, `/sbin`, `/sys`, `/usr`, `/var/lib/libvirt`,
-`/var/run` or `/var/spool`; `/var/lib/litevirt` and any `/var/lib/litevirt-*`
-other than the data directory's own children (below); the daemon's PKI
-directory; the data directory and any directory containing it; and, inside
-the data directory, the daemon's own state: every child the daemon creates
+`/var/run` or `/var/spool`; `/var/lib/litevirt-gitops` (the gitops working
+tree's default home); the daemon's PKI directory; the data directory and any
+directory containing it; and, inside the data directory, the daemon's own state: every child the daemon creates
 there (`state.db` and its WAL, `pki`, `vms`, `images`, `imports`,
 `cloudinit`, `nvram`, `iso-identity`, the audit and capability markers, any
 dot-name, … — `dataDirOwned` in `internal/storage/hostpath.go` is the list)
@@ -150,7 +149,11 @@ and anything in one, anything inside `disks/` (a pool may be `disks/`
 itself), and the roots of the `mounts/` and `pools/` areas (a pool is a
 directory inside one). Any other directory in the data directory —
 `/var/lib/litevirt/fastpool`, as earlier releases allowed — is an ordinary
-host path: an admin may name it, and nobody else. The list is a backstop, not exhaustive: `/opt`, `/srv`,
+host path: an admin may name it, and nobody else. `/var/lib/litevirt`, the
+default data directory, is judged the same way even when `data_dir` is
+elsewhere (the backup session keeps its scratch there). The data directory
+is compared by whole path components, so a sibling such as
+`/var/lib/litevirt-labtest` is an ordinary host path too. The list is a backstop, not exhaustive: `/opt`, `/srv`,
 `/var/log` and `/var/tmp` are left to the admin who names them. A target
 is judged both as written and after resolving symlinks, so a link at an
 innocent name does not reach a refused directory. Authority is checked on the

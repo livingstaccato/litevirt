@@ -544,3 +544,32 @@ func (s *Server) DeleteSnapshot(ctx context.Context, req *pb.DeleteSnapshotReque
 	s.recordVMEvent(ctx, req.VmName, "snapshot.deleted", "ok", req.SnapshotName)
 	return &emptypb.Empty{}, nil
 }
+
+// removeVMSnapshotRAMImages removes, for a VM being deleted with its disks,
+// the RAM images its memory snapshots' records on this host name. A snapshot
+// whose delete failed keeps its record and its image, and nothing else ever
+// removed it: on the lab `lv rm -f` left a 192 MB <vm>-<snap>.save behind
+// (snapshot-repro.md). Only the path this host gives that VM's snapshot is
+// removed, never another file a record names, and never by a name pattern,
+// which another VM's name can match.
+func (s *Server) removeVMSnapshotRAMImages(ctx context.Context, vmName string) {
+	snaps, err := corrosion.ListSnapshots(ctx, s.db, vmName)
+	if err != nil {
+		slog.Warn("delete: cannot list the VM's snapshots; their RAM images are kept", "vm", vmName, "error", err)
+		return
+	}
+	for _, sn := range snaps {
+		if sn.VMStatePath == "" || (sn.HostName != "" && sn.HostName != s.hostName) {
+			continue
+		}
+		own, err := lv.SafeVMStatePath(s.dataDir, vmName, sn.Name)
+		if err != nil || filepath.Clean(sn.VMStatePath) != own {
+			slog.Warn("delete: a snapshot record names a RAM image that is not this VM's; kept",
+				"vm", vmName, "snapshot", sn.Name, "path", sn.VMStatePath)
+			continue
+		}
+		if err := os.Remove(own); err != nil && !os.IsNotExist(err) {
+			slog.Warn("delete: remove snapshot RAM image", "vm", vmName, "snapshot", sn.Name, "path", own, "error", err)
+		}
+	}
+}

@@ -175,3 +175,56 @@ func TestDeleteSnapshot_RefusedWhileARecordedCloneElsewhereBacksOnIt(t *testing.
 	}
 	f.requireRefusedFor(t, f.deleteS1(), "far-clone")
 }
+
+func (f *snapUsersFixture) restoreS1() error {
+	_, err := f.s.RestoreSnapshot(adminCtx(), &pb.RestoreSnapshotRequest{VmName: "src", SnapshotName: "s1"})
+	return err
+}
+
+func (f *snapUsersFixture) reverted() bool {
+	for _, e := range f.fake.EventLog() {
+		if e.Domain == "src" && (e.Op == "revert" || e.Op == "revert-live") {
+			return true
+		}
+	}
+	return false
+}
+
+// Review C-1: a restore resets the VM's live overlay — removes it and
+// creates an empty file in its place — and starts the VM on it. A linked
+// clone of the stopped source backs on that very file (scenario 3's
+// setup): its clusters would then sit over a different, empty base that the
+// source writes into, and the clone's disk is silently corrupt. The restore
+// is refused, naming the clone, before anything is torn down.
+func TestRestoreSnapshot_RefusedWhileALinkedCloneBacksOnTheLiveOverlay(t *testing.T) {
+	for _, recorded := range []bool{true, false} {
+		t.Run(map[bool]string{true: "recorded", false: "header only"}[recorded], func(t *testing.T) {
+			f := newSnapUsersFixture(t, "stopped")
+			rec := ""
+			if recorded {
+				rec = f.overlay
+			}
+			f.vmOn(t, "sr10c", f.overlay, rec)
+			err := f.restoreS1()
+			if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "sr10c") {
+				t.Fatalf("RestoreSnapshot = %v, want FailedPrecondition naming sr10c", err)
+			}
+			if f.reverted() {
+				t.Fatal("the revert ran: it resets the overlay the clone backs on")
+			}
+		})
+	}
+}
+
+// A clone of the disk the snapshot was taken of is not touched by a
+// restore (the base is only read), so the restore goes ahead as on main.
+func TestRestoreSnapshot_ACloneOfTheBaseDoesNotStopIt(t *testing.T) {
+	f := newSnapUsersFixture(t, "stopped")
+	f.vmOn(t, "early-clone", f.base, f.base)
+	if err := f.restoreS1(); err != nil {
+		t.Fatalf("RestoreSnapshot: %v", err)
+	}
+	if !f.reverted() {
+		t.Fatal("the revert did not run")
+	}
+}

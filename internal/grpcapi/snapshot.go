@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"google.golang.org/grpc"
@@ -354,6 +355,38 @@ func (s *Server) RestoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotReq
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"snapshot %q is in error state (a failed capture) and cannot be restored — delete it instead", req.SnapshotName)
 	}
+	// The revert removes the VM's live overlays, creates empty ones in their
+	// place and starts the VM on them. A linked clone of the stopped VM backs
+	// on exactly those files: its blocks would then sit over a different,
+	// empty base that the VM writes into, and nothing fails until its guest
+	// reads them (review C-1; main lost the clone's disk the same way). So
+	// the restore is refused while another VM backs on a live layer, by its
+	// recorded backing_disk or its qcow2 header — the files StartVM's linked
+	// clone check protects too. The disk the snapshot was taken of is only
+	// read by a restore, so a clone of it does not stop one.
+	live, lerr := s.virt.DomainDiskSources(req.VmName)
+	if lerr != nil {
+		return nil, status.Errorf(codes.Internal,
+			"cannot read which disk files %q runs on, so it is not restored: %v", req.VmName, lerr)
+	}
+	var liveFiles []string
+	for _, f := range live {
+		liveFiles = append(liveFiles, f)
+	}
+	sort.Strings(liveFiles)
+	users, uerr := s.snapshotFileUsers(ctx, req.VmName, liveFiles)
+	if uerr != nil {
+		return nil, status.Errorf(codes.Internal,
+			"cannot determine whether other VMs back on the disks of %q, so it is not restored: %v", req.VmName, uerr)
+	}
+	if len(users) > 0 {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"%q is not restored to snapshot %q: %s back(s) on its disk files (%s), which the restore would empty "+
+				"and the VM would write into. Delete those VMs, or re-create them as independent copies with "+
+				"`lv clone <source> <name> --mode full`, first",
+			req.VmName, req.SnapshotName, strings.Join(users, ", "), strings.Join(liveFiles, ", "))
+	}
+
 	// The revert destroys and undefines the domain, resets its overlays and
 	// brings it back. The VM lock holds off this host's RPCs only; the
 	// reconciler and the restart policy start a VM under the replicated start

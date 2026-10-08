@@ -708,6 +708,14 @@ rather than unlink. Two cases keep every file:
 The refusal for a linked clone comes first, and applies to these metadata-only
 deletes too.
 
+`lv snapshot restore` empties the VM's live overlay and starts the VM on it,
+so it is refused, naming the VMs, while another VM (a linked clone) backs on
+one of the VM's live disk files. A clone of the disk the snapshot was taken of
+does not stop it: a restore only reads that disk. When libvirt will not take
+the restored snapshot back as its current one, the restore still succeeds,
+but `lv` prints a warning and the VM gets a `snapshot.restore-not-current`
+event: deleting that snapshot later keeps its files rather than merging them.
+
 A restore holds the VM's start lease while it brings the domain down and back,
 so no start path restarts it midway; it is refused while a start holds it.
 

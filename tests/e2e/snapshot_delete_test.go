@@ -250,8 +250,9 @@ func TestLab_SnapshotScenario2c_StoppedVM(t *testing.T) {
 
 // Scenario 3 (sr10c): a linked clone of the stopped source backs on the
 // snapshot's overlay. libvirt merged the overlay away and the clone never
-// started again. The delete is refused, naming the clone, while it exists,
-// and goes ahead once it is gone.
+// started again. The delete and a restore (which resets that overlay) are
+// refused, naming the clone, while it exists; the delete goes ahead once it
+// is gone.
 func TestLab_SnapshotScenario3_LinkedCloneOnTheSnapshot(t *testing.T) {
 	l := newLab(t)
 	h, src := snapTestVM(l, "snap3")
@@ -276,6 +277,11 @@ func TestLab_SnapshotScenario3_LinkedCloneOnTheSnapshot(t *testing.T) {
 		t.Errorf("the refusal does not name the clone %s: %v\n%s", clone, err, out)
 	}
 	l.mark("snap: rm %s s1 refused while %s backs on it", src, clone)
+	// The restore resets the overlay the clone backs on (review C-1).
+	if out, err := l.lv(h, "snapshot", "restore", src, "s1"); err == nil || !strings.Contains(err.Error()+out, clone) {
+		t.Fatalf("snapshot restore %s s1 = %v, want refused naming %s while it backs on the overlay:\n%s", src, err, clone, out)
+	}
+	l.mark("snap: restore %s s1 refused while %s backs on it", src, clone)
 	requireSnapVMWhole(l, h, clone, map[byte]bool{snapMarkA: true})
 	snapStop(l, h, clone)
 	l.mustLVf(h, "rm "+clone, "rm", "--force", clone)

@@ -1311,6 +1311,58 @@ message ContainerSnapshot {
     string created_at = 8;
 }
 
+// ── Container inspect ──
+// InspectContainer is the container analogue of InspectVM: one container's
+// row plus what only its host knows (the LXC config's privilege mode, the
+// rootfs and its size) and its snapshots and backup index entries.
+message InspectContainerRequest {
+    string name      = 1;
+    string host_name = 2;  // disambiguates a name used on two hosts; empty = resolve
+}
+
+// One NIC as the container's host records it.
+message ContainerInterfaceDetail {
+    string name            = 1;  // eth0, eth1, …
+    string network_name    = 2;  // managed logical network ("" = raw bridge)
+    string bridge          = 3;
+    string ip              = 4;
+    string mac             = 5;
+    string veth            = 6;
+    repeated string security_groups = 7;
+}
+
+// One container_backups index entry. `available` is decided at read time on
+// the container's host: false when the repo cannot be opened there (moved,
+// unmounted or deleted). The entry is reported, never removed.
+message ContainerBackupRef {
+    string repo               = 1;
+    int64  total_bytes        = 2;
+    string updated_at         = 3;
+    bool   available          = 4;
+    string unavailable_reason = 5;
+}
+
+message ContainerDetail {
+    Container container = 1;
+    // privilege is "privileged" or "unprivileged", read from the container's
+    // LXC config on its host (an lxc.idmap makes it unprivileged), or
+    // "unknown" when the host could not be asked.
+    string privilege     = 2;
+    string template      = 3;   // create spec: template / distro / release / arch
+    string distro        = 4;
+    string release       = 5;
+    string arch          = 6;
+    bool   is_template   = 7;
+    repeated ContainerInterfaceDetail interfaces = 8;
+    string rootfs_path   = 9;
+    int64  rootfs_bytes  = 10;  // -1 = not measured
+    repeated ContainerSnapshot snapshots = 11;
+    repeated ContainerBackupRef backups  = 12;
+    // host_detail is false when the container's host could not be reached and
+    // the host-local fields (privilege, rootfs, backup availability) are unknown.
+    bool   host_detail   = 13;
+}
+
 message SnapshotContainerRequest       { string name = 1; string host_name = 2; string snapshot = 3; }
 message ListContainerSnapshotsRequest  { string name = 1; string host_name = 2; }
 message ListContainerSnapshotsResponse { repeated ContainerSnapshot snapshots = 1; }
@@ -3347,6 +3399,7 @@ service LiteVirt {
     rpc DeleteContainer(DeleteContainerRequest) returns (google.protobuf.Empty);
     rpc ExecContainer(ExecContainerRequest)     returns (ExecContainerResponse);
     rpc ListContainers(ListContainersRequest)   returns (ListContainersResponse);
+    rpc InspectContainer(InspectContainerRequest) returns (ContainerDetail);
     rpc PullOCIImage(PullOCIImageRequest)       returns (google.protobuf.Empty);
     rpc BackupContainer(BackupContainerRequest)   returns (stream BackupContainerProgress);
     rpc RestoreContainer(RestoreContainerRequest) returns (stream RestoreContainerProgress);

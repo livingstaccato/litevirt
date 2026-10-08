@@ -95,3 +95,38 @@ func TestListContainerBackups_ProjectKeyedAndLegacy(t *testing.T) {
 		t.Fatalf("acme's web backups = %v, want /old (legacy) and /both (its own row)", repos)
 	}
 }
+
+// n5b: a frozen pre-release row is never charged above what main's JOIN
+// charged. alpha's web wrote a 5 GiB bare row before the upgrade, then a 1 GiB
+// backup to the same repo after it (project-keyed). Main would have
+// overwritten the bare row with 1 GiB and charged beta's same-named web 1
+// GiB; the frozen 5 GiB must not be charged to beta.
+func TestSumProjectUsage_FrozenLegacyRowCappedAtMainCharge(t *testing.T) {
+	c := newCtTestClient(t)
+	ctx := context.Background()
+	for _, p := range []string{"alpha", "beta"} {
+		if err := UpsertContainer(ctx, c, ContainerRecord{HostName: "h-" + p, Name: "web", State: "running", Project: p}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	legacyCTBackupRow(t, c, "web", "/r1", 5*testGiB)
+	if err := UpsertContainerBackup(ctx, c, "alpha", "web", "/r1", 1*testGiB); err != nil {
+		t.Fatal(err)
+	}
+	u, err := SumProjectUsage(ctx, c, "beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.BackupGiBUsed > 1 {
+		t.Fatalf("beta BackupGiBUsed = %d, more than main's 1 GiB for the overwritten row", u.BackupGiBUsed)
+	}
+	// Before any newer write the frozen row is what main charged, and stays.
+	c2 := newCtTestClient(t)
+	if err := UpsertContainer(ctx, c2, ContainerRecord{HostName: "h", Name: "web", State: "running", Project: "beta"}); err != nil {
+		t.Fatal(err)
+	}
+	legacyCTBackupRow(t, c2, "web", "/r1", 5*testGiB)
+	if u, _ := SumProjectUsage(ctx, c2, "beta"); u.BackupGiBUsed != 5 {
+		t.Fatalf("an unsuperseded legacy row: BackupGiBUsed = %d, want 5 (as main)", u.BackupGiBUsed)
+	}
+}

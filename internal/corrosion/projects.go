@@ -385,10 +385,11 @@ func splitContainerBackupKey(key string) (string, string, bool) {
 
 // containerBackupUsage sums the container backup footprint charged to
 // project: its own project-keyed rows for containers it still has, plus
-// legacy (bare-name) rows of those names — each row once, and a legacy row
-// only where the container has not written its own row for that repo. That
-// never charges more than the bare-name JOIN did for the honest owner, and it
-// stops charging one project for another's same-named container.
+// legacy (bare-name) rows of those names — each row once, a legacy row only
+// where the container has not written its own row for that repo, and a
+// legacy row capped at the newest write for its (name, repo), which is what
+// the old bare-name row (and so the old JOIN) would have held. It stops
+// charging one project for another's same-named container.
 func containerBackupUsage(ctx context.Context, c *Client, project string) (int64, error) {
 	names, err := c.Query(ctx,
 		`SELECT DISTINCT name FROM containers WHERE project = ? AND deleted_at IS NULL`, project)
@@ -402,26 +403,44 @@ func containerBackupUsage(ctx context.Context, c *Client, project string) (int64
 	if len(live) == 0 {
 		return 0, nil
 	}
-	rows, err := c.Query(ctx, `SELECT ct_name, repo, total_bytes FROM container_backups`)
+	rows, err := c.Query(ctx, `SELECT ct_name, repo, total_bytes, updated_at FROM container_backups`)
 	if err != nil {
 		return 0, err
 	}
 	type nameRepo struct{ name, repo string }
 	own := map[nameRepo]bool{}
+	// latest is, per (name, repo), the newest write of any row — the value the
+	// single bare-name row would hold had it kept being overwritten, as it was
+	// before project keys. A frozen bare row is charged no more than that.
+	type write struct {
+		bytes int64
+		at    string
+	}
+	latest := map[nameRepo]write{}
 	var total int64
 	want := normalizeProject(project)
 	for _, r := range rows {
 		p, n, keyed := splitContainerBackupKey(r.String("ct_name"))
+		k := nameRepo{n, r.String("repo")}
+		w := write{r.Int64("total_bytes"), r.String("updated_at")}
+		if cur, ok := latest[k]; !ok || LWWNewer(w.at, cur.at) {
+			latest[k] = w
+		}
 		if keyed && p == want && live[n] {
-			total += r.Int64("total_bytes")
-			own[nameRepo{n, r.String("repo")}] = true
+			total += w.bytes
+			own[k] = true
 		}
 	}
 	for _, r := range rows {
 		_, n, keyed := splitContainerBackupKey(r.String("ct_name"))
-		if !keyed && live[n] && !own[nameRepo{n, r.String("repo")}] {
-			total += r.Int64("total_bytes")
+		k := nameRepo{n, r.String("repo")}
+		if keyed || !live[n] || own[k] {
+			continue
 		}
+		// Never above the old JOIN's charge: the old row would have been
+		// overwritten by the newest write, so charge the smaller of the
+		// frozen value and that.
+		total += min(r.Int64("total_bytes"), latest[k].bytes)
 	}
 	return total, nil
 }

@@ -135,3 +135,22 @@ func TestHandler_DestroyStack_KeptAtDeleteTimeIsNotCounted(t *testing.T) {
 		}
 	}
 }
+
+// Review M-6: a network the stack kept for a workload it did not create is
+// a kept network, not a kept VM.
+func TestHandler_DestroyStack_AKeptNetworkIsNotCountedAsAVM(t *testing.T) {
+	mock := newDefaultMock()
+	mock.deleteStackFrames = []*pb.DeleteProgress{
+		{VmName: "rc5-isosym", Status: "kept", Error: "not created by stack \"hb\"; left alone"},
+		{VmName: "network hb_lan", Status: "kept", Error: "used by rc5-isosym, which the stack did not create; left in place"},
+	}
+	trig := destroyStack(t, mock).Header.Get("HX-Trigger")
+	for _, want := range []string{"Kept 1 VM(s)", "rc5-isosym", "Kept network hb_lan"} {
+		if !strings.Contains(trig, want) {
+			t.Errorf("toast %s does not say %q", trig, want)
+		}
+	}
+	if strings.Contains(trig, "Kept 2 VM(s)") {
+		t.Errorf("toast %s counts the kept network as a VM", trig)
+	}
+}

@@ -928,6 +928,10 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 			return err
 		}
 	}
+	// VMs kept at delete time: another incarnation of a member, or a peer's
+	// VM of a member's name. Such a VM may record this very stack, so the
+	// networks it uses are judged with it by name (stackNetworkUsers).
+	var keptAtDelete []string
 	for _, vm := range vms {
 		if err := stream.Send(&pb.DeleteProgress{
 			VmName: vm.Name,
@@ -938,6 +942,7 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 
 		delErr := s.deleteVMWithFanout(ctx, stackMember{Name: vm.Name, Stack: req.Name, CreatedAt: vm.CreatedAt}, req.KeepDisks)
 		if errors.Is(delErr, errNotStackMember) {
+			keptAtDelete = append(keptAtDelete, vm.Name)
 			if err := stream.Send(&pb.DeleteProgress{VmName: vm.Name, Status: "kept", Error: delErr.Error()}); err != nil {
 				return err
 			}
@@ -1061,7 +1066,7 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 			// network keeps it: removing it would pull the network out from
 			// under that workload. Said, and not a failure. Unknown keeps it
 			// too, and that is a failure the reconciler retries.
-			if users, uErr := corrosion.ForeignWorkloadsOnNetwork(ctx, s.db, nr.Name, req.Name); uErr != nil || len(users) > 0 {
+			if users, uErr := s.stackNetworkUsers(ctx, nr.Name, req.Name, keptAtDelete); uErr != nil || len(users) > 0 {
 				if uErr != nil {
 					hadFailures = true
 					notRemoved = append(notRemoved, "network "+nr.Name)
@@ -1259,6 +1264,35 @@ func checkDeleteBinding(req *pb.DeleteVMRequest, vm *corrosion.VMRecord) error {
 			vm.Name, deleteBindingMismatch, vm.CreatedAt, want)
 	}
 	return nil
+}
+
+// stackNetworkUsers names the workloads that keep a stack's network at
+// teardown: those the stack did not create (corrosion.ForeignWorkloadsOnNetwork)
+// and, by name, the VMs the teardown kept (kept), which may record this stack.
+func (s *Server) stackNetworkUsers(ctx context.Context, network, stack string, kept []string) ([]string, error) {
+	users, err := corrosion.ForeignWorkloadsOnNetwork(ctx, s.db, network, stack)
+	if err != nil || len(kept) == 0 {
+		return users, err
+	}
+	onNet, err := corrosion.VMNamesOnNetwork(ctx, s.db, network)
+	if err != nil {
+		return nil, err
+	}
+	have := map[string]bool{}
+	for _, u := range users {
+		have[u] = true
+	}
+	keep := map[string]bool{}
+	for _, k := range kept {
+		keep[k] = true
+	}
+	for _, v := range onNet {
+		if keep[v] && !have[v] {
+			users = append(users, v)
+			have[v] = true
+		}
+	}
+	return users, nil
 }
 
 // errNotStackMember: a VM of a stack member's name that the stack did not

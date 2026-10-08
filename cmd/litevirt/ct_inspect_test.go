@@ -32,8 +32,9 @@ func (m *ctInspectMock) InspectContainer(_ context.Context, in *pb.InspectContai
 		RootfsPath: "/var/lib/lxc/blct/rootfs", RootfsBytes: 3 << 20,
 		Snapshots: []*pb.ContainerSnapshot{{Name: "s1", SizeBytes: 4096, CreatedAt: "2026-10-08T12:45:00Z"}},
 		Backups: []*pb.ContainerBackupRef{
-			{Repo: "/srv/lxtrepo", TotalBytes: 1 << 20, Available: true},
-			{Repo: "/srv/lxtbk", TotalBytes: 1 << 20, UnavailableReason: "repo /srv/lxtbk does not exist on node-4"},
+			{Repo: "/srv/lxtrepo", TotalBytes: 1 << 20, Available: true, Status: "available", Location: "node-3"},
+			{Repo: "/srv/lxtbk", TotalBytes: 1 << 20, Status: "not_found", UnavailableReason: "repo /srv/lxtbk is not present on node-4"},
+			{Repo: "r2", TotalBytes: 1 << 20, Status: "unknown", UnavailableReason: "host node-5 could not be asked"},
 		},
 		HostDetail: true,
 	}, nil
@@ -72,12 +73,24 @@ func TestCTInspect_Text(t *testing.T) {
 		"Name:", "blct", "Host:", "node-4", "State:", "stopped", "Image:", "alpine:3.19",
 		"Project:", "acme", "CPU limit:", "2", "Memory:", "512 MiB", "Privilege:", "privileged",
 		"eth0", "lxtnet", "172.16.77.50/24", "/var/lib/lxc/blct/rootfs", "3.0 MiB",
-		"s1", "/srv/lxtrepo", "/srv/lxtbk", "unavailable", "does not exist on node-4",
+		"s1", "/srv/lxtrepo", "available on node-3", "/srv/lxtbk", "not found: repo /srv/lxtbk is not present on node-4",
+		"unknown: host node-5 could not be asked",
 		"Created:", "2026-10-08T12:43:00Z",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output missing %q:\n%s", want, out)
 		}
+	}
+}
+
+// --size asks the owner to measure the rootfs; without it nothing is walked.
+func TestCTInspect_SizeFlag(t *testing.T) {
+	mock := &ctInspectMock{}
+	if _, err := runCTInspect(t, mock, "ct", "inspect", "blct"); err != nil || mock.got.GetMeasureRootfs() {
+		t.Fatalf("without --size: err=%v measure=%v", err, mock.got.GetMeasureRootfs())
+	}
+	if _, err := runCTInspect(t, mock, "ct", "inspect", "blct", "--size"); err != nil || !mock.got.GetMeasureRootfs() {
+		t.Fatalf("with --size: err=%v measure=%v", err, mock.got.GetMeasureRootfs())
 	}
 }
 

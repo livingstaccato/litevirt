@@ -540,6 +540,10 @@ type Server struct {
 	// instead of dialing a real peer over mTLS, so the owner→sink push path is
 	// unit-testable in-process. Production leaves it nil → real peerClient.
 	peerClientOverride func(ctx context.Context, host string) (pb.LiteVirtClient, func(), error)
+	// rootfsSizes caches InspectContainer's measured rootfs sizes by path for
+	// rootfsSizeTTL; rootfsSizeMu guards it and serialises the walks.
+	rootfsSizeMu sync.Mutex
+	rootfsSizes  map[string]rootfsSizeEntry
 	// pciScanOverride is a test seam for the host hardware scan. Nil in
 	// production, where RescanHost calls pci.Scan directly.
 	//

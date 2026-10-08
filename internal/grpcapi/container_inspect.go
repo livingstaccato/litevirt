@@ -3,8 +3,6 @@ package grpcapi
 import (
 	"bufio"
 	"context"
-	"errors"
-	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -16,7 +14,6 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
-	"github.com/litevirt/litevirt/internal/pbsstore"
 )
 
 // rootfsMeasureBudget bounds the rootfs walk, so inspecting a container with a
@@ -50,33 +47,40 @@ func (s *Server) InspectContainer(ctx context.Context, req *pb.InspectContainerR
 	if err != nil {
 		return nil, err
 	}
+	// Whether the caller may see backup entries that cannot be attributed to
+	// this container, and the host paths in their reasons. Decided HERE, on the
+	// node the caller reached: a forwarded call reaches the owner as a peer.
+	admin := s.RequirePerm(ctx, "/", verbStorageHostPath, "admin") == nil
+
 	if host != s.hostName {
 		c, closeFn, derr := s.dialPeer(ctx, host)
 		if derr == nil {
 			defer closeFn()
-			fwd := &pb.InspectContainerRequest{Name: req.Name, HostName: host}
-			d, ferr := c.InspectContainer(ctx, fwd)
-			if ferr == nil {
-				return d, nil
+			fwd := &pb.InspectContainerRequest{Name: req.Name, HostName: host, MeasureRootfs: req.MeasureRootfs}
+			if d, ferr := c.InspectContainer(ctx, fwd); ferr == nil {
+				return filterContainerBackups(d, admin), nil
 			}
-			derr = ferr
 		}
 		// The owner is unreachable (or predates this RPC): answer with what the
-		// cluster knows, and say the host-local fields are unknown.
+		// cluster knows, and say the host-local fields are unknown. The backup
+		// entries are still resolved by asking the other hosts; one only the
+		// owner could hold stays unknown.
 		d, cerr := s.containerDetailFromCluster(ctx, rec)
 		if cerr != nil {
 			return nil, cerr
 		}
-		markHostDetailUnknown(d, fmt.Sprintf("host %s unreachable: %v", host, status.Convert(derr).Message()))
-		return d, nil
+		markHostDetailUnknown(d)
+		s.resolveContainerBackups(ctx, rec, d.Backups)
+		return filterContainerBackups(d, admin), nil
 	}
 
 	d, err := s.containerDetailFromCluster(ctx, rec)
 	if err != nil {
 		return nil, err
 	}
-	s.addHostLocalContainerDetail(ctx, req.Name, d)
-	return d, nil
+	s.addHostLocalContainerDetail(ctx, req.Name, req.MeasureRootfs, d)
+	s.resolveContainerBackups(ctx, rec, d.Backups)
+	return filterContainerBackups(d, admin), nil
 }
 
 // containerDetailFromCluster builds the detail from replicated state alone.
@@ -152,52 +156,53 @@ func containerInterfaceDetails(spec []corrosion.ContainerNetwork, rows []corrosi
 }
 
 // addHostLocalContainerDetail fills what only the container's host knows.
-func (s *Server) addHostLocalContainerDetail(ctx context.Context, name string, d *pb.ContainerDetail) {
+// The rootfs is walked only when the caller asked for its size.
+func (s *Server) addHostLocalContainerDetail(ctx context.Context, name string, measure bool, d *pb.ContainerDetail) {
 	d.HostDetail = true
 	if s.containerRuntime != nil {
 		if rootfs, err := s.containerRuntime.ContainerRootFSPath(name); err == nil && rootfs != "" {
 			d.RootfsPath = rootfs
-			d.RootfsBytes = measureTree(ctx, rootfs, rootfsMeasureBudget)
+			if measure {
+				d.RootfsBytes = s.rootfsSize(ctx, rootfs)
+			}
 			// LXC keeps the config beside the rootfs (<lxcpath>/<name>/config).
 			d.Privilege = lxcPrivilege(filepath.Join(filepath.Dir(rootfs), "config"))
 		}
 	}
-	for _, b := range d.Backups {
-		b.Available, b.UnavailableReason = s.backupRepoAvailable(ctx, b.Repo)
-	}
 }
 
-func markHostDetailUnknown(d *pb.ContainerDetail, reason string) {
+func markHostDetailUnknown(d *pb.ContainerDetail) {
 	d.HostDetail = false
 	d.Privilege = "unknown"
 	d.RootfsBytes = -1
-	for _, b := range d.Backups {
-		b.Available, b.UnavailableReason = false, reason
-	}
 }
 
-// backupRepoAvailable decides at read time whether a backup index entry's
-// repo can still be opened on this host. The entry itself is never touched: a
-// repo that is unmounted rather than deleted comes back, and its backups with
-// it. Only the location is probed — no repo permission is exercised.
-func (s *Server) backupRepoAvailable(ctx context.Context, repo string) (bool, string) {
-	path := ""
-	if p, ok := s.backupRepos[repo]; ok {
-		path = p
-	} else if p, err := corrosion.GetBackupRepoPath(ctx, s.db, repo); err == nil && p != "" {
-		path = p
-	} else if filepath.IsAbs(repo) {
-		path = repo
-	} else {
-		return false, fmt.Sprintf("repo %q is not registered on %s", repo, s.hostName)
+// rootfsSizeTTL is how long a measured rootfs size is reused.
+const rootfsSizeTTL = time.Minute
+
+type rootfsSizeEntry struct {
+	bytes int64
+	at    time.Time
+}
+
+// rootfsSize returns the apparent size of a rootfs, reusing a measurement
+// younger than rootfsSizeTTL, so repeated inspects cannot make the owner walk
+// the tree again and again. Walks are serialised: at most one runs at a time
+// on a host, however many callers ask.
+func (s *Server) rootfsSize(ctx context.Context, rootfs string) int64 {
+	s.rootfsSizeMu.Lock()
+	defer s.rootfsSizeMu.Unlock()
+	if e, ok := s.rootfsSizes[rootfs]; ok && time.Since(e.at) < rootfsSizeTTL {
+		return e.bytes
 	}
-	if _, err := pbsstore.Open(path); err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return false, fmt.Sprintf("repo %s does not exist on %s", path, s.hostName)
+	n := measureTree(ctx, rootfs, rootfsMeasureBudget)
+	if n >= 0 {
+		if s.rootfsSizes == nil {
+			s.rootfsSizes = map[string]rootfsSizeEntry{}
 		}
-		return false, fmt.Sprintf("repo %s cannot be opened on %s: %v", path, s.hostName, err)
+		s.rootfsSizes[rootfs] = rootfsSizeEntry{bytes: n, at: time.Now()}
 	}
-	return true, ""
+	return n
 }
 
 // lxcPrivilege reads an LXC container config and reports "unprivileged" when

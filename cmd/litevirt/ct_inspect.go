@@ -17,23 +17,27 @@ import (
 // `lv inspect <vm>`.
 func newCTInspectCmd() *cobra.Command {
 	var host, output string
+	var size bool
 	cmd := &cobra.Command{
 		Use:   "inspect <name>",
 		Short: "Show container details",
 		Long: `Show one container: host, state, image, project, CPU and memory limits,
 privilege mode (read from its LXC config on its host), NICs and addresses,
-rootfs and size, snapshots, backups and timestamps.
+rootfs (and its size with --size), snapshots, backups and timestamps.
 
-A backup whose repository can no longer be opened on the container's host is
-listed as unavailable, with the reason. If the container's host cannot be
-reached, the cluster view is shown and the host-local fields are unknown.`,
+Each backup entry is checked on whichever host holds its repository: it is
+available there, not found anywhere, or unknown when a host could not be
+asked. Entries that cannot be tied to this container (for example a same-named
+container in another project) are shown only to an admin. If the container's
+host cannot be reached, the cluster view is shown and the host-local fields
+are unknown.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if output != "text" && output != "json" {
 				return fmt.Errorf("unknown output format %q (text or json)", output)
 			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
-				d, err := c.InspectContainer(ctx, &pb.InspectContainerRequest{Name: args[0], HostName: host})
+				d, err := c.InspectContainer(ctx, &pb.InspectContainerRequest{Name: args[0], HostName: host, MeasureRootfs: size})
 				if err != nil {
 					return fmt.Errorf("inspect container: %w", err)
 				}
@@ -51,6 +55,7 @@ reached, the cluster view is shown and the host-local fields are unknown.`,
 	}
 	cmd.Flags().StringVar(&host, "host", "", "Owning host (default: resolve by name)")
 	cmd.Flags().StringVarP(&output, "output", "o", "text", "Output format: text or json")
+	cmd.Flags().BoolVar(&size, "size", false, "Measure the rootfs size (walks the tree on the owning host)")
 	return cmd
 }
 
@@ -151,14 +156,36 @@ func printContainerDetail(d *pb.ContainerDetail) error {
 	t := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
 	fmt.Fprintln(t, "  REPO\tSIZE\tUPDATED\tSTATUS")
 	for _, b := range d.GetBackups() {
-		st := "available"
-		if !b.GetAvailable() {
-			st = "unavailable"
-			if b.GetUnavailableReason() != "" {
-				st += ": " + b.GetUnavailableReason()
-			}
-		}
+		st := backupStatusText(b)
 		fmt.Fprintf(t, "  %s\t%s\t%s\t%s\n", b.GetRepo(), formatBytes(b.GetTotalBytes()), orDash(b.GetUpdatedAt()), st)
 	}
 	return t.Flush()
+}
+
+func backupStatusText(b *pb.ContainerBackupRef) string {
+	var st string
+	switch b.GetStatus() {
+	case "available":
+		st = "available"
+		if b.GetLocation() != "" {
+			st += " on " + b.GetLocation()
+		}
+		return st
+	case "not_found":
+		st = "not found"
+	case "foreign":
+		st = "another project's"
+	case "unknown":
+		st = "unknown"
+	default:
+		// An older daemon sends only available + reason.
+		if b.GetAvailable() {
+			return "available"
+		}
+		st = "unavailable"
+	}
+	if b.GetUnavailableReason() != "" {
+		st += ": " + b.GetUnavailableReason()
+	}
+	return st
 }

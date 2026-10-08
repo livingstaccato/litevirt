@@ -302,7 +302,7 @@ lv ct start <name>
 lv ct stop <name>
 lv ct rm <name>
 lv ct ls
-lv ct inspect <name> [--host <h>] [-o json]           # one container: limits, privilege, NICs, rootfs, snapshots, backups
+lv ct inspect <name> [--host <h>] [--size] [-o json]  # one container: limits, privilege, NICs, rootfs, snapshots, backups
 lv ct exec <name> -- <cmd> [args...]
 lv ct backup <name> --repo <dir>                       # full rootfs backup → dedup chunk store
 lv ct restore <name> --repo <dir> --timestamp <ts> [--start]  # rebuild from a backup manifest

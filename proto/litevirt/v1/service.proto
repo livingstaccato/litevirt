@@ -1318,6 +1318,10 @@ message ContainerSnapshot {
 message InspectContainerRequest {
     string name      = 1;
     string host_name = 2;  // disambiguates a name used on two hosts; empty = resolve
+    // measure_rootfs walks the rootfs to report its size. Off by default: the
+    // walk is bounded but costs I/O on the owner, so it runs only on request
+    // (and a recent result is reused).
+    bool   measure_rootfs = 3;
 }
 
 // One NIC as the container's host records it.
@@ -1340,6 +1344,35 @@ message ContainerBackupRef {
     string updated_at         = 3;
     bool   available          = 4;
     string unavailable_reason = 5;
+    // status: "available" (a host holds this container's backup in the repo),
+    // "not_found" (every host answered and none holds one), "unknown" (some
+    // host could not be asked), or "foreign" (the repo holds backups of a
+    // same-named container in another project). Only "available" entries are
+    // shown to a caller without the admin role.
+    string status             = 6;
+    string location           = 7;  // host that holds the backup (status "available")
+    string latest_timestamp   = 8;  // newest backup of this container in the repo
+}
+
+// ProbeContainerBackups is peer-only: InspectContainer asks each host whether
+// it can open each repo (resolving a logical name in its own config) and
+// whether the repo holds a backup of this container — same name and project,
+// read from the manifest's embedded spec.
+message ProbeContainerBackupsRequest {
+    string name    = 1;
+    string project = 2;
+    repeated string repos = 3;
+}
+message ContainerBackupProbe {
+    string repo             = 1;
+    bool   opened           = 2;
+    bool   attributed       = 3;  // a manifest of this name and project
+    bool   foreign          = 4;  // manifests of this name, other projects only
+    string latest_timestamp = 5;
+    string detail           = 6;  // why it could not be opened (admin-facing)
+}
+message ProbeContainerBackupsResponse {
+    repeated ContainerBackupProbe results = 1;
 }
 
 message ContainerDetail {
@@ -3400,6 +3433,7 @@ service LiteVirt {
     rpc ExecContainer(ExecContainerRequest)     returns (ExecContainerResponse);
     rpc ListContainers(ListContainersRequest)   returns (ListContainersResponse);
     rpc InspectContainer(InspectContainerRequest) returns (ContainerDetail);
+    rpc ProbeContainerBackups(ProbeContainerBackupsRequest) returns (ProbeContainerBackupsResponse);
     rpc PullOCIImage(PullOCIImageRequest)       returns (google.protobuf.Empty);
     rpc BackupContainer(BackupContainerRequest)   returns (stream BackupContainerProgress);
     rpc RestoreContainer(RestoreContainerRequest) returns (stream RestoreContainerProgress);

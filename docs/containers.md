@@ -74,33 +74,46 @@ $ lv ct rm web --host node-b
 
 `lv ct inspect <name>` is the container counterpart of `lv inspect <vm>`: host,
 state, image or template, project, CPU and memory limits, the privilege mode,
-each NIC with its network and address, the rootfs and its size, snapshots,
-backups, and when it was created and last updated. `-o json` prints the same
-detail as JSON; `--host` names the owner when the name is on two hosts.
+each NIC with its network and address, the rootfs, snapshots, backups, and when
+it was created and last updated. `--size` also measures the rootfs (a walk of
+the tree on its host, reused for a minute); `-o json` prints the same detail as
+JSON; `--host` names the owner when the name is on two hosts.
 
 ```
-$ lv ct inspect web
+$ lv ct inspect web --size
 Name:       web
 Host:       node-3
 State:      running
 Privilege:  privileged
+Rootfs:     /var/lib/lxc/web/rootfs (412.3 MiB)
 ...
 Backups:
   REPO          SIZE     UPDATED               STATUS
-  /srv/backups  2.1 MiB  2026-10-08T12:48:39Z  available
-  /srv/oldrepo  2.0 MiB  2026-10-01T09:00:00Z  unavailable: repo /srv/oldrepo does not exist on node-3
+  /srv/backups  2.1 MiB  2026-10-08T12:48:39Z  available on node-3
+  offsite       2.1 MiB  2026-10-08T13:02:11Z  available on node-1
 ```
 
 The privilege mode is read from the container's LXC config on its host: a
-config with an `lxc.idmap` is unprivileged, one without is privileged. The
-rootfs size and the backup status are also checked there. If that host does
-not answer, the cluster's view is shown and those fields read unknown.
+config with an `lxc.idmap` is unprivileged, one without is privileged. If that
+host does not answer, the cluster's view is shown and the host-local fields
+read unknown.
 
-A backup whose repository can no longer be opened (deleted, moved or
-unmounted) is listed as unavailable with the reason. The entry is never
-removed, and it still counts toward the project's `backup_gib`, as a VM backup
-in a vanished repository does; it reads available again once the repository
-is back.
+Each backup entry is checked where it lives. A backup taken through another
+host's repository (a sink) or before a migration is not on the container's
+current host, so every host is asked whether it holds a backup of this
+container (same name and project) in that repository. The entry is then:
+
+- **available on `<host>`**: that host holds it;
+- **not found**: every host answered and none holds it (the repository was
+  deleted, moved or unmounted everywhere);
+- **unknown**: no host holds it, but some host could not be asked;
+- **another project's**: the repository only holds backups of a same-named
+  container in another project.
+
+Without the admin role you see only the entries that are available for this
+container, with no host paths in reasons; the others are shown to an admin. An
+entry is never removed by inspect, and it still counts toward the project's
+`backup_gib`, as a VM backup in a vanished repository does.
 
 ### Asking one node about a container on another
 

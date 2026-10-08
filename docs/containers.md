@@ -472,6 +472,15 @@ How it works and what to expect:
   split-brain gate is enforced.
 - **No rename.** The name selects the backup in the repo, so a restore keeps
   it: restore onto another host (`--host`) to keep both.
+- **Faithful file metadata.** The archive is made with `tar --numeric-owner
+  --xattrs --xattrs-include='*' --acls`, and a restore, migrate or snapshot
+  revert lays back setuid, setgid and sticky bits, file capabilities
+  (`security.capability`), ACLs, SELinux labels and `user.*` attributes, after
+  each file's owner (a chown clears setuid and capabilities). An unprivileged
+  container's archive carries its shifted owners and re-rooted capabilities, so
+  it comes back in the same range. `trusted.*` attributes are not taken from an
+  archive. A capability, label or ACL the target filesystem refuses fails the
+  restore rather than land a file with different access.
 - **Quota.** A container's backup footprint draws down the **same `backup_gib`
   project budget** as VM backups.
 

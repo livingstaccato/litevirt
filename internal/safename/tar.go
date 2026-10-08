@@ -54,8 +54,10 @@ func ExtractFlatTar(r io.Reader, dest string) error {
 }
 
 // ExtractRootfsTar extracts a container rootfs tar into dest with rootfs-aware
-// semantics: it PRESERVES symlinks, file modes (clamped to remove setuid/setgid,
-// keeping rwx/exec bits) and numeric ownership, but never WRITES THROUGH a
+// semantics: it PRESERVES symlinks, file modes (setuid, setgid and sticky
+// included, as LXC's own tooling restores a rootfs), numeric ownership and the
+// extended attributes a container's files carry — file capabilities, ACLs,
+// SELinux labels and user attributes (applyXattrs) — but never WRITES THROUGH a
 // symlink (every path component is lstat'd; a symlinked component is refused),
 // contains every member under dest, rejects hardlinks whose target isn't an
 // already-extracted regular file under dest, and rejects device/char/fifo nodes.
@@ -103,13 +105,16 @@ func ExtractRootfsTar(r io.Reader, dest, expectedTop string) error {
 		if expectedTop != "" {
 			linkRoot = filepath.Join(dest, expectedTop)
 		}
-		mode := os.FileMode(hdr.Mode).Perm() // drops setuid/setgid/sticky, keeps rwx
+		mode := os.FileMode(hdr.Mode).Perm()
+		special := hdr.FileInfo().Mode() & (os.ModeSetuid | os.ModeSetgid | os.ModeSticky)
 		switch hdr.Typeflag {
 		case tar.TypeDir:
 			if err := mkdirAllNoFollow(dest, target, mode|0o100); err != nil {
 				return err
 			}
-			_ = os.Lchown(target, hdr.Uid, hdr.Gid)
+			if err := finishMember(target, hdr, mode|0o100|special); err != nil {
+				return err
+			}
 		case tar.TypeReg, tar.TypeRegA:
 			if err := mkdirAllNoFollow(dest, filepath.Dir(target), 0o755); err != nil {
 				return err
@@ -117,7 +122,9 @@ func ExtractRootfsTar(r io.Reader, dest, expectedTop string) error {
 			if err := writeRegularNoFollow(target, tr, mode); err != nil {
 				return err
 			}
-			_ = os.Lchown(target, hdr.Uid, hdr.Gid)
+			if err := finishMember(target, hdr, mode|special); err != nil {
+				return err
+			}
 		case tar.TypeSymlink:
 			// Validate the link TARGET stays within the extraction root: an
 			// absolute target is interpreted root-relative (so "/usr/bin" works
@@ -144,7 +151,7 @@ func ExtractRootfsTar(r io.Reader, dest, expectedTop string) error {
 			if err := os.Symlink(hdr.Linkname, target); err != nil {
 				return fmt.Errorf("rootfs tar: symlink %q: %w", hdr.Name, err)
 			}
-			_ = os.Lchown(target, hdr.Uid, hdr.Gid)
+			_ = lchown(target, hdr.Uid, hdr.Gid)
 		case tar.TypeLink:
 			if err := mkdirAllNoFollow(dest, filepath.Dir(target), 0o755); err != nil {
 				return err
@@ -268,4 +275,73 @@ func ensureNotSymlink(target string) error {
 		return fmt.Errorf("refusing to write through existing symlink %q", target)
 	}
 	return nil
+}
+
+// lchown is os.Lchown, and lsetxattr sets an attribute without following a
+// symlink; variables so a test runs without root.
+var lchown = os.Lchown
+
+func setLchownForTest(fn func(string, int, int) error) (restore func()) {
+	old := lchown
+	lchown = fn
+	return func() { lchown = old }
+}
+
+func setLsetxattrForTest(fn func(string, string, []byte) error) (restore func()) {
+	old := lsetxattr
+	lsetxattr = fn
+	return func() { lsetxattr = old }
+}
+
+// finishMember sets a directory's or regular file's owner, then its mode with
+// the special bits (chown clears setuid and setgid), then its extended
+// attributes (chown also clears a file capability). The owner is best-effort,
+// as before: an unprivileged caller cannot chown.
+func finishMember(target string, hdr *tar.Header, mode os.FileMode) error {
+	_ = lchown(target, hdr.Uid, hdr.Gid)
+	if err := os.Chmod(target, mode); err != nil {
+		return fmt.Errorf("rootfs tar: mode of %q: %w", hdr.Name, err)
+	}
+	return applyXattrs(target, hdr)
+}
+
+// xattrPAXPrefix is how GNU tar --xattrs (and Go) carry an attribute.
+const xattrPAXPrefix = "SCHILY.xattr."
+
+// rootfsXattrNamespaces are the attributes a rootfs archive may set: file
+// capabilities and SELinux labels (security.*), POSIX ACLs and user
+// attributes. trusted.* is root-only metadata other subsystems act on
+// (overlayfs reads trusted.overlay.*), so an archive does not get to choose
+// it. An ACL GNU tar --acls also wrote as text (SCHILY.acl.*) is carried by
+// its raw attribute beside it.
+var rootfsXattrNamespaces = []string{"security.", "system.posix_acl_access", "system.posix_acl_default", "user."}
+
+// applyXattrs sets the archived extended attributes of target. A filesystem
+// that takes no attributes of a namespace (ENOTSUP) is not an error for user.*
+// attributes, which carry no access control; a capability, label or ACL that
+// cannot be set fails the extraction rather than restore a file with less or
+// more access than it had.
+func applyXattrs(target string, hdr *tar.Header) error {
+	for k, v := range hdr.PAXRecords {
+		name, ok := strings.CutPrefix(k, xattrPAXPrefix)
+		if !ok || !xattrAllowed(name) {
+			continue
+		}
+		if err := lsetxattr(target, name, []byte(v)); err != nil {
+			if strings.HasPrefix(name, "user.") && errorsIsNotSupported(err) {
+				continue
+			}
+			return fmt.Errorf("rootfs tar: set %s on %q: %w", name, hdr.Name, err)
+		}
+	}
+	return nil
+}
+
+func xattrAllowed(name string) bool {
+	for _, ns := range rootfsXattrNamespaces {
+		if strings.HasPrefix(name, ns) {
+			return true
+		}
+	}
+	return false
 }

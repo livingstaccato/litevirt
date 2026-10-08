@@ -276,3 +276,67 @@ func TestContainerHardening_OwnerSnapshotAndDelete(t *testing.T) {
 		t.Fatal("rm --force left the container")
 	}
 }
+
+// Concern 3: a backup→restore keeps a setuid bit, a file capability and an
+// ACL, read off the restored rootfs with getcap/getfacl (root on the node).
+func TestContainerHardening_RestoreKeepsSpecialBitsCapsAndACLs(t *testing.T) {
+	for _, tool := range []string{"setcap", "getcap", "setfacl", "getfacl"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("%s not installed", tool)
+		}
+	}
+	name := hardenedCT(t)
+	bin := filepath.Join(ctDir(name), "rootfs", "usr", "local", "bin", "e2e-fidelity")
+	if err := os.MkdirAll(filepath.Dir(bin), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Owned like the rest of the (possibly shifted) rootfs, then marked.
+	var st syscall.Stat_t
+	if err := syscall.Lstat(filepath.Dir(bin), &st); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Lchown(bin, int(st.Uid), int(st.Gid))
+	if err := os.Chmod(bin, 0o755|os.ModeSetuid); err != nil {
+		t.Fatal(err)
+	}
+	mustRun := func(args ...string) string {
+		out, err := exec.Command(args[0], args[1:]...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("%v: %v\n%s", args, err, out)
+		}
+		return string(out)
+	}
+	mustRun("setcap", "cap_net_raw+ep", bin)
+	mustRun("setfacl", "-m", "u:"+strconv.Itoa(int(st.Uid)+33)+":r-x", bin)
+	wantCap, wantACL := mustRun("getcap", bin), mustRun("getfacl", "-n", "--omit-header", bin)
+
+	repo := filepath.Join(t.TempDir(), "repo")
+	lv(t, "backup", "repo", "init", repo)
+	out := lv(t, "ct", "backup", name, "--host", localHost, "--repo", repo)
+	ts := ""
+	if _, rest, ok := strings.Cut(out, "[done] manifest="); ok {
+		ts, _, _ = strings.Cut(rest, " ")
+	}
+	if ts == "" {
+		t.Fatalf("no manifest timestamp in the backup output:\n%s", out)
+	}
+	lv(t, "ct", "rm", name, "--host", localHost, "--force")
+	lv(t, "ct", "restore", name, "--repo", repo, "--timestamp", ts, "--host", localHost)
+
+	fi, err := os.Lstat(bin)
+	if err != nil {
+		t.Fatalf("restored binary: %v", err)
+	}
+	if fi.Mode()&os.ModeSetuid == 0 {
+		t.Errorf("restore dropped the setuid bit: %v", fi.Mode())
+	}
+	if got := mustRun("getcap", bin); got != wantCap {
+		t.Errorf("file capability after restore = %q, want %q", got, wantCap)
+	}
+	if got := mustRun("getfacl", "-n", "--omit-header", bin); got != wantACL {
+		t.Errorf("ACL after restore = %q, want %q", got, wantACL)
+	}
+}

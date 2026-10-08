@@ -684,7 +684,11 @@ func (r *LxcRunner) ExportContainer(ctx context.Context, name string, w io.Write
 	// -C <lxcpath> <name> stores paths relative to the container name, so a
 	// restore can extract under a different lxcpath. --numeric-owner keeps uid/gid
 	// stable across hosts that may not share /etc/passwd.
-	cmd := exec.CommandContext(ctx, "tar", "-C", r.lxcpath(), "--numeric-owner", "-cf", "-", name)
+	// --xattrs with every attribute and --acls keep file capabilities, ACLs
+	// and labels; setuid/setgid/sticky are in the mode. ImportContainer
+	// restores all of it (safename.ExtractRootfsTar).
+	cmd := exec.CommandContext(ctx, "tar", "-C", r.lxcpath(), "--numeric-owner",
+		"--xattrs", "--xattrs-include=*", "--acls", "-cf", "-", name)
 	stderr := strings.Builder{}
 	cmd.Stderr = stringWriter{&stderr}
 	cmd.Stdout = w

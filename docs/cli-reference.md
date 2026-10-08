@@ -689,6 +689,16 @@ lv snapshot restore <vm> <name>           # repeatable; memory snapshots are hos
 lv snapshot rm <vm> <name>
 ```
 
+`lv snapshot rm` never deletes a disk file that anything still backs on. It
+removes the snapshot's record. Only when it deletes the **last** snapshot of a
+**running** VM, a disk-only snapshot, with no other VM layered on any file of
+the VM's chain (a linked clone), does it also merge the VM's overlay into the
+snapshot's base and remove the overlay (layers under that base stay). In every
+other case — another snapshot remains, the VM is stopped, the snapshot is a
+memory snapshot, or a linked clone backs on the chain — every file stays where
+it is: the VM keeps its backing chain, and **the space the deleted snapshot
+held is not reclaimed**.
+
 ## Memory ballooning
 
 ```bash

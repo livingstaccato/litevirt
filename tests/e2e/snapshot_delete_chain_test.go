@@ -174,3 +174,95 @@ func TestLab_SnapshotCreateRmCyclesKeepTheChainDepth(t *testing.T) {
 	}
 	requireChainWhole(l, h, activeDisk(l, h, vm), "after the cycles")
 }
+
+// manifestTS is the manifest timestamp `lv backup snapshot` printed.
+func manifestTS(t *testing.T, out string) string {
+	t.Helper()
+	for _, ln := range strings.Split(out, "\n") {
+		if i := strings.Index(ln, "manifest="); i >= 0 {
+			if f := strings.Fields(ln[i+len("manifest="):]); len(f) > 0 {
+				return f[0]
+			}
+		}
+	}
+	t.Fatalf("no manifest timestamp in:\n%s", out)
+	return ""
+}
+
+// Review M-5: a stopped merge is `qemu-img commit`, which — unlike libvirt's
+// block-commit — may not carry the persistent dirty bitmaps (backup
+// checkpoints) of the merged layer into the base. Then the next incremental
+// backup diffs against a stale bitmap and silently misses the blocks the
+// merge brought down. Written from outside the guest, into the snapshot's
+// overlay while the VM is off, merged by the snapshot delete, then backed up
+// incrementally: the restored image must carry those bytes.
+func TestLab_IncrementalBackupAfterAnOfflineMergeCarriesEveryChangedBlock(t *testing.T) {
+	l := newLab(t)
+	h := labUpHosts(l, 1)[0]
+	vm := l.createVMs(h, "snapbk", h)[h]
+	repo := "/var/tmp/" + uniqueName("e2e-bkrepo")
+	restored := "/var/tmp/" + uniqueName("e2e-bkrestore") + ".img"
+	l.onRestore(func() { l.ssh(h, 60*time.Second, "rm -rf "+shellQuote(repo)+" "+shellQuote(restored)) })
+	l.mustLV(h, "backup", "repo", "init", repo)
+
+	// 1. A full guest-content backup: it establishes the checkpoint (a
+	// persistent dirty bitmap in the active layer) the next one diffs from.
+	l.mustLV(h, "backup", "snapshot", vm, "--repo", repo)
+	base := activeDisk(l, h, vm)
+	depth := chainDepth(l, h, base)
+
+	// 2. Off, a snapshot, and a pattern written into its overlay from
+	// outside the guest, near the disk's end (past what a small guest uses).
+	l.mustLV(h, "stop", vm)
+	if !l.waitDomainState(h, vm, "shut off", 3*time.Minute) {
+		t.Fatalf("%s did not stop", vm)
+	}
+	if out, err := l.lv(h, "snapshot", "create", vm, "bk1"); err != nil {
+		t.Fatalf("snapshot create %s bk1: %v\n%s", vm, err, out)
+	}
+	top := activeDisk(l, h, vm)
+	if top == base {
+		t.Fatalf("the snapshot did not cut %s over to an overlay (still on %s)", vm, base)
+	}
+	size, err := l.qemuVirtualSize(h, top)
+	if err != nil {
+		t.Fatal(err)
+	}
+	off := size - 4<<20
+	pattern := fmt.Sprintf("write -P 0xab %d 64k", off)
+	l.mustSSH(h, 60*time.Second, "qemu-io -f qcow2 -c "+shellQuote(pattern)+" "+shellQuote(top))
+	l.mark("snapbk: wrote 64k of 0xab at %d into %s", off, top)
+
+	// 3. The offline merge.
+	if out, err := l.lv(h, "snapshot", "rm", vm, "bk1"); err != nil {
+		t.Fatalf("snapshot rm %s bk1: %v\n%s", vm, err, out)
+	}
+	if got := activeDisk(l, h, vm); got != base {
+		t.Fatalf("after the merge %s is on %s, want %s — this test needs the offline merge", vm, got, base)
+	}
+	if got := chainDepth(l, h, base); got != depth {
+		t.Fatalf("after the merge the chain is %d deep, want %d", got, depth)
+	}
+
+	// 4. Running again, an incremental backup.
+	if out, err := l.lv(h, "start", vm); err != nil {
+		t.Fatalf("start %s: %v\n%s", vm, err, out)
+	}
+	if !l.waitDomainState(h, vm, "running", 3*time.Minute) {
+		t.Fatalf("%s is not running", vm)
+	}
+	out := l.mustLV(h, "backup", "snapshot", vm, "--repo", repo, "--incremental")
+	l.saveEvidence("snapbk-incremental.txt", out)
+	if !strings.Contains(out, "incremental guest-content backup") {
+		t.Logf("the second backup was not a bitmap-driven incremental, so a stale bitmap cannot show here:\n%s", out)
+	}
+	ts := manifestTS(t, out)
+
+	// 5. The restored image carries the merged bytes.
+	l.mustLV(h, "backup", "restore-from", "--repo", repo, "--vm", vm, "--disk", "root", "--timestamp", ts, "--target-path", restored)
+	read := fmt.Sprintf("read -P 0xab %d 64k", off)
+	if got, err := l.ssh(h, 60*time.Second, "qemu-io -r -c "+shellQuote(read)+" "+shellQuote(restored)); err != nil ||
+		strings.Contains(got, "Pattern verification failed") {
+		t.Fatalf("the incremental backup after an offline merge misses the merged blocks (stale checkpoint bitmap): %v\n%s", err, got)
+	}
+}

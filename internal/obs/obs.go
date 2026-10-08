@@ -24,7 +24,6 @@ package obs
 
 import (
 	"context"
-	"io"
 	"log/slog"
 	"math"
 	"net/url"
@@ -210,13 +209,6 @@ type Config struct {
 // use the LITEVIRT_* names (e.g. LITEVIRT_OTEL_ENDPOINT, LITEVIRT_LOG_LEVEL);
 // the vendor's PROVIDE_*/OTEL_* names are an internal detail of this package.
 func Setup(ctx context.Context, cfg Config) (func(context.Context) error, error) {
-	// Captured before SetupTelemetry runs: the vendor's own _configureLogger
-	// calls slog.SetDefault unconditionally as part of SetupTelemetry,
-	// regardless of any option obs passes — there's no way to opt out of that
-	// call itself. So "leave slog.Default() untouched" (finding 4) means obs
-	// must explicitly restore this value afterward, not merely skip its own
-	// SetDefault call.
-	preSetupDefault := slog.Default()
 	// Highest precedence: litevirt-native LITEVIRT_* operator overrides, mapped
 	// onto the vendor env contract. Applied first so the config-derived defaults
 	// below (setEnvDefault) will not clobber them.
@@ -244,20 +236,13 @@ func Setup(ctx context.Context, cfg Config) (func(context.Context) error, error)
 	if cfg.Environment != "" {
 		setEnvDefault("PROVIDE_TELEMETRY_ENV", cfg.Environment)
 	}
-	// Captured before the env is filled with defaults below, so it reflects
-	// only an actual operator/config ask (cfg field or a directly-exported
-	// PROVIDE_LOG_*/LITEVIRT_LOG_* value already mapped above) — used to decide
-	// whether local logging (no endpoint) adopts a stdlib handler at all
-	// (finding 4).
-	explicitLogLevel := cfg.LogLevel != "" || os.Getenv("PROVIDE_LOG_LEVEL") != ""
-	explicitLogFormat := cfg.LogFormat != "" || os.Getenv("PROVIDE_LOG_FORMAT") != ""
 	if cfg.LogLevel != "" {
 		setEnvDefault("PROVIDE_LOG_LEVEL", cfg.LogLevel)
 	}
-	// Default to "console" (human-readable text), matching the pre-telemetry
-	// daemon's stdlib text handler so an upgrade does not silently flip fleet log
-	// format and break journalctl/grep/alerts. Operators opt into structured logs
-	// with log_format: json.
+	// Default to "console": one key=value text line per record (level=,
+	// message=, then each attribute), the shape the daemon's journal lines
+	// already had. Operators opt into one JSON object per record with
+	// log_format: json.
 	setEnvDefault("PROVIDE_LOG_FORMAT", orDefault(cfg.LogFormat, "console"))
 	// obs exports LOGS + TRACES only — metrics stay on Prometheus (internal/metrics,
 	// pull /metrics). provide-telemetry defaults PROVIDE_METRICS_ENABLED=true and
@@ -380,15 +365,16 @@ func Setup(ctx context.Context, cfg Config) (func(context.Context) error, error)
 			traceExportErrors.Add(1)
 		}))
 
-		// litevirt's deliberately-non-secret token= capability lines (e.g.
-		// token=split_brain_gate_v1) must not be redacted in the exported log
-		// stream — litevirt owns its own log hygiene; the real collector
-		// credential is scrubbed separately (see credentialEnvVars below).
-		// Default OFF; an operator can re-enable vendor PII redaction with
-		// PROVIDE_LOG_SANITIZE=true. Must be set before SetupTelemetry, which
-		// reads it at logger-construction time.
-		setEnvDefault("PROVIDE_LOG_SANITIZE", "false")
 	}
+
+	// litevirt's deliberately-non-secret token= capability lines (e.g.
+	// token=split_brain_gate_v1) must not be redacted in the log stream, local
+	// or exported — litevirt owns its own log hygiene; the real collector
+	// credential is scrubbed separately (see credentialEnvVars below). Default
+	// OFF; an operator can re-enable vendor PII redaction with
+	// PROVIDE_LOG_SANITIZE=true. Must be set before SetupTelemetry, which reads
+	// it at logger-construction time.
+	setEnvDefault("PROVIDE_LOG_SANITIZE", "false")
 
 	_, err := telemetry.SetupTelemetry(setupOpts...)
 	// SetupTelemetry has now read the OTLP auth headers into the built exporters,
@@ -405,40 +391,27 @@ func Setup(ctx context.Context, cfg Config) (func(context.Context) error, error)
 	for _, k := range credentialEnvVars {
 		_ = os.Unsetenv(k)
 	}
-	// Adopting the vendor logger costs every record a ctx-merge/sampling/
-	// schema/PII-redaction pass — real cost that must not be paid when there's
-	// no collector to send to, and its default PII redaction mangles
-	// litevirt's deliberately-non-secret token= capability lines (finding 4).
-	// So local logging (no endpoint) only ever gets a plain stdlib handler,
-	// and ONLY when the operator explicitly asked for one via log_format/
-	// log_level — otherwise slog.Default() is left completely untouched,
-	// byte-for-byte parity with the pre-telemetry daemon (which never called
-	// slog.SetDefault at all).
-	var log *slog.Logger
-	switch {
-	case active:
-		// Even on error the library leaves a usable fallback logger; adopt it as
-		// the slog default so the whole tree logs through one pipeline. Guard
-		// nil: a nil return would make slog.SetDefault panic, turning fail-open
-		// into fail-closed at boot.
-		log = adoptLogger(telemetry.GetLogger(ctx, svc))
-		slog.SetDefault(log)
-	case explicitLogFormat || explicitLogLevel:
-		// Build from the resolved vendor env, not the cfg fields: the format/
-		// level can arrive via LITEVIRT_LOG_*/PROVIDE_LOG_* (mapped above) with
-		// the cfg fields empty, and reading cfg alone would silently drop an
-		// operator's env-set level/format back to INFO/text. PROVIDE_LOG_FORMAT
-		// is always set (console default above); PROVIDE_LOG_LEVEL only when an
-		// operator/config asked, and empty → INFO, matching prior behavior.
-		log = slog.New(newStdlibHandler(os.Stderr, os.Getenv("PROVIDE_LOG_FORMAT"), os.Getenv("PROVIDE_LOG_LEVEL")))
-		slog.SetDefault(log)
-	default:
-		// SetupTelemetry (above) already called slog.SetDefault internally via
-		// the vendor's own _configureLogger — undo it so the net effect is
-		// truly untouched, byte-for-byte parity with the pre-telemetry daemon.
-		slog.SetDefault(preSetupDefault)
-		log = preSetupDefault
-	}
+	// The vendor logger is the daemon's ONLY log pipeline, export or not.
+	//
+	// It used to be adopted only with an OTLP endpoint, and slog.Default() was
+	// otherwise "left untouched". It never was: SetupTelemetry has already
+	// called slog.SetDefault with the vendor logger, and slog.SetDefault also
+	// redirects the stdlib log package into that logger's handler. Restoring
+	// the pre-Setup default (whose handler formats a record to text and writes
+	// it through the log package) therefore fed every record, rendered as
+	// "ERROR container deleted name=x host=y", back into the vendor handler as
+	// the MESSAGE of a new INFO record. Every journal line came out level=INFO
+	// with its real level and attributes flattened into the message text.
+	//
+	// Adopting the vendor logger in every mode gives one structured record per
+	// call: its real level, the bare message, each attribute its own field, in
+	// the format the operator chose (console text by default, json, pretty),
+	// at the level they chose. The stdlib log package (third-party libraries)
+	// lands in the same handler as one INFO record per line, and gRPC's own
+	// logger is routed into it too (installGRPCLogger).
+	log := adoptLogger(telemetry.GetLogger(ctx, svc))
+	slog.SetDefault(log)
+	installGRPCLogger()
 	// One-line startup visibility so an operator can tell export state at a glance
 	// (a silent fail-open otherwise looks identical to "not configured"). Prints
 	// the actually-applied rate (what the injected sampler uses), not an env echo.
@@ -630,38 +603,6 @@ func buildTracerProvider(ctx context.Context, svc string, cfg Config, rate float
 		sdktrace.WithResource(res),
 		sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.TraceIDRatioBased(rate))),
 	), nil
-}
-
-// newStdlibHandler builds a plain standard-library slog handler for local
-// (no-OTLP-endpoint) structured/leveled logging — used only when an operator
-// explicitly asks for it via log_format/log_level (finding 4). No vendor
-// per-record cost, no PII redaction.
-func newStdlibHandler(w io.Writer, format, level string) slog.Handler {
-	opts := &slog.HandlerOptions{Level: parseStdlibLevel(level)}
-	if strings.EqualFold(format, "json") {
-		return slog.NewJSONHandler(w, opts)
-	}
-	return slog.NewTextHandler(w, opts)
-}
-
-// parseStdlibLevel maps litevirt's TRACE|DEBUG|INFO|WARNING|ERROR|CRITICAL
-// scale onto slog's four built-in levels, extending below Debug / above Error
-// for the two the stdlib doesn't have. Unknown/empty falls back to Info.
-func parseStdlibLevel(level string) slog.Level {
-	switch strings.ToUpper(level) {
-	case "TRACE":
-		return slog.LevelDebug - 4
-	case "DEBUG":
-		return slog.LevelDebug
-	case "WARNING":
-		return slog.LevelWarn
-	case "ERROR":
-		return slog.LevelError
-	case "CRITICAL":
-		return slog.LevelError + 4
-	default:
-		return slog.LevelInfo
-	}
 }
 
 func setEnvDefault(key, val string) {

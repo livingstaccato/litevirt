@@ -2,6 +2,7 @@ package obs
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"os"
 	"testing"
@@ -23,29 +24,34 @@ func TestSetup_InvalidSampleRateEnv_FallsBackToConfigRate(t *testing.T) {
 }
 
 // With no endpoint, an operator who sets the log format only via env
-// (LITEVIRT_LOG_FORMAT=json, cfg.LogFormat empty) must still get the stdlib
-// JSON handler — the resolved format lives in PROVIDE_LOG_FORMAT, not the cfg
-// field, so building the handler from cfg alone silently drops it.
-func TestSetup_NoEndpointEnvJSONFormat_InstallsStdlibJSONHandler(t *testing.T) {
+// (LITEVIRT_LOG_FORMAT=json, cfg.LogFormat empty) must still get JSON records —
+// the resolved format lives in PROVIDE_LOG_FORMAT, not the cfg field, so
+// building the handler from cfg alone would silently drop it.
+func TestSetup_NoEndpointEnvJSONFormat_WritesJSONRecords(t *testing.T) {
 	cleanEnv(t)
 	_ = os.Setenv("LITEVIRT_LOG_FORMAT", "json")
-	setup(t, Config{ServiceName: "s"})
-
-	if _, ok := slog.Default().Handler().(*slog.JSONHandler); !ok {
-		t.Errorf("slog.Default().Handler() = %T; want *slog.JSONHandler for env-set LITEVIRT_LOG_FORMAT=json with no endpoint", slog.Default().Handler())
+	lines := captureDaemonStderrEnv(t, Config{ServiceName: "s"}, func() {
+		slog.Warn("env json probe", "k", "v")
+	})
+	var rec map[string]any
+	if err := json.Unmarshal([]byte(lineWith(lines, "env json probe")), &rec); err != nil {
+		t.Fatalf("env-set LITEVIRT_LOG_FORMAT=json did not produce JSON records: %v (%q)", err, lines)
+	}
+	if rec["level"] != "WARN" || rec["k"] != "v" {
+		t.Fatalf("JSON record not structured: %v", rec)
 	}
 }
 
 // With no endpoint, an operator who sets the log level only via env
-// (LITEVIRT_LOG_LEVEL=DEBUG, cfg.LogLevel empty) must get a stdlib handler that
+// (LITEVIRT_LOG_LEVEL=DEBUG, cfg.LogLevel empty) must get a handler that
 // actually emits DEBUG. Building the handler from the empty cfg field drops to
 // INFO and swallows exactly the diagnostics the operator turned on.
-func TestSetup_NoEndpointEnvLogLevel_StdlibHandlerHonorsLevel(t *testing.T) {
+func TestSetup_NoEndpointEnvLogLevel_HandlerHonorsLevel(t *testing.T) {
 	cleanEnv(t)
 	_ = os.Setenv("LITEVIRT_LOG_LEVEL", "DEBUG")
 	setup(t, Config{ServiceName: "s"})
 
 	if !slog.Default().Handler().Enabled(context.Background(), slog.LevelDebug) {
-		t.Error("stdlib handler does not honor env-set LITEVIRT_LOG_LEVEL=DEBUG; debug records would be dropped")
+		t.Error("handler does not honor env-set LITEVIRT_LOG_LEVEL=DEBUG; debug records would be dropped")
 	}
 }

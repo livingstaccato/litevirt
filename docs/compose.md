@@ -134,6 +134,13 @@ state, and the next `compose up` plans against the live VMs, so it retries
 exactly the actions that failed and the stack returns to `active` once they
 all succeed.
 
+`compose down` deletes only the VMs the stack created: a VM is the stack's when
+its record names the stack, as the stack's `compose up` records it. A VM that
+merely has a member's name — created on its own (by the UI, by hand or by another
+stack) after a failed `compose up` left that name in the stored file — is left
+alone, logged at WARN, and reported as `kept <name>: ...`, naming the stack it
+belongs to.
+
 `compose down` follows the same rule. It ends with `Stack "<name>" torn down.`
 and exit status 0 only when every VM and container was deleted and every stack
 network deprovisioned. If any could not be — or the stack's containers could

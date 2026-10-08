@@ -94,9 +94,10 @@ func (s *Server) holdStartLease(ctx context.Context, holder, vmName, notDone, re
 // staleStartLease says why the VM's start lease held by heldBy has no live
 // holder behind it, or "" when it may: a lease this host took before this
 // daemon started (a run that crashed holding it), or one whose holder's host
-// is no longer an active member of the cluster. A holder on another active
-// host, a component of this daemon, or anything that cannot be read counts
-// as live.
+// is known not to be an active member: its row says another state, or it
+// was removed. A holder on another active host, a host this replica has no
+// row for yet, a component of this daemon, or anything that cannot be read
+// counts as live.
 func (s *Server) staleStartLease(ctx context.Context, vmName, heldBy string) string {
 	host, _, _ := strings.Cut(heldBy, "/")
 	if host == s.hostName {
@@ -119,7 +120,12 @@ func (s *Server) staleStartLease(ctx context.Context, vmName, heldBy string) str
 		return ""
 	}
 	if rec == nil {
-		return "its host " + host + " is not in the cluster"
+		// No live row: removed (its row tombstoned), or a host whose row has
+		// not reached this replica yet. Only the first is known to be gone.
+		if removed, rerr := corrosion.HostRemoved(ctx, s.db, host); rerr == nil && removed {
+			return "its host " + host + " was removed from the cluster"
+		}
+		return ""
 	}
 	if rec.State != "active" {
 		return "its host " + host + " is " + rec.State

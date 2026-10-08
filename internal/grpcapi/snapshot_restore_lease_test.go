@@ -162,7 +162,13 @@ func TestRestoreSnapshot_TakesOverAStaleStartLease(t *testing.T) {
 				t.Fatalf("setup: lease %q %v", h, err)
 			}
 		}},
-		{"a host the cluster no longer has", func(t *testing.T, s *Server) {
+		{"a host removed from the cluster", func(t *testing.T, s *Server) {
+			if err := corrosion.InsertHost(adminCtx(), s.db, corrosion.HostRecord{Name: "gone-host", Address: "10.0.0.3", State: "active"}); err != nil {
+				t.Fatal(err)
+			}
+			if err := corrosion.DeleteHost(adminCtx(), s.db, "gone-host"); err != nil {
+				t.Fatal(err)
+			}
 			if h, err := health.TryVMStartLease(adminCtx(), s.db, "gone-host", "rs", time.Now()); err != nil || h != "gone-host" {
 				t.Fatalf("setup: lease %q %v", h, err)
 			}
@@ -192,6 +198,9 @@ func TestRestoreSnapshot_RefusedWhileALiveHolderHasTheLease(t *testing.T) {
 		setup  func(t *testing.T, s *Server)
 	}{
 		{"this daemon", "", func(t *testing.T, s *Server) { s.startedAt = time.Now().Add(-time.Hour) }},
+		// A host whose hosts row has not reached this replica yet (re-review
+		// R1-M2): nothing says it is gone, so it counts as live.
+		{"a host this replica has no row for", "new-host", func(t *testing.T, s *Server) {}},
 		{"an active host", "host-b/repair", func(t *testing.T, s *Server) {
 			if err := corrosion.InsertHost(adminCtx(), s.db, corrosion.HostRecord{Name: "host-b", Address: "10.0.0.2", State: "active"}); err != nil {
 				t.Fatal(err)

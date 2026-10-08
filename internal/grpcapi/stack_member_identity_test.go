@@ -198,3 +198,41 @@ func TestStackNetworkUsers_AVMKeptAtDeleteTimeKeepsItsNetwork(t *testing.T) {
 		t.Fatalf("users = %v, want the kept VM web", users)
 	}
 }
+
+// Re-review 2, m-4: the wiring. A member re-created as another incarnation
+// of the same stack between the teardown's listing and its delete is kept
+// (the owner's binding check), and the network it uses is kept with it.
+func TestDeleteStack_AMemberKeptAtDeleteTimeKeepsItsNetwork(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	ctx := adminContext(context.Background())
+	if err := corrosion.UpsertStack(ctx, s.db, corrosion.StackRecord{
+		Name: "st", State: "active",
+		ComposeYAML: "name: st\nvms:\n  web:\n    image: tiny\n    cpu: 1\n    memory: 256\n",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.UpsertNetwork(ctx, s.db, corrosion.NetworkRecord{Name: "st_lan", StackName: "st", Type: "bridge", Config: "{}"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertVM(ctx, s.db,
+		corrosion.VMRecord{Name: "web", StackName: "st", HostName: "test-host", State: "stopped", CPUActual: 1, MemActual: 256},
+		[]corrosion.InterfaceRecord{{VMName: "web", NetworkName: "st_lan", MAC: "52:54:00:00:00:03"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	s.stackMemberDeleteHook = func(name string) {
+		if _, err := s.db.ExecuteRows(ctx, `UPDATE vms SET created_at = ? WHERE name = ?`, "2099-01-01T00:00:00Z", name); err != nil {
+			t.Errorf("re-create %s: %v", name, err)
+		}
+	}
+	stream := &mockDeleteStreamR2{ctx: ctx}
+	if err := s.DeleteStack(&pb.DeleteStackRequest{Name: "st"}, stream); err != nil {
+		t.Fatalf("DeleteStack: %v", err)
+	}
+	if vm, _ := corrosion.GetVM(ctx, s.db, "web"); vm == nil {
+		t.Fatalf("the other incarnation was deleted: %+v", stream.sent)
+	}
+	if nr, _ := corrosion.GetNetwork(ctx, s.db, "st_lan"); nr == nil {
+		t.Fatalf("the network the kept VM uses was deprovisioned under it: %+v", stream.sent)
+	}
+}

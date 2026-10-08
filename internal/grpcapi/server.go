@@ -317,6 +317,10 @@ type Server struct {
 	enfProjectAuthority bool
 	// commitFenceHook is a test-only seam; see SetCommitFenceHook.
 	commitFenceHook func(op string)
+	// stackMemberDeleteHook is a test-only seam: DeleteStack calls it with
+	// each member's name right before deleting it, where a test re-creates
+	// the VM as another incarnation.
+	stackMemberDeleteHook func(name string)
 	// restoreClaimedHook is a test-only seam; see SetRestoreClaimedHook.
 	restoreClaimedHook func(name string)
 	// repairLeaseHook is a test-only seam run while a compose repair holds the

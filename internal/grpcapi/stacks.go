@@ -940,6 +940,9 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 			return err
 		}
 
+		if h := s.stackMemberDeleteHook; h != nil {
+			h(vm.Name)
+		}
 		delErr := s.deleteVMWithFanout(ctx, stackMember{Name: vm.Name, Stack: req.Name, CreatedAt: vm.CreatedAt}, req.KeepDisks)
 		if errors.Is(delErr, errNotStackMember) {
 			keptAtDelete = append(keptAtDelete, vm.Name)

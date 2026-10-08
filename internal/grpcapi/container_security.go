@@ -145,6 +145,11 @@ func (s *Server) allocateIDMapBase(ctx context.Context, name string) (int64, err
 		if sec.IDMap != nil {
 			used[sec.IDMap.Base] = true
 		}
+		// An unfinished convert's target is taken while its marker exists,
+		// however long ago the ledger entry was written: it resumes into it.
+		if sec.Converting && sec.ConvertTo != nil && sec.ConvertTo.IDMap != nil {
+			used[sec.ConvertTo.IDMap.Base] = true
+		}
 	}
 	_, n := s.idmapConfig()
 	start := s.idmapStartSlot()

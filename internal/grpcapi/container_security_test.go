@@ -367,3 +367,24 @@ func TestPrepareContainerTarget_ValidatesTheRange(t *testing.T) {
 		t.Fatalf("ensured %v", rt.got)
 	}
 }
+
+// A range an unfinished convert recorded stays taken for as long as its
+// marker exists, after the ledger has forgotten it: the convert resumes into
+// it.
+func TestAllocateIDMapBase_AConvertMarkersRangeIsTaken(t *testing.T) {
+	s, rt := secServer(t)
+	s.dataDir = "" // no ledger at all: only the marker can hold the range
+	first := s.idmapSlotBase(s.idmapStartSlot())
+	rt.listNames = []string{"half"}
+	rt.security = map[string]lxc.Security{"half": {
+		Confinement: lxc.ConfinementLegacy, Converting: true,
+		ConvertTo: &lxc.ConvertOpts{IDMap: &lxc.IDMap{Base: first, Size: lxc.IDMapSize}},
+	}}
+	got, err := s.allocateIDMapBase(context.Background(), "new")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == first {
+		t.Fatalf("allocated %d, the range an unfinished convert of another container holds", got)
+	}
+}

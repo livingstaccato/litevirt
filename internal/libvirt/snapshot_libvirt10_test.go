@@ -1,7 +1,9 @@
 package libvirt
 
 import (
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -615,4 +617,61 @@ func TestRepointRevertedDisk(t *testing.T) {
 	if _, err := repointRevertedDisk(in, "vdz", "/x"); err == nil {
 		t.Error("a missing disk was not an error")
 	}
+}
+
+func fileSum(t *testing.T, p string) string {
+	t.Helper()
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatalf("read %s: %v", p, err)
+	}
+	return fmt.Sprintf("%x", sha256.Sum256(b))
+}
+
+// Re-review R2-C1: restoring the same older memory snapshot again must
+// bring its RAM back on the overlay the first restore made, not on the
+// snapshot's own overlay the saved image names — that file is the later
+// snapshot's base and holds the later writes. Every step reads the right
+// markers, and the later snapshot's files never change.
+func TestRevert_AnOlderMemorySnapshotAgainAndBack(t *testing.T) {
+	m := newLibvirt10(t)
+	m.write(markA, 1)
+	save1 := m.memorySnapshot("m1")
+	m1 := m.active()
+	m.write(markB, 2)
+	save2 := m.memorySnapshot("m2")
+	m2 := m.active()
+	m.write(markC, 3)
+	sums := map[string]string{m1: fileSum(t, m1)}
+	check := func(when string, want map[byte]bool) {
+		t.Helper()
+		for p, present := range want {
+			if got := m.has(p, map[byte]int{markA: 1, markB: 2, markC: 3}[p]); got != present {
+				t.Errorf("%s: marker 0x%02x present=%v, want %v (qemu opens %s)", when, p, got, present, m.qemuSpec("vda"))
+			}
+		}
+		for f, sum := range sums {
+			if got := fileSum(t, f); got != sum {
+				t.Errorf("%s: %s, a later snapshot's file, changed", when, filepath.Base(f))
+			}
+		}
+	}
+	m.revertLive("m1", save1)
+	check("restore m1", map[byte]bool{markA: true, markB: false, markC: false})
+	m.write(markC, 3) // the guest writes after the restore
+	m.revertLive("m1", save1)
+	check("restore m1 again", map[byte]bool{markA: true, markB: false, markC: false})
+	if got := m.active(); got == m1 {
+		t.Fatalf("the second restore of m1 runs on %s, m2's base", got)
+	}
+	m.revertLive("m2", save2)
+	check("restore m2", map[byte]bool{markA: true, markB: true, markC: false})
+	sums[m2] = fileSum(t, m2)
+	m.write(markC, 3)
+	m.revertLive("m2", save2)
+	check("restore m2 again", map[byte]bool{markA: true, markB: true, markC: false})
+	if err := m.stopAndStart(); err != nil {
+		t.Fatal(err)
+	}
+	check("after a stop and start", map[byte]bool{markA: true, markB: true, markC: false})
 }

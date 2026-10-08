@@ -380,6 +380,15 @@ func TestLab_SnapshotRestoreOlderThenDeleteBoth(t *testing.T) {
 			requireRestoredOnto(l, h, vm, root, s1, s2)
 			requireSnapVMWhole(l, h, vm, map[byte]bool{snapMarkA: true, snapMarkB: false})
 
+			// The same snapshot again (re-review R2-C1): a memory restore
+			// must come back on that overlay, not on s1's own (s2's base).
+			snapRestore(l, h, vm, "s1")
+			requireRestoredOnto(l, h, vm, root, s1, s2)
+			requireSnapVMWhole(l, h, vm, map[byte]bool{snapMarkA: true, snapMarkB: false})
+
+			snapRestore(l, h, vm, "s2")
+			requireRestoredOnto(l, h, vm, s1, s2)
+			requireSnapVMWhole(l, h, vm, map[byte]bool{snapMarkA: true, snapMarkB: true})
 			snapRestore(l, h, vm, "s2")
 			requireRestoredOnto(l, h, vm, s1, s2)
 			requireSnapVMWhole(l, h, vm, map[byte]bool{snapMarkA: true, snapMarkB: true})

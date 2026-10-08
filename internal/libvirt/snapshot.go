@@ -647,11 +647,16 @@ func revertToLiveSnapshot(v snapshotAPI, domainName, snapshotName, vmstatePath s
 			restoreXML, savedXML = rewritten, rewritten
 		}
 	}
-	// The saved image names the overlays the snapshot made. A disk moved to
-	// a new overlay is restored onto it instead, with the old chain dropped,
-	// or the RAM would come back over a disk holding later writes.
+	// The saved image names the overlays the snapshot made. Every disk is
+	// restored onto the overlay it will run on — a new one, or one an
+	// earlier restore of this snapshot made — with the old chain dropped,
+	// whenever that is not the overlay the image names: the RAM would come
+	// back over a disk holding later writes, and the guest would write into
+	// a later snapshot's base (re-review R2-C1). Compared with the image's
+	// own sources, not with the live layer.
+	savedDisks := parseDomainDiskSources(savedXML)
 	for _, r := range resets {
-		if r.target == r.live {
+		if savedDisks[r.dev] == r.target {
 			continue
 		}
 		if restoreXML == "" {

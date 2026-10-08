@@ -700,7 +700,13 @@ rather than unlink. Two cases keep every file:
 - a snapshot libvirt does not hold as current and that has no children — as
   a restore by an earlier build left one — is deleted as metadata only, with a
   warning in the log: the VM keeps its backing chain, and the space is not
-  reclaimed.
+  reclaimed;
+- so is a snapshot libvirt cannot merge because its overlay is no longer in
+  the VM's live chain. Restoring an older snapshot while a later one exists
+  leaves the restored one so: its overlay file stays on disk, unused.
+
+The refusal for a linked clone comes first, and applies to these metadata-only
+deletes too.
 
 A restore holds the VM's start lease while it brings the domain down and back,
 so no start path restarts it midway; it is refused while a start holds it.

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -372,7 +373,87 @@ func deleteSnapshot(v snapshotAPI, domainName, snapshotName string) error {
 			"vm", domainName, "snapshot", snapshotName)
 		return v.DomainSnapshotDelete(snap, golibvirt.DomainSnapshotDeleteMetadataOnly)
 	}
+	// The other case libvirt cannot handle: a snapshot it would merge, whose
+	// overlay is not in the VM's live chain over the disk it was taken of.
+	// libvirt refuses that merge ("... disk source ... not the same"), every
+	// time, so the snapshot could never be deleted and its record would keep
+	// blocking migrate and move. Restoring an older snapshot while a later
+	// one exists leaves it this way: the revert resets the live overlay over
+	// the older snapshot's base, and the older snapshot's own overlay drops
+	// out of the chain. Nothing libvirt would merge is in use, so only the
+	// metadata goes and every file stays.
+	if why := notInLiveChain(v, dom, snap); why != "" {
+		slog.Warn("snapshot delete: libvirt cannot merge this snapshot ("+why+"); "+
+			"deleting its metadata only and keeping its files",
+			"vm", domainName, "snapshot", snapshotName)
+		return v.DomainSnapshotDelete(snap, golibvirt.DomainSnapshotDeleteMetadataOnly)
+	}
 	return v.DomainSnapshotDelete(snap, golibvirt.DomainSnapshotDeleteFlags(0))
+}
+
+// notInLiveChain says why libvirt cannot merge the snapshot — an external
+// disk whose overlay is not in the domain's live chain, or is not backed
+// there by the disk the snapshot was taken of — or "" when every disk is in
+// place. Read from the domain's disk sources and the qcow2 headers; what
+// cannot be read is a reason, so the delete keeps the files.
+func notInLiveChain(v snapshotAPI, dom golibvirt.Domain, snap golibvirt.DomainSnapshot) string {
+	snapXML, err := v.DomainSnapshotGetXMLDesc(snap, 0)
+	if err != nil {
+		return "snapshot XML: " + err.Error()
+	}
+	domXML, err := v.DomainGetXMLDesc(dom, 0)
+	if err != nil {
+		return "domain XML: " + err.Error()
+	}
+	live := parseDomainDiskSources(domXML)
+	bases := parseSnapshotDomainDisks(snapXML)
+	for dev, overlay := range parseSnapshotOverlays(snapXML) {
+		top, ok := live[dev]
+		if !ok {
+			return "disk " + dev + " is not in the domain"
+		}
+		layers, err := qcow2Chain(top)
+		idx := -1
+		for i, l := range layers {
+			if filepath.Clean(l) == filepath.Clean(overlay) {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			if err != nil {
+				return "disk " + dev + ": " + err.Error()
+			}
+			return "disk " + dev + ": its overlay " + overlay + " is not in the live chain of " + top
+		}
+		if idx+1 >= len(layers) || filepath.Clean(layers[idx+1]) != filepath.Clean(bases[dev]) {
+			if err != nil {
+				return "disk " + dev + ": " + err.Error()
+			}
+			return "disk " + dev + ": its overlay " + overlay + " is not backed by " + bases[dev] + " in the live chain"
+		}
+	}
+	return ""
+}
+
+// qcow2Chain is file and the layers under it, from the qcow2 headers, as
+// far as they can be read (bounded); the error says where the walk stopped.
+func qcow2Chain(file string) ([]string, error) {
+	var out []string
+	p := file
+	for depth := 0; p != "" && depth < 64; depth++ {
+		info, err := qcow2.Info(p)
+		if err != nil {
+			return out, fmt.Errorf("read %s: %w", p, err)
+		}
+		out = append(out, p)
+		b := info.BackingFile
+		if b != "" && !filepath.IsAbs(b) {
+			b = filepath.Join(filepath.Dir(p), b)
+		}
+		p = b
+	}
+	return out, nil
 }
 
 // leafNotCurrent reports a snapshot libvirt would delete without merging:

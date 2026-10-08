@@ -366,3 +366,25 @@ func TestSnapshotDiskFiles_NamesWhatALinkedCloneBacksOn(t *testing.T) {
 		t.Fatal("the model's delete left the clone's chain whole; the test no longer shows why guard (b) is needed")
 	}
 }
+
+// Restoring an older snapshot while a later one exists (review I-2): the
+// revert resets the live overlay over the older snapshot's base, so the
+// restored snapshot's own overlay is out of the live chain. libvirt can
+// never merge it (its overlay must be in the chain), so the delete was
+// refused for good, and a snapshot record blocks migrate and move. It is
+// deleted as metadata only, and the VM stays whole.
+func TestSnapshotDelete_RestoreOlderThenDeleteBoth(t *testing.T) {
+	for _, order := range [][2]string{{"m2", "m1"}, {"m1", "m2"}} {
+		t.Run(order[0]+"-then-"+order[1], func(t *testing.T) {
+			m := newLibvirt10(t)
+			m.write(markA, 1)
+			m.snapshot("m1")
+			m.write(markB, 2)
+			m.snapshot("m2")
+			m.revert("m1")
+			m.rm(order[0])
+			m.rm(order[1])
+			m.requireWhole(map[byte]bool{markA: true, markB: false})
+		})
+	}
+}

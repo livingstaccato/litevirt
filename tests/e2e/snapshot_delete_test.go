@@ -282,3 +282,23 @@ func TestLab_SnapshotScenario3_LinkedCloneOnTheSnapshot(t *testing.T) {
 	snapRm(l, h, src, "s1")
 	requireSnapVMWhole(l, h, src, map[byte]bool{snapMarkA: true})
 }
+
+// Restoring an older snapshot while a later one exists (review I-2): the
+// restored snapshot's overlay drops out of the live chain, so libvirt can
+// never merge it. Both deletes go through as metadata only, and the VM keeps
+// the restored data.
+func TestLab_SnapshotRestoreOlderThenDeleteBoth(t *testing.T) {
+	l := newLab(t)
+	h, vm := snapTestVM(l, "snapold")
+	snapWrite(l, h, vm, snapMarkA)
+	snapCreate(l, h, vm, "d1", false)
+	snapWrite(l, h, vm, snapMarkB)
+	snapCreate(l, h, vm, "d2", false)
+	snapRestore(l, h, vm, "d1")
+	snapRm(l, h, vm, "d2")
+	snapRm(l, h, vm, "d1")
+	if out := l.mustLV(h, "snapshot", "ls", vm); strings.Contains(out, "d1") || strings.Contains(out, "d2") {
+		t.Fatalf("snapshots left after both deletes:\n%s", out)
+	}
+	requireSnapVMWhole(l, h, vm, map[byte]bool{snapMarkA: true, snapMarkB: false})
+}

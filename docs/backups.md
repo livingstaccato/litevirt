@@ -616,7 +616,10 @@ a way to overwrite another project's VM disk.
 - **`--target-path`**: names the file. It needs `storage.hostpath` — the
   **admin** role — whether it is a bare name (under `<data_dir>/disks`) or an
   absolute path, and an existing file there is refused with `AlreadyExists`,
-  for an admin too.
+  for an admin too, naming `--in-place`. The one exception is `restore-from`
+  with exactly the file the VM's own record names for that disk (as earlier
+  releases allowed): that restore is `--in-place`, with every check and the
+  rebuild above.
 
 A custom absolute `repo_path` also requires the **admin** role.
 

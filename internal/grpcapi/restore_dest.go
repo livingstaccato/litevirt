@@ -36,7 +36,8 @@ import (
 //
 //   - a fresh file the daemon names (no target_path) — created no-clobber;
 //   - a file an admin names (target_path) — also no-clobber: an existing file is
-//     a refusal, for an admin too;
+//     a refusal, for an admin too, unless it is exactly the destination VM's
+//     own recorded disk file, which RestoreFromBackup restores as in_place;
 //   - in place, the disk the VM's own record names, for a VM in the backup's
 //     project that is stopped on this host. This is the only destination a
 //     restore replaces, and its path comes from the record, never the request.
@@ -83,6 +84,43 @@ func (s *Server) resolveAdminTarget(ctx context.Context, targetPath, defaultDir 
 		return "", err
 	}
 	return target, nil
+}
+
+// resolveRestoreFromTarget is resolveAdminTarget for RestoreFromBackup: an
+// admin's target_path that already exists is refused, except when it is
+// exactly the recorded file of disk diskName of VM vmName on this host —
+// main (3e4ba50b) restored over a named file, and the VM's own disk is the
+// one file a restore may replace. ownDisk reports that case, which the
+// caller restores as in_place does, with all of its checks.
+func (s *Server) resolveRestoreFromTarget(ctx context.Context, targetPath, defaultDir, vmName, diskName string) (target string, ownDisk bool, err error) {
+	if err := s.requireAdminTargetPath(ctx); err != nil {
+		return "", false, err
+	}
+	if target, err = s.resolveRestoreTarget(ctx, targetPath, defaultDir); err != nil {
+		return "", false, err
+	}
+	eerr := refuseExistingFile(target)
+	if eerr == nil || status.Code(eerr) != codes.AlreadyExists {
+		return target, false, eerr
+	}
+	disks, derr := corrosion.GetVMDisks(ctx, s.db, vmName)
+	if derr != nil {
+		return "", false, status.Errorf(codes.Internal, "list disks: %v", derr)
+	}
+	for _, d := range disks {
+		if d.DiskName == diskName && (d.HostName == "" || d.HostName == s.hostName) &&
+			filepath.IsAbs(d.Path) && filepath.Clean(d.Path) == filepath.Clean(target) {
+			return target, true, nil
+		}
+	}
+	return "", false, existingTargetRefusal(target)
+}
+
+// existingTargetRefusal is the refusal of a restore target_path that already
+// exists and is not the VM's own disk.
+func existingTargetRefusal(path string) error {
+	return status.Errorf(codes.AlreadyExists,
+		"%q already exists; a restore never replaces a file it is merely given — to restore over the VM's own disk, use --in-place (in_place), which takes the file from the VM's record", path)
 }
 
 // refuseExistingFile reports a destination that is already taken — by a file,

@@ -264,7 +264,8 @@ By default the daemon writes a new file of its own under <data_dir>/disks and
 prints where. --in-place restores over the disk the VM's record names instead:
 the VM must be in the backup's project, on the daemon's host, and stopped.
 --target-path names the file to write; it requires the admin role, and an
-existing file there is refused, never replaced.`,
+existing file there is refused, never replaced — except exactly the file the
+VM's record names for --disk, which is restored as --in-place restores it.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			for name, val := range map[string]string{
 				"--repo": repo, "--vm": vm, "--disk": disk, "--timestamp": ts,
@@ -306,7 +307,7 @@ existing file there is refused, never replaced.`,
 	cmd.Flags().StringVar(&vm, "vm", "", "VM name (matches manifest)")
 	cmd.Flags().StringVar(&disk, "disk", "", "Disk name")
 	cmd.Flags().StringVar(&ts, "timestamp", "", "Manifest timestamp (exact RFC3339)")
-	cmd.Flags().StringVar(&target, "target-path", "", "File to write (admin only; never an existing file). Default: a new file the daemon names")
+	cmd.Flags().StringVar(&target, "target-path", "", "File to write (admin only; never an existing file but the VM's own disk, then as --in-place). Default: a new file the daemon names")
 	cmd.Flags().BoolVar(&inPlace, "in-place", false, "Restore over the disk the VM's record names (the VM must be stopped)")
 	return cmd
 }

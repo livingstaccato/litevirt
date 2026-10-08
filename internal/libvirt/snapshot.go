@@ -283,19 +283,42 @@ func (c *Client) waitBlockJobReady(dom golibvirt.Domain, dev string) error {
 	return fmt.Errorf("block job on %s did not reach ready state in time", dev)
 }
 
-// DeleteSnapshot removes a named snapshot from a domain.
+// DeleteSnapshot removes libvirt's record of a named snapshot, and only that:
+// no disk file is merged, moved or deleted. litevirt's snapshots are
+// external and litevirt manages their files itself (FlattenSnapshot, the
+// reverts' overlay resets), deleting libvirt's record metadata-only as here.
+//
+// Never let libvirt delete an external snapshot's files. libvirt >= 9 does,
+// and decides how by its own current/parent bookkeeping, which litevirt's
+// reverts do not keep (they undefine the domain and re-register the snapshot
+// without them): a snapshot it judges a "leaf non-active" one has the disk
+// its embedded domain was on UNLINKED — the snapshot's base, under every
+// later layer of the VM — and a current one is block-committed and its
+// overlay unlinked, though a linked clone may back on it (lab-recheck-5,
+// lines 81 and 82: a VM and a linked clone left without their disks).
 func (c *Client) DeleteSnapshot(domainName, snapshotName string) error {
-	dom, err := c.virt.DomainLookupByName(domainName)
+	return deleteSnapshotMetadata(c.virt, domainName, snapshotName)
+}
+
+// snapshotMetadataAPI is the part of libvirt deleteSnapshotMetadata uses.
+type snapshotMetadataAPI interface {
+	DomainLookupByName(name string) (golibvirt.Domain, error)
+	DomainSnapshotLookupByName(dom golibvirt.Domain, name string, flags uint32) (golibvirt.DomainSnapshot, error)
+	DomainSnapshotDelete(snap golibvirt.DomainSnapshot, flags golibvirt.DomainSnapshotDeleteFlags) error
+}
+
+func deleteSnapshotMetadata(v snapshotMetadataAPI, domainName, snapshotName string) error {
+	dom, err := v.DomainLookupByName(domainName)
 	if err != nil {
 		return fmt.Errorf("lookup domain %q: %w", domainName, err)
 	}
 
-	snap, err := c.virt.DomainSnapshotLookupByName(dom, snapshotName, 0)
+	snap, err := v.DomainSnapshotLookupByName(dom, snapshotName, 0)
 	if err != nil {
 		return fmt.Errorf("snapshot %q not found: %w", snapshotName, err)
 	}
 
-	return c.virt.DomainSnapshotDelete(snap, golibvirt.DomainSnapshotDeleteFlags(0))
+	return v.DomainSnapshotDelete(snap, golibvirt.DomainSnapshotDeleteMetadataOnly)
 }
 
 // CreateLiveSnapshot captures both the guest's disks AND its RAM/CPU state at a

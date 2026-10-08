@@ -447,6 +447,11 @@ func (s *Server) DeleteSnapshot(ctx context.Context, req *pb.DeleteSnapshotReque
 	// snapshots (own revert/RAM mechanism) and multi-snapshot chains keep the
 	// metadata-only delete; a flatten failure falls back to it too, so the
 	// snapshot is always removable.
+	//
+	// The metadata-only delete (s.virt.DeleteSnapshot) touches no disk file:
+	// every file stays where every chain — this VM's later layers, its other
+	// snapshots' bases, a linked clone's — expects it. Only a flatten merges
+	// and removes, and only when nothing else is layered on the chain.
 	existing, _ := corrosion.ListSnapshots(ctx, s.db, req.VmName)
 	// An errored snapshot (e.g. a failed --with-memory capture that still cut the
 	// disk overlay over) has no usable RAM image — its only residue is the disk
@@ -454,6 +459,18 @@ func (s *Server) DeleteSnapshot(ctx context.Context, req *pb.DeleteSnapshotReque
 	// otherwise the VM is left stranded on an untracked overlay chain (G1).
 	flattenable := snap == nil || snap.Type != "memory" || snap.State == "error"
 	flatten := vm.State == "running" && len(existing) <= 1 && flattenable
+	// A flatten writes this VM's overlay into the snapshot's base and removes
+	// the overlay. Another VM layered on any file of this VM's chain — a
+	// linked clone, of this build or an earlier one — would lose its disk,
+	// so the files are kept instead: the metadata-only delete below touches
+	// no file. "Cannot tell" keeps them too.
+	if flatten {
+		if deps, err := s.vmChainDependents(ctx, req.VmName); err != nil || len(deps) > 0 {
+			slog.Info("delete snapshot: keeping the disk chain — other VMs are layered on it",
+				"vm", req.VmName, "snap", req.SnapshotName, "dependents", deps, "error", err)
+			flatten = false
+		}
+	}
 
 	var delErr error
 	if flatten {

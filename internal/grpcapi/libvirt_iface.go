@@ -95,6 +95,8 @@ type LibvirtBackend interface {
 	// Snapshots.
 	CreateSnapshot(domainName, snapshotName string) (int64, error)
 	RevertToSnapshot(domainName, snapshotName string, restorePreDefine func() error) error
+	// DeleteSnapshot removes the snapshot's metadata only: it never merges,
+	// moves or deletes a disk file (see libvirt.Client.DeleteSnapshot).
 	DeleteSnapshot(domainName, snapshotName string) error
 	// FlattenSnapshot live-merges each disk's active overlay down into the named
 	// snapshot's base (block-commit + pivot), then drops the snapshot metadata —

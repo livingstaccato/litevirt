@@ -229,15 +229,17 @@ verb at `/` (Admin and NetworkAdmin hold it; Operator holds only `sg.read`; a
 cluster with no role bindings falls back to the operator role), and re-renders
 the connected host's ruleset at once, as the other tiers do. Against a daemon
 older than these RPCs the four commands fail with an error saying to upgrade
-litevirtd; they do not fall back to writing the database. `lv sg ls` and
-`lv sg rule-ls` are reads and still query the local database.
+litevirtd; they do not fall back to writing the database.
 
-The web UI reads security groups through the `ListSecurityGroups` RPC with the
-session's bearer, never from its local database. It checks the `sg.read` verb
+`lv sg ls` and `lv sg rule-ls`, and the web UI, read security groups through
+the `ListSecurityGroups` RPC with the caller's credential. The CLI reads the
+node's local database instead only when the daemon cannot answer at all: it is
+down, or it predates the RPC. It says so on stderr when it does. A refusal is
+never routed around that way. The RPC checks the `sg.read` verb
 at `/` (every built-in role with `*.read` or `sg.read` holds it; with no role
 bindings, any viewer), so a token scoped to a project, or a grant below the
-cluster root, gets a 403 on `/security-groups` and no group names in the
-Add-NIC dialog.
+cluster root, gets a 403 on `/security-groups`, no group names in the
+Add-NIC dialog, and a permission error from `lv sg ls` and `lv sg rule-ls`.
 
 ## Default-deny rollout
 

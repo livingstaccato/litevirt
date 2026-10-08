@@ -19,8 +19,9 @@ import (
 // newSGCmd groups security-group subcommands. Every write goes through the
 // daemon (CreateSecurityGroup, DeleteSecurityGroup, AddSecurityGroupRule,
 // RemoveSecurityGroupRule, BindSecurityGroups), which authorizes it and records
-// it in the signed audit log (colonelpanik/litevirt#182). The listings still
-// read the local Corrosion database. The reconciler on each host watches the
+// it in the signed audit log (colonelpanik/litevirt#182). The listings read
+// through ListSecurityGroups, falling back to the local Corrosion database only
+// when the daemon cannot answer (listSecurityGroups). The reconciler on each host watches the
 // same tables and re-applies its firewall plan when rules change — see
 // internal/firewall/reconciler.go.
 func newSGCmd() *cobra.Command {
@@ -69,9 +70,10 @@ func newSGBindCmd() *cobra.Command {
 	return cmd
 }
 
-// openClusterDB opens the local Corrosion database, read-only use: the
-// listings. Writes must go through the daemon (see sgRPCError).
-func openClusterDB() (*corrosion.Client, error) {
+// openClusterDB opens the local Corrosion database. Only the listings use it,
+// and only when the daemon cannot answer (listSecurityGroups). Writes must go
+// through the daemon (see sgRPCError). A var so a test can substitute it.
+var openClusterDB = func() (*corrosion.Client, error) {
 	cfg, err := daemon.LoadConfig()
 	if err != nil {
 		return nil, fmt.Errorf("load config (must run on a litevirt node): %w", err)
@@ -118,25 +120,78 @@ func newSGListCmd() *cobra.Command {
 		Use:   "ls",
 		Short: "List security groups",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			db, err := openClusterDB()
-			if err != nil {
-				return err
-			}
-			defer db.Close()
-			sgs, err := corrosion.ListSecurityGroups(cmd.Context(), db, stack)
+			resp, err := listSecurityGroups(cmd, &pb.ListSecurityGroupsRequest{StackName: stack})
 			if err != nil {
 				return err
 			}
 			w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 			fmt.Fprintln(w, "ID\tNAME\tSTACK\tCREATED")
-			for _, sg := range sgs {
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", sg.ID, sg.Name, sg.StackName, sg.CreatedAt)
+			for _, sg := range resp.GetGroups() {
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", sg.GetId(), sg.GetName(), sg.GetStackName(), sg.GetCreatedAt())
 			}
 			return w.Flush()
 		},
 	}
 	cmd.Flags().StringVar(&stack, "stack", "", "Filter to one stack")
 	return cmd
+}
+
+// listSecurityGroups reads security groups through ListSecurityGroups, so the
+// daemon decides what the caller's credential may see — the same RPC the web
+// UI reads through. It reads the local database instead only when the daemon
+// cannot answer at all: it is down (Unavailable) or predates the RPC
+// (Unimplemented). That keeps a listing that worked on a node working through a
+// rolling upgrade or a daemon outage, and it opens nothing new: the local
+// database is readable only by whoever could already read the file. A refusal is
+// the daemon's answer and is returned as it is, never routed around.
+func listSecurityGroups(cmd *cobra.Command, req *pb.ListSecurityGroupsRequest) (*pb.ListSecurityGroupsResponse, error) {
+	var resp *pb.ListSecurityGroupsResponse
+	err := withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+		var err error
+		resp, err = c.ListSecurityGroups(ctx, req)
+		return err
+	})
+	switch status.Code(err) {
+	case codes.OK:
+		return resp, nil
+	case codes.Unavailable, codes.Unimplemented:
+		fmt.Fprintf(cmd.ErrOrStderr(), "litevirtd could not answer (%s); reading this node's local database instead.\n",
+			status.Convert(err).Message())
+		return listSecurityGroupsLocal(cmd.Context(), req)
+	default:
+		return nil, err
+	}
+}
+
+// listSecurityGroupsLocal is listSecurityGroups' daemon-unreachable path.
+func listSecurityGroupsLocal(ctx context.Context, req *pb.ListSecurityGroupsRequest) (*pb.ListSecurityGroupsResponse, error) {
+	db, err := openClusterDB()
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+	groups, err := corrosion.ListSecurityGroups(ctx, db, req.GetStackName())
+	if err != nil {
+		return nil, err
+	}
+	resp := &pb.ListSecurityGroupsResponse{}
+	for _, g := range groups {
+		resp.Groups = append(resp.Groups, &pb.SecurityGroup{Id: g.ID, Name: g.Name, StackName: g.StackName, CreatedAt: g.CreatedAt})
+		if !req.GetIncludeRules() {
+			continue
+		}
+		rules, err := corrosion.ListSGRules(ctx, db, g.ID)
+		if err != nil {
+			return nil, err
+		}
+		for _, r := range rules {
+			resp.Rules = append(resp.Rules, &pb.SecurityGroupRule{
+				Id: r.ID, SgId: r.SGID, Direction: r.Direction, Proto: r.Proto,
+				Port: r.PortRange, Cidr: r.CIDR, Action: r.Action, Priority: int32(r.Priority),
+			})
+		}
+	}
+	return resp, nil
 }
 
 func newSGDeleteCmd() *cobra.Command {
@@ -192,20 +247,19 @@ func newSGRuleListCmd() *cobra.Command {
 		Short: "List rules in a security group",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			db, err := openClusterDB()
-			if err != nil {
-				return err
-			}
-			defer db.Close()
-			rules, err := corrosion.ListSGRules(cmd.Context(), db, args[0])
+			resp, err := listSecurityGroups(cmd, &pb.ListSecurityGroupsRequest{IncludeRules: true})
 			if err != nil {
 				return err
 			}
 			w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 			fmt.Fprintln(w, "ID\tDIR\tPROTO\tPORT\tCIDR\tACTION\tPRIO")
-			for _, r := range rules {
+			for _, r := range resp.GetRules() {
+				if r.GetSgId() != args[0] {
+					continue
+				}
 				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-					r.ID, r.Direction, r.Proto, r.PortRange, r.CIDR, r.Action, strconv.Itoa(r.Priority))
+					r.GetId(), r.GetDirection(), r.GetProto(), r.GetPort(), r.GetCidr(), r.GetAction(),
+					strconv.Itoa(int(r.GetPriority())))
 			}
 			return w.Flush()
 		},

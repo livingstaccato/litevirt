@@ -228,3 +228,42 @@ func TestRestoreSnapshot_ACloneOfTheBaseDoesNotStopIt(t *testing.T) {
 		t.Fatal("the revert did not run")
 	}
 }
+
+// A guest controls the bytes of a raw disk, header included (re-review
+// R1-M1). A raw disk holding a fake qcow2 header that names the source's
+// overlay — on its own, or as the raw base of a real qcow2 disk — is not a
+// user of that file: it stops neither the source's snapshot delete nor its
+// restore.
+func TestSnapshotFileUsers_ARawLayerIsNeverParsed(t *testing.T) {
+	for _, tc := range []string{"a raw disk", "the raw base of a qcow2 disk"} {
+		t.Run(tc, func(t *testing.T) {
+			for _, op := range []string{"delete", "restore"} {
+				t.Run(op, func(t *testing.T) {
+					f := newSnapUsersFixture(t, "stopped")
+					// Guest-written bytes that parse as a qcow2 header naming
+					// the source's overlay.
+					fake := filepath.Join(f.dir, "evil-data.raw")
+					runQemuImg(t, "create", "-q", "-f", "qcow2", "-F", "qcow2", "-b", f.overlay, fake)
+					disk := fake
+					if tc != "a raw disk" {
+						disk = filepath.Join(f.dir, "evil-root.qcow2")
+						runQemuImg(t, "create", "-q", "-u", "-f", "qcow2", "-F", "raw", "-b", fake, disk, "1M")
+					}
+					if err := corrosion.InsertVM(adminCtx(), f.s.db, corrosion.VMRecord{Name: "evil", HostName: "host-a", State: "stopped"}, nil,
+						[]corrosion.DiskRecord{{VMName: "evil", DiskName: "root", HostName: "host-a", Path: disk, StorageType: "local"}}); err != nil {
+						t.Fatal(err)
+					}
+					var err error
+					if op == "delete" {
+						err = f.deleteS1()
+					} else {
+						err = f.restoreS1()
+					}
+					if err != nil {
+						t.Fatalf("%s refused over a raw layer's guest-written header: %v", op, err)
+					}
+				})
+			}
+		})
+	}
+}

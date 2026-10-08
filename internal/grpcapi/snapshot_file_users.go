@@ -56,7 +56,8 @@ func (s *Server) snapshotFileUsers(ctx context.Context, vmName string, files []s
 			return nil, err
 		}
 		for _, d := range disks {
-			if uses(d.BackingDisk) || chainReaches(s.hostDiskFile(d.Path), uses) {
+			file := s.hostDiskFile(d.Path)
+			if uses(d.BackingDisk) || chainReaches(file, s.namedQcow2(ctx, vm.Name, file), uses) {
 				out = append(out, vm.Name)
 				break
 			}
@@ -66,20 +67,46 @@ func (s *Server) snapshotFileUsers(ctx context.Context, vmName string, files []s
 	return out, nil
 }
 
+// namedQcow2 reports whether vm's disk file is one litevirt names as qcow2:
+// <...>.qcow2, or an overlay named after one of vm's snapshots (libvirt
+// writes those as qcow2). Anything else may be a raw disk, whose first bytes
+// are the guest's and must not be read as a header.
+func (s *Server) namedQcow2(ctx context.Context, vm, file string) bool {
+	if strings.HasSuffix(file, ".qcow2") {
+		return true
+	}
+	ext := strings.TrimPrefix(filepath.Ext(file), ".")
+	if ext == "" {
+		return false
+	}
+	snaps, err := corrosion.ListSnapshots(ctx, s.db, vm)
+	if err != nil {
+		return false
+	}
+	return slices.ContainsFunc(snaps, func(sn corrosion.SnapshotRecord) bool { return sn.Name == ext })
+}
+
 // chainReaches reports whether file, or a layer of its qcow2 backing chain,
-// satisfies hit. Headers only, bounded; a layer that cannot be read, or a
-// protocol backing, ends the walk.
-func chainReaches(file string, hit func(string) bool) bool {
+// satisfies hit. Headers only, bounded. A header is read only from a layer
+// known to be qcow2: file itself when parseTop says so, and below it only a
+// layer its parent's header declares qcow2. A raw layer (a raw disk, or a
+// raw base) holds guest data — a guest could write a header there naming
+// any file — so it is checked by its path and ends the walk (re-review
+// R1-M1). A layer that cannot be read, or a protocol backing, ends it too.
+func chainReaches(file string, parseTop bool, hit func(string) bool) bool {
 	if file == "" || !filepath.IsAbs(file) {
 		return false
 	}
-	path := file
+	path, parse := file, parseTop
 	for depth := 0; depth <= maxBackingDepth; depth++ {
 		if fi, err := os.Stat(path); err != nil || !fi.Mode().IsRegular() {
 			return false
 		}
 		if hit(path) {
 			return true
+		}
+		if !parse {
+			return false
 		}
 		info, err := qcow2.Info(path)
 		if err != nil || info.BackingFile == "" || looksLikeProtocol(info.BackingFile) {
@@ -89,7 +116,7 @@ func chainReaches(file string, hit func(string) bool) bool {
 		if !filepath.IsAbs(b) {
 			b = filepath.Join(filepath.Dir(path), b)
 		}
-		path = b
+		path, parse = b, info.BackingFormat == "qcow2"
 	}
 	return false
 }

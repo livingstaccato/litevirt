@@ -326,14 +326,17 @@ func (s *Server) ConvertContainer(ctx context.Context, req *pb.ConvertContainerR
 		return nil, status.Errorf(codes.Internal,
 			"convert %q: %v (the container refuses to start until the same lv ct convert succeeds; its data is untouched)", req.Name, err)
 	}
-	if to.IDMap != nil {
-		spec.IDMapBase = to.IDMap.Base
+	// The row records what the container now IS (its config), never the
+	// request: a resumed convert finishes to the marker's target first.
+	done, derr := sc.ContainerSecurity(req.Name)
+	if derr != nil {
+		return nil, status.Errorf(codes.Internal, "converted, but reading the result back failed: %v", derr)
 	}
-	if req.Confinement != "" {
-		spec.Confinement = req.Confinement
-	} else if spec.Confinement == "" {
-		spec.Confinement = lxc.ConfinementLegacy
+	spec.IDMapBase = 0
+	if done.IDMap != nil {
+		spec.IDMapBase = done.IDMap.Base
 	}
+	spec.Confinement = done.Confinement
 	rec.CreateSpec = corrosion.EncodeCreateSpec(spec)
 	if err := corrosion.UpsertContainer(ctx, s.db, *rec); err != nil {
 		return nil, status.Errorf(codes.Internal, "converted, but recording it failed (lv ct inspect may show the old settings): %v", err)
@@ -504,7 +507,7 @@ func (s *Server) keepRecordedSecurity(ctx context.Context, rec *corrosion.Contai
 	}
 	if err := sc.ConvertContainerSecurity(ctx, rec.Name, to); err != nil {
 		return status.Errorf(codes.Internal,
-			"restore the container's recorded privilege mode after the revert: %v (it refuses to start until this finishes: run the revert again, or lv ct convert --unprivileged %s, which resumes to the recorded range)", err, rec.Name)
+			"restore the container's recorded privilege mode after the revert: %v (it refuses to start until this finishes: %s)", err, lxc.ConvertCommand(rec.Name, &to))
 	}
 	return nil
 }

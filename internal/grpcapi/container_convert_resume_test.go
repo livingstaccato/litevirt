@@ -76,3 +76,87 @@ func TestConvertContainer_InterruptedConvertResumes(t *testing.T) {
 func containsConvert(err error) bool {
 	return err != nil && (strings.Contains(err.Error(), "unfinished conversion") || strings.Contains(err.Error(), "lv ct convert"))
 }
+
+// realConvertServer is a server on the real runtime with a stopped privileged
+// container "old" that a convert can move over.
+func realConvertServer(t *testing.T) (*Server, *lxc.LxcRunner, *lxc.OwnershipOverlay, string) {
+	t.Helper()
+	s := testServer(t)
+	s.hostName = "host-a"
+	s.dataDir = t.TempDir()
+	store := filepath.Join(t.TempDir(), "lxc")
+	runner := &lxc.LxcRunner{Lxcpath: store, IDMappedRootfs: "off"}
+	s.SetContainerRuntime(stoppedLXC{NewLXCRuntimeAdapter(runner)})
+	lxc.UseSubIDFilesForTest(t, t.TempDir())
+	owners := lxc.UseOwnershipOverlayForTest(t)
+	tpl := mkCTRootfs(t, filepath.Join(t.TempDir(), "tpl"))
+	if _, err := runner.Create(context.Background(), lxc.CreateOpts{Name: "old", Template: tpl}); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.UpsertContainer(context.Background(), s.db, corrosion.ContainerRecord{
+		HostName: "host-a", Name: "old", State: "stopped",
+		CreateSpec: corrosion.EncodeCreateSpec(corrosion.ContainerCreateSpec{Template: tpl}),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return s, runner, owners, store
+}
+
+// rowAgreesWithDisk asserts the row's recorded mode, range and confinement
+// are what the container's config will start it with.
+func rowAgreesWithDisk(t *testing.T, s *Server, runner *lxc.LxcRunner, ct *pb.Container) {
+	t.Helper()
+	sec, err := runner.Security("old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	diskBase := int64(0)
+	if sec.IDMap != nil {
+		diskBase = sec.IDMap.Base
+	}
+	if sec.Converting || ct.IdmapBase != diskBase || ct.Privileged != (sec.IDMap == nil) || ct.Confinement != sec.Confinement {
+		t.Fatalf("row says privileged=%v base=%d confinement=%s; disk says %+v (base %d)",
+			ct.Privileged, ct.IdmapBase, ct.Confinement, sec, diskBase)
+	}
+	row, _ := corrosion.GetContainer(context.Background(), s.db, "host-a", "old")
+	if spec := corrosion.DecodeCreateSpec(row.CreateSpec); spec.IDMapBase != diskBase || spec.Confinement != sec.Confinement {
+		t.Fatalf("stored spec %+v, disk %+v", spec, sec)
+	}
+}
+
+// A marker that recorded no range (an interrupted confinement-only convert, or
+// a revert of a privileged container) is finished, and a re-run asking for
+// --unprivileged then really moves the container: the row and the disk agree.
+func TestConvertContainer_ResumeWithoutARangeStillAppliesUnprivileged(t *testing.T) {
+	s, runner, _, store := realConvertServer(t)
+	if err := os.WriteFile(filepath.Join(store, "old", "litevirt-converting"), []byte(`{"Confinement":"default"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ct, err := s.ConvertContainer(adminCtx(), &pb.ConvertContainerRequest{Name: "old", Unprivileged: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ct.Privileged {
+		t.Fatalf("--unprivileged left it privileged: %+v", ct)
+	}
+	rowAgreesWithDisk(t, s, runner, ct)
+}
+
+// A resumed convert records the confinement it finished to, not the re-run's
+// (empty) request.
+func TestConvertContainer_ResumeRecordsTheFinishedConfinement(t *testing.T) {
+	s, runner, owners, _ := realConvertServer(t)
+	owners.FailAfter(1, errors.New("interrupted"))
+	if _, err := s.ConvertContainer(adminCtx(), &pb.ConvertContainerRequest{Name: "old", Unprivileged: true, Confinement: lxc.ConfinementDefault}); err == nil {
+		t.Fatal("interrupted convert succeeded")
+	}
+	owners.FailAfter(-1, nil)
+	ct, err := s.ConvertContainer(adminCtx(), &pb.ConvertContainerRequest{Name: "old", Unprivileged: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rowAgreesWithDisk(t, s, runner, ct)
+	if ct.Confinement != lxc.ConfinementDefault {
+		t.Fatalf("confinement %q, want default", ct.Confinement)
+	}
+}

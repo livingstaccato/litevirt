@@ -349,8 +349,19 @@ func (r *LxcRunner) Convert(ctx context.Context, name string, to ConvertOpts) er
 		if err := r.convertTo(name, sec, rec); err != nil {
 			return err
 		}
+		// Then whatever the request asks that the recorded target did not
+		// cover: a range when the marker recorded none (a confinement-only
+		// convert or a privileged revert), or another confinement. A range
+		// the marker did record is fixed: the files are in it.
+		rest := ConvertOpts{}
+		if rec.IDMap == nil && to.IDMap != nil {
+			rest.IDMap = to.IDMap
+		}
 		if to.Confinement != "" && to.Confinement != rec.Confinement {
-			return r.Convert(ctx, name, ConvertOpts{Confinement: to.Confinement})
+			rest.Confinement = to.Confinement
+		}
+		if rest.IDMap != nil || rest.Confinement != "" {
+			return r.Convert(ctx, name, rest)
 		}
 		return nil
 	}
@@ -403,7 +414,7 @@ func (r *LxcRunner) prepareStart(name string) error {
 		return err
 	}
 	if sec.Converting {
-		return fmt.Errorf("container %q has an unfinished conversion; run the same lv ct convert again to finish it before starting", name)
+		return fmt.Errorf("container %q has an unfinished conversion (to %s); finish it before starting: %s", name, describeConvert(sec.ConvertTo), convertCommand(name, sec.ConvertTo))
 	}
 	// LXC refuses an unprivileged container whose range lies outside root's
 	// subordinate ranges (when the host hands them out): ensured on every
@@ -612,3 +623,43 @@ func (r *LxcRunner) EnsureRootSubIDs(idmap *IDMap) error { return r.ensureRootSu
 func (r *LxcRunner) RevertContainerConverting(ctx context.Context, name string, src io.Reader, to ConvertOpts) error {
 	return r.importContainerMarked(ctx, name, src, true, &to)
 }
+
+// describeConvert names a convert target for a message.
+func describeConvert(to *ConvertOpts) string {
+	if to == nil {
+		return "an unreadable target"
+	}
+	var parts []string
+	if to.IDMap != nil {
+		parts = append(parts, fmt.Sprintf("ids %d-%d", to.IDMap.Base, to.IDMap.Base+to.IDMap.Size-1))
+	}
+	if to.Confinement != "" {
+		parts = append(parts, "confinement "+to.Confinement)
+	}
+	if len(parts) == 0 {
+		return "its current settings"
+	}
+	return strings.Join(parts, ", ")
+}
+
+// convertCommand is the lv command that finishes a conversion to `to`
+// (whatever range it is given, a recorded range is resumed).
+func convertCommand(name string, to *ConvertOpts) string {
+	cmd := "lv ct convert " + name
+	if to == nil {
+		return cmd + " --unprivileged (or re-run the snapshot revert)"
+	}
+	if to.IDMap != nil {
+		cmd += " --unprivileged"
+	}
+	if to.Confinement != "" {
+		cmd += " --confinement " + to.Confinement
+	}
+	if to.IDMap == nil && to.Confinement == "" {
+		cmd += " --unprivileged"
+	}
+	return cmd + " (or re-run the snapshot revert that marked it)"
+}
+
+// ConvertCommand is convertCommand for callers outside the package.
+func ConvertCommand(name string, to *ConvertOpts) string { return convertCommand(name, to) }

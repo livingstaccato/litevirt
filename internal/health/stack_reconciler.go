@@ -89,7 +89,12 @@ func (r *StackReconciler) reconcileStack(ctx context.Context, stack corrosion.St
 
 	remainingVMs := 0
 	for _, vm := range vms {
-		if _, err := r.cleaner.DeleteVMForStackCleanup(ctx, &pb.DeleteVMRequest{Name: vm.Name}); err != nil {
+		// Bound to the incarnation listed as the stack's: the host that
+		// deletes it deletes nothing else of that name, and a VM that is no
+		// longer this one is left alone (WARN) and listed afresh next pass.
+		if _, err := r.cleaner.DeleteVMForStackCleanup(ctx, &pb.DeleteVMRequest{
+			Name: vm.Name, ExpectedStack: stack.Name, ExpectedCreatedAt: vm.CreatedAt,
+		}); err != nil {
 			slog.Warn("stack-reconciler: delete VM failed, will retry",
 				"stack", stack.Name, "vm", vm.Name, "error", err)
 			remainingVMs++

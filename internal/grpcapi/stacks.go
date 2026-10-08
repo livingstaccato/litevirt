@@ -936,7 +936,7 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 			return err
 		}
 
-		delErr := s.deleteVMWithFanout(ctx, vm.Name, req.Name, req.KeepDisks)
+		delErr := s.deleteVMWithFanout(ctx, stackMember{Name: vm.Name, Stack: req.Name, CreatedAt: vm.CreatedAt}, req.KeepDisks)
 		if errors.Is(delErr, errNotStackMember) {
 			if err := stream.Send(&pb.DeleteProgress{VmName: vm.Name, Status: "kept", Error: delErr.Error()}); err != nil {
 				return err
@@ -1136,7 +1136,8 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 //
 // stackName is the stack the VM must belong to: a peer's VM of that name is
 // deleted only when its record names that stack.
-func (s *Server) deleteVMWithFanout(ctx context.Context, vmName, stackName string, keepDisks bool) error {
+func (s *Server) deleteVMWithFanout(ctx context.Context, m stackMember, keepDisks bool) error {
+	vmName, stackName := m.Name, m.Stack
 	const maxRetries = 3
 	var err error
 
@@ -1158,9 +1159,13 @@ func (s *Server) deleteVMWithFanout(ctx context.Context, vmName, stackName strin
 				"stack", stackName, "vm", vmName, "vm_stack", row.StackName)
 			return fmt.Errorf("%w: VM %q names stack %q", errNotStackMember, vmName, row.StackName)
 		}
-		_, err = s.DeleteVM(ctx, &pb.DeleteVMRequest{Name: vmName, KeepDisks: keepDisks})
+		_, err = s.DeleteVM(ctx, &pb.DeleteVMRequest{Name: vmName, KeepDisks: keepDisks,
+			ExpectedStack: stackName, ExpectedCreatedAt: m.CreatedAt})
 		if err == nil {
 			return nil
+		}
+		if isDeleteBindingMismatch(err) {
+			return fmt.Errorf("%w: %s", errNotStackMember, status.Convert(err).Message())
 		}
 
 		code := status.Code(err)
@@ -1199,6 +1204,41 @@ func (s *Server) deleteVMWithFanout(ctx context.Context, vmName, stackName strin
 	return err
 }
 
+// stackMember is a stack's VM as the teardown saw it: its name, the stack
+// its row records, and its incarnation (the row's created_at; "" for a name
+// the stored file lists that has no row here yet).
+type stackMember struct {
+	Name, Stack, CreatedAt string
+}
+
+// isDeleteBindingMismatch reports a DeleteVM refused because the VM is not
+// the one the delete was bound to (DeleteVMRequest.expected_*).
+func isDeleteBindingMismatch(err error) bool {
+	return status.Code(err) == codes.FailedPrecondition && strings.Contains(status.Convert(err).Message(), deleteBindingMismatch)
+}
+
+// deleteBindingMismatch marks DeleteVM's refusal of a bound delete.
+const deleteBindingMismatch = "is not the VM this delete is bound to"
+
+// checkDeleteBinding refuses a delete bound (expected_stack /
+// expected_created_at) to a VM other than vm, the caller's row read under
+// the VM's lock.
+func checkDeleteBinding(req *pb.DeleteVMRequest, vm *corrosion.VMRecord) error {
+	if want := req.GetExpectedStack(); want != "" && vm.StackName != want {
+		slog.Warn("delete refused: the VM was not created by the stack the delete is bound to — left alone",
+			"vm", vm.Name, "bound_stack", want, "vm_stack", vm.StackName)
+		return status.Errorf(codes.FailedPrecondition, "VM %q %s: it records stack %q, not %q; left alone",
+			vm.Name, deleteBindingMismatch, vm.StackName, want)
+	}
+	if want := req.GetExpectedCreatedAt(); want != "" && vm.CreatedAt != want {
+		slog.Warn("delete refused: the VM is another incarnation than the delete is bound to — left alone",
+			"vm", vm.Name, "bound_created_at", want, "vm_created_at", vm.CreatedAt)
+		return status.Errorf(codes.FailedPrecondition, "VM %q %s: it was created at %s, not %s; left alone",
+			vm.Name, deleteBindingMismatch, vm.CreatedAt, want)
+	}
+	return nil
+}
+
 // errNotStackMember: a VM of a stack member's name that the stack did not
 // create. The stack leaves it alone.
 var errNotStackMember = errors.New("not created by this stack; left alone")
@@ -1235,11 +1275,17 @@ func (s *Server) fanoutDeleteVM(ctx context.Context, vmName, stackName string, k
 			}
 			return peerErr
 		}
-		_, peerErr = client.DeleteVM(ctx, &pb.DeleteVMRequest{Name: vmName, KeepDisks: keepDisks})
+		// Bound to the stack: the peer, and the owner it forwards to, check
+		// their own row under the VM's lock — the inspect above is advisory
+		// (and is all an older peer would honour).
+		_, peerErr = client.DeleteVM(ctx, &pb.DeleteVMRequest{Name: vmName, KeepDisks: keepDisks, ExpectedStack: stackName})
 		conn.Close()
 		if peerErr == nil {
 			slog.Info("VM deleted via peer", "vm", vmName, "host", h.Name)
 			return nil
+		}
+		if isDeleteBindingMismatch(peerErr) {
+			return fmt.Errorf("%w: %s", errNotStackMember, status.Convert(peerErr).Message())
 		}
 		if status.Code(peerErr) != codes.NotFound {
 			return peerErr // real error on the peer

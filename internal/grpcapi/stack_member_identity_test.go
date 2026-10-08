@@ -116,7 +116,7 @@ func TestDeleteVMWithFanout_RefusesAVMOfAnotherStack(t *testing.T) {
 		nil, nil); err != nil {
 		t.Fatal(err)
 	}
-	err := s.deleteVMWithFanout(ctx, "web", "old", false)
+	err := s.deleteVMWithFanout(ctx, stackMember{Name: "web", Stack: "old"}, false)
 	if !errors.Is(err, errNotStackMember) {
 		t.Fatalf("deleteVMWithFanout = %v, want errNotStackMember", err)
 	}

@@ -3092,11 +3092,20 @@ func (x *RestartVMRequest) GetName() string {
 }
 
 type DeleteVMRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	KeepDisks     bool                   `protobuf:"varint,2,opt,name=keep_disks,json=keepDisks,proto3" json:"keep_disks,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Name      string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	KeepDisks bool                   `protobuf:"varint,2,opt,name=keep_disks,json=keepDisks,proto3" json:"keep_disks,omitempty"`
+	// Binds the delete to the VM its caller saw; every host the delete
+	// reaches checks its own row under the VM's lock and deletes nothing on a
+	// mismatch (FailedPrecondition). Empty = unbound (an operator's delete).
+	// expected_stack: the row must record this stack (vms.stack_name, stamped
+	// when the stack created it) — a stack teardown deletes only its members.
+	ExpectedStack string `protobuf:"bytes,3,opt,name=expected_stack,json=expectedStack,proto3" json:"expected_stack,omitempty"`
+	// expected_created_at: the row must be this incarnation (vms.created_at,
+	// exactly as recorded).
+	ExpectedCreatedAt string `protobuf:"bytes,4,opt,name=expected_created_at,json=expectedCreatedAt,proto3" json:"expected_created_at,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *DeleteVMRequest) Reset() {
@@ -3141,6 +3150,20 @@ func (x *DeleteVMRequest) GetKeepDisks() bool {
 		return x.KeepDisks
 	}
 	return false
+}
+
+func (x *DeleteVMRequest) GetExpectedStack() string {
+	if x != nil {
+		return x.ExpectedStack
+	}
+	return ""
+}
+
+func (x *DeleteVMRequest) GetExpectedCreatedAt() string {
+	if x != nil {
+		return x.ExpectedCreatedAt
+	}
+	return ""
 }
 
 // RepairVMOwner re-stamps a VM's ownership (host_name + running state) with a
@@ -33766,11 +33789,13 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x05force\x18\x02 \x01(\bR\x05force\x12\x18\n" +
 	"\atimeout\x18\x03 \x01(\x05R\atimeout\"&\n" +
 	"\x10RestartVMRequest\x12\x12\n" +
-	"\x04name\x18\x01 \x01(\tR\x04name\"D\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\"\x9b\x01\n" +
 	"\x0fDeleteVMRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1d\n" +
 	"\n" +
-	"keep_disks\x18\x02 \x01(\bR\tkeepDisks\">\n" +
+	"keep_disks\x18\x02 \x01(\bR\tkeepDisks\x12%\n" +
+	"\x0eexpected_stack\x18\x03 \x01(\tR\rexpectedStack\x12.\n" +
+	"\x13expected_created_at\x18\x04 \x01(\tR\x11expectedCreatedAt\">\n" +
 	"\x14RepairVMOwnerRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x12\n" +
 	"\x04host\x18\x02 \x01(\tR\x04host\"P\n" +

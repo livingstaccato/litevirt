@@ -14,13 +14,19 @@ import (
 // LITEVIRT_E2E=1). Skipped on a node without btrfs-progs.
 //
 // A loop-backed btrfs filesystem on one node holds two btrfs pools, "src" and
-// "copies". A VM's root disk is created in "src" (a subvolume of its own), and
-// is replicated into "copies". What is checked is read from the node itself
-// with btrfs and qemu-img, never from litevirt: the copy is a NEW, writable
-// subvolume directly under the copies pool holding exactly the disk file, its
-// bytes are the source's (the VM is stopped first), a second copy is another
-// new subvolume, a copy onto an existing name is refused and leaves that name
-// as it was, and no staging subvolume or directory is left in either pool.
+// "copies". A VM gets a blank data disk in "src" (standalone, a subvolume of
+// its own) and a root disk there on the image (a qcow2 with a backing file).
+// What is checked is read from the node itself with btrfs, stat and qemu-img,
+// never from litevirt:
+//
+//   - the data disk is copied natively: the copy is a NEW file directly in
+//     the copies pool's directory (where every copy is), standalone, with the
+//     disk's bytes (the VM is stopped first);
+//   - a second copy is another new file; a copy onto an existing name is
+//     refused and leaves that file as it was;
+//   - the root disk, on a base image, is NOT sent natively: its copy is the
+//     flattened qemu-img copy, with no backing file;
+//   - no staging subvolume, directory or file is left in either pool.
 //
 //	LITEVIRT_E2E=1 LV_BIN=/usr/local/bin/litevirt E2E_LAB_DIR=~/litevirt-lab \
 //	  go test ./tests/e2e/ -run TestLab_BtrfsNativeReplicate -v -timeout 30m
@@ -51,8 +57,8 @@ func TestLab_BtrfsNativeReplicate(t *testing.T) {
 
 	stack := uniqueName("btrrep")
 	vm := stack + "-1"
-	yaml := fmt.Sprintf("name: %s\nvms:\n  %s:\n    image: %s\n    cpu: 1\n    memory: %s\n    disks:\n      root:\n        size: \"1G\"\n        storage: %q\n    placement:\n      host: %s\n",
-		stack, vm, drillImage(), drillMemory(), srcPool, h)
+	yaml := fmt.Sprintf("name: %s\nvms:\n  %s:\n    image: %s\n    cpu: 1\n    memory: %s\n    disks:\n      root:\n        size: \"1G\"\n        storage: %q\n      data:\n        size: \"64M\"\n        storage: %q\n    placement:\n      host: %s\n",
+		stack, vm, drillImage(), drillMemory(), srcPool, srcPool, h)
 	file := "/tmp/" + stack + ".yaml"
 	l.mustSSH(h, 30*time.Second, "echo "+base64.StdEncoding.EncodeToString([]byte(yaml))+" | base64 -d > "+file)
 	t.Cleanup(func() { l.deleteVMs(stack, map[string]string{h: vm}) })
@@ -62,23 +68,33 @@ func TestLab_BtrfsNativeReplicate(t *testing.T) {
 	if !l.waitDomainState(h, vm, "running", 4*time.Minute) {
 		t.Fatalf("test VM %s never ran on %s (virsh)", vm, h)
 	}
-	rows := l.mustSQL(h, "SELECT path FROM vm_disks WHERE vm_name = '"+vm+"' AND disk_name = 'root'")
-	if len(rows) != 1 {
-		t.Fatalf("root disk of %s: rows %v", vm, rows)
+	diskPath := func(disk string) string {
+		rows := l.mustSQL(h, "SELECT path FROM vm_disks WHERE vm_name = '"+vm+"' AND disk_name = '"+disk+"'")
+		if len(rows) != 1 {
+			t.Fatalf("%s disk of %s: rows %v", disk, vm, rows)
+		}
+		return rows[0][0]
 	}
-	disk := rows[0][0]
-	sub := filepath.Dir(disk)
-	if filepath.Dir(sub) != srcDir {
-		t.Fatalf("root disk %s is not in a subvolume of its own under %s", disk, srcDir)
+	data, root := diskPath("data"), diskPath("root")
+	for _, d := range []string{data, root} {
+		if filepath.Dir(filepath.Dir(d)) != srcDir {
+			t.Fatalf("disk %s is not in a subvolume of its own under %s", d, srcDir)
+		}
+		l.mustSSH(h, 30*time.Second, "btrfs subvolume show "+shellQuote(filepath.Dir(d)))
 	}
-	l.mustSSH(h, 30*time.Second, "btrfs subvolume show "+shellQuote(sub))
+	if info := l.mustSSH(h, 30*time.Second, "qemu-img info -U "+shellQuote(data)); strings.Contains(info, "backing file:") {
+		t.Fatalf("the data disk %s has a backing file:\n%s", data, info)
+	}
+	if info := l.mustSSH(h, 30*time.Second, "qemu-img info -U "+shellQuote(root)); !strings.Contains(info, "backing file:") {
+		t.Skipf("the root disk %s has no backing file on this build; the flattening leg needs one:\n%s", root, info)
+	}
 	l.mustLV(h, "stop", vm)
 	if !l.waitDomainState(h, vm, "shut off", 3*time.Minute) {
 		t.Fatalf("%s did not stop (virsh)", vm)
 	}
 
-	replicate := func(extra ...string) (string, string, error) {
-		out, err := l.lv(h, append([]string{"replicate-volume", vm, "root", copiesPool}, extra...)...)
+	replicate := func(disk string, extra ...string) (string, string, error) {
+		out, err := l.lv(h, append([]string{"replicate-volume", vm, disk, copiesPool}, extra...)...)
 		target := ""
 		for _, line := range strings.Split(out, "\n") {
 			if p, ok := strings.CutPrefix(strings.TrimSpace(line), "Target: "); ok {
@@ -87,21 +103,19 @@ func TestLab_BtrfsNativeReplicate(t *testing.T) {
 		}
 		return target, out, err
 	}
-	requireCopy := func(target string) {
+	requireStandaloneCopy := func(target, of string) {
 		t.Helper()
-		copySub := filepath.Dir(target)
-		if filepath.Dir(copySub) != copiesDir || filepath.Base(target) != filepath.Base(disk) {
-			t.Fatalf("copy at %q, want <%s>/<new subvolume>/%s", target, copiesDir, filepath.Base(disk))
+		if filepath.Dir(target) != copiesDir {
+			t.Fatalf("copy at %q, want a file directly in %s", target, copiesDir)
 		}
-		l.mustSSH(h, 30*time.Second, "btrfs subvolume show "+shellQuote(copySub))
-		if ro := l.mustSSH(h, 30*time.Second, "btrfs property get -ts "+shellQuote(copySub)+" ro"); !strings.Contains(ro, "ro=false") {
-			t.Errorf("copy subvolume %s: %s, want a writable copy", copySub, strings.TrimSpace(ro))
+		if typ := strings.TrimSpace(l.mustSSH(h, 30*time.Second, "stat -c %F "+shellQuote(target))); typ != "regular file" {
+			t.Errorf("copy %s is a %q, want a regular file", target, typ)
 		}
-		if ls := strings.TrimSpace(l.mustSSH(h, 30*time.Second, "ls -A "+shellQuote(copySub))); ls != filepath.Base(disk) {
-			t.Errorf("copy subvolume holds %q, want only %s", ls, filepath.Base(disk))
+		if info := l.mustSSH(h, 30*time.Second, "qemu-img info -U "+shellQuote(target)); strings.Contains(info, "backing file:") {
+			t.Errorf("copy %s depends on another file:\n%s", target, info)
 		}
-		if out, err := l.ssh(h, 5*time.Minute, "qemu-img compare -U "+shellQuote(disk)+" "+shellQuote(target)); err != nil {
-			t.Errorf("copy %s differs from %s: %v\n%s", target, disk, err, out)
+		if out, err := l.ssh(h, 5*time.Minute, "qemu-img compare -U "+shellQuote(of)+" "+shellQuote(target)); err != nil {
+			t.Errorf("copy %s differs from %s: %v\n%s", target, of, err, out)
 		}
 	}
 	requireNoStaging := func() {
@@ -111,36 +125,42 @@ func TestLab_BtrfsNativeReplicate(t *testing.T) {
 		}
 	}
 
-	first, out, err := replicate()
+	first, out, err := replicate("data")
 	if err != nil {
-		t.Fatalf("replicate-volume %s root %s: %v\n%s", vm, copiesPool, err, out)
+		t.Fatalf("replicate-volume %s data %s: %v\n%s", vm, copiesPool, err, out)
 	}
-	if !strings.Contains(out, "native") {
-		t.Errorf("replicate-volume did not report a native copy:\n%s", out)
+	if !strings.Contains(out, "native btrfs") {
+		t.Errorf("the data disk's copy was not native:\n%s", out)
 	}
-	requireCopy(first)
+	requireStandaloneCopy(first, data)
 	requireNoStaging()
 	l.mark("btrfs: native copy %s", first)
 
-	second, out, err := replicate()
-	if err != nil {
-		t.Fatalf("second replicate-volume: %v\n%s", err, out)
+	second, out, err := replicate("data")
+	if err != nil || second == first {
+		t.Fatalf("second replicate-volume: %v (target %s, first %s)\n%s", err, second, first, out)
 	}
-	if filepath.Dir(second) == filepath.Dir(first) {
-		t.Fatalf("second copy %s reused the first's subvolume", second)
-	}
-	requireCopy(second)
-	requireCopy(first)
+	requireStandaloneCopy(second, data)
+	requireStandaloneCopy(first, data)
 
-	// An admin naming an existing subvolume: refused, and it is left as it was.
-	taken := filepath.Base(filepath.Dir(first))
-	before := l.mustSSH(h, 30*time.Second, "btrfs subvolume show "+shellQuote(filepath.Dir(first))+" | grep -i uuid; sha256sum "+shellQuote(first))
-	if _, out, err := replicate("--target-path", taken); err == nil || !strings.Contains(out+err.Error(), "exist") {
-		t.Errorf("copy onto existing subvolume %s: err %v\n%s, want AlreadyExists", taken, err, out)
+	// An admin naming an existing copy: refused, and it is left as it was.
+	before := l.mustSSH(h, 30*time.Second, "stat -c '%i %s %Y' "+shellQuote(first)+"; sha256sum "+shellQuote(first))
+	if _, out, err := replicate("data", "--target-path", filepath.Base(first)); err == nil || !strings.Contains(out+err.Error(), "exist") {
+		t.Errorf("copy onto existing %s: err %v\n%s, want AlreadyExists", first, err, out)
 	}
-	if after := l.mustSSH(h, 30*time.Second, "btrfs subvolume show "+shellQuote(filepath.Dir(first))+" | grep -i uuid; sha256sum "+shellQuote(first)); after != before {
+	if after := l.mustSSH(h, 30*time.Second, "stat -c '%i %s %Y' "+shellQuote(first)+"; sha256sum "+shellQuote(first)); after != before {
 		t.Errorf("the existing copy changed:\nbefore %s\nafter  %s", before, after)
 	}
+
+	// The root disk is on a base image: the flattening file copy, not a send.
+	rootCopy, out, err := replicate("root")
+	if err != nil {
+		t.Fatalf("replicate-volume %s root: %v\n%s", vm, err, out)
+	}
+	if strings.Contains(out, "native") {
+		t.Errorf("a disk on a base image was sent natively:\n%s", out)
+	}
+	requireStandaloneCopy(rootCopy, root)
 	requireNoStaging()
-	l.mark("btrfs: second copy %s, existing name refused", second)
+	l.mark("btrfs: second copy %s, existing name refused, root flattened to %s", second, rootCopy)
 }

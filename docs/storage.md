@@ -981,25 +981,30 @@ was received is removed rather than left unrecorded — only the image the copy
 itself created, never the destination name, which an image created in the
 meantime may hold.
 
-A **btrfs** disk alone in its own subvolume directly under its btrfs pool (as
-the btrfs driver creates every disk) replicated into a btrfs pool is sent
-natively too. The copy is a **new** subvolume the daemon names under the target
-pool's directory — `<pool source>/<vm>-<disk>-copy-<time>-<id>`, or, for an
-admin, `--target-path` as the leaf name (never a path, never starting with `.`
-or `-`) — holding the disk file under its own name; the DONE line reports that
-file. A name that exists is refused with `AlreadyExists` before anything is
-sent. The source is snapshotted read-only into a private directory beside it,
-received into a private directory in the target pool, and a writable snapshot
-of what was received is placed with a rename that refuses an existing name
-(`renameat2(RENAME_NOREPLACE)`), so a subvolume or directory created meanwhile
-is never replaced. The send snapshot, the received (read-only) subvolume and
-both private directories are removed when the copy ends, whether it succeeded
-or not, by what exists, so a failed copy leaves nothing in either pool and
-every copy uses new names. The copy is recorded, as a file copy is, as its VM's
-project's copy of the disk. A btrfs disk anywhere else — a file in the pool's
-directory (storage motion puts it there), a disk with no pool, a subvolume that
-holds other files — and every copy between different drivers take the file
-copy. What the drivers implement:
+A **btrfs** disk replicated into a btrfs pool is sent natively when it is
+alone in its own subvolume directly under its btrfs pool (as the btrfs driver
+creates every disk) and **standalone** — no backing file, no external data
+file. A copy never depends on a file outside itself, so a disk built on a base
+image takes the qemu-img copy, which flattens it. The copy is the same new
+file a qemu-img copy makes, in the target pool's directory —
+`<vm>-<disk>-copy-<time>-<id>.qcow2`, or an admin's `--target-path` there —
+and it is recorded the same way, so promotion by name, listings, pruning and
+deletion treat it like any other copy. The source subvolume is snapshotted
+read-only into a private directory beside it and received into a private
+directory in the target pool. The received disk file is checked again (it must
+be standalone), cloned into the pool's directory (a reflink: no data is
+copied; a plain copy where the filesystem cannot) and placed with a rename
+that refuses an existing name (`renameat2(RENAME_NOREPLACE)`), so a file
+created meanwhile is never replaced; an existing name is refused before
+anything is sent. Everything staged is removed when the copy ends, whether it
+succeeded, failed or its client went away, and every copy uses new staging
+names. Staging a daemon that died mid-copy left (`.litevirt-send-*`,
+`.litevirt-recv-*`, `.litevirt-place-*`, older than a day) is removed by the
+next btrfs copy, unless a disk or pool record uses a file in it. A btrfs disk
+anywhere else — a file in the pool's directory (storage motion puts it there),
+a disk with no pool, a subvolume that holds other files, a disk on a base
+image — and every copy between different drivers, or to a `--target-path`
+outside the pool's directory, take the file copy. What the drivers implement:
 
 - **ZFS** — `zfs snapshot` then `zfs send | zfs recv`. Incremental
   (`-I` since the prior `litevirt-replicate-prev` snapshot) when
@@ -1009,8 +1014,9 @@ copy. What the drivers implement:
   image the replication created. Cross-cluster via SSH wrap on the receive
   side.
 - **BTRFS** — `btrfs subvolume snapshot -r`, then `btrfs send | btrfs
-  receive`, always a full send into a new subvolume (no snapshot is kept
-  between copies); same host only, as the copy is placed by a local rename.
+  receive`, always a full send (no snapshot is kept between copies), the disk
+  file cloned out of what was received; same host only, as the copy is placed
+  by a local rename.
 
 Cross-host replication wraps the receive in `ssh <user@host>` so the
 sender pipes straight into the remote CLI. Same-host uses a local pipe.

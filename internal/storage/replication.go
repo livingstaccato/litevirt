@@ -59,6 +59,19 @@ type ReplicateOptions struct {
 	// each get their own credentials. Nil: the source shares the
 	// destination's (one cluster).
 	SrcOptions map[string]string
+
+	// SrcRoot is the source pool's root (btrfs: the directory the disk's
+	// subvolume must sit directly under).
+	SrcRoot string
+
+	// Verify, when set, judges the received copy (btrfs: the disk file in the
+	// received subvolume) before it is placed; an error places nothing.
+	Verify func(path string) error
+
+	// InUse, when set, reports whether anything still records the file at
+	// path. btrfs then sweeps the staging a copy that never finished left,
+	// skipping anything InUse claims.
+	InUse func(path string) bool
 }
 
 // ErrDestinationExists refuses a native receive whose destination dataset or

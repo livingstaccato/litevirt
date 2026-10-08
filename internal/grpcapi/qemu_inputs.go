@@ -230,6 +230,9 @@ type diskChain struct {
 	// linked clone's source disk — and the snapshot bases under it, to that
 	// disk's row: the source's own chain is judged as its start judges it.
 	recorded map[string]corrosion.DiskRecord
+	// snapNames is d's VM's snapshot names, read once per chain (ownLayer).
+	snapNames     []string
+	snapNamesRead bool
 }
 
 func (c *diskChain) judge(layer, resolved, format string) error {
@@ -575,7 +578,10 @@ func (c *diskChain) ownLayer(layer string) bool {
 		return false
 	}
 	// By the VM's snapshot names: a dotted one (v1.2) is not cut at its dot.
-	if names := c.s.snapshotNamesOf(c.ctx, c.d.VMName); diskStemNamed(layer, names) != diskStemNamed(c.self, names) {
+	if !c.snapNamesRead {
+		c.snapNames, c.snapNamesRead = c.s.snapshotNamesOf(c.ctx, c.d.VMName), true
+	}
+	if diskStemNamed(layer, c.snapNames) != diskStemNamed(c.self, c.snapNames) {
 		return false
 	}
 	if rec, ok := replicaRecordFor(layer); ok && tenancy.NormalizeProject(rec.Project) != c.project {

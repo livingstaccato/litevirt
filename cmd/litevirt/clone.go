@@ -5,6 +5,8 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 )
@@ -26,9 +28,10 @@ The clone gets a fresh identity — new MAC addresses and a regenerated cloud-in
 instance-id/hostname, so it boots clean (new SSH host keys, new machine-id).
 
 Mode (default: storage-aware auto):
-  auto    linked when the source's disks are on shared storage (instant,
-          space-efficient); full when on local storage (independent, avoids
-          pinning the clone to the source's host)
+  auto    linked when the source's disks are on shared storage, or are a
+          clone of disks that are (instant, space-efficient); full when on
+          local storage (independent, avoids pinning the clone to the
+          source's host). The mode used, and why, is printed.
   linked  qcow2 overlay backed by the source's disk — instant, thin
   full    independent copy (qcow2 convert) — no dependency on the source
 
@@ -39,6 +42,7 @@ Examples:
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				var hdr metadata.MD
 				vm, err := c.CloneVM(ctx, &pb.CloneVMRequest{
 					Source:   args[0],
 					Target:   args[1],
@@ -47,11 +51,14 @@ Examples:
 					Ip:       ip,
 					Start:    start,
 					Snapshot: snapshot,
-				})
+				}, grpc.Header(&hdr))
 				if err != nil {
 					return fmt.Errorf("clone VM: %w", err)
 				}
 				fmt.Printf("Cloned %s → %s (state: %s)\n", args[0], vm.Name, vm.State)
+				if m := hdr.Get("x-litevirt-clone-mode"); len(m) > 0 {
+					fmt.Printf("  mode %s\n", m[0])
+				}
 				return nil
 			})
 		},

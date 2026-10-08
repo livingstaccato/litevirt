@@ -181,7 +181,7 @@ func TestPoolHostPath_ProtectedDirectoriesAreRefusedEvenToAdmin(t *testing.T) {
 	cases := map[string]*pb.CreateStoragePoolRequest{
 		"data dir":                  {Driver: "dir", Target: s.dataDir},
 		"data dir internals":        {Driver: "dir", Target: images},
-		"data dir via dot-dot":      {Driver: "local", Target: s.dataDir + "/disks/../state"},
+		"data dir via dot-dot":      {Driver: "local", Target: s.dataDir + "/disks/../state.db"},
 		"parent of the data dir":    {Driver: "dir", Target: filepath.Dir(s.dataDir)},
 		"pki dir":                   {Driver: "dir", Target: s.pkiDir},
 		"etc":                       {Driver: "dir", Target: "/etc"},

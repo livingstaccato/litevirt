@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 )
@@ -66,9 +67,11 @@ const ISOLibraryDir = "pools/isos"
 // CheckReadFile refuses a host file no VM may be given to read: a relative or
 // unclean path (one that still carries a "." or ".." to resolve), anything
 // under a secret system directory, anything in or below the daemon's PKI
-// directory, and anything in its data directory outside pools/, mounts/ and
-// disks/uploads/ (state.db, cloudinit/, nvram/, imports/, images/, …; the
-// global ISO library, pools/isos/, is under pools/). Under a user-data root
+// directory, and in its data directory the daemon's own state (dataDirOwned:
+// state.db, cloudinit/, nvram/, imports/, images/, …) and the rest of disks/
+// beyond uploads/ — pools/ and mounts/ hold pool content (the global ISO
+// library, pools/isos/, is under pools/), and another child of the data
+// directory is an ordinary host path. Under a user-data root
 // (/home, /root, /run) only an optical disc image passes, and not one a link
 // reaches through a dot-directory the named path does not name
 // (userDataRoots). A file directly in <data_dir>/disks — where an older
@@ -322,7 +325,13 @@ func refuseSecretPath(p, cand, dataDir, pkiDir string) (inDisks bool, err error)
 				inDisks = true
 				continue
 			}
-			return false, fmt.Errorf("%q is inside the daemon's data directory %s; only its pools/, mounts/, disks/uploads/ and the ISO images directly in disks/ hold pool content", p, dataDir)
+			// Another child of the data directory, not the daemon's own
+			// state, is an ordinary host path (a main-era pool there).
+			if first, _, ok := dataDirChild(d, cand); ok && first != dataDirDisks &&
+				!slices.Contains(dataDirPoolAreas, first) && !dataDirChildOwned(first) {
+				continue
+			}
+			return false, fmt.Errorf("%q is the daemon's own state in its data directory %s; of what is there only pools/, mounts/, disks/uploads/ and the ISO images directly in disks/ hold pool content", p, dataDir)
 		}
 	}
 	return inDisks, nil

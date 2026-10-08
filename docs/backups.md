@@ -576,7 +576,13 @@ a way to overwrite another project's VM disk.
     that image. Its format
     comes from a record — a replica's own record, `qcow2` for an image or a
     VM's disk — and must match what the disk declares; it is never read from
-    the bytes. The base must be the one the backup was taken on: a backup
+    the bytes. A VM an earlier build promoted with `--no-localize` has no
+    record of its replica (raw or qcow2, in its pool's directory or the
+    default pool's `<data_dir>/disks`): there the layout the promotion made
+    stands in for one — the overlay named `<vm>-promoted-<replica stem>`, the
+    replica named by that stem and the format it declares, of the row's own
+    disk, unclaimed by any disk row and by any other project's record — the
+    same test a start of that VM passes. The base must be the one the backup was taken on: a backup
     records its base's path, size and sha256 (`base_identity`), and a
     restore onto a base that has changed since is refused, naming both. A
     backup taken before that was recorded is restored onto a base that cannot

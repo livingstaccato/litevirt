@@ -532,20 +532,22 @@ func (s *Server) originalDiskBacking(ctx context.Context, dest restoreDest, m *p
 		}
 	}
 
-	// The format, from a record — or, for the raw replica under a VM an
-	// earlier build promoted with --no-localize (no record of either), from
-	// the daemon-made layout that ties it to this VM (legacyPromotedReplica).
+	// The format, from a record — or, for the replica under a VM an earlier
+	// build promoted with --no-localize (no record of either), from the
+	// daemon-made layout that ties it to this VM (legacyPromotedReplica).
 	format, immutable, err := s.recordedBackingFormat(resolved, images)
 	if err != nil && cur.BackingFormat == "qcow2" && s.newDiskChain(ctx, *d).snapshotBase(self, resolved) {
 		// The base an external snapshot of this VM left (its own earlier
 		// file, qcow2 as libvirt wrote the overlay on it).
 		format, immutable, err = "qcow2", true, nil
 	}
-	if err != nil && cur.BackingFormat == "raw" && d.BackingDisk == "" {
-		if vm, verr := corrosion.GetVM(ctx, s.db, d.VMName); verr == nil && vm != nil &&
-			s.legacyPromotedReplica(ctx, *d, tenancy.NormalizeProject(vm.Project), self, resolved, "raw") {
-			format, immutable, err = "raw", true, nil
-		}
+	if err != nil && (cur.BackingFormat == "raw" || cur.BackingFormat == "qcow2") && d.BackingDisk == "" &&
+		s.newDiskChain(ctx, *d).legacyPromoted(self, resolved, cur.BackingFormat) {
+		// The replica, raw or qcow2, under a VM main promoted with
+		// --no-localize, on the bounds its start accepts it on
+		// (diskChain.legacyPromoted). A replica is a point-in-time file: it
+		// does not change under its name.
+		format, immutable, err = cur.BackingFormat, true, nil
 	}
 	if err != nil {
 		return "", "", err

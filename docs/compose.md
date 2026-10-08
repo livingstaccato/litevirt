@@ -139,7 +139,9 @@ its record names the stack, as the stack's `compose up` records it. A VM that
 merely has a member's name — created on its own (by the UI, by hand or by another
 stack) after a failed `compose up` left that name in the stored file — is left
 alone, logged at WARN, and reported as `kept <name>: ...`, naming the stack it
-belongs to.
+belongs to. Such a VM is not counted as a deletion. A stack network that such a VM (or a
+container the stack did not create) is attached to is kept too, reported as
+`kept network <name>: used by ...`, so it is not pulled out from under it.
 
 `compose down` follows the same rule. It ends with `Stack "<name>" torn down.`
 and exit status 0 only when every VM and container was deleted and every stack

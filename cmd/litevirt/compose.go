@@ -304,6 +304,12 @@ func newDownCmd() *cobra.Command {
 						seenVM[item] = true
 						seen = append(seen, item)
 					}
+					if p.Status == "kept" && seenVM[item] {
+						// Reported "deleting" and then found not to be the
+						// stack's: no deletion, so not in the count.
+						delete(seenVM, item)
+						seen = removeString(seen, item)
+					}
 					switch p.Status {
 					case "error":
 						fmt.Fprintf(os.Stderr, "  error %s: %s\n", item, p.Error)
@@ -552,4 +558,15 @@ func newExportCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVarP(&output, "output", "o", "", "Write YAML to file instead of stdout")
 	return cmd
+}
+
+// removeString returns ss without s.
+func removeString(ss []string, s string) []string {
+	out := ss[:0:0]
+	for _, x := range ss {
+		if x != s {
+			out = append(out, x)
+		}
+	}
+	return out
 }

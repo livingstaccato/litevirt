@@ -124,3 +124,53 @@ func TestDeleteVMWithFanout_RefusesAVMOfAnotherStack(t *testing.T) {
 		t.Fatal("a VM the stack did not create was deleted")
 	}
 }
+
+// Review M-2: a VM the stack did not create but that sits on one of the
+// stack's networks keeps that network: deprovisioning it would tear the
+// network down under the kept VM. The teardown says so and is complete.
+func TestDeleteStack_KeepsANetworkAKeptVMUses(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	ctx := adminContext(context.Background())
+	if err := corrosion.UpsertStack(ctx, s.db, corrosion.StackRecord{
+		Name: "rc5iso", State: "active",
+		ComposeYAML: "name: rc5iso\nvms:\n  rc5-isosym:\n    image: tiny\n    cpu: 1\n    memory: 256\n",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, nr := range []corrosion.NetworkRecord{
+		{Name: "rc5iso_lan", StackName: "rc5iso", Type: "bridge", Config: "{}"},
+		{Name: "rc5iso_back", StackName: "rc5iso", Type: "bridge", Config: "{}"},
+	} {
+		if err := corrosion.UpsertNetwork(ctx, s.db, nr); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := corrosion.InsertVM(ctx, s.db,
+		corrosion.VMRecord{Name: "rc5-isosym", HostName: "test-host", State: "stopped", CPUActual: 1, MemActual: 256},
+		[]corrosion.InterfaceRecord{{VMName: "rc5-isosym", NetworkName: "rc5iso_lan", MAC: "52:54:00:00:00:01"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	stream := &mockDeleteStreamR2{ctx: ctx}
+	if err := s.DeleteStack(&pb.DeleteStackRequest{Name: "rc5iso"}, stream); err != nil {
+		t.Fatalf("DeleteStack: %v", err)
+	}
+	if nr, _ := corrosion.GetNetwork(ctx, s.db, "rc5iso_lan"); nr == nil {
+		t.Fatal("the stack network a kept VM uses was deprovisioned under it")
+	}
+	if nr, _ := corrosion.GetNetwork(ctx, s.db, "rc5iso_back"); nr != nil {
+		t.Error("an unused stack network was kept")
+	}
+	said := false
+	for _, p := range stream.sent {
+		if p.VmName == "network rc5iso_lan" && p.Status == "kept" && strings.Contains(p.Error, "rc5-isosym") {
+			said = true
+		}
+		if p.Status == "error" {
+			t.Errorf("a kept network is not a failure: %+v", p)
+		}
+	}
+	if !said {
+		t.Errorf("no progress says the network was kept for rc5-isosym: %+v", stream.sent)
+	}
+}

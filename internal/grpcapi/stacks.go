@@ -1057,6 +1057,28 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 			continue
 		}
 		if networkBelongsToStack(nr, req.Name, knownStacks) && !externalNets[nr.Name] {
+			// A workload the stack did not create (a kept VM) on this
+			// network keeps it: removing it would pull the network out from
+			// under that workload. Said, and not a failure. Unknown keeps it
+			// too, and that is a failure the reconciler retries.
+			if users, uErr := corrosion.ForeignWorkloadsOnNetwork(ctx, s.db, nr.Name, req.Name); uErr != nil || len(users) > 0 {
+				if uErr != nil {
+					hadFailures = true
+					notRemoved = append(notRemoved, "network "+nr.Name)
+					if sendErr := stream.Send(&pb.DeleteProgress{VmName: "network " + nr.Name, Status: "error",
+						Error: "cannot tell whether a workload the stack did not create uses it: " + uErr.Error()}); sendErr != nil {
+						return sendErr
+					}
+					continue
+				}
+				slog.Warn("stack delete: keeping a stack network that workloads the stack did not create use",
+					"stack", req.Name, "network", nr.Name, "users", users)
+				if sendErr := stream.Send(&pb.DeleteProgress{VmName: "network " + nr.Name, Status: "kept",
+					Error: "used by " + strings.Join(users, ", ") + ", which the stack did not create; left in place"}); sendErr != nil {
+					return sendErr
+				}
+				continue
+			}
 			// Tear down the static subnet route injected on deploy (injectSubnetRoutes),
 			// which network.Deprovision otherwise leaves behind → CIDR reuse can misroute.
 			// RemoveSubnetRoute is idempotent (deletes only a route whose `via` matches),
@@ -1270,7 +1292,11 @@ func (s *Server) fanoutDeleteVM(ctx context.Context, vmName, stackName string, k
 		}
 		if peerErr != nil {
 			conn.Close()
-			if status.Code(peerErr) == codes.NotFound {
+			// A peer without the row answers a project-scoped caller with
+			// PermissionDenied, not NotFound: either way it is not the
+			// holder, so the search goes on. The holder's bound delete is
+			// the authority.
+			if c := status.Code(peerErr); c == codes.NotFound || c == codes.PermissionDenied {
 				continue
 			}
 			return peerErr

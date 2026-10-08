@@ -145,6 +145,15 @@ func (r *StackReconciler) reconcileStack(ctx context.Context, stack corrosion.St
 	nets, _ := corrosion.ListNetworks(ctx, r.db)
 	for _, nr := range nets {
 		if nr.StackName == stack.Name && !externalNets[nr.Name] {
+			// A workload the stack did not create on it keeps the network.
+			if users, err := corrosion.ForeignWorkloadsOnNetwork(ctx, r.db, nr.Name, stack.Name); err != nil || len(users) > 0 {
+				slog.Warn("stack-reconciler: keeping a stack network that workloads the stack did not create use",
+					"stack", stack.Name, "network", nr.Name, "users", users, "error", err)
+				if err != nil {
+					return // unknown: retry, stack kept in deleting
+				}
+				continue
+			}
 			if err := r.cleaner.DeprovisionNetworkByName(ctx, nr.Name); err != nil {
 				slog.Warn("stack-reconciler: network deprovision failed, will retry",
 					"stack", stack.Name, "network", nr.Name, "error", err)

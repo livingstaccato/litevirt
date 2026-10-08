@@ -77,3 +77,39 @@ func TestCloneVM_WaitsForTheSourcesLock(t *testing.T) {
 		t.Fatalf("clone disk: %v", err)
 	}
 }
+
+// Re-review 2, m-6. On main 3e4ba50b an auto-mode clone was linked when
+// every source disk was recorded shared (templates.go:162
+// cloneMode(req.Mode, allDisksShared(srcDisks))), and a clone's row copied
+// its source's storage type (templates.go:221 StorageType: d.StorageType),
+// so a clone of a clone of an NFS VM was linked too. This build records the
+// clone local (its file is), and keeps that clone-of-a-clone linked.
+func TestCloneVM_AnAutoCloneOfAnNFSVMsCloneIsLinkedAsOnMain(t *testing.T) {
+	s := cloneSourceTemplate(t)
+	ctx := adminCtx()
+	src := filepath.Join(t.TempDir(), "nfsvm-root.qcow2")
+	if err := qcow2.Create(src, 64*1024*1024, nil); err != nil {
+		t.Fatal(err)
+	}
+	specJSON, _ := json.Marshal(&pb.VMSpec{Name: "nfsvm", Cpu: 1, MemoryMib: 256})
+	if err := corrosion.InsertVM(ctx, s.db,
+		corrosion.VMRecord{Name: "nfsvm", HostName: "test-host", State: "stopped", Spec: string(specJSON)}, nil,
+		[]corrosion.DiskRecord{{VMName: "nfsvm", DiskName: "root", HostName: "test-host", Path: src,
+			SizeBytes: 64 * 1024 * 1024, StorageType: "nfs", StorageVolume: "nfs1"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CloneVM(ctx, &pb.CloneVMRequest{Source: "nfsvm", Target: "c1"}); err != nil {
+		t.Fatalf("CloneVM c1: %v", err)
+	}
+	if _, err := s.CloneVM(ctx, &pb.CloneVMRequest{Source: "c1", Target: "c2"}); err != nil {
+		t.Fatalf("CloneVM c2: %v", err)
+	}
+	c1, _ := corrosion.GetVMDisks(ctx, s.db, "c1")
+	c2, _ := corrosion.GetVMDisks(ctx, s.db, "c2")
+	if len(c1) != 1 || len(c2) != 1 {
+		t.Fatalf("disks c1=%v c2=%v", c1, c2)
+	}
+	if c2[0].BackingDisk != c1[0].Path {
+		t.Fatalf("the clone of a clone is backed by %q, want linked to %s as on main", c2[0].BackingDisk, c1[0].Path)
+	}
+}

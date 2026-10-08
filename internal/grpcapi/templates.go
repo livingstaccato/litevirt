@@ -13,7 +13,9 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -96,7 +98,12 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 			return nil, status.Errorf(codes.Unavailable, "cannot reach source host %s: %v", src.HostName, perr)
 		}
 		defer conn.Close()
-		return client.CloneVM(ctx, req)
+		var hdr metadata.MD
+		vm, err := client.CloneVM(ctx, req, grpc.Header(&hdr))
+		if m := hdr.Get(CloneModeHeader); len(m) > 0 {
+			_ = grpc.SetHeader(ctx, metadata.Pairs(CloneModeHeader, m[0]))
+		}
+		return vm, err
 	}
 	// The source's lock, held until the clone's row exists (review M-1): a
 	// linked clone backs on the source's current layer before anything
@@ -175,7 +182,9 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 	}
 	defer lease.release(ctx)
 
-	mode := cloneMode(req.Mode, allDisksShared(srcDisks))
+	mode, modeWhy := s.cloneModeFor(ctx, req.Mode, srcDisks)
+	// Said to the caller (lv clone prints it), as auto may pick either.
+	_ = grpc.SetHeader(ctx, metadata.Pairs(CloneModeHeader, mode+": "+modeWhy))
 
 	// Preserve disk bus + SCSI controller model from the source spec (a Windows
 	// scsi/lsisas guest cloned as virtio wouldn't boot — and would falsify
@@ -450,7 +459,7 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 	// and became running-and-unprovable the moment it started.
 	s.assignOwnerEpochAtCreate(ctx, req.Target, state == "running")
 
-	slog.Info("VM cloned", "source", req.Source, "target", req.Target, "mode", mode, "host", s.hostName)
+	slog.Info("VM cloned", "source", req.Source, "target", req.Target, "mode", mode, "why", modeWhy, "host", s.hostName)
 	s.audit(ctx, "vm.clone", req.Target, fmt.Sprintf("source=%s mode=%s", req.Source, mode), "ok")
 	s.recordVMEvent(ctx, req.Target, "vm.cloned", "ok", "source="+req.Source+" mode="+mode)
 	s.publish("vm.cloned", req.Target, "source="+req.Source)
@@ -563,6 +572,63 @@ func cloneMode(requested string, allShared bool) string {
 		}
 		return "full"
 	}
+}
+
+// CloneModeHeader is the response header CloneVM says the mode it used in,
+// and why ("linked: ..." / "full: ...").
+const CloneModeHeader = "x-litevirt-clone-mode"
+
+// cloneModeFor resolves the clone mode and says why. A requested mode is
+// used as asked. Auto keeps main 3e4ba50b's choice — linked when every
+// source disk is on shared storage (templates.go:162 cloneMode(req.Mode,
+// allDisksShared(srcDisks))) — and counts as shared, as main did, a clone
+// of a shared disk: main recorded a clone with its source's storage type
+// (templates.go:221 StorageType: d.StorageType), so a clone of an NFS VM's
+// clone was linked. This build records such a clone "local" (its file is),
+// and judges it by what it is a clone of. The new clone records its
+// backing_disk, which a snapshot delete of the source checks before it lets
+// libvirt merge or remove a file the clone backs on. Auto falls back to a full copy only where a
+// linked clone cannot back on the disk (no file path), and says so.
+func (s *Server) cloneModeFor(ctx context.Context, requested string, disks []corrosion.DiskRecord) (string, string) {
+	switch requested {
+	case "linked", "full":
+		return requested, "requested"
+	}
+	if len(disks) == 0 {
+		return "full", "auto: the source has no disks to link to"
+	}
+	for _, d := range disks {
+		if !s.sharedAsOnMain(ctx, d, 0) {
+			return "full", fmt.Sprintf("auto: disk %s is on host-local storage, so a full copy keeps the clone independent of its source's host", d.DiskName)
+		}
+	}
+	for _, d := range disks {
+		if !filepath.IsAbs(d.Path) {
+			return "full", fmt.Sprintf("auto: disk %s (%s) is not a file a linked clone can back on, so it is copied in full", d.DiskName, d.Path)
+		}
+	}
+	return "linked", "auto: every disk is on shared storage, or a clone of a disk that is"
+}
+
+// sharedAsOnMain is DiskIsShared, or — for a clone (a backing_disk, no
+// pool) — whether the disk it is a clone of is.
+func (s *Server) sharedAsOnMain(ctx context.Context, d corrosion.DiskRecord, depth int) bool {
+	if corrosion.DiskIsShared(d) {
+		return true
+	}
+	if d.BackingDisk == "" || d.StorageVolume != "" || depth >= 8 {
+		return false
+	}
+	rows, err := corrosion.DisksReferencingPath(ctx, s.db, d.BackingDisk)
+	if err != nil {
+		return false
+	}
+	for _, r := range rows {
+		if r.Path == d.BackingDisk && s.sharedAsOnMain(ctx, r, depth+1) {
+			return true
+		}
+	}
+	return false
 }
 
 // diskIsShared reports whether a disk lives on cluster-shared storage (so a

@@ -1,9 +1,16 @@
 package obs
 
 import (
+	"bytes"
+	"compress/gzip"
+	"context"
 	"encoding/json"
+	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -57,6 +64,50 @@ func TestDaemonLog_SecretKeysRedactedOnWithAndNamedLogger(t *testing.T) {
 		line := lineWith(lines, c.msg)
 		if line == "" || strings.Contains(line, c.secret) {
 			t.Errorf("%q: secret printed or line missing: %q", c.msg, line)
+		}
+	}
+}
+
+// m6: the OTLP export path carries the masked value too: the redactor sits
+// in front of the handler that both prints and exports.
+func TestOTLPExport_SecretKeysRedacted(t *testing.T) {
+	cleanEnv(t)
+	var mu sync.Mutex
+	var bodies bytes.Buffer
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var rd io.Reader = r.Body
+		if r.Header.Get("Content-Encoding") == "gzip" {
+			if zr, err := gzip.NewReader(r.Body); err == nil {
+				rd = zr
+			}
+		}
+		b, _ := io.ReadAll(rd)
+		mu.Lock()
+		bodies.Write(b)
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	prev := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	shutdown, err := Setup(context.Background(), Config{ServiceName: "litevirt", OTLPEndpoint: srv.URL})
+	if err != nil {
+		t.Logf("Setup (fail-open): %v", err)
+	}
+	slog.Info("otlp redact probe", "marker", "otlp-marker-7f3", "password", "otlp-secret-9c1", "token", "otlp-tok-2b8")
+	if shutdown != nil {
+		_ = shutdown(context.Background())
+	}
+	mu.Lock()
+	got := bodies.String()
+	mu.Unlock()
+	if !strings.Contains(got, "otlp-marker-7f3") {
+		t.Fatalf("the probe record was not exported (%d bytes received); the test proves nothing", len(got))
+	}
+	for _, secret := range []string{"otlp-secret-9c1", "otlp-tok-2b8"} {
+		if strings.Contains(got, secret) {
+			t.Errorf("secret %q exported over OTLP", secret)
 		}
 	}
 }

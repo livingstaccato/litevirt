@@ -224,3 +224,25 @@ func TestInspectContainer_ForwardedCallFilteredForViewer(t *testing.T) {
 		t.Fatalf("forwarded detail reached the viewer unfiltered: rootfs=%q backups=%+v", d.GetRootfsPath(), d.GetBackups())
 	}
 }
+
+// When every backup entry resolves on the answering host, no peer is asked.
+func TestInspectContainer_NoPeerDialWhenResolvedLocally(t *testing.T) {
+	s := inspectTestServer(t, "")
+	repo := ctTestRepo(t)
+	putCTManifest(t, repo, "ct1", "acme", "2026-10-08T10:00:00Z")
+	if err := corrosion.UpsertContainerBackup(context.Background(), s.db, "acme", "ct1", repo, 10); err != nil {
+		t.Fatal(err)
+	}
+	addHost(t, s, "host-z")
+	dialed := false
+	s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {
+		dialed = true
+		return &probePeer{canned: &pb.ProbeContainerBackupsResponse{}}, func() {}, nil
+	}
+	if _, err := s.InspectContainer(adminCtx(), &pb.InspectContainerRequest{Name: "ct1"}); err != nil {
+		t.Fatal(err)
+	}
+	if dialed {
+		t.Fatal("a peer was asked although every entry resolved locally")
+	}
+}

@@ -28,10 +28,32 @@ const OCILibraryDir = "oci"
 // link into a dot-directory the path does not name. The path is judged as
 // written and after resolving symlinks, and must exist as a directory.
 func CheckReadDir(p, dataDir, pkiDir string) error {
+	return checkReadDir(p, dataDir, pkiDir, "", "")
+}
+
+// CheckTemplateDir is CheckReadDir for a container's rootfs template, which
+// may also come from inside the LXC store lxcStore: LXC's own template cache,
+// or another container's rootfs an Admin names. The store itself (every
+// container at once) and ownDir, the directory of the container being made,
+// are refused. Who may name a host path at all is the caller's to decide
+// (storage.hostpath): this is the backstop. A VM is still never given a file
+// in the store (CheckReadFile).
+func CheckTemplateDir(p, dataDir, pkiDir, lxcStore, ownDir string) error {
+	return checkReadDir(p, dataDir, pkiDir, lxcStore, ownDir)
+}
+
+func checkReadDir(p, dataDir, pkiDir, lxcStore, ownDir string) error {
 	if err := checkReadPathLexical(p); err != nil {
 		return err
 	}
 	for _, cand := range pathForms(p) {
+		if lxcStore != "" {
+			if inStore, err := judgeLXCStore(p, cand, lxcStore, ownDir); err != nil {
+				return err
+			} else if inStore {
+				continue
+			}
+		}
 		if err := refuseReadDir(p, cand, dataDir, pkiDir); err != nil {
 			return err
 		}
@@ -142,4 +164,35 @@ func OCILibraryItem(p, dataDir string) bool {
 		}
 	}
 	return true
+}
+
+// judgeLXCStore reports whether cand is strictly inside the LXC store (and so
+// judged here, not as a secret root), refusing the store itself, anything
+// containing it, and the container's own directory.
+func judgeLXCStore(p, cand, store, ownDir string) (bool, error) {
+	for _, s := range pathForms(store) {
+		if within(cand, s) {
+			return false, fmt.Errorf("%q is or contains the LXC container store %s", p, store)
+		}
+		if !within(s, cand) {
+			continue
+		}
+		if ownDir != "" {
+			for _, o := range pathForms(ownDir) {
+				if within(o, cand) || within(cand, o) {
+					return false, fmt.Errorf("%q is the directory of the container being made", p)
+				}
+			}
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+// SetSecretRootsForTest replaces the secret roots and returns what restores
+// them, so a test can stand a temporary directory in for /var/lib/lxc.
+func SetSecretRootsForTest(roots []string) (restore func()) {
+	old := secretRoots
+	secretRoots = roots
+	return func() { secretRoots = old }
 }

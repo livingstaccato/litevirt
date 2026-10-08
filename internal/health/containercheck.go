@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
@@ -84,6 +85,8 @@ type ContainerChecker struct {
 	// dataDir / pkiDir are the daemon's own directories, which a relocation's
 	// rootfs template may not name (storage.CheckReadDir). See SetDaemonDirs.
 	dataDir, pkiDir string
+	// lxcStore is the runtime's lxcpath (SetContainerLxcpath).
+	lxcStore string
 
 	// replicaCaughtUp, orphans and onOrphans serve the orphan-runtime report
 	// (orphan_runtime.go). A nil replicaCaughtUp is unwired and trusted.
@@ -109,6 +112,10 @@ func (c *ContainerChecker) SetContainersRoot(root string) { c.containersRoot = r
 func (c *ContainerChecker) SetDaemonDirs(dataDir, pkiDir string) {
 	c.dataDir, c.pkiDir = dataDir, pkiDir
 }
+
+// SetContainerLxcpath sets the LXC container store (default /var/lib/lxc),
+// inside which a recreate's template may be read.
+func (c *ContainerChecker) SetContainerLxcpath(p string) { c.lxcStore = p }
 
 // SetGuardedContainerRekeyActive injects the cheap configured+latch decision
 // used to select modern guarded re-key WAL shapes.
@@ -352,7 +359,11 @@ func (c *ContainerChecker) recreateRelocated(ctx context.Context, ct corrosion.C
 	// operator sees it and nothing is copied.
 	if p, isPath, perr := lxc.TemplatePath(opts.Template); isPath {
 		if perr == nil {
-			perr = storage.CheckReadDir(p, c.dataDir, c.pkiDir)
+			store := c.lxcStore
+			if store == "" {
+				store = "/var/lib/lxc"
+			}
+			perr = storage.CheckTemplateDir(p, c.dataDir, c.pkiDir, store, filepath.Join(store, ct.Name))
 		}
 		if perr != nil {
 			slog.Error("containercheck: relocate-recreate refused: its rootfs template is a protected host path",

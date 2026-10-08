@@ -663,6 +663,9 @@ type Server struct {
 
 	// recreateSec holds a compose recreate's outgoing container security
 	// between its delete and its create (stacks_containers.go), by name.
+	// lxcStore is the runtime's lxcpath (SetContainerLxcpath).
+	lxcStore string
+
 	recreateSecMu sync.Mutex
 	recreateSec   map[string]corrosion.ContainerCreateSpec
 

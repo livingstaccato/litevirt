@@ -76,7 +76,7 @@ paths:
   `storage.hostpath` at the cluster root — the Admin role.
 - Whoever asks, a template or OCI source may not be under, or contain, a
   directory that holds host secrets or live state (`/etc`, `/boot`, `/dev`,
-  `/proc`, `/sys`, `/var/backups`, `/var/spool`, `/var/lib/lxc`, libvirt's
+  `/proc`, `/sys`, `/var/backups`, `/var/spool`, `/var/lib/lxc` (but see below), libvirt's
   per-domain state), the daemon's PKI directory, or its data directory apart
   from `pools/`, `mounts/`, `disks/uploads/` and `oci/`. `/home`, `/root` and
   `/run` themselves, a whole home directory, and a link into a dot-directory
@@ -84,6 +84,12 @@ paths:
   directory the daemon writes into, except that the OCI library itself is the
   daemon's own. A template name (`download`, `busybox`) may not contain `/`;
   name a path as `rootfs:<path>`.
+- **Inside the LXC store** (`/var/lib/lxc`) an Admin's template is read as on
+  earlier releases — LXC's template cache, or another container's rootfs
+  (`--template /var/lib/lxc/base/rootfs`) — and a host-loss recreate of a
+  container made that way reads it again. The store itself, anything
+  containing it, and the directory of the container being made are refused. A
+  VM is still never given a file there as a CD-ROM.
 - A host-loss relocation that recreates a container from its template judges
   the template again on the recreating host. A refused template leaves the
   container pending, with a `ct.relocate.failed` event, and copies nothing.

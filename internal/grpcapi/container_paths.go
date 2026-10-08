@@ -52,7 +52,7 @@ func (s *Server) authorizeContainerTemplate(ctx context.Context, template string
 
 // checkContainerTemplate is the backstop half, run on the host that reads the
 // template: the protected places are refused whoever asked.
-func (s *Server) checkContainerTemplate(template string) error {
+func (s *Server) checkContainerTemplate(template, name string) error {
 	p, isPath, err := lxc.TemplatePath(template)
 	if err != nil {
 		return status.Errorf(codes.InvalidArgument, "template: %v", err)
@@ -60,7 +60,8 @@ func (s *Server) checkContainerTemplate(template string) error {
 	if !isPath {
 		return nil
 	}
-	if err := storage.CheckReadDir(p, s.dataDir, s.pkiDir); err != nil {
+	store := s.containerLxcpath()
+	if err := storage.CheckTemplateDir(p, s.dataDir, s.pkiDir, store, filepath.Join(store, name)); err != nil {
 		return status.Errorf(codes.InvalidArgument, "container template: %v", err)
 	}
 	return nil
@@ -159,4 +160,15 @@ func (s *Server) refuseForeignOCIItem(ctx context.Context, name, project, verb s
 	return status.Errorf(codes.PermissionDenied,
 		"OCI image %q was pulled by project %q; a container in project %q may not %s it (pull it into your project under another name)",
 		name, owner, tenancy.NormalizeProject(project), verb)
+}
+
+// SetContainerLxcpath sets the LXC container store the runtime uses (its
+// lxcpath; default /var/lib/lxc), inside which an Admin's template may be read.
+func (s *Server) SetContainerLxcpath(p string) { s.lxcStore = p }
+
+func (s *Server) containerLxcpath() string {
+	if s.lxcStore != "" {
+		return s.lxcStore
+	}
+	return "/var/lib/lxc"
 }

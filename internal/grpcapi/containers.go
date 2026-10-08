@@ -135,7 +135,7 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	if err := s.refuseNoContainerRuntime(ctx, s.hostName); err != nil {
 		return nil, err
 	}
-	if err := s.checkContainerTemplate(req.Template); err != nil {
+	if err := s.checkContainerTemplate(req.Template, req.Name); err != nil {
 		s.audit(ctx, "ct.create", req.Name, "template="+req.Template, "denied")
 		return nil, err
 	}

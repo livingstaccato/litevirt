@@ -10,6 +10,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/storage"
 )
 
 // Container inputs that name a host path go through the same rules a VM's do:
@@ -117,7 +118,7 @@ func TestCreateContainer_AdminHostPathOutsideDaemonStateWorks(t *testing.T) {
 func TestCreateContainer_ProtectedPlacesRefusedForAdmin(t *testing.T) {
 	s, rt := ctPathServer(t)
 	state := mkCTRootfs(t, filepath.Join(s.dataDir, "vms"))
-	for _, tmpl := range []string{"/etc", "/", "/var/lib/lxc/other/rootfs", state, s.dataDir, filepath.Dir(s.dataDir)} {
+	for _, tmpl := range []string{"/etc", "/", state, s.dataDir, filepath.Dir(s.dataDir)} {
 		err := createCT(s, adminCtx(), "c1", tmpl)
 		if status.Code(err) != codes.InvalidArgument {
 			t.Errorf("admin template %q: got %v, want InvalidArgument", tmpl, err)
@@ -162,5 +163,32 @@ func TestPullOCIImage_AdminPathsAreJudged(t *testing.T) {
 		if _, err := s.PullOCIImage(adminCtx(), &pb.PullOCIImageRequest{Image: "alpine:3.19", Dest: dest}); err != nil {
 			t.Errorf("pull to %q: %v", dest, err)
 		}
+	}
+}
+
+// An Admin's template inside the LXC store works again (LXC's template cache,
+// another container's rootfs), as on main; the container's own directory and
+// the store itself are refused, and a non-admin still names no host path.
+func TestCreateContainer_AdminTemplateInTheLXCStore(t *testing.T) {
+	s, rt := ctPathServer(t)
+	store := t.TempDir()
+	s.SetContainerLxcpath(store)
+	restore := storage.SetSecretRootsForTest([]string{"/etc", store})
+	defer restore()
+	base := mkCTRootfs(t, filepath.Join(store, "base", "rootfs"))
+	if err := createCT(s, adminCtx(), "c1", base); err != nil {
+		t.Fatalf("admin template in the LXC store: %v", err)
+	}
+	if err := createCT(s, ctOperatorCtx(), "c2", base); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("operator naming the LXC store: %v", err)
+	}
+	mkCTRootfs(t, filepath.Join(store, "c3", "rootfs"))
+	for _, tmpl := range []string{store, filepath.Join(store, "c3", "rootfs")} {
+		if err := createCT(s, adminCtx(), "c3", tmpl); status.Code(err) != codes.InvalidArgument {
+			t.Errorf("admin template %q: %v, want InvalidArgument", tmpl, err)
+		}
+	}
+	if len(rt.createCalls) != 1 {
+		t.Fatalf("create calls: %+v", rt.createCalls)
 	}
 }

@@ -2,10 +2,13 @@ package health
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/storage"
 )
 
 // A relocation recreate reads the template the container was created from on
@@ -60,5 +63,30 @@ func TestContainerCheck_RelocateRecreate_ManagedNICCarriesPrefixAndGateway(t *te
 	}
 	if n := rt.lastCreate.Network[0]; n.IP != "172.16.77.9/24" || n.Gateway != "172.16.77.1" {
 		t.Fatalf("recreated NIC = %+v, want 172.16.77.9/24 via 172.16.77.1", n)
+	}
+}
+
+// A container an Admin created from a template in the LXC store is recreated
+// from it after a host loss, as on main.
+func TestContainerCheck_RelocateRecreate_TemplateInTheLXCStore(t *testing.T) {
+	store := t.TempDir()
+	restore := storage.SetSecretRootsForTest([]string{"/etc", store})
+	defer restore()
+	tpl := filepath.Join(store, "base", "rootfs")
+	if err := os.MkdirAll(filepath.Join(tpl, "etc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	db := testLogicDB(t)
+	rt := newFakeCtRuntime()
+	insertCt(t, db, corrosion.ContainerRecord{
+		HostName: "node1", Name: "ct1", State: "pending",
+		StateDetail: corrosion.ContainerRelocateRecreateDetail, Image: "x",
+		CreateSpec: corrosion.EncodeCreateSpec(corrosion.ContainerCreateSpec{Template: tpl}),
+	})
+	c := NewContainerChecker("node1", db, rt)
+	c.SetContainerLxcpath(store)
+	c.checkContainer(context.Background(), mustGetCt(t, db, "ct1"), time.Now())
+	if rt.lastCreate.Template != tpl {
+		t.Fatalf("not recreated from the LXC-store template: %+v", rt.lastCreate)
 	}
 }

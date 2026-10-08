@@ -278,7 +278,7 @@ func (c *ContainerChecker) recreateRelocated(ctx context.Context, ct corrosion.C
 		if !c.writeRelocatedNICs(ctx, ct.Name, ifs) {
 			return // row write failed → keep the marker, retry next sweep
 		}
-		if _, err := network.ReserveContainerNICs(ctx, c.db, c.hostName, ct.Name, ifs); err != nil {
+		if _, err := network.ReserveContainerNICs(ctx, c.db, c.hostName, ct.Name, relocateLeaseProof(ct), ifs); err != nil {
 			slog.Warn("containercheck: relocate IP re-reservation incomplete", "container", ct.Name, "error", err)
 		}
 		state := "stopped"
@@ -327,7 +327,7 @@ func (c *ContainerChecker) recreateRelocated(ctx context.Context, ct corrosion.C
 		veth := corrosion.ContainerVethName(ct.Name, i)
 		ip := n.IP
 		if ip != "" {
-			if ok, rerr := network.ReserveContainerIPForRebuild(ctx, c.db, n.NetworkName, ip, n.MAC, c.hostName, ct.Name); rerr != nil || !ok {
+			if ok, rerr := network.ReserveContainerIPForRebuild(ctx, c.db, n.NetworkName, ip, n.MAC, c.hostName, ct.Name, relocateLeaseProof(ct)); rerr != nil || !ok {
 				if rerr != nil {
 					slog.Warn("containercheck: relocate IP reserve errored; using DHCP", "container", ct.Name, "ip", ip, "error", rerr)
 				}
@@ -785,4 +785,11 @@ func ctAttemptCount(rs *corrosion.ContainerRestartState) int {
 		return 0
 	}
 	return rs.AttemptCount
+}
+
+// relocateLeaseProof is the lease proof of a container re-homed here: the row
+// on this host is the container's own (the coordinator wrote it), so its
+// project is the proof.
+func relocateLeaseProof(ct corrosion.ContainerRecord) network.LeaseProof {
+	return network.LeaseProof{Project: ct.Project, HereProject: ct.Project, HereKnown: true}
 }

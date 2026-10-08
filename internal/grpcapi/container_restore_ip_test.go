@@ -2,7 +2,11 @@ package grpcapi
 
 import (
 	"context"
+	"strings"
 	"testing"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -48,9 +52,10 @@ func TestRestoreContainer_CopyBesideOriginalDoesNotTakeItsAddress(t *testing.T) 
 	s, rt, repo := restoreIPServer(t)
 	s.hostName = "host-b"
 	rs := &progressStream[pb.RestoreContainerProgress]{ctx: adminCtx()}
-	_ = s.RestoreContainer(&pb.RestoreContainerRequest{
+	err := s.RestoreContainer(&pb.RestoreContainerRequest{
 		Name: "web", RepoPath: repo, Timestamp: "2026-10-08T12:00:00Z", Start: true,
 	}, rs)
+	assertIPUnavailable(t, err)
 	if len(rt.startCalls) != 0 {
 		t.Fatalf("the copy was started on the original's address: start calls %v", rt.startCalls)
 	}
@@ -75,9 +80,10 @@ func TestRestoreContainer_DeletedThenReallocatedAcrossProjectsRefused(t *testing
 	}
 	rt.startCalls = nil
 	rs := &progressStream[pb.RestoreContainerProgress]{ctx: adminCtx()}
-	_ = s.RestoreContainer(&pb.RestoreContainerRequest{
+	err := s.RestoreContainer(&pb.RestoreContainerRequest{
 		Name: "web", RepoPath: repo, Timestamp: "2026-10-08T12:00:00Z", Start: true,
 	}, rs)
+	assertIPUnavailable(t, err)
 	if len(rt.startCalls) != 0 {
 		t.Fatalf("web was started on y's address: start calls %v", rt.startCalls)
 	}
@@ -124,5 +130,15 @@ func TestBackupContainer_IndexKeyedByManifestProject(t *testing.T) {
 	}
 	if u.BackupGiBUsed != 0 {
 		t.Fatalf("beta charged for acme's backup: %d GiB", u.BackupGiBUsed)
+	}
+}
+
+// assertIPUnavailable pins that a restore was refused for its IP and nothing
+// else, so the no-start assertions after it cannot pass because the restore
+// failed early for an unrelated reason.
+func assertIPUnavailable(t *testing.T, err error) {
+	t.Helper()
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "unavailable IPs") {
+		t.Fatalf("restore error = %v, want FailedPrecondition with \"unavailable IPs\"", err)
 	}
 }

@@ -303,7 +303,28 @@ A managed NIC (one naming a `network=`) reaches **VM parity**:
   restart/restore/migrate/clone.
 - **IPAM.** A static IP reserves that exact address; a subnet-backed network
   auto-allocates one; a subnet-less network is DHCP (the IP is discovered later).
-  Leases are non-aliasing across VMs and same-named containers.
+  Leases are non-aliasing across VMs and same-named containers. An address is
+  one lease however it is written: `ip=10.0.0.5/24` and `ip=10.0.0.5` are the
+  same address, and the second request is refused.
+- **Addresses shared before this release.** Earlier releases keyed a lease on
+  the text you gave, so two containers could hold `10.0.0.5/24` and `10.0.0.5`
+  at once. Such a pair keeps working: when one of them is restored or
+  relocated it keeps its address, with a WARN naming the other holder, so you
+  can reassign one. It keeps it only when the lease history proves it already
+  held that exact address in its own project, and no one took the address
+  after it let go. Otherwise the shared address is refused and the NIC fails
+  safe: a restore leaves the NIC without an address and the container stopped
+  (`operator-stop`), and a relocation falls back to DHCP. The address stays in
+  the container's spec. This happens when:
+  - the other holder re-acquired its lease after this container released its
+    own (its own restore or relocation, a lease rekey, a network rescope);
+  - this container's old lease record is gone (tombstone garbage collection,
+    or a rescope that moved the live leases but not the released one);
+  - the container is a copy of the other holder: the same name on another
+    host;
+  - a same-named container in another project holds the history.
+
+  Free the address (or give one container a new one) and start it again.
 - **DNS.** A managed container with a known IP is resolvable at
   `ct.stack.domain` (the container analogue of VM DNS). The per-host IP scanner
   discovers a DHCP address, persists it, and (re)writes the record; delete/migrate

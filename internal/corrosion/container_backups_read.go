@@ -55,3 +55,13 @@ func normalizeProject(p string) string {
 	}
 	return p
 }
+
+// ContainerProjectAnyState returns the project of the container row at
+// (host, name) whether live or tombstoned, and whether one exists.
+func ContainerProjectAnyState(ctx context.Context, c *Client, host, name string) (string, bool, error) {
+	rows, err := c.Query(ctx, `SELECT project FROM containers WHERE host_name = ? AND name = ?`, host, name)
+	if err != nil || len(rows) == 0 {
+		return "", false, err
+	}
+	return normalizeProject(rows[0].String("project")), true, nil
+}

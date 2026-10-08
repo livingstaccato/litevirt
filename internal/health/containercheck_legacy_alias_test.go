@@ -8,10 +8,11 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
-// M1: a container whose static address was already shared with another
+// M1 / n6: a container whose static address was already shared with another
 // workload before this release (lease "172.16.77.50" for lxt4 beside its own
-// "172.16.77.50/24") keeps that address when failover recreates it here,
-// instead of being dropped to DHCP.
+// "172.16.77.50/24") keeps that address when failover recreates it here. A
+// relocation re-keys the container's own lease to this host and keeps it live
+// (RekeyContainerOwnerGuarded), so that live row on this host is the proof.
 func TestContainerCheck_RelocateRecreate_KeepsPreexistingAliasedIP(t *testing.T) {
 	db := testLogicDB(t)
 	ctx := context.Background()
@@ -21,11 +22,9 @@ func TestContainerCheck_RelocateRecreate_KeepsPreexistingAliasedIP(t *testing.T)
 		 VALUES ('lxtnet', '172.16.77.50', 'mac-4', 'lxt4', 'ct', 'node9', '2026-10-01T00:00:00Z', ?)`, db.NowTS()); err != nil {
 		t.Fatal(err)
 	}
-	// lxt3's own lease on its failed host, released by the failover after
-	// lxt4 had its alias: lxt3 held this exact text first.
 	if err := db.Execute(ctx,
-		`INSERT INTO ip_allocations (network, ip, mac, vm_name, owner_kind, owner_host, allocated_at, updated_at, deleted_at)
-		 VALUES ('lxtnet', '172.16.77.50/24', 'mac-3', 'lxt3', 'ct', 'node0', '2026-09-01T00:00:00Z', ?, '2026-10-08T00:00:00Z')`, db.NowTS()); err != nil {
+		`INSERT INTO ip_allocations (network, ip, mac, vm_name, owner_kind, owner_host, allocated_at, updated_at)
+		 VALUES ('lxtnet', '172.16.77.50/24', 'mac-3', 'lxt3', 'ct', 'node1', '2026-09-01T00:00:00Z', ?)`, db.NowTS()); err != nil {
 		t.Fatal(err)
 	}
 	spec := corrosion.EncodeCreateSpec(corrosion.ContainerCreateSpec{

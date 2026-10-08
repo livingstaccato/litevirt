@@ -47,7 +47,9 @@ func ReserveContainerIP(ctx context.Context, db *corrosion.Client, network, ip, 
 // spelling:
 //   - a row keyed with this exact text must exist for this container (any
 //     host, live or tombstoned) — a copy restored elsewhere, or a container
-//     that never held the address, has none;
+//     that never held the address, has none — and the container row on that
+//     row's host must be in this container's project (LeaseProof), so a
+//     same-named container of another project is not mistaken for it;
 //   - no other live holder may be a same-named container (the original of a
 //     copy being restored beside it);
 //   - if that row was released, every other live holder must have acquired
@@ -58,7 +60,7 @@ func ReserveContainerIP(ctx context.Context, db *corrosion.Client, network, ip, 
 // it, otherwise under this container's own prior key. The duplicate is logged
 // as a WARN naming both owners so an operator can reassign one. A NEW
 // allocation (ReserveContainerIP) is always refused.
-func ReserveContainerIPForRebuild(ctx context.Context, db *corrosion.Client, network, ip, mac, host, ctName string) (bool, error) {
+func ReserveContainerIPForRebuild(ctx context.Context, db *corrosion.Client, network, ip, mac, host, ctName string, proof LeaseProof) (bool, error) {
 	raw := strings.TrimSpace(ip)
 	norm := LeaseAddr(raw)
 	others, err := hostAddrHoldersOther(ctx, db, network, norm, "ct", host, ctName)
@@ -86,6 +88,19 @@ func ReserveContainerIPForRebuild(ctx context.Context, db *corrosion.Client, net
 	if err != nil || prior == nil {
 		return false, err
 	}
+	// The prior row names the container only by (host, name). Bind it to THIS
+	// container's project through the container row on the prior row's host —
+	// as it was before this rebuild wrote anything there, when that host is
+	// this one — so a same-named container of another project is not "it".
+	ownerProject, known := proof.HereProject, proof.HereKnown
+	if prior.OwnerHost != host {
+		if ownerProject, known, err = corrosion.ContainerProjectAnyState(ctx, db, prior.OwnerHost, ctName); err != nil {
+			return false, err
+		}
+	}
+	if !known || normProject(ownerProject) != normProject(proof.Project) {
+		return false, nil
+	}
 	if prior.Deleted {
 		for _, o := range others {
 			if corrosion.LWWNewer(o.UpdatedAt, prior.UpdatedAt) {
@@ -106,22 +121,36 @@ func ReserveContainerIPForRebuild(ctx context.Context, db *corrosion.Client, net
 	return reserveContainerLease(ctx, db, network, key, mac, host, ctName)
 }
 
+// LeaseProof identifies the container a rebuild is for beyond its name:
+// its project, and the project of the container row on the rebuilding host
+// as it was BEFORE the rebuild wrote its own row there (a restore overwrites
+// a tombstoned row of the same name). HereKnown is false when there was none.
+type LeaseProof struct {
+	Project     string
+	HereProject string
+	HereKnown   bool
+}
+
 // priorLease is a container's earlier lease row on one address text.
 type priorLease struct {
 	Deleted   bool
 	UpdatedAt string
+	OwnerHost string
 }
 
 // priorContainerLease returns the row keyed exactly (network, ip) if it was
 // last held by a container named ctName (on any host), live or tombstoned.
 func priorContainerLease(ctx context.Context, db *corrosion.Client, network, ip, ctName string) (*priorLease, error) {
 	rows, err := db.Query(ctx,
-		`SELECT updated_at, deleted_at FROM ip_allocations
+		`SELECT updated_at, deleted_at, COALESCE(owner_host, '') AS owner_host FROM ip_allocations
 		 WHERE network = ? AND ip = ? AND owner_kind = 'ct' AND vm_name = ?`, network, ip, ctName)
 	if err != nil || len(rows) == 0 {
 		return nil, err
 	}
-	return &priorLease{Deleted: rows[0].String("deleted_at") != "", UpdatedAt: rows[0].String("updated_at")}, nil
+	return &priorLease{
+		Deleted: rows[0].String("deleted_at") != "", UpdatedAt: rows[0].String("updated_at"),
+		OwnerHost: rows[0].String("owner_host"),
+	}, nil
 }
 
 // reserveContainerLease writes (or resurrects, or idempotently refreshes) the
@@ -243,12 +272,12 @@ func ReleaseOrphanContainerLeases(ctx context.Context, db *corrosion.Client, hos
 // container (its imported on-disk config still names that IP — booting it would
 // cause the conflict the DB is avoiding). Best-effort on errors; returns the
 // number of NICs left unreserved + the first error.
-func ReserveContainerNICs(ctx context.Context, db *corrosion.Client, host, ctName string, ifaces []corrosion.ContainerInterfaceRecord) (unreserved int, firstErr error) {
+func ReserveContainerNICs(ctx context.Context, db *corrosion.Client, host, ctName string, proof LeaseProof, ifaces []corrosion.ContainerInterfaceRecord) (unreserved int, firstErr error) {
 	for _, ifc := range ifaces {
 		if ifc.IP == "" {
 			continue
 		}
-		reserved, err := ReserveContainerIPForRebuild(ctx, db, ifc.NetworkName, ifc.IP, ifc.MAC, host, ctName)
+		reserved, err := ReserveContainerIPForRebuild(ctx, db, ifc.NetworkName, ifc.IP, ifc.MAC, host, ctName, proof)
 		if err != nil {
 			if firstErr == nil {
 				firstErr = err
@@ -297,4 +326,11 @@ func hostAddrHoldersOther(ctx context.Context, db *corrosion.Client, network, ip
 		out = append(out, h)
 	}
 	return out, nil
+}
+
+func normProject(p string) string {
+	if p == "" {
+		return corrosion.DefaultProject
+	}
+	return p
 }

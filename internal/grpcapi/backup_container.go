@@ -747,6 +747,14 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 			"container %q already exists on host %q; delete it first or restore under a different name",
 			req.Name, s.hostName)
 	}
+	// The project of a deleted container that last used this (host, name),
+	// read BEFORE the restore writes its own row over it: the lease proof for a
+	// shared address must be this container's, not a same-named container of
+	// another project that once lived here (network.LeaseProof).
+	hereProject, hereKnown, herr := corrosion.ContainerProjectAnyState(ctx, s.db, s.hostName, req.Name)
+	if herr != nil {
+		return status.Errorf(codes.Internal, "check prior container: %v", herr)
+	}
 
 	// The embedded spec is UNTRUSTED manifest data and supplies only descriptive
 	// fields (image/cpu/mem/labels/restart) — never the project; the row built from
@@ -1064,7 +1072,8 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	// — an operator-supplied header falls through to the safe re-reserve path.
 	unreserved := 0
 	if s.migrateSourceFromPeer(ctx) == "" {
-		u, rerr := network.ReserveContainerNICs(ctx, s.db, s.hostName, req.Name, ifs)
+		u, rerr := network.ReserveContainerNICs(ctx, s.db, s.hostName, req.Name,
+			network.LeaseProof{Project: project, HereProject: hereProject, HereKnown: hereKnown}, ifs)
 		if rerr != nil {
 			slog.Warn("container restore: IP re-reservation incomplete (NIC may be re-discovered)",
 				"name", req.Name, "error", rerr)

@@ -183,7 +183,10 @@ func (s *Server) layerUsers(ctx context.Context, vmName string, images []string)
 
 // mergeTarget is where one disk's chain merges: base, as the disk's chain
 // spells it (what the domain is repointed at), and disk, the record of it.
-type mergeTarget struct{ base, disk string }
+type mergeTarget struct {
+	base, disk string
+	layers     []string // the files above base the merge commits (resolved)
+}
 
 // snapshotMergeBases decides, for deleting vmName's snapshot deleting, which
 // layer each of its disks merges into (controller ruling, round 4). Only
@@ -284,7 +287,11 @@ func (s *Server) snapshotMergeBases(ctx context.Context, vmName, deleting string
 		if target <= 0 {
 			continue // the active layer itself, or used: nothing to merge
 		}
-		out[dev] = mergeTarget{base: chain[target].name, disk: d.DiskName}
+		var layers []string
+		for _, l := range chain[:target] {
+			layers = append(layers, l.file)
+		}
+		out[dev] = mergeTarget{base: chain[target].name, disk: d.DiskName, layers: layers}
 	}
 	return out, nil
 }
@@ -351,6 +358,12 @@ func (s *Server) mergeStop(d corrosion.DiskRecord, l chainLayer, target bool, us
 	}
 	if snap, ok := frozen[l.file]; ok {
 		return "frozen by snapshot " + snap
+	}
+	// A layer a merge emptied into another file while the VM's definition
+	// still names it (re-review 3, I-1): committing it would write its stale
+	// data over the guest's later writes.
+	if into, ok := lv.MergedInto(l.file); ok {
+		return "marked as merged into " + into
 	}
 	if target {
 		if q, err := hasQcow2Magic(l.file); err != nil || !q {
@@ -485,13 +498,16 @@ func overlayName(src, snap string) string {
 	return filepath.Join(filepath.Dir(src), base+"."+snap)
 }
 
-// clearLeftoverOverlays removes, before snapshot snap of vmName is taken, a
-// file already at the name libvirt will give the snapshot's overlay — what a
-// failed merge leaves — when nothing uses it: no VM's record or chain
-// (layerUsers over every VM, this one too), no source of this domain, live
-// or persistent, and no layer a snapshot of it froze. A file that is used,
-// or whose use cannot be told, is kept, and the create is refused naming it
-// (libvirt would refuse it too).
+// clearLeftoverOverlays frees, before snapshot snap of vmName is taken, the
+// name libvirt will give its overlay, when what is there is a layer a
+// litevirt merge itself left behind and marked as such
+// (libvirt.LeftoverLayerMarker; re-review 3, I-2) and nothing uses it: no
+// VM's record or chain (layerUsers over every VM, this one too), no source
+// of this domain, live or persistent, and no layer a snapshot of it froze.
+// The path is never followed: a marked symlink is unlinked itself, its
+// target untouched. Anything else at that name — an operator's file, an
+// unmarked link — is kept and the create refused naming it, as libvirt
+// refused it on main.
 func (s *Server) clearLeftoverOverlays(ctx context.Context, vmName, snap string) error {
 	srcs := map[string]bool{}
 	if live, err := s.virt.DomainDiskSources(vmName); err == nil {
@@ -529,14 +545,25 @@ func (s *Server) clearLeftoverOverlays(ctx context.Context, vmName, snap string)
 		}
 	}
 	for _, ov := range leftovers {
-		file := resolvedOr(s.hostDiskFile(ov))
+		host := s.hostDiskFile(ov)
+		fi, err := os.Lstat(host)
+		if err != nil {
+			continue
+		}
+		link := fi.Mode()&os.ModeSymlink != 0
+		file := host
+		if !link {
+			file = resolvedOr(host) // the file itself; only directories resolve
+		}
 		why := ""
 		switch {
+		case !hasMarker(lv.LeftoverLayerMarker(host)):
+			why = "it is not a layer a litevirt merge left behind"
 		case uerr != nil:
 			why = "what uses it cannot be told: " + uerr.Error()
 		case herr != nil:
 			why = "the VM's snapshots cannot be listed: " + herr.Error()
-		case named[file]:
+		case named[file] || named[host]:
 			why = "the VM's definition names it"
 		case len(users[file]) > 0:
 			why = "used by " + strings.Join(users[file], ", ")
@@ -545,16 +572,128 @@ func (s *Server) clearLeftoverOverlays(ctx context.Context, vmName, snap string)
 		}
 		if why != "" {
 			return status.Errorf(codes.FailedPrecondition,
-				"snapshot %q of %q: its overlay would be %s, which is already there and kept (%s); choose another snapshot name",
+				"snapshot %q of %q: its overlay would be %s, which is already there and kept (%s); move it away or choose another snapshot name",
 				snap, vmName, ov, why)
 		}
-		if err := os.Remove(file); err != nil && !os.IsNotExist(err) {
+		if err := os.Remove(host); err != nil && !os.IsNotExist(err) {
 			return status.Errorf(codes.FailedPrecondition,
-				"snapshot %q of %q: remove the unused leftover %s: %v", snap, vmName, ov, err)
+				"snapshot %q of %q: remove the leftover %s: %v", snap, vmName, ov, err)
 		}
-		_ = os.Remove(lv.MergedLayerMarker(file))
-		slog.Warn("snapshot create: removed an unused leftover at the overlay's name (a failed merge's)",
-			"vm", vmName, "snapshot", snap, "file", ov)
+		_ = os.Remove(lv.LeftoverLayerMarker(host))
+		slog.Warn("snapshot create: removed a leftover a failed merge marked at the overlay's name",
+			"vm", vmName, "snapshot", snap, "file", ov, "symlink", link)
 	}
 	return nil
+}
+
+func hasMarker(p string) bool {
+	_, err := os.Lstat(p)
+	return err == nil
+}
+
+// markLeftoverLayers marks each layer a merge of vmName meant to give up
+// that is still there with nothing of the VM naming it — a merge that failed
+// after the domain moved off it — as a leftover (libvirt.LeftoverLayerMarker),
+// the only kind of file clearLeftoverOverlays will remove to free its name.
+// A layer still named, or marked as merged-into, is not one.
+func (s *Server) markLeftoverLayers(ctx context.Context, vmName string, targets map[string]mergeTarget) {
+	if len(targets) == 0 {
+		return
+	}
+	named := map[string]bool{}
+	if live, err := s.virt.DomainDiskSources(vmName); err == nil {
+		for _, p := range live {
+			named[resolvedOr(s.hostDiskFile(p))] = true
+		}
+	} else {
+		return
+	}
+	if x, err := s.virt.DumpXMLInactive(vmName); err == nil {
+		for _, p := range lv.DomainDiskFiles(x) {
+			named[resolvedOr(s.hostDiskFile(p))] = true
+		}
+	}
+	disks, err := corrosion.GetVMDisks(ctx, s.db, vmName)
+	if err != nil {
+		return
+	}
+	for _, d := range disks {
+		if strings.HasPrefix(d.Path, "/") {
+			named[resolvedOr(s.hostDiskFile(d.Path))] = true
+		}
+	}
+	for _, t := range targets {
+		for _, l := range t.layers {
+			if _, err := os.Lstat(l); err != nil || named[l] {
+				continue
+			}
+			if _, merged := lv.MergedInto(l); merged {
+				continue
+			}
+			if err := os.WriteFile(lv.LeftoverLayerMarker(l), []byte("left by a failed snapshot merge of "+vmName+"\n"), 0o644); err != nil {
+				slog.Warn("snapshot merge: cannot mark a leftover layer", "vm", vmName, "layer", l, "error", err)
+				continue
+			}
+			slog.Warn("snapshot merge: a layer was left with nothing naming it — marked as a leftover", "vm", vmName, "layer", l)
+		}
+	}
+}
+
+// findMergedLayer is a layer marked as merged into another file
+// (libvirt.MergedLayerMarker) anywhere in the chains of vmName's disks — as
+// the domain runs them, as its definition would boot them, and as its
+// records name them — with the file it was merged into.
+func (s *Server) findMergedLayer(ctx context.Context, vmName string) (layer, into string, ok bool) {
+	var srcs []string
+	if s.virt != nil {
+		if live, err := s.virt.DomainDiskSources(vmName); err == nil {
+			for _, p := range live {
+				srcs = append(srcs, p)
+			}
+		}
+		if x, err := s.virt.DumpXMLInactive(vmName); err == nil {
+			for _, p := range lv.DomainDiskFiles(x) {
+				srcs = append(srcs, p)
+			}
+		}
+	}
+	if disks, err := corrosion.GetVMDisks(ctx, s.db, vmName); err == nil {
+		for _, d := range disks {
+			if d.HostName == "" || d.HostName == s.hostName {
+				srcs = append(srcs, d.Path)
+			}
+		}
+	}
+	return s.mergedLayerInChains(srcs)
+}
+
+// mergedLayerInChains walks each source's chain for a merged-into marker.
+func (s *Server) mergedLayerInChains(srcs []string) (layer, into string, ok bool) {
+	images := s.rootsAsFound(filepath.Join(s.dataDir, "images"))
+	for _, src := range srcs {
+		if !strings.HasPrefix(src, "/") {
+			continue
+		}
+		if into, ok := lv.MergedInto(resolvedOr(s.hostDiskFile(src))); ok {
+			return src, into, true
+		}
+		chain, _ := s.chainOf(src, images) // the layers read, even on an error
+		for _, l := range chain {
+			if into, ok := lv.MergedInto(l.file); ok {
+				return l.name, into, true
+			}
+		}
+	}
+	return "", "", false
+}
+
+// mergedLayerRefusal is the refusal for an operation on a VM whose chain
+// holds a layer a snapshot merge emptied into another file while the VM ran
+// and whose definition could not be repointed.
+func mergedLayerRefusal(what, vmName, layer, into string) error {
+	return status.Errorf(codes.FailedPrecondition,
+		"%s of %q refused: its disk chain holds %s, whose data a snapshot delete merged into %s while the VM ran; "+
+			"the VM's definition could not be repointed, so %s holds stale blocks (marker %s). Repoint the disk at %s "+
+			"(virsh edit %s), then remove %s",
+		what, vmName, layer, into, filepath.Base(layer), lv.MergedLayerMarker(layer), into, vmName, lv.MergedLayerMarker(layer))
 }

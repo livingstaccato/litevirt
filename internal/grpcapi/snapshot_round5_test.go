@@ -87,8 +87,8 @@ func TestDeleteSnapshot_AMainEraPromotedVMOverAQcow2ReplicaInItsPoolStaysOnItsOw
 // Re-review 2, m-5. A merge that failed after libvirt's metadata was gone
 // leaves the overlay <stem>.<snap> with nothing naming it; libvirt will not
 // create an external snapshot over an existing file, so the name could
-// never be used again. Such a leftover, named and used by nothing, is
-// removed before the snapshot is taken.
+// never be used again. Such a leftover — marked as one by the merge that
+// left it, and used by nothing — is removed before the snapshot is taken.
 func TestCreateSnapshot_AnUnusedLeftoverOverlayDoesNotBlockTheName(t *testing.T) {
 	needQemuImg(t)
 	dir := t.TempDir()
@@ -97,6 +97,10 @@ func TestCreateSnapshot_AnUnusedLeftoverOverlayDoesNotBlockTheName(t *testing.T)
 	f := newMergeFixture(t, "lo", "stopped", root, corrosion.DiskRecord{})
 	leftover := filepath.Join(dir, "lo-root.s1")
 	runQemuImg(t, "create", "-q", "-f", "qcow2", "-F", "qcow2", "-b", root, leftover)
+	// A merge marks what it leaves behind (re-review 3, I-2).
+	if err := os.WriteFile(leftover+".lv-leftover", nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := f.s.CreateSnapshot(adminCtx(), &pb.CreateSnapshotRequest{VmName: "lo", Name: "s1"}); err != nil {
 		t.Fatalf("CreateSnapshot: %v", err)
 	}

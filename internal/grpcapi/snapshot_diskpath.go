@@ -53,11 +53,20 @@ func (s *Server) reconcileDiskPaths(ctx context.Context, vmName string) {
 		liveByStem[key(src)] = src
 	}
 	for _, d := range disks {
-		// A record on a layer marked merged stays there: its persistent
-		// definition still names that layer, and a start refuses it
-		// (libvirt.MergedLayerMarker). Moving the record onto the live base
-		// would hide the mismatch from that check.
-		if _, merged := lv.MergedInto(s.hostDiskFile(d.Path)); merged {
+		// A record on a layer marked merged moves to the file its data went
+		// to (re-review 3, I-1): what reads the record — a clone, a move, a
+		// backup, a cold migration — then reads the VM's current data,
+		// never the stale layer. A start judges the definition, not the
+		// record, and still refuses (refuseMergedLayerBoot).
+		if into, merged := lv.MergedInto(resolvedOr(s.hostDiskFile(d.Path))); merged {
+			if into != d.Path {
+				if err := corrosion.UpdateVMDiskPath(ctx, s.db, vmName, d.DiskName, into); err != nil {
+					slog.Warn("snapshot: move the record off a merged layer", "vm", vmName, "disk", d.DiskName, "error", err)
+				} else {
+					slog.Warn("snapshot: the record moved off a merged layer to where its data is",
+						"vm", vmName, "disk", d.DiskName, "from", d.Path, "to", into)
+				}
+			}
 			continue
 		}
 		src, ok := liveByStem[key(d.Path)]

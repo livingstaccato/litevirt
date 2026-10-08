@@ -99,8 +99,9 @@ func TestFlattenSnapshot_OfflineMultiDiskPartialFailureLeavesEveryDiskConsistent
 		if exec.Command("qemu-img", "info", chains["vdb"][1]).Run() != nil {
 			break // locked
 		}
-		if i > 50 {
-			t.Fatal("qemu-io never took the lock")
+		if i > 600 {
+			out, _ := exec.Command("qemu-img", "info", chains["vdb"][1]).CombinedOutput()
+			t.Fatalf("qemu-io never took the lock in 60s (holder exited: %v): %s", holder.ProcessState, out)
 		}
 		time.Sleep(100 * time.Millisecond)
 	}

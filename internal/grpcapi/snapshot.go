@@ -150,6 +150,9 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotReque
 	// A merge that failed after libvirt's metadata went can leave the
 	// overlay this snapshot would be given; libvirt refuses to create over
 	// it. Removed when nothing uses it (re-review 2, m-5).
+	if layer, into, ok := s.findMergedLayer(ctx, req.VmName); ok {
+		return nil, mergedLayerRefusal("snapshot create", req.VmName, layer, into)
+	}
 	if err := s.clearLeftoverOverlays(ctx, req.VmName, req.Name); err != nil {
 		return nil, err
 	}
@@ -532,6 +535,7 @@ func (s *Server) DeleteSnapshot(ctx context.Context, req *pb.DeleteSnapshotReque
 	s.recordMergedBases(ctx, req.VmName, targets, merged)
 	s.reconcileDiskPaths(ctx, req.VmName)
 	s.removeMergedLayers(ctx, req.VmName, merged)
+	s.markLeftoverLayers(ctx, req.VmName, targets)
 
 	slog.Info("snapshot deleted", "vm", req.VmName, "snapshot", req.SnapshotName)
 	s.recordVMEvent(ctx, req.VmName, "snapshot.deleted", "ok", req.SnapshotName)

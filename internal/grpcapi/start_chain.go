@@ -81,12 +81,13 @@ func (s *Server) verifyDiskChainForStart(ctx context.Context, vm *corrosion.VMRe
 }
 
 // refuseMergedLayerBoot refuses a start whose persistent definition — what
-// a cold boot opens — names a layer a snapshot merge committed into another
-// file while the VM ran but could not repoint the definition away from
-// (libvirt.MergedLayerMarker; re-review 2, I-B). That layer holds the data
-// as it was at the merge; the guest's later writes are in the base. Booting
-// it would run the guest on a mix of old and new blocks, so the start fails
-// loudly and says how to put it right.
+// a cold boot opens — reaches, anywhere in a disk's chain, a layer a
+// snapshot merge committed into another file while the VM ran but could not
+// repoint the definition away from (libvirt.MergedLayerMarker; re-review 2
+// I-B, re-review 3 I-1). That layer holds the data as it was at the merge;
+// the guest's later writes are in the base. Booting it would run the guest
+// on a mix of old and new blocks, so the start fails loudly and says how to
+// put it right.
 func (s *Server) refuseMergedLayerBoot(vm *corrosion.VMRecord) error {
 	if s.virt == nil {
 		return nil
@@ -95,16 +96,14 @@ func (s *Server) refuseMergedLayerBoot(vm *corrosion.VMRecord) error {
 	if err != nil {
 		return nil // no definition to judge; the start reports its own error
 	}
-	for dev, src := range lv.DomainDiskFiles(x) {
-		if into, ok := lv.MergedInto(s.hostDiskFile(src)); ok {
-			slog.Error("start refused: the definition boots a layer a snapshot merge emptied of its latest data",
-				"vm", vm.Name, "dev", dev, "layer", src, "merged_into", into)
-			return status.Errorf(codes.FailedPrecondition,
-				"disk %s of %q cannot be started: its definition names %s, whose data a snapshot delete merged into %s "+
-					"while the VM ran — the definition could not be repointed, and booting %s would run the guest on stale "+
-					"blocks. Repoint the disk at %s (virsh edit %s), then remove %s",
-				dev, vm.Name, src, into, filepath.Base(src), into, vm.Name, lv.MergedLayerMarker(src))
-		}
+	var srcs []string
+	for _, src := range lv.DomainDiskFiles(x) {
+		srcs = append(srcs, src)
+	}
+	if layer, into, ok := s.mergedLayerInChains(srcs); ok {
+		slog.Error("start refused: the definition boots a layer a snapshot merge emptied of its latest data",
+			"vm", vm.Name, "layer", layer, "merged_into", into)
+		return mergedLayerRefusal("start (booting stale blocks)", vm.Name, layer, into)
 	}
 	return nil
 }

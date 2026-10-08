@@ -442,6 +442,13 @@ func inLayers(p string, layers []string) bool {
 // name the layer: a start that would boot it is refused.
 func MergedLayerMarker(layer string) string { return layer + ".lv-merged" }
 
+// LeftoverLayerMarker is the file beside a layer a snapshot merge left
+// behind with nothing naming it (a merge that failed after the domain moved
+// off it). Only a layer so marked is ever removed to free its name
+// (grpcapi clearLeftoverOverlays); anything else at that name is someone
+// else's file.
+func LeftoverLayerMarker(layer string) string { return layer + ".lv-leftover" }
+
 // MergedInto reads layer's marker: the file its data was merged into.
 func MergedInto(layer string) (string, bool) {
 	b, err := os.ReadFile(MergedLayerMarker(layer))

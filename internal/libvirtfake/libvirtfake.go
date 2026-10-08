@@ -67,6 +67,10 @@ type Fake struct {
 	FlattenLeavesConfig bool
 	// FailFlattenSnapshot, when set, is FlattenSnapshot's error.
 	FailFlattenSnapshot error
+	// FlattenPivotsThenFails, when set, is FlattenSnapshot's error after the
+	// domain moved onto its bases (a later disk's commit failing): nothing
+	// is given back.
+	FlattenPivotsThenFails error
 	// snapBases: domain → snapshot → the files its disks were on at cutover.
 	snapBases map[string]map[string][]string
 
@@ -1456,6 +1460,9 @@ func (f *Fake) FlattenSnapshot(domainName, snapshotName string, bases map[string
 	}
 	f.FlattenBases = append(f.FlattenBases, cp)
 	f.record("snapshot-flatten", domainName, snapshotName)
+	if f.FlattenPivotsThenFails != nil {
+		return nil, f.FlattenPivotsThenFails
+	}
 	return out, nil
 }
 

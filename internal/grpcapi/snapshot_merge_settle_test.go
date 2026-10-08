@@ -14,9 +14,9 @@ import (
 
 // Re-review 2, I-B, end to end through the RPC. The running merge pivots,
 // but the persistent definition cannot be repointed (libvirt.FlattenSnapshot
-// then keeps and marks the layers). The record stays on the old top — the
-// file the definition names — nothing is removed, and the next start, which
-// would boot that stale top, is refused loudly.
+// then keeps and marks the layers). Nothing is removed, the record moves to
+// the base where the data is, and the next start, which would boot that
+// stale top, is refused loudly.
 func TestDeleteSnapshot_AnUnrepointedDefinitionKeepsTheRecordAndRefusesTheNextStart(t *testing.T) {
 	needQemuImg(t)
 	dir := t.TempDir()
@@ -27,9 +27,11 @@ func TestDeleteSnapshot_AnUnrepointedDefinitionKeepsTheRecordAndRefusesTheNextSt
 	f.fake.FlattenLeavesConfig = true
 	f.rm(t, "s1")
 
+	// The record names where the data is (re-review 3, I-1); the start,
+	// which judges the definition, still refuses below.
 	disks, _ := corrosion.GetVMDisks(context.Background(), f.s.db, "ib")
-	if len(disks) != 1 || disks[0].Path != top {
-		t.Fatalf("record %+v, want it left on %s, which the definition still names", disks, top)
+	if len(disks) != 1 || disks[0].Path != root {
+		t.Fatalf("record %+v, want it on %s, where the data is", disks, root)
 	}
 	if _, err := os.Stat(top); err != nil {
 		t.Fatalf("the top the definition names was removed: %v", err)

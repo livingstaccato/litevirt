@@ -56,14 +56,6 @@ func nowSnapTag() string {
 	return time.Now().UTC().Format("20060102-150405")
 }
 
-// snapshotExists is a thin probe for `<bin> list <ref>` style commands.
-// Used by zfs to detect the previous-replicate snapshot for
-// incremental sends.
-func snapshotExists(ctx context.Context, ref string) bool {
-	_, err := exec.CommandContext(ctx, "zfs", "list", "-t", "snapshot", "-H", "-o", "name", "--", ref).Output()
-	return err == nil
-}
-
 // pathExists is a `os.Stat`-style probe used by btrfs to detect the
 // previous-replicate snapshot dir for incremental `-p` sends.
 // Wrapped here (rather than imported from os in btrfs.go) so the

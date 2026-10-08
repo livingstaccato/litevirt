@@ -673,20 +673,24 @@ func revertToLiveSnapshot(v snapshotAPI, domainName, snapshotName, vmstatePath s
 		savedXML = restoreXML
 	}
 
-	// Destroy the running domain and wait for shutoff.
-	if err := v.DomainDestroy(dom); err != nil {
-		return fmt.Errorf("destroy domain before revert: %w", err)
-	}
-	for i := 0; i < 30; i++ {
-		dom2, lookupErr := v.DomainLookupByName(domainName)
-		if lookupErr != nil {
-			break
+	// Destroy the domain and wait for shutoff — only an active one: a
+	// stopped VM has nothing to destroy, and destroying it failed the revert
+	// ("domain is not running") before anything was done.
+	if st, _, sErr := v.DomainGetState(dom, 0); sErr != nil || st != int32(golibvirt.DomainShutoff) {
+		if err := v.DomainDestroy(dom); err != nil {
+			return fmt.Errorf("destroy domain before revert: %w", err)
 		}
-		st, _, _ := v.DomainGetState(dom2, 0)
-		if st == int32(golibvirt.DomainShutoff) {
-			break
+		for i := 0; i < 30; i++ {
+			dom2, lookupErr := v.DomainLookupByName(domainName)
+			if lookupErr != nil {
+				break
+			}
+			st, _, _ := v.DomainGetState(dom2, 0)
+			if st == int32(golibvirt.DomainShutoff) {
+				break
+			}
+			time.Sleep(200 * time.Millisecond)
 		}
-		time.Sleep(200 * time.Millisecond)
 	}
 
 	// Delete snapshot metadata (we manage the overlay files ourselves).

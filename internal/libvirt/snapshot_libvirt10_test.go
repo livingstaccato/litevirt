@@ -747,3 +747,31 @@ func TestRepointRevertedDisk_DoubleQuoted(t *testing.T) {
 		t.Fatalf("got\n%s\nwant\n%s", out, want)
 	}
 }
+
+// A memory snapshot restored on a stopped VM: the domain is shut off, so
+// there is nothing to destroy, and the revert brings it back running at
+// the snapshot's instant — for the newest snapshot and an older one. (It
+// failed with "destroy domain before revert: domain is not running", on
+// main too.)
+func TestRevert_AMemorySnapshotOnAStoppedVM(t *testing.T) {
+	for _, older := range []bool{false, true} {
+		t.Run(map[bool]string{false: "newest", true: "older"}[older], func(t *testing.T) {
+			m := newLibvirt10(t)
+			m.write(markA, 1)
+			save := m.memorySnapshot("m1")
+			m.write(markB, 2)
+			if older {
+				m.memorySnapshot("m2")
+				m.write(markC, 3)
+			}
+			if err := m.DomainDestroy(golibvirt.Domain{Name: "vm"}); err != nil {
+				t.Fatal(err)
+			}
+			m.revertLive("m1", save)
+			if m.state() != golibvirt.DomainRunning {
+				t.Fatalf("after the revert the domain is in state %d, want running", m.state())
+			}
+			m.requireWhole(map[byte]bool{markA: true, markB: false, markC: false})
+		})
+	}
+}

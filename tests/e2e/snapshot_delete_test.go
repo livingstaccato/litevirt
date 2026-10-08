@@ -403,3 +403,31 @@ func TestLab_SnapshotRestoreOlderThenDeleteBoth(t *testing.T) {
 		})
 	}
 }
+
+// A memory snapshot restored on a stopped VM, the newest and an older one:
+// the revert has nothing to destroy, and brings the VM back running at the
+// snapshot's instant (it failed with "domain is not running", on main too).
+func TestLab_SnapshotMemoryRestoreOnAStoppedVM(t *testing.T) {
+	for _, older := range []bool{false, true} {
+		t.Run(map[bool]string{false: "newest", true: "older"}[older], func(t *testing.T) {
+			l := newLab(t)
+			h, vm := snapTestVM(l, "snapmstop")
+			root := snapActiveDisk(l, h, vm)
+			snapWrite(l, h, vm, snapMarkA)
+			snapCreate(l, h, vm, "m1", true)
+			snapWrite(l, h, vm, snapMarkB)
+			later := []string{}
+			if older {
+				later = append(later, snapActiveDisk(l, h, vm))
+				snapCreate(l, h, vm, "m2", true)
+				later = append(later, snapActiveDisk(l, h, vm))
+			}
+			snapStop(l, h, vm)
+			snapRestore(l, h, vm, "m1")
+			if older {
+				requireRestoredOnto(l, h, vm, root, later...)
+			}
+			requireSnapVMWhole(l, h, vm, map[byte]bool{snapMarkA: true, snapMarkB: false})
+		})
+	}
+}

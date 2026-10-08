@@ -524,6 +524,13 @@ func (s *Server) deleteRecordedVMDiskVolumeRecords(
 		if d.Path == "" {
 			continue
 		}
+		// delete_with_vm=false: the file is not the VM's to remove (an
+		// adopted disk). Kept, as the rows of a VM deleted on another host
+		// are (deleted_vm_leftovers.go).
+		if !d.DeleteWithVM {
+			slog.Info("delete: keeping a disk recorded delete_with_vm=false", "vm", vmName, "disk", d.DiskName, "path", d.Path)
+			continue
+		}
 		if s.diskPathReferencedByOtherVM(ctx, vmName, d) {
 			continue
 		}
@@ -588,7 +595,14 @@ func (s *Server) deleteDiskAtRecordedLocation(ctx context.Context, d *corrosion.
 // that pairing unwriteable instead of merely discouraged.
 func (s *Server) protectedDiskPathsFrom(ctx context.Context, vmName string, candidates []string) map[string]bool {
 	keep := make(map[string]bool, len(candidates))
+	kept := s.keptDiskFiles(ctx, vmName)
 	for _, path := range candidates {
+		// A disk of this VM recorded delete_with_vm=false, or a layer under
+		// one: not the VM's to remove.
+		if kept == nil || kept[filepath.Clean(path)] {
+			keep[path] = true
+			continue
+		}
 		// A user's upload (an older one, from before uploads into
 		// <data_dir>/disks went to disks/uploads) is a project's file, not a
 		// VM's debris, whatever its name. Unreadable records protect. A

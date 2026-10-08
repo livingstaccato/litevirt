@@ -255,7 +255,11 @@ func (s *Server) ownDiskLayers(ctx context.Context, vmName string) []string {
 // removeOwnDiskLayers removes files ownDiskLayers listed, except one another
 // VM names in its record or reaches through its qcow2 chain.
 func (s *Server) removeOwnDiskLayers(ctx context.Context, vmName string, files []string) {
+	kept := s.keptDiskFiles(ctx, vmName)
 	for _, f := range files {
+		if kept == nil || kept[filepath.Clean(f)] {
+			continue
+		}
 		// A user's upload is a project's file whatever its name; unreadable
 		// records protect, as for the debris sweep (protectedDiskPathsFrom).
 		if recs, rerr := s.recordsOf(ctx, f); rerr != nil || slices.ContainsFunc(recs, func(u poolUpload) bool { return u.VM == "" && !u.Peer }) {
@@ -273,4 +277,29 @@ func (s *Server) removeOwnDiskLayers(ctx context.Context, vmName string, files [
 			slog.Warn("delete: remove snapshot overlay", "vm", vmName, "path", f, "error", err)
 		}
 	}
+}
+
+// keptDiskFiles is the files of vmName's disks recorded delete_with_vm=false
+// — each one's file and every layer of its qcow2 chain (parsed unless
+// declared raw: keeping a file too many is the safe side) — which no VM
+// delete path may remove. nil when the records cannot be read: the caller
+// then keeps everything.
+func (s *Server) keptDiskFiles(ctx context.Context, vmName string) map[string]bool {
+	disks, err := corrosion.GetVMDisks(ctx, s.db, vmName)
+	if err != nil {
+		slog.Error("delete: cannot read which disks are kept; keeping every file", "vm", vmName, "error", err)
+		return nil
+	}
+	kept := map[string]bool{}
+	for _, d := range disks {
+		if d.DeleteWithVM || d.Path == "" {
+			continue
+		}
+		chainReaches(s.hostDiskFile(d.Path), "", func(p string) bool {
+			kept[filepath.Clean(p)] = true
+			return false
+		})
+		kept[filepath.Clean(s.hostDiskFile(d.Path))] = true
+	}
+	return kept
 }

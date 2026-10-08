@@ -299,7 +299,10 @@ same data as the `<vm>-<disk>-<time>.<ext>` file at the pool's top level, so a
 failover coordinated by an older host promotes the newest replica rather than
 the last one written before the upgrade; once every host answers, runs stop
 writing it and the top-level copies are pruned. A pruned replica is never one
-a VM disk on any host references.
+a VM disk on any host references. "Every host" is the cluster's admitted
+gossip membership — the hosts replication reaches — so a host that is down,
+fenced or removed for good does not keep the copies coming; a member on an
+older build does.
 
 The owner directory is keyed by project and VM name: a VM deleted and
 re-created under the same name in the same project inherits the earlier VM's

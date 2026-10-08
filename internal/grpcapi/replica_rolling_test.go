@@ -231,9 +231,7 @@ func TestPruneEarlierReplicas_KeptWhileAHostCannotSeeTheArea(t *testing.T) {
 	if err := os.WriteFile(top, []byte("main-era replica"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := corrosion.InsertHost(ctx, f.s.db, corrosion.HostRecord{Name: "peer-host", Address: "10.0.0.9", State: "active"}); err != nil {
-		t.Fatal(err)
-	}
+	membersHosts(t, f.s, []string{"peer-host"}, "peer-host")
 	vm, _ := corrosion.GetVM(ctx, f.s.db, "web")
 
 	f.s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {

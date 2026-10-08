@@ -613,17 +613,28 @@ func replicaRecordFor(path string) (replicaRecord, bool) {
 // ListReplicas — runs a build that knows the replica area. A host on an older
 // build (Unimplemented) cannot see the area, and if it coordinates a failover
 // it promotes only top-level replicas; a host that cannot be asked is taken
-// to be one. The answer is kept for a while (replicaPeersFresh when all do,
-// replicaPeersStale otherwise), so a replication run does not ask every host.
+// to be one. "Every host" is the admitted memberlist membership — the peers
+// replication reaches, which capabilities.ReplicationGated tokens confirm
+// against — so a host row that is dead, fenced or removed for good does not
+// hold this answer at "no" forever. The answer is kept for a while
+// (replicaPeersFresh when all do, replicaPeersStale otherwise), so a
+// replication run does not ask every host; no lock is held while the hosts
+// are asked (up to replicaPeersAskTimeout each), and runs asking at once may
+// each ask.
 func (s *Server) everyHostListsReplicas(ctx context.Context) bool {
 	m := replicaPeersMemoOf(s)
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if !m.at.IsZero() && time.Since(m.at) < map[bool]time.Duration{true: replicaPeersFresh, false: replicaPeersStale}[m.all] {
-		return m.all
+		all := m.all
+		m.mu.Unlock()
+		return all
 	}
-	m.all, m.at = s.askEveryHostListsReplicas(ctx), time.Now()
-	return m.all
+	m.mu.Unlock()
+	all := s.askEveryHostListsReplicas(ctx)
+	m.mu.Lock()
+	m.all, m.at = all, time.Now()
+	m.mu.Unlock()
+	return all
 }
 
 // How long everyHostListsReplicas keeps an answer.
@@ -649,16 +660,27 @@ func replicaPeersMemoOf(s *Server) *replicaPeersMemo {
 }
 
 func (s *Server) askEveryHostListsReplicas(ctx context.Context) bool {
-	hosts, err := corrosion.ListHosts(ctx, s.db)
-	if err != nil {
-		return false
+	members := s.db.Members()
+	if len(members) == 0 {
+		// No member admitted yet (gossip still converging after a start):
+		// "all" only when no other host row is a live one.
+		hosts, err := corrosion.ListHosts(ctx, s.db)
+		if err != nil {
+			return false
+		}
+		for _, h := range hosts {
+			if h.Name != s.hostName && corrosion.VotingEligible(h.State) {
+				return false
+			}
+		}
+		return true
 	}
-	for _, h := range hosts {
-		if h.Name == s.hostName {
+	for _, p := range members {
+		if p.Name == "" || p.Name == s.hostName {
 			continue
 		}
-		if !s.hostListsReplicas(ctx, h.Name) {
-			slog.Info("replication: a host cannot show replica records; top-level replicas are kept for it", "host", h.Name)
+		if !s.hostListsReplicas(ctx, p.Name) {
+			slog.Info("replication: a host cannot show replica records; top-level replicas are kept for it", "host", p.Name)
 			return false
 		}
 	}

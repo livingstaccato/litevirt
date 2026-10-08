@@ -300,7 +300,7 @@ func newDownCmd() *cobra.Command {
 					if item == "" && p.Status == "error" {
 						item = "stack resource"
 					}
-					if item != "" && !seenVM[item] {
+					if item != "" && !seenVM[item] && p.Status != "kept" {
 						seenVM[item] = true
 						seen = append(seen, item)
 					}

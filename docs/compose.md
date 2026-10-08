@@ -164,7 +164,7 @@ page.
 vms:
   <name>:
     image: "ubuntu"           # Base image name (required unless iso is set)
-    iso: "debian-12-netinst"  # Image-store name used as the boot image instead of image; not a host path (no CD-ROM is attached)
+    iso: "isos/debian-12.iso" # Installer ISO, attached as a CD-ROM and booted first: <pool>/<file>.iso, or (Admin) a host path — judged as any create's ISO (storage.md, "Installer ISOs"). A bare name with no '/' keeps its older meaning: an image-store name used as the boot image instead of image
     kind: "vm"                # vm (default) | lxc | oci — see "Workloads" below
     cpu: 2                    # vCPUs (default 2)
     max-cpu: 8                # vCPU hotplug ceiling (> cpu); with live_resize, cpu grows live up to it

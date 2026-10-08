@@ -395,8 +395,10 @@ func (s *Server) RestoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotReq
 	// overlay, the reset went to a file nothing read, and the restore failed
 	// with "domain is already running", not restored (snapshot-repro.md). So
 	// the restore holds the start lease until the domain is back.
+	// A lease no live holder stands behind (a crashed run's) is taken over:
+	// main restored then, and that holder is starting nothing.
 	releaseLease, err := s.holdStartLease(ctx, snapshotRestoreLockHolder(s.hostName), req.VmName,
-		"so it is not restored", "restore it")
+		"so it is not restored", "restore it", true)
 	if err != nil {
 		return nil, err
 	}

@@ -717,7 +717,10 @@ but `lv` prints a warning and the VM gets a `snapshot.restore-not-current`
 event: deleting that snapshot later keeps its files rather than merging them.
 
 A restore holds the VM's start lease while it brings the domain down and back,
-so no start path restarts it midway; it is refused while a start holds it.
+so no start path restarts it midway; it is refused while a live start holds
+it. A lease with no live holder behind it — taken by this host before its
+daemon last started, or held by a host that is no longer an active member — is
+taken over instead.
 
 ## Memory ballooning
 

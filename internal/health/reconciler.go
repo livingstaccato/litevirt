@@ -2050,6 +2050,18 @@ func TryVMStartLease(ctx context.Context, db *corrosion.Client, holder, vmName s
 	return rows[0].String("holder"), nil
 }
 
+// ReadVMStartLease returns the per-VM start lease's holder and the time it
+// was last taken (its updated_at, RFC3339 on the holder's clock); ok is
+// false when no lease row exists.
+func ReadVMStartLease(ctx context.Context, db *corrosion.Client, vmName string) (holder string, takenAt time.Time, ok bool, err error) {
+	rows, err := db.Query(ctx, `SELECT holder, updated_at FROM vm_locks WHERE vm_name = ?`, vmName)
+	if err != nil || len(rows) == 0 {
+		return "", time.Time{}, false, err
+	}
+	takenAt, _ = time.Parse(time.RFC3339, rows[0].String("updated_at"))
+	return rows[0].String("holder"), takenAt, true, nil
+}
+
 // releaseVMLock clears the per-VM lock. Best-effort; leaving a stale lock
 // is recoverable (next acquire after vmLockTTL succeeds).
 func (r *Reconciler) releaseVMLock(ctx context.Context, vmName string) {

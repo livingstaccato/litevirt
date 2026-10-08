@@ -138,3 +138,87 @@ func TestRestoreSnapshot_ANotCurrentRestoreIsReported(t *testing.T) {
 		})
 	}
 }
+
+// A lease no live holder stands behind does not stop a restore (review
+// M-1): main allowed it, and the holder cannot be starting the VM. The
+// restore takes the lease over, and releases it after.
+func TestRestoreSnapshot_TakesOverAStaleStartLease(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup func(t *testing.T, s *Server)
+	}{
+		{"this node's crashed run", func(t *testing.T, s *Server) {
+			// Taken a minute before this daemon started.
+			s.startedAt = time.Now()
+			if h, err := health.TryVMStartLease(adminCtx(), s.db, s.hostName, "rs", s.startedAt.Add(-time.Minute)); err != nil || h != s.hostName {
+				t.Fatalf("setup: lease %q %v", h, err)
+			}
+		}},
+		{"a host that is not active", func(t *testing.T, s *Server) {
+			if err := corrosion.InsertHost(adminCtx(), s.db, corrosion.HostRecord{Name: "host-b", Address: "10.0.0.2", State: "fenced"}); err != nil {
+				t.Fatal(err)
+			}
+			if h, err := health.TryVMStartLease(adminCtx(), s.db, "host-b/vmcheck", "rs", time.Now()); err != nil || h != "host-b/vmcheck" {
+				t.Fatalf("setup: lease %q %v", h, err)
+			}
+		}},
+		{"a host the cluster no longer has", func(t *testing.T, s *Server) {
+			if h, err := health.TryVMStartLease(adminCtx(), s.db, "gone-host", "rs", time.Now()); err != nil || h != "gone-host" {
+				t.Fatalf("setup: lease %q %v", h, err)
+			}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := lockTestServer(t)
+			seedRestorableVM(t, s, "disk")
+			tc.setup(t, s)
+			if _, err := s.RestoreSnapshot(adminCtx(), &pb.RestoreSnapshotRequest{VmName: "rs", SnapshotName: "s1"}); err != nil {
+				t.Fatalf("RestoreSnapshot refused over a stale lease: %v", err)
+			}
+			if h, err := health.TryVMStartLease(adminCtx(), s.db, s.hostName, "rs", time.Now()); err != nil || h != s.hostName {
+				t.Fatalf("after the restore the lease is held by %q (%v); it must be released", h, err)
+			}
+		})
+	}
+}
+
+// A live holder still stops it: a component of this daemon (taken since it
+// started), or an active host.
+func TestRestoreSnapshot_RefusedWhileALiveHolderHasTheLease(t *testing.T) {
+	cases := []struct {
+		name   string
+		holder string
+		setup  func(t *testing.T, s *Server)
+	}{
+		{"this daemon", "", func(t *testing.T, s *Server) { s.startedAt = time.Now().Add(-time.Hour) }},
+		{"an active host", "host-b/repair", func(t *testing.T, s *Server) {
+			if err := corrosion.InsertHost(adminCtx(), s.db, corrosion.HostRecord{Name: "host-b", Address: "10.0.0.2", State: "active"}); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := lockTestServer(t)
+			fake := seedRestorableVM(t, s, "disk")
+			tc.setup(t, s)
+			holder := tc.holder
+			if holder == "" {
+				holder = s.hostName
+			}
+			if h, err := health.TryVMStartLease(adminCtx(), s.db, holder, "rs", time.Now()); err != nil || h != holder {
+				t.Fatalf("setup: lease %q %v", h, err)
+			}
+			_, err := s.RestoreSnapshot(adminCtx(), &pb.RestoreSnapshotRequest{VmName: "rs", SnapshotName: "s1"})
+			if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), holder) {
+				t.Fatalf("RestoreSnapshot = %v, want FailedPrecondition naming %s", err, holder)
+			}
+			for _, e := range fake.EventLog() {
+				if e.Op == "revert" {
+					t.Fatal("the revert ran while a live holder had the start lease")
+				}
+			}
+		})
+	}
+}

@@ -618,6 +618,11 @@ type Server struct {
 	// migration copies (hostDiskFile, SetHostDiskRootForTest). Empty in
 	// production.
 	hostDiskRoot string
+	// startedAt is when this daemon's Server was made. A start lease this
+	// host holds that was taken before it was left by a run that is gone
+	// (holdStartLease). Zero in tests that build a Server directly: every
+	// lease of this host then counts as live.
+	startedAt time.Time
 	// markerSweepMu guards the host state DeletedVMMarkerSweepTick last saw
 	// (markerSweepLastState, valid once markerSweepSeen).
 	markerSweepMu        sync.Mutex
@@ -1860,6 +1865,7 @@ type StoragePoolRef struct {
 // NewServer creates a new gRPC service handler.
 func NewServer(hostName, dataDir, pkiDir string, db *corrosion.Client, virt LibvirtBackend, images *image.Store) *Server {
 	s := &Server{
+		startedAt:      time.Now(),
 		hostName:       hostName,
 		dataDir:        dataDir,
 		pkiDir:         pkiDir,

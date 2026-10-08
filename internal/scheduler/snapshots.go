@@ -142,6 +142,7 @@ func (s *SnapshotScheduler) Tick(ctx context.Context) {
 			}
 			for _, vmName := range fanoutVMs {
 				fanout := sched
+				fanout.Origin = sched.VMName
 				fanout.VMName = vmName
 				fanout.Scope = "vm"
 				fanout.PoolName = ""

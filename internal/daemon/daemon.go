@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -49,6 +50,7 @@ import (
 	"github.com/litevirt/litevirt/internal/pki"
 	"github.com/litevirt/litevirt/internal/restapi"
 	"github.com/litevirt/litevirt/internal/scheduler"
+	"github.com/litevirt/litevirt/internal/storage"
 	"github.com/litevirt/litevirt/internal/tenancy"
 	"github.com/litevirt/litevirt/internal/ui"
 	"github.com/litevirt/litevirt/internal/watchdog"
@@ -62,6 +64,12 @@ const grpcMaxMsgSize = 64 << 20 // 64 MiB
 
 // Daemon is the main litevirtd process.
 type Daemon struct {
+	// auditWired is closed once wireAuditKeyring has installed the keyring
+	// audit rows are signed with; runAuditHold lands nothing before it.
+	auditWiredOnce sync.Once
+	auditWired     chan struct{}
+	auditWiredDone sync.Once
+
 	cfg     *Config
 	db      *corrosion.Client
 	virt    *libvirt.Client
@@ -342,9 +350,40 @@ func (d *Daemon) Run(ctx context.Context) error {
 		slog.Warn("failed to migrate legacy network names", "error", err)
 	}
 
+	// Hold this host's audit rows while its own chain is still arriving, before
+	// anything can write one. Only a host re-added under an old name, whose
+	// CA-signed admission record (pki_dir/audit-rejoin.json, written by
+	// `lv host add`) names history this replica does not have yet, holds: a
+	// normal restart and a brand-new name never do. Without it a rebuilt host
+	// chains its first rows onto an empty tail and forks its chain for good
+	// (corrosion/audit_hold.go). Rows held across a restart are in the spool and
+	// land first.
+	d.configureAuditHold(ctx)
+	// Whether this replica holds the cluster's history, decided once per
+	// state.db: an existing member is seeded at its first start on this build;
+	// a fresh replica becomes seeded at genesis or by an exchange with a seeded
+	// peer (corrosion/audit_seeded.go). AdmitHost vouches only when seeded.
+	if _, err := corrosion.DecideAuditSeeded(ctx, d.db, d.cfg.HostName); err != nil {
+		slog.Error("could not decide whether this replica is seeded; it is treated as NOT seeded and "+
+			"does not vouch for audit chain positions until an exchange with a seeded peer", "error", err)
+	}
+	go d.runAuditSeeded(ctx)
+
 	// Before anything that writes an audit row is built: every writer signs with
 	// the keyring this installs on d.db.
 	d.wireAuditKeyring(ctx)
+
+	// An operator's seeded assertion is audited here, signed, exactly once: not
+	// in DecideAuditSeeded, which runs before the keyring exists.
+	if err := corrosion.RecordAuditSeededAssertion(ctx, d.db, d.cfg.HostName); err != nil {
+		slog.Error("could not audit this replica's seeded assertion; retried at the next start",
+			"error", err)
+	}
+
+	// After the keyring: rows an earlier process left in the spool may land on
+	// the first poll, and landed before it they would be written unsigned
+	// (runAuditHold also waits for the wiring, whatever the order here).
+	go d.runAuditHold(ctx)
 
 	// Re-base THIS host's audit sub-chain at startup — but ONLY when it is
 	// still entirely unsigned.
@@ -367,7 +406,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	} else if signed {
 		slog.Debug("audit: chain is signed; skipping the legacy reseal", "host", d.cfg.HostName)
 		d.db.NoteAuditResealNotNeeded(d.cfg.HostName)
-	} else if n, err := corrosion.ResealAuditChain(ctx, d.db, d.cfg.HostName); err != nil {
+	} else if n, err := corrosion.ResealAuditChain(ctx, d.db, d.cfg.HostName); errors.Is(err, corrosion.ErrAuditChainNotCaughtUp) {
+		// A rebuilt host whose history has not arrived: a reseal of a partial
+		// replica would rewrite rows its peers hold intact.
+		slog.Info("audit: skipping the legacy reseal while this host's audit history is still arriving",
+			"host", d.cfg.HostName)
+	} else if err != nil {
 		// Logged, not fatal. Until a reseal succeeds the legacy tail is not
 		// anchored (corrosion.ErrAuditAnchorWithheld): an anchor over the
 		// un-rebased tail would read as a truncation once it is rebased.
@@ -479,6 +523,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	// Register storage pools in the cluster DB and start periodic refresh.
 	d.registerStoragePools(ctx)
+	d.hardenNFSPoolMounts(ctx)
 	d.refreshDBPoolCapacity(ctx)
 	go d.refreshStoragePools(ctx)
 
@@ -1391,6 +1436,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// deferred cleanup of replicate/upload/import/restore temps — they'd
 	// otherwise accumulate and fill the pool/image dirs).
 	svc.SweepStaleStaging(ctx)
+	// The pool-file records marks SweepStaleStaging wrote are retried until
+	// the replicated rows are writable: on a new cluster failover_scope_v1
+	// latches after the first start (pool_records.go).
+	go svc.RunPoolRecordsMarker(ctx)
+	startLegacyImageProvenance(ctx, svc)
 
 	// Now that the gRPC server exists, wire it as the failover coordinator's
 	// replica promoter (auto_promote recovery) and start the coordinator.
@@ -1446,6 +1496,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Adopt each decided voter generation once its certificate verifies,
 	// importing claim state first where this node is a member of it (§4.4).
 	go d.runVoterAdoption(ctx, svc)
+
+	// The global ISO library in sync mode: bring this host's copy of every
+	// library file to the recorded version (iso_library.go).
+	go d.runISOLibrarySync(ctx, svc)
 
 	// Peer self-upgrade: a daemon that comes back on an old binary (e.g. it was
 	// down during a cluster upgrade) pulls the newer binary from a healthy peer
@@ -1852,10 +1906,15 @@ func (d *Daemon) registerStoragePools(ctx context.Context) {
 		pools = []StoragePoolConfig{{
 			Name:   "default",
 			Driver: "local",
-			Target: filepath.Join(d.cfg.DataDir, "disks"),
+			Target: d.defaultPoolDir(ctx),
 		}}
 	}
+	// <data_dir>/disks on NFS is an export no pool on any host may hold:
+	// every row this host registers records it (storage.DataDisksExportOption).
+	disksExp := nfsExportOfDirPool(d.cfg.DataDir, StoragePoolConfig{Driver: "dir", Target: filepath.Join(d.cfg.DataDir, "disks")})
+	configured := map[string]bool{}
 	for _, p := range pools {
+		configured[p.Name] = true
 		rec := corrosion.StoragePoolRecord{
 			HostName: d.cfg.HostName,
 			Name:     p.Name,
@@ -1863,6 +1922,18 @@ func (d *Daemon) registerStoragePools(ctx context.Context) {
 			Source:   p.Source,
 			Target:   p.Target,
 			State:    "active",
+		}
+		// A directory pool on an NFS mount records the export it is on, so
+		// other hosts compare their pools against it (storage.NFSExportOption).
+		opts := map[string]string{}
+		if exp := nfsExportOfDirPool(d.cfg.DataDir, p); exp != "" {
+			opts[storage.NFSExportOption] = exp
+		}
+		if disksExp != "" {
+			opts[storage.DataDisksExportOption] = disksExp
+		}
+		if len(opts) > 0 {
+			rec.Options = opts
 		}
 		if p.Target != "" {
 			var st syscall.Statfs_t
@@ -1876,6 +1947,192 @@ func (d *Daemon) registerStoragePools(ctx context.Context) {
 		}
 		if err := corrosion.UpsertStoragePool(ctx, d.db, rec); err != nil {
 			slog.Warn("failed to register storage pool", "pool", p.Name, "error", err)
+		}
+	}
+	d.refreshDirPoolExports(ctx, configured)
+	d.ensureGlobalISOLibrary(ctx)
+}
+
+// ensureGlobalISOLibrary gives this host the built-in global ISO library pool
+// ("isos", no project, <data_dir>/pools/isos) when it has no pool of that name. An
+// operator who puts the library on shared storage replaces the row with
+// `lv pool create isos --driver nfs ... --option content=iso` on each host,
+// which this then leaves alone.
+func (d *Daemon) ensureGlobalISOLibrary(ctx context.Context) {
+	if d.db == nil {
+		return
+	}
+	if rec, ok, err := corrosion.GetStoragePool(ctx, d.db, d.cfg.HostName, grpcapi.GlobalISOLibraryName); err != nil || ok {
+		if ok && rec.Project != "" {
+			slog.Warn("global ISO library: this host has a project-owned pool named isos, so it has no global library; rename that pool",
+				"host", d.cfg.HostName, "project", rec.Project)
+		} else if ok && !corrosion.IsBuiltinISOLibraryRow(rec) {
+			slog.Info("global ISO library: this host's isos pool is not the daemon's (shared storage, say); it is the global library only in shared mode",
+				"host", d.cfg.HostName, "target", rec.Target)
+		}
+		return
+	}
+	dir := filepath.Join(d.cfg.DataDir, storage.ISOLibraryDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		slog.Warn("global ISO library: create directory", "dir", dir, "error", err)
+		return
+	}
+	if err := corrosion.UpsertStoragePool(ctx, d.db, corrosion.StoragePoolRecord{
+		HostName: d.cfg.HostName,
+		Name:     grpcapi.GlobalISOLibraryName,
+		Driver:   "dir",
+		Target:   dir,
+		Options:  grpcapi.GlobalISOLibraryOptions(),
+		State:    "active",
+	}); err != nil {
+		slog.Warn("global ISO library: register pool", "error", err)
+	}
+}
+
+// runISOLibrarySync runs a sync pass of the global ISO library every 30s, and,
+// on a ticker of its own (a sync pass can wait long on hashing), sweeps this
+// host's installer-ISO records of VMs that no longer exist every 5 minutes.
+func (d *Daemon) runISOLibrarySync(ctx context.Context, svc *grpcapi.Server) {
+	go func() {
+		t := time.NewTicker(5 * time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if err := svc.SweepISOIdentities(ctx); err != nil {
+					slog.Warn("installer ISO records: sweep", "error", err)
+				}
+			}
+		}
+	}()
+	t := time.NewTicker(30 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if err := svc.SyncISOLibrary(ctx); err != nil {
+				slog.Warn("global ISO library: sync", "error", err)
+			}
+		}
+	}
+}
+
+// refreshDirPoolExports records, on this host's directory pools created
+// through the API, the export each one's directory is on now (or drops a
+// recorded one that no longer holds): read at start from the mount table, so
+// a pool created by an older build, or whose fstab mount has changed, is
+// compared on other hosts by what it is today. Only rows whose record
+// differs are written.
+func (d *Daemon) refreshDirPoolExports(ctx context.Context, configured map[string]bool) {
+	rows, err := corrosion.ListStoragePoolsForHost(ctx, d.db, d.cfg.HostName)
+	if err != nil {
+		slog.Warn("storage pools: cannot refresh recorded NFS exports", "error", err)
+		return
+	}
+	for _, r := range rows {
+		switch strings.ToLower(r.Driver) {
+		case "", "local", "dir", "btrfs":
+		default:
+			continue
+		}
+		if configured[r.Name] {
+			continue
+		}
+		exp := nfsExportOfDirPool(d.cfg.DataDir, StoragePoolConfig{Driver: r.Driver, Source: r.Source, Target: r.Target})
+		if r.Options[storage.NFSExportOption] == exp {
+			continue
+		}
+		opts := make(map[string]string, len(r.Options)+1)
+		for k, v := range r.Options {
+			opts[k] = v
+		}
+		if exp == "" {
+			delete(opts, storage.NFSExportOption)
+		} else {
+			opts[storage.NFSExportOption] = exp
+		}
+		r.Options = opts
+		if err := corrosion.UpsertStoragePool(ctx, d.db, r); err != nil {
+			slog.Warn("storage pools: cannot record a pool's NFS export", "pool", r.Name, "error", err)
+		}
+	}
+}
+
+// defaultPoolDir is where the built-in default pool lives: where this host's
+// registered default pool already is when that is <data_dir>/disks (an older
+// cluster's — it is not moved), otherwise <data_dir>/pools/default, its own
+// directory.
+func (d *Daemon) defaultPoolDir(ctx context.Context) string {
+	legacy := filepath.Join(d.cfg.DataDir, "disks")
+	if rec, ok, err := corrosion.GetStoragePool(ctx, d.db, d.cfg.HostName, "default"); err == nil && ok &&
+		rec.Driver == "local" && (rec.Target == legacy || rec.Target == "") {
+		return legacy
+	}
+	defDir := filepath.Join(d.cfg.DataDir, "pools", "default")
+	if err := os.MkdirAll(defDir, 0o755); err != nil {
+		slog.Warn("create default pool directory", "dir", defDir, "error", err)
+	}
+	return defDir
+}
+
+// nfsExportOfDirPool is the export a configured directory pool's directory is
+// on ("" when on none, or not a directory pool).
+func nfsExportOfDirPool(dataDir string, p StoragePoolConfig) string {
+	var dir string
+	switch strings.ToLower(p.Driver) {
+	case "", "local":
+		dir = p.Target
+		if dir == "" {
+			dir = filepath.Join(dataDir, "disks")
+		}
+	case "dir":
+		dir = p.Target
+	case "btrfs":
+		dir = p.Source
+	default:
+		return ""
+	}
+	if dir == "" {
+		return ""
+	}
+	mt, err := storage.ReadMountTable()
+	if err != nil {
+		return ""
+	}
+	b, err := mt.NFSBackingOf(dir)
+	if err != nil || b == nil {
+		return ""
+	}
+	return b.Export.String()
+}
+
+// hardenNFSPoolMounts hardens in place, at start, every NFS pool of this host
+// whose own export is mounted without nosuid,nodev,noexec,nosymfollow (by
+// hand, or by an earlier build): a bind remount changes only that mount's
+// flags, so the VMs running from it are untouched. It reports, at ERROR, a
+// pool whose mount point holds another export, or whose remount failed: the
+// server's pool check refuses such a pool until that is fixed.
+func (d *Daemon) hardenNFSPoolMounts(ctx context.Context) {
+	var cfgs []storage.Config
+	for _, p := range d.cfg.StoragePools {
+		cfgs = append(cfgs, storage.Config{Driver: p.Driver, Source: p.Source, Target: p.Target, Options: p.Options})
+	}
+	if rows, err := corrosion.ListStoragePoolsForHost(ctx, d.db, d.cfg.HostName); err == nil {
+		for _, p := range rows {
+			cfgs = append(cfgs, storage.Config{Driver: p.Driver, Source: p.Source, Target: p.Target, Options: p.Options})
+		}
+	}
+	for _, c := range cfgs {
+		if !strings.EqualFold(c.Driver, "nfs") {
+			continue
+		}
+		if err := storage.CheckNFSMountHardened(d.cfg.DataDir, c); err != nil {
+			slog.Error("NFS pool's mount point holds another export, or its export is mounted without nosuid,nodev,noexec,nosymfollow and could not be hardened in place; the pool is refused",
+				"source", c.Source, "target", c.Target, "error", err)
 		}
 	}
 }
@@ -2192,6 +2449,12 @@ func (d *Daemon) seedAdminUser(ctx context.Context) error {
 
 	if err := corrosion.InsertUser(ctx, d.db, "admin", "admin", string(hash)); err != nil {
 		return fmt.Errorf("insert admin: %w", err)
+	}
+	// Genesis: this replica founded the cluster, so there is no earlier history
+	// it could lack (corrosion/audit_seeded.go).
+	if err := d.db.MarkAuditSeeded(ctx, "founded the cluster (genesis)"); err != nil {
+		slog.Warn("could not record the founder's replica as seeded; `lv host add` through this node "+
+			"is refused until it is", "error", err)
 	}
 
 	// The marker licenses exactly one mint, and that mint has now happened: the

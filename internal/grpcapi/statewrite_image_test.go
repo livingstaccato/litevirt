@@ -25,7 +25,7 @@ func TestPersistImageRecord_WriteFailureSurfaces(t *testing.T) {
 		t.Fatalf("drop image_hosts: %v", err)
 	}
 
-	err := s.persistImageRecord(&pb.PullImageRequest{Name: "img1", Format: "qcow2"})
+	err := s.persistImageRecord(&pb.PullImageRequest{Name: "img1", Format: "qcow2"}, image.Published{})
 	if err == nil {
 		t.Error("persistImageRecord returned nil; want an error when the image_host write fails")
 	}

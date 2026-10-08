@@ -291,3 +291,15 @@ func TestExtractRootfsTar_Rejections(t *testing.T) {
 		})
 	}
 }
+
+// A pool name reaches tool argv; one starting with "-" would read as an option.
+func TestValidatePoolName_RefusesALeadingDash(t *testing.T) {
+	for _, n := range []string{"-F", "--help", "-"} {
+		if err := ValidatePoolName(n); err == nil {
+			t.Errorf("ValidatePoolName(%q) accepted", n)
+		}
+	}
+	if err := ValidatePoolName("a-b"); err != nil {
+		t.Errorf("a-b: %v", err)
+	}
+}

@@ -33,25 +33,64 @@ var _ rolling.Ops = (*serverOps)(nil)
 // leaves the old runtime alive) then creates it from a clone of `desired` renamed to
 // `target`. It DESTROYS the target's disks, so the rolling engine only reaches it
 // under an explicit recreate-class strategy.
-func (o *serverOps) recreateAs(ctx context.Context, target string, desired *pb.VMSpec) error {
+//
+// `source` is the VM the new one replaces (the target itself, or the VM a
+// "-next" replaces). When `desired` names the installer ISO that VM already
+// has, it is carried into the create as it was classified (recreateISOGrant),
+// as a compose file's unchanged volume is. Before the delete, everything the
+// create would refuse that the delete does not change is refused, so a
+// refusal leaves the target as it was (recreatePreflight). A target with an
+// installer ISO is placed before the delete, as main placed it after, judged
+// by the host placement chose, and created there (placeRecreate,
+// judgeRecreateOn) — never put on this node for running the rollout.
+func (o *serverOps) recreateAs(ctx context.Context, target, source string, desired *pb.VMSpec) error {
 	if desired == nil {
 		return fmt.Errorf("recreate %q: no desired spec", target)
+	}
+	spec := proto.Clone(desired).(*pb.VMSpec)
+	spec.Name = target
+	if src, err := corrosion.GetVM(ctx, o.s.db, source); err == nil && src != nil {
+		ctx = withRecreateISOGrant(ctx, src)
+	}
+	var decision *resolvedCreateVMDecision
+	if cur, err := corrosion.GetVM(ctx, o.s.db, target); err == nil && cur != nil {
+		host := cur.HostName
+		var perr error
+		if spec.GetIso() != "" {
+			if host, perr = o.s.placeRecreate(ctx, spec, cur); perr == nil {
+				decision = &resolvedCreateVMDecision{resolvedHost: host, placedHere: true}
+			}
+		}
+		if perr == nil {
+			if decision != nil {
+				perr = o.s.judgeRecreateOn(ctx, spec, host)
+			} else {
+				perr = o.s.recreatePreflight(ctx, spec, host)
+			}
+		}
+		if perr != nil {
+			st := status.Convert(perr)
+			return status.Errorf(st.Code(), "recreate %s: %s; nothing was deleted", target, st.Message())
+		}
 	}
 	if _, err := o.s.DeleteVM(ctx, &pb.DeleteVMRequest{Name: target}); err != nil && status.Code(err) != codes.NotFound {
 		return fmt.Errorf("delete %s before recreate: %w", target, err)
 	}
-	spec := proto.Clone(desired).(*pb.VMSpec)
-	spec.Name = target
-	_, err := o.s.CreateVM(ctx, &pb.CreateVMRequest{Spec: spec})
+	var err error
+	if decision != nil {
+		_, err = o.s.createVM(ctx, &pb.CreateVMRequest{Spec: spec}, decision)
+	} else {
+		_, err = o.s.CreateVM(ctx, &pb.CreateVMRequest{Spec: spec})
+	}
 	return err
 }
 
 func (o *serverOps) RecreateVM(ctx context.Context, name string, desired *pb.VMSpec) error {
-	return o.recreateAs(ctx, name, desired)
+	return o.recreateAs(ctx, name, name, desired)
 }
 
 func (o *serverOps) CreateNextVM(ctx context.Context, name string, desired *pb.VMSpec) error {
-	return o.recreateAs(ctx, name+"-next", desired)
+	return o.recreateAs(ctx, name+"-next", name, desired)
 }
 
 func (o *serverOps) ReconfigureVM(ctx context.Context, name string, desired *pb.VMSpec, plan compose.ChangePlan) error {

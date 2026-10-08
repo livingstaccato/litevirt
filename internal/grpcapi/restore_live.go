@@ -1,7 +1,9 @@
 package grpcapi
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 
@@ -32,18 +34,32 @@ func (s *Server) RestoreLive(req *pb.RestoreLiveRequest, stream grpc.ServerStrea
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return err
 	}
-	if req.RepoPath == "" || req.VmName == "" || req.DiskName == "" || req.Timestamp == "" || req.TargetPath == "" {
+	if req.RepoPath == "" || req.VmName == "" || req.DiskName == "" || req.Timestamp == "" {
 		return status.Error(codes.InvalidArgument,
-			"repo_path, vm_name, disk_name, timestamp, target_path all required")
+			"repo_path, vm_name, disk_name, timestamp all required")
+	}
+	// The overlay becomes a VM's disk. It is a fresh file the daemon names, or
+	// one an admin names that does not exist yet — never a file already there
+	// (restore_dest.go).
+	disksDir := filepath.Join(s.dataDir, "disks")
+	var target string
+	if req.TargetPath != "" {
+		var err error
+		if target, err = s.resolveAdminTarget(ctx, req.TargetPath, disksDir); err != nil {
+			return err
+		}
+	} else {
+		name := req.NewName
+		if name == "" {
+			name = req.VmName
+		}
+		var err error
+		if target, err = derivedDiskFile(disksDir, name, req.DiskName, "live", ".qcow2"); err != nil {
+			return err
+		}
 	}
 	// repo_path: registered repo name (any operator) or admin-only absolute path.
 	repoPath, err := s.resolveBackupRepoPath(ctx, req.RepoPath)
-	if err != nil {
-		return err
-	}
-	// target_path: a bare filename is contained under the disks dir; a custom
-	// absolute path is admin-only. The overlay path becomes the VM's disk path.
-	target, err := s.resolveRestoreTarget(ctx, req.TargetPath, filepath.Join(s.dataDir, "disks"))
 	if err != nil {
 		return err
 	}
@@ -108,20 +124,19 @@ func (s *Server) RestoreLive(req *pb.RestoreLiveRequest, stream grpc.ServerStrea
 		return err
 	}
 
-	// Create the overlay at a temp path and rename it into place BEFORE the
-	// domain is defined/started against it — never write through a symlink at
-	// the final path, and never rename a disk a VM is already running on.
-	if err := refuseSymlinkTarget(target); err != nil {
-		return err
-	}
-	tmpOverlay := target + ".restore.tmp"
-	_ = os.Remove(tmpOverlay)
-	if err := qcow2.CreateWithBackingURI(tmpOverlay, nbdURL, uint64(manifest.TotalSize), nil); err != nil {
+	// Create the overlay BEFORE the domain is defined/started against it.
+	// qcow2 publishes it exclusively: anything already at the target — a
+	// file, a symlink, a disk a VM runs on — is refused, never replaced.
+	if err := qcow2.CreateWithBackingURI(target, nbdURL, uint64(manifest.TotalSize), nil); err != nil {
+		if errors.Is(err, fs.ErrExist) {
+			return existAsAlreadyExists(err)
+		}
 		return status.Errorf(codes.Internal, "create overlay qcow2: %v", err)
 	}
-	if err := os.Rename(tmpOverlay, target); err != nil {
-		_ = os.Remove(tmpOverlay)
-		return status.Errorf(codes.Internal, "finalize overlay: %v", err)
+	// Recorded for as long as the export is served: a VM booted on the
+	// overlay restarts against it, as qemu reconnects, until it is localized.
+	if done := s.recordLiveRestoreExport(target, nbdURL); done != nil {
+		defer done()
 	}
 
 	if err := stream.Send(&pb.RestoreLiveProgress{
@@ -170,4 +185,40 @@ func (s *Server) RestoreLive(req *pb.RestoreLiveRequest, stream grpc.ServerStrea
 		Status: "operator closed the stream — NBD server stopping",
 	})
 	return nil
+}
+
+// liveRestoreExport is a running live restore's overlay (its file, as created)
+// and the NBD export the overlay's header names.
+type liveRestoreExport struct {
+	url  string
+	file os.FileInfo
+}
+
+// recordLiveRestoreExport records that the overlay at target is served by the
+// export url, and returns what forgets it (nil when the overlay cannot be
+// identified, which records nothing).
+func (s *Server) recordLiveRestoreExport(target, url string) func() {
+	key := resolvedOr(target)
+	fi, err := os.Lstat(key)
+	if err != nil || !fi.Mode().IsRegular() {
+		return nil
+	}
+	rec := liveRestoreExport{url: url, file: fi}
+	s.liveRestoreExports.Store(key, rec)
+	return func() { s.liveRestoreExports.CompareAndDelete(key, rec) }
+}
+
+// liveRestoreExportOf reports whether file (a VM disk's own file on this
+// host) is the overlay of a live restore this process is serving right now,
+// still the file it created, whose header names exactly that restore's
+// export as its backing.
+func (s *Server) liveRestoreExportOf(file, backing string) bool {
+	key := resolvedOr(file)
+	v, ok := s.liveRestoreExports.Load(key)
+	if !ok {
+		return false
+	}
+	rec := v.(liveRestoreExport)
+	fi, err := os.Lstat(key)
+	return err == nil && os.SameFile(fi, rec.file) && backing == rec.url
 }

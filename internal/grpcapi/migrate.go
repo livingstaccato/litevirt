@@ -64,13 +64,13 @@ func (s *Server) withinDiskArtifactRoot(p string) bool {
 		return true
 	}
 	s.storagePoolsMu.RLock()
-	pools := make([]StoragePoolRef, 0, len(s.storagePools))
-	for _, pr := range s.storagePools {
-		pools = append(pools, pr)
+	pools := make(map[string]StoragePoolRef, len(s.storagePools))
+	for n, pr := range s.storagePools {
+		pools[n] = pr
 	}
 	s.storagePoolsMu.RUnlock()
-	for _, pr := range pools {
-		if !isFileBasedDriver(pr.Driver) {
+	for n, pr := range pools {
+		if !isFileBasedDriver(pr.Driver) || !s.poolUsableForWrite(context.Background(), n, pr) {
 			continue
 		}
 		if dir, derr := fileBasedPoolDir(s.dataDir, pr); derr == nil && safename.Contains(dir, p) {
@@ -536,10 +536,14 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 	// createdStubs is what THIS attempt created there — all a failed attempt
 	// may remove.
 	var createdStubs []string
+	// cdromSources: the target's own file for each installer CD-ROM that names
+	// another file there (a link, a library directory); the destination
+	// definition carries those (MigrateParams.CDROMSources).
+	var cdromSources map[string]string
 	useTLS := false
 	if withStorage {
 		var dstTLS bool
-		if createdStubs, dstTLS, err = s.ensureDisksOnTarget(ctx, req.TargetHost, vm.Name, diskStubs, srcTLS); err != nil {
+		if createdStubs, dstTLS, cdromSources, err = s.ensureDisksOnTargetISO(ctx, req.TargetHost, vm.Name, diskStubs, srcTLS, !(fwVM || coldStopped)); err != nil {
 			// EnsureDisks removed whatever it had created; the cloud-init ISO
 			// pre-created above is the only leftover, and the abort removes it.
 			return err
@@ -555,6 +559,13 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 			slog.Warn("storage migration is NOT encrypted: a host has no migration TLS and "+
 				"migration.allow_unencrypted_storage is set", "vm", req.VmName,
 				"source_tls", srcTLS, "target_tls", dstTLS, "target", req.TargetHost)
+		}
+	} else {
+		// No disks to stub, but the target's qemu opens the installer ISO from
+		// its own filesystem: the target judges that file before the migration
+		// (EnsureDisks with no stubs does only that).
+		if _, _, cdromSources, err = s.ensureDisksOnTargetISO(ctx, req.TargetHost, vm.Name, nil, false, !(fwVM || coldStopped)); err != nil {
+			return err
 		}
 	}
 
@@ -705,6 +716,7 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 			// dial), and the migrate_uri names that address.
 			TLS:            useTLS,
 			TLSDestination: targetHost.Address,
+			CDROMSources:   cdromSources,
 		})
 	}()
 
@@ -1161,6 +1173,18 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 	if _, err := s.authorizeMigrationHelper(ctx, req.VmName); err != nil {
 		return nil, err
 	}
+	isoWarning := ""
+	var isoResolved map[string]string
+	// The domain lands here with its installer ISO; qemu on THIS host opens
+	// it, so this host judges it before the migration may proceed, and for a
+	// runtime move names the file here the destination definition is to carry.
+	if rec, gErr := corrosion.GetVM(ctx, s.db, req.VmName); gErr == nil && rec != nil {
+		w, resolved, err := s.verifyIncomingVMISO(ctx, rec, req)
+		if err != nil {
+			return nil, err
+		}
+		isoWarning, isoResolved = w, resolved
+	}
 	for _, stub := range req.Disks {
 		// Only ever create stubs in a real disk-artifact root (the disks dir or a
 		// file-backed pool dir) — never an arbitrary path under the data dir such
@@ -1181,7 +1205,10 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 			return nil, status.Errorf(codes.Internal, "stat disk stub %s: %v", stub.Path, err)
 		}
 	}
-	resp := &pb.EnsureDisksResponse{}
+	if s.isoResolvedWithheld {
+		isoResolved = nil
+	}
+	resp := &pb.EnsureDisksResponse{InstallerIsoWarning: isoWarning, InstallerIsoResolved: isoResolved}
 	var made []string // created by this call: removed again if a later one fails
 	undo := func() {
 		for _, p := range made {
@@ -1551,6 +1578,19 @@ func (s *Server) coldMigrateStoppedVM(ctx context.Context, vm *corrosion.VMRecor
 	if err != nil {
 		return status.Errorf(codes.FailedPrecondition,
 			"cannot dump domain XML for %q (it must be defined to migrate it cold): %v", vm.Name, err)
+	}
+	// The VM's installer ISO goes as the path as written (a host path as the
+	// VM was given it, a pool's file through the pool's directory as the
+	// target names it), not as the file it resolved to on this host: a target
+	// on this build resolves and judges it at its start (and points the domain
+	// at its own file); a target on an older build has its qemu follow the
+	// link there, as before.
+	if remap := s.olderTargetISORemap(ctx, vm.Name, targetHost.Name, s.domainInstallerISOs(vm.Name, domXML)); len(remap) > 0 {
+		rewritten, _, rerr := lv.RewriteCDROMSources(domXML, remap)
+		if rerr != nil {
+			return status.Errorf(codes.FailedPrecondition, "point the installer CD-ROM of VM %q back at the path it was given: %v", vm.Name, rerr)
+		}
+		domXML = rewritten
 	}
 	_ = send(pb.MigratePhase_MIGRATE_COPYING, 0, 0)
 
@@ -2002,27 +2042,196 @@ func storageMigrationTargets(vmName string, disks []corrosion.DiskRecord) ([]str
 // With wantTLS it also has the target install its migration-TLS credentials
 // for QEMU and returns whether it could. An older target never answers that,
 // which reads as false.
-func (s *Server) ensureDisksOnTarget(ctx context.Context, targetHost, vmName string, stubs []*pb.DiskStub, wantTLS bool) ([]string, bool, error) {
-	if len(stubs) == 0 && !wantTLS {
-		return nil, false, nil
+//
+// It also sends the installer CD-ROM paths the domain here carries, so the
+// target judges the ISO it would open; runtime says the domain moves by
+// libvirt runtime migration (ensureDisksOnTargetISO).
+func (s *Server) ensureDisksOnTarget(ctx context.Context, targetHost, vmName string, stubs []*pb.DiskStub, wantTLS, runtime bool) ([]string, bool, error) {
+	created, tls, _, err := s.ensureDisksOnTargetISO(ctx, targetHost, vmName, stubs, wantTLS, runtime)
+	return created, tls, err
+}
+
+// ensureDisksOnTargetISO is ensureDisksOnTarget that also returns, for a
+// runtime move, the target's resolution of each installer CD-ROM that names
+// another file there (source path → target path), for
+// MigrateParams.CDROMSources. With the ISO paths it sends the sha256 of the
+// file this host judged for the VM's ISO, so a target where another project's
+// pool maps the directory admits that very content on the VM's first arrival.
+func (s *Server) ensureDisksOnTargetISO(ctx context.Context, targetHost, vmName string, stubs []*pb.DiskStub, wantTLS, runtime bool) ([]string, bool, map[string]string, error) {
+	isoPaths, err := s.domainInstallerISOPaths(vmName, runtime)
+	if err != nil {
+		return nil, false, nil, err
+	}
+	if len(stubs) == 0 && !wantTLS && len(isoPaths) == 0 {
+		return nil, false, nil, nil
 	}
 	client, conn, err := s.peerClient(ctx, targetHost)
 	if err != nil {
-		return nil, false, status.Errorf(codes.Unavailable,
+		return nil, false, nil, status.Errorf(codes.Unavailable,
 			"cannot reach %s to prepare the disks of VM %q for the copy: %v", targetHost, vmName, err)
 	}
 	defer conn.Close()
 
-	resp, err := client.EnsureDisks(ctx, &pb.EnsureDisksRequest{VmName: vmName, Disks: stubs, WantMigrationTls: wantTLS})
+	resp, err := client.EnsureDisks(ctx, &pb.EnsureDisksRequest{
+		VmName: vmName, Disks: stubs, WantMigrationTls: wantTLS,
+		InstallerIsoListed: true, InstallerIsoPaths: isoPaths, InstallerIsoRuntime: runtime && len(isoPaths) > 0,
+		InstallerIsoSha256: s.judgedISOSHA256(ctx, vmName, isoPaths),
+	})
 	if err != nil {
 		code := status.Code(err)
 		if code == codes.Unknown {
 			code = codes.Internal
 		}
-		return nil, false, status.Errorf(code, "could not prepare the disks of VM %q on %s for the copy: %s",
+		return nil, false, nil, status.Errorf(code, "could not prepare the disks of VM %q on %s for the copy: %s",
 			vmName, targetHost, status.Convert(err).Message())
 	}
-	return resp.GetCreatedPaths(), wantTLS && resp.GetMigrationTlsReady(), nil
+	if w := resp.GetInstallerIsoWarning(); w != "" {
+		slog.Warn("migration: "+w, "vm", vmName, "target", targetHost)
+		s.recordVMEvent(ctx, vmName, "vm.migrate.iso_warning", "warn", w)
+	}
+	var remap map[string]string
+	if runtime && len(isoPaths) > 0 && len(resp.GetInstallerIsoResolved()) == 0 {
+		// A target on this build answers every listed path. None: a target
+		// older than that, whose qemu opens the paths it is handed, unjudged,
+		// as on main. Hand it what main handed it — the path the VM was given —
+		// so a link that names another file there is followed there.
+		remap = s.olderTargetISORemap(ctx, vmName, targetHost, isoPaths)
+	}
+	if runtime {
+		for from, to := range resp.GetInstallerIsoResolved() {
+			if from == to || to == "" {
+				continue
+			}
+			if remap == nil {
+				remap = map[string]string{}
+			}
+			remap[from] = to
+			slog.Info("migration: the target opens the installer ISO at its own file", "vm", vmName, "target", targetHost, "here", from, "there", to)
+		}
+	}
+	return resp.GetCreatedPaths(), wantTLS && resp.GetMigrationTlsReady(), remap, nil
+}
+
+// olderTargetISORemap points, for a move to an older target, the CD-ROM that
+// is the VM's installer ISO back at the path as written, which this host's
+// start had pointed at the file it resolved to here. A target on main opens
+// the path it is handed, following its own links, as main to main did:
+//
+//   - a host path ISO (an Admin's, or a VM's from before iso_scope): the path
+//     the VM was given (spec.Iso);
+//   - a pool ISO named by its absolute path: that path;
+//   - a pool reference: the file in the pool's directory as the target's row
+//     for that pool names it (this host's, when the target has none).
+//
+// A pool ISO is remapped only from the file it resolved to here through its
+// directory: a pool directory that is a link naming another directory on
+// each host (/var/lib/libvirt/images on a data disk) is then followed on the
+// target. A target on this build re-resolves either path itself.
+func (s *Server) olderTargetISORemap(ctx context.Context, vmName, targetHost string, isoPaths []string) map[string]string {
+	vm, err := corrosion.GetVM(ctx, s.db, vmName)
+	if err != nil || vm == nil {
+		return nil
+	}
+	spec := vmSpecFor(vm)
+	iso, scope := spec.GetIso(), spec.GetIsoScope()
+	if iso == "" {
+		return nil
+	}
+	var remap map[string]string
+	add := func(from, to string) {
+		if remap == nil {
+			remap = map[string]string{}
+		}
+		remap[from] = to
+		slog.Info("migration: an older target opens the installer ISO by the path as written, as before",
+			"vm", vmName, "here", from, "there", to)
+	}
+	if filepath.IsAbs(iso) && (scope == "" || scope == isoScopeHostPath) {
+		resolved, _ := filepath.EvalSymlinks(iso)
+		for _, p := range isoPaths {
+			if p == iso || (len(isoPaths) > 1 && p != resolved) {
+				continue
+			}
+			add(p, iso)
+		}
+		return remap
+	}
+	here, written := iso, iso
+	if !filepath.IsAbs(iso) {
+		pool, file, ok := parseISORef(iso)
+		if !ok {
+			return nil
+		}
+		if here, ok = s.lexicalPoolFile(ctx, s.hostName, pool, file); !ok {
+			return nil
+		}
+		written = here
+		if there, ok := s.lexicalPoolFile(ctx, targetHost, pool, file); ok {
+			written = there
+		}
+	}
+	rdir, err := filepath.EvalSymlinks(filepath.Dir(here))
+	if err != nil {
+		return nil
+	}
+	resolvedHere := filepath.Join(rdir, filepath.Base(here))
+	for _, p := range isoPaths {
+		if p == written || p != resolvedHere {
+			continue
+		}
+		add(p, written)
+	}
+	return remap
+}
+
+// lexicalPoolFile is file in pool's directory on host as the pool's row
+// names it, links and all.
+func (s *Server) lexicalPoolFile(ctx context.Context, host, pool, file string) (string, bool) {
+	if host == "" {
+		return "", false
+	}
+	rec, ok, err := corrosion.GetStoragePool(ctx, s.db, host, pool)
+	if err != nil || !ok || !isFileBasedDriver(rec.Driver) {
+		return "", false
+	}
+	pd, err := fileBasedPoolDir(s.dataDir, StoragePoolRef{Driver: rec.Driver, Source: rec.Source, Target: rec.Target})
+	if err != nil || pd == "" {
+		return "", false
+	}
+	return filepath.Join(filepath.Clean(pd), file), true
+}
+
+// judgedISOSHA256 is, for the installer CD-ROM path that is the VM's pool ISO
+// as this host resolves and judges it now, that file's sha256 (cached per
+// file version). Nothing for a host path ISO (no ownership rule applies), or
+// when this host's judgement does not pass.
+func (s *Server) judgedISOSHA256(ctx context.Context, vmName string, isoPaths []string) map[string]string {
+	if len(isoPaths) == 0 {
+		return nil
+	}
+	vm, err := corrosion.GetVM(ctx, s.db, vmName)
+	if err != nil || vm == nil {
+		return nil
+	}
+	spec := vmSpecFor(vm)
+	if spec.GetIso() == "" {
+		return nil
+	}
+	path, viaPool, err := s.resolveSpecISO(ctx, vm.Name, vm.Project, spec)
+	if err != nil || !viaPool {
+		return nil
+	}
+	for _, p := range isoPaths {
+		if p != path {
+			continue
+		}
+		sum, err := s.isoFileSHA256(path)
+		if err != nil {
+			return nil
+		}
+		return map[string]string{p: sum}
+	}
+	return nil
 }
 
 // ensureCloudInitOnTarget calls the target host to generate the cloud-init ISO

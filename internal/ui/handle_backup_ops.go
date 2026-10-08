@@ -192,8 +192,9 @@ func (s *Server) handleRestoreFrom(w http.ResponseWriter, r *http.Request) {
 	disk := strings.TrimSpace(r.FormValue("disk_name"))
 	ts := strings.TrimSpace(r.FormValue("timestamp"))
 	target := strings.TrimSpace(r.FormValue("target_path"))
-	if repoPath == "" || vm == "" || ts == "" || target == "" {
-		sendToast(w, "repo, vm, timestamp and target path are required", "error")
+	inPlace := r.FormValue("in_place") == "on"
+	if repoPath == "" || vm == "" || ts == "" {
+		sendToast(w, "repo, vm and timestamp are required", "error")
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
@@ -207,6 +208,7 @@ func (s *Server) handleRestoreFrom(w http.ResponseWriter, r *http.Request) {
 		defer func() { st.Done = true }()
 		stream, err := s.grpc.RestoreFromBackup(opCtx, &pb.RestoreFromBackupRequest{
 			RepoPath: repoPath, VmName: vm, DiskName: disk, Timestamp: ts, TargetPath: target,
+			InPlace: inPlace,
 		})
 		if err != nil {
 			st.Error = err.Error()
@@ -229,6 +231,9 @@ func (s *Server) handleRestoreFrom(w http.ResponseWriter, r *http.Request) {
 			st.BytesWritten = prog.BytesWritten
 			st.ChunksDone = prog.ChunksDone
 			st.ChunksTotal = prog.ChunksTotal
+			if prog.TargetPath != "" {
+				st.TargetPath = prog.TargetPath
+			}
 			if prog.Error != "" {
 				st.Error = prog.Error
 				st.Status = "Restore failed"
@@ -263,8 +268,8 @@ func (s *Server) handleRestoreLive(w http.ResponseWriter, r *http.Request) {
 	disk := strings.TrimSpace(r.FormValue("disk_name"))
 	ts := strings.TrimSpace(r.FormValue("timestamp"))
 	target := strings.TrimSpace(r.FormValue("target_path"))
-	if repoPath == "" || vm == "" || ts == "" || target == "" {
-		sendToast(w, "repo, vm, timestamp and target path are required", "error")
+	if repoPath == "" || vm == "" || ts == "" {
+		sendToast(w, "repo, vm and timestamp are required", "error")
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}

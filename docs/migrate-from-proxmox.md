@@ -224,9 +224,9 @@ Verify a restore round-trip into a scratch directory:
 lv backup restore-from \
     --repo /srv/backup/main \
     --vm pilot-vm --disk root \
-    --timestamp <stamp-from-ls> \
-    --target-path /tmp/restore-test.qcow2
-qemu-img info /tmp/restore-test.qcow2
+    --timestamp <stamp-from-ls>
+# [done] … restored to <data_dir>/disks/pilot-vm-root-restore-<time>-<id>.img
+qemu-img info <the path it printed>
 ```
 
 Once you trust the repo, retire your PBS once.

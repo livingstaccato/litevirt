@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 )
 
 // PushOptions controls a snapshot push.
@@ -35,6 +36,12 @@ type PushOptions struct {
 	// ContainerSpecJSON, when set, embeds a serialized container spec so a
 	// container restore can recreate the cluster row from the manifest alone.
 	ContainerSpecJSON string
+
+	// ContentFormat is recorded on the manifest (Manifest.ContentFormat).
+	ContentFormat string
+
+	// BaseIdentity is recorded on the manifest (Manifest.BaseIdentity).
+	BaseIdentity *BaseIdentity
 
 	// FirmwareChunks, when set, references the content-addressed firmware-state
 	// bundle (UEFI NVRAM + swtpm) for a Secure-Boot/vTPM VM, captured on the
@@ -77,6 +84,8 @@ func PushDisk(ctx context.Context, repo *Repo, src io.Reader, opts PushOptions) 
 		BasedOn:           opts.BasedOn,
 		BitmapName:        opts.BitmapName,
 		VMSpecJSON:        opts.VMSpecJSON,
+		ContentFormat:     opts.ContentFormat,
+		BaseIdentity:      opts.BaseIdentity,
 		DomainXML:         opts.DomainXML,
 		ContainerSpecJSON: opts.ContainerSpecJSON,
 		FirmwareChunks:    opts.FirmwareChunks,
@@ -166,11 +175,16 @@ func RestoreToFile(ctx context.Context, repo *Repo, m *Manifest, dst string, opt
 	// from the bug sweep. The temp is in dst's directory so the rename stays on
 	// one filesystem (and replaces the dir entry atomically; a VM still holding
 	// the old inode is unaffected, unlike the old truncate-in-place).
-	tmp := dst + ".restore-tmp"
-	f, err := os.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0640)
+	// A fresh, unpredictable temp created exclusively — never a fixed name a
+	// symlink could be planted at and opened through. The "restore-" prefix
+	// and ".tmp" suffix are what the daemon's staging sweep collects after a
+	// crash.
+	f, err := os.CreateTemp(filepath.Dir(dst), "restore-*.tmp")
 	if err != nil {
 		return fmt.Errorf("open restore temp: %w", err)
 	}
+	tmp := f.Name()
+	_ = f.Chmod(0o640)
 	committed := false
 	defer func() {
 		if !committed {

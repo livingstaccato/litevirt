@@ -134,7 +134,9 @@ func TestForEachExtentChunk_SplitsLargeExtent(t *testing.T) {
 	}
 }
 
-func TestIsReplicaOf(t *testing.T) {
+// A replica name is matched exactly, from the right: <vm>-<disk>-<stamp>.
+// A shared prefix is not enough.
+func TestReplicaNameIs(t *testing.T) {
 	cases := []struct {
 		name, vm, disk string
 		want           bool
@@ -142,13 +144,19 @@ func TestIsReplicaOf(t *testing.T) {
 		{"web-root-20260608-120000.qcow2", "web", "root", true},
 		{"web-root-20260608-120000.raw", "web", "root", true},
 		{"web-data-20260608-120000.qcow2", "web", "root", false},
-		{"web-root-promoted-20260608.qcow2", "web", "root", true}, // still has the prefix
+		{"web-root-promoted-20260608.qcow2", "web", "root", false},
+		{"web-root-x-20260608-120000.qcow2", "web", "root", false}, // disk "root-x"
+		{"web-prod-root-20260608-120000.qcow2", "web", "prod-root", true},
+		{"web-prod-root-20260608-120000.qcow2", "web-prod", "root", true}, // the name alone cannot tell
+		{"bvm-root-20261006-120000.qcow2", "bvm-root", "20261006", false},
+		{"web-root-20260608-1200.qcow2", "web", "root", false},
+		{"web-root-20261399-120000.qcow2", "web", "root", false},
 		{"other-root-20260608.qcow2", "web", "root", false},
-		{"web-root-20260608.iso", "web", "root", false},
+		{"web-root-20260608-120000.iso", "web", "root", false},
 	}
 	for _, c := range cases {
-		if got := isReplicaOf(c.name, c.vm, c.disk); got != c.want {
-			t.Errorf("isReplicaOf(%q,%q,%q) = %v, want %v", c.name, c.vm, c.disk, got, c.want)
+		if got := replicaNameIs(c.name, replicaKey{VM: c.vm, Disk: c.disk}); got != c.want {
+			t.Errorf("replicaNameIs(%q, %q, %q) = %v, want %v", c.name, c.vm, c.disk, got, c.want)
 		}
 	}
 }

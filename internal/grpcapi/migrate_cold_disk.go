@@ -135,8 +135,8 @@ func (s *Server) streamColdDisk(ctx context.Context, client pb.LiteVirtClient, v
 		flat := filepath.Join(filepath.Dir(src), "."+filepath.Base(src)+coldMigScratch+uuid.NewString())
 		defer os.Remove(flat)
 		defer os.Remove(flat + ".tmp")
-		if err := qcow2.Convert(ctx, src, flat, &qcow2.Options{Uncompressed: true}); err != nil {
-			return status.Errorf(codes.Internal, "flatten disk %s (backed by %s) for the copy: %v", d.Path, info.BackingFile, err)
+		if err := s.flattenColdDisk(ctx, d, src, flat); err != nil {
+			return err
 		}
 		readPath = flat
 	}
@@ -206,6 +206,21 @@ func (s *Server) streamColdDisk(ctx context.Context, client pb.LiteVirtClient, v
 	return nil
 }
 
+// flattenColdDisk writes a standalone copy of disk d's chain (its file src) to
+// flat with this package's qcow2 reader: every backing judged by
+// diskChainRule first, the reader confined to exactly the files that accepted,
+// each read by the format the layer above declares (a raw backing as raw).
+func (s *Server) flattenColdDisk(ctx context.Context, d corrosion.DiskRecord, src, flat string) error {
+	accepted, err := precheckChain(src, s.diskChainRule(ctx, d))
+	if err != nil {
+		return status.Errorf(codes.FailedPrecondition, "disk %s cannot be flattened for the copy: %v", d.Path, err)
+	}
+	if err := qcow2.ConvertConfined(ctx, src, flat, &qcow2.Options{Uncompressed: true}, onlyAccepted(accepted)); err != nil {
+		return status.Errorf(codes.Internal, "flatten disk %s for the copy: %v", d.Path, err)
+	}
+	return nil
+}
+
 // coldDiskSourceCheck is everything this host checks about one disk before
 // copying it: the file is a regular file, a qcow2 disk's image can be read,
 // and an overlay's backing chain can be flattened — every image in it is a
@@ -233,10 +248,11 @@ func (s *Server) coldDiskSourceCheck(d corrosion.DiskRecord, format string) (*qc
 	if info.BackingFile == "" {
 		return nil, nil
 	}
-	// The flatten reads the chain with this package's qcow2 reader, which reads
-	// only qcow2 images: a raw backing (a promoted replica's overlay) cannot be
-	// flattened, and saying so here beats failing part-way through the copy.
-	if err := flattenableChain(src); err != nil {
+	// The flatten reads the chain with this package's qcow2 reader, by each
+	// layer's DECLARED backing format, every backing judged by diskChainRule.
+	// A raw backing — a promoted replica, guest content — is read as raw and
+	// accepted only as the backing_disk recorded on the layer naming it.
+	if _, err := precheckChain(src, s.diskChainRule(context.Background(), d)); err != nil {
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"disk %s cannot be flattened for the copy: %v; move the VM to shared storage, or rebase the disk onto a qcow2 image or none, then migrate again", d.Path, err)
 	}
@@ -252,27 +268,6 @@ func (s *Server) coldDiskSourceCheck(d corrosion.DiskRecord, format string) (*qc
 		return nil, err
 	}
 	return info, nil
-}
-
-// flattenableChain reports why the backing chain under the qcow2 image at
-// path cannot be read by qcow2.Convert, or nil when every image in it is a
-// readable qcow2 file. Relative backing names resolve as chainAllocated does.
-func flattenableChain(path string) error {
-	for i := 0; i < 64; i++ {
-		info, err := qcow2.Info(path)
-		if err != nil {
-			return fmt.Errorf("its backing image %s is not a qcow2 image (%v)", path, err)
-		}
-		if info.BackingFile == "" {
-			return nil
-		}
-		next := info.BackingFile
-		if !filepath.IsAbs(next) {
-			next = filepath.Join(filepath.Dir(path), next)
-		}
-		path = next
-	}
-	return fmt.Errorf("its backing chain is longer than 64 images")
 }
 
 // checkColdDiskOnTarget asks targetHost whether it would take disk d of the
@@ -609,7 +604,10 @@ func fileAllocated(p string) (uint64, error) {
 }
 
 // chainAllocated is the allocated bytes of a qcow2 image and of every image
-// in its backing chain: what qcow2.Convert can read clusters from.
+// in its backing chain: what qcow2.Convert can read clusters from. Each
+// layer's backing is followed by its DECLARED format: a raw backing ends the
+// chain (it is never parsed), and an undeclared one ends it too (the flatten
+// refuses it, precheckChain).
 func chainAllocated(path string) (uint64, error) {
 	top := path
 	var total uint64
@@ -621,13 +619,24 @@ func chainAllocated(path string) (uint64, error) {
 		total += a
 		info, err := qcow2.Info(path)
 		if err != nil || info.BackingFile == "" {
-			return total, nil // the end of the chain (a raw backing ends it too)
+			return total, nil
 		}
 		next := info.BackingFile
 		if !filepath.IsAbs(next) {
 			next = filepath.Join(filepath.Dir(path), next)
 		}
-		path = next
+		switch info.BackingFormat {
+		case "qcow2":
+			path = next
+		case "raw":
+			ra, err := fileAllocated(next)
+			if err != nil {
+				return 0, err
+			}
+			return total + ra, nil
+		default:
+			return total, nil
+		}
 	}
 	return 0, fmt.Errorf("backing chain of %s is longer than 64 images", top)
 }
@@ -789,15 +798,22 @@ var coldScratchName = regexp.MustCompile(`^\..+(` + regexp.QuoteMeta(coldRecvScr
 func (s *Server) SweepColdMigrationScratch() {
 	roots := []string{filepath.Join(s.dataDir, "disks")}
 	s.storagePoolsMu.RLock()
-	for _, pr := range s.storagePools {
+	pools := make(map[string]StoragePoolRef, len(s.storagePools))
+	for n, pr := range s.storagePools {
+		pools[n] = pr
+	}
+	s.storagePoolsMu.RUnlock()
+	for n, pr := range pools {
 		if !isHostLocalDiskDriver(strings.ToLower(pr.Driver)) && pr.Driver != "" {
+			continue
+		}
+		if !s.poolUsableForWrite(context.Background(), n, pr) {
 			continue
 		}
 		if dir, err := fileBasedPoolDir(s.dataDir, pr); err == nil {
 			roots = append(roots, dir)
 		}
 	}
-	s.storagePoolsMu.RUnlock()
 	seen := map[string]bool{}
 	for _, root := range roots {
 		root = s.hostDiskFile(root)

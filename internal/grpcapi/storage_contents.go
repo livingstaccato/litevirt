@@ -2,9 +2,13 @@ package grpcapi
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -12,7 +16,10 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/safename"
+	"github.com/litevirt/litevirt/internal/storage"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
@@ -63,56 +70,151 @@ func (s *Server) ListStoragePoolContents(ctx context.Context, req *pb.ListStorag
 		}
 	}
 
-	// Files live on the owning host — forward there if it isn't us.
+	// Files live on the owning host — forward there if it isn't us. A user's
+	// listing then gains the replicas of the VMs that user may read, decided
+	// here where the user is known (the owner sees only this host's cert).
 	if host != s.hostName {
+		fctx, err := s.forwardContentCall(ctx)
+		if err != nil {
+			return nil, err
+		}
 		client, conn, err := s.peerClient(ctx, host)
 		if err != nil {
 			return nil, status.Errorf(codes.Unavailable, "reach host %q: %v", host, err)
 		}
 		defer conn.Close()
-		return client.ListStoragePoolContents(ctx, req)
-	}
-
-	if !isFileBasedDriver(rec.Driver) {
-		// Block-backed pool: no browsable file directory.
-		return &pb.ListStoragePoolContentsResponse{}, nil
-	}
-	dir, err := fileBasedPoolDir(s.dataDir, StoragePoolRef{Driver: rec.Driver, Source: rec.Source, Target: rec.Target})
-	if err != nil {
-		return nil, status.Errorf(codes.FailedPrecondition, "resolve pool dir: %v", err)
-	}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return &pb.ListStoragePoolContentsResponse{}, nil
-		}
-		return nil, status.Errorf(codes.Internal, "read pool dir: %v", err)
-	}
-
-	resp := &pb.ListStoragePoolContentsResponse{}
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		info, err := e.Info()
+		resp, err := client.ListStoragePoolContents(fctx, req)
 		if err != nil {
-			continue
+			return nil, err
 		}
-		name := e.Name()
-		resp.Contents = append(resp.Contents, &pb.StoragePoolContent{
-			Name:       name,
-			Path:       filepath.Join(dir, name),
-			SizeBytes:  info.Size(),
-			ModifiedAt: info.ModTime().UTC().Format(time.RFC3339),
-			IsIso:      strings.HasSuffix(strings.ToLower(name), ".iso"),
-		})
+		// A user's listing gains the replicas of the VMs that user may read,
+		// decided here where the user is known.
+		if s.requirePeerCert(ctx) != nil {
+			s.appendReadableReplicas(ctx, resp, req.PoolName, host)
+		}
+		return resp, nil
 	}
-	sort.Slice(resp.Contents, func(i, j int) bool { return resp.Contents[i].Name < resp.Contents[j].Name })
+
+	contents, err := s.poolContents(ctx, rec)
+	if err != nil {
+		return nil, err
+	}
+	resp := &pb.ListStoragePoolContentsResponse{Contents: contents}
+	if s.requirePeerCert(ctx) != nil {
+		s.appendReadableReplicas(ctx, resp, req.PoolName, host)
+	}
 	return resp, nil
 }
 
+// poolContents lists the files of a pool on this host, sorted by name: the
+// one listing of pool content, which the content browser and the ISO library
+// listing (listLibrary) both go through. Block-backed pools have no browsable
+// file directory and list nothing.
+func (s *Server) poolContents(ctx context.Context, rec corrosion.StoragePoolRecord) ([]*pb.StoragePoolContent, error) {
+	if !isFileBasedDriver(rec.Driver) {
+		return nil, nil
+	}
+	ref := StoragePoolRef{Driver: rec.Driver, Source: rec.Source, Target: rec.Target, Options: rec.Options}
+	// A refused pool — a directory no pool may use, one shared with another
+	// pool, a weak NFS mount — is not even listed: its directory may be
+	// /root/.ssh, the daemon's state, or another project's disks.
+	if err := s.checkPoolForWrite(ctx, rec.Name, ref); err != nil {
+		return nil, err
+	}
+	dir, err := fileBasedPoolDir(s.dataDir, ref)
+	if err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "resolve pool dir: %v", err)
+	}
+	// A directory that is not the pool's own shows a caller only its
+	// project's files — the caller who made the call, on whichever node.
+	caller, err := s.poolContentCallerOf(ctx)
+	if err != nil {
+		return nil, err
+	}
+	conf, err := s.poolConfinementFor(ctx, rec, caller)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "pool content owners: %v", err)
+	}
+	if caller.view == viewReplicas {
+		// Tell the daemon asking that these are matched by record; an older
+		// host lists every file and the caller matches by name.
+		_ = grpc.SetHeader(ctx, metadata.Pairs(replicaListingMDKey, "matched"))
+	}
+	var out []*pb.StoragePoolContent
+	seen := map[string]bool{}
+	for _, d := range s.poolContentDirs(dir) {
+		entries, err := os.ReadDir(d)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, status.Errorf(codes.Internal, "read pool dir: %v", err)
+		}
+		for _, e := range entries {
+			if e.IsDir() || seen[e.Name()] {
+				continue
+			}
+			info, err := e.Info()
+			if err != nil {
+				continue
+			}
+			name := e.Name()
+			path := filepath.Join(d, name)
+			// A file a live disk of another pool (or of no pool) uses is not this
+			// pool's content: a legacy target-less local pool shares <data_dir>/disks
+			// with every local VM disk on the host. Unknown ownership hides it.
+			owners, oerr := s.liveDiskOwners(ctx, s.hostName, path)
+			if oerr != nil || slices.ContainsFunc(owners, func(d corrosion.DiskRecord) bool { return d.StorageVolume != rec.Name }) {
+				continue
+			}
+			if !conf.visible(ctx, path) {
+				continue
+			}
+			seen[name] = true
+			out = append(out, &pb.StoragePoolContent{
+				Name:       name,
+				Path:       path,
+				SizeBytes:  info.Size(),
+				ModifiedAt: info.ModTime().UTC().Format(time.RFC3339),
+				IsIso:      strings.HasSuffix(strings.ToLower(name), ".iso"),
+			})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+// appendReadableReplicas adds to a user's pool listing the replicas of every
+// VM the user may read (canReadVMRecord), live or deleted, each from its
+// records in the pool's replica area on host — never another project's, never
+// a file by name.
+func (s *Server) appendReadableReplicas(ctx context.Context, resp *pb.ListStoragePoolContentsResponse, pool, host string) {
+	vms, err := corrosion.ListVMs(ctx, s.db, "", "")
+	if err != nil {
+		return
+	}
+	// A deleted VM's replicas stay its project's (its tombstone says whose),
+	// listed so they can be found and deleted.
+	if gone, err := corrosion.ListDeletedVMs(ctx, s.db); err == nil {
+		vms = append(vms, gone...)
+	}
+	for i := range vms {
+		vm := &vms[i]
+		if !s.canReadVMRecord(ctx, vm) {
+			continue
+		}
+		for _, r := range s.replicaRecordsOn(ctx, pool, host, vm.Project, vm.Name) {
+			resp.Contents = append(resp.Contents, &pb.StoragePoolContent{
+				Name: r.File, SizeBytes: r.SizeBytes,
+				ReplicaVm: vm.Name, ReplicaDisk: r.Disk, ReplicaTaken: r.Taken,
+			})
+		}
+	}
+}
+
 // DeleteStoragePoolContent removes one file from a file-based pool (forwarded
-// to the pool's owning host). Used by cross-host replication pruning.
+// to the pool's owning host). Replication no longer uses it: replicas are
+// pruned through the peer-only PruneReplicas, by record.
 func (s *Server) DeleteStoragePoolContent(ctx context.Context, req *pb.DeleteStoragePoolContentRequest) (*emptypb.Empty, error) {
 	if req.PoolName == "" || req.Filename == "" {
 		return nil, status.Error(codes.InvalidArgument, "pool_name and filename required")
@@ -122,6 +224,11 @@ func (s *Server) DeleteStoragePoolContent(ctx context.Context, req *pb.DeleteSto
 	}
 	if err := safename.ValidateName(req.Filename); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "filename: %v", err)
+	}
+	if req.ReplicaVm != "" {
+		if err := safename.ValidateName(req.ReplicaVm); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "replica_vm: %v", err)
+		}
 	}
 	host := req.Host
 	if host == "" {
@@ -135,35 +242,223 @@ func (s *Server) DeleteStoragePoolContent(ctx context.Context, req *pb.DeleteSto
 		return nil, status.Errorf(codes.NotFound, "pool %q not on host %q", req.PoolName, host)
 	}
 	if s.requirePeerCert(ctx) != nil {
-		if err := s.RequirePerm(ctx, poolRBACPathFor(rec.Project, req.PoolName), "storage.content.write", "operator"); err != nil {
+		if err := s.authorizeLibraryWrite(ctx, rec); err != nil {
 			return nil, err
 		}
 	}
 	if host != s.hostName {
+		fctx, err := s.forwardContentCall(ctx)
+		if err != nil {
+			return nil, err
+		}
 		client, conn, err := s.peerClient(ctx, host)
 		if err != nil {
 			return nil, status.Errorf(codes.Unavailable, "reach host %q: %v", host, err)
 		}
 		defer conn.Close()
-		return client.DeleteStoragePoolContent(ctx, req)
+		return client.DeleteStoragePoolContent(fctx, req)
 	}
 	if !isFileBasedDriver(rec.Driver) {
 		return nil, status.Errorf(codes.FailedPrecondition, "pool %q is not file-based", req.PoolName)
 	}
-	dir, err := fileBasedPoolDir(s.dataDir, StoragePoolRef{Driver: rec.Driver, Source: rec.Source, Target: rec.Target})
+	dir, err := s.poolWriteDir(ctx, rec)
 	if err != nil {
-		return nil, status.Errorf(codes.FailedPrecondition, "resolve pool dir: %v", err)
+		return nil, err
 	}
-	target, err := safename.SafeJoin(dir, req.Filename)
+	// In a directory that is not the pool's own, only the caller's project's
+	// files — the caller who made the call, on whichever node; another's is
+	// reported as absent, not as someone else's.
+	caller, err := s.poolContentCallerOf(ctx)
 	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+		return nil, err
+	}
+	conf, err := s.poolConfinementFor(ctx, rec, caller)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "pool content owners: %v", err)
+	}
+	// The file is in the pool's directory, or (a pool on <data_dir>/disks) in
+	// disks/uploads, where users' uploads land. The name is the file the
+	// listing shows the caller under it: the first, in poolContentDirs order,
+	// that is there and that the caller sees. Otherwise it is the first that
+	// is there (refused below as not the caller's), or the first path.
+	var target, existing, first string
+	for _, d := range s.poolContentDirs(dir) {
+		p, err := safename.SafeJoin(d, req.Filename)
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+		}
+		if first == "" {
+			first = p
+		}
+		if _, err := os.Lstat(p); err != nil {
+			continue
+		}
+		if existing == "" {
+			existing = p
+		}
+		if target == "" && conf.visible(ctx, p) {
+			target = p
+		}
+	}
+	// A replica in the pool's replica area, as the listing shows it: named
+	// with its VM, or by a file name no file at the pool's top level has.
+	if req.ReplicaVm != "" || existing == "" {
+		if handled, err := s.deleteAreaReplica(ctx, dir, caller, req.Filename, req.ReplicaVm); handled || err != nil {
+			if err != nil {
+				return nil, err
+			}
+			return &emptypb.Empty{}, nil
+		}
+		if req.ReplicaVm != "" {
+			return nil, status.Errorf(codes.NotFound, "%q is not a replica of vm %q in pool %q", req.Filename, req.ReplicaVm, req.PoolName)
+		}
+	}
+	if target == "" {
+		target = existing
+	}
+	if target == "" {
+		target = first
+	}
+	if !conf.visible(ctx, target) {
+		return nil, status.Errorf(codes.NotFound, "%q is not in pool %q", req.Filename, req.PoolName)
+	}
+	// Never a file a live disk uses — this pool's or, in a directory shared
+	// with other disks, anyone's, on any host (a pool on shared storage); and
+	// for the daemon's pruning on shared storage, any host's by name too (a
+	// promotion there may keep it as a backing file).
+	owners, err := s.diskReferencesAnyHost(ctx, target)
+	if err == nil && len(owners) == 0 && caller.view == viewReplicas {
+		owners, err = s.replicaUsers(ctx, target)
+	}
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "check disk use: %v", err)
+	}
+	if len(owners) > 0 {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"%q is in use by VM %q disk %q; it is not pool content to delete", req.Filename, owners[0].VMName, owners[0].DiskName)
+	}
+	// Only the caller's own upload or replica; library content no record
+	// refers to is shared by everyone who reads the pool, and only an admin
+	// deletes it.
+	if !conf.deletable(ctx, target) {
+		return nil, status.Errorf(codes.PermissionDenied,
+			"%q is shared library content, not the caller's own; deleting it needs %s at the cluster root", req.Filename, verbStorageHostPath)
+	}
+	// A sync-mode global library removes the file from every host: record the
+	// removal (once the name is known good) before removing the file here, so
+	// no host offers its copy back.
+	if s.isGlobalISOLibrary(ctx, rec) && isISOName(req.Filename) {
+		mode, merr := corrosion.GetISOLibraryMode(ctx, s.db)
+		if merr != nil {
+			return nil, status.Errorf(codes.FailedPrecondition, "read the ISO library mode: %v", merr)
+		}
+		if mode.Value == corrosion.ISOLibrarySync {
+			if perr := corrosion.PutISOCatalogEntry(ctx, s.db, corrosion.ISOCatalogEntry{Name: req.Filename, Deleted: true, Origin: s.hostName}, callerUsername(ctx)); perr != nil {
+				return nil, status.Errorf(codes.FailedPrecondition, "record the removal of %s from the ISO library: %v", req.Filename, perr)
+			}
+		}
 	}
 	// os.Remove deletes a symlink itself (not its target), so this can't be
 	// redirected to delete an arbitrary file outside the pool.
 	if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
 		return nil, status.Errorf(codes.Internal, "delete: %v", err)
 	}
+	unmarkUpload(target)
+	if err := s.forgetPoolUpload(ctx, target); err != nil {
+		slog.Warn("pool content deleted but its upload record was not dropped", "pool", req.PoolName, "file", req.Filename, "error", err)
+	}
 	return &emptypb.Empty{}, nil
+}
+
+// deleteAreaReplica deletes the replica file of dir's replica area (of VM vm,
+// when named): a recorded replica — its record beside it, naming exactly this
+// file, in the owner directory its own project and VM hash to — that the
+// caller may delete. That is any, for an admin (storage.hostpath at the root)
+// or the daemon; for a user, a replica of a VM the user reads, in that VM's
+// project: its live row or, for a deleted VM, its tombstone — the same rule as
+// a replica at the pool's top level (poolFileConfinement.ownership). The RPC
+// has already required storage.content.write on the pool. Never a file a disk
+// on any host references. The record goes first, so a failure leaves an
+// unrecorded file nothing selects. handled is false when no recorded replica
+// in the area has that name: the request is then judged as before.
+func (s *Server) deleteAreaReplica(ctx context.Context, dir string, caller poolContentCaller, file, vm string) (bool, error) {
+	if caller.view == viewReplicas {
+		return false, nil // the daemon prunes through PruneReplicas
+	}
+	var mine []string
+	found := false
+	for _, p := range areaReplicasNamed(dir, file) {
+		r, ok := replicaRecordFor(p)
+		if !ok || (vm != "" && r.VM != vm) {
+			continue
+		}
+		found = true
+		if caller.view == viewAll || s.callerReadsReplicaVM(ctx, caller.ctx, r) {
+			mine = append(mine, p)
+		}
+	}
+	switch {
+	case !found:
+		return false, nil
+	case len(mine) == 0:
+		return true, status.Errorf(codes.NotFound, "%q is not in the pool", file)
+	case len(mine) > 1:
+		return true, status.Errorf(codes.FailedPrecondition,
+			"%q names replicas of more than one VM in the pool; name the VM (replica_vm, as the listing shows it)", file)
+	}
+	path := mine[0]
+	owners, err := s.diskReferencesAnyHost(ctx, path)
+	if err != nil {
+		return true, status.Errorf(codes.Internal, "check disk use: %v", err)
+	}
+	if len(owners) > 0 {
+		return true, status.Errorf(codes.FailedPrecondition,
+			"%q is in use by VM %q disk %q; it is not pool content to delete", file, owners[0].VMName, owners[0].DiskName)
+	}
+	if err := os.Remove(path + ".json"); err != nil && !os.IsNotExist(err) {
+		return true, status.Errorf(codes.Internal, "delete the replica's record: %v", err)
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return true, status.Errorf(codes.Internal, "delete: %v", err)
+	}
+	return true, nil
+}
+
+// areaReplicasNamed returns the files called file in the owner directories of
+// dir's replica area: real directories only (a symlink at the area or an
+// owner directory is never followed), and regular files only.
+func areaReplicasNamed(dir, file string) []string {
+	area := filepath.Join(dir, replicaAreaDir)
+	if fi, err := os.Lstat(area); err != nil || !fi.IsDir() {
+		return nil
+	}
+	ents, err := os.ReadDir(area)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, e := range ents {
+		if !e.IsDir() {
+			continue
+		}
+		p := filepath.Join(area, e.Name(), file)
+		if fi, err := os.Lstat(p); err == nil && fi.Mode().IsRegular() {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// callerReadsReplicaVM reports whether the user of uctx reads the VM r is a
+// replica of, and that VM — live, or its tombstone — is still r's project's: a
+// record made for an earlier VM of the same name in another project gives
+// this one's readers nothing.
+func (s *Server) callerReadsReplicaVM(ctx, uctx context.Context, r replicaRecord) bool {
+	vm, err := corrosion.GetVMIncludingDeleted(ctx, s.db, r.VM)
+	if err != nil || vm == nil || !sameProject(vm.Project, r.Project) {
+		return false
+	}
+	return s.RequirePerm(uctx, vmRBACPath(vm), "vm.read", "viewer") == nil
 }
 
 // UploadStoragePoolContent streams a file into a file-based pool. The first
@@ -176,6 +471,15 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 	if err != nil {
 		return status.Errorf(codes.InvalidArgument, "no data: %v", err)
 	}
+	// Nothing this build does not know rides on an upload. Field 5 used to
+	// carry a replica record; an entry node on a build that has it, or one
+	// that does not know it, forwards it as it came — under its own host
+	// certificate. Replicas now travel only on the peer-only PushReplica, which
+	// no entry node forwards for a user, so any unknown field is refused here.
+	if len(first.ProtoReflect().GetUnknown()) != 0 {
+		return status.Error(codes.InvalidArgument,
+			"upload header carries fields this daemon does not accept (a replica is sent with PushReplica, never as an upload)")
+	}
 	if first.PoolName == "" || first.Filename == "" {
 		return status.Error(codes.InvalidArgument, "pool_name and filename required")
 	}
@@ -187,7 +491,7 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 	if err := safename.ValidatePoolName(first.PoolName); err != nil {
 		return status.Errorf(codes.InvalidArgument, "%v", err)
 	}
-	if err := safename.ValidateName(first.Filename); err != nil {
+	if err := validatePoolUploadName(first.Filename); err != nil {
 		return status.Errorf(codes.InvalidArgument, "filename: %v", err)
 	}
 	host := first.Host
@@ -204,19 +508,27 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 	// Authorize BEFORE creating a temp file or reading any further frame (peer calls
 	// skip tenant RBAC). A denied upload writes nothing and drains no chunks.
 	if s.requirePeerCert(ctx) != nil {
-		if err := s.RequirePerm(ctx, poolRBACPathFor(rec.Project, first.PoolName), "storage.content.write", "operator"); err != nil {
+		if err := s.authorizeLibraryWrite(ctx, rec); err != nil {
 			return err
 		}
+	}
+	// A library holds ISOs, and a VM can only name a .iso there.
+	if s.isISOLibrary(ctx, rec) && !isISOName(first.Filename) {
+		return status.Errorf(codes.InvalidArgument, "pool %q is an ISO library; only .iso files go in it", first.PoolName)
 	}
 
 	// Remote pool: proxy the stream to the owning host.
 	if host != s.hostName {
+		fctx, err := s.forwardContentCall(ctx)
+		if err != nil {
+			return err
+		}
 		client, conn, err := s.peerClient(ctx, host)
 		if err != nil {
 			return status.Errorf(codes.Unavailable, "reach host %q: %v", host, err)
 		}
 		defer conn.Close()
-		up, err := client.UploadStoragePoolContent(ctx)
+		up, err := client.UploadStoragePoolContent(fctx)
 		if err != nil {
 			return status.Errorf(codes.Unavailable, "open upload to %q: %v", host, err)
 		}
@@ -245,19 +557,66 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 	if !isFileBasedDriver(rec.Driver) {
 		return status.Errorf(codes.FailedPrecondition, "pool %q is not file-based", first.PoolName)
 	}
-	dir, err := fileBasedPoolDir(s.dataDir, StoragePoolRef{Driver: rec.Driver, Source: rec.Source, Target: rec.Target})
+	if err := s.globalLibraryWritable(ctx, rec); err != nil {
+		return err
+	}
+	// A library file is never replaced (a VM may boot it): refuse a taken name
+	// before reading a byte. The publish below is no-replace too.
+	library := s.isISOLibrary(ctx, rec)
+	poolDir, err := s.poolWriteDir(ctx, rec)
 	if err != nil {
-		return status.Errorf(codes.FailedPrecondition, "resolve pool dir: %v", err)
+		return err
+	}
+	// Who the upload is for: the caller who made it, on whichever node. A
+	// user's upload is recorded as its pool's project's; the daemon's replica
+	// as its VM's; an older node's (no marker) is not recorded.
+	caller, err := s.poolContentCallerOf(ctx)
+	if err != nil {
+		return err
+	}
+	// Into a pool on <data_dir>/disks a user's upload lands in disks/uploads,
+	// out of the VM disks' namespace. The daemon's replica lands in the pool
+	// directory, where promotion reads it.
+	dir := poolDir
+	if caller.record {
+		dir = s.poolUploadDir(poolDir)
+	}
+	if caller.view == viewReplicas && !replicaNameIs(first.Filename, caller.replica) {
+		return notAReplicaName(first.Filename, caller.replica)
+	}
+	dest, err := safename.SafeJoin(dir, first.Filename)
+	if err != nil {
+		return status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	if library {
+		if p, jerr := safename.SafeJoin(dir, first.Filename); jerr == nil {
+			if _, lerr := os.Lstat(p); lerr == nil {
+				return errLibraryFileExists(first.Filename)
+			}
+		}
+	}
+	// Refuse a taken name — in any of the pool's content directories —
+	// before streaming anything; publishNoClobber below refuses it again
+	// atomically.
+	for _, d := range s.poolContentDirs(poolDir) {
+		p, err := safename.SafeJoin(d, first.Filename)
+		if err != nil {
+			return status.Errorf(codes.InvalidArgument, "%v", err)
+		}
+		if err := refuseExistingDest(p, first.Filename); err != nil {
+			return err
+		}
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return status.Errorf(codes.Internal, "mkdir: %v", err)
 	}
-	tmp, err := os.CreateTemp(dir, ".upload-*.tmp")
+	hasher := sha256.New()
+	tmp, err := storage.CreatePoolTemp(dir, ".upload-*.tmp")
 	if err != nil {
 		return status.Errorf(codes.Internal, "create temp: %v", err)
 	}
 	tmpName := tmp.Name()
-	defer os.Remove(tmpName) // no-op after a successful rename
+	defer os.Remove(tmpName) // after a publish, drops the temp's second link
 	defer tmp.Close()
 
 	var total int64
@@ -270,6 +629,7 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 		}
 		n, err := tmp.Write(b)
 		total += int64(n)
+		hasher.Write(b[:n])
 		return err
 	}
 	if err := writeChunk(first.Chunk); err != nil {
@@ -297,22 +657,144 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 	if err := syncPath(tmpName); err != nil {
 		return status.Errorf(codes.Internal, "sync: %v", err)
 	}
-	dest, err := safename.SafeJoin(dir, first.Filename)
-	if err != nil {
-		return status.Errorf(codes.InvalidArgument, "%v", err)
+	// Never replace what is there — a file, or a symlink planted at the name —
+	// and never write through one.
+	// An upload (not the daemon's replica) is marked on the store before it
+	// is published, so no host takes it for a late replica even where its
+	// record does not arrive (lateReplicaOK).
+	marked := caller.view != viewReplicas
+	if marked {
+		if err := markUpload(dest); err != nil {
+			unmarkUpload(dest)
+			return status.Errorf(codes.Internal, "mark upload: %v", err)
+		}
 	}
-	// Don't clobber/write through a symlink an admin may have placed at dest.
-	if fi, lerr := os.Lstat(dest); lerr == nil && fi.Mode()&os.ModeSymlink != 0 {
-		return status.Errorf(codes.FailedPrecondition, "destination %q is a symlink", first.Filename)
+	withdraw := func() {
+		_ = os.Remove(dest)
+		if marked {
+			unmarkUpload(dest)
+		}
 	}
-	if err := os.Rename(tmpName, dest); err != nil {
-		return status.Errorf(codes.Internal, "finalize: %v", err)
+	if library {
+		if err := publishLibraryFile(tmpName, dest, first.Filename, false); err != nil {
+			if marked && !lexists(dest) {
+				unmarkUpload(dest)
+			}
+			return err
+		}
+	} else if err := publishNoClobber(tmpName, dest, first.Filename); err != nil {
+		if marked && !lexists(dest) {
+			unmarkUpload(dest)
+		}
+		return err
 	}
 	if err := syncPath(dir); err != nil {
 		// The rename may not survive a crash; withdraw it rather than leave a
 		// name the storage will not vouch for.
-		_ = os.Remove(dest)
+		withdraw()
 		return status.Errorf(codes.Internal, "sync directory: %v", err)
 	}
+	// A caller's upload is recorded as its pool's project's: in a directory
+	// that is not the pool's own, the record is what makes it theirs. A
+	// replica's record says whose VM's disk it is, which is what promotion
+	// and pruning match it by.
+	var recErr error
+	switch {
+	case caller.view == viewReplicas:
+		recErr = s.recordPoolReplica(ctx, rec.Name, caller.replica, dest)
+	case caller.record:
+		recErr = s.recordPoolUpload(ctx, rec.Name, rec.Project, callerUsername(caller.ctx)+"@"+callerRealm(caller.ctx), dest)
+	default:
+		recErr = s.recordPeerUpload(ctx, rec.Name, dest)
+	}
+	// A replica that cannot be recorded stays where it would be matched by
+	// its name anyway (not a shared store whose records epoch is known), as
+	// before records; a user's upload is theirs only by its record.
+	if recErr != nil && caller.view == viewReplicas && s.isLegacyUnrecorded(ctx, dest) {
+		slog.Warn("replica upload not recorded; it is matched by its name", "path", dest, "error", recErr)
+		recErr = nil
+	}
+	if recErr != nil {
+		withdraw()
+		return status.Errorf(codes.Internal, "record upload: %v", recErr)
+	}
+	if s.isGlobalISOLibrary(ctx, rec) {
+		sum := hex.EncodeToString(hasher.Sum(nil))
+		if fi, lerr := os.Lstat(dest); lerr == nil {
+			s.rememberISOHash(dest, fi, sum)
+		}
+		if err := s.recordLibraryFile(ctx, rec, first.Filename, dest, sum, total); err != nil {
+			withdraw()
+			return err
+		}
+	}
 	return stream.SendAndClose(&pb.UploadStoragePoolContentResponse{Path: dest, SizeBytes: total})
+}
+
+// receiveFileNoClobber streams chunks (next returns io.EOF at the end) into a
+// NEW file dir/filename: a temp, synced, published with no clobber, the
+// directory synced after it. An existing name — a file, a directory, a
+// symlink — is refused before anything is written and again atomically at the
+// publish.
+func receiveFileNoClobber(dir string, dirMode os.FileMode, filename string, next func() ([]byte, error)) (string, int64, error) {
+	dest, err := safename.SafeJoin(dir, filename)
+	if err != nil {
+		return "", 0, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	if err := refuseExistingDest(dest, filename); err != nil {
+		return "", 0, err
+	}
+	if err := os.MkdirAll(dir, dirMode); err != nil {
+		return "", 0, status.Errorf(codes.Internal, "mkdir: %v", err)
+	}
+	tmp, err := storage.CreatePoolTemp(dir, ".upload-*.tmp")
+	if err != nil {
+		return "", 0, status.Errorf(codes.Internal, "create temp: %v", err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // after a publish, drops the temp's second link
+	defer tmp.Close()
+
+	var total int64
+	for {
+		b, err := next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", 0, err
+		}
+		if len(b) == 0 {
+			continue
+		}
+		if total+int64(len(b)) > maxPoolUploadBytes {
+			return "", 0, status.Errorf(codes.InvalidArgument, "upload exceeds %d-byte ceiling", maxPoolUploadBytes)
+		}
+		n, werr := tmp.Write(b)
+		total += int64(n)
+		if werr != nil {
+			return "", 0, werr
+		}
+	}
+	if err := tmp.Close(); err != nil {
+		return "", 0, status.Errorf(codes.Internal, "close: %v", err)
+	}
+	// Durable before visible: data synced before the publish, the directory
+	// after it, or a power loss can leave the final name on a file whose bytes
+	// never reached the disk.
+	if err := syncPath(tmpName); err != nil {
+		return "", 0, status.Errorf(codes.Internal, "sync: %v", err)
+	}
+	// Never replace what is there — a file, or a symlink planted at the name —
+	// and never write through one.
+	if err := publishNoClobber(tmpName, dest, filename); err != nil {
+		return "", 0, err
+	}
+	if err := syncPath(dir); err != nil {
+		// The publish may not survive a crash; withdraw it rather than leave a
+		// name the storage will not vouch for.
+		_ = os.Remove(dest)
+		return "", 0, status.Errorf(codes.Internal, "sync directory: %v", err)
+	}
+	return dest, total, nil
 }

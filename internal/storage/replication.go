@@ -46,7 +46,25 @@ type ReplicateOptions struct {
 	// SSHTarget is "user@host" for cross-host pipes. Empty = local
 	// pipe (same host, different dataset/pool).
 	SSHTarget string
+
+	// Record is the copy's owner record — project, VM, disk — written onto
+	// the received dataset or image (zfs user properties "litevirt:<key>",
+	// rbd image-meta "litevirt.<key>") so the copy is identified by what it
+	// records, never by its name.
+	Record map[string]string
+
+	// SrcOptions are the SOURCE pool's driver options (ceph: id, conf,
+	// keyring). The source side — snapshot, export — runs with them, the
+	// destination side with the destination driver's own: two ceph clusters
+	// each get their own credentials. Nil: the source shares the
+	// destination's (one cluster).
+	SrcOptions map[string]string
 }
+
+// ErrDestinationExists refuses a native receive whose destination dataset or
+// image already exists: a copy never replaces anything (no zfs recv -F; an rbd
+// import onto a name that must not exist).
+var ErrDestinationExists = errors.New("replication destination already exists; a copy never replaces one")
 
 // ErrReplicationNotSupported is returned by drivers that don't have a
 // native send/recv primitive. The grpcapi layer treats this as a

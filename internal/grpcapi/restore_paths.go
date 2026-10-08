@@ -133,7 +133,7 @@ func (s *Server) resolveBackupRepoPath(ctx context.Context, repoPath string) (st
 		}
 	}
 	if filepath.IsAbs(repoPath) {
-		if err := RequireRole(ctx, "admin"); err != nil {
+		if err := s.RequirePerm(ctx, "/", verbStorageHostPath, "admin"); err != nil {
 			return "", status.Error(codes.PermissionDenied,
 				"a custom absolute repo_path requires the admin role; otherwise reference a registered backup repo by name")
 		}
@@ -142,16 +142,17 @@ func (s *Server) resolveBackupRepoPath(ctx context.Context, repoPath string) (st
 	return "", status.Errorf(codes.NotFound, "unknown backup repo %q (register it or pass an absolute path as admin)", repoPath)
 }
 
-// resolveRestoreTarget resolves a restore/replicate destination path under a
-// consistent policy: a bare filename (or relative path) is validated and
-// contained under defaultDir; a custom absolute path is admin-only. The result
-// is always a path it is safe to create + finalize via lstat/temp/rename.
+// resolveRestoreTarget resolves the shape of a named restore/replicate
+// destination: a bare filename is validated and contained under defaultDir; an
+// absolute path is admin-only. Callers reach it only through
+// resolveAdminTarget, which requires the admin role for any name at all and
+// refuses one that already exists — a non-admin never names a destination.
 func (s *Server) resolveRestoreTarget(ctx context.Context, targetPath, defaultDir string) (string, error) {
 	if targetPath == "" {
 		return "", status.Error(codes.InvalidArgument, "target_path required")
 	}
 	if filepath.IsAbs(targetPath) {
-		if err := RequireRole(ctx, "admin"); err != nil {
+		if err := s.RequirePerm(ctx, "/", verbStorageHostPath, "admin"); err != nil {
 			return "", status.Error(codes.PermissionDenied,
 				"a custom absolute target_path requires the admin role; otherwise pass a bare filename to write under the pool")
 		}

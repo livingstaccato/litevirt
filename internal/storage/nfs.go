@@ -7,7 +7,10 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/qcow2"
@@ -55,7 +58,7 @@ func (d *nfsDriver) Teardown(ctx context.Context) error {
 	}
 	safe := strings.NewReplacer("/", "_", ":", "_").Replace(d.source)
 	mountDir := filepath.Join(d.mountBase, safe)
-	if out, err := run(commandCtx, "mountpoint", "-q", mountDir); err != nil {
+	if out, err := run(commandCtx, "mountpoint", "-q", "--", mountDir); err != nil {
 		if commandCtx.Err() != nil {
 			return nfsCommandError("check nfs mountpoint", d.source, commandCtx.Err(), out)
 		}
@@ -64,7 +67,7 @@ func (d *nfsDriver) Teardown(ctx context.Context) error {
 		}
 		return nfsCommandError("check nfs mountpoint", mountDir, err, out)
 	}
-	if out, err := run(commandCtx, "umount", mountDir); err != nil {
+	if out, err := run(commandCtx, "umount", "--", mountDir); err != nil {
 		if commandCtx.Err() != nil {
 			return nfsCommandError("umount nfs", mountDir, commandCtx.Err(), out)
 		}
@@ -102,25 +105,434 @@ func (d *nfsDriver) Prepare(ctx context.Context) error {
 	// always true and re-ran `mount` on every Prepare (every CreateVM / restart),
 	// which fails on already-mounted configs or stacks mounts (bug-sweep #8).
 	// Skip the mount when it's already mounted, keyed on the exit code.
-	mountpointOut, err := run(commandCtx, "mountpoint", "-q", d.mountDir)
+	mountpointOut, err := run(commandCtx, "mountpoint", "-q", "--", d.mountDir)
 	if err != nil && commandCtx.Err() != nil {
 		return nfsCommandError("check nfs mountpoint", d.mountDir, commandCtx.Err(), mountpointOut)
 	}
 	alreadyMounted := err == nil
-	if !alreadyMounted {
-		mountOpts := "vers=4,hard,intr"
-		if extra, ok := d.opts["options"]; ok {
-			mountOpts = extra
+	if alreadyMounted {
+		// Mounted before this build, or by hand: it may lack the hardening,
+		// which is then applied to that mount in place.
+		return d.ensureHardened(commandCtx, run)
+	}
+	mountOpts := "vers=4,hard,intr"
+	if extra, ok := d.opts["options"]; ok {
+		mountOpts = extra
+	}
+	// nosymfollow wherever the kernel has it (Linux 5.10+): without it a
+	// symlink the server plants is followed as root in the host's namespace
+	// by anything that opens a pool file by name. Where it is not available —
+	// a kernel before 5.10, or a mount.nfs that refuses the option — the pool
+	// is mounted with the other options, and the daemon's own opens of pool
+	// content follow no symlink on the export (OpenPoolFile).
+	mountOpts = hardenNFSOptions(mountOpts)
+	withSymfollow := nosymfollowAt(d.mountDir)
+	if !withSymfollow {
+		warnNoNosymfollow(d.mountDir)
+	}
+	try := func(opts string) ([]byte, error) {
+		return run(commandCtx, "mount", "-t", "nfs", "-o", opts, "--", d.source, d.mountDir)
+	}
+	opts := mountOpts
+	if withSymfollow {
+		opts += ",nosymfollow"
+	}
+	out, err := try(opts)
+	if err != nil && withSymfollow && commandCtx.Err() == nil && strings.Contains(strings.ToLower(string(out)), "option") {
+		// The option itself was refused: mounted as on a kernel without it.
+		if out2, err2 := try(mountOpts); err2 == nil {
+			nosymfollowUnusable.Store(d.mountDir, true)
+			warnNoNosymfollow(d.mountDir)
+			opts, out, err = mountOpts, out2, nil
 		}
-		if out, err := run(commandCtx, "mount", "-t", "nfs", "-o", mountOpts, d.source, d.mountDir); err != nil {
-			if commandCtx.Err() != nil {
-				return nfsCommandError("mount nfs", d.source, commandCtx.Err(), out)
+	}
+	if err != nil {
+		if commandCtx.Err() != nil {
+			return nfsCommandError("mount nfs", d.source, commandCtx.Err(), out)
+		}
+		return fmt.Errorf("%w (an NFS pool is mounted %s)",
+			nfsCommandError("mount nfs", d.source, err, out), strings.Join(requiredNFSFlagsAt(d.mountDir), ","))
+	}
+	mountOpts = opts
+	slog.Info("NFS mounted", "source", d.source, "mountpoint", d.mountDir, "options", mountOpts)
+	return nil
+}
+
+// requiredNFSFlags are the per-mount flags every NFS pool's mount must carry:
+// nosuid, nodev, noexec, and nosymfollow on a kernel that has it (5.10+).
+func requiredNFSFlags() []string {
+	if kernelHasNosymfollow() {
+		return []string{"nosuid", "nodev", "noexec", "nosymfollow"}
+	}
+	return []string{"nosuid", "nodev", "noexec"}
+}
+
+// nosymfollowUnusable holds the mount points where nosymfollow could not be
+// applied although the kernel has it (a mount or mount.nfs that refuses or
+// drops the option). They are treated as on a kernel without it.
+var nosymfollowUnusable sync.Map
+
+// nosymfollowAt reports whether an NFS pool's mount at dir carries
+// nosymfollow: the kernel has it, and it was not found unusable there.
+func nosymfollowAt(dir string) bool {
+	if !kernelHasNosymfollow() {
+		return false
+	}
+	_, bad := nosymfollowUnusable.Load(dir)
+	return !bad
+}
+
+// requiredNFSFlagsAt is requiredNFSFlags for the mount at dir.
+func requiredNFSFlagsAt(dir string) []string {
+	if nosymfollowAt(dir) {
+		return []string{"nosuid", "nodev", "noexec", "nosymfollow"}
+	}
+	return []string{"nosuid", "nodev", "noexec"}
+}
+
+// warnedNoNosymfollow: the mount points already warned about, so the warning
+// is said once per mount point, not at every use of the pool.
+var warnedNoNosymfollow sync.Map
+
+func warnNoNosymfollow(dir string) {
+	if _, seen := warnedNoNosymfollow.LoadOrStore(dir, true); seen {
+		return
+	}
+	slog.Warn("nosymfollow is not available for this NFS pool (a kernel before 5.10, or a mount that does not pass it on); it is mounted nosuid,nodev,noexec only, and litevirt opens its content following no symlink on the export and hands qemu-img no path through one — upgrade the kernel and util-linux/nfs-utils to have the kernel refuse them too",
+		"mountpoint", dir)
+}
+
+// readMountInfo returns /proc/self/mountinfo; tests replace it.
+var readMountInfo = func() ([]byte, error) { return os.ReadFile("/proc/self/mountinfo") }
+
+// mountEntry is one line of mountinfo: where, the per-mount options, and what
+// is mounted there (filesystem type and source).
+type mountEntry struct {
+	dir    string
+	flags  []string
+	fstype string
+	source string
+}
+
+// mounts parses mountinfo, in order (a later mount on the same point is on top).
+func mounts() ([]mountEntry, error) {
+	data, err := readMountInfo()
+	if err != nil {
+		return nil, err
+	}
+	var out []mountEntry
+	for _, line := range strings.Split(string(data), "\n") {
+		f := strings.Fields(line)
+		if len(f) < 6 {
+			continue
+		}
+		e := mountEntry{dir: filepath.Clean(unescapeMountInfo(f[4])), flags: strings.Split(f[5], ",")}
+		// Optional fields end at "-"; filesystem type and source follow it.
+		if i := slices.Index(f[6:], "-"); i >= 0 && len(f) > 6+i+2 {
+			e.fstype, e.source = f[6+i+1], unescapeMountInfo(f[6+i+2])
+		}
+		out = append(out, e)
+	}
+	return out, nil
+}
+
+// mountAt returns the mount at dir (the top one, when mounts are stacked), and
+// whether dir is a mount point at all.
+func mountAt(dir string) (mountEntry, bool, error) {
+	all, err := mounts()
+	if err != nil {
+		return mountEntry{}, false, err
+	}
+	want := filepath.Clean(dir)
+	var top mountEntry
+	found := false
+	for _, e := range all {
+		if e.dir == want {
+			top, found = e, true
+		}
+	}
+	return top, found, nil
+}
+
+// mountFlags returns the per-mount options of the mount at dir (the last one,
+// when mounts are stacked), and whether dir is a mount point at all.
+func mountFlags(dir string) ([]string, bool, error) {
+	e, found, err := mountAt(dir)
+	return e.flags, found, err
+}
+
+// unescapeMountInfo undoes mountinfo's octal escapes (\040 for a space …).
+func unescapeMountInfo(s string) string {
+	if !strings.Contains(s, "\\") {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+3 < len(s) {
+			if n, err := strconv.ParseUint(s[i+1:i+4], 8, 8); err == nil {
+				b.WriteByte(byte(n))
+				i += 3
+				continue
 			}
-			return nfsCommandError("mount nfs", d.source, err, out)
 		}
-		slog.Info("NFS mounted", "source", d.source, "mountpoint", d.mountDir)
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
+func missingNFSFlags(flags []string) []string { return missingFlagsOf(flags, requiredNFSFlags()) }
+
+// perMountFlags are the options of mountinfo's per-mount field that a bind
+// remount sets. A bind remount replaces all of them, so the ones the mount
+// has are passed again beside the hardening (a read-only mount stays so).
+var perMountFlags = []string{"ro", "rw", "nosuid", "nodev", "noexec", "noatime", "nodiratime", "relatime", "strictatime", "nosymfollow"}
+
+// ensureHardened refuses an existing mount at d.mountDir that is not this
+// pool's export. This pool's export mounted without the hardening — by an
+// earlier build (vers=4,hard,intr only), or by hand — is hardened in place: a
+// bind remount (MS_REMOUNT|MS_BIND) changes only that mount's per-mount
+// flags, so open files and running VMs on it are untouched. It is refused
+// only when that remount fails, or leaves a flag missing.
+func (d *nfsDriver) ensureHardened(ctx context.Context, run cmdRunner) error {
+	m, mounted, err := mountAt(d.mountDir)
+	if err != nil {
+		return fmt.Errorf("read mount options of %s: %w", d.mountDir, err)
+	}
+	if !mounted {
+		return fmt.Errorf("%s reports as a mount point but is not in mountinfo; refusing to use it", d.mountDir)
+	}
+	// The export mounted there is compared in the same canonical form as the
+	// pool's source: another export (or the same server's parent export) at
+	// the pool's mount point would hand the pool someone else's files.
+	want, werr := ParseNFSExport(d.source)
+	got, gerr := ParseNFSExport(m.source)
+	if werr != nil || gerr != nil || got != want || !isNFSFstype(m.fstype) {
+		slog.Error("NFS pool's mount point holds a mount that is not its export; the pool is refused until it is unmounted",
+			"mountpoint", d.mountDir, "mounted", m.source, "fstype", m.fstype, "source", d.source)
+		return fmt.Errorf("%s has %s mounted, not this pool's export %s; unmount it (umount %s) and litevirt mounts the pool's export there",
+			d.mountDir, mountedWhat(m), d.source, d.mountDir)
+	}
+	if !nosymfollowAt(d.mountDir) {
+		warnNoNosymfollow(d.mountDir)
+	}
+	miss := missingFlagsOf(m.flags, requiredNFSFlagsAt(d.mountDir))
+	if len(miss) == 0 {
+		return nil
+	}
+	if run == nil {
+		run = realCmd
+	}
+	left, out, rerr := d.remountWith(ctx, run, m.flags, requiredNFSFlagsAt(d.mountDir))
+	if rerr == nil && len(left) == 1 && left[0] == "nosymfollow" {
+		// The mount took the rest but not nosymfollow: as on a kernel
+		// without it.
+		nosymfollowUnusable.Store(d.mountDir, true)
+	} else if rerr != nil && slices.Contains(miss, "nosymfollow") {
+		// The remount refused the option itself: try once without it.
+		if left2, _, rerr2 := d.remountWith(ctx, run, m.flags, []string{"nosuid", "nodev", "noexec"}); rerr2 == nil && len(left2) == 0 {
+			nosymfollowUnusable.Store(d.mountDir, true)
+			left, rerr = nil, nil
+		}
+	}
+	if rerr == nil {
+		if left = missingFlagsOf(currentFlags(d.mountDir), requiredNFSFlagsAt(d.mountDir)); len(left) == 0 {
+			if !nosymfollowAt(d.mountDir) {
+				warnNoNosymfollow(d.mountDir)
+			}
+			slog.Warn("NFS pool was mounted without the required options; hardened in place",
+				"mountpoint", d.mountDir, "added", miss)
+			return nil
+		}
+		rerr = fmt.Errorf("the remount left %s missing", strings.Join(left, ","))
+	}
+	slog.Error("NFS pool is mounted without the required options and could not be hardened in place; the pool is refused",
+		"mountpoint", d.mountDir, "missing", miss, "error", rerr, "output", trimmedNFSCommandOutput(out))
+	return fmt.Errorf("NFS mount at %s lacks %s and remounting it with them failed (%v); remount it with %s, or unmount it (umount %s) and litevirt mounts it again with them",
+		d.mountDir, strings.Join(miss, ","), rerr, strings.Join(requiredNFSFlagsAt(d.mountDir), ","), d.mountDir)
+}
+
+// remountWith bind-remounts the mount at d.mountDir with its own per-mount
+// flags (have) plus want, and returns what of want the mount still lacks
+// after it.
+func (d *nfsDriver) remountWith(ctx context.Context, run cmdRunner, have, want []string) ([]string, []byte, error) {
+	var opts []string
+	for _, f := range perMountFlags {
+		if slices.Contains(have, f) || slices.Contains(want, f) {
+			opts = append(opts, f)
+		}
+	}
+	out, err := run(ctx, "mount", "-o", "remount,bind,"+strings.Join(opts, ","), "--", d.mountDir)
+	if err != nil {
+		return nil, out, err
+	}
+	m, ok, err := mountAt(d.mountDir)
+	if err != nil {
+		return nil, out, err
+	}
+	if !ok {
+		return nil, out, errors.New("the mount is gone after the remount")
+	}
+	return missingFlagsOf(m.flags, want), out, nil
+}
+
+// currentFlags is the per-mount flags of the mount at dir now (nil when it
+// cannot be read).
+func currentFlags(dir string) []string {
+	m, _, _ := mountAt(dir)
+	return m.flags
+}
+
+func missingFlagsOf(flags, want []string) []string {
+	var miss []string
+	for _, f := range want {
+		if !slices.Contains(flags, f) {
+			miss = append(miss, f)
+		}
+	}
+	return miss
+}
+
+func isNFSFstype(t string) bool { return t == "nfs" || t == "nfs4" }
+
+func mountedWhat(m mountEntry) string {
+	if m.source == "" {
+		return "a mount"
+	}
+	return fmt.Sprintf("%q (%s)", m.source, m.fstype)
+}
+
+// nfsCheckRun runs the in-place remount CheckNFSMountHardened may do; tests
+// replace it (nil: the real command).
+var nfsCheckRun cmdRunner
+
+// CheckNFSMountHardened refuses an NFS pool whose mount point holds anything
+// but its own export (ensureHardened). Its own export mounted without
+// nosuid,nodev,noexec,nosymfollow is hardened in place first, and refused only
+// if that fails. A pool that is not mounted passes (Prepare mounts it with
+// them). Not an NFS config: nil.
+func CheckNFSMountHardened(dataDir string, cfg Config) error {
+	if !strings.EqualFold(cfg.Driver, "nfs") {
+		return nil
+	}
+	dir := cfg.Target
+	if dir == "" {
+		dir = filepath.Join(dataDir, "mounts", NFSMountName(cfg.Source))
+	}
+	d := &nfsDriver{source: cfg.Source, mountDir: dir}
+	if _, mounted, err := mountFlags(dir); err != nil {
+		return fmt.Errorf("read mount options of %s: %w", dir, err)
+	} else if !mounted {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), defaultNFSCommandTimeout)
+	defer cancel()
+	return d.ensureHardened(ctx, nfsCheckRun)
+}
+
+// MountTable is a snapshot of this host's mount table, read once and judged
+// many times (one per pool row).
+type MountTable struct{ all []mountEntry }
+
+// ReadMountTable reads the mount table.
+func ReadMountTable() (MountTable, error) {
+	all, err := mounts()
+	if err != nil {
+		return MountTable{}, fmt.Errorf("read the mount table: %w", err)
+	}
+	return MountTable{all: all}, nil
+}
+
+// NFSBacking is the NFS export a directory is stored on, and what its mount
+// lacks of nosuid,nodev,noexec,nosymfollow.
+type NFSBacking struct {
+	// Export is the export of the mount the directory is on plus the path of
+	// the directory below that mount point: the directory's identity as NFS
+	// storage, comparable with an nfs pool's Source and with any other
+	// directory on the same export, on any host.
+	Export NFSExport
+	// MountPoint is where that export is mounted on this host.
+	MountPoint string
+	// Missing lists the required per-mount options the mount lacks.
+	Missing []string
+}
+
+// NFSBackingOf reports whether dir is on an NFS mount — the mount point
+// itself or anything below it, judged as written and after resolving
+// symlinks (the resolved form wins) — and if so which export it is and what
+// its mount lacks. nil: on no NFS mount. An error: the mount's source is not
+// an NFS export litevirt can identify.
+func (t MountTable) NFSBackingOf(dir string) (*NFSBacking, error) {
+	var out *NFSBacking
+	for _, p := range pathForms(dir) {
+		var under mountEntry
+		for _, e := range t.all {
+			// The deepest mount containing p is the one p is on; the last of
+			// equal depth is on top.
+			if within(e.dir, p) && len(e.dir) >= len(under.dir) {
+				under = e
+			}
+		}
+		if !isNFSFstype(under.fstype) {
+			continue
+		}
+		exp, err := ParseNFSExport(under.source)
+		if err != nil {
+			return nil, fmt.Errorf("%s is on an NFS mount at %s whose source is not server:/export", dir, under.dir)
+		}
+		rel, err := filepath.Rel(under.dir, p)
+		if err != nil {
+			return nil, err
+		}
+		exp.Path = filepath.Clean(filepath.Join(exp.Path, rel))
+		out = &NFSBacking{Export: exp, MountPoint: under.dir, Missing: missingNFSFlags(under.flags)}
+	}
+	return out, nil
+}
+
+// CheckNFSBackingHardened refuses a directory pool (local, dir, btrfs) whose
+// directory is on an NFS mount without nosuid,nodev,noexec,nosymfollow: the
+// export's server decides what is on it, so nothing there may be a setuid
+// binary, a device node, an executable or a symlink followed as root. The
+// refusal names the mount point and the options it lacks, never the export.
+func CheckNFSBackingHardened(dir string) error {
+	t, err := ReadMountTable()
+	if err != nil {
+		return err
+	}
+	b, err := t.NFSBackingOf(dir)
+	if err != nil || b == nil {
+		return err
+	}
+	if len(b.Missing) > 0 {
+		return fmt.Errorf("%s is on an NFS mount at %s without %s; mount it with nosuid,nodev,noexec,nosymfollow (in fstab, for a mount litevirt does not make)",
+			dir, b.MountPoint, strings.Join(b.Missing, ","))
 	}
 	return nil
+}
+
+// OverrideMountInfoForTest replaces how mounts are inspected, for tests in
+// other packages. It returns the restore function.
+func OverrideMountInfoForTest(mountinfo func() ([]byte, error)) func() {
+	prev := readMountInfo
+	readMountInfo = mountinfo
+	return func() { readMountInfo = prev }
+}
+
+// OverrideNFSRemountForTest replaces how CheckNFSMountHardened runs the
+// in-place remount, for tests in other packages. It returns the restore
+// function.
+func OverrideNFSRemountForTest(run func(ctx context.Context, name string, args ...string) ([]byte, error)) func() {
+	prev := nfsCheckRun
+	nfsCheckRun = run
+	return func() { nfsCheckRun = prev }
+}
+
+// OverrideNosymfollowSupportForTest makes the kernel appear to have (or lack)
+// nosymfollow, for tests in other packages. It returns the restore function.
+func OverrideNosymfollowSupportForTest(has bool) func() {
+	prev := kernelHasNosymfollow
+	kernelHasNosymfollow = func() bool { return has }
+	return func() { kernelHasNosymfollow = prev }
 }
 
 func (d *nfsDriver) commandContext(ctx context.Context) (context.Context, context.CancelFunc, error) {
@@ -184,7 +596,7 @@ func (d *nfsDriver) CreateDisk(ctx context.Context, opts DiskOptions) (string, e
 			}
 		}
 	} else {
-		f, err := os.Create(path)
+		f, err := CreateExclusive(path)
 		if err != nil {
 			return "", fmt.Errorf("create raw disk on NFS: %w", err)
 		}
@@ -211,3 +623,37 @@ func (d *nfsDriver) DeleteDisk(_ context.Context, path string) error {
 	}
 	return nil
 }
+
+// nfsHardening is what every NFS pool is mounted with: the export's server
+// decides its contents, so nothing on it may be a setuid binary, a device
+// node or an executable as far as this host is concerned. Pool content is
+// disk images; qemu reads them, nothing executes them.
+//
+// nosharecache gives each mount its own superblock. Without it two mounts of
+// one server share the first mount's, and the kernel reports that mount's
+// spelling of the server as the source of both: a pool mounted by address
+// beside one mounted by name would then fail the source check at every use.
+var nfsHardening = []string{"nosuid", "nodev", "noexec", "nosharecache"}
+
+// hardenNFSOptions appends nfsHardening to opts, and drops any option that
+// would undo it (suid, dev, exec, sharecache).
+func hardenNFSOptions(opts string) string {
+	var out []string
+	for _, o := range strings.Split(opts, ",") {
+		o = strings.TrimSpace(o)
+		switch o {
+		case "", "suid", "dev", "exec", "symfollow", "nosymfollow", "sharecache":
+			continue
+		}
+		out = append(out, o)
+	}
+	for _, h := range nfsHardening {
+		if !slices.Contains(out, h) {
+			out = append(out, h)
+		}
+	}
+	return strings.Join(out, ",")
+}
+
+// Empty reports whether the table was never read.
+func (t MountTable) Empty() bool { return t.all == nil }

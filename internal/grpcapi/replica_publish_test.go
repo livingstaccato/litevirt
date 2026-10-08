@@ -27,20 +27,35 @@ func replicaPoolDir(t *testing.T, s *Server, pool string) string {
 	return dir
 }
 
-// promotableIn lists the files in dir that promotion would consider a replica
-// of (vm, disk) — the exact predicate findReplicaHost selects the newest from.
+// promotableIn lists the replicas in dir that promotion would consider for
+// (vm, disk) in the default project — the recorded replicas findReplicaHost
+// selects the newest from.
 func promotableIn(t *testing.T, dir, vm, disk string) []string {
 	t.Helper()
-	ents, err := os.ReadDir(dir)
+	recs, err := listReplicaRecords(dir, "", vm)
 	if err != nil {
-		t.Fatalf("read dir: %v", err)
+		t.Fatalf("list replica records: %v", err)
 	}
 	var out []string
-	for _, e := range ents {
-		if isReplicaOf(e.Name(), vm, disk) {
-			out = append(out, e.Name())
+	for _, r := range recs {
+		if r.Disk == disk {
+			out = append(out, r.File)
 		}
 	}
+	return out
+}
+
+// filesUnder lists every regular file below dir, relative to it.
+func filesUnder(t *testing.T, dir string) []string {
+	t.Helper()
+	var out []string
+	_ = filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+		if err == nil && d.Type().IsRegular() {
+			rel, _ := filepath.Rel(dir, p)
+			out = append(out, rel)
+		}
+		return nil
+	})
 	return out
 }
 
@@ -68,6 +83,7 @@ func TestReplicateLocal_AFailedCopyLeavesNothingPromotable(t *testing.T) {
 
 	err := s.replicateLocalWith(context.Background(),
 		corrosion.BackupScheduleRecord{VMName: "web-1", TargetPool: "dr", KeepReplicas: 3},
+		&corrosion.VMRecord{Name: "web-1"},
 		&corrosion.DiskRecord{DiskName: "root", Path: srcPath, StorageType: "dir"},
 		"20260101-000000", tornCopy)
 
@@ -95,19 +111,12 @@ func TestReplicateLocal_AFailedCopyLeavesNoTempBehind(t *testing.T) {
 
 	_ = s.replicateLocalWith(context.Background(),
 		corrosion.BackupScheduleRecord{VMName: "web-1", TargetPool: "dr", KeepReplicas: 3},
+		&corrosion.VMRecord{Name: "web-1"},
 		&corrosion.DiskRecord{DiskName: "root", Path: srcPath, StorageType: "dir"},
 		"20260101-000000", tornCopy)
 
-	ents, err := os.ReadDir(dir)
-	if err != nil {
-		t.Fatalf("read dir: %v", err)
-	}
-	if len(ents) != 0 {
-		var names []string
-		for _, e := range ents {
-			names = append(names, e.Name())
-		}
-		t.Errorf("failed run left %v in the pool directory; nothing should remain", names)
+	if left := filesUnder(t, dir); len(left) != 0 {
+		t.Errorf("failed run left %v in the pool directory; nothing should remain", left)
 	}
 }
 
@@ -115,6 +124,12 @@ func TestReplicateLocal_AFailedCopyLeavesNoTempBehind(t *testing.T) {
 // rename" passes both tests above.
 func TestReplicateLocal_ASuccessfulCopyIsPublished(t *testing.T) {
 	s := testServer(t)
+	// A published replica is recorded as its VM's: in the data directory,
+	// from the VM's row.
+	s.dataDir = t.TempDir()
+	if err := corrosion.InsertVM(context.Background(), s.db, corrosion.VMRecord{Name: "web-1", HostName: s.hostName, State: "running"}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
 	dir := replicaPoolDir(t, s, "dr")
 	srcPath := filepath.Join(t.TempDir(), "root.qcow2")
 	if err := os.WriteFile(srcPath, []byte("source"), 0o600); err != nil {
@@ -126,12 +141,13 @@ func TestReplicateLocal_ASuccessfulCopyIsPublished(t *testing.T) {
 
 	if err := s.replicateLocalWith(context.Background(),
 		corrosion.BackupScheduleRecord{VMName: "web-1", TargetPool: "dr", KeepReplicas: 3},
+		&corrosion.VMRecord{Name: "web-1"},
 		&corrosion.DiskRecord{DiskName: "root", Path: srcPath, StorageType: "dir"},
 		"20260101-000000", goodCopy); err != nil {
 		t.Fatalf("replicateLocalWith: %v", err)
 	}
 
-	want := "web-1-root-20260101-000000.qcow2"
+	want := "root-20260101-000000.qcow2"
 	if got := promotableIn(t, dir, "web-1", "root"); len(got) != 1 || got[0] != want {
 		t.Errorf("published %v, want [%s]", got, want)
 	}
@@ -152,6 +168,7 @@ func TestReplicateLocal_AnEmptyResultIsNotPublished(t *testing.T) {
 
 	if err := s.replicateLocalWith(context.Background(),
 		corrosion.BackupScheduleRecord{VMName: "web-1", TargetPool: "dr", KeepReplicas: 3},
+		&corrosion.VMRecord{Name: "web-1"},
 		&corrosion.DiskRecord{DiskName: "root", Path: srcPath, StorageType: "dir"},
 		"20260101-000000", emptyCopy); err == nil {
 		t.Error("an empty replica was accepted")

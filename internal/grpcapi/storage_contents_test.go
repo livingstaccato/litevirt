@@ -146,8 +146,13 @@ func TestStoragePoolContents_PeerBypassesProjectRBAC(t *testing.T) {
 	if _, err := s.ListStoragePoolContents(peer, &pb.ListStoragePoolContentsRequest{PoolName: "poolB"}); err != nil {
 		t.Fatalf("peer should be allowed on poolB, got %v", err)
 	}
-	if _, err := s.DeleteStoragePoolContent(peer, &pb.DeleteStoragePoolContentRequest{PoolName: "poolB", Filename: "absent.iso"}); err != nil {
-		t.Fatalf("peer delete (absent file) should be allowed, got %v", err)
+	// A bearerless peer is the daemon (or a node that predates the content
+	// marker): it deletes as on main. A forwarded user call carries the
+	// user — see the round5 tests.
+	for _, ctx := range []context.Context{withContentView(peer, "all"), peer} {
+		if _, err := s.DeleteStoragePoolContent(ctx, &pb.DeleteStoragePoolContentRequest{PoolName: "poolB", Filename: "absent.iso"}); err != nil {
+			t.Fatalf("the daemon's own delete (absent file) should be allowed, got %v", err)
+		}
 	}
 }
 

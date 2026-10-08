@@ -253,9 +253,74 @@ image. Watch for `replication.failed` notifications: a schedule failing this
 way keeps its previous replicas and stops making new ones.
 
 A replica is also **published by rename**. The copy lands in a dotted
-`.partial` sibling and is renamed into its final name only once it has
-completed and is non-empty, so an interrupted run cannot leave a
-truncated file under a name promotion would select.
+temp sibling and is renamed into its final name only once it has completed
+and is non-empty — never over a file already there — so an interrupted run
+cannot leave a truncated file promotion would select.
+
+### Where replicas live, and how they are selected
+
+A target pool is often a global pool every project uses, so replicas are not
+plain files in it. Each VM has its own directory in the pool's daemon-owned
+replica area, and each replica a **record** beside it:
+
+```
+<pool>/.replicas/<owner>/<disk>-<YYYYMMDD-HHMMSS>.<qcow2|raw>
+<pool>/.replicas/<owner>/<disk>-<YYYYMMDD-HHMMSS>.<qcow2|raw>.json
+```
+
+The area and each owner directory are mode `0711`: a `--no-localize`
+promotion boots qemu (the distro's qemu user) on a replica there, so qemu
+must reach it by name, while no one but the daemon can list them.
+
+`<owner>` is a hash of the VM's project and name; the record names the
+project, VM, disk, format, time and the **schedule** that wrote it. Pruning
+(`--keep`), the incremental fork base and promotion select replicas only from
+the records of the VM's own project and name — never by a file-name prefix —
+and pruning only the records of the schedule that is running. A file in the
+area without a matching record is never read, forked from or deleted, and
+pruning never deletes a replica a VM disk is backed by (a `--no-localize`
+promotion records its replica as the disk's `backing_disk`). No pool-content
+RPC reaches the area: uploads refuse dotted names, listings skip directories.
+A cross-host replica is sent with its record over the peer-only `PushReplica`
+(incremental ones over `PushReplicaIncrement`, which also carries the record),
+and pruned on the peer through the peer-only `PruneReplicas`. Before a byte is
+sent, the sender asks the receiver for the VM's records (`ListReplicas`). A
+receiver on an older build (it has no `ListReplicas`) is sent the replica the
+way that build receives one: a `<vm>-<disk>-<time>.<ext>` file at its pool's
+top level (an upload, or an incremental push forked from its newest top-level
+raw replica of the disk), which its failover promotes as before; it is pruned
+there by name, to `--keep`. A receiver that cannot answer at all is sent
+nothing. During a roll, a new host also takes an older sender's record-less
+incremental push, at the pool's top level, only under the exact
+`<vm>-<disk>-<time>.raw` name of one VM disk on the cluster and forked only
+from a top-level raw replica of that disk. While any host cannot answer
+`ListReplicas`, every run that writes a replica into the area also writes the
+same data as the `<vm>-<disk>-<time>.<ext>` file at the pool's top level, so a
+failover coordinated by an older host promotes the newest replica rather than
+the last one written before the upgrade; once every host answers, runs stop
+writing it and the top-level copies are pruned. A pruned replica is never one
+a VM disk on any host references. "Every host" is the cluster's admitted
+gossip membership — the hosts replication reaches — so a host that is down,
+fenced or removed for good does not keep the copies coming; a member on an
+older build does.
+
+The owner directory is keyed by project and VM name: a VM deleted and
+re-created under the same name in the same project inherits the earlier VM's
+replicas (they can be promoted and are pruned by its schedule). No other
+project's VM ever shares the directory.
+
+A pool's content listing shows the replicas of the VMs the caller may read —
+their file name (what `--replica` takes), VM, disk and time, from their
+records — and never another project's. Replicas written by an earlier build
+as `<vm>-<disk>-<time>.<ext>` files at the pool's top level are still
+promotable: promotion and failover choose the newest of a disk's replicas from
+both places, a top-level one by its pool record, or an unrecorded one by its
+exact name ([storage.md](storage.md#uploads)). A run's `--keep` counts them
+after the area's: once the area holds `keep` replicas of the disk, the
+top-level ones are pruned too (never one a VM disk uses) — but only once every
+host answers `ListReplicas`. While any host is on an older build, or cannot
+be asked, the top-level replicas are kept to `keep` as that build kept them,
+since its failover coordinator sees nothing else.
 
 Manage it from the **Replication** section of the `/schedules` UI or the CLI:
 
@@ -284,9 +349,11 @@ to a full copy for a stopped VM / old libvirt / broken chain.
 ### Promotion (disaster recovery)
 
 A replica is inert until promoted. `lv replication promote <vm>` brings a VM up
-from its newest replica — locating it (from the VM's schedule, or `--pool`/
-`--host`), copying it into a self-contained live disk on the host that holds it,
-and defining + starting the VM there:
+from its newest recorded replica — locating it (from the VM's schedule, or
+`--pool`/`--host`), copying it into a self-contained live disk on the host that
+holds it, and defining + starting the VM there. `--replica` names one by its
+file name (`<disk>-<time>.<ext>`, as the `disk.replicated` event reports it);
+it must be one of the VM's own recorded replicas:
 
 ```bash
 lv replication promote web-1                 # take over the name (host-loss case)
@@ -339,7 +406,6 @@ lv backup restore-live \
     --repo /srv/backup/main \
     --vm postgres-1 --disk root \
     --timestamp 2026-05-11T02:15:00Z \
-    --target-path /var/lib/libvirt/images/postgres-live.qcow2 \
     --name postgres-restored \
     --auto-start --blockpull
 ```
@@ -466,8 +532,93 @@ the VM's project via path RBAC, and quota-aware:
 - restore with **`lv backup restore-from`** (→ `RestoreFromBackup`) or
   **`lv backup restore-live`** (→ `RestoreLive`).
 
-Restore destinations are a pool-relative filename by default; a custom absolute
-`target_path` (and a custom absolute `repo_path`) require the **admin** role.
+### Where a restore writes
+
+A restore never replaces a file it was merely told the name of. `<data_dir>/disks`
+holds the disks of every project on the host, so a caller-chosen name there was
+a way to overwrite another project's VM disk.
+
+- **No `--target-path`** (the default): the daemon writes a new file of its own
+  under `<data_dir>/disks` — `<vm>-<disk>-restore-<time>-<id>.img`, or
+  `<vm>-<disk>-live-<time>-<id>.qcow2` for a live-restore overlay — and reports
+  it (`target_path` in the DONE frame, the READY frame for `restore-live`).
+- **`--in-place`** (`restore-from` only, `in_place` on the RPC): restore over
+  the disk the VM's own record names. The VM must be in the backup's project,
+  on the daemon's host, stopped, without snapshots, in a pool that passes the
+  pool write check, and the file must be that disk's alone — no disk row on
+  ANY host may use it. This is the only restore that replaces a file, and its
+  path comes from the record, not the request.
+
+  The backup's bytes are never placed as the disk; the restore rebuilds a
+  **new** qcow2 from them, with the source format named and never probed, and
+  swaps it in. What the bytes are is the backup's `content_format`: `raw` for
+  a running VM's guest content (read over NBD), `disk-file` for a stopped VM's
+  image file. A backup written before formats were recorded is classified from
+  what the daemon wrote into its manifest — a guest-content backup always
+  carries its checkpoint, a disk-file backup never does — never from its bytes;
+  a container archive is refused.
+
+  - **Raw guest content** (`qemu-img convert -f raw`) becomes a standalone
+    disk. The guest controls every byte, so a qcow2 header it planted in
+    sector 0 is restored as data, never followed.
+  - **A disk file** (`-f qcow2`) has its header judged first — no external
+    data file, one backing format. Whether it is restored as an overlay is
+    the backup's own header: a standalone backup is restored standalone. An
+    overlay backup keeps the backing of the disk it replaces, never one the
+    backup names: a **linked clone** stays an overlay on its base, a
+    **`--no-localize` promoted VM** on its replica, a **disk created from an
+    image** on that image. That backing is the disk's CURRENT image header's,
+    resolved through symlinks, judged like every chain a copy reads (see
+    *Storage*: the image store, the recorded `backing_disk`, a pool the VM's
+    project may use, a file the project owns by record), every layer
+    pre-checked down to a standalone base; the disk's record (`backing_disk`,
+    `backing_image`) must agree with it — `backing_image` with any version of
+    that image. Its format
+    comes from a record — a replica's own record, `qcow2` for an image or a
+    VM's disk — and must match what the disk declares; it is never read from
+    the bytes. A VM an earlier build promoted with `--no-localize` has no
+    record of its replica (raw or qcow2, in its pool's directory or the
+    default pool's `<data_dir>/disks`): there the layout the promotion made
+    stands in for one — the overlay named `<vm>-promoted-<replica stem>`, the
+    replica named by that stem and the format it declares, of the row's own
+    disk, unclaimed by any disk row and by any other project's record — the
+    same test a start of that VM passes. The base must be the one the backup was taken on: a backup
+    records its base's path, size and sha256 (`base_identity`), and a
+    restore onto a base that has changed since is refused, naming both. A
+    backup taken before that was recorded is restored onto a base that cannot
+    change under its name (a replica, a template's disk), and onto an image
+    only when the provenance of the very file the disk is built on shows it
+    unchanged since the backup: that file was written on this host no later
+    than the backup, and its bytes still have the sha256 recorded for it.
+    Each image-store file carries that record (`<file>.sha256`); a file an
+    earlier build left is given one when first seen — its sha256 then, and
+    the later of this host's pull time for the image and the file's mtime.
+    A refresh of the image name, here or on another host, writes another
+    file and does not affect it. Otherwise it is
+    refused, saying which, and restoring to a new file still works. That
+    includes a file an earlier build re-pulled after the backup with
+    byte-identical content: the pull moved the file's mtime and the pull
+    time, and nothing recorded that the bytes stayed the same, so it cannot
+    be told from a pull that changed them. Restore such a backup to a new
+    file instead, which writes the backed-up bytes untouched. The
+    restored header is re-pointed to the backing without opening
+    what the backup named (`qemu-img rebase -u`), and the rebuilt overlay must
+    name exactly that backing. An overlay backup of a disk that is now
+    standalone (flattened by a move since) is rebuilt **flat** from the backup
+    and the base it recorded — when that base still exists where the disk's
+    chain may read from (the base's path in the backup is never trusted on
+    its own), with the recorded size and sha256 — and the result must be
+    standalone; the disk's record then names no backing. A missing, moved or changed base is
+    refused, saying which; restoring to a new file still works.
+
+  The restore streams into a temp beside the disk and rebuilds next to it, so
+  it needs room for about twice the disk in that directory while it runs.
+- **`--target-path`**: names the file. It needs `storage.hostpath` — the
+  **admin** role — whether it is a bare name (under `<data_dir>/disks`) or an
+  absolute path, and an existing file there is refused with `AlreadyExists`,
+  for an admin too.
+
+A custom absolute `repo_path` also requires the **admin** role.
 
 ## gRPC + WebUI
 

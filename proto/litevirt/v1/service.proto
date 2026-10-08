@@ -582,7 +582,9 @@ message ReplicateVolumeRequest {
     string vm_name      = 1;
     string disk_name    = 2;
     string target_pool  = 3;
-    // target_path overrides the auto-derived "<vm>-<disk>.qcow2" filename.
+    // target_path names the destination file instead of the daemon-derived
+    // "<vm>-<disk>-copy-<time>-<id>.qcow2". Admin only, and never an existing
+    // file.
     string target_path  = 4;
 }
 message ReplicateVolumeProgress {
@@ -675,6 +677,11 @@ message ImportImageRequest { string name = 1; string format = 2;
 message ImportImageResponse { string name = 1; int64 size_bytes = 2;
     string checksum = 3; }
 message PushImageRequest   { string name = 1; string target_host = 2; }
+// PruneImagesRequest removes, on one host, the image-store files no disk there
+// is built on (each image's current file is always kept). name empty: every
+// image. host_name empty: the host serving the call.
+message PruneImagesRequest { string name = 1; string host_name = 2; bool dry_run = 3; }
+message PruneImagesResponse { string host_name = 1; repeated string removed = 2; int64 freed_bytes = 3; }
 message PushImageProgress  { string status = 1; float progress_pct = 2;
     string error = 3; }
 message BuildImageRequest  { string vm_name = 1; string image_name = 2; }
@@ -1001,7 +1008,14 @@ message RestoreFromBackupRequest {
     string vm_name       = 2;  // manifest selector
     string disk_name     = 3;
     string timestamp     = 4;  // exact RFC3339 of manifest
-    string target_path   = 5;  // where to write the restored disk
+    // target_path names the file to write, admin only, and never an existing
+    // file. Empty: the daemon picks a fresh file under <data_dir>/disks and
+    // reports it in the DONE frame.
+    string target_path   = 5;
+    // in_place restores over the disk the VM's own record names (vm_name,
+    // disk_name). The VM must be in the backup's project, on this host and
+    // stopped. Exclusive with target_path.
+    bool   in_place      = 6;
 }
 message RestoreFromBackupProgress {
     enum Phase {
@@ -1015,6 +1029,7 @@ message RestoreFromBackupProgress {
     int32  chunks_total  = 4;
     string status        = 5;
     string error         = 6;
+    string target_path   = 7;  // the file written, on DONE
 }
 
 // ── Backup repository maintenance ──
@@ -1458,6 +1473,9 @@ message RestoreLiveRequest {
     string vm_name    = 2;
     string disk_name  = 3;
     string timestamp  = 4;
+    // target_path names the overlay file, admin only, and never an existing
+    // file. Empty: the daemon picks a fresh file under <data_dir>/disks and
+    // reports it as RestoreLiveProgress.target_path.
     string target_path = 5;
     // bind_addr controls the address the NBD server listens on.
     // Empty defaults to "127.0.0.1:0" — localhost-only, ephemeral
@@ -1711,6 +1729,13 @@ message StoragePoolContent {
     int64  size_bytes  = 3;
     string modified_at = 4; // RFC3339
     bool   is_iso      = 5; // .iso extension
+    // Set for a replica: the VM and disk it is a replica of, and its time. A
+    // listing shows only the replicas of VMs the caller may read, from their
+    // records in the pool's replica area; name is what PromoteReplica.replica
+    // takes.
+    string replica_vm    = 6;
+    string replica_disk  = 7;
+    string replica_taken = 8;
 }
 message ListStoragePoolContentsRequest {
     string pool_name = 1;
@@ -1725,18 +1750,92 @@ message UploadStoragePoolContentRequest {
     string host      = 2; // optional — defaults to caller's host
     string filename  = 3; // base name only (no path separators)
     bytes  chunk     = 4;
+    // 5 carried a replica record on an earlier build of this branch. Replicas
+    // now go only through the peer-only PushReplica, and a header carrying
+    // any field the receiver does not know is refused.
+    reserved 5;
 }
 message UploadStoragePoolContentResponse {
     string path       = 1;
     int64  size_bytes = 2;
+    reserved 3;
 }
-// Delete one file from a file-based pool (used by cross-host replication to
-// prune old replicas on a peer). filename is a base name.
+
+// Client-streaming replica push (cross-host replication), peer only. The
+// first message is the header (pool_name/host/replica, no chunk); the rest
+// carry chunks. The receiver writes a NEW file replica.file into the
+// replica area of (replica.project, replica.vm) and its record beside it.
+// A dedicated RPC rather than an upload field, so an entry node on an older
+// build — which has no handler for it — can never forward one for a user.
+message PushReplicaRequest {
+    string        pool_name = 1; // header
+    string        host      = 2; // header — optional, defaults to the receiver
+    ReplicaRecord replica   = 3; // header
+    bytes         chunk     = 4;
+}
+message PushReplicaResponse {
+    string path       = 1;
+    int64  size_bytes = 2;
+}
+// Delete one file from a file-based pool. filename is a base name. A file any
+// VM disk on any host uses is refused. (Replicas are pruned with the
+// peer-only PruneReplicas, by record, not through this.)
 message DeleteStoragePoolContentRequest {
-    string pool_name = 1;
-    string host      = 2; // optional — defaults to caller's host
-    string filename  = 3;
+    string pool_name  = 1;
+    string host       = 2; // optional — defaults to caller's host
+    string filename   = 3;
+    // A replica in the pool's replica area, as a listing shows it: the VM it
+    // is a replica of (StoragePoolContent.replica_vm). Optional while only one
+    // replica the caller may delete has that file name; needed when replicas
+    // of several VMs share it (one schedule's fan-out run).
+    string replica_vm = 4;
 }
+
+// One ISO a VM may name, as the reference VMSpec.iso takes.
+message ISOEntry {
+    string ref        = 1; // <pool>/<file>
+    string pool       = 2;
+    string project    = 3; // owning project; empty for the global library
+    string name       = 4;
+    int64  size_bytes = 5;
+    bool   global     = 6; // in the cluster-global library ("isos")
+    // Global library in sync mode only: "ok" when this host's copy matches the
+    // library, "syncing" while it does not yet, "not in library" for a file the
+    // library has no record of (a VM cannot start from it).
+    string sync_state = 7;
+}
+message ListISOsRequest {
+    string host    = 1; // optional — defaults to the answering host
+    string project = 2; // optional — only this project's libraries (plus the global one)
+}
+message ListISOsResponse { repeated ISOEntry isos = 1; }
+
+message PullISORequest {
+    string ref       = 1; // <pool>/<file>.iso — the library and the name to store it under
+    string host      = 2; // optional — the host whose pool receives it; defaults to the answering host
+    string url       = 3; // http(s) source; exactly one of url / host_path
+    string host_path = 4; // absolute path on that host (Admin: storage.hostpath at /)
+    string checksum  = 5; // optional sha256 the copy must match ("sha256:" prefix optional)
+}
+message PullISOResponse {
+    string ref        = 1;
+    string sha256     = 2;
+    int64  size_bytes = 3;
+}
+
+message ISOLibraryMode {
+    string mode       = 1; // sync | shared
+    string set_by     = 2;
+    string updated_at = 3;
+    bool   settable   = 4; // false until failover_scope_v1 has latched on every host
+}
+message SetISOLibraryModeRequest { string mode = 1; }
+
+message FetchISOLibraryFileRequest {
+    string name   = 1; // file name in the global library
+    string sha256 = 2; // the copy is served only if it matches
+}
+message FetchISOLibraryFileChunk { bytes chunk = 1; }
 
 // Client-streaming incremental replica push. The first message is the header
 // (pool/host/filename/base/total_size); subsequent messages each carry one
@@ -1748,16 +1847,55 @@ message DeleteStoragePoolContentRequest {
 message PushReplicaIncrementRequest {
     string pool_name  = 1; // header
     string host       = 2; // header — optional, defaults to caller
-    string filename   = 3; // header — new replica base name
-    string base       = 4; // header — previous replica to fork from; "" = full
+    string filename   = 3; // header — new replica base name; must equal replica.file
+    string base       = 4; // header — a RECORDED replica of the same disk and schedule to fork from; "" = full
     int64  total_size = 5; // header — raw file virtual size
     int64  offset      = 6; // extent
     bytes  data        = 7; // extent
+    ReplicaRecord replica = 8; // header — required: the new replica's record
 }
 message PushReplicaIncrementResponse {
     string path          = 1;
     int64  bytes_written = 2;
+    bool   replica_recorded = 3;
 }
+
+// A replica's record. Replicas live in a daemon-owned area of the pool, one
+// directory per (project, vm), each file beside its record. Replication
+// lists, prunes and forks from, and promotion boots, only files that have a
+// record naming the caller's own project and VM — never a file matched by
+// name — so a pool every project shares cannot be used to read, overwrite or
+// delete another project's replicas or disks.
+message ReplicaRecord {
+    string project    = 1; // normalized project of the VM
+    string vm         = 2;
+    string disk       = 3;
+    string schedule   = 4; // the schedule that wrote it: "<schedule row vm_name>/<repo>"
+    string file       = 5; // "<disk>-<taken>.<format>", a base name in the owner directory
+    string format     = 6; // qcow2 | raw
+    string taken      = 7; // UTC run time, 20060102-150405
+    int64  size_bytes = 8; // set by ListReplicas
+}
+// Peer only. The replica records of one VM in a pool on host.
+message ListReplicasRequest {
+    string pool_name = 1;
+    string host      = 2; // optional — defaults to the receiver
+    string project   = 3;
+    string vm        = 4;
+}
+message ListReplicasResponse { repeated ReplicaRecord replicas = 1; }
+// Peer only. Keep the newest `keep` replicas one schedule recorded for one disk
+// of one VM; delete the older ones, never a file a VM disk references.
+message PruneReplicasRequest {
+    string pool_name = 1;
+    string host      = 2;
+    string project   = 3;
+    string vm        = 4;
+    string disk      = 5;
+    string schedule  = 6;
+    int32  keep      = 7;
+}
+message PruneReplicasResponse { int32 deleted = 1; }
 
 // ── Failover promotion (recover a VM from a replica) ──
 // RuntimeActionProof is the single-use authorization a coordinator (holding the
@@ -2343,6 +2481,21 @@ message EnsureDisksRequest {
     // credentials into QEMU's TLS directory before the copy, and to report in
     // migration_tls_ready whether it could.
     bool want_migration_tls = 3;
+    // installer_iso_listed: the source sent installer_iso_paths (a source on an
+    // older build never sets it). installer_iso_paths are the installer CD-ROM
+    // paths the source's domain carries; empty means it carries none.
+    // installer_iso_runtime: the domain moves by libvirt runtime migration: the
+    // target resolves the VM's ISO itself and returns the file it judged for
+    // each path (installer_iso_resolved), which the destination definition the
+    // source hands libvirt carries.
+    bool installer_iso_listed = 4;
+    repeated string installer_iso_paths = 5;
+    bool installer_iso_runtime = 6;
+    // installer_iso_sha256: for the installer CD-ROM path whose file the
+    // source judged for this VM (through its pool), that file's sha256. On a
+    // VM's first arrival in a directory another project's pool also maps, the
+    // target admits only a file with these very bytes.
+    map<string, string> installer_iso_sha256 = 7;
 }
 
 message DiskStub {
@@ -2360,6 +2513,17 @@ message EnsureDisksResponse {
     // for QEMU, so the copy can be encrypted. An older target never sets it,
     // which reads as "not ready" and falls back to the plaintext guard.
     bool migration_tls_ready = 2;
+    // installer_iso_warning: a stopped VM's move was accepted although this
+    // host cannot attach its installer ISO yet (no such library or file here);
+    // the VM will not start here until it can. Empty otherwise.
+    string installer_iso_warning = 3;
+    // installer_iso_resolved: for a runtime migration, each listed installer
+    // CD-ROM path → the file this host resolved and judged for it. The source
+    // hands libvirt a destination definition with those sources, so qemu here
+    // opens this host's file (a link or a library directory can name another
+    // file here than on the source). An older target never sets it: the
+    // source then migrates the domain unchanged, as before.
+    map<string, string> installer_iso_resolved = 4;
 }
 
 // EnsureFirmwareStateRequest pushes a Secure-Boot/vTPM VM's firmware-state bundle
@@ -2555,6 +2719,11 @@ message TableDigest {
 message StateDigestResponse {
     string host_name                = 1;
     repeated TableDigest tables     = 2;
+    // True when this node's replica is seeded — it holds the cluster's history
+    // (corrosion/audit_seeded.go) — and it is not holding its own audit rows. A
+    // peer that completes an exchange with it becomes seeded too. An older node
+    // sends nothing, which reads as not seeded.
+    bool audit_seeded               = 3;
 }
 
 // TriggerAntiEntropy kicks an immediate anti-entropy pass (rather than waiting for the
@@ -2842,6 +3011,27 @@ message AdmitHostRequest {
     string cert_serial = 3;
 }
 
+// AdmitHostResponse carries what the admitting node knows of the name's audit
+// chain: the last seq a host under this name wrote, and that row's content hash.
+// Both are zero for a name with no history. `lv host add` signs them with the
+// cluster CA and hands them to the new machine, whose daemon holds its own audit
+// rows until its replica has that row — so a host rebuilt under an old name
+// continues its chain instead of starting a second one. Replaces
+// google.protobuf.Empty, which is wire-compatible: an older daemon's empty
+// response reads as "no history", and an older CLI ignores the fields.
+message AdmitHostResponse {
+    int64 audit_tail_seq = 1;
+    string audit_tail_hash = 2;
+    // True when the answering daemon vouches for the position: its replica has
+    // caught up with a peer (or it founded a cluster it is alone in), it is not
+    // itself holding its own audit rows, and the name's tail is not below a CA
+    // retirement it knows of. A daemon that cannot vouch refuses instead, so
+    // false means a daemon too old to say — and `lv host add` then leaves any
+    // admission record already on the machine alone rather than remove it on a
+    // "no history" it cannot trust.
+    bool audit_position_proven = 3;
+}
+
 // ── Host network configuration (schema v48, §O Tier 1) ──
 // Declarative per-host interface intent, rendered by the OWNING host into the
 // single litevirt-managed netplan file behind a journaled apply-with-rollback.
@@ -2920,7 +3110,7 @@ service LiteVirt {
     rpc GetClusterHealth(GetClusterHealthRequest) returns (ClusterHealth);
     rpc GetFenceReadiness(google.protobuf.Empty)  returns (FenceReadiness);
     rpc RemoveHost(RemoveHostRequest)          returns (google.protobuf.Empty);
-    rpc AdmitHost(AdmitHostRequest)            returns (google.protobuf.Empty);
+    rpc AdmitHost(AdmitHostRequest)            returns (AdmitHostResponse);
     // Host network configuration (v48): intent CRUD runs anywhere (replicated
     // rows); Plan and Apply are forwarded to the OWNING host — they read and
     // mutate its local netplan state.
@@ -3031,6 +3221,7 @@ service LiteVirt {
     rpc ImportImage(stream ImportImageRequest)  returns (ImportImageResponse);
     rpc PushImage(PushImageRequest)            returns (stream PushImageProgress);
     rpc BuildImage(BuildImageRequest)          returns (BuildImageResponse);
+    rpc PruneImages(PruneImagesRequest)        returns (PruneImagesResponse);
 
     // ── Backup ──
     rpc BackupVM(BackupVMRequest)              returns (stream BackupChunk);
@@ -3228,8 +3419,32 @@ service LiteVirt {
     rpc RemoveSecurityGroupRule(RemoveSecurityGroupRuleRequest)     returns (google.protobuf.Empty);
     rpc ListSecurityGroups(ListSecurityGroupsRequest)               returns (ListSecurityGroupsResponse);
     rpc DeleteStoragePoolContent(DeleteStoragePoolContentRequest) returns (google.protobuf.Empty);
+
+    // ── ISO libraries (docs/storage.md, "Installer ISOs") ──
+    // A VM names its installer ISO as <pool>/<file>.iso. ListISOs lists what
+    // the caller may name on a host: its projects' libraries, then the
+    // cluster-global library "isos".
+    rpc ListISOs(ListISOsRequest)                       returns (ListISOsResponse);
+    // PullISO copies an ISO into a library from a URL (the image-pull limits
+    // apply) or, for an Admin, from a host path. A copy, never a link.
+    rpc PullISO(PullISORequest)                         returns (PullISOResponse);
+    // GetISOLibraryMode / SetISOLibraryMode: where the global library lives —
+    // "sync" (a verified copy on every host) or "shared" (one pool on shared
+    // storage). Setting it needs the admin role and failover_scope_v1.
+    rpc GetISOLibraryMode(google.protobuf.Empty)        returns (ISOLibraryMode);
+    rpc SetISOLibraryMode(SetISOLibraryModeRequest)     returns (ISOLibraryMode);
+    // Peer-only: stream this host's copy of a global-library file whose sha256
+    // matches, so another host can sync it.
+    rpc FetchISOLibraryFile(FetchISOLibraryFileRequest) returns (stream FetchISOLibraryFileChunk);
     // Incremental replica push (dirty extents into a raw replica on a peer pool).
     rpc PushReplicaIncrement(stream PushReplicaIncrementRequest) returns (PushReplicaIncrementResponse);
+    // Peer only: one VM's replica records in a pool (promotion, incremental fork
+    // base, and a sender's proof that the receiver records replicas).
+    rpc ListReplicas(ListReplicasRequest) returns (ListReplicasResponse);
+    // Peer only: a full replica, written and recorded in the replica area.
+    rpc PushReplica(stream PushReplicaRequest) returns (PushReplicaResponse);
+    // Peer only: prune one schedule's recorded replicas of one disk.
+    rpc PruneReplicas(PruneReplicasRequest) returns (PruneReplicasResponse);
 
     // ── Internal ──
     rpc Ping(PingRequest) returns (PingResponse);
@@ -3501,6 +3716,24 @@ service LiteVirt {
     // ever terminates a capacity operation targeting the local host.
     rpc ReserveHostCapacity(ReserveHostCapacityRequest) returns (ReserveHostCapacityResponse);
     rpc ReleaseHostCapacity(ReleaseHostCapacityRequest) returns (google.protobuf.Empty);
+
+    // ── Import leftovers on shared pools (peer-only) ──
+    //
+    // A host re-importing over a file in a pool it shares with other hosts asks
+    // them whether their own placement record shows that file as a leftover of
+    // a dead import of theirs, unchanged since. The answer comes from the
+    // answering host's record alone: it never opens a path the caller names.
+    rpc ImportLeftoverStatus(ImportLeftoverStatusRequest) returns (ImportLeftoverStatusResponse);
+
+    // ── Re-create judgement (peer-only) ──
+    //
+    // A rebuild or a rolling recreate of a VM with an installer ISO places the
+    // new VM before it tears the old one down, and asks the host placement
+    // chose to judge the spec as its create there will — as the relayed
+    // caller, with the VM's own ISO grant — so a refusal leaves the VM intact.
+    // A host on an older build answers Unimplemented; its create judges no
+    // installer ISO.
+    rpc PreflightRecreateVM(PreflightRecreateVMRequest) returns (google.protobuf.Empty);
 }
 
 // Pre-flight check before `lv host upgrade`. Surfaces in-flight work,
@@ -4150,4 +4383,35 @@ message FenceEvent {
     string assurance = 4;
     string timestamp = 5;  // RFC3339
     string detail = 6;
+}
+
+// ── Import leftovers on shared pools ──
+//
+// Appended at the end of the file, like the fence messages above, so existing
+// message indexes stay stable.
+// One file in the pool, as the asking host sees it.
+message ImportLeftoverFile {
+    // A plain file name in the pool's directory: no '/', not "." or "..".
+    string name     = 1;
+    uint64 ino      = 2;
+    int64  size     = 3;
+    int64  mtime_ns = 4;
+    // 0 where the asking host's platform reports none.
+    int64  ctime_ns = 5;
+}
+message ImportLeftoverStatusRequest {
+    // The pool, by name, as both hosts know it (a shared pool).
+    string pool = 1;
+    repeated ImportLeftoverFile files = 2;
+}
+message ImportLeftoverStatusResponse {
+    // The names, among those asked, that the answering host's record shows a
+    // dead import of its own left there, in exactly the asked state.
+    repeated string dead = 1;
+}
+
+// PreflightRecreateVMRequest is the spec of a VM about to be re-created on the
+// answering host, as the asking host classified it (iso_scope included).
+message PreflightRecreateVMRequest {
+    VMSpec spec = 1;
 }

@@ -659,8 +659,18 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 
 	// Live migrate — every disk is on shared storage. (Ownership confirmed above.)
 	progress := &pb.DrainProgress{VmName: vm.Name, TargetHost: target.Name, Strategy: pb.MigrateStrategy_MIGRATE_LIVE}
+	// The target's qemu opens the installer ISO from its own filesystem: the
+	// target judges that file first (EnsureDisks with no stubs does only that).
+	// Where it resolves the ISO to another file (a link, a library
+	// directory), the destination definition carries that file.
+	_, _, cdromSources, ierr := s.ensureDisksOnTargetISO(ctx, target.Name, vm.Name, nil, false, true)
+	if ierr != nil {
+		progress.Status = "error"
+		progress.Error = "target refused the installer ISO: " + ierr.Error()
+		return progress
+	}
 	dconnuri := fmt.Sprintf("qemu+tls://%s/system", corrosion.URIHost(target.Address))
-	lerr := s.virt.MigrateToTarget(vm.Name, dconnuri, libvirt.MigrateParams{Live: true})
+	lerr := s.virt.MigrateToTarget(vm.Name, dconnuri, libvirt.MigrateParams{Live: true, CDROMSources: cdromSources})
 	if lerr == nil {
 		// Phase 4: drain move is an ownership transition (fresh-read CAS + increment).
 		//runningcheck:allow ownership handoff — this commit names the TARGET host while
@@ -1137,7 +1147,14 @@ func (s *Server) RemoveHost(ctx context.Context, req *pb.RemoveHostRequest) (*em
 // 'active' row for a machine with no daemon yet was a fence candidate as soon
 // as the observers' probes found nothing listening, and the coordinator
 // powered the machine off part-way through its setup (kvm003 drill 6).
-func (s *Server) AdmitHost(ctx context.Context, req *pb.AdmitHostRequest) (*emptypb.Empty, error) {
+//
+// The response carries the name's audit chain position on this node (the last
+// seq and its hash), which `lv host add` signs and hands to the new machine so
+// it does not append to its own chain before that history has reached it
+// (corrosion/audit_hold.go). It is read from THIS replica, which therefore has
+// to be able to vouch for it (auditAdmissionPosition), or the admission is
+// refused.
+func (s *Server) AdmitHost(ctx context.Context, req *pb.AdmitHostRequest) (*pb.AdmitHostResponse, error) {
 	if err := RequireRole(ctx, "admin"); err != nil {
 		return nil, err
 	}
@@ -1163,6 +1180,10 @@ func (s *Server) AdmitHost(ctx context.Context, req *pb.AdmitHostRequest) (*empt
 				"remove the workload (`lv rm <vm>`, `lv ct rm <name>`). Then add the host again",
 			req.Name, len(left), strings.Join(left, ", "))
 	}
+	tailSeq, tailHash, err := s.auditAdmissionPosition(ctx, req.Name)
+	if err != nil {
+		return nil, err
+	}
 	err = corrosion.AdmitHost(ctx, s.db, corrosion.HostRecord{
 		Name:       req.Name,
 		Address:    req.Address,
@@ -1176,7 +1197,7 @@ func (s *Server) AdmitHost(ctx context.Context, req *pb.AdmitHostRequest) (*empt
 		return nil, status.Errorf(codes.FailedPrecondition, "admit host: %v", err)
 	}
 	s.publish("host.admitted", req.Name, "cert_serial="+req.CertSerial)
-	return &emptypb.Empty{}, nil
+	return &pb.AdmitHostResponse{AuditTailSeq: tailSeq, AuditTailHash: tailHash, AuditPositionProven: true}, nil
 }
 
 // hostAllocatedResources returns running-VM CPU and memory, and the DECLARED

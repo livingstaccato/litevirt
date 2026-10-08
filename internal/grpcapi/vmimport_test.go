@@ -11,6 +11,9 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/vmimport"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func qemuImg(t *testing.T, args ...string) {
@@ -34,7 +37,7 @@ func TestConvertForeignDisk_VMDKRoundTrip(t *testing.T) {
 	qemuImg(t, "create", "-f", "qcow2", base, "16M")
 	qemuImg(t, "convert", "-O", "vmdk", "-o", "subformat=streamOptimized", base, vmdk)
 
-	if err := convertForeignDisk(context.Background(), vmdk, "vmdk", out, dir, nil); err != nil {
+	if err := convertForeignDisk(context.Background(), vmdk, "vmdk", out, dir, 1<<40, nil, nil); err != nil {
 		t.Fatalf("convertForeignDisk: %v", err)
 	}
 	info, err := qcow2.Info(out)
@@ -77,7 +80,7 @@ func TestConvertForeignDisk_HardFailsWithoutQemuImg(t *testing.T) {
 	dir := t.TempDir()
 	src := filepath.Join(dir, "x.raw")
 	os.WriteFile(src, []byte("not a real disk"), 0o600)
-	err := convertForeignDisk(context.Background(), src, "raw", filepath.Join(dir, "out.qcow2"), dir, nil)
+	err := convertForeignDisk(context.Background(), src, "raw", filepath.Join(dir, "out.qcow2"), dir, 1<<40, nil, nil)
 	if err == nil {
 		t.Fatal("expected hard failure without qemu-img, got nil")
 	}
@@ -160,5 +163,37 @@ func TestImportRecords_BuildsNICRecords(t *testing.T) {
 	}
 	if n.TapDevice != "" {
 		t.Errorf("nics[0].TapDevice = %q, want empty at import (assigned at start, not import)", n.TapDevice)
+	}
+}
+
+// A pool-less import writes "<vm>-<disk>.qcow2" into <data_dir>/disks, which
+// holds every project's pool-less disks. A file already there — another VM's
+// disk — is refused, never replaced, and nothing is left behind.
+func TestConvertForeignDisk_NeverReplacesAnExistingFile(t *testing.T) {
+	if !qemuImgAvailable() {
+		if os.Getenv("CI") != "" {
+			t.Fatal("qemu-img is required in CI")
+		}
+		t.Skip("qemu-img not installed")
+	}
+	dir := t.TempDir()
+	src := filepath.Join(dir, "in.raw")
+	if err := os.WriteFile(src, make([]byte, 1<<20), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(dir, "a-b-root.qcow2")
+	if err := os.WriteFile(dst, []byte("project B's disk"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := convertForeignDisk(context.Background(), src, "raw", dst, dir, 1<<30, nil, nil)
+	if status.Code(err) != codes.AlreadyExists {
+		t.Errorf("import onto an existing file: got %v, want AlreadyExists", err)
+	}
+	if got, _ := os.ReadFile(dst); string(got) != "project B's disk" {
+		t.Errorf("the existing file was replaced (%d bytes)", len(got))
+	}
+	ents, _ := os.ReadDir(dir)
+	if len(ents) != 2 {
+		t.Errorf("a refused import left %d entries, want the source and the existing file only", len(ents))
 	}
 }

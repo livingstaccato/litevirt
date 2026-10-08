@@ -77,7 +77,7 @@
             <div class="form-row">
               <label>Installer ISO <span style="color:var(--muted)">(optional)</span></label>
               <div style="display:flex;gap:6px">
-                <input type="text" name="iso" placeholder="/var/lib/litevirt/isos/debian-12.iso" style="flex:1">
+                <input type="text" name="iso" placeholder="isos/debian-12.iso" title="An ISO from a library, as pool/file.iso" style="flex:1">
                 <button type="button" class="btn" hx-get="/ui/storage/iso-browser?field=iso" hx-target="body" hx-swap="beforeend">Browse…</button>
               </div>
             </div>

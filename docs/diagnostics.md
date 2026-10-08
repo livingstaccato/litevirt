@@ -1427,6 +1427,52 @@ holder writes.
   a destroyed domain whose row moved. Otherwise leave the local copy running.
   The condition resolves once the copy is no longer declined.
 
+### Audit chain held (`audit_chain_held`)
+
+A host re-added under a name with audit history raises `audit_chain_held` about
+**itself** while it holds its own audit rows until that history has reached it
+from its peers ([audit-log.md](audit-log.md#rebuilding-a-host-under-its-old-name)).
+Its audit rows are durable in its local spool but are not yet in the cluster's
+audit log, so `lv audit ls` elsewhere does not show what was done on it.
+
+| Raised when | Clears when |
+|---|---|
+| The host's admission record (`<pki_dir>/audit-rejoin.json`) names a row of its chain its replica does not hold; re-raised once a minute while held. **Warning**; **critical** once the hold is full (10000 rows), when the host refuses every audited client action and login with `Unavailable`. The evidence carries `held_rows` and `waiting_for`. | The recorded row, and a row at every seq below it, have arrived, and every held row has landed. |
+
+**If it does not clear,** the host cannot reach a peer holding its history:
+check `lv health` for replication and gossip, and that the survivors are
+reachable from it. `waiting_for` saying the row "does not hash" means the
+replica holds a different history than the cluster had for the name — the
+hold stays closed rather than fork the chain; investigate before anything else.
+`waiting_for` naming a missing seq means the row below the recorded one has not
+arrived; if no node holds it, the history has a gap and the hold cannot open by
+itself. If no node will ever hold the history, removing `<pki_dir>/audit-rejoin.json`
+on the host and restarting its daemon ends the hold at the cost of a permanent
+fork finding for that host
+([audit-log.md](audit-log.md#rebuilding-a-host-under-its-old-name)).
+
+### Audit replica not seeded (`audit_not_seeded`)
+
+A node whose replica is not known to hold the cluster's history raises
+`audit_not_seeded` about **itself**. `lv host add` run against it is refused,
+because the audit chain position it would hand the new machine may be missing
+history ([audit-log.md](audit-log.md#rebuilding-a-host-under-its-old-name)).
+Run `lv host add` against a node without this condition.
+
+| Raised when | Clears when |
+|---|---|
+| The daemon starts on a replica that is not seeded, and every 30 s after that. **Info** for the ordinary case: a node that has just joined and has not yet completed an exchange with a seeded node on this build. **Warning**, with an error line, when `<data_dir>/audit-seeded.json` exists but cannot be read or written; the node then stays not seeded (it fails closed). The evidence carries `problem`. | The replica becomes seeded: an anti-entropy exchange with a seeded node that is not holding its own audit rows. |
+
+**If it does not clear,** check that a seeded node on this build is reachable;
+a node on an older build cannot seed one. With `problem` set, fix or remove the
+marker file and restart; while the marker cannot be written, the node also
+holds its own audit rows (`audit_chain_held`). If no node in the cluster is
+seeded, see "No seeded node" in
+[audit-log.md](audit-log.md#rebuilding-a-host-under-its-old-name): root asserts
+with the `assert_nonce` in the node's marker, which neither this condition, the
+log, nor any RPC shows, and which a marker with `problem` set does not have. The
+condition row is rewritten only when what it says changes.
+
 ### Observer stalled (`observer_stalled`)
 
 A node that was itself not running — its VM suspended, swapped out, or starved

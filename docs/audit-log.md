@@ -183,7 +183,11 @@ grouped by what it means:
   host's key. This is the finding that survives a reseal.
 - **unknown key** — the signer has no published certificate that chains to the
   cluster CA.
-- **sequence gap** — a run of rows was deleted from one host's chain.
+- **sequence break** — a jump in one host's numbering (a run of rows was
+  deleted from its chain), or a **duplicate**: two rows claiming the same seq,
+  which is a forked chain — a second writer, or a host that appended to a
+  replica still missing its own history (see "Rebuilding a host under its old
+  name" below) — and is labelled as one rather than as a deletion.
 - **laundered** — a row blanked its own hash to pose as a pre-chain reset point.
 - **truncated** — a host's signed chain head attests to more rows than exist,
   or a host's seq-0 legacy anchor names a hash that no seq-0 row of that host
@@ -553,6 +557,207 @@ by any peer: forging a retirement put every row a host had ever signed past a
 boundary, on every node, with no key required — and clearing a genuine one was
 just as cheap. The detector for "somebody else has this key" cannot itself be
 something somebody else can write.
+
+## Rebuilding a host under its old name
+
+A host removed with `lv host rm` (or `lv host rm --dead`), rebuilt on an empty
+database and re-added with `lv host add` under the same name continues the
+chain it had. Nothing needs doing by hand; this section says what happens and
+what it costs.
+
+**Removal closes the old contract.** `lv host rm` CA-retires the host's live
+signing key at the sequence the cluster holds for it. That boundary is signed
+with the cluster CA key, so the host cannot choose it, and everything at or
+below it belongs to the machine that was removed.
+
+**`lv host add` hands the new machine its chain position.** The admitting
+node reports the last seq the name wrote and that row's content hash. `lv host
+add` signs the pair with the cluster CA, together with the serial of the
+certificate it minted for the new machine, and writes it there as
+`<pki_dir>/audit-rejoin.json` before its daemon first starts. A record whose
+serial is not the machine's own `host.crt` is left over from an earlier
+admission and is ignored. A name with no history gets no record, and an
+existing record is removed only when the admitting daemon vouched for that.
+
+The position is only as good as the replica it was read from, so the admitting
+node refuses with `Unavailable` when it cannot vouch for it:
+
+- it is itself holding its own audit rows (a rebuilt host whose history has not
+  arrived — so other names' history has not either);
+- its replica is not **seeded**. A replica is seeded when it founded the
+  cluster, when it already held its own audit history the first time a build
+  with this check ran on it (an existing member at a rolling upgrade), or once
+  it has completed an anti-entropy exchange with a peer that reported itself
+  seeded and not holding its rows. Neither "has completed an exchange" nor "is
+  alone" is enough: drill 6 rebuilds three hosts together, and a rebuilt host's
+  first exchange can be with another rebuilt host as empty as itself, while at
+  first boot its hosts table names only itself. The marker is local, never
+  replicated, kept as `<data_dir>/audit-seeded.json` and bound to the state.db
+  it was written for, so a lost or replaced state.db is not seeded (an in-place
+  `lv host reseed` keeps it, which is sound: a reseed keeps every audit table
+  and only adds rows). A marker that exists but cannot be read, or a decision
+  that cannot be written, counts as not seeded. A peer on an older build
+  reports nothing and does not seed. Every node that is not seeded raises
+  `audit_not_seeded` about itself, so `lv health` shows which nodes `lv host
+  add` can run against;
+- its replica has not caught up since the daemon started, unless it is alone in
+  the cluster (a founder adding its first host has nobody to catch up with);
+- the name's tail on it is below a retirement the cluster CA recorded for the
+  name's key (the one `lv host rm` writes): it is behind the node that removed
+  the host.
+
+Run `lv host add` against another node, or retry once it has caught up.
+
+**No seeded node.** A cluster can end up with no seeded replica at all: a
+single-node cluster whose founder lost its state.db, or a total loss where
+every replica is fresh. `lv host add` is then refused everywhere, for good. The
+way out is an operator's assertion, as root on the node that holds the most
+complete history. The assertion must contain that node's **assert nonce**: 256
+random bits the node minted with its seeded marker, `<data_dir>/audit-seeded.json`
+(mode 0600). The nonce exists only in that file. It is never replicated, and no
+RPC, log line or audit row carries it. Copy it into the assertion file and
+restart. The copy goes to a fresh 0600 temporary file that is then renamed over
+the target, so a file or symlink already at `audit-seeded-assert` is replaced,
+never written through:
+
+```bash
+# <data_dir>/audit-seeded.json -> <data_dir>/audit-seeded-assert
+( umask 077; d=/var/lib/litevirt
+  t=$(mktemp "$d/.audit-seeded-assert.XXXXXX") &&
+  grep -o '"assert_nonce":"[0-9a-f]*"' "$d/audit-seeded.json" | cut -d'"' -f4 > "$t" &&
+  mv -fT "$t" "$d/audit-seeded-assert" || rm -f "$t" )
+systemctl restart litevirt
+```
+
+The nonce keeps the assertion private only while nothing short of root can
+read or write data_dir. That is what the barrier actually is, and it is enforced
+elsewhere: storage pools cannot be created on or above data_dir or write into
+one that reaches it, a VM's ISO and other spec host paths cannot point into it,
+and image import cannot pull a host file into a guest, by path or through a
+qcow2/VMDK backing or data-file reference. Someone who could write data_dir
+could replace the marker, or state.db itself, and no secret kept there would
+stop them. Within that barrier the nonce stops a writer who can drop the
+assertion file without reading the marker, a stale file outliving its state.db,
+and a value learned over an RPC.
+
+The node's voter incarnation does **not** work: it is not secret. `GetRecoveryClaim`
+returns it to an operator, the replicated `voter_configs` rows carry every
+voter's, and `GetVoterConfig` (`lv cluster voter ls`) and `InspectRecoveryClaim`
+(`lv cluster claim`) show it to a viewer.
+A node whose marker is missing or unusable has no nonce: fix or remove the
+marker and restart, and the node writes a new one. A marker written by the
+build before the nonce gets one at the next start.
+
+The next start records the replica as seeded on that assertion, removes the
+file, and — once its signing key is loaded — writes one signed
+`audit.seeded_asserted` row to the audit log, so the cluster's history says
+which node vouches on an operator's word and since when. A file that does not
+contain the nonce is ignored, and logged at error level (without either value).
+Applying an assertion replaces the nonce, and a replaced state.db gets a marker
+with a new one, so a file left behind is not applied again and does not carry
+over to a later state.db. If the replica does **not** hold a re-added name's
+history, the position it vouches for is too low and that host forks its audit
+chain, which `verify` then reports for good — the assertion is the operator
+taking that on.
+
+A seeded decision that cannot be written (a full disk) is not acted on: the
+node stays not seeded and holds its own audit rows until the decision is
+written, so a restart cannot mistake it for an existing member.
+An admitting daemon older than this reports no position, so its admissions get
+no record and nothing is held — the behaviour before this change.
+
+**The rebuilt daemon holds its audit rows until that history has arrived.** A
+host chains each row onto the tail of its own sub-chain as its local replica
+holds it, and a rebuilt host's replica holds none of its history until
+anti-entropy delivers it. Appending before then starts a second chain under a
+name that already has one: `seq 1`, an empty `prev_hash`, and a hash mismatch
+plus duplicated seqs on every node, permanently, since signed rows are never
+resealed. So when the admission record names history this replica does not
+hold, every row the host audits is **held**: written to `<data_dir>/audit-hold/`,
+mode 0700, one fsynced file per row, never replicated. The hold opens once the
+local replica holds the row at the recorded seq with the recorded hash **and a
+row at every seq below it**, from whichever peers delivered them —
+anti-entropy does not deliver a chain in order. If a seq below it is missing on
+every node — a gap in the history itself — the hold cannot open by itself;
+`waiting_for` names the lowest missing seq. While held, the startup reseal
+of unsigned legacy rows is skipped: resealing rows 1 and 3 without row 2 would
+rewrite row 3, and the rewrite replicates over every peer's good copy. Held
+rows land only after the signing keyring is installed, so they are signed. Held rows then land in the order they were held
+(a counter, not a clock), after the real tail, off any RPC's path and in
+batches. Each keeps the time it was audited as its stamp; `seq` records where
+it entered the chain. A daemon restart in that window loses nothing.
+
+"One anti-entropy exchange completed" is not the condition, deliberately. Drill
+6 rebuilds three of five hosts at once, and an exchange between two rebuilt
+hosts completes while both are empty.
+
+**Only that case holds.** A normal restart's replica already holds the
+recorded row (or there is no record), so it never holds. A brand-new name has no
+record, so it never holds either. A record that does not verify against the
+cluster CA is logged at error level and not acted on. If the row at the
+recorded seq hashes differently, the replica holds a different history than the
+cluster had for the name: the hold stays closed, and says so.
+
+**A hold does not open by itself.** While held, the daemon logs an error once a
+minute and raises the `audit_chain_held` health condition about itself (warning,
+critical once full), so `lv health` shows a host whose actions are not yet in
+the cluster's audit log. It resolves when the held rows have landed.
+
+**Leaving a hold that can never open** is a decision with a permanent cost. Three
+cases get there: no reachable node holds the host's history (the other node of
+a two-node cluster is gone for good); the history has a gap below the recorded
+row (`waiting_for` names the missing seq); or the recorded row is present but
+hashes differently (`waiting_for` says it "does not hash"), meaning this replica holds
+a different history than the cluster had for the name. Investigate the second
+before anything else. The way out, as root on the held host:
+
+```bash
+mv /etc/litevirt/pki/audit-rejoin.json /root/audit-rejoin.json.abandoned
+systemctl restart litevirt
+```
+
+With no record the daemon holds nothing, and the held rows land on whatever
+tail its replica has. If that is not the host's real tail, they **fork the
+chain**: `verify` reports a hash mismatch and duplicated seqs for this host on
+every node, permanently (see "A chain that already forked stays flagged"
+below). Nothing is lost — the held rows are written — but the finding cannot be
+cleared. While held the host is still reachable for this: reads, `lv audit
+verify` and the on-node root CLI pass even a full hold, and other nodes can
+remove and re-add it.
+
+**No row is ever dropped.** Past 10000 held rows the hold is **full**, and the
+node refuses every audited action it can refuse rather than take it with
+nowhere for its row to go: every client RPC except reads (`Get…`, `List…`,
+`Watch…`, `Verify…`, `Export…` and similar, but not `VerifyBackupRepo`, which
+writes audit rows), and the logins, are refused with `Unavailable`. Calls on a
+cluster host certificate with no user identity are not refused: a peer acting
+as the system (replication is how the history arrives) and root on the node
+itself. A user's call relayed by a peer is a client call and is refused. Rows
+from background writers (failover, health) are still held past the limit.
+Refused attempts — denied logins, which an unauthenticated caller can repeat at
+will, and any action denied to an authenticated one — are coalesced while held
+into one row per action, carrying their count, the first and last time and the
+last attempt, so they cannot fill the hold.
+
+Landing is exactly once: an id already in the log is skipped, and a spool file
+is removed only after its row is committed. That relies on the commit being
+durable before the removal, which `synchronous=FULL` provides (a voting node
+requires it).
+
+**The new key's contract starts after the old machine's rows.** The new key's
+`adopted` record is written only once the hold has opened, and its start is
+never below the highest CA retirement boundary for the host. Without that, a
+contract started at seq 0 claims every unsigned row the removed machine wrote
+before it first signed, and `verify` reports each as `unsigned after signed`.
+
+**A chain that already forked stays flagged.** A host rebuilt under its old name
+by a build without the hold may already have written a second chain. Those rows
+are signed and append-only: `verify` keeps reporting the hash mismatch, the
+duplicated sequence numbers and any `unsigned after signed` rows, on every node,
+and the hourly check keeps logging them. Nothing repairs them in place and
+nothing backfills them, deliberately — a log that could be rewritten to clear a
+finding could be rewritten to clear a real one. Such a cluster carries the
+finding until its audit history is recreated.
 
 ## WORM export
 

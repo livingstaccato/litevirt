@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"github.com/litevirt/litevirt/internal/netutil"
+	"io/fs"
 	"log/slog"
 	"net"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -81,9 +83,17 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	if req == nil {
 		return nil, status.Error(codes.InvalidArgument, "request is required")
 	}
+	// A re-create forwarded here by the host that tears the VM down carries
+	// the VM's own installer ISO grant; only a peer host's is honoured.
+	ctx = s.acceptRecreateISOGrantMD(ctx)
 	spec, err := normalizeCreateVMSpec(req.GetSpec(), s.defaultCPUModeCfg)
 	if err != nil {
 		return nil, err
+	}
+	// iso_scope is server-owned: a client's is dropped, and only a forwarded
+	// leg (a peer) carries the entry node's classification to the owner.
+	if sc := req.GetSpec().GetIsoScope(); sc != "" && s.requirePeerCert(ctx) == nil {
+		spec.IsoScope = sc
 	}
 	req = proto.Clone(req).(*pb.CreateVMRequest)
 	req.Spec = spec
@@ -302,12 +312,39 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			}
 		}
 	}
+	// Installer ISO: the guest reads it, so naming it is reading that host file.
+	// Gated here, after placement, because a library reference is judged
+	// against the SELECTED host's pools; it runs on the entry node (as the
+	// user) and again on the owner (see authorizeVMISO).
+	if err := s.authorizeVMISO(ctx, project, targetHost, spec); err != nil {
+		return nil, err
+	}
 	if targetHost != s.hostName {
-		if decision != nil {
+		if decision != nil && !decision.placedHere {
 			return nil, status.Errorf(codes.FailedPrecondition,
 				"resolved create owner %q does not match local host %q", targetHost, s.hostName)
 		}
 		return s.forwardCreateVM(ctx, req, targetHost)
+	}
+	// Stable domain identity (G1): persisted in the spec so libvirt's default
+	// swtpm path (/var/lib/libvirt/swtpm/<uuid>/) is deterministic across the VM's
+	// life — letting vTPM state be located + carried without an explicit <source>.
+	// UUID is SERVER-OWNED on create: always mint fresh, ignoring any caller-
+	// supplied value, so a client can't bind a new VM to existing swtpm state.
+	// Restore/migrate set the preserved UUID via their own record-building paths.
+	// Minted before the ISO is resolved, so the host's ISO identity record is
+	// keyed by it (never by the name, which a deleted namesake may have used),
+	// and removed again if the create fails.
+	spec.Uuid = uuid.NewString()
+	defer func() {
+		if retErr != nil {
+			s.forgetISOIdentity(isoIdentityKey(spec.Name, spec))
+		}
+	}()
+	// The owner's own filesystem decides which file the ISO is.
+	isoPath, err := s.resolveVMISO(ctx, project, spec)
+	if err != nil {
+		return nil, err
 	}
 
 	// Authoritative admission, on the OWNING node only (everything above either
@@ -333,14 +370,14 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 
 	slog.Info("creating VM", "name", spec.Name, "image", spec.Image, "cpu", spec.Cpu, "memory", spec.MemoryMib)
 
-	// Stable domain identity (G1): persisted in the spec so libvirt's default
-	// swtpm path (/var/lib/libvirt/swtpm/<uuid>/) is deterministic across the VM's
-	// life — letting vTPM state be located + carried without an explicit <source>.
-	// UUID is SERVER-OWNED on create: always mint fresh, ignoring any caller-
-	// supplied value, so a client can't bind a new VM to existing swtpm state.
-	// Restore/migrate set the preserved UUID via their own record-building paths.
-	spec.Uuid = uuid.NewString()
+	// (spec.Uuid was minted above, before the ISO was resolved.)
 	// (Cpu/MemoryMib were defaulted before admission — see normalizeVMSpecResources.)
+
+	// A disk built on the image resolves its current file now and is recorded
+	// only below: until then no prune removes a file of the image.
+	if spec.Image != "" {
+		defer s.holdImage(spec.Image)()
+	}
 
 	// Prepare disks — track created paths for cleanup on failure.
 	var diskConfigs []lv.DiskConfig
@@ -412,7 +449,9 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			}
 			sourceImage := ""
 			if isRootDisk {
-				sourceImage = spec.Image
+				if sourceImage, err = s.poolRootDiskBacking(spec.Image, volCfg.Driver); err != nil {
+					return nil, err
+				}
 			}
 			diskPath, err = drv.CreateDisk(ctx, storage.DiskOptions{
 				VMName:      spec.Name,
@@ -433,6 +472,14 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		}
 		if err != nil {
 			cleanupDisks()
+			// "<vm>-<disk>.qcow2" is ambiguous across hyphens (VM "a" disk
+			// "b-root" is VM "a-b" disk "root"), and a pool can be every
+			// project's. Disk creation is exclusive: a file already there
+			// is a refusal, never replaced — and never cleaned up here.
+			if errors.Is(err, fs.ErrExist) {
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"create disk %s: %v — choose another VM or disk name", d.Name, err)
+			}
 			return nil, status.Errorf(codes.Internal, "create disk %s: %v", d.Name, err)
 		}
 		createdDiskPaths = append(createdDiskPaths, diskPath)
@@ -490,11 +537,13 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 
 	// Installer ISO: attach as a read-only CDROM and boot from it by default so
 	// the guest can install an OS (xmlgen renders IsISO disks as <cdrom>). The
-	// path is on the target host. Persisted in the spec JSON, so it survives.
+	// spec.Iso (a library reference, or an admin's host path) is persisted in
+	// the spec JSON; the domain carries the file it resolved to on this host,
+	// which authorizeVMISO and resolveVMISO admitted above.
 	if spec.Iso != "" {
 		diskConfigs = append(diskConfigs, lv.DiskConfig{
 			Name:  "installer",
-			Path:  spec.Iso,
+			Path:  isoPath,
 			IsISO: true,
 		})
 		if spec.Boot == "" {
@@ -844,6 +893,17 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// pre_start hook — fires before the domain is started for the first time.
 	stubVM := &pb.VM{Name: spec.Name, HostName: s.hostName, State: pb.VMState_VM_STARTING}
 	hooks.Run(ctx, hooks.PreStart, stubVM, spec.Hooks)
+
+	// The ISO was judged before admission; an image pull can run in between,
+	// and qemu opens it at this boot, so it is judged again now.
+	if again, err := s.resolveVMISO(ctx, project, spec); err != nil || again != isoPath {
+		claims.releaseAll(ctx)
+		cleanupDisks()
+		if err == nil {
+			err = status.Errorf(codes.FailedPrecondition, "iso %q now resolves to %s, not %s; retry the create", spec.Iso, again, isoPath)
+		}
+		return nil, err
+	}
 
 	// Define and start in libvirt
 	if err := s.virt.DefineDomain(domXML); err != nil {
@@ -1557,6 +1617,18 @@ func (s *Server) PrepareHardwareForStart(ctx context.Context, vm *corrosion.VMRe
 		return releasePreflight, status.Errorf(codes.InvalidArgument, "prepare hardware for start: nil vm record")
 	}
 
+	// qemu reopens the installer ISO at every start, so it is judged again
+	// here, on the host that starts it — every start path runs this hook.
+	if err := s.verifyVMISOForStart(vm); err != nil {
+		return releasePreflight, err
+	}
+	// An image-store base is a file qemu opens for the guest at every start:
+	// one stored before arrival checks existed, or changed since, must still
+	// name no file outside the store.
+	if err := s.verifyImageBasesForStart(ctx, vm); err != nil {
+		return releasePreflight, err
+	}
+
 	// Adoption gate (fail-closed): a blocked VM must not (re)start under the active
 	// hardware_v2 regime — this covers ALL start callers (StartVM, RestartVM, restore/
 	// autostart, the health reconciler/checker, promote, the resource coordinator).
@@ -2138,6 +2210,13 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// files that no longer exist. Returning keeps the delete retryable — the only
 	// destructive step so far is the stop above.
 	var undefErr error
+	defer func() {
+		// The host's record of the ISO file it judged for this VM goes with
+		// the VM, once its domain is gone.
+		if !s.virt.DomainExists(req.Name) {
+			s.forgetVMISOIdentity(req.Name, vm.Spec)
+		}
+	}()
 	if req.KeepDisks {
 		undefErr = s.virt.UndefineDomainPreservingState(req.Name)
 	} else if err := s.virt.UndefineDomain(req.Name, true); err != nil {
@@ -3105,6 +3184,29 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 		}
 	}
 
+	// BEFORE anything destructive: everything the create below would refuse
+	// that the teardown does not change — the installer ISO included, judged
+	// as the create will judge it — is refused now, with the VM intact.
+	// The VM's own ISO is carried into the create as it was classified
+	// (recreateISOGrant), so one its starts accept is not refused for want
+	// of an Admin's authority. A VM with an installer ISO is placed now, as
+	// main placed it after the teardown, and judged by the host placement
+	// chose (judgeRecreateOn); the create below goes to that host.
+	rctx := withRecreateISOGrant(ctx, vm)
+	host, placed := s.hostName, false
+	if spec.GetIso() != "" {
+		h, err := s.placeRecreate(rctx, spec, vm)
+		if err != nil {
+			st := status.Convert(err)
+			return nil, status.Errorf(st.Code(), "cannot rebuild %q: %s; nothing was changed", req.Name, st.Message())
+		}
+		host, placed = h, true
+	}
+	if err := s.judgeRecreateOn(rctx, spec, host); err != nil {
+		st := status.Convert(err)
+		return nil, status.Errorf(st.Code(), "cannot rebuild %q: %s; nothing was changed", req.Name, st.Message())
+	}
+
 	// Stop and undefine the current domain.
 	if vm.State == "running" {
 		s.virt.DestroyDomain(req.Name)
@@ -3120,6 +3222,8 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	// old name-keyed NVRAM + old-UUID swtpm tree would otherwise be orphaned (G1).
 	lv.WipeFirmwareState(s.dataDir, req.Name, spec.Uuid)
 	os.Remove(lv.CloudInitISOPath(s.dataDir, req.Name))
+	// The rebuilt VM gets a fresh uuid: the ISO record of the old one goes.
+	s.forgetVMISOIdentity(req.Name, vm.Spec)
 
 	// Tombstone old records (they'll be replaced by CreateVM). This must not be
 	// best-effort: the disks and firmware state are already gone above, and if
@@ -3142,7 +3246,10 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	// Recreate the VM using the stored spec.
 	slog.Info("rebuilding VM", "name", req.Name)
 	s.recordVMEvent(ctx, req.Name, "vm.rebuilt", "ok", "image="+spec.Image)
-	return s.CreateVM(ctx, &pb.CreateVMRequest{Spec: spec})
+	if placed {
+		return s.createVM(rctx, &pb.CreateVMRequest{Spec: spec}, &resolvedCreateVMDecision{resolvedHost: host, placedHere: true})
+	}
+	return s.CreateVM(rctx, &pb.CreateVMRequest{Spec: spec})
 }
 
 // CutoverVM completes a snapshot-and-replace update. The "-next" VM replaces the original.
@@ -3554,12 +3661,18 @@ func (s *Server) resolveVolume(ctx context.Context, stackName, volumeName string
 		}
 		if f != nil {
 			if vol, ok := f.Volumes[volumeName]; ok {
-				return storage.Config{
+				cfg := storage.Config{
 					Driver:  vol.Driver,
 					Source:  vol.Source,
 					Target:  vol.Target,
 					Options: vol.Options,
-				}, nil
+				}
+				// A stack stored before deploys checked this can still name a
+				// directory no pool may write into; refuse it at use.
+				if err := storage.CheckConfig(cfg, s.dataDir, s.pkiDir); err != nil {
+					return storage.Config{}, fmt.Errorf("volume %q of stack %q: %w", volumeName, stackName, err)
+				}
+				return cfg, nil
 			}
 		}
 	}
@@ -3568,6 +3681,11 @@ func (s *Server) resolveVolume(ctx context.Context, stackName, volumeName string
 	// (a pool created since the cache was last refreshed, e.g. just after a
 	// restart, is only there).
 	if pool, ok := s.resolvePool(ctx, volumeName); ok {
+		// The disk is created there: a pool created before the directory and
+		// source checks must not take one (nor be re-mounted for it).
+		if err := s.checkPoolForWrite(ctx, volumeName, pool); err != nil {
+			return storage.Config{}, err
+		}
 		return storage.Config{
 			Driver:  pool.Driver,
 			Source:  pool.Source,
@@ -3692,7 +3810,29 @@ func (s *Server) ResizeDisk(ctx context.Context, req *pb.ResizeDiskRequest) (*pb
 		return nil, status.Errorf(codes.InvalidArgument, "new size must be larger than current size (%d bytes)", disk.SizeBytes)
 	}
 
-	if vm.State == "running" && s.virt != nil {
+	if storage.IsBlockVolumeDriver(disk.StorageType) {
+		// A zvol or thin LV is grown by its volume manager; qemu-img (or the
+		// qcow2 code) cannot. A running VM's qemu is then told the new size.
+		// zfs set volsize also shrinks, so a volume whose size is not recorded
+		// — nothing to tell a grow from a shrink — is not resized.
+		if disk.SizeBytes <= 0 {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"disk %q of VM %q has no recorded size, so a grow cannot be told from a shrink; it is not resized", req.DiskName, req.VmName)
+		}
+		if newSizeBytes > storage.MaxBlockVolumeBytes {
+			return nil, status.Errorf(codes.InvalidArgument, "size %q is more than %d bytes", req.Size, int64(storage.MaxBlockVolumeBytes))
+		}
+		grown, err := storage.GrowBlockVolume(ctx, disk.StorageType, disk.Path, newSizeBytes)
+		if err != nil {
+			return nil, status.Errorf(codes.FailedPrecondition, "resize disk: %v", err)
+		}
+		newSizeBytes = grown
+		if vm.State == "running" && s.virt != nil {
+			if err := s.virt.BlockResize(req.VmName, disk.Path, newSizeBytes); err != nil {
+				return nil, status.Errorf(codes.Internal, "block resize: %v", err)
+			}
+		}
+	} else if vm.State == "running" && s.virt != nil {
 		// Use libvirt DomainBlockResize — resizes the image and notifies the guest in one call.
 		if err := s.virt.BlockResize(req.VmName, disk.Path, newSizeBytes); err != nil {
 			return nil, status.Errorf(codes.Internal, "block resize: %v", err)
@@ -3709,7 +3849,7 @@ func (s *Server) ResizeDisk(ctx context.Context, req *pb.ResizeDiskRequest) (*pb
 		slog.Warn("failed to update disk size in DB", "vm", req.VmName, "disk", req.DiskName, "error", err)
 	}
 
-	slog.Info("disk resized", "vm", req.VmName, "disk", req.DiskName, "new_size", req.Size)
+	slog.Info("disk resized", "vm", req.VmName, "disk", req.DiskName, "new_size", req.Size, "bytes", newSizeBytes)
 	s.recordVMEvent(ctx, req.VmName, "disk.resized", "ok", req.DiskName+":"+req.Size)
 	return s.vmToProto(ctx, req.VmName)
 }
@@ -4414,4 +4554,45 @@ func resolveStopTimeout(reqTimeout int32, specJSON string) int32 {
 		}
 	}
 	return 30
+}
+
+// verifyImageBasesForStart refuses a start of vm whose local disk has a
+// backing chain qemu must not open: any layer the disk chain rule refuses
+// (verifyDiskChainForStart), or an image-store base that names a file
+// outside the store, VMDK extents or an external data file
+// (image.Store.AssertBase). A layered image whose whole chain stays in the
+// store passes, as on main. Disks on other hosts and absent files are not
+// this check's.
+func (s *Server) verifyImageBasesForStart(ctx context.Context, vm *corrosion.VMRecord) error {
+	disks, err := corrosion.GetVMDisks(ctx, s.db, vm.Name)
+	if err != nil {
+		return status.Errorf(codes.Internal, "read disks of %q: %v", vm.Name, err)
+	}
+	for _, d := range disks {
+		if d.HostName != "" && d.HostName != s.hostName {
+			continue
+		}
+		file := s.hostDiskFile(d.Path)
+		info, err := qcow2.Info(file)
+		if err != nil || info.BackingFile == "" {
+			continue
+		}
+		// The whole chain, layer by layer, by the rule every copy path
+		// judges it by (verifyDiskChainForStart).
+		if err := s.verifyDiskChainForStart(ctx, vm, d, file); err != nil {
+			return err
+		}
+		b := info.BackingFile
+		if !filepath.IsAbs(b) {
+			b = filepath.Join(filepath.Dir(file), b)
+		}
+		if s.images == nil || !s.images.Contains(b) {
+			continue
+		}
+		if err := s.images.AssertBase(b); err != nil {
+			slog.Error("start refused: the disk's image-store base names a file outside the store", "vm", vm.Name, "disk", d.DiskName, "base", b, "error", err)
+			return status.Errorf(codes.FailedPrecondition, "disk %q of %q is built on image %s, which the host will not open: %v", d.DiskName, vm.Name, filepath.Base(b), err)
+		}
+	}
+	return nil
 }

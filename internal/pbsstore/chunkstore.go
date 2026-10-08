@@ -104,8 +104,36 @@ type Manifest struct {
 	// the cluster row without the source cluster. The archived rootfs+config
 	// carries everything else. Empty on VM-disk manifests.
 	ContainerSpecJSON string `json:"container_spec_json,omitempty"`
-	SchemaVersion     int    `json:"schema_version"`
+	// ContentFormat says what the chunks are: ContentGuestRaw (the guest-
+	// visible disk content, read over NBD) or ContentDiskFile (the disk's
+	// image FILE, container header included). Empty on older manifests: the
+	// format is unknown, and nothing may assume either.
+	ContentFormat string `json:"content_format,omitempty"`
+	// BaseIdentity names, for a disk-file backup of an OVERLAY, the base the
+	// overlay was on when it was taken: the backup holds only the delta, so a
+	// restore onto a base that has since changed (an image re-pulled under
+	// the same name) would sit the old delta on new data. Nil for a
+	// standalone disk and for guest-content backups.
+	BaseIdentity  *BaseIdentity `json:"base_identity,omitempty"`
+	SchemaVersion int           `json:"schema_version"`
 }
+
+// BaseIdentity identifies an overlay's base file: its resolved path, size and
+// content hash.
+type BaseIdentity struct {
+	Path   string `json:"path"`
+	Size   int64  `json:"size"`
+	SHA256 string `json:"sha256"`
+}
+
+// Manifest.ContentFormat values.
+const (
+	// ContentGuestRaw: raw guest-visible bytes. The guest controls every one
+	// of them, a qcow2-looking header included.
+	ContentGuestRaw = "raw"
+	// ContentDiskFile: the disk's own image file, as stored on the host.
+	ContentDiskFile = "disk-file"
+)
 
 // Repo is an open backup repository. Multiple goroutines may use one
 // Repo concurrently — chunk writes are atomic (tmp+rename) and
@@ -342,6 +370,17 @@ func (r *Repo) LatestManifestFor(vm, disk string) (*Manifest, bool, error) {
 func (r *Repo) ListManifests() ([]Manifest, error) {
 	valid, _, err := r.listParsedManifests()
 	return valid, err
+}
+
+// ListParsedManifests returns every manifest that parsed, valid or not: the
+// set a reader asking "what does any backup still reference?" needs (see
+// listParsedManifests). A file that does not parse is an error.
+func (r *Repo) ListParsedManifests() ([]Manifest, error) {
+	valid, invalid, err := r.listParsedManifests()
+	if err != nil {
+		return nil, err
+	}
+	return append(valid, invalid...), nil
 }
 
 // listParsedManifests returns every manifest file that PARSED, split into those

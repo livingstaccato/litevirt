@@ -484,6 +484,27 @@ lv pool delete <name>
 
 `lv pool create` runs the driver's Prepare() hook (mount NFS, log into
 iSCSI, …) before persisting. See `docs/storage.md` for driver details.
+A pool that names a host path (`dir`, `--target`, a btrfs `--source`, NFS
+mount options, a Ceph conf or keyring), attaches network storage (`nfs`,
+`ceph`, `iscsi`) or allocates from host block storage (`zfs`, `lvm-thin`) needs `storage.hostpath` at `/` (the Admin role), and system and litevirt-internal directories are refused to
+everyone; see `docs/storage.md#host-paths`.
+
+## Installer ISOs
+
+```bash
+lv iso ls [--host <h>] [--project <p>]         # ISOs a VM may name: project libraries, then the global one
+lv iso pull <pool>/<file>.iso --url <url> [--checksum <sha256>] [--host <h>]
+lv iso pull <pool>/<file>.iso --from-host-path <path> [--host <h>]   # Admin; a copy, never a link
+lv iso rm <pool>/<file>.iso [--host <h>]
+lv cluster iso-library-mode [sync|shared]      # where the global library "isos" lives
+```
+
+A VM names its installer ISO (`VMSpec.iso`, a compose file's `iso:`) as
+`<pool>/<file>.iso`: `isos/debian-12.iso` from the cluster-global library, or
+`<project-pool>/<file>.iso` from a project library (a pool the project owns,
+created with `--option content=iso`). Only an Admin writes the global library;
+a project's operators write its own. An Admin may still give an absolute host
+path. See `docs/storage.md`, "Installer ISOs".
 
 ## Volumes
 
@@ -506,11 +527,40 @@ lv stack migrate-volumes <stack> --to fast --map pg-1/data=archive --map pg-2=wa
 ```bash
 lv image pull <url> --name <name> [--format qcow2] [--checksum sha256:...]
 lv image import <file> --name <name>
+#   Content is published as <name>@<sha256-prefix>.qcow2 (every host names the
+#   same content the same) and the name points at it. A pull or import under
+#   an existing name is a refresh: a new version that new VMs are built on. A file a disk is built on is never written over or removed.
+#   The one exception is a heal: a local copy whose bytes no longer match the
+#   sha256 recorded when it was published is put back from byte-identical
+#   content (the reconciler fetches it from a peer); any other content becomes
+#   a new version, and an unhealable base under disks is logged at ERROR.
+lv image prune [<image>] [--host <host>] [--dry-run]
+#   Removes, on one host, the image files no disk there is built on — judged
+#   from every visible disk's backing header, never from the image's name —
+#   keeping each image's current version, every version a kept image is
+#   layered on, every version a disk create in flight may use, and every
+#   version a disk-file backup was taken on: the backup pins it on the VM's
+#   host (<file>.pinned, permanent) wherever the manifest goes — a sink host,
+#   an absolute repo path. A backup taken before pins is honoured through its
+#   manifest when that is in a backup repo on the host; one taken by an older
+#   build records no base and pins nothing.
+#   Needs image.import. Nothing is removed unless the whole view can be read
+#   within 2 minutes: a pool directory, a disk header, an nfs share that is
+#   not mounted or a backup repo that cannot be read refuses the prune,
+#   saying which. A refresh prunes the image's older unused versions by
+#   itself, in the background, keeping the one it superseded.
 lv image push <image> --to <host>
 lv image build <vm> --name <name>        # Create image from running VM
 lv image ls
 lv image rm <image>
 ```
+
+`pull` and `import` accept only standalone images. A qcow2 that names a
+backing file or an external data file, and any VMDK (whose extents can name
+other files), is refused, because qemu would open the named file on the host
+for every VM built from the image. Flatten it first with
+`qemu-img convert -O qcow2 <in> <out>`. A VM is also refused a new overlay on an
+already-stored image that names another file.
 
 ## Import (migrate VMs in)
 
@@ -533,7 +583,99 @@ lv import dump.vma.zst --from vma --server-path /srv/stage/dump.vma.zst --name a
 #   --preserve-mac                 keep source MACs (default: regenerate)
 #   --server-path <path>           use a file/dir already staged on the target host
 #   --inspect                      print the mapping + warnings, import nothing
+#   Each disk lands as a NEW <vm>-<disk>.qcow2 in the target pool (or
+#   <data_dir>/disks without one); an existing file of that name is refused
+#   (AlreadyExists), never replaced.
 ```
+
+`--server-path`, `--disk-map` and any disk a Proxmox `.conf` names must be
+under the target host's import staging root (`<data_dir>/imports/staging`).
+A path outside it needs an admin (`storage.hostpath` at the root). An import
+forwarded with `--target-host` is judged on the target as its caller — by the
+session the entry node relays, or as an admin when the caller signed in with
+an admin certificate — so an admin's forwarded `--server-path` works and an
+operator's is refused. Every file a foreign disk makes qemu open (backing
+files, VMDK extents, a data file) must sit beside the disk or in the import
+directory.
+
+Disk formats: raw, qcow2, VMDK (a single-file sparse or stream-optimized
+disk), VHD, VHDX and VDI, each read from its header when the source does not
+declare it and converted with that format named, never probed. A differencing
+VHDX or VDI depends on a parent and is refused; merge it into its base first.
+QED and VMDK descriptors are refused; convert them to qcow2 first.
+
+Several imports can run on one host at once. Before each write — an upload
+(reserved 64 MiB at a time), unpacking an OVA, a VMA's device data as it
+arrives, copying a mapped disk (its allocated blocks; the copy is sparse),
+converting a disk into the pool (what `qemu-img measure` says the qcow2
+needs, not the disk's capacity) — an import reserves the bytes it will write,
+and is admitted only if that filesystem has room for them on top of what the
+running imports writing to the same filesystem have reserved and its free space
+does not yet show written. No margin is kept beyond that (unlike a cold
+migration's headroom): an import that fits is imported, however full the
+filesystem is otherwise, as before these checks existed. Imports into
+unrelated storage do not count against each other; btrfs subvolumes, datasets
+of one ZFS pool and exports of one NFS server (by address) count as one
+filesystem, and one litevirt cannot identify counts as shared with every other.
+A reservation shrinks as the filesystem's free space shows the import's writes,
+and is released when it finishes or fails, so an import that does not fit
+beside the others is refused with the space it needs and what the others hold;
+retry it when they finish. Two imports of the same VM name on one host do not
+run at once (`--inspect` is not held back), and an import never replaces a file
+already at its disk's name in the pool. A file there is taken for a crashed
+earlier import's leftover — moved aside to `<name>.orphan-<unix time>`, kept,
+and logged, after which the import goes ahead — only when all of these hold:
+
+- no disk (of a live VM, kept from a deleted one, or under a kept snapshot)
+  and no image records it;
+- no operation in flight (a create, clone, restore or disk attach) names a VM
+  whose disks would be named like it, and no other import on the host does;
+- it is a dead import's leftover (below), or both: no VM exists whose name
+  followed by `-` begins the file's name, and it has not been modified in the
+  last 15 minutes;
+- no file beside it whose name begins like its own up to any `-` (so for
+  `web-3-root.qcow2`, any `web-*` file), and no other host's conversion
+  scratch file or partial copy for such a name, has been modified in the last 15 minutes —
+  except files a disk row or an image records (a running VM's own disks, such
+  as `web-1`'s beside an import of `web-3`, never hold it back), files named
+  for an existing VM whose name does not begin the leftover's the same way,
+  files of another import running on the same host under a name that does
+  not begin the leftover's, and dead imports' leftovers (below).
+
+**A dead import's leftover.** Every file an import writes into a pool is
+recorded on its host, in `<data_dir>/import-placements/`: its path, which file
+it is (its inode), and the size, modification time and (once placed) change
+time it was left with, under the import and the daemon process that wrote it.
+The device number is not part of it, so the record survives a reboot or a
+remount of the pool. A file whose record names an import that is no longer
+running on that host (the daemon stopped or restarted mid-import; an import
+that ends drops its records), and which still has that inode, size and
+times, is that import's leftover at once, without the 15-minute wait and
+whatever VM it is named like. The record works on every filesystem, NFS
+without user xattrs and FUSE included; where the pool keeps user xattrs, the
+file also carries its origin in `user.litevirt.import-origin`, which must then
+name the same import. A file written since its import left it — rewritten in
+place by a replication into that path, say, even with its modification time
+set back — is not a leftover by its record: it waits out the 15 minutes like
+any file whose origin is unknown.
+
+The record is the importing host's own. A re-import on another host into a
+pool several hosts share (the first host is being drained, say) asks the other
+hosts that have the pool, over their peer connection, whether their record
+shows each file it cannot prove — the leftover and the fresh files beside it —
+as their dead import's, in exactly the state it sees; it takes a file for a
+leftover only on a yes. A host that does not answer within a few seconds
+leaves the file judged by age, and the refusal names it. The default pool
+(`<data_dir>/disks`) is each host's own and asks no one.
+
+Any other file there refuses the import, saying why. On a pool with neither
+hard links nor a rename that cannot replace a file (some FUSE filesystems), a
+converted disk is copied into place: into a recorded temp name beside the
+disk (`.<name>.place-<random>`), and only the finished copy takes the disk's
+name, so a crash mid-copy leaves a partial at the temp name that the next
+import of that name removes at once. That second copy is reserved like the
+first, and a leftover there is moved aside to
+`<name>.orphan-<unix time>-<random>`.
 
 ## Snapshots
 
@@ -637,10 +779,11 @@ lv backup snapshot <vm> --repo <path> [--disk <name>] [--incremental] [--quiesce
 #   --quiesce auto (default): freeze guest filesystems via the qemu-guest-agent for an
 #   application-consistent backup when the VM has an agent, else crash-consistent.
 #   --quiesce off: always crash-consistent. A freeze failure never fails the backup.
-lv backup restore-from --repo <p> --vm <v> --disk <d> \
-    --timestamp <ts> --target-path <path>
+lv backup restore-from --repo <p> --vm <v> --disk <d> --timestamp <ts>
+  [--in-place]        # restore over the VM's own disk from its record (VM stopped)
+  [--target-path <f>] # admin only; never an existing file. Default: a new daemon-named file
 lv backup restore-live --repo <p> --vm <v> --disk <d> \
-    --timestamp <ts> --target-path <overlay.qcow2> [--bind 127.0.0.1:0]
+    --timestamp <ts> [--target-path <overlay.qcow2>] [--bind 127.0.0.1:0]
   [--auto-start]      # define + start the VM against the overlay automatically
   [--name <new>]      # rename the restored VM (avoids collision with the original)
   [--blockpull]       # after start, localize the disk then tear down the NBD server
@@ -668,7 +811,7 @@ lv replication schedule rm <vm> --target-pool <pool> [--scope ...] [--pool-name 
 # Disaster recovery: bring a VM up from its replica.
 lv replication promote <vm>
   [--pool <p>] [--host <h>]   # where the replica lives (default: from the VM's schedule)
-  [--replica <file>]          # exact replica filename (default: newest)
+  [--replica <file>]          # one of the VM's recorded replicas, <disk>-<time>.<ext> (default: newest)
   [--new-name <name>]         # promote alongside a still-running original
   [--no-localize]             # boot off an overlay backed by the replica (fast; pins it)
   [--force]                   # promote even if the original is on a healthy host

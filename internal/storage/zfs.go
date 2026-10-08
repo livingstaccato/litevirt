@@ -31,6 +31,9 @@ type zfsDriver struct {
 
 func (d *zfsDriver) String() string { return "zfs" }
 
+// zfsPipe runs the send | recv pipeline; tests replace it.
+var zfsPipe = pipeCmds
+
 // zfs runs a zfs subcommand through the driver's runner (real exec by default).
 func (d *zfsDriver) zfs(ctx context.Context, args ...string) ([]byte, error) {
 	run := d.run
@@ -44,7 +47,7 @@ func (d *zfsDriver) Prepare(ctx context.Context) error {
 	if d.dataset == "" {
 		return fmt.Errorf("zfs: dataset (Source) required")
 	}
-	out, err := exec.CommandContext(ctx, "zfs", "list", "-H", "-o", "name", d.dataset).CombinedOutput()
+	out, err := exec.CommandContext(ctx, "zfs", "list", "-H", "-o", "name", "--", d.dataset).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("zfs list %s: %w: %s", d.dataset, err, out)
 	}
@@ -68,7 +71,7 @@ func (d *zfsDriver) CreateDisk(ctx context.Context, opts DiskOptions) (string, e
 	if comp := d.opts["compression"]; comp != "" {
 		args = append(args, "-o", "compression="+comp)
 	}
-	args = append(args, zvol)
+	args = append(args, "--", zvol)
 
 	if out, err := exec.CommandContext(ctx, "zfs", args...).CombinedOutput(); err != nil {
 		return "", fmt.Errorf("zfs create %s: %w: %s", zvol, err, out)
@@ -85,39 +88,73 @@ func (d *zfsDriver) CreateDisk(ctx context.Context, opts DiskOptions) (string, e
 // hop. Incremental sends use `-I` against the prior snapshot
 // recorded under <dataset>@litevirt-replicate-prev so subsequent
 // replications send only the diff.
-func (d *zfsDriver) Replicate(ctx context.Context, opts ReplicateOptions) error {
+func (d *zfsDriver) Replicate(ctx context.Context, opts ReplicateOptions) (err error) {
 	if opts.SrcRef == "" || opts.DstRef == "" {
 		return fmt.Errorf("zfs replicate: src and dst refs required")
+	}
+	// The destination must not exist: the receive below has no -F, and a
+	// dataset of that name is refused here first, before anything is sent.
+	if _, lerr := d.zfs(ctx, "list", "-H", "-o", "name", "--", opts.DstRef); lerr == nil {
+		return fmt.Errorf("zfs replicate → %s: %w", opts.DstRef, ErrDestinationExists)
 	}
 	snap := opts.SnapshotName
 	if snap == "" {
 		snap = "litevirt-" + nowSnapTag()
 	}
 	srcSnap := fmt.Sprintf("%s@%s", opts.SrcRef, snap)
-	if out, err := exec.CommandContext(ctx, "zfs", "snapshot", srcSnap).CombinedOutput(); err != nil {
-		return fmt.Errorf("zfs snapshot %s: %w: %s", srcSnap, err, out)
+	if out, serr := d.zfs(ctx, "snapshot", "--", srcSnap); serr != nil {
+		return fmt.Errorf("zfs snapshot %s: %w: %s", srcSnap, serr, out)
 	}
+	// The per-call snapshot is the copy's point in time only: always
+	// destroyed (the incremental base is the separate "prev" snapshot).
+	defer func() {
+		if out, derr := d.zfs(ctx, "destroy", "--", srcSnap); derr != nil && err == nil {
+			err = fmt.Errorf("zfs destroy %s: %w: %s", srcSnap, derr, out)
+		}
+	}()
+	// Anything after the receive fails: the dataset this copy created is
+	// destroyed, never left unrecorded.
+	received := false
+	defer func() {
+		if err != nil && received {
+			_, _ = d.zfs(ctx, "destroy", "-r", "--", opts.DstRef)
+		}
+	}()
 
 	sendArgs := []string{"send"}
 	prev := fmt.Sprintf("%s@litevirt-replicate-prev", opts.SrcRef)
 	if opts.Incremental && snapshotExists(ctx, prev) {
-		sendArgs = append(sendArgs, "-I", prev, srcSnap)
+		sendArgs = append(sendArgs, "-I", prev, "--", srcSnap)
 	} else {
-		sendArgs = append(sendArgs, srcSnap)
+		sendArgs = append(sendArgs, "--", srcSnap)
 	}
 
-	recvArgs := []string{"recv", "-F", opts.DstRef}
-	pipe, err := pipeCmds(ctx, opts.SSHTarget, "zfs", sendArgs, "zfs", recvArgs)
-	if err != nil {
-		return fmt.Errorf("zfs replicate %s → %s: %w", opts.SrcRef, opts.DstRef, err)
+	// Never -F: a forced receive rolls back or replaces whatever dataset has
+	// the name. Without it, zfs refuses an existing destination itself.
+	recvArgs := []string{"recv", "--", opts.DstRef}
+	if _, perr := zfsPipe(ctx, opts.SSHTarget, "zfs", sendArgs, "zfs", recvArgs); perr != nil {
+		return fmt.Errorf("zfs replicate %s → %s: %w", opts.SrcRef, opts.DstRef, perr)
 	}
-	_ = pipe // pipeCmds runs synchronously; nothing to wait on
-
+	received = true
+	// Record first: a recorded copy is what a failure below may leave. `zfs
+	// set` takes no "--": OpenZFS up to 2.1 parses its arguments without
+	// getopt and refuses any argument starting with "-" (GrowBlockVolume says
+	// the same). Neither the property ("litevirt:…") nor DstRef (a dataset
+	// under the pool's, never starting with "-") can be taken for an option.
+	// A property that cannot be written is warned about and the copy is
+	// kept: it is the data the operator asked for, and the deferred cleanup
+	// must never destroy it for a missing label.
+	for _, k := range sortedKeys(opts.Record) {
+		if out, serr := d.zfs(ctx, "set", "litevirt:"+k+"="+opts.Record[k], opts.DstRef); serr != nil {
+			slog.Warn("zfs replicate: the received copy is kept, but its owner property was not written",
+				"dataset", opts.DstRef, "property", "litevirt:"+k, "error", serr, "output", strings.TrimSpace(string(out)))
+		}
+	}
 	// Roll the "prev" pointer for the next incremental. A silent failure here
 	// would make the NEXT `-I` send diff against a stale base → incomplete /
 	// corrupt replica with no signal, so surface any error.
-	if err := d.rollPrevSnapshot(ctx, prev); err != nil {
-		return fmt.Errorf("zfs replicate %s → %s: roll prev snapshot: %w", opts.SrcRef, opts.DstRef, err)
+	if rerr := d.rollPrevSnapshot(ctx, prev); rerr != nil {
+		return fmt.Errorf("zfs replicate %s → %s: roll prev snapshot: %w", opts.SrcRef, opts.DstRef, rerr)
 	}
 	return nil
 }
@@ -128,13 +165,13 @@ func (d *zfsDriver) Replicate(ctx context.Context, opts ReplicateOptions) error 
 // but any real failure aborts the roll rather than leaving a stale base.
 func (d *zfsDriver) rollPrevSnapshot(ctx context.Context, prev string) error {
 	prevNew := prev + "-new"
-	if out, err := d.zfs(ctx, "snapshot", prevNew); err != nil {
+	if out, err := d.zfs(ctx, "snapshot", "--", prevNew); err != nil {
 		return fmt.Errorf("snapshot %s: %w: %s", prevNew, err, out)
 	}
-	if out, err := d.zfs(ctx, "destroy", prev); err != nil && !strings.Contains(string(out), "does not exist") {
+	if out, err := d.zfs(ctx, "destroy", "--", prev); err != nil && !strings.Contains(string(out), "does not exist") {
 		return fmt.Errorf("destroy %s: %w: %s", prev, err, out)
 	}
-	if out, err := d.zfs(ctx, "rename", prevNew, prev); err != nil {
+	if out, err := d.zfs(ctx, "rename", "--", prevNew, prev); err != nil {
 		return fmt.Errorf("rename %s -> %s: %w: %s", prevNew, prev, err, out)
 	}
 	return nil
@@ -145,7 +182,7 @@ func (d *zfsDriver) DeleteDisk(ctx context.Context, path string) error {
 	if zvol == path {
 		return fmt.Errorf("zfs: cannot derive zvol name from %q", path)
 	}
-	if out, err := exec.CommandContext(ctx, "zfs", "destroy", "-r", zvol).CombinedOutput(); err != nil {
+	if out, err := exec.CommandContext(ctx, "zfs", "destroy", "-r", "--", zvol).CombinedOutput(); err != nil {
 		return fmt.Errorf("zfs destroy %s: %w: %s", zvol, err, out)
 	}
 	slog.Info("zvol destroyed", "zvol", zvol)

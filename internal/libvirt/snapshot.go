@@ -9,6 +9,8 @@ import (
 	"time"
 
 	golibvirt "github.com/digitalocean/go-libvirt"
+
+	"github.com/litevirt/litevirt/internal/qcow2"
 )
 
 // libvirt VIR_DOMAIN_SAVE_* flag values (not all exported as typed consts by
@@ -391,7 +393,12 @@ func (c *Client) CreateLiveSnapshot(domainName, snapshotName, vmstatePath string
 // earlier attempt that swapped overlay→base made qemu open the base file both
 // read-write as the disk AND read-only as its own backing → write-lock
 // self-deadlock).
-func (c *Client) RevertToLiveSnapshot(domainName, snapshotName, vmstatePath string, restorePreDefine func() error) error {
+//
+// rewriteSaved, when set, judges the saved image's definition before anything
+// is torn down and returns the definition to restore with (the CD-ROMs pointed
+// at the files judged on this host): it is passed to the restore as its
+// replacement XML and defined persistently. An error refuses the revert.
+func (c *Client) RevertToLiveSnapshot(domainName, snapshotName, vmstatePath string, restorePreDefine func() error, rewriteSaved func(savedXML string) (string, error)) error {
 	// Pre-flight: never start tearing the VM down if the RAM image is gone.
 	if _, err := os.Stat(vmstatePath); err != nil {
 		return fmt.Errorf("vmstate image %q missing — cannot restore memory snapshot: %w", vmstatePath, err)
@@ -436,6 +443,22 @@ func (c *Client) RevertToLiveSnapshot(domainName, snapshotName, vmstatePath stri
 	savedXML, err := c.virt.DomainSaveImageGetXMLDesc(vmstatePath, 0)
 	if err != nil {
 		return fmt.Errorf("read saved image XML: %w", err)
+	}
+	restoreXML := ""
+	if rewriteSaved != nil {
+		// Secure: the replacement must keep the graphics password the saved
+		// image carries.
+		secure, err := c.virt.DomainSaveImageGetXMLDesc(vmstatePath, uint32(golibvirt.DomainSaveImageXMLSecure))
+		if err != nil {
+			return fmt.Errorf("read saved image XML: %w", err)
+		}
+		rewritten, err := rewriteSaved(secure)
+		if err != nil {
+			return err
+		}
+		if rewritten != secure {
+			restoreXML, savedXML = rewritten, rewritten
+		}
 	}
 
 	// Destroy the running domain and wait for shutoff.
@@ -486,8 +509,10 @@ func (c *Client) RevertToLiveSnapshot(domainName, snapshotName, vmstatePath stri
 
 	// Restore the VM running from the snapshot-instant RAM. The saved XML's disk
 	// references (the overlays) are valid and now empty, so no Dxml override is
-	// needed; the chain is overlay→base→image with no file opened twice.
-	if err := c.restoreWithRetry(domainName, vmstatePath, ""); err != nil {
+	// needed for them; the chain is overlay→base→image with no file opened
+	// twice. Its CD-ROMs are the files judged here (rewriteSaved), when they
+	// differ.
+	if err := c.restoreWithRetry(domainName, vmstatePath, restoreXML); err != nil {
 		return fmt.Errorf("restore guest memory: %w", err)
 	}
 	if _, err := c.virt.DomainDefineXML(savedXML); err != nil {
@@ -509,7 +534,15 @@ func (c *Client) RevertToLiveSnapshot(domainName, snapshotName, vmstatePath stri
 // resetOverlay recreates overlay as a fresh, empty qcow2 backed by base,
 // discarding any prior contents. Used by the live-snapshot revert to roll a
 // disk back to its frozen base without touching the base itself.
+//
+// qemu-img create opens base (to read its size) with the format NAMED (-F
+// qcow2), never probed. base is the snapshot's frozen disk, written by qemu;
+// its header is still checked for an external data file first, which qemu
+// would open with it.
 func resetOverlay(overlay, base string) error {
+	if err := qcow2.AssertNoExternalData(base); err != nil {
+		return fmt.Errorf("snapshot base %s: %w", base, err)
+	}
 	_ = os.Remove(overlay)
 	cmd := exec.Command("qemu-img", "create", "-q", "-f", "qcow2", "-F", "qcow2", "-b", base, overlay)
 	if out, err := cmd.CombinedOutput(); err != nil {

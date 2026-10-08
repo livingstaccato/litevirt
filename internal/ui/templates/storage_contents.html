@@ -17,7 +17,7 @@
 {{else}}
 {{range .Contents}}
 <button type="button" class="search-result" style="width:100%;text-align:left;border:none;background:transparent;cursor:pointer"
-        onclick="window.pickStorageFile(this.dataset.path)" data-path="{{.Path}}">
+        onclick="window.pickStorageFile(this.dataset.path)" data-path="{{if .IsIso}}{{$.Pool}}/{{.Name}}{{else}}{{.Path}}{{end}}">
   <span>{{if .IsIso}}{{icon "disk"}} {{end}}{{.Name}}</span>
   <span class="muted" style="float:right;font-size:11px">{{formatBytes .SizeBytes}}</span>
 </button>

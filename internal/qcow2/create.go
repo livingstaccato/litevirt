@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"syscall"
 )
 
 // fsyncDir best-effort fsyncs a directory so a rename into it survives power
@@ -37,6 +38,10 @@ func closeAndCleanup(c io.Closer, path string, err error) error {
 
 // Create creates a new empty qcow2 v3 image at path with the given virtual size.
 // opts may be nil for defaults (64 KB clusters, 16-bit refcounts).
+//
+// Every Create* refuses a path that already exists (an error wrapping
+// fs.ErrExist): the image is built at a temp and published with a hard link,
+// never renamed over what is there.
 func Create(path string, sizeBytes uint64, opts *Options) error {
 	if sizeBytes == 0 {
 		return fmt.Errorf("virtual size must be > 0")
@@ -196,8 +201,12 @@ func createImage(path, backingPath, backingFormat string, sizeBytes uint64, opts
 
 	// Write to a temp file and atomically rename into place, then fsync the parent
 	// dir: a crash mid-write can't leave a partial/torn qcow2 at the real path.
-	tmpPath := path + ".tmp"
-	f, err := os.Create(tmpPath)
+	//
+	// The temp name is fresh and unpredictable (tempSibling), so two creates
+	// of one path never share it and nothing can be planted there; it is
+	// still created exclusively without following a final symlink.
+	tmpPath := tempSibling(path)
+	f, err := os.OpenFile(tmpPath, os.O_RDWR|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o644)
 	if err != nil {
 		return fmt.Errorf("create file: %w", err)
 	}
@@ -297,8 +306,8 @@ func createImage(path, backingPath, backingFormat string, sizeBytes uint64, opts
 	if err = Check(tmpPath); err != nil {
 		return fmt.Errorf("post-create check failed: %w", err)
 	}
-	if err = os.Rename(tmpPath, path); err != nil {
-		return fmt.Errorf("rename into place: %w", err)
+	if err = publishNoReplace(tmpPath, path); err != nil {
+		return err
 	}
 	committed = true
 	fsyncDir(filepath.Dir(path))

@@ -93,6 +93,7 @@ const (
 	LiteVirt_ImportImage_FullMethodName                = "/litevirt.v1.LiteVirt/ImportImage"
 	LiteVirt_PushImage_FullMethodName                  = "/litevirt.v1.LiteVirt/PushImage"
 	LiteVirt_BuildImage_FullMethodName                 = "/litevirt.v1.LiteVirt/BuildImage"
+	LiteVirt_PruneImages_FullMethodName                = "/litevirt.v1.LiteVirt/PruneImages"
 	LiteVirt_BackupVM_FullMethodName                   = "/litevirt.v1.LiteVirt/BackupVM"
 	LiteVirt_RestoreVM_FullMethodName                  = "/litevirt.v1.LiteVirt/RestoreVM"
 	LiteVirt_ImportVM_FullMethodName                   = "/litevirt.v1.LiteVirt/ImportVM"
@@ -217,7 +218,15 @@ const (
 	LiteVirt_RemoveSecurityGroupRule_FullMethodName    = "/litevirt.v1.LiteVirt/RemoveSecurityGroupRule"
 	LiteVirt_ListSecurityGroups_FullMethodName         = "/litevirt.v1.LiteVirt/ListSecurityGroups"
 	LiteVirt_DeleteStoragePoolContent_FullMethodName   = "/litevirt.v1.LiteVirt/DeleteStoragePoolContent"
+	LiteVirt_ListISOs_FullMethodName                   = "/litevirt.v1.LiteVirt/ListISOs"
+	LiteVirt_PullISO_FullMethodName                    = "/litevirt.v1.LiteVirt/PullISO"
+	LiteVirt_GetISOLibraryMode_FullMethodName          = "/litevirt.v1.LiteVirt/GetISOLibraryMode"
+	LiteVirt_SetISOLibraryMode_FullMethodName          = "/litevirt.v1.LiteVirt/SetISOLibraryMode"
+	LiteVirt_FetchISOLibraryFile_FullMethodName        = "/litevirt.v1.LiteVirt/FetchISOLibraryFile"
 	LiteVirt_PushReplicaIncrement_FullMethodName       = "/litevirt.v1.LiteVirt/PushReplicaIncrement"
+	LiteVirt_ListReplicas_FullMethodName               = "/litevirt.v1.LiteVirt/ListReplicas"
+	LiteVirt_PushReplica_FullMethodName                = "/litevirt.v1.LiteVirt/PushReplica"
+	LiteVirt_PruneReplicas_FullMethodName              = "/litevirt.v1.LiteVirt/PruneReplicas"
 	LiteVirt_Ping_FullMethodName                       = "/litevirt.v1.LiteVirt/Ping"
 	LiteVirt_Ready_FullMethodName                      = "/litevirt.v1.LiteVirt/Ready"
 	LiteVirt_ProvisionNetwork_FullMethodName           = "/litevirt.v1.LiteVirt/ProvisionNetwork"
@@ -298,6 +307,8 @@ const (
 	LiteVirt_ReleaseProjectCapacity_FullMethodName     = "/litevirt.v1.LiteVirt/ReleaseProjectCapacity"
 	LiteVirt_ReserveHostCapacity_FullMethodName        = "/litevirt.v1.LiteVirt/ReserveHostCapacity"
 	LiteVirt_ReleaseHostCapacity_FullMethodName        = "/litevirt.v1.LiteVirt/ReleaseHostCapacity"
+	LiteVirt_ImportLeftoverStatus_FullMethodName       = "/litevirt.v1.LiteVirt/ImportLeftoverStatus"
+	LiteVirt_PreflightRecreateVM_FullMethodName        = "/litevirt.v1.LiteVirt/PreflightRecreateVM"
 )
 
 // LiteVirtClient is the client API for LiteVirt service.
@@ -315,7 +326,7 @@ type LiteVirtClient interface {
 	GetClusterHealth(ctx context.Context, in *GetClusterHealthRequest, opts ...grpc.CallOption) (*ClusterHealth, error)
 	GetFenceReadiness(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*FenceReadiness, error)
 	RemoveHost(ctx context.Context, in *RemoveHostRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
-	AdmitHost(ctx context.Context, in *AdmitHostRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	AdmitHost(ctx context.Context, in *AdmitHostRequest, opts ...grpc.CallOption) (*AdmitHostResponse, error)
 	// Host network configuration (v48): intent CRUD runs anywhere (replicated
 	// rows); Plan and Apply are forwarded to the OWNING host — they read and
 	// mutate its local netplan state.
@@ -422,6 +433,7 @@ type LiteVirtClient interface {
 	ImportImage(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[ImportImageRequest, ImportImageResponse], error)
 	PushImage(ctx context.Context, in *PushImageRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PushImageProgress], error)
 	BuildImage(ctx context.Context, in *BuildImageRequest, opts ...grpc.CallOption) (*BuildImageResponse, error)
+	PruneImages(ctx context.Context, in *PruneImagesRequest, opts ...grpc.CallOption) (*PruneImagesResponse, error)
 	// ── Backup ──
 	BackupVM(ctx context.Context, in *BackupVMRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[BackupChunk], error)
 	RestoreVM(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[RestoreVMRequest, VM], error)
@@ -600,8 +612,31 @@ type LiteVirtClient interface {
 	RemoveSecurityGroupRule(ctx context.Context, in *RemoveSecurityGroupRuleRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	ListSecurityGroups(ctx context.Context, in *ListSecurityGroupsRequest, opts ...grpc.CallOption) (*ListSecurityGroupsResponse, error)
 	DeleteStoragePoolContent(ctx context.Context, in *DeleteStoragePoolContentRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// ── ISO libraries (docs/storage.md, "Installer ISOs") ──
+	// A VM names its installer ISO as <pool>/<file>.iso. ListISOs lists what
+	// the caller may name on a host: its projects' libraries, then the
+	// cluster-global library "isos".
+	ListISOs(ctx context.Context, in *ListISOsRequest, opts ...grpc.CallOption) (*ListISOsResponse, error)
+	// PullISO copies an ISO into a library from a URL (the image-pull limits
+	// apply) or, for an Admin, from a host path. A copy, never a link.
+	PullISO(ctx context.Context, in *PullISORequest, opts ...grpc.CallOption) (*PullISOResponse, error)
+	// GetISOLibraryMode / SetISOLibraryMode: where the global library lives —
+	// "sync" (a verified copy on every host) or "shared" (one pool on shared
+	// storage). Setting it needs the admin role and failover_scope_v1.
+	GetISOLibraryMode(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*ISOLibraryMode, error)
+	SetISOLibraryMode(ctx context.Context, in *SetISOLibraryModeRequest, opts ...grpc.CallOption) (*ISOLibraryMode, error)
+	// Peer-only: stream this host's copy of a global-library file whose sha256
+	// matches, so another host can sync it.
+	FetchISOLibraryFile(ctx context.Context, in *FetchISOLibraryFileRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[FetchISOLibraryFileChunk], error)
 	// Incremental replica push (dirty extents into a raw replica on a peer pool).
 	PushReplicaIncrement(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[PushReplicaIncrementRequest, PushReplicaIncrementResponse], error)
+	// Peer only: one VM's replica records in a pool (promotion, incremental fork
+	// base, and a sender's proof that the receiver records replicas).
+	ListReplicas(ctx context.Context, in *ListReplicasRequest, opts ...grpc.CallOption) (*ListReplicasResponse, error)
+	// Peer only: a full replica, written and recorded in the replica area.
+	PushReplica(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[PushReplicaRequest, PushReplicaResponse], error)
+	// Peer only: prune one schedule's recorded replicas of one disk.
+	PruneReplicas(ctx context.Context, in *PruneReplicasRequest, opts ...grpc.CallOption) (*PruneReplicasResponse, error)
 	// ── Internal ──
 	Ping(ctx context.Context, in *PingRequest, opts ...grpc.CallOption) (*PingResponse, error)
 	// Application-level readiness — see ReadyResponse. Ping says the endpoint is
@@ -851,6 +886,22 @@ type LiteVirtClient interface {
 	// ever terminates a capacity operation targeting the local host.
 	ReserveHostCapacity(ctx context.Context, in *ReserveHostCapacityRequest, opts ...grpc.CallOption) (*ReserveHostCapacityResponse, error)
 	ReleaseHostCapacity(ctx context.Context, in *ReleaseHostCapacityRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// ── Import leftovers on shared pools (peer-only) ──
+	//
+	// A host re-importing over a file in a pool it shares with other hosts asks
+	// them whether their own placement record shows that file as a leftover of
+	// a dead import of theirs, unchanged since. The answer comes from the
+	// answering host's record alone: it never opens a path the caller names.
+	ImportLeftoverStatus(ctx context.Context, in *ImportLeftoverStatusRequest, opts ...grpc.CallOption) (*ImportLeftoverStatusResponse, error)
+	// ── Re-create judgement (peer-only) ──
+	//
+	// A rebuild or a rolling recreate of a VM with an installer ISO places the
+	// new VM before it tears the old one down, and asks the host placement
+	// chose to judge the spec as its create there will — as the relayed
+	// caller, with the VM's own ISO grant — so a refusal leaves the VM intact.
+	// A host on an older build answers Unimplemented; its create judges no
+	// installer ISO.
+	PreflightRecreateVM(ctx context.Context, in *PreflightRecreateVMRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 }
 
 type liteVirtClient struct {
@@ -979,9 +1030,9 @@ func (c *liteVirtClient) RemoveHost(ctx context.Context, in *RemoveHostRequest, 
 	return out, nil
 }
 
-func (c *liteVirtClient) AdmitHost(ctx context.Context, in *AdmitHostRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+func (c *liteVirtClient) AdmitHost(ctx context.Context, in *AdmitHostRequest, opts ...grpc.CallOption) (*AdmitHostResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(emptypb.Empty)
+	out := new(AdmitHostResponse)
 	err := c.cc.Invoke(ctx, LiteVirt_AdmitHost_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
@@ -1708,6 +1759,16 @@ func (c *liteVirtClient) BuildImage(ctx context.Context, in *BuildImageRequest, 
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(BuildImageResponse)
 	err := c.cc.Invoke(ctx, LiteVirt_BuildImage_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) PruneImages(ctx context.Context, in *PruneImagesRequest, opts ...grpc.CallOption) (*PruneImagesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PruneImagesResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_PruneImages_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3038,9 +3099,68 @@ func (c *liteVirtClient) DeleteStoragePoolContent(ctx context.Context, in *Delet
 	return out, nil
 }
 
+func (c *liteVirtClient) ListISOs(ctx context.Context, in *ListISOsRequest, opts ...grpc.CallOption) (*ListISOsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListISOsResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_ListISOs_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) PullISO(ctx context.Context, in *PullISORequest, opts ...grpc.CallOption) (*PullISOResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PullISOResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_PullISO_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) GetISOLibraryMode(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*ISOLibraryMode, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ISOLibraryMode)
+	err := c.cc.Invoke(ctx, LiteVirt_GetISOLibraryMode_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) SetISOLibraryMode(ctx context.Context, in *SetISOLibraryModeRequest, opts ...grpc.CallOption) (*ISOLibraryMode, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ISOLibraryMode)
+	err := c.cc.Invoke(ctx, LiteVirt_SetISOLibraryMode_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) FetchISOLibraryFile(ctx context.Context, in *FetchISOLibraryFileRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[FetchISOLibraryFileChunk], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[29], LiteVirt_FetchISOLibraryFile_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[FetchISOLibraryFileRequest, FetchISOLibraryFileChunk]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type LiteVirt_FetchISOLibraryFileClient = grpc.ServerStreamingClient[FetchISOLibraryFileChunk]
+
 func (c *liteVirtClient) PushReplicaIncrement(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[PushReplicaIncrementRequest, PushReplicaIncrementResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[29], LiteVirt_PushReplicaIncrement_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[30], LiteVirt_PushReplicaIncrement_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3050,6 +3170,39 @@ func (c *liteVirtClient) PushReplicaIncrement(ctx context.Context, opts ...grpc.
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type LiteVirt_PushReplicaIncrementClient = grpc.ClientStreamingClient[PushReplicaIncrementRequest, PushReplicaIncrementResponse]
+
+func (c *liteVirtClient) ListReplicas(ctx context.Context, in *ListReplicasRequest, opts ...grpc.CallOption) (*ListReplicasResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListReplicasResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_ListReplicas_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) PushReplica(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[PushReplicaRequest, PushReplicaResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[31], LiteVirt_PushReplica_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[PushReplicaRequest, PushReplicaResponse]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type LiteVirt_PushReplicaClient = grpc.ClientStreamingClient[PushReplicaRequest, PushReplicaResponse]
+
+func (c *liteVirtClient) PruneReplicas(ctx context.Context, in *PruneReplicasRequest, opts ...grpc.CallOption) (*PruneReplicasResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PruneReplicasResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_PruneReplicas_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
 
 func (c *liteVirtClient) Ping(ctx context.Context, in *PingRequest, opts ...grpc.CallOption) (*PingResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
@@ -3173,7 +3326,7 @@ func (c *liteVirtClient) CleanupMigrationArtifacts(ctx context.Context, in *Clea
 
 func (c *liteVirtClient) ReceiveMigrationDisk(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[ReceiveMigrationDiskRequest, ReceiveMigrationDiskResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[30], LiteVirt_ReceiveMigrationDisk_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[32], LiteVirt_ReceiveMigrationDisk_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3236,7 +3389,7 @@ func (c *liteVirtClient) GetStateDump(ctx context.Context, in *emptypb.Empty, op
 
 func (c *liteVirtClient) StreamStateDump(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (grpc.ServerStreamingClient[StateDumpChunk], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[31], LiteVirt_StreamStateDump_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[33], LiteVirt_StreamStateDump_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3255,7 +3408,7 @@ type LiteVirt_StreamStateDumpClient = grpc.ServerStreamingClient[StateDumpChunk]
 
 func (c *liteVirtClient) StreamTableDump(ctx context.Context, in *TableDumpRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[StateDumpChunk], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[32], LiteVirt_StreamTableDump_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[34], LiteVirt_StreamTableDump_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3284,7 +3437,7 @@ func (c *liteVirtClient) GetSensitiveStateDigest(ctx context.Context, in *Sensit
 
 func (c *liteVirtClient) StreamSensitiveStateDump(ctx context.Context, in *SensitiveStateRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[StateDumpChunk], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[33], LiteVirt_StreamSensitiveStateDump_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[35], LiteVirt_StreamSensitiveStateDump_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3313,7 +3466,7 @@ func (c *liteVirtClient) GetTableBucketDigests(ctx context.Context, in *BucketDi
 
 func (c *liteVirtClient) StreamTableRows(ctx context.Context, in *TableDumpRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[TableRowsPage], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[34], LiteVirt_StreamTableRows_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[36], LiteVirt_StreamTableRows_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3332,7 +3485,7 @@ type LiteVirt_StreamTableRowsClient = grpc.ServerStreamingClient[TableRowsPage]
 
 func (c *liteVirtClient) StreamSensitiveTableRows(ctx context.Context, in *SensitiveStateRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[TableRowsPage], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[35], LiteVirt_StreamSensitiveTableRows_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[37], LiteVirt_StreamSensitiveTableRows_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3401,7 +3554,7 @@ func (c *liteVirtClient) GetRecoveryClaim(ctx context.Context, in *GetRecoveryCl
 
 func (c *liteVirtClient) ListRecoveryClaims(ctx context.Context, in *ListRecoveryClaimsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[RecoveryClaimState], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[36], LiteVirt_ListRecoveryClaims_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[38], LiteVirt_ListRecoveryClaims_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3630,7 +3783,7 @@ func (c *liteVirtClient) RegionStatus(ctx context.Context, in *RegionStatusReque
 
 func (c *liteVirtClient) CrossRegionMigrate(ctx context.Context, in *CrossRegionMigrateRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[MigrateProgress], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[37], LiteVirt_CrossRegionMigrate_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[39], LiteVirt_CrossRegionMigrate_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3759,7 +3912,7 @@ func (c *liteVirtClient) DeleteReplicationSchedule(ctx context.Context, in *Dele
 
 func (c *liteVirtClient) PromoteReplica(ctx context.Context, in *PromoteReplicaRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PromoteReplicaProgress], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[38], LiteVirt_PromoteReplica_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[40], LiteVirt_PromoteReplica_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3926,6 +4079,26 @@ func (c *liteVirtClient) ReleaseHostCapacity(ctx context.Context, in *ReleaseHos
 	return out, nil
 }
 
+func (c *liteVirtClient) ImportLeftoverStatus(ctx context.Context, in *ImportLeftoverStatusRequest, opts ...grpc.CallOption) (*ImportLeftoverStatusResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ImportLeftoverStatusResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_ImportLeftoverStatus_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) PreflightRecreateVM(ctx context.Context, in *PreflightRecreateVMRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, LiteVirt_PreflightRecreateVM_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // LiteVirtServer is the server API for LiteVirt service.
 // All implementations must embed UnimplementedLiteVirtServer
 // for forward compatibility.
@@ -3941,7 +4114,7 @@ type LiteVirtServer interface {
 	GetClusterHealth(context.Context, *GetClusterHealthRequest) (*ClusterHealth, error)
 	GetFenceReadiness(context.Context, *emptypb.Empty) (*FenceReadiness, error)
 	RemoveHost(context.Context, *RemoveHostRequest) (*emptypb.Empty, error)
-	AdmitHost(context.Context, *AdmitHostRequest) (*emptypb.Empty, error)
+	AdmitHost(context.Context, *AdmitHostRequest) (*AdmitHostResponse, error)
 	// Host network configuration (v48): intent CRUD runs anywhere (replicated
 	// rows); Plan and Apply are forwarded to the OWNING host — they read and
 	// mutate its local netplan state.
@@ -4048,6 +4221,7 @@ type LiteVirtServer interface {
 	ImportImage(grpc.ClientStreamingServer[ImportImageRequest, ImportImageResponse]) error
 	PushImage(*PushImageRequest, grpc.ServerStreamingServer[PushImageProgress]) error
 	BuildImage(context.Context, *BuildImageRequest) (*BuildImageResponse, error)
+	PruneImages(context.Context, *PruneImagesRequest) (*PruneImagesResponse, error)
 	// ── Backup ──
 	BackupVM(*BackupVMRequest, grpc.ServerStreamingServer[BackupChunk]) error
 	RestoreVM(grpc.ClientStreamingServer[RestoreVMRequest, VM]) error
@@ -4226,8 +4400,31 @@ type LiteVirtServer interface {
 	RemoveSecurityGroupRule(context.Context, *RemoveSecurityGroupRuleRequest) (*emptypb.Empty, error)
 	ListSecurityGroups(context.Context, *ListSecurityGroupsRequest) (*ListSecurityGroupsResponse, error)
 	DeleteStoragePoolContent(context.Context, *DeleteStoragePoolContentRequest) (*emptypb.Empty, error)
+	// ── ISO libraries (docs/storage.md, "Installer ISOs") ──
+	// A VM names its installer ISO as <pool>/<file>.iso. ListISOs lists what
+	// the caller may name on a host: its projects' libraries, then the
+	// cluster-global library "isos".
+	ListISOs(context.Context, *ListISOsRequest) (*ListISOsResponse, error)
+	// PullISO copies an ISO into a library from a URL (the image-pull limits
+	// apply) or, for an Admin, from a host path. A copy, never a link.
+	PullISO(context.Context, *PullISORequest) (*PullISOResponse, error)
+	// GetISOLibraryMode / SetISOLibraryMode: where the global library lives —
+	// "sync" (a verified copy on every host) or "shared" (one pool on shared
+	// storage). Setting it needs the admin role and failover_scope_v1.
+	GetISOLibraryMode(context.Context, *emptypb.Empty) (*ISOLibraryMode, error)
+	SetISOLibraryMode(context.Context, *SetISOLibraryModeRequest) (*ISOLibraryMode, error)
+	// Peer-only: stream this host's copy of a global-library file whose sha256
+	// matches, so another host can sync it.
+	FetchISOLibraryFile(*FetchISOLibraryFileRequest, grpc.ServerStreamingServer[FetchISOLibraryFileChunk]) error
 	// Incremental replica push (dirty extents into a raw replica on a peer pool).
 	PushReplicaIncrement(grpc.ClientStreamingServer[PushReplicaIncrementRequest, PushReplicaIncrementResponse]) error
+	// Peer only: one VM's replica records in a pool (promotion, incremental fork
+	// base, and a sender's proof that the receiver records replicas).
+	ListReplicas(context.Context, *ListReplicasRequest) (*ListReplicasResponse, error)
+	// Peer only: a full replica, written and recorded in the replica area.
+	PushReplica(grpc.ClientStreamingServer[PushReplicaRequest, PushReplicaResponse]) error
+	// Peer only: prune one schedule's recorded replicas of one disk.
+	PruneReplicas(context.Context, *PruneReplicasRequest) (*PruneReplicasResponse, error)
 	// ── Internal ──
 	Ping(context.Context, *PingRequest) (*PingResponse, error)
 	// Application-level readiness — see ReadyResponse. Ping says the endpoint is
@@ -4477,6 +4674,22 @@ type LiteVirtServer interface {
 	// ever terminates a capacity operation targeting the local host.
 	ReserveHostCapacity(context.Context, *ReserveHostCapacityRequest) (*ReserveHostCapacityResponse, error)
 	ReleaseHostCapacity(context.Context, *ReleaseHostCapacityRequest) (*emptypb.Empty, error)
+	// ── Import leftovers on shared pools (peer-only) ──
+	//
+	// A host re-importing over a file in a pool it shares with other hosts asks
+	// them whether their own placement record shows that file as a leftover of
+	// a dead import of theirs, unchanged since. The answer comes from the
+	// answering host's record alone: it never opens a path the caller names.
+	ImportLeftoverStatus(context.Context, *ImportLeftoverStatusRequest) (*ImportLeftoverStatusResponse, error)
+	// ── Re-create judgement (peer-only) ──
+	//
+	// A rebuild or a rolling recreate of a VM with an installer ISO places the
+	// new VM before it tears the old one down, and asks the host placement
+	// chose to judge the spec as its create there will — as the relayed
+	// caller, with the VM's own ISO grant — so a refusal leaves the VM intact.
+	// A host on an older build answers Unimplemented; its create judges no
+	// installer ISO.
+	PreflightRecreateVM(context.Context, *PreflightRecreateVMRequest) (*emptypb.Empty, error)
 	mustEmbedUnimplementedLiteVirtServer()
 }
 
@@ -4517,7 +4730,7 @@ func (UnimplementedLiteVirtServer) GetFenceReadiness(context.Context, *emptypb.E
 func (UnimplementedLiteVirtServer) RemoveHost(context.Context, *RemoveHostRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method RemoveHost not implemented")
 }
-func (UnimplementedLiteVirtServer) AdmitHost(context.Context, *AdmitHostRequest) (*emptypb.Empty, error) {
+func (UnimplementedLiteVirtServer) AdmitHost(context.Context, *AdmitHostRequest) (*AdmitHostResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method AdmitHost not implemented")
 }
 func (UnimplementedLiteVirtServer) ListHostNetworks(context.Context, *ListHostNetworksRequest) (*ListHostNetworksResponse, error) {
@@ -4705,6 +4918,9 @@ func (UnimplementedLiteVirtServer) PushImage(*PushImageRequest, grpc.ServerStrea
 }
 func (UnimplementedLiteVirtServer) BuildImage(context.Context, *BuildImageRequest) (*BuildImageResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method BuildImage not implemented")
+}
+func (UnimplementedLiteVirtServer) PruneImages(context.Context, *PruneImagesRequest) (*PruneImagesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PruneImages not implemented")
 }
 func (UnimplementedLiteVirtServer) BackupVM(*BackupVMRequest, grpc.ServerStreamingServer[BackupChunk]) error {
 	return status.Error(codes.Unimplemented, "method BackupVM not implemented")
@@ -5078,8 +5294,32 @@ func (UnimplementedLiteVirtServer) ListSecurityGroups(context.Context, *ListSecu
 func (UnimplementedLiteVirtServer) DeleteStoragePoolContent(context.Context, *DeleteStoragePoolContentRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method DeleteStoragePoolContent not implemented")
 }
+func (UnimplementedLiteVirtServer) ListISOs(context.Context, *ListISOsRequest) (*ListISOsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListISOs not implemented")
+}
+func (UnimplementedLiteVirtServer) PullISO(context.Context, *PullISORequest) (*PullISOResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PullISO not implemented")
+}
+func (UnimplementedLiteVirtServer) GetISOLibraryMode(context.Context, *emptypb.Empty) (*ISOLibraryMode, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetISOLibraryMode not implemented")
+}
+func (UnimplementedLiteVirtServer) SetISOLibraryMode(context.Context, *SetISOLibraryModeRequest) (*ISOLibraryMode, error) {
+	return nil, status.Error(codes.Unimplemented, "method SetISOLibraryMode not implemented")
+}
+func (UnimplementedLiteVirtServer) FetchISOLibraryFile(*FetchISOLibraryFileRequest, grpc.ServerStreamingServer[FetchISOLibraryFileChunk]) error {
+	return status.Error(codes.Unimplemented, "method FetchISOLibraryFile not implemented")
+}
 func (UnimplementedLiteVirtServer) PushReplicaIncrement(grpc.ClientStreamingServer[PushReplicaIncrementRequest, PushReplicaIncrementResponse]) error {
 	return status.Error(codes.Unimplemented, "method PushReplicaIncrement not implemented")
+}
+func (UnimplementedLiteVirtServer) ListReplicas(context.Context, *ListReplicasRequest) (*ListReplicasResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListReplicas not implemented")
+}
+func (UnimplementedLiteVirtServer) PushReplica(grpc.ClientStreamingServer[PushReplicaRequest, PushReplicaResponse]) error {
+	return status.Error(codes.Unimplemented, "method PushReplica not implemented")
+}
+func (UnimplementedLiteVirtServer) PruneReplicas(context.Context, *PruneReplicasRequest) (*PruneReplicasResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PruneReplicas not implemented")
 }
 func (UnimplementedLiteVirtServer) Ping(context.Context, *PingRequest) (*PingResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Ping not implemented")
@@ -5320,6 +5560,12 @@ func (UnimplementedLiteVirtServer) ReserveHostCapacity(context.Context, *Reserve
 }
 func (UnimplementedLiteVirtServer) ReleaseHostCapacity(context.Context, *ReleaseHostCapacityRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method ReleaseHostCapacity not implemented")
+}
+func (UnimplementedLiteVirtServer) ImportLeftoverStatus(context.Context, *ImportLeftoverStatusRequest) (*ImportLeftoverStatusResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ImportLeftoverStatus not implemented")
+}
+func (UnimplementedLiteVirtServer) PreflightRecreateVM(context.Context, *PreflightRecreateVMRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method PreflightRecreateVM not implemented")
 }
 func (UnimplementedLiteVirtServer) mustEmbedUnimplementedLiteVirtServer() {}
 func (UnimplementedLiteVirtServer) testEmbeddedByValue()                  {}
@@ -6513,6 +6759,24 @@ func _LiteVirt_BuildImage_Handler(srv interface{}, ctx context.Context, dec func
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).BuildImage(ctx, req.(*BuildImageRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_PruneImages_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PruneImagesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).PruneImages(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_PruneImages_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).PruneImages(ctx, req.(*PruneImagesRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -8649,12 +8913,138 @@ func _LiteVirt_DeleteStoragePoolContent_Handler(srv interface{}, ctx context.Con
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_ListISOs_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListISOsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ListISOs(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ListISOs_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ListISOs(ctx, req.(*ListISOsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_PullISO_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PullISORequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).PullISO(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_PullISO_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).PullISO(ctx, req.(*PullISORequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_GetISOLibraryMode_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(emptypb.Empty)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).GetISOLibraryMode(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_GetISOLibraryMode_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).GetISOLibraryMode(ctx, req.(*emptypb.Empty))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_SetISOLibraryMode_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetISOLibraryModeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).SetISOLibraryMode(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_SetISOLibraryMode_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).SetISOLibraryMode(ctx, req.(*SetISOLibraryModeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_FetchISOLibraryFile_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(FetchISOLibraryFileRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(LiteVirtServer).FetchISOLibraryFile(m, &grpc.GenericServerStream[FetchISOLibraryFileRequest, FetchISOLibraryFileChunk]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type LiteVirt_FetchISOLibraryFileServer = grpc.ServerStreamingServer[FetchISOLibraryFileChunk]
+
 func _LiteVirt_PushReplicaIncrement_Handler(srv interface{}, stream grpc.ServerStream) error {
 	return srv.(LiteVirtServer).PushReplicaIncrement(&grpc.GenericServerStream[PushReplicaIncrementRequest, PushReplicaIncrementResponse]{ServerStream: stream})
 }
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type LiteVirt_PushReplicaIncrementServer = grpc.ClientStreamingServer[PushReplicaIncrementRequest, PushReplicaIncrementResponse]
+
+func _LiteVirt_ListReplicas_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListReplicasRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ListReplicas(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ListReplicas_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ListReplicas(ctx, req.(*ListReplicasRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_PushReplica_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(LiteVirtServer).PushReplica(&grpc.GenericServerStream[PushReplicaRequest, PushReplicaResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type LiteVirt_PushReplicaServer = grpc.ClientStreamingServer[PushReplicaRequest, PushReplicaResponse]
+
+func _LiteVirt_PruneReplicas_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PruneReplicasRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).PruneReplicas(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_PruneReplicas_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).PruneReplicas(ctx, req.(*PruneReplicasRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
 
 func _LiteVirt_Ping_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(PingRequest)
@@ -10029,6 +10419,42 @@ func _LiteVirt_ReleaseHostCapacity_Handler(srv interface{}, ctx context.Context,
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_ImportLeftoverStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ImportLeftoverStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ImportLeftoverStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ImportLeftoverStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ImportLeftoverStatus(ctx, req.(*ImportLeftoverStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_PreflightRecreateVM_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PreflightRecreateVMRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).PreflightRecreateVM(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_PreflightRecreateVM_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).PreflightRecreateVM(ctx, req.(*PreflightRecreateVMRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // LiteVirt_ServiceDesc is the grpc.ServiceDesc for LiteVirt service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -10259,6 +10685,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "BuildImage",
 			Handler:    _LiteVirt_BuildImage_Handler,
+		},
+		{
+			MethodName: "PruneImages",
+			Handler:    _LiteVirt_PruneImages_Handler,
 		},
 		{
 			MethodName: "CreateSnapshot",
@@ -10709,6 +11139,30 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _LiteVirt_DeleteStoragePoolContent_Handler,
 		},
 		{
+			MethodName: "ListISOs",
+			Handler:    _LiteVirt_ListISOs_Handler,
+		},
+		{
+			MethodName: "PullISO",
+			Handler:    _LiteVirt_PullISO_Handler,
+		},
+		{
+			MethodName: "GetISOLibraryMode",
+			Handler:    _LiteVirt_GetISOLibraryMode_Handler,
+		},
+		{
+			MethodName: "SetISOLibraryMode",
+			Handler:    _LiteVirt_SetISOLibraryMode_Handler,
+		},
+		{
+			MethodName: "ListReplicas",
+			Handler:    _LiteVirt_ListReplicas_Handler,
+		},
+		{
+			MethodName: "PruneReplicas",
+			Handler:    _LiteVirt_PruneReplicas_Handler,
+		},
+		{
 			MethodName: "Ping",
 			Handler:    _LiteVirt_Ping_Handler,
 		},
@@ -10992,6 +11446,14 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 			MethodName: "ReleaseHostCapacity",
 			Handler:    _LiteVirt_ReleaseHostCapacity_Handler,
 		},
+		{
+			MethodName: "ImportLeftoverStatus",
+			Handler:    _LiteVirt_ImportLeftoverStatus_Handler,
+		},
+		{
+			MethodName: "PreflightRecreateVM",
+			Handler:    _LiteVirt_PreflightRecreateVM_Handler,
+		},
 	},
 	Streams: []grpc.StreamDesc{
 		{
@@ -11143,8 +11605,18 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 			ClientStreams: true,
 		},
 		{
+			StreamName:    "FetchISOLibraryFile",
+			Handler:       _LiteVirt_FetchISOLibraryFile_Handler,
+			ServerStreams: true,
+		},
+		{
 			StreamName:    "PushReplicaIncrement",
 			Handler:       _LiteVirt_PushReplicaIncrement_Handler,
+			ClientStreams: true,
+		},
+		{
+			StreamName:    "PushReplica",
+			Handler:       _LiteVirt_PushReplica_Handler,
 			ClientStreams: true,
 		},
 		{

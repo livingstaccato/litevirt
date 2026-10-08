@@ -3,13 +3,13 @@ package grpcapi
 import (
 	"context"
 	"errors"
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
+	"github.com/litevirt/litevirt/internal/qcow2"
 )
 
 // failingBackupSource refuses to open a backup session, which is how the
@@ -32,8 +32,9 @@ func seedReplicationVM(t *testing.T, s *Server, vmName, state string) string {
 	ctx := context.Background()
 	srcDir := t.TempDir()
 	srcPath := filepath.Join(srcDir, "root.qcow2")
-	if err := os.WriteFile(srcPath, []byte("source image"), 0o600); err != nil {
-		t.Fatalf("write source: %v", err)
+	// A real qcow2: a VM disk is one, and the copy names -f qcow2.
+	if err := qcow2.Create(srcPath, 1<<20, nil); err != nil {
+		t.Fatalf("create source: %v", err)
 	}
 	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
 		Name: vmName, HostName: s.hostName, State: state, Spec: `{}`,
@@ -80,6 +81,7 @@ func TestRunReplication_NoSilentDowngradeOnARunningSource(t *testing.T) {
 // the test above.
 func TestRunReplication_AStoppedSourceStillFallsBack(t *testing.T) {
 	s := testServer(t)
+	s.dataDir = t.TempDir() // where the replica's record is written
 	s.SetBackupSource(failingBackupSource{})
 	dir := seedReplicationVM(t, s, "web-2", "stopped")
 	fake := libvirtfake.New()

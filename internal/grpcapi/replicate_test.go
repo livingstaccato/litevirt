@@ -17,7 +17,7 @@ func TestReplicateVolume_SameResolvedPathRejected(t *testing.T) {
 	s := testServer(t)
 	s.hostName = "test-host"
 	s.dataDir = t.TempDir()
-	dstDir := filepath.Join(s.dataDir, "warm")
+	dstDir := filepath.Join(s.dataDir, "pools", "warm")
 	srcPath := filepath.Join(dstDir, "vm1-root.qcow2")
 	s.SetStoragePoolsByName(map[string]StoragePoolRef{
 		"warm": {Driver: "local", Target: dstDir},
@@ -36,9 +36,11 @@ func TestReplicateVolume_SameResolvedPathRejected(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 
+	// A derived destination is always a new file, so only a named one can
+	// resolve to the source: an admin naming the disk's own path.
 	rec := &streamRecorder[pb.ReplicateVolumeProgress]{ctx: adminCtx()}
 	err := s.ReplicateVolume(&pb.ReplicateVolumeRequest{
-		VmName: "vm1", DiskName: "root", TargetPool: "warm",
+		VmName: "vm1", DiskName: "root", TargetPool: "warm", TargetPath: srcPath,
 	}, rec)
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("ReplicateVolume code = %v, want FailedPrecondition; err = %v", status.Code(err), err)

@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/netip"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -48,6 +49,10 @@ type Server struct {
 	// supersededRetentionDays is superseded_disk_retention_days, reported by
 	// SupersededDisks (superseded_disks.go).
 	supersededRetentionDays int
+
+	// isoLib holds the ISO library's per-host state: the sha256 cache of
+	// library files and the one-sync-pass-at-a-time lock (iso_library.go).
+	isoLib isoLibraryState
 
 	// Admission-gate local-inventory cache (see localInventoryCached).
 	invCacheMu sync.Mutex
@@ -288,6 +293,10 @@ type Server struct {
 	// (internal/pki InstallQemuMigrationTLS) and reports whether they are in
 	// place. nil means never: a storage copy then falls to the plaintext guard.
 	migrationTLS func() (bool, error)
+	// isoResolvedWithheld makes EnsureDisks answer as a target older than
+	// installer_iso_resolved does (no map), for tests of a new source against
+	// a main target.
+	isoResolvedWithheld bool
 	// enfCanonicalIdentity is this node's kill-switch for natural-key identity
 	// resolution (snapshots/container_snapshots); gated by this flag AND the
 	// CanonicalIdentityV1 latch. Advertised CONDITIONALLY on this flag (like
@@ -365,6 +374,10 @@ type Server struct {
 	// voterChangeMu serializes automatic genesis with `lv cluster voter`
 	// changes on this node, so one process proposes one change at a time.
 	voterChangeMu sync.Mutex
+
+	// imagePrune bounds and serializes the image-version prune, and holds
+	// the images an in-flight disk create uses (image_prune.go).
+	imagePrune imagePruneState
 
 	// SR-IOV policy (host-local). sriovManaged + sriovManagedPFs is the allowlist of
 	// PF BDFs (canonical) litevirt may create a VF pool on; sriovMaxVFs caps that
@@ -517,6 +530,11 @@ type Server struct {
 	// all shared one sweep" a fact the test establishes rather than races for.
 	leaseBarrierJoined func()
 
+	// liveRestoreExports records, for each overlay a running RestoreLive made
+	// (by its resolved path), the NBD export it serves the overlay from — the
+	// one protocol backing a start admits (liveRestoreExportOf).
+	liveRestoreExports sync.Map // string → liveRestoreExport
+
 	// peerClientOverride is a test seam for the PR-4 peer backup/restore streaming
 	// helpers (dialPeer): when non-nil it returns a fake LiteVirtClient + closer
 	// instead of dialing a real peer over mTLS, so the owner→sink push path is
@@ -565,6 +583,21 @@ type Server struct {
 	storagePoolsMu sync.RWMutex
 	storagePools   map[string]StoragePoolRef
 
+	// poolUploadsMu serializes the read-modify-write of <data_dir>/pool-uploads.json
+	// (storage_pool_confine.go).
+	poolUploadsMu sync.Mutex
+	// epochCache caches each shared store's records epoch (store id →
+	// epochEntry); hostStoresMu serializes this host's stores row
+	// (pool_records.go).
+	epochCache   sync.Map
+	hostStoresMu sync.Mutex
+	// importPrunes is the pool directories whose placement-record prune is
+	// running (vmimport_placement.go). Zero value ready.
+	importPrunes sync.Map
+	// placementLstatOverride is a TEST SEAM for the prune's stat; nil in
+	// production.
+	placementLstatOverride func(string) (os.FileInfo, error)
+
 	// migrationStubs is what EnsureDisks created on this host as a migration
 	// target: the only disk files this host hands to a mirror or removes after
 	// a failed attempt (migrate_stubs.go). Zero value ready.
@@ -601,6 +634,14 @@ type Server struct {
 	// diskSpaceOverride is a TEST SEAM for the free-space checks of a cold
 	// migration's disk copy (diskSpace). Nil in production.
 	diskSpaceOverride func(dir string) (avail, total uint64, err error)
+
+	// importSpace holds the disk space each running import on this host has
+	// reserved and not yet written (reserveImportSpace), so the free-space
+	// checks before each write are not glances two imports pass together.
+	importSpace importSpaceLedger
+	// fsKeyOverride is a TEST SEAM naming the filesystem a directory is on,
+	// for the import space ledger (importFSKey). Nil in production.
+	fsKeyOverride func(dir string) string
 
 	// firmwareTargets is what EnsureFirmwareState defined on this host as a
 	// cold firmware migration target, by attempt: the only domains
@@ -1220,6 +1261,10 @@ func (s *Server) SetAllowUnencryptedStorageMigration(on bool) { s.allowPlaintext
 // credentials for QEMU and reports whether they are ready. It runs on the
 // source before a storage copy and on the target in EnsureDisks.
 func (s *Server) SetMigrationTLS(fn func() (bool, error)) { s.migrationTLS = fn }
+
+// AnswerEnsureDisksAsAnOlderTargetForTest makes this host's EnsureDisks return
+// no installer_iso_resolved, as a target on main does.
+func (s *Server) AnswerEnsureDisksAsAnOlderTargetForTest(v bool) { s.isoResolvedWithheld = v }
 
 // migrationTLSReady runs the hook. An error means not ready; it is logged, not
 // returned, because the caller decides between refusing and the plaintext

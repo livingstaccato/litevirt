@@ -343,6 +343,14 @@ func (ae *AntiEntropy) checkPeer(ctx context.Context, peerName string, localMap,
 	}
 
 	ae.checkSensitivePeer(ctx, client, peerName, sensitiveMap, full, usersUnjudged)
+	// A completed exchange with a seeded peer that is not holding its own audit
+	// rows leaves this replica holding everything that peer held: seeded too
+	// (audit_seeded.go). An older peer does not say, and does not seed.
+	if completed && resp.GetAuditSeeded() {
+		if err := ae.client.MarkAuditSeeded(ctx, "completed an anti-entropy exchange with seeded peer "+peerName); err != nil {
+			slog.Warn("could not record this replica as seeded", "peer", peerName, "error", err)
+		}
+	}
 	return completed
 }
 

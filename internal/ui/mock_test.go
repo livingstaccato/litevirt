@@ -90,6 +90,7 @@ type mockGRPC struct {
 	lastSetLabelsVMReq     *pb.SetVMLabelsRequest
 	setLabelsVMErr         error
 	poolContentsResp       *pb.ListStoragePoolContentsResponse
+	listISOsResp           *pb.ListISOsResponse
 	poolContentsErr        error
 	lastPoolContentsReq    *pb.ListStoragePoolContentsRequest
 	listVMHardwareResp     *pb.ListVMHardwareResponse
@@ -944,6 +945,12 @@ func (m *mockGRPC) ListStoragePoolContents(_ context.Context, in *pb.ListStorage
 		return m.poolContentsResp, nil
 	}
 	return &pb.ListStoragePoolContentsResponse{}, nil
+}
+func (m *mockGRPC) ListISOs(context.Context, *pb.ListISOsRequest, ...grpc.CallOption) (*pb.ListISOsResponse, error) {
+	if m.listISOsResp != nil {
+		return m.listISOsResp, nil
+	}
+	return &pb.ListISOsResponse{}, nil
 }
 func (m *mockGRPC) DeleteStoragePoolContent(context.Context, *pb.DeleteStoragePoolContentRequest, ...grpc.CallOption) (*emptypb.Empty, error) {
 	return &emptypb.Empty{}, nil

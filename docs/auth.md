@@ -130,6 +130,29 @@ binding can:
   calls (an entry-node forward, cross-host replication, auto-promote) authenticate as a
   cluster host cert and bypass this tenant check — a deliberate peer-trust boundary:
   any known cluster host cert can reach pool contents via these RPCs.
+- **Host filesystem paths in storage** (`storage.hostpath`) are checked at `/`.
+  A pool or compose volume that names a directory or file on the host (a `dir`
+  pool, a `--target`, a btrfs source, NFS mount options, a Ceph conf or
+  keyring), any network-backed pool (`nfs`, `ceph`, `iscsi`), any pool on
+  host block storage (`zfs`, `lvm-thin`), a compose
+  `backup-repos:` path, a custom absolute `repo_path`, and any `target_path` on
+  a restore or `ReplicateVolume` RPC (a bare name included), and an import's
+  `--server-path` or `--disk-map` outside `<data_dir>/imports/staging` all need
+  it, because the daemon reads and writes there as root (the legacy `admin`
+  role keeps it too, as before). Only `Admin` holds it (through `*`): `Operator` holds
+  `storage.pool.write` but not this, at any path. A custom role gets it by
+  naming it or `storage.*`. Without bindings the floor is `admin`. Using a pool
+  an admin created — disks on a `zfs` or `lvm-thin` pool included — needs only
+  the project's ordinary VM and disk permissions. See
+  [storage.md](storage.md#host-paths).
+- **Installer ISOs** (`VMSpec.iso`) are a read of a host file by the guest, so a
+  VM names one from a library as `pool/file.iso`. The global library `isos` is
+  open to every VM and written only with `storage.library.write` at `/` (Admin);
+  any other pool needs `storage.content.read` on it (and its project's VMs only),
+  and is written with `storage.content.write`. A pool the host refuses offers
+  no ISO. An absolute host path needs `storage.hostpath` at `/`, which only
+  Admin holds, as does `lv iso pull --from-host-path`. See
+  [storage.md](storage.md#installer-isos).
 - **Security groups** (`sg.write`: `lv sg create/rm/rule-add/rule-rm`) are
   cluster-global, bound to NICs by name, and checked at `/`. Admin and
   NetworkAdmin hold `sg.write`; Operator holds only `sg.read`. Binding groups to
@@ -487,7 +510,10 @@ it to impersonate a user.
 > (`GetRuntimeInventory`/`CheckVIPParticipant`/`CheckLBPresent`),
 > `FetchBinary`, `GetVMIPRemote`, proof-bearing `PromoteReplica`/`ApplyLB`, and the
 > peer-gated `ProvisionNetwork`/`SyncVTEP`/`UpdateFDB`/`RefreshLB`/
-> `PushReplicaIncrement`. Not enforced today.
+> `PushReplicaIncrement`. Not enforced today. (`ListReplicas`, `PruneReplicas`
+> and `PushReplica` ARE peer-only, enforced: a replica's record is written and
+> read only by cluster hosts. `UploadStoragePoolContent` refuses a header with
+> any field the receiver does not know, so no replica rides on an upload.)
 
 ### Who can read the state dump
 

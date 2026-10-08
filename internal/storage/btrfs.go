@@ -34,7 +34,7 @@ func (d *btrfsDriver) Prepare(ctx context.Context) error {
 		return fmt.Errorf("btrfs: create subvol root: %w", err)
 	}
 	// `btrfs filesystem show <path>` confirms the path lives on btrfs.
-	out, err := exec.CommandContext(ctx, "btrfs", "filesystem", "show", d.subvolRoot).CombinedOutput()
+	out, err := exec.CommandContext(ctx, "btrfs", "filesystem", "show", "--", d.subvolRoot).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("btrfs filesystem show %s: %w: %s", d.subvolRoot, err, out)
 	}
@@ -43,7 +43,7 @@ func (d *btrfsDriver) Prepare(ctx context.Context) error {
 
 func (d *btrfsDriver) CreateDisk(ctx context.Context, opts DiskOptions) (string, error) {
 	subvol := filepath.Join(d.subvolRoot, fmt.Sprintf("%s-%s", opts.VMName, opts.DiskName))
-	if out, err := exec.CommandContext(ctx, "btrfs", "subvolume", "create", subvol).CombinedOutput(); err != nil {
+	if out, err := exec.CommandContext(ctx, "btrfs", "subvolume", "create", "--", subvol).CombinedOutput(); err != nil {
 		return "", fmt.Errorf("btrfs subvolume create %s: %w: %s", subvol, err, out)
 	}
 	// Reuse the local qcow2 path inside the subvolume. CoW conflicts
@@ -75,7 +75,7 @@ func (d *btrfsDriver) Replicate(ctx context.Context, opts ReplicateOptions) erro
 	}
 	snapPath := opts.SrcRef + "-" + tag
 	if out, err := exec.CommandContext(ctx,
-		"btrfs", "subvolume", "snapshot", "-r", opts.SrcRef, snapPath,
+		"btrfs", "subvolume", "snapshot", "-r", "--", opts.SrcRef, snapPath,
 	).CombinedOutput(); err != nil {
 		return fmt.Errorf("btrfs snapshot %s: %w: %s", snapPath, err, out)
 	}
@@ -85,9 +85,9 @@ func (d *btrfsDriver) Replicate(ctx context.Context, opts ReplicateOptions) erro
 	if opts.Incremental && pathExists(prev) {
 		sendArgs = append(sendArgs, "-p", prev)
 	}
-	sendArgs = append(sendArgs, snapPath)
+	sendArgs = append(sendArgs, "--", snapPath)
 
-	recvArgs := []string{"receive", opts.DstRef}
+	recvArgs := []string{"receive", "--", opts.DstRef}
 	if _, err := pipeCmds(ctx, opts.SSHTarget, "btrfs", sendArgs, "btrfs", recvArgs); err != nil {
 		return fmt.Errorf("btrfs replicate: %w", err)
 	}
@@ -116,7 +116,7 @@ func (d *btrfsDriver) DeleteDisk(ctx context.Context, path string) error {
 	if err != nil || strings.HasPrefix(rel, "..") {
 		return nil
 	}
-	if out, err := exec.CommandContext(ctx, "btrfs", "subvolume", "delete", cleanParent).CombinedOutput(); err != nil {
+	if out, err := exec.CommandContext(ctx, "btrfs", "subvolume", "delete", "--", cleanParent).CombinedOutput(); err != nil {
 		// Non-fatal: caller may have created the file directly without
 		// a wrapping subvolume.
 		slog.Warn("btrfs subvolume delete failed", "subvol", cleanParent, "error", err, "output", string(out))

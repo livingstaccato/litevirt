@@ -8,7 +8,15 @@ import (
 )
 
 // zeroAdminDaemon is a daemon whose replica holds two deleted admins and no
-// live one, caught up so the floor may act.
+// live one, caught up so the floor may act. alice's tombstone is the newer, so
+// she is the one the floor reinstates.
+//
+// The tombstones are pinned rather than left to the two DeleteUser calls:
+// deleted_at has one-second resolution, and the floor reinstates the NEWEST
+// tombstone (username only breaks a tie). Two deletes in the same second tie
+// and alice wins; two that straddle a second boundary — rare, but routine under
+// `go test -p 16` load — make bob's the newer, and the floor correctly brings
+// back bob.
 func zeroAdminDaemon(t *testing.T) *Daemon {
 	t.Helper()
 	ctx := context.Background()
@@ -22,8 +30,11 @@ func zeroAdminDaemon(t *testing.T) *Daemon {
 			t.Fatal(err)
 		}
 	}
-	for _, u := range []string{"alice", "bob"} {
+	for u, at := range map[string]string{"alice": "2026-01-01T00:00:01Z", "bob": "2026-01-01T00:00:00Z"} {
 		if err := corrosion.DeleteUser(ctx, db, u); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Execute(ctx, `UPDATE users SET deleted_at = ? WHERE username = ?`, at, u); err != nil {
 			t.Fatal(err)
 		}
 	}

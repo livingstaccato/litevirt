@@ -23,6 +23,10 @@ const createVMForwardHopMetadata = "x-litevirt-create-hop"
 
 type resolvedCreateVMDecision struct {
 	resolvedHost string
+	// placedHere: this node placed the create itself before tearing down the
+	// VM it re-creates (placeRecreate), and is its entry node — so a resolved
+	// host that is another one is forwarded to, not refused.
+	placedHere bool
 }
 
 func createVMForwardHop(ctx context.Context) (int, error) {
@@ -203,7 +207,7 @@ func (s *Server) forwardCreateVM(ctx context.Context, req *pb.CreateVMRequest, t
 	// re-entering that claim, regardless of which mixed-version path is used.
 	forwarded := proto.Clone(req).(*pb.CreateVMRequest)
 	forwarded.IdempotencyKey = ""
-	outCtx := metadata.AppendToOutgoingContext(ctx, createVMForwardHopMetadata, strconv.Itoa(nextHop))
+	outCtx := metadata.AppendToOutgoingContext(withRecreateISOGrantMD(ctx, req.GetSpec()), createVMForwardHopMetadata, strconv.Itoa(nextHop))
 
 	if !s.capacityAdmissionLatched() {
 		return client.CreateVM(outCtx, forwarded)

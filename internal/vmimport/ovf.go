@@ -318,8 +318,12 @@ func formatFromOVF(format string) string {
 	switch {
 	case strings.Contains(f, "vmdk"):
 		return "vmdk"
+	case strings.Contains(f, "vhdx"):
+		return "vhdx"
 	case strings.Contains(f, "vhd"):
 		return "vpc"
+	case strings.Contains(f, "vdi"):
+		return "vdi"
 	case strings.Contains(f, "qcow"):
 		return "qcow2"
 	default:

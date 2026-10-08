@@ -14,6 +14,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/litevirt/litevirt/internal/qcow2"
 )
 
 // Defaults for PullOptions when a field is left zero. Generous so real cloud
@@ -162,26 +164,92 @@ type PullProgress struct {
 // and a hard size ceiling enforced via LimitReader (an oversized source FAILS
 // rather than being silently truncated).
 func Pull(store *Store, name, rawURL, checksum string, opts PullOptions, progressCh chan<- PullProgress) error {
+	_, err := PullPublished(store, name, rawURL, checksum, opts, progressCh)
+	return err
+}
+
+// PullPublished is Pull, saying what the publish did: the downloaded content
+// never replaces a file a disk may be built on (Store.Publish).
+func PullPublished(store *Store, name, rawURL, checksum string, opts PullOptions, progressCh chan<- PullProgress) (Published, error) {
 	defer close(progressCh)
+	return pull(store, name, rawURL, checksum, opts, progressCh)
+}
+
+func pull(store *Store, name, rawURL, checksum string, opts PullOptions, progressCh chan<- PullProgress) (Published, error) {
+	fail := func(err error) (Published, error) { return Published{}, err }
+	destPath, err := store.SafeImagePath(name)
+	if err != nil {
+		return fail(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+		return fail(fmt.Errorf("create image dir: %w", err))
+	}
+	// A fresh, exclusive temp in the image directory (the "import-" prefix is
+	// one the startup staging sweep collects after a crash).
+	tmpPath, sum, downloaded, err := download(filepath.Dir(destPath), "import-*.tmp", filepath.Base(destPath), rawURL, checksum, opts, progressCh)
+	if err != nil {
+		return fail(err)
+	}
+	defer os.Remove(tmpPath) // gone after a publish
+
+	// Publish: never over a file a disk may be built on — a refresh becomes
+	// a new version (Store.Publish).
+	pub, err := store.Publish(name, tmpPath, sum)
+	if err != nil {
+		return fail(fmt.Errorf("publish: %w", err))
+	}
+	if progressCh != nil {
+		progressCh <- PullProgress{BytesDownloaded: downloaded, TotalBytes: downloaded, ProgressPct: 100, Status: "complete"}
+	}
+	return pub, nil
+}
+
+// PullToFile is Pull to an explicit destination, under the same PullOptions
+// (scheme allowlist re-checked on every redirect, timeout, byte ceiling, the
+// opt-in network deny list). It downloads to a fresh temp beside destPath,
+// verifies the optional checksum, and renames into place, returning the
+// sha256 (hex) and size of what it wrote. progressCh may be nil; it is not
+// closed.
+func PullToFile(destPath, rawURL, checksum string, opts PullOptions, progressCh chan<- PullProgress) (string, int64, error) {
+	// A fresh temp per pull (O_EXCL, never a link): a fixed "<dest>.tmp" let
+	// two pulls of one name write into the same file, and a link planted at
+	// that name be followed.
+	tmpPath, sum, downloaded, err := download(filepath.Dir(destPath), "."+filepath.Base(destPath)+".pull-*", filepath.Base(destPath), rawURL, checksum, opts, progressCh)
+	if err != nil {
+		return "", 0, err
+	}
+	defer os.Remove(tmpPath) // gone after the rename
+	if err := os.Rename(tmpPath, destPath); err != nil {
+		return "", 0, fmt.Errorf("rename: %w", err)
+	}
+	if progressCh != nil {
+		progressCh <- PullProgress{BytesDownloaded: downloaded, TotalBytes: downloaded, ProgressPct: 100, Status: "complete"}
+	}
+	return sum, downloaded, nil
+}
+
+// download fetches rawURL under opts into a fresh temp file in dir (named by
+// the CreateTemp pattern), verifying the optional checksum and that the
+// content is standalone, and returns the temp's path, its sha256 (hex) and
+// its size. On an error nothing is left behind. what names the content in
+// errors.
+func download(dir, pattern, what, rawURL, checksum string, opts PullOptions, progressCh chan<- PullProgress) (tmp, sum string, size int64, rerr error) {
+	progress := func(p PullProgress) {
+		if progressCh != nil {
+			progressCh <- p
+		}
+	}
 	opts = opts.withDefaults()
 
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return fmt.Errorf("parse url: %w", err)
+		return "", "", 0, fmt.Errorf("parse url: %w", err)
 	}
 	if !opts.schemeAllowed(u.Scheme) {
-		return fmt.Errorf("disallowed image URL scheme %q (allowed: %s)", u.Scheme, strings.Join(opts.Schemes, ", "))
+		return "", "", 0, fmt.Errorf("disallowed image URL scheme %q (allowed: %s)", u.Scheme, strings.Join(opts.Schemes, ", "))
 	}
 
-	destPath, err := store.SafeImagePath(name)
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
-		return fmt.Errorf("create image dir: %w", err)
-	}
-
-	progressCh <- PullProgress{Status: "downloading"}
+	progress(PullProgress{Status: "downloading"})
 
 	client := opts.httpClient(func(req *http.Request, via []*http.Request) error {
 		if !opts.schemeAllowed(req.URL.Scheme) {
@@ -194,24 +262,26 @@ func Pull(store *Store, name, rawURL, checksum string, opts PullOptions, progres
 	})
 	resp, err := client.Get(rawURL)
 	if err != nil {
-		return fmt.Errorf("download: %w", err)
+		return "", "", 0, fmt.Errorf("download: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("download: HTTP %d", resp.StatusCode)
+		return "", "", 0, fmt.Errorf("download: HTTP %d", resp.StatusCode)
 	}
 	// Cap the body at MaxBytes+1 so reaching the extra byte means "too big".
 	body := io.LimitReader(resp.Body, opts.MaxBytes+1)
 
-	tmpPath := destPath + ".tmp"
-	f, err := os.Create(tmpPath)
+	f, err := os.CreateTemp(dir, pattern)
 	if err != nil {
-		return fmt.Errorf("create temp file: %w", err)
+		return "", "", 0, fmt.Errorf("create temp file: %w", err)
 	}
+	tmpPath := f.Name()
 	defer func() {
 		f.Close()
-		os.Remove(tmpPath) // clean up on error
+		if rerr != nil {
+			os.Remove(tmpPath) // clean up on error
+		}
 	}()
 
 	hasher := sha256.New()
@@ -223,28 +293,28 @@ func Pull(store *Store, name, rawURL, checksum string, opts PullOptions, progres
 		n, err := body.Read(buf)
 		if n > 0 {
 			if _, err := writer.Write(buf[:n]); err != nil {
-				return fmt.Errorf("write: %w", err)
+				return "", "", 0, fmt.Errorf("write: %w", err)
 			}
 			downloaded += int64(n)
 			if downloaded > opts.MaxBytes {
-				return fmt.Errorf("image exceeds the %d-byte ceiling", opts.MaxBytes)
+				return "", "", 0, fmt.Errorf("image exceeds the %d-byte ceiling", opts.MaxBytes)
 			}
 			var pct float32
 			if resp.ContentLength > 0 {
 				pct = float32(downloaded) / float32(resp.ContentLength) * 100
 			}
-			progressCh <- PullProgress{
+			progress(PullProgress{
 				BytesDownloaded: downloaded,
 				TotalBytes:      resp.ContentLength,
 				ProgressPct:     pct,
 				Status:          "downloading",
-			}
+			})
 		}
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			return fmt.Errorf("read: %w", err)
+			return "", "", 0, fmt.Errorf("read: %w", err)
 		}
 	}
 
@@ -252,29 +322,22 @@ func Pull(store *Store, name, rawURL, checksum string, opts PullOptions, progres
 
 	// Verify checksum if provided
 	if checksum != "" {
-		progressCh <- PullProgress{Status: "verifying checksum"}
+		progress(PullProgress{Status: "verifying checksum"})
 		got := "sha256:" + hex.EncodeToString(hasher.Sum(nil))
 		expected := checksum
 		if !strings.HasPrefix(expected, "sha256:") {
 			expected = "sha256:" + expected
 		}
 		if got != expected {
-			os.Remove(tmpPath) // explicit cleanup on checksum failure (#28)
-			return fmt.Errorf("checksum mismatch: got %s, expected %s", got, expected)
+			return "", "", 0, fmt.Errorf("checksum mismatch: got %s, expected %s", got, expected)
 		}
 	}
 
-	// Move to final location
-	if err := os.Rename(tmpPath, destPath); err != nil {
-		return fmt.Errorf("rename: %w", err)
+	// A pulled image is the base of every VM created from it (and a pulled
+	// ISO is booted as is); one that names another file would have qemu open
+	// that file on the host for the guest.
+	if err := qcow2.AssertStandalone(tmpPath); err != nil {
+		return "", "", 0, fmt.Errorf("image %q: %w", what, err)
 	}
-
-	progressCh <- PullProgress{
-		BytesDownloaded: downloaded,
-		TotalBytes:      downloaded,
-		ProgressPct:     100,
-		Status:          "complete",
-	}
-
-	return nil
+	return tmpPath, hex.EncodeToString(hasher.Sum(nil)), downloaded, nil
 }

@@ -1,14 +1,18 @@
 package grpcapi
 
 import (
+	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/storage"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -36,6 +40,22 @@ func (s *Server) PushReplicaIncrement(stream pb.LiteVirt_PushReplicaIncrementSer
 	if !isBaseName(first.Filename) || (first.Base != "" && !isBaseName(first.Base)) {
 		return status.Error(codes.InvalidArgument, "filename and base must be base names")
 	}
+	// A replica carries its record: the receiver writes it into that VM's
+	// own directory of the replica area, never a bare name into the pool. A
+	// sender on an older build sends none (rolling upgrade): its push is
+	// taken as main took it, at the pool's top level, only under a VM disk's
+	// exact runner name (receiveLegacyIncrement).
+	legacy := first.GetReplica() == nil
+	var rec replicaRecord
+	if !legacy {
+		rec, err = replicaRecordFromPB(first.GetReplica())
+		if err != nil {
+			return status.Errorf(codes.InvalidArgument, "%v", err)
+		}
+		if first.Filename != rec.File {
+			return status.Errorf(codes.InvalidArgument, "filename %q is not the record's file %q", first.Filename, rec.File)
+		}
+	}
 	if first.TotalSize <= 0 {
 		return status.Error(codes.InvalidArgument, "total_size must be > 0")
 	}
@@ -43,7 +63,7 @@ func (s *Server) PushReplicaIncrement(stream pb.LiteVirt_PushReplicaIncrementSer
 	if host == "" {
 		host = s.hostName
 	}
-	rec, ok, err := corrosion.GetStoragePool(ctx, s.db, host, first.PoolName)
+	pool, ok, err := corrosion.GetStoragePool(ctx, s.db, host, first.PoolName)
 	if err != nil {
 		return status.Errorf(codes.Internal, "lookup pool: %v", err)
 	}
@@ -58,7 +78,11 @@ func (s *Server) PushReplicaIncrement(stream pb.LiteVirt_PushReplicaIncrementSer
 			return status.Errorf(codes.Unavailable, "reach host %q: %v", host, perr)
 		}
 		defer conn.Close()
-		up, perr := client.PushReplicaIncrement(ctx)
+		fctx, ferr := s.forwardContentCall(ctx)
+		if ferr != nil {
+			return ferr
+		}
+		up, perr := client.PushReplicaIncrement(fctx)
 		if perr != nil {
 			return status.Errorf(codes.Unavailable, "open push to %q: %v", host, perr)
 		}
@@ -84,17 +108,8 @@ func (s *Server) PushReplicaIncrement(stream pb.LiteVirt_PushReplicaIncrementSer
 		return stream.SendAndClose(resp)
 	}
 
-	if !isFileBasedDriver(rec.Driver) {
+	if !isFileBasedDriver(pool.Driver) {
 		return status.Errorf(codes.FailedPrecondition, "pool %q is not file-based", first.PoolName)
-	}
-	dir, err := fileBasedPoolDir(s.dataDir, StoragePoolRef{Driver: rec.Driver, Source: rec.Source, Target: rec.Target})
-	if err != nil {
-		return status.Errorf(codes.FailedPrecondition, "resolve pool dir: %v", err)
-	}
-	if first.Base != "" {
-		if _, serr := os.Stat(filepath.Join(dir, first.Base)); serr != nil {
-			return status.Errorf(codes.FailedPrecondition, "base replica %q not present: %v", first.Base, serr)
-		}
 	}
 
 	var written int64
@@ -126,11 +141,88 @@ func (s *Server) PushReplicaIncrement(stream pb.LiteVirt_PushReplicaIncrementSer
 			written += int64(len(msg.Data))
 		}
 	}
-	dest, ferr := forkRawAndApply(dir, first.Filename, first.Base, first.TotalSize, apply)
+	if legacy {
+		dest, ferr := s.receiveLegacyIncrement(ctx, first.PoolName, first.Filename, first.Base, first.TotalSize, apply)
+		if ferr != nil {
+			if _, isStatus := status.FromError(ferr); isStatus {
+				return ferr
+			}
+			return status.Errorf(codes.Internal, "apply replica: %v", ferr)
+		}
+		return stream.SendAndClose(&pb.PushReplicaIncrementResponse{Path: dest, BytesWritten: written})
+	}
+	dest, ferr := s.receiveRawReplica(ctx, first.PoolName, rec, first.Base, first.TotalSize, apply)
 	if ferr != nil {
+		if _, isStatus := status.FromError(ferr); isStatus {
+			return ferr
+		}
 		return status.Errorf(codes.Internal, "apply replica: %v", ferr)
 	}
-	return stream.SendAndClose(&pb.PushReplicaIncrementResponse{Path: dest, BytesWritten: written})
+	return stream.SendAndClose(&pb.PushReplicaIncrementResponse{Path: dest, BytesWritten: written, ReplicaRecorded: true})
+}
+
+// receiveLegacyIncrement takes an older build's incremental replica push
+// (no record) as main took it: a new raw file named name at pool's top
+// level, forked from base, recorded as a peer's upload. Only when name is
+// exactly a runner name of one VM disk here (<vm>-<disk>-<stamp>.raw, not
+// one another project's VM could have written), and base, when set, is a
+// top-level raw replica of that same disk; a promotion then matches the
+// file by that name, as main did.
+func (s *Server) receiveLegacyIncrement(ctx context.Context, pool, name, base string, totalSize int64, apply func(*os.File) error) (string, error) {
+	k, ok := s.legacyReplicaKey(ctx, name)
+	if !ok || !strings.HasSuffix(name, ".raw") {
+		return "", status.Errorf(codes.InvalidArgument,
+			"%q is not a replica name of one VM disk on this cluster; a push without a replica record names one", name)
+	}
+	poolDir, err := s.replicaPoolDir(ctx, pool)
+	if err != nil {
+		return "", err
+	}
+	if base != "" && (!strings.HasSuffix(base, ".raw") || !slices.Contains(s.localReplicaNames(ctx, poolDir, k, "", false), base)) {
+		return "", status.Errorf(codes.FailedPrecondition,
+			"base %q is not a raw replica of vm %q disk %q in pool %q", base, k.VM, k.Disk, pool)
+	}
+	dest, err := forkRawAndApply(poolDir, name, base, totalSize, apply)
+	if err != nil {
+		return "", err
+	}
+	if err := s.recordPeerUpload(ctx, pool, dest); err != nil {
+		slog.Warn("replica push from an older build not recorded; it is matched by its name", "path", dest, "error", err)
+	}
+	return dest, nil
+}
+
+// legacyReplicaKey is the VM disk whose exact runner name name is: the one
+// split of its <vm>-<disk> stem that names a live VM with that disk, which
+// no VM of another project could have written. ok is false for any other.
+func (s *Server) legacyReplicaKey(ctx context.Context, name string) (replicaKey, bool) {
+	stem, ok := replicaNamePrefix(name)
+	if !ok {
+		return replicaKey{}, false
+	}
+	var found []replicaKey
+	for i := 1; i < len(stem)-1; i++ {
+		if stem[i] != '-' {
+			continue
+		}
+		vm, err := corrosion.GetVM(ctx, s.db, stem[:i])
+		if err != nil || vm == nil {
+			continue
+		}
+		disks, err := corrosion.GetVMDisks(ctx, s.db, vm.Name)
+		if err != nil {
+			continue
+		}
+		for _, d := range disks {
+			if d.DiskName == stem[i+1:] {
+				found = append(found, replicaKeyOf(vm, d.DiskName))
+			}
+		}
+	}
+	if len(found) != 1 || !replicaNameIs(name, found[0]) || s.replicaNameClaimedElsewhere(ctx, name, found[0]) {
+		return replicaKey{}, false
+	}
+	return found[0], true
 }
 
 // isBaseName rejects path separators / traversal so a streamed filename can't
@@ -151,7 +243,7 @@ func forkRawAndApply(dir, name, base string, totalSize int64, apply func(*os.Fil
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
-	tmp, err := os.CreateTemp(dir, ".repl-*.tmp")
+	tmp, err := storage.CreatePoolTemp(dir, ".repl-*.tmp")
 	if err != nil {
 		return "", err
 	}
@@ -182,7 +274,8 @@ func forkRawAndApply(dir, name, base string, totalSize int64, apply func(*os.Fil
 		return "", err
 	}
 	dest := filepath.Join(dir, name)
-	if err := os.Rename(tmpName, dest); err != nil {
+	// Never over a file already there (RENAME_NOREPLACE).
+	if err := placeNoClobber(tmpName, dest); err != nil {
 		return "", err
 	}
 	committed = true
@@ -193,7 +286,7 @@ func forkRawAndApply(dir, name, base string, totalSize int64, apply func(*os.Fil
 // 1 MiB chunks so holes in the source stay holes in the destination (dst is
 // pre-truncated to size). Pure file I/O — no network.
 func sparseCopyInto(dst *os.File, srcPath string) error {
-	src, err := os.Open(srcPath)
+	src, err := storage.OpenPoolFile(srcPath, os.O_RDONLY, 0)
 	if err != nil {
 		return err
 	}

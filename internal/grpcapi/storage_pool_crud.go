@@ -4,8 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"slices"
+	"strings"
 	"syscall"
 
 	"google.golang.org/grpc/codes"
@@ -61,6 +65,12 @@ func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoo
 		return nil, status.Errorf(codes.InvalidArgument,
 			"unknown driver %q (supported: %v)", req.Driver, storage.SupportedDrivers)
 	}
+	for _, k := range []string{storage.NFSExportOption, storage.DataDisksExportOption} {
+		if _, ok := req.Options[k]; ok {
+			return nil, status.Errorf(codes.InvalidArgument,
+				"option %q is recorded by the daemon, not set in a request", k)
+		}
+	}
 
 	host := req.Host
 	if host == "" {
@@ -90,6 +100,24 @@ func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoo
 			return nil, err
 		}
 	}
+	// A pool that names a directory or file on the host makes the daemon write
+	// there as root, so naming one takes cluster-root authority, and some
+	// directories are refused to everyone. Checked here, before the forward,
+	// because a forwarded call reaches the owner as a peer; the owner checks the
+	// directories again against its own data and PKI dirs.
+	if err := s.authorizePoolHostPaths(ctx, fmt.Sprintf("pool %q", req.Name), storage.Config{
+		Driver: req.Driver, Source: req.Source, Target: req.Target, Options: req.Options,
+	}); err != nil {
+		return nil, err
+	}
+	// The global ISO library's row decides what every project may boot, so
+	// creating, replacing or retargeting it is an Admin's (storage.hostpath).
+	if req.Name == globalISOLibrary && (project == "" || (found && existing.Project == "")) {
+		if err := s.requireISOLibraryRowAuthority(ctx); err != nil {
+			return nil, err
+		}
+		s.pinImplicitISOLibraryMode(ctx)
+	}
 	if host != s.hostName {
 		client, conn, err := s.peerClient(ctx, host)
 		if err != nil {
@@ -98,6 +126,70 @@ func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoo
 		defer conn.Close()
 		req.Host = host
 		return client.CreateStoragePool(ctx, req)
+	}
+
+	// A target-less local pool gets a directory of its own, never the shared
+	// <data_dir>/disks that holds every VM's local disks across projects.
+	if req.Driver == "local" && req.Target == "" {
+		req.Target = localPoolDir(s.dataDir, req.Name)
+		// A directory left by an earlier pool of this name (in any project)
+		// is not handed to this one with its files in it.
+		if !(found && existing.Target == req.Target) {
+			// The count, never the names: they may be another project's.
+			if n := dirEntryCount(req.Target); n > 0 {
+				slog.Error("storage pool create refused: its directory holds an earlier pool's files",
+					"pool", req.Name, "dir", req.Target, "files", dirEntriesSample(req.Target, 20))
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"pool %q: its directory already holds %d file(s) from an earlier pool of that name; an admin must remove them first",
+					req.Name, n)
+			}
+		}
+	}
+	// An NFS export — an nfs pool's, or the one under a directory pool on an
+	// NFS mount — is one pool's, cluster-wide and under any spelling of its
+	// server, and an NFS pool's mount point is never another pool's
+	// directory. Directory pools may share a local directory (their content
+	// is confined per file). The other pool is not named: it may be another
+	// project's.
+	newRef := StoragePoolRef{Driver: req.Driver, Source: req.Source, Target: req.Target}
+	other, why, err := s.poolSharedWith(ctx, req.Name, &project, newRef, true)
+	if errors.Is(err, errNFSUnresolved) {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"pool %q: %v; an NFS server must resolve so its export can be told apart from every other pool's", req.Name, err)
+	}
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "check for a shared directory: %v", err)
+	}
+	if other != "" {
+		slog.Error("storage pool create refused: storage shared with another pool", "pool", req.Name, "other", other, "how", why)
+		what := req.Target
+		if strings.EqualFold(req.Driver, "nfs") {
+			what = req.Source
+		}
+		return nil, status.Errorf(codes.FailedPrecondition, "pool %q: %s is already another pool's (%s); an NFS export or mount point belongs to one pool", req.Name, what, why)
+	}
+	if err := checkDirPoolNFSHardened(s.dataDir, newRef); err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "pool %q: %v", req.Name, err)
+	}
+	// A directory pool on an NFS mount records the export it is on, so a
+	// pool on another host — which cannot see this host's mounts — compares
+	// against it.
+	var mt storage.MountTable
+	if exp, err := s.poolExportOf(&mt, s.hostName, newRef); err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "pool %q: %v", req.Name, err)
+	} else if exp != nil && !strings.EqualFold(req.Driver, "nfs") {
+		opts := make(map[string]string, len(req.Options)+1)
+		for k, v := range req.Options {
+			opts[k] = v
+		}
+		opts[storage.NFSExportOption] = exp.String()
+		req.Options = opts
+	}
+	if err := s.refuseGlobalISOLibraryOverlap(ctx, req); err != nil {
+		return nil, err
+	}
+	if err := s.refuseISOIdentityStoreOverlap(req); err != nil {
+		return nil, err
 	}
 
 	driver, err := storage.New(s.dataDir, storage.Config{
@@ -184,6 +276,12 @@ func (s *Server) DeleteStoragePool(ctx context.Context, req *pb.DeleteStoragePoo
 	if err := s.RequirePerm(ctx, poolRBACPathFor(rec.Project, req.Name), "storage.pool.write", "operator"); err != nil {
 		return nil, err
 	}
+	if rec.Name == globalISOLibrary && rec.Project == "" {
+		if err := s.requireISOLibraryRowAuthority(ctx); err != nil {
+			return nil, err
+		}
+		s.pinImplicitISOLibraryMode(ctx)
+	}
 	if host != s.hostName {
 		// Run the reference guard on THIS (entry) node's replicated view BEFORE
 		// forwarding, so a NEW entry node enforces the check even when the pool's
@@ -207,6 +305,31 @@ func (s *Server) DeleteStoragePool(ctx context.Context, req *pb.DeleteStoragePoo
 		return nil, err
 	}
 
+	// A pool's own <data_dir>/pools/<name> goes with it — but never with files
+	// in it: the next pool of this name, in any project, would inherit them.
+	// The daemon's own directories in it — the replica area, the upload
+	// markers — are not files anyone left there: their empty directories and
+	// stale markers are removed. No replica is ever deleted here, with
+	// --force or without: --force deletes the pool even with files left, as
+	// it always did (main's --force only passed the reference guard), and
+	// what is left — replicas included — stays in the directory, which is
+	// then kept (and a new pool of this name is refused it while it holds
+	// them).
+	ownDir := ""
+	if (rec.Driver == "local" || rec.Driver == "") && rec.Target == localPoolDir(s.dataDir, rec.Name) {
+		ownDir = rec.Target
+		kept := s.cleanDaemonPoolDirs(ownDir)
+		if left := dirEntriesSample(ownDir, 5); len(left) > 0 {
+			if !req.Force {
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"pool %q still holds files in %s (%s); delete them first, or delete the pool with --force (the files stay)", req.Name, ownDir, strings.Join(append(left, kept...), ", "))
+			}
+			slog.Warn("storage pool deleted with files left in its directory; the directory and every file in it are kept",
+				"pool", req.Name, "dir", ownDir, "files", left, "replicas", kept)
+			ownDir = ""
+		}
+	}
+
 	// Driver teardown (unmount NFS / log out of iSCSI) is best-effort about ERRORS
 	// — an operator who hit delete wants the pool gone from inventory even if
 	// cleanup is incomplete — but its refcount PREDICATES are hard guards (never
@@ -227,9 +350,61 @@ func (s *Server) DeleteStoragePool(ctx context.Context, req *pb.DeleteStoragePoo
 		return nil, status.Errorf(codes.Internal, "delete: %v", err)
 	}
 	s.removeStoragePoolRef(req.Name)
+	if ownDir != "" {
+		if err := os.Remove(ownDir); err != nil && !os.IsNotExist(err) {
+			slog.Warn("storage pool directory not removed", "pool", req.Name, "dir", ownDir, "error", err)
+		}
+	}
 	s.audit(ctx, "storage.pool.delete", req.Name, fmt.Sprintf("force=%t", req.Force), "ok")
 	slog.Info("storage pool deleted", "host", host, "name", req.Name)
 	return &pb.DeleteStoragePoolResponse{}, nil
+}
+
+// cleanDaemonPoolDirs removes the daemon's own directories in a pool's
+// directory before the pool is deleted, as far as they hold nothing:
+//
+//   - the replica area (.replicas): its empty owner directories, and the area
+//     once empty. A replica is never removed here — not with --force either:
+//     a replica may be a VM's only copy (its host down, not yet promoted);
+//   - the upload markers (.litevirt-uploads): every marker whose upload is no
+//     longer there.
+//
+// Only real directories are entered (a symlink there is never followed), and
+// each directory is removed only once empty. It returns the area files kept
+// (owner/name, at most a few), for the caller to name.
+func (s *Server) cleanDaemonPoolDirs(dir string) (kept []string) {
+	realDir := func(p string) bool {
+		fi, err := os.Lstat(p)
+		return err == nil && fi.IsDir()
+	}
+	area := filepath.Join(dir, replicaAreaDir)
+	if realDir(area) {
+		owners, _ := os.ReadDir(area)
+		for _, o := range owners {
+			od := filepath.Join(area, o.Name())
+			if !o.IsDir() || !realDir(od) {
+				continue
+			}
+			for _, f := range dirEntriesSample(od, 5) {
+				if len(kept) < 5 && !strings.HasPrefix(f, "and ") {
+					kept = append(kept, filepath.Join(replicaAreaDir, o.Name(), f))
+				}
+			}
+			_ = os.Remove(od) // only once empty
+		}
+		_ = os.Remove(area)
+	}
+	markers := filepath.Join(dir, uploadMarkerDir)
+	if realDir(markers) {
+		ents, _ := os.ReadDir(markers)
+		for _, e := range ents {
+			if _, err := os.Lstat(filepath.Join(dir, e.Name())); errors.Is(err, fs.ErrNotExist) {
+				_ = os.Remove(filepath.Join(markers, e.Name()))
+			}
+		}
+		_ = os.Remove(markers)
+	}
+	return kept
 }
 
 // GetStoragePool returns one pool's full details. Used by `lv pool inspect`.
@@ -321,4 +496,151 @@ func (s *Server) poolReferenceGuard(ctx context.Context, host, name string, forc
 			name, host, detail)
 	}
 	return nil
+}
+
+// requireISOLibraryRowAuthority is what touching the global "isos" row takes.
+func (s *Server) requireISOLibraryRowAuthority(ctx context.Context) error {
+	if err := s.RequirePerm(ctx, "/", verbStorageHostPath, "admin"); err != nil {
+		if status.Code(err) == codes.PermissionDenied {
+			return status.Errorf(codes.PermissionDenied,
+				"the global ISO library pool %q is created, replaced, retargeted or deleted only with %s at / (Admin): every project boots from it",
+				globalISOLibrary, verbStorageHostPath)
+		}
+		return err
+	}
+	return nil
+}
+
+// refuseGlobalISOLibraryOverlap keeps the global ISO library's directory its
+// own: no pool may be created in, above or below it, and the library row may
+// not be put on a directory another pool maps. A pool sharing it would let its
+// writers put files in the library, which only an Admin may write.
+func (s *Server) refuseGlobalISOLibraryOverlap(ctx context.Context, req *pb.CreateStoragePoolRequest) error {
+	if !isFileBasedDriver(req.Driver) {
+		return nil
+	}
+	dir, err := fileBasedPoolDir(s.dataDir, StoragePoolRef{Driver: req.Driver, Source: req.Source, Target: req.Target})
+	if err != nil {
+		return nil // the driver reports a pool it cannot place
+	}
+	var others []corrosion.StoragePoolRecord
+	if req.Name == globalISOLibrary && req.Project == "" {
+		rows, err := corrosion.ListStoragePoolsForHost(ctx, s.db, s.hostName)
+		if err != nil {
+			return status.Errorf(codes.Internal, "list pools: %v", err)
+		}
+		for _, r := range rows {
+			if r.Name != req.Name && isFileBasedDriver(r.Driver) {
+				others = append(others, r)
+			}
+		}
+	} else {
+		lib, ok, err := corrosion.GetStoragePool(ctx, s.db, s.hostName, globalISOLibrary)
+		if err != nil {
+			return status.Errorf(codes.Internal, "lookup %s: %v", globalISOLibrary, err)
+		}
+		if ok && lib.Project == "" && isFileBasedDriver(lib.Driver) {
+			others = append(others, lib)
+		}
+	}
+	for _, o := range others {
+		odir, err := fileBasedPoolDir(s.dataDir, StoragePoolRef{Driver: o.Driver, Source: o.Source, Target: o.Target})
+		if err != nil {
+			continue
+		}
+		if err := refuseOverlap(dir, odir, o.Name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// refuseISOIdentityStoreOverlap refuses a pool at or under the host-local
+// store of ISO identity records (<data_dir>/iso-identity): a pool there could
+// upload a record that excuses a file for a VM (iso_identity.go).
+func (s *Server) refuseISOIdentityStoreOverlap(req *pb.CreateStoragePoolRequest) error {
+	if !isFileBasedDriver(req.Driver) {
+		return nil
+	}
+	dir, err := fileBasedPoolDir(s.dataDir, StoragePoolRef{Driver: req.Driver, Source: req.Source, Target: req.Target})
+	if err != nil {
+		return nil // the driver reports a pool it cannot place
+	}
+	store := filepath.Join(s.dataDir, isoIdentityDir)
+	for _, a := range pathFormsOf(dir) {
+		for _, b := range pathFormsOf(store) {
+			if pathWithin(b, a) {
+				return status.Errorf(codes.InvalidArgument,
+					"pool directory %s is in %s, where this host keeps its record of the installer ISOs it judged; choose another directory", dir, store)
+			}
+		}
+	}
+	return nil
+}
+
+// pathFormsOf is p cleaned, and resolved when that differs (resolving through
+// the deepest part that exists, so a link to the place is caught too).
+func pathFormsOf(p string) []string {
+	clean := filepath.Clean(p)
+	out := []string{clean}
+	cur, rest := clean, ""
+	for {
+		if r, err := filepath.EvalSymlinks(cur); err == nil {
+			if r = filepath.Join(r, rest); r != clean {
+				out = append(out, r)
+			}
+			return out
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return out
+		}
+		rest = filepath.Join(filepath.Base(cur), rest)
+		cur = parent
+	}
+}
+
+func refuseOverlap(dir, libDir, other string) error {
+	forms := func(p string) []string {
+		out := []string{filepath.Clean(p)}
+		if r, err := filepath.EvalSymlinks(p); err == nil && r != out[0] {
+			out = append(out, r)
+		}
+		return out
+	}
+	for _, a := range forms(dir) {
+		for _, b := range forms(libDir) {
+			if pathWithin(a, b) || pathWithin(b, a) {
+				return status.Errorf(codes.InvalidArgument,
+					"pool directory %s overlaps the directory %s of pool %q, and the global ISO library's directory is its own; choose another directory", dir, libDir, other)
+			}
+		}
+	}
+	return nil
+}
+
+// pathWithin reports whether p is dir or below it.
+func pathWithin(dir, p string) bool {
+	rel, err := filepath.Rel(dir, p)
+	return err == nil && (rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))))
+}
+
+// pinImplicitISOLibraryMode writes the ISO library mode in force when none was
+// ever set, before an Admin creates, replaces or deletes a global isos pool:
+// with no row the mode is derived from which isos pools exist, so that change
+// would otherwise flip it silently, with no new record generation (stale
+// records of the old mode would then count again). The pin does not start a
+// new generation: the records made while the mode was implicit keep counting
+// (corrosion.PinISOLibraryMode), so no library start is refused while the
+// hosts re-record. Best effort: it never refuses the pool change.
+func (s *Server) pinImplicitISOLibraryMode(ctx context.Context) {
+	m, err := corrosion.GetISOLibraryMode(ctx, s.db)
+	if err != nil || !m.Implicit || !s.db.MayWriteClusterPolicy() {
+		return
+	}
+	if err := corrosion.PinISOLibraryMode(ctx, s.db, m.Value, callerUsername(ctx)); err != nil {
+		slog.Warn("iso library: pin the mode in force before an isos pool change", "mode", m.Value, "error", err)
+		return
+	}
+	slog.Info("iso library: the mode in force is now set explicitly, before an isos pool change", "mode", m.Value)
 }

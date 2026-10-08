@@ -317,6 +317,12 @@ func (s *Server) RestoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotReq
 		return client.RestoreSnapshot(ctx, req)
 	}
 
+	// A revert can bring the domain back running with its installer ISO; it
+	// is judged here, on the owner, after the caller's authority.
+	if err := s.verifyVMISOForStart(vm); err != nil {
+		return nil, err
+	}
+
 	// Guard: block restore if VM is migrating or in an unsafe transient state.
 	switch vm.State {
 	case "migrating", "creating", "starting":
@@ -366,7 +372,14 @@ func (s *Server) RestoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotReq
 				"memory snapshot %q was taken on host %q; the VM is now on %q and its RAM image is not available here — use a disk-only snapshot or take a new one",
 				req.SnapshotName, snap.HostName, s.hostName)
 		}
-		if err := s.virt.RevertToLiveSnapshot(req.VmName, req.SnapshotName, snap.VMStatePath, restoreFW); err != nil {
+		// The saved image carries its own definition, which the restore
+		// reopens: its installer CD-ROMs are judged here and pointed at the
+		// files judged, before anything is torn down.
+		rewriteSaved := func(savedXML string) (string, error) { return s.judgedCDROMDefinition(vm, savedXML) }
+		if err := s.virt.RevertToLiveSnapshot(req.VmName, req.SnapshotName, snap.VMStatePath, restoreFW, rewriteSaved); err != nil {
+			if status.Code(err) == codes.FailedPrecondition {
+				return nil, err
+			}
 			return nil, status.Errorf(codes.Internal, "revert to memory snapshot: %v", err)
 		}
 	} else if err := s.virt.RevertToSnapshot(req.VmName, req.SnapshotName, restoreFW); err != nil {

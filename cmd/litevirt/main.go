@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 
 	"github.com/spf13/cobra"
@@ -13,6 +14,7 @@ var (
 )
 
 func main() {
+	bootstrapDefaultLogger()
 	// Handle --version before cobra so the output format is stable and
 	// independent of the command tree. `lv host upgrade` execs `<binary>
 	// --version` and parses the `version=` token to decide which hosts are
@@ -34,6 +36,26 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// bootstrapDefaultLogger installs a plain, real slog handler as the
+// process-wide default before any command runs, so a slog.Warn/Error
+// anywhere in the binary — the daemon before internal/obs.Setup runs (or
+// when it never does, e.g. a dead-collector retry window), and any one-shot
+// CLI command that never calls Setup at all (gitops, schema-migrate) —
+// always carries its real level and attrs as distinct record fields.
+//
+// Left uninstalled, slog.Default() is Go's own stock handler, which funnels
+// a record through the standard "log" package as a single formatted string:
+// the level folded into the text, attrs stringified after it. That is
+// exactly how a real slog.Warn reached the journal as level=INFO with its
+// attrs flattened into the message (the defect this fixes). The daemon's own
+// telemetry pipeline (internal/obs.Setup, called from daemon.Run) still runs
+// afterward and can upgrade this further — the vendor logger, once an OTLP
+// endpoint is configured — so this is only the floor every entrypoint gets
+// for free, not a replacement for Setup.
+func bootstrapDefaultLogger() {
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
 }
 
 // newRootCmd builds the fully-wired `litevirt` root command — both the CLI

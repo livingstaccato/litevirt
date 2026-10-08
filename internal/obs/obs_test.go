@@ -480,17 +480,25 @@ func TestHealth_TracesCircuitUnknown_WhenTracingActive(t *testing.T) {
 }
 
 // With no OTLP endpoint and no explicit log_format/log_level, Setup must
-// leave slog.Default() completely untouched — byte-for-byte parity with the
-// pre-telemetry daemon, which never called slog.SetDefault at all. Adopting
-// even a plain stdlib handler would change the journalctl/grep surface
-// (finding 4), and adopting the vendor logger pays PII-redaction/schema cost
-// on every record and mangles litevirt's deliberately-non-secret token= lines.
-func TestSetup_NoEndpointNoExplicitFormat_LeavesSlogDefaultUntouched(t *testing.T) {
+// still install a plain stdlib handler — never leave slog.Default() as Go's
+// stock handler. The stock handler funnels every record through the "log"
+// package as one formatted string (level folded into the text, attrs
+// stringified after it), which is exactly how a real slog.Warn reached the
+// journal as level=INFO with its attrs flattened into the message: nothing
+// downstream can recover a level/attr the handler never emitted as a field.
+// A plain stdlib handler costs nothing over that (no vendor pass, no PII
+// redaction of litevirt's deliberately-non-secret token= lines) and always
+// keeps the level and attrs as real fields.
+func TestSetup_NoEndpointNoExplicitFormat_InstallsStdlibHandler(t *testing.T) {
 	cleanEnv(t)
 	before := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(before) })
 	setup(t, Config{ServiceName: "s"})
-	if slog.Default() != before {
-		t.Error("slog.Default() changed with no endpoint and no explicit log_format/log_level; want untouched")
+	if slog.Default() == before {
+		t.Error("slog.Default() left untouched with no endpoint and no explicit log_format/log_level; want a plain stdlib handler installed")
+	}
+	if _, ok := slog.Default().Handler().(*slog.TextHandler); !ok {
+		t.Errorf("slog.Default().Handler() = %T; want *slog.TextHandler (stdlib console default, not the stock handler, not vendor)", slog.Default().Handler())
 	}
 }
 

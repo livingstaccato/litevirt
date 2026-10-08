@@ -10,23 +10,21 @@ import (
 
 // Checklist (a) — no OTLP endpoint on a cold boot:
 //
-//	stdlib logs, token= not redacted, TracingActive false, zero otel in the
-//	RPC path. Runnable on macOS (no libvirt, no cluster).
+//	stdlib logs (never Go's stock handler), token= not redacted, TracingActive
+//	false, zero otel in the RPC path. Runnable on macOS (no libvirt, no
+//	cluster).
 //
 //	go test ./internal/obs/ -count=1 -v -run TestChecklist_A
 func TestChecklist_A_NoEndpoint_StdlibParityZeroCost(t *testing.T) {
 	cleanEnv(t)
 
-	// Capture pre-Setup default so we can prove byte-for-byte pointer parity
-	// with the pre-telemetry daemon (which never called slog.SetDefault).
+	// Capture pre-Setup default so we can prove Setup installs a real
+	// handler — never Go's stock one — even with no endpoint configured.
 	before := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(before) })
 
 	// Capture what a capability-style log line looks like after Setup.
 	var buf bytes.Buffer
-	probe := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	// Install probe only as a *local* logger for the token line; Setup must
-	// not replace slog.Default() at all when export is off.
-	_ = probe
 
 	shutdown, err := Setup(context.Background(), Config{ServiceName: "litevirt"})
 	if err != nil {
@@ -48,16 +46,22 @@ func TestChecklist_A_NoEndpoint_StdlibParityZeroCost(t *testing.T) {
 		t.Errorf("(a) ServerOptions()=%v; want nil (zero otel on serve path)", got)
 	}
 
-	// 2. slog.Default() completely untouched — not vendor, not even a new TextHandler.
-	if slog.Default() != before {
-		t.Error("(a) slog.Default() changed with no endpoint and no explicit log_format/log_level; want untouched pre-Setup pointer")
+	// 2. slog.Default() is a real stdlib handler, not vendor and not Go's
+	//    stock handler (which flattens level + attrs into the message text —
+	//    the real lab defect this checklist now also guards).
+	if slog.Default() == before {
+		t.Error("(a) slog.Default() left untouched with no endpoint and no explicit log_format/log_level; want a plain stdlib handler installed")
+	}
+	if _, ok := slog.Default().Handler().(*slog.TextHandler); !ok {
+		t.Errorf("(a) slog.Default().Handler() = %T; want *slog.TextHandler (stdlib, not vendor, not the stock handler)", slog.Default().Handler())
 	}
 
-	// 3. Capability token= line is not vendor-redacted. Emit through the
-	//    (untouched) default via a temporary capture is hard without swapping
-	//    default; instead emit on a plain stdlib handler and assert the same
-	//    shape the default path uses when no vendor is adopted — token value
-	//    appears literally. (Vendor redaction would turn it into ***.)
+	// 3. Capability token= line is not vendor-redacted. Capturing through the
+	//    now-installed default via a temporary stderr swap is covered by
+	//    TestSetup_NoEndpointNoExplicitFormat_RealWarnKeepsLevelAndAttrs;
+	//    here, emit on a plain stdlib handler and assert the same shape the
+	//    default path uses when no vendor is adopted — token value appears
+	//    literally. (Vendor redaction would turn it into ***.)
 	buf.Reset()
 	local := slog.New(slog.NewTextHandler(&buf, nil))
 	local.Info("capability check", "token", "split_brain_gate_v1")

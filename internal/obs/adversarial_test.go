@@ -301,10 +301,8 @@ func TestSetup_InjectedProvider_IsSDKTracerProvider(t *testing.T) {
 func TestSetup_NoEndpoint_TokenAttrDoesNotPanic(t *testing.T) {
 	cleanEnv(t)
 	before := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(before) })
 	setup(t, Config{ServiceName: "s"})
-	if slog.Default() != before {
-		t.Fatal("slog.Default changed; token-parity precondition failed")
-	}
 	slog.Info("capability check", "token", "split_brain_gate_v1")
 }
 
@@ -312,13 +310,15 @@ func TestSetup_NoEndpoint_TokenAttrDoesNotPanic(t *testing.T) {
 func TestSetup_OffThenOn_AdoptsVendorLogger(t *testing.T) {
 	cleanEnv(t)
 	before := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(before) })
 	setup(t, Config{ServiceName: "s"})
-	if slog.Default() != before {
-		t.Fatal("first (off) Setup mutated slog.Default")
+	afterOff := slog.Default()
+	if afterOff == before {
+		t.Fatal("first (off) Setup did not install a handler")
 	}
 	srv, _ := otelHTTPServer(t)
 	setup(t, Config{ServiceName: "s", OTLPEndpoint: srv.URL})
-	if slog.Default() == before {
+	if slog.Default() == afterOff {
 		t.Error("second (on) Setup did not adopt a new logger")
 	}
 }

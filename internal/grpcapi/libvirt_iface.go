@@ -102,7 +102,7 @@ type LibvirtBackend interface {
 	// (running: block-commit + pivot; shut off: qemu-img commit + redefine),
 	// removes the layers above, and drops the snapshot metadata. The caller
 	// picks bases no other VM uses (snapshotMergeBases).
-	FlattenSnapshot(domainName, snapshotName string, bases map[string]string) error
+	FlattenSnapshot(domainName, snapshotName string, bases map[string]string) ([]string, error)
 	// SnapshotBaseFiles lists every snapshot libvirt holds for the domain
 	// (its own metadata, recorded by litevirt or not) with the files its
 	// embedded domain's disks were on — the layers it froze.

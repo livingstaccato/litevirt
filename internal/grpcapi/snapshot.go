@@ -471,7 +471,7 @@ func (s *Server) DeleteSnapshot(ctx context.Context, req *pb.DeleteSnapshotReque
 
 	var delErr error
 	if len(bases) > 0 {
-		if delErr = s.virt.FlattenSnapshot(req.VmName, req.SnapshotName, bases); delErr != nil {
+		if _, delErr = s.virt.FlattenSnapshot(req.VmName, req.SnapshotName, bases); delErr != nil {
 			slog.Warn("delete snapshot: merge failed, falling back to metadata-only",
 				"vm", req.VmName, "snap", req.SnapshotName, "error", delErr)
 			delErr = s.virt.DeleteSnapshot(req.VmName, req.SnapshotName)

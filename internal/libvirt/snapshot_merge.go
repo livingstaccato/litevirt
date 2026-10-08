@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	golibvirt "github.com/digitalocean/go-libvirt"
+
 	"github.com/litevirt/litevirt/internal/qcow2"
 )
 
@@ -102,17 +104,28 @@ func removeMergedLayers(layers []string) []error {
 // snapshot metadata belongs to the domain, so it is the same list whether the
 // domain runs or not.
 func (c *Client) SnapshotBaseFiles(domainName string) (map[string][]string, error) {
-	dom, err := c.virt.DomainLookupByName(domainName)
+	return snapshotBaseFiles(c.virt, domainName)
+}
+
+// snapshotListAPI is the part of libvirt snapshotBaseFiles uses.
+type snapshotListAPI interface {
+	DomainLookupByName(name string) (golibvirt.Domain, error)
+	DomainListAllSnapshots(dom golibvirt.Domain, needResults int32, flags uint32) ([]golibvirt.DomainSnapshot, int32, error)
+	DomainSnapshotGetXMLDesc(snap golibvirt.DomainSnapshot, flags uint32) (string, error)
+}
+
+func snapshotBaseFiles(v snapshotListAPI, domainName string) (map[string][]string, error) {
+	dom, err := v.DomainLookupByName(domainName)
 	if err != nil {
 		return nil, fmt.Errorf("lookup domain %q: %w", domainName, err)
 	}
-	snaps, _, err := c.virt.DomainListAllSnapshots(dom, -1, 0)
+	snaps, _, err := v.DomainListAllSnapshots(dom, -1, 0)
 	if err != nil {
 		return nil, fmt.Errorf("list snapshots of %q: %w", domainName, err)
 	}
 	out := map[string][]string{}
 	for _, sn := range snaps {
-		x, err := c.virt.DomainSnapshotGetXMLDesc(sn, 0)
+		x, err := v.DomainSnapshotGetXMLDesc(sn, 0)
 		if err != nil {
 			return nil, fmt.Errorf("snapshot %q of %q: %w", sn.Name, domainName, err)
 		}

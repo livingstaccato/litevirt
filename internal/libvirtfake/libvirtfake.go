@@ -1414,11 +1414,11 @@ func (f *Fake) DeleteSnapshot(domainName, snapshotName string) error {
 // FlattenSnapshot models the merge: each disk named in bases is put back on
 // its base, as a block-commit's pivot (or an offline commit's redefine)
 // leaves the domain. FlattenBases records what each call was given.
-func (f *Fake) FlattenSnapshot(domainName, snapshotName string, bases map[string]string) error {
+func (f *Fake) FlattenSnapshot(domainName, snapshotName string, bases map[string]string) ([]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, ok := f.snapshots[domainName][snapshotName]; !ok {
-		return fmt.Errorf("libvirtfake: no snapshot %q for %q", snapshotName, domainName)
+		return nil, fmt.Errorf("libvirtfake: no snapshot %q for %q", snapshotName, domainName)
 	}
 	delete(f.snapshots[domainName], snapshotName)
 	if len(bases) > 0 && f.diskSources[domainName] == nil {
@@ -1431,7 +1431,7 @@ func (f *Fake) FlattenSnapshot(domainName, snapshotName string, bases map[string
 	}
 	f.FlattenBases = append(f.FlattenBases, cp)
 	f.record("snapshot-flatten", domainName, snapshotName)
-	return nil
+	return nil, nil
 }
 
 func (f *Fake) CreateLiveSnapshot(domainName, snapshotName, vmstatePath string, captureSuspended func() error) (diskBytes, vmstateBytes int64, err error) {

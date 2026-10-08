@@ -220,31 +220,46 @@ func (c *Client) RevertToSnapshot(domainName, snapshotName string, restorePreDef
 //
 // Any other state, or a base that is not in the disk's chain, is an error
 // before anything is written; the caller then deletes the metadata only.
-func (c *Client) FlattenSnapshot(domainName, snapshotName string, bases map[string]string) error {
-	dom, err := c.virt.DomainLookupByName(domainName)
+func (c *Client) FlattenSnapshot(domainName, snapshotName string, bases map[string]string) ([]string, error) {
+	return flattenSnapshot(c.virt, domainName, snapshotName, bases)
+}
+
+// flattenAPI is the part of libvirt flattenSnapshot uses.
+type flattenAPI interface {
+	snapshotMetadataAPI
+	DomainGetState(dom golibvirt.Domain, flags uint32) (int32, int32, error)
+	DomainGetXMLDesc(dom golibvirt.Domain, flags golibvirt.DomainXMLFlags) (string, error)
+	DomainBlockCommit(dom golibvirt.Domain, disk string, base, top golibvirt.OptString, bandwidth uint64, flags golibvirt.DomainBlockCommitFlags) error
+	DomainGetBlockJobInfo(dom golibvirt.Domain, path string, flags uint32) (int32, int32, uint64, uint64, uint64, error)
+	DomainBlockJobAbort(dom golibvirt.Domain, path string, flags golibvirt.DomainBlockJobAbortFlags) error
+	DomainDefineXML(xml string) (golibvirt.Domain, error)
+}
+
+func flattenSnapshot(v flattenAPI, domainName, snapshotName string, bases map[string]string) ([]string, error) {
+	dom, err := v.DomainLookupByName(domainName)
 	if err != nil {
-		return fmt.Errorf("lookup domain %q: %w", domainName, err)
+		return nil, fmt.Errorf("lookup domain %q: %w", domainName, err)
 	}
-	st, _, sErr := c.virt.DomainGetState(dom, 0)
+	st, _, sErr := v.DomainGetState(dom, 0)
 	if sErr != nil {
-		return fmt.Errorf("domain state: %w", sErr)
+		return nil, fmt.Errorf("domain state: %w", sErr)
 	}
 	running := st == int32(golibvirt.DomainRunning)
 	if !running && st != int32(golibvirt.DomainShutoff) {
-		return fmt.Errorf("flatten requires a running or shut-off domain")
+		return nil, fmt.Errorf("flatten requires a running or shut-off domain")
 	}
-	snap, err := c.virt.DomainSnapshotLookupByName(dom, snapshotName, 0)
+	snap, err := v.DomainSnapshotLookupByName(dom, snapshotName, 0)
 	if err != nil {
-		return fmt.Errorf("snapshot %q not found: %w", snapshotName, err)
+		return nil, fmt.Errorf("snapshot %q not found: %w", snapshotName, err)
 	}
 	flags := golibvirt.DomainXMLFlags(0)
 	if !running {
 		// Secure: the redefinition must keep the graphics password.
 		flags = golibvirt.DomainXMLInactive | golibvirt.DomainXMLSecure
 	}
-	domXML, err := c.virt.DomainGetXMLDesc(dom, flags)
+	domXML, err := v.DomainGetXMLDesc(dom, flags)
 	if err != nil {
-		return fmt.Errorf("get domain XML: %w", err)
+		return nil, fmt.Errorf("get domain XML: %w", err)
 	}
 	cur := parseDomainDiskSources(domXML) // dev → active layer
 
@@ -256,7 +271,7 @@ func (c *Client) FlattenSnapshot(domainName, snapshotName string, bases map[stri
 	for dev, base := range bases {
 		top, ok := cur[dev]
 		if !ok {
-			return fmt.Errorf("disk %s is not in the domain", dev)
+			return nil, fmt.Errorf("disk %s is not in the domain", dev)
 		}
 		if resolvedPath(top) == resolvedPath(base) {
 			continue
@@ -264,7 +279,7 @@ func (c *Client) FlattenSnapshot(domainName, snapshotName string, bases map[stri
 		// Judged before anything is written: base must be in this chain.
 		above, err := layersAbove(top, base)
 		if err != nil {
-			return fmt.Errorf("disk %s: %w", dev, err)
+			return nil, fmt.Errorf("disk %s: %w", dev, err)
 		}
 		merges = append(merges, merge{dev: dev, top: top, base: base, above: above})
 	}
@@ -273,52 +288,54 @@ func (c *Client) FlattenSnapshot(domainName, snapshotName string, bases map[stri
 		for _, m := range merges {
 			// Active-layer commit bounded at the base: layers under it (a
 			// shared image, another VM's disk) are untouched.
-			if err := c.virt.DomainBlockCommit(dom, m.dev,
+			if err := v.DomainBlockCommit(dom, m.dev,
 				golibvirt.OptString{m.base}, golibvirt.OptString{}, 0,
 				golibvirt.DomainBlockCommitActive); err != nil {
-				return fmt.Errorf("block-commit %s: %w", m.dev, err)
+				return nil, fmt.Errorf("block-commit %s: %w", m.dev, err)
 			}
-			if err := c.waitBlockJobReady(dom, m.dev); err != nil {
-				return fmt.Errorf("block-commit %s sync: %w", m.dev, err)
+			if err := waitBlockJobReady(v, dom, m.dev); err != nil {
+				return nil, fmt.Errorf("block-commit %s sync: %w", m.dev, err)
 			}
-			if err := c.virt.DomainBlockJobAbort(dom, m.dev, golibvirt.DomainBlockJobAbortPivot); err != nil {
-				return fmt.Errorf("pivot %s onto base: %w", m.dev, err)
+			if err := v.DomainBlockJobAbort(dom, m.dev, golibvirt.DomainBlockJobAbortPivot); err != nil {
+				return nil, fmt.Errorf("pivot %s onto base: %w", m.dev, err)
 			}
 		}
 	} else if len(merges) > 0 {
 		newXML := domXML
 		for _, m := range merges {
 			if _, err := commitLayersOffline(m.top, m.base); err != nil {
-				return fmt.Errorf("disk %s: %w", m.dev, err)
+				return nil, fmt.Errorf("disk %s: %w", m.dev, err)
 			}
 			out, changed, err := RewriteDiskSourceFile(newXML, m.dev, m.top, m.base)
 			if err != nil || !changed {
-				return fmt.Errorf("repoint disk %s at %s (changed=%v): %v", m.dev, m.base, changed, err)
+				return nil, fmt.Errorf("repoint disk %s at %s (changed=%v): %v", m.dev, m.base, changed, err)
 			}
 			newXML = out
 		}
 		// The data is in each base and every top still reads the same over
 		// it, so a failure here leaves a consistent (deeper) chain.
-		if _, err := c.virt.DomainDefineXML(newXML); err != nil {
-			return fmt.Errorf("redefine the domain on its merged disks: %w", err)
+		if _, err := v.DomainDefineXML(newXML); err != nil {
+			return nil, fmt.Errorf("redefine the domain on its merged disks: %w", err)
 		}
 	}
 
-	_ = c.virt.DomainSnapshotDelete(snap, golibvirt.DomainSnapshotDeleteMetadataOnly)
+	_ = v.DomainSnapshotDelete(snap, golibvirt.DomainSnapshotDeleteMetadataOnly)
+	var removed []string
 	for _, m := range merges {
 		for _, err := range removeMergedLayers(m.above) {
 			slog.Warn("snapshot flatten: a merged layer could not be removed", "vm", domainName, "disk", m.dev, "error", err)
 		}
+		removed = append(removed, m.above...)
 	}
-	return nil
+	return removed, nil
 }
 
 // waitBlockJobReady polls a disk's block job until it has synced (cur >= end),
 // the point at which an active-layer commit is ready to pivot. Returns when the
 // job is ready or gone; errors only on a query failure or timeout.
-func (c *Client) waitBlockJobReady(dom golibvirt.Domain, dev string) error {
+func waitBlockJobReady(v flattenAPI, dom golibvirt.Domain, dev string) error {
 	for i := 0; i < 1200; i++ { // ~10 min ceiling for large disks
-		found, _, _, curr, end, err := c.virt.DomainGetBlockJobInfo(dom, dev, 0)
+		found, _, _, curr, end, err := v.DomainGetBlockJobInfo(dom, dev, 0)
 		if err != nil {
 			return err
 		}

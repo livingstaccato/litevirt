@@ -387,22 +387,23 @@ func newCTStopCmd() *cobra.Command {
 
 func newCTRmCmd() *cobra.Command {
 	var host string
-	var useLocal bool
+	var useLocal, force bool
 	cmd := &cobra.Command{
 		Use:   "rm <name>",
-		Short: "Delete a stopped container",
+		Short: "Delete a stopped container (--force deletes a running one)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if useLocal {
 				return lxc.NewLxcRunner().Delete(cmd.Context(), args[0])
 			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
-				_, err := c.DeleteContainer(ctx, &pb.DeleteContainerRequest{HostName: host, Name: args[0]})
+				_, err := c.DeleteContainer(ctx, &pb.DeleteContainerRequest{HostName: host, Name: args[0], Force: force})
 				return err
 			})
 		},
 	}
 	cmd.Flags().StringVar(&host, "host", "", "Target host")
+	cmd.Flags().BoolVar(&force, "force", false, "Delete a running container (it is stopped first)")
 	cmd.Flags().BoolVar(&useLocal, "local", false, "Use the host-local runtime")
 	return cmd
 }

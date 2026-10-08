@@ -115,7 +115,7 @@ func (s *Server) handleStopContainer(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDeleteContainer(w http.ResponseWriter, r *http.Request) {
 	host, name := r.PathValue("host"), r.PathValue("name")
-	if _, err := s.grpc.DeleteContainer(s.uiBearerCtx(r), &pb.DeleteContainerRequest{HostName: host, Name: name}); err != nil {
+	if _, err := s.grpc.DeleteContainer(s.uiBearerCtx(r), &pb.DeleteContainerRequest{HostName: host, Name: name, Force: true}); err != nil {
 		slog.Error("UI: delete container failed", "name", name, "host", host, "error", err)
 		sendToast(w, "Delete failed: "+err.Error(), "error")
 	} else {

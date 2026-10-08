@@ -479,8 +479,16 @@ func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 	} else if removed {
 		return s.deleteContainerOnRemovedHost(ctx, targetHost, req.Name, project)
 	}
+	// A running container is deleted only with force (see refuseDeleteRunning).
+	// Judged here from the row when the owner is remote — the owner then trusts
+	// a peer's forward — and on the owner from its runtime.
+	if !req.Force && targetHost != s.hostName {
+		if rec, _ := corrosion.GetContainer(ctx, s.db, targetHost, req.Name); rec != nil && rec.State == "running" {
+			return nil, refuseDeleteRunning(req.Name, targetHost)
+		}
+	}
 	if forwarded, err := s.forwardSimpleCT(ctx, targetHost, func(c pb.LiteVirtClient) (*emptypb.Empty, error) {
-		return c.DeleteContainer(ctx, &pb.DeleteContainerRequest{Name: req.Name, HostName: targetHost})
+		return c.DeleteContainer(ctx, &pb.DeleteContainerRequest{Name: req.Name, HostName: targetHost, Force: req.Force})
 	}); err != nil || forwarded != nil {
 		if err == nil {
 			// Report the delete once this node no longer lists the row (see
@@ -497,6 +505,17 @@ func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 	// container that is half deleted.
 	unlock := s.LockContainer(req.Name)
 	defer unlock()
+	// The runtime delete is lxc-destroy -f, which stops a running container
+	// first, so without force a running one is refused. A remote peer's call is
+	// exempt: a current entry node judged it before forwarding, and an older
+	// one (a rolling upgrade) drives compose and relocation deletes that never
+	// carried the flag.
+	if !req.Force && !s.isRemotePeer(ctx) {
+		if st, serr := s.containerRuntime.StateContainer(ctx, req.Name); serr == nil && strings.EqualFold(st, "running") {
+			s.audit(ctx, "ct.delete", req.Name, "project="+project+" running", "denied")
+			return nil, refuseDeleteRunning(req.Name, s.hostName)
+		}
+	}
 	// Capture the stack label NOW (for the DNS-record name) — the row is about to be
 	// tombstoned. Best-effort: if the row is already gone, the reaper backstops.
 	dnsStack := ""
@@ -734,6 +753,19 @@ func (s *Server) PullOCIImage(ctx context.Context, req *pb.PullOCIImageRequest) 
 }
 
 // ── helpers ──
+
+// refuseDeleteRunning is the refusal for a delete of a running container
+// without force.
+func refuseDeleteRunning(name, host string) error {
+	return status.Errorf(codes.FailedPrecondition,
+		"container %q is running on host %q; stop it first (lv ct stop %s), or delete it running with --force", name, host, name)
+}
+
+// isRemotePeer reports whether the caller is another cluster node's daemon
+// (peer mTLS from a trusted host, not this host's own local-root CLI).
+func (s *Server) isRemotePeer(ctx context.Context) bool {
+	return callerPrincipalKind(ctx) == principalKindPeer && s.requirePeerCert(ctx) == nil
+}
 
 // forwardCreateContainer routes the request to the owning host when
 // host_name names a remote. Returns (resp, err) — both nil means

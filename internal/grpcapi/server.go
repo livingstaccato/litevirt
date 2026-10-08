@@ -1819,6 +1819,9 @@ type ContainerNICOpt struct {
 	IP     string
 	MAC    string
 	Veth   string // deterministic host-side veth name (managed NICs); "" = legacy/unmanaged
+	// Gateway is the default route a managed NIC's network gives the guest
+	// (a bare address); "" = none.
+	Gateway string
 }
 
 // ContainerInfo is the minimal post-create record handed back.

@@ -16,7 +16,7 @@ import (
 // the deploy executor for OpDelete and the delete half of an OpUpdate recreate.
 func (s *Server) deleteWorkload(ctx context.Context, a planner.VMAction) error {
 	if a.IsContainer {
-		_, err := s.DeleteContainer(ctx, &pb.DeleteContainerRequest{HostName: a.TargetHost, Name: a.VMName})
+		_, err := s.DeleteContainer(ctx, &pb.DeleteContainerRequest{HostName: a.TargetHost, Name: a.VMName, Force: true})
 		return err
 	}
 	_, err := s.DeleteVM(ctx, &pb.DeleteVMRequest{Name: a.VMName})

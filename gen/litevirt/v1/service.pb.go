@@ -12143,9 +12143,12 @@ func (x *StopContainerRequest) GetTimeoutSec() int32 {
 }
 
 type DeleteContainerRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	HostName      string                 `protobuf:"bytes,1,opt,name=host_name,json=hostName,proto3" json:"host_name,omitempty"`
-	Name          string                 `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	HostName string                 `protobuf:"bytes,1,opt,name=host_name,json=hostName,proto3" json:"host_name,omitempty"`
+	Name     string                 `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
+	// force deletes a running container (lxc-destroy -f stops it first).
+	// Without it a running container is refused: stop it, then delete it.
+	Force         bool `protobuf:"varint,3,opt,name=force,proto3" json:"force,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -12192,6 +12195,13 @@ func (x *DeleteContainerRequest) GetName() string {
 		return x.Name
 	}
 	return ""
+}
+
+func (x *DeleteContainerRequest) GetForce() bool {
+	if x != nil {
+		return x.Force
+	}
+	return false
 }
 
 type ExecContainerRequest struct {
@@ -34536,10 +34546,11 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x1f\n" +
 	"\vtimeout_sec\x18\x03 \x01(\x05R\n" +
-	"timeoutSec\"I\n" +
+	"timeoutSec\"_\n" +
 	"\x16DeleteContainerRequest\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x12\x12\n" +
-	"\x04name\x18\x02 \x01(\tR\x04name\"[\n" +
+	"\x04name\x18\x02 \x01(\tR\x04name\x12\x14\n" +
+	"\x05force\x18\x03 \x01(\bR\x05force\"[\n" +
 	"\x14ExecContainerRequest\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x12\n" +

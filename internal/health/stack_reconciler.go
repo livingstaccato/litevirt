@@ -106,7 +106,7 @@ func (r *StackReconciler) reconcileStack(ctx context.Context, stack corrosion.St
 	}
 	for _, ct := range cts {
 		if _, err := r.cleaner.DeleteContainerForStackCleanup(ctx,
-			&pb.DeleteContainerRequest{HostName: ct.HostName, Name: ct.Name}); err != nil {
+			&pb.DeleteContainerRequest{HostName: ct.HostName, Name: ct.Name, Force: true}); err != nil {
 			slog.Warn("stack-reconciler: delete container failed, will retry",
 				"stack", stack.Name, "container", ct.Name, "host", ct.HostName, "error", err)
 			remainingCTs++

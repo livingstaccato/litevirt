@@ -257,7 +257,7 @@ func (s *Server) handleBulkContainers(w http.ResponseWriter, r *http.Request) {
 	case "delete":
 		fn = func(ctx context.Context, key string) error {
 			host, name := splitHostName(key)
-			_, err := s.grpc.DeleteContainer(ctx, &pb.DeleteContainerRequest{HostName: host, Name: name})
+			_, err := s.grpc.DeleteContainer(ctx, &pb.DeleteContainerRequest{HostName: host, Name: name, Force: true})
 			return err
 		}
 	default:

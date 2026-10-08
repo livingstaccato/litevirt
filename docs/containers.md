@@ -47,6 +47,11 @@ lv ct stop web --timeout 10
 lv ct rm web
 ```
 
+`lv ct rm` deletes a stopped container. A running one is refused with a
+message naming `lv ct stop`; `lv ct rm --force` stops it and deletes it.
+`compose down`, a compose recreate and the web UI's delete (behind its
+confirmation) delete a running container as before.
+
 ### Host paths a container is given
 
 A rootfs template is copied whole into the new container, and a local

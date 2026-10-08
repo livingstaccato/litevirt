@@ -63,7 +63,7 @@ func TestGetVMIPRemote_PeerGatedAndContainer(t *testing.T) {
 func TestDeleteContainer_RemovesDNSRecord(t *testing.T) {
 	s := testServer(t)
 	s.dnsDomain = "litevirt.local"
-	s.SetContainerRuntime(&fakeCTRuntime{})
+	s.SetContainerRuntime(&fakeCTRuntime{stateByName: map[string]string{"ct1": "stopped"}})
 	ctx := adminCtx()
 
 	if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{

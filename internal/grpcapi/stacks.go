@@ -927,7 +927,7 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 		}
 	}
 	for _, ct := range containers {
-		if _, delErr := s.DeleteContainer(ctx, &pb.DeleteContainerRequest{HostName: ct.HostName, Name: ct.Name}); delErr != nil {
+		if _, delErr := s.DeleteContainer(ctx, &pb.DeleteContainerRequest{HostName: ct.HostName, Name: ct.Name, Force: true}); delErr != nil {
 			hadFailures = true
 			notRemoved = append(notRemoved, ct.Name)
 			slog.Warn("stack delete container failed", "container", ct.Name, "host", ct.HostName, "error", delErr)

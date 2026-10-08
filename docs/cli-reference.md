@@ -300,7 +300,8 @@ lv ct create <name> --restart on-failure [--restart-max-attempts 5 --restart-del
 lv ct create <name> --on-host-failure image-recreate   # rebuild on a surviving host if this one is fenced
 lv ct start <name>
 lv ct stop <name>
-lv ct rm <name>
+lv ct rm <name>                                       # a stopped container; a running one is refused
+lv ct rm <name> --force                               # a running container: stopped, then deleted
 lv ct ls
 lv ct exec <name> -- <cmd> [args...]
 lv ct backup <name> --repo <dir>                       # full rootfs backup → dedup chunk store

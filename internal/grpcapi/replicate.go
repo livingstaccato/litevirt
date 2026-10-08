@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -29,6 +30,8 @@ import (
 //     new daemon-named file (convertImage: format named, input pre-checked).
 //   - zfs→zfs and ceph→ceph use native send/receive into a new daemon-named
 //     dataset or image (replicateVolumeNative), never an existing one.
+//   - btrfs→btrfs sends a disk alone in its own subvolume natively into a new
+//     daemon-named subvolume (replicateVolumeBtrfs), never an existing one.
 //   - Crash-consistent: we don't quiesce the guest. For application
 //     consistency the operator should snapshot the VM first.
 //   - Full copy every call.
@@ -94,6 +97,14 @@ func (s *Server) ReplicateVolume(req *pb.ReplicateVolumeRequest, stream grpc.Ser
 		return err
 	}
 
+	// btrfs→btrfs: native send/receive of the disk's own subvolume into a NEW
+	// subvolume the daemon names in the target pool (replicateVolumeBtrfs).
+	// A disk that is not alone in its own subvolume keeps the file copy.
+	if src.StorageType == "btrfs" && dstPool.Driver == "btrfs" {
+		if sub, ok := s.btrfsDiskSubvolume(ctx, src); ok {
+			return s.replicateVolumeBtrfs(ctx, req, src, sub, dstPool, stream)
+		}
+	}
 	// Native send/receive between two pools of the same block driver (zfs,
 	// ceph). The destination is a NEW dataset or image the daemon names in
 	// the target pool — "<pool source>/<vm>-<disk>-copy-<time>-<id>", or an
@@ -202,13 +213,9 @@ func (s *Server) ReplicateVolume(req *pb.ReplicateVolumeRequest, stream grpc.Ser
 
 // replicateVolumeNative is ReplicateVolume's zfs/ceph send/receive.
 func (s *Server) replicateVolumeNative(ctx context.Context, req *pb.ReplicateVolumeRequest, vm *corrosion.VMRecord, src *corrosion.DiskRecord, dstPool StoragePoolRef, stream grpc.ServerStreamingServer[pb.ReplicateVolumeProgress]) error {
-	leaf := req.TargetPath
-	if leaf == "" {
-		leaf = fmt.Sprintf("%s-%s-copy-%s-%s", req.VmName, req.DiskName,
-			time.Now().UTC().Format("20060102-150405"), randid.New()[:8])
-	} else if err := safename.ValidateName(leaf); err != nil || strings.HasPrefix(leaf, "-") {
-		// Admin-only (checked above). A leaf name, never a path.
-		return status.Errorf(codes.InvalidArgument, "target_path on a %s pool is a dataset/image name: %v", dstPool.Driver, err)
+	leaf, err := nativeCopyLeaf(req, dstPool.Driver)
+	if err != nil {
+		return err
 	}
 	srcRef, dstRef, err := nativeRefs(src, dstPool, leaf)
 	if err != nil {
@@ -314,4 +321,114 @@ func rbdPathOptions(path string) map[string]string {
 		}
 	}
 	return out
+}
+
+// nativeCopyLeaf is the name of a native copy in its pool: daemon-chosen
+// ("<vm>-<disk>-copy-<time>-<id>"), or an admin's target_path (checked by the
+// caller) as a leaf name — never a path, never starting with "-".
+func nativeCopyLeaf(req *pb.ReplicateVolumeRequest, driver string) (string, error) {
+	leaf := req.TargetPath
+	if leaf == "" {
+		return fmt.Sprintf("%s-%s-copy-%s-%s", req.VmName, req.DiskName,
+			time.Now().UTC().Format("20060102-150405"), randid.New()[:8]), nil
+	}
+	if err := safename.ValidateName(leaf); err != nil || strings.HasPrefix(leaf, "-") {
+		return "", status.Errorf(codes.InvalidArgument, "target_path on a %s pool is a dataset/image name: %v", driver, err)
+	}
+	return leaf, nil
+}
+
+// btrfsDiskSubvolume is the subvolume a btrfs disk can be sent from: the
+// disk's own directory, directly under its pool's root, a btrfs subvolume,
+// holding the disk file and nothing else (a send copies the whole subvolume,
+// and the copy is recorded as this disk's). ok is false for anything else —
+// a disk file in the pool's directory (storage motion puts them there), a
+// disk with no pool, a subvolume holding other files — which keeps the file
+// copy.
+func (s *Server) btrfsDiskSubvolume(ctx context.Context, src *corrosion.DiskRecord) (string, bool) {
+	if src.StorageVolume == "" {
+		return "", false
+	}
+	pool, ok := s.resolvePool(ctx, src.StorageVolume)
+	if !ok || pool.Driver != "btrfs" || !filepath.IsAbs(pool.Source) {
+		return "", false
+	}
+	file := filepath.Clean(src.Path)
+	sub := filepath.Dir(file)
+	name := filepath.Base(sub)
+	if filepath.Dir(sub) != filepath.Clean(pool.Source) || strings.HasPrefix(name, ".") || strings.HasPrefix(name, "-") {
+		return "", false
+	}
+	if fi, err := os.Lstat(sub); err != nil || !fi.IsDir() {
+		return "", false
+	}
+	des, err := os.ReadDir(sub)
+	if err != nil || len(des) != 1 || des[0].Name() != filepath.Base(file) || !des[0].Type().IsRegular() {
+		return "", false
+	}
+	return sub, storage.IsBtrfsSubvolume(ctx, sub)
+}
+
+// replicateVolumeBtrfs is ReplicateVolume's btrfs send/receive of the disk's
+// subvolume sub. The copy is a NEW subvolume "<pool root>/<leaf>" — refused
+// if anything has the name, before anything is sent, and placed by a rename
+// that refuses one created in between — holding the disk file under its own
+// name, recorded as the VM's project's copy of the disk.
+func (s *Server) replicateVolumeBtrfs(ctx context.Context, req *pb.ReplicateVolumeRequest, src *corrosion.DiskRecord, sub string, dstPool StoragePoolRef, stream grpc.ServerStreamingServer[pb.ReplicateVolumeProgress]) error {
+	leaf, err := nativeCopyLeaf(req, dstPool.Driver)
+	if err != nil {
+		return err
+	}
+	if strings.HasPrefix(leaf, ".") {
+		return status.Errorf(codes.InvalidArgument, "target_path on a btrfs pool is a subvolume name, never a hidden one")
+	}
+	if !filepath.IsAbs(dstPool.Source) {
+		return status.Errorf(codes.FailedPrecondition, "target pool has no usable source directory")
+	}
+	dst := filepath.Join(filepath.Clean(dstPool.Source), leaf)
+	if err := refuseExistingFile(dst); err != nil {
+		return err
+	}
+	drv, err := storage.New(s.dataDir, storage.Config{
+		Driver: dstPool.Driver, Source: dstPool.Source, Target: dstPool.Target, Options: dstPool.Options,
+	})
+	if err != nil {
+		return status.Errorf(codes.Internal, "construct driver: %v", err)
+	}
+	if err := drv.Prepare(ctx); err != nil {
+		return status.Errorf(codes.FailedPrecondition, "prepare target pool: %v", err)
+	}
+	rep := storage.AsReplicator(drv)
+	if rep == nil {
+		return status.Errorf(codes.Unimplemented, "driver %q has no native replication", dstPool.Driver)
+	}
+	if err := stream.Send(&pb.ReplicateVolumeProgress{
+		Phase: pb.ReplicateVolumeProgress_SNAPSHOT, Status: fmt.Sprintf("native btrfs send/receive → %s", dst),
+		BytesTotal: src.SizeBytes,
+	}); err != nil {
+		return err
+	}
+	if err := rep.Replicate(ctx, storage.ReplicateOptions{SrcRef: sub, DstRef: dst}); err != nil {
+		if errors.Is(err, storage.ErrDestinationExists) {
+			return status.Errorf(codes.AlreadyExists, "%v", err)
+		}
+		return status.Errorf(codes.Internal, "native replicate: %v", err)
+	}
+	copyPath := filepath.Join(dst, filepath.Base(src.Path))
+	// As for a file copy: recorded as the VM's project's copy of the disk; a
+	// record that cannot be written leaves the copy, and the operator is told.
+	done := "native replication complete"
+	recErr := errors.New("its VM's row cannot be read")
+	if k, ok := s.replicaKeyFor(ctx, req.VmName, req.DiskName); ok {
+		recErr = s.recordPoolCopy(ctx, req.TargetPool, k, copyPath)
+	}
+	if recErr != nil {
+		slog.Warn("replicate: copy written but not recorded as the VM's; an admin can still promote it by name", "path", copyPath, "error", recErr)
+		done = fmt.Sprintf("native replication complete, but the copy is not recorded as %s's (%v): an admin can still promote it by name", req.VmName, recErr)
+	}
+	s.recordVMEvent(ctx, req.VmName, "disk.replicated", "ok", fmt.Sprintf("%s → %s", req.DiskName, req.TargetPool))
+	return stream.Send(&pb.ReplicateVolumeProgress{
+		Phase: pb.ReplicateVolumeProgress_DONE, Status: done,
+		TargetPath: copyPath, BytesTotal: src.SizeBytes, BytesCopied: src.SizeBytes, CopyPct: 100,
+	})
 }

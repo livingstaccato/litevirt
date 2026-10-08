@@ -979,8 +979,27 @@ so a copy between two ceph clusters uses each cluster's own credentials. The
 per-copy source snapshot is removed afterwards, and a copy that fails after it
 was received is removed rather than left unrecorded — only the image the copy
 itself created, never the destination name, which an image created in the
-meantime may hold. A btrfs disk takes the
-file copy. What the drivers implement:
+meantime may hold.
+
+A **btrfs** disk alone in its own subvolume directly under its btrfs pool (as
+the btrfs driver creates every disk) replicated into a btrfs pool is sent
+natively too. The copy is a **new** subvolume the daemon names under the target
+pool's directory — `<pool source>/<vm>-<disk>-copy-<time>-<id>`, or, for an
+admin, `--target-path` as the leaf name (never a path, never starting with `.`
+or `-`) — holding the disk file under its own name; the DONE line reports that
+file. A name that exists is refused with `AlreadyExists` before anything is
+sent. The source is snapshotted read-only into a private directory beside it,
+received into a private directory in the target pool, and a writable snapshot
+of what was received is placed with a rename that refuses an existing name
+(`renameat2(RENAME_NOREPLACE)`), so a subvolume or directory created meanwhile
+is never replaced. The send snapshot, the received (read-only) subvolume and
+both private directories are removed when the copy ends, whether it succeeded
+or not, by what exists, so a failed copy leaves nothing in either pool and
+every copy uses new names. The copy is recorded, as a file copy is, as its VM's
+project's copy of the disk. A btrfs disk anywhere else — a file in the pool's
+directory (storage motion puts it there), a disk with no pool, a subvolume that
+holds other files — and every copy between different drivers take the file
+copy. What the drivers implement:
 
 - **ZFS** — `zfs snapshot` then `zfs send | zfs recv`. Incremental
   (`-I` since the prior `litevirt-replicate-prev` snapshot) when
@@ -989,8 +1008,9 @@ file copy. What the drivers implement:
   an incremental is `rbd export-diff --from-snap | rbd import-diff` onto an
   image the replication created. Cross-cluster via SSH wrap on the receive
   side.
-- **BTRFS** — `btrfs send | btrfs receive`. Incremental via `-p` against
-  the prior replicate snapshot.
+- **BTRFS** — `btrfs subvolume snapshot -r`, then `btrfs send | btrfs
+  receive`, always a full send into a new subvolume (no snapshot is kept
+  between copies); same host only, as the copy is placed by a local rename.
 
 Cross-host replication wraps the receive in `ssh <user@host>` so the
 sender pipes straight into the remote CLI. Same-host uses a local pipe.
@@ -1006,7 +1026,7 @@ consistency is a planned follow-up.
 | Move (offline) | ✓ | ✓ | ✓ | ✓ | — | — | — | — |
 | Move (live) | ✓ | ✓ | ✓ | ✓ | — | — | — | — |
 | Replicate via qemu-img | ✓ | ✓ | ✓ | ✓ | fallback | fallback | — | — |
-| Native send / receive (`replicate-volume`) | n/a | n/a | n/a | file copy | zfs s/r | rbd export/import | n/a | n/a |
+| Native send / receive (`replicate-volume`) | n/a | n/a | n/a | btrfs s/r | zfs s/r | rbd export/import | n/a | n/a |
 | HA-friendly cluster store | no | yes | depends | no (host-local) | no (host-local) | yes | yes | no |
 
 The **Snapshots** row describes each backend's *native* snapshot capability

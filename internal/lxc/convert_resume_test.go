@@ -85,3 +85,54 @@ func TestRevertConverting_MarksBeforeTheSwap(t *testing.T) {
 		t.Fatalf("after the convert Security = %+v", sec)
 	}
 }
+
+// An N2 resume whose second stage (the range the marker did not record) is
+// itself interrupted leaves a marker naming that range; the next run finishes
+// there, not in yet another range.
+func TestConvert_InterruptedSecondStageResumesToItsRange(t *testing.T) {
+	r, _ := secRunner(t)
+	mkLegacyCT(t, r, "c")
+	owners := UseOwnershipOverlayForTest(t)
+	dir := filepath.Join(r.Lxcpath, "c")
+	if err := os.WriteFile(filepath.Join(dir, convertMarkerFile), []byte(`{"Confinement":"default"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const b2, b3 = int64(1_000_196_608), int64(1_000_262_144)
+	owners.FailAfter(2, errors.New("interrupted"))
+	if err := r.Convert(context.Background(), "c", ConvertOpts{IDMap: &IDMap{Base: b2, Size: IDMapSize}}); err == nil {
+		t.Fatal("interrupted second stage succeeded")
+	}
+	owners.FailAfter(-1, nil)
+	if sec, _ := r.Security("c"); sec.ConvertTo == nil || sec.ConvertTo.IDMap == nil || sec.ConvertTo.IDMap.Base != b2 {
+		t.Fatalf("marker after the interrupted second stage: %+v", sec.ConvertTo)
+	}
+	if err := r.Convert(context.Background(), "c", ConvertOpts{IDMap: &IDMap{Base: b3, Size: IDMapSize}}); err != nil {
+		t.Fatal(err)
+	}
+	_ = filepath.WalkDir(filepath.Join(dir, "rootfs"), func(p string, d os.DirEntry, err error) error {
+		if uid, _ := owners.Of(p); int64(uid) < b2 || int64(uid) >= b2+IDMapSize {
+			t.Errorf("%s owned by %d, outside %d", p, uid, b2)
+		}
+		return nil
+	})
+	if sec, _ := r.Security("c"); sec.Converting || sec.IDMap == nil || sec.IDMap.Base != b2 || sec.Confinement != ConfinementDefault {
+		t.Fatalf("Security = %+v", sec)
+	}
+}
+
+// The marker messages name only the exact command that finishes the recorded
+// target — lv ct convert <name>, which any caller who may convert can run —
+// never a snapshot revert (which would roll the rootfs back) and never a
+// flag the caller might not be allowed to use.
+func TestConvertCommand_OnlyTheExactResume(t *testing.T) {
+	for _, to := range []*ConvertOpts{
+		nil,
+		{Confinement: ConfinementLegacy},
+		{IDMap: &IDMap{Base: 1_000_000_000, Size: IDMapSize}, Confinement: ConfinementDefault},
+	} {
+		got := ConvertCommand("web", to)
+		if got != "lv ct convert web" {
+			t.Errorf("ConvertCommand(%+v) = %q, want %q", to, got, "lv ct convert web")
+		}
+	}
+}

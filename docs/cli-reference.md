@@ -317,6 +317,7 @@ lv ct pull <image> --dest <name> [--project p]       # stage an OCI image; with 
 lv ct inspect <name> [--host h]                        # placement, limits, privilege mode, confinement
 lv ct convert <name> --unprivileged [--confinement default]  # stopped ct → an id range of its own
 lv ct convert <name> --confinement default|legacy      # change confinement (legacy: Admin only)
+lv ct convert <name>                                  # finish an interrupted convert (the start refusal names it)
 lv ct create <name> --privileged                       # no user namespace, as earlier releases (Admin only)
 lv ct create <name> --confinement legacy               # AppArmor nesting, template seccomp/caps (Admin only)
 ```

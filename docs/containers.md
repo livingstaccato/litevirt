@@ -586,9 +586,11 @@ The convert runs offline on the owning host. It shifts the rootfs into a fresh
 range in place — nothing is copied or deleted — then rewrites the config's
 security block and records the new settings. A marker in the container's
 directory is written first and removed last, so a convert that is interrupted
-(a crash, a full disk) leaves a container that `lv ct start` refuses until the
-same convert is run again, which finishes the job (it only moves ids still in
-the old range). The re-run finishes to the range the interrupted convert
+(a crash, a full disk) leaves a container that `lv ct start` refuses, naming
+`lv ct convert <name>`: run with no flags, a convert finishes the recorded
+target (any caller who may convert the container may run it), and with
+flags it finishes the recorded target first and then applies them (it only
+moves ids still in the old range). The re-run finishes to the range the interrupted convert
 recorded, whatever range it would otherwise be given, so the rootfs never ends
 up split across two ranges. `--confinement` alone changes the profile and touches no file;
 `--confinement legacy` is the Admin's.
@@ -647,9 +649,10 @@ its on-disk dir, and stores it **host-local** under `{dataDir}/ct-snapshots`.
   container has now (its record), so it never silently runs privileged again.
   The restart refuses an overlapping id range like `lv ct start`. The restored copy is
   marked converting before it is swapped in, so a crash between the swap and
-  the convert leaves a container that refuses to start (naming `lv ct
-  convert`, which resumes to the recorded range), never one running with the
-  snapshot's older mode.
+  the convert leaves a container that refuses to start, naming
+  `lv ct convert <name>`, which finishes it to the recorded range and
+  confinement — never one running with the snapshot's older mode. Do not
+  revert again to recover: that rolls the rootfs back.
 - **Revert** stops the container (replacing the rootfs requires it stopped),
   restores the snapshot in place, and restarts it if it had been running. The
   restore is **crash-safe** — the live dir is set aside and rolled back if the

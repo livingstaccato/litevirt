@@ -8,6 +8,9 @@ import (
 	"strings"
 	"testing"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/lxc"
@@ -158,5 +161,27 @@ func TestConvertContainer_ResumeRecordsTheFinishedConfinement(t *testing.T) {
 	rowAgreesWithDisk(t, s, runner, ct)
 	if ct.Confinement != lxc.ConfinementDefault {
 		t.Fatalf("confinement %q, want default", ct.Confinement)
+	}
+}
+
+// The resume the marker messages name — lv ct convert <name>, no flags —
+// finishes the recorded target, for a non-admin too (it restores what was
+// recorded, it opts into nothing). Without a marker, no flags is still
+// nothing to convert.
+func TestConvertContainer_NoFlagsFinishesTheMarker(t *testing.T) {
+	s, runner, _, store := realConvertServer(t)
+	if _, err := s.ConvertContainer(ctOperatorCtx(), &pb.ConvertContainerRequest{Name: "old"}); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("no flags, no marker: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(store, "old", "litevirt-converting"), []byte(`{"Confinement":"default"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ct, err := s.ConvertContainer(ctOperatorCtx(), &pb.ConvertContainerRequest{Name: "old"})
+	if err != nil {
+		t.Fatalf("lv ct convert old with a marker: %v", err)
+	}
+	rowAgreesWithDisk(t, s, runner, ct)
+	if ct.Confinement != lxc.ConfinementDefault {
+		t.Fatalf("confinement %q", ct.Confinement)
 	}
 }

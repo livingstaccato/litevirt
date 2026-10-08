@@ -642,23 +642,13 @@ func describeConvert(to *ConvertOpts) string {
 	return strings.Join(parts, ", ")
 }
 
-// convertCommand is the CLI line that finishes a conversion to `to`
-// (whatever range it is given, a recorded range is resumed).
-func convertCommand(name string, to *ConvertOpts) string {
-	cmd := "lv ct convert " + name
-	if to == nil {
-		return cmd + " --unprivileged (or re-run the snapshot revert)"
-	}
-	if to.IDMap != nil {
-		cmd += " --unprivileged"
-	}
-	if to.Confinement != "" {
-		cmd += " --confinement " + to.Confinement
-	}
-	if to.IDMap == nil && to.Confinement == "" {
-		cmd += " --unprivileged"
-	}
-	return cmd + " (or re-run the snapshot revert that marked it)"
+// convertCommand is the CLI line that finishes an unfinished conversion: a
+// convert with no flags resumes the recorded target, and any caller who may
+// convert the container may run it (it restores what was recorded and opts
+// into nothing). It never names a snapshot revert, which would roll the rootfs
+// back, nor a flag the caller might not be allowed.
+func convertCommand(name string, _ *ConvertOpts) string {
+	return "lv ct convert " + name
 }
 
 // ConvertCommand is convertCommand for callers outside the package.

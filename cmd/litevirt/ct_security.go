@@ -84,8 +84,9 @@ removed. Run on an unprivileged container, it moves it to a fresh range.
 common seccomp policy and the standard capability drop list; legacy (Admin only)
 restores what earlier releases wrote.
 
-A convert that is interrupted leaves the container refusing to start; run the
-same command again to finish it.`,
+A convert that is interrupted leaves the container refusing to start; run
+lv ct convert <name> with no flags to finish it to the recorded target (with
+flags, the recorded target is finished first and the flags applied after).`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {

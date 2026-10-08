@@ -260,9 +260,9 @@ func (s *Server) ConvertContainer(ctx context.Context, req *pb.ConvertContainerR
 	if err := safename.ValidateContainerName(req.Name); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
-	if !req.Unprivileged && req.Confinement == "" {
-		return nil, status.Error(codes.InvalidArgument, "nothing to convert: pass --unprivileged and/or --confinement")
-	}
+	// No flags is the resume of an unfinished convert (lv ct convert <name>,
+	// which the marker messages name); judged on the owner, where the marker
+	// is, and refused there when there is none.
 	project, known := s.containerProject(ctx, req.HostName, req.Name)
 	if err := s.requirePermResolved(ctx, known, ctRBACPathFor(project, req.Name), ctRBACPathFor("", req.Name), "ct.update", "operator", containerWhat(req.Name)); err != nil {
 		s.audit(ctx, "ct.convert", req.Name, "project="+project, "denied")
@@ -309,6 +309,11 @@ func (s *Server) ConvertContainer(ctx context.Context, req *pb.ConvertContainerR
 			"container %q must be stopped to convert (lv ct stop %s); it is %s", req.Name, req.Name, got)
 	}
 	spec := corrosion.DecodeCreateSpec(rec.CreateSpec)
+	if !req.Unprivileged && req.Confinement == "" {
+		if cur, cerr := sc.ContainerSecurity(req.Name); cerr != nil || !cur.Converting {
+			return nil, status.Error(codes.InvalidArgument, "nothing to convert: pass --unprivileged and/or --confinement")
+		}
+	}
 	to := lxc.ConvertOpts{Confinement: req.Confinement}
 	// An interrupted convert is finished to the range it recorded, never a
 	// fresh one: part of the rootfs is already there (the runtime resumes to

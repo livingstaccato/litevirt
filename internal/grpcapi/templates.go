@@ -98,6 +98,20 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 		defer conn.Close()
 		return client.CloneVM(ctx, req)
 	}
+	// The source's lock, held until the clone's row exists (review M-1): a
+	// linked clone backs on the source's current layer before anything
+	// records that, and a snapshot delete of the source — which holds this
+	// lock — merges and removes layers no record uses. The source is judged
+	// again under it.
+	unlockSrc := s.lockVM(req.Source)
+	defer unlockSrc()
+	if fresh, gErr := corrosion.GetVM(ctx, s.db, req.Source); gErr != nil || fresh == nil {
+		return nil, status.Errorf(codes.NotFound, "source %q not found", req.Source)
+	} else if fresh.HostName != s.hostName {
+		return nil, status.Errorf(codes.FailedPrecondition, "source %q moved to host %s while the clone started; retry", req.Source, fresh.HostName)
+	} else {
+		src = fresh
+	}
 	// Consistent disk state: clone a template or a stopped VM (a running VM's
 	// disk isn't crash-consistent). Snapshot-based clone is a follow-up.
 	if !src.IsTemplate && src.State != "stopped" {
@@ -229,9 +243,12 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 			controller = ds.ControllerModel
 		}
 		diskConfigs = append(diskConfigs, lv.DiskConfig{Name: d.DiskName, Path: clonePath, Bus: bus, ControllerModel: controller})
+		// The clone's own file is <data_dir>/disks on this host whatever the
+		// source's storage (SafeDiskPath): recorded as that, so no host
+		// takes a local file for shared storage (review I-3).
 		diskRecords = append(diskRecords, corrosion.DiskRecord{
 			VMName: req.Target, DiskName: d.DiskName, HostName: s.hostName, Path: clonePath,
-			SizeBytes: d.SizeBytes, StorageType: d.StorageType, BackingDisk: backing,
+			SizeBytes: d.SizeBytes, StorageType: "local", BackingDisk: backing,
 			TargetDev: lv.DiskDevName(bus, len(diskRecords)), Bus: bus,
 		})
 	}

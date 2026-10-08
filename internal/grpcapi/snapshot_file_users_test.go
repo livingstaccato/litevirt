@@ -253,6 +253,12 @@ func TestSnapshotFileUsers_ARawLayerIsNeverParsed(t *testing.T) {
 						[]corrosion.DiskRecord{{VMName: "evil", DiskName: "root", HostName: "host-a", Path: disk, StorageType: "local"}}); err != nil {
 						t.Fatal(err)
 					}
+					// Its domain on this host says what each disk is.
+					format := "raw"
+					if disk != fake {
+						format = "qcow2"
+					}
+					defineDiskDomain(t, f.fake, "evil", disk, format)
 					var err error
 					if op == "delete" {
 						err = f.deleteS1()
@@ -261,6 +267,53 @@ func TestSnapshotFileUsers_ARawLayerIsNeverParsed(t *testing.T) {
 					}
 					if err != nil {
 						t.Fatalf("%s refused over a raw layer's guest-written header: %v", op, err)
+					}
+				})
+			}
+		})
+	}
+}
+
+// defineDiskDomain defines domain name in the fake with one disk on file,
+// whose libvirt driver type is format.
+func defineDiskDomain(t *testing.T, fake *libvirtfake.Fake, name, file, format string) {
+	t.Helper()
+	x := "<domain type='kvm'><name>" + name + "</name><devices><disk type='file' device='disk'><driver name='qemu' type='" + format +
+		"'/><source file='" + file + "'/><target dev='vda' bus='virtio'/></disk></devices></domain>"
+	if err := fake.DefineDomain(x); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Re-review R2-C2: a linked clone whose record does not say what it backs
+// on, now running on a top layer named neither .qcow2 nor after a current
+// snapshot — a restore-older overlay, or one whose snapshot was deleted
+// metadata-only — is still found by its header: its domain says the disk is
+// qcow2, or nothing says otherwise. It stops the source's snapshot delete and
+// restore, and its source's VM delete keeps what it backs on.
+func TestSnapshotFileUsers_AnUnrecordedCloneOnANonQcow2NamedTop(t *testing.T) {
+	for _, defined := range []bool{true, false} {
+		t.Run(map[bool]string{true: "domain says qcow2", false: "no domain here"}[defined], func(t *testing.T) {
+			for _, op := range []string{"delete", "restore"} {
+				t.Run(op, func(t *testing.T) {
+					f := newSnapUsersFixture(t, "stopped")
+					top := filepath.Join(f.dir, "old-root.s7-r1700000000")
+					runQemuImg(t, "create", "-q", "-f", "qcow2", "-F", "qcow2", "-b", f.overlay, top)
+					if err := corrosion.InsertVM(adminCtx(), f.s.db, corrosion.VMRecord{Name: "old", HostName: "host-a", State: "stopped"}, nil,
+						[]corrosion.DiskRecord{{VMName: "old", DiskName: "root", HostName: "host-a", Path: top, StorageType: "local"}}); err != nil {
+						t.Fatal(err)
+					}
+					if defined {
+						defineDiskDomain(t, f.fake, "old", top, "qcow2")
+					}
+					var err error
+					if op == "delete" {
+						err = f.deleteS1()
+					} else {
+						err = f.restoreS1()
+					}
+					if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "old") {
+						t.Fatalf("%s = %v, want refused naming the clone old", op, err)
 					}
 				})
 			}

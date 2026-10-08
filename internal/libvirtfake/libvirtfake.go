@@ -1505,6 +1505,18 @@ func (f *Fake) cutoverDisks(domain, snapname string) {
 	f.snapshotFiles[domain][snapname] = files
 }
 
+// DomainDiskFormats returns the disks of the domain's definition as source
+// file → driver type; a domain the fake has no definition of is not found.
+func (f *Fake) DomainDiskFormats(domainName string) (map[string]string, error) {
+	f.mu.Lock()
+	x := f.liveXMLLocked(domainName)
+	f.mu.Unlock()
+	if x == "" {
+		return nil, fmt.Errorf("libvirtfake: domain %q not found", domainName)
+	}
+	return libvirt.DiskFormatsFromXML(x), nil
+}
+
 // SnapshotDiskFiles returns the overlay and base of each disk the snapshot
 // cut over, as recorded at its creation.
 func (f *Fake) SnapshotDiskFiles(domainName, snapshotName string) ([]string, error) {

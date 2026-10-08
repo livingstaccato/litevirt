@@ -47,7 +47,9 @@ func (s *Server) snapshotFileUsers(ctx context.Context, vmName string, files []s
 		return nil, err
 	}
 	var out []string
-	for _, vm := range vms {
+	formats := map[string]map[string]string{}
+	for i := range vms {
+		vm := &vms[i]
 		if vm.Name == vmName {
 			continue
 		}
@@ -57,7 +59,7 @@ func (s *Server) snapshotFileUsers(ctx context.Context, vmName string, files []s
 		}
 		for _, d := range disks {
 			file := s.hostDiskFile(d.Path)
-			if uses(d.BackingDisk) || chainReaches(file, s.namedQcow2(ctx, vm.Name, file), uses) {
+			if uses(d.BackingDisk) || chainReaches(file, s.diskFormatOf(vm, d.Path, formats), uses) {
 				out = append(out, vm.Name)
 				break
 			}
@@ -67,37 +69,39 @@ func (s *Server) snapshotFileUsers(ctx context.Context, vmName string, files []s
 	return out, nil
 }
 
-// namedQcow2 reports whether vm's disk file is one litevirt names as qcow2:
-// <...>.qcow2, or an overlay named after one of vm's snapshots (libvirt
-// writes those as qcow2). Anything else may be a raw disk, whose first bytes
-// are the guest's and must not be read as a header.
-func (s *Server) namedQcow2(ctx context.Context, vm, file string) bool {
-	if strings.HasSuffix(file, ".qcow2") {
-		return true
+// diskFormatOf is the driver type vm's domain on this host gives file
+// ("qcow2", "raw", ...), or "" when that cannot be told: the VM is on another
+// host, its domain is not defined here, or the file is not among its disks.
+// formats caches each VM's definition for one scan.
+func (s *Server) diskFormatOf(vm *corrosion.VMRecord, file string, formats map[string]map[string]string) string {
+	if vm == nil || vm.HostName != s.hostName || s.virt == nil {
+		return ""
 	}
-	ext := strings.TrimPrefix(filepath.Ext(file), ".")
-	if ext == "" {
-		return false
+	m, ok := formats[vm.Name]
+	if !ok {
+		m, _ = s.virt.DomainDiskFormats(vm.Name)
+		formats[vm.Name] = m
 	}
-	snaps, err := corrosion.ListSnapshots(ctx, s.db, vm)
-	if err != nil {
-		return false
-	}
-	return slices.ContainsFunc(snaps, func(sn corrosion.SnapshotRecord) bool { return sn.Name == ext })
+	return m[file]
 }
 
 // chainReaches reports whether file, or a layer of its qcow2 backing chain,
-// satisfies hit. Headers only, bounded. A header is read only from a layer
-// known to be qcow2: file itself when parseTop says so, and below it only a
-// layer its parent's header declares qcow2. A raw layer (a raw disk, or a
-// raw base) holds guest data — a guest could write a header there naming
-// any file — so it is checked by its path and ends the walk (re-review
-// R1-M1). A layer that cannot be read, or a protocol backing, ends it too.
-func chainReaches(file string, parseTop bool, hit func(string) bool) bool {
+// satisfies hit. Headers only, bounded.
+//
+// A layer known to be raw is checked by its path and ends the walk: its
+// bytes are the guest's, and a guest could write a header there naming any
+// file (re-review R1-M1). What a layer is comes from outside it: the top's
+// from topFormat (its VM's domain on this host), every other layer's from
+// its parent's header. A layer nothing says is raw is parsed — when it
+// cannot be told, parsing can only find a user too many, which stops or
+// keeps, never one too few, which would delete or merge a file in use
+// (re-review R2-C2). A layer that cannot be read, or a protocol backing,
+// ends the walk.
+func chainReaches(file, topFormat string, hit func(string) bool) bool {
 	if file == "" || !filepath.IsAbs(file) {
 		return false
 	}
-	path, parse := file, parseTop
+	path, format := file, topFormat
 	for depth := 0; depth <= maxBackingDepth; depth++ {
 		if fi, err := os.Stat(path); err != nil || !fi.Mode().IsRegular() {
 			return false
@@ -105,7 +109,7 @@ func chainReaches(file string, parseTop bool, hit func(string) bool) bool {
 		if hit(path) {
 			return true
 		}
-		if !parse {
+		if format != "" && format != "qcow2" {
 			return false
 		}
 		info, err := qcow2.Info(path)
@@ -116,7 +120,7 @@ func chainReaches(file string, parseTop bool, hit func(string) bool) bool {
 		if !filepath.IsAbs(b) {
 			b = filepath.Join(filepath.Dir(path), b)
 		}
-		path, parse = b, info.BackingFormat == "qcow2"
+		path, format = b, info.BackingFormat
 	}
 	return false
 }
@@ -171,6 +175,8 @@ func (s *Server) ownDiskLayers(ctx context.Context, vmName string) []string {
 	for _, d := range disks {
 		recorded[filepath.Clean(s.hostDiskFile(d.Path))] = true
 	}
+	self, _ := corrosion.GetVM(ctx, s.db, vmName)
+	formats := map[string]map[string]string{}
 	seen := map[string]bool{}
 	var out []string
 	add := func(p string) {
@@ -194,10 +200,10 @@ func (s *Server) ownDiskLayers(ctx context.Context, vmName string) []string {
 			return filepath.Dir(p) == dir && filepath.Base(diskStem(p)) == stem
 		}
 		chain := map[string]bool{file: true}
-		path, parse := file, s.namedQcow2(ctx, vmName, file)
-		for depth := 0; parse && depth <= maxBackingDepth; depth++ {
+		top := s.diskFormatOf(self, d.Path, formats)
+		for path, depth := file, 0; (top == "" || top == "qcow2") && depth <= maxBackingDepth; depth++ {
 			info, err := qcow2.Info(path)
-			if err != nil || info.BackingFile == "" || looksLikeProtocol(info.BackingFile) || info.BackingFormat != "qcow2" {
+			if err != nil || info.BackingFile == "" || looksLikeProtocol(info.BackingFile) || (info.BackingFormat != "" && info.BackingFormat != "qcow2") {
 				break
 			}
 			b := info.BackingFile

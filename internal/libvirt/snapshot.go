@@ -1112,6 +1112,47 @@ func snapshotDiskFiles(v snapshotAPI, domainName, snapshotName string) ([]string
 	return out, nil
 }
 
+// DomainDiskFormats returns the domain's disks as source file → libvirt
+// driver type (qcow2, raw, ...), from its live definition.
+func (c *Client) DomainDiskFormats(domainName string) (map[string]string, error) {
+	dom, err := c.virt.DomainLookupByName(domainName)
+	if err != nil {
+		return nil, fmt.Errorf("lookup domain %q: %w", domainName, err)
+	}
+	x, err := c.virt.DomainGetXMLDesc(dom, 0)
+	if err != nil {
+		return nil, fmt.Errorf("get domain XML %q: %w", domainName, err)
+	}
+	return DiskFormatsFromXML(x), nil
+}
+
+// DiskFormatsFromXML is a domain XML's disks as source file → driver type,
+// for the disks with a file source and a driver type.
+func DiskFormatsFromXML(domXML string) map[string]string {
+	var v struct {
+		Devices struct {
+			Disks []struct {
+				Driver struct {
+					Type string `xml:"type,attr"`
+				} `xml:"driver"`
+				Source struct {
+					File string `xml:"file,attr"`
+				} `xml:"source"`
+			} `xml:"disk"`
+		} `xml:"devices"`
+	}
+	if err := xml.Unmarshal([]byte(domXML), &v); err != nil {
+		return nil
+	}
+	out := map[string]string{}
+	for _, d := range v.Devices.Disks {
+		if d.Source.File != "" && d.Driver.Type != "" {
+			out[d.Source.File] = d.Driver.Type
+		}
+	}
+	return out
+}
+
 // parseSnapshotOverlays extracts, from a snapshot's <disks>, each external
 // disk's overlay: target dev → file. Disks with snapshot='no' have none.
 func parseSnapshotOverlays(snapXML string) map[string]string {

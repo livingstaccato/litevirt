@@ -2215,6 +2215,14 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// that names it, and freeing the disks would leave that domain pointing at
 	// files that no longer exist. Returning keeps the delete retryable — the only
 	// destructive step so far is the stop above.
+	// The VM's snapshot overlays, listed while its domain still says what
+	// each disk is and the chain can still be read: the debris sweep matches
+	// .qcow2 names only, and the middle layers of a chain
+	// (<vm>-<disk>.<snapshot>) leaked (snapshot-lab.md).
+	var layers []string
+	if !req.KeepDisks {
+		layers = s.ownDiskLayers(ctx, req.Name)
+	}
 	var undefErr error
 	defer func() {
 		// The host's record of the ISO file it judged for this VM goes with
@@ -2242,10 +2250,6 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// (driver-dispatched, so non-default pools and block backends are released)
 	// BEFORE the corrosion tombstone, then glob the default dir for any debris.
 	if !req.KeepDisks {
-		// Its snapshot overlays first, while the chain can still be read:
-		// the debris sweep matches .qcow2 names only, and the middle layers
-		// of a chain (<vm>-<disk>.<snapshot>) leaked (snapshot-lab.md).
-		layers := s.ownDiskLayers(ctx, req.Name)
 		s.deleteRecordedVMDiskVolumes(ctx, req.Name)
 		s.sweepVMDiskDebris(ctx, req.Name)
 		s.removeOwnDiskLayers(ctx, req.Name, layers)

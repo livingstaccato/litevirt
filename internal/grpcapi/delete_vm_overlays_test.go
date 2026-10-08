@@ -11,6 +11,8 @@ import (
 )
 
 // The lab (snapshot-lab.md): `lv rm -f` of a VM with two or more snapshots
+// (here with their records already gone, as after deletes that went
+// metadata-only — re-review R2-I1)
 // left the middle overlay <vm>-root.m1 behind, backing onto a file the
 // delete had removed. The recorded disk (the live layer) went by its row and
 // <vm>-root.qcow2 by the debris glob, which matches .qcow2 names only.
@@ -43,11 +45,6 @@ func TestDeleteVM_RemovesItsSnapshotOverlays(t *testing.T) {
 			if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{Name: "vm1", HostName: "test-host", State: "running"}, nil,
 				[]corrosion.DiskRecord{{VMName: "vm1", DiskName: "root", HostName: "test-host", Path: m2, StorageType: "local"}}); err != nil {
 				t.Fatal(err)
-			}
-			for _, n := range []string{"m1", "m2"} {
-				if err := corrosion.InsertSnapshot(ctx, s.db, corrosion.SnapshotRecord{ID: "vm1-" + n, VMName: "vm1", HostName: "test-host", Name: n, State: "ok", Type: "memory"}); err != nil {
-					t.Fatal(err)
-				}
 			}
 			if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{Name: "vm1-x", HostName: "test-host", State: "stopped"}, nil,
 				[]corrosion.DiskRecord{{VMName: "vm1-x", DiskName: "root", HostName: "test-host", Path: other, StorageType: "local"}}); err != nil {

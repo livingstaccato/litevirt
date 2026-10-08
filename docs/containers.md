@@ -70,6 +70,38 @@ $ lv ct rm web --host node-b
 
 `--host` is always exact, so it is the unambiguous form in scripts.
 
+### Inspecting a container
+
+`lv ct inspect <name>` is the container counterpart of `lv inspect <vm>`: host,
+state, image or template, project, CPU and memory limits, the privilege mode,
+each NIC with its network and address, the rootfs and its size, snapshots,
+backups, and when it was created and last updated. `-o json` prints the same
+detail as JSON; `--host` names the owner when the name is on two hosts.
+
+```
+$ lv ct inspect web
+Name:       web
+Host:       node-3
+State:      running
+Privilege:  privileged
+...
+Backups:
+  REPO          SIZE     UPDATED               STATUS
+  /srv/backups  2.1 MiB  2026-10-08T12:48:39Z  available
+  /srv/oldrepo  2.0 MiB  2026-10-01T09:00:00Z  unavailable: repo /srv/oldrepo does not exist on node-3
+```
+
+The privilege mode is read from the container's LXC config on its host: a
+config with an `lxc.idmap` is unprivileged, one without is privileged. The
+rootfs size and the backup status are also checked there. If that host does
+not answer, the cluster's view is shown and those fields read unknown.
+
+A backup whose repository can no longer be opened (deleted, moved or
+unmounted) is listed as unavailable with the reason. The entry is never
+removed, and it still counts toward the project's `backup_gib`, as a VM backup
+in a vanished repository does; it reads available again once the repository
+is back.
+
 ### Asking one node about a container on another
 
 Every node serves `lv ct ls` from its own copy of the cluster state, and a

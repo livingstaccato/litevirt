@@ -32,6 +32,7 @@ func newCTCmd() *cobra.Command {
 		newCTStopCmd(),
 		newCTRmCmd(),
 		newCTLsCmd(),
+		newCTInspectCmd(),
 		newCTExecCmd(),
 		newCTPullCmd(),
 		newCTBackupCmd(),

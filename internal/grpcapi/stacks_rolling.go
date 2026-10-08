@@ -53,7 +53,8 @@ func (o *serverOps) recreateAs(ctx context.Context, target, source string, desir
 		ctx = withRecreateISOGrant(ctx, src)
 	}
 	var decision *resolvedCreateVMDecision
-	if cur, err := corrosion.GetVM(ctx, o.s.db, target); err == nil && cur != nil {
+	cur, _ := corrosion.GetVM(ctx, o.s.db, target)
+	if cur != nil {
 		host := cur.HostName
 		var perr error
 		if spec.GetIso() != "" {
@@ -76,11 +77,19 @@ func (o *serverOps) recreateAs(ctx context.Context, target, source string, desir
 	if _, err := o.s.DeleteVM(ctx, &pb.DeleteVMRequest{Name: target}); err != nil && status.Code(err) != codes.NotFound {
 		return fmt.Errorf("delete %s before recreate: %w", target, err)
 	}
+	// The delete may have run on the VM's own host, and the create may land
+	// on a host — this one included — whose replica has not applied its
+	// tombstone yet. The create carries the identity of the VM it replaces,
+	// so that host does not refuse it for that row (vm_recreate_replaces.go).
+	ctx = withReplacedVM(ctx, cur)
 	var err error
 	if decision != nil {
 		_, err = o.s.createVM(ctx, &pb.CreateVMRequest{Spec: spec}, decision)
 	} else {
 		_, err = o.s.CreateVM(ctx, &pb.CreateVMRequest{Spec: spec})
+	}
+	if err != nil && cur != nil {
+		return o.s.recreateFailedAfterTeardown("recreate", target, cur.HostName, spec, err)
 	}
 	return err
 }

@@ -1179,6 +1179,45 @@ func DeleteVM(ctx context.Context, c *Client, name string) error {
 	return deleteOutcomeError(outcome, false)
 }
 
+// ErrVMIncarnationMismatch means the live row of a VM name is not the
+// incarnation the caller named: another VM holds the name now.
+var ErrVMIncarnationMismatch = errors.New("corrosion: the live VM row is another incarnation")
+
+// DeleteVMIncarnation is DeleteVM restricted to one incarnation of name: the
+// live row whose created_at is createdAt (the incarnation identity, see
+// incarnationTombstoneDecision). It tombstones that row and nothing else —
+// a live row of another incarnation is ErrVMIncarnationMismatch, and no live
+// row is the idempotent nil. The statements are DeleteVM's own, so a
+// receiver applies them exactly as it applies a DeleteVM.
+//
+// It is for a host whose replica still holds a VM that another host has
+// already tombstoned — a delete is terminal for its incarnation, so this
+// host retiring its copy writes nothing the cluster has not already decided.
+func DeleteVMIncarnation(ctx context.Context, c *Client, name, createdAt string) error {
+	if createdAt == "" {
+		return ErrVMIncarnationMismatch
+	}
+	mismatch := false
+	outcome, err := retriedDelete(func() (deleteOutcome, error) {
+		vm, err := GetVM(ctx, c, name)
+		if err != nil {
+			return deleteContended, err
+		}
+		mismatch = vm != nil && vm.CreatedAt != createdAt
+		if vm == nil || mismatch {
+			return deleteAbsent, nil
+		}
+		return deleteVMGuardedFrom(ctx, c, *vm)
+	})
+	if err != nil {
+		return err
+	}
+	if mismatch {
+		return ErrVMIncarnationMismatch
+	}
+	return deleteOutcomeError(outcome, false)
+}
+
 // deleteVMGuarded is the single VM delete emitter; every caller routes through
 // DeleteVM's retry loop. It reports the tri-state outcome from its own guard
 // read — see deleteOutcome for why absent and CAS-miss must not be conflated.

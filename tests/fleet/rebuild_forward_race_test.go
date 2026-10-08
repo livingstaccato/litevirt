@@ -1,0 +1,343 @@
+// Fleet scenarios: a rebuild or a rolling recreate whose create lands on a
+// host that has not yet applied the tombstone of the VM it replaces.
+//
+// Observed on the lab, 2026-10-08 (lab-recheck-5.log): `lv rebuild
+// rc5-isohome`, on node-2 with a spec pin to node-3, tore the VM down on
+// node-2, tombstoned its row and forwarded the create to node-3 two
+// milliseconds later. node-3 had not applied the tombstone, so its own
+// existence check still saw the VM and refused the create AlreadyExists. The
+// VM was gone: no row, no disks, no domain anywhere.
+//
+// Main (3e4ba50b) had the same loss: RebuildVM tombstones and then calls
+// CreateVM, whose placement forwards to the pinned or chosen host, whose
+// createVM refuses on its own stale row (vm.go:3138 and :3145, then :212,
+// :310 and :146-149, at 3e4ba50b). A rolling recreate run from a node other
+// than the VM's host has it too, even when the create stays on the entry
+// node: DeleteVM is forwarded to the owner, and the entry's own row is the
+// stale one (stacks_rolling.go:40 and :45 at 3e4ba50b). The four lag
+// scenarios below fail the same way against 3e4ba50b and 1c105363.
+//
+// Only independent replicas reach this: a shared database applies the
+// tombstone everywhere at once. Replication from the deleting host is
+// delayed, as it is on a real network for the few milliseconds the forward
+// takes, and every scenario then lets it through and checks that the late
+// tombstone does not take the new VM with it anywhere.
+package fleet
+
+import (
+	"context"
+	"encoding/json"
+	"testing"
+	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/corrosion"
+)
+
+// raceLag is how long a push from the deleting host is held before the
+// receiver applies it: long enough that the create always gets there first.
+const raceLag = 3 * time.Second
+
+func newRebuildRaceFleet(t *testing.T) *Cluster {
+	t.Helper()
+	return New(t, Options{Nodes: 3, IndependentReplicas: true})
+}
+
+// seedVM puts VM name, stopped, on host on with spec, and waits until every
+// replica has it — the state the lab's VM was in before the rebuild.
+func seedVM(t *testing.T, c *Cluster, on *Node, spec *pb.VMSpec) *corrosion.VMRecord {
+	t.Helper()
+	ctx := context.Background()
+	spec.Uuid = "0b9a3c1e-7d2f-4c55-9a1b-5e6f7a8b9c0d"
+	b, err := json.Marshal(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertVM(ctx, on.DB, corrosion.VMRecord{
+		Name: spec.Name, HostName: on.Name, State: "stopped", Spec: string(b),
+		CPUActual: int(spec.Cpu), MemActual: int(spec.MemoryMib),
+	}, nil, nil); err != nil {
+		t.Fatalf("seed %s on %s: %v", spec.Name, on.Name, err)
+	}
+	if err := on.Virt.DefineDomain(`<domain><name>` + spec.Name + `</name></domain>`); err != nil {
+		t.Fatal(err)
+	}
+	c.WaitConverged(t, 20*time.Second)
+	rec, err := corrosion.GetVM(ctx, on.DB, spec.Name)
+	if err != nil || rec == nil {
+		t.Fatalf("seeded %s is not on %s: %v", spec.Name, on.Name, err)
+	}
+	return rec
+}
+
+// labelHost gives host the label k=v cluster-wide.
+func labelHost(t *testing.T, c *Cluster, host *Node, k, v string) {
+	t.Helper()
+	if err := corrosion.SetHostLabel(context.Background(), host.DB, host.Name, k, v); err != nil {
+		t.Fatalf("label %s %s=%s: %v", host.Name, k, v, err)
+	}
+	c.WaitConverged(t, 20*time.Second)
+}
+
+// lagFrom holds every push from `from` to each of `to` for raceLag.
+func lagFrom(c *Cluster, from *Node, to ...*Node) {
+	for _, n := range to {
+		c.SetLinkFault(from, n, LinkFault{Delay: raceLag})
+	}
+}
+
+// assertReCreated checks, once replication has caught up, that name is live
+// on every replica as a new incarnation on want, and that its domain is on
+// want and nowhere else.
+func assertReCreated(t *testing.T, c *Cluster, name string, before *corrosion.VMRecord, want *Node) {
+	t.Helper()
+	c.ClearLinkFaults()
+	waitHistoryApplied(t, c, 30*time.Second)
+	ctx := context.Background()
+	for _, n := range c.Nodes {
+		rec, err := corrosion.GetVM(ctx, n.DB, name)
+		if err != nil || rec == nil {
+			t.Fatalf("%s is gone on %s after replication caught up (%v)", name, n.Name, err)
+		}
+		if rec.HostName != want.Name {
+			t.Errorf("%s on %s's replica: host %s, want %s", name, n.Name, rec.HostName, want.Name)
+		}
+		if rec.CreatedAt == before.CreatedAt {
+			t.Errorf("%s on %s's replica is still the old incarnation (created_at %s)", name, n.Name, rec.CreatedAt)
+		}
+		if mine, _ := corrosion.GetVM(ctx, want.DB, name); mine == nil || rec.CreatedAt != mine.CreatedAt || rec.Spec != mine.Spec {
+			t.Errorf("%s on %s's replica is not the row its host %s holds", name, n.Name, want.Name)
+		}
+	}
+	for _, n := range c.Nodes {
+		if got := n.Virt.DomainExists(name); got != (n == want) {
+			t.Errorf("%s's domain on %s: exists=%v, want %v", name, n.Name, got, n == want)
+		}
+	}
+}
+
+// assertOnlyDeleterTombstoned checks that no host but deleter wrote a
+// tombstone of a vms row: the host the VM was re-created on waited for the
+// tombstone to arrive, and did not retire its stale copy itself.
+func assertOnlyDeleterTombstoned(t *testing.T, c *Cluster, deleter *Node) {
+	t.Helper()
+	for _, n := range c.Nodes {
+		if n == deleter {
+			continue
+		}
+		rows, err := n.DB.Query(context.Background(),
+			`SELECT hlc FROM mutation_log WHERE origin = ? AND stmts LIKE '%UPDATE vms SET deleted_at%'`, n.Name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) > 0 {
+			t.Errorf("%s tombstoned a VM itself (%d writes); only %s deletes in this scenario", n.Name, len(rows), deleter.Name)
+		}
+	}
+}
+
+// waitHistoryApplied waits until every node has applied every replicated
+// write every other node has made so far — the late tombstone included — and
+// every table but vms agrees. vms is compared by the caller: a create's
+// hardware_adoption_state stays apart between the creating host and its
+// peers on this build whatever the create (the adoption UPDATE carries the
+// insert's own updated_at, which the receivers' LWW gate drops), which is not
+// what these scenarios are about.
+func waitHistoryApplied(t *testing.T, c *Cluster, timeout time.Duration) {
+	t.Helper()
+	ctx := context.Background()
+	deadline := time.Now().Add(timeout)
+	for _, origin := range c.Nodes {
+		rows, err := origin.DB.Query(ctx, `SELECT hlc FROM mutation_log WHERE origin = ?`, origin.Name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, n := range c.Nodes {
+			if n == origin {
+				continue
+			}
+			for _, r := range rows {
+				for {
+					seen, err := n.DB.Query(ctx, `SELECT 1 FROM mutation_seen WHERE origin = ? AND hlc = ?`, origin.Name, r.String("hlc"))
+					if err != nil {
+						t.Fatal(err)
+					}
+					if len(seen) > 0 {
+						break
+					}
+					if time.Now().After(deadline) {
+						t.Fatalf("%s has not applied %s's write %s within %s", n.Name, origin.Name, r.String("hlc"), timeout)
+					}
+					time.Sleep(20 * time.Millisecond)
+				}
+			}
+		}
+	}
+	c.WaitConvergedExcept(t, time.Until(deadline), []string{"vms"})
+}
+
+// whereIs says what is left of VM name once replication has caught up: its
+// row on each replica and its domain on each host.
+func whereIs(c *Cluster, name string) string {
+	c.ClearLinkFaults()
+	time.Sleep(2 * raceLag)
+	ctx := context.Background()
+	out := "after replication caught up:"
+	for _, n := range c.Nodes {
+		row := "no row"
+		if rec, err := corrosion.GetVM(ctx, n.DB, name); err != nil {
+			row = "row unreadable: " + err.Error()
+		} else if rec != nil {
+			row = "row on " + rec.HostName
+		}
+		dom := "no domain"
+		if n.Virt.DomainExists(name) {
+			dom = "domain"
+		}
+		out += " " + n.Name + ": " + row + ", " + dom + ";"
+	}
+	return out
+}
+
+// The lab's case: the VM is on node-0 (moved there after it was created),
+// and its spec still pins node-1. The rebuild re-creates it on node-1, which
+// has not applied the tombstone yet.
+//
+// Red against 1c105363 and 3e4ba50b: AlreadyExists from node-1, and the VM is
+// gone.
+func TestFleet_ARebuildForwardedToAPinnedHostBehindOnTheTombstoneKeepsTheVM(t *testing.T) {
+	c := newRebuildRaceFleet(t)
+	n0, n1 := c.Nodes[0], c.Nodes[1]
+	before := seedVM(t, c, n0, &pb.VMSpec{
+		Name: "web", Cpu: 1, MemoryMib: 256, Placement: &pb.PlacementSpec{Host: n1.Name},
+	})
+	lagFrom(c, n0, c.Nodes[1:]...)
+
+	vm, err := c.SelfClient(n0).RebuildVM(context.Background(), &pb.RebuildVMRequest{Name: "web"})
+	if err != nil {
+		t.Fatalf("rebuild of a VM pinned to a host behind on the tombstone: %v; %s", err, whereIs(c, "web"))
+	}
+	if vm.GetHostName() != n1.Name {
+		t.Errorf("rebuilt on %s, want %s", vm.GetHostName(), n1.Name)
+	}
+	assertReCreated(t, c, "web", before, n1)
+	assertOnlyDeleterTombstoned(t, c, n0)
+}
+
+// Placement, not a pin, puts the rebuilt VM on another host: the one host
+// carrying the label its spec requires.
+func TestFleet_ARebuildPlacedOnAnotherHostBehindOnTheTombstoneKeepsTheVM(t *testing.T) {
+	c := newRebuildRaceFleet(t)
+	n0, n1 := c.Nodes[0], c.Nodes[1]
+	labelHost(t, c, n1, "rack", "b")
+	before := seedVM(t, c, n0, &pb.VMSpec{
+		Name: "web", Cpu: 1, MemoryMib: 256,
+		Placement: &pb.PlacementSpec{Require: map[string]string{"rack": "b"}},
+	})
+	lagFrom(c, n0, c.Nodes[1:]...)
+
+	vm, err := c.SelfClient(n0).RebuildVM(context.Background(), &pb.RebuildVMRequest{Name: "web"})
+	if err != nil {
+		t.Fatalf("rebuild placed on a host behind on the tombstone: %v; %s", err, whereIs(c, "web"))
+	}
+	if vm.GetHostName() != n1.Name {
+		t.Errorf("rebuilt on %s, want %s", vm.GetHostName(), n1.Name)
+	}
+	assertReCreated(t, c, "web", before, n1)
+	assertOnlyDeleterTombstoned(t, c, n0)
+}
+
+// A rolling recreate run from node-2 of a VM on node-0, whose desired spec
+// pins node-1: the delete runs on node-0, the create on node-1, and neither
+// node-2 nor node-1 has the tombstone yet.
+func TestFleet_ARollingRecreatePinnedToAnotherHostBehindOnTheTombstoneKeepsTheVM(t *testing.T) {
+	c := newRebuildRaceFleet(t)
+	n0, n1, n2 := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	before := seedVM(t, c, n0, &pb.VMSpec{Name: "web", Cpu: 1, MemoryMib: 256})
+	lagFrom(c, n0, n1, n2)
+
+	desired := &pb.VMSpec{Name: "web", Cpu: 2, MemoryMib: 256, Placement: &pb.PlacementSpec{Host: n1.Name}}
+	if err := recreateOn(t, n2, c.SelfClient(n2), "web", desired); err != nil {
+		t.Fatalf("rolling recreate onto a host behind on the tombstone: %v; %s", err, whereIs(c, "web"))
+	}
+	assertReCreated(t, c, "web", before, n1)
+	assertOnlyDeleterTombstoned(t, c, n0)
+}
+
+// A rolling recreate whose create stays on the node running the rollout: the
+// stale row is the entry node's own.
+func TestFleet_ARollingRecreatePlacedOnTheEntryBehindOnTheTombstoneKeepsTheVM(t *testing.T) {
+	c := newRebuildRaceFleet(t)
+	n0, n2 := c.Nodes[0], c.Nodes[2]
+	labelHost(t, c, n2, "rack", "c")
+	before := seedVM(t, c, n0, &pb.VMSpec{Name: "web", Cpu: 1, MemoryMib: 256})
+	lagFrom(c, n0, c.Nodes[1:]...)
+
+	desired := &pb.VMSpec{
+		Name: "web", Cpu: 2, MemoryMib: 256,
+		Placement: &pb.PlacementSpec{Require: map[string]string{"rack": "c"}},
+	}
+	if err := recreateOn(t, n2, c.SelfClient(n2), "web", desired); err != nil {
+		t.Fatalf("rolling recreate placed on its own entry node, behind on the tombstone: %v; %s", err, whereIs(c, "web"))
+	}
+	assertReCreated(t, c, "web", before, n2)
+	assertOnlyDeleterTombstoned(t, c, n0)
+}
+
+// The host the rebuild lands on cannot receive replication at all, while the
+// forwarded create still reaches it. It waits, bounded,
+// for the tombstone, then retires its stale copy itself and creates the VM;
+// when the link heals, the late tombstone kills nothing.
+//
+// Mutation: refuse instead of retiring once the wait runs out — red.
+func TestFleet_ARebuildOntoAHostCutOffFromTheTombstoneRetiresItsStaleCopy(t *testing.T) {
+	c := newRebuildRaceFleet(t)
+	n0, n1 := c.Nodes[0], c.Nodes[1]
+	before := seedVM(t, c, n0, &pb.VMSpec{
+		Name: "web", Cpu: 1, MemoryMib: 256, Placement: &pb.PlacementSpec{Host: n1.Name},
+	})
+	n1.Server.SetReplacedTombstoneWaitForTest(500 * time.Millisecond)
+	n0.Server.SetReplacedTombstoneWaitForTest(500 * time.Millisecond)
+	// Nothing reaches node-1, directly or relayed through node-2.
+	c.SetLinkFault(n0, n1, LinkFault{Block: true})
+	c.SetLinkFault(c.Nodes[2], n1, LinkFault{Block: true})
+
+	if _, err := c.SelfClient(n0).RebuildVM(context.Background(), &pb.RebuildVMRequest{Name: "web"}); err != nil {
+		t.Fatalf("rebuild onto a host cut off from the tombstone: %v; %s", err, whereIs(c, "web"))
+	}
+	assertReCreated(t, c, "web", before, n1)
+}
+
+// The host the rebuild lands on is on an older build: it ignores the identity
+// of the VM being replaced and refuses AlreadyExists until its replica has the
+// tombstone. The entry asks again until then.
+//
+// Mutation: drop the AlreadyExists retry in forwardCreateVM — red.
+func TestFleet_ARebuildOntoAnOlderHostBehindOnTheTombstoneKeepsTheVM(t *testing.T) {
+	c := newRebuildRaceFleet(t)
+	n0, n1 := c.Nodes[0], c.Nodes[1]
+	before := seedVM(t, c, n0, &pb.VMSpec{
+		Name: "web", Cpu: 1, MemoryMib: 256, Placement: &pb.PlacementSpec{Host: n1.Name},
+	})
+	// An older build never reads the replaced VM's identity: drop it from
+	// every create n1 serves.
+	older := func(ctx context.Context, req any, handler grpc.UnaryHandler) (any, error) {
+		md, _ := metadata.FromIncomingContext(ctx)
+		md = md.Copy()
+		md.Delete("x-litevirt-recreate-replaces")
+		return handler(metadata.NewIncomingContext(ctx, md), req)
+	}
+	for i := 0; i < 200; i++ {
+		n1.HookUnary("CreateVM", older)
+		n1.HookUnary("ExecuteCreateVM", older)
+	}
+	c.SetLinkFault(n0, n1, LinkFault{Delay: time.Second})
+
+	if _, err := c.SelfClient(n0).RebuildVM(context.Background(), &pb.RebuildVMRequest{Name: "web"}); err != nil {
+		t.Fatalf("rebuild onto an older host behind on the tombstone: %v; %s", err, whereIs(c, "web"))
+	}
+	assertReCreated(t, c, "web", before, n1)
+}

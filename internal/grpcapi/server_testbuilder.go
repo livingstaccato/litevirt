@@ -130,3 +130,10 @@ func (s *Server) ForgetNetworkReconcileForTests() {
 func (s *Server) RecreateVMForTest(ctx context.Context, name string, desired *pb.VMSpec) error {
 	return (&serverOps{s: s}).RecreateVM(ctx, name, desired)
 }
+
+// SetReplacedTombstoneWaitForTest sets how long a re-create on this server
+// waits for its replica to apply the tombstone of the VM it replaces before
+// retiring the stale row itself (vm_recreate_replaces.go).
+func (s *Server) SetReplacedTombstoneWaitForTest(d time.Duration) {
+	s.replacedTombstoneWait = d
+}

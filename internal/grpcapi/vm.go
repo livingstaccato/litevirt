@@ -86,6 +86,9 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// A re-create forwarded here by the host that tears the VM down carries
 	// the VM's own installer ISO grant; only a peer host's is honoured.
 	ctx = s.acceptRecreateISOGrantMD(ctx)
+	// ...and the identity of the VM it replaces, whose tombstone this host's
+	// replica may not have applied yet (vm_recreate_replaces.go).
+	ctx = s.acceptReplacedVMMD(ctx)
 	spec, err := normalizeCreateVMSpec(req.GetSpec(), s.defaultCPUModeCfg)
 	if err != nil {
 		return nil, err
@@ -153,10 +156,19 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		}
 	}
 
-	// Check if VM already exists
-	existing, _ := corrosion.GetVM(ctx, s.db, spec.Name)
-	if existing != nil {
-		return nil, status.Errorf(codes.AlreadyExists, "VM %q already exists", spec.Name)
+	// Check if VM already exists. A rebuild or recreate whose replica here has
+	// not yet applied the tombstone of the VM it replaces sees that VM's row:
+	// exactly that incarnation is settled (settleReplacedVM), anything else
+	// still refuses.
+	if existing, _ := corrosion.GetVM(ctx, s.db, spec.Name); existing != nil {
+		replaced, serr := s.settleReplacedVM(ctx, existing)
+		if serr != nil {
+			return nil, status.Errorf(codes.Unavailable,
+				"VM %q: this host still holds the VM it re-creates and could not retire it: %v", spec.Name, serr)
+		}
+		if !replaced {
+			return nil, status.Errorf(codes.AlreadyExists, "VM %q already exists", spec.Name)
+		}
 	}
 
 	// Resource defaults BEFORE admission. Everything below — quota, placement,
@@ -3243,13 +3255,23 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 		return nil, status.Errorf(codes.Internal, "rebuild: tombstone old records: %v", err)
 	}
 
-	// Recreate the VM using the stored spec.
+	// Recreate the VM using the stored spec. The create carries the identity
+	// of the VM just tombstoned: the host it lands on may not have applied
+	// that tombstone yet, and must not refuse the create for the row it
+	// names (vm_recreate_replaces.go).
 	slog.Info("rebuilding VM", "name", req.Name)
 	s.recordVMEvent(ctx, req.Name, "vm.rebuilt", "ok", "image="+spec.Image)
+	rctx = withReplacedVM(rctx, vm)
+	var out *pb.VM
 	if placed {
-		return s.createVM(rctx, &pb.CreateVMRequest{Spec: spec}, &resolvedCreateVMDecision{resolvedHost: host, placedHere: true})
+		out, err = s.createVM(rctx, &pb.CreateVMRequest{Spec: spec}, &resolvedCreateVMDecision{resolvedHost: host, placedHere: true})
+	} else {
+		out, err = s.CreateVM(rctx, &pb.CreateVMRequest{Spec: spec})
 	}
-	return s.CreateVM(rctx, &pb.CreateVMRequest{Spec: spec})
+	if err != nil {
+		return nil, s.recreateFailedAfterTeardown("rebuild", req.Name, s.hostName, spec, err)
+	}
+	return out, nil
 }
 
 // CutoverVM completes a snapshot-and-replace update. The "-next" VM replaces the original.

@@ -51,15 +51,6 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotReque
 		return nil, status.Errorf(codes.InvalidArgument,
 			"invalid snapshot name %q: allowed [A-Za-z0-9_.-], not '.' or '..'", req.Name)
 	}
-	// libvirt names the overlay <disk stem>.<name>, and the disk is found
-	// again by cutting the last extension: a dot in the name would split the
-	// stem, and the record would never follow the overlay (re-review R2-M3).
-	// Refused for new snapshots only; one that has a dot already can still
-	// be restored and deleted.
-	if strings.Contains(req.Name, ".") {
-		return nil, status.Errorf(codes.InvalidArgument,
-			"invalid snapshot name %q: a new snapshot's name may not contain '.'; use '-' or '_'", req.Name)
-	}
 	if vm.HostName != s.hostName {
 		// Released BEFORE the forward: the lock must not be held across a peer
 		// RPC. See releaseOnce.

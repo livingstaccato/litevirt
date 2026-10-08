@@ -689,6 +689,22 @@ lv snapshot restore <vm> <name>           # repeatable; memory snapshots are hos
 lv snapshot rm <vm> <name>
 ```
 
+`lv snapshot rm` lets libvirt merge the snapshot's overlay into the disk it
+was taken of and remove the overlay; deleting the last disk-only snapshot of a
+running VM does the same with a block commit of its own. A restore leaves the
+restored snapshot libvirt's current one, which is what makes libvirt merge
+rather than unlink. Two cases keep every file:
+
+- the delete is **refused**, naming the VMs, while another VM (a linked clone)
+  backs on the snapshot's overlay or on the disk it was taken of;
+- a snapshot libvirt does not hold as current and that has no children — as
+  a restore by an earlier build left one — is deleted as metadata only, with a
+  warning in the log: the VM keeps its backing chain, and the space is not
+  reclaimed.
+
+A restore holds the VM's start lease while it brings the domain down and back,
+so no start path restarts it midway; it is refused while a start holds it.
+
 ## Memory ballooning
 
 ```bash

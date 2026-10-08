@@ -171,16 +171,22 @@ func TestBtrfsReplicate_RefusesADiskOutsideItsOwnSubvolume(t *testing.T) {
 	}
 }
 
-// The sweep removes only stale staging of this driver's shape that nothing
-// uses.
-func TestBtrfsSweepStaging_RemovesOnlyStaleUnusedStaging(t *testing.T) {
+// The sweep removes only stale staging it can tell is its own — a directory
+// of its name carrying its marker, not in flight, of its shape, nothing in it
+// in use — and never a file, whatever its name.
+func TestBtrfsSweepStaging_RemovesOnlyStaleUnusedMarkedStaging(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now()
 	old, fresh := now.Add(-25*time.Hour).Unix(), now.Add(-time.Hour).Unix()
-	mk := func(name string, withSnap bool, extra string) string {
+	mk := func(name string, marked, withSnap bool, extra ...string) string {
 		p := filepath.Join(dir, name)
 		if err := os.Mkdir(p, 0o700); err != nil {
 			t.Fatal(err)
+		}
+		if marked {
+			if err := os.WriteFile(filepath.Join(p, btrfsStagingFile), nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
 		}
 		if withSnap {
 			if err := os.Mkdir(filepath.Join(p, btrfsSnapName), 0o700); err != nil {
@@ -190,39 +196,100 @@ func TestBtrfsSweepStaging_RemovesOnlyStaleUnusedStaging(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		if extra != "" {
-			if err := os.WriteFile(filepath.Join(p, extra), nil, 0o600); err != nil {
+		for _, e := range extra {
+			if err := os.WriteFile(filepath.Join(p, e), nil, 0o600); err != nil {
 				t.Fatal(err)
 			}
 		}
 		return p
 	}
-	stale := mk(fmt.Sprintf(".litevirt-recv-%d-aaaaaaaaaaaa", old), true, "")
-	staleEmpty := mk(fmt.Sprintf(".litevirt-send-%d-bbbbbbbbbbbb", old), false, "")
-	freshOne := mk(fmt.Sprintf(".litevirt-recv-%d-cccccccccccc", fresh), true, "")
-	used := mk(fmt.Sprintf(".litevirt-recv-%d-dddddddddddd", old), true, "")
-	odd := mk(fmt.Sprintf(".litevirt-recv-%d-eeeeeeeeeeee", old), true, "notours")
-	shortID := mk(fmt.Sprintf(".litevirt-recv-%d-abc", old), true, "")
-	place := filepath.Join(dir, fmt.Sprintf(".litevirt-place-%d-ffffffffffff", old))
-	if err := os.WriteFile(place, nil, 0o600); err != nil {
-		t.Fatal(err)
+	name := func(kind string, at int64, id string) string { return fmt.Sprintf(".litevirt-%s-%d-%s", kind, at, id) }
+	staleRecv := mk(name("recv", old, "aaaaaaaaaaaa"), true, true, btrfsPlaceName)
+	staleSend := mk(name("send", old, "a1a1a1a1a1a1"), true, true)
+	staleEmpty := mk(name("send", old, "bbbbbbbbbbbb"), true, false)
+	unmarked := mk(name("recv", old, "b1b1b1b1b1b1"), false, true)
+	freshOne := mk(name("recv", fresh, "cccccccccccc"), true, true)
+	inflight := mk(name("recv", old, "c1c1c1c1c1c1"), true, true)
+	used := mk(name("recv", old, "dddddddddddd"), true, true)
+	usedPlace := mk(name("recv", old, "d1d1d1d1d1d1"), true, true, btrfsPlaceName)
+	odd := mk(name("recv", old, "eeeeeeeeeeee"), true, true, "notours")
+	sendWithPlace := mk(name("send", old, "e1e1e1e1e1e1"), true, true, btrfsPlaceName)
+	shortID := mk(fmt.Sprintf(".litevirt-recv-%d-abc", old), true, true)
+	var files []string
+	for _, n := range []string{fmt.Sprintf(".litevirt-place-%d-ffffffffffff", old), name("recv", old, "f1f1f1f1f1f1")} {
+		f := filepath.Join(dir, n)
+		if err := os.WriteFile(f, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		files = append(files, f)
 	}
+	btrfsInflight.Store(filepath.Clean(inflight), true)
+	t.Cleanup(func() { btrfsInflight.Delete(filepath.Clean(inflight)) })
 	d := &btrfsDriver{subvolRoot: dir, run: func(_ context.Context, _ string, args ...string) ([]byte, error) {
 		if args[0] == "subvolume" && args[1] == "delete" {
 			return nil, os.RemoveAll(args[len(args)-1])
 		}
 		return nil, nil
 	}}
-	inUse := func(p string) bool { return p == filepath.Join(used, btrfsSnapName, "d.qcow2") }
+	inUse := func(p string) bool {
+		return p == filepath.Join(used, btrfsSnapName, "d.qcow2") || p == filepath.Join(usedPlace, btrfsPlaceName)
+	}
 	d.sweepStaging(context.Background(), now, inUse, dir)
-	for _, p := range []string{stale, staleEmpty, place} {
+	for _, p := range []string{staleRecv, staleSend, staleEmpty} {
 		if _, err := os.Lstat(p); err == nil {
 			t.Errorf("%s was not swept", filepath.Base(p))
 		}
 	}
-	for _, p := range []string{freshOne, used, odd, filepath.Join(odd, btrfsSnapName), shortID} {
+	keep := []string{unmarked, filepath.Join(unmarked, btrfsSnapName), freshOne, inflight, used, usedPlace,
+		odd, filepath.Join(odd, btrfsSnapName), sendWithPlace, shortID}
+	for _, p := range append(keep, files...) {
 		if _, err := os.Lstat(p); err != nil {
-			t.Errorf("%s was swept: %v", filepath.Base(p), err)
+			t.Errorf("%s was swept: %v", p, err)
 		}
+	}
+}
+
+// A copy's staging carries the marker and is in flight while the copy runs,
+// and neither outlives it.
+func TestBtrfsReplicate_StagingIsMarkedAndInFlightWhileTheCopyRuns(t *testing.T) {
+	root, srcRoot := t.TempDir(), t.TempDir()
+	src := filepath.Join(srcRoot, "vm1-root")
+	if err := os.Mkdir(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "vm1-root.qcow2"), []byte("disk"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prev := btrfsPipe
+	var stage string
+	btrfsPipe = func(_ context.Context, _, _ string, _ []string, _ string, recv []string) ([]byte, error) {
+		stage = recv[len(recv)-1]
+		if _, err := os.Stat(filepath.Join(stage, btrfsStagingFile)); err != nil {
+			t.Errorf("the receive directory carries no marker: %v", err)
+		}
+		if _, ok := btrfsInflight.Load(filepath.Clean(stage)); !ok {
+			t.Error("the receive directory is not in flight while the copy runs")
+		}
+		return nil, errors.New("receive failed")
+	}
+	t.Cleanup(func() { btrfsPipe = prev })
+	d := &btrfsDriver{subvolRoot: root, run: func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		if args[0] == "subvolume" && args[1] == "snapshot" {
+			return nil, os.Mkdir(args[len(args)-1], 0o755)
+		}
+		if args[0] == "subvolume" && args[1] == "delete" {
+			return nil, os.RemoveAll(args[len(args)-1])
+		}
+		return nil, nil
+	}}
+	_ = d.Replicate(context.Background(), ReplicateOptions{SrcRef: filepath.Join(src, "vm1-root.qcow2"), SrcRoot: srcRoot, DstRef: filepath.Join(root, "copy.qcow2")})
+	if stage == "" {
+		t.Fatal("the receive was never reached")
+	}
+	if _, ok := btrfsInflight.Load(filepath.Clean(stage)); ok {
+		t.Error("the receive directory is still in flight after the copy ended")
+	}
+	if _, err := os.Lstat(stage); err == nil {
+		t.Error("the receive directory outlived the copy")
 	}
 }

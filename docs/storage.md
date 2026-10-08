@@ -983,28 +983,36 @@ meantime may hold.
 
 A **btrfs** disk replicated into a btrfs pool is sent natively when it is
 alone in its own subvolume directly under its btrfs pool (as the btrfs driver
-creates every disk) and **standalone** — no backing file, no external data
-file. A copy never depends on a file outside itself, so a disk built on a base
-image takes the qemu-img copy, which flattens it. The copy is the same new
-file a qemu-img copy makes, in the target pool's directory —
-`<vm>-<disk>-copy-<time>-<id>.qcow2`, or an admin's `--target-path` there —
-and it is recorded the same way, so promotion by name, listings, pruning and
-deletion treat it like any other copy. The source subvolume is snapshotted
-read-only into a private directory beside it and received into a private
-directory in the target pool. The received disk file is checked again (it must
-be standalone), cloned into the pool's directory (a reflink: no data is
-copied; a plain copy where the filesystem cannot) and placed with a rename
-that refuses an existing name (`renameat2(RENAME_NOREPLACE)`), so a file
-created meanwhile is never replaced; an existing name is refused before
-anything is sent. Everything staged is removed when the copy ends, whether it
-succeeded, failed or its client went away, and every copy uses new staging
-names. Staging a daemon that died mid-copy left (`.litevirt-send-*`,
-`.litevirt-recv-*`, `.litevirt-place-*`, older than a day) is removed by the
-next btrfs copy, unless a disk or pool record uses a file in it. A btrfs disk
-anywhere else — a file in the pool's directory (storage motion puts it there),
-a disk with no pool, a subvolume that holds other files, a disk on a base
-image — and every copy between different drivers, or to a `--target-path`
-outside the pool's directory, take the file copy. What the drivers implement:
+creates every disk), **standalone** — no backing file, no external data file —
+and both pools pass the pool write check (the native path also writes into the
+source pool: its send snapshot). A copy never depends on a file outside itself,
+so a disk built on a base image takes the qemu-img copy, which flattens it. The
+copy is the same new file a qemu-img copy makes, in the target pool's
+directory — `<vm>-<disk>-copy-<time>-<id>.qcow2`, or an admin's `--target-path`
+there — with the same mode (0600), and it is recorded the same way, so
+promotion by name, listings, pruning and deletion treat it like any other copy.
+The source subvolume is snapshotted read-only into a private directory beside
+it and received into a private directory in the target pool. The received
+disk file is checked again (it must be standalone), cloned inside that private
+directory (a reflink: no data is copied; a plain copy where the filesystem
+cannot) and placed with a rename that refuses an existing name
+(`renameat2(RENAME_NOREPLACE)`), so a file created meanwhile is never
+replaced; an existing name is refused before anything is sent. A native copy
+that fails for any other reason — a read-only or full source pool, a receive or
+clone that does not work, a received copy that is not standalone — places
+nothing and is logged, and the qemu-img copy is made instead, as for any btrfs
+disk before. Everything staged is removed when the copy ends, whether it
+succeeded, failed or its client went away. Every private directory
+(`.litevirt-send-<time>-<id>`, `.litevirt-recv-<time>-<id>`) carries a marker
+file from the moment it is made; one a daemon that died mid-copy left is
+removed by the next btrfs copy when it carries that marker, is older than a
+day, holds nothing but what the copy puts there, is not a running copy's, and
+no disk or pool record uses a file in it. No file in a pool is ever swept,
+whatever its name. A btrfs disk anywhere else — a file in the pool's directory
+(storage motion puts it there), a disk with no pool, a subvolume that holds
+other files, a disk on a base image — and every copy between different
+drivers, or to a `--target-path` outside the pool's directory, take the file
+copy. What the drivers implement:
 
 - **ZFS** — `zfs snapshot` then `zfs send | zfs recv`. Incremental
   (`-I` since the prior `litevirt-replicate-prev` snapshot) when

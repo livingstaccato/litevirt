@@ -376,10 +376,11 @@ func (s *Server) btrfsDiskSubvolume(ctx context.Context, src *corrosion.DiskReco
 // (btrfsDiskSubvolume), standalone — no backing file, no external data file:
 // a copy never depends on a file outside itself, so a disk on a base image
 // keeps the flattening qemu-img copy — and dstPath a file directly in the
-// pool's directory. The copy is then the same new file a qemu-img copy would
+// pool's directory, and both pools pass the write check. The copy is then the same new file a qemu-img copy would
 // be (the driver places it with a rename that refuses an existing name), so
 // everything that finds copies by name or record finds it. native false: the
-// caller makes the file copy instead.
+// caller makes the file copy instead — also after any native failure but an
+// existing destination.
 func (s *Server) replicateBtrfsNative(ctx context.Context, src *corrosion.DiskRecord, dstPool StoragePoolRef, drv storage.Driver, dstDir, dstPath string, send func(*pb.ReplicateVolumeProgress) error) (native bool, err error) {
 	if src.StorageType != "btrfs" || dstPool.Driver != "btrfs" ||
 		filepath.Dir(dstPath) != filepath.Clean(dstDir) || strings.HasPrefix(filepath.Base(dstPath), ".") {
@@ -390,6 +391,13 @@ func (s *Server) replicateBtrfsNative(ctx context.Context, src *corrosion.DiskRe
 	}
 	srcPool, ok := s.resolvePool(ctx, src.StorageVolume)
 	if !ok {
+		return false, nil
+	}
+	// The native path writes into the SOURCE pool too (its send snapshot,
+	// and the sweep of staging a crashed copy left), so that pool must pass
+	// the write check every write passes; a refused one takes the file copy,
+	// which only reads it.
+	if cerr, _ := s.poolRefusal(ctx, src.StorageVolume, srcPool); cerr != nil {
 		return false, nil
 	}
 	if err := qcow2.AssertStandalone(src.Path); err != nil {
@@ -413,7 +421,14 @@ func (s *Server) replicateBtrfsNative(ctx context.Context, src *corrosion.DiskRe
 	case errors.Is(err, storage.ErrDestinationExists):
 		return true, status.Errorf(codes.AlreadyExists, "%q already exists; a restore or copy never replaces a file", dstPath)
 	case err != nil:
-		return true, status.Errorf(codes.Internal, "native btrfs replicate: %v", err)
+		// Any other failure — a read-only or full source pool, a btrfs that
+		// cannot receive or clone, a received copy that is not standalone —
+		// takes the file copy, as every btrfs copy did before: a native copy
+		// that fails places nothing at dstPath (placement is its last step,
+		// and refuses an existing name), and its staging is already removed.
+		slog.Warn("replicate: native btrfs send/receive failed; making the file copy instead",
+			"disk", src.Path, "target", dstPath, "error", err)
+		return false, nil
 	}
 	return true, nil
 }

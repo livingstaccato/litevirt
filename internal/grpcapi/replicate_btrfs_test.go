@@ -37,7 +37,8 @@ import (
 // appended to the returned log. BTRFS_FAIL_RECEIVE=1 makes receive create a
 // partial subvolume and fail; BTRFS_RECEIVE_ALSO_CREATES=<path> makes it
 // create the file <path> (someone else's) while it runs;
-// BTRFS_RECEIVE_REPLACE_WITH=<file> makes what it receives that file's bytes.
+// BTRFS_RECEIVE_REPLACE_WITH=<file> makes what it receives that file's bytes;
+// BTRFS_FAIL_SNAPSHOT=1 makes every snapshot fail (a read-only source pool).
 func fakeBtrfs(t *testing.T) (logPath, subvols string) {
 	t.Helper()
 	dir := t.TempDir()
@@ -59,6 +60,7 @@ second=$(printf '%s\n' "$pos" | sed -n 3p)
 case "$1 $2" in
   "subvolume show") [ -d "$last" ] && grep -qxF -- "$(stat -c %i "$last")" ` + subvols + ` && exit 0; echo "not a subvolume" >&2; exit 1 ;;
   "subvolume snapshot")
+    [ "$BTRFS_FAIL_SNAPSHOT" = 1 ] && { echo "read-only file system" >&2; exit 1; }
     grep -qxF -- "$(stat -c %i "$first")" ` + subvols + ` || { echo "not a subvolume" >&2; exit 1; }
     [ -e "$second" ] && { echo "exists" >&2; exit 1; }
     cp -a "$first" "$second" || exit 1
@@ -105,7 +107,8 @@ func btrfsVM(t *testing.T) (s *Server, alice context.Context, src, dst, payload 
 		t.Fatal(err)
 	}
 	payload = string(qcow2Bytes(t))
-	if err := os.WriteFile(filepath.Join(sub, "vm1-root.qcow2"), []byte(payload), 0o600); err != nil {
+	// 0644, as qcow2.Create makes a disk: the copy must still be 0600.
+	if err := os.WriteFile(filepath.Join(sub, "vm1-root.qcow2"), []byte(payload), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	markSubvol(t, subvols, sub)
@@ -185,6 +188,16 @@ func entries(t *testing.T, dir string) []string {
 	return out
 }
 
+// nativeTried reports whether the copy announced a native send/receive.
+func nativeTried(rec *streamRecorder[pb.ReplicateVolumeProgress]) bool {
+	for _, m := range rec.Sent {
+		if strings.Contains(m.Status, "native") {
+			return true
+		}
+	}
+	return false
+}
+
 func btrfsSent(t *testing.T, log string) bool {
 	t.Helper()
 	for _, c := range calls(t, log) {
@@ -217,6 +230,8 @@ func TestReplicateVolume_NativeBtrfsWorksIntoAFreshFile(t *testing.T) {
 	}
 	if fi, err := os.Lstat(got); err != nil || !fi.Mode().IsRegular() {
 		t.Fatalf("copy %q is not a regular file: %v", got, err)
+	} else if fi.Mode().Perm() != 0o600 {
+		t.Errorf("copy mode %v, want 0600 as a file copy's", fi.Mode().Perm())
 	}
 	if b, err := os.ReadFile(got); err != nil || string(b) != payload {
 		t.Errorf("copy holds other bytes than the disk (%v)", err)
@@ -328,36 +343,102 @@ func TestReplicateVolume_NativeBtrfsDestinationCreatedMidCopyIsKept(t *testing.T
 	}
 }
 
-// A failed receive removes the partial subvolume and the send snapshot it
-// created, and the next run works.
-func TestReplicateVolume_NativeBtrfsFailedReceiveLeavesNothing(t *testing.T) {
-	s, alice, src, dst, payload, subvols, _ := btrfsVM(t)
-	t.Setenv("BTRFS_FAIL_RECEIVE", "1")
-	if _, err := replicateBtrfs(t, s, alice, ""); err == nil {
-		t.Fatal("a failed receive reported success")
+// requireFileCopy checks that the last replicate made the qemu-img file copy:
+// a standalone file at the target, the status not native. The file copy never
+// replaces a file, so its success also proves the native attempt left nothing
+// at the target.
+func requireFileCopy(t *testing.T, rec *streamRecorder[pb.ReplicateVolumeProgress], err error) string {
+	t.Helper()
+	needQemuImg(t)
+	if err != nil {
+		t.Fatalf("replicate-volume: %v, want the file copy", err)
 	}
-	if e := entries(t, dst); len(e) != 0 {
-		t.Errorf("target pool holds %q after a failed copy, want nothing", e)
+	last := rec.Sent[len(rec.Sent)-1]
+	if strings.Contains(last.Status, "native") {
+		t.Errorf("status %q: want the file copy", last.Status)
+	}
+	if err := qcow2.AssertStandalone(last.TargetPath); err != nil {
+		t.Errorf("copy %s: %v", last.TargetPath, err)
+	}
+	if fi, err := os.Lstat(last.TargetPath); err != nil || !fi.Mode().IsRegular() {
+		t.Errorf("no file copy at %s: %v", last.TargetPath, err)
+	}
+	return last.TargetPath
+}
+
+// A native copy that fails — here the receive — removes the partial
+// subvolume and the send snapshot it created, places nothing, and the file
+// copy is made instead: btrfs→btrfs worked through the file copy before the
+// native path, and a native failure never newly refuses it.
+func TestReplicateVolume_NativeBtrfsFailedReceiveFallsBackToTheFileCopy(t *testing.T) {
+	s, alice, src, dst, _, subvols, _ := btrfsVM(t)
+	t.Setenv("BTRFS_FAIL_RECEIVE", "1")
+	rec, err := replicateBtrfs(t, s, alice, "")
+	copyFile := requireFileCopy(t, rec, err)
+	if e := entries(t, dst); len(e) != 1 || e[0] != filepath.Base(copyFile) {
+		t.Errorf("target pool holds %q, want only the file copy", e)
 	}
 	if e := entries(t, src); len(e) != 1 {
-		t.Errorf("source pool holds %q after a failed copy, want only the disk's subvolume", e)
+		t.Errorf("source pool holds %q after a failed native copy, want only the disk's subvolume", e)
 	}
 	if got := liveSubvols(t, subvols, src, dst); !slices.Equal(got, []string{filepath.Join(src, "vm1-root")}) {
-		t.Errorf("subvolumes left after a failed copy %q", got)
+		t.Errorf("subvolumes left after a failed native copy %q", got)
 	}
-	t.Setenv("BTRFS_FAIL_RECEIVE", "")
+}
+
+// A source pool where nothing can be snapshotted (read-only, full) still gets
+// its copy: the file copy, which only reads it.
+func TestReplicateVolume_NativeBtrfsFailedSnapshotFallsBackToTheFileCopy(t *testing.T) {
+	s, alice, src, _, _, _, _ := btrfsVM(t)
+	t.Setenv("BTRFS_FAIL_SNAPSHOT", "1")
 	rec, err := replicateBtrfs(t, s, alice, "")
-	if err != nil {
-		t.Fatalf("the run after a failed one: %v", err)
+	requireFileCopy(t, rec, err)
+	if e := entries(t, src); len(e) != 1 {
+		t.Errorf("source pool holds %q after a failed snapshot, want only the disk's subvolume", e)
 	}
-	if b, err := os.ReadFile(rec.Sent[len(rec.Sent)-1].TargetPath); err != nil || string(b) != payload {
-		t.Errorf("copy holds other bytes (%v)", err)
+}
+
+// The native path writes into the source pool (its send snapshot, the
+// sweep), so a source pool the write check refuses is only read: the file
+// copy.
+func TestReplicateVolume_NativeBtrfsRefusedSourcePoolTakesTheFileCopy(t *testing.T) {
+	s, alice, _, _, _, subvols, log := btrfsVM(t)
+	// A pool inside the daemon's data directory (not disks/, pools/ or
+	// mounts/) is refused for writes.
+	refused := filepath.Join(s.dataDir, "state")
+	sub := filepath.Join(refused, "vm1-root")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeQcow2(t, filepath.Join(sub, "vm1-root.qcow2"))
+	markSubvol(t, subvols, sub)
+	upsertPool(t, s, corrosion.StoragePoolRecord{HostName: s.hostName, Name: "src", Driver: "btrfs", Source: refused})
+	setDiskPath(t, s, filepath.Join(sub, "vm1-root.qcow2"))
+	if _, ok := s.resolvePool(context.Background(), "src"); !ok {
+		t.Fatal("the source pool does not resolve")
+	}
+	if cerr, _ := s.poolRefusal(context.Background(), "src", StoragePoolRef{Driver: "btrfs", Source: refused}); cerr == nil {
+		t.Fatal("the test's source pool is not refused")
+	}
+	rec, err := replicateBtrfs(t, s, alice, "")
+	requireFileCopy(t, rec, err)
+	if btrfsSent(t, log) {
+		t.Errorf("sent natively from a refused pool: %q", calls(t, log))
+	}
+	for _, c := range calls(t, log) {
+		if strings.Contains(c, "snapshot") || strings.Contains(c, "delete") {
+			t.Errorf("btrfs wrote into the refused source pool: %q", c)
+		}
+	}
+	if e := entries(t, refused); len(e) != 1 {
+		t.Errorf("refused source pool holds %q, want only the disk's subvolume", e)
 	}
 }
 
 // A copy never depends on a file outside itself: what was received is
-// checked again, and a copy that names a backing file is not placed.
-func TestReplicateVolume_NativeBtrfsNeverPlacesACopyWithABackingFile(t *testing.T) {
+// checked again, and a received copy that names a backing file is not placed
+// — the file copy, which flattens, is made instead.
+func TestReplicateVolume_NativeBtrfsReceivedCopyWithABackingFileTakesTheFileCopy(t *testing.T) {
 	s, alice, src, dst, _, subvols, _ := btrfsVM(t)
 	base := filepath.Join(t.TempDir(), "base.qcow2")
 	writeQcow2(t, base)
@@ -366,11 +447,10 @@ func TestReplicateVolume_NativeBtrfsNeverPlacesACopyWithABackingFile(t *testing.
 		t.Fatal(err)
 	}
 	t.Setenv("BTRFS_RECEIVE_REPLACE_WITH", overlay)
-	if _, err := replicateBtrfs(t, s, alice, ""); err == nil {
-		t.Fatal("a received copy naming a backing file was placed")
-	}
-	if e := entries(t, dst); len(e) != 0 {
-		t.Errorf("target pool holds %q, want nothing", e)
+	rec, err := replicateBtrfs(t, s, alice, "")
+	copyFile := requireFileCopy(t, rec, err)
+	if e := entries(t, dst); len(e) != 1 || e[0] != filepath.Base(copyFile) {
+		t.Errorf("target pool holds %q, want only the file copy", e)
 	}
 	if got := liveSubvols(t, subvols, src, dst); !slices.Equal(got, []string{filepath.Join(src, "vm1-root")}) {
 		t.Errorf("subvolumes left %q", got)
@@ -378,14 +458,23 @@ func TestReplicateVolume_NativeBtrfsNeverPlacesACopyWithABackingFile(t *testing.
 }
 
 // A project Operator cannot name the copy; an admin's name outside the pool's
-// directory, or a hidden one, takes the file copy, never a native send.
+// directory, or a hidden one, gets the file copy there — never a native send,
+// and never a refusal.
 func TestReplicateVolume_NativeBtrfsTargetOutsideThePoolTakesTheFileCopy(t *testing.T) {
 	s, alice, _, _, _, _, log := btrfsVM(t)
 	if _, err := replicateBtrfs(t, s, alice, "db-copy.qcow2"); status.Code(err) != codes.PermissionDenied {
 		t.Errorf("operator naming the copy: got %v, want PermissionDenied", err)
 	}
-	for _, target := range []string{filepath.Join(t.TempDir(), "elsewhere.qcow2"), ".hidden.qcow2"} {
-		_, _ = replicateBtrfs(t, s, adminCtx(), target)
+	elsewhere := filepath.Join(t.TempDir(), "elsewhere.qcow2")
+	for _, target := range []string{elsewhere, ".hidden.qcow2"} {
+		rec, err := replicateBtrfs(t, s, adminCtx(), target)
+		got := requireFileCopy(t, rec, err)
+		if target == elsewhere && got != elsewhere {
+			t.Errorf("copy at %s, want %s", got, elsewhere)
+		}
+		if nativeTried(rec) {
+			t.Errorf("a native copy was tried for %s", target)
+		}
 	}
 	if btrfsSent(t, log) {
 		t.Errorf("sent natively: %q", calls(t, log))
@@ -428,8 +517,8 @@ func TestReplicateVolume_BtrfsOtherwiseKeepsTheFileCopy(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			s, _, src, _, _, subvols, log := btrfsVM(t)
 			setup(t, s, src, subvols)
-			_, err := replicateBtrfs(t, s, adminCtx(), "")
-			if btrfsSent(t, log) {
+			rec, err := replicateBtrfs(t, s, adminCtx(), "")
+			if btrfsSent(t, log) || nativeTried(rec) {
 				t.Errorf("sent natively: %q", calls(t, log))
 			}
 			if err != nil && strings.Contains(err.Error(), "native") {
@@ -480,14 +569,15 @@ func TestReplicateVolume_NativeBtrfsCopyIsPromotedAndBooted(t *testing.T) {
 }
 
 // A copy that never finished (a daemon that died mid-copy) leaves staging; a
-// later copy removes the stale staging this driver names, and nothing else:
-// not a fresh one (a copy may be running), not one a record or disk uses,
-// not a name of another shape.
+// later copy removes the stale staging this driver made — a directory of its
+// name carrying its marker — and nothing else: not a fresh one, not one a
+// disk uses, not an unmarked directory of the same name, and never a file
+// such as an admin-named ".litevirt-place-…" copy whose record was lost.
 func TestReplicateVolume_NativeBtrfsSweepsStaleStaging(t *testing.T) {
 	s, alice, src, dst, _, subvols, _ := btrfsVM(t)
 	old := time.Now().Add(-25 * time.Hour).Unix()
 	fresh := time.Now().Add(-time.Hour).Unix()
-	stage := func(root, kind string, at int64, id string) string {
+	stage := func(root, kind string, at int64, id string, marked bool) string {
 		d := filepath.Join(root, fmt.Sprintf(".litevirt-%s-%d-%s", kind, at, id))
 		snap := filepath.Join(d, "snap")
 		if err := os.MkdirAll(snap, 0o700); err != nil {
@@ -495,33 +585,38 @@ func TestReplicateVolume_NativeBtrfsSweepsStaleStaging(t *testing.T) {
 		}
 		writeQcow2(t, filepath.Join(snap, "vm1-root.qcow2"))
 		markSubvol(t, subvols, snap)
+		if marked {
+			if err := os.WriteFile(filepath.Join(d, ".litevirt-staging"), []byte("x"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
 		return d
 	}
-	staleSend := stage(src, "send", old, "aaaaaaaaaaaa")
-	staleRecv := stage(dst, "recv", old, "bbbbbbbbbbbb")
-	freshRecv := stage(dst, "recv", fresh, "cccccccccccc")
-	usedRecv := stage(dst, "recv", old, "dddddddddddd")
+	staleSend := stage(src, "send", old, "aaaaaaaaaaaa", true)
+	staleRecv := stage(dst, "recv", old, "bbbbbbbbbbbb", true)
+	writeQcow2(t, filepath.Join(staleRecv, "place"))
+	freshRecv := stage(dst, "recv", fresh, "cccccccccccc", true)
+	usedRecv := stage(dst, "recv", old, "dddddddddddd", true)
+	unmarked := stage(dst, "recv", old, "abababababab", false)
 	if err := corrosion.InsertVM(context.Background(), s.db,
 		corrosion.VMRecord{Name: "vm2", HostName: s.hostName, State: "stopped", Project: "a"},
 		nil, []corrosion.DiskRecord{{VMName: "vm2", DiskName: "root", HostName: s.hostName,
 			Path: filepath.Join(usedRecv, "snap", "vm1-root.qcow2"), StorageType: "btrfs"}}); err != nil {
 		t.Fatal(err)
 	}
-	stalePlace := filepath.Join(dst, fmt.Sprintf(".litevirt-place-%d-eeeeeeeeeeee", old))
-	writeQcow2(t, stalePlace)
-	other := filepath.Join(dst, fmt.Sprintf(".litevirt-other-%d-ffffffffffff", old))
-	if err := os.Mkdir(other, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	adminFile := filepath.Join(dst, fmt.Sprintf(".litevirt-place-%d-eeeeeeeeeeee", old))
+	writeQcow2(t, adminFile)
+	adminRecvFile := filepath.Join(dst, fmt.Sprintf(".litevirt-recv-%d-ffffffffffff", old))
+	writeQcow2(t, adminRecvFile)
 	if _, err := replicateBtrfs(t, s, alice, ""); err != nil {
 		t.Fatal(err)
 	}
-	for _, p := range []string{staleSend, staleRecv, stalePlace} {
+	for _, p := range []string{staleSend, staleRecv} {
 		if _, err := os.Lstat(p); err == nil {
 			t.Errorf("stale staging %s outlived the next copy", p)
 		}
 	}
-	for _, p := range []string{freshRecv, usedRecv, other} {
+	for _, p := range []string{freshRecv, usedRecv, unmarked, filepath.Join(unmarked, "snap"), adminFile, adminRecvFile} {
 		if _, err := os.Lstat(p); err != nil {
 			t.Errorf("%s was swept: %v", p, err)
 		}

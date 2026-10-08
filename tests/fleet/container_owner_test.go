@@ -48,3 +48,26 @@ func TestContainerMigrate_KeepsTheOwnerRecord(t *testing.T) {
 		t.Fatalf("target owner record = %+v, want {%s %s}", o, row.Project, id)
 	}
 }
+
+// A migrate keeps a container's privilege mode exactly: the target records
+// the same id range and confinement the source created it with.
+func TestContainerMigrate_KeepsPrivilegeMode(t *testing.T) {
+	c := ctMigrateCluster(t)
+	src, dst := c.Nodes[0], c.Nodes[1]
+	ctx := context.Background()
+	const name = "ct-sec"
+	createContainer(t, c, src, name)
+	row, _ := corrosion.GetContainer(ctx, src.DB, src.Name, name)
+	before := corrosion.DecodeCreateSpec(row.CreateSpec)
+	if before.IDMapBase == 0 || before.Confinement != "default" {
+		t.Fatalf("created as %+v, want unprivileged default", before)
+	}
+	if err := runMigrate(t, c, src, dst, name, stagingRepo(t)); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	moved, _ := corrosion.GetContainer(ctx, dst.DB, dst.Name, name)
+	after := corrosion.DecodeCreateSpec(moved.CreateSpec)
+	if after.IDMapBase != before.IDMapBase || after.Confinement != before.Confinement {
+		t.Fatalf("migrated as %+v, created as %+v", after, before)
+	}
+}

@@ -313,6 +313,11 @@ lv ct snapshot revert <name> <snapshot>                # roll back (stop → res
 lv ct snapshot rm <name> <snapshot>                    # delete a snapshot
 lv ct template <name> [--revert]                       # convert a stopped ct to a clone template
 lv ct clone <source> <new-name> [--project p] [--start] # full-copy clone with a fresh identity
+lv ct inspect <name> [--host h]                        # placement, limits, privilege mode, confinement
+lv ct convert <name> --unprivileged [--confinement default]  # stopped ct → an id range of its own
+lv ct convert <name> --confinement default|legacy      # change confinement (legacy: Admin only)
+lv ct create <name> --privileged                       # no user namespace, as earlier releases (Admin only)
+lv ct create <name> --confinement legacy               # AppArmor nesting, template seccomp/caps (Admin only)
 ```
 
 `--local` runs against the local lxc-* binaries instead of the gRPC service
@@ -1036,6 +1041,7 @@ lv stats <vm>                                # VM resource statistics
 lv doctor divergence [--json] [--table <name>]... [--include-sensitive]   # Report replicated rows that disagree across nodes (read-only)
 lv doctor repair-owner <vm> <host>           # Re-assert a VM's owner on the host that actually runs it (audited)
 lv doctor fence                              # Report whether a shared-disk VM's cross-host transfer would be fenced (read-only)
+lv doctor privileged-containers              # Report privileged or legacy-confined containers (read-only)
 ```
 
 `divergence` is read-only, and lists a lease-term tie that every host has

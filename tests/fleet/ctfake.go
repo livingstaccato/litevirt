@@ -212,6 +212,18 @@ func (f *CTFake) CreateContainer(_ context.Context, opts grpcapi.CreateContainer
 	defer f.mu.Unlock()
 	f.createCalls = append(f.createCalls, opts)
 	f.seedLocked(opts.Name, "created-by-"+opts.Name)
+	// The security block a real create writes, in the config that travels
+	// with the container through export and import.
+	var idmap *lxc.IDMap
+	if opts.IDMapBase != 0 {
+		idmap = &lxc.IDMap{Base: opts.IDMapBase, Size: lxc.IDMapSize}
+	}
+	if block := lxc.SecurityConfig(opts.Confinement, idmap); block != "" {
+		cfg := filepath.Join(f.dir(opts.Name), "config")
+		if b, err := os.ReadFile(cfg); err == nil {
+			_ = os.WriteFile(cfg, append(b, block...), 0o644)
+		}
+	}
 	if f.cgroup == nil {
 		f.cgroup = map[string]string{}
 	}
@@ -561,4 +573,53 @@ func (f *CTFake) ReadOwner(name string) (*lxc.ContainerOwner, error) {
 		return nil, err
 	}
 	return &o, nil
+}
+
+// ContainerSecurity / ConvertContainerSecurity make CTFake a container
+// securer, reading and rewriting the security block in the container's own
+// config as the real runtime does (no files are shifted: the fake's rootfs
+// holds only a payload).
+func (f *CTFake) ContainerSecurity(name string) (lxc.Security, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	b, err := os.ReadFile(filepath.Join(f.dir(name), "config"))
+	if err != nil {
+		return lxc.Security{}, err
+	}
+	return lxc.ParseSecurity(string(b)), nil
+}
+
+func (f *CTFake) ConvertContainerSecurity(_ context.Context, name string, to lxc.ConvertOpts) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cfgPath := filepath.Join(f.dir(name), "config")
+	b, err := os.ReadFile(cfgPath)
+	if err != nil {
+		return err
+	}
+	sec := lxc.ParseSecurity(string(b))
+	if to.IDMap != nil {
+		sec.IDMap = to.IDMap
+	}
+	if to.Confinement != "" {
+		sec.Confinement = to.Confinement
+	}
+	// The block is the whole security config: drop the old one, keep the rest.
+	var keep []string
+	in := false
+	for _, line := range strings.Split(string(b), "\n") {
+		switch {
+		case strings.HasPrefix(line, "# litevirt security begin"):
+			in = true
+			continue
+		case line == "# litevirt security end":
+			in = false
+			continue
+		case in:
+			continue
+		}
+		keep = append(keep, line)
+	}
+	cfg := strings.TrimRight(strings.Join(keep, "\n"), "\n") + "\n" + lxc.SecurityConfig(sec.Confinement, sec.IDMap)
+	return os.WriteFile(cfgPath, []byte(cfg), 0o644)
 }

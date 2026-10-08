@@ -188,6 +188,14 @@ type CreateOpts struct {
 	// Labels are persisted into a litevirt-specific config block (we
 	// own them — LXC ignores).
 	Labels map[string]string
+	// Confinement is ConfinementDefault or ConfinementLegacy; "" is legacy,
+	// the config an earlier build wrote (a recreate of such a container).
+	Confinement string
+	// IDMap makes the container unprivileged in that id range; nil is
+	// privileged.
+	IDMap *IDMap
+	// PidsMax is written as lxc.cgroup2.pids.max when positive.
+	PidsMax int
 }
 
 // Validate checks cross-field invariants before any shell-out.
@@ -232,6 +240,20 @@ type LxcRunner struct {
 	// stat failure (container restarted → new cgroup path).
 	cgPathMu    sync.Mutex
 	cgPathCache map[string]string
+
+	// DefaultPidsMax is the pids.max a container whose config sets none gets
+	// at its next start (prepareStart). 0 adds none.
+	DefaultPidsMax int
+	// IDMappedRootfs chooses how an unprivileged container's rootfs is mapped:
+	// "on" (an idmapped mount), "off" (files shifted into its range), or
+	// "auto"/"" (an idmapped mount where idmappedProbe says this host can).
+	IDMappedRootfs string
+	// SubIDSpan is the whole id span containers are allocated from; root's
+	// subordinate range is added for all of it at once (ensureRootSubIDs).
+	SubIDSpan *IDMap
+
+	probeOnce     sync.Once
+	probeIDMapped bool
 }
 
 // NewLxcRunner returns a Runtime configured to talk to /var/lib/lxc.
@@ -284,6 +306,9 @@ func (r *LxcRunner) Create(ctx context.Context, opts CreateOpts) (*Container, er
 	if err := opts.Validate(); err != nil {
 		return nil, err
 	}
+	if opts.PidsMax == 0 {
+		opts.PidsMax = r.DefaultPidsMax
+	}
 	if opts.Template != "download" {
 		rootfs, ok, err := resolveRootfs(opts.Template)
 		if err != nil {
@@ -309,6 +334,10 @@ func (r *LxcRunner) Create(ctx context.Context, opts CreateOpts) (*Container, er
 	// --network wins) and apply cgroup limits.
 	if err := r.finalizeContainerConfig(opts); err != nil {
 		return nil, fmt.Errorf("apply container network/resource config for %q: %w", opts.Name, err)
+	}
+	if err := r.shiftNewRootfs(opts); err != nil {
+		_ = os.RemoveAll(filepath.Join(r.lxcpath(), opts.Name))
+		return nil, err
 	}
 	return &Container{
 		Name:      opts.Name,
@@ -358,6 +387,10 @@ func (r *LxcRunner) createFromRootfs(ctx context.Context, opts CreateOpts, rootf
 	if err := r.finalizeContainerConfig(opts); err != nil {
 		return nil, fmt.Errorf("apply container network/resource config for %q: %w", opts.Name, err)
 	}
+	if err := r.shiftNewRootfs(opts); err != nil {
+		_ = os.RemoveAll(containerDir)
+		return nil, err
+	}
 	return &Container{
 		Name:      opts.Name,
 		State:     StateStopped,
@@ -371,8 +404,11 @@ func (r *LxcRunner) createFromRootfs(ctx context.Context, opts CreateOpts, rootf
 	}, nil
 }
 
-// Start runs lxc-start in daemon mode.
+// Start runs lxc-start in daemon mode, after prepareStart.
 func (r *LxcRunner) Start(ctx context.Context, name string) error {
+	if err := r.prepareStart(name); err != nil {
+		return err
+	}
 	if _, stderr, err := r.run(ctx, "lxc-start", "-n", name, "-d"); err != nil {
 		return cmdErr("lxc-start", name, stderr, err)
 	}
@@ -1015,6 +1051,10 @@ func (r *LxcRunner) finalizeContainerConfig(opts CreateOpts) error {
 	}
 	cfg += netCfg
 	cfg += ResourceConfig(opts.CPULimit, opts.MemoryMiB)
+	if opts.PidsMax > 0 {
+		cfg += fmt.Sprintf("%s = %d\n", pidsMaxKey, opts.PidsMax)
+	}
+	cfg = withSecurityBlock(cfg, renderSecurityBlock(opts.Confinement, opts.IDMap, opts.IDMap != nil && r.useIDMappedMount()))
 
 	if err := os.WriteFile(path, []byte(cfg), 0o644); err != nil {
 		return err
@@ -1315,4 +1355,27 @@ func parseMemoryMax(val string) (MemoryLimit, error) {
 	// zero-byte cap is a legal cgroup2 value and the most restrictive one
 	// there is, so reading it as "no cap" inverts its meaning exactly.
 	return MemoryLimit{MiB: int((bytes + (1 << 20) - 1) >> 20)}, nil
+}
+
+// shiftNewRootfs moves a new unprivileged container's rootfs (owned by host
+// ids, as copied or as lxc-create wrote it) into its range, unless an
+// idmapped mount maps it. The config already carries the mapping.
+func (r *LxcRunner) shiftNewRootfs(opts CreateOpts) error {
+	if opts.IDMap == nil {
+		return nil
+	}
+	if err := r.ensureRootSubIDs(opts.IDMap); err != nil {
+		return err
+	}
+	if r.useIDMappedMount() {
+		return nil
+	}
+	rootfs, err := r.RootFSPath(opts.Name)
+	if err != nil {
+		return err
+	}
+	if err := shiftTree(rootfs, nil, opts.IDMap); err != nil {
+		return fmt.Errorf("shift %s into ids %d-%d: %w", rootfs, opts.IDMap.Base, opts.IDMap.Base+opts.IDMap.Size-1, err)
+	}
+	return nil
 }

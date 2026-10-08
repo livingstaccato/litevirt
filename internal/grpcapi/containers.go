@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"path/filepath"
 	"strconv"
@@ -86,6 +87,11 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	// the caller is real); the reading host refuses protected places below.
 	if err := s.authorizeContainerTemplate(ctx, req.Template); err != nil {
 		s.audit(ctx, "ct.create", req.Name, "template="+req.Template, "denied")
+		return nil, err
+	}
+	// The security opt-outs (privileged, legacy confinement) are the Admin's.
+	if err := containerSecurityRequest(ctx, req.Privileged, req.Confinement); err != nil {
+		s.audit(ctx, "ct.create", req.Name, fmt.Sprintf("privileged=%v confinement=%s", req.Privileged, req.Confinement), "denied")
 		return nil, err
 	}
 	// Idempotency: replay a completed create on a lost-response retry (see CreateVM).
@@ -238,11 +244,26 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		defer lease.release(ctx)
 		ctLease = lease
 	}
+	// Unprivileged by default, in a range no other container uses.
+	confinement := req.Confinement
+	if confinement == "" {
+		confinement = lxc.ConfinementDefault
+	}
+	var idmapBase int64
+	if !req.Privileged {
+		b, aerr := s.allocateIDMapBase(ctx, req.Name)
+		if aerr != nil {
+			_ = s.releaseContainerNICs(ctx, req.Name)
+			return nil, aerr
+		}
+		idmapBase = b
+	}
 	info, err := s.containerRuntime.CreateContainer(ctx, CreateContainerOpts{
 		Name: req.Name, Template: req.Template,
 		Distro: req.Distro, Release: req.Release, Arch: req.Arch,
 		CPULimit: int(req.Cpu), MemoryMiB: int(req.MemoryMib),
 		Networks: plan.lxcNics, Labels: req.Labels,
+		Confinement: confinement, IDMapBase: idmapBase,
 	})
 	if err != nil {
 		_ = s.releaseContainerNICs(ctx, req.Name)
@@ -256,7 +277,9 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		Template: req.Template, Distro: req.Distro, Release: req.Release, Arch: req.Arch,
 		Networks: plan.specNets,
 		// A new lineage: the owner record its files are matched by.
-		OwnerID: randid.New(),
+		OwnerID:     randid.New(),
+		IDMapBase:   idmapBase,
+		Confinement: confinement,
 	}
 	s.stampContainerOwner(info.Name, req.Project, corrosion.EncodeCreateSpec(createSpec))
 
@@ -376,6 +399,10 @@ func (s *Server) StartContainer(ctx context.Context, req *pb.StartContainerReque
 			return nil, aerr
 		}
 		defer lease.release(ctx)
+	}
+	if err := s.refuseOverlappingRange(ctx, req.Name); err != nil {
+		s.audit(ctx, "ct.start", req.Name, "project="+project+" id range overlap", "denied")
+		return nil, err
 	}
 	if err := s.containerRuntime.StartContainer(ctx, req.Name); err != nil {
 		s.audit(ctx, "ct.start", req.Name, "project="+project, "error")
@@ -812,7 +839,9 @@ func (s *Server) forwardSimpleCT(
 }
 
 func toPbContainer(r corrosion.ContainerRecord) *pb.Container {
+	privileged, confinement, base := containerSecurityOf(r)
 	return &pb.Container{
+		Privileged: privileged, Confinement: confinement, IdmapBase: base,
 		HostName: r.HostName, Name: r.Name, State: r.State,
 		Image: r.Image, CpuLimit: int32(r.CPULimit), MemoryMib: int32(r.MemMiB),
 		Restart: decodeRestartPolicy(r.RestartPolicy), StateDetail: r.StateDetail,

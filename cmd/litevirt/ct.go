@@ -40,6 +40,8 @@ func newCTCmd() *cobra.Command {
 		newCTSnapshotCmd(),
 		newCTTemplateCmd(),
 		newCTCloneCmd(),
+		newCTInspectCmd(),
+		newCTConvertCmd(),
 	)
 	return cmd
 }
@@ -217,7 +219,8 @@ func newCTCreateCmd() *cobra.Command {
 	var networks []string
 	var restart, restartDelay, restartWin string
 	var restartMax int32
-	var onHostFailure string
+	var onHostFailure, confinement string
+	var privileged bool
 	cmd := &cobra.Command{
 		Use:   "create <name>",
 		Short: "Create a new container (does not start it)",
@@ -246,6 +249,7 @@ func newCTCreateCmd() *cobra.Command {
 					Distro: distro, Release: release, Arch: arch,
 					Cpu: int32(cpu), MemoryMib: int32(memMiB), Networks: nics,
 					Project: project, OnHostFailure: onHostFailure,
+					Privileged: privileged, Confinement: confinement,
 				}
 				if restart != "" && restart != "none" {
 					req.Restart = &pb.RestartPolicy{
@@ -274,6 +278,8 @@ func newCTCreateCmd() *cobra.Command {
 	cmd.Flags().StringVar(&host, "host", "", "Target host (default: the daemon you're connected to)")
 	cmd.Flags().StringVar(&onHostFailure, "on-host-failure", "", "Host-loss relocation policy: none (default) | image-recreate (rebuild on a surviving host if this one is fenced)")
 	cmd.Flags().StringVar(&project, "project", "", "Tenancy project (default: _default)")
+	cmd.Flags().BoolVar(&privileged, "privileged", false, "Create without a user namespace, as earlier releases did (Admin only; default: unprivileged, an id range of its own)")
+	cmd.Flags().StringVar(&confinement, "confinement", "", "default | legacy (legacy: AppArmor nesting allowed, the template's seccomp and capabilities; Admin only)")
 	cmd.Flags().BoolVar(&useLocal, "local", false, "Use the host-local lxc-* runtime instead of gRPC")
 	cmd.Flags().StringVar(&restart, "restart", "", "Auto-restart policy: none | on-failure | always (default none). An operator `lv ct stop` is never auto-restarted; any other stop is treated as unexpected (containers have no stop reason).")
 	cmd.Flags().Int32Var(&restartMax, "restart-max-attempts", 0, "Max restart attempts within the window (0 = unlimited)")

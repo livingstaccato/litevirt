@@ -654,6 +654,13 @@ type Server struct {
 	vmLocksMu sync.Mutex
 	vmLocks   map[string]*sync.Mutex
 
+	// Container id ranges (container_security.go): ranges of lxc.IDMapSize
+	// host ids from idmapBase, idmapRanges of them. idmapMu serializes this
+	// host's allocations.
+	idmapMu     sync.Mutex
+	idmapBase   int64
+	idmapRanges int
+
 	// admissionMu makes this node a single serialization point for its
 	// reserve-then-verify decisions: it is held from a provisional claim's
 	// reserve through its verify to its admitted marker (decideReservation),
@@ -1810,6 +1817,11 @@ type CreateContainerOpts struct {
 	MemoryMiB int
 	Networks  []ContainerNICOpt
 	Labels    map[string]string
+	// Confinement is "default" or "legacy" ("" = as an earlier build wrote).
+	Confinement string
+	// IDMapBase makes the container unprivileged in the range starting there;
+	// 0 is privileged.
+	IDMapBase int64
 }
 
 // ContainerNICOpt mirrors lxc.NetworkAttach.

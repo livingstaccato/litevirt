@@ -26,7 +26,7 @@ to remediate a diagnosed problem (e.g. 'repair-owner') — those are admin-gated
 and audited; check each subcommand's help before running it.`,
 	}
 	cmd.AddCommand(newDoctorDivergenceCmd(), newDoctorRepairOwnerCmd(), newDoctorMachineTypesCmd(),
-		newDoctorVMUUIDsCmd(), newDoctorFenceCmd(), newDoctorCPUModeCmd())
+		newDoctorVMUUIDsCmd(), newDoctorFenceCmd(), newDoctorCPUModeCmd(), newDoctorPrivilegedContainersCmd())
 	return cmd
 }
 

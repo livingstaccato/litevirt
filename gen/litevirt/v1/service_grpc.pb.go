@@ -174,6 +174,7 @@ const (
 	LiteVirt_DeleteContainerSnapshot_FullMethodName    = "/litevirt.v1.LiteVirt/DeleteContainerSnapshot"
 	LiteVirt_ConvertContainerToTemplate_FullMethodName = "/litevirt.v1.LiteVirt/ConvertContainerToTemplate"
 	LiteVirt_CloneContainer_FullMethodName             = "/litevirt.v1.LiteVirt/CloneContainer"
+	LiteVirt_ConvertContainer_FullMethodName           = "/litevirt.v1.LiteVirt/ConvertContainer"
 	LiteVirt_GetVMStats_FullMethodName                 = "/litevirt.v1.LiteVirt/GetVMStats"
 	LiteVirt_GetHostStats_FullMethodName               = "/litevirt.v1.LiteVirt/GetHostStats"
 	LiteVirt_GetClusterStatus_FullMethodName           = "/litevirt.v1.LiteVirt/GetClusterStatus"
@@ -559,6 +560,7 @@ type LiteVirtClient interface {
 	DeleteContainerSnapshot(ctx context.Context, in *DeleteContainerSnapshotRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	ConvertContainerToTemplate(ctx context.Context, in *ConvertContainerToTemplateRequest, opts ...grpc.CallOption) (*Container, error)
 	CloneContainer(ctx context.Context, in *CloneContainerRequest, opts ...grpc.CallOption) (*Container, error)
+	ConvertContainer(ctx context.Context, in *ConvertContainerRequest, opts ...grpc.CallOption) (*Container, error)
 	// ── Stats ──
 	GetVMStats(ctx context.Context, in *GetVMStatsRequest, opts ...grpc.CallOption) (*VMStats, error)
 	GetHostStats(ctx context.Context, in *GetHostStatsRequest, opts ...grpc.CallOption) (*HostResourceStats, error)
@@ -2647,6 +2649,16 @@ func (c *liteVirtClient) CloneContainer(ctx context.Context, in *CloneContainerR
 	return out, nil
 }
 
+func (c *liteVirtClient) ConvertContainer(ctx context.Context, in *ConvertContainerRequest, opts ...grpc.CallOption) (*Container, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Container)
+	err := c.cc.Invoke(ctx, LiteVirt_ConvertContainer_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) GetVMStats(ctx context.Context, in *GetVMStatsRequest, opts ...grpc.CallOption) (*VMStats, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(VMStats)
@@ -4347,6 +4359,7 @@ type LiteVirtServer interface {
 	DeleteContainerSnapshot(context.Context, *DeleteContainerSnapshotRequest) (*emptypb.Empty, error)
 	ConvertContainerToTemplate(context.Context, *ConvertContainerToTemplateRequest) (*Container, error)
 	CloneContainer(context.Context, *CloneContainerRequest) (*Container, error)
+	ConvertContainer(context.Context, *ConvertContainerRequest) (*Container, error)
 	// ── Stats ──
 	GetVMStats(context.Context, *GetVMStatsRequest) (*VMStats, error)
 	GetHostStats(context.Context, *GetHostStatsRequest) (*HostResourceStats, error)
@@ -5161,6 +5174,9 @@ func (UnimplementedLiteVirtServer) ConvertContainerToTemplate(context.Context, *
 }
 func (UnimplementedLiteVirtServer) CloneContainer(context.Context, *CloneContainerRequest) (*Container, error) {
 	return nil, status.Error(codes.Unimplemented, "method CloneContainer not implemented")
+}
+func (UnimplementedLiteVirtServer) ConvertContainer(context.Context, *ConvertContainerRequest) (*Container, error) {
+	return nil, status.Error(codes.Unimplemented, "method ConvertContainer not implemented")
 }
 func (UnimplementedLiteVirtServer) GetVMStats(context.Context, *GetVMStatsRequest) (*VMStats, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetVMStats not implemented")
@@ -8139,6 +8155,24 @@ func _LiteVirt_CloneContainer_Handler(srv interface{}, ctx context.Context, dec 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_ConvertContainer_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ConvertContainerRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ConvertContainer(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ConvertContainer_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ConvertContainer(ctx, req.(*ConvertContainerRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LiteVirt_GetVMStats_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetVMStatsRequest)
 	if err := dec(in); err != nil {
@@ -10969,6 +11003,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "CloneContainer",
 			Handler:    _LiteVirt_CloneContainer_Handler,
+		},
+		{
+			MethodName: "ConvertContainer",
+			Handler:    _LiteVirt_ConvertContainer_Handler,
 		},
 		{
 			MethodName: "GetVMStats",

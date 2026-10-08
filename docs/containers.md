@@ -351,6 +351,15 @@ restrictive cap there is, so it is read as finite rather than rejected or
 treated as unlimited. Reading it as unlimited would flag the container as
 uncapped, which trips the uncapped gate and blocks new admission on the host.
 
+Every container also gets a **pids limit** (`lxc.cgroup2.pids.max`),
+`containers.default_pids_max` (4096) unless its config already sets one. A new
+container gets it at create. An **existing container gets it at its next
+start**, and only then: the daemon never changes a running container's limits,
+and a container whose config already sets `pids.max` keeps its own value. `0`
+turns the default off. The `cpu`/`memory` limits are cgroup v2 `cpu.max` and
+`memory.max`; the v1 keys beside them are ignored on a unified host (LXC warns
+"Ignoring legacy cgroup limits").
+
 A container created by an earlier release keeps the cgroup limits it was created
 with until it is recreated (a compose update, a restore, a relocation or a
 clone writes a fresh config): those releases wrote `cpu.max` as `N*1000 100000`,
@@ -465,6 +474,72 @@ How it works and what to expect:
   it: restore onto another host (`--host`) to keep both.
 - **Quota.** A container's backup footprint draws down the **same `backup_gib`
   project budget** as VM backups.
+
+## Security
+
+A new container is **unprivileged** and **confined** by default.
+
+- **Unprivileged.** It gets a range of 65536 host ids of its own
+  (`lxc.idmap = u 0 <base> 65536`, and `g` likewise): root in the container is
+  an unprivileged id on the host. Ranges come from `containers.idmap_base` /
+  `containers.idmap_ranges` and are allocated **cluster-wide without overlap**:
+  a create avoids every range any container row in the cluster records, every
+  range this host handed out in the last day (a host-local ledger, for creates
+  still in flight or rows still replicating), and every range a container on
+  this host's disk is configured with. Hosts start their search at different
+  points, so two hosts allocating at the same instant almost never collide; if
+  they do and a migrate later brings both containers to one host, `lv ct start`
+  refuses the second with `lv ct convert --unprivileged <name>` as the fix.
+- **The rootfs is mapped**, by an idmapped mount (`lxc.rootfs.options =
+  idmap=container`) where the host supports one (`containers.idmapped_rootfs`),
+  otherwise by shifting every file into the range at create: owner and group,
+  POSIX ACL entries, and file capabilities (re-rooted as v3). setuid and setgid
+  bits are kept. A container mapped by a mount that later starts on a host
+  without idmapped mounts (a migrate) is shifted at that start.
+- **Confinement `default`**: LXC's generated AppArmor profile with nesting off,
+  LXC's common seccomp policy, and the standard capability drop list
+  (`mac_admin mac_override sys_time sys_module sys_rawio`), written explicitly in
+  a litevirt-owned block of the container's config rather than left to the
+  template or its includes. An unprivileged container also includes LXC's
+  `userns.conf` (before the drop list, which it would otherwise reset).
+
+The opt-outs restore what earlier releases did, and are the **Admin's**:
+
+```bash
+lv ct create build --privileged                 # no user namespace
+lv ct create dind  --confinement legacy         # AppArmor nesting allowed, template seccomp/caps
+```
+
+Compose takes the same per workload (`privileged: true`, `confinement: legacy`),
+so a stack that needs them says so; deploying it then needs the Admin role.
+
+**Existing containers keep their settings.** A container created before this
+release is privileged with legacy confinement and keeps running exactly as it
+is; nothing rewrites its config. `lv ct inspect <name>` shows a container's
+privilege mode, range and confinement, and `lv doctor privileged-containers`
+lists every privileged or legacy-confined one. To move one over, stop it and:
+
+```bash
+lv ct convert web --unprivileged --confinement default
+```
+
+The convert runs offline on the owning host. It shifts the rootfs into a fresh
+range in place — nothing is copied or deleted — then rewrites the config's
+security block and records the new settings. A marker in the container's
+directory is written first and removed last, so a convert that is interrupted
+(a crash, a full disk) leaves a container that `lv ct start` refuses until the
+same convert is run again, which finishes the job (it only moves ids still in
+the old range). `--confinement` alone changes the profile and touches no file;
+`--confinement legacy` is the Admin's.
+
+**Every move keeps the mode.** Migrate, backup, restore and host-loss
+relocation carry the container's config — and so its range and confinement —
+unchanged; a relocation recreate rebuilds the same range and profile from the
+create spec, and one from an earlier release is recreated privileged and
+legacy, as it was. A clone keeps its source's mode: an unprivileged source's
+clone is moved to a fresh range of its own, a privileged one stays privileged.
+An operator restore of an unprivileged backup whose range another live
+container now holds (its original still exists) is moved to a fresh range.
 
 ## Owner records
 

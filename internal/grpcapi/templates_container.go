@@ -11,6 +11,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/lxc"
 	"github.com/litevirt/litevirt/internal/randid"
 	"github.com/litevirt/litevirt/internal/tenancy"
 )
@@ -197,6 +198,24 @@ func (s *Server) CloneContainer(ctx context.Context, req *pb.CloneContainerReque
 		s.audit(ctx, "ct.clone", req.Target, "project="+project+" source="+req.Source, "error")
 		return nil, status.Errorf(codes.Internal, "clone: %v", err)
 	}
+	// The clone keeps its source's privilege mode exactly. An unprivileged
+	// source's copy carries the source's range; the clone is another
+	// container, so it moves to a fresh range of its own.
+	cloneBase := corrosion.DecodeCreateSpec(src.CreateSpec).IDMapBase
+	if cloneBase != 0 {
+		sc, ok := s.containerRuntime.(containerSecurer)
+		b, aerr := s.allocateIDMapBase(ctx, req.Target)
+		if aerr == nil && ok {
+			aerr = sc.ConvertContainerSecurity(ctx, req.Target, lxc.ConvertOpts{IDMap: &lxc.IDMap{Base: b, Size: lxc.IDMapSize}})
+		}
+		if aerr != nil {
+			if delErr := s.containerRuntime.DeleteContainer(ctx, req.Target); delErr != nil {
+				slog.Warn("container clone: cleanup after the range move failed also failed", "name", req.Target, "error", delErr)
+			}
+			return nil, status.Errorf(codes.Internal, "clone: move the clone to its own id range: %v", aerr)
+		}
+		cloneBase = b
+	}
 
 	now := time.Now().UTC().Format(time.RFC3339)
 	// Rebuild the clone's MANAGED NIC identity (fresh deterministic MAC+veth, a
@@ -210,6 +229,7 @@ func (s *Server) CloneContainer(ctx context.Context, req *pb.CloneContainerReque
 	// A clone is a new lineage, with its own owner record (the copied
 	// directory carried the source's).
 	cloneSpec.OwnerID = randid.New()
+	cloneSpec.IDMapBase = cloneBase
 	s.stampContainerOwner(req.Target, project, corrosion.EncodeCreateSpec(cloneSpec))
 	rec := corrosion.ContainerRecord{
 		HostName: s.hostName, Name: req.Target, State: "stopped",

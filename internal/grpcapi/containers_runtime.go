@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"io"
 
 	"github.com/litevirt/litevirt/internal/lxc"
@@ -24,11 +25,16 @@ func (a *LXCRuntimeAdapter) CreateContainer(ctx context.Context, opts CreateCont
 	for _, n := range opts.Networks {
 		nics = append(nics, lxc.NetworkAttach{Name: n.Name, Bridge: n.Bridge, IP: n.IP, MAC: n.MAC, Veth: n.Veth, Gateway: n.Gateway})
 	}
+	var idmap *lxc.IDMap
+	if opts.IDMapBase != 0 {
+		idmap = &lxc.IDMap{Base: opts.IDMapBase, Size: lxc.IDMapSize}
+	}
 	c, err := a.Inner.Create(ctx, lxc.CreateOpts{
 		Name: opts.Name, Template: opts.Template,
 		Distro: opts.Distro, Release: opts.Release, Arch: opts.Arch,
 		CPULimit: opts.CPULimit, MemoryMiB: opts.MemoryMiB,
 		Network: nics, Labels: opts.Labels,
+		Confinement: opts.Confinement, IDMap: idmap,
 	})
 	if err != nil {
 		return nil, err
@@ -126,4 +132,20 @@ func (a *LXCRuntimeAdapter) ReadOwner(name string) (*lxc.ContainerOwner, error) 
 		return st.ReadOwner(name)
 	}
 	return nil, nil
+}
+
+// ContainerSecurity / ConvertContainerSecurity pass through to a runtime that
+// keeps container security in its config (lxc.Securer).
+func (a *LXCRuntimeAdapter) ContainerSecurity(name string) (lxc.Security, error) {
+	if sc, ok := a.Inner.(lxc.Securer); ok {
+		return sc.Security(name)
+	}
+	return lxc.Security{}, errors.New("this container runtime keeps no security settings")
+}
+
+func (a *LXCRuntimeAdapter) ConvertContainerSecurity(ctx context.Context, name string, to lxc.ConvertOpts) error {
+	if sc, ok := a.Inner.(lxc.Securer); ok {
+		return sc.Convert(ctx, name, to)
+	}
+	return errors.New("this container runtime cannot convert a container")
 }

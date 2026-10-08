@@ -1014,6 +1014,19 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	// directory, whose own record may be the source host's or absent.
 	spec.CreateSpec = withOwnerID(spec.CreateSpec)
 	s.stampContainerOwner(req.Name, project, spec.CreateSpec)
+	// An operator restore is a new container beside whatever still holds the
+	// backed-up range; a migrate or relocation is the same container moving.
+	if !s.isPeerRelocation(ctx, req.Proof != nil) && s.migrateSourceFromPeer(ctx) == "" {
+		remapped, rerr := s.remapRestoredRange(ctx, req.Name, spec.CreateSpec)
+		if rerr != nil {
+			if delErr := s.containerRuntime.DeleteContainer(ctx, req.Name); delErr != nil {
+				slog.Warn("container restore: cleanup after the range move failed also failed", "name", req.Name, "error", delErr)
+			}
+			s.removeRestoreMarker(req.Name)
+			return rerr
+		}
+		spec.CreateSpec = remapped
+	}
 	stateDetail := ""
 	if !req.Start {
 		stateDetail = spec.StateDetail

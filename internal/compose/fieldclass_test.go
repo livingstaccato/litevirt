@@ -23,6 +23,8 @@ import (
 var vmFieldClass = map[string]string{
 	"Extends":         "ignored: service inheritance, resolved before planning",
 	"Kind":            "recreate: a runtime change forces delete+create",
+	"Privileged":      "ignored: container security is set at create; an existing container keeps it until lv ct convert (never a recreate, which would lose its state)",
+	"Confinement":     "ignored: container security is set at create; an existing container keeps it until lv ct convert (never a recreate, which would lose its state)",
 	"Image":           "recreate: image change alters VM identity",
 	"ISO":             "recreate: boot-media change alters VM identity",
 	"Firmware":        "restart: firmware bakes into domain XML",

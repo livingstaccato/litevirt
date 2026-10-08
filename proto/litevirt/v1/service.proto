@@ -1126,6 +1126,11 @@ message Container {
     RestartPolicy restart = 9;   // auto-restart policy (nil/condition="none" = never)
     string state_detail = 10;    // stop cause / intent, e.g. "operator-stop"
     string project      = 11;    // tenancy bucket (default "_default")
+    // Security as recorded at create or convert. A container an earlier build
+    // created records none, and is privileged with legacy confinement.
+    bool privileged     = 12;
+    string confinement  = 13;    // "default" | "legacy"
+    int64 idmap_base    = 14;    // first host id of its range (unprivileged only)
 }
 
 message ContainerNetwork {
@@ -1158,6 +1163,25 @@ message CreateContainerRequest {
     string project   = 13;       // tenancy bucket (default "_default")
     string on_host_failure = 14; // host-loss relocation policy: ''/'none' | 'image-recreate'
     string idempotency_key = 15; // same-entry-node retry key (see CreateVMRequest.idempotency_key)
+    // privileged creates the container without a user namespace, as earlier
+    // builds did. Admin only. The default is unprivileged: a range of its own.
+    bool privileged = 16;
+    // confinement is "default" (LXC's generated AppArmor profile without
+    // nesting, its common seccomp policy and the standard capability drop
+    // list) or "legacy" (the generated profile with nesting, as earlier
+    // builds wrote; admin only). Empty means "default".
+    string confinement = 17;
+}
+
+// ConvertContainerRequest changes a STOPPED container's security settings in
+// place (lv ct convert). unprivileged moves a privileged container into an id
+// range of its own (or an unprivileged one into a fresh range); confinement
+// sets "default" or "legacy" (admin only). An empty field keeps the setting.
+message ConvertContainerRequest {
+    string host_name = 1;
+    string name = 2;
+    bool unprivileged = 3;
+    string confinement = 4;
 }
 
 message StartContainerRequest  { string host_name = 1; string name = 2; }
@@ -3363,6 +3387,7 @@ service LiteVirt {
     rpc DeleteContainerSnapshot(DeleteContainerSnapshotRequest) returns (google.protobuf.Empty);
     rpc ConvertContainerToTemplate(ConvertContainerToTemplateRequest) returns (Container);
     rpc CloneContainer(CloneContainerRequest)                         returns (Container);
+    rpc ConvertContainer(ConvertContainerRequest)                     returns (Container);
 
     // ── Stats ──
     rpc GetVMStats(GetVMStatsRequest)       returns (VMStats);

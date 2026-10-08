@@ -59,6 +59,9 @@ func (s *Server) buildContainerRequest(ctx context.Context, instanceName string,
 		Labels:    labels,
 		Image:     d.Image,
 		Arch:      "amd64",
+		// Security opt-outs; CreateContainer holds them to the Admin role.
+		Privileged:  d.Privileged,
+		Confinement: d.Confinement,
 	}
 
 	switch {

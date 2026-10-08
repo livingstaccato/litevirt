@@ -339,6 +339,13 @@ func (c *ContainerChecker) recreateRelocated(ctx context.Context, ct corrosion.C
 		opts.Template = spec.Template
 		opts.Distro, opts.Release, opts.Arch = spec.Distro, spec.Release, spec.Arch
 	}
+	// The same privilege mode and confinement: the recorded range (cluster-
+	// unique, so it is still this container's) and profile. Neither recorded
+	// is a container an earlier build created, recreated as it was.
+	opts.Confinement = spec.Confinement
+	if spec.IDMapBase != 0 {
+		opts.IDMap = &lxc.IDMap{Base: spec.IDMapBase, Size: lxc.IDMapSize}
+	}
 	// The template is a host path the recreating host reads, judged here by
 	// the same backstop the create's reading host applied: a protected place
 	// is refused whoever created the container. The row stays pending, so an

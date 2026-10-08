@@ -56,6 +56,10 @@ type fakeCTRuntime struct {
 	runState map[string]string
 	// owners is the on-disk owner record per container (lxc.OwnerStamper).
 	owners map[string]lxc.ContainerOwner
+	// security is each container's config security (containerSecurer);
+	// converts records ConvertContainerSecurity calls.
+	security map[string]lxc.Security
+	converts []fakeConvert
 
 	// B0 day-2 primitives: rootfs path a test wants returned, plus freeze/unfreeze
 	// call tracking so backup/snapshot tests can assert quiesce + unfreeze.
@@ -298,6 +302,38 @@ func (f *fakeCTRuntime) CloneContainer(_ context.Context, src, dst string) error
 	return nil
 }
 func (f *fakeCTRuntime) ListContainers(_ context.Context) ([]string, error) { return f.listNames, nil }
+
+type fakeConvert struct {
+	name string
+	to   lxc.ConvertOpts
+}
+
+func (f *fakeCTRuntime) ContainerSecurity(name string) (lxc.Security, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if sec, ok := f.security[name]; ok {
+		return sec, nil
+	}
+	return lxc.Security{Confinement: lxc.ConfinementLegacy}, nil
+}
+
+func (f *fakeCTRuntime) ConvertContainerSecurity(_ context.Context, name string, to lxc.ConvertOpts) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.converts = append(f.converts, fakeConvert{name, to})
+	if f.security == nil {
+		f.security = map[string]lxc.Security{}
+	}
+	sec := f.security[name]
+	if to.IDMap != nil {
+		sec.IDMap = to.IDMap
+	}
+	if to.Confinement != "" {
+		sec.Confinement = to.Confinement
+	}
+	f.security[name] = sec
+	return nil
+}
 
 // StampOwner / ReadOwner make the fake an lxc.OwnerStamper.
 func (f *fakeCTRuntime) StampOwner(name string, o lxc.ContainerOwner) error {

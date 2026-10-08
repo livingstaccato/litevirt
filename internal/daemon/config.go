@@ -162,6 +162,9 @@ type Config struct {
 	// than a real rootfs restore.
 	ContainerRestoreTimeoutSec int `yaml:"container_restore_timeout_sec"`
 
+	// Containers holds the defaults new and restarted containers get.
+	Containers ContainersConfig `yaml:"containers"`
+
 	// Split-brain Phase 2 — minority VIP self-demotion. Both are seconds, consumed as
 	// time.Duration. An isolated (quorum-lost) LB host drops its own VIP so keepalived
 	// stops answering on the wrong side of a partition:
@@ -225,6 +228,48 @@ type Config struct {
 
 	// Version is set at startup from build-time ldflags (not from config file).
 	Version string `yaml:"-"`
+}
+
+// ContainersConfig is the container security and limit defaults.
+type ContainersConfig struct {
+	// DefaultPidsMax is the cgroup v2 pids.max a container gets when its
+	// config sets none: a new container at create, an existing one at its
+	// next start (never a running one). 0 sets none. Default 4096.
+	DefaultPidsMax int `yaml:"default_pids_max"`
+	// IDMapBase and IDMapRanges are where unprivileged containers' id ranges
+	// come from: IDMapRanges ranges of 65536 host ids from IDMapBase. Ranges
+	// are allocated cluster-wide, so both MUST be the same on every node.
+	// Defaults 1000000000 and 30000.
+	IDMapBase   int64 `yaml:"idmap_base"`
+	IDMapRanges int   `yaml:"idmap_ranges"`
+	// IDMappedRootfs is how an unprivileged container's rootfs is mapped:
+	// "auto" (an idmapped mount where this host supports one, otherwise its
+	// files are shifted into the range), "on" or "off". Default "auto".
+	IDMappedRootfs string `yaml:"idmapped_rootfs"`
+}
+
+// validate refuses container defaults that cannot work.
+func (c ContainersConfig) validate() error {
+	switch c.IDMappedRootfs {
+	case "auto", "on", "off":
+	default:
+		return fmt.Errorf("config containers.idmapped_rootfs: %q, want auto, on or off", c.IDMappedRootfs)
+	}
+	if c.DefaultPidsMax < 0 {
+		return fmt.Errorf("config containers.default_pids_max: %d is negative (0 sets none)", c.DefaultPidsMax)
+	}
+	if c.IDMapRanges <= 0 {
+		return fmt.Errorf("config containers.idmap_ranges: %d, want at least 1", c.IDMapRanges)
+	}
+	// The ranges must leave the host's own ids (0-65535) alone and fit in 32
+	// bits (4294967295 is the kernel's invalid id).
+	if c.IDMapBase < 65536 {
+		return fmt.Errorf("config containers.idmap_base: %d overlaps the host's own ids; use 65536 or more", c.IDMapBase)
+	}
+	if end := c.IDMapBase + int64(c.IDMapRanges)*65536; end > 4294967295 {
+		return fmt.Errorf("config containers.idmap_base + idmap_ranges*65536 = %d, past the 32-bit id space", end)
+	}
+	return nil
 }
 
 // NetBoxConfig configures the external NetBox IPAM integration. Default off.
@@ -720,6 +765,8 @@ func LoadConfig() (*Config, error) {
 
 		ContainerRestoreTimeoutSec: 600,
 
+		Containers: ContainersConfig{DefaultPidsMax: 4096, IDMapBase: 1_000_000_000, IDMapRanges: 30000, IDMappedRootfs: "auto"},
+
 		QuorumLossDemoteAfterSec: 12,
 		KeepalivedStopTimeoutSec: 3,
 		NoQuorumVIPPolicy:        "safe",
@@ -743,6 +790,10 @@ func LoadConfig() (*Config, error) {
 	}
 
 	if err := normalizeAdvertiseAddress(cfg); err != nil {
+		return nil, err
+	}
+
+	if err := cfg.Containers.validate(); err != nil {
 		return nil, err
 	}
 

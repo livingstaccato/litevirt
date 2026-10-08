@@ -239,6 +239,10 @@ can't run them. Image forms: `kind: lxc` takes a download template (`image:
 today (`lv ct pull <ref> --dest <name>`, then set `image:` to the library item
 `<data_dir>/oci/<name>`; any other rootfs path is a host path the deploying
 caller needs the Admin role to name — see "Host paths a container is given" in
+[containers.md](containers.md)). A container workload may set `privileged: true` (no user namespace) and
+`confinement: legacy` (AppArmor nesting, the template's seccomp and
+capabilities); deploying either needs the Admin role, and changing either on a
+deployed container changes nothing until `lv ct convert` (see "Security" in
 [containers.md](containers.md)). Each container is given its own copy of the rootfs, so one pull backs any
 number of containers and `compose down` leaves the pulled template untouched.
 Remaining follow-ups: OCI registry-ref auto-pull; in-place reconfigure

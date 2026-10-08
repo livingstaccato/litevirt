@@ -428,6 +428,19 @@ func (v *validator) validate(f *File) {
 		}
 	}
 
+	// Container security opt-outs are container-only, with known values.
+	for _, baseName := range sortedKeys(f.VMs) {
+		vm := f.VMs[baseName]
+		if !vm.IsContainer() && (vm.Privileged || vm.Confinement != "") {
+			v.ps.add(v.vm(baseName), "privileged and confinement apply to containers only (kind: lxc or oci)", "")
+		}
+		switch vm.Confinement {
+		case "", "default", "legacy":
+		default:
+			v.ps.add(v.vm(baseName), fmt.Sprintf("confinement %q: want default or legacy", vm.Confinement), "")
+		}
+	}
+
 	// Collect all instance names to detect collisions with internal
 	// temp naming conventions (e.g. "-next" suffix for cutover) (#46).
 	allInstanceNames := map[string]string{} // instanceName → baseName

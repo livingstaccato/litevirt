@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/qcow2"
 )
 
 // errReachedImageStore ends a start's chain walk at an image-store base.
@@ -32,6 +33,18 @@ var errReachedImageStore = errors.New("reached an image-store base")
 // (diskChain.judge).
 func (s *Server) verifyDiskChainForStart(ctx context.Context, vm *corrosion.VMRecord, d corrosion.DiskRecord, file string) error {
 	if fi, err := os.Stat(file); err != nil || !fi.Mode().IsRegular() {
+		return nil
+	}
+	// A VM booted by a live restore that is not localized yet backs on the
+	// restore's NBD export, which qemu reconnects to: admitted exactly when
+	// this disk's own file is the overlay that restore made and recorded,
+	// naming that export (the header itself judged as every layer is). No
+	// other protocol backing is.
+	if info, err := qcow2.Info(file); err == nil && looksLikeProtocol(info.BackingFile) && s.liveRestoreExportOf(file, info.BackingFile) {
+		if err := precheckQcow2Header(file); err != nil {
+			return status.Errorf(codes.FailedPrecondition,
+				"disk %q of %q (%s) cannot be started: %v", d.DiskName, vm.Name, filepath.Base(file), err)
+		}
 		return nil
 	}
 	// The chain is judged down to an image-store base; the base and the

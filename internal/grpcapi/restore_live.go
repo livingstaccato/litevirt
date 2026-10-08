@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
 
 	"google.golang.org/grpc"
@@ -132,6 +133,11 @@ func (s *Server) RestoreLive(req *pb.RestoreLiveRequest, stream grpc.ServerStrea
 		}
 		return status.Errorf(codes.Internal, "create overlay qcow2: %v", err)
 	}
+	// Recorded for as long as the export is served: a VM booted on the
+	// overlay restarts against it, as qemu reconnects, until it is localized.
+	if done := s.recordLiveRestoreExport(target, nbdURL); done != nil {
+		defer done()
+	}
 
 	if err := stream.Send(&pb.RestoreLiveProgress{
 		Phase:      pb.RestoreLiveProgress_READY,
@@ -179,4 +185,40 @@ func (s *Server) RestoreLive(req *pb.RestoreLiveRequest, stream grpc.ServerStrea
 		Status: "operator closed the stream — NBD server stopping",
 	})
 	return nil
+}
+
+// liveRestoreExport is a running live restore's overlay (its file, as created)
+// and the NBD export the overlay's header names.
+type liveRestoreExport struct {
+	url  string
+	file os.FileInfo
+}
+
+// recordLiveRestoreExport records that the overlay at target is served by the
+// export url, and returns what forgets it (nil when the overlay cannot be
+// identified, which records nothing).
+func (s *Server) recordLiveRestoreExport(target, url string) func() {
+	key := resolvedOr(target)
+	fi, err := os.Lstat(key)
+	if err != nil || !fi.Mode().IsRegular() {
+		return nil
+	}
+	rec := liveRestoreExport{url: url, file: fi}
+	s.liveRestoreExports.Store(key, rec)
+	return func() { s.liveRestoreExports.CompareAndDelete(key, rec) }
+}
+
+// liveRestoreExportOf reports whether file (a VM disk's own file on this
+// host) is the overlay of a live restore this process is serving right now,
+// still the file it created, whose header names exactly that restore's
+// export as its backing.
+func (s *Server) liveRestoreExportOf(file, backing string) bool {
+	key := resolvedOr(file)
+	v, ok := s.liveRestoreExports.Load(key)
+	if !ok {
+		return false
+	}
+	rec := v.(liveRestoreExport)
+	fi, err := os.Lstat(key)
+	return err == nil && os.SameFile(fi, rec.file) && backing == rec.url
 }

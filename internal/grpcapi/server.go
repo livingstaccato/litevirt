@@ -530,6 +530,11 @@ type Server struct {
 	// all shared one sweep" a fact the test establishes rather than races for.
 	leaseBarrierJoined func()
 
+	// liveRestoreExports records, for each overlay a running RestoreLive made
+	// (by its resolved path), the NBD export it serves the overlay from — the
+	// one protocol backing a start admits (liveRestoreExportOf).
+	liveRestoreExports sync.Map // string → liveRestoreExport
+
 	// peerClientOverride is a test seam for the PR-4 peer backup/restore streaming
 	// helpers (dialPeer): when non-nil it returns a fake LiteVirtClient + closer
 	// instead of dialing a real peer over mTLS, so the owner→sink push path is

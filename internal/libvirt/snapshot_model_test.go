@@ -43,6 +43,13 @@ type libvirt10 struct {
 	current string
 	saved   map[string]string // vmstate path → domain XML it restores
 	unlinks []string          // files the model's libvirt unlinked
+	// touched is every file a delete wrote into or removed: the overlay a
+	// merge committed and removed, the base it committed into, the disk an
+	// unmerged delete unlinked.
+	touched []string
+	// refuseCurrent makes a REDEFINE with VIR_DOMAIN_SNAPSHOT_CREATE_CURRENT
+	// fail, as a libvirt that will not take it would.
+	refuseCurrent bool
 }
 
 type modelDomain struct {
@@ -64,6 +71,13 @@ var _ snapshotAPI = (*libvirt10)(nil)
 // qcow2 root disk.
 func newLibvirt10(t *testing.T) *libvirt10 {
 	t.Helper()
+	return newLibvirt10Disks(t, 1)
+}
+
+// newLibvirt10Disks is newLibvirt10 with n disks: vda on vm-root.qcow2,
+// then vdb, vdc, ... on vm-dataN.qcow2.
+func newLibvirt10Disks(t *testing.T, n int) *libvirt10 {
+	t.Helper()
 	for _, bin := range []string{"qemu-img", "qemu-io"} {
 		if _, err := exec.LookPath(bin); err != nil {
 			t.Skipf("%s not installed", bin)
@@ -73,11 +87,22 @@ func newLibvirt10(t *testing.T) *libvirt10 {
 	revertUndefinePoll, revertUndefineSettle = 0, 0
 	t.Cleanup(func() { revertUndefinePoll, revertUndefineSettle = oldPoll, oldSettle })
 	dir := t.TempDir()
-	root := filepath.Join(dir, "vm-root.qcow2")
-	run(t, "qemu-img", "create", "-q", "-f", "qcow2", root, "4M")
+	disks := map[string]string{}
+	for i := 0; i < n; i++ {
+		f := filepath.Join(dir, "vm-root.qcow2")
+		if i > 0 {
+			f = filepath.Join(dir, fmt.Sprintf("vm-data%d.qcow2", i))
+		}
+		run(t, "qemu-img", "create", "-q", "-f", "qcow2", f, "4M")
+		disks[string(rune('a'+i))] = f
+	}
+	devs := map[string]string{}
+	for k, f := range disks {
+		devs["vd"+k] = f
+	}
 	return &libvirt10{
 		t: t, dir: dir,
-		dom:   &modelDomain{name: "vm", disks: map[string]string{"vda": root}, state: golibvirt.DomainRunning, persistent: true},
+		dom:   &modelDomain{name: "vm", disks: devs, state: golibvirt.DomainRunning, persistent: true},
 		snaps: map[string]*modelSnap{},
 		saved: map[string]string{},
 	}
@@ -380,6 +405,9 @@ func (m *libvirt10) DomainSnapshotCreateXML(dom golibvirt.Domain, x string, flag
 		if s == nil || s.name == "" {
 			return golibvirt.DomainSnapshot{}, fmt.Errorf("XML error: bad snapshot")
 		}
+		if flags&uint32(golibvirt.DomainSnapshotCreateCurrent) != 0 && m.refuseCurrent {
+			return golibvirt.DomainSnapshot{}, fmt.Errorf("unsupported flags (0x3) in function qemuSnapshotCreateXML")
+		}
 		m.snaps[s.name] = s
 		if flags&uint32(golibvirt.DomainSnapshotCreateCurrent) != 0 {
 			m.current = s.name
@@ -456,6 +484,7 @@ func (m *libvirt10) DomainSnapshotDelete(snap golibvirt.DomainSnapshot, flags go
 			}
 			_ = os.Remove(s.bases[dev])
 			m.unlinks = append(m.unlinks, s.bases[dev])
+			m.touched = append(m.touched, s.bases[dev])
 		}
 		delete(m.snaps, s.name)
 		return nil
@@ -497,6 +526,7 @@ func (m *libvirt10) DomainSnapshotDelete(snap golibvirt.DomainSnapshot, flags go
 		if err := os.Remove(mg.ov); err != nil {
 			return err
 		}
+		m.touched = append(m.touched, mg.ov, mg.base)
 		for _, c := range kids {
 			c.bases[mg.dev] = mg.base
 		}
@@ -598,4 +628,27 @@ func (m *libvirt10) stopAndStart() error {
 		}
 	}
 	return startDomain(m, "vm")
+}
+
+func (m *libvirt10) activeOf(dev string) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.dom == nil {
+		m.t.Fatal("the domain is gone")
+	}
+	return m.dom.disks[dev]
+}
+
+// writeOn and hasOn are write and has on disk dev.
+func (m *libvirt10) writeOn(dev string, pattern byte, off int) {
+	m.t.Helper()
+	run(m.t, "qemu-io", "-f", "qcow2", "-c", fmt.Sprintf("write -P 0x%02x %dM 64k", pattern, off), m.activeOf(dev))
+}
+
+func (m *libvirt10) hasOn(dev string, pattern byte, off int) bool {
+	m.t.Helper()
+	out, err := exec.Command("qemu-io", "-r", "-f", "qcow2", "-c",
+		fmt.Sprintf("read -P 0x%02x %dM 64k", pattern, off), m.activeOf(dev)).CombinedOutput()
+	return err == nil && !strings.Contains(string(out), "Pattern verification failed") &&
+		!strings.Contains(string(out), "Could not open")
 }

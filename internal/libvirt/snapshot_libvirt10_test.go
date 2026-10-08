@@ -2,6 +2,7 @@ package libvirt
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 
 	golibvirt "github.com/digitalocean/go-libvirt"
@@ -40,10 +41,32 @@ func (m *libvirt10) revertLive(name, save string) {
 	}
 }
 
+// rm deletes the snapshot as litevirt does, and checks the files the
+// delete wrote into or removed are among those SnapshotDiskFiles named
+// before it — the files DeleteSnapshot's guard (b) asks other VMs about.
 func (m *libvirt10) rm(name string) {
 	m.t.Helper()
+	files, ferr := snapshotDiskFiles(m, "vm", name)
+	if ferr != nil {
+		m.t.Fatalf("SnapshotDiskFiles %s: %v", name, ferr)
+	}
+	m.mu.Lock()
+	before := len(m.touched)
+	m.mu.Unlock()
 	if err := deleteSnapshot(m, "vm", name); err != nil {
 		m.t.Fatalf("delete %s: %v", name, err)
+	}
+	m.mu.Lock()
+	touched := append([]string(nil), m.touched[before:]...)
+	m.mu.Unlock()
+	named := map[string]bool{}
+	for _, f := range files {
+		named[f] = true
+	}
+	for _, f := range touched {
+		if !named[f] {
+			m.t.Errorf("delete %s touched %s, which SnapshotDiskFiles (%v) did not name: guard (b) would not ask who backs on it", name, f, files)
+		}
 	}
 	if _, err := m.DomainSnapshotLookupByName(golibvirt.Domain{Name: "vm"}, name, 0); err == nil {
 		m.t.Fatalf("snapshot %s is still defined after its delete", name)
@@ -265,5 +288,81 @@ func TestSnapshotDiskFiles_OverlayAndBase(t *testing.T) {
 	}
 	if got, _ := snapshotDiskFiles(m, "vm", "s1"); len(got) != 2 || got[0] != root || got[1] != s1 {
 		t.Fatalf("files of s1 = %v, want [%s %s]", got, root, s1)
+	}
+}
+
+// Scenario 1 and the minimal case on a VM with two disks: every disk's
+// overlay is merged into its own base, and both disks keep their data.
+func TestSnapshotDelete_MultiDisk(t *testing.T) {
+	t.Run("scenario 1", func(t *testing.T) {
+		m := newLibvirt10Disks(t, 2)
+		roots := map[string]string{"vda": m.activeOf("vda"), "vdb": m.activeOf("vdb")}
+		m.memorySnapshot("m1")
+		m.writeOn("vda", markA, 1)
+		m.writeOn("vdb", markA, 1)
+		save := m.memorySnapshot("m2")
+		m.writeOn("vda", markB, 2)
+		m.writeOn("vdb", markB, 2)
+		m.revertLive("m2", save)
+		m.rm("m1")
+		m.rm("m2")
+		m.requireWhole(map[byte]bool{markA: true, markB: false})
+		for dev, root := range roots {
+			if got := m.activeOf(dev); got != root {
+				t.Errorf("%s is on %s, want merged back onto %s", dev, got, root)
+			}
+			if !m.hasOn(dev, markA, 1) || m.hasOn(dev, markB, 2) {
+				t.Errorf("%s: A present=%v B present=%v, want A only", dev, m.hasOn(dev, markA, 1), m.hasOn(dev, markB, 2))
+			}
+		}
+	})
+	t.Run("minimal", func(t *testing.T) {
+		m := newLibvirt10Disks(t, 2)
+		m.writeOn("vdb", markA, 1)
+		save := m.memorySnapshot("m1")
+		m.writeOn("vdb", markB, 2)
+		m.revertLive("m1", save)
+		m.rm("m1")
+		m.requireWhole(nil)
+		if !m.hasOn("vdb", markA, 1) || m.hasOn("vdb", markB, 2) {
+			t.Errorf("vdb: A present=%v B present=%v, want A only", m.hasOn("vdb", markA, 1), m.hasOn("vdb", markB, 2))
+		}
+	})
+}
+
+// Guard (b)'s input on the model, scenario 3 (sr10c): a linked clone of the
+// stopped VM backs on the snapshot's overlay, and an earlier clone on the
+// disk the snapshot was taken of. SnapshotDiskFiles names both files, and
+// the model's delete shows why it must: it removes the one and commits into
+// the other, and the first clone cannot open its chain afterwards.
+func TestSnapshotDiskFiles_NamesWhatALinkedCloneBacksOn(t *testing.T) {
+	m := newLibvirt10(t)
+	m.setState(golibvirt.DomainShutoff)
+	root := m.active()
+	early := filepath.Join(m.dir, "early-clone.qcow2")
+	run(t, "qemu-img", "create", "-q", "-f", "qcow2", "-F", "qcow2", "-b", root, early)
+	m.snapshot("s1")
+	clone := filepath.Join(m.dir, "clone.qcow2")
+	run(t, "qemu-img", "create", "-q", "-f", "qcow2", "-F", "qcow2", "-b", m.active(), clone)
+	files, err := snapshotDiskFiles(m, "vm", "s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	named := map[string]bool{}
+	for _, f := range files {
+		named[f] = true
+	}
+	for _, c := range []string{clone, early} {
+		layers, err := chain(c)
+		if err != nil || len(layers) < 2 {
+			t.Fatalf("setup: chain of %s = %v, %v", c, layers, err)
+		}
+		if !named[layers[1]] {
+			t.Errorf("%s backs on %s, which SnapshotDiskFiles (%v) does not name", c, layers[1], files)
+		}
+	}
+	m.rm("s1")
+	if _, err := chain(clone); err == nil {
+		t.Fatal("the model's delete left the clone's chain whole; the test no longer shows why guard (b) is needed")
 	}
 }

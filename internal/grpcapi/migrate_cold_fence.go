@@ -33,15 +33,22 @@ func coldMoveLockHolder(hostName string) string { return hostName + "/cold-migra
 // it taken until the returned release is called. A lease another start path
 // holds refuses the move, as does a lease whose state cannot be read.
 func (s *Server) holdColdMoveStartLease(ctx context.Context, vmName string) (release func(), err error) {
-	holder := coldMoveLockHolder(s.hostName)
+	return s.holdStartLease(ctx, coldMoveLockHolder(s.hostName), vmName, "so it is not migrated cold", "migrate it")
+}
+
+// holdStartLease takes the VM's start lease for holder and keeps it taken,
+// renewed, until the returned release is called. A lease another start path
+// holds refuses ("<retry> once that is done"), as does a lease whose state
+// cannot be read ("..., <notDone>: <err>").
+func (s *Server) holdStartLease(ctx context.Context, holder, vmName, notDone, retry string) (release func(), err error) {
 	heldBy, err := health.TryVMStartLease(ctx, s.db, holder, vmName, time.Now())
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable,
-			"cannot take the start lease of VM %q, so it is not migrated cold: %v", vmName, err)
+			"cannot take the start lease of VM %q, %s: %v", vmName, notDone, err)
 	}
 	if heldBy != holder {
 		return nil, status.Errorf(codes.FailedPrecondition,
-			"VM %q is being started on this cluster (its start lease is held by %s); migrate it once that is done", vmName, heldBy)
+			"VM %q is being started on this cluster (its start lease is held by %s); %s once that is done", vmName, heldBy, retry)
 	}
 	stop := make(chan struct{})
 	done := make(chan struct{})
@@ -59,7 +66,7 @@ func (s *Server) holdColdMoveStartLease(ctx context.Context, vmName string) (rel
 				// the domain, which is what the lease protects.
 				rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 				if h, rerr := health.TryVMStartLease(rctx, s.db, holder, vmName, time.Now()); rerr != nil || h != holder {
-					slog.Warn("cold migration: could not renew the VM's start lease", "vm", vmName, "held_by", h, "error", rerr)
+					slog.Warn("could not renew the VM's start lease", "vm", vmName, "holder", holder, "held_by", h, "error", rerr)
 				}
 				cancel()
 			}

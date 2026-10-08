@@ -196,6 +196,9 @@ type Fake struct {
 	// FailCreateLiveSnapshot fires AFTER the disk overlay has cut over, modeling a
 	// RAM-save/capture failure that leaves the VM on an overlay.
 	FailCreateLiveSnapshot func(domain, snap string) error
+	// OnRevertSnapshot runs inside RevertToSnapshot and RevertToLiveSnapshot,
+	// while the revert holds the domain down, as libvirt's revert does.
+	OnRevertSnapshot func(domain, snap string)
 	// snapshotFiles is, per domain and snapshot, the files the snapshot's
 	// overlay cutover named: each disk's overlay and the disk it was taken of.
 	snapshotFiles         map[string]map[string][]string
@@ -1395,7 +1398,11 @@ func (f *Fake) RevertToSnapshot(domainName, snapshotName string, restorePreDefin
 		return fmt.Errorf("libvirtfake: no snapshot %q for %q", snapshotName, domainName)
 	}
 	f.record("revert", domainName, snapshotName)
+	hook := f.OnRevertSnapshot
 	f.mu.Unlock()
+	if hook != nil {
+		hook(domainName, snapshotName)
+	}
 	if restorePreDefine != nil {
 		return restorePreDefine()
 	}
@@ -1520,7 +1527,11 @@ func (f *Fake) RevertToLiveSnapshot(domainName, snapshotName, vmstatePath string
 	if !ok {
 		saved = f.xml[domainName]
 	}
+	hook := f.OnRevertSnapshot
 	f.mu.Unlock()
+	if hook != nil {
+		hook(domainName, snapshotName)
+	}
 	restoreXML := ""
 	if rewriteSaved != nil {
 		rewritten, err := rewriteSaved(saved)

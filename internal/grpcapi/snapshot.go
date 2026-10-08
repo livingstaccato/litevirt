@@ -283,6 +283,11 @@ func (s *Server) ListSnapshots(ctx context.Context, req *pb.ListSnapshotsRequest
 	return resp, nil
 }
 
+// snapshotRestoreLockHolder is a snapshot restore's identity on the per-VM
+// start lease. Distinct from every start path's, so none can re-take a lease
+// the restore holds.
+func snapshotRestoreLockHolder(hostName string) string { return hostName + "/snapshot-restore" }
+
 func (s *Server) RestoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotRequest) (*pb.VM, error) {
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return nil, err
@@ -341,6 +346,21 @@ func (s *Server) RestoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotReq
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"snapshot %q is in error state (a failed capture) and cannot be restored — delete it instead", req.SnapshotName)
 	}
+	// The revert destroys and undefines the domain, resets its overlays and
+	// brings it back. The VM lock holds off this host's RPCs only; the
+	// reconciler and the restart policy start a VM under the replicated start
+	// lease, and the reconciler restarts a VM recorded running whose domain is
+	// gone. On the lab it did so mid-restore: the guest came back on the old
+	// overlay, the reset went to a file nothing read, and the restore failed
+	// with "domain is already running", not restored (snapshot-repro.md). So
+	// the restore holds the start lease until the domain is back.
+	releaseLease, err := s.holdStartLease(ctx, snapshotRestoreLockHolder(s.hostName), req.VmName,
+		"so it is not restored", "restore it")
+	if err != nil {
+		return nil, err
+	}
+	defer releaseLease()
+
 	// Restore firmware state (NVRAM + swtpm) from the snapshot sidecar before the
 	// domain is redefined, so reverted disks/RAM + firmware are a consistent set
 	// (G1). No-op when the snapshot captured none (non-firmware VM).

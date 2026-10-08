@@ -134,6 +134,12 @@ func (s *Server) SnapshotContainer(ctx context.Context, req *pb.SnapshotContaine
 	if st, serr := os.Stat(path); serr == nil {
 		size = st.Size()
 	}
+	// The owner record: which container (project and lineage) the snapshot is
+	// of, so a later container reusing the name is not handed it.
+	if err := writeSnapshotOwner(path, rec); err != nil {
+		_ = os.Remove(path)
+		return nil, status.Errorf(codes.Internal, "record snapshot owner: %v", err)
+	}
 
 	srec := corrosion.ContainerSnapshotRecord{
 		CtName: req.Name, HostName: host, Name: req.Snapshot,
@@ -174,7 +180,7 @@ func (s *Server) ListContainerSnapshots(ctx context.Context, req *pb.ListContain
 		[]string{"ct.read", "snapshot.read"}, "viewer", containerWhat(req.Name)); err != nil {
 		return nil, err
 	}
-	host, _, err := s.resolveContainerHost(ctx, req.HostName, req.Name)
+	host, listRec, err := s.resolveContainerHost(ctx, req.HostName, req.Name)
 	if err != nil {
 		return nil, err
 	}
@@ -182,7 +188,7 @@ func (s *Server) ListContainerSnapshots(ctx context.Context, req *pb.ListContain
 		if c, conn, derr := s.peerClient(ctx, host); derr == nil {
 			defer conn.Close()
 			req.HostName = host
-			return c.ListContainerSnapshots(ctx, req)
+			return c.ListContainerSnapshots(s.ownerStrictOutgoing(ctx), req)
 		}
 		// Fall through to the local (possibly stale) view if the peer is down.
 	}
@@ -194,6 +200,11 @@ func (s *Server) ListContainerSnapshots(ctx context.Context, req *pb.ListContain
 	for _, sn := range snaps {
 		if host == s.hostName {
 			makeSnapshotPrivate(s.dataDir, req.Name, sn.Path)
+			// Another project's earlier container took it: not listed to a
+			// caller the owner rules bind.
+			if s.refuseForeignSnapshot(ctx, sn.Path, sn.Name, listRec) != nil {
+				continue
+			}
 		}
 		resp.Snapshots = append(resp.Snapshots, &pb.ContainerSnapshot{
 			Id: sn.ID, CtName: sn.CtName, HostName: sn.HostName, Name: sn.Name,
@@ -234,7 +245,7 @@ func (s *Server) RevertContainerSnapshot(ctx context.Context, req *pb.RevertCont
 		}
 		defer conn.Close()
 		req.HostName = host
-		return c.RevertContainerSnapshot(ctx, req)
+		return c.RevertContainerSnapshot(s.ownerStrictOutgoing(ctx), req)
 	}
 	if s.containerRuntime == nil {
 		return nil, status.Error(codes.Unavailable, "container runtime not wired on this host")
@@ -242,6 +253,11 @@ func (s *Server) RevertContainerSnapshot(ctx context.Context, req *pb.RevertCont
 	snap, _ := corrosion.GetContainerSnapshot(ctx, s.db, host, req.Name, req.Snapshot)
 	if snap == nil {
 		return nil, status.Errorf(codes.NotFound, "snapshot %q not found for container %q", req.Snapshot, req.Name)
+	}
+
+	if err := s.refuseForeignSnapshot(ctx, snap.Path, req.Snapshot, rec); err != nil {
+		s.audit(ctx, "ct.snapshot.revert", req.Name, "project="+project+" foreign snapshot", "denied")
+		return nil, err
 	}
 
 	unlock := s.lockVM("ct/" + req.Name)
@@ -299,7 +315,7 @@ func (s *Server) DeleteContainerSnapshot(ctx context.Context, req *pb.DeleteCont
 		s.audit(ctx, "ct.snapshot.delete", req.Name, "project="+project, "denied")
 		return nil, err
 	}
-	host, _, err := s.resolveContainerHost(ctx, req.HostName, req.Name)
+	host, delRec, err := s.resolveContainerHost(ctx, req.HostName, req.Name)
 	if err != nil {
 		return nil, err
 	}
@@ -310,13 +326,18 @@ func (s *Server) DeleteContainerSnapshot(ctx context.Context, req *pb.DeleteCont
 		}
 		defer conn.Close()
 		req.HostName = host
-		return c.DeleteContainerSnapshot(ctx, req)
+		return c.DeleteContainerSnapshot(s.ownerStrictOutgoing(ctx), req)
 	}
 	snap, _ := corrosion.GetContainerSnapshot(ctx, s.db, host, req.Name, req.Snapshot)
 	if snap != nil && snap.Path != "" {
+		if err := s.refuseForeignSnapshot(ctx, snap.Path, req.Snapshot, delRec); err != nil {
+			s.audit(ctx, "ct.snapshot.delete", req.Name, "project="+project+" foreign snapshot", "denied")
+			return nil, err
+		}
 		if rmErr := os.Remove(snap.Path); rmErr != nil && !os.IsNotExist(rmErr) {
 			return nil, status.Errorf(codes.Internal, "remove snapshot file: %v", rmErr)
 		}
+		_ = os.Remove(snapshotOwnerPath(snap.Path))
 	}
 	if err := corrosion.DeleteContainerSnapshot(ctx, s.db, host, req.Name, req.Snapshot); err != nil {
 		return nil, status.Errorf(codes.Internal, "tombstone snapshot: %v", err)

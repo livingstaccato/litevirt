@@ -361,7 +361,10 @@ func (s *Server) sinkRemoteContainerBackup(ctx context.Context, owner string, re
 // from a genuine failure. landed=false + err ⇒ fall back to image-recreate.
 // Satisfies failover.ContainerRestorer.
 func (s *Server) RestoreContainerFromBackup(ctx context.Context, ctName, targetHost, token string) (corrosion.RestoreOutcome, error) {
-	repoName, timestamp, err := s.findLatestContainerBackup(ctName)
+	// The relocating row is the owner the backup must belong to: a newer
+	// backup of another container of this name (another project, another
+	// lineage) is not this container's data.
+	repoName, timestamp, err := s.findLatestContainerBackupFor(ctName, s.relocatingContainer(ctx, ctName, targetHost, token))
 	if err != nil {
 		return corrosion.RestoreNotAttempted, err
 	}
@@ -536,6 +539,12 @@ func classifyRestoreError(err error) corrosion.RestoreOutcome {
 // NAME (not path) + the manifest timestamp. A registered name is preferred so
 // the target can resolve the same repo via its own config.
 func (s *Server) findLatestContainerBackup(ctName string) (repoName, timestamp string, err error) {
+	return s.findLatestContainerBackupFor(ctName, nil)
+}
+
+// findLatestContainerBackupFor is findLatestContainerBackup restricted to the
+// manifests owner may own (manifestOwnedBy); a nil owner matches by name.
+func (s *Server) findLatestContainerBackupFor(ctName string, owner *corrosion.ContainerRecord) (repoName, timestamp string, err error) {
 	if len(s.backupRepos) == 0 {
 		return "", "", fmt.Errorf("no backup repos configured")
 	}
@@ -545,15 +554,32 @@ func (s *Server) findLatestContainerBackup(ctName string) (repoName, timestamp s
 		if oerr != nil {
 			continue // repo not openable from here — skip
 		}
-		m, ok, merr := repo.LatestManifestFor(ctName, containerBackupDisk)
-		if merr != nil || !ok || m == nil {
+		if owner == nil {
+			m, ok, merr := repo.LatestManifestFor(ctName, containerBackupDisk)
+			if merr != nil || !ok || m == nil {
+				continue
+			}
+			if pbsstore.ValidateManifest(m) != nil {
+				continue // structurally invalid → not restorable
+			}
+			// Manifest timestamps are RFC3339 (lexical == chronological).
+			if m.Timestamp > bestTS {
+				bestTS, bestName = m.Timestamp, name
+			}
 			continue
 		}
-		if pbsstore.ValidateManifest(m) != nil {
-			continue // structurally invalid → not restorable
+		ms, lerr := repo.ListParsedManifests()
+		if lerr != nil {
+			continue
 		}
-		// Manifest timestamps are RFC3339 (lexical == chronological).
-		if m.Timestamp > bestTS {
+		for i := range ms {
+			m := &ms[i]
+			if m.VMName != ctName || m.DiskName != containerBackupDisk || m.Timestamp <= bestTS {
+				continue
+			}
+			if pbsstore.ValidateManifest(m) != nil || !manifestOwnedBy(m, owner) {
+				continue
+			}
 			bestTS, bestName = m.Timestamp, name
 		}
 	}
@@ -983,6 +1009,11 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	// backed up): the restored container has never run HERE, so it lands as
 	// created — otherwise its restored restart policy would start it on the next
 	// sweep, a start nobody asked for.
+	// The restored container keeps the backed-up lineage (a backup from an
+	// earlier build has none: it gets one now), stamped on the imported
+	// directory, whose own record may be the source host's or absent.
+	spec.CreateSpec = withOwnerID(spec.CreateSpec)
+	s.stampContainerOwner(req.Name, project, spec.CreateSpec)
 	stateDetail := ""
 	if !req.Start {
 		stateDetail = spec.StateDetail

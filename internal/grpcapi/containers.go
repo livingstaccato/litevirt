@@ -17,6 +17,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/lxc"
+	"github.com/litevirt/litevirt/internal/randid"
 	"github.com/litevirt/litevirt/internal/safename"
 	"github.com/litevirt/litevirt/internal/tenancy"
 )
@@ -254,7 +255,10 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	createSpec := corrosion.ContainerCreateSpec{
 		Template: req.Template, Distro: req.Distro, Release: req.Release, Arch: req.Arch,
 		Networks: plan.specNets,
+		// A new lineage: the owner record its files are matched by.
+		OwnerID: randid.New(),
 	}
+	s.stampContainerOwner(info.Name, req.Project, corrosion.EncodeCreateSpec(createSpec))
 
 	// CreatedAt is left empty ON PURPOSE: the corrosion writer stamps it with
 	// nanosecond precision, and that stamp is the row's INCARNATION identity —

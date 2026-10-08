@@ -3,6 +3,7 @@ package fleet
 import (
 	"archive/tar"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -530,4 +531,34 @@ func copyTree(src, dst string) error {
 		}
 		return os.WriteFile(target, b, 0o644)
 	})
+}
+
+// StampOwner / ReadOwner make CTFake an lxc.OwnerStamper, with the record a
+// file inside the container's directory as on a real host — so an export and
+// import carry it, and a delete removes it.
+func (f *CTFake) StampOwner(name string, o lxc.ContainerOwner) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.state[name]; !ok {
+		return fmt.Errorf("stamp %q: no container directory", name)
+	}
+	b, _ := json.Marshal(o)
+	return os.WriteFile(filepath.Join(f.dir(name), "litevirt-owner"), b, 0o600)
+}
+
+func (f *CTFake) ReadOwner(name string) (*lxc.ContainerOwner, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	b, err := os.ReadFile(filepath.Join(f.dir(name), "litevirt-owner"))
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var o lxc.ContainerOwner
+	if err := json.Unmarshal(b, &o); err != nil {
+		return nil, err
+	}
+	return &o, nil
 }

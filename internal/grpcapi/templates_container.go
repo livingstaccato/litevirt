@@ -11,6 +11,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/randid"
 	"github.com/litevirt/litevirt/internal/tenancy"
 )
 
@@ -206,6 +207,10 @@ func (s *Server) CloneContainer(ctx context.Context, req *pb.CloneContainerReque
 	cloneSpec := corrosion.DecodeCreateSpec(src.CreateSpec)
 	ifaces, specNets := s.cloneContainerNICs(req.Target, cloneSpec)
 	cloneSpec.Networks = specNets
+	// A clone is a new lineage, with its own owner record (the copied
+	// directory carried the source's).
+	cloneSpec.OwnerID = randid.New()
+	s.stampContainerOwner(req.Target, project, corrosion.EncodeCreateSpec(cloneSpec))
 	rec := corrosion.ContainerRecord{
 		HostName: s.hostName, Name: req.Target, State: "stopped",
 		// Never started yet: the restart policy copied from the source must not

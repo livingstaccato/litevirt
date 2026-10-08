@@ -54,6 +54,8 @@ type fakeCTRuntime struct {
 	// by mu), so a container the test stopped reads stopped. stateByName and
 	// stateErrByName still win.
 	runState map[string]string
+	// owners is the on-disk owner record per container (lxc.OwnerStamper).
+	owners map[string]lxc.ContainerOwner
 
 	// B0 day-2 primitives: rootfs path a test wants returned, plus freeze/unfreeze
 	// call tracking so backup/snapshot tests can assert quiesce + unfreeze.
@@ -296,6 +298,25 @@ func (f *fakeCTRuntime) CloneContainer(_ context.Context, src, dst string) error
 	return nil
 }
 func (f *fakeCTRuntime) ListContainers(_ context.Context) ([]string, error) { return f.listNames, nil }
+
+// StampOwner / ReadOwner make the fake an lxc.OwnerStamper.
+func (f *fakeCTRuntime) StampOwner(name string, o lxc.ContainerOwner) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.owners == nil {
+		f.owners = map[string]lxc.ContainerOwner{}
+	}
+	f.owners[name] = o
+	return nil
+}
+func (f *fakeCTRuntime) ReadOwner(name string) (*lxc.ContainerOwner, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if o, ok := f.owners[name]; ok {
+		return &o, nil
+	}
+	return nil, nil
+}
 func (f *fakeCTRuntime) PullOCIImage(_ context.Context, image, dest, tag, username, password string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

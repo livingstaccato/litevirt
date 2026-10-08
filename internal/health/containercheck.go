@@ -284,6 +284,17 @@ func (c *ContainerChecker) recreateRelocated(ctx context.Context, ct corrosion.C
 	// relocate marker, otherwise clearing it would drop the rebuild forever.
 	if live, err := c.runtime.State(ctx, ct.Name); err == nil &&
 		(live == lxc.StateRunning || live == lxc.StateStopped) {
+		// A container of this name already here is adopted only when it is
+		// this row's: its owner record (when it has one) names the row's
+		// project and lineage. Names are per host and reusable, so another
+		// project's container — or another lineage of the name — is not a
+		// prior tick's work. The row stays pending for the operator.
+		if why := c.foreignOwner(ct); why != "" {
+			slog.Error("containercheck: relocate-recreate refused: a container of this name on this host is not the relocating container's",
+				"container", ct.Name, "reason", why)
+			c.publish("ct.relocate.failed", ct.Name, why)
+			return
+		}
 		ifs := corrosion.BuildContainerInterfacesFromSpec(c.hostName, ct.Name, spec)
 		if !c.writeRelocatedNICs(ctx, ct.Name, ifs) {
 			return // row write failed → keep the marker, retry next sweep
@@ -379,6 +390,11 @@ func (c *ContainerChecker) recreateRelocated(ctx context.Context, ct corrosion.C
 			"container", ct.Name, "image", ct.Image, "error", err)
 		c.publish("ct.relocate.failed", ct.Name, err.Error())
 		return // leave pending → retried next sweep
+	}
+	if st, ok := c.runtime.(lxc.OwnerStamper); ok {
+		if err := st.StampOwner(ct.Name, rowOwner(ct)); err != nil {
+			slog.Warn("containercheck: could not stamp the recreated container's owner record", "container", ct.Name, "error", err)
+		}
 	}
 	// Fail closed: if the interface rows can't be written, leave the relocate marker
 	// so the next sweep retries — never clear it with NIC state missing.
@@ -832,4 +848,38 @@ func (c *ContainerChecker) networkSubnet(ctx context.Context, name string) strin
 		return ""
 	}
 	return def.Subnet
+}
+
+// rowOwner is the owner record a container row gives its on-disk directory.
+func rowOwner(ct corrosion.ContainerRecord) lxc.ContainerOwner {
+	p := ct.Project
+	if p == "" {
+		p = corrosion.DefaultProject
+	}
+	return lxc.ContainerOwner{Project: p, OwnerID: corrosion.DecodeCreateSpec(ct.CreateSpec).OwnerID}
+}
+
+// foreignOwner says why the on-disk container named like ct is not ct's ("",
+// when it is or carries no record to say otherwise). An unreadable record is
+// foreign: it cannot prove the container is this row's.
+func (c *ContainerChecker) foreignOwner(ct corrosion.ContainerRecord) string {
+	st, ok := c.runtime.(lxc.OwnerStamper)
+	if !ok {
+		return ""
+	}
+	o, err := st.ReadOwner(ct.Name)
+	if err != nil {
+		return "its owner record is unreadable: " + err.Error()
+	}
+	if o == nil {
+		return ""
+	}
+	want := rowOwner(ct)
+	if o.Project != "" && o.Project != want.Project {
+		return "it belongs to project " + o.Project
+	}
+	if o.OwnerID != "" && want.OwnerID != "" && o.OwnerID != want.OwnerID {
+		return "it is another container of the same name (owner " + o.OwnerID + ")"
+	}
+	return ""
 }

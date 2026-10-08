@@ -111,3 +111,19 @@ func (a *LXCRuntimeAdapter) ContainerLimits(ctx context.Context, name string) (i
 	cpu, mem, err := a.Inner.Limits(ctx, name)
 	return cpu, ContainerMemoryLimit{MiB: mem.MiB, Unlimited: mem.Unlimited}, err
 }
+
+// StampOwner / ReadOwner pass the on-disk owner record through when the inner
+// runtime keeps one (lxc.OwnerStamper); otherwise there is no record.
+func (a *LXCRuntimeAdapter) StampOwner(name string, o lxc.ContainerOwner) error {
+	if st, ok := a.Inner.(lxc.OwnerStamper); ok {
+		return st.StampOwner(name, o)
+	}
+	return nil
+}
+
+func (a *LXCRuntimeAdapter) ReadOwner(name string) (*lxc.ContainerOwner, error) {
+	if st, ok := a.Inner.(lxc.OwnerStamper); ok {
+		return st.ReadOwner(name)
+	}
+	return nil, nil
+}

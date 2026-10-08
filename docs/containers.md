@@ -466,6 +466,33 @@ How it works and what to expect:
 - **Quota.** A container's backup footprint draws down the **same `backup_gib`
   project budget** as VM backups.
 
+## Owner records
+
+A container's name is unique per host only, and reusable: delete `web` in
+project `acme`, create `web` in project `beta`, and every file keyed by host and
+name — the snapshot tars and their rows, the backups in a repo — reads as
+beta's. Container files are therefore chosen by their **owner record**: the
+project plus an `owner_id` in the container's create spec.
+
+- `owner_id` is minted when a container is created or cloned (a clone is a new
+  lineage), and kept by `lv ct migrate`, host-loss relocation and restore. A
+  restore of a backup from an earlier release, which carries none, gets one.
+- It is stamped on disk as `<lxcpath>/<name>/litevirt-owner` (re-stamped after
+  every restore and migrate, whatever the archive held), beside each snapshot
+  tar as `<snapshot>.tar.owner`, and it rides in every backup manifest inside
+  the create spec.
+- A snapshot taken of an earlier container in another project is not listed
+  to, reverted or deleted by a caller without the Admin role (also through a
+  forwarding node, which marks the call). Within one project a snapshot stays
+  usable as before.
+- Host-loss restore picks the relocating container's own newest backup:
+  manifests of another project, or of another lineage of the name, are skipped.
+- A host-loss recreate adopts a container already on the survivor ("made by a
+  previous sweep") only when its owner record names the row's project and
+  lineage; otherwise the row stays pending with a `ct.relocate.failed` event.
+- A file or container with **no** owner record (made by an earlier release) is
+  matched by name, exactly as before: records only add proof.
+
 ## Snapshots
 
 ```bash

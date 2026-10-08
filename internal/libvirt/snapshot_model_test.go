@@ -176,7 +176,12 @@ func domainXMLOf(name string, disks map[string]string) string {
 // source written out as nested <backingStore>, as libvirt's XML has it.
 func domainXMLWithChains(name string, disks map[string]string, chains map[string][]string) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "<domain type='kvm'><name>%s</name><devices>", name)
+	// As litevirt's domains are: its namespaced metadata, and here a
+	// qemu:commandline block too, which a revert must carry over.
+	fmt.Fprintf(&b, "<domain type='kvm' xmlns:qemu='http://libvirt.org/schemas/domain/qemu/1.0'><name>%s</name>"+
+		`<metadata><litevirt-managed:managed xmlns:litevirt-managed="https://litevirt.dev/xmlns/managed/1" incarnation="1"/>`+
+		`<litevirt-owner-epoch:owner-epoch xmlns:litevirt-owner-epoch="https://litevirt.dev/xmlns/owner-epoch/1">1</litevirt-owner-epoch:owner-epoch></metadata>`+
+		"<qemu:commandline><qemu:arg value='-fw_cfg'/></qemu:commandline><devices>", name)
 	for _, dev := range sortedKeys(disks) {
 		fmt.Fprintf(&b, "<disk type='file' device='disk'><driver name='qemu' type='%s'/><source file='%s'/>", fmtOf(disks[dev]), disks[dev])
 		for _, l := range chains[dev] {

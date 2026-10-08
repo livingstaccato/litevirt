@@ -293,7 +293,19 @@ func (s *Server) ListSnapshots(ctx context.Context, req *pb.ListSnapshotsRequest
 // the restore holds.
 func snapshotRestoreLockHolder(hostName string) string { return hostName + "/snapshot-restore" }
 
+// RestoreSnapshot is restoreSnapshot, with every refusal or failure logged at
+// WARN on the host that decided it: the lab found a refusal nothing on the
+// host recorded.
 func (s *Server) RestoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotRequest) (*pb.VM, error) {
+	vm, err := s.restoreSnapshot(ctx, req)
+	if err != nil {
+		slog.Warn("snapshot restore not done", "vm", req.GetVmName(), "snapshot", req.GetSnapshotName(),
+			"code", status.Code(err).String(), "error", err)
+	}
+	return vm, err
+}
+
+func (s *Server) restoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotRequest) (*pb.VM, error) {
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return nil, err
 	}

@@ -700,3 +700,50 @@ func TestRevert_ADottedSnapshotName(t *testing.T) {
 	m.rm("v1.2")
 	m.requireWhole(map[byte]bool{markA: true, markB: false})
 }
+
+// A litevirt domain's XML carries litevirt's namespaced metadata
+// (litevirt-managed, litevirt-owner-epoch) and may carry qemu:commandline;
+// the revert's repoint edits only the one disk's <source file=> and drops
+// its <backingStore> chain, and leaves every other byte as it was.
+func TestRepointRevertedDisk_KeepsNamespacedXML(t *testing.T) {
+	in, err := os.ReadFile("testdata/revert_litevirt_domain.xml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := repointRevertedDisk(string(in), "vda", "/var/lib/litevirt/disks/sl1-root.s1-r1700000000")
+	if err != nil {
+		t.Fatalf("repoint: %v", err)
+	}
+	if got := parseDomainDiskSources(out); got["vda"] != "/var/lib/litevirt/disks/sl1-root.s1-r1700000000" || got["sdb"] != "/var/lib/litevirt/cloudinit/sl1.iso" {
+		t.Fatalf("disk sources %v", got)
+	}
+	if c := xmlBackingChains(out); len(c["vda"]) != 0 {
+		t.Fatalf("vda keeps the chain %v", c["vda"])
+	}
+	// Outside vda's <source> and its <backingStore>, byte for byte.
+	src := string(in)
+	i := strings.Index(src, "<source file='/var/lib/litevirt/disks/sl1-root.s2'")
+	j := strings.Index(src, "      <target dev='vda'")
+	k := strings.Index(out, "      <target dev='vda'")
+	if i < 0 || j < 0 || k < 0 || src[:i] != out[:i] || src[j:] != out[k:] {
+		t.Fatalf("bytes outside vda's source and chain changed:\n%s", out)
+	}
+	for _, keep := range []string{`<litevirt-managed:managed xmlns:litevirt-managed="https://litevirt.dev/xmlns/managed/1" incarnation="3f1a"/>`,
+		`<qemu:arg value='name=opt/litevirt/x,string=a&amp;b'/>`, "index='3'"} {
+		if !strings.Contains(out, keep) {
+			t.Errorf("%q is gone", keep)
+		}
+	}
+}
+
+// Double-quoted attributes, as libvirt's own XML API may write them.
+func TestRepointRevertedDisk_DoubleQuoted(t *testing.T) {
+	in := `<domain xmlns:x="urn:x"><devices><disk type="file"><source file="/d/a.s2"/><backingStore type="file"><source file="/d/a.qcow2"/></backingStore><target dev="vda"/></disk></devices><x:y/></domain>`
+	out, err := repointRevertedDisk(in, "vda", "/d/a.s1-r1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `<domain xmlns:x="urn:x"><devices><disk type="file"><source file="/d/a.s1-r1"/><target dev="vda"/></disk></devices><x:y/></domain>`; out != want {
+		t.Fatalf("got\n%s\nwant\n%s", out, want)
+	}
+}

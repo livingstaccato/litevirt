@@ -1,7 +1,9 @@
 package grpcapi
 
 import (
+	"bytes"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -247,5 +249,26 @@ func TestRestoreSnapshot_FailsWhenTheDiskPathCannotBeRecorded(t *testing.T) {
 	_, err := s.RestoreSnapshot(adminCtx(), &pb.RestoreSnapshotRequest{VmName: "rs", SnapshotName: "s1"})
 	if status.Code(err) != codes.Internal || !strings.Contains(err.Error(), "disk path") {
 		t.Fatalf("RestoreSnapshot = %v, want an error saying the disk path was not recorded", err)
+	}
+}
+
+// A refused restore says so in the daemon's log at WARN, not only to the
+// caller: the lab found a refusal nothing on the host recorded.
+func TestRestoreSnapshot_ARefusalIsLoggedAtWarn(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	s := lockTestServer(t)
+	seedRestorableVM(t, s, "disk")
+	if h, err := health.TryVMStartLease(adminCtx(), s.db, s.hostName, "rs", time.Now()); err != nil || h != s.hostName {
+		t.Fatalf("setup: lease %q %v", h, err)
+	}
+	if _, err := s.RestoreSnapshot(adminCtx(), &pb.RestoreSnapshotRequest{VmName: "rs", SnapshotName: "s1"}); err == nil {
+		t.Fatal("the restore went ahead under a live start lease")
+	}
+	log := buf.String()
+	if !strings.Contains(log, "level=WARN") || !strings.Contains(log, "vm=rs") || !strings.Contains(log, "snapshot=s1") {
+		t.Fatalf("no WARN naming the VM and snapshot in the log:\n%s", log)
 	}
 }

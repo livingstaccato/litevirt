@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -890,39 +891,25 @@ func newRevertOverlayPath(ov, snapshotName string) string {
 
 // repointRevertedDisk points the disk with target dev at file and drops the
 // <backingStore> chain under it, so libvirt probes the new overlay's chain
-// from its header instead of opening the old one as written. Namespaced XML
-// is refused, as RewriteDiskSourceFile refuses it.
+// from its header instead of opening the old one as written.
+//
+// It splices the original text: only the value of that disk's <source
+// file=> and its direct <backingStore> children change, and every other
+// byte — litevirt's namespaced metadata (litevirt-managed,
+// litevirt-owner-epoch), a qemu:commandline block, comments, formatting —
+// is kept as it was. Every litevirt domain carries namespaced metadata, so
+// re-encoding the XML, or refusing namespaces, is not an option.
 func repointRevertedDisk(domXML, dev, file string) (string, error) {
-	if hasXMLNamespace(domXML) {
-		return "", fmt.Errorf("domain XML carries XML namespaces; not rewriting it")
-	}
-	var v struct {
-		Devices struct {
-			Disks []struct {
-				Target struct {
-					Dev string `xml:"dev,attr"`
-				} `xml:"target"`
-			} `xml:"disk"`
-		} `xml:"devices"`
-	}
-	if err := xml.Unmarshal([]byte(domXML), &v); err != nil {
-		return "", fmt.Errorf("parse domain XML: %w", err)
-	}
-	match := -1
-	for i, d := range v.Devices.Disks {
-		if d.Target.Dev == dev {
-			match = i
-		}
-	}
-	if match < 0 {
-		return "", fmt.Errorf("no disk %s in the domain XML", dev)
-	}
+	type span struct{ start, end int64 }
 	dec := xml.NewDecoder(strings.NewReader(domXML))
-	var buf bytes.Buffer
-	enc := xml.NewEncoder(&buf)
 	var stack []string
-	diskIndex, diskDepth, skip, rewrote := -1, -1, 0, false
-	for {
+	diskDepth, bsDepth := -1, -1
+	var src, bsOpen span
+	var bss []span
+	var target string
+	found := false
+	for !found {
+		start := dec.InputOffset()
 		tok, err := dec.Token()
 		if err == io.EOF {
 			break
@@ -930,6 +917,7 @@ func repointRevertedDisk(domXML, dev, file string) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("decode domain XML: %w", err)
 		}
+		end := dec.InputOffset()
 		switch t := tok.(type) {
 		case xml.StartElement:
 			parent := ""
@@ -937,63 +925,83 @@ func repointRevertedDisk(domXML, dev, file string) (string, error) {
 				parent = stack[len(stack)-1]
 			}
 			stack = append(stack, t.Name.Local)
-			if skip > 0 {
-				skip++
+			depth := len(stack) - 1
+			if diskDepth < 0 && t.Name.Space == "" && t.Name.Local == "disk" && parent == "devices" {
+				diskDepth, src, bss, target = depth, span{-1, -1}, nil, ""
 				continue
 			}
-			if t.Name.Local == "disk" && parent == "devices" {
-				diskIndex++
-				if diskIndex == match {
-					diskDepth = len(stack) - 1
-				}
-			}
-			if diskDepth >= 0 && parent == "disk" && len(stack)-2 == diskDepth {
+			if diskDepth >= 0 && depth == diskDepth+1 && t.Name.Space == "" {
 				switch t.Name.Local {
-				case "backingStore":
-					skip = 1
-					continue
 				case "source":
-					t = t.Copy()
-					for i := range t.Attr {
-						if t.Attr[i].Name.Local == "file" {
-							t.Attr[i].Value = file
-							rewrote = true
+					if src.start < 0 {
+						src = span{start, end}
+					}
+				case "target":
+					for _, a := range t.Attr {
+						if a.Name.Local == "dev" {
+							target = a.Value
 						}
 					}
+				case "backingStore":
+					bsOpen, bsDepth = span{start, end}, depth
 				}
 			}
-			if err := enc.EncodeToken(t); err != nil {
-				return "", err
-			}
 		case xml.EndElement:
+			depth := len(stack) - 1
+			if bsDepth >= 0 && depth == bsDepth {
+				bss = append(bss, span{bsOpen.start, end})
+				bsDepth = -1
+			}
+			if diskDepth >= 0 && depth == diskDepth {
+				if target == dev {
+					found = true
+				} else {
+					diskDepth = -1
+				}
+			}
 			stack = stack[:len(stack)-1]
-			if skip > 0 {
-				skip--
-				continue
-			}
-			if err := enc.EncodeToken(t); err != nil {
-				return "", err
-			}
-			if diskDepth >= 0 && len(stack) == diskDepth {
-				diskDepth = -1
-			}
-		default:
-			if skip > 0 {
-				continue
-			}
-			if err := enc.EncodeToken(xml.CopyToken(tok)); err != nil {
-				return "", err
-			}
 		}
 	}
-	if err := enc.Flush(); err != nil {
-		return "", err
+	if !found {
+		return "", fmt.Errorf("no disk %s in the domain XML", dev)
 	}
-	if !rewrote {
+	if src.start < 0 {
+		return "", fmt.Errorf("disk %s has no <source> to repoint", dev)
+	}
+	m := sourceFileAttr.FindStringSubmatchIndex(domXML[src.start:src.end])
+	if m == nil {
 		return "", fmt.Errorf("disk %s has no <source file=> to repoint", dev)
 	}
-	return buf.String(), nil
+	quote, vi := "'", 2 // single-quoted value in group 1, double in group 2
+	if m[2] < 0 {
+		quote, vi = `"`, 4
+	}
+	var esc bytes.Buffer
+	if err := xml.EscapeText(&esc, []byte(file)); err != nil {
+		return "", err
+	}
+	value := esc.String()
+	if quote == "'" {
+		value = strings.ReplaceAll(value, "'", "&#39;")
+	} else {
+		value = strings.ReplaceAll(value, `"`, "&#34;")
+	}
+	edits := append([]span(nil), bss...)
+	repl := map[int64]string{}
+	vs, ve := src.start+int64(m[vi]), src.start+int64(m[vi+1])
+	edits = append(edits, span{vs, ve})
+	repl[vs] = value
+	sort.Slice(edits, func(i, j int) bool { return edits[i].start > edits[j].start })
+	out := domXML
+	for _, e := range edits {
+		out = out[:e.start] + repl[e.start] + out[e.end:]
+	}
+	return out, nil
 }
+
+// sourceFileAttr finds a <source> start tag's file attribute value:
+// single-quoted in group 1, double-quoted in group 2.
+var sourceFileAttr = regexp.MustCompile(`\sfile\s*=\s*(?:'([^']*)'|"([^"]*)")`)
 
 // resetOverlay recreates overlay as a fresh, empty qcow2 backed by base,
 // discarding any prior contents. Used by the live-snapshot revert to roll a

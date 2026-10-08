@@ -455,7 +455,14 @@ How it works and what to expect:
   pass `--start`.
 - **Host-local, like VM backup.** A container is archived on its owning host;
   run `lv ct backup`/`restore` against that host (`LV_HOST`). Restore runs on
-  the **target** host (where the container will live).
+  the **target** host (where the container will live). Running `lv` as root
+  on that host itself works too: with no CLI bundle it presents the host
+  certificate over loopback, which is local root, and its restore is an
+  operator restore like any other. Only another node's daemon is taken for a
+  failover coordinator, which must carry a relocation proof once the
+  split-brain gate is enforced.
+- **No rename.** The name selects the backup in the repo, so a restore keeps
+  it: restore onto another host (`--host`) to keep both.
 - **Quota.** A container's backup footprint draws down the **same `backup_gib`
   project budget** as VM backups.
 

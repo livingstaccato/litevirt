@@ -684,7 +684,10 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	if h := s.restoreClaimedHook; h != nil && restoreProofID != "" {
 		h(req.Name)
 	}
-	if req.Proof == nil && s.gateActive(ctx) && s.requirePeerCert(ctx) == nil {
+	// A coordinator is another node's daemon (a remote peer). `lv` run as root
+	// on this host presents the same host certificate over loopback, which is
+	// local root: an operator restore, not a coordinator's.
+	if req.Proof == nil && s.gateActive(ctx) && s.isRemotePeer(ctx) {
 		s.noteGateRefused(corrosion.ActionRelocate, health.ReasonProofMissing)
 		return status.Error(codes.FailedPrecondition, "restore refused: coordinator restore requires a proof under enforcement")
 	}
@@ -739,7 +742,7 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	}
 	if existing != nil {
 		return status.Errorf(codes.AlreadyExists,
-			"container %q already exists on host %q; delete it first or restore under a different name",
+			"container %q already exists on host %q; delete it first (lv ct rm), or restore onto another host (--host): a restore keeps the backed-up name",
 			req.Name, s.hostName)
 	}
 

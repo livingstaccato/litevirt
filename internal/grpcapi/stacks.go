@@ -450,7 +450,8 @@ func (s *Server) deployCreatePlanned(ctx context.Context, action planner.VMActio
 			if err != nil {
 				return err
 			}
-			if _, err := s.CreateContainer(ctx, ctReq); err != nil {
+			createCtx := s.inheritRecreatedSecurity(ctx, action, vmDef, ctReq)
+			if _, err := s.CreateContainer(createCtx, ctReq); err != nil {
 				return fmt.Errorf("create container %q: %w", action.VMName, err)
 			}
 			// compose `up` brings workloads to running, matching CreateVM

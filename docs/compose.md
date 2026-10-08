@@ -243,7 +243,11 @@ caller needs the Admin role to name — see "Host paths a container is given" in
 `confinement: legacy` (AppArmor nesting, the template's seccomp and
 capabilities); deploying either needs the Admin role, and changing either on a
 deployed container changes nothing until `lv ct convert` (see "Security" in
-[containers.md](containers.md)). Each container is given its own copy of the rootfs, so one pull backs any
+[containers.md](containers.md)). A recreate of an existing member (an image,
+cpu or memory change) keeps that container's current privilege mode and
+confinement when the stack file states none — a member deployed by an earlier
+release stays privileged with legacy confinement, whoever deploys — and only a
+brand-new member gets the unprivileged, confined defaults. Each container is given its own copy of the rootfs, so one pull backs any
 number of containers and `compose down` leaves the pulled template untouched.
 Remaining follow-ups: OCI registry-ref auto-pull; in-place reconfigure
 (cpu/mem changes recreate the container rather than live-tuning); and full

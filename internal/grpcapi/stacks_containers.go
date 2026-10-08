@@ -9,12 +9,16 @@ import (
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/compose/planner"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/lxc"
 )
 
 // deleteWorkload removes a planned workload, routing containers to
 // DeleteContainer (on their resolved/current host) and VMs to DeleteVM. Used by
 // the deploy executor for OpDelete and the delete half of an OpUpdate recreate.
 func (s *Server) deleteWorkload(ctx context.Context, a planner.VMAction) error {
+	if a.IsContainer && a.Kind == planner.OpUpdate {
+		s.rememberRecreatedSecurity(ctx, a)
+	}
 	if a.IsContainer {
 		_, err := s.DeleteContainer(ctx, &pb.DeleteContainerRequest{HostName: a.TargetHost, Name: a.VMName, Force: true})
 		return err
@@ -130,4 +134,70 @@ func (s *Server) buildContainerRequest(ctx context.Context, instanceName string,
 func isRootfsTemplate(image string) bool {
 	return strings.HasPrefix(image, "/") || strings.HasPrefix(image, "./") ||
 		strings.HasPrefix(image, "../") || strings.HasPrefix(image, "rootfs:")
+}
+
+// A compose recreate (an image, cpu or memory change) replaces a container
+// with a new one. It keeps the outgoing container's privilege mode and
+// confinement unless the stack file states its own: an existing container
+// keeps its settings until an operator converts it, and a main-era member
+// (privileged, legacy) would otherwise come back unprivileged and confined —
+// breaking a nesting workload on an unrelated image bump, with a fix only an
+// Admin could make. A brand-new member gets the defaults.
+
+// inheritedSecurityKey marks a create whose privileged/legacy settings were
+// carried over from the container it replaces, not asked for. Set only here,
+// in-process; it never crosses the wire.
+type inheritedSecurityKey struct{}
+
+func withInheritedSecurity(ctx context.Context) context.Context {
+	return context.WithValue(ctx, inheritedSecurityKey{}, true)
+}
+
+func securityInherited(ctx context.Context) bool {
+	v, _ := ctx.Value(inheritedSecurityKey{}).(bool)
+	return v
+}
+
+// rememberRecreatedSecurity records the outgoing container's security before
+// a recreate deletes it.
+func (s *Server) rememberRecreatedSecurity(ctx context.Context, a planner.VMAction) {
+	var rec *corrosion.ContainerRecord
+	if a.TargetHost != "" {
+		rec, _ = corrosion.GetContainer(ctx, s.db, a.TargetHost, a.VMName)
+	}
+	if rec == nil {
+		if _, r, err := s.resolveContainerHost(ctx, "", a.VMName); err == nil {
+			rec = r
+		}
+	}
+	if rec == nil {
+		return
+	}
+	s.recreateSecMu.Lock()
+	defer s.recreateSecMu.Unlock()
+	if s.recreateSec == nil {
+		s.recreateSec = map[string]corrosion.ContainerCreateSpec{}
+	}
+	s.recreateSec[a.VMName] = corrosion.DecodeCreateSpec(rec.CreateSpec)
+}
+
+// inheritRecreatedSecurity applies a recreate's remembered security to req
+// when the stack file states none, and returns the context to create with.
+func (s *Server) inheritRecreatedSecurity(ctx context.Context, a planner.VMAction, d *compose.VMDef, req *pb.CreateContainerRequest) context.Context {
+	if a.Kind != planner.OpUpdate {
+		return ctx
+	}
+	s.recreateSecMu.Lock()
+	spec, ok := s.recreateSec[a.VMName]
+	delete(s.recreateSec, a.VMName)
+	s.recreateSecMu.Unlock()
+	if !ok || d.Privileged || d.Confinement != "" {
+		return ctx
+	}
+	req.Privileged = spec.IDMapBase == 0
+	req.Confinement = spec.Confinement
+	if req.Confinement == "" {
+		req.Confinement = lxc.ConfinementLegacy
+	}
+	return withInheritedSecurity(ctx)
 }

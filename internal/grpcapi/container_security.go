@@ -198,10 +198,13 @@ func (s *Server) localContainerSecurity(ctx context.Context) map[string]lxc.Secu
 // privilege request, on the node that took it (only there is the caller
 // real). The opt-outs are the Admin's.
 func containerSecurityRequest(ctx context.Context, privileged bool, confinement string) error {
+	// Carried over from the container a compose recreate replaces: not an
+	// opt-out anyone asked for, and the replaced container had it already.
+	inherited := securityInherited(ctx)
 	switch confinement {
 	case "", lxc.ConfinementDefault:
 	case lxc.ConfinementLegacy:
-		if err := RequireRole(ctx, "admin"); err != nil {
+		if err := RequireRole(ctx, "admin"); err != nil && !inherited {
 			return status.Error(codes.PermissionDenied,
 				"confinement legacy (AppArmor nesting allowed, the template's seccomp and capabilities) requires the admin role")
 		}
@@ -209,7 +212,7 @@ func containerSecurityRequest(ctx context.Context, privileged bool, confinement 
 		return status.Errorf(codes.InvalidArgument, "confinement %q: want %q or %q", confinement, lxc.ConfinementDefault, lxc.ConfinementLegacy)
 	}
 	if privileged {
-		if err := RequireRole(ctx, "admin"); err != nil {
+		if err := RequireRole(ctx, "admin"); err != nil && !inherited {
 			return status.Error(codes.PermissionDenied,
 				"a privileged container (no user namespace: root inside is root on the host) requires the admin role")
 		}

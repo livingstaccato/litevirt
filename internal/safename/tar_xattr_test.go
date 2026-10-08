@@ -20,12 +20,12 @@ func TestExtractRootfsTar_KeepsSpecialBitsAndXattrs(t *testing.T) {
 	var order []string
 	restore := setLsetxattrForTest(func(p, name string, v []byte) error {
 		calls = append(calls, xattrCall{p, name, string(v)})
-		order = append(order, "xattr")
+		order = append(order, "xattr "+filepath.Base(p))
 		return nil
 	})
 	defer restore()
 	restoreChown := setLchownForTest(func(p string, uid, gid int) error {
-		order = append(order, "chown")
+		order = append(order, "chown "+filepath.Base(p))
 		return nil
 	})
 	defer restoreChown()
@@ -79,14 +79,17 @@ func TestExtractRootfsTar_KeepsSpecialBitsAndXattrs(t *testing.T) {
 	if _, ok := got["trusted.overlay.redirect"]; ok {
 		t.Error("a trusted.* attribute was taken from the archive")
 	}
-	// The file's own xattrs come after its chown (the last chown is the file's).
-	last := -1
+	// The file's own xattrs come after its chown.
+	chown, firstX := -1, -1
 	for i, o := range order {
-		if o == "chown" {
-			last = i
+		if o == "chown ping" {
+			chown = i
+		}
+		if o == "xattr ping" && firstX < 0 {
+			firstX = i
 		}
 	}
-	if last < 0 || last == len(order)-1 || order[len(order)-1] != "xattr" {
-		t.Errorf("xattrs were not applied after the owner: %v", order)
+	if chown < 0 || firstX < 0 || firstX < chown {
+		t.Errorf("ping's xattrs were not applied after its owner: %v", order)
 	}
 }

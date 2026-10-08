@@ -2,10 +2,12 @@ package safename
 
 import (
 	"archive/tar"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 )
@@ -69,9 +71,47 @@ func ExtractFlatTar(r io.Reader, dest string) error {
 // (so a tampered archive can't clobber a sibling under dest by naming a
 // different top-level directory).
 func ExtractRootfsTar(r io.Reader, dest, expectedTop string) error {
+	_, err := ExtractRootfsTarReport(r, dest, expectedTop)
+	return err
+}
+
+// ExtractRootfsTarReport is ExtractRootfsTar that also returns the attributes
+// the target filesystem does not support and that were therefore dropped, as
+// "<member> <attribute>" (see applyXattrs).
+func ExtractRootfsTarReport(r io.Reader, dest, expectedTop string) (dropped []string, err error) {
 	if err := os.MkdirAll(dest, 0o755); err != nil {
-		return err
+		return nil, err
 	}
+	// A directory's metadata (owner, mode, attributes — a default ACL among
+	// them) is applied after its contents, deepest first, as GNU tar does: a
+	// default ACL applied first would be inherited by children the archive
+	// recorded without one, and a read-only mode would block them.
+	type dirMeta struct {
+		target string
+		hdr    *tar.Header
+		mode   os.FileMode
+	}
+	var dirs []dirMeta
+	defer func() {
+		if err != nil {
+			return
+		}
+		for i := len(dirs) - 1; i >= 0; i-- {
+			d, ferr := finishMember(dirs[i].target, dirs[i].hdr, dirs[i].mode)
+			dropped = append(dropped, d...)
+			if ferr != nil {
+				err = ferr
+				return
+			}
+		}
+	}()
+	err = extractRootfsMembers(r, dest, expectedTop, func(target string, hdr *tar.Header, mode os.FileMode) {
+		dirs = append(dirs, dirMeta{target, hdr, mode})
+	}, func(d []string) { dropped = append(dropped, d...) })
+	return dropped, err
+}
+
+func extractRootfsMembers(r io.Reader, dest, expectedTop string, deferDir func(string, *tar.Header, os.FileMode), noteDropped func([]string)) error {
 	tr := tar.NewReader(r)
 	for {
 		hdr, err := tr.Next()
@@ -109,12 +149,10 @@ func ExtractRootfsTar(r io.Reader, dest, expectedTop string) error {
 		special := hdr.FileInfo().Mode() & (os.ModeSetuid | os.ModeSetgid | os.ModeSticky)
 		switch hdr.Typeflag {
 		case tar.TypeDir:
-			if err := mkdirAllNoFollow(dest, target, mode|0o100); err != nil {
+			if err := mkdirAllNoFollow(dest, target, 0o700); err != nil {
 				return err
 			}
-			if err := finishMember(target, hdr, mode|0o100|special); err != nil {
-				return err
-			}
+			deferDir(target, hdr, mode|0o100|special)
 		case tar.TypeReg, tar.TypeRegA:
 			if err := mkdirAllNoFollow(dest, filepath.Dir(target), 0o755); err != nil {
 				return err
@@ -122,7 +160,9 @@ func ExtractRootfsTar(r io.Reader, dest, expectedTop string) error {
 			if err := writeRegularNoFollow(target, tr, mode); err != nil {
 				return err
 			}
-			if err := finishMember(target, hdr, mode|special); err != nil {
+			d, err := finishMember(target, hdr, mode|special)
+			noteDropped(d)
+			if err != nil {
 				return err
 			}
 		case tar.TypeSymlink:
@@ -297,12 +337,12 @@ func setLsetxattrForTest(fn func(string, string, []byte) error) (restore func())
 // the special bits (chown clears setuid and setgid), then its extended
 // attributes (chown also clears a file capability). The owner is best-effort,
 // as before: an unprivileged caller cannot chown.
-func finishMember(target string, hdr *tar.Header, mode os.FileMode) error {
+func finishMember(target string, hdr *tar.Header, mode os.FileMode) ([]string, error) {
 	_ = lchown(target, hdr.Uid, hdr.Gid)
 	if err := os.Chmod(target, mode); err != nil {
-		return fmt.Errorf("rootfs tar: mode of %q: %w", hdr.Name, err)
+		return nil, fmt.Errorf("rootfs tar: mode of %q: %w", hdr.Name, err)
 	}
-	return applyXattrs(target, hdr)
+	return applyXattrs(target, hdr, mode)
 }
 
 // xattrPAXPrefix is how GNU tar --xattrs (and Go) carry an attribute.
@@ -316,25 +356,56 @@ const xattrPAXPrefix = "SCHILY.xattr."
 // its raw attribute beside it.
 var rootfsXattrNamespaces = []string{"security.", "system.posix_acl_access", "system.posix_acl_default", "user."}
 
-// applyXattrs sets the archived extended attributes of target. A filesystem
-// that takes no attributes of a namespace (ENOTSUP) is not an error for user.*
-// attributes, which carry no access control; a capability, label or ACL that
-// cannot be set fails the extraction rather than restore a file with less or
-// more access than it had.
-func applyXattrs(target string, hdr *tar.Header) error {
+// applyXattrs sets the archived extended attributes of target. An attribute
+// the target filesystem does not support (ENOTSUP: ZFS with acltype=off, NFS)
+// is dropped and returned, as main dropped them all, rather than fail the
+// restore. Dropping must never widen access: without its access ACL, a file's
+// group-class mode bits (the ACL mask) would become the owning group's
+// permissions, so they are narrowed to the ACL's own group entry. A dropped
+// capability or label only ever removes privilege. Any other error fails.
+func applyXattrs(target string, hdr *tar.Header, mode os.FileMode) ([]string, error) {
+	var dropped []string
 	for k, v := range hdr.PAXRecords {
 		name, ok := strings.CutPrefix(k, xattrPAXPrefix)
 		if !ok || !xattrAllowed(name) {
 			continue
 		}
-		if err := lsetxattr(target, name, []byte(v)); err != nil {
-			if strings.HasPrefix(name, "user.") && errorsIsNotSupported(err) {
-				continue
+		err := lsetxattr(target, name, []byte(v))
+		if err == nil {
+			continue
+		}
+		if !errorsIsNotSupported(err) {
+			return dropped, fmt.Errorf("rootfs tar: set %s on %q: %w", name, hdr.Name, err)
+		}
+		dropped = append(dropped, hdr.Name+" "+name)
+		if name == "system.posix_acl_access" {
+			if g, ok := aclGroupObjPerm(v); ok {
+				narrowed := mode&^0o070 | (mode & 0o070 & os.FileMode(g<<3))
+				if err := os.Chmod(target, narrowed); err != nil {
+					return dropped, fmt.Errorf("rootfs tar: narrow the mode of %q for its dropped ACL: %w", hdr.Name, err)
+				}
+			} else if err := os.Chmod(target, mode&^0o070); err != nil {
+				return dropped, fmt.Errorf("rootfs tar: narrow the mode of %q for its dropped ACL: %w", hdr.Name, err)
 			}
-			return fmt.Errorf("rootfs tar: set %s on %q: %w", name, hdr.Name, err)
 		}
 	}
-	return nil
+	sort.Strings(dropped)
+	return dropped, nil
+}
+
+// aclGroupObjPerm returns the rwx bits of an ACL xattr's owning-group
+// (ACL_GROUP_OBJ) entry.
+func aclGroupObjPerm(v string) (uint32, bool) {
+	b := []byte(v)
+	if len(b) < 4 || (len(b)-4)%8 != 0 || binary.LittleEndian.Uint32(b) != 2 {
+		return 0, false
+	}
+	for off := 4; off < len(b); off += 8 {
+		if binary.LittleEndian.Uint16(b[off:]) == 0x04 {
+			return uint32(binary.LittleEndian.Uint16(b[off+2:]) & 0o7), true
+		}
+	}
+	return 0, false
 }
 
 func xattrAllowed(name string) bool {

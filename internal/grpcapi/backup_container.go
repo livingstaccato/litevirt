@@ -977,6 +977,7 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 			s.audit(ctx, "ct.restore", req.Name, "project="+project, "error")
 			return status.Errorf(codes.Internal, "import container: %v", importErr)
 		}
+		s.reportDroppedAttrs(ctx, req.Name, "restore")
 		// Stamp the proof marker immediately after import, BEFORE the DB row — so a crash
 		// in the row write resumes (marker match → skipImport) instead of re-importing. If
 		// the marker can't be written, a later crash would strand an unmarked artifact, so

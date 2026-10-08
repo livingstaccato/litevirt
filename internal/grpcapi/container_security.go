@@ -17,6 +17,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/events"
 	"github.com/litevirt/litevirt/internal/lxc"
 	"github.com/litevirt/litevirt/internal/safename"
 )
@@ -375,4 +376,30 @@ func containerSecurityOf(r corrosion.ContainerRecord) (privileged bool, confinem
 		confinement = lxc.ConfinementLegacy
 	}
 	return spec.IDMapBase == 0, confinement, spec.IDMapBase
+}
+
+// droppedAttrsTaker is the runtime half of an import's dropped attributes
+// (lxc.LxcRunner.TakeDroppedAttrs).
+type droppedAttrsTaker interface {
+	TakeDroppedAttrs(name string) ([]string, error)
+}
+
+// reportDroppedAttrs records, as a container event and a warning, the
+// attributes the last import of name dropped because this host's filesystem
+// does not support them (a dropped ACL narrowed the file's group bits).
+func (s *Server) reportDroppedAttrs(ctx context.Context, name, op string) {
+	t, ok := s.containerRuntime.(droppedAttrsTaker)
+	if !ok {
+		return
+	}
+	dropped, err := t.TakeDroppedAttrs(name)
+	if err != nil || len(dropped) == 0 {
+		return
+	}
+	detail := op + " dropped attributes this filesystem does not support (a dropped ACL narrowed the file's group bits): " + strings.Join(dropped, "; ")
+	slog.Warn("container "+op+": attributes dropped", "container", name, "dropped", dropped)
+	s.audit(ctx, "ct."+op, name, detail, "warning")
+	if s.events != nil {
+		s.events.Publish(events.Event{Action: "ct.attrs.dropped", Target: name, Detail: detail})
+	}
 }

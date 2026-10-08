@@ -20,9 +20,12 @@ package lxc
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"log/slog"
 	"math"
 	"net"
 	"os"
@@ -743,56 +746,114 @@ func (r *LxcRunner) ContainerExists(name string) (bool, error) {
 }
 
 // importContainer is the shared extract path. replace=false refuses to clobber
-// (fresh import/restore); replace=true renames any existing dir aside first and
+// (fresh import/restore); replace=true sets any existing dir aside and
 // restores it on failure (crash-safe snapshot revert — a corrupt snapshot tar
 // can never lose the live container).
+//
+// The archive is laid down in a private (0700) staging directory under
+// lxcpath and moved into place only once its config points at the final
+// rootfs and the container directory is closed to other host users
+// (secureContainerDirAt): a rootfs may carry setuid binaries, and the
+// archive's own directory mode (0755 from an earlier build) must never be
+// reachable while they are there. Root's subordinate range is ensured for an
+// unprivileged container here, on the host it lands on. Attributes the
+// filesystem does not support are dropped and recorded (droppedAttrsFile).
 func (r *LxcRunner) importContainer(ctx context.Context, name string, src io.Reader, replace bool) error {
 	// The name becomes <lxcpath>/<name>; validate it before it composes a path.
 	if err := safename.ValidateContainerName(name); err != nil {
 		return err
 	}
 	dir := filepath.Join(r.lxcpath(), name)
+	if _, err := os.Stat(dir); err == nil && !replace {
+		return fmt.Errorf("container dir %s already exists; refusing to overwrite", dir)
+	}
+	if err := os.MkdirAll(r.lxcpath(), 0o755); err != nil {
+		return fmt.Errorf("ensure lxcpath %s: %w", r.lxcpath(), err)
+	}
+	staging, err := os.MkdirTemp(r.lxcpath(), ".litevirt-import-"+name+"-")
+	if err != nil {
+		return fmt.Errorf("staging dir for %s: %w", name, err)
+	}
+	defer os.RemoveAll(staging)
+	if err := os.Chmod(staging, 0o700); err != nil {
+		return err
+	}
+	// Slip-safe extraction: the archive is untrusted backup-repo data, so we
+	// contain every member under the staging dir, never write through a
+	// symlink, and require the single top-level dir to be the container name.
+	dropped, err := extractRootfs(src, staging, name)
+	if err != nil {
+		return fmt.Errorf("extract container %s: %w", name, err)
+	}
+	staged := filepath.Join(staging, name)
+	if err := rewriteRootFSPathAt(staged, filepath.Join(dir, "rootfs")); err != nil {
+		return err
+	}
+	if b, rerr := os.ReadFile(filepath.Join(staged, "config")); rerr == nil {
+		if sec := parseSecurity(string(b)); sec.IDMap != nil {
+			if err := r.ensureRootSubIDs(sec.IDMap); err != nil {
+				return err
+			}
+		}
+	}
+	if err := secureContainerDirAt(staged); err != nil {
+		return err
+	}
 	var backup string
 	if _, err := os.Stat(dir); err == nil {
-		if !replace {
-			return fmt.Errorf("container dir %s already exists; refusing to overwrite", dir)
-		}
-		// Move the current dir aside rather than deleting it, so we can roll
-		// back if the extract fails.
+		// Set the current dir aside rather than deleting it, so we can roll
+		// back if the swap fails.
 		backup = dir + ".revert-old"
 		_ = os.RemoveAll(backup) // clear any stale backup from a prior crash
 		if err := os.Rename(dir, backup); err != nil {
 			return fmt.Errorf("set aside existing dir %s for revert: %w", dir, err)
 		}
 	}
-	// rollback restores the set-aside dir on any failure past this point.
-	rollback := func(cause error) error {
-		_ = os.RemoveAll(dir)
+	if err := os.Rename(staged, dir); err != nil {
 		if backup != "" {
 			_ = os.Rename(backup, dir)
 		}
-		return cause
-	}
-	if err := os.MkdirAll(r.lxcpath(), 0o755); err != nil {
-		return rollback(fmt.Errorf("ensure lxcpath %s: %w", r.lxcpath(), err))
-	}
-	// Slip-safe extraction: the archive is untrusted backup-repo data, so we
-	// contain every member under <lxcpath>, never write through a symlink, and
-	// require the single top-level dir to be the container name (a tampered
-	// archive can't clobber a sibling container). Replaces a bare `tar -xf`.
-	if err := safename.ExtractRootfsTar(src, r.lxcpath(), name); err != nil {
-		return rollback(fmt.Errorf("extract container %s: %w", name, err))
-	}
-	if err := r.rewriteRootFSPath(name); err != nil {
-		return rollback(err)
-	}
-	if err := r.secureContainerDir(name); err != nil {
-		return rollback(err)
+		return fmt.Errorf("move container %s into place: %w", name, err)
 	}
 	if backup != "" {
 		_ = os.RemoveAll(backup) // success — drop the old copy
 	}
+	if len(dropped) > 0 {
+		slog.Warn("container import: the target filesystem does not support some attributes; they were dropped (a dropped ACL narrowed the file's group bits)",
+			"container", name, "dropped", dropped)
+		b, _ := json.Marshal(dropped)
+		_ = os.WriteFile(filepath.Join(dir, droppedAttrsFile), b, 0o600)
+	}
 	return nil
+}
+
+// extractRootfs is safename.ExtractRootfsTarReport; a variable so a test can
+// watch where it extracts.
+var extractRootfs = safename.ExtractRootfsTarReport
+
+// droppedAttrsFile records, in the container's directory, the attributes its
+// last import dropped, until TakeDroppedAttrs reports them.
+const droppedAttrsFile = "litevirt-dropped-attrs"
+
+// TakeDroppedAttrs returns and clears the attributes the container's last
+// import dropped ("<member> <attribute>"); nil when none.
+func (r *LxcRunner) TakeDroppedAttrs(name string) ([]string, error) {
+	if err := safename.ValidateContainerName(name); err != nil {
+		return nil, err
+	}
+	p := filepath.Join(r.lxcpath(), name, droppedAttrsFile)
+	b, err := os.ReadFile(p)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	if err := json.Unmarshal(b, &out); err != nil {
+		return nil, err
+	}
+	return out, os.Remove(p)
 }
 
 // CloneContainer makes a full copy of src's on-disk dir as dst (`cp -a`), then
@@ -906,12 +967,17 @@ func lxcNetOrdinal(line string) (int, bool) {
 // <lxcpath>/<name>/rootfs after an import, so a container restored under a
 // different lxcpath (or from another host) boots against the real rootfs.
 func (r *LxcRunner) rewriteRootFSPath(name string) error {
-	cfg := filepath.Join(r.lxcpath(), name, "config")
+	return rewriteRootFSPathAt(filepath.Join(r.lxcpath(), name), filepath.Join(r.lxcpath(), name, "rootfs"))
+}
+
+// rewriteRootFSPathAt pins the config in containerDir to rootfs.
+func rewriteRootFSPathAt(containerDir, rootfs string) error {
+	cfg := filepath.Join(containerDir, "config")
 	data, err := os.ReadFile(cfg)
 	if err != nil {
 		return fmt.Errorf("read imported config %s: %w", cfg, err)
 	}
-	want := "lxc.rootfs.path = dir:" + filepath.Join(r.lxcpath(), name, "rootfs")
+	want := "lxc.rootfs.path = dir:" + rootfs
 	lines := strings.Split(string(data), "\n")
 	replaced := false
 	for i, line := range lines {

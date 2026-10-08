@@ -285,6 +285,7 @@ func (s *Server) RevertContainerSnapshot(ctx context.Context, req *pb.RevertCont
 		s.audit(ctx, "ct.snapshot.revert", req.Name, "project="+project, "error")
 		return nil, status.Errorf(codes.Internal, "revert: %v", err)
 	}
+	s.reportDroppedAttrs(ctx, req.Name, "snapshot.revert")
 	if wasRunning {
 		if err := s.containerRuntime.StartContainer(ctx, req.Name); err != nil {
 			s.audit(ctx, "ct.snapshot.revert", req.Name, "project="+project+" (restart failed)", "error")

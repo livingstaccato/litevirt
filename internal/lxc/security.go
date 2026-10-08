@@ -379,6 +379,14 @@ func (r *LxcRunner) prepareStart(name string) error {
 	if sec.Converting {
 		return fmt.Errorf("container %q has an unfinished conversion; run the same lv ct convert again to finish it before starting", name)
 	}
+	// LXC refuses an unprivileged container whose range lies outside root's
+	// subordinate ranges (when the host hands them out): ensured on every
+	// start, so a container this host never created starts too.
+	if sec.IDMap != nil {
+		if err := r.ensureRootSubIDs(sec.IDMap); err != nil {
+			return err
+		}
+	}
 	if sec.IDMap != nil && sec.IDMappedMount && !r.useIDMappedMount() {
 		if err := r.applySecurity(name, sec.Confinement, nil, sec.IDMap, false); err != nil {
 			return fmt.Errorf("container %q: this host cannot mount its rootfs idmapped, and shifting it failed: %w", name, err)
@@ -545,18 +553,23 @@ func covered(p string, idmap *IDMap) bool {
 // capabilities (a restore keeps them), and a host user who could reach one
 // under the directory could run it.
 func (r *LxcRunner) secureContainerDir(name string) error {
-	dir := filepath.Join(r.lxcpath(), name)
-	sec, err := r.Security(name)
+	return secureContainerDirAt(filepath.Join(r.lxcpath(), name))
+}
+
+// secureContainerDirAt is secureContainerDir for a container directory at dir,
+// its security read from dir/config.
+func secureContainerDirAt(dir string) error {
+	b, err := os.ReadFile(filepath.Join(dir, "config"))
 	if err != nil {
-		return err
+		return fmt.Errorf("read container config in %s: %w", dir, err)
 	}
-	if sec.IDMap != nil {
+	if sec := parseSecurity(string(b)); sec.IDMap != nil {
 		if err := lchown(dir, int(sec.IDMap.Base), int(sec.IDMap.Base)); err != nil {
-			return fmt.Errorf("give container %q's directory to its mapped root: %w", name, err)
+			return fmt.Errorf("give container directory %s to its mapped root: %w", dir, err)
 		}
 	}
 	if err := os.Chmod(dir, 0o770); err != nil {
-		return fmt.Errorf("container %q directory mode: %w", name, err)
+		return fmt.Errorf("container directory %s mode: %w", dir, err)
 	}
 	return nil
 }

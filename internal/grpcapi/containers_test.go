@@ -60,6 +60,11 @@ type fakeCTRuntime struct {
 	// converts records ConvertContainerSecurity calls.
 	security map[string]lxc.Security
 	converts []fakeConvert
+	// dropped is what TakeDroppedAttrs reports per container (once).
+	dropped map[string][]string
+	// revertSecurity is the security a RevertContainer lays down (the
+	// snapshot's own config), per container.
+	revertSecurity map[string]lxc.Security
 
 	// B0 day-2 primitives: rootfs path a test wants returned, plus freeze/unfreeze
 	// call tracking so backup/snapshot tests can assert quiesce + unfreeze.
@@ -302,6 +307,14 @@ func (f *fakeCTRuntime) CloneContainer(_ context.Context, src, dst string) error
 	return nil
 }
 func (f *fakeCTRuntime) ListContainers(_ context.Context) ([]string, error) { return f.listNames, nil }
+
+func (f *fakeCTRuntime) TakeDroppedAttrs(name string) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	d := f.dropped[name]
+	delete(f.dropped, name)
+	return d, nil
+}
 
 type fakeConvert struct {
 	name string

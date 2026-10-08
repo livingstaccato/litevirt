@@ -149,3 +149,14 @@ func (a *LXCRuntimeAdapter) ConvertContainerSecurity(ctx context.Context, name s
 	}
 	return errors.New("this container runtime cannot convert a container")
 }
+
+// TakeDroppedAttrs passes through the attributes the runtime's last import
+// dropped (lxc.LxcRunner); nil when it records none.
+func (a *LXCRuntimeAdapter) TakeDroppedAttrs(name string) ([]string, error) {
+	if t, ok := a.Inner.(interface {
+		TakeDroppedAttrs(string) ([]string, error)
+	}); ok {
+		return t.TakeDroppedAttrs(name)
+	}
+	return nil, nil
+}

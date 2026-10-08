@@ -642,7 +642,7 @@ func describeConvert(to *ConvertOpts) string {
 	return strings.Join(parts, ", ")
 }
 
-// convertCommand is the lv command that finishes a conversion to `to`
+// convertCommand is the CLI line that finishes a conversion to `to`
 // (whatever range it is given, a recorded range is resumed).
 func convertCommand(name string, to *ConvertOpts) string {
 	cmd := "lv ct convert " + name

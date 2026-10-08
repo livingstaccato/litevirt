@@ -148,6 +148,27 @@ func ForeignWorkloadsOnNetwork(ctx context.Context, c *Client, networkName, stac
 	return out, nil
 }
 
+// VMNamesOnNetwork names the live VMs with a NIC (a live vm_interfaces or
+// vm_nics row) on networkName, on any host.
+func VMNamesOnNetwork(ctx context.Context, c *Client, networkName string) ([]string, error) {
+	rows, err := c.Query(ctx,
+		`SELECT DISTINCT v.name AS name FROM vms v
+		 WHERE v.deleted_at IS NULL
+		   AND v.name IN (
+		     SELECT vm_name FROM vm_interfaces WHERE network_name = ? AND deleted_at IS NULL
+		     UNION SELECT vm_name FROM vm_nics WHERE network_name = ? AND deleted_at IS NULL)
+		 ORDER BY v.name`,
+		networkName, networkName)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, r := range rows {
+		out = append(out, r.String("name"))
+	}
+	return out, nil
+}
+
 // CountWorkloadsOnNetwork counts the VMs (by a live vm_interfaces or vm_nics
 // row) and the containers (by a live container_interfaces row) with a NIC on
 // networkName, on any host.

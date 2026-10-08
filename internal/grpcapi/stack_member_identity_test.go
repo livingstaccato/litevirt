@@ -174,3 +174,27 @@ func TestDeleteStack_KeepsANetworkAKeptVMUses(t *testing.T) {
 		t.Errorf("no progress says the network was kept for rc5-isosym: %+v", stream.sent)
 	}
 }
+
+// Review M-6: a VM DeleteStack keeps at delete time — a member's name whose
+// row is another incarnation (errNotStackMember from the owner's binding
+// check) — records the same stack, so "a workload of another stack" does
+// not see it. It still keeps the networks it uses.
+func TestStackNetworkUsers_AVMKeptAtDeleteTimeKeepsItsNetwork(t *testing.T) {
+	s := testServerR2(t)
+	ctx := adminContext(context.Background())
+	if err := corrosion.InsertVM(ctx, s.db,
+		corrosion.VMRecord{Name: "web", StackName: "st", HostName: "test-host", State: "stopped", CPUActual: 1, MemActual: 256},
+		[]corrosion.InterfaceRecord{{VMName: "web", NetworkName: "st_lan", MAC: "52:54:00:00:00:02"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if users, err := s.stackNetworkUsers(ctx, "st_lan", "st", nil); err != nil || len(users) != 0 {
+		t.Fatalf("no VM kept: users = %v, %v; want none (web is the stack's own and being deleted)", users, err)
+	}
+	users, err := s.stackNetworkUsers(ctx, "st_lan", "st", []string{"web"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(users) != 1 || users[0] != "web" {
+		t.Fatalf("users = %v, want the kept VM web", users)
+	}
+}

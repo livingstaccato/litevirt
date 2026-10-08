@@ -141,7 +141,7 @@ func (s *Server) migrateSourceFromPeer(ctx context.Context) string {
 // streams the manifest back over peer mTLS (sinkRemoteContainerBackup), then
 // confirms it landed — so no shared repo is required (PR 4). sink_host drives the
 // owner side of that forward and is gated to the sink peer (requireSinkPeer).
-func (s *Server) BackupContainer(req *pb.BackupContainerRequest, stream grpc.ServerStreamingServer[pb.BackupContainerProgress]) error {
+func (s *Server) BackupContainer(req *pb.BackupContainerRequest, stream grpc.ServerStreamingServer[pb.BackupContainerProgress]) (retErr error) {
 	ctx := stream.Context()
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return err
@@ -180,6 +180,8 @@ func (s *Server) BackupContainer(req *pb.BackupContainerRequest, stream grpc.Ser
 			"container %q lives on host %q; re-run against that daemon (set LV_HOST)",
 			req.Name, host)
 	}
+	op := s.startContainerOp("backup", req.Name, "repo", req.RepoPath)
+	defer func() { op.done(retErr) }()
 	if s.containerRuntime == nil {
 		return status.Error(codes.Unavailable, "container runtime not wired on this host")
 	}
@@ -217,6 +219,7 @@ func (s *Server) BackupContainer(req *pb.BackupContainerRequest, stream grpc.Ser
 	if timestamp == "" {
 		timestamp = time.Now().UTC().Format(time.RFC3339)
 	}
+	op.with("timestamp", timestamp)
 
 	send := func(p *pb.BackupContainerProgress) error { return stream.Send(p) }
 
@@ -594,7 +597,7 @@ func (s *Server) archiveContainer(ctx context.Context, repo *pbsstore.Repo, rec 
 // archived tar, hand it to the runtime to lay down rootfs+config, then recreate
 // the cluster row from the embedded spec. Self-contained — works after the
 // source container (and even its image) is gone. Runs on the target host.
-func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.ServerStreamingServer[pb.RestoreContainerProgress]) error {
+func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.ServerStreamingServer[pb.RestoreContainerProgress]) (retErr error) {
 	ctx := stream.Context()
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return err
@@ -616,6 +619,8 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 		return status.Errorf(codes.FailedPrecondition,
 			"restore must run on the target host %q (set LV_HOST)", target)
 	}
+	op := s.startContainerOp("restore", req.Name, "timestamp", req.Timestamp, "repo", req.RepoPath)
+	defer func() { op.done(retErr) }()
 	if s.containerRuntime == nil {
 		return status.Error(codes.Unavailable, "container runtime not wired on this host")
 	}

@@ -34,7 +34,7 @@ import (
 //
 // Runs on the source host — point it at the owning daemon (FailedPrecondition
 // names it otherwise). No CRIU / live migration.
-func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.ServerStreamingServer[pb.MigrateContainerProgress]) error {
+func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.ServerStreamingServer[pb.MigrateContainerProgress]) (retErr error) {
 	ctx := stream.Context()
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return err
@@ -57,6 +57,8 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 			"container %q lives on host %q; run migrate against that daemon (set LV_HOST)",
 			req.Name, source)
 	}
+	op := s.startContainerOp("migrate", req.Name, "target", req.TargetHost, "repo", req.RepoPath)
+	defer func() { op.done(retErr) }()
 	if req.TargetHost == s.hostName {
 		return status.Error(codes.InvalidArgument, "source and target host are identical")
 	}

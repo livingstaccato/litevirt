@@ -107,9 +107,10 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 	}
 	// The source's lock, held until the clone's row exists (review M-1): a
 	// linked clone backs on the source's current layer before anything
-	// records that, and a snapshot delete of the source — which holds this
-	// lock — merges and removes layers no record uses. The source is judged
-	// again under it.
+	// records that. A snapshot delete or restore of the source holds this
+	// lock, and asks which VMs back on its files only by their rows and the
+	// headers of their disk files, neither of which exists for this clone
+	// until it is made. The source is judged again under it.
 	unlockSrc := s.lockVM(req.Source)
 	defer unlockSrc()
 	if fresh, gErr := corrosion.GetVM(ctx, s.db, req.Source); gErr != nil || fresh == nil {

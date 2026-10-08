@@ -1420,6 +1420,7 @@ func (f *Fake) DeleteSnapshot(domainName, snapshotName string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	delete(f.snapshots[domainName], snapshotName)
+	delete(f.snapshotFiles[domainName], snapshotName)
 	f.record("snapshot-delete", domainName, snapshotName)
 	return nil
 }
@@ -1430,6 +1431,7 @@ func (f *Fake) FlattenSnapshot(domainName, snapshotName string) error {
 		return fmt.Errorf("libvirtfake: no snapshot %q for %q", snapshotName, domainName)
 	}
 	delete(f.snapshots[domainName], snapshotName)
+	delete(f.snapshotFiles[domainName], snapshotName)
 	f.record("snapshot-flatten", domainName, snapshotName)
 	return nil
 }

@@ -12082,9 +12082,13 @@ func (x *CreateContainerRequest) GetConfinement() string {
 // only): before the source is stopped, the target ensures root's subordinate
 // range covers the container's id range (LXC refuses to start it otherwise).
 type PrepareContainerTargetRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	IdmapBase     int64                  `protobuf:"varint,1,opt,name=idmap_base,json=idmapBase,proto3" json:"idmap_base,omitempty"`
-	IdmapSize     int64                  `protobuf:"varint,2,opt,name=idmap_size,json=idmapSize,proto3" json:"idmap_size,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	IdmapBase int64                  `protobuf:"varint,1,opt,name=idmap_base,json=idmapBase,proto3" json:"idmap_base,omitempty"`
+	IdmapSize int64                  `protobuf:"varint,2,opt,name=idmap_size,json=idmapSize,proto3" json:"idmap_size,omitempty"`
+	// The container being migrated and its source host: its own recorded
+	// range is the one requested, so only OTHER containers' ranges conflict.
+	Name          string `protobuf:"bytes,3,opt,name=name,proto3" json:"name,omitempty"`
+	SourceHost    string `protobuf:"bytes,4,opt,name=source_host,json=sourceHost,proto3" json:"source_host,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -12131,6 +12135,20 @@ func (x *PrepareContainerTargetRequest) GetIdmapSize() int64 {
 		return x.IdmapSize
 	}
 	return 0
+}
+
+func (x *PrepareContainerTargetRequest) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *PrepareContainerTargetRequest) GetSourceHost() string {
+	if x != nil {
+		return x.SourceHost
+	}
+	return ""
 }
 
 // ConvertContainerRequest changes a STOPPED container's security settings in
@@ -34733,12 +34751,15 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\vconfinement\x18\x11 \x01(\tR\vconfinement\x1a9\n" +
 	"\vLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"]\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x92\x01\n" +
 	"\x1dPrepareContainerTargetRequest\x12\x1d\n" +
 	"\n" +
 	"idmap_base\x18\x01 \x01(\x03R\tidmapBase\x12\x1d\n" +
 	"\n" +
-	"idmap_size\x18\x02 \x01(\x03R\tidmapSize\"\x90\x01\n" +
+	"idmap_size\x18\x02 \x01(\x03R\tidmapSize\x12\x12\n" +
+	"\x04name\x18\x03 \x01(\tR\x04name\x12\x1f\n" +
+	"\vsource_host\x18\x04 \x01(\tR\n" +
+	"sourceHost\"\x90\x01\n" +
 	"\x17ConvertContainerRequest\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\"\n" +

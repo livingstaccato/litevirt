@@ -318,3 +318,52 @@ func TestRevertContainerSnapshot_MarksTheCopyBeforeTheSwap(t *testing.T) {
 		t.Fatalf("revert marks = %+v, want the row's range and confinement", rt.revertMarks)
 	}
 }
+
+type ensureRecorder struct {
+	*fakeCTRuntime
+	got []int64
+}
+
+func (e *ensureRecorder) EnsureContainerIDRange(base, size int64) error {
+	e.got = append(e.got, base)
+	return nil
+}
+
+// PrepareContainerTarget writes root's subordinate range only for a range
+// containers are allocated from, and not one another container records.
+func TestPrepareContainerTarget_ValidatesTheRange(t *testing.T) {
+	s := newPeerAuthServer(t) // hostName "self", knows peer "peer-1"
+	rt := &ensureRecorder{fakeCTRuntime: &fakeCTRuntime{}}
+	s.SetContainerRuntime(rt)
+	ctx := context.Background()
+	slot := func(i int) int64 { return s.idmapSlotBase(i) }
+	if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{HostName: "peer-1", Name: "moving", State: "stopped",
+		CreateSpec: corrosion.EncodeCreateSpec(corrosion.ContainerCreateSpec{Template: "download", IDMapBase: slot(3)})}); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{HostName: "self", Name: "other", State: "running",
+		CreateSpec: corrosion.EncodeCreateSpec(corrosion.ContainerCreateSpec{Template: "download", IDMapBase: slot(5)})}); err != nil {
+		t.Fatal(err)
+	}
+	peer := mtlsAdminCtx("peer-1")
+	for _, bad := range []*pb.PrepareContainerTargetRequest{
+		{IdmapBase: 1, IdmapSize: 1 << 30, Name: "moving", SourceHost: "peer-1"},                 // the host's own ids
+		{IdmapBase: slot(3), IdmapSize: 1 << 20, Name: "moving", SourceHost: "peer-1"},           // not a container range
+		{IdmapBase: slot(3) + 1, IdmapSize: lxc.IDMapSize, Name: "moving", SourceHost: "peer-1"}, // misaligned
+		{IdmapBase: slot(defaultIDMapRanges), IdmapSize: lxc.IDMapSize, Name: "moving", SourceHost: "peer-1"},
+		{IdmapBase: slot(5), IdmapSize: lxc.IDMapSize, Name: "moving", SourceHost: "peer-1"}, // other's range
+	} {
+		if _, err := s.PrepareContainerTarget(peer, bad); err == nil {
+			t.Errorf("accepted %+v", bad)
+		}
+	}
+	if len(rt.got) != 0 {
+		t.Fatalf("wrote ranges for invalid requests: %v", rt.got)
+	}
+	if _, err := s.PrepareContainerTarget(peer, &pb.PrepareContainerTargetRequest{IdmapBase: slot(3), IdmapSize: lxc.IDMapSize, Name: "moving", SourceHost: "peer-1"}); err != nil {
+		t.Fatalf("the migrating container's own range: %v", err)
+	}
+	if len(rt.got) != 1 || rt.got[0] != slot(3) {
+		t.Fatalf("ensured %v", rt.got)
+	}
+}

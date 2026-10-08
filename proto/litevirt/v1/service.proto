@@ -1179,6 +1179,10 @@ message CreateContainerRequest {
 message PrepareContainerTargetRequest {
     int64 idmap_base = 1;
     int64 idmap_size = 2;
+    // The container being migrated and its source host: its own recorded
+    // range is the one requested, so only OTHER containers' ranges conflict.
+    string name = 3;
+    string source_host = 4;
 }
 
 // ConvertContainerRequest changes a STOPPED container's security settings in

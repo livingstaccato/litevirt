@@ -733,8 +733,10 @@ to image-recreate (without managed-NIC reconstruction).
 
 Before the source is stopped, a migrate asks the target to give root the
 subordinate range for an unprivileged container's id range (the peer-only
-`PrepareContainerTarget`). A target that cannot — its `/etc/subuid` is locked
-or not writable — refuses the migrate while the source still runs, untouched.
+`PrepareContainerTarget`). The target takes only a real container range — 65536
+ids at a slot of its configured `containers.idmap_*` span — that no other
+container records. A target that cannot — its `/etc/subuid` is locked or not
+writable — refuses the migrate while the source still runs, untouched.
 A target older than this release cannot be asked; the migrate proceeds and the
 target's own start ensures the range.
 

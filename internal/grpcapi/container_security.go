@@ -430,8 +430,8 @@ func (s *Server) PrepareContainerTarget(ctx context.Context, req *pb.PrepareCont
 	if err := s.requirePeerCert(ctx); err != nil {
 		return nil, err
 	}
-	if req.IdmapBase <= 0 || req.IdmapSize <= 0 {
-		return nil, status.Error(codes.InvalidArgument, "idmap_base and idmap_size required")
+	if err := s.validatePreparedRange(ctx, req); err != nil {
+		return nil, err
 	}
 	e, ok := s.containerRuntime.(idRangeEnsurer)
 	if !ok {
@@ -456,7 +456,9 @@ func (s *Server) prepareMigrateTarget(ctx context.Context, target string, rec *c
 		return status.Errorf(codes.Unavailable, "reach target %q to prepare it: %v", target, err)
 	}
 	defer closer()
-	if _, err := c.PrepareContainerTarget(ctx, &pb.PrepareContainerTargetRequest{IdmapBase: base, IdmapSize: lxc.IDMapSize}); err != nil {
+	if _, err := c.PrepareContainerTarget(ctx, &pb.PrepareContainerTargetRequest{
+		IdmapBase: base, IdmapSize: lxc.IDMapSize, Name: rec.Name, SourceHost: rec.HostName,
+	}); err != nil {
 		if status.Code(err) == codes.Unimplemented {
 			slog.Warn("migrate: the target predates PrepareContainerTarget; root's subordinate range there is not ensured", "target", target, "container", rec.Name)
 			return nil
@@ -530,4 +532,34 @@ func (s *Server) revertKeepingSecurity(ctx context.Context, rec *corrosion.Conta
 		to.IDMap = &lxc.IDMap{Base: spec.IDMapBase, Size: lxc.IDMapSize}
 	}
 	return rc.RevertContainerConverting(ctx, rec.Name, r, to)
+}
+
+// validatePreparedRange admits only a container range: lxc.IDMapSize ids at a
+// slot of the configured span, which no container other than the one being
+// migrated records. A trusted peer is not thereby trusted to append any
+// root: line to /etc/subuid.
+func (s *Server) validatePreparedRange(ctx context.Context, req *pb.PrepareContainerTargetRequest) error {
+	base, n := s.idmapConfig()
+	if req.IdmapSize != lxc.IDMapSize {
+		return status.Errorf(codes.InvalidArgument, "idmap_size %d: a container range is %d ids", req.IdmapSize, lxc.IDMapSize)
+	}
+	off := req.IdmapBase - base
+	if req.IdmapBase < base || off%lxc.IDMapSize != 0 || off/lxc.IDMapSize >= int64(n) {
+		return status.Errorf(codes.InvalidArgument,
+			"idmap_base %d is not a container range of this cluster (%d ranges from %d)", req.IdmapBase, n, base)
+	}
+	rows, err := corrosion.ListContainers(ctx, s.db, "")
+	if err != nil {
+		return status.Errorf(codes.Unavailable, "read container id ranges: %v", err)
+	}
+	for _, r := range rows {
+		if r.HostName == req.SourceHost && r.Name == req.Name {
+			continue
+		}
+		if corrosion.DecodeCreateSpec(r.CreateSpec).IDMapBase == req.IdmapBase {
+			return status.Errorf(codes.FailedPrecondition,
+				"id range %d is container %s/%s's; it cannot be prepared for %s", req.IdmapBase, r.HostName, r.Name, req.Name)
+		}
+	}
+	return nil
 }

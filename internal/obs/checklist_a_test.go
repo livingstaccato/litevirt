@@ -8,8 +8,8 @@ import (
 // Checklist (a) — no OTLP endpoint on a cold boot:
 //
 //	TracingActive false, zero otel in the RPC path (the journal shape and
-//	the unredacted token= line are pinned in journal_shape_test.go and
-//	TestSetup_NoEndpoint_TokenAttrNotRedacted). Runnable on macOS (no libvirt,
+//	the unredacted capability= line are pinned in journal_shape_test.go and
+//	TestSetup_NoEndpoint_CapabilityAttrNotRedacted). Runnable on macOS (no libvirt,
 //	no cluster).
 //
 //	go test ./internal/obs/ -count=1 -v -run TestChecklist_A

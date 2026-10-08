@@ -181,7 +181,7 @@ func (s *Server) abandonRecoveryProof(ctx context.Context, key corrosion.ClaimKe
 		return corrosion.ClaimAbandonment{}, status.Errorf(codes.Unavailable, "record abandonment: %v", err)
 	}
 	slog.Warn("recovery claims: abandoned a decided recovery this host will never execute",
-		"key", key.String(), "proof", proofID, "reason", reason)
+		"claim", key.String(), "proof", proofID, "reason", reason)
 	s.audit(ctx, "recovery_claim.abandon", key.TargetKind+"/"+key.TargetName,
 		fmt.Sprintf("proof %s at %s: %s", proofID, key, reason), "ok")
 	return signer.SignAbandonment(proofID, key, reason)

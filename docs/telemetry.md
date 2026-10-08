@@ -46,8 +46,16 @@ level with `component=grpc` (errors only, as gRPC's default; open more with
 `GRPC_GO_LOG_SEVERITY_LEVEL=warning|info`), and anything using Go's standard
 `log` package as an `INFO` record per line.
 
-Values are not redacted by the vendor's PII sanitizer (litevirt's
-`token=<capability>` lines are not secrets); set `PROVIDE_LOG_SANITIZE=true` to
+An attribute whose key names secret material is always logged as
+`[REDACTED]`, in every format and whether or not an endpoint is set: `password`,
+`passwd`, `pass`, `token`, `secret`, `bearer`, `authorization`, `key`, `keyring`,
+`credential(s)`, `api_key`, `private_key`, `ipmi_pass` / `ipmi_password`, and
+compound keys ending in `_password`, `_secret`, `_token`, `_credentials` and the
+like. litevirt's own non-secret identifiers use other keys (`capability=`,
+`lease=`, `claim=`, `key_id=`).
+
+The vendor's value-pattern sanitizer, which also rewrites message text that
+looks like a key or token, is off by default; set `PROVIDE_LOG_SANITIZE=true` to
 turn it on.
 
 Set an OTLP endpoint to turn export on. That single switch also activates the

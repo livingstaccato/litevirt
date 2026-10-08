@@ -506,10 +506,9 @@ func TestSetup_NoEndpointExplicitLogLevel_Honoured(t *testing.T) {
 	}
 }
 
-// An endpoint adopts the vendor logger, and defaults
-// PROVIDE_LOG_SANITIZE to false so litevirt's deliberately-non-secret
-// token=split_brain_gate_v1-style capability lines aren't redacted in the
-// exported stream either — litevirt owns its own log hygiene; the real
+// An endpoint adopts the vendor logger, and defaults PROVIDE_LOG_SANITIZE
+// to false: the value-pattern sanitizer rewrites non-secret lines, and
+// secret-bearing attributes are masked by key instead (redact.go). The
 // collector credential is scrubbed separately. Finding 4.
 func TestSetup_Endpoint_LogSanitizeDefaultsFalse(t *testing.T) {
 	cleanEnv(t)

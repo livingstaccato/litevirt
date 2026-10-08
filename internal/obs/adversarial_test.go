@@ -299,15 +299,15 @@ func TestSetup_InjectedProvider_IsSDKTracerProvider(t *testing.T) {
 	}
 }
 
-// litevirt's capability lines carry token=<name>, which is not a secret; the
-// local journal line must show it literally, not vendor-redacted.
-func TestSetup_NoEndpoint_TokenAttrNotRedacted(t *testing.T) {
+// litevirt's capability lines carry capability=<name>, which is not a
+// secret; the local journal line must show it literally, not redacted.
+func TestSetup_NoEndpoint_CapabilityAttrNotRedacted(t *testing.T) {
 	lines := captureDaemonStderr(t, Config{ServiceName: "s"}, func() {
-		slog.Info("capability check", "token", "split_brain_gate_v1")
+		slog.Info("capability check", "capability", "split_brain_gate_v1")
 	})
 	line := lineWith(lines, "capability check")
-	if logfmtFields(line)["token"] != "split_brain_gate_v1" {
-		t.Fatalf("token attribute redacted or missing: %q", line)
+	if logfmtFields(line)["capability"] != "split_brain_gate_v1" {
+		t.Fatalf("capability attribute redacted or missing: %q", line)
 	}
 }
 
@@ -438,18 +438,18 @@ func TestSetup_DirectInvalidOTELEndpoint_UnsetAndTracingOff(t *testing.T) {
 	}
 }
 
-// Explicit log_format=json with no endpoint must not redact token= (the
-// sanitizer defaults off in every mode).
-func TestSetup_NoEndpointJSON_TokenNotRedacted(t *testing.T) {
+// Explicit log_format=json with no endpoint must not redact capability=
+// (the value sanitizer defaults off in every mode).
+func TestSetup_NoEndpointJSON_CapabilityNotRedacted(t *testing.T) {
 	lines := captureDaemonStderr(t, Config{ServiceName: "s", LogFormat: "json"}, func() {
-		slog.Info("gate", "token", "split_brain_gate_v1")
+		slog.Info("gate", "capability", "split_brain_gate_v1")
 	})
 	var rec map[string]any
 	if err := json.Unmarshal([]byte(lineWith(lines, `"gate"`)), &rec); err != nil {
 		t.Fatalf("not a JSON record: %v (%q)", err, lines)
 	}
-	if rec["token"] != "split_brain_gate_v1" {
-		t.Fatalf("token redacted or missing: %v", rec)
+	if rec["capability"] != "split_brain_gate_v1" {
+		t.Fatalf("capability redacted or missing: %v", rec)
 	}
 }
 

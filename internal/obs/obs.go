@@ -367,11 +367,11 @@ func Setup(ctx context.Context, cfg Config) (func(context.Context) error, error)
 
 	}
 
-	// litevirt's deliberately-non-secret token= capability lines (e.g.
-	// token=split_brain_gate_v1) must not be redacted in the log stream, local
-	// or exported — litevirt owns its own log hygiene; the real collector
-	// credential is scrubbed separately (see credentialEnvVars below). Default
-	// OFF; an operator can re-enable vendor PII redaction with
+	// The vendor's value-pattern sanitizer is off by default: it rewrites
+	// whole messages that merely look like keys. Secret-bearing attributes are
+	// masked by KEY in every mode by redactHandler (redact.go) instead; the real
+	// collector credential is scrubbed separately (see credentialEnvVars
+	// below). An operator can re-enable vendor PII redaction with
 	// PROVIDE_LOG_SANITIZE=true. Must be set before SetupTelemetry, which reads
 	// it at logger-construction time.
 	setEnvDefault("PROVIDE_LOG_SANITIZE", "false")
@@ -409,7 +409,7 @@ func Setup(ctx context.Context, cfg Config) (func(context.Context) error, error)
 	// at the level they chose. The stdlib log package (third-party libraries)
 	// lands in the same handler as one INFO record per line, and gRPC's own
 	// logger is routed into it too (installGRPCLogger).
-	log := adoptLogger(telemetry.GetLogger(ctx, svc))
+	log := slog.New(newRedactHandler(adoptLogger(telemetry.GetLogger(ctx, svc)).Handler()))
 	slog.SetDefault(log)
 	installGRPCLogger()
 	// One-line startup visibility so an operator can tell export state at a glance
@@ -429,7 +429,7 @@ func Setup(ctx context.Context, cfg Config) (func(context.Context) error, error)
 // trace/span IDs). Prefer this over slog.Default() where a stable component
 // name aids filtering; existing slog.* calls also work after Setup.
 func Logger(ctx context.Context, name string) *slog.Logger {
-	return telemetry.GetLogger(ctx, name)
+	return slog.New(newRedactHandler(adoptLogger(telemetry.GetLogger(ctx, name)).Handler()))
 }
 
 // Trace runs fn inside a span named name and returns fn's error. Use for a

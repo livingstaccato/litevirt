@@ -519,13 +519,13 @@ func verifiedLifecycleRows(ctx context.Context, c *Client, keyring *AuditKeyring
 			seq, r.String("by_key_id"), r.String("signature")); err != nil {
 			slog.Warn("ignoring an audit key lifecycle record that does not verify; it proves "+
 				"nothing about the key it names and is not treated as one",
-				"host", host, "key", keyID, "event", event, "error", err)
+				"host", host, "key_id", keyID, "event", event, "error", err)
 			continue
 		}
 		if !keyring.KeyBelongsToHost(ctx, c, keyID, host) {
 			slog.Warn("ignoring an audit key lifecycle record naming a key that does not belong "+
 				"to the host it claims; a signer speaks only for its OWN host's keys",
-				"host", host, "key", keyID, "event", event)
+				"host", host, "key_id", keyID, "event", event)
 			continue
 		}
 		subjectCert, subjectErr := keyring.certFor(ctx, c, keyID)
@@ -640,7 +640,7 @@ func reduceLifecycle(rows []lifecycleRow) map[lifecycleKey]map[string]int64 {
 				slog.Warn("ignoring an audit key lifecycle record whose signer has no standing "+
 					"over the key it names; only the key itself, a later-adopted key of the same "+
 					"host, or the cluster CA may speak for it",
-					"host", r.host, "key", r.keyID, "event", r.event, "signed_by", r.byKeyID)
+					"host", r.host, "key_id", r.keyID, "event", r.event, "signed_by", r.byKeyID)
 				continue
 			}
 		}

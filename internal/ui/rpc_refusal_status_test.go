@@ -25,7 +25,7 @@ import (
 // init, or in the statement just before it) and fails on a WriteHeader or
 // http.Error inside it that names 500 directly.
 func TestNoUIHandlerAnswersRPCErrorWith500(t *testing.T) {
-	for _, off := range rpcErrorAnswered(t, ".", is500) {
+	for _, off := range rpcErrorAnswered(t, ".", hardCoded(is500)) {
 		t.Errorf("%s: an error from %s is answered with a hard-coded 500; use "+
 			"rpcWriteFailed(w, what, err) or w.WriteHeader(httpStatusFor(err)), so the "+
 			"daemon's refusal reaches the browser as the 4xx it is, not as a server fault",
@@ -44,7 +44,7 @@ func TestNoUIHandlerAnswersRPCErrorWith500(t *testing.T) {
 // rpcErrorAnswered200Allowed names the handlers where 200 is deliberate; each
 // carries its reason beside the WriteHeader.
 func TestNoUIHandlerAnswersRPCErrorWith200(t *testing.T) {
-	for _, off := range rpcErrorAnswered(t, ".", is200) {
+	for _, off := range rpcErrorAnswered(t, ".", hardCoded(is200)) {
 		if reason, ok := rpcErrorAnswered200Allowed[off.fn]; ok && reason != "" {
 			continue
 		}
@@ -52,6 +52,55 @@ func TestNoUIHandlerAnswersRPCErrorWith200(t *testing.T) {
 			"rpcWriteFailed(w, what, err), so a refused write is not reported as a success "+
 			"and its empty body is not swapped into the page", off.pos, off.fn, off.rpc)
 	}
+}
+
+// TestNoUIHandlerAnswersRPCErrorWithAnImplicit200 catches the same flattening
+// without a literal: an error branch that sends an error toast and then renders
+// a partial (or writes nothing) never sets a status, so net/http answers 200.
+// That is how VM start/stop/restart and container start/stop/delete answered a
+// refusal. A branch passes when it sets a status by any means: rpcWriteFailed,
+// rpcWriteFailedRerender, w.WriteHeader or http.Error.
+func TestNoUIHandlerAnswersRPCErrorWithAnImplicit200(t *testing.T) {
+	for _, off := range rpcErrorAnswered(t, ".", errorToastWithoutStatus) {
+		t.Errorf("%s (%s): an error from %s sends an error toast but sets no status, so it is answered "+
+			"200; use rpcWriteFailed(w, what, err), or rpcWriteFailedRerender when the region "+
+			"is re-rendered either way", off.pos, off.fn, off.rpc)
+	}
+}
+
+// errorToastWithoutStatus reports a sendToast(w, ..., "error") under body when
+// nothing under body sets the response status.
+func errorToastWithoutStatus(body ast.Node) []token.Pos {
+	var toasts []token.Pos
+	setsStatus := false
+	ast.Inspect(body, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		switch fun := call.Fun.(type) {
+		case *ast.Ident:
+			switch fun.Name {
+			case "rpcWriteFailed", "rpcWriteFailedRerender":
+				setsStatus = true
+			case "sendToast":
+				if len(call.Args) == 3 {
+					if lit, ok := call.Args[2].(*ast.BasicLit); ok && lit.Value == `"error"` {
+						toasts = append(toasts, call.Pos())
+					}
+				}
+			}
+		case *ast.SelectorExpr:
+			if fun.Sel.Name == "WriteHeader" || (fun.Sel.Name == "Error" && isIdent(fun.X, "http")) {
+				setsStatus = true
+			}
+		}
+		return true
+	})
+	if setsStatus {
+		return nil
+	}
+	return toasts
 }
 
 // rpcErrorAnswered200Allowed: handler -> why a failed RPC is answered 200.
@@ -74,9 +123,8 @@ var rpcWrappers = map[string]bool{
 }
 
 // rpcErrorAnswered parses every non-test Go file in dir and returns the places
-// where an s.grpc call's error is answered with a literal status code that
-// matches literal.
-func rpcErrorAnswered(t *testing.T, dir string, literal func(ast.Expr) bool) []rpc500Offence {
+// check finds in the error branch of an s.grpc call.
+func rpcErrorAnswered(t *testing.T, dir string, check func(ast.Node) []token.Pos) []rpc500Offence {
 	t.Helper()
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -98,13 +146,13 @@ func rpcErrorAnswered(t *testing.T, dir string, literal func(ast.Expr) bool) []r
 			if !ok || fd.Body == nil {
 				continue
 			}
-			out = append(out, rpcErrorAnsweredIn(fset, fd, literal)...)
+			out = append(out, rpcErrorAnsweredIn(fset, fd, check)...)
 		}
 	}
 	return out
 }
 
-func rpcErrorAnsweredIn(fset *token.FileSet, fd *ast.FuncDecl, literal func(ast.Expr) bool) []rpc500Offence {
+func rpcErrorAnsweredIn(fset *token.FileSet, fd *ast.FuncDecl, check func(ast.Node) []token.Pos) []rpc500Offence {
 	var out []rpc500Offence
 	ast.Inspect(fd.Body, func(n ast.Node) bool {
 		// A switch or select case holds its statements in a bare list, not a
@@ -142,7 +190,7 @@ func rpcErrorAnsweredIn(fset *token.FileSet, fd *ast.FuncDecl, literal func(ast.
 			if rpc == "" {
 				continue
 			}
-			for _, p := range hardCodedStatus(ifs.Body, literal) {
+			for _, p := range check(ifs.Body) {
 				out = append(out, rpc500Offence{pos: fset.Position(p).String(), rpc: rpc, fn: fd.Name.Name})
 			}
 		}
@@ -237,6 +285,11 @@ func grpcCallName(n ast.Node) string {
 		return ""
 	}
 	return "s.grpc." + sel.Sel.Name
+}
+
+// hardCoded is the check for a literal status code that matches literal.
+func hardCoded(literal func(ast.Expr) bool) func(ast.Node) []token.Pos {
+	return func(body ast.Node) []token.Pos { return hardCodedStatus(body, literal) }
 }
 
 // hardCodedStatus finds w.WriteHeader(code) and http.Error(w, msg, code) where

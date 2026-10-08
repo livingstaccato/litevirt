@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"bytes"
 	"context"
 	"html/template"
 	"log/slog"
@@ -178,6 +179,47 @@ func rpcWriteFailed(w http.ResponseWriter, what string, err error) {
 	sendToast(w, what+" failed: "+err.Error(), "error")
 	w.WriteHeader(httpStatusFor(err))
 }
+
+// swapOnErrorHeader marks a non-2xx response whose body is still meant to be
+// swapped into the htmx target. htmx 2 does not swap a 4xx/5xx body by
+// default; base.html's htmx:beforeSwap listener does when this header says
+// "true".
+const swapOnErrorHeader = "LV-Swap-On-Error"
+
+// rpcWriteFailedRerender is rpcWriteFailed for a handler that re-renders its
+// region whether the action worked or not (the VM page after start/stop, the
+// containers table after start/stop/delete). The refusal carries the daemon's
+// status and the toast, as rpcWriteFailed's does, and the region is still sent
+// and swapped (swapOnErrorHeader), so what the user sees is what a refusal
+// showed when it was answered 200. If the region cannot be rendered, the
+// answer is rpcWriteFailed's: toast and status, nothing to swap.
+func rpcWriteFailedRerender(w http.ResponseWriter, what string, err error, render func(http.ResponseWriter)) {
+	region := &bufferedRegion{header: http.Header{}, code: http.StatusOK}
+	render(region)
+	if region.code/100 != 2 {
+		rpcWriteFailed(w, what, err)
+		return
+	}
+	sendToast(w, what+" failed: "+err.Error(), "error")
+	if ct := region.header.Get("Content-Type"); ct != "" {
+		w.Header().Set("Content-Type", ct)
+	}
+	w.Header().Set(swapOnErrorHeader, "true")
+	w.WriteHeader(httpStatusFor(err))
+	_, _ = w.Write(region.body.Bytes())
+}
+
+// bufferedRegion holds a rendered region until its status is known, so the
+// RPC's status can be written ahead of the region's body.
+type bufferedRegion struct {
+	header http.Header
+	code   int
+	body   bytes.Buffer
+}
+
+func (b *bufferedRegion) Header() http.Header         { return b.header }
+func (b *bufferedRegion) Write(p []byte) (int, error) { return b.body.Write(p) }
+func (b *bufferedRegion) WriteHeader(code int)        { b.code = code }
 
 // renderPageRPCFailed renders a page whose read RPC failed or was refused: the
 // page shell with the daemon's message in its error banner, under the status

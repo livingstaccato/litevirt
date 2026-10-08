@@ -333,8 +333,7 @@ func (s *Server) handleStartVM(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	if _, err := s.grpc.StartVM(s.uiBearerCtx(r), &pb.StartVMRequest{Name: name}); err != nil {
 		slog.Error("UI: start VM failed", "name", name, "error", err)
-		sendToast(w, "Start failed: "+err.Error(), "error")
-		s.handleVMPagePartial(w, r)
+		rpcWriteFailedRerender(w, "Start", err, func(w http.ResponseWriter) { s.handleVMPagePartial(w, r) })
 		return
 	}
 	w.Header().Set("HX-Redirect", "/vms/"+name)
@@ -345,8 +344,7 @@ func (s *Server) handleStopVM(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	if _, err := s.grpc.StopVM(s.uiBearerCtx(r), &pb.StopVMRequest{Name: name}); err != nil {
 		slog.Error("UI: stop VM failed", "name", name, "error", err)
-		sendToast(w, "Stop failed: "+err.Error(), "error")
-		s.handleVMPagePartial(w, r)
+		rpcWriteFailedRerender(w, "Stop", err, func(w http.ResponseWriter) { s.handleVMPagePartial(w, r) })
 		return
 	}
 	w.Header().Set("HX-Redirect", "/vms/"+name)
@@ -357,8 +355,7 @@ func (s *Server) handleRestartVM(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	if _, err := s.grpc.RestartVM(s.uiBearerCtx(r), &pb.RestartVMRequest{Name: name}); err != nil {
 		slog.Error("UI: restart VM failed", "name", name, "error", err)
-		sendToast(w, "Restart failed: "+err.Error(), "error")
-		s.handleVMPagePartial(w, r)
+		rpcWriteFailedRerender(w, "Restart", err, func(w http.ResponseWriter) { s.handleVMPagePartial(w, r) })
 		return
 	}
 	w.Header().Set("HX-Redirect", "/vms/"+name)
@@ -452,8 +449,7 @@ func (s *Server) handleRestoreSnapshot(w http.ResponseWriter, r *http.Request) {
 		VmName: vmName, SnapshotName: snapName,
 	})
 	if err != nil {
-		sendToast(w, "Restore failed: "+err.Error(), "error")
-		s.handleVMPagePartial(w, r)
+		rpcWriteFailedRerender(w, "Restore", err, func(w http.ResponseWriter) { s.handleVMPagePartial(w, r) })
 		return
 	}
 	sendToast(w, "Snapshot '"+snapName+"' restored", "success")

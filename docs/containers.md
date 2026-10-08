@@ -739,8 +739,12 @@ subordinate range for an unprivileged container's id range (the peer-only
 `PrepareContainerTarget`). The target takes only a container-shaped range —
 65536 ids above the host's own ids, a slot of its `containers.idmap_*` span
 when it lies inside it — that overlaps no range another container records or
-runs with there. A range outside the target's span (a backup restored from
-another cluster, nodes configured differently) is taken when it is free. A target that cannot — its `/etc/subuid` is locked or not
+runs with there — an unfinished convert's recorded range counts as held. A
+range that overlaps the target's span must be exactly one of its slots. A range
+outside the span (a backup restored from another cluster, nodes configured
+differently) is taken when it is free and overlaps no other user's entry in
+`/etc/subuid` or `/etc/subgid`. Root's lines there stay bounded: one per
+distinct range, never repeated. A target that cannot — its `/etc/subuid` is locked or not
 writable — refuses the migrate while the source still runs, untouched.
 A target older than this release cannot be asked; the migrate proceeds and the
 target's own start ensures the range.

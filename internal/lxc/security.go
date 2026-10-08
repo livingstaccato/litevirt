@@ -653,3 +653,29 @@ func convertCommand(name string, _ *ConvertOpts) string {
 
 // ConvertCommand is convertCommand for callers outside the package.
 func ConvertCommand(name string, to *ConvertOpts) string { return convertCommand(name, to) }
+
+// SubIDConflict returns the user (not root) whose subordinate ids in
+// /etc/subuid or /etc/subgid the range overlaps, if any.
+func SubIDConflict(idmap *IDMap) (owner string, hit bool) {
+	for _, p := range []string{subUIDPath, subGIDPath} {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(b), "\n") {
+			parts := strings.Split(strings.TrimSpace(line), ":")
+			if len(parts) != 3 || parts[0] == "root" || parts[0] == "0" {
+				continue
+			}
+			start, e1 := strconv.ParseInt(parts[1], 10, 64)
+			n, e2 := strconv.ParseInt(parts[2], 10, 64)
+			if e1 != nil || e2 != nil {
+				continue
+			}
+			if idmap.Base < start+n && start < idmap.Base+idmap.Size {
+				return parts[0], true
+			}
+		}
+	}
+	return "", false
+}

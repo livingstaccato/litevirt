@@ -180,3 +180,9 @@ func (a *LXCRuntimeAdapter) RevertContainerConverting(ctx context.Context, name 
 	}
 	return a.Inner.RevertContainer(ctx, name, r)
 }
+
+// SubIDConflict passes through lxc.SubIDConflict.
+func (a *LXCRuntimeAdapter) SubIDConflict(base, size int64) (string, bool) {
+	owner, hit := lxc.SubIDConflict(&lxc.IDMap{Base: base, Size: size})
+	return owner, hit
+}

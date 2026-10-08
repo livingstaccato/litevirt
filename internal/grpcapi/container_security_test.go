@@ -412,3 +412,83 @@ func TestPrepareContainerTarget_AcceptsAFreeSlotOutsideTheSpan(t *testing.T) {
 		t.Fatalf("ensured %v", rt.got)
 	}
 }
+
+// subidConflictRecorder is ensureRecorder that also reports a subordinate-id
+// owner for one range.
+type subidConflictRecorder struct {
+	*ensureRecorder
+	conflictBase int64
+}
+
+func (r *subidConflictRecorder) SubIDConflict(base, size int64) (string, bool) {
+	if base < r.conflictBase+size && r.conflictBase < base+size {
+		return "tim", true
+	}
+	return "", false
+}
+
+// The polish round's refusals: a range straddling the span without being a
+// slot; one partly overlapping another container's (not only the same base);
+// one overlapping a container on this host's disk, or an unfinished
+// convert's range there; one overlapping another user's /etc/subuid entry.
+// Nothing is written for any of them.
+func TestPrepareContainerTarget_RefusesEveryOverlap(t *testing.T) {
+	s := newPeerAuthServer(t)
+	rec := &ensureRecorder{fakeCTRuntime: &fakeCTRuntime{}}
+	rt := &subidConflictRecorder{ensureRecorder: rec, conflictBase: 100000}
+	s.SetContainerRuntime(rt)
+	ctx := context.Background()
+	cfgBase, _ := s.idmapConfig()
+	outside := int64(500_000_000)
+	if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{HostName: "self", Name: "near", State: "running",
+		CreateSpec: corrosion.EncodeCreateSpec(corrosion.ContainerCreateSpec{Template: "download", IDMapBase: outside + 2*lxc.IDMapSize})}); err != nil {
+		t.Fatal(err)
+	}
+	rec.listNames = []string{"disk", "half"}
+	rec.security = map[string]lxc.Security{
+		"disk": {IDMap: &lxc.IDMap{Base: outside + 6*lxc.IDMapSize, Size: lxc.IDMapSize}},
+		"half": {Converting: true, ConvertTo: &lxc.ConvertOpts{IDMap: &lxc.IDMap{Base: outside + 10*lxc.IDMapSize, Size: lxc.IDMapSize}}},
+	}
+	peer := mtlsAdminCtx("peer-1")
+	for what, base := range map[string]int64{
+		"straddles the span":         cfgBase - 1000,
+		"partly overlaps a row":      outside + 2*lxc.IDMapSize + 1000,
+		"overlaps a disk container":  outside + 6*lxc.IDMapSize - 1000,
+		"overlaps a convert's range": outside + 10*lxc.IDMapSize,
+		"overlaps a user's subuid":   100000 + 1000,
+	} {
+		if _, err := s.PrepareContainerTarget(peer, &pb.PrepareContainerTargetRequest{IdmapBase: base, IdmapSize: lxc.IDMapSize, Name: "m", SourceHost: "peer-1"}); err == nil {
+			t.Errorf("%s (%d): accepted", what, base)
+		}
+	}
+	if len(rec.got) != 0 {
+		t.Fatalf("wrote ranges: %v", rec.got)
+	}
+}
+
+// The start overlap check and a restore's range check count an unfinished
+// convert's recorded range as taken.
+func TestConvertMarkerRange_IsTakenAtStartAndRestore(t *testing.T) {
+	s, rt := secServer(t)
+	const b = int64(1_000_393_216)
+	seedSecCT(t, s, rt, "a", "stopped", corrosion.ContainerCreateSpec{Template: "download", IDMapBase: b})
+	seedSecCT(t, s, rt, "half", "stopped", corrosion.ContainerCreateSpec{Template: "download"})
+	rt.listNames = []string{"a", "half"}
+	rt.security = map[string]lxc.Security{
+		"a":    {IDMap: &lxc.IDMap{Base: b, Size: lxc.IDMapSize}},
+		"half": {Converting: true, ConvertTo: &lxc.ConvertOpts{IDMap: &lxc.IDMap{Base: b, Size: lxc.IDMapSize}}},
+	}
+	if _, err := s.StartContainer(adminCtx(), &pb.StartContainerRequest{Name: "a", HostName: "host-a"}); status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "overlaps") {
+		t.Fatalf("start into an unfinished convert's range: %v", err)
+	}
+	// A range no row records, held only by another container's marker here.
+	const held = int64(1_000_458_752)
+	rt.security["half"] = lxc.Security{Converting: true, ConvertTo: &lxc.ConvertOpts{IDMap: &lxc.IDMap{Base: held, Size: lxc.IDMapSize}}}
+	spec, err := s.remapRestoredRange(context.Background(), "restored", corrosion.EncodeCreateSpec(corrosion.ContainerCreateSpec{Template: "download", IDMapBase: held}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := corrosion.DecodeCreateSpec(spec).IDMapBase; got == held {
+		t.Fatal("a restore kept a range an unfinished convert holds on this host")
+	}
+}

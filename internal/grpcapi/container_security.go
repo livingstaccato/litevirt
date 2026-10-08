@@ -238,11 +238,14 @@ func (s *Server) refuseOverlappingRange(ctx context.Context, name string) error 
 		return nil
 	}
 	for other, sec := range all {
-		if other == name || sec.IDMap == nil {
+		if other == name {
 			continue
 		}
-		a, b := mine.IDMap, sec.IDMap
-		if a.Base < b.Base+b.Size && b.Base < a.Base+a.Size {
+		for _, ob := range takenBases(sec) {
+			a := mine.IDMap
+			if a.Base >= ob+lxc.IDMapSize || ob >= a.Base+a.Size {
+				continue
+			}
 			return status.Errorf(codes.FailedPrecondition,
 				"container %q's id range (%d+%d) overlaps container %q's on this host; move it to a fresh range first: lv ct convert --unprivileged %s",
 				name, a.Base, a.Size, other, name)
@@ -373,6 +376,18 @@ func (s *Server) remapRestoredRange(ctx context.Context, name, createSpec string
 		if !(r.HostName == s.hostName && r.Name == name) && corrosion.DecodeCreateSpec(r.CreateSpec).IDMapBase == spec.IDMapBase {
 			taken = true
 			break
+		}
+	}
+	// A range a container on this disk holds — its config's, or an
+	// unfinished convert's target — is taken too.
+	for other, sec := range s.localContainerSecurity(ctx) {
+		if other == name {
+			continue
+		}
+		for _, b := range takenBases(sec) {
+			if b < spec.IDMapBase+lxc.IDMapSize && spec.IDMapBase < b+lxc.IDMapSize {
+				taken = true
+			}
 		}
 	}
 	if !taken {
@@ -567,8 +582,21 @@ func (s *Server) validatePreparedRange(ctx context.Context, req *pb.PrepareConta
 	// Inside this host's span a range is one of its slots; outside it (another
 	// cluster's or another configuration's range) only freedom is required.
 	cfgBase, n := s.idmapConfig()
-	if req.IdmapBase >= cfgBase && req.IdmapBase < cfgBase+int64(n)*lxc.IDMapSize && (req.IdmapBase-cfgBase)%lxc.IDMapSize != 0 {
-		return status.Errorf(codes.InvalidArgument, "idmap_base %d is inside this host's span but not one of its slots", req.IdmapBase)
+	spanEnd := cfgBase + int64(n)*lxc.IDMapSize
+	inSpan := req.IdmapBase < spanEnd && req.IdmapBase+lxc.IDMapSize > cfgBase
+	if inSpan && (req.IdmapBase < cfgBase || (req.IdmapBase-cfgBase)%lxc.IDMapSize != 0) {
+		return status.Errorf(codes.InvalidArgument,
+			"idmap_base %d overlaps this host's container span without being one of its slots; give the container a fresh range first: lv ct convert --unprivileged %s", req.IdmapBase, req.Name)
+	}
+	// Outside the span, a range must not overlap another user's subordinate
+	// ids (a rootless user's user:100000:65536, a directory service's).
+	if !inSpan {
+		if c, ok := s.containerRuntime.(subIDConflicter); ok {
+			if owner, hit := c.SubIDConflict(req.IdmapBase, lxc.IDMapSize); hit {
+				return status.Errorf(codes.FailedPrecondition,
+					"id range %d overlaps %s's subordinate ids on this host; give the container a fresh range first: lv ct convert --unprivileged %s", req.IdmapBase, owner, req.Name)
+			}
+		}
 	}
 	overlaps := func(b int64) bool { return b < req.IdmapBase+lxc.IDMapSize && req.IdmapBase < b+lxc.IDMapSize }
 	rows, err := corrosion.ListContainers(ctx, s.db, "")
@@ -589,9 +617,31 @@ func (s *Server) validatePreparedRange(ctx context.Context, req *pb.PrepareConta
 		if n == req.Name {
 			continue
 		}
-		if sec.IDMap != nil && overlaps(sec.IDMap.Base) {
-			return status.Errorf(codes.FailedPrecondition, "id range %d overlaps container %q's on this host", req.IdmapBase, n)
+		for _, b := range takenBases(sec) {
+			if overlaps(b) {
+				return status.Errorf(codes.FailedPrecondition, "id range %d overlaps container %q's on this host", req.IdmapBase, n)
+			}
 		}
 	}
 	return nil
+}
+
+// takenBases is every range a container on this host's disk holds: the one
+// its config runs with, and an unfinished convert's recorded target, which
+// it resumes into.
+func takenBases(sec lxc.Security) []int64 {
+	var out []int64
+	if sec.IDMap != nil {
+		out = append(out, sec.IDMap.Base)
+	}
+	if sec.Converting && sec.ConvertTo != nil && sec.ConvertTo.IDMap != nil {
+		out = append(out, sec.ConvertTo.IDMap.Base)
+	}
+	return out
+}
+
+// subIDConflicter reports another user's subordinate ids a range overlaps
+// (lxc.SubIDConflict).
+type subIDConflicter interface {
+	SubIDConflict(base, size int64) (owner string, hit bool)
 }

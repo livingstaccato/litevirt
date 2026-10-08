@@ -74,7 +74,7 @@ func TestInspectContainer_ReportsTheContainer(t *testing.T) {
 	ctx := context.Background()
 	live := ctTestRepo(t)
 	putCTManifest(t, live, "ct1", "acme", "2026-10-08T12:48:39Z")
-	if err := corrosion.UpsertContainerBackup(ctx, s.db, "ct1", live, 1<<20); err != nil {
+	if err := corrosion.UpsertContainerBackup(ctx, s.db, "acme", "ct1", live, 1<<20); err != nil {
 		t.Fatal(err)
 	}
 
@@ -141,7 +141,7 @@ func TestInspectContainer_BackupInVanishedRepo(t *testing.T) {
 	s := inspectTestServer(t, "")
 	ctx := context.Background()
 	gone := filepath.Join(t.TempDir(), "lxtbk")
-	if err := corrosion.UpsertContainerBackup(ctx, s.db, "ct1", gone, 5000); err != nil {
+	if err := corrosion.UpsertContainerBackup(ctx, s.db, "acme", "ct1", gone, 5000); err != nil {
 		t.Fatal(err)
 	}
 	d, err := s.InspectContainer(adminCtx(), &pb.InspectContainerRequest{Name: "ct1"})
@@ -155,7 +155,8 @@ func TestInspectContainer_BackupInVanishedRepo(t *testing.T) {
 	if b.GetRepo() != gone || b.GetAvailable() || b.GetStatus() != "not_found" || b.GetUnavailableReason() == "" || b.GetTotalBytes() != 5000 {
 		t.Fatalf("stale backup = %+v, want not_found with a reason", b)
 	}
-	rows, _ := s.db.Query(ctx, `SELECT 1 AS ok FROM container_backups WHERE ct_name = 'ct1' AND repo = ?`, gone)
+	rows, _ := s.db.Query(ctx, `SELECT 1 AS ok FROM container_backups WHERE ct_name = ? AND repo = ?`,
+		corrosion.ContainerBackupKey("acme", "ct1"), gone)
 	if len(rows) != 1 {
 		t.Fatal("inspect removed the backup index row")
 	}
@@ -182,7 +183,7 @@ func TestInspectContainer_SameNameOtherProjectBackupsNotShown(t *testing.T) {
 	putCTManifest(t, ours, "ct1", "acme", "2026-10-08T10:00:00Z")
 	putCTManifest(t, theirs, "ct1", "beta", "2026-10-08T11:00:00Z")
 	for _, r := range []string{ours, theirs} {
-		if err := corrosion.UpsertContainerBackup(ctx, s.db, "ct1", r, 4096); err != nil {
+		if err := corrosion.UpsertContainerBackup(ctx, s.db, "acme", "ct1", r, 4096); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -264,7 +265,7 @@ func TestInspectContainer_SinkBackupIsAvailableOnTheSink(t *testing.T) {
 	putCTManifest(t, sinkDir, "ct1", "acme", "2026-10-08T12:00:00Z")
 	addHost(t, sink, "host-a")
 	addHost(t, owner, "sink-host")
-	if err := corrosion.UpsertContainerBackup(context.Background(), owner.db, "ct1", "r1", 7000); err != nil {
+	if err := corrosion.UpsertContainerBackup(context.Background(), owner.db, "acme", "ct1", "r1", 7000); err != nil {
 		t.Fatal(err)
 	}
 	owner.peerClientOverride = func(_ context.Context, host string) (pb.LiteVirtClient, func(), error) {
@@ -298,7 +299,7 @@ func TestInspectContainer_MigratedContainerBackupFoundOnFormerHost(t *testing.T)
 		t.Fatal(err)
 	}
 	repoOnA := "/srv/only-on-host-a"
-	if err := corrosion.UpsertContainerBackup(ctx, s.db, "mig", repoOnA, 9000); err != nil {
+	if err := corrosion.UpsertContainerBackup(ctx, s.db, "acme", "mig", repoOnA, 9000); err != nil {
 		t.Fatal(err)
 	}
 	addHost(t, s, "host-a")
@@ -321,7 +322,7 @@ func TestInspectContainer_MigratedContainerBackupFoundOnFormerHost(t *testing.T)
 func TestInspectContainer_UnaskableHostMakesBackupUnknown(t *testing.T) {
 	s := inspectTestServer(t, "")
 	ctx := context.Background()
-	if err := corrosion.UpsertContainerBackup(ctx, s.db, "ct1", "/srv/somewhere", 100); err != nil {
+	if err := corrosion.UpsertContainerBackup(ctx, s.db, "acme", "ct1", "/srv/somewhere", 100); err != nil {
 		t.Fatal(err)
 	}
 	addHost(t, s, "host-c")

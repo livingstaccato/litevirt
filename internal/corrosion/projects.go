@@ -316,14 +316,8 @@ func SumProjectUsage(ctx context.Context, c *Client, name string) (*ProjectUsage
 	if err == nil && len(bkRows) > 0 {
 		backupBytes += bkRows[0].Int64("bytes")
 	}
-	ctBkRows, err := c.Query(ctx,
-		`SELECT COALESCE(SUM(container_backups.total_bytes), 0) AS bytes
-		 FROM container_backups
-		 JOIN containers ON container_backups.ct_name = containers.name
-		 WHERE containers.project = ? AND containers.deleted_at IS NULL`,
-		name)
-	if err == nil && len(ctBkRows) > 0 {
-		backupBytes += ctBkRows[0].Int64("bytes")
+	if ctBytes, err := containerBackupUsage(ctx, c, name); err == nil {
+		backupBytes += ctBytes
 	}
 	u.BackupGiBUsed = int(backupBytes / (1 << 30))
 
@@ -347,10 +341,20 @@ func UpsertVMBackup(ctx context.Context, c *Client, vmName, diskName, repo strin
 		vmName, diskName, repo, totalBytes, now)
 }
 
-// UpsertContainerBackup records the latest backup size for one (container, repo)
-// into the container_backups index — the container analogue of UpsertVMBackup,
-// so the tenancy backup_gib quota sums container footprints alongside VMs.
-func UpsertContainerBackup(ctx context.Context, c *Client, ctName, repo string, totalBytes int64) error {
+// UpsertContainerBackup records the latest backup size for one (container,
+// repo) into the container_backups index — the container analogue of
+// UpsertVMBackup, so the tenancy backup_gib quota sums container footprints
+// alongside VMs.
+//
+// The row is keyed by the PROJECT-QUALIFIED name (ContainerBackupKey), the
+// project being the one the backup's manifest records for its container.
+// Container names are per host and per project, so a key of the bare name was
+// shared by every same-named container: another project's backups were
+// charged to this project (and could block its creates), and inspect showed
+// them. Rows written before this release keep their bare-name key and are
+// read as before (SumProjectUsage, ListContainerBackups); nothing rewrites
+// them. Same statement as before; only the key value differs.
+func UpsertContainerBackup(ctx context.Context, c *Client, project, ctName, repo string, totalBytes int64) error {
 	now := c.NowTS()
 	return c.Execute(ctx,
 		`INSERT INTO container_backups (ct_name, repo, total_bytes, updated_at)
@@ -358,7 +362,68 @@ func UpsertContainerBackup(ctx context.Context, c *Client, ctName, repo string, 
 		 ON CONFLICT(ct_name, repo) DO UPDATE SET
 		   total_bytes = excluded.total_bytes,
 		   updated_at  = excluded.updated_at`,
-		ctName, repo, totalBytes, now)
+		ContainerBackupKey(project, ctName), repo, totalBytes, now)
+}
+
+// containerBackupKeySep separates project and name in a container_backups
+// key. A unit separator: it appears in neither a project nor a container name.
+const containerBackupKeySep = "\x1f"
+
+// ContainerBackupKey is the container_backups key of (project, name).
+func ContainerBackupKey(project, name string) string {
+	return normalizeProject(project) + containerBackupKeySep + name
+}
+
+// splitContainerBackupKey returns (project, name, true) for a project-keyed
+// row, or ("", key, false) for a row written before project keys.
+func splitContainerBackupKey(key string) (string, string, bool) {
+	if i := strings.Index(key, containerBackupKeySep); i >= 0 {
+		return key[:i], key[i+len(containerBackupKeySep):], true
+	}
+	return "", key, false
+}
+
+// containerBackupUsage sums the container backup footprint charged to
+// project: its own project-keyed rows for containers it still has, plus
+// legacy (bare-name) rows of those names — each row once, and a legacy row
+// only where the container has not written its own row for that repo. That
+// never charges more than the bare-name JOIN did for the honest owner, and it
+// stops charging one project for another's same-named container.
+func containerBackupUsage(ctx context.Context, c *Client, project string) (int64, error) {
+	names, err := c.Query(ctx,
+		`SELECT DISTINCT name FROM containers WHERE project = ? AND deleted_at IS NULL`, project)
+	if err != nil {
+		return 0, err
+	}
+	live := make(map[string]bool, len(names))
+	for _, r := range names {
+		live[r.String("name")] = true
+	}
+	if len(live) == 0 {
+		return 0, nil
+	}
+	rows, err := c.Query(ctx, `SELECT ct_name, repo, total_bytes FROM container_backups`)
+	if err != nil {
+		return 0, err
+	}
+	type nameRepo struct{ name, repo string }
+	own := map[nameRepo]bool{}
+	var total int64
+	want := normalizeProject(project)
+	for _, r := range rows {
+		p, n, keyed := splitContainerBackupKey(r.String("ct_name"))
+		if keyed && p == want && live[n] {
+			total += r.Int64("total_bytes")
+			own[nameRepo{n, r.String("repo")}] = true
+		}
+	}
+	for _, r := range rows {
+		_, n, keyed := splitContainerBackupKey(r.String("ct_name"))
+		if !keyed && live[n] && !own[nameRepo{n, r.String("repo")}] {
+			total += r.Int64("total_bytes")
+		}
+	}
+	return total, nil
 }
 
 // QuotaCheck describes a proposed resource request. The admission

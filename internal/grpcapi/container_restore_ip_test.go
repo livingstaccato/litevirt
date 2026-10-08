@@ -88,3 +88,41 @@ func TestRestoreContainer_DeletedThenReallocatedAcrossProjectsRefused(t *testing
 		t.Fatal("y lost its lease")
 	}
 }
+
+// m4 end to end: beta's same-named container's backups are recorded under
+// beta and do not count toward acme's backup_gib, so they cannot block an
+// acme create; acme's own backup is recorded under acme.
+func TestBackupContainer_IndexKeyedByManifestProject(t *testing.T) {
+	s := testServer(t)
+	s.hostName = "host-a"
+	s.dataDir = t.TempDir()
+	ctx := context.Background()
+	s.SetContainerRuntime(&fakeCTRuntime{exportPayload: []byte("rootfs")})
+	for _, c := range []corrosion.ContainerRecord{
+		{HostName: "host-a", Name: "web", State: "stopped", Project: "acme"},
+		{HostName: "host-b", Name: "web", State: "stopped", Project: "beta"},
+	} {
+		if err := corrosion.UpsertContainer(ctx, s.db, c); err != nil {
+			t.Fatal(err)
+		}
+	}
+	repo := ctTestRepo(t)
+	bk := &progressStream[pb.BackupContainerProgress]{ctx: adminCtx()}
+	if err := s.BackupContainer(&pb.BackupContainerRequest{
+		Name: "web", HostName: "host-a", RepoPath: repo, Timestamp: "2026-10-08T12:00:00Z",
+	}, bk); err != nil {
+		t.Fatal(err)
+	}
+	rows, _ := s.db.Query(ctx, `SELECT 1 AS ok FROM container_backups WHERE ct_name = ? AND repo = ?`,
+		corrosion.ContainerBackupKey("acme", "web"), repo)
+	if len(rows) != 1 {
+		t.Fatal("acme's backup is not indexed under acme")
+	}
+	u, err := corrosion.SumProjectUsage(ctx, s.db, "beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.BackupGiBUsed != 0 {
+		t.Fatalf("beta charged for acme's backup: %d GiB", u.BackupGiBUsed)
+	}
+}

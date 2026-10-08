@@ -63,10 +63,10 @@ func TestUpsertContainerBackup_AndProjectFootprint(t *testing.T) {
 	}
 
 	const giB = int64(1) << 30
-	if err := UpsertContainerBackup(ctx, c, "ct1", "/repo", 3*giB); err != nil {
+	if err := UpsertContainerBackup(ctx, c, "p1", "ct1", "/repo", 3*giB); err != nil {
 		t.Fatal(err)
 	}
-	if err := UpsertContainerBackup(ctx, c, "other", "/repo", 9*giB); err != nil {
+	if err := UpsertContainerBackup(ctx, c, "p2", "other", "/repo", 9*giB); err != nil {
 		t.Fatal(err)
 	}
 
@@ -79,7 +79,7 @@ func TestUpsertContainerBackup_AndProjectFootprint(t *testing.T) {
 	}
 
 	// Re-push the same (container, repo) with a new size → overwrite, not add.
-	if err := UpsertContainerBackup(ctx, c, "ct1", "/repo", 5*giB); err != nil {
+	if err := UpsertContainerBackup(ctx, c, "p1", "ct1", "/repo", 5*giB); err != nil {
 		t.Fatal(err)
 	}
 	u, _ = SumProjectUsage(ctx, c, "p1")

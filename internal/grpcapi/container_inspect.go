@@ -111,7 +111,7 @@ func (s *Server) containerDetailFromCluster(ctx context.Context, rec *corrosion.
 		})
 	}
 
-	bks, err := corrosion.ListContainerBackups(ctx, s.db, rec.Name)
+	bks, err := corrosion.ListContainerBackups(ctx, s.db, rec.Name, rec.Project)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "read backups: %v", err)
 	}

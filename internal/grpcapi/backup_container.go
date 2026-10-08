@@ -269,7 +269,7 @@ func (s *Server) BackupContainer(req *pb.BackupContainerRequest, stream grpc.Ser
 			s.audit(ctx, "ct.backup", req.Name, "project="+project, "error")
 			return err
 		}
-	} else if err := corrosion.UpsertContainerBackup(ctx, s.db, req.Name, req.RepoPath, manifest.TotalSize); err != nil {
+	} else if err := corrosion.UpsertContainerBackup(ctx, s.db, manifestProject(manifest), req.Name, req.RepoPath, manifest.TotalSize); err != nil {
 		slog.Warn("container backup: update container_backups usage index",
 			"name", req.Name, "repo", req.RepoPath, "error", err)
 	}
@@ -340,7 +340,7 @@ func (s *Server) sinkRemoteContainerBackup(ctx context.Context, owner string, re
 			"remote backup did not land in repo %q (the owning daemon %q may not support peer backup streaming): %v",
 			req.RepoPath, owner, err)
 	}
-	if err := corrosion.UpsertContainerBackup(ctx, s.db, req.Name, req.RepoPath, m.TotalSize); err != nil {
+	if err := corrosion.UpsertContainerBackup(ctx, s.db, manifestProject(m), req.Name, req.RepoPath, m.TotalSize); err != nil {
 		slog.Warn("container backup: update container_backups usage index", "name", req.Name, "repo", req.RepoPath, "error", err)
 	}
 	return stream.Send(&pb.BackupContainerProgress{
@@ -1168,4 +1168,16 @@ func (s *Server) resolveContainerHost(ctx context.Context, hostHint, name string
 			name, len(hosts), strings.Join(hosts, ", "))
 	}
 	return match.HostName, match, nil
+}
+
+// manifestProject is the project a container backup manifest records for its
+// container (its embedded spec), normalised. It is what the backup index is
+// keyed by, so a backup is charged to the project that owns it, not to every
+// container that shares its name.
+func manifestProject(m *pbsstore.Manifest) string {
+	var spec containerBackupSpec
+	if m != nil && m.ContainerSpecJSON != "" {
+		_ = json.Unmarshal([]byte(m.ContainerSpecJSON), &spec)
+	}
+	return tenancy.NormalizeProject(spec.Project)
 }

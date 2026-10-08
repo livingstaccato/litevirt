@@ -287,6 +287,10 @@ func cmpInstants(a, b time.Time) int {
 //
 // The comparator is anti-symmetric (lwwOrder(a,b) == -lwwOrder(b,a)) across every
 // format pair; see lww_instant_test.go.
+// LWWNewer reports whether LWW timestamp a is strictly newer than b, by the
+// same instant-based, format-aware order replication uses (lwwOrder).
+func LWWNewer(a, b string) bool { return lwwOrder(a, b) > 0 }
+
 func lwwOrder(localTS, incomingTS string) int {
 	localHLC, incomingHLC := hlc.IsHLC(localTS), hlc.IsHLC(incomingTS)
 	switch {

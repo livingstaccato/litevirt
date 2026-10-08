@@ -33,15 +33,31 @@ func ReserveContainerIP(ctx context.Context, db *corrosion.Client, network, ip, 
 }
 
 // ReserveContainerIPForRebuild re-reserves an address a container ALREADY had
-// (its own create spec or interface row): a restore, a relocation. It refuses
-// what a rebuild was refused before this release — the same address text held
-// live by another owner — but not an alias that release allowed: another owner
-// holding the same host address under a DIFFERENT spelling ("x/24" vs "x").
-// Two workloads in that state both kept their address on every rebuild, and
-// refusing it now would strip a static address from a running workload on its
-// next restore or failover. The duplicate is kept, under this container's own
-// spelling, and logged as a WARN naming both owners so an operator can
-// reassign one. A NEW allocation (ReserveContainerIP) is always refused.
+// (its own create spec or interface row): a restore, a relocation.
+//
+// It refuses everything a rebuild was refused before this release — the same
+// address text held live by another owner — and, beyond that, tolerates
+// exactly one thing: an alias that release allowed and that THIS container was
+// already part of. Before this release leases were keyed on the operator's
+// text, so "x/24" and "x" could be held by two workloads at once, and each
+// kept its address on every rebuild. Refusing that now would strip a static
+// address from a workload on its next restore or failover.
+//
+// "Already part of it" is proved from the lease table, never assumed from the
+// spelling:
+//   - a row keyed with this exact text must exist for this container (any
+//     host, live or tombstoned) — a copy restored elsewhere, or a container
+//     that never held the address, has none;
+//   - no other live holder may be a same-named container (the original of a
+//     copy being restored beside it);
+//   - if that row was released, every other live holder must have acquired
+//     its lease BEFORE the release (its updated_at is not newer) — an address
+//     reallocated after this container let it go belongs to the new holder.
+//
+// The kept lease is written under the canonical key when no other holder has
+// it, otherwise under this container's own prior key. The duplicate is logged
+// as a WARN naming both owners so an operator can reassign one. A NEW
+// allocation (ReserveContainerIP) is always refused.
 func ReserveContainerIPForRebuild(ctx context.Context, db *corrosion.Client, network, ip, mac, host, ctName string) (bool, error) {
 	raw := strings.TrimSpace(ip)
 	norm := LeaseAddr(raw)
@@ -52,11 +68,29 @@ func ReserveContainerIPForRebuild(ctx context.Context, db *corrosion.Client, net
 	if len(others) == 0 {
 		return reserveContainerLease(ctx, db, network, norm, mac, host, ctName)
 	}
+	normTaken := false
 	for _, o := range others {
 		if o.IP == raw {
 			// The same text held by another owner: refused before this
 			// release too, and not a duplicate this rebuild keeps.
 			return false, nil
+		}
+		if o.Kind == "ct" && o.Name == ctName {
+			return false, nil // the original of a copy restored beside it
+		}
+		if o.IP == norm {
+			normTaken = true
+		}
+	}
+	prior, err := priorContainerLease(ctx, db, network, raw, ctName)
+	if err != nil || prior == nil {
+		return false, err
+	}
+	if prior.Deleted {
+		for _, o := range others {
+			if corrosion.LWWNewer(o.UpdatedAt, prior.UpdatedAt) {
+				return false, nil // acquired after this container released it
+			}
 		}
 	}
 	for _, o := range others {
@@ -65,7 +99,29 @@ func ReserveContainerIPForRebuild(ctx context.Context, db *corrosion.Client, net
 			"network", network, "ip", norm, "ct", ctName, "host", host,
 			"other", o.Name, "other_kind", o.Kind, "other_host", o.Host)
 	}
-	return reserveContainerLease(ctx, db, network, raw, mac, host, ctName)
+	key := norm
+	if normTaken {
+		key = raw
+	}
+	return reserveContainerLease(ctx, db, network, key, mac, host, ctName)
+}
+
+// priorLease is a container's earlier lease row on one address text.
+type priorLease struct {
+	Deleted   bool
+	UpdatedAt string
+}
+
+// priorContainerLease returns the row keyed exactly (network, ip) if it was
+// last held by a container named ctName (on any host), live or tombstoned.
+func priorContainerLease(ctx context.Context, db *corrosion.Client, network, ip, ctName string) (*priorLease, error) {
+	rows, err := db.Query(ctx,
+		`SELECT updated_at, deleted_at FROM ip_allocations
+		 WHERE network = ? AND ip = ? AND owner_kind = 'ct' AND vm_name = ?`, network, ip, ctName)
+	if err != nil || len(rows) == 0 {
+		return nil, err
+	}
+	return &priorLease{Deleted: rows[0].String("deleted_at") != "", UpdatedAt: rows[0].String("updated_at")}, nil
 }
 
 // reserveContainerLease writes (or resurrects, or idempotently refreshes) the
@@ -214,7 +270,7 @@ func ReserveContainerNICs(ctx context.Context, db *corrosion.Client, host, ctNam
 
 // leaseHolder is one live lease's owner and its stored address text.
 type leaseHolder struct {
-	IP, Name, Kind, Host string
+	IP, Name, Kind, Host, UpdatedAt string
 }
 
 // hostAddrHoldersOther returns the LIVE leases on network that name the same
@@ -223,7 +279,7 @@ type leaseHolder struct {
 // the (network, ip) primary key only catches an identical spelling.
 func hostAddrHoldersOther(ctx context.Context, db *corrosion.Client, network, ip, ownerKind, ownerHost, name string) ([]leaseHolder, error) {
 	rows, err := db.Query(ctx,
-		`SELECT ip, vm_name, COALESCE(owner_kind, 'vm') AS owner_kind, COALESCE(owner_host, '') AS owner_host
+		`SELECT ip, vm_name, COALESCE(owner_kind, 'vm') AS owner_kind, COALESCE(owner_host, '') AS owner_host, updated_at
 		 FROM ip_allocations WHERE network = ? AND deleted_at IS NULL`, network)
 	if err != nil {
 		return nil, err
@@ -234,7 +290,7 @@ func hostAddrHoldersOther(ctx context.Context, db *corrosion.Client, network, ip
 		if LeaseAddr(r.String("ip")) != want {
 			continue
 		}
-		h := leaseHolder{IP: r.String("ip"), Name: r.String("vm_name"), Kind: r.String("owner_kind"), Host: r.String("owner_host")}
+		h := leaseHolder{IP: r.String("ip"), Name: r.String("vm_name"), Kind: r.String("owner_kind"), Host: r.String("owner_host"), UpdatedAt: r.String("updated_at")}
 		if h.Name == name && h.Kind == ownerKind && h.Host == ownerHost {
 			continue
 		}

@@ -187,3 +187,114 @@ func captureWarn(t *testing.T) *warnBuf {
 	})
 	return w
 }
+
+// R1: a restore of a COPY on another host while the original runs. The
+// original (created after the upgrade with ip=x/24) holds the bare lease; the
+// copy's spec says x/24. The copy never held that address, so it is refused.
+func TestReserveContainerNICs_CopyOnAnotherHostRefused(t *testing.T) {
+	ctx := context.Background()
+	db := cidrTestDB(t)
+	if ok, err := ReserveContainerIP(ctx, db, "net", "10.0.0.5/24", "mac-a", "host-a", "web"); err != nil || !ok {
+		t.Fatalf("original reserve: %v %v", ok, err)
+	}
+	unreserved, _ := ReserveContainerNICs(ctx, db, "host-b", "web", []corrosion.ContainerInterfaceRecord{
+		{NetworkName: "net", IP: "10.0.0.5/24", MAC: "mac-b"},
+	})
+	if unreserved != 1 {
+		t.Fatalf("copy restore took the original's live address: unreserved=%d", unreserved)
+	}
+	if ok, _ := ipLeaseHeldBy(ctx, db, "net", "10.0.0.5", "ct", "host-b", "web"); ok {
+		t.Fatal("the copy holds a lease on the original's address")
+	}
+}
+
+// R1: a deleted container restored after its address was given to another
+// workload (another project's, on a shared network) does not take it back.
+func TestReserveContainerNICs_ReallocatedAddressRefused(t *testing.T) {
+	ctx := context.Background()
+	db := cidrTestDB(t)
+	if ok, err := ReserveContainerIP(ctx, db, "net", "10.0.0.5/24", "mac-x", "host-a", "x"); err != nil || !ok {
+		t.Fatalf("x reserve: %v %v", ok, err)
+	}
+	if err := ReleaseContainerLeases(ctx, db, "host-a", "x"); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := ReserveContainerIP(ctx, db, "net", "10.0.0.5", "mac-y", "host-c", "y"); err != nil || !ok {
+		t.Fatalf("y reserve: %v %v", ok, err)
+	}
+	unreserved, _ := ReserveContainerNICs(ctx, db, "host-a", "x", []corrosion.ContainerInterfaceRecord{
+		{NetworkName: "net", IP: "10.0.0.5/24", MAC: "mac-x"},
+	})
+	if unreserved != 1 {
+		t.Fatalf("restore of x took y's address: unreserved=%d", unreserved)
+	}
+}
+
+// R1, the hole a legacy owner leaves: x lived across the upgrade with both a
+// legacy "x/24" row and a bare row; it is deleted, y takes the bare row, and
+// x is restored. x held "x/24" once, but the address was taken after x let it
+// go, so the restore is refused.
+func TestReserveContainerNICs_ReallocatedAfterReleaseRefusedEvenWithPriorRow(t *testing.T) {
+	ctx := context.Background()
+	db := cidrTestDB(t)
+	insertLegacyLease(t, db, "lxtnet", "172.16.77.50/24", "lxt3")
+	if ok, err := ReserveContainerIP(ctx, db, "lxtnet", "172.16.77.50/24", "mac-3", "node-3", "lxt3"); err != nil || !ok {
+		t.Fatalf("lxt3 bare re-reserve: %v %v", ok, err)
+	}
+	if err := ReleaseContainerLeases(ctx, db, "node-3", "lxt3"); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := ReserveContainerIP(ctx, db, "lxtnet", "172.16.77.50", "mac-9", "node-9", "lxt9"); err != nil || !ok {
+		t.Fatalf("lxt9 takes the released address: %v %v", ok, err)
+	}
+	unreserved, _ := ReserveContainerNICs(ctx, db, "node-3", "lxt3", []corrosion.ContainerInterfaceRecord{
+		{NetworkName: "lxtnet", IP: "172.16.77.50/24", MAC: "mac-3"},
+	})
+	if unreserved != 1 {
+		t.Fatalf("lxt3 took back an address lxt9 acquired after lxt3 released it: unreserved=%d", unreserved)
+	}
+}
+
+// m5: when the canonical key is free, the kept alias is written under it.
+func TestReserveContainerNICs_LegacyAliasUsesCanonicalKeyWhenFree(t *testing.T) {
+	ctx := context.Background()
+	db := cidrTestDB(t)
+	insertLegacyLease(t, db, "lxtnet", "172.16.77.50/24", "lxt3")
+	insertLegacyLease(t, db, "lxtnet", "172.16.77.50/16", "lxt4")
+	if err := ReleaseContainerLeases(ctx, db, "node-3", "lxt3"); err != nil {
+		t.Fatal(err)
+	}
+	if u, _ := ReserveContainerNICs(ctx, db, "node-3", "lxt3", []corrosion.ContainerInterfaceRecord{
+		{NetworkName: "lxtnet", IP: "172.16.77.50/24", MAC: "mac-3"},
+	}); u != 0 {
+		t.Fatalf("legacy alias not kept: unreserved=%d", u)
+	}
+	al, _ := GetAllocationFor(ctx, db, "lxtnet", "ct", "node-3", "lxt3")
+	if al == nil || al.IP != "172.16.77.50" {
+		t.Fatalf("kept alias lease = %+v, want the canonical key 172.16.77.50", al)
+	}
+}
+
+// R1: the original's own old "x/24" row (released after it took the bare
+// key) is not a licence for a same-named copy on another host to take the
+// address the original still holds.
+func TestReserveContainerNICs_CopyRefusedDespiteOriginalsOldRow(t *testing.T) {
+	ctx := context.Background()
+	db := cidrTestDB(t)
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if err := db.Execute(ctx, q, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	exec(`INSERT INTO ip_allocations (network, ip, mac, vm_name, owner_kind, owner_host, allocated_at, updated_at)
+	      VALUES ('net', '10.0.0.5', 'mac-a', 'web', 'ct', 'host-a', '2026-10-01T00:00:00Z', ?)`, db.NowTS())
+	exec(`INSERT INTO ip_allocations (network, ip, mac, vm_name, owner_kind, owner_host, allocated_at, updated_at, deleted_at)
+	      VALUES ('net', '10.0.0.5/24', 'mac-a', 'web', 'ct', 'host-a', '2026-09-01T00:00:00Z', ?, '2026-10-02T00:00:00Z')`, db.NowTS())
+	unreserved, _ := ReserveContainerNICs(ctx, db, "host-b", "web", []corrosion.ContainerInterfaceRecord{
+		{NetworkName: "net", IP: "10.0.0.5/24", MAC: "mac-b"},
+	})
+	if unreserved != 1 {
+		t.Fatalf("copy on host-b took the original's live address: unreserved=%d", unreserved)
+	}
+}

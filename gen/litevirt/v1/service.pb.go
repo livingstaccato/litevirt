@@ -12568,8 +12568,11 @@ type PullOCIImageRequest struct {
 	// resolve per-user creds itself); (b) ad-hoc `lv ct pull --username`. When
 	// empty, the entry node resolves from stored credentials (per-user, then
 	// global).
-	Username      string `protobuf:"bytes,5,opt,name=username,proto3" json:"username,omitempty"`
-	Password      string `protobuf:"bytes,6,opt,name=password,proto3" json:"password,omitempty"`
+	Username string `protobuf:"bytes,5,opt,name=username,proto3" json:"username,omitempty"`
+	Password string `protobuf:"bytes,6,opt,name=password,proto3" json:"password,omitempty"`
+	// project owns the pulled library item (a bare dest): a non-admin may
+	// create containers from it only in this project. Empty is "_default".
+	Project       string `protobuf:"bytes,7,opt,name=project,proto3" json:"project,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -12642,6 +12645,13 @@ func (x *PullOCIImageRequest) GetUsername() string {
 func (x *PullOCIImageRequest) GetPassword() string {
 	if x != nil {
 		return x.Password
+	}
+	return ""
+}
+
+func (x *PullOCIImageRequest) GetProject() string {
+	if x != nil {
+		return x.Project
 	}
 	return ""
 }
@@ -34703,14 +34713,15 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\n" +
 	"containers\x18\x01 \x03(\v2\x16.litevirt.v1.ContainerR\n" +
 	"containers\x12&\n" +
-	"\x0fnext_page_token\x18\x02 \x01(\tR\rnextPageToken\"\xa6\x01\n" +
+	"\x0fnext_page_token\x18\x02 \x01(\tR\rnextPageToken\"\xc0\x01\n" +
 	"\x13PullOCIImageRequest\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x12\x14\n" +
 	"\x05image\x18\x02 \x01(\tR\x05image\x12\x12\n" +
 	"\x04dest\x18\x03 \x01(\tR\x04dest\x12\x10\n" +
 	"\x03tag\x18\x04 \x01(\tR\x03tag\x12\x1a\n" +
 	"\busername\x18\x05 \x01(\tR\busername\x12\x1a\n" +
-	"\bpassword\x18\x06 \x01(\tR\bpassword\"\xa1\x01\n" +
+	"\bpassword\x18\x06 \x01(\tR\bpassword\x12\x18\n" +
+	"\aproject\x18\a \x01(\tR\aproject\"\xa1\x01\n" +
 	"\x16BackupContainerRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1b\n" +
 	"\thost_name\x18\x02 \x01(\tR\bhostName\x12\x1b\n" +

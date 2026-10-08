@@ -1222,6 +1222,9 @@ message PullOCIImageRequest {
     // global).
     string username = 5;
     string password = 6;
+    // project owns the pulled library item (a bare dest): a non-admin may
+    // create containers from it only in this project. Empty is "_default".
+    string project = 7;
 }
 
 // BackupContainerRequest pushes a container's rootfs (and its LXC config) into a

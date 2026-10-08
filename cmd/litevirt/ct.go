@@ -495,7 +495,7 @@ func newCTExecCmd() *cobra.Command {
 func newCTPullCmd() *cobra.Command {
 	var host string
 	var useLocal, passwordStdin bool
-	var dest, tag, username, password string
+	var dest, tag, username, password, project string
 	cmd := &cobra.Command{
 		Use:   "pull <oci-image>",
 		Short: "Pull an OCI image and unpack as a rootfs (requires skopeo + umoci)",
@@ -524,6 +524,7 @@ func newCTPullCmd() *cobra.Command {
 			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				_, err := c.PullOCIImage(ctx, &pb.PullOCIImageRequest{
+					Project:  project,
 					HostName: host, Image: args[0], Dest: dest, Tag: tag,
 					Username: username, Password: pw,
 				})
@@ -533,6 +534,7 @@ func newCTPullCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&dest, "dest", "", "Destination rootfs directory")
 	cmd.Flags().StringVar(&tag, "tag", "", "Override image tag")
+	cmd.Flags().StringVar(&project, "project", "", "Project that owns the pulled image (default: _default); only it may create containers from it")
 	cmd.Flags().StringVar(&host, "host", "", "Target host")
 	cmd.Flags().BoolVar(&useLocal, "local", false, "Use the host-local runtime")
 	cmd.Flags().StringVarP(&username, "username", "u", "", "registry username for an ad-hoc authenticated pull")

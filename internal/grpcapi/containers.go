@@ -139,6 +139,13 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		s.audit(ctx, "ct.create", req.Name, "template="+req.Template, "denied")
 		return nil, err
 	}
+	// A library item another project pulled is that project's image.
+	if p, isPath, _ := lxc.TemplatePath(req.Template); isPath {
+		if err := s.refuseForeignOCIItem(ctx, ociLibraryName(p, s.dataDir), req.Project, "be created from"); err != nil {
+			s.audit(ctx, "ct.create", req.Name, "template="+req.Template, "denied")
+			return nil, err
+		}
+	}
 
 	// Serialize same-name creates on this host, and reject a duplicate BEFORE
 	// allocating any IPAM lease. Without this, a duplicate / concurrent create that
@@ -713,6 +720,11 @@ func (s *Server) PullOCIImage(ctx context.Context, req *pb.PullOCIImageRequest) 
 	if err := s.RequirePerm(ctx, "/", "image.pull", "operator"); err != nil {
 		return nil, err
 	}
+	if req.Project != "" {
+		if _, err := safename.CanonicalProjectName(req.Project); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+		}
+	}
 	// Dest is where umoci unpacks the (untrusted) image rootfs as root, and a
 	// local oci: source is read as root — both are host-path primitives. A bare
 	// Dest name is contained under the daemon OCI staging dir; an absolute Dest
@@ -757,7 +769,7 @@ func (s *Server) PullOCIImage(ctx context.Context, req *pb.PullOCIImageRequest) 
 	// Forward AFTER resolution so req carries the resolved secret to the host
 	// that actually runs skopeo (it cannot resolve per-user creds itself).
 	if forwarded, err := s.forwardSimpleCT(ctx, req.HostName, func(c pb.LiteVirtClient) (*emptypb.Empty, error) {
-		return c.PullOCIImage(ctx, req)
+		return c.PullOCIImage(s.ownerStrictOutgoing(ctx), req)
 	}); err != nil || forwarded != nil {
 		return forwarded, err
 	}
@@ -777,8 +789,19 @@ func (s *Server) PullOCIImage(ctx context.Context, req *pb.PullOCIImageRequest) 
 	if err := s.checkOCIPullPaths(req.Image, req.Dest); err != nil {
 		return nil, err
 	}
+	// A library item belongs to the project that pulled it; another project's
+	// caller may not pull over it.
+	item := ociLibraryName(req.Dest, s.dataDir)
+	if err := s.refuseForeignOCIItem(ctx, item, req.Project, "pull over"); err != nil {
+		return nil, err
+	}
 	if err := s.containerRuntime.PullOCIImage(ctx, req.Image, req.Dest, req.Tag, req.Username, req.Password); err != nil {
 		return nil, status.Errorf(codes.Internal, "pull oci: %v", err)
+	}
+	if item != "" && s.dataDir != "" {
+		if err := s.writeOCIOwner(item, tenancy.NormalizeProject(req.Project)); err != nil {
+			slog.Warn("oci pull: could not record the image's owner; it stays usable by every project", "image", item, "error", err)
+		}
 	}
 	return &emptypb.Empty{}, nil
 }
@@ -805,11 +828,11 @@ func (s *Server) forwardCreateContainer(ctx context.Context, req *pb.CreateConta
 	if req.HostName == "" || req.HostName == s.hostName {
 		return nil, nil
 	}
-	c, conn, err := s.peerClient(ctx, req.HostName)
+	c, closer, err := s.dialPeer(ctx, req.HostName)
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable, "forward create: %v", err)
 	}
-	defer conn.Close()
+	defer closer()
 	// The entry node owns the idempotency claim; strip the key from the forwarded
 	// copy so the executor doesn't re-run the idempotency path and self-conflict on
 	// the same key (abort the forward, or race a duplicate claim on the same row).
@@ -818,7 +841,7 @@ func (s *Server) forwardCreateContainer(ctx context.Context, req *pb.CreateConta
 		fwd = proto.Clone(req).(*pb.CreateContainerRequest)
 		fwd.IdempotencyKey = ""
 	}
-	return c.CreateContainer(ctx, fwd)
+	return c.CreateContainer(s.ownerStrictOutgoing(ctx), fwd)
 }
 
 // forwardSimpleCT is the empty-result version: returns (resp, err)

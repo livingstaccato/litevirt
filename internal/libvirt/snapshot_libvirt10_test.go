@@ -3,6 +3,7 @@ package libvirt
 import (
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 
@@ -432,4 +433,51 @@ func TestRevert_ARefusedCurrentIsReported(t *testing.T) {
 		m.rm("m1")
 		m.requireWhole(map[byte]bool{markA: true, markB: false})
 	})
+}
+
+// A snapshot over a raw base (review R1-I1): the overlay's own header names
+// the base, which is raw and never parsed. libvirt merges it, as on main,
+// and over many create/rm cycles the chain stays one overlay deep at most —
+// no untracked layer piles up toward the 64-layer migrate limit.
+func TestSnapshotDelete_ARawBaseIsMergedAsOnMain(t *testing.T) {
+	for _, state := range []golibvirt.DomainState{golibvirt.DomainRunning, golibvirt.DomainShutoff} {
+		t.Run(map[golibvirt.DomainState]string{golibvirt.DomainRunning: "running", golibvirt.DomainShutoff: "stopped"}[state], func(t *testing.T) {
+			m := newLibvirt10Raw(t)
+			m.setState(state)
+			root := m.active()
+			m.write(markA, 1)
+			m.snapshot("s1")
+			m.write(markB, 2)
+			m.rm("s1")
+			if got := m.active(); got != root {
+				t.Fatalf("the domain is on %s, want merged back onto the raw base %s", got, root)
+			}
+			for i := 0; i < 5; i++ {
+				m.snapshot("c")
+				m.rm("c")
+			}
+			if got := m.active(); got != root {
+				t.Fatalf("after 5 cycles the domain is on %s, want %s", got, root)
+			}
+			m.requireWhole(map[byte]bool{markA: true, markB: true})
+		})
+	}
+}
+
+// A block-device base (an LVM volume, a zvol): the chain lists it from the
+// overlay's header and ends there, without opening it as an image.
+func TestQcow2Chain_ABlockDeviceBaseEndsTheChain(t *testing.T) {
+	if _, err := exec.LookPath("qemu-img"); err != nil {
+		t.Skip("qemu-img not installed")
+	}
+	dev := "/dev/null" // a device, as a block device is; no image header
+	ov := filepath.Join(t.TempDir(), "vm-root.s1")
+	run(t, "qemu-img", "create", "-q", "-u", "-f", "qcow2", "-F", "raw", "-b", dev, ov, "1M")
+	layers, err := qcow2Chain(ov)
+	if err != nil {
+		t.Fatalf("qcow2Chain: %v", err)
+	}
+	if len(layers) != 2 || layers[0] != ov || layers[1] != dev {
+		t.Fatalf("chain %v, want [%s %s]", layers, ov, dev)
+	}
 }

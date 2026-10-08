@@ -437,22 +437,31 @@ func notInLiveChain(v snapshotAPI, dom golibvirt.Domain, snap golibvirt.DomainSn
 	return ""
 }
 
-// qcow2Chain is file and the layers under it, from the qcow2 headers, as
-// far as they can be read (bounded); the error says where the walk stopped.
+// qcow2Chain is file and the layers under it. Each layer is listed before
+// anything reads it, and the next one comes from its parent's own header
+// (which litevirt or libvirt wrote), so the disk a snapshot was taken of is
+// compared by its path, never parsed. A layer is opened as qcow2 only when
+// it is the top or its parent declares it qcow2: a raw file or a block
+// device (an LVM volume, a zvol) is listed and ends the chain — it holds
+// guest data, not a header — as an empty backing does. The error says where
+// a qcow2 layer could not be read; the layers listed so far are returned.
 func qcow2Chain(file string) ([]string, error) {
 	var out []string
-	p := file
+	p, parse := file, true
 	for depth := 0; p != "" && depth < 64; depth++ {
+		out = append(out, p)
+		if !parse {
+			break
+		}
 		info, err := qcow2.Info(p)
 		if err != nil {
 			return out, fmt.Errorf("read %s: %w", p, err)
 		}
-		out = append(out, p)
 		b := info.BackingFile
 		if b != "" && !filepath.IsAbs(b) {
 			b = filepath.Join(filepath.Dir(p), b)
 		}
-		p = b
+		p, parse = b, info.BackingFormat == "qcow2"
 	}
 	return out, nil
 }

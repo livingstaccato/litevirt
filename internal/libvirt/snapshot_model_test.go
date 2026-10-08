@@ -74,6 +74,17 @@ func newLibvirt10(t *testing.T) *libvirt10 {
 	return newLibvirt10Disks(t, 1)
 }
 
+// newLibvirt10Raw is newLibvirt10 on a raw root disk (an imported raw
+// disk, a promoted replica's raw base).
+func newLibvirt10Raw(t *testing.T) *libvirt10 {
+	t.Helper()
+	m := newLibvirt10(t)
+	root := filepath.Join(m.dir, "vm-root.img")
+	run(t, "qemu-img", "create", "-q", "-f", "raw", root, "4M")
+	m.dom.disks["vda"] = root
+	return m
+}
+
 // newLibvirt10Disks is newLibvirt10 with n disks: vda on vm-root.qcow2,
 // then vdb, vdc, ... on vm-dataN.qcow2.
 func newLibvirt10Disks(t *testing.T, n int) *libvirt10 {
@@ -241,11 +252,17 @@ func xmlName(x string) string {
 func chain(file string) ([]string, error) {
 	var out []string
 	for p := file; p != ""; {
+		if _, err := os.Stat(p); err != nil {
+			return out, fmt.Errorf("Could not open '%s': %w", p, err)
+		}
+		out = append(out, p)
+		if fmtOf(p) != "qcow2" {
+			break // a raw base ends the chain
+		}
 		info, err := qcow2.Info(p)
 		if err != nil {
 			return out, fmt.Errorf("Could not open '%s': %w", p, err)
 		}
-		out = append(out, p)
 		b := info.BackingFile
 		if b != "" && !filepath.IsAbs(b) {
 			b = filepath.Join(filepath.Dir(p), b)
@@ -253,6 +270,14 @@ func chain(file string) ([]string, error) {
 		p = b
 	}
 	return out, nil
+}
+
+// fmtOf is qcow2 for a file with a qcow2 header, raw otherwise.
+func fmtOf(p string) string {
+	if _, err := qcow2.Info(p); err == nil {
+		return "qcow2"
+	}
+	return "raw"
 }
 
 func (m *libvirt10) openDisks(d *modelDomain) error {
@@ -427,7 +452,7 @@ func (m *libvirt10) DomainSnapshotCreateXML(dom golibvirt.Domain, x string, flag
 		if _, err := os.Stat(ov); err == nil {
 			return golibvirt.DomainSnapshot{}, fmt.Errorf("external snapshot file for disk %s already exists and is not a block device: %s", dev, ov)
 		}
-		run(m.t, "qemu-img", "create", "-q", "-f", "qcow2", "-F", "qcow2", "-b", src, ov)
+		run(m.t, "qemu-img", "create", "-q", "-f", "qcow2", "-F", fmtOf(src), "-b", src, ov)
 		s.overlays[dev], s.bases[dev] = ov, src
 	}
 	for dev, ov := range s.overlays {
@@ -607,13 +632,13 @@ func (m *libvirt10) setState(st golibvirt.DomainState) {
 // write puts a 64 KiB pattern at off MiB through the domain's active layer.
 func (m *libvirt10) write(pattern byte, off int) {
 	m.t.Helper()
-	run(m.t, "qemu-io", "-f", "qcow2", "-c", fmt.Sprintf("write -P 0x%02x %dM 64k", pattern, off), m.active())
+	run(m.t, "qemu-io", "-f", fmtOf(m.active()), "-c", fmt.Sprintf("write -P 0x%02x %dM 64k", pattern, off), m.active())
 }
 
 // has reports whether the domain's disk reads pattern at off MiB.
 func (m *libvirt10) has(pattern byte, off int) bool {
 	m.t.Helper()
-	out, err := exec.Command("qemu-io", "-r", "-f", "qcow2", "-c",
+	out, err := exec.Command("qemu-io", "-r", "-f", fmtOf(m.active()), "-c",
 		fmt.Sprintf("read -P 0x%02x %dM 64k", pattern, off), m.active()).CombinedOutput()
 	return err == nil && !strings.Contains(string(out), "Pattern verification failed") &&
 		!strings.Contains(string(out), "Could not open")

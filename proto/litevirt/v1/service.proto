@@ -1370,6 +1370,11 @@ message ContainerBackupProbe {
     bool   foreign          = 4;  // manifests of this name, other projects only
     string latest_timestamp = 5;
     string detail           = 6;  // why it could not be opened (admin-facing)
+    int64  latest_total_bytes = 7;  // size of the newest attributed manifest
+    // unreadable: the repo exists here but could not be read (permissions, a
+    // corrupt manifest of this name, the caller's deadline). Not evidence of
+    // absence: the entry stays "unknown".
+    bool   unreadable       = 8;
 }
 message ProbeContainerBackupsResponse {
     repeated ContainerBackupProbe results = 1;

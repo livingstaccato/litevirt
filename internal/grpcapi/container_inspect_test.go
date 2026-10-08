@@ -112,7 +112,8 @@ func TestInspectContainer_ReportsTheContainer(t *testing.T) {
 	if len(d.GetSnapshots()) != 1 || d.GetSnapshots()[0].GetName() != "s1" {
 		t.Errorf("snapshots = %+v", d.GetSnapshots())
 	}
-	if len(d.GetBackups()) != 1 || !d.GetBackups()[0].GetAvailable() || d.GetBackups()[0].GetTotalBytes() != 1<<20 ||
+	if len(d.GetBackups()) != 1 || !d.GetBackups()[0].GetAvailable() ||
+		d.GetBackups()[0].GetTotalBytes() != manifestSize(t, live, "ct1", "2026-10-08T12:48:39Z") ||
 		d.GetBackups()[0].GetStatus() != "available" || d.GetBackups()[0].GetLocation() != "host-a" ||
 		d.GetBackups()[0].GetLatestTimestamp() != "2026-10-08T12:48:39Z" {
 		t.Errorf("backups = %+v, want the live repo available on host-a", d.GetBackups())
@@ -191,8 +192,8 @@ func TestInspectContainer_SameNameOtherProjectBackupsNotShown(t *testing.T) {
 	if err != nil {
 		t.Fatalf("viewer InspectContainer: %v", err)
 	}
-	if len(d.GetBackups()) != 1 || d.GetBackups()[0].GetRepo() != ours {
-		t.Fatalf("viewer backups = %+v, want only acme's repo %s", d.GetBackups(), ours)
+	if len(d.GetBackups()) != 1 || d.GetBackups()[0].GetLatestTimestamp() != "2026-10-08T10:00:00Z" {
+		t.Fatalf("viewer backups = %+v, want only acme's backup (10:00), not beta's (11:00)", d.GetBackups())
 	}
 
 	d, err = s.InspectContainer(adminCtx(), &pb.InspectContainerRequest{Name: "ct1"})

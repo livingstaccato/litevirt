@@ -106,12 +106,18 @@ container (same name and project) in that repository. The entry is then:
 - **available on `<host>`**: that host holds it;
 - **not found**: every host answered and none holds it (the repository was
   deleted, moved or unmounted everywhere);
-- **unknown**: no host holds it, but some host could not be asked;
+- **unknown**: no host holds it, but some host could not be asked, or could
+  not read the repository;
 - **another project's**: the repository only holds backups of a same-named
   container in another project.
 
+An available entry's size and time are those of this container's own newest
+backup in that repository, read from its manifest, so a same-named container in
+another project that uses the same repository never shows through.
+
 Without the admin role you see only the entries that are available for this
-container, with no host paths in reasons; the others are shown to an admin. An
+container, and no host paths: no reasons, no rootfs path, and an absolute
+repository path reads `(host path)`. The others are shown to an admin. An
 entry is never removed by inspect, and it still counts toward the project's
 `backup_gib`, as a VM backup in a vanished repository does.
 

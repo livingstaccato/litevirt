@@ -544,6 +544,12 @@ type Server struct {
 	// rootfsSizeTTL; rootfsSizeMu guards it and serialises the walks.
 	rootfsSizeMu sync.Mutex
 	rootfsSizes  map[string]rootfsSizeEntry
+	// backupProbeSem caps concurrent backup-repo probes (backupProbeSlots);
+	// backupManifests caches parsed manifests per (repo path, container name).
+	backupProbeOnce  sync.Once
+	backupProbeSem   chan struct{}
+	backupManifestMu sync.Mutex
+	backupManifests  map[string]manifestCacheEntry
 	// pciScanOverride is a test seam for the host hardware scan. Nil in
 	// production, where RescanHost calls pci.Scan directly.
 	//

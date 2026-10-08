@@ -16,6 +16,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/pbsstore"
+	"github.com/litevirt/litevirt/internal/safename"
 	"github.com/litevirt/litevirt/internal/tenancy"
 )
 
@@ -30,6 +31,25 @@ const (
 // backupProbeTimeout bounds one peer's answer to ProbeContainerBackups.
 const backupProbeTimeout = 5 * time.Second
 
+// backupProbeConcurrency caps how many repo probes run at once on a host,
+// for inspects from any number of callers and peers.
+const backupProbeConcurrency = 4
+
+// backupManifestTTL is how long a repo's parsed manifests of one container
+// name are reused.
+const backupManifestTTL = 30 * time.Second
+
+type manifestCacheEntry struct {
+	ms []pbsstore.Manifest
+	at time.Time
+}
+
+// backupProbeSlots is the host's probe limiter.
+func (s *Server) backupProbeSlots() chan struct{} {
+	s.backupProbeOnce.Do(func() { s.backupProbeSem = make(chan struct{}, backupProbeConcurrency) })
+	return s.backupProbeSem
+}
+
 // ProbeContainerBackups answers, for this host, whether each repo can be
 // opened here (a logical name resolved in this host's own config) and whether
 // it holds a backup of the named container in the named project. Peer-only:
@@ -38,8 +58,8 @@ func (s *Server) ProbeContainerBackups(ctx context.Context, req *pb.ProbeContain
 	if err := s.requirePeerCert(ctx); err != nil {
 		return nil, err
 	}
-	if req.Name == "" {
-		return nil, status.Error(codes.InvalidArgument, "name required")
+	if err := safename.ValidateContainerName(req.Name); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 	resp := &pb.ProbeContainerBackupsResponse{}
 	for _, r := range req.Repos {
@@ -48,10 +68,12 @@ func (s *Server) ProbeContainerBackups(ctx context.Context, req *pb.ProbeContain
 	return resp, nil
 }
 
-// probeContainerBackupRepo opens repo on this host and looks for container
-// backup manifests of name. A manifest is attributed to the container when its
-// embedded spec names the same project; manifests of the name in other
-// projects only make the repo "foreign" for this container.
+// probeContainerBackupRepo opens repo on this host and reads the container
+// backup manifests of name (only that name's directory). A manifest is
+// attributed to the container when its embedded spec names the same project;
+// manifests of the name in other projects make the repo foreign as well. The
+// work is bounded: it waits for a probe slot only until ctx ends, stops the
+// walk when ctx ends, and reuses a recent read of the same repo and name.
 func (s *Server) probeContainerBackupRepo(ctx context.Context, name, project, repo string) *pb.ContainerBackupProbe {
 	out := &pb.ContainerBackupProbe{Repo: repo}
 	path := ""
@@ -65,24 +87,21 @@ func (s *Server) probeContainerBackupRepo(ctx context.Context, name, project, re
 		out.Detail = fmt.Sprintf("repo %q is not registered on %s", repo, s.hostName)
 		return out
 	}
-	r, err := pbsstore.Open(path)
+	ms, err := s.containerManifests(ctx, path, name)
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
 			out.Detail = fmt.Sprintf("repo %s is not present on %s", path, s.hostName)
-		} else {
-			out.Detail = fmt.Sprintf("repo %s cannot be opened on %s: %v", path, s.hostName, err)
+		default:
+			out.Unreadable = true
+			out.Detail = fmt.Sprintf("repo %s could not be read on %s: %v", path, s.hostName, err)
 		}
 		return out
 	}
 	out.Opened = true
-	ms, err := r.ListManifests()
-	if err != nil {
-		out.Detail = fmt.Sprintf("repo %s cannot be listed on %s: %v", path, s.hostName, err)
-		return out
-	}
 	want := tenancy.NormalizeProject(project)
 	for _, m := range ms {
-		if m.VMName != name || m.DiskName != containerBackupDisk || m.ContainerSpecJSON == "" {
+		if m.ContainerSpecJSON == "" {
 			continue
 		}
 		var spec containerBackupSpec
@@ -95,15 +114,51 @@ func (s *Server) probeContainerBackupRepo(ctx context.Context, name, project, re
 		}
 		out.Attributed = true
 		if m.Timestamp > out.LatestTimestamp {
-			out.LatestTimestamp = m.Timestamp
+			out.LatestTimestamp, out.LatestTotalBytes = m.Timestamp, m.TotalSize
 		}
 	}
-	if out.Attributed {
-		out.Foreign = false
-	} else if !out.Foreign {
+	if !out.Attributed && !out.Foreign {
 		out.Detail = fmt.Sprintf("repo %s on %s holds no backup of %s", path, s.hostName, name)
 	}
 	return out
+}
+
+// containerManifests returns the rootfs manifests of name in the repo at
+// path, from the cache when a read younger than backupManifestTTL exists.
+func (s *Server) containerManifests(ctx context.Context, path, name string) ([]pbsstore.Manifest, error) {
+	key := path + "\x00" + name
+	s.backupManifestMu.Lock()
+	if e, ok := s.backupManifests[key]; ok && time.Since(e.at) < backupManifestTTL {
+		s.backupManifestMu.Unlock()
+		return e.ms, nil
+	}
+	s.backupManifestMu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return nil, err // an abandoned caller starts no walk
+	}
+	slots := s.backupProbeSlots()
+	select {
+	case slots <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	defer func() { <-slots }()
+	r, err := pbsstore.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	ms, err := r.ManifestsFor(ctx, name, containerBackupDisk)
+	if err != nil {
+		return nil, err
+	}
+	s.backupManifestMu.Lock()
+	if s.backupManifests == nil {
+		s.backupManifests = map[string]manifestCacheEntry{}
+	}
+	s.backupManifests[key] = manifestCacheEntry{ms: ms, at: time.Now()}
+	s.backupManifestMu.Unlock()
+	return ms, nil
 }
 
 // resolveContainerBackups decides each container_backups entry's status at
@@ -120,9 +175,10 @@ func (s *Server) resolveContainerBackups(ctx context.Context, rec *corrosion.Con
 	}
 	project := tenancy.NormalizeProject(rec.Project)
 	type agg struct {
-		foreign  bool
-		reasons  []string
-		resolved bool
+		foreign    bool
+		unanswered bool // some host could not say whether it holds it
+		reasons    []string
+		resolved   bool
 	}
 	st := make(map[string]*agg, len(refs))
 	var pending []string
@@ -145,8 +201,15 @@ func (s *Server) resolveContainerBackups(ctx context.Context, rec *corrosion.Con
 			ref := byRepo[p.Repo]
 			ref.Status, ref.Available, ref.Location = backupAvailable, true, host
 			ref.LatestTimestamp, ref.UnavailableReason = p.LatestTimestamp, ""
+			// Size and time come from THIS container's own newest manifest,
+			// never from the index row: (ct_name, repo) is shared by
+			// same-named containers, and the row holds whichever wrote last.
+			ref.TotalBytes, ref.UpdatedAt = p.LatestTotalBytes, p.LatestTimestamp
 		case p.Foreign:
 			a.foreign = true
+		case p.Unreadable:
+			a.unanswered = true
+			a.reasons = append(a.reasons, p.Detail)
 		case p.Detail != "":
 			a.reasons = append(a.reasons, p.Detail)
 		}
@@ -209,7 +272,7 @@ func (s *Server) resolveContainerBackups(ctx context.Context, rec *corrosion.Con
 		case a.foreign:
 			ref.Status = backupForeign
 			ref.UnavailableReason = "the repo holds backups of a same-named container in another project, not this one"
-		case allAnswered:
+		case allAnswered && !a.unanswered:
 			ref.Status = backupNotFound
 			ref.UnavailableReason = joinReasons(a.reasons)
 		default:
@@ -245,19 +308,26 @@ func joinReasons(rs []string) string {
 	return out
 }
 
+// hiddenRepoPath stands in for an absolute repo path shown to a non-admin.
+const hiddenRepoPath = "(host path)"
+
 // filterContainerBackups applies what the caller may see. Without the admin
 // role a caller sees only entries attributed to this container (the index is
-// shared by same-named containers in other projects), and no reason text,
-// which can carry host paths.
+// shared by same-named containers in other projects), and no host paths:
+// no reason text, no rootfs path, and no absolute repo path.
 func filterContainerBackups(d *pb.ContainerDetail, admin bool) *pb.ContainerDetail {
 	if admin || d == nil {
 		return d
 	}
+	d.RootfsPath = ""
 	kept := d.Backups[:0]
 	for _, b := range d.Backups {
 		// An available entry carries no reason (resolveContainerBackups
 		// clears it), so what remains holds no host path.
 		if b.GetStatus() == backupAvailable {
+			if filepath.IsAbs(b.Repo) {
+				b.Repo = hiddenRepoPath
+			}
 			kept = append(kept, b)
 		}
 	}

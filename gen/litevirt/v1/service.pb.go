@@ -13469,15 +13469,20 @@ func (x *ProbeContainerBackupsRequest) GetRepos() []string {
 }
 
 type ContainerBackupProbe struct {
-	state           protoimpl.MessageState `protogen:"open.v1"`
-	Repo            string                 `protobuf:"bytes,1,opt,name=repo,proto3" json:"repo,omitempty"`
-	Opened          bool                   `protobuf:"varint,2,opt,name=opened,proto3" json:"opened,omitempty"`
-	Attributed      bool                   `protobuf:"varint,3,opt,name=attributed,proto3" json:"attributed,omitempty"` // a manifest of this name and project
-	Foreign         bool                   `protobuf:"varint,4,opt,name=foreign,proto3" json:"foreign,omitempty"`       // manifests of this name, other projects only
-	LatestTimestamp string                 `protobuf:"bytes,5,opt,name=latest_timestamp,json=latestTimestamp,proto3" json:"latest_timestamp,omitempty"`
-	Detail          string                 `protobuf:"bytes,6,opt,name=detail,proto3" json:"detail,omitempty"` // why it could not be opened (admin-facing)
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	Repo             string                 `protobuf:"bytes,1,opt,name=repo,proto3" json:"repo,omitempty"`
+	Opened           bool                   `protobuf:"varint,2,opt,name=opened,proto3" json:"opened,omitempty"`
+	Attributed       bool                   `protobuf:"varint,3,opt,name=attributed,proto3" json:"attributed,omitempty"` // a manifest of this name and project
+	Foreign          bool                   `protobuf:"varint,4,opt,name=foreign,proto3" json:"foreign,omitempty"`       // manifests of this name, other projects only
+	LatestTimestamp  string                 `protobuf:"bytes,5,opt,name=latest_timestamp,json=latestTimestamp,proto3" json:"latest_timestamp,omitempty"`
+	Detail           string                 `protobuf:"bytes,6,opt,name=detail,proto3" json:"detail,omitempty"`                                                // why it could not be opened (admin-facing)
+	LatestTotalBytes int64                  `protobuf:"varint,7,opt,name=latest_total_bytes,json=latestTotalBytes,proto3" json:"latest_total_bytes,omitempty"` // size of the newest attributed manifest
+	// unreadable: the repo exists here but could not be read (permissions, a
+	// corrupt manifest of this name, the caller's deadline). Not evidence of
+	// absence: the entry stays "unknown".
+	Unreadable    bool `protobuf:"varint,8,opt,name=unreadable,proto3" json:"unreadable,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ContainerBackupProbe) Reset() {
@@ -13550,6 +13555,20 @@ func (x *ContainerBackupProbe) GetDetail() string {
 		return x.Detail
 	}
 	return ""
+}
+
+func (x *ContainerBackupProbe) GetLatestTotalBytes() int64 {
+	if x != nil {
+		return x.LatestTotalBytes
+	}
+	return 0
+}
+
+func (x *ContainerBackupProbe) GetUnreadable() bool {
+	if x != nil {
+		return x.Unreadable
+	}
+	return false
 }
 
 type ProbeContainerBackupsResponse struct {
@@ -35275,7 +35294,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x1cProbeContainerBackupsRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x18\n" +
 	"\aproject\x18\x02 \x01(\tR\aproject\x12\x14\n" +
-	"\x05repos\x18\x03 \x03(\tR\x05repos\"\xbf\x01\n" +
+	"\x05repos\x18\x03 \x03(\tR\x05repos\"\x8d\x02\n" +
 	"\x14ContainerBackupProbe\x12\x12\n" +
 	"\x04repo\x18\x01 \x01(\tR\x04repo\x12\x16\n" +
 	"\x06opened\x18\x02 \x01(\bR\x06opened\x12\x1e\n" +
@@ -35284,7 +35303,11 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"attributed\x12\x18\n" +
 	"\aforeign\x18\x04 \x01(\bR\aforeign\x12)\n" +
 	"\x10latest_timestamp\x18\x05 \x01(\tR\x0flatestTimestamp\x12\x16\n" +
-	"\x06detail\x18\x06 \x01(\tR\x06detail\"\\\n" +
+	"\x06detail\x18\x06 \x01(\tR\x06detail\x12,\n" +
+	"\x12latest_total_bytes\x18\a \x01(\x03R\x10latestTotalBytes\x12\x1e\n" +
+	"\n" +
+	"unreadable\x18\b \x01(\bR\n" +
+	"unreadable\"\\\n" +
 	"\x1dProbeContainerBackupsResponse\x12;\n" +
 	"\aresults\x18\x01 \x03(\v2!.litevirt.v1.ContainerBackupProbeR\aresults\"\x8d\x04\n" +
 	"\x0fContainerDetail\x124\n" +

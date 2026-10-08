@@ -815,7 +815,9 @@ Any rebuild or recreate, with an ISO or without, may create the VM on a host
 whose replica has not yet applied the tombstone of the VM it replaces — the
 pinned or chosen host, or the node running a rollout. The create carries that
 VM as its delete saw it (name, incarnation, host, owner epoch, spec
-generation and identity), and that host does not refuse the create for a
+generation and identity; for a rolling recreate, as the VM's own host
+reports the row it deleted, not as the node running the rollout last heard),
+and that host does not refuse the create for a
 stale copy the delete kills: it waits up to ten seconds for the tombstone to
 arrive and, if it does not, retires the copy itself, releasing its addresses
 as a delete does. Everything else is still refused as before: a live VM of

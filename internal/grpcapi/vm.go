@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -2041,7 +2042,14 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		defer conn.Close()
 		proxyCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 		defer cancel()
-		return client.DeleteVM(proxyCtx, req)
+		// The owner reports the row it tombstoned in a response header, which
+		// a re-create waiting on this delete takes (vm_recreate_replaces.go).
+		var hdr metadata.MD
+		out, err := client.DeleteVM(proxyCtx, req, grpc.Header(&hdr))
+		if err == nil {
+			acceptDeletedVMHeader(ctx, req.Name, hdr)
+		}
+		return out, err
 	}
 
 	// Verify the domain actually exists in libvirt on this host. If the
@@ -2110,11 +2118,13 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		// node keeps scheduling around. A failure is logged and every NIC named
 		// for the orphan sweep, never swallowed.
 		s.releaseNICLeasesBestEffort(ctx, vm, "delete-stale-record")
-		if err := corrosion.DeleteVM(ctx, s.db, req.Name); err != nil {
+		deleted, err := corrosion.DeleteVMReporting(ctx, s.db, req.Name)
+		if err != nil {
 			// A declined delete means the stale row is still live cluster-wide;
 			// claiming OK here would hide it. Idempotent — retry.
 			return nil, status.Errorf(codes.Internal, "clean up stale VM record: %v", err)
 		}
+		s.reportDeletedVM(ctx, deleted)
 		s.clearDeviceLease(req.Name)
 		// This path returns without reaching the main cleanup below, so the
 		// marker has to be dropped here too. A ghost row whose domain is already
@@ -2362,10 +2372,14 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// row every node keeps serving, scheduling around and failing over — the
 	// exact stale-live state the mandatory tombstone exists to kill. The domain
 	// teardown above is idempotent, so the caller can simply retry.
-	if err := corrosion.DeleteVM(ctx, s.db, req.Name); err != nil {
+	deleted, err := corrosion.DeleteVMReporting(ctx, s.db, req.Name)
+	if err != nil {
 		s.audit(ctx, "vm.delete", req.Name, "project="+tenancy.NormalizeProject(vm.Project), "error")
 		return nil, status.Errorf(codes.Internal, "delete: tombstone cluster row: %v", err)
 	}
+	// The row as this delete tombstoned it, for a re-create that follows
+	// (vm_recreate_replaces.go).
+	s.reportDeletedVM(ctx, deleted)
 
 	slog.Info("VM deleted", "name", req.Name)
 	// The mirror's latency shortcut, AFTER the mandatory tombstone: the VM is

@@ -11,6 +11,7 @@ import (
 	"sort"
 	"time"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -81,6 +82,89 @@ func replacedVMFor(ctx context.Context, name string) (replacedVM, bool) {
 		return replacedVM{}, false
 	}
 	return r, true
+}
+
+// withReplacedSnapshot returns ctx carrying the VM name as snap describes it
+// into the create that re-creates it — the row its delete tombstoned, as the
+// deleting host reported it (deletedVMSink).
+func withReplacedSnapshot(ctx context.Context, name string, snap corrosion.VMDeleteSnapshot) context.Context {
+	if name == "" || snap.CreatedAt == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, replacedVMKey{}, replacedVM{name: name, snap: snap})
+}
+
+// A rolling recreate's delete runs on the VM's owner, against the owner's
+// row; the node running the rollout may hold an older copy of it. The VM the
+// create replaces is the row the owner tombstoned, so DeleteVM reports it:
+// in-process into a deletedVMSink the caller put in its context, and to a
+// peer that forwarded the delete in a response header (deletedVMMD), which
+// the forwarding DeleteVM puts in its own caller's sink. An owner on an older
+// build reports nothing; the caller then falls back to its own copy.
+
+// deletedVMSinkKey carries a *deletedVMSink in a context.
+type deletedVMSinkKey struct{}
+
+// deletedVMSink receives the row a DeleteVM tombstoned, as its guard saw it.
+type deletedVMSink struct {
+	name string
+	snap *corrosion.VMDeleteSnapshot
+}
+
+// withDeletedVMSink returns ctx with a sink for the delete of name.
+func withDeletedVMSink(ctx context.Context, name string) (context.Context, *deletedVMSink) {
+	sink := &deletedVMSink{name: name}
+	return context.WithValue(ctx, deletedVMSinkKey{}, sink), sink
+}
+
+// deletedVMMD is the response header a DeleteVM answering a peer host reports
+// the row it tombstoned in.
+const deletedVMMD = "x-litevirt-deleted-vm"
+
+// reportDeletedVM reports row, which this host's DeleteVM has just
+// tombstoned: into the caller's sink when it is in-process, and in a response
+// header when the caller is a peer host.
+func (s *Server) reportDeletedVM(ctx context.Context, row *corrosion.VMRecord) {
+	if row == nil {
+		return
+	}
+	snap := corrosion.SnapshotForDelete(*row)
+	if sink, ok := ctx.Value(deletedVMSinkKey{}).(*deletedVMSink); ok && sink.name == row.Name {
+		sink.snap = &snap
+	}
+	if s.requirePeerCert(ctx) != nil {
+		return
+	}
+	b, err := json.Marshal(replacedVMWire{
+		Name: row.Name, CreatedAt: snap.CreatedAt, HostName: snap.HostName,
+		OwnerEpoch: snap.OwnerEpoch, SpecGeneration: snap.SpecGeneration, IdentityHash: snap.IdentityHash,
+	})
+	if err != nil {
+		return
+	}
+	_ = grpc.SetHeader(ctx, metadata.Pairs(deletedVMMD, string(b)))
+}
+
+// acceptDeletedVMHeader puts the row a forwarded DeleteVM's owner reported in
+// hdr into ctx's sink for name, when there is one and the report is whole.
+func acceptDeletedVMHeader(ctx context.Context, name string, hdr metadata.MD) {
+	sink, ok := ctx.Value(deletedVMSinkKey{}).(*deletedVMSink)
+	if !ok || sink.name != name {
+		return
+	}
+	vals := hdr.Get(deletedVMMD)
+	if len(vals) != 1 {
+		return
+	}
+	var w replacedVMWire
+	if err := json.Unmarshal([]byte(vals[0]), &w); err != nil || w.Name != name || w.CreatedAt == "" ||
+		w.HostName == "" || w.IdentityHash == "" {
+		return
+	}
+	sink.snap = &corrosion.VMDeleteSnapshot{
+		CreatedAt: w.CreatedAt, HostName: w.HostName, OwnerEpoch: w.OwnerEpoch,
+		SpecGeneration: w.SpecGeneration, IdentityHash: w.IdentityHash,
+	}
 }
 
 // replacedVMMD is the metadata key that hands a replacedVM to the host a

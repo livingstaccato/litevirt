@@ -429,3 +429,49 @@ func TestFleet_ARecreateWhoseDeleteFoundNothingNamesNoReplacedVM(t *testing.T) {
 		t.Fatalf("a VM someone deleted was re-created on %s", n2.Name)
 	}
 }
+
+// A rolling recreate run from node-2, whose replica is one write behind the
+// VM's owner node-0: an ownership write on node-0 (owner epoch +1) reached
+// node-1 but not node-2. The delete runs on node-0, against node-0's row; the
+// create goes to node-1, which holds that same row and has not applied the
+// tombstone yet. The VM the create replaces must be the row the owner
+// actually deleted, not node-2's stale copy of it: node-1's row is ahead of
+// node-2's copy, and refusing it for that loses the VM.
+//
+// Red against 0fdfb8ac: recreateAs sent node-2's view; node-1 refused
+// AlreadyExists and the VM was gone.
+func TestFleet_ARollingRecreateFromAReplicaBehindTheOwnerKeepsTheVM(t *testing.T) {
+	c := newRebuildRaceFleet(t)
+	n0, n1, n2 := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	before := seedVM(t, c, n0, &pb.VMSpec{Name: "web", Cpu: 1, MemoryMib: 256})
+	n2.Server.SetReplacedTombstoneWaitForTest(500 * time.Millisecond)
+	// node-2 hears nothing from here on.
+	c.SetLinkFault(n0, n2, LinkFault{Block: true})
+	c.SetLinkFault(n1, n2, LinkFault{Block: true})
+	ctx := context.Background()
+	if err := corrosion.TransferVMOwnerFresh(ctx, n0.DB, "web", n0.Name, "stopped"); err != nil {
+		t.Fatalf("ownership write on %s: %v", n0.Name, err)
+	}
+	owner, _ := corrosion.GetVM(ctx, n0.DB, "web")
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		if rec, _ := corrosion.GetVM(ctx, n1.DB, "web"); rec != nil && rec.OwnerEpoch == owner.OwnerEpoch {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s never applied %s's ownership write", n1.Name, n0.Name)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if stale, _ := corrosion.GetVM(ctx, n2.DB, "web"); stale == nil || stale.OwnerEpoch >= owner.OwnerEpoch {
+		t.Fatalf("%s is not behind the owner: %+v, owner epoch %d", n2.Name, stale, owner.OwnerEpoch)
+	}
+	// From here node-0's tombstone takes a while to reach node-1.
+	c.SetLinkFault(n0, n1, LinkFault{Delay: raceLag})
+
+	desired := &pb.VMSpec{Name: "web", Cpu: 2, MemoryMib: 256, Placement: &pb.PlacementSpec{Host: n1.Name}}
+	if err := recreateOn(t, n2, c.SelfClient(n2), "web", desired); err != nil {
+		t.Fatalf("rolling recreate from a replica behind the owner: %v; %s", err, whereIs(c, "web"))
+	}
+	assertReCreated(t, c, "web", before, n1)
+}

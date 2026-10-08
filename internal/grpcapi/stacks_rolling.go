@@ -74,19 +74,26 @@ func (o *serverOps) recreateAs(ctx context.Context, target, source string, desir
 			return status.Errorf(st.Code(), "recreate %s: %s; nothing was deleted", target, st.Message())
 		}
 	}
-	_, derr := o.s.DeleteVM(ctx, &pb.DeleteVMRequest{Name: target})
+	dctx, deleted := withDeletedVMSink(ctx, target)
+	_, derr := o.s.DeleteVM(dctx, &pb.DeleteVMRequest{Name: target})
 	if derr != nil && status.Code(derr) != codes.NotFound {
 		return fmt.Errorf("delete %s before recreate: %w", target, derr)
 	}
 	// The delete may have run on the VM's own host, and the create may land
 	// on a host — this one included — whose replica has not applied its
-	// tombstone yet. The create carries the VM it replaces, as this node saw
-	// it, so that host does not refuse it for that row
-	// (vm_recreate_replaces.go). Only when this delete removed it: NotFound
+	// tombstone yet. The create carries the VM it replaces, so that host does
+	// not refuse it for that row (vm_recreate_replaces.go): the row the
+	// delete tombstoned, as the deleting host reported it — this node's copy
+	// may be behind it — or this node's copy when that host is on an older
+	// build and reports nothing. Only when this delete removed it: NotFound
 	// tore nothing down, so the create names nothing and claims no teardown.
 	tornDown := derr == nil && cur != nil
 	if tornDown {
-		ctx = withReplacedVM(ctx, cur)
+		if deleted.snap != nil {
+			ctx = withReplacedSnapshot(ctx, target, *deleted.snap)
+		} else {
+			ctx = withReplacedVM(ctx, cur)
+		}
 	}
 	var err error
 	if decision != nil {

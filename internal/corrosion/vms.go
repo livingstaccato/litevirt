@@ -1167,16 +1167,38 @@ func TransferVMOwnerFresh(ctx context.Context, c *Client, name, hostName, state 
 // receive-only: a peer admits it only while its own row has zero authority, so
 // after the owner-epoch backfill it is silently dropped everywhere.
 func DeleteVM(ctx context.Context, c *Client, name string) error {
+	_, err := DeleteVMReporting(ctx, c, name)
+	return err
+}
+
+// DeleteVMReporting is DeleteVM that also returns the row it tombstoned, as
+// its guard saw it — nil when there was no live row to delete.
+func DeleteVMReporting(ctx context.Context, c *Client, name string) (*VMRecord, error) {
 	// Absent/already-tombstoned is the idempotent success callers expect; a row
 	// still live after every fresh-guard retry means its authority keeps moving
 	// under the CAS and the caller must not be told the delete landed.
+	var deleted *VMRecord
 	outcome, err := retriedDelete(func() (deleteOutcome, error) {
-		return deleteVMGuarded(ctx, c, name)
+		vm, err := GetVM(ctx, c, name)
+		if err != nil {
+			return deleteContended, err
+		}
+		if vm == nil {
+			return deleteAbsent, nil
+		}
+		out, err := deleteVMGuardedFrom(ctx, c, *vm)
+		if err == nil && out == deleteApplied {
+			deleted = vm
+		}
+		return out, err
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return deleteOutcomeError(outcome, false)
+	if err := deleteOutcomeError(outcome, false); err != nil {
+		return nil, err
+	}
+	return deleted, nil
 }
 
 // ErrVMIncarnationMismatch means the live row of a VM name is not one the

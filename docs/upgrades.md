@@ -679,9 +679,9 @@ off (colonelpanik/litevirt#253). Two things change:
 - **At once, on each upgraded host:** nothing takes a `fenced` state as proof
   of power-off unless the host's newest fence is proof-grade (`ipmi`, or
   `lv host fence-confirm`). Owner-assert asks an SSH-fenced host whether it
-  runs a workload, `lv host rm --dead` refuses a host whose `fenced` state
-  rests on an SSH fence, and the voter-loss condition asks such a host which
-  machine it is. This reads the rows every fence already wrote; nothing is
+  runs a workload, `lv host rm --dead` no longer counts a proof-grade fence
+  from an earlier life of a host whose `fenced` state now rests on an SSH
+  fence, and the voter-loss condition asks such a host which machine it is. This reads the rows every fence already wrote; nothing is
   backfilled.
 - **After the last host has upgraded:** the mandatory, replication-gated
   `fence_state_v1` token latches, and from then on an SSH, watchdog or
@@ -693,8 +693,11 @@ off (colonelpanik/litevirt#253). Two things change:
   previous release — such a fence keeps recording `fenced`, because a
   coordinator on that release resumes a recovery only from `fenced`.
 
-What an operator sees after the latch: `lv host ls` lists an SSH-fenced host
-as `offline`. Bring it back with `lv host undrain <host>` as before. An
+What an operator sees after the latch: the host's recorded state (the
+`host_membership` row, and the assurance `lv doctor fence` and `lv host fence`
+print) is `offline` for an SSH-fenced host. `lv host ls` shows `HOST_OFFLINE`
+for both `offline` and `fenced`, so it looks as before. Bring the host back
+with `lv host undrain <host>` as before. An
 `offline` host whose newest fence **failed** is still put back in service
 when a quorum sees it healthy again, as before; one whose newest fence
 succeeded waits for `lv host undrain`, exactly like a `fenced` host — this
@@ -702,6 +705,46 @@ now includes a host fenced with `lv host fence`, which records it `offline`.
 A host that boots again still records itself `active` from its own daemon, as
 before; what waits is a host that answers without having restarted, which is
 the host an unverified fence may never have powered off.
+
+**`lv host fence` now authorises automatic recovery**, at once on an upgraded
+leader, latched or not. When the operator's fence succeeds, the failover leader
+treats it as it treats its own fence — under the same safe-fence policy,
+`litevirt.fence_requires_confirmation` label and recovery claims — and only
+while it still **stands**: some observer has watched the host fail without a
+break since **before** the fence, and nobody has seen it answer since. Then an
+`ssh` or `best-effort` fence is resumed from without fencing again, and an
+`ipmi` fence is resumed from while under 5 minutes old and otherwise renewed
+with a fresh power-off first. On the previous release an operator fence moved
+nothing, and the host's workloads stayed where they were.
+
+An observer's failing run is held in memory, so a daemon restart starts it
+over, and a rolling upgrade restarts every observer. So for a host an operator
+fenced **before** the upgrade that is still down:
+
+- an `ssh` or `best-effort` fence no longer stands once the roll completes, and
+  is **not** resumed from: the workloads stay where they are, as on the
+  previous release. Confirm the host is off and run
+  `lv host fence-confirm <host>`; the coordinator then fences it afresh for
+  the outage and recovers its workloads. (Mid-roll, an upgraded leader can
+  still resume from it while an observer that has not restarted yet holds an
+  unbroken run.)
+- an `ipmi` fence is renewed with a fresh power-off and then recovered, on the
+  first leader cycle after the roll that finds the host still down.
+
+The same holds for an operator fence of a host that was still answering when
+it was fenced: every observer's run began after the fence, so an `ssh` fence is
+never recovered from automatically (use `lv host fence-confirm`), and an
+`ipmi` one is renewed and recovered. If you do not want an IPMI-fenced host's
+workloads recovered at the upgrade, `lv host undrain` it before upgrading, or
+move them with `lv host drain`.
+
+`lv host fence` served by an upgraded node writes the host's state and its
+fence row as one replicated entry, so every leader cycle sees both. Served by a
+node that has not been upgraded yet, mid-roll, it still writes them as two
+entries, as on the previous release: an upgraded leader whose cycle lands
+between them sees the host `offline` with no successful fence row, treats it as
+handled and moves nothing. That fails closed; run `lv host fence-confirm` once
+the host is confirmed off.
 
 A binary rolled back below the latch enters WAL quarantine, as below every
 latched token. See [What a fence records](migration-failover.md#what-a-fence-records).

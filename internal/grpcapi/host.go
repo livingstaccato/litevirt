@@ -774,8 +774,52 @@ func (s *Server) SetHostLabels(ctx context.Context, req *pb.SetHostLabelsRequest
 	return s.InspectHost(ctx, &pb.InspectHostRequest{Name: req.Name})
 }
 
+// recordFence writes a fence row and the host state it records as one
+// replicated entry. If the combined write fails it falls back to the two
+// writes separately, as the coordinator does: the state is required (its
+// failure is the RPC's error), the row is best effort.
+func (s *Server) recordFence(ctx context.Context, rec corrosion.FenceLogRecord, state string) error {
+	if err := corrosion.RecordFenceWithState(ctx, s.db, rec, state); err == nil {
+		return nil
+	} else {
+		slog.Warn("fence: write fence_log and host state together", "host", rec.HostName, "state", state, "error", err)
+	}
+	if err := corrosion.UpdateHostState(ctx, s.db, rec.HostName, state); err != nil {
+		return status.Errorf(codes.Internal, "update host state: %v", err)
+	}
+	if err := corrosion.InsertFenceLog(ctx, s.db, rec); err != nil {
+		slog.Warn("fence log insert failed", "error", err)
+	}
+	return nil
+}
+
+// fenceExecutorFunc is the shape of fence.Execute.
+type fenceExecutorFunc = func(context.Context, fence.HostConfig) fence.Result
+
+// fenceExecutor is the fence an operator's FenceHost runs: fence.Execute,
+// unless a test injected another (SetFenceExecutor).
+func (s *Server) fenceExecutor() func(context.Context, fence.HostConfig) fence.Result {
+	if s.fenceExec != nil {
+		return s.fenceExec
+	}
+	return fence.Execute
+}
+
+// SetFenceExecutor replaces the fence FenceHost runs. For tests: the fleet
+// harness has no machines to power off.
+func (s *Server) SetFenceExecutor(fn func(context.Context, fence.HostConfig) fence.Result) {
+	s.fenceExec = fn
+}
+
 // FenceHost forcibly powers off a host via SSH poweroff, then marks it offline.
 // If the host has IPMI configured, ipmitool is preferred over SSH.
+//
+// A fence that succeeds is authority for automatic recovery: if a quorum also
+// sees the host down and the fence still stands, the failover coordinator
+// resumes recovery of its workloads from this record, as it would from its
+// own fence (failover recordedFence / resumeActionFor), and the host is not put
+// back in service automatically afterwards — `lv host undrain`, or its own
+// reboot, brings it back.
 func (s *Server) FenceHost(ctx context.Context, req *pb.FenceHostRequest) (*pb.FenceResult, error) {
 	if err := RequireRole(ctx, "admin"); err != nil {
 		return nil, err
@@ -794,17 +838,17 @@ func (s *Server) FenceHost(ctx context.Context, req *pb.FenceHostRequest) (*pb.F
 	// the cluster to clear the manual-fence-pending state so the failover
 	// coordinator can reschedule its VMs. We do NOT execute a fence here.
 	if req.ConfirmManualOnly {
-		if err := corrosion.UpdateHostState(ctx, s.db, req.Name, "fenced"); err != nil {
-			return nil, status.Errorf(codes.Internal, "update host state: %v", err)
-		}
-		if err := corrosion.InsertFenceLog(ctx, s.db, corrosion.FenceLogRecord{
+		// The 'fenced' state and the confirmation row are one replicated entry
+		// (RecordFenceWithState), so no peer holds a 'fenced' state whose proof
+		// has not arrived — corrosion.HostProvedOff reads them together.
+		if err := s.recordFence(ctx, corrosion.FenceLogRecord{
 			ID:       randid.New(),
 			HostName: req.Name,
 			Method:   "manual",
 			Result:   "manual-confirmed",
 			Detail:   "operator confirmation via FenceHost(confirm_manual_only)",
-		}); err != nil {
-			slog.Warn("manual-confirm log insert failed", "error", err)
+		}, "fenced"); err != nil {
+			return nil, err
 		}
 		slog.Warn("manual fence confirmed by operator", "host", req.Name)
 		s.publish("host.fence-confirmed", req.Name, "manual")
@@ -812,13 +856,11 @@ func (s *Server) FenceHost(ctx context.Context, req *pb.FenceHostRequest) (*pb.F
 			"operator confirmed manual fence", "manual-confirmed")
 		// Deliberately narrow wording. This unblocks the flow where the COORDINATOR
 		// fenced (manual / best-effort strategy) and is waiting on confirmation
-		// before it reschedules. It does NOT make an operator-initiated fence
-		// reschedule anything: FenceHost never enumerates workloads, and the
-		// coordinator skips hosts already in offline/fenced/maintenance
-		// (failover/coordinator.go, the offline/maintenance/fenced filter in
-		// Coordinator.run's fence loop) — so
-		// promising a reschedule here would be
-		// false in exactly the case an operator is most likely to be in.
+		// before it reschedules (resumeFromConfirmation needs a fence attempt the
+		// cluster itself made). A confirmation with no attempt behind it moves
+		// nothing by itself — FenceHost never enumerates workloads — so
+		// promising a reschedule here would be false in exactly the case an
+		// operator is most likely to be in.
 		//
 		// A genuinely failed host does not need this: peers observe it by health
 		// quorum and the coordinator runs the whole fence-and-relocate sequence
@@ -833,7 +875,7 @@ func (s *Server) FenceHost(ctx context.Context, req *pb.FenceHostRequest) (*pb.F
 		}, nil
 	}
 
-	fr := fence.Execute(ctx, fence.HostConfig{
+	fr := s.fenceExecutor()(ctx, fence.HostConfig{
 		Name:          h.Name,
 		Address:       h.Address,
 		SSHUser:       h.SSHUser,
@@ -848,28 +890,29 @@ func (s *Server) FenceHost(ctx context.Context, req *pb.FenceHostRequest) (*pb.F
 		IsSelf: h.Name == s.hostName,
 	})
 
-	// Always mark offline regardless of fence success.
-	if err := corrosion.UpdateHostState(ctx, s.db, req.Name, "offline"); err != nil {
-		return nil, status.Errorf(codes.Internal, "update host state: %v", err)
-	}
-
 	method := fr.Method
 	detail := fr.Detail
-	result := "fenced"
+	result := fr.LogResult()
 	if !fr.Success {
-		result = "partial"
 		detail = fmt.Sprintf("fence failed (%s); host marked offline in state", fr.Detail)
 	}
 
-	// Record in fencing log.
-	if logErr := corrosion.InsertFenceLog(ctx, s.db, corrosion.FenceLogRecord{
+	// Mark it offline regardless of fence success, and record the fence, in
+	// ONE replicated entry (RecordFenceWithState). A successful operator fence
+	// of a host a quorum also sees down is authority the failover coordinator
+	// resumes a recovery from (recordedFence: 'offline' with a successful
+	// newest attempt), and two separate entries made that a race: a leader
+	// cycle between them saw 'offline' with no successful row, cached the
+	// host as handled, and never looked again. Together, every peer holds
+	// both or neither (colonelpanik/litevirt#253).
+	if err := s.recordFence(ctx, corrosion.FenceLogRecord{
 		ID:       randid.New(),
 		HostName: req.Name,
 		Method:   method,
 		Result:   result,
 		Detail:   detail,
-	}); logErr != nil {
-		slog.Warn("fence log insert failed", "error", logErr)
+	}, "offline"); err != nil {
+		return nil, err
 	}
 
 	slog.Warn("host fenced", "host", req.Name, "method", method, "result", result)

@@ -7,11 +7,14 @@ package fleet
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/fence"
 	"github.com/litevirt/litevirt/internal/health"
 )
 
@@ -148,5 +151,88 @@ func TestFleet_FenceStateUnlatched_SSHFenceStillRecordsFenced(t *testing.T) {
 	}
 	if n := refenced.Load(); n != 0 {
 		t.Errorf("the successor fenced %s %d time(s); an unverified fence is never re-fenced", d.Name, n)
+	}
+}
+
+// TestFleet_OperatorFence_RecoveryResumesExactlyOnce: an operator's
+// `lv host fence` that succeeds against a host a quorum also sees down is
+// authority for automatic recovery, exactly as the coordinator's own fence
+// is. FenceHost records 'offline' and its fence row in ONE replicated entry,
+// so whichever leader cycle reads the host sees both: the leader resumes the
+// recovery from the record, without fencing again, the workload runs in one
+// place, and the host stays 'offline' once it answers again (a host whose
+// workloads moved waits for `lv host undrain`).
+//
+// On main an operator fence wrote the state and the row as two entries, and
+// the coordinator cached an 'offline' host as handled; a host an operator
+// fenced on main and that is still down is recovered on the first leader
+// cycle after the upgrade.
+//
+// Mutation: make recordedFence accept only 'fenced' again (main's rule) — the
+// leader caches the operator-fenced host and never recovers vm. The one-entry
+// write itself is pinned by TestFenceHost_StateAndRowShareOneEntry.
+func TestFleet_OperatorFence_RecoveryResumesExactlyOnce(t *testing.T) {
+	ctx := context.Background()
+	vm := "vm-operator-fence"
+	c, a, b, cc, _, d := crashFleet(t, 2744, vm)
+	voters := []*Node{a, b, cc}
+	ledger := watchClaims(t, c)
+
+	clock := NewVirtualClock(time.Now().UTC())
+	cs := c.NewCoordinators(clock)
+	var coordFences atomic.Int32
+	cs.ByNode[a.Name].Gate = quorateGate{}
+	cs.ByNode[a.Name].SetFencer(func(context.Context, fence.HostConfig) fence.Result {
+		coordFences.Add(1)
+		return sshOff
+	})
+	a.Server.SetFenceExecutor(func(context.Context, fence.HostConfig) fence.Result { return sshOff })
+
+	// The operator fences d before the leader's first cycle.
+	if _, err := c.SelfClient(a).FenceHost(ctx, &pb.FenceHostRequest{Name: d.Name, Confirmed: true}); err != nil {
+		t.Fatalf("lv host fence %s: %v", d.Name, err)
+	}
+	c.WaitConverged(t, convergeTimeout, voters...)
+	for _, n := range voters {
+		if got := hostStateOn(t, n, d.Name); got != "offline" {
+			t.Fatalf("%s records %s %q after an operator SSH fence, want offline", n.Name, d.Name, got)
+		}
+		if fs := fencesOf(t, n, d.Name); len(fs) != 1 || fs[0].Method != "ssh" || fs[0].Result != "fenced" {
+			t.Fatalf("%s: fencing_log for %s = %+v, want the operator's ssh/fenced row", n.Name, d.Name, fs)
+		}
+	}
+
+	clock.Advance(time.Minute)
+	for _, n := range voters {
+		PublishHealth(t, n, d.Name, streakSince(2*time.Minute), clock.Now())
+	}
+	c.WaitConverged(t, convergeTimeout, voters...)
+	decided := tickUntilDecided(ctx, t, cs, a, d, vm, 6)
+	if decided == nil {
+		t.Fatalf("the leader never recovered %s from the operator's fence of %s: %+v", vm, d.Name, vmOn(t, a, vm))
+	}
+	if n := coordFences.Load(); n != 0 {
+		t.Errorf("the leader fenced %s %d time(s); it resumes from the operator's fence", d.Name, n)
+	}
+	c.WaitConverged(t, convergeTimeout, voters...)
+	claimReconciler(t, c.Node(decided.HostName)).ReconcileOnce(ctx)
+	out := checkClaimSafety(t, ledger, a, vm, c.Nodes)
+	if len(out.Running) != 1 || out.Running[0] != decided.HostName {
+		t.Errorf("%s runs on %v, want exactly the decided destination %s", vm, out.Running, decided.HostName)
+	}
+
+	// d answers again without having restarted: it stays out of service.
+	clock.Advance(10 * time.Minute)
+	for i := 0; i < 3; i++ {
+		for _, n := range voters {
+			publishAnswered(t, n, d.Name, clock.Now())
+		}
+		c.WaitConverged(t, convergeTimeout, voters...)
+		cs.Tick(ctx, a)
+		clock.Advance(health.ProbeInterval)
+	}
+	if got := hostStateOn(t, a, d.Name); got != "offline" {
+		t.Errorf("%s is %q after answering again; an operator-fenced host whose workloads moved "+
+			"stays offline until `lv host undrain`", d.Name, got)
 	}
 }

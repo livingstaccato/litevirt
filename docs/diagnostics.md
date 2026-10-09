@@ -670,8 +670,9 @@ one while it still stands, and never fences the host again for it (see
 A host recorded `fenced` is taken to be **off** only when its newest fence is
 proof-grade. Before `fence_state_v1` latches, or from a leader on an older
 build, an SSH fence records `fenced` too; owner-assert still asks that host
-whether it runs a workload, and `lv host rm --dead` refuses it until it is
-confirmed off (`lv host fence-confirm`).
+whether it runs a workload, and `lv host rm --dead` does not count a
+proof-grade fence from an earlier life of that host: confirm it off
+(`lv host fence-confirm`) first.
 
 `litevirt_fences_total{method,assurance}` counts the same classification. Note
 that the older `litevirt_fence_failures_total` counts every result other than

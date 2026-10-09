@@ -14,4 +14,7 @@ import (
 var (
 	_ failover.RegionGate           = (*health.Checker)(nil)
 	_ failover.RegionScopedPromoter = (*grpcapi.Server)(nil)
+	// The pre-fence fence_state_v1 read uses Latched (no Ping) when the gate
+	// has it; without it every fence would wait on a Ping sweep first.
+	_ failover.LatchReader = (*health.Checker)(nil)
 )

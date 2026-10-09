@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 )
 
@@ -119,17 +120,149 @@ var systemRoots = []string{
 	"/var/lib/libvirt", "/var/run", "/var/spool",
 }
 
-// litevirtVarLibPrefix refuses /var/lib/litevirt and every /var/lib/litevirt-*
-// (an old or side-by-side install's state) except the configured data
-// directory's own pool areas.
-const litevirtVarLibPrefix = "litevirt"
+// defaultDataDir is the daemon's default data_dir (daemon/config.go). It is
+// judged like the configured data directory whatever data_dir says: the
+// backup session's scratch and socket directories are hardcoded under it
+// (libvirt/backup_session.go), and an install that moved its data_dir may
+// have left its state there. It is compared by whole path components —
+// /var/lib/litevirt or /var/lib/litevirt/… — never as a string prefix, so a
+// sibling such as /var/lib/litevirt-labtest is an ordinary host path.
+const defaultDataDir = "/var/lib/litevirt"
+
+// litevirtStateRoots are other directories of litevirt's own state outside
+// the data directory, refused with everything in them: the gitops working
+// tree's default home (gitops.go Config.LocalDir, `lv gitops --local-dir`).
+var litevirtStateRoots = []string{"/var/lib/litevirt-gitops"}
 
 // dataDirPoolAreas are the parts of the daemon's data directory a pool may
 // live in: mounts/ holds the NFS mounts the daemon makes itself, and
-// pools/<name> is a target-less local pool's own directory. Everything else
-// there is the daemon's own state (state.db, pki, images, the audit assertion
-// file, …) — except disks/ itself (dataDirDisks).
+// pools/<name> is a target-less local pool's own directory. Their roots are
+// not pools: each contains every pool there.
 var dataDirPoolAreas = []string{"mounts", "pools"}
+
+// dataDirOwned are the children of the data directory that are the daemon's
+// own state. No pool may be one of them, inside one, or contain one (the data
+// directory itself), and no guest is given a file in one; anything else
+// directly in the data directory — /var/lib/litevirt/rc5pool, a backup repo
+// an admin made there — is an ordinary host path, as it was on main
+// (3e4ba50b had no such check), which only storage.hostpath may name.
+// disks/, pools/ and mounts/ have rules of their own (dataDirChildRefusal).
+//
+// The list is everything the daemon creates there, from the code;
+// TestDataDirOwned_CoversEverythingTheDaemonCreates fails on a join onto the
+// data directory, or a path hardcoded under /var/lib/litevirt, that it does
+// not cover. It cannot see a child built inside a helper that takes the data
+// directory under another parameter name (nowts.hwm, corrosion/hwm.go
+// newHWMStore(dir)): those were found by sweeping every function the data
+// directory is passed to, and a new one needs adding here by hand.
+var dataDirOwned = []string{
+	"state.db",               // corrosion/client.go NewClient, NewLocalClient (and -wal/-shm, dataDirOwnedPrefixes)
+	"pki",                    // the daemon's PKI when pki_dir is put in the data directory
+	"vms",                    // health/owner_marker.go: per-VM owner-epoch markers; deleted_vm_marker_sweep.go
+	"images",                 // image/store.go, imageops.go, restore_dest.go
+	"imports",                // vmimport.go: import work dirs and imports/staging (--server-path)
+	"import-placements",      // vmimport_placement.go importPlacementDirName
+	"iso-identity",           // iso_identity.go isoIdentityDir
+	"cloudinit",              // libvirt/xmlgen.go CloudInitISOPath; migrate.go, vm_iso.go
+	"nvram",                  // libvirt/xmlgen.go NvramPath; vtpmstate.go retainedMarkerPath
+	"vmstate",                // libvirt/xmlgen.go VMStatePath (saved memory state)
+	"snapfw",                 // libvirt/vtpmstate.go snapshot firmware bundles
+	"oci",                    // grpcapi/containers.go OCI image cache
+	"containers",             // daemon.go: the LXC container root
+	"ct-snapshots",           // snapshot_container.go containerSnapshotDir
+	"ct-restore",             // backup_container.go container restore staging
+	"ct-restore-markers",     // backup_container.go
+	"promote-markers",        // promote.go
+	"restore-staging",        // peer_backup.go
+	"backup-staging",         // peer_backup.go
+	"backup-scratch",         // libvirt/backup_session.go sessScratchDir (hardcoded /var/lib/litevirt)
+	"backup-sock",            // libvirt/backup_session.go sessSocketDir (hardcoded /var/lib/litevirt)
+	"replicate-scratch",      // replication_runner.go
+	"opjournal",              // daemon.go: the operation journal
+	"acme",                   // daemon/acme.go: ACME cache_dir default
+	"partition-pause",        // health/partition_pause_store.go partitionPauseDir
+	"pending-audit",          // corrosion/pending_audit.go PendingAuditDirName
+	"audit-hold",             // corrosion/audit_hold.go AuditHoldDirName
+	"audit-seeded.json",      // corrosion/audit_seeded.go AuditSeededFileName
+	"audit-seeded-assert",    // corrosion/audit_seeded.go AuditSeededAssertFileName
+	"credentials_unhydrated", // corrosion/isolation.go credentialsUnhydratedFile
+	"digest-invalidate",      // corrosion/digest_cache.go digestMarkerFile
+	"host_membership_live",   // corrosion/host_membership.go hostMembershipLiveFile
+	"genesis-pending",        // daemon.go genesisMarkerName; host_init.go genesisMarkerScript
+	"pool-uploads.json",      // storage_pool_confine.go poolUploadsFile
+	"nowts.hwm",              // corrosion/hwm.go (and nowts.hwm.lock)
+	"split_brain_activated",  // health/capability.go ActivationMarkerBase (markers are .<token>)
+}
+
+// dataDirOwnedPrefixes are owned by name prefix, each judged within one path
+// component: state.db's WAL, SHM and journal (state.db-wal); one capability
+// latch per token (health/capability.go ActivationMarkerPrefix,
+// split_brain_activated.<token>); nowts.hwm.lock; and
+// every dot-name, which is how the daemon names its temp files there
+// (secretfile.Write's .<name>.tmp, storage_pool_confine.go's
+// .pool-uploads.json-*).
+var dataDirOwnedPrefixes = []string{"state.db-", "split_brain_activated.", "nowts.hwm.", "."}
+
+// DataDirOwned returns the exact names of dataDirOwned.
+func DataDirOwned() []string { return slices.Clone(dataDirOwned) }
+
+// dataDirChildOwned reports whether name, a child of the data directory, is
+// the daemon's own state.
+func dataDirChildOwned(name string) bool {
+	for _, o := range dataDirOwned {
+		if name == o {
+			return true
+		}
+	}
+	for _, pre := range dataDirOwnedPrefixes {
+		if strings.HasPrefix(name, pre) {
+			return true
+		}
+	}
+	return false
+}
+
+// dataDirChild splits cand, strictly inside the data directory d, into its
+// first element below d and how many elements it has there; ok is false when
+// cand is not strictly inside d.
+func dataDirChild(d, cand string) (first string, depth int, ok bool) {
+	if !within(d, cand) || filepath.Clean(cand) == filepath.Clean(d) {
+		return "", 0, false
+	}
+	rel, err := filepath.Rel(d, cand)
+	if err != nil {
+		return "", 0, false
+	}
+	parts := strings.Split(rel, string(filepath.Separator))
+	return parts[0], len(parts), true
+}
+
+// dataDirChildRefusal judges a pool directory cand strictly inside the data
+// directory d: <data_dir>/disks itself and a directory under pools/ or
+// mounts/ are the daemon's pool areas; anything else in disks/, an area's
+// root, and the daemon's own state (dataDirOwned) are refused; any other
+// child is an ordinary host path.
+func dataDirChildRefusal(p, d, cand, dataDir string) error {
+	first, depth, ok := dataDirChild(d, cand)
+	if !ok {
+		return nil
+	}
+	switch {
+	case first == dataDirDisks:
+		if depth == 1 {
+			return nil
+		}
+		return fmt.Errorf("%q is inside the daemon's disks directory %s; a pool may be that directory itself, not one inside it", p, filepath.Join(dataDir, dataDirDisks))
+	case slices.Contains(dataDirPoolAreas, first):
+		if depth > 1 {
+			return nil
+		}
+		return fmt.Errorf("%q is the root of the daemon's %s/ area in %s, which holds every pool there; a pool is a directory inside it", p, first, dataDir)
+	case dataDirChildOwned(first):
+		return fmt.Errorf("%q is the daemon's own state (%s in its data directory %s)", p, first, dataDir)
+	}
+	return nil
+}
 
 // dataDirDisks is <data_dir>/disks, where every VM's local disks live across
 // projects and where the built-in default pool of an older cluster still is.
@@ -155,8 +288,9 @@ func IsDataDirDisks(p, dataDir string) bool {
 
 // CheckWriteRoot refuses a directory no pool may write into: a relative path,
 // the filesystem root, anything under a system directory, the daemon's PKI
-// directory, its data directory or any parent of it, and anything inside it
-// other than a directory under pools/ or mounts/, or disks/ itself. Symlinks
+// directory, its data directory or any parent of it, and inside it the
+// daemon's own state (dataDirChildRefusal); another child of the data
+// directory is an ordinary host path. Symlinks
 // are resolved first (through the deepest part of the path that exists), and
 // both the path as written and the path it resolves to must pass, so a link
 // planted at an innocent name cannot reach a refused directory.
@@ -178,8 +312,12 @@ func CheckWriteRoot(p, dataDir, pkiDir string) error {
 				}
 			}
 		}
-		if underLitevirtVarLib(cand) && !inAnyPoolArea(dataDir, cand) && !IsDataDirDisks(cand, dataDir) {
-			return fmt.Errorf("%q is under /var/lib/%s*, litevirt state", p, litevirtVarLibPrefix)
+		for _, root := range litevirtStateRoots {
+			for _, r := range pathForms(root) {
+				if within(r, cand) {
+					return fmt.Errorf("%q is under %s, litevirt state", p, root)
+				}
+			}
 		}
 		if pkiDir != "" {
 			for _, d := range pathForms(pkiDir) {
@@ -188,13 +326,56 @@ func CheckWriteRoot(p, dataDir, pkiDir string) error {
 				}
 			}
 		}
-		if dataDir != "" {
-			for _, d := range pathForms(dataDir) {
+		for _, dd := range dataDirsToJudge(dataDir) {
+			for _, d := range pathForms(dd) {
 				if within(cand, d) {
-					return fmt.Errorf("%q is the daemon's data directory %s or contains it", p, dataDir)
+					return fmt.Errorf("%q is the daemon's data directory %s or contains it", p, dd)
 				}
-				if within(d, cand) && !inPoolArea(d, cand) && cand != filepath.Join(d, dataDirDisks) {
-					return fmt.Errorf("%q is inside the daemon's data directory %s; only its disks/, pools/ and mounts/ hold pools", p, dataDir)
+				if err := dataDirChildRefusal(p, d, cand, dd); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// CheckDaemonStatePath refuses a file path to be written that is the daemon's
+// own state, whoever asks: in or below the PKI directory or a litevirt state
+// root, the data directory (configured or default) or a directory containing
+// it, or in or below a child of the data directory the daemon owns
+// (dataDirOwned). It is the pool rule for one file (a restore or copy
+// target_path): anywhere else — disks/, a pool, an ordinary child of the data
+// directory, any other host path — passes. Judged by path components, as
+// written and after resolving symlinks through the deepest existing parent,
+// so the parent directories a write would create cannot land in daemon state
+// either.
+func CheckDaemonStatePath(p, dataDir, pkiDir string) error {
+	if !filepath.IsAbs(p) {
+		return fmt.Errorf("%q is not an absolute path", p)
+	}
+	for _, cand := range pathForms(p) {
+		if pkiDir != "" {
+			for _, d := range pathForms(pkiDir) {
+				if within(d, cand) {
+					return fmt.Errorf("%q is in the daemon's PKI directory %s", p, pkiDir)
+				}
+			}
+		}
+		for _, root := range litevirtStateRoots {
+			for _, r := range pathForms(root) {
+				if within(r, cand) {
+					return fmt.Errorf("%q is under %s, litevirt state", p, root)
+				}
+			}
+		}
+		for _, dd := range dataDirsToJudge(dataDir) {
+			for _, d := range pathForms(dd) {
+				if within(cand, d) {
+					return fmt.Errorf("%q is the daemon's data directory %s or contains it", p, dd)
+				}
+				if first, _, ok := dataDirChild(d, cand); ok && dataDirChildOwned(first) {
+					return fmt.Errorf("%q is the daemon's own state (%s in its data directory %s)", p, first, dd)
 				}
 			}
 		}
@@ -295,25 +476,13 @@ func DirsOverlap(a, b string) bool {
 	return false
 }
 
-func underLitevirtVarLib(p string) bool {
-	rel, err := filepath.Rel("/var/lib", p)
-	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
-		return false
+// dataDirsToJudge is the configured data directory and defaultDataDir.
+func dataDirsToJudge(dataDir string) []string {
+	out := []string{defaultDataDir}
+	if dataDir != "" && filepath.Clean(dataDir) != defaultDataDir {
+		out = append(out, dataDir)
 	}
-	first, _, _ := strings.Cut(rel, string(filepath.Separator))
-	return strings.HasPrefix(first, litevirtVarLibPrefix)
-}
-
-func inAnyPoolArea(dataDir, p string) bool {
-	if dataDir == "" {
-		return false
-	}
-	for _, d := range pathForms(dataDir) {
-		if inPoolArea(d, p) {
-			return true
-		}
-	}
-	return false
+	return out
 }
 
 // The strict forms a pool's Source and identifying options must take. Each

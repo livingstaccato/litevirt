@@ -325,6 +325,10 @@ type Server struct {
 	commitFenceHook func(op string)
 	// restoreClaimedHook is a test-only seam; see SetRestoreClaimedHook.
 	restoreClaimedHook func(name string)
+	// restoreTargetResolvedHook is a test-only seam run after RestoreFromBackup
+	// has matched target_path to the VM's own disk and before it takes the VM
+	// lock, so a test can change the record in between.
+	restoreTargetResolvedHook func(vmName string)
 	// repairLeaseHook is a test-only seam run while a compose repair holds the
 	// VM's start lease, before it touches the domain.
 	repairLeaseHook func(vmName string)

@@ -614,12 +614,17 @@ func (s *Server) RestoreFromBackup(req *pb.RestoreFromBackupRequest, stream grpc
 	}
 	disksDir := filepath.Join(s.dataDir, "disks")
 	// A named target is admin only and never an existing file — refused before
-	// the repo is even opened.
+	// the repo is even opened — except the VM's own recorded disk, which is
+	// restored as in_place restores it (ownDisk).
 	var named string
+	var ownDisk bool
 	if req.TargetPath != "" {
 		var err error
-		if named, err = s.resolveAdminTarget(ctx, req.TargetPath, disksDir); err != nil {
+		if named, ownDisk, err = s.resolveRestoreFromTarget(ctx, req.TargetPath, disksDir, req.VmName, req.DiskName); err != nil {
 			return err
+		}
+		if ownDisk && s.restoreTargetResolvedHook != nil {
+			s.restoreTargetResolvedHook(req.VmName)
 		}
 	}
 	repoPath, err := s.resolveBackupRepoPath(ctx, req.RepoPath)
@@ -643,12 +648,18 @@ func (s *Server) RestoreFromBackup(req *pb.RestoreFromBackupRequest, stream grpc
 
 	var dest restoreDest
 	switch {
-	case req.InPlace:
+	case req.InPlace || ownDisk:
 		if err := inPlaceContentAccepted(manifest); err != nil {
 			return err
 		}
 		if dest, err = s.inPlaceRestoreTarget(ctx, req.VmName, req.DiskName, authProject); err != nil {
 			return err
+		}
+		// The record is re-read under the VM lock: a target_path that named
+		// the disk's file then must still name it now.
+		if ownDisk && filepath.Clean(dest.path) != filepath.Clean(named) {
+			dest.release()
+			return existingTargetRefusal(named)
 		}
 	case named != "":
 		dest = restoreDest{path: named}

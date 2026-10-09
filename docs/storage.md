@@ -139,10 +139,21 @@ with `-`.
 Some directories are refused to everyone, `Admin` included: the filesystem
 root; anything under `/bin`, `/boot`, `/dev`, `/etc`, `/home`, `/lib*`,
 `/proc`, `/root`, `/run`, `/sbin`, `/sys`, `/usr`, `/var/lib/libvirt`,
-`/var/run` or `/var/spool`; `/var/lib/litevirt` and any `/var/lib/litevirt-*`;
-the daemon's PKI directory; the data directory and any directory containing
-it; and anything inside the data directory other than a directory under its
-`mounts/` or `pools/` areas, or `disks/` itself. The list is a backstop, not exhaustive: `/opt`, `/srv`,
+`/var/run` or `/var/spool`; `/var/lib/litevirt-gitops` (the gitops working
+tree's default home); the daemon's PKI directory; the data directory and any
+directory containing it; and, inside the data directory, the daemon's own state: every child the daemon creates
+there (`state.db` and its WAL, `pki`, `vms`, `images`, `imports`,
+`cloudinit`, `nvram`, `iso-identity`, the audit and capability markers, any
+dot-name, … — `dataDirOwned` in `internal/storage/hostpath.go` is the list)
+and anything in one, anything inside `disks/` (a pool may be `disks/`
+itself), and the roots of the `mounts/` and `pools/` areas (a pool is a
+directory inside one). Any other directory in the data directory —
+`/var/lib/litevirt/fastpool`, as earlier releases allowed — is an ordinary
+host path: an admin may name it, and nobody else. `/var/lib/litevirt`, the
+default data directory, is judged the same way even when `data_dir` is
+elsewhere (the backup session keeps its scratch there). The data directory
+is compared by whole path components, so a sibling such as
+`/var/lib/litevirt-labtest` is an ordinary host path too. The list is a backstop, not exhaustive: `/opt`, `/srv`,
 `/var/log` and `/var/tmp` are left to the admin who names them. A target
 is judged both as written and after resolving symlinks, so a link at an
 innocent name does not reach a refused directory. Authority is checked on the
@@ -368,7 +379,8 @@ refused without it. Only the VM's project's readers (holding
 `storage.content.write` on the pool) or an admin delete one, and never one a
 disk on any host uses (a `--no-localize` promotion's backing).
 
-Deleting a pool on its own directory (`<data_dir>/pools/<name>`) removes the
+Deleting a `local` pool on its own directory (`<data_dir>/pools/<name>`, which
+the daemon makes for a target-less one) removes the
 daemon's own directories in it first: the replica area's empty directories,
 and the upload markers (`.litevirt-uploads`) of uploads no longer there. A
 pool still holding replicas or files is refused, naming them; with `--force`
@@ -377,6 +389,13 @@ in its area (which may be a VM's only copy while its host is down) and any
 other file stay where they are, the log names them, and the directory is
 kept — a new pool of that name is refused the directory until it is emptied.
 Delete the replicas you no longer want by name (`DeleteStoragePoolContent`) first.
+
+Any other pool on a directory — every `dir` pool, even one at
+`<data_dir>/pools/<name>`, and a `local` pool with another `--target` — is
+not refused for the replicas or files it holds (references to it, such as a
+replication schedule, still need `--force`): its directory is the
+operator's, so deleting the pool touches nothing in it, and every file and
+replica stays where it is.
 
 A user's upload into a pool on `<data_dir>/disks` lands in
 `<data_dir>/disks/uploads/` and is listed with the pool's other content: the VM
@@ -749,10 +768,11 @@ for the UI's Browse dialog, and a sync pass gives up on it the same way.
   `lv iso ls`, and the same checks apply.
 
 Some files are refused to everyone, Admin included, judged as written and after
-resolving symlinks: the PKI directory, anything in the data directory outside
-`pools/`, `mounts/`, `disks/uploads/` and the ISO images directly in `disks/`
-(`state.db`, `cloudinit/`, `nvram/`, …; the global library `pools/isos/` is
-under `pools/`), and anything under `/boot`,
+resolving symlinks: the PKI directory, the daemon's own state in the data
+directory (`state.db`, `cloudinit/`, `nvram/`, …, as for pools above) and
+anything in `disks/` other than `disks/uploads/` and the ISO images directly
+in `disks/` (the global library `pools/isos/` is under `pools/`; another
+directory in the data directory is an ordinary host path), and anything under `/boot`,
 `/dev`, `/etc`, `/proc`, `/sys`, `/var/backups`, `/var/spool`,
 `/var/lib/lxc`, `/var/lib/libvirt/qemu` or `/var/lib/libvirt/swtpm`. `/usr` is
 allowed (`virtio-win` installs there).

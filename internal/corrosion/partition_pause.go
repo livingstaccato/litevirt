@@ -90,14 +90,13 @@ func HostPartitionPauseFailed(ctx context.Context, c *Client, host string) (bool
 // enrolled in replication with the default policy of "none" is still
 // recoverable — by promotion rather than reschedule.
 func VMRecoverableOnHostFailure(vm VMRecord, autoPromote bool) bool {
-	// A stopped VM is not run anywhere, so there is nothing to recover: its
-	// row's state is the only record of the operator's (or guest's) stop, and a
-	// recovery overwrites it with "pending" and starts the VM elsewhere — on a
-	// disk rebuilt blank from its image when the real one is host-local, which
-	// then strands the real disk on the failed host. It stays where it is, with
-	// its disk, exactly as it was left (docs/migration-failover.md, "Stopped
-	// workloads"). Auto-promotion defines and starts a VM too, so enrolment does
-	// not change this.
+	// A VM stopped by intent is not run anywhere, and nobody asked for it to
+	// run: a recovery overwrites the stop with "pending" and starts it
+	// elsewhere — on a disk rebuilt blank from its image when the real one is
+	// host-local, which then strands the real disk on the failed host. It is
+	// never started (docs/migration-failover.md, "Stopped workloads").
+	// Auto-promotion defines and starts a VM too, so enrolment does not change
+	// this.
 	if VMStoppedForFailover(vm) {
 		return false
 	}
@@ -144,10 +143,48 @@ func ContainerRecoverableOnHostFailure(ct ContainerRecord) bool {
 	return true
 }
 
-// VMStoppedForFailover reports whether vm is stopped, so failover leaves it on
-// its host, stopped, with its disks. It reads the row's state alone: the
-// state is the stop intent (VMRecord carries no other), whoever stopped it.
-func VMStoppedForFailover(vm VMRecord) bool { return vm.State == "stopped" }
+// The state_detail values the reconciler records for a VM it found stopped
+// that nobody asked to stop (health.classifyStop). Every other detail on a
+// stopped row is a stop someone meant: "operator-stop" (StopVM), a drain's
+// "drain-cold-move:<op>", a managed save, the failover re-key marker — and a
+// stopped row with no detail at all, the safe reading of an unknown stop.
+const (
+	StopDetailGuestShutdown    = "guest-shutdown"      // clean ACPI poweroff from inside the guest
+	StopDetailOutOfBandDestroy = "out-of-band-destroy" // libvirt destroy not initiated by an operator stop
+	StopDetailOutOfBand        = "stopped out-of-band" // down, for a reason libvirt did not say
+)
+
+// StopIsIntent reports whether a stopped row's state_detail records a stop
+// someone meant (see the StopDetail constants).
+func StopIsIntent(detail string) bool {
+	switch detail {
+	case StopDetailGuestShutdown, StopDetailOutOfBandDestroy, StopDetailOutOfBand:
+		return false
+	}
+	return true
+}
+
+// VMStoppedForFailover reports whether vm is stopped by intent, so failover
+// never starts it: it stays on its host, stopped, with its disks (or, when
+// they are all on shared storage, is re-keyed to a live host still stopped,
+// RekeyStoppedVM). A VM that stopped without anyone asking — a guest or host
+// shutdown — is not: failover recovers it as main did when its disks are all
+// shared, and leaves it when one is host-local (VMHasHostLocalDisk), since a
+// restart elsewhere would rebuild that disk blank.
+func VMStoppedForFailover(vm VMRecord) bool {
+	return vm.State == "stopped" && StopIsIntent(vm.StateDetail)
+}
+
+// VMHasHostLocalDisk reports whether any of disks is not on cluster-shared
+// storage (DiskIsShared), so it does not follow the VM to another host.
+func VMHasHostLocalDisk(disks []DiskRecord) bool {
+	for _, d := range disks {
+		if !DiskIsShared(d) {
+			return true
+		}
+	}
+	return false
+}
 
 // ContainerStoppedForFailover is VMStoppedForFailover for a container. A row
 // the coordinator itself marked relocate-skipped is stopped too, but by

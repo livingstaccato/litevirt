@@ -152,15 +152,15 @@ func WriteVMRescheduleProof(ctx context.Context, c *Client, p ActionProof, vmNam
 	// replication first. The insert is then a no-op and only the pending link
 	// is written.
 	//
-	// A row that is stopped NOW is refused with ErrWorkloadStopped, whatever the
-	// coordinator read when it chose this VM: the stop is the operator's intent,
-	// the row's state its only record, and this write would replace it with
-	// "pending" — a start on the destination. A stop that lands after selection
-	// therefore still wins.
+	// A row that is stopped by intent NOW (VMStoppedForFailover) is refused
+	// with ErrWorkloadStopped, whatever the coordinator read when it chose this
+	// VM: this write would replace the stop with "pending" — a start on the
+	// destination. A stop that lands after selection therefore still wins.
 	applied, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
 		var currentOwnerEpoch int64
 		var startable bool
-		if err := tx.QueryRow(`SELECT vm_owner_epoch, state <> 'stopped' FROM vms WHERE name = ? AND deleted_at IS NULL`, vmName).
+		if err := tx.QueryRow(`SELECT vm_owner_epoch, NOT `+vmStoppedByIntentSQL+` FROM vms WHERE name = ? AND deleted_at IS NULL`,
+			append(vmStoppedByIntentArgs(), vmName)...).
 			Scan(&currentOwnerEpoch, &startable); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return false, nil
@@ -203,6 +203,14 @@ func WriteVMRescheduleProof(ctx context.Context, c *Client, p ActionProof, vmNam
 		return ErrNoRowsAffected
 	}
 	return nil
+}
+
+// vmStoppedByIntentSQL is VMStoppedForFailover as a predicate on a vms row,
+// with vmStoppedByIntentArgs as its parameters.
+const vmStoppedByIntentSQL = `(state = 'stopped' AND COALESCE(state_detail, '') NOT IN (?, ?, ?))`
+
+func vmStoppedByIntentArgs() []interface{} {
+	return []interface{}{StopDetailGuestShutdown, StopDetailOutOfBandDestroy, StopDetailOutOfBand}
 }
 
 // ErrWorkloadStopped means a failover write found the workload's row stopped

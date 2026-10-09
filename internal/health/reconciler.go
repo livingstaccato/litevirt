@@ -737,6 +737,11 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 			}
 
 		case "stopped":
+			// A stopped VM failover moved here off a failed host has no domain
+			// here yet: define it, shut off (rekeyed_stopped.go).
+			if corrosion.IsStoppedRekeyDetail(vm.StateDetail) {
+				r.defineRekeyedStoppedVM(ctx, vm)
+			}
 			// One-shot machine-type backfill for a STOPPED but still-defined VM (a legacy VM,
 			// or one updated with --machine q35 while stopped): pin the concrete
 			// machine type from its persistent domain. No-op once pinned, and a
@@ -1569,133 +1574,9 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	// Every disk is in place: a parked transfer has done its rebuilding.
 	r.deferredTransfers.drop(vm.Name)
 
-	// Check for cloud-init ISO. The reconciler acts on a stored (possibly
-	// peer-replicated) row, so build the ISO path through the validated builder
-	// — a malformed vm.Name must not escape the cloudinit dir.
-	cloudInitISO := ""
-	isoPath, isoErr := lv.SafeCloudInitISOPath(r.dataDir, vm.Name)
-	if isoErr != nil {
-		slog.Error("reconciler: invalid vm name for cloud-init path", "vm", vm.Name, "error", isoErr)
-		r.failPendingStart(ctx, vm.Name, proofID, false, fmt.Sprintf("invalid name: %v", isoErr)) // non-retryable
-		return
-	}
-	if _, err := os.Stat(isoPath); err == nil {
-		cloudInitISO = isoPath
-	} else if spec.CloudInit != nil {
-		// Regenerate cloud-init ISO from spec.
-		userData := spec.CloudInit.Userdata
-		if userData == "" {
-			userData = "#cloud-config\n{}\n"
-		}
-		if genErr := cloudinit.GenerateISO(cloudinit.Config{
-			InstanceID:    vm.Name,
-			LocalHostname: vm.Name,
-			UserData:      userData,
-			NetworkConfig: spec.CloudInit.Networkconfig,
-		}, isoPath); genErr != nil {
-			slog.Warn("reconciler: cloud-init ISO generation failed", "vm", vm.Name, "error", genErr)
-		} else {
-			cloudInitISO = isoPath
-		}
-	}
-
-	// Provision networks and build network configs from stored interfaces.
-	// A query failure must NOT be swallowed: starting the VM with zero NICs
-	// brings it up headless (no network) after a failover. Fail it instead,
-	// matching the ListDisks error handling above.
-	ifaces, err := corrosion.GetVMInterfaces(ctx, r.db, vm.Name)
-	if err != nil {
-		slog.Error("reconciler: get VM interfaces", "vm", vm.Name, "error", err)
-		r.failPendingStart(ctx, vm.Name, proofID, true, fmt.Sprintf("get interfaces: %v", err)) // transient DB
-		return
-	}
-	var netConfigs []lv.NetworkConfig
-	for _, iface := range ifaces {
-		bridge := iface.NetworkName
-		// Provision network infrastructure (VXLAN tunnels, DHCP, NAT, bridges).
-		// This is critical after failover — the new host may not have the network set up.
-		provision := r.provision
-		if provision == nil {
-			provision = network.SafeProvision
-		}
-		if provBridge, err := network.ProvisionForVMWith(ctx, r.db, iface.NetworkName, r.hostName, provision); err != nil {
-			slog.Warn("reconciler: network provision failed, using raw name",
-				"vm", vm.Name, "network", iface.NetworkName, "error", err)
-		} else if provBridge != "" {
-			bridge = provBridge
-		}
-		if strings.HasPrefix(bridge, "direct:") {
-			netConfigs = append(netConfigs, lv.NetworkConfig{
-				Direct: strings.TrimPrefix(bridge, "direct:"),
-				Model:  "virtio",
-				MAC:    iface.MAC,
-			})
-		} else {
-			netConfigs = append(netConfigs, lv.NetworkConfig{
-				Bridge: bridge,
-				MAC:    iface.MAC,
-			})
-		}
-	}
-
-	// Build libvirt domain config.
-	vmCfg := lv.VMConfig{
-		Name:         vm.Name,
-		CPU:          vm.CPUActual,
-		MemoryMiB:    vm.MemActual,
-		Machine:      spec.Machine,
-		Firmware:     spec.Firmware,
-		GuestAgent:   spec.GuestAgent,
-		Disks:        diskConfigs,
-		Networks:     netConfigs,
-		CloudInitISO: cloudInitISO,
-		Boot:         spec.Boot,
-	}
-	if vmCfg.Machine == "" {
-		vmCfg.Machine = "q35"
-	}
-	if vmCfg.Firmware == "" {
-		vmCfg.Firmware = "uefi"
-	}
-	// Secure Boot + vTPM (G1): stable UUID makes the swtpm state path
-	// (/var/lib/libvirt/swtpm/<uuid>/) deterministic; render the same firmware
-	// CreateVM did. A vTPM VM whose state isn't present on this host can't be
-	// rebuilt faithfully — fail clearly (state=error) rather than booting with a
-	// fresh TPM and silently breaking BitLocker.
-	vmCfg.UUID = spec.Uuid
-	r.firmware.ApplyTo(&vmCfg, r.dataDir, vm.Name, spec.SecureBoot, spec.Tpm)
-	if spec.Tpm && !lv.HasTPMState(spec.Uuid) {
-		slog.Error("reconciler: vTPM VM has no local TPM state; refusing to start with a fresh TPM", "vm", vm.Name)
-		r.failPendingStart(ctx, vm.Name, proofID, false, "vTPM state missing on this host (would break BitLocker)") // non-retryable
-		return
-	}
-	// Same rule for NVRAM (Secure Boot keys / boot entries): a UEFI firmware VM
-	// whose vars aren't present here can't be rebuilt faithfully — refuse rather
-	// than redefine with fresh vars from the template (would lose enrolled keys).
-	uefiFW := spec.Firmware == "uefi" || spec.Firmware == ""
-	if (spec.SecureBoot || spec.Tpm) && uefiFW && !lv.HasNvram(r.dataDir, vm.Name) {
-		slog.Error("reconciler: firmware VM has no local UEFI NVRAM; refusing to start with fresh vars", "vm", vm.Name)
-		r.failPendingStart(ctx, vm.Name, proofID, false, "UEFI NVRAM missing on this host (would lose Secure Boot keys)") // non-retryable
-		return
-	}
-	if r := spec.Resources; r != nil {
-		vmCfg.HugePages = r.Hugepages
-		vmCfg.IOThreads = int(r.IoThreads)
-		for _, pin := range r.CpuPinning {
-			vmCfg.CPUPinning = append(vmCfg.CPUPinning, int(pin))
-		}
-		if np := r.NumaPolicy; np != nil {
-			vmCfg.NUMAPolicy = &lv.NUMAPolicy{
-				PreferredNode: int(np.PreferredNode),
-				Strict:        np.Strict,
-			}
-		}
-	}
-
-	domXML, err := lv.GenerateDomainXML(vmCfg)
-	if err != nil {
-		slog.Error("reconciler: generate domain XML", "vm", vm.Name, "error", err)
-		r.failPendingStart(ctx, vm.Name, proofID, false, fmt.Sprintf("XML gen: %v", err)) // non-retryable (bad config)
+	domXML, retryable, failure := r.domainXMLFor(ctx, vm, spec, diskConfigs)
+	if failure != "" {
+		r.failPendingStart(ctx, vm.Name, proofID, retryable, failure)
 		return
 	}
 
@@ -1802,6 +1683,138 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	if r.onVMStarted != nil && vm.StackName != "" {
 		go r.onVMStarted(context.Background(), vm.StackName)
 	}
+}
+
+// domainXMLFor builds vm's domain XML on this host from its stored spec and
+// the disk configs the caller resolved: the cloud-init ISO, the networks
+// (provisioned here), firmware and resources. On failure it returns "" with
+// whether a later attempt may succeed and what failed.
+func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, spec *pb.VMSpec, diskConfigs []lv.DiskConfig) (domXML string, retryable bool, failure string) {
+	// Check for cloud-init ISO. The reconciler acts on a stored (possibly
+	// peer-replicated) row, so build the ISO path through the validated builder
+	// — a malformed vm.Name must not escape the cloudinit dir.
+	cloudInitISO := ""
+	isoPath, isoErr := lv.SafeCloudInitISOPath(r.dataDir, vm.Name)
+	if isoErr != nil {
+		slog.Error("reconciler: invalid vm name for cloud-init path", "vm", vm.Name, "error", isoErr)
+		return "", false, fmt.Sprintf("invalid name: %v", isoErr) // non-retryable
+	}
+	if _, err := os.Stat(isoPath); err == nil {
+		cloudInitISO = isoPath
+	} else if spec.CloudInit != nil {
+		// Regenerate cloud-init ISO from spec.
+		userData := spec.CloudInit.Userdata
+		if userData == "" {
+			userData = "#cloud-config\n{}\n"
+		}
+		if genErr := cloudinit.GenerateISO(cloudinit.Config{
+			InstanceID:    vm.Name,
+			LocalHostname: vm.Name,
+			UserData:      userData,
+			NetworkConfig: spec.CloudInit.Networkconfig,
+		}, isoPath); genErr != nil {
+			slog.Warn("reconciler: cloud-init ISO generation failed", "vm", vm.Name, "error", genErr)
+		} else {
+			cloudInitISO = isoPath
+		}
+	}
+
+	// Provision networks and build network configs from stored interfaces.
+	// A query failure must NOT be swallowed: starting the VM with zero NICs
+	// brings it up headless (no network) after a failover. Fail it instead,
+	// matching the ListDisks error handling above.
+	ifaces, err := corrosion.GetVMInterfaces(ctx, r.db, vm.Name)
+	if err != nil {
+		slog.Error("reconciler: get VM interfaces", "vm", vm.Name, "error", err)
+		return "", true, fmt.Sprintf("get interfaces: %v", err) // transient DB
+	}
+	var netConfigs []lv.NetworkConfig
+	for _, iface := range ifaces {
+		bridge := iface.NetworkName
+		// Provision network infrastructure (VXLAN tunnels, DHCP, NAT, bridges).
+		// This is critical after failover — the new host may not have the network set up.
+		provision := r.provision
+		if provision == nil {
+			provision = network.SafeProvision
+		}
+		if provBridge, err := network.ProvisionForVMWith(ctx, r.db, iface.NetworkName, r.hostName, provision); err != nil {
+			slog.Warn("reconciler: network provision failed, using raw name",
+				"vm", vm.Name, "network", iface.NetworkName, "error", err)
+		} else if provBridge != "" {
+			bridge = provBridge
+		}
+		if strings.HasPrefix(bridge, "direct:") {
+			netConfigs = append(netConfigs, lv.NetworkConfig{
+				Direct: strings.TrimPrefix(bridge, "direct:"),
+				Model:  "virtio",
+				MAC:    iface.MAC,
+			})
+		} else {
+			netConfigs = append(netConfigs, lv.NetworkConfig{
+				Bridge: bridge,
+				MAC:    iface.MAC,
+			})
+		}
+	}
+
+	// Build libvirt domain config.
+	vmCfg := lv.VMConfig{
+		Name:         vm.Name,
+		CPU:          vm.CPUActual,
+		MemoryMiB:    vm.MemActual,
+		Machine:      spec.Machine,
+		Firmware:     spec.Firmware,
+		GuestAgent:   spec.GuestAgent,
+		Disks:        diskConfigs,
+		Networks:     netConfigs,
+		CloudInitISO: cloudInitISO,
+		Boot:         spec.Boot,
+	}
+	if vmCfg.Machine == "" {
+		vmCfg.Machine = "q35"
+	}
+	if vmCfg.Firmware == "" {
+		vmCfg.Firmware = "uefi"
+	}
+	// Secure Boot + vTPM (G1): stable UUID makes the swtpm state path
+	// (/var/lib/libvirt/swtpm/<uuid>/) deterministic; render the same firmware
+	// CreateVM did. A vTPM VM whose state isn't present on this host can't be
+	// rebuilt faithfully — fail clearly (state=error) rather than booting with a
+	// fresh TPM and silently breaking BitLocker.
+	vmCfg.UUID = spec.Uuid
+	r.firmware.ApplyTo(&vmCfg, r.dataDir, vm.Name, spec.SecureBoot, spec.Tpm)
+	if spec.Tpm && !lv.HasTPMState(spec.Uuid) {
+		slog.Error("reconciler: vTPM VM has no local TPM state; refusing to start with a fresh TPM", "vm", vm.Name)
+		return "", false, "vTPM state missing on this host (would break BitLocker)" // non-retryable
+	}
+	// Same rule for NVRAM (Secure Boot keys / boot entries): a UEFI firmware VM
+	// whose vars aren't present here can't be rebuilt faithfully — refuse rather
+	// than redefine with fresh vars from the template (would lose enrolled keys).
+	uefiFW := spec.Firmware == "uefi" || spec.Firmware == ""
+	if (spec.SecureBoot || spec.Tpm) && uefiFW && !lv.HasNvram(r.dataDir, vm.Name) {
+		slog.Error("reconciler: firmware VM has no local UEFI NVRAM; refusing to start with fresh vars", "vm", vm.Name)
+		return "", false, "UEFI NVRAM missing on this host (would lose Secure Boot keys)" // non-retryable
+	}
+	if r := spec.Resources; r != nil {
+		vmCfg.HugePages = r.Hugepages
+		vmCfg.IOThreads = int(r.IoThreads)
+		for _, pin := range r.CpuPinning {
+			vmCfg.CPUPinning = append(vmCfg.CPUPinning, int(pin))
+		}
+		if np := r.NumaPolicy; np != nil {
+			vmCfg.NUMAPolicy = &lv.NUMAPolicy{
+				PreferredNode: int(np.PreferredNode),
+				Strict:        np.Strict,
+			}
+		}
+	}
+
+	domXML, err = lv.GenerateDomainXML(vmCfg)
+	if err != nil {
+		slog.Error("reconciler: generate domain XML", "vm", vm.Name, "error", err)
+		return "", false, fmt.Sprintf("XML gen: %v", err) // non-retryable (bad config)
+	}
+	return domXML, false, ""
 }
 
 // pullBackingImage fetches a missing backing image through autoPullImage

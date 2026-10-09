@@ -2622,22 +2622,48 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 		vm             corrosion.VMRecord
 		targetName     string
 		needsPlacement bool
+		// rekeyStopped: a VM stopped by intent on shared storage, moved to the
+		// target still stopped and never started (rekeyStoppedVM).
+		rekeyStopped bool
 	}
 	plans := make([]failoverPlan, 0, len(vms))
 	placementReqs := make([]placement.Request, 0, len(vms))
 
 	for _, vm := range vms {
-		// A stopped VM is not a failover candidate (VMRecoverableOnHostFailure),
-		// and this is the FIRST check, ahead of auto-promote, which defines and
-		// starts a VM too. It stays on h, stopped, with its disks: a reschedule
-		// would overwrite the stop with "pending" and start it elsewhere — on a
-		// disk rebuilt blank from its image when the real one is host-local,
-		// stranding the real disk on h for the superseded-disk sweep. The write
-		// below re-checks the state inside its transaction, so a stop that lands
-		// after this read still wins.
-		if corrosion.VMStoppedForFailover(vm) {
-			c.skipStoppedVM(ctx, h.Name, vm)
-			continue
+		// A stopped VM is decided FIRST, ahead of auto-promote, which defines
+		// and starts a VM too (skip_stopped.go):
+		//   - stopped by intent: never started. On shared storage only, it is
+		//     moved to a live host still stopped; otherwise it stays on h with
+		//     its disks;
+		//   - stopped without intent (a guest or host shutdown) with a
+		//     host-local disk: stays — a restart elsewhere would rebuild that
+		//     disk blank and strand the real one on h;
+		//   - stopped without intent, all disks shared: recovered below as
+		//     main recovered it, on its real disks.
+		// The writes re-check the stop inside their transactions, so a stop that
+		// lands after this read still wins.
+		if vm.State == "stopped" {
+			disks, derr := corrosion.GetVMDisks(ctx, c.db, vm.Name)
+			if derr != nil {
+				slog.Warn("failover: cannot read a stopped VM's disks; leaving it (fail closed)", "vm", vm.Name, "error", derr)
+				c.mVM(ActionReschedule, ResultError, ErrDBError)
+				continue
+			}
+			if corrosion.VMStoppedForFailover(vm) {
+				if c.stoppedVMRekeyable(ctx, h.Name, vm, disks, fenceEpoch) {
+					req := buildFailoverPlacementRequest(vm, h.Name, c.capacity, pinDown)
+					req.RequireRegion = c.vmRecoveryRegion(h.Name, vm)
+					placementReqs = append(placementReqs, req)
+					plans = append(plans, failoverPlan{vm: vm, needsPlacement: true, rekeyStopped: true})
+					continue
+				}
+				c.skipStoppedVM(ctx, h.Name, vm, stoppedVMDetail(h.Name))
+				continue
+			}
+			if corrosion.VMHasHostLocalDisk(disks) {
+				c.skipStoppedVM(ctx, h.Name, vm, stoppedLocalDiskDetail(h.Name, vm.StateDetail))
+				continue
+			}
 		}
 
 		// A Secure-Boot/vTPM VM's firmware state (UEFI NVRAM + swtpm) is host-local,
@@ -2863,6 +2889,11 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 
 		targetName := p.targetName
 
+		if p.rekeyStopped {
+			c.rekeyStoppedVM(ctx, h.Name, vm, targetName)
+			continue
+		}
+
 		slog.Info("failover: rescheduling VM",
 			"vm", vm.Name, "from", vm.HostName, "to", targetName, "policy", vmFailurePolicy(vm))
 
@@ -2954,7 +2985,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 			if err := corrosion.WriteVMRescheduleProof(ctx, c.db, proof, vm.Name, targetName); err != nil {
 				if errors.Is(err, corrosion.ErrWorkloadStopped) {
 					// Stopped after it was chosen: the stop wins.
-					c.skipStoppedVM(ctx, h.Name, vm)
+					c.skipStoppedVM(ctx, h.Name, vm, stoppedVMDetail(h.Name))
 					continue
 				}
 				slog.Error("failover: write reschedule proof", "vm", vm.Name, "error", err)
@@ -2964,7 +2995,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 		} else if err := corrosion.RescheduleVMHost(ctx, c.db, vm.Name, targetName, "pending"); err != nil {
 			// Legacy (pre-activation) path.
 			if errors.Is(err, corrosion.ErrWorkloadStopped) {
-				c.skipStoppedVM(ctx, h.Name, vm)
+				c.skipStoppedVM(ctx, h.Name, vm, stoppedVMDetail(h.Name))
 				continue
 			}
 			slog.Error("failover: update VM host", "vm", vm.Name, "error", err)
@@ -3561,6 +3592,18 @@ func (c *Coordinator) strandedWorkloads(ctx context.Context) (int, error) {
 		}
 		for _, vm := range vms {
 			if vmNeedsFailover(vm, enrolled[vm.Name]) {
+				// A VM that stopped without anyone asking is recovered only
+				// on shared storage; with a host-local disk it stays by
+				// design (recoverWorkloads), so it is not stranded.
+				if vm.State == "stopped" {
+					disks, derr := corrosion.GetVMDisks(ctx, c.db, vm.Name)
+					if derr != nil {
+						return 0, derr
+					}
+					if corrosion.VMHasHostLocalDisk(disks) {
+						continue
+					}
+				}
 				total++
 			}
 		}

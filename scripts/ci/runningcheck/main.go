@@ -138,7 +138,11 @@ var minting = map[string]int{
 	"TransferVMOwner":          4,
 	"TransferVMOwnerFresh":     4,
 	"TransferVMOwnerWithDisks": 4,
-	"CompleteVMStartProof":     alwaysRunning,
+	// RekeyStoppedVM(ctx, c, name, from, dest, state, epoch): the owner
+	// transfer of a stopped VM off a failed host; it refuses any state but
+	// "stopped", and its one caller passes that literal.
+	"RekeyStoppedVM":       5,
+	"CompleteVMStartProof": alwaysRunning,
 	// ReplaceVM installs a cutover's replacement with the state copied from the
 	// source row it re-reads at commit time, not taken as an argument, so no
 	// literal can ever exempt a call — and, unlike the entries above, the state
@@ -577,8 +581,8 @@ var stateWritingStatements = []stateStatement{
 	},
 	{
 		sql:     `UPDATE vms SET state = ?, state_detail = ?, updated_at = ? WHERE name = ? AND vm_owner_epoch = ?`,
-		writers: []string{"UpdateVMStateAtEpoch"},
-		note:    "nonMinting, state at arg 3",
+		writers: []string{"UpdateVMStateAtEpoch", "RekeyStoppedVM"},
+		note:    "nonMinting, state at arg 3; RekeyStoppedVM (minting, state at arg 5) writes it at the generation its transfer just minted",
 	},
 	{
 		sql:     `UPDATE vms SET host_name = ?, state = ?, state_detail = '', updated_at = ? WHERE name = ?`,
@@ -590,7 +594,7 @@ var stateWritingStatements = []stateStatement{
 	  SET host_name = ?, state = ?, state_detail = '',
 	      vm_owner_epoch = vm_owner_epoch + 1, updated_at = ?
 	  WHERE name = ? AND deleted_at IS NULL AND vm_owner_epoch = ?`,
-		writers: []string{"TransferVMOwner", "TransferVMOwnerFresh", "TransferVMOwnerWithDisks"},
+		writers: []string{"TransferVMOwner", "TransferVMOwnerFresh", "TransferVMOwnerWithDisks", "RekeyStoppedVM"},
 		note:    "MINTING: the statement advances the generation, so the correct marker value does not exist until it commits",
 	},
 	{

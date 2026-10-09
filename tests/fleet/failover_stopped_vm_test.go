@@ -32,10 +32,13 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/cli"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/image"
@@ -205,6 +208,12 @@ func TestFleet_FailoverClaimsNothingForAStoppedVM(t *testing.T) {
 	clock := NewVirtualClock(time.Now().UTC())
 	c, a, b, victim := claimFleetWith(t, clock, 2911, func(_ *Cluster, a, _, victim *Node) {
 		insertVMInState(t, a, "sv-claim", victim.Name, "stopped")
+		// A host-local disk: the VM stays where it is (one on shared storage
+		// only would be moved, still stopped — a separate scenario).
+		if err := corrosion.InsertDisk(context.Background(), a.DB, corrosion.DiskRecord{VMName: "sv-claim",
+			DiskName: "root", HostName: victim.Name, Path: "/var/lib/litevirt/disks/sv-claim-root", StorageType: "local"}); err != nil {
+			t.Fatal(err)
+		}
 		insertVMInState(t, a, "rv-claim", victim.Name, "running")
 	})
 
@@ -326,5 +335,194 @@ func TestFleet_FailoverLeavesStoppedContainers(t *testing.T) {
 	rows, err := a.DB.Query(ctx, `SELECT target FROM audit_log WHERE action = 'failover.skip' AND target IN ('ct/ct-stopped','ct/ct-stopped-noimg')`)
 	if err != nil || len(rows) != 2 {
 		t.Errorf("failover.skip audit rows for the stopped containers = %d (err %v), want 2", len(rows), err)
+	}
+}
+
+// sharedDiskVM inserts name on host with one disk on shared (nfs) storage at
+// a real file, stopped with detail, or running when detail is "".
+func sharedDiskVM(t *testing.T, c *Cluster, n *Node, name, host, state, detail string) string {
+	t.Helper()
+	dir := filepath.Join(c.tmpRoot, "shared")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, name+"-root.qcow2")
+	if err := os.WriteFile(path, []byte("shared disk of "+name), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertVM(context.Background(), n.DB, corrosion.VMRecord{
+		Name: name, HostName: host, State: state, StateDetail: detail, CPUActual: 1, MemActual: 256,
+		Spec: `{"name":"` + name + `","cpu":1,"memory_mib":256,"on_host_failure":"restart-any"}`,
+	}, nil, []corrosion.DiskRecord{{
+		VMName: name, DiskName: "root", HostName: host, Path: path, SizeBytes: 1 << 30,
+		StorageType: "nfs", TargetDev: "vda",
+	}}); err != nil {
+		t.Fatalf("InsertVM %s: %v", name, err)
+	}
+	return path
+}
+
+// reconcileAll runs every given node's reconciler once, as the daemon does.
+func reconcileAll(t *testing.T, c *Cluster, nodes ...*Node) {
+	t.Helper()
+	for _, n := range nodes {
+		rec := health.NewReconciler(n.Name, filepath.Join(c.tmpRoot, n.Name, "data"), n.DB, n.Virt)
+		rec.SetAutoPullImage(func(context.Context, string) error { return nil })
+		rec.ReconcileOnce(context.Background())
+	}
+}
+
+// A VM the operator stopped whose disks are all on shared storage gets off
+// the failed host on its real disk, as on main, but is never started: it is
+// re-keyed to a survivor still stopped, the survivor defines its domain there
+// shut off, and `lv start` then starts it there like any stopped VM.
+//
+// Mutation: have stoppedVMRekeyable return false — sv-shared stays on the
+// failed host and the test goes red on its host. Drop the reconciler's
+// define step — `lv start` on the survivor fails with no domain to start.
+func TestFleet_FailoverMovesAStoppedSharedDiskVMStoppedAndStartable(t *testing.T) {
+	c := New(t, Options{Nodes: 3, SharedCRDT: true})
+	ctx := context.Background()
+	a, b, victim := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	path := sharedDiskVM(t, c, a, "sv-shared", victim.Name, "stopped", "operator-stop")
+
+	if got := fenceVictim(t, c, a, victim, a, b); got != 1 {
+		t.Fatalf("fencer fired %d times, want 1", got)
+	}
+	vm, _ := corrosion.GetVM(ctx, a.DB, "sv-shared")
+	if vm == nil || vm.HostName == victim.Name || vm.State != "stopped" || vm.PendingActionID != "" ||
+		vm.StateDetail != corrosion.StoppedRekeyDetail(victim.Name) || vm.OwnerEpoch != 1 {
+		t.Fatalf("sv-shared after the failover = %+v; want it stopped on a survivor, marked re-keyed from %s, at epoch 1",
+			vm, victim.Name)
+	}
+	if disks, _ := corrosion.GetVMDisks(ctx, a.DB, "sv-shared"); len(disks) != 1 || disks[0].HostName != vm.HostName {
+		t.Errorf("sv-shared's disk rows = %+v, want them on %s", disks, vm.HostName)
+	}
+	if p := proofsFor(t, a, "sv-shared"); len(p) != 0 {
+		t.Errorf("a start proof %v was minted for the stopped sv-shared", p)
+	}
+	dest := c.Node(vm.HostName)
+
+	reconcileAll(t, c, a, b)
+	if xml := dest.Virt.DefinedXML("sv-shared"); !strings.Contains(xml, path) {
+		t.Fatalf("%s did not define sv-shared on its shared disk %s:\n%s", dest.Name, path, xml)
+	}
+	for _, n := range []*Node{a, b} {
+		if st, _ := n.Virt.DomainState("sv-shared"); st == "running" {
+			t.Fatalf("%s started the stopped sv-shared", n.Name)
+		}
+	}
+	if vm, _ := corrosion.GetVM(ctx, a.DB, "sv-shared"); vm == nil || vm.State != "stopped" || vm.StateDetail != "operator-stop" {
+		t.Fatalf("sv-shared after its domain was defined = %+v, want stopped with an operator stop", vm)
+	}
+
+	if _, err := c.SelfClient(dest).StartVM(ctx, &pb.StartVMRequest{Name: "sv-shared"}); err != nil {
+		t.Fatalf("lv start sv-shared on %s: %v", dest.Name, err)
+	}
+	if st, _ := dest.Virt.DomainState("sv-shared"); st != "running" {
+		t.Fatalf("sv-shared on %s after lv start: %q, want running", dest.Name, st)
+	}
+	rows, err := a.DB.Query(ctx, `SELECT detail FROM audit_log WHERE action = 'failover.rekey-stopped' AND target = 'sv-shared'`)
+	if err != nil || len(rows) != 1 {
+		t.Errorf("failover.rekey-stopped audit rows = %d (err %v), want 1", len(rows), err)
+	}
+}
+
+// A VM that stopped without anyone asking — a guest or host shutdown, as the
+// reconciler records it — is recovered as on main when its disks are all
+// shared (restarted elsewhere on its real disk), and left where it is with a
+// host-local disk, where the restart would rebuild that disk blank.
+//
+// Mutation: treat every stopped VM as stopped by intent (StopIsIntent always
+// true) — gs-shared stays on the failed host. Drop the host-local check for a
+// stop without intent — gs-local is rescheduled pending onto a blank disk.
+func TestFleet_FailoverRecoversAGuestShutdownVMOnlyOnSharedStorage(t *testing.T) {
+	c := New(t, Options{Nodes: 3, SharedCRDT: true})
+	ctx := context.Background()
+	a, b, victim := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	sharedDiskVM(t, c, a, "gs-shared", victim.Name, "stopped", corrosion.StopDetailGuestShutdown)
+	if err := corrosion.InsertVM(ctx, a.DB, corrosion.VMRecord{
+		Name: "gs-local", HostName: victim.Name, State: "stopped", StateDetail: corrosion.StopDetailGuestShutdown,
+		CPUActual: 1, MemActual: 256,
+		Spec: `{"name":"gs-local","cpu":1,"memory_mib":256,"on_host_failure":"restart-any"}`,
+	}, nil, []corrosion.DiskRecord{{
+		VMName: "gs-local", DiskName: "root", HostName: victim.Name, Path: "/nonexistent/gs-local-root",
+		BackingImage: "base", SizeBytes: 1 << 30, StorageType: "local", TargetDev: "vda",
+	}}); err != nil {
+		t.Fatalf("InsertVM gs-local: %v", err)
+	}
+
+	if got := fenceVictim(t, c, a, victim, a, b); got != 1 {
+		t.Fatalf("fencer fired %d times, want 1", got)
+	}
+	if vm, _ := corrosion.GetVM(ctx, a.DB, "gs-shared"); vm == nil || vm.HostName == victim.Name || vm.State != "pending" {
+		t.Fatalf("gs-shared (guest shutdown, shared disk) = %+v, want it rescheduled pending as on main", vm)
+	}
+	vm, _ := corrosion.GetVM(ctx, a.DB, "gs-local")
+	if vm == nil || vm.HostName != victim.Name || vm.State != "stopped" || vm.PendingActionID != "" {
+		t.Fatalf("gs-local (guest shutdown, host-local disk) = %+v, want it stopped on %s", vm, victim.Name)
+	}
+	evs, err := corrosion.ListVMEvents(ctx, a.DB, "gs-local", 10, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	named := false
+	for _, e := range evs {
+		named = named || (e.Type == "vm.failover.skipped" && strings.Contains(e.Detail, "host-local disk"))
+	}
+	if !named {
+		t.Errorf("gs-local has no vm.failover.skipped event naming its host-local disk: %+v", evs)
+	}
+}
+
+// A host removed with --dead whose only recorded workloads are stopped is
+// admitted again under its name, and they come back with it: failover never
+// moved them, and their disks are on that machine.
+//
+// Mutation: AdmitHost back on WorkloadsOnRemovedHost — the admission is
+// refused naming vm/vm-stopped.
+func TestFleet_ReaddBringsBackTheStoppedWorkloads(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 4, IndependentReplicas: true, FaultSeed: 2913})
+	a, b, e, d := c.Nodes[0], c.Nodes[1], c.Nodes[2], c.Nodes[3]
+	if err := corrosion.InsertVM(ctx, a.DB, corrosion.VMRecord{
+		Name: "vm-stopped", HostName: d.Name, State: "stopped", StateDetail: "operator-stop",
+		Spec: `{"on_host_failure":"restart-any"}`,
+	}, nil, []corrosion.DiskRecord{{
+		VMName: "vm-stopped", DiskName: "root", HostName: d.Name, Path: "/var/lib/litevirt/disks/vm-stopped-root",
+		StorageType: "local",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	c.WaitConverged(t, convergeTimeout)
+	genesisByTick(t, c, a)
+	enableRecoveryClaims(t, c)
+
+	c.Kill(d)
+	if err := corrosion.InsertFenceLog(ctx, a.DB, corrosion.FenceLogRecord{ID: "confirm-" + d.Name, HostName: d.Name,
+		Method: "manual", Result: "manual-confirmed", Detail: "operator powered it off"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.UpdateHostState(ctx, a.DB, d.Name, "fenced"); err != nil {
+		t.Fatal(err)
+	}
+	withOperatorPKI(t, a)
+	if err := cli.HostRemoveDead(ctx, c.SelfClient(a), d.Name, false); err != nil {
+		t.Fatalf("lv host rm --dead %s: %v", d.Name, err)
+	}
+	survivors := []*Node{a, b, e}
+	adoptAll(t, c, 2, survivors...)
+	c.WaitConverged(t, convergeTimeout, survivors...)
+	if left, _ := corrosion.WorkloadsOnRemovedHost(ctx, a.DB, d.Name); len(left) != 1 {
+		t.Fatalf("workloads recorded on the removed %s = %v, want vm-stopped", d.Name, left)
+	}
+
+	if _, err := c.SelfClient(a).AdmitHost(ctx, &pb.AdmitHostRequest{
+		Name: d.Name, Address: d.Address, CertSerial: "0a0b0c0d0e0f",
+	}); err != nil {
+		t.Fatalf("admitting %s back with only a stopped VM recorded on it: %v", d.Name, err)
+	}
+	if vm := vmOn(t, a, "vm-stopped"); vm == nil || vm.HostName != d.Name || vm.State != "stopped" {
+		t.Fatalf("vm-stopped after %s was admitted again = %+v, want it stopped on %s", d.Name, vm, d.Name)
 	}
 }

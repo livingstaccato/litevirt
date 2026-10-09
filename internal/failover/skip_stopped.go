@@ -6,6 +6,7 @@ import (
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/events"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/randid"
 )
 
@@ -32,6 +33,14 @@ func stoppedVMDetail(host string) string {
 		"Start it once " + host + " is back"
 }
 
+// stoppedLocalDiskDetail is the detail for a VM that stopped without anyone
+// asking (detail, health.classifyStop's record) and has a host-local disk:
+// recovering it would rebuild that disk blank from its image elsewhere.
+func stoppedLocalDiskDetail(host, detail string) string {
+	return "stopped (" + detail + ") with a host-local disk: left on " + host + " with its disks; " +
+		"restarting it elsewhere would rebuild that disk blank. Start it once " + host + " is back"
+}
+
 // stoppedContainerDetail is stoppedVMDetail for a container.
 func stoppedContainerDetail(host string) string {
 	return "stopped: left on " + host + "; failover never recreates or starts a stopped container. " +
@@ -44,14 +53,12 @@ func stoppedContainerDetail(host string) string {
 // have recovered: one with a failure policy or enrolled in auto-promote. A
 // stopped VM that opted out was never a candidate, and saying so for every
 // one on every fence would bury the ones that were.
-func (c *Coordinator) skipStoppedVM(ctx context.Context, host string, vm corrosion.VMRecord) {
+func (c *Coordinator) skipStoppedVM(ctx context.Context, host string, vm corrosion.VMRecord, detail string) {
 	c.mVM(ActionReschedule, ResultSkipped, ErrStopped)
-	p := vmFailurePolicy(vm)
-	if (p == "" || p == "none") && (c.Promoter == nil || !c.autoPromoteEnabled(ctx, vm.Name)) {
+	if !c.vmWasCandidate(ctx, vm) {
 		return
 	}
-	detail := stoppedVMDetail(host)
-	slog.Info("failover: stopped VM left on its failed host with its disks; not restarted", "vm", vm.Name, "host", host)
+	slog.Info("failover: stopped VM left on its failed host with its disks; not restarted", "vm", vm.Name, "host", host, "why", detail)
 	if !c.auditSkip(ctx, host, vm.Name, detail, "skipped") {
 		return
 	}
@@ -86,4 +93,83 @@ func (c *Coordinator) publish(action, target, detail string) {
 		return
 	}
 	c.Events.Publish(events.Event{Action: action, Target: target, Detail: detail, Username: "failover-coordinator"})
+}
+
+// vmWasCandidate reports whether failover would have recovered vm had it been
+// running: a failure policy, or enrolment in auto-promote.
+func (c *Coordinator) vmWasCandidate(ctx context.Context, vm corrosion.VMRecord) bool {
+	if p := vmFailurePolicy(vm); p != "" && p != "none" {
+		return true
+	}
+	return c.Promoter != nil && c.autoPromoteEnabled(ctx, vm.Name)
+}
+
+// stoppedVMRekeyable reports whether a VM stopped by intent on the failed
+// host can be moved to a live host still stopped (rekeyStoppedVM): it was a
+// failover candidate, every disk is on shared storage, it has no host-local
+// firmware state, its ownership is not in dispute, and — for a writable
+// shared disk under the shared-storage fence — the old owner is proven off,
+// as for a running VM's transfer. Anything else stays where it is.
+func (c *Coordinator) stoppedVMRekeyable(ctx context.Context, host string, vm corrosion.VMRecord, disks []corrosion.DiskRecord, fenceEpoch string) bool {
+	if !c.vmWasCandidate(ctx, vm) || vmUsesFirmwareState(vm) || corrosion.VMHasHostLocalDisk(disks) {
+		return false
+	}
+	if disputed, _, err := corrosion.WorkloadHasActiveOwnershipCondition(ctx, c.db, "vm", vm.Name); err != nil || disputed {
+		return false
+	}
+	if fenceEpoch == "" && c.sharedStorageFenceEnforced(ctx) && corrosion.VMHasWritableSharedDisk(disks) {
+		return false
+	}
+	return true
+}
+
+// rekeyStoppedDetail is the audit and event detail for a stopped VM moved off
+// host to target.
+func rekeyStoppedDetail(host, target string) string {
+	return "stopped: moved from " + host + " to " + target + " on its shared disks, still stopped; " +
+		"failover never starts a stopped VM. Start it there with `lv start`"
+}
+
+// rekeyStoppedVM moves a VM stopped by intent, all of whose disks are
+// shared, off the failed host to target, still stopped
+// (corrosion.RekeyStoppedVM). The target's reconciler then defines its
+// domain there, shut off. Like every move off a failed host it is taken only
+// under the decision gate and this coordinator's tenure.
+func (c *Coordinator) rekeyStoppedVM(ctx context.Context, host string, vm corrosion.VMRecord, target string) {
+	if c.gateEnforced(ctx) {
+		if g := c.decideGate(ctx, host); !g.OK {
+			slog.Warn("failover: decision gate refused moving a stopped VM", "vm", vm.Name, "reason", g.Reason)
+			c.noteGateRefused(ActionReschedule, g.Reason)
+			c.mVM(ActionReschedule, ResultError, ErrNoQuorum)
+			return
+		}
+	}
+	if !c.stillOurTenure(ctx) {
+		c.noteGateRefused(ActionReschedule, health.ReasonStaleLeaseTerm)
+		c.mVM(ActionReschedule, ResultError, ErrStaleLeaseTerm)
+		return
+	}
+	fresh, err := corrosion.GetVM(ctx, c.db, vm.Name)
+	if err != nil || fresh == nil || fresh.HostName != host {
+		c.mVM(ActionReschedule, ResultError, ErrDBError)
+		return
+	}
+	if err := corrosion.RekeyStoppedVM(ctx, c.db, vm.Name, host, target, "stopped", fresh.OwnerEpoch); err != nil {
+		slog.Warn("failover: move a stopped VM off its failed host; it stays there this pass",
+			"vm", vm.Name, "from", host, "to", target, "error", err)
+		c.mVM(ActionReschedule, ResultError, ErrDBError)
+		return
+	}
+	c.fenceRelocated[host] = true
+	c.mVM(ActionReschedule, ResultSuccess, ErrStopped)
+	detail := rekeyStoppedDetail(host, target)
+	slog.Info("failover: stopped VM moved off its failed host, still stopped", "vm", vm.Name, "from", host, "to", target)
+	c.audit(ctx, "failover.rekey-stopped", vm.Name, detail, "ok")
+	if err := corrosion.InsertVMEvent(ctx, c.db, corrosion.VMEventRecord{
+		ID: randid.New(), VMName: vm.Name, HostName: c.hostName, Type: "vm.failover.rekeyed",
+		Result: "ok", Severity: "info", Detail: detail, Username: "failover-coordinator",
+	}); err != nil {
+		slog.Warn("failover: record the stopped VM's event", "vm", vm.Name, "error", err)
+	}
+	c.publish("vm.failover.rekeyed", vm.Name, detail)
 }

@@ -161,3 +161,110 @@ func TestRecoverableOnHostFailure_StoppedIsNotACandidate(t *testing.T) {
 		t.Error("a running container with image-recreate is not recoverable")
 	}
 }
+
+// Only a stop by intent is protected: a stop the reconciler recorded as
+// nobody's (a guest or host shutdown) is recovered as on main, and the
+// guards let its reschedule through. A stopped row with no detail is read as
+// intent, the safe default.
+func TestStoppedByIntent_OnlyRecordedNonIntentStopsAreRecoverable(t *testing.T) {
+	spec := `{"on_host_failure":"restart-any"}`
+	for detail, intent := range map[string]bool{
+		"": true, "operator-stop": true, "drain-cold-move:op1": true, "suspended": true,
+		StoppedRekeyDetail("h1"):   true,
+		StopDetailGuestShutdown:    false,
+		StopDetailOutOfBandDestroy: false,
+		StopDetailOutOfBand:        false,
+	} {
+		vm := VMRecord{Name: "vm1", State: "stopped", StateDetail: detail, Spec: spec}
+		if got := VMStoppedForFailover(vm); got != intent {
+			t.Errorf("detail %q: VMStoppedForFailover = %v, want %v", detail, got, intent)
+		}
+		if got := VMRecoverableOnHostFailure(vm, false); got == intent {
+			t.Errorf("detail %q: VMRecoverableOnHostFailure = %v, want %v", detail, got, !intent)
+		}
+	}
+
+	ctx := context.Background()
+	c := newTestDB(t)
+	apInsertVM(t, c, "gs", "host-a", "stopped")
+	if err := UpdateVMState(ctx, c, "gs", "stopped", StopDetailGuestShutdown); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteVMRescheduleProof(ctx, c, apProof("p-gs", "gs", "host-b"), "gs", "host-b"); err != nil {
+		t.Fatalf("reschedule a guest-shutdown VM: %v", err)
+	}
+	apInsertVM(t, c, "gs2", "host-a", "stopped")
+	if err := UpdateVMState(ctx, c, "gs2", "stopped", StopDetailOutOfBand); err != nil {
+		t.Fatal(err)
+	}
+	if err := RescheduleVMHost(ctx, c, "gs2", "host-b", "pending"); err != nil {
+		t.Fatalf("legacy reschedule of an out-of-band-stopped VM: %v", err)
+	}
+}
+
+// RekeyStoppedVM moves a VM stopped by intent on shared storage to another
+// host still stopped, marked, at the next generation, with its disks — and
+// refuses a host-local disk, a VM no longer stopped, or a stale generation.
+func TestRekeyStoppedVM(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	apInsertVM(t, c, "sv", "host-a", "stopped")
+	if err := UpdateVMState(ctx, c, "sv", "stopped", "operator-stop"); err != nil {
+		t.Fatal(err)
+	}
+	if err := InsertDisk(ctx, c, DiskRecord{VMName: "sv", DiskName: "root", HostName: "host-a",
+		Path: "/nfs/sv-root", StorageType: "nfs"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := RekeyStoppedVM(ctx, c, "sv", "host-a", "host-b", "stopped", 1); !errors.Is(err, ErrNoRowsAffected) {
+		t.Fatalf("stale epoch: err=%v, want ErrNoRowsAffected", err)
+	}
+	if err := RekeyStoppedVM(ctx, c, "sv", "host-a", "host-b", "stopped", 0); err != nil {
+		t.Fatalf("RekeyStoppedVM: %v", err)
+	}
+	vm, _ := GetVM(ctx, c, "sv")
+	if vm == nil || vm.HostName != "host-b" || vm.State != "stopped" || vm.OwnerEpoch != 1 ||
+		vm.StateDetail != StoppedRekeyDetail("host-a") {
+		t.Fatalf("after the re-key: %+v", vm)
+	}
+	if disks, _ := GetVMDisks(ctx, c, "sv"); len(disks) != 1 || disks[0].HostName != "host-b" {
+		t.Fatalf("disk rows after the re-key: %+v", disks)
+	}
+
+	apInsertVM(t, c, "lv", "host-a", "stopped")
+	if err := InsertDisk(ctx, c, DiskRecord{VMName: "lv", DiskName: "root", HostName: "host-a",
+		Path: "/d/lv-root", StorageType: "local"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := RekeyStoppedVM(ctx, c, "lv", "host-a", "host-b", "stopped", 0); !errors.Is(err, ErrNoRowsAffected) {
+		t.Fatalf("host-local disk: err=%v, want ErrNoRowsAffected", err)
+	}
+	apInsertVM(t, c, "run", "host-a", "running")
+	if err := RekeyStoppedVM(ctx, c, "run", "host-a", "host-b", "stopped", 0); !errors.Is(err, ErrNoRowsAffected) {
+		t.Fatalf("running VM: err=%v, want ErrNoRowsAffected", err)
+	}
+}
+
+// A removed host's stopped workloads do not block its name; anything else
+// does.
+func TestWorkloadsBlockingReadmission(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	apInsertVM(t, c, "stopped-vm", "gone", "stopped")
+	seedRelocatableContainer(t, c, "gone", "stopped-ct", false)
+	if err := SetContainerStateDetail(ctx, c, "gone", "stopped-ct", "stopped", "operator-stop"); err != nil {
+		t.Fatal(err)
+	}
+	if left, err := WorkloadsBlockingReadmission(ctx, c, "gone"); err != nil || len(left) != 0 {
+		t.Fatalf("only stopped workloads: %v (err %v), want none", left, err)
+	}
+	apInsertVM(t, c, "running-vm", "gone", "running")
+	seedRelocatableContainer(t, c, "gone", "skipped-ct", false)
+	if err := SetContainerStateDetail(ctx, c, "gone", "skipped-ct", "stopped", ContainerRelocateSkippedDetail); err != nil {
+		t.Fatal(err)
+	}
+	left, err := WorkloadsBlockingReadmission(ctx, c, "gone")
+	if err != nil || len(left) != 2 || left[0] != "ct/skipped-ct" || left[1] != "vm/running-vm" {
+		t.Fatalf("blocking = %v (err %v), want ct/skipped-ct and vm/running-vm", left, err)
+	}
+}

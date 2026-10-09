@@ -288,9 +288,14 @@ func TestCoordinator_AutoPromote_SkipsAStoppedVM(t *testing.T) {
 		}
 	}
 	for name, state := range map[string]string{"stopped-vm": "stopped", "running-vm": "running"} {
+		// A host-local disk, so the stopped VM is not one failover moves
+		// still stopped (its disks would all have to be shared).
+		disks := []corrosion.DiskRecord{{VMName: name, DiskName: "root", HostName: "bad",
+			Path: "/var/lib/litevirt/disks/" + name + "-root", StorageType: "local"}}
 		if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
 			Name: name, HostName: "bad", Spec: `{"on_host_failure":"restart-any"}`, State: state,
-		}, nil, nil); err != nil {
+			StateDetail: map[bool]string{true: "operator-stop"}[state == "stopped"],
+		}, nil, disks); err != nil {
 			t.Fatalf("InsertVM %s: %v", name, err)
 		}
 		if err := corrosion.UpsertBackupSchedule(ctx, db, corrosion.BackupScheduleRecord{

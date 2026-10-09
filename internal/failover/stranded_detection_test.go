@@ -2,6 +2,7 @@ package failover
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
@@ -48,12 +49,18 @@ func TestVMNeedsFailover(t *testing.T) {
 			spec: `{"on_host_failure":"restart-any"}`, state: "stopped", want: false},
 		{name: "a stopped VM enrolled in auto-promote is not promoted either",
 			spec: `{"on_host_failure":"restart-any"}`, state: "stopped", autoPromote: true, want: false},
+		// A stop nobody asked for (the reconciler's record of a guest or host
+		// shutdown) is recovered as on main; recoverWorkloads then leaves it
+		// if a disk is host-local.
+		{name: "a guest-shutdown VM is a candidate",
+			spec: `{"on_host_failure":"restart-any"}`, state: "stopped:" + corrosion.StopDetailGuestShutdown, want: true},
 		{name: "an errored VM is still failed over",
 			spec: `{"on_host_failure":"restart-any"}`, state: "error", want: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := vmNeedsFailover(corrosion.VMRecord{Name: "vm1", Spec: tc.spec, State: tc.state}, tc.autoPromote)
+			state, detail, _ := strings.Cut(tc.state, ":")
+			got := vmNeedsFailover(corrosion.VMRecord{Name: "vm1", Spec: tc.spec, State: state, StateDetail: detail}, tc.autoPromote)
 			if got != tc.want {
 				t.Errorf("vmNeedsFailover = %v, want %v", got, tc.want)
 			}

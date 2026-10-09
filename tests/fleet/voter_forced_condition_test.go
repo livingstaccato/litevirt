@@ -86,6 +86,11 @@ func TestFleet_VoterForced_ConditionClearsWhenALostHostIsRebuilt(t *testing.T) {
 			n2.Name, raised, ev)
 	}
 	c.Kill(n2)
+	// Down now, on that same unverified fence: the advice is how to prove it
+	// off and remove it, not just "check it can be reached".
+	if raised, ev := forcedCondition(t, n0); !raised || !strings.Contains(ev, "lv host fence-confirm "+n2.Name) {
+		t.Fatalf("ha.voter.forced does not tell how to prove the unanswering, SSH-fenced %s off: raised=%v %q", n2.Name, raised, ev)
+	}
 	fenceConfirm(t, c, n0, n2)
 
 	withOperatorPKI(t, n0)

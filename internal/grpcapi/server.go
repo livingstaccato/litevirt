@@ -41,6 +41,9 @@ type Server struct {
 
 	hostName string
 	dataDir  string
+	// fenceExec, when set, replaces fence.Execute for FenceHost (tests only;
+	// SetFenceExecutor).
+	fenceExec fenceExecutorFunc
 	// containersRoot is where per-container state (and the owner-epoch marker)
 	// lives — <dataDir>/containers in production, injected by the daemon so the
 	// runtime-inventory collector can read markers. Empty disables marker reads

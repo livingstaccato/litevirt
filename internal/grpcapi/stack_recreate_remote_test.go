@@ -50,6 +50,14 @@ func (b *peerBridge) StartContainer(ctx context.Context, in *pb.StartContainerRe
 // host-a. Returns carl's context on the entry.
 func remoteEntry(t *testing.T) (entry, tgt *Server, rt *fakeCTRuntime, carl context.Context) {
 	t.Helper()
+	return remoteEntryAs(t, false)
+}
+
+// remoteEntryAs is remoteEntry; with forwardedIdentity, host-a sees the
+// forwarded calls as auth.forwarded_identity makes it: a peer (its
+// certificate's CN preserved) promoted to the deployer, carl.
+func remoteEntryAs(t *testing.T, forwardedIdentity bool) (entry, tgt *Server, rt *fakeCTRuntime, carl context.Context) {
+	t.Helper()
 	tgt, rt = ctPathServer(t)
 	carl = carlCtx(t, tgt)
 	entry = testServer(t)
@@ -70,6 +78,9 @@ func remoteEntry(t *testing.T) (entry, tgt *Server, rt *fakeCTRuntime, carl cont
 	// interceptor makes admin (auth.forwarded_identity off, the default): the
 	// owner rules bind it only through the owner-strict marker.
 	peer := context.WithValue(context.WithValue(mtlsCtx("host-b"), ctxKeyUsername, "admin"), ctxKeyRole, "admin")
+	if forwardedIdentity {
+		peer = carlPeerCtx()
+	}
 	bridge := &peerBridge{to: tgt, peer: peer}
 	entry.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) { return bridge, func() {}, nil }
 	return entry, tgt, rt, carl

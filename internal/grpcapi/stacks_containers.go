@@ -410,12 +410,14 @@ func (dec *recreateDecision) apply(ctx context.Context, d *compose.VMDef, req *p
 		ctx = context.WithValue(ctx, recreateTemplateKey{}, dec.template)
 	}
 	if !dec.keep {
-		return ctx, false
+		// Bound to this create, for its member's host when that is
+		// another one (recreate_inherit.go).
+		return withRecreateInherit(ctx, dec, req, false), false
 	}
 	if !d.Privileged && d.Confinement == "" {
 		req.Privileged, req.Confinement = recordedSecurity(dec.spec)
 	}
-	return withInheritedSecurity(ctx), true
+	return withRecreateInherit(withInheritedSecurity(ctx), dec, req, true), true
 }
 
 // inheritRecreatedSecurity applies this recreate's decision (carried in ctx

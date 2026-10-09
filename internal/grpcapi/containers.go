@@ -105,6 +105,9 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 			return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 		}
 	}
+	// A forwarded compose recreate's decision, judged on the entry host:
+	// honoured from a peer, for the create it is bound to only.
+	ctx = s.acceptRecreateInherit(ctx, req)
 	if err := s.authorizeContainerCreate(ctx, req); err != nil {
 		return nil, err
 	}
@@ -875,7 +878,9 @@ func (s *Server) forwardCreateContainer(ctx context.Context, req *pb.CreateConta
 		fwd = proto.Clone(req).(*pb.CreateContainerRequest)
 		fwd.IdempotencyKey = ""
 	}
-	return c.CreateContainer(s.ownerStrictOutgoing(ctx), fwd)
+	// A compose recreate's create carries its decision, bound to it, to the
+	// member's host (recreate_inherit.go).
+	return c.CreateContainer(recreateInheritOutgoing(ctx, s.ownerStrictOutgoing(ctx), req), fwd)
 }
 
 // forwardSimpleCT is the empty-result version: returns (resp, err)

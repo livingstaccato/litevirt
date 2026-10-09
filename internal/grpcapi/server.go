@@ -356,8 +356,8 @@ type Server struct {
 	// cluster is big enough that enforcing does not break failover".
 	enfLeaseTerm   bool
 	leaseTermReady func() bool
-	// enfRecoveryClaim is enforcement.recovery_claim: the opt-in that lets
-	// recovery_claim_v1 be advertised (with RecoveryClaimReadiness) and the
+	// enfRecoveryClaim is enforcement.recovery_claim (default on): the flag
+	// that lets recovery_claim_v1 be advertised (with RecoveryClaimReadiness) and the
 	// reversible kill switch afterwards (recovery_claim_enforce.go).
 	enfRecoveryClaim bool
 	// enfPartitionPause is enforcement.partition_pause (default on): this node

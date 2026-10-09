@@ -172,8 +172,9 @@ of acting — it says nothing about whether the resulting rows have replicated.
 - **Recovery is a decided claim when recovery claims are enforced.** The lease
   and `DecisionGate` cannot stop two coordinators that each believe they lead
   from each authorizing a destination for the same workload. With
-  `enforcement.recovery_claim: true` on every host, `recovery_claim_v1`
-  latched and a voter generation adopted, a reschedule, promote or container
+  `enforcement.recovery_claim` on for every host (the default; an explicit
+  `false` is the stand-down), `recovery_claim_v1` latched and a voter
+  generation adopted, a reschedule, promote or container
   relocation is minted only once a majority of the voter set has certified it —
   a single-decree Paxos decision per (workload, owner epoch, attempt) — and the
   destination verifies that certificate against its own replica and the

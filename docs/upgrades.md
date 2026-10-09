@@ -732,7 +732,7 @@ the derived set. It is not a rollback tool: a binary rolled back below the
 latched token enters WAL quarantine at startup, as below every latched token,
 whether or not a voter generation exists.
 
-### Recovery claims are opt-in after the roll
+### Recovery claims latch after the roll
 
 Schema v60 adds `runtime_action_proofs.claim_certificate`, the majority
 certificate that authorizes an ownership-transfer proof; v61 adds
@@ -747,23 +747,36 @@ answered by the previous one's decision. Nothing writes the new
 column until the `recovery_claim_v1` capability token has latched. It is
 replication-gated, so it cannot latch while any host the cluster replicates to
 runs the previous release, and — unlike `voter_config_v1` — it is **not**
-mandatory: it latches only once every host has opted in.
+mandatory: it has a flag, `enforcement.recovery_claim`, and latches only once
+every host advertises it.
 
-To turn recovery claims on:
+The flag defaults **on**: a config without the key has it on, so an upgrade
+needs no config change, and an explicit `false` still wins. Builds before this
+default had it off, and turning claims on was an operator step. What happens
+now:
 
-1. Finish the roll and let `voter_config_v1` latch and genesis complete
-   (`lv cluster voter ls` shows generation 1). A cluster can stop here.
-2. Set `enforcement.recovery_claim: true` on **every** host, witnesses
-   included, and restart them one at a time. A host advertises the token only
-   with the flag on, `split_brain_gate_v1` latched and the ability to vote
-   durably.
-3. Wait for `recovery_claim_v1` to latch. Until it does, a host with the
-   flag on reports `litevirt_ha_degraded{reason="unsupported_member"}`; once
-   that clears everywhere and `not_enforcing` is empty, the next failover is
-   claim-gated.
+1. During the roll nothing changes. A host on the previous build never
+   advertises the token, so it cannot latch. Each upgraded host reports
+   `litevirt_ha_degraded{reason="unsupported_member"}` until the last host is
+   upgraded, as for `partition_pause_v1`.
+2. After the last host restarts, `voter_config_v1` latches and genesis
+   completes (`lv cluster voter ls` shows generation 1).
+3. `recovery_claim_v1` then latches. A host advertises it once
+   `split_brain_gate_v1` has latched and it can vote durably. When
+   `ha_degraded` clears everywhere and `not_enforcing` is empty, the next
+   failover is claim-gated.
 4. Validate with a partition drill before relying on it.
 
-To stand down, set the flag off on **every** host and restart: coordinators
+Once enforced, a recovery decided for a destination that then dies waits for
+`lv host rm --dead <dest>` instead of moving on to another host
+(`ha.claim.stranded` names the command); an exact half of the voters cannot
+certify a recovery; and a host most voters can still reach is not recovered.
+To keep an explicit voter set without claims, set
+`enforcement.recovery_claim: false` on every host before the roll finishes.
+One host with an explicit `false` holds the latch off for the whole cluster.
+
+To stand down, set the flag to an explicit `false` on **every** host and
+restart (a missing key means on): coordinators
 mint uncertified proofs and destinations accept them, exactly the pre-claim
 behaviour; voters keep answering and keep their history, and the voter set does
 not move. A flag off on only some hosts is not a degraded mode but the hazard

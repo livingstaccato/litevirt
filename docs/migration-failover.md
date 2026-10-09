@@ -422,7 +422,7 @@ When a host goes offline, the failover coordinator:
 1. **Detects failure** — quorum of observers must agree the host is unreachable (floor(n/2) + 1). Only fresh observations count: a `host_health` row older than 30s, or dated more than 30s ahead of the coordinator's own clock (a skewed observer), is not evidence. Both halves of that count come from one **voter set**. Until the cluster has a voter generation it is derived: every host not removed from the cluster whose state is not `offline`, `maintenance` or `fenced` (witnesses, `draining` and `upgrading` hosts vote). Once automatic genesis has run it is the adopted generation's members, whatever their state — a fenced member keeps counting until `lv cluster voter rm` removes it (see [Operating model](operating-model.md) → "The voter set is explicit once genesis has run"). n is the size of that set, and an observation counts only if its observer is in it and is not the host being judged — a fenced host that is still running, a removed host whose daemon was never stopped, or a name no host carries cannot supply a vote. Bringing a host back to `active` counts the same way. It is the same set `DecisionGate` counts its locally-probed quorum over, and if the coordinator cannot read it, it does not fence
 2. **Acquires leader lease** — suppresses concurrent coordinators (45s TTL lease; a fence needs 30s of it still to run before it may begin). Best-effort, not exclusive: a CRDT lease can be held on both sides of a partition, so the decide site also requires a locally-probed quorum (`DecisionGate`) and the minority side fails closed there. See [Operating model](operating-model.md) → "Leader-gated recovery". A node taking over the lease first confirms with a quorum of peers that none of them has already recorded the term it is about to claim, so a node that has just restarted or reconnected waits until replication catches it up (one health-probe cycle after a start, then until any newer term row arrives) instead of claiming from its stale view. See [Operating model](operating-model.md) → "A node that was away does not claim a term from a stale ledger".
 3. **Fences the failed host** — prevents split-brain by ensuring the failed host cannot access shared resources
-4. **Claims the recovery** — with `enforcement.recovery_claim` on every host (see *Recovery claims* below), a majority of the voter set certifies one destination per workload before any proof is minted, so two coordinators that both believe they lead cannot both recover it
+4. **Claims the recovery** — with `enforcement.recovery_claim` on every host (the default; see *Recovery claims* below), a majority of the voter set certifies one destination per workload before any proof is minted, so two coordinators that both believe they lead cannot both recover it
 5. **Reschedules VMs** — based on each VM's `on-host-failure` policy
 
 ### Fencing methods
@@ -747,10 +747,13 @@ Local-disk VMs are unaffected: their transfers keep the existing quorum/proof ga
 The leader lease cannot stop two coordinators that both believe they hold it,
 and each could otherwise mint a valid proof for its own destination: two
 writable owners of one VM (colonelpanik/litevirt#250). With
-`enforcement.recovery_claim: true` on **every** host (witnesses included) and
-the `recovery_claim_v1` token latched, a recovery is a claim decided by the
-explicit voter set before anything is minted
-([design/recovery-claims.md](design/recovery-claims.md)):
+`enforcement.recovery_claim` on for **every** host (witnesses included; it
+defaults on, so a config without the key counts) and the `recovery_claim_v1`
+token latched, a recovery is a claim decided by the explicit voter set before
+anything is minted ([design/recovery-claims.md](design/recovery-claims.md)).
+The token latches by itself once every host runs a build that defaults it on
+and voter genesis has run (docs/upgrades.md); an explicit
+`enforcement.recovery_claim: false` on every host is the stand-down:
 
 - **Claim before mint.** After the fence, the coordinator proposes the
   reschedule, promote or container-relocate proof it would mint as the value of

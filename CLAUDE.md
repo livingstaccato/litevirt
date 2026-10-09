@@ -120,7 +120,7 @@ finally failed.
 Hardening features are gated on cluster-wide capability tokens
 (`internal/capabilities`). The pattern is uniform:
 
-- each has an `enforcement.*` config flag, default **false**. There are two
+- each has an `enforcement.*` config flag, default **false**. There are three
   exceptions, which default **true**, and an explicit `false` is the kill
   switch of each:
   - `enforcement.audit_signature`: each host signs only its own rows, so no
@@ -132,6 +132,12 @@ Hardening features are gated on cluster-wide capability tokens
     the majority waits out that pause before recovering. The majority relies
     on the peer, so the token is withheld while the flag is off
     (docs/design/partition-pause.md §5).
+  - `enforcement.recovery_claim`: a coordinator collects a voter-majority
+    certificate before it mints a reschedule, promote or relocate proof, and
+    the destination verifies it before it executes. Every node relies on its
+    peers doing both, so the token is withheld while the flag is off, and it
+    latches only after every host runs a build that defaults it on
+    (docs/design/recovery-claims.md §5.1, §5.5).
 - **advertising is not enforcing.** Most tokens are advertised on the strength
   of the BUILD, whatever the local flag says, so the cluster can latch them —
   the node's own flag then decides whether it acts. A latched token therefore

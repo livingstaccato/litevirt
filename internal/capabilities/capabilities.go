@@ -831,7 +831,7 @@ var supported = []string{
 	// binary.
 	ClaimIncarnationV1,
 	// RecoveryClaimV1 is advertised CONDITIONALLY: enforcement.recovery_claim
-	// on AND this node ready (split_brain_gate_v1 latched, voter_config_v1
+	// (default on) on AND this node ready (split_brain_gate_v1 latched, voter_config_v1
 	// ready). Withheld while the flag is off because every flag-on node relies
 	// on every peer honouring it — see RecoveryClaimV1 and
 	// grpcapi.RecoveryClaimReadiness.

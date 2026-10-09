@@ -289,7 +289,7 @@ sync with:
   accepting majority in at least one voter, and that voter reports the accept.
   The same arithmetic holds for any two majorities of one set:
   `(q-1) + q - (n-1) = 2q - n ≥ 1`.
-- **No claims** (`recovery_claim` off). Every recovery is preceded by a fence
+- **No claims** (`recovery_claim` explicitly off, or not yet latched). Every recovery is preceded by a fence
   that writes this host `fenced` or `offline` (`RecordFenceWithState`,
   `markHostState`). It is written on the coordinator at decision time, at least
   `W` (§4) before any replacement can start, and it replicates within the

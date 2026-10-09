@@ -305,8 +305,8 @@ enforcement:
                               # fleet-wide — a peer still deciding locally would bypass the
                               # single decider entirely. Enable fleet-uniformly; the flag is the
                               # reversible kill switch.
-  audit_signature: true       # DEFAULT ON — unset means on; the only enforcement flag that
-                              # is. Sign every audit row this host writes with its cluster key
+  audit_signature: true       # DEFAULT ON — unset means on, as for recovery_claim and
+                              # partition_pause below. Sign every audit row this host writes with its cluster key
                               # (the same host.key that identifies it on the wire, under a
                               # separate signing domain). An unsigned chain is an UNKEYED
                               # hash: anyone who can write the database can edit a row,
@@ -369,7 +369,7 @@ enforcement:
                               # Deliberately not a version check — mixed-version rolling
                               # upgrades keep working. Pre-latch clusters behave exactly as
                               # before. Enable fleet-uniformly; reversible kill switch.
-  recovery_claim: false       # single-winner recovery claims (recovery_claim_v1,
+  recovery_claim: true        # DEFAULT ON. Single-winner recovery claims (recovery_claim_v1,
                               # design/recovery-claims.md). The failover coordinator
                               # collects a majority certificate from the explicit voter set
                               # before it mints a reschedule, promote or container-relocate
@@ -380,12 +380,17 @@ enforcement:
                               # an adopted voter generation (`lv cluster voter ls`).
                               # Advertised only while the flag is on and the node is ready
                               # (split_brain_gate_v1 latched, able to vote durably), so the
-                              # latch means every host opted in. Set it on EVERY host,
-                              # witnesses included. Off everywhere + restart is the full
-                              # stand-down: recovery is authorized as before, and voters keep
-                              # their history. Off on only some hosts is the hazard, not a
-                              # degraded mode — such a host reports recovery_claim_v1 in
-                              # PingResponse.not_enforcing and its peers raise ha_degraded.
+                              # latch means every host has it on. A missing key means on;
+                              # an older build never advertises it, so the latch forms only
+                              # once every host runs a build that defaults it on and voter
+                              # genesis has run — nothing changes mid-roll. An explicit
+                              # `false` is the kill switch: false everywhere + restart is
+                              # the full stand-down, recovery is authorized as before, and
+                              # voters keep their history. One host with false holds the
+                              # latch off fleet-wide; false on only some hosts AFTER the
+                              # latch is the hazard, not a degraded mode — such a host
+                              # reports recovery_claim_v1 in PingResponse.not_enforcing and
+                              # its peers raise ha_degraded.
   partition_pause: true       # DEFAULT ON. A host that cannot see a majority of the voter
                               # set for 10 s suspends every VM (RAM kept) and freezes every
                               # container that failover would recover elsewhere; a workload

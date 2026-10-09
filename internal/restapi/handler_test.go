@@ -36,6 +36,10 @@ type mockGRPC struct {
 	runRebalanceCalls   int
 	lastRunRebalanceReq *pb.RunRebalanceRequest
 
+	// lastDeleteContainerReq is what DeleteContainer was last asked, so a test
+	// can see whether the REST handler set force.
+	lastDeleteContainerReq *pb.DeleteContainerRequest
+
 	// exportAuditPages serves a paginated audit export, keyed by the cursor the
 	// caller sends: "" is the first page, and each page names the next. A caller
 	// that ignores NextCursor therefore sees only the first entry.
@@ -505,7 +509,8 @@ func (m *mockGRPC) StartContainer(context.Context, *pb.StartContainerRequest, ..
 func (m *mockGRPC) StopContainer(context.Context, *pb.StopContainerRequest, ...grpc.CallOption) (*emptypb.Empty, error) {
 	return &emptypb.Empty{}, nil
 }
-func (m *mockGRPC) DeleteContainer(context.Context, *pb.DeleteContainerRequest, ...grpc.CallOption) (*emptypb.Empty, error) {
+func (m *mockGRPC) DeleteContainer(_ context.Context, in *pb.DeleteContainerRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
+	m.lastDeleteContainerReq = in
 	return &emptypb.Empty{}, nil
 }
 func (m *mockGRPC) ExecContainer(context.Context, *pb.ExecContainerRequest, ...grpc.CallOption) (*pb.ExecContainerResponse, error) {

@@ -276,7 +276,7 @@ name in the JSON body rather than a path segment, so they are
 | `/api/v1/containers/create` | POST | `CreateContainer` (`cpu` is a cap in whole cores, 0 = unlimited; see [containers.md](containers.md#resource-limits)) |
 | `/api/v1/containers/start` | POST | `StartContainer` (name in body) |
 | `/api/v1/containers/stop` | POST | `StopContainer` (name in body) |
-| `/api/v1/containers/delete` | POST / DELETE | `DeleteContainer` (name in body) |
+| `/api/v1/containers/delete` | POST / DELETE | `DeleteContainer` (body: `{name, force}`). A running container is stopped and deleted unless the body sends `"force": false`, which refuses it with 409 instead; a body without `force` deletes it, as before the field existed |
 | `/api/v1/containers/exec` | POST | `ExecContainer` |
 | `/api/v1/containers/pull` | POST | `PullOCIImage` |
 | `/api/v1/firewall/reload` | POST | `ReloadFirewall` |

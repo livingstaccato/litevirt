@@ -8,11 +8,13 @@
 package restapi
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/emptypb"
 	"gopkg.in/yaml.v3"
@@ -339,10 +341,23 @@ func (s *Server) handleContainerDelete(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusMethodNotAllowed, "POST or DELETE")
 		return
 	}
-	var req pb.DeleteContainerRequest
-	if err := protoFromJSON(r, &req); err != nil {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
 		jsonError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	var req pb.DeleteContainerRequest
+	if err := protojson.Unmarshal(body, &req); err != nil {
+		jsonError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// The REST surface had no "force" field on main, where a delete stopped a
+	// running container and removed it. A body that does not name the key keeps
+	// that behaviour; only an explicit "force": false asks the daemon to refuse
+	// a running container. The key is read from the body, because the proto's
+	// zero value cannot tell "absent" from "false".
+	if !jsonHasKey(body, "force") {
+		req.Force = true
 	}
 	if _, err := s.grpc.DeleteContainer(s.grpcCtx(r), &req); err != nil {
 		grpcHTTPError(w, http.StatusInternalServerError, err)
@@ -622,4 +637,16 @@ func (s *Server) handlePreflightUpgrade(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	jsonProto(w, resp)
+}
+
+// jsonHasKey reports whether the top-level JSON object in body names key. It
+// is only called after protojson accepted the body, so a decode failure here
+// means there was no object to look in.
+func jsonHasKey(body []byte, key string) bool {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(body, &m); err != nil {
+		return false
+	}
+	_, ok := m[key]
+	return ok
 }

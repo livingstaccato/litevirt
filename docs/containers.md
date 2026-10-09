@@ -706,8 +706,15 @@ project plus an `owner_id` in the container's create spec.
   original took after the restore. A host-loss relocation of the copy keeps
   the copy's `owner_id` and its parent record, even when it is rebuilt from
   the parent's backup, so the backups it takes, before or after a relocation,
-  are its own, and a host-loss restore of the original never picks them. A
-  restore after the original was deleted keeps the lineage.
+  are its own, and a host-loss restore of the original never picks them. The
+  failover coordinator sends that lineage with the restore, so the survivor
+  keeps it even before the relocation mark has replicated to it. A
+  coordinator on an earlier release sends none; the survivor then reads the
+  lineage from its own copy of the relocating row, and if the mark has not
+  reached it yet, keeps the backup's lineage and logs a warning (`no
+  relocating row found here`). Only a peer relocation can set the lineage
+  this way: an operator restore that sends it has it ignored. A restore after
+  the original was deleted keeps the lineage.
 - The restored-from bound compares backup times (with any UTC offset or
   fractional seconds), but a backup of the original taken later with an
   explicit `--timestamp` at or before the copy's `restored_from_ts` reads as

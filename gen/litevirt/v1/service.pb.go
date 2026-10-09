@@ -12957,9 +12957,19 @@ type RestoreContainerRequest struct {
 	// restore-relocation (split-brain hardening, v38) — carried in-request so the
 	// target validates + claims it without depending on proof-row gossip timing.
 	// nil for an operator-driven restore.
-	Proof         *RuntimeActionProof `protobuf:"bytes,7,opt,name=proof,proto3" json:"proof,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Proof *RuntimeActionProof `protobuf:"bytes,7,opt,name=proof,proto3" json:"proof,omitempty"`
+	// owner_id, restored_from_owner_id and restored_from_ts are the lineage of
+	// the container a failover coordinator relocates, read from the row it
+	// marked: the relocated container keeps them, not the lineage of the
+	// backup it is rebuilt from. The target honours them only on a peer
+	// relocation (a carried proof, or the relocation token over a peer cert);
+	// any other restore ignores them. Empty (an older coordinator, or a row
+	// with no owner_id) = the target reads the relocating row itself.
+	OwnerId             string `protobuf:"bytes,8,opt,name=owner_id,json=ownerId,proto3" json:"owner_id,omitempty"`
+	RestoredFromOwnerId string `protobuf:"bytes,9,opt,name=restored_from_owner_id,json=restoredFromOwnerId,proto3" json:"restored_from_owner_id,omitempty"`
+	RestoredFromTs      string `protobuf:"bytes,10,opt,name=restored_from_ts,json=restoredFromTs,proto3" json:"restored_from_ts,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *RestoreContainerRequest) Reset() {
@@ -13039,6 +13049,27 @@ func (x *RestoreContainerRequest) GetProof() *RuntimeActionProof {
 		return x.Proof
 	}
 	return nil
+}
+
+func (x *RestoreContainerRequest) GetOwnerId() string {
+	if x != nil {
+		return x.OwnerId
+	}
+	return ""
+}
+
+func (x *RestoreContainerRequest) GetRestoredFromOwnerId() string {
+	if x != nil {
+		return x.RestoredFromOwnerId
+	}
+	return ""
+}
+
+func (x *RestoreContainerRequest) GetRestoredFromTs() string {
+	if x != nil {
+		return x.RestoredFromTs
+	}
+	return ""
 }
 
 type RestoreContainerProgress struct {
@@ -35518,7 +35549,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\n" +
 	"\x06FREEZE\x10\x01\x12\b\n" +
 	"\x04COPY\x10\x02\x12\b\n" +
-	"\x04DONE\x10\x03\"\xf7\x01\n" +
+	"\x04DONE\x10\x03\"\xf1\x02\n" +
 	"\x17RestoreContainerRequest\x12\x1b\n" +
 	"\trepo_path\x18\x01 \x01(\tR\brepoPath\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x1c\n" +
@@ -35526,7 +35557,11 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\thost_name\x18\x04 \x01(\tR\bhostName\x12\x14\n" +
 	"\x05start\x18\x05 \x01(\bR\x05start\x12#\n" +
 	"\rstaging_token\x18\x06 \x01(\tR\fstagingToken\x125\n" +
-	"\x05proof\x18\a \x01(\v2\x1f.litevirt.v1.RuntimeActionProofR\x05proof\"\xb3\x02\n" +
+	"\x05proof\x18\a \x01(\v2\x1f.litevirt.v1.RuntimeActionProofR\x05proof\x12\x19\n" +
+	"\bowner_id\x18\b \x01(\tR\aownerId\x123\n" +
+	"\x16restored_from_owner_id\x18\t \x01(\tR\x13restoredFromOwnerId\x12(\n" +
+	"\x10restored_from_ts\x18\n" +
+	" \x01(\tR\x0erestoredFromTs\"\xb3\x02\n" +
 	"\x18RestoreContainerProgress\x12A\n" +
 	"\x05phase\x18\x01 \x01(\x0e2+.litevirt.v1.RestoreContainerProgress.PhaseR\x05phase\x12#\n" +
 	"\rbytes_written\x18\x02 \x01(\x03R\fbytesWritten\x12\x1f\n" +

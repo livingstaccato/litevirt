@@ -418,7 +418,7 @@ func (s *Server) migrateRestore(ctx context.Context, target, repoPath, name, tim
 		}
 		mdPairs = append(mdPairs, relocateTokenMDKey, proof.GetRelocationToken())
 	}
-	return s.drivePeerRestore(ctx, target, repoPath, name, timestamp, start, proof, mdPairs...)
+	return s.drivePeerRestore(ctx, target, repoPath, name, timestamp, start, proof, relocationLineage{}, mdPairs...)
 }
 
 // mintRelocationProof writes a durable single-use container-relocation proof (dest==target,

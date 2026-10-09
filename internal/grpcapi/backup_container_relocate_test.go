@@ -508,7 +508,7 @@ func TestDriveRemoteRestore_CarriesOwnerEpoch(t *testing.T) {
 		}}, func() {}, nil
 	}
 
-	outcome, err := s.driveRemoteRestore(ctx, "host-b", "repo-not-present", "ct1", "ts", "tok-1")
+	outcome, err := s.driveRemoteRestore(ctx, "host-b", "repo-not-present", "ct1", "ts", "tok-1", relocationLineage{})
 	if err != nil || outcome != corrosion.RestoreLanded {
 		t.Fatalf("driveRemoteRestore: outcome=%v err=%v; want landed/nil", outcome, err)
 	}

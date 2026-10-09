@@ -371,6 +371,10 @@ func (s *Server) RestoreContainerFromBackup(ctx context.Context, ctName, targetH
 	// When that row cannot be read, the backup is still picked, by name as
 	// before the owner rule: refusing would fall back to an image recreate
 	// and cost the container its data over a transient read error.
+	//
+	// The row's lineage travels with the restore (relocationLineageOf): the
+	// target keeps it rather than the backup's, and need not wait for the
+	// mark to replicate to it to know it.
 	owner, err := s.relocatingContainer(ctx, ctName, targetHost, token)
 	if err != nil {
 		slog.Warn("container failover: could not read the relocating row; choosing its backup by name alone",
@@ -381,7 +385,7 @@ func (s *Server) RestoreContainerFromBackup(ctx context.Context, ctName, targetH
 	if err != nil {
 		return corrosion.RestoreNotAttempted, err
 	}
-	return s.driveRemoteRestore(ctx, targetHost, repoName, ctName, timestamp, token)
+	return s.driveRemoteRestore(ctx, targetHost, repoName, ctName, timestamp, token, relocationLineageOf(owner))
 }
 
 // relocationTokenToStamp is the relocate_token a restored row carries: the
@@ -456,7 +460,7 @@ func (s *Server) removeRestoreMarker(name string) { _ = os.Remove(s.restoreMarke
 // else after the RPC started is indeterminate (the row may have landed but the
 // frame/stream was lost) → RestoreUnknown, which the coordinator defers rather
 // than destructively falling back.
-func (s *Server) driveRemoteRestore(ctx context.Context, target, repoPath, name, timestamp, token string) (corrosion.RestoreOutcome, error) {
+func (s *Server) driveRemoteRestore(ctx context.Context, target, repoPath, name, timestamp, token string, lineage relocationLineage) (corrosion.RestoreOutcome, error) {
 	// Carry the attempt token to the target (on the RestoreContainer call) so it
 	// stamps the restored row. The transport (PR-4 push to staging vs. shared-repo
 	// fallback) is handled by drivePeerRestore.
@@ -484,7 +488,7 @@ func (s *Server) driveRemoteRestore(ctx context.Context, target, repoPath, name,
 			return corrosion.RestoreNotAttempted, fmt.Errorf("relocation proof for token %s not found under enforcement; deferring", token)
 		}
 	}
-	return s.drivePeerRestore(ctx, target, repoPath, name, timestamp, true, proof, md...)
+	return s.drivePeerRestore(ctx, target, repoPath, name, timestamp, true, proof, lineage, md...)
 }
 
 // drainRestoreStream classifies a remote RestoreContainer progress stream. The

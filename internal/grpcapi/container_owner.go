@@ -158,14 +158,58 @@ func timestampAtOrBefore(a, b string) bool {
 	return !ta.After(tb)
 }
 
+// relocationLineage is a relocating container's lineage as its failover
+// coordinator read it off the row it marked: its owner_id and any
+// restored-from parent. The coordinator sends it in the restore request,
+// because the target's own replica need not have seen the mark yet.
+type relocationLineage struct {
+	ownerID, restoredFromOwnerID, restoredFromTS string
+}
+
+// relocationLineageOf is row's lineage; none for a nil row (the backup was
+// picked by name) or a row that records no owner_id.
+func relocationLineageOf(row *corrosion.ContainerRecord) relocationLineage {
+	if row == nil {
+		return relocationLineage{}
+	}
+	cs := corrosion.DecodeCreateSpec(row.CreateSpec)
+	if cs.OwnerID == "" {
+		return relocationLineage{}
+	}
+	return relocationLineage{cs.OwnerID, cs.RestoredFromOwnerID, cs.RestoredFromTS}
+}
+
+// on sets the lineage on a restore request, and returns it.
+func (l relocationLineage) on(req *pb.RestoreContainerRequest) *pb.RestoreContainerRequest {
+	req.OwnerId, req.RestoredFromOwnerId, req.RestoredFromTs = l.ownerID, l.restoredFromOwnerID, l.restoredFromTS
+	return req
+}
+
+// withLineage is createSpec carrying l in place of its own lineage.
+func (l relocationLineage) withLineage(createSpec string) string {
+	cs := corrosion.DecodeCreateSpec(createSpec)
+	cs.OwnerID, cs.RestoredFromOwnerID, cs.RestoredFromTS = l.ownerID, l.restoredFromOwnerID, l.restoredFromTS
+	return corrosion.EncodeCreateSpec(cs)
+}
+
 // relocatedLineage is the lineage a host-loss relocation lays down: the
 // relocating container's own (its owner_id and any restored-from parent), not
 // the lineage of the backup it was rebuilt from. A copy restored from its
 // parent's backup and then relocated from that same backup stays the copy;
 // taking the manifest's would make it a second holder of the parent's
-// owner_id. When the relocating row cannot be read, or records no owner_id,
-// the manifest's lineage is kept, as before.
+// owner_id.
+//
+// The caller has established that the restore is a peer relocation
+// (isPeerRelocation); no other restore reaches here, so no other restore can
+// set a lineage through the request. The lineage comes from, in order:
+//   - the request, which the coordinator fills from the row it marked;
+//   - the relocating row in this host's replica (a coordinator that sends no
+//     lineage: an earlier build, or a backup picked by name);
+//   - the manifest, as before owner records, when neither is there (WARN).
 func (s *Server) relocatedLineage(ctx context.Context, req *pb.RestoreContainerRequest, createSpec string) string {
+	if req.GetOwnerId() != "" {
+		return relocationLineage{req.GetOwnerId(), req.GetRestoredFromOwnerId(), req.GetRestoredFromTs()}.withLineage(createSpec)
+	}
 	token := relocateTokenFromMD(ctx)
 	if token == "" && req.Proof != nil {
 		token = req.Proof.GetRelocationToken()
@@ -179,13 +223,11 @@ func (s *Server) relocatedLineage(ctx context.Context, req *pb.RestoreContainerR
 		slog.Warn("container relocation: no relocating row found here (not replicated yet?); keeping the backup's lineage", "name", req.Name)
 		return createSpec
 	}
-	mine := corrosion.DecodeCreateSpec(row.CreateSpec)
-	if mine.OwnerID == "" {
+	l := relocationLineageOf(row)
+	if l.ownerID == "" {
 		return createSpec
 	}
-	cs := corrosion.DecodeCreateSpec(createSpec)
-	cs.OwnerID, cs.RestoredFromOwnerID, cs.RestoredFromTS = mine.OwnerID, mine.RestoredFromOwnerID, mine.RestoredFromTS
-	return corrosion.EncodeCreateSpec(cs)
+	return l.withLineage(createSpec)
 }
 
 // relocatingContainer is the row the failover coordinator marked for a

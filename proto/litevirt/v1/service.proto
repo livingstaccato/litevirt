@@ -1305,6 +1305,16 @@ message RestoreContainerRequest {
     // target validates + claims it without depending on proof-row gossip timing.
     // nil for an operator-driven restore.
     RuntimeActionProof proof = 7;
+    // owner_id, restored_from_owner_id and restored_from_ts are the lineage of
+    // the container a failover coordinator relocates, read from the row it
+    // marked: the relocated container keeps them, not the lineage of the
+    // backup it is rebuilt from. The target honours them only on a peer
+    // relocation (a carried proof, or the relocation token over a peer cert);
+    // any other restore ignores them. Empty (an older coordinator, or a row
+    // with no owner_id) = the target reads the relocating row itself.
+    string owner_id               = 8;
+    string restored_from_owner_id = 9;
+    string restored_from_ts       = 10;
 }
 
 message RestoreContainerProgress {

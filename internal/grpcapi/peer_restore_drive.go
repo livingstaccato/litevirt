@@ -62,10 +62,14 @@ func (s *Server) pushManifestToStaging(ctx context.Context, client pb.LiteVirtCl
 // re-open). A non-Unimplemented push failure is a real error (don't silently fall
 // back and risk the target reading a repo it can't actually reach).
 //
+// lineage is the relocated container's own lineage, which a failover sends so
+// the target keeps it whatever its replica has seen; a cold migrate sends none
+// (the backup it restores is the moving container's own, just taken).
+//
 // mdPairs are appended to the outgoing context for the RestoreContainer call
 // (migrate-from for cold migrate, relocate-token for failover) — never to the
 // push, which is authenticated by the peer host cert alone.
-func (s *Server) drivePeerRestore(ctx context.Context, target, repoName, name, timestamp string, start bool, proof *pb.RuntimeActionProof, mdPairs ...string) (corrosion.RestoreOutcome, error) {
+func (s *Server) drivePeerRestore(ctx context.Context, target, repoName, name, timestamp string, start bool, proof *pb.RuntimeActionProof, lineage relocationLineage, mdPairs ...string) (corrosion.RestoreOutcome, error) {
 	if s.migrateRestoreOverride != nil {
 		// Test seam (shared by migrate + failover): return the classified outcome
 		// without a second daemon.
@@ -93,9 +97,9 @@ func (s *Server) drivePeerRestore(ctx context.Context, target, repoName, name, t
 		token, perr := s.pushManifestToStaging(ctx, c, srcRepo, name, timestamp)
 		switch {
 		case perr == nil:
-			rs, e := c.RestoreContainer(octx, &pb.RestoreContainerRequest{
+			rs, e := c.RestoreContainer(octx, lineage.on(&pb.RestoreContainerRequest{
 				StagingToken: token, Name: name, Timestamp: timestamp, HostName: target, Start: start, Proof: proof,
-			})
+			}))
 			if e != nil {
 				return corrosion.RestoreNotAttempted, e
 			}
@@ -109,9 +113,9 @@ func (s *Server) drivePeerRestore(ctx context.Context, target, repoName, name, t
 
 	// Shared-repo fallback: the target re-opens repoName in its own config (the
 	// pre-PR-4 behavior; only works when the repo is reachable from both hosts).
-	rs, e := c.RestoreContainer(octx, &pb.RestoreContainerRequest{
+	rs, e := c.RestoreContainer(octx, lineage.on(&pb.RestoreContainerRequest{
 		RepoPath: repoName, Name: name, Timestamp: timestamp, HostName: target, Start: start, Proof: proof,
-	})
+	}))
 	if e != nil {
 		return corrosion.RestoreNotAttempted, e
 	}

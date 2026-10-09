@@ -138,19 +138,21 @@ func manifestOwnedBy(m *pbsstore.Manifest, rec *corrosion.ContainerRecord) bool 
 }
 
 // relocatingContainer is the row the failover coordinator marked for a
-// restore-relocation of name to target under token, or nil.
-func (s *Server) relocatingContainer(ctx context.Context, name, target, token string) *corrosion.ContainerRecord {
+// restore-relocation of name to target under token, or nil when no row is so
+// marked. A read error is returned, never read as "no row": a nil owner would
+// match backups by name alone.
+func (s *Server) relocatingContainer(ctx context.Context, name, target, token string) (*corrosion.ContainerRecord, error) {
 	cts, err := corrosion.ListContainers(ctx, s.db, "")
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	want := corrosion.RelocateRestoreDetail(target, token)
 	for i := range cts {
 		if cts[i].Name == name && cts[i].StateDetail == want {
-			return &cts[i]
+			return &cts[i], nil
 		}
 	}
-	return nil
+	return nil, nil
 }
 
 // stampContainerOwner writes the container's on-disk owner record (project and

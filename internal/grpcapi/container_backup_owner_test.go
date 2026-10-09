@@ -146,3 +146,39 @@ func TestInspectContainer_AnotherLineagesBackupIsNotAvailable(t *testing.T) {
 		check(t, owner, "r1")
 	})
 }
+
+// M5: when the relocating row cannot be read, failover cannot tell which
+// lineage it is restoring, so it restores nothing rather than the newest
+// backup of the name.
+func TestRestoreContainerFromBackup_UnreadableRelocatingRowFailsClosed(t *testing.T) {
+	s := testServer(t)
+	s.hostName = "host-a"
+	s.dataDir = t.TempDir()
+	ctx := context.Background()
+	repo := ctTestRepo(t)
+	s.SetContainerRuntime(&fakeCTRuntime{exportPayload: []byte("rootfs")})
+	s.SetBackupRepos(map[string]string{"main": repo})
+	if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{
+		HostName: "host-a", Name: "ct1", State: "running", Image: "alpine:3.19", Project: "acme",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	bk := &progressStream[pb.BackupContainerProgress]{ctx: adminCtx()}
+	if err := s.BackupContainer(&pb.BackupContainerRequest{
+		Name: "ct1", HostName: "host-a", RepoPath: "main", Timestamp: "2026-06-27T12:00:00Z",
+	}, bk); err != nil {
+		t.Fatalf("BackupContainer: %v", err)
+	}
+	if err := s.db.Execute(ctx, `DROP TABLE containers`); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	s.migrateRestoreOverride = func(context.Context, string, string, string, string, bool) (corrosion.RestoreOutcome, error) {
+		called = true
+		return corrosion.RestoreLanded, nil
+	}
+	outcome, err := s.RestoreContainerFromBackup(ctx, "ct1", "host-b", "tok-x")
+	if err == nil || outcome != corrosion.RestoreNotAttempted || called {
+		t.Fatalf("got (%v, %v), restore driven=%v; want (RestoreNotAttempted, err) and no restore", outcome, err, called)
+	}
+}

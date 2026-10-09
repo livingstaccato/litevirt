@@ -367,7 +367,14 @@ func (s *Server) RestoreContainerFromBackup(ctx context.Context, ctName, targetH
 	// The relocating row is the owner the backup must belong to: a newer
 	// backup of another container of this name (another project, another
 	// lineage) is not this container's data.
-	repoName, timestamp, err := s.findLatestContainerBackupFor(ctName, s.relocatingContainer(ctx, ctName, targetHost, token))
+	//
+	// When that row cannot be read, nothing is restored: the lineage is
+	// unknown, and the newest backup of the name may be another container's.
+	owner, err := s.relocatingContainer(ctx, ctName, targetHost, token)
+	if err != nil {
+		return corrosion.RestoreNotAttempted, fmt.Errorf("read the relocating container %q to choose its backup: %w", ctName, err)
+	}
+	repoName, timestamp, err := s.findLatestContainerBackupFor(ctName, owner)
 	if err != nil {
 		return corrosion.RestoreNotAttempted, err
 	}
@@ -537,16 +544,12 @@ func classifyRestoreError(err error) corrosion.RestoreOutcome {
 	}
 }
 
-// findLatestContainerBackup scans the daemon's configured repos for the newest
-// structurally-valid rootfs manifest of ctName, returning the registered repo
-// NAME (not path) + the manifest timestamp. A registered name is preferred so
-// the target can resolve the same repo via its own config.
-func (s *Server) findLatestContainerBackup(ctName string) (repoName, timestamp string, err error) {
-	return s.findLatestContainerBackupFor(ctName, nil)
-}
-
-// findLatestContainerBackupFor is findLatestContainerBackup restricted to the
-// manifests owner may own (manifestOwnedBy); a nil owner matches by name.
+// findLatestContainerBackupFor scans the daemon's configured repos for the
+// newest structurally-valid rootfs manifest of ctName that owner may own
+// (manifestOwnedBy), returning the registered repo NAME (not path) + the
+// manifest timestamp. A registered name is preferred so the target can resolve
+// the same repo via its own config. A nil owner (no relocating row records
+// the container) matches by name.
 func (s *Server) findLatestContainerBackupFor(ctName string, owner *corrosion.ContainerRecord) (repoName, timestamp string, err error) {
 	if len(s.backupRepos) == 0 {
 		return "", "", fmt.Errorf("no backup repos configured")

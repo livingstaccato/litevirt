@@ -165,6 +165,14 @@ func TestRestoreSnapshot_TakesOverAStaleStartLease(t *testing.T) {
 				t.Fatalf("setup: lease %q %v", h, err)
 			}
 		}},
+		{"a host marked offline", func(t *testing.T, s *Server) {
+			if err := corrosion.InsertHost(adminCtx(), s.db, corrosion.HostRecord{Name: "host-c", Address: "10.0.0.4", State: "offline"}); err != nil {
+				t.Fatal(err)
+			}
+			if h, err := health.TryVMStartLease(adminCtx(), s.db, "host-c/vmcheck", "rs", time.Now()); err != nil || h != "host-c/vmcheck" {
+				t.Fatalf("setup: lease %q %v", h, err)
+			}
+		}},
 		{"a host removed from the cluster", func(t *testing.T, s *Server) {
 			if err := corrosion.InsertHost(adminCtx(), s.db, corrosion.HostRecord{Name: "gone-host", Address: "10.0.0.3", State: "active"}); err != nil {
 				t.Fatal(err)
@@ -209,6 +217,22 @@ func TestRestoreSnapshot_RefusedWhileALiveHolderHasTheLease(t *testing.T) {
 				t.Fatal(err)
 			}
 		}},
+	}
+	// A host that is draining, in maintenance, upgrading, joining or merely
+	// suspect still runs its daemon, which may hold the lease and run the VM:
+	// a draining source's cold move holds it until the handoff is cleaned up
+	// (final whole-branch review M6). Only offline, fenced or removed is gone.
+	for _, st := range []string{"draining", "maintenance", "upgrading", corrosion.HostStateJoining, "suspect"} {
+		st := st
+		cases = append(cases, struct {
+			name   string
+			holder string
+			setup  func(t *testing.T, s *Server)
+		}{"a " + st + " host", "host-d/cold-migrate", func(t *testing.T, s *Server) {
+			if err := corrosion.InsertHost(adminCtx(), s.db, corrosion.HostRecord{Name: "host-d", Address: "10.0.0.5", State: st}); err != nil {
+				t.Fatal(err)
+			}
+		}})
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

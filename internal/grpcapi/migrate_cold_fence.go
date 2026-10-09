@@ -94,10 +94,10 @@ func (s *Server) holdStartLease(ctx context.Context, holder, vmName, notDone, re
 // staleStartLease says why the VM's start lease held by heldBy has no live
 // holder behind it, or "" when it may: a lease this host took before this
 // daemon started (a run that crashed holding it), or one whose holder's host
-// is known not to be an active member: its row says another state, or it
-// was removed. A holder on another active host, a host this replica has no
-// row for yet, a component of this daemon, or anything that cannot be read
-// counts as live.
+// is known to be down: its row says offline or fenced, or it was removed. A
+// holder on a host in any other state (active, draining, maintenance, ...),
+// a host this replica has no row for yet, a component of this daemon, or
+// anything that cannot be read counts as live.
 func (s *Server) staleStartLease(ctx context.Context, vmName, heldBy string) string {
 	host, _, _ := strings.Cut(heldBy, "/")
 	if host == s.hostName {
@@ -127,7 +127,12 @@ func (s *Server) staleStartLease(ctx context.Context, vmName, heldBy string) str
 		}
 		return ""
 	}
-	if rec.State != "active" {
+	// Only a host known to be down: offline or fenced. A draining, upgrading,
+	// maintenance, joining or suspect host still runs its daemon, which may
+	// hold the lease and run the VM (a draining source's cold move holds it
+	// until its handoff is cleaned up), and its lease expires by itself if no
+	// one renews it.
+	if rec.State == "offline" || rec.State == "fenced" {
 		return "its host " + host + " is " + rec.State
 	}
 	return ""

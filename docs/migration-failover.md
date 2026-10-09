@@ -929,10 +929,19 @@ What failover does with a stopped VM on a failed host:
 | stopped without anyone asking | any host-local disk | leaves it on the failed host with its disks |
 
 With recovery claims on (the default), the move is claimed like a recovery,
-so two coordinators that both believe they lead agree on one destination.
-Without them, two coordinators can move it to two hosts; the VM's record ends
-naming one, that host defines it, and the other removes the definition it
-made. The move keeps its marker (`failover-rekey-stopped:<host>`) on the VM
+so two coordinators that both believe they lead agree on one destination, and
+it advances the VM's ownership generation as a completed recovery does, so the
+VM's next failover is claimed afresh. Without them, two coordinators can move
+it to two hosts; the VM's record ends naming one, that host defines it, and
+the other removes the definition it made. One case is not covered with claims
+off: if an operator starts the VM on one of the two hosts before the other
+move has reached it, the hosts' records can disagree about where the VM is,
+and that is not repaired automatically. Leave recovery claims on, or wait
+until `lv inspect <vm>` shows the same host from every node before starting
+it.
+
+While the host defines the domain it holds the VM's start lease, and an
+`lv start` that arrives meanwhile is refused with a message to retry. The move keeps its marker (`failover-rekey-stopped:<host>`) on the VM
 until it is started, and the host the record names defines the domain afresh
 from the VM's current spec, never reusing an older definition it finds.
 

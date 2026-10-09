@@ -121,7 +121,11 @@ later. Turning the flag on was a permanent commitment to an unfinished design.
 **Removed** in `c6d990d1` (*chore(capabilities): retire the canonical_registry
 opt-in until its writer ships*, 2026-10-04):
 
-- the `enforcement.canonical_registry` config field and its docs;
+- the `enforcement.canonical_registry` config field and its docs. A config that
+  still sets it keeps loading: the key is ignored, and `LoadConfig` logs a WARN
+  that names it as retired (`retiredConfigKeys`, internal/daemon/config.go;
+  `TestLoadConfig_RetiredCanonicalRegistryFlagLoadsAndWarns`). Refusing to start
+  over it would strand every node that ever opted in;
 - `Server.SetCanonicalRegistryEnforce` / `enfCanonicalRegistry`, the advertisement
   filter and the `tokenEnabled` case;
 - `canonical_registry_v1` from `capabilities.Supported()` and `capabilities.All()`;

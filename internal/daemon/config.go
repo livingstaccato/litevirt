@@ -737,6 +737,7 @@ func LoadConfig() (*Config, error) {
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
+	warnRetiredConfigKeys(data)
 
 	if cfg.HostName == "" {
 		return nil, fmt.Errorf("host_name is required in config")
@@ -804,6 +805,54 @@ func LoadConfig() (*Config, error) {
 	normalizeTelemetry(&cfg.Telemetry)
 
 	return cfg, nil
+}
+
+// retiredConfigKeys are config keys a later build stopped reading. A config that
+// still sets one loads — refusing to start over a key that used to be valid would
+// strand every node that ever set it — and the key is ignored, with a WARN that
+// names it and says why. A key is never removed from this list: the configs that
+// set it outlive the build that retired it.
+var retiredConfigKeys = []struct {
+	path []string
+	why  string
+}{
+	{
+		path: []string{"enforcement", "canonical_registry"},
+		why: "retired with its capability token canonical_registry_v1 (it only advertised the token " +
+			"for a registry-credential writer that never shipped); the value is ignored and can be " +
+			"removed. The writer will ship under a new token, canonical_registry_v2 — see " +
+			"docs/design/canonical-registry-credentials.md",
+	},
+}
+
+// warnRetiredConfigKeys logs a WARN for each retired key the config sets. The
+// typed decode ignores unknown keys, so without this a retired key is dropped
+// silently. A document it cannot read as a map is left to the typed decode,
+// which has already accepted it.
+func warnRetiredConfigKeys(data []byte) {
+	var doc map[string]any
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return
+	}
+	for _, k := range retiredConfigKeys {
+		var node any = doc
+		found := true
+		for _, seg := range k.path {
+			m, ok := node.(map[string]any)
+			if !ok {
+				found = false
+				break
+			}
+			if node, ok = m[seg]; !ok {
+				found = false
+				break
+			}
+		}
+		if found {
+			slog.Warn("config: "+strings.Join(k.path, ".")+" is retired and ignored",
+				"key", strings.Join(k.path, "."), "value", fmt.Sprint(node), "why", k.why)
+		}
+	}
 }
 
 // normalizeAdvertiseAddress validates and canonicalizes advertise_address.

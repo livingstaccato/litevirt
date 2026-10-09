@@ -437,9 +437,10 @@ For the 80% case, named modes expand at parse time:
 
 Explicit `policy:` or `rebalance:` fields on the same `placement` block override the alias defaults.
 
-`rebalance.mode: on-demand` was removed: it behaved exactly like `dry-run`. A
-compose file that still names it fails validation and names `dry-run` as the
-replacement.
+`rebalance.mode: on-demand` is an alias of `dry-run`: it always behaved exactly
+like it, and the two were folded into one mode. A compose file that still names
+it deploys, the VM's mode is stored as `dry-run`, and a WARN says so. Write
+`dry-run` in new files.
 
 ### Hard constraints
 

@@ -45,10 +45,11 @@ const (
 	ModeAuto   Mode = "auto"
 )
 
-// legacyModeOnDemand is a removed mode that behaved exactly like dry-run.
-// Compose rejects it, but a vms.spec written before the removal, or by an
-// older node during a rolling upgrade (its ha-critical preset still expands
-// to it), can carry it. It is read as ModeDryRun. Not an accepted input.
+// legacyModeOnDemand is a folded mode that behaved exactly like dry-run.
+// Compose accepts it as an alias and stores dry-run, but a vms.spec written
+// before the fold, or by an older node during a rolling upgrade (its
+// ha-critical preset still expands to it), can carry it. It is read as
+// ModeDryRun.
 const legacyModeOnDemand Mode = "on-demand"
 
 // vmPolicy is the rebalancer's view of one VM's resolved placement+rebalance.

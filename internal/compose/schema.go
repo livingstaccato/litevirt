@@ -393,7 +393,7 @@ type PlacementDef struct {
 // RebalanceDef controls per-VM (or per-stack / per-cluster) rebalancer
 // behavior. See for the mode matrix.
 type RebalanceDef struct {
-	Mode      string           `yaml:"mode"`      // off | dry-run | auto
+	Mode      string           `yaml:"mode"`      // off | dry-run | auto (on-demand: an alias of dry-run)
 	Threshold int              `yaml:"threshold"` // min imbalance % (default 15)
 	Cooldown  string           `yaml:"cooldown"`  // "5m" — min interval per VM
 	Budget    *RebalanceBudget `yaml:"budget"`

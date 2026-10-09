@@ -58,7 +58,10 @@ Default weights (tunable via `Request.Weights`):
 | Host generation | 5 | label-driven |
 
 There is no power or thermal dimension. One was registered with no telemetry
-behind it, so it never affected placement; it was removed on 2026-10-04.
+behind it, so it never affected placement; it was removed on 2026-10-04. Its
+weight was never an operator setting: weights live only in code
+(`DefaultWeights`, overridden per request by `Request.Weights`, which no config,
+compose or RPC field sets), so no existing config carries it.
 [design/placement-power-dimension.md](design/placement-power-dimension.md)
 records what it needs before it returns.
 
@@ -121,10 +124,10 @@ The day-2 loop runs every 60 s on the leader-only coordinator (gated by the `lea
 | `dry-run` (recommended default) | Proposals written to `rebalance_proposals` table; never applied automatically. Operator reviews via `lv rebalance list` and may `approve` one to execute it. |
 | `auto` | Proposals written and immediately approved (subject to budget); the executor applies them automatically. |
 
-There was an `on-demand` mode; it behaved exactly like `dry-run` and was
-removed. Compose rejects it and names `dry-run` instead. A VM whose stored spec
-still carries it (written before the removal, or by an older node during a
-rolling upgrade) is treated as `dry-run`.
+There was an `on-demand` mode; it behaved exactly like `dry-run` and was folded
+into it. It is kept as an alias: compose accepts it, stores `dry-run`, and logs a
+WARN naming the alias. A VM whose stored spec still carries it (written before
+the fold, or by an older node during a rolling upgrade) is treated as `dry-run`.
 
 Proposals score destinations with the **same hard-constraint pipeline as initial
 placement** — anti-affinity, required labels, max-per-node, device fit, witness

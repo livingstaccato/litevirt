@@ -588,12 +588,13 @@ func (s *Server) lostVoterStill(ctx context.Context, gen int64, prev, current *c
 	}
 	inc, err := s.remoteIncarnation(ctx, l, prev.Generation)
 	switch {
-	case err != nil && h.State == "fenced":
-		// Recorded fenced on a fence nothing verified, and not answering: most
-		// likely it is off. Say how to make that a proof.
-		return fmt.Sprintf("forced generation %d dropped %s's vote; %s is recorded fenced on a fence that did not "+
-			"verify the power-off and did not answer (%v). If it is off, confirm it (`lv host fence-confirm %s`), "+
-			"then remove and revoke it with `lv host rm --dead %s`", gen, l, l, err, l, l)
+	case err != nil && (h.State == "fenced" || h.State == "offline"):
+		// Recorded down on a fence nothing verified — 'fenced' from a leader
+		// before fence_state_v1 latched, 'offline' after it — and not
+		// answering: most likely it is off. Say how to make that a proof.
+		return fmt.Sprintf("forced generation %d dropped %s's vote; %s is recorded %s without a fence that "+
+			"verified the power-off, and did not answer (%v). If it is off, confirm it (`lv host fence-confirm %s`), "+
+			"then remove and revoke it with `lv host rm --dead %s`", gen, l, l, h.State, err, l, l)
 	case err != nil:
 		return fmt.Sprintf("forced generation %d dropped %s's vote, and the %s in service now did not say which "+
 			"incarnation it is (%v), so it is not yet known to be a new machine rather than the lost voter "+

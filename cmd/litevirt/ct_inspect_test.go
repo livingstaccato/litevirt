@@ -24,7 +24,7 @@ func (m *ctInspectMock) InspectContainer(_ context.Context, in *pb.InspectContai
 	return &pb.ContainerDetail{
 		Container: &pb.Container{
 			HostName: "node-4", Name: "blct", State: "stopped", Image: "alpine:3.19",
-			CpuLimit: 2, MemoryMib: 512, Project: "acme",
+			CpuLimit: 2, MemoryMib: 512, Project: "acme", Privileged: true, Confinement: "legacy",
 			CreatedAt: "2026-10-08T12:43:00Z", UpdatedAt: "2026-10-08T12:50:00Z",
 		},
 		Privilege: "privileged", Distro: "alpine", Release: "3.19", Template: "download",
@@ -71,7 +71,7 @@ func TestCTInspect_Text(t *testing.T) {
 	}
 	for _, want := range []string{
 		"Name:", "blct", "Host:", "node-4", "State:", "stopped", "Image:", "alpine:3.19",
-		"Project:", "acme", "CPU limit:", "2", "Memory:", "512 MiB", "Privilege:", "privileged",
+		"Project:", "acme", "CPU limit:", "2", "Memory:", "512 MiB", "Privileged:", "yes (root in the container is root on the host", "Confinement:", "legacy",
 		"eth0", "lxtnet", "172.16.77.50/24", "/var/lib/lxc/blct/rootfs", "3.0 MiB",
 		"s1", "/srv/lxtrepo", "available on node-3", "/srv/lxtbk", "not found: repo /srv/lxtbk is not present on node-4",
 		"unknown: host node-5 could not be asked",

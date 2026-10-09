@@ -303,7 +303,7 @@ lv ct stop <name>
 lv ct rm <name>                                       # a stopped container; a running one is refused
 lv ct rm <name> --force                               # a running container: stopped, then deleted
 lv ct ls
-lv ct inspect <name> [--host <h>] [--size] [-o json]  # one container: limits, privilege, NICs, rootfs, snapshots, backups
+lv ct inspect <name> [--host <h>] [--size] [-o json]  # one container: limits, privilege, confinement, NICs, rootfs, snapshots, backups
 lv ct exec <name> -- <cmd> [args...]
 lv ct backup <name> --repo <dir>                       # full rootfs backup → dedup chunk store
 lv ct restore <name> --repo <dir> --timestamp <ts> [--start]  # rebuild from a backup manifest
@@ -315,7 +315,6 @@ lv ct snapshot rm <name> <snapshot>                    # delete a snapshot
 lv ct template <name> [--revert]                       # convert a stopped ct to a clone template
 lv ct clone <source> <new-name> [--project p] [--start] # full-copy clone with a fresh identity
 lv ct pull <image> --dest <name> [--project p]       # stage an OCI image; with --project only p (and Admin) may use it
-lv ct inspect <name> [--host h]                        # placement, limits, privilege mode, confinement
 lv ct convert <name> --unprivileged [--confinement default]  # stopped ct → an id range of its own
 lv ct convert <name> --confinement default|legacy      # change confinement (legacy: Admin only)
 lv ct convert <name>                                  # finish an interrupted convert (the start refusal names it)

@@ -12,40 +12,6 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 )
 
-// newCTInspectCmd shows one container, its security settings included.
-func newCTInspectCmd() *cobra.Command {
-	var host string
-	cmd := &cobra.Command{
-		Use:   "inspect <name>",
-		Short: "Show a container: placement, limits, privilege mode and confinement",
-		Args:  cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
-				resp, err := c.ListContainers(ctx, &pb.ListContainersRequest{HostName: host})
-				if err != nil {
-					return err
-				}
-				var found []*pb.Container
-				for _, ct := range resp.Containers {
-					if ct.Name == args[0] {
-						found = append(found, ct)
-					}
-				}
-				switch len(found) {
-				case 0:
-					return fmt.Errorf("container %q not found", args[0])
-				case 1:
-					writeContainerInspect(os.Stdout, found[0])
-					return nil
-				}
-				return fmt.Errorf("container %q exists on %d hosts; pass --host", args[0], len(found))
-			})
-		},
-	}
-	cmd.Flags().StringVar(&host, "host", "", "Owning host (default: resolve by name)")
-	return cmd
-}
-
 func writeContainerInspect(out io.Writer, ct *pb.Container) {
 	w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
 	defer w.Flush()
@@ -59,13 +25,17 @@ func writeContainerInspect(out io.Writer, ct *pb.Container) {
 	fmt.Fprintf(w, "Image:\t%s\n", ct.Image)
 	fmt.Fprintf(w, "CPU limit:\t%d\n", ct.CpuLimit)
 	fmt.Fprintf(w, "Memory (MiB):\t%d\n", ct.MemoryMib)
-	if ct.Privileged {
-		fmt.Fprintf(w, "Privileged:\tyes (root in the container is root on the host; move it: lv ct convert --unprivileged %s)\n", ct.Name)
-	} else {
-		fmt.Fprintf(w, "Privileged:\tno (ids %d-%d)\n", ct.IdmapBase, ct.IdmapBase+65535)
-	}
+	fmt.Fprintf(w, "Privileged:\t%s\n", privilegedText(ct))
 	fmt.Fprintf(w, "Confinement:\t%s\n", ct.Confinement)
 	fmt.Fprintf(w, "Created:\t%s\n", ct.CreatedAt)
+}
+
+// privilegedText is the Privileged: value of a container's record.
+func privilegedText(ct *pb.Container) string {
+	if ct.Privileged {
+		return "yes (root in the container is root on the host; move it: lv ct convert --unprivileged " + ct.Name + ")"
+	}
+	return fmt.Sprintf("no (ids %d-%d)", ct.IdmapBase, ct.IdmapBase+65535)
 }
 
 // newCTConvertCmd changes a stopped container's security settings in place.

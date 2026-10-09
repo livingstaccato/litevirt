@@ -41,7 +41,6 @@ func newCTCmd() *cobra.Command {
 		newCTSnapshotCmd(),
 		newCTTemplateCmd(),
 		newCTCloneCmd(),
-		newCTInspectCmd(),
 		newCTConvertCmd(),
 	)
 	return cmd

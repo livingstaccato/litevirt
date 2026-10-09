@@ -131,7 +131,8 @@ $ lv ct inspect web --size
 Name:       web
 Host:       node-3
 State:      running
-Privilege:  privileged
+Privileged:  no (ids 1065536-1131071)
+Confinement: default
 Rootfs:     /var/lib/lxc/web/rootfs (412.3 MiB)
 ...
 Backups:
@@ -140,10 +141,11 @@ Backups:
   offsite       2.1 MiB  2026-10-08T13:02:11Z  available on node-1
 ```
 
-The privilege mode is read from the container's LXC config on its host: a
-config with an `lxc.idmap` is unprivileged, one without is privileged. If that
-host does not answer, the cluster's view is shown and the host-local fields
-read unknown.
+The privilege mode and confinement come from the container's record. Its
+LXC config on its host is read as well (a config with an `lxc.idmap` is
+unprivileged, one without is privileged); when the two disagree, an
+`LXC config:` line shows what the host has. If that host does not answer, the
+cluster's view is shown and the host-local fields read unknown.
 
 Each backup entry is checked where it lives. A backup taken through another
 host's repository (a sink) or before a migration is not on the container's

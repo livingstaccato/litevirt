@@ -91,7 +91,11 @@ func printContainerDetail(d *pb.ContainerDetail) error {
 		mem = fmt.Sprintf("%d MiB", c.GetMemoryMib())
 	}
 	field("Memory", mem)
-	field("Privilege", d.GetPrivilege())
+	field("Privileged", privilegedText(c))
+	if hp := d.GetPrivilege(); hp != "" && hp != "unknown" && (hp == "privileged") != c.GetPrivileged() {
+		field("LXC config", hp)
+	}
+	field("Confinement", orDash(c.GetConfinement()))
 	if d.GetIsTemplate() {
 		field("Clone template", "yes")
 	}

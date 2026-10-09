@@ -73,10 +73,22 @@ func (c *Coordinator) relyOnPartitionPause(ctx context.Context, h *corrosion.Hos
 	return true
 }
 
+// reliesOnPauseIfAssumed is relyOnPartitionPause, decided BEFORE a fence of h
+// runs, and only for a host whose fence can come back assumed (the
+// best-effort strategy). It is read before the fence for the reason
+// fence_state_v1 is: until partition_pause_v1 latches its predicate runs a
+// live Ping sweep, and between a successful fence and the write that records
+// it, a leader that died or lost its lease in the sweep lost the record of a
+// fence that had happened.
+func (c *Coordinator) reliesOnPauseIfAssumed(ctx context.Context, h *corrosion.HostRecord) bool {
+	return fence.ResolveStrategy(h.FenceStrategy) == "best-effort" && c.relyOnPartitionPause(ctx, h)
+}
+
 // asSelfPause rewrites an assumed best-effort fence result as a self-pause
-// one when the pause may be relied on. Any other result is returned as is.
-func (c *Coordinator) asSelfPause(ctx context.Context, h *corrosion.HostRecord, fr fence.Result) fence.Result {
-	if !fr.Success || fr.Method != "best-effort-ssh" || !c.relyOnPartitionPause(ctx, h) {
+// one when the pause may be relied on (relied, decided before the fence by
+// reliesOnPauseIfAssumed). Any other result is returned as is.
+func asSelfPause(fr fence.Result, relied bool) fence.Result {
+	if !fr.Success || fr.Method != "best-effort-ssh" || !relied {
 		return fr
 	}
 	// The method stays best-effort-ssh, so an older coordinator reads the row

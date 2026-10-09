@@ -2,6 +2,7 @@ package failover
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -392,5 +393,97 @@ func TestFailover_AnUnverifiedFenceWritesItsStateOnce(t *testing.T) {
 	}
 	if got := hostState(t, db, ctx); got != "offline" {
 		t.Errorf("host state = %q, want offline", got)
+	}
+}
+
+// pingingGate is a gate whose Enforced, like health.Checker's before a token
+// latches, runs a live Ping sweep — recorded here — and whose Latched reads
+// memory.
+type pingingGate struct {
+	fakeFailoverGate
+	latched map[string]bool
+	pinged  *[]string
+}
+
+func (g pingingGate) Enforced(ctx context.Context, tok string) bool {
+	*g.pinged = append(*g.pinged, tok)
+	return g.latched[tok]
+}
+
+func (g pingingGate) Latched(tok string) bool { return g.latched[tok] }
+
+// The pre-fence fence_state_v1 read does not ping: a gate that can read its
+// latch from memory is asked that way, so no fence — a verified IPMI one
+// included — waits on a Ping sweep before it runs. The latched answer still
+// decides the state (offline for an SSH fence once latched).
+//
+// Mutation: read the latch with Enforced again — fence_state_v1 is pinged
+// and the test goes red.
+func TestFailover_TheFenceStateLatchIsReadWithoutAPing(t *testing.T) {
+	for _, tc := range []struct {
+		method  string
+		latched bool
+		want    string
+	}{{"ipmi", false, "fenced"}, {"ssh", true, "offline"}, {"ssh", false, "fenced"}} {
+		db, ctx := seedDownHost(t, tc.method, nil)
+		var pinged []string
+		c := newTestCoordinator("coordinator", db)
+		c.Gate = pingingGate{latched: map[string]bool{capabilities.FenceStateV1: tc.latched}, pinged: &pinged}
+		c.SetFencer(fencerReturning(tc.method, true))
+
+		c.run(ctx)
+
+		for _, tok := range pinged {
+			if tok == capabilities.FenceStateV1 {
+				t.Errorf("%s fence (latched=%v): %s was read with a Ping sweep (Enforced)", tc.method, tc.latched, tok)
+				break
+			}
+		}
+		if got := hostState(t, db, ctx); got != tc.want {
+			t.Errorf("%s fence (latched=%v): host state %q, want %q", tc.method, tc.latched, got, tc.want)
+		}
+	}
+}
+
+// Whether an assumed best-effort fence relies on the host's partition pause
+// is decided BEFORE the fence: until partition_pause_v1 latches, that
+// predicate runs a live Ping sweep, and between a successful fence and the
+// write that records it a leader that died or lost its lease in the sweep
+// lost the record of a fence that had happened.
+//
+// Mutation: decide it after the fence again (asSelfPause reading
+// relyOnPartitionPause) — the predicate is read after the fence and the test
+// goes red.
+func TestFailover_PartitionPauseRelianceIsDecidedBeforeTheFence(t *testing.T) {
+	db, ctx := seedDownHost(t, "best-effort", nil)
+	var events []string
+	c := newTestCoordinator("coordinator", db)
+	c.PartitionPauseEnforced = func(context.Context) bool {
+		events = append(events, "pause-read")
+		return false
+	}
+	c.SetFencer(func(context.Context, fence.HostConfig) fence.Result {
+		events = append(events, "fence")
+		return fence.Result{Method: "best-effort-ssh", Detail: "ssh failed; proceeding", Success: true}
+	})
+
+	c.run(ctx)
+
+	fenced := -1
+	for i, e := range events {
+		if e == "fence" {
+			fenced = i
+		}
+	}
+	if fenced < 0 {
+		t.Fatalf("fixture: the host was never fenced (events %v)", events)
+	}
+	for _, e := range events[fenced+1:] {
+		if e == "pause-read" {
+			t.Errorf("the partition-pause predicate was read after the fence, between it and its record: %v", events)
+		}
+	}
+	if !slices.Contains(events[:fenced], "pause-read") {
+		t.Errorf("the partition-pause predicate was never read before the best-effort fence: %v", events)
 	}
 }

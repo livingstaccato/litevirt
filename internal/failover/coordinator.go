@@ -2193,6 +2193,9 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) (fe
 	// capActivationTimeout), and a leader that died or lost its lease in that
 	// gap lost the record of a fence that had happened.
 	latched := c.fenceStateLatched(ctx)
+	// Whether an assumed best-effort fence relies on the host's partition
+	// pause is decided here too, for the same reason (reliesOnPauseIfAssumed).
+	pauseRelied := c.reliesOnPauseIfAssumed(ctx, h)
 
 	leaseLeft, ok := c.holdLeaseAtLeast(ctx, minFenceLease)
 	if !ok {
@@ -2225,7 +2228,7 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) (fe
 	// self-pause when this coordinator relies on the host's partition pause
 	// (docs/design/partition-pause.md §4.2): same row shape, assurance
 	// self_paused, and recoverFenced then waits out the pause.
-	fr = c.asSelfPause(ctx, h, fr)
+	fr = asSelfPause(fr, pauseRelied)
 
 	logResult := fr.LogResult()
 	if !fr.Success {
@@ -2365,8 +2368,30 @@ func fenceRecordState(h *corrosion.HostRecord, fr fence.Result, latched bool) st
 // fenceStateLatched reports whether fence_state_v1 has latched: every node
 // that can hold the failover lease resumes from an unverified fence recorded
 // 'offline'. A nil Gate (tests without the split-brain gate wired) has not.
+//
+// It reads the latch WITHOUT pinging when the gate can (LatchReader;
+// *health.Checker can): until the token latches, Enforced runs a live Ping
+// sweep of every activation target, up to capActivationTimeout, and that
+// would sit in front of every fence, a verified IPMI one included. The HA
+// monitor's capability driver forms the latch in the background, so a stale
+// false only records the legacy 'fenced' for an unverified fence — the safe
+// direction. A gate that cannot read a latch without pinging is asked
+// Enforced, as before.
 func (c *Coordinator) fenceStateLatched(ctx context.Context) bool {
-	return c.Gate != nil && c.Gate.Enforced(ctx, capabilities.FenceStateV1)
+	if c.Gate == nil {
+		return false
+	}
+	if lr, ok := c.Gate.(LatchReader); ok {
+		return lr.Latched(capabilities.FenceStateV1)
+	}
+	return c.Gate.Enforced(ctx, capabilities.FenceStateV1)
+}
+
+// LatchReader is a gate that can report a token's latch from memory, without
+// a Ping (health.Checker.Latched). The coordinator finds it by type assertion
+// on its Gate; internal/daemon pins that *health.Checker implements it.
+type LatchReader interface {
+	Latched(token string) bool
 }
 
 // legacyFenceProvedOff is the rule a coordinator before fence_state_v1 used to

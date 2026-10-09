@@ -243,3 +243,46 @@ func TestRestoreContainerFromBackup_UnreadableRelocatingRowStillRestores(t *test
 		t.Fatalf("got (%v, %v) restoring %q; want the backup at 2026-06-27T12:00:00Z restored (RestoreLanded)", outcome, err, gotTs)
 	}
 }
+
+// putCTManifestNoProject writes a container backup manifest whose embedded
+// spec records no project, as a build from before projects did.
+func putCTManifestNoProject(t *testing.T, dir, name, ts string) {
+	t.Helper()
+	repo, err := pbsstore.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec, _ := json.Marshal(containerBackupSpec{Name: name})
+	if _, err := pbsstore.PushDisk(context.Background(), repo, strings.NewReader("rootfs-tar-noproject-"+name), pbsstore.PushOptions{
+		VMName: name, DiskName: containerBackupDisk, Timestamp: ts, ContainerSpecJSON: string(spec),
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Inspect reads a manifest that records no project as the default
+// project's, as it did before the lineage rule: available to a _default
+// container, another project's (admin-only) to any other.
+func TestProbeContainerBackups_NoProjectManifestIsTheDefaultProjects(t *testing.T) {
+	s := newPeerAuthServer(t)
+	repo := ctTestRepo(t)
+	putCTManifestNoProject(t, repo, "ct1", "2026-10-08T09:00:00Z")
+	for _, c := range []struct {
+		project             string
+		attributed, foreign bool
+	}{
+		{"", true, false},
+		{"_default", true, false},
+		{"acme", false, true},
+	} {
+		resp, err := s.ProbeContainerBackups(mtlsAdminCtx("peer-1"), &pb.ProbeContainerBackupsRequest{
+			Name: "ct1", Project: c.project, OwnerId: "own-1", Repos: []string{repo}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := resp.GetResults()[0]
+		if p.GetAttributed() != c.attributed || p.GetForeign() != c.foreign || p.GetOtherLineage() {
+			t.Fatalf("project %q: probe = %+v, want attributed=%v foreign=%v", c.project, p, c.attributed, c.foreign)
+		}
+	}
+}

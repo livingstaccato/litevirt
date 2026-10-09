@@ -81,7 +81,8 @@ func (s *Server) ProbeContainerBackups(ctx context.Context, req *pb.ProbeContain
 // manifest and ownerID carry one. Manifests of the name in other projects make
 // the repo foreign as well; same-project manifests of another lineage are
 // reported as other_lineage. An empty ownerID (an older peer asking) matches
-// by project, as before. The work is bounded: it waits for a probe slot only
+// by project, as before, and a manifest recording no project is the default
+// project's. The work is bounded: it waits for a probe slot only
 // until ctx ends, stops the walk when ctx ends, and reuses a recent read of
 // the same repo and name.
 func (s *Server) probeContainerBackupRepo(ctx context.Context, name, project, ownerID, repo string) *pb.ContainerBackupProbe {
@@ -121,12 +122,15 @@ func (s *Server) probeContainerBackupRepo(ctx context.Context, name, project, ow
 		if json.Unmarshal([]byte(m.ContainerSpecJSON), &spec) != nil {
 			continue
 		}
+		// A manifest that records no project is the default project's
+		// here, as it was before the lineage rule (failover, which matches
+		// it by name, is deliberately looser).
+		if tenancy.NormalizeProject(spec.Project) != want {
+			out.Foreign = true
+			continue
+		}
 		if !manifestOwnedBy(m, owner) {
-			if tenancy.NormalizeProject(spec.Project) != want {
-				out.Foreign = true
-			} else {
-				out.OtherLineage = true
-			}
+			out.OtherLineage = true
 			continue
 		}
 		out.Attributed = true

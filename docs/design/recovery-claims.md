@@ -1181,9 +1181,13 @@ node-local grant tables and the voter incarnation.
   with the follow-up, `lv host rm --dead` and
   `lv cluster voter force-reconfigure` (§3.12, §4.6). Each is a decided change, so every node
   moves at the same generation. `reset` is the full exit back to the derived
-  set. A host rolled back below this build after the token has latched enters
-  WAL quarantine, as for every latched token, whether or not a config exists.
-  That note is beside the declaration, above `capabilities.supported`.
+  set. A host rolled back below the build that introduced the token, after it
+  has latched, enters WAL quarantine, as for every latched token, whether or
+  not a config exists. That note is beside the declaration, above
+  `capabilities.supported`. WAL quarantine applies only to a binary that does
+  not know a latched token's name; it does not cover a host rolled back to a
+  build that knows `recovery_claim_v1` but reads `enforcement.recovery_claim`
+  differently (§5.6).
 
 **`recovery_claim_v1`** (`capabilities.RecoveryClaimV1`) covers
 enforcement: coordinators claiming before they mint, and destinations
@@ -1240,8 +1244,9 @@ over:
 - **Witnesses.** A witness with the flag off would hold the latch off fleet-wide.
   For the fence token that is a trap, because a witness has no role in fencing.
   Here a witness runs a failover coordinator like every node (§1.1), and a
-  flag-off coordinator mints uncertified proofs, so its operator must opt in,
-  and holding the latch off until then is correct. Its role as a *voter* needs
+  flag-off coordinator mints uncertified proofs. A witness has the flag on by
+  default like any host; an explicit `false` there holds the latch off
+  fleet-wide, which is correct. Its role as a *voter* needs
   no opt-in: that is `voter_config_v1`, which is mandatory.
 - **Nodes mid-rollout stop enforcing.** For this token there is nothing to lose
   before the latch. Enforcement partway through a rollout is unsafe (the example
@@ -1303,8 +1308,10 @@ over:
 ### 5.5 What happens on upgrade
 
 The flag defaults on, so an upgrade needs no config change. Nothing is enforced
-until every host runs a build that defaults it on, because an older build never
-advertises the token and the latch needs every host's advertisement.
+until every host advertises the token, which a host on this build does by
+default and a host on an older build does only with an explicit
+`enforcement.recovery_claim: true`; the latch needs every host's
+advertisement.
 
 1. Roll every host to a build with the claim protocol, one at a time. Run
    `lv doctor fence` and confirm the fence posture is what you expect. Mid-roll
@@ -1314,7 +1321,7 @@ advertises the token and the latch needs every host's advertisement.
    and its members. If `ha.voter.genesis_pending` persists, clear what it
    names, or run `lv cluster voter init --members` for a cluster that cannot
    become clean.
-3. `recovery_claim_v1` then latches. `lv doctor` shows it, and `not_enforcing`
+3. `recovery_claim_v1` then latches. `lv doctor fence` shows it, and `not_enforcing`
    is empty everywhere. The next failover is claim-gated.
 4. Validate with a partition drill before relying on it (§7.3), in the same
    spirit as the operator note in `capabilities.supported`.
@@ -1346,6 +1353,16 @@ The kill switch follows the reversible `configFlag && latch` model described in
   One workload held by `ha.claim.legacy_held` behind a proof stuck in flight
   on a live destination is released on its own with
   `lv cluster claim-release <kind>/<name>` (§10 item 37), not by a stand-down.
+- **Rollback is a stand-down on that host.** The build before this default
+  knows `recovery_claim_v1`, so a host rolled back to it after the latch is
+  **not** WAL-quarantined, and that build reads a config without the key as
+  `false`. The same holds for a host that missed the roll and rejoins on the
+  older build. Either is the partial stand-down above. Before rolling a host
+  back or bringing one back on an older build, add
+  `enforcement.recovery_claim: true` explicitly to its config, which the older
+  build honours. Clusters founded with `lv host init` on this build carry the
+  explicit key. `lv doctor fence` warns when the token has latched and any
+  reachable host does not enforce it.
 - **The voter config is not part of the stand-down.** It is a fact the cluster
   agreed on, and `VoterSet` reads it whatever the flag says (§4.5, §9, Q4). The
   fence quorum and recovery quorum keep counting the explicit set. A voter set

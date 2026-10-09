@@ -241,6 +241,11 @@ reviewed, but no rollout has yet driven a real panic-loop through it on a live
 host. Treat the behaviour above as **expected**, not verified, and check the
 journals rather than assuming it ran.
 
+**Before relying on the auto-rollback after `recovery_claim_v1` has latched**,
+make sure every host's config sets `enforcement.recovery_claim: true`
+explicitly: the previous build reads a missing key as `false`, and it is not
+WAL-quarantined for it (see *Recovery claims latch after the roll* below).
+
 **Restoring `.old` restores the previous binary's behaviour in full** — including
 any limitations that build had. A rollback is a return to a known state, not a
 repair: whatever the older binary refused, mis-handled or did not yet implement,
@@ -755,8 +760,9 @@ needs no config change, and an explicit `false` still wins. Builds before this
 default had it off, and turning claims on was an operator step. What happens
 now:
 
-1. During the roll nothing changes. A host on the previous build never
-   advertises the token, so it cannot latch. Each upgraded host reports
+1. During the roll nothing changes. A host on the previous build advertises
+   the token only if its config sets `enforcement.recovery_claim: true`
+   explicitly, so on a cluster that never set the key it cannot latch. Each upgraded host reports
    `litevirt_ha_degraded{reason="unsupported_member"}` until the last host is
    upgraded, as for `partition_pause_v1`.
 2. After the last host restarts, `voter_config_v1` latches and genesis
@@ -781,9 +787,31 @@ mint uncertified proofs and destinations accept them, exactly the pre-claim
 behaviour; voters keep answering and keep their history, and the voter set does
 not move. A flag off on only some hosts is not a degraded mode but the hazard
 the token exists to prevent — such a host reports `recovery_claim_v1` in
-`PingResponse.not_enforcing` and its peers raise `ha_degraded`. A binary rolled
-back below the latched token enters WAL quarantine, as below every latched
-token.
+`PingResponse.not_enforcing` and its peers raise `ha_degraded`. A host left
+on an explicit `false` while the others keep the default holds the latch off
+and keeps `ha_degraded{reason="unsupported_member"}` raised on **every other
+host** for as long as it stays that way: opt out on every host, or on none.
+Alerting on `unsupported_member` also fires for the length of every roll.
+
+Once enforced, two stalls surface only as a reason on the gate-refusal metric
+and a WARN log, not as a health condition: `recovery_claim_owner_reachable` (a
+host most voters still reach is not recovered) and `recovery_claim_no_majority`
+(no majority of the voter set certified the claim, an exact half included).
+`lv cluster claim <kind>/<name>` shows each voter's answer; the unblocks are in
+[design/recovery-claims.md](design/recovery-claims.md) §6.
+
+**Rolling a host back, or rejoining one, after the latch.** WAL quarantine does
+**not** cover this token. The build before this default already knows
+`recovery_claim_v1`, so the rollback preflight finds nothing to quarantine,
+and that build reads a config **without** the key as `false`. A host rolled
+back to it — by hand or by the auto-rollback below — or a host that was offline
+through the roll and rejoins on it, therefore mints and runs recovery proofs
+without a certificate: the second owner the token exists to prevent. Before
+rolling a host back to an older build, or bringing back one that missed the
+roll, add `enforcement.recovery_claim: true` **explicitly** to its config; the
+older build honours an explicit key. Clusters founded with `lv host init` on
+this build already carry the explicit key. `lv doctor fence` warns when the
+token has latched and any host does not enforce it, and names the host.
 
 ## Schema upgrades: `litevirt schema-migrate`
 

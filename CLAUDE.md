@@ -136,8 +136,10 @@ Hardening features are gated on cluster-wide capability tokens
     certificate before it mints a reschedule, promote or relocate proof, and
     the destination verifies it before it executes. Every node relies on its
     peers doing both, so the token is withheld while the flag is off, and it
-    latches only after every host runs a build that defaults it on
-    (docs/design/recovery-claims.md §5.1, §5.5).
+    latches only once every host advertises it: on this build by default, on
+    an older one only with an explicit `true`. That older build is not
+    WAL-quarantined after a rollback and reads a missing key as false
+    (docs/design/recovery-claims.md §5.1, §5.5, §5.6).
 - **advertising is not enforcing.** Most tokens are advertised on the strength
   of the BUILD, whatever the local flag says, so the cluster can latch them —
   the node's own flag then decides whether it acts. A latched token therefore

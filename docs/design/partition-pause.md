@@ -264,7 +264,7 @@ in this order:
      absent;
    - the voter's own **row** for the workload names this host, at the recorded
      owner epoch and incarnation. This is the check that holds with recovery
-     claims off (the default), after `lv host undrain` has cleared the fenced
+     claims off (an explicit `false`, or before `recovery_claim_v1` latches), after `lv host undrain` has cleared the fenced
      state while the replacement runs, and when the majority moved the
      workload to an epoch the minority never saw;
    - that voter has accepted no recovery-claim value for this workload at the

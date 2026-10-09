@@ -609,6 +609,27 @@ warning on permanently.
 
 Exit code: `0` when no shared-disk VM is exposed · `1` when one or more are.
 
+### Recovery-claim posture
+
+The same sweep reports each host's recovery-claim posture
+(`enforcement.recovery_claim`, default on; see
+[design/recovery-claims.md](design/recovery-claims.md)), witnesses included,
+since a witness runs a failover coordinator too, and whether
+`recovery_claim_v1` has latched on the queried node. Unlike the fence token,
+`recovery_claim_v1` is withheld while a host's flag is off, so a host that
+answers with other tokens but not this one is reported `NOT enforcing`: its
+flag is off, or it cannot vote durably yet.
+
+When the token has latched and any **reachable** host is not enforcing, the
+command prints a WARNING naming each one with the fix: add
+`enforcement.recovery_claim: true` explicitly to that host's config and restart
+it. The usual cause is a host rolled back to an older build, or one that missed
+the roll and rejoined on one. That build reads a missing key as `false`, and it
+knows the token, so it is not WAL-quarantined. It mints and runs recovery
+proofs without a certificate. An unreachable host is listed as `unknown` and
+does not raise the warning. The warning is diagnostic only and does not change
+the exit code.
+
 ### What a fence established
 
 `lv doctor fence` also lists the fences of the last 7 days (newest 20), each

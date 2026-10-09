@@ -79,8 +79,8 @@ type Config struct {
 	// the only stand-down — never delete marker files). All default false except
 	// audit_signature, partition_pause and recovery_claim (see their
 	// EnforcementConfig fields for why); the
-	// build still ADVERTISES the tokens (capabilities.supported) so the cluster can
-	// latch, but nothing enforces until the operator opts in. (The strict-mTLS /
+	// build still ADVERTISES most tokens (capabilities.supported) so the cluster
+	// can latch, but nothing enforces until the flag is on. (The strict-mTLS /
 	// forwarded-identity switches live under Auth for historical reasons.)
 	Enforcement EnforcementConfig `yaml:"enforcement"`
 
@@ -605,9 +605,15 @@ type EnforcementConfig struct {
 	// wins). Without it two coordinators that each believe they lead can each
 	// mint a proof for the same workload (colonelpanik/litevirt#250), and
 	// partition pause's settle-back has no certified copy to settle to. The
-	// default changes nothing mid-roll: an older build never advertises the
-	// token, so it latches only after every host runs a build that defaults
-	// it on, and enforcement waits for an adopted voter generation too.
+	// default changes nothing mid-roll: an older build advertises the token
+	// only with an explicit `true`, so on a cluster that never set the key it
+	// latches only after every host runs a build that defaults it on, and
+	// enforcement waits for an adopted voter generation too.
+	//
+	// The default is this build's alone. An older build knows the token (so a
+	// host rolled back to it after the latch is NOT WAL-quarantined) and reads
+	// a missing key as false: write `recovery_claim: true` explicitly before a
+	// rollback. newClusterEnforcement writes it for every new cluster.
 	//
 	// An explicit false is the kill switch: turning it off everywhere and
 	// restarting returns recovery to the pre-claim behaviour; voters keep

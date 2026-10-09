@@ -22,11 +22,12 @@ import (
 //
 // voter_config_v1 is the voter side and runs whatever this file says: once a
 // voter generation is adopted every member answers Prepare / Accept. This file
-// is the opt-in that makes anybody RELY on the answers — coordinators claiming
+// is the flag (enforcement.recovery_claim, default on) that makes anybody RELY
+// on the answers — coordinators claiming
 // before they mint, destinations verifying before they execute.
 
 // SetRecoveryClaimEnforce wires enforcement.recovery_claim. It is both the
-// opt-in that lets recovery_claim_v1 be advertised and the reversible kill
+// flag that lets recovery_claim_v1 be advertised and the reversible kill
 // switch once it has latched.
 func (s *Server) SetRecoveryClaimEnforce(on bool) { s.enfRecoveryClaim = on }
 

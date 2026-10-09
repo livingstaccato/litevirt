@@ -751,8 +751,11 @@ writable owners of one VM (colonelpanik/litevirt#250). With
 defaults on, so a config without the key counts) and the `recovery_claim_v1`
 token latched, a recovery is a claim decided by the explicit voter set before
 anything is minted ([design/recovery-claims.md](design/recovery-claims.md)).
-The token latches by itself once every host runs a build that defaults it on
-and voter genesis has run (docs/upgrades.md); an explicit
+The token latches by itself once every host advertises it — by default on
+this build, only with an explicit `true` on an older one — and enforcement
+starts once voter genesis has run (docs/upgrades.md). A host rolled back to an
+older build after the latch is not WAL-quarantined and reads a missing key as
+false, so write the key explicitly before a rollback. An explicit
 `enforcement.recovery_claim: false` on every host is the stand-down:
 
 - **Claim before mint.** After the fence, the coordinator proposes the

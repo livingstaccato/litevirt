@@ -251,6 +251,9 @@ func TestRestoreSnapshot_AnUnrecordedDiskPathStillRecordsTheRunningVM(t *testing
 	if err := corrosion.UpdateVMState(adminCtx(), s.db, "rs", "stopped", ""); err != nil {
 		t.Fatal(err)
 	}
+	if err := corrosion.InsertHost(adminCtx(), s.db, corrosion.HostRecord{Name: s.hostName, Address: "10.0.0.1", State: "active"}); err != nil {
+		t.Fatal(err)
+	}
 	fake.OnRevertSnapshot = func(domain, snap string) {
 		fake.SetFailDomainDiskSources(func(string) error { return errors.New("libvirt connection lost") })
 	}
@@ -304,5 +307,64 @@ func TestRestoreSnapshot_ARefusalIsLoggedAtWarn(t *testing.T) {
 	log := buf.String()
 	if !strings.Contains(log, "level=WARN") || !strings.Contains(log, "vm=rs") || !strings.Contains(log, "snapshot=s1") {
 		t.Fatalf("no WARN naming the VM and snapshot in the log:\n%s", log)
+	}
+}
+
+// Re-review R4-M4: the background disk-path retry writes this host's live
+// paths into the VM's replicated record, so it must stop — touching
+// nothing — once this host no longer owns the VM: moved to another host
+// (a failover in the retry window, with a stale domain still here),
+// deleted, or this host fenced.
+func TestRestoreSnapshot_TheBackgroundPathRetryStopsWhenTheVMIsNotHere(t *testing.T) {
+	for _, tc := range []string{"moved", "deleted", "this host fenced"} {
+		t.Run(tc, func(t *testing.T) {
+			oldEvery, oldFor := pathRecordRetryEvery, pathRecordRetryFor
+			pathRecordRetryEvery, pathRecordRetryFor = 20*time.Millisecond, 600*time.Millisecond
+			t.Cleanup(func() { pathRecordRetryEvery, pathRecordRetryFor = oldEvery, oldFor })
+
+			s := lockTestServer(t)
+			fake := seedRestorableVM(t, s, "disk")
+			if err := corrosion.InsertHost(adminCtx(), s.db, corrosion.HostRecord{Name: s.hostName, Address: "10.0.0.1", State: "active"}); err != nil {
+				t.Fatal(err)
+			}
+			const recorded = "/var/lib/litevirt/disks/rs-root.qcow2"
+			if err := corrosion.InsertDisk(adminCtx(), s.db, corrosion.DiskRecord{VMName: "rs", DiskName: "root", HostName: s.hostName,
+				Path: recorded, StorageType: "local", DeviceKind: "disk", DeleteWithVM: true}); err != nil {
+				t.Fatal(err)
+			}
+			fake.OnRevertSnapshot = func(domain, snap string) {
+				fake.SetFailDomainDiskSources(func(string) error { return errors.New("libvirt connection lost") })
+			}
+			if _, err := s.RestoreSnapshot(adminCtx(), &pb.RestoreSnapshotRequest{VmName: "rs", SnapshotName: "s1"}); err == nil {
+				t.Fatal("setup: the restore recorded the path")
+			}
+			switch tc {
+			case "moved":
+				if err := corrosion.UpdateVMHost(adminCtx(), s.db, "rs", "host-b", "running"); err != nil {
+					t.Fatal(err)
+				}
+			case "deleted":
+				if err := corrosion.DeleteVM(adminCtx(), s.db, "rs"); err != nil {
+					t.Fatal(err)
+				}
+			case "this host fenced":
+				if err := corrosion.UpdateHostState(adminCtx(), s.db, s.hostName, "fenced"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			fake.SetFailDomainDiskSources(nil) // the live sources would now be read and recorded
+			time.Sleep(900 * time.Millisecond)
+			evs, _ := corrosion.ListVMEvents(adminCtx(), s.db, "rs", 50, "")
+			for _, e := range evs {
+				if e.Type == "snapshot.restore-path-recorded" {
+					t.Fatalf("the retry recorded the path of a VM this host no longer owns (%s)", tc)
+				}
+			}
+			if tc != "deleted" {
+				if d, _ := corrosion.GetVMDisks(adminCtx(), s.db, "rs"); len(d) != 1 || d[0].Path != recorded {
+					t.Fatalf("the retry wrote the record of a VM this host no longer owns: %+v", d)
+				}
+			}
+		})
 	}
 }

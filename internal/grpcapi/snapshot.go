@@ -522,6 +522,17 @@ func (s *Server) recordRestoredDiskPath(vmName, snapshotName string) {
 	for time.Now().Before(deadline) {
 		time.Sleep(pathRecordRetryEvery)
 		unlock := s.lockVM(vmName)
+		// Only while this host still owns the VM, and is itself an active
+		// member: after a failover, a delete or this host's fence, its live
+		// paths are not the VM's, and must not be written into the
+		// replicated record (re-review R4-M4). Checked under the lock, each
+		// attempt; anything that cannot be read stops the retry too.
+		if why := s.notOwnedHere(ctx, vmName); why != "" {
+			unlock()
+			slog.Warn("snapshot restore: stopping the disk-path retry; the VM is not this host's to record",
+				"vm", vmName, "snapshot", snapshotName, "why", why)
+			return
+		}
 		err := s.reconcileDiskPathsErr(ctx, vmName)
 		unlock()
 		if err == nil {
@@ -533,6 +544,30 @@ func (s *Server) recordRestoredDiskPath(vmName, snapshotName string) {
 	slog.Error("snapshot restore: disk path still not recorded; take a snapshot to record it", "vm", vmName, "snapshot", snapshotName)
 	s.recordVMEvent(ctx, vmName, "snapshot.restore-path-unrecorded", "error",
 		"retries ended; `lv snapshot create "+vmName+" <name>` records the path — do not migrate or redefine the VM until it is")
+}
+
+// notOwnedHere says why vmName is not this host's to record, or "": its row
+// is gone or names another host, or this host is not an active member.
+func (s *Server) notOwnedHere(ctx context.Context, vmName string) string {
+	vm, err := corrosion.GetVM(ctx, s.db, vmName)
+	switch {
+	case err != nil:
+		return "its row cannot be read: " + err.Error()
+	case vm == nil:
+		return "it was deleted"
+	case vm.HostName != s.hostName:
+		return "it is on " + vm.HostName
+	}
+	h, err := corrosion.GetHost(ctx, s.db, s.hostName)
+	switch {
+	case err != nil:
+		return "this host's row cannot be read: " + err.Error()
+	case h == nil:
+		return "this host has no row"
+	case h.State != "active":
+		return "this host is " + h.State
+	}
+	return ""
 }
 
 // RestoreWarningHeader is the response header RestoreSnapshot says, on a

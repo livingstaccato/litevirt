@@ -267,7 +267,7 @@ func TestComposeCreate_ANewPrivilegedMemberNeedsAdmin(t *testing.T) {
 		seedSecCT(t, s, rt, name, "stopped", spec)
 		if err := corrosion.UpsertContainer(context.Background(), s.db, corrosion.ContainerRecord{
 			HostName: "host-a", Name: name, State: "stopped", Project: "acme", Image: "alpine:3.22",
-			CreateSpec: corrosion.EncodeCreateSpec(spec)}); err != nil {
+			Labels: map[string]string{corrosion.LabelStack: "st"}, CreateSpec: corrosion.EncodeCreateSpec(spec)}); err != nil {
 			t.Fatal(err)
 		}
 		upd := planner.VMAction{Kind: planner.OpUpdate, VMName: name, TargetHost: "host-a", IsContainer: true}

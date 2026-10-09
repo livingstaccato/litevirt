@@ -20,9 +20,15 @@ import (
 // seedRecreateCT records container name on host with the given image and spec.
 func seedRecreateCT(t *testing.T, s *Server, host, name, image string, spec corrosion.ContainerCreateSpec) {
 	t.Helper()
+	seedStackCT(t, s, "st", host, name, image, spec)
+}
+
+// seedStackCT records container name on host as a member of stack.
+func seedStackCT(t *testing.T, s *Server, stack, host, name, image string, spec corrosion.ContainerCreateSpec) {
+	t.Helper()
 	if err := corrosion.UpsertContainer(context.Background(), s.db, corrosion.ContainerRecord{
 		HostName: host, Name: name, State: "stopped", Project: "acme", Image: image,
-		Labels: map[string]string{corrosion.LabelStack: "st"}, CreateSpec: corrosion.EncodeCreateSpec(spec),
+		Labels: map[string]string{corrosion.LabelStack: stack}, CreateSpec: corrosion.EncodeCreateSpec(spec),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -42,8 +48,8 @@ func TestComposeRecreate_AJudgmentNeverReachesAnotherRecreate(t *testing.T) {
 	s, rt := secServer(t)
 	carl := carlCtx(t, s)
 	seedSecCT(t, s, rt, "web", "stopped", corrosion.ContainerCreateSpec{})
-	seedRecreateCT(t, s, "host-a", "web", "alpine:3.22", unprivilegedSpec(s, "3.22"))
-	seedRecreateCT(t, s, "host-b", "web", "alpine:3.22", corrosion.ContainerCreateSpec{Template: "download", Distro: "alpine", Release: "3.22", Arch: "amd64"})
+	seedStackCT(t, s, "a", "host-a", "web", "alpine:3.22", unprivilegedSpec(s, "3.22"))
+	seedStackCT(t, s, "b", "host-b", "web", "alpine:3.22", corrosion.ContainerCreateSpec{Template: "download", Distro: "alpine", Release: "3.22", Arch: "amd64"})
 	fA := &compose.File{Name: "a", VMs: map[string]compose.VMDef{"web": {Kind: compose.WorkloadKindLXC, Image: "alpine:3.23"}}}
 	fB := &compose.File{Name: "b", VMs: map[string]compose.VMDef{"web": {Kind: compose.WorkloadKindLXC, Image: "alpine:3.22"}}}
 	updA := planner.VMAction{Kind: planner.OpUpdate, VMName: "web", TargetHost: "host-a", IsContainer: true}
@@ -179,6 +185,98 @@ func TestComposeRecreate_ANewOptOutNeedsAdminEvenWithExec(t *testing.T) {
 	upd := planner.VMAction{Kind: planner.OpUpdate, VMName: "web", TargetHost: "host-a", IsContainer: true}
 	if err := recreateMember(carl, s, upd, f); status.Code(err) != codes.PermissionDenied {
 		t.Fatalf("privileged recreate of an unprivileged member by a ct.exec holder: %v, want PermissionDenied", err)
+	}
+	memberExists(t, s, rt)
+}
+
+// mainEraSpec is a main-era member's create spec: privileged, legacy.
+func mainEraSpec() corrosion.ContainerCreateSpec {
+	return corrosion.ContainerCreateSpec{Template: "download", Distro: "alpine", Release: "3.22", Arch: "amd64"}
+}
+
+// Review C1-R: a recreate on host-a is judged by host-a's member alone. A
+// same-named privileged member on host-b — even of this stack — never donates
+// its mode: with no member on host-a the container is created afresh,
+// unprivileged, as the stack file states.
+func TestComposeRecreate_AnotherHostsMemberNeverDonates(t *testing.T) {
+	s, rt := secServer(t)
+	carl := carlCtx(t, s)
+	seedStackCT(t, s, "st", "host-b", "web", "alpine:3.22", mainEraSpec())
+	f := &compose.File{Name: "st", VMs: map[string]compose.VMDef{"web": {Kind: compose.WorkloadKindLXC, Image: "alpine:3.22"}}}
+	upd := planner.VMAction{Kind: planner.OpUpdate, VMName: "web", TargetHost: "host-a", IsContainer: true}
+	dec, err := s.judgeContainerRecreate(carl, upd, f)
+	if err != nil {
+		t.Fatalf("judge: %v", err)
+	}
+	if dec != nil {
+		t.Fatalf("host-a's recreate was judged from host-b's member: %+v", dec)
+	}
+	if err := recreateMember(carl, s, upd, f); err != nil {
+		t.Fatalf("recreate: %v", err)
+	}
+	if last := rt.createCalls[len(rt.createCalls)-1]; last.IDMapBase == 0 || last.Confinement != lxc.ConfinementDefault {
+		t.Fatalf("host-a's container was created as %+v: it took host-b's privilege", last)
+	}
+}
+
+// The create applies a decision only when it judged the member on the host
+// the create targets: a decision about host-b's member carries nothing to a
+// create on host-a.
+func TestComposeRecreate_ADecisionForAnotherHostCarriesNothing(t *testing.T) {
+	s, rt := secServer(t)
+	carl := carlCtx(t, s)
+	seedStackCT(t, s, "st", "host-b", "web", "alpine:3.22", mainEraSpec())
+	f := &compose.File{Name: "st", VMs: map[string]compose.VMDef{"web": {Kind: compose.WorkloadKindLXC, Image: "alpine:3.22"}}}
+	updB := planner.VMAction{Kind: planner.OpUpdate, VMName: "web", TargetHost: "host-b", IsContainer: true}
+	decB, err := s.judgeContainerRecreate(carl, updB, f)
+	if err != nil || decB == nil {
+		t.Fatalf("judge B: %+v %v", decB, err)
+	}
+	updA := planner.VMAction{Kind: planner.OpUpdate, VMName: "web", TargetHost: "host-a", IsContainer: true}
+	if err := s.deployCreatePlanned(withRecreateDecision(carl, decB), updA, f); err != nil {
+		t.Fatalf("create on host-a: %v", err)
+	}
+	if last := rt.createCalls[len(rt.createCalls)-1]; last.IDMapBase == 0 {
+		t.Fatalf("host-a's container was created as %+v from host-b's decision", last)
+	}
+}
+
+// A container on the target host that is not this stack's member (another
+// stack's, by the label compose down deletes by) never donates its mode, and
+// is not deleted by this stack's recreate: refused before the delete.
+func TestComposeRecreate_AnotherStacksContainerIsNotRecreated(t *testing.T) {
+	s, rt := secServer(t)
+	carl := carlCtx(t, s)
+	seedSecCT(t, s, rt, "web", "stopped", corrosion.ContainerCreateSpec{})
+	seedStackCT(t, s, "other", "host-a", "web", "alpine:3.22", mainEraSpec())
+	f := &compose.File{Name: "st", VMs: map[string]compose.VMDef{"web": {Kind: compose.WorkloadKindLXC, Image: "alpine:3.22"}}}
+	upd := planner.VMAction{Kind: planner.OpUpdate, VMName: "web", TargetHost: "host-a", IsContainer: true}
+	if err := recreateMember(carl, s, upd, f); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("recreate of another stack's container: %v, want FailedPrecondition", err)
+	}
+	memberExists(t, s, rt)
+	if len(rt.createCalls) != 0 {
+		t.Fatalf("a container was created: %+v", rt.createCalls)
+	}
+}
+
+// Review M3: the reading host's own template check (protected places, the
+// daemon's state) runs with the recreate's judgment when this host is the
+// one that reads it, so a member whose recorded path is now refused is
+// refused before its delete, never after.
+func TestComposeRecreate_AProtectedTemplateIsRefusedBeforeTheDelete(t *testing.T) {
+	s, rt := secServer(t)
+	carl := carlCtx(t, s)
+	path := filepath.Join(s.dataDir, "images", "ct-root")
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	seedSecCT(t, s, rt, "web", "stopped", corrosion.ContainerCreateSpec{})
+	seedStackCT(t, s, "st", "host-a", "web", path, corrosion.ContainerCreateSpec{Template: path, Arch: "amd64"})
+	f := &compose.File{Name: "st", VMs: map[string]compose.VMDef{"web": {Kind: compose.WorkloadKindLXC, Image: path, CPU: 4}}}
+	upd := planner.VMAction{Kind: planner.OpUpdate, VMName: "web", TargetHost: "host-a", IsContainer: true}
+	if err := recreateMember(carl, s, upd, f); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("recreate from a template in the daemon's state: %v, want InvalidArgument", err)
 	}
 	memberExists(t, s, rt)
 }

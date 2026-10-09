@@ -265,10 +265,17 @@ container exists, records a `ct.recreate-security` audit event. A recreate
 that **changes the image** of such a member runs a rootfs of the deployer's
 choosing as root on the host, so it needs the Admin role or `ct.exec` on that
 member (root inside it already). An opt-out the member did not already have
-needs the Admin role. These refusals, and the create's own checks (`ct.create`,
-the host-path authority a rootfs-path `image:` needs), come before anything is
-deleted: the member keeps running as it was. A member redeployed from the
-rootfs path it already uses keeps it, as before this release. `privileged: false` in a stack file is the same as
+needs the Admin role. A recreate judges only the member on the host it
+targets, and only one that carries this stack's label; another stack's
+container of the same name is refused, not replaced. These refusals, and the
+create's own checks — `ct.create`, the host-path authority a rootfs-path
+`image:` needs, and, when the deploy enters on the member's own host, the
+protected-place check of that path — come before anything is deleted: the
+member keeps running as it was. A member redeployed from the rootfs path it
+already uses keeps it, as before this release. When the member lives on
+another host than the one the deploy entered on, that host's protected-place
+check and its OCI image-owner check still run at the create, after the
+delete. `privileged: false` in a stack file is the same as
 leaving it out: to move a member over, use `lv ct convert`. Each container is given its own copy of the rootfs, so one pull backs any
 number of containers and `compose down` leaves the pulled template untouched.
 Remaining follow-ups: OCI registry-ref auto-pull; in-place reconfigure

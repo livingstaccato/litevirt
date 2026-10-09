@@ -188,25 +188,39 @@ func securityInherited(ctx context.Context) bool {
 // main, where any deployer could name one: the unchanged source is granted
 // to that create (the reading host still refuses a protected place).
 func (s *Server) judgeContainerRecreate(ctx context.Context, a planner.VMAction, f *compose.File) (*recreateDecision, error) {
-	var rec *corrosion.ContainerRecord
-	if a.TargetHost != "" {
-		rec, _ = corrosion.GetContainer(ctx, s.db, a.TargetHost, a.VMName)
-	}
-	if rec == nil {
-		if _, r, err := s.resolveContainerHost(ctx, "", a.VMName); err == nil {
-			rec = r
-		}
-	}
 	var d *compose.VMDef
 	if f != nil {
 		d, _ = compose.FindVMDef(f, a.VMName)
 	}
-	if rec == nil || d == nil {
+	if d == nil {
 		return nil, nil
 	}
-	old := corrosion.DecodeCreateSpec(rec.CreateSpec)
-	dec := &recreateDecision{name: a.VMName, host: a.TargetHost, image: d.Image, spec: old, project: rec.Project}
-	oldPrivileged, oldConfinement := recordedSecurity(old)
+	// The member is the container of this name on the host the create
+	// targets, and only that one: a same-named container on another host
+	// never decides this recreate. Without a target host, the unique
+	// container of the name anywhere.
+	var rec *corrosion.ContainerRecord
+	if a.TargetHost != "" {
+		rec, _ = corrosion.GetContainer(ctx, s.db, a.TargetHost, a.VMName)
+	} else if _, r, err := s.resolveContainerHost(ctx, "", a.VMName); err == nil {
+		rec = r
+	}
+	// It must be this stack's member, by the label compose down deletes by:
+	// another stack's container (or no stack's) is neither replaced by this
+	// recreate nor a donor of its mode.
+	if rec != nil && containerStackLabel(*rec) != f.Name {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"container %q on %s is not a member of stack %q (its stack label is %q), so this deploy does not recreate it; the container was left as it is",
+			a.VMName, rec.HostName, f.Name, containerStackLabel(*rec))
+	}
+	var dec *recreateDecision
+	var old corrosion.ContainerCreateSpec
+	oldPrivileged, oldConfinement := false, lxc.ConfinementDefault
+	if rec != nil {
+		old = corrosion.DecodeCreateSpec(rec.CreateSpec)
+		oldPrivileged, oldConfinement = recordedSecurity(old)
+		dec = &recreateDecision{name: a.VMName, host: rec.HostName, image: d.Image, spec: old, project: rec.Project}
+	}
 	privileged, confinement := d.Privileged, d.Confinement
 	if !privileged && confinement == "" {
 		privileged, confinement = oldPrivileged, oldConfinement
@@ -218,10 +232,12 @@ func (s *Server) judgeContainerRecreate(ctx context.Context, a planner.VMAction,
 	case (privileged && !oldPrivileged) || (legacy && oldConfinement != lxc.ConfinementLegacy):
 		if err := containerSecurityRequest(ctx, d.Privileged, d.Confinement); err != nil {
 			s.audit(ctx, "ct.recreate-security", a.VMName,
-				fmt.Sprintf("project=%s new opt-out privileged=%v confinement=%s", rec.Project, d.Privileged, d.Confinement), "denied")
+				fmt.Sprintf("new opt-out privileged=%v confinement=%s", d.Privileged, d.Confinement), "denied")
 			return nil, status.Errorf(status.Code(err), "recreating container %q: %s; the member was left as it is", a.VMName, status.Convert(err).Message())
 		}
 	default:
+		// Reached only with a member (rec != nil): without one, any opt-out
+		// is a new one.
 		if !sameContainerImage(*rec, old, d) {
 			if err := s.mayChangePrivilegedImage(ctx, a.VMName, rec, d, privileged); err != nil {
 				return nil, err
@@ -235,12 +251,23 @@ func (s *Server) judgeContainerRecreate(ctx context.Context, a planner.VMAction,
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "recreating container %q: %v; the member was left as it is", a.VMName, err)
 	}
-	if old.Template != "" && old.Template == req.Template {
-		dec.template = req.Template
+	createCtx := ctx
+	if dec != nil {
+		if old.Template != "" && old.Template == req.Template {
+			dec.template = req.Template
+		}
+		createCtx, _ = dec.apply(ctx, d, req)
 	}
-	createCtx, _ := dec.apply(ctx, d, req)
 	if err := s.authorizeContainerCreate(createCtx, req); err != nil {
 		return nil, status.Errorf(status.Code(err), "recreating container %q: %s; the member was left as it is", a.VMName, status.Convert(err).Message())
+	}
+	// The reading host's own template check, when this host is the one that
+	// reads it (a remote target judges its own disk, which this host cannot
+	// see): a path that is now refused is refused before the delete.
+	if a.TargetHost == "" || a.TargetHost == s.hostName {
+		if err := s.checkContainerTemplate(req.Template, req.Name); err != nil {
+			return nil, status.Errorf(status.Code(err), "recreating container %q: %s; the member was left as it is", a.VMName, status.Convert(err).Message())
+		}
 	}
 	return dec, nil
 }
@@ -377,7 +404,7 @@ func (dec *recreateDecision) apply(ctx context.Context, d *compose.VMDef, req *p
 // name, host or image is not this create's, and carries nothing over.
 func (s *Server) inheritRecreatedSecurity(ctx context.Context, a planner.VMAction, d *compose.VMDef, req *pb.CreateContainerRequest) (context.Context, func(), error) {
 	dec, _ := ctx.Value(recreateDecisionKey{}).(*recreateDecision)
-	if a.Kind != planner.OpUpdate || dec == nil || dec.name != a.VMName || dec.host != req.HostName || dec.image != d.Image {
+	if a.Kind != planner.OpUpdate || dec == nil || dec.name != a.VMName || (req.HostName != "" && dec.host != req.HostName) || dec.image != d.Image {
 		return ctx, nil, nil
 	}
 	ctx, kept := dec.apply(ctx, d, req)

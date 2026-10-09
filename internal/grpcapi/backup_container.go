@@ -804,6 +804,12 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 		_ = json.Unmarshal([]byte(manifest.ContainerSpecJSON), &spec)
 	}
 
+	// Decided once: a failover relocation (isPeerRelocation) and a cold
+	// migrate (a peer-verified migrate-from) are judged from the transport and
+	// metadata alone, which do not change during the handler.
+	peerRelocation := s.isPeerRelocation(ctx, req.Proof != nil)
+	migrateSource := s.migrateSourceFromPeer(ctx)
+
 	// Project isolation. An operator restore rebuilds the archived spec's NICs as
 	// a new workload in the authorized project, so each managed network must be
 	// one that project may use (same project as the backup: a raw bridge is
@@ -813,7 +819,7 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	// attachment, so they warn and audit, as a takeover promote does.
 	ctNets := containerSpecNetworkNames(corrosion.DecodeCreateSpec(spec.CreateSpec))
 	var foreignNets []string // recorded only once the restored row has landed
-	if s.isPeerRelocation(ctx, req.Proof != nil) || s.migrateSourceFromPeer(ctx) != "" {
+	if peerRelocation || migrateSource != "" {
 		foreignNets = s.foreignNetworks(ctx, "ct.restore", req.Name, project, ctNets)
 	} else if err := s.admitCopiedNetworks(ctx, "restore", project, project, ctNets); err != nil {
 		s.audit(ctx, "ct.restore", req.Name, "project="+project, "denied")
@@ -856,10 +862,7 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	// released when this handler returns, i.e. after the container's own row lands
 	// and accounts for the same figures.
 	var restoreQuotaLease *reservationLease
-	if s.migrateSourceFromPeer(ctx) == "" {
-		// Peer-only: the token is plain client metadata, so an operator setting it
-		// must not skip the project's quota (isPeerRelocation).
-		relocation := s.isPeerRelocation(ctx, req.Proof != nil)
+	if migrateSource == "" {
 		// Unconditional, like CreateContainer: an archived spec with no limits
 		// still restores into RESIDENCY, and that is the safety decision.
 		{
@@ -878,7 +881,9 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 			VCPU: spec.CPULimit, MemMiB: spec.MemMiB,
 			NIC: managedNICCount(corrosion.DecodeCreateSpec(spec.CreateSpec)),
 		}
-		if !relocation && !restoreQuota.IsZero() {
+		// Peer-only: the token is plain client metadata, so an operator setting it
+		// must not skip the project's quota (isPeerRelocation).
+		if !peerRelocation && !restoreQuota.IsZero() {
 			lease, aerr := s.admitQuotaWithReservation(ctx, "RestoreContainer", s.hostName, project,
 				corrosion.WorkloadContainer, req.Name, restoreQuota, restoreQuota, intentContainerResident)
 			if aerr != nil {
@@ -1040,10 +1045,15 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	// An operator restore is a new container beside whatever still holds the
 	// backed-up range or lineage; a migrate or relocation is the same
 	// container moving.
-	operatorRestore := !s.isPeerRelocation(ctx, req.Proof != nil) && s.migrateSourceFromPeer(ctx) == ""
+	//
+	// A cold migrate carries the relocation token (and, under enforcement, a
+	// proof) too, but it restores the moving container's own just-taken
+	// backup: its lineage is the manifest's, and no relocating row exists to
+	// look for.
+	operatorRestore := !peerRelocation && migrateSource == ""
 	if operatorRestore {
 		spec.CreateSpec = s.relineageRestored(ctx, req.Name, spec.CreateSpec, manifest.Timestamp)
-	} else if s.isPeerRelocation(ctx, req.Proof != nil) {
+	} else if peerRelocation && migrateSource == "" {
 		spec.CreateSpec = s.relocatedLineage(ctx, req, spec.CreateSpec)
 	}
 	s.stampContainerOwner(req.Name, project, spec.CreateSpec)
@@ -1078,7 +1088,7 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 		IsTemplate:    spec.IsTemplate,
 		// Stamp the failover coordinator's attempt token (if this is a
 		// restore-relocation) so it can prove this row is its restore.
-		RelocateToken: relocationTokenToStamp(ctx, s.isPeerRelocation(ctx, req.Proof != nil)),
+		RelocateToken: relocationTokenToStamp(ctx, peerRelocation),
 	}
 	// FENCE, immediately before the durable write (see allowCommit): the whole
 	// archive import sat between the quota grant and here, so the project's
@@ -1136,7 +1146,7 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	// honored only over peer mTLS with a CN matching the source (migrateSourceFromPeer)
 	// — an operator-supplied header falls through to the safe re-reserve path.
 	unreserved := 0
-	if s.migrateSourceFromPeer(ctx) == "" {
+	if migrateSource == "" {
 		u, rerr := network.ReserveContainerNICs(ctx, s.db, s.hostName, req.Name,
 			network.LeaseProof{Project: project, HereProject: hereProject, HereKnown: hereKnown}, ifs)
 		if rerr != nil {

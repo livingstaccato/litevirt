@@ -639,10 +639,9 @@ func TestManifestOwnedBy_ParentBoundComparesTimes(t *testing.T) {
 }
 
 // Round 4: the lineage fields of a restore request are the failover
-// coordinator's alone. An operator restore that sends them, and a restore over
-// a peer cert that is not a relocation, has them ignored: the restore lays
-// down the lineage it would have without them, so no request can claim
-// another container's lineage.
+// coordinator's alone. An operator restore that sends them has them ignored:
+// the restore lays down the lineage it would have without them, so no request
+// can claim another container's lineage.
 func TestRestoreContainer_AnOperatorCannotSetTheLineage(t *testing.T) {
 	const ts = "2026-10-08T12:00:00Z"
 	forged := func(r *pb.RestoreContainerRequest) *pb.RestoreContainerRequest {
@@ -671,7 +670,6 @@ func TestRestoreContainer_AnOperatorCannotSetTheLineage(t *testing.T) {
 		ctx  func() context.Context
 	}{
 		{"operator", adminCtx},
-		{"peer cert, no relocation", func() context.Context { return mtlsAdminCtx("peer-1") }},
 	} {
 		t.Run(c.name+"/after a delete", func(t *testing.T) {
 			s, rt, repo := setup(t)
@@ -743,5 +741,58 @@ func TestCloneContainer_ClearsTheRestoredFromParent(t *testing.T) {
 	}
 	if cl.RestoredFromOwnerID != "" || cl.RestoredFromTS != "" {
 		t.Fatalf("clone spec = %+v, want no restored-from parent", cl)
+	}
+}
+
+// R2-m1: a cold migrate carries the relocation token (and, under enforcement,
+// a proof), but it is the moving container's own just-taken backup: the target
+// keeps its lineage without looking for a relocating row, so it logs none of
+// the "not replicated yet" WARN the docs tell operators to read as a lagging
+// relocation. A relocation whose mark is absent here still logs it.
+func TestRestoreContainer_AMigrateLooksForNoRelocatingRow(t *testing.T) {
+	const ts = "2026-10-08T12:00:00Z"
+	const warn = "container relocation: no relocating row found here (not replicated yet?); keeping the backup's lineage"
+	for _, c := range []struct {
+		name    string
+		md      []string
+		wantLog bool
+	}{
+		{"migrate", []string{migrateFromMDKey, "host-a", relocateTokenMDKey, "tok-mig"}, false},
+		{"relocation, mark absent", []string{relocateTokenMDKey, "tok-rel"}, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			s, rt := secServer(t)
+			ctx := context.Background()
+			repo := ctTestRepo(t)
+			if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: "host-a", Address: "127.0.0.1", State: "active"}); err != nil {
+				t.Fatal(err)
+			}
+			if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{
+				HostName: "host-a", Name: "db", State: "stopped", Image: "alpine:3.19", Project: "acme",
+				CreateSpec: corrosion.EncodeCreateSpec(corrosion.ContainerCreateSpec{Template: "download", OwnerID: "own-1"}),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			bk := &progressStream[pb.BackupContainerProgress]{ctx: adminCtx()}
+			if err := s.BackupContainer(&pb.BackupContainerRequest{Name: "db", HostName: "host-a", RepoPath: repo, Timestamp: ts}, bk); err != nil {
+				t.Fatal(err)
+			}
+			logs := captureOpLog(t)
+			s.hostName = "host-b"
+			rctx := metadata.NewIncomingContext(mtlsAdminCtx("host-a"), metadata.Pairs(c.md...))
+			rs := &progressStream[pb.RestoreContainerProgress]{ctx: rctx}
+			if err := s.RestoreContainer(&pb.RestoreContainerRequest{Name: "db", RepoPath: repo, Timestamp: ts}, rs); err != nil {
+				t.Fatalf("restore on host-b: %v", err)
+			}
+			if cs := specOf(t, s, "host-b", "db"); cs.OwnerID != "own-1" || cs.RestoredFromOwnerID != "" {
+				t.Fatalf("restored spec = %+v, want the moving container's own-1", cs)
+			}
+			if got := rt.owners["db"]; got.OwnerID != "own-1" {
+				t.Fatalf("on-disk owner record = %+v, want own-1", got)
+			}
+			if got := logs.record(warn, nil) != nil; got != c.wantLog {
+				t.Fatalf("logged %q = %v, want %v", warn, got, c.wantLog)
+			}
+		})
 	}
 }

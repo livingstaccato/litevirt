@@ -207,10 +207,11 @@ func TestRestoreContainer_CopyBesideALiveOriginalIsANewContainer(t *testing.T) {
 	}
 }
 
-// M5: when the relocating row cannot be read, failover cannot tell which
-// lineage it is restoring, so it restores nothing rather than the newest
-// backup of the name.
-func TestRestoreContainerFromBackup_UnreadableRelocatingRowFailsClosed(t *testing.T) {
+// M5, as ruled: a relocating row that cannot be read must not cost the
+// container its data. Failover still restores the backup, picked by name as
+// before the owner rule existed, rather than falling back to an image
+// recreate.
+func TestRestoreContainerFromBackup_UnreadableRelocatingRowStillRestores(t *testing.T) {
 	s := testServer(t)
 	s.hostName = "host-a"
 	s.dataDir = t.TempDir()
@@ -232,13 +233,13 @@ func TestRestoreContainerFromBackup_UnreadableRelocatingRowFailsClosed(t *testin
 	if err := s.db.Execute(ctx, `DROP TABLE containers`); err != nil {
 		t.Fatal(err)
 	}
-	called := false
-	s.migrateRestoreOverride = func(context.Context, string, string, string, string, bool) (corrosion.RestoreOutcome, error) {
-		called = true
+	var gotTs string
+	s.migrateRestoreOverride = func(_ context.Context, _, _, _, ts string, _ bool) (corrosion.RestoreOutcome, error) {
+		gotTs = ts
 		return corrosion.RestoreLanded, nil
 	}
 	outcome, err := s.RestoreContainerFromBackup(ctx, "ct1", "host-b", "tok-x")
-	if err == nil || outcome != corrosion.RestoreNotAttempted || called {
-		t.Fatalf("got (%v, %v), restore driven=%v; want (RestoreNotAttempted, err) and no restore", outcome, err, called)
+	if err != nil || outcome != corrosion.RestoreLanded || gotTs != "2026-06-27T12:00:00Z" {
+		t.Fatalf("got (%v, %v) restoring %q; want the backup at 2026-06-27T12:00:00Z restored (RestoreLanded)", outcome, err, gotTs)
 	}
 }

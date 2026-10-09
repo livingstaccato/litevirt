@@ -368,11 +368,14 @@ func (s *Server) RestoreContainerFromBackup(ctx context.Context, ctName, targetH
 	// backup of another container of this name (another project, another
 	// lineage) is not this container's data.
 	//
-	// When that row cannot be read, nothing is restored: the lineage is
-	// unknown, and the newest backup of the name may be another container's.
+	// When that row cannot be read, the backup is still picked, by name as
+	// before the owner rule: refusing would fall back to an image recreate
+	// and cost the container its data over a transient read error.
 	owner, err := s.relocatingContainer(ctx, ctName, targetHost, token)
 	if err != nil {
-		return corrosion.RestoreNotAttempted, fmt.Errorf("read the relocating container %q to choose its backup: %w", ctName, err)
+		slog.Warn("container failover: could not read the relocating row; choosing its backup by name alone",
+			"name", ctName, "target", targetHost, "error", err)
+		owner = nil
 	}
 	repoName, timestamp, err := s.findLatestContainerBackupFor(ctName, owner)
 	if err != nil {

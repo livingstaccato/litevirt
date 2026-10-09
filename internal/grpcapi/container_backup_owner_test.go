@@ -147,6 +147,66 @@ func TestInspectContainer_AnotherLineagesBackupIsNotAvailable(t *testing.T) {
 	})
 }
 
+// I2 with M4: an operator restores web's backup on host-b while web still
+// runs on host-a. The copy is a new container: a fresh id range, no claim on
+// the original's address, and a lineage of its own — so when the copy is
+// backed up later and host-a dies, failover rebuilds the original from the
+// original's backup, not from the copy's newer one.
+func TestRestoreContainer_CopyBesideALiveOriginalIsANewContainer(t *testing.T) {
+	s, rt, repo := restoreIPServer(t)
+	ctx := context.Background()
+	orig := specOf(t, s, "host-a", "web")
+	if orig.OwnerID == "" || orig.IDMapBase == 0 {
+		t.Fatalf("original created as %+v, want an owner_id and an id range", orig)
+	}
+
+	s.hostName = "host-b"
+	rs := &progressStream[pb.RestoreContainerProgress]{ctx: adminCtx()}
+	assertIPUnavailable(t, s.RestoreContainer(&pb.RestoreContainerRequest{
+		Name: "web", RepoPath: repo, Timestamp: "2026-10-08T12:00:00Z", Start: true,
+	}, rs))
+	cp := specOf(t, s, "host-b", "web")
+	if cp.OwnerID == "" || cp.OwnerID == orig.OwnerID {
+		t.Fatalf("copy owner_id = %q, original's %q: want a lineage of its own", cp.OwnerID, orig.OwnerID)
+	}
+	if got := rt.owners["web"]; got.OwnerID != cp.OwnerID || got.Project != "acme" {
+		t.Fatalf("copy's on-disk owner record = %+v, want {acme %s}", got, cp.OwnerID)
+	}
+	if cp.IDMapBase == 0 || cp.IDMapBase == orig.IDMapBase {
+		t.Fatalf("copy id range = %d, original's %d: want a fresh one", cp.IDMapBase, orig.IDMapBase)
+	}
+	if got := specOf(t, s, "host-a", "web").OwnerID; got != orig.OwnerID {
+		t.Fatalf("the original's owner_id changed to %q", got)
+	}
+
+	bk := &progressStream[pb.BackupContainerProgress]{ctx: adminCtx()}
+	if err := s.BackupContainer(&pb.BackupContainerRequest{
+		Name: "web", HostName: "host-b", RepoPath: repo, Timestamp: "2026-10-09T12:00:00Z",
+	}, bk); err != nil {
+		t.Fatalf("backup the copy: %v", err)
+	}
+	row, err := corrosion.GetContainer(ctx, s.db, "host-a", "web")
+	if err != nil || row == nil {
+		t.Fatalf("original row: %v", err)
+	}
+	row.State, row.StateDetail = "relocating", corrosion.RelocateRestoreDetail("host-c", "tok-x")
+	if err := corrosion.UpsertContainer(ctx, s.db, *row); err != nil {
+		t.Fatal(err)
+	}
+	s.SetBackupRepos(map[string]string{"main": repo})
+	var gotTs string
+	s.migrateRestoreOverride = func(_ context.Context, target, repoPath, name, ts string, start bool) (corrosion.RestoreOutcome, error) {
+		gotTs = ts
+		return corrosion.RestoreLanded, nil
+	}
+	if _, err := s.RestoreContainerFromBackup(ctx, "web", "host-c", "tok-x"); err != nil {
+		t.Fatal(err)
+	}
+	if gotTs != "2026-10-08T12:00:00Z" {
+		t.Fatalf("failover restored the backup at %q, want the original's own (2026-10-08T12:00:00Z), not the copy's", gotTs)
+	}
+}
+
 // M5: when the relocating row cannot be read, failover cannot tell which
 // lineage it is restoring, so it restores nothing rather than the newest
 // backup of the name.

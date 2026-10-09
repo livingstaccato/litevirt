@@ -169,6 +169,49 @@ func (s *Server) stampContainerOwner(name, project, createSpec string) {
 	}
 }
 
+// heldBesideRestore reports whether a live container other than the one an
+// operator restore of name lays down here (this host, name) records what holds
+// says. It is the one test of "another container still holds this" for a
+// restore: of the backed-up id range (remapRestoredRange) and of the
+// backed-up lineage (relineageRestored).
+func (s *Server) heldBesideRestore(rows []corrosion.ContainerRecord, name string, holds func(corrosion.ContainerCreateSpec) bool) bool {
+	for _, r := range rows {
+		if r.HostName == s.hostName && r.Name == name {
+			continue
+		}
+		if holds(corrosion.DecodeCreateSpec(r.CreateSpec)) {
+			return true
+		}
+	}
+	return false
+}
+
+// relineageRestored gives an operator-restored container a new owner_id when
+// another live container records the backed-up one: the original lives on,
+// and the restore is a copy beside it. Keeping the original's lineage would
+// make the copy's later backups the original's, and failover could rebuild
+// the original from the copy's data. With no live holder (the original is
+// gone) the restore is the same lineage coming back and keeps it. A migrate or
+// relocation never comes here: it is the same container moving.
+//
+// When the rows cannot be read the restore still goes ahead, as a new
+// lineage: that can never hand failover another container's data, and it
+// costs only the link to the backups taken before it.
+func (s *Server) relineageRestored(ctx context.Context, name, createSpec string) string {
+	cs := corrosion.DecodeCreateSpec(createSpec)
+	rows, err := corrosion.ListContainers(ctx, s.db, "")
+	switch {
+	case err != nil:
+		slog.Warn("container restore: could not read the cluster's containers; the restore is given a lineage of its own", "name", name, "error", err)
+	case !s.heldBesideRestore(rows, name, func(o corrosion.ContainerCreateSpec) bool { return o.OwnerID == cs.OwnerID }):
+		return createSpec
+	default:
+		slog.Info("container restore: the backed-up container lives on; the restore is a copy with a lineage of its own", "name", name, "backed_up_owner_id", cs.OwnerID)
+	}
+	cs.OwnerID = randid.New()
+	return corrosion.EncodeCreateSpec(cs)
+}
+
 // withOwnerID returns createSpec with an owner_id, minting one when it has none.
 func withOwnerID(createSpec string) string {
 	cs := corrosion.DecodeCreateSpec(createSpec)

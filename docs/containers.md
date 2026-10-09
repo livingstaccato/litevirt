@@ -694,6 +694,12 @@ project plus an `owner_id` in the container's create spec.
 - `owner_id` is minted when a container is created or cloned (a clone is a new
   lineage), and kept by `lv ct migrate`, host-loss relocation and restore. A
   restore of a backup from an earlier release, which carries none, gets one.
+- A restore beside a container that still records the backed-up `owner_id`
+  (`lv ct restore --host` while the original runs elsewhere) is a copy, not the
+  original: it gets a new `owner_id`, as it gets a fresh id range and no claim on
+  the original's address. Its later backups are therefore its own, and a
+  host-loss restore of the original never picks them. A restore after the
+  original was deleted keeps the lineage.
 - It is stamped on disk as `<lxcpath>/<name>/litevirt-owner` (re-stamped after
   every restore and migrate, whatever the archive held), beside each snapshot
   tar as `<snapshot>.tar.owner`, and it rides in every backup manifest inside

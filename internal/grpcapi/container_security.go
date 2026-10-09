@@ -371,13 +371,7 @@ func (s *Server) remapRestoredRange(ctx context.Context, name, createSpec string
 	if err != nil {
 		return "", status.Errorf(codes.Internal, "read container id ranges: %v", err)
 	}
-	taken := false
-	for _, r := range rows {
-		if !(r.HostName == s.hostName && r.Name == name) && corrosion.DecodeCreateSpec(r.CreateSpec).IDMapBase == spec.IDMapBase {
-			taken = true
-			break
-		}
-	}
+	taken := s.heldBesideRestore(rows, name, func(o corrosion.ContainerCreateSpec) bool { return o.IDMapBase == spec.IDMapBase })
 	// A range a container on this disk holds — its config's, or an
 	// unfinished convert's target — is taken too.
 	for other, sec := range s.localContainerSecurity(ctx) {

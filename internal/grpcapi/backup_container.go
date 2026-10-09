@@ -1030,10 +1030,15 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	// earlier build has none: it gets one now), stamped on the imported
 	// directory, whose own record may be the source host's or absent.
 	spec.CreateSpec = withOwnerID(spec.CreateSpec)
-	s.stampContainerOwner(req.Name, project, spec.CreateSpec)
 	// An operator restore is a new container beside whatever still holds the
-	// backed-up range; a migrate or relocation is the same container moving.
-	if !s.isPeerRelocation(ctx, req.Proof != nil) && s.migrateSourceFromPeer(ctx) == "" {
+	// backed-up range or lineage; a migrate or relocation is the same
+	// container moving.
+	operatorRestore := !s.isPeerRelocation(ctx, req.Proof != nil) && s.migrateSourceFromPeer(ctx) == ""
+	if operatorRestore {
+		spec.CreateSpec = s.relineageRestored(ctx, req.Name, spec.CreateSpec)
+	}
+	s.stampContainerOwner(req.Name, project, spec.CreateSpec)
+	if operatorRestore {
 		remapped, rerr := s.remapRestoredRange(ctx, req.Name, spec.CreateSpec)
 		if rerr != nil {
 			if delErr := s.containerRuntime.DeleteContainer(ctx, req.Name); delErr != nil {

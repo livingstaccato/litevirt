@@ -637,3 +637,111 @@ func TestManifestOwnedBy_ParentBoundComparesTimes(t *testing.T) {
 		}
 	}
 }
+
+// Round 4: the lineage fields of a restore request are the failover
+// coordinator's alone. An operator restore that sends them, and a restore over
+// a peer cert that is not a relocation, has them ignored: the restore lays
+// down the lineage it would have without them, so no request can claim
+// another container's lineage.
+func TestRestoreContainer_AnOperatorCannotSetTheLineage(t *testing.T) {
+	const ts = "2026-10-08T12:00:00Z"
+	forged := func(r *pb.RestoreContainerRequest) *pb.RestoreContainerRequest {
+		r.OwnerId, r.RestoredFromOwnerId, r.RestoredFromTs = "own-victim", "own-victim", "2030-01-01T00:00:00Z"
+		return r
+	}
+	setup := func(t *testing.T) (*Server, *fakeCTRuntime, string) {
+		t.Helper()
+		s, rt := secServer(t)
+		ctx := context.Background()
+		repo := ctTestRepo(t)
+		if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{
+			HostName: "host-a", Name: "db", State: "running", Image: "alpine:3.19", Project: "acme",
+			CreateSpec: corrosion.EncodeCreateSpec(corrosion.ContainerCreateSpec{Template: "download", OwnerID: "own-1"}),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		bk := &progressStream[pb.BackupContainerProgress]{ctx: adminCtx()}
+		if err := s.BackupContainer(&pb.BackupContainerRequest{Name: "db", HostName: "host-a", RepoPath: repo, Timestamp: ts}, bk); err != nil {
+			t.Fatal(err)
+		}
+		return s, rt, repo
+	}
+	for _, c := range []struct {
+		name string
+		ctx  func() context.Context
+	}{
+		{"operator", adminCtx},
+		{"peer cert, no relocation", func() context.Context { return mtlsAdminCtx("peer-1") }},
+	} {
+		t.Run(c.name+"/after a delete", func(t *testing.T) {
+			s, rt, repo := setup(t)
+			if err := corrosion.DeleteContainer(context.Background(), s.db, "host-a", "db"); err != nil {
+				t.Fatal(err)
+			}
+			rs := &progressStream[pb.RestoreContainerProgress]{ctx: c.ctx()}
+			if err := s.RestoreContainer(forged(&pb.RestoreContainerRequest{Name: "db", RepoPath: repo, Timestamp: ts}), rs); err != nil {
+				t.Fatal(err)
+			}
+			if cs := specOf(t, s, "host-a", "db"); cs.OwnerID != "own-1" || cs.RestoredFromOwnerID != "" || cs.RestoredFromTS != "" {
+				t.Fatalf("restored spec = %+v, want own-1 with no parent: the request's lineage was honoured", cs)
+			}
+			if got := rt.owners["db"]; got.OwnerID != "own-1" {
+				t.Fatalf("on-disk owner record = %+v, want own-1", got)
+			}
+		})
+		t.Run(c.name+"/beside the live original", func(t *testing.T) {
+			s, rt, repo := setup(t)
+			s.hostName = "host-b"
+			rs := &progressStream[pb.RestoreContainerProgress]{ctx: c.ctx()}
+			if err := s.RestoreContainer(forged(&pb.RestoreContainerRequest{Name: "db", RepoPath: repo, Timestamp: ts}), rs); err != nil {
+				t.Fatal(err)
+			}
+			cs := specOf(t, s, "host-b", "db")
+			if cs.OwnerID == "" || cs.OwnerID == "own-1" || cs.OwnerID == "own-victim" ||
+				cs.RestoredFromOwnerID != "own-1" || cs.RestoredFromTS != ts {
+				t.Fatalf("copy spec = %+v, want a new owner_id restored from own-1@%s", cs, ts)
+			}
+			if got := rt.owners["db"]; got.OwnerID != cs.OwnerID {
+				t.Fatalf("on-disk owner record = %+v, want %s", got, cs.OwnerID)
+			}
+		})
+	}
+}
+
+// A clone is a new lineage that was restored from nothing: cloning a restored
+// copy must not carry the copy's parent record, or the clone would own the
+// parent's backups up to the copy's starting point.
+func TestCloneContainer_ClearsTheRestoredFromParent(t *testing.T) {
+	s, _ := secServer(t)
+	ctx := context.Background()
+	repo := ctTestRepo(t)
+	if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{
+		HostName: "host-a", Name: "db", State: "running", Image: "alpine:3.19", Project: "acme",
+		CreateSpec: corrosion.EncodeCreateSpec(corrosion.ContainerCreateSpec{Template: "download", OwnerID: "own-1"}),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	bk := &progressStream[pb.BackupContainerProgress]{ctx: adminCtx()}
+	if err := s.BackupContainer(&pb.BackupContainerRequest{Name: "db", HostName: "host-a", RepoPath: repo, Timestamp: "2026-10-08T12:00:00Z"}, bk); err != nil {
+		t.Fatal(err)
+	}
+	s.hostName = "host-b"
+	rs := &progressStream[pb.RestoreContainerProgress]{ctx: adminCtx()}
+	if err := s.RestoreContainer(&pb.RestoreContainerRequest{Name: "db", RepoPath: repo, Timestamp: "2026-10-08T12:00:00Z"}, rs); err != nil {
+		t.Fatal(err)
+	}
+	cp := specOf(t, s, "host-b", "db")
+	if cp.RestoredFromOwnerID != "own-1" {
+		t.Fatalf("copy spec = %+v: it records no parent, so the clone would prove nothing", cp)
+	}
+	if _, err := s.CloneContainer(adminCtx(), &pb.CloneContainerRequest{Source: "db", Target: "db2", HostName: "host-b"}); err != nil {
+		t.Fatal(err)
+	}
+	cl := specOf(t, s, "host-b", "db2")
+	if cl.OwnerID == "" || cl.OwnerID == cp.OwnerID || cl.OwnerID == "own-1" {
+		t.Fatalf("clone owner_id = %q, want a new lineage", cl.OwnerID)
+	}
+	if cl.RestoredFromOwnerID != "" || cl.RestoredFromTS != "" {
+		t.Fatalf("clone spec = %+v, want no restored-from parent", cl)
+	}
+}

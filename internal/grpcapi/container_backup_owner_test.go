@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -284,5 +285,55 @@ func TestProbeContainerBackups_NoProjectManifestIsTheDefaultProjects(t *testing.
 		if p.GetAttributed() != c.attributed || p.GetForeign() != c.foreign || p.GetOtherLineage() {
 			t.Fatalf("project %q: probe = %+v, want attributed=%v foreign=%v", c.project, p, c.attributed, c.foreign)
 		}
+	}
+}
+
+// A host-loss relocation is the same container moving: the restore on the
+// survivor keeps the backed-up owner_id even though the relocating row on
+// the dead host still records it (an operator restore beside it would not).
+func TestRestoreContainer_PeerRelocationKeepsTheLineage(t *testing.T) {
+	s := testServer(t)
+	s.hostName = "host-a"
+	s.dataDir = t.TempDir()
+	ctx := context.Background()
+	repo := ctTestRepo(t)
+	rt := &fakeCTRuntime{exportPayload: []byte("rootfs")}
+	s.SetContainerRuntime(rt)
+	spec := corrosion.EncodeCreateSpec(corrosion.ContainerCreateSpec{Template: "download", Distro: "alpine", OwnerID: "own-1"})
+	if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{
+		HostName: "host-a", Name: "ct1", State: "running", Image: "alpine:3.19", Project: "acme", CreateSpec: spec,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	bk := &progressStream[pb.BackupContainerProgress]{ctx: adminCtx()}
+	if err := s.BackupContainer(&pb.BackupContainerRequest{
+		Name: "ct1", HostName: "host-a", RepoPath: repo, Timestamp: "2026-06-27T13:00:00Z",
+	}, bk); err != nil {
+		t.Fatalf("BackupContainer: %v", err)
+	}
+	// The container lived on dead-host, which the coordinator has marked for a
+	// restore-relocation here; host-a holds no row of it.
+	_ = corrosion.DeleteContainer(ctx, s.db, "host-a", "ct1")
+	if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{
+		HostName: "dead-host", Name: "ct1", State: "relocating", Image: "alpine:3.19", Project: "acme", CreateSpec: spec,
+		StateDetail: corrosion.RelocateRestoreDetail("host-a", "tok-xyz"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: "peer-1", Address: "10.0.0.7", State: "active"}); err != nil {
+		t.Fatal(err)
+	}
+	rctx := metadata.NewIncomingContext(mtlsAdminCtx("peer-1"), metadata.Pairs(relocateTokenMDKey, "tok-xyz"))
+	rs := &progressStream[pb.RestoreContainerProgress]{ctx: rctx}
+	if err := s.RestoreContainer(&pb.RestoreContainerRequest{
+		Name: "ct1", RepoPath: repo, Timestamp: "2026-06-27T13:00:00Z",
+	}, rs); err != nil {
+		t.Fatalf("RestoreContainer: %v", err)
+	}
+	if got := specOf(t, s, "host-a", "ct1").OwnerID; got != "own-1" {
+		t.Fatalf("relocated owner_id = %q, want the container's own own-1", got)
+	}
+	if got := rt.owners["ct1"]; got.OwnerID != "own-1" {
+		t.Fatalf("relocated on-disk owner record = %+v, want own-1", got)
 	}
 }

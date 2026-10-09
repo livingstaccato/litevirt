@@ -78,6 +78,7 @@ func (s *Server) authorizeContainerRestore(ctx context.Context, name string, m *
 	if rec, _ := corrosion.GetContainer(ctx, s.db, s.hostName, name); rec != nil {
 		liveProject, liveExists = rec.Project, true
 	}
+	// Raw, not normalised: "" marks a legacy manifest, which restoreAuthDecision scopes to the live row or the admin role.
 	project, err := s.restoreAuthDecision(ctx, manifestContainerProject(m), liveProject, liveExists)
 	if err != nil {
 		return "", err

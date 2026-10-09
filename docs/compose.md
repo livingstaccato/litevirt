@@ -257,11 +257,16 @@ cpu or memory change) keeps that container's current privilege mode and
 confinement when the stack file states none — a member deployed by an earlier
 release stays privileged with legacy confinement — and only a brand-new member
 gets the unprivileged, confined defaults. A privileged or legacy-confined
-member is carried over for whoever may deploy the stack, as before this
-release, and never given a silently unprivileged replacement; when the
-deployer is not an Admin, the daemon logs a WARN naming `lv ct convert` and
-records a `ct.recreate-security` audit event. An opt-out the member did not
-already have is a new one and needs the Admin role. `privileged: false` in a stack file is the same as
+member recreated with the **same image** (a cpu, memory or network change)
+is carried over for whoever may deploy the stack, as before this release, and
+never given a silently unprivileged replacement; when the deployer is not an
+Admin, the daemon logs a WARN naming `lv ct convert` and, once the new
+container exists, records a `ct.recreate-security` audit event. A recreate
+that **changes the image** of such a member runs a rootfs of the deployer's
+choosing as root on the host, so it needs the Admin role or `ct.exec` on that
+member (root inside it already). An opt-out the member did not already have
+needs the Admin role. Either refusal comes before anything is deleted: the
+member keeps running as it was. `privileged: false` in a stack file is the same as
 leaving it out: to move a member over, use `lv ct convert`. Each container is given its own copy of the rootfs, so one pull backs any
 number of containers and `compose down` leaves the pulled template untouched.
 Remaining follow-ups: OCI registry-ref auto-pull; in-place reconfigure

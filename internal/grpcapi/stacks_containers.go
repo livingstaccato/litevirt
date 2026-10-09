@@ -6,6 +6,9 @@ import (
 	"log/slog"
 	"strings"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/compose/planner"
@@ -16,14 +19,10 @@ import (
 // deleteWorkload removes a planned workload, routing containers to
 // DeleteContainer (on their resolved/current host) and VMs to DeleteVM. Used by
 // the deploy executor for OpDelete and the delete half of an OpUpdate recreate.
+//
+// A container recreate is judged before this runs (judgeContainerRecreate,
+// from recreateInline), so a refused recreate never reaches the delete.
 func (s *Server) deleteWorkload(ctx context.Context, a planner.VMAction) error {
-	if a.IsContainer && a.Kind == planner.OpUpdate {
-		// Judged before anything is deleted: a refused recreate leaves the
-		// member running as it is.
-		if err := s.rememberRecreatedSecurity(ctx, a); err != nil {
-			return err
-		}
-	}
 	if a.IsContainer {
 		_, err := s.DeleteContainer(ctx, &pb.DeleteContainerRequest{HostName: a.TargetHost, Name: a.VMName, Force: true})
 		return err
@@ -163,10 +162,23 @@ func securityInherited(ctx context.Context) bool {
 	return v
 }
 
-// rememberRecreatedSecurity records the outgoing container's security before
-// a recreate deletes it. It refuses nothing: the deployer is already allowed
-// to manage the stack, and on main every member was privileged.
-func (s *Server) rememberRecreatedSecurity(ctx context.Context, a planner.VMAction) error {
+// judgeContainerRecreate judges a compose recreate of a container member
+// BEFORE its delete half runs, so a refused recreate leaves the member as it
+// is, and remembers the outgoing member's security for the create
+// (inheritRecreatedSecurity).
+//
+// The mode the recreate asks for is the stack file's privileged/confinement,
+// or, when it states neither, the member's own (an existing container keeps
+// its settings until an operator converts it). Then:
+//   - an opt-out the member does not already have (privileged over an id-
+//     mapped member, legacy over default confinement) is a new one: Admin
+//     only, as for lv ct create;
+//   - a privileged or legacy-confined mode the member already has is kept
+//     for whoever may deploy the stack when the recreate runs the same image
+//     (sameContainerImage), as on main; when the image changes, the deployer
+//     is choosing a new rootfs to run as host root, which needs the Admin
+//     role or ct.exec on the member (root inside it already).
+func (s *Server) judgeContainerRecreate(ctx context.Context, a planner.VMAction, f *compose.File) error {
 	var rec *corrosion.ContainerRecord
 	if a.TargetHost != "" {
 		rec, _ = corrosion.GetContainer(ctx, s.db, a.TargetHost, a.VMName)
@@ -179,25 +191,120 @@ func (s *Server) rememberRecreatedSecurity(ctx context.Context, a planner.VMActi
 	if rec == nil {
 		return nil
 	}
+	old := corrosion.DecodeCreateSpec(rec.CreateSpec)
+	m := recreatedMember{spec: old, project: rec.Project}
+	var d *compose.VMDef
+	if f != nil {
+		d, _ = compose.FindVMDef(f, a.VMName)
+	}
+	if d != nil {
+		oldPrivileged, oldConfinement := recordedSecurity(old)
+		privileged, confinement := d.Privileged, d.Confinement
+		if !privileged && confinement == "" {
+			privileged, confinement = oldPrivileged, oldConfinement
+		}
+		legacy := confinement == lxc.ConfinementLegacy
+		switch {
+		case !privileged && !legacy:
+			// The defaults; a confinement that is not one is refused now,
+			// not by the create after the delete.
+			if err := containerSecurityRequest(ctx, false, d.Confinement); err != nil {
+				return err
+			}
+		case (privileged && !oldPrivileged) || (legacy && oldConfinement != lxc.ConfinementLegacy):
+			if err := containerSecurityRequest(ctx, d.Privileged, d.Confinement); err != nil {
+				s.audit(ctx, "ct.recreate-security", a.VMName,
+					fmt.Sprintf("project=%s new opt-out privileged=%v confinement=%s", rec.Project, d.Privileged, d.Confinement), "denied")
+				return status.Errorf(status.Code(err), "recreating container %q: %s; the member was left as it is", a.VMName, status.Convert(err).Message())
+			}
+		default:
+			if !sameContainerImage(*rec, old, d) {
+				if err := s.mayChangePrivilegedImage(ctx, a.VMName, rec, d, privileged); err != nil {
+					return err
+				}
+			}
+			m.keep = true
+			m.note = RequireRole(ctx, "admin") != nil
+		}
+	}
 	s.recreateSecMu.Lock()
 	defer s.recreateSecMu.Unlock()
 	if s.recreateSec == nil {
 		s.recreateSec = map[string]recreatedMember{}
 	}
-	s.recreateSec[a.VMName] = recreatedMember{spec: corrosion.DecodeCreateSpec(rec.CreateSpec), project: rec.Project}
+	s.recreateSec[a.VMName] = m
 	return nil
+}
+
+// recordedSecurity is a container record's privilege mode and confinement;
+// a record an earlier build wrote (no confinement) is privileged and legacy.
+func recordedSecurity(spec corrosion.ContainerCreateSpec) (privileged bool, confinement string) {
+	confinement = spec.Confinement
+	if confinement == "" {
+		confinement = lxc.ConfinementLegacy
+	}
+	return spec.IDMapBase == 0, confinement
+}
+
+// sameContainerImage reports whether a recreate from d runs the image the
+// member runs: what decides the rootfs a privileged container starts as host
+// root. Compared are the image reference (the record's image against the
+// stack file's image:) and, when the member's create spec records them, the
+// rootfs source it was built from: template, distro, release and arch. The
+// security mode is judged by the caller, and the rest of a container's config
+// (cpu, memory, NICs, labels, restart) does not change what runs as root.
+func sameContainerImage(rec corrosion.ContainerRecord, old corrosion.ContainerCreateSpec, d *compose.VMDef) bool {
+	if rec.Image != d.Image {
+		return false
+	}
+	if old.Template == "" {
+		return true // a record with no create spec names its image only
+	}
+	want := corrosion.ContainerCreateSpec{Arch: "amd64"}
+	switch {
+	case isRootfsTemplate(d.Image):
+		want.Template = d.Image
+	case d.Kind == compose.WorkloadKindLXC:
+		want.Template = "download"
+		want.Distro, want.Release, _ = strings.Cut(d.Image, ":")
+	default:
+		return false
+	}
+	return old.Template == want.Template && old.Distro == want.Distro && old.Release == want.Release &&
+		(old.Arch == "" || old.Arch == want.Arch)
+}
+
+// mayChangePrivilegedImage refuses a recreate that runs a new image in a
+// privileged or legacy-confined member for a caller who is neither Admin nor
+// holds ct.exec on the member (root inside it already).
+func (s *Server) mayChangePrivilegedImage(ctx context.Context, name string, rec *corrosion.ContainerRecord, d *compose.VMDef, privileged bool) error {
+	if RequireRole(ctx, "admin") == nil {
+		return nil
+	}
+	if err := s.RequirePerm(ctx, ctRBACPathFor(rec.Project, name), "ct.exec", "operator"); err == nil {
+		return nil
+	}
+	what := "legacy-confined"
+	if privileged {
+		what = "privileged"
+	}
+	s.audit(ctx, "ct.recreate-security", name,
+		fmt.Sprintf("project=%s %s image %q -> %q", rec.Project, what, rec.Image, d.Image), "denied")
+	return status.Errorf(codes.PermissionDenied,
+		"container %q is %s, and this deploy changes its image from %q to %q, which would run as root on the host; "+
+			"that needs the Admin role or ct.exec on it (root inside it already). The member was left as it is: "+
+			"deploy it with its current image, ask an Admin to deploy this change, or move it over first with "+
+			"lv ct convert --unprivileged --confinement default %s",
+		name, what, rec.Image, d.Image, name)
 }
 
 // noteKeptMemberSecurity records, as an audit event and a WARN, that a
 // recreate carried a privileged or legacy-confined member's mode over for a
-// caller who could not have asked for it (not Admin). It is kept rather than
+// non-Admin deployer, once the new container exists. It is kept rather than
 // refused: refusing would newly block a compose update main allowed, and
 // dropping the member to unprivileged would break its workload behind the
 // deployer's back. The record names the remedy.
 func (s *Server) noteKeptMemberSecurity(ctx context.Context, name, project string, privileged bool, confinement string) {
-	if RequireRole(ctx, "admin") == nil {
-		return
-	}
 	what := "legacy-confined"
 	if privileged {
 		what = "privileged"
@@ -208,48 +315,40 @@ func (s *Server) noteKeptMemberSecurity(ctx context.Context, name, project strin
 		fmt.Sprintf("project=%s recreate kept %s (privileged=%v confinement=%s) from the replaced member", project, what, privileged, confinement), "ok")
 }
 
-// recreatedMember is what a recreate remembers of the container it replaces.
+// recreatedMember is what a recreate remembers of the container it replaces:
+// its create spec and project, whether its security mode is carried over
+// (keep: judged by judgeContainerRecreate), and whether that is recorded
+// (note: a non-Admin deployer).
 type recreatedMember struct {
 	spec    corrosion.ContainerCreateSpec
 	project string
+	keep    bool
+	note    bool
 }
 
 // inheritRecreatedSecurity applies a recreate's remembered security to req
-// when the stack file states none, and returns the context to create with.
-//
-// A privileged or legacy-confined mode the replaced member already had is
-// kept for whoever may deploy the stack, as on main; for a non-Admin it is
-// recorded (noteKeptMemberSecurity). An opt-out the member did not have,
-// stated in the stack file, is a new one, and CreateContainer holds it to
-// the Admin role.
-func (s *Server) inheritRecreatedSecurity(ctx context.Context, a planner.VMAction, d *compose.VMDef, req *pb.CreateContainerRequest) (context.Context, error) {
+// when the stack file states none, and returns the context to create with
+// and, for a non-Admin deployer whose member's mode is carried over, what
+// records that once the create has succeeded (nil otherwise). What may be
+// carried over was judged before the delete (judgeContainerRecreate).
+func (s *Server) inheritRecreatedSecurity(ctx context.Context, a planner.VMAction, d *compose.VMDef, req *pb.CreateContainerRequest) (context.Context, func(), error) {
 	if a.Kind != planner.OpUpdate {
-		return ctx, nil
+		return ctx, nil, nil
 	}
 	s.recreateSecMu.Lock()
 	m, ok := s.recreateSec[a.VMName]
 	delete(s.recreateSec, a.VMName)
 	s.recreateSecMu.Unlock()
-	if !ok {
-		return ctx, nil
-	}
-	oldPrivileged := m.spec.IDMapBase == 0
-	oldConfinement := m.spec.Confinement
-	if oldConfinement == "" {
-		oldConfinement = lxc.ConfinementLegacy
+	if !ok || !m.keep {
+		return ctx, nil, nil
 	}
 	if !d.Privileged && d.Confinement == "" {
-		req.Privileged = oldPrivileged
-		req.Confinement = oldConfinement
+		req.Privileged, req.Confinement = recordedSecurity(m.spec)
 	}
-	if !req.Privileged && (req.Confinement == "" || req.Confinement == lxc.ConfinementDefault) {
-		return ctx, nil
+	var note func()
+	if m.note {
+		privileged, confinement := req.Privileged, req.Confinement
+		note = func() { s.noteKeptMemberSecurity(ctx, a.VMName, m.project, privileged, confinement) }
 	}
-	// An opt-out the replaced member did not have is a new one: CreateContainer
-	// holds it to the Admin role as for any create.
-	if (req.Privileged && !oldPrivileged) || (req.Confinement == lxc.ConfinementLegacy && oldConfinement != lxc.ConfinementLegacy) {
-		return ctx, nil
-	}
-	s.noteKeptMemberSecurity(ctx, a.VMName, m.project, req.Privileged, req.Confinement)
-	return withInheritedSecurity(ctx), nil
+	return withInheritedSecurity(ctx), note, nil
 }

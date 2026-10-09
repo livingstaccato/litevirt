@@ -427,6 +427,15 @@ func (s *Server) waitDependsOn(ctx context.Context, action planner.VMAction, str
 // old runtime may still be alive (the same rule as serverOps.recreateAs). It
 // returns the failed-action error.
 func (s *Server) recreateInline(ctx context.Context, action planner.VMAction, f *compose.File, gate *dependsOnGate) error {
+	// A container recreate is judged before anything is deleted: a refused
+	// one leaves the member running as it is.
+	if action.IsContainer {
+		if err := s.judgeContainerRecreate(ctx, action, f); err != nil {
+			slog.Warn("deploy update refused", "workload", action.VMName, "error", err)
+			gate.markUnmet(action.VMName, err)
+			return err
+		}
+	}
 	if delErr := s.deleteWorkloadIgnoringGone(ctx, action); delErr != nil {
 		slog.Warn("deploy update delete failed", "workload", action.VMName, "error", delErr)
 		gate.markUnmet(action.VMName, fmt.Errorf("delete before recreate failed: %w", delErr))

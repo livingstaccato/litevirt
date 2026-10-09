@@ -657,6 +657,12 @@ lv ct create dind  --confinement legacy         # AppArmor nesting allowed, temp
 
 Compose takes the same per workload (`privileged: true`, `confinement: legacy`),
 so a stack that needs them says so; deploying it then needs the Admin role.
+A privileged stack member is a host-root grant to the image it runs: a compose
+recreate keeps its mode for anyone who may deploy the stack only while the
+image is unchanged (the image reference and the template, distro, release and
+arch it was built from). Changing the image needs the Admin role or `ct.exec`
+on the member, and is refused before the member is deleted (see
+[compose.md](compose.md)).
 
 **Existing containers keep their settings.** A container created before this
 release is privileged with legacy confinement and keeps running exactly as it

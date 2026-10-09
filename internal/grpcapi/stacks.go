@@ -451,12 +451,15 @@ func (s *Server) deployCreatePlanned(ctx context.Context, action planner.VMActio
 			if err != nil {
 				return err
 			}
-			createCtx, err := s.inheritRecreatedSecurity(ctx, action, vmDef, ctReq)
+			createCtx, noteKept, err := s.inheritRecreatedSecurity(ctx, action, vmDef, ctReq)
 			if err != nil {
 				return fmt.Errorf("create container %q: %w", action.VMName, err)
 			}
 			if _, err := s.CreateContainer(createCtx, ctReq); err != nil {
 				return fmt.Errorf("create container %q: %w", action.VMName, err)
+			}
+			if noteKept != nil {
+				noteKept()
 			}
 			// compose `up` brings workloads to running, matching CreateVM
 			// (which defines + starts the domain).

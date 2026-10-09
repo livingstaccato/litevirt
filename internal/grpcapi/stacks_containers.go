@@ -3,10 +3,8 @@ package grpcapi
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
-
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/compose"
@@ -166,7 +164,8 @@ func securityInherited(ctx context.Context) bool {
 }
 
 // rememberRecreatedSecurity records the outgoing container's security before
-// a recreate deletes it.
+// a recreate deletes it. It refuses nothing: the deployer is already allowed
+// to manage the stack, and on main every member was privileged.
 func (s *Server) rememberRecreatedSecurity(ctx context.Context, a planner.VMAction) error {
 	var rec *corrosion.ContainerRecord
 	if a.TargetHost != "" {
@@ -180,9 +179,6 @@ func (s *Server) rememberRecreatedSecurity(ctx context.Context, a planner.VMActi
 	if rec == nil {
 		return nil
 	}
-	if err := s.mayKeepMemberSecurity(ctx, a.VMName, rec.Project, corrosion.DecodeCreateSpec(rec.CreateSpec)); err != nil {
-		return err
-	}
 	s.recreateSecMu.Lock()
 	defer s.recreateSecMu.Unlock()
 	if s.recreateSec == nil {
@@ -192,29 +188,24 @@ func (s *Server) rememberRecreatedSecurity(ctx context.Context, a planner.VMActi
 	return nil
 }
 
-// mayKeepMemberSecurity refuses a caller recreating a privileged or
-// legacy-confined member who could not create one (not Admin) and holds no
-// ct.exec on the member (root inside it already). Dropping the member to
-// unprivileged instead would break the workload behind their back.
-func (s *Server) mayKeepMemberSecurity(ctx context.Context, name, project string, spec corrosion.ContainerCreateSpec) error {
-	privileged := spec.IDMapBase == 0
-	if !privileged && spec.Confinement == lxc.ConfinementDefault {
-		return nil
-	}
+// noteKeptMemberSecurity records, as an audit event and a WARN, that a
+// recreate carried a privileged or legacy-confined member's mode over for a
+// caller who could not have asked for it (not Admin). It is kept rather than
+// refused: refusing would newly block a compose update main allowed, and
+// dropping the member to unprivileged would break its workload behind the
+// deployer's back. The record names the remedy.
+func (s *Server) noteKeptMemberSecurity(ctx context.Context, name, project string, privileged bool, confinement string) {
 	if RequireRole(ctx, "admin") == nil {
-		return nil
+		return
 	}
-	if err := s.RequirePerm(ctx, ctRBACPathFor(project, name), "ct.exec", "operator"); err != nil {
-		what := "legacy-confined"
-		if privileged {
-			what = "privileged"
-		}
-		return status.Errorf(codes.PermissionDenied,
-			"container %q is %s; recreating it keeps that, which needs the Admin role or ct.exec on it (root inside it already): "+
-				"ask an Admin to deploy this change, or move it over first with lv ct convert --unprivileged --confinement default %s",
-			name, what, name)
+	what := "legacy-confined"
+	if privileged {
+		what = "privileged"
 	}
-	return nil
+	slog.Warn("compose recreate kept a container's privilege mode for a non-admin deployer; convert it with lv ct convert --unprivileged --confinement default",
+		"container", name, "project", project, "mode", what, "confinement", confinement, "user", callerUsername(ctx))
+	s.audit(ctx, "ct.recreate-security", name,
+		fmt.Sprintf("project=%s recreate kept %s (privileged=%v confinement=%s) from the replaced member", project, what, privileged, confinement), "ok")
 }
 
 // recreatedMember is what a recreate remembers of the container it replaces.
@@ -226,11 +217,11 @@ type recreatedMember struct {
 // inheritRecreatedSecurity applies a recreate's remembered security to req
 // when the stack file states none, and returns the context to create with.
 //
-// Carrying a privileged or legacy-confined member over is allowed only to a
-// caller who could create one (Admin) or who holds ct.exec on the member being
-// replaced — root inside it already. Anyone else is refused, by name: dropping
-// the member to unprivileged instead would break the workload behind their
-// back.
+// A privileged or legacy-confined mode the replaced member already had is
+// kept for whoever may deploy the stack, as on main; for a non-Admin it is
+// recorded (noteKeptMemberSecurity). An opt-out the member did not have,
+// stated in the stack file, is a new one, and CreateContainer holds it to
+// the Admin role.
 func (s *Server) inheritRecreatedSecurity(ctx context.Context, a planner.VMAction, d *compose.VMDef, req *pb.CreateContainerRequest) (context.Context, error) {
 	if a.Kind != planner.OpUpdate {
 		return ctx, nil
@@ -239,21 +230,26 @@ func (s *Server) inheritRecreatedSecurity(ctx context.Context, a planner.VMActio
 	m, ok := s.recreateSec[a.VMName]
 	delete(s.recreateSec, a.VMName)
 	s.recreateSecMu.Unlock()
-	if !ok || d.Privileged || d.Confinement != "" {
+	if !ok {
 		return ctx, nil
 	}
-	req.Privileged = m.spec.IDMapBase == 0
-	req.Confinement = m.spec.Confinement
-	if req.Confinement == "" {
-		req.Confinement = lxc.ConfinementLegacy
+	oldPrivileged := m.spec.IDMapBase == 0
+	oldConfinement := m.spec.Confinement
+	if oldConfinement == "" {
+		oldConfinement = lxc.ConfinementLegacy
 	}
-	if !req.Privileged && req.Confinement == lxc.ConfinementDefault {
+	if !d.Privileged && d.Confinement == "" {
+		req.Privileged = oldPrivileged
+		req.Confinement = oldConfinement
+	}
+	if !req.Privileged && (req.Confinement == "" || req.Confinement == lxc.ConfinementDefault) {
 		return ctx, nil
 	}
-	// Checked before the delete too (rememberRecreatedSecurity); again here,
-	// where the carried-over opt-out is granted.
-	if err := s.mayKeepMemberSecurity(ctx, a.VMName, m.project, m.spec); err != nil {
-		return ctx, err
+	// An opt-out the replaced member did not have is a new one: CreateContainer
+	// holds it to the Admin role as for any create.
+	if (req.Privileged && !oldPrivileged) || (req.Confinement == lxc.ConfinementLegacy && oldConfinement != lxc.ConfinementLegacy) {
+		return ctx, nil
 	}
+	s.noteKeptMemberSecurity(ctx, a.VMName, m.project, req.Privileged, req.Confinement)
 	return withInheritedSecurity(ctx), nil
 }

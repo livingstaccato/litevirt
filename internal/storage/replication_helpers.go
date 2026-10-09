@@ -3,13 +3,10 @@ package storage
 import (
 	"context"
 	"fmt"
-	"os"
 	"os/exec"
 	"sort"
 	"time"
 )
-
-func osStat(p string) (os.FileInfo, error) { return os.Stat(p) }
 
 // pipeCmds wires `<binA> <argsA> | <binB> <argsB>`, optionally
 // hopping over SSH for the receive side. Synchronous: returns when
@@ -61,15 +58,6 @@ func nowSnapTag() string {
 // incremental sends.
 func snapshotExists(ctx context.Context, ref string) bool {
 	_, err := exec.CommandContext(ctx, "zfs", "list", "-t", "snapshot", "-H", "-o", "name", "--", ref).Output()
-	return err == nil
-}
-
-// pathExists is a `os.Stat`-style probe used by btrfs to detect the
-// previous-replicate snapshot dir for incremental `-p` sends.
-// Wrapped here (rather than imported from os in btrfs.go) so the
-// stat path is centralised.
-func pathExists(p string) bool {
-	_, err := osStat(p)
 	return err == nil
 }
 

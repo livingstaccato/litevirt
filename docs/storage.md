@@ -1002,8 +1002,40 @@ so a copy between two ceph clusters uses each cluster's own credentials. The
 per-copy source snapshot is removed afterwards, and a copy that fails after it
 was received is removed rather than left unrecorded — only the image the copy
 itself created, never the destination name, which an image created in the
-meantime may hold. A btrfs disk takes the
-file copy. What the drivers implement:
+meantime may hold.
+
+A **btrfs** disk replicated into a btrfs pool is sent natively when it is
+alone in its own subvolume directly under its btrfs pool (as the btrfs driver
+creates every disk), **standalone** — no backing file, no external data file —
+and both pools pass the pool write check (the native path also writes into the
+source pool: its send snapshot). A copy never depends on a file outside itself,
+so a disk built on a base image takes the qemu-img copy, which flattens it. The
+copy is the same new file a qemu-img copy makes, in the target pool's
+directory — `<vm>-<disk>-copy-<time>-<id>.qcow2`, or an admin's `--target-path`
+there — with the same mode (0600), and it is recorded the same way, so
+promotion by name, listings, pruning and deletion treat it like any other copy.
+The source subvolume is snapshotted read-only into a private directory beside
+it and received into a private directory in the target pool. The received
+disk file is checked again (it must be standalone), cloned inside that private
+directory (a reflink: no data is copied; a plain copy where the filesystem
+cannot) and placed with a rename that refuses an existing name
+(`renameat2(RENAME_NOREPLACE)`), so a file created meanwhile is never
+replaced; an existing name is refused before anything is sent. A native copy
+that fails for any other reason — a read-only or full source pool, a receive or
+clone that does not work, a received copy that is not standalone — places
+nothing and is logged, and the qemu-img copy is made instead, as for any btrfs
+disk before. Everything staged is removed when the copy ends, whether it
+succeeded, failed or its client went away. Every private directory
+(`.litevirt-send-<time>-<id>`, `.litevirt-recv-<time>-<id>`) carries a marker
+file from the moment it is made; one a daemon that died mid-copy left is
+removed by the next btrfs copy when it carries that marker, is older than a
+day, holds nothing but what the copy puts there, is not a running copy's, and
+no disk or pool record uses a file in it. No file in a pool is ever swept,
+whatever its name. A btrfs disk anywhere else — a file in the pool's directory
+(storage motion puts it there), a disk with no pool, a subvolume that holds
+other files, a disk on a base image — and every copy between different
+drivers, or to a `--target-path` outside the pool's directory, take the file
+copy. What the drivers implement:
 
 - **ZFS** — `zfs snapshot` then `zfs send | zfs recv`. Incremental
   (`-I` since the prior `litevirt-replicate-prev` snapshot) when
@@ -1012,8 +1044,10 @@ file copy. What the drivers implement:
   an incremental is `rbd export-diff --from-snap | rbd import-diff` onto an
   image the replication created. Cross-cluster via SSH wrap on the receive
   side.
-- **BTRFS** — `btrfs send | btrfs receive`. Incremental via `-p` against
-  the prior replicate snapshot.
+- **BTRFS** — `btrfs subvolume snapshot -r`, then `btrfs send | btrfs
+  receive`, always a full send (no snapshot is kept between copies), the disk
+  file cloned out of what was received; same host only, as the copy is placed
+  by a local rename.
 
 Cross-host replication wraps the receive in `ssh <user@host>` so the
 sender pipes straight into the remote CLI. Same-host uses a local pipe.
@@ -1029,7 +1063,7 @@ consistency is a planned follow-up.
 | Move (offline) | ✓ | ✓ | ✓ | ✓ | — | — | — | — |
 | Move (live) | ✓ | ✓ | ✓ | ✓ | — | — | — | — |
 | Replicate via qemu-img | ✓ | ✓ | ✓ | ✓ | fallback | fallback | — | — |
-| Native send / receive (`replicate-volume`) | n/a | n/a | n/a | file copy | zfs s/r | rbd export/import | n/a | n/a |
+| Native send / receive (`replicate-volume`) | n/a | n/a | n/a | btrfs s/r | zfs s/r | rbd export/import | n/a | n/a |
 | HA-friendly cluster store | no | yes | depends | no (host-local) | no (host-local) | yes | yes | no |
 
 The **Snapshots** row describes each backend's *native* snapshot capability

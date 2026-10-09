@@ -285,23 +285,28 @@ func (c *ContainerChecker) recreateRelocated(ctx context.Context, ct corrosion.C
 
 	spec := corrosion.DecodeCreateSpec(ct.CreateSpec)
 
+	// A container of this name already here is acted on only when it is this
+	// row's: its owner record (when it has one) names the row's project and
+	// lineage. Names are per host and reusable, so another project's container
+	// — or another lineage of the name — is not a prior tick's work. Checked
+	// before the runtime state is read, so no path touches a foreign directory:
+	// not the adopt below, and not the fresh create, whose failed Create would
+	// otherwise release the (ct, host, name) leases that directory may still
+	// hold. No record (an earlier build's container, or no directory) is
+	// handled as before. The row stays pending for the operator.
+	if why := c.foreignOwner(ct); why != "" {
+		slog.Error("containercheck: relocate-recreate refused: a container of this name on this host is not the relocating container's",
+			"container", ct.Name, "reason", why)
+		c.publish("ct.relocate.failed", ct.Name, why)
+		return
+	}
+
 	// Already materialized by a prior tick (runtime container exists)? A prior tick
 	// may have created the runtime but failed to write the interface rows — so
 	// ENSURE the managed rows are present (and IPs re-reserved) BEFORE clearing the
 	// relocate marker, otherwise clearing it would drop the rebuild forever.
 	if live, err := c.runtime.State(ctx, ct.Name); err == nil &&
 		(live == lxc.StateRunning || live == lxc.StateStopped) {
-		// A container of this name already here is adopted only when it is
-		// this row's: its owner record (when it has one) names the row's
-		// project and lineage. Names are per host and reusable, so another
-		// project's container — or another lineage of the name — is not a
-		// prior tick's work. The row stays pending for the operator.
-		if why := c.foreignOwner(ct); why != "" {
-			slog.Error("containercheck: relocate-recreate refused: a container of this name on this host is not the relocating container's",
-				"container", ct.Name, "reason", why)
-			c.publish("ct.relocate.failed", ct.Name, why)
-			return
-		}
 		ifs := corrosion.BuildContainerInterfacesFromSpec(c.hostName, ct.Name, spec)
 		if !c.writeRelocatedNICs(ctx, ct.Name, ifs) {
 			return // row write failed → keep the marker, retry next sweep

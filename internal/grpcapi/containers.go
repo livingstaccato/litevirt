@@ -816,6 +816,9 @@ func (s *Server) PullOCIImage(ctx context.Context, req *pb.PullOCIImageRequest) 
 	if err := s.refuseForeignOCIItem(ctx, item, req.Project, "pull over"); err != nil {
 		return nil, err
 	}
+	if err := s.refuseClaimingOwnerlessItem(ctx, item, req.Dest, req.Project); err != nil {
+		return nil, err
+	}
 	if err := s.containerRuntime.PullOCIImage(ctx, req.Image, req.Dest, req.Tag, req.Username, req.Password); err != nil {
 		return nil, status.Errorf(codes.Internal, "pull oci: %v", err)
 	}

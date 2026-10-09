@@ -162,6 +162,34 @@ func (s *Server) refuseForeignOCIItem(ctx context.Context, name, project, verb s
 		name, owner, tenancy.NormalizeProject(project), verb)
 }
 
+// refuseClaimingOwnerlessItem refuses an owner-bound caller (not an admin,
+// or a peer forwarding for one) a pull with --project over a library item
+// that exists with no owner record. Such an item was pulled before owners
+// were recorded, or without --project, and is everyone's: containers of any
+// project may run from it, and claiming it for one project would refuse
+// every other project's container at its next create from it (a compose
+// recreate, after its delete). The first claim of an existing ownerless item
+// is the Admin's; a pull without --project, or into a new name, is not.
+func (s *Server) refuseClaimingOwnerlessItem(ctx context.Context, name, dest, project string) error {
+	if name == "" || project == "" || s.dataDir == "" || !s.ownerStrict(ctx) {
+		return nil
+	}
+	if _, err := os.Stat(dest); err != nil {
+		return nil // a new item: its puller's project owns it
+	}
+	owner, err := s.readOCIOwner(name)
+	if err != nil {
+		return status.Errorf(codes.PermissionDenied, "OCI image %q: its owner record is unreadable: %v", name, err)
+	}
+	if owner != "" {
+		return nil
+	}
+	return status.Errorf(codes.PermissionDenied,
+		"OCI image %q exists and belongs to no project, so containers of any project may run from it; "+
+			"claiming it for project %q needs the Admin role (pull without --project, or into another name)",
+		name, tenancy.NormalizeProject(project))
+}
+
 // SetContainerLxcpath sets the LXC container store the runtime uses (its
 // lxcpath; default /var/lib/lxc), inside which an Admin's template may be read.
 func (s *Server) SetContainerLxcpath(p string) { s.lxcStore = p }

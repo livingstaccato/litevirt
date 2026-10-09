@@ -70,7 +70,10 @@ paths:
   project; through a forwarding node too. A pull **without** `--project`
   records no owner, and the image is everyone's, as on earlier releases — as
   is every image pulled before owners were recorded (nothing is backfilled).
-  The Admin may use any image.
+  Containers of any project may run from such an ownerless item, so claiming
+  it with `--project` (a pull over an existing item that has no owner) needs
+  the Admin role; pull without `--project`, or into a new name. The Admin may
+  use any image.
 - Any other host path (`--template /srv/rootfs`, `rootfs:<path>`, a relative
   path, an absolute `lv ct pull --dest`, a local `oci:` source) needs
   `storage.hostpath` at the cluster root — the Admin role.

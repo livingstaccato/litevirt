@@ -1038,7 +1038,7 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	// container moving.
 	operatorRestore := !s.isPeerRelocation(ctx, req.Proof != nil) && s.migrateSourceFromPeer(ctx) == ""
 	if operatorRestore {
-		spec.CreateSpec = s.relineageRestored(ctx, req.Name, spec.CreateSpec)
+		spec.CreateSpec = s.relineageRestored(ctx, req.Name, spec.CreateSpec, manifest.Timestamp)
 	}
 	s.stampContainerOwner(req.Name, project, spec.CreateSpec)
 	if operatorRestore {

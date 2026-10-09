@@ -13655,9 +13655,15 @@ type ProbeContainerBackupsRequest struct {
 	// manifest of the same project but another lineage is not this
 	// container's: failover would not restore it. Empty (an older peer, or a
 	// container from before owner ids) matches by project, as before.
-	OwnerId       string `protobuf:"bytes,4,opt,name=owner_id,json=ownerId,proto3" json:"owner_id,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	OwnerId string `protobuf:"bytes,4,opt,name=owner_id,json=ownerId,proto3" json:"owner_id,omitempty"`
+	// restored_from_owner_id / restored_from_ts: the parent lineage of a
+	// restore that was given a new owner_id, and the backup it came from.
+	// That lineage's manifests up to restored_from_ts are this container's
+	// too. Empty (an older peer, or no parent) adds nothing.
+	RestoredFromOwnerId string `protobuf:"bytes,5,opt,name=restored_from_owner_id,json=restoredFromOwnerId,proto3" json:"restored_from_owner_id,omitempty"`
+	RestoredFromTs      string `protobuf:"bytes,6,opt,name=restored_from_ts,json=restoredFromTs,proto3" json:"restored_from_ts,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *ProbeContainerBackupsRequest) Reset() {
@@ -13714,6 +13720,20 @@ func (x *ProbeContainerBackupsRequest) GetRepos() []string {
 func (x *ProbeContainerBackupsRequest) GetOwnerId() string {
 	if x != nil {
 		return x.OwnerId
+	}
+	return ""
+}
+
+func (x *ProbeContainerBackupsRequest) GetRestoredFromOwnerId() string {
+	if x != nil {
+		return x.RestoredFromOwnerId
+	}
+	return ""
+}
+
+func (x *ProbeContainerBackupsRequest) GetRestoredFromTs() string {
+	if x != nil {
+		return x.RestoredFromTs
 	}
 	return ""
 }
@@ -35578,12 +35598,14 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x12unavailable_reason\x18\x05 \x01(\tR\x11unavailableReason\x12\x16\n" +
 	"\x06status\x18\x06 \x01(\tR\x06status\x12\x1a\n" +
 	"\blocation\x18\a \x01(\tR\blocation\x12)\n" +
-	"\x10latest_timestamp\x18\b \x01(\tR\x0flatestTimestamp\"}\n" +
+	"\x10latest_timestamp\x18\b \x01(\tR\x0flatestTimestamp\"\xdc\x01\n" +
 	"\x1cProbeContainerBackupsRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x18\n" +
 	"\aproject\x18\x02 \x01(\tR\aproject\x12\x14\n" +
 	"\x05repos\x18\x03 \x03(\tR\x05repos\x12\x19\n" +
-	"\bowner_id\x18\x04 \x01(\tR\aownerId\"\xb2\x02\n" +
+	"\bowner_id\x18\x04 \x01(\tR\aownerId\x123\n" +
+	"\x16restored_from_owner_id\x18\x05 \x01(\tR\x13restoredFromOwnerId\x12(\n" +
+	"\x10restored_from_ts\x18\x06 \x01(\tR\x0erestoredFromTs\"\xb2\x02\n" +
 	"\x14ContainerBackupProbe\x12\x12\n" +
 	"\x04repo\x18\x01 \x01(\tR\x04repo\x12\x16\n" +
 	"\x06opened\x18\x02 \x01(\bR\x06opened\x12\x1e\n" +

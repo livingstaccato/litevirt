@@ -1426,6 +1426,12 @@ message ProbeContainerBackupsRequest {
     // container's: failover would not restore it. Empty (an older peer, or a
     // container from before owner ids) matches by project, as before.
     string owner_id = 4;
+    // restored_from_owner_id / restored_from_ts: the parent lineage of a
+    // restore that was given a new owner_id, and the backup it came from.
+    // That lineage's manifests up to restored_from_ts are this container's
+    // too. Empty (an older peer, or no parent) adds nothing.
+    string restored_from_owner_id = 5;
+    string restored_from_ts       = 6;
 }
 message ContainerBackupProbe {
     string repo             = 1;

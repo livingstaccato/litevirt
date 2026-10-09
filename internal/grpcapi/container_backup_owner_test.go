@@ -337,3 +337,155 @@ func TestRestoreContainer_PeerRelocationKeepsTheLineage(t *testing.T) {
 		t.Fatalf("relocated on-disk owner record = %+v, want own-1", got)
 	}
 }
+
+// I-1, scenario A: the operator's manual host-loss recovery. web's host-a
+// died and its row stays (fenced, not relocated); the operator restores last
+// night's backup on host-b. The row on host-a makes the restore a copy with a
+// lineage of its own, but it keeps the backup it came from: when host-b dies
+// before the first new backup, failover rebuilds it from that backup rather
+// than from the image.
+func TestRestoreContainer_RecoveryBesideADeadHostsRowKeepsItsBackup(t *testing.T) {
+	s, _ := secServer(t)
+	ctx := context.Background()
+	repo := ctTestRepo(t)
+	if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{
+		HostName: "host-a", Name: "db", State: "running", Image: "alpine:3.19", Project: "acme",
+		CreateSpec: corrosion.EncodeCreateSpec(corrosion.ContainerCreateSpec{Template: "download", OwnerID: "own-1"}),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	bk := &progressStream[pb.BackupContainerProgress]{ctx: adminCtx()}
+	if err := s.BackupContainer(&pb.BackupContainerRequest{
+		Name: "db", HostName: "host-a", RepoPath: repo, Timestamp: "2026-10-08T12:00:00Z",
+	}, bk); err != nil {
+		t.Fatalf("backup: %v", err)
+	}
+
+	s.hostName = "host-b"
+	rs := &progressStream[pb.RestoreContainerProgress]{ctx: adminCtx()}
+	if err := s.RestoreContainer(&pb.RestoreContainerRequest{
+		Name: "db", RepoPath: repo, Timestamp: "2026-10-08T12:00:00Z",
+	}, rs); err != nil {
+		t.Fatalf("recover on host-b: %v", err)
+	}
+	cp := specOf(t, s, "host-b", "db")
+	if cp.OwnerID == "" || cp.OwnerID == "own-1" || cp.RestoredFromOwnerID != "own-1" || cp.RestoredFromTS != "2026-10-08T12:00:00Z" {
+		t.Fatalf("recovered spec = %+v, want a new owner_id restored from own-1 at 2026-10-08T12:00:00Z", cp)
+	}
+
+	if got := failOverRestoreTs(t, s, repo, "host-b", "db"); got != "2026-10-08T12:00:00Z" {
+		t.Fatalf("failover restored %q, want the backup it was recovered from (2026-10-08T12:00:00Z)", got)
+	}
+}
+
+// I-1, scenario B: a copy restored beside a live original fails over to the
+// backup it was restored from — and never to a backup the original took
+// after the restore, which is the original's data, not the copy's.
+func TestRestoreContainer_CopyFailsOverToItsOwnStartingPoint(t *testing.T) {
+	s, _, repo := restoreIPServer(t)
+	s.hostName = "host-b"
+	rs := &progressStream[pb.RestoreContainerProgress]{ctx: adminCtx()}
+	assertIPUnavailable(t, s.RestoreContainer(&pb.RestoreContainerRequest{
+		Name: "web", RepoPath: repo, Timestamp: "2026-10-08T12:00:00Z", Start: true,
+	}, rs))
+	// The original runs on and is backed up after the restore.
+	s.hostName = "host-a"
+	bk := &progressStream[pb.BackupContainerProgress]{ctx: adminCtx()}
+	if err := s.BackupContainer(&pb.BackupContainerRequest{
+		Name: "web", HostName: "host-a", RepoPath: repo, Timestamp: "2026-10-09T12:00:00Z",
+	}, bk); err != nil {
+		t.Fatalf("backup the original: %v", err)
+	}
+	if got := failOverRestoreTs(t, s, repo, "host-b", "web"); got != "2026-10-08T12:00:00Z" {
+		t.Fatalf("the copy failed over to %q, want its own starting point 2026-10-08T12:00:00Z (not the original's 10-09)", got)
+	}
+}
+
+// failOverRestoreTs marks host/name for a restore-relocation to host-z, with
+// repo as the configured backup repo, and returns the backup timestamp
+// failover drives (failing when none is chosen).
+func failOverRestoreTs(t *testing.T, s *Server, repo, host, name string) string {
+	t.Helper()
+	ctx := context.Background()
+	row, err := corrosion.GetContainer(ctx, s.db, host, name)
+	if err != nil || row == nil {
+		t.Fatalf("row %s/%s: %v", host, name, err)
+	}
+	row.State, row.StateDetail = "relocating", corrosion.RelocateRestoreDetail("host-z", "tok-fo")
+	if err := corrosion.UpsertContainer(ctx, s.db, *row); err != nil {
+		t.Fatal(err)
+	}
+	s.SetBackupRepos(map[string]string{"main": repo})
+	var gotTs string
+	s.migrateRestoreOverride = func(_ context.Context, _, _, _, ts string, _ bool) (corrosion.RestoreOutcome, error) {
+		gotTs = ts
+		return corrosion.RestoreLanded, nil
+	}
+	if _, err := s.RestoreContainerFromBackup(ctx, name, "host-z", "tok-fo"); err != nil {
+		t.Fatalf("failover of %s/%s chose no backup: %v", host, name, err)
+	}
+	return gotTs
+}
+
+// I-1 (d): inspect shows a restored copy the backup it came from as
+// available — on this host and on the peer that holds the repo — and its
+// size and time are that backup's, not the parent's later one.
+func TestInspectContainer_ARestoredCopyShowsTheBackupItCameFrom(t *testing.T) {
+	restoredFrom := func(t *testing.T, s *Server) {
+		t.Helper()
+		ctx := context.Background()
+		row, _ := corrosion.GetContainer(ctx, s.db, "host-a", "ct1")
+		cs := corrosion.DecodeCreateSpec(row.CreateSpec)
+		cs.OwnerID, cs.RestoredFromOwnerID, cs.RestoredFromTS = "own-2", "own-1", "2026-10-08T10:00:00Z"
+		row.CreateSpec = corrosion.EncodeCreateSpec(cs)
+		if err := corrosion.UpsertContainer(ctx, s.db, *row); err != nil {
+			t.Fatal(err)
+		}
+	}
+	check := func(t *testing.T, s *Server) {
+		t.Helper()
+		d, err := s.InspectContainer(adminCtx(), &pb.InspectContainerRequest{Name: "ct1"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(d.GetBackups()) != 1 {
+			t.Fatalf("backups = %+v", d.GetBackups())
+		}
+		if b := d.GetBackups()[0]; b.GetStatus() != backupAvailable || b.GetLatestTimestamp() != "2026-10-08T10:00:00Z" {
+			t.Fatalf("backup = %+v, want available at the restored-from 10:00 (not the parent's 11:00)", b)
+		}
+	}
+	t.Run("local", func(t *testing.T) {
+		s := inspectTestServer(t, "")
+		restoredFrom(t, s)
+		repo := ctTestRepo(t)
+		putCTManifestOwned(t, repo, "ct1", "acme", "own-1", "2026-10-08T10:00:00Z")
+		putCTManifestOwned(t, repo, "ct1", "acme", "own-1", "2026-10-08T11:00:00Z")
+		if err := corrosion.UpsertContainerBackup(context.Background(), s.db, "acme", "ct1", repo, 4096); err != nil {
+			t.Fatal(err)
+		}
+		check(t, s)
+	})
+	t.Run("peer", func(t *testing.T) {
+		owner := inspectTestServer(t, "")
+		restoredFrom(t, owner)
+		sink := newPeerAuthServer(t)
+		sink.hostName = "sink-host"
+		sinkDir := ctTestRepo(t)
+		sink.SetBackupRepos(map[string]string{"r1": sinkDir})
+		putCTManifestOwned(t, sinkDir, "ct1", "acme", "own-1", "2026-10-08T10:00:00Z")
+		putCTManifestOwned(t, sinkDir, "ct1", "acme", "own-1", "2026-10-08T11:00:00Z")
+		addHost(t, sink, "host-a")
+		addHost(t, owner, "sink-host")
+		if err := corrosion.UpsertContainerBackup(context.Background(), owner.db, "acme", "ct1", "r1", 7000); err != nil {
+			t.Fatal(err)
+		}
+		owner.peerClientOverride = func(_ context.Context, host string) (pb.LiteVirtClient, func(), error) {
+			if host != "sink-host" {
+				return nil, nil, status.Error(codes.Unavailable, "no such peer")
+			}
+			return &probePeer{srv: sink, callAs: "host-a"}, func() {}, nil
+		}
+		check(t, owner)
+	})
+}

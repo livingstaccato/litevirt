@@ -69,7 +69,7 @@ func (s *Server) ProbeContainerBackups(ctx context.Context, req *pb.ProbeContain
 	}
 	resp := &pb.ProbeContainerBackupsResponse{}
 	for _, r := range req.Repos {
-		resp.Results = append(resp.Results, s.probeContainerBackupRepo(ctx, req.Name, req.Project, req.OwnerId, r))
+		resp.Results = append(resp.Results, s.probeContainerBackupRepo(ctx, req.Name, req.Project, probeLineageOf(req), r))
 	}
 	return resp, nil
 }
@@ -85,7 +85,7 @@ func (s *Server) ProbeContainerBackups(ctx context.Context, req *pb.ProbeContain
 // project's. The work is bounded: it waits for a probe slot only
 // until ctx ends, stops the walk when ctx ends, and reuses a recent read of
 // the same repo and name.
-func (s *Server) probeContainerBackupRepo(ctx context.Context, name, project, ownerID, repo string) *pb.ContainerBackupProbe {
+func (s *Server) probeContainerBackupRepo(ctx context.Context, name, project string, lineage corrosion.ContainerCreateSpec, repo string) *pb.ContainerBackupProbe {
 	out := &pb.ContainerBackupProbe{Repo: repo}
 	path := ""
 	if p, ok := s.backupRepos[repo]; ok {
@@ -111,8 +111,7 @@ func (s *Server) probeContainerBackupRepo(ctx context.Context, name, project, ow
 	}
 	out.Opened = true
 	want := tenancy.NormalizeProject(project)
-	owner := &corrosion.ContainerRecord{Name: name, Project: want,
-		CreateSpec: corrosion.EncodeCreateSpec(corrosion.ContainerCreateSpec{OwnerID: ownerID})}
+	owner := &corrosion.ContainerRecord{Name: name, Project: want, CreateSpec: corrosion.EncodeCreateSpec(lineage)}
 	for i := range ms {
 		m := &ms[i]
 		if m.ContainerSpecJSON == "" {
@@ -198,7 +197,7 @@ func (s *Server) resolveContainerBackups(ctx context.Context, rec *corrosion.Con
 		return
 	}
 	project := tenancy.NormalizeProject(rec.Project)
-	ownerID := corrosion.DecodeCreateSpec(rec.CreateSpec).OwnerID
+	lineage := probeLineage(corrosion.DecodeCreateSpec(rec.CreateSpec))
 	type agg struct {
 		foreign      bool
 		otherLineage bool
@@ -251,7 +250,7 @@ func (s *Server) resolveContainerBackups(ctx context.Context, rec *corrosion.Con
 	// the deadline with the entries unknown, and the walk finishes (or not)
 	// in the background, holding only its probe slot.
 	if s.db != nil {
-		for _, p := range s.probeLocalBounded(ctx, rec.Name, project, ownerID, pending) {
+		for _, p := range s.probeLocalBounded(ctx, rec.Name, project, lineage, pending) {
 			apply(s.hostName, p)
 		}
 	}
@@ -277,7 +276,7 @@ func (s *Server) resolveContainerBackups(ctx context.Context, rec *corrosion.Con
 			wg.Add(1)
 			go func(host string) {
 				defer wg.Done()
-				res, perr := s.probePeerContainerBackups(ctx, host, rec.Name, project, ownerID, left)
+				res, perr := s.probePeerContainerBackups(ctx, host, rec.Name, project, lineage, left)
 				mu.Lock()
 				defer mu.Unlock()
 				if perr != nil {
@@ -306,7 +305,7 @@ func (s *Server) resolveContainerBackups(ctx context.Context, rec *corrosion.Con
 			// Same project, so ahead of foreign: it is the likelier
 			// mistake (an operator who recreated the name) to explain.
 			ref.Status = backupOtherLineage
-			ref.UnavailableReason = "the repo holds backups of another container of this name in this project (deleted, or a copy restored beside it), not this one; failover will not restore them"
+			ref.UnavailableReason = "the repo holds backups of another lineage of this name in this project (a predecessor, the original of a restored copy, or a copy), not this one; failover will not restore them"
 		case a.foreign:
 			ref.Status = backupForeign
 			ref.UnavailableReason = "the repo holds backups of a same-named container in another project, not this one"
@@ -320,7 +319,7 @@ func (s *Server) resolveContainerBackups(ctx context.Context, rec *corrosion.Con
 	}
 }
 
-func (s *Server) probePeerContainerBackups(ctx context.Context, host, name, project, ownerID string, repos []string) ([]*pb.ContainerBackupProbe, error) {
+func (s *Server) probePeerContainerBackups(ctx context.Context, host, name, project string, lineage corrosion.ContainerCreateSpec, repos []string) ([]*pb.ContainerBackupProbe, error) {
 	pctx, cancel := context.WithTimeout(ctx, backupProbeTimeout)
 	defer cancel()
 	c, closeFn, err := s.dialPeer(pctx, host)
@@ -328,12 +327,27 @@ func (s *Server) probePeerContainerBackups(ctx context.Context, host, name, proj
 		return nil, err
 	}
 	defer closeFn()
-	// A peer that predates owner_id ignores it and matches by project.
-	resp, err := c.ProbeContainerBackups(pctx, &pb.ProbeContainerBackupsRequest{Name: name, Project: project, OwnerId: ownerID, Repos: repos})
+	// A peer that predates owner_id ignores it and matches by project; one
+	// that predates the parent fields ignores them.
+	resp, err := c.ProbeContainerBackups(pctx, &pb.ProbeContainerBackupsRequest{Name: name, Project: project,
+		OwnerId: lineage.OwnerID, RestoredFromOwnerId: lineage.RestoredFromOwnerID, RestoredFromTs: lineage.RestoredFromTS, Repos: repos})
 	if err != nil {
 		return nil, err
 	}
 	return resp.GetResults(), nil
+}
+
+// probeLineage is the part of a create spec a backup probe judges by: the
+// owner_id and, for a restore given a new one, its parent (manifestOwnedBy).
+func probeLineage(cs corrosion.ContainerCreateSpec) corrosion.ContainerCreateSpec {
+	return corrosion.ContainerCreateSpec{OwnerID: cs.OwnerID,
+		RestoredFromOwnerID: cs.RestoredFromOwnerID, RestoredFromTS: cs.RestoredFromTS}
+}
+
+// probeLineageOf is probeLineage carried by a peer's probe request.
+func probeLineageOf(req *pb.ProbeContainerBackupsRequest) corrosion.ContainerCreateSpec {
+	return corrosion.ContainerCreateSpec{OwnerID: req.OwnerId,
+		RestoredFromOwnerID: req.RestoredFromOwnerId, RestoredFromTS: req.RestoredFromTs}
 }
 
 func joinReasons(rs []string) string {
@@ -376,13 +390,13 @@ func filterContainerBackups(d *pb.ContainerDetail, admin bool) *pb.ContainerDeta
 
 // probeLocalBounded probes repos on this host within backupProbeTimeout. A
 // repo not answered by then is reported unreadable (so it stays unknown).
-func (s *Server) probeLocalBounded(ctx context.Context, name, project, ownerID string, repos []string) []*pb.ContainerBackupProbe {
+func (s *Server) probeLocalBounded(ctx context.Context, name, project string, lineage corrosion.ContainerCreateSpec, repos []string) []*pb.ContainerBackupProbe {
 	lctx, cancel := context.WithTimeout(ctx, backupProbeTimeout)
 	defer cancel()
 	results := make(chan *pb.ContainerBackupProbe, len(repos))
 	go func() {
 		for _, repo := range repos {
-			results <- s.probeContainerBackupRepo(lctx, name, project, ownerID, repo)
+			results <- s.probeContainerBackupRepo(lctx, name, project, lineage, repo)
 		}
 	}()
 	got := make(map[string]*pb.ContainerBackupProbe, len(repos))

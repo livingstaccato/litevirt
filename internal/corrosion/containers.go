@@ -164,6 +164,15 @@ type ContainerCreateSpec struct {
 	// on-disk directory) instead of its reusable name. Empty for a container
 	// an earlier build created: its files then match as before, by name.
 	OwnerID string `json:"owner_id,omitempty"`
+	// RestoredFromOwnerID and RestoredFromTS record where a restore that was
+	// given a new OwnerID came from: the backed-up lineage and the timestamp
+	// of the backup it was restored from. That lineage's backups up to and
+	// including that one are this container's starting point too, so it can
+	// be rebuilt from them before it has a backup of its own. Never the
+	// parent's later ones: those are another container's data. Empty for any
+	// container that kept its lineage, and on a clone.
+	RestoredFromOwnerID string `json:"restored_from_owner_id,omitempty"`
+	RestoredFromTS      string `json:"restored_from_ts,omitempty"`
 	// IDMapBase is the first host id of an unprivileged container's range
 	// (0..65535 inside map to IDMapBase..IDMapBase+65535); 0 is privileged.
 	// Confinement is "default" or "legacy"; empty for a container an earlier

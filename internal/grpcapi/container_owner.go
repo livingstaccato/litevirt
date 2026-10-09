@@ -120,7 +120,9 @@ func (s *Server) refuseForeignSnapshot(ctx context.Context, tar, snap string, re
 
 // manifestOwnedBy reports whether a container backup manifest can be rec's:
 // its embedded project, and owner_id where both carry one, match. A manifest
-// with no project (an earlier build's) matches by name, as before.
+// with no project (an earlier build's) matches by name, as before. A restore
+// given a new owner_id also owns its parent lineage's backups up to the one
+// it was restored from (relineageRestored), never the parent's later ones.
 func manifestOwnedBy(m *pbsstore.Manifest, rec *corrosion.ContainerRecord) bool {
 	if rec == nil || m.ContainerSpecJSON == "" {
 		return true
@@ -134,7 +136,12 @@ func manifestOwnedBy(m *pbsstore.Manifest, rec *corrosion.ContainerRecord) bool 
 	}
 	theirs := corrosion.DecodeCreateSpec(spec.CreateSpec).OwnerID
 	mine := corrosion.DecodeCreateSpec(rec.CreateSpec).OwnerID
-	return theirs == "" || mine == "" || theirs == mine
+	if theirs == "" || mine == "" || theirs == mine {
+		return true
+	}
+	cs := corrosion.DecodeCreateSpec(rec.CreateSpec)
+	return cs.RestoredFromOwnerID != "" && theirs == cs.RestoredFromOwnerID &&
+		cs.RestoredFromTS != "" && m.Timestamp <= cs.RestoredFromTS
 }
 
 // relocatingContainer is the row the failover coordinator marked for a
@@ -187,17 +194,24 @@ func (s *Server) heldBesideRestore(rows []corrosion.ContainerRecord, name string
 }
 
 // relineageRestored gives an operator-restored container a new owner_id when
-// another live container records the backed-up one: the original lives on,
-// and the restore is a copy beside it. Keeping the original's lineage would
-// make the copy's later backups the original's, and failover could rebuild
-// the original from the copy's data. With no live holder (the original is
-// gone) the restore is the same lineage coming back and keeps it. A migrate or
-// relocation never comes here: it is the same container moving.
+// another live container records the backed-up one: the original lives on
+// (or its row does, on a dead or fenced host), and the restore is a copy
+// beside it. Keeping the original's lineage would make the copy's later
+// backups the original's, and failover could rebuild the original from the
+// copy's data. With no live holder (the original is gone) the restore is the
+// same lineage coming back and keeps it. A migrate or relocation never comes
+// here: it is the same container moving.
+//
+// A new owner_id records its parent: the backed-up lineage and fromTS, the
+// timestamp of the backup restored. manifestOwnedBy accepts that lineage's
+// backups up to fromTS as the copy's own starting point, so the copy can be
+// rebuilt from them before it has a backup of its own, and never from the
+// parent's later data.
 //
 // When the rows cannot be read the restore still goes ahead, as a new
-// lineage: that can never hand failover another container's data, and it
-// costs only the link to the backups taken before it.
-func (s *Server) relineageRestored(ctx context.Context, name, createSpec string) string {
+// lineage with its parent recorded: that can never hand failover another
+// container's data, and keeps the backup it came from.
+func (s *Server) relineageRestored(ctx context.Context, name, createSpec, fromTS string) string {
 	cs := corrosion.DecodeCreateSpec(createSpec)
 	rows, err := corrosion.ListContainers(ctx, s.db, "")
 	switch {
@@ -208,6 +222,7 @@ func (s *Server) relineageRestored(ctx context.Context, name, createSpec string)
 	default:
 		slog.Info("container restore: the backed-up container lives on; the restore is a copy with a lineage of its own", "name", name, "backed_up_owner_id", cs.OwnerID)
 	}
+	cs.RestoredFromOwnerID, cs.RestoredFromTS = cs.OwnerID, fromTS
 	cs.OwnerID = randid.New()
 	return corrosion.EncodeCreateSpec(cs)
 }

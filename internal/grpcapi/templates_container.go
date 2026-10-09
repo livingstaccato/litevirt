@@ -229,6 +229,7 @@ func (s *Server) CloneContainer(ctx context.Context, req *pb.CloneContainerReque
 	// A clone is a new lineage, with its own owner record (the copied
 	// directory carried the source's).
 	cloneSpec.OwnerID = randid.New()
+	cloneSpec.RestoredFromOwnerID, cloneSpec.RestoredFromTS = "", ""
 	cloneSpec.IDMapBase = cloneBase
 	s.stampContainerOwner(req.Target, project, corrosion.EncodeCreateSpec(cloneSpec))
 	rec := corrosion.ContainerRecord{

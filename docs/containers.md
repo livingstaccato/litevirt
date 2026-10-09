@@ -159,9 +159,10 @@ by; see [Owner records](#owner-records)) in that repository. The entry is then:
 - **unknown**: no host holds it, but some host could not be asked, or could
   not read the repository;
 - **another container's**: the repository only holds backups of another
-  container of this name in this project — one deleted before this one was
-  created, or a copy restored beside it. Host-loss restore will not use them,
-  so they do not protect this container;
+  lineage of this name in this project — a predecessor deleted before this one
+  was created, the original of a copy, or a copy restored beside this one.
+  Host-loss restore will not use them, so they do not protect this container
+  (a restored copy's own starting point, below, is not among them);
 - **another project's**: the repository only holds backups of a same-named
   container in another project.
 
@@ -694,12 +695,23 @@ project plus an `owner_id` in the container's create spec.
 - `owner_id` is minted when a container is created or cloned (a clone is a new
   lineage), and kept by `lv ct migrate`, host-loss relocation and restore. A
   restore of a backup from an earlier release, which carries none, gets one.
-- A restore beside a container that still records the backed-up `owner_id`
-  (`lv ct restore --host` while the original runs elsewhere) is a copy, not the
-  original: it gets a new `owner_id`, as it gets a fresh id range and no claim on
-  the original's address. Its later backups are therefore its own, and a
-  host-loss restore of the original never picks them. A restore after the
-  original was deleted keeps the lineage.
+- A restore beside a container row that still records the backed-up
+  `owner_id` is a copy, not the original: `lv ct restore --host` while the
+  original runs elsewhere, and also a recovery while the original's row is still
+  on a dead or fenced host. It gets a new `owner_id`, as it gets a fresh id range
+  and no claim on the original's address, and it records where it came from
+  (`restored_from_owner_id`, `restored_from_ts` in its create spec). Its later
+  backups are therefore its own, and a host-loss restore of the original never
+  picks them. The copy itself can be rebuilt from the backup it was restored
+  from (and that lineage's earlier ones) until it has its own, never from a
+  backup the original took after the restore. A restore after the original was
+  deleted keeps the lineage.
+- An original with **no** `owner_id` (created by an earlier release, or by a
+  node on an earlier release during an upgrade) is still matched by name: a
+  host-loss restore of it can pick a newer backup of a copy restored beside
+  it, as before owner records. Nothing adds an `owner_id` to a running
+  container; recreating it, or deleting it and restoring its backup, gives it
+  one.
 - It is stamped on disk as `<lxcpath>/<name>/litevirt-owner` (re-stamped after
   every restore and migrate, whatever the archive held), beside each snapshot
   tar as `<snapshot>.tar.owner`, and it rides in every backup manifest inside

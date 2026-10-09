@@ -77,8 +77,14 @@ paths:
 - Whoever asks, a template or OCI source may not be under, or contain, a
   directory that holds host secrets or live state (`/etc`, `/boot`, `/dev`,
   `/proc`, `/sys`, `/var/backups`, `/var/spool`, `/var/lib/lxc` (but see below), libvirt's
-  per-domain state), the daemon's PKI directory, or its data directory apart
-  from `pools/`, `mounts/`, `disks/uploads/` and `oci/`. `/home`, `/root` and
+  per-domain state), the daemon's PKI directory, or its data directory
+  (configured, and the default `/var/lib/litevirt` when `data_dir` is
+  elsewhere) or a directory containing it. Inside a data directory the rule
+  is the pool rule: the daemon's own state (`vms/`, `backup-scratch/`,
+  `ct-snapshots/`, ...), `disks/` apart from `disks/uploads/`, and the roots
+  of `pools/` and `mounts/` are refused; a directory inside a pool, the OCI
+  library under `oci/`, and any other child (a `<data_dir>/rc5pool` made
+  before this release) are ordinary host paths. `/home`, `/root` and
   `/run` themselves, a whole home directory, and a link into a dot-directory
   are refused too. An absolute pull `--dest` follows the pool rule for a
   directory the daemon writes into, except that the OCI library itself is the

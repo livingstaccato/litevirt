@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 )
 
 // A container can be handed a host DIRECTORY to read: a rootfs template is
@@ -22,9 +23,11 @@ const OCILibraryDir = "oci"
 
 // CheckReadDir refuses a host directory no container may be given as a rootfs
 // template or OCI source: a relative or unclean path, anything under or
-// containing a secret system directory, the daemon's PKI directory, or its
-// data directory (apart from pool content and the OCI library), and a
-// user-data root (/home, /root, /run) itself, a home directory itself, or a
+// containing a secret system directory, the daemon's PKI directory, its data
+// directory (configured or default) or a directory containing it, inside it
+// the daemon's own state, disks/ apart from disks/uploads/ and the roots of
+// pools/ and mounts/ (dataDirReadDirRefusal: another child is an ordinary
+// host path), and a user-data root (/home, /root, /run) itself, a home directory itself, or a
 // link into a dot-directory the path does not name. The path is judged as
 // written and after resolving symlinks, and must exist as a directory.
 func CheckReadDir(p, dataDir, pkiDir string) error {
@@ -92,13 +95,13 @@ func refuseReadDir(p, cand, dataDir, pkiDir string) error {
 			}
 		}
 	}
-	if dataDir != "" {
-		for _, d := range pathForms(dataDir) {
+	for _, dd := range dataDirsToJudge(dataDir) {
+		for _, d := range pathForms(dd) {
 			if within(cand, d) {
-				return fmt.Errorf("%q is the daemon's data directory %s or contains it", p, dataDir)
+				return fmt.Errorf("%q is the daemon's data directory %s or contains it", p, dd)
 			}
-			if within(d, cand) && !inPoolArea(d, cand) && !inDiskUploads(d, cand) && !inOCILibrary(d, cand) {
-				return fmt.Errorf("%q is inside the daemon's data directory %s; only its pools/, mounts/, disks/uploads/ and %s/ hold content a container may be given", p, dataDir, OCILibraryDir)
+			if err := dataDirReadDirRefusal(p, d, cand, dd); err != nil {
+				return err
 			}
 		}
 	}
@@ -116,6 +119,28 @@ func refuseReadDir(p, cand, dataDir, pkiDir string) error {
 				}
 			}
 		}
+	}
+	return nil
+}
+
+// dataDirReadDirRefusal judges a directory cand strictly inside the data
+// directory d by the rule pools and file reads use: content under pools/<x>,
+// mounts/<x>, disks/uploads/ and the OCI library passes; the rest of disks/,
+// the roots of pools/ and mounts/, and the daemon's own state (dataDirOwned)
+// are refused; any other child (a main-era <data_dir>/rc5pool) is an ordinary
+// host path.
+func dataDirReadDirRefusal(p, d, cand, dataDir string) error {
+	first, depth, ok := dataDirChild(d, cand)
+	if !ok || inPoolArea(d, cand) || inDiskUploads(d, cand) || inOCILibrary(d, cand) {
+		return nil
+	}
+	switch {
+	case first == dataDirDisks:
+		return fmt.Errorf("%q is inside disks/ in the daemon's data directory %s, which holds every VM's disks; of disks/ only disks/uploads/ holds content a container may be given", p, dataDir)
+	case slices.Contains(dataDirPoolAreas, first) && depth == 1:
+		return fmt.Errorf("%q is the root of the daemon's %s/ area in its data directory %s, which holds every pool there; name a directory inside one pool", p, first, dataDir)
+	case dataDirChildOwned(first):
+		return fmt.Errorf("%q is the daemon's own state (%s in its data directory %s)", p, first, dataDir)
 	}
 	return nil
 }

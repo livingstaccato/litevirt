@@ -489,3 +489,34 @@ func TestInspectContainer_ARestoredCopyShowsTheBackupItCameFrom(t *testing.T) {
 		check(t, owner)
 	})
 }
+
+// m2: a restore after the original was deleted on ANOTHER host keeps the
+// lineage: the tombstoned row is not a live holder.
+func TestRestoreContainer_AfterDeleteOnAnotherHostKeepsTheLineage(t *testing.T) {
+	s, _ := secServer(t)
+	ctx := context.Background()
+	repo := ctTestRepo(t)
+	if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{
+		HostName: "host-a", Name: "c1", State: "stopped", Image: "alpine:3.19", Project: "acme",
+		CreateSpec: corrosion.EncodeCreateSpec(corrosion.ContainerCreateSpec{Template: "download", OwnerID: "own-1"}),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	bk := &progressStream[pb.BackupContainerProgress]{ctx: adminCtx()}
+	if err := s.BackupContainer(&pb.BackupContainerRequest{
+		Name: "c1", HostName: "host-a", RepoPath: repo, Timestamp: "2026-10-08T12:00:00Z",
+	}, bk); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.DeleteContainer(ctx, s.db, "host-a", "c1"); err != nil {
+		t.Fatal(err)
+	}
+	s.hostName = "host-b"
+	rs := &progressStream[pb.RestoreContainerProgress]{ctx: adminCtx()}
+	if err := s.RestoreContainer(&pb.RestoreContainerRequest{Name: "c1", RepoPath: repo, Timestamp: "2026-10-08T12:00:00Z"}, rs); err != nil {
+		t.Fatal(err)
+	}
+	if cs := specOf(t, s, "host-b", "c1"); cs.OwnerID != "own-1" || cs.RestoredFromOwnerID != "" {
+		t.Fatalf("restored spec = %+v, want the lineage own-1 kept, with no parent", cs)
+	}
+}

@@ -205,7 +205,7 @@ func (c *Checker) DurablyLatched(token string) bool {
 func (c *Checker) persistActivationMarker(base, token string) {
 	if err := os.WriteFile(markerPathFor(base, token), []byte("1\n"), 0o600); err != nil {
 		slog.Error("split-brain: failed to persist activation latch — enforcement will not survive a daemon restart until this write succeeds; retrying next cycle",
-			"token", token, "path", markerPathFor(base, token), "error", err)
+			"capability", token, "path", markerPathFor(base, token), "error", err)
 		return
 	}
 	c.mu.Lock()

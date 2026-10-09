@@ -164,6 +164,8 @@ const (
 	LiteVirt_DeleteContainer_FullMethodName            = "/litevirt.v1.LiteVirt/DeleteContainer"
 	LiteVirt_ExecContainer_FullMethodName              = "/litevirt.v1.LiteVirt/ExecContainer"
 	LiteVirt_ListContainers_FullMethodName             = "/litevirt.v1.LiteVirt/ListContainers"
+	LiteVirt_InspectContainer_FullMethodName           = "/litevirt.v1.LiteVirt/InspectContainer"
+	LiteVirt_ProbeContainerBackups_FullMethodName      = "/litevirt.v1.LiteVirt/ProbeContainerBackups"
 	LiteVirt_PullOCIImage_FullMethodName               = "/litevirt.v1.LiteVirt/PullOCIImage"
 	LiteVirt_BackupContainer_FullMethodName            = "/litevirt.v1.LiteVirt/BackupContainer"
 	LiteVirt_RestoreContainer_FullMethodName           = "/litevirt.v1.LiteVirt/RestoreContainer"
@@ -549,6 +551,8 @@ type LiteVirtClient interface {
 	DeleteContainer(ctx context.Context, in *DeleteContainerRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	ExecContainer(ctx context.Context, in *ExecContainerRequest, opts ...grpc.CallOption) (*ExecContainerResponse, error)
 	ListContainers(ctx context.Context, in *ListContainersRequest, opts ...grpc.CallOption) (*ListContainersResponse, error)
+	InspectContainer(ctx context.Context, in *InspectContainerRequest, opts ...grpc.CallOption) (*ContainerDetail, error)
+	ProbeContainerBackups(ctx context.Context, in *ProbeContainerBackupsRequest, opts ...grpc.CallOption) (*ProbeContainerBackupsResponse, error)
 	PullOCIImage(ctx context.Context, in *PullOCIImageRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	BackupContainer(ctx context.Context, in *BackupContainerRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[BackupContainerProgress], error)
 	RestoreContainer(ctx context.Context, in *RestoreContainerRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[RestoreContainerProgress], error)
@@ -2520,6 +2524,26 @@ func (c *liteVirtClient) ListContainers(ctx context.Context, in *ListContainersR
 	return out, nil
 }
 
+func (c *liteVirtClient) InspectContainer(ctx context.Context, in *InspectContainerRequest, opts ...grpc.CallOption) (*ContainerDetail, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ContainerDetail)
+	err := c.cc.Invoke(ctx, LiteVirt_InspectContainer_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) ProbeContainerBackups(ctx context.Context, in *ProbeContainerBackupsRequest, opts ...grpc.CallOption) (*ProbeContainerBackupsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ProbeContainerBackupsResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_ProbeContainerBackups_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) PullOCIImage(ctx context.Context, in *PullOCIImageRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(emptypb.Empty)
@@ -4337,6 +4361,8 @@ type LiteVirtServer interface {
 	DeleteContainer(context.Context, *DeleteContainerRequest) (*emptypb.Empty, error)
 	ExecContainer(context.Context, *ExecContainerRequest) (*ExecContainerResponse, error)
 	ListContainers(context.Context, *ListContainersRequest) (*ListContainersResponse, error)
+	InspectContainer(context.Context, *InspectContainerRequest) (*ContainerDetail, error)
+	ProbeContainerBackups(context.Context, *ProbeContainerBackupsRequest) (*ProbeContainerBackupsResponse, error)
 	PullOCIImage(context.Context, *PullOCIImageRequest) (*emptypb.Empty, error)
 	BackupContainer(*BackupContainerRequest, grpc.ServerStreamingServer[BackupContainerProgress]) error
 	RestoreContainer(*RestoreContainerRequest, grpc.ServerStreamingServer[RestoreContainerProgress]) error
@@ -5131,6 +5157,12 @@ func (UnimplementedLiteVirtServer) ExecContainer(context.Context, *ExecContainer
 }
 func (UnimplementedLiteVirtServer) ListContainers(context.Context, *ListContainersRequest) (*ListContainersResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListContainers not implemented")
+}
+func (UnimplementedLiteVirtServer) InspectContainer(context.Context, *InspectContainerRequest) (*ContainerDetail, error) {
+	return nil, status.Error(codes.Unimplemented, "method InspectContainer not implemented")
+}
+func (UnimplementedLiteVirtServer) ProbeContainerBackups(context.Context, *ProbeContainerBackupsRequest) (*ProbeContainerBackupsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ProbeContainerBackups not implemented")
 }
 func (UnimplementedLiteVirtServer) PullOCIImage(context.Context, *PullOCIImageRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method PullOCIImage not implemented")
@@ -7976,6 +8008,42 @@ func _LiteVirt_ListContainers_Handler(srv interface{}, ctx context.Context, dec 
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).ListContainers(ctx, req.(*ListContainersRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_InspectContainer_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(InspectContainerRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).InspectContainer(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_InspectContainer_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).InspectContainer(ctx, req.(*InspectContainerRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_ProbeContainerBackups_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ProbeContainerBackupsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ProbeContainerBackups(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ProbeContainerBackups_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ProbeContainerBackups(ctx, req.(*ProbeContainerBackupsRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -10941,6 +11009,14 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ListContainers",
 			Handler:    _LiteVirt_ListContainers_Handler,
+		},
+		{
+			MethodName: "InspectContainer",
+			Handler:    _LiteVirt_InspectContainer_Handler,
+		},
+		{
+			MethodName: "ProbeContainerBackups",
+			Handler:    _LiteVirt_ProbeContainerBackups_Handler,
 		},
 		{
 			MethodName: "PullOCIImage",

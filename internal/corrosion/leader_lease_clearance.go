@@ -109,9 +109,9 @@ func (c *Client) clearLeaseMint(ctx context.Context, req LeaseMintRequest) bool 
 		slog.Warn("leader lease: not claiming a new term yet — this node cannot confirm its view "+
 			"of the key is current, and a term claimed from a stale view is either a permanent "+
 			"immutable-ledger conflict or a live holder deposed (retries each poll)",
-			"key", key, "term", req.Term, "takeover", req.Takeover, "reason", reason)
+			"lease", key, "term", req.Term, "takeover", req.Takeover, "reason", reason)
 	case ok && prev != "":
-		slog.Info("leader lease: new-term claim cleared", "key", key, "term", req.Term)
+		slog.Info("leader lease: new-term claim cleared", "lease", key, "term", req.Term)
 	}
 	return ok
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -44,12 +45,9 @@ func nextFreeIP(subnet string, used []string) (string, error) {
 
 	usedSet := make(map[string]bool, len(used))
 	for _, ip := range used {
-		// Canonicalize so 2001:db8::1 and 2001:0db8::1 collide.
-		if parsed := net.ParseIP(ip); parsed != nil {
-			usedSet[parsed.String()] = true
-		} else {
-			usedSet[ip] = true
-		}
+		// Canonicalize so 2001:db8::1 and 2001:0db8::1 collide, and so a lease
+		// written before normalisation as "10.0.0.2/24" still takes 10.0.0.2.
+		usedSet[LeaseAddr(ip)] = true
 	}
 
 	if v4 := ipNet.IP.To4(); v4 != nil {
@@ -176,15 +174,40 @@ func AllocateIPFor(ctx context.Context, db *corrosion.Client, network, subnet, m
 // ipLeaseHeldBy reports whether (network, ip) is held by a LIVE lease owned by
 // exactly (kind, host, name) — the read-back the conditional reserve/allocate
 // paths use to detect a no-op guarded update.
+//
+// Addresses are compared as host addresses (LeaseAddr), not as text: a lease
+// written before normalisation may be keyed "10.0.0.5/24", and a NIC row may
+// carry the operator's "10.0.0.5/24" while its lease is keyed "10.0.0.5". Both
+// are the same lease, read that way rather than backfilled.
 func ipLeaseHeldBy(ctx context.Context, db *corrosion.Client, network, ip, ownerKind, ownerHost, name string) (bool, error) {
 	rows, err := db.Query(ctx,
-		`SELECT 1 AS ok FROM ip_allocations
-		 WHERE network = ? AND ip = ? AND vm_name = ? AND owner_kind = ? AND owner_host = ? AND deleted_at IS NULL`,
-		network, ip, name, ownerKind, ownerHost)
+		`SELECT ip FROM ip_allocations
+		 WHERE network = ? AND vm_name = ? AND owner_kind = ? AND owner_host = ? AND deleted_at IS NULL`,
+		network, name, ownerKind, ownerHost)
 	if err != nil {
 		return false, err
 	}
-	return len(rows) > 0, nil
+	want := LeaseAddr(ip)
+	for _, r := range rows {
+		if LeaseAddr(r.String("ip")) == want {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// LeaseAddr is the key an address is leased under: the bare host address in
+// canonical form. "172.16.77.50/24", "172.16.77.50/16" and "172.16.77.50" are
+// one address and therefore one lease; the prefix belongs to the NIC (and the
+// network's subnet), never to the lease. Text that does not parse is returned
+// trimmed and otherwise unchanged, so no input that was accepted before is
+// newly refused here.
+func LeaseAddr(ip string) string {
+	ip = strings.TrimSpace(ip)
+	if addr, err := parseHostOrCIDR(ip); err == nil {
+		return addr.String()
+	}
+	return ip
 }
 
 // AllocateIP is the VM-owner wrapper (owner_kind='vm', an empty owner_host).

@@ -481,7 +481,7 @@ func (s *Server) runLeaseTermSweep(ctx context.Context, key string) leaseSweepRe
 		sort.Strings(missing)
 		slog.Warn("lease-term barrier: accepting on an INCOMPLETE sweep — these peers gave no "+
 			"answer, so a term higher than the one accepted could be held by one of them",
-			"key", key, "accepted_term", highest, "answered", len(answered),
+			"lease", key, "accepted_term", highest, "answered", len(answered),
 			"peers", len(peers), "unanswered", strings.Join(missing, ","))
 	}
 	return leaseSweepResult{threshold: highest, ok: true, rows: rows}
@@ -572,7 +572,7 @@ func (s *Server) fanOutHighWater(
 			// second-guess a real answer.
 			if t := resp.GetTerm(); !peerTermAcceptable(local, t) {
 				slog.Warn("lease-term barrier: refusing an implausible high-water answer",
-					"peer", peer, "key", key, "peer_term", t, "local_term", local,
+					"peer", peer, "lease", key, "peer_term", t, "local_term", local,
 					"bound", local+maxPeerTermAdvance)
 				return // not counted as an answer either
 			}
@@ -586,7 +586,7 @@ func (s *Server) fanOutHighWater(
 					// node or lying, and both are worth seeing in a log when
 					// failover starts refusing.
 					slog.Info("lease-term barrier: a peer raised the threshold by more than one tenure",
-						"peer", peer, "key", key, "peer_term", t, "local_term", local)
+						"peer", peer, "lease", key, "peer_term", t, "local_term", local)
 				}
 				highest = t
 			}

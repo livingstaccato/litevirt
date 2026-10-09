@@ -221,14 +221,14 @@ func (c *Coordinator) claimRecoveryFor(ctx context.Context, proposal corrosion.A
 			}
 			next.Abandonment = ab
 			slog.Warn("failover: a decided recovery names a destination that cannot take the workload; it abandoned the "+
-				"proof, moving the claim to the next attempt", "key", key.String(), "decided_dest", dest,
+				"proof, moving the claim to the next attempt", "claim", key.String(), "decided_dest", dest,
 				"decided_proof", cl.Proof.ID, "problem", problem, "own_pick", proposal.DestHost)
 			c.mAttempt(PhaseClaim, ResultSuperseded, "")
 			ev = next
 			continue
 		}
 		slog.Warn("failover: a decided recovery will never execute; moving the claim to the next attempt",
-			"key", key.String(), "decided_dest", cl.Proof.DestHost, "decided_proof", cl.Proof.ID,
+			"claim", key.String(), "decided_dest", cl.Proof.DestHost, "decided_proof", cl.Proof.ID,
 			"evidence", map[bool]string{true: "abandonment", false: "destination removed"}[next.Abandonment != ""])
 		c.mAttempt(PhaseClaim, ResultSuperseded, "")
 		ev = next
@@ -253,7 +253,7 @@ func (c *Coordinator) supersedeEvidence(ctx context.Context, key corrosion.Claim
 		ab, err := c.Claimer.RequestAbandonment(ctx, dest, key, decided.ID,
 			"the promote failed before StartDomain; the coordinator is falling back to a reschedule")
 		if err != nil {
-			slog.Warn("failover: the decided promote's destination did not abandon it", "key", key.String(),
+			slog.Warn("failover: the decided promote's destination did not abandon it", "claim", key.String(),
 				"dest", dest, "proof", decided.ID, "error", err)
 			return nil
 		}
@@ -273,7 +273,7 @@ func (c *Coordinator) supersedeEvidence(ctx context.Context, key corrosion.Claim
 			return ev
 		}
 		slog.Warn("failover: the destination of a spent decided proof did not show it is another incarnation's",
-			"key", key.String(), "dest", dest, "proof", decided.ID, "error", err)
+			"claim", key.String(), "dest", dest, "proof", decided.ID, "error", err)
 	}
 	// A destination removed for good (`lv host rm --dead`): voters check the
 	// fence, the removal and the revocation in their own replicas.
@@ -656,12 +656,12 @@ func (c *Coordinator) recertifyReplaced(ctx context.Context) {
 		cl, out, err := c.claimAttempt(ctx, key, proposal, cert.SourceHost, nil)
 		if err != nil {
 			slog.Warn("failover: could not re-certify a proof its forced voter generation replaced; retrying next tick",
-				"proof", pr.ID, "key", cert.Key.String(), "error", err)
+				"proof", pr.ID, "claim", cert.Key.String(), "error", err)
 			continue
 		}
 		if out.Digest != cert.ValueDigest {
 			slog.Error("failover: a forced voter generation decided a DIFFERENT value for a certified recovery; "+
-				"the old proof will never execute", "proof", pr.ID, "key", cert.Key.String())
+				"the old proof will never execute", "proof", pr.ID, "claim", cert.Key.String())
 			continue
 		}
 		re := pr.ActionProof
@@ -671,7 +671,7 @@ func (c *Coordinator) recertifyReplaced(ctx context.Context) {
 			continue
 		}
 		slog.Info("failover: re-certified a recovery at the forced voter generation", "proof", pr.ID,
-			"key", cert.Key.String(), "generation", out.Certificate.ConfigGeneration)
+			"claim", cert.Key.String(), "generation", out.Certificate.ConfigGeneration)
 	}
 }
 

@@ -26,7 +26,7 @@ func ctSnapshotPath(dataDir, ctName, snap string) string {
 // running) → tar the on-disk dir → store host-local under dataDir, recording it
 // in container_snapshots. Runs on the owning host (forwards there if the
 // container lives elsewhere, mirroring VM CreateSnapshot).
-func (s *Server) SnapshotContainer(ctx context.Context, req *pb.SnapshotContainerRequest) (*pb.ContainerSnapshot, error) {
+func (s *Server) SnapshotContainer(ctx context.Context, req *pb.SnapshotContainerRequest) (_ *pb.ContainerSnapshot, retErr error) {
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return nil, err
 	}
@@ -63,6 +63,8 @@ func (s *Server) SnapshotContainer(ctx context.Context, req *pb.SnapshotContaine
 		req.HostName = host
 		return c.SnapshotContainer(ctx, req)
 	}
+	op := s.startContainerOp("snapshot", req.Name, "snapshot", req.Snapshot)
+	defer func() { op.done(retErr) }()
 	if s.containerRuntime == nil {
 		return nil, status.Error(codes.Unavailable, "container runtime not wired on this host")
 	}
@@ -174,7 +176,7 @@ func (s *Server) ListContainerSnapshots(ctx context.Context, req *pb.ListContain
 // replaces the rootfs) → restore the snapshot tar in place → restart if it had
 // been running. The runtime's RevertContainer is crash-safe (sets the live dir
 // aside and restores it if the extract fails).
-func (s *Server) RevertContainerSnapshot(ctx context.Context, req *pb.RevertContainerSnapshotRequest) (*emptypb.Empty, error) {
+func (s *Server) RevertContainerSnapshot(ctx context.Context, req *pb.RevertContainerSnapshotRequest) (_ *emptypb.Empty, retErr error) {
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return nil, err
 	}
@@ -203,6 +205,8 @@ func (s *Server) RevertContainerSnapshot(ctx context.Context, req *pb.RevertCont
 		req.HostName = host
 		return c.RevertContainerSnapshot(ctx, req)
 	}
+	op := s.startContainerOp("snapshot revert", req.Name, "snapshot", req.Snapshot)
+	defer func() { op.done(retErr) }()
 	if s.containerRuntime == nil {
 		return nil, status.Error(codes.Unavailable, "container runtime not wired on this host")
 	}
@@ -249,7 +253,7 @@ func (s *Server) RevertContainerSnapshot(ctx context.Context, req *pb.RevertCont
 }
 
 // DeleteContainerSnapshot removes a snapshot's tar and tombstones its record.
-func (s *Server) DeleteContainerSnapshot(ctx context.Context, req *pb.DeleteContainerSnapshotRequest) (*emptypb.Empty, error) {
+func (s *Server) DeleteContainerSnapshot(ctx context.Context, req *pb.DeleteContainerSnapshotRequest) (_ *emptypb.Empty, retErr error) {
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return nil, err
 	}
@@ -278,6 +282,8 @@ func (s *Server) DeleteContainerSnapshot(ctx context.Context, req *pb.DeleteCont
 		req.HostName = host
 		return c.DeleteContainerSnapshot(ctx, req)
 	}
+	op := s.startContainerOp("snapshot delete", req.Name, "snapshot", req.Snapshot)
+	defer func() { op.done(retErr) }()
 	snap, _ := corrosion.GetContainerSnapshot(ctx, s.db, host, req.Name, req.Snapshot)
 	if snap != nil && snap.Path != "" {
 		if rmErr := os.Remove(snap.Path); rmErr != nil && !os.IsNotExist(rmErr) {

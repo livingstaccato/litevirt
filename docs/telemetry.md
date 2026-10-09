@@ -20,9 +20,43 @@ only.
 Tracing/OTLP export is **inert until you configure an endpoint**. With no
 endpoint:
 
-- logs still emit locally as structured JSON (via the default `slog` logger),
+- logs still emit locally through the same provide-telemetry logger, one
+  structured record per line on stderr (the journal),
 - traces are no-ops,
 - **no otel handler is attached to any gRPC path** — zero overhead.
+
+### What a journal line looks like
+
+Every record carries its real level as a field, the bare message, and each
+attribute as its own field. The default `console` format is one `key=value`
+line:
+
+```
+time=2026-10-08T12:52:01Z level=ERROR message="container delete failed" name=lxt2 host=node-3 error="..." logger_name=litevirt service.name=litevirt
+```
+
+so `journalctl -u litevirt -o cat | grep 'level=ERROR'` finds the errors.
+`log_format: json` writes the same fields as one JSON object per line, and
+`log_level` sets the threshold in either mode. The attribute order on a line is
+not fixed, so match fields individually rather than as one ordered string.
+
+Libraries that log on their own are routed into the same records: memberlist
+(gossip) at its own `[ERR]`/`[WARN]`/`[INFO]`/`[DEBUG]` level, gRPC at its own
+level with `component=grpc` (errors only, as gRPC's default; open more with
+`GRPC_GO_LOG_SEVERITY_LEVEL=warning|info`), and anything using Go's standard
+`log` package as an `INFO` record per line.
+
+An attribute whose key names secret material is always logged as
+`[REDACTED]`, in every format and whether or not an endpoint is set: `password`,
+`passwd`, `pass`, `token`, `secret`, `bearer`, `authorization`, `key`, `keyring`,
+`credential(s)`, `api_key`, `private_key`, `ipmi_pass` / `ipmi_password`, and
+compound keys ending in `_password`, `_secret`, `_token`, `_credentials` and the
+like. litevirt's own non-secret identifiers use other keys (`capability=`,
+`lease=`, `claim=`, `key_id=`).
+
+The vendor's value-pattern sanitizer, which also rewrites message text that
+looks like a key or token, is off by default; set `PROVIDE_LOG_SANITIZE=true` to
+turn it on.
 
 Set an OTLP endpoint to turn export on. That single switch also activates the
 otelgrpc client/server handlers, so trace context propagates across the peer
@@ -70,8 +104,7 @@ honored directly if you prefer them.
 ### Turning export off
 
 The endpoint **is** the switch: with no endpoint resolved, nothing exports, no
-otel handler attaches to any gRPC path, and local logging stays on the stock
-handler. But env wins over config — clearing `telemetry.otlp_endpoint` in
+otel handler attaches to any gRPC path, and logs stay local. But env wins over config — clearing `telemetry.otlp_endpoint` in
 `config.yaml` does **not** disable export while `LITEVIRT_OTEL_ENDPOINT` (or
 `OTEL_EXPORTER_OTLP_ENDPOINT`) is still set in the daemon's environment, e.g. in
 the systemd unit. To turn export off, clear the config field **and** any

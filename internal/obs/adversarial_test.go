@@ -3,6 +3,7 @@ package obs
 import (
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"log/slog"
 	"math"
 	"os"
@@ -298,27 +299,28 @@ func TestSetup_InjectedProvider_IsSDKTracerProvider(t *testing.T) {
 	}
 }
 
-func TestSetup_NoEndpoint_TokenAttrDoesNotPanic(t *testing.T) {
-	cleanEnv(t)
-	before := slog.Default()
-	setup(t, Config{ServiceName: "s"})
-	if slog.Default() != before {
-		t.Fatal("slog.Default changed; token-parity precondition failed")
+// litevirt's capability lines carry capability=<name>, which is not a
+// secret; the local journal line must show it literally, not redacted.
+func TestSetup_NoEndpoint_CapabilityAttrNotRedacted(t *testing.T) {
+	lines := captureDaemonStderr(t, Config{ServiceName: "s"}, func() {
+		slog.Info("capability check", "capability", "split_brain_gate_v1")
+	})
+	line := lineWith(lines, "capability check")
+	if logfmtFields(line)["capability"] != "split_brain_gate_v1" {
+		t.Fatalf("capability attribute redacted or missing: %q", line)
 	}
-	slog.Info("capability check", "token", "split_brain_gate_v1")
 }
 
-// Off → on must still adopt the vendor logger (restore must not permanently brick).
+// Off → on adopts a new (exporting) logger.
 func TestSetup_OffThenOn_AdoptsVendorLogger(t *testing.T) {
 	cleanEnv(t)
 	before := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(before) })
 	setup(t, Config{ServiceName: "s"})
-	if slog.Default() != before {
-		t.Fatal("first (off) Setup mutated slog.Default")
-	}
+	off := slog.Default()
 	srv, _ := otelHTTPServer(t)
 	setup(t, Config{ServiceName: "s", OTLPEndpoint: srv.URL})
-	if slog.Default() == before {
+	if slog.Default() == off {
 		t.Error("second (on) Setup did not adopt a new logger")
 	}
 }
@@ -436,17 +438,19 @@ func TestSetup_DirectInvalidOTELEndpoint_UnsetAndTracingOff(t *testing.T) {
 	}
 }
 
-// Explicit log_format with no endpoint must not install a vendor sanitizer
-// that would redact token= — handler must be plain stdlib.
-func TestSetup_NoEndpointJSON_TokenKeyNotVendorHandler(t *testing.T) {
-	cleanEnv(t)
-	setup(t, Config{ServiceName: "s", LogFormat: "json"})
-	h := slog.Default().Handler()
-	if _, ok := h.(*slog.JSONHandler); !ok {
-		t.Fatalf("handler type %T; want *slog.JSONHandler", h)
+// Explicit log_format=json with no endpoint must not redact capability=
+// (the value sanitizer defaults off in every mode).
+func TestSetup_NoEndpointJSON_CapabilityNotRedacted(t *testing.T) {
+	lines := captureDaemonStderr(t, Config{ServiceName: "s", LogFormat: "json"}, func() {
+		slog.Info("gate", "capability", "split_brain_gate_v1")
+	})
+	var rec map[string]any
+	if err := json.Unmarshal([]byte(lineWith(lines, `"gate"`)), &rec); err != nil {
+		t.Fatalf("not a JSON record: %v (%q)", err, lines)
 	}
-	// Emit a token= field; stdlib JSONHandler must not panic or rewrite keys.
-	slog.Info("gate", "token", "split_brain_gate_v1")
+	if rec["capability"] != "split_brain_gate_v1" {
+		t.Fatalf("capability redacted or missing: %v", rec)
+	}
 }
 
 func mustTraceID(t *testing.T, h string) oteltrace.TraceID {

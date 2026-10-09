@@ -141,7 +141,7 @@ func (s *Server) migrateSourceFromPeer(ctx context.Context) string {
 // streams the manifest back over peer mTLS (sinkRemoteContainerBackup), then
 // confirms it landed — so no shared repo is required (PR 4). sink_host drives the
 // owner side of that forward and is gated to the sink peer (requireSinkPeer).
-func (s *Server) BackupContainer(req *pb.BackupContainerRequest, stream grpc.ServerStreamingServer[pb.BackupContainerProgress]) error {
+func (s *Server) BackupContainer(req *pb.BackupContainerRequest, stream grpc.ServerStreamingServer[pb.BackupContainerProgress]) (retErr error) {
 	ctx := stream.Context()
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return err
@@ -180,6 +180,8 @@ func (s *Server) BackupContainer(req *pb.BackupContainerRequest, stream grpc.Ser
 			"container %q lives on host %q; re-run against that daemon (set LV_HOST)",
 			req.Name, host)
 	}
+	op := s.startContainerOp("backup", req.Name, "repo", req.RepoPath)
+	defer func() { op.done(retErr) }()
 	if s.containerRuntime == nil {
 		return status.Error(codes.Unavailable, "container runtime not wired on this host")
 	}
@@ -217,6 +219,7 @@ func (s *Server) BackupContainer(req *pb.BackupContainerRequest, stream grpc.Ser
 	if timestamp == "" {
 		timestamp = time.Now().UTC().Format(time.RFC3339)
 	}
+	op.with("timestamp", timestamp)
 
 	send := func(p *pb.BackupContainerProgress) error { return stream.Send(p) }
 
@@ -266,7 +269,7 @@ func (s *Server) BackupContainer(req *pb.BackupContainerRequest, stream grpc.Ser
 			s.audit(ctx, "ct.backup", req.Name, "project="+project, "error")
 			return err
 		}
-	} else if err := corrosion.UpsertContainerBackup(ctx, s.db, req.Name, req.RepoPath, manifest.TotalSize); err != nil {
+	} else if err := corrosion.UpsertContainerBackup(ctx, s.db, manifestProject(manifest), req.Name, req.RepoPath, manifest.TotalSize); err != nil {
 		slog.Warn("container backup: update container_backups usage index",
 			"name", req.Name, "repo", req.RepoPath, "error", err)
 	}
@@ -337,7 +340,7 @@ func (s *Server) sinkRemoteContainerBackup(ctx context.Context, owner string, re
 			"remote backup did not land in repo %q (the owning daemon %q may not support peer backup streaming): %v",
 			req.RepoPath, owner, err)
 	}
-	if err := corrosion.UpsertContainerBackup(ctx, s.db, req.Name, req.RepoPath, m.TotalSize); err != nil {
+	if err := corrosion.UpsertContainerBackup(ctx, s.db, manifestProject(m), req.Name, req.RepoPath, m.TotalSize); err != nil {
 		slog.Warn("container backup: update container_backups usage index", "name", req.Name, "repo", req.RepoPath, "error", err)
 	}
 	return stream.Send(&pb.BackupContainerProgress{
@@ -594,7 +597,7 @@ func (s *Server) archiveContainer(ctx context.Context, repo *pbsstore.Repo, rec 
 // archived tar, hand it to the runtime to lay down rootfs+config, then recreate
 // the cluster row from the embedded spec. Self-contained — works after the
 // source container (and even its image) is gone. Runs on the target host.
-func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.ServerStreamingServer[pb.RestoreContainerProgress]) error {
+func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.ServerStreamingServer[pb.RestoreContainerProgress]) (retErr error) {
 	ctx := stream.Context()
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return err
@@ -616,6 +619,8 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 		return status.Errorf(codes.FailedPrecondition,
 			"restore must run on the target host %q (set LV_HOST)", target)
 	}
+	op := s.startContainerOp("restore", req.Name, "timestamp", req.Timestamp, "repo", req.RepoPath)
+	defer func() { op.done(retErr) }()
 	if s.containerRuntime == nil {
 		return status.Error(codes.Unavailable, "container runtime not wired on this host")
 	}
@@ -741,6 +746,14 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 		return status.Errorf(codes.AlreadyExists,
 			"container %q already exists on host %q; delete it first or restore under a different name",
 			req.Name, s.hostName)
+	}
+	// The project of a deleted container that last used this (host, name),
+	// read BEFORE the restore writes its own row over it: the lease proof for a
+	// shared address must be this container's, not a same-named container of
+	// another project that once lived here (network.LeaseProof).
+	hereProject, hereKnown, herr := corrosion.ContainerProjectAnyState(ctx, s.db, s.hostName, req.Name)
+	if herr != nil {
+		return status.Errorf(codes.Internal, "check prior container: %v", herr)
 	}
 
 	// The embedded spec is UNTRUSTED manifest data and supplies only descriptive
@@ -1059,7 +1072,8 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	// — an operator-supplied header falls through to the safe re-reserve path.
 	unreserved := 0
 	if s.migrateSourceFromPeer(ctx) == "" {
-		u, rerr := network.ReserveContainerNICs(ctx, s.db, s.hostName, req.Name, ifs)
+		u, rerr := network.ReserveContainerNICs(ctx, s.db, s.hostName, req.Name,
+			network.LeaseProof{Project: project, HereProject: hereProject, HereKnown: hereKnown}, ifs)
 		if rerr != nil {
 			slog.Warn("container restore: IP re-reservation incomplete (NIC may be re-discovered)",
 				"name", req.Name, "error", rerr)
@@ -1163,4 +1177,16 @@ func (s *Server) resolveContainerHost(ctx context.Context, hostHint, name string
 			name, len(hosts), strings.Join(hosts, ", "))
 	}
 	return match.HostName, match, nil
+}
+
+// manifestProject is the project a container backup manifest records for its
+// container (its embedded spec), normalised. It is what the backup index is
+// keyed by, so a backup is charged to the project that owns it, not to every
+// container that shares its name.
+func manifestProject(m *pbsstore.Manifest) string {
+	var spec containerBackupSpec
+	if m != nil && m.ContainerSpecJSON != "" {
+		_ = json.Unmarshal([]byte(m.ContainerSpecJSON), &spec)
+	}
+	return tenancy.NormalizeProject(spec.Project)
 }

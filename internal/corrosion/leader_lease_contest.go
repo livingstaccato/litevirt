@@ -109,7 +109,7 @@ func (c *Client) noteLeaseTermClaims(key string, term int64, holders ...string) 
 		claimants := sortedClaimants(set)
 		slog.Warn("leader lease: contested term — every claimant except the lowest-sorting "+
 			"one stands down, and that one retires the term by minting above it",
-			"key", key, "term", term, "claimants", claimants, "continues", claimants[0])
+			"lease", key, "term", term, "claimants", claimants, "continues", claimants[0])
 	}
 }
 

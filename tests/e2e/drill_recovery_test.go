@@ -1,6 +1,7 @@
 package e2e
 
 import (
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -94,7 +95,7 @@ func TestDrill2_FrozenLeaseHolderWhileAHostFails(t *testing.T) {
 			t.Errorf("%s: proof %s minted by the thawed holder %s under its stale term %d (held %d before the freeze)", test, pr.ID, holder, pr.LeaseTerm, holderTerm)
 		}
 	}
-	lines := strings.Count(l.journalSince(holder, thawedNode, "rescheduling VM vm="+test+" "), "\n")
+	lines := strings.Count(l.journalSince(holder, thawedNode, journalPair("rescheduling VM", "vm", test)), "\n")
 	wantLines := 0
 	if len(p) == 1 && p[0].Coordinator == holder {
 		wantLines = 1
@@ -278,7 +279,7 @@ func TestDrill4_OwnerReachableVetoesTheClaim(t *testing.T) {
 		t.Fatal(err)
 	}
 	l.mark("drill4: phase 1, %s drops %v", owner, cut)
-	decider := l.waitJournal(cut, since, "quorum reached.*host="+owner+" ", 3*time.Minute)
+	decider := l.waitJournal(cut, since, journalPair("quorum reached", "host", owner), 3*time.Minute)
 	if decider == "" {
 		t.Fatalf("no coordinator logged a fence quorum for %s within 3m", owner)
 	}
@@ -310,7 +311,7 @@ func TestDrill4_OwnerReachableVetoesTheClaim(t *testing.T) {
 	if strings.Contains(claim, "decided") && !strings.Contains(claim, "no value accepted by a majority") {
 		t.Errorf("%s: a claim value looks decided:\n%s", key, claim)
 	}
-	if j := l.journalSince(decider, since, "formed no certificate.*name="+test+" .*reason="+health.ReasonClaimOwnerReachable); j == "" {
+	if j := l.journalSince(decider, since, journalPair("formed no certificate", "name", test, "reason", health.ReasonClaimOwnerReachable)); j == "" {
 		t.Errorf("coordinator %s never logged a claim for %s refused with %s", decider, test, health.ReasonClaimOwnerReachable)
 	}
 	if ps := l.proofsSince(via, "vm", test, since); len(ps) > 0 {
@@ -462,6 +463,26 @@ func (l *lab) waitHostNot(via, host, state string, timeout time.Duration) bool {
 		time.Sleep(3 * time.Second)
 	}
 	return false
+}
+
+// journalPair is a grep -E pattern for a journal line whose message contains
+// msg and that carries every key=value given in kv, in any order. The
+// daemon's records are structured (message="...", then one field per
+// attribute), and the logger does not promise an attribute order, so a
+// pattern that strings two fields together in one order is flaky. A value
+// ends at a space, a closing quote or the end of the line.
+func journalPair(msg string, kv ...string) string {
+	field := func(k, v string) string {
+		return k + "=" + regexp.QuoteMeta(v) + `([ "]|$)`
+	}
+	switch len(kv) {
+	case 2:
+		return regexp.QuoteMeta(msg) + ".*" + field(kv[0], kv[1])
+	case 4:
+		a, b := field(kv[0], kv[1]), field(kv[2], kv[3])
+		return regexp.QuoteMeta(msg) + ".*(" + a + ".*" + b + "|" + b + ".*" + a + ")"
+	}
+	panic("journalPair takes one or two key/value pairs")
 }
 
 // waitJournal returns the first of hosts whose litevirt journal matches

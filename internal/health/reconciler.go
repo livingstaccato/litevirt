@@ -1359,7 +1359,7 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 				slog.Warn("reconciler: this host has already acted at this lease term for another "+
 					"coordinator — refusing start",
 					"vm", vm.Name, "proof", proofID, "term", pr.LeaseTerm,
-					"key", pr.LeaseKey, "coordinator", pr.Coordinator)
+					"lease", pr.LeaseKey, "coordinator", pr.Coordinator)
 				r.noteGateRefused(corrosion.ActionReschedule, ReasonStaleLeaseTerm)
 				return
 			}

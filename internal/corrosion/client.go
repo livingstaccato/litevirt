@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1882,10 +1883,35 @@ type slogWriter struct {
 	client *Client
 }
 
+// memberlistLevels maps memberlist's level tags onto slog levels.
+var memberlistLevels = []struct {
+	tag   string
+	level slog.Level
+}{
+	{"[ERR] ", slog.LevelError},
+	{"[ERROR] ", slog.LevelError},
+	{"[WARN] ", slog.LevelWarn},
+	{"[INFO] ", slog.LevelInfo},
+	{"[DEBUG] ", slog.LevelDebug},
+	{"[TRACE] ", slog.LevelDebug},
+}
+
+// Write emits one memberlist line as one slog record at memberlist's own
+// level. memberlist formats "<date> <time> [LEVEL] memberlist: ..." through a
+// stdlib logger; the date and level tag are dropped, because the record
+// carries its own time and level. A line with no recognised tag stays DEBUG.
 func (w *slogWriter) Write(p []byte) (int, error) {
+	line := string(p)
 	if w.client != nil {
-		w.client.observeGossipLog(string(p))
+		w.client.observeGossipLog(line)
 	}
-	slog.Debug(string(p))
+	level, msg := slog.LevelDebug, strings.TrimRight(line, "\r\n")
+	for _, l := range memberlistLevels {
+		if i := strings.Index(msg, l.tag); i >= 0 {
+			level, msg = l.level, msg[i+len(l.tag):]
+			break
+		}
+	}
+	slog.Log(context.Background(), level, msg)
 	return len(p), nil
 }

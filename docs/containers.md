@@ -70,6 +70,57 @@ $ lv ct rm web --host node-b
 
 `--host` is always exact, so it is the unambiguous form in scripts.
 
+### Inspecting a container
+
+`lv ct inspect <name>` is the container counterpart of `lv inspect <vm>`: host,
+state, image or template, project, CPU and memory limits, the privilege mode,
+each NIC with its network and address, the rootfs, snapshots, backups, and when
+it was created and last updated. `--size` also measures the rootfs (a walk of
+the tree on its host, reused for a minute); `-o json` prints the same detail as
+JSON; `--host` names the owner when the name is on two hosts.
+
+```
+$ lv ct inspect web --size
+Name:       web
+Host:       node-3
+State:      running
+Privilege:  privileged
+Rootfs:     /var/lib/lxc/web/rootfs (412.3 MiB)
+...
+Backups:
+  REPO          SIZE     UPDATED               STATUS
+  /srv/backups  2.1 MiB  2026-10-08T12:48:39Z  available on node-3
+  offsite       2.1 MiB  2026-10-08T13:02:11Z  available on node-1
+```
+
+The privilege mode is read from the container's LXC config on its host: a
+config with an `lxc.idmap` is unprivileged, one without is privileged. If that
+host does not answer, the cluster's view is shown and the host-local fields
+read unknown.
+
+Each backup entry is checked where it lives. A backup taken through another
+host's repository (a sink) or before a migration is not on the container's
+current host, so every host is asked whether it holds a backup of this
+container (same name and project) in that repository. The entry is then:
+
+- **available on `<host>`**: that host holds it;
+- **not found**: every host answered and none holds it (the repository was
+  deleted, moved or unmounted everywhere);
+- **unknown**: no host holds it, but some host could not be asked, or could
+  not read the repository;
+- **another project's**: the repository only holds backups of a same-named
+  container in another project.
+
+An available entry's size and time are those of this container's own newest
+backup in that repository, read from its manifest, so a same-named container in
+another project that uses the same repository never shows through.
+
+Without the admin role you see only the entries that are available for this
+container, and no host paths: no reasons, no rootfs path, and an absolute
+repository path reads `(host path)`. The others are shown to an admin. An
+entry is never removed by inspect, and it still counts toward the project's
+`backup_gib`, as a VM backup in a vanished repository does.
+
 ### Asking one node about a container on another
 
 Every node serves `lv ct ls` from its own copy of the cluster state, and a
@@ -252,7 +303,28 @@ A managed NIC (one naming a `network=`) reaches **VM parity**:
   restart/restore/migrate/clone.
 - **IPAM.** A static IP reserves that exact address; a subnet-backed network
   auto-allocates one; a subnet-less network is DHCP (the IP is discovered later).
-  Leases are non-aliasing across VMs and same-named containers.
+  Leases are non-aliasing across VMs and same-named containers. An address is
+  one lease however it is written: `ip=10.0.0.5/24` and `ip=10.0.0.5` are the
+  same address, and the second request is refused.
+- **Addresses shared before this release.** Earlier releases keyed a lease on
+  the text you gave, so two containers could hold `10.0.0.5/24` and `10.0.0.5`
+  at once. Such a pair keeps working: when one of them is restored or
+  relocated it keeps its address, with a WARN naming the other holder, so you
+  can reassign one. It keeps it only when the lease history proves it already
+  held that exact address in its own project, and no one took the address
+  after it let go. Otherwise the shared address is refused and the NIC fails
+  safe: a restore leaves the NIC without an address and the container stopped
+  (`operator-stop`), and a relocation falls back to DHCP. The address stays in
+  the container's spec. This happens when:
+  - the other holder re-acquired its lease after this container released its
+    own (its own restore or relocation, a lease rekey, a network rescope);
+  - this container's old lease record is gone (tombstone garbage collection,
+    or a rescope that moved the live leases but not the released one);
+  - the container is a copy of the other holder: the same name on another
+    host;
+  - a same-named container in another project holds the history.
+
+  Free the address (or give one container a new one) and start it again.
 - **DNS.** A managed container with a known IP is resolvable at
   `ct.stack.domain` (the container analogue of VM DNS). The per-host IP scanner
   discovers a DHCP address, persists it, and (re)writes the record; delete/migrate

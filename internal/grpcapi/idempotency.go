@@ -162,7 +162,7 @@ func (s *Server) idempotencyFinish(ctx context.Context, key, claimID string, res
 			}
 			// Our claim was reclaimed mid-op: another actor owns the key now, so we
 			// can't vouch that THIS result is what will replay. Fail closed.
-			slog.Warn("idempotency: claim reclaimed before completion", "key", key)
+			slog.Warn("idempotency: claim reclaimed before completion", "idempotency_key_id", key)
 			return status.Error(codes.Aborted, "idempotency claim was reclaimed mid-operation; retry")
 		}
 		lastErr = cerr
@@ -178,6 +178,6 @@ func (s *Server) idempotencyFinish(ctx context.Context, key, claimID string, res
 	// hits the name-uniqueness backstop) instead of getting Aborted until the lease
 	// lapses, and fail closed rather than returning a success we can't replay.
 	_ = corrosion.ReleaseIdempotencyKey(fctx, s.db, key, claimID)
-	slog.Error("idempotency: could not record completion; failing closed", "key", key, "error", lastErr)
+	slog.Error("idempotency: could not record completion; failing closed", "idempotency_key_id", key, "error", lastErr)
 	return status.Error(codes.Unavailable, "operation completed but its result could not be recorded; retry")
 }

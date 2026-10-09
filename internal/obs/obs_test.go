@@ -479,49 +479,36 @@ func TestHealth_TracesCircuitUnknown_WhenTracingActive(t *testing.T) {
 	}
 }
 
-// With no OTLP endpoint and no explicit log_format/log_level, Setup must
-// leave slog.Default() completely untouched — byte-for-byte parity with the
-// pre-telemetry daemon, which never called slog.SetDefault at all. Adopting
-// even a plain stdlib handler would change the journalctl/grep surface
-// (finding 4), and adopting the vendor logger pays PII-redaction/schema cost
-// on every record and mangles litevirt's deliberately-non-secret token= lines.
-func TestSetup_NoEndpointNoExplicitFormat_LeavesSlogDefaultUntouched(t *testing.T) {
+// With no OTLP endpoint, Setup still installs the provide-telemetry logger as
+// the slog default: it is the daemon's only log pipeline. The pre-Setup
+// default must NOT be restored — its handler writes through the stdlib log
+// package, which SetupTelemetry has redirected into the vendor handler, and
+// that is what turned every record into level=INFO message="ERROR ...".
+func TestSetup_NoEndpoint_AdoptsTelemetryLogger(t *testing.T) {
 	cleanEnv(t)
 	before := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(before) })
 	setup(t, Config{ServiceName: "s"})
-	if slog.Default() != before {
-		t.Error("slog.Default() changed with no endpoint and no explicit log_format/log_level; want untouched")
+	if slog.Default() == before {
+		t.Error("slog.Default() is still the pre-Setup logger with no endpoint; want the telemetry logger")
 	}
 }
 
-// An operator who explicitly asks for structured/leveled local logs (no
-// endpoint) gets a plain stdlib handler — not the vendor logger, which would
-// pay PII-redaction/schema cost per record and default-redact litevirt's
-// token= capability lines. json -> JSONHandler.
-func TestSetup_NoEndpointExplicitJSONFormat_InstallsStdlibJSONHandler(t *testing.T) {
+// An explicit log_level with no endpoint is honoured by the installed logger.
+func TestSetup_NoEndpointExplicitLogLevel_Honoured(t *testing.T) {
 	cleanEnv(t)
-	setup(t, Config{ServiceName: "s", LogFormat: "json"})
-
-	if _, ok := slog.Default().Handler().(*slog.JSONHandler); !ok {
-		t.Errorf("slog.Default().Handler() = %T; want *slog.JSONHandler (stdlib, not vendor) for explicit log_format=json with no endpoint", slog.Default().Handler())
+	setup(t, Config{ServiceName: "s", LogLevel: "ERROR"})
+	if slog.Default().Handler().Enabled(context.Background(), slog.LevelWarn) {
+		t.Error("log_level ERROR with no endpoint still enables WARN")
+	}
+	if !slog.Default().Handler().Enabled(context.Background(), slog.LevelError) {
+		t.Error("log_level ERROR with no endpoint does not enable ERROR")
 	}
 }
 
-// A non-json explicit format (or an explicit log_level with the default
-// format) gets the stdlib TextHandler.
-func TestSetup_NoEndpointExplicitLogLevel_InstallsStdlibTextHandler(t *testing.T) {
-	cleanEnv(t)
-	setup(t, Config{ServiceName: "s", LogLevel: "DEBUG"})
-
-	if _, ok := slog.Default().Handler().(*slog.TextHandler); !ok {
-		t.Errorf("slog.Default().Handler() = %T; want *slog.TextHandler (stdlib, not vendor) for explicit log_level with no endpoint", slog.Default().Handler())
-	}
-}
-
-// An endpoint adopts the vendor logger as before, and defaults
-// PROVIDE_LOG_SANITIZE to false so litevirt's deliberately-non-secret
-// token=split_brain_gate_v1-style capability lines aren't redacted in the
-// exported stream either — litevirt owns its own log hygiene; the real
+// An endpoint adopts the vendor logger, and defaults PROVIDE_LOG_SANITIZE
+// to false: the value-pattern sanitizer rewrites non-secret lines, and
+// secret-bearing attributes are masked by key instead (redact.go). The
 // collector credential is scrubbed separately. Finding 4.
 func TestSetup_Endpoint_LogSanitizeDefaultsFalse(t *testing.T) {
 	cleanEnv(t)

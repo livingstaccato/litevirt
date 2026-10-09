@@ -618,7 +618,12 @@ since a witness runs a failover coordinator too, and whether
 `recovery_claim_v1` has latched on the queried node. Unlike the fence token,
 `recovery_claim_v1` is withheld while a host's flag is off, so a host that
 answers with other tokens but not this one is reported `NOT enforcing`: its
-flag is off, or it cannot vote durably yet.
+flag is off, or its `split_brain_gate_v1` has not latched yet. A host that
+withholds `voter_config_v1` as well cannot vote durably yet, which withholds
+the token whatever its flag says, so it is reported `unknown` rather than
+accused. The queried node's own row is read the same way — by whether it
+advertises the token, not by its flag alone — so one state reads alike from
+whichever node you ask, and its detail names the reason when it does not.
 
 When the token has latched and any **reachable** host is not enforcing, the
 command prints a WARNING naming each one with the fix: add
@@ -626,9 +631,12 @@ command prints a WARNING naming each one with the fix: add
 it. The usual cause is a host rolled back to an older build, or one that missed
 the roll and rejoined on one. That build reads a missing key as `false`, and it
 knows the token, so it is not WAL-quarantined. It mints and runs recovery
-proofs without a certificate. An unreachable host is listed as `unknown` and
-does not raise the warning. The warning is diagnostic only and does not change
-the exit code.
+proofs without a certificate. A host whose flag is already on and that is
+still listed is not ready to advertise the token — usually a host that just
+joined, whose `split_brain_gate_v1` has not latched yet; the warning says so,
+and `lv doctor fence` run with `LV_HOST` pointed at that host names the reason
+in its own row. An unreachable host is listed as `unknown` and does not raise
+the warning. The warning is diagnostic only and does not change the exit code.
 
 ### What a fence established
 

@@ -185,6 +185,11 @@ func printRecoveryClaimReadiness(r *pb.FenceReadiness) {
 	for _, h := range off {
 		fmt.Printf("  - add `enforcement.recovery_claim: true` explicitly to %s's config and restart it\n", h.GetHost())
 	}
+	fmt.Println("\nThat is the fix when the flag is off there or the host runs an older build. A")
+	fmt.Println("host whose flag is already on and that still does not advertise the token is not")
+	fmt.Println("ready to, usually because its split_brain_gate_v1 has not latched yet (a host")
+	fmt.Println("that just joined). Run `lv doctor fence` with LV_HOST pointed at that host: its")
+	fmt.Println("own row names the reason.")
 }
 
 // fenceEventAssurance is the event's assurance, derived from method and result

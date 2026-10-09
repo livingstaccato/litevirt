@@ -51,6 +51,10 @@ func TestDoctorFence_WarnsOnALatchedClusterWithANonEnforcingHost(t *testing.T) {
 			if tc.wantWarn && !strings.Contains(out, "add `enforcement.recovery_claim: true` explicitly to kvm002's config") {
 				t.Errorf("the warning does not name the host and the fix; got:\n%s", out)
 			}
+			// The flag is not the only cause, and the warning says so (R1-1).
+			if tc.wantWarn && !strings.Contains(out, "split_brain_gate_v1 has not latched") {
+				t.Errorf("the warning names only the flag fix; a flag-on host that is not ready gets it too; got:\n%s", out)
+			}
 			if !strings.Contains(out, "recovery_claim_v1 latched:") {
 				t.Errorf("the report does not show the recovery_claim_v1 latch; got:\n%s", out)
 			}

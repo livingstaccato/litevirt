@@ -255,21 +255,13 @@ func (s *Server) hostPosture(ctx context.Context, host string) hostPostures {
 				Detail: "this host advertises nothing (self-fenced or WAL-quarantined), so its posture cannot be read",
 			})
 		}
-		claim := &pb.FenceHostPosture{
-			Host: host, Reachable: true, PostureKnown: true,
-			Enforcing: s.tokenEnabled(capabilities.RecoveryClaimV1),
-			Detail:    "local config",
-		}
-		if !claim.Enforcing {
-			claim.Detail = recoveryClaimOffDetail
-		}
 		return hostPostures{
 			fence: &pb.FenceHostPosture{
 				Host: host, Reachable: true, PostureKnown: true,
 				Enforcing: s.tokenEnabled(capabilities.SharedStorageFenceV1),
 				Detail:    "local config",
 			},
-			claim: claim,
+			claim: s.selfClaimPosture(ctx, host),
 		}
 	}
 
@@ -293,6 +285,32 @@ func (s *Server) hostPosture(ctx context.Context, host string) hostPostures {
 // enforcement.recovery_claim off.
 const recoveryClaimOffDetail = "enforcement.recovery_claim is false on this host"
 
+// selfClaimPosture is this host's recovery-claim posture, read through the
+// SAME predicate its peers read it by — whether it advertises
+// recovery_claim_v1 (advertisedCapabilities) — so one state reads alike from
+// whichever node is queried. Reading the flag alone reported a flag-on host
+// that is not ready to advertise as enforcing here and as not enforcing from
+// every peer. A host that cannot vote durably is unknown, as its peers report
+// it (claimPostureFromPing): its silence does not say what its flag is.
+func (s *Server) selfClaimPosture(ctx context.Context, host string) *pb.FenceHostPosture {
+	p := &pb.FenceHostPosture{Host: host, Reachable: true, PostureKnown: true}
+	if !s.enfRecoveryClaim {
+		p.Detail = recoveryClaimOffDetail
+		return p
+	}
+	rctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if ok, why := s.RecoveryClaimReadiness(rctx); !ok {
+		if vok, _ := s.VoterConfigReadiness(rctx); !vok {
+			p.PostureKnown = false
+		}
+		p.Detail = "enforcement.recovery_claim is on, but this host does not advertise recovery_claim_v1: " + why
+		return p
+	}
+	p.Enforcing, p.Detail = true, "local config"
+	return p
+}
+
 // claimPostureFromPing maps one peer's Ping answer to its recovery-claim
 // posture. DIAGNOSTIC ONLY, like postureFromPing, and read differently from it
 // in one place: recovery_claim_v1 is WITHHELD while a host's flag is off,
@@ -300,8 +318,12 @@ const recoveryClaimOffDetail = "enforcement.recovery_claim is false on this host
 // host that advertises other tokens but not this one is reported NOT
 // enforcing. That is the host the rollback hazard produces: an older build
 // reads a missing enforcement.recovery_claim as false, knows the token (so it
-// is not WAL-quarantined), and withholds it. The one other cause — the host
-// is not ready to vote durably — is named in the detail.
+// is not WAL-quarantined), and withholds it. A host that withholds
+// voter_config_v1 as well cannot vote durably yet — recovery_claim_v1's
+// readiness includes the same gate — so its silence says nothing about its
+// flag, and it is reported unknown rather than accused. The one cause left
+// that also withholds the token, split_brain_gate_v1 not yet latched there, is
+// named in the detail.
 func claimPostureFromPing(host string, resp *pb.PingResponse) *pb.FenceHostPosture {
 	switch {
 	case !resp.GetPostureReported():
@@ -319,10 +341,15 @@ func claimPostureFromPing(host string, resp *pb.PingResponse) *pb.FenceHostPostu
 	case slices.Contains(resp.GetNotEnforcing(), capabilities.RecoveryClaimV1):
 		return &pb.FenceHostPosture{Host: host, Reachable: true, PostureKnown: true,
 			Detail: recoveryClaimOffDetail + " (it has latched the token and withholds it)"}
+	case !slices.Contains(resp.GetCapabilities(), capabilities.RecoveryClaimV1) &&
+		!slices.Contains(resp.GetCapabilities(), capabilities.VoterConfigV1):
+		return &pb.FenceHostPosture{Host: host, Reachable: true,
+			Detail: "host advertises neither recovery_claim_v1 nor voter_config_v1: it cannot vote durably yet " +
+				"(synchronous=FULL, a loadable host signing key), so whether its flag is on cannot be read"}
 	case !slices.Contains(resp.GetCapabilities(), capabilities.RecoveryClaimV1):
 		return &pb.FenceHostPosture{Host: host, Reachable: true, PostureKnown: true,
 			Detail: "host does not advertise recovery_claim_v1: enforcement.recovery_claim is off there " +
-				"(a build older than the default reads a missing key as false), or it cannot vote durably yet"}
+				"(a build older than the default reads a missing key as false), or its split_brain_gate_v1 has not latched yet"}
 	}
 	return &pb.FenceHostPosture{Host: host, Reachable: true, PostureKnown: true, Enforcing: true,
 		Detail: "enforcing"}

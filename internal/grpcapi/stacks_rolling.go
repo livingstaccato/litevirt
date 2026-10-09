@@ -429,19 +429,23 @@ func (s *Server) waitDependsOn(ctx context.Context, action planner.VMAction, str
 func (s *Server) recreateInline(ctx context.Context, action planner.VMAction, f *compose.File, gate *dependsOnGate) error {
 	// A container recreate is judged before anything is deleted: a refused
 	// one leaves the member running as it is.
+	createCtx := ctx
 	if action.IsContainer {
-		if err := s.judgeContainerRecreate(ctx, action, f); err != nil {
+		dec, err := s.judgeContainerRecreate(ctx, action, f)
+		if err != nil {
 			slog.Warn("deploy update refused", "workload", action.VMName, "error", err)
 			gate.markUnmet(action.VMName, err)
 			return err
 		}
+		// The decision goes to this recreate's create only.
+		createCtx = withRecreateDecision(ctx, dec)
 	}
 	if delErr := s.deleteWorkloadIgnoringGone(ctx, action); delErr != nil {
 		slog.Warn("deploy update delete failed", "workload", action.VMName, "error", delErr)
 		gate.markUnmet(action.VMName, fmt.Errorf("delete before recreate failed: %w", delErr))
 		return fmt.Errorf("delete before recreate: %w", delErr)
 	}
-	if vmErr := s.deployCreatePlanned(ctx, action, f); vmErr != nil {
+	if vmErr := s.deployCreatePlanned(createCtx, action, f); vmErr != nil {
 		slog.Warn("deploy update recreate failed", "workload", action.VMName, "host", action.TargetHost, "error", vmErr)
 		gate.markUnmet(action.VMName, fmt.Errorf("recreate failed: %w", vmErr))
 		return vmErr

@@ -164,8 +164,10 @@ func securityInherited(ctx context.Context) bool {
 
 // judgeContainerRecreate judges a compose recreate of a container member
 // BEFORE its delete half runs, so a refused recreate leaves the member as it
-// is, and remembers the outgoing member's security for the create
-// (inheritRecreatedSecurity).
+// is, and returns the decision the create of THIS recreate applies
+// (inheritRecreatedSecurity). The caller hands it to that create alone
+// (withRecreateDecision); it is never stored where another recreate of the
+// same name could find it. nil (no carry-over) when there is no member.
 //
 // The mode the recreate asks for is the stack file's privileged/confinement,
 // or, when it states neither, the member's own (an existing container keeps
@@ -178,7 +180,14 @@ func securityInherited(ctx context.Context) bool {
 //     (sameContainerImage), as on main; when the image changes, the deployer
 //     is choosing a new rootfs to run as host root, which needs the Admin
 //     role or ct.exec on the member (root inside it already).
-func (s *Server) judgeContainerRecreate(ctx context.Context, a planner.VMAction, f *compose.File) error {
+//
+// The create's own caller-side checks (authorizeContainerCreate: ct.create,
+// the template's host-path authority, the opt-outs) run here too, on the
+// request the create will send, so none of them refuses after the delete.
+// A member recreated from the rootfs path it already uses keeps it as on
+// main, where any deployer could name one: the unchanged source is granted
+// to that create (the reading host still refuses a protected place).
+func (s *Server) judgeContainerRecreate(ctx context.Context, a planner.VMAction, f *compose.File) (*recreateDecision, error) {
 	var rec *corrosion.ContainerRecord
 	if a.TargetHost != "" {
 		rec, _ = corrosion.GetContainer(ctx, s.db, a.TargetHost, a.VMName)
@@ -188,52 +197,52 @@ func (s *Server) judgeContainerRecreate(ctx context.Context, a planner.VMAction,
 			rec = r
 		}
 	}
-	if rec == nil {
-		return nil
-	}
-	old := corrosion.DecodeCreateSpec(rec.CreateSpec)
-	m := recreatedMember{spec: old, project: rec.Project}
 	var d *compose.VMDef
 	if f != nil {
 		d, _ = compose.FindVMDef(f, a.VMName)
 	}
-	if d != nil {
-		oldPrivileged, oldConfinement := recordedSecurity(old)
-		privileged, confinement := d.Privileged, d.Confinement
-		if !privileged && confinement == "" {
-			privileged, confinement = oldPrivileged, oldConfinement
-		}
-		legacy := confinement == lxc.ConfinementLegacy
-		switch {
-		case !privileged && !legacy:
-			// The defaults; a confinement that is not one is refused now,
-			// not by the create after the delete.
-			if err := containerSecurityRequest(ctx, false, d.Confinement); err != nil {
-				return err
-			}
-		case (privileged && !oldPrivileged) || (legacy && oldConfinement != lxc.ConfinementLegacy):
-			if err := containerSecurityRequest(ctx, d.Privileged, d.Confinement); err != nil {
-				s.audit(ctx, "ct.recreate-security", a.VMName,
-					fmt.Sprintf("project=%s new opt-out privileged=%v confinement=%s", rec.Project, d.Privileged, d.Confinement), "denied")
-				return status.Errorf(status.Code(err), "recreating container %q: %s; the member was left as it is", a.VMName, status.Convert(err).Message())
-			}
-		default:
-			if !sameContainerImage(*rec, old, d) {
-				if err := s.mayChangePrivilegedImage(ctx, a.VMName, rec, d, privileged); err != nil {
-					return err
-				}
-			}
-			m.keep = true
-			m.note = RequireRole(ctx, "admin") != nil
-		}
+	if rec == nil || d == nil {
+		return nil, nil
 	}
-	s.recreateSecMu.Lock()
-	defer s.recreateSecMu.Unlock()
-	if s.recreateSec == nil {
-		s.recreateSec = map[string]recreatedMember{}
+	old := corrosion.DecodeCreateSpec(rec.CreateSpec)
+	dec := &recreateDecision{name: a.VMName, host: a.TargetHost, image: d.Image, spec: old, project: rec.Project}
+	oldPrivileged, oldConfinement := recordedSecurity(old)
+	privileged, confinement := d.Privileged, d.Confinement
+	if !privileged && confinement == "" {
+		privileged, confinement = oldPrivileged, oldConfinement
 	}
-	s.recreateSec[a.VMName] = m
-	return nil
+	legacy := confinement == lxc.ConfinementLegacy
+	switch {
+	case !privileged && !legacy:
+		// The defaults: nothing to carry over.
+	case (privileged && !oldPrivileged) || (legacy && oldConfinement != lxc.ConfinementLegacy):
+		if err := containerSecurityRequest(ctx, d.Privileged, d.Confinement); err != nil {
+			s.audit(ctx, "ct.recreate-security", a.VMName,
+				fmt.Sprintf("project=%s new opt-out privileged=%v confinement=%s", rec.Project, d.Privileged, d.Confinement), "denied")
+			return nil, status.Errorf(status.Code(err), "recreating container %q: %s; the member was left as it is", a.VMName, status.Convert(err).Message())
+		}
+	default:
+		if !sameContainerImage(*rec, old, d) {
+			if err := s.mayChangePrivilegedImage(ctx, a.VMName, rec, d, privileged); err != nil {
+				return nil, err
+			}
+		}
+		dec.keep = true
+		dec.note = RequireRole(ctx, "admin") != nil
+	}
+	// The create's caller-side checks, on the request it will send.
+	req, err := s.buildContainerRequest(ctx, a.VMName, d, f, a.TargetHost)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "recreating container %q: %v; the member was left as it is", a.VMName, err)
+	}
+	if old.Template != "" && old.Template == req.Template {
+		dec.template = req.Template
+	}
+	createCtx, _ := dec.apply(ctx, d, req)
+	if err := s.authorizeContainerCreate(createCtx, req); err != nil {
+		return nil, status.Errorf(status.Code(err), "recreating container %q: %s; the member was left as it is", a.VMName, status.Convert(err).Message())
+	}
+	return dec, nil
 }
 
 // recordedSecurity is a container record's privilege mode and confinement;
@@ -315,40 +324,66 @@ func (s *Server) noteKeptMemberSecurity(ctx context.Context, name, project strin
 		fmt.Sprintf("project=%s recreate kept %s (privileged=%v confinement=%s) from the replaced member", project, what, privileged, confinement), "ok")
 }
 
-// recreatedMember is what a recreate remembers of the container it replaces:
-// its create spec and project, whether its security mode is carried over
-// (keep: judged by judgeContainerRecreate), and whether that is recorded
-// (note: a non-Admin deployer).
-type recreatedMember struct {
-	spec    corrosion.ContainerCreateSpec
-	project string
-	keep    bool
-	note    bool
+// recreateDecision is what judgeContainerRecreate decided for one recreate:
+// the member it replaces (name, host, create spec, project), the image the
+// recreate runs, whether the member's security mode is carried over (keep),
+// whether that is recorded (note: a non-Admin deployer), and the rootfs
+// source the member already uses that the create may name again (template).
+type recreateDecision struct {
+	name, host, image string
+	spec              corrosion.ContainerCreateSpec
+	project           string
+	keep, note        bool
+	template          string
 }
 
-// inheritRecreatedSecurity applies a recreate's remembered security to req
-// when the stack file states none, and returns the context to create with
-// and, for a non-Admin deployer whose member's mode is carried over, what
-// records that once the create has succeeded (nil otherwise). What may be
-// carried over was judged before the delete (judgeContainerRecreate).
-func (s *Server) inheritRecreatedSecurity(ctx context.Context, a planner.VMAction, d *compose.VMDef, req *pb.CreateContainerRequest) (context.Context, func(), error) {
-	if a.Kind != planner.OpUpdate {
-		return ctx, nil, nil
+// recreateDecisionKey carries one recreate's decision from its judgment to
+// its create, in that recreate's context only.
+type recreateDecisionKey struct{}
+
+// withRecreateDecision scopes dec to the create of the recreate it judged.
+func withRecreateDecision(ctx context.Context, dec *recreateDecision) context.Context {
+	return context.WithValue(ctx, recreateDecisionKey{}, dec)
+}
+
+// recreateTemplateKey grants a create the rootfs source the member it
+// replaces already uses (authorizeContainerCreate).
+type recreateTemplateKey struct{}
+
+func recreateTemplateGranted(ctx context.Context, template string) bool {
+	v, _ := ctx.Value(recreateTemplateKey{}).(string)
+	return v != "" && v == template
+}
+
+// apply applies the decision to req: the member's mode when the stack file
+// states none and the mode is kept, and the grants for the create's checks.
+func (dec *recreateDecision) apply(ctx context.Context, d *compose.VMDef, req *pb.CreateContainerRequest) (context.Context, bool) {
+	if dec.template != "" {
+		ctx = context.WithValue(ctx, recreateTemplateKey{}, dec.template)
 	}
-	s.recreateSecMu.Lock()
-	m, ok := s.recreateSec[a.VMName]
-	delete(s.recreateSec, a.VMName)
-	s.recreateSecMu.Unlock()
-	if !ok || !m.keep {
-		return ctx, nil, nil
+	if !dec.keep {
+		return ctx, false
 	}
 	if !d.Privileged && d.Confinement == "" {
-		req.Privileged, req.Confinement = recordedSecurity(m.spec)
+		req.Privileged, req.Confinement = recordedSecurity(dec.spec)
 	}
-	var note func()
-	if m.note {
-		privileged, confinement := req.Privileged, req.Confinement
-		note = func() { s.noteKeptMemberSecurity(ctx, a.VMName, m.project, privileged, confinement) }
+	return withInheritedSecurity(ctx), true
+}
+
+// inheritRecreatedSecurity applies this recreate's decision (carried in ctx
+// by recreateInline) to req, and returns the context to create with and, for
+// a non-Admin deployer whose member's mode is carried over, what records
+// that once the create has succeeded (nil otherwise). A decision for another
+// name, host or image is not this create's, and carries nothing over.
+func (s *Server) inheritRecreatedSecurity(ctx context.Context, a planner.VMAction, d *compose.VMDef, req *pb.CreateContainerRequest) (context.Context, func(), error) {
+	dec, _ := ctx.Value(recreateDecisionKey{}).(*recreateDecision)
+	if a.Kind != planner.OpUpdate || dec == nil || dec.name != a.VMName || dec.host != req.HostName || dec.image != d.Image {
+		return ctx, nil, nil
 	}
-	return withInheritedSecurity(ctx), note, nil
+	ctx, kept := dec.apply(ctx, d, req)
+	if !kept || !dec.note {
+		return ctx, nil, nil
+	}
+	privileged, confinement := req.Privileged, req.Confinement
+	return ctx, func() { s.noteKeptMemberSecurity(ctx, a.VMName, dec.project, privileged, confinement) }, nil
 }

@@ -64,6 +64,32 @@ func (s *Server) containerProject(ctx context.Context, host, name string) (proje
 // containerWhat names a container in requirePermResolved's NotFound.
 func containerWhat(name string) string { return "container " + strconv.Quote(name) }
 
+// authorizeContainerCreate is a create's caller-side checks, judged where the
+// caller is real: ct.create on the container, the host-path authority for a
+// template that names a host path, and the Admin's security opt-outs
+// (privileged, legacy confinement). A compose recreate runs it before its
+// delete half (judgeContainerRecreate), so none of them refuses after the
+// member is gone; there the template the member already uses is granted
+// (recreateTemplateGranted), as on main, and the reading host still refuses
+// a protected place (checkContainerTemplate).
+func (s *Server) authorizeContainerCreate(ctx context.Context, req *pb.CreateContainerRequest) error {
+	if err := s.RequirePerm(ctx, ctRBACPathFor(req.Project, req.Name), "ct.create", "operator"); err != nil {
+		s.audit(ctx, "ct.create", req.Name, "project="+tenancy.NormalizeProject(req.Project), "denied")
+		return err
+	}
+	if !recreateTemplateGranted(ctx, req.Template) {
+		if err := s.authorizeContainerTemplate(ctx, req.Template); err != nil {
+			s.audit(ctx, "ct.create", req.Name, "template="+req.Template, "denied")
+			return err
+		}
+	}
+	if err := containerSecurityRequest(ctx, req.Privileged, req.Confinement); err != nil {
+		s.audit(ctx, "ct.create", req.Name, fmt.Sprintf("privileged=%v confinement=%s", req.Privileged, req.Confinement), "denied")
+		return err
+	}
+	return nil
+}
+
 func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerRequest) (resp *pb.Container, retErr error) {
 	if req.Name == "" {
 		return nil, status.Error(codes.InvalidArgument, "name required")
@@ -79,19 +105,7 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 			return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 		}
 	}
-	if err := s.RequirePerm(ctx, ctRBACPathFor(req.Project, req.Name), "ct.create", "operator"); err != nil {
-		s.audit(ctx, "ct.create", req.Name, "project="+tenancy.NormalizeProject(req.Project), "denied")
-		return nil, err
-	}
-	// A host-path template needs the host-path authority (judged here, where
-	// the caller is real); the reading host refuses protected places below.
-	if err := s.authorizeContainerTemplate(ctx, req.Template); err != nil {
-		s.audit(ctx, "ct.create", req.Name, "template="+req.Template, "denied")
-		return nil, err
-	}
-	// The security opt-outs (privileged, legacy confinement) are the Admin's.
-	if err := containerSecurityRequest(ctx, req.Privileged, req.Confinement); err != nil {
-		s.audit(ctx, "ct.create", req.Name, fmt.Sprintf("privileged=%v confinement=%s", req.Privileged, req.Confinement), "denied")
+	if err := s.authorizeContainerCreate(ctx, req); err != nil {
 		return nil, err
 	}
 	// Idempotency: replay a completed create on a lost-response retry (see CreateVM).

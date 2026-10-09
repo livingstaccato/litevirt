@@ -258,9 +258,18 @@ func TestComposeCreate_ANewPrivilegedMemberNeedsAdmin(t *testing.T) {
 	}
 	// An unprivileged, default-confined member whose stack file now asks for
 	// privileged, or for legacy confinement, asks for a new opt-out.
+	// The members run the very image the stack file names, so only the new
+	// opt-out can refuse them (review M2: a changed image would refuse them
+	// for another reason and hide a missing opt-out check).
 	for _, name := range []string{"fresh", "legacy"} {
-		seedSecCT(t, s, rt, name, "stopped", corrosion.ContainerCreateSpec{Template: "download", Distro: "alpine", Release: "3.22",
-			IDMapBase: s.idmapSlotBase(s.idmapStartSlot()), Confinement: lxc.ConfinementDefault})
+		spec := corrosion.ContainerCreateSpec{Template: "download", Distro: "alpine", Release: "3.22", Arch: "amd64",
+			IDMapBase: s.idmapSlotBase(s.idmapStartSlot()), Confinement: lxc.ConfinementDefault}
+		seedSecCT(t, s, rt, name, "stopped", spec)
+		if err := corrosion.UpsertContainer(context.Background(), s.db, corrosion.ContainerRecord{
+			HostName: "host-a", Name: name, State: "stopped", Project: "acme", Image: "alpine:3.22",
+			CreateSpec: corrosion.EncodeCreateSpec(spec)}); err != nil {
+			t.Fatal(err)
+		}
 		upd := planner.VMAction{Kind: planner.OpUpdate, VMName: name, TargetHost: "host-a", IsContainer: true}
 		if err := recreateMember(carl, s, upd, f); status.Code(err) != codes.PermissionDenied {
 			t.Fatalf("%s recreate of an unprivileged member by a non-admin: %v, want PermissionDenied", name, err)

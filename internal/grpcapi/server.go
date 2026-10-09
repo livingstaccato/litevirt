@@ -690,13 +690,8 @@ type Server struct {
 	idmapBase   int64
 	idmapRanges int
 
-	// recreateSec holds a compose recreate's outgoing container security
-	// between its delete and its create (stacks_containers.go), by name.
 	// lxcStore is the runtime's lxcpath (SetContainerLxcpath).
 	lxcStore string
-
-	recreateSecMu sync.Mutex
-	recreateSec   map[string]recreatedMember
 
 	// admissionMu makes this node a single serialization point for its
 	// reserve-then-verify decisions: it is held from a provisional claim's

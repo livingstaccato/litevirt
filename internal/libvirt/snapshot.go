@@ -47,6 +47,7 @@ type snapshotAPI interface {
 	DomainSnapshotDelete(snap golibvirt.DomainSnapshot, flags golibvirt.DomainSnapshotDeleteFlags) error
 	DomainSnapshotCurrent(dom golibvirt.Domain, flags uint32) (golibvirt.DomainSnapshot, error)
 	DomainSnapshotNumChildren(snap golibvirt.DomainSnapshot, flags uint32) (int32, error)
+	DomainListAllSnapshots(dom golibvirt.Domain, needResults int32, flags uint32) ([]golibvirt.DomainSnapshot, int32, error)
 }
 
 var _ snapshotAPI = (*golibvirt.Libvirt)(nil)
@@ -74,6 +75,86 @@ func domainExists(v snapshotAPI, name string) bool {
 	return err == nil
 }
 
+// snapshotCreateXML is the definition a new disk-only snapshot is created
+// with. libvirt names a new overlay by cutting the disk's current source at
+// its last dot; when that source is the overlay of a snapshot whose name has
+// a dot (vm-root.v1.2), the cut lands inside the name (vm-root.v1.s3) and
+// nothing ties the file back to its disk, so it leaked on VM delete
+// (snapshot-lab.md, Round 3 "4b"). For such a disk the overlay is named
+// here: the disk's stem, cut by the VM's known snapshot names, then the new
+// name. Every other disk is left to libvirt, as before.
+func snapshotCreateXML(v snapshotAPI, dom golibvirt.Domain, snapshotName string) (string, error) {
+	plain := "<domainsnapshot><name>" + xmlText(snapshotName) + "</name></domainsnapshot>"
+	snaps, _, err := v.DomainListAllSnapshots(dom, -1, 0)
+	if err != nil || len(snaps) == 0 {
+		return plain, nil
+	}
+	names := make([]string, 0, len(snaps))
+	for _, sn := range snaps {
+		names = append(names, sn.Name)
+	}
+	sort.Slice(names, func(i, j int) bool { return len(names[i]) > len(names[j]) })
+	domXML, err := v.DomainGetXMLDesc(dom, 0)
+	if err != nil {
+		return plain, nil
+	}
+	sources := parseDomainDiskSources(domXML)
+	var disks strings.Builder
+	for _, dev := range sortedDevs(sources) {
+		src := sources[dev]
+		stem, ok := stemByNames(src, names)
+		if !ok || stem == strings.TrimSuffix(src, filepath.Ext(src)) {
+			continue
+		}
+		fmt.Fprintf(&disks, "<disk name='%s' snapshot='external'><source file='%s'/></disk>",
+			xmlAttr(dev), xmlAttr(stem+"."+snapshotName))
+	}
+	if disks.Len() == 0 {
+		return plain, nil
+	}
+	return "<domainsnapshot><name>" + xmlText(snapshotName) + "</name><disks>" + disks.String() + "</disks></domainsnapshot>", nil
+}
+
+// stemByNames cuts a known snapshot's name — the longest that fits — off
+// an overlay's path: <stem>.<name>, or a restore's <stem>.<name>-r<time>.
+func stemByNames(p string, names []string) (string, bool) {
+	dir, base := filepath.Dir(p), filepath.Base(p)
+	for _, n := range names {
+		if n == "" {
+			continue
+		}
+		if stem, ok := strings.CutSuffix(base, "."+n); ok && stem != "" {
+			return filepath.Join(dir, stem), true
+		}
+		if i := strings.LastIndex(base, "."+n+"-r"); i > 0 {
+			rest := base[i+len(n)+3:]
+			if rest != "" && strings.Trim(rest, "0123456789-") == "" {
+				return filepath.Join(dir, base[:i]), true
+			}
+		}
+	}
+	return "", false
+}
+
+func sortedDevs(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func xmlText(s string) string {
+	var b bytes.Buffer
+	_ = xml.EscapeText(&b, []byte(s))
+	return b.String()
+}
+
+func xmlAttr(s string) string {
+	return strings.NewReplacer("'", "&#39;", `"`, "&#34;").Replace(xmlText(s))
+}
+
 // CreateSnapshot takes an external disk-only snapshot of a VM.
 // External snapshots work with UEFI/pflash firmware (no qcow2 nvram required).
 // Returns the allocation size (bytes) of the disk at the time of the snapshot.
@@ -86,7 +167,10 @@ func (c *Client) CreateSnapshot(domainName, snapshotName string) (int64, error) 
 	// Get current disk allocation before snapshot — this becomes the snapshot's size.
 	allocation, _, _, _ := c.virt.DomainGetBlockInfo(dom, "vda", 0)
 
-	xml := fmt.Sprintf(`<domainsnapshot><name>%s</name></domainsnapshot>`, snapshotName)
+	xml, err := snapshotCreateXML(c.virt, dom, snapshotName)
+	if err != nil {
+		return 0, err
+	}
 	flags := uint32(golibvirt.DomainSnapshotCreateDiskOnly | golibvirt.DomainSnapshotCreateAtomic)
 	_, err = c.virt.DomainSnapshotCreateXML(dom, xml, flags)
 	if err != nil {
@@ -541,7 +625,10 @@ func (c *Client) CreateLiveSnapshot(domainName, snapshotName, vmstatePath string
 	}()
 
 	// 2. External disk snapshot of the frozen guest.
-	snapXML := fmt.Sprintf(`<domainsnapshot><name>%s</name></domainsnapshot>`, snapshotName)
+	snapXML, err := snapshotCreateXML(c.virt, dom, snapshotName)
+	if err != nil {
+		return 0, 0, err
+	}
 	flags := uint32(golibvirt.DomainSnapshotCreateDiskOnly | golibvirt.DomainSnapshotCreateAtomic)
 	if _, err := c.virt.DomainSnapshotCreateXML(dom, snapXML, flags); err != nil {
 		return 0, 0, fmt.Errorf("disk snapshot: %w", err)

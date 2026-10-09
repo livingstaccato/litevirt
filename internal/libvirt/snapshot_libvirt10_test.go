@@ -916,3 +916,26 @@ func TestCarryLitevirtMetadata(t *testing.T) {
 		}
 	}
 }
+
+// After a dotted snapshot (v1.2) libvirt would name the next overlay by
+// cutting the live source at its last dot: vm-root.v1.s3, which no stem
+// rule can tie back to the disk (snapshot-lab.md, Round 3 "4b"). The create
+// names that overlay itself: vm-root.s3. Then everything is deleted and
+// only the disk's own files were ever made.
+func TestSnapshotCreate_AfterADottedSnapshotNamesTheOverlayByTheDisk(t *testing.T) {
+	m := newLibvirt10(t)
+	m.snapshot("v1.2")
+	m.snapshot("s3")
+	if got := filepath.Base(m.active()); got != "vm-root.s3" {
+		t.Fatalf("s3's overlay is %s, want vm-root.s3", got)
+	}
+	m.snapshot("v2.0")
+	m.snapshot("s4")
+	if got := filepath.Base(m.active()); got != "vm-root.s4" {
+		t.Fatalf("s4's overlay is %s, want vm-root.s4", got)
+	}
+	for _, n := range []string{"v1.2", "s3", "v2.0", "s4"} {
+		m.rm(n)
+	}
+	m.requireWhole(nil)
+}

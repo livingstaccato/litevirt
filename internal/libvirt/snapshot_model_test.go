@@ -548,9 +548,17 @@ func (m *libvirt10) DomainSnapshotCreateXML(dom golibvirt.Domain, x string, flag
 	if _, ok := m.snaps[name]; ok {
 		return golibvirt.DomainSnapshot{}, fmt.Errorf("snapshot %s exists", name)
 	}
+	explicit := map[string]string{}
+	if sx := parseModelSnap(x); sx != nil {
+		explicit = sx.overlays
+	}
 	s := &modelSnap{name: name, parent: m.current, overlays: map[string]string{}, bases: map[string]string{}}
 	for dev, src := range d.disks {
+		// libvirt's default name cuts the source at its last dot.
 		ov := strings.TrimSuffix(src, filepath.Ext(src)) + "." + name
+		if e := explicit[dev]; e != "" {
+			ov = e
+		}
 		if _, err := os.Stat(ov); err == nil {
 			return golibvirt.DomainSnapshot{}, fmt.Errorf("external snapshot file for disk %s already exists and is not a block device: %s", dev, ov)
 		}
@@ -683,6 +691,16 @@ func (m *libvirt10) DomainSnapshotDelete(snap golibvirt.DomainSnapshot, flags go
 	return nil
 }
 
+func (m *libvirt10) DomainListAllSnapshots(dom golibvirt.Domain, _ int32, _ uint32) ([]golibvirt.DomainSnapshot, int32, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []golibvirt.DomainSnapshot
+	for n := range m.snaps {
+		out = append(out, golibvirt.DomainSnapshot{Name: n, Dom: dom})
+	}
+	return out, int32(len(out)), nil
+}
+
 func (m *libvirt10) DomainSnapshotCurrent(dom golibvirt.Domain, _ uint32) (golibvirt.DomainSnapshot, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -703,11 +721,15 @@ func (m *libvirt10) DomainSnapshotNumChildren(snap golibvirt.DomainSnapshot, _ u
 
 // ── Test helpers ─────────────────────────────────────────────────────────
 
-// snapshot takes a disk-only snapshot as CreateSnapshot does.
+// snapshot takes a disk-only snapshot as CreateSnapshot does, with the
+// definition CreateSnapshot sends.
 func (m *libvirt10) snapshot(name string) {
 	m.t.Helper()
-	if _, err := m.DomainSnapshotCreateXML(golibvirt.Domain{Name: "vm"},
-		fmt.Sprintf(`<domainsnapshot><name>%s</name></domainsnapshot>`, name),
+	x, err := snapshotCreateXML(m, golibvirt.Domain{Name: "vm"}, name)
+	if err != nil {
+		m.t.Fatal(err)
+	}
+	if _, err := m.DomainSnapshotCreateXML(golibvirt.Domain{Name: "vm"}, x,
 		uint32(golibvirt.DomainSnapshotCreateDiskOnly|golibvirt.DomainSnapshotCreateAtomic)); err != nil {
 		m.t.Fatalf("snapshot %s: %v", name, err)
 	}

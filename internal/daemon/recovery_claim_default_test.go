@@ -22,6 +22,10 @@ func TestLoadConfig_RecoveryClaimDefaultsOn(t *testing.T) {
 		{"empty enforcement block", "enforcement:\n", true},
 		{"enforcement block without the key", "enforcement:\n  partition_pause: true\n", true},
 		{"explicitly on", "enforcement:\n  recovery_claim: true\n", true},
+		// An empty or null value is not an explicit false: only `false` turns
+		// it off, as docs/configuration.md says.
+		{"empty value", "enforcement:\n  recovery_claim:\n", true},
+		{"null value", "enforcement:\n  recovery_claim: ~\n", true},
 		{"explicitly off", "enforcement:\n  recovery_claim: false\n", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

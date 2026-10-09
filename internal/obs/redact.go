@@ -54,7 +54,10 @@ func isSecretKey(k string) bool {
 // logged under descriptive keys instead.
 type redactHandler struct{ next slog.Handler }
 
-func newRedactHandler(next slog.Handler) slog.Handler { return redactHandler{next: next} }
+// NewRedactHandler wraps next in the secret-key masking. Setup's pipeline
+// uses it, and so does the CLI's bootstrap logger (cmd/litevirt), which every
+// one-shot command and the daemon before Setup log through.
+func NewRedactHandler(next slog.Handler) slog.Handler { return redactHandler{next: next} }
 
 func (h redactHandler) Enabled(ctx context.Context, l slog.Level) bool {
 	return h.next.Enabled(ctx, l)

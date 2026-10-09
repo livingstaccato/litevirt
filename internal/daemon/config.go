@@ -901,7 +901,7 @@ func warnRetiredConfigKeys(data []byte) {
 		}
 		if found {
 			slog.Warn("config: "+strings.Join(k.path, ".")+" is retired and ignored",
-				"key", strings.Join(k.path, "."), "value", fmt.Sprint(node), "why", k.why)
+				"config_key", strings.Join(k.path, "."), "value", fmt.Sprint(node), "why", k.why)
 		}
 	}
 }

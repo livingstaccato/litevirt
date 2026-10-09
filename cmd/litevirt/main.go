@@ -6,6 +6,8 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
+
+	"github.com/litevirt/litevirt/internal/obs"
 )
 
 var (
@@ -53,8 +55,10 @@ func main() {
 // telemetry pipeline (internal/obs.Setup, called from daemon.Run) still runs
 // afterward and replaces this with the provide-telemetry logger, so this is
 // only the floor every entrypoint gets for free, not a replacement for Setup.
+// It masks secret-keyed attributes (obs.NewRedactHandler) as Setup does, so
+// the masking holds before Setup and in commands that never call it.
 func bootstrapDefaultLogger() {
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	slog.SetDefault(slog.New(obs.NewRedactHandler(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))))
 }
 
 // newRootCmd builds the fully-wired `litevirt` root command — both the CLI

@@ -409,7 +409,7 @@ func Setup(ctx context.Context, cfg Config) (func(context.Context) error, error)
 	// at the level they chose. The stdlib log package (third-party libraries)
 	// lands in the same handler as one INFO record per line, and gRPC's own
 	// logger is routed into it too (installGRPCLogger).
-	log := slog.New(newRedactHandler(adoptLogger(telemetry.GetLogger(ctx, svc)).Handler()))
+	log := slog.New(NewRedactHandler(adoptLogger(telemetry.GetLogger(ctx, svc)).Handler()))
 	slog.SetDefault(log)
 	installGRPCLogger()
 	// One-line startup visibility so an operator can tell export state at a glance
@@ -429,7 +429,7 @@ func Setup(ctx context.Context, cfg Config) (func(context.Context) error, error)
 // trace/span IDs). Prefer this over slog.Default() where a stable component
 // name aids filtering; existing slog.* calls also work after Setup.
 func Logger(ctx context.Context, name string) *slog.Logger {
-	return slog.New(newRedactHandler(adoptLogger(telemetry.GetLogger(ctx, name)).Handler()))
+	return slog.New(NewRedactHandler(adoptLogger(telemetry.GetLogger(ctx, name)).Handler()))
 }
 
 // Trace runs fn inside a span named name and returns fn's error. Use for a

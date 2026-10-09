@@ -95,10 +95,10 @@ func (s *Server) handleStartContainer(w http.ResponseWriter, r *http.Request) {
 	host, name := r.PathValue("host"), r.PathValue("name")
 	if _, err := s.grpc.StartContainer(s.uiBearerCtx(r), &pb.StartContainerRequest{HostName: host, Name: name}); err != nil {
 		slog.Error("UI: start container failed", "name", name, "host", host, "error", err)
-		sendToast(w, "Start failed: "+err.Error(), "error")
-	} else {
-		sendToast(w, "Container '"+name+"' starting", "success")
+		rpcWriteFailedRerender(w, "Start", err, func(w http.ResponseWriter) { s.handleContainersTable(w, r) })
+		return
 	}
+	sendToast(w, "Container '"+name+"' starting", "success")
 	s.handleContainersTable(w, r)
 }
 
@@ -106,10 +106,10 @@ func (s *Server) handleStopContainer(w http.ResponseWriter, r *http.Request) {
 	host, name := r.PathValue("host"), r.PathValue("name")
 	if _, err := s.grpc.StopContainer(s.uiBearerCtx(r), &pb.StopContainerRequest{HostName: host, Name: name, TimeoutSec: 30}); err != nil {
 		slog.Error("UI: stop container failed", "name", name, "host", host, "error", err)
-		sendToast(w, "Stop failed: "+err.Error(), "error")
-	} else {
-		sendToast(w, "Container '"+name+"' stopping", "success")
+		rpcWriteFailedRerender(w, "Stop", err, func(w http.ResponseWriter) { s.handleContainersTable(w, r) })
+		return
 	}
+	sendToast(w, "Container '"+name+"' stopping", "success")
 	s.handleContainersTable(w, r)
 }
 
@@ -117,10 +117,10 @@ func (s *Server) handleDeleteContainer(w http.ResponseWriter, r *http.Request) {
 	host, name := r.PathValue("host"), r.PathValue("name")
 	if _, err := s.grpc.DeleteContainer(s.uiBearerCtx(r), &pb.DeleteContainerRequest{HostName: host, Name: name}); err != nil {
 		slog.Error("UI: delete container failed", "name", name, "host", host, "error", err)
-		sendToast(w, "Delete failed: "+err.Error(), "error")
-	} else {
-		sendToast(w, "Container '"+name+"' deleted", "success")
+		rpcWriteFailedRerender(w, "Delete", err, func(w http.ResponseWriter) { s.handleContainersTable(w, r) })
+		return
 	}
+	sendToast(w, "Container '"+name+"' deleted", "success")
 	s.handleContainersTable(w, r)
 }
 

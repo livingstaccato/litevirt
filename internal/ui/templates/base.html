@@ -193,6 +193,19 @@
       }
     });
 
+    // A refused action that re-renders its region (VM start/stop, container
+    // start/stop/delete) answers with the daemon's status AND the region, and
+    // names LV-Swap-On-Error. htmx 2 does not swap a 4xx/5xx body by default;
+    // swap this one, so a refusal still refreshes the region as it did when it
+    // was answered 200. The response stays an error (the toast logic below sees
+    // the server's showToast and does not add a second one).
+    document.body.addEventListener('htmx:beforeSwap', function(e) {
+      var x = e.detail.xhr;
+      if (x && x.status >= 400 && x.getResponseHeader('LV-Swap-On-Error') === 'true') {
+        e.detail.shouldSwap = true;
+      }
+    });
+
     // Loading indicator: disable + spinner the action button during HTMX
     // requests. The triggering element (e.detail.elt) is the <button> for
     // button-driven requests, but the <form> for hx-post forms — so resolve

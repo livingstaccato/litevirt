@@ -41,6 +41,8 @@ func newCTCmd() *cobra.Command {
 		newCTSnapshotCmd(),
 		newCTTemplateCmd(),
 		newCTCloneCmd(),
+		newCTInspectCmd(),
+		newCTConvertCmd(),
 	)
 	return cmd
 }
@@ -218,7 +220,8 @@ func newCTCreateCmd() *cobra.Command {
 	var networks []string
 	var restart, restartDelay, restartWin string
 	var restartMax int32
-	var onHostFailure string
+	var onHostFailure, confinement string
+	var privileged bool
 	cmd := &cobra.Command{
 		Use:   "create <name>",
 		Short: "Create a new container (does not start it)",
@@ -247,6 +250,7 @@ func newCTCreateCmd() *cobra.Command {
 					Distro: distro, Release: release, Arch: arch,
 					Cpu: int32(cpu), MemoryMib: int32(memMiB), Networks: nics,
 					Project: project, OnHostFailure: onHostFailure,
+					Privileged: privileged, Confinement: confinement,
 				}
 				if restart != "" && restart != "none" {
 					req.Restart = &pb.RestartPolicy{
@@ -275,6 +279,8 @@ func newCTCreateCmd() *cobra.Command {
 	cmd.Flags().StringVar(&host, "host", "", "Target host (default: the daemon you're connected to)")
 	cmd.Flags().StringVar(&onHostFailure, "on-host-failure", "", "Host-loss relocation policy: none (default) | image-recreate (rebuild on a surviving host if this one is fenced)")
 	cmd.Flags().StringVar(&project, "project", "", "Tenancy project (default: _default)")
+	cmd.Flags().BoolVar(&privileged, "privileged", false, "Create without a user namespace, as earlier releases did (Admin only; default: unprivileged, an id range of its own)")
+	cmd.Flags().StringVar(&confinement, "confinement", "", "default | legacy (legacy: AppArmor nesting allowed, the template's seccomp and capabilities; Admin only)")
 	cmd.Flags().BoolVar(&useLocal, "local", false, "Use the host-local lxc-* runtime instead of gRPC")
 	cmd.Flags().StringVar(&restart, "restart", "", "Auto-restart policy: none | on-failure | always (default none). An operator `lv ct stop` is never auto-restarted; any other stop is treated as unexpected (containers have no stop reason).")
 	cmd.Flags().Int32Var(&restartMax, "restart-max-attempts", 0, "Max restart attempts within the window (0 = unlimited)")
@@ -388,22 +394,23 @@ func newCTStopCmd() *cobra.Command {
 
 func newCTRmCmd() *cobra.Command {
 	var host string
-	var useLocal bool
+	var useLocal, force bool
 	cmd := &cobra.Command{
 		Use:   "rm <name>",
-		Short: "Delete a stopped container",
+		Short: "Delete a stopped container (--force deletes a running one)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if useLocal {
 				return lxc.NewLxcRunner().Delete(cmd.Context(), args[0])
 			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
-				_, err := c.DeleteContainer(ctx, &pb.DeleteContainerRequest{HostName: host, Name: args[0]})
+				_, err := c.DeleteContainer(ctx, &pb.DeleteContainerRequest{HostName: host, Name: args[0], Force: force})
 				return err
 			})
 		},
 	}
 	cmd.Flags().StringVar(&host, "host", "", "Target host")
+	cmd.Flags().BoolVar(&force, "force", false, "Delete a running container (it is stopped first)")
 	cmd.Flags().BoolVar(&useLocal, "local", false, "Use the host-local runtime")
 	return cmd
 }
@@ -489,7 +496,7 @@ func newCTExecCmd() *cobra.Command {
 func newCTPullCmd() *cobra.Command {
 	var host string
 	var useLocal, passwordStdin bool
-	var dest, tag, username, password string
+	var dest, tag, username, password, project string
 	cmd := &cobra.Command{
 		Use:   "pull <oci-image>",
 		Short: "Pull an OCI image and unpack as a rootfs (requires skopeo + umoci)",
@@ -518,6 +525,7 @@ func newCTPullCmd() *cobra.Command {
 			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				_, err := c.PullOCIImage(ctx, &pb.PullOCIImageRequest{
+					Project:  project,
 					HostName: host, Image: args[0], Dest: dest, Tag: tag,
 					Username: username, Password: pw,
 				})
@@ -527,6 +535,7 @@ func newCTPullCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&dest, "dest", "", "Destination rootfs directory")
 	cmd.Flags().StringVar(&tag, "tag", "", "Override image tag")
+	cmd.Flags().StringVar(&project, "project", "", "Project that owns the pulled image; only it (and Admin) may create containers from it (default: none, every project may)")
 	cmd.Flags().StringVar(&host, "host", "", "Target host")
 	cmd.Flags().BoolVar(&useLocal, "local", false, "Use the host-local runtime")
 	cmd.Flags().StringVarP(&username, "username", "u", "", "registry username for an ad-hoc authenticated pull")

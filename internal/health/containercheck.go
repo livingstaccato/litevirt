@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/litevirt/litevirt/internal/events"
 	"github.com/litevirt/litevirt/internal/lxc"
 	"github.com/litevirt/litevirt/internal/network"
+	"github.com/litevirt/litevirt/internal/storage"
 )
 
 const containerCheckInterval = 15 * time.Second
@@ -80,6 +82,11 @@ type ContainerChecker struct {
 	// (<root>/<name>/owner_epoch). Empty disables marker writes (fixture
 	// checkers that predate markers); the daemon wires the real path.
 	containersRoot string
+	// dataDir / pkiDir are the daemon's own directories, which a relocation's
+	// rootfs template may not name (storage.CheckReadDir). See SetDaemonDirs.
+	dataDir, pkiDir string
+	// lxcStore is the runtime's lxcpath (SetContainerLxcpath).
+	lxcStore string
 
 	// replicaCaughtUp, orphans and onOrphans serve the orphan-runtime report
 	// (orphan_runtime.go). A nil replicaCaughtUp is unwired and trusted.
@@ -99,6 +106,16 @@ func (c *ContainerChecker) SetEventBus(bus *events.Bus) { c.bus = bus }
 
 // SetContainersRoot wires the directory Phase 4 owner-epoch markers live under.
 func (c *ContainerChecker) SetContainersRoot(root string) { c.containersRoot = root }
+
+// SetDaemonDirs wires the daemon's data and PKI directories, which a
+// relocation recreate refuses as a rootfs template.
+func (c *ContainerChecker) SetDaemonDirs(dataDir, pkiDir string) {
+	c.dataDir, c.pkiDir = dataDir, pkiDir
+}
+
+// SetContainerLxcpath sets the LXC container store (default /var/lib/lxc),
+// inside which a recreate's template may be read.
+func (c *ContainerChecker) SetContainerLxcpath(p string) { c.lxcStore = p }
 
 // SetGuardedContainerRekeyActive injects the cheap configured+latch decision
 // used to select modern guarded re-key WAL shapes.
@@ -274,6 +291,17 @@ func (c *ContainerChecker) recreateRelocated(ctx context.Context, ct corrosion.C
 	// relocate marker, otherwise clearing it would drop the rebuild forever.
 	if live, err := c.runtime.State(ctx, ct.Name); err == nil &&
 		(live == lxc.StateRunning || live == lxc.StateStopped) {
+		// A container of this name already here is adopted only when it is
+		// this row's: its owner record (when it has one) names the row's
+		// project and lineage. Names are per host and reusable, so another
+		// project's container — or another lineage of the name — is not a
+		// prior tick's work. The row stays pending for the operator.
+		if why := c.foreignOwner(ct); why != "" {
+			slog.Error("containercheck: relocate-recreate refused: a container of this name on this host is not the relocating container's",
+				"container", ct.Name, "reason", why)
+			c.publish("ct.relocate.failed", ct.Name, why)
+			return
+		}
 		ifs := corrosion.BuildContainerInterfacesFromSpec(c.hostName, ct.Name, spec)
 		if !c.writeRelocatedNICs(ctx, ct.Name, ifs) {
 			return // row write failed → keep the marker, retry next sweep
@@ -318,7 +346,34 @@ func (c *ContainerChecker) recreateRelocated(ctx context.Context, ct corrosion.C
 		opts.Template = spec.Template
 		opts.Distro, opts.Release, opts.Arch = spec.Distro, spec.Release, spec.Arch
 	}
+	// The same privilege mode and confinement: the recorded range (cluster-
+	// unique, so it is still this container's) and profile. Neither recorded
+	// is a container an earlier build created, recreated as it was.
+	opts.Confinement = spec.Confinement
+	if spec.IDMapBase != 0 {
+		opts.IDMap = &lxc.IDMap{Base: spec.IDMapBase, Size: lxc.IDMapSize}
+	}
+	// The template is a host path the recreating host reads, judged here by
+	// the same backstop the create's reading host applied: a protected place
+	// is refused whoever created the container. The row stays pending, so an
+	// operator sees it and nothing is copied.
+	if p, isPath, perr := lxc.TemplatePath(opts.Template); isPath {
+		if perr == nil {
+			store := c.lxcStore
+			if store == "" {
+				store = "/var/lib/lxc"
+			}
+			perr = storage.CheckTemplateDir(p, c.dataDir, c.pkiDir, store, filepath.Join(store, ct.Name))
+		}
+		if perr != nil {
+			slog.Error("containercheck: relocate-recreate refused: its rootfs template is a protected host path",
+				"container", ct.Name, "template", opts.Template, "error", perr)
+			c.publish("ct.relocate.failed", ct.Name, perr.Error())
+			return
+		}
+	}
 	var ifs []corrosion.ContainerInterfaceRecord
+	haveGateway := false
 	for i, n := range spec.Networks {
 		if n.NetworkName == "" {
 			opts.Network = append(opts.Network, lxc.NetworkAttach{Name: n.Name, Bridge: n.Bridge, IP: n.IP, MAC: n.MAC})
@@ -334,7 +389,14 @@ func (c *ContainerChecker) recreateRelocated(ctx context.Context, ct corrosion.C
 				ip = "" // couldn't claim → don't put it on-disk
 			}
 		}
-		opts.Network = append(opts.Network, lxc.NetworkAttach{Name: n.Name, Bridge: n.Bridge, IP: ip, MAC: n.MAC, Veth: veth})
+		// The runtime NIC carries the subnet's prefix and gateway, as at create
+		// (network.ContainerAddress); the row keeps the address IPAM holds.
+		runIP, gw := network.ContainerAddress(ip, c.networkSubnet(ctx, n.NetworkName))
+		if haveGateway {
+			gw = ""
+		}
+		haveGateway = haveGateway || gw != ""
+		opts.Network = append(opts.Network, lxc.NetworkAttach{Name: n.Name, Bridge: n.Bridge, IP: runIP, MAC: n.MAC, Veth: veth, Gateway: gw})
 		ifs = append(ifs, corrosion.ContainerInterfaceRecord{
 			HostName: c.hostName, CtName: ct.Name, NetworkName: n.NetworkName, Ordinal: i,
 			MAC: n.MAC, IP: ip, VethDevice: veth, SecurityGroups: n.SecurityGroups,
@@ -346,6 +408,11 @@ func (c *ContainerChecker) recreateRelocated(ctx context.Context, ct corrosion.C
 			"container", ct.Name, "image", ct.Image, "error", err)
 		c.publish("ct.relocate.failed", ct.Name, err.Error())
 		return // leave pending → retried next sweep
+	}
+	if st, ok := c.runtime.(lxc.OwnerStamper); ok {
+		if err := st.StampOwner(ct.Name, rowOwner(ct)); err != nil {
+			slog.Warn("containercheck: could not stamp the recreated container's owner record", "container", ct.Name, "error", err)
+		}
 	}
 	// Fail closed: if the interface rows can't be written, leave the relocate marker
 	// so the next sweep retries — never clear it with NIC state missing.
@@ -792,4 +859,52 @@ func ctAttemptCount(rs *corrosion.ContainerRestartState) int {
 // project is the proof.
 func relocateLeaseProof(ct corrosion.ContainerRecord) network.LeaseProof {
 	return network.LeaseProof{Project: ct.Project, HereProject: ct.Project, HereKnown: true}
+}
+
+// networkSubnet is the subnet a managed network's record declares ("" when it
+// has none or cannot be read: the NIC then keeps its address as stored).
+func (c *ContainerChecker) networkSubnet(ctx context.Context, name string) string {
+	nr, err := corrosion.GetNetwork(ctx, c.db, name)
+	if err != nil || nr == nil {
+		return ""
+	}
+	var def struct{ Subnet string }
+	if json.Unmarshal([]byte(nr.Config), &def) != nil {
+		return ""
+	}
+	return def.Subnet
+}
+
+// rowOwner is the owner record a container row gives its on-disk directory.
+func rowOwner(ct corrosion.ContainerRecord) lxc.ContainerOwner {
+	p := ct.Project
+	if p == "" {
+		p = corrosion.DefaultProject
+	}
+	return lxc.ContainerOwner{Project: p, OwnerID: corrosion.DecodeCreateSpec(ct.CreateSpec).OwnerID}
+}
+
+// foreignOwner says why the on-disk container named like ct is not ct's ("",
+// when it is or carries no record to say otherwise). An unreadable record is
+// foreign: it cannot prove the container is this row's.
+func (c *ContainerChecker) foreignOwner(ct corrosion.ContainerRecord) string {
+	st, ok := c.runtime.(lxc.OwnerStamper)
+	if !ok {
+		return ""
+	}
+	o, err := st.ReadOwner(ct.Name)
+	if err != nil {
+		return "its owner record is unreadable: " + err.Error()
+	}
+	if o == nil {
+		return ""
+	}
+	want := rowOwner(ct)
+	if o.Project != "" && o.Project != want.Project {
+		return "it belongs to project " + o.Project
+	}
+	if o.OwnerID != "" && want.OwnerID != "" && o.OwnerID != want.OwnerID {
+		return "it is another container of the same name (owner " + o.OwnerID + ")"
+	}
+	return ""
 }

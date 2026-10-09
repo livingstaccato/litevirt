@@ -13,6 +13,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/lxc"
 )
 
 // fakeCTDeletePeer records DeleteContainer forwards.
@@ -51,7 +52,8 @@ func (f *fakeCTDeletePeer) DeleteContainer(ctx context.Context, req *pb.DeleteCo
 func TestDeleteContainer_HostlessResolvesTheOwner(t *testing.T) {
 	s := testServer(t)
 	ctx := context.Background()
-	s.SetContainerRuntime(&fakeCTRuntime{})
+	// "no-such-ct" exists in no runtime: lxc-info fails on it.
+	s.SetContainerRuntime(&fakeCTRuntime{stateErrByName: map[string]error{"no-such-ct": lxc.ErrContainerNotFound}})
 	fake := &fakeCTDeletePeer{replica: s.db}
 	s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {
 		return fake, func() {}, nil

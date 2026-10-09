@@ -655,6 +655,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// also read live container cgroup usage (host-local, no RPC).
 	lxcRunner := lxc.NewLxcRunner()
 	lxcRunner.HostName = d.cfg.HostName
+	lxcRunner.DefaultPidsMax = d.cfg.Containers.DefaultPidsMax
+	lxcRunner.IDMappedRootfs = d.cfg.Containers.IDMappedRootfs
+	lxcRunner.SubIDSpan = &lxc.IDMap{Base: d.cfg.Containers.IDMapBase, Size: int64(d.cfg.Containers.IDMapRanges) * lxc.IDMapSize}
 	d.metrics = metrics.NewServer(d.cfg.MetricsPort, d.cfg.MetricsBind, d.db, d.virt, lxcRunner, d.cfg.HostName)
 	d.metrics.SetReplicationTargets(repl.Targets)
 	// metrics_port: 0 DISABLES the endpoint, matching rest_port below and what
@@ -830,6 +833,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc := grpcapi.NewServer(d.cfg.HostName, d.cfg.DataDir, d.cfg.PKIDir, d.db, d.virt, d.images)
 	d.svc = svc
 	svc.SetSupersededDiskRetentionDays(d.cfg.SupersededDiskRetentionDays)
+	svc.SetContainerIDMapRange(d.cfg.Containers.IDMapBase, d.cfg.Containers.IDMapRanges)
 
 	// Re-provision every network (bridge, gateway, DHCP, NAT, VXLAN) and tear
 	// down every deleted one. dnsmasq is a child process that dies when the
@@ -1363,6 +1367,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// that stopped unexpectedly per its restart policy. Shares the runtime wired
 	// above; operator-stopped containers are left alone (state_detail).
 	ctChecker := health.NewContainerChecker(d.cfg.HostName, d.db, lxcRunner)
+	ctChecker.SetDaemonDirs(d.cfg.DataDir, d.cfg.PKIDir)
 	ctChecker.SetContainersRoot(filepath.Join(d.cfg.DataDir, "containers"))
 	ctChecker.SetEventBus(svc.EventBus())
 	// Runtime container re-key (Phase 4): corroborate a locally-running container

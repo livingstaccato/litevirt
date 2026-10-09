@@ -109,6 +109,7 @@ type containerNICPlan struct {
 // container's leases (network.ReleaseContainerLeases) to undo partial allocation.
 func (s *Server) resolveContainerNICs(ctx context.Context, project, ctName string, nics []*pb.ContainerNetwork) (*containerNICPlan, error) {
 	p := &containerNICPlan{}
+	haveGateway := false // one default route: the first managed NIC with a subnet
 	for i, n := range nics {
 		netName := n.NetworkName
 		var def *compose.NetworkDef
@@ -237,7 +238,15 @@ func (s *Server) resolveContainerNICs(ctx context.Context, project, ctName strin
 			}
 			ip = cand.IP
 		}
-		p.lxcNics = append(p.lxcNics, ContainerNICOpt{Name: n.Name, Bridge: bridge, IP: ip, MAC: mac, Veth: veth})
+		// The runtime NIC carries the subnet's prefix and gateway: LXC reads a
+		// bare address classfully. The rows and the spec keep the address as
+		// IPAM holds it.
+		runIP, gw := network.ContainerAddress(ip, def.Subnet)
+		if haveGateway {
+			gw = ""
+		}
+		haveGateway = haveGateway || gw != ""
+		p.lxcNics = append(p.lxcNics, ContainerNICOpt{Name: n.Name, Bridge: bridge, IP: runIP, MAC: mac, Veth: veth, Gateway: gw})
 		p.ifaces = append(p.ifaces, corrosion.ContainerInterfaceRecord{
 			HostName: s.hostName, CtName: ctName, NetworkName: netName, Ordinal: i,
 			MAC: mac, IP: ip, VethDevice: veth, SecurityGroups: n.SecurityGroups,

@@ -92,8 +92,8 @@ func TestContainer_Migrate_MovesRealRootfsToTheTarget(t *testing.T) {
 	name := uniqueName("ct")
 	cleanup(t, func() {
 		// The container may have ended up on either host; ask both.
-		lvErr(t, "ct", "rm", name, "--host", localHost)
-		lvErr(t, "ct", "rm", name, "--host", target)
+		lvErr(t, "ct", "rm", name, "--host", localHost, "--force")
+		lvErr(t, "ct", "rm", name, "--host", target, "--force")
 	})
 
 	if out, err := lvErr(t, "ct", "create", name, "--host", localHost); err != nil {
@@ -180,8 +180,8 @@ func TestContainer_Migrate_RefusesOntoAnOccupiedName(t *testing.T) {
 
 	name := uniqueName("ct")
 	cleanup(t, func() {
-		lvErr(t, "ct", "rm", name, "--host", localHost)
-		lvErr(t, "ct", "rm", name, "--host", target)
+		lvErr(t, "ct", "rm", name, "--host", localHost, "--force")
+		lvErr(t, "ct", "rm", name, "--host", target, "--force")
 	})
 
 	if out, err := lvErr(t, "ct", "create", name, "--host", localHost); err != nil {

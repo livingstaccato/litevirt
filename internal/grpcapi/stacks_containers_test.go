@@ -400,3 +400,18 @@ workloads:
 		t.Fatalf("container rows = %d, want 1", len(cts))
 	}
 }
+
+// The compose opt-outs reach the create request; CreateContainer then holds
+// them to the Admin role.
+func TestBuildContainerRequest_CarriesSecurity(t *testing.T) {
+	s := testServerR2(t)
+	req, err := s.buildContainerRequest(context.Background(), "c", &compose.VMDef{
+		Kind: compose.WorkloadKindLXC, Image: "alpine:3.21", Privileged: true, Confinement: "legacy",
+	}, &compose.File{Name: "st"}, "h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !req.Privileged || req.Confinement != "legacy" {
+		t.Fatalf("request = %+v", req)
+	}
+}

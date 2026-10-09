@@ -632,6 +632,25 @@ upgrade_health_deadline_sec: 120      # 0 → 120s; widen for very slow N-step s
 # relocate-restore is treated as in-flight before giving up and image-recreating.
 container_restore_timeout_sec: 600    # 0 → 600s (10m)
 
+# Container security and limit defaults (docs/containers.md, "Security").
+containers:
+  # pids.max (cgroup v2) for a container whose config sets none: a new
+  # container gets it at create, an EXISTING container at its next start (a
+  # running container is never changed under it). 0 sets none.
+  default_pids_max: 4096
+  # Unprivileged containers' id ranges: idmap_ranges ranges of 65536 host ids
+  # starting at idmap_base. Ranges are allocated cluster-wide, so set BOTH the
+  # same on every node. The daemon appends root:<base>:<span> to /etc/subuid and
+  # /etc/subgid when no root range covers a container's (LXC requires it when
+  # the host hands out subordinate ranges): once, under shadow's lock file, and
+  # it never rewrites or removes a line (docs/containers.md, "Security").
+  idmap_base: 1000000000
+  idmap_ranges: 30000
+  # How an unprivileged container's rootfs is mapped: auto (an idmapped mount
+  # on Linux 5.19+, LXC 5+ and an ext4/xfs/btrfs container store, otherwise
+  # its files are shifted into the range at create), on, or off.
+  idmapped_rootfs: auto
+
 # ACME / autocert for the web UI cert (#13). When set, the daemon TERMINATES UI
 # TLS itself (port 7445) using a cert from the configured ACME directory, with an
 # internal-PKI fallback during issuance. Unset (default) = UI stays plain HTTP

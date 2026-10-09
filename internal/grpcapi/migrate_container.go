@@ -76,6 +76,12 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 	if err := s.refuseNoContainerRuntime(ctx, req.TargetHost); err != nil {
 		return err
 	}
+	// The target takes root's subordinate range for the container's id range
+	// now, before anything happens to the source.
+	if err := s.prepareMigrateTarget(ctx, req.TargetHost, rec); err != nil {
+		s.audit(ctx, "ct.migrate", req.Name, "project="+project+" target not prepared", "error")
+		return err
+	}
 
 	// Capacity admission on the TARGET, MEMORY only — a container's cpu_limit is a
 	// cap in cores, not a vCPU reservation, so only its memory cap is comparable

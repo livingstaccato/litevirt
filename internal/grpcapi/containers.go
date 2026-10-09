@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"path/filepath"
 	"strconv"
@@ -17,6 +18,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/lxc"
+	"github.com/litevirt/litevirt/internal/randid"
 	"github.com/litevirt/litevirt/internal/safename"
 	"github.com/litevirt/litevirt/internal/tenancy"
 )
@@ -81,6 +83,17 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		s.audit(ctx, "ct.create", req.Name, "project="+tenancy.NormalizeProject(req.Project), "denied")
 		return nil, err
 	}
+	// A host-path template needs the host-path authority (judged here, where
+	// the caller is real); the reading host refuses protected places below.
+	if err := s.authorizeContainerTemplate(ctx, req.Template); err != nil {
+		s.audit(ctx, "ct.create", req.Name, "template="+req.Template, "denied")
+		return nil, err
+	}
+	// The security opt-outs (privileged, legacy confinement) are the Admin's.
+	if err := containerSecurityRequest(ctx, req.Privileged, req.Confinement); err != nil {
+		s.audit(ctx, "ct.create", req.Name, fmt.Sprintf("privileged=%v confinement=%s", req.Privileged, req.Confinement), "denied")
+		return nil, err
+	}
 	// Idempotency: replay a completed create on a lost-response retry (see CreateVM).
 	// Placed before the forward so a retry replays without re-forwarding; recorded
 	// on success across all return paths.
@@ -121,6 +134,17 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	}
 	if err := s.refuseNoContainerRuntime(ctx, s.hostName); err != nil {
 		return nil, err
+	}
+	if err := s.checkContainerTemplate(req.Template, req.Name); err != nil {
+		s.audit(ctx, "ct.create", req.Name, "template="+req.Template, "denied")
+		return nil, err
+	}
+	// A library item another project pulled is that project's image.
+	if p, isPath, _ := lxc.TemplatePath(req.Template); isPath {
+		if err := s.refuseForeignOCIItem(ctx, ociLibraryName(p, s.dataDir), req.Project, "be created from"); err != nil {
+			s.audit(ctx, "ct.create", req.Name, "template="+req.Template, "denied")
+			return nil, err
+		}
 	}
 
 	// Serialize same-name creates on this host, and reject a duplicate BEFORE
@@ -227,11 +251,26 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		defer lease.release(ctx)
 		ctLease = lease
 	}
+	// Unprivileged by default, in a range no other container uses.
+	confinement := req.Confinement
+	if confinement == "" {
+		confinement = lxc.ConfinementDefault
+	}
+	var idmapBase int64
+	if !req.Privileged {
+		b, aerr := s.allocateIDMapBase(ctx, req.Name)
+		if aerr != nil {
+			_ = s.releaseContainerNICs(ctx, req.Name)
+			return nil, aerr
+		}
+		idmapBase = b
+	}
 	info, err := s.containerRuntime.CreateContainer(ctx, CreateContainerOpts{
 		Name: req.Name, Template: req.Template,
 		Distro: req.Distro, Release: req.Release, Arch: req.Arch,
 		CPULimit: int(req.Cpu), MemoryMiB: int(req.MemoryMib),
 		Networks: plan.lxcNics, Labels: req.Labels,
+		Confinement: confinement, IDMapBase: idmapBase,
 	})
 	if err != nil {
 		_ = s.releaseContainerNICs(ctx, req.Name)
@@ -244,7 +283,12 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	createSpec := corrosion.ContainerCreateSpec{
 		Template: req.Template, Distro: req.Distro, Release: req.Release, Arch: req.Arch,
 		Networks: plan.specNets,
+		// A new lineage: the owner record its files are matched by.
+		OwnerID:     randid.New(),
+		IDMapBase:   idmapBase,
+		Confinement: confinement,
 	}
+	s.stampContainerOwner(info.Name, req.Project, corrosion.EncodeCreateSpec(createSpec))
 
 	// CreatedAt is left empty ON PURPOSE: the corrosion writer stamps it with
 	// nanosecond precision, and that stamp is the row's INCARNATION identity —
@@ -363,6 +407,10 @@ func (s *Server) StartContainer(ctx context.Context, req *pb.StartContainerReque
 		}
 		defer lease.release(ctx)
 	}
+	if err := s.refuseOverlappingRange(ctx, req.Name); err != nil {
+		s.audit(ctx, "ct.start", req.Name, "project="+project+" id range overlap", "denied")
+		return nil, err
+	}
 	if err := s.containerRuntime.StartContainer(ctx, req.Name); err != nil {
 		s.audit(ctx, "ct.start", req.Name, "project="+project, "error")
 		return nil, status.Errorf(codes.Internal, "start: %v", err)
@@ -469,8 +517,16 @@ func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 	} else if removed {
 		return s.deleteContainerOnRemovedHost(ctx, targetHost, req.Name, project)
 	}
+	// A running container is deleted only with force (see refuseDeleteRunning).
+	// Judged here from the row when the owner is remote — the owner then trusts
+	// a peer's forward — and on the owner from its runtime.
+	if !req.Force && targetHost != s.hostName {
+		if rec, _ := corrosion.GetContainer(ctx, s.db, targetHost, req.Name); rec != nil && rec.State == "running" {
+			return nil, refuseDeleteRunning(req.Name, targetHost)
+		}
+	}
 	if forwarded, err := s.forwardSimpleCT(ctx, targetHost, func(c pb.LiteVirtClient) (*emptypb.Empty, error) {
-		return c.DeleteContainer(ctx, &pb.DeleteContainerRequest{Name: req.Name, HostName: targetHost})
+		return c.DeleteContainer(ctx, &pb.DeleteContainerRequest{Name: req.Name, HostName: targetHost, Force: req.Force})
 	}); err != nil || forwarded != nil {
 		if err == nil {
 			// Report the delete once this node no longer lists the row (see
@@ -487,6 +543,17 @@ func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 	// container that is half deleted.
 	unlock := s.LockContainer(req.Name)
 	defer unlock()
+	// The runtime delete is lxc-destroy -f, which stops a running container
+	// first, so without force a running one is refused. A remote peer's call is
+	// exempt: a current entry node judged it before forwarding, and an older
+	// one (a rolling upgrade) drives compose and relocation deletes that never
+	// carried the flag.
+	if !req.Force && !s.isRemotePeer(ctx) {
+		if st, serr := s.containerRuntime.StateContainer(ctx, req.Name); serr == nil && strings.EqualFold(st, "running") {
+			s.audit(ctx, "ct.delete", req.Name, "project="+project+" running", "denied")
+			return nil, refuseDeleteRunning(req.Name, s.hostName)
+		}
+	}
 	// Capture the stack label NOW (for the DNS-record name) — the row is about to be
 	// tombstoned. Best-effort: if the row is already gone, the reaper backstops.
 	dnsStack := ""
@@ -653,6 +720,18 @@ func (s *Server) PullOCIImage(ctx context.Context, req *pb.PullOCIImageRequest) 
 	if err := s.RequirePerm(ctx, "/", "image.pull", "operator"); err != nil {
 		return nil, err
 	}
+	if req.Project != "" {
+		if _, err := safename.CanonicalProjectName(req.Project); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+		}
+		// --project makes the image that project's, and is the project the
+		// pull-over rule checks: it must be one the caller may create
+		// containers in, judged here where the caller is real.
+		if err := s.RequirePerm(ctx, projectRBACBase(req.Project)+"/containers", "ct.create", "operator"); err != nil {
+			return nil, status.Errorf(codes.PermissionDenied,
+				"--project %q: you cannot create containers in that project, so you cannot pull an image for it", req.Project)
+		}
+	}
 	// Dest is where umoci unpacks the (untrusted) image rootfs as root, and a
 	// local oci: source is read as root — both are host-path primitives. A bare
 	// Dest name is contained under the daemon OCI staging dir; an absolute Dest
@@ -697,7 +776,7 @@ func (s *Server) PullOCIImage(ctx context.Context, req *pb.PullOCIImageRequest) 
 	// Forward AFTER resolution so req carries the resolved secret to the host
 	// that actually runs skopeo (it cannot resolve per-user creds itself).
 	if forwarded, err := s.forwardSimpleCT(ctx, req.HostName, func(c pb.LiteVirtClient) (*emptypb.Empty, error) {
-		return c.PullOCIImage(ctx, req)
+		return c.PullOCIImage(s.ownerStrictOutgoing(ctx), req)
 	}); err != nil || forwarded != nil {
 		return forwarded, err
 	}
@@ -714,13 +793,42 @@ func (s *Server) PullOCIImage(ctx context.Context, req *pb.PullOCIImageRequest) 
 		}
 		req.Dest = resolved
 	}
+	if err := s.checkOCIPullPaths(req.Image, req.Dest); err != nil {
+		return nil, err
+	}
+	// A library item belongs to the project that pulled it; another project's
+	// caller may not pull over it.
+	item := ociLibraryName(req.Dest, s.dataDir)
+	if err := s.refuseForeignOCIItem(ctx, item, req.Project, "pull over"); err != nil {
+		return nil, err
+	}
 	if err := s.containerRuntime.PullOCIImage(ctx, req.Image, req.Dest, req.Tag, req.Username, req.Password); err != nil {
 		return nil, status.Errorf(codes.Internal, "pull oci: %v", err)
+	}
+	// Only an explicit --project makes the image a project's; without one it
+	// is everyone's, as on main.
+	if item != "" && s.dataDir != "" && req.Project != "" {
+		if err := s.writeOCIOwner(item, tenancy.NormalizeProject(req.Project)); err != nil {
+			slog.Warn("oci pull: could not record the image's owner; it stays usable by every project", "image", item, "error", err)
+		}
 	}
 	return &emptypb.Empty{}, nil
 }
 
 // ── helpers ──
+
+// refuseDeleteRunning is the refusal for a delete of a running container
+// without force.
+func refuseDeleteRunning(name, host string) error {
+	return status.Errorf(codes.FailedPrecondition,
+		"container %q is running on host %q; stop it first (lv ct stop %s), or delete it running with --force", name, host, name)
+}
+
+// isRemotePeer reports whether the caller is another cluster node's daemon
+// (peer mTLS from a trusted host, not this host's own local-root CLI).
+func (s *Server) isRemotePeer(ctx context.Context) bool {
+	return callerPrincipalKind(ctx) == principalKindPeer && s.requirePeerCert(ctx) == nil
+}
 
 // forwardCreateContainer routes the request to the owning host when
 // host_name names a remote. Returns (resp, err) — both nil means
@@ -729,11 +837,11 @@ func (s *Server) forwardCreateContainer(ctx context.Context, req *pb.CreateConta
 	if req.HostName == "" || req.HostName == s.hostName {
 		return nil, nil
 	}
-	c, conn, err := s.peerClient(ctx, req.HostName)
+	c, closer, err := s.dialPeer(ctx, req.HostName)
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable, "forward create: %v", err)
 	}
-	defer conn.Close()
+	defer closer()
 	// The entry node owns the idempotency claim; strip the key from the forwarded
 	// copy so the executor doesn't re-run the idempotency path and self-conflict on
 	// the same key (abort the forward, or race a duplicate claim on the same row).
@@ -742,7 +850,7 @@ func (s *Server) forwardCreateContainer(ctx context.Context, req *pb.CreateConta
 		fwd = proto.Clone(req).(*pb.CreateContainerRequest)
 		fwd.IdempotencyKey = ""
 	}
-	return c.CreateContainer(ctx, fwd)
+	return c.CreateContainer(s.ownerStrictOutgoing(ctx), fwd)
 }
 
 // forwardSimpleCT is the empty-result version: returns (resp, err)
@@ -763,7 +871,9 @@ func (s *Server) forwardSimpleCT(
 }
 
 func toPbContainer(r corrosion.ContainerRecord) *pb.Container {
+	privileged, confinement, base := containerSecurityOf(r)
 	return &pb.Container{
+		Privileged: privileged, Confinement: confinement, IdmapBase: base,
 		HostName: r.HostName, Name: r.Name, State: r.State,
 		Image: r.Image, CpuLimit: int32(r.CPULimit), MemoryMib: int32(r.MemMiB),
 		Restart: decodeRestartPolicy(r.RestartPolicy), StateDetail: r.StateDetail,

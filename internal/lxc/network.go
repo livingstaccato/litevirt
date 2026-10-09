@@ -36,7 +36,7 @@ func NetworkConfig(attaches []NetworkAttach) (string, error) {
 	// already stable (request / create-spec order), so the file stays diff-friendly.
 	var b strings.Builder
 	for i, n := range attaches {
-		for _, v := range []string{n.Bridge, n.Name, n.MAC, n.IP, n.Veth} {
+		for _, v := range []string{n.Bridge, n.Name, n.MAC, n.IP, n.Veth, n.Gateway} {
 			if err := lxcConfigSafe(v); err != nil {
 				return "", fmt.Errorf("network %q: %w", n.Name, err)
 			}
@@ -59,6 +59,9 @@ func NetworkConfig(attaches []NetworkAttach) (string, error) {
 		if n.IP != "" {
 			// LXC accepts both bare-IP and CIDR; we pass through verbatim.
 			fmt.Fprintf(&b, "lxc.net.%d.ipv4.address = %s\n", i, n.IP)
+			if n.Gateway != "" {
+				fmt.Fprintf(&b, "lxc.net.%d.ipv4.gateway = %s\n", i, n.Gateway)
+			}
 		}
 	}
 	return b.String(), nil

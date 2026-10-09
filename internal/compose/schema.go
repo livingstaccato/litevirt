@@ -168,6 +168,14 @@ type VMDef struct {
 	// "oci" pulls an OCI image and runs it as an LXC container.
 	Kind WorkloadKind `yaml:"kind,omitempty"`
 
+	// Container security opt-outs (kind lxc/oci only; docs/containers.md,
+	// "Security"): privileged creates the container without a user namespace,
+	// confinement "legacy" allows AppArmor nesting with the template's seccomp
+	// and capabilities ("default" or unset: the default confinement). Deploying
+	// either needs the Admin role.
+	Privileged  bool   `yaml:"privileged,omitempty"`
+	Confinement string `yaml:"confinement,omitempty"`
+
 	// Image & Boot
 	Image    string `yaml:"image"`
 	ISO      string `yaml:"iso"`

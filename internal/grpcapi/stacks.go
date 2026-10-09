@@ -450,7 +450,11 @@ func (s *Server) deployCreatePlanned(ctx context.Context, action planner.VMActio
 			if err != nil {
 				return err
 			}
-			if _, err := s.CreateContainer(ctx, ctReq); err != nil {
+			createCtx, err := s.inheritRecreatedSecurity(ctx, action, vmDef, ctReq)
+			if err != nil {
+				return fmt.Errorf("create container %q: %w", action.VMName, err)
+			}
+			if _, err := s.CreateContainer(createCtx, ctReq); err != nil {
 				return fmt.Errorf("create container %q: %w", action.VMName, err)
 			}
 			// compose `up` brings workloads to running, matching CreateVM
@@ -927,7 +931,7 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 		}
 	}
 	for _, ct := range containers {
-		if _, delErr := s.DeleteContainer(ctx, &pb.DeleteContainerRequest{HostName: ct.HostName, Name: ct.Name}); delErr != nil {
+		if _, delErr := s.DeleteContainer(ctx, &pb.DeleteContainerRequest{HostName: ct.HostName, Name: ct.Name, Force: true}); delErr != nil {
 			hadFailures = true
 			notRemoved = append(notRemoved, ct.Name)
 			slog.Warn("stack delete container failed", "container", ct.Name, "host", ct.HostName, "error", delErr)

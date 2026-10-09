@@ -12,6 +12,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/lxc"
 )
 
 // fakeCTRuntime captures every call so handler tests can assert
@@ -49,6 +50,23 @@ type fakeCTRuntime struct {
 	// stateErrByName injects a StateContainer read error per name (unset → no error) so a
 	// test can exercise the fail-closed path when the runtime can't report container state.
 	stateErrByName map[string]error
+	// runState follows this fake's own create/start/stop/delete calls (guarded
+	// by mu), so a container the test stopped reads stopped. stateByName and
+	// stateErrByName still win.
+	runState map[string]string
+	// owners is the on-disk owner record per container (lxc.OwnerStamper).
+	owners map[string]lxc.ContainerOwner
+	// security is each container's config security (containerSecurer);
+	// converts records ConvertContainerSecurity calls.
+	security map[string]lxc.Security
+	converts []fakeConvert
+	// dropped is what TakeDroppedAttrs reports per container (once).
+	dropped map[string][]string
+	// revertSecurity is the security a RevertContainer lays down (the
+	// snapshot's own config), per container.
+	revertSecurity map[string]lxc.Security
+	// revertMarks records RevertContainerConverting's targets.
+	revertMarks []lxc.ConvertOpts
 
 	// B0 day-2 primitives: rootfs path a test wants returned, plus freeze/unfreeze
 	// call tracking so backup/snapshot tests can assert quiesce + unfreeze.
@@ -92,6 +110,7 @@ func (f *fakeCTRuntime) CreateContainer(_ context.Context, opts CreateContainerO
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.createCalls = append(f.createCalls, opts)
+	f.setRunState(opts.Name, "stopped")
 	if f.createHook != nil {
 		f.createHook()
 	}
@@ -107,7 +126,20 @@ func (f *fakeCTRuntime) StartContainer(_ context.Context, name string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.startCalls = append(f.startCalls, name)
+	f.setRunState(name, "running")
 	return nil
+}
+
+// setRunState records a lifecycle transition; the caller holds mu.
+func (f *fakeCTRuntime) setRunState(name, st string) {
+	if f.runState == nil {
+		f.runState = map[string]string{}
+	}
+	if st == "" {
+		delete(f.runState, name)
+		return
+	}
+	f.runState[name] = st
 }
 func (f *fakeCTRuntime) StopContainer(_ context.Context, name string, timeoutSec int) error {
 	f.mu.Lock()
@@ -116,6 +148,7 @@ func (f *fakeCTRuntime) StopContainer(_ context.Context, name string, timeoutSec
 		Name    string
 		Timeout int
 	}{name, timeoutSec})
+	f.setRunState(name, "stopped")
 	if f.stopHook != nil {
 		f.stopHook()
 	}
@@ -126,6 +159,7 @@ func (f *fakeCTRuntime) DeleteContainer(_ context.Context, name string) error {
 	defer f.mu.Unlock()
 	f.deleteCalls = append(f.deleteCalls, name)
 	if f.deleteErr == nil {
+		f.setRunState(name, "")
 		delete(f.imported, name)
 		delete(f.existsByName, name)
 	}
@@ -180,6 +214,18 @@ func (f *fakeCTRuntime) StateContainer(_ context.Context, name string) (string, 
 		if s, ok := f.stateByName[name]; ok {
 			return s, nil
 		}
+	}
+	f.mu.Lock()
+	st, ok := f.runState[name]
+	absent := errors.Is(f.deleteErr, lxc.ErrContainerNotFound)
+	f.mu.Unlock()
+	if ok {
+		return st, nil
+	}
+	if absent {
+		// A fake whose delete reports not-found models a container the
+		// runtime does not have; lxc-info fails on one the same way.
+		return "", lxc.ErrContainerNotFound
 	}
 	return "running", nil
 }
@@ -251,7 +297,19 @@ func (f *fakeCTRuntime) RevertContainer(_ context.Context, name string, r io.Rea
 		f.reverted = map[string][]byte{}
 	}
 	f.reverted[name] = data
+	if sec, ok := f.revertSecurity[name]; ok {
+		if f.security == nil {
+			f.security = map[string]lxc.Security{}
+		}
+		f.security[name] = sec
+	}
 	return nil
+}
+func (f *fakeCTRuntime) RevertContainerConverting(ctx context.Context, name string, r io.Reader, to lxc.ConvertOpts) error {
+	f.mu.Lock()
+	f.revertMarks = append(f.revertMarks, to)
+	f.mu.Unlock()
+	return f.RevertContainer(ctx, name, r)
 }
 func (f *fakeCTRuntime) CloneContainer(_ context.Context, src, dst string) error {
 	f.mu.Lock()
@@ -263,6 +321,65 @@ func (f *fakeCTRuntime) CloneContainer(_ context.Context, src, dst string) error
 	return nil
 }
 func (f *fakeCTRuntime) ListContainers(_ context.Context) ([]string, error) { return f.listNames, nil }
+
+func (f *fakeCTRuntime) TakeDroppedAttrs(name string) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	d := f.dropped[name]
+	delete(f.dropped, name)
+	return d, nil
+}
+
+type fakeConvert struct {
+	name string
+	to   lxc.ConvertOpts
+}
+
+func (f *fakeCTRuntime) ContainerSecurity(name string) (lxc.Security, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if sec, ok := f.security[name]; ok {
+		return sec, nil
+	}
+	return lxc.Security{Confinement: lxc.ConfinementLegacy}, nil
+}
+
+func (f *fakeCTRuntime) ConvertContainerSecurity(_ context.Context, name string, to lxc.ConvertOpts) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.converts = append(f.converts, fakeConvert{name, to})
+	if f.security == nil {
+		f.security = map[string]lxc.Security{}
+	}
+	sec := f.security[name]
+	if to.IDMap != nil {
+		sec.IDMap = to.IDMap
+	}
+	if to.Confinement != "" {
+		sec.Confinement = to.Confinement
+	}
+	f.security[name] = sec
+	return nil
+}
+
+// StampOwner / ReadOwner make the fake an lxc.OwnerStamper.
+func (f *fakeCTRuntime) StampOwner(name string, o lxc.ContainerOwner) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.owners == nil {
+		f.owners = map[string]lxc.ContainerOwner{}
+	}
+	f.owners[name] = o
+	return nil
+}
+func (f *fakeCTRuntime) ReadOwner(name string) (*lxc.ContainerOwner, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if o, ok := f.owners[name]; ok {
+		return &o, nil
+	}
+	return nil, nil
+}
 func (f *fakeCTRuntime) PullOCIImage(_ context.Context, image, dest, tag, username, password string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

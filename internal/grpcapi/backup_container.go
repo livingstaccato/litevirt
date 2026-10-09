@@ -364,7 +364,10 @@ func (s *Server) sinkRemoteContainerBackup(ctx context.Context, owner string, re
 // from a genuine failure. landed=false + err ⇒ fall back to image-recreate.
 // Satisfies failover.ContainerRestorer.
 func (s *Server) RestoreContainerFromBackup(ctx context.Context, ctName, targetHost, token string) (corrosion.RestoreOutcome, error) {
-	repoName, timestamp, err := s.findLatestContainerBackup(ctName)
+	// The relocating row is the owner the backup must belong to: a newer
+	// backup of another container of this name (another project, another
+	// lineage) is not this container's data.
+	repoName, timestamp, err := s.findLatestContainerBackupFor(ctName, s.relocatingContainer(ctx, ctName, targetHost, token))
 	if err != nil {
 		return corrosion.RestoreNotAttempted, err
 	}
@@ -539,6 +542,12 @@ func classifyRestoreError(err error) corrosion.RestoreOutcome {
 // NAME (not path) + the manifest timestamp. A registered name is preferred so
 // the target can resolve the same repo via its own config.
 func (s *Server) findLatestContainerBackup(ctName string) (repoName, timestamp string, err error) {
+	return s.findLatestContainerBackupFor(ctName, nil)
+}
+
+// findLatestContainerBackupFor is findLatestContainerBackup restricted to the
+// manifests owner may own (manifestOwnedBy); a nil owner matches by name.
+func (s *Server) findLatestContainerBackupFor(ctName string, owner *corrosion.ContainerRecord) (repoName, timestamp string, err error) {
 	if len(s.backupRepos) == 0 {
 		return "", "", fmt.Errorf("no backup repos configured")
 	}
@@ -548,15 +557,32 @@ func (s *Server) findLatestContainerBackup(ctName string) (repoName, timestamp s
 		if oerr != nil {
 			continue // repo not openable from here — skip
 		}
-		m, ok, merr := repo.LatestManifestFor(ctName, containerBackupDisk)
-		if merr != nil || !ok || m == nil {
+		if owner == nil {
+			m, ok, merr := repo.LatestManifestFor(ctName, containerBackupDisk)
+			if merr != nil || !ok || m == nil {
+				continue
+			}
+			if pbsstore.ValidateManifest(m) != nil {
+				continue // structurally invalid → not restorable
+			}
+			// Manifest timestamps are RFC3339 (lexical == chronological).
+			if m.Timestamp > bestTS {
+				bestTS, bestName = m.Timestamp, name
+			}
 			continue
 		}
-		if pbsstore.ValidateManifest(m) != nil {
-			continue // structurally invalid → not restorable
+		ms, lerr := repo.ListParsedManifests()
+		if lerr != nil {
+			continue
 		}
-		// Manifest timestamps are RFC3339 (lexical == chronological).
-		if m.Timestamp > bestTS {
+		for i := range ms {
+			m := &ms[i]
+			if m.VMName != ctName || m.DiskName != containerBackupDisk || m.Timestamp <= bestTS {
+				continue
+			}
+			if pbsstore.ValidateManifest(m) != nil || !manifestOwnedBy(m, owner) {
+				continue
+			}
 			bestTS, bestName = m.Timestamp, name
 		}
 	}
@@ -689,7 +715,10 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	if h := s.restoreClaimedHook; h != nil && restoreProofID != "" {
 		h(req.Name)
 	}
-	if req.Proof == nil && s.gateActive(ctx) && s.requirePeerCert(ctx) == nil {
+	// A coordinator is another node's daemon (a remote peer). `lv` run as root
+	// on this host presents the same host certificate over loopback, which is
+	// local root: an operator restore, not a coordinator's.
+	if req.Proof == nil && s.gateActive(ctx) && s.isRemotePeer(ctx) {
 		s.noteGateRefused(corrosion.ActionRelocate, health.ReasonProofMissing)
 		return status.Error(codes.FailedPrecondition, "restore refused: coordinator restore requires a proof under enforcement")
 	}
@@ -744,7 +773,7 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	}
 	if existing != nil {
 		return status.Errorf(codes.AlreadyExists,
-			"container %q already exists on host %q; delete it first or restore under a different name",
+			"container %q already exists on host %q; delete it first (lv ct rm), or restore onto another host (--host): a restore keeps the backed-up name",
 			req.Name, s.hostName)
 	}
 	// The project of a deleted container that last used this (host, name),
@@ -961,6 +990,7 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 			s.audit(ctx, "ct.restore", req.Name, "project="+project, "error")
 			return status.Errorf(codes.Internal, "import container: %v", importErr)
 		}
+		s.reportDroppedAttrs(ctx, req.Name, "restore")
 		// Stamp the proof marker immediately after import, BEFORE the DB row — so a crash
 		// in the row write resumes (marker match → skipImport) instead of re-importing. If
 		// the marker can't be written, a later crash would strand an unmarked artifact, so
@@ -993,6 +1023,24 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	// backed up): the restored container has never run HERE, so it lands as
 	// created — otherwise its restored restart policy would start it on the next
 	// sweep, a start nobody asked for.
+	// The restored container keeps the backed-up lineage (a backup from an
+	// earlier build has none: it gets one now), stamped on the imported
+	// directory, whose own record may be the source host's or absent.
+	spec.CreateSpec = withOwnerID(spec.CreateSpec)
+	s.stampContainerOwner(req.Name, project, spec.CreateSpec)
+	// An operator restore is a new container beside whatever still holds the
+	// backed-up range; a migrate or relocation is the same container moving.
+	if !s.isPeerRelocation(ctx, req.Proof != nil) && s.migrateSourceFromPeer(ctx) == "" {
+		remapped, rerr := s.remapRestoredRange(ctx, req.Name, spec.CreateSpec)
+		if rerr != nil {
+			if delErr := s.containerRuntime.DeleteContainer(ctx, req.Name); delErr != nil {
+				slog.Warn("container restore: cleanup after the range move failed also failed", "name", req.Name, "error", delErr)
+			}
+			s.removeRestoreMarker(req.Name)
+			return rerr
+		}
+		spec.CreateSpec = remapped
+	}
 	stateDetail := ""
 	if !req.Start {
 		stateDetail = spec.StateDetail

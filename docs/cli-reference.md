@@ -300,7 +300,8 @@ lv ct create <name> --restart on-failure [--restart-max-attempts 5 --restart-del
 lv ct create <name> --on-host-failure image-recreate   # rebuild on a surviving host if this one is fenced
 lv ct start <name>
 lv ct stop <name>
-lv ct rm <name>
+lv ct rm <name>                                       # a stopped container; a running one is refused
+lv ct rm <name> --force                               # a running container: stopped, then deleted
 lv ct ls
 lv ct inspect <name> [--host <h>] [--size] [-o json]  # one container: limits, privilege, NICs, rootfs, snapshots, backups
 lv ct exec <name> -- <cmd> [args...]
@@ -313,6 +314,13 @@ lv ct snapshot revert <name> <snapshot>                # roll back (stop → res
 lv ct snapshot rm <name> <snapshot>                    # delete a snapshot
 lv ct template <name> [--revert]                       # convert a stopped ct to a clone template
 lv ct clone <source> <new-name> [--project p] [--start] # full-copy clone with a fresh identity
+lv ct pull <image> --dest <name> [--project p]       # stage an OCI image; with --project only p (and Admin) may use it
+lv ct inspect <name> [--host h]                        # placement, limits, privilege mode, confinement
+lv ct convert <name> --unprivileged [--confinement default]  # stopped ct → an id range of its own
+lv ct convert <name> --confinement default|legacy      # change confinement (legacy: Admin only)
+lv ct convert <name>                                  # finish an interrupted convert (the start refusal names it)
+lv ct create <name> --privileged                       # no user namespace, as earlier releases (Admin only)
+lv ct create <name> --confinement legacy               # AppArmor nesting, template seccomp/caps (Admin only)
 ```
 
 `--local` runs against the local lxc-* binaries instead of the gRPC service
@@ -1036,6 +1044,7 @@ lv stats <vm>                                # VM resource statistics
 lv doctor divergence [--json] [--table <name>]... [--include-sensitive]   # Report replicated rows that disagree across nodes (read-only)
 lv doctor repair-owner <vm> <host>           # Re-assert a VM's owner on the host that actually runs it (audited)
 lv doctor fence                              # Report whether a shared-disk VM's cross-host transfer would be fenced (read-only)
+lv doctor privileged-containers              # Report privileged or legacy-confined containers (read-only)
 ```
 
 `divergence` is read-only, and lists a lease-term tie that every host has

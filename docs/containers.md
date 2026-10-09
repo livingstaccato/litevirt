@@ -28,17 +28,17 @@ Three reasons:
 ## CLI quickstart
 
 ```
-# Pull an image into the container's directory. umoci unpacks the flattened
-# rootfs to <dest>/rootfs, so point --dest at /var/lib/lxc/<name>.
+# Pull an image into the daemon's OCI library. A bare --dest name stages the
+# image under <data_dir>/oci/<name> on the host that unpacks it.
 # (add --local to unpack on the host you're on, without the daemon)
-lv ct pull docker.io/library/nginx:1.27 --dest /var/lib/lxc/web
+lv ct pull docker.io/library/nginx:1.27 --dest nginx
 
-# Create the container from the unpacked rootfs. --template accepts the bundle
+# Create the container from the library item. --template accepts the bundle
 # dir (descends into rootfs/) or a rootfs path; the LXC config is generated.
 # The template rootfs is COPIED into the container's own <lxcpath>/<name>/rootfs,
 # so the pulled template stays intact — reuse it for many containers, and
 # `lv ct rm` only removes that container's copy, never the template.
-lv ct create web --template /var/lib/lxc/web
+lv ct create web --template /var/lib/litevirt/oci/nginx
 
 # Start, exec, stop, delete
 lv ct start web
@@ -46,6 +46,53 @@ lv ct exec web -- nginx -t
 lv ct stop web --timeout 10
 lv ct rm web
 ```
+
+`lv ct rm` deletes a stopped container. A running one is refused with a
+message naming `lv ct stop`; `lv ct rm --force` stops it and deletes it.
+`compose down`, a compose recreate and the web UI's delete (behind its
+confirmation) delete a running container as before.
+
+### Host paths a container is given
+
+A rootfs template is copied whole into the new container, and a local
+`oci:<dir>` source is unpacked by root, so naming either is reading a host
+directory as root. Container inputs follow the same rules as a VM's host
+paths:
+
+- Anyone with `ct.create` may name an **OCI library item**: exactly
+  `<data_dir>/oci/<name>` or its `rootfs/`, the directory `lv ct pull --dest
+  <name>` staged. A deeper path, or a library name that is a link out of the
+  library, is not an item.
+- `lv ct pull --project <p>` makes a library item **that project's**, recorded
+  on the pulling host in `<data_dir>/oci-owners/<name>`; `<p>` must be a
+  project the caller may create containers in. A caller without the Admin
+  role may then create a container from it, or pull over it, only in that
+  project; through a forwarding node too. A pull **without** `--project`
+  records no owner, and the image is everyone's, as on earlier releases — as
+  is every image pulled before owners were recorded (nothing is backfilled).
+  The Admin may use any image.
+- Any other host path (`--template /srv/rootfs`, `rootfs:<path>`, a relative
+  path, an absolute `lv ct pull --dest`, a local `oci:` source) needs
+  `storage.hostpath` at the cluster root — the Admin role.
+- Whoever asks, a template or OCI source may not be under, or contain, a
+  directory that holds host secrets or live state (`/etc`, `/boot`, `/dev`,
+  `/proc`, `/sys`, `/var/backups`, `/var/spool`, `/var/lib/lxc` (but see below), libvirt's
+  per-domain state), the daemon's PKI directory, or its data directory apart
+  from `pools/`, `mounts/`, `disks/uploads/` and `oci/`. `/home`, `/root` and
+  `/run` themselves, a whole home directory, and a link into a dot-directory
+  are refused too. An absolute pull `--dest` follows the pool rule for a
+  directory the daemon writes into, except that the OCI library itself is the
+  daemon's own. A template name (`download`, `busybox`) may not contain `/`;
+  name a path as `rootfs:<path>`.
+- **Inside the LXC store** (`/var/lib/lxc`) an Admin's template is read as on
+  earlier releases — LXC's template cache, or another container's rootfs
+  (`--template /var/lib/lxc/base/rootfs`) — and a host-loss recreate of a
+  container made that way reads it again. The store itself, anything
+  containing it, and the directory of the container being made are refused. A
+  VM is still never given a file there as a CD-ROM.
+- A host-loss relocation that recreates a container from its template judges
+  the template again on the recreating host. A refused template leaves the
+  container pending, with a `ct.relocate.failed` event, and copies nothing.
 
 For a download-template container (no OCI image required):
 
@@ -167,7 +214,7 @@ lv registry ls
 lv registry rm ghcr.io
 
 # Pull a private image — credentials are resolved automatically
-lv ct pull ghcr.io/acme/api:1.4 --dest /var/lib/lxc/api
+lv ct pull ghcr.io/acme/api:1.4 --dest api
 ```
 
 The registry argument is a host (`docker.io`, `ghcr.io`,
@@ -180,7 +227,7 @@ is no daemon to resolve a stored credential:
 
 ```
 echo "$TOKEN" | lv ct pull ghcr.io/acme/api:1.4 \
-    --dest /var/lib/lxc/api --username me --password-stdin
+    --dest api --username me --password-stdin
 ```
 
 Credentials can also be managed from the web UI at **Account → Registry
@@ -289,7 +336,17 @@ lxc.net.0.hwaddr = 52:1a:2b:3c:4d:5e
 lxc.net.0.flags = up
 lxc.net.0.name = eth0
 lxc.net.0.ipv4.address = 10.0.0.6/24
+lxc.net.0.ipv4.gateway = 10.0.0.1
 ```
+
+On a managed network with a subnet, the address in the container's config
+always carries the subnet's prefix, and the first such NIC gets the subnet's
+first host as its gateway — in the config and in the guest's interfaces file
+(`gateway 10.0.0.1`). That holds for an auto-allocated address, for a bare
+static `ip=10.0.0.6`, and for a host-loss recreate. LXC reads a bare address
+classfully, so without the prefix `172.16.77.2` became a `/8` route over all of
+`172.0.0.0/8`, with no default route. The interface row and the IPAM lease keep
+the address as allocated.
 
 ### Managed-NIC identity, IPAM, DNS, security groups, load balancing
 
@@ -379,6 +436,15 @@ A hand-written `memory.max = 0` is a legal cgroup2 value and the most
 restrictive cap there is, so it is read as finite rather than rejected or
 treated as unlimited. Reading it as unlimited would flag the container as
 uncapped, which trips the uncapped gate and blocks new admission on the host.
+
+Every container also gets a **pids limit** (`lxc.cgroup2.pids.max`),
+`containers.default_pids_max` (4096) unless its config already sets one. A new
+container gets it at create. An **existing container gets it at its next
+start**, and only then: the daemon never changes a running container's limits,
+and a container whose config already sets `pids.max` keeps its own value. `0`
+turns the default off. The `cpu`/`memory` limits are cgroup v2 `cpu.max` and
+`memory.max`; the v1 keys beside them are ignored on a unified host (LXC warns
+"Ignoring legacy cgroup limits").
 
 A container created by an earlier release keeps the cgroup limits it was created
 with until it is recreated (a compose update, a restore, a relocation or a
@@ -484,9 +550,158 @@ How it works and what to expect:
   pass `--start`.
 - **Host-local, like VM backup.** A container is archived on its owning host;
   run `lv ct backup`/`restore` against that host (`LV_HOST`). Restore runs on
-  the **target** host (where the container will live).
+  the **target** host (where the container will live). Running `lv` as root
+  on that host itself works too: with no CLI bundle it presents the host
+  certificate over loopback, which is local root, and its restore is an
+  operator restore like any other. Only another node's daemon is taken for a
+  failover coordinator, which must carry a relocation proof once the
+  split-brain gate is enforced.
+- **No rename.** The name selects the backup in the repo, so a restore keeps
+  it: restore onto another host (`--host`) to keep both.
+- **Faithful file metadata.** The archive is made with `tar --numeric-owner
+  --xattrs --xattrs-include='*' --acls`, and a restore, migrate or snapshot
+  revert lays back setuid, setgid and sticky bits, file capabilities
+  (`security.capability`), ACLs, SELinux labels and `user.*` attributes, after
+  each file's owner (a chown clears setuid and capabilities). An unprivileged
+  container's archive carries its shifted owners and re-rooted capabilities, so
+  it comes back in the same range. `trusted.*` attributes are not taken from an
+  archive. An attribute the target cannot store does not fail the restore or
+  migrate, as on earlier releases: no support for it (ZFS with `acltype=off`,
+  NFS), no room for it (`ENOSPC`, `E2BIG`, `ERANGE`: ext4 keeps a file's
+  attributes in one block), an SELinux label the target's policy does not
+  know, or IMA/EVM appraisal refusing a foreign signature. What it takes is
+  applied and what it cannot store is dropped, listed
+  in a `ct.attrs.dropped` event, the audit log and a warning. A dropped ACL
+  never widens access: the file's group bits narrow to the ACL's own group
+  entry. A dropped capability or label only removes privilege. A dropped
+  *default* ACL cannot be narrowed: files later created in that directory get
+  the umask's permissions, as on earlier releases. Any other failure — an I/O
+  error, or `EPERM` setting a file capability — still fails the restore. A directory's metadata
+  (its default ACL included) is applied after its contents, so files do not
+  inherit an ACL the archive did not record for them.
+- **Laid down privately.** The archive is extracted into a `0700` staging
+  directory beside the container store and moved into place once its
+  directory is closed to other users, so its setuid binaries are never
+  reachable on the way. The host it lands on gets root's subordinate range
+  for an unprivileged container then (and again at every start).
+- **The container's directory is closed to other host users.** A restored
+  rootfs carries its setuid binaries and capabilities back onto the host's disk
+  under `<lxcpath>/<name>/rootfs`, the same exposure the source host had. So
+  every create, clone, restore, migrate and convert leaves `<lxcpath>/<name>`
+  mode `0770` — owned by the container's mapped root when it is unprivileged
+  (the container reaches its rootfs through it, as LXC itself arranges), and by
+  root otherwise — and no other host user can reach the rootfs.
 - **Quota.** A container's backup footprint draws down the **same `backup_gib`
   project budget** as VM backups.
+
+## Security
+
+A new container is **unprivileged** and **confined** by default.
+
+- **Unprivileged.** It gets a range of 65536 host ids of its own
+  (`lxc.idmap = u 0 <base> 65536`, and `g` likewise): root in the container is
+  an unprivileged id on the host. Ranges come from `containers.idmap_base` /
+  `containers.idmap_ranges` and are allocated **cluster-wide without overlap**:
+  a create avoids every range any container row in the cluster records, every
+  range this host handed out in the last day (a host-local ledger, for creates
+  still in flight or rows still replicating), and every range a container on
+  this host's disk is configured with. Hosts start their search at different
+  points, so two hosts allocating at the same instant almost never collide; if
+  they do and a migrate later brings both containers to one host, `lv ct start`
+  refuses the second with `lv ct convert --unprivileged <name>` as the fix.
+- **The rootfs is mapped**, by an idmapped mount (`lxc.rootfs.options =
+  idmap=container`) where the host supports one (`containers.idmapped_rootfs`),
+  otherwise by shifting every file into the range at create: owner and group,
+  POSIX ACL entries, and file capabilities (re-rooted as v3). setuid and setgid
+  bits are kept. A container mapped by a mount that later starts on a host
+  without idmapped mounts (a migrate) is shifted at that start.
+- **Confinement `default`**: LXC's generated AppArmor profile with nesting off,
+  LXC's common seccomp policy, and the standard capability drop list
+  (`mac_admin mac_override sys_time sys_module sys_rawio`), written explicitly in
+  a litevirt-owned block of the container's config rather than left to the
+  template or its includes. An unprivileged container also includes LXC's
+  `userns.conf` (before the drop list, which it would otherwise reset).
+
+- **Root's subordinate ranges.** When the host hands out subordinate ids
+  (`newuidmap` is installed) LXC insists that root's mappings lie inside root's
+  ranges in `/etc/subuid` and `/etc/subgid`. When no `root:` line covers a new
+  container's range, the daemon appends one line, `root:<idmap_base>:<span>`
+  (the whole configured span, so it is added once). The append never rewrites
+  or removes a line, its own or anyone's (a last line without a newline gets
+  one first); it checks again under the lock, so racing creates and daemons
+  add the line once; and it takes the lock shadow's own tools use
+  (`/etc/subuid.lock`, created exclusively and removed afterwards), waiting up
+  to ten seconds for `usermod` or `useradd` and never removing their lock. A
+  host with no subordinate-id tooling and no files is not touched.
+
+The opt-outs restore what earlier releases did, and are the **Admin's**:
+
+```bash
+lv ct create build --privileged                 # no user namespace
+lv ct create dind  --confinement legacy         # AppArmor nesting allowed, template seccomp/caps
+```
+
+Compose takes the same per workload (`privileged: true`, `confinement: legacy`),
+so a stack that needs them says so; deploying it then needs the Admin role.
+
+**Existing containers keep their settings.** A container created before this
+release is privileged with legacy confinement and keeps running exactly as it
+is; nothing rewrites its config. `lv ct inspect <name>` shows a container's
+privilege mode, range and confinement, and `lv doctor privileged-containers`
+lists every privileged or legacy-confined one. To move one over, stop it and:
+
+```bash
+lv ct convert web --unprivileged --confinement default
+```
+
+The convert runs offline on the owning host. It shifts the rootfs into a fresh
+range in place — nothing is copied or deleted — then rewrites the config's
+security block and records the new settings. A marker in the container's
+directory is written first and removed last, so a convert that is interrupted
+(a crash, a full disk) leaves a container that `lv ct start` refuses, naming
+`lv ct convert <name>`: run with no flags, a convert finishes the recorded
+target (any caller who may convert the container may run it), and with
+flags it finishes the recorded target first and then applies them (it only
+moves ids still in the old range). The re-run finishes to the range the interrupted convert
+recorded, whatever range it would otherwise be given, so the rootfs never ends
+up split across two ranges. `--confinement` alone changes the profile and touches no file;
+`--confinement legacy` is the Admin's.
+
+**Every move keeps the mode.** Migrate, backup, restore and host-loss
+relocation carry the container's config — and so its range and confinement —
+unchanged; a relocation recreate rebuilds the same range and profile from the
+create spec, and one from an earlier release is recreated privileged and
+legacy, as it was. A clone keeps its source's mode: an unprivileged source's
+clone is moved to a fresh range of its own, a privileged one stays privileged.
+An operator restore of an unprivileged backup whose range another live
+container now holds (its original still exists) is moved to a fresh range.
+
+## Owner records
+
+A container's name is unique per host only, and reusable: delete `web` in
+project `acme`, create `web` in project `beta`, and every file keyed by host and
+name — the snapshot tars and their rows, the backups in a repo — reads as
+beta's. Container files are therefore chosen by their **owner record**: the
+project plus an `owner_id` in the container's create spec.
+
+- `owner_id` is minted when a container is created or cloned (a clone is a new
+  lineage), and kept by `lv ct migrate`, host-loss relocation and restore. A
+  restore of a backup from an earlier release, which carries none, gets one.
+- It is stamped on disk as `<lxcpath>/<name>/litevirt-owner` (re-stamped after
+  every restore and migrate, whatever the archive held), beside each snapshot
+  tar as `<snapshot>.tar.owner`, and it rides in every backup manifest inside
+  the create spec.
+- A snapshot taken of an earlier container in another project is not listed
+  to, reverted or deleted by a caller without the Admin role (also through a
+  forwarding node, which marks the call). Within one project a snapshot stays
+  usable as before.
+- Host-loss restore picks the relocating container's own newest backup:
+  manifests of another project, or of another lineage of the name, are skipped.
+- A host-loss recreate adopts a container already on the survivor ("made by a
+  previous sweep") only when its owner record names the row's project and
+  lineage; otherwise the row stays pending with a `ct.relocate.failed` event.
+- A file or container with **no** owner record (made by an earlier release) is
+  matched by name, exactly as before: records only add proof.
 
 ## Snapshots
 
@@ -500,12 +715,27 @@ lv ct snapshot rm web before-upgrade
 A snapshot freezes a running container (for a consistent point-in-time), tars
 its on-disk dir, and stores it **host-local** under `{dataDir}/ct-snapshots`.
 
+- **Revert keeps the container's current security.** A snapshot taken before
+  `lv ct convert` carries the old privileged config; the revert converts the
+  restored copy back to the privilege mode, range and confinement the
+  container has now (its record), so it never silently runs privileged again.
+  The restart refuses an overlapping id range like `lv ct start`. The restored copy is
+  marked converting before it is swapped in, so a crash between the swap and
+  the convert leaves a container that refuses to start, naming
+  `lv ct convert <name>`, which finishes it to the recorded range and
+  confinement — never one running with the snapshot's older mode. Do not
+  revert again to recover: that rolls the rootfs back.
 - **Revert** stops the container (replacing the rootfs requires it stopped),
   restores the snapshot in place, and restarts it if it had been running. The
   restore is **crash-safe** — the live dir is set aside and rolled back if the
   snapshot extract fails, so a corrupt snapshot can never lose the container.
 - **Host-local**, like the container itself; snapshot ops run on the owning host
   (the daemon forwards there automatically).
+- **Private to root.** A snapshot is the container's whole rootfs, its
+  `/etc/shadow` included, so the tar is written `0600` in `0700` directories
+  (`ct-snapshots/` and `ct-snapshots/<container>/`). A snapshot an earlier
+  release wrote world-readable is narrowed the next time it is listed, reverted
+  or snapshotted beside; nothing sweeps the others.
 - Snapshots are full copies today (no dedup); **COW acceleration** on
   btrfs/zfs/lvm-thin rootfs is a planned follow-up. For space-efficient,
   off-host point-in-time copies use `lv ct backup` (dedup chunk store).
@@ -575,6 +805,21 @@ persisted from schema **v34** — containers created/backed-up before v34 fall b
 to image-recreate (without managed-NIC reconstruction).
 
 ## Cold migration
+
+Before the source is stopped, a migrate asks the target to give root the
+subordinate range for an unprivileged container's id range (the peer-only
+`PrepareContainerTarget`). The target takes only a container-shaped range —
+65536 ids above the host's own ids, a slot of its `containers.idmap_*` span
+when it lies inside it — that overlaps no range another container records or
+runs with there — an unfinished convert's recorded range counts as held. A
+range that overlaps the target's span must be exactly one of its slots. A range
+outside the span (a backup restored from another cluster, nodes configured
+differently) is taken when it is free and overlaps no other user's entry in
+`/etc/subuid` or `/etc/subgid`. Root's lines there stay bounded: one per
+distinct range, never repeated. A target that cannot — its `/etc/subuid` is locked or not
+writable — refuses the migrate while the source still runs, untouched.
+A target older than this release cannot be asked; the migrate proceeds and the
+target's own start ensures the range.
 
 ```bash
 # Move a container to another host. The repo must be reachable from BOTH hosts.

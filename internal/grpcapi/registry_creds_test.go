@@ -171,7 +171,10 @@ func TestPullOCIImage_ResolvesStoredCredential(t *testing.T) {
 	}
 
 	// (c) local oci: ref → no creds attached even with a matching stored row.
-	if _, err := s.PullOCIImage(alice, &pb.PullOCIImageRequest{Image: "oci:/var/lib/litevirt/oci/x:v1", Dest: "/tmp/r"}); err != nil {
+	// The local layout has to exist: the pulling host judges it as a directory
+	// it reads (storage.CheckReadDir).
+	layout := t.TempDir()
+	if _, err := s.PullOCIImage(alice, &pb.PullOCIImageRequest{Image: "oci:" + layout + ":v1", Dest: "/tmp/r"}); err != nil {
 		t.Fatalf("pull oci-local: %v", err)
 	}
 	if got := rt.pullCalls[2]; got.Username != "" || got.Password != "" {

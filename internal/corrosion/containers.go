@@ -158,6 +158,20 @@ type ContainerCreateSpec struct {
 	Release  string             `json:"release,omitempty"`
 	Arch     string             `json:"arch,omitempty"`
 	Networks []ContainerNetwork `json:"networks,omitempty"`
+	// OwnerID names one container lineage: minted at create and clone, kept
+	// by migrate, relocation and restore. With the project it is the owner
+	// record a container's files are matched against (snapshots, backups, its
+	// on-disk directory) instead of its reusable name. Empty for a container
+	// an earlier build created: its files then match as before, by name.
+	OwnerID string `json:"owner_id,omitempty"`
+	// IDMapBase is the first host id of an unprivileged container's range
+	// (0..65535 inside map to IDMapBase..IDMapBase+65535); 0 is privileged.
+	// Confinement is "default" or "legacy"; empty for a container an earlier
+	// build created (privileged, legacy). Both are also in the container's
+	// LXC config, which travels with it; these let a recreate rebuild them
+	// and let any node report them.
+	IDMapBase   int64  `json:"idmap_base,omitempty"`
+	Confinement string `json:"confinement,omitempty"`
 }
 
 // ContainerNetwork is one NIC of a ContainerCreateSpec. It carries the create-
@@ -181,7 +195,8 @@ type ContainerNetwork struct {
 // EncodeCreateSpec marshals a create spec for storage. Returns "" for a
 // zero/empty spec so it round-trips as "unknown".
 func EncodeCreateSpec(s ContainerCreateSpec) string {
-	if s.Template == "" && s.Distro == "" && s.Release == "" && s.Arch == "" && len(s.Networks) == 0 {
+	if s.Template == "" && s.Distro == "" && s.Release == "" && s.Arch == "" && len(s.Networks) == 0 && s.OwnerID == "" &&
+		s.IDMapBase == 0 && s.Confinement == "" {
 		return ""
 	}
 	b, err := json.Marshal(s)

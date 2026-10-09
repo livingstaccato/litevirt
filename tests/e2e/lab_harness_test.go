@@ -964,7 +964,7 @@ func (l *lab) createContainer(via, prefix, host string) string {
 		}
 		for _, h := range l.hosts {
 			l.lv(v, "ct", "stop", name, "--host", h)
-			l.lv(v, "ct", "rm", name, "--host", h)
+			l.lv(v, "ct", "rm", name, "--host", h, "--force")
 		}
 	})
 	if out, err := l.lv(via, "ct", "create", name, "--host", host, "--on-host-failure", "image-recreate"); err != nil {

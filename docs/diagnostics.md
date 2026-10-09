@@ -706,6 +706,25 @@ stop/start rather than a guest reboot. And it narrows live migration for that VM
 to hosts with an equal-or-richer CPU — the trade the modern instruction set
 costs, and no trade at all on a homogeneous cluster.
 
+## `lv doctor privileged-containers`
+
+Read-only. Lists containers that run **privileged** (no user namespace: root in
+the container is root on the host) or with **legacy confinement** (AppArmor
+nesting allowed, the template's seccomp policy and capabilities).
+
+```
+lv doctor privileged-containers
+```
+
+Every container created before unprivileged containers became the default is
+both, and keeps running exactly as it is: nothing converts it behind the
+operator's back. `lv ct inspect <name>` shows the same for one container. To
+move one over, stop it and run
+`lv ct convert --unprivileged --confinement default <name>` (see
+[containers.md](containers.md), "Security"). A container an Admin created with
+`--privileged` or `--confinement legacy` is listed too: that is the point of
+the report.
+
 ## `lv doctor vm-uuids`
 
 Read-only. Lists VMs whose **persisted spec** carries no domain uuid.

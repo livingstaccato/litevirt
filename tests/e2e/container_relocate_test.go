@@ -101,7 +101,7 @@ func TestContainer_RelocateOnHostLoss(t *testing.T) {
 		for _, n := range []string{relocating, staying} {
 			lvErr(t, "ct", "stop", n)
 			for _, h := range hostNames {
-				lvErr(t, "ct", "rm", n, "--host", h)
+				lvErr(t, "ct", "rm", n, "--host", h, "--force")
 			}
 		}
 	})

@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"io"
 
 	"github.com/litevirt/litevirt/internal/lxc"
@@ -22,13 +23,18 @@ func NewLXCRuntimeAdapter(inner lxc.Runtime) *LXCRuntimeAdapter {
 func (a *LXCRuntimeAdapter) CreateContainer(ctx context.Context, opts CreateContainerOpts) (*ContainerInfo, error) {
 	nics := make([]lxc.NetworkAttach, 0, len(opts.Networks))
 	for _, n := range opts.Networks {
-		nics = append(nics, lxc.NetworkAttach{Name: n.Name, Bridge: n.Bridge, IP: n.IP, MAC: n.MAC, Veth: n.Veth})
+		nics = append(nics, lxc.NetworkAttach{Name: n.Name, Bridge: n.Bridge, IP: n.IP, MAC: n.MAC, Veth: n.Veth, Gateway: n.Gateway})
+	}
+	var idmap *lxc.IDMap
+	if opts.IDMapBase != 0 {
+		idmap = &lxc.IDMap{Base: opts.IDMapBase, Size: lxc.IDMapSize}
 	}
 	c, err := a.Inner.Create(ctx, lxc.CreateOpts{
 		Name: opts.Name, Template: opts.Template,
 		Distro: opts.Distro, Release: opts.Release, Arch: opts.Arch,
 		CPULimit: opts.CPULimit, MemoryMiB: opts.MemoryMiB,
 		Network: nics, Labels: opts.Labels,
+		Confinement: opts.Confinement, IDMap: idmap,
 	})
 	if err != nil {
 		return nil, err
@@ -110,4 +116,73 @@ func (a *LXCRuntimeAdapter) PullOCIImage(ctx context.Context, image, dest, tag, 
 func (a *LXCRuntimeAdapter) ContainerLimits(ctx context.Context, name string) (int, ContainerMemoryLimit, error) {
 	cpu, mem, err := a.Inner.Limits(ctx, name)
 	return cpu, ContainerMemoryLimit{MiB: mem.MiB, Unlimited: mem.Unlimited}, err
+}
+
+// StampOwner / ReadOwner pass the on-disk owner record through when the inner
+// runtime keeps one (lxc.OwnerStamper); otherwise there is no record.
+func (a *LXCRuntimeAdapter) StampOwner(name string, o lxc.ContainerOwner) error {
+	if st, ok := a.Inner.(lxc.OwnerStamper); ok {
+		return st.StampOwner(name, o)
+	}
+	return nil
+}
+
+func (a *LXCRuntimeAdapter) ReadOwner(name string) (*lxc.ContainerOwner, error) {
+	if st, ok := a.Inner.(lxc.OwnerStamper); ok {
+		return st.ReadOwner(name)
+	}
+	return nil, nil
+}
+
+// ContainerSecurity / ConvertContainerSecurity pass through to a runtime that
+// keeps container security in its config (lxc.Securer).
+func (a *LXCRuntimeAdapter) ContainerSecurity(name string) (lxc.Security, error) {
+	if sc, ok := a.Inner.(lxc.Securer); ok {
+		return sc.Security(name)
+	}
+	return lxc.Security{}, errors.New("this container runtime keeps no security settings")
+}
+
+func (a *LXCRuntimeAdapter) ConvertContainerSecurity(ctx context.Context, name string, to lxc.ConvertOpts) error {
+	if sc, ok := a.Inner.(lxc.Securer); ok {
+		return sc.Convert(ctx, name, to)
+	}
+	return errors.New("this container runtime cannot convert a container")
+}
+
+// TakeDroppedAttrs passes through the attributes the runtime's last import
+// dropped (lxc.LxcRunner); nil when it records none.
+func (a *LXCRuntimeAdapter) TakeDroppedAttrs(name string) ([]string, error) {
+	if t, ok := a.Inner.(interface {
+		TakeDroppedAttrs(string) ([]string, error)
+	}); ok {
+		return t.TakeDroppedAttrs(name)
+	}
+	return nil, nil
+}
+
+// EnsureContainerIDRange passes through root's subordinate-range ensure
+// (lxc.LxcRunner.EnsureRootSubIDs).
+func (a *LXCRuntimeAdapter) EnsureContainerIDRange(base, size int64) error {
+	if e, ok := a.Inner.(interface{ EnsureRootSubIDs(*lxc.IDMap) error }); ok {
+		return e.EnsureRootSubIDs(&lxc.IDMap{Base: base, Size: size})
+	}
+	return nil
+}
+
+// RevertContainerConverting passes through a revert that marks the restored
+// copy converting to `to` (lxc.LxcRunner); a runtime without it reverts.
+func (a *LXCRuntimeAdapter) RevertContainerConverting(ctx context.Context, name string, r io.Reader, to lxc.ConvertOpts) error {
+	if rc, ok := a.Inner.(interface {
+		RevertContainerConverting(context.Context, string, io.Reader, lxc.ConvertOpts) error
+	}); ok {
+		return rc.RevertContainerConverting(ctx, name, r, to)
+	}
+	return a.Inner.RevertContainer(ctx, name, r)
+}
+
+// SubIDConflict passes through lxc.SubIDConflict.
+func (a *LXCRuntimeAdapter) SubIDConflict(base, size int64) (string, bool) {
+	owner, hit := lxc.SubIDConflict(&lxc.IDMap{Base: base, Size: size})
+	return owner, hit
 }

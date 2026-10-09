@@ -20,9 +20,12 @@ package lxc
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"log/slog"
 	"math"
 	"net"
 	"os"
@@ -86,6 +89,9 @@ type NetworkAttach struct {
 	IP     string // optional static IP; empty = DHCP / RA
 	MAC    string // optional fixed MAC; empty = OS-generated
 	Veth   string // optional deterministic host-side veth name (lxc.net.N.veth.pair); ≤15 bytes
+	// Gateway is an optional bare IPv4 default gateway (lxc.net.N.ipv4.gateway),
+	// also written into the guest's ifupdown stanza for a static NIC.
+	Gateway string
 }
 
 // ExecResult captures the outcome of lxc-attach.
@@ -185,6 +191,14 @@ type CreateOpts struct {
 	// Labels are persisted into a litevirt-specific config block (we
 	// own them — LXC ignores).
 	Labels map[string]string
+	// Confinement is ConfinementDefault or ConfinementLegacy; "" is legacy,
+	// the config an earlier build wrote (a recreate of such a container).
+	Confinement string
+	// IDMap makes the container unprivileged in that id range; nil is
+	// privileged.
+	IDMap *IDMap
+	// PidsMax is written as lxc.cgroup2.pids.max when positive.
+	PidsMax int
 }
 
 // Validate checks cross-field invariants before any shell-out.
@@ -229,6 +243,20 @@ type LxcRunner struct {
 	// stat failure (container restarted → new cgroup path).
 	cgPathMu    sync.Mutex
 	cgPathCache map[string]string
+
+	// DefaultPidsMax is the pids.max a container whose config sets none gets
+	// at its next start (prepareStart). 0 adds none.
+	DefaultPidsMax int
+	// IDMappedRootfs chooses how an unprivileged container's rootfs is mapped:
+	// "on" (an idmapped mount), "off" (files shifted into its range), or
+	// "auto"/"" (an idmapped mount where idmappedProbe says this host can).
+	IDMappedRootfs string
+	// SubIDSpan is the whole id span containers are allocated from; root's
+	// subordinate range is added for all of it at once (ensureRootSubIDs).
+	SubIDSpan *IDMap
+
+	probeOnce     sync.Once
+	probeIDMapped bool
 }
 
 // NewLxcRunner returns a Runtime configured to talk to /var/lib/lxc.
@@ -281,6 +309,9 @@ func (r *LxcRunner) Create(ctx context.Context, opts CreateOpts) (*Container, er
 	if err := opts.Validate(); err != nil {
 		return nil, err
 	}
+	if opts.PidsMax == 0 {
+		opts.PidsMax = r.DefaultPidsMax
+	}
 	if opts.Template != "download" {
 		rootfs, ok, err := resolveRootfs(opts.Template)
 		if err != nil {
@@ -306,6 +337,14 @@ func (r *LxcRunner) Create(ctx context.Context, opts CreateOpts) (*Container, er
 	// --network wins) and apply cgroup limits.
 	if err := r.finalizeContainerConfig(opts); err != nil {
 		return nil, fmt.Errorf("apply container network/resource config for %q: %w", opts.Name, err)
+	}
+	if err := r.shiftNewRootfs(opts); err != nil {
+		_ = os.RemoveAll(filepath.Join(r.lxcpath(), opts.Name))
+		return nil, err
+	}
+	if err := r.secureContainerDir(opts.Name); err != nil {
+		_ = os.RemoveAll(filepath.Join(r.lxcpath(), opts.Name))
+		return nil, err
 	}
 	return &Container{
 		Name:      opts.Name,
@@ -355,6 +394,14 @@ func (r *LxcRunner) createFromRootfs(ctx context.Context, opts CreateOpts, rootf
 	if err := r.finalizeContainerConfig(opts); err != nil {
 		return nil, fmt.Errorf("apply container network/resource config for %q: %w", opts.Name, err)
 	}
+	if err := r.shiftNewRootfs(opts); err != nil {
+		_ = os.RemoveAll(containerDir)
+		return nil, err
+	}
+	if err := r.secureContainerDir(opts.Name); err != nil {
+		_ = os.RemoveAll(containerDir)
+		return nil, err
+	}
 	return &Container{
 		Name:      opts.Name,
 		State:     StateStopped,
@@ -368,8 +415,11 @@ func (r *LxcRunner) createFromRootfs(ctx context.Context, opts CreateOpts, rootf
 	}, nil
 }
 
-// Start runs lxc-start in daemon mode.
+// Start runs lxc-start in daemon mode, after prepareStart.
 func (r *LxcRunner) Start(ctx context.Context, name string) error {
+	if err := r.prepareStart(name); err != nil {
+		return err
+	}
 	if _, stderr, err := r.run(ctx, "lxc-start", "-n", name, "-d"); err != nil {
 		return cmdErr("lxc-start", name, stderr, err)
 	}
@@ -645,7 +695,11 @@ func (r *LxcRunner) ExportContainer(ctx context.Context, name string, w io.Write
 	// -C <lxcpath> <name> stores paths relative to the container name, so a
 	// restore can extract under a different lxcpath. --numeric-owner keeps uid/gid
 	// stable across hosts that may not share /etc/passwd.
-	cmd := exec.CommandContext(ctx, "tar", "-C", r.lxcpath(), "--numeric-owner", "-cf", "-", name)
+	// --xattrs with every attribute and --acls keep file capabilities, ACLs
+	// and labels; setuid/setgid/sticky are in the mode. ImportContainer
+	// restores all of it (safename.ExtractRootfsTar).
+	cmd := exec.CommandContext(ctx, "tar", "-C", r.lxcpath(), "--numeric-owner",
+		"--xattrs", "--xattrs-include=*", "--acls", "-cf", "-", name)
 	stderr := strings.Builder{}
 	cmd.Stderr = stringWriter{&stderr}
 	cmd.Stdout = w
@@ -692,53 +746,128 @@ func (r *LxcRunner) ContainerExists(name string) (bool, error) {
 }
 
 // importContainer is the shared extract path. replace=false refuses to clobber
-// (fresh import/restore); replace=true renames any existing dir aside first and
+// (fresh import/restore); replace=true sets any existing dir aside and
 // restores it on failure (crash-safe snapshot revert — a corrupt snapshot tar
 // can never lose the live container).
+//
+// The archive is laid down in a private (0700) staging directory under
+// lxcpath and moved into place only once its config points at the final
+// rootfs and the container directory is closed to other host users
+// (secureContainerDirAt): a rootfs may carry setuid binaries, and the
+// archive's own directory mode (0755 from an earlier build) must never be
+// reachable while they are there. Root's subordinate range is ensured for an
+// unprivileged container here, on the host it lands on. Attributes the
+// filesystem does not support are dropped and recorded (droppedAttrsFile).
 func (r *LxcRunner) importContainer(ctx context.Context, name string, src io.Reader, replace bool) error {
+	return r.importContainerMarked(ctx, name, src, replace, nil)
+}
+
+// importContainerMarked is importContainer that, with markTo, marks the
+// staged copy converting to markTo when its config's security differs.
+func (r *LxcRunner) importContainerMarked(ctx context.Context, name string, src io.Reader, replace bool, markTo *ConvertOpts) error {
 	// The name becomes <lxcpath>/<name>; validate it before it composes a path.
 	if err := safename.ValidateContainerName(name); err != nil {
 		return err
 	}
 	dir := filepath.Join(r.lxcpath(), name)
+	if _, err := os.Stat(dir); err == nil && !replace {
+		return fmt.Errorf("container dir %s already exists; refusing to overwrite", dir)
+	}
+	if err := os.MkdirAll(r.lxcpath(), 0o755); err != nil {
+		return fmt.Errorf("ensure lxcpath %s: %w", r.lxcpath(), err)
+	}
+	staging, err := os.MkdirTemp(r.lxcpath(), ".litevirt-import-"+name+"-")
+	if err != nil {
+		return fmt.Errorf("staging dir for %s: %w", name, err)
+	}
+	defer os.RemoveAll(staging)
+	if err := os.Chmod(staging, 0o700); err != nil {
+		return err
+	}
+	// Slip-safe extraction: the archive is untrusted backup-repo data, so we
+	// contain every member under the staging dir, never write through a
+	// symlink, and require the single top-level dir to be the container name.
+	dropped, err := extractRootfs(src, staging, name)
+	if err != nil {
+		return fmt.Errorf("extract container %s: %w", name, err)
+	}
+	staged := filepath.Join(staging, name)
+	if err := rewriteRootFSPathAt(staged, filepath.Join(dir, "rootfs")); err != nil {
+		return err
+	}
+	if b, rerr := os.ReadFile(filepath.Join(staged, "config")); rerr == nil {
+		if sec := parseSecurity(string(b)); sec.IDMap != nil {
+			if err := r.ensureRootSubIDs(sec.IDMap); err != nil {
+				return err
+			}
+		}
+	}
+	if err := secureContainerDirAt(staged); err != nil {
+		return err
+	}
+	if markTo != nil {
+		if b, rerr := os.ReadFile(filepath.Join(staged, "config")); rerr == nil && securityDiffers(parseSecurity(string(b)), *markTo) {
+			m, _ := json.Marshal(markTo)
+			if err := os.WriteFile(filepath.Join(staged, convertMarkerFile), m, 0o600); err != nil {
+				return fmt.Errorf("mark the restored copy of %s converting: %w", name, err)
+			}
+		}
+	}
 	var backup string
 	if _, err := os.Stat(dir); err == nil {
-		if !replace {
-			return fmt.Errorf("container dir %s already exists; refusing to overwrite", dir)
-		}
-		// Move the current dir aside rather than deleting it, so we can roll
-		// back if the extract fails.
+		// Set the current dir aside rather than deleting it, so we can roll
+		// back if the swap fails.
 		backup = dir + ".revert-old"
 		_ = os.RemoveAll(backup) // clear any stale backup from a prior crash
 		if err := os.Rename(dir, backup); err != nil {
 			return fmt.Errorf("set aside existing dir %s for revert: %w", dir, err)
 		}
 	}
-	// rollback restores the set-aside dir on any failure past this point.
-	rollback := func(cause error) error {
-		_ = os.RemoveAll(dir)
+	if err := os.Rename(staged, dir); err != nil {
 		if backup != "" {
 			_ = os.Rename(backup, dir)
 		}
-		return cause
-	}
-	if err := os.MkdirAll(r.lxcpath(), 0o755); err != nil {
-		return rollback(fmt.Errorf("ensure lxcpath %s: %w", r.lxcpath(), err))
-	}
-	// Slip-safe extraction: the archive is untrusted backup-repo data, so we
-	// contain every member under <lxcpath>, never write through a symlink, and
-	// require the single top-level dir to be the container name (a tampered
-	// archive can't clobber a sibling container). Replaces a bare `tar -xf`.
-	if err := safename.ExtractRootfsTar(src, r.lxcpath(), name); err != nil {
-		return rollback(fmt.Errorf("extract container %s: %w", name, err))
-	}
-	if err := r.rewriteRootFSPath(name); err != nil {
-		return rollback(err)
+		return fmt.Errorf("move container %s into place: %w", name, err)
 	}
 	if backup != "" {
 		_ = os.RemoveAll(backup) // success — drop the old copy
 	}
+	if len(dropped) > 0 {
+		slog.Warn("container import: the target filesystem does not support some attributes; they were dropped (a dropped ACL narrowed the file's group bits)",
+			"container", name, "dropped", dropped)
+		b, _ := json.Marshal(dropped)
+		_ = os.WriteFile(filepath.Join(dir, droppedAttrsFile), b, 0o600)
+	}
 	return nil
+}
+
+// extractRootfs is safename.ExtractRootfsTarReport; a variable so a test can
+// watch where it extracts.
+var extractRootfs = safename.ExtractRootfsTarReport
+
+// droppedAttrsFile records, in the container's directory, the attributes its
+// last import dropped, until TakeDroppedAttrs reports them.
+const droppedAttrsFile = "litevirt-dropped-attrs"
+
+// TakeDroppedAttrs returns and clears the attributes the container's last
+// import dropped ("<member> <attribute>"); nil when none.
+func (r *LxcRunner) TakeDroppedAttrs(name string) ([]string, error) {
+	if err := safename.ValidateContainerName(name); err != nil {
+		return nil, err
+	}
+	p := filepath.Join(r.lxcpath(), name, droppedAttrsFile)
+	b, err := os.ReadFile(p)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	if err := json.Unmarshal(b, &out); err != nil {
+		return nil, err
+	}
+	return out, os.Remove(p)
 }
 
 // CloneContainer makes a full copy of src's on-disk dir as dst (`cp -a`), then
@@ -764,6 +893,10 @@ func (r *LxcRunner) CloneContainer(ctx context.Context, src, dst string) error {
 		return err
 	}
 	if err := r.cloneFreshIdentity(dst); err != nil {
+		_ = os.RemoveAll(dstDir)
+		return err
+	}
+	if err := r.secureContainerDir(dst); err != nil {
 		_ = os.RemoveAll(dstDir)
 		return err
 	}
@@ -848,12 +981,17 @@ func lxcNetOrdinal(line string) (int, bool) {
 // <lxcpath>/<name>/rootfs after an import, so a container restored under a
 // different lxcpath (or from another host) boots against the real rootfs.
 func (r *LxcRunner) rewriteRootFSPath(name string) error {
-	cfg := filepath.Join(r.lxcpath(), name, "config")
+	return rewriteRootFSPathAt(filepath.Join(r.lxcpath(), name), filepath.Join(r.lxcpath(), name, "rootfs"))
+}
+
+// rewriteRootFSPathAt pins the config in containerDir to rootfs.
+func rewriteRootFSPathAt(containerDir, rootfs string) error {
+	cfg := filepath.Join(containerDir, "config")
 	data, err := os.ReadFile(cfg)
 	if err != nil {
 		return fmt.Errorf("read imported config %s: %w", cfg, err)
 	}
-	want := "lxc.rootfs.path = dir:" + filepath.Join(r.lxcpath(), name, "rootfs")
+	want := "lxc.rootfs.path = dir:" + rootfs
 	lines := strings.Split(string(data), "\n")
 	replaced := false
 	for i, line := range lines {
@@ -907,19 +1045,12 @@ func cmdErr(bin, name string, stderr []byte, err error) error {
 // lxc-create unchanged. A directory holding an OCI/umoci bundle (a "rootfs/"
 // subdir) is descended into.
 func resolveRootfs(template string) (path string, ok bool, err error) {
-	p := template
-	explicit := false
-	if strings.HasPrefix(p, "rootfs:") {
-		p, explicit = strings.TrimPrefix(p, "rootfs:"), true
-	}
-	// Only a path-shaped value is a rootfs candidate; a bare name is a
-	// template name for lxc-create.
-	if !explicit && !strings.HasPrefix(p, "/") && !strings.HasPrefix(p, "./") && !strings.HasPrefix(p, "../") {
-		return "", false, nil
-	}
-	abs, aerr := filepath.Abs(p)
+	abs, isPath, aerr := TemplatePath(template)
 	if aerr != nil {
-		return "", false, fmt.Errorf("resolve rootfs path %q: %w", p, aerr)
+		return "", false, aerr
+	}
+	if !isPath {
+		return "", false, nil
 	}
 	if !isDir(abs) {
 		return "", false, fmt.Errorf("rootfs template %q is not an existing directory", template)
@@ -932,6 +1063,30 @@ func resolveRootfs(template string) (path string, ok bool, err error) {
 	}
 	if !looksLikeRootfs(abs) {
 		return "", false, fmt.Errorf("rootfs template %q does not look like a root filesystem (no bin//etc//usr/…)", template)
+	}
+	return abs, true, nil
+}
+
+// TemplatePath says whether a create template names a host directory (a
+// pre-extracted rootfs) and, if so, which one, as an absolute path — the path
+// resolveRootfs would read. "rootfs:<p>", an absolute path, and "./" or "../"
+// relative paths (resolved against the daemon's working directory) are paths;
+// "download" and any other bare name are lxc-create template names. Nothing is
+// read from disk, so a caller can judge the path before anything touches it.
+func TemplatePath(template string) (path string, isPath bool, err error) {
+	p := template
+	explicit := false
+	if strings.HasPrefix(p, "rootfs:") {
+		p, explicit = strings.TrimPrefix(p, "rootfs:"), true
+	}
+	// Only a path-shaped value is a rootfs candidate; a bare name is a
+	// template name for lxc-create.
+	if !explicit && !strings.HasPrefix(p, "/") && !strings.HasPrefix(p, "./") && !strings.HasPrefix(p, "../") {
+		return "", false, nil
+	}
+	abs, aerr := filepath.Abs(p)
+	if aerr != nil {
+		return "", true, fmt.Errorf("resolve rootfs path %q: %w", p, aerr)
 	}
 	return abs, true, nil
 }
@@ -995,6 +1150,10 @@ func (r *LxcRunner) finalizeContainerConfig(opts CreateOpts) error {
 	}
 	cfg += netCfg
 	cfg += ResourceConfig(opts.CPULimit, opts.MemoryMiB)
+	if opts.PidsMax > 0 {
+		cfg += fmt.Sprintf("%s = %d\n", pidsMaxKey, opts.PidsMax)
+	}
+	cfg = withSecurityBlock(cfg, renderSecurityBlock(opts.Confinement, opts.IDMap, opts.IDMap != nil && r.useIDMappedMount()))
 
 	if err := os.WriteFile(path, []byte(cfg), 0o644); err != nil {
 		return err
@@ -1053,6 +1212,9 @@ func configureGuestStaticIP(rootfs string, nics []NetworkAttach) error {
 		fmt.Fprintf(&b, "iface %s inet static\n    address %s\n", name, addr)
 		if netmask != "" {
 			fmt.Fprintf(&b, "    netmask %s\n", netmask)
+		}
+		if n.Gateway != "" {
+			fmt.Fprintf(&b, "    gateway %s\n", n.Gateway)
 		}
 		b.WriteString("\n")
 	}
@@ -1292,4 +1454,35 @@ func parseMemoryMax(val string) (MemoryLimit, error) {
 	// zero-byte cap is a legal cgroup2 value and the most restrictive one
 	// there is, so reading it as "no cap" inverts its meaning exactly.
 	return MemoryLimit{MiB: int((bytes + (1 << 20) - 1) >> 20)}, nil
+}
+
+// shiftNewRootfs moves a new unprivileged container's rootfs (owned by host
+// ids, as copied or as lxc-create wrote it) into its range, unless an
+// idmapped mount maps it. The config already carries the mapping.
+func (r *LxcRunner) shiftNewRootfs(opts CreateOpts) error {
+	if opts.IDMap == nil {
+		return nil
+	}
+	if err := r.ensureRootSubIDs(opts.IDMap); err != nil {
+		return err
+	}
+	if r.useIDMappedMount() {
+		return nil
+	}
+	rootfs, err := r.RootFSPath(opts.Name)
+	if err != nil {
+		return err
+	}
+	if err := shiftTree(rootfs, nil, opts.IDMap); err != nil {
+		return fmt.Errorf("shift %s into ids %d-%d: %w", rootfs, opts.IDMap.Base, opts.IDMap.Base+opts.IDMap.Size-1, err)
+	}
+	return nil
+}
+
+// securityDiffers reports whether sec is not what `to` asks for.
+func securityDiffers(sec Security, to ConvertOpts) bool {
+	if to.IDMap != nil && (sec.IDMap == nil || sec.IDMap.Base != to.IDMap.Base) {
+		return true
+	}
+	return to.Confinement != "" && to.Confinement != sec.Confinement
 }

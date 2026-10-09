@@ -236,8 +236,23 @@ removes them. Placement is **LXC-aware** — containers are only scheduled onto
 hosts that advertise the container runtime, so they never land on a node that
 can't run them. Image forms: `kind: lxc` takes a download template (`image:
 "alpine:3.21"`) or a rootfs path; an OCI **registry ref** must be pre-pulled
-today (`lv ct pull <ref> --dest <rootfs-dir>`, then set `image:` to that rootfs
-path). Each container is given its own copy of the rootfs, so one pull backs any
+today (`lv ct pull <ref> --dest <name>`, then set `image:` to the library item
+`<data_dir>/oci/<name>`; any other rootfs path is a host path the deploying
+caller needs the Admin role to name — see "Host paths a container is given" in
+[containers.md](containers.md)). A container workload may set `privileged: true` (no user namespace) and
+`confinement: legacy` (AppArmor nesting, the template's seccomp and
+capabilities); deploying either needs the Admin role, and changing either on a
+deployed container changes nothing until `lv ct convert` (see "Security" in
+[containers.md](containers.md)). A recreate of an existing member (an image,
+cpu or memory change) keeps that container's current privilege mode and
+confinement when the stack file states none — a member deployed by an earlier
+release stays privileged with legacy confinement — and only a brand-new member
+gets the unprivileged, confined defaults. Carrying a privileged or
+legacy-confined member over needs the Admin role or `ct.exec` on that member
+(root inside it already; every Operator holds it); a deployer with neither is
+refused with a message naming `lv ct convert`, never given a silently
+unprivileged replacement. `privileged: false` in a stack file is the same as
+leaving it out: to move a member over, use `lv ct convert`. Each container is given its own copy of the rootfs, so one pull backs any
 number of containers and `compose down` leaves the pulled template untouched.
 Remaining follow-ups: OCI registry-ref auto-pull; in-place reconfigure
 (cpu/mem changes recreate the container rather than live-tuning); and full

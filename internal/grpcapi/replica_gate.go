@@ -60,6 +60,7 @@ func init() {
 		"StartContainer", "StopContainer", "DeleteContainer", "MigrateContainer",
 		"SnapshotContainer", "RevertContainerSnapshot", "DeleteContainerSnapshot",
 		"BackupContainer", "RestoreContainer", "CloneContainer", "ConvertContainerToTemplate",
+		"ConvertContainer",
 		// Stacks: compose up updates existing members in place, compose down
 		// deletes them — both from the local row's view of where they run.
 		"DeployStack", "DeleteStack",

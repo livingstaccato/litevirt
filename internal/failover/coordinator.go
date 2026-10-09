@@ -6,6 +6,7 @@ package failover
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"sort"
 	"strconv"
@@ -16,6 +17,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/events"
 	"github.com/litevirt/litevirt/internal/fence"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/obs"
@@ -191,6 +193,10 @@ type Coordinator struct {
 	// OnFence, when set, is invoked after a fence is recorded so the daemon can
 	// emit an operator notification (#5). Best-effort; must not block.
 	OnFence func(host, method, result, detail string)
+	// Events, when set, carries the coordinator's workload events (a stopped
+	// workload left on a failed host, skip_stopped.go) to this host's live
+	// event stream. Optional; a VM's event is also kept in vm_events.
+	Events *events.Bus
 	// Metrics, when set, counts failover decisions/outcomes/errors by
 	// phase+result+error_class (U9). Optional + nil-safe (see metrics.go).
 	Metrics Metrics
@@ -2621,6 +2627,19 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 	placementReqs := make([]placement.Request, 0, len(vms))
 
 	for _, vm := range vms {
+		// A stopped VM is not a failover candidate (VMRecoverableOnHostFailure),
+		// and this is the FIRST check, ahead of auto-promote, which defines and
+		// starts a VM too. It stays on h, stopped, with its disks: a reschedule
+		// would overwrite the stop with "pending" and start it elsewhere — on a
+		// disk rebuilt blank from its image when the real one is host-local,
+		// stranding the real disk on h for the superseded-disk sweep. The write
+		// below re-checks the state inside its transaction, so a stop that lands
+		// after this read still wins.
+		if corrosion.VMStoppedForFailover(vm) {
+			c.skipStoppedVM(ctx, h.Name, vm)
+			continue
+		}
+
 		// A Secure-Boot/vTPM VM's firmware state (UEFI NVRAM + swtpm) is host-local,
 		// so it died with the fenced host — neither a reschedule (would boot a fresh
 		// TPM) nor a disk-only replica promotion can recover it. Skip automatic
@@ -2933,12 +2952,21 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 				proof, targetName = cl.Proof, cl.Proof.DestHost
 			}
 			if err := corrosion.WriteVMRescheduleProof(ctx, c.db, proof, vm.Name, targetName); err != nil {
+				if errors.Is(err, corrosion.ErrWorkloadStopped) {
+					// Stopped after it was chosen: the stop wins.
+					c.skipStoppedVM(ctx, h.Name, vm)
+					continue
+				}
 				slog.Error("failover: write reschedule proof", "vm", vm.Name, "error", err)
 				c.mVM(ActionReschedule, ResultError, ErrDBError)
 				continue
 			}
 		} else if err := corrosion.RescheduleVMHost(ctx, c.db, vm.Name, targetName, "pending"); err != nil {
-			// Legacy (pre-activation) path — unchanged.
+			// Legacy (pre-activation) path.
+			if errors.Is(err, corrosion.ErrWorkloadStopped) {
+				c.skipStoppedVM(ctx, h.Name, vm)
+				continue
+			}
 			slog.Error("failover: update VM host", "vm", vm.Name, "error", err)
 			c.mVM(ActionReschedule, ResultError, ErrDBError)
 			continue
@@ -2983,6 +3011,14 @@ func (c *Coordinator) relocateContainers(ctx context.Context, h *corrosion.HostR
 		return
 	}
 	for _, ct := range cts {
+		// A stopped container is not a failover candidate either
+		// (ContainerRecoverableOnHostFailure): relocating it recreates and
+		// starts it on another host. The first check, as for VMs; the
+		// relocation writes re-check it in their transactions.
+		if corrosion.ContainerStoppedForFailover(ct) {
+			c.skipStoppedContainer(ctx, h.Name, ct)
+			continue
+		}
 		if ct.OnHostFailure == "" || ct.OnHostFailure == "none" {
 			continue
 		}
@@ -3088,7 +3124,11 @@ func (c *Coordinator) startRelocation(ctx context.Context, h *corrosion.HostReco
 				return
 			}
 		}
-		if err := corrosion.SetContainerStateDetail(ctx, c.db, h.Name, ct.Name, "relocating", corrosion.RelocateRestoreDetail(target, token)); err != nil {
+		if err := corrosion.MarkContainerRelocateRestore(ctx, c.db, h.Name, ct.Name, target, token); err != nil {
+			if errors.Is(err, corrosion.ErrWorkloadStopped) {
+				c.skipStoppedContainer(ctx, h.Name, ct)
+				return
+			}
 			slog.Warn("failover: failed to mark relocate-restore; deferring relocation to next tick",
 				"container", ct.Name, "error", err)
 			c.mCt(ActionRelocate, ResultError, ErrDBError)
@@ -3291,6 +3331,11 @@ func (c *Coordinator) imageRecreateOrSkip(ctx context.Context, h *corrosion.Host
 		}
 	}
 	if err := corrosion.RelocateContainerWithToken(ctx, c.db, h.Name, ct.Name, target, relocToken); err != nil {
+		if errors.Is(err, corrosion.ErrWorkloadStopped) {
+			// Stopped after it was chosen: the stop wins.
+			c.skipStoppedContainer(ctx, h.Name, ct)
+			return
+		}
 		// Includes the no-clobber guard (a same-name container appeared on the
 		// target since the check above) — never lose the source.
 		slog.Error("failover: relocate container (image-recreate)", "container", ct.Name, "error", err)

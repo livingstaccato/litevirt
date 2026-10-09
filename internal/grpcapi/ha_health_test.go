@@ -87,8 +87,10 @@ func TestAnyStrandedPending(t *testing.T) {
 	// This case was unreachable while ListVMs' projection omitted the column: every
 	// pending VM read as markerless, so a routine reschedule onto this host flapped
 	// legacy_pending_stranded.
+	// Running before the reschedule: failover never reschedules a stopped VM,
+	// and WriteVMRescheduleProof refuses one (ErrWorkloadStopped).
 	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
-		Name: "vmok", HostName: "test-host", State: "stopped",
+		Name: "vmok", HostName: "other-host", State: "running",
 	}, nil, nil); err != nil {
 		t.Fatalf("InsertVM: %v", err)
 	}

@@ -51,6 +51,7 @@ var guarded = map[string]bool{
 	"SetContainerStateStrict":       true,
 	"SetContainerStateDetail":       true,
 	"SetContainerStateDetailStrict": true,
+	"MarkContainerRelocateRestore":  true,
 }
 
 type violation struct {

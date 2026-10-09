@@ -21,6 +21,7 @@ func TestVMNeedsFailover(t *testing.T) {
 	cases := []struct {
 		name        string
 		spec        string
+		state       string
 		autoPromote bool
 		want        bool
 	}{
@@ -41,10 +42,18 @@ func TestVMNeedsFailover(t *testing.T) {
 			spec: `{"on_host_failure":"restart-any","tpm":true}`, want: false},
 		{name: "secure boot outranks auto-promote enrolment",
 			spec: `{"secure_boot":true}`, autoPromote: true, want: false},
+		// A stopped VM runs nowhere: recovering it starts it, on a blank disk
+		// when its real one is host-local (kvm003 drill 1). It stays put.
+		{name: "a stopped VM is not failed over",
+			spec: `{"on_host_failure":"restart-any"}`, state: "stopped", want: false},
+		{name: "a stopped VM enrolled in auto-promote is not promoted either",
+			spec: `{"on_host_failure":"restart-any"}`, state: "stopped", autoPromote: true, want: false},
+		{name: "an errored VM is still failed over",
+			spec: `{"on_host_failure":"restart-any"}`, state: "error", want: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := vmNeedsFailover(corrosion.VMRecord{Name: "vm1", Spec: tc.spec}, tc.autoPromote)
+			got := vmNeedsFailover(corrosion.VMRecord{Name: "vm1", Spec: tc.spec, State: tc.state}, tc.autoPromote)
 			if got != tc.want {
 				t.Errorf("vmNeedsFailover = %v, want %v", got, tc.want)
 			}
@@ -78,10 +87,18 @@ func TestContainerNeedsFailover(t *testing.T) {
 			detail: corrosion.RelocateRestoreDetail("target", "tok"), want: false},
 		// The marker only counts as one while state says 'relocating' — the same
 		// condition RelocateRestoreMarker itself applies. A stale detail string on
-		// a stopped row is a strand.
+		// an errored row is a strand.
 		{name: "restore detail without relocating state is a strand",
-			policy: "image-recreate", state: "stopped",
+			policy: "image-recreate", state: "error",
 			detail: corrosion.RelocateRestoreDetail("target", "tok"), want: true},
+		// Stopped runs nowhere, so there is nothing to relocate — whatever its
+		// detail says, unless failover itself wrote the stop (relocate-skipped,
+		// above, which is excluded for its own reason).
+		{name: "a stopped container is not relocated",
+			policy: "image-recreate", state: "stopped", detail: "operator-stop", want: false},
+		{name: "a stopped container with a stale restore detail is not relocated",
+			policy: "image-recreate", state: "stopped",
+			detail: corrosion.RelocateRestoreDetail("target", "tok"), want: false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -148,6 +165,14 @@ func TestRun_ReportsStrandedWorkloads(t *testing.T) {
 		Spec: `{"on_host_failure":"restart-any","secure_boot":true}`,
 	}, nil, nil); err != nil {
 		t.Fatalf("InsertVM secureboot: %v", err)
+	}
+	// A stopped VM is not one failover would move: counting it would page an
+	// operator for a VM that is exactly as they left it.
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+		Name: "stopped", HostName: "dead", State: "stopped",
+		Spec: `{"on_host_failure":"restart-any"}`,
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM stopped: %v", err)
 	}
 	// A VM on a HEALTHY host is not stranded however its policy reads.
 	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{

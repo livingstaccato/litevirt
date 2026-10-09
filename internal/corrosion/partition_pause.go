@@ -90,6 +90,17 @@ func HostPartitionPauseFailed(ctx context.Context, c *Client, host string) (bool
 // enrolled in replication with the default policy of "none" is still
 // recoverable — by promotion rather than reschedule.
 func VMRecoverableOnHostFailure(vm VMRecord, autoPromote bool) bool {
+	// A stopped VM is not run anywhere, so there is nothing to recover: its
+	// row's state is the only record of the operator's (or guest's) stop, and a
+	// recovery overwrites it with "pending" and starts the VM elsewhere — on a
+	// disk rebuilt blank from its image when the real one is host-local, which
+	// then strands the real disk on the failed host. It stays where it is, with
+	// its disk, exactly as it was left (docs/migration-failover.md, "Stopped
+	// workloads"). Auto-promotion defines and starts a VM too, so enrolment does
+	// not change this.
+	if VMStoppedForFailover(vm) {
+		return false
+	}
 	// Secure Boot / vTPM state (UEFI NVRAM + swtpm) was host-local and died with
 	// the host. Neither a reschedule nor a disk-only replica promotion
 	// reconstructs it, so this is not work that becomes possible later — recovery
@@ -115,6 +126,11 @@ func ContainerRecoverableOnHostFailure(ct ContainerRecord) bool {
 	if ct.StateDetail == ContainerRelocateSkippedDetail {
 		return false
 	}
+	// Stopped, as VMRecoverableOnHostFailure: a relocation recreates and starts
+	// it elsewhere, which an operator who stopped it never asked for.
+	if ContainerStoppedForFailover(ct) {
+		return false
+	}
 	// A relocate-restore marker means this row has an ACTIVE owner, not that it
 	// is stranded: resolvePendingRelocations re-derives every marker cluster-wide
 	// on EVERY cycle, independent of the fence path, and retries until the marker
@@ -126,6 +142,19 @@ func ContainerRecoverableOnHostFailure(ct ContainerRecord) bool {
 		return false
 	}
 	return true
+}
+
+// VMStoppedForFailover reports whether vm is stopped, so failover leaves it on
+// its host, stopped, with its disks. It reads the row's state alone: the
+// state is the stop intent (VMRecord carries no other), whoever stopped it.
+func VMStoppedForFailover(vm VMRecord) bool { return vm.State == "stopped" }
+
+// ContainerStoppedForFailover is VMStoppedForFailover for a container. A row
+// the coordinator itself marked relocate-skipped is stopped too, but by
+// failover, not by anyone's intent: it was running when its host died, and the
+// removed-host pass may still move it (retrySkippedOnRemovedHost).
+func ContainerStoppedForFailover(ct ContainerRecord) bool {
+	return ct.State == "stopped" && ct.StateDetail != ContainerRelocateSkippedDetail
 }
 
 // VMFailurePolicy extracts on_host_failure from a VM's spec JSON.

@@ -245,6 +245,10 @@ func (s *Server) strandedOn(ctx context.Context, host string) ([]*pb.StrandedRec
 		if err != nil || full == nil {
 			continue
 		}
+		if corrosion.VMStoppedForFailover(*full) {
+			out = append(out, &pb.StrandedRecovery{Kind: "vm", Name: full.Name, Detail: stoppedOnDeadHostDetail("vm", full.Name, host)})
+			continue
+		}
 		out = append(out, s.strandedFor(ctx, "vm", full.Name, host, full.PendingActionID))
 	}
 	cts, err := corrosion.ListContainers(ctx, s.db, host)
@@ -252,6 +256,10 @@ func (s *Server) strandedOn(ctx context.Context, host string) ([]*pb.StrandedRec
 		return nil, err
 	}
 	for _, ct := range cts {
+		if corrosion.ContainerStoppedForFailover(ct) {
+			out = append(out, &pb.StrandedRecovery{Kind: "container", Name: ct.Name, Detail: stoppedOnDeadHostDetail("container", ct.Name, host)})
+			continue
+		}
 		id := ""
 		if ct.RelocateToken != "" {
 			if pr, ok, _ := corrosion.GetActionProofByToken(ctx, s.db, ct.RelocateToken); ok {
@@ -262,6 +270,27 @@ func (s *Server) strandedOn(ctx context.Context, host string) ([]*pb.StrandedRec
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Kind+out[i].Name < out[j].Kind+out[j].Name })
 	return out, nil
+}
+
+// stoppedOnDeadHostDetail is what `lv host rm --dead` says about a stopped
+// workload on the host it removes. Failover never starts or moves a stopped
+// workload (corrosion.VMRecoverableOnHostFailure), so removing the host does
+// not move it either: it stays recorded there, its data with the machine, and
+// what happens to that data is the operator's choice, made before the
+// removal. It carries no next attempt, so it is not counted as a recovery that
+// will retry.
+func stoppedOnDeadHostDetail(kind, name, host string) string {
+	if kind == "container" {
+		return fmt.Sprintf("container/%s is stopped: failover never recreates or starts a stopped container, so it stays "+
+			"recorded on %s with its rootfs and is not moved by this removal. To keep its data, bring %s back instead "+
+			"of removing it; if the data is lost for good, remove it with `lv ct rm %s --host %s`",
+			name, host, host, name, host)
+	}
+	return fmt.Sprintf("vm/%s is stopped: failover never starts or moves a stopped VM, so it stays recorded on %s "+
+		"with its disks and is not moved by this removal. To keep its data, bring %s back instead of removing it, "+
+		"or promote a replica onto a live host (`lv replication promote %s`); if the data is lost for good, "+
+		"remove it with `lv rm %s` and create it again",
+		name, host, host, name, name)
 }
 
 func (s *Server) strandedFor(ctx context.Context, kind, name, host, proofID string) *pb.StrandedRecovery {

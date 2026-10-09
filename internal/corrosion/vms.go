@@ -1890,6 +1890,13 @@ func RepointMigratedVM(ctx context.Context, c *Client, vmName, sourceHost, targe
 // RescheduleVMHost re-keys a VM to hostName in state, with its disk rows, in
 // one batch. It is the failover coordinator's reschedule write before
 // split_brain_gate_v1 is enforced (WriteVMRescheduleProof is the gated one).
+//
+// A move to any state but "stopped" is refused with ErrWorkloadStopped when the
+// row is stopped when the transaction runs: it is failover's pre-activation
+// reschedule, and "pending" there is a start on hostName that an operator who
+// stopped the VM never asked for. The check is a local precondition, like
+// WriteVMRescheduleProof's; it adds no statement and changes no replicated
+// shape. A row that is gone is ErrNoRowsAffected.
 func RescheduleVMHost(ctx context.Context, c *Client, name, hostName, state string) error {
 	disks, err := GetVMDisks(ctx, c, name)
 	if err != nil {
@@ -1906,7 +1913,28 @@ func RescheduleVMHost(ctx context.Context, c *Client, name, hostName, state stri
 			Params: []interface{}{hostName, now, name, d.DiskName},
 		})
 	}
-	return c.ExecuteBatch(ctx, stmts)
+	applied, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+		var startable bool
+		if err := tx.QueryRowContext(ctx,
+			`SELECT state <> 'stopped' FROM vms WHERE name = ? AND deleted_at IS NULL`, name,
+		).Scan(&startable); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return false, nil
+			}
+			return false, err
+		}
+		if !startable && state != "stopped" {
+			return false, ErrWorkloadStopped
+		}
+		return true, nil
+	}, stmts)
+	if err != nil {
+		return err
+	}
+	if !applied {
+		return ErrNoRowsAffected
+	}
+	return nil
 }
 
 // UpdateDiskSize updates the size_bytes for a disk.

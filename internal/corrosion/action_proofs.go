@@ -151,13 +151,24 @@ func WriteVMRescheduleProof(ctx context.Context, c *Client, p ActionProof, vmNam
 	// point its replica's VM row at it even when the proof row itself arrived by
 	// replication first. The insert is then a no-op and only the pending link
 	// is written.
+	//
+	// A row that is stopped NOW is refused with ErrWorkloadStopped, whatever the
+	// coordinator read when it chose this VM: the stop is the operator's intent,
+	// the row's state its only record, and this write would replace it with
+	// "pending" — a start on the destination. A stop that lands after selection
+	// therefore still wins.
 	applied, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
 		var currentOwnerEpoch int64
-		if err := tx.QueryRow(`SELECT vm_owner_epoch FROM vms WHERE name = ? AND deleted_at IS NULL`, vmName).Scan(&currentOwnerEpoch); err != nil {
+		var startable bool
+		if err := tx.QueryRow(`SELECT vm_owner_epoch, state <> 'stopped' FROM vms WHERE name = ? AND deleted_at IS NULL`, vmName).
+			Scan(&currentOwnerEpoch, &startable); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return false, nil
 			}
 			return false, err
+		}
+		if !startable {
+			return false, ErrWorkloadStopped
 		}
 		if p.OwnerEpoch != "" {
 			expectedOwnerEpoch, err := strconv.ParseInt(p.OwnerEpoch, 10, 64)
@@ -193,6 +204,13 @@ func WriteVMRescheduleProof(ctx context.Context, c *Client, p ActionProof, vmNam
 	}
 	return nil
 }
+
+// ErrWorkloadStopped means a failover write found the workload's row stopped
+// and wrote nothing. Failover never starts or moves a workload an operator
+// stopped (VMRecoverableOnHostFailure); the guarded writes re-check it inside
+// their transaction, so a stop that lands after the coordinator chose the
+// workload still wins.
+var ErrWorkloadStopped = errors.New("the workload is stopped; failover leaves a stopped workload where it is")
 
 // WriteActionProof inserts a standalone 'prepared' proof (for direct-RPC actions
 // that carry it in metadata rather than via a pending link). Idempotent by id.

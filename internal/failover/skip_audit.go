@@ -17,15 +17,19 @@ import "context"
 // The record is in memory, per coordinator: a restart or a new lease holder
 // audits each standing skip once more. Keyed by host as well as workload, so
 // a workload recovered elsewhere and stranded again there is audited afresh.
-func (c *Coordinator) auditSkip(ctx context.Context, host, target, detail, result string) {
+//
+// It reports whether it wrote the row, so a caller that also emits an event
+// for the skip emits it as rarely.
+func (c *Coordinator) auditSkip(ctx context.Context, host, target, detail, result string) bool {
 	key := host + "\x00" + target
 	state := detail + "\x00" + result
 	if c.skipAudited == nil {
 		c.skipAudited = map[string]string{}
 	}
 	if c.skipAudited[key] == state {
-		return
+		return false
 	}
 	c.skipAudited[key] = state
 	c.audit(ctx, "failover.skip", target, detail, result)
+	return true
 }

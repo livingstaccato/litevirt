@@ -408,6 +408,64 @@ func SetContainerStateDetail(ctx context.Context, c *Client, hostName, name, sta
 		state, detail, now, hostName, name)
 }
 
+// containerNotStoppedTx returns ErrWorkloadStopped when the live
+// (host, name) row is stopped by intent (ContainerStoppedForFailover), read
+// inside tx. A missing row is nil: the caller's own guard decides that case.
+func containerNotStoppedTx(ctx context.Context, tx *sql.Tx, host, name string) error {
+	var stopped bool
+	err := tx.QueryRowContext(ctx,
+		`SELECT state = 'stopped' AND COALESCE(state_detail, '') <> ? FROM containers
+		  WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
+		ContainerRelocateSkippedDetail, host, name).Scan(&stopped)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if stopped {
+		return ErrWorkloadStopped
+	}
+	return nil
+}
+
+// MarkContainerRelocateRestore stamps the relocate-restore marker
+// (RelocateRestoreDetail) on a container's source row before the failover
+// coordinator restores it onto target from a backup: the write
+// SetContainerStateDetail makes, refused with ErrWorkloadStopped when the row
+// is stopped by intent when the transaction runs, so a stop that lands after
+// the coordinator chose the container still wins. A row that is gone is
+// ErrNoRowsAffected.
+func MarkContainerRelocateRestore(ctx context.Context, c *Client, hostName, name, target, token string) error {
+	now := c.NowTS()
+	applied, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+		var n int
+		if err := tx.QueryRowContext(ctx,
+			`SELECT COUNT(1) FROM containers WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
+			hostName, name).Scan(&n); err != nil {
+			return false, err
+		}
+		if n == 0 {
+			return false, nil
+		}
+		if err := containerNotStoppedTx(ctx, tx, hostName, name); err != nil {
+			return false, err
+		}
+		return true, nil
+	}, []Statement{{
+		SQL: `UPDATE containers SET state = ?, state_detail = ?, updated_at = ?
+		 WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
+		Params: []interface{}{"relocating", RelocateRestoreDetail(target, token), now, hostName, name},
+	}})
+	if err != nil {
+		return err
+	}
+	if !applied {
+		return ErrNoRowsAffected
+	}
+	return nil
+}
+
 // SetContainerStateDetailStrict is SetContainerStateDetail that treats a zero-row
 // UPDATE (the row is missing or already soft-deleted) as ErrNoRowsAffected
 // instead of a silent success. The fail-closed container lifecycle uses it so a
@@ -947,8 +1005,16 @@ func RelocateContainerWithToken(ctx context.Context, c *Client, oldHost, name, n
 	// (replication, a concurrent create) would otherwise be overwritten by the
 	// target write's INSERT OR REPLACE. This is a local precondition like the
 	// guard itself; it adds no statement and changes no replicated shape.
+	//
+	// The source is re-read for a stop too: a container stopped since the
+	// coordinator chose it (ContainerStoppedForFailover) is refused with
+	// ErrWorkloadStopped, since the target row this writes is a recreate and a
+	// start. Also a local precondition, with no statement of its own.
 	targetTaken := false
 	applied, err := c.ExecuteEntriesGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+		if err := containerNotStoppedTx(ctx, tx, oldHost, name); err != nil {
+			return false, err
+		}
 		var live int
 		if err := tx.QueryRowContext(ctx,
 			`SELECT COUNT(1) FROM containers WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,

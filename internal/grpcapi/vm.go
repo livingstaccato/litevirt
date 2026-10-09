@@ -3249,6 +3249,11 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 		return nil, status.Errorf(st.Code(), "cannot rebuild %q: %s; nothing was changed", req.Name, st.Message())
 	}
 
+	// The VM's snapshot overlays, listed while the chain can still be read,
+	// as DeleteVM lists them: the debris sweep below matches .qcow2 names
+	// only, so a rebuilt VM's middle layers (<vm>-<disk>.<snapshot>) leaked.
+	layers := s.ownDiskLayers(ctx, req.Name)
+
 	// Stop and undefine the current domain.
 	if vm.State == "running" {
 		s.virt.DestroyDomain(req.Name)
@@ -3257,9 +3262,14 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 
 	// Delete existing disks — at their recorded locations (driver-dispatched,
 	// so a rebuilt VM doesn't leak its old non-default-pool backing volume),
-	// then glob the default dir. Must run before the tombstone below.
+	// then glob the default dir, then the snapshot overlays and the RAM images
+	// its memory snapshots' records name, with DeleteVM's guards (never
+	// another VM's file or an upload). Must run before the tombstone below,
+	// which takes the snapshot records with it.
 	s.deleteRecordedVMDiskVolumes(ctx, req.Name)
 	s.sweepVMDiskDebris(ctx, req.Name)
+	s.removeOwnDiskLayers(ctx, req.Name, layers)
+	s.removeVMSnapshotRAMImages(ctx, req.Name)
 	// Wipe the old firmware state — rebuild recreates with a FRESH identity, so the
 	// old name-keyed NVRAM + old-UUID swtpm tree would otherwise be orphaned (G1).
 	lv.WipeFirmwareState(s.dataDir, req.Name, spec.Uuid)

@@ -106,6 +106,31 @@ func TestContainerCheck_RelocateRecreate_ForeignContainerNotAdopted(t *testing.T
 	}
 }
 
+// The foreign directory is refused before anything is written for it: no NIC
+// row for the relocating row, and its (ct, node1, ct1) lease untouched. A
+// refusal placed after the adopt branch's NIC and lease writes would leave
+// the detail pending too, so the detail alone does not pin the order.
+func TestContainerCheck_RelocateRecreate_ForeignContainerNoNICOrLeaseWrite(t *testing.T) {
+	for _, o := range []lxc.ContainerOwner{{Project: "beta", OwnerID: "x"}, {Project: "acme", OwnerID: "other"}} {
+		db := testLogicDB(t)
+		rt := &ownerFakeRT{fakeCtRuntime: newFakeCtRuntime(), owners: map[string]lxc.ContainerOwner{"ct1": o}}
+		rt.states["ct1"] = lxc.StateStopped
+		relocatingRowWithNIC(t, db)
+		before := leaseSnapshot(t, db)
+		c := NewContainerChecker("node1", db, rt)
+		c.checkContainer(context.Background(), mustGetCt(t, db, "ct1"), time.Now())
+		if d := mustGetCt(t, db, "ct1").StateDetail; d != corrosion.ContainerRelocateRecreateDetail {
+			t.Fatalf("owner %+v: adopted someone else's container (detail %q)", o, d)
+		}
+		if n := nicRowCount(t, db); n != 0 {
+			t.Errorf("owner %+v: %d NIC rows written for a foreign directory", o, n)
+		}
+		if after := leaseSnapshot(t, db); after != before {
+			t.Errorf("owner %+v: leases changed for a foreign directory:\nbefore %s\nafter  %s", o, before, after)
+		}
+	}
+}
+
 // M1: a foreign directory whose state the runtime cannot report (lxc-info
 // errors, or reports error/starting/stopping) is not taken for "nothing
 // here": no Create over it, and so no failed-Create rollback releasing the

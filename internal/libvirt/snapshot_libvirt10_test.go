@@ -909,6 +909,11 @@ func TestCarryLitevirtMetadata(t *testing.T) {
 		{`<domain><name>vm</name><metadata><litevirt-owner-epoch:owner-epoch xmlns:litevirt-owner-epoch="https://litevirt.dev/xmlns/owner-epoch/1">3</litevirt-owner-epoch:owner-epoch></metadata></domain>`,
 			`<domain><name>vm</name><metadata><litevirt-owner-epoch:owner-epoch xmlns:litevirt-owner-epoch="https://litevirt.dev/xmlns/owner-epoch/1">3</litevirt-owner-epoch:owner-epoch><litevirt-managed:managed xmlns:litevirt-managed="https://litevirt.dev/xmlns/managed/1" incarnation="7"/></metadata></domain>`},
 		{from, from},
+		// Re-review R4-M2: an element the saved image already carries is
+		// replaced by the current one — the snapshot-time owner epoch (1)
+		// gives way to today's (3) — and other namespaces are left alone.
+		{`<domain><name>vm</name><metadata><other:x xmlns:other="urn:other"/><litevirt-owner-epoch:owner-epoch xmlns:litevirt-owner-epoch="https://litevirt.dev/xmlns/owner-epoch/1">1</litevirt-owner-epoch:owner-epoch></metadata></domain>`,
+			`<domain><name>vm</name><metadata><other:x xmlns:other="urn:other"/><litevirt-owner-epoch:owner-epoch xmlns:litevirt-owner-epoch="https://litevirt.dev/xmlns/owner-epoch/1">3</litevirt-owner-epoch:owner-epoch><litevirt-managed:managed xmlns:litevirt-managed="https://litevirt.dev/xmlns/managed/1" incarnation="7"/></metadata></domain>`},
 	} {
 		got, err := carryLitevirtMetadata(tc.in, from)
 		if err != nil || got != tc.want {
@@ -984,6 +989,26 @@ func TestRevert_ABadBaseFailsBeforeTeardown(t *testing.T) {
 					t.Fatal("the overlay or the domain's disk changed")
 				}
 			})
+		}
+	}
+}
+
+// The owner epoch moves on after a memory snapshot is taken (a failover
+// and back, a re-key); its restore must come back with today's epoch, not
+// the saved image's, or the reconciler would read a superseded runtime.
+func TestRevert_AMemoryRestoreCarriesTheCurrentOwnerEpoch(t *testing.T) {
+	m := newLibvirt10(t)
+	save := m.memorySnapshot("m1") // the image carries epoch 1
+	m.mu.Lock()
+	m.dom.metadata = strings.Replace(m.dom.metadata, ">1</litevirt-owner-epoch:owner-epoch>", ">4</litevirt-owner-epoch:owner-epoch>", 1)
+	m.mu.Unlock()
+	var during string
+	m.onRestore = func(x string) { during = x }
+	m.revertLive("m1", save)
+	after, _ := m.DomainGetXMLDesc(golibvirt.Domain{Name: "vm"}, 0)
+	for when, x := range map[string]string{"restored domain": during, "definition": after} {
+		if !strings.Contains(x, ">4</litevirt-owner-epoch:owner-epoch>") || strings.Contains(x, ">1</litevirt-owner-epoch:owner-epoch>") {
+			t.Errorf("the %s does not carry the current owner epoch 4:\n%s", when, x)
 		}
 	}
 }

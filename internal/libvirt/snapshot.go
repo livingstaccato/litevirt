@@ -1194,14 +1194,16 @@ var sourceFileAttr = regexp.MustCompile(`\sfile\s*=\s*(?:'([^']*)'|"([^"]*)")`)
 // keeps in a domain's <metadata>.
 const litevirtMetadataPrefix = "https://litevirt.dev/xmlns/"
 
-// carryLitevirtMetadata copies into domXML each of from's <metadata>
-// elements in a litevirt namespace that domXML has none of, spliced into
-// the text so every other byte is kept. domXML is returned unchanged when
-// it lacks nothing.
+// carryLitevirtMetadata makes domXML carry from's current <metadata>
+// elements in a litevirt namespace: each one domXML lacks is added, and each
+// one it carries with another value is replaced, spliced into the text so
+// every other byte is kept. domXML is returned unchanged when it already
+// matches.
 func carryLitevirtMetadata(domXML, from string) (string, error) {
 	type elem struct {
-		uri  string
-		text string
+		uri        string
+		text       string
+		start, end int64
 	}
 	scan := func(x string) (els []elem, mdEnd, afterName int64, err error) {
 		dec := xml.NewDecoder(strings.NewReader(x))
@@ -1227,7 +1229,7 @@ func carryLitevirtMetadata(domXML, from string) (string, error) {
 				}
 			case xml.EndElement:
 				if elStart >= 0 && depth == elDepth {
-					els = append(els, elem{elURI, x[elStart:end]})
+					els = append(els, elem{elURI, x[elStart:end], elStart, end})
 					elStart = -1
 				}
 				if inMD && depth == 2 {
@@ -1248,27 +1250,58 @@ func carryLitevirtMetadata(domXML, from string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	got := map[string]bool{}
-	for _, e := range have {
-		got[e.uri] = true
-	}
-	var add strings.Builder
+	// The current value of each litevirt element wins: one the saved image
+	// lacks is added, and one it carries from snapshot time — an owner
+	// epoch that has since moved on — is replaced (re-review R4-M2).
+	current := map[string]string{}
+	var order []string
 	for _, e := range want {
-		if !got[e.uri] {
-			add.WriteString(e.text)
-			got[e.uri] = true
+		if _, ok := current[e.uri]; !ok {
+			current[e.uri] = e.text
+			order = append(order, e.uri)
 		}
 	}
-	if add.Len() == 0 {
+	type edit struct {
+		start, end int64
+		text       string
+	}
+	var edits []edit
+	seen := map[string]bool{}
+	for _, e := range have {
+		if cur, ok := current[e.uri]; ok {
+			if !seen[e.uri] && cur != e.text {
+				edits = append(edits, edit{e.start, e.end, cur})
+			} else if seen[e.uri] {
+				edits = append(edits, edit{e.start, e.end, ""}) // a duplicate goes
+			}
+			seen[e.uri] = true
+		}
+	}
+	var add strings.Builder
+	for _, uri := range order {
+		if !seen[uri] {
+			add.WriteString(current[uri])
+		}
+	}
+	if add.Len() > 0 {
+		switch {
+		case mdEnd >= 0:
+			edits = append(edits, edit{mdEnd, mdEnd, add.String()})
+		case afterName >= 0:
+			edits = append(edits, edit{afterName, afterName, "<metadata>" + add.String() + "</metadata>"})
+		default:
+			return "", fmt.Errorf("the definition has no <name> to put <metadata> after")
+		}
+	}
+	if len(edits) == 0 {
 		return domXML, nil
 	}
-	if mdEnd >= 0 {
-		return domXML[:mdEnd] + add.String() + domXML[mdEnd:], nil
+	sort.Slice(edits, func(i, j int) bool { return edits[i].start > edits[j].start })
+	out := domXML
+	for _, e := range edits {
+		out = out[:e.start] + e.text + out[e.end:]
 	}
-	if afterName < 0 {
-		return "", fmt.Errorf("the definition has no <name> to put <metadata> after")
-	}
-	return domXML[:afterName] + "<metadata>" + add.String() + "</metadata>" + domXML[afterName:], nil
+	return out, nil
 }
 
 // resetOverlay recreates overlay as a fresh, empty qcow2 backed by base,

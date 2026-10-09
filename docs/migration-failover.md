@@ -423,8 +423,8 @@ When a host goes offline, the failover coordinator:
 2. **Acquires leader lease** — suppresses concurrent coordinators (45s TTL lease; a fence needs 30s of it still to run before it may begin). Best-effort, not exclusive: a CRDT lease can be held on both sides of a partition, so the decide site also requires a locally-probed quorum (`DecisionGate`) and the minority side fails closed there. See [Operating model](operating-model.md) → "Leader-gated recovery". A node taking over the lease first confirms with a quorum of peers that none of them has already recorded the term it is about to claim, so a node that has just restarted or reconnected waits until replication catches it up (one health-probe cycle after a start, then until any newer term row arrives) instead of claiming from its stale view. See [Operating model](operating-model.md) → "A node that was away does not claim a term from a stale ledger".
 3. **Fences the failed host** — prevents split-brain by ensuring the failed host cannot access shared resources
 4. **Claims the recovery** — with `enforcement.recovery_claim` on every host (the default; see *Recovery claims* below), a majority of the voter set certifies one destination per workload before any proof is minted, so two coordinators that both believe they lead cannot both recover it
-5. **Reschedules VMs** — based on each VM's `on-host-failure` policy. Only
-   a VM that was not stopped is rescheduled; see *Stopped workloads* below
+5. **Reschedules VMs** — based on each VM's `on-host-failure` policy. A VM
+   stopped on purpose is never started; see *Stopped workloads* below
 
 ### Fencing methods
 
@@ -873,8 +873,8 @@ Set in compose `migrate` section:
 | `restart-same` | Wait for original host to recover |
 | `none` | Do not reschedule |
 
-A policy applies to every VM on the failed host except a stopped one. A
-**stopped** VM stays stopped: see *Stopped workloads* below.
+A policy applies to every VM on the failed host except a stopped one, which
+is never started by failover: see *Stopped workloads* below.
 
 A VM with a local disk that is restarted on another host does not get its disk
 back, because the disk stayed on the failed host. The new host rebuilds the disk
@@ -904,101 +904,57 @@ is `vm_disk_missing` in [diagnostics](diagnostics.md).
 
 ### Stopped workloads
 
-Failover recovers what was running. A **stopped** VM stays stopped, as it
-does in a drain: it is not rescheduled, promoted from a replica or restarted
-anywhere, whatever its `on-host-failure` policy or auto-promote enrolment
-says. It stays recorded on the failed host with its disks, and when that host
-comes back it is exactly as it was left: start it there with `lv start`. A
-stopped container stays the same way and is not relocated.
+Failover recovers what was running. A VM **stopped on purpose** is never
+started by failover, as in a drain: it is not rescheduled, promoted from a
+replica or restarted anywhere, whatever its `on-host-failure` policy or
+auto-promote enrolment says.
 
-Restarting a stopped VM would only start something nobody asked to run, and
-for a VM with a local disk it would cost the data. The restart rebuilds the
-disk blank from the image on the new host. The real disk stays on the failed
-host, where nothing records it any more. A later failover back onto that host
-renames it to `.superseded-<time>`, and it is deleted after
-`superseded_disk_retention_days`.
+A stop is on purpose unless the VM's record says otherwise. `lv stop`
+records `operator-stop`, and a drain records its own stop. A stop that nobody
+asked for is recorded by the host that saw it: `guest-shutdown` (a clean
+poweroff from inside the guest, which is also what a host shutting down
+produces), `out-of-band-destroy`, or `stopped out-of-band`. A stopped VM with
+any other record, or none, counts as stopped on purpose.
 
-The rule is enforced twice. The coordinator skips a stopped workload before it
-does anything else for it, before auto-promote. Its write then re-reads the
-workload's state in the same transaction and refuses a stopped one, so a stop
-that lands while the coordinator is deciding still wins. Each skip writes a
-`failover.skip` audit entry and a `vm.failover.skipped` (or
-`ct.failover.skipped`) event naming the workload and why. A VM's event is
-also kept in the VM's event history. The skip is counted
-in the failover metrics with error class `stopped`. A stopped workload is not
-counted as stranded, because failover would not move it.
+What failover does with a stopped VM on a failed host:
+
+| The VM | Its disks | Failover |
+|---|---|---|
+| stopped on purpose | all on shared storage | moves it to a healthy host, still stopped; that host defines its domain, shut off, and `lv start` starts it there |
+| stopped on purpose | any host-local disk | leaves it on the failed host with its disks |
+| stopped without anyone asking | all on shared storage | recovers it like a running VM, on its real disks |
+| stopped without anyone asking | any host-local disk | leaves it on the failed host with its disks |
+
+A VM left on the failed host is exactly as it was when the host comes back:
+start it there with `lv start`. A stopped container is always left in place
+and is not relocated.
+
+Restarting a VM that has a host-local disk somewhere else costs the data. The
+new host rebuilds the disk blank from the image. The real disk stays on the
+failed host, where nothing records it any more. A later failover back onto
+that host renames it to `.superseded-<time>`, and it is deleted after
+`superseded_disk_retention_days`. A running VM's failure policy accepts that
+cost; a stopped VM's never does.
+
+The rule is enforced twice. The coordinator decides a stopped VM before
+anything else, before auto-promote. Its write then re-reads the VM's state in
+the same transaction and refuses a VM stopped on purpose, so a stop that lands
+while the coordinator is deciding still wins. Each VM left in place gets a
+`failover.skip` audit entry and a `vm.failover.skipped` event (a container,
+`ct.failover.skipped`) naming it and why. A VM moved still stopped gets a
+`failover.rekey-stopped` audit entry and a `vm.failover.rekeyed` event. A
+VM's event is also kept in its event history. Both count in the failover
+metrics with error class `stopped`. A VM left in place is not counted as
+stranded, because failover would not move it.
 
 `lv host rm --dead` on a host that still holds a stopped workload lists it in
-the plan, with the choices for its data. Removing the host does not move it.
-To keep the data, bring the host back instead of removing it, or promote a
+the plan, with the choices for its data. Removing the host does not move it,
+and the removal is not refused. A stopped workload does not block the name
+either: if the machine is added again under its name (`lv host add`), the
+workload comes back with it. Another way to keep the data is to promote a
 replica onto a live host (`lv replication promote <vm>`). If the data is lost
 for good, remove the workload (`lv rm <vm>`, `lv ct rm <name> --host <host>`)
-and create it again. The removal itself is not refused.
-
-## Load-balancer VIP split-brain safety
-
-Load-balancer VIPs (keepalived/VRRP) are protected against split-brain by the same core
-rule as VM/container ownership: **no quorum or proof ⇒ no new ownership action. A safe gap
-(a VIP briefly down) is acceptable; two hosts answering the same VIP is the bug.**
-
-This hardening is **capability-gated and rolled out per-cluster** — it activates only once
-every participating host advertises support, so a mixed-version cluster keeps its previous
-behavior until the whole fleet can enforce it. **No hardware watchdog is required** for any
-of it; a watchdog, where present, is only an optional self-fence backstop.
-
-### Minority self-demotes
-
-An isolated load-balancer host that loses quorum stands its **own** VIPs down — stops
-keepalived and removes the address — so it can't keep answering on the wrong side of a
-partition. A brief blip never triggers this (there's a sustained-loss threshold,
-`quorum_loss_demote_after_sec`); a freshly-restarted host still in warm-up never drops a
-healthy VIP. If the stand-down can't be confirmed (e.g. a wedged keepalived) and the host
-has a verified hardware watchdog, it self-fences; otherwise it keeps retrying and raises a
-persistent `HA degraded` status rather than ever pretending to be down.
-
-### Majority reclaims only with proof
-
-The surviving majority (re)claims a VIP only on **proof the old holder has released it** —
-either the old holder is reachable (directly, or relayed through a peer that can reach it)
-and reports the VIP absent, or an operator has attested it is down (below). If the old
-holder is **unreachable and unproven**, the majority leaves the VIP **down and raises an
-alert** — an outage, never a blind takeover. This is the `safe` policy, and it is the only
-supported one:
-
-```yaml
-# daemon config — the default; the only accepted value
-no_quorum_vip_policy: safe
-```
-
-There is intentionally **no** weaker "take over after a timeout without proof" tier — it
-would reintroduce the dual-master risk this feature exists to prevent. The supported way to
-recover a stuck VIP is the manual fence-confirm below, not a weaker policy.
-
-### Recovering a VIP from a dead, unreachable holder
-
-If a VIP's holder has failed and can't be reached — and you need the VIP back — verify the
-host is genuinely powered off out-of-band (IPMI / PDU / console), then attest it:
-
-```bash
-lv host fence-confirm <host>
-```
-
-This is the same operator attestation that releases a manually-fenced host's VMs, and it
-also releases that host's VIPs: a host you have confirmed down has, by definition, let go of
-its VIP, so the majority reclaims it. The attestation is trusted only briefly (re-run it if
-recovery drags on), and **only an explicit `fence-confirm` counts** — an automatic fence
-*attempt* that may have partially failed does not. This is the answer to "I need my VIP
-back now": a fast, safe, operator-driven override — no weaker cluster-wide policy needed.
-
-### Coverage boundaries
-
-- A **data-plane-only** partition — gRPC/gossip quorum intact on both sides but the VRRP L2
-  segment split — is not auto-resolved (neither side loses quorum, so neither self-demotes).
-  Watch for a VIP-conflict alert and resolve the L2 fault.
-- Reclaiming an unreachable holder's VIP **automatically** (without the manual attestation
-  above) requires proof-grade fencing (IPMI power-off / SBD), a separate optional rollout.
-  Until then the unreachable case is a deliberate availability trade-off: VIP down + alert,
-  recovered by the fence-confirm step above.
+and create it again.
 
 ## Containers
 

@@ -147,9 +147,11 @@ coordinator's own, moved to `corrosion` so that both sides read one definition:
 
 - **VM.** `vmNeedsFailover`: `on_host_failure` is set and not `none`, or the VM
   is enrolled in auto-promote replication, and it has no host-local firmware
-  state, and its row is not `stopped`. A stopped VM stays stopped and is not
-  restarted: the majority never recovers it
+  state, and its row is not stopped on purpose. A VM stopped on purpose stays
+  stopped and is not restarted: the majority never starts it
   ([migration-failover.md](../migration-failover.md#stopped-workloads)).
+  Pausing concerns running domains only, so a stopped row is never paused
+  either way.
 - **Container.** `containerNeedsFailover`, which leaves out a stopped container
   the same way.
 

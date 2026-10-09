@@ -158,6 +158,15 @@ workload recorded on a removed host without contacting it: they delete its
 cluster rows and audit the delete as one on a removed host. Nothing on the
 removed machine is touched, and disks on shared storage are kept.
 
+Stopped workloads are the exception: they do not block the name. Failover
+never starts a stopped VM or container, and never rebuilds a stopped VM's
+host-local disk elsewhere, so a stopped one can still be recorded on the
+removed host with its data on that machine. `lv host add` admits the name
+anyway, and the stopped workloads come back with the machine, still stopped
+(see [Stopped workloads](migration-failover.md#stopped-workloads)). On a
+different machine whose disks do not hold them, `lv start` refuses with
+`vm_disk_missing` rather than starting a blank disk.
+
 A workload that no live host can take waits until one can. The usual case is a
 container whose host was the only one with a container runtime: it is left on
 the removed host, marked `relocate-skipped`, and the name stays refused. Bring

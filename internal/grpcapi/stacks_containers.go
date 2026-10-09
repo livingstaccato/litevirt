@@ -162,6 +162,9 @@ func securityInherited(ctx context.Context) bool {
 	return v
 }
 
+// recreateMemberRead reads a recreate's member; a test seam.
+var recreateMemberRead = corrosion.GetContainer
+
 // judgeContainerRecreate judges a compose recreate of a container member
 // BEFORE its delete half runs, so a refused recreate leaves the member as it
 // is, and returns the decision the create of THIS recreate applies
@@ -186,10 +189,11 @@ func securityInherited(ctx context.Context) bool {
 // request the create will send, so none of them refuses after the delete.
 // A member recreated from the rootfs path it already uses keeps it as on
 // main, where any deployer could name one: the unchanged source is granted
-// to that create (the reading host still refuses a protected place).
-// recreateMemberRead reads a recreate's member; a test seam.
-var recreateMemberRead = corrosion.GetContainer
-
+// to that create (the reading host still refuses a protected place). That
+// grant is the path's authority only, never an OCI library item's ownership:
+// when the member is on this host, the image-owner check the create will run
+// runs here too, so an item another project owns on this host refuses the
+// recreate before the delete. A remote target applies it at the create.
 func (s *Server) judgeContainerRecreate(ctx context.Context, a planner.VMAction, f *compose.File) (*recreateDecision, error) {
 	var d *compose.VMDef
 	if f != nil {
@@ -277,6 +281,21 @@ func (s *Server) judgeContainerRecreate(ctx context.Context, a planner.VMAction,
 	if a.TargetHost == "" || a.TargetHost == s.hostName {
 		if err := s.checkContainerTemplate(req.Template, req.Name); err != nil {
 			return nil, status.Errorf(status.Code(err), "recreating container %q: %s; the member was left as it is", a.VMName, status.Convert(err).Message())
+		}
+		// The create's image-owner check, through the same function on the
+		// same arguments: an ownerless item, or the create's own project's,
+		// passes as on main. Another project's item (an Admin's claim of it,
+		// or that project's own pull on the host the member now lives on) is
+		// refused here, not after the delete. No grant skips it: library
+		// items and owner records are per host, so the template string the
+		// member recorded does not make the item under it the member's.
+		if p, isPath, _ := lxc.TemplatePath(req.Template); isPath {
+			if err := s.refuseForeignOCIItem(createCtx, ociLibraryName(p, s.dataDir), req.Project, "be created from"); err != nil {
+				s.audit(ctx, "ct.create", req.Name, "template="+req.Template, "denied")
+				return nil, status.Errorf(status.Code(err),
+					"recreating container %q: %s; the item belongs to that project (an Admin claimed it for the project, or the project pulled it on %s), so a redeploy by a caller outside it needs the Admin role; the member was left as it is",
+					a.VMName, status.Convert(err).Message(), s.hostName)
+			}
 		}
 	}
 	return dec, nil

@@ -167,9 +167,10 @@ func (s *Server) refuseForeignOCIItem(ctx context.Context, name, project, verb s
 // that exists with no owner record. Such an item was pulled before owners
 // were recorded, or without --project, and is everyone's: containers of any
 // project may run from it, and claiming it for one project would refuse
-// every other project's container at its next create from it (a compose
-// recreate, after its delete). The first claim of an existing ownerless item
-// is the Admin's; a pull without --project, or into a new name, is not.
+// every other project a new container from it, and a compose redeploy of a
+// member already built from it (refused before its delete when the deploy
+// enters on the member's host). The first claim of an existing ownerless
+// item is the Admin's; a pull without --project, or into a new name, is not.
 func (s *Server) refuseClaimingOwnerlessItem(ctx context.Context, name, dest, project string) error {
 	if name == "" || project == "" || s.dataDir == "" || !s.ownerStrict(ctx) {
 		return nil

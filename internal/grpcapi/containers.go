@@ -153,11 +153,10 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		s.audit(ctx, "ct.create", req.Name, "template="+req.Template, "denied")
 		return nil, err
 	}
-	// A library item another project pulled is that project's image —
-	// except the one a compose recreate's member already runs from (its own
-	// recorded template, granted by judgeContainerRecreate): the member keeps
-	// running from it, as on main, whoever claimed the item since.
-	if p, isPath, _ := lxc.TemplatePath(req.Template); isPath && !recreateTemplateGranted(ctx, req.Template) {
+	// A library item another project pulled is that project's image, for
+	// every create (a compose recreate's judgment runs this same check before
+	// its delete when the member is on this host).
+	if p, isPath, _ := lxc.TemplatePath(req.Template); isPath {
 		if err := s.refuseForeignOCIItem(ctx, ociLibraryName(p, s.dataDir), req.Project, "be created from"); err != nil {
 			s.audit(ctx, "ct.create", req.Name, "template="+req.Template, "denied")
 			return nil, err
@@ -870,15 +869,7 @@ func (s *Server) forwardCreateContainer(ctx context.Context, req *pb.CreateConta
 		fwd = proto.Clone(req).(*pb.CreateContainerRequest)
 		fwd.IdempotencyKey = ""
 	}
-	// The owner rule is the target's to apply for a non-admin, except to the
-	// template a compose recreate's member already runs from: the grant does
-	// not cross the wire, so the rule is not asked for (the entry node judged
-	// the member's own recorded template).
-	octx := s.ownerStrictOutgoing(ctx)
-	if recreateTemplateGranted(ctx, req.Template) {
-		octx = ctx
-	}
-	return c.CreateContainer(octx, fwd)
+	return c.CreateContainer(s.ownerStrictOutgoing(ctx), fwd)
 }
 
 // forwardSimpleCT is the empty-result version: returns (resp, err)

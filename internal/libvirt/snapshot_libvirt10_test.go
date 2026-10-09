@@ -775,3 +775,87 @@ func TestRevert_AMemorySnapshotOnAStoppedVM(t *testing.T) {
 		})
 	}
 }
+
+// The lab's round-3 loss (snapshot-lab.md): s1, s2, restore s1 twice, then
+// restore s2 twice. libvirt rewrites s2's recorded base to s1's when the
+// revert drops s1's metadata, so a base taken from s2's snapshot XML put
+// s2's restore on root.qcow2 and B was gone. Every restore of s2 must read
+// A and B, for disk and memory snapshots, running and stopped.
+func TestRevert_TheLaterSnapshotAfterTheOlderOneTwice(t *testing.T) {
+	for _, kind := range []string{"disk", "memory"} {
+		for _, stopped := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/stopped=%v", kind, stopped), func(t *testing.T) {
+				m := newLibvirt10(t)
+				saves := map[string]string{}
+				take := func(n string) {
+					if kind == "memory" {
+						saves[n] = m.memorySnapshot(n)
+					} else {
+						m.snapshot(n)
+					}
+				}
+				restore := func(n string) {
+					if stopped && m.state() != golibvirt.DomainShutoff {
+						if err := m.DomainDestroy(golibvirt.Domain{Name: "vm"}); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if kind == "memory" {
+						m.revertLive(n, saves[n])
+					} else {
+						m.revert(n)
+					}
+				}
+				check := func(when string, a, b bool) {
+					t.Helper()
+					if got := m.has(markA, 1); got != a {
+						t.Errorf("%s: A present=%v, want %v (qemu opens %s)", when, got, a, m.qemuSpec("vda"))
+					}
+					if got := m.has(markB, 2); got != b {
+						t.Errorf("%s: B present=%v, want %v (qemu opens %s)", when, got, b, m.qemuSpec("vda"))
+					}
+				}
+				m.write(markA, 1)
+				take("s1")
+				m.write(markB, 2)
+				take("s2")
+				s1 := filepath.Join(m.dir, "vm-root.s1")
+				restore("s1")
+				check("restore s1", true, false)
+				restore("s1")
+				check("restore s1 again", true, false)
+				restore("s2")
+				check("restore s2", true, true)
+				if c, _ := m.dom.effective("vda"); len(c) < 2 || c[1] != s1 {
+					t.Errorf("restoring s2 runs on %v, want a new overlay directly on %s", c, s1)
+				}
+				restore("s2")
+				check("restore s2 again", true, true)
+				m.rm("s1")
+				m.rm("s2")
+				m.requireWhole(map[byte]bool{markA: true, markB: true})
+			})
+		}
+	}
+}
+
+// After a revert of s1 drops and redefines its metadata, libvirt has
+// rewritten s2's recorded base to s1's; SnapshotDiskFiles still names the
+// file s2's overlay backs on (root.s1), which a clone may use.
+func TestSnapshotDiskFiles_NamesTheOverlaysRealBase(t *testing.T) {
+	m := newLibvirt10(t)
+	m.snapshot("s1")
+	s1 := m.active()
+	m.snapshot("s2")
+	m.revert("s1")
+	files, err := snapshotDiskFiles(m, "vm", "s2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range files {
+		if f == s1 {
+			return
+		}
+	}
+	t.Fatalf("SnapshotDiskFiles(s2) = %v, want it to name %s, the file s2's overlay backs on", files, s1)
+}

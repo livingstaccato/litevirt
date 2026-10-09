@@ -164,7 +164,10 @@ func revertToSnapshot(v snapshotAPI, domainName, snapshotName string, restorePre
 	// Each changed disk: an empty overlay over its base (frozen) — the live
 	// layer reset in place, or a new one when the snapshot is not the
 	// newest (planRevert).
-	resets := planRevert(snapXML, currentDisks, snapshotName)
+	resets, err := planRevert(snapXML, currentDisks, snapshotName)
+	if err != nil {
+		return fmt.Errorf("plan the revert: %w", err)
+	}
 
 	// Inactive XML still references the overlay paths — redefine with it
 	// unchanged after the overlays are reset (no path swap), except a disk
@@ -624,7 +627,10 @@ func revertToLiveSnapshot(v snapshotAPI, domainName, snapshotName, vmstatePath s
 	// Each changed disk: an empty overlay over its base (frozen at snapshot)
 	// — the live layer reset in place, or a new one when the snapshot is not
 	// the newest (planRevert).
-	resets := planRevert(snapXML, currentDisks, snapshotName)
+	resets, err := planRevert(snapXML, currentDisks, snapshotName)
+	if err != nil {
+		return fmt.Errorf("plan the revert: %w", err)
+	}
 
 	// The saved image's domain XML references the overlay paths — keep it as-is
 	// for the persistent redefine after restore.
@@ -829,22 +835,55 @@ type revertStep struct {
 // opens as written: the guest kept every write since the older snapshot
 // (snapshot-lab.md, Round 1 row 5), and a memory revert came back on the
 // snapshot's own overlay, holding later writes, under its RAM.
-func planRevert(snapXML string, live map[string]string, snapshotName string) []revertStep {
+func planRevert(snapXML string, live map[string]string, snapshotName string) ([]revertStep, error) {
 	overlays := parseSnapshotOverlays(snapXML)
 	var out []revertStep
 	for dev, base := range parseSnapshotDomainDisks(snapXML) {
+		ov := overlays[dev]
+		if ov != "" {
+			// The base is what the snapshot's own overlay was created on,
+			// read from that overlay's header, never from the snapshot's
+			// XML: libvirt rewrites a descendant's recorded base to its
+			// parent's base whenever the parent's metadata is dropped — as
+			// every revert of the parent does — so after restoring s1, s2's
+			// XML named s1's base and s2's restore lost s2's data
+			// (snapshot-lab.md, Round 3 row 2b).
+			b, err := overlayBacking(ov)
+			if err != nil {
+				return nil, fmt.Errorf("disk %s: snapshot %q's overlay %s: %w", dev, snapshotName, ov, err)
+			}
+			base = b
+		}
 		l, ok := live[dev]
 		if !ok || l == base {
 			continue
 		}
 		step := revertStep{dev: dev, base: base, live: l, target: l}
-		if ov := overlays[dev]; ov != "" && l != ov && !isRevertOverlay(l, ov, snapshotName, base) {
+		if ov != "" && l != ov && !isRevertOverlay(l, ov, snapshotName, base) {
 			step.target = newRevertOverlayPath(ov, snapshotName)
 		}
 		out = append(out, step)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].dev < out[j].dev })
-	return out
+	return out, nil
+}
+
+// overlayBacking is the file a snapshot overlay was created on, from its own
+// qcow2 header (written by libvirt when the snapshot was taken; the guest
+// writes data into it, not its header).
+func overlayBacking(ov string) (string, error) {
+	info, err := qcow2.Info(ov)
+	if err != nil {
+		return "", err
+	}
+	if info.BackingFile == "" {
+		return "", fmt.Errorf("it names no backing file")
+	}
+	b := info.BackingFile
+	if !filepath.IsAbs(b) {
+		b = filepath.Join(filepath.Dir(ov), b)
+	}
+	return filepath.Clean(b), nil
 }
 
 // revertOverlayPrefix is the name a revert's new overlays of the snapshot's
@@ -1129,6 +1168,12 @@ func snapshotDiskFiles(v snapshotAPI, domainName, snapshotName string) ([]string
 	for dev, overlay := range parseSnapshotOverlays(snapXML) {
 		add(overlay)
 		add(bases[dev])
+		// And the file the overlay's own header backs on: libvirt rewrites
+		// a snapshot's recorded base when its parent's metadata is dropped,
+		// so the XML's base can be a layer further down (planRevert).
+		if b, err := overlayBacking(overlay); err == nil {
+			add(b)
+		}
 	}
 	sort.Strings(out)
 	return out, nil

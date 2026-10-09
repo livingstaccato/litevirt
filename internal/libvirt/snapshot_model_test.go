@@ -557,6 +557,23 @@ func (m *libvirt10) children(name string) []*modelSnap {
 }
 
 func (m *libvirt10) drop(s *modelSnap) {
+	// libvirt 10.0 rewrites every descendant's <domain> disk that is the
+	// dropped snapshot's overlay to the dropped snapshot's own base
+	// (qemuSnapshotDiscardMetadata -> qemuSnapshotDeleteUpdateDisks), on a
+	// METADATA_ONLY delete too: after one, a child's recorded base is no
+	// longer the file its overlay backs on.
+	var desc func(name string)
+	desc = func(name string) {
+		for _, c := range m.children(name) {
+			for dev, b := range c.bases {
+				if ov := s.overlays[dev]; ov != "" && b == ov {
+					c.bases[dev] = s.bases[dev]
+				}
+			}
+			desc(c.name)
+		}
+	}
+	desc(s.name)
 	for _, c := range m.children(s.name) {
 		c.parent = s.parent
 	}

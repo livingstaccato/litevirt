@@ -45,10 +45,55 @@ func (r *LxcRunner) StampOwner(name string, o ContainerOwner) error {
 		return fmt.Errorf("stamp container %q owner: no container directory at %s", name, dir)
 	}
 	b, _ := json.Marshal(o)
-	if err := os.WriteFile(filepath.Join(dir, ownerStampFile), b, 0o600); err != nil {
+	if err := writeOwnerRecord(dir, b); err != nil {
 		return fmt.Errorf("stamp container %q owner: %w", name, err)
 	}
 	return nil
+}
+
+// writeOwnerBytes writes the record's bytes to the temp file. A variable so a
+// test can fail the write part-way.
+var writeOwnerBytes = func(f *os.File, b []byte) error {
+	_, err := f.Write(b)
+	return err
+}
+
+// writeOwnerRecord replaces dir's owner record atomically: a temp file in the
+// same directory, written and synced, renamed over the record, then the
+// directory synced. ReadOwner treats a record it cannot parse as foreign, so a
+// record torn by a crash mid-write would refuse the container's OWN directory
+// on every later sweep; at the record's name there is only ever the old
+// record, the new one, or none.
+func writeOwnerRecord(dir string, b []byte) error {
+	tmp, err := os.CreateTemp(dir, ownerStampFile+".tmp-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name()) // nothing left behind on failure; a no-op after the rename
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := writeOwnerBytes(tmp, b); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp.Name(), filepath.Join(dir, ownerStampFile)); err != nil {
+		return err
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 // ReadOwner implements OwnerStamper.

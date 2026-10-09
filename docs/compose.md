@@ -830,7 +830,7 @@ During a rolling update, creates (scale-up) execute first, then updates are proc
       max-downtime: "100ms"
       auto-converge: true
       with-storage: false           # Copy local disks during live migration
-      on-host-failure: "restart-any"  # restart-any | restart-same | none
+      on-host-failure: "restart-any"  # restart-any | restart-same | none (a stopped VM is never restarted)
       fence-strategy: "best-effort" # best-effort | ipmi | manual | watchdog
       priority: 0                   # Higher priority VMs are migrated/rescued first
       bandwidth-mib-sec: 0          # Migration bandwidth limit (0 = unlimited)

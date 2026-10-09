@@ -147,8 +147,11 @@ coordinator's own, moved to `corrosion` so that both sides read one definition:
 
 - **VM.** `vmNeedsFailover`: `on_host_failure` is set and not `none`, or the VM
   is enrolled in auto-promote replication, and it has no host-local firmware
-  state.
-- **Container.** `containerNeedsFailover`.
+  state, and its row is not `stopped`. A stopped VM stays stopped and is not
+  restarted: the majority never recovers it
+  ([migration-failover.md](../migration-failover.md#stopped-workloads)).
+- **Container.** `containerNeedsFailover`, which leaves out a stopped container
+  the same way.
 
 A workload with policy `none` keeps running. Nothing would replace it, so
 pausing it would only cost availability.

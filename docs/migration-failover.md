@@ -423,7 +423,8 @@ When a host goes offline, the failover coordinator:
 2. **Acquires leader lease** — suppresses concurrent coordinators (45s TTL lease; a fence needs 30s of it still to run before it may begin). Best-effort, not exclusive: a CRDT lease can be held on both sides of a partition, so the decide site also requires a locally-probed quorum (`DecisionGate`) and the minority side fails closed there. See [Operating model](operating-model.md) → "Leader-gated recovery". A node taking over the lease first confirms with a quorum of peers that none of them has already recorded the term it is about to claim, so a node that has just restarted or reconnected waits until replication catches it up (one health-probe cycle after a start, then until any newer term row arrives) instead of claiming from its stale view. See [Operating model](operating-model.md) → "A node that was away does not claim a term from a stale ledger".
 3. **Fences the failed host** — prevents split-brain by ensuring the failed host cannot access shared resources
 4. **Claims the recovery** — with `enforcement.recovery_claim` on every host (the default; see *Recovery claims* below), a majority of the voter set certifies one destination per workload before any proof is minted, so two coordinators that both believe they lead cannot both recover it
-5. **Reschedules VMs** — based on each VM's `on-host-failure` policy
+5. **Reschedules VMs** — based on each VM's `on-host-failure` policy. Only
+   a VM that was not stopped is rescheduled; see *Stopped workloads* below
 
 ### Fencing methods
 
@@ -872,6 +873,9 @@ Set in compose `migrate` section:
 | `restart-same` | Wait for original host to recover |
 | `none` | Do not reschedule |
 
+A policy applies to every VM on the failed host except a stopped one. A
+**stopped** VM stays stopped: see *Stopped workloads* below.
+
 A VM with a local disk that is restarted on another host does not get its disk
 back, because the disk stayed on the failed host. The new host rebuilds the disk
 from the VM's image at the disk's recorded size. The new host might still have
@@ -897,6 +901,39 @@ records and in the data directory's `disks/` folder.
 
 The restart of a VM on its own host never rebuilds a missing disk. That case
 is `vm_disk_missing` in [diagnostics](diagnostics.md).
+
+### Stopped workloads
+
+Failover recovers what was running. A **stopped** VM stays stopped, as it
+does in a drain: it is not rescheduled, promoted from a replica or restarted
+anywhere, whatever its `on-host-failure` policy or auto-promote enrolment
+says. It stays recorded on the failed host with its disks, and when that host
+comes back it is exactly as it was left: start it there with `lv start`. A
+stopped container stays the same way and is not relocated.
+
+Restarting a stopped VM would only start something nobody asked to run, and
+for a VM with a local disk it would cost the data. The restart rebuilds the
+disk blank from the image on the new host. The real disk stays on the failed
+host, where nothing records it any more. A later failover back onto that host
+renames it to `.superseded-<time>`, and it is deleted after
+`superseded_disk_retention_days`.
+
+The rule is enforced twice. The coordinator skips a stopped workload before it
+does anything else for it, before auto-promote. Its write then re-reads the
+workload's state in the same transaction and refuses a stopped one, so a stop
+that lands while the coordinator is deciding still wins. Each skip writes a
+`failover.skip` audit entry and a `vm.failover.skipped` (or
+`ct.failover.skipped`) event naming the workload and why. A VM's event is
+also kept in the VM's event history. The skip is counted
+in the failover metrics with error class `stopped`. A stopped workload is not
+counted as stranded, because failover would not move it.
+
+`lv host rm --dead` on a host that still holds a stopped workload lists it in
+the plan, with the choices for its data. Removing the host does not move it.
+To keep the data, bring the host back instead of removing it, or promote a
+replica onto a live host (`lv replication promote <vm>`). If the data is lost
+for good, remove the workload (`lv rm <vm>`, `lv ct rm <name> --host <host>`)
+and create it again. The removal itself is not refused.
 
 ## Load-balancer VIP split-brain safety
 
@@ -982,7 +1019,8 @@ reachable repo holds a valid manifest and the survivor is schema-compatible),
 falling back to **recreate from image** (`ct.relocate.recreate` — managed NICs
 reconstructed from the persisted create spec), and finally **skip** a container
 that's neither restorable nor re-pullable (`ct.relocate.skipped`, left visible for
-operator recovery). The restore path is idempotent + crash-recoverable (source
+operator recovery). A **stopped** container is not relocated: it stays on the
+failed host, stopped (see [Stopped workloads](#stopped-workloads)). The restore path is idempotent + crash-recoverable (source
 marker `relocate-restore:<target>:<token>`, where the attempt token is stamped on
 the restored target row so the coordinator only completes the handoff against a
 row proven to be its own restore; `container_restore_timeout_sec`). See

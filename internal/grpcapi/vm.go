@@ -1449,6 +1449,22 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 	if vm.HostName != s.hostName {
 		return nil, status.Errorf(codes.Aborted, "ownership of %q moved to %s mid-operation; retry", req.Name, vm.HostName)
 	}
+	// A VM failover moved here still stopped has its domain (re)defined by
+	// this host's reconciler under the VM's start lease. Take that lease for
+	// the start, so the start never runs into the middle of the define.
+	if corrosion.IsStoppedRekeyDetail(vm.StateDetail) {
+		holder := health.OperatorStartLockHolder(s.hostName)
+		heldBy, lerr := health.TryVMStartLease(ctx, s.db, holder, vm.Name, time.Now())
+		if lerr != nil {
+			return nil, status.Errorf(codes.Unavailable, "start %q: take its start lease: %v", req.Name, lerr)
+		}
+		if heldBy != holder {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"%q was moved here by failover while stopped and %s is defining its domain; retry in a moment",
+				req.Name, heldBy)
+		}
+		defer health.ReleaseVMStartLease(context.WithoutCancel(ctx), s.db, holder, vm.Name)
+	}
 
 	spec := &pb.VMSpec{}
 	if vm.Spec != "" {

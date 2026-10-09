@@ -37,6 +37,9 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/cli"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -428,6 +431,15 @@ func TestFleet_FailoverMovesAStoppedSharedDiskVMStoppedAndStartable(t *testing.T
 		t.Fatalf("sv-shared after its domain was defined = %+v, want stopped, still marked re-keyed", vm)
 	}
 
+	// The start takes the start lease the define holds: while the reconciler
+	// holds it, the start is refused rather than interleaved (review R4).
+	if held, err := health.TryVMStartLease(ctx, dest.DB, dest.Name, "sv-shared", time.Now()); err != nil || held != dest.Name {
+		t.Fatalf("take the reconciler's start lease: %q %v", held, err)
+	}
+	if _, err := c.SelfClient(dest).StartVM(ctx, &pb.StartVMRequest{Name: "sv-shared"}); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("lv start sv-shared while its define holds the lease: %v, want FailedPrecondition", err)
+	}
+	health.ReleaseVMStartLease(ctx, dest.DB, dest.Name, "sv-shared")
 	if _, err := c.SelfClient(dest).StartVM(ctx, &pb.StartVMRequest{Name: "sv-shared"}); err != nil {
 		t.Fatalf("lv start sv-shared on %s: %v", dest.Name, err)
 	}
@@ -694,5 +706,116 @@ func TestFleet_StoppedVMReKeyNeedsAProofGradeFenceUnderTheSharedStorageFence(t *
 	}
 	if vm, _ := corrosion.GetVM(ctx, a.DB, "sv-fence"); vm == nil || vm.HostName != victim.Name || vm.State != "stopped" {
 		t.Fatalf("sv-fence = %+v; want it left stopped on %s without a proof-grade fence", vm, victim.Name)
+	}
+}
+
+// A claimed re-key advances the VM's ownership generation, so the claim key
+// it was decided at is retired: when the host it moved to fails later, with
+// the VM started there, the VM fails over normally to one other host.
+//
+// Mutation: re-key without the mint under claims (RekeyStoppedVM in place of
+// RekeyStoppedVMClaimed) — the second failover adopts the first re-key's
+// decided value, whose destination is now the failed host, and strands.
+func TestFleet_AClaimedReKeyLeavesTheNextFailoverFree(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 5, IndependentReplicas: true, FaultSeed: 2916})
+	a, b, f := c.Nodes[0], c.Nodes[1], c.Nodes[4]
+	sharedDiskVM(t, c, a, "sv-next", f.Name, "stopped", "operator-stop")
+	c.WaitConverged(t, convergeTimeout)
+	genesisByTick(t, c, a)
+	enableRecoveryClaims(t, c)
+
+	clock := NewVirtualClock(time.Now().UTC())
+	survivors := c.Nodes[:4]
+	c.Kill(f)
+	for _, n := range survivors {
+		PublishHealth(t, n, f.Name, 5, clock.Now())
+	}
+	c.WaitConverged(t, convergeTimeout, survivors...)
+	cs := c.NewCoordinators(clock)
+	for _, n := range c.Nodes {
+		cs.ByNode[n.Name].Gate = quorateGate{}
+	}
+	cs.Tick(ctx, a)
+	c.WaitConverged(t, convergeTimeout, survivors...)
+	vm := vmOn(t, a, "sv-next")
+	if vm.HostName == f.Name || vm.State != "stopped" || vm.OwnerEpoch != 1 {
+		t.Fatalf("sv-next after the claimed re-key = %+v; want it stopped on a survivor at generation 1", vm)
+	}
+	x := c.Node(vm.HostName)
+	health.NewReconciler(x.Name, filepath.Join(c.tmpRoot, x.Name, "data"), x.DB, x.Virt).ReconcileOnce(ctx)
+	if _, err := c.SelfClient(x).StartVM(ctx, &pb.StartVMRequest{Name: "sv-next"}); err != nil {
+		t.Fatalf("lv start sv-next on %s: %v", x.Name, err)
+	}
+	c.WaitConverged(t, convergeTimeout, survivors...)
+
+	// x fails with the VM running on it.
+	var rest []*Node
+	for _, n := range survivors {
+		if n != x {
+			rest = append(rest, n)
+		}
+	}
+	c.Kill(x)
+	// Past the failover lease the first coordinator took, which x may hold.
+	clock.Advance(2 * time.Minute)
+	for _, n := range rest {
+		PublishHealth(t, n, x.Name, 5, clock.Now())
+	}
+	c.WaitConverged(t, convergeTimeout, rest...)
+	coord := a
+	if x == a {
+		coord = b
+	}
+	cs.Tick(ctx, coord)
+	got := vmOn(t, coord, "sv-next")
+	if got.HostName == x.Name || got.PendingActionID == "" {
+		t.Fatalf("sv-next after %s failed = %+v; want it rescheduled off %s (a stale claim strands it)", x.Name, got, x.Name)
+	}
+}
+
+// The re-key's marker reaches a destination that is not the coordinator by
+// ordinary replication — not only by anti-entropy — so that host defines the
+// VM and `lv start` works there. Both forms of the re-key, claimed and not.
+//
+// Mutation: write the marker at the move's timestamp — the receiver meets an
+// exact tie, keeps its own (empty) detail, and the test goes red waiting for
+// the marker.
+func TestFleet_ReKeyMarkerReachesTheDestinationByReplication(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: 2917})
+	a, b, f := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	sharedDiskVM(t, c, a, "sv-wal", f.Name, "stopped", "operator-stop")
+	sharedDiskVM(t, c, a, "sv-wal-claimed", f.Name, "stopped", "operator-stop")
+	c.WaitConverged(t, convergeTimeout)
+
+	if err := corrosion.RekeyStoppedVM(ctx, a.DB, "sv-wal", f.Name, b.Name, "stopped", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.RekeyStoppedVMClaimed(ctx, a.DB, "sv-wal-claimed", f.Name, b.Name, "stopped", 0); err != nil {
+		t.Fatal(err)
+	}
+	want := corrosion.StoppedRekeyDetail(f.Name)
+	deadline := time.Now().Add(15 * time.Second)
+	for _, name := range []string{"sv-wal", "sv-wal-claimed"} {
+		for {
+			v := vmOn(t, b, name)
+			if v != nil && v.HostName == b.Name && v.StateDetail == want {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("%s on %s's replica = %+v; the re-key marker never arrived by replication", name, b.Name, v)
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+	health.NewReconciler(b.Name, filepath.Join(c.tmpRoot, b.Name, "data"), b.DB, b.Virt).ReconcileOnce(ctx)
+	for _, name := range []string{"sv-wal", "sv-wal-claimed"} {
+		if !b.Virt.DomainExists(name) {
+			t.Fatalf("%s did not define %s", b.Name, name)
+		}
+		if _, err := c.SelfClient(b).StartVM(ctx, &pb.StartVMRequest{Name: name}); err != nil {
+			t.Fatalf("lv start %s on %s: %v", name, b.Name, err)
+		}
 	}
 }

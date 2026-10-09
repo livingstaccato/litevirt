@@ -28,21 +28,21 @@ func IsStoppedRekeyDetail(detail string) bool {
 
 // RekeyStoppedVM moves a VM stopped by intent off the failed host fromHost to
 // destHost, still stopped, with its disk rows: the failover coordinator's move
-// for a stopped VM whose disks are all on shared storage, so it gets off a
-// dead host on its real disks and is never started. Its state_detail becomes
-// StoppedRekeyDetail(fromHost).
+// for a stopped VM whose disks are all on shared storage, with recovery claims
+// off, so it gets off a dead host on its real disks and is never started. Its
+// state_detail becomes StoppedRekeyDetail(fromHost).
 //
-// One guarded transaction. It applies only while the row is still on
-// fromHost at expectedEpoch, still stopped by intent (VMStoppedForFailover),
-// and still has no host-local disk (VMHasHostLocalDisk): ErrNoRowsAffected
-// otherwise. Those are local preconditions. The statements replicate without
-// one — the reschedule's host/state write and the plain state write — so two
-// coordinators that both re-key the VM (recovery claims off) converge, by
-// last-writer-wins, on one host for the VM and all its disks. An epoch-bound
-// transfer would not: each side's row would have moved past the generation
-// the other's statement names, and neither would ever apply the other's.
-// Like a reschedule, it does not advance the ownership generation; nothing
-// runs to be superseded.
+// One guarded transaction (rekeyStoppedGuard). The statements replicate
+// without an epoch predicate — the reschedule's host/state write and the
+// plain state write — so two coordinators that both re-key the VM converge,
+// by last-writer-wins, on one host for the VM and all its disks. An
+// epoch-bound transfer would not: each side's row would have moved past the
+// generation the other's statement names. Like the claims-off reschedule, it
+// does not advance the ownership generation; with claims on,
+// RekeyStoppedVMClaimed does. The marker is written at its own, later,
+// timestamp: at the move's, a receiver applying the move first meets an
+// exact tie and keeps its own detail, and the destination would learn the
+// marker only from anti-entropy.
 //
 // state must be "stopped": it is a parameter only so scripts/ci/runningcheck
 // polices the call site like every other ownership writer's (a literal
@@ -56,20 +56,72 @@ func RekeyStoppedVM(ctx context.Context, c *Client, name, fromHost, destHost, st
 		return err
 	}
 	now := c.NowTS()
-	stmts := []Statement{
-		{SQL: vmHostStateSQL, Params: []interface{}{destHost, state, now, name}},
-		{SQL: vmStateUpdateSQL, Params: []interface{}{state, StoppedRekeyDetail(fromHost), now, name}},
-	}
+	stmts := []Statement{{SQL: vmHostStateSQL, Params: []interface{}{destHost, state, now, name}}}
 	for _, d := range disks {
 		if d.HostName == destHost {
 			continue
 		}
-		stmts = append(stmts, Statement{
-			SQL:    vmDiskHostMoveSQL,
-			Params: []interface{}{destHost, now, name, d.DiskName},
-		})
+		stmts = append(stmts, Statement{SQL: vmDiskHostMoveSQL, Params: []interface{}{destHost, now, name, d.DiskName}})
 	}
-	applied, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+	stmts = append(stmts, Statement{SQL: vmStateUpdateSQL, Params: []interface{}{state, StoppedRekeyDetail(fromHost), c.NowTS(), name}})
+	applied, err := c.ExecuteBatchGuarded(ctx, rekeyStoppedGuard(ctx, name, fromHost, expectedEpoch), stmts)
+	if err != nil {
+		return err
+	}
+	if !applied {
+		return ErrNoRowsAffected
+	}
+	return nil
+}
+
+// RekeyStoppedVMClaimed is RekeyStoppedVM for a re-key decided under a
+// recovery claim, at expectedEpoch. It advances the ownership generation, as
+// every claimed transfer does when it completes: the claim is keyed on the
+// generation, and a key left at the generation it decided would hand the
+// VM's NEXT failover this re-key's decided value — a destination that is
+// now the failed host — and strand it. Every coordinator learns the same
+// decided destination, so the epoch-bound transfer cannot leave two replicas
+// on two hosts.
+func RekeyStoppedVMClaimed(ctx context.Context, c *Client, name, fromHost, destHost, state string, expectedEpoch int64) error {
+	if state != "stopped" {
+		return fmt.Errorf("RekeyStoppedVMClaimed moves a stopped VM; asked for state %q", state)
+	}
+	disks, err := GetVMDisks(ctx, c, name)
+	if err != nil {
+		return err
+	}
+	now := c.NowTS()
+	stmts := []Statement{{
+		SQL: `UPDATE vms
+		      SET host_name = ?, state = ?, state_detail = '',
+		          vm_owner_epoch = vm_owner_epoch + 1, updated_at = ?
+		      WHERE name = ? AND deleted_at IS NULL AND vm_owner_epoch = ?`,
+		Params: []interface{}{destHost, state, now, name, expectedEpoch},
+	}}
+	for _, d := range disks {
+		if d.HostName == destHost {
+			continue
+		}
+		stmts = append(stmts, Statement{SQL: vmDiskHostMoveSQL, Params: []interface{}{destHost, now, name, d.DiskName}})
+	}
+	stmts = append(stmts, Statement{SQL: vmStateAtEpochSQL,
+		Params: []interface{}{state, StoppedRekeyDetail(fromHost), c.NowTS(), name, expectedEpoch + 1}})
+	applied, err := c.ExecuteBatchGuarded(ctx, rekeyStoppedGuard(ctx, name, fromHost, expectedEpoch), stmts)
+	if err != nil {
+		return err
+	}
+	if !applied {
+		return ErrNoRowsAffected
+	}
+	return nil
+}
+
+// rekeyStoppedGuard is a re-key's transaction precondition: the row is still
+// on fromHost at expectedEpoch, still stopped by intent
+// (VMStoppedForFailover), and still has no host-local disk
+// (VMHasHostLocalDisk). The checks are local preconditions.
+func rekeyStoppedGuard(ctx context.Context, name, fromHost string, expectedEpoch int64) func(tx *sql.Tx) (bool, error) {
+	return func(tx *sql.Tx) (bool, error) {
 		var host string
 		var epoch int64
 		var stopped bool
@@ -103,12 +155,5 @@ func RekeyStoppedVM(ctx context.Context, c *Client, name, fromHost, destHost, st
 			return false, err
 		}
 		return !VMHasHostLocalDisk(now), nil
-	}, stmts)
-	if err != nil {
-		return err
 	}
-	if !applied {
-		return ErrNoRowsAffected
-	}
-	return nil
 }

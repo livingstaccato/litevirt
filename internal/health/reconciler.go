@@ -82,6 +82,9 @@ type Reconciler struct {
 	// stopSyncHook, test-only, runs between the out-of-band stop sync's
 	// decision and its write, where a concurrent `lv stop` can land.
 	stopSyncHook func(ctx context.Context, vmName string)
+	// rekeyDefineHook, test-only, runs once a re-keyed stopped VM's define
+	// path holds the start lease, before it re-checks the row and domain.
+	rekeyDefineHook func(ctx context.Context, vmName string)
 	// rekeyDefined records, per VM, the row version (updated_at) for which
 	// this process defined a stopped VM failover re-keyed here
 	// (rekeyed_stopped.go).
@@ -2023,6 +2026,12 @@ func reconcilerLockHolder(hostName string) string { return hostName }
 
 // vmcheckLockHolder is the restart-policy path's distinct identity.
 func vmcheckLockHolder(hostName string) string { return hostName + "/vmcheck" }
+
+// OperatorStartLockHolder is the per-VM lease identity of an operator's
+// `lv start` of a VM failover re-keyed here still stopped
+// (corrosion.StoppedRekeyDetail): the start takes the lease the reconciler's
+// define of that VM holds, so the two never interleave (rekeyed_stopped.go).
+func OperatorStartLockHolder(hostName string) string { return hostName + "/start" }
 
 // acquireVMLockFor is acquireVMLock without a Reconciler. The restart-policy
 // path in VMChecker needs the same lease and is not a Reconciler, and a second

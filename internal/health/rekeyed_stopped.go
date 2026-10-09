@@ -76,6 +76,23 @@ func (r *Reconciler) defineRekeyedStoppedVM(ctx context.Context, vm corrosion.VM
 		return
 	}
 	defer r.releaseVMLock(context.WithoutCancel(ctx), vm.Name)
+	if r.rekeyDefineHook != nil {
+		r.rekeyDefineHook(ctx, vm.Name)
+	}
+	// Re-check under the lease. StartVM takes the same lease for a VM still
+	// carrying the marker (OperatorStartLockHolder), so a start cannot begin
+	// from here on; one that finished before the lease was taken shows here
+	// as a running domain or a row that moved on, and is left alone.
+	fresh, err = corrosion.GetVM(ctx, r.db, vm.Name)
+	if err != nil || fresh == nil || fresh.HostName != r.hostName || fresh.State != "stopped" ||
+		!corrosion.IsStoppedRekeyDetail(fresh.StateDetail) {
+		return
+	}
+	if r.virt.DomainExists(vm.Name) {
+		if st, serr := r.virt.DomainState(vm.Name); serr != nil || st == "running" {
+			return
+		}
+	}
 
 	disks, err := corrosion.ListDisks(ctx, r.db, vm.Name)
 	if err != nil {

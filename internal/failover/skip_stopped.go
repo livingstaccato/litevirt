@@ -161,7 +161,8 @@ func (c *Coordinator) rekeyStoppedVM(ctx context.Context, host string, vm corros
 		c.mVM(ActionReschedule, ResultError, ErrDBError)
 		return
 	}
-	if c.claimsEnforced(ctx) {
+	claimed := c.claimsEnforced(ctx)
+	if claimed {
 		holder, exp, term, leaseKey, ok := c.leaseStamp(ctx)
 		if !ok {
 			c.noteGateRefused(ActionReschedule, health.ReasonStaleLeaseTerm)
@@ -195,7 +196,14 @@ func (c *Coordinator) rekeyStoppedVM(ctx context.Context, host string, vm corros
 		}
 		target = cl.Proof.DestHost
 	}
-	if err := corrosion.RekeyStoppedVM(ctx, c.db, vm.Name, host, target, "stopped", fresh.OwnerEpoch); err != nil {
+	// A claimed re-key advances the ownership generation, retiring the claim
+	// key it was decided at (corrosion.RekeyStoppedVMClaimed).
+	if claimed {
+		err = corrosion.RekeyStoppedVMClaimed(ctx, c.db, vm.Name, host, target, "stopped", fresh.OwnerEpoch)
+	} else {
+		err = corrosion.RekeyStoppedVM(ctx, c.db, vm.Name, host, target, "stopped", fresh.OwnerEpoch)
+	}
+	if err != nil {
 		if errors.Is(err, corrosion.ErrNoRowsAffected) {
 			// Another coordinator's re-key to the decided host, or a start,
 			// landed first: nothing left to do here.

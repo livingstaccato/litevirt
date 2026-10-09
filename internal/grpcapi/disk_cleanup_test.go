@@ -38,7 +38,7 @@ func TestDeleteRecordedVMDiskVolumes_FreesDirPoolDisk(t *testing.T) {
 	insertTestVM(t, ctx, s.db, "vm1", "test-host", "stopped")
 	if err := corrosion.InsertDisk(ctx, s.db, corrosion.DiskRecord{
 		VMName: "vm1", DiskName: "root", HostName: "test-host",
-		Path: diskPath, StorageType: "dir", StorageVolume: "nvme-2t",
+		Path: diskPath, StorageType: "dir", StorageVolume: "nvme-2t", DeleteWithVM: true,
 	}); err != nil {
 		t.Fatalf("InsertDisk: %v", err)
 	}
@@ -63,7 +63,7 @@ func TestDeleteRecordedVMDiskVolumes_FreesBareLocalPathDisk(t *testing.T) {
 	insertTestVM(t, ctx, s.db, "vm2", "test-host", "stopped")
 	if err := corrosion.InsertDisk(ctx, s.db, corrosion.DiskRecord{
 		VMName: "vm2", DiskName: "root", HostName: "test-host",
-		Path: diskPath, StorageType: "local", StorageVolume: "",
+		Path: diskPath, StorageType: "local", StorageVolume: "", DeleteWithVM: true,
 	}); err != nil {
 		t.Fatalf("InsertDisk: %v", err)
 	}
@@ -90,7 +90,7 @@ func TestDeleteRecordedVMDiskVolumes_KeepsSharedDisk(t *testing.T) {
 	for _, vm := range []string{"owner", "sibling"} {
 		if err := corrosion.InsertDisk(ctx, s.db, corrosion.DiskRecord{
 			VMName: vm, DiskName: "root", HostName: "test-host",
-			Path: shared, StorageType: "local",
+			Path: shared, StorageType: "local", DeleteWithVM: true,
 		}); err != nil {
 			t.Fatalf("InsertDisk(%s): %v", vm, err)
 		}
@@ -123,7 +123,7 @@ func TestDeleteVM_FreesNonDefaultPoolDisk(t *testing.T) {
 	insertTestVM(t, ctx, s.db, "vm1", "test-host", "stopped")
 	if err := corrosion.InsertDisk(ctx, s.db, corrosion.DiskRecord{
 		VMName: "vm1", DiskName: "root", HostName: "test-host",
-		Path: diskPath, StorageType: "dir", StorageVolume: "nvme-2t",
+		Path: diskPath, StorageType: "dir", StorageVolume: "nvme-2t", DeleteWithVM: true,
 	}); err != nil {
 		t.Fatalf("InsertDisk: %v", err)
 	}

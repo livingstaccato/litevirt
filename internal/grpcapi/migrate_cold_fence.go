@@ -3,11 +3,13 @@ package grpcapi
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
 )
 
@@ -33,15 +35,30 @@ func coldMoveLockHolder(hostName string) string { return hostName + "/cold-migra
 // it taken until the returned release is called. A lease another start path
 // holds refuses the move, as does a lease whose state cannot be read.
 func (s *Server) holdColdMoveStartLease(ctx context.Context, vmName string) (release func(), err error) {
-	holder := coldMoveLockHolder(s.hostName)
+	return s.holdStartLease(ctx, coldMoveLockHolder(s.hostName), vmName, "so it is not migrated cold", "migrate it", false)
+}
+
+// holdStartLease takes the VM's start lease for holder and keeps it taken,
+// renewed, until the returned release is called. A lease another start path
+// holds refuses ("<retry> once that is done"), as does a lease whose state
+// cannot be read ("..., <notDone>: <err>"). With takeOverStale, a lease
+// whose holder is not live (staleStartLease) is taken over instead.
+func (s *Server) holdStartLease(ctx context.Context, holder, vmName, notDone, retry string, takeOverStale bool) (release func(), err error) {
 	heldBy, err := health.TryVMStartLease(ctx, s.db, holder, vmName, time.Now())
+	if err == nil && heldBy != holder && takeOverStale {
+		if why := s.staleStartLease(ctx, vmName, heldBy); why != "" {
+			slog.Warn("taking over a stale start lease", "vm", vmName, "held_by", heldBy, "why", why, "holder", holder)
+			health.ReleaseVMStartLease(ctx, s.db, heldBy, vmName)
+			heldBy, err = health.TryVMStartLease(ctx, s.db, holder, vmName, time.Now())
+		}
+	}
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable,
-			"cannot take the start lease of VM %q, so it is not migrated cold: %v", vmName, err)
+			"cannot take the start lease of VM %q, %s: %v", vmName, notDone, err)
 	}
 	if heldBy != holder {
 		return nil, status.Errorf(codes.FailedPrecondition,
-			"VM %q is being started on this cluster (its start lease is held by %s); migrate it once that is done", vmName, heldBy)
+			"VM %q is being started on this cluster (its start lease is held by %s); %s once that is done", vmName, heldBy, retry)
 	}
 	stop := make(chan struct{})
 	done := make(chan struct{})
@@ -59,7 +76,7 @@ func (s *Server) holdColdMoveStartLease(ctx context.Context, vmName string) (rel
 				// the domain, which is what the lease protects.
 				rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 				if h, rerr := health.TryVMStartLease(rctx, s.db, holder, vmName, time.Now()); rerr != nil || h != holder {
-					slog.Warn("cold migration: could not renew the VM's start lease", "vm", vmName, "held_by", h, "error", rerr)
+					slog.Warn("could not renew the VM's start lease", "vm", vmName, "holder", holder, "held_by", h, "error", rerr)
 				}
 				cancel()
 			}
@@ -72,6 +89,48 @@ func (s *Server) holdColdMoveStartLease(ctx context.Context, vmName string) (rel
 		defer cancel()
 		health.ReleaseVMStartLease(rctx, s.db, holder, vmName)
 	}, nil
+}
+
+// staleStartLease says why the VM's start lease held by heldBy has no live
+// holder behind it, or "" when it may: a lease this host took before this
+// daemon started (a run that crashed holding it), or one whose holder's host
+// is known not to be an active member: its row says another state, or it
+// was removed. A holder on another active host, a host this replica has no
+// row for yet, a component of this daemon, or anything that cannot be read
+// counts as live.
+func (s *Server) staleStartLease(ctx context.Context, vmName, heldBy string) string {
+	host, _, _ := strings.Cut(heldBy, "/")
+	if host == s.hostName {
+		if s.startedAt.IsZero() {
+			return ""
+		}
+		h, takenAt, ok, err := health.ReadVMStartLease(ctx, s.db, vmName)
+		if err != nil || !ok || h != heldBy || takenAt.IsZero() {
+			return ""
+		}
+		// updated_at has whole seconds: compared with the start's second,
+		// a lease taken in this daemon's first second still counts as live.
+		if takenAt.Before(s.startedAt.Truncate(time.Second)) {
+			return "taken at " + takenAt.Format(time.RFC3339) + ", before this daemon started"
+		}
+		return ""
+	}
+	rec, err := corrosion.GetHost(ctx, s.db, host)
+	if err != nil {
+		return ""
+	}
+	if rec == nil {
+		// No live row: removed (its row tombstoned), or a host whose row has
+		// not reached this replica yet. Only the first is known to be gone.
+		if removed, rerr := corrosion.HostRemoved(ctx, s.db, host); rerr == nil && removed {
+			return "its host " + host + " was removed from the cluster"
+		}
+		return ""
+	}
+	if rec.State != "active" {
+		return "its host " + host + " is " + rec.State
+	}
+	return ""
 }
 
 // coldSourceShutOff reports whether the VM's domain here is confirmed shut

@@ -105,6 +105,70 @@ func CountVMsOnNetwork(ctx context.Context, c *Client, networkName string) (int,
 	return rows[0].Int("cnt"), nil
 }
 
+// ForeignWorkloadsOnNetwork names the live workloads with a NIC on
+// networkName that stack did not create: VMs whose stack_name is not stack
+// (by a vm_interfaces or vm_nics row) and containers whose stack label is not
+// stack ("<host>/<name>"). A stack teardown keeps such a network: removing it
+// would pull it out from under a workload that is not the stack's.
+func ForeignWorkloadsOnNetwork(ctx context.Context, c *Client, networkName, stack string) ([]string, error) {
+	rows, err := c.Query(ctx,
+		`SELECT DISTINCT v.name AS name FROM vms v
+		 WHERE v.deleted_at IS NULL AND COALESCE(v.stack_name, '') != ?
+		   AND v.name IN (
+		     SELECT vm_name FROM vm_interfaces WHERE network_name = ? AND deleted_at IS NULL
+		     UNION SELECT vm_name FROM vm_nics WHERE network_name = ? AND deleted_at IS NULL)
+		 ORDER BY v.name`,
+		stack, networkName, networkName)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, r := range rows {
+		out = append(out, r.String("name"))
+	}
+	cts, err := ListContainerInterfacesByNetwork(ctx, c, networkName)
+	if err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	for _, ci := range cts {
+		key := ci.HostName + "/" + ci.CtName
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		ct, err := GetContainer(ctx, c, ci.HostName, ci.CtName)
+		if err != nil {
+			return nil, err
+		}
+		if ct != nil && ct.Labels[LabelStack] != stack {
+			out = append(out, key)
+		}
+	}
+	return out, nil
+}
+
+// VMNamesOnNetwork names the live VMs with a NIC (a live vm_interfaces or
+// vm_nics row) on networkName, on any host.
+func VMNamesOnNetwork(ctx context.Context, c *Client, networkName string) ([]string, error) {
+	rows, err := c.Query(ctx,
+		`SELECT DISTINCT v.name AS name FROM vms v
+		 WHERE v.deleted_at IS NULL
+		   AND v.name IN (
+		     SELECT vm_name FROM vm_interfaces WHERE network_name = ? AND deleted_at IS NULL
+		     UNION SELECT vm_name FROM vm_nics WHERE network_name = ? AND deleted_at IS NULL)
+		 ORDER BY v.name`,
+		networkName, networkName)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, r := range rows {
+		out = append(out, r.String("name"))
+	}
+	return out, nil
+}
+
 // CountWorkloadsOnNetwork counts the VMs (by a live vm_interfaces or vm_nics
 // row) and the containers (by a live container_interfaces row) with a NIC on
 // networkName, on any host.

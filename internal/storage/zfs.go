@@ -123,7 +123,7 @@ func (d *zfsDriver) Replicate(ctx context.Context, opts ReplicateOptions) (err e
 
 	sendArgs := []string{"send"}
 	prev := fmt.Sprintf("%s@litevirt-replicate-prev", opts.SrcRef)
-	if opts.Incremental && snapshotExists(ctx, prev) {
+	if opts.Incremental && d.snapshotExists(ctx, prev) {
 		sendArgs = append(sendArgs, "-I", prev, "--", srcSnap)
 	} else {
 		sendArgs = append(sendArgs, "--", srcSnap)
@@ -161,20 +161,49 @@ func (d *zfsDriver) Replicate(ctx context.Context, opts ReplicateOptions) (err e
 
 // rollPrevSnapshot advances the "@litevirt-replicate-prev" pointer to the
 // current state so the next incremental diffs against it. Each step's error is
-// checked; a missing prev on the first run (nothing to destroy) is tolerated,
-// but any real failure aborts the roll rather than leaving a stale base.
-func (d *zfsDriver) rollPrevSnapshot(ctx context.Context, prev string) error {
+// checked: any real failure aborts the roll rather than leaving a stale base.
+//
+// Whether a snapshot is there is asked (snapshotExists), never read from the
+// wording of a failed destroy: zfs 2.2.2 says "could not find any snapshots
+// to destroy" where older releases say "does not exist", and a first
+// replication on 2.2.2 failed on it (lab-recheck-5 11:11:52). A "-new" an
+// earlier failed run left is this pointer's own and stale: it is destroyed
+// first, so it cannot fail this run ("dataset already exists"), and a roll
+// that fails destroys the "-new" it made, so it cannot fail the next one.
+func (d *zfsDriver) rollPrevSnapshot(ctx context.Context, prev string) (err error) {
 	prevNew := prev + "-new"
-	if out, err := d.zfs(ctx, "snapshot", "--", prevNew); err != nil {
-		return fmt.Errorf("snapshot %s: %w: %s", prevNew, err, out)
+	if d.snapshotExists(ctx, prevNew) {
+		if out, derr := d.zfs(ctx, "destroy", "--", prevNew); derr != nil {
+			return fmt.Errorf("destroy the stale %s an earlier run left: %w: %s", prevNew, derr, out)
+		}
 	}
-	if out, err := d.zfs(ctx, "destroy", "--", prev); err != nil && !strings.Contains(string(out), "does not exist") {
-		return fmt.Errorf("destroy %s: %w: %s", prev, err, out)
+	if out, serr := d.zfs(ctx, "snapshot", "--", prevNew); serr != nil {
+		return fmt.Errorf("snapshot %s: %w: %s", prevNew, serr, out)
 	}
-	if out, err := d.zfs(ctx, "rename", "--", prevNew, prev); err != nil {
-		return fmt.Errorf("rename %s -> %s: %w: %s", prevNew, prev, err, out)
+	defer func() {
+		if err != nil {
+			if out, derr := d.zfs(ctx, "destroy", "--", prevNew); derr != nil {
+				slog.Warn("zfs replicate: the failed roll's snapshot could not be removed; the next run removes it",
+					"snapshot", prevNew, "error", derr, "output", strings.TrimSpace(string(out)))
+			}
+		}
+	}()
+	if d.snapshotExists(ctx, prev) {
+		if out, derr := d.zfs(ctx, "destroy", "--", prev); derr != nil {
+			return fmt.Errorf("destroy %s: %w: %s", prev, derr, out)
+		}
+	}
+	if out, rerr := d.zfs(ctx, "rename", "--", prevNew, prev); rerr != nil {
+		return fmt.Errorf("rename %s -> %s: %w: %s", prevNew, prev, rerr, out)
 	}
 	return nil
+}
+
+// snapshotExists asks zfs whether the snapshot ref exists, through the
+// driver's runner.
+func (d *zfsDriver) snapshotExists(ctx context.Context, ref string) bool {
+	_, err := d.zfs(ctx, "list", "-H", "-t", "snapshot", "-o", "name", "--", ref)
+	return err == nil
 }
 
 func (d *zfsDriver) DeleteDisk(ctx context.Context, path string) error {

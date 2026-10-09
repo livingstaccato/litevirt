@@ -7,6 +7,8 @@ import (
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 )
@@ -113,15 +115,19 @@ func newSnapshotRestoreCmd() *cobra.Command {
 			snapName := args[1]
 
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				var hdr metadata.MD
 				vm, err := c.RestoreSnapshot(ctx, &pb.RestoreSnapshotRequest{
 					VmName:       vmName,
 					SnapshotName: snapName,
-				})
+				}, grpc.Header(&hdr))
 				if err != nil {
 					return fmt.Errorf("restore snapshot: %w", err)
 				}
 
 				fmt.Printf("VM %s restored from snapshot %q (state: %s)\n", vm.Name, snapName, vm.State)
+				for _, w := range hdr.Get("x-litevirt-restore-warning") {
+					fmt.Fprintf(os.Stderr, "warning: %s\n", w)
+				}
 				return nil
 			})
 		},

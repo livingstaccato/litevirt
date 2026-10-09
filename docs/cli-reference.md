@@ -697,6 +697,46 @@ lv snapshot restore <vm> <name>           # repeatable; memory snapshots are hos
 lv snapshot rm <vm> <name>
 ```
 
+`lv snapshot rm` lets libvirt merge the snapshot's overlay into the disk it
+was taken of and remove the overlay; deleting the last disk-only snapshot of a
+running VM does the same with a block commit of its own. A restore leaves the
+restored snapshot libvirt's current one, which is what makes libvirt merge
+rather than unlink. Two cases keep every file:
+
+- the delete is **refused**, naming the VMs, while another VM (a linked clone)
+  backs on the snapshot's overlay or on the disk it was taken of;
+- a snapshot libvirt does not hold as current and that has no children — as
+  a restore by an earlier build left one — is deleted as metadata only, with a
+  warning in the log: the VM keeps its backing chain, and the space is not
+  reclaimed;
+- so is a snapshot libvirt cannot merge because its overlay is no longer in
+  the VM's live chain. Restoring an older snapshot while a later one exists
+  leaves the restored one so: its overlay file stays on disk, unused.
+
+Restoring an older snapshot while a later one exists puts the VM on a new
+overlay (`<disk>.<snapshot>-r<time>`) directly on the disk that snapshot was
+taken of, in libvirt's definition and in the image headers alike. The later
+snapshot's files are left as they were, outside the VM's chain, so it can
+still be restored. Restoring the same snapshot again reuses that overlay.
+Files left outside the chain this way are removed when the VM is deleted.
+
+The refusal for a linked clone comes first, and applies to these metadata-only
+deletes too.
+
+`lv snapshot restore` empties the VM's live overlay and starts the VM on it,
+so it is refused, naming the VMs, while another VM (a linked clone) backs on
+one of the VM's live disk files. A clone of the disk the snapshot was taken of
+does not stop it: a restore only reads that disk. When libvirt will not take
+the restored snapshot back as its current one, the restore still succeeds,
+but `lv` prints a warning and the VM gets a `snapshot.restore-not-current`
+event: deleting that snapshot later keeps its files rather than merging them.
+
+A restore holds the VM's start lease while it brings the domain down and back,
+so no start path restarts it midway; it is refused while a live start holds
+it. A lease with no live holder behind it — taken by this host before its
+daemon last started, or held by a host that is no longer an active member — is
+taken over instead.
+
 ## Memory ballooning
 
 ```bash

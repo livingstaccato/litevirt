@@ -102,6 +102,12 @@ type LibvirtBackend interface {
 	// when deleting the last snapshot so the disk stops growing a chain and stays
 	// migratable. Running domains only.
 	FlattenSnapshot(domainName, snapshotName string) error
+	// SnapshotDiskFiles returns the files a delete of the snapshot may merge
+	// or remove: each external disk's overlay and the disk it was taken of.
+	SnapshotDiskFiles(domainName, snapshotName string) ([]string, error)
+	// DomainDiskFormats returns the domain's disks as source file → driver
+	// type, from its definition on this host.
+	DomainDiskFormats(domainName string) (map[string]string, error)
 	// Live/RAM snapshots (#3): capture guest RAM into vmstatePath alongside the
 	// external disk snapshot, and revert both to the snapshot instant.
 	CreateLiveSnapshot(domainName, snapshotName, vmstatePath string, captureSuspended func() error) (diskBytes, vmstateBytes int64, err error)

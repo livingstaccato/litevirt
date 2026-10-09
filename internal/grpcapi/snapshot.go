@@ -2,12 +2,18 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
+	"time"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 
@@ -282,7 +288,24 @@ func (s *Server) ListSnapshots(ctx context.Context, req *pb.ListSnapshotsRequest
 	return resp, nil
 }
 
+// snapshotRestoreLockHolder is a snapshot restore's identity on the per-VM
+// start lease. Distinct from every start path's, so none can re-take a lease
+// the restore holds.
+func snapshotRestoreLockHolder(hostName string) string { return hostName + "/snapshot-restore" }
+
+// RestoreSnapshot is restoreSnapshot, with every refusal or failure logged at
+// WARN on the host that decided it: the lab found a refusal nothing on the
+// host recorded.
 func (s *Server) RestoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotRequest) (*pb.VM, error) {
+	vm, err := s.restoreSnapshot(ctx, req)
+	if err != nil {
+		slog.Warn("snapshot restore not done", "vm", req.GetVmName(), "snapshot", req.GetSnapshotName(),
+			"code", status.Code(err).String(), "error", err)
+	}
+	return vm, err
+}
+
+func (s *Server) restoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotRequest) (*pb.VM, error) {
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return nil, err
 	}
@@ -314,7 +337,12 @@ func (s *Server) RestoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotReq
 			return nil, status.Errorf(codes.Unavailable, "cannot reach host %s: %v", vm.HostName, err)
 		}
 		defer conn.Close()
-		return client.RestoreSnapshot(ctx, req)
+		var hdr metadata.MD
+		vm, err := client.RestoreSnapshot(ctx, req, grpc.Header(&hdr))
+		if w := hdr.Get(RestoreWarningHeader); len(w) > 0 {
+			_ = grpc.SetHeader(ctx, metadata.Pairs(RestoreWarningHeader, w[0]))
+		}
+		return vm, err
 	}
 
 	// A revert can bring the domain back running with its installer ISO; it
@@ -340,6 +368,55 @@ func (s *Server) RestoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotReq
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"snapshot %q is in error state (a failed capture) and cannot be restored — delete it instead", req.SnapshotName)
 	}
+	// The revert removes the VM's live overlays, creates empty ones in their
+	// place and starts the VM on them. A linked clone of the stopped VM backs
+	// on exactly those files: its blocks would then sit over a different,
+	// empty base that the VM writes into, and nothing fails until its guest
+	// reads them (review C-1; main lost the clone's disk the same way). So
+	// the restore is refused while another VM backs on a live layer, by its
+	// recorded backing_disk or its qcow2 header — the files StartVM's linked
+	// clone check protects too. The disk the snapshot was taken of is only
+	// read by a restore, so a clone of it does not stop one.
+	live, lerr := s.virt.DomainDiskSources(req.VmName)
+	if lerr != nil {
+		return nil, status.Errorf(codes.Internal,
+			"cannot read which disk files %q runs on, so it is not restored: %v", req.VmName, lerr)
+	}
+	var liveFiles []string
+	for _, f := range live {
+		liveFiles = append(liveFiles, f)
+	}
+	sort.Strings(liveFiles)
+	users, uerr := s.snapshotFileUsers(ctx, req.VmName, liveFiles)
+	if uerr != nil {
+		return nil, status.Errorf(codes.Internal,
+			"cannot determine whether other VMs back on the disks of %q, so it is not restored: %v", req.VmName, uerr)
+	}
+	if len(users) > 0 {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"%q is not restored to snapshot %q: %s back(s) on its disk files (%s), which the restore would empty "+
+				"and the VM would write into. Delete those VMs, or re-create them as independent copies with "+
+				"`lv clone <source> <name> --mode full`, first",
+			req.VmName, req.SnapshotName, strings.Join(users, ", "), strings.Join(liveFiles, ", "))
+	}
+
+	// The revert destroys and undefines the domain, resets its overlays and
+	// brings it back. The VM lock holds off this host's RPCs only; the
+	// reconciler and the restart policy start a VM under the replicated start
+	// lease, and the reconciler restarts a VM recorded running whose domain is
+	// gone. On the lab it did so mid-restore: the guest came back on the old
+	// overlay, the reset went to a file nothing read, and the restore failed
+	// with "domain is already running", not restored (snapshot-repro.md). So
+	// the restore holds the start lease until the domain is back.
+	// A lease no live holder stands behind (a crashed run's) is taken over:
+	// main restored then, and that holder is starting nothing.
+	releaseLease, err := s.holdStartLease(ctx, snapshotRestoreLockHolder(s.hostName), req.VmName,
+		"so it is not restored", "restore it", true)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseLease()
+
 	// Restore firmware state (NVRAM + swtpm) from the snapshot sidecar before the
 	// domain is redefined, so reverted disks/RAM + firmware are a consistent set
 	// (G1). No-op when the snapshot captured none (non-firmware VM).
@@ -376,29 +453,142 @@ func (s *Server) RestoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotReq
 		// reopens: its installer CD-ROMs are judged here and pointed at the
 		// files judged, before anything is torn down.
 		rewriteSaved := func(savedXML string) (string, error) { return s.judgedCDROMDefinition(vm, savedXML) }
-		if err := s.virt.RevertToLiveSnapshot(req.VmName, req.SnapshotName, snap.VMStatePath, restoreFW, rewriteSaved); err != nil {
+		if err := s.notCurrentRestore(ctx, req, s.virt.RevertToLiveSnapshot(req.VmName, req.SnapshotName, snap.VMStatePath, restoreFW, rewriteSaved)); err != nil {
 			if status.Code(err) == codes.FailedPrecondition {
 				return nil, err
 			}
 			return nil, status.Errorf(codes.Internal, "revert to memory snapshot: %v", err)
 		}
-	} else if err := s.virt.RevertToSnapshot(req.VmName, req.SnapshotName, restoreFW); err != nil {
+	} else if err := s.notCurrentRestore(ctx, req, s.virt.RevertToSnapshot(req.VmName, req.SnapshotName, restoreFW)); err != nil {
 		return nil, status.Errorf(codes.Internal, "revert to snapshot: %v", err)
 	}
 
 	// Revert may leave the domain on an overlay (memory revert resets it in
 	// place; disk-only revert restores the original) — reconcile either way.
-	s.reconcileDiskPaths(ctx, req.VmName)
+	// A restore of an older snapshot moves the VM to a new overlay, so a
+	// record left behind names a later snapshot's layer, which a cold
+	// migration's copy or a define from the record would run the VM on
+	// (re-review R2-M2). It is retried, and a restore whose record could not
+	// be brought along fails loudly instead of reporting success.
+	var recErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if recErr = s.reconcileDiskPathsErr(ctx, req.VmName); recErr == nil {
+			break
+		}
+		time.Sleep(time.Duration(attempt+1) * 200 * time.Millisecond)
+	}
 
 	// After revert, VM may be running or paused depending on snapshot type. A lost
 	// "running" write is low-harm (the reconciler heals from libvirt), so record
 	// best-effort with retry rather than failing an already-completed restore.
+	// Written whether or not the path was recorded: the restore happened and
+	// the VM runs (re-review R3-M1).
 	if err := s.persistVMState(ctx, req.VmName, "running", "restored from "+req.SnapshotName, corrosion.OpVMState); err != nil {
 		slog.Error("snapshot restore: recording running state failed — reconciler will heal", "vm", req.VmName, "error", err)
+	}
+	if recErr != nil {
+		// Never "restore again": that would discard what the VM has written
+		// since. The daemon keeps trying to record the path itself; reading
+		// it back (lv inspect) says when it has, and taking a snapshot
+		// records it too, losing nothing.
+		s.recordVMEvent(ctx, req.VmName, "snapshot.restore-path-unrecorded", "error",
+			recErr.Error()+"; retrying in the background — do not migrate or redefine the VM until its disk path is recorded")
+		go s.recordRestoredDiskPath(req.VmName, req.SnapshotName)
+		return nil, status.Errorf(codes.Internal,
+			"snapshot %q of %q was restored and the VM is running, but recording its disk path failed: %v. "+
+				"The daemon keeps retrying; until `lv inspect %s` shows the disk on the file the VM runs on, "+
+				"do not migrate or redefine it. Taking a snapshot (`lv snapshot create %s <name>`) also records the path. "+
+				"Do not restore the snapshot to fix this: that discards what the VM has written since",
+			req.SnapshotName, req.VmName, recErr, req.VmName, req.VmName)
 	}
 	slog.Info("snapshot restored", "vm", req.VmName, "snapshot", req.SnapshotName)
 	s.recordVMEvent(ctx, req.VmName, "snapshot.restored", "ok", req.SnapshotName)
 	return s.vmToProto(ctx, req.VmName)
+}
+
+// How long, and how often, the daemon retries recording a restored VM's disk
+// path after the restore's own attempts failed. Variables for the tests.
+var (
+	pathRecordRetryEvery = 30 * time.Second
+	pathRecordRetryFor   = 15 * time.Minute
+)
+
+// recordRestoredDiskPath keeps trying to bring a restored VM's disk record
+// to the file it runs on, under the VM's lock, until it succeeds or
+// pathRecordRetryFor has passed, and says which as the VM's event.
+func (s *Server) recordRestoredDiskPath(vmName, snapshotName string) {
+	ctx := context.Background()
+	deadline := time.Now().Add(pathRecordRetryFor)
+	for time.Now().Before(deadline) {
+		time.Sleep(pathRecordRetryEvery)
+		unlock := s.lockVM(vmName)
+		// Only while this host still owns the VM, and is itself an active
+		// member: after a failover, a delete or this host's fence, its live
+		// paths are not the VM's, and must not be written into the
+		// replicated record (re-review R4-M4). Checked under the lock, each
+		// attempt; anything that cannot be read stops the retry too.
+		if why := s.notOwnedHere(ctx, vmName); why != "" {
+			unlock()
+			slog.Warn("snapshot restore: stopping the disk-path retry; the VM is not this host's to record",
+				"vm", vmName, "snapshot", snapshotName, "why", why)
+			return
+		}
+		err := s.reconcileDiskPathsErr(ctx, vmName)
+		unlock()
+		if err == nil {
+			slog.Info("snapshot restore: disk path recorded on retry", "vm", vmName, "snapshot", snapshotName)
+			s.recordVMEvent(ctx, vmName, "snapshot.restore-path-recorded", "ok", snapshotName)
+			return
+		}
+	}
+	slog.Error("snapshot restore: disk path still not recorded; take a snapshot to record it", "vm", vmName, "snapshot", snapshotName)
+	s.recordVMEvent(ctx, vmName, "snapshot.restore-path-unrecorded", "error",
+		"retries ended; `lv snapshot create "+vmName+" <name>` records the path — do not migrate or redefine the VM until it is")
+}
+
+// notOwnedHere says why vmName is not this host's to record, or "": its row
+// is gone or names another host, or this host is not an active member.
+func (s *Server) notOwnedHere(ctx context.Context, vmName string) string {
+	vm, err := corrosion.GetVM(ctx, s.db, vmName)
+	switch {
+	case err != nil:
+		return "its row cannot be read: " + err.Error()
+	case vm == nil:
+		return "it was deleted"
+	case vm.HostName != s.hostName:
+		return "it is on " + vm.HostName
+	}
+	h, err := corrosion.GetHost(ctx, s.db, s.hostName)
+	switch {
+	case err != nil:
+		return "this host's row cannot be read: " + err.Error()
+	case h == nil:
+		return "this host has no row"
+	case h.State != "active":
+		return "this host is " + h.State
+	}
+	return ""
+}
+
+// RestoreWarningHeader is the response header RestoreSnapshot says, on a
+// restore that succeeded, what it could not do (lv snapshot restore prints it).
+const RestoreWarningHeader = "x-litevirt-restore-warning"
+
+// notCurrentRestore passes a revert's error through, except a
+// RestoredNotCurrentError: the restore succeeded, but libvirt would not hold
+// the snapshot as current, so a later delete keeps its files rather than
+// merging them. That is said to the caller (RestoreWarningHeader), recorded
+// as the VM's event snapshot.restore-not-current, and logged — never only
+// logged, so an operator can tell the restore fix did not apply here.
+func (s *Server) notCurrentRestore(ctx context.Context, req *pb.RestoreSnapshotRequest, err error) error {
+	var nc *lv.RestoredNotCurrentError
+	if !errors.As(err, &nc) {
+		return err
+	}
+	slog.Error("snapshot restore: the snapshot is not libvirt's current one", "vm", req.VmName, "snapshot", req.SnapshotName, "error", nc)
+	s.recordVMEvent(ctx, req.VmName, "snapshot.restore-not-current", "warning", nc.Error())
+	_ = grpc.SetHeader(ctx, metadata.Pairs(RestoreWarningHeader, nc.Error()))
+	return nil
 }
 
 func (s *Server) DeleteSnapshot(ctx context.Context, req *pb.DeleteSnapshotRequest) (*emptypb.Empty, error) {
@@ -455,6 +645,29 @@ func (s *Server) DeleteSnapshot(ctx context.Context, req *pb.DeleteSnapshotReque
 	flattenable := snap == nil || snap.Type != "memory" || snap.State == "error"
 	flatten := vm.State == "running" && len(existing) <= 1 && flattenable
 
+	// Both the flatten and libvirt's delete merge the snapshot's overlay into
+	// the disk it was taken of and remove the overlay. Another VM backing on
+	// either file — a linked clone of this one — would lose its disk, so the
+	// delete is refused while one does. A snapshot libvirt no longer holds is
+	// deleted as a record only, touching no file.
+	if files, ferr := s.virt.SnapshotDiskFiles(req.VmName, req.SnapshotName); ferr != nil && !lv.IsNotFound(ferr) {
+		return nil, status.Errorf(codes.Internal,
+			"cannot read which disk files snapshot %q of %q merges, so it is not deleted: %v", req.SnapshotName, req.VmName, ferr)
+	} else if ferr == nil {
+		users, uerr := s.snapshotFileUsers(ctx, req.VmName, files)
+		if uerr != nil {
+			return nil, status.Errorf(codes.Internal,
+				"cannot determine whether other VMs back on snapshot %q of %q, so it is not deleted: %v", req.SnapshotName, req.VmName, uerr)
+		}
+		if len(users) > 0 {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"snapshot %q of %q is not deleted: %s back(s) on its disk files (%s), which the delete would merge "+
+					"into or remove. Delete those VMs, or re-create them as independent copies with "+
+					"`lv clone <source> <name> --mode full`, first",
+				req.SnapshotName, req.VmName, strings.Join(users, ", "), strings.Join(files, ", "))
+		}
+	}
+
 	var delErr error
 	if flatten {
 		if delErr = s.virt.FlattenSnapshot(req.VmName, req.SnapshotName); delErr != nil {
@@ -493,10 +706,40 @@ func (s *Server) DeleteSnapshot(ctx context.Context, req *pb.DeleteSnapshotReque
 
 	// Deleting an external snapshot makes libvirt consolidate the chain, often
 	// leaving the active disk named after the (now-gone) snapshot — reconcile
-	// the recorded path to whatever the live domain ended up on.
-	s.reconcileDiskPaths(ctx, req.VmName)
+	// the recorded path to whatever the live domain ended up on. The deleted
+	// snapshot's name still names the recorded overlay.
+	s.reconcileDiskPaths(ctx, req.VmName, req.SnapshotName)
 
 	slog.Info("snapshot deleted", "vm", req.VmName, "snapshot", req.SnapshotName)
 	s.recordVMEvent(ctx, req.VmName, "snapshot.deleted", "ok", req.SnapshotName)
 	return &emptypb.Empty{}, nil
+}
+
+// removeVMSnapshotRAMImages removes, for a VM being deleted with its disks,
+// the RAM images its memory snapshots' records on this host name. A snapshot
+// whose delete failed keeps its record and its image, and nothing else ever
+// removed it: on the lab `lv rm -f` left a 192 MB <vm>-<snap>.save behind
+// (snapshot-repro.md). Only the path this host gives that VM's snapshot is
+// removed, never another file a record names, and never by a name pattern,
+// which another VM's name can match.
+func (s *Server) removeVMSnapshotRAMImages(ctx context.Context, vmName string) {
+	snaps, err := corrosion.ListSnapshots(ctx, s.db, vmName)
+	if err != nil {
+		slog.Warn("delete: cannot list the VM's snapshots; their RAM images are kept", "vm", vmName, "error", err)
+		return
+	}
+	for _, sn := range snaps {
+		if sn.VMStatePath == "" || (sn.HostName != "" && sn.HostName != s.hostName) {
+			continue
+		}
+		own, err := lv.SafeVMStatePath(s.dataDir, vmName, sn.Name)
+		if err != nil || filepath.Clean(sn.VMStatePath) != own {
+			slog.Warn("delete: a snapshot record names a RAM image that is not this VM's; kept",
+				"vm", vmName, "snapshot", sn.Name, "path", sn.VMStatePath)
+			continue
+		}
+		if err := os.Remove(own); err != nil && !os.IsNotExist(err) {
+			slog.Warn("delete: remove snapshot RAM image", "vm", vmName, "snapshot", sn.Name, "path", own, "error", err)
+		}
+	}
 }

@@ -81,8 +81,19 @@ func BuildVMSpec(instanceName, baseName string, vm *VMDef, f *File) (*pb.VMSpec,
 		}
 	}
 
+	// iso: names the VM's installer ISO — a library reference
+	// (<pool>/<file>.iso) or a host path, both with a '/' — which is
+	// VMSpec.iso: attached as a CD-ROM beside the image's root disk, and
+	// confined as every create confines an ISO (the library's project rules;
+	// a host path is an Admin's only). It is never an image name, which every
+	// create would refuse for the '/'. A bare name keeps its earlier meaning,
+	// an image-store name used as the boot image.
 	if vm.ISO != "" {
-		spec.Image = vm.ISO
+		if strings.Contains(vm.ISO, "/") {
+			spec.Iso = vm.ISO
+		} else {
+			spec.Image = vm.ISO
+		}
 		spec.Boot = "cdrom"
 	}
 

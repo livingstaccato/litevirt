@@ -300,9 +300,15 @@ func newDownCmd() *cobra.Command {
 					if item == "" && p.Status == "error" {
 						item = "stack resource"
 					}
-					if item != "" && !seenVM[item] {
+					if item != "" && !seenVM[item] && p.Status != "kept" {
 						seenVM[item] = true
 						seen = append(seen, item)
+					}
+					if p.Status == "kept" && seenVM[item] {
+						// Reported "deleting" and then found not to be the
+						// stack's: no deletion, so not in the count.
+						delete(seenVM, item)
+						seen = removeString(seen, item)
 					}
 					switch p.Status {
 					case "error":
@@ -313,6 +319,9 @@ func newDownCmd() *cobra.Command {
 						}
 					case "deleted":
 						fmt.Printf("  deleted %s\n", p.VmName)
+					case "kept":
+						// A VM of a member's name the stack did not create.
+						fmt.Printf("  kept %s: %s\n", p.VmName, p.Error)
 					default:
 						fmt.Printf("  %s: %s\n", p.VmName, p.Status)
 					}
@@ -549,4 +558,15 @@ func newExportCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVarP(&output, "output", "o", "", "Write YAML to file instead of stdout")
 	return cmd
+}
+
+// removeString returns ss without s.
+func removeString(ss []string, s string) []string {
+	out := ss[:0:0]
+	for _, x := range ss {
+		if x != s {
+			out = append(out, x)
+		}
+	}
+	return out
 }

@@ -474,6 +474,38 @@ func TestBuildVMSpec_ISO(t *testing.T) {
 	}
 }
 
+// An iso: that names an installer ISO — a library reference
+// (<pool>/<file>.iso) or a host path — is the VM's installer ISO
+// (VMSpec.iso), attached as a CD-ROM beside the image's root disk and judged
+// as every create judges an ISO. It was sent as the image name, which every
+// create refuses ("invalid image name ... contains disallowed characters";
+// lab-recheck-5 11:17), and replaced the image: a compose file could not
+// give a VM an installer ISO at all.
+func TestBuildVMSpec_ISOReferenceIsTheInstallerISO(t *testing.T) {
+	for _, iso := range []string{"isos/debian-12.iso", "acme-isos/debian-12.iso", "/srv/lv-e2e-iso/x.iso"} {
+		t.Run(iso, func(t *testing.T) {
+			f := baseFile("stack", nil)
+			vm := &VMDef{Image: "cirros", ISO: iso, CPU: 1, Memory: 256}
+			spec := mustBuildVMSpec(t, "vm", "vm", vm, f)
+			if spec.Iso != iso {
+				t.Errorf("Iso = %q, want %q", spec.Iso, iso)
+			}
+			if spec.Image != "cirros" {
+				t.Errorf("Image = %q, want the image (cirros) kept", spec.Image)
+			}
+			if spec.Boot != "cdrom" {
+				t.Errorf("Boot = %q, want cdrom", spec.Boot)
+			}
+		})
+	}
+	// Without image: no image name either — the ISO is not one.
+	f := baseFile("stack", nil)
+	spec := mustBuildVMSpec(t, "vm", "vm", &VMDef{ISO: "isos/debian-12.iso", CPU: 1, Memory: 256}, f)
+	if spec.Iso != "isos/debian-12.iso" || spec.Image != "" {
+		t.Errorf("Iso = %q, Image = %q; want the ISO as Iso and no image", spec.Iso, spec.Image)
+	}
+}
+
 func TestBuildVMSpec_NilOptionalFields(t *testing.T) {
 	f := baseFile("stack", nil)
 	vm := &VMDef{

@@ -203,7 +203,7 @@ func (s *Server) handleDestroyStack(w http.ResponseWriter, r *http.Request) {
 	// down` does: DeleteStack reports anything it could not remove as an
 	// "error" status and still ends the stream OK, leaving the stack
 	// "deleting" for the daemon to retry. That is not "destroyed".
-	var failed, seen []string
+	var failed, seen, kept, keptNets []string
 	seenItem := map[string]bool{}
 	var streamErr error
 	for {
@@ -213,6 +213,30 @@ func (s *Server) handleDestroyStack(w http.ResponseWriter, r *http.Request) {
 				streamErr = err
 			}
 			break
+		}
+		// A VM of a member's name the stack did not create: left alone, not
+		// a deletion and not a failure. Said by name, with why.
+		// A network kept for a workload the stack did not create is named
+		// apart: it is not a VM.
+		if p.Status == "kept" && strings.HasPrefix(p.VmName, "network ") {
+			keptNets = append(keptNets, strings.TrimPrefix(p.VmName, "network ")+" ("+p.Error+")")
+			continue
+		}
+		if p.Status == "kept" {
+			kept = append(kept, p.VmName+" ("+p.Error+")")
+			// Reported "deleting" first and then found not to be the
+			// stack's: no deletion, so not in the count.
+			if seenItem[p.VmName] {
+				delete(seenItem, p.VmName)
+				var rest []string
+				for _, x := range seen {
+					if x != p.VmName {
+						rest = append(rest, x)
+					}
+				}
+				seen = rest
+			}
+			continue
 		}
 		item := p.VmName
 		if item == "" && p.Status == "error" {
@@ -232,16 +256,25 @@ func (s *Server) handleDestroyStack(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(httpStatusFor(streamErr))
 		return
 	}
+	keptNote := ""
+	if len(kept) > 0 {
+		slog.Warn("UI: destroy stack kept VMs it did not create", "stack", name, "kept", kept)
+		keptNote = fmt.Sprintf(" Kept %d VM(s) the stack did not create: %s.", len(kept), strings.Join(kept, "; "))
+	}
+	if len(keptNets) > 0 {
+		slog.Warn("UI: destroy stack kept networks other workloads use", "stack", name, "kept", keptNets)
+		keptNote += fmt.Sprintf(" Kept network %s.", strings.Join(keptNets, "; network "))
+	}
 	if len(failed) > 0 {
 		slog.Warn("UI: destroy stack incomplete", "stack", name, "failures", failed)
-		sendToast(w, fmt.Sprintf("Stack '%s' not fully destroyed: %d of %d deletions failed (%s). It is left deleting and the daemon retries the teardown.",
-			name, len(failed), len(seen), strings.Join(failed, "; ")), "error")
+		sendToast(w, fmt.Sprintf("Stack '%s' not fully destroyed: %d of %d deletions failed (%s). It is left deleting and the daemon retries the teardown.%s",
+			name, len(failed), len(seen), strings.Join(failed, "; "), keptNote), "error")
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
 	w.Header().Set("HX-Redirect", "/stacks")
-	sendToast(w, "Stack '"+name+"' destroyed", "success")
+	sendToast(w, "Stack '"+name+"' destroyed."+keptNote, "success")
 	w.WriteHeader(http.StatusOK)
 }
 

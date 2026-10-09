@@ -215,8 +215,9 @@ func TestLab_ISOMemoryRevertOpensTheJudgedFile(t *testing.T) {
 	requireISOOpened(l, h, vm, isoFileOf(h))
 
 	t.Run("memory-revert", func(t *testing.T) {
-		// A VNC password the saved image must carry back.
-		const pw = "e2e-iso-pw"
+		// A VNC password the saved image must carry back. qemu takes at most
+		// 8 characters (a 10-character one fails this setup on its own).
+		const pw = "e2eisopw"
 		l.mustSSH(h, 30*time.Second, fmt.Sprintf(
 			"virsh -c qemu:///system dumpxml --security-info %[1]s | sed -n '/<graphics type=.vnc./,/<\\/graphics>/p' | sed -e 's#<graphics #<graphics passwd=\"%[2]s\" #' -e 's#passwd=\"[^\"]*\" passwd=#passwd=#' > /tmp/%[1]s-gfx.xml && virsh -c qemu:///system update-device %[1]s /tmp/%[1]s-gfx.xml --live",
 			shellQuote(vm), pw))

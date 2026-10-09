@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -842,6 +843,18 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 	// storedErr: the stored compose cannot be read, so neither the VMs it
 	// names nor which of the stack's networks are external are known. VMs
 	// in the store are still deleted; networks are left (see below).
+	//
+	// A name in the file is not a member: a VM is the stack's only if its row
+	// records this stack (stack_name, stamped when the stack created it). A
+	// failed compose up leaves the file naming members it never made, and a
+	// VM created later under such a name — by the UI, by hand, by another
+	// stack — is someone else's (lab-recheck-5, 11:28:45: compose down
+	// deleted a UI-created VM and its disk this way). Such a VM is kept, and
+	// the progress says so. Only a name with no row here (one not replicated
+	// yet) is passed on, and the peer that has it confirms the stack before
+	// it deletes (fanoutDeleteVM).
+	var notMembers []corrosion.VMRecord
+	var unknown []string
 	stored, storedErr := s.storedStackFile(ctx, req.Name)
 	if stored != nil {
 		for baseName, vmDef := range stored.VMs {
@@ -853,8 +866,18 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 			}
 			for r := 0; r < vmDef.EffectiveReplicas(); r++ {
 				instName := vmDef.InstanceName(baseName, r)
-				if !vmNames[instName] {
-					vmNames[instName] = true
+				if vmNames[instName] {
+					continue
+				}
+				vmNames[instName] = true
+				row, gErr := corrosion.GetVM(ctx, s.db, instName)
+				switch {
+				case gErr != nil:
+					unknown = append(unknown, instName)
+				case row != nil:
+					// Listed above when it named this stack; so not.
+					notMembers = append(notMembers, *row)
+				default:
 					vms = append(vms, corrosion.VMRecord{
 						Name:      instName,
 						StackName: req.Name,
@@ -880,6 +903,39 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 	// for the audit row.
 	hadFailures := false
 	var notRemoved []string
+	for _, vm := range notMembers {
+		owner := "no stack"
+		if vm.StackName != "" {
+			owner = "stack " + strconv.Quote(vm.StackName)
+		}
+		slog.Warn("stack delete: a VM named in the stack's compose file was not created by the stack — left alone",
+			"stack", req.Name, "vm", vm.Name, "vm_stack", vm.StackName)
+		if err := stream.Send(&pb.DeleteProgress{
+			VmName: vm.Name,
+			Status: "kept",
+			Error:  fmt.Sprintf("not created by stack %q (it belongs to %s); left alone", req.Name, owner),
+		}); err != nil {
+			return err
+		}
+	}
+	for _, name := range unknown {
+		// Cannot tell whose it is: not deleted, and the stack stays
+		// "deleting" so the reconciler (which acts on recorded members
+		// only) finishes it.
+		hadFailures = true
+		notRemoved = append(notRemoved, name)
+		if err := stream.Send(&pb.DeleteProgress{
+			VmName: name,
+			Status: "error",
+			Error:  "cannot read its record to tell whether the stack created it; not deleted",
+		}); err != nil {
+			return err
+		}
+	}
+	// VMs kept at delete time: another incarnation of a member, or a peer's
+	// VM of a member's name. Such a VM may record this very stack, so the
+	// networks it uses are judged with it by name (stackNetworkUsers).
+	var keptAtDelete []string
 	for _, vm := range vms {
 		if err := stream.Send(&pb.DeleteProgress{
 			VmName: vm.Name,
@@ -888,7 +944,17 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 			return err
 		}
 
-		delErr := s.deleteVMWithFanout(ctx, vm.Name, req.KeepDisks)
+		if h := s.stackMemberDeleteHook; h != nil {
+			h(vm.Name)
+		}
+		delErr := s.deleteVMWithFanout(ctx, stackMember{Name: vm.Name, Stack: req.Name, CreatedAt: vm.CreatedAt}, req.KeepDisks)
+		if errors.Is(delErr, errNotStackMember) {
+			keptAtDelete = append(keptAtDelete, vm.Name)
+			if err := stream.Send(&pb.DeleteProgress{VmName: vm.Name, Status: "kept", Error: delErr.Error()}); err != nil {
+				return err
+			}
+			continue
+		}
 		if delErr != nil {
 			hadFailures = true
 			notRemoved = append(notRemoved, vm.Name)
@@ -1003,6 +1069,28 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 			continue
 		}
 		if networkBelongsToStack(nr, req.Name, knownStacks) && !externalNets[nr.Name] {
+			// A workload the stack did not create (a kept VM) on this
+			// network keeps it: removing it would pull the network out from
+			// under that workload. Said, and not a failure. Unknown keeps it
+			// too, and that is a failure the reconciler retries.
+			if users, uErr := s.stackNetworkUsers(ctx, nr.Name, req.Name, keptAtDelete); uErr != nil || len(users) > 0 {
+				if uErr != nil {
+					hadFailures = true
+					notRemoved = append(notRemoved, "network "+nr.Name)
+					if sendErr := stream.Send(&pb.DeleteProgress{VmName: "network " + nr.Name, Status: "error",
+						Error: "cannot tell whether a workload the stack did not create uses it: " + uErr.Error()}); sendErr != nil {
+						return sendErr
+					}
+					continue
+				}
+				slog.Warn("stack delete: keeping a stack network that workloads the stack did not create use",
+					"stack", req.Name, "network", nr.Name, "users", users)
+				if sendErr := stream.Send(&pb.DeleteProgress{VmName: "network " + nr.Name, Status: "kept",
+					Error: "used by " + strings.Join(users, ", ") + ", which the stack did not create; left in place"}); sendErr != nil {
+					return sendErr
+				}
+				continue
+			}
 			// Tear down the static subnet route injected on deploy (injectSubnetRoutes),
 			// which network.Deprovision otherwise leaves behind → CIDR reuse can misroute.
 			// RemoveSubnetRoute is idempotent (deletes only a route whose `via` matches),
@@ -1079,7 +1167,11 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 // local Corrosion (replication lag from remote host), it fans out to all peer
 // hosts until one successfully deletes it. Transient errors (Unavailable, EOF)
 // are retried with backoff since remote daemons may be temporarily unresponsive.
-func (s *Server) deleteVMWithFanout(ctx context.Context, vmName string, keepDisks bool) error {
+//
+// stackName is the stack the VM must belong to: a peer's VM of that name is
+// deleted only when its record names that stack.
+func (s *Server) deleteVMWithFanout(ctx context.Context, m stackMember, keepDisks bool) error {
+	vmName, stackName := m.Name, m.Stack
 	const maxRetries = 3
 	var err error
 
@@ -1094,17 +1186,30 @@ func (s *Server) deleteVMWithFanout(ctx context.Context, vmName string, keepDisk
 			}
 		}
 
-		_, err = s.DeleteVM(ctx, &pb.DeleteVMRequest{Name: vmName, KeepDisks: keepDisks})
+		// Judged at each attempt, right before the delete: a row of this
+		// name that names another stack (or none) is not this stack's VM.
+		if row, gErr := corrosion.GetVM(ctx, s.db, vmName); gErr == nil && row != nil && row.StackName != stackName {
+			slog.Warn("stack delete: a VM of a stack member's name was not created by the stack — left alone",
+				"stack", stackName, "vm", vmName, "vm_stack", row.StackName)
+			return fmt.Errorf("%w: VM %q names stack %q", errNotStackMember, vmName, row.StackName)
+		}
+		_, err = s.DeleteVM(ctx, &pb.DeleteVMRequest{Name: vmName, KeepDisks: keepDisks,
+			ExpectedStack: stackName, ExpectedCreatedAt: m.CreatedAt})
 		if err == nil {
 			return nil
+		}
+		if isDeleteBindingMismatch(err) {
+			return fmt.Errorf("%w: %s", errNotStackMember, status.Convert(err).Message())
 		}
 
 		code := status.Code(err)
 
 		// NotFound — fan out to peers (replication lag).
 		if code == codes.NotFound {
-			if peerErr := s.fanoutDeleteVM(ctx, vmName, keepDisks); peerErr == nil {
+			if peerErr := s.fanoutDeleteVM(ctx, vmName, stackName, keepDisks); peerErr == nil {
 				return nil
+			} else if errors.Is(peerErr, errNotStackMember) {
+				return peerErr
 			}
 			return err
 		}
@@ -1112,8 +1217,10 @@ func (s *Server) deleteVMWithFanout(ctx context.Context, vmName string, keepDisk
 		// Unavailable means the peer host is unreachable — retrying
 		// locally won't fix that. Try fanout to other peers instead.
 		if code == codes.Unavailable {
-			if peerErr := s.fanoutDeleteVM(ctx, vmName, keepDisks); peerErr == nil {
+			if peerErr := s.fanoutDeleteVM(ctx, vmName, stackName, keepDisks); peerErr == nil {
 				return nil
+			} else if errors.Is(peerErr, errNotStackMember) {
+				return peerErr
 			}
 			return err
 		}
@@ -1131,8 +1238,78 @@ func (s *Server) deleteVMWithFanout(ctx context.Context, vmName string, keepDisk
 	return err
 }
 
-// fanoutDeleteVM tries to delete a VM on all peer hosts (for replication-lag cases).
-func (s *Server) fanoutDeleteVM(ctx context.Context, vmName string, keepDisks bool) error {
+// stackMember is a stack's VM as the teardown saw it: its name, the stack
+// its row records, and its incarnation (the row's created_at; "" for a name
+// the stored file lists that has no row here yet).
+type stackMember struct {
+	Name, Stack, CreatedAt string
+}
+
+// isDeleteBindingMismatch reports a DeleteVM refused because the VM is not
+// the one the delete was bound to (DeleteVMRequest.expected_*).
+func isDeleteBindingMismatch(err error) bool {
+	return status.Code(err) == codes.FailedPrecondition && strings.Contains(status.Convert(err).Message(), deleteBindingMismatch)
+}
+
+// deleteBindingMismatch marks DeleteVM's refusal of a bound delete.
+const deleteBindingMismatch = "is not the VM this delete is bound to"
+
+// checkDeleteBinding refuses a delete bound (expected_stack /
+// expected_created_at) to a VM other than vm, the caller's row read under
+// the VM's lock.
+func checkDeleteBinding(req *pb.DeleteVMRequest, vm *corrosion.VMRecord) error {
+	if want := req.GetExpectedStack(); want != "" && vm.StackName != want {
+		slog.Warn("delete refused: the VM was not created by the stack the delete is bound to — left alone",
+			"vm", vm.Name, "bound_stack", want, "vm_stack", vm.StackName)
+		return status.Errorf(codes.FailedPrecondition, "VM %q %s: it records stack %q, not %q; left alone",
+			vm.Name, deleteBindingMismatch, vm.StackName, want)
+	}
+	if want := req.GetExpectedCreatedAt(); want != "" && vm.CreatedAt != want {
+		slog.Warn("delete refused: the VM is another incarnation than the delete is bound to — left alone",
+			"vm", vm.Name, "bound_created_at", want, "vm_created_at", vm.CreatedAt)
+		return status.Errorf(codes.FailedPrecondition, "VM %q %s: it was created at %s, not %s; left alone",
+			vm.Name, deleteBindingMismatch, vm.CreatedAt, want)
+	}
+	return nil
+}
+
+// stackNetworkUsers names the workloads that keep a stack's network at
+// teardown: those the stack did not create (corrosion.ForeignWorkloadsOnNetwork)
+// and, by name, the VMs the teardown kept (kept), which may record this stack.
+func (s *Server) stackNetworkUsers(ctx context.Context, network, stack string, kept []string) ([]string, error) {
+	users, err := corrosion.ForeignWorkloadsOnNetwork(ctx, s.db, network, stack)
+	if err != nil || len(kept) == 0 {
+		return users, err
+	}
+	onNet, err := corrosion.VMNamesOnNetwork(ctx, s.db, network)
+	if err != nil {
+		return nil, err
+	}
+	have := map[string]bool{}
+	for _, u := range users {
+		have[u] = true
+	}
+	keep := map[string]bool{}
+	for _, k := range kept {
+		keep[k] = true
+	}
+	for _, v := range onNet {
+		if keep[v] && !have[v] {
+			users = append(users, v)
+			have[v] = true
+		}
+	}
+	return users, nil
+}
+
+// errNotStackMember: a VM of a stack member's name that the stack did not
+// create. The stack leaves it alone.
+var errNotStackMember = errors.New("not created by this stack; left alone")
+
+// fanoutDeleteVM tries to delete a VM on all peer hosts (for replication-lag
+// cases). A peer's VM of that name is deleted only when the peer's record of
+// it names stackName: the name alone is not the stack's VM.
+func (s *Server) fanoutDeleteVM(ctx context.Context, vmName, stackName string, keepDisks bool) error {
 	slog.Info("VM not in local DB, fanning out delete to peers", "vm", vmName)
 	hosts, listErr := corrosion.ListHosts(ctx, s.db)
 	if listErr != nil {
@@ -1147,11 +1324,35 @@ func (s *Server) fanoutDeleteVM(ctx context.Context, vmName string, keepDisks bo
 		if peerErr != nil {
 			continue
 		}
-		_, peerErr = client.DeleteVM(ctx, &pb.DeleteVMRequest{Name: vmName, KeepDisks: keepDisks})
+		peerVM, peerErr := client.InspectVM(ctx, &pb.InspectVMRequest{Name: vmName})
+		if peerErr == nil && peerVM.GetStackName() != stackName {
+			conn.Close()
+			slog.Warn("stack delete: a peer's VM of a stack member's name was not created by the stack — left alone",
+				"stack", stackName, "vm", vmName, "host", h.Name, "vm_stack", peerVM.GetStackName())
+			return fmt.Errorf("%w: VM %q on %s names stack %q", errNotStackMember, vmName, h.Name, peerVM.GetStackName())
+		}
+		if peerErr != nil {
+			conn.Close()
+			// A peer without the row answers a project-scoped caller with
+			// PermissionDenied, not NotFound: either way it is not the
+			// holder, so the search goes on. The holder's bound delete is
+			// the authority.
+			if c := status.Code(peerErr); c == codes.NotFound || c == codes.PermissionDenied {
+				continue
+			}
+			return peerErr
+		}
+		// Bound to the stack: the peer, and the owner it forwards to, check
+		// their own row under the VM's lock — the inspect above is advisory
+		// (and is all an older peer would honour).
+		_, peerErr = client.DeleteVM(ctx, &pb.DeleteVMRequest{Name: vmName, KeepDisks: keepDisks, ExpectedStack: stackName})
 		conn.Close()
 		if peerErr == nil {
 			slog.Info("VM deleted via peer", "vm", vmName, "host", h.Name)
 			return nil
+		}
+		if isDeleteBindingMismatch(peerErr) {
+			return fmt.Errorf("%w: %s", errNotStackMember, status.Convert(peerErr).Message())
 		}
 		if status.Code(peerErr) != codes.NotFound {
 			return peerErr // real error on the peer

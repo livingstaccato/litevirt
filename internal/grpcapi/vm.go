@@ -2008,6 +2008,12 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		s.audit(ctx, "vm.delete", req.Name, "permission denied", "denied")
 		return nil, err
 	}
+	// A bound delete (a stack teardown) deletes only the VM it was bound
+	// to. Checked on every host the delete reaches, against that host's row
+	// under the lock, before anything is forwarded or torn down.
+	if err := checkDeleteBinding(req, vm); err != nil {
+		return nil, err
+	}
 
 	// localOnly: this is a peer-search probe from another node's DeleteVM. Such a
 	// probe must NOT proxy back to the recorded host or re-fan-out to peers —
@@ -2231,6 +2237,14 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// that names it, and freeing the disks would leave that domain pointing at
 	// files that no longer exist. Returning keeps the delete retryable — the only
 	// destructive step so far is the stop above.
+	// The VM's snapshot overlays, listed while its domain still says what
+	// each disk is and the chain can still be read: the debris sweep matches
+	// .qcow2 names only, and the middle layers of a chain
+	// (<vm>-<disk>.<snapshot>) leaked (snapshot-lab.md).
+	var layers []string
+	if !req.KeepDisks {
+		layers = s.ownDiskLayers(ctx, req.Name)
+	}
 	var undefErr error
 	defer func() {
 		// The host's record of the ISO file it judged for this VM goes with
@@ -2260,6 +2274,8 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	if !req.KeepDisks {
 		s.deleteRecordedVMDiskVolumes(ctx, req.Name)
 		s.sweepVMDiskDebris(ctx, req.Name)
+		s.removeOwnDiskLayers(ctx, req.Name, layers)
+		s.removeVMSnapshotRAMImages(ctx, req.Name)
 		// Remove cloud-init ISO
 		os.Remove(lv.CloudInitISOPath(s.dataDir, req.Name))
 		// Firmware state (G1): wipe nvram (name-keyed) + swtpm (uuid-keyed). With

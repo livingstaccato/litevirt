@@ -323,6 +323,10 @@ type Server struct {
 	enfProjectAuthority bool
 	// commitFenceHook is a test-only seam; see SetCommitFenceHook.
 	commitFenceHook func(op string)
+	// stackMemberDeleteHook is a test-only seam: DeleteStack calls it with
+	// each member's name right before deleting it, where a test re-creates
+	// the VM as another incarnation.
+	stackMemberDeleteHook func(name string)
 	// restoreClaimedHook is a test-only seam; see SetRestoreClaimedHook.
 	restoreClaimedHook func(name string)
 	// restoreTargetResolvedHook is a test-only seam run after RestoreFromBackup
@@ -634,6 +638,11 @@ type Server struct {
 	// migration copies (hostDiskFile, SetHostDiskRootForTest). Empty in
 	// production.
 	hostDiskRoot string
+	// startedAt is when this daemon's Server was made. A start lease this
+	// host holds that was taken before it was left by a run that is gone
+	// (holdStartLease). Zero in tests that build a Server directly: every
+	// lease of this host then counts as live.
+	startedAt time.Time
 	// markerSweepMu guards the host state DeletedVMMarkerSweepTick last saw
 	// (markerSweepLastState, valid once markerSweepSeen).
 	markerSweepMu        sync.Mutex
@@ -1899,6 +1908,7 @@ type StoragePoolRef struct {
 // NewServer creates a new gRPC service handler.
 func NewServer(hostName, dataDir, pkiDir string, db *corrosion.Client, virt LibvirtBackend, images *image.Store) *Server {
 	s := &Server{
+		startedAt:      time.Now(),
 		hostName:       hostName,
 		dataDir:        dataDir,
 		pkiDir:         pkiDir,

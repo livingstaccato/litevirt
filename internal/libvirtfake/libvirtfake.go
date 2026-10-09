@@ -196,8 +196,20 @@ type Fake struct {
 	// FailCreateLiveSnapshot fires AFTER the disk overlay has cut over, modeling a
 	// RAM-save/capture failure that leaves the VM on an overlay.
 	FailCreateLiveSnapshot func(domain, snap string) error
-	FailDomainState        func(name string) error
-	FailDomainStateReason  func(name string) error
+	// OnRevertSnapshot runs inside RevertToSnapshot and RevertToLiveSnapshot,
+	// while the revert holds the domain down, as libvirt's revert does.
+	OnRevertSnapshot func(domain, snap string)
+	// FailDomainDiskSources, when set, runs at the start of
+	// DomainDiskSources and its error is returned.
+	FailDomainDiskSources func(domain string) error
+	// RevertNotCurrent makes a revert succeed but report that libvirt would
+	// not take the snapshot back as current (libvirt.RestoredNotCurrentError).
+	RevertNotCurrent bool
+	// snapshotFiles is, per domain and snapshot, the files the snapshot's
+	// overlay cutover named: each disk's overlay and the disk it was taken of.
+	snapshotFiles         map[string]map[string][]string
+	FailDomainState       func(name string) error
+	FailDomainStateReason func(name string) error
 	// FailHasManagedSaveImage makes HasManagedSaveImage unreadable, for the
 	// fail-closed paths that must not treat "cannot tell" as "no saved RAM".
 	FailHasManagedSaveImage func(name string) error
@@ -1392,9 +1404,18 @@ func (f *Fake) RevertToSnapshot(domainName, snapshotName string, restorePreDefin
 		return fmt.Errorf("libvirtfake: no snapshot %q for %q", snapshotName, domainName)
 	}
 	f.record("revert", domainName, snapshotName)
+	hook, notCurrent := f.OnRevertSnapshot, f.RevertNotCurrent
 	f.mu.Unlock()
+	if hook != nil {
+		hook(domainName, snapshotName)
+	}
 	if restorePreDefine != nil {
-		return restorePreDefine()
+		if err := restorePreDefine(); err != nil {
+			return err
+		}
+	}
+	if notCurrent {
+		return &libvirt.RestoredNotCurrentError{Snapshot: snapshotName, Registered: true, Err: errors.New("libvirtfake: CURRENT refused")}
 	}
 	return nil
 }
@@ -1402,6 +1423,7 @@ func (f *Fake) DeleteSnapshot(domainName, snapshotName string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	delete(f.snapshots[domainName], snapshotName)
+	delete(f.snapshotFiles[domainName], snapshotName)
 	f.record("snapshot-delete", domainName, snapshotName)
 	return nil
 }
@@ -1412,6 +1434,7 @@ func (f *Fake) FlattenSnapshot(domainName, snapshotName string) error {
 		return fmt.Errorf("libvirtfake: no snapshot %q for %q", snapshotName, domainName)
 	}
 	delete(f.snapshots[domainName], snapshotName)
+	delete(f.snapshotFiles[domainName], snapshotName)
 	f.record("snapshot-flatten", domainName, snapshotName)
 	return nil
 }
@@ -1453,6 +1476,11 @@ func (f *Fake) SetDiskSource(domain, dev, src string) {
 func (f *Fake) DomainDiskSources(domain string) (map[string]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if fail := f.FailDomainDiskSources; fail != nil {
+		if err := fail(domain); err != nil {
+			return nil, err
+		}
+	}
 	out := map[string]string{}
 	for k, v := range f.diskSources[domain] {
 		out[k] = v
@@ -1469,9 +1497,51 @@ func (f *Fake) cutoverDisks(domain, snapname string) {
 	if f.diskSources[domain] == nil {
 		f.diskSources[domain] = map[string]string{"vda": "/var/lib/litevirt/disks/" + domain + "-root.qcow2"}
 	}
-	for dev, src := range f.diskSources[domain] {
-		f.diskSources[domain][dev] = strings.TrimSuffix(src, filepath.Ext(src)) + "." + snapname
+	if f.snapshotFiles == nil {
+		f.snapshotFiles = map[string]map[string][]string{}
 	}
+	if f.snapshotFiles[domain] == nil {
+		f.snapshotFiles[domain] = map[string][]string{}
+	}
+	var files []string
+	for dev, src := range f.diskSources[domain] {
+		ov := strings.TrimSuffix(src, filepath.Ext(src)) + "." + snapname
+		f.diskSources[domain][dev] = ov
+		files = append(files, ov, src)
+	}
+	sort.Strings(files)
+	f.snapshotFiles[domain][snapname] = files
+}
+
+// SetFailDomainDiskSources sets FailDomainDiskSources under the fake's lock,
+// for a test that changes it while the server may be reading it.
+func (f *Fake) SetFailDomainDiskSources(fn func(domain string) error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.FailDomainDiskSources = fn
+}
+
+// DomainDiskFormats returns the disks of the domain's definition as source
+// file → driver type; a domain the fake has no definition of is not found.
+func (f *Fake) DomainDiskFormats(domainName string) (map[string]string, error) {
+	f.mu.Lock()
+	x := f.liveXMLLocked(domainName)
+	f.mu.Unlock()
+	if x == "" {
+		return nil, fmt.Errorf("libvirtfake: domain %q not found", domainName)
+	}
+	return libvirt.DiskFormatsFromXML(x), nil
+}
+
+// SnapshotDiskFiles returns the overlay and base of each disk the snapshot
+// cut over, as recorded at its creation.
+func (f *Fake) SnapshotDiskFiles(domainName, snapshotName string) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.snapshots[domainName][snapshotName]; !ok {
+		return nil, fmt.Errorf("libvirtfake: no domain snapshot with matching name %q for %q", snapshotName, domainName)
+	}
+	return append([]string(nil), f.snapshotFiles[domainName][snapshotName]...), nil
 }
 
 // SetSavedImageXML sets the definition a memory snapshot's saved image at
@@ -1495,7 +1565,11 @@ func (f *Fake) RevertToLiveSnapshot(domainName, snapshotName, vmstatePath string
 	if !ok {
 		saved = f.xml[domainName]
 	}
+	hook := f.OnRevertSnapshot
 	f.mu.Unlock()
+	if hook != nil {
+		hook(domainName, snapshotName)
+	}
 	restoreXML := ""
 	if rewriteSaved != nil {
 		rewritten, err := rewriteSaved(saved)
@@ -1516,6 +1590,9 @@ func (f *Fake) RevertToLiveSnapshot(domainName, snapshotName, vmstatePath string
 	f.record("revert-live", domainName, snapshotName+" dxml="+restoreXML)
 	if saved != "" {
 		f.xml[domainName] = saved
+	}
+	if f.RevertNotCurrent {
+		return &libvirt.RestoredNotCurrentError{Snapshot: snapshotName, Registered: true, Err: errors.New("libvirtfake: CURRENT refused")}
 	}
 	return nil
 }

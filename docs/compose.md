@@ -134,6 +134,15 @@ state, and the next `compose up` plans against the live VMs, so it retries
 exactly the actions that failed and the stack returns to `active` once they
 all succeed.
 
+`compose down` deletes only the VMs the stack created: a VM is the stack's when
+its record names the stack, as the stack's `compose up` records it. A VM that
+merely has a member's name — created on its own (by the UI, by hand or by another
+stack) after a failed `compose up` left that name in the stored file — is left
+alone, logged at WARN, and reported as `kept <name>: ...`, naming the stack it
+belongs to. Such a VM is not counted as a deletion. A stack network that such a VM (or a
+container the stack did not create) is attached to is kept too, reported as
+`kept network <name>: used by ...`, so it is not pulled out from under it.
+
 `compose down` follows the same rule. It ends with `Stack "<name>" torn down.`
 and exit status 0 only when every VM and container was deleted and every stack
 network deprovisioned. If any could not be — or the stack's containers could
@@ -157,7 +166,7 @@ page.
 vms:
   <name>:
     image: "ubuntu"           # Base image name (required unless iso is set)
-    iso: "debian-12-netinst"  # Image-store name used as the boot image instead of image; not a host path (no CD-ROM is attached)
+    iso: "isos/debian-12.iso" # Installer ISO, attached as a CD-ROM and booted first: <pool>/<file>.iso, or (Admin) a host path — judged as any create's ISO (storage.md, "Installer ISOs"). A bare name with no '/' keeps its older meaning: an image-store name used as the boot image instead of image
     kind: "vm"                # vm (default) | lxc | oci — see "Workloads" below
     cpu: 2                    # vCPUs (default 2)
     max-cpu: 8                # vCPU hotplug ceiling (> cpu); with live_resize, cpu grows live up to it

@@ -227,11 +227,10 @@ There are exceptions, of two different kinds, and neither is "the one":
   but it is gated differently: each node's startup hardware audit plus a latched
   `operation_protocol_v1` decide whether it is advertised at all.
 
-Some mandatory tokens are additionally `capabilities.ReplicationGated`
-(`lease_term_ledger_v1`, `credentials_split_v1`, `host_membership_split_v1`,
-`failover_scope_v1`, `voter_config_v1`, plus the flag-gated `recovery_claim_v1`,
-the one member that is not mandatory; the set is
-`capabilities.replicationGated`): the latch is a claim about what every host
+Some tokens are additionally `capabilities.ReplicationGated` — mostly
+mandatory ones, though a flag-gated token can be a member too. The set is
+declared in one place, `capabilities.replicationGated` (read it; a prose copy
+of it has gone stale): the latch is a claim about what every host
 still receiving replication can *decode* or *read*, so it is confirmed against
 admitted memberlist membership — not merely against voting-eligible members. A
 host parked in `maintenance` on an older build therefore holds that latch off,

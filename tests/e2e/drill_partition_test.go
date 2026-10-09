@@ -58,7 +58,12 @@ var (
 //   - after the heal, Layer 3 stops each superseded minority copy and keeps its
 //     disk (G5);
 //   - at no sample does any workload execute on two hosts, and no vm_dual_run
-//     is raised.
+//     is raised;
+//   - a VM stopped on the minority before the split is never started: no
+//     majority host defines it, `lv inspect` keeps it stopped on its host, and
+//     after the heal its disk there is the same file (inode, size) with no
+//     .superseded-* copy beside it (merge-lab 2026-10-08, where nine stopped
+//     VMs were started on blank disks elsewhere).
 func TestDrill1_SplitTwoThree(t *testing.T) {
 	l := newLab(t)
 	b := l.requireBaseline()
@@ -67,9 +72,13 @@ func TestDrill1_SplitTwoThree(t *testing.T) {
 	minority, majority := l.hosts[:2], l.hosts[2:]
 	q := majority[0] // the CLI side that keeps a quorum
 	test := l.createVMsWhereRoom(q, "d1", minority...)
+	stopped := l.createStoppedVM(q, "d1s", minority...)
 	keys := l.recoverableOn(q, minority...)
 	if len(keys) == 0 {
 		t.Fatalf("no recoverable workload on the minority %v, and no room there for a test VM", minority)
+	}
+	if contains(keys, "vm/"+stopped.name) {
+		t.Fatalf("the stopped VM %s is counted recoverable; keys %v", stopped.name, keys)
 	}
 	home := map[string]string{}
 	disks := map[string]vmInfo{}
@@ -153,6 +162,9 @@ func TestDrill1_SplitTwoThree(t *testing.T) {
 	if len(recoveredAt) == 0 {
 		t.FailNow()
 	}
+	// Every running workload has been recovered by now, so a stopped VM
+	// recovered with them would be defined on the majority already.
+	l.assertStoppedVMStayed(stopped, q, majority)
 
 	// ── 3. the replacement disk has the recorded size ───────────────────────
 	r := s.last()
@@ -209,6 +221,8 @@ func TestDrill1_SplitTwoThree(t *testing.T) {
 	time.Sleep(tPause + 10*time.Second)
 
 	// ── 5. exactly once, at every sample ────────────────────────────────────
+	l.assertStoppedVMStayed(stopped, q, majority)
+	l.assertStoppedVMDiskKept(stopped)
 	assertExactlyOnceNow(t, s, keys)
 	s.Stop()
 	assertNeverTwice(t, s.snapshot())
@@ -527,4 +541,89 @@ func parseInt64(s string) (int64, error) {
 	var n int64
 	_, err := fmt.Sscan(s, &n)
 	return n, err
+}
+
+// stoppedVM is a VM a drill stopped before its fault, with the identity of its
+// disk file on its host at that moment.
+type stoppedVM struct {
+	name, host, disk, stat string
+}
+
+// createStoppedVM creates one recoverable (restart-any) test VM on the first
+// of hosts with room for it, stops it with `lv stop`, waits until virsh shows
+// it shut off and litevirt records it stopped, and reads its root disk's
+// inode and size on that host.
+func (l *lab) createStoppedVM(via, prefix string, hosts ...string) stoppedVM {
+	l.t.Helper()
+	for _, h := range hosts {
+		made := l.createStack(via, prefix, true, h)
+		if len(made) == 0 {
+			continue
+		}
+		sv := stoppedVM{name: made[h], host: h}
+		l.mustLV(via, "stop", sv.name)
+		if !l.waitDomainState(h, sv.name, "shut off", 3*time.Minute) {
+			l.t.Fatalf("stopped test VM %s never shut off on %s (virsh)", sv.name, h)
+		}
+		deadline := time.Now().Add(time.Minute)
+		for {
+			v, err := l.inspectVM(via, sv.name)
+			if err == nil && v.State == "VM_STOPPED" && len(v.Disks) > 0 {
+				sv.disk = v.Disks[0].Path
+				break
+			}
+			if time.Now().After(deadline) {
+				l.t.Fatalf("litevirt never recorded %s stopped with a disk: %+v (%v)", sv.name, v, err)
+			}
+			time.Sleep(3 * time.Second)
+		}
+		sv.stat = strings.TrimSpace(l.mustSSH(h, 20*time.Second, "stat -c '%i %s' "+shellQuote(sv.disk)))
+		l.mark("workloads: stopped %s on %s, disk %s (inode size %s)", sv.name, h, sv.disk, sv.stat)
+		return sv
+	}
+	l.t.Fatalf("no room on %v for the stopped test VM", hosts)
+	return stoppedVM{}
+}
+
+// assertStoppedVMStayed checks that no host in others defines sv's domain
+// (virsh) and that litevirt still records it stopped on its own host.
+func (l *lab) assertStoppedVMStayed(sv stoppedVM, via string, others []string) {
+	l.t.Helper()
+	for _, h := range others {
+		out, err := l.ssh(h, 20*time.Second, "virsh -c qemu:///system list --all --name")
+		if err != nil {
+			l.t.Errorf("list domains on %s: %v", h, err)
+			continue
+		}
+		for _, d := range strings.Fields(out) {
+			if d == sv.name {
+				st, _ := l.ssh(h, 20*time.Second, "virsh -c qemu:///system domstate "+shellQuote(sv.name))
+				l.t.Errorf("the stopped VM %s is defined on %s (state %q): failover moved it", sv.name, h, strings.TrimSpace(st))
+			}
+		}
+	}
+	v, err := l.inspectVM(via, sv.name)
+	if err != nil {
+		l.t.Errorf("inspect the stopped VM %s: %v", sv.name, err)
+		return
+	}
+	if v.HostName != sv.host || v.State != "VM_STOPPED" {
+		l.t.Errorf("the stopped VM %s is recorded %s on %s; want VM_STOPPED on %s", sv.name, v.State, v.HostName, sv.host)
+	}
+}
+
+// assertStoppedVMDiskKept checks that sv's disk on its host is the same file
+// it was when the VM was stopped, and that no copy of it was set aside.
+func (l *lab) assertStoppedVMDiskKept(sv stoppedVM) {
+	l.t.Helper()
+	stat, err := l.ssh(sv.host, 20*time.Second, "stat -c '%i %s' "+shellQuote(sv.disk))
+	if err != nil {
+		l.t.Errorf("the stopped VM %s's disk %s on %s: %v", sv.name, sv.disk, sv.host, err)
+	} else if got := strings.TrimSpace(stat); got != sv.stat {
+		l.t.Errorf("the stopped VM %s's disk %s on %s is inode/size %s, was %s", sv.name, sv.disk, sv.host, got, sv.stat)
+	}
+	aside, _ := l.ssh(sv.host, 20*time.Second, "ls -1 "+shellQuote(sv.disk)+".superseded-* 2>/dev/null || true")
+	if strings.TrimSpace(aside) != "" {
+		l.t.Errorf("the stopped VM %s's disk was set aside on %s: %s", sv.name, sv.host, strings.TrimSpace(aside))
+	}
 }

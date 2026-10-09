@@ -403,9 +403,9 @@ func TestReplicateVolume_NativeBtrfsFailedSnapshotFallsBackToTheFileCopy(t *test
 // copy.
 func TestReplicateVolume_NativeBtrfsRefusedSourcePoolTakesTheFileCopy(t *testing.T) {
 	s, alice, _, _, _, subvols, log := btrfsVM(t)
-	// A pool inside the daemon's data directory (not disks/, pools/ or
-	// mounts/) is refused for writes.
-	refused := filepath.Join(s.dataDir, "state")
+	// A pool inside one of the daemon's own data-directory children
+	// (storage.DataDirOwned) is refused for writes.
+	refused := filepath.Join(s.dataDir, "replicate-scratch", "state")
 	sub := filepath.Join(refused, "vm1-root")
 	if err := os.MkdirAll(sub, 0o755); err != nil {
 		t.Fatal(err)

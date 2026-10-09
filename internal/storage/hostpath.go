@@ -168,6 +168,9 @@ var dataDirOwned = []string{
 	"vmstate",                // libvirt/xmlgen.go VMStatePath (saved memory state)
 	"snapfw",                 // libvirt/vtpmstate.go snapshot firmware bundles
 	"oci",                    // grpcapi/containers.go OCI image cache
+	"oci-owners",             // grpcapi/container_paths.go ociOwnersDir
+	"ct-idmap-ledger",        // grpcapi/container_security.go idmapLedgerFile (and its .tmp)
+	"recreate-failed",        // grpcapi/vm_recreate_replaces.go: specs of failed recreates
 	"containers",             // daemon.go: the LXC container root
 	"ct-snapshots",           // snapshot_container.go containerSnapshotDir
 	"ct-restore",             // backup_container.go container restore staging
@@ -197,11 +200,11 @@ var dataDirOwned = []string{
 // dataDirOwnedPrefixes are owned by name prefix, each judged within one path
 // component: state.db's WAL, SHM and journal (state.db-wal); one capability
 // latch per token (health/capability.go ActivationMarkerPrefix,
-// split_brain_activated.<token>); nowts.hwm.lock; and
+// split_brain_activated.<token>); nowts.hwm.lock; ct-idmap-ledger.tmp; and
 // every dot-name, which is how the daemon names its temp files there
 // (secretfile.Write's .<name>.tmp, storage_pool_confine.go's
 // .pool-uploads.json-*).
-var dataDirOwnedPrefixes = []string{"state.db-", "split_brain_activated.", "nowts.hwm.", "."}
+var dataDirOwnedPrefixes = []string{"state.db-", "split_brain_activated.", "nowts.hwm.", "ct-idmap-ledger.", "."}
 
 // DataDirOwned returns the exact names of dataDirOwned.
 func DataDirOwned() []string { return slices.Clone(dataDirOwned) }

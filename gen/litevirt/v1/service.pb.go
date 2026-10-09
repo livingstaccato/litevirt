@@ -13544,9 +13544,11 @@ type ContainerBackupRef struct {
 	UnavailableReason string                 `protobuf:"bytes,5,opt,name=unavailable_reason,json=unavailableReason,proto3" json:"unavailable_reason,omitempty"`
 	// status: "available" (a host holds this container's backup in the repo),
 	// "not_found" (every host answered and none holds one), "unknown" (some
-	// host could not be asked), or "foreign" (the repo holds backups of a
-	// same-named container in another project). Only "available" entries are
-	// shown to a caller without the admin role.
+	// host could not be asked), "foreign" (the repo holds backups of a
+	// same-named container in another project), or "other_lineage" (it holds
+	// backups of another container of this name in this project, which
+	// failover will not restore). Only "available" entries are shown to a
+	// caller without the admin role.
 	Status          string `protobuf:"bytes,6,opt,name=status,proto3" json:"status,omitempty"`
 	Location        string `protobuf:"bytes,7,opt,name=location,proto3" json:"location,omitempty"`                                      // host that holds the backup (status "available")
 	LatestTimestamp string `protobuf:"bytes,8,opt,name=latest_timestamp,json=latestTimestamp,proto3" json:"latest_timestamp,omitempty"` // newest backup of this container in the repo
@@ -13642,13 +13644,18 @@ func (x *ContainerBackupRef) GetLatestTimestamp() string {
 
 // ProbeContainerBackups is peer-only: InspectContainer asks each host whether
 // it can open each repo (resolving a logical name in its own config) and
-// whether the repo holds a backup of this container — same name and project,
-// read from the manifest's embedded spec.
+// whether the repo holds a backup of this container — same name, project and
+// lineage (owner_id), read from the manifest's embedded spec.
 type ProbeContainerBackupsRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	Project       string                 `protobuf:"bytes,2,opt,name=project,proto3" json:"project,omitempty"`
-	Repos         []string               `protobuf:"bytes,3,rep,name=repos,proto3" json:"repos,omitempty"`
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Name    string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	Project string                 `protobuf:"bytes,2,opt,name=project,proto3" json:"project,omitempty"`
+	Repos   []string               `protobuf:"bytes,3,rep,name=repos,proto3" json:"repos,omitempty"`
+	// owner_id is the container's lineage (its create spec's owner_id). A
+	// manifest of the same project but another lineage is not this
+	// container's: failover would not restore it. Empty (an older peer, or a
+	// container from before owner ids) matches by project, as before.
+	OwnerId       string `protobuf:"bytes,4,opt,name=owner_id,json=ownerId,proto3" json:"owner_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -13704,11 +13711,18 @@ func (x *ProbeContainerBackupsRequest) GetRepos() []string {
 	return nil
 }
 
+func (x *ProbeContainerBackupsRequest) GetOwnerId() string {
+	if x != nil {
+		return x.OwnerId
+	}
+	return ""
+}
+
 type ContainerBackupProbe struct {
 	state            protoimpl.MessageState `protogen:"open.v1"`
 	Repo             string                 `protobuf:"bytes,1,opt,name=repo,proto3" json:"repo,omitempty"`
 	Opened           bool                   `protobuf:"varint,2,opt,name=opened,proto3" json:"opened,omitempty"`
-	Attributed       bool                   `protobuf:"varint,3,opt,name=attributed,proto3" json:"attributed,omitempty"` // a manifest of this name and project
+	Attributed       bool                   `protobuf:"varint,3,opt,name=attributed,proto3" json:"attributed,omitempty"` // a manifest of this name, project and lineage
 	Foreign          bool                   `protobuf:"varint,4,opt,name=foreign,proto3" json:"foreign,omitempty"`       // manifests of this name, other projects only
 	LatestTimestamp  string                 `protobuf:"bytes,5,opt,name=latest_timestamp,json=latestTimestamp,proto3" json:"latest_timestamp,omitempty"`
 	Detail           string                 `protobuf:"bytes,6,opt,name=detail,proto3" json:"detail,omitempty"`                                                // why it could not be opened (admin-facing)
@@ -13716,7 +13730,11 @@ type ContainerBackupProbe struct {
 	// unreadable: the repo exists here but could not be read (permissions, a
 	// corrupt manifest of this name, the caller's deadline). Not evidence of
 	// absence: the entry stays "unknown".
-	Unreadable    bool `protobuf:"varint,8,opt,name=unreadable,proto3" json:"unreadable,omitempty"`
+	Unreadable bool `protobuf:"varint,8,opt,name=unreadable,proto3" json:"unreadable,omitempty"`
+	// other_lineage: manifests of this name and project, but of another
+	// container of the name (a deleted predecessor, or a copy restored beside
+	// it). Failover will not restore them, so they are not attributed.
+	OtherLineage  bool `protobuf:"varint,9,opt,name=other_lineage,json=otherLineage,proto3" json:"other_lineage,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -13803,6 +13821,13 @@ func (x *ContainerBackupProbe) GetLatestTotalBytes() int64 {
 func (x *ContainerBackupProbe) GetUnreadable() bool {
 	if x != nil {
 		return x.Unreadable
+	}
+	return false
+}
+
+func (x *ContainerBackupProbe) GetOtherLineage() bool {
+	if x != nil {
+		return x.OtherLineage
 	}
 	return false
 }
@@ -35553,11 +35578,12 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x12unavailable_reason\x18\x05 \x01(\tR\x11unavailableReason\x12\x16\n" +
 	"\x06status\x18\x06 \x01(\tR\x06status\x12\x1a\n" +
 	"\blocation\x18\a \x01(\tR\blocation\x12)\n" +
-	"\x10latest_timestamp\x18\b \x01(\tR\x0flatestTimestamp\"b\n" +
+	"\x10latest_timestamp\x18\b \x01(\tR\x0flatestTimestamp\"}\n" +
 	"\x1cProbeContainerBackupsRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x18\n" +
 	"\aproject\x18\x02 \x01(\tR\aproject\x12\x14\n" +
-	"\x05repos\x18\x03 \x03(\tR\x05repos\"\x8d\x02\n" +
+	"\x05repos\x18\x03 \x03(\tR\x05repos\x12\x19\n" +
+	"\bowner_id\x18\x04 \x01(\tR\aownerId\"\xb2\x02\n" +
 	"\x14ContainerBackupProbe\x12\x12\n" +
 	"\x04repo\x18\x01 \x01(\tR\x04repo\x12\x16\n" +
 	"\x06opened\x18\x02 \x01(\bR\x06opened\x12\x1e\n" +
@@ -35570,7 +35596,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x12latest_total_bytes\x18\a \x01(\x03R\x10latestTotalBytes\x12\x1e\n" +
 	"\n" +
 	"unreadable\x18\b \x01(\bR\n" +
-	"unreadable\"\\\n" +
+	"unreadable\x12#\n" +
+	"\rother_lineage\x18\t \x01(\bR\fotherLineage\"\\\n" +
 	"\x1dProbeContainerBackupsResponse\x12;\n" +
 	"\aresults\x18\x01 \x03(\v2!.litevirt.v1.ContainerBackupProbeR\aresults\"\x8d\x04\n" +
 	"\x0fContainerDetail\x124\n" +

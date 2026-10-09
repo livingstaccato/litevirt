@@ -179,6 +179,8 @@ func backupStatusText(b *pb.ContainerBackupRef) string {
 		st = "not found"
 	case "foreign":
 		st = "another project's"
+	case "other_lineage":
+		st = "another container's"
 	case "unknown":
 		st = "unknown"
 	default:

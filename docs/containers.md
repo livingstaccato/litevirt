@@ -150,13 +150,18 @@ cluster's view is shown and the host-local fields read unknown.
 Each backup entry is checked where it lives. A backup taken through another
 host's repository (a sink) or before a migration is not on the container's
 current host, so every host is asked whether it holds a backup of this
-container (same name and project) in that repository. The entry is then:
+container (same name, project and `owner_id`, the rule host-loss restore picks
+by; see [Owner records](#owner-records)) in that repository. The entry is then:
 
 - **available on `<host>`**: that host holds it;
 - **not found**: every host answered and none holds it (the repository was
   deleted, moved or unmounted everywhere);
 - **unknown**: no host holds it, but some host could not be asked, or could
   not read the repository;
+- **another container's**: the repository only holds backups of another
+  container of this name in this project — one deleted before this one was
+  created, or a copy restored beside it. Host-loss restore will not use them,
+  so they do not protect this container;
 - **another project's**: the repository only holds backups of a same-named
   container in another project.
 

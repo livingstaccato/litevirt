@@ -1403,9 +1403,11 @@ message ContainerBackupRef {
     string unavailable_reason = 5;
     // status: "available" (a host holds this container's backup in the repo),
     // "not_found" (every host answered and none holds one), "unknown" (some
-    // host could not be asked), or "foreign" (the repo holds backups of a
-    // same-named container in another project). Only "available" entries are
-    // shown to a caller without the admin role.
+    // host could not be asked), "foreign" (the repo holds backups of a
+    // same-named container in another project), or "other_lineage" (it holds
+    // backups of another container of this name in this project, which
+    // failover will not restore). Only "available" entries are shown to a
+    // caller without the admin role.
     string status             = 6;
     string location           = 7;  // host that holds the backup (status "available")
     string latest_timestamp   = 8;  // newest backup of this container in the repo
@@ -1413,17 +1415,22 @@ message ContainerBackupRef {
 
 // ProbeContainerBackups is peer-only: InspectContainer asks each host whether
 // it can open each repo (resolving a logical name in its own config) and
-// whether the repo holds a backup of this container — same name and project,
-// read from the manifest's embedded spec.
+// whether the repo holds a backup of this container — same name, project and
+// lineage (owner_id), read from the manifest's embedded spec.
 message ProbeContainerBackupsRequest {
     string name    = 1;
     string project = 2;
     repeated string repos = 3;
+    // owner_id is the container's lineage (its create spec's owner_id). A
+    // manifest of the same project but another lineage is not this
+    // container's: failover would not restore it. Empty (an older peer, or a
+    // container from before owner ids) matches by project, as before.
+    string owner_id = 4;
 }
 message ContainerBackupProbe {
     string repo             = 1;
     bool   opened           = 2;
-    bool   attributed       = 3;  // a manifest of this name and project
+    bool   attributed       = 3;  // a manifest of this name, project and lineage
     bool   foreign          = 4;  // manifests of this name, other projects only
     string latest_timestamp = 5;
     string detail           = 6;  // why it could not be opened (admin-facing)
@@ -1432,6 +1439,10 @@ message ContainerBackupProbe {
     // corrupt manifest of this name, the caller's deadline). Not evidence of
     // absence: the entry stays "unknown".
     bool   unreadable       = 8;
+    // other_lineage: manifests of this name and project, but of another
+    // container of the name (a deleted predecessor, or a copy restored beside
+    // it). Failover will not restore them, so they are not attributed.
+    bool   other_lineage    = 9;
 }
 message ProbeContainerBackupsResponse {
     repeated ContainerBackupProbe results = 1;

@@ -134,7 +134,7 @@ func TestProbeContainerBackups_HonoursDeadlineAndCapsConcurrency(t *testing.T) {
 	cctx, ccancel := context.WithCancel(context.Background())
 	ccancel()
 	for i := 0; i < 20; i++ {
-		if p := s.probeContainerBackupRepo(cctx, "ct1", "acme", repo); p.GetAttributed() || !p.GetUnreadable() {
+		if p := s.probeContainerBackupRepo(cctx, "ct1", "acme", "", repo); p.GetAttributed() || !p.GetUnreadable() {
 			t.Fatalf("probe with a cancelled context = %+v, want unreadable", p)
 		}
 	}

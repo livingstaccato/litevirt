@@ -26,6 +26,10 @@ const (
 	backupNotFound  = "not_found"
 	backupUnknown   = "unknown"
 	backupForeign   = "foreign"
+	// backupOtherLineage: the repo holds backups of another container of this
+	// name in this project (a deleted predecessor, or a copy restored beside
+	// it), which failover will not restore.
+	backupOtherLineage = "other_lineage"
 )
 
 // backupProbeTimeout bounds one host's answer: a peer's ProbeContainerBackups,
@@ -53,8 +57,9 @@ func (s *Server) backupProbeSlots() chan struct{} {
 
 // ProbeContainerBackups answers, for this host, whether each repo can be
 // opened here (a logical name resolved in this host's own config) and whether
-// it holds a backup of the named container in the named project. Peer-only:
-// it exists so InspectContainer can find a backup on whichever host holds it.
+// it holds a backup of the named container: its project and, when the request
+// names one, its lineage. Peer-only: it exists so InspectContainer can find a
+// backup on whichever host holds it.
 func (s *Server) ProbeContainerBackups(ctx context.Context, req *pb.ProbeContainerBackupsRequest) (*pb.ProbeContainerBackupsResponse, error) {
 	if err := s.requirePeerCert(ctx); err != nil {
 		return nil, err
@@ -64,18 +69,22 @@ func (s *Server) ProbeContainerBackups(ctx context.Context, req *pb.ProbeContain
 	}
 	resp := &pb.ProbeContainerBackupsResponse{}
 	for _, r := range req.Repos {
-		resp.Results = append(resp.Results, s.probeContainerBackupRepo(ctx, req.Name, req.Project, r))
+		resp.Results = append(resp.Results, s.probeContainerBackupRepo(ctx, req.Name, req.Project, req.OwnerId, r))
 	}
 	return resp, nil
 }
 
 // probeContainerBackupRepo opens repo on this host and reads the container
 // backup manifests of name (only that name's directory). A manifest is
-// attributed to the container when its embedded spec names the same project;
-// manifests of the name in other projects make the repo foreign as well. The
-// work is bounded: it waits for a probe slot only until ctx ends, stops the
-// walk when ctx ends, and reuses a recent read of the same repo and name.
-func (s *Server) probeContainerBackupRepo(ctx context.Context, name, project, repo string) *pb.ContainerBackupProbe {
+// attributed to the container by the rule failover restores by
+// (manifestOwnedBy): the same project, and the same lineage where both the
+// manifest and ownerID carry one. Manifests of the name in other projects make
+// the repo foreign as well; same-project manifests of another lineage are
+// reported as other_lineage. An empty ownerID (an older peer asking) matches
+// by project, as before. The work is bounded: it waits for a probe slot only
+// until ctx ends, stops the walk when ctx ends, and reuses a recent read of
+// the same repo and name.
+func (s *Server) probeContainerBackupRepo(ctx context.Context, name, project, ownerID, repo string) *pb.ContainerBackupProbe {
 	out := &pb.ContainerBackupProbe{Repo: repo}
 	path := ""
 	if p, ok := s.backupRepos[repo]; ok {
@@ -101,7 +110,10 @@ func (s *Server) probeContainerBackupRepo(ctx context.Context, name, project, re
 	}
 	out.Opened = true
 	want := tenancy.NormalizeProject(project)
-	for _, m := range ms {
+	owner := &corrosion.ContainerRecord{Name: name, Project: want,
+		CreateSpec: corrosion.EncodeCreateSpec(corrosion.ContainerCreateSpec{OwnerID: ownerID})}
+	for i := range ms {
+		m := &ms[i]
 		if m.ContainerSpecJSON == "" {
 			continue
 		}
@@ -109,8 +121,12 @@ func (s *Server) probeContainerBackupRepo(ctx context.Context, name, project, re
 		if json.Unmarshal([]byte(m.ContainerSpecJSON), &spec) != nil {
 			continue
 		}
-		if tenancy.NormalizeProject(spec.Project) != want {
-			out.Foreign = true
+		if !manifestOwnedBy(m, owner) {
+			if tenancy.NormalizeProject(spec.Project) != want {
+				out.Foreign = true
+			} else {
+				out.OtherLineage = true
+			}
 			continue
 		}
 		out.Attributed = true
@@ -118,7 +134,7 @@ func (s *Server) probeContainerBackupRepo(ctx context.Context, name, project, re
 			out.LatestTimestamp, out.LatestTotalBytes = m.Timestamp, m.TotalSize
 		}
 	}
-	if !out.Attributed && !out.Foreign {
+	if !out.Attributed && !out.Foreign && !out.OtherLineage {
 		out.Detail = fmt.Sprintf("repo %s on %s holds no backup of %s", path, s.hostName, name)
 	}
 	return out
@@ -166,20 +182,25 @@ func (s *Server) containerManifests(ctx context.Context, path, name string) ([]p
 // read time. The index has no host or project column, so an entry proves
 // nothing about whose backup it is or where it lives: this host is asked
 // first, then every other host. An entry is "available" where a host holds a
-// manifest of this container's name AND project; "foreign" when the only
-// manifests of the name belong to other projects; "not_found" when every host
-// answered and none holds one; "unknown" when some host could not be asked.
-// The entries themselves are never changed.
+// manifest of this container's name, project AND lineage (the rule failover
+// restores by); "other_lineage" when the only manifests of the name in this
+// project are another lineage's (a deleted predecessor's, or a copy restored
+// beside it); "foreign" when the only manifests of the name belong to other
+// projects; "not_found" when every host answered and none holds one;
+// "unknown" when some host could not be asked. The entries themselves are
+// never changed.
 func (s *Server) resolveContainerBackups(ctx context.Context, rec *corrosion.ContainerRecord, refs []*pb.ContainerBackupRef) {
 	if len(refs) == 0 {
 		return
 	}
 	project := tenancy.NormalizeProject(rec.Project)
+	ownerID := corrosion.DecodeCreateSpec(rec.CreateSpec).OwnerID
 	type agg struct {
-		foreign    bool
-		unanswered bool // some host could not say whether it holds it
-		reasons    []string
-		resolved   bool
+		foreign      bool
+		otherLineage bool
+		unanswered   bool // some host could not say whether it holds it
+		reasons      []string
+		resolved     bool
 	}
 	st := make(map[string]*agg, len(refs))
 	var pending []string
@@ -206,8 +227,9 @@ func (s *Server) resolveContainerBackups(ctx context.Context, rec *corrosion.Con
 			// never from the index row: (ct_name, repo) is shared by
 			// same-named containers, and the row holds whichever wrote last.
 			ref.TotalBytes, ref.UpdatedAt = p.LatestTotalBytes, p.LatestTimestamp
-		case p.Foreign:
-			a.foreign = true
+		case p.Foreign || p.OtherLineage:
+			a.foreign = a.foreign || p.Foreign
+			a.otherLineage = a.otherLineage || p.OtherLineage
 		case p.Unreadable:
 			a.unanswered = true
 			a.reasons = append(a.reasons, p.Detail)
@@ -225,7 +247,7 @@ func (s *Server) resolveContainerBackups(ctx context.Context, rec *corrosion.Con
 	// the deadline with the entries unknown, and the walk finishes (or not)
 	// in the background, holding only its probe slot.
 	if s.db != nil {
-		for _, p := range s.probeLocalBounded(ctx, rec.Name, project, pending) {
+		for _, p := range s.probeLocalBounded(ctx, rec.Name, project, ownerID, pending) {
 			apply(s.hostName, p)
 		}
 	}
@@ -251,7 +273,7 @@ func (s *Server) resolveContainerBackups(ctx context.Context, rec *corrosion.Con
 			wg.Add(1)
 			go func(host string) {
 				defer wg.Done()
-				res, perr := s.probePeerContainerBackups(ctx, host, rec.Name, project, left)
+				res, perr := s.probePeerContainerBackups(ctx, host, rec.Name, project, ownerID, left)
 				mu.Lock()
 				defer mu.Unlock()
 				if perr != nil {
@@ -276,6 +298,11 @@ func (s *Server) resolveContainerBackups(ctx context.Context, rec *corrosion.Con
 		}
 		ref.Available = false
 		switch {
+		case a.otherLineage:
+			// Same project, so ahead of foreign: it is the likelier
+			// mistake (an operator who recreated the name) to explain.
+			ref.Status = backupOtherLineage
+			ref.UnavailableReason = "the repo holds backups of another container of this name in this project (deleted, or a copy restored beside it), not this one; failover will not restore them"
 		case a.foreign:
 			ref.Status = backupForeign
 			ref.UnavailableReason = "the repo holds backups of a same-named container in another project, not this one"
@@ -289,7 +316,7 @@ func (s *Server) resolveContainerBackups(ctx context.Context, rec *corrosion.Con
 	}
 }
 
-func (s *Server) probePeerContainerBackups(ctx context.Context, host, name, project string, repos []string) ([]*pb.ContainerBackupProbe, error) {
+func (s *Server) probePeerContainerBackups(ctx context.Context, host, name, project, ownerID string, repos []string) ([]*pb.ContainerBackupProbe, error) {
 	pctx, cancel := context.WithTimeout(ctx, backupProbeTimeout)
 	defer cancel()
 	c, closeFn, err := s.dialPeer(pctx, host)
@@ -297,7 +324,8 @@ func (s *Server) probePeerContainerBackups(ctx context.Context, host, name, proj
 		return nil, err
 	}
 	defer closeFn()
-	resp, err := c.ProbeContainerBackups(pctx, &pb.ProbeContainerBackupsRequest{Name: name, Project: project, Repos: repos})
+	// A peer that predates owner_id ignores it and matches by project.
+	resp, err := c.ProbeContainerBackups(pctx, &pb.ProbeContainerBackupsRequest{Name: name, Project: project, OwnerId: ownerID, Repos: repos})
 	if err != nil {
 		return nil, err
 	}
@@ -344,13 +372,13 @@ func filterContainerBackups(d *pb.ContainerDetail, admin bool) *pb.ContainerDeta
 
 // probeLocalBounded probes repos on this host within backupProbeTimeout. A
 // repo not answered by then is reported unreadable (so it stays unknown).
-func (s *Server) probeLocalBounded(ctx context.Context, name, project string, repos []string) []*pb.ContainerBackupProbe {
+func (s *Server) probeLocalBounded(ctx context.Context, name, project, ownerID string, repos []string) []*pb.ContainerBackupProbe {
 	lctx, cancel := context.WithTimeout(ctx, backupProbeTimeout)
 	defer cancel()
 	results := make(chan *pb.ContainerBackupProbe, len(repos))
 	go func() {
 		for _, repo := range repos {
-			results <- s.probeContainerBackupRepo(lctx, name, project, repo)
+			results <- s.probeContainerBackupRepo(lctx, name, project, ownerID, repo)
 		}
 	}()
 	got := make(map[string]*pb.ContainerBackupProbe, len(repos))

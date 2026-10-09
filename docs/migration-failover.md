@@ -913,17 +913,32 @@ A stop is on purpose unless the VM's record says otherwise. `lv stop`
 records `operator-stop`, and a drain records its own stop. A stop that nobody
 asked for is recorded by the host that saw it: `guest-shutdown` (a clean
 poweroff from inside the guest, which is also what a host shutting down
-produces), `out-of-band-destroy`, or `stopped out-of-band`. A stopped VM with
-any other record, or none, counts as stopped on purpose.
+produces), `out-of-band-destroy`, or `stopped out-of-band` (also what `lv ls`
+records when it finds a VM shut off that the record says is running). These
+are written only while the record still says running, so a stop recorded by
+`lv stop` is never replaced by one of them. A stopped VM with any other
+record, or none, counts as stopped on purpose.
 
 What failover does with a stopped VM on a failed host:
 
 | The VM | Its disks | Failover |
 |---|---|---|
-| stopped on purpose | all on shared storage | moves it to a healthy host, still stopped; that host defines its domain, shut off, and `lv start` starts it there |
+| stopped on purpose | all on shared storage | moves it to a healthy host, still stopped; that host defines its domain, shut off, and `lv start` starts it there. Only when the VM has a failure policy or auto-promote enrolment, no Secure Boot / vTPM state and no ownership dispute, and, while `enforcement.shared_storage_fence` is on, the failed host has a proof-grade fence. Otherwise it is left on the failed host |
 | stopped on purpose | any host-local disk | leaves it on the failed host with its disks |
 | stopped without anyone asking | all on shared storage | recovers it like a running VM, on its real disks |
 | stopped without anyone asking | any host-local disk | leaves it on the failed host with its disks |
+
+With recovery claims on (the default), the move is claimed like a recovery,
+so two coordinators that both believe they lead agree on one destination.
+Without them, two coordinators can move it to two hosts; the VM's record ends
+naming one, that host defines it, and the other removes the definition it
+made. The move keeps its marker (`failover-rekey-stopped:<host>`) on the VM
+until it is started, and the host the record names defines the domain afresh
+from the VM's current spec, never reusing an older definition it finds.
+
+During a rolling upgrade, a VM moved this way onto a host still running the
+previous release cannot be started there until that host is upgraded: the
+older release does not define it. It stays stopped and safe meanwhile.
 
 A VM left on the failed host is exactly as it was when the host comes back:
 start it there with `lv start`. A stopped container is always left in place
@@ -948,8 +963,10 @@ metrics with error class `stopped`. A VM left in place is not counted as
 stranded, because failover would not move it.
 
 `lv host rm --dead` on a host that still holds a stopped workload lists it in
-the plan, with the choices for its data. Removing the host does not move it,
-and the removal is not refused. A stopped workload does not block the name
+the plan, with the choices for its data. Removing the host does not move a
+stopped VM with a host-local disk; one stopped on purpose on shared storage
+may still be moved, stopped, by the pass that recovers a removed host's
+workloads, and the plan says so. The removal is not refused. A stopped workload does not block the name
 either: if the machine is added again under its name (`lv host add`), the
 workload comes back with it. Another way to keep the data is to promote a
 replica onto a live host (`lv replication promote <vm>`). If the data is lost

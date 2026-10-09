@@ -10,6 +10,7 @@ import (
 
 	"github.com/litevirt/litevirt/internal/cli"
 	"github.com/litevirt/litevirt/internal/mcpserver"
+	"github.com/litevirt/litevirt/internal/obs"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc/grpclog"
 )
@@ -41,7 +42,7 @@ litevirt daemon. stdout is reserved for MCP JSON-RPC; diagnostics go to stderr.`
 			if os.Getenv("LV_MCP_ALLOW_WRITE") == "1" {
 				allowWrite = true
 			}
-			logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+			logger := newMCPLogger(os.Stderr)
 			slog.SetDefault(logger)
 			grpclog.SetLoggerV2(grpclog.NewLoggerV2(io.Discard, os.Stderr, os.Stderr))
 
@@ -63,4 +64,10 @@ litevirt daemon. stdout is reserved for MCP JSON-RPC; diagnostics go to stderr.`
 	cmd.Flags().IntVar(&maxListItems, "max-list-items", 100, "maximum list items returned by tools/resources")
 	cmd.Flags().StringVar(&toolPrefix, "tool-prefix", "litevirt_", "prefix for MCP tool names")
 	return cmd
+}
+
+// newMCPLogger is the MCP server's diagnostics logger: text on w, with the
+// same secret-key masking as every other entrypoint.
+func newMCPLogger(w io.Writer) *slog.Logger {
+	return slog.New(obs.NewRedactHandler(slog.NewTextHandler(w, &slog.HandlerOptions{Level: slog.LevelInfo})))
 }

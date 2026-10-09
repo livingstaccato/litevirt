@@ -2,6 +2,7 @@ package failover
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -25,8 +26,6 @@ func fenceStateLatched() FailoverGate {
 // fenceRecordState's latched branch — the ssh, watchdog, best-effort-ssh and
 // unknown-method successes go red.
 func TestFenceClassification_OneRule(t *testing.T) {
-	ctx := context.Background()
-	c := &Coordinator{Gate: fenceStateLatched()}
 	h := &corrosion.HostRecord{Name: "down"}
 	for _, method := range []string{"ipmi", "ssh", "watchdog", "best-effort-ssh", "manual", "test", ""} {
 		for _, success := range []bool{true, false} {
@@ -42,7 +41,7 @@ func TestFenceClassification_OneRule(t *testing.T) {
 			case success:
 				want = "offline"
 			}
-			if got := c.fenceRecordState(ctx, h, fr); got != want {
+			if got := fenceRecordState(h, fr, true); got != want {
 				t.Errorf("%s success=%v, fence_state_v1 latched: records %q, want %q", method, success, got, want)
 			}
 		}
@@ -249,7 +248,9 @@ func TestRecoverHosts_OfflineAfterAnUnverifiedFenceThatMovedWorkloadsStays(t *te
 }
 
 // The same host is put back in service when the coordinator that fenced it
-// moved nothing off it — the spurious-fence rule 'fenced' always had.
+// moved nothing off it — the spurious-fence rule 'fenced' always had. Like
+// 'fenced', and unlike main's 'offline', it does not wait out
+// recentFenceWindow: phase 2 runs with the fence seconds old.
 func TestRecoverHosts_OfflineAfterASpuriousUnverifiedFenceRecovers(t *testing.T) {
 	db := newTestDB(t)
 	ctx := context.Background()
@@ -299,5 +300,97 @@ func TestRecoverHosts_OfflineAfterAFailedFenceRecovers(t *testing.T) {
 
 	if h, _ := corrosion.GetHost(ctx, db, "flaky"); h == nil || h.State != "active" {
 		t.Errorf("an offline host whose fence failed should recover when healthy, got %+v", h)
+	}
+}
+
+// orderGate records, in order, every fence_state_v1 latch read, and the
+// fencer records when it ran: the two events a test needs to say whether
+// anything slow sits between a fence and its record.
+type orderGate struct {
+	fakeFailoverGate
+	events *[]string
+}
+
+func (g orderGate) Enforced(ctx context.Context, tok string) bool {
+	if tok == capabilities.FenceStateV1 {
+		*g.events = append(*g.events, "latch-read")
+		// Unlatched, Checker.Enforced runs a live Ping sweep here.
+		time.Sleep(50 * time.Millisecond)
+	}
+	return g.fakeFailoverGate.Enforced(ctx, tok)
+}
+
+// Nothing slow sits between a fence and the write that records it. Until
+// fence_state_v1 latches, Gate.Enforced runs a live Ping sweep (up to 4 s);
+// read after a successful SSH fence, it delayed the record — and a leader that
+// died or lost its lease in that gap lost the record of a fence that had
+// happened. The latch is read once, before the fence, and that answer serves
+// recoverFenced too.
+//
+// Mutation: read the latch in fenceRecordState again (after the fence) — a
+// latch read follows the fence and the test goes red.
+func TestFailover_TheLatchIsReadBeforeTheFenceNotBetweenItAndItsRecord(t *testing.T) {
+	db, ctx := seedDownHost(t, "ssh", nil)
+	var events []string
+	c := newTestCoordinator("coordinator", db)
+	c.Gate = orderGate{fakeFailoverGate: fakeFailoverGate{enforced: map[string]bool{}}, events: &events}
+	c.SetFencer(func(context.Context, fence.HostConfig) fence.Result {
+		events = append(events, "fence")
+		return fence.Result{Method: "ssh", Detail: "poweroff sent", Success: true}
+	})
+
+	c.run(ctx)
+
+	fenced := -1
+	for i, e := range events {
+		if e == "fence" {
+			fenced = i
+		}
+	}
+	if fenced < 0 {
+		t.Fatalf("fixture: the host was never fenced (events %v)", events)
+	}
+	for _, e := range events[fenced+1:] {
+		if e == "latch-read" {
+			t.Errorf("fence_state_v1 was read after the fence, between it and its record: %v", events)
+		}
+	}
+	if got := hostState(t, db, ctx); got != "fenced" {
+		t.Errorf("host state = %q; unlatched, an SSH fence records fenced", got)
+	}
+}
+
+// A live unverified fence writes the host's 'offline' state once, in the
+// entry that carries its row. recoverFenced used to write it again as an
+// entry of its own (it was handed the pre-fence host, still 'active'): a
+// second write that moves the host's HostFenceLife cutoff and can overwrite a
+// boot write that landed in between.
+//
+// Mutation: hand recoverFenced the pre-fence host again — a second entry
+// writes 'offline' alone.
+func TestFailover_AnUnverifiedFenceWritesItsStateOnce(t *testing.T) {
+	db, ctx := seedDownHost(t, "ssh", nil)
+	c := newTestCoordinator("coordinator", db)
+	c.Gate = fenceStateLatched()
+	c.SetFencer(fencerReturning("ssh", true))
+
+	c.run(ctx)
+
+	rows, err := db.Query(ctx, `SELECT stmts FROM mutation_log`)
+	if err != nil {
+		t.Fatalf("read mutation_log: %v", err)
+	}
+	alone := 0
+	for _, r := range rows {
+		st := r.String("stmts")
+		if !strings.Contains(st, "INTO fencing_log") && strings.Contains(st, "UPDATE hosts SET state") && strings.Contains(st, `"offline"`) {
+			alone++
+		}
+	}
+	if alone != 0 {
+		t.Errorf("%d entries write 'offline' apart from the fence row's entry, want 0", alone)
+	}
+	if got := hostState(t, db, ctx); got != "offline" {
+		t.Errorf("host state = %q, want offline", got)
 	}
 }

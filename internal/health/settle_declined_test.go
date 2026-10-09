@@ -14,6 +14,7 @@ import (
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
+	"github.com/litevirt/litevirt/internal/testkit/slogtest"
 )
 
 // captureSettleLogs routes slog through a buffer for the test and returns a
@@ -23,9 +24,7 @@ func captureSettleLogs(t *testing.T) func() []string {
 	t.Helper()
 	var mu sync.Mutex
 	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&lockedWriter{mu: &mu, w: &buf}, nil)))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	slogtest.Swap(t, slog.New(slog.NewTextHandler(&lockedWriter{mu: &mu, w: &buf}, nil)))
 	return func() []string {
 		mu.Lock()
 		defer mu.Unlock()

@@ -21,6 +21,7 @@ import (
 
 	"github.com/litevirt/litevirt/internal/hlc"
 	"github.com/litevirt/litevirt/internal/pki"
+	"github.com/litevirt/litevirt/internal/testkit/slogtest"
 )
 
 var allGossipModes = []GossipEncryption{
@@ -649,9 +650,7 @@ func TestWatchGossipKeyFile_OffReportsOffAndLoadsNothing(t *testing.T) {
 // count climbs with every tick and this goes red.
 func TestWatchGossipKeyFile_ReorderedSecondariesSettle(t *testing.T) {
 	buf := &syncBuf{}
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	slogtest.Swap(t, slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
 	dir := t.TempDir()
 	keyPath, statePath := filepath.Join(dir, pki.GossipKeyName), filepath.Join(dir, pki.GossipKeyringStateName)

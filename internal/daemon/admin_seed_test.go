@@ -11,6 +11,7 @@ import (
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
+	"github.com/litevirt/litevirt/internal/testkit/slogtest"
 )
 
 // A node joining an existing cluster must not mint an admin credential.
@@ -173,9 +174,7 @@ func TestSeedAdminUser_TheSkipLogDoesNotNameAFileItNeverWrote(t *testing.T) {
 	db := newHostTestClient(t)
 
 	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	slogtest.Swap(t, slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 
 	d := &Daemon{db: db, adminPasswordPath: filepath.Join(t.TempDir(), "admin-password"), cfg: &Config{
 		HostName:  "node-5",
@@ -327,9 +326,7 @@ func TestSeedAdminUser_NoFounderMarkerMintsNothing(t *testing.T) {
 	db := newHostTestClient(t)
 
 	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	slogtest.Swap(t, slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 
 	pwFile := filepath.Join(t.TempDir(), "admin-password")
 	d := &Daemon{db: db, adminPasswordPath: pwFile, cfg: &Config{HostName: "node-1", DataDir: t.TempDir()}}

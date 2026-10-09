@@ -14,6 +14,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/network"
+	"github.com/litevirt/litevirt/internal/testkit/slogtest"
 )
 
 // Bind-time adoption's LOCAL-ROW refusals.
@@ -666,9 +667,7 @@ func TestBindWithNothingOwedDoesNotContendForThePassGate(t *testing.T) {
 func bindAndCaptureLogs(t *testing.T, s *Server) string {
 	t.Helper()
 	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	slogtest.Swap(t, slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
 	if err := s.validateAndBindPrefix(context.Background(), "shared", adoptTestPrefix, noDHCPNetworkDef); err != nil {
 		t.Fatalf("bind: %v", err)

@@ -191,16 +191,19 @@ var recreateMemberRead = corrosion.GetContainer
 // main, where any deployer could name one: the unchanged source is granted
 // to that create (the reading host still refuses a protected place). That
 // grant is the path's authority only, never an OCI library item's ownership:
-// when the member is on this host, the image-owner check the create will run
-// runs here too, so an item another project owns on this host refuses the
-// recreate before the delete. A remote target applies it at the create.
-func (s *Server) judgeContainerRecreate(ctx context.Context, a planner.VMAction, f *compose.File) (*recreateDecision, error) {
+// the image-owner check the create will run, and its protected-place check,
+// run on the member's host before the delete: here when that is this host
+// (recreateHostChecks), otherwise on that host at the delete, from the
+// returned preflight (recreate_preflight.go). Either way an item another
+// project owns there, or a protected place, refuses the recreate before the
+// delete.
+func (s *Server) judgeContainerRecreate(ctx context.Context, a planner.VMAction, f *compose.File) (*recreateDecision, *recreatePreflight, error) {
 	var d *compose.VMDef
 	if f != nil {
 		d, _ = compose.FindVMDef(f, a.VMName)
 	}
 	if d == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 	// The member is the container of this name on the host the create
 	// targets, and only that one: a same-named container on another host
@@ -212,7 +215,7 @@ func (s *Server) judgeContainerRecreate(ctx context.Context, a planner.VMAction,
 		if err != nil {
 			// Not "no member": that would recreate a privileged member
 			// unprivileged. Fail before the delete; the deploy retries.
-			return nil, status.Errorf(codes.Unavailable,
+			return nil, nil, status.Errorf(codes.Unavailable,
 				"recreating container %q: cannot read the member on %s: %v; the member was left as it is", a.VMName, a.TargetHost, err)
 		}
 		rec = r
@@ -223,7 +226,7 @@ func (s *Server) judgeContainerRecreate(ctx context.Context, a planner.VMAction,
 	// another stack's container (or no stack's) is neither replaced by this
 	// recreate nor a donor of its mode.
 	if rec != nil && containerStackLabel(*rec) != f.Name {
-		return nil, status.Errorf(codes.FailedPrecondition,
+		return nil, nil, status.Errorf(codes.FailedPrecondition,
 			"container %q on %s is not a member of stack %q (its stack label is %q), so this deploy does not recreate it; the container was left as it is",
 			a.VMName, rec.HostName, f.Name, containerStackLabel(*rec))
 	}
@@ -247,14 +250,14 @@ func (s *Server) judgeContainerRecreate(ctx context.Context, a planner.VMAction,
 		if err := containerSecurityRequest(ctx, d.Privileged, d.Confinement); err != nil {
 			s.audit(ctx, "ct.recreate-security", a.VMName,
 				fmt.Sprintf("new opt-out privileged=%v confinement=%s", d.Privileged, d.Confinement), "denied")
-			return nil, status.Errorf(status.Code(err), "recreating container %q: %s; the member was left as it is", a.VMName, status.Convert(err).Message())
+			return nil, nil, status.Errorf(status.Code(err), "recreating container %q: %s; the member was left as it is", a.VMName, status.Convert(err).Message())
 		}
 	default:
 		// Reached only with a member (rec != nil): without one, any opt-out
 		// is a new one.
 		if !sameContainerImage(*rec, old, d) {
 			if err := s.mayChangePrivilegedImage(ctx, a.VMName, rec, d, privileged); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 		}
 		dec.keep = true
@@ -263,7 +266,7 @@ func (s *Server) judgeContainerRecreate(ctx context.Context, a planner.VMAction,
 	// The create's caller-side checks, on the request it will send.
 	req, err := s.buildContainerRequest(ctx, a.VMName, d, f, a.TargetHost)
 	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "recreating container %q: %v; the member was left as it is", a.VMName, err)
+		return nil, nil, status.Errorf(codes.InvalidArgument, "recreating container %q: %v; the member was left as it is", a.VMName, err)
 	}
 	createCtx := ctx
 	if dec != nil {
@@ -273,32 +276,21 @@ func (s *Server) judgeContainerRecreate(ctx context.Context, a planner.VMAction,
 		createCtx, _ = dec.apply(ctx, d, req)
 	}
 	if err := s.authorizeContainerCreate(createCtx, req); err != nil {
-		return nil, status.Errorf(status.Code(err), "recreating container %q: %s; the member was left as it is", a.VMName, status.Convert(err).Message())
+		return nil, nil, status.Errorf(status.Code(err), "recreating container %q: %s; the member was left as it is", a.VMName, status.Convert(err).Message())
 	}
-	// The reading host's own template check, when this host is the one that
-	// reads it (a remote target judges its own disk, which this host cannot
-	// see): a path that is now refused is refused before the delete.
+	// The create's host-side checks (the protected-place check and the
+	// image-owner check), on the disk of the host that holds the member,
+	// before anything is deleted: here when that is this host; otherwise
+	// that host runs them at the delete, from the preflight its forwarded
+	// delete carries (recreate_preflight.go).
 	if a.TargetHost == "" || a.TargetHost == s.hostName {
-		if err := s.checkContainerTemplate(req.Template, req.Name); err != nil {
-			return nil, status.Errorf(status.Code(err), "recreating container %q: %s; the member was left as it is", a.VMName, status.Convert(err).Message())
+		if err := s.recreateHostChecks(createCtx, req.Template, req.Project, req.Name); err != nil {
+			s.audit(ctx, "ct.create", req.Name, "template="+req.Template, "denied")
+			return nil, nil, err
 		}
-		// The create's image-owner check, through the same function on the
-		// same arguments: an ownerless item, or the create's own project's,
-		// passes as on main. Another project's item (an Admin's claim of it,
-		// or that project's own pull on the host the member now lives on) is
-		// refused here, not after the delete. No grant skips it: library
-		// items and owner records are per host, so the template string the
-		// member recorded does not make the item under it the member's.
-		if p, isPath, _ := lxc.TemplatePath(req.Template); isPath {
-			if err := s.refuseForeignOCIItem(createCtx, ociLibraryName(p, s.dataDir), req.Project, "be created from"); err != nil {
-				s.audit(ctx, "ct.create", req.Name, "template="+req.Template, "denied")
-				return nil, status.Errorf(status.Code(err),
-					"recreating container %q: %s; the item belongs to that project (an Admin claimed it for the project, or the project pulled it on %s), so a redeploy by a caller outside it needs the Admin role; the member was left as it is",
-					a.VMName, status.Convert(err).Message(), s.hostName)
-			}
-		}
+		return dec, nil, nil
 	}
-	return dec, nil
+	return dec, &recreatePreflight{template: req.Template, project: req.Project}, nil
 }
 
 // recordedSecurity is a container record's privilege mode and confinement;

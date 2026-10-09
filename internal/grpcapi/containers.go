@@ -542,7 +542,7 @@ func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 		}
 	}
 	if forwarded, err := s.forwardSimpleCT(ctx, targetHost, func(c pb.LiteVirtClient) (*emptypb.Empty, error) {
-		return c.DeleteContainer(ctx, &pb.DeleteContainerRequest{Name: req.Name, HostName: targetHost, Force: req.Force})
+		return c.DeleteContainer(s.recreatePreflightOutgoing(ctx), &pb.DeleteContainerRequest{Name: req.Name, HostName: targetHost, Force: req.Force})
 	}); err != nil || forwarded != nil {
 		if err == nil {
 			// Report the delete once this node no longer lists the row (see
@@ -559,6 +559,12 @@ func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 	// container that is half deleted.
 	unlock := s.LockContainer(req.Name)
 	defer unlock()
+	// A compose recreate's delete forwarded from another entry host: the
+	// create that follows it is judged on this host's disk first, so a
+	// recreate refused there keeps its member (recreate_preflight.go).
+	if err := s.recreateDeleteCheck(ctx, req.Name); err != nil {
+		return nil, err
+	}
 	// The runtime delete is lxc-destroy -f, which stops a running container
 	// first, so without force a running one is refused. A remote peer's call is
 	// exempt: a current entry node judged it before forwarding, and an older

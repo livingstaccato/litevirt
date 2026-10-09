@@ -269,22 +269,22 @@ needs the Admin role. A recreate judges only the member on the host it
 targets, and only one that carries this stack's label; another stack's
 container of the same name is refused, not replaced. These refusals, and the
 create's own checks — `ct.create`, the host-path authority a rootfs-path
-`image:` needs, and, when the deploy enters on the member's own host, the
-protected-place check of that path — come before anything is deleted: the
-member keeps running as it was. A member redeployed from the rootfs path it
-already uses keeps it, as before this release. A member built from an OCI
-library item passes the image-owner check when the item on the member's host
-has no owner or is the member's project's, as before this release; when it
-belongs to another project (an Admin claimed it for that project, or the
-member was moved to a host where that project pulled its own item of the
-name), a redeploy by a caller without the Admin role is refused, and when
-the deploy enters on the member's own host that refusal also comes before
-the delete. When the member lives on another host than the one the deploy
-entered on, that host's protected-place check and its image-owner check run
-at the create, after the delete, so a deploy whose member's item another
-project owns should enter on the member's host. `privileged: false` in a stack file is the same as
-leaving it out: to move a member over, use `lv ct convert`. Each container is given its own copy of the rootfs, so one pull backs any
-number of containers and `compose down` leaves the pulled template untouched.
+`image:` needs, and the protected-place and image-owner checks of that path
+on the member's host — come before anything is deleted, whichever host the
+deploy entered on: the member keeps running as it was. (When the member is
+on another host, that host runs its checks when it is asked to delete the
+member, and refuses the delete; a host still on an earlier release runs
+them at the create, after the delete.) A member redeployed from the rootfs
+path it already uses keeps it, as before this release. A member built from
+an OCI library item passes the image-owner check when the item on the
+member's host has no owner or is the member's project's, as before this
+release; when it belongs to another project (an Admin claimed it for that
+project, or the member was moved to a host where that project pulled its
+own item of the name), a redeploy by a caller without the Admin role is
+refused. `privileged: false` in a stack file is the same as leaving it out:
+to move a member over, use `lv ct convert`. Each container is given its own
+copy of the rootfs, so one pull backs any number of containers and `compose
+down` leaves the pulled template untouched.
 Remaining follow-ups: OCI registry-ref auto-pull; in-place reconfigure
 (cpu/mem changes recreate the container rather than live-tuning); and full
 network/IPAM/security-group provisioning for container NICs (a container sharing

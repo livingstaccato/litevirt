@@ -55,11 +55,11 @@ func TestComposeRecreate_AJudgmentNeverReachesAnotherRecreate(t *testing.T) {
 	updA := planner.VMAction{Kind: planner.OpUpdate, VMName: "web", TargetHost: "host-a", IsContainer: true}
 	updB := planner.VMAction{Kind: planner.OpUpdate, VMName: "web", TargetHost: "host-b", IsContainer: true}
 
-	decA, err := s.judgeContainerRecreate(carl, updA, fA)
+	decA, _, err := s.judgeContainerRecreate(carl, updA, fA)
 	if err != nil {
 		t.Fatalf("judge A: %v", err)
 	}
-	if _, err := s.judgeContainerRecreate(carl, updB, fB); err != nil {
+	if _, _, err := s.judgeContainerRecreate(carl, updB, fB); err != nil {
 		t.Fatalf("judge B: %v", err)
 	}
 	if err := s.deleteWorkload(carl, updA); err != nil {
@@ -204,7 +204,7 @@ func TestComposeRecreate_AnotherHostsMemberNeverDonates(t *testing.T) {
 	seedStackCT(t, s, "st", "host-b", "web", "alpine:3.22", mainEraSpec())
 	f := &compose.File{Name: "st", VMs: map[string]compose.VMDef{"web": {Kind: compose.WorkloadKindLXC, Image: "alpine:3.22"}}}
 	upd := planner.VMAction{Kind: planner.OpUpdate, VMName: "web", TargetHost: "host-a", IsContainer: true}
-	dec, err := s.judgeContainerRecreate(carl, upd, f)
+	dec, _, err := s.judgeContainerRecreate(carl, upd, f)
 	if err != nil {
 		t.Fatalf("judge: %v", err)
 	}
@@ -228,7 +228,7 @@ func TestComposeRecreate_ADecisionForAnotherHostCarriesNothing(t *testing.T) {
 	seedStackCT(t, s, "st", "host-b", "web", "alpine:3.22", mainEraSpec())
 	f := &compose.File{Name: "st", VMs: map[string]compose.VMDef{"web": {Kind: compose.WorkloadKindLXC, Image: "alpine:3.22"}}}
 	updB := planner.VMAction{Kind: planner.OpUpdate, VMName: "web", TargetHost: "host-b", IsContainer: true}
-	decB, err := s.judgeContainerRecreate(carl, updB, f)
+	decB, _, err := s.judgeContainerRecreate(carl, updB, f)
 	if err != nil || decB == nil {
 		t.Fatalf("judge B: %+v %v", decB, err)
 	}

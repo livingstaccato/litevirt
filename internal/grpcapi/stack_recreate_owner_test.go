@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -42,39 +43,31 @@ func unchangedOCIRedeploy(image string) (*compose.File, planner.VMAction) {
 // Reviews I3 and I4: the image-owner check of a recreate's create runs in
 // the recreate's judgment, before the delete, on the member's own host. An
 // item another project owns there refuses a non-admin's unchanged redeploy
-// with the member left as it is — never deleted and then refused:
-//   - I3: an Admin claimed the member's (ownerless) item for project x;
-//   - I4: the member was moved (migrate, relocation) onto a host whose
-//     same-named item is x's own pull; items and owner records are per host,
-//     so the template string the member recorded does not make that item its.
+// with the member left as it is — never deleted and then refused. One case
+// covers both routes to that owner record: an Admin's claim of the member's
+// ownerless item (I3), and a member moved onto a host where x pulled its own
+// item of the name (I4); the judge reads only the member's host's record.
 func TestComposeRecreate_AnotherProjectsItemIsRefusedBeforeTheDelete(t *testing.T) {
-	for _, tc := range []struct{ name, why string }{
-		{"admin-claim", "an Admin claimed the item for x"},
-		{"moved-member", "the member was moved onto a host where x pulled its own web-img"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			s, rt := ctPathServer(t)
-			carl := carlCtx(t, s)
-			image := seedOCIMember(t, s, rt)
-			if err := s.writeOCIOwner("web-img", "x"); err != nil {
-				t.Fatal(err)
-			}
-			f, upd := unchangedOCIRedeploy(image)
-			err := recreateMember(carl, s, upd, f)
-			if status.Code(err) != codes.PermissionDenied {
-				t.Fatalf("%s: unchanged redeploy by a non-admin: %v, want PermissionDenied", tc.why, err)
-			}
-			msg := status.Convert(err).Message()
-			for _, want := range []string{`project "x"`, "Admin", "left as it is"} {
-				if !strings.Contains(msg, want) {
-					t.Errorf("refusal %q does not say %q", msg, want)
-				}
-			}
-			memberExists(t, s, rt)
-			if len(rt.createCalls) != 0 {
-				t.Fatalf("created: %+v", rt.createCalls)
-			}
-		})
+	s, rt := ctPathServer(t)
+	carl := carlCtx(t, s)
+	image := seedOCIMember(t, s, rt)
+	if err := s.writeOCIOwner("web-img", "x"); err != nil {
+		t.Fatal(err)
+	}
+	f, upd := unchangedOCIRedeploy(image)
+	err := recreateMember(carl, s, upd, f)
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("unchanged redeploy by a non-admin: %v, want PermissionDenied", err)
+	}
+	msg := status.Convert(err).Message()
+	for _, want := range []string{`project "x"`, "Admin", "left as it is"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("refusal %q does not say %q", msg, want)
+		}
+	}
+	memberExists(t, s, rt)
+	if len(rt.createCalls) != 0 {
+		t.Fatalf("created: %+v", rt.createCalls)
 	}
 }
 
@@ -151,4 +144,26 @@ func TestComposeRecreate_AnUnreadableMemberFailsBeforeTheDelete(t *testing.T) {
 	if len(rt.deleteCalls) != 0 || len(rt.createCalls) != 0 {
 		t.Fatalf("runtime touched: deletes %v creates %+v", rt.deleteCalls, rt.createCalls)
 	}
+}
+
+// Review N6: an owner record that cannot be read refuses before the delete
+// (it cannot prove the item is the member's), and the refusal says so,
+// rather than claiming the item belongs to another project.
+func TestComposeRecreate_AnUnreadableOwnerRecordIsSaidSo(t *testing.T) {
+	s, rt := ctPathServer(t)
+	carl := carlCtx(t, s)
+	image := seedOCIMember(t, s, rt)
+	if err := os.MkdirAll(filepath.Join(s.dataDir, ociOwnersDir, "web-img"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	f, upd := unchangedOCIRedeploy(image)
+	err := recreateMember(carl, s, upd, f)
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("redeploy with an unreadable owner record: %v, want PermissionDenied", err)
+	}
+	msg := status.Convert(err).Message()
+	if !strings.Contains(msg, "unreadable") || strings.Contains(msg, "belongs to that project") {
+		t.Errorf("refusal %q: want the unreadable record named, not a project owner", msg)
+	}
+	memberExists(t, s, rt)
 }

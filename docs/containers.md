@@ -70,8 +70,7 @@ paths:
   project; through a forwarding node too. That includes a compose redeploy
   of a member already built from it: the member's own recorded image path
   makes no exception (items and owner records are per host), and the
-  redeploy is refused before the member is deleted when the deploy enters on
-  the member's host (see compose.md). A pull **without** `--project`
+  redeploy is refused before the member is deleted (see compose.md). A pull **without** `--project`
   records no owner, and the image is everyone's, as on earlier releases — as
   is every image pulled before owners were recorded (nothing is backfilled).
   Containers of any project may run from such an ownerless item, so claiming

@@ -7,11 +7,13 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/lxc"
 	"github.com/litevirt/litevirt/internal/pbsstore"
@@ -141,7 +143,49 @@ func manifestOwnedBy(m *pbsstore.Manifest, rec *corrosion.ContainerRecord) bool 
 	}
 	cs := corrosion.DecodeCreateSpec(rec.CreateSpec)
 	return cs.RestoredFromOwnerID != "" && theirs == cs.RestoredFromOwnerID &&
-		cs.RestoredFromTS != "" && m.Timestamp <= cs.RestoredFromTS
+		cs.RestoredFromTS != "" && timestampAtOrBefore(m.Timestamp, cs.RestoredFromTS)
+}
+
+// timestampAtOrBefore compares two backup timestamps as times (RFC3339, any
+// offset, fractional seconds), falling back to the string order when either
+// does not parse.
+func timestampAtOrBefore(a, b string) bool {
+	ta, errA := time.Parse(time.RFC3339Nano, a)
+	tb, errB := time.Parse(time.RFC3339Nano, b)
+	if errA != nil || errB != nil {
+		return a <= b
+	}
+	return !ta.After(tb)
+}
+
+// relocatedLineage is the lineage a host-loss relocation lays down: the
+// relocating container's own (its owner_id and any restored-from parent), not
+// the lineage of the backup it was rebuilt from. A copy restored from its
+// parent's backup and then relocated from that same backup stays the copy;
+// taking the manifest's would make it a second holder of the parent's
+// owner_id. When the relocating row cannot be read, or records no owner_id,
+// the manifest's lineage is kept, as before.
+func (s *Server) relocatedLineage(ctx context.Context, req *pb.RestoreContainerRequest, createSpec string) string {
+	token := relocateTokenFromMD(ctx)
+	if token == "" && req.Proof != nil {
+		token = req.Proof.GetRelocationToken()
+	}
+	row, err := s.relocatingContainer(ctx, req.Name, s.hostName, token)
+	if err != nil {
+		slog.Warn("container relocation: could not read the relocating row; keeping the backup's lineage", "name", req.Name, "error", err)
+		return createSpec
+	}
+	if row == nil {
+		slog.Warn("container relocation: no relocating row found here (not replicated yet?); keeping the backup's lineage", "name", req.Name)
+		return createSpec
+	}
+	mine := corrosion.DecodeCreateSpec(row.CreateSpec)
+	if mine.OwnerID == "" {
+		return createSpec
+	}
+	cs := corrosion.DecodeCreateSpec(createSpec)
+	cs.OwnerID, cs.RestoredFromOwnerID, cs.RestoredFromTS = mine.OwnerID, mine.RestoredFromOwnerID, mine.RestoredFromTS
+	return corrosion.EncodeCreateSpec(cs)
 }
 
 // relocatingContainer is the row the failover coordinator marked for a

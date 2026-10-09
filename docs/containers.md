@@ -700,12 +700,18 @@ project plus an `owner_id` in the container's create spec.
   original runs elsewhere, and also a recovery while the original's row is still
   on a dead or fenced host. It gets a new `owner_id`, as it gets a fresh id range
   and no claim on the original's address, and it records where it came from
-  (`restored_from_owner_id`, `restored_from_ts` in its create spec). Its later
-  backups are therefore its own, and a host-loss restore of the original never
-  picks them. The copy itself can be rebuilt from the backup it was restored
-  from (and that lineage's earlier ones) until it has its own, never from a
-  backup the original took after the restore. A restore after the original was
-  deleted keeps the lineage.
+  (`restored_from_owner_id`, `restored_from_ts` in its create spec). The copy
+  itself can be rebuilt from the backup it was restored from (and that
+  lineage's earlier ones) until it has its own, never from a backup the
+  original took after the restore. A host-loss relocation of the copy keeps
+  the copy's `owner_id` and its parent record, even when it is rebuilt from
+  the parent's backup, so the backups it takes, before or after a relocation,
+  are its own, and a host-loss restore of the original never picks them. A
+  restore after the original was deleted keeps the lineage.
+- The restored-from bound compares backup times (with any UTC offset or
+  fractional seconds), but a backup of the original taken later with an
+  explicit `--timestamp` at or before the copy's `restored_from_ts` reads as
+  part of the copy's starting point, and the copy may be rebuilt from it.
 - An original with **no** `owner_id` (created by an earlier release, or by a
   node on an earlier release during an upgrade) is still matched by name: a
   host-loss restore of it can pick a newer backup of a copy restored beside

@@ -520,3 +520,120 @@ func TestRestoreContainer_AfterDeleteOnAnotherHostKeepsTheLineage(t *testing.T) 
 		t.Fatalf("restored spec = %+v, want the lineage own-1 kept, with no parent", cs)
 	}
 }
+
+// R-I1: a copy (own-2, restored from own-1's 10-08 backup) whose host dies is
+// rebuilt from that very backup — end to end, the target-side restore runs
+// for real. The relocated container stays the copy: own-2 with its parent,
+// on the row and on disk. Its next failover still cannot take the original's
+// later backup, and the original's failover never takes the copy's.
+func TestRestoreContainer_ACopyRelocatedFromItsParentsBackupStaysTheCopy(t *testing.T) {
+	s, rt := secServer(t)
+	ctx := context.Background()
+	repo := ctTestRepo(t)
+	s.SetBackupRepos(map[string]string{"main": repo})
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: "peer-1", Address: "10.0.0.7", State: "active"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{
+		HostName: "host-a", Name: "db", State: "running", Image: "alpine:3.19", Project: "acme",
+		CreateSpec: corrosion.EncodeCreateSpec(corrosion.ContainerCreateSpec{Template: "download", OwnerID: "own-1"}),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	backup := func(host, ts string) {
+		t.Helper()
+		s.hostName = host
+		bk := &progressStream[pb.BackupContainerProgress]{ctx: adminCtx()}
+		if err := s.BackupContainer(&pb.BackupContainerRequest{Name: "db", HostName: host, RepoPath: repo, Timestamp: ts}, bk); err != nil {
+			t.Fatalf("backup %s at %s: %v", host, ts, err)
+		}
+	}
+	backup("host-a", "2026-10-08T12:00:00Z")
+
+	// The copy, restored on host-b beside the live original.
+	s.hostName = "host-b"
+	rs := &progressStream[pb.RestoreContainerProgress]{ctx: adminCtx()}
+	if err := s.RestoreContainer(&pb.RestoreContainerRequest{Name: "db", RepoPath: repo, Timestamp: "2026-10-08T12:00:00Z"}, rs); err != nil {
+		t.Fatalf("restore the copy: %v", err)
+	}
+	cp := specOf(t, s, "host-b", "db")
+	if cp.OwnerID == "own-1" || cp.RestoredFromOwnerID != "own-1" {
+		t.Fatalf("copy spec = %+v", cp)
+	}
+	backup("host-a", "2026-10-09T12:00:00Z") // the original's, after the restore
+
+	// host-b dies: fail the copy over to host-z through the real target restore.
+	row, _ := corrosion.GetContainer(ctx, s.db, "host-b", "db")
+	row.State, row.StateDetail = "relocating", corrosion.RelocateRestoreDetail("host-z", "tok-r")
+	if err := corrosion.UpsertContainer(ctx, s.db, *row); err != nil {
+		t.Fatal(err)
+	}
+	var gotTs string
+	s.migrateRestoreOverride = func(_ context.Context, target, repoPath, name, ts string, start bool) (corrosion.RestoreOutcome, error) {
+		gotTs = ts
+		s.hostName = target
+		rctx := metadata.NewIncomingContext(mtlsAdminCtx("peer-1"), metadata.Pairs(relocateTokenMDKey, "tok-r"))
+		trs := &progressStream[pb.RestoreContainerProgress]{ctx: rctx}
+		if err := s.RestoreContainer(&pb.RestoreContainerRequest{Name: name, RepoPath: repoPath, Timestamp: ts, Start: start}, trs); err != nil {
+			return corrosion.RestoreFailedBeforeRow, err
+		}
+		return corrosion.RestoreLanded, nil
+	}
+	if outcome, err := s.RestoreContainerFromBackup(ctx, "db", "host-z", "tok-r"); err != nil || outcome != corrosion.RestoreLanded {
+		t.Fatalf("relocate the copy: (%v, %v)", outcome, err)
+	}
+	if gotTs != "2026-10-08T12:00:00Z" {
+		t.Fatalf("the copy was rebuilt from %q, want its starting point 2026-10-08T12:00:00Z", gotTs)
+	}
+	moved := specOf(t, s, "host-z", "db")
+	if moved.OwnerID != cp.OwnerID || moved.RestoredFromOwnerID != "own-1" || moved.RestoredFromTS != "2026-10-08T12:00:00Z" {
+		t.Fatalf("relocated spec = %+v, want the copy's %q with parent own-1@2026-10-08T12:00:00Z", moved, cp.OwnerID)
+	}
+	if got := rt.owners["db"]; got.OwnerID != cp.OwnerID {
+		t.Fatalf("relocated on-disk owner record = %+v, want the copy's %q", got, cp.OwnerID)
+	}
+	s.migrateRestoreOverride = nil
+
+	// Its next failover still keeps to its starting point, not the original's 10-09.
+	if got := failOverRestoreTs(t, s, repo, "host-z", "db"); got != "2026-10-08T12:00:00Z" {
+		t.Fatalf("the relocated copy's next failover picked %q, want 2026-10-08T12:00:00Z", got)
+	}
+	// The copy (now on host-z) is backed up; the original's failover never takes it.
+	_ = corrosion.DeleteContainer(ctx, s.db, "host-z", "db")
+	if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{
+		HostName: "host-z", Name: "db", State: "running", Image: "alpine:3.19", Project: "acme",
+		CreateSpec: corrosion.EncodeCreateSpec(moved),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	backup("host-z", "2026-10-10T12:00:00Z")
+	if got := failOverRestoreTs(t, s, repo, "host-a", "db"); got != "2026-10-09T12:00:00Z" {
+		t.Fatalf("the original's failover picked %q, want its own 2026-10-09T12:00:00Z", got)
+	}
+}
+
+// R-m1: the restored-from bound compares times, not strings: an offset or a
+// fractional second must not sort a later backup of the parent below it, nor
+// an earlier one above it.
+func TestManifestOwnedBy_ParentBoundComparesTimes(t *testing.T) {
+	rec := &corrosion.ContainerRecord{Project: "acme", CreateSpec: corrosion.EncodeCreateSpec(corrosion.ContainerCreateSpec{
+		OwnerID: "own-2", RestoredFromOwnerID: "own-1", RestoredFromTS: "2026-10-08T12:00:00Z"})}
+	spec, _ := json.Marshal(containerBackupSpec{Name: "db", Project: "acme",
+		CreateSpec: corrosion.EncodeCreateSpec(corrosion.ContainerCreateSpec{OwnerID: "own-1"})})
+	for _, c := range []struct {
+		ts   string
+		want bool
+	}{
+		{"2026-10-08T12:00:00Z", true},
+		{"2026-10-08T11:59:59Z", true},
+		{"2026-10-08T11:00:00-05:00", false}, // 16:00Z, after
+		{"2026-10-08T12:00:00.5Z", false},    // half a second after
+		{"2026-10-08T13:00:00+02:00", true},  // 11:00Z, before
+		{"2026-10-08T12:00:01Z", false},
+	} {
+		m := &pbsstore.Manifest{ContainerSpecJSON: string(spec), Timestamp: c.ts}
+		if got := manifestOwnedBy(m, rec); got != c.want {
+			t.Errorf("parent manifest at %s: owned = %v, want %v", c.ts, got, c.want)
+		}
+	}
+}

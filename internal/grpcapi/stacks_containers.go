@@ -187,6 +187,9 @@ func securityInherited(ctx context.Context) bool {
 // A member recreated from the rootfs path it already uses keeps it as on
 // main, where any deployer could name one: the unchanged source is granted
 // to that create (the reading host still refuses a protected place).
+// recreateMemberRead reads a recreate's member; a test seam.
+var recreateMemberRead = corrosion.GetContainer
+
 func (s *Server) judgeContainerRecreate(ctx context.Context, a planner.VMAction, f *compose.File) (*recreateDecision, error) {
 	var d *compose.VMDef
 	if f != nil {
@@ -201,7 +204,14 @@ func (s *Server) judgeContainerRecreate(ctx context.Context, a planner.VMAction,
 	// container of the name anywhere.
 	var rec *corrosion.ContainerRecord
 	if a.TargetHost != "" {
-		rec, _ = corrosion.GetContainer(ctx, s.db, a.TargetHost, a.VMName)
+		r, err := recreateMemberRead(ctx, s.db, a.TargetHost, a.VMName)
+		if err != nil {
+			// Not "no member": that would recreate a privileged member
+			// unprivileged. Fail before the delete; the deploy retries.
+			return nil, status.Errorf(codes.Unavailable,
+				"recreating container %q: cannot read the member on %s: %v; the member was left as it is", a.VMName, a.TargetHost, err)
+		}
+		rec = r
 	} else if _, r, err := s.resolveContainerHost(ctx, "", a.VMName); err == nil {
 		rec = r
 	}

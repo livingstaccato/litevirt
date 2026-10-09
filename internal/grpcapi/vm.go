@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -86,6 +87,9 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// A re-create forwarded here by the host that tears the VM down carries
 	// the VM's own installer ISO grant; only a peer host's is honoured.
 	ctx = s.acceptRecreateISOGrantMD(ctx)
+	// ...and the identity of the VM it replaces, whose tombstone this host's
+	// replica may not have applied yet (vm_recreate_replaces.go).
+	ctx = s.acceptReplacedVMMD(ctx)
 	spec, err := normalizeCreateVMSpec(req.GetSpec(), s.defaultCPUModeCfg)
 	if err != nil {
 		return nil, err
@@ -153,10 +157,19 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		}
 	}
 
-	// Check if VM already exists
-	existing, _ := corrosion.GetVM(ctx, s.db, spec.Name)
-	if existing != nil {
-		return nil, status.Errorf(codes.AlreadyExists, "VM %q already exists", spec.Name)
+	// Check if VM already exists. A rebuild or recreate whose replica here has
+	// not yet applied the tombstone of the VM it replaces sees that VM's row:
+	// exactly that incarnation is settled (settleReplacedVM), anything else
+	// still refuses.
+	if existing, _ := corrosion.GetVM(ctx, s.db, spec.Name); existing != nil {
+		replaced, serr := s.settleReplacedVM(ctx, existing)
+		if serr != nil {
+			return nil, status.Errorf(codes.Unavailable,
+				"VM %q: this host still holds the VM it re-creates and could not retire it: %v", spec.Name, serr)
+		}
+		if !replaced {
+			return nil, status.Errorf(codes.AlreadyExists, "VM %q already exists", spec.Name)
+		}
 	}
 
 	// Resource defaults BEFORE admission. Everything below — quota, placement,
@@ -2029,7 +2042,14 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		defer conn.Close()
 		proxyCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 		defer cancel()
-		return client.DeleteVM(proxyCtx, req)
+		// The owner reports the row it tombstoned in a response header, which
+		// a re-create waiting on this delete takes (vm_recreate_replaces.go).
+		var hdr metadata.MD
+		out, err := client.DeleteVM(proxyCtx, req, grpc.Header(&hdr))
+		if err == nil {
+			acceptDeletedVMHeader(ctx, req.Name, hdr)
+		}
+		return out, err
 	}
 
 	// Verify the domain actually exists in libvirt on this host. If the
@@ -2098,11 +2118,13 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		// node keeps scheduling around. A failure is logged and every NIC named
 		// for the orphan sweep, never swallowed.
 		s.releaseNICLeasesBestEffort(ctx, vm, "delete-stale-record")
-		if err := corrosion.DeleteVM(ctx, s.db, req.Name); err != nil {
+		deleted, err := corrosion.DeleteVMReporting(ctx, s.db, req.Name)
+		if err != nil {
 			// A declined delete means the stale row is still live cluster-wide;
 			// claiming OK here would hide it. Idempotent — retry.
 			return nil, status.Errorf(codes.Internal, "clean up stale VM record: %v", err)
 		}
+		s.reportDeletedVM(ctx, deleted)
 		s.clearDeviceLease(req.Name)
 		// This path returns without reaching the main cleanup below, so the
 		// marker has to be dropped here too. A ghost row whose domain is already
@@ -2350,10 +2372,14 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// row every node keeps serving, scheduling around and failing over — the
 	// exact stale-live state the mandatory tombstone exists to kill. The domain
 	// teardown above is idempotent, so the caller can simply retry.
-	if err := corrosion.DeleteVM(ctx, s.db, req.Name); err != nil {
+	deleted, err := corrosion.DeleteVMReporting(ctx, s.db, req.Name)
+	if err != nil {
 		s.audit(ctx, "vm.delete", req.Name, "project="+tenancy.NormalizeProject(vm.Project), "error")
 		return nil, status.Errorf(codes.Internal, "delete: tombstone cluster row: %v", err)
 	}
+	// The row as this delete tombstoned it, for a re-create that follows
+	// (vm_recreate_replaces.go).
+	s.reportDeletedVM(ctx, deleted)
 
 	slog.Info("VM deleted", "name", req.Name)
 	// The mirror's latency shortcut, AFTER the mandatory tombstone: the VM is
@@ -3239,17 +3265,34 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	// the row-deleting path's, not the binding's, and a rebuild must not be the
 	// one place it is missing.
 	s.releaseNICLeasesBestEffort(ctx, vm, "rebuild")
-	if err := corrosion.DeleteVM(ctx, s.db, req.Name); err != nil {
+	deleted, err := corrosion.DeleteVMReporting(ctx, s.db, req.Name)
+	if err != nil {
 		return nil, status.Errorf(codes.Internal, "rebuild: tombstone old records: %v", err)
 	}
 
-	// Recreate the VM using the stored spec.
+	// Recreate the VM using the stored spec. The create carries the identity
+	// of the VM just tombstoned: the host it lands on may not have applied
+	// that tombstone yet, and must not refuse the create for the row it
+	// names (vm_recreate_replaces.go).
 	slog.Info("rebuilding VM", "name", req.Name)
 	s.recordVMEvent(ctx, req.Name, "vm.rebuilt", "ok", "image="+spec.Image)
-	if placed {
-		return s.createVM(rctx, &pb.CreateVMRequest{Spec: spec}, &resolvedCreateVMDecision{resolvedHost: host, placedHere: true})
+	// The VM replaced is the row the delete actually tombstoned (its guard
+	// re-reads under the CAS); nil only when the row was already gone.
+	if deleted != nil {
+		rctx = withReplacedVM(rctx, deleted)
+	} else {
+		rctx = withReplacedVM(rctx, vm)
 	}
-	return s.CreateVM(rctx, &pb.CreateVMRequest{Spec: spec})
+	var out *pb.VM
+	if placed {
+		out, err = s.createVM(rctx, &pb.CreateVMRequest{Spec: spec}, &resolvedCreateVMDecision{resolvedHost: host, placedHere: true})
+	} else {
+		out, err = s.CreateVM(rctx, &pb.CreateVMRequest{Spec: spec})
+	}
+	if err != nil {
+		return nil, s.recreateFailedAfterTeardown("rebuild", req.Name, s.hostName, spec, err)
+	}
+	return out, nil
 }
 
 // CutoverVM completes a snapshot-and-replace update. The "-next" VM replaces the original.

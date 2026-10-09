@@ -54,6 +54,12 @@ type Server struct {
 	// library files and the one-sync-pass-at-a-time lock (iso_library.go).
 	isoLib isoLibraryState
 
+	// replacedTombstoneWait bounds how long a re-create waits for this
+	// host's replica to apply the tombstone of the VM it replaces before
+	// retiring its stale copy itself (vm_recreate_replaces.go). Zero is
+	// defaultReplacedTombstoneWait.
+	replacedTombstoneWait time.Duration
+
 	// Admission-gate local-inventory cache (see localInventoryCached).
 	invCacheMu sync.Mutex
 	invCache   runtimeInventory

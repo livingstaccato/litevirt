@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -207,25 +208,46 @@ func (s *Server) forwardCreateVM(ctx context.Context, req *pb.CreateVMRequest, t
 	// re-entering that claim, regardless of which mixed-version path is used.
 	forwarded := proto.Clone(req).(*pb.CreateVMRequest)
 	forwarded.IdempotencyKey = ""
-	outCtx := metadata.AppendToOutgoingContext(withRecreateISOGrantMD(ctx, req.GetSpec()), createVMForwardHopMetadata, strconv.Itoa(nextHop))
+	outCtx := metadata.AppendToOutgoingContext(
+		withReplacedVMMD(withRecreateISOGrantMD(ctx, req.GetSpec()), req.GetSpec().GetName()),
+		createVMForwardHopMetadata, strconv.Itoa(nextHop))
 
-	if !s.capacityAdmissionLatched() {
-		return client.CreateVM(outCtx, forwarded)
+	send := func() (*pb.VM, error) {
+		if !s.capacityAdmissionLatched() {
+			return client.CreateVM(outCtx, forwarded)
+		}
+		fingerprint, err := s.capacityPolicyFingerprint(ctx)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "capacity-policy fingerprint: %v", err)
+		}
+		out, err := client.ExecuteCreateVM(outCtx, &pb.ExecuteCreateVMRequest{
+			Request:              forwarded,
+			ResolvedHost:         targetHost,
+			PlacementFingerprint: fingerprint,
+			HopCount:             uint32(nextHop),
+		})
+		if status.Code(err) == codes.Unimplemented {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"host %s does not implement required capacity-admission executor", targetHost)
+		}
+		return out, err
 	}
-
-	fingerprint, err := s.capacityPolicyFingerprint(ctx)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "capacity-policy fingerprint: %v", err)
+	out, err := send()
+	if _, replacing := replacedVMFor(ctx, req.GetSpec().GetName()); !replacing {
+		return out, err
 	}
-	out, err := client.ExecuteCreateVM(outCtx, &pb.ExecuteCreateVMRequest{
-		Request:              forwarded,
-		ResolvedHost:         targetHost,
-		PlacementFingerprint: fingerprint,
-		HopCount:             uint32(nextHop),
-	})
-	if status.Code(err) == codes.Unimplemented {
-		return nil, status.Errorf(codes.FailedPrecondition,
-			"host %s does not implement required capacity-admission executor", targetHost)
+	// A re-create of a VM this node has deleted. A host on an older build
+	// ignores the replaced VM's identity and refuses AlreadyExists until its
+	// replica has applied the tombstone; ask again until then, within the
+	// bound a current host waits for it itself (vm_recreate_replaces.go).
+	deadline := time.Now().Add(s.replacedTombstoneWaitBound())
+	for status.Code(err) == codes.AlreadyExists && time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return nil, err
+		case <-time.After(250 * time.Millisecond):
+		}
+		out, err = send()
 	}
 	return out, err
 }

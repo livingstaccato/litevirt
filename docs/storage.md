@@ -811,6 +811,29 @@ classification; if it would refuse (it does not have the file, say), the
 rebuild is refused before anything is torn down. A chosen host on an older
 build, which judges no installer ISO at its create, is not asked.
 
+Any rebuild or recreate, with an ISO or without, may create the VM on a host
+whose replica has not yet applied the tombstone of the VM it replaces — the
+pinned or chosen host, or the node running a rollout. The create carries that
+VM as its delete saw it (name, incarnation, host, owner epoch, spec
+generation and identity; for a rolling recreate, as the VM's own host
+reports the row it deleted, not as the node running the rollout last heard),
+and that host does not refuse the create for a
+stale copy the delete kills: it waits up to ten seconds for the tombstone to
+arrive and, if it does not, retires the copy itself, releasing its addresses
+as a delete does. Everything else is still refused as before: a live VM of
+the same name that is another incarnation, a copy that has moved past what
+the delete saw (a failover the deleting node had not heard of), and any VM of
+that name while the host has a domain of it. A recreate whose delete found
+the VM already gone names nothing. A host on an older build ignores the
+identity; the node that forwards the create then retries it for the same ten
+seconds.
+
+If the create fails after the teardown for any reason, the error says what was
+torn down and where, and the spec the create was given is kept on that node
+under `<data_dir>/recreate-failed/`, one file per failure, readable by root
+only, to re-create the VM from. The directory keeps the newest 50 files and
+none older than 30 days; copy out a spec you still need.
+
 ### Known limits
 
 - **qemu reopens the path.** The last check opens the file without following a

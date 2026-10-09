@@ -196,3 +196,47 @@ func TestDeleteVM_AKeptDiskKeepsItsLayers(t *testing.T) {
 		}
 	}
 }
+
+// The lab (snapshot-lab.md, Round 3 row 6): after restores of older
+// snapshots, both snapshots deleted and a migration away and back, the VM
+// runs on a standalone copy of its -r overlay, and the leftovers
+// web-root.s1, web-root.s1-r<ts> and web-root.s2 back onto web-root.qcow2
+// and each other — not onto anything in the VM's chain. VM delete removes
+// them all: they are this VM's disk's layers, recognised by the disk's own
+// canonical file <stem>.qcow2, which the debris sweep takes too.
+func TestDeleteVM_RemovesLeftoversOfAFlattenedChain(t *testing.T) {
+	for _, baseThere := range []bool{true, false} {
+		t.Run(map[bool]string{true: "base present", false: "base already gone"}[baseThere], func(t *testing.T) {
+			needQemuImg(t)
+			s, fake := provableCreateServer(t)
+			fake.SetState("web", libvirtfake.StateRunning)
+			dir := filepath.Join(s.dataDir, "disks")
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			p := func(n string) string { return filepath.Join(dir, n) }
+			runQemuImg(t, "create", "-q", "-f", "qcow2", p("web-root.qcow2"), "1M")
+			runQemuImg(t, "create", "-q", "-f", "qcow2", "-F", "qcow2", "-b", p("web-root.qcow2"), p("web-root.s1"))
+			runQemuImg(t, "create", "-q", "-f", "qcow2", "-F", "qcow2", "-b", p("web-root.s1"), p("web-root.s2"))
+			runQemuImg(t, "create", "-q", "-f", "qcow2", "-F", "qcow2", "-b", p("web-root.qcow2"), p("web-root.s1-r1791502788"))
+			runQemuImg(t, "create", "-q", "-f", "qcow2", p("web-root.s2-r1791502823"), "1M") // the flattened copy it runs on
+			if !baseThere {
+				if err := os.Remove(p("web-root.qcow2")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ctx := adminCtx()
+			if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{Name: "web", HostName: "test-host", State: "running"}, nil,
+				[]corrosion.DiskRecord{{VMName: "web", DiskName: "root", HostName: "test-host", Path: p("web-root.s2-r1791502823"), StorageType: "local"}}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.DeleteVM(ctx, &pb.DeleteVMRequest{Name: "web"}); err != nil {
+				t.Fatalf("DeleteVM: %v", err)
+			}
+			left, _ := filepath.Glob(p("web-*"))
+			if len(left) != 0 {
+				t.Fatalf("left behind: %v", left)
+			}
+		})
+	}
+}

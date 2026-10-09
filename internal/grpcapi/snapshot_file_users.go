@@ -217,6 +217,12 @@ func (s *Server) ownDiskLayers(ctx context.Context, vmName string) []string {
 			add(b)
 			path = b
 		}
+		// The disk's canonical file <stem>.qcow2 is its own too — the debris
+		// sweep takes it by that name — even when the chain no longer
+		// reaches it (a migration copies the chain flat, and leaves the
+		// out-of-chain layers on the old host: snapshot-lab.md, Round 3
+		// row 6). Siblings backing onto it count as backing into the chain.
+		chain[filepath.Join(dir, stem+".qcow2")] = true
 		// Out-of-chain siblings: an overlay a restore of an older snapshot
 		// left, and the later snapshots' layers above it, each backing into
 		// the chain or into one already taken — so repeated until no more.

@@ -100,6 +100,11 @@ func manifestVMProject(m *pbsstore.Manifest) string {
 	return ""
 }
 
+// manifestContainerProject returns the project embedded in a container backup
+// manifest's spec, or "" when it records none (a legacy manifest). It is the
+// one decode of a manifest's project: the restore authorization reads it as
+// is ("" scopes the restore to the live row, or needs the admin role), and
+// the backup index keys by its normalised form (manifestIndexProject).
 func manifestContainerProject(m *pbsstore.Manifest) string {
 	if m != nil && m.ContainerSpecJSON != "" {
 		var spec containerBackupSpec

@@ -39,6 +39,56 @@ func TestExecuteWithRollingUpdates_InPlaceRecreate_FailsNoDelete(t *testing.T) {
 	}
 }
 
+// A rolling update skips a VM on an 'offline' host, as it does on a draining
+// or fenced one: once fence_state_v1 has latched, 'offline' is what an SSH
+// fence records, and that host is fenced all the same
+// (colonelpanik/litevirt#253). The VM is left as it is, not updated on a host
+// that cannot run the update.
+//
+// Mutation: drop 'offline' from the skipped states — the update is handed to
+// the engine and applied.
+func TestExecuteWithRollingUpdates_SkipsAVMOnAnOfflineHost(t *testing.T) {
+	s := coordResizeServer(t)
+	ctx := adminCtx()
+	seedRunningVM(t, s, "web", &pb.VMSpec{Name: "web", Cpu: 2, MaxCpu: 8, MemoryMib: 256, MinMemoryMib: 128, MaxMemoryMib: 512}, 2, 256)
+	if h, err := corrosion.GetHost(ctx, s.db, "test-host"); err != nil {
+		t.Fatal(err)
+	} else if h == nil {
+		if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: "test-host", Address: "127.0.0.1", State: "active"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := corrosion.UpdateHostState(ctx, s.db, "test-host", "offline"); err != nil {
+		t.Fatal(err)
+	}
+
+	f := &compose.File{Name: "st", VMs: map[string]compose.VMDef{
+		"web": {Image: "ubuntu", CPU: 4, Update: &compose.UpdateDef{Strategy: "in-place"}},
+	}}
+	resolved := &planner.ResolvedPlan{StackName: "st", VMs: []planner.VMAction{{
+		Kind: planner.OpUpdate, VMName: "web", TargetHost: "test-host",
+		Spec: &pb.VMSpec{Name: "web", Cpu: 4, MemoryMib: 256},
+		Plan: compose.ChangePlan{ResourceChanges: []compose.Delta{{Field: "cpu", Old: "2", New: "4"}}},
+	}}}
+	stream := &progressStream[pb.DeployProgress]{ctx: ctx}
+
+	if err := s.executeWithRollingUpdates(ctx, f, resolved, stream, newDeployFailures(stream)); err != nil {
+		t.Fatalf("a VM on an offline host must be skipped: %v", err)
+	}
+	skipped := false
+	for _, p := range stream.Sent {
+		if p.VmName == "web" && strings.Contains(p.Detail, "offline") {
+			skipped = true
+		}
+	}
+	if !skipped {
+		t.Errorf("no progress line says web was skipped on its offline host: %+v", stream.Sent)
+	}
+	if vm, _ := corrosion.GetVM(ctx, s.db, "web"); vm == nil || vm.CPUActual != 2 {
+		t.Errorf("web = %+v; a VM on an offline host must be left as it is", vm)
+	}
+}
+
 // A combined cpu+mem in-place update applies BOTH dimensions live (via the owner-
 // forwarding UpdateVM + SetVMMemory decomposition) without deleting the VM.
 func TestExecuteWithRollingUpdates_InPlaceCombined_AppliesCpuAndMem(t *testing.T) {

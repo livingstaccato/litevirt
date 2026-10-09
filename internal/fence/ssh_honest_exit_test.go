@@ -195,8 +195,8 @@ func TestFenceSSH_FallsBackToSysrqWhenSystemctlCannotForce(t *testing.T) {
 //
 // The remote command once ended in `|| true`, so the shell exited 0 whatever
 // happened and the fence reported Success. That success is load-bearing:
-// fenceProvedOff writes hosts.state = "fenced" from it, and a later coordinator
-// resumes the reschedule from that record alone. A host that is still running
+// a coordinator reschedules on it, and a later coordinator resumes the
+// reschedule from its record alone. A host that is still running
 // then has its VMs started somewhere else.
 func TestFenceSSH_ReportsFailureWhenThePoweroffFailed(t *testing.T) {
 	h := fakeSSH(t, fakeRemote{forceWorks: false, sysrqWritable: false})

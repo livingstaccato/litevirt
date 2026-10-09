@@ -529,8 +529,10 @@ lv host label set <host> litevirt.fence_requires_confirmation=true
 ```
 
 With the label, a fence that did not **verify** the power-off — `ssh`, and
-`best-effort` in both its forms — does not reschedule anything and does not
-record the host as `fenced`; it is left `offline`. An IPMI fence, which does
+`best-effort` in both its forms — does not reschedule anything, and it does not
+record the host as `fenced`; it is left `offline`. (Once `fence_state_v1` has
+latched, no unverified fence records `fenced`, label or not — see
+[What a fence records](#what-a-fence-records).) An IPMI fence, which does
 verify, is unaffected. The fence's assurance is shown by `lv doctor fence` and
 `lv host fence` (see [Diagnostics](diagnostics.md)).
 
@@ -543,21 +545,55 @@ the binary out before relying on it.
 `lv host fence-confirm <host>`. The coordinator resumes the recovery on its next
 cycle — see [Resuming a recovery from a confirmation](#resuming-a-recovery-from-a-confirmation).
 
+### What a fence records
+
+A fence writes a `fencing_log` row and, when it succeeds, the host's state, in
+one replicated entry. The state says what the fence **proved**:
+
+| Fence | Host state |
+|---|---|
+| `ipmi`, powered off and observed off | `fenced` |
+| `ssh`, `watchdog`, or `best-effort` that succeeded | `offline` once `fence_state_v1` has latched; `fenced` before |
+| any fence that failed | `offline` |
+| `lv host fence-confirm` | `fenced` |
+
+`fenced` is the cluster's statement that the host is **off**, and only a
+verified power-off or an operator's confirmation makes it
+(colonelpanik/litevirt#253). An SSH success means a shell accepted a forced
+power-off; nothing looked afterwards. Such a fence keeps every bit of the
+authority it had: the coordinator that ran it reschedules on it (subject to the
+safe-fence policy and `litevirt.fence_requires_confirmation`), a successor
+resumes from it (below), and the host is not put back in service behind the
+workloads that moved off it — it is `offline`, and a host whose newest fence
+succeeded is treated exactly like a `fenced` one: only `lv host undrain` brings
+it back, unless the coordinator that fenced it moved nothing off it.
+
+Before `fence_state_v1` latches — while any host the cluster replicates to,
+a `maintenance` host included, runs an older build — an unverified fence still
+records `fenced`, because an older successor resumes only from that state.
+Nothing that takes a host to be **off** reads the state alone, on any build of
+this release: owner-assert, `lv host rm --dead`, the voter-loss condition and
+late-replica matching each require the host's newest fence to be proof-grade,
+so a `fenced` state an older leader wrote for an SSH fence is not taken as
+proof.
+
 ### Resuming a recovery from a recorded fence
 
 A leader can fence a host and then stop before it moves the host's workloads:
 its lease runs out mid-fence, or it dies. The fence is already recorded — a
-`fencing_log` row and the host's `fenced` state — and whichever coordinator
-holds the lease next takes the recovery over from that record. It needs:
+`fencing_log` row and the state it records — and whichever coordinator holds
+the lease next takes the recovery over from that record. It needs:
 
-1. **The host is still recorded `fenced`.** `lv host undrain` records it
-   `active`, which ends the fence's authority. So does the host's own daemon
-   starting up again, but that write can be lost (a failed startup write, or a
-   last-writer-wins loss under clock skew), so nothing below relies on it.
-2. **The newest fence attempt succeeded**, and is one the leader could itself
-   have rescheduled on. That covers a verified `ipmi` power-off and an `ssh` or
-   `best-effort` success, unless the host is labelled
-   `litevirt.fence_requires_confirmation`.
+1. **The host is still recorded `fenced` or `offline`.** `lv host undrain`
+   records it `active`, which ends the fence's authority. So does the host's
+   own daemon starting up again, but that write can be lost (a failed startup
+   write, or a last-writer-wins loss under clock skew), so nothing below
+   relies on it.
+2. **The newest fence attempt succeeded.** That covers a verified `ipmi`
+   power-off and an `ssh` or `best-effort` success. A host left `offline` by a
+   failed fence has a failed newest attempt and is not resumed from. The
+   resumed recovery passes the same safe-fence policy and
+   `litevirt.fence_requires_confirmation` check the leader's would have.
 
 What happens next depends on the fence:
 
@@ -614,7 +650,7 @@ still needs it. The safe-fence policy is decided by the recorded fence, not by
 the host's current strategy: an `ssh` fence on record is treated as best-effort
 under the policy, even if the host has since been switched to `ipmi`.
 
-The `fencing_log` row and the `fenced` state are written as one replicated
+The `fencing_log` row and the state it records are written as one replicated
 entry, so every peer holds both or neither. A leader on an older release writes
 them separately, and a successor can then hold the row while the host still
 reads `active`. It treats that as "the state has not arrived yet": it neither

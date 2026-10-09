@@ -43,14 +43,25 @@ const ownershipAssertDebounce = 2 * time.Minute
 // keeps running across a daemon re-exec (KillMode=process) and during a drain, so
 // skipping them could miss a live copy and reclaim into a split-brain. We exclude
 // only: self; witnesses (never host workloads, and may have no runtime → always
-// "unknown", which would block every reclaim); and FENCED hosts (positively dead
-// by fencing proof → their workloads are gone). An unreachable peer in any
-// included state simply yields "inconclusive", which is safe.
-func workloadCapablePeers(hosts []corrosion.HostRecord, self string) []string {
+// "unknown", which would block every reclaim); and hosts PROVED OFF — recorded
+// 'fenced' over a proof-grade fence (corrosion.HostProvedOff's rule), whose
+// workloads are gone. An unreachable peer in any included state simply yields
+// "inconclusive", which is safe.
+//
+// The 'fenced' state alone is not that proof (colonelpanik/litevirt#253): a
+// leader before fence_state_v1 latched records it for an SSH poweroff nothing
+// verified, and that host may be running the workload still. Such a host is
+// asked like any other, and a fence row that cannot be read keeps it in.
+func workloadCapablePeers(ctx context.Context, db *corrosion.Client, hosts []corrosion.HostRecord, self string) []string {
 	var others []string
 	for _, h := range hosts {
-		if h.Name == self || h.IsWitness() || h.State == "fenced" {
+		if h.Name == self || h.IsWitness() {
 			continue
+		}
+		if h.State == "fenced" {
+			if proved, err := corrosion.FenceRecordProvesOff(ctx, db, h.Name); err == nil && proved {
+				continue
+			}
 		}
 		others = append(others, h.Name)
 	}
@@ -147,7 +158,7 @@ func (r *Reconciler) assertRuntimeOwnership(ctx context.Context) {
 			return
 		}
 	}
-	others := workloadCapablePeers(hosts, r.hostName)
+	others := workloadCapablePeers(ctx, r.db, hosts, r.hostName)
 
 	seen := make(map[string]bool, len(localDomains))
 	for _, domName := range localDomains {

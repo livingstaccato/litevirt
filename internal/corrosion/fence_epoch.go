@@ -6,6 +6,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/litevirt/litevirt/internal/fence"
 )
 
 // SharedDiskFenceWindow bounds how recent a proof-grade fence must be to authorize
@@ -75,38 +77,18 @@ func CheckProofGradeFence(ctx context.Context, c *Client, fenceEpoch, oldOwner s
 }
 
 // Fence assurance levels: what a recorded fence actually ESTABLISHES about the
-// host, as opposed to what its result string says happened.
+// host, as opposed to what its result string says happened. They are the
+// fence package's (fence.Assurance*), named here for the callers that read
+// fencing_log rows; see that package for what each one means.
 const (
-	// FenceVerified: the host was powered off AND observed off afterwards
-	// (IPMI: chassis power off, then a power-status read that says off).
-	FenceVerified = "verified"
-	// FenceOperatorConfirmed: a human ran `lv host fence-confirm` after
-	// ensuring the host is down.
-	FenceOperatorConfirmed = "operator-confirmed"
-	// FenceRequested: the host accepted a poweroff (SSH) or the heartbeat was
-	// stopped (watchdog), and nothing looked afterwards. The host may be off;
-	// the record cannot say.
-	FenceRequested = "requested"
-	// FenceAssumed: the request itself is not known to have arrived. Only the
-	// lenient best-effort path produces it — SSH failed and it proceeded.
-	FenceAssumed = "assumed"
-	// FenceSelfPaused: the request is not known to have arrived either, but
-	// the recovery it authorises waited out the host's own partition pause
-	// (docs/design/partition-pause.md §4): with partition_pause_v1 latched, a
-	// host cut off from the voter majority suspends its recoverable workloads
-	// within T_pause, and the coordinator started nothing until
-	// health.PartitionPauseWait had certainly passed. It says the old copy
-	// stopped EXECUTING, not that the host is off, so it is not proof-grade.
-	// Only FenceAssuranceDetail returns it: the row is a best-effort-ssh row
-	// whose detail carries FencePauseReliance.
-	FenceSelfPaused = "self_paused"
-	// FenceAwaitingConfirmation: a manual fence, waiting for a human. Not a
-	// failure — that is the strategy working as designed.
-	FenceAwaitingConfirmation = "awaiting-confirmation"
-	// FenceFailed: the fence ran and reported failure.
-	FenceFailed = "failed"
-	// FenceUnknown: a pair this code does not recognise. Never a success.
-	FenceUnknown = "unknown"
+	FenceVerified             = fence.AssuranceVerified
+	FenceOperatorConfirmed    = fence.AssuranceOperatorConfirmed
+	FenceRequested            = fence.AssuranceRequested
+	FenceAssumed              = fence.AssuranceAssumed
+	FenceSelfPaused           = fence.AssuranceSelfPaused
+	FenceAwaitingConfirmation = fence.AssuranceAwaitingConfirmation
+	FenceFailed               = fence.AssuranceFailed
+	FenceUnknown              = fence.AssuranceUnknown
 )
 
 // FenceAssurance classifies a fencing_log (method, result) pair.
@@ -117,61 +99,32 @@ const (
 // identical in the table while meaning different things: IPMI powered the host
 // off and then observed it off; SSH had a shell accept a poweroff command.
 //
-// The classification is derived at READ time from what every row already
-// records, rather than stored. That needs no schema change and no new
-// replicated statement shape, and it classifies every historical row too,
-// which a new column never could.
-//
-// FenceProofGrade is defined in terms of this, so the shared-storage gate and
-// every operator surface read one classification rather than two that can
-// drift apart.
+// It is fence.Assurance: ONE table, which the coordinator's own judgement of a
+// live fence (fence.Result.ProvedOff) reads too, so the state a fence writes,
+// the authority a successor resumes from and the shared-storage gate cannot
+// drift apart (colonelpanik/litevirt#253).
 func FenceAssurance(method, result string) string {
-	switch {
-	case result == "manual-confirmed":
-		return FenceOperatorConfirmed
-	case method == "manual" && result == "partial":
-		return FenceAwaitingConfirmation
-	case result == "partial":
-		switch method {
-		case "ipmi", "ssh", "watchdog", "best-effort-ssh":
-			return FenceFailed
-		}
-	case result == "fenced":
-		switch method {
-		case "ipmi":
-			return FenceVerified
-		case "ssh", "watchdog":
-			return FenceRequested
-		case "best-effort-ssh":
-			return FenceAssumed
-		}
-	}
-	return FenceUnknown
+	return fence.Assurance(method, result)
 }
 
 // FenceProofGrade reports whether a fencing_log (method, result) pair PROVES the
-// old owner is actually powered off — the bar a cross-host SHARED-disk ownership
-// transfer must clear (capabilities.SharedStorageFenceV1). It accepts ONLY a
-// confirmed power-off:
+// old owner is actually powered off. It accepts ONLY a confirmed power-off:
 //
 //   - result "fenced" + method "ipmi": IPMI/BMC power-off with verify.
 //   - result "manual-confirmed": an operator ran `lv host fence-confirm` after
 //     physically powering the host off.
 //
-// It REJECTS a best-effort / plain SSH "fenced" (a lenient SSH poweroff reports
+// It REJECTS a best-effort / plain SSH "fenced" (an SSH poweroff reports
 // success but never confirms the host is down), a "partial" (failed) fence, an
 // unconfirmed "manual", and a "watchdog" result (a self-fence timer can't be
-// positively verified on all hardware). This is deliberately STRICTER than the
-// per-host safe_fence gate, which a best-effort success can satisfy — a shared
-// writable disk started on a second host while the first may still write it
-// corrupts the disk, so only a proven power-off is acceptable.
+// positively verified on all hardware).
+//
+// It is the bar for a cross-host SHARED-disk ownership transfer
+// (capabilities.SharedStorageFenceV1), for recording a host 'fenced' once
+// fence_state_v1 has latched, and for every reader that takes a host to be off
+// (HostProvedOff). It is fence.ProofGrade.
 func FenceProofGrade(method, result string) bool {
-	switch FenceAssurance(method, result) {
-	case FenceVerified, FenceOperatorConfirmed:
-		return true
-	default:
-		return false
-	}
+	return fence.ProofGrade(method, result)
 }
 
 // FenceEpochRef binds a cross-host transfer proof to the SPECIFIC fence of the old

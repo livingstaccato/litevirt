@@ -63,7 +63,7 @@ func (c *ContainerChecker) assertContainerOwnership(ctx context.Context) {
 			return
 		}
 	}
-	others := workloadCapablePeers(hosts, c.hostName)
+	others := workloadCapablePeers(ctx, c.db, hosts, c.hostName)
 
 	// All live container rows indexed by name (cross-host) — we must reason over
 	// every host's row, not just our own, to find the single remote owner.

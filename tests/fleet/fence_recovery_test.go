@@ -17,19 +17,22 @@ import (
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/failover"
 	"github.com/litevirt/litevirt/internal/fence"
 	"github.com/litevirt/litevirt/internal/health"
 )
 
 // fenceSettled holds x's first claim RPC until every voter's replica records
-// x's fence of the dead owner (the fencing_log row and the host's 'fenced'
-// state), so a scenario about what a successor does with a dead leader's
+// x's fence of the dead owner (the fencing_log row and the state it records:
+// 'fenced' for a verified fence, 'offline' for an unverified one once
+// fence_state_v1 has latched), so a scenario about what a successor does with a dead leader's
 // recorded fence is not also a race over whether the record got out. The row
 // and the state travel in one entry, so a voter holds both or neither; the
 // wait is for the push, not for an ordering between them.
 type fenceSettled struct {
 	voters []*Node
 	host   string
+	state  string // the host state x's fence records
 	once   sync.Once
 	ok     bool
 }
@@ -42,7 +45,7 @@ func (f *fenceSettled) await() {
 			for _, n := range f.voters {
 				h, err := corrosion.GetHost(ctx, n.DB, f.host)
 				rows, qerr := n.DB.Query(ctx, `SELECT 1 AS one FROM fencing_log WHERE host_name = ? AND result = 'fenced'`, f.host)
-				if err != nil || qerr != nil || h == nil || h.State != "fenced" || len(rows) == 0 {
+				if err != nil || qerr != nil || h == nil || h.State != f.state || len(rows) == 0 {
 					all = false
 					break
 				}
@@ -75,17 +78,30 @@ func dieAtFirstClaim(c *Cluster, x *Node, settled *fenceSettled) ClaimScript {
 // coordinators, the clock and a count of the fences a issues.
 func deadLeaderFence(t *testing.T, c *Cluster, voters []*Node, x, d *Node, fr, aFr fence.Result) (*Coordinators, *VirtualClock, *atomic.Int32) {
 	t.Helper()
+	// quorateGate latches every token, fence_state_v1 included, so an
+	// unverified fence records 'offline' and only a verified one 'fenced'.
+	wantState := "offline"
+	if fr.ProvedOff() {
+		wantState = "fenced"
+	}
+	return deadLeaderFenceUnder(t, c, voters, x, d, fr, aFr, quorateGate{}, wantState)
+}
+
+// deadLeaderFenceUnder is deadLeaderFence with x's and a's coordinators under
+// gate, and x's fence expected to record d in wantState.
+func deadLeaderFenceUnder(t *testing.T, c *Cluster, voters []*Node, x, d *Node, fr, aFr fence.Result, gate failover.FailoverGate, wantState string) (*Coordinators, *VirtualClock, *atomic.Int32) {
+	t.Helper()
 	ctx := context.Background()
 	a := voters[0]
-	settled := &fenceSettled{voters: voters, host: d.Name}
+	settled := &fenceSettled{voters: voters, host: d.Name, state: wantState}
 	c.SetClaimScript(dieAtFirstClaim(c, x, settled))
 
 	clock := NewVirtualClock(time.Now().UTC())
 	cs := c.NewCoordinators(clock)
 	var refenced atomic.Int32
-	cs.ByNode[x.Name].Gate = quorateGate{}
+	cs.ByNode[x.Name].Gate = gate
 	cs.ByNode[x.Name].SetFencer(func(context.Context, fence.HostConfig) fence.Result { return fr })
-	cs.ByNode[a.Name].Gate = quorateGate{}
+	cs.ByNode[a.Name].Gate = gate
 	cs.ByNode[a.Name].SetFencer(func(_ context.Context, h fence.HostConfig) fence.Result {
 		refenced.Add(1)
 		if h.FenceStrategy != fr.Method {
@@ -99,8 +115,8 @@ func deadLeaderFence(t *testing.T, c *Cluster, voters []*Node, x, d *Node, fr, a
 	if !settled.ok {
 		t.Fatalf("x's fence of %s never settled on every voter", d.Name)
 	}
-	if h, _ := corrosion.GetHost(ctx, a.DB, d.Name); h == nil || h.State != "fenced" {
-		t.Fatalf("fixture: %s is %+v on %s after x's fence, want 'fenced'", d.Name, h, a.Name)
+	if h, _ := corrosion.GetHost(ctx, a.DB, d.Name); h == nil || h.State != wantState {
+		t.Fatalf("fixture: %s is %+v on %s after x's %s fence, want %q", d.Name, h, a.Name, fr.Method, wantState)
 	}
 	return cs, clock, &refenced
 }
@@ -266,8 +282,10 @@ func TestFleet_FenceRecovery_SuccessorResumesFromADeadLeadersFence(t *testing.T)
 // TestFleet_FenceRecovery_HostBackSinceItsFenceIsNotRecovered: an UNVERIFIED
 // fence the host may have come back from since is no authority, however the
 // successor finds it, and it is never re-fenced. Each arm's x fence is an SSH
-// power-off; d is recorded 'fenced' throughout (its daemon's boot write never
-// reached anyone, or lost LWW), which is the case the state check cannot catch.
+// power-off; d is recorded 'offline' throughout — the state an unverified fence
+// records once fence_state_v1 has latched — because its daemon's boot write
+// never reached anyone, or lost LWW, which is the case the state check cannot
+// catch.
 //
 //   - aged-streaks-restarted: seven minutes on, every voter's failing run began
 //     after the fence. Nobody has watched it stay down since.

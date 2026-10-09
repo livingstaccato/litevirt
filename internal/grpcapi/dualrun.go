@@ -881,9 +881,9 @@ const migrationGrace = 15 * time.Minute
 // keeps QEMU running while a daemon is down, and without a real STONITH/watchdog a "fenced"
 // host is a DB state whose disk may still be live, so a fenced host that failover has
 // already restarted elsewhere is the canonical dual-run this detector exists to catch.
-// (This deliberately differs from health.workloadCapablePeers, which excludes fenced for
-// OWNERSHIP eligibility — a fenced host is not eligible to own a workload, but it is exactly
-// where an illegitimate second copy hides.) An unreachable fenced host degrades to a
+// (This deliberately differs from health.workloadCapablePeers, which excludes a host PROVED
+// off — 'fenced' over a proof-grade fence — from OWNERSHIP corroboration; the detector probes
+// even that host, because it is exactly where an illegitimate second copy hides.) An unreachable fenced host degrades to a
 // coverage finding, which is the correct fail-safe.
 func dualRunProbeTargets(hosts []corrosion.HostRecord) []string {
 	var out []string

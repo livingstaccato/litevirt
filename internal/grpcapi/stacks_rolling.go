@@ -647,10 +647,13 @@ func (s *Server) rollingUpdateWave(ctx context.Context, f *compose.File, updates
 	})
 
 	// Skip VMs on draining/fenced hosts — drain handles those separately (#19).
+	// 'offline' too: once fence_state_v1 has latched it is the state an
+	// unverified (SSH) fence records, which is a fenced host all the same
+	// (colonelpanik/litevirt#253).
 	drainingHosts := map[string]bool{}
 	if hosts, herr := corrosion.ListHosts(ctx, s.db); herr == nil {
 		for _, h := range hosts {
-			if h.State == "draining" || h.State == "fenced" {
+			if h.State == "draining" || h.State == "fenced" || h.State == "offline" {
 				drainingHosts[h.Name] = true
 			}
 		}
@@ -664,7 +667,7 @@ func (s *Server) rollingUpdateWave(ctx context.Context, f *compose.File, updates
 			continue
 		}
 		if drainingHosts[a.TargetHost] {
-			_ = stream.Send(&pb.DeployProgress{Phase: "done", VmName: a.VMName, Detail: "skipped — host is draining/fenced"})
+			_ = stream.Send(&pb.DeployProgress{Phase: "done", VmName: a.VMName, Detail: "skipped — host is draining/fenced/offline"})
 			continue
 		}
 		actions = append(actions, rolling.VMAction{

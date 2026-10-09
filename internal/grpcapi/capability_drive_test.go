@@ -91,6 +91,10 @@ func TestDriveCapabilityActivation_FlagAwareBoundedDriver(t *testing.T) {
 		// incarnation and seals the legacy key". A coordinator relies on every
 		// voter keeping that format.
 		capabilities.ClaimIncarnationV1: true,
+		// fence_state_v1: "this build resumes from an unverified fence
+		// recorded 'offline' and does not auto-activate such a host". The
+		// failover lease holder relies on whichever node holds it next.
+		capabilities.FenceStateV1: true,
 	}
 
 	// Cross-check the hand-written list against the ONE declaration, so adding a

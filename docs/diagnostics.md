@@ -648,12 +648,22 @@ checked.
 | `awaiting-confirmation` | `manual` + `partial` | A manual fence waiting for a person. Not a failure. |
 | `failed` | any + `partial` | The fence ran and reported failure. |
 
-Only `verified` and `operator-confirmed` satisfy the shared-storage fence
-(`corrosion.FenceProofGrade` is defined in terms of this table). A `requested` or
-`assumed` fence still lets the coordinator that ran it reschedule **local-disk**
-VMs, which is why the command prints a note when it finds one. A later
-coordinator never resumes a recovery from one — resuming needs a proof-grade
-fence. `lv host fence` prints the same assurance for the fence it just ran.
+Only `verified` and `operator-confirmed` are proof-grade: they satisfy the
+shared-storage fence, and only they record a host `fenced` once
+`fence_state_v1` has latched (`corrosion.FenceProofGrade` is defined in terms
+of this table, and the coordinator judges a live fence by the same one). A
+`requested` or `assumed` fence records the host `offline`, and still lets the
+coordinator that ran it reschedule **local-disk** VMs, which is why the command
+prints a note when it finds one. A later coordinator resumes a recovery from
+one while it still stands, and never fences the host again for it (see
+[Resuming a recovery from a recorded fence](migration-failover.md#resuming-a-recovery-from-a-recorded-fence)).
+`lv host fence` prints the same assurance for the fence it just ran.
+
+A host recorded `fenced` is taken to be **off** only when its newest fence is
+proof-grade. Before `fence_state_v1` latches, or from a leader on an older
+build, an SSH fence records `fenced` too; owner-assert still asks that host
+whether it runs a workload, and `lv host rm --dead` refuses it until it is
+confirmed off (`lv host fence-confirm`).
 
 `litevirt_fences_total{method,assurance}` counts the same classification. Note
 that the older `litevirt_fence_failures_total` counts every result other than

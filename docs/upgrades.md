@@ -669,6 +669,43 @@ again loses nothing. Roll forward.
 Retiring the `hosts` copy is a later release's step, behind a second token; see
 [design/host-membership-retire-old-columns.md](design/host-membership-retire-old-columns.md).
 
+### An unverified fence records `offline` after the roll
+
+A host recorded `fenced` used to mean "a fence succeeded", whatever the fence
+was. An SSH poweroff that nothing verified recorded it just as an IPMI
+power-off observed off did, and readers took the state as proof the host was
+off (colonelpanik/litevirt#253). Two things change:
+
+- **At once, on each upgraded host:** nothing takes a `fenced` state as proof
+  of power-off unless the host's newest fence is proof-grade (`ipmi`, or
+  `lv host fence-confirm`). Owner-assert asks an SSH-fenced host whether it
+  runs a workload, `lv host rm --dead` refuses a host whose `fenced` state
+  rests on an SSH fence, and the voter-loss condition asks such a host which
+  machine it is. This reads the rows every fence already wrote; nothing is
+  backfilled.
+- **After the last host has upgraded:** the mandatory, replication-gated
+  `fence_state_v1` token latches, and from then on an SSH, watchdog or
+  best-effort fence records the host `offline`, not `fenced`. Recovery is
+  unchanged: the coordinator still reschedules on such a fence, a successor
+  resumes from it, and the host is not put back in service automatically
+  once its workloads have moved. Until the token latches — while any host
+  the cluster replicates to, one parked in `maintenance` included, runs the
+  previous release — such a fence keeps recording `fenced`, because a
+  coordinator on that release resumes a recovery only from `fenced`.
+
+What an operator sees after the latch: `lv host ls` lists an SSH-fenced host
+as `offline`. Bring it back with `lv host undrain <host>` as before. An
+`offline` host whose newest fence **failed** is still put back in service
+when a quorum sees it healthy again, as before; one whose newest fence
+succeeded waits for `lv host undrain`, exactly like a `fenced` host — this
+now includes a host fenced with `lv host fence`, which records it `offline`.
+A host that boots again still records itself `active` from its own daemon, as
+before; what waits is a host that answers without having restarted, which is
+the host an unverified fence may never have powered off.
+
+A binary rolled back below the latch enters WAL quarantine, as below every
+latched token. See [What a fence records](migration-failover.md#what-a-fence-records).
+
 ### Gossip encryption is a separate roll, after the upgrade
 
 The upgrade itself changes nothing on the gossip wire: `enforcement.gossip_encryption`

@@ -287,8 +287,20 @@ func (s *Server) lateReplicaOK(ctx context.Context, path string, k replicaKey) b
 	if err != nil || last.IsZero() {
 		return false
 	}
-	if hr, err := corrosion.GetHost(ctx, s.db, writer); err != nil || (healthy && (hr == nil || hr.State != "fenced")) {
-		return false // live, or unknown
+	// A writer that still answers counts as gone only when it is PROVED off:
+	// a 'fenced' state over an unverified fence is not that proof
+	// (colonelpanik/litevirt#253), and such a writer may still be writing.
+	hr, err := corrosion.GetHost(ctx, s.db, writer)
+	if err != nil {
+		return false // unknown
+	}
+	if healthy {
+		if hr == nil || hr.State != "fenced" {
+			return false // live
+		}
+		if proved, perr := corrosion.FenceRecordProvesOff(ctx, s.db, writer); perr != nil || !proved {
+			return false // live, or unknown
+		}
 	}
 	st := sharedStoreOf(filepath.Dir(path))
 	if st.ID == "" {

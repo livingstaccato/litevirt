@@ -654,6 +654,30 @@ func revertToLiveSnapshot(v snapshotAPI, domainName, snapshotName, vmstatePath s
 			restoreXML, savedXML = rewritten, rewritten
 		}
 	}
+	// The saved image's definition may lack litevirt's own metadata (the
+	// managed stamp, the owner epoch) that the domain carries now: the lab
+	// saw a restored domain without litevirt-managed until a background
+	// stamp ~10 s later. Carried over from the current definition into the
+	// one the domain is restored with and defined as, so it never runs
+	// without it.
+	if cur, err := v.DomainGetXMLDesc(dom, golibvirt.DomainXMLInactive); err == nil {
+		base := restoreXML
+		if base == "" {
+			secure, err := v.DomainSaveImageGetXMLDesc(vmstatePath, uint32(golibvirt.DomainSaveImageXMLSecure))
+			if err != nil {
+				return fmt.Errorf("read saved image XML: %w", err)
+			}
+			base = secure
+		}
+		with, err := carryLitevirtMetadata(base, cur)
+		if err != nil {
+			return fmt.Errorf("carry litevirt metadata into the restored definition: %w", err)
+		}
+		if with != base {
+			restoreXML, savedXML = with, with
+		}
+	}
+
 	// The saved image names the overlays the snapshot made. Every disk is
 	// restored onto the overlay it will run on — a new one, or one an
 	// earlier restore of this snapshot made — with the old chain dropped,
@@ -1045,6 +1069,87 @@ func repointRevertedDisk(domXML, dev, file string) (string, error) {
 // sourceFileAttr finds a <source> start tag's file attribute value:
 // single-quoted in group 1, double-quoted in group 2.
 var sourceFileAttr = regexp.MustCompile(`\sfile\s*=\s*(?:'([^']*)'|"([^"]*)")`)
+
+// litevirtMetadataPrefix starts the namespace URI of every element litevirt
+// keeps in a domain's <metadata>.
+const litevirtMetadataPrefix = "https://litevirt.dev/xmlns/"
+
+// carryLitevirtMetadata copies into domXML each of from's <metadata>
+// elements in a litevirt namespace that domXML has none of, spliced into
+// the text so every other byte is kept. domXML is returned unchanged when
+// it lacks nothing.
+func carryLitevirtMetadata(domXML, from string) (string, error) {
+	type elem struct {
+		uri  string
+		text string
+	}
+	scan := func(x string) (els []elem, mdEnd, afterName int64, err error) {
+		dec := xml.NewDecoder(strings.NewReader(x))
+		depth, mdEnd, afterName := 0, int64(-1), int64(-1)
+		inMD, elStart, elDepth, elURI := false, int64(-1), -1, ""
+		for {
+			start := dec.InputOffset()
+			tok, err := dec.Token()
+			if err == io.EOF {
+				return els, mdEnd, afterName, nil
+			}
+			if err != nil {
+				return nil, 0, 0, err
+			}
+			end := dec.InputOffset()
+			switch t := tok.(type) {
+			case xml.StartElement:
+				depth++
+				if depth == 2 && t.Name.Local == "metadata" && t.Name.Space == "" {
+					inMD = true
+				} else if inMD && depth == 3 && strings.HasPrefix(t.Name.Space, litevirtMetadataPrefix) {
+					elStart, elDepth, elURI = start, depth, t.Name.Space
+				}
+			case xml.EndElement:
+				if elStart >= 0 && depth == elDepth {
+					els = append(els, elem{elURI, x[elStart:end]})
+					elStart = -1
+				}
+				if inMD && depth == 2 {
+					inMD, mdEnd = false, start
+				}
+				if depth == 2 && (t.Name.Local == "name" || t.Name.Local == "uuid") && t.Name.Space == "" {
+					afterName = end
+				}
+				depth--
+			}
+		}
+	}
+	have, mdEnd, afterName, err := scan(domXML)
+	if err != nil {
+		return "", err
+	}
+	want, _, _, err := scan(from)
+	if err != nil {
+		return "", err
+	}
+	got := map[string]bool{}
+	for _, e := range have {
+		got[e.uri] = true
+	}
+	var add strings.Builder
+	for _, e := range want {
+		if !got[e.uri] {
+			add.WriteString(e.text)
+			got[e.uri] = true
+		}
+	}
+	if add.Len() == 0 {
+		return domXML, nil
+	}
+	if mdEnd >= 0 {
+		return domXML[:mdEnd] + add.String() + domXML[mdEnd:], nil
+	}
+	if afterName < 0 {
+		return "", fmt.Errorf("the definition has no <name> to put <metadata> after")
+	}
+	return domXML[:afterName] + "<metadata>" + add.String() + "</metadata>" + domXML[afterName:], nil
+}
 
 // resetOverlay recreates overlay as a fresh, empty qcow2 backed by base,
 // discarding any prior contents. Used by the live-snapshot revert to roll a

@@ -859,3 +859,60 @@ func TestSnapshotDiskFiles_NamesTheOverlaysRealBase(t *testing.T) {
 	}
 	t.Fatalf("SnapshotDiskFiles(s2) = %v, want it to name %s, the file s2's overlay backs on", files, s1)
 }
+
+// The lab (snapshot-lab.md, Round 3 row 2c): after a memory restore the
+// domain came back without litevirt-managed metadata, from a saved image
+// that does not carry it, until a background task stamped it ~10 s later.
+// The revert carries litevirt's metadata from the domain it replaces into
+// the restored domain and its definition, the moment they exist.
+func TestRevert_AMemoryRestoreKeepsLitevirtMetadata(t *testing.T) {
+	for _, older := range []bool{false, true} {
+		for _, stopped := range []bool{false, true} {
+			t.Run(fmt.Sprintf("older=%v/stopped=%v", older, stopped), func(t *testing.T) {
+				m := newLibvirt10(t)
+				m.saveWithoutManaged = true
+				save := m.memorySnapshot("m1")
+				if older {
+					m.memorySnapshot("m2")
+				}
+				if stopped {
+					if err := m.DomainDestroy(golibvirt.Domain{Name: "vm"}); err != nil {
+						t.Fatal(err)
+					}
+				}
+				var during string
+				m.onRestore = func(x string) { during = x }
+				m.revertLive("m1", save)
+				x, err := m.DomainGetXMLDesc(golibvirt.Domain{Name: "vm"}, 0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for when, xml := range map[string]string{"restored domain": during, "definition": x} {
+					if !strings.Contains(xml, `<litevirt-managed:managed xmlns:litevirt-managed="https://litevirt.dev/xmlns/managed/1" incarnation="1"/>`) ||
+						!strings.Contains(xml, "litevirt-owner-epoch:owner-epoch") {
+						t.Errorf("the %s lacks litevirt's metadata:\n%s", when, xml)
+					}
+				}
+			})
+		}
+	}
+}
+
+// carryLitevirtMetadata adds only what is missing, into an existing
+// <metadata> or a new one after <uuid>, and leaves other bytes alone.
+func TestCarryLitevirtMetadata(t *testing.T) {
+	from := `<domain><name>vm</name><uuid>u</uuid><metadata><litevirt-managed:managed xmlns:litevirt-managed="https://litevirt.dev/xmlns/managed/1" incarnation="7"/>` +
+		`<other:x xmlns:other="urn:other"/><litevirt-owner-epoch:owner-epoch xmlns:litevirt-owner-epoch="https://litevirt.dev/xmlns/owner-epoch/1">3</litevirt-owner-epoch:owner-epoch></metadata></domain>`
+	for _, tc := range []struct{ in, want string }{
+		{`<domain><name>vm</name><uuid>u</uuid><devices/></domain>`,
+			`<domain><name>vm</name><uuid>u</uuid><metadata><litevirt-managed:managed xmlns:litevirt-managed="https://litevirt.dev/xmlns/managed/1" incarnation="7"/><litevirt-owner-epoch:owner-epoch xmlns:litevirt-owner-epoch="https://litevirt.dev/xmlns/owner-epoch/1">3</litevirt-owner-epoch:owner-epoch></metadata><devices/></domain>`},
+		{`<domain><name>vm</name><metadata><litevirt-owner-epoch:owner-epoch xmlns:litevirt-owner-epoch="https://litevirt.dev/xmlns/owner-epoch/1">3</litevirt-owner-epoch:owner-epoch></metadata></domain>`,
+			`<domain><name>vm</name><metadata><litevirt-owner-epoch:owner-epoch xmlns:litevirt-owner-epoch="https://litevirt.dev/xmlns/owner-epoch/1">3</litevirt-owner-epoch:owner-epoch><litevirt-managed:managed xmlns:litevirt-managed="https://litevirt.dev/xmlns/managed/1" incarnation="7"/></metadata></domain>`},
+		{from, from},
+	} {
+		got, err := carryLitevirtMetadata(tc.in, from)
+		if err != nil || got != tc.want {
+			t.Errorf("carry(%s)\n got %s (%v)\nwant %s", tc.in, got, err, tc.want)
+		}
+	}
+}

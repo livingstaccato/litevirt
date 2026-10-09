@@ -50,6 +50,11 @@ type libvirt10 struct {
 	// refuseCurrent makes a REDEFINE with VIR_DOMAIN_SNAPSHOT_CREATE_CURRENT
 	// fail, as a libvirt that will not take it would.
 	refuseCurrent bool
+	// saveWithoutManaged writes memory snapshots' saved images without the
+	// litevirt-managed metadata, as the lab's restored domain came back.
+	saveWithoutManaged bool
+	// onRestore sees the XML a DomainRestoreFlags brings the domain up with.
+	onRestore func(xml string)
 }
 
 type modelDomain struct {
@@ -63,6 +68,22 @@ type modelDomain struct {
 	backing    map[string][]string
 	state      golibvirt.DomainState
 	persistent bool
+	// metadata is the domain's <metadata> element as defined, "" for none.
+	metadata string
+}
+
+// litevirtMetadata is the <metadata> a litevirt domain carries.
+const litevirtMetadata = `<metadata><litevirt-managed:managed xmlns:litevirt-managed="https://litevirt.dev/xmlns/managed/1" incarnation="1"/>` +
+	`<litevirt-owner-epoch:owner-epoch xmlns:litevirt-owner-epoch="https://litevirt.dev/xmlns/owner-epoch/1">1</litevirt-owner-epoch:owner-epoch></metadata>`
+
+// metadataOf is x's <metadata>...</metadata> text, "" when it has none.
+func metadataOf(x string) string {
+	i := strings.Index(x, "<metadata>")
+	j := strings.Index(x, "</metadata>")
+	if i < 0 || j < i {
+		return ""
+	}
+	return x[i : j+len("</metadata>")]
 }
 
 type modelSnap struct {
@@ -119,7 +140,7 @@ func newLibvirt10Disks(t *testing.T, n int) *libvirt10 {
 	}
 	return &libvirt10{
 		t: t, dir: dir,
-		dom:   &modelDomain{name: "vm", disks: devs, state: golibvirt.DomainRunning, persistent: true},
+		dom:   &modelDomain{name: "vm", disks: devs, state: golibvirt.DomainRunning, persistent: true, metadata: litevirtMetadata},
 		snaps: map[string]*modelSnap{},
 		saved: map[string]string{},
 	}
@@ -169,19 +190,17 @@ func (m *libvirt10) DomainGetState(dom golibvirt.Domain, _ uint32) (int32, int32
 }
 
 func domainXMLOf(name string, disks map[string]string) string {
-	return domainXMLWithChains(name, disks, nil)
+	return domainXMLWithChains(name, disks, nil, litevirtMetadata)
 }
 
 // domainXMLWithChains is domainXMLOf with each disk's chain under its
 // source written out as nested <backingStore>, as libvirt's XML has it.
-func domainXMLWithChains(name string, disks map[string]string, chains map[string][]string) string {
+func domainXMLWithChains(name string, disks map[string]string, chains map[string][]string, metadata string) string {
 	var b strings.Builder
 	// As litevirt's domains are: its namespaced metadata, and here a
 	// qemu:commandline block too, which a revert must carry over.
-	fmt.Fprintf(&b, "<domain type='kvm' xmlns:qemu='http://libvirt.org/schemas/domain/qemu/1.0'><name>%s</name>"+
-		`<metadata><litevirt-managed:managed xmlns:litevirt-managed="https://litevirt.dev/xmlns/managed/1" incarnation="1"/>`+
-		`<litevirt-owner-epoch:owner-epoch xmlns:litevirt-owner-epoch="https://litevirt.dev/xmlns/owner-epoch/1">1</litevirt-owner-epoch:owner-epoch></metadata>`+
-		"<qemu:commandline><qemu:arg value='-fw_cfg'/></qemu:commandline><devices>", name)
+	fmt.Fprintf(&b, "<domain type='kvm' xmlns:qemu='http://libvirt.org/schemas/domain/qemu/1.0'><name>%s</name>%s"+
+		"<qemu:commandline><qemu:arg value='-fw_cfg'/></qemu:commandline><devices>", name, metadata)
 	for _, dev := range sortedKeys(disks) {
 		fmt.Fprintf(&b, "<disk type='file' device='disk'><driver name='qemu' type='%s'/><source file='%s'/>", fmtOf(disks[dev]), disks[dev])
 		for _, l := range chains[dev] {
@@ -268,7 +287,7 @@ func (m *libvirt10) DomainGetXMLDesc(dom golibvirt.Domain, _ golibvirt.DomainXML
 	if err != nil {
 		return "", err
 	}
-	return domainXMLWithChains(d.name, d.disks, d.chainsOf()), nil
+	return domainXMLWithChains(d.name, d.disks, d.chainsOf(), d.metadata), nil
 }
 
 func (m *libvirt10) DomainDestroy(dom golibvirt.Domain) error {
@@ -312,9 +331,9 @@ func (m *libvirt10) DomainDefineXML(x string) (golibvirt.Domain, error) {
 	name := xmlName(x)
 	disks := parseDomainDiskSources(x)
 	if m.dom != nil && m.dom.name == name {
-		m.dom.disks, m.dom.backing, m.dom.persistent = disks, xmlBackingChains(x), true
+		m.dom.disks, m.dom.backing, m.dom.persistent, m.dom.metadata = disks, xmlBackingChains(x), true, metadataOf(x)
 	} else {
-		m.dom = &modelDomain{name: name, disks: disks, backing: xmlBackingChains(x), state: golibvirt.DomainShutoff, persistent: true}
+		m.dom = &modelDomain{name: name, disks: disks, backing: xmlBackingChains(x), state: golibvirt.DomainShutoff, persistent: true, metadata: metadataOf(x)}
 	}
 	return golibvirt.Domain{Name: name}, nil
 }
@@ -410,11 +429,14 @@ func (m *libvirt10) DomainRestoreFlags(from string, dxml golibvirt.OptString, _ 
 	if len(dxml) > 0 && dxml[0] != "" {
 		x = dxml[0]
 	}
+	if m.onRestore != nil {
+		m.onRestore(x)
+	}
 	name := xmlName(x)
 	if m.dom != nil && m.dom.name == name && m.dom.state != golibvirt.DomainShutoff {
 		return fmt.Errorf("Requested operation is not valid: domain '%s' is already active", name)
 	}
-	d := &modelDomain{name: name, disks: parseDomainDiskSources(x), backing: xmlBackingChains(x), state: golibvirt.DomainPaused}
+	d := &modelDomain{name: name, disks: parseDomainDiskSources(x), backing: xmlBackingChains(x), state: golibvirt.DomainPaused, metadata: metadataOf(x)}
 	if m.dom != nil && m.dom.name == name {
 		d.persistent = m.dom.persistent
 	}
@@ -701,7 +723,11 @@ func (m *libvirt10) memorySnapshot(name string) string {
 		m.t.Fatal(err)
 	}
 	m.mu.Lock()
-	m.saved[path] = domainXMLOf("vm", m.dom.disks)
+	md := m.dom.metadata
+	if m.saveWithoutManaged {
+		md = `<metadata><litevirt-owner-epoch:owner-epoch xmlns:litevirt-owner-epoch="https://litevirt.dev/xmlns/owner-epoch/1">1</litevirt-owner-epoch:owner-epoch></metadata>`
+	}
+	m.saved[path] = domainXMLWithChains("vm", m.dom.disks, nil, md)
 	m.mu.Unlock()
 	return path
 }

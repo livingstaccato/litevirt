@@ -969,6 +969,15 @@ func planRevert(snapXML string, live map[string]string, snapshotName string) ([]
 		if !ok || l == base {
 			continue
 		}
+		// The base is judged before anything is torn down: a restore over
+		// a base that is gone, is a protocol rather than a file, or would
+		// be refused by the overlay reset, fails here with the VM still
+		// defined and its snapshot registered (re-review R4-M1) — not
+		// after the domain was destroyed, undefined and its metadata
+		// dropped.
+		if err := checkRevertBase(base); err != nil {
+			return nil, fmt.Errorf("disk %s: snapshot %q's base %s: %w", dev, snapshotName, base, err)
+		}
 		step := revertStep{dev: dev, base: base, live: l, target: l}
 		if ov != "" && l != ov && !isRevertOverlay(l, ov, snapshotName, base) {
 			step.target = newRevertOverlayPath(ov, snapshotName)
@@ -977,6 +986,30 @@ func planRevert(snapXML string, live map[string]string, snapshotName string) ([]
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].dev < out[j].dev })
 	return out, nil
+}
+
+// checkRevertBase reports why the overlay reset cannot use base: it must be
+// an absolute path to an existing, readable regular file or device, not a
+// protocol (nbd://, json:, ...), and pass the reset's own check
+// (qcow2.AssertNoExternalData) — run here, before teardown, instead of
+// after it.
+func checkRevertBase(base string) error {
+	if !filepath.IsAbs(base) || strings.Contains(strings.SplitN(base, "/", 2)[0], ":") || strings.HasPrefix(base, "json:") {
+		return fmt.Errorf("it is not a file path")
+	}
+	fi, err := os.Stat(base)
+	if err != nil {
+		return err
+	}
+	if fi.IsDir() {
+		return fmt.Errorf("it is a directory")
+	}
+	f, err := os.Open(base)
+	if err != nil {
+		return err
+	}
+	f.Close()
+	return qcow2.AssertNoExternalData(base)
 }
 
 // overlayBacking is the file a snapshot overlay was created on, from its own

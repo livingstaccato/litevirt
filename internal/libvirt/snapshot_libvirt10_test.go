@@ -939,3 +939,51 @@ func TestSnapshotCreate_AfterADottedSnapshotNamesTheOverlayByTheDisk(t *testing.
 	}
 	m.requireWhole(nil)
 }
+
+// Re-review R4-M1: the base a restore puts the VM back on is read from the
+// snapshot's overlay header; when that names a file that is gone, or a
+// protocol (json:, nbd://) rather than a file, the restore fails before
+// anything is torn down — the domain still defined and running on its
+// disk, the snapshot still registered, the overlay untouched.
+func TestRevert_ABadBaseFailsBeforeTeardown(t *testing.T) {
+	for _, tc := range []string{"gone", "protocol"} {
+		for _, memory := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/memory=%v", tc, memory), func(t *testing.T) {
+				m := newLibvirt10(t)
+				var save string
+				if memory {
+					save = m.memorySnapshot("s1")
+				} else {
+					m.snapshot("s1")
+				}
+				ov := m.active()
+				switch tc {
+				case "gone":
+					missing := filepath.Join(m.dir, "missing-base.qcow2")
+					run(t, "qemu-img", "rebase", "-q", "-u", "-f", "qcow2", "-F", "qcow2", "-b", missing, ov)
+				case "protocol":
+					run(t, "qemu-img", "rebase", "-q", "-u", "-f", "qcow2", "-F", "raw", "-b", "nbd://127.0.0.1:1/x", ov)
+				}
+				before := fileSum(t, ov)
+				var err error
+				if memory {
+					err = revertToLiveSnapshot(m, "vm", "s1", save, nil, nil)
+				} else {
+					err = revertToSnapshot(m, "vm", "s1", nil)
+				}
+				if err == nil {
+					t.Fatal("the restore went ahead over a bad base")
+				}
+				if m.dom == nil || m.state() != golibvirt.DomainRunning {
+					t.Fatalf("the domain was torn down (state %d) before the base was judged: %v", m.state(), err)
+				}
+				if _, lerr := m.DomainSnapshotLookupByName(golibvirt.Domain{Name: "vm"}, "s1", 0); lerr != nil {
+					t.Fatalf("the snapshot's metadata was dropped: %v", lerr)
+				}
+				if fileSum(t, ov) != before || m.active() != ov {
+					t.Fatal("the overlay or the domain's disk changed")
+				}
+			})
+		}
+	}
+}

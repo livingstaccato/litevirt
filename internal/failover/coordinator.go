@@ -2932,7 +2932,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 		targetName := p.targetName
 
 		if p.rekeyStopped {
-			c.rekeyStoppedVM(ctx, h.Name, vm, targetName)
+			c.rekeyStoppedVM(ctx, h.Name, vm, targetName, fenceEpoch)
 			continue
 		}
 

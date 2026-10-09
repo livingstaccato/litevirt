@@ -27,16 +27,22 @@ func IsStoppedRekeyDetail(detail string) bool {
 }
 
 // RekeyStoppedVM moves a VM stopped by intent off the failed host fromHost to
-// destHost, still stopped, with its disk rows, and advances its ownership
-// generation: the failover coordinator's move for a stopped VM whose disks
-// are all on shared storage, so it gets off a dead host on its real disks and
-// is never started. Its state_detail becomes StoppedRekeyDetail(fromHost).
+// destHost, still stopped, with its disk rows: the failover coordinator's move
+// for a stopped VM whose disks are all on shared storage, so it gets off a
+// dead host on its real disks and is never started. Its state_detail becomes
+// StoppedRekeyDetail(fromHost).
 //
 // One guarded transaction. It applies only while the row is still on
 // fromHost at expectedEpoch, still stopped by intent (VMStoppedForFailover),
 // and still has no host-local disk (VMHasHostLocalDisk): ErrNoRowsAffected
-// otherwise. Both statements are shapes already on the wire (the owner
-// transfer and the epoch-bound state write).
+// otherwise. Those are local preconditions. The statements replicate without
+// one — the reschedule's host/state write and the plain state write — so two
+// coordinators that both re-key the VM (recovery claims off) converge, by
+// last-writer-wins, on one host for the VM and all its disks. An epoch-bound
+// transfer would not: each side's row would have moved past the generation
+// the other's statement names, and neither would ever apply the other's.
+// Like a reschedule, it does not advance the ownership generation; nothing
+// runs to be superseded.
 //
 // state must be "stopped": it is a parameter only so scripts/ci/runningcheck
 // polices the call site like every other ownership writer's (a literal
@@ -51,14 +57,8 @@ func RekeyStoppedVM(ctx context.Context, c *Client, name, fromHost, destHost, st
 	}
 	now := c.NowTS()
 	stmts := []Statement{
-		{
-			SQL: `UPDATE vms
-		      SET host_name = ?, state = ?, state_detail = '',
-		          vm_owner_epoch = vm_owner_epoch + 1, updated_at = ?
-		      WHERE name = ? AND deleted_at IS NULL AND vm_owner_epoch = ?`,
-			Params: []interface{}{destHost, state, now, name, expectedEpoch},
-		},
-		{SQL: vmStateAtEpochSQL, Params: []interface{}{state, StoppedRekeyDetail(fromHost), now, name, expectedEpoch + 1}},
+		{SQL: vmHostStateSQL, Params: []interface{}{destHost, state, now, name}},
+		{SQL: vmStateUpdateSQL, Params: []interface{}{state, StoppedRekeyDetail(fromHost), now, name}},
 	}
 	for _, d := range disks {
 		if d.HostName == destHost {

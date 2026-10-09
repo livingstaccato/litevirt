@@ -203,7 +203,7 @@ func TestStoppedByIntent_OnlyRecordedNonIntentStopsAreRecoverable(t *testing.T) 
 }
 
 // RekeyStoppedVM moves a VM stopped by intent on shared storage to another
-// host still stopped, marked, at the next generation, with its disks — and
+// host still stopped, marked, with its disks — and
 // refuses a host-local disk, a VM no longer stopped, or a stale generation.
 func TestRekeyStoppedVM(t *testing.T) {
 	ctx := context.Background()
@@ -223,7 +223,7 @@ func TestRekeyStoppedVM(t *testing.T) {
 		t.Fatalf("RekeyStoppedVM: %v", err)
 	}
 	vm, _ := GetVM(ctx, c, "sv")
-	if vm == nil || vm.HostName != "host-b" || vm.State != "stopped" || vm.OwnerEpoch != 1 ||
+	if vm == nil || vm.HostName != "host-b" || vm.State != "stopped" || vm.OwnerEpoch != 0 ||
 		vm.StateDetail != StoppedRekeyDetail("host-a") {
 		t.Fatalf("after the re-key: %+v", vm)
 	}
@@ -266,5 +266,33 @@ func TestWorkloadsBlockingReadmission(t *testing.T) {
 	left, err := WorkloadsBlockingReadmission(ctx, c, "gone")
 	if err != nil || len(left) != 2 || left[0] != "ct/skipped-ct" || left[1] != "vm/running-vm" {
 		t.Fatalf("blocking = %v (err %v), want ct/skipped-ct and vm/running-vm", left, err)
+	}
+}
+
+// SyncVMStopIfRunning writes only while the row still says running: an
+// operator stop recorded since the caller's snapshot is kept.
+func TestSyncVMStopIfRunning_KeepsAStopRecordedSince(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	apInsertVM(t, c, "vm1", "host-a", "running")
+	if err := SyncVMStopIfRunning(ctx, c, "vm1", "stopped", StopDetailGuestShutdown, 0); err != nil {
+		t.Fatalf("sync a running VM: %v", err)
+	}
+	if vm, _ := GetVM(ctx, c, "vm1"); vm.StateDetail != StopDetailGuestShutdown {
+		t.Fatalf("detail = %q", vm.StateDetail)
+	}
+	apInsertVM(t, c, "vm2", "host-a", "stopped")
+	if err := UpdateVMState(ctx, c, "vm2", "stopped", "operator-stop"); err != nil {
+		t.Fatal(err)
+	}
+	if err := SyncVMStopIfRunning(ctx, c, "vm2", "stopped", StopDetailGuestShutdown, 0); !errors.Is(err, ErrNoRowsAffected) {
+		t.Fatalf("sync over an operator stop: err=%v, want ErrNoRowsAffected", err)
+	}
+	if vm, _ := GetVM(ctx, c, "vm2"); vm.StateDetail != "operator-stop" {
+		t.Fatalf("the operator stop was overwritten: %q", vm.StateDetail)
+	}
+	apInsertVM(t, c, "vm3", "host-a", "running")
+	if err := SyncVMStopIfRunning(ctx, c, "vm3", "stopped", StopDetailOutOfBand, 7); !errors.Is(err, ErrNoRowsAffected) {
+		t.Fatalf("sync at a stale epoch: err=%v, want ErrNoRowsAffected", err)
 	}
 }

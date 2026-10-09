@@ -1227,10 +1227,15 @@ func (s *Server) ListVMs(ctx context.Context, req *pb.ListVMsRequest) (*pb.ListV
 					// VM crashed or was stopped externally — trust libvirt. Best-effort
 					// drift heal in a read path; a failed write is re-healed next list.
 					state = liveState
+					// Nobody asked for this stop, so it is recorded as one
+					// (StopDetailOutOfBand), and only while the row still says
+					// running: an `lv stop` that finished since this list read
+					// it has recorded its own, operator, stop.
 					//runningcheck:allow provably not running — this is the
 					// `vm.State == "running" && liveState == "stopped"` case, so liveState
 					// is "stopped" here. The guard cannot see through the switch.
-					if err := corrosion.UpdateVMState(ctx, s.db, vm.Name, liveState, ""); err != nil {
+					if err := corrosion.SyncVMStopIfRunning(ctx, s.db, vm.Name, liveState, corrosion.StopDetailOutOfBand, 0); err != nil &&
+						!errors.Is(err, corrosion.ErrNoRowsAffected) {
 						s.noteStateWriteFail(corrosion.OpVMState, err)
 					}
 				default:

@@ -40,6 +40,8 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/cli"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/failover"
+	"github.com/litevirt/litevirt/internal/fence"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/image"
 	"github.com/litevirt/litevirt/internal/qcow2"
@@ -380,19 +382,28 @@ func reconcileAll(t *testing.T, c *Cluster, nodes ...*Node) {
 // Mutation: have stoppedVMRekeyable return false — sv-shared stays on the
 // failed host and the test goes red on its host. Drop the reconciler's
 // define step — `lv start` on the survivor fails with no domain to start.
+// Let the reconciler keep a definition it finds — the stale one on the old
+// disk stays and the test goes red on the defined XML.
 func TestFleet_FailoverMovesAStoppedSharedDiskVMStoppedAndStartable(t *testing.T) {
 	c := New(t, Options{Nodes: 3, SharedCRDT: true})
 	ctx := context.Background()
 	a, b, victim := c.Nodes[0], c.Nodes[1], c.Nodes[2]
 	path := sharedDiskVM(t, c, a, "sv-shared", victim.Name, "stopped", "operator-stop")
+	// Each survivor holds a stale definition from an earlier stay, on an old
+	// disk: the re-key must never trust it (review M5).
+	for _, n := range []*Node{a, b} {
+		if err := n.Virt.DefineDomain(`<domain><name>sv-shared</name><devices><disk><source file='/old/sv-shared-root'/></disk></devices></domain>`); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	if got := fenceVictim(t, c, a, victim, a, b); got != 1 {
 		t.Fatalf("fencer fired %d times, want 1", got)
 	}
 	vm, _ := corrosion.GetVM(ctx, a.DB, "sv-shared")
 	if vm == nil || vm.HostName == victim.Name || vm.State != "stopped" || vm.PendingActionID != "" ||
-		vm.StateDetail != corrosion.StoppedRekeyDetail(victim.Name) || vm.OwnerEpoch != 1 {
-		t.Fatalf("sv-shared after the failover = %+v; want it stopped on a survivor, marked re-keyed from %s, at epoch 1",
+		vm.StateDetail != corrosion.StoppedRekeyDetail(victim.Name) {
+		t.Fatalf("sv-shared after the failover = %+v; want it stopped on a survivor, marked re-keyed from %s",
 			vm, victim.Name)
 	}
 	if disks, _ := corrosion.GetVMDisks(ctx, a.DB, "sv-shared"); len(disks) != 1 || disks[0].HostName != vm.HostName {
@@ -404,16 +415,17 @@ func TestFleet_FailoverMovesAStoppedSharedDiskVMStoppedAndStartable(t *testing.T
 	dest := c.Node(vm.HostName)
 
 	reconcileAll(t, c, a, b)
-	if xml := dest.Virt.DefinedXML("sv-shared"); !strings.Contains(xml, path) {
-		t.Fatalf("%s did not define sv-shared on its shared disk %s:\n%s", dest.Name, path, xml)
+	if xml := dest.Virt.DefinedXML("sv-shared"); !strings.Contains(xml, path) || strings.Contains(xml, "/old/") {
+		t.Fatalf("%s did not define sv-shared afresh on its shared disk %s:\n%s", dest.Name, path, xml)
 	}
 	for _, n := range []*Node{a, b} {
 		if st, _ := n.Virt.DomainState("sv-shared"); st == "running" {
 			t.Fatalf("%s started the stopped sv-shared", n.Name)
 		}
 	}
-	if vm, _ := corrosion.GetVM(ctx, a.DB, "sv-shared"); vm == nil || vm.State != "stopped" || vm.StateDetail != "operator-stop" {
-		t.Fatalf("sv-shared after its domain was defined = %+v, want stopped with an operator stop", vm)
+	if vm, _ := corrosion.GetVM(ctx, a.DB, "sv-shared"); vm == nil || vm.State != "stopped" ||
+		vm.StateDetail != corrosion.StoppedRekeyDetail(victim.Name) {
+		t.Fatalf("sv-shared after its domain was defined = %+v, want stopped, still marked re-keyed", vm)
 	}
 
 	if _, err := c.SelfClient(dest).StartVM(ctx, &pb.StartVMRequest{Name: "sv-shared"}); err != nil {
@@ -524,5 +536,163 @@ func TestFleet_ReaddBringsBackTheStoppedWorkloads(t *testing.T) {
 	}
 	if vm := vmOn(t, a, "vm-stopped"); vm == nil || vm.HostName != d.Name || vm.State != "stopped" {
 		t.Fatalf("vm-stopped after %s was admitted again = %+v, want it stopped on %s", d.Name, vm, d.Name)
+	}
+}
+
+// Two coordinators that both believe they lead, with replication between them
+// cut, both find the same stopped shared-storage VM on the failed host. With
+// recovery claims on (the default), each claims the re-key at the VM's
+// ownership generation and learns one destination: after the heal exactly one
+// host owns the VM, only it defines the domain, and `lv start` starts it
+// there.
+//
+// Mutation: skip the claim in rekeyStoppedVM — no claim state is recorded
+// for the VM's key and the test goes red there (the reconcilers then still
+// leave one definition, TestFleet_ReKeyedStoppedVMDefinedOnlyWhereTheRowEnds).
+func TestFleet_TwoCoordinatorsReKeyAStoppedVMToOneHost(t *testing.T) {
+	ctx := context.Background()
+	clock := NewVirtualClock(time.Now().UTC())
+	var path string
+	c, a, b, victim := claimFleetWith(t, clock, 2914, func(c *Cluster, a, _, victim *Node) {
+		path = sharedDiskVM(t, c, a, "sv-two", victim.Name, "stopped", "operator-stop")
+	})
+	c.SetLinkFaultBoth(a, b, LinkFault{Block: true})
+	cs := c.NewCoordinators(clock)
+	for _, n := range []*Node{a, b} {
+		cs.ByNode[n.Name].Gate = quorateGate{}
+	}
+	rekeyed := func(n *Node) bool { return vmOn(t, n, "sv-two").HostName != victim.Name }
+	for i := 0; i < 20 && !(rekeyed(a) && rekeyed(b)); i++ {
+		cs.Tick(ctx, a, b)
+		clock.Advance(contentionPoll / 10)
+	}
+	// Heal, as the two-coordinator claim scenarios do; the victim stays dead.
+	c.ClearLinkFaults()
+	c.Kill(victim)
+	for _, n := range []*Node{a, b} {
+		corrosion.NewAntiEntropy(n.DB, n.PKIDir, 0).RunOnce(ctx)
+	}
+	// leader_lease_terms keeps both contested terms by design.
+	c.WaitConvergedExcept(t, convergeTimeout, []string{"leader_lease_terms", "health_conditions"}, a, b)
+
+	va, vb := vmOn(t, a, "sv-two"), vmOn(t, b, "sv-two")
+	if va.HostName != vb.HostName || va.HostName == victim.Name || va.State != "stopped" {
+		t.Fatalf("after the heal sv-two is %s/%s on %s and %s/%s on %s; want one surviving host, stopped",
+			va.HostName, va.State, a.Name, vb.HostName, vb.State, b.Name)
+	}
+	if _, found, err := a.DB.ClaimState(ctx, vmKey(a, "sv-two", 0)); err != nil || !found {
+		t.Fatalf("no recovery claim was taken for the re-key (found %v, err %v)", found, err)
+	}
+	owner := c.Node(va.HostName)
+	recs := map[string]*health.Reconciler{}
+	for _, n := range []*Node{a, b} {
+		recs[n.Name] = health.NewReconciler(n.Name, filepath.Join(c.tmpRoot, n.Name, "data"), n.DB, n.Virt)
+	}
+	for i := 0; i < 2; i++ {
+		for _, n := range []*Node{a, b} {
+			recs[n.Name].ReconcileOnce(ctx)
+		}
+	}
+	for _, n := range []*Node{a, b} {
+		if defined := n.Virt.DomainExists("sv-two"); defined != (n == owner) {
+			t.Errorf("%s defines sv-two: %v; only its owner %s should", n.Name, defined, owner.Name)
+		}
+	}
+	if xml := owner.Virt.DefinedXML("sv-two"); !strings.Contains(xml, path) {
+		t.Fatalf("%s's definition of sv-two is not on its shared disk:\n%s", owner.Name, xml)
+	}
+	if _, err := c.SelfClient(owner).StartVM(ctx, &pb.StartVMRequest{Name: "sv-two"}); err != nil {
+		t.Fatalf("lv start sv-two on %s: %v", owner.Name, err)
+	}
+}
+
+// With recovery claims off, two coordinators can re-key one stopped VM to two
+// hosts. Each target defines it while its own replica names it. After the
+// heal the row names one host: that host keeps (or makes) its definition and
+// can start the VM, and the other undefines the one it made. The marker
+// is never rewritten, so the host the row converges on still defines.
+//
+// Mutation: rewrite the marker to operator-stop after defining (round 1) —
+// the converged row can carry the loser's rewrite and the owner never
+// defines. Drop cleanupRekeyLeftovers — the loser keeps its definition.
+func TestFleet_ReKeyedStoppedVMDefinedOnlyWhereTheRowEnds(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: 2915})
+	a, b, victim := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	sharedDiskVM(t, c, a, "sv-split", victim.Name, "stopped", "operator-stop")
+	c.WaitConverged(t, convergeTimeout)
+	c.SetLinkFaultBoth(a, b, LinkFault{Block: true})
+	// Each side's coordinator re-keys to its own host, at the same generation.
+	for _, n := range []*Node{a, b} {
+		if err := corrosion.RekeyStoppedVM(ctx, n.DB, "sv-split", victim.Name, n.Name, "stopped", 0); err != nil {
+			t.Fatalf("re-key on %s: %v", n.Name, err)
+		}
+	}
+	recs := map[string]*health.Reconciler{}
+	for _, n := range []*Node{a, b} {
+		recs[n.Name] = health.NewReconciler(n.Name, filepath.Join(c.tmpRoot, n.Name, "data"), n.DB, n.Virt)
+		recs[n.Name].ReconcileOnce(ctx)
+		if !n.Virt.DomainExists("sv-split") {
+			t.Fatalf("%s did not define sv-split while its replica named it", n.Name)
+		}
+	}
+	c.ClearLinkFaults()
+	for _, n := range []*Node{a, b} {
+		corrosion.NewAntiEntropy(n.DB, n.PKIDir, 0).RunOnce(ctx)
+	}
+	c.WaitConverged(t, convergeTimeout, a, b)
+	for i := 0; i < 2; i++ {
+		for _, n := range []*Node{a, b} {
+			recs[n.Name].ReconcileOnce(ctx)
+		}
+	}
+	va := vmOn(t, a, "sv-split")
+	if !corrosion.IsStoppedRekeyDetail(va.StateDetail) || va.State != "stopped" {
+		t.Fatalf("sv-split after the heal = %+v, want stopped and still marked", va)
+	}
+	owner := c.Node(va.HostName)
+	for _, n := range []*Node{a, b} {
+		if defined := n.Virt.DomainExists("sv-split"); defined != (n == owner) {
+			t.Errorf("%s defines sv-split: %v; only its owner %s should", n.Name, defined, owner.Name)
+		}
+	}
+	if _, err := c.SelfClient(owner).StartVM(ctx, &pb.StartVMRequest{Name: "sv-split"}); err != nil {
+		t.Fatalf("lv start sv-split on %s: %v", owner.Name, err)
+	}
+}
+
+// Under the shared-storage fence, a stopped VM on shared storage is moved off
+// a failed host only on a proof-grade fence of that host, as a running VM's
+// transfer is. A fence that is not proof-grade leaves it where it is.
+//
+// Mutation: delete the shared-storage-fence refusal in stoppedVMRekeyable —
+// sv-fence is moved on a best-effort fence.
+func TestFleet_StoppedVMReKeyNeedsAProofGradeFenceUnderTheSharedStorageFence(t *testing.T) {
+	c := New(t, Options{Nodes: 3, SharedCRDT: true})
+	ctx := context.Background()
+	a, b, victim := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	sharedDiskVM(t, c, a, "sv-fence", victim.Name, "stopped", "operator-stop")
+	nowRFC := time.Now().UTC().Format(time.RFC3339)
+	for _, o := range []*Node{a, b} {
+		if err := a.DB.Execute(ctx,
+			`INSERT OR REPLACE INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
+			 VALUES (?, ?, 'suspect', 5, NULL, ?)`, o.Name, victim.Name, nowRFC); err != nil {
+			t.Fatal(err)
+		}
+	}
+	coord := failover.NewCoordinator(a.Name, a.DB)
+	coord.Gate = quorateGate{}
+	coord.SharedStorageFenceEnforce = true
+	fences := 0
+	coord.SetFencer(func(context.Context, fence.HostConfig) fence.Result {
+		fences++
+		return fence.Result{Method: "fleet-test", Success: true} // not proof-grade
+	})
+	coord.RunOnce(ctx)
+	if fences != 1 {
+		t.Fatalf("fencer fired %d times, want 1", fences)
+	}
+	if vm, _ := corrosion.GetVM(ctx, a.DB, "sv-fence"); vm == nil || vm.HostName != victim.Name || vm.State != "stopped" {
+		t.Fatalf("sv-fence = %+v; want it left stopped on %s without a proof-grade fence", vm, victim.Name)
 	}
 }

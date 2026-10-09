@@ -2,6 +2,7 @@ package failover
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -135,7 +136,13 @@ func rekeyStoppedDetail(host, target string) string {
 // (corrosion.RekeyStoppedVM). The target's reconciler then defines its
 // domain there, shut off. Like every move off a failed host it is taken only
 // under the decision gate and this coordinator's tenure.
-func (c *Coordinator) rekeyStoppedVM(ctx context.Context, host string, vm corrosion.VMRecord, target string) {
+//
+// With recovery claims enforced it is claimed first, at the VM's ownership
+// generation, exactly as a reschedule is: two coordinators that both believe
+// they lead learn one destination and re-key to it. The decided value is a
+// reschedule proof that is never written — the re-key has nothing for a
+// destination to execute — and the move it records is to the decided host.
+func (c *Coordinator) rekeyStoppedVM(ctx context.Context, host string, vm corrosion.VMRecord, target, fenceEpoch string) {
 	if c.gateEnforced(ctx) {
 		if g := c.decideGate(ctx, host); !g.OK {
 			slog.Warn("failover: decision gate refused moving a stopped VM", "vm", vm.Name, "reason", g.Reason)
@@ -154,7 +161,47 @@ func (c *Coordinator) rekeyStoppedVM(ctx context.Context, host string, vm corros
 		c.mVM(ActionReschedule, ResultError, ErrDBError)
 		return
 	}
+	if c.claimsEnforced(ctx) {
+		holder, exp, term, leaseKey, ok := c.leaseStamp(ctx)
+		if !ok {
+			c.noteGateRefused(ActionReschedule, health.ReasonStaleLeaseTerm)
+			c.mVM(ActionReschedule, ResultError, ErrStaleLeaseTerm)
+			c.noteLeaseTermRefusal(ctx, "vm", vm.Name, host)
+			return
+		}
+		live, needed := c.proofQuorum(ctx, host)
+		proposal := corrosion.ActionProof{
+			ID: randid.New(), Action: corrosion.ActionReschedule, TargetKind: "vm",
+			TargetName: vm.Name, DestHost: target, Coordinator: c.hostName,
+			LeaseHolder: holder, LeaseExpiresAt: exp,
+			QuorumLive: live, QuorumNeeded: needed, FenceEpoch: fenceEpoch,
+			OwnerEpoch: ownerEpochString(fresh.OwnerEpoch),
+			LeaseTerm:  term, LeaseKey: leaseKey,
+		}
+		cl, cerr := c.claimRecoveryFor(ctx, proposal, host, fresh.CreatedAt, func(d corrosion.HostRecord) string {
+			return c.vmFitsOn(ctx, *fresh, host, d)
+		})
+		if cerr != nil {
+			c.noteClaimRefused(ctx, ActionReschedule, "vm", vm.Name, host, cerr)
+			return
+		}
+		if cl.Proof.Action != corrosion.ActionReschedule {
+			c.noteClaimLost(ActionReschedule, "vm", vm.Name, host, cl.Proof)
+			return
+		}
+		if cl.Proof.DestHost == host {
+			c.noteClaimStranded("vm", vm.Name, host, cl.Proof)
+			return
+		}
+		target = cl.Proof.DestHost
+	}
 	if err := corrosion.RekeyStoppedVM(ctx, c.db, vm.Name, host, target, "stopped", fresh.OwnerEpoch); err != nil {
+		if errors.Is(err, corrosion.ErrNoRowsAffected) {
+			// Another coordinator's re-key to the decided host, or a start,
+			// landed first: nothing left to do here.
+			slog.Info("failover: a stopped VM's row moved on before its re-key; leaving it", "vm", vm.Name)
+			return
+		}
 		slog.Warn("failover: move a stopped VM off its failed host; it stays there this pass",
 			"vm", vm.Name, "from", host, "to", target, "error", err)
 		c.mVM(ActionReschedule, ResultError, ErrDBError)

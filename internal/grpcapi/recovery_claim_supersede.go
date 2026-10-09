@@ -246,15 +246,21 @@ func (s *Server) strandedOn(ctx context.Context, host string) ([]*pb.StrandedRec
 			continue
 		}
 		if full.State == "stopped" {
-			stays := corrosion.VMStoppedForFailover(*full)
-			if !stays {
-				disks, derr := corrosion.GetVMDisks(ctx, s.db, full.Name)
-				if derr != nil {
-					return nil, derr
-				}
-				stays = corrosion.VMHasHostLocalDisk(disks)
+			disks, derr := corrosion.GetVMDisks(ctx, s.db, full.Name)
+			if derr != nil {
+				return nil, derr
 			}
-			if stays {
+			local := corrosion.VMHasHostLocalDisk(disks)
+			switch {
+			case corrosion.VMStoppedForFailover(*full) && !local:
+				out = append(out, &pb.StrandedRecovery{Kind: "vm", Name: full.Name, Detail: fmt.Sprintf(
+					"vm/%s is stopped, on shared storage: once this removal and the CRL have replicated, failover may "+
+						"move it, still stopped, to a live host (it needs a failure policy or auto-promote, no firmware "+
+						"state and no ownership dispute); start it there with `lv start %s`. Otherwise it stays recorded "+
+						"on %s and comes back with %s when the machine is added again under that name",
+					full.Name, full.Name, host, host)})
+				continue
+			case corrosion.VMStoppedForFailover(*full) || local:
 				out = append(out, &pb.StrandedRecovery{Kind: "vm", Name: full.Name, Detail: stoppedOnDeadHostDetail("vm", full.Name, host)})
 				continue
 			}

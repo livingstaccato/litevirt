@@ -79,6 +79,15 @@ type imagePullFlight struct {
 // and starts them. It also detects split-brain conditions where a VM
 // is running locally in libvirt but corrosion says it belongs to another host.
 type Reconciler struct {
+	// stopSyncHook, test-only, runs between the out-of-band stop sync's
+	// decision and its write, where a concurrent `lv stop` can land.
+	stopSyncHook func(ctx context.Context, vmName string)
+	// rekeyDefined records, per VM, the row version (updated_at) for which
+	// this process defined a stopped VM failover re-keyed here
+	// (rekeyed_stopped.go).
+	rekeyMu      sync.Mutex
+	rekeyDefined map[string]string
+	rekeyLogged  map[string]string
 	// startDomainHook runs immediately before StartDomain, with the context
 	// the start is running under. Test-only seam: it makes a walk budget that
 	// expires between the start and the commit reproducible instead of a
@@ -591,6 +600,7 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 	}
 
 	r.resolveDiskMissing(ctx)
+	r.cleanupRekeyLeftovers(ctx)
 
 	for _, vm := range vms {
 		switch vm.State {
@@ -719,17 +729,29 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 			// rejoined host's stale sync was doing exactly that on every rejoin
 			// (observed live 2026-08-01) — it now lands locally and stops there.
 			// Pre-epoch rows (0) and un-latched clusters keep the plain write.
-			syncErr := error(nil)
+			//
+			// The write is also conditional on the row still saying "running"
+			// in its own transaction: the decision above was made from the walk's
+			// snapshot, and an `lv stop` that finished since has recorded
+			// "operator-stop", which a clean shutdown's "guest-shutdown" must
+			// not replace — failover recovers a stop nobody asked for
+			// (corrosion.SyncVMStopIfRunning).
+			var epoch int64
 			if fresh, gerr := corrosion.GetVM(ctx, r.db, vm.Name); r.ownerEpochEnforced(ctx) &&
 				gerr == nil && fresh != nil && fresh.OwnerEpoch > 0 {
-				//runningcheck:allow provably not running — newState comes from classifyStop,
-				// which returns ("", "", false) for the "running" reason, so this out-of-band
-				// STOP sync never publishes a running VM. The guard cannot see through the
-				// helper's return.
-				syncErr = corrosion.UpdateVMStateAtEpoch(ctx, r.db, vm.Name, newState, detail, fresh.OwnerEpoch)
-			} else {
-				//runningcheck:allow provably not running — same classifyStop reasoning.
-				syncErr = corrosion.UpdateVMState(ctx, r.db, vm.Name, newState, detail)
+				epoch = fresh.OwnerEpoch
+			}
+			if r.stopSyncHook != nil {
+				r.stopSyncHook(ctx, vm.Name)
+			}
+			//runningcheck:allow provably not running — newState comes from classifyStop,
+			// which returns ("", "", false) for the "running" reason, so this out-of-band
+			// STOP sync never publishes a running VM. The guard cannot see through the
+			// helper's return.
+			syncErr := corrosion.SyncVMStopIfRunning(ctx, r.db, vm.Name, newState, detail, epoch)
+			if errors.Is(syncErr, corrosion.ErrNoRowsAffected) {
+				slog.Info("reconciler: VM's row changed before the out-of-band stop sync; leaving it", "vm", vm.Name)
+				break
 			}
 			if err := syncErr; err != nil {
 				slog.Error("reconciler: out-of-band stop sync write failed", "vm", vm.Name, "error", err)

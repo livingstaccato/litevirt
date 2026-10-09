@@ -1031,6 +1031,46 @@ func UpdateVMStateAtEpoch(ctx context.Context, c *Client, name, state, detail st
 	return c.Execute(ctx, vmStateAtEpochSQL, state, detail, now, name, expectedEpoch)
 }
 
+// SyncVMStopIfRunning records that a VM this host runs was found down —
+// state and detail from the reconciler's classification, or a list's drift
+// heal — but only while the row still says "running" when the transaction
+// runs (and, with expectedEpoch > 0, is still at that generation).
+// ErrNoRowsAffected otherwise.
+//
+// The callers decide from a snapshot of the row. A stop that an operator
+// completes between that snapshot and this write has already recorded
+// "operator-stop", and the stop libvirt reports (a clean shutdown) would
+// otherwise overwrite it with "guest-shutdown": a stop nobody asked for,
+// which failover recovers on shared storage (VMStoppedForFailover). The
+// precondition is local; the statements are the plain state writes'.
+func SyncVMStopIfRunning(ctx context.Context, c *Client, name, state, detail string, expectedEpoch int64) error {
+	now := c.NowTS()
+	stmt := Statement{SQL: vmStateUpdateSQL, Params: []interface{}{state, detail, now, name}}
+	if expectedEpoch > 0 {
+		stmt = Statement{SQL: vmStateAtEpochSQL, Params: []interface{}{state, detail, now, name, expectedEpoch}}
+	}
+	applied, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+		var cur string
+		var epoch int64
+		err := tx.QueryRowContext(ctx,
+			`SELECT state, vm_owner_epoch FROM vms WHERE name = ? AND deleted_at IS NULL`, name).Scan(&cur, &epoch)
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return cur == "running" && (expectedEpoch <= 0 || epoch == expectedEpoch), nil
+	}, []Statement{stmt})
+	if err != nil {
+		return err
+	}
+	if !applied {
+		return ErrNoRowsAffected
+	}
+	return nil
+}
+
 // UpdateVMStateStrict is UpdateVMState that reports a zero-row update as
 // ErrNoRowsAffected instead of a silent success. Use it where the write's success
 // GATES a subsequent action (an event, audit, LB refresh, hook, or ownership

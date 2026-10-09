@@ -668,7 +668,10 @@ type vmInfo struct {
 
 // recoverable mirrors corrosion.VMRecoverableOnHostFailure for a VM without
 // auto-promote replication (the lab has none). A stopped VM is not one:
-// failover leaves it on its host, stopped, with its disks.
+// failover leaves it on its host, stopped, with its disks. This is stricter
+// than the predicate, which recovers a VM that stopped without anyone asking
+// (a guest shutdown) when every disk is on shared storage; the lab has no
+// shared storage, so the two agree there.
 func (v vmInfo) recoverable() bool {
 	p := v.Spec.OnHostFailure
 	return p != "" && p != "none" && !v.Spec.SecureBoot && !v.Spec.TPM && v.State != "VM_STOPPED"

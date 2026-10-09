@@ -365,42 +365,76 @@ func requireRestoredOnto(l *lab, host, vm, base string, later ...string) {
 // and both deletes then go through.
 func TestLab_SnapshotRestoreOlderThenDeleteBoth(t *testing.T) {
 	for _, memory := range []bool{false, true} {
-		t.Run(map[bool]string{false: "disk", true: "memory"}[memory], func(t *testing.T) {
-			l := newLab(t)
-			h, vm := snapTestVM(l, "snapold")
-			root := snapActiveDisk(l, h, vm)
-			snapWrite(l, h, vm, snapMarkA)
-			snapCreate(l, h, vm, "s1", memory)
-			s1 := snapActiveDisk(l, h, vm)
-			snapWrite(l, h, vm, snapMarkB)
-			snapCreate(l, h, vm, "s2", memory)
-			s2 := snapActiveDisk(l, h, vm)
+		for _, stopped := range []bool{false, true} {
+			name := map[bool]string{false: "disk", true: "memory"}[memory] + map[bool]string{false: "/running", true: "/stopped"}[stopped]
+			t.Run(name, func(t *testing.T) {
+				l := newLab(t)
+				h, vm := snapTestVM(l, "snapold")
+				root := snapActiveDisk(l, h, vm)
+				snapWrite(l, h, vm, snapMarkA)
+				snapCreate(l, h, vm, "s1", memory)
+				s1 := snapActiveDisk(l, h, vm)
+				snapWrite(l, h, vm, snapMarkB)
+				snapCreate(l, h, vm, "s2", memory)
+				s2 := snapActiveDisk(l, h, vm)
+				restore := func(snap string) {
+					t.Helper()
+					if stopped {
+						snapStop(l, h, vm)
+					}
+					snapRestore(l, h, vm, snap)
+					requireLitevirtMetadata(l, h, vm)
+				}
 
-			snapRestore(l, h, vm, "s1")
-			requireRestoredOnto(l, h, vm, root, s1, s2)
-			requireSnapVMWhole(l, h, vm, map[byte]bool{snapMarkA: true, snapMarkB: false})
+				// s1 twice (re-review R2-C1: a memory restore must come back
+				// on s1's -r overlay, not on s1's own, which is s2's base).
+				for i := 0; i < 2; i++ {
+					restore("s1")
+					requireRestoredOnto(l, h, vm, root, s1, s2)
+					requireSnapVMWhole(l, h, vm, map[byte]bool{snapMarkA: true, snapMarkB: false})
+				}
+				// Then s2 twice: on a new overlay directly on root.s1, which
+				// holds B (snapshot-lab.md, Round 3 row 2b).
+				for i := 0; i < 2; i++ {
+					restore("s2")
+					requireRestoredOnto(l, h, vm, s1, s2)
+					requireSnapVMWhole(l, h, vm, map[byte]bool{snapMarkA: true, snapMarkB: true})
+				}
+				snapRm(l, h, vm, "s1")
+				snapRm(l, h, vm, "s2")
+				if out := l.mustLV(h, "snapshot", "ls", vm); strings.Contains(out, "s1") || strings.Contains(out, "s2") {
+					t.Fatalf("snapshots left after both deletes:\n%s", out)
+				}
+				requireSnapVMWhole(l, h, vm, map[byte]bool{snapMarkA: true, snapMarkB: true})
+				requireRmLeavesNothing(l, h, vm)
+			})
+		}
+	}
+}
 
-			// The same snapshot again (re-review R2-C1): a memory restore
-			// must come back on that overlay, not on s1's own (s2's base).
-			snapRestore(l, h, vm, "s1")
-			requireRestoredOnto(l, h, vm, root, s1, s2)
-			requireSnapVMWhole(l, h, vm, map[byte]bool{snapMarkA: true, snapMarkB: false})
+// requireLitevirtMetadata checks the domain's live and persistent
+// definitions carry litevirt's managed stamp and owner epoch right after a
+// restore (snapshot-lab.md, Round 3 row 2c).
+func requireLitevirtMetadata(l *lab, host, vm string) {
+	l.t.Helper()
+	for _, flag := range []string{"", " --inactive"} {
+		x := l.mustSSH(host, 30*time.Second, "virsh -c qemu:///system dumpxml"+flag+" "+shellQuote(vm))
+		if !strings.Contains(x, "litevirt-managed:managed") || !strings.Contains(x, "litevirt-owner-epoch:owner-epoch") {
+			l.t.Fatalf("%s's%s definition lacks litevirt's metadata right after the restore", vm, flag)
+		}
+	}
+}
 
-			snapRestore(l, h, vm, "s2")
-			requireRestoredOnto(l, h, vm, s1, s2)
-			requireSnapVMWhole(l, h, vm, map[byte]bool{snapMarkA: true, snapMarkB: true})
-			snapRestore(l, h, vm, "s2")
-			requireRestoredOnto(l, h, vm, s1, s2)
-			requireSnapVMWhole(l, h, vm, map[byte]bool{snapMarkA: true, snapMarkB: true})
-
-			snapRestore(l, h, vm, "s1")
-			snapRm(l, h, vm, "s2")
-			snapRm(l, h, vm, "s1")
-			if out := l.mustLV(h, "snapshot", "ls", vm); strings.Contains(out, "s1") || strings.Contains(out, "s2") {
-				t.Fatalf("snapshots left after both deletes:\n%s", out)
-			}
-			requireSnapVMWhole(l, h, vm, map[byte]bool{snapMarkA: true, snapMarkB: false})
-		})
+// requireRmLeavesNothing deletes vm with lv rm -f and checks no file of its
+// is left on any up node (snapshot-lab.md, Round 3 row 6).
+func requireRmLeavesNothing(l *lab, host, vm string) {
+	l.t.Helper()
+	l.mustLVf(host, "rm -f "+vm, "rm", vm, "-f")
+	for _, n := range l.upHosts() {
+		out, _ := l.ssh(n, 30*time.Second, "ls /var/lib/litevirt/disks /var/lib/litevirt/vmstate 2>/dev/null | grep -E "+shellQuote("^"+vm+"[-.]")+" || true")
+		if strings.TrimSpace(out) != "" {
+			l.t.Errorf("lv rm -f %s left on %s:\n%s", vm, n, out)
+		}
 	}
 }
 

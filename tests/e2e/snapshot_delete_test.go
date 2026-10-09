@@ -370,6 +370,13 @@ func TestLab_SnapshotRestoreOlderThenDeleteBoth(t *testing.T) {
 			t.Run(name, func(t *testing.T) {
 				l := newLab(t)
 				h, vm := snapTestVM(l, "snapold")
+				// A new VM gets litevirt's managed stamp from a background
+				// pass a few seconds after it is created (behaviour from
+				// main); a restore overlapping that first pass ends without
+				// it until the next pass. Wait for it, bounded, before the
+				// first snapshot, so the after-restore checks below judge
+				// the restore, not the creation.
+				waitLitevirtStamp(l, h, vm, 2*time.Minute)
 				root := snapActiveDisk(l, h, vm)
 				snapWrite(l, h, vm, snapMarkA)
 				snapCreate(l, h, vm, "s1", memory)
@@ -409,6 +416,24 @@ func TestLab_SnapshotRestoreOlderThenDeleteBoth(t *testing.T) {
 				requireRmLeavesNothing(l, h, vm)
 			})
 		}
+	}
+}
+
+// waitLitevirtStamp waits until vm's live definition carries litevirt's
+// managed stamp, and fails the test if it does not within timeout.
+func waitLitevirtStamp(l *lab, host, vm string, timeout time.Duration) {
+	l.t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		x, _ := l.ssh(host, 30*time.Second, "virsh -c qemu:///system dumpxml "+shellQuote(vm))
+		if strings.Contains(x, "litevirt-managed:managed") {
+			l.mark("snap: %s carries the managed stamp", vm)
+			return
+		}
+		if time.Now().After(deadline) {
+			l.t.Fatalf("%s did not get litevirt's managed stamp within %s of its creation", vm, timeout)
+		}
+		time.Sleep(2 * time.Second)
 	}
 }
 

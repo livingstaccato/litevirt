@@ -2,6 +2,7 @@ package firewall
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -46,44 +47,40 @@ func (n NftBinary) bin() string {
 //	<ruleset>                      # recreate it fresh
 //
 // nft -f processes the whole input as ONE transaction, so the delete+recreate
-// is atomic — traffic never sees a half-applied or empty table.
-//
-// The per-NIC table (bridge family, NICTableName) is replaced in the same
-// transaction when the ruleset carries one, so moving enforcement between the
-// two tables never leaves a moment with neither applied. When it does not,
-// the bridge family is left out of the transaction entirely — so a host with
-// nothing to enforce per NIC never depends on nf_tables bridge support — and a
-// table an earlier apply left behind is deleted afterwards. That must happen:
-// libvirt reuses vnetN names, so a stale chain for vnet3 would hold whichever
-// VM gets vnet3 next to another VM's rules, MAC and addresses.
+// is atomic — traffic never sees a half-applied or empty table. The same idiom
+// replaces the per-NIC bridge table when the ruleset carries that one. The
+// Applier sends the two tables as separate transactions (see Applier.Apply).
 func (n NftBinary) Apply(ctx context.Context, ruleset string) (string, error) {
-	preamble := fmt.Sprintf("table inet %s {}\ndelete table inet %s\n", TableName, TableName)
-	guarded := strings.Contains(ruleset, "table bridge "+NICTableName+" {")
-	if guarded {
-		EnsureBridgeConntrack(ctx)
+	var preamble string
+	if strings.Contains(ruleset, "table inet "+TableName+" {\n") {
+		preamble += fmt.Sprintf("table inet %s {}\ndelete table inet %s\n", TableName, TableName)
+	}
+	if strings.Contains(ruleset, "table bridge "+NICTableName+" {\n") {
 		preamble += fmt.Sprintf("table bridge %s {}\ndelete table bridge %s\n", NICTableName, NICTableName)
 	}
 	cmd := exec.CommandContext(ctx, n.bin(), "-f", "-")
 	cmd.Stdin = strings.NewReader(preamble + ruleset)
 	out, err := cmd.CombinedOutput()
-	if err != nil || guarded {
-		return string(out), err
-	}
-	return n.dropStaleGuard(ctx)
+	return string(out), err
 }
 
-// dropStaleGuard deletes the per-NIC table if one exists. A failed listing
-// means there is none (or no bridge family to hold one), which is not an
-// error; a failed delete of a table that exists is.
-func (n NftBinary) dropStaleGuard(ctx context.Context) (string, error) {
+// DropNICTable deletes the per-NIC bridge table if one exists. A failed
+// listing means there is none (or no bridge family to hold one), which is not
+// an error; a failed delete of a table that exists is.
+func (n NftBinary) DropNICTable(ctx context.Context) error {
 	if err := exec.CommandContext(ctx, n.bin(), "list", "table", "bridge", NICTableName).Run(); err != nil {
-		return "", nil
+		return nil
 	}
-	out, err := exec.CommandContext(ctx, n.bin(), "delete", "table", "bridge", NICTableName).CombinedOutput()
-	if err != nil {
-		return string(out), fmt.Errorf("delete stale per-NIC table: %w", err)
+	if out, err := exec.CommandContext(ctx, n.bin(), "delete", "table", "bridge", NICTableName).CombinedOutput(); err != nil {
+		return fmt.Errorf("delete stale per-NIC table: %w: %s", err, strings.TrimSpace(string(out)))
 	}
-	return string(out), nil
+	return nil
+}
+
+// nicTableDropper is implemented by a runner that can delete the per-NIC table
+// outside a ruleset transaction (NftBinary). Test fakes need not.
+type nicTableDropper interface {
+	DropNICTable(ctx context.Context) error
 }
 
 // Flush drops the entire table — operators only need this on
@@ -94,8 +91,13 @@ func (n NftBinary) Flush(ctx context.Context) (string, error) {
 	if err != nil {
 		return string(out), err
 	}
-	return n.dropStaleGuard(ctx)
+	return "", n.DropNICTable(ctx)
 }
+
+// ErrNICTableRefused wraps a failure to load the per-NIC bridge table. The
+// inet table (NAT, isolation, routed filtering) was still applied, rendered
+// so it does not rely on the refused table.
+var ErrNICTableRefused = errors.New("per-NIC table refused")
 
 // Applier serialises Apply calls and short-circuits when the rendered
 // ruleset hasn't changed. Intended to be a long-lived process-wide
@@ -104,7 +106,9 @@ type Applier struct {
 	runner NftRunner
 
 	mu          sync.Mutex
-	lastSent    string
+	lastInet    string
+	lastNIC     string // the per-NIC table last loaded; "" = none loaded by this process
+	nicCleaned  bool   // a stale per-NIC table from before this process was looked for
 	lastApplyAt time.Time
 	resyncAfter time.Duration
 	now         func() time.Time
@@ -141,34 +145,69 @@ func (a *Applier) SetClock(now func() time.Time) {
 // is false, the daemon can skip log/event emission. Apply is goroutine-
 // safe; concurrent callers serialise on a per-Applier mutex so two
 // reconcilers don't fight.
+//
+// The two tables load as two transactions, per-NIC table first. A refusal of
+// the per-NIC table (a kernel without some bridge-family support, an nft too
+// old for one of its expressions) must not freeze NAT, isolation and routed
+// filtering with it, so the inet table is then rendered not to rely on it and
+// applied anyway, and the error is returned wrapping ErrNICTableRefused. The
+// per-NIC table goes first because the inet table trusts the marks it sets:
+// loading the inet table first would, for a moment, trust a table not yet
+// there.
 func (a *Applier) Apply(ctx context.Context, p Plan) (bool, error) {
-	rs, err := Render(p)
-	if err != nil {
+	if _, _, err := RenderParts(p, true); err != nil {
 		return false, fmt.Errorf("render: %w", err)
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	resync := a.resyncDueLocked()
 
-	unchanged := rs == a.lastSent
-	// The cache alone cannot self-heal. Nothing here observes the kernel, so
-	// "the bytes I last sent" is not "the bytes that are loaded": after an
-	// out-of-band `nft flush` the reconciler renders the same ruleset, skips
-	// nft, and stamps a fresh tick — reporting healthy with no rules loaded.
-	// Re-sending the identical ruleset once per resync window bounds how long
-	// that can last, while leaving the ordinary tick free.
-	if unchanged && !a.resyncDueLocked() {
-		return false, nil
+	changed, sent := false, false
+	nicActive := false
+	var nicErr error
+	_, nic, _ := RenderParts(p, true)
+	switch {
+	case nic != "":
+		if nic != a.lastNIC || resync {
+			if out, err := a.runner.Apply(ctx, nic); err != nil {
+				nicErr = fmt.Errorf("%w: nft apply: %v: %s", ErrNICTableRefused, err, strings.TrimSpace(out))
+			} else {
+				changed = changed || nic != a.lastNIC
+				a.lastNIC, sent = nic, true
+			}
+		}
+		nicActive = nicErr == nil
+	case a.lastNIC != "" || !a.nicCleaned:
+		// Nothing to enforce per NIC: remove a table this process, or an
+		// earlier binary, left behind. libvirt reuses vnetN names, so a stale
+		// chain would hold the next VM to get one to another VM's policy.
+		if d, ok := a.runner.(nicTableDropper); ok {
+			if err := d.DropNICTable(ctx); err != nil {
+				nicErr = err
+			}
+		}
+		if nicErr == nil {
+			changed = changed || a.lastNIC != ""
+			a.lastNIC, a.nicCleaned = "", true
+		}
 	}
-	if out, err := a.runner.Apply(ctx, rs); err != nil {
-		return false, fmt.Errorf("nft apply: %w: %s", err, strings.TrimSpace(out))
+	if nic != "" && nicErr == nil {
+		a.nicCleaned = true
 	}
-	a.lastSent = rs
-	a.lastApplyAt = a.clockLocked()()
+
+	inet, _, _ := RenderParts(p, nicActive)
+	if inet != a.lastInet || resync {
+		if out, err := a.runner.Apply(ctx, inet); err != nil {
+			return changed, fmt.Errorf("nft apply: %w: %s", err, strings.TrimSpace(out))
+		}
+		changed = changed || inet != a.lastInet
+		a.lastInet, sent = inet, true
+	}
+	if sent {
+		a.lastApplyAt = a.clockLocked()()
+	}
 	// changed reports whether the RULESET changed, not whether nft was invoked.
-	// A resync sends identical bytes, and telling the caller otherwise would
-	// emit a firewall-changed event every window on a cluster that changed
-	// nothing.
-	return !unchanged, nil
+	return changed, nicErr
 }
 
 // resyncDueLocked reports whether the last successful apply is old enough that
@@ -198,7 +237,10 @@ func (a *Applier) clockLocked() func() time.Time {
 func (a *Applier) LastApplied() string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.lastSent
+	if a.lastNIC == "" {
+		return a.lastInet
+	}
+	return a.lastInet + "\n" + a.lastNIC
 }
 
 // Reset clears the last-sent cache so the next Apply will re-send even
@@ -207,26 +249,36 @@ func (a *Applier) LastApplied() string {
 func (a *Applier) Reset() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.lastSent = ""
+	a.lastInet, a.lastNIC = "", ""
+	a.nicCleaned = false
 	a.lastApplyAt = time.Time{}
 }
 
-var bridgeConntrackOnce sync.Once
+// BridgeConntrackAvailable reports whether nf_conntrack_bridge is loaded,
+// loading it first when load is set. Per-NIC rules need it: without it every
+// bridged frame is untracked, the reply to a guest's own connection is judged
+// as a new one, and a `ct` expression in the bridge table makes the kernel
+// refuse the table outright. The daemon loads it at start (load=true); tests
+// never do (load=false): loading a module is a change to the host.
+func BridgeConntrackAvailable(ctx context.Context, load bool) bool {
+	if moduleLoaded("nf_conntrack_bridge") {
+		return true
+	}
+	if !load {
+		return false
+	}
+	if out, err := exec.CommandContext(ctx, "modprobe", "nf_conntrack_bridge").CombinedOutput(); err != nil {
+		slog.Error("firewall: could not load nf_conntrack_bridge; per-NIC rules will not be enforced (guards only)",
+			"error", err, "output", strings.TrimSpace(string(out)))
+		return false
+	}
+	return moduleLoaded("nf_conntrack_bridge")
+}
 
-// EnsureBridgeConntrack loads nf_conntrack_bridge, once per process. The
-// per-NIC table's `ct state established,related accept` recognises a reply on
-// a bridge port only with it; without it every bridged frame is untracked, and
-// the reply to a connection a guest opened is judged by the guest's ingress
-// rules like a new connection. A failure is logged, not fatal: the module may
-// be built in, and the rules still load.
-func EnsureBridgeConntrack(ctx context.Context) {
-	bridgeConntrackOnce.Do(func() {
-		if _, err := os.Stat("/sys/module/nf_conntrack_bridge"); err == nil {
-			return
-		}
-		if out, err := exec.CommandContext(ctx, "modprobe", "nf_conntrack_bridge").CombinedOutput(); err != nil {
-			slog.Error("firewall: could not load nf_conntrack_bridge; replies on bridge ports will be judged as new connections",
-				"error", err, "output", strings.TrimSpace(string(out)))
-		}
-	})
+// moduleLoaded reports whether a kernel module is loaded or built in.
+func moduleLoaded(name string) bool {
+	if _, err := os.Stat("/sys/module/" + name); err == nil {
+		return true
+	}
+	return false
 }

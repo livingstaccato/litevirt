@@ -151,6 +151,8 @@ const (
 	LiteVirt_ReloadFirewall_FullMethodName             = "/litevirt.v1.LiteVirt/ReloadFirewall"
 	LiteVirt_SetNICGuard_FullMethodName                = "/litevirt.v1.LiteVirt/SetNICGuard"
 	LiteVirt_ListNICGuards_FullMethodName              = "/litevirt.v1.LiteVirt/ListNICGuards"
+	LiteVirt_GetFirewallEnforcement_FullMethodName     = "/litevirt.v1.LiteVirt/GetFirewallEnforcement"
+	LiteVirt_SetFirewallEnforcement_FullMethodName     = "/litevirt.v1.LiteVirt/SetFirewallEnforcement"
 	LiteVirt_BackupSnapshot_FullMethodName             = "/litevirt.v1.LiteVirt/BackupSnapshot"
 	LiteVirt_RestoreFromBackup_FullMethodName          = "/litevirt.v1.LiteVirt/RestoreFromBackup"
 	LiteVirt_HasChunks_FullMethodName                  = "/litevirt.v1.LiteVirt/HasChunks"
@@ -530,6 +532,11 @@ type LiteVirtClient interface {
 	// and the source addresses the guard lets it use.
 	SetNICGuard(ctx context.Context, in *SetNICGuardRequest, opts ...grpc.CallOption) (*NICGuard, error)
 	ListNICGuards(ctx context.Context, in *ListNICGuardsRequest, opts ...grpc.CallOption) (*ListNICGuardsResponse, error)
+	// GetFirewallEnforcement reports whether per-NIC rules are enforced or
+	// only observed, and each host's would-drop counters;
+	// SetFirewallEnforcement switches it (admin).
+	GetFirewallEnforcement(ctx context.Context, in *GetFirewallEnforcementRequest, opts ...grpc.CallOption) (*FirewallEnforcementStatus, error)
+	SetFirewallEnforcement(ctx context.Context, in *SetFirewallEnforcementRequest, opts ...grpc.CallOption) (*FirewallEnforcementStatus, error)
 	// ── Backup snapshots ──
 	BackupSnapshot(ctx context.Context, in *BackupSnapshotRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[BackupSnapshotProgress], error)
 	RestoreFromBackup(ctx context.Context, in *RestoreFromBackupRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[RestoreFromBackupProgress], error)
@@ -2378,6 +2385,26 @@ func (c *liteVirtClient) ListNICGuards(ctx context.Context, in *ListNICGuardsReq
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListNICGuardsResponse)
 	err := c.cc.Invoke(ctx, LiteVirt_ListNICGuards_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) GetFirewallEnforcement(ctx context.Context, in *GetFirewallEnforcementRequest, opts ...grpc.CallOption) (*FirewallEnforcementStatus, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(FirewallEnforcementStatus)
+	err := c.cc.Invoke(ctx, LiteVirt_GetFirewallEnforcement_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) SetFirewallEnforcement(ctx context.Context, in *SetFirewallEnforcementRequest, opts ...grpc.CallOption) (*FirewallEnforcementStatus, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(FirewallEnforcementStatus)
+	err := c.cc.Invoke(ctx, LiteVirt_SetFirewallEnforcement_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -4387,6 +4414,11 @@ type LiteVirtServer interface {
 	// and the source addresses the guard lets it use.
 	SetNICGuard(context.Context, *SetNICGuardRequest) (*NICGuard, error)
 	ListNICGuards(context.Context, *ListNICGuardsRequest) (*ListNICGuardsResponse, error)
+	// GetFirewallEnforcement reports whether per-NIC rules are enforced or
+	// only observed, and each host's would-drop counters;
+	// SetFirewallEnforcement switches it (admin).
+	GetFirewallEnforcement(context.Context, *GetFirewallEnforcementRequest) (*FirewallEnforcementStatus, error)
+	SetFirewallEnforcement(context.Context, *SetFirewallEnforcementRequest) (*FirewallEnforcementStatus, error)
 	// ── Backup snapshots ──
 	BackupSnapshot(*BackupSnapshotRequest, grpc.ServerStreamingServer[BackupSnapshotProgress]) error
 	RestoreFromBackup(*RestoreFromBackupRequest, grpc.ServerStreamingServer[RestoreFromBackupProgress]) error
@@ -5176,6 +5208,12 @@ func (UnimplementedLiteVirtServer) SetNICGuard(context.Context, *SetNICGuardRequ
 }
 func (UnimplementedLiteVirtServer) ListNICGuards(context.Context, *ListNICGuardsRequest) (*ListNICGuardsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListNICGuards not implemented")
+}
+func (UnimplementedLiteVirtServer) GetFirewallEnforcement(context.Context, *GetFirewallEnforcementRequest) (*FirewallEnforcementStatus, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetFirewallEnforcement not implemented")
+}
+func (UnimplementedLiteVirtServer) SetFirewallEnforcement(context.Context, *SetFirewallEnforcementRequest) (*FirewallEnforcementStatus, error) {
+	return nil, status.Error(codes.Unimplemented, "method SetFirewallEnforcement not implemented")
 }
 func (UnimplementedLiteVirtServer) BackupSnapshot(*BackupSnapshotRequest, grpc.ServerStreamingServer[BackupSnapshotProgress]) error {
 	return status.Error(codes.Unimplemented, "method BackupSnapshot not implemented")
@@ -7869,6 +7907,42 @@ func _LiteVirt_ListNICGuards_Handler(srv interface{}, ctx context.Context, dec f
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).ListNICGuards(ctx, req.(*ListNICGuardsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_GetFirewallEnforcement_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetFirewallEnforcementRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).GetFirewallEnforcement(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_GetFirewallEnforcement_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).GetFirewallEnforcement(ctx, req.(*GetFirewallEnforcementRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_SetFirewallEnforcement_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetFirewallEnforcementRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).SetFirewallEnforcement(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_SetFirewallEnforcement_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).SetFirewallEnforcement(ctx, req.(*SetFirewallEnforcementRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -11111,6 +11185,14 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ListNICGuards",
 			Handler:    _LiteVirt_ListNICGuards_Handler,
+		},
+		{
+			MethodName: "GetFirewallEnforcement",
+			Handler:    _LiteVirt_GetFirewallEnforcement_Handler,
+		},
+		{
+			MethodName: "SetFirewallEnforcement",
+			Handler:    _LiteVirt_SetFirewallEnforcement_Handler,
 		},
 		{
 			MethodName: "HasChunks",

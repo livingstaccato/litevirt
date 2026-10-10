@@ -350,6 +350,20 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		s.audit(ctx, "ct.create", info.Name, "image="+rec.Image, "error")
 		return nil, status.Errorf(codes.Internal, "create: record cluster state: %v", err)
 	}
+	// A container's managed NICs are new NICs: guarded by default, held to
+	// the exact address IPAM gave them. A failure here leaves them unguarded
+	// — what every container NIC was before — and says so; relax or retry
+	// with `lv firewall nic-guard set --container`.
+	var ctGuards []corrosion.NICGuardRecord
+	for _, ifc := range plan.ifaces {
+		ctGuards = append(ctGuards, corrosion.NICGuardRecord{
+			VMName: corrosion.ContainerGuardOwner(s.hostName, info.Name), MAC: ifc.MAC, Mode: corrosion.NICGuardOn})
+	}
+	if err := s.writeNewNICGuards(ctx, ctGuards); err != nil {
+		slog.Error("container create: could not record its NIC guards; its NICs are unguarded", "name", info.Name, "error", err)
+	} else if len(ctGuards) > 0 {
+		s.reconcileLocal(ctx)
+	}
 	s.audit(ctx, "ct.create", info.Name, "project="+tenancy.NormalizeProject(req.Project)+" image="+rec.Image, "ok")
 	slog.Info("container created", "name", info.Name, "host", s.hostName)
 	return toPbContainer(rec), nil

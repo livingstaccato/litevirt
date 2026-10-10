@@ -2,9 +2,11 @@ package firewall
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -48,6 +50,9 @@ type Reconciler struct {
 	// without NAT/isolation during the upgrade migration. nil in tests.
 	legacyCleanup func(bridge, masqueradeSubnet string) error
 	cleaned       map[string]bool
+
+	state     AppliedState
+	stateHook func(context.Context, AppliedState)
 }
 
 // NewReconciler wires a loader to an applier. interval controls the
@@ -128,11 +133,21 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 		return err
 	}
 	changed, err := r.applier.Apply(ctx, plan)
-	if err != nil {
+	nicRefused := errors.Is(err, ErrNICTableRefused)
+	if err != nil && !nicRefused {
 		r.recordErr(fmt.Errorf("apply plan: %w", err))
 		return err
 	}
-	r.recordOK()
+	r.recordState(ctx, plan, err)
+	if nicRefused {
+		// The inet table (NAT, isolation, routed filtering) was applied; only
+		// the per-NIC table was refused. Report it, and carry on with the
+		// rest of the pass.
+		r.recordErr(fmt.Errorf("apply plan: %w", err))
+		slog.Error("firewall: the per-NIC table was refused; NAT, isolation and routed filtering still applied", "error", err)
+	} else {
+		r.recordOK()
+	}
 	if changed {
 		slog.Info("firewall ruleset applied",
 			"rules", countRules(plan), "nics", len(plan.NICs))
@@ -140,7 +155,53 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 	// New NAT/isolation rules are now live in litevirt-fw (this apply, or an earlier
 	// one if unchanged) — safe to clear the old out-of-band rules for these bridges.
 	r.migrateLegacy(plan)
-	return nil
+	return err
+}
+
+// AppliedState is what a reconcile pass put in force on this host.
+type AppliedState struct {
+	// Mode is the per-NIC mode rendered: NICModeEnforce, NICModeObserve or
+	// NICModeGuardsOnly; "" when the host has no guest NIC.
+	Mode string
+	// NICTableError is why the per-NIC table was refused, "" when it was not.
+	NICTableError string
+	// NICs is the guest devices the per-NIC table covers.
+	NICs map[string]string // device → workload
+}
+
+// SetStateHook registers fn to receive the applied state after every pass
+// that reached nft. The daemon records health conditions from it.
+func (r *Reconciler) SetStateHook(fn func(context.Context, AppliedState)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.stateHook = fn
+}
+
+// AppliedState returns the state the last pass put in force.
+func (r *Reconciler) AppliedState() AppliedState {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.state
+}
+
+func (r *Reconciler) recordState(ctx context.Context, p Plan, applyErr error) {
+	st := AppliedState{NICs: map[string]string{}}
+	if len(p.NICs) > 0 {
+		st.Mode = p.nicMode()
+	}
+	for _, n := range p.NICs {
+		st.NICs[n.NICDev] = n.VMName
+	}
+	if applyErr != nil {
+		st.NICTableError = applyErr.Error()
+	}
+	r.mu.Lock()
+	r.state = st
+	hook := r.stateHook
+	r.mu.Unlock()
+	if hook != nil {
+		hook(ctx, st)
+	}
 }
 
 // ReconcileForce is Reconcile with the change-detection cache cleared first, so
@@ -279,6 +340,11 @@ type LoaderOptions struct {
 	// traffic to and from those bridges is decided per NIC in the bridge
 	// table rather than a second time in the inet forward chain.
 	TapBridge func(dev string) string
+
+	// BridgeConntrack reports whether nf_conntrack_bridge is available on this
+	// host (BridgeConntrackAvailable). false renders the guards only, and the
+	// daemon raises a health condition; nil means available.
+	BridgeConntrack func() bool
 
 	// OnDuplicateSGs, when set, receives after every pass the security-group
 	// names that more than one live group holds and that a NIC on this host is
@@ -429,15 +495,25 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 		// NIC guards. A read failure fails the pass like any other, keeping
 		// the applied ruleset: dropping the guards instead would unguard every
 		// NIC on the host while the database is unreadable.
-		var guards map[string]corrosion.NICGuardRecord
-		var subnets map[string]string
-		if len(ifaces) > 0 {
-			if guards, err = corrosion.ListNICGuards(ctx, db); err != nil {
-				return plan, err
-			}
-			if subnets, err = corrosion.NetworkSubnets(ctx, db); err != nil {
-				return plan, err
-			}
+		guards, err := corrosion.ListNICGuards(ctx, db)
+		if err != nil {
+			return plan, err
+		}
+		subnets, err := corrosion.NetworkSubnets(ctx, db)
+		if err != nil {
+			return plan, err
+		}
+		assigned, err := corrosion.NetworkAssignedAddrs(ctx, db)
+		if err != nil {
+			return plan, err
+		}
+		// applyRecord sets what a NIC's guard record decides beyond the guard
+		// itself: a trunk allowance and a DHCP-server allowance hold whatever
+		// the record's mode.
+		applyRecord := func(nb *NICBinding, rec corrosion.NICGuardRecord, mac, ip, network string) {
+			nb.AllowVLANTags = rec.AllowVLANTags
+			nb.DHCPServer = rec.AllowDHCPServer
+			nb.Guard = ResolveNICGuard(&rec, mac, ip, subnets[network], assigned[network])
 		}
 		plan.NICs = plan.NICs[:0:0]
 		claimed := map[string]string{} // tap → the VM that holds it this pass
@@ -462,7 +538,7 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 			nb := bind(tap, ifc.VMName, ifc.SecurityGroups)
 			nb.Bridge = tapBridge(tap)
 			if rec, ok := guards[corrosion.NICGuardKey(ifc.VMName, ifc.MAC)]; ok {
-				nb.Guard = ResolveNICGuard(&rec, ifc.MAC, ifc.IP, subnets[ifc.NetworkName])
+				applyRecord(&nb, rec, ifc.MAC, ifc.IP, ifc.NetworkName)
 			}
 			plan.NICs = append(plan.NICs, nb)
 		}
@@ -481,6 +557,9 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 			}
 			nb := bind(ifc.VethDevice, ifc.CtName, ifc.SecurityGroups)
 			nb.Bridge = tapBridge(ifc.VethDevice)
+			if rec, ok := guards[corrosion.NICGuardKey(corrosion.ContainerGuardOwner(hostName, ifc.CtName), ifc.MAC)]; ok {
+				applyRecord(&nb, rec, ifc.MAC, ifc.IP, ifc.NetworkName)
+			}
 			plan.NICs = append(plan.NICs, nb)
 		}
 		if opts.OnDuplicateSGs != nil {
@@ -495,8 +574,96 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 			return plan, err
 		}
 		plan.NAT, plan.HostIsolation = intentToNATIsolation(intents)
+
+		// Per-NIC enforcement mode: the replicated policy (no row: observe),
+		// unless bridge conntrack is unavailable on this host, in which case
+		// only the guards and the VLAN rule — which need none — are rendered.
+		enf, err := corrosion.GetFirewallEnforcement(ctx, db)
+		if err != nil {
+			return plan, err
+		}
+		plan.NICMode = NICModeObserve
+		if enf.Mode == corrosion.FirewallEnforce {
+			plan.NICMode = NICModeEnforce
+		}
+		if opts.BridgeConntrack != nil && !opts.BridgeConntrack() {
+			plan.NICMode = NICModeGuardsOnly
+		}
+		plan.Gateways = plan.Gateways[:0:0]
+		for _, sub := range subnets {
+			if gw := SubnetGateway(sub); gw != "" {
+				plan.Gateways = append(plan.Gateways, gw)
+			}
+		}
+		sort.Strings(plan.Gateways)
+		if plan.LBBackends, plan.LBSources, err = loadLBBackends(ctx, db); err != nil {
+			return plan, err
+		}
+		for _, gw := range plan.Gateways {
+			plan.LBSources = append(plan.LBSources, gw)
+		}
 		return plan, nil
 	}
+}
+
+// loadLBBackends lists every enabled built-in load balancer's backend
+// endpoints and its VIP: haproxy, on the LB's host, connects to the backends
+// from the host's address on the guest network or from the VIP.
+func loadLBBackends(ctx context.Context, db *corrosion.Client) ([]LBBackend, []string, error) {
+	cfgs, err := corrosion.ListLBConfigs(ctx, db)
+	if err != nil {
+		return nil, nil, err
+	}
+	var out []LBBackend
+	var srcs []string
+	for _, cfg := range cfgs {
+		if !cfg.Enabled {
+			continue
+		}
+		if vip, err := netip.ParsePrefix(cfg.VIP); err == nil {
+			srcs = append(srcs, vip.Addr().String())
+		} else if vip, err := netip.ParseAddr(cfg.VIP); err == nil {
+			srcs = append(srcs, vip.String())
+		}
+		var ports []struct {
+			Target   int    `json:"target"`
+			Protocol string `json:"protocol"`
+		}
+		_ = json.Unmarshal([]byte(cfg.Ports), &ports)
+		targets := map[int]bool{}
+		for _, p := range ports {
+			if p.Target > 0 {
+				targets[p.Target] = true
+			}
+		}
+		if len(targets) == 0 {
+			targets[80] = true // the LB's documented default backend port
+		}
+		bs, err := corrosion.ListLBBackends(ctx, db, cfg.Name)
+		if err != nil {
+			return nil, nil, err
+		}
+		for _, b := range bs {
+			if !b.Enabled {
+				continue
+			}
+			addr := b.Address
+			if h, _, err := net.SplitHostPort(addr); err == nil {
+				addr = h
+			}
+			for port := range targets {
+				out = append(out, LBBackend{Addr: addr, Port: port})
+			}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Addr != out[j].Addr {
+			return out[i].Addr < out[j].Addr
+		}
+		return out[i].Port < out[j].Port
+	})
+	sort.Strings(srcs)
+	return out, srcs, nil
 }
 
 // ResolveNICGuard turns a NIC's guard record into the renderer's guard, or
@@ -513,27 +680,37 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 //
 // An entry that does not parse is skipped rather than allowed to reach the
 // renderer, which would refuse the whole ruleset.
-func ResolveNICGuard(rec *corrosion.NICGuardRecord, mac, nicIP, subnet string) *NICGuard {
+func ResolveNICGuard(rec *corrosion.NICGuardRecord, mac, nicIP, subnet string, assigned []string) *NICGuard {
 	if rec == nil || !rec.Guarded() {
 		return nil
 	}
 	g := &NICGuard{MAC: strings.ToLower(mac), AllowDHCPServer: rec.AllowDHCPServer, AllowRouterAdvert: rec.AllowRouterAdvert}
 	var v4, v6 []string
+	own := map[string]bool{}
 	assigned4, assigned6 := false, false
-	add := func(s string, assigned bool) {
-		p, ok := parseGuardEntry(s, assigned)
+	add := func(s string, isAssigned bool) {
+		p, ok := parseGuardEntry(s, isAssigned)
 		if !ok {
 			if s != "" {
 				slog.Warn("firewall: skipping an unparseable NIC guard address", "vm", rec.VMName, "mac", mac, "address", s)
 			}
 			return
 		}
+		if p.Addr().Is6() && p.Addr().IsLinkLocalUnicast() && p.IsSingleIP() {
+			// A link-local address is the guest's on its link only; it is
+			// held separately from the global ones (NICGuard.LinkLocal).
+			g.LinkLocal = append(g.LinkLocal, p.Addr().String())
+			return
+		}
+		if p.IsSingleIP() {
+			own[p.Addr().String()] = true
+		}
 		if p.Addr().Is4() {
 			v4 = append(v4, guardEntryString(p))
-			assigned4 = assigned4 || assigned
+			assigned4 = assigned4 || isAssigned
 		} else {
 			v6 = append(v6, guardEntryString(p))
-			assigned6 = assigned6 || assigned
+			assigned6 = assigned6 || isAssigned
 		}
 	}
 	add(nicIP, true)
@@ -545,10 +722,25 @@ func ResolveNICGuard(rec *corrosion.NICGuardRecord, mac, nicIP, subnet string) *
 	}
 	if sp, err := netip.ParsePrefix(strings.TrimSpace(subnet)); err == nil && sp.Addr().Zone() == "" {
 		sp = sp.Masked()
-		if sp.Addr().Is4() && !assigned4 {
-			v4 = append(v4, sp.String())
-		} else if !sp.Addr().Is4() && !assigned6 {
-			v6 = append(v6, sp.String())
+		v4net := sp.Addr().Is4()
+		if (v4net && !assigned4) || (!v4net && !assigned6) {
+			// No exact address is known, so the guest may use one from the
+			// subnet — but never the network's own addresses, nor one that
+			// is assigned to another NIC on it: claiming those is how a guest
+			// impersonates the gateway or a neighbour.
+			excl := subnetReserved(sp)
+			for _, a := range assigned {
+				if ap, err := netip.ParseAddr(a); err == nil && sp.Contains(ap) && !own[ap.String()] {
+					excl = append(excl, ap.String())
+				}
+			}
+			if v4net {
+				v4 = append(v4, sp.String())
+				g.ExcludeV4 = excl
+			} else {
+				v6 = append(v6, sp.String())
+				g.ExcludeV6 = excl
+			}
 		}
 	}
 	if len(v4) > 0 {
@@ -558,6 +750,43 @@ func ResolveNICGuard(rec *corrosion.NICGuardRecord, mac, nicIP, subnet string) *
 		g.V6 = v6
 	}
 	return g
+}
+
+// subnetReserved is a subnet's own addresses: the network address, the
+// gateway litevirt puts on the bridge (the first host, where dnsmasq serves),
+// and for IPv4 the broadcast address.
+func subnetReserved(sp netip.Prefix) []string {
+	out := []string{sp.Addr().String()}
+	if gw := sp.Addr().Next(); sp.Contains(gw) {
+		out = append(out, gw.String())
+	}
+	if sp.Addr().Is4() {
+		b := sp.Addr().As4()
+		bits := sp.Bits()
+		for i := 0; i < 4; i++ {
+			for j := 0; j < 8; j++ {
+				if i*8+j >= bits {
+					b[i] |= 0x80 >> j
+				}
+			}
+		}
+		out = append(out, netip.AddrFrom4(b).String())
+	}
+	return out
+}
+
+// SubnetGateway is the address litevirt gives a managed network's bridge:
+// the subnet's first host. "" when subnet does not parse.
+func SubnetGateway(subnet string) string {
+	sp, err := netip.ParsePrefix(strings.TrimSpace(subnet))
+	if err != nil || sp.Addr().Zone() != "" {
+		return ""
+	}
+	gw := sp.Masked().Addr().Next()
+	if !sp.Contains(gw) {
+		return ""
+	}
+	return gw.String()
 }
 
 // parseGuardEntry reads one guard address. An assigned address is a host

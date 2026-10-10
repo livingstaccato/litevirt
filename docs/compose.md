@@ -365,6 +365,7 @@ Supports `s` (seconds), `m` (minutes), `h` (hours). Defaults to 30 seconds if no
         allowed-addresses: ["10.0.1.250"]   # extra sources the guest may use (a VIP)
         allow-dhcp-server: false
         allow-router-advertisement: false
+        allow-vlan-tags: false      # true: a trunk (tagged frames from the guest)
 ```
 
 IPv6 can be set either by putting a v6 address in the `ip`/`gateway` fields, or

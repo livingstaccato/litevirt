@@ -198,6 +198,7 @@ func TestCorrosionPlanLoader_DuplicateNameFailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loader: %v", err)
 	}
+	plan.NICMode = NICModeEnforce // no enforcement policy recorded: the loader says observe
 	out, err := Render(plan)
 	if err != nil {
 		t.Fatalf("Render: %v", err)

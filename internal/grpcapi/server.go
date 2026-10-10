@@ -759,6 +759,11 @@ type Server struct {
 	// `lv firewall reload` push semantics rather than a 30s wait.
 	fwReconciler FirewallReconciler
 
+	// DHCP reservations made for NICs whose rows are not written yet
+	// (nic_identity.go): network → address → reservation.
+	dhcpResMu   sync.Mutex
+	dhcpPending map[string]map[string]dhcpPendingRes
+
 	// antiEntropy is the daemon's anti-entropy loop. TriggerAntiEntropy calls RunOnce on
 	// it so `lv cluster converge` kicks an immediate (debounced) pass instead of waiting
 	// for the periodic tick. Same synchronous-push pattern as fwReconciler.

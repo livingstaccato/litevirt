@@ -1062,8 +1062,13 @@ lv firewall default-deny <on|off> [--scope <host>]   # no --scope = cluster-wide
 # NIC guards (anti-spoofing). New NICs are guarded by default; relaxing one
 # needs cluster-root network authority. --allow replaces the list (repeatable).
 lv firewall nic-guard set <vm> --network <net>|--mac <mac> --mode on|off \
-    [--allow <ip-or-cidr>] [--allow-dhcp-server] [--allow-router-advertisement]
+    [--allow <ip-or-cidr>] [--allow-dhcp-server] [--allow-router-advertisement] [--allow-vlan-tags]
+lv firewall nic-guard set --container <ct> --host <host> --network <net> --mode on|off
 lv firewall nic-guard ls [<vm>]
+
+# Per-NIC enforcement: an upgraded cluster observes (counts would-drops) until enforced.
+lv firewall enforce status    # mode per host + would-drop counts per NIC and rule
+lv firewall enforce on        # enforce (admin, audited); off = observe
 ```
 
 See `docs/firewall.md` for the three-tier model, where each tier is enforced

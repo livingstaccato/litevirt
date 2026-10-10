@@ -363,6 +363,7 @@ type NetworkAttachment struct {
 	AllowedAddresses         []string `yaml:"allowed-addresses,omitempty"`
 	AllowDHCPServer          bool     `yaml:"allow-dhcp-server,omitempty"`
 	AllowRouterAdvertisement bool     `yaml:"allow-router-advertisement,omitempty"`
+	AllowVLANTags            bool     `yaml:"allow-vlan-tags,omitempty"`
 }
 
 // CloudInitDef holds cloud-init configuration.

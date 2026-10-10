@@ -20,6 +20,7 @@ import (
 	"io"
 	"net"
 	"os/exec"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -124,31 +125,90 @@ func (l *lab) guestIP(host, vm string, timeout time.Duration) string {
 	return ""
 }
 
+// guestTap is the host device of vm's (only) NIC.
+func (l *lab) guestTap(host, vm string) string {
+	l.t.Helper()
+	out := l.mustSSH(host, 20*time.Second, "virsh domiflist "+shellQuote(vm)+" | awk 'NR>2 && $1!=\"\" {print $1; exit}'")
+	tap := strings.TrimSpace(out)
+	if tap == "" {
+		l.t.Fatalf("no tap for %s on %s", vm, host)
+	}
+	return tap
+}
+
+// probe installs a counting rule on host in its own table and returns a
+// reader for the count. family/hook/priority place it; match is the nft
+// match. The table is removed when the test ends.
+func (l *lab) probe(host, name, family, hook string, priority int, match string) func() int {
+	l.t.Helper()
+	tbl := "e2eprobe_" + name
+	l.mustSSH(host, 20*time.Second, fmt.Sprintf(
+		`nft add table %[1]s %[2]s && nft add chain %[1]s %[2]s c '{ type filter hook %[3]s priority %[4]d; policy accept; }' && nft add rule %[1]s %[2]s c %[5]s counter`,
+		family, tbl, hook, priority, match))
+	l.onRestore(func() { _, _ = l.ssh(host, 20*time.Second, "nft delete table "+family+" "+tbl) })
+	return func() int {
+		out := l.mustSSH(host, 20*time.Second, "nft list chain "+family+" "+tbl+" c | grep -o 'packets [0-9]*' | awk '{print $2}'")
+		n, _ := strconv.Atoi(strings.TrimSpace(out))
+		return n
+	}
+}
+
 // TestFirewall_TrafficBetweenVMs: per-NIC rules hold for traffic between two
 // guests on ONE bridge, the allowed case passes, replies to a guest's own
 // connection come back through a drop-everything ingress policy (stateful),
-// and a guarded guest's spoofed source is dropped — and passes once the guard
-// is turned off, so the drop was the guard's.
+// and every critical finding of the 2026-10-10 review holds on real traffic:
 //
-// Four cirros guests on one host and one bridge:
+//   - C1: a security group with a reject rule loads (it renders as drop on
+//     the bridge), drops, and leaves NAT and the rest of the firewall applied;
+//   - C2: a guest whose egress is denied cannot reach a routed UDP/67 by
+//     using DHCP's ports;
+//   - C3: a tagged frame from an UNGUARDED guest is dropped (and passes once
+//     the NIC is made a trunk);
+//   - C4: a guarded guest on a DHCP network cannot use the gateway's address
+//     or a neighbour's (its exact reservation is all it may use);
+//   - observe mode drops nothing and counts what it would have dropped.
+//
+// Five cirros guests on one host and one bridge:
 //
 //	a: no security group — the prober
-//	b: may not receive icmp
+//	b: rejects icmp ingress
 //	c: may receive only tcp/22 (so the test can log in), nothing else
 //	d: no security group — the allowed target
+//	e: may send nothing (and receive only tcp/22)
 func TestFirewall_TrafficBetweenVMs(t *testing.T) {
 	l := newLab(t)
 	host := l.hosts[0]
+
+	// The cluster's per-NIC mode is restored afterwards; this test needs
+	// enforcement (and checks observe on the way).
+	prevMode := "observe"
+	if strings.Contains(l.mustLV(host, "firewall", "enforce", "status"), "per-NIC enforcement: enforce") {
+		prevMode = "enforce"
+	}
+	l.onRestore(func() {
+		arg := "off"
+		if prevMode == "enforce" {
+			arg = "on"
+		}
+		_, _ = l.lv(host, "firewall", "enforce", arg)
+	})
+	l.mustLV(host, "firewall", "enforce", "on")
+
 	stack := uniqueName("fwt")
 	yaml := fmt.Sprintf(`name: %[1]s
 security-groups:
   noicmp:
     rules:
-      - {direction: ingress, proto: icmp, action: drop}
+      - {direction: ingress, proto: icmp, action: reject}
   sshonly:
     rules:
       - {direction: ingress, proto: tcp, port: "22", action: accept}
       - {direction: ingress, proto: all, action: drop}
+  silent:
+    rules:
+      - {direction: ingress, proto: tcp, port: "22", action: accept}
+      - {direction: ingress, proto: all, action: drop}
+      - {direction: egress, proto: all, action: drop}
 networks:
   fwt:
     type: bridge
@@ -180,6 +240,12 @@ vms:
     memory: %[3]s
     network: [{name: fwt}]
     placement: {host: %[4]s}
+  e:
+    image: %[2]s
+    cpu: 1
+    memory: %[3]s
+    network: [{name: fwt, security-groups: [silent]}]
+    placement: {host: %[4]s}
 `, stack, drillImage(), drillMemory(), host)
 	file := "/tmp/" + stack + ".yaml"
 	l.mustSSH(host, 30*time.Second, "echo "+base64.StdEncoding.EncodeToString([]byte(yaml))+" | base64 -d > "+file)
@@ -189,27 +255,28 @@ vms:
 	})
 	l.mustLV(host, "compose", "up", "-f", file, "-y")
 
-	vm := func(n string) string { return stack + "_" + n }
-	names := []string{"a", "b", "c", "d"}
-	// Compose may scope VM names; take them from the cluster rather than guess.
-	for i, n := range names {
-		for _, cand := range []string{n, vm(n), stack + "-" + n} {
+	short := []string{"a", "b", "c", "d", "e"}
+	names := map[string]string{}
+	for _, n := range short {
+		names[n] = n
+		for _, cand := range []string{n, stack + "_" + n, stack + "-" + n} {
 			if rows, _ := l.sql(host, "SELECT name FROM vms WHERE name = '"+cand+"' AND deleted_at IS NULL"); len(rows) == 1 {
-				names[i] = cand
+				names[n] = cand
 				break
 			}
 		}
 	}
 	ip := map[string]string{}
-	for i, n := range []string{"a", "b", "c", "d"} {
-		if !l.waitDomainState(host, names[i], "running", 4*time.Minute) {
-			t.Fatalf("%s never ran", names[i])
+	for _, n := range short {
+		if !l.waitDomainState(host, names[n], "running", 4*time.Minute) {
+			t.Fatalf("%s never ran", names[n])
 		}
-		ip[n] = l.guestIP(host, names[i], 5*time.Minute)
+		ip[n] = l.guestIP(host, names[n], 5*time.Minute)
 	}
 	l.mark("guests: %v", ip)
-	l.waitGuestSSH(host, ip["a"], 20*time.Minute)
-	l.waitGuestSSH(host, ip["c"], 20*time.Minute)
+	for _, n := range []string{"a", "c", "e"} {
+		l.waitGuestSSH(host, ip[n], 20*time.Minute)
+	}
 	l.saveEvidence("ruleset.txt", l.mustSSH(host, 30*time.Second, "nft list ruleset"))
 
 	try := func(from, cmd string) bool {
@@ -220,11 +287,17 @@ vms:
 		l.mark("%s$ %s -> ok=%v %s", from, cmd, ok, strings.TrimSpace(out))
 		return ok
 	}
-	ping := func(src string) string { return "ping -c 3 -W 2 " + src }
+	ping := func(dst string) string { return "ping -c 3 -W 2 " + dst }
+	gw := strings.SplitN(strings.TrimSpace(l.mustSSH(host, 20*time.Second,
+		"ip -4 -o addr show dev e2efwtbr | awk '{print $4}' | head -1")), "/", 2)[0]
+	if gw == "" {
+		t.Fatal("no gateway address on e2efwtbr")
+	}
+	netName := l.mustSQL(host, "SELECT network_name FROM vm_interfaces WHERE vm_name = '"+names["a"]+"' AND deleted_at IS NULL")[0][0]
 
 	t.Run("SameBridgeDropIsEnforced", func(t *testing.T) {
 		if try("a", ping(ip["b"])) {
-			t.Errorf("a reached b by icmp; b's group drops icmp ingress")
+			t.Errorf("a reached b by icmp; b's group rejects icmp ingress")
 		}
 		if try("a", ping(ip["c"])) {
 			t.Errorf("a reached c by icmp; c's group drops everything but tcp/22")
@@ -239,43 +312,103 @@ vms:
 		}
 	})
 	t.Run("RepliesToOwnConnectionsAreStateful", func(t *testing.T) {
-		// c drops every new inbound connection but tcp/22; the replies to
-		// its own ping are not new, so they must come back.
 		if !try("c", ping(ip["d"])) {
 			t.Errorf("c's own ping to d got no replies: replies on bridge ports are not tracked "+
 				"(is nf_conntrack_bridge loaded on %s?)", host)
 		}
 	})
-	t.Run("SpoofedSourceIsDropped", func(t *testing.T) {
-		// The spoofed source is outside the network's subnet: for a guest on
-		// a DHCP network litevirt knows the subnet, not the lease, so any
-		// address inside it is the guest's to use (docs/firewall.md).
-		gw := strings.SplitN(strings.TrimSpace(l.mustSSH(host, 20*time.Second,
-			"ip -4 -o addr show dev e2efwtbr | awk '{print $4}' | head -1")), "/", 2)[0]
-		if gw == "" {
-			t.Fatal("no gateway address on e2efwtbr")
+	t.Run("C1_RejectRuleLoadsAndLeavesTheRestApplied", func(t *testing.T) {
+		show := l.mustLV(host, "firewall", "show")
+		if !strings.Contains(show, "table bridge litevirt-nic") {
+			t.Errorf("the per-NIC table is not loaded (a reject rule must not get it refused):\n%s", show)
 		}
-		// Count, on the host, IPv4 packets from the spoofed source that got
-		// past the bridge into the host's stack.
-		const spoof = "10.206.0.199"
-		l.mustSSH(host, 20*time.Second, `nft add table inet e2espoof && nft add chain inet e2espoof c '{ type filter hook prerouting priority -400; policy accept; }' && nft add rule inet e2espoof c ip saddr `+spoof+` counter`)
-		l.onRestore(func() { _, _ = l.ssh(host, 20*time.Second, "nft delete table inet e2espoof") })
-		count := func() string {
-			out := l.mustSSH(host, 20*time.Second, "nft list chain inet e2espoof c | grep -o 'packets [0-9]*' | awk '{print $2}'")
-			return strings.TrimSpace(out)
+		if st := l.mustLV(host, "firewall", "enforce", "status"); strings.Contains(st, "refused") {
+			t.Errorf("a host reports its per-NIC table refused:\n%s", st)
 		}
+		if nat := l.mustSSH(host, 20*time.Second, "nft list table inet litevirt-fw"); !strings.Contains(nat, "10.205.0.0/24") {
+			t.Errorf("NAT for the test network is missing from the inet table:\n%s", nat)
+		}
+	})
+	t.Run("C2_DHCPPortsDoNotBypassEgressDeny", func(t *testing.T) {
+		if !try("e", "nc --help 2>&1 | grep -q -- '-u'") {
+			t.Skip("the guest's nc cannot send UDP; C2 is proven by the kernel test instead")
+		}
+		const target = "192.0.2.67" // TEST-NET-1: routed out through the host
+		count := l.probe(host, "c2", "inet", "prerouting", -400, "ip daddr "+target+" udp dport 67")
+		try("e", "echo x | nc -u -w 1 -p 68 "+target+" 67; true")
+		if n := count(); n != 0 {
+			t.Errorf("%d datagrams from a guest whose egress is denied reached the host through DHCP's ports", n)
+		}
+		try("a", "echo x | nc -u -w 1 -p 68 "+target+" 67; true")
+		if count() == 0 {
+			t.Error("not even the unrestricted guest's datagram was counted; the zero above proves nothing")
+		}
+	})
+	t.Run("C4_GatewayAndNeighbourCannotBeClaimed", func(t *testing.T) {
+		tap := l.guestTap(host, names["a"])
+		count := l.probe(host, "c4", "bridge", "input", 100,
+			"iifname "+tap+" ip saddr { "+gw+", "+ip["d"]+" }")
+		own := l.probe(host, "c4own", "bridge", "input", 100, "iifname "+tap+" ip saddr "+ip["a"])
 		try("a", ping(gw)) // the gateway's MAC is cached from the real address first
+		if own() == 0 {
+			t.Fatal("a's own packets never reached the probe; it would count nothing either way")
+		}
+		try("a", "sudo ip addr add "+gw+"/32 dev eth0 2>/dev/null; sudo ip addr add "+ip["d"]+"/32 dev eth0 2>/dev/null; true")
+		try("a", "ping -c 2 -W 1 -I "+gw+" "+gw+"; ping -c 2 -W 1 -I "+ip["d"]+" "+gw+"; true")
+		if n := count(); n != 0 {
+			t.Errorf("%d packets claiming the gateway's or a neighbour's address got past a's guard", n)
+		}
+		try("a", "sudo ip addr del "+gw+"/32 dev eth0; sudo ip addr del "+ip["d"]+"/32 dev eth0; true")
+	})
+	t.Run("C3_TaggedFramesFromAnUnguardedNIC", func(t *testing.T) {
+		if !try("a", "sudo ip link add link eth0 name eth0.10 type vlan id 10 && sudo ip addr add 10.215.0.1/24 dev eth0.10 && sudo ip link set eth0.10 up") {
+			t.Skip("the guest kernel cannot make a VLAN interface; C3 is proven by the kernel test instead")
+		}
+		l.mustLV(host, "firewall", "nic-guard", "set", names["a"], "--network", netName, "--mode", "off")
+		l.mustLV(host, "firewall", "reload")
+		tap := l.guestTap(host, names["a"])
+		count := l.probe(host, "c3", "bridge", "forward", 100, "iifname "+tap+" ether type 8021q")
+		try("a", "ping -c 3 -W 1 10.215.0.2; true")
+		if n := count(); n != 0 {
+			t.Errorf("%d tagged frames from an unguarded NIC got past the VLAN rule", n)
+		}
+		l.mustLV(host, "firewall", "nic-guard", "set", names["a"], "--network", netName, "--mode", "off", "--allow-vlan-tags")
+		l.mustLV(host, "firewall", "reload")
+		try("a", "ping -c 3 -W 1 10.215.0.2; true")
+		if count() == 0 {
+			t.Error("tagged frames from a trunk NIC were dropped too; the zero above proves nothing")
+		}
+		try("a", "sudo ip link del eth0.10; true")
+		l.mustLV(host, "firewall", "nic-guard", "set", names["a"], "--network", netName, "--mode", "on")
+	})
+	t.Run("SpoofedSourceIsDropped", func(t *testing.T) {
+		const spoof = "10.206.0.199"
+		count := l.probe(host, "spoof", "inet", "prerouting", -400, "ip saddr "+spoof)
+		try("a", ping(gw))
 		try("a", "sudo ip addr add "+spoof+"/32 dev eth0 2>/dev/null; true")
 		try("a", "ping -c 3 -W 1 -I "+spoof+" "+gw)
-		if n := count(); n != "0" {
-			t.Errorf("%s packets from the spoofed %s reached the host; a's guard is on by default", n, spoof)
+		if n := count(); n != 0 {
+			t.Errorf("%d packets from the spoofed %s reached the host; a's guard is on by default", n, spoof)
 		}
-		netName := l.mustSQL(host, "SELECT network_name FROM vm_interfaces WHERE vm_name = '"+names[0]+"' AND deleted_at IS NULL")[0][0]
-		l.mustLV(host, "firewall", "nic-guard", "set", names[0], "--network", netName, "--mode", "off")
+		l.mustLV(host, "firewall", "nic-guard", "set", names["a"], "--network", netName, "--mode", "off")
 		l.mustLV(host, "firewall", "reload")
 		try("a", "ping -c 3 -W 1 -I "+spoof+" "+gw)
-		if n := count(); n == "0" || n == "" {
+		if count() == 0 {
 			t.Errorf("with a's guard off no spoofed packet reached the host either, so the drop above proves nothing")
 		}
+		try("a", "sudo ip addr del "+spoof+"/32 dev eth0; true")
+		l.mustLV(host, "firewall", "nic-guard", "set", names["a"], "--network", netName, "--mode", "on")
+	})
+	t.Run("ObserveDropsNothingAndCounts", func(t *testing.T) {
+		l.mustLV(host, "firewall", "enforce", "off")
+		l.mustLV(host, "firewall", "reload")
+		if !try("a", ping(ip["b"])) {
+			t.Errorf("in observe mode a still cannot reach b")
+		}
+		st := l.mustLV(host, "firewall", "enforce", "status")
+		if !strings.Contains(st, "observe") || !strings.Contains(st, "sg:noicmp") {
+			t.Errorf("observe status does not show b's would-drop:\n%s", st)
+		}
+		l.mustLV(host, "firewall", "enforce", "on")
 	})
 }

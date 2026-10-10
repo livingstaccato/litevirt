@@ -9,16 +9,15 @@ func guardedPlan(g *NICGuard) Plan {
 	return Plan{NICs: []NICBinding{{NICDev: "vnet3", VMName: "web-1", Guard: g}}}
 }
 
-// TestRender_NoGuardNoBridgeTable: a plan without a guarded NIC renders no
-// bridge table at all, so hosts that guard nothing load exactly what they
-// loaded before this feature.
-func TestRender_NoGuardNoBridgeTable(t *testing.T) {
-	out, err := Render(Plan{NICs: []NICBinding{{NICDev: "vnet3", VMName: "web-1"}}})
+// TestRender_NoNICNoBridgeTable: a host with no guest NIC renders no bridge
+// table, so it never depends on nf_tables bridge support.
+func TestRender_NoNICNoBridgeTable(t *testing.T) {
+	out, err := Render(Plan{DefaultDeny: true})
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
 	if strings.Contains(out, "table bridge") {
-		t.Errorf("an unguarded plan rendered a bridge table:\n%s", out)
+		t.Errorf("a plan with no NIC rendered a bridge table:\n%s", out)
 	}
 }
 
@@ -51,8 +50,9 @@ func TestRender_GuardMACAndIPv4(t *testing.T) {
 	if strings.Index(out, "udp dport 67 accept") > strings.Index(out, "ip saddr != { 10.0.0.5 } drop") {
 		t.Errorf("DHCP discover accept must precede the IPv4 source drop:\n%s", out)
 	}
-	// IPv6 is not restricted when no IPv6 address space is known.
-	if strings.Contains(out, "ip6 saddr !=") {
+	// Global IPv6 is not restricted when no IPv6 address space is known
+	// (link-local is: TestRender_GuardLinkLocal).
+	if strings.Contains(out, "ip6 saddr != { ::") {
 		t.Errorf("IPv6 restricted with nothing known about it:\n%s", out)
 	}
 }
@@ -90,17 +90,17 @@ func TestRender_GuardDHCPAndRAServers(t *testing.T) {
 }
 
 // TestRender_GuardIPv6AndNDP: with IPv6 restricted the guest may send from its
-// addresses, any link-local address and the unspecified address (duplicate
-// address detection), and a neighbour advertisement may only claim one of
-// those — the IPv6 analogue of ARP spoofing.
+// addresses, its own (EUI-64) link-local address and the unspecified address
+// (duplicate address detection), and a neighbour advertisement may only claim
+// one of those — the IPv6 analogue of ARP spoofing.
 func TestRender_GuardIPv6AndNDP(t *testing.T) {
 	out, err := Render(guardedPlan(&NICGuard{MAC: "52:54:00:aa:bb:cc", V6: []string{"2001:db8::5", "2001:db8:1::/64"}}))
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
 	mustContainAll(t, out,
-		"ip6 saddr != { 2001:db8:1::/64, 2001:db8::5, ::, fe80::/10 } drop",
-		"icmpv6 type nd-neighbor-advert icmpv6 taddr != { 2001:db8:1::/64, 2001:db8::5, fe80::/10 } drop",
+		"ip6 saddr != { 2001:db8:1::/64, 2001:db8::5, ::, fe80::5054:ff:feaa:bbcc } drop",
+		"icmpv6 type nd-neighbor-advert icmpv6 taddr != { 2001:db8:1::/64, 2001:db8::5, fe80::5054:ff:feaa:bbcc } drop",
 	)
 	if strings.Contains(out, "arp saddr ip !=") || strings.Contains(out, "ip saddr != {") {
 		t.Errorf("IPv4 restricted with nothing known about it:\n%s", out)

@@ -186,6 +186,9 @@ message NetworkAttachment {
     repeated string allowed_addresses          = 11;
     bool            allow_dhcp_server          = 12;
     bool            allow_router_advertisement = 13;
+    // allow_vlan_tags: let the guest send 802.1Q / 802.1ad tagged frames (a
+    // trunk). Every other NIC's tagged frames are dropped.
+    bool            allow_vlan_tags            = 14;
 }
 
 message CloudInitSpec {

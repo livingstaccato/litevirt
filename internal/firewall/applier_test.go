@@ -160,3 +160,40 @@ func TestApplier_Reset(t *testing.T) {
 		t.Errorf("expected 2 applies after Reset, got %d", len(f.applies))
 	}
 }
+
+// bridgeRefusingNft refuses any transaction carrying the per-NIC table, as a
+// kernel without some bridge-family support would.
+type bridgeRefusingNft struct{ fakeNft }
+
+func (f *bridgeRefusingNft) Apply(ctx context.Context, ruleset string) (string, error) {
+	if strings.Contains(ruleset, "table bridge "+NICTableName+" {\n") {
+		return "Operation not supported", errors.New("exit status 1")
+	}
+	return f.fakeNft.Apply(ctx, ruleset)
+}
+
+// TestApplier_RefusedNICTableDoesNotFreezeInet (ruling 2, review I3): the
+// per-NIC table loads in its own transaction; when the kernel refuses it, the
+// inet table (NAT, isolation, routed filtering) is still applied — rendered not
+// to trust marks from a table that is not there — and the error says which
+// table was refused.
+func TestApplier_RefusedNICTableDoesNotFreezeInet(t *testing.T) {
+	f := &bridgeRefusingNft{}
+	a := NewApplier(f)
+	p := Plan{
+		DefaultDeny: true,
+		NAT:         []NATRule{{Subnet: "10.0.0.0/24", Bridge: "br0"}},
+		NICs:        []NICBinding{{NICDev: "vnet1", Bridge: "br0"}},
+	}
+	_, err := a.Apply(context.Background(), p)
+	if !errors.Is(err, ErrNICTableRefused) {
+		t.Fatalf("err = %v, want ErrNICTableRefused", err)
+	}
+	if len(f.applies) != 1 {
+		t.Fatalf("inet table not applied after the per-NIC table was refused: %d applies", len(f.applies))
+	}
+	inet := f.applies[0]
+	if !strings.Contains(inet, "masquerade") || strings.Contains(inet, "meta mark") {
+		t.Errorf("inet table must carry NAT and trust no marks:\n%s", inet)
+	}
+}

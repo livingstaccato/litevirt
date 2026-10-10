@@ -149,6 +149,7 @@ func BuildVMSpec(instanceName, baseName string, vm *VMDef, f *File) (*pb.VMSpec,
 			AllowedAddresses:         n.AllowedAddresses,
 			AllowDhcpServer:          n.AllowDHCPServer,
 			AllowRouterAdvertisement: n.AllowRouterAdvertisement,
+			AllowVlanTags:            n.AllowVLANTags,
 		})
 	}
 

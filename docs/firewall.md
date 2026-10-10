@@ -62,6 +62,7 @@ bridge, so per-NIC policy is enforced in a **bridge-family** table,
 | guest to guest on one bridge | bridge `forward` | sender's `nic_out_<dev>`, then receiver's `nic_in_<dev>` |
 | guest to the host, or to be routed out | bridge `input` | sender's `nic_out_<dev>` |
 | the host, or routed traffic, to a guest | bridge `output` | receiver's `nic_in_<dev>` |
+| routed traffic to a port that is not a guest NIC on such a bridge | bridge `output` | cluster and host tiers, then the default policy (`routed_to_port`) |
 
 `nic_out_<dev>` holds every tier's **egress** rules for that NIC (cluster, then
 host, then each bound security group, then the NIC's own rules) and
@@ -69,18 +70,56 @@ host, then each bound security group, then the NIC's own rules) and
 `accept` lets the frame go on to the receiver's ingress rules rather than
 ending the evaluation, so traffic between two guests must be allowed by the
 sender's egress rules **and** the receiver's ingress rules. Under default-deny
-each chain ends in `drop`.
+each chain ends in `drop`. A `reject` rule is enforced as `drop` here: the
+bridge family can reject only at prerouting and input, and one reject on the
+forward or output hook would make the kernel refuse the whole table.
 
-Every filtering chain first accepts established and related traffic, frames
-that are not IP or IPv6 (ARP and the rest of layer 2 are the
-[NIC guard](#nic-guards)'s business), the ICMPv6 that IPv6 needs (neighbour
-and router discovery, MLD, and the errors path-MTU discovery uses), and DHCP and
-DHCPv6 client/server exchanges, so a guest can always get an address and find
-its neighbours.
+Each base chain first lets through, untouched, every frame that is neither from
+nor to a guest NIC (other bridges on the host, the uplink's own traffic). For a
+guest NIC it then accepts, ahead of the rules:
+
+- replies and related ICMP errors of known flows (`ct state established,related`);
+- frames that are not IP or IPv6 — ARP and the rest of layer 2 are the
+  [NIC guard](#nic-guards)'s business;
+- neighbour discovery with hop limit 255, and MLD between link-local or
+  unspecified and multicast addresses — link-scoped, so none of it can be
+  routed (inet forward drops a routed neighbour-discovery message);
+- DHCP only toward a server on the link: client requests to the broadcast
+  address, to `ff02::1:2`, or to a managed network's gateway (where dnsmasq
+  answers); server replies only from the host's dnsmasq, from a port that is not
+  a guest NIC (an upstream server on the uplink), or from a NIC whose guard
+  allows a DHCP server; router advertisements only from the host or from a
+  non-guest port;
+- litevirt's own services by explicit generated rules: DNS to a managed
+  network's gateway, and the built-in load balancer's haproxy on the host to its
+  backends' address and port.
+
+Nothing else is accepted by protocol or port: a `udp 68 → 67` datagram to an
+arbitrary address is judged by the rules like any other.
+
+**VLAN tags.** Every guest NIC, guarded or not, has its 802.1Q and 802.1ad
+(QinQ) tagged frames dropped at prerouting: the rules match untagged IP, so a
+tag would carry traffic past them. A NIC that is a trunk is allowed tags
+explicitly (`lv firewall nic-guard set ... --allow-vlan-tags`, compose
+`allow-vlan-tags: true`).
+
+**Routed traffic.** The `inet litevirt-fw` forward chain still judges routed
+traffic with the cluster and host tiers and the default policy, as before. Two
+marks let it skip what the bridge table judges instead: a frame a guest NIC
+sent and its egress rules passed (bridge input) is accepted, and routed traffic
+toward a bridge that carries guest NICs is handed to that bridge's output hook
+to be judged there — by the receiving NIC's ingress rules, or by the tiers and
+the default policy for any other port. Nothing is accepted by bridge name.
+The marks are bits `0x10000000` and `0x20000000` of the packet mark; a host that
+routes by fwmark must not use them.
 
 Replies are recognised by bridge connection tracking, `nf_conntrack_bridge`,
-which the daemon loads (`modprobe`) the first time it applies a per-NIC table.
-`br_netfilter` is not needed and not used.
+which the daemon loads (`modprobe`) at start. `br_netfilter` is not needed and
+not used. **Without it** — the module cannot be loaded — the host renders only
+prerouting (the NIC guards and the VLAN rule, which need no connection
+tracking), keeps the inet table's tiers and NAT as they always were, and raises
+the critical health condition `firewall.nic.unavailable`: per-NIC rules are not
+enforced there, rather than enforced without stateful replies.
 
 **This replaces an enforcement point that did not work.** Before, the per-NIC
 chains lived in the `inet` forward hook and matched the tap by
@@ -90,18 +129,33 @@ security groups were not enforced on guest-to-guest traffic at all, nor on
 traffic between a guest and its host. The rules were rendered and listed by
 `lv firewall show`, which is why nothing caught it.
 
-The `inet litevirt-fw` table keeps the forward chain for routed traffic that
-involves no guest NIC (cluster and host tiers, then the default policy), and
-accepts there anything to or from a bridge that carries guest NICs, since that
-traffic was already decided per NIC on the bridge. With nothing to enforce per
-NIC (no guard, no rule of any tier, default policy accept) no bridge table is
-rendered at all.
+The two tables load as **two** `nft -f` transactions, the per-NIC table first.
+If the kernel refuses the per-NIC table, the inet table (NAT, isolation, routed
+filtering) is still applied — rendered not to trust a table that is not there —
+and the host raises `firewall.nic.refused`; the previous per-NIC table stays.
+A host with no guest NIC renders no bridge table at all, and one the daemon no
+longer renders is deleted, because libvirt reuses `vnetN` names and a stale
+chain would hold the next VM to get that name to another VM's policy.
 
-Each host replaces both tables in **one** `nft -f` transaction, so moving
-enforcement from the old hook to the new one on upgrade never leaves a moment
-with neither applied. A table the daemon no longer renders is deleted on the
-next apply, because libvirt reuses `vnetN` names and a stale chain would hold
-the next VM to get that name to another VM's policy.
+## Observe and enforce
+
+A cluster that **upgrades** to this release starts in **observe** mode: every
+per-NIC rule is installed, but each drop is a counter instead (named
+`lv-wd <device> <in|out> <rule>`) and nothing is dropped; the inet table's
+routed filtering stays exactly as it was. Every host with guest NICs raises the
+health condition `firewall.nic.observe` and sends a notification. NIC guards on
+new NICs enforce in either mode — they protect new NICs only.
+
+```
+lv firewall enforce status   # per host: the mode in force, and per NIC and rule what would have been dropped
+lv firewall enforce on       # enforce (admin; audited as firewall.enforcement; applies to every host)
+lv firewall enforce off      # back to observing
+```
+
+A **fresh** cluster — one with no workload and no firewall rule when the mode
+is first recorded — enforces from the start. The mode is the replicated
+`cluster_policies` key `firewall_nic_enforcement`, recorded once
+`failover_scope_v1` has latched; until then every host observes.
 
 ## NAT, SNAT and host isolation
 
@@ -182,66 +236,89 @@ token; IPv4 rules are unaffected.
 ## NIC guards
 
 A NIC guard holds a guest NIC to its own identity on the wire (Proxmox's
-`ipfilter` / `macfilter`, plus DHCP and router-advertisement guards). It runs at
-the bridge `prerouting` hook, ahead of everything else, and drops what a
+`ipfilter` / `macfilter`, plus DHCP, router-advertisement and NDP guards). It
+runs at the bridge `prerouting` hook, ahead of everything else, and drops what a
 guarded guest sends:
 
 - from any MAC but the NIC's own;
-- as an 802.1Q / 802.1ad tagged frame (its payload cannot be checked);
-- ARP that claims another MAC, or another IPv4 address than the guest's;
+- ARP that claims another MAC, or an IPv4 address that is not the guest's;
 - IPv4 from an address that is not the guest's (a DHCP client asking for one,
   from `0.0.0.0`, still passes);
-- IPv6 from an address that is not the guest's (link-local and the unspecified
-  address used by duplicate address detection always pass), and neighbour
-  advertisements for an address that is not the guest's — the IPv6 form of ARP
-  spoofing;
-- DHCP and DHCPv6 server replies, unless the guard allows the guest to answer
-  DHCP;
+- IPv6 from an address that is not the guest's; its link-local addresses are
+  always held — the EUI-64 one derived from its MAC, plus any listed — so it
+  cannot claim the router's link-local address;
+- neighbour advertisements for an address that is not the guest's, and
+  solicitations, advertisements and router solicitations whose link-layer
+  address option names another MAC — the IPv6 forms of ARP spoofing;
+- DHCP and DHCPv6 server traffic — anything from the server ports or **to** the
+  client ports, whatever its source port — unless the guard allows the guest to
+  answer DHCP;
 - router advertisements and redirects, unless the guard allows the guest to act
   as a router.
 
 **Which addresses are the guest's.** For each family:
 
-- an address litevirt assigned the NIC (a static `ip:`, an IPAM or NetBox
-  address, a static `ipv6:`), plus the guard's **allowed addresses**;
-- with no assigned address of that family, the network's `subnet:` (a guest
-  that takes a DHCP lease from litevirt's dnsmasq gets some address in it, and
-  litevirt does not track which), plus the allowed addresses;
+- an address litevirt assigned the NIC — a static `ip:`, a NetBox address, a
+  container's IPAM address, a static `ipv6:`, or, for a VM NIC on a network
+  litevirt serves DHCP for, the **exact address reserved for it** in dnsmasq
+  (`--dhcp-hostsfile`) — plus the guard's **allowed addresses**;
+- with no assigned address of that family (a NIC guarded after it was created,
+  an imported VM), the network's `subnet:` — except the network address, the
+  gateway, the broadcast address and every other NIC's assigned address, which
+  are never the guest's — plus the allowed addresses;
 - with neither and no allowed address of that family: **unrestricted**. A guest
   on a plain bridge served by a DHCP server or router litevirt does not run has
   addresses nobody told litevirt about, and cutting it off would break it. The
-  MAC, ARP-sender-MAC, VLAN, DHCP-server and router-advertisement guards still
-  apply.
+  MAC, ARP-sender-MAC, link-local, DHCP-server and router-advertisement guards
+  still apply.
 
 Listing an allowed address of a family restricts that family: on a network
 where litevirt does not know the guest's address, list that address (or its
-subnet) too.
+subnet) too. A guest that uses stable-privacy IPv6 link-local addresses
+(NetworkManager's default) must list its link-local address, or use EUI-64
+(`ipv6.addr-gen-mode eui64`).
+
+**Identities are unique.** An explicit MAC, IPv4 or IPv6 address in a create,
+hot-attach, clone or import request that another live NIC holds is refused, as
+is a subnet's network, gateway or broadcast address: the guard would otherwise
+enforce the impersonation for the requester.
 
 **Defaults.** A NIC created by this release — `CreateVM`, a compose deploy, a
-rebuild, a clone or `lv attach-nic` — is guarded unless its request says
-otherwise. A NIC that existed before has **no guard** and keeps working exactly
-as it did, whatever addresses it uses; set one with `lv firewall nic-guard set`.
-An imported VM (`lv import`) is not guarded by default either, since its guest
-was addressed before litevirt knew it. A clone gets the default guard, not its
-source's relaxations. A macvtap (`direct`) NIC bypasses the bridge and gets no
-guard.
+rebuild, a clone, `lv attach-nic`, a container's managed NIC — is guarded unless
+its request says otherwise. An imported VM's NICs (`lv import`) are guarded,
+confined to their network's subnet, on a network that has one (`--spoof-guard
+off` imports them unguarded). A NIC that existed before has **no guard** and
+keeps working exactly as it did; set one with `lv firewall nic-guard set`. A
+clone gets the default guard, not its source's relaxations. A macvtap
+(`direct`) NIC bypasses the bridge and gets no guard; setting one is refused.
 
-**Relaxing a guard needs cluster-root authority.** Turning a guard off, listing
-allowed addresses, or letting the guest answer DHCP or advertise routes lets
-that guest impersonate other tenants' addresses, so it needs `network.update` at
-`/` — a NetworkAdmin of one project cannot do it for a VM in that project. That
-applies to `lv firewall nic-guard set` and to the same settings in a create or
-deploy request. A rebuild carries the guard its original create stored.
+A guard applies from the first reconcile that sees the NIC running — the create
+and attach paths trigger one at once, but a guest runs unguarded for the
+seconds between its start (or a migration) and that reconcile.
+
+**Relaxing a guard needs authority over its network.** Turning a guard off,
+listing allowed addresses, letting the guest answer DHCP, advertise routes or
+send VLAN tags lets that guest impersonate the other occupants of its segment,
+so it needs `network.update` on the network: on a network a project owns, that
+project's network authority; on a shared network or a raw bridge, cluster
+root. That applies to `lv firewall nic-guard set` and to the same settings in a
+create, attach or deploy request. A re-create (rebuild, a stack's rolling
+update) may carry a relaxation the VM already had, and nothing new. A forwarded
+attach whose entry host might be an older build is refused relaxations until
+every host runs this release. With no RBAC bindings at all, the legacy role
+fallback applies, as for every check: any operator passes.
 
 ```
 # Per NIC, by MAC or by network (when the VM has one NIC on it)
 lv firewall nic-guard set web-1 --network prod --mode on --allow 10.0.0.250 --allow 10.0.0.251
 lv firewall nic-guard set lb-1 --mac 52:54:00:12:34:56 --mode on --allow-router-advertisement
-lv firewall nic-guard set router-vm --network prod --mode off
-lv firewall nic-guard ls [<vm>]      # mode, the source addresses each NIC may use, and its allowances
+lv firewall nic-guard set router-vm --network prod --mode off --allow-vlan-tags
+lv firewall nic-guard set --container web --host node-1 --network prod --mode off
+lv firewall nic-guard ls [<vm>]      # mode, the source addresses each VM NIC may use, and its allowances
 
-# At hot-attach
+# At hot-attach and import
 lv attach-nic web-1 prod --spoof-guard on --allow-address 10.0.0.250
+lv import vm.ova --name legacy --spoof-guard off
 ```
 
 `--allow` replaces the whole list. `lv firewall nic-guard ls` shows `any` for a
@@ -260,6 +337,7 @@ vms:
         spoof-guard: "off"                # a guest that routes for others
         allow-dhcp-server: true
         allow-router-advertisement: true
+        allow-vlan-tags: true             # a trunk
 ```
 
 The built-in load balancer's VIPs live on the hosts, not in guests, so a guarded
@@ -267,15 +345,11 @@ backend needs no allowed address for them; a guest that runs its own
 keepalived needs its VIP listed.
 
 Guards are stored per NIC in the replicated `cluster_policies` table under
-`nic_guard/<vm>/<mac>`, which nothing writes until `failover_scope_v1` has
-latched. Before that, a NIC is created unguarded with a warning, and a request
-that sets guard options is refused rather than silently unguarded. A record
-outlives its VM, harmlessly: a NIC created under the same VM name and MAC
-writes its own.
-
-Containers are not guarded yet: their NICs keep their per-NIC rules but get
-no guard.
-
+`nic_guard/<vm>/<mac>` (`nic_guard/ct:<host>:<name>/<mac>` for a container),
+which nothing writes until `failover_scope_v1` has latched. Before that, a NIC
+is created unguarded with a warning, and a request that sets guard options is
+refused rather than silently unguarded. A record outlives its VM, harmlessly: a
+NIC created under the same VM name and MAC writes its own.
 
 ## Compose
 
@@ -350,6 +424,9 @@ lv firewall default-deny on [--scope node-1]
 lv firewall nic-guard set <vm> --network <net> --mode on --allow 10.0.0.250
 lv firewall nic-guard ls
 
+# Observe or enforce the per-NIC rules (see "Observe and enforce")
+lv firewall enforce status
+
 # Inspect the live rulesets on this host (litevirt-fw and litevirt-nic) / force a reconcile now
 lv firewall show
 lv firewall reload
@@ -381,7 +458,8 @@ the row names the user the session belongs to.
 | `sg.bind` | VM name | `lv sg bind`, `POST /api/v1/vms/bind-sgs` |
 | `sg.add` / `sg.rm` | group name (add) / group id (rm) | `lv sg create/rm`, UI |
 | `sg.rule.add` / `sg.rule.rm` | group id (add) / rule id (rm) | `lv sg rule-add/rule-rm`, UI |
-| `nic.guard.set` | VM name | `lv firewall nic-guard set` |
+| `nic.guard.set` | VM name, or `ct:<host>/<name>` | `lv firewall nic-guard set` |
+| `firewall.enforcement` | `cluster` | `lv firewall enforce on/off` |
 
 The row's user is the authenticated caller. Its detail records the policy
 before and after the change, in the form `before=<state> after=<state>`:
@@ -429,11 +507,14 @@ Add-NIC dialog, and a permission error from `lv sg ls` and `lv sg rule-ls`.
 ## Default-deny rollout
 
 Default-deny applies **per guest NIC, in both directions**, on every path the
-NIC's traffic takes — including traffic between the guest and its own host
-(DNS to the host's dnsmasq, for example), which the old forward-hook placement
-never filtered. DHCP, DHCPv6 and the essential ICMPv6 always pass. Routed
-traffic that involves no guest NIC is still judged by the `inet` forward
-chain's cluster and host tiers and policy.
+NIC's traffic takes — including traffic between the guest and its own host,
+which the old forward-hook placement never filtered. DHCP toward the link's
+server, DNS to a managed network's gateway, the built-in load balancer's
+traffic to its backends and link-scoped neighbour discovery always pass.
+Routed traffic that involves no guest NIC is still judged by the `inet` forward
+chain's cluster and host tiers and policy. On an upgraded cluster, run in
+observe mode first and read `lv firewall enforce status` before
+`lv firewall enforce on`.
 
 Switching a running cluster to default-deny is risky if a rule is
 missing. Recommended order:
@@ -490,9 +571,9 @@ missing. Recommended order:
 
 ## What's still in flight
 
-- NIC guards for containers.
-- Guest-tagged VLAN frames from an *unguarded* NIC are not judged by the
-  per-NIC rules (only IP and IPv6 frames are); a guarded NIC may not send them.
+- The link-layer address option is checked where every stack puts it (the
+  first option); a crafted solicitation with it later is not.
+- Reservations are IPv4; a DHCPv6 lease is confined to the subnet.
 - IGMP-specific rules.
 - Application-aware logging (`log prefix`, `log group`) for
   rejected packets — useful in deny-by-default audits.

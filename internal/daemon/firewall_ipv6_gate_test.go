@@ -11,10 +11,10 @@ import (
 )
 
 // TestWireFirewallIPv6Gate_TracksTheDurableLatch: IPv6 firewall rules are
-// writable once firewall_ipv6_v1 has durably latched and not before. Every
-// other test opens the gate directly, so this is the one that fails if the
-// production wiring is deleted — an unwired gate fails closed and looks
-// exactly like a mid-roll, so nothing else would notice.
+// writable once firewall_ipv6_v1 has durably latched and not before. It wires
+// through wireCorrosionGates, the function the daemon's start calls, so it
+// fails if the IPv6 gate is dropped from that set — an unwired gate fails
+// closed and looks exactly like a mid-roll, so nothing else would notice.
 func TestWireFirewallIPv6Gate_TracksTheDurableLatch(t *testing.T) {
 	ctx := context.Background()
 	db := corrosion.NewTestClientT(t)
@@ -35,7 +35,7 @@ func TestWireFirewallIPv6Gate_TracksTheDurableLatch(t *testing.T) {
 	})
 
 	d := &Daemon{db: db, checker: checker, cfg: &Config{DataDir: dataDir}}
-	d.wireFirewallIPv6Gate()
+	d.wireCorrosionGates()
 
 	if db.MayWriteFirewallIPv6() {
 		t.Fatal("the IPv6 firewall gate is open before firewall_ipv6_v1 has durably latched")

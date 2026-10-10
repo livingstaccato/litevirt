@@ -65,6 +65,10 @@ type NICGuardRecord struct {
 	// AllowRouterAdvert lets the guest send router advertisements and
 	// redirects.
 	AllowRouterAdvert bool `json:"allow_router_advert,omitempty"`
+	// AllowVLANTags lets the guest send 802.1Q / 802.1ad tagged frames (an
+	// explicit trunk). Honoured whatever the mode: without it every NIC's
+	// tagged frames are dropped, guarded or not.
+	AllowVLANTags bool `json:"allow_vlan_tags,omitempty"`
 
 	SetBy     string `json:"-"`
 	UpdatedAt string `json:"-"`
@@ -76,14 +80,19 @@ func (r NICGuardRecord) Guarded() bool { return r.Mode == NICGuardOn }
 // AuditText renders the record for an audit row: every field that decides
 // what the guard lets the NIC send.
 func (r NICGuardRecord) AuditText() string {
-	return fmt.Sprintf("{mode=%s allowed=[%s] dhcp-server=%t router-advert=%t}",
-		r.Mode, strings.Join(r.Allowed, ","), r.AllowDHCPServer, r.AllowRouterAdvert)
+	return fmt.Sprintf("{mode=%s allowed=[%s] dhcp-server=%t router-advert=%t vlan-tags=%t}",
+		r.Mode, strings.Join(r.Allowed, ","), r.AllowDHCPServer, r.AllowRouterAdvert, r.AllowVLANTags)
 }
 
-// NICGuardKey is the cluster_policies key of a NIC's record.
+// NICGuardKey is the cluster_policies key of a VM NIC's record.
 func NICGuardKey(vm, mac string) string {
 	return nicGuardKeyPrefix + vm + "/" + strings.ToLower(mac)
 }
+
+// ContainerGuardOwner is the owner a container NIC's guard record is keyed by
+// in place of a VM name: container names are per host, and ':' appears in no
+// VM name, so the two can never collide.
+func ContainerGuardOwner(host, ct string) string { return "ct:" + host + ":" + ct }
 
 // NormalizeNICGuardAddresses validates an allowed/known list and returns it in
 // canonical form (masked prefixes, canonical addresses, sorted, deduplicated).
@@ -120,7 +129,7 @@ func NormalizeNICGuardAddresses(in []string) ([]string, error) {
 
 // normalizeNICGuard checks and canonicalises a record before it is written.
 func normalizeNICGuard(r *NICGuardRecord) error {
-	if r.VMName == "" || strings.Contains(r.VMName, "/") {
+	if r.VMName == "" || strings.ContainsAny(r.VMName, "/ ") {
 		return fmt.Errorf("invalid VM name %q", r.VMName)
 	}
 	hw, err := net.ParseMAC(r.MAC)
@@ -227,6 +236,169 @@ func NetworkSubnets(ctx context.Context, c *Client) (map[string]string, error) {
 		var def struct{ Subnet string }
 		_ = json.Unmarshal([]byte(r.String("config")), &def)
 		out[r.String("name")] = def.Subnet
+	}
+	return out, nil
+}
+
+// NetworkAssignedAddrs maps every live network to every address assigned on
+// it: IPAM leases and the addresses NIC rows (VM and container) record. A
+// guard confined to a subnet must still exclude these — they belong to other
+// NICs.
+func NetworkAssignedAddrs(ctx context.Context, c *Client) (map[string][]string, error) {
+	out := map[string][]string{}
+	add := func(netName, ip string) {
+		if netName == "" || ip == "" {
+			return
+		}
+		if p, err := netip.ParsePrefix(ip); err == nil {
+			ip = p.Addr().String()
+		} else if a, err := netip.ParseAddr(ip); err == nil {
+			ip = a.String()
+		} else {
+			return
+		}
+		out[netName] = append(out[netName], ip)
+	}
+	for _, q := range []string{
+		`SELECT network AS n, ip FROM ip_allocations WHERE deleted_at IS NULL`,
+		`SELECT network_name AS n, COALESCE(ip,'') AS ip FROM vm_nics WHERE deleted_at IS NULL`,
+		`SELECT network_name AS n, COALESCE(ip,'') AS ip FROM vm_interfaces WHERE deleted_at IS NULL`,
+		`SELECT network_name AS n, COALESCE(ip,'') AS ip FROM container_interfaces WHERE deleted_at IS NULL`,
+	} {
+		rows, err := c.Query(ctx, q)
+		if err != nil {
+			return nil, err
+		}
+		for _, r := range rows {
+			add(r.String("n"), r.String("ip"))
+		}
+	}
+	return out, nil
+}
+
+// ── Per-NIC enforcement mode ────────────────────────────────────────────────
+
+const clusterPolicyFirewallEnforcement = "firewall_nic_enforcement"
+
+// Per-NIC enforcement modes. With no row the mode is observe: a cluster that
+// upgraded must not start dropping traffic its rules never dropped before.
+const (
+	FirewallEnforce = "enforce"
+	FirewallObserve = "observe"
+)
+
+// FirewallEnforcement is the per-NIC enforcement policy row.
+type FirewallEnforcement struct {
+	Mode      string
+	SetBy     string
+	UpdatedAt string
+	Recorded  bool // false: no row yet (observe)
+}
+
+// GetFirewallEnforcement reads the mode; no row (or an unknown value, a later
+// release's) is observe.
+func GetFirewallEnforcement(ctx context.Context, c *Client) (FirewallEnforcement, error) {
+	rows, err := c.Query(ctx,
+		`SELECT value, set_by, updated_at FROM cluster_policies WHERE key = ? AND deleted_at IS NULL`,
+		clusterPolicyFirewallEnforcement)
+	if err != nil {
+		return FirewallEnforcement{Mode: FirewallObserve}, err
+	}
+	if len(rows) == 0 {
+		return FirewallEnforcement{Mode: FirewallObserve}, nil
+	}
+	e := FirewallEnforcement{Mode: rows[0].String("value"), SetBy: rows[0].String("set_by"),
+		UpdatedAt: rows[0].String("updated_at"), Recorded: true}
+	if e.Mode != FirewallEnforce {
+		e.Mode = FirewallObserve
+	}
+	return e, nil
+}
+
+// SetFirewallEnforcement writes the mode (behind the cluster_policies gate).
+func SetFirewallEnforcement(ctx context.Context, c *Client, mode, setBy string) error {
+	if mode != FirewallEnforce && mode != FirewallObserve {
+		return fmt.Errorf("firewall enforcement %q: want %s or %s", mode, FirewallEnforce, FirewallObserve)
+	}
+	if !c.MayWriteClusterPolicy() {
+		return ErrClusterPolicyGateClosed
+	}
+	return c.Execute(ctx, clusterPolicyUpsertSQL, clusterPolicyFirewallEnforcement, mode, setBy, c.NowTS())
+}
+
+// SeedFirewallEnforcement records the mode once, the first time it can: a
+// cluster that has nothing yet — no workload and no firewall rule of any
+// kind, i.e. one just initialised — enforces from the start; any other
+// cluster (one that upgraded with workloads or rules in place) starts in
+// observe, so nothing its rules never dropped before is dropped until an
+// operator turns enforcement on. It returns the mode recorded, or "" when it
+// wrote nothing (a row exists, or the gate is closed).
+func SeedFirewallEnforcement(ctx context.Context, c *Client) (string, error) {
+	cur, err := GetFirewallEnforcement(ctx, c)
+	if err != nil || cur.Recorded || !c.MayWriteClusterPolicy() {
+		return "", err
+	}
+	rows, err := c.Query(ctx, `SELECT
+		(SELECT COUNT(*) FROM vms WHERE deleted_at IS NULL) +
+		(SELECT COUNT(*) FROM containers WHERE deleted_at IS NULL) +
+		(SELECT COUNT(*) FROM sg_rules WHERE deleted_at IS NULL) +
+		(SELECT COUNT(*) FROM cluster_firewall_rules WHERE deleted_at IS NULL) +
+		(SELECT COUNT(*) FROM host_firewall_rules WHERE deleted_at IS NULL) +
+		(SELECT COUNT(*) FROM firewall_defaults WHERE deleted_at IS NULL AND default_deny != 0) AS n`)
+	if err != nil {
+		return "", err
+	}
+	mode := FirewallObserve
+	if len(rows) == 1 && rows[0].Int("n") == 0 {
+		mode = FirewallEnforce
+	}
+	if err := SetFirewallEnforcement(ctx, c, mode, "litevirt (initial)"); err != nil {
+		return "", err
+	}
+	return mode, nil
+}
+
+// AddrOwner is an address or MAC and the workload holding it.
+type AddrOwner struct {
+	Network string
+	Addr    string // canonical IP; "" for a MAC entry
+	MAC     string // lower-case; "" for an address entry
+	Owner   string // VM name, or ContainerGuardOwner for a container
+}
+
+// LiveNICIdentities lists every live NIC's MAC and recorded address, and every
+// live IPAM lease, with its owner — what a new NIC's explicit MAC or address
+// must not collide with.
+func LiveNICIdentities(ctx context.Context, c *Client) ([]AddrOwner, error) {
+	var out []AddrOwner
+	canon := func(ip string) string {
+		if p, err := netip.ParsePrefix(ip); err == nil {
+			return p.Addr().String()
+		}
+		if a, err := netip.ParseAddr(ip); err == nil {
+			return a.String()
+		}
+		return ""
+	}
+	for _, q := range []string{
+		`SELECT network_name AS n, COALESCE(ip,'') AS ip, mac, vm_name AS owner FROM vm_nics WHERE deleted_at IS NULL`,
+		`SELECT network_name AS n, COALESCE(ip,'') AS ip, mac, vm_name AS owner FROM vm_interfaces WHERE deleted_at IS NULL`,
+		`SELECT network_name AS n, COALESCE(ip,'') AS ip, mac, 'ct:' || host_name || ':' || ct_name AS owner FROM container_interfaces WHERE deleted_at IS NULL`,
+		`SELECT network AS n, ip, mac, CASE owner_kind WHEN 'ct' THEN 'ct:' || owner_host || ':' || vm_name ELSE vm_name END AS owner FROM ip_allocations WHERE deleted_at IS NULL`,
+	} {
+		rows, err := c.Query(ctx, q)
+		if err != nil {
+			return nil, err
+		}
+		for _, r := range rows {
+			o := r.String("owner")
+			if m := strings.ToLower(r.String("mac")); m != "" {
+				out = append(out, AddrOwner{Network: r.String("n"), MAC: m, Owner: o})
+			}
+			if a := canon(r.String("ip")); a != "" {
+				out = append(out, AddrOwner{Network: r.String("n"), Addr: a, Owner: o})
+			}
+		}
 	}
 	return out, nil
 }

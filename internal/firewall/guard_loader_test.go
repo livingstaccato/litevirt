@@ -39,7 +39,7 @@ func TestResolveNICGuard(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			g := ResolveNICGuard(c.rec, "52:54:00:AA:BB:CC", c.ip, c.subnet)
+			g := ResolveNICGuard(c.rec, "52:54:00:AA:BB:CC", c.ip, c.subnet, nil)
 			if c.wantNil {
 				if g != nil {
 					t.Fatalf("got %+v, want unguarded", g)
@@ -103,7 +103,7 @@ func TestCorrosionPlanLoader_GuardsRecordedNICsOnly(t *testing.T) {
 	if g == nil {
 		t.Fatal("the recorded NIC was not guarded")
 	}
-	if !reflect.DeepEqual(g.V4, []string{"10.0.0.10", "10.0.0.250"}) {
+	if !reflect.DeepEqual(g.V4, []string{"10.0.0.10", "10.0.0.250"}) || g.ExcludeV4 != nil {
 		t.Errorf("V4 = %v", g.V4)
 	}
 	out, err := Render(plan)
@@ -112,5 +112,58 @@ func TestCorrosionPlanLoader_GuardsRecordedNICsOnly(t *testing.T) {
 	}
 	if !strings.Contains(out, "iifname vnet1 jump guard_vnet1") || strings.Contains(out, "guard_vnet2") {
 		t.Errorf("guard dispatch wrong:\n%s", out)
+	}
+}
+
+// TestResolveNICGuard_SubnetExcludesOthers: a guest confined to its subnet
+// (its exact address unknown) may still never claim the network's own
+// addresses — network, gateway, broadcast — nor another NIC's assigned
+// address; its own stays usable.
+func TestResolveNICGuard_SubnetExcludesOthers(t *testing.T) {
+	g := ResolveNICGuard(on(), "52:54:00:aa:bb:cc", "", "10.1.0.0/24",
+		[]string{"10.1.0.7", "10.1.0.9", "192.168.5.5"})
+	if g == nil || !reflect.DeepEqual(g.V4, []string{"10.1.0.0/24"}) {
+		t.Fatalf("guard = %+v", g)
+	}
+	want := []string{"10.1.0.0", "10.1.0.1", "10.1.0.255", "10.1.0.7", "10.1.0.9"}
+	if !reflect.DeepEqual(g.ExcludeV4, want) {
+		t.Errorf("ExcludeV4 = %v, want %v", g.ExcludeV4, want)
+	}
+	// An allowed link-local address is held as link-local, not as a global
+	// restriction.
+	g = ResolveNICGuard(on("fe80::1234"), "52:54:00:aa:bb:cc", "10.1.0.5", "", nil)
+	if g.V6 != nil || !reflect.DeepEqual(g.LinkLocal, []string{"fe80::1234"}) {
+		t.Errorf("link-local allowance: V6=%v LinkLocal=%v", g.V6, g.LinkLocal)
+	}
+}
+
+// TestCorrosionPlanLoader_ModeFromPolicyAndConntrack (rulings 1 and 6): with
+// no policy recorded a host observes; a recorded enforce enforces; and a host
+// without bridge conntrack renders the guards only, whatever the policy.
+func TestCorrosionPlanLoader_ModeFromPolicyAndConntrack(t *testing.T) {
+	ctx := context.Background()
+	db := corrosion.NewTestClientT(t)
+	if err := corrosion.InitSchema(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	db.SetClusterPolicyGate(func() bool { return true })
+	load := func(ct bool) string {
+		p, err := CorrosionPlanLoader(db, "host-a", Plan{}, LoaderOptions{BridgeConntrack: func() bool { return ct }})(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p.NICMode
+	}
+	if m := load(true); m != NICModeObserve {
+		t.Errorf("no policy: %q, want observe", m)
+	}
+	if err := corrosion.SetFirewallEnforcement(ctx, db, corrosion.FirewallEnforce, "t"); err != nil {
+		t.Fatal(err)
+	}
+	if m := load(true); m != NICModeEnforce {
+		t.Errorf("enforce policy: %q, want enforce", m)
+	}
+	if m := load(false); m != NICModeGuardsOnly {
+		t.Errorf("no bridge conntrack: %q, want guards-only", m)
 	}
 }

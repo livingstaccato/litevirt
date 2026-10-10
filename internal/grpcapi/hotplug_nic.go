@@ -140,12 +140,15 @@ func (s *Server) attachNICEntry(ctx context.Context, req *pb.AttachDeviceRequest
 		}
 		// The entry node checked the caller's authority over the guard; the
 		// owner re-checks only what needs none.
-		if err := s.admitNICGuards(ctx, []*pb.NetworkAttachment{spec}, true); err != nil {
+		if err := s.admitNICGuards(ctx, vmRec.Name, []*pb.NetworkAttachment{spec}, admitPeerOwner); err != nil {
 			return nil, err
 		}
 		return s.attachNICOwner(ctx, req, vmRec.Name, opID, reqHash, "")
 	}
-	if err := s.admitNICGuards(ctx, []*pb.NetworkAttachment{spec}, false); err != nil {
+	if err := s.admitNICGuards(ctx, vmRec.Name, []*pb.NetworkAttachment{spec}, admitNew); err != nil {
+		return nil, err
+	}
+	if err := s.checkNICIdentities(ctx, []*pb.NetworkAttachment{spec}, vmRec.Name); err != nil {
 		return nil, err
 	}
 
@@ -529,6 +532,15 @@ func (s *Server) executeNICAttach(ctx context.Context, vm *corrosion.VMRecord, s
 	nicIP, claimCode, claimErr := s.claimNICAddress(ctx, vm, spec, mac, rb.claims)
 	if claimErr != nil {
 		return s.failNICAttach(ctx, rb, claimCode, claimErr)
+	}
+	if def, _ := lookupNetworkDef(ctx, s.db, spec.Name); nicIP == "" && !strings.HasPrefix(bridge, "direct:") && s.dhcpReservable(spec, def) {
+		// A guarded NIC on a network litevirt serves DHCP for gets an exact,
+		// reserved address (nic_identity.go).
+		ip, rerr := s.reserveDHCPAddress(ctx, spec.Name, def.Subnet, bridge, mac)
+		if rerr != nil {
+			return s.failNICAttach(ctx, rb, codes.ResourceExhausted, fmt.Errorf("reserve a DHCP address: %w", rerr))
+		}
+		nicIP = ip
 	}
 	s.appendOpStep(ctx, opID, epoch, corrosion.OpDeviceAttach, corrosion.OpStepClaimed)
 

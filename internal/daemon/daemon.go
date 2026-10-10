@@ -598,13 +598,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		return d.cfg.Enforcement.CanonicalIdentity && d.checker.Latched(capabilities.CanonicalIdentityV1)
 	})
 
-	d.wireLeaseTermLedgerGate()
-	d.wireLeaseMintClearance()
-	d.wireCredentialsSplitGate()
-	d.wireClusterPolicyGate()
-	d.wireFirewallIPv6Gate()
-	d.wireVoterConfigGate()
-	d.wireRecoveryClaimGate()
+	d.wireCorrosionGates()
 
 	// Apply a replicated guarded VM-name replacement once vm_replace_v1 is DURABLY
 	// LATCHED. Durable, not Latched or the config flag: a replace batch already on
@@ -1293,9 +1287,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// hasn't changed, so idle clusters cost ~one corrosion query/tick.
 	fwApplier := firewall.NewApplier(firewall.NftBinary{})
 	fwMetrics := metrics.NewFirewallMetrics()
+	// Per-NIC rules need bridge connection tracking. Loaded once here; a host
+	// that cannot load it renders the guards only and raises a health
+	// condition (firewall.nic.unavailable), never an empty firewall.
+	bridgeCT := firewall.BridgeConntrackAvailable(ctx, true)
 	fwLoader := firewall.CorrosionPlanLoader(d.db, d.cfg.HostName, firewall.Plan{},
-		firewall.LoaderOptions{RunningTaps: d.virt.RunningDomainTaps, OnDuplicateSGs: fwMetrics.SetDuplicateSGNICs})
+		firewall.LoaderOptions{RunningTaps: d.virt.RunningDomainTaps, OnDuplicateSGs: fwMetrics.SetDuplicateSGNICs,
+			BridgeConntrack: func() bool { return bridgeCT }})
 	d.fwReconciler = firewall.NewReconciler(fwLoader, fwApplier, 30*time.Second)
+	d.fwReconciler.SetStateHook(svc.RecordFirewallState)
 	// Upgrade migration: once the reconciler renders a bridge's NAT/isolation into
 	// litevirt-fw, clear the pre-consolidation out-of-band rules (old iptables
 	// masquerade + `inet litevirt` chains) a prior binary left for it.
@@ -1303,6 +1303,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetFirewallReconciler(d.fwReconciler)
 	svc.SetAntiEntropy(ae) // `lv cluster converge` kicks an immediate debounced pass
 	d.fwReconciler.Start(ctx)
+	// Record the per-NIC enforcement mode once (observe for a cluster that
+	// upgraded, enforce for a fresh one), and keep dnsmasq's host reservations
+	// in step with the NICs guarded on its networks.
+	go svc.SeedFirewallEnforcementLoop(ctx, 0)
+	svc.StartDHCPReservations(ctx, 0)
 
 	// Converge this host's network devices on the replicated networks table
 	// every 30s: a network created elsewhere is provisioned here, a deleted
@@ -2959,6 +2964,20 @@ func (d *Daemon) wireClusterPolicyGate() {
 	d.db.SetClusterPolicyGate(func() bool {
 		return d.checker.DurablyLatched(capabilities.FailoverScopeV1)
 	})
+}
+
+// wireCorrosionGates wires every gate corrosion consults before emitting a
+// statement shape or a row a peer relies on. One function, so the daemon and
+// its test wire the same set: a gate left unwired fails closed and looks
+// exactly like a cluster mid-roll, so nothing else would notice it missing.
+func (d *Daemon) wireCorrosionGates() {
+	d.wireLeaseTermLedgerGate()
+	d.wireLeaseMintClearance()
+	d.wireCredentialsSplitGate()
+	d.wireClusterPolicyGate()
+	d.wireFirewallIPv6Gate()
+	d.wireVoterConfigGate()
+	d.wireRecoveryClaimGate()
 }
 
 // wireFirewallIPv6Gate lets corrosion write an IPv6 firewall rule or ip-set

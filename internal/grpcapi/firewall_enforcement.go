@@ -1,0 +1,226 @@
+package grpcapi
+
+// Per-NIC enforcement mode (docs/firewall.md, "Observe and enforce").
+//
+// A cluster that upgraded starts in OBSERVE: per-NIC rules are installed with
+// would-drop counters and drop nothing, and every host with guest NICs raises a
+// health condition and a notification saying so. `lv firewall enforce on`
+// switches to enforcing; a freshly initialised cluster enforces from the start
+// (corrosion.SeedFirewallEnforcement).
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"sort"
+	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/firewall"
+	"github.com/litevirt/litevirt/internal/notify"
+)
+
+// FirewallEvaluator is the health-condition evaluator of the per-NIC firewall.
+const FirewallEvaluator = "firewall"
+
+// Condition codes, one row per host (subject_kind host).
+const (
+	CondFirewallObserve     = "firewall.nic.observe"     // rules observed, not enforced
+	CondFirewallUnavailable = "firewall.nic.unavailable" // no bridge conntrack: guards only
+	CondFirewallRefused     = "firewall.nic.refused"     // the kernel refused the per-NIC table
+)
+
+// SetFirewallEnforcement switches per-NIC enforcement for the whole cluster.
+// Admin only, audited, replicated.
+func (s *Server) SetFirewallEnforcement(ctx context.Context, req *pb.SetFirewallEnforcementRequest) (*pb.FirewallEnforcementStatus, error) {
+	if err := RequireRole(ctx, "admin"); err != nil {
+		return nil, err
+	}
+	mode := req.GetMode()
+	if mode != corrosion.FirewallEnforce && mode != corrosion.FirewallObserve {
+		return nil, status.Errorf(codes.InvalidArgument, "mode %q: want %s or %s", mode, corrosion.FirewallEnforce, corrosion.FirewallObserve)
+	}
+	before, berr := corrosion.GetFirewallEnforcement(ctx, s.db)
+	beforeText := corrosion.AuditUnknown(fmt.Errorf("unread"))
+	if berr == nil {
+		beforeText = before.Mode
+		if !before.Recorded {
+			beforeText = corrosion.AuditStateUnset
+		}
+	}
+	if err := corrosion.SetFirewallEnforcement(ctx, s.db, mode, callerUsername(ctx)); err != nil {
+		s.audit(ctx, "firewall.enforcement", "cluster", corrosion.AuditChange(beforeText, mode), "error")
+		if errors.Is(err, corrosion.ErrClusterPolicyGateClosed) {
+			return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
+		}
+		return nil, status.Errorf(codes.Internal, "set firewall enforcement: %v", err)
+	}
+	s.audit(ctx, "firewall.enforcement", "cluster", corrosion.AuditChange(beforeText, mode), "ok")
+	slog.Info("firewall enforcement set", "mode", mode, "by", callerUsername(ctx))
+	s.reconcileLocal(ctx)
+	return s.GetFirewallEnforcement(ctx, &pb.GetFirewallEnforcementRequest{})
+}
+
+// GetFirewallEnforcement reports the policy and, per host, what it has in
+// force and what it would have dropped. Without local_only it asks every
+// other active host too.
+func (s *Server) GetFirewallEnforcement(ctx context.Context, req *pb.GetFirewallEnforcementRequest) (*pb.FirewallEnforcementStatus, error) {
+	if err := RequireRole(ctx, "viewer"); err != nil {
+		return nil, err
+	}
+	enf, err := corrosion.GetFirewallEnforcement(ctx, s.db)
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "read firewall enforcement: %v", err)
+	}
+	out := &pb.FirewallEnforcementStatus{Mode: enf.Mode, SetBy: enf.SetBy, UpdatedAt: enf.UpdatedAt}
+	out.Hosts = append(out.Hosts, s.localFirewallEnforcement(ctx))
+	if req.GetLocalOnly() {
+		return out, nil
+	}
+	hosts, err := corrosion.ListHosts(ctx, s.db)
+	if err != nil {
+		return out, nil
+	}
+	for _, h := range hosts {
+		if h.Name == s.hostName || h.State != "active" {
+			continue
+		}
+		hctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		client, conn, perr := s.peerClient(hctx, h.Name)
+		if perr != nil {
+			cancel()
+			out.Hosts = append(out.Hosts, &pb.FirewallHostEnforcement{HostName: h.Name, Error: perr.Error()})
+			continue
+		}
+		st, gerr := client.GetFirewallEnforcement(hctx, &pb.GetFirewallEnforcementRequest{LocalOnly: true})
+		conn.Close()
+		cancel()
+		if gerr != nil || len(st.GetHosts()) == 0 {
+			msg := "no answer"
+			if gerr != nil {
+				msg = gerr.Error()
+			}
+			out.Hosts = append(out.Hosts, &pb.FirewallHostEnforcement{HostName: h.Name, Error: msg})
+			continue
+		}
+		out.Hosts = append(out.Hosts, st.GetHosts()[0])
+	}
+	sort.Slice(out.Hosts, func(i, j int) bool { return out.Hosts[i].HostName < out.Hosts[j].HostName })
+	return out, nil
+}
+
+// appliedStater is what the daemon's reconciler offers beyond the
+// FirewallReconciler interface (test fakes need not).
+type appliedStater interface {
+	AppliedState() firewall.AppliedState
+}
+
+func (s *Server) localFirewallEnforcement(ctx context.Context) *pb.FirewallHostEnforcement {
+	h := &pb.FirewallHostEnforcement{HostName: s.hostName}
+	if r, ok := s.fwReconciler.(appliedStater); ok {
+		st := r.AppliedState()
+		h.AppliedMode, h.Error = st.Mode, st.NICTableError
+		wd, err := firewall.WouldDrops(ctx)
+		if err != nil && h.Error == "" {
+			h.Error = err.Error()
+		}
+		for _, w := range wd {
+			h.WouldDrops = append(h.WouldDrops, &pb.FirewallWouldDrop{
+				Device: w.Device, Workload: st.NICs[w.Device], Side: w.Side, Rule: w.Rule,
+				Packets: w.Packets, Bytes: w.Bytes,
+			})
+		}
+	}
+	return h
+}
+
+// RecordFirewallState turns a reconcile pass's applied state into this host's
+// health conditions, notifying on every change. The daemon wires it as the
+// reconciler's state hook.
+func (s *Server) RecordFirewallState(ctx context.Context, st firewall.AppliedState) {
+	s.setFirewallCondition(ctx, CondFirewallObserve, st.Mode == firewall.NICModeObserve, corrosion.SeverityWarning,
+		"per-NIC firewall rules are observed, not enforced: nothing they match is dropped; see `lv firewall enforce status`, then `lv firewall enforce on`")
+	s.setFirewallCondition(ctx, CondFirewallUnavailable, st.Mode == firewall.NICModeGuardsOnly, corrosion.SeverityCritical,
+		"nf_conntrack_bridge is unavailable on this host: per-NIC rules are not enforced here (NIC guards and the VLAN rule are)")
+	s.setFirewallCondition(ctx, CondFirewallRefused, st.NICTableError != "", corrosion.SeverityCritical,
+		"the kernel refused the per-NIC firewall table; the previous one stays, routed filtering and NAT still apply: "+st.NICTableError)
+}
+
+// setFirewallCondition raises or resolves one of this host's firewall
+// conditions, writing and notifying only on a change.
+func (s *Server) setFirewallCondition(ctx context.Context, code string, active bool, severity, detail string) {
+	if s.db == nil {
+		return
+	}
+	row, ok, err := corrosion.GetHealthCondition(ctx, s.db, FirewallEvaluator, code, "host", s.hostName)
+	if err != nil {
+		return
+	}
+	isActive := ok && row.Lifecycle != corrosion.ConditionResolved
+	if active == isActive && (!active || row.Evidence == detail) {
+		return
+	}
+	ts := time.Now().UTC().Format(time.RFC3339)
+	if !ok {
+		if !active {
+			return
+		}
+		row = corrosion.HealthCondition{Evaluator: FirewallEvaluator, Code: code, SubjectKind: "host", SubjectID: s.hostName, FirstSeen: ts}
+	}
+	if active {
+		if !isActive {
+			row.FirstSeen, row.ConfirmedAt, row.ObserveCount = ts, ts, 0
+		}
+		row.Lifecycle, row.ResolvedAt, row.CleanCount, row.Evidence = corrosion.ConditionConfirmed, "", 0, detail
+		row.ObserveCount++
+	} else {
+		row.Lifecycle, row.ResolvedAt, row.ObserveCount, row.CleanCount = corrosion.ConditionResolved, ts, 0, 1
+	}
+	row.Severity, row.Hosts, row.LastSeen, row.Reporter = severity, []string{s.hostName}, ts, s.hostName
+	if err := corrosion.UpsertHealthCondition(ctx, s.db, row); err != nil {
+		slog.Warn("firewall: could not record a health condition", "code", code, "error", err)
+		return
+	}
+	sev := notify.SevWarn
+	if severity == corrosion.SeverityCritical {
+		sev = notify.SevError
+	}
+	verb := "raised"
+	if !active {
+		verb, sev = "resolved", notify.SevInfo
+	}
+	s.notify(ctx, notify.Notification{Kind: code, Severity: sev, Subject: s.hostName, Detail: verb + ": " + detail})
+}
+
+// SeedFirewallEnforcementLoop records the per-NIC enforcement mode the first
+// time it can (corrosion.SeedFirewallEnforcement), then stops.
+func (s *Server) SeedFirewallEnforcementLoop(ctx context.Context, every time.Duration) {
+	if every <= 0 {
+		every = 30 * time.Second
+	}
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		enf, err := corrosion.GetFirewallEnforcement(ctx, s.db)
+		if err == nil && enf.Recorded {
+			return
+		}
+		if mode, err := corrosion.SeedFirewallEnforcement(ctx, s.db); err != nil {
+			slog.Warn("firewall: could not record the initial enforcement mode", "error", err)
+		} else if mode != "" {
+			slog.Info("firewall: recorded the initial per-NIC enforcement mode", "mode", mode)
+			s.reconcileLocal(ctx)
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+}

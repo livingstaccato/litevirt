@@ -131,3 +131,33 @@ func TestNetworkSubnets(t *testing.T) {
 		t.Errorf("NetworkSubnets = %v", got)
 	}
 }
+
+// TestSeedFirewallEnforcement (ruling 1): a cluster with nothing in it yet
+// enforces from the start; one that has workloads or rules starts observing;
+// a recorded mode is never overwritten.
+func TestSeedFirewallEnforcement(t *testing.T) {
+	ctx := context.Background()
+	fresh := nicGuardDB(t, true)
+	if m, err := SeedFirewallEnforcement(ctx, fresh); err != nil || m != FirewallEnforce {
+		t.Fatalf("fresh cluster: %q, %v; want enforce", m, err)
+	}
+	if m, _ := SeedFirewallEnforcement(ctx, fresh); m != "" {
+		t.Errorf("a recorded mode was seeded again: %q", m)
+	}
+
+	upgraded := nicGuardDB(t, true)
+	if err := InsertVM(ctx, upgraded, VMRecord{Name: "vm", HostName: "h", Spec: "{}", State: "running"}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if m, err := SeedFirewallEnforcement(ctx, upgraded); err != nil || m != FirewallObserve {
+		t.Fatalf("cluster with a workload: %q, %v; want observe", m, err)
+	}
+
+	closed := nicGuardDB(t, false)
+	if m, err := SeedFirewallEnforcement(ctx, closed); err != nil || m != "" {
+		t.Errorf("gate closed: %q, %v; want nothing written", m, err)
+	}
+	if e, _ := GetFirewallEnforcement(ctx, closed); e.Mode != FirewallObserve || e.Recorded {
+		t.Errorf("no row must read as observe, got %+v", e)
+	}
+}

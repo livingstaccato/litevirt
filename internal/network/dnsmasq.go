@@ -100,6 +100,9 @@ func dnsmasqArgs(bridge, rangeStart, rangeEnd, mask, gateway, pidFile string, up
 		"--except-interface=lo",
 		"--dhcp-range=" + rangeStart + "," + rangeEnd + "," + mask + ",12h",
 		"--dhcp-leasefile=" + dnsmasqLeaseFile(bridge),
+		// Host reservations (mac,ip): a guarded NIC on this network is bound
+		// to the exact address litevirt reserved for it. Re-read on SIGHUP.
+		"--dhcp-hostsfile=" + DHCPHostsFile(bridge),
 		"--bind-dynamic",
 		"--no-daemon",
 		"--pid-file=" + pidFile,
@@ -174,6 +177,10 @@ func StartDHCP(bridge, gateway, rangeStart, rangeEnd, mask, pidFile string) erro
 	// Ensure the lease directory exists (it doubles as the IP scanner's read
 	// path). libvirt usually creates it, but a KVM-less / fresh host may not.
 	os.MkdirAll(dnsmasqLeaseDir, 0o755) //nolint:errcheck
+	// dnsmasq refuses to start on a hosts file that does not exist.
+	if _, err := os.Stat(DHCPHostsFile(bridge)); os.IsNotExist(err) {
+		_ = os.WriteFile(DHCPHostsFile(bridge), nil, 0o644)
+	}
 
 	// Spawn and verify it stays up. A just-stopped predecessor can hold the socket
 	// for a brief moment, so an immediate exit (bind failure) is retried once after

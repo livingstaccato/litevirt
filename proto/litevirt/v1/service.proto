@@ -741,6 +741,10 @@ message ImportVMRequest {
     bytes chunk = 11;
     bool final = 12;
     map<string, string> disk_map = 13;   // e.g. scsi0=/staged/disk.qcow2 (Proxmox .conf)
+    // spoof_guard: "" guards each imported NIC on a network with a subnet
+    // (confined to it), "off" imports them unguarded (cluster-root network
+    // authority).
+    string spoof_guard = 14;
 }
 message ImportVMProgress {
     string phase = 1;                    // unpack|parse|convert|define|done
@@ -1550,6 +1554,13 @@ message NICGuard {
     repeated string allowed_addresses          = 5;
     bool            allow_dhcp_server          = 6;
     bool            allow_router_advertisement = 7;
+    bool            allow_vlan_tags            = 14;
+    // For a container NIC: its host and name (vm_name is then empty).
+    string          container_host             = 15;
+    string          container_name             = 16;
+    // note: why the guard cannot be enforced on this NIC, when it cannot
+    // (a macvtap NIC bypasses the bridge).
+    string          note                       = 17;
     // effective_ipv4 / effective_ipv6: the source addresses the guard lets
     // the NIC send from, as the owning host renders them. Empty with
     // ipv4_unrestricted / ipv6_unrestricted set means litevirt knows no
@@ -1571,6 +1582,43 @@ message SetNICGuardRequest {
     repeated string allowed_addresses          = 5;  // replaces the list
     bool            allow_dhcp_server          = 6;
     bool            allow_router_advertisement = 7;
+    bool            allow_vlan_tags            = 8;
+    // For a container NIC, name it here instead of vm_name.
+    string          container_host             = 9;
+    string          container_name             = 10;
+}
+
+message GetFirewallEnforcementRequest {
+    bool local_only = 1;  // this host only (a peer's fan-out leg)
+}
+
+message SetFirewallEnforcementRequest {
+    string mode = 1;  // "enforce" | "observe"
+}
+
+message FirewallEnforcementStatus {
+    string mode       = 1;  // the replicated policy: enforce | observe
+    string set_by     = 2;
+    string updated_at = 3;
+    repeated FirewallHostEnforcement hosts = 4;
+}
+
+message FirewallHostEnforcement {
+    string host_name    = 1;
+    // applied_mode: what the host has in force: enforce | observe |
+    // guards-only (bridge conntrack unavailable) | "" (no guest NIC).
+    string applied_mode = 2;
+    string error        = 3;
+    repeated FirewallWouldDrop would_drops = 4;
+}
+
+message FirewallWouldDrop {
+    string device   = 1;
+    string workload = 2;
+    string side     = 3;  // in | out | state | vlan
+    string rule     = 4;
+    uint64 packets  = 5;
+    uint64 bytes    = 6;
 }
 
 message ListNICGuardsRequest {
@@ -3561,6 +3609,11 @@ service LiteVirt {
     // and the source addresses the guard lets it use.
     rpc SetNICGuard(SetNICGuardRequest)     returns (NICGuard);
     rpc ListNICGuards(ListNICGuardsRequest) returns (ListNICGuardsResponse);
+    // GetFirewallEnforcement reports whether per-NIC rules are enforced or
+    // only observed, and each host's would-drop counters;
+    // SetFirewallEnforcement switches it (admin).
+    rpc GetFirewallEnforcement(GetFirewallEnforcementRequest) returns (FirewallEnforcementStatus);
+    rpc SetFirewallEnforcement(SetFirewallEnforcementRequest) returns (FirewallEnforcementStatus);
 
     // ── Backup snapshots ──
     rpc BackupSnapshot(BackupSnapshotRequest)       returns (stream BackupSnapshotProgress);

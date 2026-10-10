@@ -779,36 +779,47 @@ release. Nothing is written to the table before then, and the scope stays
 below the latched token enters WAL quarantine, as below every latched token.
 Roll forward.
 
-### Firewall: per-NIC rules move to the bridge, IPv6 rules after the roll
+### Firewall: per-NIC rules move to the bridge, observed until enforced
 
 This release enforces per-NIC policy — security groups, the cluster and host
-tiers applied to each NIC, the default policy and the new NIC guards — in a
-`bridge litevirt-nic` table on every bridge port, instead of in the `inet`
-forward hook, where traffic between two guests on one bridge (and between a
-guest and its host) was never filtered at all (docs/firewall.md, "Where the
-rules are enforced"). Each host switches when it restarts on the new binary,
-replacing both tables in one `nft -f` transaction, so there is no window with
-neither applied. Rules that never took effect before take effect now: review
-security groups before the roll, and under default-deny allow what guests need
-from their own host (DNS to dnsmasq, for example). The daemon loads
-`nf_conntrack_bridge` for stateful matching on bridge ports.
+tiers applied to each NIC, the default policy, the VLAN rule and the new NIC
+guards — in a `bridge litevirt-nic` table on every bridge port, instead of in
+the `inet` forward hook, where traffic between two guests on one bridge (and
+between a guest and its host) was never filtered at all (docs/firewall.md,
+"Where the rules are enforced").
 
-New NICs are guarded against spoofing by default; NICs that exist before the
-roll are not (docs/firewall.md, "NIC guards"). Guards are recorded in
-`cluster_policies`, so a NIC created before `failover_scope_v1` has latched is
-created unguarded.
+An upgraded cluster starts in **observe** mode: the rules are installed with
+would-drop counters and drop nothing, so nothing that worked before the roll
+stops working, and every host with guest NICs raises `firewall.nic.observe`.
+After the roll, read `lv firewall enforce status` — per host, per NIC and rule,
+what the rules would have dropped — fix rules or guests as needed, then
+`lv firewall enforce on`. A cluster initialised on this release enforces from
+the start. Each host switches tables when it restarts on the new binary; the
+per-NIC table loads first, in its own transaction. The daemon loads
+`nf_conntrack_bridge`; a host that cannot load it enforces only the guards and
+raises `firewall.nic.unavailable`.
 
-IPv6 firewall rules and ip-set elements are refused until the mandatory,
-replication-gated token `firewall_ipv6_v1` has latched, which it does once every
-host the cluster replicates to runs this release: an older renderer refuses its
-whole plan on an IPv6 rule.
+New NICs are guarded against spoofing by default (in either mode); NICs that
+exist before the roll are not (docs/firewall.md, "NIC guards"). Guards and the
+mode are recorded in `cluster_policies`, so a NIC created before
+`failover_scope_v1` has latched is created unguarded, and the mode stays
+observe until then.
 
-**Rolling a host back below this release** leaves the `bridge litevirt-nic`
-table in place, because the older binary does not know it. Delete it on that
-host (`nft delete table bridge litevirt-nic`) as part of the rollback: libvirt
-reuses `vnetN` names, so the stale chains would otherwise hold the next VM to
-get a name to another VM's policy. A binary rolled back below the latched
-`firewall_ipv6_v1` enters WAL quarantine, as below every latched token.
+IPv6 firewall rules and ip-set elements are refused until `firewall_ipv6_v1`
+has latched, which it does once every host the cluster replicates to runs this
+release: an older renderer refuses its whole plan on an IPv6 rule.
+
+**Rolling a host back below this release.** The release installs a systemd
+`ExecStartPre` that asks the binary about to start whether it owns the
+`bridge litevirt-nic` table (a hidden command only this release and later
+answer) and deletes the table when it does not. A rollback swaps the binary and
+keeps the unit, so the rolled-back daemon starts without the stale table:
+libvirt reuses `vnetN` names, and stale chains would hold the next VM to get a
+name to another VM's policy. A host whose unit was written by an older release
+(one never upgraded through this release's upgrade path) has no such step;
+delete the table by hand there (`nft delete table bridge litevirt-nic`). A
+binary rolled back below the latched `firewall_ipv6_v1` enters WAL quarantine,
+as below every latched token.
 
 ### Replica matching while the roll is in progress
 

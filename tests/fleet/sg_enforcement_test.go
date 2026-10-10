@@ -51,6 +51,13 @@ func sgCluster(t *testing.T) *Cluster {
 	for _, n := range c.Nodes {
 		n.Server.SetBridgeEnsure(n.Net.EnsureBridge)
 	}
+	// These scenarios pin what the rules DROP, so the cluster enforces them;
+	// with no policy recorded a cluster only observes (firewall_enforcement.go).
+	db := c.Nodes[0].DB
+	db.SetClusterPolicyGate(func() bool { return true })
+	if err := corrosion.SetFirewallEnforcement(context.Background(), db, corrosion.FirewallEnforce, "fleet"); err != nil {
+		t.Fatalf("enforce: %v", err)
+	}
 	return c
 }
 

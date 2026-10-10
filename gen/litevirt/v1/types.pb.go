@@ -894,8 +894,11 @@ type NetworkAttachment struct {
 	AllowedAddresses         []string `protobuf:"bytes,11,rep,name=allowed_addresses,json=allowedAddresses,proto3" json:"allowed_addresses,omitempty"`
 	AllowDhcpServer          bool     `protobuf:"varint,12,opt,name=allow_dhcp_server,json=allowDhcpServer,proto3" json:"allow_dhcp_server,omitempty"`
 	AllowRouterAdvertisement bool     `protobuf:"varint,13,opt,name=allow_router_advertisement,json=allowRouterAdvertisement,proto3" json:"allow_router_advertisement,omitempty"`
-	unknownFields            protoimpl.UnknownFields
-	sizeCache                protoimpl.SizeCache
+	// allow_vlan_tags: let the guest send 802.1Q / 802.1ad tagged frames (a
+	// trunk). Every other NIC's tagged frames are dropped.
+	AllowVlanTags bool `protobuf:"varint,14,opt,name=allow_vlan_tags,json=allowVlanTags,proto3" json:"allow_vlan_tags,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *NetworkAttachment) Reset() {
@@ -1015,6 +1018,13 @@ func (x *NetworkAttachment) GetAllowDhcpServer() bool {
 func (x *NetworkAttachment) GetAllowRouterAdvertisement() bool {
 	if x != nil {
 		return x.AllowRouterAdvertisement
+	}
+	return false
+}
+
+func (x *NetworkAttachment) GetAllowVlanTags() bool {
+	if x != nil {
+		return x.AllowVlanTags
 	}
 	return false
 }
@@ -5896,7 +5906,7 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\x05cache\x18\x04 \x01(\tR\x05cache\x12\x14\n" +
 	"\x05image\x18\x05 \x01(\tR\x05image\x12\x18\n" +
 	"\astorage\x18\x06 \x01(\tR\astorage\x12)\n" +
-	"\x10controller_model\x18\a \x01(\tR\x0fcontrollerModel\"\xa7\x03\n" +
+	"\x10controller_model\x18\a \x01(\tR\x0fcontrollerModel\"\xcf\x03\n" +
 	"\x11NetworkAttachment\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x14\n" +
 	"\x05model\x18\x02 \x01(\tR\x05model\x12\x0e\n" +
@@ -5912,7 +5922,8 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"spoofGuard\x12+\n" +
 	"\x11allowed_addresses\x18\v \x03(\tR\x10allowedAddresses\x12*\n" +
 	"\x11allow_dhcp_server\x18\f \x01(\bR\x0fallowDhcpServer\x12<\n" +
-	"\x1aallow_router_advertisement\x18\r \x01(\bR\x18allowRouterAdvertisement\"m\n" +
+	"\x1aallow_router_advertisement\x18\r \x01(\bR\x18allowRouterAdvertisement\x12&\n" +
+	"\x0fallow_vlan_tags\x18\x0e \x01(\bR\rallowVlanTags\"m\n" +
 	"\rCloudInitSpec\x12\x1a\n" +
 	"\buserdata\x18\x01 \x01(\tR\buserdata\x12\x1a\n" +
 	"\bmetadata\x18\x02 \x01(\tR\bmetadata\x12$\n" +

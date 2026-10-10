@@ -264,6 +264,13 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 		})
 	}
 
+	if req.Ip != "" && len(srcSpec.Network) > 0 {
+		if err := s.checkNICIdentities(ctx, []*pb.NetworkAttachment{{Name: srcSpec.Network[0].Name, Ip: req.Ip}}, req.Target); err != nil {
+			cleanup()
+			return nil, err
+		}
+	}
+
 	// ── Networks: fresh MACs (don't duplicate the source's) ──────────────
 	var netConfigs []lv.NetworkConfig
 	var ifaceRecords []corrosion.InterfaceRecord
@@ -278,6 +285,17 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 		ip := ""
 		if i == 0 {
 			ip = req.Ip // optional static IP for the first NIC
+		}
+		if def, _ := lookupNetworkDef(ctx, s.db, n.Name); ip == "" && !strings.HasPrefix(bridge, "direct:") &&
+			s.dhcpReservable(&pb.NetworkAttachment{Name: n.Name}, def) {
+			// The clone's NIC is guarded by default: give it an exact,
+			// reserved address (nic_identity.go).
+			rip, rerr := s.reserveDHCPAddress(ctx, n.Name, def.Subnet, bridge, mac)
+			if rerr != nil {
+				cleanup()
+				return nil, status.Errorf(codes.ResourceExhausted, "reserve a DHCP address on %q: %v", n.Name, rerr)
+			}
+			ip = rip
 		}
 		if strings.HasPrefix(bridge, "direct:") {
 			netConfigs = append(netConfigs, lv.NetworkConfig{Direct: strings.TrimPrefix(bridge, "direct:"), Model: n.Model, MAC: mac})

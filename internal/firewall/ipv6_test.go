@@ -169,31 +169,6 @@ func TestRender_IPSetFamilyOnlyRules(t *testing.T) {
 	}
 }
 
-// TestRender_ICMPv6EssentialsAccepted: IPv6 does not work without neighbour
-// discovery, router solicitation/advertisement, MLD and the ICMPv6 errors PMTU
-// discovery depends on. Under default-deny those would otherwise be dropped by
-// the forward policy on a host that bridges through netfilter, so the forward
-// chain accepts them ahead of every tier — and ahead of the invalid drop,
-// because conntrack does not track neighbour discovery.
-func TestRender_ICMPv6EssentialsAccepted(t *testing.T) {
-	out, err := Render(Plan{DefaultDeny: true})
-	if err != nil {
-		t.Fatalf("Render: %v", err)
-	}
-	line := "icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem, " +
-		"mld-listener-query, mld-listener-report, mld-listener-done, nd-router-solicit, nd-router-advert, " +
-		"nd-neighbor-solicit, nd-neighbor-advert, mld2-listener-report } accept"
-	idx := strings.Index(out, line)
-	if idx < 0 {
-		t.Fatalf("forward chain lacks the ICMPv6 essentials accept:\n%s", out)
-	}
-	if inv := strings.Index(out, "ct state invalid drop"); inv < idx {
-		t.Errorf("ICMPv6 essentials must precede `ct state invalid drop`:\n%s", out)
-	}
-	if j := strings.Index(out, "jump cluster_default"); j < idx {
-		t.Errorf("ICMPv6 essentials must precede the tier jumps:\n%s", out)
-	}
-	if strings.Contains(line, "nd-redirect") {
-		t.Fatal("a redirect is not essential and must not be accepted here")
-	}
-}
+// The ICMPv6 a network needs is accepted link-scoped in the per-NIC table
+// and as related traffic in inet forward, never by type to any address:
+// TestRender_PreambleIsScoped.

@@ -126,3 +126,65 @@ func TestFleet_NICGuard_NoRecordWhileStoreClosed(t *testing.T) {
 		t.Fatal("an explicit guard setting was accepted with nowhere to record it")
 	}
 }
+
+// TestFleet_FirewallEnforcement_ReplicatesAndRenders (ruling 1): with no
+// policy recorded every host only observes; `lv firewall enforce on` through
+// one node switches what another node renders.
+func TestFleet_FirewallEnforcement_ReplicatesAndRenders(t *testing.T) {
+	c := New(t, Options{Nodes: 2, IndependentReplicas: true})
+	for _, n := range c.Nodes {
+		n.DB.SetClusterPolicyGate(func() bool { return true })
+	}
+	plan := func(n *Node) firewall.Plan {
+		p, err := firewall.CorrosionPlanLoader(n.DB, n.Name, firewall.Plan{}, firewall.LoaderOptions{})(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	if m := plan(c.Nodes[0]).NICMode; m != firewall.NICModeObserve {
+		t.Fatalf("no policy recorded: mode %q, want observe", m)
+	}
+	if _, err := c.SelfClient(c.Nodes[1]).SetFirewallEnforcement(context.Background(),
+		&pb.SetFirewallEnforcementRequest{Mode: "enforce"}); err != nil {
+		t.Fatalf("SetFirewallEnforcement: %v", err)
+	}
+	eventually(t, 10*time.Second, "enforcement to reach the other node", func() bool {
+		return plan(c.Nodes[0]).NICMode == firewall.NICModeEnforce
+	})
+}
+
+// TestFleet_NICGuard_DHCPNICGetsExactReservation (ruling 7): a guarded NIC on
+// a network litevirt serves DHCP for is reserved an exact address at create,
+// and its guard allows that address — not the subnet.
+func TestFleet_NICGuard_DHCPNICGetsExactReservation(t *testing.T) {
+	c := New(t, Options{Nodes: 1})
+	n := c.Nodes[0]
+	n.DB.SetClusterPolicyGate(func() bool { return true })
+	n.Server.SetBridgeEnsure(func(string) error { return nil })
+	ctx := context.Background()
+	if err := corrosion.UpsertNetwork(ctx, n.DB, corrosion.NetworkRecord{Name: "dhcpnet", Type: "bridge",
+		Config: `{"Type":"bridge","Interface":"br-dhcp","Subnet":"10.40.0.0/24","DHCP":true}`}); err != nil {
+		t.Fatal(err)
+	}
+	for i, name := range []string{"r1", "r2"} {
+		if _, err := c.SelfClient(n).CreateVM(ctx, &pb.CreateVMRequest{Spec: &pb.VMSpec{
+			Name: name, Cpu: 1, MemoryMib: 256, Placement: &pb.PlacementSpec{Host: n.Name},
+			Network: []*pb.NetworkAttachment{{Name: "dhcpnet"}},
+		}}); err != nil {
+			t.Fatalf("CreateVM %s: %v", name, err)
+		}
+		nics, err := corrosion.MergedVMNICs(ctx, n.DB, name)
+		if err != nil || len(nics) != 1 {
+			t.Fatalf("NICs of %s: %v %v", name, nics, err)
+		}
+		want := []string{"10.40.0.2", "10.40.0.3"}[i]
+		if nics[0].IP != want {
+			t.Fatalf("%s reserved %q, want %q", name, nics[0].IP, want)
+		}
+		out := renderOn(t, n)
+		if !strings.Contains(out, "ip saddr != { "+want+" } drop") || strings.Contains(out, "10.40.0.0/24 } drop") {
+			t.Errorf("%s's guard is not exact:\n%s", name, out)
+		}
+	}
+}

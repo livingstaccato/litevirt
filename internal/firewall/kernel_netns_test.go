@@ -10,7 +10,10 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -39,6 +42,14 @@ func TestKernel_NICGuard(t *testing.T) {
 	if _, err := exec.LookPath("unshare"); err != nil {
 		t.Fatalf("%s=1 but unshare is not on PATH", netnsOptIn)
 	}
+	// Loading a module changes the host, which a test must never do: the
+	// kernel autoloads one the moment a ruleset uses it. Every module the
+	// rulesets below need must already be loaded (or built in), or the tests
+	// skip, saying which.
+	if missing := missingModules(kernelTestModules...); len(missing) > 0 {
+		t.Skipf("not running the kernel tests: they would make the kernel load %v, which is not loaded on this host; "+
+			"prove these properties on a lab VM instead", missing)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "unshare", "-rnm", os.Args[0], "-test.run", "^TestKernelChild_", "-test.v", "-test.count=1")
@@ -48,11 +59,41 @@ func TestKernel_NICGuard(t *testing.T) {
 	if err != nil {
 		t.Fatalf("kernel tests failed in the namespace: %v", err)
 	}
-	for _, child := range []string{"TestKernelChild_GuardDropsSpoofs", "TestKernelChild_RulesetLoads", "TestKernelChild_RulesHoldOnEveryPath"} {
+	for _, child := range []string{"TestKernelChild_GuardDropsSpoofs", "TestKernelChild_RulesetLoads",
+		"TestKernelChild_RulesHoldOnEveryPath", "TestKernelChild_DefaultDenyAndBypasses"} {
 		if !strings.Contains(string(out), "--- PASS: "+child) {
 			t.Errorf("%s did not pass in the namespace", child)
 		}
 	}
+}
+
+// kernelTestModules are the modules the rulesets these tests load make the
+// kernel use. The rulesets avoid every other one (no inet reject, no log, no
+// limit), so nothing else can be autoloaded.
+var kernelTestModules = []string{"nf_tables", "nf_conntrack", "nft_ct", "nf_conntrack_bridge", "nft_meta_bridge", "bridge", "veth"}
+
+// missingModules lists the named modules that are neither loaded nor built in.
+func missingModules(names ...string) []string {
+	loaded, _ := os.ReadFile("/proc/modules")
+	var uts syscall.Utsname
+	_ = syscall.Uname(&uts)
+	var rel []byte
+	for _, c := range uts.Release {
+		if c == 0 {
+			break
+		}
+		rel = append(rel, byte(c))
+	}
+	builtin, _ := os.ReadFile("/lib/modules/" + string(rel) + "/modules.builtin")
+	var out []string
+	for _, n := range names {
+		if bytes.Contains(loaded, []byte("\n"+n+" ")) || bytes.HasPrefix(loaded, []byte(n+" ")) ||
+			bytes.Contains(builtin, []byte("/"+n+".ko")) {
+			continue
+		}
+		out = append(out, n)
+	}
+	return out
 }
 
 func inNetns(t *testing.T) {
@@ -76,6 +117,7 @@ func sh(t *testing.T, args ...string) string {
 // receives whatever the bridge forwards out hM.
 type bridgeLab struct {
 	guestMAC net.HardwareAddr
+	otherMAC net.HardwareAddr
 }
 
 func newBridgeLab(t *testing.T) *bridgeLab {
@@ -92,7 +134,11 @@ func newBridgeLab(t *testing.T) *bridgeLab {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &bridgeLab{guestMAC: ifc.HardwareAddr}
+	ifc1, err := net.InterfaceByName("lvg1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &bridgeLab{guestMAC: ifc.HardwareAddr, otherMAC: ifc1.HardwareAddr}
 }
 
 func htons(v uint16) uint16 { return v<<8 | v>>8 }
@@ -123,14 +169,19 @@ func packetSocket(t *testing.T, dev string) int {
 // traffic on the link can never be mistaken for it.
 func (l *bridgeLab) delivered(t *testing.T, frame []byte) bool {
 	t.Helper()
-	tx := packetSocket(t, "lvg0")
-	rx := packetSocket(t, "lvg1")
+	return l.deliveredFrom(t, "lvg0", "lvg1", frame)
+}
+
+func (l *bridgeLab) deliveredFrom(t *testing.T, from, to string, frame []byte) bool {
+	t.Helper()
+	tx := packetSocket(t, from)
+	rx := packetSocket(t, to)
 	// Exactly 32 bytes: the IPv4 and IPv6 headers built below count 32 bytes
 	// of payload for it, and a length field longer than the frame makes the
 	// kernel treat the packet as malformed rather than parse it.
 	marker := []byte(fmt.Sprintf("LVMARK%026d", time.Now().UnixNano()))
 	frame = append(append([]byte(nil), frame...), marker...)
-	ifc, _ := net.InterfaceByName("lvg0")
+	ifc, _ := net.InterfaceByName(from)
 	if err := syscall.Sendto(tx, frame, 0, &syscall.SockaddrLinklayer{Ifindex: ifc.Index, Halen: 6}); err != nil {
 		t.Fatalf("send: %v", err)
 	}
@@ -204,6 +255,14 @@ func neighborAdvert(target string) []byte {
 	return icmpv6(136, append([]byte{0x20, 0, 0, 0}, net.ParseIP(target).To16()...))
 }
 
+// neighborSolicit is an NS for target carrying a source link-layer address
+// option for sll.
+func neighborSolicit(target string, sll net.HardwareAddr) []byte {
+	body := append([]byte{0, 0, 0, 0}, net.ParseIP(target).To16()...)
+	body = append(body, 1, 1)
+	return icmpv6(135, append(body, sll...))
+}
+
 func udp6(sport, dport uint16) []byte {
 	u := make([]byte, 8)
 	binary.BigEndian.PutUint16(u[0:], sport)
@@ -213,63 +272,123 @@ func udp6(sport, dport uint16) []byte {
 }
 
 // TestKernelChild_GuardDropsSpoofs pushes forged and honest frames through a
-// guarded bridge port and checks what the kernel forwards. It then removes the
-// guard and checks the applier deleted the table and the forgeries pass, which
-// proves the guard — and nothing else in the namespace — was dropping them.
+// guarded bridge port and checks what the kernel forwards: first with the
+// guest's exact address, then confined to its subnet with the gateway and a
+// neighbour's address excluded. It then checks tagged frames from an
+// UNGUARDED NIC are dropped, and finally removes every NIC and checks the
+// table is gone and the forgeries pass — so the guard, and nothing else in the
+// namespace, was dropping them.
+//
+// The guard phases run in observe mode: guards are enforced in every mode,
+// and observe keeps the table's conntrack-invalid rule from dropping the
+// hand-built frames (whose UDP checksums are not filled in) for a reason that
+// is not the guard's.
 func TestKernelChild_GuardDropsSpoofs(t *testing.T) {
 	inNetns(t)
 	l := newBridgeLab(t)
 	mac := l.guestMAC
+	ll, _ := eui64LinkLocal(mac.String())
 	foreign := net.HardwareAddr{0x02, 0, 0, 0, 0, 0x99}
 
-	plan := Plan{NICs: []NICBinding{{
+	apply := func(p Plan) *Applier {
+		a := NewApplier(NftBinary{})
+		if _, err := a.Apply(context.Background(), p); err != nil {
+			t.Fatalf("apply: %v", err)
+		}
+		return a
+	}
+	other := NICBinding{NICDev: "lvh1", VMName: "other"}
+	apply(Plan{NICMode: NICModeObserve, NICs: []NICBinding{{
 		NICDev: "lvh0", VMName: "guest",
 		Guard: &NICGuard{MAC: mac.String(), V4: []string{"10.0.0.5"}, V6: []string{"2001:db8::5"}},
-	}}}
-	a := NewApplier(NftBinary{})
-	if _, err := a.Apply(context.Background(), plan); err != nil {
-		t.Fatalf("apply guarded plan: %v", err)
-	}
+	}, other}})
 	t.Logf("loaded:\n%s", sh(t, "nft", "list", "table", "bridge", NICTableName))
 
-	cases := []struct {
+	type tc struct {
 		name  string
 		frame []byte
 		want  bool
-	}{
+	}
+	run := func(cases []tc) {
+		for _, c := range cases {
+			if got := l.delivered(t, c.frame); got != c.want {
+				t.Errorf("%s: delivered=%v, want %v", c.name, got, c.want)
+			}
+		}
+	}
+	exact := []tc{
 		{"own IPv4 address", ether(mac, 0x0800, ipv4UDP("10.0.0.5", "10.0.0.9", 4000, 5000)), true},
 		{"spoofed IPv4 source", ether(mac, 0x0800, ipv4UDP("10.0.0.99", "10.0.0.9", 4000, 5000)), false},
 		{"foreign source MAC", ether(foreign, 0x0800, ipv4UDP("10.0.0.5", "10.0.0.9", 4000, 5000)), false},
 		{"DHCP discover from 0.0.0.0", ether(mac, 0x0800, ipv4UDP("0.0.0.0", "255.255.255.255", 68, 67)), true},
 		{"DHCP server reply", ether(mac, 0x0800, ipv4UDP("10.0.0.5", "255.255.255.255", 67, 68)), false},
+		{"DHCP reply from another source port", ether(mac, 0x0800, ipv4UDP("10.0.0.5", "255.255.255.255", 9999, 68)), false},
 		{"honest ARP", ether(mac, 0x0806, arpRequest(mac, "10.0.0.5", "10.0.0.9")), true},
 		{"ARP claiming another IP", ether(mac, 0x0806, arpRequest(mac, "10.0.0.99", "10.0.0.9")), false},
 		{"ARP claiming another MAC", ether(mac, 0x0806, arpRequest(foreign, "10.0.0.5", "10.0.0.9")), false},
 		{"VLAN-tagged frame", ether(mac, 0x8100, append([]byte{0, 10, 8, 0}, ipv4UDP("10.0.0.99", "10.0.0.9", 1, 2)...)), false},
 		{"own IPv6 address", ether(mac, 0x86dd, ipv6("2001:db8::5", "2001:db8::9", 17, udp6(4000, 5000))), true},
-		{"link-local IPv6", ether(mac, 0x86dd, ipv6("fe80::5", "ff02::1", 17, udp6(4000, 5000))), true},
+		{"own (EUI-64) link-local", ether(mac, 0x86dd, ipv6(ll, "ff02::1", 17, udp6(4000, 5000))), true},
+		{"the router's link-local as source", ether(mac, 0x86dd, ipv6("fe80::1", "ff02::1", 17, udp6(4000, 5000))), false},
 		{"spoofed IPv6 source", ether(mac, 0x86dd, ipv6("2001:db8::99", "2001:db8::9", 17, udp6(4000, 5000))), false},
-		{"router advertisement", ether(mac, 0x86dd, ipv6("fe80::5", "ff02::1", 58, icmpv6(134, make([]byte, 12)))), false},
-		{"DHCPv6 server reply", ether(mac, 0x86dd, ipv6("fe80::5", "fe80::9", 17, udp6(547, 546))), false},
-		{"honest neighbour advert", ether(mac, 0x86dd, ipv6("fe80::5", "ff02::1", 58, neighborAdvert("2001:db8::5"))), true},
-		{"neighbour advert for another address", ether(mac, 0x86dd, ipv6("fe80::5", "ff02::1", 58, neighborAdvert("2001:db8::99"))), false},
+		{"router advertisement", ether(mac, 0x86dd, ipv6(ll, "ff02::1", 58, icmpv6(134, make([]byte, 12)))), false},
+		{"DHCPv6 server reply", ether(mac, 0x86dd, ipv6(ll, "fe80::9", 17, udp6(547, 546))), false},
+		{"DHCPv6 reply from another source port", ether(mac, 0x86dd, ipv6(ll, "fe80::9", 17, udp6(9999, 546))), false},
+		{"honest neighbour advert", ether(mac, 0x86dd, ipv6(ll, "ff02::1", 58, neighborAdvert("2001:db8::5"))), true},
+		{"neighbour advert for another address", ether(mac, 0x86dd, ipv6(ll, "ff02::1", 58, neighborAdvert("2001:db8::99"))), false},
+		{"neighbour advert for the router's link-local", ether(mac, 0x86dd, ipv6(ll, "ff02::1", 58, neighborAdvert("fe80::1"))), false},
+		{"honest neighbour solicitation", ether(mac, 0x86dd, ipv6(ll, "ff02::1:ff00:9", 58, neighborSolicit("2001:db8::9", mac))), true},
+		{"solicitation naming another MAC", ether(mac, 0x86dd, ipv6(ll, "ff02::1:ff00:9", 58, neighborSolicit("2001:db8::9", foreign))), false},
 	}
-	for _, c := range cases {
-		if got := l.delivered(t, c.frame); got != c.want {
+	run(exact)
+
+	// Confined to the subnet: anything in it, except the network's own
+	// addresses and another NIC's.
+	apply(Plan{NICMode: NICModeObserve, NICs: []NICBinding{{
+		NICDev: "lvh0", VMName: "guest",
+		Guard: &NICGuard{MAC: mac.String(), V4: []string{"10.0.0.0/24"}, ExcludeV4: []string{"10.0.0.0", "10.0.0.1", "10.0.0.255", "10.0.0.7"}},
+	}, other}})
+	subnet := []tc{
+		{"an address in the subnet", ether(mac, 0x0800, ipv4UDP("10.0.0.99", "10.0.0.9", 4000, 5000)), true},
+		{"the gateway's address", ether(mac, 0x0800, ipv4UDP("10.0.0.1", "10.0.0.9", 4000, 5000)), false},
+		{"ARP claiming the gateway", ether(mac, 0x0806, arpRequest(mac, "10.0.0.1", "10.0.0.9")), false},
+		{"a neighbour's address", ether(mac, 0x0800, ipv4UDP("10.0.0.7", "10.0.0.9", 4000, 5000)), false},
+		{"outside the subnet", ether(mac, 0x0800, ipv4UDP("192.168.0.1", "10.0.0.9", 4000, 5000)), false},
+	}
+	run(subnet)
+
+	// An UNGUARDED NIC, enforce mode: tagged frames are dropped (they would
+	// carry their payload past every per-NIC rule), untagged ones pass.
+	om := l.otherMAC
+	apply(Plan{NICs: []NICBinding{{NICDev: "lvh0", VMName: "guest"}, other}})
+	tagged := []struct {
+		name  string
+		frame []byte
+		want  bool
+	}{
+		{"untagged from an unguarded NIC", ether(om, 0x0800, ipv4UDP("10.0.0.8", "10.0.0.9", 4000, 5000)), true},
+		{"802.1Q from an unguarded NIC", ether(om, 0x8100, append([]byte{0, 10, 8, 0}, ipv4UDP("10.0.0.8", "10.0.0.9", 1, 2)...)), false},
+		{"QinQ from an unguarded NIC", ether(om, 0x88a8, append([]byte{0, 20, 0x81, 0, 0, 10, 8, 0}, ipv4UDP("10.0.0.8", "10.0.0.9", 1, 2)...)), false},
+	}
+	for _, c := range tagged {
+		if got := l.deliveredFrom(t, "lvg1", "lvg0", c.frame); got != c.want {
 			t.Errorf("%s: delivered=%v, want %v", c.name, got, c.want)
 		}
 	}
 
-	// Unguard: the table must go, and the forgeries must now pass.
-	if _, err := a.Apply(context.Background(), Plan{NICs: []NICBinding{{NICDev: "lvh0", VMName: "guest"}}}); err != nil {
-		t.Fatalf("apply unguarded plan: %v", err)
-	}
+	// No NIC at all: the table must go, and every forgery must now pass.
+	apply(Plan{})
 	if err := exec.Command("nft", "list", "table", "bridge", NICTableName).Run(); err == nil {
-		t.Fatal("the guard table outlived the last guarded NIC")
+		t.Fatal("the per-NIC table outlived the last NIC")
 	}
-	for _, c := range cases {
+	for _, c := range append(exact, subnet...) {
 		if !c.want && !l.delivered(t, c.frame) {
-			t.Errorf("%s: still dropped with no guard loaded — the drop above was not the guard's", c.name)
+			t.Errorf("%s: still dropped with no table loaded — the drop above was not the guard's", c.name)
+		}
+	}
+	for _, c := range tagged {
+		if !c.want && !l.deliveredFrom(t, "lvg1", "lvg0", c.frame) {
+			t.Errorf("%s: still dropped with no table loaded", c.name)
 		}
 	}
 }
@@ -317,10 +436,23 @@ func TestKernelChild_RulesetLoads(t *testing.T) {
 // p<g>, the device a VM's tap would be.
 type guestLab struct{}
 
+var mountRun sync.Once
+
 func newGuestLab(t *testing.T, guests map[string]string) *guestLab {
 	t.Helper()
-	sh(t, "mount", "-t", "tmpfs", "tmpfs", "/run")
-	sh(t, "mkdir", "-p", "/run/netns")
+	mountRun.Do(func() {
+		sh(t, "mount", "-t", "tmpfs", "tmpfs", "/run")
+		sh(t, "mkdir", "-p", "/run/netns")
+	})
+	t.Cleanup(func() {
+		_, _ = NewApplier(NftBinary{}).Apply(context.Background(), Plan{})
+		for g := range guests {
+			_ = exec.Command("ip", "netns", "del", g).Run()
+			_ = exec.Command("ip", "link", "del", "p"+g).Run()
+		}
+		_ = exec.Command("ip", "link", "del", "gwbr0").Run()
+		_ = exec.Command("ip", "link", "del", "gwbr1").Run()
+	})
 	sh(t, "sysctl", "-qw", "net.ipv4.ip_forward=1")
 	for i, br := range []string{"gwbr0", "gwbr1"} {
 		sh(t, "ip", "link", "add", br, "type", "bridge", "stp_state", "0", "forward_delay", "0")
@@ -359,9 +491,8 @@ func (*guestLab) ping(from, to string) bool {
 // guest on one bridge, host to guest, routed into a guest, guest to host and
 // routed out of a guest — then that the allowed paths still work.
 //
-// This namespace cannot load nf_conntrack_bridge, so replies are not tracked
-// here: every case is built so no reply crosses a rule (the stateful half is
-// the e2e case, tests/e2e TestFirewall_TrafficBetweenVMs).
+// No case here depends on replies being tracked (the stateful cases are in
+// TestKernelChild_DefaultDenyAndBypasses).
 func TestKernelChild_RulesHoldOnEveryPath(t *testing.T) {
 	inNetns(t)
 	l := newGuestLab(t, map[string]string{
@@ -425,4 +556,145 @@ func TestKernelChild_RulesHoldOnEveryPath(t *testing.T) {
 			t.Errorf("%s -> %s still fails with no rules loaded", c[0], c[1])
 		}
 	}
+}
+
+// TestKernelHelper_SendUDP is not a test: a kernel test runs it inside a guest
+// namespace to send one UDP datagram from a chosen source port
+// (LV_UDP_SEND="<sport> <daddr> <dport>").
+func TestKernelHelper_SendUDP(t *testing.T) {
+	spec := os.Getenv("LV_UDP_SEND")
+	if spec == "" {
+		t.Skip("helper")
+	}
+	f := strings.Fields(spec)
+	sport, _ := strconv.Atoi(f[0])
+	dport, _ := strconv.Atoi(f[2])
+	c, err := net.DialUDP("udp4", &net.UDPAddr{Port: sport}, &net.UDPAddr{IP: net.ParseIP(f[1]), Port: dport})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	for i := 0; i < 3; i++ {
+		_, _ = c.Write([]byte("litevirt-probe"))
+	}
+}
+
+// sendUDP sends from guest g with the given ports.
+func sendUDP(t *testing.T, g string, sport int, daddr string, dport int) {
+	t.Helper()
+	cmd := exec.Command("ip", "netns", "exec", g, os.Args[0], "-test.run", "^TestKernelHelper_SendUDP$", "-test.count=1")
+	cmd.Env = append(os.Environ(), fmt.Sprintf("LV_UDP_SEND=%d %s %d", sport, daddr, dport))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("send udp from %s: %v\n%s", g, err, out)
+	}
+}
+
+var packetsRE = regexp.MustCompile(`packets (\d+)`)
+
+// probeCount reads a counter the test put on the host's IP prerouting hook,
+// ahead of litevirt's: what got past the bridge into the host's stack.
+func probeCount(t *testing.T) int {
+	t.Helper()
+	m := packetsRE.FindStringSubmatch(sh(t, "nft", "list", "chain", "inet", "lvprobe", "pre"))
+	if m == nil {
+		t.Fatal("no probe counter")
+	}
+	n, _ := strconv.Atoi(m[1])
+	return n
+}
+
+// TestKernelChild_DefaultDenyAndBypasses runs real traffic under default-deny
+// with replies tracked by bridge conntrack, and the bypasses the review found:
+//
+//   - a guest that may not send UDP must not reach a routed UDP/67 listener
+//     by using DHCP's ports (review C2);
+//   - a reject rule loads (the kernel would refuse it on the forward and
+//     output hooks; it is rendered as drop) and holds (C1);
+//   - routed traffic between ports that are not guest NICs is still judged by
+//     the default policy, not let through because its bridge carries guests
+//     (ruling 5, I1);
+//   - observe mode drops nothing per NIC, counts what it would have dropped,
+//     and loosens nothing routed.
+func TestKernelChild_DefaultDenyAndBypasses(t *testing.T) {
+	inNetns(t)
+	if missing := missingModules("nf_conntrack_bridge"); len(missing) > 0 {
+		t.Skip("nf_conntrack_bridge is not loaded; a test must not load it")
+	}
+	l := newGuestLab(t, map[string]string{
+		"ga": "10.20.0.1", // may send icmp and udp/67
+		"gb": "10.20.0.2", // may receive icmp; sends nothing
+		"gc": "10.20.0.3", // no rules, plus a reject: default-deny both ways
+		"gd": "10.21.0.4", // the routed target
+		"gx": "10.20.0.9", // a port that is no guest NIC
+		"gu": "10.21.0.9", // another
+	})
+	nic := func(g, br string, sgs ...string) NICBinding {
+		return NICBinding{NICDev: "p" + g, VMName: g, Bridge: br, SecurityGroups: sgs}
+	}
+	plan := Plan{
+		DefaultDeny: true,
+		SecurityGroups: []SecurityGroup{
+			{Name: "sender", Rules: []Rule{
+				{Direction: Egress, Proto: "icmp", Action: Accept},
+				{Direction: Egress, Proto: "udp", PortRange: "67", Action: Accept},
+			}},
+			{Name: "receiver", Rules: []Rule{{Direction: Ingress, Proto: "icmp", Action: Accept}}},
+			{Name: "rejecting", Rules: []Rule{{Direction: Ingress, Proto: "icmp", Action: Reject}}},
+			{Name: "target", Rules: []Rule{{Direction: Ingress, Proto: "udp", PortRange: "67", Action: Accept}}},
+		},
+		NICs: []NICBinding{nic("ga", "gwbr0", "sender"), nic("gb", "gwbr0", "receiver"),
+			nic("gc", "gwbr0", "rejecting"), nic("gd", "gwbr1", "target")},
+	}
+	if _, err := NewApplier(NftBinary{}).Apply(context.Background(), plan); err != nil {
+		t.Fatalf("apply (a reject rule in a security group must load): %v", err)
+	}
+	sh(t, "sh", "-c", `nft add table inet lvprobe && nft add chain inet lvprobe pre '{ type filter hook prerouting priority -400; policy accept; }' && nft add rule inet lvprobe pre ip daddr 10.21.0.4 udp dport 67 counter`)
+
+	check := func(name, from, to string, want bool) {
+		if got := l.ping(from, to); got != want {
+			t.Errorf("%s (%s -> %s): reached=%v, want %v", name, from, to, got, want)
+		}
+	}
+	check("allowed both ways, replies tracked", "ga", "10.20.0.2", true)
+	check("a sender with no egress rule", "gb", "10.20.0.1", false)
+	check("into a NIC that rejects icmp", "ga", "10.20.0.3", false)
+	check("routed between two ports that are no guest NIC", "gx", "10.21.0.9", false)
+
+	sendUDP(t, "gc", 68, "10.21.0.4", 67)
+	if n := probeCount(t); n != 0 {
+		t.Errorf("%d datagrams from a guest that may not send UDP reached a routed UDP/67 listener using DHCP's ports", n)
+	}
+	sendUDP(t, "ga", 68, "10.21.0.4", 67)
+	if n := probeCount(t); n == 0 {
+		t.Error("the allowed sender's datagram never reached the probe either; the zero above proves nothing")
+	}
+
+	// Observe: the per-NIC drops above become counters, nothing routed
+	// loosens.
+	plan.NICMode = NICModeObserve
+	if _, err := NewApplier(NftBinary{}).Apply(context.Background(), plan); err != nil {
+		t.Fatalf("apply observe: %v", err)
+	}
+	check("observe: a sender with no egress rule", "gb", "10.20.0.1", true)
+	check("observe: routed between ports that are no guest NIC", "gx", "10.21.0.9", false)
+	wd, err := WouldDrops(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, w := range wd {
+		if w.Device == "pgb" && w.Side == "out" && w.Rule == "default" && w.Packets > 0 {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("observe mode counted no would-drop for gb's egress default: %+v", wd)
+	}
+
+	// No rules: everything passes, so the drops above were the rules'.
+	if _, err := NewApplier(NftBinary{}).Apply(context.Background(), Plan{}); err != nil {
+		t.Fatal(err)
+	}
+	check("no rules: gb", "gb", "10.20.0.1", true)
+	check("no rules: routed", "gx", "10.21.0.9", true)
 }

@@ -24,6 +24,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/firewall"
 )
@@ -43,30 +44,69 @@ func normalizeNICGuardMode(m string) (string, error) {
 // nicGuardExplicit reports whether a NIC request says anything about its guard.
 func nicGuardExplicit(att *pb.NetworkAttachment) bool {
 	return att.GetSpoofGuard() != "" || len(att.GetAllowedAddresses()) > 0 ||
-		att.GetAllowDhcpServer() || att.GetAllowRouterAdvertisement()
+		att.GetAllowDhcpServer() || att.GetAllowRouterAdvertisement() || att.GetAllowVlanTags()
 }
 
 // nicGuardWeakens reports whether a guard setting lets the guest do more than
 // a default guard does.
-func nicGuardWeakens(mode string, allowed []string, dhcp, ra bool) bool {
-	return mode == corrosion.NICGuardOff || len(allowed) > 0 || dhcp || ra
+func nicGuardWeakens(mode string, allowed []string, dhcp, ra, vlan bool) bool {
+	return mode == corrosion.NICGuardOff || len(allowed) > 0 || dhcp || ra || vlan
 }
 
-// requireGuardAuthority is the cluster-root check every weakening needs.
-func (s *Server) requireGuardAuthority(ctx context.Context, what string) error {
-	if err := s.RequirePerm(ctx, "/", "network.update", "operator"); err != nil {
+// requireGuardAuthority is the check every weakening needs: authority over
+// the L2 segment the NIC sits on, whose other occupants the guard protects.
+// For a network a project owns, network.update on that network; for a shared
+// (global) network or a raw bridge, cluster-root network.update. With no RBAC
+// bindings at all, the legacy role fallback applies, as for every check: any
+// operator passes.
+func (s *Server) requireGuardAuthority(ctx context.Context, networkName, what string) error {
+	path := "/"
+	if networkName != "" {
+		if nr, err := corrosion.GetNetwork(ctx, s.db, networkName); err != nil {
+			return status.Errorf(codes.Unavailable, "look up network %q: %v", networkName, err)
+		} else if nr != nil && nr.Project != "" {
+			path = networkRBACPathFor(nr.Project, nr.Name)
+		}
+	}
+	if err := s.RequirePerm(ctx, path, "network.update", "operator"); err != nil {
 		return status.Errorf(codes.PermissionDenied,
-			"%s weakens a NIC guard (anti-spoofing) and requires cluster-root network authority", what)
+			"%s weakens a NIC guard (anti-spoofing) and requires network.update on %s", what, path)
 	}
 	return nil
 }
 
-// admitNICGuards checks the guard settings of NICs about to be created: each
-// must be well formed; an explicit one needs the record store to be writable
-// (refused rather than silently dropped); and a weakening one needs
-// cluster-root network authority unless carried is set — a re-create of a VM
-// from the spec its original, authorized create stored.
-func (s *Server) admitNICGuards(ctx context.Context, atts []*pb.NetworkAttachment, carried bool) error {
+// firewallReleaseActive reports whether every host runs a build that knows
+// NIC guards and IPv6 rules — whose entry nodes check guard authority and
+// whose renderers render IPv6 rules. One small function so the integration
+// can swap it for the shared release token (feat/release-token); until then it
+// reads firewall_ipv6_v1.
+func (s *Server) firewallReleaseActive() bool {
+	return s.gate != nil && s.gate.DurablyLatched(capabilities.FirewallIPv6V1)
+}
+
+// admitMode is how a create path came by the guard settings it carries.
+type admitMode int
+
+const (
+	// admitNew: a caller asked for them; a weakening needs authority.
+	admitNew admitMode = iota
+	// admitRecreate: a re-create of a VM under the same name (rebuild, a
+	// stack's rolling update). Settings that match a guard the VM already
+	// had pass; anything else is a new request and needs authority.
+	admitRecreate
+	// admitPeerOwner: the owner leg of a request a peer forwarded. The entry
+	// node checked authority — if it is a build that knows guards, which is
+	// what firewallReleaseActive proves; before that, explicit settings are
+	// refused rather than trusted.
+	admitPeerOwner
+)
+
+// admitNICGuards checks the guard settings of NICs about to be created by
+// vmName: each must be well formed; an explicit one needs the record store to
+// be writable (refused rather than silently dropped); and a weakening one
+// needs authority over its network (see admitMode).
+func (s *Server) admitNICGuards(ctx context.Context, vmName string, atts []*pb.NetworkAttachment, how admitMode) error {
+	var prior map[string]corrosion.NICGuardRecord
 	for _, att := range atts {
 		if att == nil {
 			continue
@@ -79,18 +119,68 @@ func (s *Server) admitNICGuards(ctx context.Context, atts []*pb.NetworkAttachmen
 		if aerr != nil {
 			return status.Errorf(codes.InvalidArgument, "network %q allowed addresses: %v", att.GetName(), aerr)
 		}
-		if nicGuardExplicit(att) && !s.db.MayWriteClusterPolicy() {
+		if !nicGuardExplicit(att) {
+			continue
+		}
+		if !s.db.MayWriteClusterPolicy() {
 			return status.Errorf(codes.FailedPrecondition,
 				"network %q: NIC guard settings cannot be recorded until failover_scope_v1 has latched on every host; "+
 					"leave them out to create the NIC (it will be unguarded until set with `lv firewall nic-guard set`)", att.GetName())
 		}
-		if !carried && nicGuardWeakens(mode, allowed, att.GetAllowDhcpServer(), att.GetAllowRouterAdvertisement()) {
-			if err := s.requireGuardAuthority(ctx, "network "+att.GetName()); err != nil {
-				return err
+		if !nicGuardWeakens(mode, allowed, att.GetAllowDhcpServer(), att.GetAllowRouterAdvertisement(), att.GetAllowVlanTags()) {
+			continue
+		}
+		switch how {
+		case admitPeerOwner:
+			if !s.firewallReleaseActive() {
+				return status.Errorf(codes.FailedPrecondition,
+					"network %q: NIC guard settings forwarded by a peer are refused until every host runs a build that checks them", att.GetName())
 			}
+			continue
+		case admitRecreate:
+			if prior == nil {
+				if prior, err = s.guardsOf(ctx, vmName); err != nil {
+					return err
+				}
+			}
+			if guardMatchesAny(prior, mode, allowed, att) {
+				continue
+			}
+		}
+		if err := s.requireGuardAuthority(ctx, att.GetName(), "network "+att.GetName()); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+// guardsOf returns every guard record of vmName, including those of an
+// incarnation already deleted (records outlive their VM).
+func (s *Server) guardsOf(ctx context.Context, vmName string) (map[string]corrosion.NICGuardRecord, error) {
+	all, err := corrosion.ListNICGuards(ctx, s.db)
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "read NIC guards: %v", err)
+	}
+	out := map[string]corrosion.NICGuardRecord{}
+	for k, r := range all {
+		if r.VMName == vmName {
+			out[k] = r
+		}
+	}
+	return out, nil
+}
+
+// guardMatchesAny reports whether a requested guard equals one the VM already
+// had.
+func guardMatchesAny(prior map[string]corrosion.NICGuardRecord, mode string, allowed []string, att *pb.NetworkAttachment) bool {
+	for _, r := range prior {
+		if r.Mode == mode && strings.Join(r.Allowed, ",") == strings.Join(allowed, ",") &&
+			r.AllowDHCPServer == att.GetAllowDhcpServer() && r.AllowRouterAdvert == att.GetAllowRouterAdvertisement() &&
+			r.AllowVLANTags == att.GetAllowVlanTags() {
+			return true
+		}
+	}
+	return false
 }
 
 // newNICGuardRecord is the record a new NIC gets from its request. A static
@@ -103,6 +193,7 @@ func newNICGuardRecord(vm, mac string, att *pb.NetworkAttachment) corrosion.NICG
 		Allowed:           att.GetAllowedAddresses(),
 		AllowDHCPServer:   att.GetAllowDhcpServer(),
 		AllowRouterAdvert: att.GetAllowRouterAdvertisement(),
+		AllowVLANTags:     att.GetAllowVlanTags(),
 	}
 	if v6 := strings.TrimSpace(att.GetIpv6()); v6 != "" {
 		if p, err := netip.ParsePrefix(v6); err == nil {
@@ -146,15 +237,25 @@ func guardState(r *corrosion.NICGuardRecord, err error) string {
 	return r.AuditText()
 }
 
-// SetNICGuard replaces one VM NIC's guard. It needs cluster-root network
-// authority whatever it sets: the guard is what keeps the VM from
-// impersonating other tenants, so its owner may not be the one to relax it.
+// guardTarget is the NIC a SetNICGuard names: a VM's or a container's.
+type guardTarget struct {
+	owner   string // the record's owner: the VM name, or ContainerGuardOwner
+	display string // for audit and logs
+	nic     corrosion.NICRecord
+}
+
+// SetNICGuard replaces one NIC's guard. It needs network.update over the
+// NIC's network whatever it sets (requireGuardAuthority): the guard is what
+// keeps the guest from impersonating the other tenants on that segment, so
+// the guest's owner may not be the one to relax it.
 func (s *Server) SetNICGuard(ctx context.Context, req *pb.SetNICGuardRequest) (*pb.NICGuard, error) {
-	if err := s.requireGuardAuthority(ctx, "setting a NIC guard"); err != nil {
+	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return nil, err
 	}
-	if req.GetVmName() == "" || (req.GetMac() == "" && req.GetNetworkName() == "") {
-		return nil, status.Error(codes.InvalidArgument, "vm_name and one of mac or network_name are required")
+	ct := req.GetContainerName() != ""
+	if (req.GetVmName() == "") == !ct || (req.GetMac() == "" && req.GetNetworkName() == "") {
+		return nil, status.Error(codes.InvalidArgument,
+			"one of vm_name or container_name (with container_host), and one of mac or network_name, are required")
 	}
 	if req.GetMode() == "" {
 		return nil, status.Error(codes.InvalidArgument, "mode is required (on or off)")
@@ -163,30 +264,37 @@ func (s *Server) SetNICGuard(ctx context.Context, req *pb.SetNICGuardRequest) (*
 	if err != nil {
 		return nil, err
 	}
-	vm, err := corrosion.GetVM(ctx, s.db, req.GetVmName())
-	if err != nil {
-		return nil, status.Errorf(codes.Unavailable, "look up vm %q: %v", req.GetVmName(), err)
+	var tgt guardTarget
+	if ct {
+		tgt, err = s.pickContainerNIC(ctx, req.GetContainerHost(), req.GetContainerName(), req.GetMac(), req.GetNetworkName())
+	} else {
+		tgt, err = s.pickVMTarget(ctx, req.GetVmName(), req.GetMac(), req.GetNetworkName())
 	}
-	if vm == nil {
-		return nil, status.Errorf(codes.NotFound, "vm %q not found", req.GetVmName())
-	}
-	nic, err := s.pickVMNIC(ctx, vm.Name, req.GetMac(), req.GetNetworkName())
 	if err != nil {
 		return nil, err
 	}
-	before, berr := corrosion.GetNICGuard(ctx, s.db, vm.Name, nic.MAC)
+	if err := s.requireGuardAuthority(ctx, tgt.nic.NetworkName, "setting a NIC guard"); err != nil {
+		return nil, err
+	}
+	if def, _ := lookupNetworkDef(ctx, s.db, tgt.nic.NetworkName); def != nil && (def.Type == "direct" || def.Type == "sriov") {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"NIC %s is on %s network %q, which bypasses the bridge where guards are enforced; a guard there would protect nothing",
+			tgt.nic.MAC, def.Type, tgt.nic.NetworkName)
+	}
+	before, berr := corrosion.GetNICGuard(ctx, s.db, tgt.owner, tgt.nic.MAC)
 	rec := corrosion.NICGuardRecord{
-		VMName: vm.Name, MAC: nic.MAC, Mode: mode,
+		VMName: tgt.owner, MAC: tgt.nic.MAC, Mode: mode,
 		Allowed:           req.GetAllowedAddresses(),
 		AllowDHCPServer:   req.GetAllowDhcpServer(),
 		AllowRouterAdvert: req.GetAllowRouterAdvertisement(),
+		AllowVLANTags:     req.GetAllowVlanTags(),
 	}
 	if berr == nil && before != nil {
 		rec.Known = before.Known // a static IPv6 address recorded at create
 	}
 	if err := corrosion.PutNICGuard(ctx, s.db, rec, callerUsername(ctx)); err != nil {
-		detail := "mac=" + nic.MAC + " " + corrosion.AuditChange(guardState(before, berr), "unchanged")
-		s.audit(ctx, "nic.guard.set", vm.Name, detail, "error")
+		detail := "mac=" + tgt.nic.MAC + " " + corrosion.AuditChange(guardState(before, berr), "unchanged")
+		s.audit(ctx, "nic.guard.set", tgt.display, detail, "error")
 		switch {
 		case errors.Is(err, corrosion.ErrClusterPolicyGateClosed):
 			return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
@@ -194,13 +302,61 @@ func (s *Server) SetNICGuard(ctx context.Context, req *pb.SetNICGuardRequest) (*
 			return nil, status.Errorf(codes.InvalidArgument, "set NIC guard: %v", err)
 		}
 	}
-	after, aerr := corrosion.GetNICGuard(ctx, s.db, vm.Name, nic.MAC)
-	s.audit(ctx, "nic.guard.set", vm.Name,
-		"mac="+nic.MAC+" "+corrosion.AuditChange(guardState(before, berr), guardState(after, aerr)), "ok")
-	slog.Info("NIC guard set", "vm", vm.Name, "mac", nic.MAC, "mode", mode, "by", callerUsername(ctx))
+	after, aerr := corrosion.GetNICGuard(ctx, s.db, tgt.owner, tgt.nic.MAC)
+	s.audit(ctx, "nic.guard.set", tgt.display,
+		"mac="+tgt.nic.MAC+" "+corrosion.AuditChange(guardState(before, berr), guardState(after, aerr)), "ok")
+	slog.Info("NIC guard set", "nic", tgt.display, "mac", tgt.nic.MAC, "mode", mode, "by", callerUsername(ctx))
 	s.reconcileLocal(ctx)
 	subnets, _ := corrosion.NetworkSubnets(ctx, s.db)
-	return nicGuardToPb(vm.Name, nic, after, subnets), nil
+	out := nicGuardToPb(tgt.owner, tgt.nic, after, subnets)
+	if ct {
+		out.VmName, out.ContainerHost, out.ContainerName = "", req.GetContainerHost(), req.GetContainerName()
+	}
+	return out, nil
+}
+
+func (s *Server) pickVMTarget(ctx context.Context, vmName, mac, network string) (guardTarget, error) {
+	vm, err := corrosion.GetVM(ctx, s.db, vmName)
+	if err != nil {
+		return guardTarget{}, status.Errorf(codes.Unavailable, "look up vm %q: %v", vmName, err)
+	}
+	if vm == nil {
+		return guardTarget{}, status.Errorf(codes.NotFound, "vm %q not found", vmName)
+	}
+	nic, err := s.pickVMNIC(ctx, vm.Name, mac, network)
+	if err != nil {
+		return guardTarget{}, err
+	}
+	return guardTarget{owner: vm.Name, display: vm.Name, nic: nic}, nil
+}
+
+// pickContainerNIC resolves a container's managed NIC.
+func (s *Server) pickContainerNIC(ctx context.Context, host, name, mac, network string) (guardTarget, error) {
+	if host == "" {
+		return guardTarget{}, status.Error(codes.InvalidArgument, "container_host is required with container_name")
+	}
+	ifaces, err := corrosion.ListContainerInterfacesByHost(ctx, s.db, host)
+	if err != nil {
+		return guardTarget{}, status.Errorf(codes.Unavailable, "read container NICs on %s: %v", host, err)
+	}
+	var match []corrosion.ContainerInterfaceRecord
+	for _, i := range ifaces {
+		if i.CtName == name && ((mac != "" && strings.EqualFold(i.MAC, mac)) || (mac == "" && i.NetworkName == network)) {
+			match = append(match, i)
+		}
+	}
+	display := host + "/" + name
+	switch len(match) {
+	case 0:
+		return guardTarget{}, status.Errorf(codes.NotFound, "container %s has no managed NIC %s", display, nicSelector(mac, network))
+	case 1:
+	default:
+		return guardTarget{}, status.Errorf(codes.InvalidArgument,
+			"container %s has %d NICs on network %q; name one by --mac", display, len(match), network)
+	}
+	m := match[0]
+	return guardTarget{owner: corrosion.ContainerGuardOwner(host, name), display: "ct:" + display,
+		nic: corrosion.NICRecord{MAC: m.MAC, IP: m.IP, NetworkName: m.NetworkName, Ordinal: m.Ordinal}}, nil
 }
 
 // pickVMNIC resolves the NIC a request names: by MAC, or by network when the
@@ -297,8 +453,9 @@ func nicGuardToPb(vm string, n corrosion.NICRecord, rec *corrosion.NICGuardRecor
 	out.AllowedAddresses = rec.Allowed
 	out.AllowDhcpServer = rec.AllowDHCPServer
 	out.AllowRouterAdvertisement = rec.AllowRouterAdvert
+	out.AllowVlanTags = rec.AllowVLANTags
 	out.SetBy, out.UpdatedAt = rec.SetBy, rec.UpdatedAt
-	if g := firewall.ResolveNICGuard(rec, n.MAC, n.IP, subnets[n.NetworkName]); g != nil {
+	if g := firewall.ResolveNICGuard(rec, n.MAC, n.IP, subnets[n.NetworkName], nil); g != nil {
 		out.EffectiveIpv4, out.Ipv4Unrestricted = g.V4, g.V4 == nil
 		out.EffectiveIpv6, out.Ipv6Unrestricted = g.V6, g.V6 == nil
 	}

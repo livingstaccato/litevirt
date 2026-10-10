@@ -131,6 +131,13 @@ func ComputeCandidateIP(ctx context.Context, db *corrosion.Client, network, subn
 	for _, r := range rows {
 		used = append(used, r.String("ip"))
 	}
+	// An address a NIC row records without a lease — a VM NIC's DHCP
+	// reservation, a static address — is taken too.
+	assigned, err := corrosion.NetworkAssignedAddrs(ctx, db)
+	if err != nil {
+		return "", fmt.Errorf("query assigned addresses: %w", err)
+	}
+	used = append(used, assigned[network]...)
 	return nextFreeIP(subnet, used)
 }
 

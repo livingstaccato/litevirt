@@ -119,6 +119,14 @@ type DiskConfig struct {
 	// DiskDevName(Bus, index) — existing callers that never set this see no
 	// change in behavior.
 	TargetDev string
+	// Discard is the <driver discard=…> value: "unmap" passes the guest's TRIM
+	// down so thin storage reclaims space, "ignore" drops it, empty emits no
+	// attribute. DetectZeroes is <driver detect_zeroes=…> (off | on | unmap),
+	// empty = no attribute. IOTune is the <iotune> throttle; zero = none. All
+	// three apply to real disks only, never to a CD-ROM.
+	Discard      string
+	DetectZeroes string
+	IOTune       IOTune
 }
 
 // NetworkConfig describes a VM network interface.
@@ -128,6 +136,10 @@ type NetworkConfig struct {
 	MAC    string
 	VLAN   int    // 0 = untagged, 1–4094 = 802.1Q VLAN ID
 	Direct string // non-empty = macvtap direct attach to this interface (e.g. "bond0.206")
+	// Queues is the virtio-net multiqueue count: <driver name='vhost'
+	// queues='N'/>. Below 2 emits nothing (a single queue is the default). Only
+	// the virtio model takes it.
+	Queues int
 }
 
 // MachineTypeFromXML extracts the resolved <os><type machine="…"> value from a
@@ -429,9 +441,11 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 		disk := diskDevice{
 			Type:   diskType,
 			Device: "disk",
-			Driver: diskDriver{Name: "qemu", Type: driverType, Cache: d.Cache},
+			Driver: diskDriver{Name: "qemu", Type: driverType, Cache: d.Cache,
+				Discard: d.Discard, DetectZeroes: d.DetectZeroes},
 			Source: source,
 			Target: diskTarget{Dev: targetDev, Bus: d.Bus},
+			IOTune: d.IOTune.element(),
 		}
 		if d.Cache == "" {
 			disk.Driver.Cache = "writeback"
@@ -441,6 +455,8 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 			disk.Device = "cdrom"
 			disk.Type = "file"
 			disk.Driver.Type = "raw"
+			disk.Driver.Discard, disk.Driver.DetectZeroes = "", ""
+			disk.IOTune = nil
 			disk.Source = diskSource{File: d.Path}
 			disk.Target = diskTarget{Dev: fmt.Sprintf("sd%c", 'a'+i), Bus: "sata"}
 			disk.Readonly = &struct{}{}
@@ -529,6 +545,9 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 				Source: ifaceSource{Bridge: n.Bridge},
 				Model:  ifaceModel{Type: model},
 			}
+		}
+		if n.Queues >= 2 && model == "virtio" {
+			iface.Driver = &ifaceDriver{Name: "vhost", Queues: n.Queues}
 		}
 		dev.Interfaces = append(dev.Interfaces, iface)
 	}
@@ -929,14 +948,15 @@ type controllerDevice struct {
 }
 
 type diskDevice struct {
-	XMLName   xml.Name   `xml:"disk"`
-	Type      string     `xml:"type,attr"`
-	Device    string     `xml:"device,attr"`
-	Driver    diskDriver `xml:"driver,omitempty"`
-	Source    diskSource `xml:"source,omitempty"`
-	Target    diskTarget `xml:"target"`
-	BootOrder *bootOrder `xml:"boot,omitempty"`
-	Readonly  *struct{}  `xml:"readonly,omitempty"`
+	XMLName   xml.Name    `xml:"disk"`
+	Type      string      `xml:"type,attr"`
+	Device    string      `xml:"device,attr"`
+	Driver    diskDriver  `xml:"driver,omitempty"`
+	Source    diskSource  `xml:"source,omitempty"`
+	Target    diskTarget  `xml:"target"`
+	BootOrder *bootOrder  `xml:"boot,omitempty"`
+	Readonly  *struct{}   `xml:"readonly,omitempty"`
+	IOTune    *diskIOTune `xml:"iotune,omitempty"`
 }
 
 type bootOrder struct {
@@ -947,6 +967,9 @@ type diskDriver struct {
 	Name  string `xml:"name,attr,omitempty"`
 	Type  string `xml:"type,attr,omitempty"`
 	Cache string `xml:"cache,attr,omitempty"`
+	// Discard and DetectZeroes: see DiskConfig.
+	Discard      string `xml:"discard,attr,omitempty"`
+	DetectZeroes string `xml:"detect_zeroes,attr,omitempty"`
 }
 
 // diskSource carries the three shapes libvirt accepts, selected by the
@@ -974,11 +997,18 @@ type diskTarget struct {
 }
 
 type interfaceDevice struct {
-	XMLName xml.Name    `xml:"interface"`
-	Type    string      `xml:"type,attr"`
-	MAC     ifaceMAC    `xml:"mac"`
-	Source  ifaceSource `xml:"source"`
-	Model   ifaceModel  `xml:"model"`
+	XMLName xml.Name     `xml:"interface"`
+	Type    string       `xml:"type,attr"`
+	MAC     ifaceMAC     `xml:"mac"`
+	Source  ifaceSource  `xml:"source"`
+	Model   ifaceModel   `xml:"model"`
+	Driver  *ifaceDriver `xml:"driver,omitempty"`
+}
+
+// ifaceDriver is the NIC's <driver>: vhost with N queues for virtio multiqueue.
+type ifaceDriver struct {
+	Name   string `xml:"name,attr,omitempty"`
+	Queues int    `xml:"queues,attr,omitempty"`
 }
 
 type ifaceMAC struct {

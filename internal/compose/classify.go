@@ -109,6 +109,12 @@ type ChangePlan struct {
 	// the cluster network. The NIC keeps its MAC and the VM its disks; only the
 	// bridge it is plugged into changes, so it is applied in place (Max=Live).
 	NICRetargets []NICRetarget
+	// TuningRedefine marks a plan carrying disk discard / detect_zeroes or NIC
+	// queue changes: they bake into the domain XML (RestartReasons has each),
+	// and the reconfigure persists them into the stored spec before the
+	// redefine renders them. (A disk I/O throttle change is not one: it is
+	// applied live and rides MetadataChanges as "disk_io".)
+	TuningRedefine bool
 	// Delegated records changes owned by another path (load-balancer, backup,
 	// rolling-update strategy) — recorded, not silently ignored, and never a VM
 	// lifecycle action here.
@@ -247,6 +253,10 @@ func Classify(desired, stored *pb.VMSpec, storedDisks []StoredDisk) ChangePlan {
 	notReconfigurableIf(desired.EnableSpice != stored.EnableSpice, "graphics (spice) change needs a redefine")
 	notReconfigurableIf(desired.Resources != nil && !proto.Equal(desired.Resources, stored.Resources), "resource-tuning change needs a redefine")
 	notReconfigurableIf(len(desired.Devices) > 0 && !devicesEqual(desired.Devices, stored.Devices), "passthrough-device change needs a redefine")
+
+	// --- Disk and NIC tuning, matched by disk name / NIC position. An unset
+	// desired value inherits (the stored one may be a create-time default). ---
+	classifyTuning(desired, stored, &p)
 
 	// --- Recreate-class: identity fields (delete+create only); unset desired inherits ---
 	recreateIf := func(cond bool, reason string) {
@@ -441,4 +451,62 @@ func networkTopologyEqual(desired, stored []*pb.NetworkAttachment) bool {
 		}
 	}
 	return true
+}
+
+// classifyTuning diffs the per-disk and per-NIC tuning: discard, detect_zeroes
+// and NIC queues bake into the domain (restart-class); a disk's I/O throttle is
+// applied to the running VM (live, "disk_io"). A disk or NIC the stored spec
+// lacks is a topology change, which the recreate checks own.
+func classifyTuning(desired, stored *pb.VMSpec, p *ChangePlan) {
+	storedDisks := make(map[string]*pb.DiskSpec, len(stored.Disks))
+	for _, d := range stored.Disks {
+		if d != nil {
+			storedDisks[d.Name] = d
+		}
+	}
+	ioChanged := false
+	for _, dd := range desired.Disks {
+		if dd == nil {
+			continue
+		}
+		sd, ok := storedDisks[dd.Name]
+		if !ok {
+			continue
+		}
+		if dd.Discard != "" && dd.Discard != sd.Discard {
+			p.RestartReasons = append(p.RestartReasons,
+				fmt.Sprintf("disk %s discard %q→%q needs a redefine", dd.Name, sd.Discard, dd.Discard))
+			p.TuningRedefine = true
+		}
+		if dd.DetectZeroes != "" && dd.DetectZeroes != sd.DetectZeroes {
+			p.RestartReasons = append(p.RestartReasons,
+				fmt.Sprintf("disk %s detect_zeroes %q→%q needs a redefine", dd.Name, sd.DetectZeroes, dd.DetectZeroes))
+			p.TuningRedefine = true
+		}
+		if dd.Io != nil && IOTuneFromSpec(dd.Io) != IOTuneFromSpec(sd.Io) {
+			ioChanged = true
+		}
+	}
+	if ioChanged {
+		p.MetadataChanges = append(p.MetadataChanges, Delta{Field: "disk_io"})
+	}
+	for i, dn := range desired.Network {
+		if dn == nil || dn.Queues == 0 || i >= len(stored.Network) || stored.Network[i] == nil {
+			continue
+		}
+		if effectiveQueues(dn.Queues) != effectiveQueues(stored.Network[i].Queues) {
+			p.RestartReasons = append(p.RestartReasons,
+				fmt.Sprintf("nic %d queues %d→%d needs a redefine", i, effectiveQueues(stored.Network[i].Queues), effectiveQueues(dn.Queues)))
+			p.TuningRedefine = true
+		}
+	}
+}
+
+// effectiveQueues is what a stored queue count renders: below 2 is the single
+// default queue, which emits nothing.
+func effectiveQueues(q int32) int32 {
+	if q < 2 {
+		return 0
+	}
+	return q
 }

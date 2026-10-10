@@ -20,6 +20,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
@@ -1138,6 +1139,8 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 
 	// Define + start — skipped on a resume where the domain was already started by
 	// this proof (guarded above at the destroy step); persist below is idempotent.
+	compose.ApplyDiskTuning(diskCfg, &spec)
+	compose.ApplyNICTuningByPosition(netCfg, &spec)
 	if !started {
 		domXML, err := lv.GenerateDomainXML(lv.VMConfig{
 			Name: targetName, CPU: int(spec.Cpu), CPUMode: spec.CpuMode, CPUModel: spec.CpuModel,

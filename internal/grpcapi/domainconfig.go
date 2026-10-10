@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/compose"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 )
 
@@ -38,6 +39,10 @@ func baseDomainConfig(spec *pb.VMSpec, disks []lv.DiskConfig, nets []lv.NetworkC
 		Hostdevs:     hostdevs,
 		Boot:         spec.Boot,
 	}
+	// Disk discard / detect_zeroes / I/O throttle and NIC queues ride in the
+	// stored spec, so every render of the domain carries them.
+	compose.ApplyDiskTuning(cfg.Disks, spec)
+	compose.ApplyNICTuning(cfg.Networks, spec)
 	if r := spec.Resources; r != nil {
 		cfg.HugePages = r.Hugepages
 		cfg.IOThreads = int(r.IoThreads)

@@ -76,6 +76,7 @@ const (
 	LiteVirt_AttachDevice_FullMethodName               = "/litevirt.v1.LiteVirt/AttachDevice"
 	LiteVirt_DetachDevice_FullMethodName               = "/litevirt.v1.LiteVirt/DetachDevice"
 	LiteVirt_ResizeDisk_FullMethodName                 = "/litevirt.v1.LiteVirt/ResizeDisk"
+	LiteVirt_SetDiskIO_FullMethodName                  = "/litevirt.v1.LiteVirt/SetDiskIO"
 	LiteVirt_ProxyVNC_FullMethodName                   = "/litevirt.v1.LiteVirt/ProxyVNC"
 	LiteVirt_GetVMLogs_FullMethodName                  = "/litevirt.v1.LiteVirt/GetVMLogs"
 	LiteVirt_DeployStack_FullMethodName                = "/litevirt.v1.LiteVirt/DeployStack"
@@ -417,6 +418,8 @@ type LiteVirtClient interface {
 	AttachDevice(ctx context.Context, in *AttachDeviceRequest, opts ...grpc.CallOption) (*VM, error)
 	DetachDevice(ctx context.Context, in *DetachDeviceRequest, opts ...grpc.CallOption) (*VM, error)
 	ResizeDisk(ctx context.Context, in *ResizeDiskRequest, opts ...grpc.CallOption) (*VM, error)
+	// SetDiskIO throttles one disk's I/O (live on a running VM, persisted).
+	SetDiskIO(ctx context.Context, in *SetDiskIORequest, opts ...grpc.CallOption) (*VM, error)
 	ProxyVNC(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[VNCData, VNCData], error)
 	GetVMLogs(ctx context.Context, in *GetVMLogsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[VMLogChunk], error)
 	// ── Stacks ──
@@ -1510,6 +1513,16 @@ func (c *liteVirtClient) ResizeDisk(ctx context.Context, in *ResizeDiskRequest, 
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(VM)
 	err := c.cc.Invoke(ctx, LiteVirt_ResizeDisk_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) SetDiskIO(ctx context.Context, in *SetDiskIORequest, opts ...grpc.CallOption) (*VM, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(VM)
+	err := c.cc.Invoke(ctx, LiteVirt_SetDiskIO_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -4249,6 +4262,8 @@ type LiteVirtServer interface {
 	AttachDevice(context.Context, *AttachDeviceRequest) (*VM, error)
 	DetachDevice(context.Context, *DetachDeviceRequest) (*VM, error)
 	ResizeDisk(context.Context, *ResizeDiskRequest) (*VM, error)
+	// SetDiskIO throttles one disk's I/O (live on a running VM, persisted).
+	SetDiskIO(context.Context, *SetDiskIORequest) (*VM, error)
 	ProxyVNC(grpc.BidiStreamingServer[VNCData, VNCData]) error
 	GetVMLogs(*GetVMLogsRequest, grpc.ServerStreamingServer[VMLogChunk]) error
 	// ── Stacks ──
@@ -4919,6 +4934,9 @@ func (UnimplementedLiteVirtServer) DetachDevice(context.Context, *DetachDeviceRe
 }
 func (UnimplementedLiteVirtServer) ResizeDisk(context.Context, *ResizeDiskRequest) (*VM, error) {
 	return nil, status.Error(codes.Unimplemented, "method ResizeDisk not implemented")
+}
+func (UnimplementedLiteVirtServer) SetDiskIO(context.Context, *SetDiskIORequest) (*VM, error) {
+	return nil, status.Error(codes.Unimplemented, "method SetDiskIO not implemented")
 }
 func (UnimplementedLiteVirtServer) ProxyVNC(grpc.BidiStreamingServer[VNCData, VNCData]) error {
 	return status.Error(codes.Unimplemented, "method ProxyVNC not implemented")
@@ -6602,6 +6620,24 @@ func _LiteVirt_ResizeDisk_Handler(srv interface{}, ctx context.Context, dec func
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).ResizeDisk(ctx, req.(*ResizeDiskRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_SetDiskIO_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetDiskIORequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).SetDiskIO(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_SetDiskIO_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).SetDiskIO(ctx, req.(*SetDiskIORequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -10797,6 +10833,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ResizeDisk",
 			Handler:    _LiteVirt_ResizeDisk_Handler,
+		},
+		{
+			MethodName: "SetDiskIO",
+			Handler:    _LiteVirt_SetDiskIO_Handler,
 		},
 		{
 			MethodName: "ListStacks",

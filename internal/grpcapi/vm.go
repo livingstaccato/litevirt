@@ -107,6 +107,9 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	if err := validateSpecNames(spec); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
+	if err := validateSpecTuning(spec); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
 	if err := s.RequirePerm(ctx, vmRBACPathFor(spec.Project, spec.Name), "vm.create", "operator"); err != nil {
 		return nil, err
 	}
@@ -497,6 +500,13 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		}
 		createdDiskPaths = append(createdDiskPaths, diskPath)
 
+		// An unset discard becomes the storage type's default now, in the spec
+		// this create persists — so it is this VM's setting from here on.
+		// baseDomainConfig renders discard, detect_zeroes and the throttle from
+		// that spec.
+		if d.Discard == "" {
+			d.Discard = defaultDiscard(storageType, d.Bus)
+		}
 		diskConfigs = append(diskConfigs, lv.DiskConfig{
 			Name:  d.Name,
 			Path:  diskPath,
@@ -3946,7 +3956,7 @@ func isPureCPUGrowRequest(req *pb.UpdateVMRequest) bool {
 		req.GuestAgent == nil && req.MinMemoryMib == nil && req.MaxMemoryMib == nil &&
 		req.SecureBoot == nil && req.Tpm == nil && req.MaxCpu == nil &&
 		req.Restart == nil && req.Onboot == nil && req.StartupOrder == nil &&
-		req.StartDelaySec == nil && req.StopDelaySec == nil && !req.DisableVnc
+		req.StartDelaySec == nil && req.StopDelaySec == nil && !req.DisableVnc && !req.RedefineHardware
 }
 
 // liveGrowVCPU hot-adds vCPUs to a RUNNING VM in place (no stop). It is the pure
@@ -4040,7 +4050,7 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	redefine := req.Cpu > 0 || req.MemoryMib > 0 || req.CpuMode != "" || req.CpuModel != "" ||
 		req.Machine != "" || req.Firmware != "" ||
 		req.GuestAgent != nil || req.MinMemoryMib != nil || req.MaxMemoryMib != nil ||
-		req.SecureBoot != nil || req.Tpm != nil || req.MaxCpu != nil
+		req.SecureBoot != nil || req.Tpm != nil || req.MaxCpu != nil || req.RedefineHardware
 	// A cpu/memory(+bounds)/cpu-mode redefine can be applied by patching the
 	// inactive domain XML in place rather than regenerating it, so libvirt-assigned
 	// details (PCI slot addresses, controller models) survive — which matters for
@@ -4058,7 +4068,7 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	inPlaceEligible := redefine &&
 		req.Machine == "" && req.Firmware == "" &&
 		req.GuestAgent == nil && req.SecureBoot == nil && req.Tpm == nil &&
-		req.MaxCpu == nil && req.DisableVnc == origDisableVnc
+		req.MaxCpu == nil && req.DisableVnc == origDisableVnc && !req.RedefineHardware
 	restartAfter := false
 	repair := false // a VM in error or mid-transition, redefined and started (see below)
 	if redefine {

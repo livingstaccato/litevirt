@@ -214,8 +214,24 @@ lv update <vm> [--cpu N] [--memory N]        # resources — VM must be STOPPED
 lv rebuild <vm>                              # Recreate from stored spec
 lv cutover <vm>                              # Snapshot-and-replace update
 lv resize-disk <vm> --disk <name> --size <size>   # Grow a disk
+lv disk-io <vm> [--disk <name>] [--total-bps <rate>] [--read-bps <rate>] [--write-bps <rate>]
+            [--total-iops <n>] [--read-iops <n>] [--write-iops <n>]
+            [--read-bps-max <rate>] [--write-iops-max <n>] [--burst-seconds <n>] [--clear]
+                                             # Throttle a disk's I/O, live on a running VM
 lv stats <vm>                                # VM resource statistics
 ```
+
+`lv disk-io` sets one disk's I/O limits (default disk `root`): bytes per second
+(`--total-bps`, `--read-bps`, `--write-bps`, with a K/M/G suffix such as `50M`) and
+operations per second (`--total-iops`, `--read-iops`, `--write-iops`), each with a
+`-max` burst ceiling above the sustained rate and `--burst-seconds` for how long it
+lasts. A running VM is throttled live and its definition updated; the limits are kept
+in the VM's spec, so a restart, a failover start and a migration carry them. **Each call
+sets the complete set of limits for the disk**: one you do not name is unlimited
+afterwards, and `--clear` removes them all. A `--total-*` limit cannot be combined with
+the `--read-*` / `--write-*` of the same kind. The disk must be one in the VM's spec (not
+a hot-plugged one). The same limits are the `iotune:` key of a compose disk; see
+[compose.md](compose.md).
 
 `lv cutover <vm>` gives the `<vm>-next` replacement the original's name. The replaced
 VM is deleted first, and a delete is a SOFT delete, so its rows still hold the primary

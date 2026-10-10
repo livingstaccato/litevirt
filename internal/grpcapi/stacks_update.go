@@ -141,6 +141,14 @@ func (s *Server) reconfigureWithRestart(ctx context.Context, name string, desire
 		v := desired.Tpm
 		req.Tpm = &v
 	}
+	if plan.TuningRedefine {
+		// Discard, detect_zeroes and NIC queues are rendered from the stored
+		// spec: record them first, then have UpdateVM redefine from it.
+		if err := s.persistHardwareTuning(ctx, name, desired); err != nil {
+			return err
+		}
+		req.RedefineHardware = true
+	}
 	if _, err := s.UpdateVM(ctx, req); err != nil {
 		return fmt.Errorf("reconfigure with restart: %w", err)
 	}

@@ -548,6 +548,21 @@ func (v *validator) validate(f *File) {
 			}
 		}
 
+		// Disk and NIC tuning: refuse what libvirt would refuse at define time.
+		if !vm.IsContainer() {
+			for _, diskName := range sortedKeys(vm.Disks) {
+				ds := diskTuningSpec(vm.Disks[diskName])
+				if err := ValidateDiskTuning(ds); err != nil {
+					v.ps.add(p+".disks."+diskName, err.Error(), "")
+				}
+			}
+			for i, n := range vm.Network {
+				if err := ValidateQueues(n.Model, nicQueues(n.Queues, vm.CPU)); err != nil {
+					v.ps.add(fmt.Sprintf("%s.network[%d].queues", p, i), err.Error(), "")
+				}
+			}
+		}
+
 		// Replicas validation
 		if vm.Replicas != nil && *vm.Replicas < 0 {
 			v.ps.add(p+".replicas", "replicas must be >= 0", "")

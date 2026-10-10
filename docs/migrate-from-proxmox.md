@@ -127,6 +127,17 @@ lv import --from vma --server-path /srv/stage/vzdump-qemu-<vmid>-*.vma.zst \
           --name pilot-vm --net-map vmbr0=br0 --start
 ```
 
+`lv import` does not carry per-disk tuning. A Proxmox disk or NIC option you
+relied on is set in the compose file after the import (or with `lv disk-io`):
+
+| Proxmox (`qm set`) | litevirt |
+|---|---|
+| `scsi0: ...,discard=on` | `disks.<name>.discard: unmap` (the default for a new VM on local, ZFS, thin LVM, Ceph) |
+| `scsi0: ...,mbps_rd=100,mbps_wr=50` | `disks.<name>.iotune: { read_bytes_sec: 100M, write_bytes_sec: 50M }`, or `lv disk-io <vm> --read-bps 100M --write-bps 50M` |
+| `scsi0: ...,iops_rd=500,iops_wr=500` | `iotune: { read_iops_sec: 500, write_iops_sec: 500 }` |
+| `scsi0: ...,mbps_rd_max=200` | `iotune: { read_bytes_sec: 100M, read_bytes_sec_max: 200M }` |
+| `net0: virtio=...,queues=4` | `network[].queues: 4` (or `auto`) |
+
 ## Step 4 — Migrate one container
 
 OCI / LXC parity:

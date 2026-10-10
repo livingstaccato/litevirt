@@ -1086,6 +1086,12 @@ consistency is a planned follow-up.
 | Native send / receive (`replicate-volume`) | n/a | n/a | n/a | btrfs s/r | zfs s/r | rbd export/import | n/a | n/a |
 | HA-friendly cluster store | no | yes | depends | no (host-local) | no (host-local) | yes | yes | no |
 
+**Discard (TRIM).** A new VM's disk gets `discard=unmap` by default on `local`,
+`dir`, `btrfs`, `zfs`, `lvm-thin` and `ceph` (on a virtio, scsi or sata bus), so a
+guest's `fstrim` returns the space to the pool. It is not defaulted on `nfs` or `iscsi`,
+whose server may not support it, nor for an existing VM; set `discard:` on a compose
+disk to choose either way (see [compose.md](compose.md)).
+
 The **Snapshots** row describes each backend's *native* snapshot capability
 (what the driver could do). It is not the `lv snapshot create` code path: that
 command always goes through libvirt — an external qcow2 overlay for disk

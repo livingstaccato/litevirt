@@ -48,7 +48,7 @@ func init() {
 		// VM lifecycle and configuration.
 		"StartVM", "StopVM", "RestartVM", "DeleteVM", "RebuildVM", "CutoverVM",
 		"UpdateVM", "SetVMMemory", "SetVMLabels", "SetVMIP", "SetBootOrder",
-		"AttachDevice", "DetachDevice", "ResizeDisk", "CloneVM", "ConvertToTemplate",
+		"AttachDevice", "DetachDevice", "ResizeDisk", "SetDiskIO", "CloneVM", "ConvertToTemplate",
 		"AbortVMOperation",
 		// VM placement and storage movement.
 		"MigrateVM", "MoveVolume", "ReplicateVolume", "MigrateStackVolumes",

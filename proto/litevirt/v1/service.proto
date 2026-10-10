@@ -498,6 +498,10 @@ message UpdateVMRequest    { string name = 1; int32 cpu = 2;
     optional int32 max_cpu         = 20;  // set the vCPU hotplug ceiling (live_resize; latched)
     optional bool  allow_restart   = 21;  // permit a stop→redefine→start for a change that can't apply live
     string         cpu_model       = 23;  // CPU model for --cpu-mode custom; empty for any other mode
+    // redefine_hardware regenerates the domain from the stored spec's disk and
+    // NIC tuning (discard, detect_zeroes, queues) with no other change — the
+    // compose reconfigure persists the tuning first, then sets this.
+    bool           redefine_hardware = 30;
 
     // allow_overcommit skips HOST capacity admission for a --restart-if-needed
     // reconfigure that GROWS the VM (project quota still applies). Audited.
@@ -513,6 +517,13 @@ message SetVMMemoryRequest  { string name = 1; int32 target_mib = 2;
 message SetVMLabelsRequest  { string name = 1; map<string, string> labels = 2; }
 message ResizeDiskRequest  { string vm_name = 1; string disk_name = 2;
     string size = 3; }  // size: new total size e.g. "40G"
+
+// SetDiskIO replaces one disk's I/O throttle. A running VM is throttled live
+// and the persistent definition updated; the limits are stored in the VM's spec
+// so a restart, redefine or migration carries them. An empty limits message
+// clears every limit.
+message SetDiskIORequest { string vm_name = 1; string disk_name = 2;
+    DiskIOLimits limits = 3; }
 
 // ── VNC Proxy ──
 message VNCData { bytes data = 1; }
@@ -3372,6 +3383,8 @@ service LiteVirt {
     rpc AttachDevice(AttachDeviceRequest) returns (VM);
     rpc DetachDevice(DetachDeviceRequest) returns (VM);
     rpc ResizeDisk(ResizeDiskRequest)    returns (VM);
+    // SetDiskIO throttles one disk's I/O (live on a running VM, persisted).
+    rpc SetDiskIO(SetDiskIORequest)      returns (VM);
     rpc ProxyVNC(stream VNCData)         returns (stream VNCData);
     rpc GetVMLogs(GetVMLogsRequest)      returns (stream VMLogChunk);
 

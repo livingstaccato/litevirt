@@ -345,7 +345,49 @@ Supports `s` (seconds), `m` (minutes), `h` (hours). Defaults to 30 seconds if no
         storage: "nfs-volume"       # Reference a volume
         cluster_size: "2M"          # qcow2 cluster size (default 64K)
         refcount_bits: 16           # qcow2 refcount width (default 16)
+        discard: unmap              # unmap (or on) | ignore (or off); see below
+        detect_zeroes: unmap        # off | on | unmap (unmap needs discard unmap)
+        iotune:                     # I/O throttle, live-changeable; see below
+          read_bytes_sec: 100M
+          write_iops_sec: 2000
 ```
+
+### Discard (TRIM)
+
+`discard: unmap` passes the guest's TRIM down to the storage, so a thin
+backend (qcow2 on a filesystem, ZFS, thin LVM, Ceph RBD) gets back the space the
+guest freed; `ignore` drops it. **A new VM's disk with no `discard:` gets `unmap`
+on the local store, btrfs, ZFS, thin LVM and Ceph, on a virtio, scsi or sata bus**,
+and nothing on NFS or iSCSI (the server may not support hole-punching or UNMAP) or
+on an IDE disk. The default is written into the VM's spec when it is created: a VM
+created before it keeps rendering no discard, and applying a file that leaves
+`discard:` out never changes a disk. (The root disk a VM gets when `disks:` names
+none is not listed in the spec and gets no default; name it to set one.)
+`detect_zeroes: unmap` additionally turns a guest write of zeroes into a discard; it
+is off unless you set it, because it costs CPU on every write. Changing either on an
+existing VM needs a restart: the deploy reconfigures and restarts the same VM, disks
+kept. Run `fstrim` in the guest (most distributions schedule it weekly) to reclaim
+space it freed before the setting was on.
+
+### I/O limits
+
+`iotune:` throttles one disk (libvirt `<iotune>`). Rates are bytes per second (a
+number, or with a `K`, `M` or `G` suffix) and operations per second; unset or `0` is
+unlimited:
+
+| Key | Meaning |
+|---|---|
+| `total_bytes_sec`, `read_bytes_sec`, `write_bytes_sec` | sustained bytes per second |
+| `total_iops_sec`, `read_iops_sec`, `write_iops_sec` | sustained operations per second |
+| `total_bytes_sec_max`, `read_bytes_sec_max`, `write_bytes_sec_max`, `total_iops_sec_max`, `read_iops_sec_max`, `write_iops_sec_max` | burst ceiling above the sustained rate; needs it |
+| `burst_seconds` | how long a burst lasts (default 1) |
+
+A `total_*` key cannot be combined with the `read_*` / `write_*` of the same kind.
+Changing `iotune:` in the file throttles the **running** disk in place (no restart)
+and updates the definition; `iotune: {}` removes every limit. The same can be done
+without the file: [`lv disk-io`](cli-reference.md). The limits are kept in the VM's
+spec, so a restart, a failover start and a migration carry them. They apply to
+disks listed in the spec, not to one hot-plugged later.
 
 ## Networks
 
@@ -358,7 +400,15 @@ Supports `s` (seconds), `m` (minutes), `h` (hours). Defaults to 30 seconds if no
         gateway: "10.0.1.1"
         trunk: [100, 101]           # VLAN trunk mode
         security-groups: ["web"]    # Per-NIC firewall (see "Firewall" below)
+        queues: 4                   # virtio-net multiqueue (1-64, or auto)
 ```
+
+`queues:` gives a virtio NIC that many queue pairs (`<driver name='vhost'
+queues='N'/>`), so a guest with several vCPUs spreads network interrupts and
+packets across them. It is off unless set (one queue); `queues: auto` is one per
+vCPU up to 8, none for a single-vCPU guest. Only the virtio model takes it. Inside
+the guest, enable the queues with `ethtool -L <nic> combined N`. A change needs a
+restart: the deploy reconfigures and restarts the same VM, disks kept.
 
 IPv6 can be set either by putting a v6 address in the `ip`/`gateway` fields, or
 via the dedicated `ipv6:` / `ipv6-gateway:` fields (which also enable dual-stack

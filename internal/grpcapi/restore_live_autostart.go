@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/pbsstore"
@@ -281,6 +282,8 @@ func (s *Server) autoDefineRestoredVM(
 		Networks:    netCfg,
 		Boot:        spec.Boot,
 	}
+	compose.ApplyDiskTuning(vmCfg.Disks, spec)
+	compose.ApplyNICTuningByPosition(vmCfg.Networks, spec)
 	// Firmware fields (G1): point the domain at the just-materialized NVRAM
 	// (name-keyed) + the fresh UUID whose swtpm dir we re-homed the state into.
 	if fwVM {

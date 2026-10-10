@@ -112,13 +112,9 @@ func BuildVMSpec(instanceName, baseName string, vm *VMDef, f *File) (*pb.VMSpec,
 
 	for _, diskName := range diskNames {
 		disk := vm.Disks[diskName]
-		spec.Disks = append(spec.Disks, &pb.DiskSpec{
-			Name:    diskName,
-			Size:    disk.Size,
-			Bus:     disk.Bus,
-			Cache:   disk.Cache,
-			Storage: disk.Storage,
-		})
+		ds := diskTuningSpec(disk)
+		ds.Name, ds.Size, ds.Bus, ds.Cache, ds.Storage = diskName, disk.Size, disk.Bus, disk.Cache, disk.Storage
+		spec.Disks = append(spec.Disks, ds)
 	}
 
 	for _, n := range vm.Network {
@@ -144,6 +140,7 @@ func BuildVMSpec(instanceName, baseName string, vm *VMDef, f *File) (*pb.VMSpec,
 			Ipv6:           n.IPv6,
 			Ipv6Gateway:    n.IPv6Gateway,
 			SecurityGroups: n.SecurityGroups,
+			Queues:         nicQueues(n.Queues, vm.CPU),
 		})
 	}
 
@@ -409,4 +406,36 @@ func FindVMDef(f *File, instanceName string) (*VMDef, string) {
 		}
 	}
 	return nil, ""
+}
+
+// diskTuningSpec carries a compose disk's discard, detect_zeroes and throttle
+// into a DiskSpec (the caller fills in the identity fields). An unset key stays
+// unset; an `iotune: {}` becomes an empty message, which clears the limits.
+func diskTuningSpec(d DiskDef) *pb.DiskSpec {
+	ds := &pb.DiskSpec{
+		Discard:      NormalizeDiscard(d.Discard),
+		DetectZeroes: strings.ToLower(strings.TrimSpace(d.DetectZeroes)),
+	}
+	if t := d.IOTune; t != nil {
+		ds.Io = &pb.DiskIOLimits{
+			TotalBytesSec: int64(t.TotalBytesSec), ReadBytesSec: int64(t.ReadBytesSec), WriteBytesSec: int64(t.WriteBytesSec),
+			TotalIopsSec: t.TotalIopsSec, ReadIopsSec: t.ReadIopsSec, WriteIopsSec: t.WriteIopsSec,
+			TotalBytesSecMax: int64(t.TotalBytesSecMax), ReadBytesSecMax: int64(t.ReadBytesSecMax), WriteBytesSecMax: int64(t.WriteBytesSecMax),
+			TotalIopsSecMax: t.TotalIopsSecMax, ReadIopsSecMax: t.ReadIopsSecMax, WriteIopsSecMax: t.WriteIopsSecMax,
+			BurstSeconds: t.BurstSeconds,
+		}
+	}
+	return ds
+}
+
+// nicQueues resolves a NIC's queue setting: "auto" is one per vCPU up to 8
+// (the create default for cpu is the one CreateVM applies).
+func nicQueues(q NICQueues, cpu int) int32 {
+	if !q.Auto {
+		return q.N
+	}
+	if cpu == 0 {
+		cpu = DefaultVMCPU
+	}
+	return ResolveAutoQueues(cpu)
 }

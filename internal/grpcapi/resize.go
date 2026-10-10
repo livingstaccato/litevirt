@@ -417,6 +417,16 @@ func (s *Server) applyLiveMetadata(ctx context.Context, name string, desired *pb
 			}
 		}
 	}
+	// A disk's I/O throttle is applied to the running domain, which only its
+	// owner can do: SetDiskIO forwards there, throttles and records it in the
+	// spec itself, so it has nothing left for the spec patch below.
+	for _, f := range fields {
+		if f == "disk_io" {
+			if err := s.applyDesiredDiskIO(ctx, name, desired); err != nil {
+				return err
+			}
+		}
+	}
 	applied, _, err := corrosion.MutateDesiredSpec(ctx, s.db, name, func(old string) (string, error) {
 		fresh := &pb.VMSpec{}
 		if old != "" {
@@ -426,6 +436,8 @@ func (s *Server) applyLiveMetadata(ctx context.Context, name string, desired *pb
 		}
 		for _, f := range fields {
 			switch f {
+			case "disk_io":
+				// applied and recorded by applyDesiredDiskIO above
 			case "restart":
 				fresh.Restart = desired.Restart
 			case "onboot":

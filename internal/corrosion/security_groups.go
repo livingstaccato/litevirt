@@ -204,16 +204,29 @@ func ListSGRulesFor(ctx context.Context, c *Client, sg SecurityGroup, legacyByNa
 	return rules, nil
 }
 
-// DeleteLegacyNameRules tombstones the rules an older client stored with sg's
-// NAME in sg_id. They go with the group whether or not they were being applied:
-// a rule that was unattributable while two groups shared the name must not
-// become the survivor's the moment the other is deleted, and one that applied
-// must not attach to a later group of the same name. Fail closed.
-func DeleteLegacyNameRules(ctx context.Context, c *Client, sg SecurityGroup) error {
-	if sg.Name == "" || sg.Name == sg.ID {
-		return nil
+// DeleteSecurityGroupWithLegacyRules tombstones a group and the rules an older
+// client stored under its name in ONE transaction. Written separately, a failure
+// between the two would leave the group gone (a retry of `lv sg rm` then answers
+// NotFound) and its name-keyed rules stranded for a later group of that name to
+// adopt. They go whether or not they were being applied: a rule that was
+// unattributable while two groups shared the name must not become the
+// survivor's, and one that applied must not attach to a later group of the same
+// name (fail closed). The group's own id-keyed rules are removed by the caller first
+// (DeleteSGRules); the statements here are the existing tombstone shapes.
+func DeleteSecurityGroupWithLegacyRules(ctx context.Context, c *Client, sg SecurityGroup) error {
+	now := c.NowTS()
+	wall := nowRFC3339()
+	stmts := []Statement{{
+		SQL:    `UPDATE security_groups SET deleted_at = ?, updated_at = ? WHERE id = ?`,
+		Params: []interface{}{wall, now, sg.ID},
+	}}
+	if sg.Name != "" && sg.Name != sg.ID {
+		stmts = append(stmts, Statement{
+			SQL:    `UPDATE sg_rules SET deleted_at = ?, updated_at = ? WHERE sg_id = ?`,
+			Params: []interface{}{wall, now, sg.Name},
+		})
 	}
-	return DeleteSGRules(ctx, c, sg.Name)
+	return c.ExecuteBatch(ctx, stmts)
 }
 
 // DeleteSGRules tombstones all rules for a security group.

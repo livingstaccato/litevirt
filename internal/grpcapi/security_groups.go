@@ -154,22 +154,22 @@ func (s *Server) DeleteSecurityGroup(ctx context.Context, req *pb.DeleteSecurity
 	if err := corrosion.DeleteSGRules(ctx, s.db, req.Id); err != nil {
 		return nil, status.Errorf(codes.Internal, "delete security group rules: %v", err)
 	}
+	// The group and the rules an older client stored under its name are
+	// tombstoned in one transaction (see DeleteSecurityGroupWithLegacyRules for
+	// why they are always removed, and why together).
 	group, _ := corrosion.GetSecurityGroup(ctx, s.db, req.Id)
-	if err := corrosion.DeleteSecurityGroup(ctx, s.db, req.Id); err != nil {
-		// The rules are already gone, so the change is recorded even though
-		// the group row itself was not tombstoned.
-		s.audit(ctx, "sg.rm", req.Id, corrosion.AuditChange(before, corrosion.AuditUnknown(err)), "error")
-		s.reconcileLocal(ctx)
-		return nil, status.Errorf(codes.Internal, "delete security group: %v", err)
-	}
-	// Rules an older client stored under the group's name go with it, after the
-	// group itself (see DeleteLegacyNameRules for why they are always removed).
+	var derr error
 	if group != nil {
-		if err := corrosion.DeleteLegacyNameRules(ctx, s.db, *group); err != nil {
-			s.audit(ctx, "sg.rm", req.Id, corrosion.AuditChange(before, corrosion.AuditUnknown(err)), "error")
-			s.reconcileLocal(ctx)
-			return nil, status.Errorf(codes.Internal, "delete security group rules keyed by name: %v", err)
-		}
+		derr = corrosion.DeleteSecurityGroupWithLegacyRules(ctx, s.db, *group)
+	} else {
+		derr = corrosion.DeleteSecurityGroup(ctx, s.db, req.Id)
+	}
+	if derr != nil {
+		// The id-keyed rules are already gone, so the change is recorded even
+		// though the group row itself was not tombstoned.
+		s.audit(ctx, "sg.rm", req.Id, corrosion.AuditChange(before, corrosion.AuditUnknown(derr)), "error")
+		s.reconcileLocal(ctx)
+		return nil, status.Errorf(codes.Internal, "delete security group: %v", derr)
 	}
 	s.audit(ctx, "sg.rm", req.Id, corrosion.AuditChange(before, corrosion.AuditStateNone), "ok")
 	s.reconcileLocal(ctx)

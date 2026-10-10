@@ -320,10 +320,7 @@ func DeleteStackFirewall(ctx context.Context, c *Client, stack string) error {
 		if err := DeleteSGRules(ctx, c, sg.ID); err != nil {
 			return err
 		}
-		if err := DeleteSecurityGroup(ctx, c, sg.ID); err != nil {
-			return err
-		}
-		if err := DeleteLegacyNameRules(ctx, c, sg); err != nil {
+		if err := DeleteSecurityGroupWithLegacyRules(ctx, c, sg); err != nil {
 			return err
 		}
 	}

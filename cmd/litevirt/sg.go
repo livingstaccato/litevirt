@@ -261,7 +261,7 @@ func warnUnattributedRules(cmd *cobra.Command, resp *pb.ListSecurityGroupsRespon
 	for _, r := range resp.GetRules() {
 		if !ids[r.GetSgId()] {
 			fmt.Fprintf(cmd.ErrOrStderr(), "warning: rule %s is keyed by %q, a name more than one security group holds; it is applied to none. "+
-				"Remove it with `lv sg rule-rm %s` and re-add it by group id.\n", r.GetId(), r.GetSgId(), r.GetId())
+				"Remove it with `lv sg rule-rm %s` and re-add it by group id (the groups holding the name are listed by `lv sg ls`).\n", r.GetId(), r.GetSgId(), r.GetId())
 		}
 	}
 }

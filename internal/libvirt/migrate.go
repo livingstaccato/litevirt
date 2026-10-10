@@ -32,6 +32,11 @@ type MigrateParams struct {
 	// sources; libvirt allows a disk's source to change in it. Empty: the
 	// domain migrates as it is.
 	CDROMSources map[string]string
+	// RBDLocators names, for each rbd disk (by its source name, "pool/image"),
+	// the disk's recorded locator: the destination definition carries the
+	// monitors that locator resolves to NOW (its pool's current mon_host or
+	// conf), not the ones the running domain was defined with.
+	RBDLocators map[string]string
 	// DestXML and PersistXML are the definitions MigrateToTarget builds from
 	// CDROMSources; callers leave them empty.
 	DestXML    string
@@ -54,7 +59,7 @@ func (c *Client) MigrateToTarget(name, dconnuri string, p MigrateParams) error {
 		_ = c.virt.DomainMigrateSetMaxDowntime(dom, uint64(p.MaxDowntimeMS), 0)
 	}
 
-	if len(p.CDROMSources) > 0 {
+	if len(p.CDROMSources) > 0 || len(p.RBDLocators) > 0 {
 		live, err := c.virt.DomainGetXMLDesc(dom, golibvirt.DomainXMLSecure|golibvirt.DomainXMLMigratable)
 		if err != nil {
 			return fmt.Errorf("get migratable XML for %q: %w", name, err)
@@ -63,7 +68,7 @@ func (c *Client) MigrateToTarget(name, dconnuri string, p MigrateParams) error {
 		if err != nil {
 			return fmt.Errorf("get persistent migratable XML for %q: %w", name, err)
 		}
-		if p.DestXML, p.PersistXML, err = MigrationCDROMXML(live, persist, p.CDROMSources); err != nil {
+		if p.DestXML, p.PersistXML, err = MigrationDomainXML(live, persist, p); err != nil {
 			return fmt.Errorf("domain %q: %w", name, err)
 		}
 	}
@@ -218,4 +223,40 @@ func (c *Client) AbortMigration(name string) error {
 		return fmt.Errorf("lookup domain %q: %w", name, err)
 	}
 	return c.virt.DomainAbortJob(dom)
+}
+
+// MigrationDomainXML builds the destination and persistent definitions a
+// migration hands libvirt: CD-ROMs pointed at the files the destination
+// resolved (CDROMSources), and every rbd disk named in RBDLocators given the
+// monitors its locator resolves to now — its pool's current mon_host or conf
+// on this host — in place of the ones the running domain was defined with,
+// which a monitor re-address may have retired. Both empty: "" (the domain
+// migrates as it is).
+func MigrationDomainXML(live, persist string, p MigrateParams) (dest, persistOut string, err error) {
+	if len(p.CDROMSources) == 0 && len(p.RBDLocators) == 0 {
+		return "", "", nil
+	}
+	dest, persistOut = live, persist
+	if len(p.CDROMSources) > 0 {
+		if dest, persistOut, err = MigrationCDROMXML(live, persist, p.CDROMSources); err != nil {
+			return "", "", err
+		}
+	}
+	if len(p.RBDLocators) > 0 {
+		hosts := make(map[string][]diskSourceHost, len(p.RBDLocators))
+		for name, loc := range p.RBDLocators {
+			_, src, _, berr := diskBacking(loc)
+			if berr != nil {
+				return "", "", fmt.Errorf("rbd disk %s: %w", name, berr)
+			}
+			hosts[name] = src.Hosts
+		}
+		if dest, err = RewriteRBDHosts(dest, hosts); err != nil {
+			return "", "", err
+		}
+		if persistOut, err = RewriteRBDHosts(persistOut, hosts); err != nil {
+			return "", "", err
+		}
+	}
+	return dest, persistOut, nil
 }

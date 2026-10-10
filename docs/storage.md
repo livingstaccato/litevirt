@@ -888,6 +888,179 @@ none older than 30 days; copy out a spec you still need.
   it is: the target judges what it would open, and refuses a pool ISO it
   cannot resolve there.
 
+## Ceph RBD pools
+
+A `ceph` pool puts VM disks in an RBD pool of an existing Ceph cluster (one
+litevirt deployed with `lv host ceph`, or any other). Every host that runs
+the pool's VMs authenticates with a **restricted client key** — never
+`client.admin`, and no admin keyring on any node.
+
+### Setting one up
+
+On the Ceph cluster, create the RBD pool and a client that can use only it:
+
+```bash
+ceph osd pool create lv
+rbd pool init lv
+ceph auth get-or-create client.litevirt mon 'profile rbd' osd 'profile rbd pool=lv' \
+    > ceph.client.litevirt.keyring
+```
+
+On every litevirt host, install the client tools and the qemu RBD driver
+(`ceph-common` and, on Debian/Ubuntu, `qemu-block-extra`), copy the cluster's
+`/etc/ceph/ceph.conf`, and install the keyring as
+`/etc/ceph/ceph.client.litevirt.keyring`, mode 0600, **at the same path on
+every host. Then create the pool, under the same name, on each host:
+
+```bash
+lv pool create ceph --driver ceph --source lv --host host-a \
+    --option id=litevirt \
+    --option conf=/etc/ceph/ceph.conf \
+    --option keyring=/etc/ceph/ceph.client.litevirt.keyring
+```
+
+`--option id=` is the client name without `client.`; a keyring with no id is
+`client.admin`'s, as for the `rbd` CLI. With an id and no `keyring` option,
+`/etc/ceph/ceph.client.<id>.keyring` is used when it exists. `--option
+mon_host=` lists the monitors explicitly; otherwise they are read from the
+conf's `mon_host` (cephadm's `[v2:…,v1:…]` form is understood, and the v1
+address is used). A conf other than `/etc/ceph/ceph.conf` must name
+`mon_host`, or a VM disk on the pool is refused: qemu reads only the default
+conf by itself. A conf or keyring path may not contain `:`, `\`, `;` or `=`.
+
+### How a VM disk authenticates
+
+qemu opens an RBD disk itself, and a libvirt domain cannot name a keyring
+file. So for each ceph pool on a host, the daemon defines a **libvirt ceph
+secret** holding the pool's client's key, read from the keyring the host's
+pool names:
+
+- The secret's UUID is derived from the pool's name and the client id
+  (UUIDv5) — not from the keyring's path — so every host with the pool names
+  the same secret, wherever it keeps the keyring. Its usage name is
+  `litevirt/ceph/<uuid>`.
+- It is **ephemeral** (never written under `/etc/libvirt`) and **private**
+  (libvirt will not hand the value back). The key never appears in a log, an
+  event or an error.
+- It is defined when the pool is created, when the daemon starts, every 30
+  seconds after (a secret libvirtd lost on a restart is put back, and a value
+  is re-set when the keyring on disk changed), before every start of a VM with
+  a ceph disk (including failover restarts and promotes), and on a live
+  migration's target when the source prepares it — the target refuses the
+  migration, with the reason, if it cannot.
+- It is removed once no ceph pool on the host and no disk recorded on the host
+  uses it — not while a disk still does, even after its pool was deleted; such
+  a disk's secret is defined from the keyring its own recorded path names.
+
+**Every host's keyring must hold the same key.** Each host records a short
+fingerprint of its key (one-way, `ceph_key_fp`) on its own row of the pool.
+A host whose key differs from another host's raises the degraded condition
+`ceph_keyring_mismatch` (see [diagnostics.md](diagnostics.md)), naming the
+host. It is a diagnostic: rows of hosts that are down, removed or mid key
+rotation cannot vouch for anyone, so no start is refused by it. Instead every
+start of a VM with a ceph disk (failover restarts included) first proves the
+host's own key with `rbd info` on each disk as the pool's client, and refuses
+with the reason — permission denied, or the image not in the cluster the
+host's pool reaches — rather than libvirt's. A live migration onto a host
+whose recorded key differs from the source host's is refused before libvirt
+is asked.
+
+Each disk's domain definition is a network disk with the monitors as `<host>`
+elements and an `<auth username='litevirt'>` naming that secret:
+
+```xml
+<disk type='network' device='disk'>
+  <driver name='qemu' type='raw'/>
+  <source protocol='rbd' name='lv/web-1-root'>
+    <host name='10.78.0.22' port='6789'/>
+    <auth username='litevirt'>
+      <secret type='ceph' uuid='…'/>
+    </auth>
+  </source>
+  <target dev='vda' bus='virtio'/>
+</disk>
+```
+
+The disk's recorded path (`rbd:lv/web-1-root:id=litevirt:keyring=…:conf=…:lvpool=ceph`)
+names the image, the client and the litevirt pool. The **monitors are looked
+up each time the domain is defined** (a create, a start, a failover restart):
+from the pool on that host — its `mon_host` option, else its conf's — so after
+the monitors are re-addressed, updating `/etc/ceph/ceph.conf` (or the pool's
+`mon_host`) on the hosts is all a stopped VM needs to start. Only a pool with
+a `mon_host` option also writes that list into the path, as the fallback for
+a host that does not have the pool. A running VM keeps working (librbd
+follows the cluster's monitor map), and a live migration hands the
+destination the monitors its pool resolves to at that moment, not the ones the
+running domain was defined with, so a re-addressed cluster's VMs migrate
+without a restart.
+
+A pool with neither an id nor a keyring gives its disks no `<auth>`: qemu
+then uses Ceph's own defaults, which means `client.admin` and its keyring on
+every host. That is how such pools behaved before and is not recommended.
+
+### Disks
+
+- **Data disks** are `rbd create --image-feature layering` images of the
+  requested size, named `<vm>-<disk>`.
+- **Root disks from an image.** The image is fetched into the host's image
+  store by name, as for any pool (auto-pulled from a peer when missing), then
+  imported into the RBD pool **once per image content**: converted to raw,
+  `rbd import`ed as `lvimage+<image>+<sha256 prefix>`, given a protected
+  snapshot `@base`. Each VM's root disk is an `rbd clone` of that snapshot
+  (copy-on-write, as Proxmox does for templates on RBD), grown to the size
+  asked for (never shrunk). Concurrent imports of the same image on several
+  hosts are safe: each imports under a private name and only one rename wins.
+  A refreshed image has a new digest and becomes a new base; the old base
+  stays while clones of it exist.
+- **A failed create** removes every RBD image it created, whatever step failed.
+- **Clone** (`lv clone`) copies a ceph disk inside its pool with `rbd deep cp`
+  — nothing passes through the host, and a root disk's copy stays a clone of
+  the same base. The copy lands in the same pool, which the clone's project
+  must be allowed to use. `--mode linked` is refused for a VM with a ceph disk
+  (there is no file a qcow2 overlay could back on); auto mode copies.
+- **Delete** (`lv rm`) removes the VM's own images. It never removes an
+  imported base (`lvimage+…`), an image outside the pool, one that has
+  snapshots (rbd refuses, so a clone made from one is never orphaned), or one
+  another VM's disk row still names. An image already gone is not an error —
+  but only once the pool itself answers: a delete that cannot reach the
+  cluster (a missing keyring or conf) fails instead of reporting success.
+- **Clone copies** are made under a private staging name and renamed into
+  place, so a failed clone removes only its own copy, never an image that
+  already had the destination's name.
+- **Not supported on ceph disks yet**: `lv resize-disk`, `lv snapshot create`
+  and `lv backup snapshot` refuse a ceph disk up front with that reason.
+
+Unused bases are not removed automatically. To reclaim one, check that it has
+no clones and then remove it by hand:
+
+```bash
+rbd --id litevirt children --all lv/lvimage+cirros+0123456789abcdef@base   # must print nothing (--all includes clones in the trash)
+rbd --id litevirt snap unprotect lv/lvimage+cirros+0123456789abcdef@base
+rbd --id litevirt snap purge lv/lvimage+cirros+0123456789abcdef
+rbd --id litevirt rm lv/lvimage+cirros+0123456789abcdef
+```
+
+### Live migration
+
+A ceph disk is shared storage: a live migration moves only the guest's
+memory. The source always asks the target to prepare first (`EnsureDisks`):
+the target defines the secret the incoming domain names — the pool's, so the
+target needs a ceph pool of the **same name** and client — from its own
+keyring, proves that key opens each disk (`rbd info`), and refuses the
+migration with the reason when it cannot read its keyring, the key does not
+open the disk, its recorded key differs from the source's, or the disk's
+storage name is a different pool there. A target that does not have the pool
+at all serves the disk from the client and keyring the disk's recorded path
+names — if that keyring is readable there and opens the disk — and refuses
+otherwise; a target that cannot read its own pool list refuses. An older
+target build does not do this: the migration then fails when the target's qemu
+opens the disk, and the VM keeps running on the source.
+
+**Rolling upgrades.** A host on a build before ceph VM disks cannot start or
+receive one: a failover onto it parks the VM in `error` (it refuses, rather
+than rebuilding the disk), and a migration onto it fails with the VM left on
+the source. Upgrade every host before relying on ceph HA.
+
 ## Compose example
 
 ```yaml

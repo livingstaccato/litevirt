@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
@@ -24,6 +25,7 @@ import (
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/qcow2"
+	"github.com/litevirt/litevirt/internal/storage"
 	"github.com/litevirt/litevirt/internal/tenancy"
 )
 
@@ -185,6 +187,21 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 	defer lease.release(ctx)
 
 	mode, modeWhy := s.cloneModeFor(ctx, req.Mode, srcDisks)
+	// A ceph disk is copied inside its pool (rbd deep cp); there is no file a
+	// linked clone's qcow2 overlay could back on.
+	for _, d := range srcDisks {
+		if mode == "linked" && isRBDDisk(d) {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"disk %s of %q is on ceph, which has no linked clone; clone it with --mode full (an rbd copy inside the pool)", d.DiskName, req.Source)
+		}
+		// The copy lands in the source disk's pool, which the clone's project
+		// must be allowed to use.
+		if isRBDDisk(d) {
+			if err := s.admitPoolAttach(ctx, project, s.hostName, d.StorageVolume); err != nil {
+				return nil, err
+			}
+		}
+	}
 	// Said to the caller (lv clone prints it), as auto may pick either.
 	_ = grpc.SetHeader(ctx, metadata.Pairs(CloneModeHeader, mode+": "+modeWhy))
 
@@ -200,14 +217,47 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 	var diskConfigs []lv.DiskConfig
 	var diskRecords []corrosion.DiskRecord
 	var created []string
+	createdBy := map[string]storage.Driver{} // an rbd copy is removed by its driver
 	cleanup := func() {
 		for _, p := range created {
+			if drv := createdBy[p]; drv != nil {
+				rmCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
+				if e := drv.DeleteDisk(rmCtx, p); e != nil {
+					slog.Warn("clone cleanup: remove disk", "path", p, "error", e)
+				}
+				cancel()
+				continue
+			}
 			if e := os.Remove(p); e != nil && !os.IsNotExist(e) {
 				slog.Warn("clone cleanup: remove disk", "path", p, "error", e)
 			}
 		}
 	}
 	for _, d := range srcDisks {
+		if isRBDDisk(d) {
+			// Copied inside the pool, never through this host.
+			bus, controller := "virtio", ""
+			if ds := diskSpecByName[d.DiskName]; ds != nil {
+				if ds.Bus != "" {
+					bus = ds.Bus
+				}
+				controller = ds.ControllerModel
+			}
+			clonePath, drv, cerr := s.cloneCephDisk(ctx, src.StackName, d, req.Target)
+			if cerr != nil {
+				cleanup()
+				return nil, cerr
+			}
+			created = append(created, clonePath)
+			createdBy[clonePath] = drv
+			diskConfigs = append(diskConfigs, lv.DiskConfig{Name: d.DiskName, Path: clonePath, Bus: bus, ControllerModel: controller})
+			diskRecords = append(diskRecords, corrosion.DiskRecord{
+				VMName: req.Target, DiskName: d.DiskName, HostName: s.hostName, Path: clonePath,
+				SizeBytes: d.SizeBytes, StorageType: "ceph", StorageVolume: d.StorageVolume,
+				TargetDev: lv.DiskDevName(bus, len(diskRecords)), Bus: bus,
+			})
+			continue
+		}
 		clonePath, err := s.images.SafeDiskPath(req.Target, d.DiskName)
 		if err != nil {
 			cleanup()
@@ -600,6 +650,11 @@ func (s *Server) cloneModeFor(ctx context.Context, requested string, disks []cor
 		return "full", "auto: the source has no disks to link to"
 	}
 	for _, d := range disks {
+		if isRBDDisk(d) {
+			return "full", fmt.Sprintf("auto: disk %s is on ceph, so it is copied inside its pool (rbd deep cp)", d.DiskName)
+		}
+	}
+	for _, d := range disks {
 		if !s.sharedAsOnMain(ctx, d, 0) {
 			return "full", fmt.Sprintf("auto: disk %s is on host-local storage, so a full copy keeps the clone independent of its source's host", d.DiskName)
 		}
@@ -663,4 +718,39 @@ func cloneDiskErr(what, disk string, err error) error {
 		return status.Errorf(codes.FailedPrecondition, "%s %s: %v — choose another target name", what, disk, err)
 	}
 	return status.Errorf(codes.Internal, "%s %s: %v", what, disk, err)
+}
+
+// isRBDDisk reports whether a disk is an rbd image on a ceph pool.
+func isRBDDisk(d corrosion.DiskRecord) bool { return strings.HasPrefix(d.Path, "rbd:") }
+
+// cloneCephDisk copies a ceph disk of a VM into a new image of the clone
+// target in the same pool, with the pool's driver (rbd deep cp), and returns
+// the copy's locator and the driver that removes it on a rollback.
+func (s *Server) cloneCephDisk(ctx context.Context, stackName string, d corrosion.DiskRecord, target string) (string, storage.Driver, error) {
+	if d.StorageVolume == "" {
+		return "", nil, status.Errorf(codes.FailedPrecondition, "disk %s (%s) names no ceph pool to copy it in", d.DiskName, d.Path)
+	}
+	cfg, err := s.resolveVolume(ctx, stackName, d.StorageVolume)
+	if err != nil {
+		return "", nil, status.Errorf(codes.FailedPrecondition, "disk %s: storage %q: %v", d.DiskName, d.StorageVolume, err)
+	}
+	if !strings.EqualFold(cfg.Driver, "ceph") {
+		return "", nil, status.Errorf(codes.FailedPrecondition, "disk %s: storage %q is not a ceph pool", d.DiskName, d.StorageVolume)
+	}
+	if _, err := s.ensureCephSecret(cfg); err != nil {
+		return "", nil, status.Errorf(codes.FailedPrecondition, "disk %s: %v", d.DiskName, err)
+	}
+	drv, err := storage.New(s.dataDir, cfg)
+	if err != nil {
+		return "", nil, status.Errorf(codes.Internal, "storage driver %q: %v", d.StorageVolume, err)
+	}
+	cloner := storage.AsDiskCloner(drv)
+	if cloner == nil {
+		return "", nil, status.Errorf(codes.Internal, "storage %q cannot copy a disk", d.StorageVolume)
+	}
+	p, err := cloner.CloneDisk(ctx, d.Path, storage.DiskOptions{VMName: target, DiskName: d.DiskName, SizeBytes: d.SizeBytes})
+	if err != nil {
+		return "", nil, cloneDiskErr("ceph clone disk", d.DiskName, err)
+	}
+	return p, drv, nil
 }

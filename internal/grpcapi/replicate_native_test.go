@@ -140,7 +140,7 @@ func TestReplicateVolume_NativeCephWorksIntoAFreshImage(t *testing.T) {
 		}
 		if rest, ok := strings.CutPrefix(c, "rbd import -- - "); ok {
 			incoming = rest
-			if !strings.HasPrefix(rest, dst+".litevirt-incoming-") {
+			if !strings.HasPrefix(rest, dst+"+litevirt-incoming-") {
 				t.Errorf("import argv %q, want a fresh name beside %q", c, dst)
 			}
 		}

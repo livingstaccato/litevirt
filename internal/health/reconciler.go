@@ -1545,8 +1545,11 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 				return
 			}
 		}
-		// Verify disk file exists on this host.
-		if _, err := os.Stat(d.Path); err != nil {
+		// Verify disk file exists on this host. An rbd disk is no file: it is
+		// in the cluster, not on a host, and is never rebuilt here — an
+		// overlay "recreated" in its place would boot the VM on a blank copy
+		// of its image.
+		if _, err := os.Stat(d.Path); err != nil && !isNetworkDiskPath(d.Path) {
 			if !transfer {
 				// A local start of a VM whose disk is gone: never rebuilt
 				// blank (missing_disk.go).

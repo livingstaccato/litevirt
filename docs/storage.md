@@ -922,14 +922,15 @@ Move a VM's disk to a different pool on the same host:
 lv move-volume web-1 root warm --delete-source
 ```
 
-**Stopped VMs** — `qemu-img convert` from source to destination, then the inactive
+**Shut-off VMs** — `qemu-img convert` (without `-U`, so a VM that is in fact still
+running fails the copy on qemu's image lock) from source to destination, then the inactive
 libvirt domain's disk source is repointed and the disk record is updated in a single
 atomic write (host, path, driver, and pool together). The redefine happens *before*
 the DB commit, so a mid-move failure rolls back cleanly; if a prior attempt already
 repointed the domain at the destination, the copy is skipped so a newer destination is
 never clobbered.
 
-**Running VMs** — libvirt `BlockCopy` mirrors writes into the destination while the VM
+**Running, paused or otherwise not shut-off VMs** — libvirt `BlockCopy` mirrors writes into the destination while the VM
 keeps running. The persistent domain config and the disk record are moved to the
 destination **before** the `BlockJobAbort PIVOT` that swaps the live disk — the pivot is
 the irreversible commit, so durable state never lags behind a pivoted guest and no
@@ -937,11 +938,12 @@ acknowledged write is lost. Operator-visible downtime: zero. The orchestrator
 preallocates the destination, polls progress every ~250 ms, and cancels/rolls back on
 context-cancel or pivot failure.
 
-> **Note:** `lv replicate-volume`'s copy step uses `qemu-img convert`, which
-> needs the source disk quiescent — replicate a **stopped** VM (or a disk no
-> running VM holds open), otherwise the convert fails on the disk lock. Online
-> `move-volume` has no such restriction: it mirrors via libvirt `BlockCopy`
-> while the VM keeps running.
+> **Note:** `lv replicate-volume` copies a shut-off VM's disk plainly and a
+> running or paused one point-in-time — through a full backup session, or an
+> external disk-only snapshot committed back afterwards. Only when neither can
+> be made does it fall back to `qemu-img convert -U`, and its final status says
+> that copy is NOT point-in-time. See [Backups](backups.md), "How a full replica
+> is copied".
 
 Both paths support file-based pools (local / nfs / dir / btrfs).
 Block backends use Replication below.
@@ -969,8 +971,8 @@ lv stack migrate-volumes postgres --to fast --dry-run
 ```
 
 - **Online by default** — running VMs migrate via blockdev-mirror (no
-  downtime); stopped VMs use the offline convert path. The choice is per VM,
-  based on its state.
+  downtime); shut-off VMs use the offline convert path. The choice is per VM,
+  based on its state as libvirt reports it (a paused VM is mirrored).
 - **Rolling** — `--parallel 1` (default) migrates one VM at a time and
   health-gates between VMs; raise `--parallel N` for stateless stacks. Use
   `--order replica-1,replica-2,primary` to fix the sequence.

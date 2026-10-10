@@ -1408,6 +1408,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// nil-safe: if BeginBackup fails, BackupSnapshot falls back to a full
 	// container backup.
 	svc.SetBackupSource(grpcapi.NewLibvirtBackupSource(d.virt))
+	// Point-in-time copies fall back to an external disk-only snapshot when
+	// no backup session opens (grpcapi/pit_copy.go, layer 2).
+	svc.SetPointInTimeSnapshotter(d.virt)
 
 	// wire the WebAuthn second-factor engine. Empty
 	// rp_id disables — the gRPC handlers then return Unimplemented

@@ -27,15 +27,19 @@ import (
 // the VM over. The source remains the VM's authoritative disk; the
 // target receives a point-in-time copy suitable for off-site DR.
 //
-//   - File-based pools (local, nfs, dir, btrfs) get a qemu-img copy into a
-//     new daemon-named file (convertImage: format named, input pre-checked).
+//   - File-based pools (local, nfs, dir, btrfs) get a copy into a new
+//     daemon-named file by copyVMDiskConsistent (pit_copy.go): a plain copy
+//     of a shut-off disk; for a running or paused one a full backup session,
+//     else an external disk-only snapshot whose frozen base is copied and then
+//     committed back — both point-in-time and crash-consistent (quiesced when
+//     the guest agent answers the snapshot). Only when neither can be made is
+//     it main's qemu-img convert -U copy, which is NOT point-in-time: the
+//     final status, an event and a notification say so.
 //   - zfs→zfs and ceph→ceph use native send/receive into a new daemon-named
 //     dataset or image (replicateVolumeNative), never an existing one.
 //   - btrfs→btrfs sends a standalone disk alone in its own subvolume with
 //     btrfs send | receive, and places it as that same new file
 //     (replicateBtrfsNative); anything else takes the qemu-img copy.
-//   - Crash-consistent: we don't quiesce the guest. For application
-//     consistency the operator should snapshot the VM first.
 //   - Full copy every call.
 func (s *Server) ReplicateVolume(req *pb.ReplicateVolumeRequest, stream grpc.ServerStreamingServer[pb.ReplicateVolumeProgress]) error {
 	ctx := stream.Context()
@@ -159,7 +163,7 @@ func (s *Server) ReplicateVolume(req *pb.ReplicateVolumeRequest, stream grpc.Ser
 
 	if err := send(&pb.ReplicateVolumeProgress{
 		Phase:  pb.ReplicateVolumeProgress_SNAPSHOT,
-		Status: "skipping in-guest quiesce; copy is crash-consistent",
+		Status: "point-in-time copy: a plain copy of a shut-off disk, else a backup session, else an external snapshot",
 	}); err != nil {
 		return err
 	}
@@ -177,8 +181,9 @@ func (s *Server) ReplicateVolume(req *pb.ReplicateVolumeRequest, stream grpc.Ser
 	if err != nil {
 		return err
 	}
+	res := copyResult{method: copyPlain}
 	if !native {
-		if err := s.copyNoClobber(ctx, src, dstPath, emit); err != nil {
+		if res, err = s.copyNoClobberConsistent(ctx, vm, src, dstPath, emit); err != nil {
 			return err
 		}
 	}
@@ -204,7 +209,11 @@ func (s *Server) ReplicateVolume(req *pb.ReplicateVolumeRequest, stream grpc.Ser
 	}
 
 	s.recordVMEvent(ctx, req.VmName, "disk.replicated", "ok",
-		fmt.Sprintf("%s → %s", req.DiskName, req.TargetPool))
+		fmt.Sprintf("%s → %s; %s", req.DiskName, req.TargetPool, res.method))
+	if !res.method.pointInTime() {
+		s.reportNotPointInTime(ctx, vm, src, "copy "+dstPath, res.why)
+		done += " — this copy is NOT point-in-time (no backup session or external snapshot could be made; copied with qemu-img convert -U): " + res.why
+	}
 	return send(&pb.ReplicateVolumeProgress{
 		Phase:       pb.ReplicateVolumeProgress_DONE,
 		Status:      done,

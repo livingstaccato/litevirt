@@ -68,6 +68,12 @@ type replicaRecord struct {
 	File     string `json:"file"`
 	Format   string `json:"format"`
 	Taken    string `json:"taken"`
+	// NotPointInTime marks a replica copied with qemu-img convert -U after
+	// every point-in-time copy failed (pit_copy.go, layer 3). Only that path
+	// sets it; a record without it — every replica written before it, or by
+	// a build that does not know it — reads as replicas always read. An
+	// older build reading this record ignores the field (encoding/json).
+	NotPointInTime bool `json:"not_point_in_time,omitempty"`
 	// SizeBytes is filled in on listing, never stored.
 	SizeBytes int64 `json:"-"`
 }
@@ -126,6 +132,7 @@ func (r replicaRecord) toPB() *pb.ReplicaRecord {
 	return &pb.ReplicaRecord{
 		Project: r.Project, Vm: r.VM, Disk: r.Disk, Schedule: r.Schedule,
 		File: r.File, Format: r.Format, Taken: r.Taken, SizeBytes: r.SizeBytes,
+		NotPointInTime: r.NotPointInTime,
 	}
 }
 
@@ -136,6 +143,7 @@ func replicaRecordFromPB(p *pb.ReplicaRecord) (replicaRecord, error) {
 	r := replicaRecord{
 		Project: p.GetProject(), VM: p.GetVm(), Disk: p.GetDisk(), Schedule: p.GetSchedule(),
 		File: p.GetFile(), Format: p.GetFormat(), Taken: p.GetTaken(), SizeBytes: p.GetSizeBytes(),
+		NotPointInTime: p.GetNotPointInTime(),
 	}
 	return r, r.validate()
 }
@@ -282,6 +290,13 @@ func writeReplicaRecord(dir string, r replicaRecord) error {
 // record. If the record cannot be written the file is withdrawn, so a replica
 // is never left selectable-by-name-only. Returns the replica's path.
 func publishRecordedReplica(ctx context.Context, poolDir string, r replicaRecord, write func(tmp string) error) (string, error) {
+	return publishRecordedReplicaRec(ctx, poolDir, &r, write)
+}
+
+// publishRecordedReplicaRec is publishRecordedReplica reading *r only after
+// write has run, so write can set what only the copy knows (NotPointInTime).
+func publishRecordedReplicaRec(ctx context.Context, poolDir string, rp *replicaRecord, write func(tmp string) error) (string, error) {
+	r := *rp
 	if err := r.validate(); err != nil {
 		return "", err
 	}
@@ -293,6 +308,7 @@ func publishRecordedReplica(ctx context.Context, poolDir string, r replicaRecord
 	if err := publishReplica(ctx, dst, write); err != nil {
 		return "", err
 	}
+	r.NotPointInTime = rp.NotPointInTime
 	if err := writeReplicaRecord(dir, r); err != nil {
 		_ = os.Remove(dst)
 		return "", fmt.Errorf("record replica: %w", err)
@@ -560,7 +576,7 @@ func (s *Server) PushReplica(stream pb.LiteVirt_PushReplicaServer) error {
 		_ = os.Remove(dest)
 		return status.Errorf(codes.Internal, "record replica: %v", err)
 	}
-	return stream.SendAndClose(&pb.PushReplicaResponse{Path: dest, SizeBytes: total})
+	return stream.SendAndClose(&pb.PushReplicaResponse{Path: dest, SizeBytes: total, NotPointInTimeRecorded: rec.NotPointInTime})
 }
 
 // proveReplicaRecords asks the receiving host for (project, vm)'s replica

@@ -27,6 +27,7 @@ import (
 	"github.com/litevirt/litevirt/internal/metrics"
 	"github.com/litevirt/litevirt/internal/netbox"
 	"github.com/litevirt/litevirt/internal/network"
+	"github.com/litevirt/litevirt/internal/notify"
 	"github.com/litevirt/litevirt/internal/opjournal"
 	"github.com/litevirt/litevirt/internal/pci"
 	"github.com/litevirt/litevirt/internal/pki"
@@ -787,6 +788,21 @@ type Server struct {
 	// nil = legacy qcow2-container full backup. Set by daemon when libvirt
 	// is reachable. content-based rewrite.
 	backupSource BackupSource
+
+	// pitSnapshotter takes the external disk-only snapshot a point-in-time
+	// copy falls back to when no backup session opens (pit_copy.go). nil =
+	// that layer is unavailable.
+	pitSnapshotter PointInTimeSnapshotter
+
+	// pitRetry holds the replication runs whose last copy was not
+	// point-in-time, so the scheduler retries them at its next tick
+	// (pit_retry.go). Node-local and in memory: a restart forgets it and
+	// the schedule's own cron runs next.
+	pitRetry pitRetrySet
+
+	// notifySeen, when set, sees every notification notify is asked to
+	// send, before any routing. Tests only.
+	notifySeen func(notify.Notification)
 
 	// ReExecCh is signalled after a successful self-upgrade to trigger
 	// a re-exec of the daemon binary. The daemon's main loop should

@@ -36,6 +36,10 @@ func ownPoolServer(t *testing.T) (*Server, string) {
 	}
 	upsertPool(t, s, corrosion.StoragePoolRecord{HostName: s.hostName, Name: "pa", Driver: "dir", Target: own, Project: "acme"})
 	insertPromotableVM(t, s, "web", "acme", s.hostName, "root")
+	// web is running: its replicas are point-in-time through an external
+	// snapshot (pit_copy.go, layer 2), so failover promotes them. With no
+	// point-in-time layer they would be -U copies, which it holds instead.
+	s.SetPointInTimeSnapshotter(&fakePITSnapshotter{})
 	return s, own
 }
 

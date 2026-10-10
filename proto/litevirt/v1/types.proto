@@ -476,6 +476,11 @@ message VM {
     // Set by InspectVM/GetVM; not by ListVMs.
     string                         health        = 15;
     string                         health_detail = 16; // why, in words: the probe's last failure reason, etc.
+    // failover_held says why automatic failover is holding this VM down
+    // rather than promoting its replica (e.g. its only replica is not
+    // point-in-time), with the command that promotes it by hand. Empty when
+    // nothing is held. Set by InspectVM/GetVM.
+    string                         failover_held = 17;
 }
 
 message VMInterface {

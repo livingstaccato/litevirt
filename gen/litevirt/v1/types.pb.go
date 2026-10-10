@@ -3330,8 +3330,13 @@ type VM struct {
 	// no verdict yet, a verdict from before a restart/recreate/migration, a
 	// stopped VM, and an owner host that is offline, fenced or in maintenance.
 	// Set by InspectVM/GetVM; not by ListVMs.
-	Health        string `protobuf:"bytes,15,opt,name=health,proto3" json:"health,omitempty"`
-	HealthDetail  string `protobuf:"bytes,16,opt,name=health_detail,json=healthDetail,proto3" json:"health_detail,omitempty"` // why, in words: the probe's last failure reason, etc.
+	Health       string `protobuf:"bytes,15,opt,name=health,proto3" json:"health,omitempty"`
+	HealthDetail string `protobuf:"bytes,16,opt,name=health_detail,json=healthDetail,proto3" json:"health_detail,omitempty"` // why, in words: the probe's last failure reason, etc.
+	// failover_held says why automatic failover is holding this VM down
+	// rather than promoting its replica (e.g. its only replica is not
+	// point-in-time), with the command that promotes it by hand. Empty when
+	// nothing is held. Set by InspectVM/GetVM.
+	FailoverHeld  string `protobuf:"bytes,17,opt,name=failover_held,json=failoverHeld,proto3" json:"failover_held,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3474,6 +3479,13 @@ func (x *VM) GetHealth() string {
 func (x *VM) GetHealthDetail() string {
 	if x != nil {
 		return x.HealthDetail
+	}
+	return ""
+}
+
+func (x *VM) GetFailoverHeld() string {
+	if x != nil {
+		return x.FailoverHeld
 	}
 	return ""
 }
@@ -6008,7 +6020,7 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\anic_mac\x18\x03 \x01(\tR\x06nicMac\x12\x1f\n" +
 	"\vpci_address\x18\x04 \x01(\tR\n" +
 	"pciAddress\x12'\n" +
-	"\x0fidempotency_key\x18\x05 \x01(\tR\x0eidempotencyKey\"\xeb\x04\n" +
+	"\x0fidempotency_key\x18\x05 \x01(\tR\x0eidempotencyKey\"\x90\x05\n" +
 	"\x02VM\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1d\n" +
 	"\n" +
@@ -6034,7 +6046,8 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\vis_template\x18\x0e \x01(\bR\n" +
 	"isTemplate\x12\x16\n" +
 	"\x06health\x18\x0f \x01(\tR\x06health\x12#\n" +
-	"\rhealth_detail\x18\x10 \x01(\tR\fhealthDetail\"\x8b\x01\n" +
+	"\rhealth_detail\x18\x10 \x01(\tR\fhealthDetail\x12#\n" +
+	"\rfailover_held\x18\x11 \x01(\tR\ffailoverHeld\"\x8b\x01\n" +
 	"\vVMInterface\x12!\n" +
 	"\fnetwork_name\x18\x01 \x01(\tR\vnetworkName\x12\x18\n" +
 	"\aordinal\x18\x02 \x01(\x05R\aordinal\x12\x10\n" +

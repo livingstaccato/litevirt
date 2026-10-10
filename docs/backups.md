@@ -235,22 +235,40 @@ target pool as a timestamped, self-contained point-in-time copy, keeping the
 newest `keep_replicas`. A fast-recovery layer, not a backup replacement, so keep
 backups too.
 
-**Consistency differs between the two replication modes, and the default is the
-weaker one.** A full replica of a RUNNING VM is `qemu-img convert -U` reading
-the image the guest still has open — no snapshot is taken, so the copy is
-smeared over however long it ran. That is neither point-in-time nor
-crash-consistent, and a guest filesystem restored from it may need repair. The
-`--incremental` path opens a real point-in-time session (the same pull-mode
-machinery backups use) and IS crash-consistent. Replicating a STOPPED VM is
-consistent either way. Prefer `--incremental` for anything you intend to
-promote, or replicate on a schedule the workload can tolerate being torn.
+**How a full replica is copied.** A full (non-incremental) replica — and the
+full copy an `--incremental` run falls back to when its session fails — is made
+by the strongest method the host has, tried in this order:
 
-An `--incremental` run whose backup session fails **does not downgrade to the
-full copy while the VM is running** — the run fails and produces no replica,
-rather than silently substituting the weaker mechanism for the one you asked
-for. A stopped source still falls back, because there is nothing writing the
-image. Watch for `replication.failed` notifications: a schedule failing this
-way keeps its previous replicas and stops making new ones.
+1. **Shut-off VM:** a plain `qemu-img convert` of the disk, *without* `-U`. If
+   the VM is in fact still running, qemu's image lock fails the copy rather
+   than letting it read a changing image. A paused or pm-suspended VM is not
+   shut off (qemu still holds its image) and takes the steps below.
+2. **Backup session:** a full pull-mode backup of the running disk (the same
+   machinery backups and `--incremental` use, with no checkpoint, so no
+   incremental chain is touched). Point-in-time and crash-consistent.
+3. **External snapshot:** when no session opens (an older libvirt, a failed
+   job), an external disk-only snapshot moves the guest's writes onto an
+   overlay — quiesced through the guest agent when one answers, otherwise
+   crash-consistent — the now-frozen disk file is copied, and the overlay is
+   committed back (active block-commit and pivot). Still point-in-time. The
+   overlay is `.<disk file>.lv-pit` beside the disk. If the commit fails, the VM
+   keeps running on the overlay, the overlay is kept, a
+   `disk.pit_overlay_stranded` event and a `replication.pit_overlay_stranded`
+   notification say so, and the next replication or move of that disk commits
+   it before copying. Do not delete that file while the VM uses it.
+4. **Last resort:** when neither 2 nor 3 can be made, the copy is what earlier
+   builds always made — `qemu-img convert -U` reading the image the guest has
+   open. That copy is **not point-in-time** (it is smeared over however long it
+   ran, and a guest restored from it may need repair). It is still made, but
+   the replica's record says `not_point_in_time`, a
+   `disk.replica_not_point_in_time` event and a `replication.not_point_in_time`
+   notification name the reason, and the scheduler retries a point-in-time copy
+   at its next tick (a minute later, not a full interval). That retry makes a
+   point-in-time copy or nothing; the schedule's own next run may make another
+   `-U` copy if the cause persists.
+
+The `disk.replicated` event names the method used. zfs, ceph and btrfs pools
+replicated natively use their own snapshots and are point-in-time.
 
 A replica is also **published by rename**. The copy lands in a dotted
 temp sibling and is renamed into its final name only once it has completed
@@ -359,6 +377,7 @@ it must be one of the VM's own recorded replicas:
 lv replication promote web-1                 # take over the name (host-loss case)
 lv replication promote web-1 --new-name web-1-dr   # bring up alongside the original
 lv replication promote web-1 --no-localize   # fast: boot off an overlay (pins the replica)
+lv replication promote web-1 --accept-not-point-in-time   # a replica recorded as not point-in-time
 ```
 
 A split-brain guard refuses to take over the name while the original is on a
@@ -368,11 +387,35 @@ healthy host (`--force` overrides). The same action is on the VM detail page
 **Automatic promotion** (`--auto-promote` on the schedule): after the failover
 coordinator **confirms a fence**, it promotes the freshest replica for opted-in
 VMs onto a healthy peer (so a VM on lost local storage resumes), falling back to
-a bare reschedule on failure. Default off. Promotion uses the newest replica,
-which is lagging by up to one schedule interval and — for a full (non-
-incremental) replica of a VM that was running — is a torn copy rather than a
-crash-consistent one, as above. Enable only where a small lag window is
-acceptable, and prefer `--incremental` on any schedule with `--auto-promote`.
+a bare reschedule on failure. Default off. Promotion uses the newest
+point-in-time replica, which is lagging by up to one schedule interval. Enable
+only where a small lag window is acceptable.
+
+**Replicas that are not point-in-time** (the last-resort copy above) are the
+last choice:
+
+- Automatic promotion never uses one while any point-in-time replica of the
+  VM exists, even an older one.
+- When a VM's only replicas are not point-in-time, automatic promotion **holds
+  the VM down** by default: the replica is left untouched, the VM's record is
+  not changed, and a `vm.failover.held` event and a `replication.promote_held`
+  notification give the reason and the exact command that promotes it by hand.
+  `lv inspect <vm>` shows the same text as `failoverHeld` while the VM's host
+  is down.
+- A VM can opt in, one VM at a time, to automatic promotion of such a replica
+  when no point-in-time one exists: give it the label
+  `litevirt.auto_promote_not_point_in_time=true` in its spec's `labels`. There is
+  no cluster-wide switch, and a build that does not know the label ignores it
+  (default off). When it fires, a `vm.promoted_not_point_in_time` event and a
+  `replication.promoted_not_point_in_time` notification say a NOT point-in-time
+  copy was promoted.
+- A manual `lv replication promote` of one is refused with a warning unless
+  `--accept-not-point-in-time` is given, whatever the label says.
+
+During a rolling upgrade, a host on an older build does not know the mark: a
+failover it coordinates promotes the newest replica as before. A replica sent to
+a receiver on an older build is recorded without the mark, and the
+`disk.replica_not_point_in_time` event says so.
 
 Automatic promotion **refuses a replica older than two of the schedule's
 longest intervals plus an hour** (or one whose filename carries no readable

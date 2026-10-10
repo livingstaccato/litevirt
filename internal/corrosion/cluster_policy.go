@@ -214,6 +214,15 @@ func (v VoterRegionSets) Regions() []string {
 // recovery targets are cluster-wide anyway.
 const LabelFailoverAnyRegion = "litevirt.failover_any_region"
 
+// LabelAutoPromoteNotPointInTime, when "true" in a VM spec's labels, lets
+// automatic failover promote one of the VM's replicas that is recorded as
+// not point-in-time (copied with qemu-img convert -U after every
+// point-in-time copy failed) — and only when no point-in-time replica of it
+// exists. Absent, or anything else, holds such a VM down with an event naming
+// the manual promote command instead. A build that does not know the label
+// ignores it, which is the default.
+const LabelAutoPromoteNotPointInTime = "litevirt.auto_promote_not_point_in_time"
+
 // RegionQuorum is one region's voting strength, as `lv cluster failover-scope`
 // prints it and the coordinator's regions-without-quorum gauge counts it.
 type RegionQuorum struct {

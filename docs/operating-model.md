@@ -1100,13 +1100,16 @@ leadership churn or a partition.
 - Backups, snapshots, and live migration are crash-consistent at the block
   level: each takes a real point-in-time view (a libvirt pull-mode session for
   backups, qemu's own machinery for migration).
-- **Scheduled volume replication is weaker than that, and the difference
-  matters.** A full (non-incremental) replica of a RUNNING VM is
-  `qemu-img convert -U` reading the image the guest still has open, with no
-  snapshot: the copy is smeared across however long it took, so it is not
-  point-in-time and not crash-consistent either. The `--incremental` path DOES
-  open a point-in-time session and is crash-consistent. See
-  [Backups](backups.md). The guest's database, filesystem, etc. must tolerate "as if power
+- Volume replication and `lv replicate-volume` of a running or paused VM are
+  point-in-time and crash-consistent too: a full backup session, or, where none
+  opens, an external disk-only snapshot (quiesced when the guest agent answers)
+  committed back after the copy. A shut-off VM is copied plainly. Only when
+  neither point-in-time method can be made is the copy `qemu-img convert -U` of
+  the open image, which is smeared and NOT point-in-time; such a replica is
+  recorded and reported as not point-in-time, and automatic promotion holds a VM
+  whose only replicas are such copies. zfs, ceph and btrfs replicate through
+  their native snapshots. See [Backups](backups.md), "How a full replica is
+  copied". The guest's database, filesystem, etc. must tolerate "as if power
   was cut" recovery. For application-consistent backups, install
   `qemu-guest-agent` in the guest and use the `freeze`/`thaw` hooks
   (currently best-effort; richer integration is on the roadmap).

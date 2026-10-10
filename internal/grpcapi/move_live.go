@@ -62,7 +62,8 @@ var LiveMoverPollInterval = 250 * time.Millisecond
 var LiveMoverPivotTimeout = 30 * time.Minute
 
 // liveMoveVolume drives the BlockCopy → poll → pivot dance for a
-// running VM. Called from moveOneVolume when vm.State == "running".
+// VM that is not definitely shut off (running, paused, an unknown state).
+// Called from moveOneVolume.
 // Progress frames go through send (the caller owns the transport).
 func (s *Server) liveMoveVolume(
 	ctx context.Context,

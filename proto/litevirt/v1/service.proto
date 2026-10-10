@@ -1950,6 +1950,10 @@ message PushReplicaRequest {
 message PushReplicaResponse {
     string path       = 1;
     int64  size_bytes = 2;
+    // The receiver recorded the replica's not_point_in_time mark. A receiver
+    // on a build that does not know the mark leaves it false, so a sender
+    // that set it can tell the mark was dropped.
+    bool   not_point_in_time_recorded = 3;
 }
 // Delete one file from a file-based pool. filename is a base name. A file any
 // VM disk on any host uses is refused. (Replicas are pruned with the
@@ -2049,6 +2053,14 @@ message ReplicaRecord {
     string format     = 6; // qcow2 | raw
     string taken      = 7; // UTC run time, 20060102-150405
     int64  size_bytes = 8; // set by ListReplicas
+    // not_point_in_time is set on a replica copied with qemu-img convert -U
+    // after every point-in-time copy failed (a backup session, an external
+    // snapshot): it may be inconsistent. Automatic promotion does not use one
+    // while a point-in-time replica exists, and by default not at all; manual
+    // promotion asks for accept_not_point_in_time. Absent (every replica
+    // written before this field, or by a build that does not know it) reads
+    // as such replicas always read.
+    bool   not_point_in_time = 9;
 }
 // Peer only. The replica records of one VM in a pool on host.
 message ListReplicasRequest {
@@ -2506,6 +2518,11 @@ message PromoteReplicaRequest {
     // it (dest==self, target==vm, action==promote), upserts it, and claims it
     // single-use before the destructive define+start.
     RuntimeActionProof proof = 8;
+    // accept_not_point_in_time promotes a replica recorded as not
+    // point-in-time (ReplicaRecord.not_point_in_time). Without it such a
+    // promotion is refused with a warning naming this flag
+    // (--accept-not-point-in-time).
+    bool   accept_not_point_in_time = 9;
 }
 message PromoteReplicaProgress {
     enum Phase {

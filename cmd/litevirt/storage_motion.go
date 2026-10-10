@@ -55,9 +55,14 @@ func newReplicateVolumeCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "replicate-volume <vm> <disk> <target-pool>",
 		Short: "Copy a VM disk to another pool without disturbing the VM",
-		Long: `Replicate-volume produces a point-in-time copy in target-pool. The VM
-keeps using its source disk; the copy is suitable for off-site DR or
-clone-to-new-VM workflows. The copy is always a new file the daemon names
+		Long: `Replicate-volume copies a VM disk into target-pool. The VM keeps using
+its source disk; the copy is suitable for off-site DR or clone-to-new-VM
+workflows. A shut-off VM's disk is copied plainly. A running or paused VM's is
+copied point-in-time (crash-consistent) through a full backup session, or, where
+none opens, an external disk-only snapshot (quiesced when the guest agent
+answers) that is committed back afterwards. Only when neither can be made is it
+copied with qemu-img convert -U, which is NOT point-in-time: the final status,
+an event and a notification say so. The copy is always a new file the daemon names
 in the pool; --target-path (admin only) names it instead, and an existing
 file is refused, never replaced. A zfs or ceph disk copied into a pool of
 the same driver uses native send/receive into a new dataset or image; a

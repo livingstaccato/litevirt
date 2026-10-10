@@ -754,6 +754,10 @@ func (c *Cluster) buildServer(n *Node) {
 		DB:       n.DB,
 		Virt:     n.Virt,
 	})
+	// A running VM's replica or copy is point-in-time through the external
+	// snapshot layer, as the daemon wires it from its libvirt client
+	// (grpcapi/pit_copy.go). The fleet has no backup sessions.
+	n.Server.SetPointInTimeSnapshotter(n.Virt)
 
 	// Domain lifecycle events: the daemon registers this same handler on its
 	// libvirt client (internal/daemon.Run). Wiring it here lets a scenario call

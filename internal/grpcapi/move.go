@@ -36,9 +36,10 @@ import (
 // copy primitives — they return Unimplemented until the corresponding
 // driver Mover lands.
 //
-// Live (running-VM) cutover is wired: a running VM routes to liveMoveVolume
-// (libvirt block-copy → pivot, see move_live.go); a stopped VM does an offline
-// copy. Only the block-backend gap above remains.
+// Live cutover is wired: any VM not definitely shut off (running, paused,
+// partition-paused, an unknown state) routes to liveMoveVolume (libvirt
+// block-copy → pivot, see move_live.go); a shut-off VM does an offline copy
+// without qemu-img's -U. Only the block-backend gap above remains.
 func (s *Server) MoveVolume(req *pb.MoveVolumeRequest, stream grpc.ServerStreamingServer[pb.MoveVolumeProgress]) error {
 	ctx := stream.Context()
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
@@ -198,10 +199,14 @@ func (s *Server) moveOneVolume(
 		return send(p)
 	}
 
-	// running VMs go through libvirt blockdev-mirror so
-	// the disk swap is online. Stopped VMs use the simpler offline
-	// qemu-img convert path below — still atomic at the DB layer.
-	if vm.State == "running" {
+	// Anything not definitely shut off goes through libvirt blockdev-mirror,
+	// so the disk swap is online and the copy is never read from an image a
+	// qemu holds open: a paused or pm-suspended domain (which the store folds
+	// into "stopped"), a partition-paused one, or a state this code does not
+	// recognise. Only a disk that is definitely closed takes the offline
+	// qemu-img convert below — without -U, so a wrong "stopped" fails on
+	// qemu's lock instead of copying a smeared disk.
+	if !s.sourceClosedForPlainCopy(vm) {
 		if err := s.liveMoveVolume(ctx, vm, src, dstPath, targetPool, dstPool, deleteSource, emit); err != nil {
 			return err
 		}
@@ -242,6 +247,11 @@ func (s *Server) moveOneVolume(
 			Status: fmt.Sprintf("copying %s → %s", src.Path, dstPath),
 		}); err != nil {
 			return err
+		}
+		// An earlier point-in-time copy's overlay holds writes the disk's
+		// file does not: commit it (or refuse) before copying the file.
+		if err := s.healPITOverlay(ctx, vm, src); err != nil {
+			return status.Errorf(codes.FailedPrecondition, "%v", err)
 		}
 		// A new file, never one already there: in a shared pool the derived
 		// "<vm>-<disk>.qcow2" can be another VM's disk (VM "a" disk "b-root"
@@ -852,7 +862,28 @@ func (s *Server) convertVMDisk(ctx context.Context, d *corrosion.DiskRecord, dst
 // Without qemu-img a qcow2 source is byte-copied (it was pre-checked); a raw
 // source cannot be, since the copy would land raw bytes in a qcow2-declared
 // file.
+//
+// It never passes -U: an image a running qemu holds open fails on qemu's lock
+// instead of being read smeared. The one copy that still forces the share is
+// convertImageForceShare (point-in-time copy layer 3, pit_copy.go).
 func convertImage(ctx context.Context, src, srcFormat string, rule chainRule, dst string, emit func(*pb.MoveVolumeProgress) error) error {
+	return convertImageWith(ctx, src, srcFormat, rule, dst, emit, false)
+}
+
+// convertImageForceShare is convertImage with qemu-img's -U (force-share):
+// it reads an image a running qemu holds open. Such a copy is smeared across
+// the time the read takes — NOT point-in-time and not crash-consistent — so
+// it is only the last layer of copyVMDiskConsistent, whose callers mark what
+// it produced as not point-in-time.
+func convertImageForceShare(ctx context.Context, src, srcFormat string, rule chainRule, dst string, emit func(*pb.MoveVolumeProgress) error) error {
+	return convertImageWith(ctx, src, srcFormat, rule, dst, emit, true)
+}
+
+// qemuImgCommand builds the qemu-img process. A variable so a test can see
+// the argv.
+var qemuImgCommand = exec.CommandContext
+
+func convertImageWith(ctx context.Context, src, srcFormat string, rule chainRule, dst string, emit func(*pb.MoveVolumeProgress) error, forceShare bool) error {
 	// qemu-img follows symlinks; on an NFS export mounted without
 	// nosymfollow (a kernel before 5.10) none is handed to it.
 	for _, p := range []string{src, dst} {
@@ -875,10 +906,12 @@ func convertImage(ctx context.Context, src, srcFormat string, rule chainRule, ds
 		}
 		return copyFileWithProgress(ctx, src, dst, emit)
 	}
-	// -U (force-share) lets us read a source image a running VM holds open —
-	// required for crash-consistent replication/move of a live disk; harmless
-	// for an offline (stopped) source.
-	cmd := exec.CommandContext(ctx, "qemu-img", "convert", "-U", "-p", "-f", srcFormat, "-O", "qcow2", src, dst)
+	args := []string{"convert"}
+	if forceShare {
+		args = append(args, "-U")
+	}
+	args = append(args, "-p", "-f", srcFormat, "-O", "qcow2", src, dst)
+	cmd := qemuImgCommand(ctx, "qemu-img", args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return err
@@ -933,6 +966,30 @@ func (s *Server) copyNoClobber(ctx context.Context, src *corrosion.DiskRecord, d
 		return status.Errorf(codes.Internal, "qemu-img convert: %v", err)
 	}
 	return placeNoClobber(tmp, dst)
+}
+
+// copyNoClobberConsistent is copyNoClobber with copyVMDiskConsistent's copy
+// (pit_copy.go): point-in-time for a running or paused source, and main's -U
+// copy, reported as not point-in-time, only when nothing else can be made.
+func (s *Server) copyNoClobberConsistent(ctx context.Context, vm *corrosion.VMRecord, src *corrosion.DiskRecord, dst string, emit func(*pb.MoveVolumeProgress) error) (copyResult, error) {
+	if err := refuseExistingFile(dst); err != nil {
+		return copyResult{}, err
+	}
+	f, err := os.CreateTemp(filepath.Dir(dst), ".repl-*.tmp")
+	if err != nil {
+		return copyResult{}, status.Errorf(codes.Internal, "create copy temp: %v", err)
+	}
+	tmp := f.Name()
+	_ = f.Close()
+	defer os.Remove(tmp) // gone after a successful place
+	res, err := s.copyVMDiskConsistent(ctx, vm, src, tmp, emit, true)
+	if err != nil {
+		if _, ok := status.FromError(err); ok {
+			return copyResult{}, err
+		}
+		return copyResult{}, status.Errorf(codes.Internal, "copy: %v", err)
+	}
+	return res, placeNoClobber(tmp, dst)
 }
 
 // parseQemuImgProgress extracts "    (12.34/100%)" → 12.34. Returns -1

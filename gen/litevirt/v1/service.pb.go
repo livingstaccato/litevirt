@@ -20117,11 +20117,15 @@ func (x *PushReplicaRequest) GetChunk() []byte {
 }
 
 type PushReplicaResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Path          string                 `protobuf:"bytes,1,opt,name=path,proto3" json:"path,omitempty"`
-	SizeBytes     int64                  `protobuf:"varint,2,opt,name=size_bytes,json=sizeBytes,proto3" json:"size_bytes,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Path      string                 `protobuf:"bytes,1,opt,name=path,proto3" json:"path,omitempty"`
+	SizeBytes int64                  `protobuf:"varint,2,opt,name=size_bytes,json=sizeBytes,proto3" json:"size_bytes,omitempty"`
+	// The receiver recorded the replica's not_point_in_time mark. A receiver
+	// on a build that does not know the mark leaves it false, so a sender
+	// that set it can tell the mark was dropped.
+	NotPointInTimeRecorded bool `protobuf:"varint,3,opt,name=not_point_in_time_recorded,json=notPointInTimeRecorded,proto3" json:"not_point_in_time_recorded,omitempty"`
+	unknownFields          protoimpl.UnknownFields
+	sizeCache              protoimpl.SizeCache
 }
 
 func (x *PushReplicaResponse) Reset() {
@@ -20166,6 +20170,13 @@ func (x *PushReplicaResponse) GetSizeBytes() int64 {
 		return x.SizeBytes
 	}
 	return 0
+}
+
+func (x *PushReplicaResponse) GetNotPointInTimeRecorded() bool {
+	if x != nil {
+		return x.NotPointInTimeRecorded
+	}
+	return false
 }
 
 // Delete one file from a file-based pool. filename is a base name. A file any
@@ -20953,17 +20964,25 @@ func (x *PushReplicaIncrementResponse) GetReplicaRecorded() bool {
 // name — so a pool every project shares cannot be used to read, overwrite or
 // delete another project's replicas or disks.
 type ReplicaRecord struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Project       string                 `protobuf:"bytes,1,opt,name=project,proto3" json:"project,omitempty"` // normalized project of the VM
-	Vm            string                 `protobuf:"bytes,2,opt,name=vm,proto3" json:"vm,omitempty"`
-	Disk          string                 `protobuf:"bytes,3,opt,name=disk,proto3" json:"disk,omitempty"`
-	Schedule      string                 `protobuf:"bytes,4,opt,name=schedule,proto3" json:"schedule,omitempty"`                     // the schedule that wrote it: "<schedule row vm_name>/<repo>"
-	File          string                 `protobuf:"bytes,5,opt,name=file,proto3" json:"file,omitempty"`                             // "<disk>-<taken>.<format>", a base name in the owner directory
-	Format        string                 `protobuf:"bytes,6,opt,name=format,proto3" json:"format,omitempty"`                         // qcow2 | raw
-	Taken         string                 `protobuf:"bytes,7,opt,name=taken,proto3" json:"taken,omitempty"`                           // UTC run time, 20060102-150405
-	SizeBytes     int64                  `protobuf:"varint,8,opt,name=size_bytes,json=sizeBytes,proto3" json:"size_bytes,omitempty"` // set by ListReplicas
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Project   string                 `protobuf:"bytes,1,opt,name=project,proto3" json:"project,omitempty"` // normalized project of the VM
+	Vm        string                 `protobuf:"bytes,2,opt,name=vm,proto3" json:"vm,omitempty"`
+	Disk      string                 `protobuf:"bytes,3,opt,name=disk,proto3" json:"disk,omitempty"`
+	Schedule  string                 `protobuf:"bytes,4,opt,name=schedule,proto3" json:"schedule,omitempty"`                     // the schedule that wrote it: "<schedule row vm_name>/<repo>"
+	File      string                 `protobuf:"bytes,5,opt,name=file,proto3" json:"file,omitempty"`                             // "<disk>-<taken>.<format>", a base name in the owner directory
+	Format    string                 `protobuf:"bytes,6,opt,name=format,proto3" json:"format,omitempty"`                         // qcow2 | raw
+	Taken     string                 `protobuf:"bytes,7,opt,name=taken,proto3" json:"taken,omitempty"`                           // UTC run time, 20060102-150405
+	SizeBytes int64                  `protobuf:"varint,8,opt,name=size_bytes,json=sizeBytes,proto3" json:"size_bytes,omitempty"` // set by ListReplicas
+	// not_point_in_time is set on a replica copied with qemu-img convert -U
+	// after every point-in-time copy failed (a backup session, an external
+	// snapshot): it may be inconsistent. Automatic promotion does not use one
+	// while a point-in-time replica exists, and by default not at all; manual
+	// promotion asks for accept_not_point_in_time. Absent (every replica
+	// written before this field, or by a build that does not know it) reads
+	// as such replicas always read.
+	NotPointInTime bool `protobuf:"varint,9,opt,name=not_point_in_time,json=notPointInTime,proto3" json:"not_point_in_time,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *ReplicaRecord) Reset() {
@@ -21050,6 +21069,13 @@ func (x *ReplicaRecord) GetSizeBytes() int64 {
 		return x.SizeBytes
 	}
 	return 0
+}
+
+func (x *ReplicaRecord) GetNotPointInTime() bool {
+	if x != nil {
+		return x.NotPointInTime
+	}
+	return false
 }
 
 // Peer only. The replica records of one VM in a pool on host.
@@ -24789,9 +24815,14 @@ type PromoteReplicaRequest struct {
 	// enforced; nil for operator-driven PromoteReplica. The executing host validates
 	// it (dest==self, target==vm, action==promote), upserts it, and claims it
 	// single-use before the destructive define+start.
-	Proof         *RuntimeActionProof `protobuf:"bytes,8,opt,name=proof,proto3" json:"proof,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Proof *RuntimeActionProof `protobuf:"bytes,8,opt,name=proof,proto3" json:"proof,omitempty"`
+	// accept_not_point_in_time promotes a replica recorded as not
+	// point-in-time (ReplicaRecord.not_point_in_time). Without it such a
+	// promotion is refused with a warning naming this flag
+	// (--accept-not-point-in-time).
+	AcceptNotPointInTime bool `protobuf:"varint,9,opt,name=accept_not_point_in_time,json=acceptNotPointInTime,proto3" json:"accept_not_point_in_time,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *PromoteReplicaRequest) Reset() {
@@ -24878,6 +24909,13 @@ func (x *PromoteReplicaRequest) GetProof() *RuntimeActionProof {
 		return x.Proof
 	}
 	return nil
+}
+
+func (x *PromoteReplicaRequest) GetAcceptNotPointInTime() bool {
+	if x != nil {
+		return x.AcceptNotPointInTime
+	}
+	return false
 }
 
 type PromoteReplicaProgress struct {
@@ -36112,11 +36150,12 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\tpool_name\x18\x01 \x01(\tR\bpoolName\x12\x12\n" +
 	"\x04host\x18\x02 \x01(\tR\x04host\x124\n" +
 	"\areplica\x18\x03 \x01(\v2\x1a.litevirt.v1.ReplicaRecordR\areplica\x12\x14\n" +
-	"\x05chunk\x18\x04 \x01(\fR\x05chunk\"H\n" +
+	"\x05chunk\x18\x04 \x01(\fR\x05chunk\"\x84\x01\n" +
 	"\x13PushReplicaResponse\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x12\x1d\n" +
 	"\n" +
-	"size_bytes\x18\x02 \x01(\x03R\tsizeBytes\"\x8d\x01\n" +
+	"size_bytes\x18\x02 \x01(\x03R\tsizeBytes\x12:\n" +
+	"\x1anot_point_in_time_recorded\x18\x03 \x01(\bR\x16notPointInTimeRecorded\"\x8d\x01\n" +
 	"\x1fDeleteStoragePoolContentRequest\x12\x1b\n" +
 	"\tpool_name\x18\x01 \x01(\tR\bpoolName\x12\x12\n" +
 	"\x04host\x18\x02 \x01(\tR\x04host\x12\x1a\n" +
@@ -36175,7 +36214,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x1cPushReplicaIncrementResponse\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x12#\n" +
 	"\rbytes_written\x18\x02 \x01(\x03R\fbytesWritten\x12)\n" +
-	"\x10replica_recorded\x18\x03 \x01(\bR\x0freplicaRecorded\"\xca\x01\n" +
+	"\x10replica_recorded\x18\x03 \x01(\bR\x0freplicaRecorded\"\xf5\x01\n" +
 	"\rReplicaRecord\x12\x18\n" +
 	"\aproject\x18\x01 \x01(\tR\aproject\x12\x0e\n" +
 	"\x02vm\x18\x02 \x01(\tR\x02vm\x12\x12\n" +
@@ -36185,7 +36224,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x06format\x18\x06 \x01(\tR\x06format\x12\x14\n" +
 	"\x05taken\x18\a \x01(\tR\x05taken\x12\x1d\n" +
 	"\n" +
-	"size_bytes\x18\b \x01(\x03R\tsizeBytes\"p\n" +
+	"size_bytes\x18\b \x01(\x03R\tsizeBytes\x12)\n" +
+	"\x11not_point_in_time\x18\t \x01(\bR\x0enotPointInTime\"p\n" +
 	"\x13ListReplicasRequest\x12\x1b\n" +
 	"\tpool_name\x18\x01 \x01(\tR\bpoolName\x12\x12\n" +
 	"\x04host\x18\x02 \x01(\tR\x04host\x12\x18\n" +
@@ -36508,7 +36548,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\amembers\x18\x02 \x03(\v2\x1d.litevirt.v1.ClaimVoterMemberR\amembers\x12\x16\n" +
 	"\x06change\x18\x03 \x01(\tR\x06change\x12\x18\n" +
 	"\aapplied\x18\x04 \x01(\bR\aapplied\x12\x16\n" +
-	"\x06detail\x18\x05 \x01(\tR\x06detail\"\x95\x02\n" +
+	"\x06detail\x18\x05 \x01(\tR\x06detail\"\xcd\x02\n" +
 	"\x15PromoteReplicaRequest\x12\x17\n" +
 	"\avm_name\x18\x01 \x01(\tR\x06vmName\x12\x1f\n" +
 	"\vtarget_pool\x18\x02 \x01(\tR\n" +
@@ -36520,7 +36560,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x05force\x18\x06 \x01(\bR\x05force\x12\x1f\n" +
 	"\vno_localize\x18\a \x01(\bR\n" +
 	"noLocalize\x125\n" +
-	"\x05proof\x18\b \x01(\v2\x1f.litevirt.v1.RuntimeActionProofR\x05proof\"\xb5\x02\n" +
+	"\x05proof\x18\b \x01(\v2\x1f.litevirt.v1.RuntimeActionProofR\x05proof\x126\n" +
+	"\x18accept_not_point_in_time\x18\t \x01(\bR\x14acceptNotPointInTime\"\xb5\x02\n" +
 	"\x16PromoteReplicaProgress\x12?\n" +
 	"\x05phase\x18\x01 \x01(\x0e2).litevirt.v1.PromoteReplicaProgress.PhaseR\x05phase\x12\x17\n" +
 	"\avm_name\x18\x02 \x01(\tR\x06vmName\x12\x12\n" +

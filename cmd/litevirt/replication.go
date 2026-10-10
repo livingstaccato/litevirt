@@ -47,9 +47,16 @@ func newReplicationScheduleAddCmd() *cobra.Command {
 pool (nfs/ceph/iscsi), or — when neither — an auto-selected healthy peer with
 the pool.
 
+A running or paused VM's full copy is point-in-time: a backup session, else an
+external disk-only snapshot that is committed back afterwards. Only when neither
+can be made is it a qemu-img -U copy, recorded and reported as NOT point-in-time
+and retried point-in-time at the next scheduler tick.
+
 --incremental transfers only dirty extents (raw replicas; full-copy fallback for
 a stopped VM or old libvirt). --auto-promote lets failover bring up the freshest
-replica if the VM's host is lost.`,
+point-in-time replica if the VM's host is lost; a VM whose only replicas are not
+point-in-time is held down unless its spec carries the label
+litevirt.auto_promote_not_point_in_time=true.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if scope == "" {
@@ -145,7 +152,7 @@ func newReplicationScheduleRmCmd() *cobra.Command {
 
 func newReplicationPromoteCmd() *cobra.Command {
 	var pool, host, replica, newName string
-	var force, noLocalize bool
+	var force, noLocalize, acceptNotPIT bool
 	cmd := &cobra.Command{
 		Use:   "promote <vm>",
 		Short: "Bring up a VM from its replica (disaster recovery)",
@@ -157,13 +164,18 @@ defined + started there.
 By default the original name is taken over (the host-loss case); pass --new-name
 to bring it up alongside a still-running original. --force overrides the
 split-brain guard. --no-localize boots off a fast overlay backed by the replica
-instead of copying (pins the replica until you localize it).`,
+instead of copying (pins the replica until you localize it).
+
+A replica recorded as NOT point-in-time (copied with qemu-img convert -U while
+the VM ran, after every point-in-time copy failed) may be inconsistent; promoting
+one is refused with a warning unless --accept-not-point-in-time is given.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				stream, err := c.PromoteReplica(ctx, &pb.PromoteReplicaRequest{
 					VmName: args[0], TargetPool: pool, TargetHost: host, Replica: replica,
 					NewName: newName, Force: force, NoLocalize: noLocalize,
+					AcceptNotPointInTime: acceptNotPIT,
 				})
 				if err != nil {
 					return err
@@ -187,5 +199,6 @@ instead of copying (pins the replica until you localize it).`,
 	cmd.Flags().StringVar(&newName, "new-name", "", "promote under a new name (alongside the original)")
 	cmd.Flags().BoolVar(&force, "force", false, "promote even if the original is on a healthy host")
 	cmd.Flags().BoolVar(&noLocalize, "no-localize", false, "boot off an overlay backed by the replica (fast; pins it)")
+	cmd.Flags().BoolVar(&acceptNotPIT, "accept-not-point-in-time", false, "promote a replica recorded as not point-in-time (a qemu-img -U copy of a running disk; may be inconsistent)")
 	return cmd
 }

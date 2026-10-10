@@ -2506,6 +2506,8 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 	if h, herr := health.EvaluateVMHealth(ctx, s.db, vm); herr == nil && h.HasHealthcheck {
 		pbVM.Health, pbVM.HealthDetail = h.Verdict, h.Detail
 	}
+	// Why automatic failover is holding the VM down, if it is.
+	pbVM.FailoverHeld = s.failoverHeldReason(ctx, vm)
 
 	// Interfaces — run IP discovery fallback if IP is unknown.
 	ifaces, _ := corrosion.GetVMInterfaces(ctx, s.db, name)

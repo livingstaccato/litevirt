@@ -312,7 +312,9 @@ func rbdPathOptions(path string) map[string]string {
 		return nil
 	}
 	out := map[string]string{}
-	for _, k := range []string{"conf", "keyring", "id"} {
+	// mon_host too: a pool-less path (delete, the start fallback) reaches a
+	// cluster configured only by monitors with no ceph.conf.
+	for _, k := range []string{"conf", "keyring", "id", "mon_host"} {
 		if v := l.Opts[k]; v != "" {
 			out[k] = v
 		}

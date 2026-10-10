@@ -121,3 +121,23 @@ func OverrideVolumeRunnerForTest(run func(ctx context.Context, name string, args
 	volumeRunner = run
 	return func() { volumeRunner = prev }
 }
+
+// cephError is a ceph failure classed for its caller: permanent means an
+// operator must fix something (a key the cluster denies, an image that is not
+// in a pool that answers) — anything else is transient, and is retried.
+type cephError struct {
+	permanent bool
+	msg       string
+	err       error
+}
+
+func (e *cephError) Error() string { return e.msg }
+func (e *cephError) Unwrap() error { return e.err }
+
+// IsPermanentCephError reports whether err is a ceph failure an operator must
+// fix, as opposed to one a retry may clear (a timeout, an unreachable or
+// re-electing cluster, a killed rbd, an ambiguous exit status).
+func IsPermanentCephError(err error) bool {
+	var ce *cephError
+	return errors.As(err, &ce) && ce.permanent
+}

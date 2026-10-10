@@ -959,9 +959,14 @@ A host whose key differs from another host's raises the degraded condition
 host. It is a diagnostic: rows of hosts that are down, removed or mid key
 rotation cannot vouch for anyone, so no start is refused by it. Instead every
 start of a VM with a ceph disk (failover restarts included) first proves the
-host's own key with `rbd info` on each disk as the pool's client, and refuses
-with the reason — permission denied, or the image not in the cluster the
-host's pool reaches — rather than libvirt's. A live migration onto a host
+host's own key with `rbd info` on each disk as the pool's client, bounded by
+rbd's own 5 s monitor and OSD timeouts. It refuses for good, with the reason,
+only when Ceph is unambiguous that an operator must act: permission denied
+(naming the keyring), or the image not in a pool that answers. Anything else —
+Ceph not answering in time, a cluster re-electing its monitors, an ambiguous
+error — is transient, and the start is retried, as it would be after a qemu
+start failure. A failover start whose remaining time is too short for the
+probe is deferred to the next pass. A live migration onto a host
 whose recorded key differs from the source host's is refused before libvirt
 is asked.
 
@@ -988,7 +993,10 @@ from the pool on that host — its `mon_host` option, else its conf's — so aft
 the monitors are re-addressed, updating `/etc/ceph/ceph.conf` (or the pool's
 `mon_host`) on the hosts is all a stopped VM needs to start. Only a pool with
 a `mon_host` option also writes that list into the path, as the fallback for
-a host that does not have the pool. A running VM keeps working (librbd
+a host that does not have the pool. Every start also rewrites the
+domain's persistent definition with the monitors its pool resolves to then. A
+disk whose pool does not resolve (or resolves to no monitors) keeps the
+`<host>` list it has; an empty list is never written. A running VM keeps working (librbd
 follows the cluster's monitor map), and a live migration hands the
 destination the monitors its pool resolves to at that moment, not the ones the
 running domain was defined with, so a re-addressed cluster's VMs migrate
@@ -1021,7 +1029,10 @@ every host. That is how such pools behaved before and is not recommended.
 - **Delete** (`lv rm`) removes the VM's own images. It never removes an
   imported base (`lvimage+…`), an image outside the pool, one that has
   snapshots (rbd refuses, so a clone made from one is never orphaned), or one
-  another VM's disk row still names. An image already gone is not an error —
+  another VM's disk row still names. An image another client still has open is
+  retried for a few seconds and then refused as **in use**, naming the
+  watcher; a rollback of litevirt's own copy waits up to a minute for a killed
+  client's watch to lapse. An image already gone is not an error —
   but only once the pool itself answers: a delete that cannot reach the
   cluster (a missing keyring or conf) fails instead of reporting success.
 - **Clone copies** are made under a private staging name and renamed into

@@ -96,7 +96,9 @@ func (s *Server) defineCephSecret(u, id, keyring string, grace bool) error {
 	}
 	key, err := storage.CephClientKey(keyring, id)
 	if err != nil {
-		return fmt.Errorf("ceph secret for client.%s: %w", id, err)
+		// A keyring that is missing or names no key for the client: an
+		// operator installs it.
+		return permanentCeph(fmt.Errorf("ceph secret for client.%s: %w", id, err))
 	}
 	defer clear(key)
 	sum := sha256.Sum256(key)
@@ -107,7 +109,7 @@ func (s *Server) defineCephSecret(u, id, keyring string, grace bool) error {
 		}
 	}
 	if err := s.virt.DefineCephSecret(u, id, key); err != nil {
-		return fmt.Errorf("ceph secret for client.%s: %w", id, err)
+		return transientCeph(fmt.Errorf("ceph secret for client.%s: %w", id, err))
 	}
 	s.cephSecrets.put(u, cephSecretMark{sum: sum, at: stamp})
 	slog.Info("ceph secret defined", "uuid", u, "client", id, "keyring", keyring)
@@ -126,7 +128,7 @@ func (s *Server) ensureCephSecret(cfg storage.Config) (string, error) {
 		return "", nil
 	}
 	if cfg.Name == "" {
-		return "", fmt.Errorf("ceph storage with no pool name has no secret to define")
+		return "", permanentCeph(fmt.Errorf("ceph storage with no pool name has no secret to define"))
 	}
 	u := lv.CephSecretUUID(cfg.Name, auth.ID)
 	return u, s.defineCephSecret(u, auth.ID, auth.Keyring, true)
@@ -182,9 +184,9 @@ func (s *Server) refuseCephKeyUnlikeSource(ctx context.Context, pool, source str
 		return nil
 	}
 	if theirs := fps[source]; theirs != "" && theirs != mine {
-		return fmt.Errorf("the keyring of ceph pool %q on %s holds a different key for client.%s than on %s, where the VM runs: "+
+		return permanentCeph(fmt.Errorf("the keyring of ceph pool %q on %s holds a different key for client.%s than on %s, where the VM runs: "+
 			"install the same keyring on %s before migrating to it (condition %s)",
-			pool, s.hostName, clientOf(cfg), source, s.hostName, condCephKeyringMismatch)
+			pool, s.hostName, clientOf(cfg), source, s.hostName, condCephKeyringMismatch))
 	}
 	return nil
 }
@@ -231,23 +233,25 @@ func (s *Server) ensureCephSecretsForVM(ctx context.Context, vm *corrosion.VMRec
 			// The pool is not on this host (any more): the disk's own locator
 			// names its client and keyring.
 			if derr := s.defineCephSecret(want, cephLocatorID(l), l.Opts["keyring"], false); derr != nil {
-				return fmt.Errorf("disk %s is on ceph pool %q, which %s does not have, and its keyring is not usable here: %w",
-					d.DiskName, pool, s.hostName, derr)
+				return classedCeph(derr, fmt.Errorf("disk %s is on ceph pool %q, which %s does not have, and its keyring is not usable here: %w",
+					d.DiskName, pool, s.hostName, derr))
 			}
 			cfg = storage.Config{Name: pool, Driver: "ceph", Source: l.Pool, Options: rbdPathOptions(d.Path)}
 		case rerr != nil:
-			return fmt.Errorf("disk %s: %w", d.DiskName, rerr)
+			// Not "no such pool": this host's pools could not be read. The
+			// start is retried, as with any transient failure.
+			return transientCeph(fmt.Errorf("disk %s: %w", d.DiskName, rerr))
 		case !strings.EqualFold(cfg.Driver, "ceph") || cfg.Name != pool:
-			return fmt.Errorf("disk %s is on ceph pool %q, but storage %q on %s is a %s pool; give the pool the same name and driver on every host",
-				d.DiskName, pool, d.StorageVolume, s.hostName, cfg.Driver)
+			return permanentCeph(fmt.Errorf("disk %s is on ceph pool %q, but storage %q on %s is a %s pool; give the pool the same name and driver on every host",
+				d.DiskName, pool, d.StorageVolume, s.hostName, cfg.Driver))
 		default:
 			u, err := s.ensureCephSecret(cfg)
 			if err != nil {
-				return fmt.Errorf("disk %s: %w", d.DiskName, err)
+				return classedCeph(err, fmt.Errorf("disk %s: %w", d.DiskName, err))
 			}
 			if u != want {
-				return fmt.Errorf("disk %s authenticates as client.%s of ceph pool %q, but pool %q on %s names client.%s; give the pool the same id on every host",
-					d.DiskName, cephLocatorID(l), pool, pool, s.hostName, clientOf(cfg))
+				return permanentCeph(fmt.Errorf("disk %s authenticates as client.%s of ceph pool %q, but pool %q on %s names client.%s; give the pool the same id on every host",
+					d.DiskName, cephLocatorID(l), pool, pool, s.hostName, clientOf(cfg)))
 			}
 			if err := s.refuseCephKeyUnlikeSource(ctx, pool, source, cfg); err != nil {
 				return err
@@ -255,11 +259,15 @@ func (s *Server) ensureCephSecretsForVM(ctx context.Context, vm *corrosion.VMRec
 		}
 		drv, err := storage.New(s.dataDir, cfg)
 		if err != nil {
-			return fmt.Errorf("disk %s: %w", d.DiskName, err)
+			return permanentCeph(fmt.Errorf("disk %s: %w", d.DiskName, err))
 		}
 		if p, ok := drv.(storage.DiskProber); ok {
 			if err := p.ProbeDisk(ctx, d.Path); err != nil {
-				return fmt.Errorf("disk %s on %s: %w", d.DiskName, s.hostName, err)
+				werr := fmt.Errorf("disk %s on %s: %w", d.DiskName, s.hostName, err)
+				if storage.IsPermanentCephError(err) {
+					return permanentCeph(werr)
+				}
+				return transientCeph(werr)
 			}
 		}
 	}
@@ -297,7 +305,7 @@ func cephLocatorID(l storage.CephLocator) string {
 // serve the disks, or the migration is refused before libvirt is asked.
 func (s *Server) prepareIncomingCephDisks(ctx context.Context, vm *corrosion.VMRecord) error {
 	if err := s.ensureCephSecretsForVM(ctx, vm, vm.HostName); err != nil {
-		return status.Errorf(codes.FailedPrecondition, "%s cannot receive VM %q: %v", s.hostName, vm.Name, err)
+		return status.Errorf(cephErrCode(err), "%s cannot receive VM %q: %v", s.hostName, vm.Name, err)
 	}
 	disks, err := corrosion.GetVMDisks(ctx, s.db, vm.Name)
 	if err != nil {
@@ -309,7 +317,7 @@ func (s *Server) prepareIncomingCephDisks(ctx context.Context, vm *corrosion.VMR
 			continue
 		}
 		if has, herr := s.virt.HasSecret(u); herr != nil || !has {
-			return status.Errorf(codes.FailedPrecondition,
+			return status.Errorf(codes.Unavailable,
 				"%s cannot receive VM %q: its disk %s needs ceph secret %s, which is not defined here (%v)",
 				s.hostName, vm.Name, d.DiskName, u, herr)
 		}
@@ -532,4 +540,61 @@ func laterOf(a, b time.Time) time.Time {
 		return a
 	}
 	return b
+}
+
+// cephClassed carries how a ceph start failure is to be answered: a
+// FailedPrecondition for one an operator must fix (a key the cluster denies,
+// a keyring missing, a pool defined differently here), Unavailable for one a
+// retry may clear (Ceph not answering, this host's pools unreadable, libvirt
+// failing) — which every start path retries, as main retried a start that
+// failed in qemu.
+type cephClassed struct {
+	code codes.Code
+	err  error
+}
+
+func (e *cephClassed) Error() string { return e.err.Error() }
+func (e *cephClassed) Unwrap() error { return e.err }
+
+func permanentCeph(err error) error { return &cephClassed{code: codes.FailedPrecondition, err: err} }
+func transientCeph(err error) error { return &cephClassed{code: codes.Unavailable, err: err} }
+
+// classedCeph wraps err with the class its cause already carries.
+func classedCeph(cause, err error) error {
+	return &cephClassed{code: cephErrCode(cause), err: err}
+}
+
+// cephErrCode is the status code a ceph start failure is answered with; an
+// unclassed one is Unavailable (retried), never a terminal refusal.
+func cephErrCode(err error) codes.Code {
+	var c *cephClassed
+	if errors.As(err, &c) {
+		return c.code
+	}
+	return codes.Unavailable
+}
+
+// refreshRBDMonitors rewrites the persistent definition of a VM about to
+// start with each rbd disk's monitors as its pool resolves them now: a start
+// does not otherwise re-resolve them, so a monitor the cluster retired would
+// stay in the definition. Best effort: a failure leaves the definition as it
+// was (it still names the monitors it started with last time).
+func (s *Server) refreshRBDMonitors(ctx context.Context, vmName string) {
+	locators := s.rbdLocatorsOf(ctx, vmName)
+	if len(locators) == 0 || !s.virt.DomainExists(vmName) {
+		return
+	}
+	x, err := s.virt.DumpXMLInactive(vmName)
+	if err != nil {
+		return
+	}
+	out, changed, err := lv.RefreshRBDHosts(x, locators)
+	if err != nil || !changed {
+		return
+	}
+	if err := s.virt.DefineDomain(out); err != nil {
+		slog.Warn("rbd monitors not refreshed in the domain definition", "vm", vmName, "error", err)
+		return
+	}
+	slog.Info("rbd monitors refreshed in the domain definition", "vm", vmName)
 }

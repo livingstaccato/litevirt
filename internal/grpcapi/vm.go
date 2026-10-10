@@ -1726,8 +1726,11 @@ func (s *Server) PrepareHardwareForStart(ctx context.Context, vm *corrosion.VMRe
 	// libvirtd restart drops (it is ephemeral): put back before every start,
 	// on every start path, so none waits for the daemon's reconcile.
 	if err := s.ensureCephSecretsForVM(ctx, vm, ""); err != nil {
-		return releasePreflight, status.Errorf(codes.FailedPrecondition, "start %q: %v", vm.Name, err)
+		// FailedPrecondition only for what an operator must fix; anything
+		// transient is Unavailable, which every start path retries.
+		return releasePreflight, status.Errorf(cephErrCode(err), "start %q: %v", vm.Name, err)
 	}
+	s.refreshRBDMonitors(ctx, vm.Name)
 
 	// Adoption gate (fail-closed): a blocked VM must not (re)start under the active
 	// hardware_v2 regime — this covers ALL start callers (StartVM, RestartVM, restore/

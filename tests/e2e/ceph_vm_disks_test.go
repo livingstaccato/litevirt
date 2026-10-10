@@ -204,8 +204,8 @@ func TestLab_CephVMDisks(t *testing.T) {
 		l.lv(dst, "pool", "delete", elsewhere, "--host", dst, "--force")
 		l.ssh(dst, 30*time.Second, "rmdir "+shellQuote(elsewhereDir))
 	})
-	badYAML := fmt.Sprintf("name: %s\nvms:\n  %s:\n    cpu: 1\n    memory: %s\n    disks:\n      data:\n        size: \"64M\"\n        storage: %q\n      zz:\n        size: \"64M\"\n        storage: %q\n    placement:\n      host: %s\n",
-		badStack, bad, drillMemory(), pool, elsewhere, src)
+	badYAML := fmt.Sprintf("name: %s\nvms:\n  %s:\n    image: %s\n    cpu: 1\n    memory: %s\n    disks:\n      data:\n        size: \"64M\"\n        storage: %q\n      zz:\n        size: \"64M\"\n        storage: %q\n    placement:\n      host: %s\n",
+		badStack, bad, drillImage(), drillMemory(), pool, elsewhere, src)
 	badFile := "/tmp/" + badStack + ".yaml"
 	l.mustSSH(src, 30*time.Second, "echo "+base64.StdEncoding.EncodeToString([]byte(badYAML))+" | base64 -d > "+badFile)
 	t.Cleanup(func() { l.deleteVMs(badStack, map[string]string{src: bad}) })

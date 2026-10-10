@@ -649,10 +649,11 @@ func TestCephCloneDisk_KilledCopyStagingIsRemovedAfterTheWatchExpires(t *testing
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	f.before["deep cp"] = func() {
-		// rbd created the staging image, then was killed.
+		// rbd created the staging image — with the source's snapshot, which
+		// deep cp copies — then was killed.
 		for _, c := range f.calls {
 			if strings.HasPrefix(c, "deep cp ") {
-				f.images[strings.Fields(c)[3]] = map[string]bool{}
+				f.images[strings.Fields(c)[3]] = map[string]bool{"s1": false}
 			}
 		}
 		cancel()
@@ -744,5 +745,132 @@ func TestVolumeDrivers_RunThroughTheRunner(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("runner calls lack %q:\n%s", want, got)
 		}
+	}
+}
+
+// probeRun answers `rbd info` with out/exit, and `rbd ls` per lsOK.
+func probeRun(out string, exit int, lsOK bool, seen *[]string) cmdRunner {
+	return func(ctx context.Context, _ string, args ...string) ([]byte, error) {
+		*seen = append(*seen, strings.Join(args, " "))
+		for _, a := range args {
+			switch a {
+			case "info":
+				if exit == -1 {
+					return nil, context.DeadlineExceeded
+				}
+				return []byte(out), rbdExit(exit)
+			case "ls":
+				if lsOK {
+					return []byte("other-image"), nil
+				}
+				return []byte("rbd: couldn't connect to the cluster!"), rbdExit(110)
+			}
+		}
+		return nil, nil
+	}
+}
+
+// I-R2-1. A start refuses for good (FailedPrecondition) only on a failure an
+// operator must fix: a key the cluster denies (rbd exits 1 for EPERM — the
+// same as a generic failure, so only rbd's "Operation not permitted" text
+// counts — or 13 for EACCES), or an image that is not in a pool that answers.
+// Anything else — a timeout, a killed rbd, a generic exit 1, an unreachable
+// cluster — is transient, and the start is retried as on main.
+func TestCephProbeDisk_ClassifiesPermanentAndTransient(t *testing.T) {
+	keyring := "/etc/ceph/ceph.client.litevirt.keyring"
+	for _, tc := range []struct {
+		name      string
+		out       string
+		exit      int
+		lsOK      bool
+		permanent bool
+	}{
+		{"EPERM by its text", "rbd: error opening image x: (1) Operation not permitted", 1, true, true},
+		{"generic exit 1", "rbd: unknown error", 1, true, false},
+		{"EACCES", "rbd: error opening image x: (13) Permission denied", 13, true, true},
+		{"ENOENT, pool answers", "rbd: error opening image x: (2) No such file or directory", 2, true, true},
+		{"ENOENT, pool does not answer", "auth: unable to find a keyring: (2) No such file or directory", 2, false, false},
+		{"ETIMEDOUT", "rbd: couldn't connect to the cluster!", 110, true, false},
+		{"killed", "", -1, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var seen []string
+			d := &cephDriver{pool: "lv", opts: map[string]string{"id": "litevirt", "keyring": keyring}, run: probeRun(tc.out, tc.exit, tc.lsOK, &seen)}
+			err := d.ProbeDisk(context.Background(), "rbd:lv/x:id=litevirt:keyring="+keyring+":lvpool=ceph")
+			if err == nil {
+				t.Fatal("no error")
+			}
+			if got := IsPermanentCephError(err); got != tc.permanent {
+				t.Fatalf("permanent = %v, want %v (%v)", got, tc.permanent, err)
+			}
+			if tc.permanent && tc.exit != 2 && !strings.Contains(err.Error(), keyring) {
+				t.Errorf("a key refusal must name the keyring the pool names: %v", err)
+			}
+		})
+	}
+}
+
+// I-R2-1. The probe is bounded by rbd's own timeouts, and is not started at
+// all when the caller has less time left than that bound (the reconciler's
+// walk budget): the start is then deferred, not refused.
+func TestCephProbeDisk_IsBounded(t *testing.T) {
+	var seen []string
+	d := &cephDriver{pool: "lv", opts: map[string]string{}, run: probeRun("", 0, true, &seen)}
+	_ = d.ProbeDisk(context.Background(), "rbd:lv/x")
+	if len(seen) != 1 || !strings.Contains(seen[0], "--client_mount_timeout") || !strings.Contains(seen[0], "--rados_osd_op_timeout") {
+		t.Fatalf("rbd info args %q, want rbd's own timeouts", seen)
+	}
+	seen = nil
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	err := d.ProbeDisk(ctx, "rbd:lv/x")
+	if err == nil || IsPermanentCephError(err) || len(seen) != 0 {
+		t.Fatalf("short budget: err %v, rbd calls %v; want a transient deferral and no rbd", err, seen)
+	}
+}
+
+// Lab 2: a killed client's watch makes `rbd rm` BLOCK about 30 s and then
+// succeed. Every rm therefore gets a context of its own that outlasts that,
+// even when its caller's is shorter.
+func TestCephRm_PerCallTimeoutOutlastsABlockingWatch(t *testing.T) {
+	var deadline time.Duration
+	d := &cephDriver{pool: "lv", opts: map[string]string{}, run: func(ctx context.Context, _ string, args ...string) ([]byte, error) {
+		if dl, ok := ctx.Deadline(); ok {
+			deadline = time.Until(dl)
+		}
+		return nil, nil
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := d.DeleteDisk(ctx, "rbd:lv/a-root"); err != nil {
+		t.Fatal(err)
+	}
+	if deadline < 45*time.Second {
+		t.Fatalf("rbd rm ran with %v left, want at least 45 s", deadline)
+	}
+}
+
+// m2. A user delete of an image another client has open retries briefly,
+// then refuses with "in use" and who holds it — it does not wait out the
+// rollback budget.
+func TestCephDeleteDisk_InUseRefusesQuickly(t *testing.T) {
+	f := newFakeCeph()
+	f.installSleep(t)
+	f.images["lv/a-root"] = map[string]bool{}
+	f.watched = map[string]time.Duration{"lv/a-root": time.Hour}
+	f.failOut["status"] = struct {
+		out []byte
+		err error
+	}{[]byte("Watchers:\n\twatcher=10.78.0.13:0/123 client.4242 cookie=1"), nil}
+	d := &cephDriver{pool: "lv", opts: map[string]string{}, run: f.run}
+	err := d.DeleteDisk(context.Background(), "rbd:lv/a-root")
+	if err == nil || !strings.Contains(err.Error(), "in use") || !strings.Contains(err.Error(), "10.78.0.13") {
+		t.Fatalf("got %v, want an 'in use' refusal naming the watcher", err)
+	}
+	if f.now > 15*time.Second {
+		t.Fatalf("a user delete waited %v", f.now)
+	}
+	if !f.has("lv/a-root") {
+		t.Fatal("the image was removed")
 	}
 }

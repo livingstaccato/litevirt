@@ -2,6 +2,7 @@ package libvirt
 
 import (
 	"fmt"
+	"log/slog"
 
 	golibvirt "github.com/digitalocean/go-libvirt"
 )
@@ -59,18 +60,22 @@ func (c *Client) MigrateToTarget(name, dconnuri string, p MigrateParams) error {
 		_ = c.virt.DomainMigrateSetMaxDowntime(dom, uint64(p.MaxDowntimeMS), 0)
 	}
 
-	if len(p.CDROMSources) > 0 || len(p.RBDLocators) > 0 {
-		live, err := c.virt.DomainGetXMLDesc(dom, golibvirt.DomainXMLSecure|golibvirt.DomainXMLMigratable)
+	live := func() (string, error) {
+		x, err := c.virt.DomainGetXMLDesc(dom, golibvirt.DomainXMLSecure|golibvirt.DomainXMLMigratable)
 		if err != nil {
-			return fmt.Errorf("get migratable XML for %q: %w", name, err)
+			return "", fmt.Errorf("get migratable XML for %q: %w", name, err)
 		}
-		persist, err := c.virt.DomainGetXMLDesc(dom, golibvirt.DomainXMLSecure|golibvirt.DomainXMLMigratable|golibvirt.DomainXMLInactive)
+		return x, nil
+	}
+	persist := func() (string, error) {
+		x, err := c.virt.DomainGetXMLDesc(dom, golibvirt.DomainXMLSecure|golibvirt.DomainXMLMigratable|golibvirt.DomainXMLInactive)
 		if err != nil {
-			return fmt.Errorf("get persistent migratable XML for %q: %w", name, err)
+			return "", fmt.Errorf("get persistent migratable XML for %q: %w", name, err)
 		}
-		if p.DestXML, p.PersistXML, err = MigrationDomainXML(live, persist, p); err != nil {
-			return fmt.Errorf("domain %q: %w", name, err)
-		}
+		return x, nil
+	}
+	if p.DestXML, p.PersistXML, err = migrationDefinitions(p, live, persist); err != nil {
+		return fmt.Errorf("domain %q: %w", name, err)
 	}
 
 	flags, params := migrationFlagsAndParams(p)
@@ -243,14 +248,7 @@ func MigrationDomainXML(live, persist string, p MigrateParams) (dest, persistOut
 		}
 	}
 	if len(p.RBDLocators) > 0 {
-		hosts := make(map[string][]diskSourceHost, len(p.RBDLocators))
-		for name, loc := range p.RBDLocators {
-			_, src, _, berr := diskBacking(loc)
-			if berr != nil {
-				return "", "", fmt.Errorf("rbd disk %s: %w", name, berr)
-			}
-			hosts[name] = src.Hosts
-		}
+		hosts := ResolveRBDHosts(p.RBDLocators)
 		if dest, err = RewriteRBDHosts(dest, hosts); err != nil {
 			return "", "", err
 		}
@@ -259,4 +257,59 @@ func MigrationDomainXML(live, persist string, p MigrateParams) (dest, persistOut
 		}
 	}
 	return dest, persistOut, nil
+}
+
+// migrationDefinitions is MigrateToTarget's choice: with CD-ROM remaps or rbd
+// locators it fetches the live and persistent definitions and builds the
+// destination ones (MigrationDomainXML); otherwise the domain migrates as it
+// is ("", "").
+func migrationDefinitions(p MigrateParams, live, persist func() (string, error)) (string, string, error) {
+	if len(p.CDROMSources) == 0 && len(p.RBDLocators) == 0 {
+		return "", "", nil
+	}
+	l, err := live()
+	if err != nil {
+		return "", "", err
+	}
+	ps, err := persist()
+	if err != nil {
+		return "", "", err
+	}
+	return MigrationDomainXML(l, ps, p)
+}
+
+// ResolveRBDHosts resolves, for each rbd disk (by image spec), the monitors
+// its locator names now (diskBacking: the pool's current mon_host or conf).
+// A disk that does not resolve, or resolves to no monitors, is left out: its
+// definition keeps the <host> list it has — never an empty one, which would
+// leave qemu to whatever ceph.conf the host happens to have.
+func ResolveRBDHosts(locators map[string]string) map[string][]diskSourceHost {
+	hosts := make(map[string][]diskSourceHost, len(locators))
+	for name, loc := range locators {
+		_, src, _, err := diskBacking(loc)
+		if err != nil {
+			slog.Warn("rbd disk monitors not re-resolved; keeping its current <host> list", "disk", name, "error", err)
+			continue
+		}
+		if len(src.Hosts) == 0 {
+			continue
+		}
+		hosts[name] = src.Hosts
+	}
+	return hosts
+}
+
+// RefreshRBDHosts rewrites a domain definition's rbd <host> lists with the
+// monitors each disk's locator resolves to now (ResolveRBDHosts); changed is
+// false when nothing differs.
+func RefreshRBDHosts(domXML string, locators map[string]string) (out string, changed bool, err error) {
+	hosts := ResolveRBDHosts(locators)
+	if len(hosts) == 0 {
+		return domXML, false, nil
+	}
+	out, err = RewriteRBDHosts(domXML, hosts)
+	if err != nil {
+		return domXML, false, err
+	}
+	return out, out != domXML, nil
 }

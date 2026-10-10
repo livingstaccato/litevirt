@@ -32,9 +32,10 @@ type cephWorld struct {
 	images map[string]map[string]bool // ref → snapshot → protected
 	sizes  map[string]int64
 	calls  []string
-	// infoExit makes `rbd info` exit with that errno (EACCES 13, ENOENT 2),
-	// as with a key the cluster does not accept.
+	// infoExit makes `rbd info` exit with that status (rbd exits with the
+	// errno: EPERM 1, ENOENT 2, ETIMEDOUT 110 …), printing infoOut.
 	infoExit int
+	infoOut  string
 }
 
 // cephExit is a failed rbd command as exec reports it (rbd exits with the errno).
@@ -112,7 +113,7 @@ func (w *cephWorld) run(_ context.Context, name string, args ...string) ([]byte,
 		}
 	case "info":
 		if w.infoExit != 0 {
-			return []byte("rbd: error opening image: injected"), cephExit(w.infoExit)
+			return []byte(w.infoOut), cephExit(w.infoExit)
 		}
 		ref, snap, _ := strings.Cut(pos[0], "@")
 		s, ok := w.images[ref]
@@ -617,21 +618,84 @@ func TestCephDisk_ResizeAndSnapshotAreRefusedClearly(t *testing.T) {
 	}
 }
 
-// N3. Every start proves this host's own key opens the disk (rbd info with
-// the pool's credentials), and refuses with the reason when it does not.
+// N3 / I-R2-1. Every start proves this host's own key opens the disk (rbd
+// info with the pool's credentials). It refuses for good (FailedPrecondition,
+// naming the host and the keyring) only when rbd is unambiguous that an
+// operator must act; anything else is Unavailable, which every start path
+// retries — as main retried a start that failed in qemu.
 func TestPrepareHardwareForStart_ProvesTheKeyWithRBD(t *testing.T) {
 	for _, tc := range []struct {
-		errno int
-		want  string
-	}{{13, "permission"}, {1, "permission"}, {2, "not in the cluster"}} {
-		f := newCephPoolFixture(t)
-		vm := f.insertCephVM(t, "pk", "test-host")
-		f.world.infoExit = tc.errno
-		_, err := f.s.PrepareHardwareForStart(context.Background(), &vm)
-		if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), tc.want) ||
-			!strings.Contains(err.Error(), "test-host") {
-			t.Fatalf("rbd info exit %d: got %v, want FailedPrecondition naming %q and the host", tc.errno, err, tc.want)
-		}
+		name string
+		exit int
+		out  string
+		code codes.Code
+		want string
+	}{
+		{"EPERM (lab 2: caps denial exits 1)", 1, "rbd: error opening image pk-data: (1) Operation not permitted", codes.FailedPrecondition, "permission"},
+		{"EACCES", 13, "rbd: error opening image pk-data: (13) Permission denied", codes.FailedPrecondition, "permission"},
+		{"ENOENT, the pool answers", 2, "rbd: error opening image pk-data: (2) No such file or directory", codes.FailedPrecondition, "not in the cluster"},
+		{"generic exit 1", 1, "rbd: something unexpected", codes.Unavailable, "retried"},
+		{"ETIMEDOUT", 110, "rbd: couldn't connect to the cluster!", codes.Unavailable, "retried"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newCephPoolFixture(t)
+			vm := f.insertCephVM(t, "pk", "test-host")
+			f.world.infoExit, f.world.infoOut = tc.exit, tc.out
+			_, err := f.s.PrepareHardwareForStart(context.Background(), &vm)
+			if status.Code(err) != tc.code || !strings.Contains(err.Error(), tc.want) || !strings.Contains(err.Error(), "test-host") {
+				t.Fatalf("got %v, want %v naming %q and the host", err, tc.code, tc.want)
+			}
+			if tc.code == codes.FailedPrecondition && tc.want == "permission" && !strings.Contains(err.Error(), f.keyring) {
+				t.Fatalf("a key refusal must name the keyring path: %v", err)
+			}
+		})
+	}
+}
+
+// I-R2-1 / m4 (N7). A failure to READ this host's pools is not "no such
+// pool": it neither falls back to the locator nor refuses for good — the
+// start is Unavailable and retried.
+func TestPrepareHardwareForStart_PoolReadErrorIsRetried(t *testing.T) {
+	f := newCephPoolFixture(t)
+	vm := f.insertCephVM(t, "rd", "test-host")
+	f.s.removeStoragePoolRef("ceph") // not cached: the table is read
+	if err := f.s.db.Execute(context.Background(), `ALTER TABLE storage_pools RENAME TO storage_pools_gone`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.s.resolveVolume(context.Background(), "", "ceph"); err == nil || errors.Is(err, errStorageNotFound) {
+		t.Fatalf("resolveVolume on an unreadable pool table: %v, want an error that is not errStorageNotFound", err)
+	}
+	if _, err := f.s.PrepareHardwareForStart(context.Background(), &vm); status.Code(err) != codes.Unavailable {
+		t.Fatalf("start with an unreadable pool table: %v, want Unavailable", err)
+	}
+}
+
+// m1. The pool-less paths (delete, the start/migration fallback) reach a
+// cluster the locator names only by its mon_host.
+func TestRBDPathOptions_CarriesMonHost(t *testing.T) {
+	o := rbdPathOptions(`rbd:lv/x:id=litevirt:keyring=/k:lvpool=ceph:mon_host=10.0.0.1\:6789\;10.0.0.2`)
+	if o["mon_host"] != "10.0.0.1:6789;10.0.0.2" || o["id"] != "litevirt" || o["keyring"] != "/k" {
+		t.Fatalf("rbdPathOptions = %v", o)
+	}
+}
+
+// Lab 2: a restart did not re-resolve monitors. A start re-resolves each rbd
+// disk's <host> list into the domain's persistent definition, so a monitor
+// that was removed does not stay in it.
+func TestPrepareHardwareForStart_RefreshesMonitorsInThePersistentXML(t *testing.T) {
+	f := newCephPoolFixture(t)
+	defer lv.SetCephMonitorResolver(f.s.CephMonitorsForPool)()
+	vm := f.insertCephVM(t, "mr", "test-host")
+	stale := `<domain type="kvm"><name>mr</name><devices><disk type="network" device="disk"><driver name="qemu" type="raw"></driver><source protocol="rbd" name="lv/mr-data"><host name="10.0.0.99" port="6789"></host><auth username="litevirt"><secret type="ceph" uuid="` + f.secret + `"></secret></auth></source><target dev="vda" bus="virtio"></target></disk></devices></domain>`
+	if err := f.fake.DefineDomain(stale); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.s.PrepareHardwareForStart(context.Background(), &vm); err != nil {
+		t.Fatal(err)
+	}
+	x, _ := f.fake.DumpXMLInactive("mr")
+	if strings.Contains(x, "10.0.0.99") || !strings.Contains(x, "10.78.0.22") || !strings.Contains(x, f.secret) {
+		t.Fatalf("persistent definition after a start:\n%s", x)
 	}
 }
 

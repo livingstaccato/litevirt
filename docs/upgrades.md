@@ -614,7 +614,10 @@ Once it has latched on a host (and `credentials_split_v1` has too):
   are repaired separately) refuses that login with "its credential has not
   reached this node yet" until it has, rather than guess. An external user
   that existed before `credentials_split_v1` latched is given an empty
-  credential row by each host's first split pass, so it keeps logging in.
+  credential row by the first split pass of the hosts that held it before the
+  clear, so it keeps logging in. A host added after the clear refuses such a
+  login until that credential row has reached it, usually within one
+  anti-entropy cycle.
 
 From then on no public row, and no operator-safe state dump, carries a
 password hash, an API token hash or an IPMI password. `lv user reset-admin`

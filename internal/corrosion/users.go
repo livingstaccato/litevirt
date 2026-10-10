@@ -64,6 +64,12 @@ func InsertUser(ctx context.Context, c *Client, username, role, passwordHash str
 		}
 		return c.Execute(ctx, usersReactivateSQL, role, passwordHash, now, username)
 	}
+	if passwordHash == "" && !split {
+		// An external-realm shadow made where no credential row can be
+		// written yet: remember it here, the positive evidence this node's
+		// first live pass replicates (credentials_live.go).
+		defer c.noteExternalShadow(username)
+	}
 	if split {
 		return c.ExecuteBatch(ctx, []Statement{
 			{SQL: usersInsertSQL, Params: []interface{}{username, role, c.oldColumnValue(passwordHash), nowRFC3339(), now}},

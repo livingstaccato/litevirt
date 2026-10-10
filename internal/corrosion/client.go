@@ -408,6 +408,13 @@ type Client struct {
 	// credentialsLiveFile. credentialsLiveChecked makes the file read once.
 	credentialsLive        atomic.Bool
 	credentialsLiveChecked atomic.Bool
+	// credentialsBaselineHeld / credentialsBaselineNoted: the credentials
+	// baseline (credentials_live.go), cached.
+	credentialsBaselineHeld  atomic.Bool
+	credentialsBaselineNoted atomic.Bool
+	// externalSeenSet caches credentials_external_seen (credentials_live.go).
+	externalSeenMu  sync.Mutex
+	externalSeenSet map[string]bool
 
 	// hostMembershipGate, when non-nil and returning true, permits WRITING
 	// host_membership. Injected via SetHostMembershipGate, wired to the durable

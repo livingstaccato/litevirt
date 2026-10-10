@@ -339,6 +339,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if err := corrosion.InitSchema(ctx, d.db); err != nil {
 		return fmt.Errorf("init schema: %w", err)
 	}
+	// Record, once, whether this node held users rows before anything could
+	// replicate in: the positive evidence an external-realm login needs on a
+	// node that is not credentials-live yet (corrosion/credentials_live.go).
+	if err := d.db.NoteCredentialsBaseline(ctx); err != nil {
+		return fmt.Errorf("record the credentials baseline: %w", err)
+	}
 
 	// Derive the cluster record from this node's CA if the cluster has none.
 	// Presence-gated and idempotent — see corrosion.EnsureClusterRecord for why

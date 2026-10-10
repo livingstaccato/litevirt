@@ -118,13 +118,32 @@ a local account, and a non-empty `password_hash` was what identified a local
 account. After the clear every local account's old column is empty, and
 anti-entropy can deliver its users row before its credential row. The guard
 now reads the credential row (`corrosion.UserLocalCredential`) and refuses when
-it cannot tell. For that to hold, a missing credential row has to mean "not
-arrived yet", never "external": a node's first split pass gives every
-pre-existing external user an empty credential row at a floor timestamp
-(`credentials_live.go`), and `credentials_clear_v1` is advertised only by a node
-that has completed that pass, so the pass always runs before any clear. A node
-that first passes after the clear (a joiner) skips the materialisation when it
-holds any cleared row, and gets those rows from its peers.
+it cannot tell. An empty old column with no credential row is judged
+"external" only on POSITIVE evidence, never from the absence of a cleared row
+in view (`credentials_live.go`):
+
+- the node created the shadow itself while it could not write a credential row
+  yet (recorded node-locally, `credentials_external_seen`);
+- or the node started on this build with its users rows already in its
+  database (the credentials baseline, recorded once at first start), so its
+  first split pass ran before any clear could exist — `credentials_clear_v1`
+  is advertised only by a node that has completed that pass.
+
+On that evidence the node's first pass gives each such user an empty
+credential row at a floor timestamp, which replicates the evidence to every
+peer. A node that started with an empty database — every host added after
+the clear — has no such evidence: it never materialises, and until a user's
+credential row arrives it refuses an external login under that name
+("its credential has not reached this node yet"). That is fail-closed and
+lasts until its sensitive lane merges. A node whose gates open together
+decides before its own clears are in view.
+
+Known limit: a host that holds its users rows across an outage spanning the
+clear (switched off with data, upgraded to this build while off) records a
+"held" baseline and may treat a cleared local account as external if its
+first pass runs before anti-entropy has brought the cleared rows' credentials.
+docs/upgrades.md already requires such a host to be upgraded before it rejoins;
+reseed it instead if it was off across the latch.
 
 ## Tests
 

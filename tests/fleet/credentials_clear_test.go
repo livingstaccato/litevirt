@@ -30,6 +30,10 @@ import (
 func latchAndClear(t *testing.T, nodes ...*Node) {
 	t.Helper()
 	for _, n := range nodes {
+		// As the daemon does at start (a no-op once recorded).
+		if err := n.DB.NoteCredentialsBaseline(context.Background()); err != nil {
+			t.Fatalf("%s baseline: %v", n.Name, err)
+		}
 		n.DB.SetCredentialsSplitGate(func() bool { return true })
 		n.DB.SetCredentialsClearGate(func() bool { return true })
 		if _, err := n.DB.SplitCredentials(context.Background()); err != nil {
@@ -383,5 +387,126 @@ func TestFleet_CredentialsClear_AnUnlatchedNeighboursRotationReachesAClearedNode
 	}
 	if got := oldColumn(t, a, `SELECT password_hash FROM users WHERE username = 'lena'`); got != "" {
 		t.Errorf("%s: users.password_hash = %q after its next pass; the cleared node must empty it again", a.Name, got)
+	}
+}
+
+// TestFleet_CredentialsClear_AJoinerNeverAdoptsAClearedLocalAccount
+// (re-review I1): a host added after the clear starts with an empty database.
+// Its public lane merges the cleared users rows; its sensitive lane has not
+// merged, and the cluster has no API tokens and no IPMI-fenced hosts, so
+// nothing on it shows a clear. An LDAP principal named after the local admin
+// is refused there before and after the joiner's first credentials pass. A
+// pre-split external user is refused too until its credential row (the floor
+// row the founders' first passes wrote) arrives, and logs in after.
+func TestFleet_CredentialsClear_AJoinerNeverAdoptsAClearedLocalAccount(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: 2693})
+	a, b, j := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	if err := j.DB.NoteCredentialsBaseline(ctx); err != nil { // j's first start: empty
+		t.Fatal(err)
+	}
+	c.Isolate(j)
+	if err := corrosion.InsertUser(ctx, a.DB, "ext", "viewer", ""); err != nil { // pre-split shadow
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertUser(ctx, a.DB, "admin", "admin", "$2a$10$cluster-admin-hash"); err != nil {
+		t.Fatal(err)
+	}
+	c.WaitConverged(t, convergeTimeout, a, b)
+	latchAndClear(t, a, b)
+	c.WaitConverged(t, convergeTimeout, a, b)
+
+	// j joins: no WAL pushes reach it, and neither source serves the
+	// sensitive lane, so only the public rows arrive.
+	c.ClearLinkFaults()
+	c.SetLinkFault(a, j, LinkFault{Block: true})
+	c.SetLinkFault(b, j, LinkFault{Block: true})
+	restoreA := a.DoNotImplement("GetSensitiveStateDigest")
+	restoreB := b.DoNotImplement("GetSensitiveStateDigest")
+	corrosion.NewAntiEntropy(j.DB, j.PKIDir, 0).RunOnce(ctx)
+	if u, _ := corrosion.GetUser(ctx, j.DB, "admin"); u == nil || u.PasswordHash != "" {
+		t.Fatalf("%s holds admin as %+v; the scenario needs the cleared users row alone", j.Name, u)
+	}
+	ldap := func(subject string) error {
+		return auth.EnsureUserShadow(ctx, j.DB, &auth.Principal{Subject: subject, Realm: "ldap:corp"}, "viewer")
+	}
+	if err := ldap("admin"); err == nil {
+		t.Fatal("before its first pass, the joiner let an LDAP principal adopt the local admin")
+	}
+	latchAndSplit(t, j)
+	if err := ldap("admin"); err == nil {
+		t.Fatal("after its first pass, the joiner let an LDAP principal adopt the local admin")
+	}
+	if rows, err := j.DB.Query(ctx, `SELECT COUNT(*) AS n FROM user_credentials`); err != nil || len(rows) != 1 || rows[0].Int64("n") != 0 {
+		t.Errorf("the joiner wrote credential rows for accounts it cannot judge (err %v)", err)
+	}
+	if err := ldap("ext"); err == nil {
+		t.Error("before its credential row arrived, the joiner judged ext external on no evidence")
+	}
+
+	restoreA()
+	restoreB()
+	corrosion.NewAntiEntropy(j.DB, j.PKIDir, 0).RunOnce(ctx)
+	if err := ldap("ext"); err != nil {
+		t.Errorf("the pre-split external user is refused after its credential row arrived: %v", err)
+	}
+	if err := ldap("admin"); err == nil {
+		t.Error("an LDAP principal adopted the local admin after its credential arrived")
+	}
+}
+
+// TestFleet_CredentialsClear_ASettledUsersTieDoesNotHoldBackCredentials
+// (re-review m3): a users table whose only difference from a peer is a tie
+// already tracked is deferred by scheduled anti-entropy. That deferral says
+// nothing about re-mints (a refused re-mint is not a tie, so it never settles),
+// so the peer's credentials are still repaired, as on main.
+func TestFleet_CredentialsClear_ASettledUsersTieDoesNotHoldBackCredentials(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 2})
+	a, b := c.Nodes[0], c.Nodes[1]
+	b.DB.SetMembersForTests(func() []corrosion.PeerInfo { return []corrosion.PeerInfo{{Name: a.Name}} })
+	latchAndClear(t, a, b)
+	if err := corrosion.InsertUser(ctx, a.DB, "mia", "operator", "$2a$10$mia-before"); err != nil {
+		t.Fatal(err)
+	}
+	pumpMutations(t, c, a, b)
+
+	// An unresolved users tie, beneath the replicator on both sides.
+	const ts = "2026-01-01T00:00:00.000000000Z"
+	for _, n := range []*Node{a, b} {
+		n.DB.Mu().Lock()
+		_, err := n.DB.DB().Exec(`INSERT INTO users (username, role, password_hash, created_at, updated_at)
+			VALUES ('tied', ?, '', '2026-01-01T00:00:00Z', ?)`, "role-"+n.Name, ts)
+		n.DB.Mu().Unlock()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !corrosion.NewAntiEntropy(b.DB, b.PKIDir, 0).RunOnce(ctx) {
+		t.Fatal("catch-up pass did not run")
+	}
+	if b.DB.UnresolvedTieCount() == 0 {
+		t.Fatal("precondition: the users tie is not tracked, so the table can never settle")
+	}
+
+	// A rotation reaches b's public lane only: its sensitive pull fails.
+	if err := corrosion.UpdateUserPassword(ctx, a.DB, "mia", "$2a$10$mia-after"); err != nil {
+		t.Fatal(err)
+	}
+	restore := a.DoNotImplement("GetSensitiveStateDigest")
+	corrosion.NewAntiEntropy(b.DB, b.PKIDir, 0).RunOnce(ctx)
+	restore()
+	if u, _ := corrosion.GetUser(ctx, b.DB, "mia"); u == nil || u.PasswordHash != "$2a$10$mia-before" {
+		t.Fatalf("precondition: b serves %+v; the scenario needs the old credential still in place", u)
+	}
+
+	// Scheduled passes: users is settled (only the tracked tie differs) and
+	// deferred; the credential must still be repaired.
+	for i := 0; i < 2; i++ {
+		corrosion.NewAntiEntropy(b.DB, b.PKIDir, 0).RunSampledOnce(ctx)
+	}
+	if u, _ := corrosion.GetUser(ctx, b.DB, "mia"); u == nil || u.PasswordHash != "$2a$10$mia-after" {
+		t.Errorf("b serves %+v after scheduled passes, want the rotation: a settled users tie held "+
+			"back the peer's credentials, and the rotated-out password keeps working", u)
 	}
 }

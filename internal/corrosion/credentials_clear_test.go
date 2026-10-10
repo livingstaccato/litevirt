@@ -337,6 +337,11 @@ func TestCredentialsLive_FirstPassMaterialisesLegacyShadows(t *testing.T) {
 	if err := InsertUser(ctx, c, "alice", "operator", "$2a$10$alice"); err != nil {
 		t.Fatal(err)
 	}
+	// This build first starts on a node that already holds these rows: the
+	// positive evidence that an empty old column predates any clear.
+	if err := c.NoteCredentialsBaseline(ctx); err != nil {
+		t.Fatal(err)
+	}
 	if local, known, err := UserLocalCredential(ctx, c, "ext"); err != nil || local || !known {
 		t.Fatalf("pre-latch shadow: local=%v known=%v err=%v, want an external user", local, known, err)
 	}
@@ -366,6 +371,9 @@ func TestCredentialsLive_FirstPassMaterialisesLegacyShadows(t *testing.T) {
 func TestCredentialsLive_AJoinerAfterTheClearMaterialisesNothing(t *testing.T) {
 	ctx := context.Background()
 	c := newTestDB(t)
+	if err := c.NoteCredentialsBaseline(ctx); err != nil { // a joiner starts empty
+		t.Fatal(err)
+	}
 	for _, q := range []string{
 		`INSERT INTO users (username, role, password_hash, created_at, updated_at) VALUES ('alice', 'operator', '', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00.000000001Z')`,
 		`INSERT INTO user_credentials (username, password_hash, updated_at) VALUES ('alice', '$2a$10$alice', '2026-01-01T00:00:00Z')`,
@@ -388,5 +396,68 @@ func TestCredentialsLive_AJoinerAfterTheClearMaterialisesNothing(t *testing.T) {
 	if _, known, err := UserLocalCredential(ctx, c, "bob"); err != nil || known {
 		t.Errorf("UserLocalCredential(bob) known=%v err=%v; a missing credential row on a cleared cluster "+
 			"must not read as an external user", known, err)
+	}
+}
+
+// TestCredentialsLive_ANeverLiveJoinerWithoutEvidenceJudgesNothingExternal
+// (re-review I1): a joiner whose public lane has merged cleared users rows and
+// whose sensitive lane has not holds no cleared PAIR — and on a cluster with no
+// API tokens and no IPMI-fenced hosts no pair of any kind. Absence of evidence
+// is not evidence: before its first pass and after it, an empty old column with
+// no credential row is a local account it cannot verify, never an external
+// user, and its first pass writes no floor rows for it.
+func TestCredentialsLive_ANeverLiveJoinerWithoutEvidenceJudgesNothingExternal(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	if err := c.NoteCredentialsBaseline(ctx); err != nil { // started empty
+		t.Fatal(err)
+	}
+	if err := c.execLocal(ctx, `INSERT INTO users (username, role, password_hash, created_at, updated_at)
+		VALUES ('admin', 'admin', '', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00.000000001Z')`); err != nil {
+		t.Fatal(err)
+	}
+	if local, known, err := UserLocalCredential(ctx, c, "admin"); err != nil || known {
+		t.Fatalf("before the first pass: local=%v known=%v err=%v; a cleared local admin read as external", local, known, err)
+	}
+	c.SetCredentialsSplitGate(func() bool { return true })
+	if _, err := c.SplitCredentials(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := tableCount(t, c, "user_credentials"); n != 0 {
+		t.Errorf("the joiner's first pass wrote %d floor credential rows for accounts it cannot judge", n)
+	}
+	if _, known, err := UserLocalCredential(ctx, c, "admin"); err != nil || known {
+		t.Errorf("after the first pass: known=%v err=%v; the cleared local admin must stay unverifiable", known, err)
+	}
+}
+
+// TestCredentialsLive_TheFirstPassJudgesBeforeItsOwnClears: a node whose split
+// and clear gates open together must decide its legacy external users before
+// its own clears are in view — a cleared row it just wrote is "clear evidence",
+// and would stop the materialisation that keeps a pre-split external user
+// logging in.
+func TestCredentialsLive_TheFirstPassJudgesBeforeItsOwnClears(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	for _, q := range []string{
+		`INSERT INTO users (username, role, password_hash, created_at, updated_at) VALUES ('legacy-ext', 'viewer', '', '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z')`,
+		`INSERT INTO users (username, role, password_hash, created_at, updated_at) VALUES ('local', 'operator', '$2a$10$local', '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z')`,
+	} {
+		if err := c.execLocal(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := c.NoteCredentialsBaseline(ctx); err != nil { // held: it had these rows
+		t.Fatal(err)
+	}
+	openClearGates(c)
+	if _, err := c.SplitCredentials(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if local, known, err := UserLocalCredential(ctx, c, "legacy-ext"); err != nil || !known || local {
+		t.Errorf("legacy-ext: local=%v known=%v err=%v, want a known external user", local, known, err)
+	}
+	if got := oneString(t, c, `SELECT password_hash FROM users WHERE username = 'local'`, "password_hash"); got != "" {
+		t.Errorf("the local account was not cleared (%q)", got)
 	}
 }

@@ -2,9 +2,12 @@ package corrosion
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 )
 
 // "Credentials live": this node has completed a SplitCredentials pass with the
@@ -31,13 +34,75 @@ import (
 // (UserLocalCredential.)
 //
 // The materialisation is safe on that pass because of READINESS: no clear can
-// exist yet. A node that joins a cluster that has already cleared reaches its
-// first pass after the clear; it skips the materialisation whenever it holds
-// any row that shows a clear (clearEvidence), and receives the shadows' rows
-// from its peers instead.
+// exist yet — but only on a node that was part of the cluster BEFORE the clear
+// latched. A node that joins afterwards reaches its first pass after the clear,
+// and an empty old column there may be a cleared local account whose
+// credential row has not arrived. Absence of a cleared row in view is no proof
+// of anything (its sensitive lane may simply not have merged yet), so the
+// decision rests on POSITIVE evidence recorded at the node's first start on
+// this build (the credentials baseline): a node that started with users rows
+// already in its database held them before it could see a clear, and its first
+// pass may treat an empty old column with no credential row as a pre-split
+// external user. A node that started EMPTY — every joiner — never materialises
+// and never treats an absence as external; it receives the shadows' rows from
+// the peers that did. clearEvidence remains as a second guard.
 
 // credentialsLiveFile is the durable half of credentialsLive. NODE-LOCAL.
 const credentialsLiveFile = "credentials_split_live"
+
+// credentialsBaselineFile records, once, what this node's database held when
+// it first started on a build that knows the credentials baseline: "held" when
+// it already had users rows, "empty" otherwise. NODE-LOCAL.
+const credentialsBaselineFile = "credentials_baseline"
+
+// NoteCredentialsBaseline records the credentials baseline if it has not been
+// recorded yet. The daemon calls it right after InitSchema, before replication
+// or anti-entropy can bring any row. Idempotent: the first answer stands.
+func (c *Client) NoteCredentialsBaseline(ctx context.Context) error {
+	if c.credentialsBaselineHeld.Load() || c.credentialsBaselineNoted.Load() {
+		return nil
+	}
+	if c.dataDir != "" {
+		b, err := os.ReadFile(filepath.Join(c.dataDir, credentialsBaselineFile))
+		if err == nil {
+			c.credentialsBaselineNoted.Store(true)
+			c.credentialsBaselineHeld.Store(strings.TrimSpace(string(b)) == "held")
+			return nil
+		}
+		if !os.IsNotExist(err) {
+			return err
+		}
+	}
+	held, err := UsersEverExisted(ctx, c)
+	if err != nil {
+		return err
+	}
+	if c.dataDir != "" {
+		v := "empty\n"
+		if held {
+			v = "held\n"
+		}
+		if err := os.WriteFile(filepath.Join(c.dataDir, credentialsBaselineFile), []byte(v), 0o600); err != nil {
+			return err
+		}
+	}
+	c.credentialsBaselineHeld.Store(held)
+	c.credentialsBaselineNoted.Store(true)
+	return nil
+}
+
+// credentialsBaselineHeldNow reports the recorded baseline: true only for a
+// node that started with users rows in its database. Unrecorded reads false:
+// fail closed, as for a joiner.
+func (c *Client) credentialsBaselineHeldNow() bool {
+	if !c.credentialsBaselineNoted.Load() && c.dataDir != "" {
+		if b, err := os.ReadFile(filepath.Join(c.dataDir, credentialsBaselineFile)); err == nil {
+			c.credentialsBaselineHeld.Store(strings.TrimSpace(string(b)) == "held")
+			c.credentialsBaselineNoted.Store(true)
+		}
+	}
+	return c.credentialsBaselineHeld.Load()
+}
 
 // credentialFloorTS stamps a materialised shadow credential: older than any
 // real write, so it never replaces a credential and only fills an absence.
@@ -70,11 +135,15 @@ func (c *Client) afterCredentialPass(ctx context.Context, passErr error) {
 		slog.Warn("credentials split: could not check for cleared rows; not live yet", "error", err)
 		return
 	}
-	if !evidence {
+	if !evidence && c.credentialsBaselineHeldNow() {
 		if err := c.materialiseShadowCredentials(ctx); err != nil {
 			slog.Warn("credentials split: shadow credentials incomplete; not live yet", "error", err)
 			return
 		}
+	}
+	if err := c.materialiseSeenShadows(ctx); err != nil {
+		slog.Warn("credentials split: shadow credentials incomplete; not live yet", "error", err)
+		return
 	}
 	c.credentialsLive.Store(true)
 	if c.dataDir == "" {
@@ -119,6 +188,27 @@ func (c *Client) materialiseShadowCredentials(ctx context.Context) error {
 	return nil
 }
 
+// materialiseSeenShadows gives every shadow this node itself created
+// (externalSeen) an empty floor credential row, when it still has none. That is
+// positive evidence whatever else is in view.
+func (c *Client) materialiseSeenShadows(ctx context.Context) error {
+	for _, name := range c.externalSeenNames() {
+		rows, err := c.Query(ctx, `SELECT u.username FROM users u
+			 WHERE u.username = ? AND u.password_hash = ''
+			   AND NOT EXISTS (SELECT 1 FROM user_credentials k WHERE k.username = u.username)`, name)
+		if err != nil {
+			return err
+		}
+		if len(rows) == 0 {
+			continue
+		}
+		if err := c.copyUserCredential(ctx, name, "", credentialFloorTS); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // UserLocalCredential reports whether username is a LOCAL account — one with
 // a password — and whether this node can tell. known is false only for a live
 // users row with an empty old column and no credential row on a node where a
@@ -142,7 +232,16 @@ func UserLocalCredential(ctx context.Context, c *Client, username string) (local
 	if r.String("password_hash") != "" {
 		return true, true, nil
 	}
+	if c.externalSeen(username) {
+		return false, true, nil // this node created it as a shadow
+	}
 	if c.CredentialsLive() {
+		return false, false, nil
+	}
+	// Not live yet: an empty old column with no credential row is an external
+	// user only on positive evidence — a node that held its users rows before
+	// it could see any clear — and never when a cleared row is in view.
+	if !c.credentialsBaselineHeldNow() {
 		return false, false, nil
 	}
 	evidence, err := clearEvidence(ctx, c)
@@ -150,4 +249,74 @@ func UserLocalCredential(ctx context.Context, c *Client, username string) (local
 		return false, false, err
 	}
 	return false, !evidence, nil
+}
+
+// externalSeenFile lists the usernames THIS node created as external-realm
+// shadows while it could not write a credential row (credentials_split_v1 not
+// latched here): positive, node-local evidence that their empty old column is
+// empty by design. The node's first live pass gives each an empty credential
+// row at the floor, which replicates that evidence. NODE-LOCAL.
+const externalSeenFile = "credentials_external_seen"
+
+// noteExternalShadow records username as a shadow this node created.
+func (c *Client) noteExternalShadow(username string) {
+	c.externalSeenMu.Lock()
+	defer c.externalSeenMu.Unlock()
+	seen := c.loadExternalSeenLocked()
+	if seen[username] {
+		return
+	}
+	seen[username] = true
+	if c.dataDir == "" {
+		return
+	}
+	names := make([]string, 0, len(seen))
+	for n := range seen {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	b, _ := json.Marshal(names)
+	if err := os.WriteFile(filepath.Join(c.dataDir, externalSeenFile), b, 0o600); err != nil {
+		slog.Warn("credentials: could not record an external shadow; it is judged by the credential row instead",
+			"user", username, "error", err)
+	}
+}
+
+// externalSeen reports whether this node created username as a shadow.
+func (c *Client) externalSeen(username string) bool {
+	c.externalSeenMu.Lock()
+	defer c.externalSeenMu.Unlock()
+	return c.loadExternalSeenLocked()[username]
+}
+
+func (c *Client) externalSeenNames() []string {
+	c.externalSeenMu.Lock()
+	defer c.externalSeenMu.Unlock()
+	out := make([]string, 0)
+	for n := range c.loadExternalSeenLocked() {
+		out = append(out, n)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (c *Client) loadExternalSeenLocked() map[string]bool {
+	if c.externalSeenSet != nil {
+		return c.externalSeenSet
+	}
+	c.externalSeenSet = map[string]bool{}
+	if c.dataDir == "" {
+		return c.externalSeenSet
+	}
+	b, err := os.ReadFile(filepath.Join(c.dataDir, externalSeenFile))
+	if err != nil {
+		return c.externalSeenSet
+	}
+	var names []string
+	if json.Unmarshal(b, &names) == nil {
+		for _, n := range names {
+			c.externalSeenSet[n] = true
+		}
+	}
+	return c.externalSeenSet
 }

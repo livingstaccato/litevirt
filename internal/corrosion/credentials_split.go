@@ -324,10 +324,28 @@ func (c *Client) SplitCredentials(ctx context.Context) (CredentialSplitReport, e
 		return rep, nil
 	}
 	if c.MayClearCredentialColumns() {
+		// A node's FIRST pass decides which empty old columns are external
+		// users (credentials_live.go), and its own clears must not be in view
+		// when it does: copy and go live first, then clear. In production the
+		// clear cannot latch before this node is live (the advertisement
+		// gate), so this only orders a node whose gates opened together.
+		if !c.CredentialsLive() {
+			if _, err := c.copyCredentialColumns(ctx); err != nil {
+				return rep, err
+			}
+		}
 		rep, err := c.clearCredentialColumns(ctx)
 		c.afterCredentialPass(ctx, err)
 		return rep, err
 	}
+	return c.copyCredentialColumns(ctx)
+}
+
+// copyCredentialColumns is the dual-write pass: copy every old-column secret
+// that has no credential row, touch no old column, then go live after a
+// complete pass.
+func (c *Client) copyCredentialColumns(ctx context.Context) (CredentialSplitReport, error) {
+	var rep CredentialSplitReport
 	var firstErr error
 	note := func(what string, err error) {
 		if err == nil {

@@ -346,12 +346,6 @@ func (ae *AntiEntropy) checkPeer(ctx context.Context, peerName string, localMap,
 		}
 	}
 
-	// users differed from this peer but was not pulled this cycle (a settled
-	// tie deferred it): nothing judged the peer's accounts, so its credentials
-	// wait as they do after a failed pull.
-	if slices.Contains(mismatched, "users") && !slices.Contains(pull, "users") {
-		usersUnjudged = true
-	}
 	ae.checkSensitivePeer(ctx, client, peerName, sensitiveMap, full, usersUnjudged, remints)
 	// A completed exchange with a seeded peer that is not holding its own audit
 	// rows leaves this replica holding everything that peer held: seeded too

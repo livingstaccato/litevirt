@@ -377,4 +377,12 @@ func TestFleet_AnOverlayIsNeverCommittedOverABaseWrittenSince(t *testing.T) {
 	if target.Virt.DomainExists("pw2") {
 		t.Fatal("pw2 was defined on its bare disk while an overlay it cannot verify may hold its writes")
 	}
+	evs, _ := corrosion.ListVMEvents(ctx, target.DB, "pw2", 50, "")
+	held := false
+	for _, e := range evs {
+		held = held || (e.Type == "disk.pit_overlay_held" && strings.Contains(e.Detail, "lv resolve-pit-overlay pw2 root"))
+	}
+	if !held {
+		t.Error("the hold was not reported with the admin command")
+	}
 }

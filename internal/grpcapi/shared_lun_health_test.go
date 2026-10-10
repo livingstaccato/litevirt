@@ -138,3 +138,46 @@ func TestSharedLUN_DistinctLUNsRaiseNothing(t *testing.T) {
 		t.Errorf("distinct LUNs raised %+v", c)
 	}
 }
+
+// insertCloneVM records a linked clone whose root overlay is layered on base.
+func insertCloneVM(t *testing.T, s *Server, name, host, base string) {
+	t.Helper()
+	if err := corrosion.InsertVM(context.Background(), s.db,
+		corrosion.VMRecord{Name: name, HostName: host, State: "stopped", Spec: "{}"},
+		nil, []corrosion.DiskRecord{{VMName: name, DiskName: "root", HostName: host,
+			Path: "/var/lib/litevirt/disks/" + name + "-root.qcow2", BackingDisk: base,
+			SizeBytes: 1 << 30, StorageType: "local", TargetDev: "vda"}}); err != nil {
+		t.Fatalf("InsertVM %s: %v", name, err)
+	}
+}
+
+// A LUN a linked clone reads from is in use. A VM whose disk is that LUN and
+// that was created AFTER the clone cannot be the clone's source — its source
+// was deleted with --keep-disks and the LUN taken again — so the new guest
+// writes under the clone's overlay: shared. A source with its own (younger)
+// clones is not.
+//
+// Mutation: ignore backing uses in the scan — the first case raises nothing
+// and this goes red.
+func TestSharedLUN_ALinkedClonesBaseTakenAgainIsShared(t *testing.T) {
+	const lun = "/dev/disk/by-path/ip-10.0.0.1-iscsi-iqn.2020-01.com.example:store-lun-0"
+	t.Run("clone older than the LUN's VM", func(t *testing.T) {
+		s := testServerR2(t)
+		insertCloneVM(t, s, "clone", "host-a", lun)
+		insertLUNVM(t, s, "newcomer", "host-b", "root", lun)
+		s.detectSharedLUNs(adminCtx())
+		c, ok := sharedLUNCondition(t, s)
+		if !ok || !strings.Contains(c.Evidence, `clone`) || !strings.Contains(c.Evidence, `newcomer`) {
+			t.Fatalf("a newer VM on a linked clone's base raised %+v (ok=%v)", c, ok)
+		}
+	})
+	t.Run("a source and its clone", func(t *testing.T) {
+		s := testServerR2(t)
+		insertLUNVM(t, s, "source", "host-a", "root", lun)
+		insertCloneVM(t, s, "clone", "host-a", lun)
+		s.detectSharedLUNs(adminCtx())
+		if c, ok := sharedLUNCondition(t, s); ok {
+			t.Fatalf("a source and its own clone raised %+v", c)
+		}
+	})
+}

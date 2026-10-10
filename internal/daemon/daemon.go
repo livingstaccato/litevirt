@@ -1276,6 +1276,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// two hosts and no DB owner disagrees with runtime. One node (the lease holder) does
 	// the work so the fleet pages once, not N times.
 	go svc.RunDualRunDetector(ctx, 60*time.Second)
+	go svc.RunSharedLUNDetector(ctx, 60*time.Second)
 	// Effective-capacity sampler: every host publishes what it is ACTUALLY
 	// carrying (union of DB and runtime workloads), so placement counts rogue
 	// runtimes and refuses hosts whose observation is stale or incomplete.

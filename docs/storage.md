@@ -1119,34 +1119,38 @@ uuid), the disk and the host that ran the create. So:
 
 **Cost.** Each LUN keeps a checkpoint (`lun_resolved/<LUN>` in the replicated
 cluster policies): every allocation below it is decided and gone. A create
-starts there — after checking with the voters that an allocation was decided
-just below it, so a bad checkpoint is ignored, not trusted — and so pays for
-the allocations still open (normally one: the current holder), not for the
-LUN's history.
+checks with the voters that an allocation was proposed just below the
+checkpoint, then starts its walk at that allocation — deciding it too, since
+a value there proves only what came before it — so a checkpoint that is wrong
+by any amount is never trusted past a live holder. Every allocation the walk
+steps past is decided, never only read. A create therefore pays for the
+allocations still open (normally one: the current holder), not for the LUN's
+history.
 
-**Which voters.** The adopted voter generation's members decide, a majority
-of them. A cluster with no member generation — automatic genesis is pending
-because a host is offline, fenced or in maintenance (see the
-`ha.voter.genesis_pending` health condition), or the voters were reset —
-decides over every voting-eligible host instead, and **all** of them must
-accept; that needs more than half of the cluster's hosts to be voting-eligible,
-and a host that cannot vote durably refuses. Otherwise iscsi allocation is
-refused (`FailedPrecondition`) until the hosts come back, the dead ones are
-removed, or a generation is adopted (`lv cluster voter init`).
+**Which voters.** The adopted voter generation's members decide, a majority of
+them. There is no fallback: a cluster with no member generation — automatic
+genesis is pending because a host is offline, fenced or in maintenance (see
+the `ha.voter.genesis_pending` health condition), or the voters were reset —
+allocates no iscsi LUN, and the create is refused (`FailedPrecondition`) until
+a generation is adopted: run `lv cluster voter init`, or bring the missing
+hosts back so automatic genesis completes.
 
 **Rebuild and rolling recreate.** A VM that is rebuilt (`lv rebuild`) or
-re-created by a rolling update **keeps its claim** and its LUN **exactly as it
-is**: nothing is written to it, and no new allocation is decided. Everything
-about the claim is judged before the teardown — the voters are reached, every
-other allocation of the LUN is proven gone (a LUN the VM held before claims
-existed is claimed for it then) — so nothing about the claim can refuse after
-the VM is torn down. Between the teardown and the create the LUN stays held on
-the host doing the rebuild. A recreate that changes only the VM's image cannot
-reach a kept root LUN: it is refused before the teardown unless the root disk
-sets `overwrite`, which writes the new image over the old system. The previous
-incarnation is recognised by its rows' name and creation time (and, for the
-claim, the VM's name and disk with nothing else holding the LUN) — never by a
-name alone.
+re-created by a compose update keeps its LUN **exactly as it is** — nothing is
+written to it — but its claim **moves**: before the teardown, the host doing
+the rebuild or running the update decides the LUN's next allocation for the
+VM, naming itself as the allocator, after proving every earlier allocation but
+the VM's own gone. It holds the LUN from then until the re-created VM's rows
+are visible on it, so a create that races the teardown meets the new
+allocation and is refused, whichever host created the VM originally or runs it
+now. Everything about the claim is judged before the teardown — no voter
+majority, a LUN another create is taking, an image the root disk could not
+take — so nothing about it can refuse after the VM is torn down. A recreate
+that changes only the VM's image cannot reach a kept root LUN: it is refused
+before the teardown unless the root disk sets `overwrite`, which writes the
+new image over the old system. The previous incarnation is recognised by its
+rows' name and creation time, and its claim by the VM's name and disk with
+nothing else holding the LUN — never by a name alone.
 
 **Upgrading.** Allocation on an iscsi pool needs the release feature
 `iscsi_lun_claim`, which opens only once the whole cluster runs a build that
@@ -1180,7 +1184,8 @@ compose, `lv run --image … --storage <pool>`) has the image's guest contents
 written onto the LUN with `qemu-img convert` before the VM is first defined —
 never a blank LUN booting to the firmware shell. The image store's images are
 qcow2, and the image is opened as qcow2 with no backing chain; anything else
-(raw bytes, VDI, VHDX, VMDK) is refused, never copied over as raw. Before writing:
+(raw bytes, VDI, VHDX, VMDK) is refused, never copied over as raw — a raw
+image in the store cannot be the root of an iscsi VM (convert it to qcow2). Before writing:
 
 - the LUN is not any VM's disk (the claim above, held for the whole write);
 - the LUN is at least the image's virtual size, or the create is refused with

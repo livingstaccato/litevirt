@@ -212,12 +212,14 @@ func TestRebuildVM_ISCSI_ClaimRefusalComesBeforeTheTeardown(t *testing.T) {
 	}
 }
 
-// N-4: a rebuild keeps the VM's existing claim — the create decides no new
-// allocation of the LUN.
+// Re-review 2, C-1: a rebuild MOVES the VM's claim — it decides the LUN's
+// next allocation, naming the host doing the rebuild (which holds the LUN
+// until the new rows are visible there) — so a racing create meets it at
+// the latest allocation, whatever host first created the VM.
 //
-// Mutation: take the LUN over by deciding the next allocation (round 1) —
+// Mutation: keep the old allocation without deciding a new one (round 2) —
 // this goes red.
-func TestRebuildVM_ISCSI_KeepsItsClaim(t *testing.T) {
+func TestRebuildVM_ISCSI_MovesItsClaim(t *testing.T) {
 	s := lunTestServer(t)
 	ctx := adminCtx()
 	if _, err := s.CreateVM(ctx, lunVM("a", "lun0")); err != nil {
@@ -227,39 +229,29 @@ func TestRebuildVM_ISCSI_KeepsItsClaim(t *testing.T) {
 		t.Fatalf("rebuild: %v", err)
 	}
 	k := corrosion.LUNClaimKey(mustLUNKey(t, "10.0.0.1", "0"), 1)
-	if st, found, err := s.db.ClaimState(ctx, k); err != nil || (found && !st.Accepted.IsZero()) {
-		t.Fatalf("the rebuild decided allocation 1 (%+v, %v): it took a new claim instead of keeping its own", st, err)
+	st, found, err := s.db.ClaimState(ctx, k)
+	if err != nil || !found || st.Value == nil || st.Value.LUN == nil {
+		t.Fatalf("the rebuild decided no allocation 1 (%+v, %v): it kept the old claim instead of moving it", st, err)
+	}
+	if l := st.Value.LUN; l.VMName != "a" || l.Host != s.hostName {
+		t.Fatalf("allocation 1 = %+v, want VM a on the rebuilding host %s", l, s.hostName)
 	}
 	vmExists(t, s, "a", "after the rebuild")
 }
 
-// Ruling 5: with no voter generation adopted, an iscsi create is decided over
-// the derived voter set (every voting-eligible host, all of whom must
-// accept) — as long as that set is more than half the cluster's hosts.
+// Re-review 2, I-2: an iscsi LUN is allocated only under an adopted member
+// voter generation. With none — genesis pending, or after a reset — the
+// create is refused, naming the command that adopts one.
 //
-// Mutation: refuse when no generation is adopted — this goes red.
+// Mutation: fall back to a derived voter set — the create succeeds and this
+// goes red.
 func TestCreateVM_ISCSI_WithoutAVoterGeneration(t *testing.T) {
-	t.Run("derived set decides", func(t *testing.T) {
-		s := newLUNTestServer(t, false)
-		if _, err := s.CreateVM(adminCtx(), lunVM("a", "lun0")); err != nil {
-			t.Fatalf("iscsi create with no voter generation: %v", err)
-		}
-		if _, err := s.CreateVM(adminCtx(), lunVM("b", "lun0")); status.Code(err) != codes.FailedPrecondition {
-			t.Fatalf("second VM on the LUN with no voter generation: got %v", err)
-		}
-	})
-	t.Run("too few voting hosts", func(t *testing.T) {
-		s := newLUNTestServer(t, false)
-		for _, h := range []string{"down-1", "down-2"} {
-			if err := corrosion.InsertHost(context.Background(), s.db, corrosion.HostRecord{Name: h, Address: "10.0.0.20", State: "offline"}); err != nil {
-				t.Fatal(err)
-			}
-		}
-		_, err := s.CreateVM(adminCtx(), lunVM("a", "lun0"))
-		if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "voter") {
-			t.Fatalf("iscsi create with too few voting hosts: got %v, want FailedPrecondition naming the voters", err)
-		}
-	})
+	s := newLUNTestServer(t, false)
+	_, err := s.CreateVM(adminCtx(), lunVM("a", "lun0"))
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "lv cluster voter init") {
+		t.Fatalf("iscsi create with no voter generation: got %v, want FailedPrecondition naming lv cluster voter init", err)
+	}
+	requireNoVM(t, s, "a")
 }
 
 // m-2: a refused claim says why, not a guess.
@@ -371,6 +363,97 @@ func TestCreateVM_ISCSI_ABogusCheckpointIsNotTrusted(t *testing.T) {
 	if status.Code(err) != codes.Aborted || !strings.Contains(err.Error(), `VM "far"`) {
 		t.Fatalf("create past a bogus checkpoint: got %v, want Aborted naming far", err)
 	}
+}
+
+// Re-review 2, m-2: a checkpoint exactly one past the live holder is not
+// trusted either: the walk starts at the allocation just below the
+// checkpoint, decides it, and meets its holder.
+//
+// Mutation: start the walk at the checkpoint itself — this goes red.
+func TestCreateVM_ISCSI_ACheckpointOnePastTheHolderIsNotTrusted(t *testing.T) {
+	s := lunTestServer(t)
+	ctx := adminCtx()
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: "peer-host", Address: "10.0.0.10", State: "active"}); err != nil {
+		t.Fatal(err)
+	}
+	key := mustLUNKey(t, "10.0.0.1", "0")
+	decideForeign(t, s, key, 0, "far", "peer-host")
+	if err := corrosion.AdvanceLUNResolved(ctx, s.db, key, 1, "forger"); err != nil {
+		t.Fatal(err)
+	}
+	s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {
+		return &lunPeer{holders: []*pb.LUNHolder{{Lun: key, VmName: "far", DiskName: "root", HostName: "peer-host", InFlight: true}}}, func() {}, nil
+	}
+	_, err := s.CreateVM(ctx, lunVM("b", "lun0"))
+	if status.Code(err) != codes.Aborted || !strings.Contains(err.Error(), `VM "far"`) {
+		t.Fatalf("create with a checkpoint one past the live holder: got %v, want Aborted naming far", err)
+	}
+}
+
+// Re-review 2, m-6: a host that was voted out but still has a live row here
+// is not evidenced removed: with no answer from it, its allocation stays
+// held.
+//
+// Mutation: drop the live-row guard in votedOut — this goes red.
+func TestCreateVM_ISCSI_AVotedOutHostWithALiveRowHoldsItsLUN(t *testing.T) {
+	s := lunTestServer(t)
+	ctx := adminCtx()
+	inc, _ := s.db.VoterIncarnation(ctx)
+	for _, g := range []struct {
+		gen     int64
+		members []corrosion.VoterMember
+	}{
+		{2, []corrosion.VoterMember{{Name: s.hostName, Incarnation: inc}, {Name: "peer-host", Incarnation: "p"}}},
+		{3, []corrosion.VoterMember{{Name: s.hostName, Incarnation: inc}}},
+	} {
+		val := corrosion.VoterConfigValue{Generation: g.gen, Members: corrosion.SortMembers(g.members),
+			Change: corrosion.VoterChangeGenesis, CreatedBy: "test", CreatedAt: "test"}
+		if err := corrosion.WriteVoterConfig(ctx, s.db, val, corrosion.ClaimCertificate{}); err != nil {
+			t.Fatal(err)
+		}
+		if err := corrosion.RecordVoterAdoption(ctx, s.db, g.gen); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: "peer-host", Address: "10.0.0.10", State: "active"}); err != nil {
+		t.Fatal(err)
+	}
+	decideForeign(t, s, mustLUNKey(t, "10.0.0.1", "0"), 0, "far", "peer-host")
+	s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {
+		return nil, nil, errors.New("dial: no route to host")
+	}
+	_, err := s.CreateVM(ctx, lunVM("b", "lun0"))
+	if status.Code(err) != codes.Unavailable || !strings.Contains(err.Error(), "peer-host") {
+		t.Fatalf("a voted-out host with a live row: got %v, want Unavailable naming peer-host", err)
+	}
+}
+
+// Re-review 2, m-4: the image's format is judged before the teardown even
+// where this host cannot open the LUN: a recreate onto a non-qcow2 image is
+// refused with the VM intact.
+//
+// Mutation: skip the format check when the device cannot be opened here —
+// the VM is torn down, then refused, and this goes red.
+func TestRecreate_ISCSI_ImageFormatJudgedBeforeTheTeardown(t *testing.T) {
+	s := lunImageServer(t)
+	d := newLUNDisks(t)
+	dev := d.lun("0", 64<<20)
+	ctx := adminCtx()
+	if _, err := s.CreateVM(ctx, lunImageVM("a", "lun0", false)); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	delete(d.files, dev) // this host cannot open the LUN any more
+	if err := os.WriteFile(s.images.ImagePath("odd"), append([]byte("vhdxfile"), make([]byte, 1<<20)...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	next := lunImageVM("a", "lun0", true).Spec
+	next.Image = "odd"
+	err := (&serverOps{s: s}).RecreateVM(ctx, "a", next)
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "qcow2") ||
+		!strings.Contains(err.Error(), "nothing was deleted") {
+		t.Fatalf("recreate onto a non-qcow2 image: got %v, want FailedPrecondition before the teardown", err)
+	}
+	vmExists(t, s, "a", "after the refused recreate")
 }
 
 var _ = json.Marshal

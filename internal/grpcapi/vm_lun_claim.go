@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -34,12 +33,10 @@ import (
 //
 // TAKING A LUN IS A VOTER DECISION. The LUN's allocations form a sequence;
 // allocation g is decided at key (lun, <LUN key>, g) by single-decree claims
-// (docs/design/recovery-claims.md §3) over the electorate lunElectorate
-// names: the adopted voter generation's members, a majority deciding — or,
-// with no member generation adopted, the derived voter set, ALL of whom must
-// accept, and which must be more than half the cluster's hosts (any two such
-// sets share a voter). The value names the claim, the VM (by uuid), the disk
-// and the creating host.
+// (docs/design/recovery-claims.md §3) over the adopted voter generation's
+// members, a majority deciding (lunElectorate; with no member generation a LUN
+// is not allocated at all). The value names the claim, the VM (by uuid), the
+// disk and the creating host.
 //
 // A create, on the host that will own the VM:
 //
@@ -49,9 +46,9 @@ import (
 //     anything;
 //  2. registers its LUNs in the registry BEFORE it proposes, and holds them
 //     until the create returns — after its row commits;
-//  3. walks the LUN's allocations from the LUN's checkpoint: every allocation
-//     below it is decided and proven gone (corrosion.GetLUNResolved; a hint
-//     the walker verifies against the voters, lunWalkStart). At each
+//  3. walks the LUN's allocations from just below the LUN's checkpoint
+//     (corrosion.GetLUNResolved; a hint the walker verifies against the
+//     voters, lunWalkStart), DECIDING every allocation it passes. At each
 //     allocation it decides with its own value: its own decided, it holds the
 //     LUN; another's decided, that allocation must be proven GONE before the
 //     walk goes on (lunAllocationHolder) — and the checkpoint moves past it.
@@ -68,15 +65,16 @@ import (
 // A walk therefore costs O(open allocations): the latest holder, plus any
 // allocation gone since the last walker.
 //
-// A rebuild or a recreate keeps the claim of the VM it replaces: its preflight
-// (preflightLUNs) judges the LUN before the teardown — and re-claims it then
-// for the VM, if no allocation names it — and the create takes the LUN over
-// without deciding anything, so nothing about the claim can refuse after the
-// teardown. The teardown-to-create window is covered by a registry hold
-// (holdLUNsForRecreate).
+// A rebuild or a recreate MOVES the claim of the VM it replaces: its preflight
+// (preflightLUNs), before the teardown, takes this host's registry hold, then
+// decides the LUN's next allocation for the VM with this host as allocator —
+// passing over the VM's own earlier one — and keeps the hold until the
+// re-created VM's rows are here (holdUntilRows). A racing create meets the new
+// allocation and asks this host. The create then takes the LUN over without a
+// claim of its own, so nothing about the claim can refuse after the teardown.
 //
 // THE GATE. Nothing is allocated on a fixed-device pool until the release
-// feature iscsi_lun_claim is open, and an electorate exists
+// feature iscsi_lun_claim is open and a member voter generation is adopted
 // (iscsiLUNClaimGate).
 
 // iscsiLUNClaimFeature is the release feature that opens iSCSI allocation.
@@ -130,21 +128,18 @@ func (s *Server) iscsiLUNClaimGate(ctx context.Context) error {
 	return nil
 }
 
-// lunElectorateT is who decides a LUN allocation.
+// lunElectorateT is who decides a LUN allocation: the adopted voter
+// generation's members, a majority of them.
 type lunElectorateT struct {
-	gen     int64
-	voters  []string
-	quorum  int
-	derived bool
+	gen    int64
+	voters []string
+	quorum int
 }
 
-// lunElectorate is the adopted voter generation's members (a majority
-// decides), or — with no member generation adopted: genesis pending, or after
-// a reset — the derived voter set (every host not offline, maintenance or
-// fenced), ALL of whom must accept, and which must be more than half of the
-// cluster's hosts. Two such derived sets each hold more than half the hosts,
-// so they share a voter, whose promise keeps two decisions apart, however two
-// replicas disagree about host states.
+// lunElectorate is the adopted member voter generation. There is no fallback:
+// with none adopted — automatic genesis pending, or after a reset — a LUN is
+// not allocated (FailedPrecondition), because a set two replicas derive from
+// their own host lists need not intersect (re-review 2, I-2).
 func (s *Server) lunElectorate(ctx context.Context) (lunElectorateT, error) {
 	gen, err := corrosion.AdoptedVoterGeneration(ctx, s.db)
 	if err != nil {
@@ -154,32 +149,14 @@ func (s *Server) lunElectorate(ctx context.Context) (lunElectorateT, error) {
 	if err != nil {
 		return lunElectorateT{}, status.Errorf(codes.Unavailable, "read the voter generation: %v", err)
 	}
-	if cfg.Explicit() {
-		names := cfg.Names()
-		return lunElectorateT{gen: gen, voters: names, quorum: corrosion.MajorityOf(len(names))}, nil
-	}
-	set, err := corrosion.VoterSet(ctx, s.db)
-	if err != nil {
-		return lunElectorateT{}, status.Errorf(codes.Unavailable, "read the voter set: %v", err)
-	}
-	hosts, err := corrosion.ListHosts(ctx, s.db)
-	if err != nil {
-		return lunElectorateT{}, status.Errorf(codes.Unavailable, "read the hosts: %v", err)
-	}
-	var names []string
-	for n := range set {
-		names = append(names, n)
-	}
-	sort.Strings(names)
-	if 2*len(names) <= len(hosts) || len(names) == 0 {
+	if !cfg.Explicit() {
 		return lunElectorateT{}, status.Errorf(codes.FailedPrecondition,
-			"an iSCSI LUN is allocated by a voter claim, and this cluster has adopted no voter generation (genesis is "+
-				"pending — see the ha.voter.genesis_pending health condition — or the voters were reset): it then "+
-				"decides over every voting-eligible host, and only %d of its %d hosts are (%s) — not more than half. "+
-				"Bring the others back, remove the dead ones, or adopt a generation (lv cluster voter init)",
-			len(names), len(hosts), strings.Join(names, ", "))
+			"an iSCSI LUN is allocated by a voter claim, and %s has adopted no voter generation with members "+
+				"(automatic genesis is pending — see the ha.voter.genesis_pending health condition — or the voters "+
+				"were reset): adopt one with `lv cluster voter init`, then retry", s.hostName)
 	}
-	return lunElectorateT{gen: gen, voters: names, quorum: len(names), derived: true}, nil
+	names := cfg.Names()
+	return lunElectorateT{gen: gen, voters: names, quorum: corrosion.MajorityOf(len(names))}, nil
 }
 
 // lunUse is one disk of a create that sits on a fixed device.
@@ -261,24 +238,6 @@ type lunHandoffKey struct{}
 func lunHandoffFrom(ctx context.Context) string {
 	t, _ := ctx.Value(lunHandoffKey{}).(string)
 	return t
-}
-
-// holdLUNsForRecreate registers spec's LUNs in this host's registry before a
-// rebuild or recreate tears the VM down, so between the teardown and the
-// create no other create can read them as gone. The returned context carries
-// the hold to the create, which takes it over; release drops it once the
-// create has returned.
-func (s *Server) holdLUNsForRecreate(ctx context.Context, spec *pb.VMSpec) (context.Context, func()) {
-	uses, err := s.fixedDeviceUses(ctx, spec)
-	if err != nil || len(uses) == 0 {
-		return ctx, func() {}
-	}
-	token := randid.New()
-	_, drop, _, _ := s.lunClaims.take(spec.Name, "", token, uses)
-	if drop == nil {
-		return ctx, func() {} // held by an in-flight create: the preflight refused already
-	}
-	return context.WithValue(ctx, lunHandoffKey{}, token), drop
 }
 
 // fixedDeviceUses resolves spec's disks to the fixed devices (iscsi LUNs) they
@@ -371,7 +330,7 @@ func (s *Server) claimLUNs(ctx context.Context, spec *pb.VMSpec) (*lunHold, erro
 	// disk, or a LUN it claimed for it — is taken over without any claim:
 	// nothing about the claim may refuse after the teardown.
 	taken := func(u lunUse) bool {
-		return hasRep && (rep.luns[u.key] == u.disk || rep.claimed[u.key] == u.disk)
+		return hasRep && rep.claimed[u.key] == u.disk
 	}
 	needClaim := false
 	for _, u := range uses {
@@ -453,7 +412,10 @@ func (s *Server) lunWalkStart(ctx context.Context, el lunElectorateT, lun string
 			"lun", lun, "checkpoint", c)
 		return 0, nil
 	}
-	return c, nil
+	// The value at c-1 proves only that everything below c-1 was gone when it
+	// was proposed — not c-1 itself — so the walk decides c-1 too and meets
+	// its holder (re-review 2, m-2).
+	return c - 1, nil
 }
 
 // lunDecisionError is a decision the voters did not reach, with their reasons.
@@ -479,6 +441,12 @@ func (s *Server) allocateLUN(ctx context.Context, vm string, u lunUse, mine corr
 	if err != nil {
 		return 0, lunDecisionError(u, vm, err)
 	}
+	// An allocation of the VM a rebuild or recreate replaces (its name and
+	// this disk) is passed over once nothing but that VM holds the LUN — the
+	// claim MOVES to the allocation this walk decides — but the checkpoint
+	// moves past it only once the new allocation is decided: until then a
+	// walker must still meet the old one (re-review 2, C-1).
+	passedOwn := false
 	for g := start; g < start+lunMaxGenerations; g++ {
 		mine.Generation = g
 		out, err := s.decideLUNWith(ctx, el, mine)
@@ -490,6 +458,11 @@ func (s *Server) allocateLUN(ctx context.Context, vm string, u lunUse, mine corr
 			return 0, status.Errorf(codes.Internal, "iSCSI LUN %s: allocation %d decided a value that is not a LUN allocation", u.device, g)
 		}
 		if a.ClaimID == mine.ClaimID {
+			if passedOwn {
+				if err := corrosion.AdvanceLUNResolved(ctx, s.db, u.key, g, s.hostName); err != nil {
+					slog.Warn("iSCSI LUN: record checkpoint", "lun", u.key, "generation", g, "error", err)
+				}
+			}
 			return g, nil
 		}
 		holder, err := s.lunAllocationHolder(ctx, el, *a, rep, hasRep, reg)
@@ -498,6 +471,13 @@ func (s *Server) allocateLUN(ctx context.Context, vm string, u lunUse, mine corr
 		}
 		if holder != nil {
 			return 0, lunHeldError(vm, u, holder)
+		}
+		if hasRep && a.VMName == rep.name && a.Disk == u.disk {
+			passedOwn = true
+			continue
+		}
+		if passedOwn {
+			continue // the checkpoint waits for this walk's own decision
 		}
 		if err := corrosion.AdvanceLUNResolved(ctx, s.db, u.key, g+1, s.hostName); err != nil {
 			slog.Warn("iSCSI LUN: record checkpoint", "lun", u.key, "generation", g+1, "error", err)
@@ -595,7 +575,7 @@ func (s *Server) lunAllocationHolder(ctx context.Context, el lunElectorateT, a c
 // adopted one, and this replica holds no live row for it. A host that was
 // never a voter is not evidenced removed by any generation.
 func (s *Server) votedOut(ctx context.Context, el lunElectorateT, host string) bool {
-	if el.derived || el.gen <= 1 || slicesContains(el.voters, host) {
+	if el.gen <= 1 || slicesContains(el.voters, host) {
 		return false
 	}
 	if h, err := corrosion.GetHost(ctx, s.db, host); err != nil || h != nil {
@@ -688,6 +668,9 @@ func (s *Server) lunHoldersHere(ctx context.Context, keys map[string]bool, rep r
 			}
 			x, err := s.virt.DumpXML(dom)
 			if err != nil {
+				if !s.virt.DomainExists(dom) {
+					continue // undefined since it was listed: it holds nothing
+				}
 				return nil, fmt.Errorf("read domain %s: %w", dom, err)
 			}
 			for _, src := range domainDiskSources(x) {

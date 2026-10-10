@@ -53,6 +53,7 @@ func (o *serverOps) recreateAs(ctx context.Context, target, source string, desir
 		ctx = withRecreateISOGrant(ctx, src)
 	}
 	var decision *resolvedCreateVMDecision
+	lunCommitted := false
 	cur, _ := corrosion.GetVM(ctx, o.s.db, target)
 	if cur != nil {
 		host := cur.HostName
@@ -70,12 +71,16 @@ func (o *serverOps) recreateAs(ctx context.Context, target, source string, desir
 			}
 		}
 		if perr == nil {
-			ctx, perr = o.s.preflightLUNs(ctx, spec, cur)
-		}
-		if perr == nil {
 			var releaseLUNHold func()
-			ctx, releaseLUNHold = o.s.holdLUNsForRecreate(ctx, spec)
-			defer releaseLUNHold()
+			ctx, releaseLUNHold, perr = o.s.preflightLUNs(ctx, spec, cur)
+			lunKeys := lunPreflightKeys(ctx)
+			defer func() {
+				if lunCommitted {
+					o.s.holdUntilRows(target, lunKeys, releaseLUNHold)
+				} else {
+					releaseLUNHold()
+				}
+			}()
 		}
 		if perr != nil {
 			st := status.Convert(perr)
@@ -117,6 +122,7 @@ func (o *serverOps) recreateAs(ctx context.Context, target, source string, desir
 	if err != nil && tornDown {
 		return o.s.recreateFailedAfterTeardown("recreate", target, cur.HostName, spec, err)
 	}
+	lunCommitted = err == nil
 	return err
 }
 
@@ -452,16 +458,55 @@ func (s *Server) recreateInline(ctx context.Context, action planner.VMAction, f 
 		// itself, before it deletes (recreate_preflight.go).
 		deleteCtx = withRecreatePreflight(ctx, pf)
 	}
+	// A VM with a disk on an iSCSI LUN moves its claim before the delete, as
+	// a rolling recreate does (preflightLUNs): what the create would refuse
+	// about the LUN is refused with the VM intact, and the LUN is held on
+	// this host until the re-created VM's rows are here.
+	var cur *corrosion.VMRecord
+	lunKeys, lunCommitted, releaseLUNHold := map[string]bool(nil), false, func() {}
+	if !action.IsContainer {
+		cur, _ = corrosion.GetVM(ctx, s.db, action.VMName)
+		if cur != nil {
+			spec, err := s.plannedVMSpec(action, f)
+			if err != nil {
+				gate.markUnmet(action.VMName, err)
+				return err
+			}
+			pctx, release, err := s.preflightLUNs(ctx, spec, cur)
+			if err != nil {
+				slog.Warn("deploy update refused", "workload", action.VMName, "error", err)
+				st := status.Convert(err)
+				err = status.Errorf(st.Code(), "recreate %s: %s; nothing was deleted", action.VMName, st.Message())
+				gate.markUnmet(action.VMName, err)
+				return err
+			}
+			releaseLUNHold, lunKeys = release, lunPreflightKeys(pctx)
+			if len(lunKeys) > 0 {
+				createCtx = pctx
+			}
+		}
+	}
+	defer func() {
+		if lunCommitted {
+			s.holdUntilRows(action.VMName, lunKeys, releaseLUNHold)
+		} else {
+			releaseLUNHold()
+		}
+	}()
 	if delErr := s.deleteWorkloadIgnoringGone(deleteCtx, action); delErr != nil {
 		slog.Warn("deploy update delete failed", "workload", action.VMName, "error", delErr)
 		gate.markUnmet(action.VMName, fmt.Errorf("delete before recreate failed: %w", delErr))
 		return fmt.Errorf("delete before recreate: %w", delErr)
+	}
+	if len(lunKeys) > 0 && cur != nil {
+		createCtx = s.withReplacedLUNs(withReplacedVM(createCtx, cur), cur)
 	}
 	if vmErr := s.deployCreatePlanned(createCtx, action, f); vmErr != nil {
 		slog.Warn("deploy update recreate failed", "workload", action.VMName, "host", action.TargetHost, "error", vmErr)
 		gate.markUnmet(action.VMName, fmt.Errorf("recreate failed: %w", vmErr))
 		return vmErr
 	}
+	lunCommitted = true
 	// A recreated workload is as new to its dependents as a created one.
 	return gate.waitCreated(ctx, action)
 }

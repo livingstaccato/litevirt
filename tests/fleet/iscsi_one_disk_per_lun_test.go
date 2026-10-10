@@ -36,15 +36,24 @@ const fleetLUNTarget = "iqn.2020-01.com.example:fleet"
 // no-op.
 func newLUNFleet(t *testing.T) *Cluster {
 	t.Helper()
+	return newLUNFleetN(t, 3)
+}
+
+// newLUNFleetN is newLUNFleet with n nodes.
+func newLUNFleetN(t *testing.T, nodes int) *Cluster {
+	t.Helper()
 	t.Cleanup(storage.OverrideISCSICommandForTest(func(context.Context, string, ...string) ([]byte, error) {
 		return nil, nil
 	}))
-	c := New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: 7301})
+	c := New(t, Options{Nodes: nodes, IndependentReplicas: true, FaultSeed: 7301})
 	runGenesis(t, c)
 	for _, n := range c.Nodes {
 		n.Server.SetReleaseFeatureGate(func(context.Context, string) error { return nil })
-		setHostCapacity(t, c, n.Name, 32, 65536, nil)
+		n.DB.SetClusterPolicyGate(func() bool { return true })
 	}
+	// (No setHostCapacity: its raw UPDATE of hosts is not a registered
+	// replicated shape, and on independent replicas it back-pressures every
+	// push behind it. The harness's hosts already have room.)
 	return c
 }
 
@@ -296,9 +305,10 @@ func TestFleet_ISCSI_ADomainWithoutARowHoldsItsLUN(t *testing.T) {
 	}
 }
 
-// N-4: a rebuild keeps the VM's claim — with one voter down it still has a
-// majority and needs no new allocation — and with no majority at all it is
-// refused before the teardown, the VM left as it was.
+// N-4 / C-1: a rebuild moves the VM's claim — with one voter down it still
+// has a majority and decides the next allocation, on the rebuilding host —
+// and with no majority at all it is refused before the teardown, the VM left
+// as it was.
 //
 // Mutation: drop the claim from the rebuild preflight — the second rebuild
 // tears the VM down, then fails, and this goes red.
@@ -314,10 +324,9 @@ func TestFleet_ISCSI_ARebuildKeepsItsClaimAndJudgesItBeforeTheTeardown(t *testin
 	if _, err := c.SelfClient(n0).RebuildVM(ctx, &pb.RebuildVMRequest{Name: "a"}); err != nil {
 		t.Fatalf("rebuild with a voter majority: %v", err)
 	}
-	lunKey, _, _ := storage.FixedDevice(storage.Config{Driver: "iscsi", Source: fleetLUNTarget, Options: map[string]string{"lun": "0"}})
-	k := corrosion.LUNClaimKey(lunKey, 1)
-	if st, found, _ := n0.DB.ClaimState(ctx, k); found && !st.Accepted.IsZero() {
-		t.Fatalf("the rebuild decided allocation 1: it took a new claim instead of keeping its own")
+	k := corrosion.LUNClaimKey(fleetLUNKey(0), 1)
+	if st, found, _ := n0.DB.ClaimState(ctx, k); !found || st.Value == nil || st.Value.LUN == nil || st.Value.LUN.Host != n0.Name {
+		t.Fatalf("the rebuild did not move the claim to allocation 1 on %s: %+v", n0.Name, st)
 	}
 	c.Kill(n1)
 	_, err := c.SelfClient(n0).RebuildVM(ctx, &pb.RebuildVMRequest{Name: "a"})
@@ -327,4 +336,215 @@ func TestFleet_ISCSI_ARebuildKeepsItsClaimAndJudgesItBeforeTheTeardown(t *testin
 	if !lunVMOn(t, n0, "a") || !n0.Virt.DomainExists("a") {
 		t.Fatal("the refused rebuild tore the VM down")
 	}
+}
+
+func fleetLUNKey(lun int) string {
+	k, _, _ := storage.FixedDevice(storage.Config{Driver: "iscsi", Source: fleetLUNTarget,
+		Options: map[string]string{"lun": fmt.Sprint(lun)}})
+	return k
+}
+
+// raceDuringCreate runs racer once any node's libvirt is asked to define vm —
+// inside the create, after any teardown — and returns racer's error.
+func raceDuringCreate(t *testing.T, c *Cluster, vm string, racer func() error) (wait func() error) {
+	t.Helper()
+	var once sync.Once
+	res := make(chan error, 1)
+	for _, n := range c.Nodes {
+		n.Virt.FailDefineDomain = func(xml string) error {
+			if strings.Contains(xml, "<name>"+vm+"</name>") {
+				once.Do(func() { res <- racer() })
+			}
+			return nil
+		}
+	}
+	t.Cleanup(func() {
+		for _, n := range c.Nodes {
+			n.Virt.FailDefineDomain = nil
+		}
+	})
+	return func() error {
+		select {
+		case err := <-res:
+			return err
+		case <-time.After(30 * time.Second):
+			t.Fatal("the racer never ran: the create never defined its domain")
+			return nil
+		}
+	}
+}
+
+// C-1, the reviewer's scenario: web is created on node-1 (allocation 0 names
+// node-1); a rolling recreate runs from node-0 and places web on node-3; while
+// web's create is under way on node-3 — its old incarnation torn down on
+// node-1, and that tombstone everywhere — a create on node-2 puts a data disk
+// on web's LUN. The racer must be refused: the recreate moved the claim to a
+// new allocation on node-0, which holds it.
+//
+// Mutation: keep web's old allocation instead of moving it (round 2) — the
+// racer asks node-1, hears nothing, takes the LUN, and this goes red.
+func TestFleet_ISCSI_ARecreateFromAnotherNodeMovesTheClaim(t *testing.T) {
+	recreateRace(t, "    update:\n      strategy: rolling\n")
+}
+
+// The same race through the default (inline) deploy update, which deletes and
+// re-creates in place: it too moves the claim before the delete.
+//
+// Mutation: drop the LUN preflight from the inline recreate — the recreate
+// cannot take its LUN over, and this goes red.
+func TestFleet_ISCSI_AnInlineRecreateMovesTheClaim(t *testing.T) {
+	recreateRace(t, "")
+}
+
+// recreateRace is the C-1 scenario with the given compose update block.
+func recreateRace(t *testing.T, update string) {
+	t.Helper()
+	c := newLUNFleetN(t, 4)
+	n0, n1, n2, n3 := c.Nodes[0], c.Nodes[1], c.Nodes[2], c.Nodes[3]
+	addLUNPool(t, c, "san", 0, onePortal)
+	ctx := context.Background()
+	for _, n := range c.Nodes {
+		// Each node's own catalog row, written locally: a raw INSERT is not a
+		// registered replicated shape.
+		if _, err := n.DB.DB().ExecContext(ctx,
+			`INSERT OR IGNORE INTO images (name, format, source_url, checksum, size_bytes, created_at, updated_at)
+			 VALUES ('test', 'qcow2', 'file:///dev/null', 'deadbeef', 1024, datetime('now'), datetime('now'))`); err != nil {
+			t.Fatalf("seed image: %v", err)
+		}
+		if err := writeEmptyImageFile(n.Server.ImagePathForTests("test")); err != nil {
+			t.Fatalf("stage image file: %v", err)
+		}
+	}
+	stack := func(host, extra string) string {
+		return "name: st\nimages:\n  test:\n    source: file:///dev/null\nvms:\n  web:\n    image: test\n    cpu: 1\n    memory: 256\n    disks:\n      data: { size: \"1G\", storage: san }\n" +
+			extra + update + "    placement:\n      host: " + host + "\n"
+	}
+	deployCollect(t, ctx, c.SelfClient(n1), stack(n1.Name, ""))
+	web := ""
+	eventually(t, convergeTimeout, "web to exist on node-1", func() bool {
+		vms, _ := corrosion.ListVMs(ctx, n1.DB, "", "")
+		for _, v := range vms {
+			if v.HostName == n1.Name {
+				web = v.Name
+				return true
+			}
+		}
+		return false
+	})
+	eventually(t, convergeTimeout, "web's row to reach every node", func() bool {
+		for _, n := range c.Nodes {
+			if !lunVMOn(t, n, web) {
+				return false
+			}
+		}
+		return true
+	})
+	waitVMAgreed(t, c, web)
+	wait := raceDuringCreate(t, c, web, func() error {
+		eventually(t, convergeTimeout, "web's teardown to reach node-1 and node-2", func() bool {
+			return !lunVMOn(t, n1, web) && !lunVMOn(t, n2, web)
+		})
+		return createOnLUN(c, n2, "db", "san")
+	})
+	// A disk-topology change recreates; the new placement is node-3.
+	deployCollect(t, ctx, c.SelfClient(n0), stack(n3.Name, "      scratch: 1G\n"))
+	if err := wait(); status.Code(err) != codes.Aborted && status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("a create on web's LUN during web's recreate: got %v, want it refused", err)
+	} else if !strings.Contains(err.Error(), web) {
+		t.Fatalf("the racer's refusal does not name %s: %v", web, err)
+	}
+	if lunVMOn(t, n2, "db") {
+		t.Fatal("the racer's VM was persisted: two guests on one LUN")
+	}
+}
+
+// C-1 for a VM that moved: web is created on node-1 and migrated to node-2,
+// so its allocation names node-1. Its rebuild runs on node-2. A create on
+// node-0 during the rebuild's create must still be refused: the rebuild
+// moves the claim to node-2, which holds it.
+//
+// Mutation: keep web's old allocation (round 2) — the racer asks node-1,
+// hears nothing, takes the LUN, and this goes red.
+func TestFleet_ISCSI_ARebuildOfAMovedVMMovesTheClaim(t *testing.T) {
+	c := newLUNFleet(t)
+	n0, n1, n2 := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	addLUNPool(t, c, "san", 0, onePortal)
+	ctx := context.Background()
+	if err := createOnLUN(c, n1, "web", "san"); err != nil {
+		t.Fatalf("create web: %v", err)
+	}
+	// The move, as a migration leaves it: the rows name node-2, the domain is
+	// on node-2, and allocation 0 still names node-1, which created web.
+	rec, err := corrosion.GetVM(ctx, n1.DB, "web")
+	if err != nil || rec == nil {
+		t.Fatalf("web on %s: %v", n1.Name, err)
+	}
+	if err := corrosion.TransferVMOwnerWithDisks(ctx, n1.DB, "web", n2.Name, rec.State, rec.OwnerEpoch); err != nil {
+		t.Fatalf("move web to %s: %v", n2.Name, err)
+	}
+	if err := n2.Virt.DefineDomain(n1.Virt.DefinedXML("web")); err != nil {
+		t.Fatal(err)
+	}
+	_ = n1.Virt.UndefineDomain("web", false)
+	eventually(t, convergeTimeout, "web to be on node-2 everywhere", func() bool {
+		for _, n := range c.Nodes {
+			rec, _ := corrosion.GetVM(ctx, n.DB, "web")
+			if rec == nil || rec.HostName != n2.Name {
+				return false
+			}
+		}
+		return true
+	})
+	waitVMAgreed(t, c, "web")
+	// It was moved to node-2 for good: its spec pins node-2, so the rebuild
+	// re-creates it there (each replica's copy, written in place).
+	pinned := strings.Replace(rec.Spec, `"host":"`+n1.Name+`"`, `"host":"`+n2.Name+`"`, 1)
+	if pinned == rec.Spec {
+		t.Fatalf("web's spec does not pin %s: %s", n1.Name, rec.Spec)
+	}
+	for _, n := range c.Nodes {
+		if _, err := n.DB.DB().ExecContext(ctx, `UPDATE vms SET spec = ? WHERE name = 'web'`, pinned); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wait := raceDuringCreate(t, c, "web", func() error {
+		eventually(t, convergeTimeout, "web's teardown to reach node-1 and node-0", func() bool {
+			return !lunVMOn(t, n1, "web") && !lunVMOn(t, n0, "web")
+		})
+		return createOnLUN(c, n0, "db", "san")
+	})
+	if _, err := c.SelfClient(n2).RebuildVM(ctx, &pb.RebuildVMRequest{Name: "web"}); err != nil {
+		t.Fatalf("rebuild of the moved web: %v", err)
+	}
+	if err := wait(); err == nil || !strings.Contains(err.Error(), "web") {
+		t.Fatalf("a create on web's LUN during its rebuild: got %v, want it refused naming web", err)
+	}
+	if lunVMOn(t, n0, "db") {
+		t.Fatal("the racer's VM was persisted: two guests on one LUN")
+	}
+}
+
+// waitVMAgreed waits until every node's row of vm agrees on what a recreate's
+// teardown checks it by: incarnation, host, owner epoch and spec generation.
+func waitVMAgreed(t *testing.T, c *Cluster, vm string) {
+	t.Helper()
+	ctx := context.Background()
+	eventually(t, convergeTimeout, vm+"'s row to agree on every node", func() bool {
+		var first *corrosion.VMRecord
+		for _, n := range c.Nodes {
+			rec, err := corrosion.GetVM(ctx, n.DB, vm)
+			if err != nil || rec == nil {
+				return false
+			}
+			if first == nil {
+				first = rec
+				continue
+			}
+			if rec.CreatedAt != first.CreatedAt || rec.HostName != first.HostName ||
+				rec.OwnerEpoch != first.OwnerEpoch || rec.SpecGeneration != first.SpecGeneration {
+				return false
+			}
+		}
+		return true
+	})
 }

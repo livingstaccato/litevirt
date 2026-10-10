@@ -403,26 +403,9 @@ func (s *Server) streamResolvedPlan(stream grpc.ServerStreamingServer[pb.DeployP
 // assignments. The spec's Placement.Host is pinned so CreateVM skips placement, and
 // device addresses are set so allocateDevices uses exact pinning.
 func (s *Server) deployCreatePlanned(ctx context.Context, action planner.VMAction, f *compose.File) error {
-	spec := action.Spec
-	if spec == nil {
-		// Fallback: build spec from compose (shouldn't happen with planner).
-		vmDef, baseName := compose.FindVMDef(f, action.VMName)
-		if vmDef == nil {
-			return fmt.Errorf("no VM definition found for %q", action.VMName)
-		}
-		var err error
-		spec, err = compose.BuildVMSpec(action.VMName, baseName, vmDef, f)
-		if err != nil {
-			return fmt.Errorf("build VM spec for %q: %w", action.VMName, err)
-		}
-	}
-
-	// Pin placement to the planner-resolved host.
-	if action.TargetHost != "" {
-		if spec.Placement == nil {
-			spec.Placement = &pb.PlacementSpec{}
-		}
-		spec.Placement.Host = action.TargetHost
+	spec, err := s.plannedVMSpec(action, f)
+	if err != nil {
+		return err
 	}
 
 	// Pin pre-resolved device addresses so allocateDevices uses exact binding. SR-IOV
@@ -1580,6 +1563,33 @@ func (s *Server) ExportStack(ctx context.Context, req *pb.ExportStackRequest) (*
 		ComposeYaml: stack.ComposeYAML,
 		ComposeHash: stack.ComposeHash,
 	}, nil
+}
+
+// plannedVMSpec is the spec a planned VM action creates: the planner's, or
+// one built from the compose file, pinned to the planner-resolved host.
+func (s *Server) plannedVMSpec(action planner.VMAction, f *compose.File) (*pb.VMSpec, error) {
+	spec := action.Spec
+	if spec == nil {
+		// Fallback: build spec from compose (shouldn't happen with planner).
+		vmDef, baseName := compose.FindVMDef(f, action.VMName)
+		if vmDef == nil {
+			return nil, fmt.Errorf("no VM definition found for %q", action.VMName)
+		}
+		var err error
+		spec, err = compose.BuildVMSpec(action.VMName, baseName, vmDef, f)
+		if err != nil {
+			return nil, fmt.Errorf("build VM spec for %q: %w", action.VMName, err)
+		}
+	}
+
+	// Pin placement to the planner-resolved host.
+	if action.TargetHost != "" {
+		if spec.Placement == nil {
+			spec.Placement = &pb.PlacementSpec{}
+		}
+		spec.Placement.Host = action.TargetHost
+	}
+	return spec, nil
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────

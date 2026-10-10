@@ -36,8 +36,8 @@ func TestCreateVM_ISCSI_AnAnswerFromAnotherHostDoesNotCount(t *testing.T) {
 // returns, so no other create can take them in between; its own create
 // takes the hold over.
 //
-// Mutation: do not register the hold — the LUN reads as gone during the
-// teardown and this goes red.
+// Mutation: do not register the hold in the preflight — the LUN reads as
+// gone during the teardown and this goes red.
 func TestRebuildVM_ISCSI_HoldsTheLUNAcrossTheTeardown(t *testing.T) {
 	s := lunTestServer(t)
 	ctx := adminCtx()
@@ -45,7 +45,10 @@ func TestRebuildVM_ISCSI_HoldsTheLUNAcrossTheTeardown(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 	spec := lunVM("a", "lun0").Spec
-	hctx, release := s.holdLUNsForRecreate(ctx, spec)
+	hctx, release, err := s.preflightLUNs(ctx, spec, vmRecord(t, s, "a"))
+	if err != nil {
+		t.Fatalf("preflight: %v", err)
+	}
 	defer release()
 	// The teardown: the row is gone, the domain undefined.
 	if err := corrosion.DeleteVM(ctx, s.db, "a"); err != nil {

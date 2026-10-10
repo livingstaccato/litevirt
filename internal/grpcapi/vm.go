@@ -3332,13 +3332,19 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	// Its iSCSI LUNs too: the claim is judged now — kept, or claimed for the
 	// VM — and a LUN the create would refuse is refused now. The LUNs are then
 	// held on this host until the create has returned.
-	rctx, err = s.preflightLUNs(rctx, spec, vm)
+	rctx, releaseLUNHold, err := s.preflightLUNs(rctx, spec, vm)
 	if err != nil {
 		st := status.Convert(err)
 		return nil, status.Errorf(st.Code(), "cannot rebuild %q: %s; nothing was changed", req.Name, st.Message())
 	}
-	rctx, releaseLUNHold := s.holdLUNsForRecreate(rctx, spec)
-	defer releaseLUNHold()
+	lunKeys, lunCommitted := lunPreflightKeys(rctx), false
+	defer func() {
+		if lunCommitted {
+			s.holdUntilRows(req.Name, lunKeys, releaseLUNHold)
+		} else {
+			releaseLUNHold()
+		}
+	}()
 
 	// Stop and undefine the current domain.
 	if vm.State == "running" {
@@ -3399,6 +3405,7 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	if err != nil {
 		return nil, s.recreateFailedAfterTeardown("rebuild", req.Name, s.hostName, spec, err)
 	}
+	lunCommitted = true
 	return out, nil
 }
 

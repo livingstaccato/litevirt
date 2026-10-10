@@ -1762,7 +1762,9 @@ func (r *Reconciler) settlePITOverlays(ctx context.Context, vm corrosion.VMRecor
 			slog.Warn("reconciler: committed a point-in-time overlay into the disk before defining the VM",
 				"vm", vm.Name, "disk", dc.Name, "overlay", pitoverlay.Path(dc.Path))
 		}
-		if r.pitCleared != nil {
+		// A disk this host cannot see (a shared pool not mounted here) reads
+		// as "no overlay" too: only a disk that is here clears a hold.
+		if _, serr := os.Stat(dc.Path); serr == nil && r.pitCleared != nil {
 			r.pitCleared(ctx, vm.Name, dc.Name)
 		}
 	}

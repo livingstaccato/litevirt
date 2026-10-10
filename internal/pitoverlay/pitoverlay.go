@@ -130,17 +130,60 @@ type Binding struct {
 	OverlayMtimeNs int64 `json:"overlay_mtime_ns,omitempty"`
 	// Diverged says how the VM was found running on its base without it.
 	Diverged string `json:"diverged,omitempty"`
+	// Format is the binding's format (bindingFormat).
+	Format int `json:"format,omitempty"`
+	// EndMtimeNs and EndSize are the base as a commit attempt left it.
+	EndMtimeNs int64 `json:"end_mtime_ns,omitempty"`
+	EndSize    int64 `json:"end_size,omitempty"`
 }
 
-// CommitBound is how long after the latest commit attempt (or its last sign
-// of progress) the base may still be written by that commit. A base modified
-// later than that was written by something else (a build that knows nothing
-// of overlays ran the VM on it), and the overlay is not committed over it.
-var CommitBound = 2 * time.Hour
-
-// RefreshEvery is how often a running commit renews its attempt stamp, so a
-// commit that runs past CommitBound is not mistaken for something else.
+// RefreshEvery is how often a running commit rewrites its binding (the
+// keep-alive). The sidecar's own modification time — the filesystem's clock,
+// the same clock as the disk's — is then the last moment the daemon vouched
+// for the commit.
 var RefreshEvery = 10 * time.Minute
+
+// CommitMargin is the slack on that keep-alive bound: a commit that died
+// without recording its end may have written the disk at most RefreshEvery
+// plus this after its binding was last written. A disk written later than
+// that was written by something else, and the overlay is not committed over
+// it.
+var CommitMargin = 2 * time.Minute
+
+// bindingFormat is the sidecar format this build writes and understands. A
+// binding of a later format (a newer build's, met after a rollback) is never
+// settled by this one.
+const bindingFormat = 1
+
+// featureGate says whether this host holds the pit_overlay release feature:
+// the cluster-wide promise that every host serving these pools understands
+// overlays. Below it, this build makes no overlay (layer 2 is skipped) and
+// settles none it finds: an overlay present then was made by a host above
+// it, and the VM is held rather than started on its disk. It fails closed
+// until the release token (feat/release-token) is wired here.
+var featureGate = func() (bool, string) {
+	return false, "this build does not hold the pit_overlay release feature (the release token is not wired yet)"
+}
+
+// FeatureOpen reports whether this host holds the pit_overlay release
+// feature, and why not.
+func FeatureOpen() (bool, string) { return featureGate() }
+
+// OpenFeatureForTest opens the pit_overlay feature for a test suite. Call it
+// from TestMain only.
+func OpenFeatureForTest() { featureGate = func() (bool, string) { return true, "" } }
+
+// SetFeatureForTest opens or closes it for one test and returns the restore.
+func SetFeatureForTest(open bool) (restore func()) {
+	prev := featureGate
+	featureGate = func() (bool, string) {
+		if open {
+			return true, ""
+		}
+		return false, "the pit_overlay release feature is closed (test)"
+	}
+	return func() { featureGate = prev }
+}
 
 // identity is the base file's identity. A variable so a test can model a
 // host that sees the same file under another device number, or a restore
@@ -221,7 +264,7 @@ func BindWindow(disk string, owner Owner, w Window) error {
 	bindingMu.Lock()
 	defer bindingMu.Unlock()
 	return writeBinding(disk, Binding{Owner: owner, Name: filepath.Base(disk), Dev: dev, Ino: ino, Size: size, MtimeNs: mt,
-		State: StateWindow, Token: w.Token, NoXattr: w.NoXattr})
+		State: StateWindow, Token: w.Token, NoXattr: w.NoXattr, Format: bindingFormat})
 }
 
 // Bind opens a new window token on disk and binds its overlay to it: for an
@@ -293,6 +336,9 @@ func update(disk string, f func(*Binding) error) error {
 	if err != nil {
 		return err
 	}
+	if b.Format > bindingFormat {
+		return fmt.Errorf("its binding was written by a newer build (format %d); this build does not rewrite it", b.Format)
+	}
 	if err := f(&b); err != nil {
 		return err
 	}
@@ -312,6 +358,26 @@ func MarkCommitting(disk string) error {
 			b.CommitStartedNs = now
 		}
 		b.CommitAttemptNs = now
+		b.EndMtimeNs, b.EndSize = 0, 0 // this attempt has not ended
+		return nil
+	})
+}
+
+// RecordAttemptEnd records, durably, the disk as a commit attempt left it —
+// failed or not — in the filesystem's own clock. After a failed attempt
+// nothing writes the disk (the VM runs on the overlay, the job is gone), so
+// a disk that is not exactly that later was written by something else: a
+// restore over it in place, say, which keeps its inode and token.
+func RecordAttemptEnd(disk string) error {
+	_, _, size, mt, err := identity(disk)
+	if err != nil {
+		return err
+	}
+	return update(disk, func(b *Binding) error {
+		if b.State != StateCommitting {
+			return nil
+		}
+		b.EndMtimeNs, b.EndSize = mt, size
 		return nil
 	})
 }
@@ -329,16 +395,29 @@ func MarkPivoting(disk string) error {
 	})
 }
 
-// MarkCommitted records that the overlay is in the base (the pivot landed,
-// or an offline commit finished), with the overlay's own time: removing it
-// is then all that is left, and committing it again would write its old
-// blocks over the guest's newer ones.
-func MarkCommitted(disk string) error {
+// MarkCommitted records that a recorded live pivot landed: the overlay is in
+// the base, and removing it is all that is left — committing it again would
+// write its old blocks over the guest's newer ones. Only from pivoting (a
+// binding already committed is left as it is): it is the one record that
+// leads to an automatic removal.
+func MarkCommitted(disk string) error { return markCommitted(disk, StatePivoting) }
+
+// markCommittedOffline records an offline commit that finished.
+func markCommittedOffline(disk string) error { return markCommitted(disk, StateCommitting) }
+
+func markCommitted(disk, from string) error {
 	fi, err := os.Stat(Path(disk))
 	if err != nil {
 		return err
 	}
 	return update(disk, func(b *Binding) error {
+		switch b.State {
+		case StateCommitted:
+			return nil
+		case from:
+		default:
+			return fmt.Errorf("a commit recorded from state %q (want %q)", b.State, from)
+		}
 		b.State = StateCommitted
 		b.OverlayMtimeNs = fi.ModTime().UnixNano()
 		return nil
@@ -356,8 +435,8 @@ func MarkDiverged(disk, why string) error {
 }
 
 // KeepCommitting renews the attempt stamp every RefreshEvery while a commit
-// runs, so a commit that runs past CommitBound keeps its own base writes
-// within the bound. stop ends it and waits.
+// runs, so a commit that runs past the keep-alive bound keeps its own base
+// writes within it. stop ends it and waits.
 func KeepCommitting(ctx context.Context, disk string) (stop func()) {
 	ctx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
@@ -409,6 +488,16 @@ type Assessment struct {
 	// CommitBegan: the binding records that a commit began writing the
 	// disk, so it may be partly written.
 	CommitBegan bool
+	// PivotUncertain: a pivot was under way and, with the VM off, whether it
+	// landed is told only by the two files' times (HoldAdvice).
+	PivotUncertain bool
+	// BelowFeature: this host does not hold the pit_overlay release feature.
+	BelowFeature bool
+	// DiskMtimeNs and OverlayMtimeNs are both files' modification times now
+	// (one clock: the filesystem's), and OverlayCurrent says so in words.
+	DiskMtimeNs    int64
+	OverlayMtimeNs int64
+	OverlayCurrent string
 }
 
 func (a *Assessment) unknown(format string, args ...any) Assessment {
@@ -430,12 +519,25 @@ func Assess(disk string, owner Owner, liveOnDisk bool) Assessment {
 	if !fi.Mode().IsRegular() {
 		return a.unknown("the overlay is not a regular file")
 	}
+	a.OverlayMtimeNs = fi.ModTime().UnixNano()
+	a.OverlayCurrent = fmt.Sprintf("%d bytes, modified %s", fi.Size(), time.Unix(0, a.OverlayMtimeNs).UTC().Format(time.RFC3339Nano))
 	b, err := readBinding(disk)
 	if err != nil {
+		if open, why := FeatureOpen(); !open {
+			a.BelowFeature = true
+			return a.unknown("%s; this host settles no overlay", why)
+		}
 		return a.unknown("no readable binding (%v)", err)
 	}
 	a.Binding = &b
 	a.CommitBegan = b.CommitStartedNs != 0 || b.State == StateCommitting || b.State == StatePivoting || b.State == StateCommitted
+	if open, why := FeatureOpen(); !open {
+		a.BelowFeature = true
+		return a.unknown("%s; this host settles no overlay", why)
+	}
+	if b.Format > bindingFormat {
+		return a.unknown("its binding was written by a newer build (format %d; this build knows %d)", b.Format, bindingFormat)
+	}
 	if b.VM != owner.VM || b.Disk != owner.Disk || (b.VMUUID != "" && owner.VMUUID != "" && b.VMUUID != owner.VMUUID) {
 		return a.unknown("it was taken of vm %q disk %q, not vm %q disk %q", b.VM, b.Disk, owner.VM, owner.Disk)
 	}
@@ -443,6 +545,7 @@ func Assess(disk string, owner Owner, liveOnDisk bool) Assessment {
 	if err != nil {
 		return a.unknown("its disk: %v", err)
 	}
+	a.DiskMtimeNs = mt
 	a.Current = fmt.Sprintf("inode %d, %d bytes, modified %s", ino, size, time.Unix(0, mt).UTC().Format(time.RFC3339Nano))
 	if ino != b.Ino {
 		return a.unknown("the disk is another file (inode %d) than the one it was taken of (inode %d)", ino, b.Ino)
@@ -458,10 +561,17 @@ func Assess(disk string, owner Owner, liveOnDisk bool) Assessment {
 	// The overlay names its base by the absolute path it had on the host
 	// that took it; another host may mount the pool elsewhere. Its base is
 	// the file of that name beside it, and only that.
-	if filepath.Base(info.BackingFile) != filepath.Base(disk) {
+	if !backingIsDisk(info.BackingFile, disk) {
 		return a.unknown("its backing file is %q, not this disk", info.BackingFile)
 	}
 	notSmaller := func() bool { return size >= b.Size && mt >= b.MtimeNs }
+	// The last time the daemon vouched for a commit: the sidecar's own
+	// modification time, in the filesystem's clock (keepAliveBound).
+	sfi, err := os.Stat(SidecarPath(disk))
+	if err != nil {
+		return a.unknown("its binding: %v", err)
+	}
+	keepAliveBound := sfi.ModTime().UnixNano() + int64(RefreshEvery+CommitMargin)
 	const older = "the disk is smaller or older than the file the overlay was taken of, so it is not that file (restored from an earlier copy?)"
 	switch b.State {
 	case StateWindow, "":
@@ -477,8 +587,14 @@ func Assess(disk string, owner Owner, liveOnDisk bool) Assessment {
 		if !notSmaller() {
 			return a.unknown("%s", older)
 		}
-		if mt > attempt+int64(CommitBound) {
-			return a.unknown("the disk was written long after the last attempt to commit into it, by something else")
+		if b.EndMtimeNs != 0 {
+			// The last attempt ended and recorded the disk as it left it;
+			// nothing writes it after a failed attempt.
+			if mt != b.EndMtimeNs || size != b.EndSize {
+				return a.unknown("the disk was written after the last attempt to commit into it ended, so it is not the disk that attempt left (restored or overwritten in place?)")
+			}
+		} else if mt > keepAliveBound {
+			return a.unknown("the disk was written long after the daemon last recorded its commit into it, by something else")
 		}
 		a.Verdict = HalfWritten
 	case StatePivoting:
@@ -486,7 +602,11 @@ func Assess(disk string, owner Owner, liveOnDisk bool) Assessment {
 			return a.unknown("%s", older)
 		}
 		if !liveOnDisk {
-			return a.unknown("a pivot onto the disk was under way when the daemon stopped, and with the VM off it cannot be told whether it landed")
+			a.PivotUncertain = true
+			return a.unknown("a pivot onto the disk was under way when the daemon stopped, and with the VM off it cannot be told for certain whether it landed")
+		}
+		if mt > keepAliveBound {
+			return a.unknown("the disk was written long after the pivot was recorded, so the VM on it may have been started there by something else")
 		}
 		a.Verdict = Pivoted
 	case StateCommitted:
@@ -569,12 +689,42 @@ func CommitOffline(ctx context.Context, disk string, owner Owner) (bool, error) 
 	err := commitInto(ctx, disk)
 	stop()
 	if err != nil {
+		if eerr := RecordAttemptEnd(disk); eerr != nil {
+			return true, fmt.Errorf("%v; and record its end: %v", err, eerr)
+		}
 		return true, err
 	}
-	if err := MarkCommitted(disk); err != nil {
+	if err := markCommittedOffline(disk); err != nil {
 		return true, fmt.Errorf("record %s committed: %w", Path(disk), err)
 	}
 	return true, nil
+}
+
+// backingIsDisk reports whether an overlay's backing file is disk. Its name
+// must be the disk's; and when the path it names exists on this host it must
+// be the disk itself, not a file of the same name elsewhere. A path that does
+// not exist here is another host's mount point for the pool, and the file of
+// that name beside the overlay is its base.
+func backingIsDisk(backing, disk string) bool {
+	if filepath.Base(backing) != filepath.Base(disk) {
+		return false
+	}
+	p := backing
+	if !filepath.IsAbs(p) {
+		p = filepath.Join(filepath.Dir(disk), p)
+	}
+	if p == disk {
+		return true
+	}
+	bfi, err := os.Stat(p)
+	if errors.Is(err, fs.ErrNotExist) {
+		return true
+	}
+	if err != nil {
+		return false
+	}
+	dfi, err := os.Stat(disk)
+	return err == nil && os.SameFile(bfi, dfi)
 }
 
 // commitInto runs qemu-img commit of disk's overlay into disk, pointing the
@@ -586,7 +736,7 @@ func commitInto(ctx context.Context, disk string) error {
 	if err != nil {
 		return fmt.Errorf("%s: %v", Path(disk), err)
 	}
-	if filepath.Base(info.BackingFile) != filepath.Base(disk) {
+	if !backingIsDisk(info.BackingFile, disk) {
 		return fmt.Errorf("%s: %w (its backing file is %q, not this disk; it is never repointed at another file)", Path(disk), ErrNotOurs, info.BackingFile)
 	}
 	if info.BackingFile != disk && filepath.Join(filepath.Dir(disk), info.BackingFile) != disk {
@@ -743,11 +893,20 @@ func HoldAdvice(vm, diskName string, a Assessment) string {
 	case Pivoted:
 		return fmt.Sprintf("The overlay's writes are already in the disk: discard it (`%s --discard --confirm`); a second commit would overwrite newer writes.", cmd)
 	}
+	if a.BelowFeature {
+		return fmt.Sprintf("This host does not hold the pit_overlay release feature, so it settles no overlay and starts no VM on a disk that has one: upgrade it, or let an upgraded host start the VM. See the verdict with `%s` (no --confirm).", cmd)
+	}
+	if a.PivotUncertain {
+		if a.DiskMtimeNs > a.OverlayMtimeNs {
+			return fmt.Sprintf("The disk was written after the overlay last was, so the pivot most likely landed and the overlay is already in the disk: discard it (`%s --discard --accept-torn-disk --confirm`).", cmd)
+		}
+		return fmt.Sprintf("The overlay was written after the disk last was, so the pivot most likely did not land and the overlay holds the newest writes: commit it (`%s --commit --force-commit --confirm`).", cmd)
+	}
 	if a.Binding != nil && a.Binding.State == StateDiverged {
 		return fmt.Sprintf("The VM ran on its disk without the overlay, so committing it now would write old blocks over newer ones. See the verdict with `%s` (no --confirm); normally the overlay is discarded (--discard, which asks for --accept-torn-disk if a commit had begun).", cmd)
 	}
 	if a.CommitBegan {
-		return fmt.Sprintf("A commit into the disk had begun, so the disk may be partly written, and it cannot be shown to be the file that commit was writing. See the verdict with `%s` (no --confirm). If the disk cannot be trusted, restore it from a backup or a replica; otherwise decide with --force-commit or --discard --accept-torn-disk.", cmd)
+		return fmt.Sprintf("A commit into the disk had begun, so the disk may be partly written, and it cannot be shown to be the file that commit was writing. See the verdict with `%s` (no --confirm). If the disk cannot be trusted, discard the overlay first (`%s --discard --accept-torn-disk --confirm`) and only then put back a backup or replica of the disk — or let `lv backup restore-from --vm %s --disk %s --in-place` do both: it sets the overlay aside, kept, before it writes the disk. Otherwise decide with --force-commit.", cmd, cmd, vm, diskName)
 	}
 	return fmt.Sprintf("Its writes cannot be verified against the disk. See the verdict and what each action does with `%s` (no --confirm): discarding keeps the disk as it is and loses the overlay's writes; a commit is refused unless forced (--force-commit).", cmd)
 }
@@ -768,14 +927,14 @@ func (a Assessment) Consequences() (commit, discard string) {
 		discard = "deletes the overlay and the guest's writes in it; the disk stays as it was when the overlay was taken (consistent, but older)"
 	case HalfWritten:
 		commit = "finishes the commit that was cut short: the disk then holds every write, and is whole again"
-		discard = "REFUSED without --accept-torn-disk: the disk is partly written, and without the overlay it stays inconsistent; restoring it from a backup or a replica is the alternative"
+		discard = "REFUSED without --accept-torn-disk: the disk is partly written, and without the overlay it stays inconsistent. To start over from a backup or a replica instead, discard first (--discard --accept-torn-disk) and then restore the disk, or use `lv backup restore-from --in-place`, which sets the overlay aside before it writes"
 	case Pivoted:
-		commit = "REFUSED without --force-commit: the overlay is already in the disk; committing it again writes its old blocks over everything the guest wrote since"
+		commit = "REFUSED, even with --force-commit (only --overwrite-newer-writes overrides it): the overlay is already in the disk; committing it again writes its old blocks over everything the guest wrote since"
 		discard = "removes the overlay, whose writes are already in the disk: nothing is lost"
 	default:
 		commit = "REFUSED without --force-commit: " + a.Reason + "; a commit could write stale blocks over newer data"
 		if a.CommitBegan {
-			discard = "REFUSED without --accept-torn-disk: a commit into the disk had begun, so without the overlay the disk may be inconsistent; restoring it from a backup or a replica is the alternative"
+			discard = "REFUSED without --accept-torn-disk: a commit into the disk had begun, so without the overlay the disk may be inconsistent. To start over from a backup or a replica instead, discard first (--discard --accept-torn-disk) and then restore the disk, or use `lv backup restore-from --in-place`, which sets the overlay aside before it writes"
 		} else {
 			discard = "deletes the overlay and its writes; the disk is used as it is"
 		}

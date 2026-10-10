@@ -275,6 +275,10 @@ func TestSettle_ACommitLongAgoAndABaseWrittenSinceIsHeld(t *testing.T) {
 	if err := writeBinding(disk, b); err != nil {
 		t.Fatal(err)
 	}
+	long := time.Now().Add(-3 * time.Hour) // and the daemon last vouched for it then
+	if err := os.Chtimes(SidecarPath(disk), long, long); err != nil {
+		t.Fatal(err)
+	}
 	if out, err := exec.Command("qemu-io", "-f", "qcow2", "-c", "write -P 0x33 65536 65536", disk).CombinedOutput(); err != nil {
 		t.Fatalf("write the base: %v %s", err, out)
 	}

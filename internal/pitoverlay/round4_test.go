@@ -329,9 +329,9 @@ func TestMarkCommitting_EveryAttemptRefreshesTheBound(t *testing.T) {
 // Mutation "CommitOffline does not keep its stamp fresh" — red.
 func TestCommitOffline_ALongCommitKeepsItsStampFresh(t *testing.T) {
 	needQemu(t)
-	pb, pr := CommitBound, RefreshEvery
-	CommitBound, RefreshEvery = 400*time.Millisecond, 25*time.Millisecond
-	defer func() { CommitBound, RefreshEvery = pb, pr }()
+	pb, pr := CommitMargin, RefreshEvery
+	CommitMargin, RefreshEvery = 300*time.Millisecond, 25*time.Millisecond
+	defer func() { CommitMargin, RefreshEvery = pb, pr }()
 	disk := window(t)
 	prev := Command
 	Command = func(ctx context.Context, name string, args ...string) *exec.Cmd {
@@ -344,8 +344,9 @@ func TestCommitOffline_ALongCommitKeepsItsStampFresh(t *testing.T) {
 		t.Fatal(err)
 	}
 	Command = prev
-	// The crash: the commit finished, its end was never recorded.
-	restamp(t, disk, func(b *Binding) { b.State = StateCommitting })
+	// The crash: the commit finished, its end was never recorded (the
+	// sidecar keeps the time of the last keep-alive).
+	restampKeep(t, disk, func(b *Binding) { b.State, b.EndMtimeNs, b.EndSize = StateCommitting, 0, 0 })
 
 	if out, err := Settle(context.Background(), disk, owner); err != nil || out != Committed {
 		t.Fatalf("Settle after a long commit = %v, %v; want it finished, not held", out, err)

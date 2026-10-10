@@ -870,11 +870,24 @@ Set in compose `migrate` section:
 | Policy | Behavior |
 |--------|----------|
 | `restart-any` | Restart on any available healthy host |
-| `restart-same` | Wait for original host to recover |
+| `restart-same` | With any host-local disk: wait for the original host, which starts it there on its real disk when it is back. With every disk on shared storage: restart on any available healthy host, like `restart-any`, on its real disks |
 | `none` | Do not reschedule |
 
 A policy applies to every VM on the failed host except a stopped one, which
 is never started by failover: see *Stopped workloads* below.
+
+A `restart-same` VM with a host-local disk is not restarted anywhere else,
+because that would start it on a disk rebuilt blank from its image. It stays
+on its host, and failover records why: the condition `vm_failover_held`
+(subject `vm/<name>@<host>`, a warning), a `vm.failover.held` event, a
+`failover.skip` audit entry and a `vm.disk.stranded` notification, each naming
+the host and what you can do. The host starts the VM on its real disk when it
+is back, and the record clears. If the host is gone for good, its data is
+gone with it: promote a replica if there is one (`lv replication promote
+<vm>`), or remove the VM (`lv rm <vm>`) and create it again. There is no
+command that moves it elsewhere onto a blank disk. It counts in the failover metrics with error class `held_for_host`. Before this
+release a `restart-same` VM was restarted on any healthy host whatever its
+disks, because the original host is never available while it is fenced.
 
 A VM with a local disk that is restarted on another host does not get its disk
 back, because the disk stayed on the failed host. The new host rebuilds the disk

@@ -1803,6 +1803,19 @@ Every copy is kept while the VM exists. To run the VM on its real disk again,
 or to give the data up, see the commands in
 [migration-failover.md](migration-failover.md#the-real-disk-a-restart-leaves-behind).
 
+### A restart-same VM waits for its host (`vm_failover_held`)
+
+A VM with `on-host-failure: restart-same` and a host-local disk was on a host
+that failed. Failover left it there instead of restarting it elsewhere on a
+disk rebuilt blank from its image. The coordinator raises `vm_failover_held`
+(evaluator `vm_disk`, subject `vm/<name>@<host>`, warning); the evidence names
+the host, the disks and what to do (see
+[VM failure policies](migration-failover.md#vm-failure-policies)).
+
+| Raised when | Clears when |
+|---|---|
+| Failover leaves a restart-same VM with a host-local disk on its failed host. | The host is back and runs the VM again, or the VM moved or was deleted. A record for a host removed from the cluster clears once the VM is deleted or elsewhere. |
+
 ## NetBox IPAM: metrics and health findings
 
 Every counter below is registered on the same `/metrics` endpoint as the rest,

@@ -320,6 +320,10 @@ func (r *Reconciler) tendStrandedDisks(ctx context.Context) {
 	}
 	suffix := "@" + r.hostName
 	for _, row := range open {
+		if row.Evaluator == DiskMissingEvaluator && row.Code == CondVMFailoverHeld {
+			r.resolveHeldForHost(ctx, row)
+			continue
+		}
 		if row.Evaluator != DiskMissingEvaluator || row.Code != CondVMDiskStranded {
 			continue
 		}
@@ -563,4 +567,126 @@ func RestoreSupersededDisk(ctx context.Context, db *corrosion.Client, dataDir, h
 	slog.Warn("restored a superseded disk copy as the VM's disk", "vm", vm.Name, "disk", disk.DiskName,
 		"path", c.DiskPath, "restored", c.Path, "set_aside", out.SetAside)
 	return out, nil
+}
+
+// A restart-same VM with a host-local disk waits for its host.
+//
+// `on-host-failure: restart-same` asks for the VM to come back on its own
+// host. A restart anywhere else would start it on a disk rebuilt blank from
+// its image, so a VM with any host-local disk is left on its fenced host and
+// recorded (internal/failover/restart_same.go): condition vm_failover_held
+// (evaluator vm_disk, subject vm/<name>@<host>, warning), naming the host and
+// what the operator can do. Its host, once back, starts it there on its real
+// disk as for any VM its row says runs there, and resolves the record. A
+// restart-same VM whose disks are all shared is still restarted elsewhere, as
+// before: nothing is lost.
+
+// CondVMFailoverHeld is filed under DiskMissingEvaluator.
+const CondVMFailoverHeld = "vm_failover_held"
+
+// HeldForHost is the evidence of vm_failover_held.
+type HeldForHost struct {
+	VM     string         `json:"vm"`
+	Host   string         `json:"host"`
+	Disks  []StrandedDisk `json:"disks"`
+	Detail string         `json:"detail"`
+	Fix    string         `json:"fix"`
+}
+
+// heldFix is what an operator can do about a restart-same VM held on host.
+func heldFix(vm, host string) string {
+	return fmt.Sprintf("bring %[2]s back: it starts %[1]s there on its real disk. If %[2]s is gone for good, its data is gone "+
+		"with it: promote a replica if there is one (`lv replication promote %[1]s`), or remove the VM (`lv rm %[1]s`) and "+
+		"create it again. Disk copies a failover set aside are listed by `lv host superseded-disks <host>`", vm, host)
+}
+
+// RecordHeldForHost records that vmName is held on host to wait for it, and
+// returns the detail for the caller's event, audit row and notification.
+func RecordHeldForHost(ctx context.Context, db *corrosion.Client, reporter, vmName, host string, disks []corrosion.DiskRecord, now time.Time) (string, error) {
+	ts := now.UTC().Format(time.RFC3339)
+	ev := HeldForHost{VM: vmName, Host: host}
+	var paths []string
+	for _, d := range disks {
+		if d.Path != "" && !corrosion.DiskIsShared(d) {
+			ev.Disks = append(ev.Disks, StrandedDisk{Disk: d.DiskName, Path: d.Path, Since: ts})
+			paths = append(paths, d.DiskName+" at "+d.Path)
+		}
+	}
+	ev.Detail = fmt.Sprintf("held on %s, not restarted elsewhere: on-host-failure is restart-same and its host-local disk(s) %s "+
+		"are on %s; a restart on another host would rebuild them blank from its image", host, strings.Join(paths, ", "), host)
+	ev.Fix = heldFix(vmName, host)
+	b, err := json.Marshal(ev)
+	if err != nil {
+		return "", err
+	}
+	row, had, err := corrosion.GetHealthCondition(ctx, db, DiskMissingEvaluator, CondVMFailoverHeld, "vm", strandedSubject(vmName, host))
+	if err != nil {
+		return "", err
+	}
+	if !had || row.Lifecycle == corrosion.ConditionResolved {
+		row = corrosion.HealthCondition{
+			Evaluator: DiskMissingEvaluator, Code: CondVMFailoverHeld, SubjectKind: "vm",
+			SubjectID: strandedSubject(vmName, host), FirstSeen: ts, ConfirmedAt: ts,
+		}
+	}
+	row.Lifecycle, row.Severity, row.Hosts = corrosion.ConditionConfirmed, corrosion.SeverityWarning, []string{host}
+	row.Evidence, row.LastSeen, row.Reporter, row.ResolvedAt = string(b), ts, reporter, ""
+	row.ObserveCount++
+	row.CleanCount = 0
+	if err := corrosion.UpsertHealthCondition(ctx, db, row); err != nil {
+		return "", err
+	}
+	return ev.Detail + ". " + ev.Fix, nil
+}
+
+// HeldForHostOf returns the open vm_failover_held record of vmName, or nil.
+func HeldForHostOf(ctx context.Context, db *corrosion.Client, vmName string) (*HeldForHost, error) {
+	open, err := corrosion.ListHealthConditions(ctx, db, false)
+	if err != nil {
+		return nil, err
+	}
+	for _, row := range open {
+		if row.Evaluator != DiskMissingEvaluator || row.Code != CondVMFailoverHeld || !strings.HasPrefix(row.SubjectID, vmName+"@") {
+			continue
+		}
+		var ev HeldForHost
+		if err := json.Unmarshal([]byte(row.Evidence), &ev); err != nil || ev.VM != vmName {
+			continue
+		}
+		return &ev, nil
+	}
+	return nil, nil
+}
+
+// resolveHeldForHost clears vm_failover_held records nothing holds any more:
+// on this host, once the VM runs here again, or is elsewhere, or is gone; on a
+// host removed from the cluster, once the VM is gone or elsewhere.
+func (r *Reconciler) resolveHeldForHost(ctx context.Context, row corrosion.HealthCondition) {
+	var ev HeldForHost
+	if err := json.Unmarshal([]byte(row.Evidence), &ev); err != nil || ev.VM == "" || ev.Host == "" {
+		return
+	}
+	vm, err := corrosion.GetVM(ctx, r.db, ev.VM)
+	if err != nil {
+		return
+	}
+	held := vm != nil && vm.HostName == ev.Host
+	if ev.Host == r.hostName {
+		if held && vm.State != "running" {
+			return // still waiting for this host to start it
+		}
+	} else {
+		if held {
+			return
+		}
+		if h, herr := corrosion.GetHost(ctx, r.db, ev.Host); herr != nil || (h != nil && h.State != "removed") {
+			return // that host clears its own
+		}
+	}
+	ts := r.now().UTC().Format(time.RFC3339)
+	row.Lifecycle, row.ResolvedAt, row.LastSeen, row.Reporter = corrosion.ConditionResolved, ts, ts, r.hostName
+	row.ObserveCount, row.CleanCount = 0, 1
+	if err := corrosion.UpsertHealthCondition(ctx, r.db, row); err != nil {
+		slog.Warn("reconciler: could not resolve vm_failover_held", "vm", ev.VM, "error", err)
+	}
 }

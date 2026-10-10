@@ -2846,6 +2846,20 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 			if same != nil && same.State == "active" {
 				targetName = same.Name
 			}
+			if targetName == "" {
+				// Elsewhere would rebuild a host-local disk blank: such a VM
+				// waits for its host (restart_same.go). All-shared moves on.
+				disks, derr := corrosion.GetVMDisks(ctx, c.db, vm.Name)
+				if derr != nil {
+					slog.Warn("failover: cannot read a restart-same VM's disks; leaving it (fail closed)", "vm", vm.Name, "error", derr)
+					c.mVM(ActionReschedule, ResultError, ErrDBError)
+					continue
+				}
+				if corrosion.VMHasHostLocalDisk(disks) {
+					c.holdRestartSame(ctx, h.Name, vm, disks)
+					continue
+				}
+			}
 		}
 
 		if targetName == "" {

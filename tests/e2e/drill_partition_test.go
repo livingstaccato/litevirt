@@ -165,8 +165,10 @@ func TestDrill1_SplitTwoThree(t *testing.T) {
 		t.FailNow()
 	}
 	// Every running workload has been recovered by now, so a stopped VM
-	// recovered with them would be defined on the majority already.
-	l.assertStoppedVMStayed(stopped, q, majority)
+	// recovered with them would be defined on the majority already. `lv
+	// inspect` through q is forwarded to the VM's host, which the split cuts
+	// off, so the majority's record is read from q's own state.db.
+	l.assertStoppedVMSkippedDuringSplit(stopped, q, majority, since)
 
 	// ── 3. the replacement disk has the recorded size ───────────────────────
 	r := s.last()
@@ -708,8 +710,62 @@ func (l *lab) createStoppedVM(via, prefix string, hosts ...string) stoppedVM {
 }
 
 // assertStoppedVMStayed checks that no host in others defines sv's domain
-// (virsh) and that litevirt still records it stopped on its own host.
+// (virsh) and that litevirt still records it stopped on its own host. It
+// reads that through `lv inspect`, so it is for a connected cluster; during a
+// split use assertStoppedVMSkippedDuringSplit.
 func (l *lab) assertStoppedVMStayed(sv stoppedVM, via string, others []string) {
+	l.t.Helper()
+	l.assertNotDefinedOn(sv, others)
+	v, err := l.inspectVM(via, sv.name)
+	if err != nil {
+		l.t.Errorf("inspect the stopped VM %s: %v", sv.name, err)
+		return
+	}
+	if v.HostName != sv.host || v.State != "VM_STOPPED" {
+		l.t.Errorf("the stopped VM %s is recorded %s on %s; want VM_STOPPED on %s", sv.name, v.State, v.HostName, sv.host)
+	}
+}
+
+// assertStoppedVMSkippedDuringSplit is assertStoppedVMStayed while sv's host is
+// cut off from via: no host in others defines sv's domain (virsh), via's own
+// state.db still records sv stopped on its host, and the majority's failover
+// coordinator decided to leave it there — a failover.skip audit row for sv
+// since the drill began, which replicates to via within a minute. `lv
+// inspect` is not used: it is forwarded to the host the VM's row names, which
+// is on the other side of the split.
+func (l *lab) assertStoppedVMSkippedDuringSplit(sv stoppedVM, via string, others []string, since string) {
+	l.t.Helper()
+	l.assertNotDefinedOn(sv, others)
+	rows, err := l.sql(via, "SELECT host_name, state FROM vms WHERE name = '"+sv.name+"' AND deleted_at IS NULL")
+	switch {
+	case err != nil:
+		l.t.Errorf("read the stopped VM %s from %s's state.db: %v", sv.name, via, err)
+	case len(rows) != 1 || len(rows[0]) != 2:
+		l.t.Errorf("the stopped VM %s has rows %v in %s's state.db; want one", sv.name, rows, via)
+	case rows[0][0] != sv.host || rows[0][1] != "stopped":
+		l.t.Errorf("%s records the stopped VM %s %s on %s; want stopped on %s", via, sv.name, rows[0][1], rows[0][0], sv.host)
+	}
+	q := "SELECT result, detail FROM audit_log WHERE action = 'failover.skip' AND target = '" + sv.name + "' AND timestamp >= '" + since + "'"
+	deadline := time.Now().Add(time.Minute)
+	for {
+		rows, err := l.sql(via, q)
+		if err == nil && len(rows) > 0 {
+			if rows[0][0] != "skipped" {
+				l.t.Errorf("the failover.skip row for %s on %s is %v; want result skipped", sv.name, via, rows[0])
+			}
+			l.mark("drill1: %s left stopped on %s: failover.skip %q", sv.name, sv.host, rows[0][len(rows[0])-1])
+			return
+		}
+		if time.Now().After(deadline) {
+			l.t.Errorf("no failover.skip audit row for the stopped VM %s on %s since %s (err %v): the coordinator never decided to leave it", sv.name, via, since, err)
+			return
+		}
+		time.Sleep(3 * time.Second)
+	}
+}
+
+// assertNotDefinedOn checks that no host in others defines sv's domain (virsh).
+func (l *lab) assertNotDefinedOn(sv stoppedVM, others []string) {
 	l.t.Helper()
 	for _, h := range others {
 		out, err := l.ssh(h, 20*time.Second, "virsh -c qemu:///system list --all --name")
@@ -723,14 +779,6 @@ func (l *lab) assertStoppedVMStayed(sv stoppedVM, via string, others []string) {
 				l.t.Errorf("the stopped VM %s is defined on %s (state %q): failover moved it", sv.name, h, strings.TrimSpace(st))
 			}
 		}
-	}
-	v, err := l.inspectVM(via, sv.name)
-	if err != nil {
-		l.t.Errorf("inspect the stopped VM %s: %v", sv.name, err)
-		return
-	}
-	if v.HostName != sv.host || v.State != "VM_STOPPED" {
-		l.t.Errorf("the stopped VM %s is recorded %s on %s; want VM_STOPPED on %s", sv.name, v.State, v.HostName, sv.host)
 	}
 }
 

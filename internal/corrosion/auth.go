@@ -168,6 +168,29 @@ func ListRoleBindings(ctx context.Context, c *Client) ([]RoleBindingRecord, erro
 	return out, nil
 }
 
+// GetRoleBinding returns the live binding with id, or nil when there is none
+// (never written here, or revoked).
+func GetRoleBinding(ctx context.Context, c *Client, id string) (*RoleBindingRecord, error) {
+	rows, err := c.Query(ctx,
+		`SELECT id, path, role, principal, propagate, updated_at
+		 FROM role_bindings WHERE id = ? AND deleted_at IS NULL`, id)
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	r := rows[0]
+	return &RoleBindingRecord{
+		ID:        r.String("id"),
+		Path:      r.String("path"),
+		Role:      r.String("role"),
+		Principal: r.String("principal"),
+		Propagate: r.Int("propagate") == 1,
+		UpdatedAt: r.String("updated_at"),
+	}, nil
+}
+
 // ListBindingsForPrincipal returns bindings that apply to a single
 // principal. Used at login/permission-check time.
 func ListBindingsForPrincipal(ctx context.Context, c *Client, principal string) ([]RoleBindingRecord, error) {

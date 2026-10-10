@@ -1783,6 +1783,26 @@ To recover, do one of these:
 - If its data is lost for good, run `lv rebuild <vm>`. It recreates the VM from
   its spec with blank disks and keeps its IP and MAC addresses.
 
+### A VM's real disk is on another host (`vm_disk_stranded`)
+
+A failover restarted a VM with a host-local disk on another host, on a disk
+rebuilt from its image, because that host could not reach the real one (see
+[VM failure policies](migration-failover.md#the-real-disk-a-restart-leaves-behind)).
+The coordinator raises `vm_disk_stranded` (evaluator `vm_disk`, subject
+`vm/<name>@<host>`, warning) naming the host that holds the real disk. The
+evidence lists each disk: its `path` there, and once the host is back and has
+set it aside, its `copy` (`<path>.superseded-<time>`). A host that sets aside an
+old copy it found at a failover start records it the same way. `lv inspect
+<vm>` shows the same list as `strandedDisks`.
+
+| Raised when | Clears when |
+|---|---|
+| A failover restarts the VM elsewhere and leaves a host-local disk on the failed host, or a host sets a copy of the VM's disk aside. | Nothing is left to keep: every copy was removed (`--remove`) or restored (`--restore`), or the VM was deleted. A record for a host removed from the cluster clears once the VM is deleted. |
+
+Every copy is kept while the VM exists. To run the VM on its real disk again,
+or to give the data up, see the commands in
+[migration-failover.md](migration-failover.md#the-real-disk-a-restart-leaves-behind).
+
 ## NetBox IPAM: metrics and health findings
 
 Every counter below is registered on the same `/metrics` endpoint as the rest,

@@ -12,11 +12,15 @@ import (
 // what its config already says, and one whose config predates the key keeps
 // the historical default (auto).
 //
-// Mutation: make the no-config branch write auto — a fresh node's UI is plain
-// HTTP again.
+// Mutations: make the no-config branch write auto — a fresh node's UI is plain
+// HTTP again; read the key with grep (which exits 1 when it is absent) — the
+// "no key" re-init aborts under the script's set -euo pipefail.
 func TestSetupScript_UITLS(t *testing.T) {
 	if !strings.Contains(setupScriptContent, "ui_tls: ${UI_TLS}") {
 		t.Fatal("the setup script does not write ui_tls")
+	}
+	if !strings.Contains(setupScriptContent, "set -euo pipefail") {
+		t.Fatal("fixture: the setup script's shell options changed; run the snippet under the new ones")
 	}
 	for name, tc := range map[string]struct{ existing, want string }{
 		"new node":        {"", "on"},
@@ -32,7 +36,9 @@ func TestSetupScript_UITLS(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		out, err := exec.Command("bash", "-c", "CONFIG="+cfg+"\n"+uiTLSScript+"\necho \"$UI_TLS\"").CombinedOutput()
+		// Exactly the setup script's shell options: under pipefail a grep that
+		// finds nothing fails the pipeline, and set -e then aborts the script.
+		out, err := exec.Command("bash", "-euo", "pipefail", "-c", "CONFIG="+cfg+"\n"+uiTLSScript+"\necho \"$UI_TLS\"").CombinedOutput()
 		if err != nil {
 			t.Fatalf("%s: %v %s", name, err, out)
 		}

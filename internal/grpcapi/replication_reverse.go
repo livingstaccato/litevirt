@@ -36,7 +36,7 @@ func (s *Server) reverseReplicationAfterMove(ctx context.Context, kind, name, pr
 		// schedule can have been made here to switch.
 		return
 	}
-	opts := corrosion.ReverseOptions{TargetOnly: s.repointReady(ctx)}
+	opts := corrosion.ReverseOptions{Ready: func() bool { return s.repointReady(ctx) }}
 	revs, err := corrosion.ReverseReplicationOnMove(ctx, s.db, kind, name, project, oldHost, newHost, opts)
 	if err != nil {
 		slog.Warn("replication: could not switch direction after a move", "kind", kind, "workload", name, "from", oldHost, "to", newHost, "error", err)

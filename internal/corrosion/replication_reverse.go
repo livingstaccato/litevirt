@@ -89,7 +89,7 @@ func ReverseReplicationOnMove(ctx context.Context, c *Client, kind, name, projec
 		if reverseBeforeWrite != nil {
 			reverseBeforeWrite()
 		}
-		applied, err := repointSchedule(ctx, c, r.VMName, r.Repo, newHost, oldHost, opts.TargetOnly)
+		applied, err := repointSchedule(ctx, c, r.VMName, r.Repo, newHost, oldHost, opts.targetOnly())
 		if err != nil {
 			return out, fmt.Errorf("re-point replication schedule of %q: %w", name, err)
 		}
@@ -111,6 +111,16 @@ type ReverseOptions struct {
 	// TargetOnly writes the switch as a compare-and-set of target_host alone
 	// (RepointReplicationTarget). Set only when every host knows that statement.
 	TargetOnly bool
+	// Ready, when set, answers TargetOnly instead, asked only when a schedule
+	// actually needs switching (it may ask the peers).
+	Ready func() bool
+}
+
+func (o ReverseOptions) targetOnly() bool {
+	if o.Ready != nil {
+		return o.Ready()
+	}
+	return o.TargetOnly
 }
 
 // reverseBeforeWrite runs between the read and the write of each switch (tests
@@ -192,7 +202,7 @@ func reversalBlocker(ctx context.Context, c *Client, kind, oldHost string, r Bac
 // left targeting the workload's own host is then reported by its runs
 // (suspended, never a success), so nothing is silent. It never fails the move.
 func ReverseReplicationAudited(ctx context.Context, c *Client, kind, name, project, oldHost, newHost string, audit func(detail, result string)) {
-	revs, err := ReverseReplicationOnMove(ctx, c, kind, name, project, oldHost, newHost, ReverseOptions{TargetOnly: c.RepointReady(ctx)})
+	revs, err := ReverseReplicationOnMove(ctx, c, kind, name, project, oldHost, newHost, ReverseOptions{Ready: func() bool { return c.RepointReady(ctx) }})
 	if err != nil {
 		slog.Warn("replication: could not switch direction after a move", "kind", kind, "workload", name, "from", oldHost, "to", newHost, "error", err)
 	}

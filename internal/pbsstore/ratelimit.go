@@ -131,9 +131,21 @@ func (o *PushOptions) waitRate(ctx context.Context, n int) error {
 // bytes, or a number with a binary K/M/G/T suffix, optionally written as KiB,
 // MB, MiB/s and so on (all binary: 1M = 1 MiB). "" and "0" mean no limit.
 func ParseRate(s string) (int64, error) {
+	return parseBytes(s, true)
+}
+
+// ParseSize parses a byte size the same way ("16G", "512MiB", a byte count),
+// without a "/s".
+func ParseSize(s string) (int64, error) {
+	return parseBytes(s, false)
+}
+
+func parseBytes(s string, rate bool) (int64, error) {
 	orig := s
 	s = strings.ToUpper(strings.TrimSpace(s))
-	s = strings.TrimSuffix(s, "/S")
+	if rate {
+		s = strings.TrimSuffix(s, "/S")
+	}
 	s = strings.TrimSuffix(s, "IB")
 	s = strings.TrimSuffix(s, "B")
 	s = strings.TrimSpace(s)
@@ -156,10 +168,13 @@ func ParseRate(s string) (int64, error) {
 	}
 	n, err := strconv.ParseInt(s, 10, 64)
 	if err != nil || n < 0 {
-		return 0, fmt.Errorf("invalid bandwidth limit %q (want e.g. 50MiB, 512K or a byte count per second)", orig)
+		if rate {
+			return 0, fmt.Errorf("invalid bandwidth limit %q (want e.g. 50MiB, 512K or a byte count per second)", orig)
+		}
+		return 0, fmt.Errorf("invalid size %q (want e.g. 16G, 512MiB or a byte count)", orig)
 	}
 	if n > 0 && n > (1<<63-1)/mult {
-		return 0, fmt.Errorf("bandwidth limit %q overflows", orig)
+		return 0, fmt.Errorf("%q overflows", orig)
 	}
 	return n * mult, nil
 }

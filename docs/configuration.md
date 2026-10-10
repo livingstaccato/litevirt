@@ -619,6 +619,20 @@ backup_repos:
 backup_bwlimits:
   offsite: 100MiB
 
+# Single-file restore (lv backup file-ls / file-restore). The backup is read
+# inside a throwaway restore VM booted from this host's own kernel; every key
+# is optional. See docs/design/backup-file-restore.md.
+file_restore:
+  enabled: true              # false refuses file restore (full restore is unaffected)
+  kernel: ""                 # default /boot/vmlinuz-<running release>
+  modules_dir: ""            # default /lib/modules/<running release>
+  qemu: ""                   # default qemu-system-x86_64 / -aarch64 on PATH, or /usr/libexec/qemu-kvm
+  memory_mib: 512            # the restore VM's memory (at least 256)
+  run_as: ""                 # user qemu drops to; default libvirt-qemu, qemu or nobody
+  idle_timeout_sec: 300      # a browsing session's VM is killed after this long unused
+  max_sessions: 2            # restore VMs at once on this host
+  max_extract_bytes: 16G     # per extraction; a request can only lower it
+
 # Billing-event webhook. Empty disables (the default — events
 # are dropped). When set, `internal/billing` POSTs JSON
 # {kind, project, subject, vcpu, mem_mib, disk_gib, …, at} on every

@@ -111,6 +111,11 @@ type Config struct {
 	// Absent or 0 = no limit.
 	BackupBWLimits map[string]string `yaml:"backup_bwlimits,omitempty"`
 
+	// FileRestore configures single-file restore from backups, which reads
+	// the backed-up filesystem inside a throwaway restore VM
+	// (docs/design/backup-file-restore.md).
+	FileRestore FileRestoreConfig `yaml:"file_restore"`
+
 	// MaxImageBytes caps a single image pull/import (disk-fill guard);
 	// ImagePullTimeoutSec bounds a pull's total wall time (SSRF/slowloris
 	// guard). Zero on either falls back to the image package's defaults
@@ -871,6 +876,10 @@ func LoadConfig() (*Config, error) {
 			cfg.VM.DefaultCPUMode, lv.CPUModeHostModel, lv.CPUModeHostPassthrough)
 	}
 
+	if err := cfg.FileRestore.validate(); err != nil {
+		return nil, err
+	}
+
 	// A typo'd bandwidth limit must fail load, not silently run unlimited.
 	if _, err := cfg.BackupBandwidthLimits(); err != nil {
 		return nil, err
@@ -1171,4 +1180,54 @@ func (c *Config) BackupBandwidthLimits() (map[string]int64, error) {
 		}
 	}
 	return out, nil
+}
+
+// FileRestoreConfig is the `file_restore:` block. Every field is optional;
+// the defaults boot this host's own kernel.
+type FileRestoreConfig struct {
+	// Enabled turns single-file restore off when false (default on). Off,
+	// the RPCs refuse; a full restore is unaffected either way.
+	Enabled *bool `yaml:"enabled,omitempty"`
+	// Kernel the restore VM boots (default /boot/vmlinuz-<running release>).
+	Kernel string `yaml:"kernel,omitempty"`
+	// ModulesDir holds that kernel's modules (default
+	// /lib/modules/<running release>).
+	ModulesDir string `yaml:"modules_dir,omitempty"`
+	// QEMU is the system emulator (default: qemu-system-x86_64 /
+	// qemu-system-aarch64 on PATH, or /usr/libexec/qemu-kvm).
+	QEMU string `yaml:"qemu,omitempty"`
+	// MemoryMiB is the restore VM's memory (default 512, minimum 256).
+	MemoryMiB int `yaml:"memory_mib,omitempty"`
+	// RunAs is the user qemu drops to (default libvirt-qemu, qemu or nobody,
+	// the first that exists).
+	RunAs string `yaml:"run_as,omitempty"`
+	// IdleTimeoutSec kills a browsing session's restore VM after this long
+	// unused (default 300).
+	IdleTimeoutSec int `yaml:"idle_timeout_sec,omitempty"`
+	// MaxSessions caps restore VMs running at once on this host (default 2).
+	MaxSessions int `yaml:"max_sessions,omitempty"`
+	// MaxExtractBytes caps one extraction ("16G" default).
+	MaxExtractBytes string `yaml:"max_extract_bytes,omitempty"`
+}
+
+// On reports whether file restore is enabled (default on).
+func (f FileRestoreConfig) On() bool { return f.Enabled == nil || *f.Enabled }
+
+// ExtractLimit is MaxExtractBytes in bytes (0 = the default).
+func (f FileRestoreConfig) ExtractLimit() int64 {
+	n, _ := pbsstore.ParseSize(f.MaxExtractBytes)
+	return n
+}
+
+func (f FileRestoreConfig) validate() error {
+	if f.MemoryMiB != 0 && f.MemoryMiB < 256 {
+		return fmt.Errorf("config file_restore.memory_mib %d: the restore VM needs at least 256", f.MemoryMiB)
+	}
+	if f.IdleTimeoutSec < 0 || f.MaxSessions < 0 {
+		return fmt.Errorf("config file_restore: idle_timeout_sec and max_sessions cannot be negative")
+	}
+	if _, err := pbsstore.ParseSize(f.MaxExtractBytes); err != nil {
+		return fmt.Errorf("config file_restore.max_extract_bytes: %w", err)
+	}
+	return nil
 }

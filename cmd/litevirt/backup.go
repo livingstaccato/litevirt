@@ -24,6 +24,8 @@ func newBackupCmd() *cobra.Command {
 		newBackupSnapshotCmd(),
 		newBackupRestoreFromCmd(),
 		newBackupRestoreLiveCmd(),
+		newBackupFileLsCmd(),
+		newBackupFileRestoreCmd(),
 		newBackupScheduleCmd(),
 	)
 	return cmd

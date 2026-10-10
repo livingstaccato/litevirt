@@ -834,6 +834,9 @@ lv backup snapshot <vm> --repo <path> [--disk <name>] [--incremental] [--quiesce
 #   application-consistent backup when the VM has an agent, else crash-consistent.
 #   --quiesce off: always crash-consistent. A freeze failure never fails the backup.
 lv backup restore-from --repo <p> --vm <v> --disk <d> --timestamp <ts>
+# Single files, read inside a throwaway restore VM (never mounted on the host):
+lv backup file-ls --repo <r> --vm <v>|--ct <c> --timestamp <ts> [--disk <d>] [/<volume>/<dir>]
+lv backup file-restore --repo <r> --vm <v>|--ct <c> --timestamp <ts> [--disk <d>] <path>... -o <archive.tar|-> [--max-bytes <size>]
   [--in-place]        # restore over the VM's own disk from its record (VM stopped)
   [--target-path <f>] # admin only; never an existing file but the VM's own disk (then as --in-place). Default: a new daemon-named file
 lv backup restore-live --repo <p> --vm <v> --disk <d> \

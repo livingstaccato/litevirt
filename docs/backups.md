@@ -25,6 +25,7 @@ surface:
 | `lv backup snapshot <vm>` | push a VM disk into a repo via the daemon (gRPC) |
 | `lv backup restore-from` | offline restore: stream chunks to a target disk path |
 | `lv backup restore-live` | live restore: serve manifest over NBD while the VM boots against a qcow2 overlay |
+| `lv backup file-ls` / `file-restore` | browse a VM or container backup and extract single files, read inside a throwaway restore VM |
 | `lv backup schedule …` | cron-driven backups, scoped per-VM, per-pool, per-project, or cluster-wide |
 | compose `backup:` block | deploy-time hook that reconciles a `backup_schedules` row from the stack |
 | `/backups` UI page | manifest list per configured repo, plus verify / GC / prune / sync through the daemon's repo RPCs |
@@ -495,6 +496,54 @@ when the manifest has none.
 The NBD server is read-only and rejects writes with `EPERM` — guests
 that try to write straight to the backing source get a clear error
 rather than silent corruption. All writes land in the qcow2 overlay.
+
+## Single-file restore
+
+Browse a backup and pull files out of it without restoring the disk:
+
+```bash
+# The backup's volumes: partitions (vda1, vda2, …), the whole disk (vda),
+# or rootfs for a container.
+lv backup file-ls --repo main --vm postgres-1 --timestamp 2026-05-11T02:15:00Z
+lv backup file-ls --repo main --vm postgres-1 --timestamp 2026-05-11T02:15:00Z /vda1/etc
+
+# Extract as a tar archive (a new file; - for stdout).
+lv backup file-restore --repo main --vm postgres-1 --timestamp 2026-05-11T02:15:00Z \
+    /vda1/etc/postgresql /vda1/home/app/.env -o files.tar
+
+# Containers: --ct, and the volume is rootfs.
+lv backup file-restore --repo main --ct web --timestamp 2026-05-11T03:00:00Z /rootfs/etc/nginx -o nginx.tar
+```
+
+**The host never mounts the backup.** A malformed filesystem is a kernel
+attack surface whatever the mount options, and a backup holds whatever its
+guest wrote. The daemon boots a throwaway **restore VM** instead: this host's
+own kernel and an initramfs whose init is the litevirt binary itself, the
+backup attached read-only as its only disk (served from the repo over a local
+NBD socket), no network, vsock as its only channel, one vCPU and 512 MiB. The
+guest kernel parses the partition table and mounts each filesystem read-only
+inside the VM. Everything the VM returns is untrusted: listings are validated
+and the archive is rebuilt entry by entry — relative names inside what you
+selected, only directories, regular files and symlinks, nothing under a
+symlink, no owners, setuid bits or extended attributes, bounded sizes — and
+streamed to you. Nothing is written on the daemon's host. The architecture,
+limits and threat model are in
+[design/backup-file-restore.md](design/backup-file-restore.md).
+
+- **Permission:** the same as a full restore of that VM or container
+  (`backup.restore` on the backup's project). Every extraction is audited as
+  `backup.file_restore`, with the paths and what was extracted.
+- **Sessions:** browsing reuses one restore VM, killed after five idle
+  minutes; an extraction's VM is killed when it completes; two at a time per
+  host (`file_restore:` in the daemon config tunes all of it).
+- **Filesystems:** ext2/3/4, xfs, btrfs, vfat and iso9660, on a disk or its
+  partitions. Not LVM, LUKS, ZFS or md-raid inside the backup, and not a
+  stopped linked clone's disk-file backup (it is only the delta over its base)
+  — restore the disk for those.
+- **Requirements:** KVM, `/dev/vhost-vsock` (the `vhost_vsock` module) and
+  qemu on the daemon's host, and a kernel it can read (its own by default).
+  Without them file restore is refused naming what is missing; a full
+  restore keeps working. There is no fallback to mounting on the host.
 
 ## Containers
 

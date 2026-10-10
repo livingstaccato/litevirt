@@ -32,6 +32,7 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/dns"
 	"github.com/litevirt/litevirt/internal/failover"
+	"github.com/litevirt/litevirt/internal/filerestore"
 	"github.com/litevirt/litevirt/internal/firewall"
 	"github.com/litevirt/litevirt/internal/grpcapi"
 	"github.com/litevirt/litevirt/internal/health"
@@ -1436,6 +1437,19 @@ func (d *Daemon) Run(ctx context.Context) error {
 		svc.SetBackupBandwidthLimits(bw)
 	} else {
 		slog.Error("backup_bwlimits", "error", err)
+	}
+	if fr := d.cfg.FileRestore; fr.On() {
+		stateDir := filepath.Join(d.cfg.DataDir, "file-restore")
+		filerestore.SweepStale(stateDir) // a previous daemon's restore VMs died with it
+		svc.SetFileRestore(grpcapi.FileRestoreOptions{
+			Launcher: filerestore.NewLauncher(filerestore.Config{
+				QEMU: fr.QEMU, Kernel: fr.Kernel, ModulesDir: fr.ModulesDir,
+				MemoryMiB: fr.MemoryMiB, RunAs: fr.RunAs, StateDir: stateDir,
+			}),
+			IdleTimeout:     time.Duration(fr.IdleTimeoutSec) * time.Second,
+			MaxSessions:     fr.MaxSessions,
+			MaxExtractBytes: fr.ExtractLimit(),
+		})
 	}
 	svc.SweepTransferStaging()                          // clear orphaned peer-transfer staging repos from a prior incarnation
 	blockedCIDRs, _ := d.cfg.ImagePullBlockedPrefixes() // already validated in LoadConfig

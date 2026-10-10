@@ -29,6 +29,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"os"
 	"sync"
 )
 
@@ -72,6 +73,25 @@ func (s *Server) Listen(addr string) (net.Addr, error) {
 	s.stopCh = make(chan struct{})
 	s.activeConns = map[net.Conn]struct{}{}
 	return l.Addr(), nil
+}
+
+// ListenUnix binds a unix socket at path and makes it owner-only. Put it in
+// a directory only the daemon can enter (file restore uses a 0700 session
+// directory), so it is never reachable by anyone else, even before the
+// chmod. The socket must not exist yet.
+func (s *Server) ListenUnix(path string) error {
+	l, err := net.Listen("unix", path)
+	if err != nil {
+		return fmt.Errorf("nbd listen: %w", err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		_ = l.Close()
+		return fmt.Errorf("nbd listen: %w", err)
+	}
+	s.listener = l
+	s.stopCh = make(chan struct{})
+	s.activeConns = map[net.Conn]struct{}{}
+	return nil
 }
 
 // Serve accepts connections until Stop is called or ctx is cancelled.

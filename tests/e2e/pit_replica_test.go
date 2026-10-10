@@ -259,6 +259,15 @@ func TestReplicateVolume_RunningVMIsPointInTime(t *testing.T) {
 		if l.fileExists(h, overlay) {
 			t.Errorf("after layer 2 the overlay %s is still there", overlay)
 		}
+		// The window's token was written on the real disk before the
+		// snapshot (round 4, N1). On a pool filesystem with user xattrs it
+		// is still there, 32 hex digits; a filesystem without them (NFS
+		// before 4.2) has none, and the binding recorded no_xattr.
+		if tok, err := l.ssh(h, 30*time.Second, "getfattr --only-values -n user.litevirt.pit_window "+shellQuote(root)+" 2>&1"); err != nil {
+			t.Logf("layer 2: no window token on %s (a filesystem without user xattrs?): %s", root, tok)
+		} else if tok = strings.TrimSpace(tok); len(tok) != 32 {
+			t.Errorf("layer 2: the window token on %s is %q, want 32 hex digits", root, tok)
+		}
 
 		// Leg 3: no session and no snapshot, so main's -U copy, marked.
 		l.mustSSH(h, 30*time.Second, "chattr +i "+shellQuote(srcDir))

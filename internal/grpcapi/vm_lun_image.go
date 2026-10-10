@@ -17,6 +17,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/qcow2"
+	"github.com/litevirt/litevirt/internal/randid"
 	"github.com/litevirt/litevirt/internal/storage"
 )
 
@@ -103,33 +104,26 @@ func qemuImgWrite(ctx context.Context, image, format, device string) error {
 	return nil
 }
 
-// lunImageFormat is the format and guest size of the image at path: qcow2
-// (its virtual size) or raw (the file's size). A VMDK, or anything else that
-// names other files, is refused.
+// lunImageFormat is the format and guest size of the image at path. The
+// image store holds qcow2 images (<name>.qcow2); that is the source format,
+// named explicitly to qemu-img. Anything else — raw bytes, a VDI, a VHDX, a
+// VMDK — is refused, never guessed at as raw and copied onto the LUN.
 func lunImageFormat(path string) (format string, size uint64, err error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return "", 0, err
 	}
-	defer f.Close()
-	head := make([]byte, 512)
+	head := make([]byte, 4)
 	n, _ := f.ReadAt(head, 0)
-	head = head[:n]
-	switch {
-	case bytes.HasPrefix(head, []byte("QFI\xfb")):
-		info, err := qcow2.Info(path)
-		if err != nil {
-			return "", 0, err
-		}
-		return "qcow2", info.VirtualSize, nil
-	case bytes.HasPrefix(head, []byte("KDMV")), bytes.Contains(head, []byte("# Disk DescriptorFile")):
-		return "", 0, fmt.Errorf("a VMDK image cannot be written onto a LUN; convert it to qcow2 or raw first")
+	f.Close()
+	if n < 4 || !bytes.Equal(head, []byte("QFI\xfb")) {
+		return "", 0, fmt.Errorf("it is not a qcow2 image, and only a qcow2 image from the image store is written onto a LUN")
 	}
-	st, err := f.Stat()
+	info, err := qcow2.Info(path)
 	if err != nil {
 		return "", 0, err
 	}
-	return "raw", uint64(st.Size()), nil
+	return "qcow2", info.VirtualSize, nil
 }
 
 // checkLUNForImage runs the size and blank checks for writing image onto
@@ -251,21 +245,43 @@ func lunBlank(r io.ReaderAt, size int64) (bool, error) {
 	return true, nil
 }
 
+// lunPreflightKey carries, from a recreate's preflight into its create, the
+// LUNs the preflight claimed for the VM (LUN key → disk name).
+type lunPreflightKey struct{}
+
 // preflightLUNs judges, before cur is torn down to be created again from
-// spec, what the create would refuse about its iSCSI LUNs that the teardown
-// does not change: the release gate, another VM using the LUN, and — for a
-// root disk built on an image onto a LUN cur did not hold as that disk — the
-// size and blank checks, where this host can open the device (the create
-// judges again on its own host).
-func (s *Server) preflightLUNs(ctx context.Context, spec *pb.VMSpec, cur *corrosion.VMRecord) error {
+// spec, everything about its iSCSI LUNs the create would judge, so that
+// nothing about them refuses after the teardown:
+//
+//   - the release gate and the electorate;
+//   - another VM, or a domain, using a LUN (cur's own rows and domain aside);
+//   - each LUN cur holds as the same disk: its allocations are walked and
+//     every one but cur's own is proven gone — cur keeps its claim and needs
+//     no new one; a LUN cur holds with no allocation at all (taken before
+//     claims existed) is claimed for cur now;
+//   - each LUN cur did not hold as that disk: claimed for cur now, and for a
+//     root disk built on an image, the size and blank checks where this host
+//     can open the device;
+//   - a root disk cur keeps whose image changes: refused unless the disk says
+//     overwrite (the LUN keeps its contents otherwise; review m-3).
+//
+// The returned context carries the claims into the create (withReplacedLUNs).
+func (s *Server) preflightLUNs(ctx context.Context, spec *pb.VMSpec, cur *corrosion.VMRecord) (context.Context, error) {
 	uses, err := s.fixedDeviceUses(ctx, spec)
 	if err != nil || len(uses) == 0 {
-		return err
+		return ctx, err
 	}
 	if err := s.iscsiLUNClaimGate(ctx); err != nil {
-		return err
+		return ctx, err
+	}
+	el, err := s.lunElectorate(ctx)
+	if err != nil {
+		return ctx, err
 	}
 	rep := replacedVM{name: cur.Name, snap: corrosion.VMDeleteSnapshot{CreatedAt: cur.CreatedAt}}
+	if cs := vmSpecFor(cur); cs != nil {
+		rep.uuid, rep.image = cs.GetUuid(), cs.GetImage()
+	}
 	if disks, err := corrosion.VMIncarnationDisks(ctx, s.db, cur.Name, cur.CreatedAt); err == nil {
 		for _, d := range disks {
 			if k, ok := storage.FixedDeviceKeyOfPath(d.Path); ok {
@@ -281,41 +297,129 @@ func (s *Server) preflightLUNs(ctx context.Context, spec *pb.VMSpec, cur *corros
 	for _, u := range uses {
 		keys[u.key], byKey[u.key] = true, u
 	}
-	here, err := s.lunHoldersHere(ctx, keys, rep, true, 0)
+	here, err := s.lunHoldersHere(ctx, keys, rep, true, 0, "")
 	if err != nil {
-		return status.Errorf(codes.Unavailable, "read disks: %v", err)
+		return ctx, status.Errorf(codes.Unavailable, "read disks: %v", err)
 	}
 	if len(here) > 0 {
-		return lunHeldError(spec.Name, byKey[here[0].Lun], here[0])
+		return ctx, lunHeldError(spec.Name, byKey[here[0].Lun], here[0])
 	}
-	if spec.Image == "" {
-		return nil
+	vmID := rep.uuid
+	if vmID == "" {
+		vmID = cur.Name + "@" + cur.CreatedAt
 	}
-	for _, d := range spec.Disks {
-		name := d.Name
-		if name == "" {
-			name = "root"
-		}
-		if name != "root" {
+	claimed := map[string]string{}
+	for _, u := range uses {
+		mine := corrosion.LUNAllocation{LUN: u.key, ClaimID: randid.New(), VMID: vmID, VMName: cur.Name,
+			Disk: u.disk, Host: s.hostName}
+		if rep.luns[u.key] == u.disk {
+			reclaimed, err := s.verifyOwnLUN(ctx, el, u, mine, rep)
+			if err != nil {
+				return ctx, err
+			}
+			if reclaimed {
+				claimed[u.key] = u.disk
+			}
 			continue
 		}
-		for _, u := range uses {
-			if u.disk != name || rep.luns[u.key] == name {
+		if _, err := s.allocateLUN(ctx, spec.Name, u, mine, rep, true, 0); err != nil {
+			return ctx, err
+		}
+		claimed[u.key] = u.disk
+	}
+	if spec.Image != "" {
+		for _, d := range spec.Disks {
+			name := d.Name
+			if name == "" {
+				name = "root"
+			}
+			if name != "root" {
 				continue
 			}
-			if f, err := openLUNDevice(u.device); err != nil {
-				continue // not on this host; the create judges it there
-			} else {
-				f.Close()
-			}
-			imagePath, err := s.poolRootDiskBacking(spec.Image, "iscsi")
-			if err != nil {
-				return err
-			}
-			if _, err := checkLUNForImage(spec.Name, name, spec.Image, imagePath, u.device, d.Overwrite); err != nil {
-				return err
+			for _, u := range uses {
+				if u.disk != name {
+					continue
+				}
+				kept := rep.luns[u.key] == name
+				if kept && spec.Image == rep.image {
+					continue // a rebuild: the LUN is kept as it is
+				}
+				if kept && !d.Overwrite {
+					return ctx, status.Errorf(codes.FailedPrecondition,
+						"root disk %q of VM %q is iSCSI LUN %s, which keeps its contents across a re-create, so the "+
+							"image change from %q to %q would not reach it — set overwrite on the disk to write the "+
+							"new image over it (destroying what it holds), or keep the image", name, spec.Name, u.device,
+						rep.image, spec.Image)
+				}
+				if f, err := openLUNDevice(u.device); err != nil {
+					continue // not on this host; the create judges it there
+				} else {
+					f.Close()
+				}
+				imagePath, err := s.poolRootDiskBacking(spec.Image, "iscsi")
+				if err != nil {
+					return ctx, err
+				}
+				if _, err := checkLUNForImage(spec.Name, name, spec.Image, imagePath, u.device, d.Overwrite); err != nil {
+					return ctx, err
+				}
 			}
 		}
 	}
-	return nil
+	return context.WithValue(ctx, lunPreflightKey{}, claimed), nil
+}
+
+// verifyOwnLUN walks u's LUN's allocations, before a teardown, for the VM rep
+// that holds the LUN as this disk (its rows say so). Every allocation that is
+// not the VM's must be proven gone. The VM keeps its claim — nothing is
+// decided — when the latest allocation is its own: the VM's name and this
+// disk, and nothing but the VM's own incarnation (rows by name and
+// created_at, its domain) holding the LUN, asked of the allocation's host.
+// Its uuid is not enough to match: a rebuild mints a fresh one, and the claim
+// outlives it. When the latest allocation is another's (gone), or there is
+// none at all (a LUN taken before claims existed), the LUN is claimed for the
+// VM now, and reclaimed is reported.
+func (s *Server) verifyOwnLUN(ctx context.Context, el lunElectorateT, u lunUse, mine corrosion.LUNAllocation, rep replacedVM) (reclaimed bool, err error) {
+	start, err := s.lunWalkStart(ctx, el, u.key)
+	if err != nil {
+		return false, lunDecisionError(u, rep.name, err)
+	}
+	latestOwn := false
+	for g := start; g < start+lunMaxGenerations; g++ {
+		a, found, err := s.learnLUN(ctx, el, u.key, g)
+		if err != nil {
+			return false, lunDecisionError(u, rep.name, err)
+		}
+		if !found {
+			if latestOwn {
+				return false, nil // the VM keeps its claim
+			}
+			mine.Generation = g
+			out, err := s.decideLUNWith(ctx, el, mine)
+			if err != nil {
+				return false, lunDecisionError(u, rep.name, err)
+			}
+			if out.Value.LUN != nil && out.Value.LUN.ClaimID == mine.ClaimID {
+				return true, nil
+			}
+			a = out.Value.LUN // another create won it meanwhile: judge it
+			if a == nil {
+				return false, status.Errorf(codes.Internal, "iSCSI LUN %s: allocation %d decided a value that is not a LUN allocation", u.device, g)
+			}
+		}
+		holder, err := s.lunAllocationHolder(ctx, el, *a, rep, true, 0)
+		if err != nil {
+			return false, err
+		}
+		if holder != nil {
+			return false, lunHeldError(rep.name, u, holder)
+		}
+		latestOwn = a.VMName == rep.name && a.Disk == u.disk
+		if !latestOwn {
+			if err := corrosion.AdvanceLUNResolved(ctx, s.db, u.key, g+1, s.hostName); err != nil {
+				slog.Warn("iSCSI LUN: record checkpoint", "lun", u.key, "generation", g+1, "error", err)
+			}
+		}
+	}
+	return false, status.Errorf(codes.ResourceExhausted, "iSCSI LUN %s: more than %d open allocations", u.device, lunMaxGenerations)
 }

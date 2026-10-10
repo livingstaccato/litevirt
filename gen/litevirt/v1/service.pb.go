@@ -34741,8 +34741,11 @@ func (x *LUNHolder) GetBacking() bool {
 }
 
 type LUNHoldersResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Holders       []*LUNHolder           `protobuf:"bytes,1,rep,name=holders,proto3" json:"holders,omitempty"`
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Holders []*LUNHolder           `protobuf:"bytes,1,rep,name=holders,proto3" json:"holders,omitempty"`
+	// The host that answered. The asker counts the answer only from the host
+	// it asked.
+	AnsweredBy    string `protobuf:"bytes,2,opt,name=answered_by,json=answeredBy,proto3" json:"answered_by,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -34782,6 +34785,13 @@ func (x *LUNHoldersResponse) GetHolders() []*LUNHolder {
 		return x.Holders
 	}
 	return nil
+}
+
+func (x *LUNHoldersResponse) GetAnsweredBy() string {
+	if x != nil {
+		return x.AnsweredBy
+	}
+	return ""
 }
 
 // PreflightRecreateVMRequest is the spec of a VM about to be re-created on the
@@ -37597,9 +37607,11 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\thost_name\x18\x04 \x01(\tR\bhostName\x12\x1b\n" +
 	"\tin_flight\x18\x05 \x01(\bR\binFlight\x12\x13\n" +
 	"\x05vm_id\x18\x06 \x01(\tR\x04vmId\x12\x18\n" +
-	"\abacking\x18\a \x01(\bR\abacking\"F\n" +
+	"\abacking\x18\a \x01(\bR\abacking\"g\n" +
 	"\x12LUNHoldersResponse\x120\n" +
-	"\aholders\x18\x01 \x03(\v2\x16.litevirt.v1.LUNHolderR\aholders\"E\n" +
+	"\aholders\x18\x01 \x03(\v2\x16.litevirt.v1.LUNHolderR\aholders\x12\x1f\n" +
+	"\vanswered_by\x18\x02 \x01(\tR\n" +
+	"answeredBy\"E\n" +
 	"\x1aPreflightRecreateVMRequest\x12'\n" +
 	"\x04spec\x18\x01 \x01(\v2\x13.litevirt.v1.VMSpecR\x04spec*V\n" +
 	"\x0eRelayVIPResult\x12\x15\n" +

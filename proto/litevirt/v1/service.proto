@@ -4647,6 +4647,9 @@ message LUNHolder {
 }
 message LUNHoldersResponse {
     repeated LUNHolder holders = 1;
+    // The host that answered. The asker counts the answer only from the host
+    // it asked.
+    string answered_by = 2;
 }
 
 // PreflightRecreateVMRequest is the spec of a VM about to be re-created on the

@@ -70,6 +70,11 @@ type replacedVM struct {
 	// (vm_lun_claim.go). Empty when unknown — then it takes over nothing.
 	uuid string
 	luns map[string]string
+	// claimed is the LUNs (LUN key → disk name) the recreate's preflight
+	// claimed for the VM before the teardown, which its create takes over
+	// without a claim of its own; image is the replaced incarnation's image.
+	claimed map[string]string
+	image   string
 }
 
 // withReplacedVM returns ctx carrying vm's identity into the create that
@@ -192,7 +197,10 @@ func (s *Server) withReplacedLUNs(ctx context.Context, vm *corrosion.VMRecord) c
 		return ctx
 	}
 	if spec := vmSpecFor(vm); spec != nil {
-		r.uuid = spec.GetUuid()
+		r.uuid, r.image = spec.GetUuid(), spec.GetImage()
+	}
+	if c, ok := ctx.Value(lunPreflightKey{}).(map[string]string); ok {
+		r.claimed = c
 	}
 	if disks, err := corrosion.VMIncarnationDisks(ctx, s.db, vm.Name, vm.CreatedAt); err == nil {
 		for _, d := range disks {
@@ -221,6 +229,8 @@ type replacedVMWire struct {
 	IdentityHash   string            `json:"identity_hash"`
 	UUID           string            `json:"uuid,omitempty"`
 	LUNs           map[string]string `json:"luns,omitempty"`
+	Claimed        map[string]string `json:"claimed,omitempty"`
+	Image          string            `json:"image,omitempty"`
 }
 
 // withReplacedVMMD returns ctx with the replaced VM ctx holds for name added
@@ -233,7 +243,7 @@ func withReplacedVMMD(ctx context.Context, name string) context.Context {
 	b, err := json.Marshal(replacedVMWire{
 		Name: r.name, CreatedAt: r.snap.CreatedAt, HostName: r.snap.HostName,
 		OwnerEpoch: r.snap.OwnerEpoch, SpecGeneration: r.snap.SpecGeneration, IdentityHash: r.snap.IdentityHash,
-		UUID: r.uuid, LUNs: r.luns,
+		UUID: r.uuid, LUNs: r.luns, Claimed: r.claimed, Image: r.image,
 	})
 	if err != nil {
 		return ctx
@@ -263,7 +273,7 @@ func (s *Server) acceptReplacedVMMD(ctx context.Context) context.Context {
 	return context.WithValue(ctx, replacedVMKey{}, replacedVM{name: w.Name, snap: corrosion.VMDeleteSnapshot{
 		CreatedAt: w.CreatedAt, HostName: w.HostName, OwnerEpoch: w.OwnerEpoch,
 		SpecGeneration: w.SpecGeneration, IdentityHash: w.IdentityHash,
-	}, uuid: w.UUID, luns: w.LUNs})
+	}, uuid: w.UUID, luns: w.LUNs, claimed: w.Claimed, image: w.Image})
 }
 
 func (s *Server) replacedTombstoneWaitBound() time.Duration {

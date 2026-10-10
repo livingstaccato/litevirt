@@ -239,3 +239,92 @@ func TestFleet_ISCSI_RefusedUntilTheUpgradeFinishes(t *testing.T) {
 		t.Fatalf("create before the latch: got %v", err)
 	}
 }
+
+// ── fix round 2 ─────────────────────────────────────────────────────────────
+
+// N-1: a replica that holds no hosts row for the host that took an earlier
+// allocation — one still catching up — must not read the missing row as the
+// host's removal. With that host unreachable, the LUN stays held:
+// Unavailable, naming it.
+//
+// Mutation: release an allocation whose host has no live row here — the
+// create on n0 takes a's LUN and this goes red.
+func TestFleet_ISCSI_AnAllocationByAHostThisReplicaHasNotSeenIsHeld(t *testing.T) {
+	c := newLUNFleet(t)
+	n0, n1 := c.Nodes[0], c.Nodes[1]
+	addLUNPool(t, c, "san", 0, onePortal)
+	if err := createOnLUN(c, n1, "a", "san"); err != nil {
+		t.Fatalf("create a on %s: %v", n1.Name, err)
+	}
+	c.Kill(n1)
+	// n0 has never seen n1, nor a: a replica still catching up.
+	ctx := context.Background()
+	for _, q := range []string{`DELETE FROM hosts WHERE name = ?`, `DELETE FROM vm_disks WHERE vm_name = 'a' AND ? <> ''`,
+		`DELETE FROM vms WHERE name = 'a' AND ? <> ''`} {
+		if _, err := n0.DB.DB().ExecContext(ctx, q, n1.Name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	err := createOnLUN(c, n0, "b", "san")
+	if status.Code(err) != codes.Unavailable || !strings.Contains(err.Error(), n1.Name) {
+		t.Fatalf("create on a LUN an unseen host took: got %v, want Unavailable naming %s", err, n1.Name)
+	}
+}
+
+// N-2: a guest whose row is gone but whose domain still uses the LUN holds
+// it — the host that took the allocation answers from its libvirt domains.
+//
+// Mutation: answer from rows and registrations only — n0 takes the LUN and
+// this goes red.
+func TestFleet_ISCSI_ADomainWithoutARowHoldsItsLUN(t *testing.T) {
+	c := newLUNFleet(t)
+	n0, n1 := c.Nodes[0], c.Nodes[1]
+	addLUNPool(t, c, "san", 0, onePortal)
+	if err := createOnLUN(c, n1, "a", "san"); err != nil {
+		t.Fatalf("create a: %v", err)
+	}
+	if err := corrosion.DeleteVM(context.Background(), n1.DB, "a"); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, convergeTimeout, "a's delete to reach n0", func() bool { return !lunVMOn(t, n0, "a") })
+	if !n1.Virt.DomainExists("a") {
+		t.Fatal("the scenario needs a's domain to outlive its row")
+	}
+	err := createOnLUN(c, n0, "b", "san")
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), `"a"`) {
+		t.Fatalf("create on a LUN a rowless domain uses: got %v, want FailedPrecondition naming a", err)
+	}
+}
+
+// N-4: a rebuild keeps the VM's claim — with one voter down it still has a
+// majority and needs no new allocation — and with no majority at all it is
+// refused before the teardown, the VM left as it was.
+//
+// Mutation: drop the claim from the rebuild preflight — the second rebuild
+// tears the VM down, then fails, and this goes red.
+func TestFleet_ISCSI_ARebuildKeepsItsClaimAndJudgesItBeforeTheTeardown(t *testing.T) {
+	c := newLUNFleet(t)
+	n0, n1, n2 := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	addLUNPool(t, c, "san", 0, onePortal)
+	if err := createOnLUN(c, n0, "a", "san"); err != nil {
+		t.Fatalf("create a: %v", err)
+	}
+	ctx := context.Background()
+	c.Kill(n2)
+	if _, err := c.SelfClient(n0).RebuildVM(ctx, &pb.RebuildVMRequest{Name: "a"}); err != nil {
+		t.Fatalf("rebuild with a voter majority: %v", err)
+	}
+	lunKey, _, _ := storage.FixedDevice(storage.Config{Driver: "iscsi", Source: fleetLUNTarget, Options: map[string]string{"lun": "0"}})
+	k := corrosion.LUNClaimKey(lunKey, 1)
+	if st, found, _ := n0.DB.ClaimState(ctx, k); found && !st.Accepted.IsZero() {
+		t.Fatalf("the rebuild decided allocation 1: it took a new claim instead of keeping its own")
+	}
+	c.Kill(n1)
+	_, err := c.SelfClient(n0).RebuildVM(ctx, &pb.RebuildVMRequest{Name: "a"})
+	if err == nil || !strings.Contains(err.Error(), "nothing was changed") {
+		t.Fatalf("rebuild with no voter majority: got %v, want a refusal before the teardown", err)
+	}
+	if !lunVMOn(t, n0, "a") || !n0.Virt.DomainExists("a") {
+		t.Fatal("the refused rebuild tore the VM down")
+	}
+}

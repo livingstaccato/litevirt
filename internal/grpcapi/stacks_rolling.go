@@ -70,7 +70,12 @@ func (o *serverOps) recreateAs(ctx context.Context, target, source string, desir
 			}
 		}
 		if perr == nil {
-			perr = o.s.preflightLUNs(ctx, spec, cur)
+			ctx, perr = o.s.preflightLUNs(ctx, spec, cur)
+		}
+		if perr == nil {
+			var releaseLUNHold func()
+			ctx, releaseLUNHold = o.s.holdLUNsForRecreate(ctx, spec)
+			defer releaseLUNHold()
 		}
 		if perr != nil {
 			st := status.Convert(perr)

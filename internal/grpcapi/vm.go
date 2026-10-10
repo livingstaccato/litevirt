@@ -393,11 +393,16 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// refuse naming the VM that holds it, before anything is created. Held
 	// until this create returns, by when its disk rows are committed here
 	// (vm_lun_claim.go).
-	releaseLUNs, keepLUNs, err := s.claimLUNs(ctx, spec)
+	lunHold, err := s.claimLUNs(ctx, spec)
 	if err != nil {
 		return nil, err
 	}
-	defer releaseLUNs()
+	defer lunHold.release(ctx, spec.Name)
+	keepLUNs := lunHold.keep
+	replacedImage := ""
+	if rep, ok := replacedVMFor(ctx, spec.Name); ok {
+		replacedImage = rep.image
+	}
 
 	slog.Info("creating VM", "name", spec.Name, "image", spec.Image, "cpu", spec.Cpu, "memory", spec.MemoryMib)
 
@@ -506,7 +511,11 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			if key, _, fixed := storage.FixedDevice(volCfg); fixed && err == nil {
 				fixedDevice = true
 				if sourceImage != "" {
-					if keepLUNs[key] {
+					// A re-created VM takes its own LUN over as it is. Only an
+					// image change with overwrite — which its preflight
+					// required before the teardown — writes the new image.
+					imageChange := keepLUNs[key] && d.Overwrite && replacedImage != "" && replacedImage != spec.Image
+					if keepLUNs[key] && !imageChange {
 						slog.Info("iSCSI root disk: the re-created VM takes its previous incarnation's LUN over as it is; "+
 							"nothing is written", "vm", spec.Name, "disk", d.Name, "lun", diskPath)
 					} else if werr := s.writeImageOntoLUN(ctx, spec.Name, d.Name, spec.Image, sourceImage, diskPath, d.Overwrite); werr != nil {
@@ -1078,8 +1087,10 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		// cluster references it. Nothing later re-creates the row, so the only
 		// fail-closed answer is to undo the create — teardown, disks, firmware
 		// state, and the claims themselves, matching the admission fence above.
-		if !claims.empty() {
-			slog.Error("vm create: row persistence failed after an address claim — aborting",
+		// The same for a create that took an iSCSI LUN: a guest left running on
+		// the LUN with no row is one no claim can see (review N-2).
+		if !claims.empty() || len(keepLUNs) > 0 || len(lunHold.own) > 0 {
+			slog.Error("vm create: row persistence failed after an address or LUN claim — aborting",
 				"name", spec.Name, "error", err)
 			if derr := s.virt.DestroyDomain(spec.Name); derr != nil {
 				slog.Warn("vm create: teardown after failed persistence also failed",
@@ -1094,6 +1105,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		slog.Error("failed to write VM to corrosion", "error", err)
 		// VM is running, but state may not be synced — log and continue
 	} else {
+		lunHold.committed = true
 		// Guarded on the insert having landed: with no row there is nothing to
 		// graduate or publish. The invariant it maintains lives on
 		// assignOwnerEpochAtCreate; do not restate it here, or the two copies drift.
@@ -3317,11 +3329,16 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 		st := status.Convert(err)
 		return nil, status.Errorf(st.Code(), "cannot rebuild %q: %s; nothing was changed", req.Name, st.Message())
 	}
-	// Its iSCSI LUNs too: a LUN the create would refuse is refused now.
-	if err := s.preflightLUNs(rctx, spec, vm); err != nil {
+	// Its iSCSI LUNs too: the claim is judged now — kept, or claimed for the
+	// VM — and a LUN the create would refuse is refused now. The LUNs are then
+	// held on this host until the create has returned.
+	rctx, err = s.preflightLUNs(rctx, spec, vm)
+	if err != nil {
 		st := status.Convert(err)
 		return nil, status.Errorf(st.Code(), "cannot rebuild %q: %s; nothing was changed", req.Name, st.Message())
 	}
+	rctx, releaseLUNHold := s.holdLUNsForRecreate(rctx, spec)
+	defer releaseLUNHold()
 
 	// Stop and undefine the current domain.
 	if vm.State == "running" {

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/claims"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/pki"
 )
 
 // Recovery-claim voter RPCs and the proposer's transport
@@ -86,7 +88,8 @@ func (s *Server) claimIdentity() (*corrosion.ClaimSigner, *corrosion.ClaimVerifi
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.signer != nil && c.verifier != nil {
-		return c.signer, c.verifier, nil
+		s.followRenewedIdentityLocked(c)
+		return c.signer, s.verifierPolicy(c.verifier), nil
 	}
 	if c.loadErr != nil && time.Since(c.loadedAt) < claimIdentityRetry {
 		return nil, nil, c.loadErr
@@ -103,7 +106,45 @@ func (s *Server) claimIdentity() (*corrosion.ClaimSigner, *corrosion.ClaimVerifi
 		return nil, nil, c.loadErr
 	}
 	c.signer, c.verifier, c.loadErr = signer, verifier, nil
-	return signer, verifier, nil
+	return signer, s.verifierPolicy(verifier), nil
+}
+
+// verifierPolicy applies this node's recovery switch to the claim verifier:
+// under auth.trust_rotated_peer_certs the serial pin is off, exactly as peer
+// trust's is, because a fleet whose recorded serials went stale would
+// otherwise refuse every claim certificate too.
+func (s *Server) verifierPolicy(v *corrosion.ClaimVerifier) *corrosion.ClaimVerifier {
+	if s.trustRotatedPeerCerts.Load() {
+		return v.WithoutSerialPin()
+	}
+	return v
+}
+
+// followRenewedIdentityLocked moves the cached signer onto the host identity
+// the gRPC listener is serving, once that has been renewed on disk.
+//
+// The signer was loaded once and kept, and the TLS identity is reloaded at
+// handshake time (pki.KeyPairSource). Left alone, a renewed node would go on
+// signing votes with a certificate it no longer presents — and the renewal
+// revokes that certificate, which every verifier checks (ClaimVerifier.revoked),
+// so the node would lose its vote the moment the CRL landed. A replacement that
+// cannot be turned into a signer keeps the current one: it is still valid until
+// the old certificate is revoked, and the TLS source refuses a pair that is not
+// this host's anyway.
+func (s *Server) followRenewedIdentityLocked(c *claimRuntime) {
+	pair, err := pki.ServedHostKeyPair(s.pkiDir)
+	if err != nil || pair.Leaf == nil || strings.EqualFold(pair.Leaf.SerialNumber.Text(16), c.signer.Serial()) {
+		return
+	}
+	renewed, err := corrosion.ClaimSignerFromKeyPair(s.hostName, pair)
+	if err != nil {
+		slog.Warn("the host certificate was renewed but the claim signer could not follow it; "+
+			"still signing votes with the previous certificate", "error", err)
+		return
+	}
+	slog.Info("claim signer moved to the renewed host certificate",
+		"previous_serial", c.signer.Serial(), "serial", renewed.Serial())
+	c.signer = renewed
 }
 
 // claimProposer is this process's proposer. Its boot nonce is drawn once, so
@@ -432,7 +473,76 @@ func (s *Server) GetRecoveryClaim(ctx context.Context, req *pb.GetRecoveryClaimR
 	if err := s.requirePeerOrRole(ctx, "operator"); err != nil {
 		return nil, err
 	}
-	return s.localGetRecoveryClaim(ctx, keyFromPB(req.GetKey()))
+	key := keyFromPB(req.GetKey())
+	resp, err := s.localGetRecoveryClaim(ctx, key)
+	if err != nil || !req.GetReattest() {
+		return resp, err
+	}
+	a, err := s.reattestedAccept(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	resp.Reattested = acceptToPB(a)
+	return resp, nil
+}
+
+// reattestedAccept is this voter's accept at the voter_config key, re-signed
+// with the certificate it holds now, when it signed the recorded one with a
+// certificate since replaced (a renewal); nil when there is nothing to
+// re-sign.
+//
+// A renewal revokes the replaced certificate at once, and a node that adopts
+// a generation decided BEFORE the renewal can then no longer count this
+// voter's accept in it: not pinned, not revoked, nothing. A majority of the
+// generation's members can be in that position, and then no voter change can
+// be decided to give them a newer anchor (a voter answers a voter_config key
+// only at its adopted generation): the voter chain would deadlock
+// (docs/design/recovery-claims.md §4.1). Re-signing restores the count
+// without trusting the replaced key: it is the SAME vote — the key,
+// generation, ballot and value digest this voter recorded in its own durable
+// claim state when it accepted — and the voter re-signs only what it holds
+// there, never a value from a row or from the caller. A forged generation
+// therefore gets nothing: no honest voter's claim state accepted it. The
+// accept must also be this voter's under its current incarnation, so a
+// re-imaged machine cannot vouch for its predecessor's votes.
+func (s *Server) reattestedAccept(ctx context.Context, key corrosion.ClaimKey) (*corrosion.ClaimAccept, error) {
+	if !key.IsVoterConfig() {
+		return nil, nil
+	}
+	st, found, err := s.db.ClaimState(ctx, key)
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "read claim state: %v", err)
+	}
+	if !found || st.Accept == nil || st.Accepted.IsZero() {
+		return nil, nil
+	}
+	old := st.Accept
+	if old.Voter != s.hostName || old.Key != key || !old.Ballot.Equal(st.Accepted) || old.ValueDigest != st.ValueDigest ||
+		old.ConfigGeneration != key.OwnerEpoch {
+		return nil, nil
+	}
+	inc, err := s.db.VoterIncarnation(ctx)
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "read voter incarnation: %v", err)
+	}
+	if old.VoterIncarnation != inc {
+		return nil, nil
+	}
+	signer, _, err := s.claimIdentity()
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "%v", err)
+	}
+	if c, perr := pki.ParseCertPEM([]byte(old.CertPEM)); perr == nil &&
+		strings.EqualFold(c.SerialNumber.Text(16), signer.Serial()) {
+		return nil, nil // signed with the current certificate already
+	}
+	a, err := signer.Sign(key, old.ConfigGeneration, old.Ballot, old.ValueDigest, inc)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "%v", err)
+	}
+	slog.Info("voter set: re-attested this voter's accept with its renewed certificate", "key", key.String(),
+		"ballot", old.Ballot.Round, "serial", signer.Serial())
+	return &a, nil
 }
 
 func (s *Server) localGetRecoveryClaim(ctx context.Context, key corrosion.ClaimKey) (*pb.GetRecoveryClaimResponse, error) {

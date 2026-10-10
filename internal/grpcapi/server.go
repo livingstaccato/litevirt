@@ -235,8 +235,14 @@ type Server struct {
 	// converges a rotation on a healthy cluster, but cannot rescue one that has
 	// stopped replicating, because the corrected row has to travel over the very
 	// channel the stale serial blocks. Default false — turn it on fleet-wide, let
-	// the self-recorded serials replicate, then turn it back off.
-	trustRotatedPeerCerts bool
+	// the self-recorded serials replicate, then turn it back off. Atomic: the
+	// certificate watch and every RPC read it, and SetTrustRotatedPeerCerts may
+	// change it while they run.
+	trustRotatedPeerCerts atomic.Bool
+
+	// certRev is the owed-revocation processing state kept between ticks
+	// (cert_revocation.go).
+	certRev certRevocationState
 
 	// forwardedIdentity, when true, is this node's enforcement switch for owner-
 	// side promotion of a forwarded user identity (x-litevirt-fwd-bearer). Gated

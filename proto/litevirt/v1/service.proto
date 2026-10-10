@@ -52,6 +52,24 @@ message PublishCRLRequest  { string crl_pem = 1; }
 // shares a pki directory with its daemon, so that answer would be "no" in the
 // ordinary case and mean nothing about the cluster.
 message PublishCRLResponse { int64 version = 1; }
+// RevokeReplacedCertificateRequest carries a CRL the CA machine minted with the
+// replaced serial of host added (`lv host renew-cert`). The daemon publishes it
+// at once when that is safe for the voter chain, and otherwise records it as a
+// revocation owed and publishes it as soon as it is.
+message RevokeReplacedCertificateRequest {
+    string host    = 1;
+    string serial  = 2;   // lower-case hex
+    string crl_pem = 3;   // must verify against the cluster CA and list serial
+}
+// revoked: published now. held: recorded as owed (reason says why); the
+// cluster publishes it once the newest voter generation still verifies with
+// the serial revoked.
+message RevokeReplacedCertificateResponse {
+    bool   revoked = 1;
+    bool   held    = 2;
+    string reason  = 3;
+    int64  version = 4;
+}
 message FenceResult        { string host_name = 1; string method = 2;
     string result = 3; string detail = 4; }
 // GetClusterHealth is THE health read: the durable condition set, evaluator
@@ -2461,6 +2479,12 @@ message AcceptRecoveryClaimResponse {
 }
 message GetRecoveryClaimRequest {
     RecoveryClaimKey key = 1;
+    // reattest: for a voter_config key whose accept this voter signed with a
+    // host certificate a renewal has since replaced, also return the same
+    // accept re-signed with its current certificate (reattested). It re-signs
+    // only the accept recorded in its own durable claim state, never a value
+    // it did not accept. An older build ignores the field.
+    bool reattest = 2;
 }
 message GetRecoveryClaimResponse {
     PrepareRecoveryClaimResponse state = 1;  // promised/accepted ballot and value, voter, incarnation
@@ -2468,6 +2492,7 @@ message GetRecoveryClaimResponse {
     string last_refusal_reason         = 3;  // this voter's most recent refusal for the key (memory only)
     string last_refusal_detail         = 4;
     int64  adopted_generation          = 5;
+    ClaimAccept reattested             = 6;  // with reattest: the accept above, re-signed with the current certificate
 }
 message ListRecoveryClaimsRequest {
     int64 config_generation = 1;  // the generation the importer is leaving
@@ -3346,6 +3371,12 @@ service LiteVirt {
     // opens a peer connection, and an unverified one would let a caller un-revoke
     // themselves by publishing a CRL that simply omits their serial.
     rpc PublishCRL(PublishCRLRequest)          returns (PublishCRLResponse);
+    // RevokeReplacedCertificate revokes the certificate a renewal replaced —
+    // now, or, when revoking now would leave the newest voter generation
+    // without a quorum of unrevoked signatures for a node that adopts it later
+    // (docs/design/recovery-claims.md §4.1), as a durable revocation owed that
+    // the cluster publishes automatically once it is safe.
+    rpc RevokeReplacedCertificate(RevokeReplacedCertificateRequest) returns (RevokeReplacedCertificateResponse);
     rpc RescanHost(RescanHostRequest)          returns (RescanHostResponse);
     rpc ListHostDevices(ListHostDevicesRequest) returns (ListHostDevicesResponse);
     // SupersededDisks lists the disk copies a failover start set aside on a

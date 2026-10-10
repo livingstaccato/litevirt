@@ -21,19 +21,23 @@ func ServerTLSConfig(pkiDir string) (*tls.Config, error) {
 		return nil, fmt.Errorf("failed to parse CA cert")
 	}
 
-	cert, err := tls.LoadX509KeyPair(
-		filepath.Join(pkiDir, "host.crt"),
-		filepath.Join(pkiDir, "host.key"),
-	)
-	if err != nil {
+	// The identity is served from disk at handshake time (identity.go), so a
+	// renewed host.crt/host.key is presented from the next handshake on. The
+	// load here only keeps the boot-time contract: no usable pair, no listener.
+	src := hostIdentitySource(pkiDir)
+	if _, err := src.Get(); err != nil {
 		return nil, fmt.Errorf("load host cert/key: %w", err)
 	}
 
+	// Certificates stays EMPTY. crypto/tls consults GetCertificate only when
+	// Certificates is empty or the client sent SNI, and peers dial IP literals,
+	// which carry no SNI — a static entry here would pin the boot-time
+	// certificate for every peer handshake.
 	tlsCfg := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		ClientAuth:   tls.RequireAndVerifyClientCert,
-		ClientCAs:    caPool,
-		MinVersion:   tls.VersionTLS13,
+		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return src.Get() },
+		ClientAuth:     tls.RequireAndVerifyClientCert,
+		ClientCAs:      caPool,
+		MinVersion:     tls.VersionTLS13,
 	}
 
 	// Always install the revocation check (not only when a CRL exists at
@@ -49,15 +53,26 @@ func ServerTLSConfig(pkiDir string) (*tls.Config, error) {
 // peer TLS configs.
 func revocationVerifier(pkiDir string, caPEM []byte) func([][]byte, [][]*x509.Certificate) error {
 	checker := newCRLChecker(pkiDir, parseCACert(caPEM))
-	return func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-		for _, rawCert := range rawCerts {
+	return func(rawCerts [][]byte, verified [][]*x509.Certificate) error {
+		var leaf *x509.Certificate
+		for i, rawCert := range rawCerts {
 			cert, err := x509.ParseCertificate(rawCert)
 			if err != nil {
 				continue
 			}
+			if i == 0 {
+				leaf = cert
+			}
 			if checker.isRevoked(cert.SerialNumber) {
 				return fmt.Errorf("certificate serial %s has been revoked", cert.SerialNumber.Text(16))
 			}
+		}
+		// A peer presenting a renewed certificate proves, by the CA's
+		// signature, that the one it replaced is no longer its identity
+		// (superseded.go). Collected from every handshake, in both
+		// directions, so each node learns it from the renewed host itself.
+		if len(verified) > 0 && leaf != nil {
+			NoteSuccessor(pkiDir, leaf)
 		}
 		return nil
 	}
@@ -79,25 +94,35 @@ func ClientTLSConfig(pkiDir string) (*tls.Config, error) {
 	}
 
 	// Try host cert first (daemon node), then client cert (remote CLI).
-	var certs []tls.Certificate
+	cfg := &tls.Config{
+		RootCAs:    caPool,
+		MinVersion: tls.VersionTLS13,
+	}
 	for _, name := range []string{"host", "client"} {
 		certFile := filepath.Join(pkiDir, name+".crt")
-		keyFile := filepath.Join(pkiDir, name+".key")
-		if _, err := os.Stat(certFile); err == nil {
-			cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-			if err != nil {
-				return nil, fmt.Errorf("load %s cert/key: %w", name, err)
-			}
-			certs = append(certs, cert)
-			break
+		if _, err := os.Stat(certFile); err != nil {
+			continue
 		}
+		var src *KeyPairSource
+		if name == "host" {
+			src = hostIdentitySource(pkiDir)
+		} else {
+			src = sharedSource(pkiDir, name, x509.ExtKeyUsageClientAuth)
+		}
+		cert, err := src.Get()
+		if err != nil {
+			return nil, fmt.Errorf("load %s cert/key: %w", name, err)
+		}
+		// Certificates documents what was loaded; the getter is what a handshake
+		// uses (crypto/tls ignores Certificates once GetClientCertificate is set).
+		// An established connection keeps the certificate it was made with; the
+		// server's ConnTracker closes one the cluster no longer accepts, and the
+		// redial here presents the renewed certificate.
+		cfg.Certificates = []tls.Certificate{*cert}
+		cfg.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) { return src.Get() }
+		break
 	}
-
-	return &tls.Config{
-		Certificates: certs,
-		RootCAs:      caPool,
-		MinVersion:   tls.VersionTLS13,
-	}, nil
+	return cfg, nil
 }
 
 // PeerTLSConfig returns a TLS config for host-to-host gRPC calls.
@@ -113,16 +138,17 @@ func PeerTLSConfig(pkiDir string) (*tls.Config, error) {
 		return nil, fmt.Errorf("failed to parse CA cert")
 	}
 
-	cert, err := tls.LoadX509KeyPair(
-		filepath.Join(pkiDir, "host.crt"),
-		filepath.Join(pkiDir, "host.key"),
-	)
-	if err != nil {
+	src := hostIdentitySource(pkiDir)
+	if _, err := src.Get(); err != nil {
 		return nil, fmt.Errorf("load host cert/key: %w", err)
 	}
 
+	// Both directions read the identity at handshake time (see ServerTLSConfig):
+	// the health checker caches this config for the life of the process, and its
+	// peer probes must carry a renewed certificate without a restart.
 	return &tls.Config{
-		Certificates:          []tls.Certificate{cert},
+		GetCertificate:        func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return src.Get() },
+		GetClientCertificate:  func(*tls.CertificateRequestInfo) (*tls.Certificate, error) { return src.Get() },
 		RootCAs:               caPool,
 		ClientAuth:            tls.RequireAndVerifyClientCert,
 		ClientCAs:             caPool,

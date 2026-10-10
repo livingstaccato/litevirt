@@ -947,6 +947,24 @@ func classifyRemoteConfig(out string, runErr error) (string, bool, error) {
 // cluster's (colonelpanik/litevirt#186).
 const foundingSetupEnv = "LITEVIRT_GENESIS=1"
 
+// uiTLSScript decides the ui_tls the setup script writes (needs $CONFIG).
+// A NEW node gets `on`: its UI speaks TLS from the start, with the cluster
+// certificate until a custom or ACME certificate is configured, so turning on
+// a non-loopback ui_bind later never sends logins in clear. A node being
+// re-initialised keeps what its config already says — a node whose config
+// predates the key, and so runs plain HTTP behind a proxy, stays on `auto`.
+//
+// One sed, no pipeline: the setup script runs under `set -euo pipefail`, and a
+// grep that finds no ui_tls line (every config written before the key existed)
+// exits 1, which aborted a re-init part-way through. sed exits 0 whether or not
+// it matched, and `q` stops at the first match.
+const uiTLSScript = `if [ -f "$CONFIG" ]; then
+    UI_TLS=$(sed -n -E '/^ui_tls:/{s/^ui_tls:[[:space:]]*"?([a-z]*)"?.*/\1/p;q;}' "$CONFIG")
+    UI_TLS=${UI_TLS:-auto}
+else
+    UI_TLS=on
+fi`
+
 // genesisMarkerScript writes or clears the founder marker in the data dir. The
 // daemon mints the cluster's first admin credential only while the marker
 // exists, and deletes it once it has. It is written only when founding AND the
@@ -1339,8 +1357,11 @@ if [ -d /etc/apparmor.d ] && command -v apparmor_parser &>/dev/null; then
 fi
 
 # Write litevirtd config
+CONFIG=/etc/litevirt/config.yaml
+` + uiTLSScript + `
 cat > /etc/litevirt/config.yaml << CONF
 host_name: "${HOST_NAME}"
+ui_tls: ${UI_TLS}
 grpc_port: 7443
 metrics_port: 7444
 gossip_port: 7946

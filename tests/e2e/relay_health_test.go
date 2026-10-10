@@ -53,11 +53,20 @@ func (l *lab) waitRelayRole(member string, want float64, within time.Duration, w
 }
 
 // TestRelayHealth_DegradedLinkBecomesALeafEverywhere (colonelpanik/litevirt#175):
-// the lab node that sorts first is a relay by name. Its link is degraded with
-// tc netem (E2E_RELAY_NETEM, default "loss 30%"); the failover lease holder
-// demotes it and litevirt_relay_role then reads 0 for it on EVERY node. The
-// netem qdisc is removed and, after RelayRestoreWindow with no failing
-// observer, it reads 1 on every node again.
+// the lab node that sorts first is a relay by name. A tc filter on it drops
+// all of its traffic to TWO of its peers: their probes of it fail on every
+// probe (2 of 4 observers, a third — and short of the 3 a fence needs), while
+// the rest of the cluster reaches it. The failover lease holder demotes it,
+// and litevirt_relay_role then reads 0 for it on EVERY node. The filter is
+// removed and, after RelayRestoreWindow below the bar, it reads 1 on every
+// node again — with the production windows, so the healed observers' one
+// healthy verdict each is long past healthFreshness when the restore comes.
+//
+// Uniform netem loss does not fit the rule: TCP retransmission hides moderate
+// loss from a 3 s probe, so no evaluation sees a third of the observers
+// failing for 2 minutes, and loss heavy enough to fail every observer makes
+// the node a fence candidate instead. E2E_RELAY_NETEM still overrides the
+// impairment with a uniform `tc netem <args>` on the node's interface.
 //
 // The judgement is each node's own metrics endpoint, which reports the
 // replicator's live election, not a row in the database.
@@ -65,11 +74,10 @@ func (l *lab) waitRelayRole(member string, want float64, within time.Duration, w
 // Needs relay_health_v1 latched on the lab (every node on this build).
 func TestRelayHealth_DegradedLinkBecomesALeafEverywhere(t *testing.T) {
 	l := newLab(t)
-	victim := l.hosts[0]
-	netem := os.Getenv("E2E_RELAY_NETEM")
-	if netem == "" {
-		netem = "loss 30%"
+	if len(l.hosts) < 5 {
+		t.Skipf("needs 5 nodes (2 of 4 observers failing is below fence quorum); the lab has %d", len(l.hosts))
 	}
+	victim := l.hosts[0]
 	l.waitRelayRole(victim, 1, 2*time.Minute, "precondition: "+victim+" a relay on every node (it sorts first)")
 
 	dev := strings.TrimSpace(l.mustSSH(victim, 30*time.Second,
@@ -77,10 +85,29 @@ func TestRelayHealth_DegradedLinkBecomesALeafEverywhere(t *testing.T) {
 	if dev == "" {
 		t.Fatalf("no interface on %s carries %s", victim, l.ip[victim])
 	}
-	clearNetem := func() { _, _ = l.ssh(victim, 30*time.Second, "tc qdisc del dev "+dev+" root 2>/dev/null; true") }
-	t.Cleanup(clearNetem)
-	l.mustSSH(victim, 30*time.Second, fmt.Sprintf("tc qdisc replace dev %s root netem %s", dev, netem))
-	l.mark("netem %q on %s (%s)", netem, victim, dev)
+	clearImpairment := func() { _, _ = l.ssh(victim, 30*time.Second, "tc qdisc del dev "+dev+" root 2>/dev/null; true") }
+	t.Cleanup(clearImpairment)
+
+	var impair string
+	if netem := os.Getenv("E2E_RELAY_NETEM"); netem != "" {
+		impair = fmt.Sprintf("tc qdisc replace dev %s root netem %s", dev, netem)
+	} else {
+		// A fourth prio band that loses everything, and a u32 filter per
+		// cut peer steering the victim's traffic to it there; every other
+		// packet keeps the default priomap's three bands.
+		cut := l.hosts[1:3]
+		cmds := []string{
+			fmt.Sprintf("tc qdisc replace dev %s root handle 1: prio bands 4 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1", dev),
+			fmt.Sprintf("tc qdisc add dev %s parent 1:4 handle 40: netem loss 100%%", dev),
+		}
+		for _, p := range cut {
+			cmds = append(cmds, fmt.Sprintf("tc filter add dev %s parent 1:0 protocol ip prio 1 u32 match ip dst %s/32 flowid 1:4", dev, l.ip[p]))
+		}
+		impair = strings.Join(cmds, " && ")
+		l.mark("cutting %s's traffic to %v", victim, cut)
+	}
+	l.mustSSH(victim, 30*time.Second, impair)
+	l.mark("impairment on %s (%s): %s", victim, dev, impair)
 
 	// The demotion window, the probes' own build-up and a backstop relay
 	// re-election (30 s) on every node, with room.
@@ -89,9 +116,18 @@ func TestRelayHealth_DegradedLinkBecomesALeafEverywhere(t *testing.T) {
 	if took < failover.RelayDemoteWindow {
 		t.Errorf("%s demoted after %s, inside the %s window", victim, took, failover.RelayDemoteWindow)
 	}
+	// Demoted, not fenced: two of four observers is below fence quorum.
+	if out, err := l.lv(l.hosts[len(l.hosts)-1], "host", "ls"); err == nil {
+		for _, line := range strings.Split(out, "\n") {
+			if f := strings.Fields(line); len(f) > 0 && f[0] == victim &&
+				(strings.Contains(line, "fenced") || strings.Contains(line, "offline")) {
+				t.Errorf("%s was fenced, not demoted: %s", victim, line)
+			}
+		}
+	}
 
-	clearNetem()
-	l.mark("netem cleared on %s", victim)
+	clearImpairment()
+	l.mark("impairment cleared on %s", victim)
 	took = l.waitRelayRole(victim, 1, failover.RelayRestoreWindow+5*time.Minute, victim+" restored to relay on every node")
 	l.mark("%s a relay again on every node after %s", victim, took.Round(time.Second))
 	if took < failover.RelayRestoreWindow {

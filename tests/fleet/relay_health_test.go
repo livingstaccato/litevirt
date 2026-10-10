@@ -23,8 +23,10 @@ func relayElection(n *Node, cfg corrosion.RelayConfig) *corrosion.RelaySet {
 }
 
 // TestFleet_RelayHealthDemotesADegradedLinkEverywhere (colonelpanik/litevirt#175):
-// node-0 sorts first, so name order makes it a relay. Its links from node-1
-// and node-2 degrade — their readiness probes of it fail, replication still
+// node-0 sorts first, so name order makes it a relay. First ONE link to it
+// degrades, for longer than healthFreshness: one observer of four is below
+// the bar, and nothing is demoted. Then its links from node-1 and node-2
+// degrade — their readiness probes of it fail, replication still
 // gets through — which is two of its four voter observers, a third, and short
 // of the three a fence needs. The failover lease holder demotes it, and every
 // node then elects the SAME relay set without it, with node-0 a leaf that
@@ -34,7 +36,11 @@ func relayElection(n *Node, cfg corrosion.RelayConfig) *corrosion.RelaySet {
 // Real health checkers, real readiness RPCs through the per-link fault
 // injector, the production Replicator push loop; only the windows are shortened.
 //
-// Mutation: compute eligibility from each node's LOCAL probe view instead of
+// Mutations: (1) count only FRESH verdicts in the demotion denominator (the
+// round-0 evaluator) — the healthy verdicts age out, the one degraded link
+// reads 1/1 and node-0 is demoted, red; and the healed verdicts age out
+// inside the 45 s restore window, so it would never be restored either.
+// (2) Compute eligibility from each node's LOCAL probe view instead of
 // the replicated demotion rows — node-1 and node-2 drop node-0 while node-0,
 // node-3 and node-4 keep it, the sets disagree, red.
 func TestFleet_RelayHealthDemotesADegradedLinkEverywhere(t *testing.T) {
@@ -49,7 +55,10 @@ func TestFleet_RelayHealthDemotesADegradedLinkEverywhere(t *testing.T) {
 		d time.Duration
 	}{
 		{&failover.RelayDemoteWindow, 6 * time.Second},
-		{&failover.RelayRestoreWindow, 8 * time.Second},
+		// Longer than healthFreshness (30 s), as in production: a healed
+		// observer publishes one healthy verdict and then nothing, and that
+		// verdict must still count when the window ends.
+		{&failover.RelayRestoreWindow, 45 * time.Second},
 	} {
 		old := *v.p
 		*v.p = v.d
@@ -93,7 +102,19 @@ func TestFleet_RelayHealthDemotesADegradedLinkEverywhere(t *testing.T) {
 	coord.RelayConfig = cfg
 	tick := func() { coord.RunOnce(ctx) }
 
+	// One degraded link of four is below the bar (a third: 2). Held well
+	// past healthFreshness, so the other observers' healthy verdicts — written
+	// once, at their first probe — are stale, as they are in production.
 	c.SetLinkFault(n1, n0, LinkFault{BlockReady: true})
+	oneLink := time.Now().Add(55 * time.Second)
+	for time.Now().Before(oneLink) {
+		tick()
+		if d, _ := corrosion.ListRelayDemotions(ctx, lead.DB); len(d) != 0 {
+			t.Fatalf("demoted %v with one of four observers failing", d)
+		}
+		time.Sleep(time.Second)
+	}
+
 	c.SetLinkFault(n2, n0, LinkFault{BlockReady: true})
 
 	agree := func(wantRelay bool) (bool, string) {
@@ -114,9 +135,9 @@ func TestFleet_RelayHealthDemotesADegradedLinkEverywhere(t *testing.T) {
 		}
 		return true, ""
 	}
-	waitAgree := func(wantRelay bool, what string) {
+	waitAgree := func(wantRelay bool, within time.Duration, what string) {
 		t.Helper()
-		deadline := time.Now().Add(90 * time.Second)
+		deadline := time.Now().Add(within)
 		last := ""
 		for time.Now().Before(deadline) {
 			tick()
@@ -127,16 +148,16 @@ func TestFleet_RelayHealthDemotesADegradedLinkEverywhere(t *testing.T) {
 			last = why
 			time.Sleep(time.Second)
 		}
-		t.Fatalf("%s: never happened within 90s; last: %s", what, last)
+		t.Fatalf("%s: never happened within %s; last: %s", what, within, last)
 	}
 
-	waitAgree(false, "every node electing the same relay set without "+n0.Name)
+	waitAgree(false, 90*time.Second, "every node electing the same relay set without "+n0.Name)
 	if len(fences) != 0 {
 		t.Fatalf("fenced %v: a third of the observers failing is a demotion, not a fence", fences)
 	}
 
 	c.ClearLinkFaults()
-	waitAgree(true, n0.Name+" restored to relay duty on every node after the heal")
+	waitAgree(true, 3*time.Minute, n0.Name+" restored to relay duty on every node after the heal")
 	if len(fences) != 0 {
 		t.Fatalf("fenced %v", fences)
 	}

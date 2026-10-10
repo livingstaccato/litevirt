@@ -806,11 +806,12 @@ lv acme status [host]   # show the TLS cert the UI is serving (subject/issuer/SA
 
 ```bash
 # Repository management (host-local)
-lv backup repo init <path> [--encrypted --key-file <file>] [--compression zstd|none]
-#   --compression zstd (default): chunks are zstd-compressed; the repo is marked
-#   schema 2, which releases without backup compression refuse to open.
-#   --compression none: the format every release reads.
-lv backup repo set-compression <path> zstd|none   # for chunks written from now on
+lv backup repo init <path> [--encrypted --key-file <file>] [--compression zstd|none] [--force]
+#   Default: none until the cluster's release token has latched (feature
+#   backup_zstd), zstd after. zstd marks the repo schema 2, which releases
+#   without backup compression refuse to open; --force allows it before the
+#   latch, for a repo no older host reads.
+lv backup repo set-compression <path> zstd|none [--force]   # for chunks written from now on; zstd gated as above
 lv backup repo ls <path>
 lv backup repo verify <path>
 lv backup repo gc <path>

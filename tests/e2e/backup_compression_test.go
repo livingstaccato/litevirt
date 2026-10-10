@@ -69,7 +69,9 @@ func bkSnapshot(l *lab, host, vm, repo string, extra ...string) (ts string, byte
 func TestLab_BackupCompression_RoundTripAndOnDiskSize(t *testing.T) {
 	l := newLab(t)
 	host, vm, disk := bkStoppedVM(l, "bkz")
-	repo := bkRepo(l, host, "e2e-bkz")
+	// zstd is forced: until the cluster's release token latches it is not
+	// the default (TestLab_BackupCompression_DefaultIsNoneBeforeTheLatch).
+	repo := bkRepo(l, host, "e2e-bkz", "--compression", "zstd", "--force")
 
 	meta := l.mustSSH(host, 30*time.Second, "cat "+shellQuote(repo+"/repo.json"))
 	if !strings.Contains(meta, `"compression": "zstd"`) || !strings.Contains(meta, `"schema_version": 2`) {
@@ -135,5 +137,23 @@ func TestLab_BackupBWLimit_HoldsTheRate(t *testing.T) {
 	}
 	if took < floor*9/10 {
 		t.Fatalf("backup of %d bytes at --bwlimit 4MiB took %v, under the %v the limit allows", covered, took, floor)
+	}
+}
+
+// Until the cluster's release token has latched (feature backup_zstd), a
+// new repo is uncompressed, and asking for zstd without --force is refused.
+func TestLab_BackupCompression_DefaultIsNoneBeforeTheLatch(t *testing.T) {
+	l := newLab(t)
+	host := labUpHosts(l, 1)[0]
+	repo := bkRepo(l, host, "e2e-bkdef")
+	meta := l.mustSSH(host, 30*time.Second, "cat "+shellQuote(repo+"/repo.json"))
+	if strings.Contains(meta, "zstd") || !strings.Contains(meta, `"schema_version": 1`) {
+		t.Fatalf("a default repo before the latch:\n%s", meta)
+	}
+	dir := fmt.Sprintf("/var/tmp/e2e-bkgate-%d", time.Now().UnixNano())
+	out, err := l.lv(host, "backup", "repo", "init", dir, "--compression", "zstd")
+	l.onRestore(func() { _, _ = l.ssh(host, time.Minute, "rm -rf "+shellQuote(dir)) })
+	if err == nil || !strings.Contains(out+err.Error(), "backup_zstd") {
+		t.Fatalf("zstd without --force before the latch: %v\n%s", err, out)
 	}
 }

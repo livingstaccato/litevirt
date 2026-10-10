@@ -85,18 +85,24 @@ second snapshot's manifest just references the existing chunk.
 
 ## Compression
 
-A repo created by `lv backup repo init` compresses each chunk with zstd
-before it is written (and before it is sealed, in an encrypted repo). The
+A compressed repo compresses each chunk with zstd before it is written (and before it is sealed, in an encrypted repo). The
 chunk id stays the BLAKE3 of the *uncompressed* bytes, so dedup is unchanged,
 spans compressed and uncompressed repos, and sync and peer streaming still
 move plain chunks — a DR copy can differ in compression from its source. A
 chunk zstd cannot shrink (already-compressed guest data) is stored as it is.
 
 ```bash
-lv backup repo init /srv/backup/main                      # zstd (default)
+lv backup repo init /srv/backup/main                      # the default (below)
 lv backup repo init /srv/backup/main --compression none   # uncompressed
 lv backup repo set-compression /srv/backup/main zstd      # existing repo
 ```
+
+**The default follows the cluster's upgrade.** Until the cluster's release
+token has latched — every host runs a build that reads compressed repos —
+a new repo is uncompressed and `--compression zstd` or `set-compression ...
+zstd` is refused, naming the release feature `backup_zstd`. Once it has
+latched, new repos are compressed by default. `--force` allows zstd earlier,
+for a repository no older host or backup host reads (an air-gapped one).
 
 **Older releases refuse a compressed repo.** A compressed repo's `repo.json`
 says `"compression": "zstd"` and `"schema_version": 2`. Every release before
@@ -109,12 +115,9 @@ schema 2.
 
 So an **existing** repo is never compressed behind your back: it stays
 schema 1 and uncompressed, byte-identical to what earlier releases wrote,
-until `lv backup repo set-compression <path> zstd`. Run that once every host
-and backup host that reads the repo runs a release with compression. During
-a rolling upgrade, create a repo that a not-yet-upgraded host must use with
-`--compression none`. Turning compression on rewrites nothing: earlier
-backups stay as they are and keep restoring, and only chunks written from
-then on are compressed.
+until `lv backup repo set-compression <path> zstd`. Turning compression on
+rewrites nothing: earlier backups stay as they are and keep restoring, and
+only chunks written from then on are compressed.
 
 A compressed chunk is a 4-byte marker followed by a zstd frame. Guest data
 is arbitrary and may begin with the same bytes, so a chunk is taken as
@@ -146,7 +149,10 @@ backup_bwlimits:
   twenty times it. It applies to scheduled backups too, which have no
   per-job limit of their own.
 
-When both are set, the lower wins. A limit covers the bytes read from the
+When both are set, the lower wins. A limit is at least 64 KiB/s (a lower
+one is refused, or raised to it when it arrives over the RPC); a job that is
+cancelled gives back the part of its reservation it did not use, so it does
+not hold up the jobs sharing the repo's limit. A limit covers the bytes read from the
 disk or container (holes, and regions an incremental inherits from its
 parent, are not read and cost nothing) and, for a remote backup, the chunks
 sent to the repo's host. For a remote backup the host you call (the repo's
@@ -522,28 +528,37 @@ own kernel and an initramfs whose init is the litevirt binary itself, the
 backup attached read-only as its only disk (served from the repo over a local
 NBD socket), no network, vsock as its only channel, one vCPU and 512 MiB. The
 guest kernel parses the partition table and mounts each filesystem read-only
-inside the VM. Everything the VM returns is untrusted: listings are validated
-and the archive is rebuilt entry by entry — relative names inside what you
-selected, only directories, regular files and symlinks, nothing under a
-symlink, no owners, setuid bits or extended attributes, bounded sizes — and
-streamed to you. Nothing is written on the daemon's host. The architecture,
+inside the VM. qemu is started as an unprivileged user (`libvirt-qemu`) with
+its seccomp sandbox on; it dies with the daemon, a restarted daemon kills any
+it left, and the agent inside powers off on its own when no one talks to it.
+The VM's console stays in a small in-memory buffer. Everything the VM
+returns is untrusted: it sends simple records, not tar, and the daemon builds
+the archive itself entry by entry — relative names inside what you selected,
+only directories, regular files and symlinks, nothing under a symlink (also
+compared case-insensitively), no owners, setuid bits or extended attributes,
+bounded sizes, counts and memory — and streams it to you. Nothing is written
+on the daemon's host. The architecture,
 limits and threat model are in
 [design/backup-file-restore.md](design/backup-file-restore.md).
 
 - **Permission:** the same as a full restore of that VM or container
   (`backup.restore` on the backup's project). Every extraction is audited as
   `backup.file_restore`, with the paths and what was extracted.
-- **Sessions:** browsing reuses one restore VM, killed after five idle
-  minutes; an extraction's VM is killed when it completes; two at a time per
+- **Sessions:** browsing reuses one restore VM per backup, killed after five
+  idle minutes; each extraction runs on a VM of its own, killed when it
+  completes, when you cancel, or at its wall-clock limit (10 minutes, or the
+  byte limit at 1 MiB/s if longer); two VMs and one extraction at a time per
   host (`file_restore:` in the daemon config tunes all of it).
 - **Filesystems:** ext2/3/4, xfs, btrfs, vfat and iso9660, on a disk or its
   partitions. Not LVM, LUKS, ZFS or md-raid inside the backup, and not a
   stopped linked clone's disk-file backup (it is only the delta over its base)
   — restore the disk for those.
-- **Requirements:** KVM, `/dev/vhost-vsock` (the `vhost_vsock` module) and
-  qemu on the daemon's host, and a kernel it can read (its own by default).
-  Without them file restore is refused naming what is missing; a full
-  restore keeps working. There is no fallback to mounting on the host.
+- **Requirements:** KVM (read-write for the qemu user), `/dev/vhost-vsock`
+  (the `vhost_vsock` module), a qemu with seccomp support, and a kernel the
+  daemon can read (its own by default). Without them file restore is refused
+  naming what is missing; a full restore keeps working. There is no fallback
+  to mounting on the host. `file_restore.allow_unsandboxed: true` lets a
+  restore VM run on a qemu without seccomp, decided for each VM.
 
 ## Containers
 

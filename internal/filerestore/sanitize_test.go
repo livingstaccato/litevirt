@@ -2,53 +2,60 @@ package filerestore
 
 import (
 	"archive/tar"
+	"bufio"
 	"bytes"
 	"errors"
 	"io"
+	"math"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/litevirt/litevirt/internal/filerestore/wire"
 )
 
-type tEnt struct {
-	name     string
-	typ      byte
-	body     string
-	link     string
-	mode     int64
-	pax      map[string]string
-	declared int64 // size to declare when != len(body)
+// rec is one record of a hostile agent's stream, with its data.
+type rec struct {
+	wire.Record
+	data string
 }
 
-func mkTar(t *testing.T, ents ...tEnt) []byte {
+func file(name, data string) rec {
+	return rec{wire.Record{Name: name, Type: TypeFile, Size: int64(len(data)), Mode: 0o644, MTime: 1700000000}, data}
+}
+
+func dir(name string) rec { return rec{wire.Record{Name: name, Type: TypeDir, Mode: 0o755}, ""} }
+
+func link(name, target string) rec {
+	return rec{wire.Record{Name: name, Type: TypeSymlink, Link: target}, ""}
+}
+
+// stream encodes records the way the agent does, ending the stream unless
+// noEnd.
+func stream(t *testing.T, noEnd bool, recs ...rec) []byte {
 	t.Helper()
 	var b bytes.Buffer
-	tw := tar.NewWriter(&b)
-	for _, e := range ents {
-		h := &tar.Header{Name: e.name, Typeflag: e.typ, Mode: e.mode, Linkname: e.link,
-			ModTime: time.Unix(1700000000, 0), PAXRecords: e.pax, Uid: 1234, Gid: 1234, Uname: "evil", Format: tar.FormatPAX}
-		if h.Mode == 0 {
-			h.Mode = 0o644
+	for _, r := range recs {
+		if err := wire.WriteRecord(&b, r.Record); err != nil {
+			t.Fatal(err)
 		}
-		if e.typ == tar.TypeReg {
-			h.Size = int64(len(e.body))
-			if e.declared != 0 {
-				h.Size = e.declared
-			}
-		}
-		if err := tw.WriteHeader(h); err != nil {
-			t.Fatalf("header %q: %v", e.name, err)
-		}
-		if e.typ == tar.TypeReg && e.declared == 0 {
-			if _, err := tw.Write([]byte(e.body)); err != nil {
-				t.Fatal(err)
-			}
-		}
+		b.WriteString(r.data)
 	}
-	if err := tw.Close(); err != nil {
-		t.Fatal(err)
+	if !noEnd {
+		_ = wire.WriteRecord(&b, wire.Record{End: true})
 	}
 	return b.Bytes()
+}
+
+func sanitize(t *testing.T, in []byte, sels []string, lim TarLimits) (map[string]outEnt, TarStats, error) {
+	t.Helper()
+	var out bytes.Buffer
+	st, err := SanitizeStream(&out, bufio.NewReader(bytes.NewReader(in)), sels, lim)
+	if err != nil && !errors.Is(err, ErrLimit) {
+		return nil, st, err
+	}
+	return readTar(t, out.Bytes()), st, err
 }
 
 type outEnt struct {
@@ -73,115 +80,58 @@ func readTar(t *testing.T, b []byte) map[string]outEnt {
 	}
 }
 
+func keys(m map[string]outEnt) []string {
+	var out []string
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
 // Names a careless extractor would write outside its directory, or that are
 // not names at all, never reach the caller.
-func TestSanitizeTar_RefusesUnsafeNames(t *testing.T) {
-	in := mkTar(t,
-		tEnt{name: "vda1/ok.txt", typ: tar.TypeReg, body: "fine"},
-		tEnt{name: "/etc/passwd", typ: tar.TypeReg, body: "abs"},
-		tEnt{name: "vda1/../../etc/shadow", typ: tar.TypeReg, body: "dotdot"},
-		tEnt{name: "vda1/a/../b", typ: tar.TypeReg, body: "unclean"},
-		tEnt{name: "vda1/./c", typ: tar.TypeReg, body: "dot"},
-		tEnt{name: "vda1/" + strings.Repeat("x", 300), typ: tar.TypeReg, body: "long component"},
-		tEnt{name: "vda2/elsewhere", typ: tar.TypeReg, body: "not selected"},
-		tEnt{name: "vda1x/prefix-trick", typ: tar.TypeReg, body: "not selected"},
-	)
-	var out bytes.Buffer
-	st, err := SanitizeTar(&out, bytes.NewReader(in), []string{"vda1"}, TarLimits{})
+func TestSanitize_RefusesUnsafeNames(t *testing.T) {
+	got, st, err := sanitize(t, stream(t, false,
+		file("vda1/ok.txt", "fine"),
+		file("/etc/passwd", "abs"),
+		file("vda1/../../etc/shadow", "dotdot"),
+		file("vda1/a/../b", "unclean"),
+		file("vda1/./c", "dot"),
+		file("vda1/"+strings.Repeat("x", 300), "long component"),
+		file("vda2/elsewhere", "not selected"),
+		file("vda1x/prefix-trick", "not selected"),
+		file("vda1/nul\x00byte", "nul"),
+	), []string{"vda1"}, TarLimits{})
 	if err != nil {
-		t.Fatalf("SanitizeTar: %v", err)
+		t.Fatalf("SanitizeStream: %v", err)
 	}
-	got := readTar(t, out.Bytes())
 	if len(got) != 1 || got["vda1/ok.txt"].body != "fine" {
 		t.Fatalf("got %v, want only vda1/ok.txt", keys(got))
 	}
-	if st.Skipped != 7 {
-		t.Fatalf("skipped %d, want 7", st.Skipped)
+	if st.Skipped != 8 {
+		t.Fatalf("skipped %d, want 8", st.Skipped)
 	}
 }
 
-func TestSanitizeTar_RefusesNonUTF8AndNUL(t *testing.T) {
-	// archive/tar will not write these names itself; build the header bytes.
-	in := mkTar(t, tEnt{name: "vda1/good", typ: tar.TypeReg, body: "g"})
-	bad := rawTarHeader(t, "vda1/bad\xff", "x")
-	in = append(bad, in...)
-	var out bytes.Buffer
-	if _, err := SanitizeTar(&out, bytes.NewReader(in), []string{"vda1"}, TarLimits{}); err != nil {
-		t.Fatalf("SanitizeTar: %v", err)
-	}
-	got := readTar(t, out.Bytes())
-	if _, ok := got["vda1/good"]; !ok || len(got) != 1 {
-		t.Fatalf("got %v", keys(got))
-	}
-}
-
-// rawTarHeader writes one ustar regular-file entry with an arbitrary name.
-func rawTarHeader(t *testing.T, name, body string) []byte {
-	t.Helper()
-	h := make([]byte, 512)
-	copy(h[0:100], name)
-	copy(h[100:108], "0000644\x00")
-	copy(h[108:116], "0000000\x00")
-	copy(h[116:124], "0000000\x00")
-	copy(h[124:136], []byte(octal(int64(len(body)), 11)+"\x00"))
-	copy(h[136:148], "00000000000\x00")
-	h[156] = '0'
-	copy(h[257:263], "ustar\x00")
-	copy(h[263:265], "00")
-	for i := 148; i < 156; i++ {
-		h[i] = ' '
-	}
-	var sum int64
-	for _, c := range h {
-		sum += int64(c)
-	}
-	copy(h[148:156], octal(sum, 6)+"\x00 ")
-	data := make([]byte, (len(body)+511)/512*512)
-	copy(data, body)
-	return append(h, data...)
-}
-
-func octal(n int64, width int) string {
-	s := strings.Repeat("0", width) + strconvOct(n)
-	return s[len(s)-width:]
-}
-
-func strconvOct(n int64) string {
-	if n == 0 {
-		return "0"
-	}
-	var b []byte
-	for n > 0 {
-		b = append([]byte{byte('0' + n%8)}, b...)
-		n /= 8
-	}
-	return string(b)
-}
-
-// Only directories, regular files and symlinks pass; a hard link, device or
-// fifo does not.
-func TestSanitizeTar_OnlySafeTypes(t *testing.T) {
-	in := mkTar(t,
-		tEnt{name: "vda1/dir", typ: tar.TypeDir, mode: 0o755},
-		tEnt{name: "vda1/dir/f", typ: tar.TypeReg, body: "data"},
-		tEnt{name: "vda1/lnk", typ: tar.TypeSymlink, link: "/etc/shadow"},
-		tEnt{name: "vda1/hard", typ: tar.TypeLink, link: "vda1/dir/f"},
-		tEnt{name: "vda1/dev", typ: tar.TypeChar},
-		tEnt{name: "vda1/blk", typ: tar.TypeBlock},
-		tEnt{name: "vda1/fifo", typ: tar.TypeFifo},
-	)
-	var out bytes.Buffer
-	st, err := SanitizeTar(&out, bytes.NewReader(in), []string{"vda1"}, TarLimits{})
+// Only directories, regular files and symlinks pass.
+func TestSanitize_OnlySafeTypes(t *testing.T) {
+	got, st, err := sanitize(t, stream(t, false,
+		dir("vda1/dir"),
+		file("vda1/dir/f", "data"),
+		link("vda1/lnk", "/etc/shadow"),
+		rec{wire.Record{Name: "vda1/hard", Type: "hardlink", Link: "vda1/dir/f"}, ""},
+		rec{wire.Record{Name: "vda1/dev", Type: TypeOther}, ""},
+		rec{wire.Record{Name: "vda1/blk", Type: "blockdev"}, ""},
+	), []string{"vda1"}, TarLimits{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := readTar(t, out.Bytes())
 	for _, want := range []string{"vda1/dir/", "vda1/dir/f", "vda1/lnk"} {
 		if _, ok := got[want]; !ok {
 			t.Errorf("missing %s (got %v)", want, keys(got))
 		}
 	}
-	for _, refused := range []string{"vda1/hard", "vda1/dev", "vda1/blk", "vda1/fifo"} {
+	for _, refused := range []string{"vda1/hard", "vda1/dev", "vda1/blk"} {
 		if _, ok := got[refused]; ok {
 			t.Errorf("%s passed", refused)
 		}
@@ -189,27 +139,24 @@ func TestSanitizeTar_OnlySafeTypes(t *testing.T) {
 	if got["vda1/lnk"].h.Typeflag != tar.TypeSymlink || got["vda1/lnk"].h.Linkname != "/etc/shadow" {
 		t.Errorf("symlink not kept as a symlink: %+v", got["vda1/lnk"].h)
 	}
-	if st.Skipped != 4 {
-		t.Errorf("skipped %d, want 4", st.Skipped)
+	if st.Skipped != 3 {
+		t.Errorf("skipped %d, want 3", st.Skipped)
 	}
 }
 
 // Extracting the archive must never write through a link: nothing under a
-// symlink the archive holds, and no name twice (a symlink replacing a
-// directory already written).
-func TestSanitizeTar_NothingThroughASymlink(t *testing.T) {
-	in := mkTar(t,
-		tEnt{name: "vda1/esc", typ: tar.TypeSymlink, link: "/root/.ssh"},
-		tEnt{name: "vda1/esc/authorized_keys", typ: tar.TypeReg, body: "ssh-ed25519 attacker"},
-		tEnt{name: "vda1/d", typ: tar.TypeDir},
-		tEnt{name: "vda1/d", typ: tar.TypeSymlink, link: "/etc"},
-		tEnt{name: "vda1/d/cron.d", typ: tar.TypeReg, body: "x"},
-	)
-	var out bytes.Buffer
-	if _, err := SanitizeTar(&out, bytes.NewReader(in), []string{"vda1"}, TarLimits{}); err != nil {
+// symlink the archive holds, and no name twice.
+func TestSanitize_NothingThroughASymlink(t *testing.T) {
+	got, _, err := sanitize(t, stream(t, false,
+		link("vda1/esc", "/root/.ssh"),
+		file("vda1/esc/authorized_keys", "ssh-ed25519 attacker"),
+		dir("vda1/d"),
+		link("vda1/d", "/etc"),
+		file("vda1/d/cron.d", "x"),
+	), []string{"vda1"}, TarLimits{})
+	if err != nil {
 		t.Fatal(err)
 	}
-	got := readTar(t, out.Bytes())
 	if _, ok := got["vda1/esc/authorized_keys"]; ok {
 		t.Fatal("an entry under a symlink passed")
 	}
@@ -223,87 +170,170 @@ func TestSanitizeTar_NothingThroughASymlink(t *testing.T) {
 	}
 }
 
-// Headers are rebuilt: permission bits only, no owner, no guest PAX records.
-func TestSanitizeTar_RebuildsHeaders(t *testing.T) {
-	in := mkTar(t, tEnt{name: "vda1/suid", typ: tar.TypeReg, body: "x", mode: 0o4755,
-		pax: map[string]string{"SCHILY.xattr.security.capability": "cap", "LIBARCHIVE.xattr.user.x": "y"}})
-	var out bytes.Buffer
-	if _, err := SanitizeTar(&out, bytes.NewReader(in), []string{"vda1"}, TarLimits{}); err != nil {
+// On a case-insensitive or normalizing filesystem (macOS, Windows), "A" and
+// "a", or NFC and NFD spellings, are one path: the symlink and duplicate
+// checks compare them as one.
+func TestSanitize_CaseAndNormalizationCollisions(t *testing.T) {
+	nfc, nfd := "vda1/café", "vda1/café"
+	got, st, err := sanitize(t, stream(t, false,
+		link("vda1/A", "/root/.ssh"),
+		file("vda1/a/authorized_keys", "attacker"),
+		link(nfc, "/etc"),
+		file(nfd+"/cron", "x"),
+		file("vda1/Readme", "1"),
+		file("vda1/README", "2"),
+	), []string{"vda1"}, TarLimits{})
+	if err != nil {
 		t.Fatal(err)
 	}
-	h := readTar(t, out.Bytes())["vda1/suid"].h
-	if h == nil {
-		t.Fatal("entry missing")
-	}
-	if h.Mode != 0o755 {
-		t.Errorf("mode %o, want 755 (setuid stripped)", h.Mode)
-	}
-	if h.Uid != 0 || h.Gid != 0 || h.Uname != "" {
-		t.Errorf("owner carried over: uid=%d gid=%d uname=%q", h.Uid, h.Gid, h.Uname)
-	}
-	for k := range h.PAXRecords {
-		if strings.Contains(k, "xattr") {
-			t.Errorf("guest PAX record %q carried over", k)
+	for _, refused := range []string{"vda1/a/authorized_keys", nfd + "/cron", "vda1/README"} {
+		if _, ok := got[refused]; ok {
+			t.Errorf("%q passed", refused)
 		}
+	}
+	if st.Skipped != 3 {
+		t.Errorf("skipped %d, want 3 (%v)", st.Skipped, keys(got))
 	}
 }
 
-func TestSanitizeTar_Limits(t *testing.T) {
-	in := mkTar(t,
-		tEnt{name: "vda1/a", typ: tar.TypeReg, body: strings.Repeat("a", 100)},
-		tEnt{name: "vda1/b", typ: tar.TypeReg, body: strings.Repeat("b", 100)},
-		tEnt{name: "vda1/c", typ: tar.TypeReg, body: strings.Repeat("c", 100)},
+// Headers are built from scratch: permission bits only, no owner.
+func TestSanitize_RebuildsHeaders(t *testing.T) {
+	r := file("vda1/suid", "x")
+	r.Mode = 0o4755
+	got, _, err := sanitize(t, stream(t, false, r), []string{"vda1"}, TarLimits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := got["vda1/suid"].h
+	if h == nil || h.Mode != 0o755 || h.Uid != 0 || h.Gid != 0 || h.Uname != "" {
+		t.Fatalf("header %+v: want mode 755, no owner", h)
+	}
+}
+
+func TestSanitize_Limits(t *testing.T) {
+	in := stream(t, false,
+		file("vda1/a", strings.Repeat("a", 100)),
+		file("vda1/b", strings.Repeat("b", 100)),
+		file("vda1/c", strings.Repeat("c", 100)),
 	)
-	var out bytes.Buffer
-	st, err := SanitizeTar(&out, bytes.NewReader(in), []string{"vda1"}, TarLimits{MaxBytes: 250})
+	got, st, err := sanitize(t, in, []string{"vda1"}, TarLimits{MaxBytes: 250})
 	if !errors.Is(err, ErrLimit) || !st.Truncated {
 		t.Fatalf("want ErrLimit and Truncated at 250 bytes, got %v %+v", err, st)
 	}
-	got := readTar(t, out.Bytes()) // still a valid, closed archive
 	if len(got) != 2 || st.Bytes != 200 {
 		t.Fatalf("got %v (%d bytes), want a and b only", keys(got), st.Bytes)
 	}
-	out.Reset()
-	st, err = SanitizeTar(&out, bytes.NewReader(in), []string{"vda1"}, TarLimits{MaxEntries: 1})
-	if !errors.Is(err, ErrLimit) || len(readTar(t, out.Bytes())) != 1 {
-		t.Fatalf("MaxEntries 1: err=%v %+v", err, st)
+	got, _, err = sanitize(t, in, []string{"vda1"}, TarLimits{MaxEntries: 1})
+	if !errors.Is(err, ErrLimit) || len(got) != 1 {
+		t.Fatalf("MaxEntries 1: err=%v %v", err, keys(got))
 	}
 }
 
-// An archive that ends inside a file is an error, not a short file passed on
-// as whole.
-func TestSanitizeTar_TruncatedStream(t *testing.T) {
-	in := mkTar(t, tEnt{name: "vda1/big", typ: tar.TypeReg, body: strings.Repeat("z", 5000)})
+// I-1: a size near MaxInt64 after a small file must not wrap the byte cap
+// into a pass.
+func TestSanitize_SizeCannotOverflowTheCap(t *testing.T) {
+	huge := rec{wire.Record{Name: "vda1/huge", Type: TypeFile, Size: math.MaxInt64}, ""}
+	in := stream(t, true, file("vda1/one", "x"), huge)
+	got, st, err := sanitize(t, in, []string{"vda1"}, TarLimits{MaxBytes: 1 << 20})
+	if !errors.Is(err, ErrLimit) {
+		t.Fatalf("a MaxInt64-byte file after a 1-byte one: err=%v, want ErrLimit", err)
+	}
+	if _, ok := got["vda1/huge"]; ok || st.Bytes != 1 {
+		t.Fatalf("got %v, %d bytes", keys(got), st.Bytes)
+	}
+}
+
+// I-1: the bytes counted are the bytes written, and refused entries' bytes
+// are bounded by the same cap (they are read to stay in step).
+func TestSanitize_RefusedBytesAreBounded(t *testing.T) {
+	refused := rec{wire.Record{Name: "elsewhere/big", Type: TypeFile, Size: 1 << 40}, ""}
+	in := stream(t, true, refused)
+	_, _, err := sanitize(t, in, []string{"vda1"}, TarLimits{MaxBytes: 1 << 20})
+	if err == nil || !strings.Contains(err.Error(), "refused data") {
+		t.Fatalf("a refused 1 TiB entry under a 1 MiB cap: %v", err)
+	}
+}
+
+// I-1: the host reads records, not tar — a GNU sparse archive (whose holes a
+// tar reader would synthesize as endless zeros) is not parsed at all.
+func TestSanitize_SparseTarIsNotParsed(t *testing.T) {
+	var b bytes.Buffer
+	tw := tar.NewWriter(&b)
+	_ = tw.WriteHeader(&tar.Header{Name: "vda1/sparse", Typeflag: tar.TypeReg, Size: 0, Format: tar.FormatPAX,
+		PAXRecords: map[string]string{"GNU.sparse.major": "1", "GNU.sparse.minor": "0", "GNU.sparse.name": "vda1/sparse",
+			"GNU.sparse.realsize": strconv.FormatInt(math.MaxInt64, 10)}})
+	_ = tw.Close()
 	var out bytes.Buffer
-	if _, err := SanitizeTar(&out, bytes.NewReader(in[:512+1000]), []string{"vda1"}, TarLimits{}); err == nil {
-		t.Fatal("a truncated archive was accepted")
+	start := time.Now()
+	_, err := SanitizeStream(&out, bufio.NewReader(bytes.NewReader(b.Bytes())), []string{"vda1"}, TarLimits{})
+	if err == nil {
+		t.Fatal("a sparse tar was accepted as a record stream")
+	}
+	if out.Len() > 1024 || time.Since(start) > time.Second {
+		t.Fatalf("a sparse tar produced %d bytes in %v", out.Len(), time.Since(start))
 	}
 }
 
-// A stream of refused headers is bounded too.
-func TestSanitizeTar_HeaderFloodBounded(t *testing.T) {
-	old := maxTarHeaders
-	maxTarHeaders = 50
-	defer func() { maxTarHeaders = old }()
-	var ents []tEnt
+// I-2: the names one extraction remembers are bounded, whatever their
+// length; past the bound the extraction stops.
+func TestSanitize_TrackingIsBounded(t *testing.T) {
+	old := maxTracked
+	maxTracked = 10
+	defer func() { maxTracked = old }()
+	var recs []rec
+	for i := 0; i < 20; i++ {
+		recs = append(recs, file("vda1/"+strings.Repeat("n", 200)+strconv.Itoa(i), ""))
+	}
+	got, st, err := sanitize(t, stream(t, false, recs...), []string{"vda1"}, TarLimits{})
+	if !errors.Is(err, ErrLimit) || len(got) != 10 || !st.Truncated {
+		t.Fatalf("20 entries past a tracking bound of 10: err=%v kept=%d", err, len(got))
+	}
+}
+
+// A record line over its bound, and a stream that ends inside a file, are
+// errors.
+func TestSanitize_MalformedStreams(t *testing.T) {
+	long := []byte(`{"n":"` + strings.Repeat("x", wire.MaxRecordLine) + `","t":"file"}` + "\n")
+	if _, _, err := sanitize(t, long, []string{"vda1"}, TarLimits{}); err == nil {
+		t.Error("an oversized record line was accepted")
+	}
+	short := stream(t, true, file("vda1/big", strings.Repeat("z", 5000)))
+	short = short[:len(short)-4000]
+	if _, _, err := sanitize(t, short, []string{"vda1"}, TarLimits{}); err == nil {
+		t.Error("a stream that ends inside a file was accepted")
+	}
+	neg := stream(t, false, rec{wire.Record{Name: "vda1/n", Type: TypeFile, Size: -1}, ""})
+	if _, _, err := sanitize(t, neg, []string{"vda1"}, TarLimits{}); err == nil {
+		t.Error("a negative size was accepted")
+	}
+	if _, _, err := sanitize(t, []byte("not json\n"), []string{"vda1"}, TarLimits{}); err == nil {
+		t.Error("garbage was accepted")
+	}
+}
+
+// A stream of refused records is bounded too.
+func TestSanitize_RecordFloodBounded(t *testing.T) {
+	old := maxRecords
+	maxRecords = 50
+	defer func() { maxRecords = old }()
+	var recs []rec
 	for i := 0; i < 60; i++ {
-		ents = append(ents, tEnt{name: "other/x" + itoa(i), typ: tar.TypeReg, body: "."})
+		recs = append(recs, file("other/x"+strconv.Itoa(i), "."))
 	}
-	var out bytes.Buffer
-	if _, err := SanitizeTar(&out, bytes.NewReader(mkTar(t, ents...)), []string{"vda1"}, TarLimits{}); err == nil {
-		t.Fatal("60 refused headers past a bound of 50 were read without error")
+	if _, _, err := sanitize(t, stream(t, false, recs...), []string{"vda1"}, TarLimits{}); err == nil {
+		t.Fatal("60 refused records past a bound of 50 were read without error")
 	}
 }
 
 func TestSanitizeEntries(t *testing.T) {
 	in := []Entry{
 		{Name: "ok", Type: TypeFile, Size: 10, Mode: 0o4755},
-		{Name: "ok", Type: TypeFile},        // duplicate
-		{Name: "a/b", Type: TypeFile},       // slash
-		{Name: "..", Type: TypeDir},         // dot-dot
-		{Name: "bad\xff", Type: TypeFile},   // not UTF-8
-		{Name: "weird", Type: "blockdev"},   // unknown type
-		{Name: "d", Type: TypeDir, Size: 9}, // dir size
+		{Name: "ok", Type: TypeFile},
+		{Name: "a/b", Type: TypeFile},
+		{Name: "..", Type: TypeDir},
+		{Name: "bad\xff", Type: TypeFile},
+		{Name: "weird", Type: "blockdev"},
+		{Name: "d", Type: TypeDir, Size: 9},
 		{Name: "f", Type: TypeFile, Target: "/x"},
 		{Name: "l", Type: TypeSymlink, Target: "/etc/passwd"},
 		{Name: "neg", Type: TypeFile, Size: -5},
@@ -316,29 +346,19 @@ func TestSanitizeEntries(t *testing.T) {
 	for _, e := range out {
 		byName[e.Name] = e
 	}
-	if byName["ok"].Mode != 0o755 {
-		t.Errorf("mode %o", byName["ok"].Mode)
-	}
-	if byName["weird"].Type != TypeOther {
-		t.Errorf("unknown type kept: %q", byName["weird"].Type)
-	}
-	if byName["d"].Size != 0 || byName["neg"].Size != 0 {
-		t.Errorf("sizes: d=%d neg=%d", byName["d"].Size, byName["neg"].Size)
+	if byName["ok"].Mode != 0o755 || byName["weird"].Type != TypeOther || byName["d"].Size != 0 || byName["neg"].Size != 0 {
+		t.Errorf("entries %+v", byName)
 	}
 	if byName["f"].Target != "" || byName["l"].Target != "/etc/passwd" {
 		t.Errorf("targets: f=%q l=%q", byName["f"].Target, byName["l"].Target)
 	}
 	many := make([]Entry, MaxListEntries+10)
 	for i := range many {
-		many[i] = Entry{Name: "n" + strings.Repeat("x", i%7) + string(rune('A'+i%26)) + itoa(i), Type: TypeFile}
+		many[i] = Entry{Name: "n" + strconv.Itoa(i), Type: TypeFile}
 	}
 	if out, _ := SanitizeEntries(many); len(out) != MaxListEntries {
 		t.Errorf("kept %d entries, cap is %d", len(out), MaxListEntries)
 	}
-}
-
-func itoa(i int) string {
-	return strconvOct(int64(i))
 }
 
 func TestSelectionNamesAndPaths(t *testing.T) {
@@ -355,15 +375,4 @@ func TestSelectionNamesAndPaths(t *testing.T) {
 	if err != nil || got[0] != "vda1/etc/hosts" {
 		t.Errorf("got %v %v", got, err)
 	}
-	if v, r := SplitVolume("/rootfs/etc/x"); v != "rootfs" || r != "etc/x" {
-		t.Errorf("SplitVolume: %q %q", v, r)
-	}
-}
-
-func keys(m map[string]outEnt) []string {
-	var out []string
-	for k := range m {
-		out = append(out, k)
-	}
-	return out
 }

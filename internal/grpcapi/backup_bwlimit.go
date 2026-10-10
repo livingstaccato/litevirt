@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"path/filepath"
 	"sync"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -44,6 +45,10 @@ func (s *Server) targetThrottle(ctx context.Context, repo string) *pbsstore.Thro
 	if t, ok := s.backupBW.throttles[repo]; ok {
 		return t
 	}
+	// A path: compare canonical forms, so another spelling of the same
+	// directory (a trailing slash, "//", "..", a symlink) cannot dodge the
+	// limit.
+	want := canonicalRepoPath(repo)
 	for name, t := range s.backupBW.throttles {
 		p, ok := s.backupRepos[name]
 		if !ok && s.db != nil {
@@ -51,11 +56,21 @@ func (s *Server) targetThrottle(ctx context.Context, repo string) *pbsstore.Thro
 				p, ok = dp, true
 			}
 		}
-		if ok && p == repo {
+		if ok && canonicalRepoPath(p) == want {
 			return t
 		}
 	}
 	return nil
+}
+
+// canonicalRepoPath is p cleaned and with symlinks resolved (just cleaned
+// when it cannot be resolved).
+func canonicalRepoPath(p string) string {
+	c := filepath.Clean(p)
+	if r, err := filepath.EvalSymlinks(c); err == nil {
+		return r
+	}
+	return c
 }
 
 // targetRate is the target's limit in bytes/s (0 = none).

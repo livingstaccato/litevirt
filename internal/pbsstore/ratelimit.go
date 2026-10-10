@@ -36,11 +36,21 @@ type Throttle struct {
 	sleep func(context.Context, time.Duration) error
 }
 
+// MinRate is the lowest bandwidth limit: 64 KiB/s. Below it one 4 MiB
+// chunk would reserve over a minute and a typo (--bwlimit 1) days; a lower
+// limit is refused where it is parsed and raised to this where it arrives
+// over the wire.
+const MinRate = 64 << 10
+
 // NewThrottle returns a Throttle of bytesPerSec, or nil (no limit) for a
-// non-positive rate. A nil *Throttle is a valid no-op RateLimiter.
+// non-positive rate. A positive rate below MinRate is raised to it. A nil
+// *Throttle is a valid no-op RateLimiter.
 func NewThrottle(bytesPerSec int64) *Throttle {
 	if bytesPerSec <= 0 {
 		return nil
+	}
+	if bytesPerSec < MinRate {
+		bytesPerSec = MinRate
 	}
 	return &Throttle{rate: float64(bytesPerSec), now: time.Now, sleep: sleepCtx}
 }
@@ -67,7 +77,31 @@ func (t *Throttle) WaitN(ctx context.Context, n int) error {
 	t.next = t.next.Add(cost)
 	wake := t.next
 	t.mu.Unlock()
-	return t.sleep(ctx, wake.Sub(now))
+	if err := t.sleep(ctx, wake.Sub(now)); err != nil {
+		t.refund(wake, cost)
+		return err
+	}
+	return nil
+}
+
+// refund gives back the part of a cancelled reservation [wake-cost, wake]
+// that has not elapsed, so a cancelled job does not hold up the jobs that
+// share the throttle (reservations after it move earlier by as much).
+func (t *Throttle) refund(wake time.Time, cost time.Duration) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	now := t.now()
+	unused := wake.Sub(now)
+	if unused > cost {
+		unused = cost
+	}
+	if unused <= 0 {
+		return
+	}
+	t.next = t.next.Add(-unused)
+	if t.next.Before(now) {
+		t.next = now
+	}
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) error {
@@ -175,6 +209,9 @@ func parseBytes(s string, rate bool) (int64, error) {
 	}
 	if n > 0 && n > (1<<63-1)/mult {
 		return 0, fmt.Errorf("%q overflows", orig)
+	}
+	if rate && n*mult > 0 && n*mult < MinRate {
+		return 0, fmt.Errorf("bandwidth limit %q is below the minimum of 64KiB/s (use 0 for no limit)", orig)
 	}
 	return n * mult, nil
 }

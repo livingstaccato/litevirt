@@ -1,6 +1,6 @@
 //go:build !linux
 
-package filerestore
+package agent
 
 // IsAgent is always false off Linux: a restore VM boots a Linux kernel.
 func IsAgent() bool { return false }

@@ -6,13 +6,13 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"strconv"
 	"text/tabwriter"
 	"time"
 
 	"github.com/spf13/cobra"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/filerestore/wire"
 	"github.com/litevirt/litevirt/internal/pbsstore"
 )
 
@@ -53,17 +53,9 @@ func (b *backupFileTarget) resolve() (name, disk string, err error) {
 	}
 }
 
-// printable escapes control characters in a name from a backup, which is
-// guest data: it must not drive the terminal.
-func printable(s string) string {
-	for _, r := range s {
-		if r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0) {
-			q := strconv.Quote(s)
-			return q[1 : len(q)-1]
-		}
-	}
-	return s
-}
+// printable escapes a name from a backup, which is guest data: control,
+// C1 and bidi characters must not drive or spoof the terminal.
+func printable(s string) string { return wire.Escape(s) }
 
 func newBackupFileLsCmd() *cobra.Command {
 	var t backupFileTarget

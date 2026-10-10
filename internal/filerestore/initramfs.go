@@ -1,3 +1,5 @@
+//go:build linux
+
 package filerestore
 
 import (
@@ -12,8 +14,11 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"syscall"
 
 	"github.com/klauspost/compress/zstd"
+	"golang.org/x/sys/unix"
 )
 
 // The restore VM boots the host's own kernel with an initramfs built here:
@@ -233,64 +238,198 @@ type InitramfsSpec struct {
 	ModulesDir string // /lib/modules/<release>
 }
 
-// initramfsKey identifies a built initramfs: the agent binary (size, mtime,
-// a hash of its first MiB), the modules dir and its modules.dep.
-func initramfsKey(spec InitramfsSpec) (string, error) {
-	h := sha256.New()
-	st, err := os.Stat(spec.Agent)
+// fileStamp identifies one version of a file without reading it.
+type fileStamp struct {
+	path               string
+	dev, ino           uint64
+	size, mtime, ctime int64
+}
+
+var (
+	hashMu   sync.Mutex
+	hashMemo = map[fileStamp]string{}
+)
+
+// fileHash is the sha256 of a file's whole content, remembered per version
+// of the file, so the 70+ MB agent binary is hashed once, not per session.
+func fileHash(path string) (string, error) {
+	f, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
-	fmt.Fprintf(h, "v1|%s|%d|%d|%s|", spec.Agent, st.Size(), st.ModTime().UnixNano(), spec.ModulesDir)
-	if f, err := os.Open(spec.Agent); err == nil {
-		_, _ = io.CopyN(h, f, 1<<20)
-		f.Close()
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return "", err
 	}
-	if b, err := os.ReadFile(filepath.Join(spec.ModulesDir, "modules.dep")); err == nil {
-		h.Write(b)
+	stamp := fileStamp{path: path, size: st.Size(), mtime: st.ModTime().UnixNano()}
+	if sys, ok := st.Sys().(*syscall.Stat_t); ok {
+		stamp.dev, stamp.ino = uint64(sys.Dev), uint64(sys.Ino)
+		stamp.ctime = sys.Ctim.Nano()
+	}
+	hashMu.Lock()
+	h, ok := hashMemo[stamp]
+	hashMu.Unlock()
+	if ok {
+		return h, nil
+	}
+	sum := sha256.New()
+	if _, err := io.Copy(sum, f); err != nil {
+		return "", err
+	}
+	h = hex.EncodeToString(sum.Sum(nil))
+	hashMu.Lock()
+	hashMemo[stamp] = h
+	hashMu.Unlock()
+	return h, nil
+}
+
+// initramfsKey identifies a built initramfs by everything that goes into
+// it: the whole agent binary, every module file packed, modules.dep, and the
+// module list.
+func initramfsKey(spec InitramfsSpec) (string, error) {
+	h := sha256.New()
+	ah, err := fileHash(spec.Agent)
+	if err != nil {
+		return "", err
+	}
+	fmt.Fprintf(h, "v2|agent=%s|", ah)
+	if dh, err := fileHash(filepath.Join(spec.ModulesDir, "modules.dep")); err == nil {
+		fmt.Fprintf(h, "dep=%s|", dh)
+	}
+	if ms, err := loadModuleSet(spec.ModulesDir); err == nil {
+		if order, err := ms.resolve(agentModules, nil); err == nil {
+			for _, rel := range order {
+				mh, err := fileHash(filepath.Join(ms.dir, rel))
+				if err != nil {
+					return "", err
+				}
+				fmt.Fprintf(h, "%s=%s|", rel, mh)
+			}
+		}
 	}
 	m := append([]string(nil), agentModules...)
 	sort.Strings(m)
 	fmt.Fprintf(h, "|%s", strings.Join(m, ","))
-	return hex.EncodeToString(h.Sum(nil))[:24], nil
+	return hex.EncodeToString(h.Sum(nil))[:32], nil
+}
+
+// cachedFileOK reports whether a cache file can be reused as it is: a
+// regular file, one link, owned by owner (or, for owner -1, by this
+// process) with mode 0400 — exactly what writeCacheFile leaves. Anything
+// else is rebuilt.
+func cachedFileOK(path string, owner int) bool {
+	var st unix.Stat_t
+	if err := unix.Lstat(path, &st); err != nil {
+		return false
+	}
+	want := owner
+	if want < 0 {
+		want = os.Geteuid()
+	}
+	return st.Mode&unix.S_IFMT == unix.S_IFREG && st.Nlink == 1 && int(st.Uid) == want && st.Mode&0o7777 == 0o400 && st.Size > 0
+}
+
+// prepareCacheDir makes the cache directory: the daemon's, traversable (so
+// a qemu running as another user can open the files it is given by name)
+// but not listable.
+func prepareCacheDir(dir string) error {
+	if err := os.MkdirAll(dir, 0o711); err != nil {
+		return err
+	}
+	return os.Chmod(dir, 0o711)
+}
+
+// writeCacheFile writes dst atomically with fill, mode 0400, owned by owner
+// (-1: this process), so only that user (and root) can read it.
+func writeCacheFile(dir, dst string, owner int, fill func(io.Writer) error) error {
+	tmp, err := os.CreateTemp(dir, ".tmp-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if err := fill(tmp); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(0o400); err != nil {
+		tmp.Close()
+		return err
+	}
+	if owner >= 0 {
+		if err := tmp.Chown(owner, -1); err != nil {
+			tmp.Close()
+			return err
+		}
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), dst)
 }
 
 // EnsureInitramfs returns the path of an initramfs for spec under cacheDir,
-// building it if it is not there yet. The file is the daemon's own (0600)
-// and written atomically.
-func EnsureInitramfs(cacheDir string, spec InitramfsSpec) (string, error) {
+// building it if it is not there yet or is not exactly as built. owner is
+// the uid qemu runs as (-1: the daemon's own); the file is mode 0400 and
+// owned by it.
+func EnsureInitramfs(cacheDir string, spec InitramfsSpec, owner int) (string, error) {
 	key, err := initramfsKey(spec)
 	if err != nil {
 		return "", fmt.Errorf("restore VM agent binary: %w", err)
 	}
 	dst := filepath.Join(cacheDir, "initramfs-"+key+".cpio")
-	if st, err := os.Stat(dst); err == nil && st.Mode().IsRegular() {
+	if cachedFileOK(dst, owner) {
 		return dst, nil
 	}
-	if err := os.MkdirAll(cacheDir, 0o700); err != nil {
+	if err := prepareCacheDir(cacheDir); err != nil {
 		return "", err
 	}
-	tmp, err := os.CreateTemp(cacheDir, ".initramfs-*.tmp")
-	if err != nil {
-		return "", err
-	}
-	defer os.Remove(tmp.Name())
-	if err := writeInitramfs(tmp, spec); err != nil {
-		tmp.Close()
-		return "", err
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return "", err
-	}
-	if err := tmp.Close(); err != nil {
-		return "", err
-	}
-	if err := os.Rename(tmp.Name(), dst); err != nil {
+	_ = os.Remove(dst)
+	if err := writeCacheFile(cacheDir, dst, owner, func(w io.Writer) error { return writeInitramfs(w, spec) }); err != nil {
 		return "", err
 	}
 	// Drop older builds.
 	if old, _ := filepath.Glob(filepath.Join(cacheDir, "initramfs-*.cpio")); len(old) > 0 {
+		for _, o := range old {
+			if o != dst {
+				_ = os.Remove(o)
+			}
+		}
+	}
+	return dst, nil
+}
+
+// ensureKernelCopy returns a copy of kernel that owner can read: the host's
+// own image is usually root-only (0600), and qemu runs as owner.
+func ensureKernelCopy(cacheDir, kernel string, owner int) (string, error) {
+	h, err := fileHash(kernel)
+	if err != nil {
+		return "", err
+	}
+	dst := filepath.Join(cacheDir, "kernel-"+h[:32])
+	if cachedFileOK(dst, owner) {
+		return dst, nil
+	}
+	if err := prepareCacheDir(cacheDir); err != nil {
+		return "", err
+	}
+	_ = os.Remove(dst)
+	if err := writeCacheFile(cacheDir, dst, owner, func(w io.Writer) error {
+		f, err := os.Open(kernel)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		_, err = io.Copy(w, f)
+		return err
+	}); err != nil {
+		return "", err
+	}
+	if old, _ := filepath.Glob(filepath.Join(cacheDir, "kernel-*")); len(old) > 0 {
 		for _, o := range old {
 			if o != dst {
 				_ = os.Remove(o)

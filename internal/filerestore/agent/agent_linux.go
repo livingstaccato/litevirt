@@ -1,6 +1,6 @@
 //go:build linux
 
-package filerestore
+package agent
 
 import (
 	"errors"
@@ -10,18 +10,22 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/litevirt/litevirt/internal/filerestore/wire"
 )
 
 // IsAgent reports whether this process is the restore agent: PID 1 of a
 // restore VM, started by a kernel command line carrying the agent marker
 // (the kernel hands unknown name=value parameters to init as environment).
 func IsAgent() bool {
-	return os.Getpid() == 1 && os.Getenv(envAgent) == "1"
+	return os.Getpid() == 1 && os.Getenv(wire.EnvAgent) == "1"
 }
 
 // RunAgent is the restore VM's init. It never returns: whatever happens, the
@@ -40,7 +44,36 @@ func RunAgent() {
 	}
 }
 
+// defaultIdle is the agent's idle timeout when the command line names none.
+const defaultIdle = 10 * time.Minute
+
+// idleTimeout is how long the agent waits for a request before powering the
+// VM off on its own (wire.EnvIdle). It is the backstop for a host that went
+// away without killing its VM: a daemon that died, or restarted.
+func idleTimeout() time.Duration {
+	if n, err := strconv.Atoi(os.Getenv(wire.EnvIdle)); err == nil && n > 0 {
+		return time.Duration(n) * time.Second
+	}
+	return defaultIdle
+}
+
+// watchdog powers the VM off once last (unix nanoseconds) is older than idle.
+func watchdog(last *atomic.Int64, idle time.Duration) {
+	for {
+		time.Sleep(time.Second)
+		if time.Since(time.Unix(0, last.Load())) > idle {
+			log.Printf("no request for %v: powering off", idle)
+			unix.Sync()
+			_ = unix.Reboot(unix.LINUX_REBOOT_CMD_POWER_OFF)
+		}
+	}
+}
+
 func runAgent() error {
+	var last atomic.Int64
+	last.Store(time.Now().UnixNano())
+	go watchdog(&last, idleTimeout())
+
 	for _, m := range []struct{ src, dst, fs string }{
 		{"proc", "/proc", "proc"},
 		{"sysfs", "/sys", "sysfs"},
@@ -64,9 +97,9 @@ func runAgent() error {
 		f.Close()
 	}
 
-	vols := map[string]volume{}
-	switch os.Getenv(envKind) {
-	case KindArchive:
+	vols := map[string]Volume{}
+	switch os.Getenv(wire.EnvKind) {
+	case wire.KindArchive:
 		f, err := os.Open(dev)
 		if err != nil {
 			return err
@@ -96,7 +129,9 @@ func runAgent() error {
 	sort.Strings(names)
 	log.Printf("ready: volumes %v", names)
 
-	return serveVsock(&agentServer{vols: vols})
+	srv := NewServer(vols, os.Getenv(wire.EnvNonce))
+	srv.touch = func() { last.Store(time.Now().UnixNano()) }
+	return serveVsock(srv)
 }
 
 // loadModules loads every module the initramfs lists, in order. A module
@@ -158,7 +193,7 @@ func blockCandidates(disk string) []string {
 // mountReadOnly mounts /dev/<name> read-only on /mnt/<name>, trying the
 // filesystems the agent knows. Journal replay is off: the disk is read-only
 // and a backup is never modified.
-func mountReadOnly(name string) (volume, error) {
+func mountReadOnly(name string) (Volume, error) {
 	dst := filepath.Join("/mnt", name)
 	if err := os.MkdirAll(dst, 0o755); err != nil {
 		return nil, err
@@ -181,14 +216,14 @@ func mountReadOnly(name string) (volume, error) {
 	return nil, fmt.Errorf("no supported filesystem (%s)", strings.Join(errs, "; "))
 }
 
-// serveVsock listens on AgentPort and serves one host connection at a time
+// serveVsock listens on wire.AgentPort and serves one host connection at a time
 // until the host asks for shutdown.
-func serveVsock(a *agentServer) error {
+func serveVsock(a *Server) error {
 	fd, err := unix.Socket(unix.AF_VSOCK, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
 	if err != nil {
 		return fmt.Errorf("vsock socket: %w", err)
 	}
-	if err := unix.Bind(fd, &unix.SockaddrVM{CID: unix.VMADDR_CID_ANY, Port: AgentPort}); err != nil {
+	if err := unix.Bind(fd, &unix.SockaddrVM{CID: unix.VMADDR_CID_ANY, Port: wire.AgentPort}); err != nil {
 		return fmt.Errorf("vsock bind: %w", err)
 	}
 	if err := unix.Listen(fd, 1); err != nil {
@@ -203,7 +238,7 @@ func serveVsock(a *agentServer) error {
 			return fmt.Errorf("vsock accept: %w", err)
 		}
 		conn := os.NewFile(uintptr(nfd), "vsock")
-		shutdown, err := a.serveConn(conn)
+		shutdown, err := a.ServeConn(conn)
 		conn.Close()
 		if err != nil {
 			log.Printf("connection: %v", err)

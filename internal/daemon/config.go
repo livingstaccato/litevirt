@@ -1206,6 +1206,12 @@ type FileRestoreConfig struct {
 	IdleTimeoutSec int `yaml:"idle_timeout_sec,omitempty"`
 	// MaxSessions caps restore VMs running at once on this host (default 2).
 	MaxSessions int `yaml:"max_sessions,omitempty"`
+	// MaxExtractions caps extractions running at once on this host
+	// (default 1); each also takes a session.
+	MaxExtractions int `yaml:"max_extractions,omitempty"`
+	// AllowUnsandboxed permits a restore VM when this host's qemu has no
+	// seccomp sandbox. Default false: file restore is then refused.
+	AllowUnsandboxed bool `yaml:"allow_unsandboxed,omitempty"`
 	// MaxExtractBytes caps one extraction ("16G" default).
 	MaxExtractBytes string `yaml:"max_extract_bytes,omitempty"`
 }
@@ -1223,8 +1229,8 @@ func (f FileRestoreConfig) validate() error {
 	if f.MemoryMiB != 0 && f.MemoryMiB < 256 {
 		return fmt.Errorf("config file_restore.memory_mib %d: the restore VM needs at least 256", f.MemoryMiB)
 	}
-	if f.IdleTimeoutSec < 0 || f.MaxSessions < 0 {
-		return fmt.Errorf("config file_restore: idle_timeout_sec and max_sessions cannot be negative")
+	if f.IdleTimeoutSec < 0 || f.MaxSessions < 0 || f.MaxExtractions < 0 {
+		return fmt.Errorf("config file_restore: idle_timeout_sec, max_sessions and max_extractions cannot be negative")
 	}
 	if _, err := pbsstore.ParseSize(f.MaxExtractBytes); err != nil {
 		return fmt.Errorf("config file_restore.max_extract_bytes: %w", err)

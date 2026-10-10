@@ -609,7 +609,7 @@ backup_repos:
   offsite: /mnt/dr/offsite
 
 # Backup bandwidth limits, per repo (by logical name), per second: "100MiB",
-# "512K" or a byte count. One limit is shared by every backup job THIS host
+# "512K" or a byte count; at least 64KiB (0 = none). One limit is shared by every backup job THIS host
 # runs into the repo (a scheduled fan-out moves at the repo's rate in total),
 # and covers the disk read and, for a remote backup, the chunks sent to the
 # repo's host. When this host is the repo's sink for a remote backup, it hands
@@ -628,10 +628,12 @@ file_restore:
   modules_dir: ""            # default /lib/modules/<running release>
   qemu: ""                   # default qemu-system-x86_64 / -aarch64 on PATH, or /usr/libexec/qemu-kvm
   memory_mib: 512            # the restore VM's memory (at least 256)
-  run_as: ""                 # user qemu drops to; default libvirt-qemu, qemu or nobody
+  run_as: ""                 # user qemu is started as (a root daemon); default libvirt-qemu, qemu or nobody
   idle_timeout_sec: 300      # a browsing session's VM is killed after this long unused
-  max_sessions: 2            # restore VMs at once on this host
+  max_sessions: 2            # restore VMs at once on this host (browsing and extracting)
+  max_extractions: 1         # extractions at once on this host; each runs on a VM of its own
   max_extract_bytes: 16G     # per extraction; a request can only lower it
+  allow_unsandboxed: false   # true lets a restore VM run when this qemu has no seccomp sandbox
 
 # Billing-event webhook. Empty disables (the default — events
 # are dropped). When set, `internal/billing` POSTs JSON

@@ -8,8 +8,9 @@ func TestPrintable_EscapesControlCharacters(t *testing.T) {
 	for in, want := range map[string]string{
 		"hosts":              "hosts",
 		"résumé.txt":         "résumé.txt",
-		"evil\x1b]0;pwn\x07": `evil\x1b]0;pwn\a`,
-		"two\nlines":         `two\nlines`,
+		"evil\x1b]0;pwn\x07": `evil\x1b]0;pwn\x07`,
+		"two\nlines":         `two\x0alines`,
+		"bidi\u202egnp.exe":  `bidi\u202egnp.exe`,
 		"c1\u009bcsi":        `c1\u009bcsi`,
 	} {
 		if got := printable(in); got != want {

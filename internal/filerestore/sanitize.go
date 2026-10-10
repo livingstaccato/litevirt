@@ -2,6 +2,8 @@ package filerestore
 
 import (
 	"archive/tar"
+	"bufio"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -9,6 +11,10 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"golang.org/x/text/unicode/norm"
+
+	"github.com/litevirt/litevirt/internal/filerestore/wire"
 )
 
 // Host-side handling of what the restore VM returns. The agent runs on the
@@ -24,7 +30,7 @@ func SanitizeVolumes(in []Volume) []Volume {
 		if len(out) >= MaxVolumes {
 			break
 		}
-		if !ValidName(v.Name) || !utf8.ValidString(v.Name) || seen[v.Name] {
+		if !wire.ValidName(v.Name) || !utf8.ValidString(v.Name) || seen[v.Name] {
 			continue
 		}
 		seen[v.Name] = true
@@ -48,7 +54,7 @@ func SanitizeEntries(in []Entry) (out []Entry, skipped int) {
 			skipped += len(in) - MaxListEntries
 			break
 		}
-		if !ValidName(e.Name) || !utf8.ValidString(e.Name) || seen[e.Name] {
+		if !wire.ValidName(e.Name) || !utf8.ValidString(e.Name) || seen[e.Name] {
 			skipped++
 			continue
 		}
@@ -72,11 +78,11 @@ func SanitizeEntries(in []Entry) (out []Entry, skipped int) {
 
 // TarLimits bound one extraction.
 type TarLimits struct {
-	MaxBytes   int64 // total file bytes
+	MaxBytes   int64 // total file bytes written to the archive
 	MaxEntries int   // entries written
 }
 
-// TarStats reports what SanitizeTar wrote and left out.
+// TarStats reports what SanitizeStream wrote and left out.
 type TarStats struct {
 	Entries   int
 	Bytes     int64
@@ -84,31 +90,54 @@ type TarStats struct {
 	Truncated bool
 }
 
-// ErrLimit means the extraction hit a TarLimits bound; the archive written
-// so far is complete and valid, but not everything selected is in it.
+// ErrLimit means the extraction hit a bound; the archive written so far is
+// complete and valid, but not everything selected is in it.
 var ErrLimit = errors.New("extraction limit reached")
 
-// maxTarHeaders bounds the headers read (written or skipped), so a stream
-// of refused entries cannot spin forever. (A var for tests.)
-var maxTarHeaders = 4 * DefaultMaxEntries
+// maxRecords bounds the records read (written or refused), so a stream of
+// refused entries cannot spin forever. (A var for tests.)
+var maxRecords = 4 * DefaultMaxEntries
 
-// SanitizeTar reads the agent's tar stream from src and writes a fresh
-// archive to dst holding only what is safe to hand a caller:
+// maxTracked bounds the names one extraction remembers (to refuse
+// duplicates and entries under a symlink). Each costs a fixed 16-byte key,
+// so the memory an extraction can make the host hold is bounded no matter
+// how long the names are. (A var for tests.)
+var maxTracked = DefaultMaxEntries
+
+// nameKey is the fixed-size key a name is remembered by: a hash of its
+// case-folded NFC form, so names that a case-insensitive or normalizing
+// filesystem (macOS, Windows) would extract to one path collide here too.
+type nameKey [16]byte
+
+func keyOf(name string) nameKey {
+	sum := sha256.Sum256([]byte(norm.NFC.String(strings.ToLower(name))))
+	var k nameKey
+	copy(k[:], sum[:16])
+	return k
+}
+
+// SanitizeStream reads the agent's record stream from src (wire.Record
+// lines and file bytes) and writes a fresh tar archive to dst holding only
+// what is safe to hand a caller:
 //
 //   - names: relative, clean, no "..", every component a valid name, UTF-8,
 //     bounded, and inside one of the selected paths (selections are
 //     "<volume>/<path>", as the agent names entries);
-//   - types: directories, regular files and symlinks only (no hard links,
-//     devices, fifos);
-//   - no entry under a symlink this archive already holds, and no name
-//     twice — so extracting the archive cannot write through a link;
-//   - headers rebuilt from scratch: permission bits only (no setuid,
-//     setgid or sticky), no owner, no xattrs or PAX records from the guest;
-//   - bounded total bytes and entries (ErrLimit; the archive is still
-//     closed and valid).
+//   - types: directories, regular files and symlinks only;
+//   - no entry under a symlink this archive already holds, and no name twice
+//     — compared case-folded and NFC-normalized, so extracting the archive
+//     on a case-insensitive filesystem cannot write through a link either;
+//   - headers built from scratch: permission bits only (no setuid, setgid or
+//     sticky), no owner, no xattrs;
+//   - bounded: total file bytes and entries (ErrLimit, the archive still
+//     closed and valid), records read, names remembered, and each record
+//     line. A size is compared without overflow, and the bytes counted are
+//     the bytes written.
 //
-// It never resolves, opens or creates a path.
-func SanitizeTar(dst io.Writer, src io.Reader, selections []string, lim TarLimits) (TarStats, error) {
+// The stream is not tar: no PAX records, sparse maps or long-name
+// extensions reach a parser here. It never resolves, opens or creates a
+// path.
+func SanitizeStream(dst io.Writer, src *bufio.Reader, selections []string, lim TarLimits) (TarStats, error) {
 	var st TarStats
 	if lim.MaxBytes <= 0 {
 		lim.MaxBytes = DefaultMaxBytes
@@ -116,67 +145,98 @@ func SanitizeTar(dst io.Writer, src io.Reader, selections []string, lim TarLimit
 	if lim.MaxEntries <= 0 {
 		lim.MaxEntries = DefaultMaxEntries
 	}
-	tr := tar.NewReader(src)
-	tw := tar.NewWriter(dst)
-	seen := map[string]bool{}
-	symlinks := map[string]bool{}
-	headers := 0
+	cw := &countingWriter{w: dst}
+	tw := tar.NewWriter(cw)
+	seen := map[nameKey]struct{}{}
+	symlinks := map[nameKey]struct{}{}
+	records := 0
+	var discarded int64 // bytes of refused entries read and dropped
 	var limitErr error
 	for {
-		h, err := tr.Next()
-		if errors.Is(err, io.EOF) {
-			break
-		}
+		rec, err := wire.ReadRecord(src)
 		if err != nil {
 			_ = tw.Close()
-			return st, fmt.Errorf("restore VM sent a malformed archive: %w", err)
+			return st, fmt.Errorf("restore VM stream: %w", err)
 		}
-		if headers++; headers > maxTarHeaders {
+		if rec.End {
+			break
+		}
+		if records++; records > maxRecords {
 			_ = tw.Close()
-			return st, fmt.Errorf("restore VM sent more than %d archive headers", maxTarHeaders)
+			return st, fmt.Errorf("restore VM sent more than %d records", maxRecords)
 		}
-		name, ok := cleanTarName(h.Name)
-		if !ok || !underSelection(name, selections) || seen[name] || underSymlink(name, symlinks) {
+		size := int64(0)
+		if rec.Type == TypeFile {
+			size = rec.Size
+		}
+		if size < 0 {
+			_ = tw.Close()
+			return st, fmt.Errorf("restore VM sent a negative size for %q", wire.Escape(rec.Name))
+		}
+		name, ok := cleanTarName(rec.Name)
+		key := keyOf(name)
+		refuse := !ok || !underSelection(name, selections)
+		if !refuse {
+			_, dup := seen[key]
+			refuse = dup || underSymlink(name, symlinks)
+		}
+		if !refuse {
+			switch rec.Type {
+			case TypeDir, TypeFile:
+			case TypeSymlink:
+				refuse = rec.Link == "" || len(rec.Link) > MaxPathLen || !utf8.ValidString(rec.Link) || strings.ContainsRune(rec.Link, 0)
+			default:
+				refuse = true
+			}
+		}
+		if refuse {
 			st.Skipped++
+			// Refused bytes are bounded by the same cap as written ones.
+			if size > lim.MaxBytes-discarded {
+				_ = tw.Close()
+				return st, fmt.Errorf("restore VM sent more refused data than the %d-byte extraction limit", lim.MaxBytes)
+			}
+			discarded += size
+			if err := discard(src, size); err != nil {
+				_ = tw.Close()
+				return st, err
+			}
 			continue
 		}
-		out := &tar.Header{Name: name, Mode: h.Mode & 0o777, ModTime: clampTime(h.ModTime), Format: tar.FormatPAX}
-		switch h.Typeflag {
-		case tar.TypeDir:
-			out.Typeflag, out.Name = tar.TypeDir, name+"/"
-		case tar.TypeReg, tar.TypeRegA:
-			if h.Size < 0 {
-				st.Skipped++
-				continue
-			}
-			out.Typeflag, out.Size = tar.TypeReg, h.Size
-		case tar.TypeSymlink:
-			if h.Linkname == "" || len(h.Linkname) > MaxPathLen || !utf8.ValidString(h.Linkname) || strings.ContainsRune(h.Linkname, 0) {
-				st.Skipped++
-				continue
-			}
-			out.Typeflag, out.Linkname = tar.TypeSymlink, h.Linkname
-		default:
-			st.Skipped++
-			continue
-		}
-		if st.Entries >= lim.MaxEntries || st.Bytes+out.Size > lim.MaxBytes {
+		// Overflow-safe: size against what is left, never st.Bytes+size.
+		if st.Entries >= lim.MaxEntries || size > lim.MaxBytes-st.Bytes {
 			st.Truncated = true
 			limitErr = ErrLimit
 			break
 		}
-		if err := tw.WriteHeader(out); err != nil {
+		if len(seen) >= maxTracked {
+			st.Truncated = true
+			limitErr = fmt.Errorf("%w: more than %d entries to track", ErrLimit, maxTracked)
+			break
+		}
+		h := &tar.Header{Name: name, Mode: int64(rec.Mode & 0o777), ModTime: clampTime(rec.MTime), Format: tar.FormatPAX}
+		switch rec.Type {
+		case TypeDir:
+			h.Typeflag, h.Name = tar.TypeDir, name+"/"
+		case TypeFile:
+			h.Typeflag, h.Size = tar.TypeReg, size
+		case TypeSymlink:
+			h.Typeflag, h.Linkname = tar.TypeSymlink, rec.Link
+		}
+		if err := tw.WriteHeader(h); err != nil {
 			return st, err
 		}
-		seen[name] = true
-		if out.Typeflag == tar.TypeSymlink {
-			symlinks[name] = true
+		seen[key] = struct{}{}
+		if rec.Type == TypeSymlink {
+			symlinks[key] = struct{}{}
 		}
-		if out.Size > 0 {
-			n, err := io.CopyN(tw, tr, out.Size)
-			st.Bytes += n
+		if size > 0 {
+			before := cw.n
+			_, err := io.CopyN(tw, src, size)
+			// What was written, not what was claimed.
+			st.Bytes += cw.n - before
 			if err != nil {
-				return st, fmt.Errorf("restore VM archive ended inside %s: %w", name, err)
+				return st, fmt.Errorf("restore VM stream ended inside %s: %w", wire.Escape(name), err)
 			}
 		}
 		st.Entries++
@@ -187,9 +247,31 @@ func SanitizeTar(dst io.Writer, src io.Reader, selections []string, lim TarLimit
 	return st, limitErr
 }
 
-// cleanTarName validates an archive entry name: relative, already clean,
-// no "..", valid components, UTF-8, bounded. A directory's trailing slash
-// is dropped.
+// countingWriter counts the bytes written through it.
+type countingWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	c.n += int64(n)
+	return n, err
+}
+
+// discard skips a refused file's bytes.
+func discard(r io.Reader, n int64) error {
+	if n <= 0 {
+		return nil
+	}
+	if _, err := io.CopyN(io.Discard, r, n); err != nil {
+		return fmt.Errorf("restore VM stream ended inside a refused entry: %w", err)
+	}
+	return nil
+}
+
+// cleanTarName validates an entry name: relative, already clean, no "..",
+// valid components, UTF-8, bounded.
 func cleanTarName(n string) (string, bool) {
 	n = strings.TrimSuffix(n, "/")
 	if n == "" || len(n) > MaxPathLen || strings.HasPrefix(n, "/") || !utf8.ValidString(n) {
@@ -199,7 +281,7 @@ func cleanTarName(n string) (string, bool) {
 		return "", false
 	}
 	for _, c := range strings.Split(n, "/") {
-		if !ValidName(c) {
+		if !wire.ValidName(c) {
 			return "", false
 		}
 	}
@@ -216,15 +298,17 @@ func underSelection(name string, selections []string) bool {
 	return false
 }
 
-// underSymlink reports whether any proper ancestor of name is a symlink the
-// archive already holds.
-func underSymlink(name string, symlinks map[string]bool) bool {
+// underSymlink reports whether any proper ancestor of name is (case-folded)
+// a symlink the archive already holds.
+func underSymlink(name string, symlinks map[nameKey]struct{}) bool {
 	if len(symlinks) == 0 {
 		return false
 	}
 	for i := 0; i < len(name); i++ {
-		if name[i] == '/' && symlinks[name[:i]] {
-			return true
+		if name[i] == '/' {
+			if _, ok := symlinks[keyOf(name[:i])]; ok {
+				return true
+			}
 		}
 	}
 	return false
@@ -250,9 +334,9 @@ func SelectionNames(paths []string) ([]string, error) {
 	return out, nil
 }
 
-func clampTime(t time.Time) time.Time {
-	if t.Before(time.Unix(0, 0)) || t.After(time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC)) {
+func clampTime(unix int64) time.Time {
+	if unix < 0 || unix > 253402300799 { // 9999-12-31
 		return time.Unix(0, 0)
 	}
-	return t
+	return time.Unix(unix, 0)
 }

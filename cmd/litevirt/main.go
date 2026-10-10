@@ -7,7 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/litevirt/litevirt/internal/filerestore"
+	"github.com/litevirt/litevirt/internal/filerestore/agent"
 	"github.com/litevirt/litevirt/internal/obs"
 )
 
@@ -19,8 +19,8 @@ var (
 func main() {
 	// Inside a restore VM this binary is /init, the file-restore agent
 	// (internal/filerestore). Nothing else of the CLI applies there.
-	if filerestore.IsAgent() {
-		filerestore.RunAgent()
+	if agent.IsAgent() {
+		agent.RunAgent()
 		return
 	}
 	bootstrapDefaultLogger()

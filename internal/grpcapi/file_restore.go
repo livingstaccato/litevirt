@@ -59,7 +59,8 @@ func (a launcherAdapter) Open(ctx context.Context, dev filerestore.BlockDevice, 
 type FileRestoreOptions struct {
 	Launcher        *filerestore.Launcher
 	IdleTimeout     time.Duration // a browsing session's restore VM is killed after this long unused
-	MaxSessions     int           // restore VMs at once on this host
+	MaxSessions     int           // restore VMs at once on this host (browsing and extracting)
+	MaxExtractions  int           // extractions at once on this host
 	MaxExtractBytes int64         // per extraction
 }
 
@@ -80,6 +81,9 @@ func (s *Server) setFileRestorer(fr fileRestorer, o FileRestoreOptions) {
 	if o.MaxSessions <= 0 {
 		o.MaxSessions = 2
 	}
+	if o.MaxExtractions <= 0 {
+		o.MaxExtractions = 1
+	}
 	if o.MaxExtractBytes <= 0 {
 		o.MaxExtractBytes = filerestore.DefaultMaxBytes
 	}
@@ -94,23 +98,37 @@ func (s *Server) setFileRestorer(fr fileRestorer, o FileRestoreOptions) {
 
 type frKey struct{ repo, name, disk, ts string }
 
+// frEntry is a cached browsing session. ready is closed once the boot ends;
+// conn is nil if it failed (err says why).
 type frEntry struct {
-	conn fileRestoreConn
-	last time.Time
-	busy int
+	ready chan struct{}
+	conn  fileRestoreConn
+	err   error
+	last  time.Time
+	busy  int
 }
 
-// fileRestoreSessions caches browsing sessions: listing a directory, then
-// its subdirectories, reuses one restore VM instead of booting one per call.
-// An idle session is killed after IdleTimeout; an extraction's session is
-// killed when it completes.
+// fileRestoreSessions holds the restore VMs of this host:
+//   - browsing sessions, cached per backup, so listing a directory and then
+//     its subdirectories boots once; killed after IdleTimeout unused;
+//   - extractions, each on a fresh VM of its own that is killed when it
+//     completes (never a cached one: another caller may be browsing it).
+//
+// Slots (MaxSessions in all, MaxExtractions of them extracting) are reserved
+// before a boot and released if it fails; no lock is held while a VM boots.
 type fileRestoreSessions struct {
-	mu     sync.Mutex
-	openMu sync.Mutex // one boot at a time
-	fr     fileRestorer
-	opts   FileRestoreOptions
-	m      map[frKey]*frEntry
-	reaper bool
+	mu         sync.Mutex
+	fr         fileRestorer
+	opts       FileRestoreOptions
+	m          map[frKey]*frEntry
+	booting    int // slots reserved by boots in progress (browse)
+	extracting int // extraction sessions running or booting
+	reaper     bool
+}
+
+// used is the number of restore VM slots taken. Caller holds mu.
+func (fs *fileRestoreSessions) used() int {
+	return len(fs.m) + fs.booting + fs.extracting
 }
 
 // fileRestoreTarget is a resolved, authorized backup to read files from.
@@ -223,79 +241,154 @@ func (s *Server) fileRestorePreflight() (fileRestorer, FileRestoreOptions, error
 	return fr, opts, nil
 }
 
-// acquireFileRestore returns a session for t, booting a restore VM when
-// there is none. release must be called; closeNow kills the VM at once.
-func (s *Server) acquireFileRestore(ctx context.Context, t *fileRestoreTarget) (fileRestoreConn, func(closeNow bool), error) {
+func (s *Server) slotsExhausted(n int, opts FileRestoreOptions) error {
+	return status.Errorf(codes.ResourceExhausted,
+		"%d file restore sessions are already open on this host; retry when one ends (idle sessions close after %v)", n, opts.IdleTimeout)
+}
+
+func (s *Server) openRestoreVM(ctx context.Context, fr fileRestorer, t *fileRestoreTarget) (fileRestoreConn, error) {
+	reader, err := pbsstore.NewManifestReader(t.repo, t.manifest)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "read backup: %v", err)
+	}
+	conn, err := fr.Open(ctx, reader, t.kind, t.format)
+	if err != nil {
+		if errors.Is(err, filerestore.ErrUnavailable) {
+			return nil, status.Errorf(codes.FailedPrecondition, "%v; a full restore still works", err)
+		}
+		return nil, status.Errorf(codes.Internal, "start restore VM: %v", err)
+	}
+	return conn, nil
+}
+
+// acquireBrowse returns the browsing session for t, booting a restore VM
+// when there is none. Concurrent callers for the same backup wait for one
+// boot. release must be called.
+func (s *Server) acquireBrowse(ctx context.Context, t *fileRestoreTarget) (fileRestoreConn, func(), error) {
 	fr, opts, err := s.fileRestorePreflight()
 	if err != nil {
 		return nil, nil, err
 	}
 	fs := &s.fileRestore
-	get := func() *frEntry {
+	for {
 		fs.mu.Lock()
-		defer fs.mu.Unlock()
-		if e := fs.m[t.key]; e != nil && !e.conn.Broken() {
-			e.busy++
-			return e
-		}
-		return nil
-	}
-	e := get()
-	if e == nil {
-		fs.openMu.Lock()
-		if e = get(); e == nil {
-			fs.mu.Lock()
-			n := len(fs.m)
-			fs.mu.Unlock()
-			if n >= opts.MaxSessions {
-				fs.openMu.Unlock()
-				return nil, nil, status.Errorf(codes.ResourceExhausted,
-					"%d file restore sessions are already open on this host; retry when one ends (idle sessions close after %v)", n, opts.IdleTimeout)
-			}
-			reader, rerr := pbsstore.NewManifestReader(t.repo, t.manifest)
-			if rerr != nil {
-				fs.openMu.Unlock()
-				return nil, nil, status.Errorf(codes.Internal, "read backup: %v", rerr)
-			}
-			conn, oerr := fr.Open(ctx, reader, t.kind, t.format)
-			if oerr != nil {
-				fs.openMu.Unlock()
-				if errors.Is(oerr, filerestore.ErrUnavailable) {
-					return nil, nil, status.Errorf(codes.FailedPrecondition, "%v; a full restore still works", oerr)
+		e := fs.m[t.key]
+		if e != nil {
+			select {
+			case <-e.ready:
+				if e.conn != nil && !e.conn.Broken() {
+					e.busy++
+					fs.mu.Unlock()
+					return e.conn, s.releaseBrowse(t.key, e), nil
 				}
-				return nil, nil, status.Errorf(codes.Internal, "start restore VM: %v", oerr)
+				// A failed or broken session: drop it and boot afresh.
+				delete(fs.m, t.key)
+				if e.conn != nil && e.busy == 0 {
+					go e.conn.Close()
+				}
+				fs.mu.Unlock()
+				continue
+			default:
+				fs.mu.Unlock()
+				select {
+				case <-e.ready:
+					continue
+				case <-ctx.Done():
+					return nil, nil, ctx.Err()
+				}
 			}
-			e = &frEntry{conn: conn, last: time.Now(), busy: 1}
-			fs.mu.Lock()
-			if old := fs.m[t.key]; old != nil && old.busy == 0 {
-				old.conn.Close()
-			}
-			fs.m[t.key] = e
-			if !fs.reaper {
-				fs.reaper = true
-				go s.reapFileRestore()
-			}
-			fs.mu.Unlock()
 		}
-		fs.openMu.Unlock()
-	}
-	release := func(closeNow bool) {
-		fs.mu.Lock()
-		e.busy--
-		e.last = time.Now()
-		drop := (closeNow || e.conn.Broken()) && e.busy == 0
-		if drop && fs.m[t.key] == e {
-			delete(fs.m, t.key)
+		if n := fs.used(); n >= opts.MaxSessions {
+			fs.mu.Unlock()
+			return nil, nil, s.slotsExhausted(n, opts)
+		}
+		e = &frEntry{ready: make(chan struct{}), busy: 1}
+		fs.m[t.key] = e
+		if !fs.reaper {
+			fs.reaper = true
+			go s.reapFileRestore()
 		}
 		fs.mu.Unlock()
-		if drop {
-			e.conn.Close()
+
+		conn, oerr := s.openRestoreVM(ctx, fr, t)
+		fs.mu.Lock()
+		e.conn, e.err, e.last = conn, oerr, time.Now()
+		if oerr != nil {
+			if fs.m[t.key] == e {
+				delete(fs.m, t.key)
+			}
 		}
+		close(e.ready)
+		fs.mu.Unlock()
+		if oerr != nil {
+			return nil, nil, oerr
+		}
+		return conn, s.releaseBrowse(t.key, e), nil
 	}
-	return e.conn, release, nil
 }
 
-// reapFileRestore kills restore VMs idle longer than the idle timeout.
+func (s *Server) releaseBrowse(key frKey, e *frEntry) func() {
+	fs := &s.fileRestore
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			fs.mu.Lock()
+			e.busy--
+			e.last = time.Now()
+			drop := e.conn.Broken() && e.busy == 0
+			if drop && fs.m[key] == e {
+				delete(fs.m, key)
+			}
+			fs.mu.Unlock()
+			if drop {
+				e.conn.Close()
+			}
+		})
+	}
+}
+
+// acquireExtraction boots a restore VM of its own for one extraction. The
+// returned release kills it.
+func (s *Server) acquireExtraction(ctx context.Context, t *fileRestoreTarget) (fileRestoreConn, func(), error) {
+	fr, opts, err := s.fileRestorePreflight()
+	if err != nil {
+		return nil, nil, err
+	}
+	fs := &s.fileRestore
+	fs.mu.Lock()
+	if fs.extracting >= opts.MaxExtractions {
+		n := fs.extracting
+		fs.mu.Unlock()
+		return nil, nil, status.Errorf(codes.ResourceExhausted,
+			"%d file restore extractions are already running on this host (file_restore.max_extractions); retry when one ends", n)
+	}
+	if n := fs.used(); n >= opts.MaxSessions {
+		fs.mu.Unlock()
+		return nil, nil, s.slotsExhausted(n, opts)
+	}
+	fs.extracting++
+	fs.mu.Unlock()
+	free := func() {
+		fs.mu.Lock()
+		fs.extracting--
+		fs.mu.Unlock()
+	}
+	conn, err := s.openRestoreVM(ctx, fr, t)
+	if err != nil {
+		free()
+		return nil, nil, err
+	}
+	var once sync.Once
+	return conn, func() {
+		once.Do(func() {
+			conn.Close()
+			free()
+		})
+	}, nil
+}
+
+// reapFileRestore kills browsing restore VMs idle longer than the idle
+// timeout.
 func (s *Server) reapFileRestore() {
 	fs := &s.fileRestore
 	for {
@@ -319,7 +412,12 @@ func (s *Server) reapFileRestoreOnce(now time.Time) {
 	var dead []fileRestoreConn
 	fs.mu.Lock()
 	for k, e := range fs.m {
-		if e.busy == 0 && (e.conn.Broken() || now.Sub(e.last) > fs.opts.IdleTimeout) {
+		select {
+		case <-e.ready:
+		default:
+			continue // still booting
+		}
+		if e.conn != nil && e.busy == 0 && (e.conn.Broken() || now.Sub(e.last) > fs.opts.IdleTimeout) {
 			dead = append(dead, e.conn)
 			delete(fs.m, k)
 		}
@@ -340,11 +438,11 @@ func (s *Server) ListBackupFiles(ctx context.Context, req *pb.ListBackupFilesReq
 	if err != nil {
 		return nil, err
 	}
-	conn, release, err := s.acquireFileRestore(ctx, t)
+	conn, release, err := s.acquireBrowse(ctx, t)
 	if err != nil {
 		return nil, err
 	}
-	defer release(false)
+	defer release()
 	entries, truncated, skipped, err := conn.List(p)
 	if err != nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "list %s: %v", p, err)
@@ -396,7 +494,7 @@ func (w *chunkWriter) flush() error {
 
 // RestoreBackupFiles streams a tar archive of the selected paths out of a
 // backup. The archive is rebuilt by the host from the restore VM's output
-// (filerestore.SanitizeTar) and goes only to the caller.
+// (filerestore.SanitizeStream) and goes only to the caller.
 func (s *Server) RestoreBackupFiles(req *pb.RestoreBackupFilesRequest, stream grpc.ServerStreamingServer[pb.RestoreBackupFilesChunk]) (retErr error) {
 	ctx := stream.Context()
 	if _, err := filerestore.SelectionNames(req.Paths); err != nil {
@@ -425,19 +523,28 @@ func (s *Server) RestoreBackupFiles(req *pb.RestoreBackupFilesRequest, stream gr
 	if req.MaxBytes > 0 && req.MaxBytes < lim.MaxBytes {
 		lim.MaxBytes = req.MaxBytes
 	}
-	conn, release, err := s.acquireFileRestore(ctx, t)
+	conn, release, err := s.acquireExtraction(ctx, t)
 	if err != nil {
 		return err
 	}
-	// An extraction ends its session: the VM is killed on completion — and
-	// at once if the caller goes away, which also ends a read the agent is
-	// stalling.
-	defer release(true)
-	stop := context.AfterFunc(ctx, conn.Close)
+	// An extraction runs on a VM of its own, killed on completion — and at
+	// once if the caller goes away or the extraction outlives its wall
+	// clock, which also ends a read the agent is stalling.
+	defer release()
+	wall := extractWallClock(lim.MaxBytes)
+	if extractWallClockOverride > 0 {
+		wall = extractWallClockOverride
+	}
+	ectx, cancel := context.WithTimeout(ctx, wall)
+	defer cancel()
+	stop := context.AfterFunc(ectx, conn.Close)
 	defer stop()
 	w := &chunkWriter{send: stream.Send, buf: make([]byte, 0, restoreFilesFrame)}
 	st, err = conn.Tar(w, req.Paths, lim)
 	if err != nil && !errors.Is(err, filerestore.ErrLimit) {
+		if errors.Is(ectx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
+			return status.Errorf(codes.DeadlineExceeded, "extract: stopped after %v (the extraction's wall-clock limit); select less", wall)
+		}
 		return status.Errorf(codes.FailedPrecondition, "extract: %v", err)
 	}
 	if ferr := w.flush(); ferr != nil {
@@ -456,6 +563,20 @@ func (s *Server) RestoreBackupFiles(req *pb.RestoreBackupFilesRequest, stream gr
 		Truncated: st.Truncated, Status: msg,
 	})
 }
+
+// extractWallClock bounds one extraction's total time: ten minutes, or the
+// byte limit at 1 MiB/s if that is longer. The progress deadline alone
+// would let an agent trickling a byte a minute hold a slot forever.
+func extractWallClock(maxBytes int64) time.Duration {
+	d := time.Duration(maxBytes/(1<<20)) * time.Second
+	if d < 10*time.Minute {
+		d = 10 * time.Minute
+	}
+	return d
+}
+
+// extractWallClockOverride, when set, replaces extractWallClock (tests).
+var extractWallClockOverride time.Duration
 
 func fileRestoreAuditDetail(req *pb.RestoreBackupFilesRequest, project string, st *filerestore.TarStats) string {
 	paths := strings.Join(req.Paths, ",")

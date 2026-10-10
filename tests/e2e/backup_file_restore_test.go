@@ -58,6 +58,17 @@ func TestLab_BackupFileRestore(t *testing.T) {
 	if strings.Contains(ps, "-netdev") {
 		t.Errorf("the restore VM has a network device:\n%s", ps)
 	}
+	// I-5: qemu runs as the unprivileged qemu user, with a seccomp filter.
+	pid := strings.Fields(strings.TrimSpace(ps))[0]
+	who := strings.TrimSpace(l.mustSSH(host, 30*time.Second, "ps -o user= -p "+pid))
+	sec := l.mustSSH(host, 30*time.Second, "grep -E '^Seccomp:' /proc/"+pid+"/status")
+	l.saveEvidence("bkfr-qemu-user", who+"\n"+sec)
+	if who == "root" || who == "" {
+		t.Errorf("the restore VM's qemu runs as %q, want the unprivileged qemu user", who)
+	}
+	if !strings.Contains(sec, "2") {
+		t.Errorf("the restore VM's qemu has no seccomp filter: %s", sec)
+	}
 
 	archive := "/var/tmp/e2e-bkfr-" + vm + ".tar"
 	l.onRestore(func() { _, _ = l.ssh(host, time.Minute, "rm -f "+shellQuote(archive)) })
@@ -101,5 +112,38 @@ func TestLab_BackupFileRestore(t *testing.T) {
 	rows := l.mustSQL(host, `SELECT result, detail FROM audit_log WHERE action = 'backup.file_restore' ORDER BY seq DESC LIMIT 1`)
 	if len(rows) == 0 || rows[0][0] != "ok" || !strings.Contains(rows[0][1], "/"+vol+"/etc") {
 		t.Fatalf("audit row for the extraction: %v", rows)
+	}
+}
+
+// I-4: a daemon restart in the middle of a browsing session leaves no restore
+// VM behind: it dies with the old daemon, and the new one sweeps leftovers.
+func TestLab_BackupFileRestore_DaemonRestartKillsTheVM(t *testing.T) {
+	l := newLab(t)
+	host := labUpHosts(l, 1)[0]
+	vm := l.createVMs(host, "bkfrr", host)[host]
+	repo := bkRepo(l, host, "e2e-bkfrr")
+	ts, _, _ := bkSnapshot(l, host, vm, repo)
+	if out, err := l.lv(host, "backup", "file-ls", "--repo", repo, "--vm", vm, "--timestamp", ts); err != nil {
+		t.Fatalf("file-ls: %v\n%s", err, out)
+	}
+	if ps := l.mustSSH(host, 30*time.Second, "pgrep -af '[l]itevirt-file-restore' || true"); strings.TrimSpace(ps) == "" {
+		t.Fatal("no browsing session's restore VM is running")
+	}
+	if err := l.restartDaemon(host); err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+	if err := l.waitDaemon(host, 2*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		ps := l.mustSSH(host, 30*time.Second, "pgrep -af '[l]itevirt-file-restore' || true")
+		if strings.TrimSpace(ps) == "" {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("a restore VM survived the daemon restart:\n%s", ps)
+		}
+		time.Sleep(2 * time.Second)
 	}
 }

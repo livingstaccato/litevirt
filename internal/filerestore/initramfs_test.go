@@ -1,3 +1,5 @@
+//go:build linux
+
 package filerestore
 
 import (
@@ -108,12 +110,12 @@ func fakeAgent(t *testing.T, content string) string {
 func TestInitramfs_Contents(t *testing.T) {
 	mods := fakeModules(t)
 	agent := fakeAgent(t, "#!agent binary bytes, 33 bytes long")
-	path, err := EnsureInitramfs(t.TempDir(), InitramfsSpec{Agent: agent, ModulesDir: mods})
+	path, err := EnsureInitramfs(t.TempDir(), InitramfsSpec{Agent: agent, ModulesDir: mods}, -1)
 	if err != nil {
 		t.Fatalf("EnsureInitramfs: %v", err)
 	}
-	if st, _ := os.Stat(path); st.Mode().Perm() != 0o600 {
-		t.Errorf("initramfs mode %v, want 0600", st.Mode().Perm())
+	if st, _ := os.Stat(path); st.Mode().Perm() != 0o400 {
+		t.Errorf("initramfs mode %v, want 0400", st.Mode().Perm())
 	}
 	b, _ := os.ReadFile(path)
 	ents := parseCPIO(t, b)
@@ -180,7 +182,7 @@ func TestInitramfs_RequiredModuleMissing(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(mods, "modules.dep"), []byte(strings.Join(keep, "\n")), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	_, err := EnsureInitramfs(t.TempDir(), InitramfsSpec{Agent: fakeAgent(t, "a"), ModulesDir: mods})
+	_, err := EnsureInitramfs(t.TempDir(), InitramfsSpec{Agent: fakeAgent(t, "a"), ModulesDir: mods}, -1)
 	if err == nil || !strings.Contains(err.Error(), "vmw_vsock_virtio_transport") {
 		t.Fatalf("want an error naming the missing vsock transport, got %v", err)
 	}
@@ -191,12 +193,12 @@ func TestInitramfs_Cache(t *testing.T) {
 	mods := fakeModules(t)
 	cache := t.TempDir()
 	agent := fakeAgent(t, "v1")
-	p1, err := EnsureInitramfs(cache, InitramfsSpec{Agent: agent, ModulesDir: mods})
+	p1, err := EnsureInitramfs(cache, InitramfsSpec{Agent: agent, ModulesDir: mods}, -1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	st1, _ := os.Stat(p1)
-	p2, err := EnsureInitramfs(cache, InitramfsSpec{Agent: agent, ModulesDir: mods})
+	p2, err := EnsureInitramfs(cache, InitramfsSpec{Agent: agent, ModulesDir: mods}, -1)
 	if err != nil || p2 != p1 {
 		t.Fatalf("second build: %q %v (want the cached %q)", p2, err, p1)
 	}
@@ -207,7 +209,7 @@ func TestInitramfs_Cache(t *testing.T) {
 	if err := os.WriteFile(agent, []byte("v2 — an upgraded binary"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	p3, err := EnsureInitramfs(cache, InitramfsSpec{Agent: agent, ModulesDir: mods})
+	p3, err := EnsureInitramfs(cache, InitramfsSpec{Agent: agent, ModulesDir: mods}, -1)
 	if err != nil || p3 == p1 {
 		t.Fatalf("a changed binary reused %q (%v)", p3, err)
 	}

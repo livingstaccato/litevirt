@@ -7,12 +7,16 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/litevirt/litevirt/internal/filerestore/wire"
 )
 
 // ErrUnavailable wraps every reason a restore VM cannot be started on this
-// host (no KVM, no kernel, no qemu, no vhost-vsock). File restore is then
-// refused with that reason; a full restore is unaffected.
+// host (no KVM, no kernel, no qemu, no vhost-vsock, no seccomp sandbox).
+// File restore is then refused with that reason; a full restore is
+// unaffected.
 var ErrUnavailable = errors.New("file restore unavailable on this host")
 
 // BlockDevice is what a session exposes to the restore VM as its disk.
@@ -33,14 +37,26 @@ type Config struct {
 	// MemoryMiB is the restore VM's memory (0 = 512). The initramfs holds
 	// the litevirt binary, so this cannot go much lower.
 	MemoryMiB int
-	// RunAs is the user qemu drops to once its files are open ("" = the
-	// first of libvirt-qemu, qemu, nobody that exists).
+	// RunAs is the user qemu runs as when the daemon is root ("" = the
+	// first of libvirt-qemu, qemu, nobody that exists). qemu is started as
+	// that user; it never switches users itself.
 	RunAs string
-	// StateDir holds the cached initramfs and each session's sockets and
-	// serial log (the daemon's <data_dir>/file-restore).
-	StateDir string
+	// CacheDir holds the cached initramfs and kernel copy (the daemon's
+	// <data_dir>/file-restore/cache: trusted, host-built files).
+	CacheDir string
+	// RunDir holds each session's NBD socket and pidfile — outside
+	// data_dir (/run/litevirt/file-restore for a root daemon). Nothing the
+	// guest writes lands in it.
+	RunDir string
 	// BootTimeout bounds boot until the agent answers (0 = 60s).
 	BootTimeout time.Duration
+	// AgentIdle is how long the agent in the VM waits for a request before
+	// it powers off on its own (0 = 10 minutes): the backstop when the
+	// daemon that started it is gone.
+	AgentIdle time.Duration
+	// AllowUnsandboxed lets a restore VM run when this qemu has no seccomp
+	// sandbox. Off by default: without it, file restore is refused.
+	AllowUnsandboxed bool
 	// Agent is the binary run as the agent ("" = this running binary).
 	Agent string
 }
@@ -59,6 +75,13 @@ func (c Config) bootTimeout() time.Duration {
 	return c.BootTimeout
 }
 
+func (c Config) agentIdle() time.Duration {
+	if c.AgentIdle <= 0 {
+		return 10 * time.Minute
+	}
+	return c.AgentIdle
+}
+
 // VMSpec is one restore VM.
 type VMSpec struct {
 	QEMU, Kernel, Initrd string
@@ -70,23 +93,29 @@ type VMSpec struct {
 	DiskFormat string
 	Kind       string
 	CID        uint32
-	SerialLog  string
-	Arch       string // GOARCH
-	// RunAs / RunWith: the user qemu drops to, and whether this qemu
-	// spells it -run-with (9.1+) rather than -runas.
-	RunAs   string
-	RunWith bool
+	// VhostFD is the inherited fd of /dev/vhost-vsock (opened by the
+	// daemon), so qemu needs no access to the device node.
+	VhostFD int
+	Arch    string // GOARCH
+	// Nonce is echoed by the agent's hello; AgentIdleSec its own timeout.
+	Nonce        string
+	AgentIdleSec int
 	// Sandbox enables qemu's seccomp sandbox.
 	Sandbox bool
 }
 
 // qemuArgs builds the restore VM's command line. The VM has:
-//   - no NIC, no default devices, no display, no reboot;
+//   - no NIC, no default devices, no display, no monitor, no reboot;
+//   - its console on qemu's stdout (into a bounded in-memory buffer), never
+//     a file;
 //   - one disk, read-only at both the NBD client and the format node, and
 //     for qcow2 no backing file (backing: null), so qemu opens nothing the
 //     image header names;
-//   - one vhost-vsock device, its only channel to the host;
-//   - fixed small memory and one vCPU.
+//   - one vhost-vsock device on an inherited fd, its only channel to the
+//     host;
+//   - fixed small memory and one vCPU;
+//   - qemu's seccomp sandbox, including elevateprivileges=deny: qemu never
+//     changes user itself (it is started as its user).
 func qemuArgs(s VMSpec) ([]string, error) {
 	if s.DiskFormat != "raw" && s.DiskFormat != "qcow2" {
 		return nil, fmt.Errorf("disk format %q", s.DiskFormat)
@@ -96,6 +125,12 @@ func qemuArgs(s VMSpec) ([]string, error) {
 	}
 	if s.CID < 3 {
 		return nil, fmt.Errorf("vsock cid %d", s.CID)
+	}
+	if s.VhostFD < 3 {
+		return nil, fmt.Errorf("vhost fd %d", s.VhostFD)
+	}
+	if s.Nonce == "" || strings.ContainsAny(s.Nonce, " \t\n\"") {
+		return nil, fmt.Errorf("nonce %q", s.Nonce)
 	}
 	machine, console := "q35,accel=kvm", "ttyS0"
 	if s.Arch == "arm64" {
@@ -119,9 +154,13 @@ func qemuArgs(s VMSpec) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	idle := s.AgentIdleSec
+	if idle <= 0 {
+		idle = 600
+	}
 	args := []string{
 		"-name", "litevirt-file-restore",
-		"-nodefaults", "-no-user-config", "-nographic", "-no-reboot",
+		"-nodefaults", "-no-user-config", "-display", "none", "-no-reboot",
 		"-machine", machine,
 		"-cpu", "host",
 		"-smp", "1",
@@ -130,70 +169,68 @@ func qemuArgs(s VMSpec) ([]string, error) {
 		"-initrd", s.Initrd,
 		"-append", strings.Join([]string{
 			"console=" + console, "panic=-1", "loglevel=4", "rdinit=/init",
-			envAgent + "=1", envKind + "=" + s.Kind,
+			wire.EnvAgent + "=1", wire.EnvKind + "=" + s.Kind,
+			wire.EnvNonce + "=" + s.Nonce, wire.EnvIdle + "=" + strconv.Itoa(idle),
 		}, " "),
-		"-serial", "file:" + s.SerialLog,
+		"-serial", "stdio",
 		"-nic", "none",
 		"-blockdev", string(src),
 		"-blockdev", string(disk),
 		"-device", "virtio-blk-pci,drive=disk",
-		"-device", "vhost-vsock-pci,guest-cid=" + strconv.FormatUint(uint64(s.CID), 10),
+		"-device", "vhost-vsock-pci,guest-cid=" + strconv.FormatUint(uint64(s.CID), 10) + ",vhostfd=" + strconv.Itoa(s.VhostFD),
 	}
 	if s.Sandbox {
 		args = append(args, "-sandbox", "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny")
 	}
-	if s.RunAs != "" {
-		if s.RunWith {
-			args = append(args, "-run-with", "user="+s.RunAs)
-		} else {
-			args = append(args, "-runas", s.RunAs)
-		}
-	}
 	return args, nil
 }
 
-// qemuSupportsRunWith reports whether a `qemu -version` banner is 9.1+.
-func qemuSupportsRunWith(banner string) bool {
-	i := strings.Index(banner, "version ")
-	if i < 0 {
-		return false
-	}
-	f := strings.FieldsFunc(banner[i+len("version "):], func(r rune) bool { return r == '.' || r == ' ' || r == '\n' || r == '(' })
-	if len(f) < 2 {
-		return false
-	}
-	maj, err1 := strconv.Atoi(f[0])
-	mnr, err2 := strconv.Atoi(f[1])
-	if err1 != nil || err2 != nil {
-		return false
-	}
-	return maj > 9 || maj == 9 && mnr >= 1
+// consoleRing keeps the last cap bytes of the restore VM's console, in
+// memory. The guest controls every byte, so nothing of it is written to the
+// host's disk; its tail only ever reaches an error message, escaped.
+type consoleRing struct {
+	mu   sync.Mutex
+	buf  []byte
+	cap  int
+	seen int64
 }
 
-// tailClean returns the last n bytes of r with control characters replaced
-// — a restore VM's console log, for an error message.
-func tailClean(r io.ReadSeeker, n int64) string {
-	end, err := r.Seek(0, io.SeekEnd)
-	if err != nil {
-		return ""
+func newConsoleRing(capacity int) *consoleRing { return &consoleRing{cap: capacity} }
+
+func (r *consoleRing) Write(p []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.seen += int64(len(p))
+	if len(p) >= r.cap {
+		r.buf = append(r.buf[:0], p[len(p)-r.cap:]...)
+		return len(p), nil
 	}
-	start := end - n
-	if start < 0 {
-		start = 0
+	if over := len(r.buf) + len(p) - r.cap; over > 0 {
+		r.buf = append(r.buf[:0], r.buf[over:]...)
 	}
-	if _, err := r.Seek(start, io.SeekStart); err != nil {
-		return ""
+	r.buf = append(r.buf, p...)
+	return len(p), nil
+}
+
+// Tail returns the last n bytes, one line, escaped.
+func (r *consoleRing) Tail(n int) string {
+	r.mu.Lock()
+	b := r.buf
+	if len(b) > n {
+		b = b[len(b)-n:]
 	}
-	b, _ := io.ReadAll(io.LimitReader(r, n))
-	out := make([]rune, 0, len(b))
-	for _, c := range string(b) {
-		switch {
-		case c == '\n':
-			out = append(out, ' ')
-		case c < 0x20 || c == 0x7f:
-		default:
-			out = append(out, c)
-		}
-	}
-	return strings.TrimSpace(string(out))
+	s := strings.ReplaceAll(string(b), "\r", "")
+	r.mu.Unlock()
+	return strings.TrimSpace(wire.Escape(strings.ReplaceAll(s, "\n", " ")))
+}
+
+// stderrSaysNoSeccomp reports a qemu built without seccomp.
+func stderrSaysNoSeccomp(s string) bool {
+	s = strings.ToLower(s)
+	return strings.Contains(s, "seccomp") && (strings.Contains(s, "disabled") || strings.Contains(s, "not supported") || strings.Contains(s, "unsupported"))
+}
+
+// stderrSaysCIDInUse reports a vsock CID another VM holds.
+func stderrSaysCIDInUse(s string) bool {
+	return strings.Contains(s, "guest cid") || strings.Contains(s, "Address already in use")
 }

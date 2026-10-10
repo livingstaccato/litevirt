@@ -1438,16 +1438,31 @@ func (d *Daemon) Run(ctx context.Context) error {
 	} else {
 		slog.Error("backup_bwlimits", "error", err)
 	}
+	// Restore VMs a previous daemon left running (a crash, a restart, an
+	// upgrade) are killed whether or not file restore is still enabled.
+	frRunDir := fileRestoreRunDir(d.cfg.DataDir)
+	if n := filerestore.SweepStale(frRunDir); n > 0 {
+		slog.Warn("file restore: killed restore VMs a previous daemon left running", "count", n)
+	}
 	if fr := d.cfg.FileRestore; fr.On() {
-		stateDir := filepath.Join(d.cfg.DataDir, "file-restore")
-		filerestore.SweepStale(stateDir) // a previous daemon's restore VMs died with it
+		idle := time.Duration(fr.IdleTimeoutSec) * time.Second
+		if idle <= 0 {
+			idle = 5 * time.Minute
+		}
 		svc.SetFileRestore(grpcapi.FileRestoreOptions{
 			Launcher: filerestore.NewLauncher(filerestore.Config{
 				QEMU: fr.QEMU, Kernel: fr.Kernel, ModulesDir: fr.ModulesDir,
-				MemoryMiB: fr.MemoryMiB, RunAs: fr.RunAs, StateDir: stateDir,
+				MemoryMiB: fr.MemoryMiB, RunAs: fr.RunAs,
+				CacheDir: filepath.Join(d.cfg.DataDir, "file-restore", "cache"),
+				RunDir:   frRunDir,
+				// The agent outlives the host's idle timeout by a minute, so
+				// it only ever powers off on its own when the host is gone.
+				AgentIdle:        idle + time.Minute,
+				AllowUnsandboxed: fr.AllowUnsandboxed,
 			}),
-			IdleTimeout:     time.Duration(fr.IdleTimeoutSec) * time.Second,
+			IdleTimeout:     idle,
 			MaxSessions:     fr.MaxSessions,
+			MaxExtractions:  fr.MaxExtractions,
 			MaxExtractBytes: fr.ExtractLimit(),
 		})
 	}
@@ -3058,4 +3073,14 @@ func (d *Daemon) wireLeaseTermLedgerGate() {
 	d.db.SetLeaseTermLedgerGate(func() bool {
 		return d.checker.DurablyLatched(capabilities.LeaseTermLedgerV1)
 	})
+}
+
+// fileRestoreRunDir is where restore VM sessions keep their NBD socket and
+// pidfile: under /run for a root daemon, outside data_dir, so a session never
+// shares a filesystem with state.db.
+func fileRestoreRunDir(dataDir string) string {
+	if os.Geteuid() == 0 {
+		return "/run/litevirt/file-restore"
+	}
+	return filepath.Join(dataDir, "file-restore", "run")
 }

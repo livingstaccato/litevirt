@@ -68,22 +68,43 @@ func TestPushBackup_BandwidthLimits(t *testing.T) {
 func TestForwardRate_LowerOfJobAndTarget(t *testing.T) {
 	s := testServer(t)
 	s.SetBackupRepos(map[string]string{"main": "/srv/main"})
-	s.SetBackupBandwidthLimits(map[string]int64{"main": 100})
+	s.SetBackupBandwidthLimits(map[string]int64{"main": 1 << 20})
 	ctx := context.Background()
 	for _, tc := range []struct {
 		repo string
 		job  int64
 		want int64
 	}{
-		{"main", 0, 100},
-		{"main", 50, 50},
-		{"main", 500, 100},
-		{"/srv/main", 0, 100},
+		{"main", 0, 1 << 20},
+		{"main", 512 << 10, 512 << 10},
+		{"main", 4 << 20, 1 << 20},
+		{"/srv/main", 0, 1 << 20},
 		{"other", 0, 0},
-		{"other", 70, 70},
+		{"other", 700 << 10, 700 << 10},
 	} {
 		if got := s.forwardRate(ctx, tc.repo, tc.job); got != tc.want {
 			t.Errorf("forwardRate(%q, %d) = %d, want %d", tc.repo, tc.job, got, tc.want)
+		}
+	}
+}
+
+// m-8: the repo's limit applies under any spelling of its path.
+func TestTargetThrottle_CanonicalPath(t *testing.T) {
+	s := testServer(t)
+	dir := filepath.Join(t.TempDir(), "repo")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(dir, alias); err != nil {
+		t.Fatal(err)
+	}
+	s.SetBackupRepos(map[string]string{"main": dir})
+	s.SetBackupBandwidthLimits(map[string]int64{"main": 1 << 20})
+	ctx := context.Background()
+	for _, spelling := range []string{dir, dir + "/", filepath.Dir(dir) + "//repo", dir + "/../repo", alias} {
+		if got := s.targetRate(ctx, spelling); got != 1<<20 {
+			t.Errorf("%q: target rate %d, want the repo's limit", spelling, got)
 		}
 	}
 }

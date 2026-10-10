@@ -19,6 +19,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/filerestore"
+	"github.com/litevirt/litevirt/internal/filerestore/filerestoretest"
 	"github.com/litevirt/litevirt/internal/pbsstore"
 	"github.com/litevirt/litevirt/internal/qcow2"
 )
@@ -43,11 +44,11 @@ func (f *fakeRestorer) Open(_ context.Context, dev filerestore.BlockDevice, kind
 	f.opens++
 	f.kind, f.format = kind, format
 	f.mu.Unlock()
-	s, err := filerestore.InProcessSession(dev, kind, f.dir)
+	s, err := filerestoretest.Open(dev, kind, f.dir)
 	if err != nil {
 		return nil, err
 	}
-	return &countingConn{InProcSession: s, f: f}, nil
+	return &countingConn{Session: s, f: f}, nil
 }
 
 func (f *fakeRestorer) counts() (int, int) {
@@ -57,14 +58,14 @@ func (f *fakeRestorer) counts() (int, int) {
 }
 
 type countingConn struct {
-	*filerestore.InProcSession
+	*filerestoretest.Session
 	f    *fakeRestorer
 	once sync.Once
 }
 
 func (c *countingConn) Close() {
 	c.once.Do(func() {
-		c.InProcSession.Close()
+		c.Session.Close()
 		c.f.mu.Lock()
 		c.f.closes++
 		c.f.mu.Unlock()
@@ -181,8 +182,10 @@ func TestFileRestore_ContainerBrowseAndExtract(t *testing.T) {
 	if done == nil || done.Entries != 1 || done.Bytes != 18 {
 		t.Fatalf("done frame %+v", done)
 	}
-	if o, c := fr.counts(); o != 1 || c != 1 {
-		t.Fatalf("after the extraction: %d opens, %d closes; the extraction must end its restore VM", o, c)
+	// m-3: the extraction ran on a restore VM of its own (never the browsing
+	// one another caller may be using), killed on completion.
+	if o, c := fr.counts(); o != 2 || c != 1 {
+		t.Fatalf("after the extraction: %d opens, %d closes; want the browsing VM kept and the extraction's own VM ended", o, c)
 	}
 	a := lastAuditRow(t, s, "backup.file_restore")
 	if !a.found || a.result != "ok" || a.target != "box" || !strings.Contains(a.detail, "paths=/rootfs/root/notes.txt") ||
@@ -506,5 +509,147 @@ func TestFileRestore_CancelKillsTheVM(t *testing.T) {
 	case <-conn.closed:
 	default:
 		t.Fatal("the restore VM was not killed")
+	}
+}
+
+// I-2: extractions per host are capped on their own, below the sessions.
+func TestFileRestore_ExtractionCap(t *testing.T) {
+	s := testServer(t)
+	s.dataDir = t.TempDir()
+	s.SetBackupRepos(map[string]string{"r": ctBackup(t, s, "2026-10-10T01:00:00Z")})
+	conn := &stallConn{closed: make(chan struct{})}
+	s.setFileRestorer(&stallRestorer{conn: conn}, FileRestoreOptions{MaxSessions: 5, MaxExtractions: 1})
+	ctx, cancel := context.WithCancel(adminCtx())
+	defer cancel()
+	go func() {
+		_ = s.RestoreBackupFiles(&pb.RestoreBackupFilesRequest{
+			RepoPath: "r", Name: "box", DiskName: "rootfs", Timestamp: "2026-10-10T01:00:00Z", Paths: []string{"/rootfs"},
+		}, &progressStream[pb.RestoreBackupFilesChunk]{ctx: ctx})
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		s.fileRestore.mu.Lock()
+		n := s.fileRestore.extracting
+		s.fileRestore.mu.Unlock()
+		if n == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the first extraction never started")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// Bounded: an uncapped second extraction would block on the stalled VM.
+	ctx2, cancel2 := context.WithTimeout(adminCtx(), 3*time.Second)
+	defer cancel2()
+	err := s.RestoreBackupFiles(&pb.RestoreBackupFilesRequest{
+		RepoPath: "r", Name: "box", DiskName: "rootfs", Timestamp: "2026-10-10T01:00:00Z", Paths: []string{"/rootfs"},
+	}, &progressStream[pb.RestoreBackupFilesChunk]{ctx: ctx2})
+	if status.Code(err) != codes.ResourceExhausted || !strings.Contains(err.Error(), "max_extractions") {
+		t.Fatalf("a second extraction past max_extractions 1: %v", err)
+	}
+}
+
+// gatedRestorer's first Open blocks until released; later ones go through.
+type gatedRestorer struct {
+	fakeRestorer
+	gate  chan struct{}
+	first sync.Once
+}
+
+func (g *gatedRestorer) Open(ctx context.Context, dev filerestore.BlockDevice, kind, format string) (fileRestoreConn, error) {
+	blocked := false
+	g.first.Do(func() { blocked = true })
+	if blocked {
+		g.mu.Lock()
+		g.opens++
+		g.mu.Unlock()
+		<-g.gate
+		g.mu.Lock()
+		g.opens--
+		g.mu.Unlock()
+	}
+	return g.fakeRestorer.Open(ctx, dev, kind, format)
+}
+
+// m-4: one backup's slow boot does not hold up another backup's session,
+// and concurrent callers for the same backup share one boot.
+func TestFileRestore_BootsDoNotSerialize(t *testing.T) {
+	s := testServer(t)
+	s.dataDir = t.TempDir()
+	repoDir := ctBackup(t, s, "2026-10-10T01:00:00Z")
+	repo, _ := pbsstore.Open(repoDir)
+	m, _ := repo.GetManifest("box", "2026-10-10T01:00:00Z", containerBackupDisk)
+	m2 := *m
+	m2.Timestamp = "2026-10-10T02:00:00Z"
+	_ = repo.PutManifest(&m2)
+	s.SetBackupRepos(map[string]string{"r": repoDir})
+	g := &gatedRestorer{gate: make(chan struct{})}
+	s.setFileRestorer(g, FileRestoreOptions{MaxSessions: 4})
+	list := func(ts string) error {
+		_, err := s.ListBackupFiles(adminCtx(), &pb.ListBackupFilesRequest{RepoPath: "r", Name: "box", DiskName: "rootfs", Timestamp: ts})
+		return err
+	}
+	slow := make(chan error, 2)
+	go func() { slow <- list("2026-10-10T01:00:00Z") }()
+	for i := 0; ; i++ {
+		if o, _ := g.counts(); o == 1 {
+			break
+		}
+		if i > 500 {
+			t.Fatal("the slow boot never started")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// A second caller for the SAME backup waits for that boot, not another.
+	go func() { slow <- list("2026-10-10T01:00:00Z") }()
+	done := make(chan error, 1)
+	go func() { done <- list("2026-10-10T02:00:00Z") }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("another backup's session waited for an unrelated boot")
+	}
+	close(g.gate)
+	for i := 0; i < 2; i++ {
+		if err := <-slow; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if o, _ := g.counts(); o != 2 {
+		t.Fatalf("%d boots for two backups (three callers), want 2", o)
+	}
+}
+
+// m-13: an extraction has a wall clock as well as a progress deadline.
+func TestFileRestore_ExtractionWallClock(t *testing.T) {
+	s := testServer(t)
+	s.dataDir = t.TempDir()
+	s.SetBackupRepos(map[string]string{"r": ctBackup(t, s, "2026-10-10T01:00:00Z")})
+	conn := &stallConn{closed: make(chan struct{})}
+	s.setFileRestorer(&stallRestorer{conn: conn}, FileRestoreOptions{})
+	extractWallClockOverride = 200 * time.Millisecond
+	defer func() { extractWallClockOverride = 0 }()
+	start := time.Now()
+	// The caller's own context is far longer than the wall clock; only the
+	// wall clock can end this in time.
+	ctx, cancel := context.WithTimeout(adminCtx(), 5*time.Second)
+	defer cancel()
+	err := s.RestoreBackupFiles(&pb.RestoreBackupFilesRequest{
+		RepoPath: "r", Name: "box", DiskName: "rootfs", Timestamp: "2026-10-10T01:00:00Z", Paths: []string{"/rootfs"},
+	}, &progressStream[pb.RestoreBackupFilesChunk]{ctx: ctx})
+	if status.Code(err) != codes.DeadlineExceeded || time.Since(start) > 4*time.Second {
+		t.Fatalf("a stalled extraction past its wall clock: %v after %v", err, time.Since(start))
+	}
+	select {
+	case <-conn.closed:
+	default:
+		t.Fatal("the restore VM outlived its extraction's wall clock")
+	}
+	if extractWallClock(16<<30) < 4*time.Hour || extractWallClock(1<<20) != 10*time.Minute {
+		t.Fatalf("wall clock: %v / %v", extractWallClock(16<<30), extractWallClock(1<<20))
 	}
 }

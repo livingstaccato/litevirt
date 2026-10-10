@@ -240,3 +240,47 @@ func TestPush_ChargesLimiterForBytesRead(t *testing.T) {
 		}
 	})
 }
+
+// m-9: a limit below 64 KiB/s is refused where it is parsed and raised to
+// the floor where it arrives over the wire.
+func TestRate_Minimum(t *testing.T) {
+	for _, bad := range []string{"1", "63K", "1000"} {
+		if _, err := ParseRate(bad); err == nil {
+			t.Errorf("ParseRate(%q) accepted a limit below the minimum", bad)
+		}
+	}
+	if n, err := ParseRate("64K"); err != nil || n != MinRate {
+		t.Errorf("64K: %d %v", n, err)
+	}
+	if n, err := ParseRate("0"); err != nil || n != 0 {
+		t.Errorf("0 (no limit): %d %v", n, err)
+	}
+	if NewThrottle(1).Rate() != MinRate {
+		t.Errorf("a 1 B/s throttle was not raised to the minimum")
+	}
+}
+
+// m-9: a cancelled job's unslept reservation is given back, so the jobs
+// sharing its throttle are not held up by it.
+func TestThrottle_RefundOnCancel(t *testing.T) {
+	th, c := newFakeThrottle(1 << 20)
+	cancelled := true
+	var last time.Duration
+	th.sleep = func(ctx context.Context, d time.Duration) error {
+		if cancelled {
+			return context.Canceled
+		}
+		last = d
+		return c.sleep(ctx, d)
+	}
+	if err := th.WaitN(context.Background(), 4<<20); err == nil {
+		t.Fatal("want the cancellation")
+	}
+	cancelled = false
+	if err := th.WaitN(context.Background(), 1<<20); err != nil {
+		t.Fatal(err)
+	}
+	if last > time.Second+time.Millisecond {
+		t.Fatalf("after a cancelled 4 MiB reservation, 1 MiB waited %v; the reservation was not refunded", last)
+	}
+}

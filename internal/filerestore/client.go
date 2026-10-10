@@ -7,6 +7,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/litevirt/litevirt/internal/filerestore/wire"
 )
 
 // Client talks to the agent in a restore VM. One request at a time.
@@ -14,21 +16,42 @@ import (
 type Client struct {
 	mu     sync.Mutex
 	rw     io.ReadWriteCloser
-	c      *lineConn
+	c      *wire.LineConn
 	broken atomic.Bool
-	// opTimeout bounds one list/volumes round trip (not a tar, which is
-	// bounded by its limits and the caller's context).
+	// streaming: while an extraction is read, each read off the connection
+	// first pushes the deadline out (progress, not total time, is bounded).
+	streaming atomic.Bool
+	// opTimeout bounds one round trip, and how long an extraction may go
+	// without progress.
 	opTimeout time.Duration
 }
 
 // ErrClientBroken means an earlier request left the connection out of step
-// (a cut-short archive); the session has to be replaced.
+// (a cut-short extraction); the session has to be replaced.
 var ErrClientBroken = errors.New("restore VM connection is no longer usable")
+
+// ErrWrongVM means the agent did not answer with the session's nonce: the
+// vsock CID reached some other VM.
+var ErrWrongVM = errors.New("the vsock peer is not this session's restore VM")
 
 // NewClient wraps an established connection to the agent.
 func NewClient(rw io.ReadWriteCloser) *Client {
-	return &Client{rw: rw, c: newLineConn(rw), opTimeout: 60 * time.Second}
+	c := &Client{rw: rw, opTimeout: 60 * time.Second}
+	c.c = wire.NewLineConn(touchRW{c})
+	return c
 }
+
+// touchRW is the connection as the line reader sees it.
+type touchRW struct{ c *Client }
+
+func (t touchRW) Read(b []byte) (int, error) {
+	if t.c.streaming.Load() {
+		t.c.setDeadline(t.c.opTimeout)
+	}
+	return t.c.rw.Read(b)
+}
+
+func (t touchRW) Write(b []byte) (int, error) { return t.c.rw.Write(b) }
 
 type deadliner interface{ SetDeadline(time.Time) error }
 
@@ -42,29 +65,46 @@ func (c *Client) setDeadline(d time.Duration) {
 	}
 }
 
-func (c *Client) roundTrip(req Request) (Response, error) {
+func (c *Client) roundTrip(req wire.Request) (wire.Response, error) {
 	if c.broken.Load() {
-		return Response{}, ErrClientBroken
+		return wire.Response{}, ErrClientBroken
 	}
 	c.setDeadline(c.opTimeout)
 	defer c.setDeadline(0)
-	if err := c.c.send(req); err != nil {
+	if err := c.c.Send(req); err != nil {
 		c.broken.Store(true)
-		return Response{}, fmt.Errorf("restore VM: %w", err)
+		return wire.Response{}, fmt.Errorf("restore VM: %w", err)
 	}
-	var resp Response
-	if err := c.c.recv(&resp); err != nil {
+	var resp wire.Response
+	if err := c.c.Recv(&resp); err != nil {
 		c.broken.Store(true)
-		return Response{}, fmt.Errorf("restore VM: %w", err)
+		return wire.Response{}, fmt.Errorf("restore VM: %w", err)
 	}
 	return resp, nil
+}
+
+// Hello checks the agent is the one this session booted: it must answer
+// with nonce, which only the session's kernel command line carries. Until
+// it has, nothing else is sent.
+func (c *Client) Hello(nonce string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	resp, err := c.roundTrip(wire.Request{Op: wire.OpHello})
+	if err != nil {
+		return err
+	}
+	if nonce == "" || resp.Nonce != nonce {
+		c.broken.Store(true)
+		return ErrWrongVM
+	}
+	return nil
 }
 
 // Volumes lists the filesystems the agent mounted.
 func (c *Client) Volumes() ([]Volume, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	resp, err := c.roundTrip(Request{Op: OpVolumes})
+	resp, err := c.roundTrip(wire.Request{Op: wire.OpVolumes})
 	if err != nil {
 		return nil, err
 	}
@@ -82,7 +122,7 @@ func (c *Client) List(p string) (entries []Entry, truncated bool, skipped int, e
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	resp, err := c.roundTrip(Request{Op: OpList, Path: clean})
+	resp, err := c.roundTrip(wire.Request{Op: wire.OpList, Path: clean})
 	if err != nil {
 		return nil, false, 0, err
 	}
@@ -93,8 +133,8 @@ func (c *Client) List(p string) (entries []Entry, truncated bool, skipped int, e
 	return entries, resp.Truncated, skipped, nil
 }
 
-// Tar writes a sanitized archive of paths to dst. Unless it returns nil the
-// client is spent: the agent's archive was not read to its end.
+// Tar writes a sanitized tar archive of paths to dst. Unless it returns nil
+// the client is spent: the agent's stream was not read to its end.
 func (c *Client) Tar(dst io.Writer, paths []string, lim TarLimits) (TarStats, error) {
 	sels, err := SelectionNames(paths)
 	if err != nil {
@@ -109,40 +149,26 @@ func (c *Client) Tar(dst io.Writer, paths []string, lim TarLimits) (TarStats, er
 	if c.broken.Load() {
 		return TarStats{}, ErrClientBroken
 	}
-	if err := c.c.send(Request{Op: OpTar, Paths: clean, MaxBytes: lim.MaxBytes, MaxEntries: lim.MaxEntries}); err != nil {
-		c.broken.Store(true)
-		return TarStats{}, fmt.Errorf("restore VM: %w", err)
+	resp, err := c.roundTrip(wire.Request{Op: wire.OpTar, Paths: clean, MaxBytes: lim.MaxBytes, MaxEntries: lim.MaxEntries})
+	if err != nil {
+		return TarStats{}, err
 	}
-	c.setDeadline(c.opTimeout)
-	var resp Response
-	if err := c.c.recv(&resp); err != nil {
-		c.broken.Store(true)
-		return TarStats{}, fmt.Errorf("restore VM: %w", err)
-	}
-	c.setDeadline(0)
 	if resp.Error != "" {
 		return TarStats{}, errors.New(agentErr(resp.Error))
 	}
-	// The archive may be large, so there is no deadline on the whole of it,
+	// The stream may be large, so there is no deadline on the whole of it,
 	// but a stall is bounded: every read must make progress within
-	// opTimeout, or the agent is taken as hung.
-	st, err := SanitizeTar(dst, &progressReader{r: c.c.r, touch: func() { c.setDeadline(c.opTimeout) }}, sels, lim)
+	// opTimeout, or the agent is taken as hung. (The caller bounds the
+	// whole extraction's wall time.)
+	c.setDeadline(c.opTimeout)
+	c.streaming.Store(true)
+	st, err := SanitizeStream(dst, c.c.R, sels, lim)
+	c.streaming.Store(false)
 	c.setDeadline(0)
 	if err != nil {
 		c.broken.Store(true)
 	}
 	return st, err
-}
-
-// progressReader refreshes the connection deadline before each read.
-type progressReader struct {
-	r     io.Reader
-	touch func()
-}
-
-func (p *progressReader) Read(b []byte) (int, error) {
-	p.touch()
-	return p.r.Read(b)
 }
 
 // Shutdown asks the agent to power the VM off. With a request in flight it
@@ -156,9 +182,9 @@ func (c *Client) Shutdown() error {
 		return ErrClientBroken
 	}
 	c.setDeadline(5 * time.Second)
-	_ = c.c.send(Request{Op: OpShutdown})
-	var resp Response
-	return c.c.recv(&resp)
+	_ = c.c.Send(wire.Request{Op: wire.OpShutdown})
+	var resp wire.Response
+	return c.c.Recv(&resp)
 }
 
 // Broken reports whether the connection is out of step and the session
@@ -168,18 +194,8 @@ func (c *Client) Broken() bool { return c.broken.Load() }
 // Close closes the connection.
 func (c *Client) Close() error { return c.rw.Close() }
 
-// agentErr bounds and de-controls an error string from the agent before it
+// agentErr bounds and escapes an error string from the agent before it
 // reaches a caller.
 func agentErr(s string) string {
-	if len(s) > 512 {
-		s = s[:512]
-	}
-	b := []rune{}
-	for _, r := range s {
-		if r < 0x20 || r == 0x7f {
-			r = '?'
-		}
-		b = append(b, r)
-	}
-	return "restore VM: " + string(b)
+	return "restore VM: " + wire.EscapeBounded(s, 512)
 }

@@ -30,4 +30,4 @@ func (l *Launcher) Open(context.Context, BlockDevice, string, string) (*Session,
 func (s *Session) Close() {}
 
 // SweepStale does nothing off Linux.
-func SweepStale(string) {}
+func SweepStale(string) int { return 0 }

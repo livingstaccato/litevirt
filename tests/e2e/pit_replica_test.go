@@ -3,6 +3,7 @@ package e2e
 import (
 	"encoding/base64"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -41,9 +42,14 @@ import (
 //     made, reported NOT point-in-time and recorded so.
 //  4. Scheduled replication (layer 1): point-in-time, recorded so.
 //
-// The leg-2 and leg-3 tricks touch only this node's backup scratch directory
-// and this test's own pool directory, and are undone in cleanup; a backup on
-// this node during leg 2 or 3 would fail.
+// The leg-2 and leg-3 tricks have two side effects on the node: its backup
+// scratch directory is replaced by a file (any backup or backup session on
+// that node fails meanwhile), and this test's own pool directory is made
+// immutable. So they run only on a node pinned with E2E_PIT_EXCLUSIVE_NODE
+// (the operator asserting nothing else runs there), under a node-side lock
+// (/run/lv-e2e-pit.lock, skipped if held), with a systemd-run watchdog armed
+// first that restores both after 30 minutes even if this test is killed, and
+// every restore is verified and logged.
 //
 //	LITEVIRT_E2E=1 LV_BIN=/usr/local/bin/litevirt E2E_LAB_DIR=~/litevirt-lab \
 //	  go test ./tests/e2e/ -run TestReplicateVolume_RunningVMIsPointInTime -v -timeout 40m
@@ -205,56 +211,86 @@ func TestReplicateVolume_RunningVMIsPointInTime(t *testing.T) {
 	}
 	requirePointInTime("layer 1 (backup session)", target)
 
-	// Leg 2: no session can open, so an external snapshot.
-	l.mustSSH(h, 30*time.Second, fmt.Sprintf("mv %[1]s %[1]s.e2e-held && touch %[1]s", scratch))
-	restoreScratch := func() {
-		l.ssh(h, 30*time.Second, fmt.Sprintf("[ -f %[1]s ] && rm -f %[1]s && mv %[1]s.e2e-held %[1]s", scratch))
+	// Legs 2 and 3 change node-wide state for a few minutes: the backup
+	// scratch directory, and the immutable bit on this test's own pool
+	// directory. They run only on a node the operator pins to this test
+	// (E2E_PIT_EXCLUSIVE_NODE, asserting no other e2e or backup runs there),
+	// under a node-side lock, with a node-side watchdog (systemd-run) that
+	// restores both even if this process is killed; each restore is checked.
+	restore := fmt.Sprintf("[ -f %[1]s ] && rm -f %[1]s && mv %[1]s.e2e-held %[1]s; chattr -i %[2]s; rmdir /run/lv-e2e-pit.lock", scratch, shellQuote(srcDir))
+	unit := "lv-e2e-pit-restore-" + suffix
+	restoreAndVerify := func() {
+		t.Helper()
+		l.ssh(h, 30*time.Second, restore)
+		if out, err := l.ssh(h, 30*time.Second, fmt.Sprintf("test -d %[1]s && ! test -e %[1]s.e2e-held && ! lsattr -d %[2]s | cut -c1-20 | grep -q i && echo restored", scratch, shellQuote(srcDir))); err != nil || !strings.Contains(out, "restored") {
+			t.Errorf("leg 2/3 side effects not restored on %s: %v %s", h, err, out)
+		} else {
+			l.mark("legs 2/3: backup scratch and %s restored", srcDir)
+		}
+		l.ssh(h, 30*time.Second, "systemctl stop "+unit+".timer "+unit+".service 2>/dev/null")
 	}
-	t.Cleanup(restoreScratch)
-	startWriter("l2", "0.25")
-	target, out = replicateVolume("layer 2")
-	writerAlive("layer 2", "l2")
-	stopWriter("l2")
-	if strings.Contains(out, "NOT point-in-time") {
-		t.Errorf("layer 2 made a copy that is not point-in-time:\n%s", out)
-	}
-	if d := lastReplicatedDetail(); !strings.Contains(d, "external snapshot") {
-		t.Errorf("layer 2's copy was not made by an external snapshot: %q", d)
-	}
-	requirePointInTime("layer 2 (external snapshot)", target)
-	if blk := l.mustSSH(h, 30*time.Second, "virsh domblklist "+shellQuote(vm)); !strings.Contains(blk, root) || strings.Contains(blk, ".lv-pit") {
-		t.Errorf("after layer 2 the VM does not run on its disk:\n%s", blk)
-	}
-	inactive := l.mustSSH(h, 30*time.Second, "virsh dumpxml --inactive "+shellQuote(vm))
-	if strings.Contains(inactive, ".lv-pit") || !strings.Contains(inactive, root) {
-		t.Errorf("after layer 2 the persistent definition does not name the disk alone:\n%s", inactive)
-	}
-	if strings.Contains(inactive, "<backingStore type") {
-		t.Errorf("after layer 2 the persistent definition keeps a backing chain:\n%s", inactive)
-	}
-	if job, _ := l.ssh(h, 30*time.Second, "virsh blockjob "+shellQuote(vm)+" "+shellQuote(root)+" --info"); !strings.Contains(job, "No current block job") {
-		t.Errorf("after layer 2 a block job is left on the disk: %s", job)
-	}
-	if l.fileExists(h, overlay) {
-		t.Errorf("after layer 2 the overlay %s is still there", overlay)
-	}
+	forcedLegs := func() {
+		// Leg 2: no session can open, so an external snapshot.
+		l.mustSSH(h, 30*time.Second, fmt.Sprintf("mv %[1]s %[1]s.e2e-held && touch %[1]s", scratch))
+		startWriter("l2", "0.25")
+		target, out = replicateVolume("layer 2")
+		writerAlive("layer 2", "l2")
+		stopWriter("l2")
+		if strings.Contains(out, "NOT point-in-time") {
+			t.Errorf("layer 2 made a copy that is not point-in-time:\n%s", out)
+		}
+		if d := lastReplicatedDetail(); !strings.Contains(d, "external snapshot") {
+			t.Errorf("layer 2's copy was not made by an external snapshot: %q", d)
+		}
+		requirePointInTime("layer 2 (external snapshot)", target)
+		if blk := l.mustSSH(h, 30*time.Second, "virsh domblklist "+shellQuote(vm)); !strings.Contains(blk, root) || strings.Contains(blk, ".lv-pit") {
+			t.Errorf("after layer 2 the VM does not run on its disk:\n%s", blk)
+		}
+		inactive := l.mustSSH(h, 30*time.Second, "virsh dumpxml --inactive "+shellQuote(vm))
+		if strings.Contains(inactive, ".lv-pit") || !strings.Contains(inactive, root) {
+			t.Errorf("after layer 2 the persistent definition does not name the disk alone:\n%s", inactive)
+		}
+		if strings.Contains(inactive, "<backingStore type") {
+			t.Errorf("after layer 2 the persistent definition keeps a backing chain:\n%s", inactive)
+		}
+		if job, _ := l.ssh(h, 30*time.Second, "virsh blockjob "+shellQuote(vm)+" "+shellQuote(root)+" --info"); !strings.Contains(job, "No current block job") {
+			t.Errorf("after layer 2 a block job is left on the disk: %s", job)
+		}
+		if l.fileExists(h, overlay) {
+			t.Errorf("after layer 2 the overlay %s is still there", overlay)
+		}
 
-	// Leg 3: no session and no snapshot, so main's -U copy, marked.
-	l.mustSSH(h, 30*time.Second, "chattr +i "+shellQuote(srcDir))
-	startWriter("l3", "0.25")
-	target, out = replicateVolume("layer 3")
-	writerAlive("layer 3", "l3")
-	stopWriter("l3")
-	l.mustSSH(h, 30*time.Second, "chattr -i "+shellQuote(srcDir))
-	restoreScratch()
-	if !strings.Contains(out, "NOT point-in-time") {
-		t.Errorf("layer 3's copy was not reported NOT point-in-time:\n%s", out)
+		// Leg 3: no session and no snapshot, so main's -U copy, marked.
+		l.mustSSH(h, 30*time.Second, "chattr +i "+shellQuote(srcDir))
+		startWriter("l3", "0.25")
+		target, out = replicateVolume("layer 3")
+		writerAlive("layer 3", "l3")
+		stopWriter("l3")
+		restoreAndVerify()
+		if !strings.Contains(out, "NOT point-in-time") {
+			t.Errorf("layer 3's copy was not reported NOT point-in-time:\n%s", out)
+		}
+		if rec := l.mustSSH(h, 30*time.Second, "grep -o '\"[^\"]*"+filepath.Base(target)+"\"[^}]*}' /var/lib/litevirt/pool-uploads.json || true"); !strings.Contains(rec, "not_point_in_time") {
+			t.Errorf("layer 3's copy is not recorded as not point-in-time: %q", rec)
+		}
+		lo, hi := slots("layer 3 (-U)", target)
+		l.mark("layer 3: LOW=%d HIGH=%d (smeared: %v)", lo, hi, lo != hi && lo != hi+1)
 	}
-	if rec := l.mustSSH(h, 30*time.Second, "grep -o '\"[^\"]*"+filepath.Base(target)+"\"[^}]*}' /var/lib/litevirt/pool-uploads.json || true"); !strings.Contains(rec, "not_point_in_time") {
-		t.Errorf("layer 3's copy is not recorded as not point-in-time: %q", rec)
+	switch {
+	case os.Getenv("E2E_PIT_EXCLUSIVE_NODE") != h:
+		t.Logf("legs 2 and 3 skipped: set E2E_PIT_EXCLUSIVE_NODE=%s to pin them to this node (no other e2e or backup may run there)", h)
+	default:
+		if out, err := l.ssh(h, 20*time.Second, "mkdir /run/lv-e2e-pit.lock"); err != nil {
+			t.Logf("legs 2 and 3 skipped: another run holds /run/lv-e2e-pit.lock on %s: %s", h, out)
+			break
+		}
+		if out, err := l.ssh(h, 30*time.Second, fmt.Sprintf("systemd-run --unit %s --on-active=30m /bin/sh -c %s", unit, shellQuote(restore))); err != nil {
+			l.ssh(h, 20*time.Second, "rmdir /run/lv-e2e-pit.lock")
+			t.Fatalf("arm the restore watchdog on %s: %v %s", h, err, out)
+		}
+		t.Cleanup(restoreAndVerify)
+		forcedLegs()
 	}
-	lo, hi := slots("layer 3 (-U)", target)
-	l.mark("layer 3: LOW=%d HIGH=%d (smeared: %v)", lo, hi, lo != hi && lo != hi+1)
 
 	// Leg 4: scheduled replication of the same VM, every minute.
 	l.mustLV(h, "replication", "schedule", "add", vm, "--cron", "* * * * *", "--target-pool", copiesPool, "--target-host", h, "--keep", "1")

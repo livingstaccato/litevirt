@@ -47,7 +47,7 @@ func (s *Server) CheckPartitionResume(ctx context.Context, recs []health.PauseRe
 	// copy) stays in the majority it must reach but is not asked: on the
 	// cluster's view it may be out of the voter set, and counting its clean
 	// answer could let a minority resume what the majority recovered — the
-	// rule the quorum count applies (corrosion.VotersNotCountedLive).
+	// rule the quorum count applies (corrosion.VoterSetWithUncounted).
 	voters, uncounted, err := corrosion.VoterSetWithUncounted(ctx, s.db)
 	if err != nil {
 		for _, r := range recs {

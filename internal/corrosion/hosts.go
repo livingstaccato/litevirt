@@ -321,37 +321,18 @@ func VoterSet(ctx context.Context, c *Client) (map[string]bool, error) {
 	return DerivedVoterSet(ctx, c)
 }
 
-// VotersNotCountedLive is the subset of the voter set that must not count
-// toward a quorum's LIVE numerator however healthy its probes: derived-set
-// voters this node reads as HostStateUnknown. Such a host may be in
-// maintenance or offline on the cluster's view — out of the voter set there —
-// so counting its probes could hand a minority a majority. It stays in the
-// denominator (VoterSet), which is the fail-closed side. With an adopted voter
+// VoterSetWithUncounted is VoterSet together with the voters that must not
+// count toward a quorum's LIVE numerator however healthy their probes:
+// derived-set voters this node reads as HostStateUnknown. Such a host may be
+// in maintenance or offline on the cluster's view — out of the voter set
+// there — so counting its probes could hand a minority a majority. It stays in
+// the denominator, which is the fail-closed side. With an adopted voter
 // generation the set is the generation's members and nothing is excluded.
-func VotersNotCountedLive(ctx context.Context, c *Client) (map[string]bool, error) {
-	cfg, err := AdoptedVoterConfig(ctx, c)
-	if err != nil {
-		return nil, err
-	}
-	out := map[string]bool{}
-	if cfg.Explicit() {
-		return out, nil
-	}
-	states, err := resolvedHostStates(ctx, c)
-	if err != nil {
-		return nil, err
-	}
-	for name, st := range states {
-		if st == HostStateUnknown {
-			out[name] = true
-		}
-	}
-	return out, nil
-}
-
-// VoterSetWithUncounted is VoterSet and VotersNotCountedLive from ONE read of
-// host state, so a membership row landing between two reads cannot make them
-// disagree (re-review 2, N4).
+//
+// Both come from ONE read of host state, so a membership row landing between
+// two reads cannot make them disagree (re-review 2, N4; re-review 3, R6). It is
+// the only source of the uncounted set: every quorum count takes it from here
+// or from VoterRegions, which calls it.
 func VoterSetWithUncounted(ctx context.Context, c *Client) (voters, uncounted map[string]bool, err error) {
 	cfg, err := AdoptedVoterConfig(ctx, c)
 	if err != nil {

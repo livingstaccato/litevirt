@@ -415,7 +415,7 @@ func unlatchedMembershipWrites(stmts []Statement) []unlatchedMembershipWrite {
 		if sh.Kind == KindInsert {
 			w.insert = true
 		}
-		if isReadmitStatement(s.SQL) {
+		if isReadmit(s) {
 			w.insert, w.revive = true, true
 		}
 		if lwwOrder(w.ts, ts) < 0 {
@@ -514,7 +514,7 @@ const (
 func absorbUnlatchedMembershipWrite(ctx context.Context, tx *sql.Tx, stmts []Statement, mayInsert, frozen bool) error {
 	for _, w := range unlatchedMembershipWrites(stmts) {
 		insert := mayInsert && (!frozen || w.insert || (w.hasState && w.hasIso))
-		if err := absorbMembershipWrite(ctx, tx, w, w.ts, insert); err != nil {
+		if err := absorbMembershipWrite(ctx, tx, w, w.ts, insert, frozen); err != nil {
 			return fmt.Errorf("absorb hosts-only membership write for %s: %w", w.host, err)
 		}
 	}
@@ -524,7 +524,18 @@ func absorbUnlatchedMembershipWrite(ctx context.Context, tx *sql.Tx, stmts []Sta
 // absorbMembershipWrite writes one absorbed write, LWW-gated on updatedAt. It
 // takes updatedAt from its caller because an absorbed row carries the WRITE's
 // own updated_at, never a fresh clock: every node must compute the same row.
-func absorbMembershipWrite(ctx context.Context, tx *sql.Tx, w unlatchedMembershipWrite, updatedAt string, mayInsert bool) error {
+//
+// One exception (re-review 3, R5): a re-admission that must CREATE the row on
+// a retired node (frozen) — the node lacks the host's tombstoned row. Its
+// isolation can only come from the frozen hosts copy, which may be behind the
+// epoch the nodes holding the tombstone revive with at the re-admission's own
+// timestamp, and an equal timestamp with a different epoch is a tie no rule
+// resolves. So the created row takes a fresh epoch strictly above the one this
+// node has seen, and is stamped one step past the floor copy of the
+// re-admission (membershipCopyTS): below any real write, so the revived row
+// replaces it on every node, and above a not-retired node's pass copy of the
+// same hosts row, which carries the lower epoch.
+func absorbMembershipWrite(ctx context.Context, tx *sql.Tx, w unlatchedMembershipWrite, updatedAt string, mayInsert, frozen bool) error {
 	var hState, hReason string
 	var hEpoch int64
 	err := tx.QueryRowContext(ctx,
@@ -551,7 +562,18 @@ func absorbMembershipWrite(ctx context.Context, tx *sql.Tx, w unlatchedMembershi
 		if w.hasIso {
 			epoch, reason = w.epoch, w.reason
 		}
-		_, err = tx.ExecContext(ctx, absorbInsertSQL, w.host, state, epoch, reason, updatedAt)
+		ts := updatedAt
+		if frozen && w.revive && !w.hasIso {
+			floor, ok := membershipCopyTS(updatedAt)
+			if ok {
+				ts, ok = clearTS(credentialSplitRow{srcTS: floor})
+			}
+			if !ok {
+				return nil // no stamp below the write: leave the row to anti-entropy
+			}
+			epoch++
+		}
+		_, err = tx.ExecContext(ctx, absorbInsertSQL, w.host, state, epoch, reason, ts)
 		return err
 	case err != nil:
 		return err
@@ -746,12 +768,3 @@ func currentIsolation(ctx context.Context, c *Client, host string) (int64, strin
 	}
 	return cur.Epoch, cur.Reason, nil
 }
-
-// isReadmitStatement reports whether sqlText is readmitHostSQL. Its wire shape
-// has not changed across builds (host_readmit.go), so a peer on any supported
-// build sends exactly this text.
-func isReadmitStatement(sqlText string) bool {
-	return strings.Join(strings.Fields(sqlText), " ") == readmitNormalized
-}
-
-var readmitNormalized = strings.Join(strings.Fields(readmitHostSQL), " ")

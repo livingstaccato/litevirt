@@ -76,7 +76,7 @@ release back, as v57's was.
   neither fences nor recovers a host it reads as `unknown`; it logs and skips
   it (`state_unknown`), and re-reads it next cycle. On a derived voter set such
   a host stays in every quorum's denominator but its probes never count toward
-  the live numerator (`corrosion.VotersNotCountedLive`); with an adopted voter
+  the live numerator (`corrosion.VoterSetWithUncounted`, read in one pass with the voter set); with an adopted voter
   generation the generation's members count as usual.
 - **A state write never inserts from the frozen copy** (re-review m1). A live
   writer on a retired node that has no row for the host updates an existing
@@ -122,7 +122,16 @@ release back, as v57's was.
   any real or absorbed write wins.
 - **Re-admission** of a removed host that has no membership row at all (it
   was removed before the split) creates one taking the isolation pair from the
-  `hosts` copy, the only one there is.
+  `hosts` copy, the only one there is. On a retired node, where that copy may
+  be behind, the created row takes a fresh isolation epoch one above the
+  copy's and is stamped just past the floor copy of the re-admission (re-review
+  3, R5). Nodes that still hold the tombstoned row revive it at the
+  re-admission's own timestamp with the current epoch, so their row replaces
+  the created one everywhere; an equal timestamp, which would be a tie between
+  two epochs that no rule resolves, cannot occur. The cost is one extra epoch
+  on that node until the revived row arrives, in the fail-closed direction. A
+  re-admission is recognised by its statement fingerprint, the same
+  recogniser host_readmit.go uses.
 
 ## Out of scope
 

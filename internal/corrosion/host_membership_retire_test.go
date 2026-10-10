@@ -257,3 +257,81 @@ func TestHostMembershipRetire_AReadmissionCreatesOrRevivesTheRow(t *testing.T) {
 		t.Errorf("h2's revived row has isolation_epoch %q, want the tombstone's 9", got)
 	}
 }
+
+// TestHostMembershipRetire_AReadmissionWithoutTheRowNeverTiesTheRevive
+// (re-review 3, R5): a retired node that lacks a host's tombstoned membership
+// row takes a re-admission's isolation from its frozen hosts copy, which may
+// be stale. Its row must not carry the re-admission's own timestamp — every
+// node holding the tombstone revives it at that timestamp with the current
+// epoch, and an equal timestamp with a different epoch is an unresolved tie.
+// It takes a fresh epoch strictly above the one it has seen, at a stamp below
+// the re-admission's, so the revived row replaces it everywhere.
+func TestHostMembershipRetire_AReadmissionWithoutTheRowNeverTiesTheRevive(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	seedMembershipHosts(t, c, "h3")
+	retireLive(t, c)
+	const readmitTS = "2999-01-01T00:00:00.000000000Z"
+	for _, q := range []string{
+		`UPDATE hosts SET deleted_at = '2026-01-01T00:00:00Z', isolation_epoch = 3 WHERE name = 'h3'`,
+		`DELETE FROM host_membership WHERE host_name = 'h3'`,
+	} {
+		if err := c.execLocal(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	applyAsReplicated(t, c, Statement{SQL: readmitHostSQL, Params: []interface{}{
+		"10.0.0.9", "root", 22, 7443, "joining", "new-h3", readmitTS, "h3", "new-h3"}})
+	if got := resolvedState(t, c, "h3"); got != "joining" {
+		t.Errorf("h3 reads %q after its re-admission, want joining", got)
+	}
+	if got := membershipCol(t, c, "h3", "isolation_epoch"); got != "4" {
+		t.Errorf("h3's row has isolation_epoch %s, want 4: strictly above the 3 this node has seen", got)
+	}
+	if ts := membershipCol(t, c, "h3", "updated_at"); lwwOrder(ts, readmitTS) >= 0 {
+		t.Fatalf("h3's row is stamped %s, not below the re-admission's %s: it ties the revive elsewhere", ts, readmitTS)
+	}
+
+	// The revived row from a node that held the tombstone: current epoch 7.
+	table := syncTable{Name: "host_membership", Columns: []string{
+		"host_name", "state", "isolation_epoch", "isolation_reason", "updated_at", "deleted_at"}}
+	if _, _, err := c.mergeChunk(table, [][]interface{}{{"h3", "joining", int64(7), "manual", readmitTS, nil}},
+		buildMergeUpsertSQL(table.Name, table.Columns, []string{"host_name"}),
+		[]string{"host_name"}, []int{0}, indexOf(table.Columns, "updated_at")); err != nil {
+		t.Fatalf("mergeChunk: %v", err)
+	}
+	if got := membershipCol(t, c, "h3", "isolation_epoch"); got != "7" {
+		t.Errorf("h3's isolation_epoch is %s after the revived row arrived, want its 7", got)
+	}
+	if n := c.UnresolvedTieCount(); n != 0 {
+		t.Errorf("%d unresolved ties: the re-admission tied the revived row", n)
+	}
+}
+
+// TestHostMembershipRetire_AReadmissionIsRecognisedByFingerprint (re-review
+// 3, nit): the absorb recognises a re-admission the way host_readmit.go does
+// — by its statement fingerprint — not by its exact text, so one recogniser
+// decides both the reset and the revive.
+func TestHostMembershipRetire_AReadmissionIsRecognisedByFingerprint(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	seedMembershipHosts(t, c, "h2")
+	retireLive(t, c)
+	for _, q := range []string{
+		`UPDATE hosts SET deleted_at = '2026-01-01T00:00:00Z' WHERE name = 'h2'`,
+		`UPDATE host_membership SET deleted_at = '2026-01-01T00:00:00Z', isolation_epoch = 9, isolation_reason = 'manual' WHERE host_name = 'h2'`,
+	} {
+		if err := c.execLocal(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	variant := strings.Replace(readmitHostSQL, "UPDATE hosts SET", "update hosts set", 1)
+	if fp, err := FingerprintSQL(variant); err != nil || fp != readmitFingerprint {
+		t.Fatalf("precondition: the variant's fingerprint %q (err %v) is not the re-admission's", fp, err)
+	}
+	applyAsReplicated(t, c, Statement{SQL: variant, Params: []interface{}{
+		"10.0.0.9", "root", 22, 7443, "joining", "new-h2", "2999-01-01T00:00:00Z", "h2", "new-h2"}})
+	if got := resolvedState(t, c, "h2"); got != "joining" {
+		t.Errorf("h2 reads %q after a re-admission written in another form, want joining", got)
+	}
+}

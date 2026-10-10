@@ -361,11 +361,14 @@ func (s *Server) ListUsers(ctx context.Context, _ *emptypb.Empty) (*pb.ListUsers
 // existing user with no local password is an external-realm (LDAP/OIDC) user.
 // It writes the positive evidence an external login needs once the old secret
 // columns are cleared (corrosion.MarkUserExternal): an empty credential row at
-// a floor timestamp, which never replaces a real credential anywhere.
+// a timestamp decades back, which never replaces a real credential anywhere,
+// and which holds only for the users row as it stands now.
 //
-// Refused for an account that holds a password, and on a node whose replica
-// has not caught up — there a missing credential row may only be one that has
-// not arrived yet.
+// Refused for an account with any local-credential evidence in view (a
+// password in its old column, or a credential row with one, live or
+// tombstoned), and on a node whose replica has not caught up — there a missing
+// credential row may only be one that has not arrived yet. Every refusal is
+// audited.
 func (s *Server) MarkUserExternal(ctx context.Context, req *pb.MarkUserExternalRequest) (*emptypb.Empty, error) {
 	if err := RequireRole(ctx, "admin"); err != nil {
 		return nil, err
@@ -389,9 +392,11 @@ func (s *Server) MarkUserExternal(ctx context.Context, req *pb.MarkUserExternalR
 			"user %q does not exist or holds a local password; only an account with no local "+
 				"password can be marked external", req.Username)
 	case errors.Is(err, corrosion.ErrCredentialTablesNotLatched):
+		s.audit(ctx, "user.mark-external", req.Username, "credentials_split_v1 not latched", "denied")
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"credentials_split_v1 has not latched on this node; external users need no mark until it has")
 	default:
+		s.audit(ctx, "user.mark-external", req.Username, "error", "denied")
 		return nil, status.Errorf(codes.Internal, "mark %q external: %v", req.Username, err)
 	}
 	s.audit(ctx, "user.mark-external", req.Username, "by="+callerUsername(ctx), "ok")

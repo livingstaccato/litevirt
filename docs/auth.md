@@ -54,10 +54,14 @@ administrator. When a host cannot tell, the login is refused:
   lv user mark-external <username>
   ```
 
-  The command is audited (`user.mark-external`), admin-only, refused for an
-  account that holds a local password, and refused while the host it runs on
-  has not caught up with its peers. The mark is an empty credential row with a
-  timestamp older than any real write, so it never replaces a password.
+  The command is audited (`user.mark-external`, refusals included),
+  admin-only, refused while the host it runs on sees any local password for
+  the name (in the users row, or in a credential row, live or deleted), and
+  refused while that host has not caught up with its peers. The mark is an
+  empty credential row with a timestamp older than any real write, so it never
+  replaces a password. It holds for the account as it stands when it is made:
+  if the user is deleted and created again, the login is refused again until an
+  administrator decides again.
 
 A host that has not synced its users table yet also refuses to create a NEW
 shadow (`Unavailable`): "no row under this name" there may only mean the

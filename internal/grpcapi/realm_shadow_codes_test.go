@@ -79,3 +79,25 @@ func TestLogin_ExternalUserWithoutEvidence(t *testing.T) {
 		t.Errorf("an external login under a local account: %v, want PermissionDenied", err)
 	}
 }
+
+// TestMarkUserExternal_EveryRefusalIsAudited (re-review 3, nit): the mark is
+// an audited administrator action, so a refusal is audited on every path —
+// including the one where credentials_split_v1 has not latched here.
+func TestMarkUserExternal_EveryRefusalIsAudited(t *testing.T) {
+	ctx := context.Background()
+	s := testServer(t)
+	if err := s.db.Execute(ctx, `INSERT INTO users (username, role, password_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`,
+		"legacy", "viewer", "", "2025-01-01T00:00:00Z", s.db.NowTS()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.MarkUserExternal(adminCtx(), &pb.MarkUserExternalRequest{Username: "legacy"}); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("MarkUserExternal before the split latched: %v, want FailedPrecondition", err)
+	}
+	rows, err := s.db.Query(ctx, `SELECT result FROM audit_log WHERE action = 'user.mark-external' AND target = 'legacy'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].String("result") != "denied" {
+		t.Errorf("audit rows for the refused mark = %d (%v), want one denied row", len(rows), rows)
+	}
+}

@@ -1024,7 +1024,7 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 		// so. See users_admin_guard.go for why this is keyed on created_at and why
 		// it is not a customMergeTables entry.
 		if floor, ok := credentialMergeGuards[table.Name]; ok {
-			keepLocal, reason, kErr := floor.refuse(tx, table, row, pkCols, pkIdx)
+			keepLocal, reason, kErr := floor.refuse(c, tx, table, row, pkCols, pkIdx)
 			if kErr != nil {
 				_ = tx.Rollback()
 				return merged, skipped, kErr

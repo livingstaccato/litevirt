@@ -658,8 +658,10 @@ with an empty database and takes every row, credential rows included, from
 the cluster. (Bringing it back on the dual-write build reads empty secrets;
 bringing it back with its old database on this build is safe for logins —
 evidence that a user is external is kept per user and bound to that user's
-row, so a local account cleared since is never taken for one — but it holds
-stale state for everything else until anti-entropy has caught up.)
+row as it stood, including its last write, so a local account cleared since,
+or a name deleted and created again since, is never taken for one; such a
+login is refused until the account's credential arrives — but it holds stale
+state for everything else until anti-entropy has caught up.)
 
 **External users after the roll.** An LDAP or OIDC user created before
 `credentials_split_v1` latched has no credential row until a host that held it

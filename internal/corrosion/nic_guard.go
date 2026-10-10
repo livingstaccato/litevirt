@@ -80,6 +80,13 @@ type NICGuardRecord struct {
 	Network string `json:"network,omitempty"`
 	Ordinal int    `json:"ordinal,omitempty"`
 
+	// Deleted tombstones the record: the VM (or container) it was written for
+	// is gone (DeleteNICGuardsOf). cluster_policies has no delete statement,
+	// so a record is retired by rewriting it through the same upsert. Readers
+	// skip it, except a re-create, which carries the guard state of the
+	// incarnation it replaces (ListNICGuardsWithDeleted).
+	Deleted bool `json:"deleted,omitempty"`
+
 	SetBy     string `json:"-"`
 	UpdatedAt string `json:"-"`
 }
@@ -203,7 +210,7 @@ func GetNICGuard(ctx context.Context, c *Client, vm, mac string) (*NICGuardRecor
 		return nil, nil
 	}
 	rec, ok := decodeNICGuard(rows[0])
-	if !ok {
+	if !ok || rec.Deleted {
 		return nil, nil
 	}
 	return &rec, nil
@@ -212,7 +219,50 @@ func GetNICGuard(ctx context.Context, c *Client, vm, mac string) (*NICGuardRecor
 // ListNICGuards returns every NIC guard record, keyed by NICGuardKey. A record
 // that does not decode, or holds a mode this build does not implement (a later
 // release's), is left out: its NIC is unguarded here, as it was before.
+//
+// A record tombstoned with its VM (Deleted) is left out too.
 func ListNICGuards(ctx context.Context, c *Client) (map[string]NICGuardRecord, error) {
+	all, err := ListNICGuardsWithDeleted(ctx, c)
+	if err != nil {
+		return nil, err
+	}
+	for k, r := range all {
+		if r.Deleted {
+			delete(all, k)
+		}
+	}
+	return all, nil
+}
+
+// DeleteNICGuardsOf tombstones every guard record of owner (a VM name, or a
+// ContainerGuardOwner), keeping what it held for a re-create of it to carry.
+// Nothing is written before the cluster_policies gate opens.
+func DeleteNICGuardsOf(ctx context.Context, c *Client, owner, setBy string) error {
+	if !c.MayWriteClusterPolicy() {
+		return nil
+	}
+	all, err := ListNICGuards(ctx, c)
+	if err != nil {
+		return err
+	}
+	for _, r := range all {
+		if r.VMName != owner {
+			continue
+		}
+		r.Deleted = true
+		b, err := json.Marshal(r)
+		if err != nil {
+			return err
+		}
+		if err := c.Execute(ctx, clusterPolicyUpsertSQL, NICGuardKey(r.VMName, r.MAC), string(b), setBy, c.NowTS()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ListNICGuardsWithDeleted is ListNICGuards with the tombstoned records.
+func ListNICGuardsWithDeleted(ctx context.Context, c *Client) (map[string]NICGuardRecord, error) {
 	lo, hi := keyRange(nicGuardKeyPrefix)
 	rows, err := c.Query(ctx,
 		`SELECT key, value, set_by, updated_at FROM cluster_policies
@@ -419,6 +469,9 @@ func SeedFirewallEnforcement(ctx context.Context, c *Client, mode, hostName stri
 // another NIC's address.
 type NetworkGuardInfo struct {
 	Subnet string
+	// AllowedVLANs are the VLANs a trunk NIC created on this release may
+	// carry on the network (compose.NetworkDef.AllowedVLANs).
+	AllowedVLANs []int
 	// LitevirtGateway is the subnet's first host where litevirt is the
 	// network's router (compose.NetworkDef.LitevirtGateway), else "".
 	LitevirtGateway string
@@ -472,7 +525,7 @@ func NetworkGuardInfos(ctx context.Context, c *Client) (map[string]NetworkGuardI
 	for _, r := range rows {
 		var def compose.NetworkDef
 		_ = json.Unmarshal([]byte(r.String("config")), &def)
-		info := NetworkGuardInfo{Subnet: def.Subnet, LitevirtGateway: def.LitevirtGateway()}
+		info := NetworkGuardInfo{Subnet: def.Subnet, LitevirtGateway: def.LitevirtGateway(), AllowedVLANs: def.AllowedVLANs}
 		for _, a := range append([]string{def.Gateway}, def.ReservedAddresses...) {
 			if ca := canonIP(a); ca != "" {
 				info.Reserved = append(info.Reserved, ca)
@@ -569,4 +622,13 @@ func VMSpecOfIncarnation(ctx context.Context, c *Client, name, createdAt string)
 		return "", false, err
 	}
 	return rows[0].String("spec"), true, nil
+}
+
+// SetClusterPolicy writes one cluster_policies key (behind the gate), through
+// the table's one upsert.
+func SetClusterPolicy(ctx context.Context, c *Client, key, value, setBy string) error {
+	if !c.MayWriteClusterPolicy() {
+		return ErrClusterPolicyGateClosed
+	}
+	return c.Execute(ctx, clusterPolicyUpsertSQL, key, value, setBy, c.NowTS())
 }

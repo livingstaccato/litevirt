@@ -56,6 +56,18 @@ type Reconciler struct {
 	stateHook func(context.Context, AppliedState)
 
 	arming *Arming // SetArming; nil = nothing armed
+
+	// Arm passes, coalesced: armRunning is the pass in progress, armNext the
+	// one every Arm that arrived since will share.
+	armMu      sync.Mutex
+	armRunning *armRound
+	armNext    *armRound
+}
+
+// armRound is one coalesced pass Arm callers wait on.
+type armRound struct {
+	done chan struct{}
+	err  error
 }
 
 // NewReconciler wires a loader to an applier. interval controls the
@@ -170,6 +182,12 @@ type AppliedState struct {
 	NICTableError string
 	// NICs is the guest devices the per-NIC table covers.
 	NICs map[string]string // device → workload
+	// Guarded is, per workload, the MACs whose guard the per-NIC table in
+	// force holds; empty when the table was refused.
+	Guarded map[string]map[string]bool
+	// BlockedTrunks are trunk VLANs left out because their network does not
+	// allow them (Plan.BlockedTrunks).
+	BlockedTrunks []BlockedTrunk
 }
 
 // SetStateHook registers fn to receive the applied state after every pass
@@ -188,12 +206,18 @@ func (r *Reconciler) AppliedState() AppliedState {
 }
 
 func (r *Reconciler) recordState(ctx context.Context, p Plan, applyErr error) {
-	st := AppliedState{NICs: map[string]string{}}
+	st := AppliedState{NICs: map[string]string{}, Guarded: map[string]map[string]bool{}, BlockedTrunks: p.BlockedTrunks}
 	if len(p.NICs) > 0 {
 		st.Mode = p.nicMode()
 	}
 	for _, n := range p.NICs {
 		st.NICs[n.NICDev] = n.VMName
+		if n.Guard != nil && applyErr == nil {
+			if st.Guarded[n.VMName] == nil {
+				st.Guarded[n.VMName] = map[string]bool{}
+			}
+			st.Guarded[n.VMName][strings.ToLower(n.Guard.MAC)] = true
+		}
 	}
 	if applyErr != nil {
 		st.NICTableError = applyErr.Error()
@@ -539,7 +563,18 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 			info := nets[network]
 			nb.Guard = ResolveNICGuard(&rec, mac, ip, info.Subnet, info.All(), assigned[network])
 		}
+		// recordOf is the NIC's guard record — only one written for the
+		// incarnation that runs now: a record an earlier VM of the same name
+		// and MAC left guards nothing (re-review m1).
+		recordOf := func(ifc corrosion.HostVMNIC) (corrosion.NICGuardRecord, bool) {
+			rec, ok := guards[corrosion.NICGuardKey(ifc.VMName, ifc.MAC)]
+			if ok && rec.VMUUID != "" && ifc.VMUUID != "" && rec.VMUUID != ifc.VMUUID {
+				return corrosion.NICGuardRecord{}, false
+			}
+			return rec, ok
+		}
 		plan.NICs = plan.NICs[:0:0]
+		plan.BlockedTrunks = plan.BlockedTrunks[:0:0]
 		claimed := map[string]string{} // tap → the VM that holds it this pass
 		for _, ifc := range ifaces {
 			tap := running[ifc.VMName][strings.ToLower(ifc.MAC)]
@@ -550,7 +585,7 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 				// created — or its VM is armed: the guard is then in force from
 				// the guest's first frame (re-review I-10). Any other NIC is
 				// rendered once running, as before.
-				_, recorded := guards[corrosion.NICGuardKey(ifc.VMName, ifc.MAC)]
+				_, recorded := recordOf(ifc)
 				if recorded || armedVM[ifc.VMName] {
 					tap = nictap.Name(ifc.MAC)
 				}
@@ -575,8 +610,17 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 			nb.Bridge = tapBridge(tap)
 			nb.MAC = strings.ToLower(ifc.MAC)
 			nb.TrunkVIDs = ifc.TrunkVIDs
-			if rec, ok := guards[corrosion.NICGuardKey(ifc.VMName, ifc.MAC)]; ok {
+			rec, recorded := recordOf(ifc)
+			if recorded {
 				applyRecord(&nb, rec, ifc.MAC, ifc.IP, ifc.NetworkName)
+				// A trunk this build created carries only the VLANs its network
+				// allows; one that predates guards (no record) keeps its own
+				// (re-review R2-I1).
+				var blocked []int
+				nb.TrunkVIDs, blocked = allowedTrunkVIDs(ifc.TrunkVIDs, nets[ifc.NetworkName].AllowedVLANs)
+				if len(blocked) > 0 {
+					plan.BlockedTrunks = append(plan.BlockedTrunks, BlockedTrunk{Workload: ifc.VMName, Network: ifc.NetworkName, VIDs: blocked})
+				}
 			}
 			plan.NICs = append(plan.NICs, nb)
 		}
@@ -588,6 +632,18 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 		ctIfaces, err := corrosion.ListContainerInterfacesByHost(ctx, db, hostName)
 		if err != nil {
 			return plan, err
+		}
+		// A container being created: its NICs before its rows exist, so the
+		// guard is in force when the runtime brings its veth up (re-review
+		// m10).
+		haveCT := map[string]bool{}
+		for _, ifc := range ctIfaces {
+			haveCT[ifc.CtName+"|"+strings.ToLower(ifc.MAC)] = true
+		}
+		for _, p := range opts.Arming.PendingContainers() {
+			if !haveCT[p.CtName+"|"+strings.ToLower(p.MAC)] {
+				ctIfaces = append(ctIfaces, p)
+			}
 		}
 		for _, ifc := range ctIfaces {
 			if ifc.VethDevice == "" {
@@ -637,20 +693,26 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 			}
 		}
 		sort.Strings(plan.Gateways)
-		if plan.LBBackends, plan.LBSources, err = loadLBBackends(ctx, db); err != nil {
+		var lbHosts map[string]bool
+		if plan.LBBackends, plan.LBSources, lbHosts, err = loadLBBackends(ctx, db); err != nil {
 			return plan, err
 		}
 		for _, gw := range plan.Gateways {
 			plan.LBSources = append(plan.LBSources, gw)
 		}
 		// haproxy on another host reaches a backend here from that host's
-		// address (re-review m-d).
-		if len(plan.LBBackends) > 0 {
+		// address (re-review m-d) — only the hosts an LB runs on (m6): any
+		// other host's address would let its masqueraded guests reach a
+		// backend's port past the backend's own groups.
+		if len(lbHosts) > 0 {
 			hosts, err := corrosion.ListHosts(ctx, db)
 			if err != nil {
 				return plan, err
 			}
 			for _, h := range hosts {
+				if !lbHosts[h.Name] {
+					continue
+				}
 				if a, err := netip.ParseAddr(h.Address); err == nil && a.Is4() {
 					plan.LBSources = append(plan.LBSources, a.String())
 				}
@@ -686,16 +748,22 @@ func ContainerGuard(guards map[string]corrosion.NICGuardRecord, host, name, mac 
 // loadLBBackends lists every enabled built-in load balancer's backend
 // endpoints and its VIP: haproxy, on the LB's host, connects to the backends
 // from the host's address on the guest network or from the VIP.
-func loadLBBackends(ctx context.Context, db *corrosion.Client) ([]LBBackend, []string, error) {
+func loadLBBackends(ctx context.Context, db *corrosion.Client) ([]LBBackend, []string, map[string]bool, error) {
 	cfgs, err := corrosion.ListLBConfigs(ctx, db)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	var out []LBBackend
 	var srcs []string
+	hosts := map[string]bool{}
 	for _, cfg := range cfgs {
 		if !cfg.Enabled {
 			continue
+		}
+		var lbHosts []string
+		_ = json.Unmarshal([]byte(cfg.Hosts), &lbHosts)
+		for _, h := range lbHosts {
+			hosts[h] = true
 		}
 		if vip, err := netip.ParsePrefix(cfg.VIP); err == nil {
 			srcs = append(srcs, vip.Addr().String())
@@ -718,7 +786,7 @@ func loadLBBackends(ctx context.Context, db *corrosion.Client) ([]LBBackend, []s
 		}
 		bs, err := corrosion.ListLBBackends(ctx, db, cfg.Name)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		for _, b := range bs {
 			if !b.Enabled {
@@ -740,7 +808,24 @@ func loadLBBackends(ctx context.Context, db *corrosion.Client) ([]LBBackend, []s
 		return out[i].Port < out[j].Port
 	})
 	sort.Strings(srcs)
-	return out, srcs, nil
+	return out, srcs, hosts, nil
+}
+
+// allowedTrunkVIDs splits a trunk's VLANs into those its network allows and
+// the rest.
+func allowedTrunkVIDs(trunk, allowed []int) (keep, blocked []int) {
+	ok := map[int]bool{}
+	for _, v := range allowed {
+		ok[v] = true
+	}
+	for _, v := range trunk {
+		if ok[v] {
+			keep = append(keep, v)
+		} else {
+			blocked = append(blocked, v)
+		}
+	}
+	return keep, blocked
 }
 
 // ResolveNICGuard turns a NIC's guard record into the renderer's guard, or

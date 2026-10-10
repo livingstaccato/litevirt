@@ -3,6 +3,7 @@ package firewall
 import (
 	"context"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,17 +20,53 @@ import (
 // An armed VM stays armed for armTTL — long enough for any start or migration
 // to finish, after which its row says where it runs.
 type Arming struct {
-	mu      sync.Mutex
-	armed   map[string]time.Time
-	pending map[string][]corrosion.HostVMNIC
-	now     func() time.Time
+	mu        sync.Mutex
+	armed     map[string]time.Time
+	pending   map[string][]corrosion.HostVMNIC
+	pendingCT map[string][]corrosion.ContainerInterfaceRecord
+	now       func() time.Time
 }
 
 const armTTL = 30 * time.Minute
 
 // NewArming returns an empty set.
 func NewArming() *Arming {
-	return &Arming{armed: map[string]time.Time{}, pending: map[string][]corrosion.HostVMNIC{}, now: time.Now}
+	return &Arming{armed: map[string]time.Time{}, pending: map[string][]corrosion.HostVMNIC{},
+		pendingCT: map[string][]corrosion.ContainerInterfaceRecord{}, now: time.Now}
+}
+
+// SetPendingContainer records the NICs of a container being created, before
+// its rows exist; ClearPendingContainer forgets them.
+func (a *Arming) SetPendingContainer(ct string, nics []corrosion.ContainerInterfaceRecord) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.pendingCT[ct] = append([]corrosion.ContainerInterfaceRecord(nil), nics...)
+}
+
+// ClearPendingContainer forgets a container's pending NICs.
+func (a *Arming) ClearPendingContainer(ct string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.pendingCT, ct)
+}
+
+// PendingContainers is every pending container NIC.
+func (a *Arming) PendingContainers() []corrosion.ContainerInterfaceRecord {
+	if a == nil {
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	names := make([]string, 0, len(a.pendingCT))
+	for n := range a.pendingCT {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	var out []corrosion.ContainerInterfaceRecord
+	for _, n := range names {
+		out = append(out, a.pendingCT[n]...)
+	}
+	return out
 }
 
 // Arm adds vm to the set.
@@ -110,9 +147,12 @@ func (r *Reconciler) SetArming(a *Arming) {
 	r.arming = a
 }
 
-// Arm puts vm's NIC firewall in force here now: it arms vm and runs a pass.
-// The error is the pass's — a refused per-NIC table included — so a caller
-// can refuse to run a guarded VM unguarded.
+// Arm puts vm's NIC firewall in force here now: it arms vm and waits for a
+// pass that started after it did. Passes are coalesced — every Arm that
+// arrives while one runs shares the next (re-review m3) — and each sends the
+// tables even when they render as last time, since the kernel's copy may have
+// been flushed out of band (m9). The error is the pass's, a refused per-NIC
+// table included; GuardsInForce says whether the VM's guards made it.
 func (r *Reconciler) Arm(ctx context.Context, vm string) error {
 	r.mu.Lock()
 	a := r.arming
@@ -120,7 +160,55 @@ func (r *Reconciler) Arm(ctx context.Context, vm string) error {
 	if a != nil {
 		a.Arm(vm)
 	}
-	return r.Reconcile(ctx)
+	r.armMu.Lock()
+	if r.armNext == nil {
+		r.armNext = &armRound{done: make(chan struct{})}
+	}
+	round := r.armNext
+	if r.armRunning == nil {
+		r.startArmRoundLocked()
+	}
+	r.armMu.Unlock()
+	select {
+	case <-round.done:
+		return round.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// startArmRoundLocked runs armNext. Caller holds armMu.
+func (r *Reconciler) startArmRoundLocked() {
+	round := r.armNext
+	r.armRunning, r.armNext = round, nil
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		round.err = r.ReconcileForce(ctx)
+		cancel()
+		close(round.done)
+		r.armMu.Lock()
+		r.armRunning = nil
+		if r.armNext != nil {
+			r.startArmRoundLocked()
+		}
+		r.armMu.Unlock()
+	}()
+}
+
+// GuardsInForce reports whether the per-NIC table last applied holds the
+// guard of every MAC of workload in macs.
+func (r *Reconciler) GuardsInForce(workload string, macs []string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.state.NICTableError != "" {
+		return false
+	}
+	for _, m := range macs {
+		if !r.state.Guarded[workload][strings.ToLower(m)] {
+			return false
+		}
+	}
+	return true
 }
 
 // SetPending records NICs of vm whose rows are not written yet (Arming).
@@ -130,6 +218,26 @@ func (r *Reconciler) SetPending(vm string, nics []corrosion.HostVMNIC) {
 	r.mu.Unlock()
 	if a != nil {
 		a.SetPending(vm, nics)
+	}
+}
+
+// SetPendingContainer records a container's NICs before its rows exist.
+func (r *Reconciler) SetPendingContainer(ct string, nics []corrosion.ContainerInterfaceRecord) {
+	r.mu.Lock()
+	a := r.arming
+	r.mu.Unlock()
+	if a != nil {
+		a.SetPendingContainer(ct, nics)
+	}
+}
+
+// ClearPendingContainer forgets a container's pending NICs.
+func (r *Reconciler) ClearPendingContainer(ct string) {
+	r.mu.Lock()
+	a := r.arming
+	r.mu.Unlock()
+	if a != nil {
+		a.ClearPendingContainer(ct)
 	}
 }
 

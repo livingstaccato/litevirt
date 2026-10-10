@@ -45,7 +45,11 @@ const (
 	// LabelTPMCapable / LabelSecureBootCapable are HOST labels advertising vTPM
 	// (swtpm) and Secure Boot (secboot/MS OVMF) support (G1). Independent because
 	// their host dependencies differ. Placement requires whichever a VM spec needs.
-	LabelTPMCapable        = "litevirt.tpm"
+	LabelTPMCapable = "litevirt.tpm"
+	// LabelNICGuards says the host's build enforces NIC guards (set "true"
+	// by every daemon of that build at start); until every host runs one, a
+	// guarded VM is placed only on such a host.
+	LabelNICGuards         = "litevirt.nic-guards"
 	LabelSecureBootCapable = "litevirt.secureboot"
 	// LabelUnsafeAutoFailover, when "true" on a host, restores the LEGACY
 	// proceed-anyway behavior for a failed best-effort fence even after the

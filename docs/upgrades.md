@@ -808,8 +808,13 @@ New NICs are guarded against spoofing by default (in either mode); NICs that
 exist before the roll are not, and stay unguarded through their VMs' rebuilds
 and rolling updates (docs/firewall.md, "NIC guards"). NICs this release defines
 name their taps after their MACs (`lvt<mac>`), so their guards are in force
-before their domains run. Guards and the
-mode are recorded in `cluster_policies`, so a NIC created before
+before their domains run; a guarded NIC an older release defined is started,
+or handed over by a live move, paused until its guard is in force. A trunk
+NIC's VLANs in use at the upgrade are recorded into its network's
+`allowed-vlans` once, so no trunk in use loses a VLAN; a new trunk's VLANs need
+`lv network set <net> --allowed-vlans`. Until every host runs this release, a
+guarded VM is placed and moved only onto hosts that advertise NIC guards.
+Guards and the mode are recorded in `cluster_policies`, so a NIC created before
 `failover_scope_v1` has latched is created unguarded, and the mode stays
 observe until then.
 
@@ -824,10 +829,11 @@ answer) and deletes the table when it does not. A rollback swaps the binary and
 keeps the unit, so the rolled-back daemon starts without the stale table:
 libvirt reuses `vnetN` names, and stale chains would hold the next VM to get a
 name to another VM's policy. An upgrade writes the units of the binary doing
-the upgrading — the older one — so this release installs its own units (and
-reloads systemd) when its daemon starts, on every host that runs it as a
-systemd unit: a host upgraded from an older release has the step from its
-first start on this one. Only a host not run under the systemd unit at
+the upgrading — the older one — so this release, when its daemon starts on a
+host whose unit lacks the step, installs it as the drop-in
+`/etc/systemd/system/litevirt.service.d/10-nic-table-cleanup.conf` (and reloads
+systemd), leaving the main unit and any local edits to it as they are: a host
+upgraded from an older release has the step from its first start on this one. Only a host not run under the systemd unit at
 `/etc/systemd/system/litevirt.service` lacks it; delete the table by hand there
 (`nft delete table bridge litevirt-nic`). A binary rolled back below the
 latched `firewall_ipv6_v1` enters WAL quarantine, as below every latched

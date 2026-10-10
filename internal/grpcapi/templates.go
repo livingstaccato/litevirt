@@ -448,7 +448,15 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 	if req.Start {
 		// The clone's rows are written once it runs; until then the firewall
 		// renders its NICs from here (nic_firewall_arming.go).
-		defer s.pendingNICs(req.Target, ifaceRecords, nil)()
+		trunks := map[int][]int{}
+		for i, n := range srcSpec.Network {
+			if len(n.Trunk) > 1 {
+				for _, v := range n.Trunk {
+					trunks[i] = append(trunks[i], int(v))
+				}
+			}
+		}
+		defer s.pendingNICs(req.Target, cloneUUID, ifaceRecords, trunks)()
 		if err := s.virt.StartDomain(req.Target); err != nil {
 			rollbackClone(false)
 			return nil, status.Errorf(codes.Internal, "start clone: %v", err)

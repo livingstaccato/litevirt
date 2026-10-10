@@ -182,6 +182,11 @@ func New(cfg *Config) (*Daemon, error) {
 	if err != nil {
 		return nil, fmt.Errorf("libvirt: %w", err)
 	}
+	// No domain starts before the per-NIC firewall is wired (re-review
+	// R2-I2): after a host boots its nft tables are empty, and an onboot,
+	// self-heal or restart-policy start would run its guest unguarded. Starts
+	// wait for SetStartGuard (Run), and refuse if it never comes.
+	virt.RequireStartGuard(5 * time.Minute)
 
 	// Image store
 	store := image.NewStore(cfg.DataDir)
@@ -826,6 +831,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 
 	svc := grpcapi.NewServer(d.cfg.HostName, d.cfg.DataDir, d.cfg.PKIDir, d.db, d.virt, d.images)
+	// A guarded VM recovers only onto a host that enforces NIC guards until
+	// every host does (re-review m8).
+	fc.SetPlacementLabels(svc.GuardHostLabels)
 	d.svc = svc
 	svc.SetSupersededDiskRetentionDays(d.cfg.SupersededDiskRetentionDays)
 	svc.SetContainerIDMapRange(d.cfg.Containers.IDMapBase, d.cfg.Containers.IDMapRanges)
@@ -1161,6 +1169,56 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// construction — guarantees no automated runtime start (reschedule, restart
 	// policy, onboot autostart) ever runs in the window before the gate can confirm
 	// capability, closing the fail-open race for a should-enforce node.
+	// distributed firewall: poll cluster security_groups +
+	// sg_rules every 30s and atomically replace this host's nftables
+	// table. The applier short-circuits when the rendered ruleset
+	// hasn't changed, so idle clusters cost ~one corrosion query/tick.
+	fwApplier := firewall.NewApplier(firewall.NftBinary{})
+	// Observe-mode evidence outlives every table reload and daemon restart
+	// (re-review I-4): harvested before each replace, kept in data_dir.
+	fwApplier.SetTally(firewall.NewWouldDropTally(filepath.Join(d.cfg.DataDir, "firewall-would-drop.json"), time.Now()))
+	fwMetrics := metrics.NewFirewallMetrics()
+	// VMs about to start or migrate in here, and NICs whose rows are not
+	// written yet: rendered ahead of their rows (firewall.Arming).
+	fwArming := firewall.NewArming()
+	// Per-NIC rules need bridge connection tracking. Loaded once here; a host
+	// that cannot load it renders the guards only and raises a health
+	// condition (firewall.nic.unavailable), never an empty firewall.
+	bridgeCT := firewall.BridgeConntrackAvailable(ctx, true)
+	fwLoader := firewall.CorrosionPlanLoader(d.db, d.cfg.HostName, firewall.Plan{},
+		firewall.LoaderOptions{RunningTaps: d.virt.RunningDomainTaps, OnDuplicateSGs: fwMetrics.SetDuplicateSGNICs,
+			BridgeConntrack: func() bool { return bridgeCT }, Arming: fwArming})
+	d.fwReconciler = firewall.NewReconciler(fwLoader, fwApplier, 30*time.Second)
+	d.fwReconciler.SetArming(fwArming)
+	// Every domain start — an API start, a restart policy, a failover
+	// reschedule, a restore — first puts the VM's NIC firewall in force here,
+	// its guards above all, and a guarded VM whose guards cannot be is not
+	// started (re-review I-10).
+	d.virt.SetStartGuard(svc.NICStartGuard(ctx))
+	d.fwReconciler.SetStateHook(svc.RecordFirewallState)
+	// Upgrade migration: once the reconciler renders a bridge's NAT/isolation into
+	// litevirt-fw, clear the pre-consolidation out-of-band rules (old iptables
+	// masquerade + `inet litevirt` chains) a prior binary left for it.
+	d.fwReconciler.SetLegacyCleanup(network.RemoveLegacyBridgeFirewall)
+	svc.SetFirewallReconciler(d.fwReconciler)
+	// This build's units, before the first per-NIC table is loaded: the main
+	// unit's ExecStartPre removes that table when a build that does not own it
+	// starts, so a rollback leaves no stale per-NIC rules enforcing. An upgrade
+	// only ever installs the OLD binary's units.
+	grpcapi.EnsureSystemdUnits()
+	// One pass now, before any runtime start: the tables a host boots with
+	// are empty (re-review R2-I2).
+	if err := d.fwReconciler.Reconcile(ctx); err != nil {
+		slog.Warn("firewall: the first pass failed; starts arm their own", "error", err)
+	}
+	d.fwReconciler.Start(ctx)
+	// This host enforces NIC guards: until every host does, a guarded VM is
+	// placed only on such a host (re-review m8).
+	if err := corrosion.SetHostLabel(ctx, d.db, d.cfg.HostName, corrosion.LabelNICGuards, "true"); err != nil {
+		slog.Warn("could not advertise NIC guards in the host labels", "error", err)
+	}
+	go svc.RecordExistingTrunkVLANsLoop(ctx, 0)
+
 	go vmChecker.Start(ctx)
 	go reconciler.Start(ctx)
 	// Finish any drain cold move a previous process died in the middle of: the
@@ -1281,49 +1339,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	ipScanner := grpcapi.NewIPScanner(svc)
 	go ipScanner.Start(ctx)
 
-	// distributed firewall: poll cluster security_groups +
-	// sg_rules every 30s and atomically replace this host's nftables
-	// table. The applier short-circuits when the rendered ruleset
-	// hasn't changed, so idle clusters cost ~one corrosion query/tick.
-	fwApplier := firewall.NewApplier(firewall.NftBinary{})
-	// Observe-mode evidence outlives every table reload and daemon restart
-	// (re-review I-4): harvested before each replace, kept in data_dir.
-	fwApplier.SetTally(firewall.NewWouldDropTally(filepath.Join(d.cfg.DataDir, "firewall-would-drop.json"), time.Now()))
-	fwMetrics := metrics.NewFirewallMetrics()
-	// VMs about to start or migrate in here, and NICs whose rows are not
-	// written yet: rendered ahead of their rows (firewall.Arming).
-	fwArming := firewall.NewArming()
-	// Per-NIC rules need bridge connection tracking. Loaded once here; a host
-	// that cannot load it renders the guards only and raises a health
-	// condition (firewall.nic.unavailable), never an empty firewall.
-	bridgeCT := firewall.BridgeConntrackAvailable(ctx, true)
-	fwLoader := firewall.CorrosionPlanLoader(d.db, d.cfg.HostName, firewall.Plan{},
-		firewall.LoaderOptions{RunningTaps: d.virt.RunningDomainTaps, OnDuplicateSGs: fwMetrics.SetDuplicateSGNICs,
-			BridgeConntrack: func() bool { return bridgeCT }, Arming: fwArming})
-	d.fwReconciler = firewall.NewReconciler(fwLoader, fwApplier, 30*time.Second)
-	d.fwReconciler.SetArming(fwArming)
-	// Every domain start — an API start, a restart policy, a failover
-	// reschedule, a restore — first puts the VM's NIC firewall in force here,
-	// its guards above all, and a guarded VM whose guards cannot be is not
-	// started (re-review I-10).
-	d.virt.SetBeforeStart(func(name string) error {
-		actx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		defer cancel()
-		return svc.ArmNICsFor(actx, name)
-	})
-	d.fwReconciler.SetStateHook(svc.RecordFirewallState)
-	// Upgrade migration: once the reconciler renders a bridge's NAT/isolation into
-	// litevirt-fw, clear the pre-consolidation out-of-band rules (old iptables
-	// masquerade + `inet litevirt` chains) a prior binary left for it.
-	d.fwReconciler.SetLegacyCleanup(network.RemoveLegacyBridgeFirewall)
-	svc.SetFirewallReconciler(d.fwReconciler)
 	svc.SetAntiEntropy(ae) // `lv cluster converge` kicks an immediate debounced pass
-	// This build's units, before the first per-NIC table is loaded: the main
-	// unit's ExecStartPre removes that table when a build that does not own it
-	// starts, so a rollback leaves no stale per-NIC rules enforcing. An upgrade
-	// only ever installs the OLD binary's units.
-	grpcapi.EnsureSystemdUnits()
-	d.fwReconciler.Start(ctx)
 	// Record the founder's genesis decision of the per-NIC enforcement mode
 	// (enforce) once it can; a cluster with no mode recorded observes. And keep
 	// dnsmasq's host reservations in step with the NICs guarded on its

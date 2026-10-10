@@ -4,6 +4,9 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
+
+	golibvirt "github.com/digitalocean/go-libvirt"
 
 	"github.com/litevirt/litevirt/internal/nictap"
 )
@@ -35,13 +38,88 @@ func TestGenerateDomainXML_NICTapNamedByMAC(t *testing.T) {
 	}
 }
 
-// TestStartDomain_BeforeStartRefuses: a domain whose NIC firewall cannot be
-// put in force first is not started (the hook fails closed for guarded VMs).
-func TestStartDomain_BeforeStartRefuses(t *testing.T) {
+// TestStartDomain_GuardRefuses: a domain whose NIC firewall cannot be put in
+// force first is not started (the guard fails closed for guarded VMs).
+func TestStartDomain_GuardRefuses(t *testing.T) {
 	c := &Client{}
 	called := ""
-	c.SetBeforeStart(func(name string) error { called = name; return errors.New("guards not applied") })
+	c.SetStartGuard(StartGuard{Before: func(name string) (bool, error) { called = name; return false, errors.New("guards not applied") }})
 	if err := c.StartDomain("web"); err == nil || called != "web" || !strings.Contains(err.Error(), "guards not applied") {
-		t.Fatalf("StartDomain = %v (hook saw %q); want the hook's refusal before libvirt is asked", err, called)
+		t.Fatalf("StartDomain = %v (guard saw %q); want the guard's refusal before libvirt is asked", err, called)
 	}
+}
+
+// TestStartDomain_WaitsForARequiredGuard (re-review R2-I2): after a host
+// boots, the daemon's onboot, self-heal and restart-policy starts may run
+// before the firewall is wired. A client that requires a guard holds every
+// start until one is set — and refuses, rather than starting unguarded, if
+// none is set in time.
+func TestStartDomain_WaitsForARequiredGuard(t *testing.T) {
+	c := &Client{}
+	c.RequireStartGuard(5 * time.Second)
+	done := make(chan error, 1)
+	go func() { done <- c.StartDomain("web") }()
+	select {
+	case err := <-done:
+		t.Fatalf("a start ran before any guard was set: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	seen := make(chan string, 1)
+	c.SetStartGuard(StartGuard{Before: func(name string) (bool, error) { seen <- name; return false, errors.New("stop here") }})
+	select {
+	case err := <-done:
+		if !strings.Contains(err.Error(), "stop here") || <-seen != "web" {
+			t.Fatalf("the held start did not go through the guard: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the held start never resumed once the guard was set")
+	}
+
+	late := &Client{}
+	late.RequireStartGuard(50 * time.Millisecond)
+	if err := late.StartDomain("web"); err == nil || !strings.Contains(err.Error(), "not ready") {
+		t.Fatalf("a start with no guard set in time = %v; want a refusal", err)
+	}
+}
+
+// TestSnapshotRevert_GoesThroughTheGuard (re-review m5): a snapshot revert
+// starts the domain, and a live-snapshot restore resumes it: both put its NIC
+// firewall in force first — a restore while it is paused, under the taps it
+// actually has — and neither runs a guarded domain the guard refused.
+func TestSnapshotRevert_GoesThroughTheGuard(t *testing.T) {
+	refuse := StartGuard{Before: func(string) (bool, error) { return false, errors.New("guards not in force") }}
+	t.Run("disk", func(t *testing.T) {
+		m := newLibvirt10(t)
+		m.write(markA, 1)
+		m.snapshot("m1")
+		if err := revertToSnapshot(m, "vm", "m1", nil, refuse); err == nil || !strings.Contains(err.Error(), "guards not in force") {
+			t.Fatalf("revert with a refusing guard = %v", err)
+		}
+		if m.state() == golibvirt.DomainRunning {
+			t.Fatal("the domain runs although its guard refused")
+		}
+	})
+	t.Run("memory", func(t *testing.T) {
+		m := newLibvirt10(t)
+		m.write(markA, 1)
+		save := m.memorySnapshot("m1")
+		var stateWhileArmed golibvirt.DomainState
+		g := StartGuard{
+			Before:      func(string) (bool, error) { return true, nil },
+			AfterPaused: func(string) error { stateWhileArmed = m.state(); return nil },
+		}
+		if err := revertToLiveSnapshot(m, "vm", "m1", save, nil, nil, g); err != nil {
+			t.Fatalf("revert with an arming guard: %v", err)
+		}
+		if stateWhileArmed != golibvirt.DomainPaused || m.state() != golibvirt.DomainRunning {
+			t.Fatalf("armed in state %v, now %v; want armed while paused, then running", stateWhileArmed, m.state())
+		}
+		bad := StartGuard{Before: func(string) (bool, error) { return true, nil }, AfterPaused: func(string) error { return errors.New("no") }}
+		if err := revertToLiveSnapshot(m, "vm", "m1", save, nil, nil, bad); err == nil {
+			t.Fatal("a restore whose guard failed while paused succeeded")
+		}
+		if m.state() == golibvirt.DomainRunning {
+			t.Fatal("the restored domain runs although its guard failed")
+		}
+	})
 }

@@ -758,6 +758,7 @@ type Server struct {
 	// ReloadFirewall calls Reconcile(ctx) on it synchronously to give
 	// `lv firewall reload` push semantics rather than a 30s wait.
 	fwReconciler FirewallReconciler
+	fwMu         sync.RWMutex
 
 	// DHCP reservations made for NICs whose rows are not written yet
 	// (nic_identity.go): network → address → reservation.
@@ -2008,7 +2009,20 @@ func (s *Server) RealmRegistry() *auth.Registry { return s.realmRegistry }
 
 // SetFirewallReconciler wires the daemon's firewall reconciler so the
 // ReloadFirewall RPC can drive a synchronous Reconcile.
-func (s *Server) SetFirewallReconciler(r FirewallReconciler) { s.fwReconciler = r }
+func (s *Server) SetFirewallReconciler(r FirewallReconciler) {
+	s.fwMu.Lock()
+	defer s.fwMu.Unlock()
+	s.fwReconciler = r
+}
+
+// fwRec is the firewall reconciler, safe against SetFirewallReconciler from
+// the daemon's start-up while the runtime loops already run (re-review
+// R2-I2).
+func (s *Server) fwRec() FirewallReconciler {
+	s.fwMu.RLock()
+	defer s.fwMu.RUnlock()
+	return s.fwReconciler
+}
 
 // SetAntiEntropy wires the daemon's anti-entropy loop so TriggerAntiEntropy can drive an
 // immediate (debounced) pass for `lv cluster converge`.
@@ -2021,10 +2035,10 @@ func (s *Server) SetAntiEntropy(a AntiEntropyTrigger) { s.antiEntropy = a }
 // tick after a create. A failure is only a latency regression (the tick still
 // applies it), so it is logged, not surfaced.
 func (s *Server) reconcileFirewall(ctx context.Context) {
-	if s.fwReconciler == nil {
+	if s.fwRec() == nil {
 		return
 	}
-	if err := s.fwReconciler.Reconcile(ctx); err != nil {
+	if err := s.fwRec().Reconcile(ctx); err != nil {
 		slog.Debug("firewall reconcile after intent change failed (next tick will apply)", "error", err)
 	}
 }
@@ -2037,10 +2051,10 @@ func (s *Server) reconcileFirewall(ctx context.Context) {
 // direct EnsureHostIsolation/EnsureNAT calls, which returned the error. Teardown
 // and LB paths use the best-effort reconcileFirewall instead.
 func (s *Server) reconcileFirewallRequired(ctx context.Context) error {
-	if s.fwReconciler == nil {
+	if s.fwRec() == nil {
 		return nil
 	}
-	return s.fwReconciler.Reconcile(ctx)
+	return s.fwRec().Reconcile(ctx)
 }
 
 // SetFirmwarePaths injects the host's resolved OVMF firmware paths (G1).

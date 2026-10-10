@@ -94,8 +94,10 @@ guest NIC it then accepts, ahead of the rules:
   non-guest port;
 - litevirt's own services by explicit generated rules: DNS to a network's
   gateway where litevirt's dnsmasq is the router, and the built-in load
-  balancer's haproxy to its backends' address and port — from the host it runs
-  on, whichever host that is (its address, the VIP or the gateway address).
+  balancer's haproxy to its backends' address and port — from a host the LB
+  runs on (its address, the VIP or the gateway address), and from no other
+  host: another host's address would let its masqueraded guests reach a
+  backend's port past the backend's own groups.
 
 Nothing else is accepted by protocol or port: a `udp 68 → 67` datagram to an
 arbitrary address is judged by the rules like any other. DNS to the gateway is
@@ -119,13 +121,27 @@ guard drops in both modes.
 Two kinds of NIC carry tags:
 
 - a NIC on the **`trunk:`** feature (two or more VLANs, a tagged trunk on its
-  bridge port) carries single-tagged frames of exactly its VLANs, and its rules
-  still judge them: a rule matches the packet inside the tag. A VID it was not
-  given, an 802.1ad outer tag or a tag inside the tag (whose payload no rule can
-  see) is dropped in enforce mode and counted (`vlan trunk`) in observe mode,
-  where everything a trunk sent before keeps working. A trunk NIC gets no NIC
-  guard by default; one set explicitly checks the MAC of its tagged frames and
-  holds its addresses on the untagged (native) VLAN only;
+  bridge port) carries single-tagged frames of the VLANs its **network allows**
+  (`lv network set <net> --allowed-vlans 100,101`, compose `allowed-vlans:`,
+  set with `network.update` on the network), and its rules still judge them: a
+  rule matches the packet inside the tag. Any other VLAN is dropped in either
+  mode — on a bridge that filters no VLANs it would leave through the uplink
+  onto a VLAN the tenant chose. An 802.1ad outer tag or a tag inside the tag
+  (whose payload no rule can see) is dropped in enforce mode and counted
+  (`vlan trunk`) in observe mode. A trunk NIC is **guarded** like any other new
+  NIC: every frame it sends, tagged or not, is held to its MAC, to its own MAC
+  in ARP and neighbour discovery, and may not answer DHCP or advertise a router;
+  its address guards hold its untagged (native) VLAN only, the addresses its
+  guest uses on its other VLANs being no one's to know.
+  - A trunk that existed when the cluster upgraded keeps its VLANs: they are
+    recorded into its network's allowed list, once, when the cluster first can
+    (an audited `network.update` by `litevirt`), and a trunk with no guard
+    record (one that predates guards) keeps carrying its own VLANs.
+  - A tenant's **new** trunk outside its network's list is still created; its
+    VLANs the network does not allow are dropped, and the host raises the
+    warning condition `firewall.nic.trunk_vlans`, which names the trunk and the
+    `lv network set ... --allowed-vlans` that allows them — an operator decides
+    once per VLAN;
 - a NIC allowed tags explicitly (`lv firewall nic-guard set ...
   --allow-vlan-tags`, compose `allow-vlan-tags: true`) — a VLAN-aware guest
   outside the `trunk:` feature, a nested hypervisor — sends and receives tags
@@ -181,8 +197,10 @@ the per-NIC table carries a guarded NIC's chains whether or not it is running
 **Rollback.** The daemon's systemd unit removes the per-NIC table when a binary
 that does not own it starts (`ExecStartPre`), so a rollback to a release
 without per-NIC enforcement leaves no stale rules in force. An upgrade installs
-the units of the binary doing the upgrading — the old one — so the new binary
-installs its own when it starts.
+the units of the binary doing the upgrading — the old one — so the new binary,
+when it starts on a host whose unit lacks the step, installs it as the drop-in
+`litevirt.service.d/10-nic-table-cleanup.conf`; the main unit, and anything an
+operator changed in it, is left as it is.
 
 ## Observe and enforce
 
@@ -356,12 +374,13 @@ subnet instead. A NIC re-created with its MAC (a rebuild) keeps the address
 its MAC already leased.
 
 **The network's router.** The router a NIC may not claim is the network's own:
-the subnet's first host where litevirt is the router (it serves DHCP or routes
-the network — a managed bridge, an isolated or vxlan network); the network's
-`gateway:` and `reserved-addresses:` (`lv network create --gateway
---reserved-address`) — set them on an external or VLAN bridge, whose router is
-someone else's and often not the first host; and the `gateway:` / `ipv6_gateway:`
-every VM's NIC on the network routes through.
+the subnet's first host wherever litevirt runs dnsmasq or routes the network
+(a managed bridge, a bridge with `dhcp`, an isolated or vxlan network) — the
+address guests send DHCP and DNS to, protected whatever `gateway:` says; the
+network's `gateway:` and `reserved-addresses:` (`lv network create --gateway
+--reserved-address`, or later `lv network set`) — set them on an external or
+VLAN bridge, whose router is someone else's and often not the first host; and
+the `gateway:` / `ipv6_gateway:` every VM's NIC on the network routes through.
 
 Listing an allowed address of a family restricts that family: on a network
 where litevirt does not know the guest's address, list that address (or its
@@ -397,16 +416,36 @@ updates, with its IPv6 link-local addresses and its DHCP address as they were;
 every other NIC is new and gets the default. A container keeps its NICs'
 guards when it migrates or is relocated.
 
-**When a guard takes effect.** Before the guest's first frame. A guarded NIC is
-rendered under its tap name (`lvt<mac>`) whether or not it is running, every
-domain start first puts the VM's per-NIC rules in force on its host — an API
-start, a restart policy, a failover reschedule, a restore — and a NIC whose rows
-are written only after its domain starts (a create, a clone, a hot-attach) is
-rendered from the request until they are. A migration source asks the target
-to put them in force before handing the guest over. If a guarded VM's guards
-cannot be put in force — the kernel refuses the table — the VM is not started,
-and the migration is refused, rather than run unguarded. A NIC an older release
-defined (with a `vnetN` tap) and no guard is rendered once it runs, as before.
+**When a guard takes effect.** Before the guest's first frame, on every path
+that runs it:
+
+- A guarded NIC is rendered under its tap name (`lvt<mac>`) whether or not it
+  is running, and every domain start first puts the VM's per-NIC rules in force
+  on its host — an API start, a restart policy, an onboot start, a failover
+  reschedule, a restore, a snapshot revert. A NIC whose rows are written only
+  after its domain starts (a create, a clone, a hot-attach) is rendered from
+  the request until they are.
+- A guarded NIC whose domain an older release defined has a `vnetN` tap that
+  libvirt names only at start. Such a domain is started **paused**; its guard
+  is put in force under the tap it actually got, and only then does the guest
+  run. A live-snapshot restore is resumed the same way.
+- A live move — `lv migrate`, `lv host drain` — asks the target to put the
+  guest's rules in force before handing it over; a guest with a `vnetN` guarded
+  NIC is handed over paused and runs once its target has.
+- A container's NICs are put in force before its runtime brings their veths up,
+  at its create and at every start.
+- After a host boots, no domain starts until the daemon has wired its firewall
+  and run a first pass: its nft tables are empty until then.
+
+If a guarded workload's guards are not in force after the pass — the kernel
+refuses the table — it is not started, and the move is refused, rather than run
+unguarded; a pass that failed for another reason with the guards in force does
+not refuse. A NIC with no guard is rendered once it runs, as before.
+
+**Mixed versions.** Until every host runs this release, a guarded VM is placed,
+moved and recovered only onto hosts that advertise NIC guards (the host label
+`litevirt.nic-guards`, which each daemon of this release sets): on an older
+host it would run unguarded while `nic-guard ls` says `on`.
 
 **Relaxing a guard needs authority over its network.** Turning a guard off,
 listing allowed addresses, letting the guest answer DHCP, advertise routes or
@@ -465,9 +504,10 @@ name and MAC), with the incarnation, network and position of the NIC they were
 written for. Nothing writes them until `failover_scope_v1` has latched. Before
 that, a NIC is created unguarded with a warning, and a request that sets guard
 options is refused rather than silently unguarded. A container whose guards
-cannot be written is not created. A record outlives its VM, harmlessly: a NIC
-created under the same VM name and MAC writes its own, and a re-create carries
-only its own incarnation's.
+cannot be written is not created. A record is retired (tombstoned) when its
+VM or container is deleted, and a record written for another incarnation of the
+same VM name guards nothing; a re-create carries only the guard state of the
+incarnation it replaces.
 
 **Neighbour discovery.** A guarded NIC's solicitations and advertisements are
 held to the header and one 8-byte option (the link-layer address, or a

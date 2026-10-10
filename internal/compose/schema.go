@@ -118,6 +118,12 @@ type NetworkDef struct {
 	Gateway           string   `yaml:"gateway"`
 	ReservedAddresses []string `yaml:"reserved-addresses"`
 
+	// AllowedVLANs are the VLANs a NIC on the `trunk:` feature may carry on
+	// this network: a trunk NIC created on this release carries only those of
+	// its trunk VLANs listed here (docs/firewall.md, "VLAN tags"). Setting it
+	// needs network.update on the network.
+	AllowedVLANs []int `yaml:"allowed-vlans"`
+
 	// NetBoxPrefixID binds this network to a NetBox prefix. Zero means unbound,
 	// which is every network today.
 	//
@@ -130,11 +136,13 @@ type NetworkDef struct {
 }
 
 // LitevirtGateway is the address litevirt itself puts on the network's bridge
-// — the subnet's first host — on a network whose router litevirt is: one it
-// serves DHCP for or routes (a vxlan network's anycast gateway, an isolated
-// network, a bridge litevirt manages). "" where the router is someone else's:
-// a VLAN or external bridge, a host-isolated network, or a network whose
-// configured Gateway names another address. It is a superset of where
+// — the subnet's first host — on a network whose dnsmasq or router litevirt
+// runs: one it serves DHCP for (where guests send DHCP and DNS), or routes (a
+// vxlan network's anycast gateway, an isolated network, a bridge litevirt
+// manages). It is protected whatever Gateway names: a network's configured
+// gateway is its upstream router, and dnsmasq still answers on the first host
+// (re-review R2-I5). "" where litevirt runs neither: a VLAN or external bridge
+// with no DHCP, a host-isolated network. A superset of where
 // network.DHCPWouldServe starts dnsmasq (TestLitevirtGatewayCoversDHCP).
 func (n NetworkDef) LitevirtGateway() string {
 	if n.Subnet == "" || n.HostIsolation {
@@ -157,11 +165,6 @@ func (n NetworkDef) LitevirtGateway() string {
 	gw := p.Addr().Next()
 	if !p.Contains(gw) {
 		return ""
-	}
-	if g := strings.TrimSpace(n.Gateway); g != "" {
-		if a, err := netip.ParseAddr(g); err == nil && a != gw {
-			return ""
-		}
 	}
 	return gw.String()
 }

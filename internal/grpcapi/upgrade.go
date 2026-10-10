@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"google.golang.org/grpc"
@@ -211,36 +212,60 @@ const unitPath = systemdunit.MainPath
 const needrestartDropinPath = systemdunit.NeedrestartPath
 const needrestartDropin = systemdunit.Needrestart
 
-// systemdUnitPaths are where the units are installed; tests point them
-// elsewhere.
-type systemdUnitPaths struct{ main, rollback string }
+// systemdUnitPaths are where the main unit is and where the drop-in goes;
+// tests point them elsewhere.
+type systemdUnitPaths struct{ main, dropin string }
 
-var defaultSystemdUnitPaths = systemdUnitPaths{main: unitPath, rollback: rollbackUnitPath}
+var defaultSystemdUnitPaths = systemdUnitPaths{
+	main:   unitPath,
+	dropin: strings.TrimSuffix(unitPath, ".service") + ".service.d/10-nic-table-cleanup.conf",
+}
 
-// EnsureSystemdUnits installs this binary's units when the daemon starts, on a
-// host that runs it under systemd at all (its main unit is installed).
+// nicTableCleanupDropin is the drop-in that adds the per-NIC table cleanup to
+// a main unit an older build installed.
+const nicTableCleanupDropin = "# Installed by litevirt: remove the per-NIC firewall table when a binary\n" +
+	"# that does not own it starts (a rollback), so no stale per-NIC rules stay in force.\n" +
+	"[Service]\nExecStartPre=" + systemdunit.NICTableCleanup + "\n"
+
+// EnsureSystemdUnits installs, when the daemon starts, what this build needs
+// from its systemd unit on a host that runs it under systemd at all (its main
+// unit is installed): the per-NIC table cleanup that makes a rollback safe
+// (systemdunit.NICTableCleanup).
 //
-// An upgrade writes the units the RUNNING binary carries (updateSystemdUnit,
-// called by the old binary just before it is replaced), so a host upgraded
-// from a build whose unit lacks something this one needs — the per-NIC
-// firewall table cleanup that makes a rollback safe (systemdunit.NICTableCleanup)
-// — would otherwise never get it (re-review I-6).
+// An upgrade writes the units the RUNNING (old) binary carries
+// (updateSystemdUnit, called by the old binary just before it is replaced), so
+// a host upgraded from a build without the cleanup would otherwise never get
+// it (re-review I-6). It goes in as a drop-in, only when the main unit lacks
+// the step, so the main unit — and whatever an operator changed in it — is
+// left alone (m7).
 func EnsureSystemdUnits() {
 	ensureSystemdUnitsAt(defaultSystemdUnitPaths, systemdDaemonReload)
 }
 
 func ensureSystemdUnitsAt(p systemdUnitPaths, reload func() error) {
-	if _, err := os.Stat(p.main); err != nil {
+	main, err := os.ReadFile(p.main)
+	if err != nil {
 		return // not installed as a systemd unit here
 	}
-	if !writeSystemdUnitsAt(p) {
+	if strings.Contains(string(main), "ExecStartPre="+systemdunit.NICTableCleanup) {
+		return // the unit has the step already
+	}
+	if existing, err := os.ReadFile(p.dropin); err == nil && string(existing) == nicTableCleanupDropin {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(p.dropin), 0o755); err != nil {
+		slog.Warn("could not create the systemd drop-in directory", "error", err)
+		return
+	}
+	if err := os.WriteFile(p.dropin, []byte(nicTableCleanupDropin), 0o644); err != nil {
+		slog.Warn("could not install the per-NIC table cleanup drop-in", "error", err)
 		return
 	}
 	if err := reload(); err != nil {
-		slog.Warn("systemctl daemon-reload failed after installing this build's units", "error", err)
+		slog.Warn("systemctl daemon-reload failed after installing the per-NIC table cleanup drop-in", "error", err)
 		return
 	}
-	slog.Info("installed this build's systemd units (main + rollback)")
+	slog.Info("installed the per-NIC table cleanup as a systemd drop-in", "path", p.dropin)
 }
 
 func systemdDaemonReload() error {
@@ -252,17 +277,17 @@ func systemdDaemonReload() error {
 
 // writeSystemdUnitsAt writes the current main and rollback units where they
 // differ, reporting whether anything changed.
-func writeSystemdUnitsAt(p systemdUnitPaths) bool {
+func writeSystemdUnitsAt(mainPath, rollbackPath string) bool {
 	changed := false
-	if existing, err := os.ReadFile(p.main); err != nil || string(existing) != litevirtUnit {
-		if err := os.WriteFile(p.main, []byte(litevirtUnit), 0644); err != nil {
+	if existing, err := os.ReadFile(mainPath); err != nil || string(existing) != litevirtUnit {
+		if err := os.WriteFile(mainPath, []byte(litevirtUnit), 0644); err != nil {
 			slog.Warn("failed to update systemd unit", "error", err)
 			return false
 		}
 		changed = true
 	}
-	if existing, err := os.ReadFile(p.rollback); err != nil || string(existing) != litevirtRollbackUnit {
-		if err := os.WriteFile(p.rollback, []byte(litevirtRollbackUnit), 0644); err != nil {
+	if existing, err := os.ReadFile(rollbackPath); err != nil || string(existing) != litevirtRollbackUnit {
+		if err := os.WriteFile(rollbackPath, []byte(litevirtRollbackUnit), 0644); err != nil {
 			slog.Warn("failed to update rollback unit", "error", err)
 			// don't return — the main unit still works, just without auto-rollback
 		} else {
@@ -276,7 +301,7 @@ func writeSystemdUnitsAt(p systemdUnitPaths) bool {
 // companion) and reloads systemd if anything changed on disk. Best-effort —
 // failures are logged, not fatal.
 func updateSystemdUnit() {
-	changed := writeSystemdUnitsAt(defaultSystemdUnitPaths)
+	changed := writeSystemdUnitsAt(unitPath, rollbackUnitPath)
 	// Install the needrestart exclusion when needrestart is present. Not a systemd
 	// unit, so it never gates the daemon-reload below; best-effort.
 	if _, err := os.Stat("/etc/needrestart"); err == nil {

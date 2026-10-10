@@ -48,9 +48,10 @@ func TestCorrosionPlanLoader_ContainerGuardFollowsMigration(t *testing.T) {
 	}
 }
 
-// TestCorrosionPlanLoader_LBSourcesIncludePeerHosts (re-review m-d): haproxy
-// runs on the LB's host, which may not be the backend's; it reaches a backend
-// here from its own host's address, which must be an allowed LB source.
+// TestCorrosionPlanLoader_LBSourcesIncludePeerHosts (re-review m-d, m6):
+// haproxy runs on the LB's hosts, which may not be the backend's; it reaches a
+// backend here from its own host's address, which must be an allowed LB
+// source — and no other host's is.
 func TestCorrosionPlanLoader_LBSourcesIncludePeerHosts(t *testing.T) {
 	ctx := context.Background()
 	db := corrosion.NewTestClientT(t)
@@ -60,7 +61,10 @@ func TestCorrosionPlanLoader_LBSourcesIncludePeerHosts(t *testing.T) {
 	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{Name: "lb-host", Address: "192.0.2.21", State: "active"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := corrosion.UpsertLBConfig(ctx, db, corrosion.LBConfigRecord{Name: "web", VIP: "10.0.0.100", Ports: `[{"target":8080}]`, Enabled: true}); err != nil {
+	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{Name: "other", Address: "192.0.2.22", State: "active"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.UpsertLBConfig(ctx, db, corrosion.LBConfigRecord{Name: "web", VIP: "10.0.0.100", Hosts: `["lb-host"]`, Ports: `[{"target":8080}]`, Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
 	if err := corrosion.UpsertLBBackend(ctx, db, corrosion.LBBackendRecord{LBName: "web", Name: "b1", Address: "10.0.0.20", Enabled: true}); err != nil {
@@ -76,5 +80,12 @@ func TestCorrosionPlanLoader_LBSourcesIncludePeerHosts(t *testing.T) {
 	}
 	if !found || len(plan.LBBackends) != 1 {
 		t.Errorf("LB sources %v (backends %v) lack the LB host's address", plan.LBSources, plan.LBBackends)
+	}
+	// Only the hosts the LB runs on (re-review m6): any other host's address
+	// would let its masqueraded guests reach a backend past its group.
+	for _, s := range plan.LBSources {
+		if s == "192.0.2.22" {
+			t.Errorf("a host the LB does not run on is an LB source: %v", plan.LBSources)
+		}
 	}
 }

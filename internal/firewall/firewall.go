@@ -289,6 +289,17 @@ type Plan struct {
 	// them, from LBSources (the LB VIPs and the host's gateway addresses).
 	LBBackends []LBBackend
 	LBSources  []string
+
+	// BlockedTrunks are the trunk VLANs the loader left out because the NIC's
+	// network does not allow them (not rendered; reported as a condition).
+	BlockedTrunks []BlockedTrunk
+}
+
+// BlockedTrunk is a trunk NIC's VLANs its network does not allow.
+type BlockedTrunk struct {
+	Workload string
+	Network  string
+	VIDs     []int
 }
 
 // LBBackend is one load-balancer backend endpoint.

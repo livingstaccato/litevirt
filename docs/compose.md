@@ -25,6 +25,7 @@ networks:
     subnet: "192.168.10.0/24"
     gateway: "192.168.10.254"         # the upstream router, when it is not litevirt's
     reserved-addresses: ["192.168.10.253"]   # other infrastructure no guest may claim
+    allowed-vlans: [100, 101]         # the VLANs a trunk: NIC on this network may carry
 
 vms:
   base-vm:
@@ -375,9 +376,11 @@ Supports `s` (seconds), `m` (minutes), `h` (hours). Defaults to 30 seconds if no
         trunk: [100, 101]           # VLAN trunk mode: the guest carries VLANs 100 and 101 tagged
 ```
 
-A NIC with `trunk:` (two or more VLANs) carries exactly those VLANs, single
-tagged, and its per-NIC rules still judge the packet inside the tag; it gets no
-NIC guard unless it asks for one. `allow-vlan-tags: true` is for a VLAN-aware
+A NIC with `trunk:` (two or more VLANs) carries those of its VLANs its
+network's `allowed-vlans:` lists, single tagged, and its per-NIC rules still
+judge the packet inside the tag; it is guarded like any other new NIC. A trunk
+that existed when the cluster upgraded keeps its VLANs (they are recorded into
+the network's list once). `allow-vlan-tags: true` is for a VLAN-aware
 guest outside the `trunk:` feature (docs/firewall.md, "VLAN tags").
 
 A network's `gateway:` names its router when the router is not litevirt's — the

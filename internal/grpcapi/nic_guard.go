@@ -127,8 +127,6 @@ func (d guardDecision) guarded(att *pb.NetworkAttachment) bool {
 		return false
 	case d.carry != nil:
 		return d.carry.Guarded()
-	case len(att.GetTrunk()) > 1:
-		return false
 	}
 	return true
 }
@@ -142,17 +140,16 @@ func (d guardDecision) record(vm, uuid string, ordinal int, mac string, att *pb.
 	case d.carry != nil:
 		r := *d.carry
 		r.VMName, r.MAC, r.VMUUID, r.Network, r.Ordinal = vm, mac, uuid, att.GetName(), ordinal
-		r.SetBy, r.UpdatedAt = "", ""
+		r.SetBy, r.UpdatedAt, r.Deleted = "", "", false
 		if k := staticIPv6Known(att); k != nil {
 			r.Known = k
 		}
 		return &r
-	case len(att.GetTrunk()) > 1:
-		// A NIC on the `trunk:` feature gets no guard unless it asks for
-		// one: its guest addresses its other VLANs itself, and a trunk ran
-		// unguarded before guards existed (re-review I-2).
-		return nil
 	}
+	// A NIC on the `trunk:` feature is guarded like any other new NIC: its
+	// guard holds every frame's MAC, ARP, ND, DHCP-server and RA identity,
+	// and the addresses of its native VLAN; which VLANs it carries is its
+	// network's to allow (re-review R2-I1).
 	r := newNICGuardRecord(vm, uuid, ordinal, mac, att)
 	return &r
 }
@@ -191,7 +188,8 @@ func (s *Server) replacedIncarnation(ctx context.Context, vmName string) (replac
 			"vm", vmName)
 		return replacedNICs{}, false, nil
 	}
-	all, err := corrosion.ListNICGuards(ctx, s.db)
+	// With the tombstoned ones: the incarnation was deleted for the re-create.
+	all, err := corrosion.ListNICGuardsWithDeleted(ctx, s.db)
 	if err != nil {
 		return replacedNICs{}, false, status.Errorf(codes.Internal, "read NIC guards: %v", err)
 	}
@@ -389,6 +387,16 @@ func (s *Server) writeNewNICGuards(ctx context.Context, recs []corrosion.NICGuar
 		}
 	}
 	return nil
+}
+
+// retireNICGuards tombstones the guard records of a workload just deleted, so
+// a later VM of the same name and MAC inherits nothing (re-review m1). A
+// re-create still carries them (ListNICGuardsWithDeleted).
+func (s *Server) retireNICGuards(ctx context.Context, owner string) {
+	if err := corrosion.DeleteNICGuardsOf(ctx, s.db, owner, callerUsername(ctx)); err != nil {
+		slog.Warn("NIC guard: could not retire the guard records of a deleted workload; a record of another incarnation guards nothing",
+			"owner", owner, "error", err)
+	}
 }
 
 // guardState renders a NIC's guard for an audit row.

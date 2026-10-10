@@ -46,7 +46,17 @@ func (r *recordingNft) nicTable() string {
 // before libvirt starts it.
 func wireNodeFirewall(t *testing.T, n *Node) *recordingNft {
 	t.Helper()
-	nft := &recordingNft{}
+	return wireNodeFirewallWith(t, n, &recordingNft{})
+}
+
+// wireNodeFirewallWith is wireNodeFirewall onto a given nft: the daemon's
+// wiring (daemon.go), including the host label that says this host enforces
+// NIC guards.
+func wireNodeFirewallWith(t *testing.T, n *Node, nft *recordingNft) *recordingNft {
+	t.Helper()
+	if err := corrosion.SetHostLabel(context.Background(), n.DB, n.Name, corrosion.LabelNICGuards, "true"); err != nil {
+		t.Fatal(err)
+	}
 	arm := firewall.NewArming()
 	loader := firewall.CorrosionPlanLoader(n.DB, n.Name, firewall.Plan{}, firewall.LoaderOptions{
 		RunningTaps: n.Virt.RunningDomainTaps,
@@ -56,7 +66,7 @@ func wireNodeFirewall(t *testing.T, n *Node) *recordingNft {
 	rec := firewall.NewReconciler(loader, firewall.NewApplier(nft), 0)
 	rec.SetArming(arm)
 	n.Server.SetFirewallReconciler(rec)
-	n.Virt.SetBeforeStart(func(name string) error { return n.Server.ArmNICsFor(context.Background(), name) })
+	n.Virt.SetStartGuard(n.Server.NICStartGuard(context.Background()))
 	return nft
 }
 

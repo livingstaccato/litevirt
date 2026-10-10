@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -35,6 +36,7 @@ const (
 	CondFirewallObserve     = "firewall.nic.observe"     // rules observed, not enforced
 	CondFirewallUnavailable = "firewall.nic.unavailable" // no bridge conntrack: guards only
 	CondFirewallRefused     = "firewall.nic.refused"     // the kernel refused the per-NIC table
+	CondFirewallTrunkVLANs  = "firewall.nic.trunk_vlans" // trunk VLANs their network does not allow
 )
 
 // SetFirewallEnforcement switches per-NIC enforcement for the whole cluster.
@@ -130,11 +132,11 @@ type wouldDropKeeper interface {
 
 func (s *Server) localFirewallEnforcement(ctx context.Context) *pb.FirewallHostEnforcement {
 	h := &pb.FirewallHostEnforcement{HostName: s.hostName}
-	if r, ok := s.fwReconciler.(appliedStater); ok {
+	if r, ok := s.fwRec().(appliedStater); ok {
 		st := r.AppliedState()
 		h.AppliedMode, h.Error = st.Mode, st.NICTableError
 	}
-	if k, ok := s.fwReconciler.(wouldDropKeeper); ok {
+	if k, ok := s.fwRec().(wouldDropKeeper); ok {
 		since, entries, err := k.WouldDropTotals(ctx)
 		if err != nil && h.Error == "" {
 			h.Error = err.Error()
@@ -160,7 +162,7 @@ func (s *Server) ResetFirewallWouldDrops(ctx context.Context, req *pb.ResetFirew
 		return nil, err
 	}
 	now := time.Now()
-	if k, ok := s.fwReconciler.(wouldDropKeeper); ok {
+	if k, ok := s.fwRec().(wouldDropKeeper); ok {
 		if err := k.ResetWouldDrops(ctx, now); err != nil {
 			s.audit(ctx, "firewall.would_drop.reset", s.hostName, "", "error")
 			return nil, status.Errorf(codes.Internal, "reset the would-drop totals on %s: %v", s.hostName, err)
@@ -205,6 +207,46 @@ func (s *Server) RecordFirewallState(ctx context.Context, st firewall.AppliedSta
 		"nf_conntrack_bridge is unavailable on this host: per-NIC rules are not enforced here (NIC guards and the VLAN rule are)")
 	s.setFirewallCondition(ctx, CondFirewallRefused, st.NICTableError != "", corrosion.SeverityCritical,
 		"the kernel refused the per-NIC firewall table; the previous one stays, routed filtering and NAT still apply: "+st.NICTableError)
+	s.setFirewallCondition(ctx, CondFirewallTrunkVLANs, len(st.BlockedTrunks) > 0, corrosion.SeverityWarning,
+		s.blockedTrunksText(ctx, st.BlockedTrunks))
+}
+
+// blockedTrunksText names each trunk whose VLANs its network does not allow,
+// and the command that allows them (re-review R2-I1).
+func (s *Server) blockedTrunksText(ctx context.Context, blocked []firewall.BlockedTrunk) string {
+	if len(blocked) == 0 {
+		return ""
+	}
+	byNet := map[string][]int{}
+	var who []string
+	for _, b := range blocked {
+		byNet[b.Network] = append(byNet[b.Network], b.VIDs...)
+		who = append(who, fmt.Sprintf("%s on %s (VLANs %s)", b.Workload, b.Network, vidList(b.VIDs)))
+	}
+	nets := make([]string, 0, len(byNet))
+	for n := range byNet {
+		nets = append(nets, n)
+	}
+	sort.Strings(nets)
+	var cmds []string
+	for _, n := range nets {
+		vids := byNet[n]
+		if def, err := lookupNetworkDef(ctx, s.db, n); err == nil && def != nil {
+			vids = append(vids, def.AllowedVLANs...)
+		}
+		cmds = append(cmds, fmt.Sprintf("lv network set %s --allowed-vlans %s", n, vidList(sortedVIDs(vids))))
+	}
+	sort.Strings(who)
+	return "trunk VLANs their network does not allow are dropped: " + strings.Join(who, "; ") +
+		". To allow them (needs network.update): " + strings.Join(cmds, "; ")
+}
+
+func vidList(v []int) string {
+	out := make([]string, len(v))
+	for i, x := range v {
+		out[i] = strconv.Itoa(x)
+	}
+	return strings.Join(out, ",")
 }
 
 // setFirewallCondition raises or resolves one of this host's firewall

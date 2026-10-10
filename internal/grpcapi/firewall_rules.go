@@ -45,10 +45,10 @@ func firewallWriteCode(err error, def codes.Code) codes.Code {
 // reconcileLocal triggers an immediate best-effort re-render on the connected
 // host so an operator's change is live without waiting for the poll tick.
 func (s *Server) reconcileLocal(ctx context.Context) {
-	if s.fwReconciler == nil {
+	if s.fwRec() == nil {
 		return
 	}
-	if err := s.fwReconciler.Reconcile(ctx); err != nil {
+	if err := s.fwRec().Reconcile(ctx); err != nil {
 		slog.Warn("firewall: immediate reconcile after change failed", "error", err)
 	}
 }

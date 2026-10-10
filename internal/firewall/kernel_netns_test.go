@@ -765,7 +765,12 @@ func vport(t *testing.T, br, host, far string) net.HardwareAddr {
 // tagged wraps an IPv4 payload in one 802.1Q tag per VID, outermost first;
 // tpid sets the outer tag's type (0x8100 or 0x88a8).
 func tagged(src net.HardwareAddr, tpid uint16, payload []byte, vids ...uint16) []byte {
-	inner := []byte{8, 0}
+	return taggedType(src, tpid, 0x0800, payload, vids...)
+}
+
+// taggedType is tagged with the innermost ethertype given (0x0806 for ARP).
+func taggedType(src net.HardwareAddr, tpid, etype uint16, payload []byte, vids ...uint16) []byte {
+	inner := []byte{byte(etype >> 8), byte(etype)}
 	for i := len(vids) - 1; i >= 0; i-- {
 		tci := []byte{byte(vids[i] >> 8), byte(vids[i])}
 		tag := append(tci, inner...)
@@ -806,7 +811,7 @@ func TestKernelChild_VLANToNICAndTrunk(t *testing.T) {
 	// I-1: a plain bridge, two guest NICs and an uplink.
 	sh(t, "ip", "link", "add", "lvvb0", "type", "bridge", "stp_state", "0", "forward_delay", "0")
 	sh(t, "ip", "link", "set", "lvvb0", "up")
-	vport(t, "lvvb0", "lvvh0", "lvvg0")
+	ga := vport(t, "lvvb0", "lvvh0", "lvvg0")
 	vport(t, "lvvb0", "lvvh1", "lvvg1")
 	up := vport(t, "lvvb0", "lvvh2", "lvvg2")
 	nics := []NICBinding{{NICDev: "lvvh0", VMName: "a", Bridge: "lvvb0"}, {NICDev: "lvvh1", VMName: "b", Bridge: "lvvb0"}}
@@ -855,21 +860,27 @@ func TestKernelChild_VLANToNICAndTrunk(t *testing.T) {
 	for _, v := range []string{"100", "101", "102"} {
 		sh(t, "bridge", "vlan", "add", "dev", "lvth1", "vid", v)
 	}
+	// The trunk NIC is guarded (re-review R2-I1: a trunk keeps the default
+	// guard) on every frame, tagged or not.
 	trunkPlan := Plan{
 		SecurityGroups: []SecurityGroup{{Name: "no25", Rules: []Rule{{Direction: Egress, Proto: "udp", PortRange: "25", Action: Drop}}}},
-		NICs:           []NICBinding{{NICDev: "lvth0", VMName: "router", Bridge: "lvtb0", TrunkVIDs: []int{100, 101}, SecurityGroups: []string{"no25"}}},
+		NICs: []NICBinding{{NICDev: "lvth0", VMName: "router", Bridge: "lvtb0", TrunkVIDs: []int{100, 101}, SecurityGroups: []string{"no25"},
+			Guard: &NICGuard{MAC: tr.String(), V4: []string{"10.0.0.8"}}}},
 	}
+	foreign := net.HardwareAddr{0x02, 0, 0, 0, 0, 0x99}
 	trunk := []struct {
-		name           string
-		frame          []byte
-		enforce, empty bool
+		name                    string
+		frame                   []byte
+		enforce, observe, empty bool
 	}{
-		{"VLAN 100", tagged(tr, 0x8100, udp(5000), 100), true, true},
-		{"VLAN 101", tagged(tr, 0x8100, udp(5000), 101), true, true},
-		{"untagged (native VLAN)", ether(tr, 0x0800, udp(5000)), true, true},
-		{"VLAN 100, to a port its rules refuse", tagged(tr, 0x8100, udp(25), 100), false, true},
-		{"a doubled tag inside VLAN 100", tagged(tr, 0x8100, udp(5000), 100, 7), false, true},
-		{"802.1ad outer tag", tagged(tr, 0x88a8, udp(5000), 100, 7), false, true},
+		{"VLAN 100", tagged(tr, 0x8100, udp(5000), 100), true, true, true},
+		{"VLAN 101", tagged(tr, 0x8100, udp(5000), 101), true, true, true},
+		{"untagged (native VLAN)", ether(tr, 0x0800, udp(5000)), true, true, true},
+		{"VLAN 100, to a port its rules refuse", tagged(tr, 0x8100, udp(25), 100), false, true, true},
+		{"a doubled tag inside VLAN 100", tagged(tr, 0x8100, udp(5000), 100, 7), false, true, true},
+		{"802.1ad outer tag", tagged(tr, 0x88a8, udp(5000), 100, 7), false, true, true},
+		{"a DHCP server reply on VLAN 100", tagged(tr, 0x8100, ipv4UDP("10.0.0.8", "255.255.255.255", 67, 68), 100), false, false, true},
+		{"ARP naming another MAC on VLAN 100", taggedType(tr, 0x8100, 0x0806, arpRequest(foreign, "10.9.0.5", "10.9.0.1"), 100), false, false, true},
 	}
 	apply(trunkPlan)
 	for _, c := range trunk {
@@ -880,8 +891,26 @@ func TestKernelChild_VLANToNICAndTrunk(t *testing.T) {
 	trunkPlan.NICMode = NICModeObserve
 	apply(trunkPlan)
 	for _, c := range trunk {
-		if got := l.deliveredFrom(t, "lvtg0", "lvtg1", c.frame); got != c.empty {
-			t.Errorf("trunk, observe: %s: delivered=%v, want %v (as with no table)", c.name, got, c.empty)
+		if got := l.deliveredFrom(t, "lvtg0", "lvtg1", c.frame); got != c.observe {
+			t.Errorf("trunk, observe: %s: delivered=%v, want %v", c.name, got, c.observe)
+		}
+	}
+
+	// A trunk on a bridge with no VLAN filtering of its own (a plain managed
+	// bridge with an uplink): a VLAN the tenant chose, which its network does
+	// not allow, does not leave through the uplink, in either mode.
+	hop := tagged(ga, 0x8100, udp(5000), 102)
+	allowed := tagged(ga, 0x8100, udp(5000), 100)
+	plainTrunk := Plan{NICs: []NICBinding{{NICDev: "lvvh0", VMName: "tenant", Bridge: "lvvb0", TrunkVIDs: []int{100},
+		Guard: &NICGuard{MAC: ga.String()}}, {NICDev: "lvvh1", VMName: "b", Bridge: "lvvb0"}}}
+	for _, mode := range []string{NICModeEnforce, NICModeObserve} {
+		plainTrunk.NICMode = mode
+		apply(plainTrunk)
+		if l.deliveredFrom(t, "lvvg0", "lvvg2", hop) {
+			t.Errorf("%s: a tenant-chosen VLAN (102) left through the uplink", mode)
+		}
+		if !l.deliveredFrom(t, "lvvg0", "lvvg2", allowed) {
+			t.Errorf("%s: the allowed VLAN 100 did not leave through the uplink", mode)
 		}
 	}
 	if t.Failed() {
@@ -899,5 +928,8 @@ func TestKernelChild_VLANToNICAndTrunk(t *testing.T) {
 		if got := l.deliveredFrom(t, "lvtg0", "lvtg1", c.frame); got != c.empty {
 			t.Errorf("no table: %s: delivered=%v, want %v", c.name, got, c.empty)
 		}
+	}
+	if !l.deliveredFrom(t, "lvvg0", "lvvg2", hop) {
+		t.Error("no table: VLAN 102 still does not leave — the drop above was not the rule's")
 	}
 }

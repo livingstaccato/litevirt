@@ -996,7 +996,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			}
 		}
 	}
-	defer s.pendingNICs(spec.Name, ifaceRecords, trunks)()
+	defer s.pendingNICs(spec.Name, spec.Uuid, ifaceRecords, trunks)()
 
 	if err := s.virt.StartDomain(spec.Name); err != nil {
 		s.virt.UndefineDomain(spec.Name, false)
@@ -2228,6 +2228,7 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 			return nil, status.Errorf(codes.Internal, "clean up stale VM record: %v", err)
 		}
 		s.reportDeletedVM(ctx, deleted)
+		s.retireNICGuards(ctx, req.Name)
 		s.clearDeviceLease(req.Name)
 		// This path returns without reaching the main cleanup below, so the
 		// marker has to be dropped here too. A ghost row whose domain is already
@@ -2493,6 +2494,7 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// The row as this delete tombstoned it, for a re-create that follows
 	// (vm_recreate_replaces.go).
 	s.reportDeletedVM(ctx, deleted)
+	s.retireNICGuards(ctx, req.Name)
 
 	slog.Info("VM deleted", "name", req.Name)
 	// The mirror's latency shortcut, AFTER the mandatory tombstone: the VM is
@@ -3396,6 +3398,7 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "rebuild: tombstone old records: %v", err)
 	}
+	s.retireNICGuards(ctx, req.Name)
 
 	// Recreate the VM using the stored spec. The create carries the identity
 	// of the VM just tombstoned: the host it lands on may not have applied

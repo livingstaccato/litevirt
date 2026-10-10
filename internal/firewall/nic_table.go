@@ -293,6 +293,9 @@ func renderTrunkConfine(b *strings.Builder, p Plan, n NICBinding, word string, v
 	v := verdict(p, n.NICDev, "vlan", "trunk")
 	fmt.Fprintf(b, "        %s %s ether type 8021ad %s\n", word, n.NICDev, v)
 	if vids {
+		// A VLAN its network does not allow is dropped in either mode: on a
+		// bridge that filters no VLANs it would leave through the uplink onto
+		// a VLAN the tenant chose (re-review R2-I1).
 		ids := append([]int(nil), n.TrunkVIDs...)
 		sort.Ints(ids)
 		strs := make([]string, 0, len(ids))
@@ -301,7 +304,7 @@ func renderTrunkConfine(b *strings.Builder, p Plan, n NICBinding, word string, v
 				strs = append(strs, fmt.Sprint(id))
 			}
 		}
-		fmt.Fprintf(b, "        %s %s vlan id != { %s } %s\n", word, n.NICDev, strings.Join(strs, ", "), v)
+		fmt.Fprintf(b, "        %s %s vlan id != { %s } drop\n", word, n.NICDev, strings.Join(strs, ", "))
 	}
 	fmt.Fprintf(b, "        %s %s vlan type { 8021q, 8021ad } %s\n", word, n.NICDev, v)
 }
@@ -443,6 +446,26 @@ func renderGuardChain(b *strings.Builder, dev string, g NICGuard, vlanOK, trunk 
 	fmt.Fprintf(b, "    chain guard_%s {\n", sanitiseChain(dev))
 	fmt.Fprintf(b, "        ether saddr != %s drop\n", mac)
 	if trunk {
+		// Every frame of a trunk, tagged or not, is held to the guest's own
+		// MAC in ARP and neighbour discovery, and may not answer DHCP or
+		// advertise a router (re-review R2-I1). These match with no network-
+		// header dependency (raw @nh, meta l4proto), because the kernel holds a
+		// single tag outside the frame and nft's ether type then reads the tag.
+		fmt.Fprintf(b, "        meta protocol arp @nh,64,48 != %s drop\n", macHex)
+		if !g.AllowDHCPServer {
+			fmt.Fprintf(b, "        meta l4proto udp th sport 67 drop\n")
+			fmt.Fprintf(b, "        meta l4proto udp th dport 68 drop\n")
+			fmt.Fprintf(b, "        meta l4proto udp th sport 547 drop\n")
+			fmt.Fprintf(b, "        meta l4proto udp th dport 546 drop\n")
+		}
+		if !g.AllowRouterAdvert {
+			fmt.Fprintf(b, "        icmpv6 type { nd-router-advert, nd-redirect } drop\n")
+		}
+		fmt.Fprintf(b, "        meta protocol ip6 icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert } @nh,32,16 > 32 drop\n")
+		fmt.Fprintf(b, "        meta protocol ip6 icmpv6 type nd-router-solicit @nh,32,16 > 16 drop\n")
+		renderNDOptionChecks(b, macHex)
+		// The addresses its guest uses on its other VLANs are not litevirt's
+		// to know: the address guards below hold the native VLAN only.
 		fmt.Fprintf(b, "        ether type 8021q return\n")
 	} else if !vlanOK {
 		// Held here too, so a guarded NIC drops tagged frames in observe mode,
@@ -509,8 +532,14 @@ func renderGuardChain(b *strings.Builder, dev string, g NICGuard, vlanOK, trunk 
 	// solicitation 8 plus one.
 	fmt.Fprintf(b, "        icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert } ip6 length > 32 drop\n")
 	fmt.Fprintf(b, "        icmpv6 type nd-router-solicit ip6 length > 16 drop\n")
+	renderNDOptionChecks(b, macHex)
+	fmt.Fprintf(b, "    }\n\n")
+}
+
+// renderNDOptionChecks holds the link-layer address option of a guarded
+// guest's router and neighbour solicitations and advertisements to its MAC.
+func renderNDOptionChecks(b *strings.Builder, macHex string) {
 	fmt.Fprintf(b, "        icmpv6 type nd-router-solicit @th,64,16 0x0101 @th,80,48 != %s drop\n", macHex)
 	fmt.Fprintf(b, "        icmpv6 type nd-neighbor-solicit @th,192,16 0x0101 @th,208,48 != %s drop\n", macHex)
 	fmt.Fprintf(b, "        icmpv6 type nd-neighbor-advert @th,192,16 0x0201 @th,208,48 != %s drop\n", macHex)
-	fmt.Fprintf(b, "    }\n\n")
 }

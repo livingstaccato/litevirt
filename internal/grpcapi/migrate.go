@@ -643,8 +643,9 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 	// force before the guest arrives, under the tap names its MACs fix
 	// (re-review I-10). Before anything is written, so a refusal changes
 	// nothing.
-	if err := s.armMigrationTarget(ctx, targetHost, vm.Name); err != nil {
-		return err
+	armed, aerr := s.armMigrationTarget(ctx, targetHost, vm.Name)
+	if aerr != nil {
+		return aerr
 	}
 
 	// Split-brain gate, LATE re-check: the early gate (after target validation) is a
@@ -709,7 +710,7 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 	abort.armed = false
 	done := make(chan error, 1)
 	go func() {
-		done <- s.virt.MigrateToTarget(vm.Name, dconnuri, lv.MigrateParams{
+		params := lv.MigrateParams{
 			Live:          live,
 			WithStorage:   withStorage,
 			BandwidthMiB:  bandwidthMiB,
@@ -725,7 +726,9 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 			TLS:            useTLS,
 			TLSDestination: targetHost.Address,
 			CDROMSources:   cdromSources,
-		})
+		}
+		armed.apply(&params)
+		done <- s.virt.MigrateToTarget(vm.Name, dconnuri, params)
 	}()
 
 	ticker := time.NewTicker(2 * time.Second)
@@ -744,7 +747,7 @@ poll:
 			*adopted = true
 			s.adoptAbandonedMigration(context.WithoutCancel(ctx), vm, req.TargetHost,
 				withStorage, disks, done, unlock, migrationFinish{
-					target: targetHost, detachedVFs: detachedVFs, pbVM: pbVM, hspec: hspec,
+					target: targetHost, detachedVFs: detachedVFs, pbVM: pbVM, hspec: hspec, armed: armed,
 					createdStubs: createdStubs,
 				})
 			return status.Errorf(codes.DeadlineExceeded,
@@ -811,7 +814,7 @@ poll:
 	// (Firmware-state cleanup is handled in coldMigrateStoppedVM, which firmware
 	// VMs take instead of this runtime-migration path — see the early return above.)
 	s.finishMigrationOnTarget(ctx, vm, migrationFinish{
-		target: targetHost, detachedVFs: detachedVFs, pbVM: pbVM, hspec: hspec,
+		target: targetHost, detachedVFs: detachedVFs, pbVM: pbVM, hspec: hspec, armed: armed,
 	})
 
 	return send(pb.MigratePhase_MIGRATE_DONE, 100, 0)
@@ -2330,6 +2333,9 @@ type migrationFinish struct {
 	// createdStubs are the disk stubs this attempt created on the target
 	// (EnsureDisks), the only disk files a failed attempt removes there.
 	createdStubs []string
+	// armed lets a guest handed over paused run once its NIC guards are in
+	// force on the target (armedMigration.finish).
+	armed *armedMigration
 }
 
 // adoptedMigrationCeiling bounds how long an adopted migration may run before
@@ -2365,6 +2371,9 @@ func (s *Server) finishMigrationOnTarget(ctx context.Context, vm *corrosion.VMRe
 	// below outlives this call and uses it.
 	ctx = context.WithoutCancel(ctx)
 	target := f.target.Name
+	// A guest handed over paused (a guarded NIC with no tap name of its own)
+	// runs once its guards are in force under the taps it got there.
+	_ = f.armed.finish(ctx)
 	s.enqueueMirrorSync(ctx, vm.Name, mirrorOpUpsert)
 
 	// Re-attach equivalent VFs on the target host for any VFs detached pre-migration.

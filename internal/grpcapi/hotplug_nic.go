@@ -571,7 +571,7 @@ func (s *Server) executeNICAttach(ctx context.Context, vm *corrosion.VMRecord, s
 				trunk = append(trunk, int(v))
 			}
 		}
-		defer s.pendingNICs(vm.Name, []corrosion.InterfaceRecord{{VMName: vm.Name, NetworkName: spec.Name, Ordinal: ordinal,
+		defer s.pendingNICs(vm.Name, specUUID(vm.Spec), []corrosion.InterfaceRecord{{VMName: vm.Name, NetworkName: spec.Name, Ordinal: ordinal,
 			MAC: mac, IP: nicIP, SecurityGroups: spec.GetSecurityGroups()}}, map[int][]int{ordinal: trunk})()
 		if err := s.ArmNICsFor(ctx, vm.Name); err != nil {
 			return s.failNICAttach(ctx, rb, codes.FailedPrecondition, err)

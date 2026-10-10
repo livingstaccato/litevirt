@@ -185,22 +185,18 @@ func TestSeedFirewallEnforcementLoop_FounderDecisionOnly(t *testing.T) {
 	}
 }
 
-// TestGuardDecision_TrunkNICGetsNoDefault (re-review I-2): a NIC on the
-// `trunk:` feature ran unguarded before guards existed and addresses its
-// other VLANs itself, so it gets no record unless it asks for one.
-func TestGuardDecision_TrunkNICGetsNoDefault(t *testing.T) {
+// TestGuardDecision_TrunkNICKeepsTheDefaultGuard (re-review R2-I1): a NIC on
+// the `trunk:` feature is guarded like any other new NIC — declaring a trunk
+// is no way around the guard. Which VLANs it carries is the network's to
+// allow, not the tenant's.
+func TestGuardDecision_TrunkNICKeepsTheDefaultGuard(t *testing.T) {
 	var d guardDecision
 	trunk := &pb.NetworkAttachment{Name: "core", Trunk: []int32{100, 101}}
-	if r := d.record("rt", "u", 0, "52:54:00:00:00:01", trunk); r != nil || d.guarded(trunk) {
-		t.Errorf("a trunk NIC got a default guard: %+v", r)
+	if r := d.record("rt", "u", 0, "52:54:00:00:00:01", trunk); r == nil || !r.Guarded() || !d.guarded(trunk) {
+		t.Errorf("a new trunk NIC got no guard: %+v", r)
 	}
-	asked := &pb.NetworkAttachment{Name: "core", Trunk: []int32{100, 101}, SpoofGuard: "on"}
-	if r := d.record("rt", "u", 0, "52:54:00:00:00:01", asked); r == nil || !r.Guarded() {
-		t.Errorf("a trunk NIC that asks for a guard did not get one: %+v", r)
-	}
-	access := &pb.NetworkAttachment{Name: "core", Trunk: []int32{100}}
-	if r := d.record("rt", "u", 0, "52:54:00:00:00:01", access); r == nil || !r.Guarded() {
-		t.Errorf("an access-mode NIC (one VLAN) is no trunk and gets the default guard: %+v", r)
+	if _, err := guardServer(t, true).admitNICGuards(context.Background(), "rt", []*pb.NetworkAttachment{trunk}, admitNew); err != nil {
+		t.Errorf("a trunk NIC that asks for nothing more needs no authority to be created: %v", err)
 	}
 }
 

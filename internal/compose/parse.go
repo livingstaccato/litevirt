@@ -436,6 +436,11 @@ func (v *validator) validate(f *File) {
 				v.ps.add("networks."+name, fmt.Sprintf("gateway / reserved address %q is not an IP address", a), "")
 			}
 		}
+		for _, vid := range net.AllowedVLANs {
+			if vid < 1 || vid > 4094 {
+				v.ps.add("networks."+name, fmt.Sprintf("allowed VLAN %d is outside 1-4094", vid), "")
+			}
+		}
 	}
 
 	// Container security opt-outs are container-only, with known values.

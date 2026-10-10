@@ -32,22 +32,27 @@ type HostVMNIC struct {
 	// VLANs in the VM spec, configured as a tagged trunk on its bridge port);
 	// nil for any other NIC, an access-mode NIC (one VLAN) included.
 	TrunkVIDs []int
+	// VMUUID is the incarnation of the VM (its spec uuid): a guard record
+	// written for another incarnation guards nothing.
+	VMUUID string
 }
 
 // specTrunks reads each NIC's trunk VLANs from a stored VM spec (encoding/json
 // of VMSpec): by MAC where the spec names one, else by position, which is the
 // NIC's ordinal for every NIC created with the VM. Only trunks (two or more
 // VLANs) are returned.
-func specTrunks(spec string) (byMAC map[string][]int, byOrdinal map[int][]int) {
+func specTrunks(spec string) (byMAC map[string][]int, byOrdinal map[int][]int, uuid string) {
 	var s struct {
+		UUID    string `json:"uuid"`
 		Network []struct {
 			Mac   string  `json:"mac"`
 			Trunk []int32 `json:"trunk"`
 		} `json:"network"`
 	}
 	if spec == "" || json.Unmarshal([]byte(spec), &s) != nil {
-		return nil, nil
+		return nil, nil, ""
 	}
+	uuid = s.UUID
 	byMAC, byOrdinal = map[string][]int{}, map[int][]int{}
 	for i, n := range s.Network {
 		if len(n.Trunk) < 2 {
@@ -63,7 +68,7 @@ func specTrunks(spec string) (byMAC map[string][]int, byOrdinal map[int][]int) {
 			byOrdinal[i] = vids
 		}
 	}
-	return byMAC, byOrdinal
+	return byMAC, byOrdinal, uuid
 }
 
 // ListHostVMNICs returns every live NIC of every live VM whose row places it on
@@ -161,6 +166,7 @@ func ListHostVMNICs(ctx context.Context, c *Client, hostName string, extraVMs ..
 	type trunks struct {
 		byMAC     map[string][]int
 		byOrdinal map[int][]int
+		uuid      string
 	}
 	parsed := map[string]trunks{}
 	for _, m := range merged {
@@ -170,7 +176,7 @@ func ListHostVMNICs(ctx context.Context, c *Client, hostName string, extraVMs ..
 		}
 		tr, ok := parsed[m.VMName]
 		if !ok {
-			tr.byMAC, tr.byOrdinal = specTrunks(specs[m.VMName])
+			tr.byMAC, tr.byOrdinal, tr.uuid = specTrunks(specs[m.VMName])
 			parsed[m.VMName] = tr
 		}
 		vids := tr.byMAC[strings.ToLower(m.MAC)]
@@ -186,6 +192,7 @@ func ListHostVMNICs(ctx context.Context, c *Client, hostName string, extraVMs ..
 			SecurityGroups: decodeSGs(groups),
 			IP:             m.IP,
 			TrunkVIDs:      vids,
+			VMUUID:         tr.uuid,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {

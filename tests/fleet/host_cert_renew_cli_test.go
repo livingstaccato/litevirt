@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/cli"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/daemon"
@@ -46,20 +45,24 @@ func revokedOn(n *Node, serial string) bool {
 // TestFleet_RenewCert_ProductPath drives `lv host renew-cert` itself — the CLI
 // code, the host-side key generation and atomic install, the real certificate
 // watch on every node and real replication — against a 3-node cluster with an
-// explicit voter generation.
+// explicit voter generation. Genesis is decided by all three members, so it
+// needs node-0's accept.
 //
-// Genesis is decided by all three members, so renewing node-0 makes the
-// revocation of its replaced certificate unsafe: generation 1 would no longer
-// verify for a node adopting it later. The successor is served and recorded
-// cluster-wide; the revocation is OWED — a replicated certificate/revocation_owed
-// condition carrying the signed CRL, the serial unrevoked everywhere. Once the
-// voter set changes (generation 2, which the renewed node-0 signs with its new
-// certificate) the cluster publishes the revocation by itself and resolves the
-// condition.
+// While node-2 runs with auth.trust_rotated_peer_certs it does not pin, so
+// revoking node-0's replaced certificate would leave generation 1
+// unverifiable for it: the revocation is OWED — a replicated
+// certificate/revocation_owed condition carrying the signed CRL, the serial
+// unrevoked everywhere. Once node-2 turns the switch off, every node pins, the
+// hold protects no one, and the cluster publishes the revocation by itself.
+// A second renewal, with the pin in force everywhere, revokes the replaced
+// certificate AT ONCE — although generation 1 still carries an accept signed
+// with a replaced key — and owes nothing.
 //
-// Mutations: make revocationSafeForVoters always answer safe — the serial is
-// revoked at once; drop ProcessOwedRevocations from the certificate watch —
-// the owed revocation is never published.
+// Mutations: drop the trust_rotated_peer_certs condition from
+// revocationHoldReason — the first renewal revokes at once; drop
+// ProcessOwedRevocations from the certificate watch — the owed revocation is
+// never published; make revocationHoldReason always hold — the second renewal
+// is owed too.
 func TestFleet_RenewCert_ProductPath(t *testing.T) {
 	ctx := context.Background()
 	c := New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: 7713})
@@ -67,8 +70,18 @@ func TestFleet_RenewCert_ProductPath(t *testing.T) {
 	c.WaitConverged(t, convergeTimeout)
 	runGenesis(t, c)
 	withOperatorPKI(t, n1)
+	n2.Server.SetTrustRotatedPeerCerts(true)
 	stop := runCertWatches(c)
 	defer stop()
+	eventually(t, convergeTimeout, "every node to see that node-2 does not pin", func() bool {
+		for _, n := range c.Nodes {
+			cnd, ok, err := corrosion.GetHealthCondition(ctx, n.DB, "certificate", "trust_rotated_peer_certs", "host", n2.Name)
+			if err != nil || !ok || cnd.Lifecycle == corrosion.ConditionResolved {
+				return false
+			}
+		}
+		return true
+	})
 
 	renew := func() (prev, next string) {
 		t.Helper()
@@ -94,14 +107,11 @@ func TestFleet_RenewCert_ProductPath(t *testing.T) {
 		return prev, next
 	}
 
-	// Genesis is decided by every member, so node-0's accept is needed by the
-	// newest generation: revoking its replaced certificate now would leave a
-	// node that adopts generation 1 later without an anchor. Owed, not revoked.
-	prev2, next := renew()
+	prev, next := renew()
 	eventually(t, convergeTimeout, "every node to record the renewed serial and hold the owed revocation", func() bool {
 		for _, n := range c.Nodes {
 			_, rec, _, _ := hostRowOf(t, n, n0.Name)
-			if !strings.EqualFold(rec, next) || owedFor(t, n, n0.Name, prev2) == "" {
+			if !strings.EqualFold(rec, next) || owedFor(t, n, n0.Name, prev) == "" {
 				return false
 			}
 		}
@@ -109,28 +119,40 @@ func TestFleet_RenewCert_ProductPath(t *testing.T) {
 	})
 	for _, n := range c.Nodes {
 		_, _ = corrosion.SyncClusterCRL(ctx, n.DB, n.PKIDir)
-		if revokedOn(n, prev2) {
-			t.Fatalf("%s revoked %s although generation 1 needs its accept", n.Name, prev2)
+		if revokedOn(n, prev) {
+			t.Fatalf("%s revoked %s although node-2 does not pin and generation 1 needs its accept", n.Name, prev)
 		}
 	}
 
-	// The voter set changes; node-0 signs with its renewed certificate. Now the
-	// newest generation does not lean on the replaced key and the cluster
-	// publishes the owed revocation by itself.
-	if resp, err := c.SelfClient(n1).ChangeVoterConfig(ctx, &pb.ChangeVoterConfigRequest{Op: "rm", Host: n2.Name}); err != nil ||
-		resp.GetGeneration() != 2 {
-		t.Fatalf("lv cluster voter rm %s: %+v %v", n2.Name, resp, err)
-	}
-	adoptAll(t, c, 2)
-	eventually(t, convergeTimeout, "the owed revocation to be published once safe", func() bool {
+	// node-2 turns the recovery switch off: no node is left that the hold
+	// protects, and the cluster publishes the owed revocation by itself.
+	n2.Server.SetTrustRotatedPeerCerts(false)
+	eventually(t, convergeTimeout, "the owed revocation to be published once no node needs the hold", func() bool {
 		for _, n := range c.Nodes {
 			_, _ = corrosion.SyncClusterCRL(ctx, n.DB, n.PKIDir)
-			if !revokedOn(n, prev2) || owedFor(t, n, n0.Name, prev2) != corrosion.ConditionResolved {
+			if !revokedOn(n, prev) || owedFor(t, n, n0.Name, prev) != corrosion.ConditionResolved {
 				return false
 			}
 		}
 		return true
 	})
+
+	// Every node pins: the next renewal revokes at once and owes nothing.
+	prev2, _ := renew()
+	eventually(t, convergeTimeout, "the second replaced certificate to be revoked everywhere at once", func() bool {
+		for _, n := range c.Nodes {
+			_, _ = corrosion.SyncClusterCRL(ctx, n.DB, n.PKIDir)
+			if !revokedOn(n, prev2) {
+				return false
+			}
+		}
+		return true
+	})
+	for _, n := range c.Nodes {
+		if l := owedFor(t, n, n0.Name, prev2); l != "" {
+			t.Fatalf("%s: a renewal under the pin was owed (%s)", n.Name, l)
+		}
+	}
 }
 
 // owedFor returns the lifecycle of the revocation_owed condition for

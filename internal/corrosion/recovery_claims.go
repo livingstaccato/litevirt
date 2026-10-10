@@ -483,10 +483,10 @@ type ClaimVerifier struct {
 	// extraRevoked are serials (lower-case hex) treated as revoked in addition
 	// to the installed CRL — the "what if" WithRevoked asks.
 	extraRevoked map[string]bool
-	// pin, when set (PinnedTo), returns the certificate serial recorded for a
-	// voter; an accept signed with any other certificate does not count.
-	pin   func(voter string) (serial string, ok bool, err error)
-	noPin bool
+	// pinned (WithSerialPin): an accept signed with a certificate the CA has
+	// replaced (pki.SupersededBy) does not count.
+	pinned bool
+	noPin  bool
 }
 
 // WithRevoked returns a copy of v that also treats serials as revoked: the
@@ -507,29 +507,30 @@ func (v *ClaimVerifier) WithRevoked(serials ...string) *ClaimVerifier {
 	return &h
 }
 
-// PinnedTo returns a copy of v that also requires each accept's certificate to
-// be the one recorded for its voter (hosts.cert_serial), or the CA-attested
-// successor of it (pki.RenewedFromSerial) while a renewal's re-recorded serial
-// is still replicating.
+// WithSerialPin returns a copy of v that also refuses an accept signed with a
+// certificate the CA has REPLACED: one this node holds a standing CA-issued
+// successor of (pki.SupersededBy — the renewal extension, collected from
+// handshakes, from accepts and from this node's own identity, and kept
+// node-locally). Its authority is the CA's signature on the successor and
+// nothing else: no replicated row, which any peer can write, can relax it.
 //
 // Without it, §3.10 step 5 asks only for a CA-issued, unrevoked certificate
 // naming the voter, so the key of a certificate a renewal replaced — revocation
-// of which may be held for the voter chain (§4.1) — could still sign accepts.
-// lookup returning ok=false (no live row, an unknown serial) leaves that voter
-// unpinned, as peer trust does for a host it has no row for; an error refuses.
-// Historical verification is never pinned: history was signed by whatever a
-// voter held then.
-func (v *ClaimVerifier) PinnedTo(lookup func(voter string) (string, bool, error)) *ClaimVerifier {
+// of which may be held (§4.1) or skipped with --keep-old — could still sign
+// accepts. A certificate this node holds no successor of is not refused by
+// the pin; revocation (the CRL) is what ends it. Historical verification is
+// never pinned: history was signed by whatever a voter held then.
+func (v *ClaimVerifier) WithSerialPin() *ClaimVerifier {
 	if v == nil {
 		return nil
 	}
 	h := *v
-	h.pin = lookup
+	h.pinned, h.noPin = true, false
 	return &h
 }
 
-// Pinned reports whether v checks accepts against recorded serials.
-func (v *ClaimVerifier) Pinned() bool { return v != nil && v.pin != nil }
+// Pinned reports whether v refuses accepts signed with replaced certificates.
+func (v *ClaimVerifier) Pinned() bool { return v != nil && v.pinned }
 
 // WithoutSerialPin returns a copy of v that VerifyClaimCertificate does not
 // pin: the auth.trust_rotated_peer_certs recovery mode, for a fleet whose
@@ -539,7 +540,7 @@ func (v *ClaimVerifier) WithoutSerialPin() *ClaimVerifier {
 		return nil
 	}
 	h := *v
-	h.pin, h.noPin = nil, true
+	h.pinned, h.noPin = false, true
 	return &h
 }
 
@@ -592,24 +593,25 @@ func (v *ClaimVerifier) revoked(c *x509.Certificate) bool {
 
 // pinRefuses reports why c may not sign as voter under v's serial pin, or nil.
 func (v *ClaimVerifier) pinRefuses(c *x509.Certificate, voter string) error {
-	if v.historical || v.pin == nil {
+	if v.historical || !v.pinned {
 		return nil
 	}
-	recorded, ok, err := v.pin(voter)
-	if err != nil {
-		return fmt.Errorf("read the certificate recorded for %s: %w", voter, err)
+	if err := pki.SupersededError(v.pkiDir, c); err != nil {
+		return fmt.Errorf("signed as %s with a replaced certificate: %w", voter, err)
 	}
-	if !ok || recorded == "" {
-		return nil
+	return nil
+}
+
+// noteSuccessors collects, from every certificate an accept carries, the CA's
+// proof that some other certificate was replaced (pki.NoteSuccessor). It runs
+// before any accept is judged, so a renewed voter's own accept in a row proves
+// its predecessor replaced for the rest of that row as well.
+func (v *ClaimVerifier) noteSuccessors(certPEMs ...string) {
+	for _, p := range certPEMs {
+		if c, err := parseCertPEM([]byte(p)); err == nil {
+			pki.NoteSuccessor(v.pkiDir, c)
+		}
 	}
-	presented := strings.ToLower(c.SerialNumber.Text(16))
-	if strings.EqualFold(presented, recorded) {
-		return nil
-	}
-	if prev, isRenewal := pki.RenewedFromSerial(c); isRenewal && strings.EqualFold(prev, recorded) {
-		return nil
-	}
-	return fmt.Errorf("signed with certificate %s, but the certificate recorded for %s is %s", presented, voter, recorded)
 }
 
 // CertExpectation is what a certificate must certify, and who may certify it.
@@ -654,6 +656,9 @@ func (v *ClaimVerifier) Verify(cert ClaimCertificate, want CertExpectation) erro
 	}
 	counted := map[string]bool{}
 	var problems []string
+	for _, a := range cert.Accepts {
+		v.noteSuccessors(a.CertPEM)
+	}
 	for _, a := range cert.Accepts {
 		if err := v.verifyAccept(cert, a, electorate); err != nil {
 			problems = append(problems, fmt.Sprintf("%s: %v", a.Voter, err))

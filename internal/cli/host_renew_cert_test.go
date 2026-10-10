@@ -430,18 +430,21 @@ func TestHostRevokeCert_Guards(t *testing.T) {
 	}
 }
 
-// The CA machine's copy of the replaced key (left by `lv host init`) is removed
-// by the renewal; a file there that is not that key is left alone.
+// The CA machine's copy of the replaced pair (left by `lv host init`) is
+// removed by the renewal — key AND certificate, so no half pair is left; a
+// file there that is not that pair is left alone.
 //
-// Mutation: skip removeCAMachineCopy — the copy outlives the renewal.
+// Mutations: skip removeCAMachineCopy — the copy outlives the renewal; skip
+// the certificate's removal (the re-review's N-c) — <host>.crt is left beside
+// a missing key.
 func TestRenewHostCert_RemovesTheCAMachinesCopyOfTheReplacedKey(t *testing.T) {
 	f := newRenewFixture(t)
 	key, _ := os.ReadFile(filepath.Join(f.host, "host.key"))
-	if err := os.WriteFile(filepath.Join(f.op, "node-r.key"), key, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(f.op, "node-o.key"), key, 0o600); err != nil {
-		t.Fatal(err)
+	crt, _ := os.ReadFile(filepath.Join(f.host, "host.crt"))
+	for name, b := range map[string][]byte{"node-r.key": key, "node-r.crt": crt, "node-o.key": key, "node-o.crt": crt} {
+		if err := os.WriteFile(filepath.Join(f.op, name), b, 0o600); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := f.run(t, RenewCertOptions{}, f.probe); err != nil {
 		t.Fatal(err)
@@ -449,7 +452,26 @@ func TestRenewHostCert_RemovesTheCAMachinesCopyOfTheReplacedKey(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(f.op, "node-r.key")); !os.IsNotExist(err) {
 		t.Fatal("the CA machine still holds a copy of the replaced key")
 	}
-	if _, err := os.Stat(filepath.Join(f.op, "node-o.key")); err != nil {
-		t.Fatal("a file for another host was removed")
+	if _, err := os.Stat(filepath.Join(f.op, "node-r.crt")); !os.IsNotExist(err) {
+		t.Fatal("the CA machine kept the replaced certificate beside the removed key (a half pair)")
+	}
+	for _, name := range []string{"node-o.key", "node-o.crt"} {
+		if _, err := os.Stat(filepath.Join(f.op, name)); err != nil {
+			t.Fatalf("a file for another host was removed: %s", name)
+		}
+	}
+}
+
+// The rotate-audit-key hint reaches the host the way the renewal did.
+//
+// Mutation: drop the --ssh branch from rotateAuditKeyHint.
+func TestRotateAuditKeyHint_CarriesTheSSHTarget(t *testing.T) {
+	if got := rotateAuditKeyHint("node-r", "admin@10.0.50.11"); got != "lv host rotate-audit-key node-r --ssh admin@10.0.50.11" {
+		t.Fatalf("hint = %q", got)
+	}
+	for _, target := range []string{"", "root@node-r"} {
+		if got := rotateAuditKeyHint("node-r", target); got != "lv host rotate-audit-key node-r" {
+			t.Fatalf("default target %q: hint = %q", target, got)
+		}
 	}
 }

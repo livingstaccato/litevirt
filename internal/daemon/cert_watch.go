@@ -151,6 +151,9 @@ func (w *certWatch) recordHostSerial(ctx context.Context) {
 	if err != nil {
 		return
 	}
+	// This host's own renewal is the first proof it holds that its previous
+	// certificate is replaced (pki.NoteSuccessor): its own pins refuse it too.
+	pki.NoteSuccessor(w.pkiDir, leaf)
 	serial := strings.ToLower(leaf.SerialNumber.Text(16))
 	w.mu.Lock()
 	done := w.recorded == serial

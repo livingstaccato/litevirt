@@ -65,16 +65,24 @@ func recordedSerial(t *testing.T, db *corrosion.Client, host string) string {
 }
 
 // A node renewed while running re-records the serial it now serves, so the
-// pin moves on and the next renewal has a recorded predecessor to name.
+// pin moves on and the next renewal has a recorded predecessor to name; and it
+// takes its own renewal as proof that its previous certificate is replaced, so
+// its own serial pins refuse that certificate too.
 //
-// Mutation: drop recordHostSerial from tick — the row keeps the old serial.
+// Mutations: drop recordHostSerial from tick — the row keeps the old serial;
+// drop the NoteSuccessor of its own identity — the node does not know its own
+// previous certificate is replaced.
 func TestCertWatch_ReRecordsARenewedSerial(t *testing.T) {
 	w, db, pkiDir := certWatchFixture(t, "node-0")
 	w.tick(context.Background(), time.Now())
+	before := recordedSerial(t, db, "node-0")
 	renewed := renewOnDisk(t, pkiDir, "node-0")
 	w.tick(context.Background(), time.Now())
 	if got := recordedSerial(t, db, "node-0"); got != renewed {
 		t.Fatalf("hosts.cert_serial = %s after a renewal to %s", got, renewed)
+	}
+	if succ, ok := pki.SupersededBy(pkiDir, "node-0", before); !ok || succ != renewed {
+		t.Fatalf("the renewed node does not hold its own proof that %s was replaced (%s %v)", before, succ, ok)
 	}
 }
 

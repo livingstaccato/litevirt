@@ -84,7 +84,8 @@ func pushAs(t *testing.T, pkiDir, sender string, target *Node) error {
 //     replication push it makes with it is accepted by a peer whose record
 //     still names the old serial — the successor is accepted on the CA's word.
 //  2. Once the node re-records its serial and that replicates, the peer pins
-//     the new certificate: the OLD one, still CA-valid, is refused as a peer.
+//     the new certificate: the OLD one, still CA-valid, is refused as a peer
+//     (and, since the peer has seen the successor, refused outright).
 //  3. Revoking the old serial makes the old certificate fail the handshake
 //     outright, while the renewed one keeps working — renewal does not route
 //     around revocation.
@@ -120,7 +121,11 @@ func TestFleet_HostCertRenewalKeepsThePeerTrusted(t *testing.T) {
 	if _, rec, _, _ := hostRowOf(t, b, a.Name); !strings.EqualFold(rec, newSerial) {
 		t.Fatalf("%s records %s for %s after the re-record replicated, want %s", b.Name, rec, a.Name, newSerial)
 	}
-	if err := pushAs(t, oldDir, a.Name, b); status.Code(err) != codes.PermissionDenied {
+	// Refused either way: as no longer the host (PermissionDenied), or — once
+	// b holds the successor, which it has from a's push above — outright, as a
+	// certificate the CA replaced (connIdentityGate).
+	if err := pushAs(t, oldDir, a.Name, b); err == nil ||
+		(status.Code(err) != codes.PermissionDenied && !strings.Contains(err.Error(), "replaced")) {
 		t.Fatalf("%s accepted %s's REPLACED certificate as a peer after the record moved on: %v", b.Name, a.Name, err)
 	}
 	if err := pushAs(t, a.PKIDir, a.Name, b); status.Code(err) == codes.PermissionDenied {

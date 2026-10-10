@@ -53,15 +53,26 @@ func ServerTLSConfig(pkiDir string) (*tls.Config, error) {
 // peer TLS configs.
 func revocationVerifier(pkiDir string, caPEM []byte) func([][]byte, [][]*x509.Certificate) error {
 	checker := newCRLChecker(pkiDir, parseCACert(caPEM))
-	return func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-		for _, rawCert := range rawCerts {
+	return func(rawCerts [][]byte, verified [][]*x509.Certificate) error {
+		var leaf *x509.Certificate
+		for i, rawCert := range rawCerts {
 			cert, err := x509.ParseCertificate(rawCert)
 			if err != nil {
 				continue
 			}
+			if i == 0 {
+				leaf = cert
+			}
 			if checker.isRevoked(cert.SerialNumber) {
 				return fmt.Errorf("certificate serial %s has been revoked", cert.SerialNumber.Text(16))
 			}
+		}
+		// A peer presenting a renewed certificate proves, by the CA's
+		// signature, that the one it replaced is no longer its identity
+		// (superseded.go). Collected from every handshake, in both
+		// directions, so each node learns it from the renewed host itself.
+		if len(verified) > 0 && leaf != nil {
+			NoteSuccessor(pkiDir, leaf)
 		}
 		return nil
 	}

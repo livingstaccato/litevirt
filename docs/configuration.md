@@ -577,9 +577,14 @@ auth:
   # tombstone (a decommissioned host stays out) and never lets a distributable
   # client certificate act as a peer. While it is on it ALSO turns off the
   # recovery-claim serial pin (accepts signed with a renewal's replaced key
-  # count again, in claim certificates and voter generations) and stops closing
-  # established connections made with a superseded host certificate — so turn
-  # it off as soon as the fleet has converged. See docs/auth.md. Default false.
+  # count again, in claim certificates and voter generations) and stops
+  # refusing RPCs on, or closing, connections made with a superseded host
+  # certificate. Because such a node does not pin, the cluster also HOLDS the
+  # revocation of a renewal's replaced certificate while any node has it on
+  # (each node reports it as a certificate/trust_rotated_peer_certs
+  # condition). Turn it off as soon as the fleet has converged. It is also the
+  # last-resort way out of a voter chain stuck after a renewal (docs/auth.md,
+  # "Renewing a voter"). Default false.
   trust_rotated_peer_certs: false
   # Forwarded identity: when true (and the forwarded_identity_v1 capability is
   # active cluster-wide), the owning node re-authenticates a forwarded user's

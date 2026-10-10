@@ -176,27 +176,61 @@ func voterAnchor(ctx context.Context, db *corrosion.Client, v *corrosion.ClaimVe
 	return anchor, nil
 }
 
-// voterPinned pins voter-chain verification to recorded serials
-// (corrosion.ClaimVerifier.PinnedTo): an accept in a generation this node has
-// not adopted counts only when it is signed with the certificate the cluster
-// records for its voter, or that certificate's CA-attested successor.
+// voterPinned pins voter-chain verification (corrosion.ClaimVerifier.
+// WithSerialPin): an accept in a generation this node has not adopted does not
+// count when it is signed with a certificate the CA has replaced — one this
+// node holds a CA-issued successor of (pki.SupersededBy).
 //
 // Without it, a renewed voter's REPLACED key — whose revocation may be owed
-// for the voter chain, or kept with --keep-old — together with one
-// compromised live host could sign a new generation that every node adopts,
-// and through it decide claims. The pin covers every generation above the
-// adopted one, the anchor search included; history at or below the anchor is
-// verified historically and is not pinned (it was signed with whatever each
-// voter held then). The cost is §4.1's, bounded the same way: a node that
-// adopts a generation decided BEFORE one of its signers renewed cannot count
-// that signer's accept until the voter set next changes, exactly as when the
-// replaced certificate is revoked. auth.trust_rotated_peer_certs turns the
-// pin off (verifierPolicy).
-func (s *Server) voterPinned(ctx context.Context, v *corrosion.ClaimVerifier) *corrosion.ClaimVerifier {
+// (an older build in the cluster, trust_rotated_peer_certs somewhere) or kept
+// with --keep-old — together with one compromised live host could sign a new
+// generation that every node adopts, and through it decide claims. The pin's
+// authority is the successor's CA signature only; no replicated row (the
+// hosts.cert_serial column any peer can write) can relax or tighten it. It
+// covers every generation above the adopted one, the anchor search included;
+// history at or below the anchor is verified historically and is not pinned
+// (it was signed with whatever each voter held then). The cost is §4.1's: a
+// node that adopts a generation decided BEFORE one of its signers renewed
+// cannot count that signer's accept until the voter set next changes, which
+// noteVoterAdoptionStuck reports with its remedy. auth.trust_rotated_peer_certs
+// turns the pin off (verifierPolicy).
+func (s *Server) voterPinned(_ context.Context, v *corrosion.ClaimVerifier) *corrosion.ClaimVerifier {
 	if v.SerialPinDisabled() {
 		return v
 	}
-	return v.PinnedTo(corrosion.RecordedHostSerial(ctx, s.db))
+	return v.WithSerialPin()
+}
+
+// condVoterGenerationStuck is raised by a node whose adoption of the next
+// voter generation is refused by the serial pin alone: the generation was
+// decided with an accept signed by a certificate the CA has since replaced
+// (one of its voters renewed before this node adopted it). Nothing about the
+// generation is wrong; it is one this node can no longer count, and it stays
+// below it — with the voter set and the claim certificates of the generation
+// before — until a newer generation, signed with current certificates, becomes
+// its anchor (voterAnchor). That needs one more voter change, which nothing
+// makes by itself; the condition names it.
+const condVoterGenerationStuck = "voter_generation_stuck"
+
+// noteAdoptionRefusedByPin raises condVoterGenerationStuck when row failed
+// only because of the serial pin (it verifies with the pin off).
+func (s *Server) noteAdoptionRefusedByPin(ctx context.Context, v *corrosion.ClaimVerifier, prev, row *corrosion.VoterConfig, err error) {
+	if !v.Pinned() || verifyVoterConfigRow(v.WithoutSerialPin(), prev, row) != nil {
+		return
+	}
+	var adopted int64
+	if prev != nil {
+		adopted = prev.Generation
+	}
+	s.setOwnCondition(ctx, condVoterGenerationStuck, corrosion.SeverityWarning, true, fmt.Sprintf(
+		"this node has adopted voter generation %d and cannot adopt %d: it was decided with an accept signed by a "+
+			"certificate the CA has since replaced (%v), and a generation decided before a voter renewed cannot be "+
+			"counted after it. Decide one more voter change from a node that has adopted %d — `lv cluster voter add "+
+			"<host>`, or `lv cluster voter rm <host>` then add it back — whose accepts carry current certificates; "+
+			"this node adopts through it. If a majority of generation %d's members are stuck like this one, no change "+
+			"can be decided: set auth.trust_rotated_peer_certs: true on the stuck nodes and restart them, let them "+
+			"adopt, decide that voter change, then turn it off again (docs/auth.md, \"Renewing a voter\")",
+		adopted, row.Generation, err, row.Generation, row.Generation))
 }
 
 // memberAs reports whether this node is a member of cfg as the voter it is
@@ -239,6 +273,7 @@ func (s *Server) AdoptVoterConfigs(ctx context.Context) (int64, error) {
 			return adopted, err
 		}
 		if row == nil {
+			s.setOwnCondition(ctx, condVoterGenerationStuck, corrosion.SeverityWarning, false, "")
 			return adopted, nil
 		}
 		if verifier == nil {
@@ -287,6 +322,7 @@ func (s *Server) AdoptVoterConfigs(ctx context.Context) (int64, error) {
 			continue
 		}
 		if err := verifyVoterConfigRow(v, prev, row); err != nil {
+			s.noteAdoptionRefusedByPin(ctx, v, prev, row, err)
 			slog.Error("voter set: refusing to adopt a voter generation whose certificate does not verify",
 				"generation", row.Generation, "change", row.Change, "created_by", row.CreatedBy, "error", err)
 			return adopted, fmt.Errorf("generation %d does not verify: %w", row.Generation, err)

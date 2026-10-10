@@ -114,7 +114,7 @@ func (s *Server) claimIdentity() (*corrosion.ClaimSigner, *corrosion.ClaimVerifi
 // trust's is, because a fleet whose recorded serials went stale would
 // otherwise refuse every claim certificate too.
 func (s *Server) verifierPolicy(v *corrosion.ClaimVerifier) *corrosion.ClaimVerifier {
-	if s.trustRotatedPeerCerts {
+	if s.trustRotatedPeerCerts.Load() {
 		return v.WithoutSerialPin()
 	}
 	return v

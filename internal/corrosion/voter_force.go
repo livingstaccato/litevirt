@@ -188,6 +188,9 @@ func (v *ClaimVerifier) verifyForcedSignatures(prev *VoterConfig, next VoterConf
 	}
 	signed := map[string]bool{}
 	for _, sgn := range ev.Signatures {
+		v.noteSuccessors(sgn.CertPEM)
+	}
+	for _, sgn := range ev.Signatures {
 		if !isMember(next.Members, sgn.Voter) {
 			return fmt.Errorf("%s signed but is not a survivor", sgn.Voter)
 		}

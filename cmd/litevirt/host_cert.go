@@ -30,15 +30,18 @@ command confirms the host presents the new certificate, and puts the old one
 back only when the host demonstrably still presents it; an issued successor
 that is never used is revoked.
 
-The replaced certificate is then revoked. When revoking it now would leave the
-newest voter generation unverifiable for a node that adopts it later, the
-revocation is recorded as owed (a degraded condition, notified daily) and the
-cluster publishes it by itself once that is safe; --revoke-old revokes now
-regardless, --keep-old not at all ('lv host revoke-cert' later). It refuses
+The replaced certificate is then revoked, at once. Only while the cluster has a
+node that does not pin voter and claim accepts to unreplaced certificates — one
+on an older build (--force), or one with auth.trust_rotated_peer_certs on — and
+revoking would leave the newest voter generation unverifiable for such a node,
+is the revocation recorded as owed (a degraded condition, notified daily); the
+cluster publishes it by itself once that is no longer so. --revoke-old revokes
+now regardless, --keep-old not at all ('lv host revoke-cert' later). It refuses
 while hosts run different builds unless --force.
 
-Connections made with the old certificate are re-established within seconds;
-one carrying a long transfer (cold-disk migration, backup push) is left up to
+A connection made with the old certificate accepts no new RPC once a node knows
+the certificate was replaced; its client reconnects with the new one. RPCs
+already in flight on it (a cold-disk migration, a backup push) are left up to
 15 minutes to finish, and a transfer still running then fails and must be
 re-run — renew outside long transfers.
 
@@ -62,7 +65,7 @@ reaches them by replication — renew after an upgrade has finished.
 	cmd.Flags().BoolVar(&opts.KeepOld, "keep-old", false,
 		"do not revoke the replaced certificate (it stays CA-valid until it expires)")
 	cmd.Flags().BoolVar(&opts.RevokeOld, "revoke-old", false,
-		"revoke the replaced certificate now, even when the voter chain would hold it as owed")
+		"revoke the replaced certificate now, even when a node that does not pin would hold it as owed")
 	cmd.Flags().BoolVar(&opts.Force, "force", false, "renew although hosts run different builds")
 	cmd.MarkFlagsMutuallyExclusive("keep-old", "revoke-old")
 	cmd.Flags().DurationVar(&opts.Wait, "wait", 90*time.Second, "how long to wait for each confirmation")

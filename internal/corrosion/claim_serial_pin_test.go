@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -12,42 +11,61 @@ import (
 	"github.com/litevirt/litevirt/internal/pki"
 )
 
-// The serial pin (§3.10 step 5): an accept counts only when signed with the
-// certificate recorded for its voter, or that certificate's CA-attested
-// successor. A renewed voter's REPLACED key — whose revocation the voter chain
-// may hold — signs nothing that counts. History is not pinned.
+// renewVoter renews v's certificate in place and returns a signer for the
+// successor.
+func renewVoter(t *testing.T, f *certFixture, v *claimTestVoter) *ClaimSigner {
+	t.Helper()
+	if _, _, err := pki.RenewLocal(f.ca.cert, f.ca.key, v.pki, v.name); err != nil {
+		t.Fatal(err)
+	}
+	pair, err := tls.LoadX509KeyPair(filepath.Join(v.pki, "host.crt"), filepath.Join(v.pki, "host.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	renewed, err := ClaimSignerFromKeyPair(v.name, leafed(t, &pair))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return renewed
+}
+
+// The serial pin (§3.10 step 5): an accept signed with a certificate the CA
+// has replaced does not count. Its only authority is the CA-signed successor —
+// here collected from the renewed voter's own accept, as a node collects it
+// from a handshake — and no replicated row enters into it. Without that
+// proof nothing is refused; history is never pinned; and a successor the CA
+// revoked unused (an abandoned renewal) hands the identity back.
 //
-// Mutations: drop pinRefuses from verifyAccept (the replaced key's accept
-// counts); drop the successor clause in pinRefuses (the renewed voter's accept
-// is refused while the record still names its predecessor); pin historical
-// verification (history signed with the old key stops verifying).
+// Mutations: make pinRefuses return nil (the replaced key's accept counts);
+// drop noteSuccessors from Verify (the successor in the row proves nothing,
+// so the replaced key's accept counts); pin historical verification (history
+// signed with the old key stops verifying); ignore a revoked successor in
+// pki.SupersededBy (the abandoned renewal keeps the old certificate refused).
 func TestClaimVerifier_SerialPin(t *testing.T) {
 	f := newCertFixture(t)
-	a, b := f.voters[0], f.voters[1]
-	rec := map[string]string{"a": a.signer.Serial(), "b": b.signer.Serial(), "c": f.voters[2].signer.Serial()}
-	var lookupErr error
-	pinned := f.verifier.PinnedTo(func(n string) (string, bool, error) {
-		s, ok := rec[n]
-		return s, ok, lookupErr
-	})
+	a := f.voters[0]
+	pinned := f.verifier.WithSerialPin()
 	if err := pinned.Verify(f.cert, f.want); err != nil {
-		t.Fatalf("accepts signed with the recorded certificates were refused: %v", err)
+		t.Fatalf("accepts signed with current certificates were refused: %v", err)
 	}
 
-	// a renews; the record moves on. Its old-key accept no longer counts.
-	if _, _, err := pki.RenewLocal(f.ca.cert, f.ca.key, a.pki, "a"); err != nil {
-		t.Fatal(err)
+	renewed := renewVoter(t, f, a)
+	if err := pinned.Verify(f.cert, f.want); err != nil {
+		t.Fatalf("refused with no CA proof of a replacement held: %v", err)
 	}
-	pair, err := tls.LoadX509KeyPair(filepath.Join(a.pki, "host.crt"), filepath.Join(a.pki, "host.key"))
+
+	// The renewed voter's accept carries its successor certificate: that is
+	// the CA's proof a's previous certificate is replaced.
+	acc, err := renewed.Sign(f.cert.Key, f.cert.ConfigGeneration, f.cert.Ballot, f.cert.ValueDigest, a.inc)
 	if err != nil {
 		t.Fatal(err)
 	}
-	renewed, err := ClaimSignerFromKeyPair("a", leafed(t, &pair))
-	if err != nil {
-		t.Fatal(err)
+	withNew := f.cert
+	withNew.Accepts = []ClaimAccept{acc, f.cert.Accepts[1]}
+	if err := pinned.Verify(withNew, f.want); err != nil {
+		t.Fatalf("the renewed voter's accept was refused: %v", err)
 	}
-	rec["a"] = renewed.Serial()
-	if err := pinned.Verify(f.cert, f.want); err == nil || !strings.Contains(err.Error(), "recorded") {
+	if err := pinned.Verify(f.cert, f.want); err == nil || !strings.Contains(err.Error(), "replaced") {
 		t.Fatalf("an accept signed with a replaced key counted: %v", err)
 	}
 	if err := pinned.Historical().Verify(f.cert, f.want); err != nil {
@@ -57,22 +75,14 @@ func TestClaimVerifier_SerialPin(t *testing.T) {
 		t.Fatalf("the unpinned verifier changed: %v", err)
 	}
 
-	// The record still names the predecessor: the successor's accept counts.
-	rec["a"] = a.signer.Serial()
-	acc, err := renewed.Sign(f.cert.Key, f.cert.ConfigGeneration, f.cert.Ballot, f.cert.ValueDigest, a.inc)
-	if err != nil {
+	// The CA revokes the successor unused: the renewal was abandoned and a's
+	// previous certificate is its identity again.
+	if err := pki.GenerateCRL(f.ca.cert, f.ca.key, filepath.Join(f.verifier.pkiDir, "crl.pem"),
+		[]string{renewed.Serial()}); err != nil {
 		t.Fatal(err)
 	}
-	c := f.cert
-	c.Accepts = []ClaimAccept{acc, f.cert.Accepts[1]}
-	if err := pinned.Verify(c, f.want); err != nil {
-		t.Fatalf("the successor of the recorded certificate was refused: %v", err)
-	}
-
-	// An unreadable record refuses.
-	lookupErr = errors.New("database locked")
-	if err := pinned.Verify(f.cert, f.want); err == nil {
-		t.Fatal("verified although the recorded serials could not be read")
+	if err := pinned.Verify(f.cert, f.want); err != nil {
+		t.Fatalf("an abandoned renewal kept the certificate it would have replaced refused: %v", err)
 	}
 }
 
@@ -103,13 +113,15 @@ func leafed(t *testing.T, p *tls.Certificate) *tls.Certificate {
 	return p
 }
 
-// The destination check pins on its own replica's hosts rows: an accept whose
-// certificate is not the one recorded for its voter does not count, and the
-// recovery switch (WithoutSerialPin) turns that off.
+// The destination check pins whatever its replica's hosts rows say: once it
+// holds the CA's proof that a voter's certificate was replaced, an accept
+// signed with it does not count — even with hosts.cert_serial written back to
+// the replaced serial, which any peer can do. The recovery switch
+// (WithoutSerialPin) turns the pin off.
 //
-// Mutation: drop the PinnedTo wrapping in VerifyClaimCertificate — the accept
-// signed with a no-longer-recorded certificate counts.
-func TestVerifyClaimCertificate_PinsToRecordedSerials(t *testing.T) {
+// Mutation: drop the WithSerialPin wrapping in VerifyClaimCertificate — the
+// accept signed with the replaced certificate counts.
+func TestVerifyClaimCertificate_PinsReplacedCertificatesWhateverTheRowSays(t *testing.T) {
 	ctx := context.Background()
 	f := newCertFixture(t)
 	dest := f.voters[2]
@@ -126,13 +138,20 @@ func TestVerifyClaimCertificate_PinsToRecordedSerials(t *testing.T) {
 		}
 	}
 	if _, err := VerifyClaimCertificate(ctx, dest.c, f.verifier, proof); err != nil {
-		t.Fatalf("accepts signed with the recorded certificates were refused: %v", err)
+		t.Fatalf("accepts signed with current certificates were refused: %v", err)
 	}
-	if err := dest.c.Execute(ctx, recordOwnCertSerialSQL, "0123456789abcdef", dest.c.NowTS(), "a"); err != nil {
+	renewed := renewVoter(t, f, f.voters[0])
+	succ, err := pki.ParseCertPEM([]byte(renewed.certPEM))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := VerifyClaimCertificate(ctx, dest.c, f.verifier, proof); err == nil || !strings.Contains(err.Error(), "recorded") {
-		t.Fatalf("an accept signed with a certificate no longer recorded counted: %v", err)
+	pki.NoteSuccessor(f.verifier.pkiDir, succ)
+	// The row still names (or was written back to) the replaced serial.
+	if err := dest.c.Execute(ctx, recordOwnCertSerialSQL, f.voters[0].signer.Serial(), dest.c.NowTS(), "a"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := VerifyClaimCertificate(ctx, dest.c, f.verifier, proof); err == nil || !strings.Contains(err.Error(), "replaced") {
+		t.Fatalf("an accept signed with a replaced certificate counted because the row names it: %v", err)
 	}
 	if _, err := VerifyClaimCertificate(ctx, dest.c, f.verifier.WithoutSerialPin(), proof); err != nil {
 		t.Fatalf("the recovery switch did not turn the pin off: %v", err)

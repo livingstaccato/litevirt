@@ -31,12 +31,16 @@ import (
 // fresh handshake — which a renewed client passes with its new certificate,
 // and a revoked one fails.
 //
-// A connection carrying an RPC in flight — a cold-disk migration stream, a
-// backup push — is not cut mid-transfer: it is closed once its RPCs finish, or
-// when StreamGrace runs out, whichever comes first. That bounds how long a
-// revoked or superseded certificate keeps a live connection (sweep interval +
-// StreamGrace) without failing a transfer that started legitimately before a
-// renewal. The tracker learns about RPCs through StatsHandler, which the
+// A judged connection DRAINS: from the moment it is judged, every new RPC on
+// it is refused (the server's auth interceptors consult Draining, and also
+// refuse a revoked or superseded identity themselves, per RPC, before any
+// sweep has run). What a drain spares is only the RPCs already in flight on a
+// connection superseded by a renewal — a cold-disk migration stream, a backup
+// push that started legitimately before it — and only until they finish or
+// StreamGrace runs out, whichever comes first; the connection is closed the
+// moment its last RPC ends. A REVOKED identity gets no grace at all: revocation
+// is the emergency path, and its connection is closed at once, in-flight RPCs
+// included. The tracker learns about RPCs through StatsHandler, which the
 // server must install alongside ServerCreds.
 type ConnTracker struct {
 	mu     sync.Mutex
@@ -72,6 +76,32 @@ type trackedConn struct {
 	once     sync.Once
 	active   atomic.Int64
 	judgedAt time.Time // first sweep that wanted it closed; guarded by sweepMu
+	// draining is set once the connection has been judged unacceptable; its
+	// reason is drainWhy. New RPCs on it are refused, and it is closed when
+	// the last RPC in flight ends.
+	draining atomic.Bool
+	drainWhy atomic.Value // string
+}
+
+// Verdict is a judge's answer for one connection.
+type Verdict struct {
+	// Close: the connection is no longer acceptable. It drains — no new RPC —
+	// and is closed once its RPCs in flight end, or after StreamGrace.
+	Close bool
+	// Immediate closes it at once, RPCs in flight included (revocation).
+	Immediate bool
+	Reason    string
+}
+
+func (c *trackedConn) markDraining(why string) {
+	if c.draining.CompareAndSwap(false, true) {
+		c.drainWhy.Store(why)
+	}
+}
+
+func (c *trackedConn) drainReason() string {
+	s, _ := c.drainWhy.Load().(string)
+	return s
 }
 
 func (c *trackedConn) Close() error {
@@ -171,20 +201,67 @@ func (h *connStats) TagRPC(ctx context.Context, _ *stats.RPCTagInfo) context.Con
 	return context.WithValue(ctx, rpcConnCtx{}, tc)
 }
 
+// ConnInfo is what the auth interceptors learn about the connection an RPC
+// arrived on: the certificates it was made with, and whether it is draining.
+type ConnInfo struct {
+	TrackedConn
+	Draining    bool
+	DrainReason string
+}
+
+// ConnFromContext returns the tracked connection ctx's RPC arrived on.
+// ok=false when the server has no tracker (or the connection predates it).
+func ConnFromContext(ctx context.Context) (ConnInfo, bool) {
+	tc, ok := ctx.Value(rpcConnCtx{}).(*trackedConn)
+	if !ok || tc == nil {
+		return ConnInfo{}, false
+	}
+	return ConnInfo{TrackedConn: tc.info, Draining: tc.draining.Load(), DrainReason: tc.drainReason()}, true
+}
+
+// DrainConnection marks the connection ctx's RPC arrived on as draining: an
+// RPC the auth interceptor has just refused for its identity. Every later RPC
+// on it is refused, and it is closed when the RPCs in flight end — this one,
+// being refused, ends at once — or, when immediate, right after the refusal
+// has had a moment to reach the client (immediateCloseDelay), RPCs in flight
+// included.
+func DrainConnection(ctx context.Context, why string, immediate bool) {
+	tc, ok := ctx.Value(rpcConnCtx{}).(*trackedConn)
+	if !ok || tc == nil {
+		return
+	}
+	tc.markDraining(why)
+	if immediate {
+		time.AfterFunc(immediateCloseDelay, func() { _ = tc.Close() })
+	}
+}
+
+// immediateCloseDelay lets the refusal that triggered an immediate close be
+// written before the connection goes, so the client sees why. The connection
+// accepts no new RPC meanwhile.
+const immediateCloseDelay = 100 * time.Millisecond
+
 func (h *connStats) HandleRPC(ctx context.Context, s stats.RPCStats) {
 	if _, end := s.(*stats.End); !end {
 		return
 	}
 	if tc, ok := ctx.Value(rpcConnCtx{}).(*trackedConn); ok {
-		tc.active.Add(-1)
+		if tc.active.Add(-1) <= 0 && tc.draining.Load() {
+			// The last RPC on a draining connection ended: close it now
+			// rather than at the next sweep, so the client reconnects with a
+			// fresh handshake at once — just after its last status has been
+			// written, so a refusal reaches the client with its reason.
+			time.AfterFunc(immediateCloseDelay, func() { _ = tc.Close() })
+		}
 	}
 }
 
 // Sweep closes every tracked connection judge rejects and returns how many.
 // The judge runs on a snapshot, outside the lock new handshakes take, so a
 // judge that reads the database never holds up the accept path. A rejected
-// connection with RPCs in flight is left to finish them, up to StreamGrace.
-func (t *ConnTracker) Sweep(judge func(TrackedConn) (bool, string)) int {
+// connection drains (no new RPC is accepted on it); one with RPCs in flight is
+// left to finish them, up to StreamGrace, unless the verdict is Immediate.
+func (t *ConnTracker) Sweep(judge func(TrackedConn) Verdict) int {
 	t.sweepMu.Lock()
 	defer t.sweepMu.Unlock()
 	t.mu.Lock()
@@ -196,16 +273,23 @@ func (t *ConnTracker) Sweep(judge func(TrackedConn) (bool, string)) int {
 	now := time.Now()
 	closed := 0
 	for _, c := range snap {
-		drop, why := judge(c.info)
-		if !drop {
-			c.judgedAt = time.Time{}
-			continue
+		v := judge(c.info)
+		why := v.Reason
+		if !v.Close {
+			// Drained by the interceptor (an RPC refused for its identity)
+			// stays drained: the identity does not become acceptable again.
+			if !c.draining.Load() {
+				c.judgedAt = time.Time{}
+				continue
+			}
+			why = c.drainReason()
 		}
+		c.markDraining(why)
 		peer := ""
 		if c.info.Peer != nil {
 			peer = c.info.Peer.Subject.CommonName + "/" + c.info.Peer.SerialNumber.Text(16)
 		}
-		if n := c.active.Load(); n > 0 {
+		if n := c.active.Load(); n > 0 && !v.Immediate {
 			if c.judgedAt.IsZero() {
 				c.judgedAt = now
 				slog.Info("a connection made with a certificate that is no longer acceptable carries RPCs in flight; "+
@@ -235,7 +319,7 @@ func (t *ConnTracker) Len() int {
 
 // Run sweeps every `every` until ctx ends, with a fresh judge per sweep (so a
 // judge may cache what it reads for exactly one sweep).
-func (t *ConnTracker) Run(ctx context.Context, every time.Duration, newJudge func() func(TrackedConn) (bool, string)) {
+func (t *ConnTracker) Run(ctx context.Context, every time.Duration, newJudge func() func(TrackedConn) Verdict) {
 	tk := time.NewTicker(every)
 	defer tk.Stop()
 	for {
@@ -254,4 +338,26 @@ func RevocationChecker(pkiDir string) func(*big.Int) bool {
 	caPEM, _ := readBounded(filepath.Join(pkiDir, "ca.crt"))
 	chk := newCRLChecker(pkiDir, parseCACert(caPEM))
 	return chk.isRevoked
+}
+
+var sharedRevocationCheckers sync.Map // pkiDir -> *crlChecker
+
+// IsRevokedCached is the handshakes' revocation check — the CA-verified CRL
+// installed in pkiDir, re-read only when the file changes — shared per pkiDir,
+// for a check that runs on every RPC (the auth interceptors). Without a
+// readable CA it falls back to IsCertRevoked.
+func IsRevokedCached(pkiDir string, serial *big.Int) bool {
+	if serial == nil {
+		return false
+	}
+	if v, ok := sharedRevocationCheckers.Load(pkiDir); ok {
+		return v.(*crlChecker).isRevoked(serial)
+	}
+	caPEM, err := readBounded(filepath.Join(pkiDir, "ca.crt"))
+	ca := parseCACert(caPEM)
+	if err != nil || ca == nil {
+		return IsCertRevoked(pkiDir, serial)
+	}
+	v, _ := sharedRevocationCheckers.LoadOrStore(pkiDir, newCRLChecker(pkiDir, ca))
+	return v.(*crlChecker).isRevoked(serial)
 }

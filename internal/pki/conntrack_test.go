@@ -43,7 +43,7 @@ func trackedServer(t *testing.T, grace time.Duration) (*ConnTracker, healthpb.He
 	return tr, healthpb.NewHealthClient(cc), cc
 }
 
-func dropAll(TrackedConn) (bool, string) { return true, "test" }
+func dropAll(TrackedConn) Verdict { return Verdict{Close: true, Reason: "test"} }
 
 // A connection the judge rejects is not cut while it carries an RPC — a
 // migration or backup stream that began before a renewal finishes — and is
@@ -65,8 +65,10 @@ func TestConnTracker_WaitsForInFlightRPCsWithABound(t *testing.T) {
 		t.Fatalf("closed %d connection(s) with a stream in flight", n)
 	}
 	cancel()
+	// The stream's end closes the draining connection itself, without
+	// waiting for the next sweep.
 	deadline := time.Now().Add(5 * time.Second)
-	for tr.Sweep(dropAll) == 0 {
+	for tr.Len() != 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("the connection was not closed once its stream ended")
 		}

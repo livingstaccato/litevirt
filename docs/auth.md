@@ -428,14 +428,21 @@ could read as a failure:
    PKI directory, owned by another user, or with a mode that cannot be tightened
    is still served, logged as a WARN and raised as a degraded
    `certificate/key_file_unsafe` condition naming the file and the fix (move,
-   `chown` or `chmod 600`); a key readable by others is tightened. **Established
-   connections** made with a certificate since revoked, or with a host
-   certificate the cluster no longer records, are closed within seconds and
-   re-handshake. A connection carrying an RPC in flight — a cold-disk
-   migration stream, a backup push — is closed only once the RPC finishes, or
-   after 15 minutes, whichever comes first; one cut by that bound fails and must
-   be re-run (cold-disk migration and peer backup streams do not resume), so
-   renew outside long transfers.
+   `chown` or `chmod 600`); a key readable by others is tightened.
+   **Established connections** are judged on every RPC, not only at the
+   handshake. A connection made with a REVOKED certificate (or on which the
+   host served one) refuses its next RPC and is closed at once, streams in
+   flight included. A connection made with a certificate the CA has
+   **replaced** — see "Superseded certificates" below — starts no new RPC: the
+   next one is refused with `Unavailable`, and the client reconnects and
+   presents its renewed certificate. Only the RPCs already in flight on it — a
+   cold-disk migration stream, a backup push — are left to finish, and the
+   connection is closed when the last one ends, or after 15 minutes; one cut
+   by that bound fails and must be re-run (cold-disk migration and peer backup
+   streams do not resume), so renew outside long transfers. A host's own UI
+   and REST clients are such clients too: while a browser keeps an event
+   stream open on the old connection, UI requests that need a new RPC fail
+   until the page is reloaded or 15 minutes pass.
 5. The command dials the host and **confirms** it presents the new certificate.
    It switches back only when the host demonstrably still presents the old one
    and the cluster does not record the new one; a probe that merely fails proves
@@ -443,39 +450,85 @@ could read as a failure:
    used is revoked.
 6. The daemon re-records its own serial within a minute, so the record moves on
    and the old certificate stops being accepted as that host.
-7. Then the replaced certificate is **revoked**. The one thing a revocation can
-   break is the voter chain: the newest voter generation's certificate carries
-   each member's vote signed with the certificate it held, and a node that adopts
-   that generation later checks those signatures against the CRL
-   ([recovery-claims.md §4.1](design/recovery-claims.md)). The daemon checks
-   whether the newest generation still verifies with the serial revoked —
-   judged only by a node whose replica has caught up and that has adopted the
-   newest generation it holds, so a reseeding or newly admitted node never
-   publishes early. If it does, the CRL is published at once. If not, the revocation is **owed**: the
-   CA-signed CRL is stored in a replicated `certificate/revocation_owed` health
-   condition (a degraded reason in `lv health`), the host notifies
-   `certificate.revocation_owed` daily, and every node publishes the CRL by
-   itself as soon as the voter set has moved on — any `lv cluster voter` change,
-   which the renewed voter signs with its new certificate. `--revoke-old`
-   revokes at once regardless; `--keep-old` not at all.
+7. Then the replaced certificate is **revoked, at once**. Every node on this
+   build already refuses it — as a voter, as a claim signer and on every RPC
+   (see "Superseded certificates") — so revoking it costs a pinning node
+   nothing. The revocation is held only while the cluster has a node that does
+   **not** pin: a live host on a different build (`--force`), or one running
+   with `auth.trust_rotated_peer_certs` (each node reports that switch as its
+   own `certificate/trust_rotated_peer_certs` condition, which is how the others
+   know). For such a node the newest voter generation, if it needed the replaced
+   certificate's accept, would stop verifying after the revocation
+   ([recovery-claims.md §4.1](design/recovery-claims.md)); so while one exists,
+   and only if the newest generation does need that accept, the revocation is
+   **owed**: the CA-signed CRL is stored in a replicated
+   `certificate/revocation_owed` health condition (a degraded reason in
+   `lv health`), the host notifies `certificate.revocation_owed` daily, and the
+   cluster publishes the CRL by itself as soon as no such node is left, or a
+   newer voter generation no longer needs the accept. `--revoke-old` revokes at
+   once regardless; `--keep-old` not at all.
 
-While a revocation is owed — or after `--keep-old` — the replaced certificate is
-still CA-valid, and its exposure is specific: peers no longer accept it as the
-host once the new serial is recorded, and accepts signed with it count neither
-in workload claim certificates nor in a voter generation this node has not yet
-adopted — each must be signed with the certificate recorded for its voter, or
-that certificate's CA-attested successor — so it cannot help decide anything
-new. (A node joining after the renewal cannot count it in the generation it
-adopts either, which is the voter-chain cost §4.1 describes; the next voter
-change ends it.) But it still authenticates as a **bearerless client**, which is
-`admin` unless `auth.strict_mtls_identity` is on, and as a TLS server to
-anything that dials it. Under `auth.trust_rotated_peer_certs` neither serial pin
-applies and established connections are not judged stale, so while that
-recovery switch is on, a replaced key's accepts DO count.
+   An owed revocation is published only by a node that can trust its own view:
+   its replica has caught up, it has adopted the newest voter generation it
+   holds, and a majority of that generation's members answer it now, each
+   having adopted it and none holding anything newer. A node on the minority
+   side of a partition, or one still mid-exchange after a heal, holds.
+
+#### Superseded certificates
+
+A successor is the CA's own statement that the certificate it names is no
+longer the host's identity. Every node collects that statement wherever it sees
+a successor — a TLS handshake in either direction, an accept carried in a claim
+or voter certificate, its own renewed identity — and keeps it node-locally in
+`pki_dir/superseded.pem` (re-verified against the CA on load, never replicated,
+only ever added to). A certificate a node holds a standing successor of is
+refused there:
+
+- its accepts do not count — in workload claim certificates or in a voter
+  generation the node has not yet adopted;
+- every new RPC on a connection made with it is refused, and the connection
+  drains as above;
+- it is never the host for peer trust, whatever the host's row says.
+
+None of this reads `hosts.cert_serial`. That column is replicated data any peer
+can write — a compromised host could write a renewed voter's record back to its
+replaced serial — so it decides nothing here; a host recorded with a serial
+whose revocation is owed is reported as `certificate/serial_regressed` (a pki
+directory restored from before a renewal, or a peer rewriting the row) and the
+revocation is published regardless. Only the CA can take a successor back: a
+successor it revokes unused (an abandoned renewal) hands the identity back to
+its predecessor; one revoked because it was renewed in turn does not.
+
+A node that holds no successor for a certificate does not refuse it on that
+ground; revocation is what ends it everywhere. Until it is revoked — while it is
+owed, or after `--keep-old` — the replaced certificate still authenticates as a
+**bearerless client** (`admin` unless `auth.strict_mtls_identity` is on) to a
+node that has not yet seen its successor, and as a TLS server to anything that
+dials it. Under `auth.trust_rotated_peer_certs` the supersession checks are off
+on that node — its serial pins and the stale-connection judge with them — so
+while that recovery switch is on, a replaced key's accepts DO count there.
+
+#### Renewing a voter
+
+A node that adopts a voter generation decided BEFORE one of its signers renewed
+cannot count that signer's pre-renewal accept (§4.1's cost). Most of the time
+this is invisible: every node adopts within seconds. A node that was offline,
+whose import was retrying, or that was admitted later can be left one
+generation short. It raises `certificate/voter_generation_stuck`, naming the
+generation and the fix: **decide one more voter change** from a node that has
+adopted the newest generation — `lv cluster voter add <host>`, or `lv cluster
+voter rm <host>` and then add it back. Its accepts carry current certificates,
+it becomes the stuck node's anchor, and the node adopts through it; the
+condition clears. If a MAJORITY of the newest generation's members are stuck
+like this, no change can be decided (a voter answers only at its adopted
+generation): set `auth.trust_rotated_peer_certs: true` on the stuck nodes and
+restart them, let them adopt, decide one voter change, then set it back to
+`false` and restart again. To avoid all of this, renew voters only when `lv
+cluster voter ls` shows every node on the newest generation.
 
 The renewal deletes the replaced key from the host's PKI directory and the copy
 `lv host init`/`lv host add` left on the CA machine (`<host>.key`, when it is
-that key). A legacy `host.key` that resolved OUTSIDE the PKI directory is no
+that key, together with `<host>.crt`, when it is the replaced certificate). A legacy `host.key` that resolved OUTSIDE the PKI directory is no
 longer used but is not deleted (the renewal cannot know what else uses that
 file); the command names it. Any other copy taken earlier is what `lv host
 revoke-cert` closes, at any time.
@@ -486,10 +539,14 @@ marked resolved or tombstoned without that is restored to owed, and a row whose
 evidence no longer carries a CA-signed CRL listing its serial raises the
 critical `certificate/revocation_owed_tampered` condition (and
 `certificate.revocation_owed_tampered`), telling the operator to publish it with
-`lv host revoke-cert`. A row deleted outright leaves the CA machine's
-`pki/renewals.json` as the record. A late publish is also never made for a
-serial a host is recorded with again (a pki directory restored from backup):
-that would fence the host, so the row stays owed until it is renewed.
+`lv host revoke-cert`. Only a node that can trust its view judges this (the
+same test as for publishing), after installing the cluster CRL that tick, and
+only once the row has looked dropped there for three minutes — the row and the
+CRL that justifies a legitimate resolve replicate independently, and a node
+holding the first without the second accuses no one. A node that cannot install
+the cluster CRL raises `certificate/crl_install_failed` once and judges nothing
+until it can. A row deleted outright leaves the CA machine's
+`pki/renewals.json` as the record.
 
 A recovery whose claim certificate was signed with the replaced key before the
 revocation lands is refused at execution (`recovery_claim_unproven`) and

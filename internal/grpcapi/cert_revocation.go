@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/big"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -22,26 +23,35 @@ import (
 
 // Revoking the certificate a renewal replaced.
 //
-// Revocation is the default — a replaced key that stays CA-valid is a live
-// client, server and vote-signing credential for the rest of its five years.
-// The one thing it can break is the voter chain: the newest voter generation's
-// certificate carries each member's accept, signed with the certificate it held
-// then, and a node that adopts that generation LATER verifies it against the
-// CRL (docs/design/recovery-claims.md §4.1). When revoking the replaced serial
-// would leave that generation short of a quorum of unrevoked signatures, the
-// revocation is OWED instead of dropped:
+// Revocation is the default, and it is IMMEDIATE. A replaced key that stays
+// CA-valid is a live client, server and vote-signing credential for the rest
+// of its five years, and on this build nothing needs it: the voter and claim
+// serial pin (corrosion.ClaimVerifier.WithSerialPin) already refuses its
+// accepts, whether or not it is revoked, on every node that holds the
+// successor — which every node collects from the renewed host's handshakes.
+//
+// A HOLD helps only a node that does NOT pin. Revoking the replaced serial
+// makes the newest voter generation unverifiable, for a node that adopts it
+// later, when that generation needed the serial's accept
+// (docs/design/recovery-claims.md §4.1); a pinning node cannot count that
+// accept either way, but a node that does not pin could, and revoking would
+// stall it. Two kinds of node do not pin: one on an older build, and one
+// running with auth.trust_rotated_peer_certs. So a revocation is held only
+// while the cluster has one of those (revocationHoldReason) AND the newest
+// generation would stop verifying for it (revocationSafeForVoters). Then it is
+// OWED:
 //
 //   - the CA-signed CRL (minted on the CA machine, which holds the only key that
 //     can sign one) is stored in a replicated health condition
 //     (certificate/revocation_owed), which every node lists as a degraded
 //     reason, and the host notifies certificate.revocation_owed daily;
-//   - every node re-checks owed revocations each minute and publishes the CRL
-//     as soon as the newest generation verifies with the serial revoked —
-//     typically after the next voter change, whose accepts the renewed voter
-//     signs with its new certificate;
-//   - meanwhile the claim serial pin (ClaimVerifier.PinnedTo) already refuses
-//     accepts signed with the replaced key, and peer trust refuses it as a
-//     peer, so what the hold leaves is a CA-valid client credential.
+//   - every node re-checks owed revocations on each certificate-watch tick and
+//     publishes the CRL as soon as no hold applies — the older build upgraded,
+//     trust_rotated_peer_certs turned off everywhere — or the newest generation
+//     verifies with the serial revoked. It publishes only from a replica it
+//     can trust with that judgement (owedPublishTrust): caught up, holding
+//     and having adopted the newest generation, and in contact with a voter
+//     majority of it that holds nothing newer.
 //
 // The storage reuses health_conditions' existing replicated statement shape, so
 // it reaches peers on the previous release without a new table, shape or
@@ -53,7 +63,62 @@ const (
 	certEvaluator       = "certificate"
 	condRevocationOwed  = "revocation_owed"
 	revocationOwedEvery = 24 * time.Hour
+
+	// condTrustRotated is each node's own report that it runs with
+	// auth.trust_rotated_peer_certs, which turns its serial pins off: the one
+	// configuration, besides an older build, for which an owed hold protects
+	// anything. Replicated so every node's hold decision can see it.
+	condTrustRotated = "trust_rotated_peer_certs"
+	// condCRLInstallFailed is raised by a node that cannot install the
+	// cluster CRL. It judges no owed row while it stands.
+	condCRLInstallFailed = "crl_install_failed"
+	// condSerialRegressed is raised for a host recorded (hosts.cert_serial)
+	// with a certificate whose revocation is owed: a pki dir restored from
+	// backup, or a peer rewriting the column. Display only — the column is
+	// peer-writable and decides nothing here.
+	condSerialRegressed = "serial_regressed"
 )
+
+// owedTamperSettle is how long an owed row must have looked dropped — marked
+// resolved or tombstoned with no CA-verified CRL revoking its serial — on THIS
+// node before it is judged tampered. The row and the CRL that justifies a
+// legitimate resolve replicate independently (health_conditions comes before
+// cluster_crl in an anti-entropy exchange, and broadcasts can be lost), so a
+// row resolved moments ago elsewhere is not yet evidence. The clock is local
+// observation, not a timestamp in the row, which the writer chooses. A var so
+// tests can shorten it.
+var owedTamperSettle = 3 * time.Minute
+
+// owedContactTimeout bounds each voter's answer in owedPublishTrust.
+var owedContactTimeout = 3 * time.Second
+
+// certRevocationState is what owed-revocation processing remembers between
+// ticks on this node.
+type certRevocationState struct {
+	mu sync.Mutex
+	// suspect is when this node first saw each owed row (subject id) dropped
+	// without proof.
+	suspect map[string]time.Time
+}
+
+func (st *certRevocationState) firstSuspect(subject string, now time.Time) time.Time {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.suspect == nil {
+		st.suspect = map[string]time.Time{}
+	}
+	if at, ok := st.suspect[subject]; ok {
+		return at
+	}
+	st.suspect[subject] = now
+	return now
+}
+
+func (st *certRevocationState) clearSuspect(subject string) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	delete(st.suspect, subject)
+}
 
 type revocationOwedEvidence struct {
 	Host   string `json:"host"`
@@ -62,8 +127,8 @@ type revocationOwedEvidence struct {
 	CRLPEM string `json:"crl_pem"`
 }
 
-// RevokeReplacedCertificate publishes req.CrlPem now if that is safe for the
-// voter chain, and otherwise records the revocation as owed (see above).
+// RevokeReplacedCertificate publishes req.CrlPem now, unless a hold applies
+// (see above), in which case it records the revocation as owed.
 func (s *Server) RevokeReplacedCertificate(ctx context.Context, req *pb.RevokeReplacedCertificateRequest) (*pb.RevokeReplacedCertificateResponse, error) {
 	if err := RequireRole(ctx, "admin"); err != nil {
 		return nil, err
@@ -79,16 +144,36 @@ func (s *Server) RevokeReplacedCertificate(ctx context.Context, req *pb.RevokeRe
 	if !crlLists(req.CrlPem, serial) {
 		return nil, status.Errorf(codes.InvalidArgument, "the CRL does not revoke %s", serial)
 	}
-	// Never the certificate a host is recorded with: that is `lv host rm`'s job,
-	// and done by accident it fences a healthy host.
+	// Never the certificate a host is recorded with — that is `lv host rm`'s
+	// job, and done by accident it fences a healthy host — unless the CA has
+	// demonstrably replaced it: the recorded column is replicated data any
+	// peer can write back to a replaced serial, and that must not keep the
+	// replaced certificate alive. The proof is the successor's CA signature,
+	// which this node holds once it has seen the host present it (a handshake;
+	// asked for here if need be).
 	if owner, err := hostRecordedWithSerial(ctx, s.db, serial); err != nil {
 		return nil, status.Errorf(codes.Unavailable, "read host records: %v", err)
-	} else if owner != "" {
+	} else if owner != "" && !s.knownReplaced(ctx, owner, serial) {
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"%s is the certificate the cluster records for %s; revoking it would cut that host off", serial, owner)
 	}
-	safe, why, err := s.revocationSafeForVoters(ctx, serial, false)
+	hold, err := s.revocationHoldReason(ctx)
 	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "check the cluster's builds: %v", err)
+	}
+	if hold == "" {
+		if err := s.publishCRL(ctx, req.CrlPem); err != nil {
+			return nil, err
+		}
+		return &pb.RevokeReplacedCertificateResponse{Revoked: true, Version: version}, nil
+	}
+	// Judging the voter chain for the node the hold protects needs the same
+	// trusted view an owed publish does: a stale replica's "newest
+	// generation" may not be the newest that exists.
+	safe, why := false, ""
+	if ok, untrusted := s.owedPublishTrust(ctx); !ok {
+		why = untrusted
+	} else if safe, why, err = s.revocationSafeForVoters(ctx, serial); err != nil {
 		return nil, status.Errorf(codes.Unavailable, "check the voter chain: %v", err)
 	}
 	if safe {
@@ -97,10 +182,34 @@ func (s *Server) RevokeReplacedCertificate(ctx context.Context, req *pb.RevokeRe
 		}
 		return &pb.RevokeReplacedCertificateResponse{Revoked: true, Version: version}, nil
 	}
+	why = hold + "; " + why
 	if err := s.recordRevocationOwed(ctx, req.Host, serial, why, req.CrlPem); err != nil {
 		return nil, status.Errorf(codes.Internal, "record the owed revocation: %v", err)
 	}
 	return &pb.RevokeReplacedCertificateResponse{Held: true, Reason: why, Version: version}, nil
+}
+
+// knownReplaced reports whether this node holds standing CA proof that host's
+// certificate serial was replaced, asking the host for the certificate it
+// presents (whose handshake hands over the proof) when it does not yet.
+func (s *Server) knownReplaced(ctx context.Context, host, serial string) bool {
+	if _, ok := pki.SupersededBy(s.pkiDir, host, serial); ok {
+		return true
+	}
+	if host == s.hostName {
+		if leaf, err := pki.ServedHostCertificate(s.pkiDir); err == nil {
+			pki.NoteSuccessor(s.pkiDir, leaf)
+		}
+	} else {
+		pctx, cancel := context.WithTimeout(ctx, owedContactTimeout)
+		if cl, closer, err := s.dialPeer(pctx, host); err == nil {
+			_, _ = cl.Ping(pctx, &pb.PingRequest{}) // the handshake is the point
+			closer()
+		}
+		cancel()
+	}
+	_, ok := pki.SupersededBy(s.pkiDir, host, serial)
+	return ok
 }
 
 func (s *Server) publishCRL(ctx context.Context, crlPEM string) error {
@@ -132,9 +241,67 @@ func hostRecordedWithSerial(ctx context.Context, db *corrosion.Client, serial st
 	return rows[0].String("name"), nil
 }
 
+// revocationHoldReason says why the cluster may have a node that does NOT pin
+// voter and claim accepts to unreplaced certificates — the only node an owed
+// hold protects — or "" when it has none: every live host reports this build,
+// and no node runs with auth.trust_rotated_peer_certs. A replica that has not
+// caught up cannot rule either out, and says so.
+//
+// Both inputs are replicated rows a compromised peer could write. Forging one
+// only buys a HOLD, and a held certificate is still refused by every pinning
+// node — as a voter, as a claim signer and on every RPC (connIdentityGate).
+func (s *Server) revocationHoldReason(ctx context.Context) (string, error) {
+	if ok, why := s.db.ReplicaCaughtUp(); !ok {
+		return "this node's replica is not trusted yet (" + why + "), so a host on an older build cannot be ruled out", nil
+	}
+	if s.trustRotatedPeerCerts.Load() {
+		return "this node runs with auth.trust_rotated_peer_certs, which turns its serial pins off", nil
+	}
+	hosts, err := corrosion.ListHosts(ctx, s.db)
+	if err != nil {
+		return "", err
+	}
+	builds := map[string][]string{}
+	live := map[string]bool{}
+	for _, h := range hosts {
+		builds[h.Version] = append(builds[h.Version], h.Name)
+		live[h.Name] = true
+	}
+	if len(builds) > 1 {
+		var parts []string
+		for v, names := range builds {
+			if v == "" {
+				v = "unknown"
+			}
+			sort.Strings(names)
+			parts = append(parts, fmt.Sprintf("%s on %s", strings.Join(names, ","), v))
+		}
+		sort.Strings(parts)
+		return "hosts run different builds (" + strings.Join(parts, "; ") + "), and an older one does not pin " +
+			"accepts to unreplaced certificates", nil
+	}
+	conds, deleted, err := corrosion.ListHealthConditionsByCode(ctx, s.db, certEvaluator, condTrustRotated)
+	if err != nil {
+		return "", err
+	}
+	var on []string
+	for i, c := range conds {
+		if deleted[i] || c.Lifecycle == corrosion.ConditionResolved || !live[c.SubjectID] {
+			continue
+		}
+		on = append(on, c.SubjectID)
+	}
+	if len(on) > 0 {
+		sort.Strings(on)
+		return "auth.trust_rotated_peer_certs is on at " + strings.Join(on, ",") + ", which turns their serial pins off", nil
+	}
+	return "", nil
+}
+
 // revocationSafeForVoters reports whether revoking serial keeps the newest
-// voter generation verifiable against the CRL — the anchor a node adopting it
-// later needs (§4.1).
+// voter generation verifiable against the CRL for a node that does NOT pin —
+// the anchor such a node needs when it adopts it later (§4.1). Asked only
+// while a hold applies (revocationHoldReason).
 //
 // It only ever says "safe" from a voter state this node can trust: a replica
 // that has completed an anti-entropy exchange since it started (or last lost
@@ -143,13 +310,11 @@ func hostRecordedWithSerial(ctx context.Context, db *corrosion.Client, serial st
 // admitted or long-partitioned node can hold the row with an empty or partial
 // chain — so anything less is "not yet known" and holds.
 //
-// owed distinguishes the two callers. For an OWED revocation, a replica with
-// no voter generation at all is incomplete by definition (the row exists
-// because a generation needed the serial) and holds. For a fresh request it
-// means the cluster has never decided a generation, so nothing is signed with
-// the serial and it is safe. A newest generation that does not verify here
-// holds in both cases: this replica cannot judge it.
-func (s *Server) revocationSafeForVoters(ctx context.Context, serial string, owed bool) (bool, string, error) {
+// No voter generation at all means nothing is signed with the serial: safe.
+// Both callers ask only from a replica owedPublishTrust vouches for, so "none
+// here" is "none at a voter majority". A newest generation that does not
+// verify here holds: this replica cannot judge it.
+func (s *Server) revocationSafeForVoters(ctx context.Context, serial string) (bool, string, error) {
 	if ok, why := s.db.ReplicaCaughtUp(); !ok {
 		return false, "this node's replica is not trusted yet (" + why + ")", nil
 	}
@@ -158,9 +323,9 @@ func (s *Server) revocationSafeForVoters(ctx context.Context, serial string, owe
 		return false, "", err
 	}
 	if len(rows) == 0 {
-		if owed {
-			return false, "this replica holds no voter generation yet, and an owed revocation implies one", nil
-		}
+		// Nothing is signed with the serial. For an owed revocation the
+		// caller has established (owedPublishTrust) that a voter majority
+		// holds no generation either.
 		return true, "", nil
 	}
 	newest := rows[len(rows)-1]
@@ -182,15 +347,116 @@ func (s *Server) revocationSafeForVoters(ctx context.Context, serial string, owe
 	if err != nil {
 		return false, "", err
 	}
-	v = v.WithoutSerialPin() // revocation, not the pin, is the question here
+	v = v.WithoutSerialPin() // the node the hold protects does not pin
 	if err := verifyRowSignatures(v, prev, newest); err != nil {
 		return false, fmt.Sprintf("voter generation %d does not verify on this node (%v)", newest.Generation, err), nil
 	}
 	if err := verifyRowSignatures(v.WithRevoked(serial), prev, newest); err != nil {
-		return false, fmt.Sprintf("voter generation %d would no longer verify for a node that adopts it later "+
-			"(%v); the revocation is published once a newer generation does", newest.Generation, err), nil
+		return false, fmt.Sprintf("voter generation %d would no longer verify for a node that does not pin and "+
+			"adopts it later (%v); the revocation is published once a newer generation does, or once no such "+
+			"node is left", newest.Generation, err), nil
 	}
 	return true, "", nil
+}
+
+// owedPublishTrust reports whether this node may judge and publish owed
+// revocations — and judge an owed row tampered — from its own replica. That is
+// the voter-decision notion of a trusted replica:
+//
+//   - it has caught up (an anti-entropy exchange completed since it started or
+//     last lost every peer);
+//   - it has ADOPTED the newest voter generation it holds (none, before
+//     genesis);
+//   - a majority of that generation's members (the derived voter set when it
+//     has none) answer now, each having adopted it, and none holds a newer
+//     one. A minority partition cannot assemble that majority, and a node
+//     mid-exchange after a heal — which can hold a peer's owed row before the
+//     generation that supersedes its own, or before any generation at all —
+//     hears of the newer generation from the members and holds.
+func (s *Server) owedPublishTrust(ctx context.Context) (bool, string) {
+	if ok, why := s.db.ReplicaCaughtUp(); !ok {
+		return false, "this node's replica is not trusted yet (" + why + ")"
+	}
+	rows, err := corrosion.ListVoterConfigs(ctx, s.db)
+	if err != nil {
+		return false, "voter generations could not be read: " + err.Error()
+	}
+	adopted, err := corrosion.AdoptedVoterGeneration(ctx, s.db)
+	if err != nil {
+		return false, "the adopted voter generation could not be read: " + err.Error()
+	}
+	newest := &corrosion.VoterConfig{}
+	if len(rows) > 0 {
+		newest = rows[len(rows)-1]
+	}
+	if adopted < newest.Generation {
+		return false, fmt.Sprintf("this node has adopted voter generation %d of %d", adopted, newest.Generation)
+	}
+	var members []string
+	if newest.Explicit() {
+		members = newest.Names()
+	} else {
+		set, err := corrosion.DerivedVoterSet(ctx, s.db)
+		if err != nil {
+			return false, "the derived voter set could not be read: " + err.Error()
+		}
+		for n := range set {
+			members = append(members, n)
+		}
+		sort.Strings(members)
+	}
+	need := corrosion.MajorityOf(len(members))
+	type answer struct {
+		name             string
+		adopted, highest int64
+		err              error
+	}
+	answers := make(chan answer, len(members))
+	var wg sync.WaitGroup
+	for _, m := range members {
+		if m == s.hostName {
+			answers <- answer{name: m, adopted: adopted, highest: newest.Generation}
+			continue
+		}
+		wg.Add(1)
+		go func(m string) {
+			defer wg.Done()
+			pctx, cancel := context.WithTimeout(ctx, owedContactTimeout)
+			defer cancel()
+			cl, closer, err := s.dialPeer(pctx, m)
+			if err != nil {
+				answers <- answer{name: m, err: err}
+				return
+			}
+			defer closer()
+			resp, err := cl.GetVoterConfig(pctx, &pb.GetVoterConfigRequest{})
+			if err != nil {
+				answers <- answer{name: m, err: err}
+				return
+			}
+			answers <- answer{name: m, adopted: resp.GetAdoptedGeneration(), highest: resp.GetLatestGeneration()}
+		}(m)
+	}
+	wg.Wait()
+	close(answers)
+	count := 0
+	for a := range answers {
+		if a.err != nil {
+			continue
+		}
+		if a.highest > newest.Generation || a.adopted > newest.Generation {
+			return false, fmt.Sprintf("%s holds voter generation %d, newer than this node's %d; this replica is "+
+				"behind", a.name, max(a.highest, a.adopted), newest.Generation)
+		}
+		if a.adopted == newest.Generation {
+			count++
+		}
+	}
+	if count < need {
+		return false, fmt.Sprintf("in contact with %d of the %d members of voter generation %d that have adopted it; "+
+			"needs %d", count, len(members), newest.Generation, need)
+	}
+	return true, ""
 }
 
 func (s *Server) recordRevocationOwed(ctx context.Context, host, serial, why, crlPEM string) error {
@@ -217,10 +483,12 @@ var owedNotified sync.Map // subject id -> time.Time
 // not in the installed CRL: a peer dropped it without publishing it.
 const condRevocationTampered = "revocation_owed_tampered"
 
-// ProcessOwedRevocations publishes every owed revocation that has become safe
-// and resolves its condition; one that is still unsafe is re-announced daily
-// by the host it belongs to. Safe to run on every node at once: a CRL is
-// stored keyed by its own bytes, and resolving twice writes the same state.
+// ProcessOwedRevocations runs on every certificate-watch tick. It reports this
+// node's trust_rotated_peer_certs posture, then publishes every owed
+// revocation that no hold applies to any more and resolves its condition; one
+// still held is re-announced daily by the host it belongs to. Safe to run on
+// every node at once: a CRL is stored keyed by its own bytes, and resolving
+// twice writes the same state.
 //
 // "Done" requires proof, not a row state. The row is replicated data any peer
 // can write, so a revocation counts as done only when its serial is in the
@@ -228,16 +496,50 @@ const condRevocationTampered = "revocation_owed_tampered"
 // tombstoned without that is put back to owed and raised as
 // certificate/revocation_owed_tampered; so is a row whose evidence no longer
 // carries a CA-signed CRL listing its serial (the serial is read from the
-// row's key, which an overwrite cannot change).
+// row's key, which an overwrite cannot change). That judgement is made only
+// from a trusted replica (owedPublishTrust), only after the cluster CRL has
+// been installed this tick, and only once the row has looked dropped here for
+// owedTamperSettle — so a node that holds a legitimately resolved row before
+// the CRL that justifies it accuses no one. A node that cannot install the
+// cluster CRL raises one condition (certificate/crl_install_failed) and judges
+// nothing until it can, so it never contests a row it cannot check.
 func (s *Server) ProcessOwedRevocations(ctx context.Context) {
 	if s.db == nil {
 		return
 	}
+	s.reportTrustRotated(ctx)
 	conds, deleted, err := corrosion.ListHealthConditionsByCode(ctx, s.db, certEvaluator, condRevocationOwed)
-	if err != nil {
+	if err != nil || len(conds) == 0 {
 		return
 	}
-	_, _ = corrosion.SyncClusterCRL(ctx, s.db, s.pkiDir)
+	if _, err := corrosion.SyncClusterCRL(ctx, s.db, s.pkiDir); err != nil {
+		s.setOwnCondition(ctx, condCRLInstallFailed, corrosion.SeverityWarning, true,
+			"this node could not install the cluster CRL ("+err.Error()+"); it judges no owed revocation until it "+
+				"can — check pki_dir/crl.pem and the daemon log")
+		return
+	}
+	s.setOwnCondition(ctx, condCRLInstallFailed, corrosion.SeverityWarning, false, "")
+	// Judged at most once per tick, and only when some row needs it.
+	var (
+		trustDone, trusted, holdDone bool
+		untrustedWhy, hold           string
+		holdErr                      error
+	)
+	trust := func() (bool, string) {
+		if !trustDone {
+			trusted, untrustedWhy = s.owedPublishTrust(ctx)
+			trustDone = true
+		}
+		return trusted, untrustedWhy
+	}
+	holdReason := func() (string, error) {
+		if !holdDone {
+			hold, holdErr = s.revocationHoldReason(ctx)
+			holdDone = true
+		}
+		return hold, holdErr
+	}
+	now := time.Now()
 	for i, cnd := range conds {
 		host, serial, ok := strings.Cut(cnd.SubjectID, "/")
 		n := mustSerialInt(serial)
@@ -246,7 +548,9 @@ func (s *Server) ProcessOwedRevocations(ctx context.Context) {
 		}
 		serial = strings.ToLower(serial)
 		if pki.IsCertRevoked(s.pkiDir, n) {
+			s.certRev.clearSuspect(cnd.SubjectID)
 			s.settleTamper(ctx, host, serial)
+			s.settleRegressed(ctx, serial)
 			if cnd.Lifecycle != corrosion.ConditionResolved && !deleted[i] {
 				s.resolveOwed(ctx, cnd)
 			}
@@ -260,11 +564,19 @@ func (s *Server) ProcessOwedRevocations(ctx context.Context) {
 			}
 		}
 		if !evOK {
-			s.raiseTamper(ctx, host, serial, "its evidence no longer carries a CA-signed CRL revoking it — "+
-				"publish one from the CA machine with `lv host revoke-cert "+host+" --serial "+serial+"`")
+			if ok, _ := trust(); ok {
+				s.raiseTamper(ctx, host, serial, "its evidence no longer carries a CA-signed CRL revoking it — "+
+					"publish one from the CA machine with `lv host revoke-cert "+host+" --serial "+serial+"`")
+			}
 			continue
 		}
 		if cnd.Lifecycle == corrosion.ConditionResolved || deleted[i] {
+			if ok, _ := trust(); !ok {
+				continue
+			}
+			if now.Sub(s.certRev.firstSuspect(cnd.SubjectID, now)) < owedTamperSettle {
+				continue // the CRL that justifies it may still be on its way
+			}
 			s.raiseTamper(ctx, host, serial, "its row was marked done although the serial was never revoked; "+
 				"it is owed again")
 			cnd.Lifecycle, cnd.ResolvedAt = corrosion.ConditionConfirmed, ""
@@ -272,42 +584,122 @@ func (s *Server) ProcessOwedRevocations(ctx context.Context) {
 				slog.Warn("could not restore an owed revocation", "serial", serial, "error", err)
 			}
 		}
-		if blocked := s.owedBlockedReason(ctx, serial); blocked != "" {
-			s.remindOwed(ctx, cnd.SubjectID, host, serial, blocked)
+		s.certRev.clearSuspect(cnd.SubjectID)
+		s.reportRegressed(ctx, host, serial)
+		ok, why := trust()
+		if !ok {
+			s.remindOwed(ctx, cnd.SubjectID, host, serial, why)
 			continue
 		}
-		safe, why, err := s.revocationSafeForVoters(ctx, serial, true)
+		h, err := holdReason()
 		if err != nil {
 			continue
 		}
-		if !safe {
-			s.remindOwed(ctx, cnd.SubjectID, host, serial, why)
-			continue
+		if h != "" {
+			safe, why, err := s.revocationSafeForVoters(ctx, serial)
+			if err != nil {
+				continue
+			}
+			if !safe {
+				s.remindOwed(ctx, cnd.SubjectID, host, serial, h+"; "+why)
+				continue
+			}
 		}
 		if err := s.publishCRL(ctx, ev.CRLPEM); err != nil {
 			slog.Warn("could not publish an owed revocation; retrying", "serial", serial, "error", err)
 			continue
 		}
-		slog.Warn("published an owed revocation now that the voter chain allows it", "host", host, "serial", serial)
+		slog.Warn("published an owed revocation now that nothing holds it", "host", host, "serial", serial)
 		s.notify(ctx, notify.Notification{Kind: "certificate.revoked", Severity: notify.SevInfo, Subject: host,
 			Detail: fmt.Sprintf("the replaced certificate %s is now revoked", serial)})
 		s.resolveOwed(ctx, cnd)
+		s.settleRegressed(ctx, serial)
 	}
 }
 
-// owedBlockedReason is why an owed serial must not be published whatever the
-// voter chain says: a host is recorded with it again (a pki dir restored from
-// backup, say), and revoking it would cut that host off and get it fenced.
-func (s *Server) owedBlockedReason(ctx context.Context, serial string) string {
+// reportRegressed raises serial_regressed (display only) when a live host is
+// recorded with an owed serial. It never blocks the publish: the column is
+// peer-writable, and a host that really presents a replaced certificate is
+// refused by every node that holds the successor anyway. Such a host — a pki
+// dir restored from a backup taken before a renewal — is cut off once the
+// revocation is published; renew it again, or re-initialise it.
+func (s *Server) reportRegressed(ctx context.Context, host, serial string) {
 	owner, err := hostRecordedWithSerial(ctx, s.db, serial)
+	if err != nil || owner == "" {
+		s.settleRegressed(ctx, serial)
+		return
+	}
+	s.setCondition(ctx, condSerialRegressed, owner+"/"+serial, owner, corrosion.SeverityWarning, true,
+		fmt.Sprintf("%s is recorded with %s, a certificate whose revocation is owed after a renewal of %s. "+
+			"Either its pki dir was restored from before the renewal, or a peer rewrote the record. The "+
+			"revocation is published regardless; if %s really presents %s, renew or re-initialise it",
+			owner, serial, host, owner, serial))
+}
+
+func (s *Server) settleRegressed(ctx context.Context, serial string) {
+	conds, deleted, err := corrosion.ListHealthConditionsByCode(ctx, s.db, certEvaluator, condSerialRegressed)
 	if err != nil {
-		return "host records could not be read: " + err.Error()
+		return
 	}
-	if owner != "" {
-		return fmt.Sprintf("%s is recorded as %s's live certificate again; publishing would fence %s — renew %s, "+
-			"after which the revocation proceeds", serial, owner, owner, owner)
+	for i, c := range conds {
+		if deleted[i] || c.Lifecycle == corrosion.ConditionResolved || !strings.HasSuffix(c.SubjectID, "/"+serial) {
+			continue
+		}
+		s.resolveOwed(ctx, c)
 	}
-	return ""
+}
+
+// reportTrustRotated keeps this node's certificate/trust_rotated_peer_certs
+// condition in step with its own flag, writing only on a change.
+func (s *Server) reportTrustRotated(ctx context.Context) {
+	s.setOwnCondition(ctx, condTrustRotated, corrosion.SeverityWarning, s.trustRotatedPeerCerts.Load(),
+		"auth.trust_rotated_peer_certs is on: this node relaxes the peer serial pin, the voter and claim serial pins "+
+			"and the stale-connection judge, and the cluster holds the revocation of replaced certificates while it "+
+			"is on. Turn it off once the fleet has replicated its re-recorded serials")
+}
+
+// setOwnCondition raises or resolves a certificate condition about this host.
+func (s *Server) setOwnCondition(ctx context.Context, code, severity string, raised bool, detail string) {
+	s.setCondition(ctx, code, s.hostName, s.hostName, severity, raised, detail)
+}
+
+// setCondition raises (raised) or resolves the certificate condition
+// code/subject, writing only when its state changes.
+func (s *Server) setCondition(ctx context.Context, code, subject, host, severity string, raised bool, detail string) {
+	if s.db == nil {
+		return
+	}
+	cur, ok, err := corrosion.GetHealthCondition(ctx, s.db, certEvaluator, code, "host", subject)
+	if err != nil {
+		return
+	}
+	active := ok && cur.Lifecycle != corrosion.ConditionResolved
+	ts := time.Now().UTC().Format(time.RFC3339)
+	if !raised {
+		if active {
+			s.resolveOwed(ctx, cur)
+		}
+		return
+	}
+	ev, _ := json.Marshal(map[string]string{"host": host, "detail": detail})
+	if active && cur.Evidence == string(ev) {
+		return
+	}
+	first := ts
+	if active && cur.FirstSeen != "" {
+		first = cur.FirstSeen
+	}
+	if err := corrosion.UpsertHealthCondition(ctx, s.db, corrosion.HealthCondition{
+		Evaluator: certEvaluator, Code: code, SubjectKind: "host", SubjectID: subject,
+		Lifecycle: corrosion.ConditionConfirmed, Severity: severity, Hosts: []string{host},
+		Evidence: string(ev), ObserveCount: 1, FirstSeen: first, LastSeen: ts, ConfirmedAt: first, Reporter: s.hostName,
+	}); err != nil {
+		slog.Warn("could not record a certificate condition", "code", code, "subject", subject, "error", err)
+		return
+	}
+	if !active {
+		slog.Warn("certificate condition raised", "code", code, "subject", subject, "detail", detail)
+	}
 }
 
 func (s *Server) remindOwed(ctx context.Context, subject, host, serial, why string) {
@@ -367,33 +759,38 @@ func mustSerialInt(hexSerial string) *big.Int {
 }
 
 // ConnJudge is this server's policy for established connections
-// (pki.ConnTracker): a connection is closed when the client certificate it was
-// made with has since been revoked, when the host certificate THIS side served
-// on it has been, or when it was made with a host certificate the peer pin no
-// longer accepts — the certificate a renewal replaced, once the renewed serial
-// is recorded. The client reconnects with a fresh handshake.
+// (pki.ConnTracker): a connection is closed AT ONCE when the client
+// certificate it was made with has since been revoked, or the host certificate
+// THIS side served on it has been; it drains (no new RPC, closed once its RPCs
+// in flight end) when it was made with a host certificate that is no longer
+// the host's — one the CA has replaced (pki.SupersededBy), or, as the peer pin
+// has it, one the cluster no longer records that is not the recorded serial's
+// successor. The client reconnects with a fresh handshake.
 //
 // Build one per sweep: it reads the hosts table once, the first time a host
 // certificate needs judging, and keeps it for that sweep only.
-func (s *Server) ConnJudge(ctx context.Context) func(pki.TrackedConn) (bool, string) {
+func (s *Server) ConnJudge(ctx context.Context) func(pki.TrackedConn) pki.Verdict {
 	revoked := pki.RevocationChecker(s.pkiDir)
 	var hosts map[string]hostPin
-	return func(c pki.TrackedConn) (bool, string) {
+	return func(c pki.TrackedConn) pki.Verdict {
 		if c.Peer != nil && revoked(c.Peer.SerialNumber) {
-			return true, "the client certificate was revoked"
+			return pki.Verdict{Close: true, Immediate: true, Reason: "the client certificate was revoked"}
 		}
 		if n := mustSerialInt(c.ServedSerial); c.ServedSerial != "" && n != nil && revoked(n) {
-			return true, "the certificate this host served on it was revoked"
+			return pki.Verdict{Close: true, Immediate: true, Reason: "the certificate this host served on it was revoked"}
 		}
-		if c.Peer != nil && isHostCert(c.Peer) && !s.trustRotatedPeerCerts {
+		if c.Peer != nil && isHostCert(c.Peer) && !s.trustRotatedPeerCerts.Load() {
+			if err := pki.SupersededError(s.pkiDir, c.Peer); err != nil {
+				return pki.Verdict{Close: true, Reason: err.Error()}
+			}
 			if hosts == nil {
 				hosts = s.readHostPins(ctx)
 			}
 			if staleHostIdentity(hosts, c.Peer) {
-				return true, "made with a host certificate the cluster no longer records"
+				return pki.Verdict{Close: true, Reason: "made with a host certificate the cluster no longer records"}
 			}
 		}
-		return false, ""
+		return pki.Verdict{}
 	}
 }
 

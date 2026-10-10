@@ -107,9 +107,9 @@ func CertificateAuthorizesProof(certJSON string, p ActionProof) (ClaimCertificat
 //     members of it signed at one ballot, each with the incarnation its entry
 //     records;
 //  5. every counted accept's certificate chains to the cluster CA, names the
-//     voter, is not revoked, is the certificate recorded for that voter in
-//     hosts.cert_serial (or its CA-attested successor; ClaimVerifier.PinnedTo),
-//     and its signature verifies.
+//     voter, is not revoked, has not been replaced by a CA-issued renewal this
+//     node holds proof of (ClaimVerifier.WithSerialPin), and its signature
+//     verifies.
 //
 // It reads nothing but this node's own replica and makes no RPC: execution
 // stays independent of voter reachability beyond the quorum ExecutionGate
@@ -149,7 +149,7 @@ func VerifyClaimCertificate(ctx context.Context, c *Client, v *ClaimVerifier, p 
 		return cert, fmt.Errorf("voter generation %d has no members to have certified anything", cert.ConfigGeneration)
 	}
 	if !v.Pinned() && !v.SerialPinDisabled() {
-		v = v.PinnedTo(RecordedHostSerial(ctx, c))
+		v = v.WithSerialPin()
 	}
 	err = v.Verify(cert, CertExpectation{
 		Key: cert.Key, ValueDigest: cert.ValueDigest, ConfigGeneration: cert.ConfigGeneration,
@@ -487,26 +487,4 @@ func UncertifiedProofSource(p ActionProof) (string, bool) {
 		return "", false
 	}
 	return ref.Host, true
-}
-
-// RecordedHostSerial is the serial pin's lookup over c: the certificate serial
-// recorded for a live host row. No row, a tombstone (removal revokes the
-// certificate instead), or an unrecorded serial leaves the voter unpinned; a
-// failed read is an error, which refuses — an unreadable row cannot rule out
-// that the accept was signed with a replaced key.
-func RecordedHostSerial(ctx context.Context, c *Client) func(string) (string, bool, error) {
-	return func(name string) (string, bool, error) {
-		rows, err := c.Query(ctx, `SELECT cert_serial, deleted_at FROM hosts WHERE name = ?`, name)
-		if err != nil {
-			return "", false, err
-		}
-		if len(rows) == 0 || rows[0].String("deleted_at") != "" {
-			return "", false, nil
-		}
-		s := strings.ToLower(rows[0].String("cert_serial"))
-		if s == "" || s == "unknown" {
-			return "", false, nil
-		}
-		return s, true, nil
-	}
 }

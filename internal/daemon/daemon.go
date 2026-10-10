@@ -1580,9 +1580,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	rpcMetrics := metrics.NewRPCMetrics()
 	// Established connections are re-judged every few seconds (pki.ConnTracker):
 	// one made with a certificate since revoked, or with a host certificate a
-	// renewal replaced, is closed and its client re-handshakes.
+	// renewal replaced, drains and is closed, and its client re-handshakes. The
+	// auth interceptors refuse a new RPC on such a connection at once, without
+	// waiting for a sweep (Server.connIdentityGate).
 	connTracker := pki.NewConnTracker(d.cfg.PKIDir)
-	go connTracker.Run(ctx, connSweepInterval, func() func(pki.TrackedConn) (bool, string) { return svc.ConnJudge(ctx) })
+	go connTracker.Run(ctx, connSweepInterval, func() func(pki.TrackedConn) pki.Verdict { return svc.ConnJudge(ctx) })
 	grpcOpts := []grpc.ServerOption{
 		grpc.Creds(connTracker.ServerCreds(credentials.NewTLS(tlsCfg))),
 		grpc.StatsHandler(connTracker.StatsHandler()),

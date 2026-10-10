@@ -52,9 +52,10 @@ import (
 //     merely fails proves nothing either way, so nothing is undone on it. A
 //     successor that was issued and then abandoned is revoked.
 //   - Then the replaced certificate is revoked (RevokeReplacedCertificate):
-//     at once, or — when that would leave the newest voter generation
-//     unverifiable for a node adopting it later — as an owed revocation the
-//     cluster publishes itself once it is safe.
+//     at once — or, only while some node does not pin accepts to unreplaced
+//     certificates (an older build, auth.trust_rotated_peer_certs) and
+//     revoking would leave the newest voter generation unverifiable for it,
+//     as an owed revocation the cluster publishes itself once that ends.
 //   - An audit admission record (audit-rejoin.json) is bound to the host
 //     certificate's serial; it is re-signed for the new serial.
 //
@@ -69,8 +70,8 @@ type RenewCertOptions struct {
 	GRPCPort int
 	// KeepOld leaves the replaced certificate unrevoked.
 	KeepOld bool
-	// RevokeOld revokes the replaced certificate immediately, even when the
-	// voter chain would hold it.
+	// RevokeOld revokes the replaced certificate immediately, even when a
+	// hold would apply.
 	RevokeOld bool
 	// Force renews although hosts run different builds.
 	Force bool
@@ -303,7 +304,7 @@ func renewHostCert(ctx context.Context, c pb.LiteVirtClient, r remotePKI, probe 
 		// and audit verification does not consult the CRL. A restart (or
 		// rotate-audit-key, which restarts) retires it at a signed boundary.
 		fmt.Printf("  NOTE: %s signs audit rows with its host key and keeps using the replaced one until its\n", hostName)
-		fmt.Printf("  daemon restarts; run `lv host rotate-audit-key %s` to retire it now at a signed boundary\n", hostName)
+		fmt.Printf("  daemon restarts; run `%s` to retire it now at a signed boundary\n", rotateAuditKeyHint(hostName, opts.SSHTarget))
 	}
 	if rejoin != nil {
 		fmt.Println("  the host's audit admission record was re-signed for the new serial")
@@ -367,10 +368,12 @@ func revokeReplaced(ctx context.Context, c pb.LiteVirtClient, hostName, serial s
 	}
 	logRenewal(pkiDir, renewalEntry{Host: hostName, Serial: serial, State: "owed"})
 	fmt.Printf("  the replaced certificate %s is OWED revocation, not revoked yet: %s.\n", serial, resp.Reason)
-	fmt.Println("  The cluster holds the signed CRL as a degraded condition (certificate/revocation_owed),")
-	fmt.Println("  publishes it by itself once the voter set has moved on, and notifies")
-	fmt.Println("  certificate.revocation_owed daily meanwhile. Accepts signed with the replaced key")
-	fmt.Println("  already do not count (the claim serial pin), and peers do not accept it as the host.")
+	fmt.Println("  A hold applies only while some node does not pin accepts to unreplaced certificates (an")
+	fmt.Println("  older build, or auth.trust_rotated_peer_certs on). The cluster holds the signed CRL as a")
+	fmt.Println("  degraded condition (certificate/revocation_owed), publishes it by itself once that is no")
+	fmt.Println("  longer so, and notifies certificate.revocation_owed daily meanwhile. Every node on this")
+	fmt.Println("  build already refuses the replaced certificate: as a voter, as a claim signer, and on")
+	fmt.Println("  every RPC.")
 	fmt.Printf("  To revoke it now regardless: `lv host revoke-cert %s --serial %s`\n", hostName, serial)
 	return nil
 }
@@ -387,11 +390,26 @@ func abandonIssued(ctx context.Context, c pb.LiteVirtClient, hostName, serial, w
 	return nil
 }
 
-// removeCAMachineCopy deletes the copy of the replaced host key that `lv host
-// init` / `lv host add` left in this machine's pki directory (<host>.key), when
-// it is that key: a renewal retires the key, and a copy here would outlive it.
+// rotateAuditKeyHint is the rotate-audit-key command for hostName, reaching it
+// the way this renewal did: an explicit --ssh target is passed on, or the
+// command would dial root@<host> and fail where the renewal succeeded.
+func rotateAuditKeyHint(hostName, sshTarget string) string {
+	if sshTarget != "" && sshTarget != "root@"+hostName {
+		return fmt.Sprintf("lv host rotate-audit-key %s --ssh %s", hostName, sshTarget)
+	}
+	return "lv host rotate-audit-key " + hostName
+}
+
+// removeCAMachineCopy deletes the copy of the replaced host pair that `lv host
+// init` / `lv host add` left in this machine's pki directory (<host>.key and
+// <host>.crt), when it is that pair: a renewal retires the key, and a copy here
+// would outlive it. The key goes only when it matches the replaced certificate;
+// the certificate goes with it, never alone, and only when it IS the replaced
+// certificate — so no half pair is left behind for a later `lv host add` or a
+// human to trip on.
 func removeCAMachineCopy(pkiDir, hostName string, prev *x509.Certificate) {
 	keyPath := filepath.Join(pkiDir, hostName+".key")
+	crtPath := filepath.Join(pkiDir, hostName+".crt")
 	b, err := os.ReadFile(keyPath)
 	if err != nil {
 		return
@@ -404,6 +422,15 @@ func removeCAMachineCopy(pkiDir, hostName string, prev *x509.Certificate) {
 		return
 	}
 	fmt.Printf("  removed this machine's copy of the replaced key (%s)\n", keyPath)
+	if cb, err := os.ReadFile(crtPath); err == nil {
+		if c, err := pki.ParseCertPEM(cb); err == nil && c.Equal(prev) {
+			if err := os.Remove(crtPath); err != nil {
+				fmt.Printf("  NOTE: could not remove this machine's copy of the replaced certificate %s: %v\n", crtPath, err)
+				return
+			}
+			fmt.Printf("  removed this machine's copy of the replaced certificate (%s)\n", crtPath)
+		}
+	}
 }
 
 func pemOfCert(c *x509.Certificate) []byte {

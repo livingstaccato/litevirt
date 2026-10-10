@@ -300,6 +300,14 @@ const (
 		   updated_at = excluded.updated_at, deleted_at = NULL`
 	// The isolation writers keep hosts' guards: record only over epoch 0,
 	// clear only the pinned epoch (isolation.go says why).
+	// hostMembershipStateOnlySQL changes state on a row that EXISTS and
+	// nothing else. A writer on a node whose hosts copy is frozen and that has
+	// no membership row for the host uses it instead of the upsert: an insert
+	// would take its isolation pair from the frozen copy (re-review m1). A
+	// receiver without the row applies nothing; the row reaches it, with this
+	// state, by anti-entropy from any node that had it.
+	hostMembershipStateOnlySQL = `UPDATE host_membership SET state = ?, updated_at = ?
+		 WHERE host_name = ? AND deleted_at IS NULL`
 	hostMembershipIsolateSQL = `UPDATE host_membership SET isolation_epoch = ?, isolation_reason = ?, updated_at = ?
 		 WHERE host_name = ? AND deleted_at IS NULL AND isolation_epoch = 0`
 	hostMembershipClearIsolationSQL = `UPDATE host_membership SET isolation_epoch = 0, isolation_reason = '', updated_at = ?
@@ -699,6 +707,20 @@ func (c *Client) withMembershipWrite(ctx context.Context, fn func(live bool) err
 		slog.Warn("host membership split: pass before a membership write failed", "error", err)
 	}
 	return fn(c.HostMembershipLive())
+}
+
+// membershipRowMissingFrozen reports whether a live state writer on this node
+// must not insert host's membership row: the hosts copy is frozen here and no
+// live row exists (hostMembershipStateOnlySQL).
+func membershipRowMissingFrozen(ctx context.Context, c *Client, host string) (bool, error) {
+	if !c.hostsCopyFrozen() {
+		return false, nil
+	}
+	rows, err := scanMembership(ctx, c, ` WHERE h.name = ? AND h.deleted_at IS NULL`, host)
+	if err != nil {
+		return false, err
+	}
+	return len(rows) == 1 && !rows[0].memPresent, nil
 }
 
 // currentIsolation is host's resolved isolation, for a live state writer's

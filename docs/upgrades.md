@@ -771,8 +771,12 @@ current:
   placed on it, but still counted in every quorum's denominator. The split
   pass no longer fills such a row from the `hosts` copy there, and a
   hosts-only write fills one only when it carries the whole row (adding the
-  host) or both state and isolation. The row arrives from its peers by
-  replication or anti-entropy.
+  host) or both state and isolation; a state change made on that host writes
+  only to an existing row. The row arrives from its peers by replication or
+  anti-entropy. Until it does, the failover coordinator on that host neither
+  fences nor recovers such a host (it logs the skip), and the host never
+  counts as a live voter there unless it is a member of an adopted voter
+  generation.
 
 Before the retire latch, a split pass that fills a missing `host_membership`
 row from the `hosts` copy stamps it decades in the past, so it fills an

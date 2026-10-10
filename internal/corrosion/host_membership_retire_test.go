@@ -157,3 +157,63 @@ func TestHostMembershipRetire_AFrozenPassCopiesNothing(t *testing.T) {
 		t.Errorf("a host with no membership row on a retired node reads %q, want %q", got, HostStateUnknown)
 	}
 }
+
+// TestHostMembershipRetire_AFrozenWriterNeverInsertsFromTheFrozenCopy
+// (re-review m1): a state write on a retired node that has no membership row
+// for the host must not insert one — the insert would take its isolation pair
+// from the frozen hosts copy. It updates a row that exists elsewhere and
+// changes nothing here.
+func TestHostMembershipRetire_AFrozenWriterNeverInsertsFromTheFrozenCopy(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	seedMembershipHosts(t, c, "h1")
+	retireLive(t, c)
+	if err := c.execLocal(ctx, `DELETE FROM host_membership WHERE host_name = 'h1'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.execLocal(ctx, `UPDATE hosts SET isolation_epoch = 7, isolation_reason = 'manual' WHERE name = 'h1'`); err != nil {
+		t.Fatal(err)
+	}
+	from := maxSeq(t, c)
+	if err := UpdateHostState(ctx, c, "h1", "draining"); err != nil {
+		t.Fatal(err)
+	}
+	if err := RecordFenceWithState(ctx, c, FenceLogRecord{ID: "f-m1", HostName: "h1", Method: "ipmi", Result: "fenced"}, "fenced"); err != nil {
+		t.Fatal(err)
+	}
+	if n := oneString(t, c, `SELECT COUNT(*) AS n FROM host_membership WHERE host_name = 'h1'`, "n"); n != "0" {
+		t.Errorf("a frozen writer created h1's membership row from the frozen copy's isolation")
+	}
+	for _, e := range logSince(t, c, from) {
+		if strings.Contains(e, "INSERT INTO host_membership") {
+			t.Errorf("a frozen writer put an insert on the stream:\n%s", e)
+		}
+	}
+}
+
+// TestHostMembershipRetire_AFloorCopyDatesNothing (re-review m4): a split-pass
+// copy is stamped at a floor and records no state change, so it is no "active
+// since" boundary — HostActiveSince and HostFenceLife report none, as before
+// the split, rather than a boundary forty years back.
+func TestHostMembershipRetire_AFloorCopyDatesNothing(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	seedMembershipHosts(t, c, "h1")
+	openMembershipGate(c)
+	if _, err := c.SplitHostMembership(ctx); err != nil {
+		t.Fatal(err)
+	}
+	floor, ok := membershipCopyTS("2026-06-01T00:00:00Z")
+	if !ok {
+		t.Fatal("floor")
+	}
+	if err := c.execLocal(ctx, `UPDATE host_membership SET state = 'active', updated_at = ? WHERE host_name = 'h1'`, floor); err != nil {
+		t.Fatal(err)
+	}
+	if at, ok, err := HostActiveSince(ctx, c, "h1"); err != nil || ok {
+		t.Errorf("HostActiveSince = %v ok=%v err=%v; a floor copy is no boundary", at, ok, err)
+	}
+	if since, _, ok, err := HostFenceLife(ctx, c, "h1"); err != nil || ok {
+		t.Errorf("HostFenceLife = %v ok=%v err=%v; a floor copy is no boundary", since, ok, err)
+	}
+}

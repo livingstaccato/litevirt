@@ -72,12 +72,45 @@ release back, as v57's was.
   the hosts row's moving clock over a frozen state undid a fence
   cluster-wide). An absorb on a retired node creates a missing row only from
   a complete write (review L2).
+- **"unknown" acts on nothing** (re-review I2). The failover coordinator
+  neither fences nor recovers a host it reads as `unknown`; it logs and skips
+  it (`state_unknown`), and re-reads it next cycle. On a derived voter set such
+  a host stays in every quorum's denominator but its probes never count toward
+  the live numerator (`corrosion.VotersNotCountedLive`); with an adopted voter
+  generation the generation's members count as usual.
+- **A state write never inserts from the frozen copy** (re-review m1). A live
+  writer on a retired node that has no row for the host updates an existing
+  row only (`hostMembershipStateOnlySQL`); the row, with that state, reaches
+  this node by anti-entropy from any node that had it.
+- **A floor copy dates nothing** (re-review m4). `HostsActiveSince`,
+  `HostActiveSince` and `HostFenceLife` treat a floor-stamped row as "no
+  boundary known", which is how they judged before the split.
 - **Absorbing hosts-only writes stays (deviation from item 2 above).** A latch
   is per node: a neighbour that advertises the retire token but whose own
   `host_membership_split_v1` latch has not formed yet still writes `hosts`
   alone, and a retired node must still take that write. A retired writer's
   entries carry their `host_membership` statement and are never absorbed, so
   keeping the absorb costs nothing.
+
+## Known limits
+
+- **A node that has not latched the retire token yet** (re-review m2) still
+  reads, and before the latch copies at the floor, the `hosts` copy for a host
+  it has no membership row for. Latches form per node, so a joiner whose
+  anti-entropy merged `hosts` but not `host_membership` can read a host fenced
+  after the latch as `active` until the row arrives. A failed merge marks the
+  replica not caught up, which holds the coordinator back, and a floor copy
+  always loses to the real row; the window closes with that node's next
+  anti-entropy pass or its retire latch.
+- **A previous build's copy** (re-review m4) is stamped with the raw `hosts`
+  timestamp, so during the roll it beats this build's floor copy even when it
+  was made from an older `hosts` row. Ordering the two would need the copy
+  compared against its parent row's `updated_at`, which CLAUDE.md forbids.
+  It is transient: before the retire latch the `hosts` copy is current, and
+  any real or absorbed write wins.
+- **Re-admission** of a removed host on a retired node that has no live
+  membership row for it still inserts one, taking the isolation pair from the
+  `hosts` copy, as the identity row is rewritten whole.
 
 ## Out of scope
 

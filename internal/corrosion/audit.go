@@ -1215,6 +1215,16 @@ func RecordFenceWithState(ctx context.Context, c *Client, r FenceLogRecord, stat
 				{SQL: updateHostStateSQL, Params: []interface{}{state, uts, r.HostName}},
 			})
 		}
+		missing, err := membershipRowMissingFrozen(ctx, c, r.HostName)
+		if err != nil {
+			return err
+		}
+		if missing {
+			return c.ExecuteBatch(ctx, []Statement{
+				{SQL: insertFenceLogSQL, Params: []interface{}{r.ID, r.HostName, r.Method, r.Result, now, r.Detail}},
+				{SQL: hostMembershipStateOnlySQL, Params: []interface{}{state, uts, r.HostName}},
+			})
+		}
 		epoch, reason, err := currentIsolation(ctx, c, r.HostName)
 		if err != nil {
 			return err

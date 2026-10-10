@@ -135,6 +135,9 @@ const (
 	// ErrJoining: quorum agreed a host failed, but it is a host `lv host add`
 	// admitted whose daemon has not started yet, so it is not fenced.
 	ErrJoining = "joining"
+	// ErrStateUnknown: quorum agreed a host failed, but this node has no
+	// membership row for it and cannot read its state, so it is not fenced.
+	ErrStateUnknown = "state_unknown"
 )
 
 // nil-safe wrappers so the coordinator can increment unconditionally.

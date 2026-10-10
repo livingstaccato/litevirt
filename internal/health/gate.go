@@ -168,7 +168,11 @@ func (c *Checker) QuorumProof(ctx context.Context) (state QuorumState, live, nee
 		// Unknown = "neither proof nor loss" → no action, no loss-clock.
 		return QuorumUnknown, 0, 0
 	}
-	state, live, needed = c.quorumOver(voters)
+	uncounted, err := corrosion.VotersNotCountedLive(ctx, c.db)
+	if err != nil {
+		return QuorumUnknown, 0, 0
+	}
+	state, live, needed = c.quorumOver(voters, uncounted)
 	c.noteQuorum(QuorumScopeCluster, state)
 	return state, live, needed
 }
@@ -262,7 +266,11 @@ func (c *Checker) RegionQuorumProof(ctx context.Context, region string) (state Q
 	if err != nil {
 		return QuorumUnknown, 0, 0
 	}
-	state, live, needed = c.quorumOver(vr.In(region))
+	uncounted, err := corrosion.VotersNotCountedLive(ctx, c.db)
+	if err != nil {
+		return QuorumUnknown, 0, 0
+	}
+	state, live, needed = c.quorumOver(vr.In(region), uncounted)
 	c.noteQuorum(RegionQuorumScope(region), state)
 	return state, live, needed
 }
@@ -270,7 +278,11 @@ func (c *Checker) RegionQuorumProof(ctx context.Context, region string) (state Q
 // quorumOver counts this daemon's fresh probe results over voters: live is
 // self (when a member) plus each member probed healthy this run, needed is a
 // majority of voters.
-func (c *Checker) quorumOver(voters map[string]bool) (state QuorumState, live, needed int) {
+//
+// uncounted names voters that stay in the denominator but never count as live
+// (corrosion.VotersNotCountedLive: a derived-set voter this node reads as
+// unknown).
+func (c *Checker) quorumOver(voters, uncounted map[string]bool) (state QuorumState, live, needed int) {
 	// A peer this node last saw healthy BEFORE its own most recent stall is not
 	// proven live: the stall is exactly the window in which it may have died,
 	// and the failures that would have said so were withheld (stall.go). It
@@ -301,6 +313,9 @@ func (c *Checker) quorumOver(voters map[string]bool) (state QuorumState, live, n
 	// count toward live.
 	needed = len(voters)/2 + 1
 	for name := range voters {
+		if uncounted[name] {
+			continue
+		}
 		if name == c.hostName || healthy[name] {
 			live++
 		}
@@ -342,7 +357,11 @@ func (c *Checker) executionQuorum(ctx context.Context) QuorumState {
 	if err != nil {
 		return QuorumUnknown
 	}
-	st, _, _ := c.quorumOver(vr.In(vr.Region(c.hostName)))
+	uncounted, err := corrosion.VotersNotCountedLive(ctx, c.db)
+	if err != nil {
+		return QuorumUnknown
+	}
+	st, _, _ := c.quorumOver(vr.In(vr.Region(c.hostName)), uncounted)
 	return st
 }
 
@@ -506,7 +525,11 @@ func (c *Checker) ExecutionQuorum(ctx context.Context) (QuorumState, int, int) {
 		return QuorumUnknown, 0, 0
 	}
 	region := vr.Region(c.hostName)
-	st, live, needed := c.quorumOver(vr.In(region))
+	uncounted, err := corrosion.VotersNotCountedLive(ctx, c.db)
+	if err != nil {
+		return QuorumUnknown, 0, 0
+	}
+	st, live, needed := c.quorumOver(vr.In(region), uncounted)
 	c.noteQuorum(RegionQuorumScope(region), st)
 	return st, live, needed
 }

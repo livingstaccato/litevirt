@@ -51,8 +51,23 @@ func activeSince(r membershipRow) (time.Time, bool) {
 	if !r.memPresent || r.mem.State != "active" {
 		return time.Time{}, false
 	}
-	return ParseUpdatedAt(r.memTS)
+	at, ok := ParseUpdatedAt(r.memTS)
+	if !ok || isMembershipCopyFloor(at) {
+		return time.Time{}, false // no boundary known (re-review m4)
+	}
+	return at, true
 }
+
+// isMembershipCopyFloor reports whether a membership row's updated_at is a
+// split-pass copy's floor (membershipCopyTS): it records no state change, so it
+// dates nothing, and the host's life boundary is unknown — the readers then
+// judge as they did before the split. Any real write is decades newer.
+func isMembershipCopyFloor(at time.Time) bool {
+	return at.Before(membershipFloorCeiling)
+}
+
+// membershipFloorCeiling: every floor copy is older, every real write newer.
+var membershipFloorCeiling = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
 
 // fenceLifeSkew is how much older than the host's last membership change a
 // proof-grade fence row may be and still count (HostFenceLife). The row is
@@ -107,7 +122,7 @@ func HostFenceLife(ctx context.Context, c *Client, host string) (since time.Time
 		}
 	}
 	at, ok := ParseUpdatedAt(r.memTS)
-	if !ok {
+	if !ok || isMembershipCopyFloor(at) {
 		return time.Time{}, "", false, nil
 	}
 	return at.Add(-fenceLifeSkew).Truncate(time.Second), r.mem.State, true, nil

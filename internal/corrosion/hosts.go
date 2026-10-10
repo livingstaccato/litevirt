@@ -321,6 +321,34 @@ func VoterSet(ctx context.Context, c *Client) (map[string]bool, error) {
 	return DerivedVoterSet(ctx, c)
 }
 
+// VotersNotCountedLive is the subset of the voter set that must not count
+// toward a quorum's LIVE numerator however healthy its probes: derived-set
+// voters this node reads as HostStateUnknown. Such a host may be in
+// maintenance or offline on the cluster's view — out of the voter set there —
+// so counting its probes could hand a minority a majority. It stays in the
+// denominator (VoterSet), which is the fail-closed side. With an adopted voter
+// generation the set is the generation's members and nothing is excluded.
+func VotersNotCountedLive(ctx context.Context, c *Client) (map[string]bool, error) {
+	cfg, err := AdoptedVoterConfig(ctx, c)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]bool{}
+	if cfg.Explicit() {
+		return out, nil
+	}
+	states, err := resolvedHostStates(ctx, c)
+	if err != nil {
+		return nil, err
+	}
+	for name, st := range states {
+		if st == HostStateUnknown {
+			out[name] = true
+		}
+	}
+	return out, nil
+}
+
 // DerivedVoterSet is the voter set as it was before any explicit generation:
 // every non-deleted host whose state is VotingEligible. Automatic genesis
 // proposes it as generation 1's members.
@@ -463,6 +491,15 @@ func UpdateHostState(ctx context.Context, c *Client, name, state string) error {
 		if !live {
 			return c.Execute(ctx, updateHostStateSQL, state, uts, name)
 		}
+		missing, err := membershipRowMissingFrozen(ctx, c, name)
+		if err != nil {
+			return err
+		}
+		if missing {
+			return c.ExecuteBatch(ctx, []Statement{
+				{SQL: hostMembershipStateOnlySQL, Params: []interface{}{state, uts, name}},
+			})
+		}
 		epoch, reason, err := currentIsolation(ctx, c, name)
 		if err != nil {
 			return err
@@ -564,6 +601,16 @@ func UpdateHostStartup(ctx context.Context, c *Client, name, state, version stri
 		// in the same batch under the same updated_at: the hosts statement is
 		// the previous release's, unchanged, so a node rolled back one release
 		// still reads it.
+		missing, err := membershipRowMissingFrozen(ctx, c, name)
+		if err != nil {
+			return err
+		}
+		if missing {
+			return c.ExecuteBatch(ctx, []Statement{
+				hostsStmt,
+				{SQL: hostMembershipStateOnlySQL, Params: []interface{}{state, uts, name}},
+			})
+		}
 		epoch, reason, err := currentIsolation(ctx, c, name)
 		if err != nil {
 			return err

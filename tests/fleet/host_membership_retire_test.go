@@ -210,3 +210,53 @@ func TestFleet_HostMembershipRetire_ANotLiveNeighboursDrainReachesARetiredNode(t
 		t.Errorf("%s (retired) reads %s as %q after a not-live neighbour's drain, want draining", a.Name, h, got)
 	}
 }
+
+// TestFleet_HostMembershipRetire_TheCoordinatorNeverFencesAnUnknownHost
+// (re-review I2): a coordinator that has no membership row for a failed host —
+// on a retired node it reads the host as unknown — neither fences nor recovers
+// it until the row arrives. It may be in maintenance or still joining, and a
+// fence is irrevocable. Once anti-entropy brings the row back (active), the
+// next cycle fences it as usual.
+func TestFleet_HostMembershipRetire_TheCoordinatorNeverFencesAnUnknownHost(t *testing.T) {
+	ctx := context.Background()
+	clock := NewVirtualClock(time.Now().UTC())
+	c := New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: 2676})
+	a, b, victim := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	insertVM(t, a, "vm-unknown", victim.Name)
+	c.WaitConverged(t, convergeTimeout)
+	for _, n := range c.Nodes {
+		retireMembership(t, n)
+	}
+	c.WaitConverged(t, convergeTimeout)
+
+	c.Isolate(victim)
+	PublishHealth(t, a, victim.Name, 5, clock.Now())
+	PublishHealth(t, b, victim.Name, 5, clock.Now())
+	c.WaitConverged(t, convergeTimeout, a, b)
+
+	// a misses victim's membership row (a merge that brought hosts but not
+	// host_membership), after everything else has converged.
+	a.DB.Mu().Lock()
+	_, err := a.DB.DB().Exec(`DELETE FROM host_membership WHERE host_name = ?`, victim.Name)
+	a.DB.Mu().Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := hostOn(t, a, victim.Name).State; got != corrosion.HostStateUnknown {
+		t.Fatalf("precondition: %s reads %s as %q, want unknown", a.Name, victim.Name, got)
+	}
+	cs := c.NewCoordinators(clock)
+	cs.Tick(ctx, a)
+	if f := cs.Fences(); len(f) != 0 {
+		t.Fatalf("%s fenced %+v while it could not read %s's state", a.Name, f, victim.Name)
+	}
+
+	corrosion.NewAntiEntropy(a.DB, a.PKIDir, 0).RunOnce(ctx)
+	if got := hostOn(t, a, victim.Name).State; got != "active" {
+		t.Fatalf("the membership row did not come back by anti-entropy (%q)", got)
+	}
+	cs.Tick(ctx, a)
+	if f := cs.Fences(); len(f) != 1 || f[0].Target != victim.Name {
+		t.Errorf("once the row arrived, expected one fence of %s, got %+v", victim.Name, f)
+	}
+}

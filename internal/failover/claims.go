@@ -344,6 +344,7 @@ func (c *Coordinator) adoptedDestProblem(ctx context.Context, cl claimedProof, p
 // applied: the destination is the one decided, not one being chosen.
 func (c *Coordinator) vmFitsOn(ctx context.Context, vm corrosion.VMRecord, failed string, h corrosion.HostRecord) string {
 	req := buildFailoverPlacementRequest(vm, failed, c.capacity, func(string) bool { return true })
+	c.resolveUSBPlacement(ctx, &req)
 	req.RequireRegion = c.vmRecoveryRegion(failed, vm)
 	allVMs, err := corrosion.ListVMs(ctx, c.db, "", "")
 	if err != nil {

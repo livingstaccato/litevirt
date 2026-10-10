@@ -89,6 +89,7 @@ func (s *Server) createVMPlacementRequest(ctx context.Context, spec *pb.VMSpec, 
 		}
 	}
 	addCapabilityLabels(&req, spec)
+	applyUSBPlacement(&req, spec, spec.GetPlacement().GetHost())
 	for _, dev := range spec.Devices {
 		req.Devices = append(req.Devices, placementDeviceRequest(dev))
 	}

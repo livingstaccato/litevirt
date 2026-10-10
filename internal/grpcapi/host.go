@@ -512,6 +512,9 @@ func buildDrainPlacementRequest(vm corrosion.VMRecord, drainHost string, capacit
 	if err := json.Unmarshal([]byte(vm.Spec), spec); err != nil {
 		return placementReq
 	}
+	// A raw USB device binds the VM to the host being drained, so it has no
+	// target; a mapped one restricts it to the mapping's hosts.
+	applyUSBPlacement(&placementReq, spec, vm.HostName)
 	if p := spec.Placement; p != nil {
 		// Override PinHost — cannot pin to the host being drained.
 		if p.Host != "" && p.Host != drainHost {

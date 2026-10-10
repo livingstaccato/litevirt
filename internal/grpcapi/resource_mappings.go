@@ -10,6 +10,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	lv "github.com/litevirt/litevirt/internal/libvirt"
 )
 
 // Resource mappings (#14) are cluster-wide aliases for equivalent passthrough
@@ -141,6 +142,13 @@ func (s *Server) AddMappingDevice(ctx context.Context, req *pb.AddMappingDeviceR
 	if req.Mapping == "" || req.Address == "" {
 		return nil, status.Error(codes.InvalidArgument, "mapping and address required")
 	}
+	// A mapping hands out PCI devices or USB devices, never both: a VM's PCI
+	// selector and its USB device read the same rows, and each would resolve
+	// the other kind's address into a hostdev of the wrong type.
+	if err := s.checkMappingDeviceKind(ctx, req.Mapping, req.Address); err != nil {
+		s.audit(ctx, auditResourceMapDeviceAdd, req.Mapping, "requested="+requested+" "+err.Error(), "error")
+		return nil, err
+	}
 	// Re-adding the same (mapping, host, address) rewrites vendor and device:
 	// read what it replaces.
 	before := corrosion.MappingDeviceAuditState(ctx, s.db, req.Mapping, host, req.Address)
@@ -188,4 +196,31 @@ func (s *Server) RemoveMappingDevice(ctx context.Context, req *pb.RemoveMappingD
 		return &pb.ResourceMapping{Name: req.Mapping}, nil
 	}
 	return toPbResourceMapping(*m), nil
+}
+
+// checkMappingDeviceKind refuses a malformed USB device address and a device
+// whose kind (USB or PCI) differs from the devices the mapping already holds.
+func (s *Server) checkMappingDeviceKind(ctx context.Context, mapping, address string) error {
+	usb := corrosion.IsUSBMappingAddress(address)
+	if usb {
+		if _, err := lv.ParseUSBMappingAddress(address); err != nil {
+			return status.Errorf(codes.InvalidArgument, "%v", err)
+		}
+	}
+	m, err := corrosion.GetResourceMapping(ctx, s.db, mapping)
+	if err != nil {
+		return status.Errorf(codes.Internal, "read resource mapping %q: %v", mapping, err)
+	}
+	if m == nil {
+		return nil
+	}
+	switch kind := m.MappingKind(); {
+	case usb && (kind == corrosion.MappingKindPCI || kind == corrosion.MappingKindMixed):
+		return status.Errorf(codes.FailedPrecondition,
+			"mapping %q holds PCI devices; give the USB device a mapping of its own", mapping)
+	case !usb && (kind == corrosion.MappingKindUSB || kind == corrosion.MappingKindMixed):
+		return status.Errorf(codes.FailedPrecondition,
+			"mapping %q holds USB devices; give the PCI device a mapping of its own", mapping)
+	}
+	return nil
 }

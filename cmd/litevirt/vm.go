@@ -38,6 +38,8 @@ func newRunCmd() *cobra.Command {
 		cpuModel     string
 
 		allowOvercommit bool
+		memHotplugMax   int32
+		usb             usbFlags
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -63,7 +65,14 @@ func newRunCmd() *cobra.Command {
 					Tpm:           tpm,
 					CpuMode:       cpuMode,
 					CpuModel:      cpuModel,
+
+					MemoryHotplugMaxMib: memHotplugMax,
 				}
+				usbDevs, err := usb.devices()
+				if err != nil {
+					return err
+				}
+				spec.UsbDevices = usbDevs
 				// Validate here too, so a typo costs a round trip and not a
 				// half-understood server error.
 				if err := lvpkg.ValidateCPUMode(cpuMode, cpuModel); err != nil {
@@ -119,6 +128,9 @@ func newRunCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&tpm, "tpm", false, "Attach an emulated TPM 2.0 device (Windows 11 / BitLocker)")
 	cmd.Flags().BoolVar(&allowOvercommit, "allow-overcommit", false,
 		"Skip the host capacity check for this VM (project quota still applies). For deliberate density on a host you know can take it; the bypass is audited.")
+	cmd.Flags().Int32Var(&memHotplugMax, "memory-hotplug-max", 0,
+		"Memory hot-add ceiling in MiB (virtio-mem; > --memory): memory can then be raised live up to it with lv set-memory or lv update --memory (needs enforcement.usb_mounts_memory)")
+	usb.register(cmd)
 	cmd.MarkFlagRequired("name")
 	return cmd
 }

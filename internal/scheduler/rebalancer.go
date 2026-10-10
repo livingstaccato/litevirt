@@ -409,6 +409,14 @@ func buildPlacementRequest(vm corrosion.VMRecord, spec *pb.VMSpec, pol vmPolicy,
 	if spec == nil {
 		return req
 	}
+	// USB passthrough: a raw device binds the VM to its host, and a mapped one
+	// to hosts a snapshot ranking never loads — so a USB VM gets no proposal.
+	if mappings, raw := corrosion.USBMappingNames(spec); len(mappings) > 0 || raw {
+		req.USBMappings = mappings
+		if raw {
+			req.USBHost = vm.HostName
+		}
+	}
 	if p := spec.Placement; p != nil {
 		// Deliberately NOT setting req.PinHost from p.Host: it's auto-populated
 		// with the planner-resolved host for every compose VM, so it's not a

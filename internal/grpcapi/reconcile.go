@@ -207,7 +207,10 @@ func (s *Server) reconcileDomainDefinition(ctx context.Context, vm *corrosion.VM
 	if x, derr := s.virt.DumpXMLInactive(vm.Name); derr == nil {
 		priorXML = x
 	}
-	usePatch := priorXML != "" && !aliaslessHostdev
+	// A VM with USB passthrough is regenerated too: the patcher manages PCI
+	// hostdevs by alias and would drop a USB one it does not know, and a
+	// regenerate re-resolves each device on this host.
+	usePatch := priorXML != "" && !aliaslessHostdev && len(spec.GetUsbDevices()) == 0
 
 	var newXML string
 	if usePatch {
@@ -222,6 +225,11 @@ func (s *Server) reconcileDomainDefinition(ctx context.Context, vm *corrosion.VM
 		newXML = patched
 	} else {
 		vmCfg := baseDomainConfig(spec, diskConfigs, netConfigs, hostdevConfigs)
+		usb, uerr := s.resolveUSBHostdevs(ctx, spec)
+		if uerr != nil {
+			return uerr
+		}
+		vmCfg.USBHostdevs = usb
 		// Preserve Secure Boot + vTPM across the regenerate (G1); verify the host can
 		// still satisfy a requested SB/TPM before applying it.
 		if spec.SecureBoot && !s.firmware.SecureBootAvailable() {

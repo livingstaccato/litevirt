@@ -96,7 +96,23 @@ func (s *Server) resizeVMLive(ctx context.Context, name string, desired *pb.VMSp
 				name, ceiling, wantCPU, wantCPU)
 		}
 	}
-	if memDelta != 0 {
+	if memDelta != 0 && stored.MemoryHotplugMaxMib > 0 {
+		// Memory hot-add: plug or unplug virtio-mem blocks within the band the
+		// domain booted with. The boot cell itself cannot be unplugged.
+		base, max := stored.MemoryHotplugBaseMib, stored.MemoryHotplugMaxMib
+		if wantMem > max {
+			return status.Errorf(codes.FailedPrecondition,
+				"live resize target %d MiB exceeds %q's hot-add maximum %d MiB; raise it (`lv update --memory-hotplug-max`) and restart", wantMem, name, max)
+		}
+		if wantMem < base {
+			return status.Errorf(codes.FailedPrecondition,
+				"live resize target %d MiB is below %q's boot memory %d MiB, which cannot be unplugged; stop it to shrink further", wantMem, name, base)
+		}
+		if (wantMem-base)%2 != 0 {
+			return status.Errorf(codes.InvalidArgument,
+				"live resize target %d MiB must be the boot memory %d MiB plus a multiple of 2 MiB", wantMem, base)
+		}
+	} else if memDelta != 0 {
 		ceiling := stored.MaxMemoryMib
 		if ceiling == 0 {
 			ceiling = stored.MemoryMib
@@ -391,6 +407,14 @@ func (s *Server) applyLiveResize(ctx context.Context, name string, target, apply
 		}
 	}
 	if target.MemoryMib != applyPrev.MemoryMib {
+		if target.MemoryHotplugMaxMib > 0 {
+			// Hot-add domain: memory above the boot cell is virtio-mem, so the
+			// change is how much of the region is plugged, not a balloon target.
+			if err := s.virt.SetVirtioMemRequested(name, int(target.MemoryMib-target.MemoryHotplugBaseMib)); err != nil {
+				return fmt.Errorf("memory hot-add: %w", err)
+			}
+			return nil
+		}
 		if err := s.virt.SetMemory(name, int(target.MemoryMib)); err != nil {
 			return fmt.Errorf("memory: %w", err)
 		}

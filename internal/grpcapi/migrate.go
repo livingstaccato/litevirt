@@ -261,6 +261,20 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 		}
 	}
 
+	// USB passthrough: live is refused while a device is attached; cold needs
+	// every device mapped and the target to hold each mapping. Before any
+	// target-side work, so a refusal wastes none. A spec that cannot be read
+	// refuses rather than migrating a VM whose devices are unknown.
+	if vm.Spec != "" {
+		usbSpec := &pb.VMSpec{}
+		if err := json.Unmarshal([]byte(vm.Spec), usbSpec); err != nil {
+			return status.Errorf(codes.Internal, "parse spec of %q: %v", vm.Name, err)
+		}
+		if err := s.refuseUSBMigration(ctx, vm, usbSpec, targetHost.Name, req.Strategy == pb.MigrateStrategy_MIGRATE_COLD); err != nil {
+			return err
+		}
+	}
+
 	// PCI passthrough cannot be re-realized cross-host in this release, so refuse
 	// migrating any VM that holds PCI intent — but only once hardware_v2 is latched,
 	// so pre-latch migration behavior (incl. the legacy VF/PF/target-availability
@@ -1358,7 +1372,25 @@ func (s *Server) EnsureFirmwareState(ctx context.Context, req *pb.EnsureFirmware
 			return nil, status.Errorf(codes.InvalidArgument,
 				"domain XML identity (name=%q uuid=%q) does not match request (name=%q uuid=%q)", xn, xu, req.VmName, req.Uuid)
 		}
-		if err := s.virt.DefineDomain(req.DomainXml); err != nil {
+		// USB passthrough: the source's definition names the SOURCE's device.
+		// Re-resolve each one here — its mapping's row for this host, a
+		// bus-port from this host's sysfs — so the VM is defined with the device
+		// this host has, or not at all.
+		domXML := req.DomainXml
+		if usbSpec := parseSpecOrNil(vm.Spec); len(usbSpec.GetUsbDevices()) > 0 {
+			usb, uerr := s.resolveUSBHostdevs(ctx, usbSpec)
+			if uerr != nil {
+				wipe()
+				return nil, uerr
+			}
+			rewritten, rerr := lv.ReplaceUSBHostdevs(domXML, usb)
+			if rerr != nil {
+				wipe()
+				return nil, status.Errorf(codes.Internal, "re-resolve USB devices of %q on %s: %v", req.VmName, s.hostName, rerr)
+			}
+			domXML = rewritten
+		}
+		if err := s.virt.DefineDomain(domXML); err != nil {
 			// Roll back the firmware we just materialized so a retry is clean.
 			wipe()
 			return nil, status.Errorf(codes.Internal, "define migrated domain %q: %v", req.VmName, err)

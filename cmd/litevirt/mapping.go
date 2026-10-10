@@ -97,9 +97,14 @@ func newMappingRmCmd() *cobra.Command {
 func newMappingAddDeviceCmd() *cobra.Command {
 	var host, vendor, device string
 	cmd := &cobra.Command{
-		Use:   "add-device <mapping> <pci-address>",
+		Use:   "add-device <mapping> <address>",
 		Short: "Register a host's device under a mapping",
-		Args:  cobra.ExactArgs(2),
+		Long: `Register one host's device under a mapping. The address is a PCI address
+(0000:41:00.0) or a USB device: usb:<vendor>:<product> (usb:046d:c52b) or
+usb:<bus>-<port>[.<port>...] (usb:1-2, the device plugged into that port).
+A mapping holds PCI devices or USB devices, never both. A VM names a USB
+mapping with lv create --usb-mapping or lv update --usb-mapping.`,
+		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				m, err := c.AddMappingDevice(ctx, &pb.AddMappingDeviceRequest{
@@ -122,7 +127,7 @@ func newMappingAddDeviceCmd() *cobra.Command {
 func newMappingRmDeviceCmd() *cobra.Command {
 	var host string
 	cmd := &cobra.Command{
-		Use:   "rm-device <mapping> <pci-address>",
+		Use:   "rm-device <mapping> <address>",
 		Short: "Remove a host's device from a mapping",
 		Args:  cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {

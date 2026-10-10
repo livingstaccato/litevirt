@@ -3,6 +3,9 @@ package corrosion
 import (
 	"context"
 	"sort"
+	"strings"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 )
 
 // MappingDevice is one host's concrete device under a named resource mapping.
@@ -149,4 +152,64 @@ func HostsForMapping(ctx context.Context, c *Client, name string) ([]string, err
 		hosts = append(hosts, r.String("host_name"))
 	}
 	return hosts, nil
+}
+
+// USBMappingPrefix starts the address of a USB device under a resource
+// mapping ("usb:<vendor>:<product>" or "usb:<bus>-<port>"). A PCI address
+// never does, so the prefix alone tells the two kinds apart.
+const USBMappingPrefix = "usb:"
+
+// IsUSBMappingAddress reports whether a mapping device address names a USB
+// device.
+func IsUSBMappingAddress(addr string) bool { return strings.HasPrefix(addr, USBMappingPrefix) }
+
+// Mapping kinds, as MappingKind reports them.
+const (
+	MappingKindNone  = ""      // no devices yet
+	MappingKindPCI   = "pci"   // every device is a PCI address
+	MappingKindUSB   = "usb"   // every device is a USB device
+	MappingKindMixed = "mixed" // both — refused at write, reported if found
+)
+
+// MappingKind reports what kind of device a mapping hands out.
+func (m ResourceMappingRecord) MappingKind() string {
+	var usb, pci bool
+	for _, d := range m.Devices {
+		if IsUSBMappingAddress(d.Address) {
+			usb = true
+		} else {
+			pci = true
+		}
+	}
+	switch {
+	case usb && pci:
+		return MappingKindMixed
+	case usb:
+		return MappingKindUSB
+	case pci:
+		return MappingKindPCI
+	}
+	return MappingKindNone
+}
+
+// USBMappingNames returns the distinct resource mappings a VM spec's USB
+// devices name, sorted, and whether any device is a raw (unmapped) one —
+// which binds the VM to the host the device is plugged into.
+func USBMappingNames(spec *pb.VMSpec) (mappings []string, raw bool) {
+	seen := map[string]bool{}
+	for _, d := range spec.GetUsbDevices() {
+		if d == nil {
+			continue
+		}
+		if d.Mapping == "" {
+			raw = true
+			continue
+		}
+		if !seen[d.Mapping] {
+			seen[d.Mapping] = true
+			mappings = append(mappings, d.Mapping)
+		}
+	}
+	sort.Strings(mappings)
+	return mappings, raw
 }

@@ -188,6 +188,15 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	compose.NormalizeVMSpecResources(spec)
 	compose.NormalizeVMSpecResources(req.Spec)
 
+	// USB passthrough and memory hot-add: gated on usb_mounts_memory_v1, and
+	// checked before placement (which a raw USB device or a mapping
+	// constrains). After the resource defaults, since the hot-add boot memory
+	// is the VM's memory. spec is req.Spec here, so the forwarded request
+	// carries the result, and the owner re-admits it.
+	if err := s.admitCreateUSBAndHotplug(ctx, spec); err != nil {
+		return nil, err
+	}
+
 	// admission: prefer the tenancy engine (live billing +
 	// public-IP/backup-GiB checks); fall back to the corrosion-direct
 	// path for harnesses that haven't wired an Engine.
@@ -853,6 +862,16 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// here, not in the shared builder.
 	vmCfg := baseDomainConfig(spec, diskConfigs, netConfigs, nil)
 	vmCfg.CloudInitISO = cloudInitISO
+	// USB passthrough, resolved on this (the owning) host: a mapping's row for
+	// it, a bus-port read from its sysfs. A device it cannot resolve refuses
+	// the create rather than defining a VM without it.
+	if usb, uerr := s.resolveUSBHostdevs(ctx, spec); uerr != nil {
+		claims.releaseAll(ctx)
+		cleanupDisks()
+		return nil, uerr
+	} else {
+		vmCfg.USBHostdevs = usb
+	}
 	// Secure Boot + vTPM (G1). Use the host-resolved firmware paths and pin per-VM
 	// nvram + swtpm state under dataDir so they travel across the lifecycle. Refuse
 	// to silently adopt firmware state left by a prior `delete --keep-disks`.
@@ -3960,7 +3979,21 @@ func isPureCPUGrowRequest(req *pb.UpdateVMRequest) bool {
 		req.GuestAgent == nil && req.MinMemoryMib == nil && req.MaxMemoryMib == nil &&
 		req.SecureBoot == nil && req.Tpm == nil && req.MaxCpu == nil &&
 		req.Restart == nil && req.Onboot == nil && req.StartupOrder == nil &&
-		req.StartDelaySec == nil && req.StopDelaySec == nil && !req.DisableVnc
+		req.StartDelaySec == nil && req.StopDelaySec == nil && !req.DisableVnc &&
+		!req.SetUsbDevices && req.MemoryHotplugMaxMib == nil
+}
+
+// isPureMemoryRequest reports whether req changes nothing but memory — the
+// change a hot-add VM takes live (resizeVMLive plugs virtio-mem).
+func isPureMemoryRequest(req *pb.UpdateVMRequest) bool {
+	return req.MemoryMib > 0 && req.Cpu == 0 &&
+		req.CpuMode == "" && req.CpuModel == "" &&
+		req.Machine == "" && req.Firmware == "" &&
+		req.GuestAgent == nil && req.MinMemoryMib == nil && req.MaxMemoryMib == nil &&
+		req.SecureBoot == nil && req.Tpm == nil && req.MaxCpu == nil &&
+		req.Restart == nil && req.Onboot == nil && req.StartupOrder == nil &&
+		req.StartDelaySec == nil && req.StopDelaySec == nil && !req.DisableVnc &&
+		!req.SetUsbDevices && req.MemoryHotplugMaxMib == nil
 }
 
 // liveGrowVCPU hot-adds vCPUs to a RUNNING VM in place (no stop). It is the pure
@@ -4019,6 +4052,15 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	if isPureCPUGrowRequest(req) && int(req.Cpu) > int(spec.Cpu) && vm.State == "running" && s.liveResizeActive(ctx) {
 		return s.liveGrowVCPU(ctx, req)
 	}
+	// Memory hot-add: a memory-only change to a RUNNING VM with a virtio-mem
+	// region is plugged (or unplugged) live, within its band, by the same
+	// coordinator SetVMMemory uses — no stop.
+	if isPureMemoryRequest(req) && vm.State == "running" && spec.MemoryHotplugMaxMib > 0 {
+		if err := s.resizeVMLive(ctx, req.Name, &pb.VMSpec{MemoryMib: req.MemoryMib}, req.IdempotencyKey); err != nil {
+			return nil, err
+		}
+		return s.vmToProto(ctx, req.Name)
+	}
 
 	// Snapshot fields whose change would take the redefine off the CPU/memory-only
 	// fast path (an inactive-XML patch that preserves libvirt-assigned addresses).
@@ -4054,7 +4096,14 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	redefine := req.Cpu > 0 || req.MemoryMib > 0 || req.CpuMode != "" || req.CpuModel != "" ||
 		req.Machine != "" || req.Firmware != "" ||
 		req.GuestAgent != nil || req.MinMemoryMib != nil || req.MaxMemoryMib != nil ||
-		req.SecureBoot != nil || req.Tpm != nil || req.MaxCpu != nil
+		req.SecureBoot != nil || req.Tpm != nil || req.MaxCpu != nil ||
+		req.SetUsbDevices || req.MemoryHotplugMaxMib != nil
+	// USB passthrough and memory hot-add are checked here, before anything is
+	// stopped: a refusal after the stop of a --restart-if-needed would cost the
+	// VM a restart for nothing.
+	if err := s.preflightUSBHotplugUpdate(ctx, req, spec, vm.HostName); err != nil {
+		return nil, err
+	}
 	// A cpu/memory(+bounds)/cpu-mode redefine can be applied by patching the
 	// inactive domain XML in place rather than regenerating it, so libvirt-assigned
 	// details (PCI slot addresses, controller models) survive — which matters for
@@ -4072,7 +4121,10 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	inPlaceEligible := redefine &&
 		req.Machine == "" && req.Firmware == "" &&
 		req.GuestAgent == nil && req.SecureBoot == nil && req.Tpm == nil &&
-		req.MaxCpu == nil && req.DisableVnc == origDisableVnc
+		req.MaxCpu == nil && req.DisableVnc == origDisableVnc &&
+		// USB devices and the hot-add topology (<maxMemory>, the NUMA cell,
+		// the virtio-mem device) are not what the value-only patch edits.
+		!req.SetUsbDevices && req.MemoryHotplugMaxMib == nil && spec.MemoryHotplugMaxMib == 0
 	restartAfter := false
 	repair := false // a VM in error or mid-transition, redefined and started (see below)
 	if redefine {
@@ -4323,6 +4375,11 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 			}
 			spec.MaxCpu = *req.MaxCpu
 		}
+		// USB devices and the hot-add band, as preflightUSBHotplugUpdate
+		// already checked them.
+		if err := applyUSBHotplugUpdate(req, spec); err != nil {
+			return nil, err
+		}
 		// Toggling secure_boot/tpm once firmware state exists can brick an
 		// unsigned guest (SB) or orphan BitLocker (TPM) — refuse without --force.
 		if req.SecureBoot != nil && *req.SecureBoot != spec.SecureBoot {
@@ -4521,6 +4578,11 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		// Hostdevs are populated here — the fields the old inline redefine builder
 		// dropped, collapsing the balloon ceiling and detaching passthrough).
 		vmCfg := baseDomainConfig(spec, diskConfigs, netConfigs, hostdevs)
+		usb, uerr := s.resolveUSBHostdevs(ctx, spec)
+		if uerr != nil {
+			return nil, uerr
+		}
+		vmCfg.USBHostdevs = usb
 		// Preserve Secure Boot + vTPM across the redefine (G1): without this a stopped
 		// SB/vTPM VM updated for cpu/mem would be redefined with no <uuid>/<tpm>/SB
 		// loader/SMM/nvram — silent BitLocker breakage. ApplyTo only sets fields (no

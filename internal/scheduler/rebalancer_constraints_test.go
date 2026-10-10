@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
@@ -205,5 +206,19 @@ func TestBuildPlacementRequest_CarriesCapacityPolicy(t *testing.T) {
 	req := buildPlacementRequest(vm, nil, vmPolicy{}, pol)
 	if req.Capacity != pol {
 		t.Errorf("req.Capacity = %+v, want the configured policy %+v", req.Capacity, pol)
+	}
+}
+
+// A USB VM carries its constraints into the rebalancer's request: a raw
+// device keeps it on its host, a mapped one is never ranked from a snapshot.
+func TestBuildPlacementRequest_CarriesUSBConstraints(t *testing.T) {
+	vm := corrosion.VMRecord{Name: "vm1", HostName: "h1", CPUActual: 1, MemActual: 1024}
+	raw := &pb.VMSpec{UsbDevices: []*pb.USBDeviceSpec{{BusPort: "1-2"}}}
+	if req := buildPlacementRequest(vm, raw, vmPolicy{}, corrosion.CapacityPolicy{}); req.USBHost != "h1" {
+		t.Errorf("raw USB: USBHost = %q; want h1", req.USBHost)
+	}
+	mapped := &pb.VMSpec{UsbDevices: []*pb.USBDeviceSpec{{Mapping: "dongle"}}}
+	if req := buildPlacementRequest(vm, mapped, vmPolicy{}, corrosion.CapacityPolicy{}); len(req.USBMappings) != 1 {
+		t.Errorf("mapped USB: USBMappings = %v; want [dongle]", req.USBMappings)
 	}
 }

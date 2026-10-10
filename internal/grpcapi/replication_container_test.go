@@ -12,6 +12,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -30,9 +31,13 @@ func newReplicaRepo(t *testing.T) *pbsstore.Repo {
 }
 
 // replicaManifest builds a container manifest. mark nil makes it a backup.
+// A replica is captured at its timestamp unless capturedAs says otherwise.
 func replicaManifest(name, ts, project, owner string, mark *containerReplicaMark) *pbsstore.Manifest {
 	spec := containerBackupSpec{Name: name, Project: project, Replica: mark,
 		CreateSpec: corrosion.EncodeCreateSpec(corrosion.ContainerCreateSpec{OwnerID: owner})}
+	if mark != nil {
+		spec.CapturedAt = ts
+	}
 	b, _ := json.Marshal(spec)
 	return &pbsstore.Manifest{VMName: name, DiskName: containerBackupDisk, Timestamp: ts, ContainerSpecJSON: string(b)}
 }
@@ -57,9 +62,18 @@ func timestampsOf(t *testing.T, r *pbsstore.Repo, name string) map[string]bool {
 	return out
 }
 
-// mk is a replica mark of segment (source, inc).
-func mk(stream, source, inc string, keep int, bases ...replicaBase) *containerReplicaMark {
-	return &containerReplicaMark{Stream: stream, Source: source, Incarnation: inc, Keep: keep, Bases: bases}
+// mk is a replica mark of segment (source, placement).
+func mk(stream, source, placement string, keep int, bases ...replicaBase) *containerReplicaMark {
+	return &containerReplicaMark{Stream: stream, Source: source, Placement: placement, Keep: keep, Bases: bases}
+}
+
+// capturedAs is m with its capture instant set to at.
+func capturedAs(m *pbsstore.Manifest, at string) *pbsstore.Manifest {
+	spec, _ := manifestSpec(m)
+	spec.CapturedAt = at
+	b, _ := json.Marshal(spec)
+	m.ContainerSpecJSON = string(b)
+	return m
 }
 
 // admitT runs admitContainerReplica on a server that holds no rows (the
@@ -87,7 +101,7 @@ func TestAdmitContainerReplica_RefusesAnOlderCopyOfTheSameSegment(t *testing.T) 
 func TestAdmitContainerReplica_RefusesACopyAHeldReplicaContains(t *testing.T) {
 	r := newReplicaRepo(t)
 	put(t, r, replicaManifest("web", "2026-01-01T00:00:00Z", "_default", "o1",
-		mk("s", "host-d", "inc-d", 0, replicaBase{Source: "host-a", Incarnation: "inc-a", Taken: "2026-01-05T00:00:00Z"})))
+		mk("s", "host-d", "inc-d", 0, replicaBase{Source: "host-a", Placement: "inc-a", Taken: "2026-01-05T00:00:00Z"})))
 	err := admitT(t, r, replicaManifest("web", "2026-01-04T00:00:00Z", "_default", "o1", mk("s", "host-a", "inc-a", 0)))
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("a replica the held one descends from must be refused, got %v", err)
@@ -143,7 +157,8 @@ func TestAdmitContainerReplica_RefusesAStaleOrFencedSource(t *testing.T) {
 		seedActiveHost(t, s, h, true)
 	}
 	if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{
-		HostName: "host-a", Name: "web", State: "running", Image: "alpine", CreatedAt: "inc-a",
+		HostName: "host-a", Name: "web", State: "running", Image: "alpine",
+		CreateSpec: corrosion.EncodeCreateSpec(corrosion.ContainerCreateSpec{Placement: "inc-a"}),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -156,16 +171,18 @@ func TestAdmitContainerReplica_RefusesAStaleOrFencedSource(t *testing.T) {
 	if err := push("host-a", "inc-a", 0, "web"); err != nil {
 		t.Fatalf("the owner's own replica: %v", err)
 	}
-	if err := push("host-d", "inc-d", 0, "web"); status.Code(err) != codes.FailedPrecondition {
+	// A container that has just moved, seen from here: Aborted, which the
+	// sender reports as a warning, not an error page (N7).
+	if err := push("host-d", "inc-d", 0, "web"); status.Code(err) != codes.Aborted {
 		t.Errorf("a replica from a host the row is not on: %v", err)
 	}
-	if err := push("host-a", "inc-old", 0, "web"); status.Code(err) != codes.FailedPrecondition {
-		t.Errorf("a replica of an earlier row incarnation: %v", err)
+	if err := push("host-a", "inc-old", 0, "web"); status.Code(err) != codes.Aborted {
+		t.Errorf("a replica of an earlier placement: %v", err)
 	}
 	if err := s.db.Execute(ctx, `UPDATE containers SET owner_epoch = 3 WHERE host_name = 'host-a' AND name = 'web'`); err != nil {
 		t.Fatal(err)
 	}
-	if err := push("host-a", "inc-a", 2, "web"); status.Code(err) != codes.FailedPrecondition {
+	if err := push("host-a", "inc-a", 2, "web"); status.Code(err) != codes.Aborted {
 		t.Errorf("a replica at an owner epoch the row has moved past: %v", err)
 	}
 	if err := push("host-d", "inc-d", 0, "unknown-here"); err != nil {
@@ -251,7 +268,7 @@ func TestSettleContainerReplicas_AProvenEarlierSegmentGoes(t *testing.T) {
 		put(t, r, replicaManifest("web", ts, "_default", "o1", mk("s", "host-a", "inc-a", 0)))
 	}
 	m := replicaManifest("web", "2026-01-02T00:00:00Z", "_default", "o1",
-		mk("s", "host-d", "inc-d", 0, replicaBase{Source: "host-a", Incarnation: "inc-a", Taken: "2026-01-01T01:00:00Z"}))
+		mk("s", "host-d", "inc-d", 0, replicaBase{Source: "host-a", Placement: "inc-a", Taken: "2026-01-01T01:00:00Z"}))
 	put(t, r, m)
 	aside := settleContainerReplicas(context.Background(), r, m)
 	got := timestampsOf(t, r, "web")
@@ -279,7 +296,7 @@ func TestSettleContainerReplicas_KeepZeroKeepsEverythingCurrent(t *testing.T) {
 func TestSameReplicaStream_NoRecordedLineageIsAnotherLineage(t *testing.T) {
 	r := newReplicaRepo(t)
 	put(t, r, replicaManifest("web", "2026-01-05T00:00:00Z", "_default", "", mk("s", "host-a", "inc-old", 0,
-		replicaBase{Source: "host-a", Incarnation: "inc-new", Taken: "2026-02-01T00:00:00Z"})))
+		replicaBase{Source: "host-a", Placement: "inc-new", Taken: "2026-02-01T00:00:00Z"})))
 	if err := admitT(t, r, replicaManifest("web", "2026-01-06T00:00:00Z", "_default", "o-new", mk("s", "host-a", "inc-new", 0))); err != nil {
 		t.Fatalf("an unrelated lineage's replica blocked a new container's: %v", err)
 	}
@@ -623,12 +640,14 @@ func TestContainerReplicaFor_PromotesOnlyTheRelocatingRowsReplica(t *testing.T) 
 	}); err != nil {
 		t.Fatal(err)
 	}
-	owner := &corrosion.ContainerRecord{HostName: "host-a", Name: "web", Project: "_default", CreatedAt: "inc-a"}
+	owner := &corrosion.ContainerRecord{HostName: "host-a", Name: "web", Project: "_default",
+		CreateSpec: corrosion.EncodeCreateSpec(corrosion.ContainerCreateSpec{Placement: "p-a"})}
+	capt := func(d time.Duration) string { return now.Add(-d).Format(time.RFC3339Nano) }
 	peer := &replicaPeer{reps: []*pb.ContainerReplica{
-		{Timestamp: at(50 * time.Minute), Source: "host-a", Incarnation: "inc-a"},                 // the one
-		{Timestamp: at(40 * time.Minute), Source: "host-x", Incarnation: "inc-x"},                 // another segment
-		{Timestamp: at(30 * time.Minute), Source: "host-a", Incarnation: "inc-old"},               // an earlier row
-		{Timestamp: at(20 * time.Minute), Source: "host-a", Incarnation: "inc-a", SetAside: true}, // set aside
+		{Timestamp: at(50 * time.Minute), CapturedAt: capt(50 * time.Minute), Source: "host-a", Placement: "p-a"},                 // the one
+		{Timestamp: at(40 * time.Minute), CapturedAt: capt(40 * time.Minute), Source: "host-x", Placement: "p-x"},                 // another segment
+		{Timestamp: at(30 * time.Minute), CapturedAt: capt(30 * time.Minute), Source: "host-a", Placement: "p-old"},               // an earlier placement here
+		{Timestamp: at(20 * time.Minute), CapturedAt: capt(20 * time.Minute), Source: "host-a", Placement: "p-a", SetAside: true}, // set aside
 	}}
 	s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) { return peer, func() {}, nil }
 	rep, ok := s.containerReplicaFor(ctx, "web", owner, "host-b", now)
@@ -645,15 +664,29 @@ func TestContainerReplicaFor_PromotesOnlyTheRelocatingRowsReplica(t *testing.T) 
 func TestContainerBases_OnlyForTheRowTheRestoreLaidDown(t *testing.T) {
 	s := testServer(t)
 	s.dataDir = t.TempDir()
-	spec := containerBackupSpec{Source: "host-a", Incarnation: "inc-a",
-		Bases: []replicaBase{{Source: "host-z", Incarnation: "inc-z", Taken: "2026-01-01T00:00:00Z"}}}
-	s.recordContainerBases("_default", "web", "row-1", spec, "2026-02-01T00:00:00Z")
-	got := s.containerBases(&corrosion.ContainerRecord{Name: "web", Project: "_default", CreatedAt: "row-1"})
-	if len(got) != 2 || got[0] != (replicaBase{Source: "host-a", Incarnation: "inc-a", Taken: "2026-02-01T00:00:00Z"}) {
+	spec := containerBackupSpec{Source: "host-a", Placement: "p-a", CapturedAt: "2026-02-01T00:00:00Z",
+		Bases: []replicaBase{{Source: "host-z", Placement: "inc-z", Taken: "2026-01-01T00:00:00Z"}}}
+	s.recordContainerBases("_default", "web", "place-1", spec)
+	row := func(p string) *corrosion.ContainerRecord {
+		return &corrosion.ContainerRecord{Name: "web", Project: "_default",
+			CreateSpec: corrosion.EncodeCreateSpec(corrosion.ContainerCreateSpec{Placement: p})}
+	}
+	got := s.containerBases(row("place-1"))
+	if len(got) != 2 || got[0] != (replicaBase{Source: "host-a", Placement: "p-a", Taken: "2026-02-01T00:00:00Z"}) {
 		t.Fatalf("chain = %+v, want the archive's own point then the chain it carried", got)
 	}
-	if got := s.containerBases(&corrosion.ContainerRecord{Name: "web", Project: "_default", CreatedAt: "row-2"}); got != nil {
-		t.Fatalf("another row incarnation inherited the chain: %+v", got)
+	// The container handed back to this host later (a relocate-recreate, a
+	// re-key) is another placement: the old record proves nothing for it.
+	if got := s.containerBases(row("place-2")); got != nil {
+		t.Fatalf("another placement inherited the chain: %+v", got)
+	}
+	if got := s.containerBases(row("")); got != nil {
+		t.Fatalf("a row with no placement inherited the chain: %+v", got)
+	}
+	// An archive whose capture is not known adds no point of its own.
+	s.recordContainerBases("_default", "web", "place-3", containerBackupSpec{Source: "host-a", Placement: "p-a"})
+	if got := s.containerBases(row("place-3")); len(got) != 0 {
+		t.Fatalf("an archive with no capture instant proved something: %+v", got)
 	}
 }
 
@@ -675,5 +708,138 @@ func TestRunContainerReplication_RefusesWhenItsMarkerIsAhead(t *testing.T) {
 	err := s.runContainerReplication(context.Background(), sched, time.Now())
 	if err == nil || !strings.Contains(err.Error(), "marker") {
 		t.Fatalf("a run behind its own marker: %v, want refused", err)
+	}
+}
+
+// N1: a container that returns to a host it once ran on (D, then A by an image
+// re-create, then D again) is a new placement there. Its runs never trim the
+// replicas of its first stay on D, the only copy of its data from before the
+// loss, however many there are: keep_replicas trims one placement only.
+func TestSettleContainerReplicas_AReturnToAFormerHostIsANewPlacement(t *testing.T) {
+	r := newReplicaRepo(t)
+	for _, ts := range []string{"2026-01-01T00:00:00Z", "2026-01-01T01:00:00Z", "2026-01-01T02:00:00Z"} {
+		put(t, r, replicaManifest("web", ts, "_default", "o1", mk("s", "host-d", "place-1", 2)))
+	}
+	for i, ts := range []string{"2026-02-01T00:00:00Z", "2026-02-01T01:00:00Z", "2026-02-01T02:00:00Z", "2026-02-01T03:00:00Z", "2026-02-01T04:00:00Z"} {
+		m := replicaManifest("web", ts, "_default", "o1", mk("s", "host-d", "place-3", 2))
+		put(t, r, m)
+		settleContainerReplicas(context.Background(), r, m)
+		got := timestampsOf(t, r, "web")
+		for _, pre := range []string{"2026-01-01T00:00:00Z", "2026-01-01T01:00:00Z", "2026-01-01T02:00:00Z"} {
+			if !got[pre] {
+				t.Fatalf("run %d: the pre-loss replica %s was trimmed by a later placement on the same host", i, pre)
+			}
+		}
+	}
+}
+
+// keep_replicas never trims a set-aside replica, even one of the placement it
+// trims, and a replica proven contained takes its set-aside record with it.
+func TestSettleContainerReplicas_KeepNeverTrimsASetAsideReplica(t *testing.T) {
+	r := newReplicaRepo(t)
+	aside := replicaManifest("web", "2026-01-01T00:00:00Z", "_default", "o1", mk("s", "host-a", "p-a", 1))
+	put(t, r, aside)
+	b, _ := json.Marshal(setAsideRecord{Timestamp: aside.Timestamp, Reason: "test"})
+	if err := os.MkdirAll(filepath.Dir(setAsidePath(r, "web", aside.Timestamp)), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(setAsidePath(r, "web", aside.Timestamp), b, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	for _, ts := range []string{"2026-01-02T00:00:00Z", "2026-01-03T00:00:00Z"} {
+		m := replicaManifest("web", ts, "_default", "o1", mk("s", "host-a", "p-a", 1))
+		put(t, r, m)
+		settleContainerReplicas(context.Background(), r, m)
+	}
+	if !timestampsOf(t, r, "web")[aside.Timestamp] {
+		t.Fatal("keep trimmed a set-aside replica")
+	}
+	// Proven contained by a later placement: it goes, and so does its record.
+	m := replicaManifest("web", "2026-01-04T00:00:00Z", "_default", "o1",
+		mk("s", "host-b", "p-b", 1, replicaBase{Source: "host-a", Placement: "p-a", Taken: "2026-01-05T00:00:00Z"}))
+	put(t, r, m)
+	settleContainerReplicas(context.Background(), r, m)
+	if timestampsOf(t, r, "web")[aside.Timestamp] {
+		t.Fatal("a set-aside replica proven contained was kept")
+	}
+	if _, err := os.Stat(setAsidePath(r, "web", aside.Timestamp)); err == nil {
+		t.Fatal("the removed replica's set-aside record was left behind")
+	}
+}
+
+// N2: a replica named for its scheduler tick but captured later is not
+// "contained" in a point captured between the two.
+func TestSettleContainerReplicas_ProofUsesTheCaptureNotTheName(t *testing.T) {
+	r := newReplicaRepo(t)
+	late := capturedAs(replicaManifest("web", "2026-01-01T10:00:00Z", "_default", "o1", mk("s", "host-a", "p-a", 0)), "2026-01-01T10:20:00Z")
+	put(t, r, late)
+	m := replicaManifest("web", "2026-01-02T00:00:00Z", "_default", "o1",
+		mk("s", "host-b", "p-b", 0, replicaBase{Source: "host-a", Placement: "p-a", Taken: "2026-01-01T10:05:00Z"}))
+	put(t, r, m)
+	settleContainerReplicas(context.Background(), r, m)
+	if !timestampsOf(t, r, "web")[late.Timestamp] {
+		t.Fatal("a replica captured at 10:20 was deleted as contained in a point captured at 10:05")
+	}
+}
+
+// N8 + N6: once no schedule replicates the container into this host and repo,
+// its replicas here are orphans an operator may remove; while one does, only a
+// set-aside replica goes. A forwarded removal is audited as the operator.
+func TestRemoveContainerReplicas_OrphansAndTheOperatorsName(t *testing.T) {
+	s := testServer(t)
+	ctx := context.Background()
+	base := filepath.Join(t.TempDir(), "dr")
+	if _, err := pbsstore.Init(base); err != nil {
+		t.Fatal(err)
+	}
+	s.SetBackupRepos(map[string]string{"dr": base})
+	ns, err := s.openReplicaNamespace(ctx, containerReplicaRepo("_default", "dr"), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	put(t, ns, replicaManifest("web", "2026-01-01T00:00:00Z", "_default", "o1", mk("s", "host-a", "p-a", 0)))
+	sched := corrosion.BackupScheduleRecord{VMName: corrosion.ContainerScheduleKey("_default", "web"), ProjectName: "_default",
+		Scope: "container", Repo: "dr", Cron: "0 * * * *", Enabled: true, Type: "replication", TargetPool: "dr", TargetHost: s.hostName}
+	if err := corrosion.UpsertBackupSchedule(ctx, s.db, sched); err != nil {
+		t.Fatal(err)
+	}
+	pctx := metadata.NewIncomingContext(peerCtxFor(t, s, "entry-host"), metadata.Pairs(repairActorMDKey, "alice"))
+	req := &pb.RemoveContainerReplicasRequest{Repo: "dr", Name: "web", Timestamps: []string{"2026-01-01T00:00:00Z"}}
+	if _, err := s.RemoveContainerReplicas(pctx, req); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("a scheduled, not set-aside replica: %v, want refused", err)
+	}
+	if err := corrosion.DeleteBackupSchedule(ctx, s.db, sched.VMName, "dr"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RemoveContainerReplicas(pctx, req); err != nil {
+		t.Fatalf("an orphaned replica: %v", err)
+	}
+	if got := auditActor(t, s, "ct.replica.remove", "ok"); got != "alice" {
+		t.Fatalf("the removal was audited as %q, want the operator alice", got)
+	}
+}
+
+// N9: the compare-and-set switch is emitted only once every other member
+// answers with this build's RPC; an older member (Unimplemented) keeps it off.
+func TestRepointReady_OnlyWhenEveryHostHasTheStatement(t *testing.T) {
+	s := testServer(t)
+	seedActiveHost(t, s, "host-b", true)
+	s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {
+		return &replicaPeer{err: status.Error(codes.InvalidArgument, "name required")}, func() {}, nil
+	}
+	if !s.repointReady(context.Background()) {
+		t.Fatal("every member answers: the switch may be a compare-and-set")
+	}
+	s2 := testServer(t)
+	seedActiveHost(t, s2, "host-b", true)
+	s2.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {
+		return &replicaPeer{err: status.Error(codes.Unimplemented, "unknown method")}, func() {}, nil
+	}
+	if s2.repointReady(context.Background()) {
+		t.Fatal("a member on an earlier build would back-pressure the statement")
+	}
+	s.wireRepointReady()
+	if !s.db.RepointReady(context.Background()) {
+		t.Fatal("the database client asks the server (the audited reversal paths use it)")
 	}
 }

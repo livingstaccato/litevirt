@@ -70,6 +70,10 @@ type replicaRecord struct {
 	File     string `json:"file"`
 	Format   string `json:"format"`
 	Taken    string `json:"taken"`
+	// Source is the host that wrote the replica (this host for a local run, the
+	// pushing host for a received one). On disk only; "" in a record an
+	// earlier build wrote.
+	Source string `json:"source,omitempty"`
 	// SizeBytes is filled in on listing, never stored.
 	SizeBytes int64 `json:"-"`
 }
@@ -555,6 +559,7 @@ func (s *Server) PushReplica(stream pb.LiteVirt_PushReplicaServer) error {
 	if err := s.admitVMReplicaSource(ctx, rec.Project, rec.VM); err != nil {
 		return err
 	}
+	rec.Source = replicaSourceOf(ctx)
 	poolDir, err := s.replicaPoolDir(ctx, first.GetPoolName())
 	if err != nil {
 		return err

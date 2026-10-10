@@ -108,6 +108,7 @@ func relocateOnDB(t *testing.T, n *Node, from, to *Node, name string) {
 	}
 	moved := *row
 	moved.HostName, moved.CreatedAt = to.Name, ""
+	moved.CreateSpec, _ = corrosion.WithNewPlacement(moved.CreateSpec) // a placement change
 	if err := corrosion.UpsertContainer(ctx, n.DB, moved); err != nil {
 		t.Fatal(err)
 	}
@@ -174,6 +175,26 @@ func TestReplicationIndependent_AFailoverThatDidNotUseTheReplicaKeepsIt(t *testi
 	if len(aside) != 1 || aside[0] != before[0].Timestamp || len(current) != 1 {
 		t.Fatalf("want the earlier replica listed as set aside and the new one current: aside %v current %v", aside, current)
 	}
+	// N3: the kept replica can be restored by an operator, but never as a
+	// second runnable copy: not while the container lives on d.
+	restore := &pb.RestoreContainerReplicaRequest{Repo: "dr", Project: "_default", Name: name, Timestamp: aside[0]}
+	if _, err := c.SelfClient(b).RestoreContainerReplica(ctx, restore); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("restoring a replica of a container that lives on %s: %v, want refused", d.Name, err)
+	}
+	if err := corrosion.DeleteContainer(ctx, d.DB, d.Name, name); err != nil {
+		t.Fatal(err)
+	}
+	waitForRepl(t, b.Name+" to see the container gone", func() bool { return containerHostOn(t, b, name) == "" })
+	if _, err := c.SelfClient(b).RestoreContainerReplica(ctx, restore); err != nil {
+		t.Fatalf("restoring the set-aside replica: %v", err)
+	}
+	if got := b.CT.Payload(name); got != "the data before the loss" {
+		t.Fatalf("the restored container holds %q, want the data from before the loss", got)
+	}
+	if got := containerHostOn(t, b, name); got != b.Name {
+		t.Fatalf("the restored container's row is on %q, want %s", got, b.Name)
+	}
+
 	// Only a set-aside replica can be removed, and only by asking.
 	if _, err := c.SelfClient(b).RemoveContainerReplicas(ctx, &pb.RemoveContainerReplicasRequest{
 		Repo: "dr", Project: "_default", Name: name, Timestamps: current,
@@ -254,6 +275,7 @@ func TestReplicationIndependent_ANewOwnerThatMissedTheSwitchWaits(t *testing.T) 
 	}
 	moved := *row
 	moved.HostName, moved.CreatedAt = b.Name, ""
+	moved.CreateSpec, _ = corrosion.WithNewPlacement(moved.CreateSpec)
 	if err := corrosion.UpsertContainer(ctx, b.DB, moved); err != nil {
 		t.Fatal(err)
 	}
@@ -464,6 +486,11 @@ func TestReplicationIndependent_AVMsNewOwnerThatMissedTheSwitchWaits(t *testing.
 		t.Fatal(err)
 	}
 	c.WaitConverged(t, convergeTimeout)
+	// b holds a's replica: what makes b's own run, once the VM is there, the
+	// move's leftover rather than an operator's same-host copy.
+	if err := a.Server.RunReplication(ctx, sched, time.Now().Add(-10*time.Minute)); err != nil {
+		t.Fatalf("the owner's own run: %v", err)
+	}
 
 	if err := corrosion.TransferVMOwnerFresh(ctx, a.DB, "web", b.Name, "running"); err != nil {
 		t.Fatal(err)
@@ -480,8 +507,8 @@ func TestReplicationIndependent_AVMsNewOwnerThatMissedTheSwitchWaits(t *testing.
 	if err := b.Server.RunReplication(ctx, onB, time.Now()); err == nil || !strings.Contains(err.Error(), "suspended") {
 		t.Fatalf("a run onto the VM's own host: %v, want suspended", err)
 	}
-	if n := replicaRecordsIn(t, poolB, "web"); n != 0 {
-		t.Fatalf("a replica was written beside the VM's disk (%d)", n)
+	if n := replicaRecordsIn(t, poolB, "web"); n != 1 {
+		t.Fatalf("a replica was written beside the VM's disk (%d, want only a's)", n)
 	}
 	c.ClearLinkFaults()
 	waitForRepl(t, "the switch to reach "+b.Name, func() bool { return scheduleOn(t, b, "web", "dr").TargetHost == a.Name })
@@ -490,5 +517,70 @@ func TestReplicationIndependent_AVMsNewOwnerThatMissedTheSwitchWaits(t *testing.
 	}
 	if n := replicaRecordsIn(t, poolA, "web"); n != 1 {
 		t.Fatalf("no replica reached %s after the switch (%d)", a.Name, n)
+	}
+}
+
+// N1, the reviewer's scenario: a container on D is lost and image-recreated on
+// A (a relocate-recreate, which keeps created_at), then A is lost and it is
+// image-recreated back onto D. D's replicas from before the first loss are the
+// only copy of the real data. However many runs the container makes back on D,
+// keep_replicas never trims them: a return to D is a new placement.
+func TestReplicationIndependent_AReturnToAFormerHostNeverTrimsThePreLossReplicas(t *testing.T) {
+	c := New(t, Options{Nodes: 3, IndependentReplicas: true})
+	tgt, d, a := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	ctx := context.Background()
+	c.WaitConverged(t, convergeTimeout)
+	const name = "web"
+	replCT(t, c, d, name)
+	repo := drRepo(t, tgt)
+	c.WaitConverged(t, convergeTimeout)
+	sched := ctSchedule(t, c, d, name, tgt.Name, 2, true)
+	runningRow(t, d, name) // failover relocates a running container
+	c.WaitConverged(t, convergeTimeout)
+	base := time.Now().UTC().Add(-time.Hour)
+	tick := 0
+	run := func(n *Node) {
+		t.Helper()
+		tick++
+		if err := n.Server.RunReplication(ctx, scheduleOn(t, n, sched.VMName, sched.Repo), base.Add(time.Duration(tick)*time.Minute)); err != nil {
+			t.Fatalf("run %d on %s: %v", tick, n.Name, err)
+		}
+	}
+	d.CT.Seed(name, "the real data")
+	run(d)
+	run(d)
+	pre := map[string]bool{}
+	for _, m := range replicas(t, repo, name) {
+		pre[m.Timestamp] = true
+	}
+	if len(pre) != 2 {
+		t.Fatalf("premise: two pre-loss replicas, got %d", len(pre))
+	}
+	relocate := func(from, to *Node, token string) {
+		t.Helper()
+		if err := corrosion.RelocateContainerWithToken(ctx, tgt.DB, from.Name, name, to.Name, token); err != nil {
+			t.Fatal(err)
+		}
+		if err := corrosion.CompleteContainerRelocation(ctx, tgt.DB, to.Name, name, token); err != nil {
+			t.Fatal(err)
+		}
+		c.WaitConverged(t, convergeTimeout)
+		to.CT.Seed(name, "recreated from the image on "+to.Name)
+	}
+	// A is lost before it ever runs: nothing sets D's pre-loss replicas aside,
+	// so only the placement id keeps the return to D from trimming them.
+	relocate(d, a, "tok-1")
+	relocate(a, d, "tok-2")
+	for i := 0; i < 4; i++ {
+		run(d)
+		have := map[string]bool{}
+		for _, m := range replicas(t, repo, name) {
+			have[m.Timestamp] = true
+		}
+		for ts := range pre {
+			if !have[ts] {
+				t.Fatalf("run %d back on %s trimmed the pre-loss replica %s", i+1, d.Name, ts)
+			}
+		}
 	}
 }

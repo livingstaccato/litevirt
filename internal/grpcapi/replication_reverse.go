@@ -4,7 +4,12 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/notify"
 )
@@ -25,14 +30,13 @@ func (s *Server) reverseReplicationAfterMove(ctx context.Context, kind, name, pr
 	// stream to it): it is used once every host runs a release that has it, the
 	// container_replication release feature. Until then the switch re-reads the
 	// row and re-upserts it (ReverseOptions).
-	gateErr := s.containerReplicationGate(ctx)
-	if kind == "container" && gateErr != nil {
+	if kind == "container" && s.containerReplicationGate(ctx) != nil {
 		// Container replication, its reversal included, is the
 		// container_replication release feature: with it closed no container
 		// schedule can have been made here to switch.
 		return
 	}
-	opts := corrosion.ReverseOptions{TargetOnly: gateErr == nil}
+	opts := corrosion.ReverseOptions{TargetOnly: s.repointReady(ctx)}
 	revs, err := corrosion.ReverseReplicationOnMove(ctx, s.db, kind, name, project, oldHost, newHost, opts)
 	if err != nil {
 		slog.Warn("replication: could not switch direction after a move", "kind", kind, "workload", name, "from", oldHost, "to", newHost, "error", err)
@@ -53,4 +57,67 @@ func (s *Server) reverseReplicationAfterMove(ctx context.Context, kind, name, pr
 		}
 		s.notify(ctx, notify.Notification{Kind: "replication.reversed", Severity: notify.SevInfo, Subject: r.Workload, Detail: detail})
 	}
+}
+
+// The compare-and-set switch (corrosion.RepointReplicationTarget) is a statement
+// shape a host on an earlier build does not know, and an unknown shape
+// back-pressures the sender's whole replication stream to it. So it is emitted
+// only when every host is known to apply it: the container_replication release
+// feature is open, or every other member answers ListContainerReplicas, an RPC
+// of the same build as the statement (an older build answers Unimplemented).
+// The answer is kept for repointReadyTTL once yes, and re-asked a minute after
+// a no.
+const repointReadyTTL = 10 * time.Minute
+
+func (s *Server) wireRepointReady() {
+	if s.db != nil {
+		s.db.SetRepointReady(s.repointReady)
+	}
+}
+
+func (s *Server) repointReady(ctx context.Context) bool {
+	if s.containerReplicationGate(ctx) == nil {
+		return true
+	}
+	s.repointMu.Lock()
+	if !s.repointAt.IsZero() && time.Since(s.repointAt) < s.repointTTL() {
+		ok := s.repointOK
+		s.repointMu.Unlock()
+		return ok
+	}
+	s.repointMu.Unlock()
+	ok := s.everyHostAppliesRepoint(ctx)
+	s.repointMu.Lock()
+	s.repointOK, s.repointAt = ok, time.Now()
+	s.repointMu.Unlock()
+	return ok
+}
+
+func (s *Server) repointTTL() time.Duration {
+	if s.repointOK {
+		return repointReadyTTL
+	}
+	return time.Minute
+}
+
+func (s *Server) everyHostAppliesRepoint(ctx context.Context) bool {
+	hosts, err := corrosion.ListHosts(ctx, s.db)
+	if err != nil {
+		return false
+	}
+	for _, h := range hosts {
+		if h.Name == s.hostName || h.State == "removed" {
+			continue
+		}
+		c, closeConn, err := s.dialPeer(ctx, h.Name)
+		if err != nil {
+			return false
+		}
+		_, err = c.ListContainerReplicas(ctx, &pb.ListContainerReplicasRequest{})
+		closeConn()
+		if status.Code(err) == codes.Unimplemented || status.Code(err) == codes.Unavailable {
+			return false
+		}
+	}
+	return true
 }

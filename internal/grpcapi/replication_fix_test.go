@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -16,9 +17,9 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
-	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/notify"
+	"github.com/litevirt/litevirt/internal/pbsstore"
 	"github.com/litevirt/litevirt/internal/qcow2"
 )
 
@@ -147,13 +148,20 @@ func TestReplicationOutcome_OwnTargetIsSuspendedQuietlyThenReported(t *testing.T
 }
 
 // The VM runner never replicates onto the VM's own host, and says so.
-func TestRunReplication_VMOnItsOwnTargetIsSuspended(t *testing.T) {
+func TestRunReplication_VMMovedOntoItsTargetIsSuspended(t *testing.T) {
 	f := newPoolFixture(t)
+	ctx := context.Background()
 	sched := corrosion.BackupScheduleRecord{VMName: "web", Repo: "dr", Type: "replication", TargetPool: "dr", TargetHost: f.s.hostName}
-	if err := f.s.RunReplication(context.Background(), sched, time.Now()); !errors.Is(err, errReplicationSuspended) {
-		t.Fatalf("a VM schedule targeting the VM's own host: %v, want suspended", err)
+	// The replica here came from the host the VM ran on before it moved here.
+	rec := newReplicaRecord("a", "web", "1", replicaScheduleKey(sched), "20261001-000000", "qcow2")
+	rec.Source = "host-old"
+	if _, err := publishRecordedReplica(ctx, f.dr, rec, func(tmp string) error { return os.WriteFile(tmp, []byte("replica"), 0o600) }); err != nil {
+		t.Fatal(err)
 	}
-	if recs := f.s.replicaRecordsOn(context.Background(), "dr", f.s.hostName, "a", "web"); len(recs) != 0 {
+	if err := f.s.RunReplication(ctx, sched, time.Now()); !errors.Is(err, errReplicationSuspended) {
+		t.Fatalf("a VM that moved onto its own replica target: %v, want suspended", err)
+	}
+	if recs := f.s.replicaRecordsOn(ctx, "dr", f.s.hostName, "a", "web"); len(recs) != 1 {
 		t.Fatalf("a replica was written beside the disk it protects: %+v", recs)
 	}
 }
@@ -250,13 +258,13 @@ func TestAdmitVMReplicaSource_RefusesAStaleOrFencedSource(t *testing.T) {
 	if err := push(f.s.hostName, 0); err != nil {
 		t.Fatalf("the owner's own push: %v", err)
 	}
-	if err := push("host-old", 0); status.Code(err) != codes.FailedPrecondition {
+	if err := push("host-old", 0); status.Code(err) != codes.Aborted {
 		t.Errorf("a push from a host the VM's row is not on: %v", err)
 	}
 	if err := f.s.db.Execute(ctx, `UPDATE vms SET vm_owner_epoch = 4 WHERE name = 'web'`); err != nil {
 		t.Fatal(err)
 	}
-	if err := push(f.s.hostName, 3); status.Code(err) != codes.FailedPrecondition {
+	if err := push(f.s.hostName, 3); status.Code(err) != codes.Aborted {
 		t.Errorf("a push at an owner epoch the row has moved past: %v", err)
 	}
 	if err := corrosion.UpdateHostState(ctx, f.s.db, "host-old", "fenced"); err != nil {
@@ -267,29 +275,43 @@ func TestAdmitVMReplicaSource_RefusesAStaleOrFencedSource(t *testing.T) {
 	}
 }
 
-// I2: a VM schedule naming the VM's own host for host-local storage would never
-// run (the runner refuses to put a replica beside the disk it protects), so it
-// is refused when it is made; with no target host the local pool is still used
-// when no peer has it.
-func TestCreateReplicationSchedule_OwnHostLocalPoolIsRefused(t *testing.T) {
+// N7: the target refusing a push because the workload is moving (its view
+// lags the move, or the run's VM moved mid-run) is a warning, not an error page;
+// a change of cause in a plain error is a new class.
+func TestReplErrorClass_MovingIsAWarningAndCausesDiffer(t *testing.T) {
+	cls, sev := replErrorClass(fmt.Errorf("push: %w", status.Error(codes.Aborted, "row here is on host-b")))
+	if cls != "moving" || sev != notify.SevWarn {
+		t.Fatalf("Aborted: %s/%s, want moving/warn", cls, sev)
+	}
+	a, _ := replErrorClass(errors.New("archive container: disk full at 1234"))
+	b, _ := replErrorClass(errors.New("archive container: disk full at 5678"))
+	c, _ := replErrorClass(errors.New("look up target host: database locked"))
+	if a != b || a == c {
+		t.Fatalf("classes %q %q %q: one cause must be one class, another cause another", a, b, c)
+	}
+}
+
+// N2: which of a replica and a backup is newer is judged by capture, not by
+// name: a backup named (or labelled by its operator) later than the replica's
+// tick, but captured before the replica, does not outrank it.
+func TestBackupCapturedAfter_JudgesByCaptureNotName(t *testing.T) {
 	s := testServer(t)
-	ctx := adminCtx()
-	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{Name: "vm1", HostName: s.hostName, State: "stopped"}, nil, nil); err != nil {
+	dir := filepath.Join(t.TempDir(), "bk")
+	repo, err := pbsstore.Init(dir)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := corrosion.UpsertStoragePool(ctx, s.db, corrosion.StoragePoolRecord{HostName: s.hostName, Name: "local-pool", Driver: "local", State: "active"}); err != nil {
-		t.Fatal(err)
+	s.SetBackupRepos(map[string]string{"bk": dir})
+	put(t, repo, capturedAs(replicaManifest("web", "2026-01-01T10:05:00Z", "_default", "o1", nil), "2026-01-01T10:05:00Z"))
+	put(t, repo, replicaManifest("web", "2026-01-01T11:00:00Z", "_default", "o1", nil)) // no capture recorded
+	if s.backupCapturedAfter("bk", "web", "2026-01-01T10:05:00Z", "2026-01-01T10:20:00Z") {
+		t.Fatal("a backup captured at 10:05 outranked a replica captured at 10:20 (named 10:00)")
 	}
-	_, err := s.CreateReplicationSchedule(ctx, &pb.CreateReplicationScheduleRequest{
-		Scope: "vm", VmName: "vm1", TargetPool: "local-pool", TargetHost: s.hostName, Cron: "0 0 * * *",
-	})
-	if status.Code(err) != codes.InvalidArgument {
-		t.Fatalf("an explicit own-host target on host-local storage: got %v, want InvalidArgument", err)
+	if !s.backupCapturedAfter("bk", "web", "2026-01-01T10:05:00Z", "2026-01-01T10:01:00Z") {
+		t.Fatal("a backup captured after the replica must outrank it")
 	}
-	if _, err := s.CreateReplicationSchedule(ctx, &pb.CreateReplicationScheduleRequest{
-		Scope: "vm", VmName: "vm1", TargetPool: "local-pool", Cron: "0 0 * * *",
-	}); err != nil {
-		t.Fatalf("no target host (the local pool when no peer has one): %v", err)
+	if s.backupCapturedAfter("bk", "web", "2026-01-01T11:00:00Z", "2026-01-01T10:20:00Z") {
+		t.Fatal("a backup whose capture is unknown outranked a replica by its name")
 	}
 }
 

@@ -192,47 +192,85 @@ func containerScheduleRef(project, name string) string {
 }
 
 func newReplicationReplicasCmd() *cobra.Command {
-	var host, repo, projectName string
+	var host, repo, projectName, restore string
 	var remove []string
+	var yes bool
 	cmd := &cobra.Command{
 		Use:   "replicas <container>",
-		Short: "List a container's replicas on its replica host, or remove set-aside ones",
+		Short: "List a container's replicas on its replica host; restore one, or remove set-aside or orphaned ones",
 		Long: `List the scheduled replicas of a container that a host holds in one backup
 repo's replica namespace (--host, --target-pool: the schedule's target), with
-the host and row incarnation each was taken from.
+the host and placement each was taken from and when it was captured.
 
-A replica is SET ASIDE when a later replica arrived from a part of the
-container's history that is not proven to contain it: typically the container
-came back after a host loss from its image or a backup rather than from this
-replica, so the set-aside replica may hold the newest copy of its data. A
-set-aside replica is never pruned by its schedule and never promoted by
-failover; it stays until removed here with --remove <timestamp> (admin).`,
+A replica is SET ASIDE when a later replica arrived from a placement of the
+container that is not proven to contain it: typically the container came back
+after a host loss from its image or a backup rather than from this replica, so
+a set-aside replica may hold the NEWEST copy of its data. It is never pruned by
+its schedule and never promoted by failover. A replica is ORPHANED when no
+schedule replicates the container into this host and repo any more.
+
+--restore <timestamp> lays that replica down as the container, stopped, on the
+replica host (admin). It is refused while the container lives anywhere: remove
+that one first, so there is never a second runnable copy.
+
+--remove <timestamp> deletes a set-aside or orphaned replica (admin). It may be
+the only copy of the data: it asks first unless --yes.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if restore != "" && len(remove) > 0 {
+				return fmt.Errorf("--restore and --remove are separate requests")
+			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				if restore != "" {
+					resp, err := c.RestoreContainerReplica(ctx, &pb.RestoreContainerReplicaRequest{
+						Host: host, Repo: repo, Project: projectName, Name: args[0], Timestamp: restore,
+					})
+					if err != nil {
+						return fmt.Errorf("restore replica: %w", err)
+					}
+					fmt.Printf("restored the replica of %s taken at %s, stopped, on %s\n", args[0], restore, resp.Host)
+					return nil
+				}
+				list, err := c.ListContainerReplicas(ctx, &pb.ListContainerReplicasRequest{
+					Host: host, Repo: repo, Project: projectName, Name: args[0],
+				})
+				if err != nil {
+					return fmt.Errorf("list replicas: %w", err)
+				}
 				if len(remove) > 0 {
+					byTS := map[string]*pb.ContainerReplica{}
+					for _, r := range list.Replicas {
+						byTS[r.Timestamp] = r
+					}
+					fmt.Println("About to delete, for good:")
+					for _, ts := range remove {
+						if r := byTS[ts]; r != nil {
+							fmt.Printf("  %s  taken on %s, captured %s, %d bytes, %s\n", ts, r.Source, defaultStr(r.CapturedAt, "-"), r.TotalSize, replicaState(r))
+						} else {
+							fmt.Printf("  %s  (not listed)\n", ts)
+						}
+					}
+					fmt.Println("A set-aside replica may hold the newest copy of the container's data; --restore lays it down instead.")
+					ok, err := confirmVoterChange(yes, "Delete these replicas?")
+					if err != nil || !ok {
+						return err
+					}
 					resp, err := c.RemoveContainerReplicas(ctx, &pb.RemoveContainerReplicasRequest{
 						Host: host, Repo: repo, Project: projectName, Name: args[0], Timestamps: remove,
 					})
 					if err != nil {
 						return fmt.Errorf("remove replicas: %w", err)
 					}
-					fmt.Printf("removed %d set-aside replica(s) of %s from %s on %s\n", resp.Removed, args[0], repo, defaultStr(host, "this host"))
+					fmt.Printf("removed %d replica(s) of %s from %s on %s\n", resp.Removed, args[0], repo, defaultStr(host, "this host"))
 					return nil
 				}
-				resp, err := c.ListContainerReplicas(ctx, &pb.ListContainerReplicasRequest{
-					Host: host, Repo: repo, Project: projectName, Name: args[0],
-				})
-				if err != nil {
-					return fmt.Errorf("list replicas: %w", err)
-				}
-				fmt.Printf("%-26s %-14s %-11s %-10s %s\n", "TAKEN", "FROM", "SIZE", "STATE", "WHY")
-				for _, r := range resp.Replicas {
-					state, why := "current", ""
+				fmt.Printf("%-26s %-14s %-32s %-11s %-10s %s\n", "TAKEN", "FROM", "CAPTURED", "SIZE", "STATE", "WHY")
+				for _, r := range list.Replicas {
+					why := ""
 					if r.SetAside {
-						state, why = "set-aside", r.SetAsideReason
+						why = r.SetAsideReason
 					}
-					fmt.Printf("%-26s %-14s %-11d %-10s %s\n", r.Timestamp, r.Source, r.TotalSize, state, why)
+					fmt.Printf("%-26s %-14s %-32s %-11d %-10s %s\n", r.Timestamp, r.Source, defaultStr(r.CapturedAt, "-"), r.TotalSize, replicaState(r), why)
 				}
 				return nil
 			})
@@ -241,9 +279,22 @@ failover; it stays until removed here with --remove <timestamp> (admin).`,
 	cmd.Flags().StringVar(&host, "host", "", "the replica host (the schedule's --target-host)")
 	cmd.Flags().StringVar(&repo, "target-pool", "", "the backup repo on that host (the schedule's --target-pool)")
 	cmd.Flags().StringVar(&projectName, "project-name", "", "the container's project (default _default)")
-	cmd.Flags().StringArrayVar(&remove, "remove", nil, "remove the SET-ASIDE replica taken at this timestamp (repeatable; admin)")
+	cmd.Flags().StringVar(&restore, "restore", "", "restore the replica taken at this timestamp as the container, stopped (admin)")
+	cmd.Flags().StringArrayVar(&remove, "remove", nil, "remove the SET-ASIDE or ORPHANED replica taken at this timestamp (repeatable; admin)")
+	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "remove without asking")
 	_ = cmd.MarkFlagRequired("target-pool")
 	return cmd
+}
+
+// replicaState is how a listing shows one replica.
+func replicaState(r *pb.ContainerReplica) string {
+	switch {
+	case r.SetAside:
+		return "set-aside"
+	case r.Orphaned:
+		return "orphaned"
+	}
+	return "current"
 }
 
 func newReplicationPromoteCmd() *cobra.Command {

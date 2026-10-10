@@ -253,6 +253,12 @@ func (c *ContainerChecker) tryRekey(ctx context.Context, name string, remote cor
 		slog.Warn("ct-rekey: reclaimed container ownership — runs locally and no other host runs it",
 			"container", name, "from_host", remote.HostName, "to_host", c.hostName)
 		c.auditRekey(ctx, name, remote.HostName)
+		// A re-key is a new placement of the container here (container
+		// replication keys a segment of its history by it): minted after the
+		// re-key, whose statements must carry the source's create spec.
+		if _, err := corrosion.MintContainerPlacement(ctx, c.db, c.hostName, name, remote.CreateSpec); err != nil {
+			slog.Warn("ct-rekey: mint a new placement", "container", name, "error", err)
+		}
 		corrosion.ReverseReplicationAudited(ctx, c.db, "container", name, remote.Project, remote.HostName, c.hostName, func(detail, result string) {
 			auditSystem(ctx, c.db, c.hostName, "replication.reverse", name, detail, result)
 		})

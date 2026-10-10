@@ -434,31 +434,48 @@ not hold cross the wire. A replica archive is cut into **content-defined
 chunks**: a chunk ends where the bytes say so, not every 4 MiB, so a file that
 grew in the middle of the rootfs (which shifts every later byte of the tar)
 changes only the chunks around it, and the next replica sends those and little
-else. Only the container's owner pushes: the run refuses on a host that has
+else. The archive is written in name order with each member's modification
+time and no access or change time, and a restore, migrate or promotion lays
+every member down with its archived modification time, so an unchanged tree
+archives to the same bytes before and after a move. (A container whose files
+did change sends those; the first run into a repo that holds no replica of the
+container sends it whole.) Only the container's owner pushes: the run refuses on a host that has
 self-fenced, is not an active member, or whose owner-epoch marker is ahead of
 its own row, and the **target** checks again against its own view, refusing a
-replica from a host it knows is fenced, or when the container's row there is on
-another host, is another row incarnation, or has moved past the replica's owner
-epoch. A stale owner coming back from a partition therefore adds nothing that
+replica from a host it knows is fenced. When the container's row there is on
+another host, is another placement, or has moved past the replica's owner epoch,
+the push is refused too, as "moving": a warning, since the owner's next run
+lands. A stale owner coming back from a partition therefore adds nothing that
 could later be promoted.
 
 **Keeping the newest copy.** Each replica records the segment of the
-container's history it was taken in (the host and that host's container row)
-and the points of earlier history its data descends from (a restore records the
-archive it laid down; a migrate carries its source's chain). A replica of the
-same segment is a snapshot of one linear history, so `--keep` trims the oldest
-of those. A replica of an earlier segment is removed only when the new
-replica's data provably descends from a point of that segment at or after it
-was taken. Anything else is **set aside**: kept, never pruned by the schedule,
+container's history it was taken in: the host and the container's **placement
+id**, a random id minted every time the container's row is put on a host (a
+create, clone, restore, migrate, relocation or re-key), so a container that
+returns to a host it ran on before is a new segment there. It records when it
+was **captured** (after the freeze), as opposed to its name, which is only the
+scheduler's tick. And it records the points of earlier history its data
+descends from (a restore records the archive it laid down; a migrate carries its
+source's chain), each by capture instant. A replica of the same placement is a
+snapshot of one linear history, so `--keep` trims the oldest of those, and never
+a set-aside one or one whose capture is not known. A replica of another
+placement is removed only when the new replica's data provably descends from a
+point of that placement captured at or after it. Anything else is **set
+aside**: kept, never pruned by the schedule,
 never promoted by failover, reported once (`replication.replica_set_aside`, warn,
 and an audit row), and listed by `lv replication replicas` with the reason. That
 is what a failover that did not restore from the replica leaves behind (the
 container came back from its image or a backup, or on a host placement chose
 over the replica host): the set-aside replica may be the newest copy of the
-data, and only an operator removes it:
+data. An operator can restore it, stopped, as the container (refused while the
+container lives anywhere, so there is never a second runnable copy), or remove
+it; removal asks first. A replica no schedule settles any more (the schedule was
+deleted, re-targeted or reversed away) is listed as orphaned and may be removed
+too:
 
 ```bash
 lv replication replicas web --host hostB --target-pool dr
+lv replication replicas web --host hostB --target-pool dr --restore 2026-10-10T08:00:00Z
 lv replication replicas web --host hostB --target-pool dr --remove 2026-10-10T08:00:00Z
 ```
 
@@ -480,12 +497,14 @@ warning, not an error. The schedule's `LAST ERR` always shows the latest run.
 **Promotion.** When a container's host is fenced, the failover coordinator
 places a container whose schedule has `--auto-promote` on the replica host when
 placement accepts it, and restores the newest replica there that was taken from
-the very container row being relocated (its host and row incarnation) and is
-not set aside, through the same restore-relocation as a restore from backup: the
-same relocation proof, recovery claim and single-use token, so one copy exists
-at every moment. It restores the replica when it is newer than the newest
-backup it can reach, or when there is no backup. A replica becomes a live copy
-only this way: an operator restore or a cold migrate of a replica is refused.
+the very container row being relocated (its host and placement) and is not set
+aside, through the same restore-relocation as a restore from backup: the same
+relocation proof, recovery claim and single-use token, so one copy exists at
+every moment. It restores the replica unless the newest backup it can reach was
+captured after it (a backup whose capture is not known does not outrank a
+replica). A replica becomes a live copy only this way or through
+`lv replication replicas --restore`; a plain restore or a cold migrate of a
+replica is refused.
 Like a VM, a replica older than two of the schedule's longest intervals plus an
 hour is not promoted automatically; the container then falls back to the
 backup or image-recreate path as if there were no replica.
@@ -507,28 +526,32 @@ workload moved onto** is switched. A schedule with no target host (a shared
 pool, or an auto-selected peer) already replicates away from wherever the
 workload runs; a schedule that targets a third host stays as it is. A pool,
 project or cluster schedule is shared by many workloads, so none is re-pointed
-for one of them; it does not replicate the VMs on its own target host at all.
+for one of them.
 
-**Never onto its own host.** A run whose schedule's explicit target is the host
-the workload now runs on (on host-local storage) never replicates: the replica
-would be lost with the workload. It is not reported as a success either. While
-the switch made by the move is still on its way to this host (it replicates
-from the host that committed the move), the run is skipped quietly; after 15
-minutes it is reported as `replication.suspended` (warn), once and then hourly,
-with the reason in the schedule's `LAST ERR`. A VM schedule that names the VM's
-own host for host-local storage is refused when it is created; omit
-`--target-host` to use a local pool only when no peer has one.
+**Never onto its own host after a move.** An explicit `--target-host` equal to
+the VM's own host is an operator's same-host copy and works as it always has. But
+a run that finds the workload on its replica target because it MOVED there (a
+container's schedule never targets its own host; a VM's replicas there were
+written by another host) never replicates: the replica would be lost with the
+workload. It is not reported as a success either. While the switch made by the
+move is still on its way to this host (it replicates from the host that
+committed the move), the run is skipped quietly; after 15 minutes it is reported
+as `replication.suspended` (warn), once and then hourly, with the reason in the
+schedule's `LAST ERR`.
 
-The switch changes only the target host: once every host runs a release that has
-it, as a compare-and-set of that one column, so an operator's concurrent edit of
-the schedule on another node survives it. For a VM the incremental checkpoint of
+The switch changes only the target host: once every host is known to run a
+build that has the statement (every member answers this build's replica RPC),
+as a compare-and-set of that one column, so an operator's concurrent edit of the
+schedule on another node survives it; before that, by re-reading the row just
+before re-writing it. For a VM the incremental checkpoint of
 the old direction is dropped, and an incremental run forks only from the replica
 its own checkpoint continues (a checkpoint names the run that made it, as does
 that run's replica): when the target does not hold that replica (after a
 reversal, or when another period left a newer one there), the run is a full
 push, never increments grafted onto another run's file. A container needs no
-such step: its chunks are content-defined, so a reversed run over a target that
-still holds earlier replicas sends only what changed. Nothing on the old host
+such step: a reversed run over a target that still holds its earlier replicas
+sends only the chunks that changed (see "A run" above; the first run into a repo
+that holds none sends the container whole). Nothing on the old host
 is read, written or removed by the switch: replicas are only ever added there as
 new files, written without replacing an existing one, and a replica that a disk
 copy set aside by a failover is layered on (a `--no-localize` promotion's

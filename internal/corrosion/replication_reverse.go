@@ -192,7 +192,7 @@ func reversalBlocker(ctx context.Context, c *Client, kind, oldHost string, r Bac
 // left targeting the workload's own host is then reported by its runs
 // (suspended, never a success), so nothing is silent. It never fails the move.
 func ReverseReplicationAudited(ctx context.Context, c *Client, kind, name, project, oldHost, newHost string, audit func(detail, result string)) {
-	revs, err := ReverseReplicationOnMove(ctx, c, kind, name, project, oldHost, newHost, ReverseOptions{})
+	revs, err := ReverseReplicationOnMove(ctx, c, kind, name, project, oldHost, newHost, ReverseOptions{TargetOnly: c.RepointReady(ctx)})
 	if err != nil {
 		slog.Warn("replication: could not switch direction after a move", "kind", kind, "workload", name, "from", oldHost, "to", newHost, "error", err)
 	}
@@ -203,4 +203,15 @@ func ReverseReplicationAudited(ctx context.Context, c *Client, kind, name, proje
 		}
 		audit(fmt.Sprintf("%s %s moved %s -> %s: replication now runs %s -> %s (%s)", kind, name, oldHost, newHost, newHost, r.ToHost, r.Repo), "ok")
 	}
+}
+
+// SetRepointReady installs the answer to "may this client emit
+// RepointReplicationTarget's statement": true only once every host is known to
+// apply it (grpcapi's readiness probe). nil, the default, is "no".
+func (c *Client) SetRepointReady(fn func(context.Context) bool) { c.repointReady.Store(&fn) }
+
+// RepointReady reports whether the compare-and-set switch may be emitted.
+func (c *Client) RepointReady(ctx context.Context) bool {
+	fn := c.repointReady.Load()
+	return fn != nil && *fn != nil && (*fn)(ctx)
 }

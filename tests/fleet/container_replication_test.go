@@ -2,6 +2,8 @@ package fleet
 
 import (
 	"context"
+	"encoding/json"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -214,21 +216,58 @@ func TestContainerReplication_ATooOldReplicaIsNotPromotedAutomatically(t *testin
 	ctx := context.Background()
 	const name = "web"
 	replCT(t, c, dead, name)
-	drRepo(t, target)
+	repo := drRepo(t, target)
 	sched := ctSchedule(t, c, dead, name, target.Name, 3, true) // hourly: the bound is about 3h
 	dead.CT.Seed(name, "ancient")
 	if err := dead.Server.RunReplication(ctx, sched, time.Now().UTC().Add(-100*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
+	// Age is judged by when the replica was captured, not by its name: make
+	// this one's capture 100 hours old.
+	ageReplicas(t, repo, name, 100*time.Hour)
 	if outcome, err := promoteVia(t, coord, dead, target, name, "tok-3"); err == nil || outcome == corrosion.RestoreLanded {
 		t.Fatalf("a replica far past the schedule's age bound must not be promoted automatically: (%v, %v)", outcome, err)
 	}
 }
 
-// A replica older than one the target already holds of the same segment of the
-// container's history is refused at the target: the newer copy is never
-// replaced by an older one.
-func TestContainerReplication_AnOlderCopyNeverReplacesANewerReplica(t *testing.T) {
+// ageReplicas moves the capture instant of every replica of name in the repo at
+// repo back by d.
+func ageReplicas(t *testing.T, repo, name string, d time.Duration) {
+	t.Helper()
+	dir := filepath.Join(replicaNS(repo), "snapshots", name)
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range ents {
+		p := filepath.Join(dir, e.Name())
+		b, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var m pbsstore.Manifest
+		if err := json.Unmarshal(b, &m); err != nil {
+			t.Fatal(err)
+		}
+		var spec map[string]any
+		if err := json.Unmarshal([]byte(m.ContainerSpecJSON), &spec); err != nil {
+			t.Fatal(err)
+		}
+		spec["captured_at"] = time.Now().UTC().Add(-d).Format(time.RFC3339Nano)
+		sb, _ := json.Marshal(spec)
+		m.ContainerSpecJSON = string(sb)
+		out, _ := json.Marshal(m)
+		if err := os.WriteFile(p, out, 0o640); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// A replica the target already holds is never written over: a second push of
+// the same replica (the same name) is refused, and the one held stands. (A
+// replica captured before one held of the same placement is refused too:
+// TestAdmitContainerReplica_RefusesAnOlderCopyOfTheSameSegment.)
+func TestContainerReplication_AHeldReplicaIsNeverWrittenOver(t *testing.T) {
 	c := New(t, Options{Nodes: 3, SharedCRDT: true})
 	a, b := c.Nodes[0], c.Nodes[1]
 	ctx := context.Background()
@@ -236,17 +275,17 @@ func TestContainerReplication_AnOlderCopyNeverReplacesANewerReplica(t *testing.T
 	replCT(t, c, a, name)
 	repo := drRepo(t, b)
 	sched := ctSchedule(t, c, a, name, b.Name, 3, true)
-	now := time.Now().UTC()
-	a.CT.Seed(name, "newer")
-	if err := a.Server.RunReplication(ctx, sched, now.Add(-time.Minute)); err != nil {
+	at := time.Now().UTC().Add(-time.Minute)
+	a.CT.Seed(name, "first")
+	if err := a.Server.RunReplication(ctx, sched, at); err != nil {
 		t.Fatal(err)
 	}
-	a.CT.Seed(name, "older")
-	if err := a.Server.RunReplication(ctx, sched, now.Add(-2*time.Minute)); err == nil {
-		t.Fatal("a replica older than the one held must be refused by the target")
+	a.CT.Seed(name, "second")
+	if err := a.Server.RunReplication(ctx, sched, at); err == nil {
+		t.Fatal("a second replica under a held replica's name must be refused")
 	}
 	if ms := replicas(t, repo, name); len(ms) != 1 {
-		t.Fatalf("the target holds %d replicas, want only the newer one", len(ms))
+		t.Fatalf("the target holds %d replicas, want the first", len(ms))
 	}
 }
 

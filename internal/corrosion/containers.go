@@ -2,7 +2,9 @@ package corrosion
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -181,6 +183,63 @@ type ContainerCreateSpec struct {
 	// and let any node report them.
 	IDMapBase   int64  `json:"idmap_base,omitempty"`
 	Confinement string `json:"confinement,omitempty"`
+	// Placement names ONE placement of the container: a random id minted
+	// whenever its row is written onto a host by a create, clone, restore
+	// (including a migrate and a replica promotion), relocate-recreate or
+	// owner re-key (WithNewPlacement). Unlike created_at, which a
+	// relocate-recreate and a re-key keep on purpose, it is never reused, so
+	// a container that returns to a host it once ran on is a new placement
+	// there. Container replication keys a segment of the container's history
+	// by it. Empty for a row an earlier build wrote: an unknown placement.
+	Placement string `json:"placement,omitempty"`
+}
+
+// WithNewPlacement returns createSpec carrying a freshly minted placement id,
+// and that id.
+func WithNewPlacement(createSpec string) (string, string) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic("corrosion: no randomness for a placement id: " + err.Error())
+	}
+	id := hex.EncodeToString(b[:])
+	// Only the placement changes: every other key is kept verbatim, including
+	// one this build does not know.
+	m := map[string]json.RawMessage{}
+	if createSpec != "" {
+		if err := json.Unmarshal([]byte(createSpec), &m); err != nil {
+			m = map[string]json.RawMessage{}
+		}
+	}
+	m["placement"], _ = json.Marshal(id)
+	out, _ := json.Marshal(m)
+	return string(out), id
+}
+
+// PlacementOf is the placement id a stored create spec carries ("" unknown).
+func PlacementOf(createSpec string) string { return DecodeCreateSpec(createSpec).Placement }
+
+// MintContainerPlacement gives the live row (host, name) a new placement id,
+// compare-and-set on the create spec it has now: for a re-key, whose own
+// statements must carry the source row's create spec unchanged (every receiver
+// verifies the re-keyed row's identity against the source). Changes nothing
+// else. The statement is a shape a host on an earlier build does not know, so
+// it is emitted only when RepointReady says every host applies this build's
+// shapes; until then the re-keyed row keeps the placement it had (applied
+// false), and container replication, which needs the same, is off. applied is
+// also false when the row changed meanwhile.
+func MintContainerPlacement(ctx context.Context, c *Client, host, name, current string) (bool, error) {
+	if !c.RepointReady(ctx) {
+		return false, nil
+	}
+	next, _ := WithNewPlacement(current)
+	n, err := c.ExecuteRowsStrict(ctx,
+		`UPDATE containers SET create_spec = ?, updated_at = ?
+		 WHERE host_name = ? AND name = ? AND deleted_at IS NULL AND COALESCE(create_spec, '') = ?`,
+		next, c.NowTS(), host, name, current)
+	if errors.Is(err, ErrNoRowsAffected) {
+		return false, nil
+	}
+	return n > 0, err
 }
 
 // ContainerNetwork is one NIC of a ContainerCreateSpec. It carries the create-
@@ -205,7 +264,7 @@ type ContainerNetwork struct {
 // zero/empty spec so it round-trips as "unknown".
 func EncodeCreateSpec(s ContainerCreateSpec) string {
 	if s.Template == "" && s.Distro == "" && s.Release == "" && s.Arch == "" && len(s.Networks) == 0 && s.OwnerID == "" &&
-		s.IDMapBase == 0 && s.Confinement == "" {
+		s.IDMapBase == 0 && s.Confinement == "" && s.Placement == "" {
 		return ""
 	}
 	b, err := json.Marshal(s)
@@ -910,6 +969,8 @@ func RelocateContainerWithToken(ctx context.Context, c *Client, oldHost, name, n
 	rec.State = "pending"
 	rec.StateDetail = ContainerRelocateRecreateDetail
 	rec.RelocateToken = token
+	// A new placement, whatever created_at keeps (below).
+	rec.CreateSpec, _ = WithNewPlacement(rec.CreateSpec)
 	// created_at is PRESERVED, as RekeyContainerOwnerGuarded preserves it: a
 	// relocation moves one incarnation of the container, it does not make a
 	// new one. A recovery claim is keyed by created_at

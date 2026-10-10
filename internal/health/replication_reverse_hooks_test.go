@@ -2,6 +2,7 @@ package health
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -80,5 +81,29 @@ func TestCtRekey_AReclaimSwitchesReplicationOffTheNewOwner(t *testing.T) {
 	}
 	if got := replTarget(t, db, key); got != "node-b" {
 		t.Fatalf("after the re-key the schedule targets %q, want node-b", got)
+	}
+}
+
+// N1: a re-key is a new placement: once every host applies this build's
+// statements, the re-keyed row gets a fresh placement id, so a container that
+// is re-keyed back onto a host it ran on never re-enters its old segment there.
+func TestCtRekey_MintsANewPlacement(t *testing.T) {
+	ctx := context.Background()
+	c, db, clock, _ := ctRekeyFixture(t)
+	db.SetRepointReady(func(context.Context) bool { return true })
+	before := corrosion.PlacementOf(liveCt(t, db, "node-b", "ct1").CreateSpec)
+	c.SetPeerContainerRuntimeChecker(func(_ context.Context, _, _ string) (string, error) { return RuntimeAbsent, nil })
+	c.assertContainerOwnership(ctx)
+	*clock = clock.Add(ownershipAssertDebounce + time.Minute)
+	c.assertContainerOwnership(ctx)
+	got := liveCt(t, db, "node-a", "ct1")
+	if got == nil {
+		t.Fatal("the premise: node-a must have re-keyed ct1")
+	}
+	if p := corrosion.PlacementOf(got.CreateSpec); p == "" || p == before {
+		t.Fatalf("the re-keyed row's placement is %q (was %q), want a new one", p, before)
+	}
+	if !strings.Contains(got.CreateSpec, `"image":"alpine"`) {
+		t.Fatalf("the rest of the create spec must be kept: %s", got.CreateSpec)
 	}
 }

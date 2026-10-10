@@ -155,6 +155,7 @@ func (s *Server) PushReplicaIncrement(stream pb.LiteVirt_PushReplicaIncrementSer
 	if err := s.admitVMReplicaSource(ctx, rec.Project, rec.VM); err != nil {
 		return err
 	}
+	rec.Source = replicaSourceOf(ctx)
 	dest, ferr := s.receiveRawReplica(ctx, first.PoolName, rec, first.Base, first.TotalSize, apply)
 	if ferr != nil {
 		if _, isStatus := status.FromError(ferr); isStatus {

@@ -181,9 +181,8 @@ func TestScheduler_ContainerScheduleIsNotAVMSchedule(t *testing.T) {
 }
 
 // A shared (pool, project, cluster) replication schedule whose explicit target
-// is this host does not replicate this host's own VMs: the replica would sit
-// beside the disk it protects.
-func TestScheduler_ASharedReplicationScheduleSkipsItsOwnTarget(t *testing.T) {
+// is this host still runs this host's own VMs, into the pool here, as on main.
+func TestScheduler_ASharedReplicationScheduleRunsItsTargetsOwnVMs(t *testing.T) {
 	ctx := context.Background()
 	db := newSchedTestDB(t)
 	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{Name: "vm-on-b", HostName: "host-b", Spec: "{}", State: "running"}, nil, nil); err != nil {
@@ -202,7 +201,7 @@ func TestScheduler_ASharedReplicationScheduleSkipsItsOwnTarget(t *testing.T) {
 	s.Tick(ctx)
 	repl.mu.Lock()
 	defer repl.mu.Unlock()
-	if len(repl.calls) != 0 {
-		t.Fatalf("the target host ran its own VMs into its own pool: %d run(s)", len(repl.calls))
+	if len(repl.calls) != 1 {
+		t.Fatalf("the target host's own VM ran %d time(s), want once, as on main", len(repl.calls))
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -94,14 +95,37 @@ func (e *replTargetDownError) Unwrap() error { return e.err }
 // condition is reported and a repeat is not.
 func replErrorClass(err error) (class string, sev notify.Severity) {
 	var down *replTargetDownError
+	var st interface{ GRPCStatus() *status.Status }
 	switch {
 	case errors.As(err, &down):
 		return "target-down:" + down.host, notify.SevWarn
 	case errors.Is(err, errReplicationSuspended):
 		return "suspended", notify.SevWarn
+	case errors.As(err, &st) && st.GRPCStatus().Code() == codes.Aborted:
+		// The target's view says the workload is moving (replication_owner.go):
+		// the owner's next run lands. A warning, not an error page.
+		return "moving", notify.SevWarn
+	case errors.As(err, &st):
+		return "error:" + st.GRPCStatus().Code().String() + ":" + errShape(st.GRPCStatus().Message()), notify.SevError
 	default:
-		return "error:" + status.Code(err).String(), notify.SevError
+		return "error:" + errShape(err.Error()), notify.SevError
 	}
+}
+
+// errShape is an error message with its digits blanked and its length capped,
+// so a repeat of one cause (another timestamp, another byte count) is the same
+// class and another cause is not.
+func errShape(msg string) string {
+	b := []byte(msg)
+	for i, c := range b {
+		if c >= '0' && c <= '9' {
+			b[i] = '#'
+		}
+	}
+	if len(b) > 96 {
+		b = b[:96]
+	}
+	return string(b)
 }
 
 // suspendedOnOwnTarget is the outcome of a run whose schedule targets the host

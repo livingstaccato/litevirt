@@ -62,6 +62,10 @@ type Server struct {
 	// schedule's reporting state (replication_outcome.go).
 	ctReplGate containerReplicationGateFn
 	replRuns   replRuns
+	// repointOK is the memoised answer of repointReady, taken at repointAt.
+	repointMu sync.Mutex
+	repointOK bool
+	repointAt time.Time
 
 	// isoLib holds the ISO library's per-host state: the sha256 cache of
 	// library files and the one-sync-pass-at-a-time lock (iso_library.go).
@@ -1944,6 +1948,7 @@ func NewServer(hostName, dataDir, pkiDir string, db *corrosion.Client, virt Libv
 		pushBackupSem:  make(chan struct{}, pushBackupMaxConcurrent),
 	}
 	s.wireCertificateVerifier()
+	s.wireRepointReady()
 	return s
 }
 

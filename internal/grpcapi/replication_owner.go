@@ -98,12 +98,14 @@ func (s *Server) admitVMReplicaSource(ctx context.Context, project, vmName strin
 	if vm == nil || tenancy.NormalizeProject(vm.Project) != tenancy.NormalizeProject(project) {
 		return nil
 	}
+	// Aborted, not a failure: the VM has just moved, or this host has not
+	// seen the move yet. The owner's next run lands (replErrorClass).
 	if vm.HostName != source {
-		return status.Errorf(codes.FailedPrecondition,
+		return status.Errorf(codes.Aborted,
 			"refusing a replica of %s from %q: the VM's row here is on %q", vmName, source, vm.HostName)
 	}
 	if haveEpoch && vm.OwnerEpoch > epoch {
-		return status.Errorf(codes.FailedPrecondition,
+		return status.Errorf(codes.Aborted,
 			"refusing a replica of %s from %q at owner epoch %d: the row here is at %d", vmName, source, epoch, vm.OwnerEpoch)
 	}
 	return nil
@@ -126,4 +128,15 @@ func (s *Server) mayReplicateVMAsOwner(ctx context.Context, vm *corrosion.VMReco
 		}
 	}
 	return nil
+}
+
+// replicaSourceOf is the host a received replica push says it was taken on, or
+// the pushing peer's certificate name.
+func replicaSourceOf(ctx context.Context) string {
+	if md, ok := metadata.FromIncomingContext(ctx); ok {
+		if v := md.Get(replicaSourceMD); len(v) > 0 && v[0] != "" {
+			return v[0]
+		}
+	}
+	return callerMTLSCommonName(ctx)
 }

@@ -115,10 +115,8 @@ func TestPoolBlock_OperatorUsesAdminCreatedZfsAndLvmThinPools(t *testing.T) {
 	if _, err := s.CreateSnapshot(pat, &pb.CreateSnapshotRequest{VmName: "vm1", Name: "before"}); err != nil {
 		t.Errorf("operator snapshots the VM: %v", err)
 	}
-	// No target host: the pool on this host, which no peer has (an explicit
-	// target that is the VM's own host is refused for host-local storage).
 	if _, err := s.CreateReplicationSchedule(pat, &pb.CreateReplicationScheduleRequest{
-		VmName: "vm1", TargetPool: "tank", Cron: "0 0 * * *",
+		VmName: "vm1", TargetPool: "tank", TargetHost: s.hostName, Cron: "0 0 * * *",
 	}); err != nil {
 		t.Errorf("operator schedules replication to the zfs pool: %v", err)
 	}

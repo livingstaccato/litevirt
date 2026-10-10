@@ -524,6 +524,8 @@ func extractTar(r io.Reader, base string) error {
 			return err
 		}
 		out.Close()
+		// As the real importer (safename.ExtractRootfsTar): the archived mtime.
+		_ = os.Chtimes(dst, hdr.ModTime, hdr.ModTime)
 	}
 }
 

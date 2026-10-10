@@ -135,15 +135,6 @@ func (s *SnapshotScheduler) Tick(ctx context.Context) {
 		// matching VM owned by THIS host and fire one backup each.
 		// Per-VM scope: the single-host-owner gate below.
 		if fanoutVMs, isFanout := s.expandScope(ctx, sched); isFanout {
-			// A shared replication schedule whose explicit target is THIS host
-			// does not replicate this host's own VMs: a replica beside the
-			// disk it protects is lost with it. They are left out, not run
-			// and reported as replicated.
-			if sched.Type == "replication" && sched.TargetHost != "" && sched.TargetHost == s.HostName {
-				slog.Debug("snapshot scheduler: a shared replication schedule targets this host; its VMs here are not replicated by it",
-					"schedule", sched.VMName, "repo", sched.Repo)
-				continue
-			}
 			if len(fanoutVMs) == 0 {
 				// No matching VMs on this host's slice — nothing to do.
 				// Don't mark the row run; other hosts may own matches.

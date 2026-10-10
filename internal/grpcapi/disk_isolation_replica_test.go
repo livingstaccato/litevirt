@@ -172,6 +172,10 @@ func TestReplicaRPCs_ArePeerOnly(t *testing.T) {
 // and schedule — never from a file named in the request, like B's raw replica.
 func TestPushReplicaIncrement_BaseMustBeARecordedReplica(t *testing.T) {
 	f := newPoolFixture(t)
+	// The pusher is the VM's owner, so the base check is what refuses.
+	if err := corrosion.UpdateVMHost(context.Background(), f.s.db, "web", "peer-host", "running"); err != nil {
+		t.Fatal(err)
+	}
 	rec := newReplicaRecord("a", "web", "1", "web/dr", "20261009-000000", "raw")
 	st := &fakePushStream{ctx: peerCtxFor(t, f.s, "peer-host"), msgs: []*pb.PushReplicaIncrementRequest{
 		{PoolName: "dr", Filename: rec.File, Base: bReplicaRaw, TotalSize: 1 << 16, Replica: rec.toPB()},

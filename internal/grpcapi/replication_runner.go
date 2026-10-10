@@ -88,14 +88,14 @@ func (s *Server) runVMReplication(ctx context.Context, sched corrosion.BackupSch
 	case shared:
 		targetHost = s.hostName
 	case targetHost == s.hostName:
-		// An explicit target that is the host the VM runs on, on storage only
-		// this host reaches: the replica would sit beside the disk it
-		// protects and be lost with it. That is a VM that moved onto its
-		// replica target; the move switches the schedule to the host it left.
-		// It never runs here (a schedule with no target host still falls back
-		// to a local pool when no peer has one, below). A pool on shared
-		// storage (a mount other hosts reach) is usable from any of them.
-		if !s.poolOnSharedStore(ctx, sched.TargetPool) {
+		// An explicit target that is the host the VM runs on: a same-host
+		// copy, as an operator may choose (as on main). But when the VM moved
+		// here from the host that replicated INTO this host (its replicas
+		// here were written by another host), the schedule is the move's
+		// leftover: replicating beside the disk it protects would protect
+		// nothing. The move switches it to the host it left; until then it
+		// is suspended, never reported as a success.
+		if s.vmMovedOntoItsTarget(ctx, sched, vm, src.DiskName) {
 			return s.suspendedOnOwnTarget(sched, "vm", vm.Name)
 		}
 	case targetHost != "":
@@ -222,6 +222,7 @@ func (s *Server) replicateLocalWith(ctx context.Context, sched corrosion.BackupS
 	// record naming its project, VM, disk and schedule (replica_records.go).
 	key := replicaScheduleKey(sched)
 	rec := newReplicaRecord(vm.Project, sched.VMName, src.DiskName, key, ts, "qcow2")
+	rec.Source = s.hostName
 	if filepath.Join(replicaOwnerDir(dstDir, rec.Project, rec.VM), rec.File) == src.Path {
 		return fmt.Errorf("source and destination resolve to the same path")
 	}
@@ -261,6 +262,7 @@ func (s *Server) replicateCrossHost(ctx context.Context, sched corrosion.BackupS
 	ctx = s.withReplicaOwner(ctx, vm)
 	key := replicaScheduleKey(sched)
 	rec := newReplicaRecord(vm.Project, sched.VMName, src.DiskName, key, ts, "qcow2")
+	rec.Source = s.hostName
 	// The receiver proves it records replicas BEFORE anything is spent on
 	// it: no full local copy for a host that would refuse it.
 	client, closeConn, err := s.dialPeer(ctx, targetHost)
@@ -500,6 +502,7 @@ func (s *Server) replicateIncremental(ctx context.Context, sched corrosion.Backu
 	}
 	totalSize := session.Size()
 	rec := newReplicaRecord(vm.Project, sched.VMName, src.DiskName, key, ts, "raw")
+	rec.Source = s.hostName
 
 	if targetHost == s.hostName {
 		if err := s.applyIncrementLocal(ctx, sched.TargetPool, rec, base, totalSize, session, extents); err != nil {
@@ -1038,12 +1041,18 @@ func (s *Server) sourceIsShutOff(vm *corrosion.VMRecord) bool {
 	return st.State == "stopped" && st.Reason != "paused" && st.Reason != "pmsuspended"
 }
 
-// poolOnSharedStore reports whether pool's directory here is on storage other
-// hosts mount too (sharedStoreOf), so a replica in it outlives this host.
-func (s *Server) poolOnSharedStore(ctx context.Context, pool string) bool {
-	dir, err := s.replicaPoolDir(ctx, pool)
-	if err != nil {
-		return false
+// vmMovedOntoItsTarget reports whether vm's schedule targets the host the VM
+// now runs on because the VM moved onto its replica target: the newest replica
+// this schedule recorded here was written by another host. A schedule that has
+// only ever replicated here from here (an operator's same-host copy), or none
+// yet, is not.
+func (s *Server) vmMovedOntoItsTarget(ctx context.Context, sched corrosion.BackupScheduleRecord, vm *corrosion.VMRecord, disk string) bool {
+	key := replicaScheduleKey(sched)
+	newest := replicaRecord{}
+	for _, r := range s.replicaRecordsOn(ctx, sched.TargetPool, s.hostName, vm.Project, vm.Name) { // oldest first
+		if r.Disk == disk && r.Schedule == key {
+			newest = r
+		}
 	}
-	return sharedStoreOf(dir).Shared
+	return newest.Source != "" && newest.Source != s.hostName
 }

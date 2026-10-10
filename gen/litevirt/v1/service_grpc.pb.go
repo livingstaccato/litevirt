@@ -168,6 +168,7 @@ const (
 	LiteVirt_ProbeContainerBackups_FullMethodName      = "/litevirt.v1.LiteVirt/ProbeContainerBackups"
 	LiteVirt_ListContainerReplicas_FullMethodName      = "/litevirt.v1.LiteVirt/ListContainerReplicas"
 	LiteVirt_RemoveContainerReplicas_FullMethodName    = "/litevirt.v1.LiteVirt/RemoveContainerReplicas"
+	LiteVirt_RestoreContainerReplica_FullMethodName    = "/litevirt.v1.LiteVirt/RestoreContainerReplica"
 	LiteVirt_PullOCIImage_FullMethodName               = "/litevirt.v1.LiteVirt/PullOCIImage"
 	LiteVirt_BackupContainer_FullMethodName            = "/litevirt.v1.LiteVirt/BackupContainer"
 	LiteVirt_RestoreContainer_FullMethodName           = "/litevirt.v1.LiteVirt/RestoreContainer"
@@ -562,6 +563,8 @@ type LiteVirtClient interface {
 	ListContainerReplicas(ctx context.Context, in *ListContainerReplicasRequest, opts ...grpc.CallOption) (*ListContainerReplicasResponse, error)
 	// Remove SET-ASIDE container replicas (admin): the only way one goes.
 	RemoveContainerReplicas(ctx context.Context, in *RemoveContainerReplicasRequest, opts ...grpc.CallOption) (*RemoveContainerReplicasResponse, error)
+	// Restore one replica as the container, stopped (admin; never a second copy).
+	RestoreContainerReplica(ctx context.Context, in *RestoreContainerReplicaRequest, opts ...grpc.CallOption) (*RestoreContainerReplicaResponse, error)
 	PullOCIImage(ctx context.Context, in *PullOCIImageRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	BackupContainer(ctx context.Context, in *BackupContainerRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[BackupContainerProgress], error)
 	RestoreContainer(ctx context.Context, in *RestoreContainerRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[RestoreContainerProgress], error)
@@ -2575,6 +2578,16 @@ func (c *liteVirtClient) RemoveContainerReplicas(ctx context.Context, in *Remove
 	return out, nil
 }
 
+func (c *liteVirtClient) RestoreContainerReplica(ctx context.Context, in *RestoreContainerReplicaRequest, opts ...grpc.CallOption) (*RestoreContainerReplicaResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RestoreContainerReplicaResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_RestoreContainerReplica_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) PullOCIImage(ctx context.Context, in *PullOCIImageRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(emptypb.Empty)
@@ -4419,6 +4432,8 @@ type LiteVirtServer interface {
 	ListContainerReplicas(context.Context, *ListContainerReplicasRequest) (*ListContainerReplicasResponse, error)
 	// Remove SET-ASIDE container replicas (admin): the only way one goes.
 	RemoveContainerReplicas(context.Context, *RemoveContainerReplicasRequest) (*RemoveContainerReplicasResponse, error)
+	// Restore one replica as the container, stopped (admin; never a second copy).
+	RestoreContainerReplica(context.Context, *RestoreContainerReplicaRequest) (*RestoreContainerReplicaResponse, error)
 	PullOCIImage(context.Context, *PullOCIImageRequest) (*emptypb.Empty, error)
 	BackupContainer(*BackupContainerRequest, grpc.ServerStreamingServer[BackupContainerProgress]) error
 	RestoreContainer(*RestoreContainerRequest, grpc.ServerStreamingServer[RestoreContainerProgress]) error
@@ -5227,6 +5242,9 @@ func (UnimplementedLiteVirtServer) ListContainerReplicas(context.Context, *ListC
 }
 func (UnimplementedLiteVirtServer) RemoveContainerReplicas(context.Context, *RemoveContainerReplicasRequest) (*RemoveContainerReplicasResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method RemoveContainerReplicas not implemented")
+}
+func (UnimplementedLiteVirtServer) RestoreContainerReplica(context.Context, *RestoreContainerReplicaRequest) (*RestoreContainerReplicaResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RestoreContainerReplica not implemented")
 }
 func (UnimplementedLiteVirtServer) PullOCIImage(context.Context, *PullOCIImageRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method PullOCIImage not implemented")
@@ -8150,6 +8168,24 @@ func _LiteVirt_RemoveContainerReplicas_Handler(srv interface{}, ctx context.Cont
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).RemoveContainerReplicas(ctx, req.(*RemoveContainerReplicasRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_RestoreContainerReplica_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RestoreContainerReplicaRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).RestoreContainerReplica(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_RestoreContainerReplica_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).RestoreContainerReplica(ctx, req.(*RestoreContainerReplicaRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -11167,6 +11203,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "RemoveContainerReplicas",
 			Handler:    _LiteVirt_RemoveContainerReplicas_Handler,
+		},
+		{
+			MethodName: "RestoreContainerReplica",
+			Handler:    _LiteVirt_RestoreContainerReplica_Handler,
 		},
 		{
 			MethodName: "PullOCIImage",

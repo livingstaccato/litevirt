@@ -698,7 +698,15 @@ func (r *LxcRunner) ExportContainer(ctx context.Context, name string, w io.Write
 	// --xattrs with every attribute and --acls keep file capabilities, ACLs
 	// and labels; setuid/setgid/sticky are in the mode. ImportContainer
 	// restores all of it (safename.ExtractRootfsTar).
-	cmd := exec.CommandContext(ctx, "tar", "-C", r.lxcpath(), "--numeric-owner",
+	// --sort=name makes the member order the names' order, not the
+	// directory's (an ext4 htree order differs per filesystem), and the pax
+	// headers --xattrs selects carry no atime or ctime: a restore keeps a
+	// member's mtime (safename.ExtractRootfsTar) but can never keep its ctime,
+	// and a read moves its atime. Two archives of the same tree, before and
+	// after a move, are then the same bytes, which is what lets a replica send
+	// only the content-defined chunks that changed.
+	cmd := exec.CommandContext(ctx, "tar", "-C", r.lxcpath(), "--numeric-owner", "--sort=name",
+		"--pax-option=delete=atime,delete=ctime",
 		"--xattrs", "--xattrs-include=*", "--acls", "-cf", "-", name)
 	stderr := strings.Builder{}
 	cmd.Stderr = stringWriter{&stderr}

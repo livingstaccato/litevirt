@@ -323,3 +323,29 @@ func TestReverseReplicationOnMove_ARetargetedScheduleIsLeftAlone(t *testing.T) {
 		}
 	}
 }
+
+// N9: the reversal the failover coordinator and the health loops make
+// (ReverseReplicationAudited) is the compare-and-set of target_host alone once
+// every host applies it, as the daemon's own reversal is.
+func TestReverseReplicationAudited_UsesTheCompareAndSetWhenReady(t *testing.T) {
+	for _, ready := range []bool{false, true} {
+		db := reverseFixture(t)
+		ctx := context.Background()
+		db.SetRepointReady(func(context.Context) bool { return ready })
+		if err := UpsertBackupSchedule(ctx, db, vmSched("web", "dr", "host-b")); err != nil {
+			t.Fatal(err)
+		}
+		var rows []string
+		ReverseReplicationAudited(ctx, db, "vm", "web", "", "host-a", "host-b", func(d, r string) { rows = append(rows, r) })
+		if len(rows) != 1 || schedulesOf(t, db)["web|dr"].TargetHost != "host-a" {
+			t.Fatalf("ready=%v: rows %v, schedule %+v", ready, rows, schedulesOf(t, db)["web|dr"])
+		}
+		got, err := db.Query(ctx, `SELECT COUNT(*) AS n FROM mutation_log WHERE stmts LIKE '%UPDATE backup_schedules SET target_host%'`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n := got[0].Int64("n"); (n > 0) != ready {
+			t.Fatalf("ready=%v: %d compare-and-set statement(s) emitted", ready, n)
+		}
+	}
+}

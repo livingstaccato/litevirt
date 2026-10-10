@@ -253,8 +253,10 @@ of acting — it says nothing about whether the resulting rows have replicated.
     repeated: a host switched to `best-effort` is never "recovered" on a failed
     best-effort fence.
   - **What is never retried:** a `manual` fence (`lv host fence-confirm`
-    resumes it), a `watchdog` fence of a peer (it cannot succeed), and a host
-    any observer has seen answer since the attempt that failed. That last
+    resumes it) and a `watchdog` fence of a peer (it cannot succeed) — unless
+    the host's strategy has since been set to `ipmi` or `ssh`, which the next
+    retry then runs — and a host any observer has seen answer since the
+    attempt that failed. That last
     check is made immediately before each retry, so a partition that heals
     between attempts does not power off a host that has just come back.
   - **Notifications:** the first failure raises `host.fenced` (warn); failed

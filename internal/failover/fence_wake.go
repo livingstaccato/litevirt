@@ -91,8 +91,8 @@ func fenceRetryDelay(n int) time.Duration {
 	return d
 }
 
-// retryableFenceMethod reports whether a failed attempt with method is worth
-// repeating. A manual fence cannot succeed (the confirmation path owns it), a
+// retryableFenceMethod reports whether a retry running method is worth
+// making. A manual fence cannot succeed (the confirmation path owns it), a
 // best-effort fence already proceeded on its failure, and a watchdog fence of
 // a peer always fails: fence.Execute refuses the watchdog strategy for any
 // host but the caller itself, and the coordinator never fences itself.
@@ -191,7 +191,11 @@ func (c *Coordinator) fenceRetryDue(ctx context.Context, h *corrosion.HostRecord
 	// (a failure wins a same-second tie against a success, as in
 	// readNewestFenceAttempt; a confirmation in the same second is taken as
 	// the operator's answer to the failure).
-	if newestFailed.IsZero() || newestFailed.Before(settled) || !retryableFenceMethod(newestFailedMethod) {
+	// Gate on the strategy the retry would RUN, not the method that failed: a
+	// host whose watchdog or manual fence failed and that the operator has
+	// since given ipmi or ssh is retried with it.
+	strategy := retryStrategy(h.FenceStrategy, newestFailedMethod)
+	if newestFailed.IsZero() || newestFailed.Before(settled) || !retryableFenceMethod(strategy) {
 		return fenceRetry{}
 	}
 	life, _, lifeKnown, lerr := corrosion.HostFenceLife(ctx, c.db, h.Name)
@@ -213,7 +217,7 @@ func (c *Coordinator) fenceRetryDue(ctx context.Context, h *corrosion.HostRecord
 		Due:      !c.now().Before(next),
 		Next:     next,
 		FailedAt: newestFailed,
-		Strategy: retryStrategy(h.FenceStrategy, newestFailedMethod),
+		Strategy: strategy,
 		Failures: n,
 	}
 }
@@ -258,6 +262,27 @@ func (c *Coordinator) noteFencedOn(host, fenceID string) {
 	c.fencedOn[host] = fenceID
 }
 
+// logRetryRefused logs that a due retry of host was refused because it
+// answered since the attempt that failed at failedAt: at Warn on the
+// transition — the first refusal for this failed attempt, or a new reason —
+// and at Debug while it stays refused for the same one. A one-way partition
+// can keep a host a fence candidate with one observer answering for as long
+// as it lasts, and the retry is refused on every 5 s poll.
+func (c *Coordinator) logRetryRefused(host string, failedAt time.Time, why string) {
+	key := failedAt.UTC().Format(time.RFC3339) + "|" + why
+	level := slog.LevelWarn
+	if c.retryRefusedLogged[host] == key {
+		level = slog.LevelDebug
+	} else {
+		if c.retryRefusedLogged == nil {
+			c.retryRefusedLogged = map[string]string{}
+		}
+		c.retryRefusedLogged[host] = key
+	}
+	slog.Log(context.Background(), level, "failover: not retrying the fence of a host that answered after the attempt that failed",
+		"host", host, "failed_at", failedAt.UTC().Format(time.RFC3339), "reason", why)
+}
+
 // noteHold records why the recovery of host is not proceeding, for the stall
 // alert. The newest reason wins.
 func (c *Coordinator) noteHold(host, reason string) {
@@ -273,6 +298,7 @@ func (c *Coordinator) forgetHost(host string) {
 	delete(c.fencedOn, host)
 	delete(c.lastFenceAt, host)
 	delete(c.retryNotified, host)
+	delete(c.retryRefusedLogged, host)
 	delete(c.holdReason, host)
 	delete(c.stallSince, host)
 	delete(c.stallAlerted, host)

@@ -474,6 +474,7 @@ func (c *Coordinator) noteClaimRefused(ctx context.Context, action, kind, name, 
 	}
 	slog.Warn("failover: recovery claim formed no certificate; minting nothing, retrying next tick",
 		"kind", kind, "name", name, "from", host, "reason", reason, "detail", detail)
+	c.noteHold(host, kind+" "+name+": its recovery claim formed no certificate ("+reason+": "+detail+"); retried next tick")
 	c.retryClaimsFor(host)
 }
 
@@ -490,6 +491,8 @@ func (c *Coordinator) noteClaimLost(action, kind, name, host string, decided cor
 	slog.Warn("failover: another coordinator's recovery was decided for this workload; deferring to it",
 		"kind", kind, "name", name, "from", host, "decided_action", decided.Action,
 		"decided_dest", decided.DestHost, "decided_by", decided.Coordinator, "proof", decided.ID)
+	c.noteHold(host, kind+" "+name+": another coordinator's recovery was decided for it ("+decided.Action+" to "+
+		decided.DestHost+" by "+decided.Coordinator+"); deferring to it")
 	c.retryClaimsFor(host)
 }
 

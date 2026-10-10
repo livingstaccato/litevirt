@@ -185,6 +185,9 @@ type Coordinator struct {
 	retrying *fenceRetry
 	// retryNotified is, per host, when a failed retry last notified.
 	retryNotified map[string]time.Time
+	// retryRefusedLogged is, per host, the failed attempt and reason of the
+	// last refused retry logged at Warn (logRetryRefused).
+	retryRefusedLogged map[string]string
 	// cycleCandidates is the set of fence candidates of the current cycle,
 	// for the stall alert's default reason.
 	cycleCandidates map[string]bool
@@ -965,8 +968,7 @@ func (c *Coordinator) run(ctx context.Context) {
 			// loop re-validated: a host anyone has seen answer since the
 			// attempt that failed is never fenced again (retryStillDown).
 			if why, down := c.retryStillDown(ctx, target, retryPlan.FailedAt); !down {
-				slog.Warn("failover: not retrying the fence of a host that answered after the attempt that failed",
-					"host", target, "failed_at", retryPlan.FailedAt.UTC().Format(time.RFC3339), "reason", why)
+				c.logRetryRefused(target, retryPlan.FailedAt, why)
 				c.mAttempt(PhaseSkip, ResultSkipped, ErrRetryHostAnswered)
 				c.noteHold(target, "fence failed, and the host has answered since; not retried: "+why)
 				continue
@@ -1767,6 +1769,13 @@ func (c *Coordinator) fenceStillStands(ctx context.Context, host string, at time
 // answeredSince is fenceStillStands' second half: it reports false, and why,
 // when some observer's latest verdict about host — healthy or unready — is
 // newer than `at` (less fenceSkewMargin). It fails closed on a read error.
+//
+// Any observer counts, a non-voter included, and a verdict dated in the
+// future is not discarded the way the fence-candidate count discards one.
+// Both are deliberate and safe, because this check only ever REFUSES: a
+// non-voter that saw the host answer is evidence it is up, and an observer
+// whose clock runs ahead can delay a resume or a retry by at most its skew,
+// never cause one.
 func (c *Coordinator) answeredSince(ctx context.Context, host string, at time.Time) (string, bool) {
 	rows, err := c.db.Query(ctx,
 		`SELECT observer, status, consecutive_failures, updated_at FROM host_health WHERE target = ?`, host)
@@ -3246,6 +3255,7 @@ func (c *Coordinator) relocateContainers(ctx context.Context, h *corrosion.HostR
 				"container", ct.Name, "condition", code)
 			c.noteGateRefused(corrosion.ActionRelocate, health.ReasonOwnershipDispute)
 			c.mCt(ActionRelocate, ResultRefused, ErrOwnershipDispute)
+			c.noteHold(h.Name, "ct "+ct.Name+": active ownership condition "+code+"; resolve the dispute")
 			continue
 		}
 		// Crash recovery: a prior tick already began a restore-relocation (marker on

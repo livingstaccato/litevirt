@@ -818,13 +818,18 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	// and a cold migrate (a peer-verified migrate-from) RE-HOME the existing
 	// container instead: refusing would leave it down without removing the
 	// attachment, so they warn and audit, as a takeover promote does.
+	//
+	// The archive's names are judged here, ahead of any I/O; the NICs the
+	// restore actually keeps are admitted again once classified
+	// (authorizeRestoredNICs), and a re-home's foreign networks are taken
+	// from those.
 	ctNets := containerSpecNetworkNames(corrosion.DecodeCreateSpec(spec.CreateSpec))
 	var foreignNets []string // recorded only once the restored row has landed
-	if peerRelocation || migrateSource != "" {
-		foreignNets = s.foreignNetworks(ctx, "ct.restore", req.Name, project, ctNets)
-	} else if err := s.admitCopiedNetworks(ctx, "restore", project, project, ctNets); err != nil {
-		s.audit(ctx, "ct.restore", req.Name, "project="+project, "denied")
-		return err
+	if !peerRelocation && migrateSource == "" {
+		if err := s.admitCopiedNetworks(ctx, "restore", project, project, ctNets); err != nil {
+			s.audit(ctx, "ct.restore", req.Name, "project="+project, "denied")
+			return err
+		}
 	}
 
 	// Capacity + quota admission, the SAME two-scope split as CreateContainer.
@@ -1127,7 +1132,18 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 			stripped = strings.TrimSpace(stripped + " " + strippedSec)
 		}
 		// Where its NICs attach: never a bridge the archive names.
-		authorized, droppedNICs := s.authorizeRestoredNICs(ctx, authorized, source, !operatorRestore)
+		authorized, droppedNICs, nerr := s.authorizeRestoredNICs(ctx, project, authorized, source, !operatorRestore)
+		if nerr != nil {
+			if delErr := s.containerRuntime.DeleteContainer(ctx, req.Name); delErr != nil {
+				slog.Warn("container restore: cleanup after the NIC admission failed also failed", "name", req.Name, "error", delErr)
+			}
+			s.removeRestoreMarker(req.Name)
+			s.audit(ctx, "ct.restore", req.Name, "project="+project+" (network records unreadable)", "error")
+			return nerr
+		}
+		if !operatorRestore {
+			foreignNets = s.foreignNetworks(ctx, "ct.restore", req.Name, project, containerSpecNetworkNames(authorized))
+		}
 		if stripped != "" || !reflect.DeepEqual(authorized.Networks, corrosion.DecodeCreateSpec(spec.CreateSpec).Networks) {
 			spec.CreateSpec = corrosion.EncodeCreateSpec(authorized)
 		}

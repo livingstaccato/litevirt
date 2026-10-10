@@ -141,8 +141,12 @@ func (a *LXCRuntimeAdapter) ContainerSecurity(name string) (lxc.Security, error)
 	if sc, ok := a.Inner.(lxc.Securer); ok {
 		return sc.Security(name)
 	}
-	return lxc.Security{}, errors.New("this container runtime keeps no security settings")
+	return lxc.Security{}, errRuntimeKeepsNoSecurity
 }
+
+// errRuntimeKeepsNoSecurity is ContainerSecurity's answer from a runtime that
+// keeps no security settings: no conversion can be pending there.
+var errRuntimeKeepsNoSecurity = errors.New("this container runtime keeps no security settings")
 
 func (a *LXCRuntimeAdapter) ConvertContainerSecurity(ctx context.Context, name string, to lxc.ConvertOpts) error {
 	if sc, ok := a.Inner.(lxc.Securer); ok {

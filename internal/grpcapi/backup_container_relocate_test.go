@@ -402,6 +402,12 @@ func TestRestoreContainer_IPUnavailable_StampsNoRestart(t *testing.T) {
 		ip  = "10.9.0.5"
 		mac = "52:11:22:33:44:55"
 	)
+	// The managed network exists: a restored NIC on a network with no record
+	// is dropped, never attached.
+	if err := corrosion.UpsertNetwork(ctx, s.db, corrosion.NetworkRecord{Name: net, Type: "bridge",
+		Config: `{"type":"bridge","interface":"br-acme"}`}); err != nil {
+		t.Fatal(err)
+	}
 	// Source with a managed static-IP NIC (in create_spec) and a restart policy.
 	if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{
 		HostName: s.hostName, Name: "ct1", State: "running", Image: "alpine:3.19", Project: "acme",

@@ -376,36 +376,79 @@ func (s *Server) noteStrippedHostAccess(ctx context.Context, action, name, strip
 }
 
 // authorizeRestoredNICs decides where a restored container's NICs attach.
-// The archive's spec names bridges, and a bridge is host access too, so none
-// is taken from it:
-//   - a managed NIC is rendered on its network's own bridge (resolveBridge,
-//     as create names it), whatever bridge the spec names;
+// The archive's spec names bridges and networks, and a bridge is host access
+// too, so nothing is taken from it on its word. Each NIC is first classified
+// — a raw bridge that renders a managed network IS that network's NIC — and
+// then admitted as create admits it, on what it now is:
+//   - a managed NIC is kept only if its network record exists (a name with no
+//     record is dropped: never the flat-bridge fallback, which would land it
+//     on whatever host bridge carries that name), its type is one a container
+//     can use (not direct or sriov), and — for an operator restore — the
+//     project may attach to it (admitManagedNetwork, or admitNetworkAttach for
+//     a reclassified raw bridge). It is rendered on its network's own bridge,
+//     whatever bridge the spec names. A peer move re-homes an existing
+//     container, so a foreign network is recorded (foreignNetworks) rather
+//     than dropped, but a raw bridge reclassified as a network is kept there
+//     only when the SOURCE ROW records that NIC;
 //   - a raw NIC (no managed network) is kept only for a caller with raw-bridge
 //     authority (admitRawBridge, as create requires), or — on a peer move,
-//     where the caller is the peer — when the SOURCE ROW records that raw NIC;
-//     otherwise it is dropped and reported, and the restore proceeds.
+//     where the caller is the peer — when the SOURCE ROW records that raw NIC.
 //
-// A raw bridge that resolves to a managed network is that network's NIC.
-func (s *Server) authorizeRestoredNICs(ctx context.Context, cs corrosion.ContainerCreateSpec, source *corrosion.ContainerRecord, peer bool) (corrosion.ContainerCreateSpec, []string) {
-	var sourceRaw map[string]bool
+// Everything else is dropped and reported, and the restore proceeds. A
+// network record that cannot be read fails the restore (Unavailable): "not
+// found" is an answer that read did not give.
+func (s *Server) authorizeRestoredNICs(ctx context.Context, project string, cs corrosion.ContainerCreateSpec, source *corrosion.ContainerRecord, peer bool) (corrosion.ContainerCreateSpec, []string, error) {
+	var sourceRaw, sourceManaged map[string]bool
 	if peer && source != nil {
-		sourceRaw = map[string]bool{}
+		sourceRaw, sourceManaged = map[string]bool{}, map[string]bool{}
 		for _, n := range corrosion.DecodeCreateSpec(source.CreateSpec).Networks {
 			if n.NetworkName == "" {
 				sourceRaw[n.Name+"\x00"+n.Bridge] = true
+			} else {
+				sourceManaged[n.Name+"\x00"+n.NetworkName] = true
 			}
 		}
 	}
 	var out []corrosion.ContainerNetwork
 	var dropped []string
 	for _, n := range cs.Networks {
+		reclassified := false
 		if n.NetworkName == "" {
 			if name, ok := s.resolveBridgeToNetwork(ctx, n.Bridge); ok {
-				n.NetworkName = name
+				if peer && !sourceRaw[n.Name+"\x00"+n.Bridge] && !sourceManaged[n.Name+"\x00"+name] {
+					dropped = append(dropped, "NIC "+n.Name+" on bridge "+n.Bridge+" (network "+name+"): the source container's row does not record it")
+					continue
+				}
+				n.NetworkName, reclassified = name, true
 			}
 		}
 		if n.NetworkName != "" {
-			n.Bridge = resolveBridge(ctx, s.db, n.NetworkName)
+			def, err := lookupNetworkDef(ctx, s.db, n.NetworkName)
+			if err != nil {
+				return cs, nil, status.Errorf(codes.Unavailable, "restore: read network %q (what decides where NIC %s attaches): %v", n.NetworkName, n.Name, err)
+			}
+			if def == nil {
+				dropped = append(dropped, "NIC "+n.Name+" on network "+n.NetworkName+", which does not exist")
+				continue
+			}
+			if def.Type == "direct" || def.Type == "sriov" {
+				dropped = append(dropped, "NIC "+n.Name+" on network "+n.NetworkName+" of type "+def.Type+", which containers cannot use")
+				continue
+			}
+			if !peer {
+				admit := s.admitManagedNetwork
+				if reclassified {
+					admit = s.admitNetworkAttach
+				}
+				if aerr := admit(ctx, project, n.NetworkName); aerr != nil {
+					if status.Code(aerr) != codes.PermissionDenied {
+						return cs, nil, status.Errorf(codes.Unavailable, "restore: %s", status.Convert(aerr).Message())
+					}
+					dropped = append(dropped, "NIC "+n.Name+" on network "+n.NetworkName+": "+status.Convert(aerr).Message())
+					continue
+				}
+			}
+			n.Bridge = network.BridgeName(n.NetworkName, *def)
 			out = append(out, n)
 			continue
 		}
@@ -422,7 +465,7 @@ func (s *Server) authorizeRestoredNICs(ctx context.Context, cs corrosion.Contain
 		dropped = append(dropped, "raw NIC "+n.Name+" on bridge "+n.Bridge)
 	}
 	cs.Networks = out
-	return cs, dropped
+	return cs, dropped, nil
 }
 
 // noteDroppedArchiveConfig says what of an archived config the rebuild

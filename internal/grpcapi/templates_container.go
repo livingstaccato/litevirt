@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -153,11 +154,22 @@ func (s *Server) CloneContainer(ctx context.Context, req *pb.CloneContainerReque
 			"source %q must be a template or stopped to clone (current: %s)", req.Source, src.State)
 	}
 	// A source with an unfinished conversion is not cloned: the copy would
-	// carry its marker, which names the SOURCE's target range, so the clone
-	// would be finished into (and share) that range and never start. Finishing
-	// the conversion first loses nothing; the clone could not run before.
+	// carry its marker, which names the SOURCE's target range, so finishing
+	// the clone's conversion would move it into that range too — a range two
+	// containers then share. (On main such a clone could start once its own
+	// conversion finished, sharing the range; a confinement-only conversion
+	// shares none.) Finishing the source's conversion first, then cloning,
+	// loses nothing. Security that cannot be read is refused rather than read
+	// as "not converting".
 	if sc, ok := s.containerRuntime.(containerSecurer); ok {
-		if sec, serr := sc.ContainerSecurity(req.Source); serr == nil && sec.Converting {
+		sec, serr := sc.ContainerSecurity(req.Source)
+		switch {
+		case errors.Is(serr, errRuntimeKeepsNoSecurity):
+			// Nothing to convert on such a runtime.
+		case serr != nil:
+			return nil, status.Errorf(codes.Unavailable,
+				"read source %q's security settings (a source mid-conversion is not cloned): %v", req.Source, serr)
+		case sec.Converting:
 			return nil, status.Errorf(codes.FailedPrecondition,
 				"source %q has an unfinished conversion; finish it with lv ct convert %s, then clone it", req.Source, req.Source)
 		}

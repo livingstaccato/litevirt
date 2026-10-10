@@ -186,7 +186,7 @@ func TestAuthorizeRestoredNICs(t *testing.T) {
 		{Name: "eth1", Bridge: "br-mgmt"},
 	}}
 	scoped := projectBoundCtx(t, s, "carol", "acme")
-	out, dropped := s.authorizeRestoredNICs(scoped, forged, nil, false)
+	out, dropped, _ := s.authorizeRestoredNICs(scoped, "acme", forged, nil, false)
 	if len(out.Networks) != 1 || out.Networks[0].Bridge != "br-ctnet" || out.Networks[0].NetworkName != "ctnet" || out.Networks[0].MAC != "02:00:00:00:00:01" {
 		t.Fatalf("a scoped operator's restore NICs = %+v; want only eth0 on br-ctnet", out.Networks)
 	}
@@ -195,17 +195,17 @@ func TestAuthorizeRestoredNICs(t *testing.T) {
 	}
 	// Raw-bridge authority (an admin) keeps the raw NIC; the managed bridge
 	// is still the network's.
-	out, _ = s.authorizeRestoredNICs(adminCtx(), forged, nil, false)
+	out, _, _ = s.authorizeRestoredNICs(adminCtx(), "acme", forged, nil, false)
 	if len(out.Networks) != 2 || out.Networks[0].Bridge != "br-ctnet" || out.Networks[1].Bridge != "br-mgmt" {
 		t.Fatalf("an admin's restore NICs = %+v", out.Networks)
 	}
 	// A peer move keeps a raw NIC only when the source row records it.
 	src := &corrosion.ContainerRecord{CreateSpec: corrosion.EncodeCreateSpec(corrosion.ContainerCreateSpec{Template: "download",
 		Networks: []corrosion.ContainerNetwork{{Name: "eth1", Bridge: "br-mgmt"}}})}
-	if out, _ = s.authorizeRestoredNICs(adminCtx(), forged, src, true); len(out.Networks) != 2 {
+	if out, _, _ = s.authorizeRestoredNICs(adminCtx(), "acme", forged, src, true); len(out.Networks) != 2 {
 		t.Errorf("a peer move dropped the raw NIC its source row records: %+v", out.Networks)
 	}
-	if out, _ = s.authorizeRestoredNICs(adminCtx(), forged, nil, true); len(out.Networks) != 1 {
+	if out, _, _ = s.authorizeRestoredNICs(adminCtx(), "acme", forged, nil, true); len(out.Networks) != 1 {
 		t.Errorf("a peer move with no source row kept a raw NIC: %+v", out.Networks)
 	}
 }

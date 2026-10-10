@@ -715,6 +715,12 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 					"vm", vm.Name)
 				break
 			}
+			// A restart-same VM failover held for this host is owed a start,
+			// not a stop sync: a power-off fence leaves its domain defined
+			// and shut off here (stranded_disk.go, startHeldVM).
+			if r.startHeldVM(ctx, vm, st) {
+				break
+			}
 			newState, detail, sync := classifyStop(st.State, st.Reason)
 			if !sync {
 				break // paused / migrated / not genuinely down — leave alone

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
@@ -362,3 +363,45 @@ func TestStrandedRecord_LeavesTheVMRowAsItWas(t *testing.T) {
 		t.Fatalf("the VM row changed from %q to %q", before, after)
 	}
 }
+
+// startHeldVM starts only a held VM whose domain a power loss or a kill left
+// down; a guest shutdown or a saved domain is synced as before, and without
+// a hold nothing changes.
+//
+// Mutations: drop the reason filter — the saved and guest-shutdown domains
+// are started and the test is red; drop the hold check — the VM with no hold
+// is started and the test is red.
+func TestStartHeldVM_OnlyAHeldVMDownForNoReasonOfItsOwn(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name, reason string
+		hold, want   bool
+	}{
+		{"unknown-held", "unknown", true, true},
+		{"destroyed-held", "destroyed", true, true},
+		{"guest-shutdown-held", "guest-shutdown", true, false},
+		{"saved-held", "saved", true, false},
+		{"unknown-not-held", "unknown", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := testReconcilerDB(t)
+			disks := []corrosion.DiskRecord{{VMName: "vm1", DiskName: "root", HostName: "node-a", Path: "/x/vm1.qcow2", StorageType: "local"}}
+			if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{Name: "vm1", HostName: "node-a", State: "running", Spec: "{}"}, nil, disks); err != nil {
+				t.Fatal(err)
+			}
+			if tc.hold {
+				if _, err := RecordHeldForHost(ctx, db, "coord", "vm1", "node-a", disks, time.Now()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			r := NewReconciler("node-a", t.TempDir(), db, libvirtfake.New())
+			vm, _ := corrosion.GetVM(ctx, db, "vm1")
+			got := r.startHeldVM(ctx, *vm, lvDomainStatus("stopped", tc.reason))
+			if got != tc.want {
+				t.Fatalf("startHeldVM(%s) handled = %v, want %v", tc.reason, got, tc.want)
+			}
+		})
+	}
+}
+
+func lvDomainStatus(state, reason string) lv.DomainStatus { return lv.DomainStatus{State: state, Reason: reason} }

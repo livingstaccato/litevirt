@@ -25,7 +25,9 @@ import (
 // Mutations: drop the hold in recoverWorkloads — rs-local is rescheduled to
 // another host and the test is red; hold every restart-same VM — rs-shared
 // is left on the failed host and the test is red; never resolve the hold —
-// the record stays open after home starts rs-local again and the test is red.
+// the record stays open after home starts rs-local again and the test is red;
+// drop the owed start in the reconciler — the shut-off domain a power fence
+// leaves is synced to stopped, never started, and the test is red.
 func TestFleet_RestartSameWaitsForItsHostOnlyWithALocalDisk(t *testing.T) {
 	c := New(t, Options{Nodes: 3, SharedCRDT: true})
 	defer c.Stop()
@@ -92,9 +94,24 @@ func TestFleet_RestartSameWaitsForItsHostOnlyWithALocalDisk(t *testing.T) {
 	if err := coord.DB.Execute(ctx, `UPDATE hosts SET state = 'active', updated_at = ? WHERE name = ?`, coord.DB.NowTS(), home.Name); err != nil {
 		t.Fatal(err)
 	}
+	// As on a real host after a power-off fence: the persistent domain is
+	// still defined, shut off, with no reason libvirt kept across the
+	// power loss.
+	if err := home.Virt.DefineDomain(`<domain type='kvm'><name>rs-local</name></domain>`); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := home.Virt.DomainStateReason("rs-local"); st.State != "stopped" || st.Reason != "unknown" {
+		t.Fatalf("setup: rs-local on %s is %+v, want shut off with reason unknown", home.Name, st)
+	}
 	rec := health.NewReconciler(home.Name, homeData, home.DB, home.Virt)
 	rec.ReconcileOnce(ctx)
 	rec.ReconcileOnce(ctx)
+	if vm, _ := corrosion.GetVM(ctx, coord.DB, "rs-local"); vm == nil || vm.State != "running" {
+		t.Fatalf("rs-local = %+v after %s came back, want it started there (not synced to stopped)", vm, home.Name)
+	}
+	if st, _ := home.Virt.DomainStateReason("rs-local"); st.State != "running" {
+		t.Fatalf("rs-local's domain on %s is %+v, want running", home.Name, st)
+	}
 	if !strings.Contains(home.Virt.DefinedXML("rs-local"), path) {
 		t.Fatalf("rs-local was not started on %s on its disk at %s", home.Name, path)
 	}

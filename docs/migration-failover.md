@@ -881,10 +881,19 @@ because that would start it on a disk rebuilt blank from its image. It stays
 on its host, and failover records why: the condition `vm_failover_held`
 (subject `vm/<name>@<host>`, a warning), a `vm.failover.held` event, a
 `failover.skip` audit entry and a `vm.disk.stranded` notification, each naming
-the host and what you can do. The host starts the VM on its real disk when it
-is back, and the record clears. If the host is gone for good, its data is
-gone with it: promote a replica if there is one (`lv replication promote
-<vm>`), or remove the VM (`lv rm <vm>`) and create it again. There is no
+the host and what you can do. When the host is back and active, it starts the
+VM on its real disk (the domain a power-off fence leaves shut off there is
+started, not recorded stopped), and the record clears. A host comes back
+`fenced` when failover moved any other workload off it: run
+`lv host undrain <host>`. A removed host does not block this: adding the
+machine back under its name (`lv host add`) brings the held VM back with it.
+If the host is gone for good, its data is gone with it: promote a replica if
+there is one (`lv replication promote <vm>`), or remove the host first
+(`lv host rm --dead <host>`, try `--dry-run`) and then the VM (`lv rm <vm>`),
+and create it again; `lv rm` cannot reach a VM on a host that is fenced but
+not removed. The coordinator decides the hold once per fence, so changing the
+policy afterwards takes effect only at the next failover decision for that
+host. There is no
 command that moves it elsewhere onto a blank disk. It counts in the failover metrics with error class `held_for_host`. Before this
 release a `restart-same` VM was restarted on any healthy host whatever its
 disks, because the original host is never available while it is fenced.
@@ -945,6 +954,7 @@ To run a VM on the real disk a failover left on a host, once that host is
 back:
 
 ```bash
+lv host undrain <host>               # it comes back fenced; a migration onto it needs it active
 lv stop <vm>
 lv migrate <vm> <host> --cold        # the stopped VM moves there with its current disk
 lv host superseded-disks <host>      # find the copy

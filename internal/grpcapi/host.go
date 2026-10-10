@@ -1207,9 +1207,10 @@ func (s *Server) AdmitHost(ctx context.Context, req *pb.AdmitHostRequest) (*pb.A
 	// A name whose removed machine still has workloads recorded on it is not
 	// given to a new machine: those rows are the old machine's, recovered by
 	// the claim path only while the name stays removed, and the new machine
-	// would take them over (corrosion.WorkloadsOnRemovedHost). Stopped ones do
-	// not block: failover leaves them on their machine, and they come back
-	// with it (corrosion.WorkloadsBlockingReadmission).
+	// would take them over (corrosion.WorkloadsOnRemovedHost). Stopped ones,
+	// and restart-same VMs failover holds for their host, do not block:
+	// failover leaves them on their machine, and they come back with it
+	// (corrosion.WorkloadsBlockingReadmission).
 	left, err := corrosion.WorkloadsBlockingReadmission(ctx, s.db, req.Name)
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable, "read the workloads recorded on %s: %v", req.Name, err)

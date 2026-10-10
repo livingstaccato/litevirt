@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/randid"
 )
 
@@ -86,7 +87,8 @@ func strandedSubject(vm, host string) string { return vm + "@" + host }
 // strandedFix is what an operator can do about the disks of vm left on host.
 func strandedFix(vm, host string) string {
 	return fmt.Sprintf("%[2]s keeps them as <path>.superseded-<time> while %[1]s exists; `lv host superseded-disks %[2]s` lists them. "+
-		"To run %[1]s on its real disk again once %[2]s is back: `lv stop %[1]s`, `lv migrate %[1]s %[2]s --cold`, "+
+		"To run %[1]s on its real disk again once %[2]s is back: `lv host undrain %[2]s` (it comes back fenced), "+
+		"`lv stop %[1]s`, `lv migrate %[1]s %[2]s --cold`, "+
 		"`lv host superseded-disks %[2]s --restore <copy>` (the disk it replaces is kept the same way), then `lv start %[1]s`. "+
 		"To give the data up: `lv host superseded-disks %[2]s --remove <copy>`", vm, host)
 }
@@ -595,9 +597,13 @@ type HeldForHost struct {
 
 // heldFix is what an operator can do about a restart-same VM held on host.
 func heldFix(vm, host string) string {
-	return fmt.Sprintf("bring %[2]s back: it starts %[1]s there on its real disk. If %[2]s is gone for good, its data is gone "+
-		"with it: promote a replica if there is one (`lv replication promote %[1]s`), or remove the VM (`lv rm %[1]s`) and "+
-		"create it again. Disk copies a failover set aside are listed by `lv host superseded-disks <host>`", vm, host)
+	return fmt.Sprintf("bring %[2]s back: once it is active it starts %[1]s there on its real disk (if it stays fenced, "+
+		"because failover moved other workloads off it, run `lv host undrain %[2]s`). If %[2]s was removed "+
+		"(`lv host rm --dead`), adding the machine back under that name (`lv host add`) brings %[1]s back with it. "+
+		"If %[2]s is gone for good, its data is gone with it: promote a replica if there is one "+
+		"(`lv replication promote %[1]s`), or remove the host first (`lv host rm --dead %[2]s`, try `--dry-run`) and then "+
+		"the VM (`lv rm %[1]s`), and create it again. Disk copies a failover set aside are listed by "+
+		"`lv host superseded-disks <host>`", vm, host)
 }
 
 // RecordHeldForHost records that vmName is held on host to wait for it, and
@@ -672,7 +678,9 @@ func (r *Reconciler) resolveHeldForHost(ctx context.Context, row corrosion.Healt
 	}
 	held := vm != nil && vm.HostName == ev.Host
 	if ev.Host == r.hostName {
-		if held && vm.State != "running" {
+		// A held VM's row says running all along: only its domain running
+		// here says this host has started it.
+		if held && (vm.State != "running" || !r.domainRunningHere(vm.Name)) {
 			return // still waiting for this host to start it
 		}
 	} else {
@@ -689,4 +697,61 @@ func (r *Reconciler) resolveHeldForHost(ctx context.Context, row corrosion.Healt
 	if err := corrosion.UpsertHealthCondition(ctx, r.db, row); err != nil {
 		slog.Warn("reconciler: could not resolve vm_failover_held", "vm", ev.VM, "error", err)
 	}
+}
+
+// startHeldVM starts a restart-same VM that failover held for this host, now
+// that the host is back, instead of letting the out-of-band stop sync record
+// it stopped (which the restart engine never restarts, and which left the
+// hold open for good). It reports whether it handled the VM: true means do
+// not sync.
+//
+// It acts only on positive proof, and every gate of a local start still
+// applies:
+//   - an open vm_failover_held record names this host — failover decided the
+//     VM stays here, and no copy of it was started anywhere (the hold mints
+//     no claim and moves no row);
+//   - the row names this host and says running (the caller's walk), and the
+//     domain here is genuinely down with nothing to resume: shut off for a
+//     reason a power loss or a kill leaves (unknown, destroyed, crashed,
+//     failed). A guest shutdown, a saved or suspended domain, or anything
+//     still live is left to the usual sync;
+//   - the replica is trusted, the owner epoch (when enforced) does not say
+//     this runtime is superseded, and startPendingVM's own gates hold:
+//     self-fence, the ExecutionGate (quorum, and this host ACTIVE — a fenced
+//     host starts it once undrained), the ownership-dispute refusal and the
+//     VM lock.
+func (r *Reconciler) startHeldVM(ctx context.Context, vm corrosion.VMRecord, st lv.DomainStatus) bool {
+	held, err := HeldForHostOf(ctx, r.db, vm.Name)
+	if err != nil || held == nil || held.Host != r.hostName {
+		return false
+	}
+	switch st.Reason {
+	case "unknown", "destroyed", "crashed", "failed":
+	default:
+		return false
+	}
+	if st.State != "stopped" {
+		return false
+	}
+	if ok, why := r.replicaTrusted(ctx); !ok {
+		slog.Info("reconciler: a held VM's start waits for the replica to catch up", "vm", vm.Name, "why", why)
+		return true
+	}
+	if r.ownerEpochEnforced(ctx) && r.runtimeSuperseded(ctx, vm.Name) {
+		slog.Warn("reconciler: not starting a held VM — this host's runtime belongs to a superseded ownership generation", "vm", vm.Name)
+		r.noteGateRefused(corrosion.ActionReschedule, ReasonStaleEpoch)
+		return true
+	}
+	slog.Warn("reconciler: starting a restart-same VM failover held for this host, on its real disk", "vm", vm.Name)
+	r.startPendingVM(ctx, vm)
+	return true
+}
+
+// domainRunningHere reports whether name's domain runs on this host.
+func (r *Reconciler) domainRunningHere(name string) bool {
+	if r.virt == nil || !r.virt.DomainExists(name) {
+		return false
+	}
+	st, err := r.virt.DomainStateReason(name)
+	return err == nil && st.State == "running"
 }

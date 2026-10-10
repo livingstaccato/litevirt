@@ -16,9 +16,9 @@ import (
 //     safe_if_unused`, and `lv cluster upgrade-status` agrees with the used
 //     records in state.db about whether the token blocks a rollback;
 //  2. a node holding a marker for a LATER release token (one this build does
-//     not know) that carries the rule starts unquarantined while none of that
-//     token's features is recorded used — the case one token per feature used
-//     to quarantine;
+//     not know) that carries the rule, with none of that token's features
+//     recorded used, starts in release probation, asks a voter majority, and
+//     leaves probation — never quarantined, which one token per feature was;
 //  3. the same node, once that marker carries no rule, starts WAL-quarantined
 //     and says so in upgrade-status — today's behaviour for every token.
 //
@@ -48,13 +48,15 @@ func TestLab_ReleaseTokenRollbackRule(t *testing.T) {
 		"/' AND key < 'release_feature/"+tok+"0' AND deleted_at IS NULL")
 	status := l.mustLV(q, "cluster", "upgrade-status")
 	l.saveEvidence("upgrade-status-before.txt", status)
-	wantBlocks := "no"
+	// Every build below the first release token predates rules: it always
+	// blocks. A rule-aware build would be blocked only once a feature is used.
+	wantRuleAware := "no"
 	if len(used) == 1 && used[0][0] != "0" {
-		wantBlocks = "yes"
+		wantRuleAware = "yes"
 	}
-	if !upgradeStatusRow(status, tok, "safe_if_unused", wantBlocks) {
-		t.Errorf("upgrade-status on %s has no %s row with rule safe_if_unused and BLOCKS ROLLBACK %s "+
-			"(%v used records):\n%s", q, tok, wantBlocks, used, status)
+	if !upgradeStatusRow(status, tok, "safe_if_unused", "yes", wantRuleAware) {
+		t.Errorf("upgrade-status on %s has no %s row with rule safe_if_unused, BLOCKS ROLLBACK yes and "+
+			"IF RULE-AWARE %s (%v used records):\n%s", q, tok, wantRuleAware, used, status)
 	}
 
 	victim := l.hosts[len(l.hosts)-1]
@@ -66,16 +68,30 @@ func TestLab_ReleaseTokenRollbackRule(t *testing.T) {
 	}
 	t.Cleanup(cleanup)
 
-	// 2. A later release's marker, rule on, nothing used: not quarantined.
+	// 2. A later release's marker, rule on, nothing used: it starts in release
+	// probation (its own replica's "nothing used" is not proof), asks a voter
+	// majority, finds nothing, and leaves probation — never quarantined.
 	l.mustSSH(victim, time.Minute, "systemctl stop litevirt && printf '1\\nrollback: safe_if_unused\\n' > "+
 		shellQuote(futureMarker)+" && chmod 600 "+shellQuote(futureMarker)+" && systemctl start litevirt")
 	if err := l.waitDaemon(victim, 3*time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	st := l.mustLV(victim, "cluster", "upgrade-status")
+	var st string
+	deadline := time.Now().Add(2 * time.Minute)
+	for {
+		st = l.mustLV(victim, "cluster", "upgrade-status")
+		if !strings.Contains(st, "WAL quarantine: yes") {
+			break
+		}
+		if !strings.Contains(st, "release probation") || time.Now().After(deadline) {
+			l.saveEvidence("upgrade-status-unused.txt", st)
+			t.Fatalf("%s did not leave release probation for an unused release token's marker:\n%s", victim, st)
+		}
+		time.Sleep(5 * time.Second)
+	}
 	l.saveEvidence("upgrade-status-unused.txt", st)
-	if strings.Contains(st, "WAL quarantine: yes") {
-		t.Fatalf("%s quarantined for an unused release token's marker:\n%s", victim, st)
+	if out := l.mustSSH(victim, time.Minute, "journalctl -u litevirt --since '-5 min' --no-pager | grep -c 'release probation lifted' || true"); strings.TrimSpace(out) == "0" {
+		t.Errorf("%s logged no probation lift", victim)
 	}
 
 	// 3. The same marker with no rule: quarantined at startup.
@@ -95,12 +111,12 @@ func TestLab_ReleaseTokenRollbackRule(t *testing.T) {
 	}
 }
 
-// upgradeStatusRow reports whether out has a token row whose rule and
-// BLOCKS ROLLBACK columns are rule and blocks.
-func upgradeStatusRow(out, token, rule, blocks string) bool {
+// upgradeStatusRow reports whether out has a token row whose rule, BLOCKS
+// ROLLBACK and IF RULE-AWARE columns are rule, blocks and ruleAware.
+func upgradeStatusRow(out, token, rule, blocks, ruleAware string) bool {
 	for _, line := range strings.Split(out, "\n") {
 		f := strings.Fields(line)
-		if len(f) == 5 && f[0] == token && f[3] == rule && f[4] == blocks {
+		if len(f) == 6 && f[0] == token && f[3] == rule && f[4] == blocks && f[5] == ruleAware {
 			return true
 		}
 	}

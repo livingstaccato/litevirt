@@ -1,6 +1,10 @@
 package capabilities
 
-import "sort"
+import (
+	"errors"
+	"fmt"
+	"sort"
+)
 
 // Release features: the closed set of features a release token opens, and the
 // rollback rule its activation marker carries.
@@ -13,14 +17,16 @@ import "sort"
 // rolled-back node quarantines only for a feature that was actually used.
 //
 // HOW A FEATURE IS OPENED. Declare it below (a constant and a releaseFeatures
-// entry with a one-line description), then call
-// health.Checker.RequireFeature(ctx, feature) — on a gRPC handler,
-// grpcapi.Server.RequireReleaseFeature — immediately before the write the
-// feature's data needs. It refuses with FailedPrecondition until the release
-// token has durably latched; on the feature's first use it records the use,
-// replicated, BEFORE returning nil, and refuses the write if it cannot. Never
-// gate on Latched/Enforced(ReleaseToken) alone: that leaves no used bit, and a
-// rolled-back node would keep running over data it drops.
+// entry with a one-line description). Run every write of the feature's data
+// through health.Checker.WithFeature(ctx, feature, write) — on a gRPC handler,
+// grpcapi.Server.WithReleaseFeature — on the node that performs the write, and
+// have the writer take the FeatureGrant it is handed and Check it. The gate
+// refuses with FailedPrecondition until the release token has durably latched;
+// before a first use's write it records the use and waits until every
+// replication recipient holds the record; and every writing node puts its own
+// record on its own stream first. Never gate on Latched/Enforced(ReleaseToken):
+// that leaves no used bit, and a rolled-back node would keep running over data
+// it drops. release_guard_test.go fails the build on it.
 
 // Feature names one feature of a release. Its string is written into a
 // replicated cluster_policies key and so is frozen once it ships: lower-case
@@ -38,6 +44,15 @@ type FeatureInfo struct {
 // keyed by name. Empty at the release's start; each feature branch adds its
 // own entry beside its constant. A feature never moves to another token: a
 // used bit is recorded under the token its feature was declared with.
+//
+// A TOKEN'S FEATURE SET IS FROZEN WHEN ITS RELEASE SHIPS. A build that knows a
+// token but not one of its features cannot keep that feature's data, so a used
+// record for an undeclared (token, feature) pair quarantines it exactly as an
+// unknown token does (corrosion release_features.go, the rollback preflight). A
+// feature added after the release — in a patch release, say — gets the NEXT
+// release token, never this one: under this one, every build of the release
+// that lacks it would quarantine on its first use, and every build before the
+// feature landed on main would too.
 var releaseFeatures = map[Feature]FeatureInfo{}
 
 // LookupFeature returns a declared feature's token and description.
@@ -76,7 +91,7 @@ const MarkerRollbackKey = "rollback"
 
 // rollbackRules is every token whose activation marker carries a rollback rule.
 // Only release tokens belong here: the rule is sound only for a token whose
-// every effect is behind RequireFeature, so that "no feature used" means
+// every effect is behind WithFeature, so that "no feature used" means
 // "nothing written that a previous build cannot keep".
 var rollbackRules = map[string]string{
 	Release202611V1: RollbackSafeIfUnused,
@@ -95,4 +110,62 @@ func MarkerContent(token string) []byte {
 		return []byte("1\n" + MarkerRollbackKey + ": " + rule + "\n")
 	}
 	return []byte("1\n")
+}
+
+// Honoured reports whether this build keeps the data of feature under token:
+// it declares the feature, under that token.
+func Honoured(token string, feature Feature) bool {
+	info, ok := releaseFeatures[feature]
+	return ok && info.Token == token
+}
+
+// ruleAwareBelow records, per token with a rollback rule, whether the build
+// directly below it — the one a rollback below the token lands on — reads
+// marker rules at all. False for the first release token: every build before
+// it quarantines on any marker it does not know, rule or not. A later release
+// token's entry is true, because the build below it is a release-token build.
+var ruleAwareBelow = map[string]bool{
+	Release202611V1: false,
+}
+
+// RuleHonouredBelow reports whether a rollback below token lands on a build
+// that reads its marker's rollback rule. False for any token without a rule.
+func RuleHonouredBelow(token string) bool {
+	return RollbackRule(token) != "" && ruleAwareBelow[token]
+}
+
+// FeatureGrant is the proof that a release feature's gate passed on THIS node
+// in this process: the feature's release token has durably latched, and the
+// feature's use is recorded, replicated and on this node's own outgoing stream.
+// A writer of a feature's data takes one and calls Check before it writes.
+//
+// The zero value grants nothing. Only health.Checker.WithFeature mints one
+// (MintFeatureGrant), which the release-feature guard
+// (internal/capabilities/release_guard_test.go) enforces: a grant obtained any
+// other way would let a write skip the used bit a rollback relies on.
+type FeatureGrant struct {
+	feature Feature
+	minted  bool
+}
+
+// ErrNoFeatureGrant is returned by FeatureGrant.Check for a grant that does not
+// cover the feature asked about.
+var ErrNoFeatureGrant = errors.New("release feature write without a grant from its gate")
+
+// Check returns nil only for a grant minted for exactly f.
+func (g FeatureGrant) Check(f Feature) error {
+	if !g.minted || g.feature != f {
+		return fmt.Errorf("%w: %s", ErrNoFeatureGrant, f)
+	}
+	return nil
+}
+
+// Feature is the feature g was minted for ("" for the zero value).
+func (g FeatureGrant) Feature() Feature { return g.feature }
+
+// MintFeatureGrant mints a grant for f. ONLY health.Checker.WithFeature may
+// call it, after the gate has passed; the release-feature guard fails the
+// build for any other caller.
+func MintFeatureGrant(f Feature) FeatureGrant {
+	return FeatureGrant{feature: f, minted: true}
 }

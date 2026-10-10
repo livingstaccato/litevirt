@@ -265,6 +265,14 @@ func (ae *AntiEntropy) checkPeer(ctx context.Context, peerName string, localMap,
 			"fix", "reseed "+peerName+" to bring it back into the compatibility regime")
 		return false
 	}
+	// A peer that cannot keep the data of a release feature in use is not
+	// merged from either (release_features.go, SetReplicationSourceGate): its
+	// rows may be rewrites that dropped that data.
+	if err := ae.client.ReplicationSourceAllowed(ctx, peerName); err != nil {
+		slog.Warn("anti-entropy: NOT merging from a peer that cannot keep a release feature in use",
+			"peer", peerName, "error", err)
+		return false
+	}
 	client, conn, err := ae.peerClient(ctx, peerName)
 	if err != nil {
 		slog.Debug("anti-entropy: cannot reach peer", "peer", peerName, "error", err)

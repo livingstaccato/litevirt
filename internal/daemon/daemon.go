@@ -120,6 +120,9 @@ type Daemon struct {
 	// reseed it, but it emits no replicated writes.
 	rolledBackTokens []string
 
+	// releaseProbationKick wakes runReleaseProbation (kickReleaseProbation).
+	releaseProbationKick chan struct{}
+
 	// exitFunc terminates the process on a watchdog rollback. Defaults to os.Exit;
 	// overridable in tests.
 	exitFunc func(int)
@@ -318,7 +321,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// would, under the unit's OnFailure rollback, be a rollback loop; and the node
 	// has to stay up anyway so peers can see it degraded and an operator can reseed
 	// it. Fail-closed happens at the write path instead, wired below.
-	if toks := preflightCapabilityRollback(d.cfg.DataDir, releaseFeatureUseReader(ctx, d.db)); len(toks) > 0 {
+	toks, probation := preflightRollback(d.cfg.DataDir, releaseFeatureUseReader(ctx, d.db))
+	// Release probation (C1): rolled back below a safe_if_unused release token
+	// with no use in this replica. No replicated writes until a voter majority
+	// confirms (runReleaseProbation, below).
+	d.db.EnterReleaseProbation(probation)
+	if len(toks) > 0 {
 		d.rolledBackTokens = toks
 		slog.Error("preflight: this binary is a ROLLBACK below capability tokens this node "+
 			"already latched; entering WAL quarantine — no replicated writes will be emitted "+
@@ -649,6 +657,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	ae.SetRelayConfig(relayCfg)
 	ae.SetLegacyRepair(d.cfg.AntiEntropyLegacyRepair)
 	go ae.Start(ctx)
+	// Release probation is lifted only by asking a voter majority. A peer
+	// advertising a release token this build does not know starts one too:
+	// this node may have been away while it latched and hold no marker.
+	d.releaseProbationKick = make(chan struct{}, 1)
+	go d.runReleaseProbation(ctx, ae)
 
 	// Start metrics server. Create the LXC runner ONCE here and share it with the
 	// gRPC container adapter + health checker below, so the metrics collector can
@@ -847,8 +860,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// re-applies VIPs, so an isolated/latched restart can't bring up a VIP ungated.
 	svc.SetGate(d.checker)
 	// Release features (capabilities.Feature) open through the checker's
-	// RequireFeature: the release token's latch plus the replicated used bit.
+	// WithFeature: the release token's latch plus the replicated used bit.
 	svc.SetReleaseFeatureGate(d.checker)
+	d.checker.SetReleaseUseConfirmer(svc.PeerHoldsReleaseFeatureUse)
+	d.checker.SetUnknownReleaseTokenObserver(func(tok string) {
+		d.db.EnterReleaseProbation([]string{tok})
+		d.kickReleaseProbation()
+	})
+	// Take no replicated state from a peer that cannot keep a release feature
+	// in use: pushes are refused in PushMutations, pulls here.
+	d.db.SetReplicationSourceGate(svc.ReleasePeerAllowed)
 	// The server can answer the lease-mint clearance from here on: it has the
 	// gate whose quorum and healthy-peer set its high-water read uses.
 	d.mintClearance.Store(svc)
@@ -1256,7 +1277,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Quarantined below a latched token found at startup, OR since startup by
 	// a use of a newer release's feature arriving by replication.
 	svc.SetWALQuarantined(func() bool {
-		return len(d.rolledBackTokens) > 0 || len(d.db.ReleaseUseQuarantine()) > 0
+		return len(d.rolledBackTokens) > 0 || d.db.QuarantineReason() != ""
 	})
 	go vipDemoter.Start(ctx)
 	// Partition pause (docs/design/partition-pause.md): on losing the execution

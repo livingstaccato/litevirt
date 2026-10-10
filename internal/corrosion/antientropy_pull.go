@@ -3,6 +3,7 @@ package corrosion
 import (
 	"context"
 	"io"
+	"slices"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -21,6 +22,17 @@ import (
 // The stand-down (legacyRepair) goes straight to the blob dump.
 func (ae *AntiEntropy) pullAndMerge(ctx context.Context, client pb.LiteVirtClient, tables []string, scope *pullScope, sensReq *pb.SensitiveStateRequest) (kept *syncPayload, pullErr, mergeErr error) {
 	sensitive := sensReq != nil
+	// A used release-feature record must be in, and any quarantine it trips up,
+	// before a feature table is merged (I2). The paged stream merges vms and
+	// containers ahead of cluster_policies, and a stream that breaks midway
+	// keeps what it merged, so cluster_policies is pulled ALONE first, whole.
+	// Done on the receiver: reordering the sender's ranks would make every
+	// paged pull from this build fail an older receiver's page-order check.
+	if !sensitive && len(tables) > 1 && slices.Contains(tables, "cluster_policies") {
+		if _, perr, merr := ae.pullAndMerge(ctx, client, []string{"cluster_policies"}, nil, nil); perr != nil || merr != nil {
+			return nil, perr, merr
+		}
+	}
 	allowed := replicatedTableSet
 	if sensitive {
 		allowed = sensitiveTableSet

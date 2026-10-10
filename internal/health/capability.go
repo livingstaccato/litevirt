@@ -303,6 +303,7 @@ func (c *Checker) PeerSupportsFresh(ctx context.Context, peer, token string) boo
 		return false // fail-closed; don't cache a failure
 	}
 	c.checkClockSkew(ctx, peer, peerWall, reqStart, reqEnd)
+	c.noteAdvertised(caps)
 	c.mu.Lock()
 	c.peerCaps[peer] = peerCapEntry{caps: caps, fetchedAt: c.now()}
 	c.mu.Unlock()
@@ -345,6 +346,7 @@ func (c *Checker) CapabilityActive(ctx context.Context, token string) (bool, str
 		// This sweep already holds a fresh Ping from every voting member, so it
 		// is the cheapest place in the daemon to observe cluster-wide drift.
 		c.checkClockSkew(ctx, name, peerWall, reqStart, reqEnd)
+		c.noteAdvertised(caps)
 		if !capabilities.Has(caps, token) {
 			return c.cacheNeg(token, ReasonUnsupportedCapability)
 		}

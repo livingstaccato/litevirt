@@ -287,6 +287,7 @@ const (
 	LiteVirt_GetFailoverScope_FullMethodName           = "/litevirt.v1.LiteVirt/GetFailoverScope"
 	LiteVirt_SetFailoverScope_FullMethodName           = "/litevirt.v1.LiteVirt/SetFailoverScope"
 	LiteVirt_GetUpgradeStatus_FullMethodName           = "/litevirt.v1.LiteVirt/GetUpgradeStatus"
+	LiteVirt_HoldsReleaseFeatureUse_FullMethodName     = "/litevirt.v1.LiteVirt/HoldsReleaseFeatureUse"
 	LiteVirt_UpsertServiceEndpoint_FullMethodName      = "/litevirt.v1.LiteVirt/UpsertServiceEndpoint"
 	LiteVirt_ListServiceEndpoints_FullMethodName       = "/litevirt.v1.LiteVirt/ListServiceEndpoints"
 	LiteVirt_DeleteServiceEndpoint_FullMethodName      = "/litevirt.v1.LiteVirt/DeleteServiceEndpoint"
@@ -809,6 +810,11 @@ type LiteVirtClient interface {
 	// each release token which of its features have been used cluster-wide
 	// (`lv cluster upgrade-status`, docs/upgrades.md). Viewer.
 	GetUpgradeStatus(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*UpgradeStatus, error)
+	// HoldsReleaseFeatureUse answers, for a peer, whether this replica holds the
+	// used record of one release feature. A first use waits for every
+	// replication recipient to answer yes before the feature writes anything.
+	// Peer mTLS only.
+	HoldsReleaseFeatureUse(ctx context.Context, in *ReleaseFeatureUseQuery, opts ...grpc.CallOption) (*ReleaseFeatureUseHeld, error)
 	// ── anycast services ──
 	// service_endpoints map a logical name (e.g. "api.litevirt.local")
 	// to N (ip, region) pairs. The embedded DNS server round-robins
@@ -3884,6 +3890,16 @@ func (c *liteVirtClient) GetUpgradeStatus(ctx context.Context, in *emptypb.Empty
 	return out, nil
 }
 
+func (c *liteVirtClient) HoldsReleaseFeatureUse(ctx context.Context, in *ReleaseFeatureUseQuery, opts ...grpc.CallOption) (*ReleaseFeatureUseHeld, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReleaseFeatureUseHeld)
+	err := c.cc.Invoke(ctx, LiteVirt_HoldsReleaseFeatureUse_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) UpsertServiceEndpoint(ctx context.Context, in *UpsertServiceEndpointRequest, opts ...grpc.CallOption) (*ServiceEndpoint, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ServiceEndpoint)
@@ -4656,6 +4672,11 @@ type LiteVirtServer interface {
 	// each release token which of its features have been used cluster-wide
 	// (`lv cluster upgrade-status`, docs/upgrades.md). Viewer.
 	GetUpgradeStatus(context.Context, *emptypb.Empty) (*UpgradeStatus, error)
+	// HoldsReleaseFeatureUse answers, for a peer, whether this replica holds the
+	// used record of one release feature. A first use waits for every
+	// replication recipient to answer yes before the feature writes anything.
+	// Peer mTLS only.
+	HoldsReleaseFeatureUse(context.Context, *ReleaseFeatureUseQuery) (*ReleaseFeatureUseHeld, error)
 	// ── anycast services ──
 	// service_endpoints map a logical name (e.g. "api.litevirt.local")
 	// to N (ip, region) pairs. The embedded DNS server round-robins
@@ -5573,6 +5594,9 @@ func (UnimplementedLiteVirtServer) SetFailoverScope(context.Context, *SetFailove
 }
 func (UnimplementedLiteVirtServer) GetUpgradeStatus(context.Context, *emptypb.Empty) (*UpgradeStatus, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetUpgradeStatus not implemented")
+}
+func (UnimplementedLiteVirtServer) HoldsReleaseFeatureUse(context.Context, *ReleaseFeatureUseQuery) (*ReleaseFeatureUseHeld, error) {
+	return nil, status.Error(codes.Unimplemented, "method HoldsReleaseFeatureUse not implemented")
 }
 func (UnimplementedLiteVirtServer) UpsertServiceEndpoint(context.Context, *UpsertServiceEndpointRequest) (*ServiceEndpoint, error) {
 	return nil, status.Error(codes.Unimplemented, "method UpsertServiceEndpoint not implemented")
@@ -10154,6 +10178,24 @@ func _LiteVirt_GetUpgradeStatus_Handler(srv interface{}, ctx context.Context, de
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_HoldsReleaseFeatureUse_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReleaseFeatureUseQuery)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).HoldsReleaseFeatureUse(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_HoldsReleaseFeatureUse_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).HoldsReleaseFeatureUse(ctx, req.(*ReleaseFeatureUseQuery))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LiteVirt_UpsertServiceEndpoint_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(UpsertServiceEndpointRequest)
 	if err := dec(in); err != nil {
@@ -11547,6 +11589,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetUpgradeStatus",
 			Handler:    _LiteVirt_GetUpgradeStatus_Handler,
+		},
+		{
+			MethodName: "HoldsReleaseFeatureUse",
+			Handler:    _LiteVirt_HoldsReleaseFeatureUse_Handler,
 		},
 		{
 			MethodName: "UpsertServiceEndpoint",

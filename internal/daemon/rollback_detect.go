@@ -40,15 +40,18 @@ import (
 // RELEASE TOKENS. A marker may carry a rollback rule (capabilities.MarkerContent).
 // The one rule this build honours is `rollback: safe_if_unused`, which a release
 // token's marker carries: every effect of a release token is behind
-// health.Checker.RequireFeature, which records a feature's use in a replicated
-// row before the feature writes anything. So an unknown token whose marker says
-// safe_if_unused, and for which uses() holds no recorded use, wrote nothing this
-// build could drop, and does not quarantine. Anything else does: no rule, a
-// rule this build does not know, a recorded use, or a used set that cannot be
-// read (nil uses included — nothing then proves the token unused).
+// health.Checker.WithFeature, which records a feature's use, and waits for every
+// replication recipient to hold the record, before the feature writes anything.
+// An unknown token whose marker says safe_if_unused, and for which uses() holds
+// no recorded use, is not quarantined — but not trusted either: this replica's
+// "nothing used" is not proof, so the node starts in release PROBATION
+// (preflightRollback), emitting nothing until a voter majority has been asked.
+// Anything else quarantines: no rule, a rule this build does not know, a
+// recorded use, or a used set that cannot be read (nil uses included — nothing
+// then proves the token unused).
 //
-// A recorded use of a token this build does not know quarantines with or
-// without a marker: the token latched while this node was away, and its
+// A recorded use this build cannot honour — an unknown token, or a feature it
+// does not declare under a token it knows — quarantines with or without a marker: the token latched while this node was away, and its
 // features write what this build cannot keep. A use that arrives AFTER startup
 // trips the same quarantine at the replication apply (corrosion
 // release_features.go).
@@ -57,14 +60,24 @@ import (
 // quarantine on every marker they do not know, used or not. That cannot be
 // fixed from here.
 func preflightCapabilityRollback(dataDir string, uses func() ([]corrosion.ReleaseFeatureUse, error)) []string {
+	q, _ := preflightRollback(dataDir, uses)
+	return q
+}
+
+// preflightRollback is preflightCapabilityRollback with the second answer the
+// safe_if_unused rule needs: the tokens whose marker passed it only on this
+// replica's word. Those are a PROBATION, not a pass (C1): this replica may lack
+// a record its peers hold, so the node emits nothing until a voter majority
+// has been asked (corrosion.AntiEntropy.VerifyReleaseProbation).
+func preflightRollback(dataDir string, uses func() ([]corrosion.ReleaseFeatureUse, error)) (quarantine, probation []string) {
 	if os.Getenv("LITEVIRT_UNSAFE_SKIP_ROLLBACK_CHECK") == "1" {
 		slog.Warn("preflight: capability-rollback detection disabled by " +
 			"LITEVIRT_UNSAFE_SKIP_ROLLBACK_CHECK=1; this node will emit replicated writes " +
 			"even if it is a rollback below a token it already latched")
-		return nil
+		return nil, nil
 	}
 	if dataDir == "" {
-		return nil
+		return nil, nil
 	}
 	latched, err := health.ActivationMarkersOnDisk(dataDir)
 	if err != nil {
@@ -72,7 +85,7 @@ func preflightCapabilityRollback(dataDir string, uses func() ([]corrosion.Releas
 		// Log rather than fail: an unreadable data dir is its own problem and the
 		// daemon will hit it again immediately.
 		slog.Warn("preflight: could not scan capability activation markers", "error", err)
-		return nil
+		return nil, nil
 	}
 	// The used set is read at most once, and only when something needs it.
 	var (
@@ -133,10 +146,14 @@ func preflightCapabilityRollback(dataDir string, uses func() ([]corrosion.Releas
 	// or not — a safe_if_unused marker included.
 	if u, err := readUses(); err == nil {
 		for token, feats := range u {
-			if !unknown[token] && !corrosion.ReleaseTokenKnown(token) {
-				slog.Error("preflight: features of a release this build does not know are in use",
-					"capability", token, "features", feats)
-				unknown[token] = true
+			for _, f := range feats {
+				// An unknown token, or a feature this build does not declare
+				// under a token it knows (I3): either way it cannot keep the data.
+				if name := corrosion.UnhonouredUse(token, f); name != "" && !unknown[name] {
+					slog.Error("preflight: a feature this build cannot keep the data of is in use",
+						"capability", token, "feature", f)
+					unknown[name] = true
+				}
 			}
 		}
 	} else if uses != nil && !isNoSuchTable(err) {
@@ -147,17 +164,18 @@ func preflightCapabilityRollback(dataDir string, uses func() ([]corrosion.Releas
 	for _, token := range safeIfUnused {
 		if !unknown[token] {
 			slog.Warn("preflight: this binary predates a latched release token none of whose "+
-				"features has been used; not quarantining (rollback: safe_if_unused). Its peers "+
-				"refuse every first use of its features while this node runs",
+				"features is recorded used here; entering release probation (rollback: "+
+				"safe_if_unused) until a voter majority confirms it",
 				"capability", token)
+			probation = append(probation, token)
 		}
 	}
-	out := make([]string, 0, len(unknown))
 	for tok := range unknown {
-		out = append(out, tok)
+		quarantine = append(quarantine, tok)
 	}
-	sort.Strings(out)
-	return out
+	sort.Strings(quarantine)
+	sort.Strings(probation)
+	return quarantine, probation
 }
 
 // isNoSuchTable reports a read before the schema exists (a brand-new node).

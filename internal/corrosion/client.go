@@ -496,6 +496,10 @@ type Client struct {
 	// holding mu, and the writers read it both before and under mu.
 	releaseUseMu      sync.Mutex
 	releaseUseTripped map[string]bool
+	// releaseProbation: see EnterReleaseProbation. Guarded by releaseUseMu.
+	releaseProbation map[string]bool
+	// replicationSourceGate: see SetReplicationSourceGate.
+	replicationSourceGate atomic.Pointer[func(ctx context.Context, peer string) error]
 }
 
 // SetWriteQuarantine injects the predicate that refuses replicated writes, returning

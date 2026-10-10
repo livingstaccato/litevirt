@@ -181,8 +181,16 @@ type Checker struct {
 	quorumLost       map[string]bool
 	quorumRegainedAt map[string]time.Time
 	// featuresRecorded is every release feature whose use this node has seen
-	// recorded (RequireFeature). Monotone, like the record. Guarded by mu.
+	// recorded (WithFeature). Monotone, like the record. Guarded by mu.
 	featuresRecorded map[capabilities.Feature]bool
+	// releaseConfirm asks a peer whether it holds a used record
+	// (SetReleaseUseConfirmer). Guarded by mu.
+	releaseConfirm ReleaseUseConfirmer
+	// unknownReleaseObserver / unknownReleaseSeen: a peer advertising a
+	// release token this build does not know (SetUnknownReleaseTokenObserver).
+	// Guarded by mu.
+	unknownReleaseObserver func(token string)
+	unknownReleaseSeen     map[string]bool
 }
 
 // now reads the checker's local clock.

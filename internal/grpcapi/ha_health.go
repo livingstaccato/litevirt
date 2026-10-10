@@ -26,7 +26,7 @@ const (
 	haRolledBackLatch   = "rolled_back_latch"          // this binary is below a capability token this node already latched — WAL-quarantined, needs an operator reseed
 )
 
-var haReasons = []string{haUnsupportedMember, haRolloutPending, haDemotionUnfenced, haVIPNoHolder, haStrandedPending, haRolledBackLatch}
+var haReasons = []string{haUnsupportedMember, haRolloutPending, haDemotionUnfenced, haVIPNoHolder, haStrandedPending, haRolledBackLatch, haReleasePeerRefused}
 
 // capabilityDegradedReason maps a configured-to-enforce token's latch state (ok = latched)
 // to an HA-degraded reason, or "" if it's fine. vip_demote_v1 is a software capability (no
@@ -207,7 +207,11 @@ func (s *Server) RunHAHealthMonitor(ctx context.Context, interval time.Duration)
 			s.haMetrics.Set(r, on)
 			switch {
 			case on && !prev[r], degradedSetGrew(r, on, prev[r], unsupported, prevUnsupported):
-				s.publish("ha.degraded", r, haDegradedDetail(r, s.hostName, unsupported))
+				detail := haDegradedDetail(r, s.hostName, unsupported)
+				if r == haReleasePeerRefused {
+					detail += " (" + s.releasePeerRefusedDetail() + ")"
+				}
+				s.publish("ha.degraded", r, detail)
 				s.pageHADegraded(ctx, r) // route the alertable VIP reasons to notify
 			case !on && prev[r]:
 				s.publish("ha.recovered", r, "")
@@ -553,6 +557,11 @@ func (s *Server) evaluateHADegraded(ctx context.Context) (map[string]bool, []deg
 	// (or an upgrade back) rather than a network problem at the other end.
 	if quarantined {
 		out[haRolledBackLatch] = true
+	}
+	// This node is back-pressuring a peer that cannot keep a release feature
+	// in use (ReleasePeerAllowed); the event detail names it.
+	if len(s.releasePeerRefusedNow()) > 0 {
+		out[haReleasePeerRefused] = true
 	}
 	return out, unsupported
 }

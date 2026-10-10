@@ -417,27 +417,48 @@ bit**:
   replicates to — a host in `maintenance` included — runs this release.
   Latching it changes nothing on its own.
 - A feature of the release is refused, with `the cluster upgrade must finish
-  first (<feature> needs <token>)`, until the token has latched. The first time
-  it is used anywhere, the cluster records that it is used — a replicated row,
-  written and on the replication stream before the feature writes anything — and
-  if the record cannot be written, the feature's write is refused too. The
-  record is never cleared: nothing proves the feature's data has all gone.
+  first (<feature> needs <token>)`, until the token has latched. Before its
+  first write anywhere, the cluster records that it is used — a replicated row
+  — and **every host the cluster replicates to must confirm it holds that
+  record** before the write runs. A host that does not confirm in time refuses
+  the write (`Unavailable`; retry). If the record cannot be written at all, the
+  write is refused too. Every host that writes the feature's data puts its own
+  copy of the record on its own replication stream first. The record is never
+  cleared: nothing proves the feature's data has all gone.
 - A first use also re-checks, live, that every host the cluster replicates to
   still advertises the token. A host rolled back after the latch therefore
   holds every **first** use off for as long as it runs; features already in use
   keep working.
+- Once a feature is in use, an upgraded host **refuses replication** (pushes
+  and anti-entropy pulls) from a peer that does not advertise its token — a host
+  rolled back, or back from a long absence on an older build. The refusal is
+  back-pressure, nothing is dropped, and it raises
+  `litevirt_ha_degraded{reason="release_feature_peer_refused"}` with an event
+  naming the peer. Upgrade that host again, or remove it.
 - The release token's marker carries a rollback rule, `rollback:
   safe_if_unused`. A binary that understands the rule (this release and later)
-  rolled back below a release token quarantines **only if one of that token's
-  features has been used**. Unused, it starts normally; its peers report it in
-  `ha_degraded` because it does not advertise the token. If a use of a feature it
-  does not know arrives later by replication, it quarantines at that moment,
-  before the feature's data is applied.
+  rolled back below a release token quarantines **if one of that token's
+  features has been used** — or if any feature it does not declare is recorded
+  used under a token it does know. If its own replica shows no use, it does not
+  take that on trust: it starts in **release probation**, emitting no replicated
+  writes and advertising nothing, until it has pulled the cluster's records from
+  a majority of the voters. No use there: probation lifts (`release probation
+  lifted` in the log). A use there: it quarantines. A host that sees a peer
+  advertise a release token it does not know enters the same probation.
 
 **What this does not change.** A binary built before `release_2026_11_v1`
 understands no rollback rule. Rolled back below any token it does not know —
 this release's token included — it quarantines, used or not. Tokens other than
 release tokens carry no rule and block a rollback once latched, as before.
+
+**Quarantine stops writes, not misreads.** A quarantined host emits nothing the
+cluster could take, but it still acts on what it holds locally. A host that
+applied a feature's data it cannot interpret — before the quarantine came up,
+or on a build from before this mechanism — may still run that host's workloads
+without it (a VM defined without the limits a feature set, for example). So a
+host quarantined below a release feature in use must be **drained** of the
+workloads the feature touches (`lv host drain`), then upgraded again or reseeded;
+reseeding alone does not correct a workload already running.
 
 **Before you roll back**, ask the cluster what would block it:
 
@@ -445,18 +466,27 @@ release tokens carry no rule and block a rollback once latched, as before.
 lv cluster upgrade-status
 ```
 
-It lists every token latched on the connected host with `BLOCKS ROLLBACK`, and
-every release feature with whether it is used and which host used it first.
-`BLOCKS ROLLBACK: no` on a release token means a host rolled back onto a build
-that knows the rule (see above) keeps running. A feature listed as *not known to
-this build* is a newer release's that has been used: this build is the one that
-would be quarantined, and is, if it is the binary answering.
+It lists every token latched on the connected host with two answers:
+`BLOCKS ROLLBACK` for the build directly below that token, and `IF RULE-AWARE`
+for a target build that reads rollback rules. For `release_2026_11_v1`,
+`BLOCKS ROLLBACK` is always `yes`: every build below it predates rules. `IF
+RULE-AWARE: no` on a later release token means a host rolled back onto this
+release would keep running (after one probation round). Every release feature
+is listed with whether it is used and the host that last recorded it. A
+feature listed as *not known to this build* is a newer release's that has been
+used: this build is the one that would be quarantined, and is, if it is the
+binary answering.
+
+**Residuals.** An origin that a receiver cannot reach is not judged, so its
+entries relayed by another host are accepted until it answers. A peer that
+rolls back and restarts in under five seconds can have its first pushes
+accepted on an answer from before its restart.
 
 `LITEVIRT_UNSAFE_SKIP_ROLLBACK_CHECK=1` skips the startup check, the recorded
-uses included, as before (see [configuration.md](configuration.md)). A use that
-arrives by replication after startup still quarantines the node at run time;
-that ends with an upgrade back to a build that knows the token, a reseed, or a
-restart with the override set.
+uses and the startup probation included, as before (see
+[configuration.md](configuration.md)). A use that arrives by replication after
+startup still quarantines the node at run time; that ends with an upgrade back
+to a build that knows the token, a reseed, or a restart with the override set.
 
 ---
 

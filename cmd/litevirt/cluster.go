@@ -126,15 +126,19 @@ func newClusterUpgradeStatusCmd() *cobra.Command {
 whether each would block rolling a host back below the build that introduced it,
 and which features of each release token have been used anywhere in the cluster.
 
-A token with no rollback rule blocks a rollback once latched: a host rolled back
-below it enters WAL quarantine. A release token carries the rule
-"safe_if_unused": a host rolled back below it, onto a build that understands the
-rule, quarantines only if one of its features has been used. A build older than
-the first release token understands no rule and quarantines on every token it
-does not know, used or not.
+BLOCKS ROLLBACK answers for the build directly below the token. A token with no
+rollback rule always blocks: a host rolled back below it enters WAL quarantine.
+release_2026_11_v1 always blocks too, because every build below it predates
+rollback rules and quarantines on any marker it does not know, used or not.
 
-A feature is marked used the first time it is used on any host, before that
-use writes anything, and stays marked: nothing proves its data has all gone.`,
+IF RULE-AWARE answers for a target build that reads the "safe_if_unused" rule a
+release token's marker carries: there, a rollback below the token quarantines
+only once one of its features has been used. That is what a later release's
+token offers when rolled back onto this release.
+
+A feature is marked used before its first write anywhere, every host that writes
+it records it again, and the mark is never cleared: nothing proves the
+feature's data has all gone. RECORDED BY is the host that last recorded it.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
@@ -163,14 +167,15 @@ func printUpgradeStatus(out io.Writer, st *pb.UpgradeStatus) {
 	}
 	fmt.Fprintln(out)
 	w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
-	fmt.Fprintf(w, "TOKEN\tDURABLE\tMANDATORY\tROLLBACK RULE\tBLOCKS ROLLBACK\n")
+	fmt.Fprintf(w, "TOKEN\tDURABLE\tMANDATORY\tROLLBACK RULE\tBLOCKS ROLLBACK\tIF RULE-AWARE\n")
 	for _, tk := range st.GetTokens() {
 		rule := tk.GetRollbackRule()
 		if rule == "" {
 			rule = "-"
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", tk.GetName(), upgradeYesNo(tk.GetDurable()),
-			upgradeYesNo(tk.GetMandatory()), rule, upgradeYesNo(tk.GetBlocksRollback()))
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", tk.GetName(), upgradeYesNo(tk.GetDurable()),
+			upgradeYesNo(tk.GetMandatory()), rule, upgradeYesNo(tk.GetBlocksRollback()),
+			upgradeYesNo(tk.GetBlocksRollbackRuleAware()))
 	}
 	w.Flush()
 	if len(st.GetTokens()) == 0 {
@@ -182,13 +187,13 @@ func printUpgradeStatus(out io.Writer, st *pb.UpgradeStatus) {
 		return
 	}
 	w = tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
-	fmt.Fprintf(w, "RELEASE TOKEN\tFEATURE\tUSED\tFIRST USED BY\tDESCRIPTION\n")
+	fmt.Fprintf(w, "RELEASE TOKEN\tFEATURE\tUSED\tRECORDED BY\tDESCRIPTION\n")
 	for _, f := range st.GetFeatures() {
 		desc := f.GetDescription()
 		if !f.GetDeclared() {
 			desc = "(not known to this build: a newer release's feature)"
 		}
-		by := f.GetFirstUsedBy()
+		by := f.GetRecordedBy()
 		if by == "" {
 			by = "-"
 		}

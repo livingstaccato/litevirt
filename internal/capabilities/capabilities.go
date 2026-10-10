@@ -641,15 +641,16 @@ const (
 	//
 	// What it adds is a per-feature USED bit (release_features.go). A feature
 	// is opened by capabilities' closed set of Features, never by the latch
-	// alone: health.Checker.RequireFeature refuses until this token has
-	// durably latched, and on a feature's first use it records, in a
-	// replicated cluster_policies row, that the feature is in use before the
-	// caller performs its write. A later binary rolled back onto a build that
+	// alone: health.Checker.WithFeature refuses until this token has
+	// durably latched, and before a feature's first write it records, in a
+	// replicated cluster_policies row every replication recipient has
+	// acknowledged, that the feature is in use. A later binary rolled back onto a build that
 	// predates this token then quarantines only when a feature was actually
 	// used (preflightCapabilityRollback reads the marker's `rollback:
-	// safe_if_unused` attribute and the recorded uses). Nothing may gate on
+	// safe_if_unused` attribute and the recorded uses, then holds the node in
+	// release probation until a voter majority confirms them). Nothing may gate on
 	// Latched/Enforced(Release202611V1) directly: a write that skipped
-	// RequireFeature would leave no used bit, and a rolled-back node would
+	// WithFeature would leave no used bit, and a rolled-back node would
 	// believe it safe to keep running over data it drops.
 	//
 	// The name is the release train, not a version number. A version is
@@ -832,7 +833,7 @@ const ReleaseToken = Release202611V1
 //
 //   - release_2026_11_v1 (the release token) has no flag and no stand-down of
 //     its own, and needs none: latching it changes nothing until a feature is
-//     USED, and every feature is opened through RequireFeature, which records
+//     USED, and every feature is opened through WithFeature, which records
 //     the use first. The stand-down for a feature is that feature's own
 //     (clear the field it set, remove the row it wrote); the used bit stays,
 //     because it is monotone — it records that data a previous build cannot
@@ -956,7 +957,7 @@ var supported = []string{
 	IsolationEpochV1,
 	// Release202611V1 is advertised UNCONDITIONALLY: it says "this build
 	// decodes, keeps and honours every field and shape of its release", a fact
-	// about the binary. What opens a feature is RequireFeature, not a flag.
+	// about the binary. What opens a feature is WithFeature, not a flag.
 	Release202611V1,
 }
 

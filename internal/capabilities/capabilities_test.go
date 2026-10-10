@@ -187,3 +187,43 @@ func TestReleaseFeaturesAreWellFormed(t *testing.T) {
 		}
 	}
 }
+
+// TestFeatureGrant_OnlyAMintedGrantForTheFeatureChecks: the zero value, and a
+// grant for another feature, refuse.
+func TestFeatureGrant_OnlyAMintedGrantForTheFeatureChecks(t *testing.T) {
+	var zero FeatureGrant
+	if zero.Check("widgets") == nil {
+		t.Error("the zero FeatureGrant passed Check")
+	}
+	g := MintFeatureGrant("widgets")
+	if err := g.Check("widgets"); err != nil {
+		t.Errorf("a grant for widgets: %v", err)
+	}
+	if g.Check("gadgets") == nil {
+		t.Error("a grant for widgets passed Check for gadgets")
+	}
+}
+
+// TestReleaseTokenRuleIsNotHonouredBelowIt: every build below the first
+// release token predates marker rules, so a rollback below it quarantines
+// whatever was used — upgrade-status must not say otherwise.
+func TestReleaseTokenRuleIsNotHonouredBelowIt(t *testing.T) {
+	if RuleHonouredBelow(Release202611V1) {
+		t.Errorf("RuleHonouredBelow(%s) = true; the build below it reads no rule", Release202611V1)
+	}
+	if RuleHonouredBelow(SplitBrainGateV1) {
+		t.Errorf("RuleHonouredBelow(%s) = true for a token with no rule", SplitBrainGateV1)
+	}
+}
+
+// TestHonoured: a (token, feature) pair is honoured only when this build
+// declares the feature under that token.
+func TestHonoured(t *testing.T) {
+	defer OverrideFeaturesForTest(map[Feature]FeatureInfo{"widgets": {Token: ReleaseToken, Description: "w"}})()
+	if !Honoured(ReleaseToken, "widgets") {
+		t.Error("a declared feature under its token is not honoured")
+	}
+	if Honoured(ReleaseToken, "gadgets") || Honoured("release_2099_01_v1", "widgets") {
+		t.Error("an undeclared pair is honoured")
+	}
+}

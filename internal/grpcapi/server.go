@@ -805,10 +805,16 @@ type Server struct {
 	// When set + enforced, ApplyLB (VIP takeover) requires local quorum. nil /
 	// pre-activation → unchanged. onGateRefused feeds the refusal metric (nil-safe).
 	gate serverGate
-	// releaseFeatures opens a release feature (RequireReleaseFeature): the
-	// checker's RequireFeature in production. Nil refuses every feature.
+	// releaseFeatures opens a release feature (WithReleaseFeature): the
+	// checker's WithFeature in production. Nil refuses every feature.
 	releaseFeatures releaseFeatureGate
-	onGateRefused   func(action, reason string)
+	// releasePeerMu guards the release-peer refusal state (ReleasePeerAllowed).
+	releasePeerMu      sync.Mutex
+	releaseUsed        []string
+	releaseUsedAt      time.Time
+	releasePeerRefused map[string]time.Time
+	releasePeerChecks  map[string]releasePeerCheck
+	onGateRefused      func(action, reason string)
 	// vmStartObserver is told of every guest start (SetVMStartObserver).
 	vmStartObserver VMStartObserver
 

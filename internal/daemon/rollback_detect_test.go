@@ -153,9 +153,15 @@ func writeMarkerContent(t *testing.T, dir, token, content string) {
 func TestPreflightCapabilityRollback_SafeIfUnusedReleaseTokenUnused(t *testing.T) {
 	dir := t.TempDir()
 	writeMarkerContent(t, dir, futureRelease, "1\nrollback: safe_if_unused\n")
-	if got := preflightCapabilityRollback(dir, noUses); len(got) != 0 {
-		t.Fatalf("preflightCapabilityRollback = %v for a release token none of whose features was "+
-			"used; the node would be quarantined for nothing", got)
+	q, p := preflightRollback(dir, noUses)
+	if len(q) != 0 {
+		t.Fatalf("quarantine = %v for a release token none of whose features was "+
+			"used; the node would be quarantined for nothing", q)
+	}
+	// But not trusted either: its own replica may lack a record its peers hold
+	// (C1), so it starts in probation until a voter majority has been asked.
+	if len(p) != 1 || p[0] != futureRelease {
+		t.Fatalf("probation = %v, want [%s]: a replica's own \"nothing used\" is not proof", p, futureRelease)
 	}
 }
 
@@ -163,7 +169,7 @@ func TestPreflightCapabilityRollback_SafeIfUnusedReleaseTokenUsed(t *testing.T) 
 	dir := t.TempDir()
 	writeMarkerContent(t, dir, futureRelease, "1\nrollback: safe_if_unused\n")
 	uses := func() ([]corrosion.ReleaseFeatureUse, error) {
-		return []corrosion.ReleaseFeatureUse{{Token: futureRelease, Feature: "widgets", FirstUsedBy: "n2"}}, nil
+		return []corrosion.ReleaseFeatureUse{{Token: futureRelease, Feature: "widgets", RecordedBy: "n2"}}, nil
 	}
 	if got := preflightCapabilityRollback(dir, uses); len(got) != 1 || got[0] != futureRelease {
 		t.Fatalf("preflightCapabilityRollback = %v, want [%s]: a feature of it was used, and this "+
@@ -173,6 +179,9 @@ func TestPreflightCapabilityRollback_SafeIfUnusedReleaseTokenUsed(t *testing.T) 
 
 // A use of a DIFFERENT token says nothing about this one.
 func TestPreflightCapabilityRollback_SafeIfUnusedIgnoresOtherTokensUses(t *testing.T) {
+	t.Cleanup(capabilities.OverrideFeaturesForTest(map[capabilities.Feature]capabilities.FeatureInfo{
+		"widgets": {Token: capabilities.ReleaseToken, Description: "w"},
+	}))
 	dir := t.TempDir()
 	writeMarkerContent(t, dir, futureRelease, "1\nrollback: safe_if_unused\n")
 	uses := func() ([]corrosion.ReleaseFeatureUse, error) {
@@ -219,6 +228,9 @@ func TestPreflightCapabilityRollback_OnlyTheKnownRuleLiftsQuarantine(t *testing.
 // marker on this node: it latched while this node was away, and its features
 // write what this build cannot keep.
 func TestPreflightCapabilityRollback_UseOfUnknownTokenWithoutMarker(t *testing.T) {
+	t.Cleanup(capabilities.OverrideFeaturesForTest(map[capabilities.Feature]capabilities.FeatureInfo{
+		"known": {Token: capabilities.ReleaseToken, Description: "k"},
+	}))
 	uses := func() ([]corrosion.ReleaseFeatureUse, error) {
 		return []corrosion.ReleaseFeatureUse{
 			{Token: futureRelease, Feature: "widgets"},
@@ -246,10 +258,50 @@ func TestPreflightCapabilityRollback_ReadsTheReplicatedUsedSet(t *testing.T) {
 	if got := preflightCapabilityRollback(dir, reader); len(got) != 0 {
 		t.Fatalf("preflightCapabilityRollback = %v with nothing used", got)
 	}
-	if err := corrosion.RecordReleaseFeatureUse(ctx, db, futureRelease, "widgets", "n2"); err != nil {
+	if err := corrosion.RecordReleaseFeatureUse(ctx, db, futureRelease, "widgets", "n2", false); err != nil {
 		t.Fatalf("RecordReleaseFeatureUse: %v", err)
 	}
 	if got := preflightCapabilityRollback(dir, reader); len(got) != 1 || got[0] != futureRelease {
 		t.Fatalf("preflightCapabilityRollback = %v after a use, want [%s]", got, futureRelease)
+	}
+}
+
+// TestPreflightCapabilityRollback_UndeclaredFeatureOfAKnownToken (I3): this
+// build knows the release token but not the feature recorded used under it —
+// a build from before that feature landed. It cannot keep the data.
+func TestPreflightCapabilityRollback_UndeclaredFeatureOfAKnownToken(t *testing.T) {
+	t.Cleanup(capabilities.OverrideFeaturesForTest(map[capabilities.Feature]capabilities.FeatureInfo{
+		"widgets": {Token: capabilities.ReleaseToken, Description: "w"},
+	}))
+	uses := func() ([]corrosion.ReleaseFeatureUse, error) {
+		return []corrosion.ReleaseFeatureUse{
+			{Token: capabilities.ReleaseToken, Feature: "widgets"},
+			{Token: capabilities.ReleaseToken, Feature: "email_target_secret"},
+		}, nil
+	}
+	want := capabilities.ReleaseToken + "/email_target_secret"
+	if got := preflightCapabilityRollback(t.TempDir(), uses); len(got) != 1 || got[0] != want {
+		t.Fatalf("preflightCapabilityRollback = %v, want [%s]", got, want)
+	}
+}
+
+// TestPreflightRollback_NoProbationWithoutARule: a known token, or an unknown
+// one without the rule, never puts a node in probation — the first is fine and
+// the second is quarantined outright.
+func TestPreflightRollback_NoProbationWithoutARule(t *testing.T) {
+	dir := t.TempDir()
+	writeMarker(t, dir, capabilities.SplitBrainGateV1)
+	writeMarker(t, dir, "some_future_token_v9")
+	q, p := preflightRollback(dir, noUses)
+	if len(p) != 0 || len(q) != 1 {
+		t.Fatalf("quarantine=%v probation=%v, want one quarantined token and no probation", q, p)
+	}
+	// A used safe_if_unused token is quarantined, not in probation.
+	writeMarkerContent(t, dir, futureRelease, "1\nrollback: safe_if_unused\n")
+	usedFuture := func() ([]corrosion.ReleaseFeatureUse, error) {
+		return []corrosion.ReleaseFeatureUse{{Token: futureRelease, Feature: "widgets"}}, nil
+	}
+	if _, p := preflightRollback(dir, usedFuture); len(p) != 0 {
+		t.Fatalf("probation = %v for a token already shown used", p)
 	}
 }

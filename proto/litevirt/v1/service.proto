@@ -3801,6 +3801,11 @@ service LiteVirt {
     // each release token which of its features have been used cluster-wide
     // (`lv cluster upgrade-status`, docs/upgrades.md). Viewer.
     rpc GetUpgradeStatus(google.protobuf.Empty)       returns (UpgradeStatus);
+    // HoldsReleaseFeatureUse answers, for a peer, whether this replica holds the
+    // used record of one release feature. A first use waits for every
+    // replication recipient to answer yes before the feature writes anything.
+    // Peer mTLS only.
+    rpc HoldsReleaseFeatureUse(ReleaseFeatureUseQuery) returns (ReleaseFeatureUseHeld);
 
     // ── anycast services ──
     // service_endpoints map a logical name (e.g. "api.litevirt.local")
@@ -4056,12 +4061,16 @@ message UpgradeToken {
     bool   mandatory = 3;  // no config flag
     // rollback_rule is the marker's rollback rule ("safe_if_unused") or "".
     string rollback_rule = 4;
-    // blocks_rollback is true when a binary older than this token, but new
-    // enough to read its rollback rule, would quarantine on it: always for a
-    // token with no rule, and for a safe_if_unused token once one of its
-    // features is used. A binary that predates the rule quarantines on every
-    // token it does not know.
+    // blocks_rollback is true when rolling a host back to the build directly
+    // below this token would quarantine it. Always for a token with no rule;
+    // always for the first release token, because every build below it
+    // predates rollback rules; for a later release token, once one of its
+    // features is used.
     bool   blocks_rollback = 5;
+    // blocks_rollback_rule_aware is the same question for a target build that
+    // reads rollback rules: false for a safe_if_unused token none of whose
+    // features is used, true otherwise.
+    bool   blocks_rollback_rule_aware = 6;
 }
 
 // ReleaseFeatureStatus is one release feature: declared by this build, or
@@ -4071,9 +4080,18 @@ message ReleaseFeatureStatus {
     string name          = 2;
     string description   = 3;  // "" for a feature this build does not declare
     bool   used          = 4;
-    string first_used_by = 5;  // the host that recorded the use
+    string recorded_by   = 5;  // the host that last recorded the use (every writing host re-records it)
     string recorded_at   = 6;
     bool   declared      = 7;  // this build declares the feature
+}
+
+message ReleaseFeatureUseQuery {
+    string token   = 1;
+    string feature = 2;
+}
+
+message ReleaseFeatureUseHeld {
+    bool held = 1;
 }
 
 // CrossRegionMigrate refuses when source/target hosts are in the

@@ -124,7 +124,9 @@ that takes the request, before it forwards anything — and so does cloning a
 container that has one. A non-admin's clone of a **privileged or
 legacy-confined** container is never refused: the clone lands unprivileged, in
 an id range of its own (its files shifted), with default confinement, and the
-audit (`ct.clone`) says so. An admin's clone keeps the source's mode. Then the host itself decides what it allows:
+audit (`ct.clone`) says so. An admin's clone keeps the source's mode. A
+source with an unfinished conversion is not cloned until the conversion is
+finished (`lv ct convert <name>`). Then the host itself decides what it allows:
 
 ```yaml
 containers:
@@ -135,29 +137,38 @@ containers:
 - Each mount's host path is **resolved on the host, symlinks followed**, and
   the resolved path must lie under one of that host's prefixes. Empty lists
   (the default) allow nothing.
-- **Protected trees** are never mounted, whatever the prefixes say, and a
-  prefix or source that is, lies in, or CONTAINS one is refused (at config
-  load too): `/`, `/etc`, `/root`, `/boot`, `/proc`, `/sys`, `/dev`, `/run`,
+- **Protected trees** are never mounted, whatever the prefixes say: a
+  source whose resolved path is, lies in, or CONTAINS one is refused, and so
+  is a configured prefix (at config load) that is, lies in or contains one of
+  the fixed trees below: `/`, `/etc`, `/root`, `/boot`, `/proc`, `/sys`, `/dev`, `/run`,
   `/var/run`, `/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`, the LXC store,
   `/var/lib/libvirt`, litevirt's data and PKI directories, and **every store
   the host serves**: each storage pool's source and target on this host, every
   backup repo (configured or registered), the image and disk stores, the
   restore cache, and litevirt's own binary (the start hook LXC runs as root).
   Each is compared in its resolved, canonical form, on every start; a store
-  list that cannot be read refuses every mount.
+  list that cannot be read refuses every mount. A store created beneath an
+  allowed prefix refuses only the sources in it or containing it: `/srv/share`
+  keeps working when a pool appears at `/srv/pools/x`. A container with no
+  mounts never reads the store list.
 - **Devices are listed exactly**: each `device_paths` entry is one device
   node (never a directory such as `/dev`), and only character or block nodes
   pass. Physical and kernel memory (`/dev/mem`, `/dev/kmem`), I/O ports,
-  `/dev/kvm`, `/dev/vhost-*`, and the raw-disk character nodes — SCSI generic
+  `/dev/kvm`, `/dev/vhost-*`, the raw-disk character nodes — SCSI generic
   (`/dev/sg*`), block SCSI generic (`/dev/bsg/*`), NVMe generic namespaces
-  (`/dev/ng*`) and NVMe controllers (`/dev/nvme0`) — are never passed through,
-  by name or by device number. A block device is judged **by its device
+  (`/dev/ng*`) and NVMe controllers (`/dev/nvme0`) — and the host's console
+  and input — virtual terminals (`/dev/tty`, `/dev/tty0`–`/dev/tty63`),
+  `/dev/console`, `/dev/vcs*`, `/dev/uinput`, `/dev/input/*` and
+  `/dev/watchdog*` — are never passed through, by name or by device number.
+  Serial ports (`/dev/ttyS*`, `/dev/ttyUSB*`, `/dev/ttyACM*`) pass. A block device is judged **by its device
   number**, with its partitions and the disk it belongs to: it is refused when
   any of them holds a mounted filesystem, is swap, has a device built on it
   (LVM, md, dm-crypt), is a loop device with a backing file or a connected nbd
   device, is held open by any process (qemu's VM disks), is refused an
-  exclusive open by the kernel (btrfs and ZFS members), or is a VM disk on this
-  host by number, whatever path names it.
+  exclusive open by the kernel (btrfs and ZFS members), or is the disk of any
+  VM in the cluster by number, whatever path names it (a shared LUN backing a
+  VM on another host included). Only block devices count: a character node
+  with the same numbers does not.
 - Paths may hold letters, digits and `. _ @ + / -` only.
 - Mounts are **read-only unless `:rw`**, and always `nosuid,nodev`.
   Read-only is a boundary only for an **unprivileged** container, where the
@@ -167,14 +178,22 @@ containers:
   `/run/litevirt/ct` (root-only, private propagation). Litevirt's start hook,
   which LXC runs on **every** start — a reboot from inside the container
   included — opens each source beneath its allowed prefix with
-  `openat2(RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS|RESOLVE_NO_XDEV)`, clones
-  exactly that tree, sets read-only/nosuid/nodev on it and moves it onto the
-  staging path. A symlink swapped into the tree at any time, or a filesystem
-  mounted over part of it, is refused by the kernel, not followed. The hook
-  judges every mount and device again against the host's policy as the daemon
-  last recorded it before a start (`/run/litevirt/lxc-hook-policy.json`), so a
-  reboot from inside the container cannot outlive a prefix the host has since
-  withdrawn; with no policy recorded it stages nothing. A refusal is logged
+  `openat2(RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS)`, then judges what it opened
+  by the path the kernel resolved it to (still beneath the prefix, inside no
+  protected tree), clones exactly that tree, sets read-only/nosuid/nodev on it
+  and moves it onto the staging path. A symlink swapped into the tree at any
+  time is refused by the kernel, not followed. A filesystem mounted beneath an
+  allowed prefix (a NAS share) is a source like any other; a store or
+  protected tree mounted there is refused. The hook runs
+  for a container with devices and no mounts too, and judges every mount and
+  device again against a policy the daemon keeps per container
+  (`/run/litevirt/lxc-hook-policy/<name>.json`): the host's policy and the
+  container's own authorized record, as resolved now. The daemon writes it at
+  every start it drives and whenever the record changes, and rewrites every
+  container's at daemon start and once a minute, so a pool created, or a
+  prefix withdrawn, reaches a reboot from inside the container within a
+  minute. With no policy the hook stages nothing, and it stages only what the
+  record authorizes. A refusal is logged
   to the system log under the tag `litevirt-lxc-hook`. A failed start takes
   down what it staged, and the stop removes each staging entry by itself.
   This needs Linux 5.12+; on an older kernel mounts are refused.
@@ -195,7 +214,11 @@ containers:
   every `lxc.net.*` line in the archive is dropped (a `phys`, `macvlan` or
   `none` NIC, a router-mode veth, another project's bridge) and the spec's
   NICs are written as create writes them; what was dropped is audited
-  (`ct.restore`). A restore keeps the backup's mounts and devices only for an
+  (`ct.restore`). No bridge is taken from the archive's spec either: a managed
+  NIC lands on its network's own bridge, and a raw-bridge NIC is kept only for
+  a caller who may attach raw bridges (as at create), or for a cold migration
+  or relocation whose source row records it. Otherwise that NIC is dropped,
+  audited, and the restore proceeds. A restore keeps the backup's mounts and devices only for an
   admin (a cold migration or failover relocation keeps them only when they are
   exactly what the source's row records); otherwise they are stripped, the
   strip is audited, and an admin re-applies them with `lv ct convert`.

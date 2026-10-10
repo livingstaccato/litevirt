@@ -58,7 +58,7 @@ func (s *Server) FinishWebAuthnRegistration(ctx context.Context, req *pb.FinishW
 	// reference so the UI can show "registered key abc1234…".
 	label := credentialLabelFromAttestation(req.AttestationJson)
 	slog.Info("webauthn registered", "username", target, "label", label)
-	return &pb.FinishWebAuthnRegistrationResponse{CredentialLabel: label}, nil
+	return &pb.FinishWebAuthnRegistrationResponse{CredentialLabel: label, SessionEnded: s.endEnrollmentSession(ctx)}, nil
 }
 
 func (s *Server) BeginWebAuthnLogin(ctx context.Context, req *pb.BeginWebAuthnLoginRequest) (*pb.BeginWebAuthnLoginResponse, error) {

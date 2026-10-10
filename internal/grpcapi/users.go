@@ -106,6 +106,34 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 		}
 	}
 
+	// Account lifecycle: a disabled or expired account gets no session, and
+	// no second-factor prompt either. Checked only after the credentials
+	// verified, so it tells nothing to someone who does not hold them.
+	if err := s.refuseInactiveAccount(ctx, principal.Subject); err != nil {
+		s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" "+status.Convert(err).Message(), "denied")
+		return nil, err
+	}
+
+	// Mandatory second factor. LocalRealm already demands an enrolled factor;
+	// the policy demands it of every realm it covers, and a covered account
+	// with none gets an enrollment-only session rather than no session.
+	required, enrolled, perr := s.secondFactorRequirement(ctx, principal.Subject, realmName)
+	if perr != nil {
+		s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" second-factor policy unreadable", "denied")
+		return nil, status.Errorf(codes.Unavailable, "evaluate the second-factor policy: %v", perr)
+	}
+	if required && enrolled {
+		principal.Requires2FA = true
+		// An OIDC code is single-use, so there is no second round in which to
+		// ask for the factor: it has to arrive with the code. Answering
+		// Requires_2Fa would send the client back with a spent code.
+		if hasOIDCCode && !hasPassword && req.TotpCode == "" {
+			s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" second factor missing", "denied")
+			return nil, status.Errorf(codes.Unauthenticated,
+				"realm %q requires a second factor: send totp_code together with the OIDC code", realmName)
+		}
+	}
+
 	if principal.Requires2FA && req.TotpCode == "" {
 		return &pb.LoginResponse{Requires_2Fa: true}, nil
 	}
@@ -130,13 +158,22 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 		return nil, err
 	}
 
-	slog.Info("user logged in", "username", principal.Subject, "realm", realmName)
-	s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" ip="+clientIP, "ok")
+	enrollOnly := required && !enrolled
+	detail := "realm=" + realmName + " ip=" + clientIP
+	if enrollOnly {
+		// The role is withheld from the response as it is from the session:
+		// until a factor is enrolled the session can do nothing that needs one.
+		role = ""
+		detail += " enrollment-only (second factor required, none enrolled)"
+	}
+	slog.Info("user logged in", "username", principal.Subject, "realm", realmName, "enrollment_only", enrollOnly)
+	s.audit(ctx, "auth.login", principal.Subject, detail, "ok")
 	return &pb.LoginResponse{
-		Token:     token,
-		Username:  principal.Subject,
-		Role:      role,
-		ExpiresAt: expiresAt,
+		Token:                  token,
+		Username:               principal.Subject,
+		Role:                   role,
+		ExpiresAt:              expiresAt,
+		Requires_2FaEnrollment: enrollOnly,
 	}, nil
 }
 
@@ -154,6 +191,11 @@ func (s *Server) mintSession(ctx context.Context, username, realm, clientIP, use
 	user, gerr := corrosion.GetUser(ctx, s.db, username)
 	if gerr != nil || user == nil {
 		return "", "", "", status.Errorf(codes.Internal, "post-auth user lookup: %v", gerr)
+	}
+	// Every login path ends here, so this is the one check no path can skip —
+	// the WebAuthn login reaches no other.
+	if err := s.refuseInactiveAccount(ctx, username); err != nil {
+		return "", "", "", err
 	}
 	id, ierr := newSessionID()
 	if ierr != nil {
@@ -335,9 +377,15 @@ func (s *Server) ListUsers(ctx context.Context, _ *emptypb.Empty) (*pb.ListUsers
 		return nil, status.Errorf(codes.Internal, "list users: %v", err)
 	}
 
+	lifecycles, err := corrosion.ListUserLifecycles(ctx, s.db)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "list account states: %v", err)
+	}
+
 	resp := &pb.ListUsersResponse{}
 	for _, u := range users {
-		pbUser := &pb.User{Username: u.Username, Role: u.Role}
+		life := lifecycles[u.Username]
+		pbUser := &pb.User{Username: u.Username, Role: u.Role, Disabled: life.Disabled, ExpiresAt: life.ExpiresAt}
 		if u.CreatedAt != "" {
 			if t, err := time.Parse(time.RFC3339, u.CreatedAt); err == nil {
 				pbUser.CreatedAt = timestamppb.New(t)

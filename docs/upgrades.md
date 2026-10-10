@@ -817,6 +817,20 @@ the derived set. It is not a rollback tool: a binary rolled back below the
 latched token enters WAL quarantine at startup, as below every latched token,
 whether or not a voter generation exists.
 
+### Account lifecycle and the second-factor policy latch after the roll
+
+Schema v64 adds `user_lifecycle`, one row per (account, attribute) holding an
+account's `disabled` flag and `expires_at`. Nothing writes it, and nothing
+writes the `login_2fa_required` second-factor policy row, until the mandatory,
+replication-gated `login_policy_v1` token has latched — so `lv user disable`,
+`lv user enable`, `lv user expire` and setting `lv 2fa policy` are refused with
+`FailedPrecondition` until every host (every host in `maintenance` included)
+runs this release. A previous-release host would neither decode the rows nor
+enforce them; it has no statement that touches the table, so it cannot undo a
+disable either. Delegated administration (`perm.modify`) needs no token: it
+writes the existing `role_bindings` shape, and its rules are enforced where a
+grant is created.
+
 ### Recovery claims latch after the roll
 
 Schema v60 adds `runtime_action_proofs.claim_certificate`, the majority

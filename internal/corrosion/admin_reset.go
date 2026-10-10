@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // ErrNoLiveAdmin is ResetAdminPassword's refusal: there is no live admin
@@ -46,6 +47,34 @@ func ResetAdminPassword(ctx context.Context, c *Client, passwordHash string) err
 	}
 	if existing == nil {
 		return ErrNoLiveAdmin
+	}
+	// The recovery path must also recover an admin that cannot log in for a
+	// reason other than its password: a disable or an expiry (user_lifecycle).
+	// Without this, disabling or expiring every administrator — which the
+	// SetUserAccount guard refuses, but two admins on two nodes can still
+	// race into — would leave the cluster with no supported way back in.
+	life, err := GetUserLifecycle(ctx, c, "admin")
+	if err != nil {
+		return fmt.Errorf("read the admin account's lifecycle: %w", err)
+	}
+	if !life.Unrestricted() {
+		stmts := resetUserLifecycleStatements(c, "admin", "user.reset-admin", c.NowTS())
+		if stmts == nil {
+			// A row exists, so some node has latched login_policy_v1, but this
+			// one has not durably latched it yet. Its own latch follows within a
+			// capability sweep; writing before it would be the one write this
+			// node's gate exists to stop.
+			state := life.InactiveReason(time.Now().UTC())
+			if state == "" {
+				state = "set to expire at " + life.ExpiresAt
+			}
+			return fmt.Errorf("the admin account is restricted (%s), and this node cannot clear that "+
+				"until login_policy_v1 has latched here; retry in a minute, or run `lv user enable admin` "+
+				"and `lv user expire admin never` from a node where it has", state)
+		}
+		if err := c.ExecuteBatch(ctx, stmts); err != nil {
+			return fmt.Errorf("re-enable the admin account: %w", err)
+		}
 	}
 	if err := UpdateUserPassword(ctx, c, "admin", passwordHash); err != nil {
 		return fmt.Errorf("update password: %w", err)

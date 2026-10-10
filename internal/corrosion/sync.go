@@ -414,6 +414,11 @@ var tableNames = []string{
 	// signed accepts whose certificates are public. Written only once
 	// voter_config_v1 has latched (voter_config.go).
 	"voter_configs",
+	// v64 account lifecycle (disabled, expires_at). Every node enforces it at
+	// authentication, so a node that missed a disable must be repaired here
+	// like any other cluster fact. Nothing secret. Written only once
+	// login_policy_v1 has latched (user_lifecycle.go).
+	"user_lifecycle",
 }
 
 // sensitiveTableNames are secret-bearing tables repaired only by the peer-mTLS

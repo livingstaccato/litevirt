@@ -100,6 +100,7 @@ Built-in roles (seeded by `auth.SeedBuiltinRoles`):
 | Auditor | `*.read`, `audit.export` |
 | BackupOperator | `backup.*`, `snapshot.*`, `vm.read` |
 | NetworkAdmin | `network.*`, `lb.*`, `sg.*` |
+| PermissionAdmin | `perm.modify` (delegated administration; see below) |
 | NoAccess | (none) |
 
 `--allow-overcommit` (CreateVM/StartVM/UpdateVM) additionally requires
@@ -205,6 +206,45 @@ successful reload interval after it becomes locally visible. Deleting a user
 tombstones that user's role bindings in the same transaction, so a deleted
 account cannot retain access through a lingering binding.
 
+### Delegated administration (`perm.modify`)
+
+`GrantRole` and `RevokeRole` are open to a cluster admin, and to any caller
+holding `perm.modify` at the binding's path (Proxmox: `Permissions.Modify`).
+The built-in `PermissionAdmin` role carries it alone, so a project admin is two
+bindings:
+
+```bash
+lv role grant Operator        user:pat@local --path /projects/acme --propagate
+lv role grant PermissionAdmin user:pat@local --path /projects/acme --propagate
+```
+
+pat can now grant and revoke roles at `/projects/acme` and below. A delegated
+grant or revoke is refused, and audited as `denied`, when:
+
+- **the role carries more than the grantor holds there.** Every grant in the
+  role must be covered by one the grantor holds at that path: `vm.*` covers
+  `vm.start`, `*.read` covers `vm.read`, only `*` covers `*`. A list of
+  specific reads does not cover `*.read`, so an Operator cannot hand out
+  Viewer. Delegating delegation is allowed, because pat holds `perm.modify`.
+- **it propagates and the grantor's own grant does not.** A propagating grant
+  at a path reaches every path below it, so it is measured against the
+  grantor's propagating bindings only.
+- **the path is outside the grantor's reach,** including through a sibling
+  prefix (`/projects/acme2`), a `.`/`..`/empty segment, or a scoped API token
+  whose scope does not cover it.
+- **it would be the principal's first binding, or remove its last.** A
+  principal with no binding is authorized by its legacy role cluster-wide;
+  its first binding ends that, and removing its last restores it. Either
+  changes access outside the delegated path, so only a cluster admin may.
+- **the principal is not resolvable:** a delegated grant names an existing
+  user with its realm (`user:<name>@<realm>`) or a group, never a bare
+  `user:<name>`, an unknown user, or an undefined role.
+
+A delegated revoke of a binding outside the caller's reach answers exactly as
+for a binding that does not exist. `lv role ls` shows a delegated admin its own
+bindings and those at the paths it administers. A cluster admin who later
+widens a custom role widens every binding of it, delegated ones included.
+
 ## Sessions
 
 `Login` mints an opaque session id (32 random bytes hex-encoded, prefixed
@@ -289,6 +329,101 @@ against the daemon; the resulting credential lands in the same
 
 To disable a factor: `lv 2fa disable --method totp --label phone`.
 
+### Mandatory second factor (`lv 2fa policy`)
+
+A cluster-wide policy decides which realms must present a second factor:
+
+```bash
+lv 2fa policy                    # show it
+lv 2fa policy all                # every realm
+lv 2fa policy local,ldap:corp    # only these realms
+lv 2fa policy off                # the default
+```
+
+It is a replicated row (the `login_2fa_required` key of `cluster_policies`),
+so every node enforces the same rule. Setting it is admin only, and refused
+until `login_policy_v1` has latched on every host.
+
+- **A covered user with a factor** must present it at every login, through
+  every covered realm. The local realm always did this; the policy extends
+  it to LDAP and OIDC. An OIDC code is single-use, so through an OIDC realm
+  the TOTP code has to arrive in the same `Login` call as the OIDC code.
+  WebAuthn login is itself a second factor.
+- **A covered user with no factor** is not locked out. Login returns an
+  enrollment-only session (`requires_2fa_enrollment`, no role): it can call
+  `Whoami`, `Logout`, `GetLoginPolicy`, list its factors and enroll one for
+  its own account (`lv 2fa enroll-totp`, or a security key at
+  `/account/2fa`), and every other call is refused. Enrolling ends that
+  session; the next login presents the new factor. The web UI sends such a
+  session to `/account/2fa`.
+- **It holds from the moment it is set.** Setting it ends every live session
+  in a realm it newly covers, the caller's own included, because a session
+  row does not record whether its login presented a factor. And it is
+  evaluated on every request, so an account whose last factor is removed
+  (`lv 2fa disable`, or an admin's reset for a lost device) is restricted to
+  enrollment at once.
+- **API tokens are not subject to it.** They are administrator-issued
+  automation with no interactive holder; scope them, give them an expiry,
+  and revoke them with `lv user token-revoke`.
+
+A stored value this build does not understand (a later release's) is enforced
+as `all`. A node that cannot read the policy or a user's factors — including
+one whose credential tables a reseed has not repopulated yet — refuses the
+login or request rather than guess.
+
+Recovery: the policy can never lock an account out, only ask it to enroll. An
+admin who lost their factor and recovery codes is recovered by another admin
+removing the factor (`lv 2fa disable --user <name> --method totp`), after
+which they enroll a new one at their next login.
+
+## Account lifecycle (`lv user disable`, `lv user expire`)
+
+```bash
+lv user disable bob                          # refuse every credential of bob's
+lv user enable bob                           # undo it
+lv user expire contractor 2026-12-31T00:00:00Z
+lv user expire contractor never              # clear the expiry
+lv user ls                                   # STATUS and EXPIRES columns
+```
+
+A disabled account, or one past its expiry, cannot authenticate by any path:
+password and WebAuthn login through any realm (an LDAP or OIDC user is refused
+like a local one), its sessions, its API tokens, and either one relayed by a
+peer as a forwarded identity. The check runs on every request against the
+node's replica, so a disable takes effect on each node as soon as it has
+replicated there, and an expiry needs no timer. Disabling an account, or
+setting an expiry, also ends its sessions, so re-enabling it does not revive
+them; its API tokens work again on re-enable. A wrong password for a disabled
+account is still just a wrong password: the disabled state is told only to
+someone who presents the account's credentials.
+
+Each attribute is its own replicated row (`user_lifecycle`), so a disable and
+an expiry change made on two nodes never undo each other. A value a node
+cannot read is treated as disabled. Deleting a user resets its lifecycle, so a
+name deleted and re-created starts enabled.
+
+Admin only, audited as `user.account`. Refused for the cluster's last admin
+that is enabled with no expiry, and until `login_policy_v1` has latched on
+every host. Two admins restricting each other on two nodes at once can still
+race past that guard; `lv user reset-admin` re-enables the `admin` account,
+and is the documented recovery path.
+
+**The one credential a disable cannot reach** is the distributable `lv-cli`
+client certificate: it authenticates as the cluster admin with no user behind
+it. Turn on `auth.strict_mtls_identity` (below) so that a disabled operator
+cannot keep acting through it.
+
+### Rolling upgrade
+
+`login_policy_v1` is mandatory and replication-gated: every build that has the
+`user_lifecycle` table advertises it, and it latches only once every host the
+cluster replicates to does. Until then `lv user disable|enable|expire` and
+setting `lv 2fa policy` are refused, and nothing is written. A
+previous-release host therefore never receives a statement it cannot decode,
+never holds an account state it would not enforce, and — having no statement
+that names the table — cannot re-enable an account. A binary rolled back below
+the latch enters WAL quarantine and writes nothing.
+
 ## Migration from the legacy admin/operator/viewer roles
 
 `users.role` holds a flat `admin > operator > viewer` ladder. The RBAC
@@ -313,8 +448,8 @@ is the only authority.
 
 | Bearer prefix | Lookup table | Rejected on |
 |---|---|---|
-| `lvs_<hex>` | `sessions` | revoked, hard-expired, idle-timeout |
-| `<hex>` (no prefix) | `tokens` (bcrypt match) | `deleted_at`, `expires_at` |
+| `lvs_<hex>` | `sessions` | revoked, hard-expired, idle-timeout, account disabled/expired |
+| `<hex>` (no prefix) | `tokens` (bcrypt match) | `deleted_at`, `expires_at`, account disabled/expired |
 | (no Authorization header) | mTLS client cert → classified (see below) | invalid/expired peer cert |
 
 ## mTLS principal model
@@ -391,7 +526,11 @@ reach and they still need to `lv login` to act.
 credential. It runs as root on a node and gives the existing `admin` account a
 new random password, written to `/etc/litevirt/admin-password` (mode 0600). It
 never creates an admin: on a node with no live admin it refuses, because a
-joining node's credential replicates in and a deleted admin stays deleted.
+joining node's credential replicates in and a deleted admin stays deleted. If
+the `admin` account is disabled or has an expiry, the reset also clears both,
+so it recovers an account locked out by `lv user disable` or `lv user expire`
+too (on a node where `login_policy_v1` has latched; elsewhere it refuses and
+changes nothing).
 
 Every reset is audited as `user.reset-admin`, attributed to `root@<host>`, with
 target `admin` and a detail of `via=<channel> os_user=<who>`. `os_user` is

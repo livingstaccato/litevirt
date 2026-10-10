@@ -29,7 +29,14 @@ lv session revoke <session-id>         # Revoke a session immediately
 lv 2fa enroll-totp --label <name>          # Enroll TOTP; prints otpauth URL + recovery codes
 lv 2fa disable --method totp --label <l>   # Drop a single factor
 lv 2fa ls [--user <name>]                  # List enrolled factors
+lv 2fa policy                              # Show the mandatory second-factor policy
+lv 2fa policy off|all|<realm>[,<realm>...] # Set it (admin); ends sessions in newly covered realms
 ```
+
+Under a policy that covers their realm, a user with no factor gets an
+enrollment-only session at login: it can enroll a factor for its own account
+and nothing else, and the enrollment ends it. See `docs/auth.md`,
+"Mandatory second factor".
 
 WebAuthn enrollment is browser-only; use the `/account/2fa` page.
 
@@ -981,7 +988,16 @@ lv user token-create <username> <token-name> [--expires <RFC3339>]
   [--scope-path <path>] ...        # Repeatable; intersect with role bindings
 lv user token-revoke <token-id>
 lv user reset-admin                # As root on a node: reset the EXISTING admin password (does not create one); audited as user.reset-admin
+                                   # It also re-enables a disabled or expired admin account
+lv user disable <username>         # No login; sessions ended, sessions and API tokens refused (admin)
+lv user enable <username>          # Re-enable; API tokens work again, ended sessions stay ended (admin)
+lv user expire <username> <RFC3339|never>   # Stop authenticating at that instant; "never" clears it (admin)
 ```
+
+`lv user ls` shows each account's STATUS (`active`, `disabled`, `expired`) and
+EXPIRES. Disable and expiry are refused for the last admin that is enabled with
+no expiry, and until `login_policy_v1` has latched on every host. See
+`docs/auth.md`, "Account lifecycle".
 
 ## Roles (path-based RBAC)
 
@@ -994,6 +1010,12 @@ lv role ls [--principal user:alice]
 Principals are `user:<name>` or `group:<name>@<realm>`. Paths are RBAC
 scopes (`/`, `/projects/acme`, `/projects/acme/vms/web-1`). See
 `docs/auth.md` for the role catalog and propagation semantics.
+
+A cluster admin may grant anything anywhere. A caller holding `perm.modify`
+at a path (the `PermissionAdmin` role) may grant and revoke there and below,
+never a role carrying a verb it does not itself hold there, never a
+principal's first binding or last. See `docs/auth.md`, "Delegated
+administration".
 
 ## Projects (tenancy)
 

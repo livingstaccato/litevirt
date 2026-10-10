@@ -1022,6 +1022,10 @@ func (s *Server) advertisedCapabilities() []string {
 	// (this binary decodes cluster_policies and honours failover_scope). The
 	// opt-in is the replicated policy row, which cannot be written until the
 	// ReplicationGated latch has formed.
+	// login_policy_v1 is not withheld either: a fact about the build (this
+	// binary decodes user_lifecycle and enforces account disable, expiry and
+	// the second-factor policy). The opt-ins are replicated rows, which cannot
+	// be written until the ReplicationGated latch has formed.
 	// claim_incarnation_v1 is not withheld either: it is the claim format this
 	// binary's voters keep (an incarnation in the key, the v2 accept, the
 	// legacy-key seal), a fact about the build.
@@ -1489,6 +1493,11 @@ func (s *Server) tokenEnabled(token string) bool {
 		// No kill switch: it says this build resumes from an unverified fence
 		// recorded 'offline' and does not auto-activate such a host, which
 		// the failover lease holder relies on of every node.
+		return true
+	case capabilities.LoginPolicyV1:
+		// No kill switch: it says this build decodes user_lifecycle and
+		// enforces account disable, expiry and the mandatory second-factor
+		// policy on every authentication path. The opt-ins are the rows.
 		return true
 	case capabilities.LeaseTermV1:
 		return s.enfLeaseTerm

@@ -172,7 +172,7 @@ func DeleteUser(ctx context.Context, c *Client, username string) error {
 	marker := nowRFC3339()
 	barePrincipal := "user:" + username
 	localPrincipal := barePrincipal + "@local"
-	return c.ExecuteBatch(ctx, []Statement{
+	stmts := []Statement{
 		{SQL: `UPDATE users SET deleted_at = ?, updated_at = ? WHERE username = ?`,
 			Params: []interface{}{marker, now, username}},
 		{SQL: `UPDATE user_2fa SET deleted_at = ?, updated_at = ? WHERE username = ? AND deleted_at IS NULL`,
@@ -185,7 +185,13 @@ func DeleteUser(ctx context.Context, c *Client, username string) error {
 			Params: []interface{}{marker, now, username}},
 		{SQL: `UPDATE role_bindings SET deleted_at = ?, updated_at = ? WHERE (principal = ? OR principal = ?) AND deleted_at IS NULL`,
 			Params: []interface{}{marker, now, barePrincipal, localPrincipal}},
-	})
+	}
+	// The account's lifecycle goes back to the zero value in the same batch, so
+	// a name deleted and later re-created starts enabled rather than inheriting
+	// a disable meant for the account that was removed. Only once
+	// login_policy_v1 has latched: before that no row can exist to reset.
+	stmts = append(stmts, resetUserLifecycleStatements(c, username, "user.delete", now)...)
+	return c.ExecuteBatch(ctx, stmts)
 }
 
 // InsertToken stores a new API token. scope_paths, when non-empty, is

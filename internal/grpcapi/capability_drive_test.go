@@ -95,6 +95,10 @@ func TestDriveCapabilityActivation_FlagAwareBoundedDriver(t *testing.T) {
 		// recorded 'offline' and does not auto-activate such a host". The
 		// failover lease holder relies on whichever node holds it next.
 		capabilities.FenceStateV1: true,
+		// login_policy_v1: "this build decodes user_lifecycle and enforces
+		// account disable, expiry and the second-factor policy on every
+		// authentication path". Every node accepts logins.
+		capabilities.LoginPolicyV1: true,
 	}
 
 	// Cross-check the hand-written list against the ONE declaration, so adding a

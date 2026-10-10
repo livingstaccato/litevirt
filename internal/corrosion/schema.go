@@ -486,7 +486,16 @@ import (
 //	     local_recovery_claims, and a row here seals the legacy key of the same
 //	     (kind, name, epoch, attempt) on this voter. Nothing is written to it
 //	     until claim_incarnation_v1 latches. One new table.
-const CurrentSchemaVersion = 63
+//	v64: account lifecycle — user_lifecycle (username, attribute PK; value,
+//	     set_by): an account's `disabled` flag and `expires_at` instant, one
+//	     row per attribute so a disable and an expiry change made on two nodes
+//	     each keep their own LWW clock and never undo each other. On a row of
+//	     its own rather than new columns on users, so no previous-release
+//	     statement on users can reset it. Absent = enabled, never expires. A
+//	     previous-release node cannot decode the table's statements, and would
+//	     not enforce them, so nothing writes it until login_policy_v1 latches
+//	     (ReplicationGated). One new table.
+const CurrentSchemaVersion = 64
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -2884,6 +2893,19 @@ var schemaDDL = []string{
 		updated_at        TEXT    NOT NULL,
 		PRIMARY KEY (target_kind, target_name, incarnation, owner_epoch, attempt)
 	)`,
+	// v64 account lifecycle — one row per (account, attribute): `disabled`
+	// ("true"/"false") and `expires_at` (RFC3339 UTC, "" = never). Separate
+	// rows so each attribute has its own LWW clock. Written only once
+	// login_policy_v1 latches; see user_lifecycle.go.
+	`CREATE TABLE IF NOT EXISTS user_lifecycle (
+		username   TEXT NOT NULL,
+		attribute  TEXT NOT NULL,
+		value      TEXT NOT NULL DEFAULT '',
+		set_by     TEXT NOT NULL DEFAULT '',
+		updated_at TEXT NOT NULL,
+		deleted_at TEXT,
+		PRIMARY KEY (username, attribute)
+	)`,
 }
 
 // schemaIndexes are CREATE INDEX IF NOT EXISTS statements added after table creation.
@@ -3073,6 +3095,7 @@ var tablePrimaryKeys = map[string][]string{
 	"host_membership":         {"host_name"},
 	"cluster_policies":        {"key"},
 	"voter_configs":           {"generation"},
+	"user_lifecycle":          {"username", "attribute"},
 }
 
 // schemaMigrations contains ALTER TABLE statements for upgrading existing databases.
@@ -3447,6 +3470,7 @@ var createTableUnits = []struct {
 	{61, "local_abandoned_proofs"},
 	{62, "local_voter_seals"},
 	{63, "local_incarnation_claims"},
+	{64, "user_lifecycle"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

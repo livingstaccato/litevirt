@@ -157,6 +157,15 @@ var firstShapeAcks = map[string]string{
 		"latch cannot form, and nothing is written, while a previous-release peer is listening. Their " +
 		"callers (SetFailoverScope, SetISOLibraryMode, and ISO library uploads, pulls and removals) refuse " +
 		"on the same gate first",
+	"user_lifecycle": "every writer (corrosion.SetUserLifecycle, and the reset statements DeleteUser and " +
+		"ResetAdminPassword append, all through the one userLifecycleUpsertSQL) writes only when " +
+		"Client.MayWriteLoginPolicy: SetUserLifecycle returns ErrLoginPolicyGateClosed, and " +
+		"resetUserLifecycleStatements returns no statements, while the gate is closed. The daemon wires that gate " +
+		"to DurablyLatched(login_policy_v1), and `lv user reset-admin` with the daemon down to the same durable " +
+		"marker on disk — mandatory, so advertised by every build carrying this table and by none that does " +
+		"not, and in capabilities.replicationGated, so it is confirmed against every memberlist recipient " +
+		"rather than the voting members only. It fails CLOSED when unwired, so nothing is written while a " +
+		"previous-release peer is listening. Its RPC (SetUserAccount) refuses on the same latch first",
 	"voter_configs": "the only writer is corrosion.WriteVoterConfig, which returns ErrVoterConfigGateClosed " +
 		"without touching the table unless Client.MayWriteVoterConfigs — the durable voter_config_v1 marker, " +
 		"wired by the daemon and failing CLOSED when unwired. voter_config_v1 is mandatory, so advertised by " +

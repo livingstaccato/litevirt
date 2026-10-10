@@ -57,6 +57,9 @@ when it next starts.`,
 					// Write user_credentials too once this node has latched
 					// credentials_split_v1, as the daemon would.
 					db.SetCredentialsSplitGate(daemon.CredentialsSplitLatchedOnDisk(cfg.DataDir))
+					// And re-enable a disabled or expired admin account once
+					// login_policy_v1 has latched, as the daemon would.
+					db.SetLoginPolicyGate(daemon.LoginPolicyLatchedOnDisk(cfg.DataDir))
 					return db, nil
 				},
 				dataDir: cfg.DataDir,

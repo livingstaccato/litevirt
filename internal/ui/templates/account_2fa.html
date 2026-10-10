@@ -9,6 +9,9 @@
     </p>
   </div>
 
+  {{if .EnrollmentRequired}}<div class="error">The login policy requires a second factor and
+    your account has none. Register a security key below, or run
+    <code>lv 2fa enroll-totp</code>, then log in again. Nothing else is available until you do.</div>{{end}}
   {{if .Error}}<div class="error">{{.Error}}</div>{{end}}
 
   <h3>Enrolled factors</h3>

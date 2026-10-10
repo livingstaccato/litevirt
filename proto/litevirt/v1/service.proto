@@ -869,12 +869,45 @@ message LoginResponse      {
     string role          = 3;
     string expires_at    = 4;  // RFC3339; hard expiry of the session
     bool   requires_2fa  = 5;  // if true, token is empty; client must re-call Login with totp_code
+    // requires_2fa_enrollment: the login policy requires a second factor for
+    // this realm and the account has none. token is an ENROLLMENT-ONLY session:
+    // it can enroll a factor for its own account (EnrollTOTP, WebAuthn
+    // registration), call Whoami and Logout, and nothing else. Enrolling ends
+    // it; log in again with the new factor.
+    bool   requires_2fa_enrollment = 6;
 }
 message ListRealmsResponse { repeated string realms = 1; }
 message CreateUserRequest  { string username = 1; string password = 2; string role = 3; }
 message ListUsersResponse  { repeated User users = 1; }
 message DeleteUserRequest  { string username = 1; }
-message WhoamiResponse     { string username = 1; string role = 2; string realm = 3; string expires_at = 4; }
+message WhoamiResponse     {
+    string username = 1; string role = 2; string realm = 3; string expires_at = 4;
+    // requires_2fa_enrollment: this is an enrollment-only session (see
+    // LoginResponse.requires_2fa_enrollment).
+    bool requires_2fa_enrollment = 5;
+}
+// SetUserAccountRequest changes an account's lifecycle. An unset field is left
+// as it is, so disabling and setting an expiry from two places cannot undo each
+// other. expires_at is RFC3339; "" clears the expiry (never expires).
+message SetUserAccountRequest {
+    string username = 1;
+    optional bool   disabled   = 2;
+    optional string expires_at = 3;
+}
+// LoginPolicy is the cluster-wide mandatory second-factor policy.
+// require_2fa is "off" (no row, the default), "all", or a comma-separated list
+// of realm names ("local,ldap:corp"). A value this build does not understand is
+// reported as stored and enforced as "all".
+message LoginPolicy {
+    string          require_2fa      = 1;
+    repeated string realms           = 2;  // the realms it covers; empty with all_realms=false = off
+    bool            all_realms       = 3;
+    string          set_by           = 4;
+    string          updated_at       = 5;
+    bool            settable         = 6;  // login_policy_v1 has latched here
+    int32           sessions_revoked = 7;  // SetLoginPolicy only: sessions ended in newly covered realms
+}
+message SetLoginPolicyRequest { string require_2fa = 1; }
 // CheckPermissionsRequest names permission gates (see grpcapi permGates), not
 // raw verbs, so the question cannot drift from the one the RPC asks.
 message CheckPermissionsRequest  { repeated string gates = 1; }
@@ -1546,6 +1579,9 @@ message EnrollTOTPResponse {
     string otpauth_url    = 1;  // for QR code rendering
     string secret_base32  = 2;  // for manual entry
     repeated string recovery_codes = 3; // shown once; user must save them
+    // session_ended: the call came from an enrollment-only session, which the
+    // enrollment ended. Log in again with the new factor.
+    bool session_ended = 4;
 }
 message DisableTwoFactorRequest { string username = 1; string method = 2; string label = 3; }
 
@@ -1702,7 +1738,8 @@ message FinishWebAuthnRegistrationRequest {
     string username        = 1;
     bytes  attestation_json = 2;
 }
-message FinishWebAuthnRegistrationResponse { string credential_label = 1; }
+// session_ended: as EnrollTOTPResponse.session_ended.
+message FinishWebAuthnRegistrationResponse { string credential_label = 1; bool session_ended = 2; }
 
 message BeginWebAuthnLoginRequest  { string username = 1; }
 message BeginWebAuthnLoginResponse { bytes options_json = 1; }
@@ -3452,6 +3489,14 @@ service LiteVirt {
     rpc CreateUser(CreateUserRequest)   returns (User);
     rpc ListUsers(google.protobuf.Empty) returns (ListUsersResponse);
     rpc DeleteUser(DeleteUserRequest)    returns (google.protobuf.Empty);
+    // SetUserAccount disables, re-enables, or sets the expiry of an account.
+    // Admin only. Refused until login_policy_v1 has latched on every host.
+    rpc SetUserAccount(SetUserAccountRequest) returns (User);
+    // GetLoginPolicy / SetLoginPolicy read and change the cluster-wide
+    // mandatory second-factor policy (`lv 2fa policy`). Set is admin only and
+    // refused until login_policy_v1 has latched on every host.
+    rpc GetLoginPolicy(google.protobuf.Empty) returns (LoginPolicy);
+    rpc SetLoginPolicy(SetLoginPolicyRequest) returns (LoginPolicy);
     rpc CreateToken(CreateTokenRequest)  returns (Token);
     rpc RevokeToken(RevokeTokenRequest)  returns (google.protobuf.Empty);
     // Whoami returns the authenticated caller's identity. Authenticated (NOT in

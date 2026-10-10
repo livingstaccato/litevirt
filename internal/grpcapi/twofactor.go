@@ -77,6 +77,7 @@ func (s *Server) EnrollTOTP(ctx context.Context, req *pb.EnrollTOTPRequest) (*pb
 		OtpauthUrl:    res.OtpAuthURL,
 		SecretBase32:  res.SecretBase32,
 		RecoveryCodes: res.RecoveryCodes,
+		SessionEnded:  s.endEnrollmentSession(ctx),
 	}, nil
 }
 

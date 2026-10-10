@@ -42,7 +42,8 @@ func (s *Server) renderAccountPage(w http.ResponseWriter, r *http.Request, extra
 	// Default false (form hidden) if we can't determine the realm — fail closed.
 	if who, err := s.grpc.Whoami(ctx, &emptypb.Empty{}); err == nil {
 		data["Realm"] = who.Realm
-		data["CanChangePassword"] = who.Realm == "local"
+		data["CanChangePassword"] = who.Realm == "local" && !who.GetRequires_2FaEnrollment()
+		data["EnrollmentRequired"] = who.GetRequires_2FaEnrollment()
 	}
 	for k, v := range extra {
 		data[k] = v

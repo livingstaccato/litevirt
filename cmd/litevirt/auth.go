@@ -7,6 +7,7 @@ import (
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
+	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 )
@@ -67,7 +68,7 @@ func newTwoFactorCmd() *cobra.Command {
 		Use:   "2fa",
 		Short: "Manage two-factor authentication",
 	}
-	cmd.AddCommand(new2FAListCmd(), new2FAEnrollCmd(), new2FADisableCmd())
+	cmd.AddCommand(new2FAListCmd(), new2FAEnrollCmd(), new2FADisableCmd(), new2FAPolicyCmd())
 	return cmd
 }
 
@@ -114,6 +115,10 @@ func new2FAEnrollCmd() *cobra.Command {
 				for _, code := range resp.RecoveryCodes {
 					fmt.Printf("  %s\n", code)
 				}
+				if resp.GetSessionEnded() {
+					fmt.Println("\nThis was an enrollment-only session and the enrollment ended it.")
+					fmt.Println("Log in again with `lv login`, using a code from the new authenticator.")
+				}
 				return nil
 			})
 		},
@@ -147,6 +152,56 @@ func new2FADisableCmd() *cobra.Command {
 	cmd.Flags().StringVar(&method, "method", "", "totp | webauthn")
 	cmd.Flags().StringVar(&label, "label", "", "Specific factor label (matches the enrolment label)")
 	return cmd
+}
+
+// new2FAPolicyCmd shows or sets the cluster-wide mandatory second-factor
+// policy. One flat subcommand: no argument shows it.
+func new2FAPolicyCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "policy [off|all|<realm>[,<realm>...]]",
+		Short: "Show or set the mandatory second-factor policy (admin to set)",
+		Long: `With no argument, show the cluster-wide second-factor policy.
+
+With one, set it (admin only):
+
+  off                 no second factor is required (the default)
+  all                 every realm requires one
+  local,ldap:corp     only the named realms require one
+
+A user in a covered realm with no factor enrolled is not locked out: login
+gives them an enrollment-only session that can enroll a factor
+(` + "`lv 2fa enroll-totp`" + `) and nothing else, and the enrollment ends it.
+Setting the policy ends every live session in a realm it newly covers,
+your own included. API tokens are not subject to it.
+
+Refused until login_policy_v1 has latched on every host.`,
+		Args: cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				var p *pb.LoginPolicy
+				var err error
+				if len(args) == 0 {
+					p, err = c.GetLoginPolicy(ctx, &emptypb.Empty{})
+				} else {
+					p, err = c.SetLoginPolicy(ctx, &pb.SetLoginPolicyRequest{Require_2Fa: args[0]})
+				}
+				if err != nil {
+					return err
+				}
+				fmt.Printf("Second factor required: %s\n", p.GetRequire_2Fa())
+				if p.GetSetBy() != "" {
+					fmt.Printf("Set by:                 %s at %s\n", p.GetSetBy(), p.GetUpdatedAt())
+				}
+				if !p.GetSettable() {
+					fmt.Println("Not settable here yet:  login_policy_v1 has not latched on every host")
+				}
+				if len(args) == 1 {
+					fmt.Printf("Sessions ended:         %d (log in again if yours was one)\n", p.GetSessionsRevoked())
+				}
+				return nil
+			})
+		},
+	}
 }
 
 // shortID truncates session IDs for table output. Full id is required to

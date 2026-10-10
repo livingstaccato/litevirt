@@ -35,6 +35,10 @@ const (
 	ctxKeyAuthMethod
 	ctxKeyMTLSCommonName
 	ctxKeyPrincipalKind
+	// ctxKeyEnrollOnly marks an enrollment-only session: the login policy
+	// requires a second factor for its realm and the account has none
+	// (login_policy.go).
+	ctxKeyEnrollOnly
 )
 
 const (
@@ -172,6 +176,9 @@ func (s *Server) UnaryAuthInterceptor(
 	if err != nil {
 		return nil, err
 	}
+	if err := gateEnrollmentOnly(ctx, info.FullMethod); err != nil {
+		return nil, err
+	}
 	if err := s.gateStaleReplica(ctx, info.FullMethod); err != nil {
 		return nil, err
 	}
@@ -205,6 +212,9 @@ func (s *Server) StreamAuthInterceptor(
 	}
 	ctx, err := s.authenticate(ss.Context())
 	if err != nil {
+		return err
+	}
+	if err := gateEnrollmentOnly(ctx, info.FullMethod); err != nil {
 		return err
 	}
 	if err := s.gateStaleReplica(ctx, info.FullMethod); err != nil {
@@ -241,6 +251,12 @@ func (s *Server) authenticate(ctx context.Context) (context.Context, error) {
 			}
 			if user == nil {
 				return nil, status.Error(codes.Unauthenticated, "invalid or expired token")
+			}
+			// A disabled or expired account's tokens stop working with it. Not
+			// subject to the second-factor policy: an API token is
+			// administrator-issued automation with no interactive holder.
+			if err := s.refuseInactiveAccount(ctx, user.Username); err != nil {
+				return nil, err
 			}
 			ctx = context.WithValue(ctx, ctxKeyUsername, user.Username)
 			ctx = context.WithValue(ctx, ctxKeyRole, user.Role)
@@ -545,8 +561,20 @@ func (s *Server) authenticateForwardedBearer(ctx context.Context, val string) (c
 			// the owner would churn the row across nodes.
 			return nil, status.Error(codes.Unavailable, "forwarded identity not yet visible on owner; retry")
 		}
+		if err := s.refuseInactiveAccount(ctx, user.Username); err != nil {
+			return nil, err
+		}
+		enrollOnly, err := s.sessionEnrollOnly(ctx, user.Username, sess.Realm)
+		if err != nil {
+			return nil, err
+		}
+		role := user.Role
+		if enrollOnly {
+			role = ""
+			ctx = context.WithValue(ctx, ctxKeyEnrollOnly, true)
+		}
 		ctx = context.WithValue(ctx, ctxKeyUsername, user.Username)
-		ctx = context.WithValue(ctx, ctxKeyRole, user.Role)
+		ctx = context.WithValue(ctx, ctxKeyRole, role)
 		ctx = context.WithValue(ctx, ctxKeyRealm, sess.Realm)
 		ctx = context.WithValue(ctx, ctxKeyAuthMethod, authMethodSession)
 		ctx = context.WithValue(ctx, ctxKeyPrincipalKind, principalKindPeer)
@@ -565,6 +593,9 @@ func (s *Server) authenticateForwardedBearer(ctx context.Context, val string) (c
 	}
 	if user == nil {
 		return nil, status.Error(codes.Unauthenticated, "forwarded identity: invalid or expired token")
+	}
+	if err := s.refuseInactiveAccount(ctx, user.Username); err != nil {
+		return nil, err
 	}
 	ctx = context.WithValue(ctx, ctxKeyUsername, user.Username)
 	ctx = context.WithValue(ctx, ctxKeyRole, user.Role)
@@ -638,9 +669,26 @@ func (s *Server) authenticateSession(ctx context.Context, sid string) (context.C
 		_ = corrosion.RevokeSession(ctx, s.db, sid)
 		return nil, status.Error(codes.Unauthenticated, "session user not found")
 	}
+	// Checked on every request rather than at disable time, so a disable or
+	// an expiry takes effect on every node as soon as its replica has it,
+	// whatever happened to the session rows.
+	if err := s.refuseInactiveAccount(ctx, user.Username); err != nil {
+		return nil, err
+	}
+	enrollOnly, err := s.sessionEnrollOnly(ctx, user.Username, sess.Realm)
+	if err != nil {
+		return nil, err
+	}
 	_ = corrosion.TouchSession(ctx, s.db, sid)
+	role := user.Role
+	if enrollOnly {
+		// No role at all: every role gate refuses it, so the few methods
+		// gateEnrollmentOnly admits cannot act on anyone but the caller.
+		role = ""
+		ctx = context.WithValue(ctx, ctxKeyEnrollOnly, true)
+	}
 	ctx = context.WithValue(ctx, ctxKeyUsername, user.Username)
-	ctx = context.WithValue(ctx, ctxKeyRole, user.Role)
+	ctx = context.WithValue(ctx, ctxKeyRole, role)
 	ctx = context.WithValue(ctx, ctxKeyRealm, sess.Realm)
 	ctx = context.WithValue(ctx, ctxKeySessionID, sid)
 	ctx = context.WithValue(ctx, ctxKeyAuthMethod, authMethodSession)

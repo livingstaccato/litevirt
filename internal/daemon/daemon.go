@@ -602,6 +602,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.wireLeaseMintClearance()
 	d.wireCredentialsSplitGate()
 	d.wireClusterPolicyGate()
+	d.wireLoginPolicyGate()
 	d.wireVoterConfigGate()
 	d.wireRecoveryClaimGate()
 
@@ -2954,6 +2955,30 @@ func (d *Daemon) wireClusterPolicyGate() {
 	d.db.SetClusterPolicyGate(func() bool {
 		return d.checker.DurablyLatched(capabilities.FailoverScopeV1)
 	})
+}
+
+// wireLoginPolicyGate lets corrosion write user_lifecycle (account disable
+// and expiry) and the second-factor policy row only once login_policy_v1 is
+// DURABLY latched: the table's statements stall a previous-release peer's
+// stream, and a previous-release node would not enforce either. Unwired, the
+// gate fails closed and `lv user disable` / `lv 2fa policy` refuse to change
+// anything.
+func (d *Daemon) wireLoginPolicyGate() {
+	d.db.SetLoginPolicyGate(func() bool {
+		return d.checker.DurablyLatched(capabilities.LoginPolicyV1)
+	})
+}
+
+// LoginPolicyLatchedOnDisk is the login_policy_v1 gate for a process that is
+// NOT the daemon — `lv user reset-admin` with the daemon down. It reads the
+// durable activation marker Checker.DurablyLatched is backed by, like
+// CredentialsSplitLatchedOnDisk.
+func LoginPolicyLatchedOnDisk(dataDir string) func() bool {
+	path := health.ActivationMarkerPath(dataDir, capabilities.LoginPolicyV1)
+	return func() bool {
+		_, err := os.Stat(path)
+		return err == nil
+	}
 }
 
 // wireLeaseMintClearance makes every new lease term wait for the quorum

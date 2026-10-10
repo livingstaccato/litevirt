@@ -13,6 +13,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
+	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/pbsstore"
 )
 
@@ -241,7 +242,7 @@ func (s *Server) autoDefineRestoredVM(
 		if renamed || mac == "" {
 			mac = lv.GenerateMAC()
 		}
-		bridge := n.Name
+		bridge := network.FlatBridgeName(n.Name)
 		if err := s.ensureBridge(bridge); err != nil {
 			return "", "", status.Errorf(codes.FailedPrecondition,
 				"network bridge %q not available on host %s: %v", bridge, s.hostName, err)

@@ -590,7 +590,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	}
 
 	for i, n := range spec.Network {
-		bridge := n.Name // default: use network name as bridge
+		bridge := network.FlatBridgeName(n.Name) // default: flat bridge named after the network
 		mac := n.Mac
 		if mac == "" {
 			mac = lv.GenerateMAC()

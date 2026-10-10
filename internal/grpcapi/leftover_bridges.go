@@ -52,12 +52,23 @@ func (s *Server) removeStackBridgeIfUnused(ctx context.Context, name string) {
 	}
 }
 
-func (s *Server) removeBridgeIfUnusedHere(name string) {
+func (s *Server) removeBridgeIfUnusedHere(netName string) {
+	// The device is the flat-bridge name for the network: the network's own
+	// name when it fits IFNAMSIZ, a stable hashed form otherwise.
+	name := network.FlatBridgeName(netName)
 	removed, err := s.networkProvisioner().RemoveUnusedBridge(name)
 	switch {
 	case err != nil:
-		slog.Warn("remove leftover stack bridge failed", "bridge", name, "error", err)
+		// The reconcile pass retries every 30s. A failure that will repeat
+		// (a name no interface can carry, unreadable addresses) is logged
+		// once per bridge and then stays quiet; a success or a later
+		// recovery re-arms it.
+		if _, seen := s.leftoverBridgeWarned.LoadOrStore(name, true); !seen {
+			slog.Warn("remove leftover stack bridge failed (not retried quietly: further failures for this bridge are not logged)",
+				"bridge", name, "network", netName, "error", err)
+		}
 	case removed:
+		s.leftoverBridgeWarned.Delete(name)
 		slog.Info("removed a leftover flat stack bridge no NIC uses", "bridge", name)
 	}
 }
@@ -120,7 +131,7 @@ func (s *Server) unusedStackFlatBridgeNames(ctx context.Context, only string) ([
 	}
 	var out []string
 	for _, name := range candidates {
-		if live[name] || taken[name] || !isStackScoped(name) {
+		if live[name] || taken[name] || taken[network.FlatBridgeName(name)] || !isStackScoped(name) {
 			continue
 		}
 		out = append(out, name)

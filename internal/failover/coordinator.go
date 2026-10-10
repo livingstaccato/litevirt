@@ -170,6 +170,27 @@ type Coordinator struct {
 	// skipAudited is the failover.skip state last audited per host and
 	// workload (auditSkip).
 	skipAudited map[string]string
+	// fencedOn records, per host in c.fenced, the fencing_log id of the fence
+	// this coordinator's recovery acted on ("" when it acted on none). A
+	// successful fence recorded since is news the cached host must not hide
+	// (fenceAuthorityChanged, lab drill S5).
+	fencedOn map[string]string
+	// lastFenceAt is, per host, when this coordinator last ran a fence of it,
+	// on its own clock; the failed-fence retry counts its backoff from it
+	// when that is later than the row (fenceRetryDue).
+	lastFenceAt map[string]time.Time
+	// holdReason is, per host, why its recovery last did not proceed; the
+	// stall alert names it (alertStalledRecoveries).
+	holdReason map[string]string
+	// stallSince and stallAlerted are the stall alert's clock and its last
+	// alert, per host (alertStalledRecoveries).
+	stallSince   map[string]time.Time
+	stallAlerted map[string]time.Time
+	// OnRecoveryStalled, when set, is invoked when a fenced or offline host's
+	// recoverable workloads are still on it recoveryStallAfter after its fence
+	// record, and again at most every recoveryStallRepeat, so the daemon can
+	// emit an operator notification. Best-effort; must not block.
+	OnRecoveryStalled func(host, coordinator, reason string, pending int, since time.Time)
 	// confirmResumed records, per host, the operator confirmation a recovery
 	// was already resumed from in this process, so one confirmation resumes one
 	// recovery rather than one per cycle. Losing it on restart costs at most one
@@ -740,10 +761,20 @@ func (c *Coordinator) run(ctx context.Context) {
 			// Or confirmed it off before anything fenced it: the cached skip
 			// of an 'offline' host would otherwise hide that for good.
 			h, err := corrosion.GetHost(ctx, c.db, target)
-			if err != nil || !c.confirmationFencesAfresh(ctx, h) {
+			if err != nil || h == nil {
 				continue
 			}
-			afresh = true
+			switch {
+			case c.confirmationFencesAfresh(ctx, h):
+				afresh = true
+			case c.fenceAuthorityChanged(ctx, h):
+				// A fence recorded since this coordinator handled the host
+				// (an operator's, another coordinator's), or its own failed
+				// fence due a retry: the cache must not hide either (lab drill
+				// S5). The ordinary path below re-reads both and decides.
+			default:
+				continue
+			}
 			delete(c.fenced, target)
 		}
 
@@ -778,6 +809,11 @@ func (c *Coordinator) run(ctx context.Context) {
 		// recorded: h carries a successful fence a successor may resume from
 		// (recordedFence), whether or not this cycle resumed it.
 		recorded := false
+		// retry: this host's newest fence attempt failed and its retry
+		// backoff has passed (fenceRetryDue); it goes down the fence path
+		// below although it is recorded 'offline'.
+		retry := false
+		retryMethod := ""
 		if !afresh && (h.State == "offline" || h.State == "maintenance" || h.State == "fenced") {
 			// A 'fenced' host is normally finished with — the fence ran and its
 			// recovery ran with it. But the two halves can land on different
@@ -795,6 +831,7 @@ func (c *Coordinator) run(ctx context.Context) {
 					slog.Info("failover: resuming recovery from a fence a previous leader recorded",
 						"host", target, "fence_id", rec.ID, "method", rec.Method)
 					c.mAttempt(PhaseRecovery, ResultOK, ErrRecoveryResumed)
+					c.noteFencedOn(target, rec.ID)
 					c.recoverFenced(ctx, h, fence.Result{Success: true, Method: rec.Method, Detail: rec.Detail}, "", c.fenceStateLatched(ctx))
 					continue
 				case resumeAfterRefence:
@@ -814,8 +851,19 @@ func (c *Coordinator) run(ctx context.Context) {
 			// A confirmation of this outage that no fence has followed: fence
 			// it now, as if it were still active (confirmationFencesAfresh).
 			afresh = c.confirmationFencesAfresh(ctx, h)
+			// A fence that FAILED does not park the host: once its backoff
+			// has passed, it is fenced again (fenceRetryDue).
+			if !afresh && !recorded {
+				var next time.Time
+				if retry, next, retryMethod = c.fenceRetryDue(ctx, h); retry {
+					slog.Warn("failover: the newest fence of this host failed; fencing it again with the same method",
+						"host", target, "method", retryMethod, "observers", cand.observers)
+				} else if !next.IsZero() {
+					c.noteHold(target, "fence failed; retrying at "+next.UTC().Format(time.RFC3339))
+				}
+			}
 		}
-		if !afresh && (h.State == "offline" || h.State == "maintenance" || h.State == "fenced") {
+		if !afresh && !retry && (h.State == "offline" || h.State == "maintenance" || h.State == "fenced") {
 			// A 'fenced' host WITHOUT that proof is not settled, it is unproven:
 			// hosts.state and fencing_log replicate independently, so the state
 			// can land here a cycle or more before the row that authorises the
@@ -901,6 +949,13 @@ func (c *Coordinator) run(ctx context.Context) {
 			"host", target, "observers", cand.observers, "quorum", c.scope.quorum(target),
 			"region_scoped", c.scope.region)
 
+		if retry {
+			// A retry repeats the method that failed (fenceRetryDue), as a
+			// re-fence repeats the recorded one.
+			again := *h
+			again.FenceStrategy = retryMethod
+			h = &again
+		}
 		c.failover(ctx, h)
 	}
 
@@ -942,13 +997,20 @@ func (c *Coordinator) run(ctx context.Context) {
 	// this reports rather than recovers. Runs after recoverHosts and
 	// resolvePendingRelocations so a host or marker settled THIS cycle is already
 	// out of the count.
-	if n, err := c.strandedWorkloads(ctx); err != nil {
+	if byHost, err := c.strandedByHost(ctx); err != nil {
 		// Leave the gauge holding its last measured value: publishing 0 here
 		// would clear an operator's alert using a number we failed to read.
 		slog.Error("failover: count stranded workloads", "error", err)
 		c.mAttempt(PhaseRecovery, ResultError, ErrDBError)
 	} else {
+		n := 0
+		for _, k := range byHost {
+			n += k
+		}
 		c.mStranded(n)
+		// Name each host whose recovery has stalled, and why
+		// (alertStalledRecoveries).
+		c.alertStalledRecoveries(ctx, byHost)
 	}
 }
 
@@ -966,6 +1028,9 @@ func (c *Coordinator) run(ctx context.Context) {
 func (c *Coordinator) stepDownGauges() {
 	c.mStranded(0)
 	c.mRegionsWithoutQuorum(0)
+	// The stall alert is the leader's too: a node that takes the lease back
+	// starts its clocks afresh rather than alerting on a stale one.
+	c.stallSince, c.stallAlerted = nil, nil
 }
 
 // resolvePendingRelocations re-derives every relocate-restore marker in the
@@ -1117,6 +1182,7 @@ func (c *Coordinator) recoverHosts(ctx context.Context, q quorumView) {
 		c.mAttempt(PhaseRecovery, ResultRecovered, errClassNone)
 		delete(c.fenced, h.Name)
 		delete(c.fenceRelocated, h.Name)
+		c.forgetHost(h.Name)
 	}
 }
 
@@ -1133,6 +1199,7 @@ func (c *Coordinator) clearRecoveredFromFenced(ctx context.Context) {
 			delete(c.fenced, host)
 			delete(c.fenceRelocated, host)
 			delete(c.pauseWaits, host)
+			c.forgetHost(host)
 		}
 	}
 }
@@ -1701,9 +1768,10 @@ func (c *Coordinator) fenceStillStands(ctx context.Context, host string, at time
 // recovery proceeds on, and binds shared-disk transfers to, the FRESH fence.
 // On failure nothing is recovered: the failed attempt is now the newest on
 // record, so recordedFence no longer offers the old fence and the host is not
-// re-fenced every cycle. The host is left for an operator — recorded
-// 'offline' by the failed fence, with `lv host fence-confirm` resuming it
-// through the confirmation path — and counted as error_class=refence_failed.
+// re-fenced every cycle, only on the failed-fence retry backoff
+// (fenceRetryDue). Until a fence succeeds the host stays recorded 'offline'
+// by the failed fence, with `lv host fence-confirm` resuming it through the
+// confirmation path, and is counted as error_class=refence_failed.
 func (c *Coordinator) refence(ctx context.Context, h *corrosion.HostRecord, rec fenceRecord, observers int) bool {
 	// A re-fence is a new judgement, unlike a resume from the record, so it is
 	// held back while this node is in its stall grace, like any fence.
@@ -1738,6 +1806,7 @@ func (c *Coordinator) noteResumeDeclined(host string, rec fenceRecord, why strin
 		return
 	}
 	c.resumeDeclined[host] = rec.ID
+	c.noteHold(host, "the recorded fence "+rec.ID+" no longer stands: "+why)
 	slog.Warn("failover: the recorded fence of this host no longer stands, NOT resuming its recovery",
 		"host", host, "fence_id", rec.ID, "method", rec.Method, "fenced_at", rec.TS, "reason", why,
 		"hint", "if the host is down, 'lv host undrain "+host+"' lets the coordinator fence it afresh for this outage")
@@ -2219,6 +2288,10 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) (fe
 	defer cancelFence()
 
 	// Step 1: Fence the host.
+	if c.lastFenceAt == nil {
+		c.lastFenceAt = map[string]time.Time{}
+	}
+	c.lastFenceAt[h.Name] = c.now()
 	fr := c.fencer(fenceCtx, fence.HostConfig{
 		Name:          h.Name,
 		Address:       h.Address,
@@ -2317,6 +2390,7 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) (fe
 	// entirely — the resuming-leader case — means "not mine to judge", which
 	// recoverHosts reads as manual-undrain-only. See recoverHosts.
 	c.fenceRelocated[h.Name] = false
+	c.noteFencedOn(h.Name, rec.ID)
 
 	// recoverFenced sees the host as this fence recorded it, so it does not
 	// write the same state a second time as a separate entry.
@@ -2514,6 +2588,7 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 				"hint", "run 'lv host fence-confirm "+h.Name+"' once the host is powered off, "+
 					"or set host label "+corrosion.LabelUnsafeAutoFailover+"=true to opt into legacy proceed-anyway")
 			c.mAttempt(PhaseSplitBrain, ResultRefused, ErrManualUnconfirmed)
+			c.noteHold(h.Name, "best-effort fence awaiting 'lv host fence-confirm "+h.Name+"' (safe-fence policy)")
 			return
 		}
 		slog.Info("failover: operator confirmed best-effort fence, proceeding", "host", h.Name)
@@ -2535,6 +2610,7 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 				"label", corrosion.LabelFenceRequiresConfirmation,
 				"hint", "run 'lv host fence-confirm "+h.Name+"' once the host is powered off; the recovery resumes from it")
 			c.mAttempt(PhaseSplitBrain, ResultRefused, ErrManualUnconfirmed)
+			c.noteHold(h.Name, "unverified "+fr.Method+" fence awaiting 'lv host fence-confirm "+h.Name+"' ("+corrosion.LabelFenceRequiresConfirmation+")")
 			return
 		}
 		slog.Info("failover: operator confirmed an unverified fence, proceeding", "host", h.Name, "method", fr.Method)
@@ -2562,6 +2638,7 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 					"host", h.Name, "detail", fr.Detail,
 					"hint", "run 'lv host fence-confirm "+h.Name+"' once the host is powered off")
 				c.mAttempt(PhaseSplitBrain, ResultRefused, ErrManualUnconfirmed)
+				c.noteHold(h.Name, "manual fence awaiting 'lv host fence-confirm "+h.Name+"'")
 				return
 			}
 			slog.Info("failover: operator confirmed manual fence, proceeding",
@@ -2571,6 +2648,7 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 			slog.Error("failover: CRITICAL — fencing failed, NOT rescheduling VMs to prevent split-brain",
 				"host", h.Name, "strategy", h.FenceStrategy, "detail", fr.Detail)
 			c.mAttempt(PhaseSplitBrain, ResultRefused, ErrFenceFailed)
+			c.noteHold(h.Name, "fence failed ("+fr.Method+": "+fr.Detail+"); retrying with backoff, or 'lv host fence-confirm "+h.Name+"' once it is off")
 			return
 		}
 	}
@@ -2579,6 +2657,7 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 	// the pause has certainly happened (docs/design/partition-pause.md §4.2);
 	// retryPauseWait finishes it from the fence loop.
 	if corrosion.ReliesOnPartitionPause(fr.Method, fr.Detail) && !c.pauseDeadlinePassed(ctx, h) {
+		c.noteHold(h.Name, "waiting out the host's partition pause")
 		return
 	}
 	delete(c.pauseWaits, h.Name)
@@ -3602,9 +3681,23 @@ func containerNeedsFailover(ct corrosion.ContainerRecord) bool {
 // value in place and reports through the error metric instead, because "0"
 // during a store outage is the all-clear on the one signal an operator alerts on.
 func (c *Coordinator) strandedWorkloads(ctx context.Context) (int, error) {
-	hosts, err := corrosion.ListHosts(ctx, c.db)
+	byHost, err := c.strandedByHost(ctx)
 	if err != nil {
 		return 0, err
+	}
+	total := 0
+	for _, n := range byHost {
+		total += n
+	}
+	return total, nil
+}
+
+// strandedByHost is strandedWorkloads per fenced or offline host; a host with
+// none is absent.
+func (c *Coordinator) strandedByHost(ctx context.Context) (map[string]int, error) {
+	hosts, err := corrosion.ListHosts(ctx, c.db)
+	if err != nil {
+		return nil, err
 	}
 	// Read ONCE per cycle, not once per down host: ListBackupSchedules has no
 	// host or vm_name predicate (a full scan), and the map it builds is keyed by
@@ -3615,7 +3708,7 @@ func (c *Coordinator) strandedWorkloads(ctx context.Context) (int, error) {
 	if c.Promoter != nil {
 		rows, serr := corrosion.ListBackupSchedules(ctx, c.db)
 		if serr != nil {
-			return 0, serr
+			return nil, serr
 		}
 		for _, r := range rows {
 			if r.Type == "replication" && r.AutoPromote {
@@ -3623,14 +3716,14 @@ func (c *Coordinator) strandedWorkloads(ctx context.Context) (int, error) {
 			}
 		}
 	}
-	total := 0
+	total := map[string]int{}
 	for _, h := range hosts {
 		if h.State != "fenced" && h.State != "offline" {
 			continue
 		}
 		vms, verr := corrosion.ListVMs(ctx, c.db, "", h.Name)
 		if verr != nil {
-			return 0, verr
+			return nil, verr
 		}
 		for _, vm := range vms {
 			if vmNeedsFailover(vm, enrolled[vm.Name]) {
@@ -3640,22 +3733,22 @@ func (c *Coordinator) strandedWorkloads(ctx context.Context) (int, error) {
 				if vm.State == "stopped" {
 					disks, derr := corrosion.GetVMDisks(ctx, c.db, vm.Name)
 					if derr != nil {
-						return 0, derr
+						return nil, derr
 					}
 					if corrosion.VMHasHostLocalDisk(disks) {
 						continue
 					}
 				}
-				total++
+				total[h.Name]++
 			}
 		}
 		cts, cerr := corrosion.ListContainers(ctx, c.db, h.Name)
 		if cerr != nil {
-			return 0, cerr
+			return nil, cerr
 		}
 		for _, ct := range cts {
 			if containerNeedsFailover(ct) {
-				total++
+				total[h.Name]++
 			}
 		}
 	}

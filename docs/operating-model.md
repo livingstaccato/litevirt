@@ -241,8 +241,25 @@ of acting — it says nothing about whether the resulting rows have replicated.
   re-fenced — see
   [Resuming a recovery from a recorded fence](migration-failover.md#resuming-a-recovery-from-a-recorded-fence).
 - **Split-brain refusal.** If a fence fails (and the strategy is not
-  `best-effort`), the coordinator refuses to reschedule the host's VMs.
-  Operator must intervene.
+  `best-effort`), the coordinator refuses to reschedule the host's VMs. It
+  does not park the host: while a quorum still sees it down, the leader fences
+  it again on a backoff — 30 s after the failed attempt, doubling per
+  consecutive failure to a 5-minute cap, read from `fencing_log` so a restart
+  or a new leader keeps the schedule — and recovers on the first success. A
+  `manual` fence is not retried; `lv host fence-confirm` resumes it.
+- **A fence recorded by anyone wakes the leader.** A successful fence of a
+  quorum-down host recorded after the leader handled it — an operator's
+  `lv host fence`, or another coordinator's — is picked up on the leader's
+  next cycle, exactly as a successor would resume from it, with no restart.
+  The host and fence state are re-read every cycle; nothing the leader cached
+  about its own earlier, failed attempt hides the newer record.
+- **Stalled recovery alert.** When a `fenced` or `offline` host's recoverable
+  workloads are still on it 60 s after its fence record, the leader logs
+  "recovery of a fenced host has stalled" and emits a `host.recovery.stalled`
+  event and notification naming the host, the coordinator and why it is not
+  proceeding (a failed fence and its next retry, a confirmation it waits for,
+  a partition pause, a fence that no longer stands). It repeats at most every
+  10 minutes per host while the condition lasts.
 - **A new VM is never published `running` before it can prove its
   generation.** Every path that creates a VM row — `CreateVM`, template
   instantiation, import, live-restore autostart and a renamed replica
@@ -645,7 +662,7 @@ Check `lv host inspect <host>` and the last `fencing_log` row before acting:
 | --- | --- |
 | Fence never confirmed — `manual` strategy awaiting confirmation, a `best-effort` fence with a writable shared disk, or a fence that failed | `lv host fence-confirm <host>`, **after** you have confirmed the power state yourself. This is a normal state for a `manual`-strategy host, and the likeliest non-zero you will see. |
 | Fenced successfully, but recovery was then refused — lost quorum, an ungated target, a superseded lease term, no placement candidate, a store error on the proof write | `lv host undrain <host>` once you have confirmed the host is dead. |
-| Marked down by hand — `lv host fence <host>` | If the fence succeeded, the failover leader treats it as it treats its own fence, and only while it still **stands**: some observer has watched the host fail without a break since **before** the fence, and nobody has seen it answer since. Then an `ssh` or `best-effort` fence is resumed from and the workloads are recovered; an `ipmi` fence is resumed from while under 5 minutes old, and otherwise renewed with a fresh power-off and then recovered. A fence that does not stand — the host was still answering when you fenced it, or every observer restarted since (a rolling upgrade restarts them all, so a host fenced before the upgrade) — is never resumed from on an `ssh` or `best-effort` fence: its workloads stay. Confirm the power state, then `lv host fence-confirm <host>`: within 5 minutes of the fence that resumes the recovery, and later the coordinator fences the host afresh for the outage. An `ipmi` fence that does not stand is renewed with a fresh power-off and recovered. If the fence failed, nothing moves: confirm the power state, then `lv host fence-confirm <host>`. A host whose fence **failed** returns to `active` on its own once quorum sees it healthy; one whose fence **succeeded** stays `offline` until `lv host undrain <host>` or its own reboot, because its workloads may have moved. For planned removal, `lv host drain <host>` first, which moves the workloads. |
+| Marked down by hand — `lv host fence <host>` | If the fence succeeded, the failover leader treats it as it treats its own fence, and only while it still **stands**: some observer has watched the host fail without a break since **before** the fence, and nobody has seen it answer since. Then an `ssh` or `best-effort` fence is resumed from and the workloads are recovered; an `ipmi` fence is resumed from while under 5 minutes old, and otherwise renewed with a fresh power-off and then recovered. A fence that does not stand — the host was still answering when you fenced it, or every observer restarted since (a rolling upgrade restarts them all, so a host fenced before the upgrade) — is never resumed from on an `ssh` or `best-effort` fence: its workloads stay. Confirm the power state, then `lv host fence-confirm <host>`: within 5 minutes of the fence that resumes the recovery, and later the coordinator fences the host afresh for the outage. An `ipmi` fence that does not stand is renewed with a fresh power-off and recovered. If the fence failed, nothing moves on it: while a quorum sees the host down the leader fences it again on its retry backoff, and otherwise confirm the power state, then `lv host fence-confirm <host>`. A host whose fence **failed** returns to `active` on its own once quorum sees it healthy; one whose fence **succeeded** stays `offline` until `lv host undrain <host>` or its own reboot, because its workloads may have moved. For planned removal, `lv host drain <host>` first, which moves the workloads. |
 | Fenced on a fence that did not verify the power-off (`ssh`, `watchdog`, `best-effort`), and its workloads were not recovered | Owner-assert keeps asking such a host whether it runs a workload, and repairs nothing while it does not answer. If it is off, `lv host fence-confirm <host>` makes that a proof. |
 
 Do **not** reach for `lv host undrain` on an unconfirmed fence. It returns the
@@ -1214,7 +1231,7 @@ The web UI at port 7445 surfaces the most critical of these on the
 | Symptom | Action |
 |---|---|
 | Host unreachable, fence-pending alert | Confirm out-of-band; if dead, `lv host fence-confirm <host>` |
-| Fence failed, VMs stuck on offline host | Inspect IPMI; if power-off confirmed externally, run fence-confirm |
+| Fence failed, VMs stuck on offline host | The leader retries the fence on a backoff and raises `host.recovery.stalled` with the reason; inspect IPMI; if power-off confirmed externally, run fence-confirm |
 | Two leaders observed via metric | Kill the older daemon; investigate clock skew |
 | HLC rejected counter rising on one peer | Check NTP on that peer; expect to fence it |
 | Replication backlog growing | Identify slow peer via watermarks; consider `lv host drain` |

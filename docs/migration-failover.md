@@ -592,7 +592,11 @@ the lease next takes the recovery over from that record. It needs:
    relies on it.
 2. **The newest fence attempt succeeded.** That covers a verified `ipmi`
    power-off and an `ssh` or `best-effort` success. A host left `offline` by a
-   failed fence has a failed newest attempt and is not resumed from. The
+   failed fence has a failed newest attempt and is not resumed from; while a
+   quorum sees it down, the leader fences it again on a backoff (30 s,
+   doubling to 5 minutes), and a later successful fence by anyone — an
+   operator's `lv host fence` included — is resumed from on the leader's next
+   cycle. The
    resumed recovery passes the same safe-fence policy and
    `litevirt.fence_requires_confirmation` check the leader's would have.
 
@@ -605,9 +609,10 @@ What happens next depends on the fence:
   whatever happened to the host in between. The recovery then proceeds on the
   fresh fence, and a shared-disk VM is bound to it. If the re-fence fails,
   nothing is recovered. The failed attempt is now the newest on record, so the
-  host is not re-fenced every cycle; it is left `offline` for an operator,
-  counted as `phase=recovery, error_class=refence_failed` and raised as the
-  `refence_failed` health condition. Confirm it is off and run
+  host is not re-fenced every cycle, only on the failed-fence retry backoff
+  (30 s, doubling to 5 minutes, with the host's current strategy); it is left
+  `offline`, counted as `phase=recovery, error_class=refence_failed` and
+  raised as the `refence_failed` health condition. Confirm it is off and run
   `lv host fence-confirm <host>`, and the recovery resumes from the
   confirmation.
 - **An unverified (`ssh`, `best-effort`) fence** is resumed from directly while

@@ -792,7 +792,7 @@ lv notify route ls
 lv notify test <target-id>
 lv notify route rm <id>
 lv notify target rm <id>
-# Events: backup.failed, host.fenced, replication.failed, quota.exceeded. See notifications.md.
+# Events: backup.failed, host.fenced, host.recovery.stalled, replication.failed, quota.exceeded. See notifications.md.
 ```
 
 ## ACME (web UI cert)

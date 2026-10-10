@@ -258,10 +258,21 @@ func TestReplicateVolume_ANotPointInTimeCopyNeedsTheFlagByName(t *testing.T) {
 // re-set is removed — red.
 func TestRunReplication_AnEarlyFailureKeepsTheRetryOwed(t *testing.T) {
 	s, _, _ := pitServer(t)
-	sched := corrosion.BackupScheduleRecord{VMName: "web", Repo: "dr", Type: "replication", TargetPool: "no-such-pool", KeepReplicas: 1}
+	// A pool the run resolves (so it gets as far as the copy) whose
+	// directory cannot exist: its parent is a regular file.
+	blocker := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(blocker, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.UpsertStoragePool(context.Background(), s.db, corrosion.StoragePoolRecord{
+		HostName: s.hostName, Name: "broken", Driver: "dir", Target: filepath.Join(blocker, "pool"), State: "active",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sched := corrosion.BackupScheduleRecord{VMName: "web", Repo: "dr", Type: "replication", TargetPool: "broken", KeepReplicas: 1}
 	s.pitRetry.set(pitRetryKey(sched))
 	if err := s.RunReplication(context.Background(), sched, time.Now()); err == nil {
-		t.Fatal("a run into a missing pool succeeded")
+		t.Fatal("a run into a pool that cannot exist succeeded")
 	}
 	if !s.PointInTimeRetryDue(sched) {
 		t.Error("the owed retry was dropped by a run that never copied")

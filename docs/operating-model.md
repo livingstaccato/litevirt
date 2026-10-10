@@ -687,6 +687,16 @@ token has not latched yet. During an upgrade that is expected and should not
 page; persisting long after one is the signal that a host is stuck — most often
 one parked in `maintenance` on an older build.
 
+One mandatory token is a **release token** (`release_2026_11_v1` for this
+release): every new feature of the release gates on it rather than on a token
+of its own. While it is pending, those features are refused with `the cluster
+upgrade must finish first (<feature> needs <token>)`. Once it latches, each
+feature's first use is recorded cluster-wide before the feature writes
+anything, and that record is what decides whether a host rolled back below the
+token must be quarantined — see
+[upgrades.md → Rolling back after a release token latched](upgrades.md#rolling-back-after-a-release-token-latched)
+and `lv cluster upgrade-status`.
+
 #### What this table will and will not show you
 
 `PRIMARY KEY (key, term)` makes two rows for one term unrepresentable, so **no

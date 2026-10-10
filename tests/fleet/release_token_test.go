@@ -1,0 +1,746 @@
+// Fleet scenarios for the release token and its per-feature used bit
+// (capabilities.ReleaseToken, health.Checker.WithFeature): real checkers
+// latching over real Pings, the used record travelling between independent
+// replicas and acknowledged over a real RPC, a used record for a token a node
+// does not know quarantining that node over real replication, a rolled-back
+// node held in probation until a voter majority has been asked, and an
+// upgraded node refusing replication from a peer that cannot keep a used
+// feature's data.
+package fleet
+
+import (
+	"context"
+	"errors"
+	"os"
+	"slices"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
+	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/daemon"
+	"github.com/litevirt/litevirt/internal/health"
+)
+
+// wireReleaseFeatures gives every node the daemon's release-feature wiring:
+// the cluster_policies write gate (wireClusterPolicyGate), the acknowledgement
+// RPC a first use waits on, the server's release-feature gate, and the
+// replication-source gate, all against the node's real checker. A feature
+// branch's fleet test calls it after gateAll.
+func wireReleaseFeatures(t *testing.T, c *Cluster, gates map[string]*health.Checker) {
+	t.Helper()
+	for _, n := range c.Nodes {
+		n := n
+		g := gates[n.Name]
+		n.DB.SetClusterPolicyGate(func() bool { return g.DurablyLatched(capabilities.FailoverScopeV1) })
+		g.SetReleaseUseConfirmer(n.Server.PeerHoldsReleaseFeatureUse)
+		n.Server.SetReleaseFeatureGate(g)
+		n.DB.SetReplicationSourceGate(n.Server.ReleaseSourceAllowed)
+		// The daemon's predicate: a rollback quarantine or a tripped use, never
+		// a probation (N1).
+		n.Server.SetWALQuarantined(n.DB.WALQuarantined)
+		// A peer advertising a release token this build does not know: the
+		// daemon's own wiring — a background look at its cluster_policies,
+		// never a probation (N2).
+		corrosion.WireUnknownReleaseObserver(c.ctx, g, corrosion.NewAntiEntropy(n.DB, n.PKIDir, 0))
+	}
+}
+
+func featureUsedOn(t *testing.T, n *Node, token, feature string) bool {
+	t.Helper()
+	used, err := corrosion.ReleaseFeatureUsed(context.Background(), n.DB, token, feature)
+	if err != nil {
+		t.Fatalf("ReleaseFeatureUsed on %s: %v", n.Name, err)
+	}
+	return used
+}
+
+func releaseFeatures(t *testing.T) {
+	t.Cleanup(capabilities.OverrideFeaturesForTest(map[capabilities.Feature]capabilities.FeatureInfo{
+		"widgets": {Token: capabilities.ReleaseToken, Description: "Widgets on every VM"},
+		"gadgets": {Token: capabilities.ReleaseToken, Description: "Gadgets on every host"},
+	}))
+}
+
+// writeFeature runs a feature write on n through the gate; the write itself
+// checks its grant, as a real writer of the feature's data does.
+func writeFeature(ctx context.Context, n *Node, f capabilities.Feature) error {
+	return n.Server.WithReleaseFeature(ctx, f, func(_ context.Context, g capabilities.FeatureGrant) error {
+		return g.Check(f)
+	})
+}
+
+func latchedFleet(t *testing.T, nodes int, seed int64) (*Cluster, map[string]*health.Checker) {
+	t.Helper()
+	ctx := context.Background()
+	c := New(t, Options{Nodes: nodes, IndependentReplicas: true, FaultSeed: seed})
+	gates := gateAll(t, c)
+	wireReleaseFeatures(t, c, gates)
+	for _, n := range c.Nodes {
+		if !gates[n.Name].Enforced(ctx, capabilities.FailoverScopeV1) {
+			t.Fatalf("%s: failover_scope_v1 did not latch", n.Name)
+		}
+	}
+	c.WaitConverged(t, convergeTimeout)
+	return c, gates
+}
+
+// TestFleet_ReleaseFeature_LatchRecordAndRollbackGuard walks the mechanism in
+// the order a cluster meets it.
+func TestFleet_ReleaseFeature_LatchRecordAndRollbackGuard(t *testing.T) {
+	releaseFeatures(t)
+	ctx := context.Background()
+	c, gates := latchedFleet(t, 3, 1126)
+	a, b, old := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+
+	// 1. A host still on the previous build (modelled as one advertising
+	// nothing, as a quarantined or older node does to this token): the
+	// release token cannot latch, the feature is refused with the
+	// operator-facing reason, and nothing is recorded anywhere.
+	old.Server.SetWALQuarantined(func() bool { return true })
+	err := writeFeature(ctx, a, "widgets")
+	if status.Code(err) != codes.FailedPrecondition ||
+		!strings.Contains(err.Error(), "the cluster upgrade must finish first (widgets needs "+capabilities.ReleaseToken+")") {
+		t.Fatalf("WithReleaseFeature with %s on the old build: %v", old.Name, err)
+	}
+	if gates[a.Name].Latched(capabilities.ReleaseToken) {
+		t.Fatalf("the release token latched across %s", old.Name)
+	}
+
+	// 2. Every host on this build: the token latches, the first use is
+	// recorded on a, acknowledged by every recipient over the real RPC, and so
+	// already on every replica when the write runs.
+	old.Server.SetWALQuarantined(old.DB.WALQuarantined)
+	var lastErr error
+	eventually(t, 10*time.Second, "the first use to be accepted on a uniform fleet", func() bool {
+		lastErr = writeFeature(ctx, a, "widgets")
+		return lastErr == nil
+	})
+	for _, n := range c.Nodes {
+		if !featureUsedOn(t, n, capabilities.ReleaseToken, "widgets") {
+			t.Fatalf("%s does not hold the widgets record although a's write has run", n.Name)
+		}
+		if featureUsedOn(t, n, capabilities.ReleaseToken, "gadgets") {
+			t.Fatalf("%s sees gadgets used; nothing used it", n.Name)
+		}
+	}
+	if err := writeFeature(ctx, b, "widgets"); err != nil {
+		t.Fatalf("a write on %s of a feature already in use: %v", b.Name, err)
+	}
+
+	// 3. old is rolled back after the latch. The latch is monotone, so it
+	// stays; but a FIRST use re-confirms every recipient, and is refused.
+	// A feature already in use is not refused: its data is already out.
+	old.Server.SetWALQuarantined(func() bool { return true })
+	if err := writeFeature(ctx, a, "gadgets"); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("first use of gadgets with %s rolled back: %v, want FailedPrecondition", old.Name, err)
+	}
+	if featureUsedOn(t, a, capabilities.ReleaseToken, "gadgets") {
+		t.Fatal("gadgets was recorded while a recipient could not keep it")
+	}
+	if err := writeFeature(ctx, a, "widgets"); err != nil {
+		t.Fatalf("a feature already in use was refused: %v", err)
+	}
+	old.Server.SetWALQuarantined(old.DB.WALQuarantined)
+
+	// 4. A node rolled back onto this build from a LATER one sees a use
+	// recorded under a token it does not know. Modelled from the other side:
+	// a records a use of a future token; every replica that applies it is
+	// quarantined, and stops emitting replicated writes.
+	const future = "release_2099_01_v1"
+	if err := corrosion.RecordReleaseFeatureUse(ctx, a.DB, future, "sprockets", a.Name, false); err != nil {
+		t.Fatalf("record a future token's use: %v", err)
+	}
+	for _, n := range []*Node{b, old} {
+		eventually(t, convergeTimeout, n.Name+" to apply the future use", func() bool {
+			return featureUsedOn(t, n, future, "sprockets")
+		})
+		if got := n.DB.ReleaseUseQuarantine(); !slices.Equal(got, []string{future}) {
+			t.Fatalf("%s: ReleaseUseQuarantine = %v after the future use replicated, want [%s]", n.Name, got, future)
+		}
+		if err := corrosion.InsertProject(ctx, n.DB, corrosion.ProjectRecord{Name: "after-" + n.Name}); err == nil ||
+			!strings.Contains(err.Error(), "quarantine") {
+			t.Fatalf("%s accepted a replicated write after a use it cannot honour arrived: %v", n.Name, err)
+		}
+	}
+}
+
+// TestFleet_ReleaseFeature_ProbationHoldsARolledBackNode is C1. x has been
+// rolled back onto this build below a LATER release token whose marker says
+// safe_if_unused, and its own replica holds no use of it — it was away when
+// the use was recorded. Feature data then reaches it from an origin that is
+// not the recorder (cross-origin), with no record ahead of it on that stream.
+// Probation keeps x from emitting a single replicated write until it has asked
+// a voter majority, and that pull finds the use and quarantines it.
+func TestFleet_ReleaseFeature_ProbationHoldsARolledBackNode(t *testing.T) {
+	releaseFeatures(t)
+	ctx := context.Background()
+	c, _ := latchedFleet(t, 3, 1127)
+	a, b, x := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	const future = "release_2099_01_v1"
+
+	// Nothing used anywhere: one pull from a voter majority lifts probation.
+	// The pull is exempt from the replication-source gate (N2): reading
+	// cluster_policies for used records is harmless from any peer.
+	x.DB.SetReplicationSourceGate(func(context.Context, string) error { return errors.New("refused") })
+	x.DB.EnterReleaseProbation([]string{future})
+	if err := corrosion.InsertProject(ctx, x.DB, corrosion.ProjectRecord{Name: "in-probation"}); err == nil ||
+		!strings.Contains(err.Error(), "probation") {
+		t.Fatalf("%s emitted a replicated write in probation: %v", x.Name, err)
+	}
+	lifted, err := corrosion.NewAntiEntropy(x.DB, x.PKIDir, 0).VerifyReleaseProbation(ctx)
+	if err != nil || !lifted {
+		t.Fatalf("VerifyReleaseProbation with nothing used: lifted=%v err=%v", lifted, err)
+	}
+	if err := corrosion.InsertProject(ctx, x.DB, corrosion.ProjectRecord{Name: "after-probation"}); err != nil {
+		t.Fatalf("a write after probation lifted: %v", err)
+	}
+	x.DB.SetReplicationSourceGate(x.Server.ReleaseSourceAllowed)
+
+	// x restarts below the token again. a records a use of the future feature
+	// while its stream to x (and to b, so b — on this build, in this harness —
+	// is not quarantined by it before it writes) is held. Then b, which is not
+	// the recorder, writes the feature's data, and b's stream reaches x: data
+	// with no record ahead of it, the cross-origin path.
+	x.DB.EnterReleaseProbation([]string{future})
+	c.SetLinkFault(a, x, LinkFault{Block: true})
+	c.SetLinkFault(a, b, LinkFault{Block: true})
+	if err := corrosion.RecordReleaseFeatureUse(ctx, a.DB, future, "sprockets", a.Name, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertProject(ctx, b.DB, corrosion.ProjectRecord{Name: "sprocket-data"}); err != nil {
+		t.Fatal(err)
+	}
+	// b pushes its data to x, and x — in probation — applies none of it
+	// (I-R3-1): the data has no record ahead of it on this stream.
+	pushed := c.LinkStats(b, x).Applied
+	eventually(t, convergeTimeout, "b to push its data to x", func() bool {
+		return c.LinkStats(b, x).Applied > pushed
+	})
+	time.Sleep(time.Second) // a retry or two
+	if p, _ := corrosion.GetProject(ctx, x.DB, "sprocket-data"); p != nil {
+		t.Fatalf("%s applied data it has no record of while in release probation", x.Name)
+	}
+	if featureUsedOn(t, x, future, "sprockets") {
+		t.Fatal("setup: x holds the record; the cross-origin path was not exercised")
+	}
+	if err := corrosion.InsertProject(ctx, x.DB, corrosion.ProjectRecord{Name: "over-the-data"}); err == nil {
+		t.Fatalf("%s emitted a replicated write while holding data it cannot keep and no record of it", x.Name)
+	}
+
+	// The pull from a majority finds the use: quarantined for good.
+	c.ClearLinkFaults()
+	lifted, err = corrosion.NewAntiEntropy(x.DB, x.PKIDir, 0).VerifyReleaseProbation(ctx)
+	if lifted {
+		t.Fatalf("probation lifted although a use of %s is recorded (err %v)", future, err)
+	}
+	if got := x.DB.ReleaseUseQuarantine(); !slices.Equal(got, []string{future}) {
+		t.Fatalf("ReleaseUseQuarantine after the majority pull = %v, want [%s]", got, future)
+	}
+}
+
+// TestFleet_ReleaseFeature_UpgradedNodesRefuseAPeerThatCannotKeepIt is I6. A
+// host that was away for the latch and the first use comes back on a build
+// with no release token at all, so nothing on its side can stop it. Its peers
+// can: once a feature is used they back-pressure its replication instead of
+// applying writes that would rewrite the feature's data away.
+func TestFleet_ReleaseFeature_UpgradedNodesRefuseAPeerThatCannotKeepIt(t *testing.T) {
+	releaseFeatures(t)
+	ctx := context.Background()
+	c, gates := latchedFleet(t, 3, 1128)
+	a, _, old := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	var lastErr error
+	eventually(t, 10*time.Second, "the first use", func() bool {
+		lastErr = writeFeature(ctx, a, "widgets")
+		return lastErr == nil
+	})
+	// old is now on an older build: it advertises no release token. Model it
+	// by withholding its advertisement while it keeps writing.
+	old.Server.SetWALQuarantined(func() bool { return true })
+	// Past the receivers' reuse of an earlier answer about old
+	// (grpcapi releasePeerCheckTTL, 5s): the window a restart shorter than that
+	// would leave.
+	time.Sleep(6 * time.Second)
+	if err := corrosion.InsertProject(ctx, old.DB, corrosion.ProjectRecord{Name: "from-old"}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(2 * time.Second) // several push rounds
+	if p, _ := corrosion.GetProject(ctx, a.DB, "from-old"); p != nil {
+		t.Fatalf("%s applied a write from %s, which cannot keep a used feature's data", a.Name, old.Name)
+	}
+	// So far b had not latched the token, so it took old's pushes and relayed
+	// them; a refused them by their ORIGIN. Now every upgraded node latches
+	// (the HA monitor's job in production, while old still advertised it),
+	// old rolls back again, and is refused by every push path — and
+	// anti-entropy does not pull its rows either.
+	old.Server.SetWALQuarantined(old.DB.WALQuarantined)
+	for _, n := range c.Nodes[:2] {
+		n := n
+		eventually(t, 10*time.Second, n.Name+" to latch the release token", func() bool {
+			return gates[n.Name].Enforced(ctx, capabilities.ReleaseToken)
+		})
+	}
+	old.Server.SetWALQuarantined(func() bool { return true })
+	time.Sleep(6 * time.Second)
+	if err := corrosion.InsertProject(ctx, old.DB, corrosion.ProjectRecord{Name: "from-old-2"}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(2 * time.Second)
+	corrosion.NewAntiEntropy(a.DB, a.PKIDir, 0).RunOnce(ctx)
+	if p, _ := corrosion.GetProject(ctx, a.DB, "from-old-2"); p != nil {
+		t.Fatalf("%s took a row from %s by anti-entropy", a.Name, old.Name)
+	}
+
+	// Back on a build that keeps it: its writes flow again.
+	old.Server.SetWALQuarantined(old.DB.WALQuarantined)
+	eventually(t, 2*convergeTimeout, "old's writes to arrive once it advertises the token", func() bool {
+		p, _ := corrosion.GetProject(ctx, a.DB, "from-old")
+		p2, _ := corrosion.GetProject(ctx, a.DB, "from-old-2")
+		return p != nil && p2 != nil
+	})
+}
+
+// TestFleet_ReleaseFeature_ProbationIsNotQuarantine is N1. A host in release
+// probation refuses its own replicated writes, but to its peers it is an
+// ordinary member: it keeps advertising, its Ping never says wal_quarantined
+// (which is what makes a peer record a rolled_back_latch isolation), and it
+// says release_probation instead.
+func TestFleet_ReleaseFeature_ProbationIsNotQuarantine(t *testing.T) {
+	releaseFeatures(t)
+	ctx := context.Background()
+	c, _ := latchedFleet(t, 3, 1129)
+	a, x := c.Nodes[0], c.Nodes[2]
+	x.DB.EnterReleaseProbation([]string{"release_2099_01_v1"})
+	resp, err := c.SelfClient(x).Ping(ctx, &pb.PingRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.GetWalQuarantined() || !resp.GetReleaseProbation() {
+		t.Fatalf("%s Ping in probation: wal_quarantined=%v release_probation=%v, want false/true",
+			x.Name, resp.GetWalQuarantined(), resp.GetReleaseProbation())
+	}
+	caps, _, err := a.Server.PeerCapabilities(ctx, x.Name)
+	if err != nil || !slices.Contains(caps, capabilities.ReleaseToken) {
+		t.Fatalf("%s sees %s advertising %v (err %v), want it to keep advertising", a.Name, x.Name, caps, err)
+	}
+}
+
+// TestFleet_ReleaseFeature_ForwardRollRefusesNothing is N2. A feature of this
+// release is in use. The first host upgraded to the next release is a
+// NON-voter, and the hosts still on this release see it advertise a release
+// token they do not know. That token cannot have a use — it cannot latch while
+// they do not advertise it — so they look at its cluster_policies without
+// stopping anything: no probation, no refused write. Only a use actually found
+// there would quarantine them.
+func TestFleet_ReleaseFeature_ForwardRollRefusesNothing(t *testing.T) {
+	releaseFeatures(t)
+	ctx := context.Background()
+	c, gates := latchedFleet(t, 4, 1130)
+	a, b, cc, next := c.Nodes[0], c.Nodes[1], c.Nodes[2], c.Nodes[3]
+	var lastErr error
+	eventually(t, 10*time.Second, "the first use", func() bool {
+		lastErr = writeFeature(ctx, a, "widgets")
+		return lastErr == nil
+	})
+	// next becomes a non-voter (maintenance) and is "upgraded": the hosts on
+	// this release see it advertise the next release's token.
+	if err := corrosion.UpdateHostState(ctx, a.DB, next.Name, "maintenance"); err != nil {
+		t.Fatal(err)
+	}
+	c.WaitConverged(t, convergeTimeout)
+	const nextToken = "release_2099_01_v1"
+	for _, n := range []*Node{a, b, cc} {
+		n := n
+		gates[n.Name].SetPeerPinger(func(pctx context.Context, host string) ([]string, time.Time, error) {
+			caps, wall, err := n.Server.PeerCapabilities(pctx, host)
+			if host == next.Name && err == nil {
+				caps = append(caps, nextToken)
+			}
+			return caps, wall, err
+		})
+		gates[n.Name].CapabilityActive(ctx, capabilities.ReleaseToken)
+	}
+	for i, n := range []*Node{a, b, cc} {
+		if p := n.DB.ReleaseProbation(); len(p) != 0 {
+			t.Fatalf("%s entered probation %v on a forward roll", n.Name, p)
+		}
+		if err := corrosion.InsertProject(ctx, n.DB, corrosion.ProjectRecord{Name: "during-roll-" + n.Name}); err != nil {
+			t.Fatalf("%s refused a replicated write during a forward roll: %v", n.Name, err)
+		}
+		if err := writeFeature(ctx, n, "widgets"); err != nil {
+			t.Fatalf("%s refused a feature write during a forward roll (%d): %v", n.Name, i, err)
+		}
+	}
+	// The look is real, through the daemon's wiring: a use found on the
+	// advertising host quarantines the host that looked. A fresh checker on a
+	// (the token is reported once per checker) sees the advert again.
+	c.SetLinkFault(next, a, LinkFault{Block: true})
+	c.SetLinkFault(next, b, LinkFault{Block: true})
+	c.SetLinkFault(next, cc, LinkFault{Block: true})
+	if err := corrosion.RecordReleaseFeatureUse(ctx, next.DB, nextToken, "sprockets", next.Name, true); err != nil {
+		t.Fatal(err)
+	}
+	fresh := gateFor(t, c, a)
+	corrosion.WireUnknownReleaseObserver(c.ctx, fresh, corrosion.NewAntiEntropy(a.DB, a.PKIDir, 0))
+	fresh.SetPeerPinger(func(pctx context.Context, host string) ([]string, time.Time, error) {
+		caps, wall, err := a.Server.PeerCapabilities(pctx, host)
+		if host == next.Name && err == nil {
+			caps = append(caps, nextToken)
+		}
+		return caps, wall, err
+	})
+	fresh.CapabilityActive(ctx, capabilities.ReleaseToken)
+	eventually(t, convergeTimeout, a.Name+" to find the use on "+next.Name, func() bool {
+		return slices.Equal(a.DB.ReleaseUseQuarantine(), []string{nextToken})
+	})
+}
+
+// TestFleet_ReleaseFeature_SimultaneousRollbacksLift is C-R2-1. Hosts rolled
+// back together are all in probation together. Each counts the others — every
+// voter acknowledged any use, so a voter holding none was not there for one —
+// and every one of them lifts with every voter healthy: a whole-cluster
+// rollback, and two of three.
+func TestFleet_ReleaseFeature_SimultaneousRollbacksLift(t *testing.T) {
+	releaseFeatures(t)
+	ctx := context.Background()
+	c, _ := latchedFleet(t, 3, 1131)
+	const future = "release_2099_01_v1"
+	for name, rolled := range map[string][]*Node{
+		"whole cluster": c.Nodes,
+		"two of three":  c.Nodes[:2],
+	} {
+		for _, n := range rolled {
+			n.DB.EnterReleaseProbation([]string{future})
+		}
+		for _, n := range rolled {
+			lifted, err := corrosion.NewAntiEntropy(n.DB, n.PKIDir, 0).VerifyReleaseProbation(ctx)
+			if err != nil || !lifted {
+				t.Fatalf("%s: %s did not lift (lifted=%v err=%v) with every voter healthy", name, n.Name, lifted, err)
+			}
+		}
+	}
+}
+
+// TestFleet_ReleaseFeature_QuarantinedVoterDoesNotVouch: through the real pull,
+// a voter whose Ping says wal_quarantined is not counted; once it is healthy
+// again, it is. The third voter is down, so y is the one other voter x can ask.
+func TestFleet_ReleaseFeature_QuarantinedVoterDoesNotVouch(t *testing.T) {
+	releaseFeatures(t)
+	ctx := context.Background()
+	c, _ := latchedFleet(t, 3, 1132)
+	x, y := c.Nodes[0], c.Nodes[1]
+	c.Kill(c.Nodes[2])
+	x.DB.EnterReleaseProbation([]string{"release_2099_01_v1"})
+	y.Server.SetWALQuarantined(func() bool { return true })
+	if lifted, _ := corrosion.NewAntiEntropy(x.DB, x.PKIDir, 0).VerifyReleaseProbation(ctx); lifted {
+		t.Fatalf("%s lifted with %s WAL-quarantined and %s down", x.Name, y.Name, c.Nodes[2].Name)
+	}
+	y.Server.SetWALQuarantined(y.DB.WALQuarantined)
+	if lifted, err := corrosion.NewAntiEntropy(x.DB, x.PKIDir, 0).VerifyReleaseProbation(ctx); !lifted {
+		t.Fatalf("%s did not lift once %s was healthy (err %v)", x.Name, y.Name, err)
+	}
+}
+
+// TestFleet_ReleaseFeature_WholeClusterRollbackWithAHostDead is I-R4-1. A
+// three-node cluster rolls back below a release marker as a whole, and one
+// host does not come back. Every boot below the marker is a probation, and a
+// probation applies nothing, so the two survivors must lift on each other's
+// word alone — a majority of the voter set with their own seat counted — or
+// the control plane stays frozen until the dead host returns. Right after the
+// lift each runs an anti-entropy pass, so its replica catches up at once
+// rather than one interval later (m2).
+func TestFleet_ReleaseFeature_WholeClusterRollbackWithAHostDead(t *testing.T) {
+	releaseFeatures(t)
+	ctx := context.Background()
+	c, _ := latchedFleet(t, 3, 1135)
+	live, dead := c.Nodes[:2], c.Nodes[2]
+	const future = "release_2099_01_v1"
+	c.Kill(dead)
+	for _, n := range live {
+		dataDir := t.TempDir()
+		if err := os.WriteFile(health.ActivationMarkerPath(dataDir, future), []byte("1\nrollback: safe_if_unused\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if q := daemon.BootRollbackCheck(ctx, dataDir, n.DB); len(q) != 0 {
+			t.Fatalf("%s: quarantined %v with nothing used", n.Name, q)
+		}
+		if p := n.DB.ReleaseProbation(); !slices.Equal(p, []string{future}) {
+			t.Fatalf("%s: probation = %v, want [%s]", n.Name, p, future)
+		}
+		n.DB.MarkReplicaStale("test: rebooted below a release marker")
+	}
+	var wg sync.WaitGroup
+	for _, n := range live {
+		wg.Add(1)
+		go func(n *Node) {
+			defer wg.Done()
+			lctx, cancel := context.WithTimeout(ctx, convergeTimeout)
+			defer cancel()
+			daemon.RunReleaseProbation(lctx, n.DB, corrosion.NewAntiEntropy(n.DB, n.PKIDir, 0))
+		}(n)
+	}
+	wg.Wait()
+	for _, n := range live {
+		if p := n.DB.ReleaseProbation(); len(p) != 0 {
+			t.Fatalf("%s is still in probation %v with one voter of three dead: the control plane is frozen", n.Name, p)
+		}
+		if ok, why := n.DB.ReplicaCaughtUp(); !ok {
+			t.Fatalf("%s lifted but its replica has not caught up (%s): the first anti-entropy pass was spent in probation", n.Name, why)
+		}
+		if err := corrosion.InsertProject(ctx, n.DB, corrosion.ProjectRecord{Name: "after-" + n.Name}); err != nil {
+			t.Fatalf("%s: a write after the lift: %v", n.Name, err)
+		}
+	}
+}
+
+// TestFleet_ReleaseFeature_ProbationLearnsTheNewVoterSet is I-R4-2. x is away
+// while the voters change: x itself, then n2, then n1 are removed, leaving n0
+// the one voter. n1 and n2 then die, and x comes back below a release marker.
+// Its replica still says the voters are generation 1 — all four — so it would
+// need two of n0, n1 and n2, and only n0 answers. A probation applies nothing,
+// so nothing would ever tell it otherwise. The probation pull merges the voter
+// view, n0's Ping says it has adopted generation 4, and x adopts the newer
+// generations — each certificate verified — and lifts against {n0}.
+func TestFleet_ReleaseFeature_ProbationLearnsTheNewVoterSet(t *testing.T) {
+	releaseFeatures(t)
+	ctx := context.Background()
+	c, _ := latchedFleet(t, 4, 1136)
+	runGenesis(t, c)
+	n0, n1, n2, x := c.Nodes[0], c.Nodes[1], c.Nodes[2], c.Nodes[3]
+	c.Kill(x)
+	for _, step := range []struct {
+		host *Node
+		gen  int64
+	}{{x, 2}, {n2, 3}, {n1, 4}} {
+		resp, err := c.SelfClient(n0).ChangeVoterConfig(ctx, &pb.ChangeVoterConfigRequest{Op: "rm", Host: step.host.Name})
+		if err != nil || resp.GetGeneration() != step.gen {
+			t.Fatalf("rm %s: %+v %v", step.host.Name, resp, err)
+		}
+		adoptAll(t, c, step.gen, n0, n1, n2)
+	}
+	if got := voterNames(t, x); !slices.Equal(got, nodeNames(n0, n1, n2, x)) {
+		t.Fatalf("setup: %s's voter view = %v, want generation 1's four", x.Name, got)
+	}
+	c.Kill(n1)
+	c.Kill(n2)
+	x.DB.EnterReleaseProbation([]string{"release_2099_01_v1"})
+	c.SetLinkFaultBoth(x, n0, LinkFault{})
+	ae := corrosion.NewAntiEntropy(x.DB, x.PKIDir, 0)
+	ae.SetVoterAdopter(x.Server.AdoptVoterConfigs)
+	if lifted, err := ae.VerifyReleaseProbation(ctx); !lifted || err != nil {
+		t.Fatalf("%s did not lift (lifted=%v err=%v; waiting on %v; voter view %v): a stale voter set holds it",
+			x.Name, lifted, err, x.DB.ReleaseProbationWaitingOn(), voterNames(t, x))
+	}
+	if got := voterNames(t, x); !slices.Equal(got, nodeNames(n0)) {
+		t.Fatalf("%s's voter view after the lift = %v, want [%s]", x.Name, got, n0.Name)
+	}
+}
+
+// TestFleet_ReleaseFeature_RestartedHostIsNotRefused is I-R2-2. A feature is in
+// use and a healthy host restarts: before its server wires the live advert, its
+// replicator already declares this build's release tokens, so its first pushes
+// are accepted and no peer raises release_feature_peer_refused.
+func TestFleet_ReleaseFeature_RestartedHostIsNotRefused(t *testing.T) {
+	releaseFeatures(t)
+	ctx := context.Background()
+	c, _ := latchedFleet(t, 3, 1133)
+	a, b := c.Nodes[0], c.Nodes[1]
+	var lastErr error
+	eventually(t, 10*time.Second, "the first use", func() bool {
+		lastErr = writeFeature(ctx, a, "widgets")
+		return lastErr == nil
+	})
+	// Past a's short cache of which tokens are in use (grpcapi
+	// releaseUsedCacheTTL, 5s), so a judges b with the use in view.
+	time.Sleep(6 * time.Second)
+	// b "restarted": its replicator is running and the server has not wired it.
+	b.repl.SetAdvertisedCapabilities(nil)
+	if err := corrosion.InsertProject(ctx, b.DB, corrosion.ProjectRecord{Name: "after-restart"}); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, convergeTimeout, "b's first write to reach a", func() bool {
+		p, _ := corrosion.GetProject(ctx, a.DB, "after-restart")
+		return p != nil
+	})
+	if refused := a.Server.RefusedReleasePeers(); len(refused) != 0 {
+		t.Fatalf("%s refused %v: a healthy restarted host was taken for one that cannot keep the data", a.Name, refused)
+	}
+}
+
+// TestFleet_ReleaseFeature_RebootAfterALiftIsAProbationAgain is I-R3-1. x boots
+// below a later release token's safe_if_unused marker with nothing used: the
+// daemon's own boot check puts it in probation, and the daemon's own loop
+// lifts it. Then x goes away. a records a first use of that later release whose
+// record never reaches x — the entry a log pruned while x was unreachable no
+// longer carries — and b, which is not the recorder, writes the feature's data.
+// x boots again below the same marker. Every release token's marker holds the
+// same bytes, so nothing about it says this boot is safe: x must be in
+// probation again, must apply none of b's data while in it, and the majority
+// pull must find the use and quarantine it.
+func TestFleet_ReleaseFeature_RebootAfterALiftIsAProbationAgain(t *testing.T) {
+	releaseFeatures(t)
+	ctx := context.Background()
+	c, _ := latchedFleet(t, 3, 1134)
+	a, b, x := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	const future = "release_2099_01_v1"
+	dataDir := t.TempDir()
+	if err := os.WriteFile(health.ActivationMarkerPath(dataDir, future), []byte("1\nrollback: safe_if_unused\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// First boot: nothing is used anywhere; probation, then the lift.
+	if q := daemon.BootRollbackCheck(ctx, dataDir, x.DB); len(q) != 0 {
+		t.Fatalf("first boot: quarantined %v with nothing used", q)
+	}
+	if p := x.DB.ReleaseProbation(); !slices.Equal(p, []string{future}) {
+		t.Fatalf("first boot: probation = %v, want [%s]", p, future)
+	}
+	lctx, cancel := context.WithTimeout(ctx, convergeTimeout)
+	daemon.RunReleaseProbation(lctx, x.DB, corrosion.NewAntiEntropy(x.DB, x.PKIDir, 0))
+	cancel()
+	if p := x.DB.ReleaseProbation(); len(p) != 0 {
+		t.Fatalf("first boot: probation %v did not lift with every voter healthy", p)
+	}
+
+	// x goes away. a records a use whose record x never gets (and b neither,
+	// so b — on this build, in this harness — is not quarantined by it before
+	// it writes); b writes the feature's data.
+	c.Isolate(x)
+	c.SetLinkFault(a, b, LinkFault{Block: true})
+	if err := corrosion.RecordReleaseFeatureUse(ctx, a.DB, future, "sprockets", a.Name, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertProject(ctx, b.DB, corrosion.ProjectRecord{Name: "sprocket-data"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// x boots again below the same marker.
+	if q := daemon.BootRollbackCheck(ctx, dataDir, x.DB); len(q) != 0 {
+		t.Fatalf("second boot: quarantined %v before anything arrived", q)
+	}
+	if p := x.DB.ReleaseProbation(); !slices.Equal(p, []string{future}) {
+		t.Fatalf("second boot below the same marker after a lift: probation = %v, want [%s]", p, future)
+	}
+	// b's stream reaches x again; a's does not (its record is the pruned one).
+	c.SetLinkFault(b, x, LinkFault{})
+	pushed := c.LinkStats(b, x).Applied
+	eventually(t, convergeTimeout, "b to push its data to x", func() bool {
+		return c.LinkStats(b, x).Applied > pushed
+	})
+	time.Sleep(time.Second) // a retry or two
+	if p, _ := corrosion.GetProject(ctx, x.DB, "sprocket-data"); p != nil {
+		t.Fatalf("%s applied the data of a use it has no record of, after a reboot below the marker", x.Name)
+	}
+	if err := corrosion.InsertProject(ctx, x.DB, corrosion.ProjectRecord{Name: "after-reboot"}); err == nil {
+		t.Fatalf("%s emitted a replicated write in probation", x.Name)
+	}
+	// The majority pull finds the use: quarantined for good.
+	c.ClearLinkFaults()
+	if lifted, err := corrosion.NewAntiEntropy(x.DB, x.PKIDir, 0).VerifyReleaseProbation(ctx); lifted {
+		t.Fatalf("probation lifted although a use of %s is recorded (err %v)", future, err)
+	}
+	if got := x.DB.ReleaseUseQuarantine(); !slices.Equal(got, []string{future}) {
+		t.Fatalf("ReleaseUseQuarantine after the majority pull = %v, want [%s]", got, future)
+	}
+}
+
+// relayedEntries is relay's copy of every entry the given origins wrote, in
+// log order: what relay forwards of them.
+func relayedEntries(t *testing.T, relay *Node, origins ...string) []*pb.MutationEntry {
+	t.Helper()
+	var out []*pb.MutationEntry
+	for _, o := range origins {
+		rows, err := relay.DB.Query(context.Background(),
+			`SELECT seq, hlc, origin, stmts FROM mutation_log WHERE origin = ? ORDER BY seq`, o)
+		if err != nil {
+			t.Fatalf("read %s mutation_log for %s: %v", relay.Name, o, err)
+		}
+		for _, r := range rows {
+			out = append(out, &pb.MutationEntry{
+				Seq: r.Int64("seq"), Hlc: r.String("hlc"), Origin: r.String("origin"), Stmts: r.String("stmts"),
+			})
+		}
+	}
+	return out
+}
+
+// TestFleet_ReleaseFeature_SelfFencedOriginDoesNotStallARelay is I-R3-2. A
+// feature is in use. Origin o self-fences: its Ping advertises nothing, but it
+// is not WAL-quarantined, and it was made by a build that keeps the data. a
+// reaches o's entries only through relay r. When a re-asks o — past its trust
+// in o's last list — the empty answer is no news: a keeps o's list, refuses
+// nothing, raises no alarm, and the relay stream carrying o's entries beside
+// p's is never stalled, through the fence and after it.
+func TestFleet_ReleaseFeature_SelfFencedOriginDoesNotStallARelay(t *testing.T) {
+	releaseFeatures(t)
+	ctx := context.Background()
+	c, _ := latchedFleet(t, 4, 1135)
+	a, r, o, p := c.Nodes[0], c.Nodes[1], c.Nodes[2], c.Nodes[3]
+	var lastErr error
+	eventually(t, 10*time.Second, "the first use", func() bool {
+		lastErr = writeFeature(ctx, a, "widgets")
+		return lastErr == nil
+	})
+	for _, n := range []*Node{o, p} {
+		if err := corrosion.InsertProject(ctx, n.DB, corrosion.ProjectRecord{Name: "from-" + n.Name}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	eventually(t, convergeTimeout, "o's and p's writes to reach a and r", func() bool {
+		for _, n := range []*Node{a, r} {
+			for _, w := range []string{"from-" + o.Name, "from-" + p.Name} {
+				if pr, _ := corrosion.GetProject(ctx, n.DB, w); pr == nil {
+					return false
+				}
+			}
+		}
+		return true
+	})
+	// From here o reaches a only through r, and o self-fences.
+	c.SetLinkFault(o, a, LinkFault{Block: true})
+	o.Server.SetWatchdogFenced(func() bool { return true })
+	if caps, _, err := a.Server.PeerCapabilities(ctx, o.Name); err != nil || len(caps) != 0 {
+		t.Fatalf("setup: %s's Ping of the self-fenced %s = %v (err %v), want it advertising nothing", a.Name, o.Name, caps, err)
+	}
+	// Past a's trust in o's last list (grpcapi releasePeerPositiveTTL, 30s):
+	// the next relayed entry of o's makes a ask o again, in the background.
+	time.Sleep(31 * time.Second)
+	relay := func(when string) {
+		t.Helper()
+		entries := relayedEntries(t, r, o.Name, p.Name)
+		if _, err := c.PeerClient(r, a).PushMutations(ctx, &pb.ReplicateRequest{
+			Sender: r.Name, SenderVersion: "fleet-test", SenderSchemaVersion: int32(corrosion.CurrentSchemaVersion),
+			Entries: entries, SenderCapabilities: r.Server.DeclaredCapabilities(),
+		}); err != nil {
+			t.Fatalf("%s: relay stream %s→%s carrying %s's and %s's entries refused: %v", when, r.Name, a.Name, o.Name, p.Name, err)
+		}
+	}
+	for i := 0; i < 30; i++ { // the refresh lands somewhere in here
+		relay("while " + o.Name + " is self-fenced")
+		time.Sleep(100 * time.Millisecond)
+	}
+	if refused := a.Server.RefusedReleasePeers(); len(refused) != 0 {
+		t.Fatalf("%s refused %v: a self-fenced, upgraded origin was taken for one that cannot keep the data", a.Name, refused)
+	}
+	// o un-fences and writes; through r its write reaches a.
+	o.Server.SetWatchdogFenced(func() bool { return false })
+	if err := corrosion.InsertProject(ctx, o.DB, corrosion.ProjectRecord{Name: "after-fence"}); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, convergeTimeout, "o's write to reach r", func() bool {
+		pr, _ := corrosion.GetProject(ctx, r.DB, "after-fence")
+		return pr != nil
+	})
+	relay("after " + o.Name + " un-fenced")
+	if pr, _ := corrosion.GetProject(ctx, a.DB, "after-fence"); pr == nil {
+		t.Fatalf("%s did not apply %s's write relayed by %s after the fence", a.Name, o.Name, r.Name)
+	}
+	if refused := a.Server.RefusedReleasePeers(); len(refused) != 0 {
+		t.Fatalf("%s refused %v after the fence", a.Name, refused)
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 
@@ -240,4 +241,64 @@ func TestPrintFailoverScope_MarksRegionsThatCannotFenceTheirOwn(t *testing.T) {
 	if strings.Contains(buf.String(), "hold workloads but have fewer") {
 		t.Errorf("cluster scope printed the region-scope warning:\n%s", buf.String())
 	}
+}
+
+// TestPrintUpgradeStatus: every latched token with its rollback verdict for
+// the build below it and for a rule-aware build, and every release feature — a
+// newer release's included — with its used bit and the host that recorded it.
+func TestPrintUpgradeStatus(t *testing.T) {
+	st := &pb.UpgradeStatus{
+		HostsTotal: 3, HostsOnRelease: 2, FeaturesWaiting: 2,
+		Lagging:          []*pb.LaggingHost{{Name: "node-3", Version: "1.9.0"}},
+		ReleaseProbation: true, ProbationReason: "release probation: started below …",
+		RefusedPeers:     []string{"node-9"},
+		ReleaseToken:     "release_2026_11_v1",
+		WalQuarantined:   true,
+		QuarantineReason: "a feature of a newer release this build does not know is in use: release_2099_01_v1",
+		Tokens: []*pb.UpgradeToken{
+			{Name: "split_brain_gate_v1", Durable: true, Mandatory: true, BlocksRollback: true, BlocksRollbackRuleAware: true},
+			{Name: "release_2026_11_v1", Durable: true, Mandatory: true, RollbackRule: "safe_if_unused", BlocksRollback: true},
+		},
+		Features: []*pb.ReleaseFeatureStatus{
+			{Token: "release_2026_11_v1", Name: "widgets", Description: "Widgets on every VM", Declared: true,
+				Used: true, RecordedBy: "host-b"},
+			{Token: "release_2026_11_v1", Name: "gadgets", Description: "Gadgets on every host", Declared: true},
+			{Token: "release_2099_01_v1", Name: "sprockets", Used: true, RecordedBy: "host-c"},
+		},
+	}
+	var buf bytes.Buffer
+	printUpgradeStatus(&buf, st)
+	out := buf.String()
+	rows := map[string][]string{}
+	for _, line := range strings.Split(out, "\n") {
+		if f := strings.Fields(line); len(f) > 0 {
+			rows[f[0]+"/"+strings.Join(f[1:2], "")] = f
+		}
+	}
+	for _, want := range []string{
+		"Rollout: 2 of 3 hosts on release_2026_11_v1; 2 feature(s) waiting for the rest",
+		"  not yet: node-3 (1.9.0)",
+		"Release probation: yes — release probation: started below",
+		"Refusing replication from: node-9",
+		"Release token: release_2026_11_v1",
+		"WAL quarantine: yes — a feature of a newer release",
+		"BLOCKS ROLLBACK", "IF RULE-AWARE", "RECORDED BY",
+		"(not known to this build",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output lacks %q:\n%s", want, out)
+		}
+	}
+	check := func(key string, want ...string) {
+		t.Helper()
+		got := rows[key]
+		if len(got) < len(want) || !slices.Equal(got[:len(want)], want) {
+			t.Errorf("row %s = %v, want prefix %v\n%s", key, got, want, out)
+		}
+	}
+	check("split_brain_gate_v1/yes", "split_brain_gate_v1", "yes", "yes", "-", "yes", "yes")
+	check("release_2026_11_v1/yes", "release_2026_11_v1", "yes", "yes", "safe_if_unused", "yes", "no")
+	check("release_2026_11_v1/widgets", "release_2026_11_v1", "widgets", "yes", "host-b")
+	check("release_2026_11_v1/gadgets", "release_2026_11_v1", "gadgets", "no", "-")
+	check("release_2099_01_v1/sprockets", "release_2099_01_v1", "sprockets", "yes", "host-c")
 }

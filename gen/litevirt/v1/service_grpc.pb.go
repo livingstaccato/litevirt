@@ -312,6 +312,7 @@ const (
 	LiteVirt_ReserveHostCapacity_FullMethodName        = "/litevirt.v1.LiteVirt/ReserveHostCapacity"
 	LiteVirt_ReleaseHostCapacity_FullMethodName        = "/litevirt.v1.LiteVirt/ReleaseHostCapacity"
 	LiteVirt_ImportLeftoverStatus_FullMethodName       = "/litevirt.v1.LiteVirt/ImportLeftoverStatus"
+	LiteVirt_LUNHolders_FullMethodName                 = "/litevirt.v1.LiteVirt/LUNHolders"
 	LiteVirt_PreflightRecreateVM_FullMethodName        = "/litevirt.v1.LiteVirt/PreflightRecreateVM"
 )
 
@@ -901,6 +902,15 @@ type LiteVirtClient interface {
 	// a dead import of theirs, unchanged since. The answer comes from the
 	// answering host's record alone: it never opens a path the caller names.
 	ImportLeftoverStatus(ctx context.Context, in *ImportLeftoverStatusRequest, opts ...grpc.CallOption) (*ImportLeftoverStatusResponse, error)
+	// ── iSCSI LUN holders (peer-only) ──
+	//
+	// An iscsi pool is one LUN: every disk created on it IS that LUN. A create
+	// putting a disk on one first asks every other host which VMs hold the
+	// LUN — in its replica, and in a create of its own still in flight — so two
+	// creates on two hosts cannot both take it. A host on an older build
+	// answers Unimplemented; its committed disks still reach the asker by
+	// replication.
+	LUNHolders(ctx context.Context, in *LUNHoldersRequest, opts ...grpc.CallOption) (*LUNHoldersResponse, error)
 	// ── Re-create judgement (peer-only) ──
 	//
 	// A rebuild or a rolling recreate of a VM with an installer ISO places the
@@ -4137,6 +4147,16 @@ func (c *liteVirtClient) ImportLeftoverStatus(ctx context.Context, in *ImportLef
 	return out, nil
 }
 
+func (c *liteVirtClient) LUNHolders(ctx context.Context, in *LUNHoldersRequest, opts ...grpc.CallOption) (*LUNHoldersResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(LUNHoldersResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_LUNHolders_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) PreflightRecreateVM(ctx context.Context, in *PreflightRecreateVMRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(emptypb.Empty)
@@ -4733,6 +4753,15 @@ type LiteVirtServer interface {
 	// a dead import of theirs, unchanged since. The answer comes from the
 	// answering host's record alone: it never opens a path the caller names.
 	ImportLeftoverStatus(context.Context, *ImportLeftoverStatusRequest) (*ImportLeftoverStatusResponse, error)
+	// ── iSCSI LUN holders (peer-only) ──
+	//
+	// An iscsi pool is one LUN: every disk created on it IS that LUN. A create
+	// putting a disk on one first asks every other host which VMs hold the
+	// LUN — in its replica, and in a create of its own still in flight — so two
+	// creates on two hosts cannot both take it. A host on an older build
+	// answers Unimplemented; its committed disks still reach the asker by
+	// replication.
+	LUNHolders(context.Context, *LUNHoldersRequest) (*LUNHoldersResponse, error)
 	// ── Re-create judgement (peer-only) ──
 	//
 	// A rebuild or a rolling recreate of a VM with an installer ISO places the
@@ -5627,6 +5656,9 @@ func (UnimplementedLiteVirtServer) ReleaseHostCapacity(context.Context, *Release
 }
 func (UnimplementedLiteVirtServer) ImportLeftoverStatus(context.Context, *ImportLeftoverStatusRequest) (*ImportLeftoverStatusResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ImportLeftoverStatus not implemented")
+}
+func (UnimplementedLiteVirtServer) LUNHolders(context.Context, *LUNHoldersRequest) (*LUNHoldersResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method LUNHolders not implemented")
 }
 func (UnimplementedLiteVirtServer) PreflightRecreateVM(context.Context, *PreflightRecreateVMRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method PreflightRecreateVM not implemented")
@@ -10573,6 +10605,24 @@ func _LiteVirt_ImportLeftoverStatus_Handler(srv interface{}, ctx context.Context
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_LUNHolders_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(LUNHoldersRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).LUNHolders(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_LUNHolders_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).LUNHolders(ctx, req.(*LUNHoldersRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LiteVirt_PreflightRecreateVM_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(PreflightRecreateVMRequest)
 	if err := dec(in); err != nil {
@@ -11601,6 +11651,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ImportLeftoverStatus",
 			Handler:    _LiteVirt_ImportLeftoverStatus_Handler,
+		},
+		{
+			MethodName: "LUNHolders",
+			Handler:    _LiteVirt_LUNHolders_Handler,
 		},
 		{
 			MethodName: "PreflightRecreateVM",

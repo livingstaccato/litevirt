@@ -790,8 +790,13 @@ type DiskSpec struct {
 	// | vmpvscsi | buslogic). Set by VM import to preserve guest bootability;
 	// empty = virtio-scsi. Ignored for non-SCSI buses.
 	ControllerModel string `protobuf:"bytes,7,opt,name=controller_model,json=controllerModel,proto3" json:"controller_model,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// overwrite lets a root disk created from an image on an iscsi pool write
+	// the image over a LUN that is not blank (a partition table, filesystem or
+	// any earlier data in its first or last MiB). Without it such a LUN is
+	// refused. A LUN any VM's disk is never written, whatever this says.
+	Overwrite     bool `protobuf:"varint,8,opt,name=overwrite,proto3" json:"overwrite,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *DiskSpec) Reset() {
@@ -871,6 +876,13 @@ func (x *DiskSpec) GetControllerModel() string {
 		return x.ControllerModel
 	}
 	return ""
+}
+
+func (x *DiskSpec) GetOverwrite() bool {
+	if x != nil {
+		return x.Overwrite
+	}
+	return false
 }
 
 type NetworkAttachment struct {
@@ -5762,7 +5774,7 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\tiso_scope\x18+ \x01(\tR\bisoScope\x1a9\n" +
 	"\vLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b,\x10-R\fiso_identity\"\xb5\x01\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b,\x10-R\fiso_identity\"\xd3\x01\n" +
 	"\bDiskSpec\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x12\n" +
 	"\x04size\x18\x02 \x01(\tR\x04size\x12\x10\n" +
@@ -5770,7 +5782,8 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\x05cache\x18\x04 \x01(\tR\x05cache\x12\x14\n" +
 	"\x05image\x18\x05 \x01(\tR\x05image\x12\x18\n" +
 	"\astorage\x18\x06 \x01(\tR\astorage\x12)\n" +
-	"\x10controller_model\x18\a \x01(\tR\x0fcontrollerModel\"\xef\x01\n" +
+	"\x10controller_model\x18\a \x01(\tR\x0fcontrollerModel\x12\x1c\n" +
+	"\toverwrite\x18\b \x01(\bR\toverwrite\"\xef\x01\n" +
 	"\x11NetworkAttachment\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x14\n" +
 	"\x05model\x18\x02 \x01(\tR\x05model\x12\x0e\n" +

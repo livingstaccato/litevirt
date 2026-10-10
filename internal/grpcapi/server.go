@@ -557,6 +557,9 @@ type Server struct {
 	// instead of dialing a real peer over mTLS, so the owner→sink push path is
 	// unit-testable in-process. Production leaves it nil → real peerClient.
 	peerClientOverride func(ctx context.Context, host string) (pb.LiteVirtClient, func(), error)
+	// lunClaims holds the iscsi LUNs this host's in-flight creates are taking,
+	// until their disk rows commit (vm_lun_claim.go).
+	lunClaims lunClaimRegistry
 	// rootfsSizes caches InspectContainer's measured rootfs sizes by path for
 	// rootfsSizeTTL; rootfsSizeMu guards it and serialises the walks.
 	rootfsSizeMu sync.Mutex

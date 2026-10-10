@@ -113,11 +113,12 @@ func BuildVMSpec(instanceName, baseName string, vm *VMDef, f *File) (*pb.VMSpec,
 	for _, diskName := range diskNames {
 		disk := vm.Disks[diskName]
 		spec.Disks = append(spec.Disks, &pb.DiskSpec{
-			Name:    diskName,
-			Size:    disk.Size,
-			Bus:     disk.Bus,
-			Cache:   disk.Cache,
-			Storage: disk.Storage,
+			Name:      diskName,
+			Size:      disk.Size,
+			Bus:       disk.Bus,
+			Cache:     disk.Cache,
+			Storage:   disk.Storage,
+			Overwrite: disk.Overwrite,
 		})
 	}
 

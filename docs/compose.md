@@ -345,7 +345,13 @@ Supports `s` (seconds), `m` (minutes), `h` (hours). Defaults to 30 seconds if no
         storage: "nfs-volume"       # Reference a volume
         cluster_size: "2M"          # qcow2 cluster size (default 64K)
         refcount_bits: 16           # qcow2 refcount width (default 16)
+        overwrite: false            # iscsi root disk from an image: write it over a non-blank LUN
 ```
+
+`overwrite` matters only for a root disk built on an image in an `iscsi` pool:
+the image is written onto the LUN, and a LUN that is not blank is refused
+unless the disk sets `overwrite: true` — see
+[storage.md](storage.md#iscsi-one-lun-one-disk).
 
 ## Networks
 

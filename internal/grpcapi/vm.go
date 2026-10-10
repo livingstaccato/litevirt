@@ -381,6 +381,16 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		createLease = lease
 	}
 
+	// An iscsi pool is one LUN: take each one this VM's disks would use, or
+	// refuse naming the VM that holds it, before anything is created. Held
+	// until this create returns, by when its disk rows are committed here
+	// (vm_lun_claim.go).
+	releaseLUNs, ownLUNs, err := s.claimLUNs(ctx, spec)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseLUNs()
+
 	slog.Info("creating VM", "name", spec.Name, "image", spec.Image, "cpu", spec.Cpu, "memory", spec.MemoryMib)
 
 	// (spec.Uuid was minted above, before the ISO was resolved.)
@@ -444,6 +454,9 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		var diskPath string
 		var err error
 		storageType := "local"
+		// fixedDevice: the disk is a device the create did not make (an
+		// iscsi LUN), so a failed create must not remove it.
+		fixedDevice := false
 
 		isRootDisk := d.Name == "root"
 
@@ -476,6 +489,24 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			if storageType == "" {
 				storageType = "local"
 			}
+			// A fixed-device pool (iscsi) allocated nothing: the disk is the
+			// LUN, as it is. A root disk from an image must BE the image, so
+			// it is written onto the LUN now — never a blank LUN booting to the
+			// firmware shell. Not the LUN this VM's previous incarnation held
+			// (a rebuild/recreate whose old rows are still here): that is a
+			// disk in use, and keeps what it holds.
+			if key, _, fixed := storage.FixedDevice(volCfg); fixed && err == nil {
+				fixedDevice = true
+				if sourceImage != "" {
+					if ownLUNs[key] {
+						slog.Warn("iSCSI root disk: the LUN is this VM's own previous disk; not writing the image over it",
+							"vm", spec.Name, "lun", diskPath)
+					} else if werr := s.writeImageOntoLUN(ctx, spec.Name, d.Name, spec.Image, sourceImage, diskPath, d.Overwrite); werr != nil {
+						cleanupDisks()
+						return nil, werr
+					}
+				}
+			}
 		} else if spec.Image != "" && isRootDisk {
 			// Cloud image mode: only the root disk gets the backing image
 			diskPath, err = s.images.CreateOverlayDisk(spec.Name, d.Name, spec.Image, d.Size)
@@ -495,7 +526,9 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			}
 			return nil, status.Errorf(codes.Internal, "create disk %s: %v", d.Name, err)
 		}
-		createdDiskPaths = append(createdDiskPaths, diskPath)
+		if !fixedDevice {
+			createdDiskPaths = append(createdDiskPaths, diskPath)
+		}
 
 		diskConfigs = append(diskConfigs, lv.DiskConfig{
 			Name:  d.Name,

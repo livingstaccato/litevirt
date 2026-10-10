@@ -3903,6 +3903,16 @@ service LiteVirt {
     // answering host's record alone: it never opens a path the caller names.
     rpc ImportLeftoverStatus(ImportLeftoverStatusRequest) returns (ImportLeftoverStatusResponse);
 
+    // ── iSCSI LUN holders (peer-only) ──
+    //
+    // An iscsi pool is one LUN: every disk created on it IS that LUN. A create
+    // putting a disk on one first asks every other host which VMs hold the
+    // LUN — in its replica, and in a create of its own still in flight — so two
+    // creates on two hosts cannot both take it. A host on an older build
+    // answers Unimplemented; its committed disks still reach the asker by
+    // replication.
+    rpc LUNHolders(LUNHoldersRequest) returns (LUNHoldersResponse);
+
     // ── Re-create judgement (peer-only) ──
     //
     // A rebuild or a rolling recreate of a VM with an installer ISO places the
@@ -4599,6 +4609,28 @@ message ImportLeftoverStatusResponse {
     // The names, among those asked, that the answering host's record shows a
     // dead import of its own left there, in exactly the asked state.
     repeated string dead = 1;
+}
+
+// LUNHoldersRequest asks a host which VMs hold any of the named LUNs.
+message LUNHoldersRequest {
+    // LUN keys (storage.FixedDevice), at most 64.
+    repeated string luns = 1;
+    // The VM being created. Its own disk rows — the incarnation a rebuild or a
+    // recreate replaces — hold nothing against it. An in-flight create of the
+    // same name on the answering host still does.
+    string vm_name = 2;
+}
+message LUNHolder {
+    string lun       = 1;
+    string vm_name   = 2;
+    string disk_name = 3;
+    // The VM's host as recorded; for an in-flight create, the answering host.
+    string host_name = 4;
+    // A create on the answering host holds it and has not committed yet.
+    bool   in_flight = 5;
+}
+message LUNHoldersResponse {
+    repeated LUNHolder holders = 1;
 }
 
 // PreflightRecreateVMRequest is the spec of a VM about to be re-created on the

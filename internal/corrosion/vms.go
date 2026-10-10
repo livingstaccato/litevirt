@@ -821,6 +821,34 @@ func DisksReferencingPath(ctx context.Context, c *Client, path string) ([]DiskRe
 	return disks, nil
 }
 
+// LiveVMDisksWithPathPrefix returns the live disk rows of live VMs whose path
+// starts with prefix — the disks a block-device prefix (an iscsi pool's
+// /dev/disk/by-path/ names) can hold. A row whose VM is gone holds nothing.
+func LiveVMDisksWithPathPrefix(ctx context.Context, c *Client, prefix string) ([]DiskRecord, error) {
+	esc := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(prefix)
+	rows, err := c.Query(ctx,
+		`SELECT d.vm_name, d.disk_name, d.host_name, d.path, d.storage_type, d.storage_volume
+		 FROM vm_disks d JOIN vms v ON v.name = d.vm_name AND v.deleted_at IS NULL
+		 WHERE d.path LIKE ? ESCAPE '\' AND d.deleted_at IS NULL
+		 ORDER BY d.vm_name, d.disk_name`,
+		esc+"%")
+	if err != nil {
+		return nil, err
+	}
+	disks := make([]DiskRecord, len(rows))
+	for i, r := range rows {
+		disks[i] = DiskRecord{
+			VMName:        r.String("vm_name"),
+			DiskName:      r.String("disk_name"),
+			HostName:      r.String("host_name"),
+			Path:          r.String("path"),
+			StorageType:   r.String("storage_type"),
+			StorageVolume: r.String("storage_volume"),
+		}
+	}
+	return disks, nil
+}
+
 // DisksReferencingPathSuffix returns every non-deleted disk record whose
 // path, backing_image or backing_disk ends in "/"+rel. It finds references to
 // a file in a pool another host mounts at a different directory: the caller

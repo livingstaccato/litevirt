@@ -138,6 +138,9 @@ lv run --name <vm> --image <img> [flags]  # Create and start a VM
   --cpu-model <model>   # CPU model for --cpu-mode custom, e.g. x86-64-v3
   --memory <mib>        # Memory in MiB (default 4096)
   --disk <size>         # Root disk size (default 20G)
+  --storage <pool>      # Storage pool for the root disk (default: the host's local disks)
+  --overwrite           # iscsi pool + --image: write the image over a LUN that is not blank
+                        #   (destroys what it holds; a LUN another VM uses is never written)
   --host <name>         # Target host (auto-placed if omitted)
   --project <name>      # Tenancy project to create in (default _default); charges its quota
   --secure-boot         # UEFI Secure Boot (MS keys; q35 + UEFI). Windows 11 ready

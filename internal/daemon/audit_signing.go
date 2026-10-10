@@ -270,8 +270,13 @@ func (d *Daemon) writeAuditHoldCondition(ctx context.Context, open bool, count i
 // this host. One writer per row: each node about itself. Reports whether the row
 // was written.
 func (d *Daemon) writeSelfCondition(ctx context.Context, code string, open bool, severity string, evidence any) bool {
+	return d.writeSelfConditionAs(ctx, auditHoldEvaluator, code, open, severity, evidence)
+}
+
+// writeSelfConditionAs is writeSelfCondition for evaluator's condition code.
+func (d *Daemon) writeSelfConditionAs(ctx context.Context, evaluator, code string, open bool, severity string, evidence any) bool {
 	ts := time.Now().UTC().Format(time.RFC3339)
-	row, found, err := corrosion.GetHealthCondition(ctx, d.db, auditHoldEvaluator, code, "host", d.cfg.HostName)
+	row, found, err := corrosion.GetHealthCondition(ctx, d.db, evaluator, code, "host", d.cfg.HostName)
 	if err != nil {
 		return false
 	}
@@ -280,7 +285,7 @@ func (d *Daemon) writeSelfCondition(ctx context.Context, code string, open bool,
 	}
 	if !found || row.Lifecycle == corrosion.ConditionResolved {
 		row = corrosion.HealthCondition{
-			Evaluator: auditHoldEvaluator, Code: code,
+			Evaluator: evaluator, Code: code,
 			SubjectKind: "host", SubjectID: d.cfg.HostName, FirstSeen: ts,
 		}
 	}
@@ -305,7 +310,7 @@ func (d *Daemon) writeSelfCondition(ctx context.Context, code string, open bool,
 		row.CleanCount = 1
 	}
 	if err := corrosion.UpsertHealthCondition(ctx, d.db, row); err != nil {
-		slog.Warn("could not record an audit health condition", "code", code, "error", err)
+		slog.Warn("could not record a health condition about this host", "evaluator", evaluator, "code", code, "error", err)
 		return false
 	}
 	return true

@@ -661,6 +661,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	lxcRunner.HostAccess.Deny = append(lxcRunner.HostAccess.Deny, d.storeDenyStatic()...)
 	lxcRunner.HostAccess.DenyFunc = d.storeDenyDynamic
 	lxcRunner.HostAccess.BlockInUse = d.vmDiskBlockInUse
+	d.noteHostAccessOverlaps(ctx, lxc.HostAccessOverlaps(lxcRunner.HostAccess))
 	go refreshHookPolicies(ctx, lxcRunner)
 	lxcRunner.SubIDSpan = &lxc.IDMap{Base: d.cfg.Containers.IDMapBase, Size: int64(d.cfg.Containers.IDMapRanges) * lxc.IDMapSize}
 	d.metrics = metrics.NewServer(d.cfg.MetricsPort, d.cfg.MetricsBind, d.db, d.virt, lxcRunner, d.cfg.HostName)

@@ -33,15 +33,16 @@ func (d *Daemon) storeDenyStatic() []string {
 
 // storeDenyDynamic is what the cluster names, read at every resolve and so
 // at every start: this host's storage pools' sources and targets and every
-// registered backup repo. A read that fails denies everything ("/"): a mount
-// is never judged against a store list that could not be read.
-func (d *Daemon) storeDenyDynamic() []string {
+// registered backup repo. A read that fails is an error: a mount is never
+// judged against a store list that could not be read (the resolve refuses
+// every mount), and the periodic refresh keeps the policy it last wrote.
+func (d *Daemon) storeDenyDynamic() ([]string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	pools, err := corrosion.ListStoragePoolsForHost(ctx, d.db, d.cfg.HostName)
 	if err != nil {
-		slog.Warn("container host mounts: this host's storage pools cannot be read; refusing every mount", "err", err)
-		return []string{"/"}
+		slog.Warn("container host mounts: this host's storage pools cannot be read; no mount can be judged", "err", err)
+		return nil, fmt.Errorf("read this host's storage pools: %w", err)
 	}
 	var out []string
 	for _, p := range pools {
@@ -49,27 +50,28 @@ func (d *Daemon) storeDenyDynamic() []string {
 	}
 	repos, err := corrosion.ListBackupRepos(ctx, d.db)
 	if err != nil {
-		slog.Warn("container host mounts: backup repos cannot be read; refusing every mount", "err", err)
-		return []string{"/"}
+		slog.Warn("container host mounts: backup repos cannot be read; no mount can be judged", "err", err)
+		return nil, fmt.Errorf("read the backup repos: %w", err)
 	}
 	for _, r := range repos {
 		out = append(out, r.Path)
 	}
-	return out
+	return out, nil
 }
 
 // vmDiskBlockInUse reports a VM disk — any VM's in the cluster, so a shared
 // LUN backing a VM on another host counts — that is the block device
 // major:minor here, compared by device number (never by path, which a
-// symlink or a rename changes). A read that fails refuses.
-func (d *Daemon) vmDiskBlockInUse(major, minor uint32) string {
+// symlink or a rename changes). A read that fails is an error, which refuses
+// the device (and a refresh keeps the policy it last wrote).
+func (d *Daemon) vmDiskBlockInUse(major, minor uint32) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	disks, err := corrosion.VMDiskPaths(ctx, d.db)
 	if err != nil {
-		return fmt.Sprintf("this host's VM disks cannot be read (%v)", err)
+		return "", fmt.Errorf("this host's VM disks cannot be read: %w", err)
 	}
-	return diskWithNumber(disks, major, minor, blockNumber)
+	return diskWithNumber(disks, major, minor, blockNumber), nil
 }
 
 // blockNumber reads a block node's number; tests replace it.
@@ -105,4 +107,25 @@ func refreshHookPolicies(ctx context.Context, r interface{ RefreshHookPolicies()
 		case <-t.C:
 		}
 	}
+}
+
+// hostAccessEvaluator raises the conditions about this host's container
+// host-access config.
+const hostAccessEvaluator = "host-access"
+
+// CondHostAccessPrefixOverlap is raised by a node about itself while one of
+// its containers.bind_mount_paths prefixes shares a filesystem with a
+// protected tree (lxc.HostAccessOverlaps). Such a config loaded before
+// filesystem identity was checked, so it still loads (m-6); mount sources in
+// the protected tree are refused when they are resolved.
+const CondHostAccessPrefixOverlap = "container_mount_prefix_overlap"
+
+// noteHostAccessOverlaps warns about, and raises or resolves the condition
+// for, the prefixes lxc.HostAccessOverlaps reports.
+func (d *Daemon) noteHostAccessOverlaps(ctx context.Context, overlaps []string) {
+	for _, o := range overlaps {
+		slog.Warn("config: a container bind-mount prefix shares a filesystem with a protected tree; the daemon starts, and mount sources in that tree are refused", "overlap", o)
+	}
+	d.writeSelfConditionAs(ctx, hostAccessEvaluator, CondHostAccessPrefixOverlap, len(overlaps) > 0, corrosion.SeverityWarning,
+		map[string]any{"overlaps": overlaps})
 }

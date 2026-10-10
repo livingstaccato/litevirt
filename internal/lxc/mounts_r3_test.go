@@ -14,7 +14,7 @@ func TestResolveHostAccess_StoreUnderAPrefixRefusesOnlyItsSources(t *testing.T) 
 	root, access := hostTree(t)
 	pool := filepath.Join(root, "allowed", "pools", "x")
 	_ = os.MkdirAll(filepath.Join(pool, "d"), 0o755)
-	access.DenyFunc = func() []string { return []string{pool} }
+	access.DenyFunc = func() ([]string, error) { return []string{pool}, nil }
 	if _, _, err := ResolveHostAccess([]Mount{{HostPath: filepath.Join(root, "allowed", "data"), ContainerPath: "/m"}}, nil, access); err != nil {
 		t.Errorf("a source beside a pool under the same prefix was refused: %v", err)
 	}
@@ -29,7 +29,7 @@ func TestResolveHostAccess_StoreUnderAPrefixRefusesOnlyItsSources(t *testing.T) 
 func TestResolveHostAccess_NoStoreQueryWithoutMounts(t *testing.T) {
 	_, access := hostTree(t)
 	calls := 0
-	access.DenyFunc = func() []string { calls++; return nil }
+	access.DenyFunc = func() ([]string, error) { calls++; return nil, nil }
 	if _, _, err := ResolveHostAccess(nil, nil, access); err != nil {
 		t.Fatal(err)
 	}

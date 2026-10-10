@@ -73,7 +73,7 @@ func TestResolveHostAccess_DynamicDenyTrees(t *testing.T) {
 	root, access := hostTree(t)
 	pool := filepath.Join(root, "allowed", "pools", "a")
 	_ = os.MkdirAll(pool, 0o755)
-	access.DenyFunc = func() []string { return []string{pool} }
+	access.DenyFunc = func() ([]string, error) { return []string{pool}, nil }
 	for _, p := range []string{pool, filepath.Join(root, "allowed", "pools")} {
 		if _, _, err := ResolveHostAccess([]Mount{{HostPath: p, ContainerPath: "/m"}}, nil, access); err == nil ||
 			!strings.Contains(err.Error(), "protected tree") {
@@ -232,25 +232,25 @@ func TestLitevirtBlockUse_CoversTheFamily(t *testing.T) {
 	_ = os.WriteFile(filepath.Join(sysDevBlock, "8:64/sde1/partition"), []byte("1\n"), 0o644)
 	_ = os.WriteFile(filepath.Join(sysDevBlock, "8:64/sde1/dev"), []byte("8:65\n"), 0o644)
 	_ = os.MkdirAll(filepath.Join(sysDevBlock, "8:80"), 0o755)
-	a := HostAccess{BlockInUse: func(ma, mi uint32) string {
+	a := HostAccess{BlockInUse: func(ma, mi uint32) (string, error) {
 		if ma == 8 && mi == 64 {
-			return "the disk of VM db"
+			return "the disk of VM db", nil
 		}
-		return ""
+		return "", nil
 	}}
-	if why := litevirtBlockUse(a, 8, 65); why == "" {
+	if why, _ := litevirtBlockUse(a, 8, 65); why == "" {
 		t.Error("a partition of a VM's disk was not litevirt's")
 	}
-	a.BlockInUse = func(ma, mi uint32) string {
+	a.BlockInUse = func(ma, mi uint32) (string, error) {
 		if ma == 8 && mi == 65 {
-			return "the disk of VM db"
+			return "the disk of VM db", nil
 		}
-		return ""
+		return "", nil
 	}
-	if why := litevirtBlockUse(a, 8, 64); why == "" {
+	if why, _ := litevirtBlockUse(a, 8, 64); why == "" {
 		t.Error("the disk holding a VM's partition was not litevirt's")
 	}
-	if why := litevirtBlockUse(a, 8, 80); why != "" {
+	if why, _ := litevirtBlockUse(a, 8, 80); why != "" {
 		t.Errorf("an unrelated disk was litevirt's: %s", why)
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 )
 
 // Host bind mounts and device nodes (Proxmox mpN / devN).
@@ -75,11 +76,14 @@ type HostAccess struct {
 	// DenyFunc returns this host's stores as they are now — every storage
 	// pool's source and target, every backup repo, the image store, the
 	// restore cache — re-read at every resolve, so at every start. The daemon
-	// wires it; nil adds nothing.
-	DenyFunc func() []string
+	// wires it; nil adds nothing. An error (the list cannot be read) refuses
+	// every mount, and a refresh keeps the policy it last wrote.
+	DenyFunc func() ([]string, error)
 	// BlockInUse reports why a block device (by number) is litevirt's — a VM
-	// disk on this host, compared by device number. The daemon wires it.
-	BlockInUse func(major, minor uint32) string
+	// disk on this host, compared by device number. The daemon wires it. An
+	// error (the disks cannot be read) refuses the device, and a refresh
+	// keeps the policy it last wrote.
+	BlockInUse func(major, minor uint32) (string, error)
 }
 
 // hardDenyTrees are host trees no bind mount may come from, or be an
@@ -158,14 +162,37 @@ func resolveIfExists(p string) string {
 	return filepath.Clean(p)
 }
 
-// deniedTree reports the protected tree p touches — p inside it, or p an
-// ancestor of it, by path or by filesystem identity (the same tree mounted
-// somewhere else: deniedTreeByIdentity) — or "" when it touches none.
-func deniedTree(p string, extra []string) string {
+// transientError is a judgment that could not be made — a read or a lookup
+// failed — as opposed to a refusal: a refresh keeps the policy it last wrote
+// on one (m-2); every other caller refuses, as for any error.
+type transientError struct{ err error }
+
+func (e transientError) Error() string { return e.err.Error() }
+func (e transientError) Unwrap() error { return e.err }
+
+// transient marks err as a judgment that could not be made.
+func transient(err error) error { return transientError{err} }
+
+// isTransient reports whether err is (or wraps) a judgment that could not be
+// made.
+func isTransient(err error) bool {
+	var t transientError
+	return errors.As(err, &t)
+}
+
+// definiteLookup reports a path lookup error that is an answer — the path is
+// not there (or not a directory, or a symlink loop) — rather than a failed
+// read (ESTALE, ETIMEDOUT, EIO on a network filesystem).
+func definiteLookup(err error) bool {
+	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) || errors.Is(err, syscall.ELOOP)
+}
+
+// deniedTreeByPath reports the protected tree p touches by path — p inside
+// it, or p an ancestor of it — or "".
+func deniedTreeByPath(p string, trees []string) string {
 	if p == "/" {
 		return "/"
 	}
-	trees := append(append([]string(nil), hardDenyTrees...), extra...)
 	for _, d := range trees {
 		if d == "" || !filepath.IsAbs(d) {
 			continue
@@ -175,6 +202,18 @@ func deniedTree(p string, extra []string) string {
 				return form
 			}
 		}
+	}
+	return ""
+}
+
+// deniedTree reports the protected tree p touches — p inside it, or p an
+// ancestor of it, by path or by filesystem identity (the same tree mounted
+// somewhere else: deniedTreeByIdentity) — or "" when it touches none. An
+// error is a check that could not be made (transient).
+func deniedTree(p string, extra []string) (string, error) {
+	trees := append(append([]string(nil), hardDenyTrees...), extra...)
+	if d := deniedTreeByPath(p, trees); d != "" {
+		return d, nil
 	}
 	return deniedTreeByIdentity(p, 0, trees)
 }
@@ -269,16 +308,24 @@ func deniedDeviceNumber(kind byte, major, minor uint32) bool {
 }
 
 // ValidateHostAccess refuses an allowed-prefix list a host must not run with:
-// a mount prefix that is, lies in, or is an ancestor of a protected tree (so
-// never "/"), and a device entry that is not an exact node under /dev or is a
-// denied one. The daemon runs it on its config at load.
+// a mount prefix that is, lies in, or is an ancestor of a protected tree by
+// path (so never "/"), and a device entry that is not an exact node under
+// /dev or is a denied one. The daemon runs it on its config at load.
+//
+// A prefix that reaches a protected tree only by filesystem identity (the
+// same filesystem mounted elsewhere) is not refused here: such a config
+// loaded before identity was checked, and a config that loaded must still
+// load (m-6). HostAccessOverlaps reports it, for a warning and a health
+// condition, and every mount source is still judged by identity when it is
+// resolved, so a source inside the protected tree is refused there.
 func ValidateHostAccess(a HostAccess) error {
+	trees := append(append([]string(nil), hardDenyTrees...), a.Deny...)
 	for _, p := range a.MountPaths {
 		if !filepath.IsAbs(p) {
 			return fmt.Errorf("containers.bind_mount_paths: %q is not an absolute path", p)
 		}
 		r := resolveIfExists(p)
-		if d := deniedTree(r, a.Deny); d != "" {
+		if d := deniedTreeByPath(r, trees); d != "" {
 			return fmt.Errorf("containers.bind_mount_paths: %q (%s) is, lies in, or contains the protected tree %s", p, r, d)
 		}
 	}
@@ -297,6 +344,34 @@ func ValidateHostAccess(a HostAccess) error {
 	return nil
 }
 
+// HostAccessOverlaps lists each bind_mount_paths prefix that shares files
+// with a protected tree by filesystem identity — on the same filesystem as a
+// tree and inside it, or containing it — though not by path (m-6), and a
+// prefix whose identity could not be judged. Each entry names the prefix and
+// the tree. Mount sources beneath such a prefix that lie in the tree are
+// refused when they are resolved; the rest of the prefix keeps working.
+func HostAccessOverlaps(a HostAccess) []string {
+	trees := append(append([]string(nil), hardDenyTrees...), a.Deny...)
+	var out []string
+	for _, p := range a.MountPaths {
+		if !filepath.IsAbs(p) {
+			continue
+		}
+		r := resolveIfExists(p)
+		if deniedTreeByPath(r, trees) != "" {
+			continue
+		}
+		d, err := deniedTreeByIdentity(r, 0, trees)
+		switch {
+		case err != nil:
+			out = append(out, fmt.Sprintf("containers.bind_mount_paths %s (%s) could not be judged by filesystem identity: %v", p, r, err))
+		case d != "":
+			out = append(out, fmt.Sprintf("containers.bind_mount_paths %s (%s) shares a filesystem with the protected tree %s; mount sources in that tree are refused", p, r, d))
+		}
+	}
+	return out
+}
+
 // resolveMount judges one mount on this host.
 func resolveMount(m Mount, a HostAccess) (resolvedMount, error) {
 	src, err := cleanAbs("host path", m.HostPath)
@@ -309,15 +384,24 @@ func resolveMount(m Mount, a HostAccess) (resolvedMount, error) {
 	}
 	resolved, err := filepath.EvalSymlinks(src)
 	if err != nil {
-		return resolvedMount{}, fmt.Errorf("host path %q: %w", m.HostPath, err)
+		err = fmt.Errorf("host path %q: %w", m.HostPath, err)
+		if !definiteLookup(err) {
+			err = transient(err)
+		}
+		return resolvedMount{}, err
 	}
 	if !safePathRe.MatchString(resolved) {
 		return resolvedMount{}, fmt.Errorf("host path %q resolves to %q, which holds characters a mount entry cannot carry", m.HostPath, resolved)
 	}
-	if d := deniedTree(resolved, a.Deny); d != "" {
+	d, derr := deniedTree(resolved, a.Deny)
+	if derr != nil {
+		return resolvedMount{}, fmt.Errorf("host path %q (%s): the protected trees cannot be checked: %w", m.HostPath, resolved, derr)
+	}
+	if d != "" {
 		return resolvedMount{}, fmt.Errorf("host path %q resolves to %q, which is, lies in or contains the protected tree %s", m.HostPath, resolved, d)
 	}
 	var prefix string
+	var prefixErr error
 	for _, p := range a.MountPaths {
 		if !filepath.IsAbs(p) {
 			continue
@@ -326,6 +410,9 @@ func resolveMount(m Mount, a HostAccess) (resolvedMount, error) {
 		// The prefix is not judged against the protected trees as a whole:
 		// a store created beneath it refuses only sources that lie in it or
 		// contain it (the source check above), never a disjoint one.
+		if perr != nil && !definiteLookup(perr) && prefixErr == nil {
+			prefixErr = fmt.Errorf("containers.bind_mount_paths %s: %w", p, perr)
+		}
 		if perr != nil || rp == "/" || !safePathRe.MatchString(rp) {
 			continue
 		}
@@ -334,6 +421,10 @@ func resolveMount(m Mount, a HostAccess) (resolvedMount, error) {
 		}
 	}
 	if prefix == "" {
+		if prefixErr != nil {
+			// A prefix that could not be read may be the one it lies under.
+			return resolvedMount{}, transient(fmt.Errorf("host path %q resolves to %q, under no prefix that could be read: %w", m.HostPath, resolved, prefixErr))
+		}
 		return resolvedMount{}, fmt.Errorf("host path %q resolves to %q, outside every containers.bind_mount_paths prefix on this host", m.HostPath, resolved)
 	}
 	rel, err := filepath.Rel(prefix, resolved)
@@ -342,7 +433,11 @@ func resolveMount(m Mount, a HostAccess) (resolvedMount, error) {
 	}
 	fi, err := os.Lstat(resolved)
 	if err != nil {
-		return resolvedMount{}, fmt.Errorf("host path %q: %w", resolved, err)
+		err = fmt.Errorf("host path %q: %w", resolved, err)
+		if !definiteLookup(err) {
+			err = transient(err)
+		}
+		return resolvedMount{}, err
 	}
 	rm := resolvedMount{Prefix: prefix, Rel: rel, Target: target, RW: m.ReadWrite}
 	switch {
@@ -541,7 +636,11 @@ func resolveDevice(d Device, a HostAccess, live bool) (resolvedDevice, error) {
 	}
 	fi, err := lstatDevice(src)
 	if err != nil {
-		return resolvedDevice{}, fmt.Errorf("device %q: %w", src, err)
+		err = fmt.Errorf("device %q: %w", src, err)
+		if !definiteLookup(err) {
+			err = transient(err)
+		}
+		return resolvedDevice{}, err
 	}
 	if fi.Mode()&fs.ModeSymlink != 0 {
 		return resolvedDevice{}, fmt.Errorf("device %q is a symlink; name the device node itself", src)
@@ -559,7 +658,11 @@ func resolveDevice(d Device, a HostAccess, live bool) (resolvedDevice, error) {
 				return resolvedDevice{}, fmt.Errorf("block device %q is the host's: %s", src, why)
 			}
 		}
-		if why := litevirtBlockUse(a, major, minor); why != "" {
+		why, err := litevirtBlockUse(a, major, minor)
+		if err != nil {
+			return resolvedDevice{}, transient(fmt.Errorf("block device %q: whether it is a VM's disk cannot be read: %w", src, err))
+		}
+		if why != "" {
 			return resolvedDevice{}, fmt.Errorf("block device %q is litevirt's: %s", src, why)
 		}
 	}
@@ -586,7 +689,12 @@ func resolveHostAccess(mounts []Mount, devices []Device, access HostAccess, live
 			return nil, nil, fmt.Errorf("host mounts and devices are judged again by litevirt's start hook, and %w", err)
 		}
 	}
-	access.Deny = effectiveDeny(access, len(mounts) > 0)
+	deny, err := effectiveDeny(access, len(mounts) > 0)
+	if err != nil {
+		// No mount is judged against a store list that could not be read.
+		return nil, nil, transient(fmt.Errorf("this host's stores (pools, backup repos) cannot be read, so no host mount can be judged: %w", err))
+	}
+	access.Deny = deny
 	var rm []resolvedMount
 	for _, m := range mounts {
 		r, err := resolveMount(m, access)
@@ -827,15 +935,19 @@ func (r *LxcRunner) syncHookPolicy(name string, rm []resolvedMount, rd []resolve
 //
 // The stores are read only when stores is set (the container has mounts):
 // a container with none never queries the database at its start.
-func effectiveDeny(a HostAccess, stores bool) []string {
+func effectiveDeny(a HostAccess, stores bool) ([]string, error) {
 	out := append([]string(nil), a.Deny...)
 	if stores && a.DenyFunc != nil {
-		out = append(out, a.DenyFunc()...)
+		d, err := a.DenyFunc()
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, d...)
 	}
 	if a.HookBinary != "" {
 		out = append(out, a.HookBinary)
 	}
-	return out
+	return out, nil
 }
 
 // validateHookBinary refuses a start-hook binary LXC must not run as root: a
@@ -1136,7 +1248,11 @@ func (p hookPolicy) judgeOpened(prefix, opened string, mntID uint64) error {
 	if err := p.judgeMount(prefix, opened); err != nil {
 		return err
 	}
-	if d := deniedTreeByIdentity(filepath.Clean(opened), mntID, append(append([]string(nil), hardDenyTrees...), p.Deny...)); d != "" {
+	d, err := deniedTreeByIdentity(filepath.Clean(opened), mntID, append(append([]string(nil), hardDenyTrees...), p.Deny...))
+	if err != nil {
+		return fmt.Errorf("%s: the protected trees cannot be checked: %w", opened, err)
+	}
+	if d != "" {
 		return fmt.Errorf("%s is, lies in or contains the protected tree %s", opened, d)
 	}
 	return nil
@@ -1177,9 +1293,17 @@ func (r *LxcRunner) RefreshHookPolicies() error {
 	return errors.Join(errs...)
 }
 
-// refreshHookPolicy rewrites one container's policy under its lock.
+// refreshHookPolicy rewrites one container's policy under its lock. A
+// container whose lock is held — a start or a grant judging it now, which
+// may wait on a device that does not answer — is skipped, so one container
+// never stalls the refresh of every other (m-5); the next run refreshes it.
 func (r *LxcRunner) refreshHookPolicy(name string) error {
-	defer r.lockHostAccess(name)()
+	unlock, ok := r.tryLockHostAccess(name)
+	if !ok {
+		slog.Debug("container: host-access policy refresh skipped; the container is being judged now", "container", name)
+		return nil
+	}
+	defer unlock()
 	auth, err := readAuthorizedHostAccess(filepath.Join(r.lxcpath(), name))
 	if err != nil {
 		// Unreadable: authorize nothing until it reads.
@@ -1189,9 +1313,16 @@ func (r *LxcRunner) refreshHookPolicy(name string) error {
 		return r.syncHookPolicy(name, nil, nil)
 	}
 	// A record that no longer resolves here yields nothing (rm, rd nil):
-	// its policy then authorizes nothing.
+	// its policy then authorizes nothing. One that could not be judged now
+	// (a read or lookup failed) keeps the policy last written (m-2): the
+	// refresh only tightens for a store or prefix that changed, the config
+	// still bounds the container, and the hook judges again at pre-start.
 	rm, rd, rerr := resolveHostAccess(auth.Mounts, auth.Devices, r.hostAccess(), false)
 	if rerr != nil {
+		if isTransient(rerr) {
+			slog.Warn("container: its host access could not be judged now; its start hook keeps the policy last written", "container", name, "error", rerr)
+			return nil
+		}
 		slog.Warn("container: its host access no longer resolves on this host; its start hook will refuse it", "container", name, "error", rerr)
 	}
 	if refreshPauseHook != nil {
@@ -1218,7 +1349,11 @@ func (r *LxcRunner) sweepHookPolicies() error {
 			continue
 		}
 		func() {
-			defer r.lockHostAccess(name)()
+			unlock, ok := r.tryLockHostAccess(name)
+			if !ok {
+				return // being judged now: the next sweep removes it if it is gone
+			}
+			defer unlock()
 			if _, err := os.Stat(filepath.Join(r.lxcpath(), name)); !errors.Is(err, fs.ErrNotExist) {
 				return
 			}
@@ -1247,6 +1382,25 @@ func (r *LxcRunner) lockHostAccess(name string) func() {
 	return l.Unlock
 }
 
+// tryLockHostAccess is lockHostAccess that does not wait: ok is false, and
+// nothing is held, when name's lock is taken.
+func (r *LxcRunner) tryLockHostAccess(name string) (func(), bool) {
+	r.hostAccessMu.Lock()
+	if r.hostAccessLocks == nil {
+		r.hostAccessLocks = map[string]*sync.Mutex{}
+	}
+	l := r.hostAccessLocks[name]
+	if l == nil {
+		l = &sync.Mutex{}
+		r.hostAccessLocks[name] = l
+	}
+	r.hostAccessMu.Unlock()
+	if !l.TryLock() {
+		return nil, false
+	}
+	return l.Unlock, true
+}
+
 // refreshPauseHook, when set (tests), runs in RefreshHookPolicies between a
 // container's resolve and its policy write.
 var refreshPauseHook func(name string)
@@ -1255,7 +1409,11 @@ var refreshPauseHook func(name string)
 func (r *LxcRunner) writeHookPolicy(name string, rm []resolvedMount, rd []resolvedDevice) error {
 	a := r.hostAccess()
 	p := hookPolicy{DevicePaths: append([]string(nil), a.DevicePaths...), Mounts: rm, Devices: rd}
-	for _, d := range effectiveDeny(a, len(rm) > 0) {
+	deny, err := effectiveDeny(a, len(rm) > 0)
+	if err != nil {
+		return fmt.Errorf("this host's stores cannot be read for the start hook's policy: %w", err)
+	}
+	for _, d := range deny {
 		if d == "" || !filepath.IsAbs(d) {
 			continue
 		}
@@ -1313,7 +1471,11 @@ func (p hookPolicy) judgeMount(prefix, src string) error {
 	if !allowed {
 		return fmt.Errorf("%s is no longer under any containers.bind_mount_paths prefix on this host", prefix)
 	}
-	if d := deniedTree(src, p.Deny); d != "" {
+	d, err := deniedTree(src, p.Deny)
+	if err != nil {
+		return fmt.Errorf("%s: the protected trees cannot be checked: %w", src, err)
+	}
+	if d != "" {
 		return fmt.Errorf("%s is, lies in or contains the protected tree %s", src, d)
 	}
 	return nil
@@ -1412,18 +1574,22 @@ func BlockDeviceNumber(p string) (major, minor uint32, ok bool) {
 // litevirtBlockUse reports why a block device, one of its partitions or the
 // disk it belongs to is litevirt's own (a.BlockInUse: a VM disk on this host),
 // or "".
-func litevirtBlockUse(a HostAccess, major, minor uint32) string {
+func litevirtBlockUse(a HostAccess, major, minor uint32) (string, error) {
 	if a.BlockInUse == nil {
-		return ""
+		return "", nil
 	}
 	for _, f := range blockFamily(major, minor) {
 		var ma, mi uint32
 		if _, err := fmt.Sscanf(f.dev, "%d:%d", &ma, &mi); err != nil {
 			continue
 		}
-		if why := a.BlockInUse(ma, mi); why != "" {
-			return f.what + why
+		why, err := a.BlockInUse(ma, mi)
+		if err != nil {
+			return "", err
+		}
+		if why != "" {
+			return f.what + why, nil
 		}
 	}
-	return ""
+	return "", nil
 }

@@ -55,7 +55,7 @@ func TestResolveHostAccess_ProtectedTreeByFilesystemIdentity(t *testing.T) {
 		"41 20 0:50 / ROOT/allowed/nas rw - nfs srv:/exp rw",
 		"43 20 0:50 / /srv/nfs rw - nfs srv:/exp rw",
 	)
-	access.DenyFunc = func() []string { return []string{"/srv/nfs/pools/x"} }
+	access.DenyFunc = func() ([]string, error) { return []string{"/srv/nfs/pools/x"}, nil }
 	for _, rel := range []string{"allowed/lv/x", "allowed/nas/pools/x/d", "allowed/nas/pools"} {
 		if _, _, err := ResolveHostAccess([]Mount{{HostPath: filepath.Join(root, rel), ContainerPath: "/m"}}, nil, access); err == nil {
 			t.Errorf("%s, a protected tree under another path, was allowed", rel)

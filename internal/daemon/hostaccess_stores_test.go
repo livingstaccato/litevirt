@@ -4,6 +4,7 @@ import (
 	"context"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -29,7 +30,11 @@ func TestStoreDeny_EveryStoreThisHostServes(t *testing.T) {
 	if err := corrosion.UpsertBackupRepo(ctx, db, corrosion.BackupRepo{Name: "stackrepo", Path: "/srv/backups/stack"}); err != nil {
 		t.Fatal(err)
 	}
-	static, dynamic := d.storeDenyStatic(), d.storeDenyDynamic()
+	static := d.storeDenyStatic()
+	dynamic, err := d.storeDenyDynamic()
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, want := range []string{"/var/lib/litevirt/images", "/var/lib/litevirt/disks", "/var/lib/litevirt/ct-restore", "/srv/backups/nightly"} {
 		if !slices.Contains(static, want) {
 			t.Errorf("static deny list %v lacks %s", static, want)
@@ -43,10 +48,12 @@ func TestStoreDeny_EveryStoreThisHostServes(t *testing.T) {
 	if slices.Contains(dynamic, "/srv/pools/other") {
 		t.Errorf("another host's pool %v is not this host's store", dynamic)
 	}
-	// A store list that cannot be read denies everything.
+	// A store list that cannot be read is an error, never a shorter list: the
+	// resolve refuses every mount on it (and a refresh keeps the policy it
+	// last wrote, m-2).
 	db.Close()
-	if got := d.storeDenyDynamic(); !slices.Equal(got, []string{"/"}) {
-		t.Errorf("a failed read denied %v; want everything (\"/\")", got)
+	if got, err := d.storeDenyDynamic(); err == nil {
+		t.Errorf("a failed read returned %v and no error", got)
 	}
 }
 
@@ -69,8 +76,8 @@ func TestVMDiskBlockInUse_ByNumber(t *testing.T) {
 	db := corrosion.NewTestClientT(t)
 	d := &Daemon{db: db, cfg: &Config{HostName: "h1"}}
 	db.Close()
-	if why := d.vmDiskBlockInUse(8, 16); why == "" {
-		t.Error("an unreadable VM disk list passed a block device")
+	if why, err := d.vmDiskBlockInUse(8, 16); err == nil {
+		t.Errorf("an unreadable VM disk list returned %q and no error", why)
 	}
 }
 
@@ -96,7 +103,7 @@ func TestVMDiskBlockInUse_ClusterWide(t *testing.T) {
 		return 0, 0, false
 	}
 	d := &Daemon{db: db, cfg: &Config{HostName: "h1"}}
-	if why := d.vmDiskBlockInUse(8, 112); why == "" {
+	if why, _ := d.vmDiskBlockInUse(8, 112); why == "" {
 		t.Error("a LUN backing a VM on another host passed as unused")
 	}
 }
@@ -122,5 +129,28 @@ func TestRefreshHookPolicies_RunsAtStart(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("the refresh loop did not stop with its context")
+	}
+}
+
+// m-6. A bind_mount_paths prefix that shares a filesystem with a protected
+// tree loads (it did before identity was checked) and is reported: a warning
+// condition about this host, naming the overlap, resolved once the config no
+// longer has one.
+func TestNoteHostAccessOverlaps_RaisesAndResolvesACondition(t *testing.T) {
+	ctx := context.Background()
+	db := corrosion.NewTestClientT(t)
+	if err := corrosion.InitSchema(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	d := &Daemon{db: db, cfg: &Config{HostName: "h1"}}
+	d.noteHostAccessOverlaps(ctx, []string{"/srv/share shares a filesystem with the protected tree /var/lib/litevirt"})
+	row, found, err := corrosion.GetHealthCondition(ctx, db, hostAccessEvaluator, CondHostAccessPrefixOverlap, "host", "h1")
+	if err != nil || !found || row.Lifecycle != corrosion.ConditionConfirmed || row.Severity != corrosion.SeverityWarning ||
+		!strings.Contains(row.Evidence, "/var/lib/litevirt") {
+		t.Fatalf("condition = %+v (found %v, %v); want a confirmed warning naming the overlap", row, found, err)
+	}
+	d.noteHostAccessOverlaps(ctx, nil)
+	if row, _, _ := corrosion.GetHealthCondition(ctx, db, hostAccessEvaluator, CondHostAccessPrefixOverlap, "host", "h1"); row.Lifecycle != corrosion.ConditionResolved {
+		t.Errorf("condition after the overlap is gone = %+v; want resolved", row)
 	}
 }

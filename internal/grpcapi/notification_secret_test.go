@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
@@ -94,13 +95,74 @@ func TestListNotificationTargets_EmailPasswordMaskedForEveryRole(t *testing.T) {
 	}
 }
 
+func latchedEmailGate() fakeServerGate {
+	return fakeServerGate{enforcedTok: map[string]bool{capabilities.EmailTargetSecretV1: true}}
+}
+
 func TestCreateNotificationTarget_EmailValidated(t *testing.T) {
 	s := testServer(t)
+	s.gate = latchedEmailGate()
 	_, err := s.CreateNotificationTarget(adminCtx(), &pb.CreateNotificationTargetRequest{Name: "m", Type: "email", Config: `{"host":"h"}`, Enabled: true})
 	if err == nil {
 		t.Fatal("invalid email config accepted")
 	}
 	if _, err := s.CreateNotificationTarget(adminCtx(), &pb.CreateNotificationTargetRequest{Name: "m", Type: "email", Config: emailSecret, Enabled: true}); err != nil {
 		t.Fatalf("valid email config rejected: %v", err)
+	}
+}
+
+// I-2: the create response must not echo the password.
+func TestCreateNotificationTarget_ResponseMasksPassword(t *testing.T) {
+	s := testServer(t)
+	s.gate = latchedEmailGate()
+	pt, err := s.CreateNotificationTarget(adminCtx(), &pb.CreateNotificationTargetRequest{Name: "m", Type: "email", Config: emailSecret, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(pt.Config, "sm7pPassw0rd") {
+		t.Errorf("create response echoed the password: %s", pt.Config)
+	}
+	// ...but the stored row still has it, or sending would break.
+	rows, _ := corrosion.ListNotificationTargets(adminCtx(), s.db)
+	if len(rows) != 1 || !strings.Contains(rows[0].Config, "sm7pPassw0rd") {
+		t.Errorf("stored config lost the password: %+v", rows)
+	}
+}
+
+// I-1: a differently-cased key is stored canonically and masked on list.
+func TestCreateNotificationTarget_MixedCasePasswordCanonicalAndMasked(t *testing.T) {
+	s := testServer(t)
+	s.gate = latchedEmailGate()
+	cfg := `{"Host":"smtp.example.com","From":"lv@example.com","To":["ops@example.com"],"Username":"u","Password":"MixedCasePw"}`
+	if _, err := s.CreateNotificationTarget(adminCtx(), &pb.CreateNotificationTargetRequest{Name: "m", Type: "email", Config: cfg, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	rows, _ := corrosion.ListNotificationTargets(adminCtx(), s.db)
+	if strings.Contains(rows[0].Config, `"Password"`) || !strings.Contains(rows[0].Config, `"password"`) {
+		t.Errorf("stored config not canonical: %s", rows[0].Config)
+	}
+	for _, role := range []string{"viewer", "operator", "admin"} {
+		resp, _ := s.ListNotificationTargets(userCtx("u", role), &pb.ListNotificationTargetsRequest{})
+		if strings.Contains(resp.Targets[0].Config, "MixedCasePw") {
+			t.Errorf("%s saw the password: %s", role, resp.Targets[0].Config)
+		}
+	}
+}
+
+// Rolling upgrade: an email target with a password is refused until the token
+// latches; one without a password is always allowed.
+func TestCreateNotificationTarget_EmailPasswordGatedOnCapability(t *testing.T) {
+	s := testServer(t) // no gate / not latched
+	_, err := s.CreateNotificationTarget(adminCtx(), &pb.CreateNotificationTargetRequest{Name: "m", Type: "email", Config: emailSecret, Enabled: true})
+	if err == nil || !strings.Contains(err.Error(), "email_target_secret_v1") || !strings.Contains(err.Error(), "upgrade") {
+		t.Fatalf("want a refusal naming the token and the upgrade, got %v", err)
+	}
+	s.gate = fakeServerGate{enforcedTok: map[string]bool{capabilities.EmailTargetSecretV1: false}}
+	if _, err := s.CreateNotificationTarget(adminCtx(), &pb.CreateNotificationTargetRequest{Name: "m", Type: "email", Config: emailSecret, Enabled: true}); err == nil {
+		t.Fatal("accepted with the token unlatched")
+	}
+	nopw := `{"host":"smtp.example.com","from":"lv@example.com","to":["ops@example.com"]}`
+	if _, err := s.CreateNotificationTarget(adminCtx(), &pb.CreateNotificationTargetRequest{Name: "m2", Type: "email", Config: nopw, Enabled: true}); err != nil {
+		t.Fatalf("passwordless email target refused: %v", err)
 	}
 }

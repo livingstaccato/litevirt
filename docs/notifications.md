@@ -42,6 +42,7 @@ A notification has a `kind` (verb.noun), `severity` (`info` | `warn` | `error`),
 | `ha.dualrun.coverage` | warn | a workload-capable host could not be fully probed this pass — unreachable (segmented/down) OR returned a partial runtime (a local libvirt/container/ip probe errored, so its workload absence is unreliable); split-brain can't be ruled out there |
 | `quota.exceeded` | warn | a CreateVM is rejected by a project quota |
 | `disk.smart.failing` | error | a disk on this host fails its SMART overall-health self-assessment (subject `host:/dev/sdX`) |
+| `disk.smart.warning` | warn | a disk passes SMART but reports a non-failure warning (NVMe temperature above its threshold: check cooling) |
 | `disk.smart.prefail` | warn | a disk still passes SMART but a prefailure attribute has tripped or the NVMe critical-warning flag is set |
 | `disk.smart.recovered` | info | a disk that was prefail/failing reports healthy again |
 | `test.notification` | info | `lv notify test` / the UI "Test" button |
@@ -143,7 +144,19 @@ username and `--smtp-tls none` is refused unless the relay is loopback. The
 SMTP password is stored in the target's config, in the same replicated,
 sensitive `notification_targets` table that holds webhook URLs; every list
 response (`lv notify target ls`, the API, the UI) masks it for every role, and
-it is never logged. To change it, delete and re-add the target. Subjects are
+it is never logged, and `CreateNotificationTarget` masks it in its own response too.
+The config is stored canonically (re-encoded from the validated struct, lowercase keys
+only) so a differently-cased `Password` key cannot dodge the masking. To change the
+password, delete and re-add the target.
+
+**Rolling upgrade.** Creating an email target *with a password* is refused until the
+mandatory, replication-gated `email_target_secret_v1` token has latched, i.e. every
+host runs a build that masks the password on read; the refusal says to finish the
+upgrade first. A passwordless email target (an open relay or IP-allowlisted relay) can
+be created at any time. Hosts still on an older build do not know the `email` type: they
+log `notify: bad target config` and send **no email** for events they handle, so email
+coverage has gaps (and a warning per event in those hosts' logs) until the rollout
+completes. Create email targets after the upgrade. Subjects are
 `[cluster] severity: kind subject`, with newlines stripped so a hostile VM name
 cannot inject headers. Each email also carries cluster, kind, severity, subject
 and detail in the body.
@@ -154,16 +167,25 @@ unknown type, logs a warning and skips it; the other targets keep working.
 ## Disk SMART alerts
 
 Every host checks its own disks with `smartctl` (from smartmontools) on
-`smart.interval` (default `1h`; `0` or `off` disables) and:
+`smart.interval` (default `1h`; `0` or `off` disables; values under `10m` are
+clamped to `10m` with a warning, since smartctl runs once per disk per pass) and:
 
 - exposes `litevirt_disk_smart_status{device,model,status}` (1 for the disk's
-  current status: `ok`, `prefail`, `failing` or `unknown`) and
+  current status: `ok`, `warning`, `prefail`, `failing` or `unknown`; the series set
+  is swapped atomically each pass) and
   `litevirt_disk_smart_available` (0 when `smartctl` is not installed) on that
   host's Prometheus endpoint;
 - notifies `disk.smart.failing` (error) or `disk.smart.prefail` (warn) when a
   disk enters or worsens into that state, and `disk.smart.recovered` (info) when
   it clears. A standing failure is paged once per daemon run, not every pass; a
   daemon restart pages it again.
+
+smartctl runs with `-n standby`, so a spun-down disk is not woken (it reports
+`unknown` for that pass and keeps its last state). Disk state is keyed by serial
+number (WWN as a fallback, device name last), so a device renamed across a reboot
+neither re-pages nor strands a standing failure; a disk that is physically removed
+simply drops out. An NVMe critical warning of only the temperature bit is
+`warning`; any other bit is `prefail`.
 
 A host without `smartctl`, a virtual disk with no SMART support, or output that
 cannot be parsed reports `unknown`: it neither pages nor clears a standing

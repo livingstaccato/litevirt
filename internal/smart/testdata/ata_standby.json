@@ -1,0 +1,2 @@
+{"json_format_version":[1,0],"smartctl":{"version":[7,4],"exit_status":2,"messages":[{"string":"Device is in STANDBY (OS) mode, exit(2)","severity":"error"}]},
+"device":{"name":"/dev/sdc","type":"sat","protocol":"ATA"},"local_time":{"time_t":1700000000}}

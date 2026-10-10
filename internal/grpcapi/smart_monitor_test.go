@@ -162,3 +162,48 @@ func TestRunSMARTMonitor_NoSmartctlDegrades(t *testing.T) {
 		t.Errorf("disk series with no smartctl: %v", got)
 	}
 }
+
+// A disk renamed across a reboot (same serial) neither re-pages nor strands.
+func TestSMARTTransitions_RenameKeepsState(t *testing.T) {
+	_, st := smartTransitions("h1", nil, []smart.Disk{{Device: "/dev/sdb", ID: "serial:X", Status: smart.Failing}})
+	ns, st := smartTransitions("h1", st, []smart.Disk{{Device: "/dev/sdc", ID: "serial:X", Status: smart.Failing}})
+	if len(ns) != 0 {
+		t.Errorf("renamed standing failure re-paged: %+v", ns)
+	}
+	ns, _ = smartTransitions("h1", st, []smart.Disk{{Device: "/dev/sdc", ID: "serial:X", Status: smart.OK}})
+	if len(ns) != 1 || ns[0].Kind != "disk.smart.recovered" {
+		t.Errorf("recovery under the new name = %+v", ns)
+	}
+}
+
+func TestSMARTTransitions_WarningKind(t *testing.T) {
+	ns, _ := smartTransitions("h1", nil, []smart.Disk{{Device: "/dev/nvme0", ID: "serial:N", Status: smart.Warning}})
+	if len(ns) != 1 || ns[0].Kind != "disk.smart.warning" || ns[0].Severity != "warn" {
+		t.Errorf("warning = %+v", ns)
+	}
+}
+
+// A scrape racing a pass must never see the series set half-built.
+func TestSMARTMetrics_SwapIsAtomic(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := metrics.NewSMARTMetricsWith(reg)
+	two := []metrics.SMARTDisk{{Device: "/dev/a", Model: "M", Status: "ok"}, {Device: "/dev/b", Model: "M", Status: "ok"}}
+	m.Set(true, two)
+	stop := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				m.Set(true, two)
+			}
+		}
+	}()
+	defer close(stop)
+	for i := 0; i < 2000; i++ {
+		if n := len(gaugeVals(t, reg, "litevirt_disk_smart_status")); n != 2 {
+			t.Fatalf("scrape %d saw %d series, want 2", i, n)
+		}
+	}
+}

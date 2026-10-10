@@ -2,7 +2,9 @@ package notify
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"mime"
@@ -143,20 +145,32 @@ func EmailSubject(n Notification) string {
 	return mime.QEncoding.Encode("utf-8", s)
 }
 
+// messageID mints a unique RFC 5322 Message-ID in the sender's domain.
+func (e *EmailTarget) messageID() string {
+	var r [12]byte
+	_, _ = rand.Read(r[:])
+	domain := "litevirt.invalid"
+	if i := strings.LastIndex(e.from.Address, "@"); i >= 0 && i+1 < len(e.from.Address) {
+		domain = e.from.Address[i+1:]
+	}
+	return "<" + hex.EncodeToString(r[:]) + "@" + domain + ">"
+}
+
 func (e *EmailTarget) message(n Notification) []byte {
 	var toList []string
 	for _, a := range e.to {
-		toList = append(toList, a.Address)
+		toList = append(toList, a.String())
 	}
 	ts := n.Timestamp
 	if ts.IsZero() {
 		ts = time.Now().UTC()
 	}
 	var b strings.Builder
-	b.WriteString("From: " + e.from.Address + "\n")
+	b.WriteString("From: " + e.from.String() + "\n")
 	b.WriteString("To: " + strings.Join(toList, ", ") + "\n")
 	b.WriteString("Subject: " + EmailSubject(n) + "\n")
 	b.WriteString("Date: " + ts.Format(time.RFC1123Z) + "\n")
+	b.WriteString("Message-ID: " + e.messageID() + "\n")
 	b.WriteString("MIME-Version: 1.0\nContent-Type: text/plain; charset=utf-8\nContent-Transfer-Encoding: 8bit\n\n")
 	fmt.Fprintf(&b, "Event:    %s\nSeverity: %s\nSubject:  %s\n", n.Kind, n.Severity, n.Subject)
 	if n.Cluster != "" {
@@ -235,10 +249,43 @@ func (e *EmailTarget) Send(ctx context.Context, n Notification) error {
 	return nil
 }
 
+// CanonicalConfig returns the config an email target is stored as: the
+// validated struct re-encoded, so only the canonical lowercase keys are ever
+// persisted. encoding/json matches field names case-insensitively, so a client
+// that sends "Password" would otherwise be accepted and stored under a key a
+// case-sensitive reader does not recognise as a secret. Other target types are
+// returned unchanged (their config is the URL, handled by role elsewhere).
+func CanonicalConfig(typ, configJSON string) (string, error) {
+	if typ != "email" {
+		return configJSON, nil
+	}
+	var c emailConfig
+	if err := json.Unmarshal([]byte(configJSON), &c); err != nil {
+		return "", fmt.Errorf("email target: bad config: %w", err)
+	}
+	b, err := json.Marshal(c)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+// HasSecret reports whether a target config carries a secret that needs the
+// masking contract (an email target with a password).
+func HasSecret(typ, configJSON string) bool {
+	if typ != "email" {
+		return false
+	}
+	var c emailConfig
+	return json.Unmarshal([]byte(configJSON), &c) == nil && c.Password != ""
+}
+
 // RedactConfig returns config with any stored secret masked, for display to a
 // caller. Only email targets carry a secret apart from the URL (which existing
-// callers already handle by role); other types are returned unchanged. A config
-// that does not parse is returned unchanged rather than guessed at.
+// callers already handle by role); other types are returned unchanged. The key
+// match is case-insensitive, as defence in depth for a config stored before
+// CanonicalConfig existed. A config that does not parse is returned unchanged
+// rather than guessed at.
 func RedactConfig(typ, configJSON string) string {
 	if typ != "email" {
 		return configJSON
@@ -247,8 +294,12 @@ func RedactConfig(typ, configJSON string) string {
 	if err := json.Unmarshal([]byte(configJSON), &m); err != nil {
 		return configJSON
 	}
-	if p, ok := m["password"].(string); ok && p != "" {
-		m["password"] = RedactedSecret
+	for k, v := range m {
+		if strings.EqualFold(k, "password") {
+			if p, ok := v.(string); ok && p != "" {
+				m[k] = RedactedSecret
+			}
+		}
 	}
 	out, err := json.Marshal(m)
 	if err != nil {

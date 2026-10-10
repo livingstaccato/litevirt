@@ -33,6 +33,7 @@ func TestCheckOneCapabilityHealth_DetectsPostLatchRegression(t *testing.T) {
 		capabilities.VoterConfigV1:         true,
 		capabilities.ClaimIncarnationV1:    true,
 		capabilities.FenceStateV1:          true,
+		capabilities.EmailTargetSecretV1:   true,
 		capabilities.LWWSkewGuardV1:        true,
 	}
 	g.enforcedTok = map[string]bool{
@@ -44,6 +45,7 @@ func TestCheckOneCapabilityHealth_DetectsPostLatchRegression(t *testing.T) {
 		capabilities.VoterConfigV1:         true,  // still active
 		capabilities.ClaimIncarnationV1:    true,  // still active
 		capabilities.FenceStateV1:          true,  // still active
+		capabilities.EmailTargetSecretV1:   true,  // still active
 		capabilities.LWWSkewGuardV1:        false, // regressed: a peer stopped advertising
 	}
 	s := testServer(t) // real db so evaluateHADegraded's stranded-pending query is safe

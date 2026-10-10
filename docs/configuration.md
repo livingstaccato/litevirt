@@ -687,7 +687,7 @@ notifications:
 # Disk SMART health check (smartctl): litevirt_disk_smart_* gauges plus
 # disk.smart.* notifications (see notifications.md). Informational only.
 smart:
-  interval: "1h"                    # Go duration; "0" or "off" disables
+  interval: "1h"                    # Go duration (floor 10m); "0" or "off" disables
 
 # Telemetry: structured logging + distributed tracing over OTLP (see
 # telemetry.md). Metrics stay on Prometheus (metrics_port) — this block does NOT

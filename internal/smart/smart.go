@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os/exec"
 	"sort"
 	"time"
@@ -20,6 +21,7 @@ type Status int
 const (
 	Unknown Status = iota // no SMART data (no smartctl, virtual disk, unreadable)
 	OK
+	Warning // SMART passes, but the drive reports a non-fatal warning (NVMe over-temperature)
 	Prefail // SMART passes but a prefailure attribute has tripped or the NVMe critical warning is set
 	Failing // SMART overall-health self-assessment FAILED
 )
@@ -28,6 +30,8 @@ func (s Status) String() string {
 	switch s {
 	case OK:
 		return "ok"
+	case Warning:
+		return "warning"
 	case Prefail:
 		return "prefail"
 	case Failing:
@@ -42,6 +46,8 @@ func (s Status) Detail() string {
 	switch s {
 	case Failing:
 		return "SMART overall-health self-assessment FAILED: the drive reports it is failing; replace it"
+	case Warning:
+		return "SMART reports a drive warning that is not a failure sign (NVMe temperature above its threshold); check cooling"
 	case Prefail:
 		return "SMART reports a prefailure condition (a prefail attribute crossed its threshold, or the NVMe critical-warning flag is set); plan a replacement"
 	case OK:
@@ -55,6 +61,10 @@ func (s Status) Detail() string {
 type Disk struct {
 	Device string
 	Model  string
+	// ID identifies the physical disk across renames (sdb -> sdc after a
+	// reboot): "serial:<serial>" or "wwn:<wwn>" when smartctl reports one,
+	// else the device name.
+	ID     string
 	Status Status
 }
 
@@ -87,6 +97,12 @@ type scanOut struct {
 
 type healthOut struct {
 	ModelName    string `json:"model_name"`
+	SerialNumber string `json:"serial_number"`
+	WWN          *struct {
+		NAA int64 `json:"naa"`
+		OUI int64 `json:"oui"`
+		ID  int64 `json:"id"`
+	} `json:"wwn"`
 	SmartSupport *struct {
 		Available bool `json:"available"`
 		Enabled   bool `json:"enabled"`
@@ -120,8 +136,11 @@ func Check(ctx context.Context, run Runner) Report {
 	}
 	r := Report{Available: true}
 	for _, d := range sc.Devices {
-		disk := Disk{Device: d.Name, Status: Unknown}
-		args := []string{"--json", "-H", "-A"}
+		disk := Disk{Device: d.Name, ID: d.Name, Status: Unknown}
+		// -n standby: never spin up a sleeping disk to read it (smartd does the
+		// same). A disk in standby exits with no SMART data, which is Unknown
+		// and so keeps whatever state we last saw.
+		args := []string{"--json", "-n", "standby", "-H", "-A"}
 		if d.Type != "" {
 			args = append(args, "-d", d.Type)
 		}
@@ -132,37 +151,55 @@ func Check(ctx context.Context, run Runner) Report {
 			r.Disks = append(r.Disks, disk)
 			continue
 		}
-		disk.Model, disk.Status = classify(o)
+		var id string
+		disk.Model, id, disk.Status = classify(o)
+		if id != "" {
+			disk.ID = id
+		}
 		r.Disks = append(r.Disks, disk)
 	}
 	sort.Slice(r.Disks, func(i, j int) bool { return r.Disks[i].Device < r.Disks[j].Device })
 	return r
 }
 
-func classify(raw []byte) (model string, st Status) {
+func classify(raw []byte) (model, id string, st Status) {
 	var h healthOut
 	if json.Unmarshal(raw, &h) != nil {
-		return "", Unknown
+		return "", "", Unknown
 	}
 	model = h.ModelName
+	switch {
+	case h.SerialNumber != "":
+		id = "serial:" + h.SerialNumber
+	case h.WWN != nil:
+		id = fmt.Sprintf("wwn:%x-%x-%x", h.WWN.NAA, h.WWN.OUI, h.WWN.ID)
+	}
 	if h.SmartSupport != nil && !h.SmartSupport.Available {
-		return model, Unknown
+		return model, id, Unknown
 	}
 	if h.SmartStatus == nil {
-		return model, Unknown
+		return model, id, Unknown
 	}
 	if !h.SmartStatus.Passed {
-		return model, Failing
+		return model, id, Failing
 	}
-	if h.NVMe != nil && h.NVMe.CriticalWarning != 0 {
-		return model, Prefail
+	if h.NVMe != nil {
+		// Bit 0x02 is "temperature above/below threshold": a cooling problem,
+		// not a dying drive. Every other bit (spare low, reliability degraded,
+		// read-only, backup failed) is a prefailure signal.
+		if h.NVMe.CriticalWarning&^0x02 != 0 {
+			return model, id, Prefail
+		}
 	}
 	if h.ATA != nil {
 		for _, a := range h.ATA.Table {
 			if a.Flags.Prefailure && (a.WhenFailed == "now" || a.WhenFailed == "in_the_past") {
-				return model, Prefail
+				return model, id, Prefail
 			}
 		}
 	}
-	return model, OK
+	if h.NVMe != nil && h.NVMe.CriticalWarning&0x02 != 0 {
+		return model, id, Warning
+	}
+	return model, id, OK
 }

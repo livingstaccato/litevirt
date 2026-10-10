@@ -1,0 +1,8 @@
+{"json_format_version":[1,0],"smartctl":{"version":[7,4],"exit_status":64},"device":{"name":"/dev/sda","type":"sat","protocol":"ATA"},
+"model_name":"ST4000DM004-2CV104","serial_number":"ZFN0ABCD","wwn":{"naa":5,"oui":3152,"id":98765432},"smart_support":{"available":true,"enabled":true},
+"smart_status":{"passed":true},
+"ata_smart_attributes":{"revision":10,"table":[
+{"id":1,"name":"Raw_Read_Error_Rate","value":117,"worst":99,"thresh":6,"when_failed":"","flags":{"value":15,"prefailure":true,"updated_online":true},"raw":{"value":134291368,"string":"134291368"}},
+{"id":5,"name":"Reallocated_Sector_Ct","value":100,"worst":100,"thresh":10,"when_failed":"","flags":{"value":51,"prefailure":true},"raw":{"value":0,"string":"0"}},
+{"id":9,"name":"Power_On_Hours","value":80,"worst":80,"thresh":0,"when_failed":"","flags":{"value":50,"prefailure":false},"raw":{"value":18000,"string":"18000"}}]},
+"messages":[{"string":"Warning: ATA error count 3 inconsistent with error log pointer 1","severity":"warning"}]}

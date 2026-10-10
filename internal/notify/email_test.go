@@ -238,7 +238,7 @@ func TestEmail_StartTLSWithAuth_Delivers(t *testing.T) {
 	if !strings.Contains(f.from, "lv@example.com") {
 		t.Errorf("from %q", f.from)
 	}
-	for _, want := range []string{"Subject: [lab] error: disk.smart.failing node1:/dev/sda", "From: lv@example.com", "To: a@example.com, b@example.com", "SMART health FAILED"} {
+	for _, want := range []string{"Subject: [lab] error: disk.smart.failing node1:/dev/sda", "From: <lv@example.com>", "To: <a@example.com>, <b@example.com>", "Message-ID: <", "@example.com>", "Date: ", "SMART health FAILED"} {
 		if !strings.Contains(f.data, want) {
 			t.Errorf("message missing %q:\n%s", want, f.data)
 		}
@@ -320,5 +320,91 @@ func TestEmail_RedactConfig(t *testing.T) {
 	w := `{"url":"https://x"}`
 	if RedactConfig("webhook", w) != w {
 		t.Error("webhook config changed")
+	}
+}
+
+func TestEmail_RedactConfig_CaseInsensitive(t *testing.T) {
+	for _, in := range []string{
+		`{"host":"h","Password":"hunter2"}`,
+		`{"host":"h","PASSWORD":"hunter2"}`,
+		`{"host":"h","password":"hunter2","Password":"hunter3"}`,
+	} {
+		out := RedactConfig("email", in)
+		if strings.Contains(out, "hunter") {
+			t.Errorf("password survived redaction of %s: %s", in, out)
+		}
+	}
+}
+
+func TestEmail_CanonicalConfig(t *testing.T) {
+	in := `{"Host":"h","FROM":"a@b.c","To":["x@y.z"],"Username":"u","Password":"pw","junk":1}`
+	out, err := CanonicalConfig("email", in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	_ = json.Unmarshal([]byte(out), &m)
+	for k := range m {
+		if k != strings.ToLower(k) {
+			t.Errorf("non-canonical key %q in %s", k, out)
+		}
+	}
+	if m["password"] != "pw" || m["host"] != "h" {
+		t.Errorf("canonical config lost fields: %s", out)
+	}
+	if _, ok := m["junk"]; ok {
+		t.Errorf("unknown key persisted: %s", out)
+	}
+	if !HasSecret("email", in) || HasSecret("email", `{"host":"h"}`) || HasSecret("webhook", in) {
+		t.Error("HasSecret wrong")
+	}
+	if w, _ := CanonicalConfig("webhook", `{"URL":"x"}`); w != `{"URL":"x"}` {
+		t.Error("webhook config altered")
+	}
+}
+
+// A relay that strips STARTTLS must never be sent the credentials.
+func TestEmail_StrippedStartTLSNeverReceivesAuth(t *testing.T) {
+	f := startFakeSMTP(t, false, false)
+	cfg := map[string]any{"host": "127.0.0.1", "port": f.port(), "from": "lv@example.com", "to": []string{"a@example.com"},
+		"username": "u", "password": "topsecret"}
+	tg, _ := NewTarget("mail", "email", emailCfg(t, cfg))
+	if err := tg.Send(context.Background(), testNote); err == nil {
+		t.Fatal("sent despite STARTTLS being stripped")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.authed != "" || strings.Contains(f.plainDlg, "AUTH") || strings.Contains(f.plainDlg, "topsecret") || f.data != "" {
+		t.Errorf("credentials or content reached a plaintext relay: auth=%q dialogue=%q", f.authed, f.plainDlg)
+	}
+}
+
+// A relay that accepts the connection and never answers must not hold a sender
+// past its context deadline.
+func TestEmail_HungServerHonoursDeadline(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			defer c.Close() // never greets
+		}
+	}()
+	cfg := map[string]any{"host": "127.0.0.1", "port": ln.Addr().(*net.TCPAddr).Port, "tls": "none", "from": "lv@example.com", "to": []string{"a@example.com"}}
+	tg, _ := NewTarget("mail", "email", emailCfg(t, cfg))
+	ctx, cancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if err := tg.Send(ctx, testNote); err == nil {
+		t.Fatal("hung server reported success")
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Errorf("Send held for %v past a 600ms deadline", d)
 	}
 }

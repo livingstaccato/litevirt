@@ -1067,3 +1067,18 @@ The whole regime is gated on `isolation_epoch_v1`
 (`enforcement.isolation_epoch`, default off). A pre-latch cluster does none of
 this, so it can be rolled out incrementally — enable the
 flag fleet-uniformly, since the token latches only under config uniformity.
+
+## Email notification targets during a rolling upgrade
+
+Email notification targets (see [notifications.md](notifications.md)) are new in
+this release. Two effects while the fleet is mixed:
+
+- **No email from older hosts.** A host on the previous build does not know the
+  `email` target type: it logs `notify: bad target config` and sends no email
+  for the events it handles. Create email targets after the last host has
+  upgraded, or accept gaps in email coverage until then.
+- **SMTP password creation is held back.** The mandatory, replication-gated
+  `email_target_secret_v1` token states that a host masks the stored SMTP
+  password on read. Until it has latched, creating an email target that carries a
+  password is refused (the message names the token and says to finish the
+  upgrade); an email target without a password is allowed at any time.

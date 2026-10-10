@@ -1493,6 +1493,10 @@ func (s *Server) tokenEnabled(token string) bool {
 		// recorded 'offline' and does not auto-activate such a host, which
 		// the failover lease holder relies on of every node.
 		return true
+	case capabilities.EmailTargetSecretV1:
+		// No kill switch: it says this build masks an email target's SMTP
+		// password on read, a fact about the binary.
+		return true
 	case capabilities.LeaseTermV1:
 		return s.enfLeaseTerm
 	case capabilities.RecoveryClaimV1:

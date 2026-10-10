@@ -2333,8 +2333,19 @@ func parseSMARTInterval(s string) time.Duration {
 		slog.Warn("invalid smart.interval; using 1h", "value", s, "error", err)
 		return time.Hour
 	}
+	if dur == 0 {
+		return 0
+	}
+	if dur < minSMARTInterval {
+		slog.Warn("smart.interval below the floor; clamped", "value", s, "floor", minSMARTInterval)
+		return minSMARTInterval
+	}
 	return dur
 }
+
+// minSMARTInterval is the shortest smart.interval: smartctl forks per disk per
+// pass and a sub-minute interval would run it continuously.
+const minSMARTInterval = 10 * time.Minute
 
 // parseDurationOr parses a Go duration string, returning fallback when empty
 // or unparseable (logging a warning in the latter case).

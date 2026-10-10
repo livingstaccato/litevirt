@@ -11,6 +11,7 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/notify"
 	"github.com/litevirt/litevirt/internal/randid"
@@ -112,13 +113,31 @@ func (s *Server) CreateNotificationTarget(ctx context.Context, req *pb.CreateNot
 	if _, err := notify.NewTarget(req.Name, req.Type, req.Config); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
-	t := corrosion.NotificationTarget{ID: randid.New(), Name: req.Name, Type: req.Type, Config: req.Config, Enabled: req.Enabled}
+	// Store the validated config in canonical form: encoding/json matches field
+	// names case-insensitively, so without this a "Password" key would be
+	// accepted and persisted under a name masking does not look for.
+	cfg, cerr := notify.CanonicalConfig(req.Type, req.Config)
+	if cerr != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", cerr)
+	}
+	// An email target's SMTP password replicates in the row, and a host on an
+	// older build would list it unmasked. Hold it back until every host masks.
+	if notify.HasSecret(req.Type, cfg) && !(s.gate != nil && s.gate.Enforced(ctx, capabilities.EmailTargetSecretV1)) {
+		return nil, status.Error(codes.FailedPrecondition,
+			"an email target with a password cannot be created yet: "+capabilities.EmailTargetSecretV1+
+				" has not latched cluster-wide, because at least one host still runs a build that would show the stored "+
+				"password unmasked. Finish the rolling upgrade first, or create the target without a password")
+	}
+	t := corrosion.NotificationTarget{ID: randid.New(), Name: req.Name, Type: req.Type, Config: cfg, Enabled: req.Enabled}
 	if err := corrosion.InsertNotificationTarget(ctx, s.db, t); err != nil {
 		return nil, status.Errorf(codes.Internal, "create target: %v", err)
 	}
 	slog.Info("notification target created", "name", t.Name, "type", t.Type)
 	s.audit(ctx, "notify.target.add", t.ID, t.Name+" "+t.Type, "ok")
-	return toPbTarget(t), nil
+	// Never echo the stored secret back: the response is masked like a list.
+	pt := toPbTarget(t)
+	pt.Config = notify.RedactConfig(t.Type, t.Config)
+	return pt, nil
 }
 
 func (s *Server) ListNotificationTargets(ctx context.Context, _ *pb.ListNotificationTargetsRequest) (*pb.ListNotificationTargetsResponse, error) {

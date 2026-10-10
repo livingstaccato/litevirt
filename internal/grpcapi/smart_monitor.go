@@ -15,6 +15,7 @@ import (
 // docs/notifications.md).
 const (
 	kindDiskSMARTFailing   = "disk.smart.failing"
+	kindDiskSMARTWarning   = "disk.smart.warning"
 	kindDiskSMARTPrefail   = "disk.smart.prefail"
 	kindDiskSMARTRecovered = "disk.smart.recovered"
 )
@@ -31,15 +32,21 @@ func smartTransitions(host string, prev map[string]smart.Status, disks []smart.D
 	next := make(map[string]smart.Status, len(disks))
 	var out []notify.Notification
 	for _, d := range disks {
-		old, seen := prev[d.Device]
+		// Keyed by the disk's identity (serial/WWN) so a rename across a reboot
+		// neither re-pages a standing failure nor strands its state.
+		key := d.ID
+		if key == "" {
+			key = d.Device
+		}
+		old, seen := prev[key]
 		st := d.Status
 		if st == smart.Unknown {
 			if seen {
-				next[d.Device] = old
+				next[key] = old
 			}
 			continue
 		}
-		next[d.Device] = st
+		next[key] = st
 		if seen && old == st {
 			continue
 		}
@@ -47,14 +54,16 @@ func smartTransitions(host string, prev map[string]smart.Status, disks []smart.D
 		if model == "" {
 			model = "unknown model"
 		}
-		n := notify.Notification{Subject: fmt.Sprintf("%s:%s", host, d.Device), Detail: fmt.Sprintf("%s (%s)", st.Detail(), model)}
+		n := notify.Notification{Subject: fmt.Sprintf("%s:%s", host, d.Device), Detail: fmt.Sprintf("%s (%s, id %s)", st.Detail(), model, key)}
 		switch st {
 		case smart.Failing:
 			n.Kind, n.Severity = kindDiskSMARTFailing, notify.SevError
+		case smart.Warning:
+			n.Kind, n.Severity = kindDiskSMARTWarning, notify.SevWarn
 		case smart.Prefail:
 			n.Kind, n.Severity = kindDiskSMARTPrefail, notify.SevWarn
 		case smart.OK:
-			if old != smart.Prefail && old != smart.Failing {
+			if old != smart.Prefail && old != smart.Failing && old != smart.Warning {
 				continue // first sighting of a healthy disk is not news
 			}
 			n.Kind, n.Severity = kindDiskSMARTRecovered, notify.SevInfo

@@ -286,6 +286,22 @@ const (
 	// replicates to, a maintenance host on the previous build included.
 	FenceStateV1 = "fence_state_v1"
 
+	// EmailTargetSecretV1 gates storing an SMTP password in an email
+	// notification target. Once latched, every host this node replicates to
+	// masks that password in ListNotificationTargets and in the create
+	// response; before it, a host on an older build would hand the replicated
+	// row's password back unmasked to any operator, so CreateNotificationTarget
+	// refuses an email target that carries a password until the upgrade has
+	// finished (a passwordless email target is allowed at any time).
+	//
+	// It states a fact about the BINARY, which is why it is mandatory and has
+	// no config flag: this build masks the secret on read. Nothing newly
+	// refuses a workflow an older build allowed (email targets are new).
+	//
+	// ReplicationGated: any host holding the replicated row can serve the
+	// list, a maintenance host on the previous build included.
+	EmailTargetSecretV1 = "email_target_secret_v1"
+
 	// RecoveryClaimV1 gates ENFORCEMENT of single-winner recovery claims
 	// (docs/design/recovery-claims.md §3, §5.1–§5.2,
 	// colonelpanik/litevirt#250): a failover coordinator collects a majority
@@ -872,6 +888,9 @@ var supported = []string{
 	// a recovery from an unverified fence recorded 'offline' and does not
 	// auto-activate such a host", a fact about the binary.
 	FenceStateV1,
+	// EmailTargetSecretV1 is advertised UNCONDITIONALLY: it says "this build
+	// masks an email target's SMTP password on read", a fact about the binary.
+	EmailTargetSecretV1,
 	// RecoveryClaimV1 is advertised CONDITIONALLY: enforcement.recovery_claim
 	// (default on) on AND this node ready (split_brain_gate_v1 latched, voter_config_v1
 	// ready). Withheld while the flag is off because every flag-on node relies
@@ -901,7 +920,7 @@ var supported = []string{
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, FenceStateV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, FenceStateV1, EmailTargetSecretV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {
@@ -963,6 +982,9 @@ var replicationGated = map[string]bool{
 	// failover lease, a maintenance host on the previous build included, and
 	// that build resumes only from 'fenced'. See FenceStateV1.
 	FenceStateV1: true,
+	// Confirmed against every replication recipient: any host holding the
+	// replicated target row can serve the list. See EmailTargetSecretV1.
+	EmailTargetSecretV1: true,
 	// Confirmed against every replication recipient: the claim_certificate
 	// column's statement shapes on runtime_action_proofs must be decodable by
 	// every host we stream to. Not mandatory: the flag is the opt-in.
@@ -1017,6 +1039,9 @@ var mandatory = map[string]bool{
 	// 'offline' and does not auto-activate such a host), and the lease holder
 	// relies on whichever node holds the lease next. See FenceStateV1.
 	FenceStateV1: true,
+	// A fact about the binary (it masks an email target's SMTP password on
+	// read), not a policy. See EmailTargetSecretV1.
+	EmailTargetSecretV1: true,
 }
 
 // Mandatory reports whether token is enforced with no config kill switch.

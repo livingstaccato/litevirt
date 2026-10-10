@@ -276,14 +276,19 @@ func TestReplicateVolume_RunningVMIsPointInTime(t *testing.T) {
 		lo, hi := slots("layer 3 (-U)", target)
 		l.mark("layer 3: LOW=%d HIGH=%d (smeared: %v)", lo, hi, lo != hi && lo != hi+1)
 	}
-	switch {
-	case os.Getenv("E2E_PIT_EXCLUSIVE_NODE") != h:
-		t.Logf("legs 2 and 3 skipped: set E2E_PIT_EXCLUSIVE_NODE=%s to pin them to this node (no other e2e or backup may run there)", h)
-	default:
-		if out, err := l.ssh(h, 20*time.Second, "mkdir /run/lv-e2e-pit.lock"); err != nil {
-			t.Logf("legs 2 and 3 skipped: another run holds /run/lv-e2e-pit.lock on %s: %s", h, out)
-			break
+	// The legs' gate is a subtest of its own, so a skip shows in the results
+	// (a red run on the lab must not pass on layers 1 and 4 alone).
+	forced := false
+	t.Run("forced layers 2 and 3", func(st *testing.T) {
+		if os.Getenv("E2E_PIT_EXCLUSIVE_NODE") != h {
+			st.Skipf("set E2E_PIT_EXCLUSIVE_NODE=%s to pin legs 2 and 3 to this node (no other e2e or backup may run there)", h)
 		}
+		if out, err := l.ssh(h, 20*time.Second, "mkdir /run/lv-e2e-pit.lock"); err != nil {
+			st.Skipf("another run holds /run/lv-e2e-pit.lock on %s: %s", h, out)
+		}
+		forced = true
+	})
+	if forced {
 		if out, err := l.ssh(h, 30*time.Second, fmt.Sprintf("systemd-run --unit %s --on-active=30m /bin/sh -c %s", unit, shellQuote(restore))); err != nil {
 			l.ssh(h, 20*time.Second, "rmdir /run/lv-e2e-pit.lock")
 			t.Fatalf("arm the restore watchdog on %s: %v %s", h, err, out)

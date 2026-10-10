@@ -240,6 +240,15 @@ func TestContainer_HostMount_ReadOnlyAndConfined(t *testing.T) {
 	if got, err := lvErr(t, "ct", "exec", name, "--host", localHost, "--", "ls", "/mnt/host"); err == nil && strings.Contains(got, "passwd") {
 		t.Fatalf("an in-container reboot followed a swapped-in symlink to /etc:\n%s", got)
 	}
+	// Refused, not merely unmounted: the hook failed the reboot's start, so
+	// LXC left the container stopped, and the refusal is in the system log.
+	if st, err := exec.Command("lxc-info", "-n", name, "-sH").CombinedOutput(); err != nil || strings.TrimSpace(string(st)) != "STOPPED" {
+		t.Errorf("after the refused in-container reboot the container is %q (%v); want STOPPED", strings.TrimSpace(string(st)), err)
+	}
+	if jl, err := exec.Command("journalctl", "-t", "litevirt-lxc-hook", "--since", "-5min", "--no-pager", "-o", "cat").CombinedOutput(); err != nil ||
+		!strings.Contains(string(jl), name+": refusing to start") {
+		t.Errorf("the system log holds no refusal for %s (%v):\n%s", name, err, jl)
+	}
 
 	// Stopped, the swapped tree refuses the start outright.
 	_, _ = lvErr(t, "ct", "stop", name, "--host", localHost)

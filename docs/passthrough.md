@@ -26,6 +26,14 @@ the admin role's to hand out, as on Proxmox VE (`Sys.Modify` on `/`); a mapped
 one needs the mapping's use permission (Proxmox `Mapping.Use`). Both are judged
 on the node that takes the request, before it forwards anything.
 
+Changing a **USB mapping's devices** — `lv mapping add-device` of a USB
+device, `lv mapping rm-device` on a mapping that holds USB devices, `lv mapping
+rm` of one — needs the **admin role**: the devices are what every VM holding
+the mapping's use permission receives at its next start, so whoever edits them
+hands out host USB. Neither `resourcemap.write` (the Operator role's) nor
+`resourcemap.use` changes a USB mapping, and a mapping another tenant's VMs use
+is changed only by an admin. PCI mappings keep `resourcemap.write`.
+
 A raw device binds the VM to its host: placement, failover, drain and
 rebalance consider that host alone, and a VM whose host is lost stays down
 rather than starting without its device. A **USB mapping** is the portable
@@ -113,7 +121,10 @@ lv ct convert web --clear-host-access                 # remove them
 A host path inside a container is access to the host. On Proxmox VE only
 `root@pam` may add one; here it needs the **admin role** — judged on the node
 that takes the request, before it forwards anything — and so does cloning a
-container that has one. Then the host itself decides what it allows:
+container that has one. A non-admin's clone of a **privileged or
+legacy-confined** container is never refused: the clone lands unprivileged, in
+an id range of its own (its files shifted), with default confinement, and the
+audit (`ct.clone`) says so. An admin's clone keeps the source's mode. Then the host itself decides what it allows:
 
 ```yaml
 containers:
@@ -128,36 +139,63 @@ containers:
   prefix or source that is, lies in, or CONTAINS one is refused (at config
   load too): `/`, `/etc`, `/root`, `/boot`, `/proc`, `/sys`, `/dev`, `/run`,
   `/var/run`, `/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`, the LXC store,
-  `/var/lib/libvirt`, litevirt's data and PKI directories. A path a VM disk
-  or a storage pool uses is refused too.
+  `/var/lib/libvirt`, litevirt's data and PKI directories, and **every store
+  the host serves**: each storage pool's source and target on this host, every
+  backup repo (configured or registered), the image and disk stores, the
+  restore cache, and litevirt's own binary (the start hook LXC runs as root).
+  Each is compared in its resolved, canonical form, on every start; a store
+  list that cannot be read refuses every mount.
 - **Devices are listed exactly**: each `device_paths` entry is one device
   node (never a directory such as `/dev`), and only character or block nodes
   pass. Physical and kernel memory (`/dev/mem`, `/dev/kmem`), I/O ports,
-  `/dev/kvm` and `/dev/vhost-*` are never passed through, and neither is a
-  block device that holds a mounted filesystem, has a device built on it, or
-  is a VM's disk.
+  `/dev/kvm`, `/dev/vhost-*`, and the raw-disk character nodes — SCSI generic
+  (`/dev/sg*`), block SCSI generic (`/dev/bsg/*`), NVMe generic namespaces
+  (`/dev/ng*`) and NVMe controllers (`/dev/nvme0`) — are never passed through,
+  by name or by device number. A block device is judged **by its device
+  number**, with its partitions and the disk it belongs to: it is refused when
+  any of them holds a mounted filesystem, is swap, has a device built on it
+  (LVM, md, dm-crypt), is a loop device with a backing file or a connected nbd
+  device, is held open by any process (qemu's VM disks), is refused an
+  exclusive open by the kernel (btrfs and ZFS members), or is a VM disk on this
+  host by number, whatever path names it.
 - Paths may hold letters, digits and `. _ @ + / -` only.
 - Mounts are **read-only unless `:rw`**, and always `nosuid,nodev`.
+  Read-only is a boundary only for an **unprivileged** container, where the
+  kernel locks the flag. Root in a privileged or legacy-confined container
+  (both admin-only) can remount the tree read-write.
 - **The config never names the tree.** LXC binds a staging path under
   `/run/litevirt/ct` (root-only, private propagation). Litevirt's start hook,
   which LXC runs on **every** start — a reboot from inside the container
   included — opens each source beneath its allowed prefix with
-  `openat2(RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS)`, clones exactly that tree,
-  sets read-only/nosuid/nodev on it and moves it onto the staging path. A
-  symlink swapped into the tree at any time is refused by the kernel, not
-  followed. This needs Linux 5.12+; on an older kernel mounts are refused.
+  `openat2(RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS|RESOLVE_NO_XDEV)`, clones
+  exactly that tree, sets read-only/nosuid/nodev on it and moves it onto the
+  staging path. A symlink swapped into the tree at any time, or a filesystem
+  mounted over part of it, is refused by the kernel, not followed. The hook
+  judges every mount and device again against the host's policy as the daemon
+  last recorded it before a start (`/run/litevirt/lxc-hook-policy.json`), so a
+  reboot from inside the container cannot outlive a prefix the host has since
+  withdrawn; with no policy recorded it stages nothing. A refusal is logged
+  to the system log under the tag `litevirt-lxc-hook`. A failed start takes
+  down what it staged, and the stop removes each staging entry by itself.
+  This needs Linux 5.12+; on an older kernel mounts are refused.
 - **Every start judges the container again**: the mounts and devices an admin
-  authorized are recorded in its directory, the managed config block is
-  rendered from that record, and a config whose block is anything else —
+  authorized are recorded in its directory, and the managed config block is
+  rendered from that record on every start. A block that says anything else —
   other mount options, another `devices.allow` line, an entry nobody
-  authorized, a record that cannot be read — refuses the start, as does a
-  path the host no longer allows. A container migrated, restored or relocated
+  authorized — is replaced by the rendering and the difference logged, never
+  kept. A record that cannot be read refuses the start, as does a path the
+  host no longer allows. A container migrated, restored or relocated
   to a host that does not allow its paths does not start there.
 - **Archives grant nothing.** A restore, import, migration or snapshot revert
   rebuilds the container's config from litevirt's own renderers: only the
-  keys litevirt writes survive (rootfs, hostname, network, resource limits,
-  LXC's own includes), and security and host access are rendered from the
-  authorized spec. A restore keeps the backup's mounts and devices only for an
+  keys litevirt writes survive (rootfs, hostname, resource limits, and only
+  the includes create writes: LXC's `common.conf` and `userns.conf`, generic
+  or per distro), and security and host access are rendered from the
+  authorized spec. A restore renders the **network** from the spec as well:
+  every `lxc.net.*` line in the archive is dropped (a `phys`, `macvlan` or
+  `none` NIC, a router-mode veth, another project's bridge) and the spec's
+  NICs are written as create writes them; what was dropped is audited
+  (`ct.restore`). A restore keeps the backup's mounts and devices only for an
   admin (a cold migration or failover relocation keeps them only when they are
   exactly what the source's row records); otherwise they are stripped, the
   strip is audited, and an admin re-applies them with `lv ct convert`.

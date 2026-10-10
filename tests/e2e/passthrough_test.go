@@ -314,6 +314,17 @@ func deviceHolders(rdev uint64) []string {
 	return out
 }
 
+// containerInitPid is the host pid of name's init, or "" when it has none
+// (not running).
+func containerInitPid(t *testing.T, name string) string {
+	t.Helper()
+	b, err := exec.Command("lxc-info", "-n", name, "-pH").CombinedOutput()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
 // TestContainer_GrantedBlockDeviceSurvivesInContainerReboot (R3-I2): a
 // container whose own process holds its granted block device open keeps the
 // grant across the once-a-minute policy refresh, and a reboot from inside it
@@ -360,18 +371,31 @@ func TestContainer_GrantedBlockDeviceSurvivesInContainerReboot(t *testing.T) {
 		t.Fatalf("the refresh revoked the device %s its container holds open; policy:\n%s", dev, pol)
 	}
 
+	// The container's boot: the host pid of its init. A container shares the
+	// host's kernel, so /proc/sys/kernel/random/boot_id is the host's and does
+	// not change; a new init does, and only a reboot starts one.
+	boot := containerInitPid(t, name)
+	if boot == "" {
+		t.Fatalf("%s has no init pid before the reboot", name)
+	}
 	since := time.Now().Add(-time.Second).Format("2006-01-02 15:04:05")
-	_, _ = lvErr(t, "ct", "exec", name, "--host", localHost, "--", "reboot")
-	var st string
+	if out, err := lvErr(t, "ct", "exec", name, "--host", localHost, "--", "reboot"); err != nil {
+		t.Logf("reboot from inside %s returned %v (the exec may lose its session as init goes): %s", name, err, out)
+	}
+	var st, after string
 	deadline = time.Now().Add(120 * time.Second)
 	for time.Now().Before(deadline) {
 		time.Sleep(5 * time.Second)
 		b, _ := exec.Command("lxc-info", "-n", name, "-sH").CombinedOutput()
-		if st = strings.TrimSpace(string(b)); st == "RUNNING" {
+		st = strings.TrimSpace(string(b))
+		if after = containerInitPid(t, name); st == "RUNNING" && after != "" && after != boot {
 			break
 		}
 	}
 	jl, _ := exec.Command("journalctl", "-t", "litevirt-lxc-hook", "--since", since, "--no-pager", "-o", "cat").CombinedOutput()
+	if after == boot {
+		t.Fatalf("the container did not reboot: its init is still pid %s (state %q); the test proves nothing. hook log:\n%s", boot, st, jl)
+	}
 	if st != "RUNNING" {
 		t.Fatalf("after an in-container reboot the container is %q; want RUNNING. hook log:\n%s", st, jl)
 	}

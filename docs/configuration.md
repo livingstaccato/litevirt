@@ -671,8 +671,11 @@ containers:
   # --mount / --device; docs/passthrough.md). A mount's host path is resolved
   # here, symlinks followed, and must land under one of these prefixes; LXC's
   # start hook mounts it from an fd on every start, never by path. A prefix
-  # that is, lies in or contains a protected tree (/, /etc, /run, the LXC
-  # store, litevirt's data and PKI directories, ...) is refused at load.
+  # whose path is, lies in or contains a protected tree (/, /etc, /run, the
+  # LXC store, litevirt's data and PKI directories, ...) is refused at load;
+  # one that reaches a protected tree only through another mount of the same
+  # filesystem still loads, with a warning and the condition
+  # container_mount_prefix_overlap, and sources in that tree are refused.
   # Devices are listed EXACTLY, one node each (never a directory such as /dev;
   # /dev/mem, /dev/kvm and /dev/vhost-* are refused). Mounts are read-only
   # unless --mount asks for :rw, and always nosuid,nodev. Empty (the default)

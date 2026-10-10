@@ -127,7 +127,10 @@ an id range of its own (its files shifted), with default confinement, and the
 audit (`ct.clone`) says so. An admin's clone keeps the source's mode. A
 source with an unfinished conversion is not cloned until the conversion is
 finished (`lv ct convert <name>`), and neither is one whose security settings
-cannot be read (the refusal names the error). Then the host itself decides what it allows:
+cannot be read (the refusal names the error). A clone's NICs are admitted as
+what they now are: a raw bridge that has since become the rendered bridge of a
+managed network is that network's NIC, so a clone onto another project's
+network is refused. Then the host itself decides what it allows:
 
 ```yaml
 containers:
@@ -140,8 +143,8 @@ containers:
   (the default) allow nothing.
 - **Protected trees** are never mounted, whatever the prefixes say: a
   source whose resolved path is, lies in, or CONTAINS one is refused, and so
-  is a configured prefix (at config load) that is, lies in or contains one of
-  the fixed trees below: `/`, `/etc`, `/root`, `/boot`, `/proc`, `/sys`, `/dev`, `/run`,
+  is a configured prefix (at config load) whose path is, lies in or contains
+  one of the fixed trees below: `/`, `/etc`, `/root`, `/boot`, `/proc`, `/sys`, `/dev`, `/run`,
   `/var/run`, `/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`, the LXC store,
   `/var/lib/libvirt`, litevirt's data and PKI directories, and **every store
   the host serves**: each storage pool's source and target on this host, every
@@ -152,8 +155,26 @@ containers:
   number in `/proc/self/mountinfo`) and the path within that filesystem. The
   same tree mounted again somewhere else — `/var/lib/litevirt` bound under an
   allowed prefix, or a second mount of the NFS export a pool lives on — is
-  therefore refused too, beneath the prefix or not. A store list or a mount
-  table that cannot be read refuses every mount. A store created beneath an
+  therefore refused too, beneath the prefix or not. On NFS the path within the
+  filesystem is the export path the mount names (`srv:/export/share`), not
+  mountinfo's root column: on NFSv3, mounts of two exports of one server
+  filesystem can share a superblock, and their root column reads `/` until the
+  kernel splices the dentry, so it depends on the dentry cache. A share beside
+  a pool's export passes and one inside it is refused, the same way every
+  time. Where the path within the filesystem is still not certain (an NFS
+  source that names no export path, or a bind of a subdirectory on such a
+  shared superblock), identity is not used and the resolved-path check alone
+  decides. Identity does not recognise an overlay whose lower or upper
+  directory is a protected tree, a btrfs snapshot of one, or a mount of the
+  same NFS export that does not share a superblock (`nosharecache`, other
+  mount options): do not build those beneath an allowed prefix. A store list
+  or a mount table that cannot be read refuses every mount. A configured
+  prefix that reaches a protected tree only by filesystem identity — a prefix
+  on the disk that also holds `data_dir`, say — does not stop the daemon
+  starting (such a config loaded before identity was checked): it is logged
+  and raised as the warning condition `container_mount_prefix_overlap` about
+  the host, and the sources in the protected tree are refused when they are
+  resolved, as above. A store created beneath an
   allowed prefix refuses only the sources in it or containing it: `/srv/share`
   keeps working when a pool appears at `/srv/pools/x`. A container with no
   mounts never reads the store list.
@@ -214,9 +235,15 @@ containers:
   container's at daemon start and once a minute, so a pool created, or a
   prefix withdrawn, reaches a reboot from inside the container within a
   minute; a container whose directory is gone (deleted, migrated away) has its
-  policy removed then. The refresh and every change of a container's host
-  access take that container's lock, so a refresh never writes an older policy
-  over a newer one. With no policy the hook stages nothing, and it stages only what the
+  policy removed then. A refresh that cannot judge a container's grant now — a
+  read or a lookup failed (the database, the mount table, an NFS source that
+  does not answer) — keeps the policy it last wrote and logs it, rather than
+  stopping the container's next reboot over a transient error; a definite
+  refusal (a prefix withdrawn, a device no longer listed) empties it. The
+  refresh and every change of a container's host access take that
+  container's lock, so a refresh never writes an older policy over a newer
+  one; a container whose lock is held (a start judging it now) is skipped and
+  refreshed at the next run, so one container never holds up the others. With no policy the hook stages nothing, and it stages only what the
   record authorizes. A refusal is logged
   to the system log under the tag `litevirt-lxc-hook`. A failed start takes
   down what it staged, and the stop removes each staging entry by itself.
@@ -246,13 +273,27 @@ containers:
   on that network's own bridge, whatever bridge the spec names. A NIC naming
   a network that does not exist is dropped — never placed on a host bridge
   that happens to carry the name. A raw-bridge NIC is kept only for a caller
-  who may attach raw bridges (as at create). A cold migration or relocation
-  re-homes an existing container: a network its project may not use is kept
-  and audited (`allowed-foreign-network`), but a raw-bridge NIC, or a raw
-  bridge that is a network's, is kept only when the source container's row
-  records that NIC. Every other NIC is dropped, audited, and the restore
-  proceeds. A network record that cannot be read fails the restore, to be
-  retried. A restore keeps the backup's mounts and devices only for an
+  who may attach raw bridges (as at create). Every other NIC is dropped,
+  audited, and the restore proceeds. A spec that records no NICs at all (a
+  backup from before the create spec) is restored onto the default bridge,
+  and the archive's network lines dropped are audited.
+
+  A **cold migration or failover relocation** re-homes an existing container,
+  so its NICs are the ones its **source row** records, by NIC name — never the
+  archive's. Each keeps the row's address and MAC; a managed NIC lands on its
+  network's bridge, or, when the network's record is gone (`lv network rm
+  --force`, or not replicated to the target yet), on the bridge the row
+  records, as before; a raw-bridge NIC keeps its bridge. A network its project
+  may not use is kept and audited (`allowed-foreign-network`). A NIC the
+  archive adds that the row does not record is dropped and audited, wherever
+  it points. The moving host sends the row with the move (the target's own
+  replica need not have it yet); a target that has neither the row nor a copy
+  of it (a move from an earlier build, before replication catches up) refuses
+  before it writes anything, and the move is retried — never landed without
+  the container's NICs, mounts or privilege. A row from before the create
+  spec records no NICs: a move keeps the archive's veth-on-bridge NICs and
+  drops every other kind. A network record or list that cannot be read fails
+  the restore, to be retried. A restore keeps the backup's mounts and devices only for an
   admin (a cold migration or failover relocation keeps them only when they are
   exactly what the source's row records); otherwise they are stripped, the
   strip is audited, and an admin re-applies them with `lv ct convert`.

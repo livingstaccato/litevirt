@@ -3317,7 +3317,9 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	// chose (judgeRecreateOn); the create below goes to that host.
 	rctx := withRecreateISOGrant(ctx, vm)
 	host, placed := s.hostName, false
-	if spec.GetIso() != "" {
+	// A VM on an iSCSI LUN is placed now too: its moved claim names the host
+	// it will run on, so the create must go exactly there (vm_lun_hold.go).
+	if spec.GetIso() != "" || s.hasFixedDeviceDisk(rctx, spec) {
 		h, err := s.placeRecreate(rctx, spec, vm)
 		if err != nil {
 			st := status.Convert(err)
@@ -3329,22 +3331,16 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 		st := status.Convert(err)
 		return nil, status.Errorf(st.Code(), "cannot rebuild %q: %s; nothing was changed", req.Name, st.Message())
 	}
-	// Its iSCSI LUNs too: the claim is judged now — kept, or claimed for the
-	// VM — and a LUN the create would refuse is refused now. The LUNs are then
-	// held on this host until the create has returned.
-	rctx, releaseLUNHold, err := s.preflightLUNs(rctx, spec, vm)
+	// Its iSCSI LUNs too: the claim is judged now and moved to an allocation
+	// naming this host and the one the VM is created on, and a LUN the create
+	// would refuse is refused now. This host then holds the LUNs until the
+	// evidence that it may let go arrives (vm_lun_hold.go).
+	rctx, lunDone, err := s.preflightLUNs(rctx, spec, vm, host)
 	if err != nil {
 		st := status.Convert(err)
 		return nil, status.Errorf(st.Code(), "cannot rebuild %q: %s; nothing was changed", req.Name, st.Message())
 	}
-	lunKeys, lunCommitted := lunPreflightKeys(rctx), false
-	defer func() {
-		if lunCommitted {
-			s.holdUntilRows(req.Name, lunKeys, releaseLUNHold)
-		} else {
-			releaseLUNHold()
-		}
-	}()
+	defer lunDone()
 
 	// Stop and undefine the current domain.
 	if vm.State == "running" {
@@ -3405,7 +3401,6 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	if err != nil {
 		return nil, s.recreateFailedAfterTeardown("rebuild", req.Name, s.hostName, spec, err)
 	}
-	lunCommitted = true
 	return out, nil
 }
 

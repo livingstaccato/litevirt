@@ -560,6 +560,9 @@ type Server struct {
 	// lunClaims holds the iscsi LUNs this host's in-flight creates are taking,
 	// until their disk rows commit (vm_lun_claim.go).
 	lunClaims lunClaimRegistry
+	// lunHolds is this host's durable holds on the LUNs whose claims its
+	// rebuilds and recreates moved (vm_lun_hold.go).
+	lunHolds lunHoldStore
 	// releaseFeatureGate opens a release feature (SetReleaseFeatureGate); nil
 	// opens none.
 	releaseFeatureMu   sync.Mutex

@@ -34589,8 +34589,12 @@ type LUNHoldersRequest struct {
 	// against the asker; no name alone exempts anything.
 	ReplacedName      string `protobuf:"bytes,2,opt,name=replaced_name,json=replacedName,proto3" json:"replaced_name,omitempty"`
 	ReplacedCreatedAt string `protobuf:"bytes,3,opt,name=replaced_created_at,json=replacedCreatedAt,proto3" json:"replaced_created_at,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// A moved claim's hold (its token) the asker needs to know this host still
+	// keeps on every asked LUN: the create of a re-created VM, taking its LUN
+	// over, asks the host that moved the claim before it goes on.
+	HoldToken     string `protobuf:"bytes,4,opt,name=hold_token,json=holdToken,proto3" json:"hold_token,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *LUNHoldersRequest) Reset() {
@@ -34644,6 +34648,13 @@ func (x *LUNHoldersRequest) GetReplacedCreatedAt() string {
 	return ""
 }
 
+func (x *LUNHoldersRequest) GetHoldToken() string {
+	if x != nil {
+		return x.HoldToken
+	}
+	return ""
+}
+
 type LUNHolder struct {
 	state    protoimpl.MessageState `protogen:"open.v1"`
 	Lun      string                 `protobuf:"bytes,1,opt,name=lun,proto3" json:"lun,omitempty"`
@@ -34656,7 +34667,10 @@ type LUNHolder struct {
 	// The VM's uuid, where the answering host knows it.
 	VmId string `protobuf:"bytes,6,opt,name=vm_id,json=vmId,proto3" json:"vm_id,omitempty"`
 	// The VM reads the LUN as its disk's base (a linked clone), not as its disk.
-	Backing       bool `protobuf:"varint,7,opt,name=backing,proto3" json:"backing,omitempty"`
+	Backing bool `protobuf:"varint,7,opt,name=backing,proto3" json:"backing,omitempty"`
+	// The incarnation (created_at) of the VM whose row holds the LUN; empty for
+	// an in-flight create or a domain.
+	VmCreatedAt   string `protobuf:"bytes,8,opt,name=vm_created_at,json=vmCreatedAt,proto3" json:"vm_created_at,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -34740,12 +34754,22 @@ func (x *LUNHolder) GetBacking() bool {
 	return false
 }
 
+func (x *LUNHolder) GetVmCreatedAt() string {
+	if x != nil {
+		return x.VmCreatedAt
+	}
+	return ""
+}
+
 type LUNHoldersResponse struct {
 	state   protoimpl.MessageState `protogen:"open.v1"`
 	Holders []*LUNHolder           `protobuf:"bytes,1,rep,name=holders,proto3" json:"holders,omitempty"`
 	// The host that answered. The asker counts the answer only from the host
 	// it asked.
-	AnsweredBy    string `protobuf:"bytes,2,opt,name=answered_by,json=answeredBy,proto3" json:"answered_by,omitempty"`
+	AnsweredBy string `protobuf:"bytes,2,opt,name=answered_by,json=answeredBy,proto3" json:"answered_by,omitempty"`
+	// The answering host still keeps the hold the request's hold_token names,
+	// on every asked LUN.
+	HoldPresent   bool `protobuf:"varint,3,opt,name=hold_present,json=holdPresent,proto3" json:"hold_present,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -34792,6 +34816,13 @@ func (x *LUNHoldersResponse) GetAnsweredBy() string {
 		return x.AnsweredBy
 	}
 	return ""
+}
+
+func (x *LUNHoldersResponse) GetHoldPresent() bool {
+	if x != nil {
+		return x.HoldPresent
+	}
+	return false
 }
 
 // PreflightRecreateVMRequest is the spec of a VM about to be re-created on the
@@ -37595,11 +37626,13 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x04pool\x18\x01 \x01(\tR\x04pool\x125\n" +
 	"\x05files\x18\x02 \x03(\v2\x1f.litevirt.v1.ImportLeftoverFileR\x05files\"2\n" +
 	"\x1cImportLeftoverStatusResponse\x12\x12\n" +
-	"\x04dead\x18\x01 \x03(\tR\x04dead\"|\n" +
+	"\x04dead\x18\x01 \x03(\tR\x04dead\"\x9b\x01\n" +
 	"\x11LUNHoldersRequest\x12\x12\n" +
 	"\x04luns\x18\x01 \x03(\tR\x04luns\x12#\n" +
 	"\rreplaced_name\x18\x02 \x01(\tR\freplacedName\x12.\n" +
-	"\x13replaced_created_at\x18\x03 \x01(\tR\x11replacedCreatedAt\"\xbc\x01\n" +
+	"\x13replaced_created_at\x18\x03 \x01(\tR\x11replacedCreatedAt\x12\x1d\n" +
+	"\n" +
+	"hold_token\x18\x04 \x01(\tR\tholdToken\"\xe0\x01\n" +
 	"\tLUNHolder\x12\x10\n" +
 	"\x03lun\x18\x01 \x01(\tR\x03lun\x12\x17\n" +
 	"\avm_name\x18\x02 \x01(\tR\x06vmName\x12\x1b\n" +
@@ -37607,11 +37640,13 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\thost_name\x18\x04 \x01(\tR\bhostName\x12\x1b\n" +
 	"\tin_flight\x18\x05 \x01(\bR\binFlight\x12\x13\n" +
 	"\x05vm_id\x18\x06 \x01(\tR\x04vmId\x12\x18\n" +
-	"\abacking\x18\a \x01(\bR\abacking\"g\n" +
+	"\abacking\x18\a \x01(\bR\abacking\x12\"\n" +
+	"\rvm_created_at\x18\b \x01(\tR\vvmCreatedAt\"\x8a\x01\n" +
 	"\x12LUNHoldersResponse\x120\n" +
 	"\aholders\x18\x01 \x03(\v2\x16.litevirt.v1.LUNHolderR\aholders\x12\x1f\n" +
 	"\vanswered_by\x18\x02 \x01(\tR\n" +
-	"answeredBy\"E\n" +
+	"answeredBy\x12!\n" +
+	"\fhold_present\x18\x03 \x01(\bR\vholdPresent\"E\n" +
 	"\x1aPreflightRecreateVMRequest\x12'\n" +
 	"\x04spec\x18\x01 \x01(\v2\x13.litevirt.v1.VMSpecR\x04spec*V\n" +
 	"\x0eRelayVIPResult\x12\x15\n" +

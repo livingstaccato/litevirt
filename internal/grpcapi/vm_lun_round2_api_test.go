@@ -45,7 +45,7 @@ func TestRebuildVM_ISCSI_HoldsTheLUNAcrossTheTeardown(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 	spec := lunVM("a", "lun0").Spec
-	hctx, release, err := s.preflightLUNs(ctx, spec, vmRecord(t, s, "a"))
+	hctx, release, err := s.preflightLUNs(ctx, spec, vmRecord(t, s, "a"), "")
 	if err != nil {
 		t.Fatalf("preflight: %v", err)
 	}

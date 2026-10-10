@@ -19,6 +19,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/claims"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/randid"
 	"github.com/litevirt/litevirt/internal/storage"
 )
@@ -66,12 +67,14 @@ import (
 // allocation gone since the last walker.
 //
 // A rebuild or a recreate MOVES the claim of the VM it replaces: its preflight
-// (preflightLUNs), before the teardown, takes this host's registry hold, then
-// decides the LUN's next allocation for the VM with this host as allocator —
-// passing over the VM's own earlier one — and keeps the hold until the
-// re-created VM's rows are here (holdUntilRows). A racing create meets the new
-// allocation and asks this host. The create then takes the LUN over without a
-// claim of its own, so nothing about the claim can refuse after the teardown.
+// (preflightLUNs), before the teardown, takes this host's hold — durable,
+// released only on positive evidence (vm_lun_hold.go) — then, once nothing
+// else can refuse, decides the LUN's next allocation for the VM with this
+// host as allocator and the host the VM is re-created on (RunHost) beside it,
+// passing over the VM's own earlier one. A racing create meets the new
+// allocation and asks both hosts. The create then takes the LUN over without
+// a claim of its own — while this host's hold stands — so nothing about the
+// claim can refuse after the teardown.
 //
 // THE GATE. Nothing is allocated on a fixed-device pool until the release
 // feature iscsi_lun_claim is open and a member voter generation is adopted
@@ -276,6 +279,14 @@ func (s *Server) fixedDeviceUses(ctx context.Context, spec *pb.VMSpec) ([]lunUse
 	return uses, nil
 }
 
+// hasFixedDeviceDisk reports whether spec puts a disk on a fixed device (an
+// iscsi LUN). A disk whose storage does not resolve counts as none; the
+// create reports it.
+func (s *Server) hasFixedDeviceDisk(ctx context.Context, spec *pb.VMSpec) bool {
+	uses, err := s.fixedDeviceUses(ctx, spec)
+	return err == nil && len(uses) > 0
+}
+
 // lunHold is a create's hold on its LUNs.
 type lunHold struct {
 	s    *Server
@@ -367,13 +378,28 @@ func (s *Server) claimLUNs(ctx context.Context, spec *pb.VMSpec) (*lunHold, erro
 	// Anything this host already knows holds a LUN refuses before a
 	// generation is spent on it. The VM's own name is not a holder here: an
 	// orphan domain of that name is cleaned up by the create.
-	here, err := s.lunHoldersHere(ctx, keys, rep, hasRep, id, spec.Name)
+	here, err := s.lunHoldersHere(ctx, keys, rep, hasRep, id, lunHandoffFrom(ctx), spec.Name)
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable, "cannot confirm iSCSI LUN %s is free: read disks: %v",
 			uses[0].device, err)
 	}
 	if len(here) > 0 {
 		return nil, lunHeldError(spec.Name, byKey[here[0].Lun], here[0])
+	}
+	// A LUN taken over from a moved claim is taken only while the host that
+	// moved it still holds it — asked after this create's own registration
+	// above, so a racer that found both hosts empty cannot meet this create
+	// going on (vm_lun_hold.go).
+	var takenKeys []string
+	for _, u := range uses {
+		if taken(u) {
+			takenKeys = append(takenKeys, u.key)
+		}
+	}
+	if len(takenKeys) > 0 && rep.holdToken != "" {
+		if err := s.verifyLUNHold(ctx, spec.Name, rep, takenKeys); err != nil {
+			return nil, err
+		}
 	}
 	for _, u := range uses {
 		if taken(u) {
@@ -382,7 +408,7 @@ func (s *Server) claimLUNs(ctx context.Context, spec *pb.VMSpec) (*lunHold, erro
 		}
 		mine := corrosion.LUNAllocation{LUN: u.key, ClaimID: randid.New(), VMID: spec.Uuid, VMName: spec.Name,
 			Disk: u.disk, Host: s.hostName}
-		g, err := s.allocateLUN(ctx, spec.Name, u, mine, rep, hasRep, id)
+		g, err := s.allocateLUN(ctx, spec.Name, u, mine, rep, hasRep, id, lunHandoffFrom(ctx))
 		if err != nil {
 			return nil, err
 		}
@@ -390,6 +416,31 @@ func (s *Server) claimLUNs(ctx context.Context, spec *pb.VMSpec) (*lunHold, erro
 	}
 	ok = true
 	return hold, nil
+}
+
+// verifyLUNHold refuses the create of vm unless the host that moved its
+// claim (rep.holdHost) still holds rep.holdToken on every key.
+func (s *Server) verifyLUNHold(ctx context.Context, vm string, rep replacedVM, keys []string) error {
+	var present bool
+	var err error
+	if rep.holdHost == "" || rep.holdHost == s.hostName {
+		present, err = s.lunHoldPresent(rep.holdToken, keys)
+	} else {
+		var resp *pb.LUNHoldersResponse
+		resp, err = s.askLUNHoldersResp(ctx, rep.holdHost, &pb.LUNHoldersRequest{Luns: keys, HoldToken: rep.holdToken})
+		present = err == nil && resp.HoldPresent
+	}
+	if err != nil {
+		return status.Errorf(codes.Unavailable,
+			"VM %q: cannot confirm with %s that it still holds the iSCSI LUN it moved for this re-create (%v); "+
+				"nothing was started", vm, rep.holdHost, err)
+	}
+	if !present {
+		return status.Errorf(codes.Aborted,
+			"VM %q: %s no longer holds the iSCSI LUN it moved for this re-create — the re-create was given up, "+
+				"and the LUN may since be another VM's; nothing was started", vm, rep.holdHost)
+	}
+	return nil
 }
 
 // lunWalkStart is where a walk of lun's allocations starts: its checkpoint,
@@ -432,7 +483,7 @@ func lunDecisionError(u lunUse, vm string, err error) error {
 // allocateLUN walks u's LUN's allocations from the checkpoint until one is
 // decided for mine, and returns its generation. An allocation decided for
 // another create is gone, or refuses.
-func (s *Server) allocateLUN(ctx context.Context, vm string, u lunUse, mine corrosion.LUNAllocation, rep replacedVM, hasRep bool, reg uint64) (int64, error) {
+func (s *Server) allocateLUN(ctx context.Context, vm string, u lunUse, mine corrosion.LUNAllocation, rep replacedVM, hasRep bool, reg uint64, ownHold string) (int64, error) {
 	el, err := s.lunElectorate(ctx)
 	if err != nil {
 		return 0, err
@@ -443,9 +494,12 @@ func (s *Server) allocateLUN(ctx context.Context, vm string, u lunUse, mine corr
 	}
 	// An allocation of the VM a rebuild or recreate replaces (its name and
 	// this disk) is passed over once nothing but that VM holds the LUN — the
-	// claim MOVES to the allocation this walk decides — but the checkpoint
-	// moves past it only once the new allocation is decided: until then a
-	// walker must still meet the old one (re-review 2, C-1).
+	// claim MOVES to the allocation this walk decides — and the checkpoint
+	// moves past it only once the new allocation is decided (re-review 2,
+	// C-1). That deferral is defence in depth, not what keeps the old
+	// allocation in view: every walk starts one below the checkpoint
+	// (lunWalkStart), so an advance made at once would still leave a walker
+	// deciding the old allocation and meeting its holder (re-review 3, m-3).
 	passedOwn := false
 	for g := start; g < start+lunMaxGenerations; g++ {
 		mine.Generation = g
@@ -465,7 +519,7 @@ func (s *Server) allocateLUN(ctx context.Context, vm string, u lunUse, mine corr
 			}
 			return g, nil
 		}
-		holder, err := s.lunAllocationHolder(ctx, el, *a, rep, hasRep, reg)
+		holder, err := s.lunAllocationHolder(ctx, el, *a, rep, hasRep, reg, ownHold)
 		if err != nil {
 			return 0, err
 		}
@@ -528,25 +582,46 @@ func (s *Server) learnLUN(ctx context.Context, el lunElectorateT, lun string, g 
 // lunAllocationHolder returns what still holds allocation a, or nil once it
 // is PROVEN gone (see the file comment): nothing here — registry, replica,
 // libvirt — holds the LUN, and the host that ran a's create either answers,
-// by name, that nothing there does, or is recorded removed. reg is the asking
-// create's own registration, which is not a holder.
-func (s *Server) lunAllocationHolder(ctx context.Context, el lunElectorateT, a corrosion.LUNAllocation, rep replacedVM, hasRep bool, reg uint64) (*pb.LUNHolder, error) {
+// by name, that nothing there does, or is recorded removed. reg and ownHold
+// are the asking create's own registration and hold, which are not holders.
+//
+// A MOVED allocation (a rebuild's or recreate's, vm_lun_hold.go) names two
+// hosts: Host, which holds the claim, and RunHost, which runs the re-created
+// VM. It is gone only when BOTH show nothing (or are recorded removed), and
+// Host is asked first — the order the hold's release relies on.
+func (s *Server) lunAllocationHolder(ctx context.Context, el lunElectorateT, a corrosion.LUNAllocation, rep replacedVM, hasRep bool, reg uint64, ownHold string) (*pb.LUNHolder, error) {
 	keys := map[string]bool{a.LUN: true}
-	here, err := s.lunHoldersHere(ctx, keys, rep, hasRep, reg, "")
+	here, err := s.lunHoldersHere(ctx, keys, rep, hasRep, reg, ownHold, "")
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable, "read disks: %v", err)
 	}
 	if len(here) > 0 {
 		return here[0], nil
 	}
-	if a.Host == s.hostName {
-		return nil, nil // this host's registry, replica and domains were just read
+	hosts := []string{a.Host}
+	if a.RunHost != "" && a.RunHost != a.Host {
+		hosts = append(hosts, a.RunHost)
 	}
+	for _, host := range hosts {
+		if host == s.hostName {
+			continue // this host's registry, holds, replica and domains were just read
+		}
+		holder, err := s.lunAllocationHolderOn(ctx, el, a, host, rep, hasRep)
+		if err != nil || holder != nil {
+			return holder, err
+		}
+	}
+	return nil, nil
+}
+
+// lunAllocationHolderOn asks host what holds allocation a: its holder, nil
+// once host shows nothing or its removal is recorded, or Unavailable.
+func (s *Server) lunAllocationHolderOn(ctx context.Context, el lunElectorateT, a corrosion.LUNAllocation, host string, rep replacedVM, hasRep bool) (*pb.LUNHolder, error) {
 	req := &pb.LUNHoldersRequest{Luns: []string{a.LUN}}
 	if hasRep {
 		req.ReplacedName, req.ReplacedCreatedAt = rep.name, rep.snap.CreatedAt
 	}
-	there, askErr := s.askLUNHolders(ctx, a.Host, req)
+	there, askErr := s.askLUNHolders(ctx, host, req)
 	if askErr == nil {
 		if len(there) > 0 {
 			return there[0], nil
@@ -554,20 +629,20 @@ func (s *Server) lunAllocationHolder(ctx context.Context, el lunElectorateT, a c
 		return nil, nil
 	}
 	// No answer. Gone only on a record of the host's removal.
-	if removed, err := corrosion.HostRemoved(ctx, s.db, a.Host); err == nil && removed {
-		slog.Info("iSCSI LUN: the host that took an earlier allocation was removed from the cluster",
-			"lun", a.LUN, "generation", a.Generation, "host", a.Host, "vm", a.VMName)
+	if removed, err := corrosion.HostRemoved(ctx, s.db, host); err == nil && removed {
+		slog.Info("iSCSI LUN: a host of an earlier allocation was removed from the cluster",
+			"lun", a.LUN, "generation", a.Generation, "host", host, "vm", a.VMName)
 		return nil, nil
 	}
-	if s.votedOut(ctx, el, a.Host) {
-		slog.Info("iSCSI LUN: the host that took an earlier allocation was removed from the voters, and has no "+
-			"row here", "lun", a.LUN, "host", a.Host)
+	if s.votedOut(ctx, el, host) {
+		slog.Info("iSCSI LUN: a host of an earlier allocation was removed from the voters, and has no "+
+			"row here", "lun", a.LUN, "host", host)
 		return nil, nil
 	}
 	return nil, status.Errorf(codes.Unavailable,
 		"iSCSI LUN %s was taken by a create of VM %q on %s, which cannot be asked whether that create is gone (%v), "+
 			"and whose removal from the cluster is not recorded here; nothing was allocated — retry once %s answers, "+
-			"or once it is removed (lv host rm)", a.LUN, a.VMName, a.Host, askErr, a.Host)
+			"or once it is removed (lv host rm)", a.LUN, a.VMName, host, askErr, host)
 }
 
 // votedOut reports whether the adopted voter generation records host's
@@ -630,17 +705,35 @@ func lunUseLabel(h *pb.LUNHolder) string {
 }
 
 // lunHoldersHere is what this host knows holds any of keys: its in-flight
-// creates (except registration own); every live VM's use of the LUN in its
-// replica — as a disk, or as a linked clone's base — except the replaced
-// incarnation's rows (name AND created_at); and every libvirt domain on this
-// host whose disks use the LUN — a guest running with no row still holds it —
-// except the replaced VM's domain and selfDomain (the VM this host is
-// creating, whose orphan the create cleans up). Sorted, so a refusal names
-// the same holder each time.
-func (s *Server) lunHoldersHere(ctx context.Context, keys map[string]bool, rep replacedVM, hasRep bool, own uint64, selfDomain string) ([]*pb.LUNHolder, error) {
+// creates (except registration own); its moved holds (vm_lun_hold.go; except
+// the hold ownHold); every live VM's use of the LUN in its replica — as a
+// disk, or as a linked clone's base — except the replaced incarnation's rows
+// (name AND created_at); and every libvirt domain on this host whose disks use
+// the LUN — a guest running with no row still holds it — except the replaced
+// VM's domain and selfDomain (the VM this host is creating, whose orphan the
+// create cleans up). Sorted, so a refusal names the same holder each time.
+func (s *Server) lunHoldersHere(ctx context.Context, keys map[string]bool, rep replacedVM, hasRep bool, own uint64, ownHold, selfDomain string) ([]*pb.LUNHolder, error) {
 	var out []*pb.LUNHolder
 	for k, c := range s.lunClaims.holding(keys, own) {
 		out = append(out, &pb.LUNHolder{Lun: k, VmName: c.vm, DiskName: c.disk, HostName: s.hostName, InFlight: true, VmId: c.vmID})
+	}
+	holds, err := s.lunHoldHolders(keys, ownHold)
+	if err != nil {
+		return nil, err
+	}
+	for _, h := range holds {
+		// A hold whose re-create is still running here is in the registry
+		// too: name it once.
+		dup := false
+		for _, o := range out {
+			if o.InFlight && o.Lun == h.Lun && o.VmName == h.VmName {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			out = append(out, h)
+		}
 	}
 	uses, err := corrosion.LiveVMDiskUsesWithPathPrefix(ctx, s.db, iscsiDevicePrefix)
 	if err != nil {
@@ -655,7 +748,7 @@ func (s *Server) lunHoldersHere(ctx context.Context, keys map[string]bool, rep r
 			continue
 		}
 		out = append(out, &pb.LUNHolder{Lun: k, VmName: d.VMName, DiskName: d.DiskName, HostName: d.HostName,
-			Backing: d.Via == "backing"})
+			Backing: d.Via == "backing", VmCreatedAt: d.VMCreatedAt})
 	}
 	if s.virt != nil {
 		names, err := s.virt.ListDomains()
@@ -668,8 +761,13 @@ func (s *Server) lunHoldersHere(ctx context.Context, keys map[string]bool, rep r
 			}
 			x, err := s.virt.DumpXML(dom)
 			if err != nil {
-				if !s.virt.DomainExists(dom) {
-					continue // undefined since it was listed: it holds nothing
+				// Only libvirt saying the domain does not exist — undefined
+				// since it was listed — lets it hold nothing. Any other error
+				// (a dropped connection makes every lookup fail too) fails the
+				// answer: a guest with no row must never read as nothing
+				// (re-review 3, m-2).
+				if lv.IsNoDomain(err) {
+					continue
 				}
 				return nil, fmt.Errorf("read domain %s: %w", dom, err)
 			}
@@ -750,6 +848,16 @@ func sortLUNHolders(hs []*pb.LUNHolder) {
 // connection shows the answering certificate, its CN is the host. An answer
 // never adds a LUN that was not asked about.
 func (s *Server) askLUNHolders(ctx context.Context, host string, req *pb.LUNHoldersRequest) ([]*pb.LUNHolder, error) {
+	resp, err := s.askLUNHoldersResp(ctx, host, req)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Holders, nil
+}
+
+// askLUNHoldersResp is askLUNHolders' whole answer, its holders limited to
+// the LUNs asked.
+func (s *Server) askLUNHoldersResp(ctx context.Context, host string, req *pb.LUNHoldersRequest) (*pb.LUNHoldersResponse, error) {
 	ctx, cancel := context.WithTimeout(ctx, lunPeerAskTimeout)
 	defer cancel()
 	c, done, err := s.dialPeer(ctx, host)
@@ -780,7 +888,7 @@ func (s *Server) askLUNHolders(ctx context.Context, host string, req *pb.LUNHold
 			out = append(out, h)
 		}
 	}
-	return out, nil
+	return &pb.LUNHoldersResponse{Holders: out, AnsweredBy: resp.GetAnsweredBy(), HoldPresent: resp.GetHoldPresent()}, nil
 }
 
 // LUNHolders answers, from this host's in-flight creates, its replica and its
@@ -803,9 +911,15 @@ func (s *Server) LUNHolders(ctx context.Context, req *pb.LUNHoldersRequest) (*pb
 	if hasRep {
 		rep = replacedVM{name: req.ReplacedName, snap: corrosion.VMDeleteSnapshot{CreatedAt: req.ReplacedCreatedAt}}
 	}
-	holders, err := s.lunHoldersHere(ctx, keys, rep, hasRep, 0, "")
+	holders, err := s.lunHoldersHere(ctx, keys, rep, hasRep, 0, "", "")
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "read disks: %v", err)
 	}
-	return &pb.LUNHoldersResponse{Holders: holders, AnsweredBy: s.hostName}, nil
+	resp := &pb.LUNHoldersResponse{Holders: holders, AnsweredBy: s.hostName}
+	if req.HoldToken != "" {
+		if resp.HoldPresent, err = s.lunHoldPresent(req.HoldToken, req.Luns); err != nil {
+			return nil, status.Errorf(codes.Internal, "read the holds: %v", err)
+		}
+	}
+	return resp, nil
 }

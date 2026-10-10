@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -250,30 +251,32 @@ func lunBlank(r io.ReaderAt, size int64) (bool, error) {
 type lunPreflightKey struct{}
 
 // preflightLUNs judges, before cur is torn down to be created again from
-// spec, everything about its iSCSI LUNs the create would judge, so that
-// nothing about them refuses after the teardown — and MOVES the claim:
+// spec on runHost, everything about its iSCSI LUNs the create would judge, so
+// that nothing about them refuses after the teardown — and MOVES the claim:
 //
 //   - the release gate and the voter generation;
-//   - this host's registry hold on every LUN, taken FIRST (a LUN another
-//     create holds refuses here) and kept until the re-created VM's rows are
-//     visible on this host (holdUntilRows);
+//   - this host's hold on every LUN, taken FIRST (a LUN another create holds
+//     refuses here): its registry entry, and its durable record
+//     (vm_lun_hold.go), which outlives the re-create and a restart and is
+//     released only on positive evidence;
 //   - another VM, or a domain, using a LUN (cur's own rows and domain aside);
-//   - each LUN's next allocation, decided now for the VM with THIS host as
-//     its allocator: every allocation before it is proven gone, cur's own
-//     (its name and the disk) passed over once nothing but cur holds the LUN.
-//     A racing create meets the new allocation and asks this host, which
-//     holds it (re-review 2, C-1);
 //   - for a root disk built on an image that is written: the image's format
 //     (no device needed), then the size and blank checks where this host can
 //     open the device;
 //   - a root disk cur keeps whose image changes: refused unless the disk says
-//     overwrite (review m-3).
+//     overwrite (review m-3);
+//   - LAST, once nothing above can refuse (re-review 3, m-1): each LUN's next
+//     allocation, decided for the VM with THIS host as its allocator and
+//     runHost, where the re-created VM runs, beside it. Every allocation
+//     before it is proven gone, cur's own (its name and the disk) passed over
+//     once nothing but cur holds the LUN. A racing create meets the new
+//     allocation and asks both hosts (re-review 2, C-1; re-review 3, I-2).
 //
 // The returned context carries the claims and the hold into the create
-// (withReplacedLUNs takes them over); release drops the hold — call it at
-// once if the create is not attempted or fails, or holdUntilRows after a
-// create that committed.
-func (s *Server) preflightLUNs(ctx context.Context, spec *pb.VMSpec, cur *corrosion.VMRecord) (context.Context, func(), error) {
+// (withReplacedLUNs takes them over); done marks the re-create returned —
+// call it once the create has returned, whatever its outcome. The hold stays
+// until its evidence arrives.
+func (s *Server) preflightLUNs(ctx context.Context, spec *pb.VMSpec, cur *corrosion.VMRecord, runHost string) (context.Context, func(), error) {
 	noop := func() {}
 	uses, err := s.fixedDeviceUses(ctx, spec)
 	if err != nil || len(uses) == 0 {
@@ -281,6 +284,9 @@ func (s *Server) preflightLUNs(ctx context.Context, spec *pb.VMSpec, cur *corros
 	}
 	if err := s.iscsiLUNClaimGate(ctx); err != nil {
 		return ctx, noop, err
+	}
+	if runHost == "" {
+		runHost = s.hostName
 	}
 	rep := replacedVM{name: cur.Name, snap: corrosion.VMDeleteSnapshot{CreatedAt: cur.CreatedAt}}
 	if cs := vmSpecFor(cur); cs != nil {
@@ -298,44 +304,40 @@ func (s *Server) preflightLUNs(ctx context.Context, spec *pb.VMSpec, cur *corros
 	}
 	keys := map[string]bool{}
 	byKey := map[string]lunUse{}
+	held := map[string]string{}
 	for _, u := range uses {
-		keys[u.key], byKey[u.key] = true, u
+		keys[u.key], byKey[u.key], held[u.key] = true, u, u.disk
 	}
 	// The hold first: from here on no create on this host takes these LUNs,
 	// and a create on another host that meets the moved claim is told they
 	// are in flight (review m-1: a hold that cannot be taken refuses now).
 	token := randid.New()
-	holdID, drop, heldKey, held := s.lunClaims.take(cur.Name, "", token, uses)
+	holdID, drop, heldKey, holder := s.lunClaims.take(cur.Name, "", token, uses)
 	if drop == nil {
 		return ctx, noop, lunHeldError(spec.Name, byKey[heldKey], &pb.LUNHolder{
-			Lun: heldKey, VmName: held.vm, DiskName: held.disk, HostName: s.hostName, InFlight: true, VmId: held.vmID,
+			Lun: heldKey, VmName: holder.vm, DiskName: holder.disk, HostName: s.hostName, InFlight: true, VmId: holder.vmID,
 		})
+	}
+	if err := s.putLUNHold(&lunHoldRecord{Token: token, VM: cur.Name, ReplacedCreatedAt: cur.CreatedAt, LUNs: held,
+		RunHost: runHost, Since: time.Now().UTC().Format(time.RFC3339Nano)}); err != nil {
+		drop()
+		return ctx, noop, status.Errorf(codes.Unavailable, "cannot record this host's hold on the VM's iSCSI LUNs: %v", err)
 	}
 	ok := false
 	defer func() {
 		if !ok {
+			// Refused before the teardown: the VM still holds its LUNs
+			// as it did, so the hold goes with nothing to wait for.
+			s.abandonLUNHold(token)
 			drop()
 		}
 	}()
-	here, err := s.lunHoldersHere(ctx, keys, rep, true, holdID, "")
+	here, err := s.lunHoldersHere(ctx, keys, rep, true, holdID, token, "")
 	if err != nil {
 		return ctx, noop, status.Errorf(codes.Unavailable, "read disks: %v", err)
 	}
 	if len(here) > 0 {
 		return ctx, noop, lunHeldError(spec.Name, byKey[here[0].Lun], here[0])
-	}
-	vmID := rep.uuid
-	if vmID == "" {
-		vmID = cur.Name + "@" + cur.CreatedAt
-	}
-	claimed := map[string]string{}
-	for _, u := range uses {
-		mine := corrosion.LUNAllocation{LUN: u.key, ClaimID: randid.New(), VMID: vmID, VMName: cur.Name,
-			Disk: u.disk, Host: s.hostName}
-		if _, err := s.allocateLUN(ctx, spec.Name, u, mine, rep, true, holdID); err != nil {
-			return ctx, noop, err
-		}
-		claimed[u.key] = u.disk
 	}
 	if spec.Image != "" {
 		for _, d := range spec.Disks {
@@ -380,50 +382,34 @@ func (s *Server) preflightLUNs(ctx context.Context, spec *pb.VMSpec, cur *corros
 			}
 		}
 	}
+	vmID := rep.uuid
+	if vmID == "" {
+		vmID = cur.Name + "@" + cur.CreatedAt
+	}
+	moved := ""
+	if runHost != s.hostName {
+		moved = runHost
+	}
+	claimed := map[string]string{}
+	for _, u := range uses {
+		mine := corrosion.LUNAllocation{LUN: u.key, ClaimID: randid.New(), VMID: vmID, VMName: cur.Name,
+			Disk: u.disk, Host: s.hostName, RunHost: moved}
+		if _, err := s.allocateLUN(ctx, spec.Name, u, mine, rep, true, holdID, token); err != nil {
+			return ctx, noop, err
+		}
+		claimed[u.key] = u.disk
+	}
 	ok = true
 	ctx = context.WithValue(ctx, lunPreflightKey{}, claimed)
 	ctx = context.WithValue(ctx, lunHandoffKey{}, token)
-	return ctx, drop, nil
+	var once sync.Once
+	return ctx, func() {
+		once.Do(func() {
+			drop()
+			s.finishLUNHold(token)
+		})
+	}, nil
 }
-
-// holdUntilRows keeps a recreate's registry hold (release) until this host's
-// replica shows vm's live disk rows on every LUN in keys — from then on its
-// rows answer for the moved claim — or until lunHoldRowsWait passes, after
-// which it is released and logged: the rows are then long replicated or the
-// create never committed them.
-func (s *Server) holdUntilRows(vm string, keys map[string]bool, release func()) {
-	if len(keys) == 0 {
-		release()
-		return
-	}
-	go func() {
-		defer release()
-		deadline := time.Now().Add(lunHoldRowsWait)
-		for time.Now().Before(deadline) {
-			uses, err := corrosion.LiveVMDiskUsesWithPathPrefix(context.Background(), s.db, iscsiDevicePrefix)
-			if err == nil {
-				seen := map[string]bool{}
-				for _, u := range uses {
-					if k, ok := storage.FixedDeviceKeyOfPath(u.Path); ok && u.VMName == vm && keys[k] {
-						seen[k] = true
-					}
-				}
-				if len(seen) == len(keys) {
-					return
-				}
-			}
-			time.Sleep(lunHoldRowsPoll)
-		}
-		slog.Warn("iSCSI LUN: a re-created VM's rows did not reach this host in time; releasing its hold",
-			"vm", vm, "waited", lunHoldRowsWait)
-	}()
-}
-
-// lunHoldRowsWait bounds holdUntilRows; lunHoldRowsPoll is its poll.
-var (
-	lunHoldRowsWait = 10 * time.Minute
-	lunHoldRowsPoll = 200 * time.Millisecond
-)
 
 // lunPreflightKeys is the LUN keys a preflight context claimed.
 func lunPreflightKeys(ctx context.Context) map[string]bool {

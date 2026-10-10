@@ -241,6 +241,12 @@ type LUNAllocation struct {
 	VMName     string `json:"vm_name"`
 	Disk       string `json:"disk"`
 	Host       string `json:"host"` // the host running the create
+	// RunHost is set on a MOVED allocation — a rebuild or recreate deciding
+	// its VM's next allocation before the teardown — when the re-created VM
+	// runs on another host than Host: Host holds the claim until that VM's
+	// rows reach it, RunHost runs the VM. The allocation is gone only once
+	// both show nothing (or are recorded removed).
+	RunHost string `json:"run_host,omitempty"`
 }
 
 // ClaimValue is what a claim decides. Exactly one of Proof (a workload
@@ -324,6 +330,11 @@ func (v ClaimValue) Digest() (string, error) {
 		claimField(h, claimLUNValueDomain)
 		for _, f := range []string{l.LUN, i64(l.Generation), l.ClaimID, l.VMID, l.VMName, l.Disk, l.Host} {
 			claimField(h, f)
+		}
+		if l.RunHost != "" {
+			// Only a moved allocation has it, so every other value digests
+			// as it always did.
+			claimField(h, l.RunHost)
 		}
 	case v.Config != nil && v.Proof == nil && v.LUN == nil && v.SourceHost == "":
 		cfg := v.Config

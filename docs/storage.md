@@ -1139,18 +1139,38 @@ hosts back so automatic genesis completes.
 re-created by a compose update keeps its LUN **exactly as it is** — nothing is
 written to it — but its claim **moves**: before the teardown, the host doing
 the rebuild or running the update decides the LUN's next allocation for the
-VM, naming itself as the allocator, after proving every earlier allocation but
-the VM's own gone. It holds the LUN from then until the re-created VM's rows
-are visible on it, so a create that races the teardown meets the new
-allocation and is refused, whichever host created the VM originally or runs it
-now. Everything about the claim is judged before the teardown — no voter
-majority, a LUN another create is taking, an image the root disk could not
-take — so nothing about it can refuse after the VM is torn down. A recreate
-that changes only the VM's image cannot reach a kept root LUN: it is refused
-before the teardown unless the root disk sets `overwrite`, which writes the
-new image over the old system. The previous incarnation is recognised by its
-rows' name and creation time, and its claim by the VM's name and disk with
-nothing else holding the LUN — never by a name alone.
+VM, after proving every earlier allocation but the VM's own gone. The new
+allocation names two hosts: that host, which holds the claim, and the host
+the VM is re-created on (placed before the teardown, so the create goes
+exactly there). A LUN is free again only when **both** show nothing; either
+one that cannot be asked holds it (`Unavailable`, naming it) until it answers
+or is removed (`lv host rm`). So a create that races the teardown, or comes
+after the re-create returned but before the VM's rows reached every host, is
+refused, whichever host created the VM originally or runs it now. Everything
+about the claim is judged before the teardown — no voter majority, a LUN
+another create is taking, an image the root disk could not take — and the new
+allocation is decided only after all of it passed, so a refused rebuild moves
+nothing and nothing about the claim can refuse after the VM is torn down. A
+recreate that changes only the VM's image cannot reach a kept root LUN: it is
+refused before the teardown unless the root disk sets `overwrite`, which
+writes the new image over the old system. The previous incarnation is
+recognised by its rows' name and creation time, and its claim by the VM's name
+and disk with nothing else holding the LUN — never by a name alone.
+
+The holding host keeps a **durable hold** on the LUN, a record in
+`<data_dir>/iscsi-lun-holds/`: it survives a daemon restart, and nothing
+releases it on a timer or because the re-create returned, with or without an
+error. It is released only on evidence — the re-created incarnation's own rows
+(by creation time) have reached that host, or the host the VM was re-created
+on shows nothing holding the LUN, or that host is recorded removed. While that
+host cannot be asked, the hold stays, however long. The re-created VM's create
+takes the LUN over only after confirming the hold still stands, so a create
+still on its way when the hold was released (its rebuild given up, or the
+holding host restarted) is refused before it starts anything. A rebuild or
+recreate of the same VM while an earlier one's hold stands is refused
+(`Aborted`) until that hold is released, normally seconds after the earlier
+re-create. Do not delete a hold record by hand: it is the only thing that
+answers for the VM until its rows arrive.
 
 **Upgrading.** Allocation on an iscsi pool needs the release feature
 `iscsi_lun_claim`, which opens only once the whole cluster runs a build that

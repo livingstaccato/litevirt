@@ -4631,6 +4631,10 @@ message LUNHoldersRequest {
     // against the asker; no name alone exempts anything.
     string replaced_name       = 2;
     string replaced_created_at = 3;
+    // A moved claim's hold (its token) the asker needs to know this host still
+    // keeps on every asked LUN: the create of a re-created VM, taking its LUN
+    // over, asks the host that moved the claim before it goes on.
+    string hold_token          = 4;
 }
 message LUNHolder {
     string lun       = 1;
@@ -4644,12 +4648,18 @@ message LUNHolder {
     string vm_id     = 6;
     // The VM reads the LUN as its disk's base (a linked clone), not as its disk.
     bool   backing   = 7;
+    // The incarnation (created_at) of the VM whose row holds the LUN; empty for
+    // an in-flight create or a domain.
+    string vm_created_at = 8;
 }
 message LUNHoldersResponse {
     repeated LUNHolder holders = 1;
     // The host that answered. The asker counts the answer only from the host
     // it asked.
     string answered_by = 2;
+    // The answering host still keeps the hold the request's hold_token names,
+    // on every asked LUN.
+    bool hold_present = 3;
 }
 
 // PreflightRecreateVMRequest is the spec of a VM about to be re-created on the

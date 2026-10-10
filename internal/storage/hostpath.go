@@ -171,6 +171,7 @@ var dataDirOwned = []string{
 	"oci-owners",             // grpcapi/container_paths.go ociOwnersDir
 	"ct-idmap-ledger",        // grpcapi/container_security.go idmapLedgerFile (and its .tmp)
 	"recreate-failed",        // grpcapi/vm_recreate_replaces.go: specs of failed recreates
+	"iscsi-lun-holds",        // grpcapi/vm_lun_hold.go lunHoldDirName: moved iSCSI LUN holds
 	"containers",             // daemon.go: the LXC container root
 	"ct-snapshots",           // snapshot_container.go containerSnapshotDir
 	"ct-restore",             // backup_container.go container restore staging

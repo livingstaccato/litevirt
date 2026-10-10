@@ -265,8 +265,21 @@ func TestFleet_ISCSI_AnAllocationByAHostThisReplicaHasNotSeenIsHeld(t *testing.T
 	if err := createOnLUN(c, n1, "a", "san"); err != nil {
 		t.Fatalf("create a on %s: %v", n1.Name, err)
 	}
+	// Every push of a's rows has landed on n0 before they are taken away,
+	// so no late one brings them back.
+	eventually(t, convergeTimeout, "a's row to reach every node", func() bool {
+		for _, n := range c.Nodes {
+			if !lunVMOn(t, n, "a") {
+				return false
+			}
+		}
+		return true
+	})
 	c.Kill(n1)
-	// n0 has never seen n1, nor a: a replica still catching up.
+	// n0 has never seen n1, nor a: a replica still catching up. node-2 must
+	// not hand a's rows back to it either (a push or relay of rows it
+	// already had made this flaky under -race).
+	c.SetLinkFault(c.Nodes[2], n0, LinkFault{Block: true})
 	ctx := context.Background()
 	for _, q := range []string{`DELETE FROM hosts WHERE name = ?`, `DELETE FROM vm_disks WHERE vm_name = 'a' AND ? <> ''`,
 		`DELETE FROM vms WHERE name = 'a' AND ? <> ''`} {
@@ -399,8 +412,36 @@ func TestFleet_ISCSI_AnInlineRecreateMovesTheClaim(t *testing.T) {
 // recreateRace is the C-1 scenario with the given compose update block.
 func recreateRace(t *testing.T, update string) {
 	t.Helper()
-	c := newLUNFleetN(t, 4)
+	c, web, stack := lunWebStack(t, update)
 	n0, n1, n2, n3 := c.Nodes[0], c.Nodes[1], c.Nodes[2], c.Nodes[3]
+	ctx := context.Background()
+	wait := raceDuringCreate(t, c, web, func() error {
+		eventually(t, convergeTimeout, "web's teardown to reach node-1 and node-2", func() bool {
+			return !lunVMOn(t, n1, web) && !lunVMOn(t, n2, web)
+		})
+		return createOnLUN(c, n2, "db", "san")
+	})
+	// A disk-topology change recreates; the new placement is node-3.
+	deployCollect(t, ctx, c.SelfClient(n0), stack(n3.Name, "      scratch: 1G\n"))
+	if err := wait(); status.Code(err) != codes.Aborted && status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("a create on web's LUN during web's recreate: got %v, want it refused", err)
+	} else if !strings.Contains(err.Error(), web) {
+		t.Fatalf("the racer's refusal does not name %s: %v", web, err)
+	}
+	if lunVMOn(t, n2, "db") {
+		t.Fatal("the racer's VM was persisted: two guests on one LUN")
+	}
+}
+
+// lunWebStack is the reviewer's four-node fleet: a pool on LUN 0, the test
+// image on every node, and stack st's VM web created on node-1 with a data
+// disk on the LUN — its row on every node, and agreed. stack(host, extra)
+// renders st placed on host, extra adding disk lines, with update as its
+// update block.
+func lunWebStack(t *testing.T, update string) (*Cluster, string, func(host, extra string) string) {
+	t.Helper()
+	c := newLUNFleetN(t, 4)
+	n1 := c.Nodes[1]
 	addLUNPool(t, c, "san", 0, onePortal)
 	ctx := context.Background()
 	for _, n := range c.Nodes {
@@ -440,22 +481,7 @@ func recreateRace(t *testing.T, update string) {
 		return true
 	})
 	waitVMAgreed(t, c, web)
-	wait := raceDuringCreate(t, c, web, func() error {
-		eventually(t, convergeTimeout, "web's teardown to reach node-1 and node-2", func() bool {
-			return !lunVMOn(t, n1, web) && !lunVMOn(t, n2, web)
-		})
-		return createOnLUN(c, n2, "db", "san")
-	})
-	// A disk-topology change recreates; the new placement is node-3.
-	deployCollect(t, ctx, c.SelfClient(n0), stack(n3.Name, "      scratch: 1G\n"))
-	if err := wait(); status.Code(err) != codes.Aborted && status.Code(err) != codes.FailedPrecondition {
-		t.Fatalf("a create on web's LUN during web's recreate: got %v, want it refused", err)
-	} else if !strings.Contains(err.Error(), web) {
-		t.Fatalf("the racer's refusal does not name %s: %v", web, err)
-	}
-	if lunVMOn(t, n2, "db") {
-		t.Fatal("the racer's VM was persisted: two guests on one LUN")
-	}
+	return c, web, stack
 }
 
 // C-1 for a VM that moved: web is created on node-1 and migrated to node-2,

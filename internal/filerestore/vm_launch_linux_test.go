@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net"
 	"os"
 	"os/exec"
 	"os/user"
@@ -16,6 +17,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 type memDev struct{ b []byte }
@@ -32,6 +35,7 @@ const noSeccompReal = "qemu-system-x86_64: -sandbox on,obsolete=deny,elevatepriv
 const fakeQemuScript = `#!/bin/sh
 d=$(dirname "$0")
 mode=$(cat "$d/mode")
+case "$*" in *"-run-with help"*) exit 0;; esac
 case "$*" in *"-machine none"*)
   # The sandbox probe.
   echo probe >> "$d/probe.log"
@@ -82,7 +86,8 @@ func newFakeHost(t *testing.T, mode string, allowUnsandboxed bool) *fakeHost {
 	})
 	h.l.kvmPath, h.l.vhostPath = dev, dev
 	h.l.checkAgent = func(string) error { return nil }
-	h.l.appArmor = func() bool { return false }
+	h.l.appArmorState = func() (bool, bool) { return false, false }
+	h.l.skipRootCheck = true
 	return h
 }
 
@@ -227,7 +232,7 @@ func TestSweepStale_KillsOnlyVerifiedRestoreVMs(t *testing.T) {
 			t.Fatal(err)
 		}
 		cmd := exec.Command("sh", "-c", "sleep 300; true", "-name", "litevirt-file-restore",
-			`{"driver":"nbd","server":{"path":"`+filepath.Join(cmdlineDir, "nbd.sock")+`","type":"unix"}}`)
+			`{"driver":"nbd","server":{"path":"`+filepath.Join(cmdlineDir, "nbd-0.sock")+`","type":"unix"}}`)
 		if err := cmd.Start(); err != nil {
 			t.Fatal(err)
 		}
@@ -248,7 +253,7 @@ func TestSweepStale_KillsOnlyVerifiedRestoreVMs(t *testing.T) {
 	_ = os.WriteFile(filepath.Join(garbage, pidFile), []byte("1 0\n"), 0o600)
 
 	time.Sleep(100 * time.Millisecond) // let sh set up its argv
-	if n := SweepStale(run); n != 1 {
+	if n := SweepStale(run, 0); n != 1 {
 		t.Fatalf("killed %d, want 1", n)
 	}
 	done := make(chan error, 1)
@@ -382,32 +387,175 @@ func TestCacheFiles_OwnedVerifiedRebuilt(t *testing.T) {
 	}
 }
 
-// N-1: the restore VM never runs as a user that owns production disks or
-// keys, nor as root, unless allow_unsandboxed says so.
-func TestLookupQemuUser_DedicatedOnly(t *testing.T) {
-	for _, name := range []string{"nobody", "root"} {
-		if _, err := lookupQemuUser(name, false); err == nil {
-			t.Errorf("run_as %q accepted", name)
+// N-1 / R2-M4: root and the shared qemu users are not dedicated identities.
+func TestSharedIdentity(t *testing.T) {
+	if sharedIdentity("x", "0", 0) != "root" {
+		t.Error("root not recognized")
+	}
+	if nb, err := user.Lookup("nobody"); err == nil {
+		v, _ := strconv.ParseUint(nb.Uid, 10, 32)
+		if got := sharedIdentity("anything", nb.Uid, uint32(v)); !strings.Contains(got, "nobody") {
+			t.Errorf("nobody's uid: %q", got)
 		}
 	}
-	if u, err := lookupQemuUser("nobody", true); err != nil || u == nil {
-		t.Errorf("nobody with allow_unsandboxed: %v %v", u, err)
+	if sharedIdentity("x", "4242424", 4242424) != "" {
+		t.Error("an unknown uid read as shared")
 	}
-	if u, err := lookupQemuUser("root", true); err != nil || u != nil {
-		t.Errorf("root with allow_unsandboxed: %v %v (want no credential)", u, err)
+}
+
+// R2-M4: an existing account is the restore account only if it is what the
+// daemon would create: a system uid, no shell, a uid no one else has.
+func TestValidateRestoreAccount(t *testing.T) {
+	pw := filepath.Join(t.TempDir(), "passwd")
+	old := passwdPath
+	passwdPath = pw
+	defer func() { passwdPath = old }()
+	write := func(lines ...string) {
+		_ = os.WriteFile(pw, []byte(strings.Join(lines, "\n")+"\n"), 0o644)
 	}
-	if _, err := user.Lookup("libvirt-qemu"); err == nil {
-		if _, err := lookupQemuUser("libvirt-qemu", false); err == nil || !strings.Contains(err.Error(), "production") {
-			t.Errorf("libvirt-qemu: %v", err)
+	u := &user.User{Username: "litevirt-restore", Uid: "993", Gid: "986"}
+	write("litevirt-restore:x:993:986::/nonexistent:/bin/bash")
+	if err := validateRestoreAccount(u, 993, 986, 993); err == nil || !strings.Contains(err.Error(), "login shell") {
+		t.Errorf("a login shell: %v", err)
+	}
+	write("litevirt-restore:x:993:986::/nonexistent:/usr/sbin/nologin", "other:x:993:993::/:/usr/sbin/nologin")
+	if err := validateRestoreAccount(u, 993, 986, 993); err == nil || !strings.Contains(err.Error(), "shares uid 993 with other") {
+		t.Errorf("a shared uid: %v", err)
+	}
+	if err := validateRestoreAccount(&user.User{Username: "litevirt-restore", Uid: "5000"}, 5000, 986, 993); err == nil || !strings.Contains(err.Error(), "system uid") {
+		t.Errorf("a non-system uid: %v", err)
+	}
+	write("someone:x:1:1::/:/usr/sbin/nologin")
+	if err := validateRestoreAccount(u, 993, 986, 993); err == nil || !strings.Contains(err.Error(), "not in") {
+		t.Errorf("an account not in passwd: %v", err)
+	}
+	// Groups: its own and kvm only.
+	write("litevirt-restore:x:993:986::/nonexistent:/usr/sbin/nologin")
+	oldG := groupIDs
+	defer func() { groupIDs = oldG }()
+	groupIDs = func(*user.User) ([]string, error) { return []string{"986", "993"}, nil }
+	if err := validateRestoreAccount(u, 993, 986, 993); err != nil {
+		t.Errorf("own group and kvm: %v", err)
+	}
+	groupIDs = func(*user.User) ([]string, error) { return []string{"986", "993", "6"}, nil }
+	if err := validateRestoreAccount(u, 993, 986, 993); err == nil || !strings.Contains(err.Error(), "is in group") {
+		t.Errorf("an extra group (disk): %v", err)
+	}
+}
+
+// R2-I1: every session gets its own uid from the reserved range, and a
+// released uid is reused.
+func TestAllocUID_DistinctPerSession(t *testing.T) {
+	l := NewLauncher(Config{UIDBase: 3_800_000_000})
+	seen := map[uint32]bool{}
+	var rel []func()
+	for i := 0; i < UIDSlots; i++ {
+		uid, r, err := l.allocUID()
+		if err != nil {
+			t.Fatalf("slot %d: %v", i, err)
+		}
+		if seen[uid] || uid < 3_800_000_000 || uid >= 3_800_000_000+UIDSlots {
+			t.Fatalf("uid %d reused or outside the range", uid)
+		}
+		seen[uid] = true
+		rel = append(rel, r)
+	}
+	if _, _, err := l.allocUID(); err == nil {
+		t.Fatal("a 65th session got a uid")
+	}
+	rel[7]()
+	if uid, _, err := l.allocUID(); err != nil || uid != 3_800_000_007 {
+		t.Fatalf("a released uid is not reused: %d %v", uid, err)
+	}
+}
+
+// Nit 8: a passed sandbox probe is reused for the same binary, but only for
+// probeTTL; a failed one is never cached.
+func TestSandboxProbe_CachedWithTTL(t *testing.T) {
+	dir := t.TempDir()
+	count := filepath.Join(dir, "count")
+	qemu := filepath.Join(dir, "qemu")
+	if err := os.WriteFile(qemu, []byte("#!/bin/sh\necho x >> "+count+"\nexec sleep 5\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runs := func() int { b, _ := os.ReadFile(count); return strings.Count(string(b), "x") }
+	l := NewLauncher(Config{})
+	ctx := context.Background()
+	for i := 0; i < 2; i++ {
+		if ok, msg := l.sandboxOK(ctx, qemu, nil); !ok {
+			t.Fatalf("probe %d: %s", i, msg)
 		}
 	}
-	u, err := lookupQemuUser("", false)
-	if _, lerr := user.Lookup(DefaultRestoreUser); lerr != nil {
-		if err == nil || !strings.Contains(err.Error(), "useradd") {
-			t.Errorf("no %s: %v", DefaultRestoreUser, err)
+	if n := runs(); n != 1 {
+		t.Fatalf("probed %d times, want 1 (cached)", n)
+	}
+	for k := range l.probeCache {
+		l.probeCache[k] = time.Now().Add(-probeTTL - time.Second)
+	}
+	if ok, _ := l.sandboxOK(ctx, qemu, nil); !ok || runs() != 2 {
+		t.Fatalf("an expired pass was trusted: probed %d times", runs())
+	}
+}
+
+// R2-I1 / R2-M2: the sweep also finds a restore VM by its reserved uid,
+// when its pidfile — or its trampoline — is gone.
+func TestSweepStale_ByReservedUID(t *testing.T) {
+	orphan := exec.Command("sh", "-c", "sleep 300; true", "-name", "litevirt-file-restore")
+	other := exec.Command("sh", "-c", "sleep 300; true", "-name", "something-else")
+	for _, c := range []*exec.Cmd{orphan, other} {
+		if err := c.Start(); err != nil {
+			t.Fatal(err)
 		}
-	} else if err != nil || u == nil || u.name != DefaultRestoreUser {
-		t.Errorf("default user: %+v %v", u, err)
+		c := c
+		t.Cleanup(func() { _ = c.Process.Kill(); _ = c.Wait() })
+	}
+	time.Sleep(100 * time.Millisecond)
+	// This test's own uid stands in for the reserved range.
+	if n := SweepStale(t.TempDir(), uint32(os.Getuid())); n < 1 {
+		t.Fatalf("killed %d, want the orphan", n)
+	}
+	done := make(chan error, 1)
+	go func() { done <- orphan.Wait() }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("an orphaned restore VM in the reserved uid range survived the sweep")
+	}
+	if err := other.Process.Signal(syscall.Signal(0)); err != nil {
+		t.Fatal("a process that is not a restore VM was killed")
+	}
+}
+
+// Nit 5: a session's boot files are never collected while it uses them;
+// superseded ones go once no session uses them.
+func TestBootFilesGC(t *testing.T) {
+	cache := t.TempDir()
+	l := NewLauncher(Config{CacheDir: cache})
+	put := func(names ...string) {
+		for _, f := range names {
+			_ = os.WriteFile(filepath.Join(cache, f), []byte("x"), 0o440)
+		}
+	}
+	exists := func(f string) bool { _, err := os.Stat(filepath.Join(cache, f)); return err == nil }
+	put("kernel-stray")
+	put("initramfs-old.cpio", "initramfs-old.cpio.sha256")
+	releaseOld := l.useBootFiles(true, filepath.Join(cache, "initramfs-old.cpio")) // a session boots the old build
+	if exists("kernel-stray") {
+		t.Fatal("an unused boot file was kept")
+	}
+	put("initramfs-new.cpio") // the binary was upgraded: a new build
+	releaseNew := l.useBootFiles(true, filepath.Join(cache, "initramfs-new.cpio"))
+	if !exists("initramfs-old.cpio") {
+		t.Fatal("a boot file a running session uses was collected")
+	}
+	releaseOld()
+	releaseNew()
+	l.useBootFiles(true, filepath.Join(cache, "initramfs-new.cpio"))()
+	if exists("initramfs-old.cpio") || exists("initramfs-old.cpio.sha256") {
+		t.Fatal("a released, superseded boot file was kept")
+	}
+	if !exists("initramfs-new.cpio") {
+		t.Fatal("the current boot file was collected")
 	}
 }
 
@@ -419,10 +567,12 @@ func TestAppArmorProfileText(t *testing.T) {
 	for _, want := range []string{
 		"profile " + AppArmorProfile,
 		"/var/cache/litevirt-restore/* r,",
-		"/run/litevirt/file-restore/s-*/nbd.sock rw,",
+		"/run/litevirt/file-restore/s-*/nbd-*.sock rw,",
 		"/run/litevirt/file-restore/s-*/nonce r,",
 		"/dev/kvm rw,", "/dev/vhost-vsock rw,",
 		"deny network inet,", "deny ptrace,",
+		"unix (connect, send, receive) type=stream peer=(label=unconfined),",
+		"deny unix (connect, send, receive) peer=(addr=@**),",
 	} {
 		if !strings.Contains(p, want) {
 			t.Errorf("profile lacks %q", want)
@@ -430,6 +580,20 @@ func TestAppArmorProfileText(t *testing.T) {
 	}
 	if strings.Contains(p, "/var/lib/litevirt") || strings.Contains(p, "/var/lib/libvirt") {
 		t.Errorf("profile reaches VM storage:\n%s", p)
+	}
+	if strings.Contains(p, "@{pid}/** ") {
+		t.Errorf("profile grants all of /proc/<pid>, not just the files qemu needs:\n%s", p)
+	}
+	// The real parser compiles it (no kernel load, no cache, no root).
+	parser, err := exec.LookPath("apparmor_parser")
+	if err != nil {
+		t.Logf("apparmor_parser not installed; profile syntax not checked")
+		return
+	}
+	cmd := exec.Command(parser, "-Q", "-K", "-T")
+	cmd.Stdin = strings.NewReader(p)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("apparmor_parser rejects the profile: %v\n%s", err, out)
 	}
 }
 
@@ -480,5 +644,93 @@ func TestAccessibleTo(t *testing.T) {
 	}
 	if err := accessibleTo(p, &qemuUser{name: "q", uid: 99999, gid: 12345}); err == nil {
 		t.Fatal("a stranger was granted a 0660 device")
+	}
+}
+
+// R2-I2: AppArmor fails closed — enabled with no parser refuses unless
+// allow_unsandboxed; no AppArmor at all runs (uid separation, seccomp).
+func TestAppArmorDecision(t *testing.T) {
+	if use, err := appArmorDecision(true, true)(false); !use || err != nil {
+		t.Errorf("enabled + parser: %v %v", use, err)
+	}
+	if _, err := appArmorDecision(true, false)(false); err == nil || !strings.Contains(err.Error(), "apparmor_parser") {
+		t.Errorf("enabled, no parser, no key: %v", err)
+	}
+	if use, err := appArmorDecision(true, false)(true); use || err != nil {
+		t.Errorf("enabled, no parser, key: %v %v", use, err)
+	}
+	if use, err := appArmorDecision(false, false)(false); use || err != nil {
+		t.Errorf("no AppArmor: %v %v", use, err)
+	}
+}
+
+// R2-I2: a non-root daemon refuses file restore unless allow_unsandboxed.
+func TestCheck_NonRootRefused(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("runs as non-root")
+	}
+	h := newFakeHost(t, "cid", false)
+	h.l.skipRootCheck = false
+	if err := h.l.Preflight(); err == nil || !strings.Contains(err.Error(), "root daemon") {
+		t.Fatalf("non-root without the key: %v", err)
+	}
+	h.l.cfg.AllowUnsandboxed = true
+	if err := h.l.Preflight(); err != nil {
+		t.Fatalf("non-root with the key: %v", err)
+	}
+}
+
+// R2-I1 / R2-I2: the export is handed only to a peer with the VM's uid, in
+// its process group, and — under AppArmor — confined; the same is checked
+// again before the session is used.
+func TestVetPeerAndVerifyConfined(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "s")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := net.Dial("unix", sock)
+			if err != nil {
+				return
+			}
+			defer c.Close()
+			time.Sleep(time.Hour)
+		}
+	}()
+	conn, err := ln.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	me := uint32(os.Getuid())
+	pg, _ := unix.Getpgid(os.Getpid())
+	s := &Session{}
+	s.pgid.Store(int64(pg))
+	if err := s.vetPeer(conn, me, false); err != nil {
+		t.Fatalf("the right peer: %v", err)
+	}
+	if err := s.verifyConfined(me, false); err != nil {
+		t.Fatalf("verify, no AppArmor: %v", err)
+	}
+	if err := s.verifyConfined(me+1, false); err == nil {
+		t.Error("verify: a qemu under another uid was accepted")
+	}
+	if err := s.vetPeer(conn, me+1, false); err == nil {
+		t.Error("a peer with another uid was accepted")
+	}
+	s.pgid.Store(int64(pg) + 100000)
+	if err := s.vetPeer(conn, me, false); err == nil {
+		t.Error("a peer outside the session's process group was accepted")
+	}
+	s.pgid.Store(int64(pg))
+	// This test process is not confined by the restore profile.
+	if err := s.vetPeer(conn, me, true); err == nil || !strings.Contains(err.Error(), "not confined") {
+		t.Errorf("an unconfined peer under AppArmor: %v", err)
+	}
+	if err := s.verifyConfined(me, true); err == nil || !strings.Contains(err.Error(), "not confined") {
+		t.Errorf("verify, unconfined qemu under AppArmor: %v", err)
 	}
 }

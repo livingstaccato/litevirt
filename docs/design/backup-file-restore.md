@@ -27,7 +27,7 @@ guest kernel exploited by a malicious filesystem controls the agent.
 ## 2. The restore VM
 
 ```
- daemon (host, root)                             restore VM (qemu as litevirt-restore, seccomp, AppArmor)
+ daemon (host, root)                             restore VM (qemu as its own per-session uid, seccomp, AppArmor)
  ───────────────────                             ──────────────────────────────────────────
  repo ── pbsstore.ManifestReader                   host kernel copy, initramfs:
     │      (decrypts, decompresses, verifies)        /init = this litevirt binary
@@ -74,30 +74,59 @@ guest kernel exploited by a malicious filesystem controls the agent.
   file descriptor the daemon opened and hands qemu, with a random CID.
 - **Fixed resources.** One vCPU, `file_restore.memory_mib` (512 MiB default:
   the initramfs carries the litevirt binary).
-- **qemu's user.** As root, the daemon starts qemu already as the dedicated
-  `litevirt-restore` user (`file_restore.run_as`), which it creates at start
-  (`useradd --system --user-group --groups kvm`, no home, no shell) and which
-  owns nothing: no VM disk, no key. `libvirt-qemu`, `qemu`, `nobody` and root
-  are refused — the first owns every running VM's disks (libvirt's dynamic
-  ownership) and the migration-TLS key, `nobody` is shared — unless
-  `allow_unsandboxed`. The credential is set in the child before exec; qemu
-  never switches users itself, so its seccomp sandbox
-  (`-sandbox on,obsolete=deny,elevateprivileges=deny,spawn=deny,
-  resourcecontrol=deny`) and the user drop do not conflict. The user needs
-  only read-write `/dev/kvm` (the `kvm` group); preflight checks it by mode
-  bits and names the gap.
-- **AppArmor.** Where AppArmor is enabled, the daemon loads the
-  `litevirt-restore-qemu` profile (from memory, nothing under `/etc`): qemu's
-  binary, libraries and firmware, `/dev/kvm` and `/dev/vhost-vsock`, the boot
-  files, its sessions' sockets and nonces — no IP networking, no ptrace, no
-  mount, nothing of `/var/lib/litevirt` or any VM disk. qemu is started
-  through a trampoline in the litevirt binary (`litevirt __file-restore-exec`,
-  as the restore user): its parent stage stays as qemu's parent; its exec
-  stage sets the profile for its next exec and execs qemu, which starts
-  confined. Two stages because AppArmor's on-exec profile applies only to the
-  task that sets it, and because the exec into a new profile is a secure exec,
-  across which the kernel clears the parent-death signal: the parent stage
-  keeps its own (SIGTERM from the daemon's death) and kills qemu on it.
+- **qemu's identity.** File restore needs a root daemon; a non-root one
+  refuses it (unless `allow_unsandboxed`: qemu would run as the daemon's own
+  user, which owns `data_dir` and its keys). Each restore VM runs as **its own
+  uid**, taken from 64 reserved ones (`file_restore.uid_base`, default
+  3800000000, checked to belong to no account), with groups
+  `{litevirt-restore, kvm}` only — never an account's supplementary groups.
+  So concurrent sessions, which may be different tenants' backups, cannot
+  signal, trace or open each other's files whatever the LSM. The
+  `litevirt-restore` account exists for its group (which reads the boot files)
+  and is created at daemon start (`useradd --system --user-group --groups kvm`,
+  nologin); an existing account of that name is used only if it is a system
+  uid with a nologin shell, a uid no one else has and no group but its own and
+  kvm. `libvirt-qemu`, `qemu`, `nobody` and root as `run_as` are refused unless
+  `allow_shared_run_as`, which then runs qemu as that user. The credential is
+  set in the child before exec; qemu never switches users itself, so its
+  seccomp sandbox (`elevateprivileges=deny`) and the drop do not conflict.
+- **The disk export is single-peer.** Each start attempt gets its own NBD
+  socket in the session directory, chowned to the VM's uid. The server vets
+  the first connection — `SO_PEERCRED`: the VM's uid, the VM's process group,
+  and under AppArmor the restore profile in enforce mode — and only then
+  serves it; it closes its listener and unlinks the socket at once, so no
+  second client (another session's qemu included) can ever connect. qemu's
+  NBD client has `reconnect-delay: 0`. The nonce file (the VM's uid, 0400) is
+  unlinked once the agent has answered.
+- **AppArmor, failing closed.** Where AppArmor is enabled, the daemon loads
+  the `litevirt-restore-qemu` profile from memory (`apparmor_parser -r`,
+  nothing under `/etc`, verified loaded in enforce mode). Enabled but no
+  parser: refused unless `allow_unsandboxed`. The profile grants qemu's binary,
+  libraries and firmware, `/dev/kvm`, `/dev/vhost-vsock` (needed: AppArmor
+  revalidates the inherited vhost fd at exec against the new profile), the
+  boot files, the sessions' sockets and nonce files (DAC narrows them to its
+  own uid, and both are gone once qemu has them), a few of its own `/proc`
+  files (owner: only its own session's uid), stream unix sockets to the
+  unconfined daemon — no abstract sockets, no IP networking, no ptrace, no
+  mount, nothing of `/var/lib/litevirt` or any VM disk. qemu starts through a
+  trampoline in the litevirt binary (`litevirt __file-restore-exec`, as the
+  VM's uid): its parent stage stays as qemu's parent; its exec stage locks its
+  OS thread, writes the on-exec profile to `/proc/thread-self/attr`, sets
+  no_new_privs and execs qemu, which starts confined. The daemon checks the
+  result twice — the NBD peer must carry the profile before it is served, and
+  the qemu holding the disk must still carry it after the hello — and kills
+  and refuses otherwise. Two stages because AppArmor's on-exec profile is per
+  thread and not inherited by a forked child, and because the exec into a new
+  profile is a secure exec, across which the kernel clears the parent-death
+  signal: the parent stage keeps its own (SIGTERM from the daemon's death) and
+  kills qemu on it; on qemu 9.1+ qemu also gets `-run-with
+  exit-with-parent=on`.
+- **Hosts without AppArmor** (SELinux, or no LSM): the profile is absent, and
+  what isolates a restore VM is its own uid (DAC between sessions and against
+  every host file not world-accessible), its seccomp sandbox
+  (`elevateprivileges`, `spawn`, `obsolete`, `resourcecontrol` denied), the
+  single-peer export, and the absence of any NIC. No SELinux policy is
+  shipped.
 - **Seccomp, asked of qemu.** Before each restore VM, the daemon starts the
   qemu binary with the sandbox and no machine (`-machine none -S`), as the
   restore user. A qemu that cannot install the sandbox exits at once with its
@@ -117,7 +146,9 @@ guest kernel exploited by a malicious filesystem controls the agent.
     pidfd, kills it — and its process group — only if it still runs as that
     uid with the restore VM's command line for that very session (`-name
     litevirt-file-restore` and that session's socket path), never a recycled
-    pid, and removes the directories.
+    pid, and removes the directories. It also kills any process running as one
+    of the reserved per-session uids with a restore VM's command line, which
+    finds a qemu whose trampoline — and so its pidfile record — is gone.
   - The agent powers the VM off on its own after `idle_timeout_sec + 60`
     seconds without a request (`litevirt_fr_idle` on the command line), the
     backstop for a host that went away.
@@ -201,15 +232,22 @@ The host (`filerestore/sanitize.go`) treats every response as hostile:
     invisible character, bounded, and inside one of the paths the caller
     selected;
   - only directories, regular files and symlinks;
-  - a symlink only with a relative target that, resolved against the link's
-    directory, stays inside the archive; an absolute or escaping one is left
-    out and counted (`links_dropped` in the audit row and the status);
+  - a symlink only with a relative target whose `..` components, if any, all
+    come first, and that, resolved against the link's directory, stays inside
+    the archive; any other is left out and counted (`links_dropped` in the
+    audit row and the status). The leading-`..` rule is what makes the check
+    hold physically: the kernel resolves a symlink component before a `..`
+    after it, so `up/../../..` through a link `up` climbs further than its
+    spelling; with `..` only first, the climb starts at the link's own
+    directory (never under a link), and by induction no chain of links leaves
+    the archive;
   - no entry below a symlink the archive already holds and no name twice —
     both compared with Unicode case folding and NFC normalization ("ſ" is "s",
     "ς" is "σ"), so extracting the archive on a case-insensitive or
     normalizing filesystem (macOS, Windows) cannot write through a link either;
-    the symlink check hashes only the ancestors at depths where a symlink was
-    written, so a deep name is cheap;
+    each name is folded once and walked down a trie of the archive's symlink
+    paths, so the check costs the name's length, whatever the depths of the
+    links;
   - each tar header is built from scratch: permission bits without setuid,
     setgid or sticky, no owner, no extended attributes;
   - bounded: the whole archive's bytes, headers included

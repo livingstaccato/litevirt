@@ -110,7 +110,7 @@ var maxRecords = 4 * DefaultMaxEntries
 var maxTracked = DefaultMaxEntries
 
 // MaxDepth bounds the components of an extracted name. Real trees are far
-// shallower; the bound keeps the per-record work of the checks below small.
+// shallower.
 const MaxDepth = 256
 
 // tarHeaderAllowance is what one tar header can cost beyond its name and
@@ -128,12 +128,75 @@ type nameKey [16]byte
 var keyCalls int64
 
 func keyOf(name string) nameKey {
+	return keyOfFolded(fold(name))
+}
+
+// fold is a name's case-folded, NFC-normalized form. A Caser keeps state:
+// one per call, never shared between goroutines.
+func fold(name string) string {
+	return norm.NFC.String(cases.Fold().String(norm.NFC.String(name)))
+}
+
+func keyOfFolded(folded string) nameKey {
 	atomic.AddInt64(&keyCalls, 1)
-	// A Caser keeps state: one per call, never shared between goroutines.
-	sum := sha256.Sum256([]byte(norm.NFC.String(cases.Fold().String(norm.NFC.String(name)))))
+	sum := sha256.Sum256([]byte(folded))
 	var k nameKey
 	copy(k[:], sum[:16])
 	return k
+}
+
+// linkTrie holds the (folded) paths of the symlinks an archive holds, by
+// component, so "is any ancestor of this name a symlink?" is one walk down
+// the name — O(its length) whatever the depths of the links. Nodes are
+// bounded (maxTrieNodes).
+type linkTrie struct {
+	root  trieNode
+	nodes int
+}
+
+type trieNode struct {
+	kids map[string]*trieNode
+	link bool
+}
+
+// maxTrieNodes bounds the trie (a var for tests).
+var maxTrieNodes = 1 << 20
+
+// add records a symlink at folded; false when the trie is full.
+func (t *linkTrie) add(folded string) bool {
+	n := &t.root
+	for _, c := range strings.Split(folded, "/") {
+		next := n.kids[c]
+		if next == nil {
+			if t.nodes >= maxTrieNodes {
+				return false
+			}
+			if n.kids == nil {
+				n.kids = map[string]*trieNode{}
+			}
+			next = &trieNode{}
+			n.kids[c] = next
+			t.nodes++
+		}
+		n = next
+	}
+	n.link = true
+	return true
+}
+
+// underLink reports whether a proper ancestor of folded is a symlink.
+func (t *linkTrie) underLink(folded string) bool {
+	n := &t.root
+	comps := strings.Split(folded, "/")
+	for _, c := range comps[:len(comps)-1] {
+		if n = n.kids[c]; n == nil {
+			return false
+		}
+		if n.link {
+			return true
+		}
+	}
+	return false
 }
 
 // SanitizeStream reads the agent's record stream from src (wire.Record
@@ -173,8 +236,7 @@ func SanitizeStream(dst io.Writer, src *bufio.Reader, selections []string, lim T
 	cw := &countingWriter{w: dst}
 	tw := tar.NewWriter(cw)
 	seen := map[nameKey]struct{}{}
-	symlinks := map[nameKey]struct{}{}
-	linkDepths := map[int]struct{}{} // depths (component counts) at which a symlink was written
+	var links linkTrie
 	records := 0
 	var discarded int64 // bytes of refused entries read and dropped
 	var limitErr error
@@ -202,10 +264,12 @@ func SanitizeStream(dst io.Writer, src *bufio.Reader, selections []string, lim T
 		name, ok := cleanTarName(rec.Name)
 		refuse := !ok || !underSelection(name, selections)
 		var key nameKey
+		var folded string
 		if !refuse {
-			key = keyOf(name)
+			folded = fold(name) // once per record
+			key = keyOfFolded(folded)
 			_, dup := seen[key]
-			refuse = dup || underSymlink(name, symlinks, linkDepths)
+			refuse = dup || links.underLink(folded)
 		}
 		if !refuse {
 			switch rec.Type {
@@ -259,9 +323,10 @@ func SanitizeStream(dst io.Writer, src *bufio.Reader, selections []string, lim T
 			return st, err
 		}
 		seen[key] = struct{}{}
-		if rec.Type == TypeSymlink {
-			symlinks[key] = struct{}{}
-			linkDepths[strings.Count(name, "/")+1] = struct{}{}
+		if rec.Type == TypeSymlink && !links.add(folded) {
+			st.Truncated = true
+			limitErr = fmt.Errorf("%w: too many symlink path components to track", ErrLimit)
+			break
 		}
 		if size > 0 {
 			before := cw.n
@@ -281,14 +346,33 @@ func SanitizeStream(dst io.Writer, src *bufio.Reader, selections []string, lim T
 }
 
 // linkTargetOK reports whether a symlink at name may point at target: a
-// relative target that, resolved against the link's directory, stays inside
-// the archive. An absolute target, or one whose ".." leads above the
-// archive's root, could make a later extraction (or a later archive
-// extracted into the same directory) write outside it.
+// relative target whose ".." components, if any, all come first, and which,
+// resolved against the link's directory, stays inside the archive.
+//
+// The leading-".." rule is what makes the lexical check true physically: a
+// kernel resolves a symlink component BEFORE a ".." that follows it, so
+// "up/../../.." through a link "up" that points upward climbs further than
+// its spelling suggests. With ".." only at the front, the climb happens from
+// the link's own directory — which is never under a symlink (no entry is) —
+// and every link the rest of the path passes through obeys the same rule, so
+// by induction no chain of links leaves the archive.
 func linkTargetOK(name, target string) bool {
 	if target == "" || len(target) > MaxPathLen || !utf8.ValidString(target) || strings.ContainsRune(target, 0) ||
 		strings.HasPrefix(target, "/") || wire.HasUnsafe(target) {
 		return false
+	}
+	leading := true
+	for _, c := range strings.Split(target, "/") {
+		switch {
+		case c == "..":
+			if !leading {
+				return false
+			}
+		case c == "" || c == ".":
+			return false // not a clean relative path
+		default:
+			leading = false
+		}
 	}
 	resolved := path.Clean(path.Join(path.Dir(name), target))
 	return resolved != ".." && !strings.HasPrefix(resolved, "../") && resolved != "."
@@ -343,29 +427,6 @@ func underSelection(name string, selections []string) bool {
 	for _, s := range selections {
 		if name == s || strings.HasPrefix(name, s+"/") {
 			return true
-		}
-	}
-	return false
-}
-
-// underSymlink reports whether any proper ancestor of name is (case-folded)
-// a symlink the archive already holds. Only the ancestors at a depth where
-// some symlink was written are hashed, so a deep name costs one hash per
-// such depth, not one per component.
-func underSymlink(name string, symlinks map[nameKey]struct{}, depths map[int]struct{}) bool {
-	if len(symlinks) == 0 {
-		return false
-	}
-	depth := 0
-	for i := 0; i < len(name); i++ {
-		if name[i] == '/' {
-			depth++
-			if _, ok := depths[depth]; !ok {
-				continue
-			}
-			if _, ok := symlinks[keyOf(name[:i])]; ok {
-				return true
-			}
 		}
 	}
 	return false

@@ -457,7 +457,7 @@ func TestSanitize_SymlinkTargetsConfined(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, kept := range []string{"vda1/etc/rel", "vda1/etc/up", "vda1/top", "vda1/self"} {
+	for _, kept := range []string{"vda1/etc/rel", "vda1/etc/up", "vda1/top"} {
 		if _, ok := got[kept]; !ok {
 			t.Errorf("%s (a target inside the archive) was dropped", kept)
 		}
@@ -467,8 +467,8 @@ func TestSanitize_SymlinkTargetsConfined(t *testing.T) {
 			t.Errorf("%s (an absolute or escaping target) was kept", dropped)
 		}
 	}
-	if st.LinksDropped != 3 {
-		t.Errorf("links dropped %d, want 3 (abs, esc, esc2)", st.LinksDropped)
+	if st.LinksDropped != 4 {
+		t.Errorf("links dropped %d, want 4 (abs, esc, esc2, self)", st.LinksDropped)
 	}
 }
 
@@ -483,5 +483,63 @@ func TestSanitize_HeaderBytesCount(t *testing.T) {
 	st, err := SanitizeStream(&out, bufio.NewReader(bytes.NewReader(stream(t, false, recs...))), []string{"vda1"}, TarLimits{MaxBytes: 64 << 10})
 	if !errors.Is(err, ErrLimit) || int64(out.Len()) > 64<<10+2048 {
 		t.Fatalf("1000 empty files with 200-byte names under a 64 KiB cap: err=%v, archive %d bytes (%d entries)", err, out.Len(), st.Entries)
+	}
+}
+
+// R2-M1: a chain of two links, each lexically inside the archive, must not
+// escape physically: the kernel resolves "up" before the ".." after it.
+func TestSanitize_LinkChainCannotEscape(t *testing.T) {
+	got, st, err := sanitize(t, stream(t, false,
+		link("vda1/a/b/c/up", "../../.."),        // -> vda1: fine on its own
+		link("vda1/esc", "a/b/c/up/../../../.."), // lexically vda1, physically 3 levels above the root
+		link("vda1/mid", "x/../y"),               // ".." after a name
+		link("vda1/ok", "../vda1/a"),             // leading ".." only: fine
+	), []string{"vda1"}, TarLimits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got["vda1/a/b/c/up"]; !ok {
+		t.Error("a link with only leading .. inside the archive was dropped")
+	}
+	if _, ok := got["vda1/ok"]; !ok {
+		t.Error("vda1/ok was dropped")
+	}
+	for _, bad := range []string{"vda1/esc", "vda1/mid"} {
+		if _, ok := got[bad]; ok {
+			t.Errorf("%s (a .. after a name) was kept", bad)
+		}
+	}
+	if st.LinksDropped != 2 {
+		t.Errorf("links dropped %d, want 2", st.LinksDropped)
+	}
+}
+
+// R2-M3: links at every depth cannot make a record cost one hash per
+// component: each record is folded once and walks the link trie.
+func TestSanitize_LinksAtEveryDepthStayCheap(t *testing.T) {
+	var recs []rec
+	branch := "vda1"
+	for d := 1; d < MaxDepth-2; d++ {
+		branch += "/b"
+		recs = append(recs, link(branch+"l", "x")) // a link at depth d+1, in its own branch
+	}
+	long := strings.Repeat("c", 200)
+	deep := "vda1"
+	for i := 0; i < 18; i++ {
+		deep += "/" + long
+	}
+	for i := 0; i < 2000; i++ {
+		recs = append(recs, file(deep+strconv.Itoa(i), ""))
+	}
+	before := keyCalls
+	start := time.Now()
+	if _, _, err := sanitize(t, stream(t, false, recs...), []string{"vda1"}, TarLimits{}); err != nil {
+		t.Fatal(err)
+	}
+	if calls := keyCalls - before; calls > int64(len(recs)) {
+		t.Fatalf("%d hashes for %d records: more than one per record", calls, len(recs))
+	}
+	if el := time.Since(start); el > 10*time.Second {
+		t.Fatalf("%d records took %v", len(recs), el)
 	}
 }

@@ -433,6 +433,16 @@ func writeCacheFile(dir, dst string, gid int, fill func(io.Writer) error) error 
 // with fill. A file that exists but does not check out is reported to
 // onTamper before it is rebuilt.
 func ensureCacheFile(dir, dst string, gid int, onTamper TamperFunc, fill func(io.Writer) error) error {
+	// The directory first: owned by this process, group gid, 0750. A
+	// directory not exactly so is reported and put right.
+	if why := cacheDirWrong(dir, gid); why != "" {
+		if onTamper != nil {
+			onTamper(dir, why)
+		}
+		if err := prepareCacheDir(dir, gid); err != nil {
+			return err
+		}
+	}
 	ok, why := cachedFile(dst, gid)
 	if ok {
 		return nil
@@ -447,13 +457,37 @@ func ensureCacheFile(dir, dst string, gid int, onTamper TamperFunc, fill func(io
 	return writeCacheFile(dir, dst, gid, fill)
 }
 
-// dropOthers removes the cache files matching glob other than keep (and
-// their sidecars).
-func dropOthers(glob, keep string) {
-	old, _ := filepath.Glob(glob)
-	for _, o := range old {
-		if o != keep && o != keep+".sha256" {
-			_ = os.Remove(o)
+// cacheDirWrong says what is wrong with an existing cache directory ("" if
+// nothing, or if it does not exist yet).
+func cacheDirWrong(dir string, gid int) string {
+	var st unix.Stat_t
+	if err := unix.Lstat(dir, &st); err != nil {
+		return ""
+	}
+	switch {
+	case st.Mode&unix.S_IFMT != unix.S_IFDIR:
+		return "not a directory"
+	case int(st.Uid) != os.Geteuid():
+		return fmt.Sprintf("directory owned by uid %d", st.Uid)
+	case int(st.Gid) != gid:
+		return fmt.Sprintf("directory group %d, want %d", st.Gid, gid)
+	case st.Mode&0o7777 != cacheDirMode:
+		return fmt.Sprintf("directory mode %o", st.Mode&0o7777)
+	}
+	return ""
+}
+
+// GCCache removes the boot files in cacheDir (and their sidecars) for which
+// keep is false. The launcher calls it with the files current or in use by a
+// running session, so a session never loses the files it is about to boot.
+func GCCache(cacheDir string, keep func(path string) bool) {
+	for _, glob := range []string{"initramfs-*", "kernel-*"} {
+		files, _ := filepath.Glob(filepath.Join(cacheDir, glob))
+		for _, f := range files {
+			base := strings.TrimSuffix(f, ".sha256")
+			if !keep(base) {
+				_ = os.Remove(f)
+			}
 		}
 	}
 }
@@ -470,7 +504,6 @@ func EnsureInitramfs(cacheDir string, spec InitramfsSpec, gid int, onTamper Tamp
 	if err := ensureCacheFile(cacheDir, dst, gid, onTamper, func(w io.Writer) error { return writeInitramfs(w, spec) }); err != nil {
 		return "", err
 	}
-	dropOthers(filepath.Join(cacheDir, "initramfs-*"), dst)
 	return dst, nil
 }
 
@@ -493,7 +526,6 @@ func ensureKernelCopy(cacheDir, kernel string, gid int, onTamper TamperFunc) (st
 	}); err != nil {
 		return "", err
 	}
-	dropOthers(filepath.Join(cacheDir, "kernel-*"), dst)
 	return dst, nil
 }
 

@@ -33,6 +33,14 @@ type TamperFunc func(path, why string)
 // nothing — no VM disk, no key — and is in the kvm group only.
 const DefaultRestoreUser = "litevirt-restore"
 
+// DefaultUIDBase is the first of the reserved uids restore VMs run as, one
+// per session (UIDSlots of them): above the container id-map ranges, below
+// the 32-bit limit, and never in /etc/passwd.
+const DefaultUIDBase = 3_800_000_000
+
+// UIDSlots is how many per-session uids are reserved from the base.
+const UIDSlots = 64
+
 // AppArmorProfile is the profile a restore VM's qemu is confined by where
 // AppArmor is enabled.
 const AppArmorProfile = "litevirt-restore-qemu"
@@ -53,11 +61,19 @@ type Config struct {
 	// MemoryMiB is the restore VM's memory (0 = 512). The initramfs holds
 	// the litevirt binary, so this cannot go much lower.
 	MemoryMiB int
-	// RunAs is the user qemu runs as when the daemon is root ("" =
-	// DefaultRestoreUser). qemu is started as that user; it never switches
-	// users itself. root, libvirt-qemu, qemu and nobody are refused (they
-	// own production disks or are shared) unless AllowUnsandboxed.
+	// RunAs is the restore account ("" = DefaultRestoreUser): a system
+	// account with no shell whose group reads the boot files. Each restore VM
+	// runs as its own uid from the reserved range (UIDBase), with that group
+	// and kvm only, so concurrent sessions cannot reach each other. root,
+	// libvirt-qemu, qemu and nobody are refused unless AllowSharedRunAs, which
+	// then runs qemu as that user itself.
 	RunAs string
+	// UIDBase is the first reserved per-session uid (0 = DefaultUIDBase).
+	UIDBase uint32
+	// AllowSharedRunAs permits RunAs to be root or a shared qemu user.
+	// DANGEROUS: the restore VM then shares an identity with production VMs
+	// or with everything.
+	AllowSharedRunAs bool
 	// CacheDir holds the initramfs and kernel copy: root-owned, group the
 	// restore user's, 0440, re-verified on every use
 	// (/var/cache/litevirt-restore).
@@ -74,10 +90,11 @@ type Config struct {
 	// it powers off on its own (0 = 10 minutes): the backstop when the
 	// daemon that started it is gone.
 	AgentIdle time.Duration
-	// AllowUnsandboxed lets a restore VM run when this qemu has no seccomp
-	// sandbox, or as a user that is not a dedicated one. DANGEROUS: it
-	// removes a barrier between a malicious backup and the host. Off by
-	// default: without it, file restore is refused.
+	// AllowUnsandboxed lets a restore VM run without one of its barriers:
+	// qemu's seccomp sandbox, the AppArmor profile on a host that has
+	// AppArmor enabled but cannot load it, or a root daemon (a non-root
+	// daemon runs qemu as itself). DANGEROUS: each removes a barrier between a
+	// malicious backup and the host. Off by default: file restore is refused.
 	AllowUnsandboxed bool
 	// Agent is the binary run as the agent ("" = this running binary).
 	Agent string
@@ -126,6 +143,8 @@ type VMSpec struct {
 	AgentIdleSec int
 	// Sandbox enables qemu's seccomp sandbox.
 	Sandbox bool
+	// ExitWithParent asks qemu (9.1+) to exit when its parent does.
+	ExitWithParent bool
 }
 
 // qemuArgs builds the restore VM's command line. The VM has:
@@ -166,6 +185,9 @@ func qemuArgs(s VMSpec) ([]string, error) {
 		"server":    map[string]string{"type": "unix", "path": s.NBDSocket},
 		"export":    s.Export,
 		"read-only": true,
+		// One connection, never re-made: the export is single-peer and its
+		// socket is gone once qemu has it.
+		"reconnect-delay": 0,
 	})
 	if err != nil {
 		return nil, err
@@ -205,6 +227,9 @@ func qemuArgs(s VMSpec) ([]string, error) {
 	}
 	if s.Sandbox {
 		args = append(args, "-sandbox", "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny")
+	}
+	if s.ExitWithParent {
+		args = append(args, "-run-with", "exit-with-parent=on")
 	}
 	return args, nil
 }

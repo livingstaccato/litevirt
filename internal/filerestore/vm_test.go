@@ -72,6 +72,11 @@ func TestQemuArgs_Isolation(t *testing.T) {
 		if m["read-only"] != true {
 			t.Errorf("blockdev %v is not read-only", m)
 		}
+		if m["driver"] == "nbd" {
+			if d, ok := m["reconnect-delay"]; !ok || d != float64(0) {
+				t.Errorf("nbd blockdev %v must carry reconnect-delay: 0 (a single-peer export)", m)
+			}
+		}
 	}
 	if v := argValues(args, "-m"); len(v) != 1 || v[0] != "512" {
 		t.Errorf("-m %v", v)
@@ -145,6 +150,10 @@ func TestQemuArgs_RejectsBadSpecs(t *testing.T) {
 	s.Sandbox = false
 	if args, _ := qemuArgs(s); hasFlag(args, "-sandbox") {
 		t.Error("-sandbox with Sandbox false")
+	}
+	s.ExitWithParent = true
+	if args, _ := qemuArgs(s); len(argValues(args, "-run-with")) != 1 || argValues(args, "-run-with")[0] != "exit-with-parent=on" {
+		t.Errorf("ExitWithParent: %v", argValues(args, "-run-with"))
 	}
 	s.Arch = "arm64"
 	args, _ := qemuArgs(s)

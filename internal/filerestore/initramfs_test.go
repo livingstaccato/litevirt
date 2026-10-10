@@ -215,12 +215,36 @@ func TestInitramfs_Cache(t *testing.T) {
 	if err != nil || p3 == p1 {
 		t.Fatalf("a changed binary reused %q (%v)", p3, err)
 	}
-	if _, err := os.Stat(p1); !os.IsNotExist(err) {
-		t.Error("the stale initramfs was left behind")
-	}
+	// The superseded build stays until the launcher collects it unused
+	// (TestBootFilesGC).
 	b, _ := os.ReadFile(p3)
 	if got := string(parseCPIO(t, b)["init"].data); got != "v2 — an upgraded binary" {
 		t.Fatalf("/init = %q", got)
+	}
+}
+
+// Nit 4: the cache directory is re-checked on every use, not only when a
+// file is rebuilt: a loosened mode is reported and put right.
+func TestInitramfs_CacheDirRecheckedOnReuse(t *testing.T) {
+	mods := fakeModules(t)
+	cache := filepath.Join(t.TempDir(), "c")
+	agent := fakeAgent(t, "v1")
+	spec := InitramfsSpec{Agent: agent, ModulesDir: mods}
+	if _, err := EnsureInitramfs(cache, spec, os.Getgid(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(cache, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	if _, err := EnsureInitramfs(cache, spec, os.Getgid(), func(p, why string) { got = append(got, p+": "+why) }); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) == 0 || !strings.Contains(got[0], "mode") {
+		t.Errorf("a 0777 cache directory was not reported: %v", got)
+	}
+	if st, _ := os.Stat(cache); st.Mode().Perm() != 0o750 {
+		t.Errorf("cache directory mode %o, want 750", st.Mode().Perm())
 	}
 }
 

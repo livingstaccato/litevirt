@@ -528,11 +528,18 @@ own kernel and an initramfs whose init is the litevirt binary itself, the
 backup attached read-only as its only disk (served from the repo over a local
 NBD socket), no network, vsock as its only channel, one vCPU and 512 MiB. The
 guest kernel parses the partition table and mounts each filesystem read-only
-inside the VM. qemu is started as a dedicated user, `litevirt-restore` — it
-owns no VM disk and no key, and the daemon creates it at start — with its
-seccomp sandbox on and, where AppArmor is enabled, confined by the
-`litevirt-restore-qemu` profile (its boot files, its own session's socket,
-`/dev/kvm` and vsock; nothing under `/var/lib/litevirt`). Its kernel copy and
+inside the VM. Each restore VM's qemu runs as its own uid from a reserved
+range — so two sessions (possibly two tenants) cannot signal, trace or reach
+each other — with only the `litevirt-restore` group and `kvm`, its seccomp
+sandbox on and, where AppArmor is enabled, confined by the
+`litevirt-restore-qemu` profile (its boot files, its session's export socket
+and nonce, `/dev/kvm` and vsock; no IP, no abstract sockets, nothing under
+`/var/lib/litevirt`). Its disk export accepts exactly one connection, from
+that qemu (checked by its socket credentials, process group and, under
+AppArmor, its confinement), and the socket is unlinked the moment qemu has
+it. The daemon must run as root for this; a non-root daemon refuses file
+restore. On a host without AppArmor (SELinux, or no LSM), the per-VM uid,
+the seccomp sandbox and the single-peer export are what isolate it. Its kernel copy and
 initramfs are root-owned and read-only to that user
 (`/var/cache/litevirt-restore`), and re-verified against a recorded digest
 before every boot. It dies with the daemon, a restarted daemon kills any it
@@ -543,8 +550,8 @@ the archive itself entry by entry — relative names inside what you selected,
 only directories, regular files and symlinks, nothing under a symlink (also
 compared case-insensitively), no owners, setuid bits or extended attributes,
 bounded sizes, counts and memory — and streams it to you. A symlink is kept
-only when its target is relative and stays inside the archive; one with an
-absolute or escaping target is left out and counted. Nothing is written on
+only when its target is relative, any `..` in it comes first, and it stays
+inside the archive; any other is left out and counted. Nothing is written on
 the daemon's host.
 
 **Extract each archive into a new, empty directory**, and use your tar's
@@ -573,10 +580,13 @@ limits and threat model are in
   to mounting on the host. Whether qemu can install its seccomp sandbox is
   asked of qemu itself before each restore VM starts.
 - **`file_restore.allow_unsandboxed` is dangerous.** It lets a restore VM run
-  without the seccomp sandbox (or as root or a shared qemu user), removing a
-  barrier between a malicious backup and the host: a guest that escapes qemu
-  then has every syscall as that user. Install a qemu with seccomp instead;
-  if you must use it, keep the dedicated `run_as` user.
+  without one of its barriers — qemu's seccomp sandbox, its AppArmor profile
+  (AppArmor on but `apparmor_parser` missing), or a root daemon (a non-root
+  daemon runs qemu as itself, the user that owns `data_dir` and its keys) —
+  removing one between a malicious backup and the host. Install a qemu with
+  seccomp and `apparmor_parser`, and run the daemon as root, instead.
+  **`file_restore.allow_shared_run_as`** separately permits `run_as` to be root
+  or a shared qemu user, which then runs the VM itself — equally dangerous.
 
 ## Containers
 

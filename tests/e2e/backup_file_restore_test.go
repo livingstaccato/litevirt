@@ -1,6 +1,8 @@
 package e2e
 
 import (
+	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -71,12 +73,16 @@ func TestLab_BackupFileRestore(t *testing.T) {
 	if pid == "" {
 		t.Fatalf("no restore VM qemu in:\n%s", ps)
 	}
-	who := strings.TrimSpace(l.mustSSH(host, 30*time.Second, "ps -o user= -p "+pid))
+	uidStr := strings.TrimSpace(l.mustSSH(host, 30*time.Second, "ps -o uid= -p "+pid))
 	sec := l.mustSSH(host, 30*time.Second, "grep -E '^Seccomp:' /proc/"+pid+"/status")
 	aa := l.mustSSH(host, 30*time.Second, "cat /proc/"+pid+"/attr/current 2>/dev/null; cat /sys/module/apparmor/parameters/enabled 2>/dev/null || true")
-	l.saveEvidence("bkfr-qemu-user", who+"\n"+sec+"\n"+aa)
-	if who != "litevirt-restore" {
-		t.Errorf("the restore VM's qemu runs as %q, want the dedicated litevirt-restore", who)
+	l.saveEvidence("bkfr-qemu-user", uidStr+"\n"+sec+"\n"+aa)
+	if uid, err := strconv.ParseUint(uidStr, 10, 32); err != nil || uid < 3800000000 || uid >= 3800000064 {
+		t.Errorf("the restore VM's qemu runs as uid %q, want one of the reserved per-session uids 3800000000..3800000063", uidStr)
+	}
+	// The single-peer export: no socket left once qemu has its disk.
+	if socks := strings.TrimSpace(l.mustSSH(host, 30*time.Second, "ls /run/litevirt/file-restore/s-*/nbd-*.sock 2>/dev/null || true")); socks != "" {
+		t.Errorf("an export socket is still connectable while the VM runs: %s", socks)
 	}
 	if !strings.Contains(sec, "2") {
 		t.Errorf("the restore VM's qemu has no seccomp filter: %s", sec)
@@ -169,5 +175,56 @@ func TestLab_BackupFileRestore_DaemonRestartKillsTheVM(t *testing.T) {
 			t.Fatalf("a restore VM survived the daemon restart:\n%s", ps)
 		}
 		time.Sleep(2 * time.Second)
+	}
+}
+
+// R2-I1: two restore VMs at once (two backups, possibly two tenants) run as
+// different uids and cannot signal or read each other; neither leaves its
+// export socket connectable.
+func TestLab_BackupFileRestore_ConcurrentSessionsIsolated(t *testing.T) {
+	l := newLab(t)
+	host := labUpHosts(l, 1)[0]
+	vms := l.createVMs(host, "bkfri", host)
+	vm := vms[host]
+	repo := bkRepo(l, host, "e2e-bkfri")
+	tsA, _, _ := bkSnapshot(l, host, vm, repo)
+	time.Sleep(2 * time.Second)
+	tsB, _, _ := bkSnapshot(l, host, vm, repo)
+	for _, ts := range []string{tsA, tsB} {
+		if out, err := l.lv(host, "backup", "file-ls", "--repo", repo, "--vm", vm, "--timestamp", ts); err != nil {
+			t.Fatalf("file-ls %s: %v\n%s", ts, err, out)
+		}
+	}
+	ps := strings.TrimSpace(l.mustSSH(host, 30*time.Second, "pgrep -af '[l]itevirt-file-restore' || true"))
+	type q struct{ pid, uid string }
+	var qs []q
+	for _, ln := range strings.Split(ps, "\n") {
+		if f := strings.Fields(ln); len(f) > 1 && !strings.Contains(ln, "__file-restore-exec") {
+			uid := strings.TrimSpace(l.mustSSH(host, 30*time.Second, "ps -o uid= -p "+f[0]))
+			qs = append(qs, q{f[0], uid})
+		}
+	}
+	l.saveEvidence("bkfri-qemus", fmt.Sprintf("%v", qs))
+	if len(qs) != 2 {
+		t.Fatalf("want two restore VMs, found %v", qs)
+	}
+	if qs[0].uid == qs[1].uid {
+		t.Fatalf("two sessions share uid %s", qs[0].uid)
+	}
+	// As A's uid: B must be unreachable — no signal, no /proc/<B>/environ.
+	as := func(uid, cmd string) (string, error) {
+		return l.ssh(host, 30*time.Second, "setpriv --reuid="+uid+" --regid=$(getent group litevirt-restore | cut -d: -f3) --clear-groups "+cmd)
+	}
+	if out, err := as(qs[0].uid, "kill -0 "+qs[1].pid); err == nil {
+		t.Errorf("session A's uid can signal session B's qemu: %s", out)
+	}
+	if out, err := as(qs[0].uid, "cat /proc/"+qs[1].pid+"/environ"); err == nil {
+		t.Errorf("session A's uid can read session B's qemu environment: %s", out)
+	}
+	if socks := strings.TrimSpace(l.mustSSH(host, 30*time.Second, "ls /run/litevirt/file-restore/s-*/nbd-*.sock 2>/dev/null || true")); socks != "" {
+		t.Errorf("an export socket is still connectable: %s", socks)
+	}
+	if denied := strings.TrimSpace(l.mustSSH(host, 30*time.Second, "dmesg 2>/dev/null | grep litevirt-restore-qemu | grep -i denied | tail -5 || true")); denied != "" {
+		t.Logf("AppArmor denials for the restore profile (review):\n%s", denied)
 	}
 }

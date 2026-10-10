@@ -634,10 +634,14 @@ file_restore:
   max_sessions: 2            # restore VMs at once on this host (browsing and extracting)
   max_extractions: 1         # extractions at once on this host; each runs on a VM of its own
   max_extract_bytes: 16G     # per extraction; a request can only lower it
-  allow_unsandboxed: false   # DANGEROUS. true lets a restore VM run without qemu's seccomp sandbox, or as
-                             # root or a shared qemu user. It removes a barrier between a malicious backup
-                             # and the host: a guest that escapes qemu gets every syscall as that user.
-                             # Install a qemu with seccomp instead; never combine it with a non-dedicated run_as.
+  uid_base: 3800000000       # first of 64 uids reserved for restore VMs, one per session; must belong to no account
+  allow_shared_run_as: false # DANGEROUS. true permits run_as to be root or a shared qemu user (libvirt-qemu,
+                             # qemu, nobody): the restore VM then shares an identity with production VMs.
+  allow_unsandboxed: false   # DANGEROUS. true lets a restore VM run without one of its barriers: qemu's
+                             # seccomp sandbox, its AppArmor profile (AppArmor on but apparmor_parser missing),
+                             # or a root daemon (a non-root daemon runs qemu as itself, with its data_dir and
+                             # keys). Each removes a barrier between a malicious backup and the host. Install a
+                             # qemu with seccomp and apparmor_parser, and run the daemon as root, instead.
 
 # Billing-event webhook. Empty disables (the default — events
 # are dropped). When set, `internal/billing` POSTs JSON

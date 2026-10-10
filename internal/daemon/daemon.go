@@ -1441,7 +1441,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Restore VMs a previous daemon left running (a crash, a restart, an
 	// upgrade) are killed whether or not file restore is still enabled.
 	frRunDir := fileRestoreRunDir(d.cfg.DataDir)
-	if n := filerestore.SweepStale(frRunDir); n > 0 {
+	frUIDBase := d.cfg.FileRestore.UIDBase
+	if frUIDBase == 0 {
+		frUIDBase = filerestore.DefaultUIDBase
+	}
+	if n := filerestore.SweepStale(frRunDir, frUIDBase); n > 0 {
 		slog.Warn("file restore: killed restore VMs a previous daemon left running", "count", n)
 	}
 	if fr := d.cfg.FileRestore; fr.On() {
@@ -1467,6 +1471,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 				// it only ever powers off on its own when the host is gone.
 				AgentIdle:        idle + time.Minute,
 				AllowUnsandboxed: fr.AllowUnsandboxed,
+				AllowSharedRunAs: fr.AllowSharedRunAs,
+				UIDBase:          frUIDBase,
 			}),
 			IdleTimeout:     idle,
 			MaxSessions:     fr.MaxSessions,

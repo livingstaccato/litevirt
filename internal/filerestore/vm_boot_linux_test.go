@@ -100,6 +100,9 @@ func bootLauncher(t *testing.T) *Launcher {
 	l := NewLauncher(Config{
 		Kernel: kernel, Agent: agent, BootTimeout: 120 * time.Second,
 		CacheDir: filepath.Join(base, "cache"), RunDir: filepath.Join(base, "run"),
+		// A non-root daemon has no per-VM uid or profile: it runs only with
+		// the explicit, dangerous key. Root runs (lab 2) do not set it.
+		AllowUnsandboxed: os.Geteuid() != 0,
 	})
 	if err := l.Preflight(); err != nil {
 		t.Fatalf("preflight: %v", err)
@@ -200,11 +203,11 @@ func assertConfined(t *testing.T, s *Session) {
 		if uid == "0" {
 			t.Errorf("qemu runs as root")
 		}
-		u, _ := lookupQemuUser("", false)
-		if u == nil || u.name != DefaultRestoreUser || uid != strconv.FormatUint(uint64(u.uid), 10) {
-			t.Errorf("qemu runs as uid %s, want the dedicated %s %+v", uid, DefaultRestoreUser, u)
+		n, _ := strconv.ParseUint(uid, 10, 32)
+		if n < DefaultUIDBase || n >= DefaultUIDBase+UIDSlots {
+			t.Errorf("qemu runs as uid %s, want one of the reserved per-session uids from %d", uid, DefaultUIDBase)
 		}
-		if appArmorEnabled() && !strings.HasPrefix(profile, AppArmorProfile+" (enforce)") {
+		if enabled, _ := appArmorState(); enabled && !strings.HasPrefix(profile, AppArmorProfile+" (enforce)") {
 			t.Errorf("qemu is not confined by %s (attr/current %q)", AppArmorProfile, profile)
 		}
 	}
@@ -416,5 +419,44 @@ func TestRestoreVM_AgentPowersOffWhenIdle(t *testing.T) {
 		t.Logf("the restore VM powered off on its own after %v idle", l.cfg.AgentIdle)
 	case <-time.After(60 * time.Second):
 		t.Fatal("an idle restore VM kept running past the agent's idle timeout")
+	}
+}
+
+// R2-I1: the disk export is single-peer: once qemu has it, the socket is
+// gone, so nothing else — another session's qemu included — can connect.
+// Two sessions run side by side.
+func TestRestoreVM_ExportIsSinglePeerAndSessionsRunSideBySide(t *testing.T) {
+	l := bootLauncher(t)
+	img := filepath.Join(t.TempDir(), "blank.img")
+	run(t, "truncate", "-s", "16M", img)
+	run(t, "mkfs.ext4", "-q", "-F", img)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	a, err := l.Open(ctx, openDev(t, img), KindFS, "raw")
+	if err != nil {
+		t.Fatalf("Open a: %v", err)
+	}
+	defer a.Close()
+	b, err := l.Open(ctx, openDev(t, img), KindFS, "raw")
+	if err != nil {
+		t.Fatalf("Open b: %v", err)
+	}
+	defer b.Close()
+	for name, s := range map[string]*Session{"a": a, "b": b} {
+		if socks, _ := filepath.Glob(filepath.Join(s.dir, "nbd-*.sock")); len(socks) != 0 {
+			t.Errorf("session %s: export socket still there after qemu took it: %v", name, socks)
+		}
+		if _, err := os.Stat(filepath.Join(s.dir, "nonce")); !os.IsNotExist(err) {
+			t.Errorf("session %s: the nonce file outlived the hello", name)
+		}
+		if vols, err := s.Volumes(); err != nil || len(vols) != 1 {
+			t.Errorf("session %s: volumes %v %v", name, vols, err)
+		}
+		if s.qemuPid.Load() == 0 {
+			t.Errorf("session %s: no vetted NBD peer recorded", name)
+		}
+	}
+	if a.qemuPid.Load() == b.qemuPid.Load() {
+		t.Error("two sessions share one qemu")
 	}
 }

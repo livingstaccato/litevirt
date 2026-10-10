@@ -1210,9 +1210,17 @@ type FileRestoreConfig struct {
 	// MaxExtractions caps extractions running at once on this host
 	// (default 1); each also takes a session.
 	MaxExtractions int `yaml:"max_extractions,omitempty"`
-	// AllowUnsandboxed permits a restore VM when this host's qemu has no
-	// seccomp sandbox. Default false: file restore is then refused.
+	// AllowUnsandboxed permits a restore VM without one of its barriers:
+	// qemu's seccomp sandbox, the AppArmor profile (AppArmor enabled but its
+	// parser missing), or a root daemon. DANGEROUS. Default false: file
+	// restore is then refused.
 	AllowUnsandboxed bool `yaml:"allow_unsandboxed,omitempty"`
+	// AllowSharedRunAs permits run_as to be root or a shared qemu user
+	// (libvirt-qemu, qemu, nobody). DANGEROUS. Default false.
+	AllowSharedRunAs bool `yaml:"allow_shared_run_as,omitempty"`
+	// UIDBase is the first of the 64 uids reserved for restore VMs, one per
+	// session (default 3800000000). They must belong to no account.
+	UIDBase uint32 `yaml:"uid_base,omitempty"`
 	// MaxExtractBytes caps one extraction ("16G" default).
 	MaxExtractBytes string `yaml:"max_extract_bytes,omitempty"`
 }
@@ -1235,6 +1243,9 @@ func (f FileRestoreConfig) validate() error {
 	}
 	if _, err := pbsstore.ParseSize(f.MaxExtractBytes); err != nil {
 		return fmt.Errorf("config file_restore.max_extract_bytes: %w", err)
+	}
+	if f.UIDBase != 0 && (f.UIDBase < 65536 || uint64(f.UIDBase)+64 > 4294967294) {
+		return fmt.Errorf("config file_restore.uid_base %d: want 65536..%d (64 uids are reserved from it)", f.UIDBase, uint64(4294967294-64))
 	}
 	return nil
 }

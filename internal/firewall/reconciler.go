@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/nictap"
 )
 
 // PlanLoader builds the desired Plan for *this host* from cluster
@@ -53,6 +54,8 @@ type Reconciler struct {
 
 	state     AppliedState
 	stateHook func(context.Context, AppliedState)
+
+	arming *Arming // SetArming; nil = nothing armed
 }
 
 // NewReconciler wires a loader to an applier. interval controls the
@@ -352,6 +355,10 @@ type LoaderOptions struct {
 	// An empty map means none. The daemon exports it as
 	// litevirt_firewall_sg_duplicate_name_nics.
 	OnDuplicateSGs func(nicsByName map[string]int)
+
+	// Arming, when set, names VMs rendered here whatever host their row
+	// names and NICs whose rows are not written yet (see Arming).
+	Arming *Arming
 }
 
 // CorrosionPlanLoader builds a Plan from the cluster's
@@ -482,9 +489,25 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 			}
 			return nb
 		}
-		ifaces, err := corrosion.ListHostVMNICs(ctx, db, hostName)
+		armed := opts.Arming.Armed()
+		ifaces, err := corrosion.ListHostVMNICs(ctx, db, hostName, armed...)
 		if err != nil {
 			return plan, err
+		}
+		// NICs whose rows are not written yet (a create, a hot-attach): rendered
+		// from what the create path registered, unless their rows have landed.
+		have := map[string]bool{}
+		for _, ifc := range ifaces {
+			have[ifc.VMName+"|"+strings.ToLower(ifc.MAC)] = true
+		}
+		for _, p := range opts.Arming.Pending() {
+			if !have[p.VMName+"|"+strings.ToLower(p.MAC)] {
+				ifaces = append(ifaces, p)
+			}
+		}
+		armedVM := map[string]bool{}
+		for _, vm := range armed {
+			armedVM[vm] = true
 		}
 		var running map[string]map[string]string
 		if len(ifaces) > 0 && opts.RunningTaps != nil {
@@ -499,7 +522,7 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 		if err != nil {
 			return plan, err
 		}
-		subnets, err := corrosion.NetworkSubnets(ctx, db)
+		nets, err := corrosion.NetworkGuardInfos(ctx, db)
 		if err != nil {
 			return plan, err
 		}
@@ -513,12 +536,25 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 		applyRecord := func(nb *NICBinding, rec corrosion.NICGuardRecord, mac, ip, network string) {
 			nb.AllowVLANTags = rec.AllowVLANTags
 			nb.DHCPServer = rec.AllowDHCPServer
-			nb.Guard = ResolveNICGuard(&rec, mac, ip, subnets[network], assigned[network])
+			info := nets[network]
+			nb.Guard = ResolveNICGuard(&rec, mac, ip, info.Subnet, info.All(), assigned[network])
 		}
 		plan.NICs = plan.NICs[:0:0]
 		claimed := map[string]string{} // tap → the VM that holds it this pass
 		for _, ifc := range ifaces {
 			tap := running[ifc.VMName][strings.ToLower(ifc.MAC)]
+			if tap == "" {
+				// Not running here. A NIC litevirt defined names its tap after
+				// its MAC (nictap.Name), so it is rendered under that name
+				// before it runs when it has a guard record — a NIC this build
+				// created — or its VM is armed: the guard is then in force from
+				// the guest's first frame (re-review I-10). Any other NIC is
+				// rendered once running, as before.
+				_, recorded := guards[corrosion.NICGuardKey(ifc.VMName, ifc.MAC)]
+				if recorded || armedVM[ifc.VMName] {
+					tap = nictap.Name(ifc.MAC)
+				}
+			}
 			if tap == "" {
 				if ifc.VMState == "running" && opts.RunningTaps != nil {
 					// libvirt answered and does not have this NIC running.
@@ -537,6 +573,8 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 			claimed[tap] = ifc.VMName
 			nb := bind(tap, ifc.VMName, ifc.SecurityGroups)
 			nb.Bridge = tapBridge(tap)
+			nb.MAC = strings.ToLower(ifc.MAC)
+			nb.TrunkVIDs = ifc.TrunkVIDs
 			if rec, ok := guards[corrosion.NICGuardKey(ifc.VMName, ifc.MAC)]; ok {
 				applyRecord(&nb, rec, ifc.MAC, ifc.IP, ifc.NetworkName)
 			}
@@ -557,7 +595,8 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 			}
 			nb := bind(ifc.VethDevice, ifc.CtName, ifc.SecurityGroups)
 			nb.Bridge = tapBridge(ifc.VethDevice)
-			if rec, ok := guards[corrosion.NICGuardKey(corrosion.ContainerGuardOwner(hostName, ifc.CtName), ifc.MAC)]; ok {
+			nb.MAC = strings.ToLower(ifc.MAC)
+			if rec, ok := ContainerGuard(guards, hostName, ifc.CtName, ifc.MAC); ok {
 				applyRecord(&nb, rec, ifc.MAC, ifc.IP, ifc.NetworkName)
 			}
 			plan.NICs = append(plan.NICs, nb)
@@ -589,10 +628,12 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 		if opts.BridgeConntrack != nil && !opts.BridgeConntrack() {
 			plan.NICMode = NICModeGuardsOnly
 		}
+		// The addresses of litevirt's own dnsmasq on the guest networks: only
+		// where litevirt is the network's router (re-review I-9).
 		plan.Gateways = plan.Gateways[:0:0]
-		for _, sub := range subnets {
-			if gw := SubnetGateway(sub); gw != "" {
-				plan.Gateways = append(plan.Gateways, gw)
+		for _, info := range nets {
+			if info.LitevirtGateway != "" {
+				plan.Gateways = append(plan.Gateways, info.LitevirtGateway)
 			}
 		}
 		sort.Strings(plan.Gateways)
@@ -602,8 +643,44 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 		for _, gw := range plan.Gateways {
 			plan.LBSources = append(plan.LBSources, gw)
 		}
+		// haproxy on another host reaches a backend here from that host's
+		// address (re-review m-d).
+		if len(plan.LBBackends) > 0 {
+			hosts, err := corrosion.ListHosts(ctx, db)
+			if err != nil {
+				return plan, err
+			}
+			for _, h := range hosts {
+				if a, err := netip.ParseAddr(h.Address); err == nil && a.Is4() {
+					plan.LBSources = append(plan.LBSources, a.String())
+				}
+			}
+		}
 		return plan, nil
 	}
+}
+
+// ContainerGuard finds a container NIC's guard record. Its key names the host
+// the container was created on (container names are per host), so a container
+// that migrated or was relocated finds its record under the host it came from,
+// by its name and MAC (re-review m-f); a record written on its current host
+// (`lv firewall nic-guard set --container`) wins, then the newest.
+func ContainerGuard(guards map[string]corrosion.NICGuardRecord, host, name, mac string) (corrosion.NICGuardRecord, bool) {
+	if rec, ok := guards[corrosion.NICGuardKey(corrosion.ContainerGuardOwner(host, name), mac)]; ok {
+		return rec, true
+	}
+	var best corrosion.NICGuardRecord
+	found := false
+	for _, rec := range guards {
+		h, n, ok := corrosion.ParseContainerGuardOwner(rec.VMName)
+		if !ok || n != name || h == host || !strings.EqualFold(rec.MAC, mac) {
+			continue
+		}
+		if !found || rec.UpdatedAt > best.UpdatedAt {
+			best, found = rec, true
+		}
+	}
+	return best, found
 }
 
 // loadLBBackends lists every enabled built-in load balancer's backend
@@ -680,7 +757,12 @@ func loadLBBackends(ctx context.Context, db *corrosion.Client) ([]LBBackend, []s
 //
 // An entry that does not parse is skipped rather than allowed to reach the
 // renderer, which would refuse the whole ruleset.
-func ResolveNICGuard(rec *corrosion.NICGuardRecord, mac, nicIP, subnet string, assigned []string) *NICGuard {
+//
+// reserved are the network's infrastructure addresses — its router where it
+// is litevirt's, its configured gateway and reserved addresses, the gateways
+// its NICs route through (corrosion.NetworkGuardInfo.All) — which a guest
+// confined to its subnet may never claim.
+func ResolveNICGuard(rec *corrosion.NICGuardRecord, mac, nicIP, subnet string, reserved, assigned []string) *NICGuard {
 	if rec == nil || !rec.Guarded() {
 		return nil
 	}
@@ -729,11 +811,17 @@ func ResolveNICGuard(rec *corrosion.NICGuardRecord, mac, nicIP, subnet string, a
 			// is assigned to another NIC on it: claiming those is how a guest
 			// impersonates the gateway or a neighbour.
 			excl := subnetReserved(sp)
+			for _, a := range reserved {
+				if ap, err := netip.ParseAddr(a); err == nil && sp.Contains(ap) && !own[ap.String()] {
+					excl = append(excl, ap.String())
+				}
+			}
 			for _, a := range assigned {
 				if ap, err := netip.ParseAddr(a); err == nil && sp.Contains(ap) && !own[ap.String()] {
 					excl = append(excl, ap.String())
 				}
 			}
+			excl = sortedAddrs(excl)
 			if v4net {
 				v4 = append(v4, sp.String())
 				g.ExcludeV4 = excl
@@ -752,14 +840,30 @@ func ResolveNICGuard(rec *corrosion.NICGuardRecord, mac, nicIP, subnet string, a
 	return g
 }
 
-// subnetReserved is a subnet's own addresses: the network address, the
-// gateway litevirt puts on the bridge (the first host, where dnsmasq serves),
-// and for IPv4 the broadcast address.
+// sortedAddrs sorts addresses numerically and drops duplicates.
+func sortedAddrs(in []string) []string {
+	addrs := make([]netip.Addr, 0, len(in))
+	for _, a := range in {
+		if ap, err := netip.ParseAddr(a); err == nil {
+			addrs = append(addrs, ap)
+		}
+	}
+	sort.Slice(addrs, func(i, j int) bool { return addrs[i].Less(addrs[j]) })
+	out := make([]string, 0, len(addrs))
+	for i, a := range addrs {
+		if i == 0 || a != addrs[i-1] {
+			out = append(out, a.String())
+		}
+	}
+	return out
+}
+
+// subnetReserved is a subnet's own addresses: the network address and, for
+// IPv4, the broadcast address. The router is not among them: it is whatever
+// the network says it is (ResolveNICGuard's reserved), not simply the first
+// host.
 func subnetReserved(sp netip.Prefix) []string {
 	out := []string{sp.Addr().String()}
-	if gw := sp.Addr().Next(); sp.Contains(gw) {
-		out = append(out, gw.String())
-	}
 	if sp.Addr().Is4() {
 		b := sp.Addr().As4()
 		bits := sp.Bits()
@@ -773,20 +877,6 @@ func subnetReserved(sp netip.Prefix) []string {
 		out = append(out, netip.AddrFrom4(b).String())
 	}
 	return out
-}
-
-// SubnetGateway is the address litevirt gives a managed network's bridge:
-// the subnet's first host. "" when subnet does not parse.
-func SubnetGateway(subnet string) string {
-	sp, err := netip.ParsePrefix(strings.TrimSpace(subnet))
-	if err != nil || sp.Addr().Zone() != "" {
-		return ""
-	}
-	gw := sp.Masked().Addr().Next()
-	if !sp.Contains(gw) {
-		return ""
-	}
-	return gw.String()
 }
 
 // parseGuardEntry reads one guard address. An assigned address is a host

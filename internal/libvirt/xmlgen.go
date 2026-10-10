@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/litevirt/litevirt/internal/nictap"
 	"github.com/litevirt/litevirt/internal/safename"
 )
 
@@ -523,12 +524,7 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 				Model:  ifaceModel{Type: model},
 			}
 		} else {
-			iface = interfaceDevice{
-				Type:   "bridge",
-				MAC:    ifaceMAC{Address: mac},
-				Source: ifaceSource{Bridge: n.Bridge},
-				Model:  ifaceModel{Type: model},
-			}
+			iface = bridgeInterface(n.Bridge, model, mac)
 		}
 		dev.Interfaces = append(dev.Interfaces, iface)
 	}
@@ -974,11 +970,35 @@ type diskTarget struct {
 }
 
 type interfaceDevice struct {
-	XMLName xml.Name    `xml:"interface"`
-	Type    string      `xml:"type,attr"`
-	MAC     ifaceMAC    `xml:"mac"`
-	Source  ifaceSource `xml:"source"`
-	Model   ifaceModel  `xml:"model"`
+	XMLName xml.Name     `xml:"interface"`
+	Type    string       `xml:"type,attr"`
+	MAC     ifaceMAC     `xml:"mac"`
+	Source  ifaceSource  `xml:"source"`
+	Target  *ifaceTarget `xml:"target,omitempty"`
+	Model   ifaceModel   `xml:"model"`
+}
+
+type ifaceTarget struct {
+	Dev string `xml:"dev,attr"`
+}
+
+// bridgeInterface is a NIC on a bridge, its tap named after its MAC
+// (nictap.Name) so the per-NIC firewall can be in force before the domain
+// runs — at its start, and on the target of a migration.
+func bridgeInterface(bridge, model, mac string) interfaceDevice {
+	if model == "" {
+		model = "virtio"
+	}
+	iface := interfaceDevice{
+		Type:   "bridge",
+		MAC:    ifaceMAC{Address: mac},
+		Source: ifaceSource{Bridge: bridge},
+		Model:  ifaceModel{Type: model},
+	}
+	if tap := nictap.Name(mac); tap != "" {
+		iface.Target = &ifaceTarget{Dev: tap}
+	}
+	return iface
 }
 
 type ifaceMAC struct {

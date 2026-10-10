@@ -118,10 +118,11 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	if _, recreate := replacedVMFor(ctx, spec.Name); recreate {
 		guardAdmit = admitRecreate
 	}
-	if err := s.admitNICGuards(ctx, spec.Name, spec.Network, guardAdmit); err != nil {
+	guardDec, err := s.admitNICGuards(ctx, spec.Name, spec.Network, guardAdmit)
+	if err != nil {
 		return nil, err
 	}
-	if err := s.checkNICIdentities(ctx, spec.Network, spec.Name); err != nil {
+	if err := s.checkNICIdentities(ctx, spec.Project, spec.Network, spec.Name); err != nil {
 		return nil, err
 	}
 
@@ -730,18 +731,27 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 				OwnerKind: "vm", OwnerHost: "", Name: spec.Name,
 				Identity: identity, NetBoxID: res.NetBoxIPID,
 			})
-		} else if def, _ := lookupNetworkDef(ctx, s.db, n.Name); !strings.HasPrefix(bridge, "direct:") && s.dhcpReservable(n, def) {
-			// A guarded NIC on a network litevirt serves DHCP for: an exact
-			// address, reserved in dnsmasq before the guest can ask, so the
-			// guard holds the guest to it rather than to the whole subnet.
+		} else if def, _ := lookupNetworkDef(ctx, s.db, n.Name); !strings.HasPrefix(bridge, "direct:") &&
+			guardDec[i].guarded(n) && s.dhcpReservable(n, def) {
+			// A guarded NIC on a network this host alone serves DHCP for: an
+			// exact address, reserved in dnsmasq before the guest can ask, so
+			// the guard holds the guest to it rather than to the whole subnet.
 			ip, rerr := s.reserveDHCPAddress(ctx, n.Name, def.Subnet, bridge, mac)
-			if rerr != nil {
+			switch {
+			case errors.Is(rerr, network.ErrNoLocalDHCPServer):
+				// The server went away under us: no exact address, and the
+				// guard confines the NIC to its subnet — never a reservation
+				// nobody honours (re-review I-8).
+				slog.Warn("DHCP reservation: no local DHCP server after all; the NIC's guard is confined to its subnet",
+					"vm", spec.Name, "network", n.Name, "error", rerr)
+			case rerr != nil:
 				claims.releaseAll(ctx)
 				cleanupDisks()
 				return nil, status.Errorf(codes.ResourceExhausted, "reserve a DHCP address on %q: %v", n.Name, rerr)
+			default:
+				nicIP = ip
+				dhcpReserved[i] = true
 			}
-			nicIP = ip
-			dhcpReserved[i] = true
 		}
 
 		ifaceRecords = append(ifaceRecords, corrosion.InterfaceRecord{
@@ -772,7 +782,9 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		// A macvtap NIC bypasses the bridge, where guards are enforced, so it
 		// gets no record rather than one that claims a protection it lacks.
 		if !strings.HasPrefix(bridge, "direct:") {
-			guardRecords = append(guardRecords, newNICGuardRecord(spec.Name, mac, n))
+			if rec := guardDec[i].record(spec.Name, spec.Uuid, i, mac, n); rec != nil {
+				guardRecords = append(guardRecords, *rec)
+			}
 		}
 	}
 
@@ -972,6 +984,19 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		return nil, status.Errorf(codes.Internal, "define domain: %v", err)
 	}
 	s.ensureSparePCIeRootPorts(spec.Name)
+
+	// The NIC rows are written once the domain runs; until then the firewall
+	// renders the NICs from here, so their guards are in force when the
+	// before-start hook arms the VM (nic_firewall_arming.go).
+	trunks := map[int][]int{}
+	for i, n := range spec.Network {
+		if len(n.Trunk) > 1 {
+			for _, v := range n.Trunk {
+				trunks[i] = append(trunks[i], int(v))
+			}
+		}
+	}
+	defer s.pendingNICs(spec.Name, ifaceRecords, trunks)()
 
 	if err := s.virt.StartDomain(spec.Name); err != nil {
 		s.virt.UndefineDomain(spec.Name, false)

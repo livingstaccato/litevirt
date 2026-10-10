@@ -639,6 +639,14 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 		return err
 	}
 
+	// The target puts the guest's NIC firewall — its guards above all — in
+	// force before the guest arrives, under the tap names its MACs fix
+	// (re-review I-10). Before anything is written, so a refusal changes
+	// nothing.
+	if err := s.armMigrationTarget(ctx, targetHost, vm.Name); err != nil {
+		return err
+	}
+
 	// Split-brain gate, LATE re-check: the early gate (after target validation) is a
 	// fail-fast, but preflight/provisioning ran since then. Re-check quorum on the
 	// source IMMEDIATELY before the irreversible step (state → migrating, then

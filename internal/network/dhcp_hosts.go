@@ -8,6 +8,7 @@ package network
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"net/netip"
 	"os"
@@ -57,9 +58,15 @@ func SyncDHCPHosts(bridge string, hosts map[string]string) (bool, error) {
 	return true, hupDnsmasqFor(path)
 }
 
+// ErrNoLocalDHCPServer: no dnsmasq of litevirt's serves the bridge on this
+// host, so a reservation here would reserve nothing.
+var ErrNoLocalDHCPServer = errors.New("no litevirt DHCP server for this bridge on this host")
+
 // AddDHCPHost adds one reservation now, ahead of the periodic sync — a guest
 // asks for an address within seconds of starting, before its rows are
-// replicated anywhere.
+// replicated anywhere. A bridge with no hosts file has no dnsmasq of
+// litevirt's here: that is ErrNoLocalDHCPServer, never a silent success, since
+// the guest would then take a dynamic address its exact guard drops.
 func AddDHCPHost(bridge, mac, ip string) error {
 	hostsMu.Lock()
 	path := DHCPHostsFile(bridge)
@@ -67,7 +74,7 @@ func AddDHCPHost(bridge, mac, ip string) error {
 	if err != nil {
 		hostsMu.Unlock()
 		if os.IsNotExist(err) {
-			return nil
+			return fmt.Errorf("%w: %s", ErrNoLocalDHCPServer, bridge)
 		}
 		return err
 	}
@@ -137,6 +144,43 @@ func LeasedAddrs(bridge string) []string {
 		}
 	}
 	return out
+}
+
+// DHCPServedHere reports whether a live dnsmasq of litevirt's on this host
+// reads bridge's reservations file — whether a reservation made here is one a
+// DHCP server will honour.
+func DHCPServedHere(bridge string) bool {
+	path := DHCPHostsFile(bridge)
+	if _, err := os.Stat(path); err != nil {
+		return false
+	}
+	pids, _ := filepath.Glob("/var/run/litevirt-dnsmasq-*.pid")
+	for _, pf := range pids {
+		pid := readPidFile(pf)
+		if pid <= 0 || !processRunning(pid) || !procIsOurDnsmasq(pid, pf) {
+			continue
+		}
+		cmdline, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/cmdline")
+		if err == nil && bytes.Contains(cmdline, []byte("--dhcp-hostsfile="+path+"\x00")) {
+			return true
+		}
+	}
+	return false
+}
+
+// LeasedAddrFor is the address bridge's dnsmasq has leased to mac, or "".
+func LeasedAddrFor(bridge, mac string) string {
+	data, err := os.ReadFile(lv.DHCPLeaseFile(dnsmasqLeaseDir, bridge))
+	if err != nil {
+		return ""
+	}
+	sc := bufio.NewScanner(bytes.NewReader(data))
+	for sc.Scan() {
+		if f := strings.Fields(sc.Text()); len(f) >= 3 && strings.EqualFold(f[1], mac) {
+			return f[2]
+		}
+	}
+	return ""
 }
 
 // NextFreeIP returns the lowest host address of subnet not in used (the

@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/litevirt/litevirt/internal/libvirt"
+	"github.com/litevirt/litevirt/internal/nictap"
 )
 
 // State describes a single domain's lifecycle. Mirrors what
@@ -130,6 +131,9 @@ type Fake struct {
 	FailHostCPUXML   func() error
 	FailDefineDomain func(xml string) error
 	FailStartDomain  func(name string) error
+	// beforeStart mirrors libvirt.Client.SetBeforeStart: run ahead of every
+	// StartDomain, before FailStartDomain; an error refuses the start.
+	beforeStart func(name string) error
 	// IgnoreShutdown makes ShutdownDomain a guest that ignores the ACPI
 	// request when it returns true: the call succeeds, the domain keeps
 	// running, and WaitForShutdown times out.
@@ -449,7 +453,22 @@ func domainUUIDFromXML(xmlConfig string) string {
 	return strings.TrimSpace(rest[:j])
 }
 
+// SetBeforeStart mirrors libvirt.Client.SetBeforeStart.
+func (f *Fake) SetBeforeStart(fn func(name string) error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.beforeStart = fn
+}
+
 func (f *Fake) StartDomain(name string) error {
+	f.mu.Lock()
+	before := f.beforeStart
+	f.mu.Unlock()
+	if before != nil {
+		if err := before(name); err != nil {
+			return fmt.Errorf("start domain %s: %w", name, err)
+		}
+	}
 	if f.FailStartDomain != nil {
 		if err := f.FailStartDomain(name); err != nil {
 			return err
@@ -1122,8 +1141,12 @@ func insertNICIntoDomainXML(domainXML, domainName, bridge, model, mac string) st
 	if nicMacInDomainXML(domainXML, mac) {
 		return domainXML
 	}
+	target := ""
+	if tap := nictap.Name(mac); tap != "" {
+		target = "<target dev='" + tap + "'/>" // as libvirt.Client.AttachNIC names it
+	}
 	iface := "<interface type='bridge'><source bridge='" + bridge + "'/>" +
-		"<mac address='" + mac + "'/><model type='" + model + "'/></interface>"
+		"<mac address='" + mac + "'/>" + target + "<model type='" + model + "'/></interface>"
 	if strings.Contains(domainXML, "</devices>") {
 		return strings.Replace(domainXML, "</devices>", iface+"</devices>", 1)
 	}
@@ -1896,10 +1919,36 @@ func (f *Fake) tapLocked(domainName, mac string) string {
 	if tap, ok := f.taps[k]; ok {
 		return tap
 	}
-	tap := fmt.Sprintf("vnet%d", f.nextTap)
-	f.nextTap++
+	// A NIC whose definition names its tap (<target dev>, as litevirt's do —
+	// nictap.Name) gets that name, as libvirt gives it; any other gets the
+	// next vnetN.
+	tap := targetDevForMAC(f.liveXMLLocked(domainName), mac)
+	if tap == "" {
+		tap = fmt.Sprintf("vnet%d", f.nextTap)
+		f.nextTap++
+	}
 	f.taps[k] = tap
 	return tap
+}
+
+var (
+	reFakeIface     = regexp.MustCompile(`(?s)<interface\b.*?</interface>`)
+	reFakeTargetDev = regexp.MustCompile(`<target\b[^>]*\bdev=['"]([^'"]+)['"]`)
+)
+
+// targetDevForMAC is the <target dev> of the interface with mac in domainXML,
+// or "" when it names none.
+func targetDevForMAC(domainXML, mac string) string {
+	for _, el := range reFakeIface.FindAllString(domainXML, -1) {
+		if !nicMacInDomainXML(el, mac) {
+			continue
+		}
+		if m := reFakeTargetDev.FindStringSubmatch(el); m != nil {
+			return m[1]
+		}
+		return ""
+	}
+	return ""
 }
 
 // Lifecycle hooks — daemon-only paths. Connection management is a no-op (there

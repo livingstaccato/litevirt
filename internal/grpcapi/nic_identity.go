@@ -21,12 +21,14 @@ import (
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/network"
+	"github.com/litevirt/litevirt/internal/tenancy"
 )
 
 // checkNICIdentities refuses explicit MACs and addresses another live NIC
-// holds, and addresses a subnet keeps for itself. owners are the names whose
-// own rows do not count (the VM being created, and the one it re-creates).
-func (s *Server) checkNICIdentities(ctx context.Context, atts []*pb.NetworkAttachment, owners ...string) error {
+// holds, and addresses a network keeps for itself. project is the project of
+// the workload the NICs are for; owners are the names whose own rows do not
+// count (the VM being created, and the one it re-creates).
+func (s *Server) checkNICIdentities(ctx context.Context, project string, atts []*pb.NetworkAttachment, owners ...string) error {
 	explicit := false
 	for _, a := range atts {
 		if a != nil && (a.GetMac() != "" || a.GetIp() != "" || a.GetIpv6() != "") {
@@ -46,8 +48,9 @@ func (s *Server) checkNICIdentities(ctx context.Context, atts []*pb.NetworkAttac
 	}
 	guards, err := corrosion.ListNICGuards(ctx, s.db)
 	if err != nil {
-		return status.Errorf(codes.Unavailable, "read NIC guards: %v", err)
+		return status.Errorf(codes.Internal, "read NIC guards: %v", err)
 	}
+	var infos map[string]corrosion.NetworkGuardInfo
 	seenMAC := map[string]bool{}
 	for _, a := range atts {
 		if a == nil {
@@ -65,7 +68,12 @@ func (s *Server) checkNICIdentities(ctx context.Context, atts []*pb.NetworkAttac
 			}
 		}
 		if ip := a.GetIp(); ip != "" {
-			if err := s.checkAddrFree(ctx, a.GetName(), ip, ids, mine); err != nil {
+			if infos == nil {
+				if infos, err = corrosion.NetworkGuardInfos(ctx, s.db); err != nil {
+					return status.Errorf(codes.Internal, "read networks: %v", err)
+				}
+			}
+			if err := s.checkAddrFree(ctx, project, a.GetName(), ip, ids, mine, infos[a.GetName()]); err != nil {
 				return err
 			}
 		}
@@ -86,10 +94,18 @@ func (s *Server) checkNICIdentities(ctx context.Context, atts []*pb.NetworkAttac
 	return nil
 }
 
-// checkAddrFree refuses an explicit IPv4 address on a network litevirt
-// manages when it is one of the subnet's own addresses or another NIC's. On a
-// NetBox-bound network NetBox decides, as it always has.
-func (s *Server) checkAddrFree(ctx context.Context, netName, ip string, ids []corrosion.AddrOwner, mine map[string]bool) error {
+// checkAddrFree refuses an explicit address on a network litevirt manages
+// when it is one of the subnet's own addresses (network, broadcast), the
+// network's router or a reserved address (re-review I-9: the gateway litevirt
+// puts on the bridge where it does, the configured gateway and reserved
+// addresses — never simply network+1), a gateway other projects' NICs route
+// through, or another NIC's. On a NetBox-bound network NetBox decides, as it
+// always has.
+//
+// A gateway only VMs of the caller's own project route through stays
+// claimable: a project may run its own router. A caller with network.update on
+// the network may claim any NIC-declared gateway.
+func (s *Server) checkAddrFree(ctx context.Context, project, netName, ip string, ids []corrosion.AddrOwner, mine map[string]bool, info corrosion.NetworkGuardInfo) error {
 	addr := canonAddr(ip)
 	if addr == "" {
 		return nil // the create path reports a malformed address itself
@@ -97,14 +113,27 @@ func (s *Server) checkAddrFree(ctx context.Context, netName, ip string, ids []co
 	if alloc, _, err := s.allocatorFor(ctx, "vm", netName); err == nil && alloc != nil {
 		return nil
 	}
-	if def, _ := lookupNetworkDef(ctx, s.db, netName); def != nil && def.Subnet != "" {
-		if sp, err := netip.ParsePrefix(def.Subnet); err == nil {
-			sp = sp.Masked()
-			a, _ := netip.ParseAddr(addr)
-			if sp.Contains(a) && (a == sp.Addr() || a == sp.Addr().Next() || (a.Is4() && a == lastAddr(sp))) {
-				return status.Errorf(codes.InvalidArgument,
-					"%s is the network address, gateway or broadcast of %s; it cannot be a NIC's", addr, netName)
-			}
+	a, _ := netip.ParseAddr(addr)
+	if sp, err := netip.ParsePrefix(strings.TrimSpace(info.Subnet)); err == nil && sp.Addr().Is4() == a.Is4() {
+		sp = sp.Masked()
+		if sp.Contains(a) && sp.Bits() < sp.Addr().BitLen()-1 && (a == sp.Addr() || (a.Is4() && a == lastAddr(sp))) {
+			return status.Errorf(codes.InvalidArgument,
+				"%s is the network or broadcast address of %s; it cannot be a NIC's", addr, netName)
+		}
+	}
+	for _, r := range append([]string{info.LitevirtGateway}, info.Reserved...) {
+		if r != "" && r == addr {
+			return status.Errorf(codes.InvalidArgument,
+				"%s is the gateway or a reserved address of network %q; it cannot be a NIC's", addr, netName)
+		}
+	}
+	for _, d := range info.NICGateways {
+		if d.Addr != addr || mine[d.VM] || tenancy.NormalizeProject(d.Project) == tenancy.NormalizeProject(project) {
+			continue
+		}
+		if err := s.requireGuardAuthority(ctx, netName, "claiming "+addr+", the gateway "+d.VM+" routes through,"); err != nil {
+			return status.Errorf(codes.InvalidArgument,
+				"%s is the gateway VM %s routes through on network %q; claiming it needs network.update there", addr, d.VM, netName)
 		}
 	}
 	for _, id := range ids {
@@ -138,7 +167,13 @@ func canonAddr(s string) string {
 
 // dhcpReservable reports whether a new NIC should get an exact DHCP
 // reservation: it will be guarded (its record can be written and it is on),
-// it named no address, and its network is one litevirt serves DHCPv4 on.
+// it named no address, and its network's DHCP is served by this host's
+// dnsmasq ALONE — an isolated network, or a host-local bridge (no VLAN, no
+// uplink) — since the reservation is made here (re-review I-8). On vxlan the
+// elected gateway host serves, and on a bridge with an uplink another server
+// may answer first; a guest given a dynamic address there would be dropped by
+// its exact guard for the whole lease. Such a NIC is guarded to its subnet
+// instead (docs/firewall.md, "Which addresses a guarded NIC may use").
 func (s *Server) dhcpReservable(att *pb.NetworkAttachment, def *compose.NetworkDef) bool {
 	if att.GetIp() != "" || def == nil || !def.DHCP || def.Subnet == "" || !s.db.MayWriteClusterPolicy() {
 		return false
@@ -146,20 +181,41 @@ func (s *Server) dhcpReservable(att *pb.NetworkAttachment, def *compose.NetworkD
 	if mode, err := normalizeNICGuardMode(att.GetSpoofGuard()); err != nil || mode != corrosion.NICGuardOn {
 		return false
 	}
-	if def.Type == "direct" || def.Type == "sriov" || def.NetBoxPrefixID != 0 {
+	if def.NetBoxPrefixID != 0 || def.HostIsolation {
 		return false
 	}
+	switch def.Type {
+	case "", "bridge":
+		if def.VLAN != 0 {
+			return false
+		}
+	case "isolated":
+	default:
+		return false // vxlan: another host may serve; sriov, direct: no bridge
+	}
 	p, err := netip.ParsePrefix(def.Subnet)
-	return err == nil && p.Addr().Is4()
+	if err != nil || !p.Addr().Is4() {
+		return false
+	}
+	bridge := network.BridgeName(att.GetName(), *def)
+	served, uplink := network.DHCPServedHere, network.BridgeHasUplink
+	if s.dhcpServedHere != nil {
+		served = s.dhcpServedHere
+	}
+	if s.bridgeHasUplink != nil {
+		uplink = s.bridgeHasUplink
+	}
+	return served(bridge) && (def.Type == "isolated" || !uplink(bridge))
 }
 
 // reserveDHCPAddress picks a free address for mac on netName and reserves it
 // in the local dnsmasq at once (the guest asks within seconds of starting).
 // Free means: no live NIC row or lease holds it, the local dnsmasq has not
-// leased it, and no create in flight on this host just took it. Two hosts
-// reserving at the same instant can still pick the same address — the
-// tables have no UNIQUE — which the guard then shows as a dropped guest, not
-// as an impersonation.
+// leased it, and no create in flight on this host just took it. A MAC the
+// local dnsmasq has already leased an address to (a re-created VM that kept
+// its MAC) keeps that address when nothing else holds it (re-review I-11).
+// dhcpReservable has established that this host's dnsmasq is the network's
+// only server, so one host decides each address.
 func (s *Server) reserveDHCPAddress(ctx context.Context, netName, subnet, bridge, mac string) (string, error) {
 	assigned, err := corrosion.NetworkAssignedAddrs(ctx, s.db)
 	if err != nil {
@@ -168,21 +224,41 @@ func (s *Server) reserveDHCPAddress(ctx context.Context, netName, subnet, bridge
 	s.dhcpResMu.Lock()
 	defer s.dhcpResMu.Unlock()
 	s.prunePendingLocked()
-	used := append(append([]string(nil), assigned[netName]...), network.LeasedAddrs(bridge)...)
-	for ip := range s.dhcpPending[netName] {
-		used = append(used, ip)
+	taken := map[string]bool{}
+	for _, a := range assigned[netName] {
+		taken[a] = true
 	}
-	ip, err := network.NextFreeIP(subnet, used)
-	if err != nil {
+	for ip := range s.dhcpPending[netName] {
+		taken[ip] = true
+	}
+	ip := ""
+	if own := canonAddr(network.LeasedAddrFor(bridge, mac)); own != "" && !taken[own] {
+		if sp, perr := netip.ParsePrefix(subnet); perr == nil {
+			if a, aerr := netip.ParseAddr(own); aerr == nil && sp.Masked().Contains(a) && a != sp.Masked().Addr().Next() {
+				ip = own
+			}
+		}
+	}
+	if ip == "" {
+		used := append([]string(nil), network.LeasedAddrs(bridge)...)
+		for a := range taken {
+			used = append(used, a)
+		}
+		if ip, err = network.NextFreeIP(subnet, used); err != nil {
+			return "", err
+		}
+	}
+	add := network.AddDHCPHost
+	if s.addDHCPHost != nil {
+		add = s.addDHCPHost
+	}
+	if err := add(bridge, mac, ip); err != nil {
 		return "", err
 	}
 	if s.dhcpPending[netName] == nil {
 		s.dhcpPending[netName] = map[string]dhcpPendingRes{}
 	}
 	s.dhcpPending[netName][ip] = dhcpPendingRes{mac: strings.ToLower(mac), at: time.Now()}
-	if err := network.AddDHCPHost(bridge, mac, ip); err != nil {
-		return "", err
-	}
 	return ip, nil
 }
 

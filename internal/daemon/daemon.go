@@ -1286,15 +1286,31 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// table. The applier short-circuits when the rendered ruleset
 	// hasn't changed, so idle clusters cost ~one corrosion query/tick.
 	fwApplier := firewall.NewApplier(firewall.NftBinary{})
+	// Observe-mode evidence outlives every table reload and daemon restart
+	// (re-review I-4): harvested before each replace, kept in data_dir.
+	fwApplier.SetTally(firewall.NewWouldDropTally(filepath.Join(d.cfg.DataDir, "firewall-would-drop.json"), time.Now()))
 	fwMetrics := metrics.NewFirewallMetrics()
+	// VMs about to start or migrate in here, and NICs whose rows are not
+	// written yet: rendered ahead of their rows (firewall.Arming).
+	fwArming := firewall.NewArming()
 	// Per-NIC rules need bridge connection tracking. Loaded once here; a host
 	// that cannot load it renders the guards only and raises a health
 	// condition (firewall.nic.unavailable), never an empty firewall.
 	bridgeCT := firewall.BridgeConntrackAvailable(ctx, true)
 	fwLoader := firewall.CorrosionPlanLoader(d.db, d.cfg.HostName, firewall.Plan{},
 		firewall.LoaderOptions{RunningTaps: d.virt.RunningDomainTaps, OnDuplicateSGs: fwMetrics.SetDuplicateSGNICs,
-			BridgeConntrack: func() bool { return bridgeCT }})
+			BridgeConntrack: func() bool { return bridgeCT }, Arming: fwArming})
 	d.fwReconciler = firewall.NewReconciler(fwLoader, fwApplier, 30*time.Second)
+	d.fwReconciler.SetArming(fwArming)
+	// Every domain start — an API start, a restart policy, a failover
+	// reschedule, a restore — first puts the VM's NIC firewall in force here,
+	// its guards above all, and a guarded VM whose guards cannot be is not
+	// started (re-review I-10).
+	d.virt.SetBeforeStart(func(name string) error {
+		actx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		return svc.ArmNICsFor(actx, name)
+	})
 	d.fwReconciler.SetStateHook(svc.RecordFirewallState)
 	// Upgrade migration: once the reconciler renders a bridge's NAT/isolation into
 	// litevirt-fw, clear the pre-consolidation out-of-band rules (old iptables
@@ -1302,11 +1318,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.fwReconciler.SetLegacyCleanup(network.RemoveLegacyBridgeFirewall)
 	svc.SetFirewallReconciler(d.fwReconciler)
 	svc.SetAntiEntropy(ae) // `lv cluster converge` kicks an immediate debounced pass
+	// This build's units, before the first per-NIC table is loaded: the main
+	// unit's ExecStartPre removes that table when a build that does not own it
+	// starts, so a rollback leaves no stale per-NIC rules enforcing. An upgrade
+	// only ever installs the OLD binary's units.
+	grpcapi.EnsureSystemdUnits()
 	d.fwReconciler.Start(ctx)
-	// Record the per-NIC enforcement mode once (observe for a cluster that
-	// upgraded, enforce for a fresh one), and keep dnsmasq's host reservations
-	// in step with the NICs guarded on its networks.
-	go svc.SeedFirewallEnforcementLoop(ctx, 0)
+	// Record the founder's genesis decision of the per-NIC enforcement mode
+	// (enforce) once it can; a cluster with no mode recorded observes. And keep
+	// dnsmasq's host reservations in step with the NICs guarded on its
+	// networks.
+	go svc.SeedFirewallEnforcementLoop(ctx, 0, filepath.Join(d.cfg.DataDir, firewallInitialModeName))
 	svc.StartDHCPReservations(ctx, 0)
 
 	// Converge this host's network devices on the replicated networks table
@@ -2345,6 +2367,11 @@ const adminPasswordFile = "/etc/litevirt/admin-password"
 // while it exists, and deletes it once that credential is written.
 const genesisMarkerName = "genesis-pending"
 
+// firewallInitialModeName is the founder's genesis decision of the cluster's
+// per-NIC firewall mode, in data_dir, consumed once recorded
+// (grpcapi.SeedFirewallEnforcementLoop).
+const firewallInitialModeName = "firewall-initial-mode"
+
 // wireActivationMarker points the health checker at this node's durable
 // capability latches (health.ActivationMarkerBase), loading any already there.
 // They are written only after a daemon has run as a member and survive a
@@ -2470,6 +2497,17 @@ func (d *Daemon) seedAdminUser(ctx context.Context) error {
 	if err := d.db.MarkAuditSeeded(ctx, "founded the cluster (genesis)"); err != nil {
 		slog.Warn("could not record the founder's replica as seeded; `lv host add` through this node "+
 			"is refused until it is", "error", err)
+	}
+
+	// Genesis is also the one moment the cluster is known to be new, so it is
+	// where "a fresh cluster enforces its per-NIC firewall rules" is decided
+	// (re-review I-3, m-j): the seed loop records this once the
+	// cluster_policies gate opens. No other host ever decides; with nothing
+	// recorded a cluster observes.
+	if err := os.WriteFile(filepath.Join(d.cfg.DataDir, firewallInitialModeName),
+		[]byte(corrosion.FirewallEnforce+"\n"), 0o600); err != nil {
+		slog.Warn("could not record the new cluster's initial firewall mode; it observes until `lv firewall enforce on`",
+			"error", err)
 	}
 
 	// The marker licenses exactly one mint, and that mint has now happened: the

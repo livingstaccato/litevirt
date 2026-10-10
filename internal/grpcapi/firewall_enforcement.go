@@ -13,7 +13,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"sort"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -120,23 +122,77 @@ type appliedStater interface {
 	AppliedState() firewall.AppliedState
 }
 
+// wouldDropKeeper keeps this host's observe-mode totals (firewall.WouldDropTally).
+type wouldDropKeeper interface {
+	WouldDropTotals(ctx context.Context) (time.Time, []firewall.TallyEntry, error)
+	ResetWouldDrops(ctx context.Context, now time.Time) error
+}
+
 func (s *Server) localFirewallEnforcement(ctx context.Context) *pb.FirewallHostEnforcement {
 	h := &pb.FirewallHostEnforcement{HostName: s.hostName}
 	if r, ok := s.fwReconciler.(appliedStater); ok {
 		st := r.AppliedState()
 		h.AppliedMode, h.Error = st.Mode, st.NICTableError
-		wd, err := firewall.WouldDrops(ctx)
+	}
+	if k, ok := s.fwReconciler.(wouldDropKeeper); ok {
+		since, entries, err := k.WouldDropTotals(ctx)
 		if err != nil && h.Error == "" {
 			h.Error = err.Error()
 		}
-		for _, w := range wd {
+		if !since.IsZero() {
+			h.WouldDropSince = since.UTC().Format(time.RFC3339)
+		}
+		for _, e := range entries {
 			h.WouldDrops = append(h.WouldDrops, &pb.FirewallWouldDrop{
-				Device: w.Device, Workload: st.NICs[w.Device], Side: w.Side, Rule: w.Rule,
-				Packets: w.Packets, Bytes: w.Bytes,
+				Device: e.Device, Workload: e.Workload, Mac: e.MAC, Side: e.Side, Rule: e.Rule,
+				Packets: e.Packets, Bytes: e.Bytes,
 			})
 		}
 	}
 	return h
+}
+
+// ResetFirewallWouldDrops restarts every host's would-drop totals from now.
+// Admin only, audited: the totals are the evidence an operator turns
+// enforcement on by.
+func (s *Server) ResetFirewallWouldDrops(ctx context.Context, req *pb.ResetFirewallWouldDropsRequest) (*pb.FirewallEnforcementStatus, error) {
+	if err := RequireRole(ctx, "admin"); err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	if k, ok := s.fwReconciler.(wouldDropKeeper); ok {
+		if err := k.ResetWouldDrops(ctx, now); err != nil {
+			s.audit(ctx, "firewall.would_drop.reset", s.hostName, "", "error")
+			return nil, status.Errorf(codes.Internal, "reset the would-drop totals on %s: %v", s.hostName, err)
+		}
+	}
+	s.audit(ctx, "firewall.would_drop.reset", s.hostName, "since="+now.UTC().Format(time.RFC3339), "ok")
+	if !req.GetLocalOnly() {
+		hosts, err := corrosion.ListHosts(ctx, s.db)
+		if err != nil {
+			return nil, status.Errorf(codes.Unavailable, "list hosts: %v", err)
+		}
+		var failed []string
+		for _, h := range hosts {
+			if h.Name == s.hostName || h.State != "active" {
+				continue
+			}
+			hctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			client, conn, perr := s.peerClient(hctx, h.Name)
+			if perr == nil {
+				_, perr = client.ResetFirewallWouldDrops(hctx, &pb.ResetFirewallWouldDropsRequest{LocalOnly: true})
+				conn.Close()
+			}
+			cancel()
+			if perr != nil {
+				failed = append(failed, h.Name+": "+perr.Error())
+			}
+		}
+		if len(failed) > 0 {
+			return nil, status.Errorf(codes.Unavailable, "the totals were not reset on every host: %s", strings.Join(failed, "; "))
+		}
+	}
+	return s.GetFirewallEnforcement(ctx, &pb.GetFirewallEnforcementRequest{LocalOnly: req.GetLocalOnly()})
 }
 
 // RecordFirewallState turns a reconcile pass's applied state into this host's
@@ -197,9 +253,23 @@ func (s *Server) setFirewallCondition(ctx context.Context, code string, active b
 	s.notify(ctx, notify.Notification{Kind: code, Severity: sev, Subject: s.hostName, Detail: verb + ": " + detail})
 }
 
-// SeedFirewallEnforcementLoop records the per-NIC enforcement mode the first
-// time it can (corrosion.SeedFirewallEnforcement), then stops.
-func (s *Server) SeedFirewallEnforcementLoop(ctx context.Context, every time.Duration) {
+// SeedFirewallEnforcementLoop records the founder's genesis decision
+// (decisionPath, written by the daemon when it founded the cluster: enforce)
+// as the cluster's per-NIC enforcement mode, the first time it can
+// (corrosion.SeedFirewallEnforcement), audits it and consumes the decision.
+// With no decision on disk — a joiner, a rejoiner, a host of a cluster that
+// upgraded — it records nothing: with no mode recorded the cluster observes,
+// and only `lv firewall enforce` changes that (re-review I-3).
+func (s *Server) SeedFirewallEnforcementLoop(ctx context.Context, every time.Duration, decisionPath string) {
+	b, err := os.ReadFile(decisionPath)
+	if err != nil {
+		return
+	}
+	mode := strings.TrimSpace(string(b))
+	if mode != corrosion.FirewallEnforce && mode != corrosion.FirewallObserve {
+		slog.Warn("firewall: ignoring an unreadable initial enforcement decision", "path", decisionPath, "value", mode)
+		return
+	}
 	if every <= 0 {
 		every = 30 * time.Second
 	}
@@ -208,12 +278,16 @@ func (s *Server) SeedFirewallEnforcementLoop(ctx context.Context, every time.Dur
 	for {
 		enf, err := corrosion.GetFirewallEnforcement(ctx, s.db)
 		if err == nil && enf.Recorded {
+			_ = os.Remove(decisionPath)
 			return
 		}
-		if mode, err := corrosion.SeedFirewallEnforcement(ctx, s.db); err != nil {
+		if wrote, err := corrosion.SeedFirewallEnforcement(ctx, s.db, mode, s.hostName); err != nil {
 			slog.Warn("firewall: could not record the initial enforcement mode", "error", err)
-		} else if mode != "" {
-			slog.Info("firewall: recorded the initial per-NIC enforcement mode", "mode", mode)
+		} else if wrote != "" {
+			slog.Info("firewall: recorded the cluster's initial per-NIC enforcement mode", "mode", wrote)
+			s.auditAs(ctx, "litevirt", "firewall.enforcement", "cluster",
+				corrosion.AuditChange(corrosion.AuditStateUnset, wrote)+" (initial, at genesis)", "ok")
+			_ = os.Remove(decisionPath)
 			s.reconcileLocal(ctx)
 			return
 		}

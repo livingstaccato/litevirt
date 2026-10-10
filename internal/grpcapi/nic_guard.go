@@ -14,6 +14,7 @@ package grpcapi
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/netip"
@@ -91,8 +92,11 @@ const (
 	// admitNew: a caller asked for them; a weakening needs authority.
 	admitNew admitMode = iota
 	// admitRecreate: a re-create of a VM under the same name (rebuild, a
-	// stack's rolling update). Settings that match a guard the VM already
-	// had pass; anything else is a new request and needs authority.
+	// stack's rolling update), whose context carries the incarnation it
+	// replaces (replacedVMFor). Each NIC that is the same NIC of that
+	// incarnation — same network, and the same MAC when the request names
+	// one, else the same position — carries that NIC's guard state; anything
+	// else is a new request and needs authority to weaken (re-review I-7).
 	admitRecreate
 	// admitPeerOwner: the owner leg of a request a peer forwarded. The entry
 	// node checked authority — if it is a build that knows guards, which is
@@ -101,29 +105,173 @@ const (
 	admitPeerOwner
 )
 
+// guardDecision is what one NIC being created gets for its guard.
+type guardDecision struct {
+	// none: no record. The NIC is the same NIC of a re-created incarnation
+	// that had no record (it predates guards, or was created before records
+	// could be written), and the request says nothing about its guard: it
+	// stays unguarded, as it ran (re-review I-11).
+	none bool
+	// carry: the record of the same NIC of the incarnation a re-create
+	// replaces, carried to the new NIC unless the request says otherwise.
+	carry *corrosion.NICGuardRecord
+}
+
+// guarded reports whether the NIC will be guarded once created with att.
+func (d guardDecision) guarded(att *pb.NetworkAttachment) bool {
+	switch {
+	case nicGuardExplicit(att):
+		mode, err := normalizeNICGuardMode(att.GetSpoofGuard())
+		return err == nil && mode == corrosion.NICGuardOn
+	case d.none:
+		return false
+	case d.carry != nil:
+		return d.carry.Guarded()
+	case len(att.GetTrunk()) > 1:
+		return false
+	}
+	return true
+}
+
+// record is the guard record the NIC gets, or nil for none.
+func (d guardDecision) record(vm, uuid string, ordinal int, mac string, att *pb.NetworkAttachment) *corrosion.NICGuardRecord {
+	switch {
+	case nicGuardExplicit(att):
+	case d.none:
+		return nil
+	case d.carry != nil:
+		r := *d.carry
+		r.VMName, r.MAC, r.VMUUID, r.Network, r.Ordinal = vm, mac, uuid, att.GetName(), ordinal
+		r.SetBy, r.UpdatedAt = "", ""
+		if k := staticIPv6Known(att); k != nil {
+			r.Known = k
+		}
+		return &r
+	case len(att.GetTrunk()) > 1:
+		// A NIC on the `trunk:` feature gets no guard unless it asks for
+		// one: its guest addresses its other VLANs itself, and a trunk ran
+		// unguarded before guards existed (re-review I-2).
+		return nil
+	}
+	r := newNICGuardRecord(vm, uuid, ordinal, mac, att)
+	return &r
+}
+
+// replacedNICs is the guard state of the incarnation a re-create replaces.
+type replacedNICs struct {
+	recs     []corrosion.NICGuardRecord // its records (VMUUID = its uuid)
+	networks map[string]bool            // the networks its spec put a NIC on
+	// uuidless: the incarnation's spec carries no uuid (an import without
+	// firmware state), so its records cannot be told from an earlier
+	// incarnation's under the same name. Only a guard no weaker than the
+	// default is carried from such a record; a relaxation is a new request.
+	uuidless bool
+}
+
+// replacedIncarnation reads the guard state of the incarnation ctx says a
+// re-create of vmName replaces. ok is false when there is none, or it cannot
+// be identified on this replica — the create is then treated as new.
+func (s *Server) replacedIncarnation(ctx context.Context, vmName string) (replacedNICs, bool, error) {
+	r, ok := replacedVMFor(ctx, vmName)
+	if !ok {
+		return replacedNICs{}, false, nil
+	}
+	spec, found, err := corrosion.VMSpecOfIncarnation(ctx, s.db, vmName, r.snap.CreatedAt)
+	if err != nil {
+		return replacedNICs{}, false, status.Errorf(codes.Internal, "read the VM being re-created: %v", err)
+	}
+	var sp struct {
+		UUID    string `json:"uuid"`
+		Network []struct {
+			Name string `json:"name"`
+		} `json:"network"`
+	}
+	if !found || json.Unmarshal([]byte(spec), &sp) != nil {
+		slog.Warn("NIC guard: the incarnation a re-create replaces is not on this replica; its NICs are treated as new",
+			"vm", vmName)
+		return replacedNICs{}, false, nil
+	}
+	all, err := corrosion.ListNICGuards(ctx, s.db)
+	if err != nil {
+		return replacedNICs{}, false, status.Errorf(codes.Internal, "read NIC guards: %v", err)
+	}
+	out := replacedNICs{networks: map[string]bool{}, uuidless: sp.UUID == ""}
+	for _, n := range sp.Network {
+		out.networks[n.Name] = true
+	}
+	for _, rec := range all {
+		if rec.VMName == vmName && rec.VMUUID == sp.UUID {
+			out.recs = append(out.recs, rec)
+		}
+	}
+	sort.Slice(out.recs, func(i, j int) bool { return out.recs[i].MAC < out.recs[j].MAC })
+	return out, true, nil
+}
+
+// sameNIC finds the replaced incarnation's record of the NIC att is, at
+// position ordinal: the same network, and the same MAC when att names one,
+// else the same position.
+func (p replacedNICs) sameNIC(att *pb.NetworkAttachment, ordinal int) (*corrosion.NICGuardRecord, bool) {
+	for i := range p.recs {
+		r := &p.recs[i]
+		if r.Network != att.GetName() {
+			continue
+		}
+		if m := strings.ToLower(att.GetMac()); m != "" {
+			if strings.EqualFold(r.MAC, m) {
+				return r, true
+			}
+			continue
+		}
+		if r.Ordinal == ordinal {
+			return r, true
+		}
+	}
+	return nil, false
+}
+
+// recordedOn reports whether the replaced incarnation had any record on
+// network.
+func (p replacedNICs) recordedOn(network string) bool {
+	for _, r := range p.recs {
+		if r.Network == network {
+			return true
+		}
+	}
+	return false
+}
+
 // admitNICGuards checks the guard settings of NICs about to be created by
-// vmName: each must be well formed; an explicit one needs the record store to
-// be writable (refused rather than silently dropped); and a weakening one
-// needs authority over its network (see admitMode).
-func (s *Server) admitNICGuards(ctx context.Context, vmName string, atts []*pb.NetworkAttachment, how admitMode) error {
-	var prior map[string]corrosion.NICGuardRecord
-	for _, att := range atts {
+// vmName and decides each one's record: each must be well formed; an
+// explicit one needs the record store to be writable (refused rather than
+// silently dropped); and a weakening one needs authority over its network
+// (see admitMode). The decisions are indexed like atts.
+func (s *Server) admitNICGuards(ctx context.Context, vmName string, atts []*pb.NetworkAttachment, how admitMode) ([]guardDecision, error) {
+	decisions := make([]guardDecision, len(atts))
+	if how == admitRecreate {
+		var err error
+		if decisions, err = s.guardDecisions(ctx, vmName, atts); err != nil {
+			return nil, err
+		}
+	}
+	for i, att := range atts {
 		if att == nil {
 			continue
 		}
 		mode, err := normalizeNICGuardMode(att.GetSpoofGuard())
 		if err != nil {
-			return err
+			return nil, err
 		}
 		allowed, aerr := corrosion.NormalizeNICGuardAddresses(att.GetAllowedAddresses())
 		if aerr != nil {
-			return status.Errorf(codes.InvalidArgument, "network %q allowed addresses: %v", att.GetName(), aerr)
+			return nil, status.Errorf(codes.InvalidArgument, "network %q allowed addresses: %v", att.GetName(), aerr)
 		}
+		same := decisions[i].carry
 		if !nicGuardExplicit(att) {
 			continue
 		}
 		if !s.db.MayWriteClusterPolicy() {
-			return status.Errorf(codes.FailedPrecondition,
+			return nil, status.Errorf(codes.FailedPrecondition,
 				"network %q: NIC guard settings cannot be recorded until failover_scope_v1 has latched on every host; "+
 					"leave them out to create the NIC (it will be unguarded until set with `lv firewall nic-guard set`)", att.GetName())
 		}
@@ -133,76 +281,93 @@ func (s *Server) admitNICGuards(ctx context.Context, vmName string, atts []*pb.N
 		switch how {
 		case admitPeerOwner:
 			if !s.firewallReleaseActive() {
-				return status.Errorf(codes.FailedPrecondition,
+				return nil, status.Errorf(codes.FailedPrecondition,
 					"network %q: NIC guard settings forwarded by a peer are refused until every host runs a build that checks them", att.GetName())
 			}
 			continue
 		case admitRecreate:
-			if prior == nil {
-				if prior, err = s.guardsOf(ctx, vmName); err != nil {
-					return err
-				}
-			}
-			if guardMatchesAny(prior, mode, allowed, att) {
+			if same != nil && guardEquals(*same, mode, allowed, att) {
 				continue
 			}
 		}
 		if err := s.requireGuardAuthority(ctx, att.GetName(), "network "+att.GetName()); err != nil {
-			return err
+			return nil, err
 		}
+	}
+	return decisions, nil
+}
+
+// guardDecisions decides each NIC's record for a create of vmName: when ctx
+// carries the incarnation a re-create replaces, a NIC that is the same NIC of
+// it carries its guard state (a record, or none); every other NIC is new.
+// Indexed like atts.
+func (s *Server) guardDecisions(ctx context.Context, vmName string, atts []*pb.NetworkAttachment) ([]guardDecision, error) {
+	decisions := make([]guardDecision, len(atts))
+	prior, ok, err := s.replacedIncarnation(ctx, vmName)
+	if err != nil || !ok {
+		return decisions, err
+	}
+	for i, att := range atts {
+		if att == nil {
+			continue
+		}
+		if r, same := prior.sameNIC(att, i); same {
+			if !prior.uuidless || !nicGuardWeakens(r.Mode, r.Allowed, r.AllowDHCPServer, r.AllowRouterAdvert, r.AllowVLANTags) {
+				decisions[i].carry = r
+			}
+		} else if prior.networks[att.GetName()] && !prior.recordedOn(att.GetName()) {
+			decisions[i].none = true
+		}
+	}
+	return decisions, nil
+}
+
+// guardEquals reports whether a requested guard is exactly the record r.
+func guardEquals(r corrosion.NICGuardRecord, mode string, allowed []string, att *pb.NetworkAttachment) bool {
+	return r.Mode == mode && strings.Join(r.Allowed, ",") == strings.Join(allowed, ",") &&
+		r.AllowDHCPServer == att.GetAllowDhcpServer() && r.AllowRouterAdvert == att.GetAllowRouterAdvertisement() &&
+		r.AllowVLANTags == att.GetAllowVlanTags()
+}
+
+// specUUID is the incarnation uuid of a stored VM spec (encoding/json of
+// VMSpec), or "".
+func specUUID(spec string) string {
+	var sp struct {
+		UUID string `json:"uuid"`
+	}
+	_ = json.Unmarshal([]byte(spec), &sp)
+	return sp.UUID
+}
+
+// staticIPv6Known is a request's static IPv6 address as a record's Known
+// list: the NIC row carries only the IPv4 address.
+func staticIPv6Known(att *pb.NetworkAttachment) []string {
+	v6 := strings.TrimSpace(att.GetIpv6())
+	if v6 == "" {
+		return nil
+	}
+	if p, err := netip.ParsePrefix(v6); err == nil {
+		return []string{p.Addr().String()}
+	}
+	if a, err := netip.ParseAddr(v6); err == nil {
+		return []string{a.String()}
 	}
 	return nil
 }
 
-// guardsOf returns every guard record of vmName, including those of an
-// incarnation already deleted (records outlive their VM).
-func (s *Server) guardsOf(ctx context.Context, vmName string) (map[string]corrosion.NICGuardRecord, error) {
-	all, err := corrosion.ListNICGuards(ctx, s.db)
-	if err != nil {
-		return nil, status.Errorf(codes.Unavailable, "read NIC guards: %v", err)
-	}
-	out := map[string]corrosion.NICGuardRecord{}
-	for k, r := range all {
-		if r.VMName == vmName {
-			out[k] = r
-		}
-	}
-	return out, nil
-}
-
-// guardMatchesAny reports whether a requested guard equals one the VM already
-// had.
-func guardMatchesAny(prior map[string]corrosion.NICGuardRecord, mode string, allowed []string, att *pb.NetworkAttachment) bool {
-	for _, r := range prior {
-		if r.Mode == mode && strings.Join(r.Allowed, ",") == strings.Join(allowed, ",") &&
-			r.AllowDHCPServer == att.GetAllowDhcpServer() && r.AllowRouterAdvert == att.GetAllowRouterAdvertisement() &&
-			r.AllowVLANTags == att.GetAllowVlanTags() {
-			return true
-		}
-	}
-	return false
-}
-
-// newNICGuardRecord is the record a new NIC gets from its request. A static
-// IPv6 address in the request is recorded as known: the NIC row carries only
-// the IPv4 address.
-func newNICGuardRecord(vm, mac string, att *pb.NetworkAttachment) corrosion.NICGuardRecord {
+// newNICGuardRecord is the record a new NIC gets from its request: on unless
+// it says otherwise.
+func newNICGuardRecord(vm, uuid string, ordinal int, mac string, att *pb.NetworkAttachment) corrosion.NICGuardRecord {
 	mode, _ := normalizeNICGuardMode(att.GetSpoofGuard()) // admitted already
-	rec := corrosion.NICGuardRecord{
+	return corrosion.NICGuardRecord{
 		VMName: vm, MAC: mac, Mode: mode,
 		Allowed:           att.GetAllowedAddresses(),
 		AllowDHCPServer:   att.GetAllowDhcpServer(),
 		AllowRouterAdvert: att.GetAllowRouterAdvertisement(),
 		AllowVLANTags:     att.GetAllowVlanTags(),
+		Known:             staticIPv6Known(att),
+		VMUUID:            uuid, Network: att.GetName(), Ordinal: ordinal,
 	}
-	if v6 := strings.TrimSpace(att.GetIpv6()); v6 != "" {
-		if p, err := netip.ParsePrefix(v6); err == nil {
-			rec.Known = []string{p.Addr().String()}
-		} else if a, err := netip.ParseAddr(v6); err == nil {
-			rec.Known = []string{a.String()}
-		}
-	}
-	return rec
 }
 
 // writeNewNICGuards records the guards of NICs being created. Before
@@ -289,8 +454,17 @@ func (s *Server) SetNICGuard(ctx context.Context, req *pb.SetNICGuardRequest) (*
 		AllowRouterAdvert: req.GetAllowRouterAdvertisement(),
 		AllowVLANTags:     req.GetAllowVlanTags(),
 	}
+	rec.Network, rec.Ordinal = tgt.nic.NetworkName, tgt.nic.Ordinal
+	if !ct {
+		if vm, err := corrosion.GetVM(ctx, s.db, tgt.owner); err == nil && vm != nil {
+			rec.VMUUID = specUUID(vm.Spec)
+		}
+	}
 	if berr == nil && before != nil {
 		rec.Known = before.Known // a static IPv6 address recorded at create
+		if rec.VMUUID == "" {
+			rec.VMUUID = before.VMUUID
+		}
 	}
 	if err := corrosion.PutNICGuard(ctx, s.db, rec, callerUsername(ctx)); err != nil {
 		detail := "mac=" + tgt.nic.MAC + " " + corrosion.AuditChange(guardState(before, berr), "unchanged")
@@ -307,8 +481,8 @@ func (s *Server) SetNICGuard(ctx context.Context, req *pb.SetNICGuardRequest) (*
 		"mac="+tgt.nic.MAC+" "+corrosion.AuditChange(guardState(before, berr), guardState(after, aerr)), "ok")
 	slog.Info("NIC guard set", "nic", tgt.display, "mac", tgt.nic.MAC, "mode", mode, "by", callerUsername(ctx))
 	s.reconcileLocal(ctx)
-	subnets, _ := corrosion.NetworkSubnets(ctx, s.db)
-	out := nicGuardToPb(tgt.owner, tgt.nic, after, subnets)
+	nets, _ := corrosion.NetworkGuardInfos(ctx, s.db)
+	out := nicGuardToPb(tgt.owner, tgt.nic, after, nets)
 	if ct {
 		out.VmName, out.ContainerHost, out.ContainerName = "", req.GetContainerHost(), req.GetContainerName()
 	}
@@ -420,7 +594,7 @@ func (s *Server) ListNICGuards(ctx context.Context, req *pb.ListNICGuardsRequest
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable, "read NIC guards: %v", err)
 	}
-	subnets, err := corrosion.NetworkSubnets(ctx, s.db)
+	nets, err := corrosion.NetworkGuardInfos(ctx, s.db)
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable, "read networks: %v", err)
 	}
@@ -436,7 +610,37 @@ func (s *Server) ListNICGuards(ctx context.Context, req *pb.ListNICGuardsRequest
 			if r, ok := guards[corrosion.NICGuardKey(vm.Name, n.MAC)]; ok {
 				rec = &r
 			}
-			out.Guards = append(out.Guards, nicGuardToPb(vm.Name, n, rec, subnets))
+			out.Guards = append(out.Guards, nicGuardToPb(vm.Name, n, rec, nets))
+		}
+	}
+	if req.GetVmName() != "" {
+		return out, nil
+	}
+	// Containers the caller may read, with the record the owning host renders
+	// (firewall.containerGuard's lookup: a migrated container's follows it).
+	cts, err := corrosion.ListContainers(ctx, s.db, "")
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "list containers: %v", err)
+	}
+	for _, ct := range cts {
+		if s.RequirePerm(ctx, ctRBACPathFor(ct.Project, ct.Name), "ct.read", "viewer") != nil {
+			continue
+		}
+		ifaces, err := corrosion.ListContainerInterfacesByHost(ctx, s.db, ct.HostName)
+		if err != nil {
+			return nil, status.Errorf(codes.Unavailable, "read the NICs of container %s/%s: %v", ct.HostName, ct.Name, err)
+		}
+		for _, i := range ifaces {
+			if i.CtName != ct.Name {
+				continue
+			}
+			var rec *corrosion.NICGuardRecord
+			if r, ok := firewall.ContainerGuard(guards, ct.HostName, ct.Name, i.MAC); ok {
+				rec = &r
+			}
+			g := nicGuardToPb("", corrosion.NICRecord{MAC: i.MAC, IP: i.IP, NetworkName: i.NetworkName, Ordinal: i.Ordinal}, rec, nets)
+			g.ContainerHost, g.ContainerName = ct.HostName, ct.Name
+			out.Guards = append(out.Guards, g)
 		}
 	}
 	return out, nil
@@ -444,7 +648,7 @@ func (s *Server) ListNICGuards(ctx context.Context, req *pb.ListNICGuardsRequest
 
 // nicGuardToPb reports a NIC's guard, with the source addresses the owning
 // host renders for it — the same resolution the firewall loader uses.
-func nicGuardToPb(vm string, n corrosion.NICRecord, rec *corrosion.NICGuardRecord, subnets map[string]string) *pb.NICGuard {
+func nicGuardToPb(vm string, n corrosion.NICRecord, rec *corrosion.NICGuardRecord, nets map[string]corrosion.NetworkGuardInfo) *pb.NICGuard {
 	out := &pb.NICGuard{VmName: vm, Mac: strings.ToLower(n.MAC), NetworkName: n.NetworkName, Mode: "unset"}
 	if rec == nil {
 		return out
@@ -455,7 +659,8 @@ func nicGuardToPb(vm string, n corrosion.NICRecord, rec *corrosion.NICGuardRecor
 	out.AllowRouterAdvertisement = rec.AllowRouterAdvert
 	out.AllowVlanTags = rec.AllowVLANTags
 	out.SetBy, out.UpdatedAt = rec.SetBy, rec.UpdatedAt
-	if g := firewall.ResolveNICGuard(rec, n.MAC, n.IP, subnets[n.NetworkName], nil); g != nil {
+	info := nets[n.NetworkName]
+	if g := firewall.ResolveNICGuard(rec, n.MAC, n.IP, info.Subnet, info.All(), nil); g != nil {
 		out.EffectiveIpv4, out.Ipv4Unrestricted = g.V4, g.V4 == nil
 		out.EffectiveIpv6, out.Ipv6Unrestricted = g.V6, g.V6 == nil
 	}

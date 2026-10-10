@@ -117,13 +117,15 @@ func guardFamily(mode string, addrs []string, open bool) string {
 // what would be dropped) and enforce, and reports it.
 func newFirewallEnforceCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "enforce <on|off|status>",
-		Short: "Enforce per-NIC firewall rules (on), only observe them (off), or show the state and would-drop counts",
+		Use:   "enforce <on|off|status|reset-counters>",
+		Short: "Enforce per-NIC firewall rules (on), only observe them (off), show the state and would-drop totals, or restart the totals",
 		Long: `A cluster that upgraded to this release starts in observe mode: per-NIC rules
 are installed with counters and drop nothing. "status" shows, per host, the
-mode in force and what the rules would have dropped (per NIC and rule); once
-those counts are what you expect, "on" enforces them. "off" goes back to
-observing. Admin only; audited; applies to every host.`,
+mode in force and what the rules would have dropped (per workload, NIC and
+rule), totalled since the time it shows — across firewall reloads, VM starts
+and migrations and daemon restarts. Once those totals are what you expect,
+"on" enforces them. "off" goes back to observing. "reset-counters" restarts
+every host's totals from now. Admin only; audited; applies to every host.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
@@ -136,8 +138,10 @@ observing. Admin only; audited; applies to every host.`,
 					st, err = c.SetFirewallEnforcement(ctx, &pb.SetFirewallEnforcementRequest{Mode: "observe"})
 				case "status":
 					st, err = c.GetFirewallEnforcement(ctx, &pb.GetFirewallEnforcementRequest{})
+				case "reset-counters":
+					st, err = c.ResetFirewallWouldDrops(ctx, &pb.ResetFirewallWouldDropsRequest{})
 				default:
-					return fmt.Errorf("want on, off or status, not %q", args[0])
+					return fmt.Errorf("want on, off, status or reset-counters, not %q", args[0])
 				}
 				if err != nil {
 					return err
@@ -155,17 +159,22 @@ func printEnforcement(st *pb.FirewallEnforcementStatus) error {
 	}
 	fmt.Println()
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "HOST\tIN FORCE\tDEVICE\tWORKLOAD\tSIDE\tRULE\tWOULD-DROP PKTS\tERROR")
+	fmt.Fprintln(w, "HOST\tIN FORCE\tSINCE\tWORKLOAD\tMAC\tDEVICE\tSIDE\tRULE\tWOULD-DROP PKTS\tERROR")
 	for _, h := range st.Hosts {
 		mode := h.AppliedMode
 		if mode == "" {
 			mode = "-"
 		}
+		since := h.WouldDropSince
+		if since == "" {
+			since = "-"
+		}
 		if len(h.WouldDrops) == 0 {
-			fmt.Fprintf(w, "%s\t%s\t\t\t\t\t\t%s\n", h.HostName, mode, h.Error)
+			fmt.Fprintf(w, "%s\t%s\t%s\t\t\t\t\t\t\t%s\n", h.HostName, mode, since, h.Error)
 		}
 		for _, d := range h.WouldDrops {
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n", h.HostName, mode, d.Device, d.Workload, d.Side, d.Rule, d.Packets, h.Error)
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n", h.HostName, mode, since,
+				d.Workload, d.Mac, d.Device, d.Side, d.Rule, d.Packets, h.Error)
 		}
 	}
 	return w.Flush()

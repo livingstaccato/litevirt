@@ -39,7 +39,7 @@ func TestResolveNICGuard(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			g := ResolveNICGuard(c.rec, "52:54:00:AA:BB:CC", c.ip, c.subnet, nil)
+			g := ResolveNICGuard(c.rec, "52:54:00:AA:BB:CC", c.ip, c.subnet, nil, nil)
 			if c.wantNil {
 				if g != nil {
 					t.Fatalf("got %+v, want unguarded", g)
@@ -117,21 +117,23 @@ func TestCorrosionPlanLoader_GuardsRecordedNICsOnly(t *testing.T) {
 
 // TestResolveNICGuard_SubnetExcludesOthers: a guest confined to its subnet
 // (its exact address unknown) may still never claim the network's own
-// addresses — network, gateway, broadcast — nor another NIC's assigned
-// address; its own stays usable.
+// addresses — network, broadcast, its router and reserved addresses — nor
+// another NIC's assigned address; its own stays usable.
 func TestResolveNICGuard_SubnetExcludesOthers(t *testing.T) {
-	g := ResolveNICGuard(on(), "52:54:00:aa:bb:cc", "", "10.1.0.0/24",
+	g := ResolveNICGuard(on(), "52:54:00:aa:bb:cc", "", "10.1.0.0/24", []string{"10.1.0.254", "fd00::1"},
 		[]string{"10.1.0.7", "10.1.0.9", "192.168.5.5"})
 	if g == nil || !reflect.DeepEqual(g.V4, []string{"10.1.0.0/24"}) {
 		t.Fatalf("guard = %+v", g)
 	}
-	want := []string{"10.1.0.0", "10.1.0.1", "10.1.0.255", "10.1.0.7", "10.1.0.9"}
+	// The router is the network's configured one (.254), not the first host
+	// (re-review I-9).
+	want := []string{"10.1.0.0", "10.1.0.7", "10.1.0.9", "10.1.0.254", "10.1.0.255"}
 	if !reflect.DeepEqual(g.ExcludeV4, want) {
 		t.Errorf("ExcludeV4 = %v, want %v", g.ExcludeV4, want)
 	}
 	// An allowed link-local address is held as link-local, not as a global
 	// restriction.
-	g = ResolveNICGuard(on("fe80::1234"), "52:54:00:aa:bb:cc", "10.1.0.5", "", nil)
+	g = ResolveNICGuard(on("fe80::1234"), "52:54:00:aa:bb:cc", "10.1.0.5", "", nil, nil)
 	if g.V6 != nil || !reflect.DeepEqual(g.LinkLocal, []string{"fe80::1234"}) {
 		t.Errorf("link-local allowance: V6=%v LinkLocal=%v", g.V6, g.LinkLocal)
 	}

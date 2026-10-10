@@ -41,22 +41,22 @@ func TestAdmitNICGuards(t *testing.T) {
 	on := att("lan", func(a *pb.NetworkAttachment) { a.SpoofGuard = "on" })
 
 	closed := guardServer(t, false)
-	if err := closed.admitNICGuards(adminCtx(), "vm", def, admitNew); err != nil {
+	if _, err := closed.admitNICGuards(adminCtx(), "vm", def, admitNew); err != nil {
 		t.Errorf("default guard with the store closed: %v", err)
 	}
-	if err := closed.admitNICGuards(adminCtx(), "vm", on, admitNew); status.Code(err) != codes.FailedPrecondition {
+	if _, err := closed.admitNICGuards(adminCtx(), "vm", on, admitNew); status.Code(err) != codes.FailedPrecondition {
 		t.Errorf("explicit guard with the store closed: %v, want FailedPrecondition", err)
 	}
 
 	s := guardServer(t, true)
-	if err := s.admitNICGuards(adminCtx(), "vm", off, admitNew); err != nil {
+	if _, err := s.admitNICGuards(adminCtx(), "vm", off, admitNew); err != nil {
 		t.Errorf("admin turning a guard off: %v", err)
 	}
 	for name, bad := range map[string][]*pb.NetworkAttachment{
 		"mode":    att("lan", func(a *pb.NetworkAttachment) { a.SpoofGuard = "strict" }),
 		"address": att("lan", func(a *pb.NetworkAttachment) { a.AllowedAddresses = []string{"10.0.0.1; drop"} }),
 	} {
-		if err := s.admitNICGuards(adminCtx(), "vm", bad, admitNew); status.Code(err) != codes.InvalidArgument {
+		if _, err := s.admitNICGuards(adminCtx(), "vm", bad, admitNew); status.Code(err) != codes.InvalidArgument {
 			t.Errorf("%s: %v, want InvalidArgument", name, err)
 		}
 	}
@@ -73,36 +73,70 @@ func TestAdmitNICGuards(t *testing.T) {
 		"ra":      func(a *pb.NetworkAttachment) { a.AllowRouterAdvertisement = true },
 		"vlan":    func(a *pb.NetworkAttachment) { a.AllowVlanTags = true },
 	} {
-		if err := s.admitNICGuards(project, "vm", att("lan", weak), admitNew); status.Code(err) != codes.PermissionDenied {
+		if _, err := s.admitNICGuards(project, "vm", att("lan", weak), admitNew); status.Code(err) != codes.PermissionDenied {
 			t.Errorf("a project's NetworkAdmin weakening (%s) on a shared network: %v, want PermissionDenied", name, err)
 		}
-		if err := s.admitNICGuards(project, "vm", att("teamnet", weak), admitNew); err != nil {
+		if _, err := s.admitNICGuards(project, "vm", att("teamnet", weak), admitNew); err != nil {
 			t.Errorf("a project's NetworkAdmin weakening (%s) on its own network: %v", name, err)
 		}
 	}
-	if err := s.admitNICGuards(project, "vm", on, admitNew); err != nil {
+	if _, err := s.admitNICGuards(project, "vm", on, admitNew); err != nil {
 		t.Errorf("project NetworkAdmin asking for the default guard: %v", err)
 	}
 }
 
-// TestAdmitNICGuards_RecreateCarriesOnlyWhatItHad (review I5a): a re-create
-// (rebuild, a stack's rolling update) may carry a relaxed guard the VM already
-// had without authority — but not a new relaxation slipped into the new spec.
+// TestAdmitNICGuards_RecreateCarriesOnlyWhatItHad (review I5a, re-review
+// I-7, I-11): a re-create (rebuild, a stack's rolling update) carries each NIC's
+// guard from the same NIC of the incarnation it replaces — a relaxation
+// included, without authority — but not a new relaxation slipped into the new
+// spec, not one recorded for an EARLIER incarnation under the same name, and
+// a NIC that had no record keeps none.
 func TestAdmitNICGuards_RecreateCarriesOnlyWhatItHad(t *testing.T) {
 	ctx := context.Background()
 	s := guardServer(t, true)
-	if err := corrosion.PutNICGuard(ctx, s.db, corrosion.NICGuardRecord{VMName: "web", MAC: "52:54:00:00:00:01",
-		Mode: corrosion.NICGuardOff}, "admin"); err != nil {
+	bob := sgBindUser(t, s, "bob", "_default")
+	rctx := seedReplacedVM(t, s, bob, "web", `{"name":"web","uuid":"u-2","network":[{"name":"lan"},{"name":"old"}]}`)
+	put := func(r corrosion.NICGuardRecord) {
+		t.Helper()
+		if err := corrosion.PutNICGuard(ctx, s.db, r, "admin"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	put(corrosion.NICGuardRecord{VMName: "web", MAC: "52:54:00:00:00:01", Mode: corrosion.NICGuardOff, VMUUID: "u-2", Network: "lan"})
+	// An earlier incarnation's relaxation on another network.
+	put(corrosion.NICGuardRecord{VMName: "web", MAC: "52:54:00:00:00:05", Mode: corrosion.NICGuardOff, VMUUID: "u-1", Network: "dmz"})
+
+	same := []*pb.NetworkAttachment{{Name: "lan", SpoofGuard: "off"}}
+	if _, err := s.admitNICGuards(rctx, "web", same, admitRecreate); err != nil {
+		t.Errorf("re-create carrying the guard its NIC had: %v", err)
+	}
+	dec, err := s.admitNICGuards(rctx, "web", []*pb.NetworkAttachment{{Name: "lan"}, {Name: "old"}, {Name: "dmz"}}, admitRecreate)
+	if err != nil {
 		t.Fatal(err)
 	}
-	bob := sgBindUser(t, s, "bob", "_default")
-	same := []*pb.NetworkAttachment{{Name: "lan", SpoofGuard: "off"}}
-	if err := s.admitNICGuards(bob, "web", same, admitRecreate); err != nil {
-		t.Errorf("re-create carrying the guard it had: %v", err)
+	if dec[0].carry == nil || dec[0].carry.Mode != corrosion.NICGuardOff {
+		t.Errorf("a NIC that says nothing does not carry its record: %+v", dec[0])
+	}
+	if !dec[1].none {
+		t.Errorf("a NIC whose predecessor had no record must keep none: %+v", dec[1])
+	}
+	if dec[2].carry != nil || dec[2].none {
+		t.Errorf("a NIC on a network the replaced incarnation had none on is new: %+v", dec[2])
+	}
+	if r := dec[2].record("web", "u-3", 2, "52:54:00:00:00:07", &pb.NetworkAttachment{Name: "dmz"}); r == nil || !r.Guarded() {
+		t.Errorf("a new NIC must be guarded: %+v", r)
 	}
 	more := []*pb.NetworkAttachment{{Name: "lan", AllowedAddresses: []string{"10.0.0.7"}}}
-	if err := s.admitNICGuards(bob, "web", more, admitRecreate); status.Code(err) != codes.PermissionDenied {
+	if _, err := s.admitNICGuards(rctx, "web", more, admitRecreate); status.Code(err) != codes.PermissionDenied {
 		t.Errorf("re-create adding a relaxation: %v, want PermissionDenied", err)
+	}
+	moved := []*pb.NetworkAttachment{{Name: "dmz", SpoofGuard: "off"}} // the off NIC's position, another network
+	if _, err := s.admitNICGuards(rctx, "web", moved, admitRecreate); status.Code(err) != codes.PermissionDenied {
+		t.Errorf("re-create moving a relaxation to another network: %v, want PermissionDenied", err)
+	}
+	stale := []*pb.NetworkAttachment{{Name: "dmz", Mac: "52:54:00:00:00:05", SpoofGuard: "off"}}
+	if _, err := s.admitNICGuards(rctx, "web", stale, admitRecreate); status.Code(err) != codes.PermissionDenied {
+		t.Errorf("re-create claiming an earlier incarnation's relaxation: %v, want PermissionDenied", err)
 	}
 }
 
@@ -112,11 +146,11 @@ func TestAdmitNICGuards_RecreateCarriesOnlyWhatItHad(t *testing.T) {
 func TestAdmitNICGuards_PeerOwnerBeforeRelease(t *testing.T) {
 	s := guardServer(t, true)
 	off := []*pb.NetworkAttachment{{Name: "lan", SpoofGuard: "off"}}
-	if err := s.admitNICGuards(adminCtx(), "vm", off, admitPeerOwner); status.Code(err) != codes.FailedPrecondition {
+	if _, err := s.admitNICGuards(adminCtx(), "vm", off, admitPeerOwner); status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("forwarded relaxation before the release latch: %v, want FailedPrecondition", err)
 	}
 	s.SetGate(fakeServerGate{durablyLatchedTok: map[string]bool{capabilities.FirewallIPv6V1: true}})
-	if err := s.admitNICGuards(adminCtx(), "vm", off, admitPeerOwner); err != nil {
+	if _, err := s.admitNICGuards(adminCtx(), "vm", off, admitPeerOwner); err != nil {
 		t.Errorf("forwarded relaxation after the release latch: %v", err)
 	}
 }
@@ -150,11 +184,11 @@ func TestCheckNICIdentities(t *testing.T) {
 		"the broadcast":  {&pb.NetworkAttachment{Name: "lan", Ip: "10.9.0.255"}, codes.InvalidArgument},
 		"a free address": {&pb.NetworkAttachment{Name: "lan", Ip: "10.9.0.6", Mac: "52:54:00:00:00:bb"}, codes.OK},
 	} {
-		if err := s.checkNICIdentities(ctx, []*pb.NetworkAttachment{c.att}, "attacker"); status.Code(err) != c.code {
+		if err := s.checkNICIdentities(ctx, "", []*pb.NetworkAttachment{c.att}, "attacker"); status.Code(err) != c.code {
 			t.Errorf("%s: %v, want %v", name, err, c.code)
 		}
 	}
-	if err := s.checkNICIdentities(ctx, []*pb.NetworkAttachment{{Name: "lan", Ip: "10.9.0.5", Mac: "52:54:00:00:00:aa"}}, "victim"); err != nil {
+	if err := s.checkNICIdentities(ctx, "", []*pb.NetworkAttachment{{Name: "lan", Ip: "10.9.0.5", Mac: "52:54:00:00:00:aa"}}, "victim"); err != nil {
 		t.Errorf("the VM's own identity on a re-create: %v", err)
 	}
 }
@@ -165,6 +199,9 @@ func TestCheckNICIdentities(t *testing.T) {
 func TestReserveDHCPAddress(t *testing.T) {
 	ctx := context.Background()
 	s := guardServer(t, true)
+	reserved := map[string]string{}
+	s.SetDHCPReservationBackend(func(string) bool { return true }, func(string) bool { return false },
+		func(_, mac, ip string) error { reserved[mac] = ip; return nil })
 	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{Name: "a", HostName: s.hostName, Spec: "{}", State: "running"},
 		[]corrosion.InterfaceRecord{{VMName: "a", NetworkName: "lan", MAC: "52:54:00:00:00:01", IP: "10.9.0.2"}}, nil); err != nil {
 		t.Fatal(err)
@@ -176,6 +213,9 @@ func TestReserveDHCPAddress(t *testing.T) {
 	second, err := s.reserveDHCPAddress(ctx, "lan", "10.9.0.0/24", "no-such-bridge", "52:54:00:00:00:03")
 	if err != nil || second != "10.9.0.4" {
 		t.Fatalf("second reservation = %q, %v; want 10.9.0.4 (the first is in flight)", second, err)
+	}
+	if reserved["52:54:00:00:00:02"] != "10.9.0.3" || reserved["52:54:00:00:00:03"] != "10.9.0.4" {
+		t.Errorf("reservations handed to dnsmasq = %v", reserved)
 	}
 	def := &compose.NetworkDef{Type: "bridge", Subnet: "10.9.0.0/24", DHCP: true}
 	if !s.dhcpReservable(&pb.NetworkAttachment{Name: "lan"}, def) {
@@ -190,11 +230,11 @@ func TestReserveDHCPAddress(t *testing.T) {
 // TestNewNICGuardRecord: a request becomes the record a new NIC gets; an empty
 // spoof_guard is on, and a static IPv6 address is recorded as known.
 func TestNewNICGuardRecord(t *testing.T) {
-	r := newNICGuardRecord("vm", "52:54:00:aa:bb:cc", &pb.NetworkAttachment{Name: "lan", Ipv6: "2001:db8::5/64"})
-	if r.Mode != corrosion.NICGuardOn || len(r.Known) != 1 || r.Known[0] != "2001:db8::5" {
+	r := newNICGuardRecord("vm", "u-1", 0, "52:54:00:aa:bb:cc", &pb.NetworkAttachment{Name: "lan", Ipv6: "2001:db8::5/64"})
+	if r.Mode != corrosion.NICGuardOn || len(r.Known) != 1 || r.Known[0] != "2001:db8::5" || r.VMUUID != "u-1" || r.Network != "lan" {
 		t.Errorf("record = %+v", r)
 	}
-	r = newNICGuardRecord("vm", "52:54:00:aa:bb:cc", &pb.NetworkAttachment{SpoofGuard: "OFF"})
+	r = newNICGuardRecord("vm", "u-1", 0, "52:54:00:aa:bb:cc", &pb.NetworkAttachment{SpoofGuard: "OFF"})
 	if r.Mode != corrosion.NICGuardOff {
 		t.Errorf("mode = %q, want off", r.Mode)
 	}

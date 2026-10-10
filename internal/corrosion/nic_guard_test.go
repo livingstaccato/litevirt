@@ -138,23 +138,29 @@ func TestNetworkSubnets(t *testing.T) {
 func TestSeedFirewallEnforcement(t *testing.T) {
 	ctx := context.Background()
 	fresh := nicGuardDB(t, true)
-	if m, err := SeedFirewallEnforcement(ctx, fresh); err != nil || m != FirewallEnforce {
+	if m, err := SeedFirewallEnforcement(ctx, fresh, FirewallEnforce, ""); err != nil || m != FirewallEnforce {
 		t.Fatalf("fresh cluster: %q, %v; want enforce", m, err)
 	}
-	if m, _ := SeedFirewallEnforcement(ctx, fresh); m != "" {
+	if m, _ := SeedFirewallEnforcement(ctx, fresh, FirewallEnforce, ""); m != "" {
 		t.Errorf("a recorded mode was seeded again: %q", m)
 	}
 
+	if m, err := FirewallSeedDecision(ctx, nicGuardDB(t, true)); err != nil || m != FirewallEnforce {
+		t.Errorf("decision for an empty cluster: %q, %v; want enforce", m, err)
+	}
 	upgraded := nicGuardDB(t, true)
 	if err := InsertVM(ctx, upgraded, VMRecord{Name: "vm", HostName: "h", Spec: "{}", State: "running"}, nil, nil); err != nil {
 		t.Fatal(err)
 	}
-	if m, err := SeedFirewallEnforcement(ctx, upgraded); err != nil || m != FirewallObserve {
+	if m, err := FirewallSeedDecision(ctx, upgraded); err != nil || m != FirewallObserve {
+		t.Errorf("decision for a cluster with a workload: %q, %v; want observe", m, err)
+	}
+	if m, err := SeedFirewallEnforcement(ctx, upgraded, FirewallObserve, ""); err != nil || m != FirewallObserve {
 		t.Fatalf("cluster with a workload: %q, %v; want observe", m, err)
 	}
 
 	closed := nicGuardDB(t, false)
-	if m, err := SeedFirewallEnforcement(ctx, closed); err != nil || m != "" {
+	if m, err := SeedFirewallEnforcement(ctx, closed, FirewallEnforce, ""); err != nil || m != "" {
 		t.Errorf("gate closed: %q, %v; want nothing written", m, err)
 	}
 	if e, _ := GetFirewallEnforcement(ctx, closed); e.Mode != FirewallObserve || e.Recorded {

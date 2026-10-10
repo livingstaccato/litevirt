@@ -763,6 +763,12 @@ type Server struct {
 	// (nic_identity.go): network → address → reservation.
 	dhcpResMu   sync.Mutex
 	dhcpPending map[string]map[string]dhcpPendingRes
+	// Host-local DHCP facts a reservation depends on; nil = the real host
+	// (network.DHCPServedHere, network.BridgeHasUplink, network.AddDHCPHost).
+	// Test seams: SetDHCPReservationBackend.
+	dhcpServedHere  func(bridge string) bool
+	bridgeHasUplink func(bridge string) bool
+	addDHCPHost     func(bridge, mac, ip string) error
 
 	// antiEntropy is the daemon's anti-entropy loop. TriggerAntiEntropy calls RunOnce on
 	// it so `lv cluster converge` kicks an immediate (debounced) pass instead of waiting
@@ -1207,6 +1213,14 @@ func (s *Server) SetNetBoxMirrorInventory(on bool) { s.enfNetBoxMirror = on }
 // SetBridgeEnsure injects the host-bridge test seam (see bridgeEnsure): a
 // rootless harness cannot create a real bridge, so it substitutes a no-op.
 func (s *Server) SetBridgeEnsure(fn func(name string) error) { s.bridgeEnsure = fn }
+
+// SetDHCPReservationBackend injects the host-local DHCP facts an exact
+// reservation depends on (nic_identity.go): whether this host's dnsmasq
+// serves a bridge, whether the bridge has an uplink, and the reservation
+// write itself. A nil argument keeps the real host's answer.
+func (s *Server) SetDHCPReservationBackend(served, uplink func(bridge string) bool, add func(bridge, mac, ip string) error) {
+	s.dhcpServedHere, s.bridgeHasUplink, s.addDHCPHost = served, uplink, add
+}
 
 // SetBridgeExists injects the "does this bridge already exist here" seam (see
 // bridgeExists). It is the host-local fact the NetBox bind-time DHCP refusal

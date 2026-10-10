@@ -72,7 +72,7 @@ func TestRender_PreambleIsScoped(t *testing.T) {
 	if strings.Contains(inet, "destination-unreachable") {
 		t.Errorf("inet forward accepts ICMPv6 errors by type:\n%s", inet)
 	}
-	if !strings.Contains(inet, "icmpv6 type { nd-router-solicit, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert, nd-redirect } drop") {
+	if !strings.Contains(inet, "ip6 hoplimit != 255 icmpv6 type { nd-router-solicit, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert, nd-redirect } drop") {
 		t.Errorf("routed neighbour discovery is not dropped in inet forward:\n%s", inet)
 	}
 }
@@ -202,6 +202,10 @@ func TestRender_OwnServicesAllowedExplicitly(t *testing.T) {
 	mustContainAll(t, chainBody(t, nic, "output"),
 		"ip saddr @lv_gw4 udp sport 67 udp dport 68 accept",
 		"ip saddr @lv_lb_src4 ip daddr . tcp dport @lv_lb4 accept")
+	// haproxy on another host reaches a backend here through the forward
+	// hook, from that host's address (re-review m-d).
+	mustContainAll(t, chainBody(t, nic, "forward"),
+		"iifname != @lv_nic_devs ip saddr @lv_lb_src4 ip daddr . tcp dport @lv_lb4 accept")
 	mustContainAll(t, nic, "elements = { 10.0.0.20 . 8080, 10.0.0.21 . 8080 }",
 		"elements = { 10.0.0.1, 192.0.2.10 }", "elements = { fd00::1 }")
 }

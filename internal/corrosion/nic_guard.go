@@ -28,6 +28,8 @@ import (
 	"net/netip"
 	"sort"
 	"strings"
+
+	"github.com/litevirt/litevirt/internal/compose"
 )
 
 const (
@@ -70,6 +72,14 @@ type NICGuardRecord struct {
 	// tagged frames are dropped, guarded or not.
 	AllowVLANTags bool `json:"allow_vlan_tags,omitempty"`
 
+	// The NIC the record was written for, beyond its key: the incarnation of
+	// the VM (its spec uuid, minted fresh by every create), the network and
+	// the NIC's position. A re-create (rebuild, rolling update) carries a
+	// record only onto the same NIC of the incarnation it replaces.
+	VMUUID  string `json:"vm_uuid,omitempty"`
+	Network string `json:"network,omitempty"`
+	Ordinal int    `json:"ordinal,omitempty"`
+
 	SetBy     string `json:"-"`
 	UpdatedAt string `json:"-"`
 }
@@ -93,6 +103,20 @@ func NICGuardKey(vm, mac string) string {
 // in place of a VM name: container names are per host, and ':' appears in no
 // VM name, so the two can never collide.
 func ContainerGuardOwner(host, ct string) string { return "ct:" + host + ":" + ct }
+
+// ParseContainerGuardOwner splits a ContainerGuardOwner; ok is false for a VM
+// name.
+func ParseContainerGuardOwner(owner string) (host, ct string, ok bool) {
+	rest, found := strings.CutPrefix(owner, "ct:")
+	if !found {
+		return "", "", false
+	}
+	i := strings.Index(rest, ":")
+	if i <= 0 || i == len(rest)-1 {
+		return "", "", false
+	}
+	return rest[:i], rest[i+1:], true
+}
 
 // NormalizeNICGuardAddresses validates an allowed/known list and returns it in
 // canonical form (masked prefixes, canonical addresses, sorted, deduplicated).
@@ -326,18 +350,13 @@ func SetFirewallEnforcement(ctx context.Context, c *Client, mode, setBy string) 
 	return c.Execute(ctx, clusterPolicyUpsertSQL, clusterPolicyFirewallEnforcement, mode, setBy, c.NowTS())
 }
 
-// SeedFirewallEnforcement records the mode once, the first time it can: a
-// cluster that has nothing yet — no workload and no firewall rule of any
-// kind, i.e. one just initialised — enforces from the start; any other
-// cluster (one that upgraded with workloads or rules in place) starts in
-// observe, so nothing its rules never dropped before is dropped until an
-// operator turns enforcement on. It returns the mode recorded, or "" when it
-// wrote nothing (a row exists, or the gate is closed).
-func SeedFirewallEnforcement(ctx context.Context, c *Client) (string, error) {
-	cur, err := GetFirewallEnforcement(ctx, c)
-	if err != nil || cur.Recorded || !c.MayWriteClusterPolicy() {
-		return "", err
-	}
+// FirewallSeedDecision is the mode a cluster's founding host records for it
+// (SeedFirewallEnforcement): enforce when the cluster has nothing yet — no
+// workload and no firewall rule of any kind, i.e. one just initialised —
+// observe for any other (one that upgraded with workloads or rules in place),
+// so nothing its rules never dropped before is dropped until an operator turns
+// enforcement on.
+func FirewallSeedDecision(ctx context.Context, c *Client) (string, error) {
 	rows, err := c.Query(ctx, `SELECT
 		(SELECT COUNT(*) FROM vms WHERE deleted_at IS NULL) +
 		(SELECT COUNT(*) FROM containers WHERE deleted_at IS NULL) +
@@ -348,14 +367,148 @@ func SeedFirewallEnforcement(ctx context.Context, c *Client) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	mode := FirewallObserve
 	if len(rows) == 1 && rows[0].Int("n") == 0 {
-		mode = FirewallEnforce
+		return FirewallEnforce, nil
 	}
-	if err := SetFirewallEnforcement(ctx, c, mode, "litevirt (initial)"); err != nil {
+	return FirewallObserve, nil
+}
+
+// seedTS is the timestamp a seeded mode is written with: before any write a
+// clock can stamp, so an operator's `lv firewall enforce` outranks every seed
+// on every replica, whenever and wherever either was written. Of two seeds
+// observe outranks enforce: failing open, as a cluster did before.
+func seedTS(mode string) string {
+	if mode == FirewallObserve {
+		return "0001-01-01T00:00:00.000000002Z"
+	}
+	return "0001-01-01T00:00:00.000000001Z"
+}
+
+// SeedFirewallEnforcement records mode as the cluster's per-NIC enforcement
+// mode, once, from the cluster's founding host. It writes only when no mode is
+// recorded, the cluster_policies gate is open, and this replica can be trusted
+// to know: it has caught up with a peer since it started, or no host other
+// than hostName is known (a cluster of one). A replica that has not caught up
+// may simply not have seen the mode yet — a joiner would flip a cluster to
+// enforce, a rejoiner back to observe. It returns the mode written, or "".
+func SeedFirewallEnforcement(ctx context.Context, c *Client, mode, hostName string) (string, error) {
+	if mode != FirewallEnforce && mode != FirewallObserve {
+		return "", fmt.Errorf("firewall enforcement %q: want %s or %s", mode, FirewallEnforce, FirewallObserve)
+	}
+	cur, err := GetFirewallEnforcement(ctx, c)
+	if err != nil || cur.Recorded || !c.MayWriteClusterPolicy() {
+		return "", err
+	}
+	if caught, _ := c.ReplicaCaughtUp(); !caught {
+		rows, err := c.Query(ctx, `SELECT COUNT(*) AS n FROM hosts WHERE name != ?`, hostName)
+		if err != nil {
+			return "", err
+		}
+		if len(rows) != 1 || rows[0].Int("n") != 0 {
+			return "", nil
+		}
+	}
+	if err := c.Execute(ctx, clusterPolicyUpsertSQL, clusterPolicyFirewallEnforcement, mode,
+		"litevirt (initial)", seedTS(mode)); err != nil {
 		return "", err
 	}
 	return mode, nil
+}
+
+// NetworkGuardInfo is what a NIC on a network may not claim as its own, beyond
+// another NIC's address.
+type NetworkGuardInfo struct {
+	Subnet string
+	// LitevirtGateway is the subnet's first host where litevirt is the
+	// network's router (compose.NetworkDef.LitevirtGateway), else "".
+	LitevirtGateway string
+	// Reserved are the network's configured gateway and reserved addresses.
+	Reserved []string
+	// NICGateways are the gateways live VMs' NIC specs on the network route
+	// through, each with the VM and its project.
+	NICGateways []NICGatewayDecl
+}
+
+// NICGatewayDecl is one gateway a VM's NIC routes through.
+type NICGatewayDecl struct {
+	Addr    string
+	VM      string
+	Project string
+}
+
+// All is every address the network keeps from its NICs, the NIC-declared
+// gateways included.
+func (g NetworkGuardInfo) All() []string {
+	out := append([]string(nil), g.Reserved...)
+	if g.LitevirtGateway != "" {
+		out = append(out, g.LitevirtGateway)
+	}
+	for _, d := range g.NICGateways {
+		out = append(out, d.Addr)
+	}
+	return out
+}
+
+func canonIP(s string) string {
+	s = strings.TrimSpace(s)
+	if p, err := netip.ParsePrefix(s); err == nil && p.Addr().Zone() == "" {
+		return p.Addr().String()
+	}
+	if a, err := netip.ParseAddr(s); err == nil && a.Zone() == "" {
+		return a.String()
+	}
+	return ""
+}
+
+// NetworkGuardInfos returns NetworkGuardInfo for every live network.
+// networks.config is json.Marshal of compose.NetworkDef; vms.spec is
+// encoding/json of VMSpec.
+func NetworkGuardInfos(ctx context.Context, c *Client) (map[string]NetworkGuardInfo, error) {
+	rows, err := c.Query(ctx, `SELECT name, config FROM networks WHERE deleted_at IS NULL`)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]NetworkGuardInfo, len(rows))
+	for _, r := range rows {
+		var def compose.NetworkDef
+		_ = json.Unmarshal([]byte(r.String("config")), &def)
+		info := NetworkGuardInfo{Subnet: def.Subnet, LitevirtGateway: def.LitevirtGateway()}
+		for _, a := range append([]string{def.Gateway}, def.ReservedAddresses...) {
+			if ca := canonIP(a); ca != "" {
+				info.Reserved = append(info.Reserved, ca)
+			}
+		}
+		out[r.String("name")] = info
+	}
+	vms, err := c.Query(ctx, `SELECT name, COALESCE(project, '') AS project, spec FROM vms WHERE deleted_at IS NULL`)
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range vms {
+		var spec struct {
+			Network []struct {
+				Name        string `json:"name"`
+				Gateway     string `json:"gateway"`
+				Ipv6Gateway string `json:"ipv6_gateway"`
+			} `json:"network"`
+		}
+		if json.Unmarshal([]byte(r.String("spec")), &spec) != nil {
+			continue
+		}
+		for _, n := range spec.Network {
+			info, ok := out[n.Name]
+			if !ok {
+				continue
+			}
+			for _, g := range []string{n.Gateway, n.Ipv6Gateway} {
+				if ca := canonIP(g); ca != "" {
+					info.NICGateways = append(info.NICGateways, NICGatewayDecl{Addr: ca, VM: r.String("name"), Project: r.String("project")})
+				}
+			}
+			out[n.Name] = info
+		}
+	}
+	return out, nil
 }
 
 // AddrOwner is an address or MAC and the workload holding it.
@@ -401,4 +554,19 @@ func LiveNICIdentities(ctx context.Context, c *Client) ([]AddrOwner, error) {
 		}
 	}
 	return out, nil
+}
+
+// VMSpecOfIncarnation returns the stored spec of name's row when that row is
+// the incarnation created at createdAt, live or already tombstoned (a delete
+// keeps the spec). found is false when this replica holds another
+// incarnation, or none.
+func VMSpecOfIncarnation(ctx context.Context, c *Client, name, createdAt string) (spec string, found bool, err error) {
+	if createdAt == "" {
+		return "", false, nil
+	}
+	rows, err := c.Query(ctx, `SELECT spec FROM vms WHERE name = ? AND created_at = ?`, name, createdAt)
+	if err != nil || len(rows) == 0 {
+		return "", false, err
+	}
+	return rows[0].String("spec"), true, nil
 }

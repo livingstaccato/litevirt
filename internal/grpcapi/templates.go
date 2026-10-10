@@ -265,7 +265,7 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 	}
 
 	if req.Ip != "" && len(srcSpec.Network) > 0 {
-		if err := s.checkNICIdentities(ctx, []*pb.NetworkAttachment{{Name: srcSpec.Network[0].Name, Ip: req.Ip}}, req.Target); err != nil {
+		if err := s.checkNICIdentities(ctx, project, []*pb.NetworkAttachment{{Name: srcSpec.Network[0].Name, Ip: req.Ip}}, req.Target); err != nil {
 			cleanup()
 			return nil, err
 		}
@@ -276,6 +276,7 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 	var ifaceRecords []corrosion.InterfaceRecord
 	var nicRecords []corrosion.NICRecord // v42 dual-write alongside ifaceRecords (vm_nics)
 	var guardRecords []corrosion.NICGuardRecord
+	cloneUUID := uuid.NewString() // the clone's incarnation; its guard records carry it
 	for i, n := range srcSpec.Network {
 		mac := lv.GenerateMAC()
 		bridge := network.FlatBridgeName(n.Name)
@@ -327,8 +328,10 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 		// source's relaxations are not copied — relaxing a guard needs
 		// cluster-root network authority the cloning caller may not hold —
 		// and are set on the clone with `lv firewall nic-guard set`.
-		if !strings.HasPrefix(bridge, "direct:") {
-			guardRecords = append(guardRecords, corrosion.NICGuardRecord{VMName: req.Target, MAC: mac, Mode: corrosion.NICGuardOn})
+		// A NIC on the `trunk:` feature gets none (guardDecision.record).
+		if !strings.HasPrefix(bridge, "direct:") && len(n.Trunk) < 2 {
+			guardRecords = append(guardRecords, corrosion.NICGuardRecord{VMName: req.Target, MAC: mac, Mode: corrosion.NICGuardOn,
+				VMUUID: cloneUUID, Network: n.Name, Ordinal: i})
 		}
 	}
 	if err := s.writeNewNICGuards(ctx, guardRecords); err != nil {
@@ -367,8 +370,8 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 	mem := int(srcSpec.MemoryMib)
 	srcSpec.Name = req.Target
 	srcSpec.Project = project
-	srcSpec.Devices = nil           // v1: don't clone PCI passthrough (device may be in use)
-	srcSpec.Uuid = uuid.NewString() // fresh identity ⇒ fresh vTPM (never copy the source TPM secret) (G1)
+	srcSpec.Devices = nil    // v1: don't clone PCI passthrough (device may be in use)
+	srcSpec.Uuid = cloneUUID // fresh identity ⇒ fresh vTPM (never copy the source TPM secret) (G1)
 	for i := range srcSpec.Network {
 		if i < len(ifaceRecords) {
 			srcSpec.Network[i].Mac = ifaceRecords[i].MAC
@@ -443,6 +446,9 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 
 	state := "stopped"
 	if req.Start {
+		// The clone's rows are written once it runs; until then the firewall
+		// renders its NICs from here (nic_firewall_arming.go).
+		defer s.pendingNICs(req.Target, ifaceRecords, nil)()
 		if err := s.virt.StartDomain(req.Target); err != nil {
 			rollbackClone(false)
 			return nil, status.Errorf(codes.Internal, "start clone: %v", err)

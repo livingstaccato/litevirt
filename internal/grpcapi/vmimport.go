@@ -440,12 +440,12 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 	for _, n := range fv.NICs {
 		importAtts = append(importAtts, &pb.NetworkAttachment{Name: n.Network, Mac: n.MAC})
 	}
-	if err := s.checkNICIdentities(ctx, importAtts, name); err != nil {
+	if err := s.checkNICIdentities(ctx, project, importAtts, name); err != nil {
 		unwindImport()
 		return err
 	}
 	var importGuards []corrosion.NICGuardRecord
-	for _, n := range fv.NICs {
+	for i, n := range fv.NICs {
 		if first.SpoofGuard == "off" {
 			if err := s.requireGuardAuthority(ctx, n.Network, "importing a NIC unguarded"); err != nil {
 				unwindImport()
@@ -454,7 +454,8 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 			continue
 		}
 		if def, _ := lookupNetworkDef(ctx, s.db, n.Network); def != nil && def.Subnet != "" && def.Type != "direct" && def.Type != "sriov" {
-			importGuards = append(importGuards, corrosion.NICGuardRecord{VMName: name, MAC: n.MAC, Mode: corrosion.NICGuardOn})
+			importGuards = append(importGuards, corrosion.NICGuardRecord{VMName: name, MAC: n.MAC, Mode: corrosion.NICGuardOn,
+				VMUUID: spec.Uuid, Network: n.Network, Ordinal: i})
 		}
 	}
 	if err := s.writeNewNICGuards(ctx, importGuards); err != nil {

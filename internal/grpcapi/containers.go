@@ -337,6 +337,27 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		}
 		return nil, ferr
 	}
+	// A container's managed NICs are new NICs: guarded by default, held to the
+	// exact address IPAM gave them. Recorded before the container's rows, and a
+	// failure fails the create (re-review m-f): a container recorded as created
+	// must not be running with guards nobody wrote. Before failover_scope_v1 has
+	// latched nothing can be recorded and the NICs are unguarded, as every
+	// container NIC was.
+	var ctGuards []corrosion.NICGuardRecord
+	for _, ifc := range plan.ifaces {
+		ctGuards = append(ctGuards, corrosion.NICGuardRecord{
+			VMName: corrosion.ContainerGuardOwner(s.hostName, info.Name), MAC: ifc.MAC, Mode: corrosion.NICGuardOn,
+			Network: ifc.NetworkName, Ordinal: ifc.Ordinal})
+	}
+	if err := s.writeNewNICGuards(ctx, ctGuards); err != nil {
+		_ = s.releaseContainerNICs(ctx, info.Name)
+		if delErr := s.containerRuntime.DeleteContainer(ctx, info.Name); delErr != nil {
+			slog.Warn("container create: cleanup after a failed guard write also failed",
+				"name", info.Name, "error", delErr)
+		}
+		s.audit(ctx, "ct.create", info.Name, "image="+rec.Image, "error")
+		return nil, err
+	}
 	// Write the container row + managed interface rows in ONE atomic batch. Fail
 	// closed: the runtime container exists but the DB write failed → delete the
 	// just-created container and release its leases, so no partial tracked state
@@ -350,18 +371,7 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		s.audit(ctx, "ct.create", info.Name, "image="+rec.Image, "error")
 		return nil, status.Errorf(codes.Internal, "create: record cluster state: %v", err)
 	}
-	// A container's managed NICs are new NICs: guarded by default, held to
-	// the exact address IPAM gave them. A failure here leaves them unguarded
-	// — what every container NIC was before — and says so; relax or retry
-	// with `lv firewall nic-guard set --container`.
-	var ctGuards []corrosion.NICGuardRecord
-	for _, ifc := range plan.ifaces {
-		ctGuards = append(ctGuards, corrosion.NICGuardRecord{
-			VMName: corrosion.ContainerGuardOwner(s.hostName, info.Name), MAC: ifc.MAC, Mode: corrosion.NICGuardOn})
-	}
-	if err := s.writeNewNICGuards(ctx, ctGuards); err != nil {
-		slog.Error("container create: could not record its NIC guards; its NICs are unguarded", "name", info.Name, "error", err)
-	} else if len(ctGuards) > 0 {
+	if len(ctGuards) > 0 {
 		s.reconcileLocal(ctx)
 	}
 	s.audit(ctx, "ct.create", info.Name, "project="+tenancy.NormalizeProject(req.Project)+" image="+rec.Image, "ok")

@@ -22,6 +22,16 @@ func (c *Client) DefineDomain(xmlConfig string) error {
 
 // StartDomain boots a defined domain.
 func (c *Client) StartDomain(name string) error {
+	c.mu.RLock()
+	before := c.beforeStart
+	c.mu.RUnlock()
+	if before != nil {
+		// Whatever must be in force before the guest's first frame — its NIC
+		// guards (SetBeforeStart). A refusal leaves the domain stopped.
+		if err := before(name); err != nil {
+			return fmt.Errorf("start domain %s: %w", name, err)
+		}
+	}
 	dom, err := c.virt.DomainLookupByName(name)
 	if err != nil {
 		return fmt.Errorf("lookup domain %s: %w", name, err)

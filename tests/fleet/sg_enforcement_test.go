@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -34,6 +35,7 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/firewall"
 	"github.com/litevirt/litevirt/internal/image"
+	"github.com/litevirt/litevirt/internal/nictap"
 	"github.com/litevirt/litevirt/internal/qcow2"
 )
 
@@ -168,6 +170,10 @@ func legacyGroups(t *testing.T, n *Node, vmName, netName string) []string {
 // TestFleet_SG_ChainFollowsTheTapAcrossARestart is the lab finding: create a VM
 // with a group, stop it, start it. libvirt gives the NIC a new vnetN, and the
 // chain has to be on that one.
+//
+// A NIC this build defines names its tap after its MAC (nictap), so its tap
+// no longer moves; the NIC here is made one an older build defined, with no
+// tap name in its definition, which still gets a new vnetN on every start.
 func TestFleet_SG_ChainFollowsTheTapAcrossARestart(t *testing.T) {
 	c := sgCluster(t)
 	ctx := context.Background()
@@ -186,9 +192,15 @@ func TestFleet_SG_ChainFollowsTheTapAcrossARestart(t *testing.T) {
 		t.Fatalf("control: before any restart, web's tap %s must carry the ssh rule; chain:\n%s", before, chain)
 	}
 
+	if before != nictap.Name(nic.MAC) {
+		t.Fatalf("a NIC this build defines must have the tap its MAC names (%s), got %s", nictap.Name(nic.MAC), before)
+	}
 	if _, err := c.SelfClient(host).StopVM(ctx, &pb.StopVMRequest{Name: "web", Force: true}); err != nil {
 		t.Fatalf("StopVM web: %v", err)
 	}
+	// An older build's definition: no tap name.
+	untarget := regexp.MustCompile(`<target dev="lvt[0-9a-f]+"></target>`)
+	host.Virt.SetInactiveXML("web", untarget.ReplaceAllString(host.Virt.DefinedXML("web"), ""))
 	if _, err := c.SelfClient(host).StartVM(ctx, &pb.StartVMRequest{Name: "web"}); err != nil {
 		t.Fatalf("StartVM web: %v", err)
 	}

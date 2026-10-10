@@ -781,6 +781,11 @@ message CreateNetworkRequest {
     bool   spoof_check = 12;
     string project    = 13; // owning tenant; empty = global/shared (usable by all)
     int32  netbox_prefix_id = 14; // bind to a NetBox prefix; 0 = unbound
+    // gateway: the network's router when it is not litevirt's own (an
+    // upstream router on an external or VLAN bridge). reserved_addresses:
+    // further infrastructure addresses. No guest NIC may claim either.
+    string gateway = 15;
+    repeated string reserved_addresses = 16;
 }
 message GetNetworkRequest      { string name = 1; }
 message DeleteNetworkRequest   { string name = 1; bool force = 2; }
@@ -1609,16 +1614,33 @@ message FirewallHostEnforcement {
     // guards-only (bridge conntrack unavailable) | "" (no guest NIC).
     string applied_mode = 2;
     string error        = 3;
+    // would_drops: what the per-NIC rules would have dropped, totalled per
+    // workload, NIC, side and rule since would_drop_since (RFC 3339) — across
+    // table reloads and daemon restarts, until `lv firewall enforce
+    // reset-counters`.
     repeated FirewallWouldDrop would_drops = 4;
+    string would_drop_since = 5;
 }
 
 message FirewallWouldDrop {
-    string device   = 1;
+    string device   = 1;  // the tap or veth it is on now; "" when not on this host now
     string workload = 2;
     string side     = 3;  // in | out | state | vlan
     string rule     = 4;
     uint64 packets  = 5;
     uint64 bytes    = 6;
+    string mac      = 7;
+}
+
+message ResetFirewallWouldDropsRequest {
+    bool local_only = 1;  // this host only (a peer's fan-out leg)
+}
+
+// ArmNICFirewallRequest asks a host to put a VM's per-NIC firewall — its NIC
+// guards above all — in force before the VM runs there (a migration target,
+// before the guest is handed over). Peer only.
+message ArmNICFirewallRequest {
+    string vm_name = 1;
 }
 
 message ListNICGuardsRequest {
@@ -3614,6 +3636,11 @@ service LiteVirt {
     // SetFirewallEnforcement switches it (admin).
     rpc GetFirewallEnforcement(GetFirewallEnforcementRequest) returns (FirewallEnforcementStatus);
     rpc SetFirewallEnforcement(SetFirewallEnforcementRequest) returns (FirewallEnforcementStatus);
+    // ResetFirewallWouldDrops restarts every host's would-drop totals from now
+    // (admin, audited).
+    rpc ResetFirewallWouldDrops(ResetFirewallWouldDropsRequest) returns (FirewallEnforcementStatus);
+    // ArmNICFirewall: see ArmNICFirewallRequest.
+    rpc ArmNICFirewall(ArmNICFirewallRequest) returns (google.protobuf.Empty);
 
     // ── Backup snapshots ──
     rpc BackupSnapshot(BackupSnapshotRequest)       returns (stream BackupSnapshotProgress);

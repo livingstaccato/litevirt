@@ -12,7 +12,7 @@ table inet litevirt-fw {
         type filter hook forward priority filter; policy drop;
         ct state established,related accept
         ct state invalid drop
-        icmpv6 type { nd-router-solicit, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert, nd-redirect } drop
+        ip6 hoplimit != 255 icmpv6 type { nd-router-solicit, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert, nd-redirect } drop
         meta mark & 0x10000000 == 0x10000000 accept
         jump cluster_default
         jump host_overrides
@@ -74,6 +74,7 @@ table bridge litevirt-nic {
     chain forward {
         type filter hook forward priority filter; policy accept;
         iifname != @lv_nic_devs oifname != @lv_nic_devs accept
+        oifname @lv_nic_devs oifname != @lv_vlan_ok ether type { 8021q, 8021ad } drop
         ct state established,related accept
         meta protocol != { ip, ip6 } accept
         ip6 hoplimit 255 icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } accept
@@ -85,6 +86,7 @@ table bridge litevirt-nic {
         iifname @lv_dhcp_srv udp sport 67 udp dport 68 accept
         iifname @lv_dhcp_srv ip6 saddr fe80::/10 udp sport 547 udp dport 546 accept
         iifname != @lv_nic_devs ip6 hoplimit 255 icmpv6 type { nd-router-advert, nd-redirect } accept
+        iifname != @lv_nic_devs ip saddr @lv_lb_src4 ip daddr . tcp dport @lv_lb4 accept
         ct state invalid drop
         iifname tap-vm1-0 jump nic_out_tap_vm1_0
         oifname tap-vm1-0 jump nic_in_tap_vm1_0
@@ -113,6 +115,7 @@ table bridge litevirt-nic {
         type filter hook output priority filter; policy accept;
         oifname != @lv_nic_devs meta mark & 0x20000000 == 0x20000000 jump routed_to_port
         oifname != @lv_nic_devs accept
+        oifname @lv_nic_devs oifname != @lv_vlan_ok ether type { 8021q, 8021ad } drop
         ct state established,related accept
         meta protocol != { ip, ip6 } accept
         ip6 hoplimit 255 icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } accept

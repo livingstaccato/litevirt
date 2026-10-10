@@ -60,7 +60,8 @@ func TestKernel_NICGuard(t *testing.T) {
 		t.Fatalf("kernel tests failed in the namespace: %v", err)
 	}
 	for _, child := range []string{"TestKernelChild_GuardDropsSpoofs", "TestKernelChild_RulesetLoads",
-		"TestKernelChild_RulesHoldOnEveryPath", "TestKernelChild_DefaultDenyAndBypasses"} {
+		"TestKernelChild_RulesHoldOnEveryPath", "TestKernelChild_DefaultDenyAndBypasses",
+		"TestKernelChild_VLANToNICAndTrunk"} {
 		if !strings.Contains(string(out), "--- PASS: "+child) {
 			t.Errorf("%s did not pass in the namespace", child)
 		}
@@ -199,6 +200,32 @@ func (l *bridgeLab) deliveredFrom(t *testing.T, from, to string, frame []byte) b
 	return false
 }
 
+// deliveredWhole is deliveredFrom for a frame that must go out at its exact
+// length (no marker appended): it reports whether a frame byte-identical to
+// it came out of to. The frames sent this way carry a zero checksum, which
+// the kernel never sends, so its own traffic cannot match.
+func (l *bridgeLab) deliveredWhole(t *testing.T, from, to string, frame []byte) bool {
+	t.Helper()
+	tx := packetSocket(t, from)
+	rx := packetSocket(t, to)
+	ifc, _ := net.InterfaceByName(from)
+	if err := syscall.Sendto(tx, frame, 0, &syscall.SockaddrLinklayer{Ifindex: ifc.Index, Halen: 6}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	buf := make([]byte, 4096)
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		n, _, err := syscall.Recvfrom(rx, buf, 0)
+		if err != nil {
+			continue
+		}
+		if n >= len(frame) && bytes.Equal(buf[:len(frame)], frame) {
+			return true
+		}
+	}
+	return false
+}
+
 var bcast = net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
 
 func ether(src net.HardwareAddr, etype uint16, payload []byte) []byte {
@@ -247,6 +274,14 @@ func ipv6(src, dst string, next byte, payload []byte) []byte {
 	copy(h[8:], net.ParseIP(src).To16())
 	copy(h[24:], net.ParseIP(dst).To16())
 	return append(h, payload...)
+}
+
+// ipv6Exact is ipv6 with a payload length that counts the payload alone, for
+// frames sent without the marker (deliveredWhole).
+func ipv6Exact(src, dst string, next byte, payload []byte) []byte {
+	f := ipv6(src, dst, next, payload)
+	binary.BigEndian.PutUint16(f[4:], uint16(len(payload)))
+	return f
 }
 
 func icmpv6(typ byte, body []byte) []byte { return append([]byte{typ, 0, 0, 0}, body...) }
@@ -334,13 +369,26 @@ func TestKernelChild_GuardDropsSpoofs(t *testing.T) {
 		{"router advertisement", ether(mac, 0x86dd, ipv6(ll, "ff02::1", 58, icmpv6(134, make([]byte, 12)))), false},
 		{"DHCPv6 server reply", ether(mac, 0x86dd, ipv6(ll, "fe80::9", 17, udp6(547, 546))), false},
 		{"DHCPv6 reply from another source port", ether(mac, 0x86dd, ipv6(ll, "fe80::9", 17, udp6(9999, 546))), false},
-		{"honest neighbour advert", ether(mac, 0x86dd, ipv6(ll, "ff02::1", 58, neighborAdvert("2001:db8::5"))), true},
 		{"neighbour advert for another address", ether(mac, 0x86dd, ipv6(ll, "ff02::1", 58, neighborAdvert("2001:db8::99"))), false},
 		{"neighbour advert for the router's link-local", ether(mac, 0x86dd, ipv6(ll, "ff02::1", 58, neighborAdvert("fe80::1"))), false},
-		{"honest neighbour solicitation", ether(mac, 0x86dd, ipv6(ll, "ff02::1:ff00:9", 58, neighborSolicit("2001:db8::9", mac))), true},
 		{"solicitation naming another MAC", ether(mac, 0x86dd, ipv6(ll, "ff02::1:ff00:9", 58, neighborSolicit("2001:db8::9", foreign))), false},
 	}
 	run(exact)
+
+	// Neighbour discovery at its real length: the guard caps it at the header
+	// plus one option (re-review m-a), and the marker the other cases append
+	// would count against that, so these frames are matched whole instead.
+	nonce := []byte{14, 1, 1, 2, 3, 4, 5, 6} // a Nonce option (RFC 3971), ahead of the SLLA
+	smuggled := icmpv6(135, append(append(append([]byte{0, 0, 0, 0}, net.ParseIP("2001:db8::9").To16()...), nonce...), append([]byte{1, 1}, foreign...)...))
+	for _, c := range []tc{
+		{"honest neighbour advert", ether(mac, 0x86dd, ipv6Exact(ll, "ff02::1", 58, neighborAdvert("2001:db8::5"))), true},
+		{"honest neighbour solicitation", ether(mac, 0x86dd, ipv6Exact(ll, "ff02::1:ff00:9", 58, neighborSolicit("2001:db8::9", mac))), true},
+		{"solicitation smuggling a foreign MAC in a second option", ether(mac, 0x86dd, ipv6Exact(ll, "ff02::1:ff00:9", 58, smuggled)), false},
+	} {
+		if got := l.deliveredWhole(t, "lvg0", "lvg1", c.frame); got != c.want {
+			t.Errorf("%s: delivered=%v, want %v", c.name, got, c.want)
+		}
+	}
 
 	// Confined to the subnet: anything in it, except the network's own
 	// addresses and another NIC's.
@@ -697,4 +745,159 @@ func TestKernelChild_DefaultDenyAndBypasses(t *testing.T) {
 	}
 	check("no rules: gb", "gb", "10.20.0.1", true)
 	check("no rules: routed", "gx", "10.21.0.9", true)
+}
+
+// vport adds a veth pair to bridge br: the bridge port is host, the far end
+// (where a frame is sent from or seen arriving) is far.
+func vport(t *testing.T, br, host, far string) net.HardwareAddr {
+	t.Helper()
+	sh(t, "ip", "link", "add", far, "type", "veth", "peer", "name", host)
+	sh(t, "ip", "link", "set", host, "master", br)
+	sh(t, "ip", "link", "set", host, "up")
+	sh(t, "ip", "link", "set", far, "up")
+	ifc, err := net.InterfaceByName(far)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ifc.HardwareAddr
+}
+
+// tagged wraps an IPv4 payload in one 802.1Q tag per VID, outermost first;
+// tpid sets the outer tag's type (0x8100 or 0x88a8).
+func tagged(src net.HardwareAddr, tpid uint16, payload []byte, vids ...uint16) []byte {
+	inner := []byte{8, 0}
+	for i := len(vids) - 1; i >= 0; i-- {
+		tci := []byte{byte(vids[i] >> 8), byte(vids[i])}
+		tag := append(tci, inner...)
+		inner = append([]byte{0x81, 0}, tag...)
+	}
+	// inner now begins with the outer TPID; replace it with tpid.
+	inner[0], inner[1] = byte(tpid>>8), byte(tpid)
+	return ether(src, binary.BigEndian.Uint16(inner[:2]), append(inner[2:], payload...))
+}
+
+// TestKernelChild_VLANToNICAndTrunk pushes tagged frames through real
+// bridges:
+//
+//   - re-review I-1: a tagged frame sent TO a guest NIC from a port that is
+//     not one (the uplink) is dropped, so it cannot carry its payload past
+//     the receiver's rules — and observe mode only counts it;
+//   - re-review I-2: a NIC on the `trunk:` feature, on a vlan_filtering
+//     bridge as litevirt configures it, carries its VLANs, is still judged
+//     by its rules (which see the inner packet), and cannot send a doubled or
+//     802.1ad tag in enforce mode; in observe mode nothing it could send on
+//     main is dropped.
+//
+// Each drop is then shown to pass with no table loaded.
+func TestKernelChild_VLANToNICAndTrunk(t *testing.T) {
+	inNetns(t)
+	if missing := missingModules("nf_conntrack_bridge"); len(missing) > 0 {
+		t.Skip("nf_conntrack_bridge is not loaded; a test must not load it")
+	}
+	apply := func(p Plan) {
+		t.Helper()
+		if _, err := NewApplier(NftBinary{}).Apply(context.Background(), p); err != nil {
+			t.Fatalf("apply: %v", err)
+		}
+	}
+	l := &bridgeLab{}
+	udp := func(dport uint16) []byte { return ipv4UDP("10.0.0.8", "10.0.0.9", 4000, dport) }
+
+	// I-1: a plain bridge, two guest NICs and an uplink.
+	sh(t, "ip", "link", "add", "lvvb0", "type", "bridge", "stp_state", "0", "forward_delay", "0")
+	sh(t, "ip", "link", "set", "lvvb0", "up")
+	vport(t, "lvvb0", "lvvh0", "lvvg0")
+	vport(t, "lvvb0", "lvvh1", "lvvg1")
+	up := vport(t, "lvvb0", "lvvh2", "lvvg2")
+	nics := []NICBinding{{NICDev: "lvvh0", VMName: "a", Bridge: "lvvb0"}, {NICDev: "lvvh1", VMName: "b", Bridge: "lvvb0"}}
+	toNIC := []struct {
+		name  string
+		frame []byte
+		want  bool
+	}{
+		{"untagged from the uplink", ether(up, 0x0800, udp(5000)), true},
+		{"priority-tagged (VID 0) from the uplink", tagged(up, 0x8100, udp(5000), 0), false},
+		{"802.1Q from the uplink", tagged(up, 0x8100, udp(5000), 10), false},
+		{"802.1ad over 802.1Q from the uplink", tagged(up, 0x88a8, udp(5000), 0, 10), false},
+	}
+	apply(Plan{NICs: nics})
+	for _, c := range toNIC {
+		if got := l.deliveredFrom(t, "lvvg2", "lvvg0", c.frame); got != c.want {
+			t.Errorf("enforce: %s: delivered=%v, want %v", c.name, got, c.want)
+		}
+	}
+	apply(Plan{NICMode: NICModeObserve, NICs: nics})
+	for _, c := range toNIC {
+		if !l.deliveredFrom(t, "lvvg2", "lvvg0", c.frame) {
+			t.Errorf("observe: %s was dropped", c.name)
+		}
+	}
+	counted := false
+	wd, _ := WouldDrops(context.Background())
+	for _, w := range wd {
+		if w.Rule == "tagged-to-nic" && w.Packets > 0 {
+			counted = true
+		}
+	}
+	if !counted {
+		t.Errorf("observe mode counted no tagged frame sent to a NIC: %+v", wd)
+	}
+
+	// I-2: a vlan_filtering bridge; the trunk NIC carries VLANs 100 and 101,
+	// the uplink 100-102.
+	sh(t, "ip", "link", "add", "lvtb0", "type", "bridge", "stp_state", "0", "forward_delay", "0", "vlan_filtering", "1")
+	sh(t, "ip", "link", "set", "lvtb0", "up")
+	tr := vport(t, "lvtb0", "lvth0", "lvtg0")
+	vport(t, "lvtb0", "lvth1", "lvtg1")
+	for _, v := range []string{"100", "101"} {
+		sh(t, "bridge", "vlan", "add", "dev", "lvth0", "vid", v)
+	}
+	for _, v := range []string{"100", "101", "102"} {
+		sh(t, "bridge", "vlan", "add", "dev", "lvth1", "vid", v)
+	}
+	trunkPlan := Plan{
+		SecurityGroups: []SecurityGroup{{Name: "no25", Rules: []Rule{{Direction: Egress, Proto: "udp", PortRange: "25", Action: Drop}}}},
+		NICs:           []NICBinding{{NICDev: "lvth0", VMName: "router", Bridge: "lvtb0", TrunkVIDs: []int{100, 101}, SecurityGroups: []string{"no25"}}},
+	}
+	trunk := []struct {
+		name           string
+		frame          []byte
+		enforce, empty bool
+	}{
+		{"VLAN 100", tagged(tr, 0x8100, udp(5000), 100), true, true},
+		{"VLAN 101", tagged(tr, 0x8100, udp(5000), 101), true, true},
+		{"untagged (native VLAN)", ether(tr, 0x0800, udp(5000)), true, true},
+		{"VLAN 100, to a port its rules refuse", tagged(tr, 0x8100, udp(25), 100), false, true},
+		{"a doubled tag inside VLAN 100", tagged(tr, 0x8100, udp(5000), 100, 7), false, true},
+		{"802.1ad outer tag", tagged(tr, 0x88a8, udp(5000), 100, 7), false, true},
+	}
+	apply(trunkPlan)
+	for _, c := range trunk {
+		if got := l.deliveredFrom(t, "lvtg0", "lvtg1", c.frame); got != c.enforce {
+			t.Errorf("trunk, enforce: %s: delivered=%v, want %v", c.name, got, c.enforce)
+		}
+	}
+	trunkPlan.NICMode = NICModeObserve
+	apply(trunkPlan)
+	for _, c := range trunk {
+		if got := l.deliveredFrom(t, "lvtg0", "lvtg1", c.frame); got != c.empty {
+			t.Errorf("trunk, observe: %s: delivered=%v, want %v (as with no table)", c.name, got, c.empty)
+		}
+	}
+	if t.Failed() {
+		t.Logf("ruleset:\n%s", sh(t, "nft", "list", "table", "bridge", NICTableName))
+	}
+
+	// No table: every frame dropped above passes, so the drops were ours.
+	apply(Plan{})
+	for _, c := range toNIC {
+		if !l.deliveredFrom(t, "lvvg2", "lvvg0", c.frame) {
+			t.Errorf("no table: %s still dropped — the drop above was not the rule's", c.name)
+		}
+	}
+	for _, c := range trunk {
+		if got := l.deliveredFrom(t, "lvtg0", "lvtg1", c.frame); got != c.empty {
+			t.Errorf("no table: %s: delivered=%v, want %v", c.name, got, c.empty)
+		}
+	}
 }

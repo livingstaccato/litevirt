@@ -113,6 +113,8 @@ func newNetworkCreateCmd() *cobra.Command {
 		spoofCheck bool
 		project    string
 		netboxID   int
+		gateway    string
+		reserved   []string
 	)
 	cmd := &cobra.Command{
 		Use:   "create <name>",
@@ -128,18 +130,20 @@ Examples:
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				ni, err := c.CreateNetwork(ctx, &pb.CreateNetworkRequest{
-					Name:           args[0],
-					Type:           ntype,
-					Iface:          iface,
-					Vlan:           int32(vlan),
-					Vni:            int32(vni),
-					Underlay:       underlay,
-					Subnet:         subnet,
-					Dhcp:           dhcp,
-					Pf:             pf,
-					SpoofCheck:     spoofCheck,
-					Project:        project,
-					NetboxPrefixId: int32(netboxID),
+					Name:              args[0],
+					Type:              ntype,
+					Iface:             iface,
+					Vlan:              int32(vlan),
+					Vni:               int32(vni),
+					Underlay:          underlay,
+					Subnet:            subnet,
+					Dhcp:              dhcp,
+					Pf:                pf,
+					SpoofCheck:        spoofCheck,
+					Project:           project,
+					NetboxPrefixId:    int32(netboxID),
+					Gateway:           gateway,
+					ReservedAddresses: reserved,
 				})
 				if err != nil {
 					// The server's own message, not a wrapped rpc error. This
@@ -173,6 +177,10 @@ Examples:
 	cmd.Flags().StringVar(&project, "project", "", "Owning project (empty = global/shared, usable by all projects)")
 	cmd.Flags().IntVar(&netboxID, "netbox-prefix-id", 0,
 		"bind this network to a NetBox prefix, claiming VM addresses from it")
+	cmd.Flags().StringVar(&gateway, "gateway", "",
+		"the network's router when it is not litevirt's (e.g. the upstream router of an external bridge); no guest NIC may claim it")
+	cmd.Flags().StringSliceVar(&reserved, "reserved-address", nil,
+		"an infrastructure address on the network no guest NIC may claim (repeatable)")
 	return cmd
 }
 

@@ -1,7 +1,11 @@
 // Package compose parses litevirt compose YAML files and generates execution plans.
 package compose
 
-import "fmt"
+import (
+	"fmt"
+	"net/netip"
+	"strings"
+)
 
 // File is the top-level compose document.
 type File struct {
@@ -105,6 +109,15 @@ type NetworkDef struct {
 	HostIsolation bool     `yaml:"host-isolation"` // block VM→host management traffic
 	DNS           []string `yaml:"dns"`            // DNS resolvers for isolated VMs (default: 1.1.1.1, 8.8.8.8)
 
+	// Gateway is the network's router when it is not litevirt's own: the
+	// address of the upstream router on an external or VLAN bridge. Setting it
+	// also says the subnet's first host is NOT the router (LitevirtGateway).
+	// ReservedAddresses are further infrastructure addresses on the network (a
+	// second router, a VRRP address, the IPv6 router). No guest NIC may claim
+	// either, and a NIC guard confined to the subnet excludes them.
+	Gateway           string   `yaml:"gateway"`
+	ReservedAddresses []string `yaml:"reserved-addresses"`
+
 	// NetBoxPrefixID binds this network to a NetBox prefix. Zero means unbound,
 	// which is every network today.
 	//
@@ -114,6 +127,43 @@ type NetworkDef struct {
 	// mixed-version cluster safe is the netbox_ipam_v1 latch, because an older
 	// node would otherwise allocate from the builtin allocator across the prefix.
 	NetBoxPrefixID int `yaml:"netbox-prefix-id"`
+}
+
+// LitevirtGateway is the address litevirt itself puts on the network's bridge
+// — the subnet's first host — on a network whose router litevirt is: one it
+// serves DHCP for or routes (a vxlan network's anycast gateway, an isolated
+// network, a bridge litevirt manages). "" where the router is someone else's:
+// a VLAN or external bridge, a host-isolated network, or a network whose
+// configured Gateway names another address. It is a superset of where
+// network.DHCPWouldServe starts dnsmasq (TestLitevirtGatewayCoversDHCP).
+func (n NetworkDef) LitevirtGateway() string {
+	if n.Subnet == "" || n.HostIsolation {
+		return ""
+	}
+	switch n.Type {
+	case "", "bridge":
+		if n.VLAN != 0 || (n.External && !n.DHCP) {
+			return ""
+		}
+	case "vxlan", "isolated":
+	default:
+		return ""
+	}
+	p, err := netip.ParsePrefix(strings.TrimSpace(n.Subnet))
+	if err != nil || p.Addr().Zone() != "" {
+		return ""
+	}
+	p = p.Masked()
+	gw := p.Addr().Next()
+	if !p.Contains(gw) {
+		return ""
+	}
+	if g := strings.TrimSpace(n.Gateway); g != "" {
+		if a, err := netip.ParseAddr(g); err == nil && a != gw {
+			return ""
+		}
+	}
+	return gw.String()
 }
 
 // NATEnabled returns true unless NAT is explicitly disabled.

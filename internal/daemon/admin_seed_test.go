@@ -469,3 +469,29 @@ func TestSeedAdminUser_GenesisSeedsTheFoundersReplica(t *testing.T) {
 		t.Fatal("the founder's replica is not seeded after genesis")
 	}
 }
+
+// TestSeedAdminUser_GenesisDecidesFirewallEnforce (re-review I-3, m-j): the
+// one moment a cluster is known to be new is its genesis, so that is where
+// "a fresh cluster enforces" is decided — on the founder, before any workload
+// exists. A joiner, or a former member, decides nothing: with no mode recorded
+// the cluster observes, and only `lv firewall enforce` changes that.
+func TestSeedAdminUser_GenesisDecidesFirewallEnforce(t *testing.T) {
+	ctx := context.Background()
+	d := founderDaemon(t, newHostTestClient(t), filepath.Join(t.TempDir(), "admin-password"))
+	if err := d.seedAdminUser(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(d.cfg.DataDir, firewallInitialModeName))
+	if err != nil || strings.TrimSpace(string(got)) != corrosion.FirewallEnforce {
+		t.Fatalf("genesis decided %q (%v), want enforce", got, err)
+	}
+
+	joiner := founderDaemon(t, newHostTestClient(t), filepath.Join(t.TempDir(), "admin-password"))
+	joiner.cfg.JoinPeers = []string{"10.77.0.11:7946"}
+	if err := joiner.seedAdminUser(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(joiner.cfg.DataDir, firewallInitialModeName)); !os.IsNotExist(err) {
+		t.Errorf("a joiner decided an initial firewall mode: %v", err)
+	}
+}

@@ -112,6 +112,43 @@ type Applier struct {
 	lastApplyAt time.Time
 	resyncAfter time.Duration
 	now         func() time.Time
+
+	// tally, when set, is handed the observe counters of the per-NIC table
+	// before every replace or removal of it, which zeroes them.
+	tally      *WouldDropTally
+	lastOwners map[string]NICOwner // the NICs of lastNIC
+}
+
+// SetTally makes the applier harvest the observe counters into t before it
+// replaces or removes the per-NIC table.
+func (a *Applier) SetTally(t *WouldDropTally) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.tally = t
+}
+
+// NICOwners is who owns each tap of the per-NIC table last loaded.
+func (a *Applier) NICOwners() map[string]NICOwner {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.ownersLocked()
+}
+
+// harvestLocked hands the counters of the table about to go to the tally. A
+// table this process did not load (one left by the previous daemon, whose
+// taps the running VMs still hold) is attributed by p's owners. Caller holds
+// a.mu.
+func (a *Applier) harvestLocked(ctx context.Context, p Plan) {
+	if a.tally == nil {
+		return
+	}
+	owners := a.lastOwners
+	if a.lastNIC == "" {
+		owners = nicOwners(p)
+	}
+	if err := a.tally.Harvest(ctx, owners); err != nil {
+		slog.Warn("firewall: could not keep the observe-mode counters before replacing the per-NIC table", "error", err)
+	}
 }
 
 // NewApplier wraps an NftRunner with the change-detection cache.
@@ -169,11 +206,13 @@ func (a *Applier) Apply(ctx context.Context, p Plan) (bool, error) {
 	switch {
 	case nic != "":
 		if nic != a.lastNIC || resync {
+			a.harvestLocked(ctx, p)
 			if out, err := a.runner.Apply(ctx, nic); err != nil {
 				nicErr = fmt.Errorf("%w: nft apply: %v: %s", ErrNICTableRefused, err, strings.TrimSpace(out))
 			} else {
 				changed = changed || nic != a.lastNIC
 				a.lastNIC, sent = nic, true
+				a.lastOwners = nicOwners(p)
 			}
 		}
 		nicActive = nicErr == nil
@@ -182,13 +221,14 @@ func (a *Applier) Apply(ctx context.Context, p Plan) (bool, error) {
 		// earlier binary, left behind. libvirt reuses vnetN names, so a stale
 		// chain would hold the next VM to get one to another VM's policy.
 		if d, ok := a.runner.(nicTableDropper); ok {
+			a.harvestLocked(ctx, p)
 			if err := d.DropNICTable(ctx); err != nil {
 				nicErr = err
 			}
 		}
 		if nicErr == nil {
 			changed = changed || a.lastNIC != ""
-			a.lastNIC, a.nicCleaned = "", true
+			a.lastNIC, a.nicCleaned, a.lastOwners = "", true, nil
 		}
 	}
 	if nic != "" && nicErr == nil {
@@ -254,31 +294,84 @@ func (a *Applier) Reset() {
 	a.lastApplyAt = time.Time{}
 }
 
-// BridgeConntrackAvailable reports whether nf_conntrack_bridge is loaded,
-// loading it first when load is set. Per-NIC rules need it: without it every
-// bridged frame is untracked, the reply to a guest's own connection is judged
-// as a new one, and a `ct` expression in the bridge table makes the kernel
-// refuse the table outright. The daemon loads it at start (load=true); tests
-// never do (load=false): loading a module is a change to the host.
+// BridgeConntrackAvailable reports whether nf_conntrack_bridge is available
+// — loaded or built in — loading it first when load is set. Per-NIC rules need
+// it: without it every bridged frame is untracked, the reply to a guest's own
+// connection is judged as a new one, and a `ct` expression in the bridge table
+// makes the kernel refuse the table outright. The daemon loads it at start
+// (load=true); tests never do (load=false): loading a module is a change to
+// the host. A modprobe that succeeds is availability, whatever sysfs shows.
 func BridgeConntrackAvailable(ctx context.Context, load bool) bool {
-	if moduleLoaded("nf_conntrack_bridge") {
+	if moduleAvailable("nf_conntrack_bridge") {
 		return true
 	}
 	if !load {
 		return false
 	}
-	if out, err := exec.CommandContext(ctx, "modprobe", "nf_conntrack_bridge").CombinedOutput(); err != nil {
+	if err := modprobe(ctx, "nf_conntrack_bridge"); err != nil {
 		slog.Error("firewall: could not load nf_conntrack_bridge; per-NIC rules will not be enforced (guards only)",
-			"error", err, "output", strings.TrimSpace(string(out)))
+			"error", err)
 		return false
 	}
-	return moduleLoaded("nf_conntrack_bridge")
+	return true
 }
 
-// moduleLoaded reports whether a kernel module is loaded or built in.
-func moduleLoaded(name string) bool {
-	if _, err := os.Stat("/sys/module/" + name); err == nil {
+// Where module state is read; tests point them elsewhere.
+var (
+	sysModuleDir     = "/sys/module"
+	procModulesPath  = "/proc/modules"
+	builtinListPath  = "" // "" = /lib/modules/<release>/modules.builtin
+	modprobe         = runModprobe
+	errNoModuleState = errors.New("no module state")
+)
+
+func runModprobe(ctx context.Context, name string) error {
+	if out, err := exec.CommandContext(ctx, "modprobe", name).CombinedOutput(); err != nil {
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// moduleAvailable reports whether a kernel module is loaded or built in. A
+// built-in module that takes no parameters has no /sys/module entry, so the
+// kernel's list of built-in modules is read as well.
+func moduleAvailable(name string) bool {
+	if _, err := os.Stat(sysModuleDir + "/" + name); err == nil {
 		return true
 	}
+	if b, err := os.ReadFile(procModulesPath); err == nil {
+		for _, line := range strings.Split(string(b), "\n") {
+			if f := strings.Fields(line); len(f) > 0 && f[0] == name {
+				return true
+			}
+		}
+	}
+	path := builtinListPath
+	if path == "" {
+		rel, err := kernelRelease()
+		if err != nil {
+			return false
+		}
+		path = "/lib/modules/" + rel + "/modules.builtin"
+	}
+	if b, err := os.ReadFile(path); err == nil {
+		for _, line := range strings.Split(string(b), "\n") {
+			base := line[strings.LastIndex(line, "/")+1:]
+			if strings.TrimSuffix(base, ".ko") == name {
+				return true
+			}
+		}
+	}
 	return false
+}
+
+func kernelRelease() (string, error) {
+	b, err := os.ReadFile("/proc/sys/kernel/osrelease")
+	if err != nil {
+		return "", err
+	}
+	if r := strings.TrimSpace(string(b)); r != "" {
+		return r, nil
+	}
+	return "", errNoModuleState
 }

@@ -162,6 +162,10 @@ func TestFleet_NICGuard_DHCPNICGetsExactReservation(t *testing.T) {
 	n := c.Nodes[0]
 	n.DB.SetClusterPolicyGate(func() bool { return true })
 	n.Server.SetBridgeEnsure(func(string) error { return nil })
+	// The bridge is host-local and this host's dnsmasq serves it (no real
+	// dnsmasq runs in the fleet).
+	n.Server.SetDHCPReservationBackend(func(string) bool { return true }, func(string) bool { return false },
+		func(_, _, _ string) error { return nil })
 	ctx := context.Background()
 	if err := corrosion.UpsertNetwork(ctx, n.DB, corrosion.NetworkRecord{Name: "dhcpnet", Type: "bridge",
 		Config: `{"Type":"bridge","Interface":"br-dhcp","Subnet":"10.40.0.0/24","DHCP":true}`}); err != nil {
@@ -186,5 +190,61 @@ func TestFleet_NICGuard_DHCPNICGetsExactReservation(t *testing.T) {
 		if !strings.Contains(out, "ip saddr != { "+want+" } drop") || strings.Contains(out, "10.40.0.0/24 } drop") {
 			t.Errorf("%s's guard is not exact:\n%s", name, out)
 		}
+	}
+}
+
+// TestFleet_NICGuard_RebuildCarriesGuardState (re-review I-11): a rebuild
+// re-creates a VM under a new incarnation. A VM whose NICs predate guards —
+// here created before records could be written — stays unguarded through it,
+// exactly as it ran before (no newly broken IPv6 or DHCP address); a guarded
+// VM stays guarded; and an operator's relaxation is carried by the NIC it was
+// made for.
+func TestFleet_NICGuard_RebuildCarriesGuardState(t *testing.T) {
+	c := New(t, Options{Nodes: 1})
+	n := c.Nodes[0]
+	n.Server.SetBridgeEnsure(func(string) error { return nil })
+	ctx := context.Background()
+	cl := c.SelfClient(n)
+	create := func(name, ip string) string {
+		t.Helper()
+		if _, err := cl.CreateVM(ctx, &pb.CreateVMRequest{Spec: &pb.VMSpec{
+			Name: name, Cpu: 1, MemoryMib: 256, Placement: &pb.PlacementSpec{Host: n.Name},
+			Network: []*pb.NetworkAttachment{{Name: "lan", Ip: ip}},
+		}}); err != nil {
+			t.Fatalf("CreateVM %s: %v", name, err)
+		}
+		nics, err := corrosion.MergedVMNICs(ctx, n.DB, name)
+		if err != nil || len(nics) != 1 {
+			t.Fatalf("NICs of %s: %v %v", name, nics, err)
+		}
+		return nics[0].MAC
+	}
+	legacyMAC := create("legacy", "10.30.0.21") // the store is closed: no record, as before guards
+	n.DB.SetClusterPolicyGate(func() bool { return true })
+	freshMAC := create("fresh", "10.30.0.22")
+	relaxedMAC := create("relaxed", "10.30.0.23")
+	if _, err := cl.SetNICGuard(ctx, &pb.SetNICGuardRequest{VmName: "relaxed", Mac: relaxedMAC, Mode: "on",
+		AllowedAddresses: []string{"10.30.0.250"}}); err != nil {
+		t.Fatalf("SetNICGuard: %v", err)
+	}
+
+	for _, name := range []string{"legacy", "fresh", "relaxed"} {
+		if _, err := cl.RebuildVM(ctx, &pb.RebuildVMRequest{Name: name}); err != nil {
+			t.Fatalf("RebuildVM %s: %v", name, err)
+		}
+	}
+	if rec, err := corrosion.GetNICGuard(ctx, n.DB, "legacy", legacyMAC); err != nil || rec != nil {
+		t.Errorf("a rebuild newly guarded a VM whose NIC predates guards: %+v, %v", rec, err)
+	}
+	if rec, err := corrosion.GetNICGuard(ctx, n.DB, "fresh", freshMAC); err != nil || rec == nil || !rec.Guarded() {
+		t.Errorf("a rebuild dropped a guard: %+v, %v", rec, err)
+	}
+	rec, err := corrosion.GetNICGuard(ctx, n.DB, "relaxed", relaxedMAC)
+	if err != nil || rec == nil || len(rec.Allowed) != 1 || rec.Allowed[0] != "10.30.0.250" {
+		t.Errorf("a rebuild lost the operator's relaxation: %+v, %v", rec, err)
+	}
+	out := renderOn(t, n)
+	if strings.Contains(out, "10.30.0.21 } drop") {
+		t.Errorf("the legacy VM is guarded after its rebuild:\n%s", out)
 	}
 }

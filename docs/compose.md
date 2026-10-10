@@ -19,6 +19,12 @@ networks:
     subnet: "10.0.100.0/24"
     host-isolation: true              # VMs can't reach the hypervisor
     dns: ["1.1.1.1", "8.8.8.8"]      # DNS for isolated VMs (optional, these are defaults)
+  lan:
+    type: "bridge"
+    interface: "br0"
+    subnet: "192.168.10.0/24"
+    gateway: "192.168.10.254"         # the upstream router, when it is not litevirt's
+    reserved-addresses: ["192.168.10.253"]   # other infrastructure no guest may claim
 
 vms:
   base-vm:
@@ -356,17 +362,29 @@ Supports `s` (seconds), `m` (minutes), `h` (hours). Defaults to 30 seconds if no
         ip: "10.0.1.10"             # Static IPv4 (optional)
         mac: "52:54:00:12:34:56"    # Fixed MAC (optional)
         gateway: "10.0.1.1"
-        trunk: [100, 101]           # VLAN trunk mode
         security-groups: ["web"]    # Per-NIC firewall (see "Firewall" below)
         # NIC guard (anti-spoofing, docs/firewall.md "NIC guards"). A new NIC
         # is guarded by default; anything below but the default needs
-        # cluster-root network authority at deploy.
+        # network.update on the network at deploy.
         spoof-guard: "on"           # on (default) | off
         allowed-addresses: ["10.0.1.250"]   # extra sources the guest may use (a VIP)
         allow-dhcp-server: false
         allow-router-advertisement: false
-        allow-vlan-tags: false      # true: a trunk (tagged frames from the guest)
+        allow-vlan-tags: false      # true: the guest may send and receive any tags (a VLAN-aware guest)
+      - name: "core"
+        trunk: [100, 101]           # VLAN trunk mode: the guest carries VLANs 100 and 101 tagged
 ```
+
+A NIC with `trunk:` (two or more VLANs) carries exactly those VLANs, single
+tagged, and its per-NIC rules still judge the packet inside the tag; it gets no
+NIC guard unless it asks for one. `allow-vlan-tags: true` is for a VLAN-aware
+guest outside the `trunk:` feature (docs/firewall.md, "VLAN tags").
+
+A network's `gateway:` names its router when the router is not litevirt's — the
+upstream router of an external or VLAN bridge, often not the subnet's first
+host — and `reserved-addresses:` its other infrastructure addresses. No guest
+NIC may claim either, and a guest whose guard is confined to the subnet may not
+use them (docs/firewall.md, "NIC guards").
 
 IPv6 can be set either by putting a v6 address in the `ip`/`gateway` fields, or
 via the dedicated `ipv6:` / `ipv6-gateway:` fields (which also enable dual-stack

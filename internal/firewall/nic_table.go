@@ -86,7 +86,7 @@ func renderNICTable(b *strings.Builder, p Plan, sgs map[string]SecurityGroup, v6
 	var devs, vlanOK, dhcpSrv []string
 	for _, n := range nics {
 		devs = append(devs, n.NICDev)
-		if n.AllowVLANTags {
+		if n.AllowVLANTags || len(n.TrunkVIDs) > 0 {
 			vlanOK = append(vlanOK, n.NICDev)
 		}
 		if n.DHCPServer {
@@ -119,6 +119,9 @@ func renderNICTable(b *strings.Builder, p Plan, sgs map[string]SecurityGroup, v6
 	fmt.Fprintf(b, "        iifname != @%s ether type { 8021q, 8021ad } %s\n", setVLANOK,
 		verdictVLAN(p))
 	for _, n := range nics {
+		renderTrunkConfine(b, p, n, "iifname", true)
+	}
+	for _, n := range nics {
 		if n.Guard != nil {
 			fmt.Fprintf(b, "        iifname %s jump guard_%s\n", n.NICDev, sanitiseChain(n.NICDev))
 		}
@@ -126,7 +129,7 @@ func renderNICTable(b *strings.Builder, p Plan, sgs map[string]SecurityGroup, v6
 	fmt.Fprintf(b, "    }\n\n")
 	for _, n := range nics {
 		if n.Guard != nil {
-			renderGuardChain(b, n.NICDev, *n.Guard, n.AllowVLANTags)
+			renderGuardChain(b, n.NICDev, *n.Guard, n.AllowVLANTags, len(n.TrunkVIDs) > 0)
 		}
 	}
 	if mode == NICModeGuardsOnly {
@@ -138,6 +141,7 @@ func renderNICTable(b *strings.Builder, p Plan, sgs map[string]SecurityGroup, v6
 	fmt.Fprintf(b, "    chain forward {\n")
 	fmt.Fprintf(b, "        type filter hook forward priority filter; policy accept;\n")
 	fmt.Fprintf(b, "        iifname != @%s oifname != @%s accept\n", setNICDevs, setNICDevs)
+	renderTaggedToNIC(b, p, nics)
 	bridgeCommon(b, p)
 	// DHCPv4/v6 client requests broadcast or multicast to a server on the
 	// link, and replies from a server that is not a guest (an upstream server
@@ -150,6 +154,9 @@ func renderNICTable(b *strings.Builder, p Plan, sgs map[string]SecurityGroup, v6
 	fmt.Fprintf(b, "        iifname @%s ip6 saddr fe80::/10 udp sport 547 udp dport 546 accept\n", setDHCPSrv)
 	// Router advertisements and redirects from a router that is not a guest.
 	fmt.Fprintf(b, "        iifname != @%s ip6 hoplimit 255 icmpv6 type { nd-router-advert, nd-redirect } accept\n", setNICDevs)
+	// The built-in load balancer's haproxy on ANOTHER host reaching a backend
+	// here: bridged in from the uplink (re-review m-d).
+	fmt.Fprintf(b, "        iifname != @%s ip saddr @%s ip daddr . tcp dport @%s accept\n", setNICDevs, setLBSrc4, setLB4)
 	fmt.Fprintf(b, "        ct state invalid %s\n", verdict(p, "-", "state", "invalid"))
 	dispatchNICs(b, nics, "iifname", "nic_out_")
 	dispatchNICs(b, nics, "oifname", "nic_in_")
@@ -183,6 +190,7 @@ func renderNICTable(b *strings.Builder, p Plan, sgs map[string]SecurityGroup, v6
 		fmt.Fprintf(b, "        oifname != @%s meta mark & %#x == %#x jump routed_to_port\n", setNICDevs, deferMark, deferMark)
 	}
 	fmt.Fprintf(b, "        oifname != @%s accept\n", setNICDevs)
+	renderTaggedToNIC(b, p, nics)
 	bridgeCommon(b, p)
 	// The host's dnsmasq answering DHCP and acting as the IPv6 router.
 	fmt.Fprintf(b, "        ip saddr @%s udp sport 67 udp dport 68 accept\n", setGateways4)
@@ -253,10 +261,49 @@ func renderNICTableSets(b *strings.Builder, p Plan, dhcpSrv, gw4, gw6 []string) 
 }
 
 func verdictVLAN(p Plan) string {
-	if p.nicMode() == NICModeObserve {
-		return fmt.Sprintf("counter comment %q", WouldDropComment+" - vlan tagged")
+	return verdict(p, "-", "vlan", "tagged")
+}
+
+// renderTaggedToNIC drops a tagged frame on its way TO a guest NIC that may
+// not carry tags (re-review I-1). It comes ahead of bridgeCommon's non-IP
+// accept: the kernel holds a frame's outer tag outside the payload, so
+// skb->protocol reads as the next header and a tag would otherwise carry the
+// frame past the receiver's rules, and the receiver's guest strips it. On a
+// vlan_filtering bridge the egress tagging policy has already been applied at
+// these hooks, so an access port's untagged VLAN traffic does not match. A
+// trunk NIC's own confinement follows (renderTrunkConfine).
+func renderTaggedToNIC(b *strings.Builder, p Plan, nics []NICBinding) {
+	fmt.Fprintf(b, "        oifname @%s oifname != @%s ether type { 8021q, 8021ad } %s\n", setNICDevs, setVLANOK,
+		verdict(p, "-", "vlan", "tagged-to-nic"))
+	for _, n := range nics {
+		renderTrunkConfine(b, p, n, "oifname", false)
 	}
-	return "drop"
+}
+
+// renderTrunkConfine confines a trunk NIC (NICBinding.TrunkVIDs) to single
+// 802.1Q tags: no 802.1ad outer tag and no tag inside the tag, either of which
+// would carry a payload no rule can see. On the way in it is also confined to
+// its own VIDs (the bridge's vlan_filtering does so too; this keeps the rule
+// independent of it). In observe mode each is a counter: everything a trunk
+// could send before keeps working until enforcement is switched on.
+func renderTrunkConfine(b *strings.Builder, p Plan, n NICBinding, word string, vids bool) {
+	if len(n.TrunkVIDs) == 0 {
+		return
+	}
+	v := verdict(p, n.NICDev, "vlan", "trunk")
+	fmt.Fprintf(b, "        %s %s ether type 8021ad %s\n", word, n.NICDev, v)
+	if vids {
+		ids := append([]int(nil), n.TrunkVIDs...)
+		sort.Ints(ids)
+		strs := make([]string, 0, len(ids))
+		for i, id := range ids {
+			if i == 0 || id != ids[i-1] {
+				strs = append(strs, fmt.Sprint(id))
+			}
+		}
+		fmt.Fprintf(b, "        %s %s vlan id != { %s } %s\n", word, n.NICDev, strings.Join(strs, ", "), v)
+	}
+	fmt.Fprintf(b, "        %s %s vlan type { 8021q, 8021ad } %s\n", word, n.NICDev, v)
 }
 
 func lbProto(l LBBackend) string {
@@ -384,13 +431,20 @@ func eui64LinkLocal(mac string) (string, bool) {
 // renderGuardChain emits one guarded NIC's chain. Order matters: the drops of
 // things a guest may never send come first, so the DHCP-client accept further
 // down can never let a server reply or a spoofed frame through.
-func renderGuardChain(b *strings.Builder, dev string, g NICGuard, vlanOK bool) {
+//
+// A trunk NIC's tagged frames leave the chain after the MAC check: the
+// addresses its guest uses on its other VLANs are not litevirt's to know, so
+// the address guards hold its untagged (native VLAN) traffic only. The
+// prerouting chain has already confined its tags (renderTrunkConfine).
+func renderGuardChain(b *strings.Builder, dev string, g NICGuard, vlanOK, trunk bool) {
 	mac := strings.ToLower(g.MAC)
 	hw, _ := net.ParseMAC(mac)
 	macHex := fmt.Sprintf("0x%x", []byte(hw))
 	fmt.Fprintf(b, "    chain guard_%s {\n", sanitiseChain(dev))
 	fmt.Fprintf(b, "        ether saddr != %s drop\n", mac)
-	if !vlanOK {
+	if trunk {
+		fmt.Fprintf(b, "        ether type 8021q return\n")
+	} else if !vlanOK {
 		// Held here too, so a guarded NIC drops tagged frames in observe mode,
 		// where the table-wide VLAN rule only counts.
 		fmt.Fprintf(b, "        ether type { 8021q, 8021ad } drop\n")
@@ -447,7 +501,14 @@ func renderGuardChain(b *strings.Builder, dev string, g NICGuard, vlanOK bool) {
 	}
 	// The link-layer address options of solicitations and advertisements must
 	// carry the guest's own MAC: they are what a neighbour cache records. The
-	// option checked is the first one, where every stack puts it.
+	// option checked is the first one, where every stack puts it; and there may
+	// be no second one, where a stack that skips an unknown first option would
+	// find a smuggled address (re-review m-a): a solicitation or advertisement
+	// is at most its header (24 bytes) plus one 8-byte option — the link-layer
+	// address, or a duplicate-address-detection nonce — and a router
+	// solicitation 8 plus one.
+	fmt.Fprintf(b, "        icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert } ip6 length > 32 drop\n")
+	fmt.Fprintf(b, "        icmpv6 type nd-router-solicit ip6 length > 16 drop\n")
 	fmt.Fprintf(b, "        icmpv6 type nd-router-solicit @th,64,16 0x0101 @th,80,48 != %s drop\n", macHex)
 	fmt.Fprintf(b, "        icmpv6 type nd-neighbor-solicit @th,192,16 0x0101 @th,208,48 != %s drop\n", macHex)
 	fmt.Fprintf(b, "        icmpv6 type nd-neighbor-advert @th,192,16 0x0201 @th,208,48 != %s drop\n", macHex)

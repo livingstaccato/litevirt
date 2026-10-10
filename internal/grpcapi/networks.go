@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/netip"
+	"strings"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -68,6 +70,18 @@ func (s *Server) CreateNetwork(ctx context.Context, req *pb.CreateNetworkRequest
 		DHCP:       req.Dhcp,
 		PF:         req.Pf,
 		SpoofCheck: req.SpoofCheck,
+		Gateway:    strings.TrimSpace(req.GetGateway()),
+	}
+	for _, a := range append([]string{def.Gateway}, req.GetReservedAddresses()...) {
+		if a == "" {
+			continue
+		}
+		if ip, err := netip.ParseAddr(strings.TrimSpace(a)); err != nil || ip.Zone() != "" {
+			return nil, status.Errorf(codes.InvalidArgument, "gateway / reserved address %q is not an IP address", a)
+		}
+	}
+	for _, a := range req.GetReservedAddresses() {
+		def.ReservedAddresses = append(def.ReservedAddresses, strings.TrimSpace(a))
 	}
 	if def.Interface == "" {
 		def.Interface = req.Name

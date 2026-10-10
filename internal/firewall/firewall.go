@@ -182,10 +182,21 @@ type NICBinding struct {
 	// the tiers for any other port) instead of in the inet forward chain.
 	Bridge string
 
+	// MAC is the NIC's MAC address, when known. It names the NIC in the
+	// observe-mode tally (WouldDropTally), which must outlive the tap name.
+	MAC string
+
 	// AllowVLANTags lets the guest send 802.1Q / 802.1ad tagged frames (an
 	// explicit trunk). Every other NIC's tagged frames are dropped: rules match
 	// untagged IP, so a tag would carry traffic past them.
 	AllowVLANTags bool
+
+	// TrunkVIDs are the VLANs of a NIC on litevirt's `trunk:` feature (two or
+	// more VLANs, configured on a vlan_filtering bridge port). Such a NIC
+	// carries single-tagged frames of exactly these VLANs, which its rules
+	// still judge (they match the inner packet); an 802.1ad or doubled tag,
+	// whose payload no rule can see, is refused like any other NIC's tag.
+	TrunkVIDs []int
 
 	// DHCPServer marks a NIC whose guest is allowed to answer DHCP: its
 	// replies reach other guests ahead of their ingress rules, as the host's
@@ -366,8 +377,11 @@ func RenderParts(p Plan, nicActive bool) (inet, nic string, err error) {
 	fmt.Fprintf(&b, "        ct state invalid drop\n")
 	// Neighbour and router discovery are link-local: a router never forwards
 	// them (RFC 4861 requires hop limit 255), so a routed one is a guest using
-	// the discovery exemptions to smuggle traffic off its link.
-	fmt.Fprintf(&b, "        icmpv6 type { nd-router-solicit, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert, nd-redirect } drop\n")
+	// the discovery exemptions to smuggle traffic off its link. Routing has
+	// already decremented the hop limit when this hook runs; a BRIDGED
+	// message, which reaches this hook too on a host with br_netfilter loaded,
+	// still carries 255 and must pass, as it did before this rule existed.
+	fmt.Fprintf(&b, "        ip6 hoplimit != 255 icmpv6 type { nd-router-solicit, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert, nd-redirect } drop\n")
 	if trust {
 		// A frame a guest sent was judged by its NIC's egress rules at the
 		// bridge input hook, which marks what it lets through.
@@ -844,6 +858,11 @@ func validate(p Plan) error {
 		}
 		if n.Bridge != "" && !safeIfName(n.Bridge) {
 			return fmt.Errorf("NIC %q: bridge name %q is not a safe interface name", n.NICDev, n.Bridge)
+		}
+		for _, v := range n.TrunkVIDs {
+			if v < 1 || v > 4094 {
+				return fmt.Errorf("NIC %q: trunk VLAN %d is outside 1-4094", n.NICDev, v)
+			}
 		}
 	}
 	// NAT / isolation are IPv4-only (same as the filter rules) and must be

@@ -215,6 +215,9 @@ networks:
     interface: e2efwtbr
     subnet: 10.205.0.0/24
     dhcp: true
+  fwt2:
+    type: bridge
+    interface: e2efwt2br
 vms:
   a:
     image: %[2]s
@@ -246,16 +249,22 @@ vms:
     memory: %[3]s
     network: [{name: fwt, security-groups: [silent]}]
     placement: {host: %[4]s}
+  t:
+    image: %[2]s
+    cpu: 1
+    memory: %[3]s
+    network: [{name: fwt}, {name: fwt2, trunk: [100, 101]}]
+    placement: {host: %[4]s}
 `, stack, drillImage(), drillMemory(), host)
 	file := "/tmp/" + stack + ".yaml"
 	l.mustSSH(host, 30*time.Second, "echo "+base64.StdEncoding.EncodeToString([]byte(yaml))+" | base64 -d > "+file)
 	l.onRestore(func() {
 		_, _ = l.lv(host, "compose", "down", "-f", file, "-y")
-		_, _ = l.ssh(host, 30*time.Second, "ip link del e2efwtbr 2>/dev/null; rm -f "+file)
+		_, _ = l.ssh(host, 30*time.Second, "ip link del e2efwtbr 2>/dev/null; ip link del e2efwt2br 2>/dev/null; rm -f "+file)
 	})
 	l.mustLV(host, "compose", "up", "-f", file, "-y")
 
-	short := []string{"a", "b", "c", "d", "e"}
+	short := []string{"a", "b", "c", "d", "e", "t"}
 	names := map[string]string{}
 	for _, n := range short {
 		names[n] = n
@@ -274,7 +283,7 @@ vms:
 		ip[n] = l.guestIP(host, names[n], 5*time.Minute)
 	}
 	l.mark("guests: %v", ip)
-	for _, n := range []string{"a", "c", "e"} {
+	for _, n := range []string{"a", "c", "e", "t"} {
 		l.waitGuestSSH(host, ip[n], 20*time.Minute)
 	}
 	l.saveEvidence("ruleset.txt", l.mustSSH(host, 30*time.Second, "nft list ruleset"))
@@ -410,5 +419,98 @@ vms:
 			t.Errorf("observe status does not show b's would-drop:\n%s", st)
 		}
 		l.mustLV(host, "firewall", "enforce", "on")
+	})
+	t.Run("I1_TaggedFramesToANICAreDropped", func(t *testing.T) {
+		// The host sends tagged frames out of the bridge (a port that is no
+		// guest NIC): they must not reach a guest's port, where its guest
+		// would strip the tag past its rules.
+		l.mustSSH(host, 30*time.Second, "ip link add link e2efwtbr name e2efwtbr.10 type vlan id 10 && "+
+			"ip addr add 10.216.0.254/24 dev e2efwtbr.10 && ip link set e2efwtbr.10 up")
+		defer l.ssh(host, 30*time.Second, "ip link del e2efwtbr.10") //nolint:errcheck
+		tap := l.guestTap(host, names["d"])
+		count := l.probe(host, "i1", "bridge", "output", 100, "oifname "+tap+" ether type 8021q")
+		l.ssh(host, 30*time.Second, "ping -c 3 -W 1 -I e2efwtbr.10 10.216.0.1; true") //nolint:errcheck
+		if n := count(); n != 0 {
+			t.Errorf("%d tagged frames from the host's side reached guest d's port", n)
+		}
+		l.mustLV(host, "firewall", "nic-guard", "set", names["d"], "--network", netName, "--mode", "on", "--allow-vlan-tags")
+		l.mustLV(host, "firewall", "reload")
+		l.ssh(host, 30*time.Second, "ping -c 3 -W 1 -I e2efwtbr.10 10.216.0.1; true") //nolint:errcheck
+		if count() == 0 {
+			t.Error("with d allowed tags none reached its port either; the zero above proves nothing")
+		}
+		l.mustLV(host, "firewall", "nic-guard", "set", names["d"], "--network", netName, "--mode", "on")
+		l.mustLV(host, "firewall", "reload")
+	})
+	t.Run("I2_TrunkNICCarriesItsVLANs", func(t *testing.T) {
+		// t's second NIC is on the trunk: feature with VLANs 100 and 101.
+		if !try("t", "sudo ip link add link eth1 name eth1.100 type vlan id 100 && sudo ip addr add 10.217.0.1/24 dev eth1.100 && "+
+			"sudo ip link set eth1 up && sudo ip link set eth1.100 up && "+
+			"sudo ip link add link eth1 name eth1.102 type vlan id 102 && sudo ip addr add 10.218.0.1/24 dev eth1.102 && sudo ip link set eth1.102 up") {
+			t.Skip("the guest kernel cannot make VLAN interfaces; I-2 is proven by the kernel test instead")
+		}
+		mac := l.mustSQL(host, "SELECT mac FROM vm_interfaces WHERE vm_name = '"+names["t"]+"' AND network_name LIKE '%fwt2' AND deleted_at IS NULL")[0][0]
+		tap := "lvt" + strings.ReplaceAll(strings.ToLower(mac), ":", "")
+		in100 := l.probe(host, "i2a", "bridge", "input", 100, "iifname "+tap+" vlan id 100")
+		in102 := l.probe(host, "i2b", "bridge", "input", 100, "iifname "+tap+" vlan id 102")
+		try("t", "ping -c 3 -W 1 10.217.0.254; ping -c 3 -W 1 10.218.0.254; true")
+		if in100() == 0 {
+			t.Errorf("the trunk NIC's VLAN 100 frames were dropped; a trunk must carry its VLANs in both modes")
+		}
+		if n := in102(); n != 0 {
+			t.Errorf("%d frames on VLAN 102, which the trunk was not given, got through", n)
+		}
+		if rows := l.mustSQL(host, "SELECT COUNT(*) FROM cluster_policies WHERE key LIKE 'nic_guard/"+names["t"]+"/"+strings.ToLower(mac)+"' AND deleted_at IS NULL"); rows[0][0] != "0" {
+			t.Errorf("a trunk NIC got a default guard record")
+		}
+	})
+	t.Run("I10_GuardInForceBeforeTheGuestRuns", func(t *testing.T) {
+		mac := l.mustSQL(host, "SELECT mac FROM vm_interfaces WHERE vm_name = '"+names["a"]+"' AND deleted_at IS NULL")[0][0]
+		tap := "lvt" + strings.ReplaceAll(strings.ToLower(mac), ":", "")
+		if got := l.guestTap(host, names["a"]); got != tap {
+			t.Fatalf("a's tap is %q, want the one its MAC names (%s)", got, tap)
+		}
+		l.mustLV(host, "stop", names["a"])
+		if !l.waitDomainState(host, names["a"], "shut off", 3*time.Minute) {
+			t.Fatalf("%s did not stop", names["a"])
+		}
+		if nic := l.mustSSH(host, 20*time.Second, "nft list table bridge litevirt-nic"); !strings.Contains(nic, "chain guard_"+tap+" {") {
+			t.Errorf("a's guard is not in force while it is stopped, so its first frames would run unguarded:\n%s", nic)
+		}
+		l.mustLV(host, "start", names["a"])
+		if !l.waitDomainState(host, names["a"], "running", 3*time.Minute) {
+			t.Fatalf("%s did not start", names["a"])
+		}
+		if got := l.guestTap(host, names["a"]); got != tap {
+			t.Errorf("after a restart a's tap is %q, want %s", got, tap)
+		}
+	})
+	t.Run("I11_RebuildKeepsEachNICsGuard", func(t *testing.T) {
+		l.mustLV(host, "firewall", "nic-guard", "set", names["d"], "--network", netName, "--mode", "on", "--allow", "10.205.0.250")
+		l.mustLV(host, "rebuild", names["d"])
+		if !l.waitDomainState(host, names["d"], "running", 4*time.Minute) {
+			t.Fatalf("%s never ran after its rebuild", names["d"])
+		}
+		ls := l.mustLV(host, "firewall", "nic-guard", "ls", names["d"])
+		if !strings.Contains(ls, "10.205.0.250") {
+			t.Errorf("a rebuild dropped the NIC's relaxation:\n%s", ls)
+		}
+		guard := func(vm string) string {
+			rows := l.mustSQL(host, "SELECT value FROM cluster_policies WHERE key LIKE 'nic_guard/"+vm+"/%' AND deleted_at IS NULL")
+			if len(rows) == 0 {
+				return ""
+			}
+			return rows[0][0]
+		}
+		if !strings.Contains(guard(names["e"]), `"mode":"on"`) {
+			t.Fatalf("fixture: e is not guarded: %q", guard(names["e"]))
+		}
+		l.mustLV(host, "rebuild", names["e"])
+		if !l.waitDomainState(host, names["e"], "running", 4*time.Minute) {
+			t.Fatalf("%s never ran after its rebuild", names["e"])
+		}
+		if g := guard(names["e"]); !strings.Contains(g, `"mode":"on"`) {
+			t.Errorf("a rebuild dropped a guard: %q", g)
+		}
 	})
 }

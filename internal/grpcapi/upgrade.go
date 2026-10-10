@@ -211,26 +211,72 @@ const unitPath = systemdunit.MainPath
 const needrestartDropinPath = systemdunit.NeedrestartPath
 const needrestartDropin = systemdunit.Needrestart
 
-// updateSystemdUnit writes the current unit file templates (main + rollback
-// companion) and reloads systemd if anything changed on disk. Best-effort —
-// failures are logged, not fatal.
-func updateSystemdUnit() {
+// systemdUnitPaths are where the units are installed; tests point them
+// elsewhere.
+type systemdUnitPaths struct{ main, rollback string }
+
+var defaultSystemdUnitPaths = systemdUnitPaths{main: unitPath, rollback: rollbackUnitPath}
+
+// EnsureSystemdUnits installs this binary's units when the daemon starts, on a
+// host that runs it under systemd at all (its main unit is installed).
+//
+// An upgrade writes the units the RUNNING binary carries (updateSystemdUnit,
+// called by the old binary just before it is replaced), so a host upgraded
+// from a build whose unit lacks something this one needs — the per-NIC
+// firewall table cleanup that makes a rollback safe (systemdunit.NICTableCleanup)
+// — would otherwise never get it (re-review I-6).
+func EnsureSystemdUnits() {
+	ensureSystemdUnitsAt(defaultSystemdUnitPaths, systemdDaemonReload)
+}
+
+func ensureSystemdUnitsAt(p systemdUnitPaths, reload func() error) {
+	if _, err := os.Stat(p.main); err != nil {
+		return // not installed as a systemd unit here
+	}
+	if !writeSystemdUnitsAt(p) {
+		return
+	}
+	if err := reload(); err != nil {
+		slog.Warn("systemctl daemon-reload failed after installing this build's units", "error", err)
+		return
+	}
+	slog.Info("installed this build's systemd units (main + rollback)")
+}
+
+func systemdDaemonReload() error {
+	if out, err := exec.Command("systemctl", "daemon-reload").CombinedOutput(); err != nil {
+		return fmt.Errorf("%w: %s", err, out)
+	}
+	return nil
+}
+
+// writeSystemdUnitsAt writes the current main and rollback units where they
+// differ, reporting whether anything changed.
+func writeSystemdUnitsAt(p systemdUnitPaths) bool {
 	changed := false
-	if existing, err := os.ReadFile(unitPath); err != nil || string(existing) != litevirtUnit {
-		if err := os.WriteFile(unitPath, []byte(litevirtUnit), 0644); err != nil {
+	if existing, err := os.ReadFile(p.main); err != nil || string(existing) != litevirtUnit {
+		if err := os.WriteFile(p.main, []byte(litevirtUnit), 0644); err != nil {
 			slog.Warn("failed to update systemd unit", "error", err)
-			return
+			return false
 		}
 		changed = true
 	}
-	if existing, err := os.ReadFile(rollbackUnitPath); err != nil || string(existing) != litevirtRollbackUnit {
-		if err := os.WriteFile(rollbackUnitPath, []byte(litevirtRollbackUnit), 0644); err != nil {
+	if existing, err := os.ReadFile(p.rollback); err != nil || string(existing) != litevirtRollbackUnit {
+		if err := os.WriteFile(p.rollback, []byte(litevirtRollbackUnit), 0644); err != nil {
 			slog.Warn("failed to update rollback unit", "error", err)
 			// don't return — the main unit still works, just without auto-rollback
 		} else {
 			changed = true
 		}
 	}
+	return changed
+}
+
+// updateSystemdUnit writes the current unit file templates (main + rollback
+// companion) and reloads systemd if anything changed on disk. Best-effort —
+// failures are logged, not fatal.
+func updateSystemdUnit() {
+	changed := writeSystemdUnitsAt(defaultSystemdUnitPaths)
 	// Install the needrestart exclusion when needrestart is present. Not a systemd
 	// unit, so it never gates the daemon-reload below; best-effort.
 	if _, err := os.Stat("/etc/needrestart"); err == nil {

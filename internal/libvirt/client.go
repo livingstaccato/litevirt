@@ -43,6 +43,19 @@ type Client struct {
 
 	// Domain event callback registered by the daemon.
 	eventCallback DomainEventCallback
+
+	// beforeStart runs ahead of every domain start (SetBeforeStart).
+	beforeStart func(name string) error
+}
+
+// SetBeforeStart registers fn to run before every StartDomain; an error from
+// it refuses the start. The daemon wires the per-NIC firewall here, so a VM's
+// NIC guards are in force before its first frame, whichever path starts it
+// (an API start, a restart policy, a failover reschedule, a restore).
+func (c *Client) SetBeforeStart(fn func(name string) error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.beforeStart = fn
 }
 
 // NewClient connects to the local libvirtd daemon.

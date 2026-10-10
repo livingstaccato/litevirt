@@ -821,6 +821,70 @@ func DisksReferencingPath(ctx context.Context, c *Client, path string) ([]DiskRe
 	return disks, nil
 }
 
+// DiskPathUse is one place a live disk row of a live VM names a path: as the
+// disk itself (Via "disk") or as what it is layered on — a linked clone's
+// base (backing_disk) or a full clone's provenance (backing_image), Via
+// "backing".
+type DiskPathUse struct {
+	VMName      string
+	VMCreatedAt string
+	DiskName    string
+	HostName    string
+	Path        string // the path used, whichever column names it
+	Via         string // "disk" | "backing"
+}
+
+// LiveVMDiskUsesWithPathPrefix returns every use, by a live disk row of a live
+// VM, of a path starting with prefix — as a disk, or as a disk's backing. A LUN
+// a linked clone reads from is in use as surely as one a VM writes.
+func LiveVMDiskUsesWithPathPrefix(ctx context.Context, c *Client, prefix string) ([]DiskPathUse, error) {
+	pat := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(prefix) + "%"
+	rows, err := c.Query(ctx,
+		`SELECT d.vm_name, v.created_at, d.disk_name, d.host_name, d.path, d.backing_disk, d.backing_image
+		 FROM vm_disks d JOIN vms v ON v.name = d.vm_name AND v.deleted_at IS NULL
+		 WHERE d.deleted_at IS NULL
+		   AND (d.path LIKE ? ESCAPE '\' OR d.backing_disk LIKE ? ESCAPE '\' OR d.backing_image LIKE ? ESCAPE '\')
+		 ORDER BY d.vm_name, d.disk_name`,
+		pat, pat, pat)
+	if err != nil {
+		return nil, err
+	}
+	var out []DiskPathUse
+	for _, r := range rows {
+		base := DiskPathUse{VMName: r.String("vm_name"), VMCreatedAt: r.String("created_at"),
+			DiskName: r.String("disk_name"), HostName: r.String("host_name")}
+		for _, col := range []struct{ name, via string }{
+			{"path", "disk"}, {"backing_disk", "backing"}, {"backing_image", "backing"},
+		} {
+			if p := r.String(col.name); strings.HasPrefix(p, prefix) {
+				u := base
+				u.Path, u.Via = p, col.via
+				out = append(out, u)
+			}
+		}
+	}
+	return out, nil
+}
+
+// VMIncarnationDisks returns the disk rows, tombstoned ones included, of the
+// incarnation of VM name created at createdAt: what a VM that a rebuild or a
+// recreate has just deleted held.
+func VMIncarnationDisks(ctx context.Context, c *Client, name, createdAt string) ([]DiskRecord, error) {
+	rows, err := c.Query(ctx,
+		`SELECT d.vm_name, d.disk_name, d.host_name, d.path
+		 FROM vm_disks d JOIN vms v ON v.name = d.vm_name
+		 WHERE v.name = ? AND v.created_at = ?`, name, createdAt)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]DiskRecord, len(rows))
+	for i, r := range rows {
+		out[i] = DiskRecord{VMName: r.String("vm_name"), DiskName: r.String("disk_name"),
+			HostName: r.String("host_name"), Path: r.String("path")}
+	}
+	return out, nil
+}
+
 // LiveVMDisksWithPathPrefix returns the live disk rows of live VMs whose path
 // starts with prefix — the disks a block-device prefix (an iscsi pool's
 // /dev/disk/by-path/ names) can hold. A row whose VM is gone holds nothing.

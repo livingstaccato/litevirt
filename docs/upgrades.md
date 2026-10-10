@@ -779,6 +779,27 @@ release. Nothing is written to the table before then, and the scope stays
 below the latched token enters WAL quarantine, as below every latched token.
 Roll forward.
 
+### Health-aware relays need every host upgraded
+
+This release lets the failover lease holder demote a host whose probes keep
+failing from relay duty, by writing a `relay_demoted/<host>` row in
+`cluster_policies` (colonelpanik/litevirt#175;
+[operating-model.md](operating-model.md#replication)). A host on the previous
+release decodes that row but ignores it, so it would keep the demoted host as
+a relay while every upgraded host dropped it — two relay sets in one cluster.
+So nothing is demoted until the `relay_health_v1` capability token has
+latched, which it does on its own once every host the cluster replicates to —
+including one parked in `maintenance` — runs this release, and until
+`failover_scope_v1` has latched too. Until then relays are chosen exactly as
+before.
+
+`relay_health_v1` is mandatory and replication-gated, like
+`failover_scope_v1`, with no flag: a flag would let one node elect a different
+relay set from its peers. A demotion withholds the relay role only, so the
+stand-down is healing the link; the host is restored after 10 minutes with no
+failing observer. A binary rolled back below the latched token enters WAL
+quarantine, as below every latched token. Roll forward.
+
 ### Replica matching while the roll is in progress
 
 An upgraded host matches replicas by record and, for a file with no record,

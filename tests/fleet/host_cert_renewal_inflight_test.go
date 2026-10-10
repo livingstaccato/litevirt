@@ -112,45 +112,11 @@ func TestFleet_RenewalMidColdMigrationLetsItFinish(t *testing.T) {
 	withOperatorPKI(t, dst)
 	stopWatches := runCertWatches(c)
 	defer stopWatches()
-	prevCert, err := pki.ServedHostCertificate(src.PKIDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	prev := strings.ToLower(prevCert.SerialNumber.Text(16))
-
 	var renewErr error
 	renewed := false
 	renewMid := func() {
-		rctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-		defer cancel()
-		if err := cli.RenewHostCertOn(rctx, c.SelfClient(dst), &cli.LocalRemotePKI{Dir: src.PKIDir},
-			cli.GRPCProbe(src.Address, src.Port), src.Name,
-			cli.RenewCertOptions{Wait: 20 * time.Second, RevokeOld: true}); err != nil {
-			renewErr = err
-			return
-		}
-		// node-0's replicator pushes with its renewed certificate (its serial
-		// was just re-recorded): that handshake is how node-1 learns the
-		// CA-signed successor of the certificate it is streaming from.
-		if err := pushAs(t, src.PKIDir, src.Name, dst); err != nil {
-			renewErr = err
-			return
-		}
-		deadline := time.Now().Add(convergeTimeout)
-		for !revokedOn(src, prev) || !revokedOn(dst, prev) {
-			// Each node installs the published CRL, as its 30 s loop does.
-			for _, n := range []*Node{src, dst} {
-				_, _ = corrosion.SyncClusterCRL(ctx, n.DB, n.PKIDir)
-			}
-			if time.Now().After(deadline) {
-				renewErr = context.DeadlineExceeded
-				return
-			}
-			time.Sleep(50 * time.Millisecond)
-		}
-		dst.SweepConnections(ctx)
-		src.SweepConnections(ctx)
-		renewed = true
+		renewErr = renewRevokeAndSweep(ctx, t, c, src, dst)
+		renewed = renewErr == nil
 	}
 	dst.HookStream("ReceiveMigrationDisk", func(srv any, ss grpc.ServerStream, h grpc.StreamHandler) error {
 		// The header, then the first data frame: the copy is under way.
@@ -193,5 +159,101 @@ func TestFleet_RenewalMidColdMigrationLetsItFinish(t *testing.T) {
 	vm, err := corrosion.GetVM(ctx, dst.DB, "os1")
 	if err != nil || vm == nil || vm.HostName != dst.Name {
 		t.Fatalf("VM row after the migration: %+v %v, want it on %s", vm, err, dst.Name)
+	}
+}
+
+// renewRevokeAndSweep runs `lv host renew-cert <target> --revoke-old` against
+// via, lets via learn the successor the way target's replicator would (a push
+// with the renewed certificate), waits for the replaced certificate to be
+// revoked on every node, and sweeps every node's connection tracker. It is
+// called from inside a server handler, so it returns errors rather than
+// failing the test.
+func renewRevokeAndSweep(ctx context.Context, t *testing.T, c *Cluster, target, via *Node) error {
+	prevCert, err := pki.ServedHostCertificate(target.PKIDir)
+	if err != nil {
+		return err
+	}
+	prev := strings.ToLower(prevCert.SerialNumber.Text(16))
+	rctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	if err := cli.RenewHostCertOn(rctx, c.SelfClient(via), &cli.LocalRemotePKI{Dir: target.PKIDir},
+		cli.GRPCProbe(target.Address, target.Port), target.Name,
+		cli.RenewCertOptions{Wait: 20 * time.Second, RevokeOld: true}); err != nil {
+		return err
+	}
+	// target's replicator pushes with its renewed certificate (its serial was
+	// just re-recorded): that handshake is how via learns the CA-signed
+	// successor of the certificate it is streaming from.
+	if err := pushAs(t, target.PKIDir, target.Name, via); err != nil {
+		return err
+	}
+	deadline := time.Now().Add(convergeTimeout)
+	for {
+		done := true
+		for _, n := range c.Nodes {
+			// Each node installs the published CRL, as its 30 s loop does.
+			_, _ = corrosion.SyncClusterCRL(ctx, n.DB, n.PKIDir)
+			done = done && revokedOn(n, prev)
+		}
+		if done {
+			break
+		}
+		if time.Now().After(deadline) {
+			return context.DeadlineExceeded
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	for _, n := range c.Nodes {
+		n.SweepConnections(ctx)
+	}
+	return nil
+}
+
+// TestFleet_RenewalMidContainerMigrateLetsItLand is re-review 4's L1. A
+// container cold migrate pushes the rootfs to the target (PushBackup) and
+// then drives the target's RestoreContainer. While the target is receiving
+// the push, node-0 (the source) renews with its replaced certificate revoked
+// at once, and both trackers sweep. The push drains and finishes; the restore
+// goes over a FRESH connection with the renewed certificate, and the
+// container lands on the target with its bytes.
+//
+// Mutation: drive RestoreContainer on the push's connection (the pre-fix
+// drivePeerRestore) — the restore is refused on the draining connection, and
+// the container does not land.
+func TestFleet_RenewalMidContainerMigrateLetsItLand(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 2, SharedCRDT: true, ConnTracking: true})
+	src, dst := c.Nodes[0], c.Nodes[1]
+	const name = "ct-renew"
+	createContainer(t, c, src, name)
+	const payload = "rootfs-bytes-pushed-while-node-0-renewed"
+	src.CT.Seed(name, payload)
+
+	withOperatorPKI(t, dst)
+	stopWatches := runCertWatches(c)
+	defer stopWatches()
+	var renewErr error
+	renewed := false
+	dst.HookStream("PushBackup", func(srv any, ss grpc.ServerStream, h grpc.StreamHandler) error {
+		return h(srv, &midStream{ServerStream: ss, after: 1, fn: func() {
+			renewErr = renewRevokeAndSweep(ctx, t, c, src, dst)
+			renewed = renewErr == nil
+		}})
+	})
+	migErr := runMigrate(t, c, src, dst, name, stagingRepo(t))
+	if renewErr != nil {
+		t.Fatalf("the renewal in the middle of the push failed: %v", renewErr)
+	}
+	if !renewed {
+		t.Fatal("fixture: the renewal never ran during the push")
+	}
+	if migErr != nil {
+		t.Fatalf("a container migrate whose push was in flight when node-0's replaced certificate was revoked failed: %v", migErr)
+	}
+	if got := dst.CT.Payload(name); got != payload {
+		t.Fatalf("target rootfs payload = %q, want %q", got, payload)
+	}
+	if rec, err := corrosion.GetContainer(ctx, dst.DB, dst.Name, name); err != nil || rec == nil {
+		t.Fatalf("target row after migrate: rec=%v err=%v", rec, err)
 	}
 }

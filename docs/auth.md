@@ -442,7 +442,9 @@ could read as a failure:
    certificate with a standing CA-issued successor was revoked because it was
    renewed, and its connections drain the same way. A cold-disk migration
    opens a fresh connection for each disk, so one renewed mid-copy finishes
-   the disk in flight and copies the rest with the renewed certificate.
+   the disk in flight and copies the rest with the renewed certificate; a
+   container migrate or failover relocate likewise drives the target's
+   restore over a fresh connection once its rootfs push has finished.
    A certificate revoked with **no** successor — `lv host rm`, `lv host
    revoke-cert` of a live identity — is the emergency path: a connection made
    with it (or on which the host served it) refuses its next RPC and is closed

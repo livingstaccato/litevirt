@@ -36,6 +36,9 @@ func windowOverlay(t *testing.T, disk string) {
 	if out, err := exec.Command("qemu-io", "-f", "qcow2", "-c", "write -P 0x5a 65536 65536", pitoverlay.Path(disk)).CombinedOutput(); err != nil {
 		t.Fatalf("write into the overlay: %v %s", err, out)
 	}
+	if err := pitoverlay.Bind(disk, pitoverlay.Owner{VM: "web", Disk: "root"}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func holdsTheWindowsWrite(t *testing.T, qcow string) bool {
@@ -90,7 +93,7 @@ func TestHeal_ActiveDomainOnItsDiskSetsTheOverlayAside(t *testing.T) {
 	if err := runRepl(t, s, time.Now()); err != nil {
 		t.Fatalf("RunReplication: %v", err)
 	}
-	aside, _ := filepath.Glob(pitoverlay.Path(live) + ".orphan-*")
+	aside, _ := filepath.Glob(pitoverlay.Path(live) + ".orphan-*[0-9]")
 	if len(aside) != 1 {
 		t.Fatalf("set-aside copies %v, want the overlay kept under a new name", aside)
 	}
@@ -187,7 +190,7 @@ func TestSweepPITOverlays_SettlesAWindowADeadDaemonLeft(t *testing.T) {
 	s.virt.(*libvirtfake.Fake).SetState("web", libvirtfake.StateShutdown)
 	windowOverlay(t, live)
 
-	s.SweepPITOverlays(context.Background())
+	s.SweepPITOverlays(context.Background(), func() (bool, string) { return true, "" })
 	if pitoverlay.Present(live) || !holdsTheWindowsWrite(t, live) {
 		t.Fatal("the sweep did not commit the overlay into the disk")
 	}

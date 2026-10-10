@@ -178,9 +178,15 @@ func commitDiskOverlay(v pitAPI, domain, diskPath, overlay, diskFormat string) e
 // activeCommitAndPivot commits dev's active layer down into diskPath and
 // pivots, resuming a commit job already there.
 func activeCommitAndPivot(v pitAPI, dom golibvirt.Domain, dev, diskPath string) error {
-	found, _, _, _, _, err := v.DomainGetBlockJobInfo(dom, dev, 0)
+	found, typ, _, _, _, err := v.DomainGetBlockJobInfo(dom, dev, 0)
 	if err != nil {
 		return fmt.Errorf("block job of %s: %w", dev, err)
+	}
+	// Only an active commit is ours to resume. Any other job on the disk —
+	// a copy a live move left behind, say — is not touched: pivoting it
+	// would move the disk where nothing records.
+	if found != 0 && golibvirt.DomainBlockJobType(typ) != golibvirt.DomainBlockJobTypeActiveCommit {
+		return fmt.Errorf("disk %s has another block job (type %d) running; it is not ours and is left alone", dev, typ)
 	}
 	if found == 0 {
 		if err := v.DomainBlockCommit(dom, dev, golibvirt.OptString{diskPath}, golibvirt.OptString{}, 0,

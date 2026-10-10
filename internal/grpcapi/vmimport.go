@@ -270,6 +270,12 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 		writes.converting = func(n uint64) error {
 			return space.reserve(poolDir, n, "converting disk "+diskName)
 		}
+		// An overlay left beside the new disk's path (a disk once there) can
+		// never belong to the imported contents: set it aside, never commit it.
+		if err := s.setAsideStaleOverlay(ctx, name, d.Name, dst); err != nil {
+			cleanupDisks()
+			return status.Error(codes.FailedPrecondition, err.Error())
+		}
 		if err := convertForeignDisk(ctx, d.LocalPath, d.Format, dst, importDir, importSourceLimit(d.CapacityBytes), func(pct float32) {
 			select {
 			case progress <- &pb.ImportVMProgress{Phase: "convert", ConvertPct: pct, CurrentDisk: curDisk}:

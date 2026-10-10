@@ -126,7 +126,7 @@ func TestFleet_NotPointInTimeReplicaIsMarkedAcrossHostsAndHeld(t *testing.T) {
 // windowOverlay leaves, beside disk, the overlay of a layer-2 copy whose host
 // died mid-window: a real qcow2 backed by the disk, holding a write (0x5a over
 // 64 KiB at 64 KiB) the disk lacks.
-func windowOverlay(t *testing.T, disk string) {
+func windowOverlay(t *testing.T, disk string, owner pitoverlay.Owner) {
 	t.Helper()
 	if _, err := exec.LookPath("qemu-io"); err != nil {
 		t.Skip("qemu-io not on PATH")
@@ -136,6 +136,9 @@ func windowOverlay(t *testing.T, disk string) {
 	}
 	if out, err := exec.Command("qemu-io", "-f", "qcow2", "-c", "write -P 0x5a 65536 65536", pitoverlay.Path(disk)).CombinedOutput(); err != nil {
 		t.Fatalf("write into the overlay: %v %s", err, out)
+	}
+	if err := pitoverlay.Bind(disk, owner); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -169,7 +172,7 @@ func TestFleet_FailoverMidWindowKeepsTheWindowsWrites(t *testing.T) {
 	if err := qcow2.Create(disk, 1<<20, nil); err != nil {
 		t.Fatal(err)
 	}
-	windowOverlay(t, disk)
+	windowOverlay(t, disk, pitoverlay.Owner{VM: "pw1", Disk: "root"})
 	if err := corrosion.InsertVM(ctx, coord.DB, corrosion.VMRecord{
 		Name: "pw1", HostName: victim.Name, State: "running", CPUActual: 1, MemActual: 256,
 		Spec: `{"name":"pw1","cpu":1,"memory_mib":256,"on_host_failure":"restart-any","placement":{"host":"` + target.Name + `"}}`,
@@ -323,5 +326,51 @@ func TestFleet_AHeldPromotionStaysDownAndItsCommandWorks(t *testing.T) {
 	}
 	if !replicaHost.Virt.DomainExists("hw") {
 		t.Errorf("hw was not promoted on %s by the printed command", replicaHost.Name)
+	}
+}
+
+// N1(c) of the #256 review, multi-node: the overlay a dead host left is NOT
+// committed when the base has been written since — as when a host that knows
+// nothing of overlays restarted the VM on the base mid-roll. The target's
+// define sets it aside and keeps the newer base.
+//
+// Mutation "binding ignored": pitoverlay.Check accepts any sidecar — red.
+func TestFleet_AnOverlayIsNeverCommittedOverABaseWrittenSince(t *testing.T) {
+	c := New(t, Options{Nodes: 3, SharedCRDT: true})
+	ctx := context.Background()
+	target, victim, coord := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	shared := filepath.Join(c.tmpRoot, "nfs")
+	if err := os.MkdirAll(shared, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	disk := filepath.Join(shared, "pw2-root.qcow2")
+	if err := qcow2.Create(disk, 1<<20, nil); err != nil {
+		t.Fatal(err)
+	}
+	windowOverlay(t, disk, pitoverlay.Owner{VM: "pw2", Disk: "root"})
+	time.Sleep(10 * time.Millisecond)
+	if out, err := exec.Command("qemu-io", "-f", "qcow2", "-c", "write -P 0x33 65536 65536", disk).CombinedOutput(); err != nil {
+		t.Fatalf("write the base: %v %s", err, out)
+	}
+	if err := corrosion.InsertVM(ctx, coord.DB, corrosion.VMRecord{
+		Name: "pw2", HostName: victim.Name, State: "running", CPUActual: 1, MemActual: 256,
+		Spec: `{"name":"pw2","cpu":1,"memory_mib":256,"on_host_failure":"restart-any","placement":{"host":"` + target.Name + `"}}`,
+	}, nil, []corrosion.DiskRecord{{
+		VMName: "pw2", DiskName: "root", HostName: victim.Name, Path: disk,
+		SizeBytes: 1 << 20, StorageType: "nfs", StorageVolume: "nfs", TargetDev: "vda",
+	}}); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	if got := fenceVictim(t, c, coord, victim, target, coord); got != 1 {
+		t.Fatalf("fencer fired %d times, want 1", got)
+	}
+	rec := health.NewReconciler(target.Name, filepath.Join(c.tmpRoot, target.Name, "data"), target.DB, target.Virt)
+	rec.ReconcileOnce(ctx)
+
+	if diskHoldsTheWindow(t, disk) {
+		t.Fatal("the stale overlay was committed over the base written since")
+	}
+	if aside, _ := filepath.Glob(pitoverlay.Path(disk) + ".orphan-*"); len(aside) == 0 {
+		t.Fatal("the stale overlay was not kept")
 	}
 }

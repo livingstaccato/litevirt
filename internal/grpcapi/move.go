@@ -23,6 +23,7 @@ import (
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/libvirt"
+	"github.com/litevirt/litevirt/internal/pitoverlay"
 	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/storage"
 )
@@ -576,7 +577,16 @@ func (s *Server) deleteDiskAtRecordedLocation(ctx context.Context, d *corrosion.
 	if err != nil {
 		return fmt.Errorf("construct %s driver: %w", cfg.Driver, err)
 	}
-	return drv.DeleteDisk(ctx, d.Path)
+	if err := drv.DeleteDisk(ctx, d.Path); err != nil {
+		return err
+	}
+	// The disk's data is destroyed by intent: a point-in-time overlay of it
+	// (and its binding) goes with it, so a disk re-created at this path never
+	// meets it. One already set aside (.orphan-*) is kept.
+	if err := pitoverlay.Remove(s.hostDiskFile(d.Path)); err != nil {
+		slog.Warn("delete: point-in-time overlay of a deleted disk not removed", "disk", d.Path, "error", err)
+	}
+	return nil
 }
 
 // diskPathReferencedByOtherVM reports whether a disk's path is still in use by a

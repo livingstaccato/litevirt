@@ -130,6 +130,10 @@ func (r *Reconciler) defineRekeyedStoppedVM(ctx context.Context, vm corrosion.VM
 		r.noteRekeyOnce(vm.Name, "its domain cannot be built: "+failure)
 		return
 	}
+	if failure := r.settlePITOverlays(ctx, *fresh, spec, diskConfigs); failure != "" {
+		r.noteRekeyOnce(vm.Name, failure)
+		return
+	}
 	if r.virt.DomainExists(vm.Name) {
 		// Replace, never trust: a leftover may name an old disk set.
 		r.virt.UndefineDomainPreservingState(vm.Name)

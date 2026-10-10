@@ -24,6 +24,7 @@ import (
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/pitoverlay"
+	"github.com/litevirt/litevirt/internal/randid"
 )
 
 const reconcileInterval = 15 * time.Second
@@ -109,6 +110,7 @@ type Reconciler struct {
 	// settleVerify / settleProofs are Layer 3 of partition pause (settle.go):
 	// the certificate check and the proof source. nil verifier settles nothing.
 	settleVerify SettleVerifier
+	pitReport    func(ctx context.Context, vm, detail string)
 	settleProofs func(ctx context.Context, c *corrosion.Client, kind, name string) ([]corrosion.ProofRecord, error)
 	// settleDeclines rate-limits the decline report (settle_declined.go).
 	settleDeclines   settleDeclineTracker
@@ -1629,6 +1631,14 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		}
 	}
 
+	// After the start checkpoint (a host that abandoned the proof has
+	// returned above): settle any point-in-time overlay into the disk before
+	// the domain is defined on it.
+	if failure := r.settlePITOverlays(ctx, vm, spec, diskConfigs); failure != "" {
+		r.failPendingStart(ctx, vm.Name, proofID, true, failure)
+		return
+	}
+
 	// Define and start the domain.
 	if err := r.virt.DefineDomain(domXML); err != nil {
 		slog.Error("reconciler: define domain", "vm", vm.Name, "error", err)
@@ -1715,26 +1725,52 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 // the disk configs the caller resolved: the cloud-init ISO, the networks
 // (provisioned here), firmware and resources. On failure it returns "" with
 // whether a later attempt may succeed and what failed.
-func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, spec *pb.VMSpec, diskConfigs []lv.DiskConfig) (domXML string, retryable bool, failure string) {
-	// A point-in-time copy's overlay (pitoverlay) holds the guest's newest
-	// writes when a copy's commit failed or its host died mid-window — on a
-	// shared pool it travels here with the disk. The definition built below
-	// names only the disk, so commit the overlay into it first (offline, no
-	// -U: a qemu still holding it fails this closed) and never start without
-	// it. Nothing replicated records an overlay; its fixed name beside the
-	// disk is what finds it.
+// SetPITOverlayReporter wires the event and notification of a point-in-time
+// overlay the define path set aside (grpcapi.Server.ReportPITOverlaySetAside).
+func (r *Reconciler) SetPITOverlayReporter(fn func(ctx context.Context, vm, detail string)) {
+	r.pitReport = fn
+}
+
+// settlePITOverlays settles each disk's point-in-time copy overlay
+// (pitoverlay) before the domain is defined on the disk: a copy whose commit
+// failed, or whose host died mid-window, left the guest's newest writes in it
+// — on a shared pool it travels here with the disk — and the definition names
+// only the disk. An overlay bound to this VM's disk as the file is now is
+// committed offline (no -U: a qemu still holding it fails this closed);
+// any other — another VM's, or one the disk was written past — is set aside,
+// kept and reported, never committed over newer data. Nothing replicated
+// records an overlay; its fixed name beside the disk is what finds it. A
+// failure is the start's failure, retried.
+func (r *Reconciler) settlePITOverlays(ctx context.Context, vm corrosion.VMRecord, spec *pb.VMSpec, diskConfigs []lv.DiskConfig) string {
 	for _, dc := range diskConfigs {
-		had, err := pitoverlay.Settle(ctx, dc.Path)
-		if err != nil {
+		owner := pitoverlay.Owner{VM: vm.Name, VMUUID: spec.GetUuid(), Disk: dc.Name}
+		out, aside, err := pitoverlay.Settle(ctx, dc.Path, owner, time.Now().UTC().Format("20060102-150405"))
+		switch {
+		case err != nil:
 			slog.Error("reconciler: a point-in-time overlay holds writes the disk lacks and could not be committed; not defining the VM",
 				"vm", vm.Name, "disk", dc.Name, "overlay", pitoverlay.Path(dc.Path), "error", err)
-			return "", true, fmt.Sprintf("disk %s: commit its point-in-time overlay %s: %v", dc.Name, pitoverlay.Path(dc.Path), err)
-		}
-		if had {
+			return fmt.Sprintf("disk %s: commit its point-in-time overlay %s: %v", dc.Name, pitoverlay.Path(dc.Path), err)
+		case out == pitoverlay.Committed:
 			slog.Warn("reconciler: committed a point-in-time overlay into the disk before defining the VM",
 				"vm", vm.Name, "disk", dc.Name, "overlay", pitoverlay.Path(dc.Path))
+		case out == pitoverlay.SetAsideO:
+			detail := fmt.Sprintf("%s: the point-in-time overlay %s does not belong to %s as it is now, so it was not committed (that could write stale blocks over newer data); it was kept as %s for an operator to inspect",
+				dc.Name, pitoverlay.Path(dc.Path), dc.Path, aside)
+			if r.pitReport != nil {
+				r.pitReport(ctx, vm.Name, detail)
+			} else {
+				slog.Error("reconciler: "+detail, "vm", vm.Name)
+				_ = corrosion.InsertVMEvent(ctx, r.db, corrosion.VMEventRecord{
+					ID: randid.New(), VMName: vm.Name, HostName: r.hostName, Type: "disk.pit_overlay_set_aside",
+					Result: "error", Severity: "error", Detail: detail, Username: "reconciler",
+				})
+			}
 		}
 	}
+	return ""
+}
+
+func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, spec *pb.VMSpec, diskConfigs []lv.DiskConfig) (domXML string, retryable bool, failure string) {
 	// Check for cloud-init ISO. The reconciler acts on a stored (possibly
 	// peer-replicated) row, so build the ISO path through the validated builder
 	// — a malformed vm.Name must not escape the cloudinit dir.

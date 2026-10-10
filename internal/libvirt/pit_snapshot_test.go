@@ -15,9 +15,10 @@ type pitModel struct {
 	backing        map[string]string // dev → backing file of the inactive entry (libvirt's post-snapshot form)
 	state          golibvirt.DomainState
 	agent          bool // a guest agent answers quiesce
-	jobRunning     bool // a commit job is already on vda (a dead daemon started it)
-	pivotFails     int  // the next pivots that fail
-	aborts         int  // job aborts without pivot
+	jobRunning     bool // a job is already on vda (a dead daemon started it)
+	jobType        golibvirt.DomainBlockJobType
+	pivotFails     int // the next pivots that fail
+	aborts         int // job aborts without pivot
 	snapFlags      []uint32
 	snapXML        string
 	commits        []string
@@ -34,6 +35,7 @@ func newPITModel() *pitModel {
 		inactive: map[string]string{"vda": "/pool/web-root.qcow2", "vdb": "/pool/web-data.qcow2"},
 		backing:  map[string]string{},
 		state:    golibvirt.DomainRunning,
+		jobType:  golibvirt.DomainBlockJobTypeActiveCommit,
 	}
 }
 
@@ -97,7 +99,7 @@ func (m *pitModel) DomainGetBlockJobInfo(golibvirt.Domain, string, uint32) (int3
 	if !m.jobRunning && len(m.commits) == 0 {
 		return 0, 0, 0, 0, 0, nil
 	}
-	return 1, 0, 0, 10, 10, nil
+	return 1, int32(m.jobType), 0, 10, 10, nil
 }
 func (m *pitModel) DomainBlockJobAbort(_ golibvirt.Domain, dev string, flags golibvirt.DomainBlockJobAbortFlags) error {
 	if flags&golibvirt.DomainBlockJobAbortPivot == 0 {
@@ -300,5 +302,23 @@ func TestPITCommit_InactiveDomainOnlyRepairsTheDefinition(t *testing.T) {
 	}
 	if m.inactive["vda"] != "/pool/web-root.qcow2" || strings.Contains(m.defined, "<backingStore") {
 		t.Errorf("persistent entry not repaired: %s", m.defined)
+	}
+}
+
+// Another kind of job on the disk (a copy a live move left) is never resumed
+// or pivoted as if it were the commit.
+//
+// Mutation "resume any job": activeCommitAndPivot ignores the job type — red.
+func TestPITCommit_NeverTouchesAnotherKindOfJob(t *testing.T) {
+	m := newPITModel()
+	if _, err := snapshotDiskExternal(m, "web", "/pool/web-root.qcow2", "/pool/ov"); err != nil {
+		t.Fatal(err)
+	}
+	m.jobRunning, m.jobType = true, golibvirt.DomainBlockJobTypeCopy
+	if err := commitDiskOverlay(m, "web", "/pool/web-root.qcow2", "/pool/ov", "qcow2"); err == nil {
+		t.Fatal("a commit ran over another kind of block job")
+	}
+	if m.pivots != 0 || m.aborts != 0 || len(m.commits) != 0 {
+		t.Errorf("pivots %d aborts %d commits %v: the other job was touched", m.pivots, m.aborts, m.commits)
 	}
 }

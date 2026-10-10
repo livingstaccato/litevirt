@@ -925,6 +925,9 @@ func (n *Node) blocked(fullMethod string, ctx context.Context) bool {
 	if n.claimBlocked(fullMethod, peerCertCN(ctx)) {
 		return true
 	}
+	if n.readyBlocked(fullMethod, peerCertCN(ctx)) {
+		return true
+	}
 	if !partitionedMethods[methodName(fullMethod)] {
 		return false
 	}

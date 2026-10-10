@@ -37,6 +37,8 @@ type Server struct {
 	hostName string
 	// replicationTargets is handed to the collector; see SetReplicationTargets.
 	replicationTargets func() []string
+	// relayRoles is handed to the collector; see SetRelayRoles.
+	relayRoles func() map[string]bool
 	// mu guards httpSrv and stopped. Start assigns httpSrv from whatever
 	// goroutine the daemon launches it on (`go d.metrics.Start()`), and Stop
 	// runs on the shutdown path — so the two race, and an unsynchronised Stop
@@ -90,6 +92,12 @@ func (s *Server) Addr() string {
 // acknowledging. Call before Start.
 func (s *Server) SetReplicationTargets(targets func() []string) {
 	s.replicationTargets = targets
+}
+
+// SetRelayRoles tells the collector the replicator's current relay election,
+// for litevirt_relay_role. Call before Start.
+func (s *Server) SetRelayRoles(roles func() map[string]bool) {
+	s.relayRoles = roles
 }
 
 // NewServer creates a metrics server. bindAddr is the interface to listen on
@@ -146,6 +154,7 @@ func (s *Server) newHTTPServer() *http.Server {
 func (s *Server) Start() {
 	collector := newCollector(s.db, s.virt, s.ctStat, s.hostName)
 	collector.replicationTargets = s.replicationTargets
+	collector.relayRoles = s.relayRoles
 	s.registerer().MustRegister(collector)
 	registerTelemetryMetrics()
 
@@ -300,6 +309,9 @@ type collector struct {
 	// now. Nil when not wired; the backlog gauges then fall back to watermark
 	// rows updated within LiveWatermarkWindow.
 	replicationTargets func() []string
+	// relayRoles is the replicator's current relay election (host → relay?).
+	// Nil when not wired; litevirt_relay_role is then not reported.
+	relayRoles func() map[string]bool
 
 	hostVMCount    *prometheus.Desc
 	hostCPUTotal   *prometheus.Desc
@@ -335,6 +347,9 @@ type collector struct {
 	replicationMinSeq  *prometheus.Desc // MIN(last_seq) across replication_watermarks
 	replicationPending *prometheus.Desc // entries ahead of the slowest LIVE peer
 	replicationAge     *prometheus.Desc // seconds the oldest un-acked entry has waited
+	relayRole          *prometheus.Desc // this node's relay election: 1 relay, 0 leaf, per member
+	relayDemoted       *prometheus.Desc // 1 per host the replicated rows say is demoted from relay duty
+	relayHold          *prometheus.Desc // seconds left on each operator relay hold
 	replicationPeerLag *prometheus.Desc // per-peer backlog: MAX(seq) - peer last_seq
 
 	// NetBox IPAM gauges. Both are CURRENT state, which the NetBox counters
@@ -507,6 +522,21 @@ func newCollector(db *corrosion.Client, virt *libvirt.Client, ctStat containerSt
 			"Seconds the oldest mutation_log entry not yet acked by the slowest LIVE peer has been waiting on this node; 0 when caught up or when there are no live peers",
 			nil, prometheus.Labels{"host": hostName},
 		),
+		relayRole: prometheus.NewDesc(
+			"litevirt_relay_role",
+			"This node's relay election, one series per member: 1 when the member is a relay, 0 when it is a leaf. Every node elects from replicated state, so the series agree across nodes; a host demoted for failing probes reads 0 everywhere",
+			[]string{"member"}, prometheus.Labels{"host": hostName},
+		),
+		relayDemoted: prometheus.NewDesc(
+			"litevirt_relay_demoted",
+			"1 for each host the failover lease holder has demoted from relay duty for failing probes, as this node's replica holds the relay_demoted rows. Absent for a host that is not demoted. Clear one with lv cluster relay-restore",
+			[]string{"member"}, prometheus.Labels{"host": hostName},
+		),
+		relayHold: prometheus.NewDesc(
+			"litevirt_relay_hold_seconds",
+			"Seconds left on each operator relay hold (lv cluster relay-restore --hold): the lease holder will not demote that host until it runs out. Absent for a host with no hold in force",
+			[]string{"member"}, prometheus.Labels{"host": hostName},
+		),
 		replicationPeerLag: prometheus.NewDesc(
 			"litevirt_replication_peer_pending_entries",
 			"Per-peer replication backlog: local mutation_log tail (MAX(seq)) minus the peer's acknowledged last_seq. One series per live peer; a single climbing series identifies the lagging peer",
@@ -577,6 +607,9 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.replicationMinSeq
 	ch <- c.replicationPending
 	ch <- c.replicationAge
+	ch <- c.relayRole
+	ch <- c.relayDemoted
+	ch <- c.relayHold
 	ch <- c.replicationPeerLag
 	ch <- c.netboxSyncQueueDepth
 	ch <- c.netboxBindingsSuspended
@@ -834,6 +867,35 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 		}
 	}
 	ch <- prometheus.MustNewConstMetric(c.replicationAge, prometheus.GaugeValue, age)
+
+	// Relay demotions and operator holds, from the replicated rows
+	// (colonelpanik/litevirt#175). A read error reports neither.
+	if demoted, derr := corrosion.ListRelayDemotions(ctx, c.db); derr == nil {
+		for member := range demoted {
+			ch <- prometheus.MustNewConstMetric(c.relayDemoted, prometheus.GaugeValue, 1, member)
+		}
+	}
+	if holds, herr := corrosion.ListRelayHolds(ctx, c.db); herr == nil {
+		now := time.Now()
+		for member, h := range holds {
+			if !h.Active(now) {
+				continue
+			}
+			until, _ := time.Parse(time.RFC3339, h.Until)
+			ch <- prometheus.MustNewConstMetric(c.relayHold, prometheus.GaugeValue, until.Sub(now).Seconds(), member)
+		}
+	}
+
+	// The relay election as this node computed it (colonelpanik/litevirt#175).
+	if c.relayRoles != nil {
+		for member, relay := range c.relayRoles() {
+			v := 0.0
+			if relay {
+				v = 1
+			}
+			ch <- prometheus.MustNewConstMetric(c.relayRole, prometheus.GaugeValue, v, member)
+		}
+	}
 
 	// Per-peer replication backlog: how far each peer this node serves is behind
 	// the local mutation_log tail, one series per replicationPeers entry. A peer

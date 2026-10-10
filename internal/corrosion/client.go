@@ -409,6 +409,12 @@ type Client struct {
 	// failover_scope_v1 latch. Fails CLOSED when unset: the table's shapes
 	// back-pressure a previous-release peer. See cluster_policy.go.
 	clusterPolicyGate atomic.Pointer[func() bool]
+	// relayHealthGate, when non-nil and returning true, permits writing the
+	// relay_demoted/<host> rows of cluster_policies. Injected via
+	// SetRelayHealthGate, wired to the durable relay_health_v1 latch. Fails
+	// CLOSED when unset: a previous-release peer ignores the key and would
+	// elect a different relay set. See relay_health.go.
+	relayHealthGate atomic.Pointer[func() bool]
 	// voterConfigGate, when set and returning true, permits WRITING
 	// voter_configs. Injected via SetVoterConfigGate, wired to the durable
 	// voter_config_v1 latch. Fails CLOSED when unset: that table's shapes

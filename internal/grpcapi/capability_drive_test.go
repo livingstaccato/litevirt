@@ -95,6 +95,10 @@ func TestDriveCapabilityActivation_FlagAwareBoundedDriver(t *testing.T) {
 		// recorded 'offline' and does not auto-activate such a host". The
 		// failover lease holder relies on whichever node holds it next.
 		capabilities.FenceStateV1: true,
+		// relay_health_v1: "this build reads the relay demotion rows when it
+		// elects relays". Every node relies on every other electing the same
+		// relay set.
+		capabilities.RelayHealthV1: true,
 	}
 
 	// Cross-check the hand-written list against the ONE declaration, so adding a

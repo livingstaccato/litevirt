@@ -31,6 +31,8 @@ func newFirewallCmd() *cobra.Command {
 		newFirewallHostRuleCmd(),
 		newFirewallIPSetCmd(),
 		newFirewallDefaultDenyCmd(),
+		newFirewallNICGuardCmd(),
+		newFirewallEnforceCmd(),
 	)
 	return cmd
 }
@@ -38,13 +40,18 @@ func newFirewallCmd() *cobra.Command {
 func newFirewallShowCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "show",
-		Short: "Print the current nftables ruleset for the litevirt-fw table",
+		Short: "Print the nftables rulesets litevirt manages on this host (litevirt-fw and litevirt-nic)",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			out, err := exec.CommandContext(cmd.Context(), "nft", "list", "table", "inet", firewall.TableName).CombinedOutput()
 			if err != nil {
 				return fmt.Errorf("nft list: %w: %s", err, string(out))
 			}
 			fmt.Print(string(out))
+			// The per-NIC table exists only while some NIC has a policy to
+			// enforce; its absence is not an error.
+			if nic, err := exec.CommandContext(cmd.Context(), "nft", "list", "table", "bridge", firewall.NICTableName).CombinedOutput(); err == nil {
+				fmt.Print(string(nic))
+			}
 			return nil
 		},
 	}

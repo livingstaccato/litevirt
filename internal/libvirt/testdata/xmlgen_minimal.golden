@@ -27,6 +27,7 @@
     <interface type="bridge">
       <mac address="52:54:00:11:22:33"></mac>
       <source bridge="br0"></source>
+      <target dev="lvt525400112233"></target>
       <model type="virtio"></model>
     </interface>
     <serial type="pty">

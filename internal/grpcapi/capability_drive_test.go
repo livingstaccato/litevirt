@@ -104,6 +104,10 @@ func TestDriveCapabilityActivation_FlagAwareBoundedDriver(t *testing.T) {
 		// when it latches; a feature is opened only through WithFeature,
 		// which records the use first.
 		capabilities.Release202611V1: true,
+		// firewall_ipv6_v1: "this build renders IPv6 firewall rules". An
+		// older renderer refuses its whole plan on one, so none is written
+		// until every host that receives them can render them.
+		capabilities.FirewallIPv6V1: true,
 	}
 
 	// Cross-check the hand-written list against the ONE declaration, so adding a

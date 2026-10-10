@@ -884,8 +884,21 @@ type NetworkAttachment struct {
 	Ipv6           string                 `protobuf:"bytes,7,opt,name=ipv6,proto3" json:"ipv6,omitempty"`
 	Ipv6Gateway    string                 `protobuf:"bytes,8,opt,name=ipv6_gateway,json=ipv6Gateway,proto3" json:"ipv6_gateway,omitempty"`
 	SecurityGroups []string               `protobuf:"bytes,9,rep,name=security_groups,json=securityGroups,proto3" json:"security_groups,omitempty"` // SG names bound to this NIC (distributed firewall)
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// NIC guard (anti-spoofing, docs/firewall.md). Applied when the NIC is
+	// created or hot-attached; change it later with SetNICGuard.
+	//
+	//	spoof_guard: "" = the default for a new NIC (on), "on", or "off".
+	//	allowed_addresses: extra source addresses/prefixes the guest may use
+	//	  beyond the ones litevirt assigns (VIPs, VRRP, static secondaries).
+	SpoofGuard               string   `protobuf:"bytes,10,opt,name=spoof_guard,json=spoofGuard,proto3" json:"spoof_guard,omitempty"`
+	AllowedAddresses         []string `protobuf:"bytes,11,rep,name=allowed_addresses,json=allowedAddresses,proto3" json:"allowed_addresses,omitempty"`
+	AllowDhcpServer          bool     `protobuf:"varint,12,opt,name=allow_dhcp_server,json=allowDhcpServer,proto3" json:"allow_dhcp_server,omitempty"`
+	AllowRouterAdvertisement bool     `protobuf:"varint,13,opt,name=allow_router_advertisement,json=allowRouterAdvertisement,proto3" json:"allow_router_advertisement,omitempty"`
+	// allow_vlan_tags: let the guest send 802.1Q / 802.1ad tagged frames (a
+	// trunk). Every other NIC's tagged frames are dropped.
+	AllowVlanTags bool `protobuf:"varint,14,opt,name=allow_vlan_tags,json=allowVlanTags,proto3" json:"allow_vlan_tags,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *NetworkAttachment) Reset() {
@@ -979,6 +992,41 @@ func (x *NetworkAttachment) GetSecurityGroups() []string {
 		return x.SecurityGroups
 	}
 	return nil
+}
+
+func (x *NetworkAttachment) GetSpoofGuard() string {
+	if x != nil {
+		return x.SpoofGuard
+	}
+	return ""
+}
+
+func (x *NetworkAttachment) GetAllowedAddresses() []string {
+	if x != nil {
+		return x.AllowedAddresses
+	}
+	return nil
+}
+
+func (x *NetworkAttachment) GetAllowDhcpServer() bool {
+	if x != nil {
+		return x.AllowDhcpServer
+	}
+	return false
+}
+
+func (x *NetworkAttachment) GetAllowRouterAdvertisement() bool {
+	if x != nil {
+		return x.AllowRouterAdvertisement
+	}
+	return false
+}
+
+func (x *NetworkAttachment) GetAllowVlanTags() bool {
+	if x != nil {
+		return x.AllowVlanTags
+	}
+	return false
 }
 
 type CloudInitSpec struct {
@@ -5858,7 +5906,7 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\x05cache\x18\x04 \x01(\tR\x05cache\x12\x14\n" +
 	"\x05image\x18\x05 \x01(\tR\x05image\x12\x18\n" +
 	"\astorage\x18\x06 \x01(\tR\astorage\x12)\n" +
-	"\x10controller_model\x18\a \x01(\tR\x0fcontrollerModel\"\xef\x01\n" +
+	"\x10controller_model\x18\a \x01(\tR\x0fcontrollerModel\"\xcf\x03\n" +
 	"\x11NetworkAttachment\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x14\n" +
 	"\x05model\x18\x02 \x01(\tR\x05model\x12\x0e\n" +
@@ -5868,7 +5916,14 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\x05trunk\x18\x06 \x03(\x05R\x05trunk\x12\x12\n" +
 	"\x04ipv6\x18\a \x01(\tR\x04ipv6\x12!\n" +
 	"\fipv6_gateway\x18\b \x01(\tR\vipv6Gateway\x12'\n" +
-	"\x0fsecurity_groups\x18\t \x03(\tR\x0esecurityGroups\"m\n" +
+	"\x0fsecurity_groups\x18\t \x03(\tR\x0esecurityGroups\x12\x1f\n" +
+	"\vspoof_guard\x18\n" +
+	" \x01(\tR\n" +
+	"spoofGuard\x12+\n" +
+	"\x11allowed_addresses\x18\v \x03(\tR\x10allowedAddresses\x12*\n" +
+	"\x11allow_dhcp_server\x18\f \x01(\bR\x0fallowDhcpServer\x12<\n" +
+	"\x1aallow_router_advertisement\x18\r \x01(\bR\x18allowRouterAdvertisement\x12&\n" +
+	"\x0fallow_vlan_tags\x18\x0e \x01(\bR\rallowVlanTags\"m\n" +
 	"\rCloudInitSpec\x12\x1a\n" +
 	"\buserdata\x18\x01 \x01(\tR\buserdata\x12\x1a\n" +
 	"\bmetadata\x18\x02 \x01(\tR\bmetadata\x12$\n" +

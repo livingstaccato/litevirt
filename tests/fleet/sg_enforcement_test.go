@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -34,6 +35,7 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/firewall"
 	"github.com/litevirt/litevirt/internal/image"
+	"github.com/litevirt/litevirt/internal/nictap"
 	"github.com/litevirt/litevirt/internal/qcow2"
 )
 
@@ -50,6 +52,13 @@ func sgCluster(t *testing.T) *Cluster {
 	c := New(t, Options{Nodes: 2, SharedCRDT: true})
 	for _, n := range c.Nodes {
 		n.Server.SetBridgeEnsure(n.Net.EnsureBridge)
+	}
+	// These scenarios pin what the rules DROP, so the cluster enforces them;
+	// with no policy recorded a cluster only observes (firewall_enforcement.go).
+	db := c.Nodes[0].DB
+	db.SetClusterPolicyGate(func() bool { return true })
+	if err := corrosion.SetFirewallEnforcement(context.Background(), db, corrosion.FirewallEnforce, "fleet"); err != nil {
+		t.Fatalf("enforce: %v", err)
 	}
 	return c
 }
@@ -76,19 +85,25 @@ func renderPlan(t *testing.T, p firewall.Plan) string {
 	return out
 }
 
-// nicChain returns the body of the per-NIC chain for tap in a rendered ruleset,
-// or "" when there is none.
+// nicChain returns the bodies of the per-NIC chains for tap in a rendered
+// ruleset — its ingress chain, then its egress chain — or "" when there are
+// none.
 func nicChain(rendered, tap string) string {
-	head := "chain nic_" + strings.NewReplacer("-", "_", ".", "_").Replace(tap) + " {\n"
-	i := strings.Index(rendered, head)
-	if i < 0 {
-		return ""
+	dev := strings.NewReplacer("-", "_", ".", "_").Replace(tap)
+	var out string
+	for _, prefix := range []string{"nic_in_", "nic_out_"} {
+		head := "chain " + prefix + dev + " {\n"
+		i := strings.Index(rendered, head)
+		if i < 0 {
+			continue
+		}
+		body := rendered[i+len(head):]
+		if j := strings.Index(body, "\n    }"); j >= 0 {
+			body = body[:j]
+		}
+		out += body
 	}
-	body := rendered[i+len(head):]
-	if j := strings.Index(body, "\n    }"); j >= 0 {
-		body = body[:j]
-	}
-	return body
+	return out
 }
 
 // mustCreateSG creates a security group with one ingress tcp accept on port,
@@ -155,6 +170,10 @@ func legacyGroups(t *testing.T, n *Node, vmName, netName string) []string {
 // TestFleet_SG_ChainFollowsTheTapAcrossARestart is the lab finding: create a VM
 // with a group, stop it, start it. libvirt gives the NIC a new vnetN, and the
 // chain has to be on that one.
+//
+// A NIC this build defines names its tap after its MAC (nictap), so its tap
+// no longer moves; the NIC here is made one an older build defined, with no
+// tap name in its definition, which still gets a new vnetN on every start.
 func TestFleet_SG_ChainFollowsTheTapAcrossARestart(t *testing.T) {
 	c := sgCluster(t)
 	ctx := context.Background()
@@ -173,9 +192,15 @@ func TestFleet_SG_ChainFollowsTheTapAcrossARestart(t *testing.T) {
 		t.Fatalf("control: before any restart, web's tap %s must carry the ssh rule; chain:\n%s", before, chain)
 	}
 
+	if before != nictap.Name(nic.MAC) {
+		t.Fatalf("a NIC this build defines must have the tap its MAC names (%s), got %s", nictap.Name(nic.MAC), before)
+	}
 	if _, err := c.SelfClient(host).StopVM(ctx, &pb.StopVMRequest{Name: "web", Force: true}); err != nil {
 		t.Fatalf("StopVM web: %v", err)
 	}
+	// An older build's definition: no tap name.
+	untarget := regexp.MustCompile(`<target dev="lvt[0-9a-f]+"></target>`)
+	host.Virt.SetInactiveXML("web", untarget.ReplaceAllString(host.Virt.DefinedXML("web"), ""))
 	if _, err := c.SelfClient(host).StartVM(ctx, &pb.StartVMRequest{Name: "web"}); err != nil {
 		t.Fatalf("StartVM web: %v", err)
 	}

@@ -34,6 +34,7 @@ package firewall
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/netip"
 	"sort"
 	"strings"
@@ -43,6 +44,28 @@ import (
 // emit lives here so `nft list table inet litevirt-fw` shows the entire
 // litevirt-managed surface.
 const TableName = "litevirt-fw"
+
+// NICTableName is the bridge-family table that enforces every per-NIC policy:
+// the NIC guards (anti-spoofing) and the per-NIC rules (cluster, host and
+// security-group tiers plus the default policy, applied to each NIC), and the
+// VLAN rule. It is loaded in its own transaction, before TableName (see
+// Applier.Apply), and its layout is described in nic_table.go.
+//
+// WHY THE BRIDGE FAMILY. A guest's tap is a port of a Linux bridge, so two
+// guests on one bridge talk at layer 2: their frames never reach the inet
+// forward hook, and with br_netfilter loaded that hook sees the bridge, not
+// the tap, as iif/oif. A rule matching the tap there never matches. The bridge
+// family's forward, input and output hooks see every frame a port sends or
+// receives, with the tap as iifname/oifname: guest to guest (forward), guest
+// to the host or to anything the host routes to (input), and the host or
+// routed traffic to the guest (output). It needs no br_netfilter. Replies are
+// recognised by nf_conntrack_bridge (BridgeConntrackAvailable); without it
+// only the guards are rendered (NICModeGuardsOnly).
+const NICTableName = "litevirt-nic"
+
+// ipv6SetSuffix names the ipv6_addr companion of a named ip set that holds
+// IPv6 elements: nft sets are typed, so one name cannot hold both families.
+const ipv6SetSuffix = "_v6"
 
 // Direction selects which side of a NIC a rule applies to. The
 // semantics match Proxmox / AWS / GCP / OpenStack:
@@ -153,6 +176,73 @@ type NICBinding struct {
 	VMName         string
 	SecurityGroups []string // SG names, resolved via Plan.SecurityGroups
 	ExtraRules     []Rule   // per-VM rules layered after SG rules
+
+	// Bridge is the bridge the NIC's device is a port of, when known. Routed
+	// traffic toward it is judged at that bridge's output hook (per NIC, or by
+	// the tiers for any other port) instead of in the inet forward chain.
+	Bridge string
+
+	// MAC is the NIC's MAC address, when known. It names the NIC in the
+	// observe-mode tally (WouldDropTally), which must outlive the tap name.
+	MAC string
+
+	// AllowVLANTags lets the guest send 802.1Q / 802.1ad tagged frames (an
+	// explicit trunk). Every other NIC's tagged frames are dropped: rules match
+	// untagged IP, so a tag would carry traffic past them.
+	AllowVLANTags bool
+
+	// TrunkVIDs are the VLANs of a NIC on litevirt's `trunk:` feature (two or
+	// more VLANs, configured on a vlan_filtering bridge port). Such a NIC
+	// carries single-tagged frames of exactly these VLANs, which its rules
+	// still judge (they match the inner packet); an 802.1ad or doubled tag,
+	// whose payload no rule can see, is refused like any other NIC's tag.
+	TrunkVIDs []int
+
+	// DHCPServer marks a NIC whose guest is allowed to answer DHCP: its
+	// replies reach other guests ahead of their ingress rules, as the host's
+	// dnsmasq replies do.
+	DHCPServer bool
+
+	// Guard, when non-nil, holds the NIC to its own identity on the wire:
+	// see NICGuard. nil leaves the NIC unguarded, as every NIC was before
+	// guards existed.
+	Guard *NICGuard
+}
+
+// NICGuard is a NIC's anti-spoofing policy, enforced in the bridge family at
+// prerouting so it sees every frame the guest sends — to another guest on the
+// same bridge, out the uplink, or to the host — before anything else does.
+//
+// A guarded NIC may only send frames from MAC, may not send VLAN-tagged frames
+// itself (their payload could not be checked), may not answer DHCP or send
+// router advertisements and redirects unless allowed, and may only claim its
+// own addresses in ARP and in neighbour advertisements.
+//
+// V4 and V6 restrict the source address of each family. nil means litevirt
+// knows no address space for that family on this NIC, and leaves its source
+// address unrestricted rather than cutting the guest off: a guest on a plain
+// bridge served by an upstream DHCP server or router has addresses nobody
+// told litevirt about. A restricted IPv6 family always allows link-local
+// sources and the unspecified address (duplicate address detection); a
+// restricted IPv4 family always lets a DHCP client ask for an address.
+type NICGuard struct {
+	MAC               string
+	V4                []string // addresses / prefixes; nil = unrestricted
+	V6                []string // addresses / prefixes; nil = unrestricted
+	AllowDHCPServer   bool
+	AllowRouterAdvert bool
+
+	// ExcludeV4 / ExcludeV6 are addresses the guest may never claim even
+	// inside an allowed prefix: the network's own addresses (network,
+	// broadcast, gateway) and every other NIC's assigned address on it. They
+	// matter when V4/V6 is a subnet rather than the NIC's exact address.
+	ExcludeV4 []string
+	ExcludeV6 []string
+
+	// LinkLocal are the IPv6 link-local addresses the guest may use besides
+	// the EUI-64 one derived from MAC (a guest with stable-privacy addresses
+	// lists its own here).
+	LinkLocal []string
 }
 
 // Plan is the input to the renderer — the *complete* desired state
@@ -181,14 +271,83 @@ type Plan struct {
 	// them in lockstep with the filter rules.
 	NAT           []NATRule
 	HostIsolation []IsolationChain
+
+	// NICMode is how per-NIC rules are applied: NICModeEnforce,
+	// NICModeObserve (count what would be dropped, drop nothing) or
+	// NICModeGuardsOnly (bridge conntrack is unavailable: only the guards and
+	// the VLAN rule, which need no connection tracking). "" is enforce.
+	NICMode string
+
+	// Gateways are the addresses of litevirt's own services on the guest
+	// networks — each managed network's gateway, where dnsmasq answers DHCP
+	// and DNS. Guests may always reach those services there, and the host may
+	// always answer from there.
+	Gateways []string
+
+	// LBBackends are the built-in load balancer's backend endpoints; the
+	// host's haproxy (proxied connections and health checks) may always reach
+	// them, from LBSources (the LB VIPs and the host's gateway addresses).
+	LBBackends []LBBackend
+	LBSources  []string
+
+	// BlockedTrunks are the trunk VLANs the loader left out because the NIC's
+	// network does not allow them (not rendered; reported as a condition).
+	BlockedTrunks []BlockedTrunk
 }
 
-// Render turns the Plan into an nftables ruleset that can be fed to
-// `nft -f -`. The output is deterministic — identical Plan ⇒ identical
-// bytes — so apply can short-circuit when nothing changed.
+// BlockedTrunk is a trunk NIC's VLANs its network does not allow.
+type BlockedTrunk struct {
+	Workload string
+	Network  string
+	VIDs     []int
+}
+
+// LBBackend is one load-balancer backend endpoint.
+type LBBackend struct {
+	Addr  string
+	Port  int
+	Proto string // "tcp" (default) or "udp"
+}
+
+// Per-NIC enforcement modes (Plan.NICMode).
+const (
+	NICModeEnforce    = "enforce"
+	NICModeObserve    = "observe"
+	NICModeGuardsOnly = "guards-only"
+)
+
+func (p Plan) nicMode() string {
+	switch p.NICMode {
+	case NICModeObserve, NICModeGuardsOnly:
+		return p.NICMode
+	}
+	return NICModeEnforce
+}
+
+// Render turns the Plan into the nftables ruleset `nft -f -` loads: the inet
+// table, then the per-NIC bridge table when the plan has one. The inet table
+// is rendered as it is when the bridge table is in force (RenderParts). The
+// output is deterministic — identical Plan ⇒ identical bytes.
 func Render(p Plan) (string, error) {
-	if err := validate(p); err != nil {
+	inet, nic, err := RenderParts(p, true)
+	if err != nil {
 		return "", err
+	}
+	if nic == "" {
+		return inet, nil
+	}
+	return inet + "\n" + nic, nil
+}
+
+// RenderParts renders the inet table and the per-NIC bridge table separately,
+// so the applier can load them in two transactions and a refusal of the bridge
+// table never freezes the inet table (NAT, isolation, routed filtering).
+// nicActive says whether the bridge table is in force on the host: only then
+// does the inet forward chain trust its per-NIC decisions (judgedMark,
+// deferMark). nic is "" when the plan needs no bridge table.
+func RenderParts(p Plan, nicActive bool) (inet, nic string, err error) {
+	if err := validate(p); err != nil {
+		return "", "", err
 	}
 	sgByName := map[string]SecurityGroup{}
 	for _, sg := range p.SecurityGroups {
@@ -197,62 +356,98 @@ func Render(p Plan) (string, error) {
 	for _, n := range p.NICs {
 		for _, name := range n.SecurityGroups {
 			if _, ok := sgByName[name]; !ok {
-				return "", fmt.Errorf("NIC %q references unknown security group %q", n.NICDev, name)
+				return "", "", fmt.Errorf("NIC %q references unknown security group %q", n.NICDev, name)
 			}
 		}
 	}
+	v6Sets := setsWithIPv6(p.IPSets)
+	nicTable := len(p.NICs) > 0
+	trust := nicTable && nicActive && p.nicMode() == NICModeEnforce
 
 	var b strings.Builder
 	b.WriteString("# Generated by litevirt firewall renderer — do not edit by hand.\n")
 	b.WriteString("# `nft -f -` consumes this file as an atomic ruleset replace.\n\n")
 
-	// We emit the table block as a self-contained unit. `nft -f -`
-	// treats this as an atomic replace of the litevirt-fw table.
-	//
 	// IMPORTANT: do NOT close the brace via `defer` — strings.Builder.String()
-	// snapshots the length at call time, and a deferred WriteString
-	// happens *after* return value evaluation, so the brace would be
-	// written into the underlying buffer but never appear in the
-	// returned string. Always close before returning.
+	// snapshots the length at call time. Always close before returning.
 	fmt.Fprintf(&b, "table inet %s {\n", TableName)
-
-	// IP sets first; chains may reference them.
 	renderIPSets(&b, p.IPSets)
 
-	// One forward chain hooks to the netfilter forward path. Everything
-	// else is a regular chain we jump into.
 	defaultPolicy := "accept"
 	if p.DefaultDeny {
 		defaultPolicy = "drop"
 	}
+	// The forward chain judges routed traffic with the cluster and host tiers
+	// and the default policy, exactly as before per-NIC enforcement existed —
+	// except traffic the bridge table has already judged per NIC (trust).
 	fmt.Fprintf(&b, "    chain forward {\n")
 	fmt.Fprintf(&b, "        type filter hook forward priority filter; policy %s;\n", defaultPolicy)
-	// Stateful conntrack — reply traffic is always allowed. Putting it
-	// at the head of the forward chain means we never re-evaluate per-
-	// connection-state for established flows.
+	// Stateful conntrack — reply traffic, and the ICMP(v6) errors that relate
+	// to a known flow, are always allowed.
 	fmt.Fprintf(&b, "        ct state established,related accept\n")
 	fmt.Fprintf(&b, "        ct state invalid drop\n")
-	// Jump tier-by-tier. Cluster rules run first because they describe
-	// blanket policy (e.g. "block egress to RFC1918 from public VLAN").
+	// Neighbour and router discovery are link-local: a router never forwards
+	// them (RFC 4861 requires hop limit 255), so a routed one is a guest using
+	// the discovery exemptions to smuggle traffic off its link. Routing has
+	// already decremented the hop limit when this hook runs; a BRIDGED
+	// message, which reaches this hook too on a host with br_netfilter loaded,
+	// still carries 255 and must pass, as it did before this rule existed.
+	fmt.Fprintf(&b, "        ip6 hoplimit != 255 icmpv6 type { nd-router-solicit, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert, nd-redirect } drop\n")
+	if trust {
+		// A frame a guest sent was judged by its NIC's egress rules at the
+		// bridge input hook, which marks what it lets through.
+		fmt.Fprintf(&b, "        meta mark & %#x == %#x accept\n", judgedMark, judgedMark)
+		// Routed traffic toward a bridge that carries guest NICs is judged at
+		// that bridge's output hook: by the receiving NIC's ingress rules, or,
+		// for any other port, by the tiers and default policy below
+		// (routed_to_port), so nothing is let through unjudged.
+		if brs := nicBridges(p.NICs); len(brs) > 0 {
+			fmt.Fprintf(&b, "        oifname { %s } meta mark set meta mark | %#x accept\n", quoteNames(brs), deferMark)
+		}
+	}
 	fmt.Fprintf(&b, "        jump cluster_default\n")
 	fmt.Fprintf(&b, "        jump host_overrides\n")
-	// Each NIC gets a dispatch chain so a packet only evaluates the
-	// rules for the NIC it's traversing.
-	fmt.Fprintf(&b, "        jump nic_dispatch\n")
 	fmt.Fprintf(&b, "    }\n\n")
 
-	renderTierChain(&b, "cluster_default", p.ClusterRules, "" /* no per-NIC match */)
-	renderTierChain(&b, "host_overrides", p.HostRules, "")
-	renderNICDispatch(&b, p.NICs, sgByName)
+	renderTierChain(&b, "cluster_default", p.ClusterRules, v6Sets)
+	renderTierChain(&b, "host_overrides", p.HostRules, v6Sets)
 
 	// Infra chains on their own hooks. Emitted only when non-empty so a plan with
 	// no NAT / isolation renders byte-identically to before this feature (and so
 	// removing the last rule drops the whole chain on the next atomic replace).
 	renderNAT(&b, p.NAT)
 	renderHostIsolation(&b, p.HostIsolation)
-
 	b.WriteString("}\n")
-	return b.String(), nil
+	inet = b.String()
+
+	if nicTable {
+		var nb strings.Builder
+		renderNICTable(&nb, p, sgByName, v6Sets)
+		nic = nb.String()
+	}
+	return inet, nic, nil
+}
+
+// nicBridges is every bridge a guest NIC in the plan is a port of, sorted.
+func nicBridges(nics []NICBinding) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, n := range nics {
+		if n.Bridge != "" && !seen[n.Bridge] {
+			seen[n.Bridge] = true
+			out = append(out, n.Bridge)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func quoteNames(names []string) string {
+	q := make([]string, len(names))
+	for i, n := range names {
+		q[i] = `"` + n + `"`
+	}
+	return strings.Join(q, ", ")
 }
 
 // renderNAT emits a single `postrouting` nat chain covering masquerade (managed
@@ -339,27 +534,62 @@ func renderIPSets(b *strings.Builder, sets []IPSet) {
 	if len(sets) == 0 {
 		return
 	}
-	byName := map[string][]string{}
-	var names []string
-	for _, s := range sets {
-		if _, ok := byName[s.Name]; !ok {
-			names = append(names, s.Name)
-			byName[s.Name] = nil
-		}
-		byName[s.Name] = append(byName[s.Name], s.CIDRs...)
+	byName := mergeIPSets(sets)
+	names := make([]string, 0, len(byName))
+	for name := range byName {
+		names = append(names, name)
 	}
 	// Stable order so the rendered output is byte-deterministic.
 	sort.Strings(names)
 
 	for _, name := range names {
+		v4, v6 := splitFamilies(byName[name])
 		fmt.Fprintf(b, "    set %s {\n", name)
 		fmt.Fprintf(b, "        type ipv4_addr\n")
 		fmt.Fprintf(b, "        flags interval\n")
-		if cidrs := collapseSetElements(byName[name]); len(cidrs) > 0 {
+		if cidrs := collapseSetElements(v4); len(cidrs) > 0 {
 			fmt.Fprintf(b, "        elements = { %s }\n", strings.Join(cidrs, ", "))
 		}
 		fmt.Fprintf(b, "    }\n\n")
+		if len(v6) == 0 {
+			continue
+		}
+		// The IPv6 members live in a typed companion; a rule referencing the
+		// set renders one line per family (renderRules).
+		fmt.Fprintf(b, "    set %s%s {\n", name, ipv6SetSuffix)
+		fmt.Fprintf(b, "        type ipv6_addr\n")
+		fmt.Fprintf(b, "        flags interval\n")
+		fmt.Fprintf(b, "        elements = { %s }\n", strings.Join(collapseSetElements(v6), ", "))
+		fmt.Fprintf(b, "    }\n\n")
 	}
+}
+
+// mergeIPSets unions the elements of every set row by name.
+func mergeIPSets(sets []IPSet) map[string][]string {
+	byName := map[string][]string{}
+	for _, s := range sets {
+		byName[s.Name] = append(byName[s.Name], s.CIDRs...)
+	}
+	return byName
+}
+
+// splitFamilies separates IPv6 elements from the rest. Anything without a
+// colon stays with IPv4, as every element did before IPv6 sets existed.
+func splitFamilies(elems []string) (v4, v6 []string) {
+	for _, e := range elems {
+		if isIPv6Literal(e) {
+			v6 = append(v6, e)
+		} else {
+			v4 = append(v4, e)
+		}
+	}
+	return v4, v6
+}
+
+// isIPv6Literal reports whether s is written as an IPv6 address or prefix.
+// A set reference ("@name") is not.
+func isIPv6Literal(s string) bool {
+	return !strings.HasPrefix(s, "@") && strings.Contains(s, ":")
 }
 
 // collapseSetElements returns the elements sorted, with duplicates removed and
@@ -421,56 +651,66 @@ func collapseSetElements(in []string) []string {
 // renderTierChain emits a chain whose rules apply to every packet
 // entering it (cluster + host tiers don't filter by NIC). The chain
 // name is the tier name.
-func renderTierChain(b *strings.Builder, name string, rules []Rule, _ string) {
+func renderTierChain(b *strings.Builder, name string, rules []Rule, v6Sets map[string]bool) {
 	fmt.Fprintf(b, "    chain %s {\n", name)
 	for _, r := range rules {
-		fmt.Fprintf(b, "        %s\n", renderRule(r, ""))
+		for _, line := range renderRules(r, "", v6Sets) {
+			fmt.Fprintf(b, "        %s\n", line)
+		}
 	}
 	fmt.Fprintf(b, "    }\n\n")
 }
 
-// renderNICDispatch emits one chain per NIC plus a `nic_dispatch` chain
-// that jumps into the right one based on iifname / oifname. SG
-// expansion happens here.
-func renderNICDispatch(b *strings.Builder, nics []NICBinding, sgs map[string]SecurityGroup) {
-	fmt.Fprintf(b, "    chain nic_dispatch {\n")
-	// Sort by NICDev so the dispatch order is deterministic — important
-	// for byte-equality between two equivalent Plans.
-	sortedNICs := make([]NICBinding, len(nics))
-	copy(sortedNICs, nics)
-	sort.Slice(sortedNICs, func(i, j int) bool { return sortedNICs[i].NICDev < sortedNICs[j].NICDev })
-
-	for _, n := range sortedNICs {
-		// Both directions land in the same per-NIC chain — the chain's
-		// rules use iifname/oifname to filter inside.
-		fmt.Fprintf(b, "        iifname %s jump nic_%s\n", n.NICDev, sanitiseChain(n.NICDev))
-		fmt.Fprintf(b, "        oifname %s jump nic_%s\n", n.NICDev, sanitiseChain(n.NICDev))
-	}
-	fmt.Fprintf(b, "    }\n\n")
-
-	for _, n := range sortedNICs {
-		fmt.Fprintf(b, "    chain nic_%s {\n", sanitiseChain(n.NICDev))
-		// Expand each referenced SG, then layer extra rules on top.
-		for _, name := range n.SecurityGroups {
-			sg := sgs[name]
-			if sg.Name == "" {
-				continue
-			}
-			fmt.Fprintf(b, "        # security group %q\n", sg.Name)
-			for _, r := range sg.Rules {
-				fmt.Fprintf(b, "        %s\n", renderRule(r, n.NICDev))
-			}
+// setsWithIPv6 names the ip sets that hold at least one IPv6 element, so
+// have an ipv6_addr companion.
+func setsWithIPv6(sets []IPSet) map[string]bool {
+	out := map[string]bool{}
+	for name, elems := range mergeIPSets(sets) {
+		if _, v6 := splitFamilies(elems); len(v6) > 0 {
+			out[name] = true
 		}
-		for _, r := range n.ExtraRules {
-			fmt.Fprintf(b, "        %s\n", renderRule(r, n.NICDev))
-		}
-		fmt.Fprintf(b, "    }\n\n")
 	}
+	return out
+}
+
+// ruleFamily is the address family a rule's protocol pins it to: "ip" for
+// icmp, "ip6" for icmpv6, "" for a protocol that exists in both.
+func ruleFamily(proto string) string {
+	switch strings.ToLower(proto) {
+	case "icmp":
+		return "ip"
+	case "icmpv6", "ipv6-icmp":
+		return "ip6"
+	}
+	return ""
+}
+
+// renderRules renders one rule as the nft lines that implement it. That is
+// one line, except for a rule referencing a set that holds IPv6 elements: nft
+// sets are typed, so it becomes one line per family, either of which matches.
+// A family the rule's protocol excludes gets no line.
+func renderRules(r Rule, nicDev string, v6Sets map[string]bool) []string {
+	if !strings.HasPrefix(r.CIDR, "@") || !v6Sets[strings.TrimPrefix(r.CIDR, "@")] {
+		return []string{renderRule(r, nicDev, "")}
+	}
+	var out []string
+	if ruleFamily(r.Proto) != "ip6" {
+		out = append(out, renderRule(r, nicDev, "ip"))
+	}
+	if ruleFamily(r.Proto) != "ip" {
+		r6 := r
+		r6.CIDR = r.CIDR + ipv6SetSuffix
+		out = append(out, renderRule(r6, nicDev, "ip6"))
+	}
+	return out
 }
 
 // renderRule builds one nftables rule line. iifname/oifname is added
 // only when nicDev is non-empty (cluster/host tiers don't filter by NIC).
-func renderRule(r Rule, nicDev string) string {
+// family forces the address matcher ("ip" / "ip6") for a set reference;
+// empty derives it from the CIDR, and an IPv4 rule renders exactly as it did
+// before IPv6 support.
+func renderRule(r Rule, nicDev, family string) string {
 	var parts []string
 
 	if nicDev != "" {
@@ -486,9 +726,16 @@ func renderRule(r Rule, nicDev string) string {
 		}
 	}
 
-	switch strings.ToLower(r.Proto) {
+	if family == "" {
+		family = "ip"
+		if isIPv6Literal(r.CIDR) {
+			family = "ip6"
+		}
+	}
+
+	switch proto := strings.ToLower(r.Proto); proto {
 	case "tcp", "udp":
-		parts = append(parts, strings.ToLower(r.Proto))
+		parts = append(parts, proto)
 		if r.PortRange != "" {
 			// Port semantics flip with the direction the rule was
 			// expressed in by the operator:
@@ -499,12 +746,19 @@ func renderRule(r Rule, nicDev string) string {
 			parts = append(parts, "dport", r.PortRange)
 		}
 	case "icmp":
-		// IPv4 ICMP only — ICMPv6 will land with the IPv6 expansion.
 		parts = append(parts, "ip", "protocol", "icmp")
+	case "icmpv6", "ipv6-icmp":
+		parts = append(parts, "meta", "l4proto", "ipv6-icmp")
 	case "", "all":
 		// no proto filter
 	default:
-		parts = append(parts, "ip", "protocol", strings.ToLower(r.Proto))
+		if r.CIDR != "" && family == "ip6" {
+			// `ip protocol` beside `ip6 saddr` names two network protocols,
+			// which nft refuses; meta l4proto is family-neutral.
+			parts = append(parts, "meta", "l4proto", proto)
+		} else {
+			parts = append(parts, "ip", "protocol", proto)
+		}
 	}
 
 	if r.CIDR != "" {
@@ -516,7 +770,7 @@ func renderRule(r Rule, nicDev string) string {
 			addrWord = "daddr"
 		}
 		// "@name" is the nftables set-reference syntax. Preserve verbatim.
-		parts = append(parts, "ip", addrWord, r.CIDR)
+		parts = append(parts, family, addrWord, r.CIDR)
 	}
 
 	action := r.Action
@@ -549,11 +803,18 @@ func validate(p Plan) error {
 			return errors.New("ipset with empty name")
 		}
 		ipsets[ipset.Name] = true
-		// F10: sets render as ipv4_addr, so an IPv6 element can't be expressed.
 		for _, cidr := range ipset.CIDRs {
-			if strings.Contains(cidr, ":") {
-				return fmt.Errorf("ipset %q: IPv6 element %q not supported yet (sets render as ipv4_addr)", ipset.Name, cidr)
+			if isIPv6Literal(cidr) && !validAddrOrPrefix(cidr, true) {
+				return fmt.Errorf("ipset %q: %q is not an IPv6 address or prefix", ipset.Name, cidr)
 			}
+		}
+	}
+	// An IPv6 companion named like a declared set would make nft refuse the
+	// whole ruleset ("set exists").
+	for name := range setsWithIPv6(p.IPSets) {
+		if ipsets[name+ipv6SetSuffix] {
+			return fmt.Errorf("ipset %q holds IPv6 elements, whose set is named %q, but a set of that name is also declared; rename one",
+				name, name+ipv6SetSuffix)
 		}
 	}
 
@@ -568,13 +829,19 @@ func validate(p Plan) error {
 		default:
 			return fmt.Errorf("rule %d: action %q not supported (accept|drop|reject)", i, r.Action)
 		}
-		// F10: the renderer is IPv4-only (ip saddr/daddr + ipv4_addr sets). A
-		// literal IPv6 CIDR would emit an invalid `ip saddr <v6>` line and poison
-		// the whole atomic ruleset at apply time — so reject it here rather than
-		// silently mis-rendering. (Set references "@name" carry no ":"; their
-		// elements are checked via the IPSet loop below.)
-		if r.CIDR != "" && !strings.HasPrefix(r.CIDR, "@") && strings.Contains(r.CIDR, ":") {
-			return fmt.Errorf("rule %d: IPv6 CIDR %q is not supported by security-group rules yet (IPv4-only renderer)", i, r.CIDR)
+		// An IPv6 CIDR renders with the ip6 matcher. A malformed one, or one
+		// paired with IPv4's icmp (or an IPv4 CIDR with icmpv6), would emit a
+		// line nft refuses, poisoning the whole atomic ruleset — so refuse it
+		// here. IPv4 CIDRs are passed through as they always were.
+		if isIPv6Literal(r.CIDR) {
+			if !validAddrOrPrefix(r.CIDR, true) {
+				return fmt.Errorf("rule %d: %q is not an IPv6 address or prefix", i, r.CIDR)
+			}
+			if ruleFamily(r.Proto) == "ip" {
+				return fmt.Errorf("rule %d: proto %q is IPv4-only and cannot match IPv6 CIDR %q (use icmpv6)", i, r.Proto, r.CIDR)
+			}
+		} else if r.CIDR != "" && !strings.HasPrefix(r.CIDR, "@") && ruleFamily(r.Proto) == "ip6" {
+			return fmt.Errorf("rule %d: proto %q is IPv6-only and cannot match IPv4 CIDR %q", i, r.Proto, r.CIDR)
 		}
 		if strings.HasPrefix(r.CIDR, "@") {
 			name := strings.TrimPrefix(r.CIDR, "@")
@@ -586,6 +853,27 @@ func validate(p Plan) error {
 	for _, sg := range p.SecurityGroups {
 		if sg.Name == "" {
 			return errors.New("security group with empty name")
+		}
+	}
+	for _, g := range p.Gateways {
+		if !validAddrOrPrefix(g, false) && !validAddrOrPrefix(g, true) {
+			return fmt.Errorf("gateway %q is not an IP address", g)
+		}
+	}
+	for _, n := range p.NICs {
+		if !safeIfName(n.NICDev) {
+			return fmt.Errorf("NIC device %q is not a safe interface name", n.NICDev)
+		}
+		if err := validateGuard(n); err != nil {
+			return err
+		}
+		if n.Bridge != "" && !safeIfName(n.Bridge) {
+			return fmt.Errorf("NIC %q: bridge name %q is not a safe interface name", n.NICDev, n.Bridge)
+		}
+		for _, v := range n.TrunkVIDs {
+			if v < 1 || v > 4094 {
+				return fmt.Errorf("NIC %q: trunk VLAN %d is outside 1-4094", n.NICDev, v)
+			}
 		}
 	}
 	// NAT / isolation are IPv4-only (same as the filter rules) and must be
@@ -614,6 +902,73 @@ func validate(p Plan) error {
 		}
 	}
 	return nil
+}
+
+// validateGuard refuses a guard whose MAC or addresses would emit a line nft
+// refuses, which would take the whole atomic ruleset down with it.
+func validateGuard(n NICBinding) error {
+	g := n.Guard
+	if g == nil {
+		return nil
+	}
+	if n.NICDev == "" {
+		return errors.New("guarded NIC with empty device name")
+	}
+	if hw, err := net.ParseMAC(g.MAC); err != nil || len(hw) != 6 {
+		return fmt.Errorf("NIC %q: guard MAC %q is not an Ethernet address", n.NICDev, g.MAC)
+	}
+	for _, a := range g.V4 {
+		if !validAddrOrPrefix(a, false) {
+			return fmt.Errorf("NIC %q: guard IPv4 entry %q is not an IPv4 address or prefix", n.NICDev, a)
+		}
+	}
+	for _, a := range g.V6 {
+		if !validAddrOrPrefix(a, true) {
+			return fmt.Errorf("NIC %q: guard IPv6 entry %q is not an IPv6 address or prefix", n.NICDev, a)
+		}
+	}
+	for _, a := range g.ExcludeV4 {
+		if !validAddrOrPrefix(a, false) {
+			return fmt.Errorf("NIC %q: guard IPv4 exclusion %q is not an IPv4 address or prefix", n.NICDev, a)
+		}
+	}
+	for _, a := range g.ExcludeV6 {
+		if !validAddrOrPrefix(a, true) {
+			return fmt.Errorf("NIC %q: guard IPv6 exclusion %q is not an IPv6 address or prefix", n.NICDev, a)
+		}
+	}
+	for _, a := range g.LinkLocal {
+		if p, err := netip.ParseAddr(a); err != nil || !p.Is6() || !p.IsLinkLocalUnicast() || p.Zone() != "" {
+			return fmt.Errorf("NIC %q: guard link-local entry %q is not an IPv6 link-local address", n.NICDev, a)
+		}
+	}
+	return nil
+}
+
+// safeIfName reports whether s is a plausible Linux interface name that is
+// safe to quote into a ruleset.
+func safeIfName(s string) bool {
+	if s == "" || len(s) > 15 {
+		return false
+	}
+	for _, r := range s {
+		if !(r == '-' || r == '_' || r == '.' || (r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')) {
+			return false
+		}
+	}
+	return true
+}
+
+// validAddrOrPrefix reports whether s is an address or prefix of the given
+// family (v6 = IPv6). An IPv4-mapped IPv6 address counts as IPv6.
+func validAddrOrPrefix(s string, v6 bool) bool {
+	if p, err := netip.ParsePrefix(s); err == nil {
+		return p.Addr().Is4() != v6 && p.Addr().Zone() == ""
+	}
+	if a, err := netip.ParseAddr(s); err == nil {
+		return a.Is4() != v6 && a.Zone() == ""
+	}
+	return false
 }
 
 // allRules walks every Rule the Plan contains so validate can sweep

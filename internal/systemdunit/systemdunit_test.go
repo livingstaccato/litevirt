@@ -105,3 +105,20 @@ func TestUnitsAreHeredocSafe(t *testing.T) {
 		}
 	}
 }
+
+// TestMainUnitCleansAStaleNICTable: the main unit removes the per-NIC bridge
+// table before starting a binary that does not own it (a rolled-back one),
+// and keeps it for one that does — the hidden command decides.
+func TestMainUnitCleansAStaleNICTable(t *testing.T) {
+	if !strings.Contains(Main, "ExecStartPre="+NICTableCleanup) {
+		t.Fatalf("main unit lacks the per-NIC table cleanup:\n%s", Main)
+	}
+	for _, want := range []string{"litevirt " + NICTableOwnerCommand, "|| nft delete table bridge litevirt-nic", "-/bin/sh"} {
+		if !strings.Contains(NICTableCleanup, want) {
+			t.Errorf("cleanup %q lacks %q", NICTableCleanup, want)
+		}
+	}
+	if strings.Index(Main, "ExecStartPre=") > strings.Index(Main, "ExecStart=/usr/local/bin/litevirt daemon") {
+		t.Error("the cleanup must run before the daemon starts")
+	}
+}

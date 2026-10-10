@@ -434,6 +434,9 @@ lv network create <name> --type bridge [flags]    # Create a network
   --pf <iface> --spoof-check                      # SR-IOV variants
   --project <name>                                # owning project (empty = global/shared)
   --netbox-prefix-id <id>                         # bind to a NetBox prefix
+  --gateway <ip> --reserved-address <ip>          # the network's router when it is not litevirt's, other infrastructure (repeatable); no guest NIC may claim them
+lv network set <name> [--gateway <ip>] [--reserved-address <ip>]... [--allowed-vlans 100,101]
+                                                  # change what a network keeps from its NICs (network.update; each flag replaces its setting)
 lv network rm <name> [--force]
 ```
 
@@ -964,7 +967,7 @@ See docs/configuration.md.
 lv hardware-ls <vm>                               # List a VM's disks/NICs/PCI devices
 lv attach-disk <vm> <disk> --size 50G [--bus virtio]
 lv detach-disk <vm> <disk>
-lv attach-nic <vm> <network> [--model virtio] [--mac ...]
+lv attach-nic <vm> <network> [--model virtio] [--mac ...] [--spoof-guard on|off] [--allow-address <ip>]
 lv detach-nic <vm> <mac>
 lv attach-pci <vm> --type gpu [--vendor 10de] [--count 1] [--sriov]
 lv detach-pci <vm> <pci-address>
@@ -1074,9 +1077,22 @@ lv firewall ipset rm <id>
 
 # Default forward policy (deny = drop anything not explicitly accepted):
 lv firewall default-deny <on|off> [--scope <host>]   # no --scope = cluster-wide
+
+# NIC guards (anti-spoofing). New NICs are guarded by default; relaxing one
+# needs network.update on its network. --allow replaces the list (repeatable).
+lv firewall nic-guard set <vm> --network <net>|--mac <mac> --mode on|off \
+    [--allow <ip-or-cidr>] [--allow-dhcp-server] [--allow-router-advertisement] [--allow-vlan-tags]
+lv firewall nic-guard set --container <ct> --host <host> --network <net> --mode on|off
+lv firewall nic-guard ls [<vm>]   # VM NICs, then container NICs
+
+# Per-NIC enforcement: an upgraded cluster observes (counts would-drops) until enforced.
+lv firewall enforce status          # mode per host + would-drop totals per workload, NIC and rule, since <time>
+lv firewall enforce on              # enforce (admin, audited); off = observe
+lv firewall enforce reset-counters  # restart every host's would-drop totals from now (admin, audited)
 ```
 
-See `docs/firewall.md` for the three-tier model.
+See `docs/firewall.md` for the three-tier model, where each tier is enforced
+(the `bridge litevirt-nic` table), IPv6 rules and NIC guards.
 
 ## Audit log
 

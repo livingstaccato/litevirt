@@ -264,10 +264,19 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 		})
 	}
 
+	if req.Ip != "" && len(srcSpec.Network) > 0 {
+		if err := s.checkNICIdentities(ctx, project, []*pb.NetworkAttachment{{Name: srcSpec.Network[0].Name, Ip: req.Ip}}, req.Target); err != nil {
+			cleanup()
+			return nil, err
+		}
+	}
+
 	// ── Networks: fresh MACs (don't duplicate the source's) ──────────────
 	var netConfigs []lv.NetworkConfig
 	var ifaceRecords []corrosion.InterfaceRecord
 	var nicRecords []corrosion.NICRecord // v42 dual-write alongside ifaceRecords (vm_nics)
+	var guardRecords []corrosion.NICGuardRecord
+	cloneUUID := uuid.NewString() // the clone's incarnation; its guard records carry it
 	for i, n := range srcSpec.Network {
 		mac := lv.GenerateMAC()
 		bridge := network.FlatBridgeName(n.Name)
@@ -277,6 +286,17 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 		ip := ""
 		if i == 0 {
 			ip = req.Ip // optional static IP for the first NIC
+		}
+		if def, _ := lookupNetworkDef(ctx, s.db, n.Name); ip == "" && !strings.HasPrefix(bridge, "direct:") &&
+			s.dhcpReservable(&pb.NetworkAttachment{Name: n.Name}, def) {
+			// The clone's NIC is guarded by default: give it an exact,
+			// reserved address (nic_identity.go).
+			rip, rerr := s.reserveDHCPAddress(ctx, n.Name, def.Subnet, bridge, mac)
+			if rerr != nil {
+				cleanup()
+				return nil, status.Errorf(codes.ResourceExhausted, "reserve a DHCP address on %q: %v", n.Name, rerr)
+			}
+			ip = rip
 		}
 		if strings.HasPrefix(bridge, "direct:") {
 			netConfigs = append(netConfigs, lv.NetworkConfig{Direct: strings.TrimPrefix(bridge, "direct:"), Model: n.Model, MAC: mac})
@@ -304,6 +324,19 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 			TapDevice:      "",
 			SecurityGroups: encodeSecurityGroups(n.SecurityGroups),
 		})
+		// A clone's NICs are new NICs: each gets the default guard. The
+		// source's relaxations are not copied — relaxing a guard needs
+		// cluster-root network authority the cloning caller may not hold —
+		// and are set on the clone with `lv firewall nic-guard set`.
+		// A NIC on the `trunk:` feature gets none (guardDecision.record).
+		if !strings.HasPrefix(bridge, "direct:") && len(n.Trunk) < 2 {
+			guardRecords = append(guardRecords, corrosion.NICGuardRecord{VMName: req.Target, MAC: mac, Mode: corrosion.NICGuardOn,
+				VMUUID: cloneUUID, Network: n.Name, Ordinal: i})
+		}
+	}
+	if err := s.writeNewNICGuards(ctx, guardRecords); err != nil {
+		cleanup()
+		return nil, err
 	}
 
 	// ── Fresh cloud-init identity (new instance-id ⇒ clean first boot) ───
@@ -337,8 +370,8 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 	mem := int(srcSpec.MemoryMib)
 	srcSpec.Name = req.Target
 	srcSpec.Project = project
-	srcSpec.Devices = nil           // v1: don't clone PCI passthrough (device may be in use)
-	srcSpec.Uuid = uuid.NewString() // fresh identity ⇒ fresh vTPM (never copy the source TPM secret) (G1)
+	srcSpec.Devices = nil    // v1: don't clone PCI passthrough (device may be in use)
+	srcSpec.Uuid = cloneUUID // fresh identity ⇒ fresh vTPM (never copy the source TPM secret) (G1)
 	for i := range srcSpec.Network {
 		if i < len(ifaceRecords) {
 			srcSpec.Network[i].Mac = ifaceRecords[i].MAC
@@ -413,6 +446,17 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 
 	state := "stopped"
 	if req.Start {
+		// The clone's rows are written once it runs; until then the firewall
+		// renders its NICs from here (nic_firewall_arming.go).
+		trunks := map[int][]int{}
+		for i, n := range srcSpec.Network {
+			if len(n.Trunk) > 1 {
+				for _, v := range n.Trunk {
+					trunks[i] = append(trunks[i], int(v))
+				}
+			}
+		}
+		defer s.pendingNICs(req.Target, cloneUUID, ifaceRecords, trunks)()
 		if err := s.virt.StartDomain(req.Target); err != nil {
 			rollbackClone(false)
 			return nil, status.Errorf(codes.Internal, "start clone: %v", err)
@@ -460,6 +504,9 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 	// clone therefore sat at 0 until someone enabled the default-off backfill,
 	// and became running-and-unprovable the moment it started.
 	s.assignOwnerEpochAtCreate(ctx, req.Target, state == "running")
+	if len(guardRecords) > 0 {
+		s.reconcileLocal(ctx)
+	}
 
 	slog.Info("VM cloned", "source", req.Source, "target", req.Target, "mode", mode, "why", modeWhy, "host", s.hostName)
 	s.audit(ctx, "vm.clone", req.Target, fmt.Sprintf("source=%s mode=%s", req.Source, mode), "ok")

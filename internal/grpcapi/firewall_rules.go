@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 
 	"google.golang.org/grpc/codes"
@@ -31,13 +32,23 @@ func toPbIpSet(s corrosion.IPSet) *pb.IpSet {
 	return &pb.IpSet{Id: s.ID, Name: s.Name, Cidrs: s.CIDRs, StackName: s.StackName}
 }
 
+// firewallWriteCode maps a firewall-row write error to its gRPC code: an IPv6
+// rule refused because firewall_ipv6_v1 has not latched is a precondition (it
+// will succeed once every host is upgraded), anything else keeps def.
+func firewallWriteCode(err error, def codes.Code) codes.Code {
+	if errors.Is(err, corrosion.ErrFirewallIPv6GateClosed) {
+		return codes.FailedPrecondition
+	}
+	return def
+}
+
 // reconcileLocal triggers an immediate best-effort re-render on the connected
 // host so an operator's change is live without waiting for the poll tick.
 func (s *Server) reconcileLocal(ctx context.Context) {
-	if s.fwReconciler == nil {
+	if s.fwRec() == nil {
 		return
 	}
-	if err := s.fwReconciler.Reconcile(ctx); err != nil {
+	if err := s.fwRec().Reconcile(ctx); err != nil {
 		slog.Warn("firewall: immediate reconcile after change failed", "error", err)
 	}
 }
@@ -102,7 +113,7 @@ func (s *Server) CreateClusterFirewallRule(ctx context.Context, req *pb.CreateCl
 		CIDR: r.Cidr, Action: r.Action, Priority: int(r.Priority), Comment: r.Comment,
 	}
 	if err := corrosion.InsertClusterFirewallRule(ctx, s.db, row); err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "create cluster rule: %v", err)
+		return nil, status.Errorf(firewallWriteCode(err, codes.InvalidArgument), "create cluster rule: %v", err)
 	}
 	// The "after" is read back so it is the rule as stored and enforced — the
 	// insert fills in defaults for an empty proto, action and priority.
@@ -155,7 +166,7 @@ func (s *Server) CreateHostFirewallRule(ctx context.Context, req *pb.CreateHostF
 		PortRange: r.Port, CIDR: r.Cidr, Action: r.Action, Priority: int(r.Priority), Comment: r.Comment,
 	}
 	if err := corrosion.InsertHostFirewallRule(ctx, s.db, row); err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "create host rule: %v", err)
+		return nil, status.Errorf(firewallWriteCode(err, codes.InvalidArgument), "create host rule: %v", err)
 	}
 	s.audit(ctx, "firewall.host-rule.add", row.ID,
 		corrosion.AuditChange(corrosion.AuditStateNone, ruleState(corrosion.GetHostFirewallRule(ctx, s.db, row.ID))), "ok")
@@ -202,7 +213,7 @@ func (s *Server) CreateIpSet(ctx context.Context, req *pb.CreateIpSetRequest) (*
 	}
 	row := corrosion.IPSet{ID: randid.New(), Name: req.Name, CIDRs: req.Cidrs}
 	if err := corrosion.InsertIPSet(ctx, s.db, row); err != nil {
-		return nil, status.Errorf(codes.Internal, "create ipset: %v", err)
+		return nil, status.Errorf(firewallWriteCode(err, codes.Internal), "create ipset: %v", err)
 	}
 	s.audit(ctx, "firewall.ipset.add", row.Name,
 		corrosion.AuditChange(corrosion.AuditStateNone, ipSetState(corrosion.GetIPSet(ctx, s.db, row.ID))), "ok")

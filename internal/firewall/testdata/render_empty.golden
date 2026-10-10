@@ -6,18 +6,15 @@ table inet litevirt-fw {
         type filter hook forward priority filter; policy accept;
         ct state established,related accept
         ct state invalid drop
+        ip6 hoplimit != 255 icmpv6 type { nd-router-solicit, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert, nd-redirect } drop
         jump cluster_default
         jump host_overrides
-        jump nic_dispatch
     }
 
     chain cluster_default {
     }
 
     chain host_overrides {
-    }
-
-    chain nic_dispatch {
     }
 
 }

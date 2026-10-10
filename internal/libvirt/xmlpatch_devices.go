@@ -497,12 +497,7 @@ func marshalNewNIC(childIndent string, n WantNIC) (string, error) {
 			Model:  ifaceModel{Type: model},
 		}
 	} else {
-		iface = interfaceDevice{
-			Type:   "bridge",
-			MAC:    ifaceMAC{Address: n.MAC},
-			Source: ifaceSource{Bridge: n.Bridge},
-			Model:  ifaceModel{Type: model},
-		}
+		iface = bridgeInterface(n.Bridge, model, n.MAC)
 	}
 	return marshalFragment(childIndent, iface)
 }

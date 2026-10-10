@@ -41,6 +41,7 @@
     <interface type="bridge">
       <mac address="52:54:00:de:ad:be"></mac>
       <source bridge="br0"></source>
+      <target dev="lvt525400deadbe"></target>
       <model type="virtio"></model>
     </interface>
     <hostdev mode="subsystem" type="pci" managed="yes">

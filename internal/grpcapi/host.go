@@ -404,6 +404,9 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 	var drainJobs []drainJob
 	for _, vm := range toMigrate {
 		placementReq := buildDrainPlacementRequest(vm, req.Name, s.capacity)
+		// A guarded VM drains only onto a host that enforces NIC guards
+		// until every host does (re-review m8).
+		s.requireGuardHost(ctx, &placementReq, vm.Name)
 
 		// Ensure the drained host is excluded via anti-affinity on itself.
 		// placement.Select() excludes non-active hosts, and we already set the host to "draining".
@@ -673,9 +676,20 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 		progress.Error = "target refused the installer ISO: " + ierr.Error()
 		return progress
 	}
+	// The same arming every live move goes through (re-review R2-I3): the
+	// target puts the guest's NIC guards in force before it arrives.
+	armed, aerr := s.armMigrationTarget(ctx, &target, vm.Name)
+	if aerr != nil {
+		progress.Status = "error"
+		progress.Error = "target refused: " + aerr.Error()
+		return progress
+	}
 	dconnuri := fmt.Sprintf("qemu+tls://%s/system", corrosion.URIHost(target.Address))
-	lerr := s.virt.MigrateToTarget(vm.Name, dconnuri, libvirt.MigrateParams{Live: true, CDROMSources: cdromSources})
+	params := libvirt.MigrateParams{Live: true, CDROMSources: cdromSources}
+	armed.apply(&params)
+	lerr := s.virt.MigrateToTarget(vm.Name, dconnuri, params)
 	if lerr == nil {
+		defer func() { _ = armed.finish(context.WithoutCancel(ctx)) }()
 		// Phase 4: drain move is an ownership transition (fresh-read CAS + increment).
 		//runningcheck:allow ownership handoff — this commit names the TARGET host while
 		// running on the source, whose domain MigrateToTarget has already undefined

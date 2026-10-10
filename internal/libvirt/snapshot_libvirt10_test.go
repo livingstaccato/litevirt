@@ -35,14 +35,14 @@ func currentOf(t *testing.T, m *libvirt10) string {
 
 func (m *libvirt10) revert(name string) {
 	m.t.Helper()
-	if err := revertToSnapshot(m, "vm", name, nil); err != nil {
+	if err := revertToSnapshot(m, "vm", name, nil, StartGuard{}); err != nil {
 		m.t.Fatalf("revert %s: %v", name, err)
 	}
 }
 
 func (m *libvirt10) revertLive(name, save string) {
 	m.t.Helper()
-	if err := revertToLiveSnapshot(m, "vm", name, save, nil, nil); err != nil {
+	if err := revertToLiveSnapshot(m, "vm", name, save, nil, nil, StartGuard{}); err != nil {
 		m.t.Fatalf("revert (memory) %s: %v", name, err)
 	}
 }
@@ -417,7 +417,7 @@ func TestRevert_ARefusedCurrentIsReported(t *testing.T) {
 		m.write(markA, 1)
 		m.snapshot("m1")
 		m.write(markB, 2)
-		check(t, revertToSnapshot(m, "vm", "m1", nil))
+		check(t, revertToSnapshot(m, "vm", "m1", nil, StartGuard{}))
 		if m.state() != golibvirt.DomainRunning {
 			t.Fatal("the reverted domain is not running")
 		}
@@ -433,7 +433,7 @@ func TestRevert_ARefusedCurrentIsReported(t *testing.T) {
 		m.write(markA, 1)
 		save := m.memorySnapshot("m1")
 		m.write(markB, 2)
-		check(t, revertToLiveSnapshot(m, "vm", "m1", save, nil, nil))
+		check(t, revertToLiveSnapshot(m, "vm", "m1", save, nil, nil, StartGuard{}))
 		m.rm("m1")
 		m.requireWhole(map[byte]bool{markA: true, markB: false})
 	})
@@ -972,9 +972,9 @@ func TestRevert_ABadBaseFailsBeforeTeardown(t *testing.T) {
 				before := fileSum(t, ov)
 				var err error
 				if memory {
-					err = revertToLiveSnapshot(m, "vm", "s1", save, nil, nil)
+					err = revertToLiveSnapshot(m, "vm", "s1", save, nil, nil, StartGuard{})
 				} else {
-					err = revertToSnapshot(m, "vm", "s1", nil)
+					err = revertToSnapshot(m, "vm", "s1", nil, StartGuard{})
 				}
 				if err == nil {
 					t.Fatal("the restore went ahead over a bad base")

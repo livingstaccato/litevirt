@@ -12,9 +12,10 @@ table inet litevirt-fw {
         type filter hook forward priority filter; policy drop;
         ct state established,related accept
         ct state invalid drop
+        ip6 hoplimit != 255 icmpv6 type { nd-router-solicit, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert, nd-redirect } drop
+        meta mark & 0x10000000 == 0x10000000 accept
         jump cluster_default
         jump host_overrides
-        jump nic_dispatch
     }
 
     chain cluster_default {
@@ -23,15 +24,124 @@ table inet litevirt-fw {
     chain host_overrides {
     }
 
-    chain nic_dispatch {
-        iifname tap-vm1-0 jump nic_tap_vm1_0
-        oifname tap-vm1-0 jump nic_tap_vm1_0
+}
+
+table bridge litevirt-nic {
+    set lv_nic_devs {
+        type ifname
+        elements = { "tap-vm1-0" }
     }
 
-    chain nic_tap_vm1_0 {
+    set lv_vlan_ok {
+        type ifname
+    }
+
+    set lv_dhcp_srv {
+        type ifname
+    }
+
+    set lv_gw4 {
+        type ipv4_addr
+        flags interval
+    }
+
+    set lv_gw6 {
+        type ipv6_addr
+        flags interval
+    }
+
+    set trusted {
+        type ipv4_addr
+        flags interval
+        elements = { 10.0.0.0/24, 10.0.1.0/24 }
+    }
+
+    set lv_lb4 {
+        type ipv4_addr . inet_service
+    }
+
+    set lv_lb_src4 {
+        type ipv4_addr
+        flags interval
+    }
+
+    chain prerouting {
+        type filter hook prerouting priority -300; policy accept;
+        iifname != @lv_nic_devs accept
+        iifname != @lv_vlan_ok ether type { 8021q, 8021ad } drop
+    }
+
+    chain forward {
+        type filter hook forward priority filter; policy accept;
+        iifname != @lv_nic_devs oifname != @lv_nic_devs accept
+        oifname @lv_nic_devs oifname != @lv_vlan_ok ether type { 8021q, 8021ad } drop
+        ct state established,related accept
+        meta protocol != { ip, ip6 } accept
+        ip6 hoplimit 255 icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } accept
+        ip6 saddr { ::, fe80::/10 } ip6 daddr ff00::/8 icmpv6 type { mld-listener-query, mld-listener-report, mld-listener-done, mld2-listener-report } accept
+        iifname @lv_nic_devs udp sport 68 udp dport 67 ip daddr 255.255.255.255 accept
+        iifname @lv_nic_devs ip6 saddr fe80::/10 ip6 daddr ff02::1:2 udp sport 546 udp dport 547 accept
+        iifname != @lv_nic_devs udp sport 67 udp dport 68 accept
+        iifname != @lv_nic_devs ip6 saddr fe80::/10 udp sport 547 udp dport 546 accept
+        iifname @lv_dhcp_srv udp sport 67 udp dport 68 accept
+        iifname @lv_dhcp_srv ip6 saddr fe80::/10 udp sport 547 udp dport 546 accept
+        iifname != @lv_nic_devs ip6 hoplimit 255 icmpv6 type { nd-router-advert, nd-redirect } accept
+        iifname != @lv_nic_devs ip saddr @lv_lb_src4 ip daddr . tcp dport @lv_lb4 accept
+        ct state invalid drop
+        iifname tap-vm1-0 jump nic_out_tap_vm1_0
+        oifname tap-vm1-0 jump nic_in_tap_vm1_0
+    }
+
+    chain input {
+        type filter hook input priority filter; policy accept;
+        iifname != @lv_nic_devs accept
+        ct state established,related accept
+        meta protocol != { ip, ip6 } accept
+        ip6 hoplimit 255 icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } accept
+        ip6 saddr { ::, fe80::/10 } ip6 daddr ff00::/8 icmpv6 type { mld-listener-query, mld-listener-report, mld-listener-done, mld2-listener-report } accept
+        udp sport 68 udp dport 67 ip daddr { 255.255.255.255 } accept
+        udp sport 68 udp dport 67 ip daddr @lv_gw4 accept
+        ip6 saddr fe80::/10 ip6 daddr ff02::1:2 udp sport 546 udp dport 547 accept
+        ip daddr @lv_gw4 udp dport 53 accept
+        ip daddr @lv_gw4 tcp dport 53 accept
+        ip6 daddr @lv_gw6 udp dport 53 accept
+        ip6 daddr @lv_gw6 tcp dport 53 accept
+        ct state invalid drop
+        iifname tap-vm1-0 jump nic_out_tap_vm1_0
+        meta mark set meta mark | 0x10000000
+    }
+
+    chain output {
+        type filter hook output priority filter; policy accept;
+        oifname != @lv_nic_devs meta mark & 0x20000000 == 0x20000000 jump routed_to_port
+        oifname != @lv_nic_devs accept
+        oifname @lv_nic_devs oifname != @lv_vlan_ok ether type { 8021q, 8021ad } drop
+        ct state established,related accept
+        meta protocol != { ip, ip6 } accept
+        ip6 hoplimit 255 icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } accept
+        ip6 saddr { ::, fe80::/10 } ip6 daddr ff00::/8 icmpv6 type { mld-listener-query, mld-listener-report, mld-listener-done, mld2-listener-report } accept
+        ip saddr @lv_gw4 udp sport 67 udp dport 68 accept
+        ip6 saddr fe80::/10 udp sport 547 udp dport 546 accept
+        ip6 saddr fe80::/10 ip6 hoplimit 255 icmpv6 type nd-router-advert accept
+        ip saddr @lv_lb_src4 ip daddr . tcp dport @lv_lb4 accept
+        ct state invalid drop
+        oifname tap-vm1-0 jump nic_in_tap_vm1_0
+    }
+
+    chain routed_to_port {
+        drop
+    }
+
+    chain nic_out_tap_vm1_0 {
+        # security group "web"
+        drop
+    }
+
+    chain nic_in_tap_vm1_0 {
         # security group "web"
         oifname tap-vm1-0 tcp dport 80 ip saddr @trusted accept
         oifname tap-vm1-0 tcp dport 443 ip saddr @trusted accept
+        drop
     }
 
 }

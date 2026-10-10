@@ -36,6 +36,10 @@ type MigrateParams struct {
 	// CDROMSources; callers leave them empty.
 	DestXML    string
 	PersistXML string
+	// Paused leaves the guest paused on the target (VIR_MIGRATE_PAUSED): its
+	// NIC firewall is put in force there under the taps it got, and the
+	// target resumes it (re-review R2-I4).
+	Paused bool
 }
 
 // MigrateToTarget performs a live (or cold) P2P migration of a domain to
@@ -107,6 +111,9 @@ func migrationFlagsAndParams(p MigrateParams) (golibvirt.DomainMigrateFlags, []g
 		golibvirt.MigratePersistDest |
 		golibvirt.MigrateUndefineSource
 
+	if p.Paused {
+		flags |= golibvirt.MigratePaused
+	}
 	if p.Live {
 		flags |= golibvirt.MigrateLive
 		if p.AutoConverge {

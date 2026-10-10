@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
 	"sort"
 	"strconv"
@@ -425,6 +426,19 @@ func (v *validator) validate(f *File) {
 		if net.External {
 			if net.Subnet != "" || net.DHCP || net.VNI != 0 || net.Type != "" {
 				v.ps.add("networks."+name, "external network must not set subnet, dhcp, vni, or type", "")
+			}
+		}
+		for _, a := range append([]string{net.Gateway}, net.ReservedAddresses...) {
+			if a == "" {
+				continue
+			}
+			if ip, err := netip.ParseAddr(strings.TrimSpace(a)); err != nil || ip.Zone() != "" {
+				v.ps.add("networks."+name, fmt.Sprintf("gateway / reserved address %q is not an IP address", a), "")
+			}
+		}
+		for _, vid := range net.AllowedVLANs {
+			if vid < 1 || vid > 4094 {
+				v.ps.add("networks."+name, fmt.Sprintf("allowed VLAN %d is outside 1-4094", vid), "")
 			}
 		}
 	}

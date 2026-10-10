@@ -63,13 +63,14 @@ func TestReconcile_LibvirtOutageKeepsTheAppliedChains(t *testing.T) {
 	if !strings.Contains(nft.applies[0], outageChain) {
 		t.Fatalf("control: the first apply must carry vm-a's chain:\n%s", nft.applies[0])
 	}
+	applied := len(nft.applies) // the per-NIC table and the inet table
 	down.Store(true)
 	if err := r.Reconcile(ctx); err == nil {
 		t.Error("a pass that could not ask libvirt must fail, not succeed with the VM NICs dropped")
 	}
-	if len(nft.applies) != 1 {
-		t.Errorf("libvirt outage applied a new ruleset (%d applies); the last one must stay:\n%s",
-			len(nft.applies), nft.applies[len(nft.applies)-1])
+	if len(nft.applies) != applied {
+		t.Errorf("libvirt outage applied a new ruleset (%d applies, was %d); the last one must stay:\n%s",
+			len(nft.applies), applied, nft.applies[len(nft.applies)-1])
 	}
 	if r.LastError() == nil {
 		t.Error("the failed pass must be visible in LastError (lv firewall show)")
@@ -122,7 +123,7 @@ func TestReconcile_HungLibvirtTimesOut(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if len(nft.applies) != 1 || !strings.Contains(nft.applies[0], outageChain) {
+	if len(nft.applies) == 0 || !strings.Contains(nft.applies[0], outageChain) {
 		t.Errorf("once libvirt answers, vm-a's chain must be applied: %v", nft.applies)
 	}
 }

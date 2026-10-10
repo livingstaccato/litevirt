@@ -196,6 +196,23 @@ const (
 	// config; a flag would only keep a mandatory token from latching. Standing
 	// down in an incident is `lv cluster failover-scope cluster`.
 	FailoverScopeV1 = "failover_scope_v1"
+	// FirewallIPv6V1 gates writing IPv6 firewall rules: a security-group,
+	// cluster or host rule naming an IPv6 CIDR or the icmpv6 protocol, and an
+	// ip set holding an IPv6 element (internal/corrosion/firewall_ipv6.go).
+	//
+	// It states a fact about the BINARY, which is why it is mandatory and has
+	// no config flag: this build RENDERS those rows (ip6 matchers, ipv6_addr
+	// set companions). They replicate in shapes every build decodes, but an
+	// earlier renderer refuses its whole plan on one, and that host stops
+	// applying its firewall — new VMs on it get no chains — until it is
+	// upgraded. So nothing writes one until this token has latched. There is
+	// no enforcement here for a flag to switch off: rendering is unconditional
+	// on a build that can, and the rows are the opt-in.
+	//
+	// ReplicationGated: the claim must hold of every host that RECEIVES the
+	// rows, a maintenance host on the previous build included, since that
+	// host still renders its firewall from them.
+	FirewallIPv6V1 = "firewall_ipv6_v1"
 	// VoterConfigV1 gates the explicit voter set (colonelpanik/litevirt#251
 	// step 2) and the voter side of recovery claims
 	// (docs/design/recovery-claims.md §3–§5.1): the voter_configs table, the
@@ -958,6 +975,10 @@ var supported = []string{
 	// decodes cluster_policies and honours failover_scope", a fact about the
 	// binary. The policy is the row, not a flag.
 	FailoverScopeV1,
+	// FirewallIPv6V1 is advertised UNCONDITIONALLY: it says "this build
+	// renders IPv6 firewall rules and ip-set elements", a fact about the
+	// binary.
+	FirewallIPv6V1,
 	// VoterConfigV1 is mandatory but advertised only when READY — this node
 	// commits a promise durably (synchronous=FULL) and can sign an accept. See
 	// grpcapi.VoterConfigReadiness. Readiness is a fact about this node, not a
@@ -1007,7 +1028,7 @@ var supported = []string{
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, FenceStateV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1, RelayHealthV1, Release202611V1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, FenceStateV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1, RelayHealthV1, Release202611V1, FirewallIPv6V1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {
@@ -1059,6 +1080,10 @@ var replicationGated = map[string]bool{
 	// Confirmed against every replication recipient: cluster_policies' shapes
 	// must be decodable by every host we stream to.
 	FailoverScopeV1: true,
+	// Confirmed against every replication recipient: an IPv6 firewall row
+	// must be renderable by every host we stream to, since each renders its
+	// own firewall from what it receives. See FirewallIPv6V1.
+	FirewallIPv6V1: true,
 	// Confirmed against every replication recipient: voter_configs' shapes
 	// must be decodable by every host we stream to.
 	VoterConfigV1: true,
@@ -1118,6 +1143,10 @@ var mandatory = map[string]bool{
 	// A fact about the binary (it decodes cluster_policies and honours
 	// failover_scope). The policy is the replicated row. See FailoverScopeV1.
 	FailoverScopeV1: true,
+	// A fact about the binary (it renders IPv6 firewall rows), not a policy;
+	// the rows are the opt-in. Standing down in an incident is removing the
+	// IPv6 rules. See FirewallIPv6V1.
+	FirewallIPv6V1: true,
 	// A fact about the binary (it decodes voter_configs and answers the claim
 	// RPCs durably), not a policy — and a flag would let one node count a
 	// different majority from its peers. Its stand-down is the decided

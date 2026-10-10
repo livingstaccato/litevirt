@@ -6,9 +6,9 @@ table inet litevirt-fw {
         type filter hook forward priority filter; policy drop;
         ct state established,related accept
         ct state invalid drop
+        ip6 hoplimit != 255 icmpv6 type { nd-router-solicit, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert, nd-redirect } drop
         jump cluster_default
         jump host_overrides
-        jump nic_dispatch
     }
 
     chain cluster_default {
@@ -17,9 +17,6 @@ table inet litevirt-fw {
 
     chain host_overrides {
         tcp dport 22 ip saddr 192.0.2.0/24 accept comment "ssh from jump"
-    }
-
-    chain nic_dispatch {
     }
 
 }

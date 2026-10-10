@@ -23,6 +23,7 @@ func newNetworkCmd() *cobra.Command {
 		newNetworkLsCmd(),
 		newNetworkInspectCmd(),
 		newNetworkCreateCmd(),
+		newNetworkSetCmd(),
 		newNetworkRmCmd(),
 	)
 	return cmd
@@ -113,6 +114,8 @@ func newNetworkCreateCmd() *cobra.Command {
 		spoofCheck bool
 		project    string
 		netboxID   int
+		gateway    string
+		reserved   []string
 	)
 	cmd := &cobra.Command{
 		Use:   "create <name>",
@@ -128,18 +131,20 @@ Examples:
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				ni, err := c.CreateNetwork(ctx, &pb.CreateNetworkRequest{
-					Name:           args[0],
-					Type:           ntype,
-					Iface:          iface,
-					Vlan:           int32(vlan),
-					Vni:            int32(vni),
-					Underlay:       underlay,
-					Subnet:         subnet,
-					Dhcp:           dhcp,
-					Pf:             pf,
-					SpoofCheck:     spoofCheck,
-					Project:        project,
-					NetboxPrefixId: int32(netboxID),
+					Name:              args[0],
+					Type:              ntype,
+					Iface:             iface,
+					Vlan:              int32(vlan),
+					Vni:               int32(vni),
+					Underlay:          underlay,
+					Subnet:            subnet,
+					Dhcp:              dhcp,
+					Pf:                pf,
+					SpoofCheck:        spoofCheck,
+					Project:           project,
+					NetboxPrefixId:    int32(netboxID),
+					Gateway:           gateway,
+					ReservedAddresses: reserved,
 				})
 				if err != nil {
 					// The server's own message, not a wrapped rpc error. This
@@ -173,6 +178,60 @@ Examples:
 	cmd.Flags().StringVar(&project, "project", "", "Owning project (empty = global/shared, usable by all projects)")
 	cmd.Flags().IntVar(&netboxID, "netbox-prefix-id", 0,
 		"bind this network to a NetBox prefix, claiming VM addresses from it")
+	cmd.Flags().StringVar(&gateway, "gateway", "",
+		"the network's router when it is not litevirt's (e.g. the upstream router of an external bridge); no guest NIC may claim it")
+	cmd.Flags().StringSliceVar(&reserved, "reserved-address", nil,
+		"an infrastructure address on the network no guest NIC may claim (repeatable)")
+	return cmd
+}
+
+func newNetworkSetCmd() *cobra.Command {
+	var (
+		gateway  string
+		reserved []string
+		vlans    []int
+	)
+	cmd := &cobra.Command{
+		Use:   "set <name>",
+		Short: "Set a network's gateway, reserved addresses or allowed trunk VLANs",
+		Long: `Change what a network keeps from its NICs (needs network.update on it):
+
+  --gateway            its router when it is not litevirt's own; no guest NIC may claim it
+  --reserved-address   further infrastructure addresses no guest NIC may claim (repeatable; replaces the list)
+  --allowed-vlans      the VLANs a NIC on the trunk: feature may carry (replaces the list)
+
+Only the flags given change; an empty value clears that setting.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			req := &pb.SetNetworkGuardConfigRequest{Name: args[0]}
+			if cmd.Flags().Changed("gateway") {
+				req.SetGateway, req.Gateway = true, gateway
+			}
+			if cmd.Flags().Changed("reserved-address") {
+				req.SetReservedAddresses, req.ReservedAddresses = true, reserved
+			}
+			if cmd.Flags().Changed("allowed-vlans") {
+				req.SetAllowedVlans = true
+				for _, v := range vlans {
+					req.AllowedVlans = append(req.AllowedVlans, int32(v))
+				}
+			}
+			if !req.SetGateway && !req.SetReservedAddresses && !req.SetAllowedVlans {
+				return errors.New("nothing to set: give --gateway, --reserved-address or --allowed-vlans")
+			}
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				ni, err := c.SetNetworkGuardConfig(ctx, req)
+				if err != nil {
+					return errors.New(status.Convert(err).Message())
+				}
+				fmt.Printf("Network %s updated\n", ni.Name)
+				return nil
+			})
+		},
+	}
+	cmd.Flags().StringVar(&gateway, "gateway", "", "the network's router when it is not litevirt's; empty clears it")
+	cmd.Flags().StringSliceVar(&reserved, "reserved-address", nil, "an infrastructure address no guest NIC may claim (repeatable; replaces the list)")
+	cmd.Flags().IntSliceVar(&vlans, "allowed-vlans", nil, "the VLANs a trunk NIC on this network may carry (comma-separated; replaces the list)")
 	return cmd
 }
 

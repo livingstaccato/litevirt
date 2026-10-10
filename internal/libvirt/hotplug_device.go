@@ -49,16 +49,7 @@ func (c *Client) DetachDisk(domainName, targetDev string) error {
 
 // AttachNIC hot-attaches a network interface to a running domain.
 func (c *Client) AttachNIC(domainName, bridge, model, mac string) error {
-	if model == "" {
-		model = "virtio"
-	}
-	iface := interfaceDevice{
-		Type:   "bridge",
-		MAC:    ifaceMAC{Address: mac},
-		Source: ifaceSource{Bridge: bridge},
-		Model:  ifaceModel{Type: model},
-	}
-	return c.attachDeviceXML(domainName, iface)
+	return c.attachDeviceXML(domainName, bridgeInterface(bridge, model, mac))
 }
 
 // DetachNIC hot-detaches a network interface by MAC address.

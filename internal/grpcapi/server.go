@@ -764,6 +764,18 @@ type Server struct {
 	// ReloadFirewall calls Reconcile(ctx) on it synchronously to give
 	// `lv firewall reload` push semantics rather than a 30s wait.
 	fwReconciler FirewallReconciler
+	fwMu         sync.RWMutex
+
+	// DHCP reservations made for NICs whose rows are not written yet
+	// (nic_identity.go): network → address → reservation.
+	dhcpResMu   sync.Mutex
+	dhcpPending map[string]map[string]dhcpPendingRes
+	// Host-local DHCP facts a reservation depends on; nil = the real host
+	// (network.DHCPServedHere, network.BridgeHasUplink, network.AddDHCPHost).
+	// Test seams: SetDHCPReservationBackend.
+	dhcpServedHere  func(bridge string) bool
+	bridgeHasUplink func(bridge string) bool
+	addDHCPHost     func(bridge, mac, ip string) error
 
 	// antiEntropy is the daemon's anti-entropy loop. TriggerAntiEntropy calls RunOnce on
 	// it so `lv cluster converge` kicks an immediate (debounced) pass instead of waiting
@@ -1041,6 +1053,9 @@ func (s *Server) advertisedCapabilities() []string {
 	// (this binary decodes cluster_policies and honours failover_scope). The
 	// opt-in is the replicated policy row, which cannot be written until the
 	// ReplicationGated latch has formed.
+	// firewall_ipv6_v1 is not withheld either: it is a fact about the build
+	// (this binary renders IPv6 firewall rows), and no IPv6 row is written
+	// until the ReplicationGated latch has formed.
 	// claim_incarnation_v1 is not withheld either: it is the claim format this
 	// binary's voters keep (an incarnation in the key, the v2 accept, the
 	// legacy-key seal), a fact about the build.
@@ -1217,6 +1232,14 @@ func (s *Server) SetNetBoxMirrorInventory(on bool) { s.enfNetBoxMirror = on }
 // SetBridgeEnsure injects the host-bridge test seam (see bridgeEnsure): a
 // rootless harness cannot create a real bridge, so it substitutes a no-op.
 func (s *Server) SetBridgeEnsure(fn func(name string) error) { s.bridgeEnsure = fn }
+
+// SetDHCPReservationBackend injects the host-local DHCP facts an exact
+// reservation depends on (nic_identity.go): whether this host's dnsmasq
+// serves a bridge, whether the bridge has an uplink, and the reservation
+// write itself. A nil argument keeps the real host's answer.
+func (s *Server) SetDHCPReservationBackend(served, uplink func(bridge string) bool, add func(bridge, mac, ip string) error) {
+	s.dhcpServedHere, s.bridgeHasUplink, s.addDHCPHost = served, uplink, add
+}
 
 // SetBridgeExists injects the "does this bridge already exist here" seam (see
 // bridgeExists). It is the host-local fact the NetBox bind-time DHCP refusal
@@ -1497,6 +1520,10 @@ func (s *Server) tokenEnabled(token string) bool {
 	case capabilities.FailoverScopeV1:
 		// No kill switch: the token says this build decodes cluster_policies
 		// and honours failover_scope. The opt-in is the replicated policy row.
+		return true
+	case capabilities.FirewallIPv6V1:
+		// No kill switch: the token says this build renders IPv6 firewall
+		// rows. The opt-in is writing one.
 		return true
 	case capabilities.VoterConfigV1:
 		// No kill switch: a node with voter_config_v1 off would count a
@@ -2005,7 +2032,20 @@ func (s *Server) RealmRegistry() *auth.Registry { return s.realmRegistry }
 
 // SetFirewallReconciler wires the daemon's firewall reconciler so the
 // ReloadFirewall RPC can drive a synchronous Reconcile.
-func (s *Server) SetFirewallReconciler(r FirewallReconciler) { s.fwReconciler = r }
+func (s *Server) SetFirewallReconciler(r FirewallReconciler) {
+	s.fwMu.Lock()
+	defer s.fwMu.Unlock()
+	s.fwReconciler = r
+}
+
+// fwRec is the firewall reconciler, safe against SetFirewallReconciler from
+// the daemon's start-up while the runtime loops already run (re-review
+// R2-I2).
+func (s *Server) fwRec() FirewallReconciler {
+	s.fwMu.RLock()
+	defer s.fwMu.RUnlock()
+	return s.fwReconciler
+}
 
 // SetAntiEntropy wires the daemon's anti-entropy loop so TriggerAntiEntropy can drive an
 // immediate (debounced) pass for `lv cluster converge`.
@@ -2018,10 +2058,10 @@ func (s *Server) SetAntiEntropy(a AntiEntropyTrigger) { s.antiEntropy = a }
 // tick after a create. A failure is only a latency regression (the tick still
 // applies it), so it is logged, not surfaced.
 func (s *Server) reconcileFirewall(ctx context.Context) {
-	if s.fwReconciler == nil {
+	if s.fwRec() == nil {
 		return
 	}
-	if err := s.fwReconciler.Reconcile(ctx); err != nil {
+	if err := s.fwRec().Reconcile(ctx); err != nil {
 		slog.Debug("firewall reconcile after intent change failed (next tick will apply)", "error", err)
 	}
 }
@@ -2034,10 +2074,10 @@ func (s *Server) reconcileFirewall(ctx context.Context) {
 // direct EnsureHostIsolation/EnsureNAT calls, which returned the error. Teardown
 // and LB paths use the best-effort reconcileFirewall instead.
 func (s *Server) reconcileFirewallRequired(ctx context.Context) error {
-	if s.fwReconciler == nil {
+	if s.fwRec() == nil {
 		return nil
 	}
-	return s.fwReconciler.Reconcile(ctx)
+	return s.fwRec().Reconcile(ctx)
 }
 
 // SetFirmwarePaths injects the host's resolved OVMF firmware paths (G1).

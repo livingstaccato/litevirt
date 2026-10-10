@@ -69,6 +69,11 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 	if err := s.RequirePerm(ctx, vmRBACPathFor(project, name), "vm.create", "operator"); err != nil {
 		return err
 	}
+	switch first.SpoofGuard {
+	case "", "off":
+	default:
+		return status.Errorf(codes.InvalidArgument, "spoof_guard %q: want off, or leave it empty", first.SpoofGuard)
+	}
 
 	// Forward to the destination host without consuming more of the stream, so
 	// bytes land directly on the host that will own the VM (a concurrent stream
@@ -420,6 +425,43 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 	s.pinMachineFromDomain(spec)
 	specJSON, _ := json.Marshal(spec)
 	diskRecords, ifaceRecords, nicRecords := importRecords(fv, name, s.hostName)
+	// An imported NIC is a new NIC on the segment: its MAC must be its own, and
+	// on a network with a subnet it is guarded — confined to the subnet, since
+	// an imported guest was addressed before litevirt knew it. Turning that off
+	// needs authority over the network, like any other relaxation.
+	unwindImport := func() {
+		_ = s.virt.UndefineDomain(name, false)
+		if fwImport {
+			lv.WipeFirmwareState(s.dataDir, name, spec.Uuid)
+		}
+		cleanupDisks()
+	}
+	var importAtts []*pb.NetworkAttachment
+	for _, n := range fv.NICs {
+		importAtts = append(importAtts, &pb.NetworkAttachment{Name: n.Network, Mac: n.MAC})
+	}
+	if err := s.checkNICIdentities(ctx, project, importAtts, name); err != nil {
+		unwindImport()
+		return err
+	}
+	var importGuards []corrosion.NICGuardRecord
+	for i, n := range fv.NICs {
+		if first.SpoofGuard == "off" {
+			if err := s.requireGuardAuthority(ctx, n.Network, "importing a NIC unguarded"); err != nil {
+				unwindImport()
+				return err
+			}
+			continue
+		}
+		if def, _ := lookupNetworkDef(ctx, s.db, n.Network); def != nil && def.Subnet != "" && def.Type != "direct" && def.Type != "sriov" {
+			importGuards = append(importGuards, corrosion.NICGuardRecord{VMName: name, MAC: n.MAC, Mode: corrosion.NICGuardOn,
+				VMUUID: spec.Uuid, Network: n.Network, Ordinal: i})
+		}
+	}
+	if err := s.writeNewNICGuards(ctx, importGuards); err != nil {
+		unwindImport()
+		return err
+	}
 	// pciIntents: the mapped spec's Devices, if the source format ever declares
 	// any (none do today — ForeignVM carries no PCI passthrough — but this keeps
 	// import on the same canonicalized-BDF path as every other producer with a

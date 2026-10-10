@@ -267,7 +267,7 @@ func (s *Server) CloneContainer(ctx context.Context, req *pb.CloneContainerReque
 	}
 
 	if req.Start {
-		if err := s.containerRuntime.StartContainer(ctx, req.Target); err != nil {
+		if err := s.startContainerArmed(ctx, req.Target); err != nil {
 			s.audit(ctx, "ct.clone", req.Target, "project="+project+" (start failed)", "error")
 			return nil, status.Errorf(codes.Internal, "cloned but start failed: %v", err)
 		}

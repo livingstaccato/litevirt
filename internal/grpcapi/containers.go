@@ -284,6 +284,34 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		}
 		idmapBase = b
 	}
+	// A container's managed NICs are new NICs: guarded by default, held to the
+	// exact address IPAM gave them. Recorded — and put in force, from the
+	// NICs planned here, since its rows do not exist yet — before the runtime
+	// brings its veth up (re-review m-f, m10); a failure fails the create.
+	// Before failover_scope_v1 has latched nothing can be recorded and the
+	// NICs are unguarded, as every container NIC was.
+	ctOwner := corrosion.ContainerGuardOwner(s.hostName, req.Name)
+	var ctGuards []corrosion.NICGuardRecord
+	for _, ifc := range plan.ifaces {
+		ctGuards = append(ctGuards, corrosion.NICGuardRecord{
+			VMName: ctOwner, MAC: ifc.MAC, Mode: corrosion.NICGuardOn,
+			Network: ifc.NetworkName, Ordinal: ifc.Ordinal})
+	}
+	if err := s.writeNewNICGuards(ctx, ctGuards); err != nil {
+		_ = s.releaseContainerNICs(ctx, req.Name)
+		s.audit(ctx, "ct.create", req.Name, "image="+req.Image, "error")
+		return nil, err
+	}
+	if pa, ok := s.fwRec().(pendingContainerArmer); ok && len(plan.ifaces) > 0 {
+		pa.SetPendingContainer(req.Name, plan.ifaces)
+		defer pa.ClearPendingContainer(req.Name)
+	}
+	if err := s.armWorkload(ctx, ctOwner, req.Name); err != nil {
+		_ = s.releaseContainerNICs(ctx, req.Name)
+		s.retireNICGuards(ctx, ctOwner)
+		s.audit(ctx, "ct.create", req.Name, "image="+req.Image, "error")
+		return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
+	}
 	info, err := s.containerRuntime.CreateContainer(ctx, CreateContainerOpts{
 		Name: req.Name, Template: req.Template,
 		Distro: req.Distro, Release: req.Release, Arch: req.Arch,
@@ -293,6 +321,7 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	})
 	if err != nil {
 		_ = s.releaseContainerNICs(ctx, req.Name)
+		s.retireNICGuards(ctx, ctOwner)
 		s.audit(ctx, "ct.create", req.Name, "image="+req.Image, "error")
 		return nil, status.Errorf(codes.Internal, "create: %v", err)
 	}
@@ -349,6 +378,9 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		}
 		s.audit(ctx, "ct.create", info.Name, "image="+rec.Image, "error")
 		return nil, status.Errorf(codes.Internal, "create: record cluster state: %v", err)
+	}
+	if len(ctGuards) > 0 {
+		s.reconcileLocal(ctx)
 	}
 	s.audit(ctx, "ct.create", info.Name, "project="+tenancy.NormalizeProject(req.Project)+" image="+rec.Image, "ok")
 	slog.Info("container created", "name", info.Name, "host", s.hostName)
@@ -430,8 +462,11 @@ func (s *Server) StartContainer(ctx context.Context, req *pb.StartContainerReque
 		s.audit(ctx, "ct.start", req.Name, "project="+project+" id range overlap", "denied")
 		return nil, err
 	}
-	if err := s.containerRuntime.StartContainer(ctx, req.Name); err != nil {
+	if err := s.startContainerArmed(ctx, req.Name); err != nil {
 		s.audit(ctx, "ct.start", req.Name, "project="+project, "error")
+		if status.Code(err) == codes.FailedPrecondition {
+			return nil, err
+		}
 		return nil, status.Errorf(codes.Internal, "start: %v", err)
 	}
 	// Clear any prior stop intent ('operator-stop') so a later unexpected stop is
@@ -612,6 +647,7 @@ func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 	// prior delete may have tombstoned the container row but failed these, so a
 	// retry (now zero-row) must still clean them up, else a later same-host/name
 	// recreate inherits stale leases/rows.
+	s.retireNICGuards(ctx, corrosion.ContainerGuardOwner(s.hostName, req.Name))
 	nicErr := s.releaseContainerNICs(ctx, req.Name)
 	// Remove the auto DNS record (prompt — a lingering record could resolve to a now
 	// freed/reassigned IP). Best-effort; the reaper backstops.

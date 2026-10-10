@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -457,5 +458,77 @@ func TestContainerReplication_APreUpgradeRowGetsAPlacementAndKeepApplies(t *test
 	}
 	if n := len(replicas(t, repo, name)); n != 1 {
 		t.Fatalf("keep 1 left %d replicas", n)
+	}
+}
+
+// R3-m1: two schedules of one container fire on the same tick, and both read
+// the row before either gives it a placement id. The one that loses the mint
+// archives under the placement the other minted, never under the empty one it
+// first read (which the target would accept, and its next run set aside):
+//   - "before the lock": the other run mints after this run read the row and
+//     before it takes the container's lock, so the re-read under the lock
+//     finds the placement;
+//   - "under the lock": another writer's mint lands between this run's re-read
+//     and its own compare-and-set, which therefore loses, and the run re-reads.
+//
+// The container replication gate is the seam: a run consults it once before
+// the lock, and the mint consults it (RepointReady) just before its
+// compare-and-set.
+func TestContainerReplication_ARunThatLosesTheMintArchivesUnderTheWinnersPlacement(t *testing.T) {
+	for _, tc := range []struct {
+		when  string
+		winAt int32 // the gate call on which the other writer mints
+	}{{"before the lock", 1}, {"under the lock", 2}} {
+		t.Run(tc.when, func(t *testing.T) {
+			c := New(t, Options{Nodes: 2, SharedCRDT: true})
+			a, b := c.Nodes[0], c.Nodes[1]
+			ctx := context.Background()
+			const name = "web"
+			replCT(t, c, a, name)
+			drRepo(t, b)
+			sched := ctSchedule(t, c, a, name, b.Name, 2, true)
+			if err := a.DB.Execute(ctx, `UPDATE containers SET create_spec = '' WHERE host_name = ? AND name = ?`, a.Name, name); err != nil {
+				t.Fatal(err)
+			}
+			var calls atomic.Int32
+			var won atomic.Bool
+			a.Server.SetContainerReplicationGate(func(gctx context.Context) error {
+				if calls.Add(1) == tc.winAt {
+					row, err := corrosion.GetContainer(gctx, a.DB, a.Name, name)
+					if err != nil || row == nil {
+						t.Errorf("row: %v", err)
+						return nil
+					}
+					_, applied, err := corrosion.MintContainerPlacementSpec(gctx, a.DB, a.Name, name, row.CreateSpec)
+					if err != nil {
+						t.Errorf("the other writer's mint: %v", err)
+					}
+					won.Store(applied)
+				}
+				return nil
+			})
+			a.CT.Seed(name, "run")
+			if err := a.Server.RunReplication(ctx, sched, time.Now().UTC().Add(-time.Minute)); err != nil {
+				t.Fatalf("the run that lost the mint: %v", err)
+			}
+			if !won.Load() {
+				t.Fatal("premise: the other writer's mint landed first")
+			}
+			row, err := corrosion.GetContainer(ctx, a.DB, a.Name, name)
+			if err != nil || row == nil || corrosion.PlacementOf(row.CreateSpec) == "" {
+				t.Fatalf("premise: the row has the minted placement: %+v %v", row, err)
+			}
+			want := corrosion.PlacementOf(row.CreateSpec)
+			list, err := c.SelfClient(b).ListContainerReplicas(ctx, &pb.ListContainerReplicasRequest{Repo: "dr", Project: "_default", Name: name})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(list.Replicas) != 1 {
+				t.Fatalf("want one replica, got %+v", list.Replicas)
+			}
+			if got := list.Replicas[0].Placement; got != want {
+				t.Fatalf("a run that lost the mint archived a replica of placement %q, want the minted %q", got, want)
+			}
+		})
 	}
 }

@@ -1349,7 +1349,9 @@ func manifestIndexProject(m *pbsstore.Manifest) string {
 // Instants are compared only within one placement (one host, one clock). A
 // backup taken in another placement never outranks the replica, which was
 // taken in the placement being relocated: the current placement's copy wins,
-// whatever two hosts' clocks say.
+// whatever two hosts' clocks say. A replica with no placement id (a row from
+// before this build) is compared only with a backup with none taken on the
+// same host: the same clock.
 func (s *Server) backupCapturedAfter(repoName, name, ts, replicaAt, replicaSource, replicaPlacement string) bool {
 	path, ok := s.backupRepos[repoName]
 	if !ok {
@@ -1364,7 +1366,7 @@ func (s *Server) backupCapturedAfter(repoName, name, ts, replicaAt, replicaSourc
 		return false
 	}
 	spec, _ := manifestSpec(m)
-	if replicaPlacement == "" || spec.Placement != replicaPlacement || spec.Source != replicaSource {
+	if replicaSource == "" || spec.Placement != replicaPlacement || spec.Source != replicaSource {
 		return false
 	}
 	b, ok := capturedAt(m)

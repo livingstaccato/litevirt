@@ -185,6 +185,15 @@ func TestReplicationIndependent_AFailoverThatDidNotUseTheReplicaKeepsIt(t *testi
 		t.Fatal(err)
 	}
 	waitForRepl(t, b.Name+" to see the container gone", func() bool { return containerHostOn(t, b, name) == "" })
+	// a, the host the replica was taken on, is asked too: while it is cut off
+	// it still sees its own row live, and the restore is refused.
+	if _, err := c.SelfClient(b).RestoreContainerReplica(ctx, restore); status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), a.Name) {
+		t.Fatalf("a restore while %s, the replica's source, still sees the container live: %v, want refused", a.Name, err)
+	}
+	// a comes back (fenced, so it runs nothing) and learns the container moved
+	// and is gone: now every host that could hold it says so.
+	c.ClearLinkFaults()
+	waitForRepl(t, a.Name+" to see the container gone", func() bool { return containerHostOn(t, a, name) == "" })
 	if _, err := c.SelfClient(b).RestoreContainerReplica(ctx, restore); err != nil {
 		t.Fatalf("restoring the set-aside replica: %v", err)
 	}
@@ -619,10 +628,103 @@ func TestReplicationIndependent_ARestoreNeedsTheLastOwnersWord(t *testing.T) {
 	_, err := c.SelfClient(b).RestoreContainerReplica(ctx, &pb.RestoreContainerReplicaRequest{
 		Repo: "dr", Project: "_default", Name: name, Timestamp: ms[0].Timestamp,
 	})
-	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "last-known owner") {
-		t.Fatalf("a restore the last-known owner contradicts: %v, want refused with the reason", err)
+	// "still sees": the owner answered and contradicted the restore, which is
+	// a different refusal from an owner that could not be asked.
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "still sees") || !strings.Contains(err.Error(), a.Name) {
+		t.Fatalf("a restore the last-known owner contradicts: %v, want refused because %s still sees it live", err, a.Name)
 	}
 	if b.CT.Exists(name) {
+		t.Fatal("a second copy was laid down")
+	}
+}
+
+// R3-I1, the migrate case: web moves from a to b. b's new row travels on b's
+// stream and a's tombstone on a's, and b's stream is held from both the replica
+// host and a. The replica host's newest row is a's tombstone, and a, asked,
+// sees no live row either: only b can say web is running, so b must be asked.
+func TestReplicationIndependent_ARestoreAsksTheHostAMigrateMovedTo(t *testing.T) {
+	c := New(t, Options{Nodes: 3, IndependentReplicas: true})
+	a, b, tg := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	ctx := context.Background()
+	c.WaitConverged(t, convergeTimeout)
+	const name = "web"
+	replCT(t, c, a, name)
+	repo := drRepo(t, tg)
+	c.WaitConverged(t, convergeTimeout)
+	sched := ctSchedule(t, c, a, name, tg.Name, 2, true)
+	c.WaitConverged(t, convergeTimeout)
+	a.CT.Seed(name, "replicated")
+	if err := a.Server.RunReplication(ctx, sched, time.Now().UTC().Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	ms := replicas(t, repo, name)
+	if len(ms) != 1 {
+		t.Fatalf("premise: one replica, got %d", len(ms))
+	}
+	// The migrate: b's stream is held from tg and from a, in both directions,
+	// so neither learns of b's row by push or by pull.
+	c.SetLinkFaultBoth(b, tg, LinkFault{Block: true})
+	c.SetLinkFaultBoth(b, a, LinkFault{Block: true})
+	row, err := corrosion.GetContainer(ctx, a.DB, a.Name, name)
+	if err != nil || row == nil {
+		t.Fatalf("row on %s: %v", a.Name, err)
+	}
+	moved := *row
+	moved.HostName, moved.CreatedAt = b.Name, ""
+	moved.CreateSpec, _ = corrosion.WithNewPlacement(moved.CreateSpec)
+	if err := corrosion.UpsertContainer(ctx, b.DB, moved); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.DeleteContainer(ctx, a.DB, a.Name, name); err != nil {
+		t.Fatal(err)
+	}
+	waitForRepl(t, tg.Name+" to apply "+a.Name+"'s tombstone", func() bool { return containerHostOn(t, tg, name) == "" })
+	if onB, err := corrosion.GetContainer(ctx, b.DB, b.Name, name); containerHostOn(t, a, name) != "" || err != nil || onB == nil {
+		t.Fatalf("premise: %s sees no container, %s runs it (%v)", a.Name, b.Name, err)
+	}
+	_, err = c.SelfClient(tg).RestoreContainerReplica(ctx, &pb.RestoreContainerReplicaRequest{
+		Repo: "dr", Project: "_default", Name: name, Timestamp: ms[0].Timestamp,
+	})
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "still sees") || !strings.Contains(err.Error(), b.Name) {
+		t.Fatalf("a restore while %s runs the container after a migrate: %v, want refused because %s still sees it live", b.Name, err, b.Name)
+	}
+	if tg.CT.Exists(name) {
+		t.Fatal("a second copy was laid down")
+	}
+}
+
+// R3-I1, the no-row case: the replica host holds replicas of a container it has
+// no row for at all (the owner's stream to it is held; replicas arrive by a
+// direct push). No row is not absence: the host the replica was taken on is
+// asked, and it still runs the container.
+func TestReplicationIndependent_ARestoreWithNoRowAsksTheReplicasSource(t *testing.T) {
+	c := New(t, Options{Nodes: 3, IndependentReplicas: true})
+	a, tg := c.Nodes[0], c.Nodes[2]
+	ctx := context.Background()
+	c.WaitConverged(t, convergeTimeout)
+	const name = "web"
+	repo := drRepo(t, tg)
+	cutOff(c, tg) // tg never receives the container's row
+	replCT(t, c, a, name)
+	sched := ctSchedule(t, c, a, name, tg.Name, 2, true)
+	a.CT.Seed(name, "replicated")
+	if err := a.Server.RunReplication(ctx, sched, time.Now().UTC().Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	ms := replicas(t, repo, name)
+	if len(ms) != 1 {
+		t.Fatalf("premise: one replica on %s, got %d", tg.Name, len(ms))
+	}
+	if rows, err := tg.DB.Query(ctx, `SELECT host_name FROM containers WHERE name = ?`, name); err != nil || len(rows) != 0 {
+		t.Fatalf("premise: %s holds no row of %s at all: %d row(s), %v", tg.Name, name, len(rows), err)
+	}
+	_, err := c.SelfClient(tg).RestoreContainerReplica(ctx, &pb.RestoreContainerReplicaRequest{
+		Repo: "dr", Project: "_default", Name: name, Timestamp: ms[0].Timestamp,
+	})
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "still sees") || !strings.Contains(err.Error(), a.Name) {
+		t.Fatalf("a restore on a host with no row while %s runs the container: %v, want refused because it is live on %s", a.Name, err, a.Name)
+	}
+	if tg.CT.Exists(name) {
 		t.Fatal("a second copy was laid down")
 	}
 }

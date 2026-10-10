@@ -174,8 +174,17 @@ func TestRunReplication_VMMovedOntoItsTargetIsSuspended(t *testing.T) {
 	if _, err := publishRecordedReplica(ctx, f.dr, srec, func(tmp string) error { return os.WriteFile(tmp, []byte("replica"), 0o600) }); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.s.RunReplication(ctx, shared, time.Now()); errors.Is(err, errReplicationSuspended) {
-		t.Fatalf("a shared schedule's VM on its target was suspended: %v", err)
+	if err := f.s.RunReplication(ctx, shared, time.Now()); err != nil {
+		t.Fatalf("a shared schedule's VM on its target did not replicate as on main: %v", err)
+	}
+	var mine int
+	for _, r := range f.s.replicaRecordsOn(ctx, "dr", f.s.hostName, "a", "web") {
+		if r.Schedule == replicaScheduleKey(shared) {
+			mine++
+		}
+	}
+	if mine != 2 {
+		t.Fatalf("the shared schedule's run wrote no replica here: %d record(s) of %s, want the earlier one and a new one", mine, replicaScheduleKey(shared))
 	}
 }
 
@@ -338,6 +347,19 @@ func TestBackupCapturedAfter_JudgesByCaptureNotName(t *testing.T) {
 	// m1: never two hosts' clocks: the current placement's replica wins.
 	if s.backupCapturedAfter("bk", "web", "2026-01-01T12:00:00Z", "2026-01-01T10:20:00Z", "host-d", "p-d") {
 		t.Fatal("a backup of another placement outranked the replica by comparing two hosts' clocks")
+	}
+	// R3-n1: a replica with no placement id (a row from before this build)
+	// and a backup with none, both taken on one host, are on one clock.
+	backup("2026-01-01T13:00:00Z", "2026-01-01T13:00:00Z", "host-e", "")
+	if !s.backupCapturedAfter("bk", "web", "2026-01-01T13:00:00Z", "2026-01-01T12:30:00Z", "host-e", "") {
+		t.Fatal("a same-host backup captured after a placement-less replica lost to the older replica")
+	}
+	if s.backupCapturedAfter("bk", "web", "2026-01-01T13:00:00Z", "2026-01-01T12:30:00Z", "host-f", "") {
+		t.Fatal("a placement-less backup of another host outranked the replica by comparing two hosts' clocks")
+	}
+	backup("2026-01-01T14:00:00Z", "2026-01-01T14:00:00Z", "", "")
+	if s.backupCapturedAfter("bk", "web", "2026-01-01T14:00:00Z", "2026-01-01T12:30:00Z", "", "") {
+		t.Fatal("a replica that records no source host was compared on a clock it cannot name")
 	}
 }
 

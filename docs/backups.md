@@ -470,10 +470,21 @@ is what a failover that did not restore from the replica leaves behind (the
 container came back from its image or a backup, or on a host placement chose
 over the replica host): the set-aside replica may be the newest copy of the
 data. An operator can restore it, stopped, as the container, or remove it;
-removal asks first. A restore is refused unless both the replica host and the
-container's last-known owner positively see no live copy of it (a host that
-cannot be asked cannot vouch: bring it back or remove it from the cluster), so
-there is never a second runnable copy. It may be entered on any node. A replica no schedule settles any more (the schedule was
+removal asks first. It may be entered on any node. A restore is refused unless
+each of these positively sees no live copy of the container, so there is never
+a second runnable copy:
+
+- the replica host;
+- the host the replica was taken on, which is asked even when the replica host
+  has no row of the container at all;
+- every host the replica host holds a row of the container for, deleted rows
+  included;
+- a majority of the voters; every other member is asked too.
+
+Any host that sees the container live refuses the restore. A host in the first
+three that cannot be asked cannot vouch, and neither can a missing majority: the
+refusal names the host, and the remedy is to bring it back or remove it from the
+cluster (`lv host rm`). A replica no schedule settles any more (the schedule was
 deleted, re-targeted or reversed away) is listed as orphaned and may be removed
 too:
 

@@ -1048,6 +1048,12 @@ vms:
 	lv(t, "compose", "down", "--name", stackName, "-y")
 }
 
+// TestCompose_RollingUpdate deploys two replicas under a start-first update
+// policy, changes their cpu, and checks the redeploy applied the change to
+// both and left both running. The batch size of a start-first update is
+// update.max-surge (internal/rolling: MaxSurge for start-first, MaxUnavailable
+// for stop-first); compose has no max-parallel, and its strict parser refuses
+// that key.
 func TestCompose_RollingUpdate(t *testing.T) {
 	if skipSlow {
 		t.Skip("slow test skipped")
@@ -1071,7 +1077,7 @@ vms:
     replicas: 2
     update:
       strategy: start-first
-      max-parallel: 1
+      max-surge: 1
 `, stackName, vmBase, testImage, cpu)
 		f := fmt.Sprintf("/tmp/e2e-compose-%d.yaml", os.Getpid())
 		os.WriteFile(f, []byte(compose), 0644)
@@ -1084,12 +1090,45 @@ vms:
 	waitVM(t, vmBase+"-1", "RUNNING", 2*time.Minute)
 	waitVM(t, vmBase+"-2", "RUNNING", 2*time.Minute)
 
+	for _, n := range []string{vmBase + "-1", vmBase + "-2"} {
+		if got := inspectCPU(t, n); got != 1 {
+			t.Fatalf("%s deployed with cpu 1 records cpu %d", n, got)
+		}
+	}
+
 	f = writeCompose(2)
 	lv(t, "compose", "up", "-f", f, "-y")
 	waitVM(t, vmBase+"-1", "RUNNING", 3*time.Minute)
 	waitVM(t, vmBase+"-2", "RUNNING", 3*time.Minute)
+	// The update reached both replicas: a redeploy that planned or applied
+	// nothing would leave them running at cpu 1.
+	for _, n := range []string{vmBase + "-1", vmBase + "-2"} {
+		if got := inspectCPU(t, n); got != 2 {
+			t.Errorf("%s records cpu %d after the update to cpu 2", n, got)
+		}
+	}
 
 	lv(t, "compose", "down", "--name", stackName, "-y")
+}
+
+// inspectCPU is the vCPU count `lv inspect` reports a VM running with
+// (cpuActual), or its spec's cpu when the VM reports none.
+func inspectCPU(t *testing.T, name string) int {
+	t.Helper()
+	var v struct {
+		Spec struct {
+			CPU int `json:"cpu"`
+		} `json:"spec"`
+		CPUActual int `json:"cpuActual"`
+	}
+	out := lv(t, "inspect", name)
+	if err := json.Unmarshal([]byte(out), &v); err != nil {
+		t.Fatalf("inspect %s: %v\n%s", name, err, out)
+	}
+	if v.CPUActual != 0 {
+		return v.CPUActual
+	}
+	return v.Spec.CPU
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

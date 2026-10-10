@@ -42,6 +42,8 @@ A notification has a `kind` (verb.noun), `severity` (`info` | `warn` | `error`),
 | `quota.exceeded` | warn | a CreateVM is rejected by a project quota |
 | `ct.rootfs.stranded` | warn | a container relocated off a failed host left its own rootfs there (nothing removes it); the detail names the container and the host |
 | `vm.disk.stranded` | warn | a failover restarted a VM elsewhere and left its host-local disk on the failed host, a host set such a disk (or an old copy a failover found) aside, or failover held a `restart-same` VM with a host-local disk on its failed host to wait for it; the detail names the VM, the host and the path. See [migration-failover.md](migration-failover.md#the-real-disk-a-restart-leaves-behind) |
+| `certificate.expiring` | warn / error | a certificate this node serves (`host`: its cluster mTLS identity; `ui`: a custom web UI certificate) expires within 30 days (error within 7); repeated daily. Subject is `<host>/<cert>`; the detail names the renew command. See [auth.md](auth.md#renewing-a-host-certificate-lv-host-renew-cert) |
+| `certificate.expired` | error | that certificate is past its NotAfter |
 | `test.notification` | info | `lv notify test` / the UI "Test" button |
 
 > **Route the `ha.vip.*` kinds if you enable VIP HA** (`enforcement.vip_self_demote` /

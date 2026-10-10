@@ -79,6 +79,9 @@ type Daemon struct {
 	checker *health.Checker
 	metrics *metrics.Server
 
+	// certWatch reports on the certificates this node serves (cert_watch.go).
+	certWatch *certWatch
+
 	// mintClearance is the gRPC server the lease-mint clearance asks, published
 	// once its gate is wired. Atomic because lease holders (the rebalancer)
 	// start before the server exists. See wireLeaseMintClearance.
@@ -1509,6 +1512,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// The global ISO library in sync mode: bring this host's copy of every
 	// library file to the recorded version (iso_library.go).
 	go d.runISOLibrarySync(ctx, svc)
+
+	// Certificates this node serves: re-record a host certificate renewed in
+	// place, export expiry, and notify ahead of it (cert_watch.go).
+	d.certWatch = newCertWatch(d.cfg.HostName, d.cfg.PKIDir, d.db, svc, metrics.NewCertMetrics())
+	go d.certWatch.run(ctx)
 
 	// Peer self-upgrade: a daemon that comes back on an old binary (e.g. it was
 	// down during a cluster upgrade) pulls the newer binary from a healthy peer

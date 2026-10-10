@@ -228,3 +228,12 @@ func (s *Server) DeleteNotificationRoute(ctx context.Context, req *pb.DeleteNoti
 	s.audit(ctx, "notify.route.rm", req.Id, "", "ok")
 	return &emptypb.Empty{}, nil
 }
+
+// NotifyCertificate emits a certificate lifecycle notification
+// (certificate.expiring / certificate.expired) for a certificate this node
+// serves. The daemon's certificate watch decides when; this only delivers.
+func (s *Server) NotifyCertificate(kind string, sev notify.Severity, subject, detail string) {
+	s.notify(context.Background(), notify.Notification{
+		Kind: kind, Severity: sev, Subject: subject, Detail: detail,
+	})
+}

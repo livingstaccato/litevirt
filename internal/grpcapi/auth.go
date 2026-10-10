@@ -375,6 +375,18 @@ func (s *Server) isTrustedHostCN(ctx context.Context, cn string) bool {
 			if strings.EqualFold(recorded, presented) {
 				return true
 			}
+			// A CA-issued SUCCESSOR of the recorded certificate (`lv host
+			// renew-cert`): the CA's signature over "this replaces <recorded>"
+			// is the same authority admission recorded, so the renewed node
+			// stays a peer through the swap instead of waiting for its
+			// re-recorded serial to replicate. It cannot reopen a re-admitted
+			// name to an old certificate: that certificate predates the
+			// admission and so cannot name the serial the admission recorded.
+			// See pki.RenewedFromSerial.
+			if prev, ok := pki.RenewedFromSerial(cert); ok && strings.EqualFold(prev, recorded) &&
+				callerCertHasServerAuth(ctx) {
+				return true
+			}
 			if !s.trustRotatedPeerCerts {
 				return false
 			}

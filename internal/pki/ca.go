@@ -266,12 +266,13 @@ const (
 // doing so keeps rotation off the TLS path entirely.
 //
 // That separation is the whole point. Replacing host.crt/host.key on a running
-// node changes the identity the gRPC listener serves (built once at boot and
-// never reloaded), the client identity the health checker dials peers with
-// (likewise), and the target of the libvirt TLS symlinks that qemu+tls://
-// migration reads. Rotating the audit key must not risk any of that: an
-// operator restoring audit integrity should not be gambling with quorum or a
-// live migration.
+// node changes the identity the gRPC listener serves and the client identity
+// the health checker dials peers with (both follow the files at handshake time,
+// identity.go), the serial every peer pins, and the target of the libvirt TLS
+// symlinks that qemu+tls:// migration reads. That is `lv host renew-cert`'s job,
+// done with a CA-attested successor (renew.go); rotating the audit key must not
+// risk any of it: an operator restoring audit integrity should not be gambling
+// with quorum or a live migration.
 //
 // No IP SANs and no ExtKeyUsage: this certificate must never be usable for TLS.
 // Its only job is to say "this public key belongs to this host".

@@ -244,11 +244,47 @@ func RegisterHost(ctx context.Context, c *Client, h HostRecord) error {
 		slog.Warn("this host's certificate has been reissued since it was admitted; re-recording its serial "+
 			"so peers accept it (rotation converges by replication)",
 			"host", h.Name, "recorded_serial", recorded, "installed_serial", h.CertSerial)
-		return c.Execute(ctx,
-			`UPDATE hosts SET cert_serial = ?, updated_at = ? WHERE name = ? AND deleted_at IS NULL`,
-			h.CertSerial, c.NowTS(), h.Name)
+		return c.Execute(ctx, recordOwnCertSerialSQL, h.CertSerial, c.NowTS(), h.Name)
 	}
 	return AdmitHost(ctx, c, h)
+}
+
+// recordOwnCertSerialSQL re-records a live host's certificate serial. One
+// statement shape for both callers (RegisterHost at boot, RecordOwnCertSerial at
+// runtime), so the replicated shape is the one older peers already apply.
+const recordOwnCertSerialSQL = `UPDATE hosts SET cert_serial = ?, updated_at = ? WHERE name = ? AND deleted_at IS NULL`
+
+// RecordOwnCertSerial is RegisterHost's re-record for a RUNNING daemon whose
+// certificate was renewed in place (`lv host renew-cert`): it writes serial to
+// the host's own live row when the row names another one.
+//
+// The same entitlement as at boot applies — the caller passes its own name and
+// the serial it is serving, so the write touches only the node's own row — and
+// the same refusals: a missing or tombstoned row, or a serial the daemon could
+// not read, is left alone. A missing row is not this path's business (boot
+// inserts it), and a tombstone is only ever cleared by admission. It reports
+// whether it wrote.
+func RecordOwnCertSerial(ctx context.Context, c *Client, name, serial string) (bool, error) {
+	if name == "" || serial == "" || strings.EqualFold(serial, "unknown") {
+		return false, nil
+	}
+	rows, err := c.Query(ctx, `SELECT cert_serial, deleted_at FROM hosts WHERE name = ?`, name)
+	if err != nil {
+		return false, err
+	}
+	if len(rows) == 0 || rows[0].String("deleted_at") != "" {
+		return false, nil
+	}
+	recorded := rows[0].String("cert_serial")
+	if strings.EqualFold(recorded, serial) {
+		return false, nil
+	}
+	slog.Info("re-recording this host's renewed certificate serial so peers pin the new certificate",
+		"host", name, "recorded_serial", recorded, "serving_serial", serial)
+	if err := c.Execute(ctx, recordOwnCertSerialSQL, serial, c.NowTS(), name); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // ListHosts returns all active hosts.

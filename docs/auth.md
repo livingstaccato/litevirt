@@ -385,6 +385,58 @@ root-obtained *node* identity. What this model closes is that a **distributable*
 credential (the shared CLI client cert) does not equal admin: hand someone CLI
 reach and they still need to `lv login` to act.
 
+### Renewing a host certificate (`lv host renew-cert`)
+
+A host's cluster certificate — the identity behind every peer and on-node mTLS
+call — is valid for five years. Each daemon exports its expiry as
+`litevirt_certificate_expiry_timestamp_seconds{cert="host"}` and sends a
+`certificate.expiring` notification from 30 days out (error severity inside 7
+days), then `certificate.expired`, repeating daily while it stands. Renew it from
+the machine that holds the cluster CA key:
+
+```bash
+lv host renew-cert host-b
+lv host renew-cert host-b --ssh root@10.0.50.11   # name isn't the address
+```
+
+The host keeps running throughout — no restart, no partition, nothing a peer
+could read as a failure:
+
+1. The new certificate is a **successor**: same name and addresses, a new key, a
+   fresh five-year validity, and — signed by the CA — the serial of the
+   certificate it replaces. Peers pin each host's recorded serial (that pin is
+   what keeps a re-admitted name's old certificate out), and a peer whose record
+   still names the predecessor accepts its successor immediately. The pin is not
+   relaxed: only one hop is honoured, and an older certificate cannot name a
+   serial recorded after it was minted.
+2. The files are installed by rename (key `0600`), and the daemon serves the new
+   pair from the next handshake — its gRPC listener, its peer probes and its
+   loopback clients all read the identity at handshake time, and its recovery-claim
+   votes are signed with it too. A replacement that does not chain to the cluster
+   CA, names another host, or does not match its key is refused and the current
+   identity kept.
+3. The command dials the host and **confirms** it presents the new certificate;
+   if it does not, the previous pair is put back and nothing else happens.
+4. The daemon re-records its own serial within a minute, so the record moves on
+   and the old certificate stops being accepted as that host.
+5. Only then is the old certificate **revoked** and the CRL published, as `lv host
+   rm` does — so a renewal retires the old key instead of leaving a second valid
+   one. `--keep-old` skips this step.
+
+The command refuses, touching nothing, when the cluster's recorded serial and the
+installed certificate disagree (a successor of an unrecorded certificate would be
+refused by every peer until replication caught up); wait a minute after a daemon
+start and retry. A re-added host's audit admission record, which is bound to its
+certificate serial, is re-signed for the new one in the same swap. libvirt's TLS
+listener (`qemu+tls://` migration) is asked to reload; if it cannot, it keeps the
+old certificate until libvirt restarts, which is harmless because libvirt does not
+read the cluster CRL.
+
+Peers on an older release do not recognise the successor and refuse the renewed
+host until its re-recorded serial reaches them by anti-entropy (about a minute) —
+renew once a rolling upgrade has finished. The migration-TLS certificates under
+`pki_dir/migration` come from a separate CA and are not renewed by this command.
+
 ### Recovering the admin account (`lv user reset-admin`)
 
 `lv user reset-admin` is for the cluster nobody can log in to, so it takes no

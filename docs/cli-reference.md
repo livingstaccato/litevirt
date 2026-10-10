@@ -90,6 +90,9 @@ lv host rm --dead <host> [--dry-run]      # Remove a host fenced proof-grade and
                                           #   removes it, and reports the stranded recoveries that now retry
                                           #   at the next claim attempt. --dry-run changes nothing
 lv host publish-crl                       # Re-publish this machine's crl.pem if `host rm` could not
+lv host renew-cert <host>                 # Renew a host's cluster certificate in place: successor
+  [--ssh root@<addr>] [--keep-old]        #   accepted by peers at once, served without a restart,
+  [--grpc-port 7443] [--wait 90s]         #   confirmed, then the old one revoked. See auth.md
 lv host install-gossip-key                # Put the cluster gossip key on every host (mints it if
   [--ssh-user root]                       #   none); never replaces one. Re-run to see each host's
                                           #   gossip stage. See auth.md "Gossip encryption"

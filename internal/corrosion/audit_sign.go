@@ -50,10 +50,11 @@ import (
 // ROTATION moves the host onto a DEDICATED audit signing pair (see
 // auditSigningPaths). It has to be a separate identity, because replacing
 // host.crt/host.key on a running node changes the certificate the gRPC listener
-// serves and the one the health checker dials peers with — both built once at
-// boot and never reloaded — plus the target of the libvirt symlinks that
-// qemu+tls:// migration follows. Rotating the audit key must not put quorum or
-// a live migration at risk.
+// serves and the one the health checker dials peers with — both follow the
+// files at handshake time — the serial every peer pins, and the target of the
+// libvirt symlinks that qemu+tls:// migration follows. That is a renewal (`lv
+// host renew-cert`); rotating the audit key must not put quorum or a live
+// migration at risk.
 
 // auditSigDomain separates audit-row signatures from every other use of the
 // host key. Without it, a signature produced for one protocol could in

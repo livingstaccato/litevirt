@@ -811,6 +811,20 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	peerRelocation := s.isPeerRelocation(ctx, req.Proof != nil)
 	migrateSource := s.migrateSourceFromPeer(ctx)
 
+	// A peer move (a cold migrate, a failover relocation) re-homes an existing
+	// container: what it may hold — its NICs, host mounts and devices,
+	// privilege — is what its SOURCE ROW records, never the archive. Read
+	// before anything is laid down; with no row the restore refuses, so the
+	// move is retried rather than landing the container stripped.
+	var source *corrosion.ContainerRecord
+	if peerRelocation || migrateSource != "" {
+		var serr error
+		if source, serr = s.peerMoveSource(ctx, req, migrateSource); serr != nil {
+			s.audit(ctx, "ct.restore", req.Name, "project="+project+" (source row: "+status.Convert(serr).Message()+")", "error")
+			return serr
+		}
+	}
+
 	// Project isolation. An operator restore rebuilds the archived spec's NICs as
 	// a new workload in the authorized project, so each managed network must be
 	// one that project may use (same project as the backup: a raw bridge is
@@ -1081,29 +1095,6 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	// in the archive's config is trusted (the import already dropped every line
 	// that grants host access or overrides confinement).
 	{
-		// The source row is what authorizes a peer move's host access and
-		// privilege: one that cannot be read fails the restore (Unavailable,
-		// retried), never reads as "no source" and strips a container's
-		// authorized mounts on a transient error.
-		var source *corrosion.ContainerRecord
-		var serr error
-		if migrateSource != "" {
-			source, serr = corrosion.GetContainer(ctx, s.db, migrateSource, req.Name)
-		} else if peerRelocation {
-			token := relocateTokenFromMD(ctx)
-			if token == "" && req.Proof != nil {
-				token = req.Proof.GetRelocationToken()
-			}
-			source, serr = s.relocatingContainer(ctx, req.Name, s.hostName, token)
-		}
-		if serr != nil {
-			if delErr := s.containerRuntime.DeleteContainer(ctx, req.Name); delErr != nil {
-				slog.Warn("container restore: cleanup after the source row read failed also failed", "name", req.Name, "error", delErr)
-			}
-			s.removeRestoreMarker(req.Name)
-			s.audit(ctx, "ct.restore", req.Name, "project="+project+" (source row unreadable)", "error")
-			return status.Errorf(codes.Unavailable, "restore: read the source container's row (what authorizes its host access): %v", serr)
-		}
 		authorized, stripped := s.authorizeRestoredHostAccess(ctx, corrosion.DecodeCreateSpec(spec.CreateSpec), source, !operatorRestore)
 		// Privileged mode and legacy confinement are the same host-escalation
 		// class, decided the same way. Stripped, the container is moved into an
@@ -1150,7 +1141,7 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 		// The network as well: lxc.net.* comes from the authorized spec's
 		// NICs alone, never the archive's (a phys, macvlan or router-mode NIC,
 		// or another tenant's bridge, is host access too).
-		droppedCfg, err := s.renderContainerConfig(ctx, req.Name, authorized, true)
+		droppedCfg, err := s.renderContainerConfig(ctx, req.Name, authorized, restoredNetworkMode(operatorRestore, source))
 		if err != nil {
 			if delErr := s.containerRuntime.DeleteContainer(ctx, req.Name); delErr != nil {
 				slog.Warn("container restore: cleanup after the config rebuild failed also failed", "name", req.Name, "error", delErr)

@@ -13235,8 +13235,18 @@ type RestoreContainerRequest struct {
 	OwnerId             string `protobuf:"bytes,8,opt,name=owner_id,json=ownerId,proto3" json:"owner_id,omitempty"`
 	RestoredFromOwnerId string `protobuf:"bytes,9,opt,name=restored_from_owner_id,json=restoredFromOwnerId,proto3" json:"restored_from_owner_id,omitempty"`
 	RestoredFromTs      string `protobuf:"bytes,10,opt,name=restored_from_ts,json=restoredFromTs,proto3" json:"restored_from_ts,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	// source_create_spec is the moving container's create spec as the peer
+	// that drives a move read it off the container's row: the cold migrate's
+	// source (its own row) or the failover coordinator (the row it marked).
+	// A peer move takes the container's NICs, host mounts and devices and
+	// privilege from that row, never from the archive, and the target's own
+	// replica need not have the row yet. Honoured only on a peer move (a
+	// verified migrate-from, or a peer relocation); any other restore
+	// ignores it. Empty (an earlier build, or a row with no spec) = the
+	// target reads the row from its own replica.
+	SourceCreateSpec string `protobuf:"bytes,11,opt,name=source_create_spec,json=sourceCreateSpec,proto3" json:"source_create_spec,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *RestoreContainerRequest) Reset() {
@@ -13335,6 +13345,13 @@ func (x *RestoreContainerRequest) GetRestoredFromOwnerId() string {
 func (x *RestoreContainerRequest) GetRestoredFromTs() string {
 	if x != nil {
 		return x.RestoredFromTs
+	}
+	return ""
+}
+
+func (x *RestoreContainerRequest) GetSourceCreateSpec() string {
+	if x != nil {
+		return x.SourceCreateSpec
 	}
 	return ""
 }
@@ -35974,7 +35991,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\n" +
 	"\x06FREEZE\x10\x01\x12\b\n" +
 	"\x04COPY\x10\x02\x12\b\n" +
-	"\x04DONE\x10\x03\"\xf1\x02\n" +
+	"\x04DONE\x10\x03\"\x9f\x03\n" +
 	"\x17RestoreContainerRequest\x12\x1b\n" +
 	"\trepo_path\x18\x01 \x01(\tR\brepoPath\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x1c\n" +
@@ -35986,7 +36003,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\bowner_id\x18\b \x01(\tR\aownerId\x123\n" +
 	"\x16restored_from_owner_id\x18\t \x01(\tR\x13restoredFromOwnerId\x12(\n" +
 	"\x10restored_from_ts\x18\n" +
-	" \x01(\tR\x0erestoredFromTs\"\xb3\x02\n" +
+	" \x01(\tR\x0erestoredFromTs\x12,\n" +
+	"\x12source_create_spec\x18\v \x01(\tR\x10sourceCreateSpec\"\xb3\x02\n" +
 	"\x18RestoreContainerProgress\x12A\n" +
 	"\x05phase\x18\x01 \x01(\x0e2+.litevirt.v1.RestoreContainerProgress.PhaseR\x05phase\x12#\n" +
 	"\rbytes_written\x18\x02 \x01(\x03R\fbytesWritten\x12\x1f\n" +

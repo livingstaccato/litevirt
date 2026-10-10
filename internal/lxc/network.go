@@ -2,6 +2,10 @@ package lxc
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -103,4 +107,83 @@ func ResourceConfig(cpuLimit, memMiB int) string {
 		fmt.Fprintf(&b, "lxc.cgroup.memory.limit_in_bytes = %dM\n", memMiB)
 	}
 	return b.String()
+}
+
+// BridgeNICs are the NICs cfg's lxc.net lines configure that are the kind
+// litevirt itself renders — a veth on a bridge — in index order. Every other
+// kind is left out: a host NIC moved in (phys), a NIC on the host's interface
+// (macvlan, ipvlan, vlan), a routed veth (veth.mode router) and an empty
+// namespace (none, empty) are host access, not a bridge attachment.
+//
+// It is what a peer move keeps of an archived config whose container's row
+// predates the create spec, which records nothing about its NICs (R4-I1).
+func BridgeNICs(cfg string) []NetworkAttach {
+	type nic struct {
+		typ, mode string
+		a         NetworkAttach
+	}
+	byIndex := map[int]*nic{}
+	for _, line := range strings.Split(cfg, "\n") {
+		k, v := configKey(line)
+		rest, ok := strings.CutPrefix(k, "lxc.net.")
+		if !ok {
+			continue
+		}
+		idx, key, ok := strings.Cut(rest, ".")
+		if !ok {
+			continue
+		}
+		i, err := strconv.Atoi(idx)
+		if err != nil || i < 0 {
+			continue
+		}
+		n := byIndex[i]
+		if n == nil {
+			n = &nic{}
+			byIndex[i] = n
+		}
+		switch key {
+		case "type":
+			n.typ = v
+		case "veth.mode":
+			n.mode = v
+		case "link":
+			n.a.Bridge = v
+		case "name":
+			n.a.Name = v
+		case "hwaddr":
+			n.a.MAC = v
+		case "veth.pair":
+			n.a.Veth = v
+		case "ipv4.address":
+			if n.a.IP == "" {
+				n.a.IP = v
+			}
+		case "ipv4.gateway":
+			n.a.Gateway = v
+		}
+	}
+	idxs := make([]int, 0, len(byIndex))
+	for i := range byIndex {
+		idxs = append(idxs, i)
+	}
+	sort.Ints(idxs)
+	var out []NetworkAttach
+	for _, i := range idxs {
+		n := byIndex[i]
+		if n.typ != "veth" || (n.mode != "" && n.mode != "bridge") || n.a.Bridge == "" {
+			continue
+		}
+		out = append(out, n.a)
+	}
+	return out
+}
+
+// ConfigNICs are the bridge NICs (BridgeNICs) name's config configures now.
+func (r *LxcRunner) ConfigNICs(name string) ([]NetworkAttach, error) {
+	b, err := os.ReadFile(filepath.Join(r.lxcpath(), name, "config"))
+	if err != nil {
+		return nil, fmt.Errorf("read container config: %w", err)
+	}
+	return BridgeNICs(string(b)), nil
 }

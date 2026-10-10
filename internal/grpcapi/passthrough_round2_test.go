@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -107,25 +108,38 @@ func TestCloneContainer_NonAdminCloneLandsUnprivileged(t *testing.T) {
 	}
 }
 
-// m-e. A peer move's source row authorizes its host access: one that cannot
-// be read fails the restore Unavailable (retried), and removes what was
-// imported — never reads as "no source" and strips the container.
-func TestRestoreContainer_SourceRowReadErrorIsUnavailable(t *testing.T) {
-	s, rt, repo, ts, token, proofID := setupProofRestore(t)
-	rt.importHook = func() { _ = s.db.Execute(context.Background(), `DROP TABLE containers`) }
-	rs := &progressStream[pb.RestoreContainerProgress]{ctx: proofRestoreCtx(token)}
-	err := s.RestoreContainer(&pb.RestoreContainerRequest{
-		Name: "ct1", RepoPath: repo, Timestamp: ts, Proof: relocProof(proofID, token),
-	}, rs)
-	if status.Code(err) != codes.Unavailable {
-		t.Fatalf("restore with an unreadable source row = %v; want Unavailable", err)
+// m-e, R4-I1. A peer move's source row authorizes its NICs, host access and
+// privilege: one that cannot be read fails the restore Unavailable (retried);
+// one this replica does not hold yet refuses before anything is written —
+// FailedPrecondition for a cold migrate (its source rolls back), Unavailable
+// for a relocation (its coordinator defers); the row the moving peer sends is
+// used as sent. Never "no source", which would strip the container.
+func TestPeerMoveSource(t *testing.T) {
+	s := testServer(t)
+	s.hostName = "self"
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs(relocateTokenMDKey, "tok"))
+	req := &pb.RestoreContainerRequest{Name: "ct1"}
+	if _, err := s.peerMoveSource(ctx, req, "src"); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("a migrate whose source row is not here = %v; want FailedPrecondition", err)
 	}
-	deleted := false
-	for _, n := range rt.deleteCalls {
-		deleted = deleted || n == "ct1"
+	if _, err := s.peerMoveSource(ctx, req, ""); status.Code(err) != codes.Unavailable {
+		t.Errorf("a relocation whose mark is not here = %v; want Unavailable", err)
 	}
-	if !deleted {
-		t.Fatalf("the imported container was left behind: deleteCalls=%v", rt.deleteCalls)
+	sent := corrosion.EncodeCreateSpec(corrosion.ContainerCreateSpec{Template: "download", Networks: []corrosion.ContainerNetwork{{Name: "eth0", Bridge: "br0"}}})
+	if src, err := s.peerMoveSource(ctx, &pb.RestoreContainerRequest{Name: "ct1", SourceCreateSpec: sent}, "src"); err != nil || src == nil || src.CreateSpec != sent {
+		t.Errorf("the row the peer sent = %+v (%v); want it as sent", src, err)
+	}
+	if err := corrosion.UpsertContainer(context.Background(), s.db, corrosion.ContainerRecord{HostName: "src", Name: "ct1", State: "stopped", CreateSpec: sent}); err != nil {
+		t.Fatal(err)
+	}
+	if src, err := s.peerMoveSource(ctx, req, "src"); err != nil || src == nil || src.CreateSpec != sent {
+		t.Errorf("the migrate source row here = %+v (%v); want it", src, err)
+	}
+	_ = s.db.Close()
+	for _, from := range []string{"src", ""} {
+		if _, err := s.peerMoveSource(ctx, req, from); status.Code(err) != codes.Unavailable {
+			t.Errorf("an unreadable source row (migrate from %q) = %v; want Unavailable", from, err)
+		}
 	}
 }
 
@@ -199,13 +213,15 @@ func TestAuthorizeRestoredNICs(t *testing.T) {
 	if len(out.Networks) != 2 || out.Networks[0].Bridge != "br-ctnet" || out.Networks[1].Bridge != "br-mgmt" {
 		t.Fatalf("an admin's restore NICs = %+v", out.Networks)
 	}
-	// A peer move keeps a raw NIC only when the source row records it.
+	// A peer move keeps exactly the NICs its source row records (R4-I1): the
+	// raw NIC the row records, and not the archive's eth0 it does not.
 	src := &corrosion.ContainerRecord{CreateSpec: corrosion.EncodeCreateSpec(corrosion.ContainerCreateSpec{Template: "download",
 		Networks: []corrosion.ContainerNetwork{{Name: "eth1", Bridge: "br-mgmt"}}})}
-	if out, _, _ = s.authorizeRestoredNICs(adminCtx(), "acme", forged, src, true); len(out.Networks) != 2 {
-		t.Errorf("a peer move dropped the raw NIC its source row records: %+v", out.Networks)
+	if out, _, _ = s.authorizeRestoredNICs(adminCtx(), "acme", forged, src, true); len(out.Networks) != 1 || out.Networks[0].Bridge != "br-mgmt" {
+		t.Errorf("a peer move's NICs = %+v; want only the raw NIC its source row records", out.Networks)
 	}
-	if out, _, _ = s.authorizeRestoredNICs(adminCtx(), "acme", forged, nil, true); len(out.Networks) != 1 {
-		t.Errorf("a peer move with no source row kept a raw NIC: %+v", out.Networks)
+	// With no source row it keeps nothing and fails, so the move is retried.
+	if out, _, err := s.authorizeRestoredNICs(adminCtx(), "acme", forged, nil, true); err == nil {
+		t.Errorf("a peer move with no source row kept %+v and did not fail", out.Networks)
 	}
 }

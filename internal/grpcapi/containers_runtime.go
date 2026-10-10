@@ -220,6 +220,18 @@ func (a *LXCRuntimeAdapter) RebuildContainerConfig(_ context.Context, name strin
 	return rb.RebuildConfig(name, cfg.Confinement, cfg.IDMapBase, LXCNICs(cfg), lxcMounts(cfg.Mounts), lxcDevices(cfg.Devices))
 }
 
+// ContainerConfigNICs are the bridge NICs name's config holds
+// (lxc.LxcRunner.ConfigNICs).
+func (a *LXCRuntimeAdapter) ContainerConfigNICs(name string) ([]lxc.NetworkAttach, error) {
+	rd, ok := a.Inner.(interface {
+		ConfigNICs(name string) ([]lxc.NetworkAttach, error)
+	})
+	if !ok {
+		return nil, errors.New("this container runtime cannot read a container's NICs from its config")
+	}
+	return rd.ConfigNICs(name)
+}
+
 // LXCNICs are the NICs a rebuild renders: nil (keep the config's network)
 // unless cfg.RenderNetwork, then exactly cfg.Networks (possibly none).
 func LXCNICs(cfg AuthorizedContainerConfig) []lxc.NetworkAttach {

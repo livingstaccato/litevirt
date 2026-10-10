@@ -1370,6 +1370,16 @@ message RestoreContainerRequest {
     string owner_id               = 8;
     string restored_from_owner_id = 9;
     string restored_from_ts       = 10;
+    // source_create_spec is the moving container's create spec as the peer
+    // that drives a move read it off the container's row: the cold migrate's
+    // source (its own row) or the failover coordinator (the row it marked).
+    // A peer move takes the container's NICs, host mounts and devices and
+    // privilege from that row, never from the archive, and the target's own
+    // replica need not have the row yet. Honoured only on a peer move (a
+    // verified migrate-from, or a peer relocation); any other restore
+    // ignores it. Empty (an earlier build, or a row with no spec) = the
+    // target reads the row from its own replica.
+    string source_create_spec = 11;
 }
 
 message RestoreContainerProgress {

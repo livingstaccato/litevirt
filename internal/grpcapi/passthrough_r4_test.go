@@ -81,9 +81,9 @@ func TestAuthorizeRestoredNICs_AdmitsTheAuthorizedNICs(t *testing.T) {
 	}
 }
 
-// R3-I1 on a peer move: a raw bridge that resolves to a managed network is
-// kept only when the source row records that NIC, and a NIC whose network
-// has no record is dropped there too (never the flat-bridge fallback).
+// R3-I1 on a peer move: the NICs are the source row's (R4-I1), so a raw
+// bridge of the archive's that the row records as a network NIC is kept as
+// the row records it, and a NIC the row does not record (eth1) is not.
 func TestAuthorizeRestoredNICs_PeerMoveReclassified(t *testing.T) {
 	s := testServer(t)
 	r4Networks(t, s)
@@ -92,21 +92,14 @@ func TestAuthorizeRestoredNICs_PeerMoveReclassified(t *testing.T) {
 		{Name: "eth1", NetworkName: "gone"},
 		{Name: "eth2", Bridge: "br-victim"},
 	}}
-	out, dropped, err := s.authorizeRestoredNICs(adminCtx(), "acme", forged, nil, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := nicNames(out.Networks); len(got) != 1 || got[0] != "eth0@br-ctnet" {
-		t.Errorf("a peer move with no source row kept NICs %v; want only eth0@br-ctnet (dropped: %v)", got, dropped)
-	}
 	src := &corrosion.ContainerRecord{CreateSpec: corrosion.EncodeCreateSpec(corrosion.ContainerCreateSpec{Template: "download",
 		Networks: []corrosion.ContainerNetwork{{Name: "eth0", NetworkName: "ctnet"}, {Name: "eth2", NetworkName: "vnet", Bridge: "br-victim"}}})}
-	out, _, err = s.authorizeRestoredNICs(adminCtx(), "acme", forged, src, true)
+	out, _, err := s.authorizeRestoredNICs(adminCtx(), "acme", forged, src, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := nicNames(out.Networks); len(got) != 2 || got[1] != "eth2@br-victim" {
-		t.Errorf("a peer move dropped the NIC its source row records: %v", got)
+	if got := nicNames(out.Networks); len(got) != 2 || got[0] != "eth0@br-ctnet" || got[1] != "eth2@br-victim" {
+		t.Errorf("a peer move's NICs = %v; want the row's eth0@br-ctnet and eth2@br-victim", got)
 	}
 }
 

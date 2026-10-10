@@ -264,6 +264,14 @@ func setupProofRestore(t *testing.T) (s *Server, rt *fakeCTRuntime, repo, ts, to
 		t.Fatalf("BackupContainer: %v", err)
 	}
 	_ = corrosion.DeleteContainer(ctx, s.db, "self", "ct1")
+	// The row the coordinator marked for this restore: the container lived on
+	// peer-1, which died. A peer move's NICs and host access come from it.
+	if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{
+		HostName: "peer-1", Name: "ct1", State: "relocating", StateDetail: corrosion.RelocateRestoreDetail("self", token),
+		Image: "alpine:3.19", Project: "acme", CreateSpec: corrosion.EncodeCreateSpec(corrosion.ContainerCreateSpec{Template: "download"}),
+	}); err != nil {
+		t.Fatal(err)
+	}
 	return
 }
 
@@ -557,6 +565,8 @@ func TestRestoreContainer_StampsRelocateTokenFromMetadata(t *testing.T) {
 	rs := &progressStream[pb.RestoreContainerProgress]{ctx: rctx}
 	if err := s.RestoreContainer(&pb.RestoreContainerRequest{
 		Name: "ct1", RepoPath: repo, Timestamp: "2026-06-27T13:00:00Z",
+		// The coordinator sends the row it marked (its replica, not ours).
+		SourceCreateSpec: corrosion.EncodeCreateSpec(corrosion.ContainerCreateSpec{Template: "download"}),
 	}, rs); err != nil {
 		t.Fatalf("RestoreContainer: %v", err)
 	}

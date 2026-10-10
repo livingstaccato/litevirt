@@ -184,8 +184,13 @@ func (s *Server) CloneContainer(ctx context.Context, req *pb.CloneContainerReque
 
 	// Project isolation: the clone's NICs land in the TARGET project, which may
 	// differ from the source's. Refused before admission and the rootfs copy.
-	if err := s.admitCopiedNetworks(ctx, "clone", project, src.Project,
-		containerSpecNetworkNames(corrosion.DecodeCreateSpec(src.CreateSpec))); err != nil {
+	// A raw bridge is judged as what it now is: one that renders a managed
+	// network is that network's NIC (m-7).
+	cloneNets, cerr := s.classifiedNetworkNames(ctx, corrosion.DecodeCreateSpec(src.CreateSpec))
+	if cerr != nil {
+		return nil, status.Errorf(codes.Unavailable, "clone: read the networks (what decides whether the source's raw bridges are managed networks): %v", cerr)
+	}
+	if err := s.admitCopiedNetworks(ctx, "clone", project, src.Project, cloneNets); err != nil {
 		s.audit(ctx, "ct.clone", req.Target, "project="+project, "denied")
 		return nil, err
 	}

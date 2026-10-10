@@ -110,6 +110,14 @@ func (f *CTFake) RebuildContainerConfig(_ context.Context, name string, cfg grpc
 	return f.runner().RebuildConfig(name, cfg.Confinement, cfg.IDMapBase, grpcapi.LXCNICs(cfg), fakeMounts(cfg.Mounts), fakeDevices(cfg.Devices))
 }
 
+// ContainerConfigNICs reads the bridge NICs a container's config holds,
+// with the real lxc parser.
+func (f *CTFake) ContainerConfigNICs(name string) ([]lxc.NetworkAttach, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.runner().ConfigNICs(name)
+}
+
 func (f *CTFake) SetContainerHostAccess(_ context.Context, name string, mounts []grpcapi.ContainerMountOpt, devices []grpcapi.ContainerDeviceOpt) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

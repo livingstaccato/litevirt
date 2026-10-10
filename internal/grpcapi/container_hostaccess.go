@@ -165,6 +165,80 @@ type AuthorizedContainerConfig struct {
 	Networks      []ContainerNICOpt
 }
 
+// networkMode is what a config rebuild does with the container's network.
+type networkMode int
+
+const (
+	// networkKeep keeps the config's network as it is: a revert, or a clone
+	// of a config this host wrote.
+	networkKeep networkMode = iota
+	// networkRender renders lxc.net.* from the authorized spec's NICs alone
+	// (none: create's default), dropping every network line the config
+	// holds: a restore, whose config an archive wrote.
+	networkRender
+	// networkKeepBridgeNICs keeps the veth-on-bridge NICs the config holds
+	// (lxc.BridgeNICs) and drops every other NIC: a peer move of a container
+	// whose row predates the create spec and so records no NICs.
+	networkKeepBridgeNICs
+)
+
+// restoredNetworkMode is how a restore renders the container's network. A
+// peer move takes the NICs its source row records; a row with no create spec
+// at all (an earlier build's) records none, so the archive's bridge NICs are
+// kept, as on main, and every other kind dropped. An operator restore always
+// renders the authorized spec's NICs (none: the default bridge), audited.
+func restoredNetworkMode(operatorRestore bool, source *corrosion.ContainerRecord) networkMode {
+	if !operatorRestore && source != nil && source.CreateSpec == "" {
+		return networkKeepBridgeNICs
+	}
+	return networkRender
+}
+
+// containerConfigNICReader is a runtime that reads the bridge NICs a
+// container's config holds (lxc.LxcRunner.ConfigNICs).
+type containerConfigNICReader interface {
+	ContainerConfigNICs(name string) ([]lxc.NetworkAttach, error)
+}
+
+// peerMoveSource is the row a peer move's container is authorized by: the
+// spec the moving peer read off it and sent (req.SourceCreateSpec), else the
+// row in this host's replica — the cold migrate's source row, or the row the
+// failover coordinator marked for this restore. A row that cannot be read
+// fails the restore (Unavailable, retried); one this replica does not hold
+// yet refuses before anything is written — FailedPrecondition for a cold
+// migrate, which its source reads as "nothing landed" and rolls back (it
+// would read Unavailable as indeterminate and park the container), and
+// Unavailable for a relocation, which its coordinator defers. Never "no
+// source": that would strip the container's NICs and host access.
+func (s *Server) peerMoveSource(ctx context.Context, req *pb.RestoreContainerRequest, migrateSource string) (*corrosion.ContainerRecord, error) {
+	if spec := req.GetSourceCreateSpec(); spec != "" {
+		return &corrosion.ContainerRecord{Name: req.Name, CreateSpec: spec}, nil
+	}
+	var source *corrosion.ContainerRecord
+	var err error
+	if migrateSource != "" {
+		source, err = corrosion.GetContainer(ctx, s.db, migrateSource, req.Name)
+	} else {
+		token := relocateTokenFromMD(ctx)
+		if token == "" && req.Proof != nil {
+			token = req.Proof.GetRelocationToken()
+		}
+		source, err = s.relocatingContainer(ctx, req.Name, s.hostName, token)
+	}
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "restore: read the source container's row (what authorizes its NICs, host access and privilege): %v", err)
+	}
+	if source == nil {
+		code := codes.Unavailable
+		if migrateSource != "" {
+			code = codes.FailedPrecondition
+		}
+		return nil, status.Errorf(code, "restore: this host has not seen container %q's source row yet (replication still catching up?): "+
+			"a move takes the container's NICs, host access and privilege from that row, never from the archive; retry the move once it has replicated", req.Name)
+	}
+	return source, nil
+}
+
 // rebuildContainerConfig renders name's config from the authorized spec cs.
 // The security is cs's; where cs records none (an earlier build's
 // container), what the config holds now — set by litevirt's own convert — is
@@ -172,17 +246,16 @@ type AuthorizedContainerConfig struct {
 // ever loosened by a rebuild. A runtime that cannot rebuild refuses, unless
 // there is nothing to render.
 func (s *Server) rebuildContainerConfig(ctx context.Context, name string, cs corrosion.ContainerCreateSpec) error {
-	_, err := s.renderContainerConfig(ctx, name, cs, false)
+	_, err := s.renderContainerConfig(ctx, name, cs, networkKeep)
 	return err
 }
 
-// renderContainerConfig is rebuildContainerConfig that, with renderNetwork,
-// renders the network from cs as well, and returns what of the config was
-// dropped.
-func (s *Server) renderContainerConfig(ctx context.Context, name string, cs corrosion.ContainerCreateSpec, renderNetwork bool) ([]string, error) {
+// renderContainerConfig is rebuildContainerConfig that renders the network
+// as net says, and returns what of the config was dropped.
+func (s *Server) renderContainerConfig(ctx context.Context, name string, cs corrosion.ContainerCreateSpec, net networkMode) ([]string, error) {
 	rb, ok := s.containerRuntime.(hostAccessRebuilder)
 	if !ok {
-		if len(cs.Mounts) > 0 || len(cs.Devices) > 0 || renderNetwork {
+		if len(cs.Mounts) > 0 || len(cs.Devices) > 0 || net != networkKeep {
 			return nil, status.Error(codes.Unavailable, "this host's container runtime cannot render a container's config")
 		}
 		return nil, nil
@@ -199,9 +272,24 @@ func (s *Server) renderContainerConfig(ctx context.Context, name string, cs corr
 		}
 	}
 	cfg.Mounts, cfg.Devices = hostAccessOpts(cs)
-	if renderNetwork {
+	switch net {
+	case networkRender:
 		cfg.RenderNetwork = true
 		cfg.Networks = s.authorizedContainerNICs(ctx, name, cs)
+	case networkKeepBridgeNICs:
+		rd, ok := s.containerRuntime.(containerConfigNICReader)
+		if !ok {
+			return nil, status.Error(codes.Unavailable, "this host's container runtime cannot read a container's NICs from its config")
+		}
+		nics, err := rd.ContainerConfigNICs(name)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "read %q's NICs from its config: %v", name, err)
+		}
+		cfg.RenderNetwork = true
+		cfg.Networks = make([]ContainerNICOpt, 0, len(nics))
+		for _, n := range nics {
+			cfg.Networks = append(cfg.Networks, ContainerNICOpt{Name: n.Name, Bridge: n.Bridge, IP: n.IP, MAC: n.MAC, Veth: n.Veth, Gateway: n.Gateway})
+		}
 	}
 	dropped, err := rb.RebuildContainerConfig(ctx, name, cfg)
 	if err != nil {
@@ -377,48 +465,43 @@ func (s *Server) noteStrippedHostAccess(ctx context.Context, action, name, strip
 
 // authorizeRestoredNICs decides where a restored container's NICs attach.
 // The archive's spec names bridges and networks, and a bridge is host access
-// too, so nothing is taken from it on its word. Each NIC is first classified
-// — a raw bridge that renders a managed network IS that network's NIC — and
-// then admitted as create admits it, on what it now is:
+// too, so nothing is taken from it on its word.
+//
+// A peer move (peer: a cold migrate or a failover relocation) re-homes an
+// existing container, so its NICs are the ones its SOURCE ROW records, matched
+// by NIC name — managed NICs included (peerMoveNICs). An archive NIC the row
+// does not record is dropped and said, wherever it points.
+//
+// An operator restore classifies each NIC first — a raw bridge that renders a
+// managed network IS that network's NIC — and then admits it as create admits
+// it, on what it now is:
 //   - a managed NIC is kept only if its network record exists (a name with no
 //     record is dropped: never the flat-bridge fallback, which would land it
 //     on whatever host bridge carries that name), its type is one a container
-//     can use (not direct or sriov), and — for an operator restore — the
-//     project may attach to it (admitManagedNetwork, or admitNetworkAttach for
-//     a reclassified raw bridge). It is rendered on its network's own bridge,
-//     whatever bridge the spec names. A peer move re-homes an existing
-//     container, so a foreign network is recorded (foreignNetworks) rather
-//     than dropped, but a raw bridge reclassified as a network is kept there
-//     only when the SOURCE ROW records that NIC;
+//     can use (not direct or sriov), and the project may attach to it
+//     (admitManagedNetwork, or admitNetworkAttach for a reclassified raw
+//     bridge). It is rendered on its network's own bridge, whatever bridge the
+//     spec names;
 //   - a raw NIC (no managed network) is kept only for a caller with raw-bridge
-//     authority (admitRawBridge, as create requires), or — on a peer move,
-//     where the caller is the peer — when the SOURCE ROW records that raw NIC.
+//     authority (admitRawBridge, as create requires).
 //
 // Everything else is dropped and reported, and the restore proceeds. A
-// network record that cannot be read fails the restore (Unavailable): "not
-// found" is an answer that read did not give.
+// network record or list that cannot be read fails the restore
+// (Unavailable): "not found" is an answer that read did not give.
 func (s *Server) authorizeRestoredNICs(ctx context.Context, project string, cs corrosion.ContainerCreateSpec, source *corrosion.ContainerRecord, peer bool) (corrosion.ContainerCreateSpec, []string, error) {
-	var sourceRaw, sourceManaged map[string]bool
-	if peer && source != nil {
-		sourceRaw, sourceManaged = map[string]bool{}, map[string]bool{}
-		for _, n := range corrosion.DecodeCreateSpec(source.CreateSpec).Networks {
-			if n.NetworkName == "" {
-				sourceRaw[n.Name+"\x00"+n.Bridge] = true
-			} else {
-				sourceManaged[n.Name+"\x00"+n.NetworkName] = true
-			}
-		}
+	if peer {
+		return s.peerMoveNICs(ctx, cs, source)
 	}
 	var out []corrosion.ContainerNetwork
 	var dropped []string
 	for _, n := range cs.Networks {
 		reclassified := false
 		if n.NetworkName == "" {
-			if name, ok := s.resolveBridgeToNetwork(ctx, n.Bridge); ok {
-				if peer && !sourceRaw[n.Name+"\x00"+n.Bridge] && !sourceManaged[n.Name+"\x00"+name] {
-					dropped = append(dropped, "NIC "+n.Name+" on bridge "+n.Bridge+" (network "+name+"): the source container's row does not record it")
-					continue
-				}
+			name, ok, err := s.resolveBridgeToNetwork(ctx, n.Bridge)
+			if err != nil {
+				return cs, nil, status.Errorf(codes.Unavailable, "restore: read the networks (what decides whether NIC %s's bridge %s is a managed network): %v", n.Name, n.Bridge, err)
+			}
+			if ok {
 				n.NetworkName, reclassified = name, true
 			}
 		}
@@ -435,34 +518,88 @@ func (s *Server) authorizeRestoredNICs(ctx context.Context, project string, cs c
 				dropped = append(dropped, "NIC "+n.Name+" on network "+n.NetworkName+" of type "+def.Type+", which containers cannot use")
 				continue
 			}
-			if !peer {
-				admit := s.admitManagedNetwork
-				if reclassified {
-					admit = s.admitNetworkAttach
+			admit := s.admitManagedNetwork
+			if reclassified {
+				admit = s.admitNetworkAttach
+			}
+			if aerr := admit(ctx, project, n.NetworkName); aerr != nil {
+				if status.Code(aerr) != codes.PermissionDenied {
+					return cs, nil, status.Errorf(codes.Unavailable, "restore: %s", status.Convert(aerr).Message())
 				}
-				if aerr := admit(ctx, project, n.NetworkName); aerr != nil {
-					if status.Code(aerr) != codes.PermissionDenied {
-						return cs, nil, status.Errorf(codes.Unavailable, "restore: %s", status.Convert(aerr).Message())
-					}
-					dropped = append(dropped, "NIC "+n.Name+" on network "+n.NetworkName+": "+status.Convert(aerr).Message())
-					continue
-				}
+				dropped = append(dropped, "NIC "+n.Name+" on network "+n.NetworkName+": "+status.Convert(aerr).Message())
+				continue
 			}
 			n.Bridge = network.BridgeName(n.NetworkName, *def)
 			out = append(out, n)
 			continue
 		}
-		keep := false
-		if peer {
-			keep = sourceRaw[n.Name+"\x00"+n.Bridge]
-		} else {
-			keep = s.admitRawBridge(ctx, n.Bridge) == nil
-		}
-		if keep {
+		if s.admitRawBridge(ctx, n.Bridge) == nil {
 			out = append(out, n)
 			continue
 		}
 		dropped = append(dropped, "raw NIC "+n.Name+" on bridge "+n.Bridge)
+	}
+	cs.Networks = out
+	return cs, dropped, nil
+}
+
+// peerMoveNICs are a peer-moved container's NICs: exactly those its source
+// row records, in the row's order, with the row's address and MAC (R4-I1,
+// R4-I2). As on main, a NIC the container holds is never lost to the move:
+//   - a managed NIC whose network record exists is rendered on that
+//     network's bridge;
+//   - one whose record is absent here (force-deleted, or not replicated yet)
+//     keeps the bridge the row records — the row was admitted when it was
+//     created — and so does a network now of a type containers cannot use
+//     (direct, sriov: a network re-created under the same name);
+//   - a raw NIC keeps its bridge.
+//
+// An archive NIC the row does not record is dropped and said. A nil source
+// fails (Unavailable): the caller refuses a peer move with no source row
+// before it gets here (peerMoveSource). A row with no create spec records no
+// NICs; its archive's network is kept (restoredNetworkMode) and its spec's
+// NICs are not claimed for the restored row.
+func (s *Server) peerMoveNICs(ctx context.Context, cs corrosion.ContainerCreateSpec, source *corrosion.ContainerRecord) (corrosion.ContainerCreateSpec, []string, error) {
+	if source == nil {
+		return cs, nil, status.Error(codes.Unavailable, "restore: a moved container's NICs come from its source row, which this host does not have yet; retry the move")
+	}
+	if source.CreateSpec == "" {
+		cs.Networks = nil
+		return cs, nil, nil
+	}
+	row := corrosion.DecodeCreateSpec(source.CreateSpec).Networks
+	recorded := map[string]bool{}
+	for _, n := range row {
+		recorded[n.Name] = true
+	}
+	var dropped []string
+	for _, n := range cs.Networks {
+		if !recorded[n.Name] {
+			where := n.Bridge
+			if n.NetworkName != "" {
+				where = n.NetworkName
+			}
+			dropped = append(dropped, "NIC "+n.Name+" on "+where+": the source container's row does not record it")
+		}
+	}
+	out := make([]corrosion.ContainerNetwork, 0, len(row))
+	for _, n := range row {
+		if n.NetworkName != "" {
+			def, err := lookupNetworkDef(ctx, s.db, n.NetworkName)
+			if err != nil {
+				return cs, nil, status.Errorf(codes.Unavailable, "restore: read network %q (what decides where NIC %s attaches): %v", n.NetworkName, n.Name, err)
+			}
+			if def != nil && def.Type != "direct" && def.Type != "sriov" {
+				n.Bridge = network.BridgeName(n.NetworkName, *def)
+			}
+		}
+		if n.Bridge == "" {
+			// Nothing to attach it to: no record here, and the row names no
+			// bridge (an earlier build's row). Said, never guessed.
+			dropped = append(dropped, "NIC "+n.Name+" on network "+n.NetworkName+": no network record here and the row records no bridge")
+			continue
+		}
+		out = append(out, n)
 	}
 	cs.Networks = out
 	return cs, dropped, nil

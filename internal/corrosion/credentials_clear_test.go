@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // Clearing the old secret columns once credentials_clear_v1 has latched
@@ -328,7 +329,7 @@ func TestCredentialsClear_AnUnreadableTimestampIsNotClearedWithAFreshClock(t *te
 // TestCredentialsLive_FirstPassMaterialisesLegacyShadows: an external-realm
 // user created before the split latched has an empty old column and no
 // credential row. The pass that makes a node live gives it an empty credential
-// row at the floor timestamp, so from then on a missing credential row means
+// row stamped decades before its users row, so from then on a missing credential row means
 // "not here yet" and never "external".
 func TestCredentialsLive_FirstPassMaterialisesLegacyShadows(t *testing.T) {
 	ctx := context.Background()
@@ -354,8 +355,14 @@ func TestCredentialsLive_FirstPassMaterialisesLegacyShadows(t *testing.T) {
 	if !c.CredentialsLive() {
 		t.Fatal("a complete pass did not make the node live")
 	}
-	if got := oneString(t, c, `SELECT updated_at FROM user_credentials WHERE username = 'ext'`, "updated_at"); got != credentialFloorTS {
-		t.Errorf("the shadow's credential row is stamped %q, want the floor %q", got, credentialFloorTS)
+	usersAt, ok := tsInstant(oneString(t, c, `SELECT updated_at FROM users WHERE username = 'ext'`, "updated_at"))
+	if !ok {
+		t.Fatal("ext's users row has no readable timestamp")
+	}
+	got := oneString(t, c, `SELECT updated_at FROM user_credentials WHERE username = 'ext'`, "updated_at")
+	if want := usersAt.Add(-40 * 365 * 24 * time.Hour).UTC().Format(nowTSLayout); got != want {
+		t.Errorf("the shadow's credential row is stamped %q, want %q: the users row's own time, "+
+			"decades back so any real credential write beats it", got, want)
 	}
 	for user, want := range map[string]bool{"ext": false, "alice": true} {
 		local, known, err := UserLocalCredential(ctx, c, user)
@@ -493,12 +500,16 @@ func TestCredentialsLive_EvidenceIsPerUserAndBoundToTheRow(t *testing.T) {
 	if local, known, _ := UserLocalCredential(ctx, c, "ext"); !known || local {
 		t.Errorf("ext: local=%v known=%v; the baseline's own external user", local, known)
 	}
-	// ext deleted and created again elsewhere: a new incarnation.
-	if err := c.execLocal(ctx, `UPDATE users SET created_at = '2026-07-01T00:00:00Z' WHERE username = 'ext'`); err != nil {
-		t.Fatal(err)
+	// ext deleted and created again elsewhere as a local account. users rows
+	// are never hard-deleted, so the create REACTIVATES the row and keeps its
+	// created_at (re-review 3, R1); the credential row is still on its way.
+	createdAt := oneString(t, c, `SELECT created_at FROM users WHERE username = 'ext'`, "created_at")
+	applyReplicatedUserDeleteAndReactivate(t, c, "ext", "admin")
+	if got := oneString(t, c, `SELECT created_at FROM users WHERE username = 'ext'`, "created_at"); got != createdAt {
+		t.Fatalf("precondition: the reactivation changed created_at (%s -> %s)", createdAt, got)
 	}
 	if _, known, _ := UserLocalCredential(ctx, c, "ext"); known {
-		t.Error("a re-created ext matched the baseline of the user it replaced")
+		t.Error("a reactivated ext matched the baseline of the row it was before")
 	}
 	c.SetCredentialsSplitGate(func() bool { return true })
 	if _, err := c.SplitCredentials(ctx); err != nil {
@@ -517,7 +528,7 @@ func TestCredentialsLive_TheBaselineIsBoundToItsStateDB(t *testing.T) {
 	dir := t.TempDir()
 	// A baseline another state.db recorded, naming admin as external.
 	b, _ := json.Marshal(credentialsBaseline{Incarnation: "another-state-db",
-		Shadows: []userIdentity{{Username: "admin", CreatedAt: "2025-01-01T00:00:00Z"}}})
+		Shadows: []userIdentity{{Username: "admin", CreatedAt: "2025-01-01T00:00:00Z", UpdatedAt: "2026-06-01T00:00:00Z"}}})
 	if err := os.WriteFile(filepath.Join(dir, credentialsBaselineFile), b, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -555,16 +566,40 @@ func TestCredentialsLive_ExternalSeenIsBoundToTheRowAndRecordedAfterTheInsert(t 
 	if local, known, _ := UserLocalCredential(ctx, c, "bob"); !known || local {
 		t.Fatalf("bob: local=%v known=%v; this node made the shadow", local, known)
 	}
-	if err := DeleteUser(ctx, c, "bob"); err != nil {
-		t.Fatal(err)
-	}
-	// bob re-created as a local account elsewhere, its users row cleared and
-	// its credential row still on its way here.
-	if err := c.execLocal(ctx, `UPDATE users SET deleted_at = NULL, created_at = '2999-01-01T00:00:00Z', password_hash = '' WHERE username = 'bob'`); err != nil {
-		t.Fatal(err)
-	}
+	// bob deleted and created again as a local account ELSEWHERE: the real
+	// statements arrive here (a local DeleteUser would forget the record and
+	// hide the binding), the users row cleared, its credential still on its
+	// way. The reactivation keeps created_at (re-review 3, R1).
+	applyReplicatedUserDeleteAndReactivate(t, c, "bob", "admin")
 	if _, known, _ := UserLocalCredential(ctx, c, "bob"); known {
-		t.Error("a deleted shadow's record judged the re-created local bob external")
+		t.Error("a deleted shadow's record judged the reactivated local bob external")
+	}
+	// A reactivation made HERE forgets the earlier incarnation's record...
+	if err := InsertUser(ctx, c, "dan", "viewer", ""); err != nil {
+		t.Fatal(err)
+	}
+	applyReplicatedUserDelete(t, c, "dan")
+	if err := InsertUser(ctx, c, "dan", "operator", "$2a$10$dan-local"); err != nil {
+		t.Fatal(err)
+	}
+	c.externalSeenMu.Lock()
+	for id := range c.loadExternalSeenLocked() {
+		if id.Username == "dan" {
+			t.Errorf("a local reactivation kept the record of the shadow it replaced (%+v)", id)
+		}
+	}
+	c.externalSeenMu.Unlock()
+	// ...and a reactivation as a shadow, where no credential row can be
+	// written yet, records the new one.
+	if err := InsertUser(ctx, c, "eva", "viewer", ""); err != nil {
+		t.Fatal(err)
+	}
+	applyReplicatedUserDelete(t, c, "eva")
+	if err := InsertUser(ctx, c, "eva", "viewer", ""); err != nil {
+		t.Fatal(err)
+	}
+	if local, known, _ := UserLocalCredential(ctx, c, "eva"); !known || local {
+		t.Errorf("eva: local=%v known=%v; this node reactivated the shadow itself", local, known)
 	}
 	// A failed insert records nothing: carol already exists.
 	if err := c.execLocal(ctx, `INSERT INTO users (username, role, password_hash, created_at, updated_at) VALUES ('carol', 'operator', '', '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z')`); err != nil {
@@ -580,4 +615,165 @@ func TestCredentialsLive_ExternalSeenIsBoundToTheRowAndRecordedAfterTheInsert(t 
 		}
 	}
 	c.externalSeenMu.Unlock()
+}
+
+// applyWALStatement applies one replicated statement as the WAL lane does.
+func applyWALStatement(t *testing.T, c *Client, s Statement, ts string) {
+	t.Helper()
+	r := NewReplicator(c, "", RelayConfig{})
+	tx, err := c.db.Begin()
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if aerr := r.applyStatementLWW(context.Background(), tx, s, ts); aerr != nil {
+		tx.Rollback()
+		c.dropDeferredEffects(tx)
+		t.Fatalf("apply %s: %v", s.SQL, aerr)
+	}
+	if cerr := tx.Commit(); cerr != nil {
+		t.Fatalf("commit: %v", cerr)
+	}
+	c.runDeferredEffects(tx)
+}
+
+// applyReplicatedUserDelete applies the users statement DeleteUser emits, as
+// it arrives from another node.
+func applyReplicatedUserDelete(t *testing.T, c *Client, username string) {
+	t.Helper()
+	ts := c.NowTS()
+	applyWALStatement(t, c, Statement{SQL: `UPDATE users SET deleted_at = ?, updated_at = ? WHERE username = ?`,
+		Params: []interface{}{nowRFC3339(), ts, username}}, ts)
+}
+
+// applyReplicatedUserDeleteAndReactivate applies, as they arrive from another
+// node, the users statements of DeleteUser and then of InsertUser's
+// reactivation of a local account after the clear (empty old column). The
+// credential row that came with the reactivation has not arrived.
+func applyReplicatedUserDeleteAndReactivate(t *testing.T, c *Client, username, role string) {
+	t.Helper()
+	applyReplicatedUserDelete(t, c, username)
+	ts := c.NowTS()
+	applyWALStatement(t, c, Statement{SQL: usersReactivateSQL,
+		Params: []interface{}{role, "", ts, username}}, ts)
+}
+
+// TestCredentialsLive_EvidenceRowsHoldOnlyForTheRowTheyWereMadeFor
+// (re-review 3, R1 and R2): an empty credential row a node's first pass
+// materialised, and an administrator's mark, describe the users row as it
+// stood when they were written. A reactivation since — a local account under
+// the name, its credential still in flight — is not that row: neither counts,
+// and the login is refused (fail-closed) instead of adopting the account.
+func TestCredentialsLive_EvidenceRowsHoldOnlyForTheRowTheyWereMadeFor(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	if err := InsertUser(ctx, c, "ext", "viewer", ""); err != nil { // pre-split shadow
+		t.Fatal(err)
+	}
+	if err := c.NoteCredentialsBaseline(ctx); err != nil {
+		t.Fatal(err)
+	}
+	c.SetCredentialsSplitGate(func() bool { return true })
+	if _, err := c.SplitCredentials(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// lu: a users row this node holds no evidence for.
+	if err := c.execLocal(ctx, `INSERT INTO users (username, role, password_hash, created_at, updated_at)
+		VALUES ('lu', 'viewer', '', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00.000000001Z')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, known, _ := UserLocalCredential(ctx, c, "lu"); known {
+		t.Fatal("precondition: lu was judged with no evidence")
+	}
+	if err := MarkUserExternal(ctx, c, "lu"); err != nil {
+		t.Fatalf("MarkUserExternal: %v", err)
+	}
+	for _, u := range []string{"ext", "lu"} {
+		if local, known, err := UserLocalCredential(ctx, c, u); err != nil || !known || local {
+			t.Fatalf("%s: local=%v known=%v err=%v, want an external user", u, local, known, err)
+		}
+	}
+	for _, u := range []string{"ext", "lu"} {
+		applyReplicatedUserDeleteAndReactivate(t, c, u, "admin")
+		if _, known, _ := UserLocalCredential(ctx, c, u); known {
+			t.Errorf("%s: an evidence row written for the earlier row was taken for the reactivated "+
+				"local admin, whose credential has not arrived", u)
+		}
+	}
+	// A stale mark is replaced by a new one: an administrator who decides
+	// again for the row as it stands now is not refused.
+	if err := c.execLocal(ctx, `INSERT INTO users (username, role, password_hash, created_at, updated_at)
+		VALUES ('mo', 'viewer', '', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00.000000001Z')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := MarkUserExternal(ctx, c, "mo"); err != nil {
+		t.Fatal(err)
+	}
+	applyReplicatedUserDeleteAndReactivate(t, c, "mo", "viewer") // a shadow reactivation from an unlatched node
+	if _, known, _ := UserLocalCredential(ctx, c, "mo"); known {
+		t.Fatal("precondition: the mark made for mo's earlier row still holds")
+	}
+	if err := MarkUserExternal(ctx, c, "mo"); err != nil {
+		t.Fatalf("MarkUserExternal again: %v", err)
+	}
+	if local, known, _ := UserLocalCredential(ctx, c, "mo"); !known || local {
+		t.Errorf("mo after a new mark: local=%v known=%v, want an external user", local, known)
+	}
+}
+
+// TestInsertUser_AShadowReactivationIsStampedPastTheTombstoneOnly (re-review
+// 3, R4): a shadow that reactivates a tombstoned row is stamped two successor
+// steps past the newest write this node holds for the row — newer than the
+// tombstone and than another node's clear of it (one step), older than any
+// write made since.
+func TestInsertUser_AShadowReactivationIsStampedPastTheTombstoneOnly(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	c.SetCredentialsSplitGate(func() bool { return true })
+	if err := InsertUser(ctx, c, "alice", "operator", "$2a$10$alice"); err != nil {
+		t.Fatal(err)
+	}
+	if err := DeleteUser(ctx, c, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	tomb := oneString(t, c, `SELECT updated_at FROM users WHERE username = 'alice'`, "updated_at")
+	otherNodesClear, ok := clearTS(credentialSplitRow{srcTS: tomb})
+	if !ok {
+		t.Fatal("tombstone timestamp unreadable")
+	}
+	later := c.NowTS()
+	if err := InsertUser(ctx, c, "alice", "viewer", ""); err != nil {
+		t.Fatal(err)
+	}
+	got := oneString(t, c, `SELECT updated_at FROM users WHERE username = 'alice'`, "updated_at")
+	if lwwOrder(got, otherNodesClear) <= 0 {
+		t.Errorf("shadow reactivation stamped %s, not newer than another node's clear of the tombstone (%s): "+
+			"an equal stamp with different content is a tie", got, otherNodesClear)
+	}
+	if lwwOrder(got, later) >= 0 {
+		t.Errorf("shadow reactivation stamped %s, not older than %s, a write made after the tombstone", got, later)
+	}
+	if cred := oneString(t, c, `SELECT updated_at FROM user_credentials WHERE username = 'alice'`, "updated_at"); cred != got {
+		t.Errorf("the shadow's credential row is stamped %s, want the users row's %s", cred, got)
+	}
+}
+
+// TestCredentialsLive_AMarkIsRefusedWhereAnyLocalCredentialIsInView
+// (re-review 3, R2): a credential row with a password — tombstoned included —
+// is local-credential evidence, and mark-external refuses it.
+func TestCredentialsLive_AMarkIsRefusedWhereAnyLocalCredentialIsInView(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	c.SetCredentialsSplitGate(func() bool { return true })
+	for _, q := range []string{
+		`INSERT INTO users (username, role, password_hash, created_at, updated_at) VALUES ('tm', 'operator', '', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`,
+		`INSERT INTO user_credentials (username, password_hash, updated_at, deleted_at) VALUES ('tm', '$2a$10$tm', '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z')`,
+	} {
+		if err := c.execLocal(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := MarkUserExternal(ctx, c, "tm"); err != ErrUserNotExternalCandidate {
+		t.Errorf("MarkUserExternal(tm) = %v, want ErrUserNotExternalCandidate: a credential row "+
+			"with a password is in view", err)
+	}
 }

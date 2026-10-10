@@ -130,24 +130,71 @@ in view (`credentials_live.go`):
   is advertised only by a node that has completed that pass.
 
 On that evidence the node's first pass gives each such user an empty
-credential row at a floor timestamp, which replicates the evidence to every
-peer. A node that started with an empty database — every host added after
+credential row stamped with the users row's own time moved 40 years back, which
+replicates the evidence to every peer and never beats a real credential. A node that started with an empty database — every host added after
 the clear — has no such evidence: it never materialises, and until a user's
 credential row arrives it refuses an external login under that name
 ("its credential has not reached this node yet"). That is fail-closed and
 lasts until its sensitive lane merges. A node whose gates open together
 decides before its own clears are in view.
 
-The evidence is PER USER and bound to the users row's identity (username and
-created_at): the credentials baseline lists the users that had an empty old
-column and no credential row in this node's own database when this build
-first started on it (fsynced, bound to the state.db incarnation, recorded
-before replication starts), and the external-seen set lists the shadows this
-node created itself. A local account that is cleared later never matches it,
-and neither does a name deleted and created again. Where no host holds
-evidence for a pre-split external user (its hosts were replaced, not
-upgraded), an administrator states it with `lv user mark-external`, which
-writes the same floor row.
+The evidence is PER USER and bound to the users row AS IT STOOD (username,
+created_at and the row's own updated_at): the credentials baseline lists the
+users that had an empty old column and no credential row in this node's own
+database when this build first started on it (fsynced, bound to the state.db
+incarnation, recorded before replication starts), and the external-seen set
+lists the shadows this node created itself. created_at alone does not identify
+an account: users rows are never hard-deleted, so `lv user rm` followed by
+`lv user create` under the same name REACTIVATES the row and keeps its
+created_at. Every write to the account moves the row's updated_at, and nothing
+else writes the users table, so a local account cleared later never matches the
+evidence, and neither does a name deleted and created again. The same holds
+for the replicated evidence: an empty credential row counts only when it was
+made no earlier than the users row's current version — a shadow writes both in
+one batch at one timestamp, a first pass stamps the users row's own time 40
+years back (the shift is fixed and undone on read), and a mark is stamped with
+the time it was made, 40 years back. Evidence about an earlier version fails
+closed: the login is refused (`Unavailable`, or `FailedPrecondition` naming
+`lv user mark-external`), never adopted. This compares a row with its own
+earlier stamp, or reads an empty credential row fail-closed against it; it
+never chooses between a copy and its parent by `updated_at`.
+
+Where no host holds evidence for a pre-split external user (its hosts were
+replaced, not upgraded), an administrator states it with
+`lv user mark-external`. The mark is refused while the host sees any local
+credential for the name — a password in the old column, or a credential row
+with one, live or tombstoned — and on a host whose replica has not caught up.
+It holds for the users row as it stands when it is made: if the name is later
+deleted and created again, the administrator decides again.
+
+### Receivers never demote an account they cannot judge
+
+A users row that arrives with a DIFFERENT created_at under a live account's
+name is a different account, and receivers refuse it over a local account
+(`users_admin_guard.go`). After the clear a local account whose credential row
+lags reads as an empty old column with no credential row, so the receiver
+judges the local row exactly as `UserLocalCredential` does and refuses unless it
+KNOWS the row is external. In the same anti-entropy exchange, the refused
+account's empty credential row is refused too: the account this node kept has
+no credential in view to compare it with. Refusing is fail-closed; the row is
+offered again by the next exchange and judged on what has arrived by then.
+The cost: an external shadow this node holds no evidence for is judged the same
+way, so if two hosts created a shadow for one new external user at the same
+time (two created_at), a host that holds the older one keeps it until evidence
+for it arrives (its credential row, after the split latches), and counts the
+refusal (`admin_remint`). Both rows are viewer shadows; nothing is demoted.
+
+### A shadow reactivation never wipes a local password
+
+An external login whose name this node holds only as a tombstone reactivates
+that row as a shadow. It is stamped two successor steps past the newest write
+this node holds for the row or its credential, never with a fresh clock. One
+step is what another node's clear of the same tombstone carries; two keep the
+shadow strictly newer than both the tombstone and that clear. Any write a peer
+made after the tombstone — the name created again as a local account, still in
+flight — is newer still, so it wins on every node and the local account keeps
+its password and role. With a fresh clock the shadow, written later in real
+time, replaced it cluster-wide (pre-existing on main).
 
 ## Tests
 

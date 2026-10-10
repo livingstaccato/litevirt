@@ -3,6 +3,7 @@ package corrosion
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
@@ -54,15 +55,30 @@ func InsertUser(ctx context.Context, c *Client, username, role, passwordHash str
 	split := c.MayWriteCredentialTables()
 	// Try reactivating a soft-deleted user first.
 	rows, err := c.Query(ctx,
-		`SELECT username FROM users WHERE username = ? AND deleted_at IS NOT NULL`, username)
+		`SELECT u.username, u.created_at, u.updated_at, k.updated_at AS cred_ts
+		   FROM users u LEFT JOIN user_credentials k ON k.username = u.username
+		  WHERE u.username = ? AND u.deleted_at IS NOT NULL`, username)
 	if err == nil && len(rows) > 0 {
+		// Whatever this node recorded about the name describes the row before
+		// this write (re-review 3, R1).
+		c.forgetExternalShadow(username)
+		ts := now
+		if passwordHash == "" {
+			ts = shadowReactivationTS(rows[0].String("updated_at"), rows[0].String("cred_ts"), now)
+		}
 		if split {
 			return c.ExecuteBatch(ctx, []Statement{
-				{SQL: usersReactivateSQL, Params: []interface{}{role, c.oldColumnValue(passwordHash), now, username}},
-				{SQL: userCredentialUpsertSQL, Params: []interface{}{username, passwordHash, now}},
+				{SQL: usersReactivateSQL, Params: []interface{}{role, c.oldColumnValue(passwordHash), ts, username}},
+				{SQL: userCredentialUpsertSQL, Params: []interface{}{username, passwordHash, ts}},
 			})
 		}
-		return c.Execute(ctx, usersReactivateSQL, role, passwordHash, now, username)
+		if err := c.Execute(ctx, usersReactivateSQL, role, passwordHash, ts, username); err != nil {
+			return err
+		}
+		if passwordHash == "" {
+			c.noteExternalShadow(userIdentity{Username: username, CreatedAt: rows[0].String("created_at"), UpdatedAt: ts})
+		}
+		return nil
 	}
 	created := nowRFC3339()
 	if passwordHash != "" {
@@ -83,9 +99,38 @@ func InsertUser(ctx context.Context, c *Client, username, role, passwordHash str
 		// An external-realm shadow made where no credential row can be
 		// written yet: positive evidence, bound to this row's identity, which
 		// this node's first live pass replicates (credentials_live.go).
-		c.noteExternalShadow(userIdentity{Username: username, CreatedAt: created})
+		c.noteExternalShadow(userIdentity{Username: username, CreatedAt: created, UpdatedAt: now})
 	}
 	return nil
+}
+
+// shadowReactivationTS is the updated_at of an external shadow that
+// reactivates a tombstoned users row: two successor steps (clearTS) past the
+// newest write this node holds for the row or its credential — not a fresh
+// clock (re-review 3, R4; pre-existing on main). Two, because one step is
+// exactly the stamp another node's credentials_clear_v1 pass gives the same
+// tombstone, and an equal timestamp with different content is a tie.
+//
+// The shadow is a reactivation of the tombstone THIS node holds. Any write a
+// peer made after that tombstone — above all the name created again as a local
+// account, still in flight to this node — is newer than the successor, so it
+// wins on every node, here included once it arrives, and the local account
+// keeps its password and role. With a fresh clock the shadow, written later in
+// real time, beat that write by LWW and wiped the local password cluster-wide.
+// It still beats the tombstone, so the reactivation itself replicates. A row
+// whose timestamps cannot be read keeps the fresh clock (main's behaviour).
+func shadowReactivationTS(usersTS, credTS, now string) string {
+	newest := usersTS
+	if credTS != "" && lwwOrder(credTS, newest) > 0 {
+		newest = credTS
+	}
+	if once, ok := clearTS(credentialSplitRow{srcTS: newest}); ok {
+		if twice, ok := clearTS(credentialSplitRow{srcTS: once}); ok {
+			return twice
+		}
+	}
+	slog.Warn("users: a tombstoned row has no readable timestamp; reactivating it with a fresh clock")
+	return now
 }
 
 const usersInsertSQL = `INSERT INTO users (username, role, password_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`

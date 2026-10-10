@@ -599,3 +599,140 @@ func TestFleet_CredentialsClear_AHostBackFromOfflineNeverTakesACleardLocalAccoun
 		t.Errorf("the host wrote a floor credential row for the cleared local admin (err %v)", err)
 	}
 }
+
+// TestFleet_CredentialsClear_AReactivatedNameNeverMatchesItsOldEvidence
+// (re-review 3, R1): users rows are never hard-deleted, so `lv user rm` and
+// `lv user create` under the same name REACTIVATE the row and keep its
+// created_at. A host that was off while that happened, and comes back with
+// its old database, holds evidence — its baseline, and the shadow it made
+// itself — that the name was an external user. The reactivated row arrives
+// with its credential still in flight. That evidence describes the row as it
+// was, not the local account it is now: an LDAP principal under the name is
+// refused there before and after the host's first pass, and the pass writes no
+// empty credential row for it. An external user whose row has not changed
+// keeps logging in.
+func TestFleet_CredentialsClear_AReactivatedNameNeverMatchesItsOldEvidence(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: 2696})
+	a, b, s := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	// Pre-split shadows: ops made on s itself, ext2 made on a.
+	if err := corrosion.InsertUser(ctx, s.DB, "ops", "viewer", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertUser(ctx, a.DB, "ext2", "viewer", ""); err != nil {
+		t.Fatal(err)
+	}
+	c.WaitConverged(t, convergeTimeout)
+	c.Isolate(s) // switched off with its database
+	latchAndClear(t, a, b)
+	c.WaitConverged(t, convergeTimeout, a, b)
+
+	// ops becomes a local admin: the real delete, then the real create, which
+	// reactivates the tombstoned row.
+	if _, err := c.SelfClient(a).DeleteUser(ctx, &pb.DeleteUserRequest{Username: "ops"}); err != nil {
+		t.Fatalf("DeleteUser: %v", err)
+	}
+	if _, err := c.SelfClient(a).CreateUser(ctx, &pb.CreateUserRequest{
+		Username: "ops", Password: "0ps-local", Role: "admin",
+	}); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	c.WaitConverged(t, convergeTimeout, a, b)
+	createdAt := oldColumn(t, a, `SELECT created_at FROM users WHERE username = 'ops'`)
+
+	// s comes back on this build with its old database.
+	if err := s.DB.NoteCredentialsBaseline(ctx); err != nil {
+		t.Fatal(err)
+	}
+	c.ClearLinkFaults()
+	c.SetLinkFault(a, s, LinkFault{Block: true})
+	c.SetLinkFault(b, s, LinkFault{Block: true})
+	restoreA := a.DoNotImplement("GetSensitiveStateDigest")
+	restoreB := b.DoNotImplement("GetSensitiveStateDigest")
+	defer restoreA()
+	defer restoreB()
+	corrosion.NewAntiEntropy(s.DB, s.PKIDir, 0).RunOnce(ctx)
+	u, err := corrosion.GetUser(ctx, s.DB, "ops")
+	if err != nil || u == nil || u.Role != "admin" || u.PasswordHash != "" || u.CreatedAt != createdAt {
+		t.Fatalf("precondition: %s holds ops as %+v (err %v); the scenario needs the reactivated "+
+			"admin row, created_at %s kept, without its credential", s.Name, u, err, createdAt)
+	}
+	ldap := func(subject string) error {
+		return auth.EnsureUserShadow(ctx, s.DB, &auth.Principal{Subject: subject, Realm: "ldap:corp"}, "viewer")
+	}
+	if err := ldap("ops"); err == nil {
+		t.Fatal("an LDAP principal adopted the reactivated local admin ops on evidence about the row it replaced")
+	}
+	if err := ldap("ext2"); err != nil {
+		t.Errorf("an unchanged pre-split external user was refused: %v", err)
+	}
+	latchAndSplit(t, s)
+	if err := ldap("ops"); err == nil {
+		t.Fatal("after its first pass, the host let an LDAP principal adopt the reactivated local admin")
+	}
+	if rows, err := s.DB.Query(ctx, `SELECT COUNT(*) AS n FROM user_credentials WHERE username = 'ops'`); err != nil || rows[0].Int64("n") != 0 {
+		t.Errorf("the host wrote an empty credential row for the reactivated local admin (err %v)", err)
+	}
+	if err := ldap("ext2"); err != nil {
+		t.Errorf("after the first pass, an unchanged pre-split external user was refused: %v", err)
+	}
+}
+
+// TestFleet_CredentialsClear_AShadowReactivationNeverWipesALocalPassword
+// (re-review 3, R4; pre-existing on main): alice is deleted and created again
+// as a local account on a. Inside the replication latency an LDAP alice logs
+// in on b, which still holds only the tombstone, and b reactivates the row as
+// an external shadow. That write comes later in real time, but it must not
+// beat a's: it is a reactivation of the tombstone b saw, not of the account a
+// created since. alice keeps her local password and role on every node.
+func TestFleet_CredentialsClear_AShadowReactivationNeverWipesALocalPassword(t *testing.T) {
+	for _, clear := range []bool{false, true} {
+		name := "before the split"
+		if clear {
+			name = "after the clear"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			c := New(t, Options{Nodes: 2, IndependentReplicas: true, FaultSeed: 2697})
+			a, b := c.Nodes[0], c.Nodes[1]
+			if clear {
+				latchAndClear(t, a, b)
+			}
+			if _, err := c.SelfClient(a).CreateUser(ctx, &pb.CreateUserRequest{
+				Username: "alice", Password: "al1ce-first", Role: "operator",
+			}); err != nil {
+				t.Fatalf("CreateUser: %v", err)
+			}
+			c.WaitConverged(t, convergeTimeout)
+			if _, err := c.SelfClient(a).DeleteUser(ctx, &pb.DeleteUserRequest{Username: "alice"}); err != nil {
+				t.Fatalf("DeleteUser: %v", err)
+			}
+			c.WaitConverged(t, convergeTimeout)
+
+			c.Isolate(b)
+			if _, err := c.SelfClient(a).CreateUser(ctx, &pb.CreateUserRequest{
+				Username: "alice", Password: "al1ce-again", Role: "operator",
+			}); err != nil {
+				t.Fatalf("CreateUser (reactivation): %v", err)
+			}
+			time.Sleep(50 * time.Millisecond) // b's write is later in real time
+			if err := auth.EnsureUserShadow(ctx, b.DB, &auth.Principal{Subject: "alice", Realm: "ldap:corp"}, "viewer"); err != nil {
+				t.Fatalf("precondition: b did not reactivate alice as a shadow: %v", err)
+			}
+			c.ClearLinkFaults()
+			c.WaitConverged(t, convergeTimeout)
+			for _, n := range []*Node{a, b} {
+				corrosion.NewAntiEntropy(n.DB, n.PKIDir, 0).RunOnce(ctx)
+			}
+			for _, n := range []*Node{a, b} {
+				u, err := corrosion.GetUser(ctx, n.DB, "alice")
+				if err != nil || u == nil || u.Role != "operator" || u.PasswordHash == "" {
+					t.Errorf("%s holds alice as %+v (err %v): a stale shadow reactivation replaced the local account", n.Name, u, err)
+				}
+				if _, err := c.SelfClient(n).Login(ctx, &pb.LoginRequest{Username: "alice", Password: "al1ce-again"}); err != nil {
+					t.Errorf("%s: alice's local password no longer works: %v", n.Name, err)
+				}
+			}
+		})
+	}
+}

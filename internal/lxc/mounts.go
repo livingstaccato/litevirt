@@ -526,16 +526,8 @@ func resolveDevice(d Device, a HostAccess) (resolvedDevice, error) {
 		if why := blockDeviceInUse(major, minor); why != "" {
 			return resolvedDevice{}, fmt.Errorf("block device %q is the host's: %s", src, why)
 		}
-		if a.BlockInUse != nil {
-			for _, f := range blockFamily(major, minor) {
-				var ma, mi uint32
-				if _, err := fmt.Sscanf(f.dev, "%d:%d", &ma, &mi); err != nil {
-					continue
-				}
-				if why := a.BlockInUse(ma, mi); why != "" {
-					return resolvedDevice{}, fmt.Errorf("block device %q is litevirt's: %s%s", src, f.what, why)
-				}
-			}
+		if why := litevirtBlockUse(a, major, minor); why != "" {
+			return resolvedDevice{}, fmt.Errorf("block device %q is litevirt's: %s", src, why)
 		}
 	}
 	return resolvedDevice{Source: src, Target: target, Kind: kind, Major: major, Minor: minor}, nil
@@ -1193,4 +1185,23 @@ func BlockDeviceNumber(p string) (major, minor uint32, ok bool) {
 	}
 	kind, ma, mi, ok := deviceNumbers(fi)
 	return ma, mi, ok && kind == 'b'
+}
+
+// litevirtBlockUse reports why a block device, one of its partitions or the
+// disk it belongs to is litevirt's own (a.BlockInUse: a VM disk on this host),
+// or "".
+func litevirtBlockUse(a HostAccess, major, minor uint32) string {
+	if a.BlockInUse == nil {
+		return ""
+	}
+	for _, f := range blockFamily(major, minor) {
+		var ma, mi uint32
+		if _, err := fmt.Sscanf(f.dev, "%d:%d", &ma, &mi); err != nil {
+			continue
+		}
+		if why := a.BlockInUse(ma, mi); why != "" {
+			return f.what + why
+		}
+	}
+	return ""
 }

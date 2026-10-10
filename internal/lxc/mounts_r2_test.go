@@ -224,3 +224,69 @@ func TestHookPolicy_RoundTripAndJudging(t *testing.T) {
 		t.Error("a missing policy read as allowing")
 	}
 }
+
+// N4. A VM disk on this host is litevirt's by number, and so are its
+// partitions and, for a partition, the disk it belongs to.
+func TestLitevirtBlockUse_CoversTheFamily(t *testing.T) {
+	old := sysDevBlock
+	t.Cleanup(func() { sysDevBlock = old })
+	sysDevBlock = filepath.Join(t.TempDir(), "sys")
+	_ = os.MkdirAll(filepath.Join(sysDevBlock, "8:64/sde1"), 0o755)
+	_ = os.WriteFile(filepath.Join(sysDevBlock, "8:64/sde1/partition"), []byte("1\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(sysDevBlock, "8:64/sde1/dev"), []byte("8:65\n"), 0o644)
+	_ = os.MkdirAll(filepath.Join(sysDevBlock, "8:80"), 0o755)
+	a := HostAccess{BlockInUse: func(ma, mi uint32) string {
+		if ma == 8 && mi == 64 {
+			return "the disk of VM db"
+		}
+		return ""
+	}}
+	if why := litevirtBlockUse(a, 8, 65); why == "" {
+		t.Error("a partition of a VM's disk was not litevirt's")
+	}
+	a.BlockInUse = func(ma, mi uint32) string {
+		if ma == 8 && mi == 65 {
+			return "the disk of VM db"
+		}
+		return ""
+	}
+	if why := litevirtBlockUse(a, 8, 64); why == "" {
+		t.Error("the disk holding a VM's partition was not litevirt's")
+	}
+	if why := litevirtBlockUse(a, 8, 80); why != "" {
+		t.Errorf("an unrelated disk was litevirt's: %s", why)
+	}
+}
+
+// m-c. The start hook's binary must be one root alone can change: a path a
+// config line cannot carry, or a file in a tree that is not root-owned and
+// closed to group and others, is refused.
+func TestValidateHookBinary_RefusesAnOpenTree(t *testing.T) {
+	if err := validateHookBinary("/opt/lv;rm -rf /"); err == nil {
+		t.Error("a hook path with shell characters passed")
+	}
+	bin := filepath.Join(t.TempDir(), "litevirt")
+	if err := os.WriteFile(bin, []byte("x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Owned by the test's user, or (as root) beneath the world-writable /tmp.
+	if err := validateHookBinary(bin); err == nil {
+		t.Errorf("a hook binary in an open tree (%s) passed", bin)
+	}
+}
+
+// m-b. The hook refuses a source that now lies in a protected tree, even
+// beneath an allowed prefix.
+func TestHookPolicy_JudgesProtectedTrees(t *testing.T) {
+	allowed := t.TempDir()
+	p := hookPolicy{MountPaths: []string{allowed}, Deny: []string{filepath.Join(allowed, "pool")}}
+	if err := p.judgeMount(allowed, filepath.Join(allowed, "pool", "disk")); err == nil {
+		t.Error("a source inside a protected store passed the hook")
+	}
+	if err := p.judgeMount(allowed, filepath.Join(allowed, "data")); err == nil {
+		t.Error("a prefix containing a protected store passed the hook")
+	}
+	if err := (hookPolicy{MountPaths: []string{allowed}}).judgeMount(allowed, filepath.Join(allowed, "data")); err != nil {
+		t.Errorf("an allowed source was refused: %v", err)
+	}
+}

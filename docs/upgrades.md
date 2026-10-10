@@ -241,6 +241,11 @@ reviewed, but no rollout has yet driven a real panic-loop through it on a live
 host. Treat the behaviour above as **expected**, not verified, and check the
 journals rather than assuming it ran.
 
+**Before relying on the auto-rollback after `recovery_claim_v1` has latched**,
+make sure every host's config sets `enforcement.recovery_claim: true`
+explicitly: the previous build reads a missing key as `false`, and it is not
+WAL-quarantined for it (see *Recovery claims latch after the roll* below).
+
 **Restoring `.old` restores the previous binary's behaviour in full** — including
 any limitations that build had. A rollback is a return to a known state, not a
 repair: whatever the older binary refused, mis-handled or did not yet implement,
@@ -664,6 +669,86 @@ again loses nothing. Roll forward.
 Retiring the `hosts` copy is a later release's step, behind a second token; see
 [design/host-membership-retire-old-columns.md](design/host-membership-retire-old-columns.md).
 
+### An unverified fence records `offline` after the roll
+
+A host recorded `fenced` used to mean "a fence succeeded", whatever the fence
+was. An SSH poweroff that nothing verified recorded it just as an IPMI
+power-off observed off did, and readers took the state as proof the host was
+off (colonelpanik/litevirt#253). Two things change:
+
+- **At once, on each upgraded host:** nothing takes a `fenced` state as proof
+  of power-off unless the host's newest fence is proof-grade (`ipmi`, or
+  `lv host fence-confirm`). Owner-assert asks an SSH-fenced host whether it
+  runs a workload, `lv host rm --dead` no longer counts a proof-grade fence
+  from an earlier life of a host whose `fenced` state now rests on an SSH
+  fence, and the voter-loss condition asks such a host which machine it is. This reads the rows every fence already wrote; nothing is
+  backfilled.
+- **After the last host has upgraded:** the mandatory, replication-gated
+  `fence_state_v1` token latches, and from then on an SSH, watchdog or
+  best-effort fence records the host `offline`, not `fenced`. Recovery is
+  unchanged: the coordinator still reschedules on such a fence, a successor
+  resumes from it, and the host is not put back in service automatically
+  once its workloads have moved. Until the token latches — while any host
+  the cluster replicates to, one parked in `maintenance` included, runs the
+  previous release — such a fence keeps recording `fenced`, because a
+  coordinator on that release resumes a recovery only from `fenced`.
+
+What an operator sees after the latch: the host's recorded state (the
+`host_membership` row, and the assurance `lv doctor fence` and `lv host fence`
+print) is `offline` for an SSH-fenced host. `lv host ls` shows `HOST_OFFLINE`
+for both `offline` and `fenced`, so it looks as before. Bring the host back
+with `lv host undrain <host>` as before. An
+`offline` host whose newest fence **failed** is still put back in service
+when a quorum sees it healthy again, as before; one whose newest fence
+succeeded waits for `lv host undrain`, exactly like a `fenced` host — this
+now includes a host fenced with `lv host fence`, which records it `offline`.
+A host that boots again still records itself `active` from its own daemon, as
+before; what waits is a host that answers without having restarted, which is
+the host an unverified fence may never have powered off.
+
+**`lv host fence` now authorises automatic recovery**, at once on an upgraded
+leader, latched or not. When the operator's fence succeeds, the failover leader
+treats it as it treats its own fence — under the same safe-fence policy,
+`litevirt.fence_requires_confirmation` label and recovery claims — and only
+while it still **stands**: some observer has watched the host fail without a
+break since **before** the fence, and nobody has seen it answer since. Then an
+`ssh` or `best-effort` fence is resumed from without fencing again, and an
+`ipmi` fence is resumed from while under 5 minutes old and otherwise renewed
+with a fresh power-off first. On the previous release an operator fence moved
+nothing, and the host's workloads stayed where they were.
+
+An observer's failing run is held in memory, so a daemon restart starts it
+over, and a rolling upgrade restarts every observer. So for a host an operator
+fenced **before** the upgrade that is still down:
+
+- an `ssh` or `best-effort` fence no longer stands once the roll completes, and
+  is **not** resumed from: the workloads stay where they are, as on the
+  previous release. Confirm the host is off and run
+  `lv host fence-confirm <host>`; the coordinator then fences it afresh for
+  the outage and recovers its workloads. (Mid-roll, an upgraded leader can
+  still resume from it while an observer that has not restarted yet holds an
+  unbroken run.)
+- an `ipmi` fence is renewed with a fresh power-off and then recovered, on the
+  first leader cycle after the roll that finds the host still down.
+
+The same holds for an operator fence of a host that was still answering when
+it was fenced: every observer's run began after the fence, so an `ssh` fence is
+never recovered from automatically (use `lv host fence-confirm`), and an
+`ipmi` one is renewed and recovered. If you do not want an IPMI-fenced host's
+workloads recovered at the upgrade, `lv host undrain` it before upgrading, or
+move them with `lv host drain`.
+
+`lv host fence` served by an upgraded node writes the host's state and its
+fence row as one replicated entry, so every leader cycle sees both. Served by a
+node that has not been upgraded yet, mid-roll, it still writes them as two
+entries, as on the previous release: an upgraded leader whose cycle lands
+between them sees the host `offline` with no successful fence row, treats it as
+handled and moves nothing. That fails closed; run `lv host fence-confirm` once
+the host is confirmed off.
+
+A binary rolled back below the latch enters WAL quarantine, as below every
+latched token. See [What a fence records](migration-failover.md#what-a-fence-records).
+
 ### Gossip encryption is a separate roll, after the upgrade
 
 The upgrade itself changes nothing on the gossip wire: `enforcement.gossip_encryption`
@@ -732,7 +817,7 @@ the derived set. It is not a rollback tool: a binary rolled back below the
 latched token enters WAL quarantine at startup, as below every latched token,
 whether or not a voter generation exists.
 
-### Recovery claims are opt-in after the roll
+### Recovery claims latch after the roll
 
 Schema v60 adds `runtime_action_proofs.claim_certificate`, the majority
 certificate that authorizes an ownership-transfer proof; v61 adds
@@ -747,30 +832,66 @@ answered by the previous one's decision. Nothing writes the new
 column until the `recovery_claim_v1` capability token has latched. It is
 replication-gated, so it cannot latch while any host the cluster replicates to
 runs the previous release, and — unlike `voter_config_v1` — it is **not**
-mandatory: it latches only once every host has opted in.
+mandatory: it has a flag, `enforcement.recovery_claim`, and latches only once
+every host advertises it.
 
-To turn recovery claims on:
+The flag defaults **on**: a config without the key has it on, so an upgrade
+needs no config change, and an explicit `false` still wins. Builds before this
+default had it off, and turning claims on was an operator step. What happens
+now:
 
-1. Finish the roll and let `voter_config_v1` latch and genesis complete
-   (`lv cluster voter ls` shows generation 1). A cluster can stop here.
-2. Set `enforcement.recovery_claim: true` on **every** host, witnesses
-   included, and restart them one at a time. A host advertises the token only
-   with the flag on, `split_brain_gate_v1` latched and the ability to vote
-   durably.
-3. Wait for `recovery_claim_v1` to latch. Until it does, a host with the
-   flag on reports `litevirt_ha_degraded{reason="unsupported_member"}`; once
-   that clears everywhere and `not_enforcing` is empty, the next failover is
-   claim-gated.
+1. During the roll nothing changes. A host on the previous build advertises
+   the token only if its config sets `enforcement.recovery_claim: true`
+   explicitly, so on a cluster that never set the key it cannot latch. Each upgraded host reports
+   `litevirt_ha_degraded{reason="unsupported_member"}` until the last host is
+   upgraded, as for `partition_pause_v1`.
+2. After the last host restarts, `voter_config_v1` latches and genesis
+   completes (`lv cluster voter ls` shows generation 1).
+3. `recovery_claim_v1` then latches. A host advertises it once
+   `split_brain_gate_v1` has latched and it can vote durably. When
+   `ha_degraded` clears everywhere and `not_enforcing` is empty, the next
+   failover is claim-gated.
 4. Validate with a partition drill before relying on it.
 
-To stand down, set the flag off on **every** host and restart: coordinators
+Once enforced, a recovery decided for a destination that then dies waits for
+`lv host rm --dead <dest>` instead of moving on to another host
+(`ha.claim.stranded` names the command); an exact half of the voters cannot
+certify a recovery; and a host most voters can still reach is not recovered.
+To keep an explicit voter set without claims, set
+`enforcement.recovery_claim: false` on every host before the roll finishes.
+One host with an explicit `false` holds the latch off for the whole cluster.
+
+To stand down, set the flag to an explicit `false` on **every** host and
+restart (a missing key means on): coordinators
 mint uncertified proofs and destinations accept them, exactly the pre-claim
 behaviour; voters keep answering and keep their history, and the voter set does
 not move. A flag off on only some hosts is not a degraded mode but the hazard
 the token exists to prevent — such a host reports `recovery_claim_v1` in
-`PingResponse.not_enforcing` and its peers raise `ha_degraded`. A binary rolled
-back below the latched token enters WAL quarantine, as below every latched
-token.
+`PingResponse.not_enforcing` and its peers raise `ha_degraded`. A host left
+on an explicit `false` while the others keep the default holds the latch off
+and keeps `ha_degraded{reason="unsupported_member"}` raised on **every other
+host** for as long as it stays that way: opt out on every host, or on none.
+Alerting on `unsupported_member` also fires for the length of every roll.
+
+Once enforced, two stalls surface only as a reason on the gate-refusal metric
+and a WARN log, not as a health condition: `recovery_claim_owner_reachable` (a
+host most voters still reach is not recovered) and `recovery_claim_no_majority`
+(no majority of the voter set certified the claim, an exact half included).
+`lv cluster claim <kind>/<name>` shows each voter's answer; the unblocks are in
+[design/recovery-claims.md](design/recovery-claims.md) §6.
+
+**Rolling a host back, or rejoining one, after the latch.** WAL quarantine does
+**not** cover this token. The build before this default already knows
+`recovery_claim_v1`, so the rollback preflight finds nothing to quarantine,
+and that build reads a config **without** the key as `false`. A host rolled
+back to it — by hand or by the auto-rollback below — or a host that was offline
+through the roll and rejoins on it, therefore mints and runs recovery proofs
+without a certificate: the second owner the token exists to prevent. Before
+rolling a host back to an older build, or bringing back one that missed the
+roll, add `enforcement.recovery_claim: true` **explicitly** to its config; the
+older build honours an explicit key. Clusters founded with `lv host init` on
+this build already carry the explicit key. `lv doctor fence` warns when the
+token has latched and any host does not enforce it, and names the host.
 
 ## Schema upgrades: `litevirt schema-migrate`
 

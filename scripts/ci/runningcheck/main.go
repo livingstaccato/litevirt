@@ -105,6 +105,9 @@ var nonMinting = map[string]int{
 	"UpdateVMState":        3,
 	"UpdateVMStateStrict":  3,
 	"UpdateVMStateAtEpoch": 3,
+	// SyncVMStopIfRunning(ctx, c, name, state, detail, epoch): the
+	// out-of-band stop sync, conditional on the row still running.
+	"SyncVMStopIfRunning": 3,
 	// UpdateVMHost(ctx, c, name, hostName, state) — a plain state argument that
 	// goes straight into `UPDATE vms SET host_name = ?, state = ?`. It was
 	// registered -1 here under a comment claiming the state travelled inside a
@@ -114,8 +117,12 @@ var nonMinting = map[string]int{
 	// RescheduleVMHost(ctx, c, name, hostName, state) and
 	// RepointMigratedVM(ctx, c, vm, source, target, finalState): UpdateVMHost's
 	// statement, with the VM's disk rows or a guard on the migrating row.
-	"RescheduleVMHost":     4,
-	"RepointMigratedVM":    5,
+	"RescheduleVMHost":  4,
+	"RepointMigratedVM": 5,
+	// RekeyStoppedVM(ctx, c, name, from, dest, state, epoch): the
+	// reschedule's statement for a stopped VM moved off a failed host; it
+	// refuses any state but "stopped", and its one caller passes that literal.
+	"RekeyStoppedVM":       5,
 	"InsertVM":             stateInVMRecord,
 	"InsertVMWithHardware": stateInVMRecord,
 }
@@ -138,7 +145,11 @@ var minting = map[string]int{
 	"TransferVMOwner":          4,
 	"TransferVMOwnerFresh":     4,
 	"TransferVMOwnerWithDisks": 4,
-	"CompleteVMStartProof":     alwaysRunning,
+	// RekeyStoppedVMClaimed(ctx, c, name, from, dest, state, epoch): the
+	// claimed re-key of a stopped VM off a failed host; it refuses any state
+	// but "stopped", and its one caller passes that literal.
+	"RekeyStoppedVMClaimed": 5,
+	"CompleteVMStartProof":  alwaysRunning,
 	// ReplaceVM installs a cutover's replacement with the state copied from the
 	// source row it re-reads at commit time, not taken as an argument, so no
 	// literal can ever exempt a call — and, unlike the entries above, the state
@@ -572,25 +583,25 @@ type stateStatement struct {
 var stateWritingStatements = []stateStatement{
 	{
 		sql:     `UPDATE vms SET state = ?, state_detail = ?, updated_at = ? WHERE name = ?`,
-		writers: []string{"UpdateVMState", "UpdateVMStateStrict"},
+		writers: []string{"UpdateVMState", "UpdateVMStateStrict", "SyncVMStopIfRunning", "RekeyStoppedVM"},
 		note:    "nonMinting, state at arg 3; they differ only in their Go-side row-count check",
 	},
 	{
 		sql:     `UPDATE vms SET state = ?, state_detail = ?, updated_at = ? WHERE name = ? AND vm_owner_epoch = ?`,
-		writers: []string{"UpdateVMStateAtEpoch"},
-		note:    "nonMinting, state at arg 3",
+		writers: []string{"UpdateVMStateAtEpoch", "SyncVMStopIfRunning", "RekeyStoppedVMClaimed"},
+		note:    "nonMinting, state at arg 3; RekeyStoppedVMClaimed (minting, arg 5) writes its marker at the generation its transfer minted",
 	},
 	{
 		sql:     `UPDATE vms SET host_name = ?, state = ?, state_detail = '', updated_at = ? WHERE name = ?`,
-		writers: []string{"UpdateVMHost", "CommitMigrationOwnership", "RescheduleVMHost", "RepointMigratedVM"},
-		note:    "all nonMinting (state at arg 4, 5, 4 and 5) - identical SQL, different guards and companions in Go",
+		writers: []string{"UpdateVMHost", "CommitMigrationOwnership", "RescheduleVMHost", "RepointMigratedVM", "RekeyStoppedVM"},
+		note:    "all nonMinting (state at arg 4, 5, 4, 5 and 5) - identical SQL, different guards and companions in Go",
 	},
 	{
 		sql: `UPDATE vms
 	  SET host_name = ?, state = ?, state_detail = '',
 	      vm_owner_epoch = vm_owner_epoch + 1, updated_at = ?
 	  WHERE name = ? AND deleted_at IS NULL AND vm_owner_epoch = ?`,
-		writers: []string{"TransferVMOwner", "TransferVMOwnerFresh", "TransferVMOwnerWithDisks"},
+		writers: []string{"TransferVMOwner", "TransferVMOwnerFresh", "TransferVMOwnerWithDisks", "RekeyStoppedVMClaimed"},
 		note:    "MINTING: the statement advances the generation, so the correct marker value does not exist until it commits",
 	},
 	{

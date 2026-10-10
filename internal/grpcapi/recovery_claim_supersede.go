@@ -245,6 +245,26 @@ func (s *Server) strandedOn(ctx context.Context, host string) ([]*pb.StrandedRec
 		if err != nil || full == nil {
 			continue
 		}
+		if full.State == "stopped" {
+			disks, derr := corrosion.GetVMDisks(ctx, s.db, full.Name)
+			if derr != nil {
+				return nil, derr
+			}
+			local := corrosion.VMHasHostLocalDisk(disks)
+			switch {
+			case corrosion.VMStoppedForFailover(*full) && !local:
+				out = append(out, &pb.StrandedRecovery{Kind: "vm", Name: full.Name, Detail: fmt.Sprintf(
+					"vm/%s is stopped, on shared storage: once this removal and the CRL have replicated, failover may "+
+						"move it, still stopped, to a live host (it needs a failure policy or auto-promote, no firmware "+
+						"state and no ownership dispute); start it there with `lv start %s`. Otherwise it stays recorded "+
+						"on %s and comes back with %s when the machine is added again under that name",
+					full.Name, full.Name, host, host)})
+				continue
+			case corrosion.VMStoppedForFailover(*full) || local:
+				out = append(out, &pb.StrandedRecovery{Kind: "vm", Name: full.Name, Detail: stoppedOnDeadHostDetail("vm", full.Name, host)})
+				continue
+			}
+		}
 		out = append(out, s.strandedFor(ctx, "vm", full.Name, host, full.PendingActionID))
 	}
 	cts, err := corrosion.ListContainers(ctx, s.db, host)
@@ -252,6 +272,10 @@ func (s *Server) strandedOn(ctx context.Context, host string) ([]*pb.StrandedRec
 		return nil, err
 	}
 	for _, ct := range cts {
+		if corrosion.ContainerStoppedForFailover(ct) {
+			out = append(out, &pb.StrandedRecovery{Kind: "container", Name: ct.Name, Detail: stoppedOnDeadHostDetail("container", ct.Name, host)})
+			continue
+		}
 		id := ""
 		if ct.RelocateToken != "" {
 			if pr, ok, _ := corrosion.GetActionProofByToken(ctx, s.db, ct.RelocateToken); ok {
@@ -262,6 +286,30 @@ func (s *Server) strandedOn(ctx context.Context, host string) ([]*pb.StrandedRec
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Kind+out[i].Name < out[j].Kind+out[j].Name })
 	return out, nil
+}
+
+// stoppedOnDeadHostDetail is what `lv host rm --dead` says about a stopped
+// workload failover leaves on the host it removes: one stopped by intent that
+// it could not move still stopped, or one with a host-local disk
+// (failover.recoverWorkloads). Removing the host does not move it either: it
+// stays recorded there, its data with the machine, and comes back with the
+// machine if it is added again under the same name (AdmitHost admits a name
+// whose only recorded workloads are stopped). It carries no next attempt, so
+// it is not counted as a recovery that will retry.
+func stoppedOnDeadHostDetail(kind, name, host string) string {
+	if kind == "container" {
+		return fmt.Sprintf("container/%s is stopped: failover never recreates or starts a stopped container, so it stays "+
+			"recorded on %s with its rootfs and is not moved by this removal. To keep its data, bring %s back: it "+
+			"returns with %s when the machine is added again under that name (`lv host add`). If the data is lost "+
+			"for good, remove it with `lv ct rm %s --host %s`",
+			name, host, host, host, name, host)
+	}
+	return fmt.Sprintf("vm/%s is stopped: failover does not start it or rebuild its disks elsewhere, so it stays "+
+		"recorded on %s with its disks and is not moved by this removal. To keep its data, bring %s back: it "+
+		"returns with %s when the machine is added again under that name (`lv host add`). Or promote a replica "+
+		"onto a live host (`lv replication promote %s`). If the data is lost for good, remove it with `lv rm %s` "+
+		"and create it again",
+		name, host, host, host, name, name)
 }
 
 func (s *Server) strandedFor(ctx context.Context, kind, name, host, proofID string) *pb.StrandedRecovery {

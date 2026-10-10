@@ -140,8 +140,10 @@ is not. Step 2 (§4) makes the set explicit.
   changes only through an operator action (colonelpanik/litevirt#251 step 2).
   Once initialized it is permanent: it does not depend on whether recovery
   claims are enforced, and no kill switch dissolves it.
-- **G5.** Off by default and inert until the cluster latches it. A kill switch
-  must return recovery authorization to today's behaviour.
+- **G5.** On by default, and inert until the cluster latches it, which needs
+  every host on a build that advertises it. A kill switch must return recovery
+  authorization to the pre-claim behaviour. (It was off by default until
+  colonelpanik/litevirt#250 was closed; §5.5 covers the upgrade.)
 - **G6.** A certificate also records that a majority of voters, each probing
   for itself, could not reach the workload's recorded owner. No coordinator,
   whatever its own health view says, can certify the recovery of a host that
@@ -1179,15 +1181,24 @@ node-local grant tables and the voter incarnation.
   with the follow-up, `lv host rm --dead` and
   `lv cluster voter force-reconfigure` (§3.12, §4.6). Each is a decided change, so every node
   moves at the same generation. `reset` is the full exit back to the derived
-  set. A host rolled back below this build after the token has latched enters
-  WAL quarantine, as for every latched token, whether or not a config exists.
-  That note is beside the declaration, above `capabilities.supported`.
+  set. A host rolled back below the build that introduced the token, after it
+  has latched, enters WAL quarantine, as for every latched token, whether or
+  not a config exists. That note is beside the declaration, above
+  `capabilities.supported`. WAL quarantine applies only to a binary that does
+  not know a latched token's name; it does not cover a host rolled back to a
+  build that knows `recovery_claim_v1` but reads `enforcement.recovery_claim`
+  differently (§5.6).
 
 **`recovery_claim_v1`** (`capabilities.RecoveryClaimV1`) covers
 enforcement: coordinators claiming before they mint, and destinations
 verifying before they execute.
 
-- **Flag:** `enforcement.recovery_claim`, default **false**.
+- **Flag:** `enforcement.recovery_claim`, default **true**: `LoadConfig` sets
+  it before parsing, so a config without the key has it on, and an explicit
+  `false` wins. It is the third enforcement flag that defaults on, beside
+  `audit_signature` and `partition_pause`. Partition pause's settle-back stops
+  a returning host's copy only on a certified claim, so the two defaults go
+  together.
 - **Advertised conditionally** in `Server.advertisedCapabilities` when the flag
   is on **and** this node is ready: `split_brain_gate_v1` is latched (the
   certificate rides on proofs) and `voter_config_v1` is ready on this node. A
@@ -1233,8 +1244,9 @@ over:
 - **Witnesses.** A witness with the flag off would hold the latch off fleet-wide.
   For the fence token that is a trap, because a witness has no role in fencing.
   Here a witness runs a failover coordinator like every node (§1.1), and a
-  flag-off coordinator mints uncertified proofs, so its operator must opt in,
-  and holding the latch off until then is correct. Its role as a *voter* needs
+  flag-off coordinator mints uncertified proofs. A witness has the flag on by
+  default like any host; an explicit `false` there holds the latch off
+  fleet-wide, which is correct. Its role as a *voter* needs
   no opt-in: that is `voter_config_v1`, which is mandatory.
 - **Nodes mid-rollout stop enforcing.** For this token there is nothing to lose
   before the latch. Enforcement partway through a rollout is unsafe (the example
@@ -1256,8 +1268,9 @@ over:
 - **After genesis:** `VoterSet` counts the explicit set for the fence
   quorum, the recovery quorum and `health.QuorumProof`, and voter changes are
   claims. Recovery itself is authorized as today until claims are enforced.
-- **A new binary with `enforcement.recovery_claim` on, before
-  `recovery_claim_v1` latches:** it advertises and enforces nothing.
+- **A new binary with `enforcement.recovery_claim` on (the default), before
+  `recovery_claim_v1` latches:** it advertises the token once it is ready, and
+  enforces nothing.
 - **After `recovery_claim_v1` latches, with no voter config:** enforcement
   stays off (the predicate needs an adopted config), and `lv doctor` says so.
 - **After the latch, with a config:** fully enforced. A node whose flag is later
@@ -1292,22 +1305,35 @@ over:
   members, and per member reachable, fenced or abstaining, with incarnation
   mismatches.
 
-### 5.5 Turning it on
+### 5.5 What happens on upgrade
 
-1. Roll every host to a build with the claim protocol. Run `lv doctor fence`
-   and confirm the fence posture is what you expect.
-2. Wait for `voter_config_v1` to latch and genesis to complete. Neither needs
-   config. `lv cluster voter ls` shows generation 1 and its members.
-   If `ha.voter.genesis_pending` persists, clear what it names, or run
-   `lv cluster voter init --members` for a cluster that cannot
-   become clean. This step stands on its own: a cluster can stop here and keep
-   an explicit voter set without ever enforcing claims.
-3. Set `enforcement.recovery_claim: true` on **every** host, witnesses included,
-   and restart them one at a time.
-4. Wait for `recovery_claim_v1` to latch. `lv doctor` shows it, and
-   `not_enforcing` is empty everywhere. The next failover is claim-gated.
-5. Validate with a partition drill before relying on it (§7.3), in the same
+The flag defaults on, so an upgrade needs no config change. Nothing is enforced
+until every host advertises the token, which a host on this build does by
+default and a host on an older build does only with an explicit
+`enforcement.recovery_claim: true`; the latch needs every host's
+advertisement.
+
+1. Roll every host to a build with the claim protocol, one at a time. Run
+   `lv doctor fence` and confirm the fence posture is what you expect. Mid-roll
+   nothing changes: the token cannot latch while any host runs an older build.
+2. After the last host restarts, `voter_config_v1` latches and genesis
+   completes. Neither needs config. `lv cluster voter ls` shows generation 1
+   and its members. If `ha.voter.genesis_pending` persists, clear what it
+   names, or run `lv cluster voter init --members` for a cluster that cannot
+   become clean.
+3. `recovery_claim_v1` then latches. `lv doctor fence` shows it, and `not_enforcing`
+   is empty everywhere. The next failover is claim-gated.
+4. Validate with a partition drill before relying on it (§7.3), in the same
    spirit as the operator note in `capabilities.supported`.
+
+A cluster that wants an explicit voter set without claims sets
+`enforcement.recovery_claim: false` on every host before step 3. One host with
+an explicit `false` holds the latch off fleet-wide, which is intended: the
+latch has to mean every host enforces (§5.2). What enforcing changes is in
+§3.12 (a destination that dies after its claim is decided waits for
+`lv host rm --dead`), and in the majority and owner-probe rules (§3.5, §3.5.1): an exact
+half of the voters cannot certify a recovery, and neither can voters that still
+reach the recorded owner.
 
 ### 5.6 Standing down in an incident
 
@@ -1315,8 +1341,9 @@ The kill switch follows the reversible `configFlag && latch` model described in
 `internal/capabilities/capabilities.go`:
 
 - **Full stand-down:** set `enforcement.recovery_claim: false` on **every** node
-  and restart. Coordinators mint uncertified proofs and destinations accept
-  them. That is exactly today's behaviour, including its documented
+  and restart. The setting has to be an explicit `false`: a missing key
+  means on. Coordinators mint uncertified proofs and destinations accept
+  them. That is exactly the pre-claim behaviour, including its documented
   double-owner exposure. Do not delete latch markers (retired practice). Voters
   keep answering and keep their tables, so turning the flag back on resumes
   with history intact.
@@ -1326,6 +1353,16 @@ The kill switch follows the reversible `configFlag && latch` model described in
   One workload held by `ha.claim.legacy_held` behind a proof stuck in flight
   on a live destination is released on its own with
   `lv cluster claim-release <kind>/<name>` (§10 item 37), not by a stand-down.
+- **Rollback is a stand-down on that host.** The build before this default
+  knows `recovery_claim_v1`, so a host rolled back to it after the latch is
+  **not** WAL-quarantined, and that build reads a config without the key as
+  `false`. The same holds for a host that missed the roll and rejoins on the
+  older build. Either is the partial stand-down above. Before rolling a host
+  back or bringing one back on an older build, add
+  `enforcement.recovery_claim: true` explicitly to its config, which the older
+  build honours. Clusters founded with `lv host init` on this build carry the
+  explicit key. `lv doctor fence` warns when the token has latched and any
+  reachable host does not enforce it.
 - **The voter config is not part of the stand-down.** It is a fact the cluster
   agreed on, and `VoterSet` reads it whatever the flag says (§4.5, §9, Q4). The
   fence quorum and recovery quorum keep counting the explicit set. A voter set

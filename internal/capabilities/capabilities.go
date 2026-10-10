@@ -256,6 +256,36 @@ const (
 	// (claims.Spec.AdoptLegacy, grpcapi Server.legacyValueExcluded).
 	ClaimIncarnationV1 = "claim_incarnation_v1"
 
+	// FenceStateV1 gates what an UNVERIFIED fence records as the host's state
+	// (colonelpanik/litevirt#253). Before it latches, a coordinator records
+	// 'fenced' for any successful fence, as every earlier build does. Once
+	// latched, only a proof-grade fence — a verified IPMI power-off — records
+	// 'fenced'; an SSH, watchdog or best-effort success records 'offline',
+	// together with its fencing_log row, because nothing proved the host off.
+	//
+	// It states a fact about the BINARY, which is why it is mandatory and has
+	// no config flag: this build RESUMES a recovery from an unverified fence
+	// recorded 'offline' — a successor finishes what a leader that lost its
+	// lease mid-recovery started — and never AUTO-ACTIVATES an 'offline' host
+	// whose newest fence succeeded unless it fenced that host itself and moved
+	// nothing off it. A coordinator on an older build resumes only from
+	// 'fenced' and auto-activates any 'offline' host a quorum sees healthy, so
+	// a leader that wrote 'offline' while one could still take the lease would
+	// strand the recovery, or put a host whose workloads had moved back into
+	// service. Whichever node holds the failover lease relies on every node
+	// that could hold it next, which is any node.
+	//
+	// The READ side needs no token: corrosion.HostProvedOff judges a 'fenced'
+	// state by its newest fence row on every build of this release, so a host
+	// an older leader recorded 'fenced' on an SSH success is not taken to be
+	// off by anything here, latched or not.
+	//
+	// ReplicationGated: a host in `maintenance` is skipped by the voting sweep
+	// and can still hold the failover lease (nothing in the lease gates on the
+	// holder's state), so the latch must hold of every host this node
+	// replicates to, a maintenance host on the previous build included.
+	FenceStateV1 = "fence_state_v1"
+
 	// RecoveryClaimV1 gates ENFORCEMENT of single-winner recovery claims
 	// (docs/design/recovery-claims.md §3, §5.1–§5.2,
 	// colonelpanik/litevirt#250): a failover coordinator collects a majority
@@ -751,6 +781,14 @@ const (
 //     intact, and the incarnation-scoped one is left unread until it is
 //     upgraded again.
 //
+//   - fence_state_v1 has no flag either: it says this build resumes from an
+//     unverified fence recorded 'offline' and does not auto-activate such a
+//     host, which the lease holder relies on of every node. It changes only
+//     the state an unverified fence records; the safe-fence policy and
+//     litevirt.fence_requires_confirmation still decide whether a recovery
+//     runs on one. A binary rolled back below it enters WAL quarantine, as
+//     below every latched token.
+//
 // recovery_claim_v1 is NOT mandatory and HAS a flag, enforcement.recovery_claim,
 // which is its stand-down: false on every node and a restart returns recovery
 // authorization to the pre-claim behaviour; voters keep answering and keep
@@ -830,8 +868,12 @@ var supported = []string{
 	// keys claims by incarnation and seals the legacy key", a fact about the
 	// binary.
 	ClaimIncarnationV1,
+	// FenceStateV1 is advertised UNCONDITIONALLY: it says "this build resumes
+	// a recovery from an unverified fence recorded 'offline' and does not
+	// auto-activate such a host", a fact about the binary.
+	FenceStateV1,
 	// RecoveryClaimV1 is advertised CONDITIONALLY: enforcement.recovery_claim
-	// on AND this node ready (split_brain_gate_v1 latched, voter_config_v1
+	// (default on) on AND this node ready (split_brain_gate_v1 latched, voter_config_v1
 	// ready). Withheld while the flag is off because every flag-on node relies
 	// on every peer honouring it — see RecoveryClaimV1 and
 	// grpcapi.RecoveryClaimReadiness.
@@ -859,7 +901,7 @@ var supported = []string{
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, FenceStateV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {
@@ -917,6 +959,10 @@ var replicationGated = map[string]bool{
 	// Confirmed against every replication recipient: a v2 accept inside a
 	// replicated certificate must be verifiable by every host we stream to.
 	ClaimIncarnationV1: true,
+	// Confirmed against every replication recipient: any of them can hold the
+	// failover lease, a maintenance host on the previous build included, and
+	// that build resumes only from 'fenced'. See FenceStateV1.
+	FenceStateV1: true,
 	// Confirmed against every replication recipient: the claim_certificate
 	// column's statement shapes on runtime_action_proofs must be decodable by
 	// every host we stream to. Not mandatory: the flag is the opt-in.
@@ -967,6 +1013,10 @@ var mandatory = map[string]bool{
 	// legacy key), and a coordinator relies on every voter keeping that
 	// format. See ClaimIncarnationV1.
 	ClaimIncarnationV1: true,
+	// A fact about the binary (it resumes from an unverified fence recorded
+	// 'offline' and does not auto-activate such a host), and the lease holder
+	// relies on whichever node holds the lease next. See FenceStateV1.
+	FenceStateV1: true,
 }
 
 // Mandatory reports whether token is enforced with no config kill switch.

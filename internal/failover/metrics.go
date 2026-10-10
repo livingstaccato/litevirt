@@ -103,6 +103,9 @@ const (
 	ErrRelocateFailed      = "relocate_failed"
 	ErrOwnershipDispute    = "ownership_dispute" // active ownership condition on the workload; recovery refused
 	ErrRestoreUnknown      = "restore_unknown"
+	// ErrStopped: the workload is stopped, so failover leaves it on its
+	// host with its disks and never starts or moves it.
+	ErrStopped = "stopped"
 	// ErrLocalStall: quorum agreed a host failed, but this coordinator itself
 	// stopped running within health.StallGrace, so the fence is deferred.
 	ErrLocalStall = "local_stall"

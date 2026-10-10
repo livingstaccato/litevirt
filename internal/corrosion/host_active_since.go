@@ -85,9 +85,14 @@ const fenceLifeSkew = 5 * time.Second
 // when `lv host add` gave the name to a new machine, would have let
 // `lv host rm --dead` remove the new one as proven off.
 //
-// A host recorded 'fenced' is exempt: that write IS a fence of the host as it
-// is now (RecordFenceWithState, `lv host fence-confirm`), and its row stands
-// beside it whatever the two clocks say.
+// A host recorded 'fenced' whose newest fence is proof-grade is exempt: that
+// write IS a proved fence of the host as it is now (RecordFenceWithState,
+// `lv host fence-confirm`), and its row stands beside it whatever the two
+// clocks say. A 'fenced' state over an UNVERIFIED fence — what a leader before
+// fence_state_v1 latched writes for an SSH success — is not: it says nothing
+// proved the host off, so an older proof-grade row of an earlier life must not
+// count for it (colonelpanik/litevirt#253). Its state write dates its life like
+// any other state's.
 func HostFenceLife(ctx context.Context, c *Client, host string) (since time.Time, state string, ok bool, err error) {
 	if !c.HostMembershipLive() {
 		return time.Time{}, "", false, nil
@@ -97,8 +102,17 @@ func HostFenceLife(ctx context.Context, c *Client, host string) (since time.Time
 		return time.Time{}, "", false, err
 	}
 	r := rows[0]
-	if !r.memPresent || r.mem.State == "fenced" {
+	if !r.memPresent {
 		return time.Time{}, "", false, nil
+	}
+	if r.mem.State == "fenced" {
+		proved, perr := FenceRecordProvesOff(ctx, c, host)
+		if perr != nil {
+			return time.Time{}, "", false, perr
+		}
+		if proved {
+			return time.Time{}, "", false, nil
+		}
 	}
 	at, ok := ParseUpdatedAt(r.memTS)
 	if !ok {

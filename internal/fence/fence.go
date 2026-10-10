@@ -146,8 +146,9 @@ const sshFenceArmed = "litevirt-fence-armed"
 // There is no trailing `|| true`. It was once here, and it meant a host whose
 // shutdown commands BOTH failed still exited 0, so the fence returned
 // Method:"ssh", Success:true for a machine that was still running. That
-// success is load-bearing: fenceProvedOff writes hosts.state="fenced" from it,
-// and a later coordinator resumes the reschedule from that record alone. When
+// success is load-bearing: a coordinator reschedules on it, and a later
+// coordinator resumes the reschedule from its record alone (it never proves
+// the host off — see Assurance — but it is still authority to recover). When
 // both commands here fail, the shell exits non-zero (and not 255: neither
 // systemctl nor a failed redirect exits 255), and that is reported as a
 // failure.

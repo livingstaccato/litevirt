@@ -4549,6 +4549,19 @@ message FenceReadiness {
     // writes "fenced" both for an IPMI power-off that was observed off and for
     // an SSH poweroff nobody checked. DIAGNOSTIC ONLY.
     repeated FenceEvent recent_fences = 7;
+    // recovery_claim_latched: recovery_claim_v1 is latched ON THE RESPONDING
+    // NODE (Latched, never Enforced — the same per-node caveat as
+    // capability_latched).
+    bool recovery_claim_latched = 8;
+    // recovery_claim_hosts: every host's recovery-claim posture, witnesses
+    // included (a witness runs a failover coordinator). enforcing=false with
+    // posture_known=true is a host that reports enforcement.recovery_claim
+    // off, or that does not advertise recovery_claim_v1 at all — after the
+    // latch, either one is the uncertified second owner the token exists to
+    // prevent. An older build reads a missing key as false and is NOT
+    // WAL-quarantined for it, which is how a rolled-back host lands here.
+    // DIAGNOSTIC ONLY.
+    repeated FenceHostPosture recovery_claim_hosts = 9;
 }
 
 // FenceEvent is one fencing_log row, labelled with what it established.

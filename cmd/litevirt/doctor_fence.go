@@ -38,6 +38,11 @@ A host advertises the token regardless of its own config flag, so the cluster
 can show the capability fully latched while individual hosts silently skip the
 fence. This command asks every host for its own posture, so that gap is visible.
 
+It also reports each host's recovery-claim posture (enforcement.recovery_claim,
+default on) and warns when recovery_claim_v1 has latched but a host does not
+enforce it — for example one rolled back to an older build, which reads a
+missing key as false. That warning does not change the exit code.
+
 Exit code: 0 when no shared-disk VM is exposed · 1 when one or more are.
 
 Two things this check cannot establish, reported on every run: each host's own
@@ -127,6 +132,64 @@ func printFenceReadiness(r *pb.FenceReadiness) {
 
 	printRecentFences(r.GetRecentFences())
 	printFenceCaveats(r)
+	printRecoveryClaimReadiness(r)
+}
+
+// printRecoveryClaimReadiness reports whether every host enforces recovery
+// claims, and WARNS when recovery_claim_v1 has latched on the queried node and
+// some reachable host does not. DIAGNOSTIC ONLY: it does not change the exit
+// code, which stays the shared-disk fence verdict.
+//
+// The case it exists for is a host rolled back to an older build after the
+// latch, or one that missed the roll and rejoins on one. That build reads a
+// config without enforcement.recovery_claim as false, and it knows the token,
+// so the rollback preflight does not WAL-quarantine it. Its coordinator then
+// mints uncertified proofs and its executor runs them: the second owner the
+// token exists to prevent, with nothing else in the CLI saying so.
+func printRecoveryClaimReadiness(r *pb.FenceReadiness) {
+	hosts := r.GetRecoveryClaimHosts()
+	fmt.Println("\nrecovery claims:")
+	if len(hosts) == 0 {
+		// A current server always reports itself, so no rows means a server
+		// that predates the field.
+		fmt.Println("  the queried node does not report recovery-claim posture (its build predates it)")
+		return
+	}
+	fmt.Printf("  recovery_claim_v1 latched:  %v (on the queried node)\n", r.GetRecoveryClaimLatched())
+	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(w, "  HOST\tPOSTURE\tDETAIL")
+	var off []*pb.FenceHostPosture
+	for _, h := range hosts {
+		fmt.Fprintf(w, "  %s\t%s\t%s\n", h.GetHost(), hostPostureWord(h), h.GetDetail())
+		if h.GetReachable() && h.GetPostureKnown() && !h.GetEnforcing() {
+			off = append(off, h)
+		}
+	}
+	w.Flush()
+
+	if !r.GetRecoveryClaimLatched() {
+		fmt.Println("\nrecovery claims are not enforced on the queried node until recovery_claim_v1")
+		fmt.Println("latches, which needs every host to advertise it. Hosts above that are not")
+		fmt.Println("enforcing hold the latch off.")
+		return
+	}
+	if len(off) == 0 {
+		return
+	}
+	fmt.Printf("\nWARNING: recovery_claim_v1 has latched, and %d host(s) do not enforce recovery\n", len(off))
+	fmt.Println("claims. Such a host mints and runs recovery proofs without a voter certificate,")
+	fmt.Println("so a workload can be started twice. A host rolled back to an older build after")
+	fmt.Println("the latch lands here: that build reads a missing enforcement.recovery_claim as")
+	fmt.Println("false, and it is not WAL-quarantined for it.")
+	fmt.Println("\nTo close it:")
+	for _, h := range off {
+		fmt.Printf("  - add `enforcement.recovery_claim: true` explicitly to %s's config and restart it\n", h.GetHost())
+	}
+	fmt.Println("\nThat is the fix when the flag is off there or the host runs an older build. A")
+	fmt.Println("host whose flag is already on and that still does not advertise the token is not")
+	fmt.Println("ready to, usually because its split_brain_gate_v1 has not latched yet (a host")
+	fmt.Println("that just joined). Run `lv doctor fence` with LV_HOST pointed at that host: its")
+	fmt.Println("own row names the reason.")
 }
 
 // fenceEventAssurance is the event's assurance, derived from method and result

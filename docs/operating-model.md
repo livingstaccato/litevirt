@@ -172,8 +172,9 @@ of acting — it says nothing about whether the resulting rows have replicated.
 - **Recovery is a decided claim when recovery claims are enforced.** The lease
   and `DecisionGate` cannot stop two coordinators that each believe they lead
   from each authorizing a destination for the same workload. With
-  `enforcement.recovery_claim: true` on every host, `recovery_claim_v1`
-  latched and a voter generation adopted, a reschedule, promote or container
+  `enforcement.recovery_claim` on for every host (the default; an explicit
+  `false` is the stand-down), `recovery_claim_v1` latched and a voter
+  generation adopted, a reschedule, promote or container
   relocation is minted only once a majority of the voter set has certified it —
   a single-decree Paxos decision per (workload, owner epoch, attempt) — and the
   destination verifies that certificate against its own replica and the
@@ -229,10 +230,11 @@ of acting — it says nothing about whether the resulting rows have replicated.
 - **A fence and its recovery can land on different coordinators.** The fence is
   bounded by the lease that authorises it, and the leader re-checks the lease
   before rescheduling anything. If it lost the lease meanwhile it stops there —
-  but the verified power-off is already recorded, in `fencing_log` and in the
-  host's `fenced` state, written together as one replicated entry so no peer
-  holds one without the other, so the next leader resumes the reschedule from that
-  record. The resumed pass is counted as
+  but the fence is already recorded, in `fencing_log` and in the host's state
+  (`fenced` for a verified power-off, `offline` for an unverified one once
+  `fence_state_v1` has latched), written together as one replicated entry so
+  no peer holds one without the other, so the next leader resumes the
+  reschedule from that record. The resumed pass is counted as
   `phase=recovery, error_class=recovery_resumed`. A verified fence that is over
   5 minutes old, or in any doubt, is renewed with a fresh verified power-off
   first; an unverified one is resumed only while it still stands, and never
@@ -643,7 +645,8 @@ Check `lv host inspect <host>` and the last `fencing_log` row before acting:
 | --- | --- |
 | Fence never confirmed — `manual` strategy awaiting confirmation, a `best-effort` fence with a writable shared disk, or a fence that failed | `lv host fence-confirm <host>`, **after** you have confirmed the power state yourself. This is a normal state for a `manual`-strategy host, and the likeliest non-zero you will see. |
 | Fenced successfully, but recovery was then refused — lost quorum, an ungated target, a superseded lease term, no placement candidate, a store error on the proof write | `lv host undrain <host>` once you have confirmed the host is dead. |
-| Marked down by hand — `lv host fence <host>`, which never enumerates workloads | Nothing, if intended; the state clears on its own once quorum sees the host healthy. Use `lv host drain <host>` first next time, which moves the workloads. |
+| Marked down by hand — `lv host fence <host>` | If the fence succeeded, the failover leader treats it as it treats its own fence, and only while it still **stands**: some observer has watched the host fail without a break since **before** the fence, and nobody has seen it answer since. Then an `ssh` or `best-effort` fence is resumed from and the workloads are recovered; an `ipmi` fence is resumed from while under 5 minutes old, and otherwise renewed with a fresh power-off and then recovered. A fence that does not stand — the host was still answering when you fenced it, or every observer restarted since (a rolling upgrade restarts them all, so a host fenced before the upgrade) — is never resumed from on an `ssh` or `best-effort` fence: its workloads stay. Confirm the power state, then `lv host fence-confirm <host>`: within 5 minutes of the fence that resumes the recovery, and later the coordinator fences the host afresh for the outage. An `ipmi` fence that does not stand is renewed with a fresh power-off and recovered. If the fence failed, nothing moves: confirm the power state, then `lv host fence-confirm <host>`. A host whose fence **failed** returns to `active` on its own once quorum sees it healthy; one whose fence **succeeded** stays `offline` until `lv host undrain <host>` or its own reboot, because its workloads may have moved. For planned removal, `lv host drain <host>` first, which moves the workloads. |
+| Fenced on a fence that did not verify the power-off (`ssh`, `watchdog`, `best-effort`), and its workloads were not recovered | Owner-assert keeps asking such a host whether it runs a workload, and repairs nothing while it does not answer. If it is off, `lv host fence-confirm <host>` makes that a proof. |
 
 Do **not** reach for `lv host undrain` on an unconfirmed fence. It returns the
 host to `active` while the machine may still be running, which is exactly the

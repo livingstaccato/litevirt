@@ -120,7 +120,7 @@ finally failed.
 Hardening features are gated on cluster-wide capability tokens
 (`internal/capabilities`). The pattern is uniform:
 
-- each has an `enforcement.*` config flag, default **false**. There are two
+- each has an `enforcement.*` config flag, default **false**. There are three
   exceptions, which default **true**, and an explicit `false` is the kill
   switch of each:
   - `enforcement.audit_signature`: each host signs only its own rows, so no
@@ -132,6 +132,14 @@ Hardening features are gated on cluster-wide capability tokens
     the majority waits out that pause before recovering. The majority relies
     on the peer, so the token is withheld while the flag is off
     (docs/design/partition-pause.md §5).
+  - `enforcement.recovery_claim`: a coordinator collects a voter-majority
+    certificate before it mints a reschedule, promote or relocate proof, and
+    the destination verifies it before it executes. Every node relies on its
+    peers doing both, so the token is withheld while the flag is off, and it
+    latches only once every host advertises it: on this build by default, on
+    an older one only with an explicit `true`. That older build is not
+    WAL-quarantined after a rollback and reads a missing key as false
+    (docs/design/recovery-claims.md §5.1, §5.5, §5.6).
 - **advertising is not enforcing.** Most tokens are advertised on the strength
   of the BUILD, whatever the local flag says, so the cluster can latch them —
   the node's own flag then decides whether it acts. A latched token therefore
@@ -219,11 +227,10 @@ There are exceptions, of two different kinds, and neither is "the one":
   but it is gated differently: each node's startup hardware audit plus a latched
   `operation_protocol_v1` decide whether it is advertised at all.
 
-Some mandatory tokens are additionally `capabilities.ReplicationGated`
-(`lease_term_ledger_v1`, `credentials_split_v1`, `host_membership_split_v1`,
-`failover_scope_v1`, `voter_config_v1`, plus the flag-gated `recovery_claim_v1`,
-the one member that is not mandatory; the set is
-`capabilities.replicationGated`): the latch is a claim about what every host
+Some tokens are additionally `capabilities.ReplicationGated` — mostly
+mandatory ones, though a flag-gated token can be a member too. The set is
+declared in one place, `capabilities.replicationGated` (read it; a prose copy
+of it has gone stale): the latch is a claim about what every host
 still receiving replication can *decode* or *read*, so it is confirmed against
 admitted memberlist membership — not merely against voting-eligible members. A
 host parked in `maintenance` on an older build therefore holds that latch off,

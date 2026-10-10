@@ -51,6 +51,10 @@ var guarded = map[string]bool{
 	"SetContainerStateStrict":       true,
 	"SetContainerStateDetail":       true,
 	"SetContainerStateDetailStrict": true,
+	"MarkContainerRelocateRestore":  true,
+	"RekeyStoppedVM":                true,
+	"RekeyStoppedVMClaimed":         true,
+	"SyncVMStopIfRunning":           true,
 }
 
 type violation struct {

@@ -1031,6 +1031,46 @@ func UpdateVMStateAtEpoch(ctx context.Context, c *Client, name, state, detail st
 	return c.Execute(ctx, vmStateAtEpochSQL, state, detail, now, name, expectedEpoch)
 }
 
+// SyncVMStopIfRunning records that a VM this host runs was found down —
+// state and detail from the reconciler's classification, or a list's drift
+// heal — but only while the row still says "running" when the transaction
+// runs (and, with expectedEpoch > 0, is still at that generation).
+// ErrNoRowsAffected otherwise.
+//
+// The callers decide from a snapshot of the row. A stop that an operator
+// completes between that snapshot and this write has already recorded
+// "operator-stop", and the stop libvirt reports (a clean shutdown) would
+// otherwise overwrite it with "guest-shutdown": a stop nobody asked for,
+// which failover recovers on shared storage (VMStoppedForFailover). The
+// precondition is local; the statements are the plain state writes'.
+func SyncVMStopIfRunning(ctx context.Context, c *Client, name, state, detail string, expectedEpoch int64) error {
+	now := c.NowTS()
+	stmt := Statement{SQL: vmStateUpdateSQL, Params: []interface{}{state, detail, now, name}}
+	if expectedEpoch > 0 {
+		stmt = Statement{SQL: vmStateAtEpochSQL, Params: []interface{}{state, detail, now, name, expectedEpoch}}
+	}
+	applied, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+		var cur string
+		var epoch int64
+		err := tx.QueryRowContext(ctx,
+			`SELECT state, vm_owner_epoch FROM vms WHERE name = ? AND deleted_at IS NULL`, name).Scan(&cur, &epoch)
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return cur == "running" && (expectedEpoch <= 0 || epoch == expectedEpoch), nil
+	}, []Statement{stmt})
+	if err != nil {
+		return err
+	}
+	if !applied {
+		return ErrNoRowsAffected
+	}
+	return nil
+}
+
 // UpdateVMStateStrict is UpdateVMState that reports a zero-row update as
 // ErrNoRowsAffected instead of a silent success. Use it where the write's success
 // GATES a subsequent action (an event, audit, LB refresh, hook, or ownership
@@ -1890,6 +1930,13 @@ func RepointMigratedVM(ctx context.Context, c *Client, vmName, sourceHost, targe
 // RescheduleVMHost re-keys a VM to hostName in state, with its disk rows, in
 // one batch. It is the failover coordinator's reschedule write before
 // split_brain_gate_v1 is enforced (WriteVMRescheduleProof is the gated one).
+//
+// A move to any state but "stopped" is refused with ErrWorkloadStopped when the
+// row is stopped by intent (VMStoppedForFailover) when the transaction runs: it is failover's pre-activation
+// reschedule, and "pending" there is a start on hostName that an operator who
+// stopped the VM never asked for. The check is a local precondition, like
+// WriteVMRescheduleProof's; it adds no statement and changes no replicated
+// shape. A row that is gone is ErrNoRowsAffected.
 func RescheduleVMHost(ctx context.Context, c *Client, name, hostName, state string) error {
 	disks, err := GetVMDisks(ctx, c, name)
 	if err != nil {
@@ -1906,7 +1953,29 @@ func RescheduleVMHost(ctx context.Context, c *Client, name, hostName, state stri
 			Params: []interface{}{hostName, now, name, d.DiskName},
 		})
 	}
-	return c.ExecuteBatch(ctx, stmts)
+	applied, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+		var startable bool
+		if err := tx.QueryRowContext(ctx,
+			`SELECT NOT `+vmStoppedByIntentSQL+` FROM vms WHERE name = ? AND deleted_at IS NULL`,
+			append(vmStoppedByIntentArgs(), name)...,
+		).Scan(&startable); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return false, nil
+			}
+			return false, err
+		}
+		if !startable && state != "stopped" {
+			return false, ErrWorkloadStopped
+		}
+		return true, nil
+	}, stmts)
+	if err != nil {
+		return err
+	}
+	if !applied {
+		return ErrNoRowsAffected
+	}
+	return nil
 }
 
 // UpdateDiskSize updates the size_bytes for a disk.

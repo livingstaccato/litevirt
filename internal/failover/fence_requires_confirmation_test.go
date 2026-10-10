@@ -159,7 +159,7 @@ func TestFenceRequiresConfirmation_TheGateAcceptsAnOperatorConfirmation(t *testi
 		t.Fatal("precondition: acquire the lease")
 	}
 
-	c.recoverFenced(ctx, h, fence.Result{Method: "ssh", Success: true}, h.FenceStrategy)
+	c.recoverFenced(ctx, h, fence.Result{Method: "ssh", Success: true}, h.FenceStrategy, false)
 
 	if got := vmHost(t, db, ctx); got != "alive" {
 		t.Errorf("VM on %q; an operator confirmation satisfies the label", got)

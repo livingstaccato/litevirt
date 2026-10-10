@@ -720,7 +720,7 @@ func (c *Coordinator) certifyUncertified(ctx context.Context) {
 			c.noteClaimLost(action, pr.TargetKind, pr.TargetName, source, cl.Proof)
 			if pr.TargetKind == "vm" && cl.Proof.Action == corrosion.ActionReschedule {
 				if err := corrosion.WriteVMRescheduleProof(ctx, c.db, cl.Proof, pr.TargetName, cl.Proof.DestHost); err != nil &&
-					!errors.Is(err, corrosion.ErrNoRowsAffected) {
+					!errors.Is(err, corrosion.ErrNoRowsAffected) && !errors.Is(err, corrosion.ErrWorkloadStopped) {
 					slog.Warn("failover: write the decided reschedule in place of an uncertified one", "vm", pr.TargetName,
 						"proof", cl.Proof.ID, "error", err)
 				}

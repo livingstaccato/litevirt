@@ -1227,10 +1227,15 @@ func (s *Server) ListVMs(ctx context.Context, req *pb.ListVMsRequest) (*pb.ListV
 					// VM crashed or was stopped externally — trust libvirt. Best-effort
 					// drift heal in a read path; a failed write is re-healed next list.
 					state = liveState
+					// Nobody asked for this stop, so it is recorded as one
+					// (StopDetailOutOfBand), and only while the row still says
+					// running: an `lv stop` that finished since this list read
+					// it has recorded its own, operator, stop.
 					//runningcheck:allow provably not running — this is the
 					// `vm.State == "running" && liveState == "stopped"` case, so liveState
 					// is "stopped" here. The guard cannot see through the switch.
-					if err := corrosion.UpdateVMState(ctx, s.db, vm.Name, liveState, ""); err != nil {
+					if err := corrosion.SyncVMStopIfRunning(ctx, s.db, vm.Name, liveState, corrosion.StopDetailOutOfBand, 0); err != nil &&
+						!errors.Is(err, corrosion.ErrNoRowsAffected) {
 						s.noteStateWriteFail(corrosion.OpVMState, err)
 					}
 				default:
@@ -1443,6 +1448,22 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 	}
 	if vm.HostName != s.hostName {
 		return nil, status.Errorf(codes.Aborted, "ownership of %q moved to %s mid-operation; retry", req.Name, vm.HostName)
+	}
+	// A VM failover moved here still stopped has its domain (re)defined by
+	// this host's reconciler under the VM's start lease. Take that lease for
+	// the start, so the start never runs into the middle of the define.
+	if corrosion.IsStoppedRekeyDetail(vm.StateDetail) {
+		holder := health.OperatorStartLockHolder(s.hostName)
+		heldBy, lerr := health.TryVMStartLease(ctx, s.db, holder, vm.Name, time.Now())
+		if lerr != nil {
+			return nil, status.Errorf(codes.Unavailable, "start %q: take its start lease: %v", req.Name, lerr)
+		}
+		if heldBy != holder {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"%q was moved here by failover while stopped and %s is defining its domain; retry in a moment",
+				req.Name, heldBy)
+		}
+		defer health.ReleaseVMStartLease(context.WithoutCancel(ctx), s.db, holder, vm.Name)
 	}
 
 	spec := &pb.VMSpec{}

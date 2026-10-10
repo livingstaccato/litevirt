@@ -73,14 +73,23 @@ func (s *Server) GetFenceReadiness(ctx context.Context, _ *emptypb.Empty) (*pb.F
 		// viewer, would permanently latch the capability and then report the
 		// `true` it had just caused. Latched is a pure in-memory marker read.
 		CapabilityLatched: s.gate != nil && s.gate.Latched(capabilities.SharedStorageFenceV1),
-		VmsWithSharedDisk: int32(len(sharedVMs)),
-		GeneratedAt:       time.Now().UTC().Format(time.RFC3339),
+		// Latched, never Enforced, for the same reason.
+		RecoveryClaimLatched: s.gate != nil && s.gate.Latched(capabilities.RecoveryClaimV1),
+		VmsWithSharedDisk:    int32(len(sharedVMs)),
+		GeneratedAt:          time.Now().UTC().Format(time.RFC3339),
 	}
 	if len(sharedVMs) > fenceReadinessSampleVMs {
 		resp.SampleVms = append(resp.SampleVms, sharedVMs[:fenceReadinessSampleVMs]...)
 	} else {
 		resp.SampleVms = append(resp.SampleVms, sharedVMs...)
 	}
+
+	// One Ping per host answers both postures. Witnesses are swept for the
+	// recovery-claim posture — a witness runs a failover coordinator, so a
+	// flag-off witness mints uncertified proofs like any host — and left out
+	// of the fence posture below.
+	sort.Slice(hosts, func(i, j int) bool { return hosts[i].Name < hosts[j].Name })
+	swept := s.probeHostPostures(ctx, hosts)
 
 	// Witnesses are excluded, following dualRunProbeTargets: a witness never
 	// hosts a workload, so it can never perform the fence and its operator will
@@ -91,16 +100,15 @@ func (s *Server) GetFenceReadiness(ctx context.Context, _ *emptypb.Empty) (*pb.F
 	// fenced host still has disks, and is exactly where an unfenced second copy
 	// would hide.
 	workloadHosts := make([]corrosion.HostRecord, 0, len(hosts))
-	for _, h := range hosts {
+	for i, h := range hosts {
+		resp.RecoveryClaimHosts = append(resp.RecoveryClaimHosts, swept[i].claim)
 		if h.IsWitness() {
 			continue
 		}
 		workloadHosts = append(workloadHosts, h)
+		resp.Hosts = append(resp.Hosts, swept[i].fence)
 	}
 	hosts = workloadHosts
-
-	sort.Slice(hosts, func(i, j int) bool { return hosts[i].Name < hosts[j].Name })
-	resp.Hosts = s.probeFencePostures(ctx, hosts)
 
 	// enforced_everywhere starts true and is cleared by any host that is not
 	// demonstrably enforcing. Unknown clears it exactly like "not enforcing"
@@ -147,10 +155,33 @@ const fenceReadinessRecentMax = 20
 // detail that makes the report useful. A probe cut short by the budget lands as
 // unreachable — unknown, which clears readiness — never as covered.
 func (s *Server) probeFencePostures(ctx context.Context, hosts []corrosion.HostRecord) []*pb.FenceHostPosture {
+	swept := s.probeHostPostures(ctx, hosts)
+	out := make([]*pb.FenceHostPosture, len(swept))
+	for i, p := range swept {
+		out[i] = p.fence
+	}
+	return out
+}
+
+// hostPostures is one host's two postures, read from one Ping.
+type hostPostures struct {
+	fence, claim *pb.FenceHostPosture
+}
+
+// unknownPostures is the same unknown answer for both postures: a host that
+// could not be asked has neither.
+func unknownPostures(p *pb.FenceHostPosture) hostPostures {
+	return hostPostures{fence: p, claim: &pb.FenceHostPosture{
+		Host: p.GetHost(), Reachable: p.GetReachable(), PostureKnown: p.GetPostureKnown(), Detail: p.GetDetail(),
+	}}
+}
+
+// probeHostPostures is probeFencePostures for both postures.
+func (s *Server) probeHostPostures(ctx context.Context, hosts []corrosion.HostRecord) []hostPostures {
 	probeCtx, cancel := context.WithTimeout(ctx, fenceReadinessTotalBudget)
 	defer cancel()
 
-	out := make([]*pb.FenceHostPosture, len(hosts))
+	out := make([]hostPostures, len(hosts))
 	sem := make(chan struct{}, fenceReadinessProbeWorkers)
 	var wg sync.WaitGroup
 	for i, h := range hosts {
@@ -161,7 +192,7 @@ func (s *Server) probeFencePostures(ctx context.Context, hosts []corrosion.HostR
 			case sem <- struct{}{}:
 				defer func() { <-sem }()
 			case <-probeCtx.Done():
-				out[i] = budgetExpiredPosture(name)
+				out[i] = unknownPostures(budgetExpiredPosture(name))
 				return
 			}
 			// select chooses uniformly among ready cases, so once the budget is
@@ -170,10 +201,10 @@ func (s *Server) probeFencePostures(ctx context.Context, hosts []corrosion.HostR
 			// `ping: context deadline exceeded` — rendered to the operator as "did
 			// not answer" about a host nothing ever dialled.
 			if probeCtx.Err() != nil {
-				out[i] = budgetExpiredPosture(name)
+				out[i] = unknownPostures(budgetExpiredPosture(name))
 				return
 			}
-			out[i] = s.fenceHostPosture(probeCtx, name)
+			out[i] = s.hostPosture(probeCtx, name)
 		}(i, h.Name)
 	}
 	wg.Wait()
@@ -196,6 +227,11 @@ func budgetExpiredPosture(host string) *pb.FenceHostPosture {
 // needs to ask itself over the network, and a loopback dial would fail on a
 // single-node cluster whose listener is mid-restart.
 func (s *Server) fenceHostPosture(ctx context.Context, host string) *pb.FenceHostPosture {
+	return s.hostPosture(ctx, host).fence
+}
+
+// hostPosture fresh-Pings one host for both postures (fenceHostPosture).
+func (s *Server) hostPosture(ctx context.Context, host string) hostPostures {
 	if host == s.hostName {
 		// Self is held to the same standard as a peer. postureFromPing refuses to
 		// call a non-advertising peer enforcing; without this the node an operator
@@ -214,15 +250,18 @@ func (s *Server) fenceHostPosture(ctx context.Context, host string) *pb.FenceHos
 		// which is inherent to a node reporting on itself; the peers' answers are
 		// the authority in that window.
 		if s.selfFenced() || s.walQuarantinedNow() {
-			return &pb.FenceHostPosture{
+			return unknownPostures(&pb.FenceHostPosture{
 				Host: host, Reachable: true, PostureKnown: false,
 				Detail: "this host advertises nothing (self-fenced or WAL-quarantined), so its posture cannot be read",
-			}
+			})
 		}
-		return &pb.FenceHostPosture{
-			Host: host, Reachable: true, PostureKnown: true,
-			Enforcing: s.tokenEnabled(capabilities.SharedStorageFenceV1),
-			Detail:    "local config",
+		return hostPostures{
+			fence: &pb.FenceHostPosture{
+				Host: host, Reachable: true, PostureKnown: true,
+				Enforcing: s.tokenEnabled(capabilities.SharedStorageFenceV1),
+				Detail:    "local config",
+			},
+			claim: s.selfClaimPosture(ctx, host),
 		}
 	}
 
@@ -231,15 +270,89 @@ func (s *Server) fenceHostPosture(ctx context.Context, host string) *pb.FenceHos
 
 	c, closeConn, err := s.dialPeer(pctx, host)
 	if err != nil {
-		return &pb.FenceHostPosture{Host: host, Detail: fmt.Sprintf("dial: %v", err)}
+		return unknownPostures(&pb.FenceHostPosture{Host: host, Detail: fmt.Sprintf("dial: %v", err)})
 	}
 	defer closeConn()
 
 	resp, err := c.Ping(pctx, &pb.PingRequest{})
 	if err != nil {
-		return &pb.FenceHostPosture{Host: host, Detail: fmt.Sprintf("ping: %v", err)}
+		return unknownPostures(&pb.FenceHostPosture{Host: host, Detail: fmt.Sprintf("ping: %v", err)})
 	}
-	return postureFromPing(host, resp)
+	return hostPostures{fence: postureFromPing(host, resp), claim: claimPostureFromPing(host, resp)}
+}
+
+// recoveryClaimOffDetail is the detail for a host known to have
+// enforcement.recovery_claim off.
+const recoveryClaimOffDetail = "enforcement.recovery_claim is false on this host"
+
+// selfClaimPosture is this host's recovery-claim posture, read through the
+// SAME predicate its peers read it by — whether it advertises
+// recovery_claim_v1 (advertisedCapabilities) — so one state reads alike from
+// whichever node is queried. Reading the flag alone reported a flag-on host
+// that is not ready to advertise as enforcing here and as not enforcing from
+// every peer. A host that cannot vote durably is unknown, as its peers report
+// it (claimPostureFromPing): its silence does not say what its flag is.
+func (s *Server) selfClaimPosture(ctx context.Context, host string) *pb.FenceHostPosture {
+	p := &pb.FenceHostPosture{Host: host, Reachable: true, PostureKnown: true}
+	if !s.enfRecoveryClaim {
+		p.Detail = recoveryClaimOffDetail
+		return p
+	}
+	rctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if ok, why := s.RecoveryClaimReadiness(rctx); !ok {
+		if vok, _ := s.VoterConfigReadiness(rctx); !vok {
+			p.PostureKnown = false
+		}
+		p.Detail = "enforcement.recovery_claim is on, but this host does not advertise recovery_claim_v1: " + why
+		return p
+	}
+	p.Enforcing, p.Detail = true, "local config"
+	return p
+}
+
+// claimPostureFromPing maps one peer's Ping answer to its recovery-claim
+// posture. DIAGNOSTIC ONLY, like postureFromPing, and read differently from it
+// in one place: recovery_claim_v1 is WITHHELD while a host's flag is off,
+// where shared_storage_fence_v1 is advertised unconditionally. So a healthy
+// host that advertises other tokens but not this one is reported NOT
+// enforcing. That is the host the rollback hazard produces: an older build
+// reads a missing enforcement.recovery_claim as false, knows the token (so it
+// is not WAL-quarantined), and withholds it. A host that withholds
+// voter_config_v1 as well cannot vote durably yet — recovery_claim_v1's
+// readiness includes the same gate — so its silence says nothing about its
+// flag, and it is reported unknown rather than accused. The one cause left
+// that also withholds the token, split_brain_gate_v1 not yet latched there, is
+// named in the detail.
+func claimPostureFromPing(host string, resp *pb.PingResponse) *pb.FenceHostPosture {
+	switch {
+	case !resp.GetPostureReported():
+		return &pb.FenceHostPosture{
+			Host: host, Reachable: true,
+			Detail: "host reported no enforcement posture (its binary predates the field, " +
+				"or it withheld posture from this caller)",
+		}
+	case resp.GetWalQuarantined():
+		return &pb.FenceHostPosture{Host: host, Reachable: true,
+			Detail: "host is WAL-quarantined and advertising nothing"}
+	case len(resp.GetCapabilities()) == 0:
+		return &pb.FenceHostPosture{Host: host, Reachable: true,
+			Detail: "host advertises nothing (self-fenced), so its posture cannot be read"}
+	case slices.Contains(resp.GetNotEnforcing(), capabilities.RecoveryClaimV1):
+		return &pb.FenceHostPosture{Host: host, Reachable: true, PostureKnown: true,
+			Detail: recoveryClaimOffDetail + " (it has latched the token and withholds it)"}
+	case !slices.Contains(resp.GetCapabilities(), capabilities.RecoveryClaimV1) &&
+		!slices.Contains(resp.GetCapabilities(), capabilities.VoterConfigV1):
+		return &pb.FenceHostPosture{Host: host, Reachable: true,
+			Detail: "host advertises neither recovery_claim_v1 nor voter_config_v1: it cannot vote durably yet " +
+				"(synchronous=FULL, a loadable host signing key), so whether its flag is on cannot be read"}
+	case !slices.Contains(resp.GetCapabilities(), capabilities.RecoveryClaimV1):
+		return &pb.FenceHostPosture{Host: host, Reachable: true, PostureKnown: true,
+			Detail: "host does not advertise recovery_claim_v1: enforcement.recovery_claim is off there " +
+				"(a build older than the default reads a missing key as false), or its split_brain_gate_v1 has not latched yet"}
+	}
+	return &pb.FenceHostPosture{Host: host, Reachable: true, PostureKnown: true, Enforcing: true,
+		Detail: "enforcing"}
 }
 
 // postureFromPing maps one peer's Ping answer to its fence posture. Split out as

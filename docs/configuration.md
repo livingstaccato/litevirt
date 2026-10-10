@@ -305,8 +305,8 @@ enforcement:
                               # fleet-wide — a peer still deciding locally would bypass the
                               # single decider entirely. Enable fleet-uniformly; the flag is the
                               # reversible kill switch.
-  audit_signature: true       # DEFAULT ON — unset means on; the only enforcement flag that
-                              # is. Sign every audit row this host writes with its cluster key
+  audit_signature: true       # DEFAULT ON — unset means on, as for digest_v2 above and
+                              # recovery_claim and partition_pause below. Sign every audit row this host writes with its cluster key
                               # (the same host.key that identifies it on the wire, under a
                               # separate signing domain). An unsigned chain is an UNKEYED
                               # hash: anyone who can write the database can edit a row,
@@ -369,7 +369,7 @@ enforcement:
                               # Deliberately not a version check — mixed-version rolling
                               # upgrades keep working. Pre-latch clusters behave exactly as
                               # before. Enable fleet-uniformly; reversible kill switch.
-  recovery_claim: false       # single-winner recovery claims (recovery_claim_v1,
+  recovery_claim: true        # DEFAULT ON. Single-winner recovery claims (recovery_claim_v1,
                               # design/recovery-claims.md). The failover coordinator
                               # collects a majority certificate from the explicit voter set
                               # before it mints a reschedule, promote or container-relocate
@@ -380,12 +380,27 @@ enforcement:
                               # an adopted voter generation (`lv cluster voter ls`).
                               # Advertised only while the flag is on and the node is ready
                               # (split_brain_gate_v1 latched, able to vote durably), so the
-                              # latch means every host opted in. Set it on EVERY host,
-                              # witnesses included. Off everywhere + restart is the full
-                              # stand-down: recovery is authorized as before, and voters keep
-                              # their history. Off on only some hosts is the hazard, not a
-                              # degraded mode — such a host reports recovery_claim_v1 in
+                              # latch means every host has it on. A missing key, an empty
+                              # value or `~` means on; only an explicit `false` turns it
+                              # off. An older build reads a missing key as false and
+                              # advertises the token only with an explicit `true`, so the
+                              # latch forms once every host runs a build that defaults it
+                              # on (or has the explicit key) — nothing changes mid-roll.
+                              # `false` is the kill switch: false everywhere + restart is
+                              # the full stand-down, recovery is authorized as before, and
+                              # voters keep their history. One host with false holds the
+                              # latch off fleet-wide and keeps
+                              # ha_degraded{reason="unsupported_member"} raised on every
+                              # other host: opt out everywhere or nowhere. False on only
+                              # some hosts AFTER the latch is the hazard, not a degraded
+                              # mode — such a host reports recovery_claim_v1 in
                               # PingResponse.not_enforcing and its peers raise ha_degraded.
+                              # WAL quarantine does NOT cover a host rolled back to an older
+                              # build after the latch: that build knows the token and reads
+                              # a missing key as false. Write `recovery_claim: true`
+                              # explicitly before rolling a host back (`lv host init` on
+                              # this build writes it for a new cluster); `lv doctor fence`
+                              # warns about a latched cluster with a non-enforcing host.
   partition_pause: true       # DEFAULT ON. A host that cannot see a majority of the voter
                               # set for 10 s suspends every VM (RAM kept) and freezes every
                               # container that failover would recover elsewhere; a workload

@@ -572,14 +572,29 @@ func (s *Server) lostVoterStill(ctx context.Context, gen int64, prev, current *c
 	if isVoter && cur.Incarnation != lost.Incarnation {
 		return ""
 	}
-	// A fenced row is the lost machine's own, never removed: nothing to ask,
-	// and a dead host is not dialled on every tick.
+	// A host PROVED off is the lost machine's own, never removed: nothing to
+	// ask, and a dead host is not dialled on every tick. A 'fenced' state over
+	// an unverified fence is not that proof (colonelpanik/litevirt#253): the
+	// machine may be up, and may answer as the lost voter come back, so it is
+	// asked like any other. An unreadable fence record keeps the advice.
 	h, err := corrosion.GetHost(ctx, s.db, l)
-	if err != nil || h == nil || h.State == "fenced" {
+	if err != nil || h == nil {
 		return advise
+	}
+	if h.State == "fenced" {
+		if proved, perr := corrosion.FenceRecordProvesOff(ctx, s.db, l); perr != nil || proved {
+			return advise
+		}
 	}
 	inc, err := s.remoteIncarnation(ctx, l, prev.Generation)
 	switch {
+	case err != nil && (h.State == "fenced" || h.State == "offline"):
+		// Recorded down on a fence nothing verified — 'fenced' from a leader
+		// before fence_state_v1 latched, 'offline' after it — and not
+		// answering: most likely it is off. Say how to make that a proof.
+		return fmt.Sprintf("forced generation %d dropped %s's vote; %s is recorded %s without a fence that "+
+			"verified the power-off, and did not answer (%v). If it is off, confirm it (`lv host fence-confirm %s`), "+
+			"then remove and revoke it with `lv host rm --dead %s`", gen, l, l, h.State, err, l, l)
 	case err != nil:
 		return fmt.Sprintf("forced generation %d dropped %s's vote, and the %s in service now did not say which "+
 			"incarnation it is (%v), so it is not yet known to be a new machine rather than the lost voter "+

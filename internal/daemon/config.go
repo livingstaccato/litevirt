@@ -77,9 +77,10 @@ type Config struct {
 	// this flag AND the token's cluster-wide capability latch, so false disables
 	// the behavior regardless of any durable latch marker (flag=false + restart is
 	// the only stand-down — never delete marker files). All default false except
-	// audit_signature (see EnforcementConfig.AuditSignature for why); the
-	// build still ADVERTISES the tokens (capabilities.supported) so the cluster can
-	// latch, but nothing enforces until the operator opts in. (The strict-mTLS /
+	// audit_signature, partition_pause and recovery_claim (see their
+	// EnforcementConfig fields for why); the
+	// build still ADVERTISES most tokens (capabilities.supported) so the cluster
+	// can latch, but nothing enforces until the flag is on. (The strict-mTLS /
 	// forwarded-identity switches live under Auth for historical reasons.)
 	Enforcement EnforcementConfig `yaml:"enforcement"`
 
@@ -450,8 +451,8 @@ type AuthConfig struct {
 // capability tokens. Each is `flag && capability` (the strict-mTLS pattern): the
 // flag is authoritative for enforcement AND recovery, so false disables the
 // behavior regardless of the durable latch. All default false except
-// AuditSignature and PartitionPause, which LoadConfig defaults to true. DigestV2
-// (not a capability token) also defaults to true.
+// AuditSignature, PartitionPause and RecoveryClaim, which LoadConfig defaults to
+// true. DigestV2 (not a capability token) also defaults to true.
 type EnforcementConfig struct {
 	// SafeFenceDefault: a best-effort (unconfirmable) fence must carry an operator
 	// proof-of-power-off before the coordinator reschedules/promotes off the host
@@ -598,11 +599,28 @@ type EnforcementConfig struct {
 	// The token is advertised only while this flag is on, so the latch means
 	// CONFIG uniformity: a flag-off node would mint an uncertified proof or
 	// start one, which is the second owner the others are protecting against.
-	// Enable on every host, witnesses included. Turning it off everywhere and
+	//
+	// DEFAULT TRUE, the third enforcement flag that is on unless switched off
+	// (LoadConfig sets it before parsing; an explicit `recovery_claim: false`
+	// wins). Without it two coordinators that each believe they lead can each
+	// mint a proof for the same workload (colonelpanik/litevirt#250), and
+	// partition pause's settle-back has no certified copy to settle to. The
+	// default changes nothing mid-roll: an older build advertises the token
+	// only with an explicit `true`, so on a cluster that never set the key it
+	// latches only after every host runs a build that defaults it on, and
+	// enforcement waits for an adopted voter generation too.
+	//
+	// The default is this build's alone. An older build knows the token (so a
+	// host rolled back to it after the latch is NOT WAL-quarantined) and reads
+	// a missing key as false: write `recovery_claim: true` explicitly before a
+	// rollback. newClusterEnforcement writes it for every new cluster.
+	//
+	// An explicit false is the kill switch: turning it off everywhere and
 	// restarting returns recovery to the pre-claim behaviour; voters keep
 	// answering and keep their history either way. Off on SOME hosts is the
-	// hazard, not a degraded mode: those hosts report the token in
-	// PingResponse.not_enforcing and their peers raise ha_degraded.
+	// hazard, not a degraded mode: one such host holds the latch off
+	// fleet-wide before it forms, and after it those hosts report the token
+	// in PingResponse.not_enforcing and their peers raise ha_degraded.
 	RecoveryClaim bool `yaml:"recovery_claim,omitempty"`
 	// PartitionPause: on losing the voter majority for T_pause (10 s), suspend
 	// every VM and freeze every container the failover coordinator would
@@ -777,8 +795,10 @@ func LoadConfig() (*Config, error) {
 		PCI: PCIConfig{SparePCIeRootPorts: 4},
 
 		// The enforcement flags that default ON — see EnforcementConfig.
-		// AuditSignature, PartitionPause and DigestV2. An explicit false still wins.
-		Enforcement: EnforcementConfig{AuditSignature: true, PartitionPause: true, DigestV2: true},
+		// AuditSignature, PartitionPause, RecoveryClaim and DigestV2. An
+		// explicit false still wins (TestLoadConfig_RecoveryClaimDefaultsOn and
+		// its siblings pin both halves).
+		Enforcement: EnforcementConfig{AuditSignature: true, PartitionPause: true, RecoveryClaim: true, DigestV2: true},
 	}
 
 	if err := yaml.Unmarshal(data, cfg); err != nil {

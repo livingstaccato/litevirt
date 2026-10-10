@@ -39,6 +39,8 @@ func forcedCondition(t *testing.T, n *Node) (bool, string) {
 // cannot be asked as a new machine — cleared while node-3 is unreachable;
 // count any answering host as gone, whatever incarnation it answers as —
 // node-2 back as it left is not named.
+// Take a 'fenced' state alone as proof the machine is off — node-2, recorded
+// 'fenced' on an SSH fence, is not asked and not named as back.
 func TestFleet_VoterForced_ConditionClearsWhenALostHostIsRebuilt(t *testing.T) {
 	ctx := context.Background()
 	c := New(t, Options{Nodes: 5, IndependentReplicas: true, FaultSeed: 2542})
@@ -70,10 +72,37 @@ func TestFleet_VoterForced_ConditionClearsWhenALostHostIsRebuilt(t *testing.T) {
 	if raised, ev := forcedCondition(t, n0); !raised || !strings.Contains(ev, n2.Name+"'s vote") {
 		t.Fatalf("ha.voter.forced does not name the lost %s answering as its old incarnation: raised=%v %q", n2.Name, raised, ev)
 	}
-	c.Kill(n2)
-	if err := corrosion.UpdateHostState(ctx, n0.DB, n2.Name, "fenced"); err != nil {
+	// A leader before fence_state_v1 latched records it 'fenced' on an SSH
+	// poweroff nothing verified (colonelpanik/litevirt#253). That is no proof
+	// the machine is off, so it is still asked, and still named as the lost
+	// voter come back.
+	if err := corrosion.RecordFenceWithState(ctx, n0.DB, corrosion.FenceLogRecord{
+		ID: "ssh-" + n2.Name, HostName: n2.Name, Method: "ssh", Result: "fenced", Detail: "poweroff sent",
+	}, "fenced"); err != nil {
 		t.Fatal(err)
 	}
+	if raised, ev := forcedCondition(t, n0); !raised || !strings.Contains(ev, "came back as it left") {
+		t.Fatalf("ha.voter.forced does not ask %s, recorded 'fenced' on an unverified fence, which machine it is: raised=%v %q",
+			n2.Name, raised, ev)
+	}
+	c.Kill(n2)
+	// Down now, on that same unverified fence: the advice is how to prove it
+	// off and remove it, not just "check it can be reached".
+	if raised, ev := forcedCondition(t, n0); !raised || !strings.Contains(ev, "lv host fence-confirm "+n2.Name) {
+		t.Fatalf("ha.voter.forced does not tell how to prove the unanswering, SSH-fenced %s off: raised=%v %q", n2.Name, raised, ev)
+	}
+	// Once fence_state_v1 has latched an SSH fence records 'offline'; the
+	// same advice applies.
+	if err := corrosion.RecordFenceWithState(ctx, n0.DB, corrosion.FenceLogRecord{
+		ID: "ssh2-" + n2.Name, HostName: n2.Name, Method: "ssh", Result: "fenced", Detail: "poweroff sent",
+	}, "offline"); err != nil {
+		t.Fatal(err)
+	}
+	if raised, ev := forcedCondition(t, n0); !raised || !strings.Contains(ev, "lv host fence-confirm "+n2.Name) {
+		t.Fatalf("ha.voter.forced does not tell how to prove the unanswering %s, recorded offline on an SSH fence, off: raised=%v %q",
+			n2.Name, raised, ev)
+	}
+	fenceConfirm(t, c, n0, n2)
 
 	withOperatorPKI(t, n0)
 	for _, n := range []*Node{n2, n3, n4} {

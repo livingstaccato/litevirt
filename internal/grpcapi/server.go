@@ -41,6 +41,9 @@ type Server struct {
 
 	hostName string
 	dataDir  string
+	// fenceExec, when set, replaces fence.Execute for FenceHost (tests only;
+	// SetFenceExecutor).
+	fenceExec fenceExecutorFunc
 	// containersRoot is where per-container state (and the owner-epoch marker)
 	// lives — <dataDir>/containers in production, injected by the daemon so the
 	// runtime-inventory collector can read markers. Empty disables marker reads
@@ -356,8 +359,8 @@ type Server struct {
 	// cluster is big enough that enforcing does not break failover".
 	enfLeaseTerm   bool
 	leaseTermReady func() bool
-	// enfRecoveryClaim is enforcement.recovery_claim: the opt-in that lets
-	// recovery_claim_v1 be advertised (with RecoveryClaimReadiness) and the
+	// enfRecoveryClaim is enforcement.recovery_claim (default on): the flag
+	// that lets recovery_claim_v1 be advertised (with RecoveryClaimReadiness) and the
 	// reversible kill switch afterwards (recovery_claim_enforce.go).
 	enfRecoveryClaim bool
 	// enfPartitionPause is enforcement.partition_pause (default on): this node
@@ -1022,6 +1025,9 @@ func (s *Server) advertisedCapabilities() []string {
 	// claim_incarnation_v1 is not withheld either: it is the claim format this
 	// binary's voters keep (an incarnation in the key, the v2 accept, the
 	// legacy-key seal), a fact about the build.
+	// fence_state_v1 is not withheld either: it says what this binary's
+	// coordinator does with an unverified fence recorded 'offline', a fact
+	// about the build.
 	// hardware_v2 (CONTRACT h) is advertised only once this node is READY: its
 	// backfill audit pass has populated the typed-hardware tables (hwV2Ready) AND
 	// operation_protocol_v1 is active (the crash-safe operation journal is a hard
@@ -1478,6 +1484,11 @@ func (s *Server) tokenEnabled(token string) bool {
 	case capabilities.ClaimIncarnationV1:
 		// No kill switch: it is the claim format this build's voters keep,
 		// and a coordinator relies on every voter keeping it.
+		return true
+	case capabilities.FenceStateV1:
+		// No kill switch: it says this build resumes from an unverified fence
+		// recorded 'offline' and does not auto-activate such a host, which
+		// the failover lease holder relies on of every node.
 		return true
 	case capabilities.LeaseTermV1:
 		return s.enfLeaseTerm

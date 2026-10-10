@@ -1171,6 +1171,13 @@ func setupScriptEnvWith(hostName, advertiseAddr, joinPeers, enforcement string) 
 // flag stays at its documented default here, because this is a safety floor,
 // not a policy.
 //
+// recovery_claim is the one default written out anyway. This build reads a
+// missing key as true, but the build before it reads it as false, and a host
+// rolled back to that build after recovery_claim_v1 has latched is not
+// WAL-quarantined (it knows the token): with no key it would mint and run
+// uncertified recovery proofs, the second owner the token exists to prevent.
+// An explicit true survives the rollback (colonelpanik/litevirt#250).
+//
 // Gossip encryption is on the floor for the same reason as the fences: an
 // existing cluster has to walk it on in three rolling restarts because nodes
 // two stages apart cannot gossip, but a new cluster has no plaintext node to
@@ -1196,6 +1203,9 @@ const newClusterEnforcement = `enforcement:
                               # proof-grade fence of the source host
   gossip_encryption: true     # gossip is encrypted with pki_dir/gossip.key, and anything
                               # unencrypted or under another key is dropped
+  recovery_claim: true        # this build's default, written out so a host rolled back to
+                              # an older build (which reads a missing key as false) keeps
+                              # enforcing single-winner recovery claims
 `
 
 // enforcementYAML decides what enforcement block a host being initialised

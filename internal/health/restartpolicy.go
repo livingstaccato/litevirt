@@ -12,16 +12,20 @@ package health
 // "always" currently behave identically here — the distinction is reserved for a
 // future mode that would also restart clean exits.
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/litevirt/litevirt/internal/corrosion"
+)
 
 // state_detail markers, written by the operators/reconcilers and read back by
 // the decision when the live stop-reason isn't available.
 const (
-	operatorStopDetail     = "operator-stop"       // set by StopVM/StopContainer
-	guestShutdownDetail    = "guest-shutdown"      // clean ACPI poweroff from inside the guest
-	crashedDetail          = "crashed"             // kernel panic / guest crash / failed start
-	outOfBandDestroyDetail = "out-of-band-destroy" // libvirt destroy not initiated by an operator stop (e.g. a fence)
-	suspendedDetail        = "suspended"           // managed-save / pm-suspend / RAM-snapshot
+	operatorStopDetail     = "operator-stop"                      // set by StopVM/StopContainer
+	guestShutdownDetail    = corrosion.StopDetailGuestShutdown    // clean ACPI poweroff from inside the guest
+	crashedDetail          = "crashed"                            // kernel panic / guest crash / failed start
+	outOfBandDestroyDetail = corrosion.StopDetailOutOfBandDestroy // libvirt destroy not initiated by an operator stop (e.g. a fence)
+	suspendedDetail        = "suspended"                          // managed-save / pm-suspend / RAM-snapshot
 )
 
 // DrainStopDetailPrefix starts the state_detail host drain records when it
@@ -39,8 +43,13 @@ func DrainStopDetail(operationID string) string { return DrainStopDetailPrefix +
 // IsOperatorStop reports whether a state_detail records a deliberate stop:
 // an operator's (StopVM) or a host drain's for a cold move. Neither is ever
 // restarted, reconciled to running, or treated as a crash.
+//
+// A VM failover re-keyed to this host while it was stopped
+// (corrosion.StoppedRekeyDetailPrefix) counts too: it carries the stop it was
+// re-keyed with.
 func IsOperatorStop(detail string) bool {
-	return detail == operatorStopDetail || strings.HasPrefix(detail, DrainStopDetailPrefix)
+	return detail == operatorStopDetail || strings.HasPrefix(detail, DrainStopDetailPrefix) ||
+		strings.HasPrefix(detail, corrosion.StoppedRekeyDetailPrefix)
 }
 
 // classifyStop maps a domain's coarse state + normalized stop reason to the
@@ -70,7 +79,7 @@ func classifyStop(state, reason string) (newState, detail string, sync bool) {
 		if state == "running" || state == "" {
 			return "", "", false
 		}
-		return state, "stopped out-of-band", true
+		return state, corrosion.StopDetailOutOfBand, true
 	}
 }
 

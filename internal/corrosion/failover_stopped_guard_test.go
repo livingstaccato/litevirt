@@ -1,0 +1,298 @@
+package corrosion
+
+import (
+	"context"
+	"errors"
+	"testing"
+)
+
+// The failover writes re-read the workload's state inside their transaction
+// and refuse a stopped one with ErrWorkloadStopped, writing nothing: a stop
+// that lands after the coordinator chose the workload wins over the recovery
+// (docs/migration-failover.md, "Stopped workloads"). Each case's mutation is
+// the removal of that writer's stopped check; the write then lands and the
+// case goes red.
+
+func TestWriteVMRescheduleProof_StoppedRowWritesNothing(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	apInsertVM(t, c, "vm1", "host-a", "stopped")
+	if err := InsertDisk(ctx, c, DiskRecord{VMName: "vm1", DiskName: "root", HostName: "host-a",
+		Path: "/d/vm1-root", StorageType: "local"}); err != nil {
+		t.Fatal(err)
+	}
+
+	err := WriteVMRescheduleProof(ctx, c, apProof("p1", "vm1", "host-b"), "vm1", "host-b")
+	if !errors.Is(err, ErrWorkloadStopped) {
+		t.Fatalf("WriteVMRescheduleProof on a stopped VM: err=%v, want ErrWorkloadStopped", err)
+	}
+	vm, _ := GetVM(ctx, c, "vm1")
+	if vm == nil || vm.State != "stopped" || vm.HostName != "host-a" || vm.PendingActionID != "" {
+		t.Fatalf("the stopped VM was rewritten: %+v", vm)
+	}
+	if _, ok, _ := GetActionProof(ctx, c, "p1"); ok {
+		t.Error("a proof was written for a stopped VM")
+	}
+	if disks, _ := GetVMDisks(ctx, c, "vm1"); len(disks) != 1 || disks[0].HostName != "host-a" {
+		t.Errorf("the stopped VM's disk rows moved: %+v", disks)
+	}
+}
+
+func TestRescheduleVMHost_StoppedRowIsNotRescheduledPending(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	apInsertVM(t, c, "vm1", "host-a", "stopped")
+	if err := InsertDisk(ctx, c, DiskRecord{VMName: "vm1", DiskName: "root", HostName: "host-a",
+		Path: "/d/vm1-root", StorageType: "local"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := RescheduleVMHost(ctx, c, "vm1", "host-b", "pending"); !errors.Is(err, ErrWorkloadStopped) {
+		t.Fatalf("RescheduleVMHost(pending) on a stopped VM: err=%v, want ErrWorkloadStopped", err)
+	}
+	if vm, _ := GetVM(ctx, c, "vm1"); vm == nil || vm.State != "stopped" || vm.HostName != "host-a" {
+		t.Fatalf("the stopped VM was rewritten: %+v", vm)
+	}
+	if disks, _ := GetVMDisks(ctx, c, "vm1"); len(disks) != 1 || disks[0].HostName != "host-a" {
+		t.Errorf("the stopped VM's disk rows moved: %+v", disks)
+	}
+
+	// A move that keeps it stopped is not a start, and is not refused.
+	if err := RescheduleVMHost(ctx, c, "vm1", "host-b", "stopped"); err != nil {
+		t.Fatalf("RescheduleVMHost(stopped) on a stopped VM: %v", err)
+	}
+	if vm, _ := GetVM(ctx, c, "vm1"); vm == nil || vm.State != "stopped" || vm.HostName != "host-b" {
+		t.Fatalf("a stopped move did not land: %+v", vm)
+	}
+
+	// A running VM reschedules as before; a vanished one is reported.
+	apInsertVM(t, c, "vm2", "host-a", "running")
+	if err := RescheduleVMHost(ctx, c, "vm2", "host-b", "pending"); err != nil {
+		t.Fatalf("RescheduleVMHost on a running VM: %v", err)
+	}
+	if vm, _ := GetVM(ctx, c, "vm2"); vm == nil || vm.State != "pending" || vm.HostName != "host-b" {
+		t.Fatalf("the running VM was not rescheduled: %+v", vm)
+	}
+	if err := RescheduleVMHost(ctx, c, "ghost", "host-b", "pending"); !errors.Is(err, ErrNoRowsAffected) {
+		t.Fatalf("RescheduleVMHost on a missing VM: err=%v, want ErrNoRowsAffected", err)
+	}
+}
+
+func TestRelocateContainerWithToken_StoppedSourceIsNotRelocated(t *testing.T) {
+	ctx := context.Background()
+	for _, lifecycle := range []bool{false, true} {
+		c := newTestDB(t)
+		seedRelocatableContainer(t, c, "host-a", "web", lifecycle)
+		if err := SetContainerStateDetail(ctx, c, "host-a", "web", "stopped", "operator-stop"); err != nil {
+			t.Fatal(err)
+		}
+		if err := RelocateContainerWithToken(ctx, c, "host-a", "web", "host-b", "tok"); !errors.Is(err, ErrWorkloadStopped) {
+			t.Fatalf("lifecycle=%v: relocate a stopped container: err=%v, want ErrWorkloadStopped", lifecycle, err)
+		}
+		if src, _ := GetContainer(ctx, c, "host-a", "web"); src == nil || src.State != "stopped" || src.StateDetail != "operator-stop" {
+			t.Fatalf("lifecycle=%v: the stopped source was changed: %+v", lifecycle, src)
+		}
+		if dst, _ := GetContainer(ctx, c, "host-b", "web"); dst != nil {
+			t.Fatalf("lifecycle=%v: a target row was written for a stopped container: %+v", lifecycle, dst)
+		}
+	}
+}
+
+// A container failover itself marked relocate-skipped is stopped by failover,
+// not by intent: the removed-host pass still relocates it.
+func TestRelocateContainerWithToken_RelocateSkippedSourceStillMoves(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	seedRelocatableContainer(t, c, "host-a", "web", true)
+	if err := SetContainerStateDetail(ctx, c, "host-a", "web", "stopped", ContainerRelocateSkippedDetail); err != nil {
+		t.Fatal(err)
+	}
+	if err := RelocateContainerWithToken(ctx, c, "host-a", "web", "host-b", "tok"); err != nil {
+		t.Fatalf("relocate a relocate-skipped container: %v", err)
+	}
+	if dst, _ := GetContainer(ctx, c, "host-b", "web"); dst == nil || dst.State != "pending" {
+		t.Fatalf("the relocate-skipped container did not move: %+v", dst)
+	}
+}
+
+func TestMarkContainerRelocateRestore_StoppedRowIsNotMarked(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	seedRelocatableContainer(t, c, "host-a", "web", true)
+	seedRelocatableContainer(t, c, "host-a", "api", true)
+	if err := SetContainerStateDetail(ctx, c, "host-a", "web", "stopped", "operator-stop"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := MarkContainerRelocateRestore(ctx, c, "host-a", "web", "host-b", "tok"); !errors.Is(err, ErrWorkloadStopped) {
+		t.Fatalf("mark a stopped container: err=%v, want ErrWorkloadStopped", err)
+	}
+	if src, _ := GetContainer(ctx, c, "host-a", "web"); src == nil || src.State != "stopped" || src.StateDetail != "operator-stop" {
+		t.Fatalf("the stopped container was marked: %+v", src)
+	}
+
+	if err := MarkContainerRelocateRestore(ctx, c, "host-a", "api", "host-b", "tok"); err != nil {
+		t.Fatalf("mark a running container: %v", err)
+	}
+	src, _ := GetContainer(ctx, c, "host-a", "api")
+	if target, token, ok := RelocateRestoreMarker(src.State, src.StateDetail); !ok || target != "host-b" || token != "tok" {
+		t.Fatalf("the running container's marker = %q/%q (%v), want host-b/tok", src.State, src.StateDetail, ok)
+	}
+	if err := MarkContainerRelocateRestore(ctx, c, "host-a", "ghost", "host-b", "tok"); !errors.Is(err, ErrNoRowsAffected) {
+		t.Fatalf("mark a missing container: err=%v, want ErrNoRowsAffected", err)
+	}
+}
+
+func TestRecoverableOnHostFailure_StoppedIsNotACandidate(t *testing.T) {
+	vm := VMRecord{Name: "vm1", State: "stopped", Spec: `{"on_host_failure":"restart-any"}`}
+	if VMRecoverableOnHostFailure(vm, false) || VMRecoverableOnHostFailure(vm, true) {
+		t.Error("a stopped VM is recoverable on host failure")
+	}
+	vm.State = "running"
+	if !VMRecoverableOnHostFailure(vm, false) {
+		t.Error("a running VM with restart-any is not recoverable")
+	}
+	ct := ContainerRecord{Name: "ct1", State: "stopped", StateDetail: "operator-stop", OnHostFailure: "image-recreate"}
+	if ContainerRecoverableOnHostFailure(ct) {
+		t.Error("a stopped container is recoverable on host failure")
+	}
+	ct.State, ct.StateDetail = "running", ""
+	if !ContainerRecoverableOnHostFailure(ct) {
+		t.Error("a running container with image-recreate is not recoverable")
+	}
+}
+
+// Only a stop by intent is protected: a stop the reconciler recorded as
+// nobody's (a guest or host shutdown) is recovered as on main, and the
+// guards let its reschedule through. A stopped row with no detail is read as
+// intent, the safe default.
+func TestStoppedByIntent_OnlyRecordedNonIntentStopsAreRecoverable(t *testing.T) {
+	spec := `{"on_host_failure":"restart-any"}`
+	for detail, intent := range map[string]bool{
+		"": true, "operator-stop": true, "drain-cold-move:op1": true, "suspended": true,
+		StoppedRekeyDetail("h1"):   true,
+		StopDetailGuestShutdown:    false,
+		StopDetailOutOfBandDestroy: false,
+		StopDetailOutOfBand:        false,
+	} {
+		vm := VMRecord{Name: "vm1", State: "stopped", StateDetail: detail, Spec: spec}
+		if got := VMStoppedForFailover(vm); got != intent {
+			t.Errorf("detail %q: VMStoppedForFailover = %v, want %v", detail, got, intent)
+		}
+		if got := VMRecoverableOnHostFailure(vm, false); got == intent {
+			t.Errorf("detail %q: VMRecoverableOnHostFailure = %v, want %v", detail, got, !intent)
+		}
+	}
+
+	ctx := context.Background()
+	c := newTestDB(t)
+	apInsertVM(t, c, "gs", "host-a", "stopped")
+	if err := UpdateVMState(ctx, c, "gs", "stopped", StopDetailGuestShutdown); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteVMRescheduleProof(ctx, c, apProof("p-gs", "gs", "host-b"), "gs", "host-b"); err != nil {
+		t.Fatalf("reschedule a guest-shutdown VM: %v", err)
+	}
+	apInsertVM(t, c, "gs2", "host-a", "stopped")
+	if err := UpdateVMState(ctx, c, "gs2", "stopped", StopDetailOutOfBand); err != nil {
+		t.Fatal(err)
+	}
+	if err := RescheduleVMHost(ctx, c, "gs2", "host-b", "pending"); err != nil {
+		t.Fatalf("legacy reschedule of an out-of-band-stopped VM: %v", err)
+	}
+}
+
+// RekeyStoppedVM moves a VM stopped by intent on shared storage to another
+// host still stopped, marked, with its disks — and
+// refuses a host-local disk, a VM no longer stopped, or a stale generation.
+func TestRekeyStoppedVM(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	apInsertVM(t, c, "sv", "host-a", "stopped")
+	if err := UpdateVMState(ctx, c, "sv", "stopped", "operator-stop"); err != nil {
+		t.Fatal(err)
+	}
+	if err := InsertDisk(ctx, c, DiskRecord{VMName: "sv", DiskName: "root", HostName: "host-a",
+		Path: "/nfs/sv-root", StorageType: "nfs"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := RekeyStoppedVM(ctx, c, "sv", "host-a", "host-b", "stopped", 1); !errors.Is(err, ErrNoRowsAffected) {
+		t.Fatalf("stale epoch: err=%v, want ErrNoRowsAffected", err)
+	}
+	if err := RekeyStoppedVM(ctx, c, "sv", "host-a", "host-b", "stopped", 0); err != nil {
+		t.Fatalf("RekeyStoppedVM: %v", err)
+	}
+	vm, _ := GetVM(ctx, c, "sv")
+	if vm == nil || vm.HostName != "host-b" || vm.State != "stopped" || vm.OwnerEpoch != 0 ||
+		vm.StateDetail != StoppedRekeyDetail("host-a") {
+		t.Fatalf("after the re-key: %+v", vm)
+	}
+	if disks, _ := GetVMDisks(ctx, c, "sv"); len(disks) != 1 || disks[0].HostName != "host-b" {
+		t.Fatalf("disk rows after the re-key: %+v", disks)
+	}
+
+	apInsertVM(t, c, "lv", "host-a", "stopped")
+	if err := InsertDisk(ctx, c, DiskRecord{VMName: "lv", DiskName: "root", HostName: "host-a",
+		Path: "/d/lv-root", StorageType: "local"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := RekeyStoppedVM(ctx, c, "lv", "host-a", "host-b", "stopped", 0); !errors.Is(err, ErrNoRowsAffected) {
+		t.Fatalf("host-local disk: err=%v, want ErrNoRowsAffected", err)
+	}
+	apInsertVM(t, c, "run", "host-a", "running")
+	if err := RekeyStoppedVM(ctx, c, "run", "host-a", "host-b", "stopped", 0); !errors.Is(err, ErrNoRowsAffected) {
+		t.Fatalf("running VM: err=%v, want ErrNoRowsAffected", err)
+	}
+}
+
+// A removed host's stopped workloads do not block its name; anything else
+// does.
+func TestWorkloadsBlockingReadmission(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	apInsertVM(t, c, "stopped-vm", "gone", "stopped")
+	seedRelocatableContainer(t, c, "gone", "stopped-ct", false)
+	if err := SetContainerStateDetail(ctx, c, "gone", "stopped-ct", "stopped", "operator-stop"); err != nil {
+		t.Fatal(err)
+	}
+	if left, err := WorkloadsBlockingReadmission(ctx, c, "gone"); err != nil || len(left) != 0 {
+		t.Fatalf("only stopped workloads: %v (err %v), want none", left, err)
+	}
+	apInsertVM(t, c, "running-vm", "gone", "running")
+	seedRelocatableContainer(t, c, "gone", "skipped-ct", false)
+	if err := SetContainerStateDetail(ctx, c, "gone", "skipped-ct", "stopped", ContainerRelocateSkippedDetail); err != nil {
+		t.Fatal(err)
+	}
+	left, err := WorkloadsBlockingReadmission(ctx, c, "gone")
+	if err != nil || len(left) != 2 || left[0] != "ct/skipped-ct" || left[1] != "vm/running-vm" {
+		t.Fatalf("blocking = %v (err %v), want ct/skipped-ct and vm/running-vm", left, err)
+	}
+}
+
+// SyncVMStopIfRunning writes only while the row still says running: an
+// operator stop recorded since the caller's snapshot is kept.
+func TestSyncVMStopIfRunning_KeepsAStopRecordedSince(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	apInsertVM(t, c, "vm1", "host-a", "running")
+	if err := SyncVMStopIfRunning(ctx, c, "vm1", "stopped", StopDetailGuestShutdown, 0); err != nil {
+		t.Fatalf("sync a running VM: %v", err)
+	}
+	if vm, _ := GetVM(ctx, c, "vm1"); vm.StateDetail != StopDetailGuestShutdown {
+		t.Fatalf("detail = %q", vm.StateDetail)
+	}
+	apInsertVM(t, c, "vm2", "host-a", "stopped")
+	if err := UpdateVMState(ctx, c, "vm2", "stopped", "operator-stop"); err != nil {
+		t.Fatal(err)
+	}
+	if err := SyncVMStopIfRunning(ctx, c, "vm2", "stopped", StopDetailGuestShutdown, 0); !errors.Is(err, ErrNoRowsAffected) {
+		t.Fatalf("sync over an operator stop: err=%v, want ErrNoRowsAffected", err)
+	}
+	if vm, _ := GetVM(ctx, c, "vm2"); vm.StateDetail != "operator-stop" {
+		t.Fatalf("the operator stop was overwritten: %q", vm.StateDetail)
+	}
+	apInsertVM(t, c, "vm3", "host-a", "running")
+	if err := SyncVMStopIfRunning(ctx, c, "vm3", "stopped", StopDetailOutOfBand, 7); !errors.Is(err, ErrNoRowsAffected) {
+		t.Fatalf("sync at a stale epoch: err=%v, want ErrNoRowsAffected", err)
+	}
+}

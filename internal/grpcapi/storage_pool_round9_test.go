@@ -199,6 +199,30 @@ func TestPoolRound9_APlantedFileOutsideThePartitionIsRefused(t *testing.T) {
 			t.Errorf("an unrecorded file was taken while h1 is live: %v", got)
 		}
 	})
+	// A writer that still answers counts as gone only when it is PROVED off.
+	// 'fenced' over an SSH fence nothing verified — what a leader before
+	// fence_state_v1 latched records — is not that (colonelpanik/litevirt#253).
+	//
+	// Mutation: take the 'fenced' state alone as gone again — the file is
+	// taken from the SSH-fenced writer that still answers.
+	for _, tc := range []struct {
+		method string
+		taken  bool
+	}{{"ssh", false}, {"ipmi", true}} {
+		t.Run("writer answering, recorded fenced by "+tc.method, func(t *testing.T) {
+			h1, h2, dir := partitionedWriter(t, time.Now().Add(time.Minute), true)
+			if err := corrosion.RecordFenceWithState(context.Background(), h1.db, corrosion.FenceLogRecord{
+				ID: "f-" + tc.method, HostName: "h1", Method: tc.method, Result: "fenced",
+			}, "fenced"); err != nil {
+				t.Fatal(err)
+			}
+			late := lateReplica(t, dir, time.Now().Add(-5*time.Minute), time.Now())
+			if got := h2.replicaNames(context.Background(), "shared", "", k, "", false); slices.Contains(got, late) != tc.taken {
+				t.Errorf("unrecorded file taken=%v from a writer that answers and is recorded fenced by %s, want %v: %v",
+					!tc.taken, tc.method, tc.taken, got)
+			}
+		})
+	}
 }
 
 // NI2: h2 mounts the store at another path. h1's prune never deletes the

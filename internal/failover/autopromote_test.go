@@ -265,3 +265,68 @@ func (p *dbPromoter) AutoPromoteReplica(ctx context.Context, vmName, fenceEpoch 
 	}
 	return corrosion.UpdateVMHost(ctx, p.db, vmName, t, "running")
 }
+
+// TestCoordinator_AutoPromote_SkipsAStoppedVM: auto-promotion defines and
+// starts the replica, so a stopped VM enrolled in it is not promoted — the
+// stop is checked before auto-promote, and the VM stays on its failed host,
+// stopped. A running VM enrolled the same way, on the same host, is promoted,
+// so the test cannot pass because the coordinator never reached the loop.
+//
+// Mutation: remove the stopped check at the top of recoverWorkloads — the
+// stopped VM is promoted (the write guard does not cover promotion) and the
+// test goes red.
+func TestCoordinator_AutoPromote_SkipsAStoppedVM(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+
+	for _, h := range []string{"bad", "good"} {
+		if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+			Name: h, Address: "10.0.0.1", SSHUser: "root", SSHPort: 22,
+			GRPCPort: 7443, State: "active", FenceStrategy: "manual",
+		}); err != nil {
+			t.Fatalf("InsertHost %s: %v", h, err)
+		}
+	}
+	for name, state := range map[string]string{"stopped-vm": "stopped", "running-vm": "running"} {
+		// A host-local disk, so the stopped VM is not one failover moves
+		// still stopped (its disks would all have to be shared).
+		disks := []corrosion.DiskRecord{{VMName: name, DiskName: "root", HostName: "bad",
+			Path: "/var/lib/litevirt/disks/" + name + "-root", StorageType: "local"}}
+		if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+			Name: name, HostName: "bad", Spec: `{"on_host_failure":"restart-any"}`, State: state,
+			StateDetail: map[bool]string{true: "operator-stop"}[state == "stopped"],
+		}, nil, disks); err != nil {
+			t.Fatalf("InsertVM %s: %v", name, err)
+		}
+		if err := corrosion.UpsertBackupSchedule(ctx, db, corrosion.BackupScheduleRecord{
+			VMName: name, Repo: "dr", Scope: "vm", Cron: "* * * * *", Enabled: true,
+			Type: "replication", TargetPool: "dr", TargetHost: "good", AutoPromote: true,
+		}); err != nil {
+			t.Fatalf("UpsertBackupSchedule %s: %v", name, err)
+		}
+	}
+
+	fenceQuorum(t, ctx, db, []string{"coordinator", "good"}, "bad")
+
+	prom := &dbPromoter{db: db, target: "promoted-host"}
+	c := newTestCoordinator("coordinator", db)
+	c.Promoter = prom
+	fm := newFakeMetrics()
+	c.Metrics = fm
+	c.run(ctx)
+
+	if len(prom.promoted) != 1 || prom.promoted[0] != "running-vm" {
+		t.Fatalf("promoted %v, want only running-vm", prom.promoted)
+	}
+	vm, _ := corrosion.GetVM(ctx, db, "stopped-vm")
+	if vm == nil || vm.HostName != "bad" || vm.State != "stopped" || vm.PendingActionID != "" {
+		t.Fatalf("stopped-vm = %+v, want it stopped on bad", vm)
+	}
+	if got := fm.vm[foKey(ActionReschedule, ResultSkipped, ErrStopped)]; got != 1 {
+		t.Errorf("skipped-stopped VM metric = %d, want 1", got)
+	}
+	rows, err := db.Query(ctx, `SELECT detail FROM audit_log WHERE action = 'failover.skip' AND target = 'stopped-vm'`)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("failover.skip audit rows for stopped-vm = %d (err %v), want 1", len(rows), err)
+	}
+}

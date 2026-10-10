@@ -1082,7 +1082,7 @@ lv stats <vm>                                # VM resource statistics
 ```bash
 lv doctor divergence [--json] [--table <name>]... [--include-sensitive]   # Report replicated rows that disagree across nodes (read-only)
 lv doctor repair-owner <vm> <host>           # Re-assert a VM's owner on the host that actually runs it (audited)
-lv doctor fence                              # Report whether a shared-disk VM's cross-host transfer would be fenced (read-only)
+lv doctor fence                              # Report whether a shared-disk VM's cross-host transfer would be fenced and whether every host enforces recovery claims (read-only)
 lv doctor privileged-containers              # Report privileged or legacy-confined containers (read-only)
 ```
 

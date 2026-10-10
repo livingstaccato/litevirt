@@ -147,8 +147,13 @@ coordinator's own, moved to `corrosion` so that both sides read one definition:
 
 - **VM.** `vmNeedsFailover`: `on_host_failure` is set and not `none`, or the VM
   is enrolled in auto-promote replication, and it has no host-local firmware
-  state.
-- **Container.** `containerNeedsFailover`.
+  state, and its row is not stopped on purpose. A VM stopped on purpose stays
+  stopped and is not restarted: the majority never starts it
+  ([migration-failover.md](../migration-failover.md#stopped-workloads)).
+  Pausing concerns running domains only, so a stopped row is never paused
+  either way.
+- **Container.** `containerNeedsFailover`, which leaves out a stopped container
+  the same way.
 
 A workload with policy `none` keeps running. Nothing would replace it, so
 pausing it would only cost availability.
@@ -264,7 +269,7 @@ in this order:
      absent;
    - the voter's own **row** for the workload names this host, at the recorded
      owner epoch and incarnation. This is the check that holds with recovery
-     claims off (the default), after `lv host undrain` has cleared the fenced
+     claims off (an explicit `false`, or before `recovery_claim_v1` latches), after `lv host undrain` has cleared the fenced
      state while the replacement runs, and when the majority moved the
      workload to an epoch the minority never saw;
    - that voter has accepted no recovery-claim value for this workload at the
@@ -289,7 +294,7 @@ sync with:
   accepting majority in at least one voter, and that voter reports the accept.
   The same arithmetic holds for any two majorities of one set:
   `(q-1) + q - (n-1) = 2q - n ≥ 1`.
-- **No claims** (`recovery_claim` off). Every recovery is preceded by a fence
+- **No claims** (`recovery_claim` explicitly off, or not yet latched). Every recovery is preceded by a fence
   that writes this host `fenced` or `offline` (`RecordFenceWithState`,
   `markHostState`). It is written on the coordinator at decision time, at least
   `W` (§4) before any replacement can start, and it replicates within the

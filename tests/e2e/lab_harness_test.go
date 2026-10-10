@@ -667,10 +667,14 @@ type vmInfo struct {
 }
 
 // recoverable mirrors corrosion.VMRecoverableOnHostFailure for a VM without
-// auto-promote replication (the lab has none).
+// auto-promote replication (the lab has none). A stopped VM is not one:
+// failover leaves it on its host, stopped, with its disks. This is stricter
+// than the predicate, which recovers a VM that stopped without anyone asking
+// (a guest shutdown) when every disk is on shared storage; the lab has no
+// shared storage, so the two agree there.
 func (v vmInfo) recoverable() bool {
 	p := v.Spec.OnHostFailure
-	return p != "" && p != "none" && !v.Spec.SecureBoot && !v.Spec.TPM
+	return p != "" && p != "none" && !v.Spec.SecureBoot && !v.Spec.TPM && v.State != "VM_STOPPED"
 }
 
 func (l *lab) inspectVM(via, name string) (vmInfo, error) {
@@ -708,17 +712,24 @@ func (l *lab) vms(via string) map[string]vmInfo {
 	return m
 }
 
-type ctInfo struct{ Host, Name, State, OnHostFailure, CreateSpec string }
+type ctInfo struct{ Host, Name, State, StateDetail, OnHostFailure, CreateSpec string }
 
-func (c ctInfo) recoverable() bool { return c.OnHostFailure != "" && c.OnHostFailure != "none" }
+// recoverable mirrors corrosion.ContainerRecoverableOnHostFailure's policy and
+// stop rules: a container stopped by intent stays put; one failover itself
+// marked relocate-skipped is stopped too, and the removed-host pass may still
+// move it.
+func (c ctInfo) recoverable() bool {
+	stopped := c.State == "stopped" && c.StateDetail != "relocate-skipped"
+	return c.OnHostFailure != "" && c.OnHostFailure != "none" && !stopped
+}
 
 // containers lists the live container rows in via's replica.
 func (l *lab) containers(via string) map[string]ctInfo {
 	l.t.Helper()
 	m := map[string]ctInfo{}
-	for _, r := range l.mustSQL(via, "SELECT host_name,name,state,COALESCE(on_host_failure,''),COALESCE(create_spec,'') FROM containers WHERE deleted_at IS NULL AND is_template=0") {
-		if len(r) >= 5 {
-			m[r[1]] = ctInfo{Host: r[0], Name: r[1], State: r[2], OnHostFailure: r[3], CreateSpec: strings.Join(r[4:], "|")}
+	for _, r := range l.mustSQL(via, "SELECT host_name,name,state,COALESCE(state_detail,''),COALESCE(on_host_failure,''),COALESCE(create_spec,'') FROM containers WHERE deleted_at IS NULL AND is_template=0") {
+		if len(r) >= 6 {
+			m[r[1]] = ctInfo{Host: r[0], Name: r[1], State: r[2], StateDetail: r[3], OnHostFailure: r[4], CreateSpec: strings.Join(r[5:], "|")}
 		}
 	}
 	return m

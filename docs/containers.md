@@ -817,8 +817,12 @@ every container clone is independent, so reverting a template is always safe.
 ## Host-loss relocation
 
 Opt a container in at create time: `lv ct create web --on-host-failure
-image-recreate` (default is `none` — left in place). If a host is fenced, the
-failover coordinator relocates its containers that carry that policy onto a
+image-recreate` (default is `none` — left in place). A stopped container is
+left in place too, whatever its policy: relocation recreates and starts it, so
+it stays on its host, stopped, until the host returns
+([migration-failover.md](migration-failover.md#stopped-workloads)). If a host
+is fenced, the failover coordinator relocates its other containers that carry
+that policy onto a
 healthy host (chosen via the placement engine), preferring the most faithful
 option available:
 

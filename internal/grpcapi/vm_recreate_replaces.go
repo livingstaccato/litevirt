@@ -371,15 +371,26 @@ func (s *Server) retireReplacedRow(ctx context.Context, name string, snap corros
 
 // recreateFailedAfterTeardown is the error a rebuild or recreate returns when
 // its create fails after the VM was torn down: it says what is gone, where
-// the spec to re-create it from was kept, and the create's own error.
-func (s *Server) recreateFailedAfterTeardown(op, name, where string, spec *pb.VMSpec, cause error) error {
+// the spec to re-create it from was kept, and the create's own error. luns
+// says the VM kept disks on iSCSI LUNs, which were not torn down: the
+// recovery takes them over as they are (re-review 4, concern 3).
+func (s *Server) recreateFailedAfterTeardown(op, name, where string, spec *pb.VMSpec, cause error, luns bool) error {
 	kept := s.keepRecreateSpec(op, name, spec)
+	if luns {
+		kept += " " + lunRecoveryHint
+	}
 	slog.Error(op+": the VM was torn down and its re-create failed",
 		"vm", name, "torn_down_on", where, "spec_kept_at", kept, "error", cause)
 	st := status.Convert(cause)
 	return status.Errorf(st.Code(), "%s %q: the VM was torn down on %s (its domain, disks and record are gone) and "+
 		"re-creating it failed: %s. %s", op, name, where, st.Message(), kept)
 }
+
+// lunRecoveryHint is how a VM whose re-create was torn down and failed gets
+// its iSCSI disks back.
+const lunRecoveryHint = "Its disks on iSCSI LUNs keep the guest's data: create the VM again under the same name on " +
+	"the same pools (lv compose up, or lv run) and it takes them over as they are, with no overwrite — once this " +
+	"re-create's hold on them is released, normally within seconds."
 
 // recreateKeepMax and recreateKeepMaxAge bound <data_dir>/recreate-failed/:
 // the newest recreateKeepMax kept specs are kept, and none older than

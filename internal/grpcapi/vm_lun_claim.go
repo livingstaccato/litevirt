@@ -164,10 +164,11 @@ func (s *Server) lunElectorate(ctx context.Context) (lunElectorateT, error) {
 
 // lunUse is one disk of a create that sits on a fixed device.
 type lunUse struct {
-	key    string // storage.FixedDevice key: the LUN
-	device string
-	disk   string
-	pool   string
+	key       string // storage.FixedDevice key: the LUN
+	device    string
+	disk      string
+	pool      string
+	overwrite bool // the disk says overwrite
 }
 
 // lunClaim is one in-flight create's (or recreate's) hold on a LUN.
@@ -235,6 +236,11 @@ func (r *lunClaimRegistry) holding(keys map[string]bool, own uint64) map[string]
 	return out
 }
 
+// resolveVolumeFault, when set (tests only), is consulted first by every
+// resolution of a disk's storage: a non-nil error is that resolution's
+// error, as a transient read failure would be.
+var resolveVolumeFault func(stackName, volumeName string) error
+
 // lunHandoffKey carries a recreate's hold token into its create.
 type lunHandoffKey struct{}
 
@@ -243,48 +249,156 @@ func lunHandoffFrom(ctx context.Context) string {
 	return t
 }
 
-// fixedDeviceUses resolves spec's disks to the fixed devices (iscsi LUNs) they
-// would take, refusing a create that puts two of its own disks on one. A disk
-// whose storage does not resolve is left to the create loop, which reports it.
-func (s *Server) fixedDeviceUses(ctx context.Context, spec *pb.VMSpec) ([]lunUse, error) {
+// fixedDeviceUses resolves spec's disks, for a create on this host, to the
+// fixed devices (iscsi LUNs) they take, refusing a create that puts two of
+// its own disks on one — and returns every disk's resolved storage (by disk
+// name), which the create then uses as it is: the claim and the disk are one
+// resolution, so they cannot disagree (re-review 4, I-2). A disk whose
+// storage does not resolve refuses the create now, as the create's disk loop
+// would: never counted as no LUN, which let a transient read error, or a pool
+// row arriving between two resolutions, attach a LUN nothing claimed.
+func (s *Server) fixedDeviceUses(ctx context.Context, spec *pb.VMSpec) ([]lunUse, map[string]storage.Config, error) {
+	cfgs := map[string]storage.Config{}
 	var uses []lunUse
 	seen := map[string]lunUse{}
 	for _, d := range spec.Disks {
 		if d.Storage == "" {
 			continue
 		}
+		name := diskNameOrRoot(d.Name)
 		cfg, err := s.resolveVolume(ctx, spec.StackName, d.Storage)
 		if err != nil {
+			return nil, nil, status.Errorf(codes.FailedPrecondition, "storage %q: %v", d.Storage, err)
+		}
+		cfgs[name] = cfg
+		key, dev, ok := storage.FixedDevice(cfg)
+		if !ok {
+			continue
+		}
+		u := lunUse{key: key, device: dev, disk: name, pool: d.Storage, overwrite: d.Overwrite}
+		if err := addLUNUse(spec.Name, seen, &uses, u); err != nil {
+			return nil, nil, err
+		}
+	}
+	return uses, cfgs, nil
+}
+
+func diskNameOrRoot(name string) string {
+	if name == "" {
+		return "root"
+	}
+	return name
+}
+
+// addLUNUse appends u, refusing a second disk of the VM on u's LUN.
+func addLUNUse(vm string, seen map[string]lunUse, uses *[]lunUse, u lunUse) error {
+	if first, dup := seen[u.key]; dup {
+		return status.Errorf(codes.FailedPrecondition,
+			"disks %q (storage %q) and %q (storage %q) of VM %q are both iSCSI LUN %s: an iscsi pool is "+
+				"one LUN and holds one disk, and two disks on one LUN corrupt each other — give each disk "+
+				"a pool of its own LUN (lv pool create ... --driver iscsi --option lun=N)",
+			first.disk, first.pool, u.disk, u.pool, vm, u.device)
+	}
+	seen[u.key] = u
+	*uses = append(*uses, u)
+	return nil
+}
+
+// lookupVolumeConfig is the storage config a disk's storage name has on this
+// host — a volume of the stack, or one of this host's pools — without the
+// checks a write there needs: found false when there is none by that name,
+// an error only when what would say so cannot be read.
+func (s *Server) lookupVolumeConfig(ctx context.Context, stackName, volumeName string) (storage.Config, bool, error) {
+	if f := resolveVolumeFault; f != nil {
+		if err := f(stackName, volumeName); err != nil {
+			return storage.Config{}, false, err
+		}
+	}
+	if stackName != "" {
+		f, err := s.storedStackFile(ctx, stackName)
+		if err != nil {
+			return storage.Config{}, false, err
+		}
+		if f != nil {
+			if vol, ok := f.Volumes[volumeName]; ok {
+				return storage.Config{Driver: vol.Driver, Source: vol.Source, Target: vol.Target, Options: vol.Options}, true, nil
+			}
+		}
+	}
+	if ref, ok := s.lookupStoragePool(volumeName); ok {
+		return storage.Config{Driver: ref.Driver, Source: ref.Source, Target: ref.Target, Options: ref.Options}, true, nil
+	}
+	rec, ok, err := corrosion.GetStoragePool(ctx, s.db, s.hostName, volumeName)
+	if err != nil {
+		return storage.Config{}, false, err
+	}
+	if !ok {
+		return storage.Config{}, false, nil
+	}
+	return storage.Config{Driver: rec.Driver, Source: rec.Source, Target: rec.Target, Options: rec.Options}, true, nil
+}
+
+// recreateFixedDeviceUses is fixedDeviceUses for a rebuild or recreate of
+// cur judged on this host — the host running it, which need not be the host
+// the VM is re-created on, and pools are per host. A storage this host
+// cannot read refuses (re-review 4, I-2): it is never counted as no LUN. A
+// storage with no volume or pool of that name here is skipped — its disk is
+// created where the VM lands, which judges it — unless cur's own disk of
+// that name is an iSCSI LUN: the claim on that LUN must move from here, and
+// cannot without knowing it.
+func (s *Server) recreateFixedDeviceUses(ctx context.Context, spec *pb.VMSpec, cur *corrosion.VMRecord) ([]lunUse, error) {
+	var curLUNs map[string]string // disk name → device
+	var uses []lunUse
+	seen := map[string]lunUse{}
+	for _, d := range spec.Disks {
+		if d.Storage == "" {
+			continue
+		}
+		name := diskNameOrRoot(d.Name)
+		cfg, found, err := s.lookupVolumeConfig(ctx, spec.StackName, d.Storage)
+		if err != nil {
+			return nil, status.Errorf(codes.Unavailable,
+				"storage %q of disk %q of VM %q cannot be read on %s (%v), so whether it is an iSCSI LUN cannot "+
+					"be judged — retry", d.Storage, name, spec.Name, s.hostName, err)
+		}
+		if !found {
+			if curLUNs == nil && cur != nil {
+				curLUNs = map[string]string{}
+				disks, err := corrosion.VMIncarnationDisks(ctx, s.db, cur.Name, cur.CreatedAt)
+				if err != nil {
+					return nil, status.Errorf(codes.Unavailable, "read the disks of VM %q: %v", cur.Name, err)
+				}
+				for _, cd := range disks {
+					if _, ok := storage.FixedDeviceKeyOfPath(cd.Path); ok {
+						curLUNs[cd.DiskName] = cd.Path
+					}
+				}
+			}
+			if dev, ok := curLUNs[name]; ok {
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"disk %q of VM %q is iSCSI LUN %s, and %s has no storage %q to judge its claim by — run the "+
+						"update or rebuild from a host with that pool", name, spec.Name, dev, s.hostName, d.Storage)
+			}
 			continue
 		}
 		key, dev, ok := storage.FixedDevice(cfg)
 		if !ok {
 			continue
 		}
-		name := d.Name
-		if name == "" {
-			name = "root"
+		u := lunUse{key: key, device: dev, disk: name, pool: d.Storage, overwrite: d.Overwrite}
+		if err := addLUNUse(spec.Name, seen, &uses, u); err != nil {
+			return nil, err
 		}
-		u := lunUse{key: key, device: dev, disk: name, pool: d.Storage}
-		if first, dup := seen[key]; dup {
-			return nil, status.Errorf(codes.FailedPrecondition,
-				"disks %q (storage %q) and %q (storage %q) of VM %q are both iSCSI LUN %s: an iscsi pool is "+
-					"one LUN and holds one disk, and two disks on one LUN corrupt each other — give each disk "+
-					"a pool of its own LUN (lv pool create ... --driver iscsi --option lun=N)",
-				first.disk, first.pool, u.disk, u.pool, spec.Name, u.device)
-		}
-		seen[key] = u
-		uses = append(uses, u)
 	}
 	return uses, nil
 }
 
-// hasFixedDeviceDisk reports whether spec puts a disk on a fixed device (an
-// iscsi LUN). A disk whose storage does not resolve counts as none; the
-// create reports it.
-func (s *Server) hasFixedDeviceDisk(ctx context.Context, spec *pb.VMSpec) bool {
-	uses, err := s.fixedDeviceUses(ctx, spec)
-	return err == nil && len(uses) > 0
+// hasFixedDeviceDisk reports whether spec, re-creating cur, puts a disk on a
+// fixed device (an iscsi LUN), judged as recreateFixedDeviceUses judges it:
+// an error is a refusal, never "no".
+func (s *Server) hasFixedDeviceDisk(ctx context.Context, spec *pb.VMSpec, cur *corrosion.VMRecord) (bool, error) {
+	uses, err := s.recreateFixedDeviceUses(ctx, spec, cur)
+	return len(uses) > 0, err
 }
 
 // lunHold is a create's hold on its LUNs.
@@ -299,6 +413,9 @@ type lunHold struct {
 	// committed is set once the create's row is written: from then on its
 	// allocations are held by the row.
 	committed bool
+	// cfgs is every disk's storage as the claim resolved it, by disk name:
+	// the create uses it as it is.
+	cfgs map[string]storage.Config
 }
 
 // release drops the hold once the create has returned. A create that did not
@@ -329,12 +446,12 @@ func (h *lunHold) release(ctx context.Context, vm string) {
 // must call hold.release once the create has returned, after setting
 // hold.committed when its row was written.
 func (s *Server) claimLUNs(ctx context.Context, spec *pb.VMSpec) (*lunHold, error) {
-	uses, err := s.fixedDeviceUses(ctx, spec)
+	uses, cfgs, err := s.fixedDeviceUses(ctx, spec)
 	if err != nil {
 		return nil, err
 	}
 	if len(uses) == 0 {
-		return &lunHold{drop: func() {}}, nil
+		return &lunHold{drop: func() {}, cfgs: cfgs}, nil
 	}
 	rep, hasRep := replacedVMFor(ctx, spec.Name)
 	// What the recreate's preflight already judged — the replaced VM's own
@@ -367,7 +484,7 @@ func (s *Server) claimLUNs(ctx context.Context, spec *pb.VMSpec) (*lunHold, erro
 			Lun: heldKey, VmName: held.vm, DiskName: held.disk, HostName: s.hostName, InFlight: true, VmId: held.vmID,
 		})
 	}
-	hold := &lunHold{s: s, drop: drop, own: map[string]int64{}, keep: map[string]bool{}}
+	hold := &lunHold{s: s, drop: drop, own: map[string]int64{}, keep: map[string]bool{}, cfgs: cfgs}
 	ok := false
 	defer func() {
 		if !ok {
@@ -396,7 +513,14 @@ func (s *Server) claimLUNs(ctx context.Context, spec *pb.VMSpec) (*lunHold, erro
 			takenKeys = append(takenKeys, u.key)
 		}
 	}
-	if len(takenKeys) > 0 && rep.holdToken != "" {
+	if len(takenKeys) > 0 {
+		// Every takeover is verified: one that names no hold to verify is
+		// refused, never let through (re-review 4, m-3).
+		if rep.holdToken == "" {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"VM %q: the re-create takes over iSCSI LUNs its moved claim names, but names no hold to verify "+
+					"them by; nothing was started", spec.Name)
+		}
 		if err := s.verifyLUNHold(ctx, spec.Name, rep, takenKeys); err != nil {
 			return nil, err
 		}
@@ -408,14 +532,33 @@ func (s *Server) claimLUNs(ctx context.Context, spec *pb.VMSpec) (*lunHold, erro
 		}
 		mine := corrosion.LUNAllocation{LUN: u.key, ClaimID: randid.New(), VMID: spec.Uuid, VMName: spec.Name,
 			Disk: u.disk, Host: s.hostName}
-		g, err := s.allocateLUN(ctx, spec.Name, u, mine, rep, hasRep, id, lunHandoffFrom(ctx))
+		g, prev, err := s.allocateLUN(ctx, spec.Name, u, mine, rep, hasRep, id, lunHandoffFrom(ctx), true)
 		if err != nil {
 			return nil, err
 		}
 		hold.own[u.key] = g
+		// The allocation just before this one is this VM's own kept LUN —
+		// a re-create of it moved the claim, keeping the disk, and was torn
+		// down before its create committed. The LUN is the VM's own disk:
+		// it is taken over as it is, never refused for holding data, and
+		// nothing is written over it unless the disk says overwrite
+		// (re-review 4, concern 3).
+		if keptForVM(prev, spec.Name, u) {
+			hold.keep[u.key] = true
+			slog.Info("iSCSI LUN: a create of the VM a re-create kept this LUN for takes it over as it is",
+				"vm", spec.Name, "disk", u.disk, "lun", u.device, "after_allocation", prev.Generation)
+		}
 	}
 	ok = true
 	return hold, nil
+}
+
+// keptForVM reports whether prev, the allocation decided just before a
+// create's own, is a moved allocation that kept u's LUN as the disk of the
+// VM being created — same name, same disk — and u does not ask to write
+// over it.
+func keptForVM(prev *corrosion.LUNAllocation, vm string, u lunUse) bool {
+	return prev != nil && prev.Kept && prev.VMName == vm && prev.Disk == u.disk && !u.overwrite
 }
 
 // verifyLUNHold refuses the create of vm unless the host that moved its
@@ -438,7 +581,9 @@ func (s *Server) verifyLUNHold(ctx context.Context, vm string, rep replacedVM, k
 	if !present {
 		return status.Errorf(codes.Aborted,
 			"VM %q: %s no longer holds the iSCSI LUN it moved for this re-create — the re-create was given up, "+
-				"and the LUN may since be another VM's; nothing was started", vm, rep.holdHost)
+				"and the LUN may since be another VM's; nothing was started. Create the VM again under the same "+
+				"name on the same pools: unless another VM has taken the LUN since, it takes its own disk over as "+
+				"it is, with no overwrite", vm, rep.holdHost)
 	}
 	return nil
 }
@@ -481,16 +626,24 @@ func lunDecisionError(u lunUse, vm string, err error) error {
 }
 
 // allocateLUN walks u's LUN's allocations from the checkpoint until one is
-// decided for mine, and returns its generation. An allocation decided for
-// another create is gone, or refuses.
-func (s *Server) allocateLUN(ctx context.Context, vm string, u lunUse, mine corrosion.LUNAllocation, rep replacedVM, hasRep bool, reg uint64, ownHold string) (int64, error) {
+// decided for mine, and returns its generation and the allocation decided
+// just before it, when the walk met it. An allocation decided for another
+// create is gone, or refuses.
+//
+// advanceOwn moves the checkpoint to mine once it is decided after passing
+// the replaced VM's own allocation. A re-create's preflight passes false: its
+// moved allocation moves the checkpoint only once the re-created VM's create
+// commits (re-review 4, I-1), so a re-create refused before its create —
+// however often — never walks the checkpoint past the allocation of the VM
+// that still runs.
+func (s *Server) allocateLUN(ctx context.Context, vm string, u lunUse, mine corrosion.LUNAllocation, rep replacedVM, hasRep bool, reg uint64, ownHold string, advanceOwn bool) (int64, *corrosion.LUNAllocation, error) {
 	el, err := s.lunElectorate(ctx)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	start, err := s.lunWalkStart(ctx, el, u.key)
 	if err != nil {
-		return 0, lunDecisionError(u, vm, err)
+		return 0, nil, lunDecisionError(u, vm, err)
 	}
 	// An allocation of the VM a rebuild or recreate replaces (its name and
 	// this disk) is passed over once nothing but that VM holds the LUN — the
@@ -501,30 +654,32 @@ func (s *Server) allocateLUN(ctx context.Context, vm string, u lunUse, mine corr
 	// (lunWalkStart), so an advance made at once would still leave a walker
 	// deciding the old allocation and meeting its holder (re-review 3, m-3).
 	passedOwn := false
+	var prev *corrosion.LUNAllocation
 	for g := start; g < start+lunMaxGenerations; g++ {
 		mine.Generation = g
 		out, err := s.decideLUNWith(ctx, el, mine)
 		if err != nil {
-			return 0, lunDecisionError(u, vm, err)
+			return 0, nil, lunDecisionError(u, vm, err)
 		}
 		a := out.Value.LUN
 		if a == nil {
-			return 0, status.Errorf(codes.Internal, "iSCSI LUN %s: allocation %d decided a value that is not a LUN allocation", u.device, g)
+			return 0, nil, status.Errorf(codes.Internal, "iSCSI LUN %s: allocation %d decided a value that is not a LUN allocation", u.device, g)
 		}
 		if a.ClaimID == mine.ClaimID {
-			if passedOwn {
+			if passedOwn && advanceOwn {
 				if err := corrosion.AdvanceLUNResolved(ctx, s.db, u.key, g, s.hostName); err != nil {
 					slog.Warn("iSCSI LUN: record checkpoint", "lun", u.key, "generation", g, "error", err)
 				}
 			}
-			return g, nil
+			return g, prev, nil
 		}
+		prev = a
 		holder, err := s.lunAllocationHolder(ctx, el, *a, rep, hasRep, reg, ownHold)
 		if err != nil {
-			return 0, err
+			return 0, nil, err
 		}
 		if holder != nil {
-			return 0, lunHeldError(vm, u, holder)
+			return 0, nil, lunHeldError(vm, u, holder)
 		}
 		if hasRep && a.VMName == rep.name && a.Disk == u.disk {
 			passedOwn = true
@@ -537,7 +692,7 @@ func (s *Server) allocateLUN(ctx context.Context, vm string, u lunUse, mine corr
 			slog.Warn("iSCSI LUN: record checkpoint", "lun", u.key, "generation", g+1, "error", err)
 		}
 	}
-	return 0, status.Errorf(codes.ResourceExhausted, "iSCSI LUN %s: more than %d open allocations", u.device, lunMaxGenerations)
+	return 0, nil, status.Errorf(codes.ResourceExhausted, "iSCSI LUN %s: more than %d open allocations", u.device, lunMaxGenerations)
 }
 
 // lunSpec is the proposer spec of one allocation under el.

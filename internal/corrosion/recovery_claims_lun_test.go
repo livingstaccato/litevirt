@@ -51,12 +51,21 @@ func TestLUNClaimValue_Digest(t *testing.T) {
 		func(l *LUNAllocation) { l.Host = "b" },
 		func(l *LUNAllocation) { l.Generation = 1 },
 		func(l *LUNAllocation) { l.VMName = "db" },
+		func(l *LUNAllocation) { l.RunHost = "c" },
+		func(l *LUNAllocation) { l.Kept = true },
 	} {
 		b := lunValue(0, "c1", "web")
 		mut(b.LUN)
 		if db, _ := b.Digest(); db == da {
 			t.Errorf("%+v digests like %+v", b.LUN, a.LUN)
 		}
+	}
+	// RunHost and Kept are digested only when set, each in a field of its
+	// own: no RunHost spelling digests like Kept.
+	kept, spelled := lunValue(0, "c1", "web"), lunValue(0, "c1", "web")
+	kept.LUN.Kept, spelled.LUN.RunHost = true, "kept"
+	if dk, _ := kept.Digest(); func() bool { ds, _ := spelled.Digest(); return ds == dk }() {
+		t.Error("a RunHost of \"kept\" digests like Kept")
 	}
 	mixed := lunValue(0, "c1", "web")
 	mixed.Proof = &ActionProof{ID: "p"}

@@ -91,6 +91,10 @@ func reimage(t *testing.T, c *Cluster, n, via *Node, live ...*Node) {
 	if err := corrosion.RegisterHost(ctx, n.DB, rec); err != nil {
 		t.Fatal(err)
 	}
+	// The replaced server's loops stop with it (re-review 4, n-1).
+	if n.stopServerLoops != nil {
+		n.stopServerLoops()
+	}
 	c.buildServer(n)
 	n.repl.SetProofReplicaGate(func(context.Context, string) bool { return true })
 	n.repl.Start(c.ctx)

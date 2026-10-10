@@ -105,6 +105,9 @@ lv host rescan [host]                     # Rescan PCI devices
 lv host devices <host> [--type gpu|network|nvme|infiniband]   # List PCI devices
 lv host superseded-disks <host>           # List the old disk copies a failover set aside
   [--purge] [--older-than 72h]            #   and remove the ones not held (admin)
+lv host lun-holds [host]                  # List the holds kept on iSCSI LUNs a rebuild or recreate moved
+lv host lun-hold discard <lun> --yes      # Move a hold aside so the LUN can be taken again (admin, audited)
+  [--host <host>]                         #   on that host (default: the one host holding it)
 lv host upgrade --binary <path> [host...] # Rolling upgrade of litevirt
   [--yes]                                 # Skip confirmation prompt
   [--force]                               # Skip preflight blocks (warnings still printed)

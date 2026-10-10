@@ -45,11 +45,11 @@ func TestRebuildVM_ISCSI_HoldsTheLUNAcrossTheTeardown(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 	spec := lunVM("a", "lun0").Spec
-	hctx, release, err := s.preflightLUNs(ctx, spec, vmRecord(t, s, "a"), "")
+	hctx, release, err := s.preflightLUNs(ctx, spec, vmRecord(t, s, "a"), s.hostName)
 	if err != nil {
 		t.Fatalf("preflight: %v", err)
 	}
-	defer release()
+	defer release(recreateFailed)
 	// The teardown: the row is gone, the domain undefined.
 	if err := corrosion.DeleteVM(ctx, s.db, "a"); err != nil {
 		t.Fatal(err)

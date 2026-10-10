@@ -445,11 +445,11 @@ func lunWebStack(t *testing.T, update string) (*Cluster, string, func(host, extr
 	addLUNPool(t, c, "san", 0, onePortal)
 	ctx := context.Background()
 	for _, n := range c.Nodes {
-		// Each node's own catalog row, written locally: a raw INSERT is not a
-		// registered replicated shape.
-		if _, err := n.DB.DB().ExecContext(ctx,
-			`INSERT OR IGNORE INTO images (name, format, source_url, checksum, size_bytes, created_at, updated_at)
-			 VALUES ('test', 'qcow2', 'file:///dev/null', 'deadbeef', 1024, datetime('now'), datetime('now'))`); err != nil {
+		// Each node's own catalog row, written locally through the catalog's
+		// registered statement: a raw INSERT is not a registered replicated
+		// shape, and on independent replicas it stalls every push behind it.
+		if err := corrosion.InsertImage(ctx, n.DB, corrosion.ImageRecord{Name: "test", Format: "qcow2",
+			SourceURL: "file:///dev/null", Checksum: "deadbeef", SizeBytes: 1024}); err != nil {
 			t.Fatalf("seed image: %v", err)
 		}
 		if err := writeEmptyImageFile(n.Server.ImagePathForTests("test")); err != nil {

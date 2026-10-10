@@ -3923,6 +3923,13 @@ service LiteVirt {
     // is proven gone: the creating host is asked which VMs hold the LUN — in
     // its replica, and in a create of its own still in flight.
     rpc LUNHolders(LUNHoldersRequest) returns (LUNHoldersResponse);
+    // ISCSILUNHolds is `lv host lun-holds [host]`: the durable holds a host
+    // keeps on iSCSI LUNs whose claim a rebuild or recreate there moved,
+    // including records it cannot read. With discard (admin, audited) —
+    // `lv host lun-hold discard <lun>` — it moves the records naming that LUN
+    // (or that token or file) aside, to iscsi-lun-holds/discarded/, and
+    // reloads the holds without a restart.
+    rpc ISCSILUNHolds(ISCSILUNHoldsRequest) returns (ISCSILUNHoldsResponse);
 
     // ── Re-create judgement (peer-only) ──
     //
@@ -4660,6 +4667,35 @@ message LUNHoldersResponse {
     // The answering host still keeps the hold the request's hold_token names,
     // on every asked LUN.
     bool hold_present = 3;
+}
+
+// ISCSILUNHoldsRequest lists, or with discard moves aside, a host's iSCSI LUN
+// holds (`lv host lun-holds`, `lv host lun-hold discard`).
+message ISCSILUNHoldsRequest {
+    string host    = 1;  // "" = the host answering
+    // A LUN key (iscsi:<target>/lun<n>), a hold's token, or a record's file
+    // name: every record it names is moved aside. Admin only.
+    string discard = 2;
+}
+message ISCSILUNHold {
+    string file                = 1;  // the record, under <data_dir>/iscsi-lun-holds/
+    string token               = 2;
+    string vm_name             = 3;
+    map<string, string> luns   = 4;  // LUN key → disk name
+    string run_host            = 5;  // where the re-created VM runs
+    string since               = 6;  // RFC3339
+    string replaced_created_at = 7;
+    string new_created_at      = 8;  // the re-created incarnation, once learnt
+    bool   active              = 9;  // its re-create is still running on this host
+    string error               = 10; // set when the record cannot be read; the rest is empty
+}
+message ISCSILUNHoldsResponse {
+    string                host      = 1;
+    repeated ISCSILUNHold holds     = 2;
+    repeated string       discarded = 3;  // the records this request moved aside
+    // Why the holds cannot be read, if they cannot: while it is set the host
+    // answers no LUN question.
+    string                load_error = 4;
 }
 
 // PreflightRecreateVMRequest is the spec of a VM about to be re-created on the

@@ -854,6 +854,12 @@ under `<data_dir>/recreate-failed/`, one file per failure, readable by root
 only, to re-create the VM from. The directory keeps the newest 50 files and
 none older than 30 days; copy out a spec you still need.
 
+A disk on an iSCSI LUN is not torn down: the LUN keeps the guest's data. Create
+the VM again under the **same name** on the same pools (`lv compose up`, or
+`lv run`) and it takes its own LUN over as it is — nothing is written over it,
+and no `overwrite` is needed, even for a root disk built on an image (see
+[iSCSI: one LUN, one disk](#iscsi-one-lun-one-disk)).
+
 ### Known limits
 
 - **qemu reopens the path.** The last check opens the file without following a
@@ -1157,6 +1163,26 @@ writes the new image over the old system. The previous incarnation is
 recognised by its rows' name and creation time, and its claim by the VM's name
 and disk with nothing else holding the LUN — never by a name alone.
 
+The storage of every disk is judged before the teardown, on the host running
+the rebuild or update, and must be readable there: a storage that cannot be
+read refuses (nothing is deleted), never counts as "no LUN". A storage that is
+not a pool on that host is judged where the VM is created — unless the VM's
+current disk of that name is an iSCSI LUN, whose claim must move from here:
+then the update or rebuild is refused, naming the pool; run it from a host with
+that pool. A create, likewise, refuses a disk whose storage does not resolve,
+and puts the disk on exactly the storage its claim resolved.
+
+**Re-creating a VM whose re-create was torn down.** If the re-created VM's
+create fails after the teardown (a fault), the LUN keeps the guest's disk, and
+the moved allocation records that it was kept. A create of the **same VM name
+and disk** that takes the LUN next — the documented recovery, `lv compose up`
+or `lv run` with the same pools — takes it over **as it is**: a root disk built
+on an image is not refused for holding data, and nothing is written over it.
+Set `overwrite` on the disk to write the image instead. Only that VM's own
+kept LUN is taken over this way: a VM of another name meets a LUN that holds
+data and needs `overwrite`, as does a VM created after one of the same name
+was **deleted** (a delete gives the LUN up; the new VM is a new disk).
+
 The holding host keeps a **durable hold** on the LUN, a record in
 `<data_dir>/iscsi-lun-holds/`: it survives a daemon restart, and nothing
 releases it on a timer or because the re-create returned, with or without an
@@ -1169,8 +1195,46 @@ still on its way when the hold was released (its rebuild given up, or the
 holding host restarted) is refused before it starts anything. A rebuild or
 recreate of the same VM while an earlier one's hold stands is refused
 (`Aborted`) until that hold is released, normally seconds after the earlier
-re-create. Do not delete a hold record by hand: it is the only thing that
-answers for the VM until its rows arrive.
+re-create.
+
+A rebuild or recreate that ends **before its create runs** — its delete was
+refused (a journaled operation such as a backup holds the VM, its host cannot
+be reached, the delete is not allowed) or failed — leaves **no hold**: no guest
+was started under the moved claim, and the VM, which still runs, holds its LUN
+as it did. Run it again once the cause is gone. The LUN's checkpoint moves to
+the moved allocation only once the re-created VM's create has committed, so
+refused re-creates, however many, never walk it past the VM that still runs.
+
+**Seeing and clearing holds.** `lv host lun-holds [host]` lists the holds a
+host keeps (every host without one): the VM, its LUNs, the host it is
+re-created on, since when, and whether its re-create is still running. A hold
+that has stood for more than five minutes raises the
+`iscsi_lun_hold_standing` warning on its host, naming the VM, its LUNs and the
+host it waits for ([diagnostics.md](diagnostics.md#iscsi-lun-holds-iscsi_lun_hold_unreadable-iscsi_lun_hold_standing)).
+
+A hold record that cannot be read fails that host closed: it answers no LUN
+question, so every iSCSI create on it, and every create elsewhere that must
+ask it, is refused. A read error is retried on the next question; a record
+that does not parse (it was edited by hand, or the disk was damaged — records
+are written whole, by a rename) stays until it is discarded. Either raises the
+critical `iscsi_lun_hold_unreadable` condition on that host, naming the file.
+
+Do not edit or delete a record by hand. `lv host lun-hold discard <lun> --yes`
+(admin, audited) moves every record that names `<lun>` — the LUN key the list
+shows (`iscsi:<target>/lun<n>`), a hold's token, or a record's file name — to
+`<data_dir>/iscsi-lun-holds/discarded/` on that host, where it is kept, and
+reloads the host's holds at once, with no restart. Without `--host`, the one
+host holding it is found; a hold whose re-create is still running is refused.
+A hold is what keeps a second VM off the LUN while the re-created VM's rows
+travel, so discard one only once it is safe:
+
+- the VM it names shows running in `lv ls`, on the host the hold names as its
+  run host, and its row has reached the hold's own host; or
+- that VM no longer exists, and no domain of it is defined on any host.
+
+A record that does not parse names no VM. Identify it from the LUN: the VM
+whose pool is that LUN, its rebuild or recreate around the record's time
+(`lv events`), and the host that ran it — then check the same two things.
 
 **Upgrading.** Allocation on an iscsi pool needs the release feature
 `iscsi_lun_claim`, which opens only once the whole cluster runs a build that

@@ -250,6 +250,21 @@ func lunBlank(r io.ReaderAt, size int64) (bool, error) {
 // LUNs the preflight claimed for the VM (LUN key → disk name).
 type lunPreflightKey struct{}
 
+// recreateOutcome is how a rebuild or recreate ended, as its preflight's
+// done is told.
+type recreateOutcome int
+
+const (
+	// recreateNotAttempted: it returned before its create was called — the
+	// delete refused, or failed. No guest was started under the moved claim.
+	recreateNotAttempted recreateOutcome = iota
+	// recreateFailed: the create was called and returned an error. Its
+	// guest may run all the same (an answer lost after it started).
+	recreateFailed
+	// recreateCommitted: the create returned the re-created VM.
+	recreateCommitted
+)
+
 // preflightLUNs judges, before cur is torn down to be created again from
 // spec on runHost, everything about its iSCSI LUNs the create would judge, so
 // that nothing about them refuses after the teardown — and MOVES the claim:
@@ -272,13 +287,24 @@ type lunPreflightKey struct{}
 //     once nothing but cur holds the LUN. A racing create meets the new
 //     allocation and asks both hosts (re-review 2, C-1; re-review 3, I-2).
 //
+// runHost is the host the create is pinned or placed to; every caller names
+// it, and a preflight with LUNs to move and no run host refuses — the
+// moved allocation must name exactly where the VM runs (re-review 4, I-2).
+//
 // The returned context carries the claims and the hold into the create
-// (withReplacedLUNs takes them over); done marks the re-create returned —
-// call it once the create has returned, whatever its outcome. The hold stays
-// until its evidence arrives.
-func (s *Server) preflightLUNs(ctx context.Context, spec *pb.VMSpec, cur *corrosion.VMRecord, runHost string) (context.Context, func(), error) {
-	noop := func() {}
-	uses, err := s.fixedDeviceUses(ctx, spec)
+// (withReplacedLUNs takes them over); done(outcome) marks the re-create
+// returned — call it exactly once, whatever happened:
+//
+//   - recreateNotAttempted (the delete refused or failed, no create called):
+//     the hold is ABANDONED — no guest was started under the moved claim, and
+//     a VM that survived keeps its own allocation on its own host, which
+//     every walk still meets (re-review 4, I-1);
+//   - recreateFailed: the hold stays until its evidence arrives;
+//   - recreateCommitted: likewise, and the LUN's checkpoint moves to the
+//     moved allocation now, never before the create committed.
+func (s *Server) preflightLUNs(ctx context.Context, spec *pb.VMSpec, cur *corrosion.VMRecord, runHost string) (context.Context, func(recreateOutcome), error) {
+	noop := func(recreateOutcome) {}
+	uses, err := s.recreateFixedDeviceUses(ctx, spec, cur)
 	if err != nil || len(uses) == 0 {
 		return ctx, noop, err
 	}
@@ -286,7 +312,9 @@ func (s *Server) preflightLUNs(ctx context.Context, spec *pb.VMSpec, cur *corros
 		return ctx, noop, err
 	}
 	if runHost == "" {
-		runHost = s.hostName
+		return ctx, noop, status.Errorf(codes.Unavailable,
+			"VM %q has a disk on an iSCSI LUN, and the host it is re-created on was not fixed before the "+
+				"teardown (its storage changed while the re-create was judged) — retry", spec.Name)
 	}
 	rep := replacedVM{name: cur.Name, snap: corrosion.VMDeleteSnapshot{CreatedAt: cur.CreatedAt}}
 	if cs := vmSpecFor(cur); cs != nil {
@@ -391,24 +419,50 @@ func (s *Server) preflightLUNs(ctx context.Context, spec *pb.VMSpec, cur *corros
 		moved = runHost
 	}
 	claimed := map[string]string{}
+	decided := map[string]int64{}
 	for _, u := range uses {
 		mine := corrosion.LUNAllocation{LUN: u.key, ClaimID: randid.New(), VMID: vmID, VMName: cur.Name,
-			Disk: u.disk, Host: s.hostName, RunHost: moved}
-		if _, err := s.allocateLUN(ctx, spec.Name, u, mine, rep, true, holdID, token); err != nil {
+			Disk: u.disk, Host: s.hostName, RunHost: moved, Kept: lunKeptAcross(spec, rep, u)}
+		g, _, err := s.allocateLUN(ctx, spec.Name, u, mine, rep, true, holdID, token, false)
+		if err != nil {
 			return ctx, noop, err
 		}
 		claimed[u.key] = u.disk
+		decided[u.key] = g
 	}
 	ok = true
 	ctx = context.WithValue(ctx, lunPreflightKey{}, claimed)
 	ctx = context.WithValue(ctx, lunHandoffKey{}, token)
 	var once sync.Once
-	return ctx, func() {
+	return ctx, func(out recreateOutcome) {
 		once.Do(func() {
+			switch out {
+			case recreateNotAttempted:
+				s.abandonLUNHold(token)
+				drop()
+				return
+			case recreateCommitted:
+				for k, g := range decided {
+					if err := corrosion.AdvanceLUNResolved(context.WithoutCancel(ctx), s.db, k, g, s.hostName); err != nil {
+						slog.Warn("iSCSI LUN: record checkpoint", "lun", k, "generation", g, "error", err)
+					}
+				}
+			}
 			drop()
 			s.finishLUNHold(token)
 		})
 	}, nil
+}
+
+// lunKeptAcross reports whether u's LUN keeps its contents across the
+// re-create of rep as spec: it is the replaced VM's own disk of that name,
+// and nothing is written over it — no image change written with overwrite on
+// the root disk.
+func lunKeptAcross(spec *pb.VMSpec, rep replacedVM, u lunUse) bool {
+	if rep.luns[u.key] != u.disk {
+		return false
+	}
+	return !(u.disk == "root" && spec.Image != "" && spec.Image != rep.image && u.overwrite)
 }
 
 // lunPreflightKeys is the LUN keys a preflight context claimed.

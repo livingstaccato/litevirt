@@ -49,13 +49,20 @@ import (
 // so a racer that passed both cannot meet a create that later proceeds.
 //
 // Errors reading the records fail closed: this host answers no LUN question
-// until they can be read.
+// until they can be read. An I/O error is retried on the next question; a
+// record that does not parse stays an error until it is discarded (`lv host
+// lun-hold discard`, which moves it aside and reloads the store without a
+// restart). Either raises the iscsi_lun_hold_unreadable condition, naming the
+// file (vm_lun_hold_admin.go).
 
 // lunHoldDirName is the records' directory under the data directory.
 const lunHoldDirName = "iscsi-lun-holds"
 
 // lunHoldResolveEvery is how often RunLUNHoldResolver re-judges the holds.
 const lunHoldResolveEvery = 5 * time.Second
+
+// lunHoldReadDir lists the records' directory; tests replace it to fail.
+var lunHoldReadDir = os.ReadDir
 
 // lunHoldRecord is one moved hold.
 type lunHoldRecord struct {
@@ -76,56 +83,91 @@ type lunHoldRecord struct {
 // lunHoldStore is this host's moved holds: the records, mirrored in memory,
 // and which of them a re-create in this process is still running under.
 type lunHoldStore struct {
-	mu      sync.Mutex
+	mu sync.Mutex
+	// loaded: recs mirrors the records. A record that did not parse also
+	// sets it, with loadErr and badFile: that stays until it is discarded.
 	loaded  bool
-	loadErr error
+	loadErr error  // the last load's error, latched or not
+	badFile string // the file loadErr names, when there is one
 	recs    map[string]*lunHoldRecord
 	active  map[string]bool
-	kick    chan struct{}
-	resolve sync.Mutex // one resolve pass at a time
+	// abandoned: a refused re-create's hold whose record could not be
+	// removed; the resolver removes it.
+	abandoned map[string]bool
+	kick      chan struct{}
+	resolve   sync.Mutex // one resolve pass at a time
+	health    lunHoldHealth
 }
 
 func (s *Server) lunHoldDir() string { return filepath.Join(s.dataDir, lunHoldDirName) }
 
-// lunHoldsLocked loads the records once. Caller holds s.lunHolds.mu.
+// lunHoldsLocked loads the records once. An I/O error is not latched — the
+// next call reads again — and a record that does not parse is, until it is
+// discarded (re-review 4, m-1). Caller holds s.lunHolds.mu.
 func (s *Server) lunHoldsLocked() error {
 	h := &s.lunHolds
 	if h.loaded {
 		return h.loadErr
 	}
-	h.loaded = true
-	h.recs = map[string]*lunHoldRecord{}
+	recs := map[string]*lunHoldRecord{}
 	if s.dataDir == "" {
+		h.loaded, h.recs, h.loadErr, h.badFile = true, recs, nil, ""
 		return nil
 	}
-	ents, err := os.ReadDir(s.lunHoldDir())
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
+	ents, err := lunHoldReadDir(s.lunHoldDir())
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		h.loadErr = fmt.Errorf("read the iSCSI LUN holds in %s: %w", s.lunHoldDir(), err)
+		h.badFile = s.lunHoldDir()
 		return h.loadErr
 	}
 	for _, e := range ents {
 		name := e.Name()
-		if !strings.HasSuffix(name, ".json") {
+		if !strings.HasSuffix(name, ".json") || e.IsDir() {
 			continue // a temporary file a crash left behind: never renamed into place
 		}
-		b, err := os.ReadFile(filepath.Join(s.lunHoldDir(), name))
-		var rec lunHoldRecord
-		if err == nil {
-			err = json.Unmarshal(b, &rec)
-		}
-		if err == nil && (rec.Token == "" || rec.Token+".json" != name || len(rec.LUNs) == 0) {
-			err = errors.New("not a whole hold record")
-		}
-		if err != nil {
-			h.loadErr = fmt.Errorf("read the iSCSI LUN hold %s: %w", filepath.Join(s.lunHoldDir(), name), err)
+		path := filepath.Join(s.lunHoldDir(), name)
+		rec, perr, ioErr := readLUNHoldFile(path)
+		if ioErr != nil {
+			h.loadErr = fmt.Errorf("read the iSCSI LUN hold %s: %w", path, ioErr)
+			h.badFile = path
 			return h.loadErr
 		}
-		h.recs[rec.Token] = &rec
+		if perr != nil {
+			h.loaded, h.recs = true, nil
+			h.loadErr = fmt.Errorf("read the iSCSI LUN hold %s: %w", path, perr)
+			h.badFile = path
+			return h.loadErr
+		}
+		recs[rec.Token] = rec
 	}
+	h.loaded, h.recs, h.loadErr, h.badFile = true, recs, nil, ""
 	return nil
+}
+
+// readLUNHoldFile reads one record: ioErr when the file cannot be read,
+// parseErr when what it holds is not a whole record.
+func readLUNHoldFile(path string) (rec *lunHoldRecord, parseErr, ioErr error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	rec = &lunHoldRecord{}
+	if err := json.Unmarshal(b, rec); err != nil {
+		return nil, err, nil
+	}
+	if rec.Token == "" || rec.Token+".json" != filepath.Base(path) || len(rec.LUNs) == 0 {
+		return nil, errors.New("not a whole hold record"), nil
+	}
+	return rec, nil, nil
+}
+
+// reloadLUNHoldsLocked forgets the mirror and reads the records again. The
+// re-creates still running here (active) are kept. Caller holds
+// s.lunHolds.mu.
+func (s *Server) reloadLUNHoldsLocked() error {
+	h := &s.lunHolds
+	h.loaded, h.recs, h.loadErr, h.badFile = false, nil, nil, ""
+	return s.lunHoldsLocked()
 }
 
 // writeLUNHoldFile writes rec durably: a temporary file, fsynced, renamed
@@ -135,8 +177,17 @@ func (s *Server) writeLUNHoldFile(rec *lunHoldRecord) error {
 		return errors.New("this host has no data directory to record the hold in")
 	}
 	dir := s.lunHoldDir()
+	_, statErr := os.Stat(dir)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
+	}
+	if errors.Is(statErr, os.ErrNotExist) {
+		// The directory is new: its entry in the data directory is made
+		// durable too, or the first record could vanish with it (re-review
+		// 4, n-2).
+		if err := syncLUNHoldDir(s.dataDir); err != nil {
+			return err
+		}
 	}
 	b, err := json.Marshal(rec)
 	if err != nil {
@@ -204,6 +255,7 @@ func (s *Server) dropLUNHoldLocked(token string) error {
 	}
 	delete(h.recs, token)
 	delete(h.active, token)
+	delete(h.abandoned, token)
 	return nil
 }
 
@@ -214,9 +266,13 @@ func (s *Server) abandonLUNHold(token string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if err := s.dropLUNHoldLocked(token); err != nil {
-		slog.Warn("iSCSI LUN: could not remove the hold of a refused re-create; it is resolved later",
+		slog.Warn("iSCSI LUN: could not remove the hold of a refused re-create; the resolver removes it",
 			"token", token, "error", err)
 		delete(h.active, token)
+		if h.abandoned == nil {
+			h.abandoned = map[string]bool{}
+		}
+		h.abandoned[token] = true
 	}
 }
 
@@ -379,6 +435,7 @@ func (s *Server) RunLUNHoldResolver(ctx context.Context, interval time.Duration)
 		if err := s.ResolveLUNHolds(ctx); err != nil {
 			slog.Debug("iSCSI LUN: a moved hold stays until its evidence can be read", "error", err)
 		}
+		s.lunHoldHealthPass(ctx, time.Now())
 	}
 }
 
@@ -393,7 +450,7 @@ func (s *Server) resolveLUNHold(ctx context.Context, token string) (bool, error)
 		h.mu.Unlock()
 		return false, err
 	}
-	cur, active := h.recs[token], h.active[token]
+	cur, active, abandoned := h.recs[token], h.active[token], h.abandoned[token]
 	var rec lunHoldRecord
 	if cur != nil {
 		rec = *cur
@@ -413,6 +470,9 @@ func (s *Server) resolveLUNHold(ctx context.Context, token string) (bool, error)
 		}
 		slog.Info("iSCSI LUN: a moved claim's hold is released", "vm", rec.VM, "run_host", rec.RunHost, "evidence", why)
 		return true, nil
+	}
+	if abandoned {
+		return release("its re-create was refused before anything was created")
 	}
 	if here, err := s.lunHoldRowsHere(ctx, &rec, rec.NewCreatedAt); err != nil {
 		return false, err

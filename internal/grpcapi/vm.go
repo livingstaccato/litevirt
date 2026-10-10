@@ -474,10 +474,16 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		isRootDisk := d.Name == "root"
 
 		if d.Storage != "" {
-			// Use a named storage volume (nfs, ceph, iscsi, etc.).
-			volCfg, volErr := s.resolveVolume(ctx, spec.StackName, d.Storage)
-			if volErr != nil {
-				return nil, status.Errorf(codes.FailedPrecondition, "storage %q: %v", d.Storage, volErr)
+			// Use a named storage volume (nfs, ceph, iscsi, etc.) — as the
+			// LUN claim resolved it, so the disk is the LUN the claim took
+			// (re-review 4, I-2); claimLUNs refused a storage that did not
+			// resolve.
+			volCfg, resolved := lunHold.cfgs[d.Name]
+			if !resolved {
+				var volErr error
+				if volCfg, volErr = s.resolveVolume(ctx, spec.StackName, d.Storage); volErr != nil {
+					return nil, status.Errorf(codes.FailedPrecondition, "storage %q: %v", d.Storage, volErr)
+				}
 			}
 			drv, drvErr := storage.New(s.dataDir, volCfg)
 			if drvErr != nil {
@@ -3319,7 +3325,13 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	host, placed := s.hostName, false
 	// A VM on an iSCSI LUN is placed now too: its moved claim names the host
 	// it will run on, so the create must go exactly there (vm_lun_hold.go).
-	if spec.GetIso() != "" || s.hasFixedDeviceDisk(rctx, spec) {
+	// A storage that cannot be judged refuses, the VM intact.
+	onLUN, err := s.hasFixedDeviceDisk(rctx, spec, vm)
+	if err != nil {
+		st := status.Convert(err)
+		return nil, status.Errorf(st.Code(), "cannot rebuild %q: %s; nothing was changed", req.Name, st.Message())
+	}
+	if spec.GetIso() != "" || onLUN {
 		h, err := s.placeRecreate(rctx, spec, vm)
 		if err != nil {
 			st := status.Convert(err)
@@ -3335,12 +3347,21 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	// naming this host and the one the VM is created on, and a LUN the create
 	// would refuse is refused now. This host then holds the LUNs until the
 	// evidence that it may let go arrives (vm_lun_hold.go).
-	rctx, lunDone, err := s.preflightLUNs(rctx, spec, vm, host)
+	// Unplaced, the create goes wherever CreateVM places it: no run host is
+	// named, and a LUN found now refuses (preflightLUNs).
+	runHost := ""
+	if placed {
+		runHost = host
+	}
+	rctx, lunDone, err := s.preflightLUNs(rctx, spec, vm, runHost)
 	if err != nil {
 		st := status.Convert(err)
 		return nil, status.Errorf(st.Code(), "cannot rebuild %q: %s; nothing was changed", req.Name, st.Message())
 	}
-	defer lunDone()
+	// Until the create is called, the rebuild ended before one was attempted
+	// (the record's tombstone failed): its hold is abandoned.
+	outcome := recreateNotAttempted
+	defer func() { lunDone(outcome) }()
 
 	// Stop and undefine the current domain.
 	if vm.State == "running" {
@@ -3398,9 +3419,11 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	} else {
 		out, err = s.CreateVM(rctx, &pb.CreateVMRequest{Spec: spec})
 	}
+	outcome = recreateFailed
 	if err != nil {
-		return nil, s.recreateFailedAfterTeardown("rebuild", req.Name, s.hostName, spec, err)
+		return nil, s.recreateFailedAfterTeardown("rebuild", req.Name, s.hostName, spec, err, len(lunPreflightKeys(rctx)) > 0)
 	}
+	outcome = recreateCommitted
 	return out, nil
 }
 
@@ -3803,6 +3826,11 @@ func (s *Server) storedStackFile(ctx context.Context, stackName string) (*compos
 // this host's storage pools. A name found in neither is an error — never the
 // local driver (a disk with no storage name is what uses that).
 func (s *Server) resolveVolume(ctx context.Context, stackName, volumeName string) (storage.Config, error) {
+	if f := resolveVolumeFault; f != nil {
+		if err := f(stackName, volumeName); err != nil {
+			return storage.Config{}, err
+		}
+	}
 	// 1. Try compose volumes. A stored stack that cannot be read is an
 	// error: falling through would put the disk on whatever storage the
 	// later steps find, most likely the local driver.

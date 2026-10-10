@@ -1668,6 +1668,26 @@ admission — starting either VM included — does not read it. Refusing the sta
 would not undo what both guests already wrote. Decide which VM keeps the LUN,
 stop the others, and move their disks to LUNs of their own (a pool per LUN).
 
+### iSCSI LUN holds (`iscsi_lun_hold_unreadable`, `iscsi_lun_hold_standing`)
+
+A rebuild or recreate of a VM with a disk on an iSCSI LUN moves the LUN's
+claim, and the host running it keeps a durable hold on the LUN until the
+evidence that it may let go arrives
+([storage.md](storage.md#iscsi-one-lun-one-disk)). Each host reports its own
+holds (evaluator `iscsi_lun_hold`, subject kind `host`, the subject the host),
+so each row has one writer. Neither condition is an ownership code: admission
+never reads it.
+
+| Code | Severity | Raised when | Clears when |
+|---|---|---|---|
+| `iscsi_lun_hold_unreadable` | critical | The host cannot read its hold records under `<data_dir>/iscsi-lun-holds/`: the directory or a record cannot be read, or a record does not parse. The evidence names the file. While it stands the host answers no LUN question: every iSCSI create on it, and every create elsewhere that must ask it, is refused. | The records read cleanly again: a read error is retried on every question; a record that does not parse stays until `lv host lun-hold discard` moves it aside. |
+| `iscsi_lun_hold_standing` | warning | A hold has stood for more than five minutes with no re-create running under it. The evidence names each VM, its LUNs and the host it was re-created on — normally that host cannot be asked, or the VM's rows have not reached the holding host. | The hold is released (its evidence arrived) or discarded. |
+
+The holds are checked every five seconds, and a condition is written only when
+it changes. `lv host lun-holds <host>` lists them. Discard one only after the
+check in [storage.md](storage.md#iscsi-one-lun-one-disk): a hold is what keeps
+a second VM off a LUN whose re-created VM's rows are still on their way.
+
 ### Orphaned runtimes (`vm_orphan_runtime`, `ct_orphan_runtime`)
 
 Each host reports the workloads **litevirt created** that are still present on

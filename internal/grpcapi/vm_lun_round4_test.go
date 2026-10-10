@@ -50,11 +50,11 @@ func TestRebuildVM_ISCSI_TheMovedHoldSurvivesARestart(t *testing.T) {
 	if _, err := s.CreateVM(ctx, lunVM("a", "lun0")); err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	_, release, err := s.preflightLUNs(ctx, lunVM("a", "lun0").Spec, vmRecord(t, s, "a"), "")
+	_, release, err := s.preflightLUNs(ctx, lunVM("a", "lun0").Spec, vmRecord(t, s, "a"), s.hostName)
 	if err != nil {
 		t.Fatalf("preflight: %v", err)
 	}
-	defer release()
+	defer release(recreateFailed)
 	if err := corrosion.DeleteVM(ctx, s.db, "a"); err != nil {
 		t.Fatal(err)
 	}

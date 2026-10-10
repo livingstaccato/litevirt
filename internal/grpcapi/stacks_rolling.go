@@ -53,14 +53,18 @@ func (o *serverOps) recreateAs(ctx context.Context, target, source string, desir
 		ctx = withRecreateISOGrant(ctx, src)
 	}
 	var decision *resolvedCreateVMDecision
+	// The preflight's done is told how the re-create ended (preflightLUNs);
+	// until the create is called, it ended before one was attempted.
+	lunDone, outcome := func(recreateOutcome) {}, recreateNotAttempted
+	defer func() { lunDone(outcome) }()
 	cur, _ := corrosion.GetVM(ctx, o.s.db, target)
 	if cur != nil {
 		host := cur.HostName
-		var perr error
 		// A VM on an iSCSI LUN is placed now too: its moved claim names the
 		// host it will run on, so the create must go exactly there
-		// (vm_lun_hold.go).
-		if spec.GetIso() != "" || o.s.hasFixedDeviceDisk(ctx, spec) {
+		// (vm_lun_hold.go). A storage that cannot be judged refuses.
+		onLUN, perr := o.s.hasFixedDeviceDisk(ctx, spec, cur)
+		if perr == nil && (spec.GetIso() != "" || onLUN) {
 			if host, perr = o.s.placeRecreate(ctx, spec, cur); perr == nil {
 				decision = &resolvedCreateVMDecision{resolvedHost: host, placedHere: true}
 			}
@@ -73,13 +77,16 @@ func (o *serverOps) recreateAs(ctx context.Context, target, source string, desir
 			}
 		}
 		if perr == nil {
+			// Unplaced, the create goes wherever CreateVM places it: no run
+			// host is named, and a LUN found now refuses (preflightLUNs).
 			runHost := ""
 			if decision != nil {
 				runHost = decision.resolvedHost
 			}
-			var lunDone func()
-			ctx, lunDone, perr = o.s.preflightLUNs(ctx, spec, cur, runHost)
-			defer lunDone()
+			var done func(recreateOutcome)
+			if ctx, done, perr = o.s.preflightLUNs(ctx, spec, cur, runHost); perr == nil {
+				lunDone = done
+			}
 		}
 		if perr != nil {
 			st := status.Convert(perr)
@@ -118,8 +125,12 @@ func (o *serverOps) recreateAs(ctx context.Context, target, source string, desir
 	} else {
 		_, err = o.s.CreateVM(ctx, &pb.CreateVMRequest{Spec: spec})
 	}
+	outcome = recreateFailed
+	if err == nil {
+		outcome = recreateCommitted
+	}
 	if err != nil && tornDown {
-		return o.s.recreateFailedAfterTeardown("recreate", target, cur.HostName, spec, err)
+		return o.s.recreateFailedAfterTeardown("recreate", target, cur.HostName, spec, err, len(lunPreflightKeys(ctx)) > 0)
 	}
 	return err
 }
@@ -463,7 +474,8 @@ func (s *Server) recreateInline(ctx context.Context, action planner.VMAction, f 
 	// (vm_lun_hold.go).
 	var cur *corrosion.VMRecord
 	var deleted *deletedVMSink
-	lunKeys, lunDone := map[string]bool(nil), func() {}
+	lunKeys, lunDone, outcome := map[string]bool(nil), func(recreateOutcome) {}, recreateNotAttempted
+	defer func() { lunDone(outcome) }()
 	if !action.IsContainer {
 		cur, _ = corrosion.GetVM(ctx, s.db, action.VMName)
 		if cur != nil {
@@ -475,7 +487,14 @@ func (s *Server) recreateInline(ctx context.Context, action planner.VMAction, f 
 			// The moved claim names the host the VM runs on: the planner's,
 			// which the create is pinned to.
 			runHost := spec.GetPlacement().GetHost()
-			if runHost == "" && s.hasFixedDeviceDisk(ctx, spec) {
+			onLUN, err := s.hasFixedDeviceDisk(ctx, spec, cur)
+			if err != nil {
+				st := status.Convert(err)
+				err = status.Errorf(st.Code(), "recreate %s: %s; nothing was deleted", action.VMName, st.Message())
+				gate.markUnmet(action.VMName, err)
+				return err
+			}
+			if runHost == "" && onLUN {
 				if runHost, err = s.placeRecreate(ctx, spec, cur); err != nil {
 					gate.markUnmet(action.VMName, err)
 					return err
@@ -503,7 +522,6 @@ func (s *Server) recreateInline(ctx context.Context, action planner.VMAction, f 
 			}
 		}
 	}
-	defer lunDone()
 	if delErr := s.deleteWorkloadIgnoringGone(deleteCtx, action); delErr != nil {
 		slog.Warn("deploy update delete failed", "workload", action.VMName, "error", delErr)
 		gate.markUnmet(action.VMName, fmt.Errorf("delete before recreate failed: %w", delErr))
@@ -517,7 +535,16 @@ func (s *Server) recreateInline(ctx context.Context, action planner.VMAction, f 
 		}
 		createCtx = s.withReplacedLUNs(createCtx, cur)
 	}
-	if vmErr := s.deployCreatePlanned(createCtx, action, f); vmErr != nil {
+	vmErr := s.deployCreatePlanned(createCtx, action, f)
+	outcome = recreateFailed
+	if vmErr == nil {
+		outcome = recreateCommitted
+	}
+	if vmErr != nil && len(lunKeys) > 0 {
+		st := status.Convert(vmErr)
+		vmErr = status.Errorf(st.Code(), "%s. %s", st.Message(), lunRecoveryHint)
+	}
+	if vmErr != nil {
 		slog.Warn("deploy update recreate failed", "workload", action.VMName, "host", action.TargetHost, "error", vmErr)
 		gate.markUnmet(action.VMName, fmt.Errorf("recreate failed: %w", vmErr))
 		return vmErr

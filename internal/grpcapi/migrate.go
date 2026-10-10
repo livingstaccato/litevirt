@@ -813,9 +813,11 @@ poll:
 
 	// (Firmware-state cleanup is handled in coldMigrateStoppedVM, which firmware
 	// VMs take instead of this runtime-migration path — see the early return above.)
-	s.finishMigrationOnTarget(ctx, vm, migrationFinish{
+	if err := s.finishMigrationOnTarget(ctx, vm, migrationFinish{
 		target: targetHost, detachedVFs: detachedVFs, pbVM: pbVM, hspec: hspec, armed: armed,
-	})
+	}); err != nil {
+		return status.Errorf(codes.FailedPrecondition, "VM %q migrated to %s, but is %v", vm.Name, req.TargetHost, err)
+	}
 
 	return send(pb.MigratePhase_MIGRATE_DONE, 100, 0)
 }
@@ -930,7 +932,9 @@ func (s *Server) adoptAbandonedMigration(
 		// on the old VTEP, its LB backends and DNS stale, and the source's files
 		// orphaned.
 		if finish.target != nil {
-			s.finishMigrationOnTarget(ctx, vm, finish)
+			if err := s.finishMigrationOnTarget(ctx, vm, finish); err != nil {
+				slog.Error("adopted migration: the guest is held paused on its target", "vm", vm.Name, "error", err)
+			}
 		} else {
 			s.enqueueMirrorSync(ctx, vm.Name, mirrorOpUpsert)
 		}
@@ -2363,7 +2367,11 @@ func (s *Server) abortOnMigrateTimeout(ctx, migrateCtx context.Context, vmName s
 // VFs, switch MAC tables, DNS, LB backends, VXLAN FDB, the post_migrate hook,
 // the target's own view, and the source's leftovers. Shared by the watched
 // path and an adopted migration, which used to commit ownership and stop.
-func (s *Server) finishMigrationOnTarget(ctx context.Context, vm *corrosion.VMRecord, f migrationFinish) {
+//
+// It returns an error only for a guest handed over paused that its target has
+// not yet let run (armedMigration.finish): the move is done, and the guest is
+// held paused there until its guards are in force (re-review R3-I2).
+func (s *Server) finishMigrationOnTarget(ctx context.Context, vm *corrosion.VMRecord, f migrationFinish) error {
 	// All of it runs DETACHED from the request: ownership has been committed,
 	// nothing retries this finish, and the watched path passes the request
 	// context, which a client that went away after the cutover has cancelled.
@@ -2371,9 +2379,6 @@ func (s *Server) finishMigrationOnTarget(ctx context.Context, vm *corrosion.VMRe
 	// below outlives this call and uses it.
 	ctx = context.WithoutCancel(ctx)
 	target := f.target.Name
-	// A guest handed over paused (a guarded NIC with no tap name of its own)
-	// runs once its guards are in force under the taps it got there.
-	_ = f.armed.finish(ctx)
 	s.enqueueMirrorSync(ctx, vm.Name, mirrorOpUpsert)
 
 	// Re-attach equivalent VFs on the target host for any VFs detached pre-migration.
@@ -2423,6 +2428,16 @@ func (s *Server) finishMigrationOnTarget(ctx context.Context, vm *corrosion.VMRe
 	// Clean up orphaned files on the source host (cloud-init ISO, and disk
 	// files for --with-storage migrations where copies now live on target).
 	go s.cleanupPostMigration(vm.Name)
+
+	// Last, so a slow target holds up none of the above: a guest handed over
+	// paused (a guarded NIC with no tap name of its own) runs once its guards
+	// are in force under the taps it got there; the source retries until
+	// handOverDeadline (re-review R3-I2).
+	if err := f.armed.finish(ctx); err != nil {
+		s.recordVMEvent(ctx, vm.Name, "vm.held", "error", err.Error())
+		return err
+	}
+	return nil
 }
 
 // migrationAbort is what MigrateVM has done, before libvirt took the guest, that

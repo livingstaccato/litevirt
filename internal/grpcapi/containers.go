@@ -306,7 +306,7 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		pa.SetPendingContainer(req.Name, plan.ifaces)
 		defer pa.ClearPendingContainer(req.Name)
 	}
-	if err := s.armWorkload(ctx, ctOwner, req.Name); err != nil {
+	if err := s.armWorkload(ctx, req.Name, func() ([]string, error) { return s.containerGuardedMACs(ctx, req.Name) }); err != nil {
 		_ = s.releaseContainerNICs(ctx, req.Name)
 		s.retireNICGuards(ctx, ctOwner)
 		s.audit(ctx, "ct.create", req.Name, "image="+req.Image, "error")
@@ -620,6 +620,9 @@ func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 	if rec, _ := corrosion.GetContainer(ctx, s.db, s.hostName, req.Name); rec != nil {
 		dnsStack = containerStackLabel(*rec)
 	}
+	// Its NICs' MACs, for retiring their guard records below: the tombstone
+	// takes the NIC rows with it.
+	ctMACs := s.containerNICMACs(ctx, req.Name)
 	// A runtime "not found" is acceptable (idempotent) — proceed to the row
 	// tombstone so a retry after "runtime gone but DB write failed" can clear the
 	// ghost row. A real runtime failure still aborts.
@@ -647,7 +650,7 @@ func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 	// prior delete may have tombstoned the container row but failed these, so a
 	// retry (now zero-row) must still clean them up, else a later same-host/name
 	// recreate inherits stale leases/rows.
-	s.retireNICGuards(ctx, corrosion.ContainerGuardOwner(s.hostName, req.Name))
+	s.retireContainerGuards(ctx, req.Name, ctMACs)
 	nicErr := s.releaseContainerNICs(ctx, req.Name)
 	// Remove the auto DNS record (prompt — a lingering record could resolve to a now
 	// freed/reassigned IP). Best-effort; the reaper backstops.

@@ -56,7 +56,7 @@ func TestStartDomain_GuardRefuses(t *testing.T) {
 // none is set in time.
 func TestStartDomain_WaitsForARequiredGuard(t *testing.T) {
 	c := &Client{}
-	c.RequireStartGuard(5 * time.Second)
+	c.RequireStartGuard(5*time.Second, nil)
 	done := make(chan error, 1)
 	go func() { done <- c.StartDomain("web") }()
 	select {
@@ -76,7 +76,7 @@ func TestStartDomain_WaitsForARequiredGuard(t *testing.T) {
 	}
 
 	late := &Client{}
-	late.RequireStartGuard(50 * time.Millisecond)
+	late.RequireStartGuard(50*time.Millisecond, nil)
 	if err := late.StartDomain("web"); err == nil || !strings.Contains(err.Error(), "not ready") {
 		t.Fatalf("a start with no guard set in time = %v; want a refusal", err)
 	}

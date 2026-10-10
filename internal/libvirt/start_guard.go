@@ -54,12 +54,17 @@ func (c *Client) SetStartGuard(g StartGuard) {
 	}
 }
 
-// RequireStartGuard makes every start wait, up to wait, for SetStartGuard,
-// and refuse if none is set by then. The daemon calls it right after
-// connecting: after a host boots, its onboot, self-heal and restart-policy
-// starts may otherwise run before the firewall is wired, with the nft tables
-// empty (re-review R2-I2).
-func (c *Client) RequireStartGuard(wait time.Duration) {
+// RequireStartGuard makes a start wait, up to wait, for SetStartGuard, and
+// refuse if none is set by then. The daemon calls it right after connecting:
+// after a host boots, its onboot, self-heal and restart-policy starts may
+// otherwise run before the firewall is wired, with the nft tables empty
+// (re-review R2-I2).
+//
+// needs scopes the wait (re-review m3): a start of a domain it reports false
+// for — a VM with no NIC guard — does not wait, and runs as it did before
+// guards existed. It is asked only while no guard is set; nil means every
+// start waits. It should answer true when it cannot tell.
+func (c *Client) RequireStartGuard(wait time.Duration, needs func(name string) bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.guardReady == nil {
@@ -68,19 +73,27 @@ func (c *Client) RequireStartGuard(wait time.Duration) {
 			c.readyOnce.Do(func() { close(c.guardReady) })
 		}
 	}
-	c.guardWait = wait
+	c.guardWait, c.guardNeeds = wait, needs
 }
 
-// guard returns the start guard, waiting for a required one.
-func (c *Client) guard() (StartGuard, error) {
+// guard returns the start guard for a start of name, waiting for a required
+// one when name needs it.
+func (c *Client) guard(name string) (StartGuard, error) {
 	c.mu.RLock()
-	ready, wait := c.guardReady, c.guardWait
+	ready, wait, needs := c.guardReady, c.guardWait, c.guardNeeds
 	c.mu.RUnlock()
 	if ready != nil {
 		select {
 		case <-ready:
-		case <-time.After(wait):
-			return StartGuard{}, errGuardNotReady
+		default:
+			if needs != nil && !needs(name) {
+				return StartGuard{}, nil
+			}
+			select {
+			case <-ready:
+			case <-time.After(wait):
+				return StartGuard{}, errGuardNotReady
+			}
 		}
 	}
 	c.mu.RLock()
@@ -89,7 +102,8 @@ func (c *Client) guard() (StartGuard, error) {
 }
 
 // guardedStart starts a domain through the guard: create(paused) starts it,
-// resume lets a paused one run, destroy undoes a start the guard refused.
+// resume lets a paused one run, destroy undoes a start the guard refused or
+// that could not be resumed.
 func guardedStart(g StartGuard, name string, create func(paused bool) error, resume func() error, destroy func()) error {
 	pause, err := g.before(name)
 	if err != nil {
@@ -106,6 +120,9 @@ func guardedStart(g StartGuard, name string, create func(paused bool) error, res
 		return fmt.Errorf("start domain %s: %w", name, err)
 	}
 	if err := resume(); err != nil {
+		// Left paused, the domain would disagree with the start's error and
+		// with the row (re-review m5): stop it, as a refusal does.
+		destroy()
 		return fmt.Errorf("resume domain %s: %w", name, err)
 	}
 	return nil

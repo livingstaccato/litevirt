@@ -328,8 +328,10 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 		// source's relaxations are not copied — relaxing a guard needs
 		// cluster-root network authority the cloning caller may not hold —
 		// and are set on the clone with `lv firewall nic-guard set`.
-		// A NIC on the `trunk:` feature gets none (guardDecision.record).
-		if !strings.HasPrefix(bridge, "direct:") && len(n.Trunk) < 2 {
+		// A NIC on the `trunk:` feature is guarded like any other new NIC,
+		// its VLANs its network's to allow (guardDecision.record, re-review
+		// R2-I1, R3-I1).
+		if !strings.HasPrefix(bridge, "direct:") {
 			guardRecords = append(guardRecords, corrosion.NICGuardRecord{VMName: req.Target, MAC: mac, Mode: corrosion.NICGuardOn,
 				VMUUID: cloneUUID, Network: n.Name, Ordinal: i})
 		}

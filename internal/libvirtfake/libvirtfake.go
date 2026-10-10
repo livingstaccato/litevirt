@@ -137,6 +137,7 @@ type Fake struct {
 	guardSet   bool
 	guardReady chan struct{}
 	guardWait  time.Duration
+	guardNeeds func(name string) bool
 	// OnRunning, when set, is called (outside the fake's lock) each time a
 	// domain starts running: a start, a resume. A scenario samples what is in
 	// force at the moment a guest runs.
@@ -476,12 +477,13 @@ func (f *Fake) SetStartGuard(g libvirt.StartGuard) {
 	}
 }
 
-// RequireStartGuard mirrors libvirt.Client.RequireStartGuard: starts wait for
-// the next SetStartGuard, up to wait.
-func (f *Fake) RequireStartGuard(wait time.Duration) {
+// RequireStartGuard mirrors libvirt.Client.RequireStartGuard: starts of a
+// domain needs reports true for (nil: every start) wait for the next
+// SetStartGuard, up to wait.
+func (f *Fake) RequireStartGuard(wait time.Duration, needs func(name string) bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.guardReady, f.guardWait = make(chan struct{}), wait
+	f.guardReady, f.guardWait, f.guardNeeds = make(chan struct{}), wait, needs
 }
 
 func (f *Fake) running(name string) {
@@ -495,18 +497,30 @@ func (f *Fake) running(name string) {
 // already assigned), then resumes it.
 func (f *Fake) StartDomain(name string) error {
 	f.mu.Lock()
-	ready, wait := f.guardReady, f.guardWait
+	ready, wait, needs := f.guardReady, f.guardWait, f.guardNeeds
 	f.mu.Unlock()
+	unguarded := false
 	if ready != nil {
 		select {
 		case <-ready:
-		case <-time.After(wait):
-			return fmt.Errorf("start domain %s: the NIC firewall is not ready yet", name)
+		default:
+			if needs != nil && !needs(name) {
+				unguarded = true
+				break
+			}
+			select {
+			case <-ready:
+			case <-time.After(wait):
+				return fmt.Errorf("start domain %s: the NIC firewall is not ready yet", name)
+			}
 		}
 	}
 	f.mu.Lock()
 	g := f.startGuard
 	f.mu.Unlock()
+	if unguarded {
+		g = libvirt.StartGuard{}
+	}
 	pause := false
 	if g.Before != nil {
 		p, err := g.Before(name)
@@ -530,7 +544,15 @@ func (f *Fake) StartDomain(name string) error {
 			return fmt.Errorf("start domain %s: %w", name, err)
 		}
 	}
-	return f.ResumeDomain(name)
+	if err := f.ResumeDomain(name); err != nil {
+		// As libvirt.Client does (re-review m5): a domain that cannot be
+		// resumed is stopped, not left paused.
+		f.mu.Lock()
+		f.domains[name] = StateShutdown
+		f.mu.Unlock()
+		return err
+	}
+	return nil
 }
 
 func (f *Fake) startDomain(name string, paused bool) error {

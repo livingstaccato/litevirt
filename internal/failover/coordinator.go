@@ -138,8 +138,8 @@ type Coordinator struct {
 	fencer   Fencer
 	// capacity is the cluster-wide capacity policy; see placement.Request.Capacity.
 	capacity corrosion.CapacityPolicy
-	// placementLabels: SetPlacementLabels.
-	placementLabels func(ctx context.Context, vm string) map[string]string
+	// nicGuardPlacement: SetNICGuardPlacement.
+	nicGuardPlacement func(ctx context.Context, vm string) bool
 	// leaseTerm is the fencing term of the lease incarnation this coordinator
 	// currently holds, 0 when it holds none. Recorded here in Phase 1 and read by
 	// the Phase-2 enforcement path; nothing enforces on it yet.
@@ -421,23 +421,18 @@ func NewCoordinator(hostName string, db *corrosion.Client) *Coordinator {
 // should not use this.
 func (c *Coordinator) SetFencer(f Fencer) { c.fencer = f }
 
-// SetPlacementLabels sets the host labels a recovery of a VM must require
-// beyond its spec's: the daemon requires a host that enforces NIC guards for a
-// guarded VM until every host does (grpcapi.Server.GuardHostLabels).
-func (c *Coordinator) SetPlacementLabels(fn func(ctx context.Context, vm string) map[string]string) {
-	c.placementLabels = fn
+// SetNICGuardPlacement sets whether a recovery of a VM must land on a host
+// that enforces NIC guards (placement.Request.RequireNICGuards): the daemon
+// requires one for a guarded VM until every host does
+// (grpcapi.Server.GuardHostNeeded).
+func (c *Coordinator) SetNICGuardPlacement(fn func(ctx context.Context, vm string) bool) {
+	c.nicGuardPlacement = fn
 }
 
-// addPlacementLabels adds SetPlacementLabels' labels to req.
+// addPlacementLabels adds what SetNICGuardPlacement requires to req.
 func (c *Coordinator) addPlacementLabels(ctx context.Context, req *placement.Request, vm string) {
-	if c.placementLabels == nil {
-		return
-	}
-	for k, v := range c.placementLabels(ctx, vm) {
-		if req.RequireLabels == nil {
-			req.RequireLabels = map[string]string{}
-		}
-		req.RequireLabels[k] = v
+	if c.nicGuardPlacement != nil && c.nicGuardPlacement(ctx, vm) {
+		req.RequireNICGuards = true
 	}
 }
 

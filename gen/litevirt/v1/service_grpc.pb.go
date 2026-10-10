@@ -155,6 +155,7 @@ const (
 	LiteVirt_SetFirewallEnforcement_FullMethodName     = "/litevirt.v1.LiteVirt/SetFirewallEnforcement"
 	LiteVirt_ResetFirewallWouldDrops_FullMethodName    = "/litevirt.v1.LiteVirt/ResetFirewallWouldDrops"
 	LiteVirt_ArmNICFirewall_FullMethodName             = "/litevirt.v1.LiteVirt/ArmNICFirewall"
+	LiteVirt_ResumeHeldVM_FullMethodName               = "/litevirt.v1.LiteVirt/ResumeHeldVM"
 	LiteVirt_SetNetworkGuardConfig_FullMethodName      = "/litevirt.v1.LiteVirt/SetNetworkGuardConfig"
 	LiteVirt_BackupSnapshot_FullMethodName             = "/litevirt.v1.LiteVirt/BackupSnapshot"
 	LiteVirt_RestoreFromBackup_FullMethodName          = "/litevirt.v1.LiteVirt/RestoreFromBackup"
@@ -545,6 +546,8 @@ type LiteVirtClient interface {
 	ResetFirewallWouldDrops(ctx context.Context, in *ResetFirewallWouldDropsRequest, opts ...grpc.CallOption) (*FirewallEnforcementStatus, error)
 	// ArmNICFirewall: see ArmNICFirewallRequest.
 	ArmNICFirewall(ctx context.Context, in *ArmNICFirewallRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// ResumeHeldVM: see ResumeHeldVMRequest.
+	ResumeHeldVM(ctx context.Context, in *ResumeHeldVMRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// SetNetworkGuardConfig: see SetNetworkGuardConfigRequest.
 	SetNetworkGuardConfig(ctx context.Context, in *SetNetworkGuardConfigRequest, opts ...grpc.CallOption) (*NetworkInfo, error)
 	// ── Backup snapshots ──
@@ -2435,6 +2438,16 @@ func (c *liteVirtClient) ArmNICFirewall(ctx context.Context, in *ArmNICFirewallR
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(emptypb.Empty)
 	err := c.cc.Invoke(ctx, LiteVirt_ArmNICFirewall_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) ResumeHeldVM(ctx context.Context, in *ResumeHeldVMRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, LiteVirt_ResumeHeldVM_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -4464,6 +4477,8 @@ type LiteVirtServer interface {
 	ResetFirewallWouldDrops(context.Context, *ResetFirewallWouldDropsRequest) (*FirewallEnforcementStatus, error)
 	// ArmNICFirewall: see ArmNICFirewallRequest.
 	ArmNICFirewall(context.Context, *ArmNICFirewallRequest) (*emptypb.Empty, error)
+	// ResumeHeldVM: see ResumeHeldVMRequest.
+	ResumeHeldVM(context.Context, *ResumeHeldVMRequest) (*emptypb.Empty, error)
 	// SetNetworkGuardConfig: see SetNetworkGuardConfigRequest.
 	SetNetworkGuardConfig(context.Context, *SetNetworkGuardConfigRequest) (*NetworkInfo, error)
 	// ── Backup snapshots ──
@@ -5267,6 +5282,9 @@ func (UnimplementedLiteVirtServer) ResetFirewallWouldDrops(context.Context, *Res
 }
 func (UnimplementedLiteVirtServer) ArmNICFirewall(context.Context, *ArmNICFirewallRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method ArmNICFirewall not implemented")
+}
+func (UnimplementedLiteVirtServer) ResumeHeldVM(context.Context, *ResumeHeldVMRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method ResumeHeldVM not implemented")
 }
 func (UnimplementedLiteVirtServer) SetNetworkGuardConfig(context.Context, *SetNetworkGuardConfigRequest) (*NetworkInfo, error) {
 	return nil, status.Error(codes.Unimplemented, "method SetNetworkGuardConfig not implemented")
@@ -8035,6 +8053,24 @@ func _LiteVirt_ArmNICFirewall_Handler(srv interface{}, ctx context.Context, dec 
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).ArmNICFirewall(ctx, req.(*ArmNICFirewallRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_ResumeHeldVM_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ResumeHeldVMRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ResumeHeldVM(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ResumeHeldVM_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ResumeHeldVM(ctx, req.(*ResumeHeldVMRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -11311,6 +11347,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ArmNICFirewall",
 			Handler:    _LiteVirt_ArmNICFirewall_Handler,
+		},
+		{
+			MethodName: "ResumeHeldVM",
+			Handler:    _LiteVirt_ResumeHeldVM_Handler,
 		},
 		{
 			MethodName: "SetNetworkGuardConfig",

@@ -9,6 +9,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/firewall"
+	"github.com/litevirt/litevirt/internal/grpcapi"
 	"github.com/litevirt/litevirt/internal/nictap"
 )
 
@@ -54,7 +55,18 @@ func wireNodeFirewall(t *testing.T, n *Node) *recordingNft {
 // NIC guards.
 func wireNodeFirewallWith(t *testing.T, n *Node, nft *recordingNft) *recordingNft {
 	t.Helper()
-	if err := corrosion.SetHostLabel(context.Background(), n.DB, n.Name, corrosion.LabelNICGuards, "true"); err != nil {
+	return wireServerFirewall(t, n, n.Server, nft)
+}
+
+// wireServerFirewall is wireNodeFirewallWith onto a given server of n's — a
+// restarted daemon's. The host label carries the build that set it, and
+// counts only while the host reports that build (re-review m2).
+func wireServerFirewall(t *testing.T, n *Node, srv *grpcapi.Server, nft *recordingNft) *recordingNft {
+	t.Helper()
+	if err := corrosion.UpdateHostVersion(context.Background(), n.DB, n.Name, "fleet-build"); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.SetHostLabel(context.Background(), n.DB, n.Name, corrosion.LabelNICGuards, "fleet-build"); err != nil {
 		t.Fatal(err)
 	}
 	arm := firewall.NewArming()
@@ -65,8 +77,8 @@ func wireNodeFirewallWith(t *testing.T, n *Node, nft *recordingNft) *recordingNf
 	})
 	rec := firewall.NewReconciler(loader, firewall.NewApplier(nft), 0)
 	rec.SetArming(arm)
-	n.Server.SetFirewallReconciler(rec)
-	n.Virt.SetStartGuard(n.Server.NICStartGuard(context.Background()))
+	srv.SetFirewallReconciler(rec)
+	n.Virt.SetStartGuard(srv.NICStartGuard(context.Background()))
 	return nft
 }
 

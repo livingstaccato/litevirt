@@ -9,6 +9,7 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -21,6 +22,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/firewall"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/nictap"
 	"github.com/litevirt/litevirt/internal/placement"
@@ -50,33 +52,29 @@ type pendingContainerArmer interface {
 // vm has a NIC guard on that is not in force after the pass (or whether it has
 // one could not be read): a guarded VM is not run unguarded. A pass that
 // failed for another reason with the guards in force does not refuse (re-review
-// m3). For a VM with no guard a failed pass is logged and the VM runs as it
-// would have before guards.
+// m3). A VM with no guard starts as it did before guards (m3): no pass is run
+// or waited for ahead of it, and the next tick renders its NICs.
 func (s *Server) ArmNICsFor(ctx context.Context, vm string) error {
-	return s.armWorkload(ctx, vm, vm)
+	return s.armWorkload(ctx, vm, func() ([]string, error) { return s.guardedMACs(ctx, vm) })
 }
 
-// armWorkload arms the guard records of owner (a VM name or a
-// ContainerGuardOwner) for the workload the table names display.
-func (s *Server) armWorkload(ctx context.Context, owner, display string) error {
+// armWorkload puts the workload the table names display in force here, when
+// guarded (its guarded MACs, read by macs) says it has a guard.
+func (s *Server) armWorkload(ctx context.Context, display string, macs func() ([]string, error)) error {
 	a, ok := s.fwRec().(nicArmer)
-	if !ok || owner == "" {
+	if !ok || display == "" {
 		return nil
 	}
-	err := a.Arm(ctx, display)
-	macs, gerr := s.guardedMACs(ctx, owner)
+	guarded, gerr := macs()
 	switch {
 	case gerr != nil:
 		return fmt.Errorf("whether %s has NIC guards could not be read, so it is not run here: %w", display, gerr)
-	case len(macs) == 0:
-		if err != nil {
-			slog.Warn("firewall: could not put a workload's per-NIC rules in force before it runs; it has no NIC guard and runs as before",
-				"workload", display, "error", err)
-		}
+	case len(guarded) == 0:
 		return nil
 	}
+	err := a.Arm(ctx, display)
 	if f, ok := a.(guardsInForcer); ok {
-		if f.GuardsInForce(display, macs) {
+		if f.GuardsInForce(display, guarded) {
 			return nil
 		}
 		if err == nil {
@@ -93,10 +91,49 @@ func (s *Server) armWorkload(ctx context.Context, owner, display string) error {
 // its NIC firewall in force first: a guarded container whose guards are not
 // is not started (re-review m10). Every container start goes through it.
 func (s *Server) startContainerArmed(ctx context.Context, name string) error {
-	if err := s.armWorkload(ctx, corrosion.ContainerGuardOwner(s.hostName, name), name); err != nil {
+	if err := s.armWorkload(ctx, name, func() ([]string, error) { return s.containerGuardedMACs(ctx, name) }); err != nil {
 		return status.Errorf(codes.FailedPrecondition, "%v", err)
 	}
 	return s.containerRuntime.StartContainer(ctx, name)
+}
+
+// containerGuardedMACs is the MACs of this host's container name whose guard
+// is on, resolved as the loader resolves them (firewall.ContainerGuard): the
+// record this host wrote, or, for a NIC of a container that migrated or was
+// relocated here, the record its earlier host wrote (re-review m1).
+func (s *Server) containerGuardedMACs(ctx context.Context, name string) ([]string, error) {
+	all, err := corrosion.ListNICGuards(ctx, s.db)
+	if err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	var out []string
+	add := func(mac string) {
+		mac = strings.ToLower(mac)
+		if !seen[mac] {
+			seen[mac] = true
+			out = append(out, mac)
+		}
+	}
+	own := corrosion.ContainerGuardOwner(s.hostName, name)
+	for _, r := range all {
+		if r.VMName == own && r.Guarded() {
+			add(r.MAC)
+		}
+	}
+	nics, err := corrosion.GetContainerInterfaces(ctx, s.db, s.hostName, name)
+	if err != nil {
+		return nil, err
+	}
+	// A NIC whose rows are not written yet is a create's, whose records are
+	// this host's own (above).
+	for _, n := range nics {
+		if rec, ok := firewall.ContainerGuard(all, s.hostName, name, n.MAC); ok && rec.Guarded() {
+			add(n.MAC)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
 // vmGuarded reports whether any NIC of vm has its guard on.
@@ -105,30 +142,10 @@ func (s *Server) vmGuarded(ctx context.Context, vm string) (bool, error) {
 	return len(macs) > 0, err
 }
 
-// guardedMACs is the MACs of owner's NICs whose guard is on — only records of
-// the incarnation that exists now: one an earlier VM of the same name left, or
-// one tombstoned with its VM, guards nothing (re-review m1).
+// guardedMACs is the MACs of owner's NICs whose guard is on
+// (corrosion.GuardedMACsOf).
 func (s *Server) guardedMACs(ctx context.Context, owner string) ([]string, error) {
-	all, err := corrosion.ListNICGuards(ctx, s.db)
-	if err != nil {
-		return nil, err
-	}
-	uuid := ""
-	if vm, err := corrosion.GetVM(ctx, s.db, owner); err == nil && vm != nil {
-		uuid = specUUID(vm.Spec)
-	}
-	var out []string
-	for _, r := range all {
-		if r.VMName != owner || !r.Guarded() {
-			continue
-		}
-		if r.VMUUID != "" && uuid != "" && r.VMUUID != uuid {
-			continue
-		}
-		out = append(out, strings.ToLower(r.MAC))
-	}
-	sort.Strings(out)
-	return out, nil
+	return corrosion.GuardedMACsOf(ctx, s.db, owner)
 }
 
 // needsPausedStart reports whether vm has a guarded NIC whose definition names
@@ -202,7 +219,8 @@ func (s *Server) pendingNICs(vm, uuid string, recs []corrosion.InterfaceRecord, 
 }
 
 // ArmNICFirewall is the RPC a migration source calls on the target before
-// handing the guest over. Peer only.
+// handing the guest over, and, for a guest handed over paused, after. Peer
+// only.
 func (s *Server) ArmNICFirewall(ctx context.Context, req *pb.ArmNICFirewallRequest) (*emptypb.Empty, error) {
 	if err := s.requirePeerCert(ctx); err != nil {
 		return nil, err
@@ -210,10 +228,24 @@ func (s *Server) ArmNICFirewall(ctx context.Context, req *pb.ArmNICFirewallReque
 	if req.GetVmName() == "" {
 		return nil, status.Error(codes.InvalidArgument, "vm_name is required")
 	}
-	if err := s.ArmNICsFor(ctx, req.GetVmName()); err != nil {
-		return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
-	}
 	if req.GetResume() {
+		// The guest arrived paused: its guards in force under the taps it got
+		// here, then it runs (resumeHeld). A guest this host does not hold —
+		// a source of an earlier round, or a record lost — is armed and
+		// resumed as before.
+		err := s.resumeHeld(ctx, req.GetVmName())
+		switch {
+		case err == nil:
+			return &emptypb.Empty{}, nil
+		case !errors.Is(err, errNotHeld):
+			return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
+		}
+		if st, serr := s.virt.DomainStateReason(req.GetVmName()); serr == nil && st.State == "running" {
+			return &emptypb.Empty{}, nil // let run already (this host's resumer, or a retry)
+		}
+		if err := s.ArmNICsFor(ctx, req.GetVmName()); err != nil {
+			return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
+		}
 		r, ok := s.virt.(interface{ ResumeDomain(string) error })
 		if !ok {
 			return nil, status.Error(codes.Unimplemented, "this host cannot resume a domain")
@@ -221,6 +253,18 @@ func (s *Server) ArmNICFirewall(ctx context.Context, req *pb.ArmNICFirewallReque
 		if err := r.ResumeDomain(req.GetVmName()); err != nil {
 			return nil, status.Errorf(codes.Internal, "resume %s: %v", req.GetVmName(), err)
 		}
+		return &emptypb.Empty{}, nil
+	}
+	if req.GetPausedHandover() {
+		// Before anything arrives: from here on this host owns letting the
+		// guest run (re-review R3-I2), whatever becomes of the source.
+		if err := s.holdForHandOver(ctx, req.GetVmName(), callerMTLSCommonName(ctx)); err != nil {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"cannot record that %s will be held here for its NIC guards: %v", req.GetVmName(), err)
+		}
+	}
+	if err := s.ArmNICsFor(ctx, req.GetVmName()); err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
 	}
 	return &emptypb.Empty{}, nil
 }
@@ -239,8 +283,10 @@ type armedMigration struct {
 // R2-I3, R2-I4, m8): the target must advertise NIC guards when vm is guarded
 // and the release is not yet everywhere; it puts vm's NIC firewall in force
 // before the guest arrives; and a guarded NIC whose definition names no tap
-// of its own makes the move hand the guest over paused. Every live move —
-// `lv migrate` and `lv host drain` — goes through it.
+// of its own makes the move hand the guest over paused — which the target
+// records, so it lets the guest run itself if the source's resume never
+// comes (R3-I2). Every live move — `lv migrate` and `lv host drain` — goes
+// through it.
 func (s *Server) armMigrationTarget(ctx context.Context, target *corrosion.HostRecord, vm string) (*armedMigration, error) {
 	if err := s.refuseUnguardedTarget(ctx, vm, *target); err != nil {
 		return nil, err
@@ -259,28 +305,70 @@ func (am *armedMigration) apply(p *lv.MigrateParams) {
 	}
 }
 
+// Hand-over timing (re-review R3-I2): each resume attempt is bounded, and the
+// source keeps trying until handOverDeadline; vars so tests can shorten them.
+var (
+	armCallTimeout   = 45 * time.Second // longer than the target's 30 s arm
+	handOverBackoff  = time.Second
+	handOverDeadline = 2 * time.Minute
+)
+
+// SetHandOverTimingForTests shortens the source's retry of a paused
+// hand-over's resume; the returned func restores it.
+func SetHandOverTimingForTests(backoff, deadline time.Duration) func() {
+	ob, od := handOverBackoff, handOverDeadline
+	handOverBackoff, handOverDeadline = backoff, deadline
+	return func() { handOverBackoff, handOverDeadline = ob, od }
+}
+
 // finish lets a guest handed over paused run, its guards in force on the
-// target first. A failure leaves it paused there.
+// target first, retrying until handOverDeadline. An error means the guest is
+// still held paused there; the target lets it run itself once its guards are
+// in force, and says so in firewall.nic.held meanwhile.
 func (am *armedMigration) finish(ctx context.Context) error {
 	if am == nil || !am.paused {
 		return nil
 	}
-	if err := am.call(ctx, true); err != nil {
-		slog.Error("migrate: the guest arrived paused and its target could not put its NIC guards in force; it stays paused there",
-			"vm", am.vm, "target", am.target.Name, "error", err)
-		return err
+	deadline := time.Now().Add(handOverDeadline)
+	wait := handOverBackoff
+	for {
+		err := am.call(ctx, true)
+		if err == nil {
+			return nil
+		}
+		if time.Now().Add(wait).After(deadline) || ctx.Err() != nil {
+			slog.Error("migrate: the guest arrived paused and its target could not put its NIC guards in force; "+
+				"it stays paused there until they are", "vm", am.vm, "target", am.target.Name, "error", err)
+			return fmt.Errorf("held paused on %s until its NIC guards are in force there (`lv firewall nic-guard resume %s`): %w",
+				am.target.Name, am.vm, err)
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(wait):
+		}
+		if wait *= 2; wait > 15*time.Second {
+			wait = 15 * time.Second
+		}
 	}
-	return nil
 }
 
 func (am *armedMigration) call(ctx context.Context, resume bool) error {
 	s := am.s
 	conn, err := s.dialPeerAddr(peerTarget(am.target.Address, am.target.GRPCPort))
 	if err != nil {
+		if resume {
+			return err // finish reports the hand-over
+		}
 		return s.armTargetFailed(ctx, am.vm, am.target.Name, err)
 	}
 	defer conn.Close()
-	_, err = pb.NewLiteVirtClient(conn).ArmNICFirewall(ctx, &pb.ArmNICFirewallRequest{VmName: am.vm, Resume: resume})
+	cctx, cancel := context.WithTimeout(ctx, armCallTimeout)
+	defer cancel()
+	_, err = pb.NewLiteVirtClient(conn).ArmNICFirewall(cctx, &pb.ArmNICFirewallRequest{
+		VmName: am.vm, Resume: resume, PausedHandover: am.paused && !resume})
+	if resume {
+		return err
+	}
 	switch status.Code(err) {
 	case codes.OK:
 		return nil
@@ -304,61 +392,55 @@ func (s *Server) armTargetFailed(ctx context.Context, vm, target string, cause e
 		"the target %s could not put the NIC guards of %s in force before the guest arrives; not migrating: %v", target, vm, cause)
 }
 
-// guardHostLabels is the host label a placement of vm must require: until
-// every host runs a build that knows NIC guards (the release latch), a
-// guarded VM goes only to a host that advertises them (corrosion.
-// LabelNICGuards) — on any other it would run unguarded while `nic-guard ls`
-// says on (re-review m8).
-func (s *Server) guardHostLabels(ctx context.Context, vm string) (map[string]string, error) {
+// guardHostNeeded reports whether a placement of vm must land on a host that
+// enforces NIC guards (corrosion.HostEnforcesNICGuards): until every host runs
+// a build that knows them (the release latch), a guarded VM does — on any
+// other it would run unguarded while `nic-guard ls` says on (re-review m8).
+func (s *Server) guardHostNeeded(ctx context.Context, vm string) (bool, error) {
 	if s.firewallReleaseActive() {
-		return nil, nil
+		return false, nil
 	}
-	g, err := s.vmGuarded(ctx, vm)
-	if err != nil || !g {
-		return nil, err
-	}
-	return map[string]string{corrosion.LabelNICGuards: "true"}, nil
+	return s.vmGuarded(ctx, vm)
 }
 
-// GuardHostLabels is guardHostLabels for a placement outside this package
-// (failover.Coordinator.SetPlacementLabels); an unreadable answer requires
-// the label, which can only narrow the choice.
-func (s *Server) GuardHostLabels(ctx context.Context, vm string) map[string]string {
-	labels, err := s.guardHostLabels(ctx, vm)
-	if err != nil {
-		return map[string]string{corrosion.LabelNICGuards: "true"}
-	}
-	return labels
+// GuardHostNeeded is guardHostNeeded for a placement outside this package
+// (failover.Coordinator.SetNICGuardPlacement); an unreadable answer requires
+// such a host, which can only narrow the choice.
+func (s *Server) GuardHostNeeded(ctx context.Context, vm string) bool {
+	need, err := s.guardHostNeeded(ctx, vm)
+	return need || err != nil
 }
 
-// requireGuardHost adds guardHostLabels to a placement request.
+// requireGuardHost adds guardHostNeeded to a placement request.
 func (s *Server) requireGuardHost(ctx context.Context, req *placement.Request, vm string) {
-	labels, err := s.guardHostLabels(ctx, vm)
-	if err != nil {
-		// Unknown: require it, which can only narrow the choice.
-		labels = map[string]string{corrosion.LabelNICGuards: "true"}
-	}
-	for k, v := range labels {
-		if req.RequireLabels == nil {
-			req.RequireLabels = map[string]string{}
-		}
-		req.RequireLabels[k] = v
+	if s.GuardHostNeeded(ctx, vm) {
+		req.RequireNICGuards = true
 	}
 }
 
-// refuseUnguardedTarget refuses an explicit target that guardHostLabels rules
+// refuseUnguardedTarget refuses an explicit target that guardHostNeeded rules
 // out.
 func (s *Server) refuseUnguardedTarget(ctx context.Context, vm string, target corrosion.HostRecord) error {
-	labels, err := s.guardHostLabels(ctx, vm)
+	need, err := s.guardHostNeeded(ctx, vm)
 	if err != nil {
 		return status.Errorf(codes.Unavailable, "read the NIC guards of %s: %v", vm, err)
 	}
-	for k, v := range labels {
-		if target.Labels[k] != v {
-			return status.Errorf(codes.FailedPrecondition,
-				"%s has NIC guards and host %s does not advertise them (an older build): it would run there unguarded; "+
-					"move it once every host runs this release", vm, target.Name)
-		}
+	if need && !corrosion.HostEnforcesNICGuards(target) {
+		return status.Errorf(codes.FailedPrecondition,
+			"%s has NIC guards and host %s does not enforce them (an older build, or a kernel that refuses the per-NIC table): "+
+				"it would run there unguarded; move it once every host runs this release", vm, target.Name)
 	}
 	return nil
+}
+
+// NICGuardLabelValue is the value a daemon of this build sets its host's
+// corrosion.LabelNICGuards to at start (re-review m2): its own version —
+// which a host rolled back to an older build no longer reports — or "" where
+// the kernel refused the per-NIC table on the first pass, so no guard can be
+// enforced here.
+func NICGuardLabelValue(version string, st firewall.AppliedState) string {
+	if st.NICTableError != "" {
+		return ""
+	}
+	return version
 }

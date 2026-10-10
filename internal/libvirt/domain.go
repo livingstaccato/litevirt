@@ -26,7 +26,7 @@ func (c *Client) DefineDomain(xmlConfig string) error {
 // before the guest's first frame — its NIC guards — is, or the domain is not
 // started.
 func (c *Client) StartDomain(name string) error {
-	g, err := c.guard()
+	g, err := c.guard(name)
 	if err != nil {
 		return fmt.Errorf("start domain %s: %w", name, err)
 	}

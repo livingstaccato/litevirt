@@ -49,6 +49,7 @@ type Client struct {
 	guardSet   bool
 	guardReady chan struct{} // RequireStartGuard; closed once a guard is set
 	guardWait  time.Duration
+	guardNeeds func(name string) bool // RequireStartGuard's scope; nil = every start
 	readyOnce  sync.Once
 }
 

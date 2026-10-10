@@ -99,7 +99,7 @@ func TestFleet_NICGuard_InForceAfterAReboot(t *testing.T) {
 	// The reboot: an empty table, nothing wired, and a start that does not
 	// wait for the daemon.
 	n.Virt.SetStartGuard(lv.StartGuard{})
-	n.Virt.RequireStartGuard(10 * time.Second)
+	n.Virt.RequireStartGuard(10*time.Second, nil)
 	fresh := &recordingNft{}
 	g := watchGuardAtRunning(t, n, fresh)
 	started := make(chan error, 1)

@@ -98,7 +98,28 @@ prefix).`,
 			})
 		},
 	}
-	cmd.AddCommand(set, ls)
+	resume := &cobra.Command{
+		Use:   "resume <vm>",
+		Short: "Let a VM held paused for its NIC guards run, its guards in force first",
+		Long: `A guarded VM whose domain an older release defined is moved paused, and its
+target lets it run once its NIC guards are in force there. Until they are, the
+target holds it paused and raises the critical condition firewall.nic.held.
+The target retries on its own; this asks it now. It puts the guards in force
+first and refuses while they cannot be (the kernel refuses the per-NIC table,
+say), so the guest never runs unguarded. The alternative is lv stop and
+lv start, which reboots the guest.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				if _, err := c.ResumeHeldVM(ctx, &pb.ResumeHeldVMRequest{VmName: args[0]}); err != nil {
+					return err
+				}
+				fmt.Printf("%s: guards in force, resumed\n", args[0])
+				return nil
+			})
+		},
+	}
+	cmd.AddCommand(set, ls, resume)
 	return cmd
 }
 

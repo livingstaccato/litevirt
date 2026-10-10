@@ -182,11 +182,18 @@ func New(cfg *Config) (*Daemon, error) {
 	if err != nil {
 		return nil, fmt.Errorf("libvirt: %w", err)
 	}
-	// No domain starts before the per-NIC firewall is wired (re-review
+	// No guarded VM starts before the per-NIC firewall is wired (re-review
 	// R2-I2): after a host boots its nft tables are empty, and an onboot,
-	// self-heal or restart-policy start would run its guest unguarded. Starts
-	// wait for SetStartGuard (Run), and refuse if it never comes.
-	virt.RequireStartGuard(5 * time.Minute)
+	// self-heal or restart-policy start would run its guest unguarded. Such a
+	// start waits for SetStartGuard (Run), and refuses if it never comes. A
+	// VM with no NIC guard does not wait (m3): it starts as it did before
+	// guards. One whose guards cannot be read waits.
+	virt.RequireStartGuard(5*time.Minute, func(name string) bool {
+		gctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		macs, err := corrosion.GuardedMACsOf(gctx, db, name)
+		return err != nil || len(macs) > 0
+	})
 
 	// Image store
 	store := image.NewStore(cfg.DataDir)
@@ -833,7 +840,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc := grpcapi.NewServer(d.cfg.HostName, d.cfg.DataDir, d.cfg.PKIDir, d.db, d.virt, d.images)
 	// A guarded VM recovers only onto a host that enforces NIC guards until
 	// every host does (re-review m8).
-	fc.SetPlacementLabels(svc.GuardHostLabels)
+	fc.SetNICGuardPlacement(svc.GuardHostNeeded)
 	d.svc = svc
 	svc.SetSupersededDiskRetentionDays(d.cfg.SupersededDiskRetentionDays)
 	svc.SetContainerIDMapRange(d.cfg.Containers.IDMapBase, d.cfg.Containers.IDMapRanges)
@@ -1207,17 +1214,27 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// only ever installs the OLD binary's units.
 	grpcapi.EnsureSystemdUnits()
 	// One pass now, before any runtime start: the tables a host boots with
-	// are empty (re-review R2-I2).
-	if err := d.fwReconciler.Reconcile(ctx); err != nil {
+	// are empty (re-review R2-I2). Bounded (m3): a hung nft must not hold the
+	// whole daemon start; a guarded start arms its own pass.
+	if err := bootFirewallPass(ctx, d.fwReconciler, bootFirewallPassBudget); err != nil {
 		slog.Warn("firewall: the first pass failed; starts arm their own", "error", err)
 	}
 	d.fwReconciler.Start(ctx)
-	// This host enforces NIC guards: until every host does, a guarded VM is
-	// placed only on such a host (re-review m8).
-	if err := corrosion.SetHostLabel(ctx, d.db, d.cfg.HostName, corrosion.LabelNICGuards, "true"); err != nil {
+	// Whether this host enforces NIC guards, derived from this build and
+	// this host at every start (re-review m8, m2): the label carries this
+	// build's version, so a host rolled back to an older build — which
+	// reports its own version and knows nothing of the label — stops counting;
+	// and it is cleared where the kernel refuses the per-NIC table. Until
+	// every host enforces them, a guarded VM is placed only on such a host.
+	if err := corrosion.SetHostLabel(ctx, d.db, d.cfg.HostName, corrosion.LabelNICGuards,
+		grpcapi.NICGuardLabelValue(d.cfg.Version, d.fwReconciler.AppliedState())); err != nil {
 		slog.Warn("could not advertise NIC guards in the host labels", "error", err)
 	}
 	go svc.RecordExistingTrunkVLANsLoop(ctx, 0)
+	// A guest handed over paused for its NIC guards runs once they are in
+	// force here, even when the source's resume never arrives (re-review
+	// R3-I2).
+	go svc.RunHeldGuestResumer(ctx, 0)
 
 	go vmChecker.Start(ctx)
 	go reconciler.Start(ctx)
@@ -3126,4 +3143,16 @@ func (d *Daemon) wireLeaseTermLedgerGate() {
 	d.db.SetLeaseTermLedgerGate(func() bool {
 		return d.checker.DurablyLatched(capabilities.LeaseTermLedgerV1)
 	})
+}
+
+// bootFirewallPassBudget bounds the daemon's first firewall pass (re-review m3).
+const bootFirewallPassBudget = 60 * time.Second
+
+// bootFirewallPass runs the first firewall pass at boot under budget: it runs
+// before every start source and before the gRPC server, so a pass that hangs
+// (an nft that never returns) must not hold the daemon's start.
+func bootFirewallPass(ctx context.Context, r interface{ Reconcile(context.Context) error }, budget time.Duration) error {
+	bctx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	return r.Reconcile(bctx)
 }

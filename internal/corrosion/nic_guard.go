@@ -624,6 +624,62 @@ func VMSpecOfIncarnation(ctx context.Context, c *Client, name, createdAt string)
 	return rows[0].String("spec"), true, nil
 }
 
+// GuardedMACsOf is the MACs (lower-case, sorted) of owner's NICs whose guard
+// is on — only records of the incarnation that exists now: one an earlier VM
+// of the same name left, or one tombstoned with its VM, guards nothing
+// (re-review m1, round 3).
+func GuardedMACsOf(ctx context.Context, c *Client, owner string) ([]string, error) {
+	all, err := ListNICGuards(ctx, c)
+	if err != nil {
+		return nil, err
+	}
+	uuid := ""
+	if vm, err := GetVM(ctx, c, owner); err == nil && vm != nil {
+		var sp struct {
+			UUID string `json:"uuid"`
+		}
+		_ = json.Unmarshal([]byte(vm.Spec), &sp)
+		uuid = sp.UUID
+	}
+	var out []string
+	for _, r := range all {
+		if r.VMName != owner || !r.Guarded() {
+			continue
+		}
+		if r.VMUUID != "" && uuid != "" && r.VMUUID != uuid {
+			continue
+		}
+		out = append(out, strings.ToLower(r.MAC))
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// TrunkVLANsRecordedKey is the cluster_policies key under which the upgrade
+// recording of trunk VLANs keeps what it has recorded: a JSON object of
+// network name → the VLANs it recorded for that network's trunks that predate
+// guards (re-review R2-I1, R3-I1). Its presence says the recording has run at
+// least once.
+const TrunkVLANsRecordedKey = "firewall_trunk_vlans_recorded"
+
+// TrunkVLANsRecorded reads what the upgrade recording has recorded. ok is
+// false until its first pass. A value that does not parse (an earlier build of
+// this release wrote "done") counts as a pass that recorded nothing.
+func TrunkVLANsRecorded(ctx context.Context, c *Client) (map[string][]int, bool, error) {
+	rows, err := c.Query(ctx, `SELECT value FROM cluster_policies WHERE key = ? AND deleted_at IS NULL`, TrunkVLANsRecordedKey)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(rows) == 0 {
+		return nil, false, nil
+	}
+	out := map[string][]int{}
+	if json.Unmarshal([]byte(rows[0].String("value")), &out) != nil {
+		out = map[string][]int{}
+	}
+	return out, true, nil
+}
+
 // SetClusterPolicy writes one cluster_policies key (behind the gate), through
 // the table's one upsert.
 func SetClusterPolicy(ctx context.Context, c *Client, key, value, setBy string) error {

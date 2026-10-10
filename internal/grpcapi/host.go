@@ -685,7 +685,6 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 	armed.apply(&params)
 	lerr := s.virt.MigrateToTarget(vm.Name, dconnuri, params)
 	if lerr == nil {
-		defer func() { _ = armed.finish(context.WithoutCancel(ctx)) }()
 		// Phase 4: drain move is an ownership transition (fresh-read CAS + increment).
 		//runningcheck:allow ownership handoff — this commit names the TARGET host while
 		// running on the source, whose domain MigrateToTarget has already undefined
@@ -696,6 +695,17 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 			s.noteStateWriteFail(corrosion.OpVMHost, err)
 			progress.Status = "error"
 			progress.Error = "migrated but recording new owner failed: " + err.Error()
+			if herr := armed.finish(context.WithoutCancel(ctx)); herr != nil {
+				progress.Error += "; " + herr.Error()
+			}
+			return progress
+		}
+		// A guest handed over paused runs once the target has its guards in
+		// force; until then the move is not clean (re-review R3-I2).
+		if herr := armed.finish(context.WithoutCancel(ctx)); herr != nil {
+			s.recordVMEvent(context.WithoutCancel(ctx), vm.Name, "vm.held", "error", herr.Error())
+			progress.Status = "error"
+			progress.Error = "migrated; " + herr.Error()
 			return progress
 		}
 		progress.Status = "done"

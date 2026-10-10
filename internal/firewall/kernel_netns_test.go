@@ -913,6 +913,24 @@ func TestKernelChild_VLANToNICAndTrunk(t *testing.T) {
 			t.Errorf("%s: the allowed VLAN 100 did not leave through the uplink", mode)
 		}
 	}
+	// A trunk none of whose VLANs its network allows (re-review R3-I1): a
+	// trunk that predates guards — no record, so no guard — whose VLANs are
+	// not on its network's recorded list. Nothing tagged leaves, in either
+	// mode: in observe mode the plain VLAN rule only counts.
+	deniedTrunk := Plan{NICs: []NICBinding{{NICDev: "lvvh0", VMName: "legacy", Bridge: "lvvb0", TrunkDenied: true},
+		{NICDev: "lvvh1", VMName: "b", Bridge: "lvvb0"}}}
+	for _, mode := range []string{NICModeEnforce, NICModeObserve} {
+		deniedTrunk.NICMode = mode
+		apply(deniedTrunk)
+		for _, f := range [][]byte{hop, allowed} {
+			if l.deliveredFrom(t, "lvvg0", "lvvg2", f) {
+				t.Errorf("%s: a trunk with no allowed VLAN sent a tagged frame through the uplink", mode)
+			}
+		}
+		if !l.deliveredFrom(t, "lvvg0", "lvvg2", ether(ga, 0x0800, udp(5000))) {
+			t.Errorf("%s: a trunk with no allowed VLAN lost its untagged (native VLAN) traffic", mode)
+		}
+	}
 	if t.Failed() {
 		t.Logf("ruleset:\n%s", sh(t, "nft", "list", "table", "bridge", NICTableName))
 	}

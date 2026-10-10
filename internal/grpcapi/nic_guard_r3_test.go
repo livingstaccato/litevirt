@@ -27,8 +27,9 @@ func networkDef(t *testing.T, s *Server, name string) compose.NetworkDef {
 
 // TestRecordExistingTrunkVLANs (re-review R2-I1): the trunks a cluster had
 // when it upgraded keep their VLANs: each one's VLANs are recorded into its
-// network's allowed list, once. A trunk created afterwards is not added: its
-// VLANs need an operator.
+// network's allowed list. A trunk this release created (it has a guard
+// record) is not added: its VLANs need an operator. Recording again until the
+// release latches is TestRecordExistingTrunkVLANs_UntilTheRelease.
 func TestRecordExistingTrunkVLANs(t *testing.T) {
 	ctx := context.Background()
 	s := guardServer(t, true)
@@ -52,18 +53,18 @@ func TestRecordExistingTrunkVLANs(t *testing.T) {
 	}
 	trunkVM("old-router", "52:54:00:00:00:01", "100,101", false)
 	trunkVM("new-tenant", "52:54:00:00:00:02", "300", true)
-	if done, err := s.recordExistingTrunkVLANs(ctx); err != nil || !done {
-		t.Fatalf("recordExistingTrunkVLANs = %v, %v", done, err)
+	if _, err := s.recordExistingTrunkVLANs(ctx); err != nil {
+		t.Fatalf("recordExistingTrunkVLANs: %v", err)
 	}
 	if got := networkDef(t, s, "core").AllowedVLANs; !reflect.DeepEqual(got, []int{50, 100, 101}) {
 		t.Errorf("allowed VLANs = %v, want the existing trunk's added: [50 100 101]", got)
 	}
-	trunkVM("later", "52:54:00:00:00:03", "200,201", false)
+	trunkVM("later", "52:54:00:00:00:03", "200,201", true)
 	if _, err := s.recordExistingTrunkVLANs(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if got := networkDef(t, s, "core").AllowedVLANs; !reflect.DeepEqual(got, []int{50, 100, 101}) {
-		t.Errorf("allowed VLANs = %v after a second pass; the recording happens once", got)
+		t.Errorf("allowed VLANs = %v after a second pass; a trunk created on this release is not recorded", got)
 	}
 }
 
@@ -216,18 +217,19 @@ func TestGuardHostLabel(t *testing.T) {
 		Mode: corrosion.NICGuardOn, VMUUID: "u-1"}, "t"); err != nil {
 		t.Fatal(err)
 	}
-	labels, err := s.guardHostLabels(ctx, "web")
-	if err != nil || labels[corrosion.LabelNICGuards] != "true" {
-		t.Errorf("a guarded VM before the release latch: labels %v, %v", labels, err)
+	need, err := s.guardHostNeeded(ctx, "web")
+	if err != nil || !need {
+		t.Errorf("a guarded VM before the release latch: need %v, %v", need, err)
 	}
 	if err := s.refuseUnguardedTarget(ctx, "web", corrosion.HostRecord{Name: "old", Labels: map[string]string{}}); status.Code(err) != codes.FailedPrecondition {
 		t.Errorf("a guarded VM to a host that does not advertise guards: %v, want FailedPrecondition", err)
 	}
-	if err := s.refuseUnguardedTarget(ctx, "web", corrosion.HostRecord{Name: "new", Labels: map[string]string{corrosion.LabelNICGuards: "true"}}); err != nil {
+	if err := s.refuseUnguardedTarget(ctx, "web", corrosion.HostRecord{Name: "new", Version: "v2",
+		Labels: map[string]string{corrosion.LabelNICGuards: "v2"}}); err != nil {
 		t.Errorf("to a host that does: %v", err)
 	}
-	if labels, _ := s.guardHostLabels(ctx, "plain"); len(labels) != 0 {
-		t.Errorf("an unguarded VM needs no such host: %v", labels)
+	if need, _ := s.guardHostNeeded(ctx, "plain"); need {
+		t.Error("an unguarded VM needs no such host")
 	}
 }
 

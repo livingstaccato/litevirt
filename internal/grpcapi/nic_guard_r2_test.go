@@ -232,7 +232,8 @@ func TestArmNICsFor_FailsClosedForGuardedVMs(t *testing.T) {
 		t.Errorf("a VM with no guard was refused: %v", err)
 	}
 	a.err = nil
-	if err := s.ArmNICsFor(ctx, "guarded"); err != nil || len(a.armed) != 3 {
+	// Two passes: the unguarded VM ran none (re-review m3).
+	if err := s.ArmNICsFor(ctx, "guarded"); err != nil || len(a.armed) != 2 {
 		t.Errorf("after the pass succeeds: %v (armed %v)", err, a.armed)
 	}
 }

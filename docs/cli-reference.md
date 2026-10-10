@@ -1068,6 +1068,7 @@ lv firewall nic-guard set <vm> --network <net>|--mac <mac> --mode on|off \
     [--allow <ip-or-cidr>] [--allow-dhcp-server] [--allow-router-advertisement] [--allow-vlan-tags]
 lv firewall nic-guard set --container <ct> --host <host> --network <net> --mode on|off
 lv firewall nic-guard ls [<vm>]   # VM NICs, then container NICs
+lv firewall nic-guard resume <vm> # let a VM held paused for its guards run, guards in force first
 
 # Per-NIC enforcement: an upgraded cluster observes (counts would-drops) until enforced.
 lv firewall enforce status          # mode per host + would-drop totals per workload, NIC and rule, since <time>

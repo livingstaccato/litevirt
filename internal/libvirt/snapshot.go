@@ -207,7 +207,7 @@ func (c *Client) ListSnapshots(domainName string) ([]string, error) {
 // the snapshot's sidecar right before the domain is redefined, so reverted disks
 // and firmware are a consistent set (G1).
 func (c *Client) RevertToSnapshot(domainName, snapshotName string, restorePreDefine func() error) error {
-	g, err := c.guard()
+	g, err := c.guard(domainName)
 	if err != nil {
 		return fmt.Errorf("revert %s: %w", domainName, err)
 	}
@@ -678,7 +678,7 @@ func (c *Client) CreateLiveSnapshot(domainName, snapshotName, vmstatePath string
 // at the files judged on this host): it is passed to the restore as its
 // replacement XML and defined persistently. An error refuses the revert.
 func (c *Client) RevertToLiveSnapshot(domainName, snapshotName, vmstatePath string, restorePreDefine func() error, rewriteSaved func(savedXML string) (string, error)) error {
-	g, err := c.guard()
+	g, err := c.guard(domainName)
 	if err != nil {
 		return fmt.Errorf("revert %s: %w", domainName, err)
 	}
@@ -1336,7 +1336,7 @@ func resetOverlay(overlay, base string) error {
 // attempts we destroy any partial domain and wait for the lease to release —
 // sanlock/lockd leases can take longer than a single second.
 func (c *Client) restoreWithRetry(domainName, vmstatePath, dxml string) error {
-	g, err := c.guard()
+	g, err := c.guard(domainName)
 	if err != nil {
 		return fmt.Errorf("restore %s: %w", domainName, err)
 	}
@@ -1379,13 +1379,18 @@ func restoreWithRetry(v snapshotAPI, g StartGuard, domainName, vmstatePath, dxml
 	if lerr != nil {
 		return fmt.Errorf("lookup restored domain: %w", lerr)
 	}
-	if _, gerr := g.before(domainName); gerr != nil {
+	pause, gerr := g.before(domainName)
+	if gerr != nil {
 		_ = v.DomainDestroy(dom)
 		return fmt.Errorf("restore %s: %w", domainName, gerr)
 	}
-	if gerr := g.afterPaused(domainName); gerr != nil {
-		_ = v.DomainDestroy(dom)
-		return fmt.Errorf("restore %s: %w", domainName, gerr)
+	// Before armed it already when it did not ask for the paused step (its
+	// NICs name their taps); one pass is enough (re-review m3).
+	if pause {
+		if gerr := g.afterPaused(domainName); gerr != nil {
+			_ = v.DomainDestroy(dom)
+			return fmt.Errorf("restore %s: %w", domainName, gerr)
+		}
 	}
 	for i := 0; i < 6; i++ {
 		if err = v.DomainResume(dom); err == nil {

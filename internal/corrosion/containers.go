@@ -46,8 +46,11 @@ const (
 	// (swtpm) and Secure Boot (secboot/MS OVMF) support (G1). Independent because
 	// their host dependencies differ. Placement requires whichever a VM spec needs.
 	LabelTPMCapable = "litevirt.tpm"
-	// LabelNICGuards says the host's build enforces NIC guards (set "true"
-	// by every daemon of that build at start); until every host runs one, a
+	// LabelNICGuards says the host's build enforces NIC guards: every daemon
+	// of a build that does sets it at start to its own version, and clears it
+	// where the kernel refuses the per-NIC table. It counts only while the
+	// host reports that version (HostEnforcesNICGuards), so a host rolled back
+	// to an older build stops counting. Until every host enforces guards, a
 	// guarded VM is placed only on such a host.
 	LabelNICGuards         = "litevirt.nic-guards"
 	LabelSecureBootCapable = "litevirt.secureboot"
@@ -1377,6 +1380,16 @@ func decodeContainerLabels(raw string) map[string]string {
 		return nil
 	}
 	return out
+}
+
+// HostEnforcesNICGuards reports whether h enforces NIC guards: its daemon set
+// LabelNICGuards to the version it reports, and h still reports that version
+// (re-review m2). A host rolled back to a build that knows nothing of guards
+// reports its own version at start and leaves the label as it was; that
+// stale label no longer counts.
+func HostEnforcesNICGuards(h HostRecord) bool {
+	v := h.Labels[LabelNICGuards]
+	return v != "" && v == h.Version
 }
 
 // HostRunsContainers reports whether a container may be placed on h: its

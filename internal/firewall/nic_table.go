@@ -287,6 +287,11 @@ func renderTaggedToNIC(b *strings.Builder, p Plan, nics []NICBinding) {
 // independent of it). In observe mode each is a counter: everything a trunk
 // could send before keeps working until enforcement is switched on.
 func renderTrunkConfine(b *strings.Builder, p Plan, n NICBinding, word string, vids bool) {
+	if n.TrunkDenied && len(n.TrunkVIDs) == 0 {
+		// No VLAN of this trunk is allowed: drop its tags in either mode.
+		fmt.Fprintf(b, "        %s %s ether type { 8021q, 8021ad } drop\n", word, n.NICDev)
+		return
+	}
 	if len(n.TrunkVIDs) == 0 {
 		return
 	}

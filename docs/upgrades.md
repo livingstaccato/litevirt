@@ -809,11 +809,17 @@ exist before the roll are not, and stay unguarded through their VMs' rebuilds
 and rolling updates (docs/firewall.md, "NIC guards"). NICs this release defines
 name their taps after their MACs (`lvt<mac>`), so their guards are in force
 before their domains run; a guarded NIC an older release defined is started,
-or handed over by a live move, paused until its guard is in force. A trunk
-NIC's VLANs in use at the upgrade are recorded into its network's
-`allowed-vlans` once, so no trunk in use loses a VLAN; a new trunk's VLANs need
-`lv network set <net> --allowed-vlans`. Until every host runs this release, a
-guarded VM is placed and moved only onto hosts that advertise NIC guards.
+or handed over by a live move, paused until its guard is in force — held
+paused on its target, with the critical condition `firewall.nic.held`, until
+the target can put it in force (`lv firewall nic-guard resume <vm>`;
+docs/firewall.md, "Held paused"). A trunk NIC's VLANs in use at the upgrade
+are recorded into its network's `allowed-vlans`, every 30 seconds until every
+host runs this release (so a trunk an older host creates during the roll keeps
+its VLANs too), each VLAN once; a new trunk's VLANs, and VLANs a re-create
+adds to a trunk, need `lv network set <net> --allowed-vlans`. Until every
+host runs this release, a guarded VM is placed and moved only onto hosts that
+enforce NIC guards: hosts whose daemon set the `litevirt.nic-guards` label to
+the version they still report.
 Guards and the mode are recorded in `cluster_policies`, so a NIC created before
 `failover_scope_v1` has latched is created unguarded, and the mode stays
 observe until then.
@@ -835,9 +841,11 @@ host whose unit lacks the step, installs it as the drop-in
 systemd), leaving the main unit and any local edits to it as they are: a host
 upgraded from an older release has the step from its first start on this one. Only a host not run under the systemd unit at
 `/etc/systemd/system/litevirt.service` lacks it; delete the table by hand there
-(`nft delete table bridge litevirt-nic`). A binary rolled back below the
-latched `firewall_ipv6_v1` enters WAL quarantine, as below every latched
-token.
+(`nft delete table bridge litevirt-nic`). A rolled-back host keeps its
+`litevirt.nic-guards` label, which its older binary does not know, but reports
+its older version at start, so the label no longer counts: no guarded VM is
+placed or recovered onto it. A binary rolled back below the latched
+`firewall_ipv6_v1` enters WAL quarantine, as below every latched token.
 
 ### Replica matching while the roll is in progress
 

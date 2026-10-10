@@ -554,6 +554,13 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 		if err != nil {
 			return plan, err
 		}
+		// The trunk VLANs recorded at upgrade (re-review R3-I1): once the
+		// recording has run, a trunk carries only what its network allows,
+		// record or not.
+		recordedVLANs, trunksRecorded, err := corrosion.TrunkVLANsRecorded(ctx, db)
+		if err != nil {
+			return plan, err
+		}
 		// applyRecord sets what a NIC's guard record decides beyond the guard
 		// itself: a trunk allowance and a DHCP-server allowance hold whatever
 		// the record's mode.
@@ -613,11 +620,25 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 			rec, recorded := recordOf(ifc)
 			if recorded {
 				applyRecord(&nb, rec, ifc.MAC, ifc.IP, ifc.NetworkName)
-				// A trunk this build created carries only the VLANs its network
-				// allows; one that predates guards (no record) keeps its own
-				// (re-review R2-I1).
+			}
+			// A trunk carries only the VLANs its network allows (re-review
+			// R2-I1). Lacking a guard record grants nothing (R3-I1): the
+			// trunks that predate guards had their VLANs recorded into their
+			// networks' lists at upgrade, and that list is what they carry.
+			// Only until that recording has first run does a trunk with no
+			// record keep its own VLANs, so nothing in use breaks while the
+			// lists are written.
+			if len(ifc.TrunkVIDs) > 0 && (recorded || trunksRecorded) {
+				info, known := nets[ifc.NetworkName]
+				allowed := info.AllowedVLANs
+				if !known {
+					// A flat bridge (no network row) has no list an operator
+					// can set: it carries what was recorded for it.
+					allowed = recordedVLANs[ifc.NetworkName]
+				}
 				var blocked []int
-				nb.TrunkVIDs, blocked = allowedTrunkVIDs(ifc.TrunkVIDs, nets[ifc.NetworkName].AllowedVLANs)
+				nb.TrunkVIDs, blocked = allowedTrunkVIDs(ifc.TrunkVIDs, allowed)
+				nb.TrunkDenied = len(nb.TrunkVIDs) == 0
 				if len(blocked) > 0 {
 					plan.BlockedTrunks = append(plan.BlockedTrunks, BlockedTrunk{Workload: ifc.VMName, Network: ifc.NetworkName, VIDs: blocked})
 				}

@@ -114,26 +114,39 @@ func sortedVIDs(in []int) []int {
 	return out
 }
 
-// trunkVLANsRecordedKey marks, in cluster_policies, that the trunks the
-// cluster had at upgrade are recorded into their networks' allowed lists.
-const trunkVLANsRecordedKey = "firewall_trunk_vlans_recorded"
-
-// recordExistingTrunkVLANs records, once per cluster, the VLANs of every trunk
-// NIC that predates guards (it has no guard record) into its network's
-// allowed list, so a trunk in use at upgrade keeps its VLANs (re-review
-// R2-I1). Later trunks are not added: a tenant's new trunk VLAN needs an
-// operator (`lv network set <net> --allowed-vlans`). done is false while the
-// cluster_policies gate is closed.
+// recordExistingTrunkVLANs records the VLANs of every trunk NIC that predates
+// guards (it has no guard record) into its network's allowed list, so a trunk
+// in use at upgrade keeps its VLANs (re-review R2-I1). The loader grants a
+// trunk nothing else: lacking a record is not an allowance (R3-I1).
+//
+// It runs on every pass until the release has latched — an older build may
+// create a trunk during the rollout, and that one keeps its VLANs too — and
+// reports done after a pass made with the release latched: from then on no
+// trunk without a record appears but a re-create's, which carries at most the
+// VLANs its incarnation had. What it has recorded is kept under
+// corrosion.TrunkVLANsRecordedKey, and a VLAN recorded once is never recorded
+// again, so an operator who takes it off the list (`lv network set
+// --allowed-vlans`) keeps it off. A flat bridge (no network row) has no list;
+// its recorded VLANs are what the loader allows it.
+//
+// A replica that has not caught up records nothing (m4): it would upsert its
+// stale copy of a network row over a newer one, and miss trunks it has not
+// seen.
 func (s *Server) recordExistingTrunkVLANs(ctx context.Context) (done bool, err error) {
 	if !s.db.MayWriteClusterPolicy() {
 		return false, nil
 	}
-	rows, err := s.db.Query(ctx, `SELECT value FROM cluster_policies WHERE key = ? AND deleted_at IS NULL`, trunkVLANsRecordedKey)
+	if ok, why := corrosion.ReplicaTrusted(ctx, s.db, s.hostName, s.db.ReplicaCaughtUp); !ok {
+		slog.Debug("firewall: not recording trunk VLANs yet: the replica has not caught up", "why", why)
+		return false, nil
+	}
+	final := s.firewallReleaseActive()
+	recorded, have, err := corrosion.TrunkVLANsRecorded(ctx, s.db)
 	if err != nil {
 		return false, err
 	}
-	if len(rows) > 0 {
-		return true, nil
+	if recorded == nil {
+		recorded = map[string][]int{}
 	}
 	guards, err := corrosion.ListNICGuardsWithDeleted(ctx, s.db)
 	if err != nil {
@@ -172,32 +185,51 @@ func (s *Server) recordExistingTrunkVLANs(ctx context.Context) (done bool, err e
 		nets = append(nets, n)
 	}
 	sort.Strings(nets)
+	changed := false
 	for _, name := range nets {
+		seen := map[int]bool{}
+		for _, v := range recorded[name] {
+			seen[v] = true
+		}
+		var fresh []int
+		for _, v := range sortedVIDs(add[name]) {
+			if !seen[v] {
+				fresh = append(fresh, v)
+			}
+		}
+		if len(fresh) == 0 {
+			continue
+		}
 		nr, err := corrosion.GetNetwork(ctx, s.db, name)
 		if err != nil {
 			return false, err
 		}
-		if nr == nil {
-			continue
+		if nr != nil {
+			var def compose.NetworkDef
+			_ = json.Unmarshal([]byte(nr.Config), &def)
+			def.AllowedVLANs = sortedVIDs(append(def.AllowedVLANs, fresh...))
+			b, _ := json.Marshal(def)
+			nr.Config = string(b)
+			if err := corrosion.UpsertNetwork(ctx, s.db, *nr); err != nil {
+				return false, err
+			}
+			s.auditAs(ctx, "litevirt", "network.update", name,
+				"allowed-vlans += "+vidList(fresh)+" (trunks that predate NIC guards)", "ok")
 		}
-		var def compose.NetworkDef
-		_ = json.Unmarshal([]byte(nr.Config), &def)
-		def.AllowedVLANs = sortedVIDs(append(def.AllowedVLANs, add[name]...))
-		b, _ := json.Marshal(def)
-		nr.Config = string(b)
-		if err := corrosion.UpsertNetwork(ctx, s.db, *nr); err != nil {
+		recorded[name] = sortedVIDs(append(recorded[name], fresh...))
+		changed = true
+	}
+	if changed || !have {
+		b, _ := json.Marshal(recorded)
+		if err := corrosion.SetClusterPolicy(ctx, s.db, corrosion.TrunkVLANsRecordedKey, string(b), "litevirt (upgrade)"); err != nil {
 			return false, err
 		}
-		s.auditAs(ctx, "litevirt", "network.update", name, "allowed-vlans += the trunks in use at upgrade", "ok")
 	}
-	if err := corrosion.SetClusterPolicy(ctx, s.db, trunkVLANsRecordedKey, "done", "litevirt (upgrade)"); err != nil {
-		return false, err
-	}
-	return true, nil
+	return final, nil
 }
 
-// RecordExistingTrunkVLANsLoop runs recordExistingTrunkVLANs until it has
-// done its once-per-cluster job.
+// RecordExistingTrunkVLANsLoop runs recordExistingTrunkVLANs until a pass
+// made with the release latched.
 func (s *Server) RecordExistingTrunkVLANsLoop(ctx context.Context, every time.Duration) {
 	if every <= 0 {
 		every = 30 * time.Second

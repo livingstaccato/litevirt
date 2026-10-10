@@ -109,8 +109,9 @@ const (
 type guardDecision struct {
 	// none: no record. The NIC is the same NIC of a re-created incarnation
 	// that had no record (it predates guards, or was created before records
-	// could be written), and the request says nothing about its guard: it
-	// stays unguarded, as it ran (re-review I-11).
+	// could be written), the request says nothing about its guard, and it
+	// carries no trunk VLAN that incarnation did not: it stays unguarded, as
+	// it ran (re-review I-11, R3-I1).
 	none bool
 	// carry: the record of the same NIC of the incarnation a re-create
 	// replaces, carried to the new NIC unless the request says otherwise.
@@ -158,6 +159,9 @@ func (d guardDecision) record(vm, uuid string, ordinal int, mac string, att *pb.
 type replacedNICs struct {
 	recs     []corrosion.NICGuardRecord // its records (VMUUID = its uuid)
 	networks map[string]bool            // the networks its spec put a NIC on
+	// trunks are, per network, the VLANs its NICs there carried on the
+	// `trunk:` feature (two or more VLANs).
+	trunks map[string]map[int32]bool
 	// uuidless: the incarnation's spec carries no uuid (an import without
 	// firmware state), so its records cannot be told from an earlier
 	// incarnation's under the same name. Only a guard no weaker than the
@@ -180,7 +184,8 @@ func (s *Server) replacedIncarnation(ctx context.Context, vmName string) (replac
 	var sp struct {
 		UUID    string `json:"uuid"`
 		Network []struct {
-			Name string `json:"name"`
+			Name  string  `json:"name"`
+			Trunk []int32 `json:"trunk"`
 		} `json:"network"`
 	}
 	if !found || json.Unmarshal([]byte(spec), &sp) != nil {
@@ -193,9 +198,17 @@ func (s *Server) replacedIncarnation(ctx context.Context, vmName string) (replac
 	if err != nil {
 		return replacedNICs{}, false, status.Errorf(codes.Internal, "read NIC guards: %v", err)
 	}
-	out := replacedNICs{networks: map[string]bool{}, uuidless: sp.UUID == ""}
+	out := replacedNICs{networks: map[string]bool{}, trunks: map[string]map[int32]bool{}, uuidless: sp.UUID == ""}
 	for _, n := range sp.Network {
 		out.networks[n.Name] = true
+		if len(n.Trunk) > 1 {
+			if out.trunks[n.Name] == nil {
+				out.trunks[n.Name] = map[int32]bool{}
+			}
+			for _, v := range n.Trunk {
+				out.trunks[n.Name][v] = true
+			}
+		}
 	}
 	for _, rec := range all {
 		if rec.VMName == vmName && rec.VMUUID == sp.UUID {
@@ -226,6 +239,21 @@ func (p replacedNICs) sameNIC(att *pb.NetworkAttachment, ordinal int) (*corrosio
 		}
 	}
 	return nil, false
+}
+
+// carriesNoNewVLAN reports whether att's trunk VLANs are all VLANs the
+// replaced incarnation's NICs carried on att's network (re-review R3-I1). A
+// NIC with no trunk carries none.
+func (p replacedNICs) carriesNoNewVLAN(att *pb.NetworkAttachment) bool {
+	if len(att.GetTrunk()) < 2 {
+		return true
+	}
+	for _, v := range att.GetTrunk() {
+		if !p.trunks[att.GetName()][v] {
+			return false
+		}
+	}
+	return true
 }
 
 // recordedOn reports whether the replaced incarnation had any record on
@@ -313,7 +341,11 @@ func (s *Server) guardDecisions(ctx context.Context, vmName string, atts []*pb.N
 			if !prior.uuidless || !nicGuardWeakens(r.Mode, r.Allowed, r.AllowDHCPServer, r.AllowRouterAdvert, r.AllowVLANTags) {
 				decisions[i].carry = r
 			}
-		} else if prior.networks[att.GetName()] && !prior.recordedOn(att.GetName()) {
+		} else if prior.networks[att.GetName()] && !prior.recordedOn(att.GetName()) && prior.carriesNoNewVLAN(att) {
+			// The same NIC of an incarnation that predates guards stays as
+			// it ran — but only with at most the VLANs it ran with: a trunk
+			// VLAN it never carried makes it a new NIC, with the default
+			// guard and its network's VLANs (re-review R3-I1).
 			decisions[i].none = true
 		}
 	}
@@ -396,6 +428,51 @@ func (s *Server) retireNICGuards(ctx context.Context, owner string) {
 	if err := corrosion.DeleteNICGuardsOf(ctx, s.db, owner, callerUsername(ctx)); err != nil {
 		slog.Warn("NIC guard: could not retire the guard records of a deleted workload; a record of another incarnation guards nothing",
 			"owner", owner, "error", err)
+	}
+}
+
+// containerNICMACs is the MACs of this host's container name's NICs, read
+// before its delete tombstones the rows (retireContainerGuards).
+func (s *Server) containerNICMACs(ctx context.Context, name string) map[string]bool {
+	nics, err := corrosion.GetContainerInterfaces(ctx, s.db, s.hostName, name)
+	if err != nil {
+		slog.Warn("NIC guard: could not read a container's NICs before its delete", "container", name, "error", err)
+		return nil
+	}
+	mine := map[string]bool{}
+	for _, n := range nics {
+		mine[strings.ToLower(n.MAC)] = true
+	}
+	return mine
+}
+
+// retireContainerGuards tombstones the guard records of this host's
+// container name, just deleted: its own, and those of its NICs (mine, from
+// containerNICMACs) an earlier host wrote before it migrated or was
+// relocated here, which the loader still renders it by (re-review m1).
+// Another host's record is left alone while that host has a live container of
+// the same name.
+func (s *Server) retireContainerGuards(ctx context.Context, name string, mine map[string]bool) {
+	s.retireNICGuards(ctx, corrosion.ContainerGuardOwner(s.hostName, name))
+	if len(mine) == 0 {
+		return
+	}
+	all, err := corrosion.ListNICGuards(ctx, s.db)
+	if err != nil {
+		slog.Warn("NIC guard: could not read the guard records of a deleted container's earlier hosts", "container", name, "error", err)
+		return
+	}
+	done := map[string]bool{}
+	for _, r := range all {
+		h, n, ok := corrosion.ParseContainerGuardOwner(r.VMName)
+		if !ok || n != name || h == s.hostName || done[r.VMName] || !mine[strings.ToLower(r.MAC)] {
+			continue
+		}
+		if live, err := corrosion.GetContainer(ctx, s.db, h, name); err != nil || live != nil {
+			continue // that host's own container, or unknown: not this one's to retire
+		}
+		done[r.VMName] = true
+		s.retireNICGuards(ctx, r.VMName)
 	}
 }
 

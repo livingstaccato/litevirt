@@ -198,6 +198,13 @@ type NICBinding struct {
 	// whose payload no rule can see, is refused like any other NIC's tag.
 	TrunkVIDs []int
 
+	// TrunkDenied marks a NIC on the `trunk:` feature none of whose VLANs its
+	// network allows (re-review R3-I1): it has no TrunkVIDs, and every tagged
+	// frame to or from it is dropped in either mode. Rendered like any other
+	// NIC, its tags would meet only the plain VLAN rule, which observe mode
+	// counts, and leave through the uplink on VLANs the tenant chose.
+	TrunkDenied bool
+
 	// DHCPServer marks a NIC whose guest is allowed to answer DHCP: its
 	// replies reach other guests ahead of their ingress rules, as the host's
 	// dnsmasq replies do.

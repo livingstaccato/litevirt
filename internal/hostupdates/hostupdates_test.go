@@ -174,3 +174,38 @@ func TestFromLabels(t *testing.T) {
 		t.Fatal("absent must not parse")
 	}
 }
+
+// M4: dnf5 lists the advisory type as its own lowercase column and the package
+// before the issue date; its security updates are counted, not read as zero.
+func TestParseDnfSecurity_Dnf5Layout(t *testing.T) {
+	out := `Name                     Type     Severity  Package                                Issued
+FEDORA-2024-1a2b3c4d5e   security Moderate  openssl-libs-1:3.1.4-3.fc41.x86_64     2024-01-10 01:23:45
+FEDORA-2024-9f8e7d6c5b   security Important curl-8.6.0-1.fc41.x86_64               2024-02-01 09:00:00
+`
+	set, ok := ParseDnfSecurityChecked(out)
+	if !ok || !set["openssl-libs"] || !set["curl"] || len(set) != 2 {
+		t.Fatalf("dnf5 advisories: %v ok=%v", set, ok)
+	}
+	if set, ok := ParseDnfSecurityChecked("Last metadata expiration check: 0:10:00 ago on Thu Oct 10 2026.\n"); !ok || len(set) != 0 {
+		t.Fatalf("no advisories is a readable zero: %v %v", set, ok)
+	}
+}
+
+// An advisory line in a form this parser does not know makes the security count
+// unknown, never zero.
+func TestCheck_DnfUnreadableAdvisoriesAreUnknown(t *testing.T) {
+	run := func(_ context.Context, name string, args ...string) ([]byte, error) {
+		joined := strings.Join(args, " ")
+		switch {
+		case strings.Contains(joined, "check-update"):
+			return []byte("openssl.x86_64  3.1.4-3.fc41  updates\n"), ExitCodeError(100)
+		case strings.Contains(joined, "updateinfo"):
+			return []byte("FEDORA-2030-aaaa  critical-ish  openssl\n"), nil
+		}
+		return nil, nil
+	}
+	st := Check(context.Background(), Options{Run: run, Have: func(b string) bool { return b == "dnf" }})
+	if st.Pending != 1 || st.Labels()[LabelSecurity] != "unknown" {
+		t.Fatalf("pending=%d labels=%v, want 1 pending and an unknown security count", st.Pending, st.Labels())
+	}
+}

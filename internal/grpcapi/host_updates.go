@@ -2,8 +2,11 @@ package grpcapi
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -28,10 +31,12 @@ func (s *Server) SetHostUpdates(cfg HostUpdatesConfig) { s.hostUpdates = cfg }
 // interval and publishes the result as host labels, a metric (the collector
 // reads the labels back) and a notification. It is read-only: nothing is
 // installed, and the package index is refreshed only when host_updates.
-// refresh_index is set.
+// refresh_index is set. With the check disabled it withdraws what an earlier
+// run published, so no stale count stays on the host record.
 func (s *Server) RunHostUpdateLoop(ctx context.Context) {
 	cfg := s.hostUpdates
 	if !cfg.Enabled {
+		s.withdrawHostUpdateLabels(ctx)
 		return
 	}
 	interval := cfg.Interval
@@ -55,11 +60,64 @@ func (s *Server) RunHostUpdateLoop(ctx context.Context) {
 	}
 }
 
-// CheckHostUpdatesOnce runs one check and publishes it. A notification goes
-// out only when the counts differ from what this host last published (read
-// back off its own record, so a daemon restart does not repeat itself), and
-// only when something is pending: security updates are a warning, the rest
-// info. A check that failed publishes "unknown" and notifies nothing.
+// withdrawHostUpdateLabels removes the published counts: the check is off, or
+// this host has no package manager it can read.
+func (s *Server) withdrawHostUpdateLabels(ctx context.Context) {
+	if s.db == nil {
+		return
+	}
+	if err := corrosion.SetHostLabels(ctx, s.db, s.hostName, nil,
+		[]string{hostupdates.LabelPending, hostupdates.LabelSecurity}); err != nil {
+		slog.Warn("host updates: withdraw labels failed", "error", err)
+	}
+}
+
+// hostUpdateCounts is the last check that produced counts, kept apart from the
+// published labels (which say "unknown" while a check fails) so a failed check
+// between two identical results does not repeat the notification.
+type hostUpdateCounts struct {
+	Pending  int `json:"pending"`
+	Security int `json:"security"`
+}
+
+func (s *Server) hostUpdateCountsPath() string { return filepath.Join(s.dataDir, "host-updates.json") }
+
+// lastHostUpdateCounts reads the last known counts: the host-local record, or,
+// before the first one is written, what this host last published.
+func (s *Server) lastHostUpdateCounts(ctx context.Context) (hostUpdateCounts, bool) {
+	if s.dataDir != "" {
+		if b, err := os.ReadFile(s.hostUpdateCountsPath()); err == nil {
+			var c hostUpdateCounts
+			if json.Unmarshal(b, &c) == nil {
+				return c, true
+			}
+		}
+	}
+	if h, err := corrosion.GetHost(ctx, s.db, s.hostName); err == nil && h != nil {
+		if p, sec, ok := hostupdates.FromLabels(h.Labels); ok {
+			return hostUpdateCounts{Pending: p, Security: sec}, true
+		}
+	}
+	return hostUpdateCounts{}, false
+}
+
+func (s *Server) recordHostUpdateCounts(c hostUpdateCounts) {
+	if s.dataDir == "" {
+		return
+	}
+	b, _ := json.Marshal(c)
+	if err := os.WriteFile(s.hostUpdateCountsPath(), b, 0o640); err != nil {
+		slog.Warn("host updates: record last counts failed", "error", err)
+	}
+}
+
+// CheckHostUpdatesOnce runs one check and publishes it in one label write. A
+// notification goes out only when the counts differ from the last check that
+// produced counts (kept host-locally, so neither a daemon restart nor a failed
+// check in between repeats it), and only when something is pending: security
+// updates are a warning, the rest info. A check that failed publishes "unknown"
+// and notifies nothing. A host with no readable package manager publishes
+// nothing, and withdraws what it published before.
 func (s *Server) CheckHostUpdatesOnce(ctx context.Context) {
 	cfg := s.hostUpdates
 	check := cfg.Check
@@ -72,25 +130,22 @@ func (s *Server) CheckHostUpdatesOnce(ctx context.Context) {
 	}
 	st := check(ctx)
 	if !st.Supported {
+		s.withdrawHostUpdateLabels(ctx)
 		return
 	}
-	var prevP, prevS int
-	prevKnown := false
-	if h, err := corrosion.GetHost(ctx, s.db, s.hostName); err == nil && h != nil {
-		prevP, prevS, prevKnown = hostupdates.FromLabels(h.Labels)
-	}
-	for k, v := range st.Labels() {
-		if err := corrosion.SetHostLabel(ctx, s.db, s.hostName, k, v); err != nil {
-			slog.Warn("host updates: publish label failed", "label", k, "error", err)
-		}
+	last, known := s.lastHostUpdateCounts(ctx) // before the labels change under it
+	if err := corrosion.SetHostLabels(ctx, s.db, s.hostName, st.Labels(), nil); err != nil {
+		slog.Warn("host updates: publish labels failed", "error", err)
 	}
 	if st.Err != "" {
 		slog.Warn("host updates: check incomplete", "manager", st.Manager, "error", st.Err)
 	}
-	if st.Pending == 0 || (st.Err != "" && len(st.Packages) == 0) {
-		return
+	if st.Err != "" && len(st.Packages) == 0 {
+		return // no counts from this check
 	}
-	if prevKnown && prevP == st.Pending && prevS == st.Security {
+	now := hostUpdateCounts{Pending: st.Pending, Security: st.Security}
+	s.recordHostUpdateCounts(now)
+	if st.Pending == 0 || (known && last == now) {
 		return
 	}
 	kind, sev := "host.updates", notify.SevInfo

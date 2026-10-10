@@ -155,3 +155,80 @@ func TestHostUpdates_UnsupportedHostPublishesNothing(t *testing.T) {
 		t.Fatalf("a host with no package manager must publish no label: %v", h.Labels)
 	}
 }
+
+// M5: a failed check between two identical results does not repeat the
+// notification: the last known counts are kept apart from the published labels,
+// which say "unknown" while a check fails.
+func TestHostUpdates_AFailedCheckBetweenTwoEqualResultsDoesNotRenotify(t *testing.T) {
+	ok := hostupdates.Status{Supported: true, Manager: "apt", Pending: 2, Security: 1,
+		Packages: []hostupdates.Pkg{{Name: "openssl", Security: true}, {Name: "vim"}}}
+	s, rec := hostUpdatesServer(t, ok)
+	s.dataDir = t.TempDir()
+	s.CheckHostUpdatesOnce(context.Background())
+	waitKinds(t, rec, 1)
+	s.hostUpdates.Check = func(context.Context) hostupdates.Status {
+		return hostupdates.Status{Supported: true, Manager: "apt", Err: "apt list: lock held"}
+	}
+	s.CheckHostUpdatesOnce(context.Background())
+	s.hostUpdates.Check = func(context.Context) hostupdates.Status { return ok }
+	s.CheckHostUpdatesOnce(context.Background())
+	time.Sleep(200 * time.Millisecond)
+	if k := rec.kinds(); len(k) != 1 {
+		t.Fatalf("the same counts after a failed check notified again: %v", k)
+	}
+}
+
+// M5: a host that stops reporting (the check is disabled, or there is no
+// package manager any more) withdraws its counts instead of showing them forever.
+func TestHostUpdates_DisabledOrUnsupportedWithdrawsTheCounts(t *testing.T) {
+	s, _ := hostUpdatesServer(t, hostupdates.Status{Supported: true, Manager: "apt", Pending: 4, Packages: []hostupdates.Pkg{{Name: "a"}, {Name: "b"}, {Name: "c"}, {Name: "d"}}})
+	ctx := context.Background()
+	labels := func() map[string]string {
+		h, _ := corrosion.GetHost(ctx, s.db, s.hostName)
+		return h.Labels
+	}
+	s.CheckHostUpdatesOnce(ctx)
+	if labels()[hostupdates.LabelPending] != "4" {
+		t.Fatalf("premise: %v", labels())
+	}
+	s.hostUpdates.Check = func(context.Context) hostupdates.Status { return hostupdates.Status{} }
+	s.CheckHostUpdatesOnce(ctx)
+	if _, ok := labels()[hostupdates.LabelPending]; ok {
+		t.Fatalf("a host with no package manager kept its old counts: %v", labels())
+	}
+	s.hostUpdates.Check = nil
+	s.SetHostUpdates(HostUpdatesConfig{Enabled: true, Check: func(context.Context) hostupdates.Status {
+		return hostupdates.Status{Supported: true, Manager: "apt", Pending: 1, Packages: []hostupdates.Pkg{{Name: "a"}}}
+	}})
+	s.CheckHostUpdatesOnce(ctx)
+	s.SetHostUpdates(HostUpdatesConfig{Enabled: false})
+	s.RunHostUpdateLoop(ctx) // disabled: withdraws and returns
+	if l := labels(); l[hostupdates.LabelPending] != "" || l[hostupdates.LabelSecurity] != "" {
+		t.Fatalf("a disabled check left counts on the host: %v", l)
+	}
+}
+
+// M3: one check publishes both counts in ONE write of the labels column, and a
+// check that changes nothing writes nothing: each write of the whole column is
+// a chance to carry back a stale copy of another node's concurrent label edit.
+func TestHostUpdates_OneLabelWritePerChange(t *testing.T) {
+	s, _ := hostUpdatesServer(t, hostupdates.Status{Supported: true, Manager: "apt", Pending: 3, Security: 1,
+		Packages: []hostupdates.Pkg{{Name: "openssl", Security: true}, {Name: "vim"}, {Name: "tzdata"}}})
+	ctx := context.Background()
+	writes := func() int {
+		rows, err := s.db.Query(ctx, `SELECT COUNT(*) AS n FROM mutation_log WHERE stmts LIKE '%UPDATE hosts SET labels%'`)
+		if err != nil || len(rows) != 1 {
+			t.Fatalf("count label writes: %v", err)
+		}
+		return int(rows[0].Int64("n"))
+	}
+	before := writes()
+	s.CheckHostUpdatesOnce(ctx)
+	if n := writes() - before; n != 1 {
+		t.Fatalf("one check wrote the labels column %d times, want once", n)
+	}
+	s.CheckHostUpdatesOnce(ctx)
+	if n := writes() - before; n != 1 {
+		t.Fatalf("an unchanged check wrote the labels column again (%d writes)", n)
+	}
+}

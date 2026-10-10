@@ -10,6 +10,15 @@
 // once confirmed cluster-wide it LATCHES durably (per token, via a marker file), so
 // a later partition — where support can't be re-confirmed — fails closed rather
 // than reverting to the legacy ungated path.
+//
+// RELEASE TOKENS (release_features.go). A release's new data shares one
+// mandatory, replication-gated release token (release_<yyyy>_<mm>_v1), with a
+// replicated per-feature USED bit, instead of one token per feature. A release
+// token's FEATURE SET IS FROZEN WHEN ITS RELEASE SHIPS: a build that adds a
+// feature — a patch release included — declares it under the NEXT release
+// token, never a shipped one. capabilities_test.go pins every release token's
+// list (frozenReleaseFeatures), so adding a feature to a shipped token fails
+// CI. See docs/upgrades.md "Rolling back after a release token latched".
 package capabilities
 
 import "sort"

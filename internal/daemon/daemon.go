@@ -318,12 +318,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// would, under the unit's OnFailure rollback, be a rollback loop; and the node
 	// has to stay up anyway so peers can see it degraded and an operator can reseed
 	// it. Fail-closed happens at the write path instead, wired below.
-	toks, probation := preflightRollback(d.cfg.DataDir, releaseFeatureUseReader(ctx, d.db))
 	// Release probation (C1): rolled back below a safe_if_unused release token
 	// with no use in this replica. No replicated writes until a voter majority
-	// confirms (runReleaseProbation, below).
-	d.db.EnterReleaseProbation(probation)
-	if len(toks) > 0 {
+	// confirms (RunReleaseProbation, below).
+	if toks := BootRollbackCheck(ctx, d.cfg.DataDir, d.db); len(toks) > 0 {
 		d.rolledBackTokens = toks
 		slog.Error("preflight: this binary is a ROLLBACK below capability tokens this node "+
 			"already latched; entering WAL quarantine — no replicated writes will be emitted "+
@@ -661,7 +659,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	go ae.Start(ctx)
 	// Release probation (entered only from a marker at boot) is lifted only by
 	// asking a voter majority.
-	go d.runReleaseProbation(ctx, ae)
+	go RunReleaseProbation(ctx, d.db, ae)
 
 	// Start metrics server. Create the LXC runner ONCE here and share it with the
 	// gRPC container adapter + health checker below, so the metrics collector can

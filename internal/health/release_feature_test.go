@@ -2,6 +2,7 @@ package health
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -405,5 +406,68 @@ func TestWithFeature_RefusalNamesTheLaggingHosts(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "host-a") {
 		t.Fatalf("refusal %v names this host, which is on the release", err)
+	}
+}
+
+// TestFeatureAvailable_ReadsTheLatchWithoutAsking (m7): a caller that falls
+// back rather than fails asks whether a feature can be used at all without
+// any peer being pinged: the feature's token has latched durably here. It is a
+// hint, never a grant: the write still goes through WithFeature.
+func TestFeatureAvailable_ReadsTheLatchWithoutAsking(t *testing.T) {
+	e := newRelEnv(t)
+	var pings atomic.Int32
+	e.c.SetPeerPinger(func(_ context.Context, host string) ([]string, time.Time, error) {
+		pings.Add(1)
+		return capabilities.Supported(), time.Time{}, nil
+	})
+	if e.c.FeatureAvailable(testFeature) || pings.Load() != 0 {
+		t.Fatalf("before the latch: available=%v pings=%d, want false and no ping", e.c.FeatureAvailable(testFeature), pings.Load())
+	}
+	if !e.c.Enforced(context.Background(), capabilities.ReleaseToken) || !e.c.DurablyLatched(capabilities.ReleaseToken) {
+		t.Fatal("setup: the release token did not latch durably")
+	}
+	before := pings.Load()
+	if !e.c.FeatureAvailable(testFeature) {
+		t.Fatal("not available once the release token latched durably")
+	}
+	if pings.Load() != before {
+		t.Fatalf("the availability read pinged %d peer(s)", pings.Load()-before)
+	}
+	if e.c.FeatureAvailable("undeclared") {
+		t.Fatal("an undeclared feature reported available")
+	}
+	e2 := newRelEnv(t)
+	e2.c.SetActivationMarker("")
+	e2.c.Enforced(context.Background(), capabilities.ReleaseToken)
+	if e2.c.FeatureAvailable(testFeature) {
+		t.Fatal("available on a latch held only in memory")
+	}
+}
+
+// TestWithFeature_RefusalTextIsExact (UX 1; lab 1 could not try it live, since
+// no gated action exists on this branch): the whole operator-facing refusal,
+// word for word — each lagging host with its build version, or unreachable,
+// and the pointer to the status command at the end.
+func TestWithFeature_RefusalTextIsExact(t *testing.T) {
+	e := newRelEnv(t)
+	ctx := context.Background()
+	gateHost(t, e.db, "host-c", "active", "worker")
+	if err := corrosion.UpdateHostVersion(ctx, e.db, "host-b", "1.9.0"); err != nil {
+		t.Fatal(err)
+	}
+	e.c.SetPeerPinger(func(_ context.Context, host string) ([]string, time.Time, error) {
+		switch host {
+		case "host-b":
+			return withoutToken(capabilities.Supported(), capabilities.ReleaseToken), time.Time{}, nil
+		case "host-c":
+			return nil, time.Time{}, errors.New("connection refused")
+		}
+		return capabilities.Supported(), time.Time{}, nil
+	})
+	_, err := e.write(t, e.c, testFeature)
+	want := "the cluster upgrade must finish first (widgets needs " + capabilities.ReleaseToken + "): " +
+		"not on this release yet: host-b (1.9.0), host-c (unreachable) — see `lv cluster upgrade-status`"
+	if status.Code(err) != codes.FailedPrecondition || status.Convert(err).Message() != want {
+		t.Fatalf("refusal = %v\nwant FailedPrecondition %q", err, want)
 	}
 }

@@ -7,8 +7,10 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
@@ -146,6 +148,8 @@ func (g fakeFeatureGate) WithFeature(ctx context.Context, f capabilities.Feature
 	}
 	return write(ctx, grant)
 }
+
+func (g fakeFeatureGate) FeatureAvailable(capabilities.Feature) bool { return g.err == nil }
 
 // TestWithReleaseFeature_FailsClosed: with no gate wired every feature is
 // refused and the write never runs; a wired gate's refusal passes through; a
@@ -444,7 +448,9 @@ func TestGetUpgradeStatus_RolloutSummaryAndProbation(t *testing.T) {
 func TestReleaseRolloutCondition(t *testing.T) {
 	ctx := context.Background()
 	s := rolloutServer(t, false)
-	s.evaluateReleaseRollout(ctx)
+	for i := 0; i < 3; i++ { // one peer asked per cycle (m2)
+		s.evaluateReleaseRollout(ctx)
+	}
 	h, ok, err := corrosion.GetHealthCondition(ctx, s.db, releaseRolloutEvaluator, condReleaseRolloutPending, "cluster", capabilities.ReleaseToken)
 	if err != nil || !ok || h.Lifecycle == corrosion.ConditionResolved || h.Severity != corrosion.SeverityInfo ||
 		!slices.Contains(h.Hosts, "peer-old") {
@@ -457,3 +463,230 @@ func TestReleaseRolloutCondition(t *testing.T) {
 		t.Fatalf("condition after the latch = %+v, want resolved", h)
 	}
 }
+
+// pingOnlyClient answers Ping with a fixed response: what a peer says of itself.
+type pingOnlyClient struct {
+	pb.LiteVirtClient
+	resp *pb.PingResponse
+}
+
+func (f pingOnlyClient) Ping(context.Context, *pb.PingRequest, ...grpc.CallOption) (*pb.PingResponse, error) {
+	return f.resp, nil
+}
+
+// TestReleasePeerAllowed_SelfFencedOriginKeepsItsLastList (I-R3-2): a
+// self-fenced peer advertises nothing, but it is not WAL-quarantined, and its
+// pushes still declare this build's release tokens. Its empty Ping is no news:
+// it keeps its last list, is never refused for it, raises no alarm, and leaves
+// no negative entry behind; one never heard from stays unjudged. A relay stream
+// carrying its entries with another origin's flows. A WAL-quarantined peer's
+// empty answer is still a refusal.
+func TestReleasePeerAllowed_SelfFencedOriginKeepsItsLastList(t *testing.T) {
+	ctx := context.Background()
+	s := releasePeerServer(t)
+	withTok := capabilities.Supported()
+	answers := map[string]*pb.PingResponse{
+		"fenced":          {Capabilities: []string{}},
+		"stranger-fenced": {Capabilities: []string{}},
+		"rolled-back":     {Capabilities: []string{}, WalQuarantined: true},
+	}
+	s.peerClientOverride = func(_ context.Context, host string) (pb.LiteVirtClient, func(), error) {
+		return pingOnlyClient{resp: answers[host]}, func() {}, nil
+	}
+	s.notePeerCaps("fenced", withTok)
+	s.notePeerCaps("rolled-back", withTok)
+	for peer := range answers { // the background refresh, run to completion
+		s.refreshPeerCaps(peer)
+	}
+	if err := s.ReleasePeerAllowed(ctx, "fenced"); err != nil {
+		t.Fatalf("a self-fenced origin last known to carry the token: %v", err)
+	}
+	if err := s.ReleasePeerAllowed(ctx, "stranger-fenced"); err != nil {
+		t.Fatalf("a self-fenced origin never heard from: %v", err)
+	}
+	if err := s.ReleasePeerAllowed(ctx, "rolled-back"); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("a WAL-quarantined origin advertising nothing: %v, want FailedPrecondition", err)
+	}
+	if got := s.RefusedReleasePeers(); !slices.Equal(got, []string{"rolled-back"}) {
+		t.Fatalf("refused peers = %v, want only rolled-back", got)
+	}
+	s.releasePeerMu.Lock()
+	if e := s.releasePeerLast["fenced"]; e == nil || e.backoff != 0 {
+		t.Errorf("the fenced origin's entry = %+v, want its positive list kept with no backoff", e)
+	}
+	if e := s.releasePeerLast["stranger-fenced"]; e != nil && e.known {
+		t.Errorf("a fenced stranger was recorded as known: %+v", e)
+	}
+	s.releasePeerMu.Unlock()
+	entries := append(crlEntry("fenced", "2000000000021-0000-n5"), crlEntry("other", "2000000000022-0000-n6")...)
+	if _, err := s.PushMutations(replicationPeerCtx("relay"), &pb.ReplicateRequest{
+		Sender: "relay", Entries: entries, SenderCapabilities: withTok,
+	}); err != nil || !crlApplied(t, s, "other", "2000000000022-0000-n6") {
+		t.Fatalf("a relay stream carrying a self-fenced origin's entries: %v", err)
+	}
+}
+
+// TestPushMutations_RefusedInReleaseProbation (I-R3-1): a node in release
+// probation applies nothing a peer pushes — the data of a first use can reach
+// it with its record pruned away — until a voter majority has been asked. The
+// refusal is back-pressure: retried, nothing dropped.
+func TestPushMutations_RefusedInReleaseProbation(t *testing.T) {
+	s := upgradeStatusServer(t)
+	s.replicator = corrosion.NewReplicator(s.db, "", corrosion.RelayConfig{})
+	s.db.EnterReleaseProbation([]string{"release_2099_01_v1"})
+	_, err := s.PushMutations(replicationPeerCtx("peer-a"), &pb.ReplicateRequest{
+		Sender: "peer-a", Entries: crlEntry("peer-a", "2000000000031-0000-n1"), SenderCapabilities: capabilities.Supported(),
+	})
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "probation") ||
+		crlApplied(t, s, "peer-a", "2000000000031-0000-n1") {
+		t.Fatalf("a push in release probation: %v, want FailedPrecondition naming the probation, nothing applied", err)
+	}
+}
+
+// TestGetUpgradeStatus_RolloutCountsTheLatchHostSet (m2): the rollout summary
+// counts the hosts the release token's latch waits on — every voting-eligible
+// host and every admitted member — and no other: a powered-off host parked in
+// maintenance is not "not yet", while a member in maintenance that is still
+// replicated to is.
+func TestGetUpgradeStatus_RolloutCountsTheLatchHostSet(t *testing.T) {
+	ctx := context.Background()
+	s := rolloutServer(t, false)
+	for _, h := range []struct{ name, version string }{{"peer-parked", "1.8.0"}, {"peer-member", "1.9.5"}} {
+		if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: h.name, Address: "10.0.0.9", State: "maintenance", Role: "worker"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := corrosion.UpdateHostVersion(ctx, s.db, h.name, h.version); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.db.SetMembersForTests(func() []corrosion.PeerInfo {
+		return []corrosion.PeerInfo{{Name: "peer-new"}, {Name: "peer-old"}, {Name: "peer-member"}}
+	})
+	st, err := s.GetUpgradeStatus(viewerCtx(), &emptypb.Empty{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, l := range st.GetLagging() {
+		names = append(names, l.GetName()+" ("+l.GetVersion()+")")
+	}
+	if st.GetHostsTotal() != 4 || st.GetHostsOnRelease() != 2 ||
+		!slices.Equal(names, []string{"peer-member (1.9.5)", "peer-old (1.9.0)"}) {
+		t.Fatalf("summary: %d of %d hosts, lagging %v; want 2 of 4, lagging [peer-member (1.9.5) peer-old (1.9.0)]",
+			st.GetHostsOnRelease(), st.GetHostsTotal(), names)
+	}
+}
+
+// countingGate counts the peer answers the rollout asks for.
+type countingGate struct {
+	fakeServerGate
+	calls *atomic.Int32
+	per   *sync.Map
+	down  map[string]bool
+}
+
+func (g countingGate) PeerSupportsFresh(ctx context.Context, peer, token string) bool {
+	g.calls.Add(1)
+	n, _ := g.per.LoadOrStore(peer, new(atomic.Int32))
+	n.(*atomic.Int32).Add(1)
+	if g.down[peer] {
+		return false
+	}
+	return g.fakeServerGate.PeerSupportsFresh(ctx, peer, token)
+}
+
+func (g countingGate) PeerSupports(ctx context.Context, peer, token string) bool {
+	return g.PeerSupportsFresh(ctx, peer, token)
+}
+
+// TestReleaseRolloutCondition_AsksOnePeerPerCycle (m2): before the latch, the
+// HA monitor keeps the rollout condition from cached answers and asks at most
+// one peer per cycle; an unreachable peer is re-asked only after a backoff, so
+// it cannot hold every cycle up.
+func TestReleaseRolloutCondition_AsksOnePeerPerCycle(t *testing.T) {
+	ctx := context.Background()
+	s := rolloutServer(t, false)
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: "peer-down", Address: "10.0.0.9", State: "active", Role: "worker"}); err != nil {
+		t.Fatal(err)
+	}
+	g := countingGate{fakeServerGate: s.gate.(fakeServerGate), calls: new(atomic.Int32), per: new(sync.Map),
+		down: map[string]bool{"peer-down": true}}
+	s.gate = g
+	const cycles = 6
+	for i := 0; i < cycles; i++ {
+		before := g.calls.Load()
+		s.evaluateReleaseRollout(ctx)
+		if n := g.calls.Load() - before; n > 1 {
+			t.Fatalf("cycle %d asked %d peers, want at most one", i, n)
+		}
+	}
+	if n, _ := g.per.Load("peer-down"); n != nil && n.(*atomic.Int32).Load() > 1 {
+		t.Fatalf("an unreachable peer was asked %d times in %d quick cycles; want once, then a backoff",
+			n.(*atomic.Int32).Load(), cycles)
+	}
+	h, ok, err := corrosion.GetHealthCondition(ctx, s.db, releaseRolloutEvaluator, condReleaseRolloutPending, "cluster", capabilities.ReleaseToken)
+	if err != nil || !ok || !slices.Equal(h.Hosts, []string{"peer-down", "peer-old"}) {
+		t.Fatalf("condition = %+v ok=%v err=%v, want it naming peer-down and peer-old", h, ok, err)
+	}
+}
+
+// TestReleaseRolloutCondition_ReopenKeepsFirstSeen (m5): while the token has
+// not latched, a condition that resolved and opens again keeps the time the
+// rollout was first seen pending, so a flapping row still shows how long the
+// roll has taken.
+func TestReleaseRolloutCondition_ReopenKeepsFirstSeen(t *testing.T) {
+	ctx := context.Background()
+	s := rolloutServer(t, false)
+	const first = "2026-01-01T00:00:00Z"
+	if err := corrosion.UpsertHealthCondition(ctx, s.db, corrosion.HealthCondition{
+		Evaluator: releaseRolloutEvaluator, Code: condReleaseRolloutPending, SubjectKind: "cluster",
+		SubjectID: capabilities.ReleaseToken, Severity: corrosion.SeverityInfo, Reporter: "test-host",
+		Lifecycle: corrosion.ConditionResolved, FirstSeen: first, ConfirmedAt: first, LastSeen: first, ResolvedAt: first,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		s.evaluateReleaseRollout(ctx)
+	}
+	h, ok, err := corrosion.GetHealthCondition(ctx, s.db, releaseRolloutEvaluator, condReleaseRolloutPending, "cluster", capabilities.ReleaseToken)
+	if err != nil || !ok || h.Lifecycle == corrosion.ConditionResolved {
+		t.Fatalf("condition = %+v ok=%v err=%v, want it open again", h, ok, err)
+	}
+	if h.FirstSeen != first {
+		t.Fatalf("reopened condition FirstSeen = %q, want %q kept from the resolved row", h.FirstSeen, first)
+	}
+}
+
+// TestReleaseFeatureAvailable_AsksNoPeer (m7): a caller that falls back rather
+// than fails (backup_zstd's default) asks whether a feature can be used without
+// a peer being asked: the release token's durable latch, read locally.
+func TestReleaseFeatureAvailable_AsksNoPeer(t *testing.T) {
+	s := upgradeStatusServer(t)
+	if s.ReleaseFeatureAvailable("widgets") {
+		t.Fatal("available with no gate wired")
+	}
+	g := &availGate{latched: false}
+	s.SetReleaseFeatureGate(g)
+	if s.ReleaseFeatureAvailable("widgets") {
+		t.Fatal("available before the latch")
+	}
+	g.latched = true
+	if !s.ReleaseFeatureAvailable("widgets") {
+		t.Fatal("not available once latched")
+	}
+	if g.withFeature != 0 {
+		t.Fatalf("the availability read ran the gate %d time(s)", g.withFeature)
+	}
+}
+
+type availGate struct {
+	latched     bool
+	withFeature int
+}
+
+func (g *availGate) WithFeature(context.Context, capabilities.Feature, func(context.Context, capabilities.FeatureGrant) error) error {
+	g.withFeature++
+	return nil
+}
+
+func (g *availGate) FeatureAvailable(capabilities.Feature) bool { return g.latched }

@@ -244,3 +244,58 @@ func TestGrantMinter_ClaimedOnce(t *testing.T) {
 	}()
 	_ = ClaimGrantMinter()
 }
+
+// frozenReleaseFeatures pins, per release token, the exact feature set the
+// release ships with. A TOKEN'S FEATURE SET IS FROZEN WHEN ITS RELEASE SHIPS
+// (releaseFeatures): a build that knows the token but not one of its features
+// cannot keep that feature's data, and it advertises the token, is counted
+// toward its latch and is accepted as a sender all the same — so a feature added
+// to a shipped token turns every host on the shipped build into one that acks a
+// first use and then WAL-quarantines itself. A feature added later is declared
+// under the NEXT release token, whose list is pinned here as a new entry.
+//
+// Editing an existing entry is a release-engineering decision, not a code
+// change: it is only ever right before that release has shipped.
+var frozenReleaseFeatures = map[string][]Feature{
+	Release202611V1: {
+		"backup_zstd",
+		"container_replication",
+		"drain_failback",
+		"email_target_secret",
+		"firewall_ipv6",
+		"iscsi_lun_claim",
+		"login_policy",
+		"pit_overlay",
+		"usb_mounts_memory",
+		"vm_disk_nic_io",
+		"vm_limits",
+	},
+}
+
+// TestReleaseFeatureSetIsFrozen (m6): every release token's declared features
+// are exactly its pinned list, and every release token has one.
+func TestReleaseFeatureSetIsFrozen(t *testing.T) {
+	byToken := map[string][]Feature{}
+	for _, f := range Features() {
+		info, _ := LookupFeature(f)
+		byToken[info.Token] = append(byToken[info.Token], f)
+	}
+	for _, tok := range ReleaseTokens() {
+		if _, ok := frozenReleaseFeatures[tok]; !ok {
+			t.Errorf("release token %s has no pinned feature list in frozenReleaseFeatures", tok)
+		}
+	}
+	for tok, want := range frozenReleaseFeatures {
+		got := byToken[tok]
+		slices.Sort(got)
+		if !slices.Equal(got, want) {
+			t.Errorf("features declared under %s = %v, want exactly %v: a shipped release token's feature "+
+				"set is frozen; declare a new feature under the next release token", tok, got, want)
+		}
+	}
+	for tok := range byToken {
+		if _, ok := frozenReleaseFeatures[tok]; !ok {
+			t.Errorf("features are declared under %s, which has no pinned list", tok)
+		}
+	}
+}

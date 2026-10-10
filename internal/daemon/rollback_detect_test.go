@@ -2,9 +2,12 @@ package daemon
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
@@ -306,32 +309,35 @@ func TestPreflightRollback_NoProbationWithoutARule(t *testing.T) {
 	}
 }
 
-// TestPreflightRollback_ConfirmedLiftIsRemembered (C-R2-1): once a voter
-// majority has confirmed no use, later boots below the same marker do not
-// re-enter probation — a cluster-wide restart would otherwise put every voter
-// back in it at once. The record is bound to the marker: a different marker
-// (a later rollback) is checked afresh, and a use that has since arrived still
-// quarantines.
-func TestPreflightRollback_ConfirmedLiftIsRemembered(t *testing.T) {
+// TestPreflightRollback_EveryBootBelowAMarkerIsAProbation (I-R3-1): no boot
+// below a safe_if_unused marker skips probation, whatever an earlier boot found.
+// Every release token's marker holds the same bytes, so a lift "bound to the
+// marker" was a lift remembered for the token for good: a host that lifted,
+// was then away through a first use whose record its peers pruned, and booted
+// again would have taken the feature's data with no trip. The record a round-3
+// build left in the data directory (release_probation_lifted.<token>, the
+// marker's sha256) is planted here exactly as that build wrote it, and must
+// change nothing.
+func TestPreflightRollback_EveryBootBelowAMarkerIsAProbation(t *testing.T) {
 	dir := t.TempDir()
-	writeMarkerContent(t, dir, futureRelease, "1\nrollback: safe_if_unused\n")
-	if _, p := preflightRollback(dir, noUses); len(p) != 1 {
-		t.Fatalf("first boot: probation = %v, want [%s]", p, futureRelease)
+	marker := capabilities.MarkerContent(capabilities.ReleaseToken) // what every release token's marker holds
+	writeMarkerContent(t, dir, futureRelease, string(marker))
+	sum := sha256.Sum256(marker)
+	lift := filepath.Join(dir, "release_probation_lifted."+futureRelease)
+	if err := os.WriteFile(lift, []byte(hex.EncodeToString(sum[:])+"\n"), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	if err := persistProbationLift(dir, []string{futureRelease}); err != nil {
-		t.Fatalf("persistProbationLift: %v", err)
-	}
-	if q, p := preflightRollback(dir, noUses); len(q) != 0 || len(p) != 0 {
-		t.Fatalf("boot after a confirmed lift: quarantine=%v probation=%v, want neither", q, p)
+	for boot := 1; boot <= 3; boot++ {
+		q, p := preflightRollback(dir, noUses)
+		if len(q) != 0 || !slices.Equal(p, []string{futureRelease}) {
+			t.Fatalf("boot %d after a lift: quarantine=%v probation=%v, want probation [%s]: "+
+				"a replica that holds no use is never proof on its own", boot, q, p, futureRelease)
+		}
 	}
 	usedFuture := func() ([]corrosion.ReleaseFeatureUse, error) {
 		return []corrosion.ReleaseFeatureUse{{Token: futureRelease, Feature: "widgets"}}, nil
 	}
-	if q, _ := preflightRollback(dir, usedFuture); len(q) != 1 {
+	if q, _ := preflightRollback(dir, usedFuture); !slices.Equal(q, []string{futureRelease}) {
 		t.Fatalf("a use after the lift: quarantine = %v, want [%s]", q, futureRelease)
-	}
-	writeMarkerContent(t, dir, futureRelease, "1\nrollback: safe_if_unused\nlatched: 2\n")
-	if _, p := preflightRollback(dir, noUses); len(p) != 1 {
-		t.Fatalf("a different marker: probation = %v, want it checked afresh", p)
 	}
 }

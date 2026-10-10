@@ -136,8 +136,10 @@ release token's marker carries: there, a rollback below the token quarantines
 only once one of its features has been used. That is what a later release's
 token offers when rolled back onto this release.
 
-The first line is the rollout: how many hosts run this release, which do not
-(with their build version), and how many features wait for them. A feature
+The first line is the rollout: how many of the hosts the release token waits
+on run this release — every voting-eligible host and every host the cluster
+replicates to, so a powered-off host parked in maintenance is not counted —
+which do not (with their build version), and how many features wait for them. A feature
 refused mid-upgrade says the same and points here. The release token latches by
 itself once every host is on the release; nothing has to be run.
 

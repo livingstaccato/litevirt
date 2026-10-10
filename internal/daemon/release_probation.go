@@ -12,25 +12,34 @@ import (
 // voter majority again.
 const releaseProbationInterval = 5 * time.Second
 
-// runReleaseProbation lifts the release probation preflightRollback put this
-// node in at boot, once a voter majority has been asked and holds no use of a
-// feature this build cannot keep (corrosion.AntiEntropy.VerifyReleaseProbation).
-// A use found there quarantines the node for good instead. It returns once
-// there is no probation: probation is entered only at boot.
-func (d *Daemon) runReleaseProbation(ctx context.Context, ae *corrosion.AntiEntropy) {
+// BootRollbackCheck is the daemon's startup rollback check: it runs
+// preflightRollback against db's replicated used records, puts db in release
+// probation for every token that passed only on this replica's word, and
+// returns the tokens that quarantine this node. One function so the daemon and
+// the fleet harness boot the same way.
+func BootRollbackCheck(ctx context.Context, dataDir string, db *corrosion.Client) []string {
+	toks, probation := preflightRollback(dataDir, releaseFeatureUseReader(ctx, db))
+	db.EnterReleaseProbation(probation)
+	return toks
+}
+
+// RunReleaseProbation lifts the release probation BootRollbackCheck put db in,
+// once a voter majority has been asked and holds no use of a feature this build
+// cannot keep (corrosion.AntiEntropy.VerifyReleaseProbation). A use found there
+// quarantines the node for good instead. It returns once there is no
+// probation: probation is entered only at boot. While it lasts the node emits
+// no replicated writes and applies nothing a peer pushes or anti-entropy
+// offers; only the probation pull itself is merged.
+func RunReleaseProbation(ctx context.Context, db *corrosion.Client, ae *corrosion.AntiEntropy) {
 	t := time.NewTicker(releaseProbationInterval)
 	defer t.Stop()
-	for len(d.db.ReleaseProbation()) > 0 {
-		checking := d.db.ReleaseProbation()
+	for len(db.ReleaseProbation()) > 0 {
 		if lifted, err := ae.VerifyReleaseProbation(ctx); err != nil {
 			slog.Warn("release probation: check failed; staying in probation", "error", err)
 		} else if lifted {
-			// Remembered, bound to the marker, so a restart does not put this
-			// node back in probation (C-R2-1).
-			if err := persistProbationLift(d.cfg.DataDir, checking); err != nil {
-				slog.Warn("release probation: could not record the lift; the next boot checks again", "error", err)
-			}
-			if len(d.db.ReleaseProbation()) == 0 {
+			// Nothing is remembered: the next boot below the marker is a
+			// probation again (I-R3-1).
+			if len(db.ReleaseProbation()) == 0 {
 				slog.Info("release probation lifted")
 				return
 			}

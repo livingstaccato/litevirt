@@ -223,11 +223,27 @@ func f() {
 // TestReleaseFeatureWriters_TakeAGrant: every function a declared feature lists
 // as a writer of its data takes a capabilities.FeatureGrant, so it cannot be
 // called without passing the gate.
+//
+// writersPending are the features declared ahead of the branch that writes
+// their data (release_2026_11_v1 is declared in full before its feature
+// branches land, because its set is frozen). Each may list no writer, and must
+// not: the branch that adds its Writers deletes it from here in the same
+// change, after which the feature must list them.
+var writersPending = map[Feature]bool{
+	"backup_zstd": true, "container_replication": true, "drain_failback": true,
+	"email_target_secret": true, "firewall_ipv6": true, "iscsi_lun_claim": true,
+	"login_policy": true, "pit_overlay": true, "usb_mounts_memory": true,
+	"vm_disk_nic_io": true, "vm_limits": true,
+}
+
 func TestReleaseFeatureWriters_TakeAGrant(t *testing.T) {
 	root := filepath.Join("..", "..")
 	for _, f := range Features() {
 		info, _ := LookupFeature(f)
-		if len(info.Writers) == 0 {
+		switch {
+		case writersPending[f] && len(info.Writers) > 0:
+			t.Errorf("feature %q lists writers but is still in writersPending: delete it from there", f)
+		case !writersPending[f] && len(info.Writers) == 0:
 			t.Errorf("feature %q lists no writer of its data", f)
 		}
 		for _, w := range info.Writers {

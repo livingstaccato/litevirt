@@ -464,6 +464,11 @@ func (s *Server) PushMutations(ctx context.Context, req *pb.ReplicateRequest) (*
 	if err := s.requireNotIsolated(ctx, req.Sender); err != nil {
 		return nil, err
 	}
+	// A node in release probation applies nothing pushed (I-R3-1): back-pressure
+	// until its probation pull has asked a voter majority.
+	if err := s.db.ReleaseProbationRefusal(); err != nil {
+		return nil, status.Error(codes.FailedPrecondition, err.Error())
+	}
 	if err := s.ReleaseSenderAllowed(ctx, req.Sender, req.SenderCapabilities); err != nil {
 		return nil, err
 	}

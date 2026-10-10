@@ -660,3 +660,68 @@ func TestAntiEntropy_SensitivePullTakesClusterPoliciesFirst(t *testing.T) {
 		t.Fatalf("quarantine at the sensitive pull = %v, want [%s]", f.tripped, futureReleaseToken)
 	}
 }
+
+// TestVerifyReleaseProbation_EmptyVoterSetAsksAdmittedMembers (m-R2-6): a
+// replica that holds no voter at all — no hosts row voting-eligible, no
+// adopted generation — never lifts having asked nobody. It asks a majority of
+// its admitted members instead, and with none to ask it stays in probation.
+func TestVerifyReleaseProbation_EmptyVoterSetAsksAdmittedMembers(t *testing.T) {
+	ctx := context.Background()
+	asked := map[string]int{}
+	answer := map[string]error{}
+	setup := func(members []string) (*Client, *AntiEntropy) {
+		c := testClient(t)
+		if v, err := VoterSet(ctx, c); err != nil || len(v) != 0 {
+			t.Fatalf("setup: voter set = %v (err %v), want empty", v, err)
+		}
+		c.SetMembersForTests(func() []PeerInfo {
+			out := make([]PeerInfo, 0, len(members))
+			for _, m := range members {
+				out = append(out, PeerInfo{Name: m})
+			}
+			return out
+		})
+		c.EnterReleaseProbation([]string{futureReleaseToken})
+		ae := NewAntiEntropy(c, t.TempDir(), time.Minute)
+		ae.probationPull = func(_ context.Context, peer string) (bool, error) {
+			asked[peer]++
+			return false, answer[peer]
+		}
+		return c, ae
+	}
+	if _, ae := setup(nil); func() bool { l, _ := ae.VerifyReleaseProbation(ctx); return l }() {
+		t.Fatal("probation lifted with an empty voter set and nobody to ask")
+	}
+	answer["member-b"], answer["member-c"] = errors.New("unreachable"), errors.New("unreachable")
+	if _, ae := setup([]string{"member-a", "member-b", "member-c"}); func() bool { l, _ := ae.VerifyReleaseProbation(ctx); return l }() {
+		t.Fatalf("probation lifted on one admitted member of three (asked %v)", asked)
+	}
+	answer["member-b"] = nil
+	c, ae := setup([]string{"member-a", "member-b", "member-c"})
+	if lifted, err := ae.VerifyReleaseProbation(ctx); !lifted || err != nil {
+		t.Fatalf("two admitted members of three answered: lifted=%v err=%v (asked %v)", lifted, err, asked)
+	}
+	if len(c.ReleaseProbation()) != 0 {
+		t.Fatal("probation still set after it lifted")
+	}
+}
+
+// TestReplicationSource_RefusedInReleaseProbation (I-R3-1): a node in release
+// probation takes no replicated state by anti-entropy either — the data a
+// first use wrote can arrive with its record pruned away — until the probation
+// pull, which is exempt, has asked a voter majority.
+func TestReplicationSource_RefusedInReleaseProbation(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	if err := c.ReplicationSourceAllowed(ctx, "peer-a"); err != nil {
+		t.Fatalf("no probation, no gate: %v", err)
+	}
+	c.EnterReleaseProbation([]string{futureReleaseToken})
+	if err := c.ReplicationSourceAllowed(ctx, "peer-a"); err == nil || !strings.Contains(err.Error(), "probation") {
+		t.Fatalf("anti-entropy source in probation: %v, want a probation refusal", err)
+	}
+	c.liftReleaseProbation([]string{futureReleaseToken})
+	if err := c.ReplicationSourceAllowed(ctx, "peer-a"); err != nil {
+		t.Fatalf("after the lift: %v", err)
+	}
+}

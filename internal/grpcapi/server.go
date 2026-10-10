@@ -814,7 +814,10 @@ type Server struct {
 	releaseUsedAt      time.Time
 	releasePeerRefused map[string]time.Time
 	releasePeerLast    map[string]*peerCapsEntry
-	onGateRefused      func(action, reason string)
+	// releaseRollout: the HA monitor's cached rollout answers
+	// (releaseRolloutLagging). Guarded by releasePeerMu.
+	releaseRollout map[string]*rolloutAnswer
+	onGateRefused  func(action, reason string)
 	// vmStartObserver is told of every guest start (SetVMStartObserver).
 	vmStartObserver VMStartObserver
 

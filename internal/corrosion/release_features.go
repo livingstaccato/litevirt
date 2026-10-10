@@ -36,6 +36,7 @@ package corrosion
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -298,9 +299,12 @@ func (c *Client) noteReleaseUseRows(table syncTable) {
 }
 
 // EnterReleaseProbation puts this node in RELEASE PROBATION for tokens: it
-// emits no replicated writes (quarantineReason) and advertises nothing, until
-// LiftReleaseProbation — after a voter majority has been asked
-// (AntiEntropy.VerifyReleaseProbation). Additive: a later call adds tokens.
+// emits no replicated writes (quarantineReason) and applies no replicated
+// state — a peer's push is refused (grpcapi PushMutations) and anti-entropy
+// takes nothing (ReplicationSourceAllowed) — until a voter majority has been
+// asked (AntiEntropy.VerifyReleaseProbation), whose own pull is exempt. It
+// keeps advertising (N1): probation is not a WAL quarantine, its Ping says
+// release_probation. Additive: a later call adds tokens.
 //
 // Why a node that found no recorded use still cannot run (C1): its own
 // replica can lack a record its peers hold — a pruned mutation log, a
@@ -366,6 +370,20 @@ func (c *Client) WALQuarantined() bool {
 // InReleaseProbation reports whether this node is in release probation.
 func (c *Client) InReleaseProbation() bool { return len(c.ReleaseProbation()) > 0 }
 
+// ErrReleaseProbation is what a node in release probation answers a peer's
+// push or its own anti-entropy source with: back-pressure, nothing dropped.
+var ErrReleaseProbation = errors.New("this node is in release probation and applies no replicated state " +
+	"until a voter majority has confirmed no feature it cannot keep is in use; it lifts by itself (docs/upgrades.md)")
+
+// ReleaseProbationRefusal returns ErrReleaseProbation, naming the tokens, while
+// this node is in release probation, else nil.
+func (c *Client) ReleaseProbationRefusal() error {
+	if toks := c.ReleaseProbation(); len(toks) > 0 {
+		return fmt.Errorf("%w (below %s)", ErrReleaseProbation, strings.Join(toks, ","))
+	}
+	return nil
+}
+
 // VerifyReleaseProbation tries once to lift this node's release probation.
 //
 // It asks the OTHER voters (VoterSet: the newest adopted generation, or the
@@ -380,7 +398,9 @@ func (c *Client) InReleaseProbation() bool { return len(c.ReleaseProbation()) > 
 // counted. It needs a majority of the voter set from the others, capped at the
 // number of other voters: a two-voter cluster asks its one peer, and a
 // one-voter cluster lifts on its own check (nobody else was a voter to
-// acknowledge). The pull is exempt from the replication-source gate (N2).
+// acknowledge). A replica with no voter at all asks a majority of its admitted
+// members instead, and with none to ask does not lift (m-R2-6). The pull is
+// exempt from the replication-source gate (N2) and from probation.
 //
 // Any use this build cannot honour, found in what was merged, trips the
 // permanent quarantine and probation stays. Otherwise probation lifts — for the
@@ -402,11 +422,26 @@ func (ae *AntiEntropy) VerifyReleaseProbation(ctx context.Context) (bool, error)
 			others = append(others, v)
 		}
 	}
-	sort.Strings(others)
 	need := len(voters)/2 + 1
 	if need > len(others) {
 		need = len(others)
 	}
+	if len(voters) == 0 {
+		// No voter at all in this replica (m-R2-6): never lift having asked
+		// nobody. Ask a majority of the admitted members instead; with none,
+		// stay in probation.
+		for _, p := range ae.client.Members() {
+			if p.Name != "" && p.Name != self {
+				others = append(others, p.Name)
+			}
+		}
+		if len(others) == 0 {
+			slog.Warn("release probation: this replica holds no voter and no admitted member to ask; staying in probation")
+			return false, nil
+		}
+		need = len(others)/2 + 1
+	}
+	sort.Strings(others)
 	pull := ae.probationPull
 	if pull == nil {
 		pull = ae.pullClusterPoliciesForProbation
@@ -557,7 +592,13 @@ func (c *Client) SetReplicationSourceGate(fn func(ctx context.Context, peer stri
 }
 
 // ReplicationSourceAllowed reports whether this node may take state from peer.
+// A node in release probation takes state from nobody (I-R3-1): the data of a
+// first use can reach it with its record pruned away, so it waits for the
+// probation pull, which is exempt, to ask a voter majority first.
 func (c *Client) ReplicationSourceAllowed(ctx context.Context, peer string) error {
+	if err := c.ReleaseProbationRefusal(); err != nil {
+		return err
+	}
 	fn := c.replicationSourceGate.Load()
 	if fn == nil {
 		return nil

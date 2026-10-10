@@ -114,6 +114,15 @@ func (c *Checker) WithFeature(ctx context.Context, feature capabilities.Feature,
 	return write(ctx, mintGrant(feature))
 }
 
+// FeatureAvailable reports whether feature is declared and its release token
+// has DURABLY latched here, asking no peer (m7). It is a hint for a caller that
+// falls back rather than fails, never a grant: WithFeature can still refuse,
+// and is still the only way to write the feature's data.
+func (c *Checker) FeatureAvailable(feature capabilities.Feature) bool {
+	info, ok := capabilities.LookupFeature(feature)
+	return ok && c.DurablyLatched(info.Token)
+}
+
 // requireFeature is WithFeature's gate (see there).
 func (c *Checker) requireFeature(ctx context.Context, feature capabilities.Feature) error {
 	info, ok := capabilities.LookupFeature(feature)

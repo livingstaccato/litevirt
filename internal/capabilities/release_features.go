@@ -48,9 +48,8 @@ type FeatureInfo struct {
 }
 
 // releaseFeatures is THE closed set of release features this build knows,
-// keyed by name. Empty at the release's start; each feature branch adds its
-// own entry beside its constant. A feature never moves to another token: a
-// used bit is recorded under the token its feature was declared with.
+// keyed by name. A feature never moves to another token: a used bit is
+// recorded under the token its feature was declared with.
 //
 // A TOKEN'S FEATURE SET IS FROZEN WHEN ITS RELEASE SHIPS. A build that knows a
 // token but not one of its features cannot keep that feature's data, so a used
@@ -59,8 +58,46 @@ type FeatureInfo struct {
 // feature added after the release — in a patch release, say — gets the NEXT
 // release token, never this one: under this one, every build of the release
 // that lacks it would quarantine on its first use, and every build before the
-// feature landed on main would too.
-var releaseFeatures = map[Feature]FeatureInfo{}
+// feature landed on main would too. Worse, the latch, a push's declaration and
+// a peer's advertisement are all per TOKEN: a build that knows the token but
+// not the feature is counted toward the latch and accepted as a sender, so the
+// first use is not refused — every such host acknowledges it and then
+// quarantines itself.
+//
+// release_2026_11_v1's set is declared here IN FULL, before any of its feature
+// branches lands, because it ships together (capabilities_test.go
+// frozenReleaseFeatures pins it, so adding to it fails CI). Each branch adds
+// only its Writers to its own entry and its writes through WithFeature; a
+// declared feature nobody writes yet is simply unused.
+var releaseFeatures = map[Feature]FeatureInfo{
+	FeatureVMLimits:             {Token: Release202611V1, Description: "Per-VM CPU limit and shares, and NIC bandwidth limits"},
+	FeatureVMDiskNICIO:          {Token: Release202611V1, Description: "Per-disk I/O tuning and per-NIC tuning"},
+	FeatureEmailTargetSecret:    {Token: Release202611V1, Description: "Email notification targets with a stored SMTP secret"},
+	FeatureLoginPolicy:          {Token: Release202611V1, Description: "Cluster login policy"},
+	FeatureDrainFailback:        {Token: Release202611V1, Description: "Failback of the workloads a drain moved"},
+	FeatureFirewallIPv6:         {Token: Release202611V1, Description: "IPv6 security-group and firewall rules"},
+	FeatureUSBMountsMemory:      {Token: Release202611V1, Description: "VM USB devices and memory hot-add; container host mounts and devices"},
+	FeatureBackupZstd:           {Token: Release202611V1, Description: "zstd chunk compression in backup repositories"},
+	FeatureContainerReplication: {Token: Release202611V1, Description: "Container replication to a replica host"},
+	FeatureISCSILUNClaim:        {Token: Release202611V1, Description: "Cluster-wide claim of an iSCSI LUN by one disk"},
+	FeaturePITOverlay:           {Token: Release202611V1, Description: "Point-in-time overlays for copies of running VMs"},
+}
+
+// The features of release_2026_11_v1. Each name is written into a replicated
+// key once used, so it never changes.
+const (
+	FeatureVMLimits             Feature = "vm_limits"
+	FeatureVMDiskNICIO          Feature = "vm_disk_nic_io"
+	FeatureEmailTargetSecret    Feature = "email_target_secret"
+	FeatureLoginPolicy          Feature = "login_policy"
+	FeatureDrainFailback        Feature = "drain_failback"
+	FeatureFirewallIPv6         Feature = "firewall_ipv6"
+	FeatureUSBMountsMemory      Feature = "usb_mounts_memory"
+	FeatureBackupZstd           Feature = "backup_zstd"
+	FeatureContainerReplication Feature = "container_replication"
+	FeatureISCSILUNClaim        Feature = "iscsi_lun_claim"
+	FeaturePITOverlay           Feature = "pit_overlay"
+)
 
 // LookupFeature returns a declared feature's token and description.
 func LookupFeature(f Feature) (FeatureInfo, bool) {

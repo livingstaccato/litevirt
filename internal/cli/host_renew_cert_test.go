@@ -18,7 +18,7 @@ import (
 	"google.golang.org/grpc"
 )
 
-// dirTarget is a renewTarget over a local directory standing in for the host's
+// dirTarget is a remotePKI over a local directory standing in for the host's
 // /etc/litevirt/pki.
 type dirTarget struct {
 	dir      string
@@ -88,10 +88,28 @@ func (d *dirTarget) Commit(files []installFile) error {
 
 func (d *dirTarget) ReloadLibvirtTLS() error { d.reloaded = true; return nil }
 
+func (d *dirTarget) Remove(paths []string) error {
+	for _, p := range paths {
+		if err := os.Remove(d.local(p)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
+}
+
 type renewTestClient struct {
 	pb.LiteVirtClient
 	recorded  func() string
 	published int
+	voters    []string
+}
+
+func (c *renewTestClient) GetVoterConfig(context.Context, *pb.GetVoterConfigRequest, ...grpc.CallOption) (*pb.GetVoterConfigResponse, error) {
+	resp := &pb.GetVoterConfigResponse{AdoptedGeneration: 3, Explicit: len(c.voters) > 0}
+	for _, v := range c.voters {
+		resp.Members = append(resp.Members, &pb.VoterMemberStatus{Name: v})
+	}
+	return resp, nil
 }
 
 func (c *renewTestClient) ListHosts(context.Context, *pb.ListHostsRequest, ...grpc.CallOption) (*pb.ListHostsResponse, error) {
@@ -318,4 +336,51 @@ func TestRenewHostCert_RefusesToResignAForgedRejoinRecord(t *testing.T) {
 func tlsPairMatches(dir string) (bool, error) {
 	_, err := pki.NewKeyPairSource(filepath.Join(dir, "host.crt"), filepath.Join(dir, "host.key"), nil).Get()
 	return err == nil, err
+}
+
+// A voter's replaced certificate is not revoked by default: the adopted voter
+// generation carries its votes signed with it, and a later adopter checks them
+// against the CRL. --revoke-old overrides.
+//
+// Mutation: drop the voterRevocationHold check — the voter's old certificate
+// is revoked by default.
+func TestRenewHostCert_HoldsAVotersRevocation(t *testing.T) {
+	f := newRenewFixture(t)
+	f.client.voters = []string{"node-a", "node-r"}
+	if err := f.run(t, RenewCertOptions{}, f.probe); err != nil {
+		t.Fatal(err)
+	}
+	if crlHas(t, f.op, f.prevSerial) || f.client.published != 0 {
+		t.Fatal("a voter's replaced certificate was revoked by default")
+	}
+
+	g := newRenewFixture(t)
+	g.client.voters = []string{"node-r"}
+	if err := g.run(t, RenewCertOptions{RevokeOld: true}, g.probe); err != nil {
+		t.Fatal(err)
+	}
+	if !crlHas(t, g.op, g.prevSerial) {
+		t.Fatal("--revoke-old did not revoke a voter's replaced certificate")
+	}
+}
+
+// revoke-cert refuses the serial the cluster records — that would cut the
+// host off — and revokes a replaced one.
+//
+// Mutation: drop the recorded-serial refusal — the live certificate is revoked.
+func TestHostRevokeCert_RefusesTheLiveCertificate(t *testing.T) {
+	f := newRenewFixture(t)
+	ctx := context.Background()
+	if err := HostRevokeCert(ctx, f.client, "node-r", f.prevSerial, 1); err == nil {
+		t.Fatal("revoked the certificate the cluster records for the host")
+	}
+	if crlHas(t, f.op, f.prevSerial) {
+		t.Fatal("the live certificate reached the CRL")
+	}
+	if err := HostRevokeCert(ctx, f.client, "node-r", "0xABCDEF", 1); err != nil {
+		t.Fatal(err)
+	}
+	if !crlHas(t, f.op, "abcdef") || f.client.published != 1 {
+		t.Fatal("a replaced certificate was not revoked and published")
+	}
 }

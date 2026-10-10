@@ -19,6 +19,8 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/pki"
 	"github.com/litevirt/litevirt/internal/ssh"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // HostRenewCert replaces a running host's cluster (mTLS) certificate with a
@@ -65,15 +67,18 @@ type RenewCertOptions struct {
 	GRPCPort int
 	// KeepOld leaves the replaced certificate unrevoked.
 	KeepOld bool
+	// RevokeOld revokes the replaced certificate even when the host is a
+	// member of the adopted voter generation (see voterRevocationHold).
+	RevokeOld bool
 	// Wait bounds each confirmation (served certificate, re-recorded serial).
 	Wait time.Duration
 }
 
 const remotePKIDir = "/etc/litevirt/pki"
 
-// renewTarget is what renewal needs from the host's machine. The SSH form is
-// sshRenewTarget; tests use a directory.
-type renewTarget interface {
+// remotePKI is what installing key material needs from the host's machine.
+// The SSH form is sshRemotePKI; tests use a directory.
+type remotePKI interface {
 	// ReadFile returns path's contents, or ok=false when it does not exist.
 	ReadFile(path string) (data []byte, ok bool, err error)
 	// Install puts each file in place, keeping the files it replaces so
@@ -86,6 +91,8 @@ type renewTarget interface {
 	Commit(files []installFile) error
 	// ReloadLibvirtTLS asks libvirt's TLS listener to re-read its certificate.
 	ReloadLibvirtTLS() error
+	// Remove deletes each path, in order; an absent path is not an error.
+	Remove(paths []string) error
 }
 
 type installFile struct {
@@ -125,12 +132,12 @@ func HostRenewCert(ctx context.Context, c pb.LiteVirtClient, hostName string, op
 	probe := func(ctx context.Context) (*x509.Certificate, error) {
 		return dialServedCert(ctx, net.JoinHostPort(addr, strconv.Itoa(opts.GRPCPort)))
 	}
-	return renewHostCert(ctx, c, &sshRenewTarget{sc: sc}, probe, hostName, opts)
+	return renewHostCert(ctx, c, &sshRemotePKI{sc: sc}, probe, hostName, opts)
 }
 
 // renewHostCert is HostRenewCert past the connections, so it can be driven
 // against a directory and a fake cluster.
-func renewHostCert(ctx context.Context, c pb.LiteVirtClient, r renewTarget, probe servedCertProbe,
+func renewHostCert(ctx context.Context, c pb.LiteVirtClient, r remotePKI, probe servedCertProbe,
 	hostName string, opts RenewCertOptions) error {
 	pkiDir := PKIDir()
 	certPath := filepath.Join(remotePKIDir, "host.crt")
@@ -229,8 +236,19 @@ func renewHostCert(ctx context.Context, c pb.LiteVirtClient, r renewTarget, prob
 
 	if opts.KeepOld {
 		fmt.Printf("  the previous certificate %s was NOT revoked (--keep-old): peers no longer accept it as\n", prevSerial)
-		fmt.Printf("  %s once the new serial is recorded, but it stays a CA-valid credential until %s\n",
+		fmt.Printf("  %s once the new serial is recorded, but it stays a CA-valid credential until %s.\n",
 			hostName, prev.NotAfter.UTC().Format("2006-01-02"))
+		fmt.Printf("  Revoke it later with `lv host revoke-cert %s --serial %s`\n", hostName, prevSerial)
+		return nil
+	}
+	if hold, why := voterRevocationHold(ctx, c, hostName); hold && !opts.RevokeOld {
+		fmt.Printf("  the previous certificate %s was NOT revoked: %s.\n", prevSerial, why)
+		fmt.Println("  The newest voter generation was decided with this host's votes, signed with that")
+		fmt.Println("  certificate, and a node adopting the generation later checks those signatures against")
+		fmt.Println("  the CRL (docs/design/recovery-claims.md §4.1): revoking now could leave it unable to")
+		fmt.Println("  adopt until the voter set next changes. Its key no longer exists on the host. Revoke it")
+		fmt.Printf("  after the next `lv cluster voter` change with `lv host revoke-cert %s --serial %s`,\n", hostName, prevSerial)
+		fmt.Println("  or pass --revoke-old to revoke it now")
 		return nil
 	}
 	if err := revokeHostCert(pkiDir, hostName, prevSerial); err != nil {
@@ -246,11 +264,81 @@ func renewHostCert(ctx context.Context, c pb.LiteVirtClient, r renewTarget, prob
 	return nil
 }
 
+// voterRevocationHold reports whether revoking hostName's replaced
+// certificate should wait: the host is a member of the adopted voter
+// generation, whose certificate carries its votes. An unreadable voter set
+// holds too — revocation can always be done later, and cannot be undone.
+func voterRevocationHold(ctx context.Context, c pb.LiteVirtClient, hostName string) (bool, string) {
+	resp, err := c.GetVoterConfig(ctx, &pb.GetVoterConfigRequest{})
+	if status.Code(err) == codes.Unimplemented {
+		return false, ""
+	}
+	if err != nil {
+		return true, fmt.Sprintf("the voter set could not be read (%v)", err)
+	}
+	for _, m := range resp.GetMembers() {
+		if m.GetName() == hostName {
+			return true, fmt.Sprintf("%s is a member of voter generation %d", hostName, resp.GetAdoptedGeneration())
+		}
+	}
+	return false, ""
+}
+
+// HostRevokeCert revokes one certificate serial issued to hostName and
+// publishes the CRL — the deferred half of a renewal (`lv host renew-cert`
+// --keep-old, or a voter whose revocation was held).
+//
+// It refuses the serial the cluster records for the host and the one the host
+// presents: revoking either cuts the host off from every peer, which is what
+// `lv host rm` is for.
+func HostRevokeCert(ctx context.Context, c pb.LiteVirtClient, hostName, serial string, grpcPort int) error {
+	serial = strings.ToLower(strings.TrimPrefix(strings.TrimSpace(serial), "0x"))
+	if serial == "" {
+		return fmt.Errorf("--serial is required")
+	}
+	if err := requireCAKey(PKIDir(), "revoking a certificate"); err != nil {
+		return err
+	}
+	recorded, err := hostCertSerial(ctx, c, hostName)
+	if err != nil {
+		return fmt.Errorf("read %s's recorded certificate serial: %w", hostName, err)
+	}
+	if strings.EqualFold(recorded, serial) {
+		return fmt.Errorf("%s is the certificate the cluster records for %s; revoking it would cut the host off "+
+			"from every peer. Renew first (`lv host renew-cert %s`), or remove the host (`lv host rm %s`)",
+			serial, hostName, hostName, hostName)
+	}
+	if grpcPort == 0 {
+		grpcPort = 7443
+	}
+	if addr, err := hostAddress(ctx, c, hostName); err == nil {
+		if served, err := dialServedCert(ctx, net.JoinHostPort(addr, strconv.Itoa(grpcPort))); err == nil &&
+			strings.EqualFold(served.SerialNumber.Text(16), serial) {
+			return fmt.Errorf("%s is the certificate %s presents right now; revoking it would cut the host off", serial, hostName)
+		}
+	}
+	return revokeAndPublishSerial(ctx, c, hostName, serial)
+}
+
+func revokeAndPublishSerial(ctx context.Context, c pb.LiteVirtClient, hostName, serial string) error {
+	pkiDir := PKIDir()
+	if err := revokeHostCert(pkiDir, hostName, serial); err != nil {
+		return err
+	}
+	version, err := publishClusterCRL(ctx, c, pkiDir)
+	if err != nil {
+		return fmt.Errorf("%s is revoked in %s, but publishing the CRL failed: %w. Retry with `lv host publish-crl`",
+			serial, filepath.Join(pkiDir, "crl.pem"), err)
+	}
+	fmt.Printf("Revoked certificate %s of %s in CRL %d; every node installs it within a minute\n", serial, hostName, version)
+	return nil
+}
+
 // resignedRejoin returns the host's audit admission record re-signed for
 // nextSerial, or nil when there is none to carry over. Only a record that
 // verifies against the cluster CA and is bound to the certificate being
 // replaced is carried: re-signing anything else would launder it.
-func resignedRejoin(r renewTarget, pkiDir, hostName string, prevPEM []byte, prevSerial, nextSerial string) (*installFile, error) {
+func resignedRejoin(r remotePKI, pkiDir, hostName string, prevPEM []byte, prevSerial, nextSerial string) (*installFile, error) {
 	path := filepath.Join(remotePKIDir, corrosion.AuditRejoinFileName)
 	data, ok, err := r.ReadFile(path)
 	if err != nil {
@@ -391,10 +479,10 @@ func orNotFound(err error) error {
 	return err
 }
 
-// sshRenewTarget is renewTarget over SSH.
-type sshRenewTarget struct{ sc *ssh.Client }
+// sshRemotePKI is remotePKI over SSH.
+type sshRemotePKI struct{ sc *ssh.Client }
 
-func (t *sshRenewTarget) ReadFile(path string) ([]byte, bool, error) {
+func (t *sshRemotePKI) ReadFile(path string) ([]byte, bool, error) {
 	q := ssh.ShellQuote(path)
 	// One command, two answers: a marker for absence, so an empty file and a
 	// missing one are not confused, and a read error is still an error.
@@ -412,7 +500,7 @@ const absentMarker = "__litevirt_file_absent__"
 
 const preRenewSuffix = ".pre-renew"
 
-func (t *sshRenewTarget) Install(files []installFile) error {
+func (t *sshRemotePKI) Install(files []installFile) error {
 	// Stage everything first: a dropped connection mid-transfer must leave the
 	// installed pair untouched.
 	for _, f := range files {
@@ -433,7 +521,7 @@ func (t *sshRenewTarget) Install(files []installFile) error {
 	return t.sc.Run(cmd.String())
 }
 
-func (t *sshRenewTarget) Rollback(files []installFile) error {
+func (t *sshRemotePKI) Rollback(files []installFile) error {
 	var cmd strings.Builder
 	for _, f := range files {
 		b := ssh.ShellQuote(f.path + preRenewSuffix)
@@ -443,7 +531,7 @@ func (t *sshRenewTarget) Rollback(files []installFile) error {
 	return t.sc.Run(cmd.String())
 }
 
-func (t *sshRenewTarget) Commit(files []installFile) error {
+func (t *sshRemotePKI) Commit(files []installFile) error {
 	var cmd strings.Builder
 	cmd.WriteString("rm -f --")
 	for _, f := range files {
@@ -452,11 +540,20 @@ func (t *sshRenewTarget) Commit(files []installFile) error {
 	return t.sc.Run(cmd.String())
 }
 
-func (t *sshRenewTarget) ReloadLibvirtTLS() error {
+func (t *sshRemotePKI) ReloadLibvirtTLS() error {
 	// The monolithic daemon first, then the modular proxy daemon that owns the
 	// TLS socket on newer distributions.
 	return t.sc.Run("virt-admin server-update-tls libvirtd >/dev/null 2>&1 || " +
 		"virt-admin -c virtproxyd:///system server-update-tls virtproxyd >/dev/null 2>&1")
+}
+
+func (t *sshRemotePKI) Remove(paths []string) error {
+	var cmd strings.Builder
+	cmd.WriteString("set -e; ")
+	for _, p := range paths {
+		fmt.Fprintf(&cmd, "rm -f -- %s; ", ssh.ShellQuote(p))
+	}
+	return t.sc.Run(cmd.String())
 }
 
 func stagedPath(path string) string {

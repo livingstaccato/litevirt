@@ -395,10 +395,9 @@ func (r *Reconciler) resolveStrandedOnRemovedHost(ctx context.Context, row corro
 // the file aside).
 func (r *Reconciler) tendStrandedDisk(ctx context.Context, vm *corrosion.VMRecord, d StrandedDisk) (bool, StrandedDisk) {
 	if d.Copy != "" {
-		if _, err := os.Lstat(d.Copy); err != nil && os.IsNotExist(err) {
-			slog.Info("reconciler: a stranded disk copy is gone (removed or restored by an operator)", "vm", vm.Name, "copy", d.Copy)
-			return false, d
-		}
+		// A missing copy is not a removed one (an empty mount point reads
+		// the same): the entry goes only when --remove or --restore reports
+		// the copy gone (dropStrandedCopy), or with its VM.
 		return true, d
 	}
 	if vm.HostName == r.hostName {
@@ -576,6 +575,7 @@ func RestoreSupersededDisk(ctx context.Context, db *corrosion.Client, dataDir, h
 	if err := os.Remove(c.Path); err != nil {
 		slog.Warn("restore: the copy is in place, but its old name could not be removed", "copy", c.Path, "error", err)
 	}
+	dropStrandedCopy(ctx, db, hostName, c.Path, now)
 	slog.Warn("restored a superseded disk copy as the VM's disk", "vm", vm.Name, "disk", disk.DiskName,
 		"path", c.DiskPath, "restored", c.Path, "set_aside", out.SetAside)
 	return out, nil
@@ -840,4 +840,37 @@ func (r *Reconciler) domainRunningHere(name string) bool {
 	}
 	st, err := r.virt.DomainStateReason(name)
 	return err == nil && st.State == "running"
+}
+
+// dropStrandedCopy removes the record entry of a set-aside copy an operator
+// removed (--remove) or put back (--restore), resolving a record left with
+// none. It is the only way a copy's entry goes while its VM exists.
+func dropStrandedCopy(ctx context.Context, db *corrosion.Client, reporter, copyPath string, now time.Time) {
+	open, err := corrosion.ListHealthConditions(ctx, db, false)
+	if err != nil {
+		slog.Warn("could not read the stranded-disk records to drop a removed copy", "copy", copyPath, "error", err)
+		return
+	}
+	for _, row := range open {
+		if row.Evaluator != DiskMissingEvaluator || row.Code != CondVMDiskStranded {
+			continue
+		}
+		var ev StrandedDisks
+		if err := json.Unmarshal([]byte(row.Evidence), &ev); err != nil {
+			continue
+		}
+		var kept []StrandedDisk
+		for _, d := range ev.Disks {
+			if d.Copy != copyPath {
+				kept = append(kept, d)
+			}
+		}
+		if len(kept) == len(ev.Disks) {
+			continue
+		}
+		ev.Disks = kept
+		if err := writeStranded(ctx, db, reporter, row, true, ev, now); err != nil {
+			slog.Warn("could not drop a removed copy from its stranded-disk record", "copy", copyPath, "error", err)
+		}
+	}
 }

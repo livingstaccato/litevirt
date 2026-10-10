@@ -187,7 +187,7 @@ func TestTendStrandedDisks_LeavesTheDiskOfADomainStillRunningHere(t *testing.T) 
 //
 // Mutation: never resolve — the test is red.
 func TestTendStrandedDisks_ClearsWhenNothingIsLeftToKeep(t *testing.T) {
-	db, _, r, _, _ := strandedFixture(t)
+	db, _, r, dataDir, _ := strandedFixture(t)
 	ctx := context.Background()
 	recordWeb(t, db, time.Now())
 	r.tendStrandedDisks(ctx)
@@ -195,7 +195,7 @@ func TestTendStrandedDisks_ClearsWhenNothingIsLeftToKeep(t *testing.T) {
 	if len(ev.Disks) != 1 || ev.Disks[0].Copy == "" {
 		t.Fatalf("setup: %+v", ev)
 	}
-	if err := os.Remove(ev.Disks[0].Copy); err != nil { // the operator's --remove
+	if _, err := RemoveSupersededDisks(ctx, db, dataDir, []string{ev.Disks[0].Copy}); err != nil { // the operator's --remove
 		t.Fatal(err)
 	}
 	r.tendStrandedDisks(ctx)

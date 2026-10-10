@@ -247,6 +247,7 @@ func RemoveSupersededDisks(ctx context.Context, db *corrosion.Client, dataDir st
 		}
 		slog.Warn("removed a superseded disk copy by operator request", "path", c.Path, "disk", c.DiskPath, "vm", c.VM,
 			"retained", c.Retained, "set_aside_at", c.SetAsideAt.Format(time.RFC3339), "bytes", c.SizeBytes)
+		dropStrandedCopy(ctx, db, "", c.Path, time.Now())
 		removed = append(removed, c)
 	}
 	return removed, nil

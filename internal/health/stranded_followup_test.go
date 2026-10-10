@@ -141,3 +141,37 @@ func TestTendStrandedDisks_KeepsTheEntryUnderAnEmptyMountPoint(t *testing.T) {
 		t.Fatalf("once the disk is back it is not set aside: %+v", ev)
 	}
 }
+
+// N6: a set-aside copy missing from its path keeps its record entry (an
+// empty mount point reads like a deletion). The entry goes only when the
+// operator's --remove or --restore reports the copy gone.
+//
+// Mutation: drop a copy's entry in tendStrandedDisk when its file is missing
+// — the entry is dropped with the volume unmounted and the test is red.
+func TestTendStrandedDisks_KeepsACopyEntryUntilTheOperatorRemovesIt(t *testing.T) {
+	db, _, r, dataDir, _ := strandedFixture(t)
+	ctx := context.Background()
+	recordWeb(t, db, time.Now())
+	r.tendStrandedDisks(ctx)
+	_, ev, _ := strandedRow(t, db, "web", "node-a")
+	if len(ev.Disks) != 1 || ev.Disks[0].Copy == "" {
+		t.Fatalf("setup: %+v", ev)
+	}
+	copyPath := ev.Disks[0].Copy
+	if err := os.Rename(copyPath, copyPath+".unmounted"); err != nil {
+		t.Fatal(err)
+	}
+	r.tendStrandedDisks(ctx)
+	if row, ev, ok := strandedRow(t, db, "web", "node-a"); !ok || row.Lifecycle == corrosion.ConditionResolved || len(ev.Disks) != 1 {
+		t.Fatalf("the copy's entry was dropped on a missing file: %+v %+v", row, ev)
+	}
+	if err := os.Rename(copyPath+".unmounted", copyPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RemoveSupersededDisks(ctx, db, dataDir, []string{copyPath}); err != nil {
+		t.Fatal(err)
+	}
+	if row, _, ok := strandedRow(t, db, "web", "node-a"); !ok || row.Lifecycle != corrosion.ConditionResolved {
+		t.Fatalf("condition %+v, want resolved once --remove took the copy", row)
+	}
+}

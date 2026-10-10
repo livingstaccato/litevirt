@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -128,7 +129,7 @@ func (s *Server) restoreSupersededDisk(ctx context.Context, copyPath string) (he
 	}
 	vmName := ""
 	for _, c := range copies {
-		if c.Path == copyPath {
+		if c.Path == filepath.Clean(copyPath) {
 			vmName = c.VM
 		}
 	}

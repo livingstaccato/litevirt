@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"path/filepath"
 	"text/tabwriter"
 	"time"
 
@@ -92,11 +93,11 @@ retained in turn.`,
 					gone := map[string]bool{}
 					for _, d := range resp.Disks {
 						if d.Removed {
-							gone[d.Path] = true
+							gone[filepath.Clean(d.Path)] = true
 						}
 					}
 					for _, p := range remove {
-						if !gone[p] {
+						if !gone[filepath.Clean(p)] {
 							return fmt.Errorf("%s did not remove %s; it may run an older release without --remove", resp.Host, p)
 						}
 					}
@@ -147,6 +148,17 @@ func printSupersededDisks(out io.Writer, resp *pb.SupersededDisksResponse, purge
 		fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\n", d.Path, vm, age, d.SizeBytes, st)
 	}
 	w.Flush()
+	var retained, retainedBytes int64
+	for _, d := range resp.Disks {
+		if d.Retained != "" && !d.Removed {
+			retained++
+			retainedBytes += d.SizeBytes
+		}
+	}
+	if retained > 0 {
+		fmt.Fprintf(out, "Retained: %d copies, %d bytes on %s; kept while their VMs exist (remove one with --remove <copy>).\n",
+			retained, retainedBytes, resp.Host)
+	}
 	if purge {
 		fmt.Fprintf(out, "Removed %d copies (%d bytes) on %s.\n", removed, removedBytes, resp.Host)
 	}

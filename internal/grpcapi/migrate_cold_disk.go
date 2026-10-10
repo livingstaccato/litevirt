@@ -414,7 +414,9 @@ func (s *Server) ReceiveMigrationDisk(stream grpc.ClientStreamingServer[pb.Recei
 			return status.Errorf(codes.FailedPrecondition,
 				"disk %s of VM %q already exists on %s, and this migration did not create it. "+
 					"It may be the VM's disk from an earlier stay on %s, and the copy would overwrite it. "+
-					"Check whether it is still needed, move it aside or remove it on %s, then migrate again",
+					"It may be the only copy of the VM's data from before a failover: do not delete it. Move it aside on %s "+
+					"(rename it to <path>.superseded-<time>, which `lv host superseded-disks` then lists and keeps), "+
+					"then migrate again",
 				hdr.Path, vm.Name, s.hostName, s.hostName, s.hostName)
 		}
 	} else if !os.IsNotExist(err) {

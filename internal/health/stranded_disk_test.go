@@ -404,4 +404,6 @@ func TestStartHeldVM_OnlyAHeldVMDownForNoReasonOfItsOwn(t *testing.T) {
 	}
 }
 
-func lvDomainStatus(state, reason string) lv.DomainStatus { return lv.DomainStatus{State: state, Reason: reason} }
+func lvDomainStatus(state, reason string) lv.DomainStatus {
+	return lv.DomainStatus{State: state, Reason: reason}
+}

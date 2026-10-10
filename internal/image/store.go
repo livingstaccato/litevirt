@@ -229,7 +229,10 @@ func (s *Store) VMDiskCandidates(vmName string) ([]string, error) {
 		return nil, err
 	}
 	for _, e := range entries {
-		if !e.IsDir() {
+		// A copy a failover set aside (<disk>.superseded-<time>) is retained
+		// while its VM exists and removed only by an operator
+		// (health/superseded_retention.go): never a sweep candidate.
+		if !e.IsDir() && !strings.Contains(e.Name(), ".superseded-") {
 			matches = append(matches, filepath.Join(legacyDir, e.Name()))
 		}
 	}

@@ -41,7 +41,7 @@ A notification has a `kind` (verb.noun), `severity` (`info` | `warn` | `error`),
 | `ha.dualrun.coverage` | warn | a workload-capable host could not be fully probed this pass — unreachable (segmented/down) OR returned a partial runtime (a local libvirt/container/ip probe errored, so its workload absence is unreliable); split-brain can't be ruled out there |
 | `quota.exceeded` | warn | a CreateVM is rejected by a project quota |
 | `ct.rootfs.stranded` | warn | a container relocated off a failed host left its own rootfs there (nothing removes it); the detail names the container and the host |
-| `vm.disk.stranded` | warn | a failover restarted a VM elsewhere and left its host-local disk on the failed host, or a host set such a disk (or an old copy a failover found) aside; the detail names the VM, the host and the path. See [migration-failover.md](migration-failover.md#the-real-disk-a-restart-leaves-behind) |
+| `vm.disk.stranded` | warn | a failover restarted a VM elsewhere and left its host-local disk on the failed host, a host set such a disk (or an old copy a failover found) aside, or failover held a `restart-same` VM with a host-local disk on its failed host to wait for it; the detail names the VM, the host and the path. See [migration-failover.md](migration-failover.md#the-real-disk-a-restart-leaves-behind) |
 | `test.notification` | info | `lv notify test` / the UI "Test" button |
 
 > **Route the `ha.vip.*` kinds if you enable VIP HA** (`enforcement.vip_self_demote` /

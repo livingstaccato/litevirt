@@ -968,7 +968,15 @@ the disk paths the cluster records and in the data directory's `disks/` folder.
 
 During a rolling upgrade a host on the previous release keeps copies by the
 old rule, from the VM's state alone; nothing this release writes changes a
-VM's state, so it removes nothing it would not have removed before. Ask a host
+VM's state, so it removes nothing it would not have removed before. Two
+consequences follow. A failed host that comes back on the previous release
+does not set the real disk aside, so a cold migration back onto it is refused
+on the occupied path: rename the file there to
+`<disk path>.superseded-<time>` yourself (never delete it), or upgrade the host
+first. And a later failover back onto a host on the previous release sets the
+disk aside by the old rule, and that host's sweep removes it after
+`superseded_disk_retention_days`: upgrade a host before it takes failovers
+back. Ask a host
 on this release for `--remove` and `--restore`: a host on the previous release
 answers with the listing and removes nothing, and the command says so.
 

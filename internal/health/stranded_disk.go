@@ -413,6 +413,11 @@ func (r *Reconciler) tendStrandedDisk(ctx context.Context, vm *corrosion.VMRecor
 	fi, err := os.Lstat(d.Path)
 	if err != nil {
 		if os.IsNotExist(err) {
+			// Its directory missing is a volume not mounted (yet), not a
+			// disk gone: keep the entry and look again next pass.
+			if di, derr := os.Stat(filepath.Dir(d.Path)); derr != nil || !di.IsDir() {
+				return true, d
+			}
 			slog.Warn("reconciler: a disk a failover left on this host is no longer at its path; nothing to keep",
 				"vm", vm.Name, "path", d.Path)
 			return false, d
@@ -490,6 +495,9 @@ type RestoredCopy struct {
 	SetAside string // where the file it replaced was set aside; "" when there was none
 }
 
+// linkFile is os.Link; a test replaces it to make the link fail.
+var linkFile = os.Link
+
 // ErrRestoreRefused marks a restore refused for the VM's state or place, as
 // opposed to a failure.
 var ErrRestoreRefused = errors.New("restore refused")
@@ -560,8 +568,16 @@ func RestoreSupersededDisk(ctx context.Context, db *corrosion.Client, dataDir, h
 		return RestoredCopy{}, err
 	}
 	// Link, then unlink: a link never replaces an existing file.
-	if err := os.Link(c.Path, c.DiskPath); err != nil {
-		return out, fmt.Errorf("put %s back at %s: %w", c.Path, c.DiskPath, err)
+	if err := linkFile(c.Path, c.DiskPath); err != nil {
+		// Never leave the VM with no disk at its path: put back the one set
+		// aside above.
+		if out.SetAside != "" {
+			if rerr := os.Rename(out.SetAside, c.DiskPath); rerr != nil {
+				return out, fmt.Errorf("put %s back at %s: %w; the disk that was there is kept at %s (moving it back failed: %v)",
+					c.Path, c.DiskPath, err, out.SetAside, rerr)
+			}
+		}
+		return out, fmt.Errorf("put %s back at %s: %w; nothing was changed", c.Path, c.DiskPath, err)
 	}
 	if err := os.Remove(c.Path); err != nil {
 		slog.Warn("restore: the copy is in place, but its old name could not be removed", "copy", c.Path, "error", err)
@@ -629,7 +645,28 @@ func RecordHeldForHost(ctx context.Context, db *corrosion.Client, reporter, vmNa
 	if err != nil {
 		return "", err
 	}
-	if !had || row.Lifecycle == corrosion.ConditionResolved {
+	open := had && row.Lifecycle != corrosion.ConditionResolved
+	if open {
+		// Keep when the hold began; an unchanged hold is not rewritten (the
+		// removed-host pass re-decides it every few seconds).
+		var prev HeldForHost
+		if json.Unmarshal([]byte(row.Evidence), &prev) == nil {
+			since := map[string]string{}
+			for _, d := range prev.Disks {
+				since[d.Path] = d.Since
+			}
+			for i := range ev.Disks {
+				if s := since[ev.Disks[i].Path]; s != "" {
+					ev.Disks[i].Since = s
+				}
+			}
+		}
+		if nb, merr := json.Marshal(ev); merr == nil && string(nb) == row.Evidence {
+			return ev.Detail + ". " + ev.Fix, nil
+		}
+		b, _ = json.Marshal(ev)
+	}
+	if !open {
 		row = corrosion.HealthCondition{
 			Evaluator: DiskMissingEvaluator, Code: CondVMFailoverHeld, SubjectKind: "vm",
 			SubjectID: strandedSubject(vmName, host), FirstSeen: ts, ConfirmedAt: ts,

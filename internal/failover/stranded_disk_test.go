@@ -84,3 +84,24 @@ func TestRecoverWorkloads_RecordsTheLocalDiskItLeavesBehind(t *testing.T) {
 		t.Fatalf("notifications = %q, want one for local-vm@bad", notified)
 	}
 }
+
+// M8: a container relocated by restoring a backup elsewhere leaves its own
+// rootfs (newer than the backup) on the failed host; that is recorded like
+// an image-recreate relocation.
+//
+// Mutation: drop the noteRootfsStranded call in completeRestore — no record,
+// red.
+func TestCompleteRestore_RecordsTheRootfsLeftBehind(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	ct := corrosion.ContainerRecord{HostName: "bad", Name: "web", State: "running", OnHostFailure: "image-recreate"}
+	if err := corrosion.UpsertContainer(ctx, db, ct); err != nil {
+		t.Fatal(err)
+	}
+	c := newTestCoordinator("good", db)
+	c.completeRestore(ctx, &corrosion.HostRecord{Name: "bad", State: "fenced"}, ct, "good")
+	got, err := health.StrandedRootfsOf(ctx, db, "web")
+	if err != nil || len(got) != 1 || got[0].Host != "bad" || got[0].How != "backup-restore" || got[0].MovedTo != "good" {
+		t.Fatalf("records = %+v (err %v), want the rootfs left on bad by a backup restore", got, err)
+	}
+}

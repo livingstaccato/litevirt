@@ -311,13 +311,13 @@ func (c *ContainerChecker) recreateRelocated(ctx context.Context, ct corrosion.C
 	// relocate marker, otherwise clearing it would drop the rebuild forever.
 	if live, err := c.runtime.State(ctx, ct.Name); err == nil &&
 		(live == lxc.StateRunning || live == lxc.StateStopped) {
-		// One a relocation off this host left behind is adopted as before,
-		// and now said (stranded_rootfs.go).
-		c.noteAdoptedRootfs(ctx, ct.Name)
 		ifs := corrosion.BuildContainerInterfacesFromSpec(c.hostName, ct.Name, spec)
 		if !c.writeRelocatedNICs(ctx, ct.Name, ifs) {
 			return // row write failed → keep the marker, retry next sweep
 		}
+		// One a relocation off this host left behind is adopted as before,
+		// and now said (stranded_rootfs.go) — once the adopt's rows are in.
+		c.noteAdoptedRootfs(ctx, ct.Name)
 		if _, err := network.ReserveContainerNICs(ctx, c.db, c.hostName, ct.Name, relocateLeaseProof(ct), ifs); err != nil {
 			slog.Warn("containercheck: relocate IP re-reservation incomplete", "container", ct.Name, "error", err)
 		}

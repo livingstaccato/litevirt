@@ -146,17 +146,26 @@ func StrandedRootfsOf(ctx context.Context, db *corrosion.Client, name string) ([
 // record once none is, or once a live row names it here again. It touches no
 // container.
 func (c *ContainerChecker) tendStrandedRootfs(ctx context.Context, local map[string]bool) {
+	// Not from a replica still catching up: a row it has not received yet
+	// (the relocation) reads as the container still here.
+	if ok, _ := corrosion.ReplicaTrusted(ctx, c.db, c.hostName, c.replicaCaughtUp); !ok {
+		return
+	}
 	open, err := corrosion.ListHealthConditions(ctx, c.db, false)
 	if err != nil {
 		return
 	}
 	suffix := "@" + c.hostName
 	for _, row := range open {
-		if row.Evaluator != CTRootfsEvaluator || row.Code != CondCTRootfsStranded || !strings.HasSuffix(row.SubjectID, suffix) {
+		if row.Evaluator != CTRootfsEvaluator || row.Code != CondCTRootfsStranded {
 			continue
 		}
 		var ev StrandedRootfs
 		if err := json.Unmarshal([]byte(row.Evidence), &ev); err != nil {
+			continue
+		}
+		if !strings.HasSuffix(row.SubjectID, suffix) {
+			c.resolveRootfsOnRemovedHost(ctx, row, ev)
 			continue
 		}
 		live, err := corrosion.GetContainer(ctx, c.db, c.hostName, ev.Container)
@@ -204,5 +213,22 @@ func (c *ContainerChecker) noteAdoptedRootfs(ctx context.Context, name string) {
 	}
 	c.publish("ct.relocate.adopted", name, detail)
 	slog.Warn("containercheck: relocation adopted the container's own rootfs left here earlier", "container", name)
+	_ = writeStrandedRootfs(ctx, c.db, c.hostName, row, true, true, ev, time.Now())
+}
+
+// resolveRootfsOnRemovedHost clears another host's record once nothing can act
+// on it: that host was removed from the cluster (or is unknown) and no live
+// container of that name is left anywhere. The host itself clears its own.
+func (c *ContainerChecker) resolveRootfsOnRemovedHost(ctx context.Context, row corrosion.HealthCondition, ev StrandedRootfs) {
+	if ev.Container == "" || ev.Host == "" {
+		return
+	}
+	if h, err := corrosion.GetHost(ctx, c.db, ev.Host); err != nil || (h != nil && h.State != "removed") {
+		return
+	}
+	live, err := c.db.Query(ctx, `SELECT 1 FROM containers WHERE name = ? AND deleted_at IS NULL LIMIT 1`, ev.Container)
+	if err != nil || len(live) > 0 {
+		return
+	}
 	_ = writeStrandedRootfs(ctx, c.db, c.hostName, row, true, true, ev, time.Now())
 }

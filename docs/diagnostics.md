@@ -1810,11 +1810,13 @@ that failed. Failover left it there instead of restarting it elsewhere on a
 disk rebuilt blank from its image. The coordinator raises `vm_failover_held`
 (evaluator `vm_disk`, subject `vm/<name>@<host>`, warning); the evidence names
 the host, the disks and what to do (see
-[VM failure policies](migration-failover.md#vm-failure-policies)).
+[VM failure policies](migration-failover.md#vm-failure-policies)). A held VM
+still counts in the failover's stranded-workloads gauge: it is a workload on a
+down host that no other host runs.
 
 | Raised when | Clears when |
 |---|---|
-| Failover leaves a restart-same VM with a host-local disk on its failed host. | The host is back and runs the VM again, or the VM moved or was deleted. A record for a host removed from the cluster clears once the VM is deleted or elsewhere. |
+| Failover leaves a restart-same VM with a host-local disk on its failed host. | The host is back and the VM runs there again (a host that comes back `fenced` needs `lv host undrain <host>` first), or, once the host is back, the VM is on another host or deleted. A record for a host removed from the cluster clears once the VM is deleted or on another host. |
 
 ### A relocated container's own rootfs is on another host (`ct_rootfs_stranded`)
 

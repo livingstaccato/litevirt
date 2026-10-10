@@ -957,6 +957,19 @@ const foundingSetupEnv = "LITEVIRT_GENESIS=1"
 // while its cluster is unreachable does not mint a second admin either. Every other
 // setup clears a marker left by a `host init` whose daemon never started.
 // LV_DATA_DIR exists for tests; the daemon's data_dir is /var/lib/litevirt.
+// uiTLSScript decides the ui_tls the setup script writes (needs $CONFIG).
+// A NEW node gets `on`: its UI speaks TLS from the start, with the cluster
+// certificate until a custom or ACME certificate is configured, so turning on
+// a non-loopback ui_bind later never sends logins in clear. A node being
+// re-initialised keeps what its config already says — a node whose config
+// predates the key, and so runs plain HTTP behind a proxy, stays on `auto`.
+const uiTLSScript = `if [ -f "$CONFIG" ]; then
+    UI_TLS=$(grep -m1 -E '^ui_tls:' "$CONFIG" | sed -E 's/^ui_tls:[[:space:]]*"?([a-z]*)"?.*/\1/')
+    UI_TLS=${UI_TLS:-auto}
+else
+    UI_TLS=on
+fi`
+
 const genesisMarkerScript = `
 # Founder marker: licenses this node's daemon to mint the cluster's first admin.
 LV_DATA_DIR="${LV_DATA_DIR:-/var/lib/litevirt}"
@@ -1339,8 +1352,11 @@ if [ -d /etc/apparmor.d ] && command -v apparmor_parser &>/dev/null; then
 fi
 
 # Write litevirtd config
+CONFIG=/etc/litevirt/config.yaml
+` + uiTLSScript + `
 cat > /etc/litevirt/config.yaml << CONF
 host_name: "${HOST_NAME}"
+ui_tls: ${UI_TLS}
 grpc_port: 7443
 metrics_port: 7444
 gossip_port: 7946

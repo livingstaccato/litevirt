@@ -32,15 +32,17 @@ ui_port: 7445
 # non-loopback address.
 ui_bind: "127.0.0.1"
 
-# Whether the web UI speaks TLS itself (docs/ui.md, "TLS").
-#   auto (default): TLS while a custom certificate is installed
+# Whether the web UI speaks TLS itself (docs/ui.md, "TLS"). `lv host init` /
+# `lv host add` write `on` for a NEW node; a config without the key (an older
+# node) means auto, and re-initialising a node keeps the value it has.
+#   auto (the default when unset): TLS while a custom certificate is installed
 #        (`lv host ui-cert set`) or acme: is configured; plain HTTP otherwise.
 #        Re-decided while running — installing or clearing a certificate
 #        switches the listener within seconds, no restart.
 #   on:  always TLS. Serves the custom certificate, else ACME's, else this
 #        host's cluster certificate (issued by the cluster CA; import ca.crt
 #        into browsers that should trust it).
-ui_tls: auto
+ui_tls: on
 
 # WebSocket Origin allowlist for the UI (host patterns). Empty (default)
 # enforces strict same-origin checks on the console WebSocket; add entries

@@ -115,6 +115,9 @@ func (p *RFC2136) update(ctx context.Context, fqdn, value string, add bool) erro
 	if p.KeyName == "" || p.Secret == "" {
 		return fmt.Errorf("rfc2136: a TSIG key is required")
 	}
+	if err := p.checkOwner(fqdn); err != nil {
+		return err
+	}
 	m := new(dns.Msg)
 	m.SetUpdate(dns.Fqdn(p.Zone))
 	rr := []dns.RR{p.txt(fqdn, value)}
@@ -132,6 +135,21 @@ func (p *RFC2136) update(ctx context.Context, fqdn, value string, add bool) erro
 	}
 	if r.Rcode != dns.RcodeSuccess {
 		return fmt.Errorf("rfc2136: %s refused the update of %s: %s", p.Nameserver, fqdn, dns.RcodeToString[r.Rcode])
+	}
+	return nil
+}
+
+// checkOwner refuses any name but an _acme-challenge record inside Zone: the
+// TSIG key is the authority to edit the zone, and this provider only ever has
+// a reason to write challenge records.
+func (p *RFC2136) checkOwner(fqdn string) error {
+	name := strings.ToLower(dns.Fqdn(fqdn))
+	zone := strings.ToLower(dns.Fqdn(p.Zone))
+	if !strings.HasPrefix(name, "_acme-challenge.") {
+		return fmt.Errorf("rfc2136: refusing to write %s: only _acme-challenge records are written", fqdn)
+	}
+	if rest := strings.TrimPrefix(name, "_acme-challenge."); rest != zone && !strings.HasSuffix(rest, "."+zone) {
+		return fmt.Errorf("rfc2136: refusing to write %s: it is not inside zone %s", fqdn, p.Zone)
 	}
 	return nil
 }

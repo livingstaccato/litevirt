@@ -4,9 +4,11 @@ The litevirt web UI runs on port 7445. It is built with Go templates and HTMX --
 
 ## TLS
 
-By default the UI listens on `127.0.0.1` and speaks **plain HTTP**: it is meant
-to be reached through an SSH tunnel or a reverse proxy that terminates TLS. It
-speaks HTTPS itself in three cases, decided by `ui_tls` (configuration.md):
+The UI listens on `127.0.0.1` by default. A node installed by `lv host init` /
+`lv host add` gets `ui_tls: on`, so its UI speaks **HTTPS** from the start (with
+the cluster certificate until you install your own). A node whose config predates
+the key runs under `ui_tls: auto` and speaks plain HTTP — meant for an SSH tunnel
+or a TLS-terminating proxy — until a certificate source exists. The sources:
 
 | Source | How | Precedence |
 |---|---|---|

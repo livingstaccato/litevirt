@@ -9,6 +9,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -48,6 +49,8 @@ type Issuer struct {
 
 	mu   sync.RWMutex
 	cert *tls.Certificate
+
+	pendingMu sync.Mutex
 }
 
 const (
@@ -81,8 +84,70 @@ func (i *Issuer) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, e
 	return c, nil
 }
 
+// requested reports whether name (an authorization identifier, a wildcard's
+// base without "*.") is one this issuer asked for.
+func (i *Issuer) requested(name string) bool {
+	name = strings.ToLower(strings.TrimSuffix(name, "."))
+	for _, d := range i.Domains {
+		if strings.ToLower(strings.TrimPrefix(strings.TrimSuffix(d, "."), "*.")) == name {
+			return true
+		}
+	}
+	return false
+}
+
+type pendingRecord struct {
+	FQDN  string `json:"fqdn"`
+	Value string `json:"value"`
+}
+
+const pendingFile = "dns01-pending.json"
+
+func (i *Issuer) readPending() []pendingRecord {
+	b, err := os.ReadFile(filepath.Join(i.CacheDir, pendingFile))
+	if err != nil {
+		return nil
+	}
+	var out []pendingRecord
+	_ = json.Unmarshal(b, &out)
+	return out
+}
+
+// notePending adds (or removes) a record from the list of challenge records
+// published and not yet removed.
+func (i *Issuer) notePending(r pendingRecord, add bool) {
+	i.pendingMu.Lock()
+	defer i.pendingMu.Unlock()
+	var out []pendingRecord
+	for _, p := range i.readPending() {
+		if p != r {
+			out = append(out, p)
+		}
+	}
+	if add {
+		out = append(out, r)
+	}
+	b, _ := json.Marshal(out)
+	if err := os.MkdirAll(i.CacheDir, 0o700); err == nil {
+		_ = secretfile.Write(filepath.Join(i.CacheDir, pendingFile), b, 0o600)
+	}
+}
+
+// sweepPending removes challenge records an earlier run published and never
+// cleaned up (a crash between Present and CleanUp).
+func (i *Issuer) sweepPending(ctx context.Context) {
+	for _, r := range i.readPending() {
+		if err := i.Provider.CleanUp(ctx, r.FQDN, r.Value); err != nil {
+			slog.Warn("acme dns-01: could not remove a challenge record left by an earlier run", "record", r.FQDN, "error", err)
+			continue
+		}
+		i.notePending(r, false)
+	}
+}
+
 // Run serves the cached certificate and keeps it renewed until ctx ends.
 func (i *Issuer) Run(ctx context.Context) {
+	i.sweepPending(ctx)
 	if err := i.loadCached(); err != nil && !errors.Is(err, os.ErrNotExist) {
 		slog.Warn("acme dns-01: ignoring the cached certificate", "error", err)
 	}
@@ -223,8 +288,11 @@ func (i *Issuer) Obtain(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// The CN is Domains[0] verbatim — a wildcard included. A CA counts the CN
+	// as a requested name, and one that is not among the SANs (the bare base
+	// of a wildcard) makes the finalize fail.
 	csr, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{
-		Subject:  pkix.Name{CommonName: strings.TrimPrefix(i.Domains[0], "*.")},
+		Subject:  pkix.Name{CommonName: i.Domains[0]},
 		DNSNames: i.Domains,
 	}, key)
 	if err != nil {
@@ -247,6 +315,12 @@ func (i *Issuer) authorize(ctx context.Context, cl *acme.Client, url string) err
 	if z.Status == acme.StatusValid {
 		return nil
 	}
+	// The owner name comes from the CA. Publish only for a name this issuer
+	// asked for: a directory answering with another name would otherwise get a
+	// TXT record written anywhere the TSIG key reaches.
+	if !i.requested(z.Identifier.Value) {
+		return fmt.Errorf("the CA asked to validate %q, which is not one of %v; refusing", z.Identifier.Value, i.Domains)
+	}
 	var chal *acme.Challenge
 	for _, c := range z.Challenges {
 		if c.Type == "dns-01" {
@@ -262,6 +336,9 @@ func (i *Issuer) authorize(ctx context.Context, cl *acme.Client, url string) err
 		return err
 	}
 	fqdn := "_acme-challenge." + strings.TrimPrefix(z.Identifier.Value, "*.") + "."
+	// Remember the record before publishing it, so one a crash leaves behind is
+	// removed at the next start (sweepPending).
+	i.notePending(pendingRecord{FQDN: fqdn, Value: value}, true)
 	if err := i.Provider.Present(ctx, fqdn, value); err != nil {
 		return fmt.Errorf("publish the challenge record: %w", err)
 	}
@@ -269,9 +346,11 @@ func (i *Issuer) authorize(ctx context.Context, cl *acme.Client, url string) err
 		cctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		if err := i.Provider.CleanUp(cctx, fqdn, value); err != nil {
-			slog.Warn("acme dns-01: could not remove the challenge record; remove it by hand",
+			slog.Warn("acme dns-01: could not remove the challenge record; it is retried at the next start",
 				"record", fqdn, "error", err)
+			return
 		}
+		i.notePending(pendingRecord{FQDN: fqdn, Value: value}, false)
 	}()
 	if err := i.waitVisible(ctx, fqdn, value); err != nil {
 		return err

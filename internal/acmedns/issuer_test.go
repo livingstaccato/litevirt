@@ -100,8 +100,11 @@ type fakeCA struct {
 
 	mu        sync.Mutex
 	thumb     string
-	ids       []string
+	ids       []string // authorization identifiers (a wildcard's base)
+	wild      []bool
+	reqIDs    []string // identifiers as ordered
 	authz     []string // status per identifier
+	rename    string   // when set, every authorization names this instead (a hostile CA)
 	finalized bool
 	certPEM   []byte
 	issued    int
@@ -167,9 +170,15 @@ func (ca *fakeCA) serve(w http.ResponseWriter, r *http.Request) {
 			Identifiers []struct{ Type, Value string }
 		}
 		_ = json.Unmarshal(payload, &req)
-		ca.ids, ca.authz, ca.finalized = nil, nil, false
+		ca.ids, ca.wild, ca.reqIDs, ca.authz, ca.finalized = nil, nil, nil, nil, false
 		for _, id := range req.Identifiers {
-			ca.ids = append(ca.ids, id.Value)
+			base := strings.TrimPrefix(id.Value, "*.")
+			if ca.rename != "" {
+				base = ca.rename
+			}
+			ca.ids = append(ca.ids, base)
+			ca.wild = append(ca.wild, strings.HasPrefix(id.Value, "*."))
+			ca.reqIDs = append(ca.reqIDs, id.Value)
 			ca.authz = append(ca.authz, "pending")
 		}
 		w.Header().Set("Location", ca.url("/order/1"))
@@ -182,7 +191,7 @@ func (ca *fakeCA) serve(w http.ResponseWriter, r *http.Request) {
 		var n int
 		fmt.Sscanf(p, "/authz/%d", &n)
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"status": ca.authz[n], "identifier": map[string]string{"type": "dns", "value": ca.ids[n]},
+			"status": ca.authz[n], "identifier": map[string]string{"type": "dns", "value": ca.ids[n]}, "wildcard": ca.wild[n],
 			"challenges": []map[string]string{{"type": "dns-01", "url": ca.url(fmt.Sprintf("/chal/%d", n)),
 				"token": fmt.Sprintf("tok%d", n), "status": ca.authz[n]}},
 		})
@@ -205,6 +214,18 @@ func (ca *fakeCA) serve(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
+		}
+		// As Boulder does: the CN counts as a requested name, and every name
+		// in the request must be one the order authorised.
+		names := map[string]bool{}
+		for _, id := range ca.reqIDs {
+			names[id] = true
+		}
+		for _, n := range append([]string{csr.Subject.CommonName}, csr.DNSNames...) {
+			if n != "" && !names[n] {
+				http.Error(w, `{"type":"urn:ietf:params:acme:error:badCSR","detail":"CSR names `+n+`, not in the order"}`, http.StatusBadRequest)
+				return
+			}
 		}
 		tmpl := &x509.Certificate{SerialNumber: big.NewInt(time.Now().UnixNano()), DNSNames: csr.DNSNames,
 			NotBefore: time.Now().Add(-time.Minute), NotAfter: time.Now().Add(90 * 24 * time.Hour),
@@ -241,7 +262,7 @@ func (ca *fakeCA) orderLocked() map[string]any {
 		}
 	}
 	var authz, ids []any
-	for i, id := range ca.ids {
+	for i, id := range ca.reqIDs {
 		authz = append(authz, ca.url(fmt.Sprintf("/authz/%d", i)))
 		ids = append(ids, map[string]string{"type": "dns", "value": id})
 	}
@@ -336,5 +357,65 @@ func TestIssuer_AWrongRecordFails(t *testing.T) {
 	}
 	if d.removed == 0 {
 		t.Fatal("the challenge record was not cleaned up after a failure")
+	}
+}
+
+// A wildcard listed first: the request's CN is the wildcard itself, which the
+// CA (enforcing CN ⊆ SANs as Boulder does) accepts, and the challenge is
+// published at the base name.
+//
+// Mutation: CN = Domains[0] without "*." — the fake CA refuses the finalize.
+func TestIssuer_AWildcardFirstOrder(t *testing.T) {
+	d := &memDNS{txt: map[string][]string{}}
+	ca := newFakeCA(t, d)
+	iss := &Issuer{DirectoryURL: ca.url("/dir"), Domains: []string{"*.hv.example.test"},
+		CacheDir: t.TempDir(), Provider: d, PropagationTimeout: 5 * time.Second}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := iss.Obtain(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := iss.GetCertificate(&tls.ClientHelloInfo{ServerName: "a.hv.example.test"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A CA that asks to validate a name the issuer never requested gets no record.
+//
+// Mutation: drop the requested() check — a record is published for the CA's
+// name.
+func TestIssuer_RefusesAnAuthorizationForAnotherName(t *testing.T) {
+	d := &memDNS{txt: map[string][]string{}}
+	ca := newFakeCA(t, d)
+	ca.rename = "victim.example.test"
+	iss := newIssuer(t, ca, d, t.TempDir())
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := iss.Obtain(ctx); err == nil {
+		t.Fatal("issued for a name the CA substituted")
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if len(d.txt["_acme-challenge.victim.example.test."]) != 0 || d.removed != 0 {
+		t.Fatal("published a record for a name the issuer never asked for")
+	}
+}
+
+// A record a crashed run left behind is removed at the next start.
+//
+// Mutation: drop sweepPending from Run — the record stays.
+func TestIssuer_SweepsRecordsACrashLeft(t *testing.T) {
+	d := &memDNS{txt: map[string][]string{"_acme-challenge.ui.example.test.": {"stale"}}}
+	dir := t.TempDir()
+	iss := &Issuer{Domains: []string{"ui.example.test"}, CacheDir: dir, Provider: d}
+	iss.notePending(pendingRecord{FQDN: "_acme-challenge.ui.example.test.", Value: "stale"}, true)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // Run sweeps, then returns at the first wait
+	iss.Run(ctx)
+	if d.has("_acme-challenge.ui.example.test.", "stale") {
+		t.Fatal("a challenge record left by a crash was not removed")
+	}
+	if len(iss.readPending()) != 0 {
+		t.Fatal("the pending list still holds the removed record")
 	}
 }

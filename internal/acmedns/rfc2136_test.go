@@ -177,3 +177,28 @@ func TestTSIGAlgorithmAndNameserver(t *testing.T) {
 		t.Fatalf("NormalizeNameserver = %s", got)
 	}
 }
+
+// The provider writes only _acme-challenge records inside its zone, whatever
+// it is asked: the TSIG key is authority over the whole zone.
+//
+// Mutation: drop checkOwner — the out-of-zone and non-challenge updates are
+// sent (and the in-zone one is accepted by the server).
+func TestRFC2136_WritesOnlyChallengeRecordsInItsZone(t *testing.T) {
+	z := startFakeZone(t, "example.test", "litevirt-acme", testSecret())
+	p := newProvider(z, testSecret())
+	ctx := context.Background()
+	for _, bad := range []string{"www.example.test.", "_acme-challenge.example.org.", "_acme-challenge.notexample.test."} {
+		if err := p.Present(ctx, bad, "v"); err == nil {
+			t.Errorf("wrote %s", bad)
+		}
+	}
+	z.mu.Lock()
+	n := z.updates
+	z.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("%d refused updates reached the server", n)
+	}
+	if err := p.Present(ctx, "_acme-challenge.example.test.", "apex"); err != nil {
+		t.Fatalf("the zone apex's challenge record was refused: %v", err)
+	}
+}

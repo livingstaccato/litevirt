@@ -460,7 +460,12 @@ func TestMD_ExactDeleteResolvesADuplicate(t *testing.T) {
 	if _, err := s.DeleteUser(adminCtx(), &pb.DeleteUserRequest{Username: "Bob"}); err == nil {
 		t.Fatal("a normalized delete chose one of two duplicates")
 	}
-	if _, err := s.DeleteUser(adminCtx(), &pb.DeleteUserRequest{Username: "Bob", Exact: true}); err != nil {
+	stored, err := corrosion.GetUserExact(context.Background(), s.db, "Bob")
+	if err != nil || stored == nil {
+		t.Fatalf("GetUserExact(Bob): %v %v", stored, err)
+	}
+	if _, err := s.DeleteUser(adminCtx(), &pb.DeleteUserRequest{Username: "Bob", Exact: true,
+		ExactId: corrosion.VariantID(stored.Username, stored.CreatedAt)}); err != nil {
 		t.Fatalf("exact delete of Bob: %v", err)
 	}
 	if r := login(t, s, "bob", "pw1"); r.Token == "" {
@@ -513,7 +518,7 @@ func TestME_StuckRecheckCutsTheStream(t *testing.T) {
 	// Stuck the way a query behind a held lock is: deaf to its context.
 	release := make(chan struct{})
 	defer close(release)
-	hook := func(context.Context) { <-release }
+	hook := func(context.Context) error { <-release; return nil }
 	recheckHook.Store(&hook)
 	defer recheckHook.Store(nil)
 	wantStreamCut(t, "a stream whose recheck hangs", done, 3*time.Second)

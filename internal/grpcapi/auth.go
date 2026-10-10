@@ -269,7 +269,7 @@ func (s *Server) authenticate(ctx context.Context) (context.Context, error) {
 			if err := s.refuseAmbiguousAccount(ctx, user.Username); err != nil {
 				return nil, err
 			}
-			if err := s.refuseInactiveAccount(ctx, user.Username); err != nil {
+			if err := s.refuseInactiveToken(ctx, user.Username, user.TokenCreatedAt); err != nil {
 				return nil, err
 			}
 			ctx = context.WithValue(ctx, ctxKeyUsername, user.Username)
@@ -579,6 +579,9 @@ func (s *Server) authenticateForwardedBearer(ctx context.Context, val string) (c
 			// the owner would churn the row across nodes.
 			return nil, status.Error(codes.Unavailable, "forwarded identity not yet visible on owner; retry")
 		}
+		if user.Username != sess.Username {
+			return nil, status.Error(codes.Unauthenticated, "forwarded session belongs to an account that no longer exists")
+		}
 		if err := s.refuseInactiveSession(ctx, user.Username, sess.CreatedAt); err != nil {
 			return nil, err
 		}
@@ -618,7 +621,7 @@ func (s *Server) authenticateForwardedBearer(ctx context.Context, val string) (c
 	if err := s.refuseAmbiguousAccount(ctx, user.Username); err != nil {
 		return nil, err
 	}
-	if err := s.refuseInactiveAccount(ctx, user.Username); err != nil {
+	if err := s.refuseInactiveToken(ctx, user.Username, user.TokenCreatedAt); err != nil {
 		return nil, err
 	}
 	ctx = context.WithValue(ctx, ctxKeyUsername, user.Username)
@@ -697,6 +700,14 @@ func (s *Server) authenticateSession(ctx context.Context, sid string) (context.C
 	// Checked on every request rather than at disable time, so a disable or
 	// an expiry takes effect on every node as soon as its replica has it,
 	// whatever happened to the session rows.
+	// A session is bound to the EXACT stored name it was minted for
+	// (rereview-2 N6). The lookup above is normalized, so once one of two
+	// spellings is deleted, a session of the deleted one would otherwise
+	// resolve to — and authenticate as — the spelling that survives.
+	if user.Username != sess.Username {
+		_ = corrosion.RevokeSession(ctx, s.db, sid)
+		return nil, status.Error(codes.Unauthenticated, "session belongs to an account that no longer exists")
+	}
 	if err := s.refuseInactiveSession(ctx, user.Username, sess.CreatedAt); err != nil {
 		return nil, err
 	}

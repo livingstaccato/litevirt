@@ -209,11 +209,14 @@ func (r *OIDCRealm) Authenticate(ctx context.Context, creds Credentials) (*Princ
 
 	p := &Principal{
 		Subject: subject,
-		Realm:   r.Name(),
-		Email:   stringClaim(claims, r.emailClaim),
-		Name:    stringClaim(claims, r.nameClaim),
-		Groups:  stringSliceClaim(claims, r.groupsClaim),
-		Claims:  flattenClaims(claims),
+		// The account is bound to (issuer, sub) — the IdP's stable identity
+		// of this person — whatever claim names the account (rereview N5).
+		ExternalID: idTok.Issuer + "|" + idTok.Subject,
+		Realm:      r.Name(),
+		Email:      stringClaim(claims, r.emailClaim),
+		Name:       stringClaim(claims, r.nameClaim),
+		Groups:     stringSliceClaim(claims, r.groupsClaim),
+		Claims:     flattenClaims(claims),
 	}
 	return p, nil
 }

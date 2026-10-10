@@ -411,6 +411,9 @@ var capabilityMap = map[string]tableResolver{
 	// v64 first-enrollment codes: a tie between two different codes is never
 	// coin-flipped into one of them.
 	"user_enrollment_codes": {category: "policy", chain: policyChain()},
+	// v64 identity bindings: two different ids for one account at one instant
+	// are never coin-flipped.
+	"user_identity_bindings": {category: "policy", chain: policyChain()},
 	// v56 credential tables: a tie naming two different secrets is never
 	// coin-flipped into one of them — tombstone wins, anything else differing
 	// goes to a human, same as the rest of this block.

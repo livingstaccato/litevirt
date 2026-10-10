@@ -148,7 +148,7 @@ func runResetAdmin(ctx context.Context, env resetAdminEnv) error {
 			codeCtx, cancel := context.WithTimeout(ctx, resetAdminRPCTimeout)
 			code, cerr := client.IssueEnrollmentCode(codeCtx, &pb.IssueEnrollmentCodeRequest{Username: "admin"})
 			cancel()
-			printEnrollmentCode(env.out, code.GetCode(), code.GetExpiresAt(), cerr)
+			printEnrollmentCode(env.out, code.GetCode(), code.GetExpiresAt(), code.GetIssuedOn(), cerr)
 		}
 		return nil
 	case codes.Unavailable, codes.Unimplemented:
@@ -172,13 +172,16 @@ func runResetAdmin(ctx context.Context, env resetAdminEnv) error {
 
 // printEnrollmentCode tells the operator the admin's first-enrollment code, or
 // how to get one when it could not be issued.
-func printEnrollmentCode(out io.Writer, code, expires string, err error) {
+func printEnrollmentCode(out io.Writer, code, expires, issuedOn string, err error) {
 	if err != nil || code == "" {
 		fmt.Fprintf(out, "No enrollment code could be issued (%v). Issue one as root on a node where\n"+
 			"login_policy_v1 has latched: `sudo lv 2fa enroll-code admin`.\n", err)
 		return
 	}
 	fmt.Fprintf(out, "Enrollment code for the admin's first factor (single use, until %s):\n  %s\n", expires, code)
+	if issuedOn != "" {
+		fmt.Fprintf(out, "It works only through node %s: log in to that node to enroll.\n", issuedOn)
+	}
 	fmt.Fprintln(out, "Log in as admin, then `lv 2fa enroll-totp --code <code>`, then log in again.")
 }
 
@@ -231,7 +234,7 @@ func resetAdminOffline(ctx context.Context, db *corrosion.Client, dataDir, pwPat
 	if clear2FA {
 		fmt.Fprintln(out, "Every second factor of the admin account was removed.")
 		code, exp, err := corrosion.IssueEnrollmentCode(ctx, db, "admin", 0, "root (reset-admin)", db.HostName())
-		printEnrollmentCode(out, code, exp, err)
+		printEnrollmentCode(out, code, exp, db.HostName(), err)
 	}
 	return nil
 }

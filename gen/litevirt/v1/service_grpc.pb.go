@@ -131,6 +131,8 @@ const (
 	LiteVirt_GetLoginPolicy_FullMethodName             = "/litevirt.v1.LiteVirt/GetLoginPolicy"
 	LiteVirt_SetLoginPolicy_FullMethodName             = "/litevirt.v1.LiteVirt/SetLoginPolicy"
 	LiteVirt_IssueEnrollmentCode_FullMethodName        = "/litevirt.v1.LiteVirt/IssueEnrollmentCode"
+	LiteVirt_ListUserVariants_FullMethodName           = "/litevirt.v1.LiteVirt/ListUserVariants"
+	LiteVirt_ClearIdentityBinding_FullMethodName       = "/litevirt.v1.LiteVirt/ClearIdentityBinding"
 	LiteVirt_CreateToken_FullMethodName                = "/litevirt.v1.LiteVirt/CreateToken"
 	LiteVirt_RevokeToken_FullMethodName                = "/litevirt.v1.LiteVirt/RevokeToken"
 	LiteVirt_Whoami_FullMethodName                     = "/litevirt.v1.LiteVirt/Whoami"
@@ -501,6 +503,8 @@ type LiteVirtClient interface {
 	GetLoginPolicy(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*LoginPolicy, error)
 	SetLoginPolicy(ctx context.Context, in *SetLoginPolicyRequest, opts ...grpc.CallOption) (*LoginPolicy, error)
 	IssueEnrollmentCode(ctx context.Context, in *IssueEnrollmentCodeRequest, opts ...grpc.CallOption) (*IssueEnrollmentCodeResponse, error)
+	ListUserVariants(ctx context.Context, in *ListUserVariantsRequest, opts ...grpc.CallOption) (*ListUserVariantsResponse, error)
+	ClearIdentityBinding(ctx context.Context, in *ClearIdentityBindingRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	CreateToken(ctx context.Context, in *CreateTokenRequest, opts ...grpc.CallOption) (*Token, error)
 	RevokeToken(ctx context.Context, in *RevokeTokenRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// Whoami returns the authenticated caller's identity. Authenticated (NOT in
@@ -2175,6 +2179,26 @@ func (c *liteVirtClient) IssueEnrollmentCode(ctx context.Context, in *IssueEnrol
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(IssueEnrollmentCodeResponse)
 	err := c.cc.Invoke(ctx, LiteVirt_IssueEnrollmentCode_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) ListUserVariants(ctx context.Context, in *ListUserVariantsRequest, opts ...grpc.CallOption) (*ListUserVariantsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListUserVariantsResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_ListUserVariants_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) ClearIdentityBinding(ctx context.Context, in *ClearIdentityBindingRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, LiteVirt_ClearIdentityBinding_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -4382,6 +4406,8 @@ type LiteVirtServer interface {
 	GetLoginPolicy(context.Context, *emptypb.Empty) (*LoginPolicy, error)
 	SetLoginPolicy(context.Context, *SetLoginPolicyRequest) (*LoginPolicy, error)
 	IssueEnrollmentCode(context.Context, *IssueEnrollmentCodeRequest) (*IssueEnrollmentCodeResponse, error)
+	ListUserVariants(context.Context, *ListUserVariantsRequest) (*ListUserVariantsResponse, error)
+	ClearIdentityBinding(context.Context, *ClearIdentityBindingRequest) (*emptypb.Empty, error)
 	CreateToken(context.Context, *CreateTokenRequest) (*Token, error)
 	RevokeToken(context.Context, *RevokeTokenRequest) (*emptypb.Empty, error)
 	// Whoami returns the authenticated caller's identity. Authenticated (NOT in
@@ -5146,6 +5172,12 @@ func (UnimplementedLiteVirtServer) SetLoginPolicy(context.Context, *SetLoginPoli
 }
 func (UnimplementedLiteVirtServer) IssueEnrollmentCode(context.Context, *IssueEnrollmentCodeRequest) (*IssueEnrollmentCodeResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method IssueEnrollmentCode not implemented")
+}
+func (UnimplementedLiteVirtServer) ListUserVariants(context.Context, *ListUserVariantsRequest) (*ListUserVariantsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListUserVariants not implemented")
+}
+func (UnimplementedLiteVirtServer) ClearIdentityBinding(context.Context, *ClearIdentityBindingRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method ClearIdentityBinding not implemented")
 }
 func (UnimplementedLiteVirtServer) CreateToken(context.Context, *CreateTokenRequest) (*Token, error) {
 	return nil, status.Error(codes.Unimplemented, "method CreateToken not implemented")
@@ -7552,6 +7584,42 @@ func _LiteVirt_IssueEnrollmentCode_Handler(srv interface{}, ctx context.Context,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).IssueEnrollmentCode(ctx, req.(*IssueEnrollmentCodeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_ListUserVariants_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListUserVariantsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ListUserVariants(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ListUserVariants_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ListUserVariants(ctx, req.(*ListUserVariantsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_ClearIdentityBinding_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ClearIdentityBindingRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ClearIdentityBinding(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ClearIdentityBinding_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ClearIdentityBinding(ctx, req.(*ClearIdentityBindingRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -11107,6 +11175,14 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "IssueEnrollmentCode",
 			Handler:    _LiteVirt_IssueEnrollmentCode_Handler,
+		},
+		{
+			MethodName: "ListUserVariants",
+			Handler:    _LiteVirt_ListUserVariants_Handler,
+		},
+		{
+			MethodName: "ClearIdentityBinding",
+			Handler:    _LiteVirt_ClearIdentityBinding_Handler,
 		},
 		{
 			MethodName: "CreateToken",

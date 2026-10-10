@@ -93,6 +93,14 @@ func ResetAdminPassword(ctx context.Context, c *Client, passwordHash string, cle
 				"and `lv user expire admin never` from a node where it has", state)
 		}
 		stmts = append(stmts, enable...)
+		// A re-enable is a session cut-off here as in SetUserLifecycle
+		// (rereview-2 m-3): nothing minted before it — on a node the disable
+		// had not reached — revives with it. Set back by the skew margin, as
+		// a re-create's is (ResetUserLifecycle), so the operator's login
+		// right after the reset works at once.
+		cutoff := time.Now().Add(-SessionCutoffSkewMargin - time.Second).UTC().Format(time.RFC3339)
+		stmts = append(stmts, Statement{SQL: userLifecycleUpsertSQL,
+			Params: []interface{}{name, UserAttrSessionsNotBefore, cutoff, "user.reset-admin", now}})
 	}
 	pw, err := updateUserPasswordStatements(ctx, c, name, passwordHash, now)
 	if err != nil {

@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -44,11 +45,11 @@ type LDAPConfig struct {
 	//   (&(objectClass=group)(member=%s))
 	GroupFilter string
 
-	// UserLoginAttr is the attribute whose value IS the account's login name,
-	// read back from the directory entry and used as the litevirt subject.
-	// Empty: every attribute UserFilter matches the typed name against
-	// ("(uid=%s)" → uid), in filter order, then the entry DN's own RDN when
-	// it is one of those. The typed name is never the subject (rereview N4).
+	// UserLoginAttr, when set, is the one attribute the typed login name must
+	// literally match (after normalization): it must be present and
+	// single-valued on the entry, or the login is refused. Empty: the typed
+	// name must match a value of some attribute UserFilter matches it against
+	// ("(uid=%s)" → uid), or the entry DN's own RDN (rereview N5).
 	UserLoginAttr string
 
 	// Attributes — overridable so non-standard schemas can be handled.
@@ -147,10 +148,12 @@ func (r *LDAPRealm) Authenticate(ctx context.Context, creds Credentials) (*Princ
 		}
 	}
 
-	// The directory matches names case-insensitively and ignores surrounding
-	// spaces, so the subject is the normalized name, never the raw input:
-	// otherwise `ALICE` binds as the same directory entry as `alice` and
-	// becomes a different litevirt account (t1-auth-review I2).
+	// The account name is the normalized TYPED login name, as it always was
+	// (no account is re-keyed on upgrade). Three things keep two directory
+	// entries from becoming one account (rereview N5): the search must
+	// return exactly one entry; the typed name must name-match that entry's
+	// own login value (below); and the login handler binds the account to the
+	// entry's immutable id (Principal.ExternalID) and refuses any other.
 	username := strings.TrimSpace(creds.Username)
 	filter := substituteUser(r.cfg.UserFilter, username)
 	req := ldap.NewSearchRequest(
@@ -158,7 +161,8 @@ func (r *LDAPRealm) Authenticate(ctx context.Context, creds Credentials) (*Princ
 		ldap.ScopeWholeSubtree, ldap.NeverDerefAliases,
 		2, 0, false, // SizeLimit=2 → fast-fail on duplicates
 		filter,
-		append([]string{"dn", r.cfg.UserNameAttr, r.cfg.UserMailAttr, r.cfg.UserGroupAttr}, r.loginAttrs()...),
+		append(append([]string{"dn", r.cfg.UserNameAttr, r.cfg.UserMailAttr, r.cfg.UserGroupAttr}, r.loginAttrs()...),
+			immutableIDAttrs...),
 		nil,
 	)
 	res, err := conn.Search(req)
@@ -193,23 +197,21 @@ func (r *LDAPRealm) Authenticate(ctx context.Context, creds Credentials) (*Princ
 	}
 	groups = normalizeGroups(groups, r.cfg.GroupNameAttr)
 
-	// The subject is the DIRECTORY's own value for the login attribute, not
-	// what was typed: a directory matches width, case and space variants of a
-	// name (RFC 4518 string preparation: `ａｌｉｃｅ`, `alice\u00a0`, `ALICE`
-	// all bind as alice's entry), and taking the typed form made each variant
-	// a different, never-disabled litevirt account (rereview N4).
-	// Normalization stays as the second line of defence.
-	login := r.entryLogin(entry)
-	if login == "" {
-		return nil, fmt.Errorf("%w: directory entry %q has no login attribute (%s); set user_login_attr",
-			ErrInvalidCredentials, entry.DN, strings.Join(r.loginAttrs(), ", "))
+	// Name match: the directory matches width, case and compatibility
+	// variants of a name (RFC 4518: `ａｌｉｃｅ` binds as alice's entry); the
+	// typed name must equal the entry's OWN login value after litevirt's
+	// normalization, so a variant is refused rather than becoming a second,
+	// never-disabled account (rereview N4).
+	if err := r.nameMatches(entry, username); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidCredentials, err)
 	}
 	p := &Principal{
-		Subject: corrosion.NormalizeUsername(login),
-		Realm:   r.Name(),
-		Email:   firstAttr(entry, r.cfg.UserMailAttr),
-		Name:    firstAttr(entry, r.cfg.UserNameAttr),
-		Groups:  groups,
+		Subject:    corrosion.NormalizeUsername(username),
+		ExternalID: entryImmutableID(entry),
+		Realm:      r.Name(),
+		Email:      firstAttr(entry, r.cfg.UserMailAttr),
+		Name:       firstAttr(entry, r.cfg.UserNameAttr),
+		Groups:     groups,
 		Claims: map[string]string{
 			"dn": entry.DN,
 		},
@@ -220,44 +222,92 @@ func (r *LDAPRealm) Authenticate(ctx context.Context, creds Credentials) (*Princ
 // filterAttrRe finds each "(attr=%s)" in a user filter.
 var filterAttrRe = regexp.MustCompile(`\(([A-Za-z][A-Za-z0-9-]*)=%s\)`)
 
-// loginAttrs is the attributes the login name may be read from, in order:
-// UserLoginAttr, then each attribute UserFilter matches the typed name against.
+// loginAttrs is the attributes a typed name is matched against: the
+// configured UserLoginAttr alone when set, else each attribute UserFilter
+// matches the typed name against ("(uid=%s)" → uid), in filter order.
 func (r *LDAPRealm) loginAttrs() []string {
+	if r.cfg.UserLoginAttr != "" {
+		return []string{r.cfg.UserLoginAttr}
+	}
 	var out []string
 	seen := map[string]bool{}
-	add := func(a string) {
-		if a != "" && !seen[strings.ToLower(a)] {
+	for _, m := range filterAttrRe.FindAllStringSubmatch(r.cfg.UserFilter, -1) {
+		if a := m[1]; !seen[strings.ToLower(a)] {
 			seen[strings.ToLower(a)] = true
 			out = append(out, a)
 		}
 	}
-	add(r.cfg.UserLoginAttr)
-	for _, m := range filterAttrRe.FindAllStringSubmatch(r.cfg.UserFilter, -1) {
-		add(m[1])
-	}
 	return out
 }
 
-// entryLogin reads the login name from the entry: the first login attribute
-// with a value, else the DN's RDN value when its attribute is a login
-// attribute. "" when there is none.
-func (r *LDAPRealm) entryLogin(e *ldap.Entry) string {
+// nameMatches checks the typed name against the entry's own login value.
+//
+// With user_login_attr configured, that attribute must be present and
+// single-valued, and its value must normalize to the typed name — no
+// fall-through to any other attribute.
+//
+// Without it, some value of an attribute the filter matched the name against
+// (or the DN's own RDN when its attribute is one of those) must normalize to
+// the typed name. Only literal values count: a directory's width, case and
+// compatibility folding is not litevirt's.
+func (r *LDAPRealm) nameMatches(e *ldap.Entry, typed string) error {
+	want := corrosion.NormalizeUsername(typed)
+	if r.cfg.UserLoginAttr != "" {
+		vals := e.GetAttributeValues(r.cfg.UserLoginAttr)
+		if len(vals) != 1 {
+			return fmt.Errorf("entry %q has %d values of user_login_attr %q; exactly one is required",
+				e.DN, len(vals), r.cfg.UserLoginAttr)
+		}
+		if corrosion.NormalizeUsername(vals[0]) != want {
+			return fmt.Errorf("the name does not match entry %q's %s", e.DN, r.cfg.UserLoginAttr)
+		}
+		return nil
+	}
 	attrs := r.loginAttrs()
+	if len(attrs) == 0 {
+		return fmt.Errorf("user_filter matches the name against no (attr=%%s) term; set user_login_attr")
+	}
 	for _, a := range attrs {
-		if v := strings.TrimSpace(firstAttr(e, a)); v != "" {
-			return v
+		for _, v := range e.GetAttributeValues(a) {
+			if corrosion.NormalizeUsername(v) == want {
+				return nil
+			}
 		}
 	}
 	if dn, err := ldap.ParseDN(e.DN); err == nil && len(dn.RDNs) > 0 {
 		for _, av := range dn.RDNs[0].Attributes {
 			for _, a := range attrs {
-				if strings.EqualFold(av.Type, a) && strings.TrimSpace(av.Value) != "" {
-					return strings.TrimSpace(av.Value)
+				if strings.EqualFold(av.Type, a) && corrosion.NormalizeUsername(av.Value) == want {
+					return nil
 				}
 			}
 		}
 	}
-	return ""
+	return fmt.Errorf("the name is not literally the login value of entry %q", e.DN)
+}
+
+// immutableIDAttrs are the directory attributes that identify an entry for
+// its whole life, in the order they are tried: entryUUID (RFC 4530; OpenLDAP
+// and most servers), objectGUID (Active Directory), nsUniqueId (389/RHDS).
+var immutableIDAttrs = []string{"entryUUID", "objectGUID", "nsUniqueId"}
+
+// entryImmutableID is the identity an account is bound to: the first
+// immutable id attribute the server returned ("entryUUID:<v>",
+// "objectGUID:<hex>", "nsUniqueId:<v>"), else the entry's DN, lower-cased
+// ("dn:<dn>"). A DN changes when an entry is renamed or moved, so a directory
+// without an immutable id rebinds on those (docs/auth.md).
+func entryImmutableID(e *ldap.Entry) string {
+	for _, a := range immutableIDAttrs {
+		raw := e.GetRawAttributeValue(a)
+		if len(raw) == 0 {
+			continue
+		}
+		if a == "objectGUID" {
+			return a + ":" + hex.EncodeToString(raw)
+		}
+		return a + ":" + string(raw)
+	}
+	return "dn:" + strings.ToLower(e.DN)
 }
 
 // SyncGroups is a no-op — group memberships are pulled at login time.

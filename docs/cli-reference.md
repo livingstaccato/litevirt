@@ -32,7 +32,7 @@ lv 2fa ls [--user <name>]                  # List enrolled factors
 lv 2fa policy                              # Show the mandatory second-factor policy
 lv 2fa policy off|all|<realm>[,<realm>...] # Set it (admin); ends sessions in newly covered realms
   [--allow-self-enroll --enroll-by <RFC3339>] # let a first factor be enrolled without a code until then
-lv 2fa enroll-code <username> [--ttl 1h]   # Admin: single-use first-enrollment code (max 24h)
+lv 2fa enroll-code <username> [--ttl 1h]   # Admin: single-use first-enrollment code (max 24h), usable only through the node it names
 lv 2fa enroll-totp --code <code>           # Enroll a first factor from an enrollment-only session
 ```
 
@@ -985,14 +985,17 @@ show the VM deleted and no domain of that name is defined there.
 ```bash
 lv user create <username> --role admin|operator|viewer
 lv user ls
-lv user delete <username> [--exact]   # --exact: match the name as stored (resolve a case-duplicate)
+lv user delete <username>             # Revokes its sessions and API tokens in the same write
+lv user delete <username> --exact     # List the accounts named like <username> (case-duplicates) with ids; deletes nothing
+lv user delete <username> --exact --id <id>   # Delete the one chosen by id (admin, audited)
+lv user unbind <username> <realm>     # Clear an LDAP/OIDC account's directory binding; next login binds afresh (admin)
 lv user passwd [username]           # Change your own password (or, as admin, another user's)
   [--old-password <p>] [--new-password <p>]   # prompts if unset; old not needed for an admin reset
 lv user token-create <username> <token-name> [--expires <RFC3339>]
   [--scope-path <path>] ...        # Repeatable; intersect with role bindings
 lv user token-revoke <token-id>
 lv user reset-admin                # As root on a node: reset the EXISTING admin password (does not create one); audited as user.reset-admin
-                                   # It also re-enables a disabled or expired admin account
+                                   # It also re-enables a disabled or expired admin account, and logs it out everywhere
 lv user reset-admin --clear-2fa    # Also remove the admin's second factors and print an enrollment code
 lv user disable <username>         # No login; sessions ended, sessions and API tokens refused (admin)
 lv user enable <username>          # Re-enable; API tokens work again, ended sessions stay ended (admin)

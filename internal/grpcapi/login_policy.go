@@ -131,6 +131,21 @@ func (s *Server) accountLifecycle(ctx context.Context, username string) (corrosi
 	return life, nil
 }
 
+// refuseInactiveToken is refuseInactiveAccount for an API token created at
+// createdAt: it also refuses a token from before the account's last delete or
+// re-create, so a token whose revoke never reached this node does not come
+// back with the name (rereview-2 m-4).
+func (s *Server) refuseInactiveToken(ctx context.Context, username, createdAt string) error {
+	life, err := s.accountLifecycle(ctx, username)
+	if err != nil {
+		return err
+	}
+	if life.TokenPredates(createdAt) {
+		return status.Error(codes.Unauthenticated, "API token predates the account's last delete or re-create")
+	}
+	return nil
+}
+
 // refuseInactiveSession is refuseInactiveAccount for a session created at
 // createdAt: it also refuses a session from before the account's last disable
 // or expiry, so re-enabling an account revives none of its old sessions —
@@ -612,5 +627,67 @@ func (s *Server) IssueEnrollmentCode(ctx context.Context, req *pb.IssueEnrollmen
 		return nil, status.Errorf(codes.Internal, "issue enrollment code: %v", err)
 	}
 	s.audit(ctx, "2fa.enroll_code", user.Username, "expires_at="+exp+" issued_on="+s.hostName, "ok")
-	return &pb.IssueEnrollmentCodeResponse{Code: code, ExpiresAt: exp}, nil
+	// The code is bound to this node (rereview N3); say which, so the
+	// operator hands the user the right address with it (rereview-2 m-5).
+	return &pb.IssueEnrollmentCodeResponse{Code: code, ExpiresAt: exp, IssuedOn: s.hostName}, nil
+}
+
+// ListUserVariants lists every live account whose name normalizes like
+// req.Username — the spellings a normalized lookup refuses to choose between —
+// with what an operator chooses by: creation time, role, realm, last login
+// seen here, and the factors and tokens each holds. Each carries the id an
+// exact delete takes (rereview-2 m-7). Admin only.
+func (s *Server) ListUserVariants(ctx context.Context, req *pb.ListUserVariantsRequest) (*pb.ListUserVariantsResponse, error) {
+	if err := RequireRole(ctx, "admin"); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(req.GetUsername()) == "" {
+		return nil, status.Error(codes.InvalidArgument, "username required")
+	}
+	vs, err := corrosion.UserVariants(ctx, s.db, req.GetUsername())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "list accounts named like %q: %v", req.GetUsername(), err)
+	}
+	resp := &pb.ListUserVariantsResponse{}
+	for _, v := range vs {
+		resp.Variants = append(resp.Variants, &pb.UserVariant{
+			Id: v.ID, Username: v.Username, CreatedAt: v.CreatedAt, Role: v.Role, Realm: v.Realm,
+			LastLogin: v.LastLogin, Factors: int32(v.Factors), Tokens: int32(v.Tokens),
+		})
+	}
+	return resp, nil
+}
+
+// ClearIdentityBinding drops the directory entry an external-realm account is
+// bound to (rereview-2 N5), for when the directory re-created the user's entry
+// under a new immutable id: the account's next login binds afresh. Admin only,
+// audited, and refused until login_policy_v1 has latched.
+func (s *Server) ClearIdentityBinding(ctx context.Context, req *pb.ClearIdentityBindingRequest) (*emptypb.Empty, error) {
+	if err := RequireRole(ctx, "admin"); err != nil {
+		return nil, err
+	}
+	if req.GetUsername() == "" || req.GetRealm() == "" {
+		return nil, status.Error(codes.InvalidArgument, "username and realm required")
+	}
+	if !s.loginPolicySettable() {
+		return nil, loginPolicyNotLatched()
+	}
+	name := req.GetUsername()
+	if u, err := corrosion.GetUser(ctx, s.db, name); err != nil {
+		return nil, status.Errorf(codes.Internal, "look up user %q: %v", name, err)
+	} else if u != nil {
+		name = u.Username
+	}
+	was, err := corrosion.GetIdentityBinding(ctx, s.db, name, req.GetRealm())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "read the identity binding: %v", err)
+	}
+	if err := corrosion.ClearIdentityBinding(ctx, s.db, name, req.GetRealm()); err != nil {
+		if errors.Is(err, corrosion.ErrLoginPolicyGateClosed) {
+			return nil, status.Error(codes.FailedPrecondition, err.Error())
+		}
+		return nil, status.Errorf(codes.Internal, "clear the identity binding: %v", err)
+	}
+	s.audit(ctx, "user.identity_unbind", name, "realm="+req.GetRealm()+" was="+was, "ok")
+	return &emptypb.Empty{}, nil
 }

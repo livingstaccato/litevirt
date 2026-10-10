@@ -161,6 +161,10 @@ var firstShapeAcks = map[string]string{
 		"Client.MayWriteLoginPolicy and otherwise inserts the session alone; the gate is wired to " +
 		"DurablyLatched(login_policy_v1) — mandatory and in capabilities.replicationGated, so confirmed against " +
 		"every memberlist recipient — and fails CLOSED when unwired",
+	"user_identity_bindings": "every writer (corrosion.BindIdentity, ClearIdentityBinding, and the clear " +
+		"DeleteUser appends while the gate is open) writes only when Client.MayWriteLoginPolicy, wired to " +
+		"DurablyLatched(login_policy_v1) — mandatory and in capabilities.replicationGated — failing CLOSED when " +
+		"unwired. Its RPCs (Login's binding, ClearIdentityBinding) refuse or skip on the same latch",
 	"user_enrollment_codes": "every writer (corrosion.IssueEnrollmentCode, ConsumeEnrollmentCode, " +
 		"InvalidateEnrollmentCode, and the invalidation SetUserLifecycle, ResetUserLifecycle and DeleteUser " +
 		"append while the gate is open) returns " +

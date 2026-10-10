@@ -72,6 +72,8 @@ func (s *Server) ConsoleVM(stream grpc.BidiStreamingServer[pb.ConsoleInput, pb.C
 		return status.Errorf(codes.Internal, "open console PTY %s: %v", ptyPath, err)
 	}
 	defer ptmx.Close()
+	// Released at the cut even if this handler is blocked elsewhere (m-2).
+	registerStreamCloser(ctx, func() { _ = ptmx.Close() })
 
 	slog.Info("console session started", "vm", vmName)
 

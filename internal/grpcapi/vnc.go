@@ -71,6 +71,8 @@ func (s *Server) ProxyVNC(stream grpc.BidiStreamingServer[pb.VNCData, pb.VNCData
 		return status.Errorf(codes.Internal, "connect to VNC port %d: %v", port, err)
 	}
 	defer conn.Close()
+	// Released at the cut even if this handler is blocked elsewhere (m-2).
+	registerStreamCloser(stream.Context(), func() { _ = conn.Close() })
 
 	slog.Info("VNC proxy session started", "vm", vmName, "port", port)
 

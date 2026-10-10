@@ -423,6 +423,9 @@ var tableNames = []string{
 	// here so every replica converges on one row per account — a re-issue on
 	// one node and a use on another otherwise leave two answers.
 	"user_enrollment_codes",
+	// v64 directory identity bindings: every node enforces them at login, so
+	// a node that missed one must be repaired. Nothing secret.
+	"user_identity_bindings",
 }
 
 // sensitiveTableNames are secret-bearing tables repaired only by the peer-mTLS

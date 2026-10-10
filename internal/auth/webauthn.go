@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"sync"
 	"time"
 
@@ -268,17 +269,17 @@ type bytesReaderImpl struct {
 
 func (r *bytesReaderImpl) Read(p []byte) (int, error) {
 	if r.i >= len(r.b) {
-		return 0, fmtErrorEOF
+		// io.EOF itself: a reader that ends with any other error is a FAILED
+		// read to io.ReadAll and every decoder, which made every WebAuthn
+		// registration and assertion fail to parse ("Parse error for
+		// Registration"). Found by the fix-round-3 attestation test.
+		return 0, io.EOF
 	}
 	n := copy(p, r.b[r.i:])
 	r.i += n
 	return n, nil
 }
 func (r *bytesReaderImpl) Close() error { return nil }
-
-// fmtErrorEOF is returned at end of bytesReaderImpl; we don't depend
-// on io.EOF directly to avoid the larger import surface in this file.
-var fmtErrorEOF = errors.New("EOF")
 
 // asTime makes the go-webauthn TimedSessionData round-trip happy in
 // tests where we want to inspect a session's expiry.

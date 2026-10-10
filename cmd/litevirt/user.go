@@ -31,6 +31,7 @@ func newUserCmd() *cobra.Command {
 		newUserDisableCmd(),
 		newUserEnableCmd(),
 		newUserExpireCmd(),
+		newUserUnbindCmd(),
 	)
 	return cmd
 }
@@ -149,17 +150,40 @@ func newUserListCmd() *cobra.Command {
 
 func newUserDeleteCmd() *cobra.Command {
 	var exact bool
+	var id string
 	cmd := &cobra.Command{
 		Use:   "delete <username>",
 		Short: "Delete a user (its sessions and API tokens are revoked)",
 		Long: `Delete a user. Its sessions and API tokens are revoked and its open streams
-end. Names are matched ignoring case and surrounding spaces; two accounts that
-differ only that way are refused by every lookup — remove one with --exact,
-which matches the name exactly as stored (admin, audited).`,
+end, in the same write as the delete. Names are matched ignoring case and
+surrounding spaces; two accounts that differ only that way are refused by every
+lookup. To remove one of them, run --exact without --id: it lists every account
+named like <username> with its id, creation time, role, realm, last login,
+factors and tokens, and deletes nothing. Then run it again with --id <id> of
+the one to remove (admin, audited).`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if id != "" && !exact {
+				return fmt.Errorf("--id chooses among the accounts --exact lists; pass --exact too")
+			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
-				_, err := c.DeleteUser(ctx, &pb.DeleteUserRequest{Username: args[0], Exact: exact})
+				if exact && id == "" {
+					r, err := c.ListUserVariants(ctx, &pb.ListUserVariantsRequest{Username: args[0]})
+					if err != nil {
+						return err
+					}
+					w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+					fmt.Fprintln(w, "ID\tUSERNAME\tCREATED\tROLE\tREALM\tLAST LOGIN\tFACTORS\tTOKENS")
+					for _, v := range r.GetVariants() {
+						fmt.Fprintf(w, "%s\t%q\t%s\t%s\t%s\t%s\t%d\t%d\n", v.GetId(), v.GetUsername(), v.GetCreatedAt(),
+							v.GetRole(), v.GetRealm(), orDash(v.GetLastLogin()), v.GetFactors(), v.GetTokens())
+					}
+					if err := w.Flush(); err != nil {
+						return err
+					}
+					return fmt.Errorf("nothing deleted: choose one account and run `lv user delete --exact %s --id <ID>`", args[0])
+				}
+				_, err := c.DeleteUser(ctx, &pb.DeleteUserRequest{Username: args[0], Exact: exact, ExactId: id})
 				if err != nil {
 					return err
 				}
@@ -168,7 +192,33 @@ which matches the name exactly as stored (admin, audited).`,
 			})
 		},
 	}
-	cmd.Flags().BoolVar(&exact, "exact", false, "match the name exactly as stored (to remove one of two case-duplicates)")
+	cmd.Flags().BoolVar(&exact, "exact", false, "list the accounts named like <username> (with --id: delete the one chosen)")
+	cmd.Flags().StringVar(&id, "id", "", "with --exact: the id of the account to delete, from the list --exact prints")
+	return cmd
+}
+
+// newUserUnbindCmd clears the directory entry an external-realm account is
+// bound to, for when the directory re-created the user's entry.
+func newUserUnbindCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "unbind <username> <realm>",
+		Short: "Clear the directory entry an LDAP or OIDC account is bound to (admin)",
+		Long: `An LDAP or OIDC account is bound, on its first login, to the directory entry's
+immutable id (LDAP entryUUID, objectGUID or nsUniqueId, else its DN; OIDC
+issuer and subject), and a login through any other entry is refused. When the
+directory re-creates a user's entry under a new id, clear the binding: the
+account's next login binds to the entry it comes through (admin, audited).`,
+		Args: cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				if _, err := c.ClearIdentityBinding(ctx, &pb.ClearIdentityBindingRequest{Username: args[0], Realm: args[1]}); err != nil {
+					return err
+				}
+				fmt.Printf("Cleared the directory binding of %q in realm %q; its next login binds afresh\n", args[0], args[1])
+				return nil
+			})
+		},
+	}
 	return cmd
 }
 

@@ -56,6 +56,12 @@ const (
 	// one whose row reached a node after that node's revocation sweep had run
 	// (t1-auth-review m2). Never cleared by a re-enable.
 	UserAttrSessionsNotBefore = "sessions_not_before"
+	// UserAttrTokensNotBefore is the RFC3339 instant before which no API
+	// token of the account is honoured, "" for none. A delete and a re-create
+	// set it — not a disable, whose tokens work again on re-enable — so a
+	// token whose revoke never reached a node does not come back with the
+	// name (rereview-2 m-4).
+	UserAttrTokensNotBefore = "tokens_not_before"
 
 	// LoginTwoFactorPolicyKey is the cluster_policies key of the mandatory
 	// second-factor policy.
@@ -111,6 +117,8 @@ type UserLifecycle struct {
 	ExpiresAt string
 	// SessionsNotBefore is UserAttrSessionsNotBefore, "" for none.
 	SessionsNotBefore string
+	// TokensNotBefore is UserAttrTokensNotBefore, "" for none.
+	TokensNotBefore string
 	// Unreadable names a stored attribute this build could not parse. Such an
 	// account is inactive: see InactiveReason.
 	Unreadable string
@@ -169,6 +177,24 @@ func (l UserLifecycle) SessionPredates(createdAt string) bool {
 	return ca.Before(nb.Add(SessionCutoffSkewMargin))
 }
 
+// TokenPredates reports whether an API token created at createdAt is from
+// before the account's last delete or re-create. Unparseable on either side
+// predates: it fails closed.
+func (l UserLifecycle) TokenPredates(createdAt string) bool {
+	if l.TokensNotBefore == "" {
+		return false
+	}
+	nb, err := time.Parse(time.RFC3339, l.TokensNotBefore)
+	if err != nil {
+		return true
+	}
+	ca, err := time.Parse(time.RFC3339, createdAt)
+	if err != nil {
+		return true
+	}
+	return ca.Before(nb)
+}
+
 // Unrestricted reports whether the account is enabled and has no expiry —
 // one that can stand in as the cluster's administrator indefinitely.
 func (l UserLifecycle) Unrestricted() bool {
@@ -198,6 +224,8 @@ func (l *UserLifecycle) applyAttribute(attr, value string) {
 		}
 	case UserAttrSessionsNotBefore:
 		l.SessionsNotBefore = value
+	case UserAttrTokensNotBefore:
+		l.TokensNotBefore = value
 	}
 }
 
@@ -335,8 +363,11 @@ func ResetUserLifecycle(ctx context.Context, c *Client, username, setBy string) 
 	cutoff := time.Now().Add(-SessionCutoffSkewMargin - time.Second).UTC().Format(time.RFC3339)
 	stmts = append(stmts, Statement{SQL: userLifecycleUpsertSQL,
 		Params: []interface{}{username, UserAttrSessionsNotBefore, cutoff, setBy, now}})
-	// A re-created name starts with no outstanding enrollment code (N3).
+	// A re-created name starts with no outstanding enrollment code (N3), and
+	// no token of the namesake (m-4).
 	stmts = append(stmts, invalidateEnrollmentCodeStatement(username, now))
+	stmts = append(stmts, Statement{SQL: userLifecycleUpsertSQL,
+		Params: []interface{}{username, UserAttrTokensNotBefore, nowRFC3339(), setBy, now}})
 	return c.ExecuteBatch(ctx, stmts)
 }
 
@@ -345,13 +376,23 @@ func ResetUserLifecycle(ctx context.Context, c *Client, username, setBy string) 
 // admin is refused unless one is, so the cluster is never left with only
 // administrators who cannot log in. A read that fails is an error, not an
 // answer.
+//
+// An admin that is one of two accounts normalizing alike does not count:
+// every lookup of it is refused, so it cannot log in (rereview-2 m-7).
 func OtherUnrestrictedAdminExists(ctx context.Context, c *Client, username string) (bool, error) {
 	rows, err := c.Query(ctx,
 		`SELECT username FROM users WHERE role = 'admin' AND deleted_at IS NULL AND username != ?`, username)
 	if err != nil {
 		return false, err
 	}
+	amb, err := ambiguousNames(ctx, c)
+	if err != nil {
+		return false, err
+	}
 	for _, r := range rows {
+		if amb[NormalizeUsername(r.String("username"))] {
+			continue
+		}
 		l, err := GetUserLifecycle(ctx, c, r.String("username"))
 		if err != nil {
 			return false, err
@@ -380,7 +421,14 @@ func UsableAdminExists(ctx context.Context, c *Client) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	amb, err := ambiguousNames(ctx, c)
+	if err != nil {
+		return false, err
+	}
 	for _, r := range rows {
+		if amb[NormalizeUsername(r.String("username"))] {
+			continue // refused at every login (m-7)
+		}
 		ok, err := usableAdmin(ctx, c, r.String("username"))
 		if err != nil {
 			return false, err
@@ -390,6 +438,26 @@ func UsableAdminExists(ctx context.Context, c *Client) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+// ambiguousNames is the set of normalized names two or more live accounts
+// share.
+func ambiguousNames(ctx context.Context, c *Client) (map[string]bool, error) {
+	rows, err := c.Query(ctx, `SELECT username FROM users WHERE deleted_at IS NULL`)
+	if err != nil {
+		return nil, err
+	}
+	seen := map[string]int{}
+	for _, r := range rows {
+		seen[NormalizeUsername(r.String("username"))]++
+	}
+	out := map[string]bool{}
+	for n, k := range seen {
+		if k > 1 {
+			out[n] = true
+		}
+	}
+	return out, nil
 }
 
 // TwoFactorPolicy is the cluster-wide mandatory second-factor policy as this

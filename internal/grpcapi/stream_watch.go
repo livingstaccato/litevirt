@@ -19,22 +19,29 @@ package grpcapi
 // open no stream at all). The first failure cancels the stream's context and
 // the stream ends with Unauthenticated.
 //
-// THE BOUND: an open stream ends within 5 s of the change reaching this node's
-// replica — a recheck every StreamRecheckInterval (3 s), each with its own
-// StreamRecheckTimeout (2 s) — and at once on the node where the change was
-// made. A recheck that fails, or does not finish within its timeout (a stuck
-// replica, a reseed holding the lock), ends the stream: it fails closed, so the
-// bound holds whatever the replica is doing. A node the change has not reached
-// yet keeps the stream — the same bound as every other refusal (docs/auth.md).
+// THE BOUND: an open stream ends within 5 s (StreamRecheckBound) of the change
+// reaching this node's replica, and at once on the node where the change was
+// made. A recheck runs every StreamRecheckInterval (2 s), each under its own
+// StreamRecheckTimeout (1.5 s). One that fails or times out — a replica stall,
+// a reseed holding the lock — is retried at once rather than ending the
+// stream (rereview-2 m-1: a single stall must not cut every console and
+// every running migration on the node); the stream ends only when no recheck
+// has succeeded for StreamRecheckBound, so the credential's state is still
+// unknown at the bound. A definite refusal ends it at once. A node the change
+// has not reached yet keeps the stream — the same bound as every other
+// refusal (docs/auth.md).
 //
-// ENDING IT FOR REAL (rereview N1). Cancelling a derived context ends nothing
-// by itself: grpc-go's RecvMsg and SendMsg are bound to the transport, and the
-// console and VNC handlers block in them and in reads of the PTY or socket. So
-// the cut is made three ways: the handlers that hold a device (ConsoleVM,
-// ProxyVNC) select on the stream context and close the PTY or socket when it
-// ends; the stream handed to every handler refuses SendMsg and RecvMsg once
-// cut; and the interceptor returns the cut error after streamCutGrace even if
-// a handler is still blocked, which ends the RPC and so the transport.
+// ENDING IT FOR REAL (rereview N1, rereview-2 m-2). Cancelling a derived
+// context ends nothing by itself: grpc-go's RecvMsg and SendMsg are bound to
+// the transport, and the console and VNC handlers block in them and in reads
+// of the PTY or socket. So the cut is made four ways: a handler that holds a
+// device for its caller registers a closer (registerStreamCloser), which runs
+// AT the cut whether or not the handler is looking at its context; the
+// device-holding handlers also select on the stream context; the stream
+// handed to every handler refuses SendMsg and RecvMsg once cut; and the
+// interceptor returns the cut error after streamCutGrace even if a handler is
+// still blocked, which ends the RPC and so the transport. streamHandlerAudit
+// lists every streaming RPC and what it holds, and a test keeps it complete.
 //
 // Bearerless mTLS streams (peer, local-root) are not user credentials and are
 // not watched.
@@ -43,6 +50,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -57,8 +65,11 @@ import (
 // credential when nothing on this node has changed, and StreamRecheckTimeout
 // how long one recheck may take; together they are the documented 5 s.
 const (
-	StreamRecheckInterval = 3 * time.Second
-	StreamRecheckTimeout  = 2 * time.Second
+	StreamRecheckInterval = 2 * time.Second
+	StreamRecheckTimeout  = 1500 * time.Millisecond
+	// StreamRecheckBound is the longest a stream lives with its credential
+	// unconfirmed: no successful recheck for this long ends it.
+	StreamRecheckBound = 5 * time.Second
 )
 
 // streamCutGrace is how long the interceptor waits, after a cut, for the
@@ -70,6 +81,14 @@ func (s *Server) streamRecheckInterval() time.Duration {
 		return s.streamRecheckEvery
 	}
 	return StreamRecheckInterval
+}
+
+// streamRecheckBound is StreamRecheckBound, or 2.5 test intervals.
+func (s *Server) streamRecheckBound() time.Duration {
+	if s.streamRecheckEvery > 0 {
+		return s.streamRecheckEvery * 5 / 2
+	}
+	return StreamRecheckBound
 }
 
 // streamRecheckTimeout is one recheck's deadline: StreamRecheckTimeout, or
@@ -123,27 +142,41 @@ func (s *Server) watchStream(ctx context.Context) (context.Context, func()) {
 	wctx, cancel := context.WithCancelCause(ctx)
 	stopped := make(chan struct{})
 	go func() {
-		t := time.NewTicker(s.streamRecheckInterval())
-		defer t.Stop()
+		lastOK := time.Now()
+		wait := s.streamRecheckInterval()
 		for {
 			kick := s.kickChan()
+			timer := time.NewTimer(wait)
 			select {
 			case <-stopped:
+				timer.Stop()
 				return
 			case <-wctx.Done():
+				timer.Stop()
 				return
-			case <-t.C:
+			case <-timer.C:
 			case <-kick:
+				timer.Stop()
 			}
-			err := s.recheckWithTimeout(wctx)
+			remaining := s.streamRecheckBound() - time.Since(lastOK)
+			err := s.recheckWithTimeout(wctx, remaining)
 			var transient errTransientRecheck
 			switch {
 			case err == nil:
+				lastOK = time.Now()
+				wait = s.streamRecheckInterval()
 			case errors.As(err, &transient):
-				// Fail closed: a credential that cannot be confirmed within
-				// the bound is not one.
+				if time.Since(lastOK) < s.streamRecheckBound() {
+					// Unknown, not refused: try again at once, inside the
+					// bound (m-1).
+					wait = s.streamRecheckInterval() / 8
+					continue
+				}
+				// Fail closed AT the bound: a credential that could not be
+				// confirmed for that long is not one.
 				cancel(errStreamCut{status.Errorf(codes.Unauthenticated,
-					"stream ended: its credential could not be re-checked: %v", transient.err)})
+					"stream ended: its credential could not be re-checked for %s: %v",
+					s.streamRecheckBound(), transient.err)})
 				return
 			default:
 				cancel(errStreamCut{err})
@@ -160,13 +193,23 @@ func (s *Server) watchStream(ctx context.Context) (context.Context, func()) {
 // recheckWithTimeout runs one recheck under its own deadline. A recheck that
 // has not answered by then is a failed one (errTransientRecheck), whatever it
 // is blocked on.
-func (s *Server) recheckWithTimeout(ctx context.Context) error {
-	rctx, cancel := context.WithTimeout(ctx, s.streamRecheckTimeout())
+func (s *Server) recheckWithTimeout(ctx context.Context, remaining time.Duration) error {
+	timeout := s.streamRecheckTimeout()
+	if remaining < timeout {
+		timeout = remaining
+	}
+	if timeout <= 0 {
+		return errTransientRecheck{errors.New("no time left inside the recheck bound")}
+	}
+	rctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	res := make(chan error, 1)
 	go func() {
 		if h := recheckHook.Load(); h != nil {
-			(*h)(rctx)
+			if err := (*h)(rctx); err != nil {
+				res <- errTransientRecheck{err}
+				return
+			}
 		}
 		res <- s.recheckStreamIdentity(rctx)
 	}()
@@ -174,7 +217,7 @@ func (s *Server) recheckWithTimeout(ctx context.Context) error {
 	case err := <-res:
 		return err
 	case <-rctx.Done():
-		return errTransientRecheck{errors.New("recheck did not finish within " + s.streamRecheckTimeout().String())}
+		return errTransientRecheck{errors.New("recheck did not finish within " + timeout.String())}
 	}
 }
 
@@ -202,6 +245,27 @@ func (w *watchedStream) RecvMsg(m any) error {
 	return w.ServerStream.RecvMsg(m)
 }
 
+// streamClosers holds the closers a handler registered for its stream.
+type streamClosers struct {
+	mu    sync.Mutex
+	fns   []func()
+	fired bool
+}
+
+type streamClosersKey struct{}
+
+// fire runs every registered closer once; a closer registered later runs at
+// once.
+func (c *streamClosers) fire() {
+	c.mu.Lock()
+	fns := c.fns
+	c.fns, c.fired = nil, true
+	c.mu.Unlock()
+	for _, fn := range fns {
+		fn()
+	}
+}
+
 // serveWatched runs handler on a watched stream and ends it on a cut: the
 // handler is given streamCutGrace to return on its own (the device-holding
 // handlers close their PTY or socket and do), and then the cut error is
@@ -210,8 +274,10 @@ func (w *watchedStream) RecvMsg(m any) error {
 func (s *Server) serveWatched(ctx context.Context, srv any, ss grpc.ServerStream, handler grpc.StreamHandler) error {
 	wctx, stop := s.watchStream(ctx)
 	defer stop()
+	closers := &streamClosers{}
+	hctx := context.WithValue(wctx, streamClosersKey{}, closers)
 	done := make(chan error, 1)
-	go func() { done <- handler(srv, &watchedStream{ServerStream: ss, ctx: wctx}) }()
+	go func() { done <- handler(srv, &watchedStream{ServerStream: ss, ctx: hctx}) }()
 	select {
 	case err := <-done:
 		if cut := streamCutCause(wctx); cut != nil {
@@ -225,6 +291,9 @@ func (s *Server) serveWatched(ctx context.Context, srv any, ss grpc.ServerStream
 		// The transport ended, not a cut: wait for the handler as before.
 		return <-done
 	}
+	// Release what the handler holds for its caller NOW, whether or not it
+	// is looking at its context (m-2).
+	closers.fire()
 	select {
 	case <-done:
 	case <-time.After(streamCutGrace):
@@ -275,8 +344,10 @@ func (s *Server) recheckStreamIdentity(ctx context.Context) error {
 	switch callerAuthMethod(ctx) {
 	case authMethodSession:
 		// A deleted account's sessions end with it (rereview N2); the token
-		// branch gets this from TokenLive's join.
-		u, err := corrosion.GetUser(ctx, s.db, user)
+		// branch gets this from TokenLive's join. Looked up by the EXACT
+		// stored name (rereview-2 N6): a normalized lookup would find another
+		// spelling once this one is deleted.
+		u, err := corrosion.GetUserExact(ctx, s.db, user)
 		if err != nil {
 			return errTransientRecheck{err}
 		}
@@ -290,6 +361,12 @@ func (s *Server) recheckStreamIdentity(ctx context.Context) error {
 		}
 		if sess == nil || sess.RevokedAt != "" {
 			return status.Error(codes.Unauthenticated, "stream ended: session revoked")
+		}
+		// The exact stored name the session was minted for (rereview-2 N6):
+		// once its spelling is deleted, a normalized lookup finds the
+		// spelling that survives, which this session never belonged to.
+		if u.Username != user || sess.Username != user {
+			return status.Error(codes.Unauthenticated, "stream ended: account deleted")
 		}
 		if exp, perr := time.Parse(time.RFC3339, sess.ExpiresAt); perr != nil || time.Now().After(exp) {
 			return status.Error(codes.Unauthenticated, "stream ended: session expired")
@@ -307,12 +384,15 @@ func (s *Server) recheckStreamIdentity(ctx context.Context) error {
 		}
 	case authMethodToken:
 		id, _ := ctx.Value(ctxKeyTokenID).(string)
-		live, err := corrosion.TokenLive(ctx, s.db, id)
+		live, created, err := corrosion.TokenLive(ctx, s.db, id)
 		if err != nil {
 			return errTransientRecheck{err}
 		}
 		if !live {
 			return status.Error(codes.Unauthenticated, "stream ended: API token revoked or expired")
+		}
+		if life.TokenPredates(created) {
+			return status.Error(codes.Unauthenticated, "stream ended: API token predates the account's last delete")
 		}
 	}
 	return nil
@@ -320,4 +400,88 @@ func (s *Server) recheckStreamIdentity(ctx context.Context) error {
 
 // recheckHook, when set (tests only), runs at the start of every stream
 // recheck with that recheck's context.
-var recheckHook atomic.Pointer[func(context.Context)]
+var recheckHook atomic.Pointer[func(context.Context) error]
+
+// streamHandlerAudit is the reviewed list of every streaming RPC and what it
+// holds open on behalf of its caller, so a cut credential releases it
+// (rereview-2 m-2). TestM2_EveryStreamingRPCIsAudited fails when a streaming
+// RPC is added without an entry here: decide, for the new one, whether it
+// holds a device for its caller (then registerStreamCloser it) or not.
+var streamHandlerAudit = map[string]string{
+	"/litevirt.v1.LiteVirt/ConsoleVM": "holds the VM's serial-console PTY: closer registered (ptmx.Close), " +
+		"and the handler selects on its context; a forwarded leg's outgoing stream derives from it",
+	"/litevirt.v1.LiteVirt/ProxyVNC": "holds a TCP socket to the VM's VNC port: closer registered (conn.Close), " +
+		"and the handler selects on its context; a forwarded leg's outgoing stream derives from it",
+	"/litevirt.v1.LiteVirt/GetVMLogs": "holds the VM log file in follow mode: closer registered (f.Close); " +
+		"the follow loop also checks its context",
+	"/litevirt.v1.LiteVirt/StreamEvents":       "holds an event-bus subscription only; its loop selects on the context",
+	"/litevirt.v1.LiteVirt/ListRecoveryClaims": "a bounded read; holds no device",
+
+	// Operations that run to completion or observe their context: they hold
+	// no device on the caller's behalf, and their progress Sends are refused
+	// once the stream is cut.
+	"/litevirt.v1.LiteVirt/DrainHost":             "operation; holds no device for the caller",
+	"/litevirt.v1.LiteVirt/ShutdownHostWorkloads": "operation; holds no device for the caller",
+	"/litevirt.v1.LiteVirt/UpgradeHost":           "operation; holds no device for the caller",
+	"/litevirt.v1.LiteVirt/PreStageUpgrade":       "operation; holds no device for the caller",
+	"/litevirt.v1.LiteVirt/DeployStack":           "operation; holds no device for the caller",
+	"/litevirt.v1.LiteVirt/DeleteStack":           "operation; holds no device for the caller",
+	"/litevirt.v1.LiteVirt/MigrateVM":             "operation; holds no device for the caller",
+	"/litevirt.v1.LiteVirt/MoveVolume":            "operation; holds no device for the caller",
+	"/litevirt.v1.LiteVirt/ReplicateVolume":       "operation; holds no device for the caller",
+	"/litevirt.v1.LiteVirt/MigrateStackVolumes":   "operation; holds no device for the caller",
+	"/litevirt.v1.LiteVirt/PullImage":             "operation; holds no device for the caller",
+	"/litevirt.v1.LiteVirt/PushImage":             "operation; holds no device for the caller",
+	"/litevirt.v1.LiteVirt/BackupVM":              "operation; holds no device for the caller",
+	"/litevirt.v1.LiteVirt/RestoreVM":             "operation; holds no device for the caller",
+	"/litevirt.v1.LiteVirt/RestoreLive":           "operation; holds no device for the caller",
+	"/litevirt.v1.LiteVirt/BackupSnapshot":        "operation; holds no device for the caller",
+	"/litevirt.v1.LiteVirt/RestoreFromBackup":     "operation; holds no device for the caller",
+	"/litevirt.v1.LiteVirt/BackupContainer":       "operation; holds no device for the caller",
+	"/litevirt.v1.LiteVirt/RestoreContainer":      "operation; holds no device for the caller",
+	"/litevirt.v1.LiteVirt/MigrateContainer":      "operation; holds no device for the caller",
+	"/litevirt.v1.LiteVirt/CrossRegionMigrate":    "operation; holds no device for the caller",
+	"/litevirt.v1.LiteVirt/PromoteReplica":        "operation; holds no device for the caller",
+
+	// Client-streaming uploads: the handler reads the caller's frames; a cut
+	// refuses the next RecvMsg, which ends the upload.
+	"/litevirt.v1.LiteVirt/ImportImage":              "upload; RecvMsg refused after a cut ends it",
+	"/litevirt.v1.LiteVirt/ImportVM":                 "upload; RecvMsg refused after a cut ends it",
+	"/litevirt.v1.LiteVirt/UploadStoragePoolContent": "upload; RecvMsg refused after a cut ends it",
+
+	// Peer-to-peer: authenticated by a host certificate, never by a user
+	// credential, so never watched.
+	"/litevirt.v1.LiteVirt/FetchBinary":              "peer mTLS only (requirePeerCert); not a user stream",
+	"/litevirt.v1.LiteVirt/FetchISOLibraryFile":      "peer mTLS only (requirePeerCert); not a user stream",
+	"/litevirt.v1.LiteVirt/PushBackup":               "peer-to-peer backup push; not a user stream",
+	"/litevirt.v1.LiteVirt/PushReplicaIncrement":     "peer-to-peer replica push; not a user stream",
+	"/litevirt.v1.LiteVirt/PushReplica":              "peer-to-peer replica push; not a user stream",
+	"/litevirt.v1.LiteVirt/ReceiveMigrationDisk":     "peer-to-peer migration disk transfer; not a user stream",
+	"/litevirt.v1.LiteVirt/StreamStateDump":          "peer anti-entropy; not a user stream",
+	"/litevirt.v1.LiteVirt/StreamTableDump":          "peer anti-entropy; not a user stream",
+	"/litevirt.v1.LiteVirt/StreamSensitiveStateDump": "peer anti-entropy; not a user stream",
+	"/litevirt.v1.LiteVirt/StreamTableRows":          "peer anti-entropy; not a user stream",
+	"/litevirt.v1.LiteVirt/StreamSensitiveTableRows": "peer anti-entropy; not a user stream",
+}
+
+// registerStreamCloser records fn, which releases what a handler holds for
+// its stream's caller (a PTY, a socket, a file), to run at the moment the
+// stream's credential is cut — before the grace, and even if the handler
+// never looks at its context (rereview-2 m-2). Outside a watched stream (mTLS
+// callers) it does nothing; after a cut it runs fn at once. fn must be safe to
+// call alongside the handler's own close of the same thing (os.File and
+// net.Conn Close are).
+func registerStreamCloser(ctx context.Context, fn func()) {
+	c, ok := ctx.Value(streamClosersKey{}).(*streamClosers)
+	if !ok {
+		return
+	}
+	c.mu.Lock()
+	if c.fired {
+		c.mu.Unlock()
+		fn()
+		return
+	}
+	c.fns = append(c.fns, fn)
+	c.mu.Unlock()
+}

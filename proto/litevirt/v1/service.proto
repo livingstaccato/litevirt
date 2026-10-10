@@ -882,7 +882,28 @@ message ListUsersResponse  { repeated User users = 1; }
 // exact: match username as stored, byte for byte, instead of by normalized
 // name — the way to remove one of two accounts that differ only in case or
 // surrounding spaces, which every normalized lookup refuses (admin, audited).
-message DeleteUserRequest  { string username = 1; bool exact = 2; }
+// exact_id: with exact, the id of the one account to delete, as
+// ListUserVariants reports it — an exact delete refuses without it.
+message DeleteUserRequest  { string username = 1; bool exact = 2; string exact_id = 3; }
+// ListUserVariants lists every live account whose name normalizes like
+// username (case and surrounding spaces), with what an operator needs to
+// choose which one an exact delete removes. Admin only.
+message ListUserVariantsRequest { string username = 1; }
+message UserVariant {
+    string id         = 1;  // stable id to pass as DeleteUserRequest.exact_id
+    string username   = 2;  // as stored, byte for byte
+    string created_at = 3;
+    string role       = 4;
+    string realm      = 5;
+    string last_login = 6;  // newest session created_at, "" if none here
+    int32  factors    = 7;
+    int32  tokens     = 8;
+}
+message ListUserVariantsResponse { repeated UserVariant variants = 1; }
+// ClearIdentityBindingRequest drops the directory identity an external-realm
+// account is bound to, so its next login binds afresh (an entry re-created in
+// the directory). Admin only, audited.
+message ClearIdentityBindingRequest { string username = 1; string realm = 2; }
 message WhoamiResponse     {
     string username = 1; string role = 2; string realm = 3; string expires_at = 4;
     // requires_2fa_enrollment: this is an enrollment-only session (see
@@ -922,7 +943,9 @@ message SetLoginPolicyRequest { string require_2fa = 1; bool allow_self_enroll =
 // ttl_seconds 0 = one hour; at most 24 hours. The code is shown once and
 // stored hashed.
 message IssueEnrollmentCodeRequest  { string username = 1; int64 ttl_seconds = 2; }
-message IssueEnrollmentCodeResponse { string code = 1; string expires_at = 2; }
+// issued_on: the node the code is bound to; it can be used only through that
+// node.
+message IssueEnrollmentCodeResponse { string code = 1; string expires_at = 2; string issued_on = 3; }
 // CheckPermissionsRequest names permission gates (see grpcapi permGates), not
 // raw verbs, so the question cannot drift from the one the RPC asks.
 message CheckPermissionsRequest  { repeated string gates = 1; }
@@ -3519,6 +3542,8 @@ service LiteVirt {
     rpc GetLoginPolicy(google.protobuf.Empty) returns (LoginPolicy);
     rpc SetLoginPolicy(SetLoginPolicyRequest) returns (LoginPolicy);
     rpc IssueEnrollmentCode(IssueEnrollmentCodeRequest) returns (IssueEnrollmentCodeResponse);
+    rpc ListUserVariants(ListUserVariantsRequest) returns (ListUserVariantsResponse);
+    rpc ClearIdentityBinding(ClearIdentityBindingRequest) returns (google.protobuf.Empty);
     rpc CreateToken(CreateTokenRequest)  returns (Token);
     rpc RevokeToken(RevokeTokenRequest)  returns (google.protobuf.Empty);
     // Whoami returns the authenticated caller's identity. Authenticated (NOT in

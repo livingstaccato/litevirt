@@ -2,6 +2,8 @@ package corrosion
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,6 +33,9 @@ type UserRecord struct {
 	// TokenID is the matched API token's id, set only by ValidateToken, so an
 	// open stream authenticated by it can be re-checked without a bcrypt sweep.
 	TokenID string
+	// TokenCreatedAt is the matched token's created_at (ValidateToken only),
+	// checked against the account's tokens_not_before.
+	TokenCreatedAt string
 }
 
 // TokenRecord represents an API token.
@@ -272,6 +277,13 @@ const usersUpdatePasswordSQL = `UPDATE users SET password_hash = ?, updated_at =
 // (Local users authenticate through the "local" realm; external OIDC/LDAP group
 // bindings are out of scope — they are not session-persisted yet.)
 func DeleteUser(ctx context.Context, c *Client, username string) error {
+	_, _, err := DeleteUserCounted(ctx, c, username)
+	return err
+}
+
+// DeleteUserCounted is DeleteUser, reporting how many sessions and API tokens
+// its batch revoked.
+func DeleteUserCounted(ctx context.Context, c *Client, username string) (sessions, tokens int, err error) {
 	now := c.NowTS()
 	marker := nowRFC3339()
 	barePrincipal := "user:" + username
@@ -284,16 +296,45 @@ func DeleteUser(ctx context.Context, c *Client, username string) error {
 	stmts = append(stmts, Statement{
 		SQL:    `UPDATE role_bindings SET deleted_at = ?, updated_at = ? WHERE (principal = ? OR principal = ?) AND deleted_at IS NULL`,
 		Params: []interface{}{marker, now, barePrincipal, localPrincipal}})
+	// The account's credentials end IN THIS BATCH (rereview-2 N6, m-4): every
+	// session and API token this node holds for it is revoked with the
+	// existing per-row statements, so the delete cannot land without them.
+	sessRows, err := c.Query(ctx, `SELECT id FROM sessions WHERE username = ? AND revoked_at IS NULL`, username)
+	if err != nil {
+		return 0, 0, err
+	}
+	for _, r := range sessRows {
+		stmts = append(stmts, Statement{SQL: sessionRevokeSQL, Params: []interface{}{marker, r.String("id")}})
+	}
+	tokRows, err := c.Query(ctx, `SELECT id FROM tokens WHERE username = ? AND deleted_at IS NULL`, username)
+	if err != nil {
+		return 0, 0, err
+	}
+	for _, r := range tokRows {
+		stmts = append(stmts, Statement{SQL: tokenRevokeSQL, Params: []interface{}{marker, now, r.String("id")}})
+	}
 	if c.MayWriteLoginPolicy() {
-		// A deleted account's first-enrollment code goes with it (N3).
+		// A deleted account's first-enrollment code goes with it (N3); its
+		// directory binding too, so a re-created name binds afresh (N5).
 		stmts = append(stmts, invalidateEnrollmentCodeStatement(username, now))
+		stmts = append(stmts, clearIdentityBindingsStatement(username, now))
+		// And the cut-offs are durable: a session or token this node never
+		// held (sessions are not anti-entropy repaired) is refused anyway
+		// once these replicate, whatever comes back under the name.
+		stmts = append(stmts,
+			Statement{SQL: userLifecycleUpsertSQL, Params: []interface{}{username, UserAttrSessionsNotBefore, marker, "user.delete", now}},
+			Statement{SQL: userLifecycleUpsertSQL, Params: []interface{}{username, UserAttrTokensNotBefore, marker, "user.delete", now}},
+		)
 	}
 	// The account's lifecycle (user_lifecycle) is deliberately LEFT as it is
 	// (t1-auth-review m3): a disabled account that is deleted must not come
 	// back enabled when the admin floor reinstates it or a directory login
 	// re-creates its shadow. Only an explicit CreateUser starts a name afresh
 	// (ResetUserLifecycle).
-	return c.ExecuteBatch(ctx, stmts)
+	if err := c.ExecuteBatch(ctx, stmts); err != nil {
+		return 0, 0, err
+	}
+	return len(sessRows), len(tokRows), nil
 }
 
 // clearSecondFactorStatements tombstones every second factor, recovery code and
@@ -340,16 +381,22 @@ const tokensInsertSQL = `INSERT INTO tokens (id, username, name, token_hash, exp
 
 // TokenLive reports whether token id is unrevoked, unexpired and belongs to a
 // live user: ValidateToken's verdict for a token already matched once.
-func TokenLive(ctx context.Context, c *Client, id string) (bool, error) {
+// It also returns the token's created_at, for the account's tokens_not_before.
+func TokenLive(ctx context.Context, c *Client, id string) (bool, string, error) {
 	rows, err := c.Query(ctx,
-		`SELECT 1 FROM tokens t JOIN users u ON u.username = t.username
+		`SELECT t.created_at FROM tokens t JOIN users u ON u.username = t.username
 		 WHERE t.id = ? AND t.deleted_at IS NULL AND u.deleted_at IS NULL
 		   AND (t.expires_at IS NULL OR t.expires_at = '' OR t.expires_at > ?)`, id, nowRFC3339())
 	if err != nil {
-		return false, err
+		return false, "", err
 	}
-	return len(rows) > 0, nil
+	if len(rows) == 0 {
+		return false, "", nil
+	}
+	return true, rows[0].String("created_at"), nil
 }
+
+const tokenRevokeSQL = `UPDATE tokens SET deleted_at = ?, updated_at = ? WHERE id = ?`
 
 // RevokeToken tombstones a token. updated_at is bumped alongside deleted_at so the
 // revocation wins LWW over a stale peer's still-live copy under anti-entropy.
@@ -357,10 +404,7 @@ func TokenLive(ctx context.Context, c *Client, id string) (bool, error) {
 // high-frequency token use can't out-timestamp a revoke.)
 func RevokeToken(ctx context.Context, c *Client, id string) error {
 	now := c.NowTS()
-	return c.Execute(ctx,
-		`UPDATE tokens SET deleted_at = ?, updated_at = ? WHERE id = ?`,
-		nowRFC3339(), now, id,
-	)
+	return c.Execute(ctx, tokenRevokeSQL, nowRFC3339(), now, id)
 }
 
 // ValidateToken checks a raw token string against stored bcrypt hashes.
@@ -396,9 +440,10 @@ func ValidateToken(ctx context.Context, c *Client, rawToken string) (*UserRecord
 			_ = c.Execute(ctx, `UPDATE tokens SET last_used_at = ? WHERE id = ?`,
 				time.Now().UTC().Format(time.RFC3339), r.String("id"))
 			rec := &UserRecord{
-				Username: r.String("username"),
-				Role:     r.String("role"),
-				TokenID:  r.String("id"),
+				Username:       r.String("username"),
+				Role:           r.String("role"),
+				TokenID:        r.String("id"),
+				TokenCreatedAt: r.String("created_at"),
 			}
 			if raw := r.String("scope_paths"); raw != "" {
 				var paths []string
@@ -417,7 +462,7 @@ func ValidateToken(ctx context.Context, c *Client, rawToken string) (*UserRecord
 // new-first (credentials_split.go). cutoff is a bare RFC3339 instant.
 func liveTokenCandidates(ctx context.Context, c *Client, cutoff string) ([]Row, error) {
 	return c.Query(ctx,
-		`SELECT t.id, t.username, t.token_hash, t.scope_paths, u.role,
+		`SELECT t.id, t.username, t.token_hash, t.scope_paths, u.role, t.created_at,
 		        COALESCE(NULLIF(t.updated_at, ''), t.created_at) AS src_ts,
 		        c.token_id AS cred_key, c.token_hash AS cred_val, c.updated_at AS cred_ts
 		 FROM tokens t
@@ -549,4 +594,51 @@ func OtherLiveAdminExists(ctx context.Context, c *Client, username string) (bool
 		return false, err
 	}
 	return len(rows) > 0, nil
+}
+
+// UserVariant is one of the live accounts whose names normalize alike, with
+// what an operator needs to choose the one an exact delete removes.
+type UserVariant struct {
+	ID        string // stable: hash of the stored name and created_at
+	Username  string
+	CreatedAt string
+	Role      string
+	Realm     string
+	LastLogin string
+	Factors   int
+	Tokens    int
+}
+
+// VariantID is UserVariant.ID for a stored name and created_at.
+func VariantID(username, createdAt string) string {
+	sum := sha256.Sum256([]byte(username + "\x00" + createdAt))
+	return hex.EncodeToString(sum[:6])
+}
+
+// UserVariants lists every live account whose name normalizes like username.
+func UserVariants(ctx context.Context, c *Client, username string) ([]UserVariant, error) {
+	rows, err := c.Query(ctx,
+		`SELECT u.username, u.role, COALESCE(u.realm, 'local') AS realm, u.created_at FROM users u
+		 WHERE `+usernameNormSQL+` = ? AND u.deleted_at IS NULL ORDER BY u.created_at, u.username`,
+		NormalizeUsername(username))
+	if err != nil {
+		return nil, err
+	}
+	out := make([]UserVariant, 0, len(rows))
+	for _, r := range rows {
+		v := UserVariant{Username: r.String("username"), Role: r.String("role"), Realm: r.String("realm"),
+			CreatedAt: r.String("created_at")}
+		v.ID = VariantID(v.Username, v.CreatedAt)
+		if ll, err := c.Query(ctx, `SELECT MAX(created_at) AS m FROM sessions WHERE username = ?`, v.Username); err == nil && len(ll) > 0 {
+			v.LastLogin = ll[0].String("m")
+		}
+		if f, err := ListUser2FA(ctx, c, v.Username); err == nil {
+			v.Factors = len(f)
+		}
+		if tk, err := c.Query(ctx, `SELECT COUNT(*) AS n FROM tokens WHERE username = ? AND deleted_at IS NULL`, v.Username); err == nil && len(tk) > 0 {
+			v.Tokens = int(tk[0].Int("n"))
+		}
+		out = append(out, v)
+	}
+	return out, nil
 }

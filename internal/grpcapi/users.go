@@ -103,6 +103,27 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 		return nil, status.Errorf(codes.Internal, "authenticate: %v", err)
 	}
 
+	// One directory entry is one account (rereview-2 N5): an id already bound
+	// to another account of this realm does not log in as this one. Checked
+	// before the shadow, so a refused login creates no account.
+	bindID := ""
+	if realmName != "local" && principal.ExternalID != "" {
+		bindID = principal.ExternalID
+		bound, berr := corrosion.AccountsBoundTo(ctx, s.db, realmName, bindID)
+		if berr != nil {
+			s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" identity binding unreadable", "denied")
+			return nil, status.Errorf(codes.Unavailable, "read the directory identity binding: %v", berr)
+		}
+		for _, other := range bound {
+			if corrosion.NormalizeUsername(other) != corrosion.NormalizeUsername(principal.Subject) {
+				s.audit(ctx, "auth.identity_mismatch", principal.Subject,
+					"realm="+realmName+" directory id "+bindID+" is bound to the account "+other, "denied")
+				return nil, status.Errorf(codes.PermissionDenied,
+					"this directory entry is bound to another account; an administrator can clear the binding (lv user unbind)")
+			}
+		}
+	}
+
 	// External realms (OIDC/LDAP) may surface users not yet in the
 	// local users table. Auto-shadow them so sessions / RBAC have a
 	// stable subject. Default role is viewer; admins promote via
@@ -129,6 +150,36 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 	if err := s.refuseInactiveAccount(ctx, principal.Subject); err != nil {
 		s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" "+status.Convert(err).Message(), "denied")
 		return nil, err
+	}
+
+	// The account is bound to the directory entry that first logged in to it
+	// after the upgrade (rereview-2 N5): another entry answering to the same
+	// name is refused, and audited, whatever its credentials.
+	boundID := ""
+	if bindID != "" {
+		got, berr := corrosion.GetIdentityBinding(ctx, s.db, principal.Subject, realmName)
+		if berr != nil {
+			s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" identity binding unreadable", "denied")
+			return nil, status.Errorf(codes.Unavailable, "read the directory identity binding: %v", berr)
+		}
+		if got != "" && got != bindID {
+			s.audit(ctx, "auth.identity_mismatch", principal.Subject,
+				"realm="+realmName+" bound to "+got+", login through "+bindID, "denied")
+			return nil, status.Errorf(codes.PermissionDenied,
+				"the account %q is bound to another directory entry; an administrator can clear the binding (lv user unbind)",
+				principal.Subject)
+		}
+		boundID = got
+	}
+
+	// A login inside the skew margin after a lifecycle change would be
+	// refused at the mint anyway (mintSession); refuse it HERE, before the
+	// second factor is checked, so it does not use up the TOTP step (m-3).
+	if life, lerr := s.accountLifecycle(ctx, principal.Subject); lerr != nil {
+		return nil, lerr
+	} else if life.SessionPredates(time.Now().UTC().Format(time.RFC3339)) {
+		return nil, status.Errorf(codes.Unavailable,
+			"the account was changed moments ago; log in again in %s", corrosion.SessionCutoffSkewMargin)
 	}
 
 	// Mandatory second factor. LocalRealm already demands an enrolled factor;
@@ -169,6 +220,24 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 	// Successful credential + (if required) second-factor verification —
 	// clear any accumulated failure state for this key.
 	s.loginThrottle.success(throttleKey)
+
+	// First login since the upgrade (or since an unbind): bind the account to
+	// the entry that just name-matched and proved its credentials. Before
+	// login_policy_v1 latches nothing is written and the login proceeds
+	// unbound, as on main.
+	if bindID != "" && boundID == "" {
+		switch berr := corrosion.BindIdentity(ctx, s.db, principal.Subject, realmName, bindID); {
+		case berr == nil:
+			s.audit(ctx, "auth.identity_bound", principal.Subject, "realm="+realmName+" id="+bindID, "ok")
+		case errors.Is(berr, corrosion.ErrLoginPolicyGateClosed):
+		case errors.Is(berr, corrosion.ErrIdentityBindingConflict):
+			s.audit(ctx, "auth.identity_mismatch", principal.Subject,
+				"realm="+realmName+" directory id "+bindID+" is bound to another account", "denied")
+			return nil, status.Error(codes.PermissionDenied, "this directory entry is bound to another account")
+		default:
+			return nil, status.Errorf(codes.Unavailable, "record the directory identity binding: %v", berr)
+		}
+	}
 
 	// What this login PRESENTED is recorded on the session (C1): the session
 	// is a full one under the policy only if a factor was presented here.
@@ -495,7 +564,21 @@ func (s *Server) DeleteUser(ctx context.Context, req *pb.DeleteUserRequest) (*em
 	var target *corrosion.UserRecord
 	var err error
 	if req.GetExact() {
+		// The operator chooses ONE of the spellings by the id `lv user
+		// delete --exact` lists (ListUserVariants) with the facts to choose
+		// by — never by typing a name that differs from another only in case
+		// or space (rereview-2 m-7).
+		if req.GetExactId() == "" {
+			return nil, status.Errorf(codes.InvalidArgument,
+				"an exact delete names the account by id: run `lv user delete --exact %s` without --id to list the accounts and their ids",
+				req.Username)
+		}
 		target, err = corrosion.GetUserExact(ctx, s.db, req.Username)
+		if err == nil && (target == nil || corrosion.VariantID(target.Username, target.CreatedAt) != req.GetExactId()) {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"no account %q with id %s; list them again with `lv user delete --exact %s`",
+				req.Username, req.GetExactId(), req.Username)
+		}
 	} else {
 		target, err = corrosion.GetUser(ctx, s.db, req.Username)
 	}
@@ -525,15 +608,15 @@ func (s *Server) DeleteUser(ctx context.Context, req *pb.DeleteUserRequest) (*em
 	if target != nil {
 		name = target.Username
 	}
-	if err := corrosion.DeleteUser(ctx, s.db, name); err != nil {
+	// A deleted account's credentials end with it, IN THE DELETE'S OWN BATCH
+	// (rereview N2, rereview-2 N6/m-4): its sessions and API tokens are
+	// revoked and durable session and token cut-offs written, so a floor
+	// reinstatement or a re-create brings none of them back; and its open
+	// streams are re-checked now and cut.
+	ended, revokedTokens, err := corrosion.DeleteUserCounted(ctx, s.db, name)
+	if err != nil {
 		return nil, status.Errorf(codes.Internal, "delete user: %v", err)
 	}
-	// A deleted account's credentials end with it, as a disable's do
-	// (rereview N2): its sessions and API tokens are revoked — so a floor
-	// reinstatement or a re-create brings none of them back — and its open
-	// streams are re-checked now and cut.
-	ended := s.revokeUserSessions(ctx, name)
-	revokedTokens := s.revokeUserTokens(ctx, name)
 	s.kickStreams()
 	// The OtherLiveAdminExists check above and this delete are two independent
 	// operations against replicated state, and nothing makes that pair atomic

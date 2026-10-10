@@ -501,7 +501,10 @@ import (
 //	     re-derived into a full one) and user_enrollment_codes (username PK:
 //	     the admin-issued, single-use, short-lived first-enrollment code,
 //	     stored as a SHA-256 and bound to the node that issued it, which alone
-//	     may spend it; repaired by anti-entropy). Three new tables.
+//	     may spend it; repaired by anti-entropy), and user_identity_bindings
+//	     ((username, realm) PK: the directory entry's immutable id an
+//	     external-realm account is bound to at its first login after the
+//	     upgrade, refused under any other). Four new tables.
 const CurrentSchemaVersion = 64
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
@@ -2934,11 +2937,24 @@ var schemaDDL = []string{
 		updated_at TEXT NOT NULL,
 		deleted_at TEXT
 	)`,
+	// v64 the directory identity an external-realm account is bound to; see
+	// identity_binding.go.
+	`CREATE TABLE IF NOT EXISTS user_identity_bindings (
+		username    TEXT NOT NULL,
+		realm       TEXT NOT NULL,
+		external_id TEXT NOT NULL,
+		bound_at    TEXT NOT NULL,
+		updated_at  TEXT NOT NULL,
+		deleted_at  TEXT,
+		PRIMARY KEY (username, realm)
+	)`,
 }
 
 // schemaIndexes are CREATE INDEX IF NOT EXISTS statements added after table creation.
 // These accelerate the most common query patterns (ListVMs by host, interfaces by VM, etc.).
 var schemaIndexes = []string{
+	// identity bindings by entry id: one id is never bound to two accounts.
+	`CREATE INDEX IF NOT EXISTS idx_user_identity_bindings_id ON user_identity_bindings(realm, external_id)`,
 	// users by normalized name (corrosion.NormalizeUsername / GetUser): every
 	// authenticated request looks an account up this way.
 	`CREATE INDEX IF NOT EXISTS idx_users_username_norm ON users(lower(trim(username, ' ' || char(9) || char(10) || char(13))))`,
@@ -3129,6 +3145,7 @@ var tablePrimaryKeys = map[string][]string{
 	"user_lifecycle":          {"username", "attribute"},
 	"session_factors":         {"session_id"},
 	"user_enrollment_codes":   {"username"},
+	"user_identity_bindings":  {"username", "realm"},
 }
 
 // schemaMigrations contains ALTER TABLE statements for upgrading existing databases.
@@ -3504,6 +3521,7 @@ var createTableUnits = []struct {
 	{62, "local_voter_seals"},
 	{63, "local_incarnation_claims"},
 	{64, "user_lifecycle"}, {64, "session_factors"}, {64, "user_enrollment_codes"},
+	{64, "user_identity_bindings"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

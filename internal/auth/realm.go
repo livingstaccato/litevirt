@@ -54,6 +54,12 @@ type Principal struct {
 	// preserved for audit logging.
 	Claims map[string]string
 
+	// ExternalID is the directory's immutable identifier of the entry that
+	// authenticated (LDAP entryUUID / objectGUID / nsUniqueId, else its DN;
+	// OIDC issuer + sub), "" for the local realm. The account is bound to it
+	// on its first login and refused under any other (rereview N5).
+	ExternalID string
+
 	// Requires2FA is set by realms that don't enforce 2FA themselves
 	// (e.g. local) when the local user has 2FA enrolled. The login handler
 	// then issues a `stage=2fa_required` partial response.

@@ -154,6 +154,9 @@ Hand it over out of band.`,
 					return err
 				}
 				fmt.Printf("Enrollment code for %s (single use, until %s):\n  %s\n", args[0], r.GetExpiresAt(), r.GetCode())
+				if on := r.GetIssuedOn(); on != "" {
+					fmt.Printf("It works only through node %s: the user logs in to that node to enroll.\n", on)
+				}
 				return nil
 			})
 		},

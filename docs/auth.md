@@ -56,15 +56,36 @@ Under `auth.realms[].ldap:`. `url` and `user_base_dn` are required; prefer
 | `user_filter` | LDAP filter selecting user entries (e.g. `(objectClass=person)`). |
 | `group_base_dn` | Subtree searched for groups. |
 | `group_filter` | LDAP filter selecting group entries. |
-| `user_login_attr` | Attribute whose value is the account's login name, read back from the directory entry and used as the litevirt account name. Default: the attributes `user_filter` matches the typed name against (`(uid=%s)` → `uid`), then the entry DN's RDN. The typed name is never used: a directory matches case, width and space variants of a name, and each would otherwise be a separate account. An entry with no login value is refused. |
+| `user_login_attr` | Attribute that must hold the typed login name. When set, the entry must carry it with exactly one value, equal to the typed name ignoring ASCII case and surrounding spaces; an entry where it is missing or multi-valued is refused, with no fall-through to other attributes. Unset: some value of an attribute `user_filter` matches the typed name against (`(uid=%s)` → `uid`), or the entry DN's RDN when its attribute is one of those, must equal the typed name that way. A directory that matched the filter by a looser rule (width or accent folding, a second attribute) does not log in. |
 | `user_name_attr` | Attribute read as the display name. |
 | `user_mail_attr` | Attribute read as the email address. |
 | `user_group_attr` | Attribute on the user entry listing group membership (typically `memberOf`). |
 | `group_name_attr` | Attribute on a group entry holding its name. |
 | `skip_tls_verify` | Disables certificate verification on the LDAPS connection. **Leave off outside a lab** — it makes directory traffic, including bind credentials, trivially interceptable. |
 
-As with OIDC, changing `user_login_attr` or `group_name_attr` re-keys principal
-ids and invalidates existing role bindings.
+The account is named by the typed login name, normalized (ASCII lower case,
+surrounding spaces trimmed), exactly as before this release: upgrading re-keys
+no account. Changing `group_name_attr` re-keys group principal ids and
+invalidates existing group role bindings.
+
+**Directory identity binding.** An LDAP or OIDC account is bound to the
+directory entry it is reached through, by an id the directory never reuses:
+for LDAP the entry's `entryUUID` (OpenLDAP), `objectGUID` (Active Directory)
+or `nsUniqueId` (389 DS), and only when the entry has none of those, its full
+DN (lower-cased) — a weaker id, since a renamed or moved entry gets a new one;
+for OIDC the token's issuer and subject. The binding is written on the
+account's first successful login after the upgrade (once `login_policy_v1`
+has latched; before that, logins proceed unbound, as on the previous release).
+After that, a login that name-matches the account through an entry with a
+different id is refused with `PermissionDenied` and audited as
+`auth.identity_mismatch`, whatever its password; and one entry is never bound
+to two accounts of a realm, so a second name on the same entry (a second
+`uid` value, another attribute) cannot log in as another account. The search
+for the typed name must return exactly one entry, or the login is refused.
+When the directory re-creates a user's entry (a new id), an admin clears the
+binding with `lv user unbind <username> <realm>` (audited as
+`user.identity_unbind`), and the next login binds to the entry it comes
+through. Deleting the account clears its bindings too.
 
 ## Path-based RBAC
 
@@ -400,8 +421,14 @@ as `ldap:crop` covers nothing).
   one guarded write, so it is single-use cluster-wide even across a partition.
   Used on any other node it is refused with a message naming the issuing node
   — log in through that node, or have an admin issue a new code where you are.
-  A disable, a delete or a re-create of the account, or an admin enrolling a
-  factor for it, voids an outstanding code. A WebAuthn enrollment verifies the
+  `lv 2fa enroll-code` (and `lv user reset-admin --clear-2fa`) prints that
+  node with the code, so hand both over together. A disable, a delete or a
+  re-create of the account, or an admin enrolling a factor for it (TOTP or a
+  security key), voids an outstanding code. Each of those is a replicated
+  write: it voids the code on the issuing node once it has replicated there,
+  so a code used on that node within replication lag of a disable made on
+  another one can still be spent — the enrollment-only session it ends in is
+  then refused by the disable as soon as that arrives. A WebAuthn enrollment verifies the
   attestation before it spends the code or ends the session, so a failed
   ceremony leaves both. The policy
   can instead allow self-enrollment until a deadline (`--allow-self-enroll
@@ -463,9 +490,11 @@ password and WebAuthn login through any realm (an LDAP or OIDC user is refused
 like a local one), its sessions, its API tokens, and either one relayed by a
 peer as a forwarded identity. The check runs on every request against the
 node's replica, so a disable takes effect on each node as soon as it has
-replicated there, and an expiry needs no timer. Disabling an account, or
-setting an expiry, also ends its sessions, so re-enabling it does not revive
-them; its API tokens work again on re-enable. A wrong password for a disabled
+replicated there, and an expiry needs no timer. Any lifecycle change — a disable, a re-enable, an expiry set, changed or
+cleared, a re-create, `lv user reset-admin` re-enabling the admin — logs the
+account out everywhere: it records a cut-off before which no session is
+honoured (below), so re-enabling does not revive ended sessions. Its API
+tokens work again on re-enable. A wrong password for a disabled
 account is still just a wrong password: the disabled state is told only to
 someone who presents the account's credentials.
 
@@ -486,7 +515,19 @@ re-enable. Deleting a user keeps its disable:
 the admin floor never brings back a disabled admin, and a directory login that
 re-creates a deleted, disabled LDAP or OIDC user's account finds it still
 disabled. An explicit `lv user create` starts the name afresh (enabled, and
-none of a former namesake's sessions honoured).
+none of a former namesake's sessions or API tokens honoured).
+
+**Deleting a user** revokes its sessions and API tokens in the same write as
+the delete, voids its enrollment code and clears its directory bindings, and
+records durable session and API-token cut-offs (`user_lifecycle`). So a
+session or token the deleting node never held — minted elsewhere, its revoke
+lost — is refused anyway once the cut-offs replicate, and stays refused when
+the name is re-created or the admin floor reinstates it. A session or token
+is also bound to the exact stored name it was issued for: once that spelling
+is deleted, it does not authenticate as another spelling of the name that
+survives, on any path (direct, forwarded by a peer, or an open stream). The
+cut-off has one-second resolution: a token created in the same second as a
+re-create is not refused by it.
 
 **Where and when it holds.** Each node judges against its own replica and its
 own clock. A change takes effect on a node when its row arrives there: on the
@@ -499,13 +540,25 @@ daemon's verdict by its clock. **Open streams** — serial consoles, VNC, log
 follows, event watches, and the web UI websockets and REST SSE built on them —
 are re-checked while open: one authenticated by a session or API token ends
 within 5 seconds of a disable, an expiry, a delete, a session or token revoke,
-or a policy change reaching the node (a recheck every 3 s, each allowed 2 s;
-a recheck that fails or does not finish in time ends the stream), and at once
-on the node where the change was made. The console and VNC handlers close the
-PTY or VNC socket themselves; any other handler still blocked 2 s after the
-cut has its RPC ended. Exec (`lv exec`, the UI exec page) is one RPC per
-command, each authenticated on its own. Deleting a user also revokes its
-sessions and API tokens.
+or a policy change reaching the node, and at once on the node where the change
+was made. A recheck runs every 2 s, each allowed 1.5 s. One that fails or does
+not finish in time (a replica stall, a reseed) is retried at once instead of
+ending the stream; the stream ends only when no recheck has succeeded for 5 s,
+so its credential is still unknown at the bound. At the cut, what a handler
+holds for the caller — the console's PTY, the VNC socket, a followed log file —
+is closed at once, whether or not the handler is watching; any handler still
+blocked 2 s after the cut has its RPC ended. Every streaming RPC is listed,
+with what it holds, in `streamHandlerAudit` (internal/grpcapi), and a test
+fails when one is added without an entry. Exec (`lv exec`, the UI exec page)
+is one RPC per command, each authenticated on its own.
+
+**SPICE is not cut.** SPICE is not proxied through the daemon: it listens on
+the host's `127.0.0.1` and is reached through an SSH tunnel (`lv spice`), so
+an open SPICE session lives as long as that tunnel, whatever happens to the
+account. To end one when disabling a user, revoke the user's SSH access to
+the host and kill their SSH session there (`pkill -u <ssh-user> sshd`), which
+ends the tunnel and the SPICE connection in it; restarting the VM also ends
+it. `lv user disable` alone stops only new `lv spice` calls.
 
 Admin only, audited as `user.account`. Refused for the cluster's last admin
 that is enabled with no expiry — `lv user delete` applies the same rule — and
@@ -522,9 +575,14 @@ the fleet is upgraded again; local root still reaches every running daemon.
 **Duplicate spellings.** Two accounts whose names differ only in case or
 surrounding spaces (left over from before names were normalized, or created
 on two nodes at once) are never merged: every lookup of either — a login, a
-session, an API token, `lv user`, reset-admin — refuses, naming both. Remove
-one with `lv user delete --exact <name as stored>` (admin, audited as an exact
-delete). A deleted account under a variant spelling is brought back under its
+session, an API token, `lv user`, reset-admin — refuses, naming both. To
+remove one, `lv user delete --exact <name>` lists every account named like it
+— id, exact stored name, creation time, role, realm, last login seen by the
+answering node, factors and tokens — and deletes nothing; then
+`lv user delete --exact <name> --id <id>` deletes the one chosen (admin,
+audited as an exact delete). An admin that is one of such a pair cannot log
+in, so it never counts as the admin that remains when the last-admin guard
+decides. A deleted account under a variant spelling is brought back under its
 own name by a directory login, so it keeps its disable.
 
 **The one credential a disable cannot reach** is the distributable `lv-cli`

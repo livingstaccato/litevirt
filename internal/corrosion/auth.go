@@ -316,10 +316,10 @@ func TouchSession(ctx context.Context, c *Client, id string) error {
 
 // RevokeSession marks a session as terminated immediately.
 func RevokeSession(ctx context.Context, c *Client, id string) error {
-	return c.Execute(ctx,
-		`UPDATE sessions SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL`,
-		nowRFC3339(), id) // bare marker
+	return c.Execute(ctx, sessionRevokeSQL, nowRFC3339(), id) // bare marker
 }
+
+const sessionRevokeSQL = `UPDATE sessions SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL`
 
 // ListSessionsForUser returns active sessions for a username.
 func ListSessionsForUser(ctx context.Context, c *Client, username string) ([]SessionRecord, error) {

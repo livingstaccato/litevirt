@@ -419,3 +419,43 @@ func TestContainerReplication_MigrateThereAndBackFollowsTheContainer(t *testing.
 		t.Fatalf("b holds %+v, want only the new replica: the one from before the moves is proven contained", list.Replicas)
 	}
 }
+
+// R2-I1: a container created before this build has no placement id. Its owner
+// gives it one before the first run, so its runs form one segment: keep
+// applies, and no run sets the previous run's replica aside (or pages for it).
+func TestContainerReplication_APreUpgradeRowGetsAPlacementAndKeepApplies(t *testing.T) {
+	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	a, b := c.Nodes[0], c.Nodes[1]
+	ctx := context.Background()
+	const name = "web"
+	replCT(t, c, a, name)
+	repo := drRepo(t, b)
+	sched := ctSchedule(t, c, a, name, b.Name, 1, true)
+	// As an earlier build wrote it: no placement id.
+	if err := a.DB.Execute(ctx, `UPDATE containers SET create_spec = '' WHERE host_name = ? AND name = ?`, a.Name, name); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now().UTC().Add(-10 * time.Minute)
+	for i := 0; i < 3; i++ {
+		a.CT.Seed(name, "run")
+		if err := a.Server.RunReplication(ctx, sched, base.Add(time.Duration(i)*time.Minute)); err != nil {
+			t.Fatalf("run %d: %v", i+1, err)
+		}
+	}
+	row, err := corrosion.GetContainer(ctx, a.DB, a.Name, name)
+	if err != nil || row == nil || corrosion.PlacementOf(row.CreateSpec) == "" {
+		t.Fatalf("the owner did not give the row a placement id: %+v %v", row, err)
+	}
+	list, err := c.SelfClient(b).ListContainerReplicas(ctx, &pb.ListContainerReplicasRequest{Repo: "dr", Project: "_default", Name: name})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range list.Replicas {
+		if r.SetAside {
+			t.Fatalf("a run set a replica of the same row aside: %+v", list.Replicas)
+		}
+	}
+	if n := len(replicas(t, repo, name)); n != 1 {
+		t.Fatalf("keep 1 left %d replicas", n)
+	}
+}

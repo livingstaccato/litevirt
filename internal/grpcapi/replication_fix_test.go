@@ -164,6 +164,19 @@ func TestRunReplication_VMMovedOntoItsTargetIsSuspended(t *testing.T) {
 	if recs := f.s.replicaRecordsOn(ctx, "dr", f.s.hostName, "a", "web"); len(recs) != 1 {
 		t.Fatalf("a replica was written beside the disk it protects: %+v", recs)
 	}
+	// m5: a shared schedule is never switched for one VM, so a VM that moved
+	// onto its explicit target keeps replicating into the pool here, as on main.
+	shared := sched
+	shared.Origin, shared.VMName = "@cluster", "web"
+	// It too last wrote here from the host the VM ran on before.
+	srec := newReplicaRecord("a", "web", "1", replicaScheduleKey(shared), "20261001-010000", "qcow2")
+	srec.Source = "host-old"
+	if _, err := publishRecordedReplica(ctx, f.dr, srec, func(tmp string) error { return os.WriteFile(tmp, []byte("replica"), 0o600) }); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.s.RunReplication(ctx, shared, time.Now()); errors.Is(err, errReplicationSuspended) {
+		t.Fatalf("a shared schedule's VM on its target was suspended: %v", err)
+	}
 }
 
 // I9: an incremental run forks from the replica its checkpoint continues, and
@@ -302,16 +315,29 @@ func TestBackupCapturedAfter_JudgesByCaptureNotName(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.SetBackupRepos(map[string]string{"bk": dir})
-	put(t, repo, capturedAs(replicaManifest("web", "2026-01-01T10:05:00Z", "_default", "o1", nil), "2026-01-01T10:05:00Z"))
-	put(t, repo, replicaManifest("web", "2026-01-01T11:00:00Z", "_default", "o1", nil)) // no capture recorded
-	if s.backupCapturedAfter("bk", "web", "2026-01-01T10:05:00Z", "2026-01-01T10:20:00Z") {
+	backup := func(ts, captured, source, placement string) {
+		m := replicaManifest("web", ts, "_default", "o1", nil)
+		spec, _ := manifestSpec(m)
+		spec.CapturedAt, spec.Source, spec.Placement = captured, source, placement
+		b, _ := json.Marshal(spec)
+		m.ContainerSpecJSON = string(b)
+		put(t, repo, m)
+	}
+	backup("2026-01-01T10:05:00Z", "2026-01-01T10:05:00Z", "host-d", "p-d") // this placement
+	backup("2026-01-01T11:00:00Z", "", "host-d", "p-d")                     // capture unknown
+	backup("2026-01-01T12:00:00Z", "2026-01-01T12:00:00Z", "host-x", "p-x") // another placement, another clock
+	if s.backupCapturedAfter("bk", "web", "2026-01-01T10:05:00Z", "2026-01-01T10:20:00Z", "host-d", "p-d") {
 		t.Fatal("a backup captured at 10:05 outranked a replica captured at 10:20 (named 10:00)")
 	}
-	if !s.backupCapturedAfter("bk", "web", "2026-01-01T10:05:00Z", "2026-01-01T10:01:00Z") {
-		t.Fatal("a backup captured after the replica must outrank it")
+	if !s.backupCapturedAfter("bk", "web", "2026-01-01T10:05:00Z", "2026-01-01T10:01:00Z", "host-d", "p-d") {
+		t.Fatal("a backup of the same placement captured after the replica must outrank it")
 	}
-	if s.backupCapturedAfter("bk", "web", "2026-01-01T11:00:00Z", "2026-01-01T10:20:00Z") {
+	if s.backupCapturedAfter("bk", "web", "2026-01-01T11:00:00Z", "2026-01-01T10:20:00Z", "host-d", "p-d") {
 		t.Fatal("a backup whose capture is unknown outranked a replica by its name")
+	}
+	// m1: never two hosts' clocks: the current placement's replica wins.
+	if s.backupCapturedAfter("bk", "web", "2026-01-01T12:00:00Z", "2026-01-01T10:20:00Z", "host-d", "p-d") {
+		t.Fatal("a backup of another placement outranked the replica by comparing two hosts' clocks")
 	}
 }
 

@@ -584,3 +584,45 @@ func TestReplicationIndependent_AReturnToAFormerHostNeverTrimsThePreLossReplicas
 		}
 	}
 }
+
+// R2-m3: the replica host's view can lag (a move's new row and the old row's
+// tombstone travel on independent streams). A restore needs the container's
+// last-known owner to confirm, positively, that it holds no live row: here the
+// replica host has a tombstone the owner never received, and the restore is
+// refused with the reason.
+func TestReplicationIndependent_ARestoreNeedsTheLastOwnersWord(t *testing.T) {
+	c := New(t, Options{Nodes: 2, IndependentReplicas: true})
+	a, b := c.Nodes[0], c.Nodes[1]
+	ctx := context.Background()
+	c.WaitConverged(t, convergeTimeout)
+	const name = "web"
+	replCT(t, c, a, name)
+	repo := drRepo(t, b)
+	c.WaitConverged(t, convergeTimeout)
+	sched := ctSchedule(t, c, a, name, b.Name, 2, true)
+	c.WaitConverged(t, convergeTimeout)
+	a.CT.Seed(name, "replicated")
+	if err := a.Server.RunReplication(ctx, sched, time.Now().UTC().Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	ms := replicas(t, repo, name)
+	if len(ms) != 1 {
+		t.Fatalf("premise: one replica, got %d", len(ms))
+	}
+	cutOff(c, a) // a never learns of the tombstone below
+	if err := corrosion.DeleteContainer(ctx, b.DB, a.Name, name); err != nil {
+		t.Fatal(err)
+	}
+	if containerHostOn(t, b, name) != "" || containerHostOn(t, a, name) != a.Name {
+		t.Fatal("premise: b sees no container, a still holds it")
+	}
+	_, err := c.SelfClient(b).RestoreContainerReplica(ctx, &pb.RestoreContainerReplicaRequest{
+		Repo: "dr", Project: "_default", Name: name, Timestamp: ms[0].Timestamp,
+	})
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "last-known owner") {
+		t.Fatalf("a restore the last-known owner contradicts: %v, want refused with the reason", err)
+	}
+	if b.CT.Exists(name) {
+		t.Fatal("a second copy was laid down")
+	}
+}

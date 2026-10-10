@@ -1046,7 +1046,15 @@ func (s *Server) sourceIsShutOff(vm *corrosion.VMRecord) bool {
 // this schedule recorded here was written by another host. A schedule that has
 // only ever replicated here from here (an operator's same-host copy), or none
 // yet, is not.
+//
+// Only a per-VM schedule: a shared (pool, project, cluster) schedule is never
+// switched for one of its VMs, so a VM that moves onto its explicit target
+// keeps replicating into the pool there, as on main, rather than being
+// suspended with no way out.
 func (s *Server) vmMovedOntoItsTarget(ctx context.Context, sched corrosion.BackupScheduleRecord, vm *corrosion.VMRecord, disk string) bool {
+	if sched.Origin != "" {
+		return false
+	}
 	key := replicaScheduleKey(sched)
 	newest := replicaRecord{}
 	for _, r := range s.replicaRecordsOn(ctx, sched.TargetPool, s.hostName, vm.Project, vm.Name) { // oldest first

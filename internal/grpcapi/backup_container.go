@@ -410,9 +410,10 @@ func (s *Server) RestoreContainerFromBackup(ctx context.Context, ctName, targetH
 	// Newer is judged by when each was captured, never by its name: a replica
 	// named for the scheduler tick may have been captured long after it, and
 	// a backup's name can be anything its operator passed. A backup whose
-	// capture is not known (an earlier build's) does not outrank a replica.
+	// capture is not known (an earlier build's), or that was taken in another
+	// placement (on another host's clock), does not outrank a replica.
 	if rep, ok := s.containerReplicaFor(ctx, ctName, owner, targetHost, time.Now()); ok &&
-		(err != nil || !s.backupCapturedAfter(repoName, ctName, timestamp, rep.CapturedAt)) {
+		(err != nil || !s.backupCapturedAfter(repoName, ctName, timestamp, rep.CapturedAt, rep.Source, rep.Placement)) {
 		return s.driveRemoteRestoreVia(ctx, targetHost, rep.Repo, ctName, rep.Timestamp, token, relocationLineageOf(owner), true)
 	}
 	if err != nil {
@@ -788,7 +789,11 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	// A coordinator is another node's daemon (a remote peer). `lv` run as root
 	// on this host presents the same host certificate over loopback, which is
 	// local root: an operator restore, not a coordinator's.
-	if req.Proof == nil && s.gateActive(ctx) && s.isRemotePeer(ctx) {
+	// An operator's replica restore forwarded by its entry host
+	// (RestoreContainerReplica) arrives as a peer but is no coordinator's
+	// relocation: it is admin-authorized, audited, and lays down a container
+	// only once its absence is confirmed.
+	if req.Proof == nil && s.gateActive(ctx) && s.isRemotePeer(ctx) && !operatorReplicaRestore(ctx) {
 		s.noteGateRefused(corrosion.ActionRelocate, health.ReasonProofMissing)
 		return status.Error(codes.FailedPrecondition, "restore refused: coordinator restore requires a proof under enforcement")
 	}
@@ -1340,7 +1345,12 @@ func manifestIndexProject(m *pbsstore.Manifest) string {
 
 // backupCapturedAfter reports whether the backup (repoName, ts) of name is
 // known to have been captured after the instant replicaAt (RFC3339Nano).
-func (s *Server) backupCapturedAfter(repoName, name, ts, replicaAt string) bool {
+//
+// Instants are compared only within one placement (one host, one clock). A
+// backup taken in another placement never outranks the replica, which was
+// taken in the placement being relocated: the current placement's copy wins,
+// whatever two hosts' clocks say.
+func (s *Server) backupCapturedAfter(repoName, name, ts, replicaAt, replicaSource, replicaPlacement string) bool {
 	path, ok := s.backupRepos[repoName]
 	if !ok {
 		return false
@@ -1351,6 +1361,10 @@ func (s *Server) backupCapturedAfter(repoName, name, ts, replicaAt string) bool 
 	}
 	m, err := repo.GetManifest(name, ts, containerBackupDisk)
 	if err != nil {
+		return false
+	}
+	spec, _ := manifestSpec(m)
+	if replicaPlacement == "" || spec.Placement != replicaPlacement || spec.Source != replicaSource {
 		return false
 	}
 	b, ok := capturedAt(m)

@@ -86,3 +86,26 @@ func TestRestoreContainer_AlreadyExistsNamesWhatWorks(t *testing.T) {
 		t.Fatalf("message %q offers a rename restore does not have, or omits --host", err)
 	}
 }
+
+// R2-m2: an operator's replica restore entered on another node reaches the
+// replica host as a remote peer (RestoreContainerReplica forwards it). Under
+// enforcement it is still an operator's restore, admin-authorized on the entry
+// host and confirmed absent, not a coordinator's relocation: it is not refused
+// for carrying no relocation proof. (The fleet cannot reach this: there every
+// peer dials over loopback and classifies as local root.)
+func TestRestoreContainer_AForwardedOperatorReplicaRestorePassesTheGate(t *testing.T) {
+	s, rt, repo, ts, _, _ := setupProofRestore(t)
+	s.gate = fakeServerGate{execOK: true, enforced: true}
+	authed, aerr := s.authenticate(mtlsPeerCtx("peer-1", tcpAddr("10.0.0.9"), ""))
+	if aerr != nil || callerPrincipalKind(authed) != principalKindPeer {
+		t.Fatalf("authenticate peer: %v kind=%q", aerr, callerPrincipalKind(authed))
+	}
+	rctx := context.WithValue(authed, operatorReplicaRestoreKey{}, true)
+	rs := &progressStream[pb.RestoreContainerProgress]{ctx: rctx}
+	if err := s.RestoreContainer(&pb.RestoreContainerRequest{Name: "ct1", RepoPath: repo, Timestamp: ts}, rs); err != nil {
+		t.Fatalf("a forwarded operator replica restore under enforcement: %v", err)
+	}
+	if _, ok := rt.imported["ct1"]; !ok {
+		t.Fatal("nothing imported")
+	}
+}

@@ -250,7 +250,7 @@ the only copy of the data: it asks first unless --yes.`,
 							fmt.Printf("  %s  (not listed)\n", ts)
 						}
 					}
-					fmt.Println("A set-aside replica may hold the newest copy of the container's data; --restore lays it down instead.")
+					fmt.Println("A set-aside or orphaned replica may hold the newest copy of the container's data; --restore lays it down instead.")
 					ok, err := confirmVoterChange(yes, "Delete these replicas?")
 					if err != nil || !ok {
 						return err

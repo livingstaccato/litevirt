@@ -599,6 +599,19 @@ func (s *Server) runContainerReplication(ctx context.Context, sched corrosion.Ba
 	if err := s.mayReplicateAsOwner(ctx, rec); err != nil {
 		return err
 	}
+	// A row written before this build has no placement id: it belongs to no
+	// segment, so each run would set the previous run's replica aside and keep
+	// would never apply. Its owner gives it one before the first run (the same
+	// release gate replication needs lets the statement flow).
+	if corrosion.PlacementOf(rec.CreateSpec) == "" {
+		spec, applied, merr := corrosion.MintContainerPlacementSpec(ctx, s.db, s.hostName, name, rec.CreateSpec)
+		if merr != nil {
+			return fmt.Errorf("give the container a placement id: %w", merr)
+		}
+		if applied {
+			rec.CreateSpec = spec
+		}
+	}
 	th, err := corrosion.GetHost(ctx, s.db, target)
 	if err != nil {
 		return fmt.Errorf("look up target host %q: %w", target, err)
@@ -705,8 +718,9 @@ func (s *Server) containerReplicationGate(ctx context.Context) error {
 // ctReplica is a promotable replica of a container, held by a host.
 type ctReplica struct {
 	Host, Repo, Timestamp string
-	// CapturedAt is when it was captured (RFC3339Nano).
-	CapturedAt string
+	// CapturedAt is when it was captured (RFC3339Nano); Source and Placement
+	// are the placement it was taken in.
+	CapturedAt, Source, Placement string
 }
 
 // replicaOfRow reports whether a listed replica was taken from the row owner:
@@ -784,7 +798,8 @@ func (s *Server) containerReplicaFor(ctx context.Context, name string, owner *co
 				"container", name, "host", targetHost, "taken", best.Timestamp, "age", age.Round(time.Minute))
 			continue
 		}
-		return ctReplica{Host: targetHost, Repo: containerReplicaRepo(project, sched.TargetPool), Timestamp: best.Timestamp, CapturedAt: best.CapturedAt}, true
+		return ctReplica{Host: targetHost, Repo: containerReplicaRepo(project, sched.TargetPool), Timestamp: best.Timestamp,
+			CapturedAt: best.CapturedAt, Source: best.Source, Placement: best.Placement}, true
 	}
 	return ctReplica{}, false
 }
@@ -1267,6 +1282,12 @@ func (s *Server) RestoreContainerReplica(ctx context.Context, req *pb.RestoreCon
 				req.GetName(), project, ct.HostName)
 		}
 	}
+	// This host's view can lag (a migrate's new row and the old row's
+	// tombstone arrive on independent streams): the container's last-known
+	// owner must also say, positively, that it holds no live row.
+	if err := s.lastOwnerConfirmsAbsent(ctx, project, req.GetName()); err != nil {
+		return nil, err
+	}
 	rctx := context.WithValue(ctx, operatorReplicaRestoreKey{}, true)
 	st := &localRestoreStream{ctx: rctx}
 	if err := s.RestoreContainer(&pb.RestoreContainerRequest{
@@ -1280,4 +1301,52 @@ func (s *Server) RestoreContainerReplica(ctx context.Context, req *pb.RestoreCon
 	s.auditAs(ctx, actor, "ct.replica.restore", req.GetName(),
 		fmt.Sprintf("project=%s repo=%s replica=%s restored stopped on %s", project, req.GetRepo(), req.GetTimestamp(), s.hostName), "ok")
 	return &pb.RestoreContainerReplicaResponse{Host: s.hostName}, nil
+}
+
+// lastOwnerConfirmsAbsent asks the host that last held project/name's row (as
+// this host's replica of the cluster state records it, tombstones included)
+// whether its own view holds a live row of the container anywhere. Anything
+// but a positive "none" refuses, with the reason: a host that cannot be asked
+// cannot vouch. A host that has been removed from the cluster runs nothing and
+// is not asked.
+func (s *Server) lastOwnerConfirmsAbsent(ctx context.Context, project, name string) error {
+	rows, err := s.db.Query(ctx,
+		`SELECT host_name FROM containers WHERE name = ? AND project = ? ORDER BY updated_at DESC LIMIT 1`, name, project)
+	if err != nil {
+		return status.Errorf(codes.Unavailable, "read the container's last-known owner: %v", err)
+	}
+	if len(rows) == 0 {
+		return nil // never known here: nothing to ask
+	}
+	owner := rows[0].String("host_name")
+	if owner == s.hostName {
+		return nil // this host's own view, checked above
+	}
+	if h, herr := corrosion.GetHost(ctx, s.db, owner); herr == nil && h != nil && h.State == "removed" {
+		return nil
+	}
+	c, closeConn, err := s.dialPeer(ctx, owner)
+	if err != nil {
+		return status.Errorf(codes.FailedPrecondition,
+			"cannot confirm with %s, the container's last-known owner, that it holds no live %s (%v): bring it back, or remove it from the cluster, before restoring a replica", owner, name, err)
+	}
+	defer closeConn()
+	token := ""
+	for {
+		resp, err := c.ListContainers(ctx, &pb.ListContainersRequest{PageToken: token})
+		if err != nil {
+			return status.Errorf(codes.FailedPrecondition,
+				"cannot confirm with %s, the container's last-known owner, that it holds no live %s: %v", owner, name, err)
+		}
+		for _, ct := range resp.GetContainers() {
+			if ct.GetName() == name && tenancy.NormalizeProject(ct.GetProject()) == project {
+				return status.Errorf(codes.FailedPrecondition,
+					"%s, the container's last-known owner, still sees %s live on %s; restoring its replica would make a second runnable copy",
+					owner, name, ct.GetHostName())
+			}
+		}
+		if token = resp.GetNextPageToken(); token == "" {
+			return nil
+		}
+	}
 }

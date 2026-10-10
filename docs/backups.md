@@ -437,7 +437,9 @@ changes only the chunks around it, and the next replica sends those and little
 else. The archive is written in name order with each member's modification
 time and no access or change time, and a restore, migrate or promotion lays
 every member down with its archived modification time, so an unchanged tree
-archives to the same bytes before and after a move. (A container whose files
+archives to the same bytes before and after a move. (GNU tar sorts with
+`--sort=name` from 1.28; on an older one the export hands tar the same order as
+a list, so no export fails where it did not before.) (A container whose files
 did change sends those; the first run into a repo that holds no replica of the
 container sends it whole.) Only the container's owner pushes: the run refuses on a host that has
 self-fenced, is not an active member, or whose owner-epoch marker is ahead of
@@ -467,9 +469,11 @@ and an audit row), and listed by `lv replication replicas` with the reason. That
 is what a failover that did not restore from the replica leaves behind (the
 container came back from its image or a backup, or on a host placement chose
 over the replica host): the set-aside replica may be the newest copy of the
-data. An operator can restore it, stopped, as the container (refused while the
-container lives anywhere, so there is never a second runnable copy), or remove
-it; removal asks first. A replica no schedule settles any more (the schedule was
+data. An operator can restore it, stopped, as the container, or remove it;
+removal asks first. A restore is refused unless both the replica host and the
+container's last-known owner positively see no live copy of it (a host that
+cannot be asked cannot vouch: bring it back or remove it from the cluster), so
+there is never a second runnable copy. It may be entered on any node. A replica no schedule settles any more (the schedule was
 deleted, re-targeted or reversed away) is listed as orphaned and may be removed
 too:
 
@@ -501,8 +505,9 @@ the very container row being relocated (its host and placement) and is not set
 aside, through the same restore-relocation as a restore from backup: the same
 relocation proof, recovery claim and single-use token, so one copy exists at
 every moment. It restores the replica unless the newest backup it can reach was
-captured after it (a backup whose capture is not known does not outrank a
-replica). A replica becomes a live copy only this way or through
+taken in the same placement and captured after it: capture instants are only
+ever compared on one host's clock, so a backup taken in another placement, or
+whose capture is not known, does not outrank the replica. A replica becomes a live copy only this way or through
 `lv replication replicas --restore`; a plain restore or a cold migrate of a
 replica is refused.
 Like a VM, a replica older than two of the schedule's longest intervals plus an
@@ -537,13 +542,26 @@ workload. It is not reported as a success either. While the switch made by the
 move is still on its way to this host (it replicates from the host that
 committed the move), the run is skipped quietly; after 15 minutes it is reported
 as `replication.suspended` (warn), once and then hourly, with the reason in the
-schedule's `LAST ERR`.
+schedule's `LAST ERR`. A pool, project or cluster schedule is never switched for
+one of its VMs, so a VM that moves onto such a schedule's explicit target keeps
+replicating into the pool there, as it always has.
 
 The switch changes only the target host: once every host is known to run a
 build that has the statement (every member answers this build's replica RPC),
 as a compare-and-set of that one column, so an operator's concurrent edit of the
 schedule on another node survives it; before that, by re-reading the row just
-before re-writing it. For a VM the incremental checkpoint of
+before re-writing it. (A container's re-key mints its new placement id with a
+statement of the same kind, under the same condition.)
+
+**If a member is rolled back.** Until the release token gates these two
+statements, "every member answers" is asked of the members at the time, not
+latched. A member rolled back to an earlier build after the answer was yes
+cannot apply the next such statement: it refuses it, and replication from the
+sending host to that member stops at it (back-pressure) until the member runs
+this build again. Nothing is applied in part and nothing is corrupted; other
+members are not affected, and anti-entropy still merges the rows. The remedy is
+to upgrade the member again (or remove it from the cluster); replication then
+resumes from where it stopped. For a VM the incremental checkpoint of
 the old direction is dropped, and an incremental run forks only from the replica
 its own checkpoint continues (a checkpoint names the run that made it, as does
 that run's replica): when the target does not hold that replica (after a

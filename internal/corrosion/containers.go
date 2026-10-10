@@ -228,8 +228,15 @@ func PlacementOf(createSpec string) string { return DecodeCreateSpec(createSpec)
 // false), and container replication, which needs the same, is off. applied is
 // also false when the row changed meanwhile.
 func MintContainerPlacement(ctx context.Context, c *Client, host, name, current string) (bool, error) {
+	_, applied, err := MintContainerPlacementSpec(ctx, c, host, name, current)
+	return applied, err
+}
+
+// MintContainerPlacementSpec is MintContainerPlacement returning the create
+// spec it wrote.
+func MintContainerPlacementSpec(ctx context.Context, c *Client, host, name, current string) (string, bool, error) {
 	if !c.RepointReady(ctx) {
-		return false, nil
+		return "", false, nil
 	}
 	next, _ := WithNewPlacement(current)
 	n, err := c.ExecuteRowsStrict(ctx,
@@ -237,9 +244,12 @@ func MintContainerPlacement(ctx context.Context, c *Client, host, name, current 
 		 WHERE host_name = ? AND name = ? AND deleted_at IS NULL AND COALESCE(create_spec, '') = ?`,
 		next, c.NowTS(), host, name, current)
 	if errors.Is(err, ErrNoRowsAffected) {
-		return false, nil
+		return "", false, nil
 	}
-	return n > 0, err
+	if err != nil || n == 0 {
+		return "", false, err
+	}
+	return next, true, nil
 }
 
 // ContainerNetwork is one NIC of a ContainerCreateSpec. It carries the create-

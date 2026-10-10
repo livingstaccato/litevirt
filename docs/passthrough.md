@@ -126,7 +126,8 @@ legacy-confined** container is never refused: the clone lands unprivileged, in
 an id range of its own (its files shifted), with default confinement, and the
 audit (`ct.clone`) says so. An admin's clone keeps the source's mode. A
 source with an unfinished conversion is not cloned until the conversion is
-finished (`lv ct convert <name>`). Then the host itself decides what it allows:
+finished (`lv ct convert <name>`), and neither is one whose security settings
+cannot be read (the refusal names the error). Then the host itself decides what it allows:
 
 ```yaml
 containers:
@@ -146,8 +147,13 @@ containers:
   the host serves**: each storage pool's source and target on this host, every
   backup repo (configured or registered), the image and disk stores, the
   restore cache, and litevirt's own binary (the start hook LXC runs as root).
-  Each is compared in its resolved, canonical form, on every start; a store
-  list that cannot be read refuses every mount. A store created beneath an
+  Each is compared in its resolved, canonical form, on every start, and by
+  **filesystem identity** as well: the filesystem a tree is on (its device
+  number in `/proc/self/mountinfo`) and the path within that filesystem. The
+  same tree mounted again somewhere else — `/var/lib/litevirt` bound under an
+  allowed prefix, or a second mount of the NFS export a pool lives on — is
+  therefore refused too, beneath the prefix or not. A store list or a mount
+  table that cannot be read refuses every mount. A store created beneath an
   allowed prefix refuses only the sources in it or containing it: `/srv/share`
   keeps working when a pool appears at `/srv/pools/x`. A container with no
   mounts never reads the store list.
@@ -159,8 +165,14 @@ containers:
   (`/dev/ng*`) and NVMe controllers (`/dev/nvme0`) — and the host's console
   and input — virtual terminals (`/dev/tty`, `/dev/tty0`–`/dev/tty63`),
   `/dev/console`, `/dev/vcs*`, `/dev/uinput`, `/dev/input/*` and
-  `/dev/watchdog*` — are never passed through, by name or by device number.
-  Serial ports (`/dev/ttyS*`, `/dev/ttyUSB*`, `/dev/ttyACM*`) pass. A block device is judged **by its device
+  `/dev/watchdog*` — and device-mapper control (`/dev/mapper/control`, which
+  builds a dm target over any host disk), the CPU MSRs (`/dev/cpu/*/msr`) and
+  the hibernation image (`/dev/snapshot`, host RAM) are never passed through,
+  by name or by device number. Serial ports (`/dev/ttyS*`, `/dev/ttyUSB*`,
+  `/dev/ttyACM*`) pass. The list is not exhaustive: other host-trust nodes —
+  `/dev/kmsg`, `/dev/nvram`, `/dev/hpet`, `/dev/ipmi*`, `/dev/mtd*`,
+  `/dev/mei*`, `/dev/tpm*`, `/dev/vfio/vfio` — are not refused by litevirt and
+  must never be listed in `device_paths`. A block device is judged **by its device
   number**, with its partitions and the disk it belongs to: it is refused when
   any of them holds a mounted filesystem, is swap, has a device built on it
   (LVM, md, dm-crypt), is a loop device with a backing file or a connected nbd
@@ -168,7 +180,14 @@ containers:
   exclusive open by the kernel (btrfs and ZFS members), or is the disk of any
   VM in the cluster by number, whatever path names it (a shared LUN backing a
   VM on another host included). Only block devices count: a character node
-  with the same numbers does not.
+  with the same numbers does not. Who holds a device — a mount, swap, a
+  process, the exclusive-open probe — is judged when the container is NOT
+  running: at create, at `lv ct convert`, at every start the daemon drives,
+  and by the start hook before every start, a reboot from inside the
+  container included (when no process of the container is left). The
+  once-a-minute policy refresh does not judge it, so a running container
+  whose own process holds its granted block device open keeps it, and its
+  next in-container reboot is judged by the hook as above.
 - Paths may hold letters, digits and `. _ @ + / -` only.
 - Mounts are **read-only unless `:rw`**, and always `nosuid,nodev`.
   Read-only is a boundary only for an **unprivileged** container, where the
@@ -179,12 +198,14 @@ containers:
   which LXC runs on **every** start — a reboot from inside the container
   included — opens each source beneath its allowed prefix with
   `openat2(RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS)`, then judges what it opened
-  by the path the kernel resolved it to (still beneath the prefix, inside no
+  by the path the kernel resolved it to and by the filesystem identity of the
+  mount the opened fd is on (still beneath the prefix, sharing no files with a
   protected tree), clones exactly that tree, sets read-only/nosuid/nodev on it
   and moves it onto the staging path. A symlink swapped into the tree at any
   time is refused by the kernel, not followed. A filesystem mounted beneath an
   allowed prefix (a NAS share) is a source like any other; a store or
-  protected tree mounted there is refused. The hook runs
+  protected tree mounted there, or reached there through another mount of its
+  filesystem, is refused. The hook runs
   for a container with devices and no mounts too, and judges every mount and
   device again against a policy the daemon keeps per container
   (`/run/litevirt/lxc-hook-policy/<name>.json`): the host's policy and the
@@ -192,7 +213,10 @@ containers:
   every start it drives and whenever the record changes, and rewrites every
   container's at daemon start and once a minute, so a pool created, or a
   prefix withdrawn, reaches a reboot from inside the container within a
-  minute. With no policy the hook stages nothing, and it stages only what the
+  minute; a container whose directory is gone (deleted, migrated away) has its
+  policy removed then. The refresh and every change of a container's host
+  access take that container's lock, so a refresh never writes an older policy
+  over a newer one. With no policy the hook stages nothing, and it stages only what the
   record authorizes. A refusal is logged
   to the system log under the tag `litevirt-lxc-hook`. A failed start takes
   down what it staged, and the stop removes each staging entry by itself.
@@ -214,11 +238,21 @@ containers:
   every `lxc.net.*` line in the archive is dropped (a `phys`, `macvlan` or
   `none` NIC, a router-mode veth, another project's bridge) and the spec's
   NICs are written as create writes them; what was dropped is audited
-  (`ct.restore`). No bridge is taken from the archive's spec either: a managed
-  NIC lands on its network's own bridge, and a raw-bridge NIC is kept only for
-  a caller who may attach raw bridges (as at create), or for a cold migration
-  or relocation whose source row records it. Otherwise that NIC is dropped,
-  audited, and the restore proceeds. A restore keeps the backup's mounts and devices only for an
+  (`ct.restore`). No bridge or network is taken from the archive's spec on its
+  word either; each NIC is admitted as create admits it. A raw bridge that is
+  the rendered bridge of a managed network IS that network's NIC. A managed
+  NIC is kept when its network exists, is of a type containers use (not
+  `direct` or `sriov`), and the restoring project may attach to it; it lands
+  on that network's own bridge, whatever bridge the spec names. A NIC naming
+  a network that does not exist is dropped — never placed on a host bridge
+  that happens to carry the name. A raw-bridge NIC is kept only for a caller
+  who may attach raw bridges (as at create). A cold migration or relocation
+  re-homes an existing container: a network its project may not use is kept
+  and audited (`allowed-foreign-network`), but a raw-bridge NIC, or a raw
+  bridge that is a network's, is kept only when the source container's row
+  records that NIC. Every other NIC is dropped, audited, and the restore
+  proceeds. A network record that cannot be read fails the restore, to be
+  retried. A restore keeps the backup's mounts and devices only for an
   admin (a cold migration or failover relocation keeps them only when they are
   exactly what the source's row records); otherwise they are stripped, the
   strip is audited, and an admin re-applies them with `lv ct convert`.

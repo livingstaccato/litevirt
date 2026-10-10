@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -24,6 +25,9 @@ import (
 //     gate's refusal, rather than fail);
 //   - for the container test, LV_E2E_MOUNT_DIR naming a directory under this
 //     host's containers.bind_mount_paths.
+//   - for the device test, LV_E2E_BLOCK_DEVICE naming a spare block device
+//     listed in this host's containers.device_paths, holding nothing the
+//     host uses (a scratch virtio disk on a lab node).
 
 const gateRefusal = "the cluster upgrade must finish first"
 
@@ -269,5 +273,112 @@ func TestContainer_HostMount_ReadOnlyAndConfined(t *testing.T) {
 	cleanup(t, func() { lvErr(t, "ct", "rm", esc, "--host", localHost, "--force") })
 	if out, err := lvErr(t, "ct", "create", esc, "--host", localHost, "--mount", link+":/mnt/etc"); err == nil {
 		t.Fatalf("a symlink out of the allowed tree was mounted:\n%s", out)
+	}
+}
+
+// rdevOf is a device node's device number.
+func rdevOf(t *testing.T, p string) uint64 {
+	t.Helper()
+	fi, err := os.Stat(p)
+	if err != nil {
+		t.Fatalf("stat %s: %v", p, err)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok || fi.Mode()&os.ModeDevice == 0 {
+		t.Fatalf("%s is not a device node", p)
+	}
+	return uint64(st.Rdev)
+}
+
+// deviceHolders lists the pids, on this host, with an fd open on the device
+// whose number is rdev (fds are stat'ed, so a node at any path counts).
+func deviceHolders(rdev uint64) []string {
+	var out []string
+	pids, _ := os.ReadDir("/proc")
+	for _, p := range pids {
+		if _, err := strconv.Atoi(p.Name()); err != nil {
+			continue
+		}
+		fds, _ := os.ReadDir(filepath.Join("/proc", p.Name(), "fd"))
+		for _, fd := range fds {
+			fi, err := os.Stat(filepath.Join("/proc", p.Name(), "fd", fd.Name()))
+			if err != nil || fi.Mode()&os.ModeDevice == 0 {
+				continue
+			}
+			if st, ok := fi.Sys().(*syscall.Stat_t); ok && uint64(st.Rdev) == rdev {
+				out = append(out, p.Name())
+				break
+			}
+		}
+	}
+	return out
+}
+
+// TestContainer_GrantedBlockDeviceSurvivesInContainerReboot (R3-I2): a
+// container whose own process holds its granted block device open keeps the
+// grant across the once-a-minute policy refresh, and a reboot from inside it
+// more than a minute after its start comes back RUNNING — the refresh judges
+// what the device is, never who holds it, and the start hook's pre-start
+// judgment runs after the container's old processes are gone.
+func TestContainer_GrantedBlockDeviceSurvivesInContainerReboot(t *testing.T) {
+	dev := os.Getenv("LV_E2E_BLOCK_DEVICE")
+	if dev == "" {
+		t.Skip("set LV_E2E_BLOCK_DEVICE to a spare block device listed in this host's containers.device_paths")
+	}
+	requireLXC(t)
+	rdev := rdevOf(t, dev)
+	name := uniqueName("ctd")
+	cleanup(t, func() { lvErr(t, "ct", "rm", name, "--host", localHost, "--force") })
+	// Privileged, so container root may open the node (an unprivileged
+	// container's root is "other" to a root:disk 0660 node).
+	out, err := lvErr(t, "ct", "create", name, "--host", localHost, "--privileged", "--device", dev)
+	skipIfGated(t, out, err)
+	if err != nil {
+		t.Fatalf("ct create --device: %v\n%s", err, out)
+	}
+	startCT(t, name)
+	if len(deviceHolders(rdev)) != 0 {
+		t.Fatalf("%s is held open on the host before the container opened it: %v", dev, deviceHolders(rdev))
+	}
+	lv(t, "ct", "exec", name, "--host", localHost, "--", "sh", "-c",
+		"nohup sh -c 'exec 3<"+dev+"; exec sleep 3600' >/dev/null 2>&1 &")
+	deadline := time.Now().Add(15 * time.Second)
+	for len(deviceHolders(rdev)) == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Second)
+	}
+	if len(deviceHolders(rdev)) == 0 {
+		t.Fatalf("no process holds %s after the container opened it", dev)
+	}
+
+	// Past at least one policy refresh (once a minute).
+	time.Sleep(75 * time.Second)
+	pol, err := os.ReadFile("/run/litevirt/lxc-hook-policy/" + name + ".json")
+	if err != nil {
+		t.Fatalf("read %s's hook policy: %v", name, err)
+	}
+	if !strings.Contains(string(pol), `"Source":"`+dev+`"`) {
+		t.Fatalf("the refresh revoked the device %s its container holds open; policy:\n%s", dev, pol)
+	}
+
+	since := time.Now().Add(-time.Second).Format("2006-01-02 15:04:05")
+	_, _ = lvErr(t, "ct", "exec", name, "--host", localHost, "--", "reboot")
+	var st string
+	deadline = time.Now().Add(120 * time.Second)
+	for time.Now().Before(deadline) {
+		time.Sleep(5 * time.Second)
+		b, _ := exec.Command("lxc-info", "-n", name, "-sH").CombinedOutput()
+		if st = strings.TrimSpace(string(b)); st == "RUNNING" {
+			break
+		}
+	}
+	jl, _ := exec.Command("journalctl", "-t", "litevirt-lxc-hook", "--since", since, "--no-pager", "-o", "cat").CombinedOutput()
+	if st != "RUNNING" {
+		t.Fatalf("after an in-container reboot the container is %q; want RUNNING. hook log:\n%s", st, jl)
+	}
+	if strings.Contains(string(jl), name+": refusing to start") {
+		t.Errorf("the hook refused the reboot's start:\n%s", jl)
+	}
+	if got := lv(t, "ct", "exec", name, "--host", localHost, "--", "sh", "-c", "test -b "+dev+" && echo present"); !strings.Contains(got, "present") {
+		t.Errorf("after the reboot the container has no %s: %q", dev, got)
 	}
 }

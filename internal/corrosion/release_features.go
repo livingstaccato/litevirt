@@ -40,6 +40,7 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
@@ -368,16 +369,18 @@ func (c *Client) InReleaseProbation() bool { return len(c.ReleaseProbation()) > 
 // VerifyReleaseProbation tries once to lift this node's release probation.
 //
 // It asks the OTHER voters (VoterSet: the newest adopted generation, or the
-// derived set) for their cluster_policies, whole and unscoped, merging each.
-// Two kinds of answer do not count (N3): this node's own replica — the one in
-// doubt — and a peer that is itself in probation, which is in the same doubt.
-// It needs a majority of the voter set from the others, capped at the number
-// of other voters, so a two-voter cluster asks its one peer and a one-voter
-// cluster has nobody else to ask. A first use is acknowledged by every voter
-// and every replication recipient (health.Checker.WithFeature), so a use made
-// while this node was away is held by every voter that was up — and a voter
-// majority meets that set. The pull is exempt from the replication-source gate
-// (N2): reading cluster_policies is harmless from any peer.
+// derived set, as THIS replica holds it — possibly stale after a long absence)
+// for their cluster_policies, whole and unscoped, merging each. This node's own
+// replica does not count: it is the one in doubt. A voter that is itself in
+// probation DOES count (C-R2-1): every voter acknowledged any first use before
+// its data was written (health.Checker.WithFeature), so a voter holding no
+// record was not a voter, or not there, for any use — its replica is as good
+// evidence as any other, and excluding it would leave hosts rolled back
+// together waiting on each other for good. Only a WAL-quarantined voter is not
+// counted. It needs a majority of the voter set from the others, capped at the
+// number of other voters: a two-voter cluster asks its one peer, and a
+// one-voter cluster lifts on its own check (nobody else was a voter to
+// acknowledge). The pull is exempt from the replication-source gate (N2).
 //
 // Any use this build cannot honour, found in what was merged, trips the
 // permanent quarantine and probation stays. Otherwise probation lifts — for the
@@ -413,13 +416,13 @@ func (ae *AntiEntropy) VerifyReleaseProbation(ctx context.Context) (bool, error)
 		if have >= need {
 			break
 		}
-		inProbation, err := pull(ctx, peer)
+		excluded, err := pull(ctx, peer)
 		if err != nil {
 			slog.Debug("release probation: could not pull cluster_policies", "peer", peer, "error", err)
 			continue
 		}
-		if inProbation {
-			slog.Debug("release probation: not counting a peer that is itself in probation", "peer", peer)
+		if excluded {
+			slog.Debug("release probation: not counting a WAL-quarantined peer", "peer", peer)
 			continue
 		}
 		have++
@@ -445,9 +448,9 @@ func (ae *AntiEntropy) VerifyReleaseProbation(ctx context.Context) (bool, error)
 	return true, nil
 }
 
-// pullClusterPoliciesForProbation asks peer whether it is in probation, then
-// pulls and merges its cluster_policies whole. NOT gated by the
-// replication-source gate (N2).
+// pullClusterPoliciesForProbation asks peer whether it is WAL-quarantined
+// (excluded), then pulls and merges its cluster_policies whole. NOT gated by
+// the replication-source gate (N2).
 func (ae *AntiEntropy) pullClusterPoliciesForProbation(ctx context.Context, peer string) (bool, error) {
 	pctx, cancel := context.WithTimeout(ctx, antiEntropyPeerTimeout)
 	defer cancel()
@@ -460,7 +463,7 @@ func (ae *AntiEntropy) pullClusterPoliciesForProbation(ctx context.Context, peer
 	if err != nil {
 		return false, err
 	}
-	if resp.GetReleaseProbation() || resp.GetWalQuarantined() {
+	if resp.GetWalQuarantined() {
 		return true, nil
 	}
 	_, perr, merr := ae.pullAndMerge(pctx, client, []string{"cluster_policies"}, nil, nil)
@@ -494,11 +497,50 @@ func (ae *AntiEntropy) CheckReleaseUsesFrom(ctx context.Context, peer string) er
 // cannot latch, and so cannot have a use, while this node is admitted and does
 // not advertise it. It looks at that peer's cluster_policies anyway, so a use
 // made while this node was away is found and trips the quarantine.
+//
+// A failed look is retried with backoff (releaseCheckBackoff, doubling to
+// releaseCheckMaxBackoff) until one succeeds or ctx ends (m-R2-4).
 func (ae *AntiEntropy) OnUnknownReleaseToken(ctx context.Context, peer, token string) {
-	if err := ae.CheckReleaseUsesFrom(ctx, peer); err != nil {
-		slog.Debug("release feature: could not look at a newer peer's used records", "peer", peer,
-			"token", token, "error", err)
+	check := ae.checkFrom
+	if check == nil {
+		check = ae.CheckReleaseUsesFrom
 	}
+	backoff := releaseCheckBackoff
+	for {
+		err := check(ctx, peer)
+		if err == nil {
+			return
+		}
+		slog.Debug("release feature: could not look at a newer peer's used records; retrying", "peer", peer,
+			"token", token, "retry_in", backoff, "error", err)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		if backoff *= 2; backoff > releaseCheckMaxBackoff {
+			backoff = releaseCheckMaxBackoff
+		}
+	}
+}
+
+// releaseCheckBackoff / releaseCheckMaxBackoff pace OnUnknownReleaseToken's
+// retries. Vars so tests can shrink them.
+var (
+	releaseCheckBackoff    = 5 * time.Second
+	releaseCheckMaxBackoff = 5 * time.Minute
+)
+
+// WireUnknownReleaseObserver installs the daemon's response to a peer
+// advertising a release token this build does not know: a background
+// OnUnknownReleaseToken, which refuses nothing. One function so the daemon
+// and the fleet harness wire it the same way.
+func WireUnknownReleaseObserver(ctx context.Context, c interface {
+	SetUnknownReleaseTokenObserver(func(peer, token string))
+}, ae *AntiEntropy) {
+	c.SetUnknownReleaseTokenObserver(func(peer, tok string) {
+		go ae.OnUnknownReleaseToken(ctx, peer, tok)
+	})
 }
 
 // SetReplicationSourceGate injects the predicate deciding whether this node
@@ -534,10 +576,12 @@ func (r *Replicator) SetAdvertisedCapabilities(fn func() []string) {
 	r.advertised.Store(&fn)
 }
 
-// advertisedCapabilities is what the push declares; nil when unwired.
+// advertisedCapabilities is what the push declares. Unwired — a restart, before
+// the server exists — it is this build's release tokens (I-R2-2): the claim a
+// receiver checks is "this binary keeps the data", a fact about the build.
 func (r *Replicator) advertisedCapabilities() []string {
 	if fn := r.advertised.Load(); fn != nil {
 		return (*fn)()
 	}
-	return nil
+	return capabilities.ReleaseTokens()
 }

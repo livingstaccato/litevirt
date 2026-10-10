@@ -43,17 +43,31 @@ var mintAllowed = map[string]bool{
 	"internal/health/release_feature.go": true,
 }
 
-// variableTokenAllowed are the files that may read a latch with a token held in
-// a VARIABLE rather than named as a capabilities constant (N11), each for a
-// reason that has nothing to do with gating a feature's write. Anywhere else a
-// non-constant token is refused: info.Token, a loop variable or a helper's
-// result is how a release token would reach a latch read unseen.
+// variableTokenAllowed are the places that may read a latch with a token held
+// in a VARIABLE rather than named as a capabilities constant (N11), each for a
+// reason that has nothing to do with gating a feature's write. A key is
+// "<file>:<function>" — the exemption covers that function, not its file
+// (m-R2-5) — or "<file>:*" for the latch implementation and the gate. Anywhere
+// else a non-constant token is refused: info.Token, a loop variable or a
+// helper's result is how a release token would reach a latch read unseen.
 var variableTokenAllowed = map[string]string{
-	"internal/health/capability.go":      "the latch implementation itself",
-	"internal/health/release_feature.go": "the release-feature gate",
-	"internal/grpcapi/upgrade_status.go": "the status report iterates every known token",
-	"internal/grpcapi/ha_health.go":      "the HA monitor drives and checks every supported token",
-	"internal/grpcapi/host.go":           "withheldStandDowns walks a fixed list of two flag tokens",
+	"internal/health/capability.go:*":                           "the latch implementation itself",
+	"internal/health/release_feature.go:*":                      "the release-feature gate",
+	"internal/grpcapi/upgrade_status.go:GetUpgradeStatus":       "the status report iterates every known token",
+	"internal/grpcapi/upgrade_status.go:usedReleaseTokens":      "the push-path judge over every used release token",
+	"internal/grpcapi/upgrade_status.go:releaseLagging":         "the rollout summary over this build's release token",
+	"internal/grpcapi/upgrade_status.go:evaluateReleaseRollout": "the rollout condition over this build's release token",
+	"internal/grpcapi/ha_health.go:RunHAHealthMonitor":          "per-token metrics over Supported()",
+	"internal/grpcapi/ha_health.go:retryLatchedMarkers":         "retries the marker write of every latched token",
+	"internal/grpcapi/ha_health.go:activateOneUnlatched":        "the latch driver walks every supported token",
+	"internal/grpcapi/ha_health.go:checkOneCapabilityHealth":    "the post-latch freshness check over every token",
+	"internal/grpcapi/ha_health.go:evaluateHADegraded":          "the degraded evaluation over every supported token",
+	"internal/grpcapi/host.go:withheldStandDowns":               "walks a fixed list of two flag tokens",
+}
+
+// variableTokenOK reports whether rel's function fn is exempt.
+func variableTokenOK(rel, fn string) bool {
+	return variableTokenAllowed[rel+":*"] != "" || variableTokenAllowed[rel+":"+fn] != ""
 }
 
 // constantToken reports whether e names a capabilities constant directly
@@ -95,33 +109,43 @@ func calleeName(call *ast.CallExpr) string {
 // releaseGuardViolations lists the guard's findings in one parsed file.
 func releaseGuardViolations(fset *token.FileSet, f *ast.File, rel string) []string {
 	var out []string
-	ast.Inspect(f, func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
-		if !ok {
-			return true
-		}
-		name := calleeName(call)
-		pos := fset.Position(call.Pos()).String()
-		if name == "ClaimGrantMinter" && !mintAllowed[rel] {
-			out = append(out, pos+": ClaimGrantMinter outside the release-feature gate")
-		}
-		if name == "GrantForTest" {
-			out = append(out, pos+": GrantForTest outside a test")
-		}
-		if releaseLatchReaders[name] && len(call.Args) > 0 {
-			last := call.Args[len(call.Args)-1]
-			switch {
-			case isReleaseTokenExpr(last):
-				if !releaseGuardAllowed[rel] {
-					out = append(out, pos+": "+name+" on a release token; gate the write with health.Checker.WithFeature")
+	check := func(fn string, root ast.Node) {
+		ast.Inspect(root, func(n ast.Node) bool {
+			switch v := n.(type) {
+			case *ast.SelectorExpr:
+				// Every mention, called or taken as a value (m-R2-5).
+				if v.Sel.Name == "GrantForTest" {
+					out = append(out, fset.Position(v.Pos()).String()+": GrantForTest outside a test")
 				}
-			case !constantToken(last) && variableTokenAllowed[rel] == "":
-				out = append(out, pos+": "+name+" with a token that is not a named capabilities constant; "+
-					"name the token, or add this file to variableTokenAllowed with a reason")
+			case *ast.CallExpr:
+				name := calleeName(v)
+				pos := fset.Position(v.Pos()).String()
+				if name == "ClaimGrantMinter" && !mintAllowed[rel] {
+					out = append(out, pos+": ClaimGrantMinter outside the release-feature gate")
+				}
+				if releaseLatchReaders[name] && len(v.Args) > 0 {
+					last := v.Args[len(v.Args)-1]
+					switch {
+					case isReleaseTokenExpr(last):
+						if !releaseGuardAllowed[rel] {
+							out = append(out, pos+": "+name+" on a release token; gate the write with health.Checker.WithFeature")
+						}
+					case !constantToken(last) && !variableTokenOK(rel, fn):
+						out = append(out, pos+": "+name+" in "+fn+" with a token that is not a named capabilities constant; "+
+							"name the token, or add \""+rel+":"+fn+"\" to variableTokenAllowed with a reason")
+					}
+				}
 			}
+			return true
+		})
+	}
+	for _, d := range f.Decls {
+		if fd, ok := d.(*ast.FuncDecl); ok {
+			check(fd.Name.Name, fd)
+			continue
 		}
-		return true
-	})
+		check("", d)
+	}
 	return out
 }
 
@@ -172,20 +196,27 @@ func f() {
 	_ = gate.Latched(tok)
 	_ = gate.PeerSupportsFresh(ctx, peer, featureToken(f))
 	_ = capabilities.GrantForTest(t, "widgets")
+	g := capabilities.GrantForTest
+	_ = g
 }`
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, "x.go", src, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := releaseGuardViolations(fset, f, "internal/grpcapi/vm.go"); len(got) != 8 {
-		t.Fatalf("violations = %v, want the eight shortcuts and not the split-brain read", got)
+	if got := releaseGuardViolations(fset, f, "internal/grpcapi/vm.go"); len(got) != 9 {
+		t.Fatalf("violations = %v, want the nine shortcuts and not the split-brain read", got)
+	}
+	// An exemption covers a named function, not its whole file: the same
+	// variable-token reads in an allowlisted FILE but another function are found.
+	if got := releaseGuardViolations(fset, f, "internal/grpcapi/ha_health.go"); len(got) != 9 {
+		t.Fatalf("in ha_health.go, function f: violations = %v, want all nine", got)
 	}
 	// The gate's own file may read the token and claim the minter; GrantForTest
-	// is refused everywhere outside tests.
-	if got := releaseGuardViolations(fset, f, "internal/health/release_feature.go"); len(got) != 1 ||
-		!strings.Contains(got[0], "GrantForTest") {
-		t.Fatalf("the gate's own file: %v, want only the GrantForTest finding", got)
+	// is refused everywhere outside tests, called or not.
+	if got := releaseGuardViolations(fset, f, "internal/health/release_feature.go"); len(got) != 2 ||
+		!strings.Contains(got[0], "GrantForTest") || !strings.Contains(got[1], "GrantForTest") {
+		t.Fatalf("the gate's own file: %v, want only the two GrantForTest findings", got)
 	}
 }
 
@@ -218,8 +249,9 @@ func TestReleaseFeatureWriters_CheckFindsAMissingGrant(t *testing.T) {
 import "github.com/litevirt/litevirt/internal/capabilities"
 func Good(g capabilities.FeatureGrant, n int) error { return g.Check("widgets") }
 func Bad(n int) error { return nil }
+func NoCheck(g capabilities.FeatureGrant) error { return nil }
 type T struct{}
-func (T) Method(ctx int, g capabilities.FeatureGrant) error { return nil }
+func (T) Method(ctx int, g capabilities.FeatureGrant) error { return g.Check("widgets") }
 `
 	if err := os.WriteFile(filepath.Join(pkg, "x.go"), []byte(src), 0o644); err != nil {
 		t.Fatal(err)
@@ -232,6 +264,9 @@ func (T) Method(ctx int, g capabilities.FeatureGrant) error { return nil }
 	}
 	if writerTakesGrant(dir, "internal/x.Bad") == nil {
 		t.Error("Bad takes no grant, and passed")
+	}
+	if writerTakesGrant(dir, "internal/x.NoCheck") == nil {
+		t.Error("NoCheck takes a grant and never checks it, and passed")
 	}
 	if writerTakesGrant(dir, "internal/x.Missing") == nil {
 		t.Error("a writer that does not exist passed")
@@ -270,9 +305,15 @@ func writerTakesGrant(root, writer string) error {
 				continue
 			}
 			for _, field := range fd.Type.Params.List {
-				if isGrantType(field.Type) {
-					return nil
+				if !isGrantType(field.Type) {
+					continue
 				}
+				for _, pn := range field.Names {
+					if callsCheckOn(fd.Body, pn.Name) {
+						return nil
+					}
+				}
+				return fmt.Errorf("%s takes a capabilities.FeatureGrant but never calls its Check", writer)
 			}
 			return fmt.Errorf("%s takes no capabilities.FeatureGrant", writer)
 		}
@@ -302,4 +343,26 @@ func isGrantType(e ast.Expr) bool {
 		return v.Name == "FeatureGrant"
 	}
 	return false
+}
+
+// callsCheckOn reports whether body calls <param>.Check(...).
+func callsCheckOn(body *ast.BlockStmt, param string) bool {
+	if body == nil {
+		return false
+	}
+	found := false
+	ast.Inspect(body, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if ok && sel.Sel.Name == "Check" {
+			if id, ok := sel.X.(*ast.Ident); ok && id.Name == param {
+				found = true
+			}
+		}
+		return !found
+	})
+	return found
 }

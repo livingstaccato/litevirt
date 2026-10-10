@@ -4063,6 +4063,28 @@ message UpgradeStatus {
     // writes; quarantine_reason says why.
     bool   wal_quarantined   = 4;
     string quarantine_reason = 5;
+    // The rollout summary the status opens with: how many hosts run a build
+    // that advertises release_token, which do not (with their build version),
+    // and how many declared features wait for it.
+    int32  hosts_total      = 6;
+    int32  hosts_on_release = 7;
+    repeated LaggingHost lagging = 8;
+    int32  features_waiting = 9;
+    // release_probation is true while the answering host is in release
+    // probation (its replicated writes refused until a voter majority confirms
+    // no use); probation_reason says why.
+    bool   release_probation = 10;
+    string probation_reason  = 11;
+    // refused_peers are the peers this host is refusing replication from
+    // because they cannot keep a release feature in use.
+    repeated string refused_peers = 12;
+}
+
+// LaggingHost is a host not yet on the answering host's release.
+message LaggingHost {
+    string name    = 1;
+    string version = 2;  // its reported build version, "" if unknown
+    string reason  = 3;  // "not advertising <token>" | "unreachable"
 }
 
 // UpgradeToken is one capability token latched on the answering host.

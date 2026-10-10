@@ -5,10 +5,12 @@ package grpcapi
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -128,6 +130,26 @@ func (s *Server) GetUpgradeStatus(ctx context.Context, _ *emptypb.Empty) (*pb.Up
 			out.QuarantineReason = reason
 		}
 	}
+	// Probation is not a quarantine, but every replicated write here is
+	// refused while it lasts, so it is shown (m-R2-3).
+	if s.db.InReleaseProbation() {
+		out.ReleaseProbation, out.ProbationReason = true, s.db.QuarantineReason()
+	}
+	// The rollout summary the status opens with (UX 2).
+	if s.gate != nil {
+		total, on, lagging, err := s.releaseLagging(ctx, true)
+		if err == nil {
+			out.HostsTotal, out.HostsOnRelease, out.Lagging = int32(total), int32(on), lagging
+		}
+		if !s.gate.Latched(capabilities.ReleaseToken) {
+			for _, f := range capabilities.Features() {
+				if info, _ := capabilities.LookupFeature(f); info.Token == capabilities.ReleaseToken {
+					out.FeaturesWaiting++
+				}
+			}
+		}
+	}
+	out.RefusedPeers = s.RefusedReleasePeers()
 	return out, nil
 }
 
@@ -211,26 +233,108 @@ func (s *Server) resetReleasePeerCache() {
 	s.releasePeerMu.Unlock()
 }
 
-// notePeerCaps remembers the last capability list a peer declared or answered
-// (residual a): its pushes declare it (ReplicateRequest.sender_capabilities),
-// and an answered Ping is one too. Kept until replaced, so an origin that cannot
-// be reached now is judged by what it last said.
-func (s *Server) notePeerCaps(peer string, caps []string) {
-	s.releasePeerMu.Lock()
-	if s.releasePeerLast == nil {
-		s.releasePeerLast = map[string][]string{}
-	}
-	s.releasePeerLast[peer] = append([]string(nil), caps...)
-	s.releasePeerMu.Unlock()
+// peerCapsEntry is what this node knows of one peer's capability list: the
+// last one it declared (a push) or answered (a Ping), when, and the state of
+// the background refresh.
+type peerCapsEntry struct {
+	caps        []string
+	known       bool
+	nextRefresh time.Time
+	backoff     time.Duration
+	inFlight    bool
 }
 
-// peerLastCaps is the last list peer declared or answered, and whether there
-// is one.
-func (s *Server) peerLastCaps(peer string) ([]string, bool) {
+// releasePeerPositiveTTL is how long a peer's list is trusted before a
+// background refresh; releasePeerBackoffMin/Max pace refreshes of a peer that
+// lacks the token or does not answer.
+const (
+	releasePeerPositiveTTL = 30 * time.Second
+	releasePeerBackoffMin  = 5 * time.Second
+	releasePeerBackoffMax  = 5 * time.Minute
+)
+
+// notePeerCaps remembers the capability list a peer declared or answered
+// (residual a), and schedules its next refresh: in 30s if it carries every
+// used release token, else after a backoff that grows while it stays short.
+func (s *Server) notePeerCaps(peer string, caps []string) {
 	s.releasePeerMu.Lock()
 	defer s.releasePeerMu.Unlock()
-	caps, ok := s.releasePeerLast[peer]
-	return caps, ok
+	if s.releasePeerLast == nil {
+		s.releasePeerLast = map[string]*peerCapsEntry{}
+	}
+	e := s.releasePeerLast[peer]
+	if e == nil {
+		e = &peerCapsEntry{}
+		s.releasePeerLast[peer] = e
+	}
+	e.caps, e.known = append([]string(nil), caps...), true
+	ok := true
+	for _, tok := range s.releaseUsed {
+		if !capabilities.Has(caps, tok) {
+			ok = false
+		}
+	}
+	if ok {
+		e.backoff = 0
+		e.nextRefresh = time.Now().Add(releasePeerPositiveTTL)
+		return
+	}
+	e.backoff = nextBackoff(e.backoff)
+	e.nextRefresh = time.Now().Add(e.backoff)
+}
+
+func nextBackoff(b time.Duration) time.Duration {
+	if b < releasePeerBackoffMin {
+		return releasePeerBackoffMin
+	}
+	if b *= 2; b > releasePeerBackoffMax {
+		return releasePeerBackoffMax
+	}
+	return b
+}
+
+// peerCapsFor returns what is known of peer and, when it is due, starts ONE
+// background refresh (I-R2-1): the caller never waits on a dial.
+func (s *Server) peerCapsFor(peer string) ([]string, bool) {
+	s.releasePeerMu.Lock()
+	if s.releasePeerLast == nil {
+		s.releasePeerLast = map[string]*peerCapsEntry{}
+	}
+	e := s.releasePeerLast[peer]
+	if e == nil {
+		e = &peerCapsEntry{}
+		s.releasePeerLast[peer] = e
+	}
+	caps, known := e.caps, e.known
+	start := !e.inFlight && !time.Now().Before(e.nextRefresh)
+	if start {
+		e.inFlight = true
+	}
+	s.releasePeerMu.Unlock()
+	if start {
+		go s.refreshPeerCaps(peer)
+	}
+	return caps, known
+}
+
+// refreshPeerCaps asks peer for its list out of band. An unanswered ask keeps
+// the last list and backs off.
+func (s *Server) refreshPeerCaps(peer string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	caps, _, err := s.PeerCapabilities(ctx, peer)
+	cancel()
+	if err == nil {
+		s.notePeerCaps(peer, caps)
+	}
+	s.releasePeerMu.Lock()
+	if e := s.releasePeerLast[peer]; e != nil {
+		e.inFlight = false
+		if err != nil {
+			e.backoff = nextBackoff(e.backoff)
+			e.nextRefresh = time.Now().Add(e.backoff)
+		}
+	}
+	s.releasePeerMu.Unlock()
 }
 
 // ReleaseSenderAllowed judges a push's SENDER by what it declared in the push
@@ -256,23 +360,19 @@ func (s *Server) ReleaseSenderAllowed(ctx context.Context, sender string, declar
 
 // ReleasePeerAllowed judges a peer this node is about to take state FROM
 // without a declaration — an anti-entropy pull source, or a relayed entry's
-// origin: by the last list it declared or answered, else by a Ping now. A peer
-// that cannot be asked and was never heard from is not judged: a dead host's
-// relayed writes must not stall a stream, and a startup with no peer answers
-// yet must not refuse everyone.
+// origin — by the last list it declared or answered. It never dials (I-R2-1):
+// a stale or missing list is refreshed in the background, one dial in flight
+// per peer, positive answers trusted 30s, negative ones re-asked with backoff.
+// A peer never heard from is not judged until its first answer: a dead host's
+// relayed writes must not stall a stream, and a startup with no answers yet
+// must not refuse everyone. A newly bad origin is therefore caught up to 30s
+// late.
 func (s *Server) ReleasePeerAllowed(ctx context.Context, peer string) error {
 	toks := s.usedReleaseTokens(ctx)
 	if len(toks) == 0 || peer == s.hostName {
 		return nil
 	}
-	caps, known := s.peerLastCaps(peer)
-	pctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	fresh, _, err := s.PeerCapabilities(pctx, peer)
-	cancel()
-	if err == nil {
-		caps, known = fresh, true
-		s.notePeerCaps(peer, fresh)
-	}
+	caps, known := s.peerCapsFor(peer)
 	if !known {
 		return nil
 	}
@@ -366,3 +466,129 @@ func (s *Server) releasePeerRefusedDetail() string {
 // AdvertisedCapabilities is the capability list this node's Ping returns, which
 // its pushes also declare (corrosion.Replicator.SetAdvertisedCapabilities).
 func (s *Server) AdvertisedCapabilities() []string { return s.advertisedCapabilities() }
+
+// Release rollout health condition (UX 3): informational, never degraded.
+const (
+	releaseRolloutEvaluator   = "release_rollout"
+	condReleaseRolloutPending = "release_rollout_pending"
+)
+
+// DeclaredCapabilities is what this node's pushes declare
+// (ReplicateRequest.sender_capabilities): its advertisement plus this build's
+// release tokens, whatever the live advertisement says — a self-fenced node
+// advertises nothing but its pending writes were made by a build that keeps
+// the data (I-R2-2, m-R2-1). A WAL-quarantined node declares only its (empty)
+// advertisement; it emits nothing anyway.
+func (s *Server) DeclaredCapabilities() []string {
+	adv := s.advertisedCapabilities()
+	if s.walQuarantinedNow() {
+		return adv
+	}
+	out := append([]string(nil), adv...)
+	for _, t := range capabilities.ReleaseTokens() {
+		if !slices.Contains(out, t) {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// RefusedReleasePeers lists the peers this node refused replication from in
+// the last releasePeerRefusedFor.
+func (s *Server) RefusedReleasePeers() []string { return s.releasePeerRefusedNow() }
+
+// releaseLagging lists the hosts not yet advertising this build's release
+// token, with their reported version, this host excluded. fresh pings each
+// (the status RPC); otherwise the checker's cached answer is used where the
+// gate offers one (the HA monitor).
+func (s *Server) releaseLagging(ctx context.Context, fresh bool) (total, on int, lagging []*pb.LaggingHost, err error) {
+	hosts, err := corrosion.ListHosts(ctx, s.db)
+	if err != nil {
+		return 0, 0, nil, err
+	}
+	tok := capabilities.ReleaseToken
+	cached, _ := s.gate.(interface {
+		PeerSupports(ctx context.Context, peer, token string) bool
+	})
+	results := make([]bool, len(hosts))
+	var wg sync.WaitGroup
+	for i, h := range hosts {
+		if h.Name == s.hostName {
+			results[i] = true
+			continue
+		}
+		wg.Add(1)
+		go func(i int, name string) {
+			defer wg.Done()
+			if !fresh && cached != nil {
+				results[i] = cached.PeerSupports(ctx, name, tok)
+				return
+			}
+			results[i] = s.gate.PeerSupportsFresh(ctx, name, tok)
+		}(i, h.Name)
+	}
+	wg.Wait()
+	for i, h := range hosts {
+		total++
+		if results[i] {
+			on++
+			continue
+		}
+		lagging = append(lagging, &pb.LaggingHost{Name: h.Name, Version: h.Version,
+			Reason: "not advertising " + tok + " (an older build, or unreachable)"})
+	}
+	sort.Slice(lagging, func(i, j int) bool { return lagging[i].GetName() < lagging[j].GetName() })
+	return total, on, lagging, nil
+}
+
+// evaluateReleaseRollout keeps the informational release_rollout_pending
+// condition (UX 3): open, naming the lagging hosts, while this build's release
+// token has not latched here and some host does not advertise it; resolved
+// once it latches or every host does. Written only on a change. Severity info:
+// an upgrade in progress is not a fault, and info does not degrade `lv health`.
+func (s *Server) evaluateReleaseRollout(ctx context.Context) {
+	if s.gate == nil {
+		return
+	}
+	tok := capabilities.ReleaseToken
+	prev, open, err := corrosion.GetHealthCondition(ctx, s.db, releaseRolloutEvaluator, condReleaseRolloutPending, "cluster", tok)
+	if err != nil {
+		return
+	}
+	open = open && prev.Lifecycle != corrosion.ConditionResolved
+	var names []string
+	if !s.gate.Latched(tok) {
+		_, _, lagging, err := s.releaseLagging(ctx, false)
+		if err != nil {
+			return
+		}
+		for _, l := range lagging {
+			names = append(names, l.GetName())
+		}
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	row := corrosion.HealthCondition{Evaluator: releaseRolloutEvaluator, Code: condReleaseRolloutPending,
+		SubjectKind: "cluster", SubjectID: tok, Severity: corrosion.SeverityInfo, Hosts: names,
+		Reporter: s.hostName, LastSeen: now, FirstSeen: prev.FirstSeen, ConfirmedAt: prev.ConfirmedAt}
+	if row.FirstSeen == "" {
+		row.FirstSeen = now
+	}
+	switch {
+	case len(names) > 0:
+		if open && slices.Equal(prev.Hosts, names) {
+			return
+		}
+		row.Lifecycle, row.ObserveCount = corrosion.ConditionConfirmed, 1
+		if !open {
+			row.FirstSeen, row.ConfirmedAt = now, now
+		}
+		row.Evidence = fmt.Sprintf(`{"token":%q,"lagging":%d}`, tok, len(names))
+	case open:
+		row.Lifecycle, row.ResolvedAt, row.Hosts = corrosion.ConditionResolved, now, prev.Hosts
+	default:
+		return
+	}
+	if err := corrosion.UpsertHealthCondition(ctx, s.db, row); err != nil {
+		slog.Debug("release rollout condition: write failed", "error", err)
+	}
+}

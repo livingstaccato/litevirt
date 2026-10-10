@@ -618,6 +618,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.db.SetVMReplaceAccept(func() bool {
 		return d.checker.DurablyLatched(capabilities.VMReplaceV1)
 	})
+	// Every push declares this build's release tokens from the first one
+	// (I-R2-2): the server, which wires the live advertisement, is built later,
+	// and a push that declared nothing would be refused by every peer with a
+	// release feature in use.
+	repl.SetAdvertisedCapabilities(capabilities.ReleaseTokens)
 	repl.Start(ctx)
 
 	// Audit key lifecycle, deferred until replication is running.
@@ -861,9 +866,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// A peer advertising a release token this build does not know is, almost
 	// always, a forward roll: a non-blocking look at its used records, never a
 	// probation (N2). Probation comes only from a marker at boot.
-	d.checker.SetUnknownReleaseTokenObserver(func(peer, tok string) {
-		go ae.OnUnknownReleaseToken(ctx, peer, tok)
-	})
+	corrosion.WireUnknownReleaseObserver(ctx, d.checker, ae)
 	// Take no replicated state from a peer that cannot keep a release feature
 	// in use: pushes are refused in PushMutations, pulls here.
 	d.db.SetReplicationSourceGate(svc.ReleasePeerAllowed)

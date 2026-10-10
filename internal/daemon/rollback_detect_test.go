@@ -305,3 +305,33 @@ func TestPreflightRollback_NoProbationWithoutARule(t *testing.T) {
 		t.Fatalf("probation = %v for a token already shown used", p)
 	}
 }
+
+// TestPreflightRollback_ConfirmedLiftIsRemembered (C-R2-1): once a voter
+// majority has confirmed no use, later boots below the same marker do not
+// re-enter probation — a cluster-wide restart would otherwise put every voter
+// back in it at once. The record is bound to the marker: a different marker
+// (a later rollback) is checked afresh, and a use that has since arrived still
+// quarantines.
+func TestPreflightRollback_ConfirmedLiftIsRemembered(t *testing.T) {
+	dir := t.TempDir()
+	writeMarkerContent(t, dir, futureRelease, "1\nrollback: safe_if_unused\n")
+	if _, p := preflightRollback(dir, noUses); len(p) != 1 {
+		t.Fatalf("first boot: probation = %v, want [%s]", p, futureRelease)
+	}
+	if err := persistProbationLift(dir, []string{futureRelease}); err != nil {
+		t.Fatalf("persistProbationLift: %v", err)
+	}
+	if q, p := preflightRollback(dir, noUses); len(q) != 0 || len(p) != 0 {
+		t.Fatalf("boot after a confirmed lift: quarantine=%v probation=%v, want neither", q, p)
+	}
+	usedFuture := func() ([]corrosion.ReleaseFeatureUse, error) {
+		return []corrosion.ReleaseFeatureUse{{Token: futureRelease, Feature: "widgets"}}, nil
+	}
+	if q, _ := preflightRollback(dir, usedFuture); len(q) != 1 {
+		t.Fatalf("a use after the lift: quarantine = %v, want [%s]", q, futureRelease)
+	}
+	writeMarkerContent(t, dir, futureRelease, "1\nrollback: safe_if_unused\nlatched: 2\n")
+	if _, p := preflightRollback(dir, noUses); len(p) != 1 {
+		t.Fatalf("a different marker: probation = %v, want it checked afresh", p)
+	}
+}

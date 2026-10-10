@@ -133,7 +133,7 @@ func (c *Checker) requireFeature(ctx context.Context, feature capabilities.Featu
 		// not wait for the HA monitor's turn.
 		c.Enforced(ctx, tok)
 		if !c.DurablyLatched(tok) {
-			return refuse("not every host this one replicates to runs a build that keeps it yet")
+			return refuse(c.releaseLaggards(ctx, tok))
 		}
 	}
 
@@ -166,6 +166,9 @@ func (c *Checker) requireFeature(ctx context.Context, feature capabilities.Featu
 	} else {
 		targets, rerr := c.releaseRecipients(ctx, tok)
 		if rerr != nil {
+			if errors.Is(rerr, errReleaseLagging) {
+				return refuse(c.releaseLaggards(ctx, tok))
+			}
 			return refuse(rerr.Error())
 		}
 		if err := record(false); err != nil {
@@ -194,9 +197,8 @@ func (c *Checker) requireFeature(ctx context.Context, feature capabilities.Featu
 // because a later probation majority is drawn from the voter set. A powered-off
 // maintenance host that is not a voter is neither, and does not block.
 func (c *Checker) releaseRecipients(ctx context.Context, tok string) ([]string, error) {
-	if ok, reason := c.CapabilityActive(ctx, tok); !ok {
-		return nil, fmt.Errorf("a host this one replicates to does not advertise it now (%s); a host "+
-			"rolled back after the upgrade must be upgraded again or removed", reason)
+	if ok, _ := c.CapabilityActive(ctx, tok); !ok {
+		return nil, errReleaseLagging
 	}
 	hosts, err := corrosion.ListHosts(ctx, c.db)
 	if err != nil {
@@ -266,13 +268,87 @@ func (c *Checker) awaitReleaseAcks(ctx context.Context, targets []string, tok, f
 		if time.Now().After(deadline) || ctx.Err() != nil {
 			slog.Warn("release feature: a first use was not acknowledged by every recipient; refusing the write",
 				"feature", feature, "token", tok, "unacknowledged", pending)
-			return status.Errorf(codes.Unavailable,
-				"%s's use is recorded here but not yet acknowledged by %s; the write is refused until every "+
-					"host holds the record — retry", feature, strings.Join(pending, ", "))
+			voters, _ := c.voters(ctx)
+			var hints []string
+			for _, h := range pending {
+				if voters[h] {
+					hints = append(hints, fmt.Sprintf("%s is a voter: if it is gone for good, `lv cluster voter rm %s` "+
+						"removes it and lets this proceed", h, h))
+				}
+			}
+			msg := fmt.Sprintf("%s's use is recorded here but not yet acknowledged by %s; the write is refused "+
+				"until every host holds the record — retry", feature, strings.Join(pending, ", "))
+			if len(hints) > 0 {
+				msg += ". " + strings.Join(hints, "; ")
+			}
+			return status.Error(codes.Unavailable, msg)
 		}
 		select {
 		case <-ctx.Done():
 		case <-time.After(releaseAckPoll):
 		}
 	}
+}
+
+// errReleaseLagging: some host this node must hear the token from does not
+// advertise it now.
+var errReleaseLagging = errors.New("a host does not advertise the release token")
+
+// releaseLaggards names, for a refusal, every host this node must hear the
+// token from that does not advertise it now, with its reported build version,
+// and points at the status command (UX 1). It pings every target (a refusal
+// is rare, and the operator needs the whole list, not the first miss).
+func (c *Checker) releaseLaggards(ctx context.Context, tok string) string {
+	hosts, err := corrosion.ListHosts(ctx, c.db)
+	if err != nil {
+		return "not every host this one replicates to runs a build that keeps it yet — see `lv cluster upgrade-status`"
+	}
+	version := map[string]string{}
+	for _, h := range hosts {
+		version[h.Name] = h.Version
+	}
+	c.mu.Lock()
+	pinger := c.peerPinger
+	c.mu.Unlock()
+	targets := c.activationTargets(hosts, tok)
+	lag := make([]string, len(targets))
+	var wg sync.WaitGroup
+	for i, h := range targets {
+		if h == c.hostName {
+			continue
+		}
+		wg.Add(1)
+		go func(i int, h string) {
+			defer wg.Done()
+			if pinger == nil {
+				lag[i] = h + " (unreachable)"
+				return
+			}
+			pctx, cancel := context.WithTimeout(ctx, capActivationTimeout)
+			caps, _, err := pinger(pctx, h)
+			cancel()
+			switch {
+			case err != nil:
+				lag[i] = h + " (unreachable)"
+			case !capabilities.Has(caps, tok):
+				v := version[h]
+				if v == "" {
+					v = "version unknown"
+				}
+				lag[i] = h + " (" + v + ")"
+			}
+		}(i, h)
+	}
+	wg.Wait()
+	var out []string
+	for _, l := range lag {
+		if l != "" {
+			out = append(out, l)
+		}
+	}
+	if len(out) == 0 {
+		return "the release token has not latched on this host yet; it latches by itself shortly — see " +
+			"`lv cluster upgrade-status`"
+	}
+	return "not on this release yet: " + strings.Join(out, ", ") + " — see `lv cluster upgrade-status`"
 }

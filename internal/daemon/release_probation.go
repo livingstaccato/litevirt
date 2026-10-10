@@ -21,11 +21,19 @@ func (d *Daemon) runReleaseProbation(ctx context.Context, ae *corrosion.AntiEntr
 	t := time.NewTicker(releaseProbationInterval)
 	defer t.Stop()
 	for len(d.db.ReleaseProbation()) > 0 {
+		checking := d.db.ReleaseProbation()
 		if lifted, err := ae.VerifyReleaseProbation(ctx); err != nil {
 			slog.Warn("release probation: check failed; staying in probation", "error", err)
-		} else if lifted && len(d.db.ReleaseProbation()) == 0 {
-			slog.Info("release probation lifted")
-			return
+		} else if lifted {
+			// Remembered, bound to the marker, so a restart does not put this
+			// node back in probation (C-R2-1).
+			if err := persistProbationLift(d.cfg.DataDir, checking); err != nil {
+				slog.Warn("release probation: could not record the lift; the next boot checks again", "error", err)
+			}
+			if len(d.db.ReleaseProbation()) == 0 {
+				slog.Info("release probation lifted")
+				return
+			}
 		}
 		select {
 		case <-ctx.Done():

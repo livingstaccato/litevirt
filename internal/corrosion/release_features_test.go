@@ -546,10 +546,13 @@ func probationVoters(t *testing.T, others []string, pull func(peer string) (bool
 	return c, ae
 }
 
-// TestVerifyReleaseProbation_CountsOnlyOtherVotersNotInProbation (N3): this
-// node's own replica is the one in doubt, and a peer in probation is in the
-// same doubt, so neither counts toward the majority.
-func TestVerifyReleaseProbation_CountsOnlyOtherVotersNotInProbation(t *testing.T) {
+// TestVerifyReleaseProbation_CountsOtherVotersInProbation (N3, C-R2-1): this
+// node's own replica is the one in doubt, so it does not count. A voter that
+// is itself in probation DOES count: every voter acknowledged a first use, so a
+// voter holding no record of one was not there for it, and its replica is as
+// good evidence as any other. Only a WAL-quarantined voter (a rollback below a
+// use, or a pre-rule build) is excluded.
+func TestVerifyReleaseProbation_CountsOtherVotersInProbation(t *testing.T) {
 	ctx := context.Background()
 	// 3 voters: self, b answers, c unreachable. Self does not count: 1 < 2.
 	_, ae := probationVoters(t, []string{"voter-b", "voter-c"}, func(peer string) (bool, error) {
@@ -561,14 +564,15 @@ func TestVerifyReleaseProbation_CountsOnlyOtherVotersNotInProbation(t *testing.T
 	if lifted, _ := ae.VerifyReleaseProbation(ctx); lifted {
 		t.Fatal("probation lifted on one other voter of three: this node counted itself")
 	}
-	// b and c answer, but b is itself in probation: 1 < 2.
+	// b and c answer, but b is WAL-quarantined: 1 < 2.
 	_, ae = probationVoters(t, []string{"voter-b", "voter-c"}, func(peer string) (bool, error) {
 		return peer == "voter-b", nil
 	})
 	if lifted, _ := ae.VerifyReleaseProbation(ctx); lifted {
-		t.Fatal("probation lifted on the word of a peer that is itself in probation")
+		t.Fatal("probation lifted on the word of a WAL-quarantined peer")
 	}
-	// Both answer and neither is in probation: lifted.
+	// Both answer, both themselves in probation (a whole-cluster rollback):
+	// they count, and it lifts. The pull reports only quarantine as excluded.
 	c, ae := probationVoters(t, []string{"voter-b", "voter-c"}, func(string) (bool, error) { return false, nil })
 	if lifted, err := ae.VerifyReleaseProbation(ctx); !lifted || err != nil {
 		t.Fatalf("both other voters answered: lifted=%v err=%v", lifted, err)
@@ -580,6 +584,43 @@ func TestVerifyReleaseProbation_CountsOnlyOtherVotersNotInProbation(t *testing.T
 	_, ae = probationVoters(t, []string{"voter-b"}, func(string) (bool, error) { return false, nil })
 	if lifted, _ := ae.VerifyReleaseProbation(ctx); !lifted {
 		t.Fatal("a two-voter cluster cannot lift probation: stuck")
+	}
+	// One voter (this node): nobody else can have acknowledged as a voter, and
+	// it lifts on its own check (documented).
+	_, ae = probationVoters(t, nil, func(string) (bool, error) { return false, errors.New("never asked") })
+	if lifted, _ := ae.VerifyReleaseProbation(ctx); !lifted {
+		t.Fatal("a one-voter cluster cannot lift probation: stuck")
+	}
+}
+
+// TestReplicator_DeclaresReleaseTokensBeforeWiring (I-R2-2): until the server
+// wires the live advertisement, a push declares this build's release tokens —
+// a fact about the binary — so a restarted, healthy host is never refused.
+func TestReplicator_DeclaresReleaseTokensBeforeWiring(t *testing.T) {
+	r := NewReplicator(testClient(t), "", RelayConfig{})
+	if got := r.advertisedCapabilities(); !slices.Contains(got, capabilities.ReleaseToken) {
+		t.Fatalf("an unwired replicator declares %v, want %s", got, capabilities.ReleaseToken)
+	}
+}
+
+// TestOnUnknownReleaseToken_RetriesWithBackoff (m-R2-4): a failed look is
+// retried, with backoff, until one succeeds.
+func TestOnUnknownReleaseToken_RetriesWithBackoff(t *testing.T) {
+	prev := releaseCheckBackoff
+	releaseCheckBackoff = time.Millisecond
+	t.Cleanup(func() { releaseCheckBackoff = prev })
+	ae := NewAntiEntropy(testClient(t), "", time.Minute)
+	calls := 0
+	ae.checkFrom = func(context.Context, string) error {
+		calls++
+		if calls < 3 {
+			return errors.New("transient")
+		}
+		return nil
+	}
+	ae.OnUnknownReleaseToken(context.Background(), "peer", futureReleaseToken)
+	if calls != 3 {
+		t.Fatalf("checks = %d, want 3 (two failures retried)", calls)
 	}
 }
 

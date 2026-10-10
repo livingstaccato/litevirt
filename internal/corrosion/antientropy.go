@@ -35,6 +35,9 @@ type AntiEntropy struct {
 	// probationPull answers VerifyReleaseProbation's pulls; nil uses the real
 	// pull (pullClusterPoliciesForProbation). Tests replace it.
 	probationPull probationPullFunc
+	// checkFrom answers OnUnknownReleaseToken's look; nil uses
+	// CheckReleaseUsesFrom. Tests replace it.
+	checkFrom func(ctx context.Context, peer string) error
 
 	// mu guards the trigger decision only (not the pass itself): a pass no-ops when one is
 	// already running or ran within antiEntropyCooldown. It never bypasses checkPeers's

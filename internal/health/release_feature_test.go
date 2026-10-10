@@ -349,8 +349,10 @@ func TestWithFeature_AckSetIncludesEveryVoter(t *testing.T) {
 		return host == "host-b" || (host == "host-c" && cHolds), nil
 	}
 	wrote, err := e.write(t, e.c, testFeature)
-	if status.Code(err) != codes.Unavailable || wrote || !strings.Contains(err.Error(), "host-c") {
-		t.Fatalf("first use with voter host-c not holding the record: wrote=%v err=%v, want Unavailable naming host-c", wrote, err)
+	if status.Code(err) != codes.Unavailable || wrote || !strings.Contains(err.Error(), "host-c") ||
+		!strings.Contains(err.Error(), "lv cluster voter rm host-c") {
+		t.Fatalf("first use with voter host-c not holding the record: wrote=%v err=%v, want Unavailable naming "+
+			"host-c and `lv cluster voter rm host-c` as the way out if it is gone", wrote, err)
 	}
 	mu.Lock()
 	if asked["host-d"] {
@@ -383,5 +385,25 @@ func TestWithFeature_AcksAreAskedInParallel(t *testing.T) {
 	}
 	if d := time.Since(start); d > 450*time.Millisecond {
 		t.Fatalf("four 150ms acknowledgements took %v: asked one at a time", d)
+	}
+}
+
+// TestWithFeature_RefusalNamesTheLaggingHosts (UX 1): a feature refused
+// mid-upgrade says which hosts hold the release back, on which build, and where
+// to look — so it never reads as a broken feature.
+func TestWithFeature_RefusalNamesTheLaggingHosts(t *testing.T) {
+	e := newRelEnv(t)
+	if err := corrosion.UpdateHostVersion(context.Background(), e.db, "host-b", "1.9.0"); err != nil {
+		t.Fatal(err)
+	}
+	e.bAdvertises.Store(false)
+	_, err := e.write(t, e.c, testFeature)
+	for _, want := range []string{"host-b (1.9.0)", "lv cluster upgrade-status"} {
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("refusal %v does not contain %q", err, want)
+		}
+	}
+	if strings.Contains(err.Error(), "host-a") {
+		t.Fatalf("refusal %v names this host, which is on the release", err)
 	}
 }

@@ -136,6 +136,11 @@ release token's marker carries: there, a rollback below the token quarantines
 only once one of its features has been used. That is what a later release's
 token offers when rolled back onto this release.
 
+The first line is the rollout: how many hosts run this release, which do not
+(with their build version), and how many features wait for them. A feature
+refused mid-upgrade says the same and points here. The release token latches by
+itself once every host is on the release; nothing has to be run.
+
 A feature is marked used before its first write anywhere, every host that writes
 it records it again, and the mark is never cleared: nothing proves the
 feature's data has all gone. RECORDED BY is the host that last recorded it.`,
@@ -161,9 +166,31 @@ func upgradeYesNo(b bool) string {
 }
 
 func printUpgradeStatus(out io.Writer, st *pb.UpgradeStatus) {
+	// The one line that answers "is the upgrade done?" (UX 2).
+	if st.GetHostsTotal() > 0 {
+		fmt.Fprintf(out, "Rollout: %d of %d hosts on %s", st.GetHostsOnRelease(), st.GetHostsTotal(), st.GetReleaseToken())
+		if n := st.GetFeaturesWaiting(); n > 0 {
+			fmt.Fprintf(out, "; %d feature(s) waiting for the rest", n)
+		}
+		fmt.Fprintln(out)
+		for _, l := range st.GetLagging() {
+			v := l.GetVersion()
+			if v == "" {
+				v = "version unknown"
+			}
+			fmt.Fprintf(out, "  not yet: %s (%s)\n", l.GetName(), v)
+		}
+	}
 	fmt.Fprintf(out, "Release token: %s\n", st.GetReleaseToken())
 	if st.GetWalQuarantined() {
 		fmt.Fprintf(out, "WAL quarantine: yes — %s\n", st.GetQuarantineReason())
+	}
+	if st.GetReleaseProbation() {
+		fmt.Fprintf(out, "Release probation: yes — %s\n", st.GetProbationReason())
+	}
+	if peers := st.GetRefusedPeers(); len(peers) > 0 {
+		fmt.Fprintf(out, "Refusing replication from: %s (they do not advertise a release token in use)\n",
+			strings.Join(peers, ", "))
 	}
 	fmt.Fprintln(out)
 	w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)

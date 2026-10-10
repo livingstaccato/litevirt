@@ -844,9 +844,13 @@ const ReleaseToken = Release202611V1
 //     `rollback: safe_if_unused` marker attribute and cannot honour it. A
 //     LATER release's token rolled back onto this build quarantines only if
 //     one of its features was used (daemon.preflightCapabilityRollback).
-//     RETIREMENT: never. A release token is not retired when its release is
-//     superseded; it stays in All() so a later build keeps recognising its
-//     marker and its features' used bits.
+//     RETIREMENT: never, and it stays ADVERTISED, unconditionally and for
+//     good. A build on this release refuses the pushes of a sender whose
+//     declaration lacks a release token in use (grpcapi ReleaseSenderAllowed),
+//     so a later build that stopped advertising it would be refused by every
+//     host still on this release during a forward roll. It also stays in All()
+//     so a later build keeps recognising its marker and its features' used
+//     bits.
 //
 // recovery_claim_v1 is NOT mandatory and HAS a flag, enforcement.recovery_claim,
 // which is its stand-down: false on every node and a restart returns recovery

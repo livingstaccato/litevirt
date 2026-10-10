@@ -414,14 +414,25 @@ bit**:
 
 - The release token (`release_2026_11_v1` for this release) is mandatory and
   replication-gated. It latches by itself once every host the cluster
-  replicates to — a host in `maintenance` included — runs this release.
-  Latching it changes nothing on its own.
-- A feature of the release is refused, with `the cluster upgrade must finish
-  first (<feature> needs <token>)`, until the token has latched. Before its
+  replicates to — a host in `maintenance` included — runs this release; there
+  is nothing to run. Latching it changes nothing on its own. Every later build
+  keeps ADVERTISING it, unconditionally and for good: a host on this release
+  refuses the pushes of a sender that does not declare a release token in use.
+- **Mid-upgrade, nothing looks broken.** A feature of the release is refused,
+  with `the cluster upgrade must finish first (<feature> needs <token>): not on
+  this release yet: <host> (<its build version>), … — see lv cluster
+  upgrade-status`, until the token has latched. `lv cluster upgrade-status`
+  opens with the rollout (`Rollout: N of M hosts on <token>; K feature(s)
+  waiting for the rest`, then each lagging host and its version), and the
+  informational health condition `release_rollout_pending` (`lv health`; it does
+  not degrade the cluster's health) names the lagging hosts until they have
+  rolled. No runbook step is needed. Before its
   first write anywhere, the cluster records that it is used — a replicated row
-  — and **every host the cluster replicates to must confirm it holds that
-  record** before the write runs. A host that does not confirm in time refuses
-  the write (`Unavailable`; retry). If the record cannot be written at all, the
+  — and **every voter and every host the cluster replicates to must confirm it
+  holds that record** before the write runs. A host that does not confirm in
+  time refuses the write (`Unavailable`; retry), naming the host; for a voter
+  the message adds that, if it is gone for good, `lv cluster voter rm <host>` is
+  the way out. If the record cannot be written at all, the
   write is refused too. Every host that writes the feature's data puts its own
   copy of the record on its own replication stream first. The record is never
   cleared: nothing proves the feature's data has all gone.
@@ -432,9 +443,12 @@ bit**:
 - Once a feature is in use, an upgraded host **refuses replication** from a
   peer that cannot keep its data. A push is judged by what the sender declares
   in it (every push carries the sender's advertised capabilities; an older
-  build carries none), so an upgraded sender is never refused for being hard to
-  reach. Relayed entries are judged by their origin's last declared or answered
-  list, and anti-entropy pulls the same way. The refusal is back-pressure,
+  build carries none). A push always declares this build's release tokens — from
+  the first push after a restart, and while self-fenced — so an upgraded sender
+  is never refused. Relayed entries and anti-entropy pulls are judged by their
+  origin's last declared or answered list, which is refreshed in the background
+  (trusted 30s, a lacking or silent peer re-asked with backoff), never by a dial
+  on the push path; a newly bad origin is therefore caught up to 30s late. The refusal is back-pressure,
   nothing is dropped, and it raises
   `litevirt_ha_degraded{reason="release_feature_peer_refused"}` with an event
   naming the peers, again whenever a new peer joins them. Upgrade that host
@@ -449,11 +463,19 @@ bit**:
   it is not quarantined: it keeps advertising, its Ping reports
   `release_probation` and never `wal_quarantined`, and no peer isolates it. It
   pulls the cluster's used records from a majority of the other voters — not
-  counting itself or a voter that is itself in probation — and lifts (`release
-  probation lifted` in the log), or quarantines if a use is there. In a
-  two-voter cluster the one other voter is enough. A voter majority that stays
-  unreachable keeps it in probation; `LITEVIRT_UNSAFE_SKIP_ROLLBACK_CHECK=1` and
-  a restart is the operator's way out.
+  counting itself, nor a WAL-quarantined voter, but counting a voter that is in
+  probation too, so hosts rolled back together (a whole-cluster rollback
+  included) lift together — and lifts (`release probation lifted` in the log),
+  or quarantines if a use is there. In a two-voter cluster the one other voter
+  is enough; a one-voter cluster lifts on its own check, since no other voter
+  could have acknowledged a use. The lift is remembered beside the marker
+  (`release_probation_lifted.<token>` in the data directory), so a later
+  restart below the same marker does not enter probation again; a use that
+  arrives since still quarantines. The voter set is this host's own view, which
+  may be stale after a long absence: a voter removed meanwhile and unreachable
+  can keep it in probation. A voter majority that stays unreachable keeps it in
+  probation; `LITEVIRT_UNSAFE_SKIP_ROLLBACK_CHECK=1` and a restart is the
+  operator's way out, and `lv cluster upgrade-status` shows the probation.
 - A first use is acknowledged by every voter (one in `maintenance` included)
   and every host the cluster replicates to, so whichever voters a probation asks
   later, a majority of them holds it. A powered-off host that is neither does
@@ -499,8 +521,9 @@ used: this build is the one that would be quarantined, and is, if it is the
 binary answering.
 
 **Residuals.**
-- An origin a receiver has never heard from and cannot reach is not judged, so
-  its entries relayed by another host are accepted until it answers once.
+- An origin a receiver has never heard from is not judged, so its entries
+  relayed by another host are accepted until it first answers (asked in the
+  background); a known origin that turns bad is caught up to 30s late.
 - A host with no marker that was away through the next release's latch and
   first use, and comes back on this release, emits replicated writes until its
   first Ping of a newer host leads it to their used records. Upgraded hosts with

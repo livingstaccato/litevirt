@@ -189,6 +189,8 @@ func (s *Server) RunHAHealthMonitor(ctx context.Context, interval time.Duration)
 		s.recordSelfReportedIsolation(ctx)
 		cur, unsupported := s.evaluateHADegraded(ctx)
 		curRefused := s.releasePeerRefusedNow()
+		// Informational, never a degraded reason: hosts still to roll (UX 3).
+		s.evaluateReleaseRollout(ctx)
 		// Rollout observability: per-feature config intent, latch state, and
 		// whether the feature is degraded. Written AFTER the evaluation because
 		// the degraded set comes from it, and for EVERY supported token rather

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"sync/atomic"
+	"testing"
 )
 
 // Release features: the closed set of features a release token opens, and the
@@ -194,7 +195,19 @@ func ClaimGrantMinter() func(Feature) FeatureGrant {
 
 // GrantForTest mints a grant for a test's fake gate. Test code only: the
 // release-feature guard fails the build on any non-test caller.
-func GrantForTest(t interface{ Helper() }, f Feature) FeatureGrant {
+func GrantForTest(t testing.TB, f Feature) FeatureGrant {
 	t.Helper()
 	return mintGrant(f)
+}
+
+// ReleaseTokens lists the release tokens this build advertises (tokens with a
+// rollback rule), what a push declares before the live advertisement is wired.
+func ReleaseTokens() []string {
+	var out []string
+	for _, t := range supported {
+		if RollbackRule(t) != "" {
+			out = append(out, t)
+		}
+	}
+	return out
 }

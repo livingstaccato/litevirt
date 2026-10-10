@@ -6,6 +6,7 @@ import (
 	"errors"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"google.golang.org/grpc/codes"
@@ -128,11 +129,8 @@ func TestGetUpgradeStatus_ShowsUsesOfUnknownTokens(t *testing.T) {
 	}
 }
 
-type t0 struct{}
-
-func (t0) Helper() {}
-
 type fakeFeatureGate struct {
+	t     testing.TB
 	err   error
 	grant bool
 }
@@ -144,7 +142,7 @@ func (g fakeFeatureGate) WithFeature(ctx context.Context, f capabilities.Feature
 	}
 	var grant capabilities.FeatureGrant
 	if g.grant {
-		grant = capabilities.GrantForTest(t0{}, f)
+		grant = capabilities.GrantForTest(g.t, f)
 	}
 	return write(ctx, grant)
 }
@@ -167,7 +165,7 @@ func TestWithReleaseFeature_FailsClosed(t *testing.T) {
 	if err := s.WithReleaseFeature(context.Background(), "widgets", write); !errors.Is(err, want) || ran {
 		t.Fatalf("WithReleaseFeature = %v ran=%v, want the gate's refusal", err, ran)
 	}
-	s.SetReleaseFeatureGate(fakeFeatureGate{grant: true})
+	s.SetReleaseFeatureGate(fakeFeatureGate{t: t, grant: true})
 	if err := s.WithReleaseFeature(context.Background(), "widgets", write); err != nil || !ran {
 		t.Fatalf("WithReleaseFeature with a passing gate: ran=%v err=%v", ran, err)
 	}
@@ -330,5 +328,132 @@ func TestPing_ProbationIsNotWALQuarantine(t *testing.T) {
 	if resp.GetWalQuarantined() || !resp.GetReleaseProbation() || !slices.Contains(resp.GetCapabilities(), capabilities.ReleaseToken) {
 		t.Fatalf("Ping in probation: wal_quarantined=%v release_probation=%v caps=%v, want false/true/advertising",
 			resp.GetWalQuarantined(), resp.GetReleaseProbation(), resp.GetCapabilities())
+	}
+}
+
+// TestPushMutations_OriginJudgedWithoutDialling (I-R2-1): the push path never
+// dials. A relayed origin is judged from what it last declared; an origin never
+// heard from is not judged now and is refreshed in the background, with at
+// most one dial in flight per origin.
+func TestPushMutations_OriginJudgedWithoutDialling(t *testing.T) {
+	s := releasePeerServer(t)
+	var mu sync.Mutex
+	dials := map[string]int{}
+	release := make(chan struct{})
+	s.peerClientOverride = func(_ context.Context, host string) (pb.LiteVirtClient, func(), error) {
+		mu.Lock()
+		dials[host]++
+		mu.Unlock()
+		<-release
+		return nil, nil, errors.New("unreachable")
+	}
+	withTok := capabilities.Supported()
+	// good-peer declared the token in its own push.
+	if _, err := s.PushMutations(replicationPeerCtx("good-peer"), &pb.ReplicateRequest{
+		Sender: "good-peer", Entries: crlEntry("good-peer", "2000000000010-0000-n1"), SenderCapabilities: withTok,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for i, hlc := range []string{"2000000000011-0000-n4", "2000000000012-0000-n4", "2000000000013-0000-n4"} {
+		entries := append(crlEntry("good-peer", hlc), crlEntry("stranger", hlc)...)
+		entries[1].Seq = 2
+		if _, err := s.PushMutations(replicationPeerCtx("relay"), &pb.ReplicateRequest{
+			Sender: "relay", Entries: entries, SenderCapabilities: withTok,
+		}); err != nil {
+			t.Fatalf("relayed push %d: %v", i, err)
+		}
+	}
+	mu.Lock()
+	if dials["good-peer"] != 0 {
+		t.Errorf("a recently declared origin was dialled %d time(s) on the push path", dials["good-peer"])
+	}
+	if dials["stranger"] > 1 {
+		t.Errorf("an unknown origin was dialled %d times: more than one in flight", dials["stranger"])
+	}
+	mu.Unlock()
+	close(release)
+}
+
+// TestDeclaredCapabilities_SelfFencedStillDeclares (I-R2-2, m-R2-1): a push
+// declares this build's release tokens whatever the live advertisement says —
+// a self-fenced node's pending writes are not refused for it. A WAL-quarantined
+// node declares nothing (and emits nothing).
+func TestDeclaredCapabilities_SelfFencedStillDeclares(t *testing.T) {
+	s := testServer(t)
+	s.SetWatchdogFenced(func() bool { return true })
+	if got := s.DeclaredCapabilities(); !slices.Contains(got, capabilities.ReleaseToken) {
+		t.Fatalf("a self-fenced node declares %v, want %s", got, capabilities.ReleaseToken)
+	}
+	s2 := testServer(t)
+	s2.SetWALQuarantined(func() bool { return true })
+	if got := s2.DeclaredCapabilities(); len(got) != 0 {
+		t.Fatalf("a WAL-quarantined node declares %v, want nothing", got)
+	}
+}
+
+func rolloutServer(t *testing.T, latched bool) *Server {
+	t.Helper()
+	s := upgradeStatusServer(t)
+	ctx := context.Background()
+	for _, h := range []struct{ name, version string }{{"test-host", "1.10.0"}, {"peer-new", "1.10.0"}, {"peer-old", "1.9.0"}} {
+		if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: h.name, Address: "10.0.0.9", State: "active", Role: "worker"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := corrosion.UpdateHostVersion(ctx, s.db, h.name, h.version); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.gate = fakeServerGate{
+		enforcedTok: map[string]bool{capabilities.SplitBrainGateV1: true, capabilities.ReleaseToken: latched},
+		supportsTok: map[string]map[string]bool{
+			"peer-new": {capabilities.ReleaseToken: true},
+			"peer-old": {capabilities.SplitBrainGateV1: true},
+		},
+	}
+	return s
+}
+
+// TestGetUpgradeStatus_RolloutSummaryAndProbation (UX 2, m-R2-3): the status
+// opens with how far the rollout is and which features wait on it, and shows a
+// release probation.
+func TestGetUpgradeStatus_RolloutSummaryAndProbation(t *testing.T) {
+	s := rolloutServer(t, false)
+	s.db.EnterReleaseProbation([]string{"release_2099_01_v1"})
+	st, err := s.GetUpgradeStatus(viewerCtx(), &emptypb.Empty{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.GetHostsTotal() != 3 || st.GetHostsOnRelease() != 2 || st.GetFeaturesWaiting() != 2 {
+		t.Fatalf("summary: %d of %d hosts, %d features waiting; want 2 of 3, 2 waiting",
+			st.GetHostsOnRelease(), st.GetHostsTotal(), st.GetFeaturesWaiting())
+	}
+	if len(st.GetLagging()) != 1 || st.GetLagging()[0].GetName() != "peer-old" || st.GetLagging()[0].GetVersion() != "1.9.0" {
+		t.Fatalf("lagging = %v, want peer-old (1.9.0)", st.GetLagging())
+	}
+	if !st.GetReleaseProbation() || !strings.Contains(st.GetProbationReason(), "release probation") {
+		t.Fatalf("probation not shown: %v %q", st.GetReleaseProbation(), st.GetProbationReason())
+	}
+	st, _ = rolloutServer(t, true).GetUpgradeStatus(viewerCtx(), &emptypb.Empty{})
+	if st.GetFeaturesWaiting() != 0 {
+		t.Fatalf("features waiting with the token latched = %d, want 0", st.GetFeaturesWaiting())
+	}
+}
+
+// TestReleaseRolloutCondition (UX 3): an informational health condition stands
+// while hosts lag the release, names them, and resolves once the token latches.
+func TestReleaseRolloutCondition(t *testing.T) {
+	ctx := context.Background()
+	s := rolloutServer(t, false)
+	s.evaluateReleaseRollout(ctx)
+	h, ok, err := corrosion.GetHealthCondition(ctx, s.db, releaseRolloutEvaluator, condReleaseRolloutPending, "cluster", capabilities.ReleaseToken)
+	if err != nil || !ok || h.Lifecycle == corrosion.ConditionResolved || h.Severity != corrosion.SeverityInfo ||
+		!slices.Contains(h.Hosts, "peer-old") {
+		t.Fatalf("condition while peer-old lags = %+v ok=%v err=%v, want an open info condition naming peer-old", h, ok, err)
+	}
+	s.gate = fakeServerGate{enforcedTok: map[string]bool{capabilities.ReleaseToken: true}}
+	s.evaluateReleaseRollout(ctx)
+	h, _, _ = corrosion.GetHealthCondition(ctx, s.db, releaseRolloutEvaluator, condReleaseRolloutPending, "cluster", capabilities.ReleaseToken)
+	if h.Lifecycle != corrosion.ConditionResolved {
+		t.Fatalf("condition after the latch = %+v, want resolved", h)
 	}
 }

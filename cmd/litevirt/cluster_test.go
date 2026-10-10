@@ -248,6 +248,10 @@ func TestPrintFailoverScope_MarksRegionsThatCannotFenceTheirOwn(t *testing.T) {
 // newer release's included — with its used bit and the host that recorded it.
 func TestPrintUpgradeStatus(t *testing.T) {
 	st := &pb.UpgradeStatus{
+		HostsTotal: 3, HostsOnRelease: 2, FeaturesWaiting: 2,
+		Lagging:          []*pb.LaggingHost{{Name: "node-3", Version: "1.9.0"}},
+		ReleaseProbation: true, ProbationReason: "release probation: started below …",
+		RefusedPeers:     []string{"node-9"},
 		ReleaseToken:     "release_2026_11_v1",
 		WalQuarantined:   true,
 		QuarantineReason: "a feature of a newer release this build does not know is in use: release_2099_01_v1",
@@ -272,6 +276,10 @@ func TestPrintUpgradeStatus(t *testing.T) {
 		}
 	}
 	for _, want := range []string{
+		"Rollout: 2 of 3 hosts on release_2026_11_v1; 2 feature(s) waiting for the rest",
+		"  not yet: node-3 (1.9.0)",
+		"Release probation: yes — release probation: started below",
+		"Refusing replication from: node-9",
 		"Release token: release_2026_11_v1",
 		"WAL quarantine: yes — a feature of a newer release",
 		"BLOCKS ROLLBACK", "IF RULE-AWARE", "RECORDED BY",

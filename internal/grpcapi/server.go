@@ -813,7 +813,7 @@ type Server struct {
 	releaseUsed        []string
 	releaseUsedAt      time.Time
 	releasePeerRefused map[string]time.Time
-	releasePeerLast    map[string][]string
+	releasePeerLast    map[string]*peerCapsEntry
 	onGateRefused      func(action, reason string)
 	// vmStartObserver is told of every guest start (SetVMStartObserver).
 	vmStartObserver VMStartObserver
@@ -2154,7 +2154,7 @@ func (s *Server) SetReplicator(r *corrosion.Replicator) {
 	// Every push declares what this node advertises (ReplicateRequest.
 	// sender_capabilities), so a receiver can judge it without dialling back.
 	if r != nil {
-		r.SetAdvertisedCapabilities(s.AdvertisedCapabilities)
+		r.SetAdvertisedCapabilities(s.DeclaredCapabilities)
 	}
 }
 

@@ -2,9 +2,12 @@ package daemon
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -162,6 +165,11 @@ func preflightRollback(dataDir string, uses func() ([]corrosion.ReleaseFeatureUs
 		slog.Warn("preflight: could not read the recorded release-feature uses", "error", err)
 	}
 	for _, token := range safeIfUnused {
+		if !unknown[token] && probationLiftConfirmed(dataDir, token) {
+			slog.Info("preflight: a voter majority already confirmed no feature of this release token is "+
+				"in use; not entering release probation again", "capability", token)
+			continue
+		}
 		if !unknown[token] {
 			slog.Warn("preflight: this binary predates a latched release token none of whose "+
 				"features is recorded used here; entering release probation (rollback: "+
@@ -186,4 +194,56 @@ func isNoSuchTable(err error) bool {
 // releaseFeatureUseReader reads the recorded release-feature uses from db.
 func releaseFeatureUseReader(ctx context.Context, db *corrosion.Client) func() ([]corrosion.ReleaseFeatureUse, error) {
 	return func() ([]corrosion.ReleaseFeatureUse, error) { return corrosion.ListReleaseFeatureUses(ctx, db) }
+}
+
+// probationLiftPrefix is the basename prefix of the record that a release
+// probation below token was confirmed and lifted: <data_dir>/<prefix>.<token>,
+// holding the sha256 of the token's activation marker at that time.
+const probationLiftPrefix = "release_probation_lifted"
+
+func probationLiftPath(dataDir, token string) string {
+	return filepath.Join(dataDir, probationLiftPrefix+"."+token)
+}
+
+// markerDigest is the sha256 of token's activation marker, or "" if unreadable.
+func markerDigest(dataDir, token string) string {
+	b, err := os.ReadFile(health.ActivationMarkerPath(dataDir, token))
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// persistProbationLift records that a voter majority confirmed no use of
+// tokens, bound to each token's current marker (C-R2-1). A later boot below
+// the same marker does not re-enter probation — a cluster-wide restart would
+// otherwise put every voter back in it at once. A use that arrives later still
+// quarantines (at the apply, and at the next boot's preflight), and a
+// different marker — a later rollback — is checked afresh.
+func persistProbationLift(dataDir string, tokens []string) error {
+	if dataDir == "" {
+		return nil
+	}
+	for _, tok := range tokens {
+		d := markerDigest(dataDir, tok)
+		if d == "" {
+			continue
+		}
+		if err := os.WriteFile(probationLiftPath(dataDir, tok), []byte(d+"\n"), 0o600); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// probationLiftConfirmed reports whether a lift was recorded for token's
+// current marker.
+func probationLiftConfirmed(dataDir, token string) bool {
+	b, err := os.ReadFile(probationLiftPath(dataDir, token))
+	if err != nil {
+		return false
+	}
+	d := markerDigest(dataDir, token)
+	return d != "" && strings.TrimSpace(string(b)) == d
 }

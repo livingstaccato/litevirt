@@ -204,6 +204,18 @@ func ListSGRulesFor(ctx context.Context, c *Client, sg SecurityGroup, legacyByNa
 	return rules, nil
 }
 
+// DeleteLegacyNameRules tombstones the rules an older client stored with sg's
+// NAME in sg_id. They go with the group whether or not they were being applied:
+// a rule that was unattributable while two groups shared the name must not
+// become the survivor's the moment the other is deleted, and one that applied
+// must not attach to a later group of the same name. Fail closed.
+func DeleteLegacyNameRules(ctx context.Context, c *Client, sg SecurityGroup) error {
+	if sg.Name == "" || sg.Name == sg.ID {
+		return nil
+	}
+	return DeleteSGRules(ctx, c, sg.Name)
+}
+
 // DeleteSGRules tombstones all rules for a security group.
 func DeleteSGRules(ctx context.Context, c *Client, sgID string) error {
 	now := c.NowTS()

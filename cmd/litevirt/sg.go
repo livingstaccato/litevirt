@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"text/tabwriter"
 
@@ -120,7 +121,7 @@ func newSGListCmd() *cobra.Command {
 		Use:   "ls",
 		Short: "List security groups",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			resp, err := listSecurityGroups(cmd, &pb.ListSecurityGroupsRequest{StackName: stack})
+			resp, err := listSecurityGroups(cmd, &pb.ListSecurityGroupsRequest{StackName: stack, IncludeRules: true})
 			if err != nil {
 				return err
 			}
@@ -129,6 +130,7 @@ func newSGListCmd() *cobra.Command {
 			for _, sg := range resp.GetGroups() {
 				fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", sg.GetId(), sg.GetName(), sg.GetStackName(), sg.GetCreatedAt())
 			}
+			warnUnattributedRules(cmd, resp)
 			return w.Flush()
 		},
 	}
@@ -190,13 +192,48 @@ func listSecurityGroupsLocal(ctx context.Context, req *pb.ListSecurityGroupsRequ
 	if err != nil {
 		return nil, err
 	}
+	all, err := corrosion.ListSecurityGroups(ctx, db, "")
+	if err != nil {
+		return nil, err
+	}
+	counts := map[string]int{}
+	for _, g := range all {
+		counts[g.Name]++
+	}
 	resp := &pb.ListSecurityGroupsResponse{}
+	var unattributed []corrosion.SGRule
+	toPb := func(r corrosion.SGRule) *pb.SecurityGroupRule {
+		return &pb.SecurityGroupRule{
+			Id: r.ID, SgId: r.SGID, Direction: r.Direction, Proto: r.Proto,
+			Port: r.PortRange, Cidr: r.CIDR, Action: r.Action, Priority: int32(r.Priority),
+		}
+	}
+	if req.GetIncludeRules() {
+		// Rules stored under a name two groups share belong to neither (the
+		// daemon reports them the same way, with sg_id left as the bare name).
+		var shared []string
+		for name, n := range counts {
+			if n > 1 {
+				shared = append(shared, name)
+			}
+		}
+		sort.Strings(shared)
+		for _, name := range shared {
+			orphans, err := corrosion.ListSGRules(ctx, db, name)
+			if err != nil {
+				return nil, err
+			}
+			unattributed = append(unattributed, orphans...)
+		}
+	}
 	for _, g := range groups {
 		resp.Groups = append(resp.Groups, &pb.SecurityGroup{Id: g.ID, Name: g.Name, StackName: g.StackName, CreatedAt: g.CreatedAt})
 		if !req.GetIncludeRules() {
 			continue
 		}
-		rules, err := corrosion.ListSGRules(ctx, db, g.ID)
+		// The same reader the daemon uses, so a rule an older client stored
+		// under the group's name shows here too.
+		rules, err := corrosion.ListSGRulesFor(ctx, db, g, counts[g.Name] == 1)
 		if err != nil {
 			return nil, err
 		}
@@ -207,7 +244,26 @@ func listSecurityGroupsLocal(ctx context.Context, req *pb.ListSecurityGroupsRequ
 			})
 		}
 	}
+	for _, r := range unattributed {
+		resp.Rules = append(resp.Rules, toPb(r))
+	}
 	return resp, nil
+}
+
+// warnUnattributedRules says so when a listing carries rules whose sg_id names
+// no group: rules an older client stored under a group NAME that two groups
+// share. They are applied to neither.
+func warnUnattributedRules(cmd *cobra.Command, resp *pb.ListSecurityGroupsResponse) {
+	ids := map[string]bool{}
+	for _, g := range resp.GetGroups() {
+		ids[g.GetId()] = true
+	}
+	for _, r := range resp.GetRules() {
+		if !ids[r.GetSgId()] {
+			fmt.Fprintf(cmd.ErrOrStderr(), "warning: rule %s is keyed by %q, a name more than one security group holds; it is applied to none. "+
+				"Remove it with `lv sg rule-rm %s` and re-add it by group id.\n", r.GetId(), r.GetSgId(), r.GetId())
+		}
+	}
 }
 
 func newSGDeleteCmd() *cobra.Command {
@@ -267,28 +323,45 @@ func newSGRuleListCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-			fmt.Fprintln(w, "ID\tDIR\tPROTO\tPORT\tCIDR\tACTION\tPRIO")
-			// The argument is a group id or a group name.
-			want := args[0]
-			for _, g := range resp.GetGroups() {
-				if g.GetName() == want {
-					want = g.GetId()
-				}
-			}
+			// The argument is a group id or a group name. A name several groups
+			// hold lists the rules of each, labelled by group id.
+			var matched []string
 			for _, g := range resp.GetGroups() {
 				if g.GetId() == args[0] {
-					want = args[0]
+					matched = []string{g.GetId()}
+					break
+				}
+				if g.GetName() == args[0] {
+					matched = append(matched, g.GetId())
 				}
 			}
-			for _, r := range resp.GetRules() {
-				if r.GetSgId() != want {
-					continue
-				}
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-					r.GetId(), r.GetDirection(), r.GetProto(), r.GetPort(), r.GetCidr(), r.GetAction(),
-					strconv.Itoa(int(r.GetPriority())))
+			if len(matched) == 0 {
+				matched = []string{args[0]}
 			}
+			label := len(matched) > 1
+			if label {
+				fmt.Fprintf(cmd.ErrOrStderr(), "note: %d security groups are named %q; listing each, labelled by group id.\n", len(matched), args[0])
+			}
+			w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+			if label {
+				fmt.Fprintln(w, "SG\tID\tDIR\tPROTO\tPORT\tCIDR\tACTION\tPRIO")
+			} else {
+				fmt.Fprintln(w, "ID\tDIR\tPROTO\tPORT\tCIDR\tACTION\tPRIO")
+			}
+			for _, gid := range matched {
+				for _, r := range resp.GetRules() {
+					if r.GetSgId() != gid {
+						continue
+					}
+					if label {
+						fmt.Fprintf(w, "%s\t", gid)
+					}
+					fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+						r.GetId(), r.GetDirection(), r.GetProto(), r.GetPort(), r.GetCidr(), r.GetAction(),
+						strconv.Itoa(int(r.GetPriority())))
+				}
+			}
+			warnUnattributedRules(cmd, resp)
 			return w.Flush()
 		},
 	}

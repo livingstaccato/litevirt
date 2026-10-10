@@ -254,3 +254,32 @@ func TestSGCLI_OldDaemonGetsAClearError(t *testing.T) {
 		}
 	}
 }
+
+// rule-ls on a name two groups hold lists both groups' rules, labelled by group
+// id, and does not silently pick one.
+func TestSGCLI_RuleLsAmbiguousNameListsEveryGroup(t *testing.T) {
+	db := sgCLIRealDaemon(t, "carol", "operator")
+	var ids []string
+	for _, sg := range []corrosion.SecurityGroup{{ID: "sg-aaa", Name: "web"}, {ID: "sg-bbb", Name: "web", StackName: "shop"}} {
+		// Two groups of one name arise from a replication race; create refuses it.
+		if err := corrosion.InsertSecurityGroup(context.Background(), db, sg); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, sg.ID)
+		if _, err := runSGCLI(t, "rule-add", sg.ID, "--proto", "tcp", "--port", "80"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out, err := runSGCLI(t, "rule-ls", "web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range ids {
+		if !strings.Contains(out, id) {
+			t.Errorf("rule-ls web omits group %s:\n%s", id, out)
+		}
+	}
+	if !strings.HasPrefix(out, "SG") {
+		t.Errorf("ambiguous listing is not labelled by group id:\n%s", out)
+	}
+}

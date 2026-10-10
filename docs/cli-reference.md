@@ -1022,13 +1022,17 @@ lv sg rule-ls <sg-id-or-name>
 lv sg rule-rm <rule-id>       # Takes the RULE id from rule-ls, not the group id
 lv sg bind <vm> --network <name> --sg <name> [--sg <name>...]   # Bind SGs to a VM NIC
   # --network matches the compose network name on the NIC; --sg is repeatable
-  # rule-add and rule-ls take a group id or name. A name no group has is
-  # NotFound; a name two groups hold is refused (use the id). Rules an older
-  # client stored under a group's NAME are read as that group's own while the
-  # name is unique, and are removed with the group.
   # (an empty --sg list clears the bindings).
   # create/rm/rule-add/rule-rm go through the daemon: they need sg.write and
   # each leaves an sg.* audit row (see docs/firewall.md#audit-trail).
+  # rule-add takes a group id or name. A name no group has is NotFound; a name
+  # two groups hold is refused (use the id). rule-ls takes either too; for a
+  # name two groups hold it lists every group's rules, labelled by group id.
+  # Rules an older client stored under a group's NAME are read as that group's
+  # own while the name is unique, and are removed with the group. While two
+  # groups share the name those rules apply to neither: `lv sg ls` and
+  # `lv sg rule-ls` warn, and the firewall reconciler logs it once per rule.
+  # Deleting either group removes them (the sg.rm audit row records them).
 
 lv firewall show              # Render the live nft ruleset for this host
 lv firewall reload            # Force the reconciler to re-read state and apply now

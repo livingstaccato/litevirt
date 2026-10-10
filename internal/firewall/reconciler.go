@@ -350,6 +350,7 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 		plan.SecurityGroups = plan.SecurityGroups[:0:0]
 		for _, sg := range sgs {
 			if holders[sg.Name] > 1 {
+				warnUnattributableLegacyRules(ctx, db, sg.Name)
 				continue
 			}
 			// holders[sg.Name] == 1 here: a duplicated name was skipped above.

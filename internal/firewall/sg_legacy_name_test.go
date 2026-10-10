@@ -1,7 +1,10 @@
 package firewall
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -49,5 +52,34 @@ func TestCorrosionPlanLoader_LegacyNameRule(t *testing.T) {
 				t.Errorf("rendered %d rules, want %d (%+v)", got, tc.wantRules, plan.SecurityGroups)
 			}
 		})
+	}
+}
+
+// An unattributable legacy rule is reported by the reconciler, once per rule.
+func TestCorrosionPlanLoader_AmbiguousLegacyRuleWarnsOnce(t *testing.T) {
+	ctx := context.Background()
+	db := corrosion.NewTestClientT(t)
+	if err := corrosion.InitSchema(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	for _, g := range []corrosion.SecurityGroup{{ID: "sg-1", Name: "web"}, {ID: "sg-2", Name: "web", StackName: "shop"}} {
+		if err := corrosion.InsertSecurityGroup(ctx, db, g); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := corrosion.InsertSGRule(ctx, db, corrosion.SGRule{ID: "warn-once-rule", SGID: "web", Direction: "ingress"}); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	defer slog.SetDefault(old)
+	for i := 0; i < 3; i++ {
+		if _, err := CorrosionPlanLoader(db, "host-a", Plan{}, liveTaps(nil))(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := strings.Count(buf.String(), "warn-once-rule"); n != 1 {
+		t.Errorf("warned %d times, want 1:\n%s", n, buf.String())
 	}
 }

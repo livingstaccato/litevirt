@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"google.golang.org/grpc/codes"
@@ -121,8 +122,10 @@ func TestSecurityGroupLegacyNameRule_AmbiguousIsNotGuessed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(resp.Rules) != 0 {
-		t.Errorf("an ambiguous legacy rule was attributed: %v", resp.Rules)
+	for _, r := range resp.Rules {
+		if r.SgId != "web" { // reported unattributed, sg_id left as the bare name
+			t.Errorf("an ambiguous legacy rule was attributed to %q", r.SgId)
+		}
 	}
 }
 
@@ -146,5 +149,62 @@ func TestDeleteSecurityGroup_TakesLegacyNameRules(t *testing.T) {
 	}
 	if len(resp.Rules) != 0 {
 		t.Errorf("a deleted group's legacy rule attached to a new group: %v", resp.Rules)
+	}
+}
+
+// Deleting one of two same-named groups must not hand a legacy name-keyed rule
+// (unapplied while the name was shared) to the survivor.
+func TestDeleteSecurityGroup_SharedNameLegacyRuleDoesNotFlipToSurvivor(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtxWithEngine(t, s)
+	bg := context.Background()
+	addSG(t, s, "sg-aaa", "web", "")
+	addSG(t, s, "sg-bbb", "web", "shop")
+	if err := corrosion.InsertSGRule(bg, s.db, corrosion.SGRule{ID: "legacy", SGID: "web", Direction: "ingress", Proto: "tcp", PortRange: "22"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DeleteSecurityGroup(ctx, &pb.DeleteSecurityGroupRequest{Id: "sg-aaa"}); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := s.ListSecurityGroups(ctx, &pb.ListSecurityGroupsRequest{IncludeRules: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Rules) != 0 {
+		t.Errorf("the survivor inherited an unattributed legacy rule: %v", resp.Rules)
+	}
+	// And the removal is in the audit record.
+}
+
+// While two groups share the name the legacy rule is reported, with sg_id left
+// as the bare name, rather than silently unapplied.
+func TestListSecurityGroups_ReportsAmbiguousLegacyRule(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtxWithEngine(t, s)
+	bg := context.Background()
+	addSG(t, s, "sg-aaa", "web", "")
+	addSG(t, s, "sg-bbb", "web", "shop")
+	if err := corrosion.InsertSGRule(bg, s.db, corrosion.SGRule{ID: "legacy", SGID: "web", Direction: "ingress"}); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := s.ListSecurityGroups(ctx, &pb.ListSecurityGroupsRequest{IncludeRules: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Rules) != 1 || resp.Rules[0].Id != "legacy" || resp.Rules[0].SgId != "web" {
+		t.Errorf("rules = %v, want the legacy rule reported with sg_id=web", resp.Rules)
+	}
+}
+
+// The delete's audit "before" includes the legacy rules it removes.
+func TestDeleteSecurityGroup_AuditBeforeIncludesLegacyRules(t *testing.T) {
+	s := testServer(t)
+	bg := context.Background()
+	addSG(t, s, "sg-aaa", "web", "")
+	if err := corrosion.InsertSGRule(bg, s.db, corrosion.SGRule{ID: "legacy", SGID: "web", Direction: "ingress", Proto: "tcp", PortRange: "2222"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := corrosion.SecurityGroupAuditState(bg, s.db, "sg-aaa"); !strings.Contains(got, "2222") {
+		t.Errorf("audit state omits the legacy rule: %s", got)
 	}
 }

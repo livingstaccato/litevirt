@@ -323,6 +323,9 @@ func DeleteStackFirewall(ctx context.Context, c *Client, stack string) error {
 		if err := DeleteSecurityGroup(ctx, c, sg.ID); err != nil {
 			return err
 		}
+		if err := DeleteLegacyNameRules(ctx, c, sg); err != nil {
+			return err
+		}
 	}
 	// Row-scope the tombstones: a single bulk `UPDATE … WHERE stack_name = ?` is not full-PK,
 	// so on the replication apply path it can't be LWW-gated per row (a concurrently-newer

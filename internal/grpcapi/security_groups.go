@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"sort"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -153,22 +154,22 @@ func (s *Server) DeleteSecurityGroup(ctx context.Context, req *pb.DeleteSecurity
 	if err := corrosion.DeleteSGRules(ctx, s.db, req.Id); err != nil {
 		return nil, status.Errorf(codes.Internal, "delete security group rules: %v", err)
 	}
-	// Rules an older client stored under the group's name are read as the
-	// group's own (ListSGRulesFor), so they go with it; left behind they would
-	// attach to a later group of the same name.
-	if g, gerr := corrosion.GetSecurityGroup(ctx, s.db, req.Id); gerr == nil && g != nil && g.Name != "" {
-		if all, lerr := corrosion.ListSecurityGroups(ctx, s.db, ""); lerr == nil && sgNameCounts(all)[g.Name] == 1 {
-			if err := corrosion.DeleteSGRules(ctx, s.db, g.Name); err != nil {
-				return nil, status.Errorf(codes.Internal, "delete security group rules: %v", err)
-			}
-		}
-	}
+	group, _ := corrosion.GetSecurityGroup(ctx, s.db, req.Id)
 	if err := corrosion.DeleteSecurityGroup(ctx, s.db, req.Id); err != nil {
 		// The rules are already gone, so the change is recorded even though
 		// the group row itself was not tombstoned.
 		s.audit(ctx, "sg.rm", req.Id, corrosion.AuditChange(before, corrosion.AuditUnknown(err)), "error")
 		s.reconcileLocal(ctx)
 		return nil, status.Errorf(codes.Internal, "delete security group: %v", err)
+	}
+	// Rules an older client stored under the group's name go with it, after the
+	// group itself (see DeleteLegacyNameRules for why they are always removed).
+	if group != nil {
+		if err := corrosion.DeleteLegacyNameRules(ctx, s.db, *group); err != nil {
+			s.audit(ctx, "sg.rm", req.Id, corrosion.AuditChange(before, corrosion.AuditUnknown(err)), "error")
+			s.reconcileLocal(ctx)
+			return nil, status.Errorf(codes.Internal, "delete security group rules keyed by name: %v", err)
+		}
 	}
 	s.audit(ctx, "sg.rm", req.Id, corrosion.AuditChange(before, corrosion.AuditStateNone), "ok")
 	s.reconcileLocal(ctx)
@@ -264,6 +265,27 @@ func (s *Server) ListSecurityGroups(ctx context.Context, req *pb.ListSecurityGro
 		}
 		for _, r := range rules {
 			resp.Rules = append(resp.Rules, toPbSGRule(r))
+		}
+	}
+	// Legacy rules stored under a name two live groups share belong to neither,
+	// and are not applied. Report them with sg_id left as the bare name (it
+	// matches no group id) so `lv sg` can say so.
+	if req.GetIncludeRules() {
+		var shared []string
+		for name, n := range counts {
+			if n > 1 {
+				shared = append(shared, name)
+			}
+		}
+		sort.Strings(shared)
+		for _, name := range shared {
+			orphans, err := corrosion.ListSGRules(ctx, s.db, name)
+			if err != nil {
+				return nil, status.Errorf(codes.Internal, "list rules keyed by %q: %v", name, err)
+			}
+			for _, r := range orphans {
+				resp.Rules = append(resp.Rules, toPbSGRule(r))
+			}
 		}
 	}
 	return resp, nil

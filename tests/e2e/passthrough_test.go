@@ -25,7 +25,7 @@ import (
 //   - for the container test, LV_E2E_MOUNT_DIR naming a directory under this
 //     host's containers.bind_mount_paths.
 
-const gateRefusal = "is not available until every host runs this release"
+const gateRefusal = "the cluster upgrade must finish first"
 
 func skipIfGated(t *testing.T, out string, err error) {
 	t.Helper()

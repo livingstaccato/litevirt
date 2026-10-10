@@ -27,6 +27,7 @@ import (
 // with no role bindings is the admin role's too.
 func TestCreateVM_USBPermissions(t *testing.T) {
 	s, _ := provableCreateServer(t)
+	enableUsbMountsMemory(s)
 	addUSBMapping(t, s, "dongle", "test-host", "usb:1a86:7523")
 	op := userCtx("op", "operator")
 	if err := s.RequirePerm(op, vmRBACPathFor("", "u"), "vm.create", "operator"); err != nil {
@@ -127,7 +128,7 @@ func TestAuthorizeRestoredHostAccess(t *testing.T) {
 		{"peer move, source row differs", adminCtx(), other, true, false, false},
 		{"peer move, no source row", adminCtx(), nil, true, false, false},
 	} {
-		s.SetPassthroughGate(nil)
+		enableUsbMountsMemory(s)
 		if tc.closed {
 			closePassthroughGate(s)
 		}
@@ -143,6 +144,7 @@ func TestAuthorizeRestoredHostAccess(t *testing.T) {
 // operator may only clear it.
 func TestConvertContainer_SetHostAccess(t *testing.T) {
 	s, rt := secServer(t)
+	enableUsbMountsMemory(s)
 	seedSecCT(t, s, rt, "c", "stopped", corrosion.ContainerCreateSpec{Template: "download"})
 	set := &pb.ConvertContainerRequest{Name: "c", HostName: "host-a", SetHostAccess: true,
 		Mounts: []*pb.ContainerMount{{HostPath: "/srv/data", ContainerPath: "/data"}}}
@@ -264,6 +266,7 @@ func TestResize_HotplugCountsWhatTheGuestHolds(t *testing.T) {
 // row; a client or manifest spec is stripped of both.
 func TestAdmitRestoredUSBAndHotplug(t *testing.T) {
 	s := reconfigServer(t)
+	enableUsbMountsMemory(s)
 	ctx := adminCtx()
 	spec := &pb.VMSpec{Name: "r", MemoryMib: 1024, MemoryHotplugBaseMib: 64, MemoryHotplugMaxMib: 4096,
 		UsbDevices: []*pb.USBDeviceSpec{{Vendor: "046d", Product: "c52b"}}}

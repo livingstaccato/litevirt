@@ -23,7 +23,7 @@ import (
 // enableUsbMountsMemory opens the passthrough gate and latches any extra
 // tokens the scenario needs.
 func enableUsbMountsMemory(s *Server, extra ...string) {
-	s.SetPassthroughGate(nil)
+	s.SetPassthroughGate(func(context.Context) bool { return true })
 	if len(extra) > 0 {
 		tok := map[string]bool{}
 		for _, e := range extra {
@@ -62,7 +62,9 @@ func TestCreateVM_USBGated(t *testing.T) {
 	dev := &pb.USBDeviceSpec{Vendor: "046D", Product: "0xC52B"}
 	for _, open := range []bool{false, true} {
 		s, fake := provableCreateServer(t)
-		if !open {
+		if open {
+			enableUsbMountsMemory(s)
+		} else {
 			closePassthroughGate(s)
 		}
 		_, err := s.CreateVM(ctx, usbCreateRequest("u1", dev))

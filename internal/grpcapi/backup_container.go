@@ -21,6 +21,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
+	"github.com/litevirt/litevirt/internal/lxc"
 	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/pbsstore"
 	"github.com/litevirt/litevirt/internal/safename"
@@ -1086,6 +1087,36 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 			source, _ = s.relocatingContainer(ctx, req.Name, s.hostName, token)
 		}
 		authorized, stripped := s.authorizeRestoredHostAccess(ctx, corrosion.DecodeCreateSpec(spec.CreateSpec), source, !operatorRestore)
+		// Privileged mode and legacy confinement are the same host-escalation
+		// class, decided the same way. Stripped, the container is moved into an
+		// id range of its own (its files shifted) before its config is rendered.
+		authorized, strippedSec, unprivilege := s.authorizeRestoredSecurity(ctx, authorized, source, !operatorRestore)
+		if unprivilege {
+			sc, ok := s.containerRuntime.(containerSecurer)
+			if !ok {
+				if delErr := s.containerRuntime.DeleteContainer(ctx, req.Name); delErr != nil {
+					slog.Warn("container restore: cleanup after a refused privileged restore also failed", "name", req.Name, "error", delErr)
+				}
+				s.removeRestoreMarker(req.Name)
+				return status.Error(codes.PermissionDenied, "restoring a privileged container needs the admin role (this host cannot convert it to unprivileged)")
+			}
+			base, aerr := s.allocateIDMapBase(ctx, req.Name)
+			if aerr == nil {
+				aerr = sc.ConvertContainerSecurity(ctx, req.Name, lxc.ConvertOpts{
+					IDMap: &lxc.IDMap{Base: base, Size: lxc.IDMapSize}, Confinement: lxc.ConfinementDefault})
+			}
+			if aerr != nil {
+				if delErr := s.containerRuntime.DeleteContainer(ctx, req.Name); delErr != nil {
+					slog.Warn("container restore: cleanup after the unprivileged move failed also failed", "name", req.Name, "error", delErr)
+				}
+				s.removeRestoreMarker(req.Name)
+				return status.Errorf(codes.Internal, "move the restored container into an id range of its own: %v", aerr)
+			}
+			authorized.IDMapBase = base
+		}
+		if strippedSec != "" {
+			stripped = strings.TrimSpace(stripped + " " + strippedSec)
+		}
 		if stripped != "" {
 			spec.CreateSpec = corrosion.EncodeCreateSpec(authorized)
 		}

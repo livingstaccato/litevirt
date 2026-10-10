@@ -99,6 +99,7 @@ func TestFleet_RestoreCarriesNoUnauthorizedHostAccess(t *testing.T) {
 	src, opDst, adminDst := c.Nodes[0], c.Nodes[1], c.Nodes[2]
 	for _, n := range c.Nodes {
 		setHostCapacity(t, c, n.Name, 64, 65536, nil)
+		n.Server.SetPassthroughGate(func(context.Context) bool { return true })
 	}
 	allowed, _ := filepath.EvalSymlinks(t.TempDir())
 	_ = os.MkdirAll(filepath.Join(allowed, "data"), 0o755)
@@ -332,5 +333,119 @@ func TestFleet_ContainerRelocationCarriesItsAuthorizedMounts(t *testing.T) {
 	last := calls[len(calls)-1]
 	if last.Name != "ctm" || len(last.Mounts) != 1 || last.Mounts[0].HostPath != "/srv/data" || last.Mounts[0].ReadWrite {
 		t.Fatalf("recreate on %s asked for %+v; want ctm with its one read-only /srv/data mount", dest.Name, last)
+	}
+}
+
+// §4.3: a restore takes privileged mode and legacy confinement from a backup
+// only for an admin. An operator's restore of a privileged, legacy container
+// lands unprivileged, in a range of its own, with default confinement — and
+// says so; an admin's restore keeps the backup's mode.
+func TestFleet_RestoreCarriesNoUnauthorizedPrivilege(t *testing.T) {
+	c := New(t, Options{Nodes: 3, SharedCRDT: true})
+	ctx := context.Background()
+	src, opDst, adminDst := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	for _, n := range c.Nodes {
+		setHostCapacity(t, c, n.Name, 64, 65536, nil)
+		n.Server.SetPassthroughGate(func(context.Context) bool { return true })
+	}
+	if _, err := c.SelfClient(src).CreateContainer(ctx, &pb.CreateContainerRequest{
+		HostName: src.Name, Name: "pv", Template: "download", Distro: "debian", Release: "bookworm", Arch: "amd64",
+		Privileged: true, Confinement: "legacy",
+	}); err != nil {
+		t.Fatalf("admin create of a privileged container: %v", err)
+	}
+	repo, ts := backupContainer(t, c, src, "pv")
+
+	opDst.Server.SetBackupRepos(map[string]string{"main": repo})
+	op := operatorOn(t, c, opDst)
+	st, err := op.RestoreContainer(ctx, &pb.RestoreContainerRequest{RepoPath: "main", Name: "pv", Timestamp: ts, HostName: opDst.Name})
+	if err != nil {
+		t.Fatalf("operator restore: %v", err)
+	}
+	for {
+		if _, rerr := st.Recv(); rerr != nil {
+			if !strings.Contains(rerr.Error(), "EOF") {
+				t.Fatalf("operator restore stream: %v", rerr)
+			}
+			break
+		}
+	}
+	row, _ := corrosion.GetContainer(ctx, opDst.DB, opDst.Name, "pv")
+	if row == nil {
+		t.Fatal("no restored row")
+	}
+	if cs := corrosion.DecodeCreateSpec(row.CreateSpec); cs.IDMapBase == 0 || cs.Confinement != "default" {
+		t.Errorf("operator-restored row idmap_base=%d confinement=%q; want unprivileged with default confinement", cs.IDMapBase, cs.Confinement)
+	}
+	sec := lxc.ParseSecurity(opDst.CT.Config("pv"))
+	if sec.IDMap == nil || sec.Confinement != "default" {
+		t.Errorf("operator-restored config is privileged=%v confinement=%q:\n%s", sec.IDMap == nil, sec.Confinement, opDst.CT.Config("pv"))
+	}
+
+	// An admin's restore keeps the backup's privileged, legacy mode.
+	if err := restoreContainerAt(t, c, adminDst, repo, "pv", ts); err != nil {
+		t.Fatalf("admin restore: %v", err)
+	}
+	arow, _ := corrosion.GetContainer(ctx, adminDst.DB, adminDst.Name, "pv")
+	if cs := corrosion.DecodeCreateSpec(arow.CreateSpec); cs.IDMapBase != 0 || cs.Confinement != "legacy" {
+		t.Errorf("admin-restored row idmap_base=%d confinement=%q; want privileged legacy kept", cs.IDMapBase, cs.Confinement)
+	}
+}
+
+// A drain moves a running VM with a mapped USB device COLD — libvirt is
+// never asked to migrate it live — onto a host its mapping lists, which
+// defines it with that host's device.
+func TestFleet_DrainMovesAUSBVMCold(t *testing.T) {
+	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	ctx := context.Background()
+	src, dst := c.Nodes[0], c.Nodes[1]
+	for _, n := range c.Nodes {
+		setHostCapacity(t, c, n.Name, 64, 65536, nil)
+	}
+	if err := corrosion.CreateResourceMapping(ctx, src.DB, "dongle", ""); err != nil {
+		t.Fatal(err)
+	}
+	for h, addr := range map[string]string{src.Name: "usb:046d:c52b", dst.Name: "usb:1a86:7523"} {
+		if err := corrosion.AddMappingDevice(ctx, src.DB, "dongle", h, addr, "", ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	shared := filepath.Join(c.tmpRoot, "nfs", "u1-root.qcow2")
+	_ = os.MkdirAll(filepath.Dir(shared), 0o755)
+	_ = os.WriteFile(shared, nil, 0o600)
+	spec, _ := json.Marshal(&pb.VMSpec{Name: "u1", Cpu: 1, MemoryMib: 256, UsbDevices: []*pb.USBDeviceSpec{{Mapping: "dongle"}}})
+	if err := corrosion.InsertVM(ctx, src.DB, corrosion.VMRecord{Name: "u1", HostName: src.Name, State: "running", Spec: string(spec), CPUActual: 1, MemActual: 256},
+		nil, []corrosion.DiskRecord{{VMName: "u1", DiskName: "root", HostName: src.Name, Path: shared, StorageType: "nfs", TargetDev: "vda"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := src.Virt.DefineDomain(`<domain type='kvm'><name>u1</name><uuid>11111111-2222-4333-8444-777777777777</uuid><devices>` +
+		`<disk type='file' device='disk'><driver name='qemu' type='qcow2'/><source file='` + shared + `'/><target dev='vda'/></disk>` +
+		`<hostdev mode='subsystem' type='usb' managed='yes'><source><vendor id='0x046d'/><product id='0xc52b'/></source></hostdev>` +
+		`</devices></domain>`); err != nil {
+		t.Fatal(err)
+	}
+	if err := src.Virt.StartDomain("u1"); err != nil {
+		t.Fatal(err)
+	}
+	st, err := c.SelfClient(src).DrainHost(ctx, &pb.DrainHostRequest{Name: src.Name})
+	if err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	for {
+		if _, rerr := st.Recv(); rerr != nil {
+			break
+		}
+	}
+	for _, e := range src.Virt.EventLog() {
+		if e.Op == "migrate" && e.Domain == "u1" {
+			t.Fatalf("drain asked libvirt to migrate a USB VM live: %+v", e)
+		}
+	}
+	vm := vmOn(t, src, "u1")
+	if vm == nil || vm.HostName != dst.Name {
+		t.Fatalf("u1 after the drain: %+v; want it moved to %s", vm, dst.Name)
+	}
+	if x := dst.Virt.DefinedXML("u1"); !strings.Contains(x, "0x1a86") {
+		t.Fatalf("u1 on %s does not name that host's mapped device:\n%s", dst.Name, x)
 	}
 }

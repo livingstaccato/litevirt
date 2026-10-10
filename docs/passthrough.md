@@ -2,12 +2,14 @@
 
 Three Proxmox VE features that change what a workload can reach on its host.
 
-Setting any of them is refused while the cluster is mid-upgrade: the fields
-live in a VM's or container's stored spec, and a host on an older release
-would drop them from any spec it rewrites, or place, fail over or recreate the
-workload without them. The gate is the cluster's shared release token; once
-every host runs this release the features are on, as on Proxmox VE. Clearing
-them is never gated.
+Setting any of them is refused — "the cluster upgrade must finish first" —
+until the cluster's shared release token proves every host runs this
+release: the fields live in a VM's or container's stored spec, and a host on
+an older release would drop them from any spec it rewrites, or place, fail
+over or recreate the workload without them. Until that gate is wired the
+features stay refused (they fail closed); once the upgrade finishes they are
+on, as on Proxmox VE. Clearing them is never gated, and a workload without
+them is unaffected.
 
 ## USB passthrough (VMs)
 
@@ -159,6 +161,12 @@ containers:
   admin (a cold migration or failover relocation keeps them only when they are
   exactly what the source's row records); otherwise they are stripped, the
   strip is audited, and an admin re-applies them with `lv ct convert`.
+  **Privileged mode and legacy confinement** recorded in a backup are the same
+  class and are decided the same way: an operator's restore of a privileged or
+  legacy container lands unprivileged, in an id range of its own (its files
+  shifted), with default confinement, and the audit says so. An admin
+  re-applies legacy confinement with `lv ct convert --confinement legacy`, and
+  a privileged mode by restoring the container as admin.
 - An unprivileged container **keeps its id map**: a mounted tree's files
   appear owned by the ids they map to (anything unmapped as `nobody`), so a
   read-write tree must be owned by ids in the container's range. A device node

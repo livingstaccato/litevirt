@@ -231,13 +231,63 @@ func (s *Server) authorizeRestoredHostAccess(ctx context.Context, cs corrosion.C
 	return withoutHostAccess(cs)
 }
 
+// escalatedSecurity reports whether a spec runs privileged (no id range) or
+// with legacy confinement ("" is an earlier build's: legacy too).
+func escalatedSecurity(cs corrosion.ContainerCreateSpec) bool {
+	return cs.IDMapBase == 0 || cs.Confinement == "" || cs.Confinement == lxc.ConfinementLegacy
+}
+
+// sameSecurity reports whether two specs run with the same privilege mode and
+// confinement.
+func sameSecurity(a, b corrosion.ContainerCreateSpec) bool {
+	norm := func(c string) string {
+		if c == "" {
+			return lxc.ConfinementLegacy
+		}
+		return c
+	}
+	return (a.IDMapBase == 0) == (b.IDMapBase == 0) && norm(a.Confinement) == norm(b.Confinement)
+}
+
+// authorizeRestoredSecurity decides whether a restored container keeps the
+// privileged mode or legacy confinement its backup's create spec records —
+// the same host-escalation class as a host mount, and decided the same way:
+// kept for an admin's operator restore, or for a peer-driven move whose
+// SOURCE ROW records exactly that mode; otherwise stripped. A stripped
+// container runs with default confinement, and unprivilege reports that it
+// needs an id range of its own (the caller allocates it and shifts its
+// files). An admin re-applies the mode: legacy confinement with lv ct
+// convert --confinement legacy, a privileged mode by restoring it as admin.
+func (s *Server) authorizeRestoredSecurity(ctx context.Context, cs corrosion.ContainerCreateSpec, source *corrosion.ContainerRecord, peer bool) (out corrosion.ContainerCreateSpec, stripped string, unprivilege bool) {
+	if !escalatedSecurity(cs) {
+		return cs, "", false
+	}
+	if peer {
+		if source != nil && sameSecurity(cs, corrosion.DecodeCreateSpec(source.CreateSpec)) {
+			return cs, "", false
+		}
+	} else if RequireRole(ctx, "admin") == nil {
+		return cs, "", false
+	}
+	var what []string
+	if cs.IDMapBase == 0 {
+		what = append(what, "privileged")
+		unprivilege = true
+	}
+	if cs.Confinement != lxc.ConfinementDefault {
+		what = append(what, "confinement=legacy")
+	}
+	cs.Confinement = lxc.ConfinementDefault
+	return cs, strings.Join(what, " "), unprivilege
+}
+
 // noteStrippedHostAccess records host access a restore or clone did not carry.
 func (s *Server) noteStrippedHostAccess(ctx context.Context, action, name, stripped string) {
 	if stripped == "" {
 		return
 	}
-	slog.Warn("container: host mounts/devices were not carried; an admin re-applies them with lv ct convert", "container", name, "action", action, "stripped", stripped)
-	s.audit(ctx, action, name, "host access not carried (an admin re-applies it with lv ct convert --mount/--device): "+stripped, "ok")
+	slog.Warn("container: host access or privilege was not carried; an admin re-applies it", "container", name, "action", action, "stripped", stripped)
+	s.audit(ctx, action, name, "not carried (an admin re-applies host mounts/devices with lv ct convert --mount/--device, legacy confinement with lv ct convert --confinement legacy, a privileged mode by restoring as admin): "+stripped, "ok")
 }
 
 // cloneHostAccessAllowed refuses a non-admin clone of a container with host

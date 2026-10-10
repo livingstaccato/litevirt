@@ -387,3 +387,35 @@ func VirtioMemCurrentMiB(domXML string) (int, bool) {
 	}
 	return kib / 1024, true
 }
+
+var (
+	reNumaCellMemory  = regexp.MustCompile(`<cell\b[^>]*\bmemory=['"](\d+)['"]`)
+	reVirtioMemReqKiB = regexp.MustCompile(`<requested\b[^>]*>(\d+)</requested>`)
+)
+
+// HeldMemoryMiBFromXML is the memory a domain holds, in MiB. For a hot-add
+// domain that is its NUMA cells (the boot memory) plus the larger of the
+// virtio-mem size requested and the size the guest has actually plugged:
+// never the whole region, and never less than the guest still holds. Any
+// other domain is CurrentMemoryMiBFromXML.
+func HeldMemoryMiBFromXML(domXML string) int {
+	elem := reVirtioMemElem.FindString(domXML)
+	if elem == "" {
+		return CurrentMemoryMiBFromXML(domXML)
+	}
+	cellsKiB := 0
+	for _, m := range reNumaCellMemory.FindAllStringSubmatch(domXML, -1) {
+		n, _ := strconv.Atoi(m[1])
+		cellsKiB += n
+	}
+	plugged := 0
+	if m := reVirtioMemReqKiB.FindStringSubmatch(elem); m != nil {
+		plugged, _ = strconv.Atoi(m[1])
+	}
+	if m := reVirtioMemCurrent.FindStringSubmatch(elem); m != nil {
+		if cur, _ := strconv.Atoi(m[1]); cur > plugged {
+			plugged = cur
+		}
+	}
+	return (cellsKiB + plugged) / 1024
+}

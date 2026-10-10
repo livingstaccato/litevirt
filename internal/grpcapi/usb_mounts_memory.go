@@ -15,11 +15,12 @@ import (
 // over or recreate the workload without them. So in a mixed-version cluster
 // they must not be set. That is a fact about the release, and it is decided
 // by the cluster's shared release token (branch feat/release-token), which
-// wires passthroughGate; until it does, the features are on, as on Proxmox.
-// Clearing a field is never gated.
+// wires passthroughGate. Unwired, the gate FAILS CLOSED: nothing proves every
+// host runs this release, so the fields cannot be set. Clearing a field is
+// never gated, and a spec without them is unaffected.
 func (s *Server) passthroughFeaturesActive(ctx context.Context) bool {
 	if s.passthroughGate == nil {
-		return true
+		return false
 	}
 	return s.passthroughGate(ctx)
 }
@@ -28,11 +29,11 @@ func (s *Server) passthroughFeaturesActive(ctx context.Context) bool {
 func (s *Server) SetPassthroughGate(fn func(ctx context.Context) bool) { s.passthroughGate = fn }
 
 // passthroughRefusalText is the fixed part of the refusal, matched by tests.
-const passthroughRefusalText = "is not available until every host runs this release"
+const passthroughRefusalText = "the cluster upgrade must finish first"
 
 // passthroughRefusal is the refusal for a request that sets one of the gated
 // fields while passthroughFeaturesActive is false.
 func passthroughRefusal(what string) error {
 	return status.Errorf(codes.FailedPrecondition,
-		"%s %s (an older host would drop the setting)", what, passthroughRefusalText)
+		"%s: %s (until every host runs this release, an older host would drop the setting)", what, passthroughRefusalText)
 }

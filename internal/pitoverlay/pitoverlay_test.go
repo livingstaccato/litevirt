@@ -147,7 +147,8 @@ func TestCommitOffline_RefusesAnotherDisksOverlay(t *testing.T) {
 // the same name) never receives the old overlay's data: the overlay is set
 // aside, kept.
 //
-// Mutation "binding ignored": Check accepts any sidecar — red.
+// Mutation "file identity ignored": Check takes the file's identity from the
+// sidecar instead of the file — red.
 func TestSettle_ARecreatedDiskNeverReceivesTheOldOverlay(t *testing.T) {
 	needQemu(t)
 	disk := window(t)
@@ -157,8 +158,9 @@ func TestSettle_ARecreatedDiskNeverReceivesTheOldOverlay(t *testing.T) {
 	if err := qcow2.Create(disk, 1<<20, nil); err != nil {
 		t.Fatal(err)
 	}
-	reborn := Owner{VM: "web", VMUUID: "u-2", Disk: "root"}
-	out, aside, err := Settle(context.Background(), disk, reborn, "t")
+	// The same owner (a rebuild keeps the VM's identity): only the file's
+	// own identity tells the new disk from the old.
+	out, aside, err := Settle(context.Background(), disk, owner, "t")
 	if err != nil || out != SetAsideO {
 		t.Fatalf("Settle = %v, %v, want the old overlay set aside", out, err)
 	}
@@ -192,5 +194,21 @@ func TestSettle_ABaseWrittenSinceIsNeverOverwritten(t *testing.T) {
 	}
 	if got := readDisk(t, disk); !bytes.Equal(got[65536:131072], bytes.Repeat([]byte{0x33}, 65536)) {
 		t.Fatal("the newer write in the base was overwritten by the old overlay")
+	}
+}
+
+// An overlay bound to another VM incarnation (same name, another uuid) is
+// never committed, even into an unchanged file.
+//
+// Mutation "owner not checked": Check skips the owner comparison — red.
+func TestSettle_AnotherIncarnationsOverlayIsSetAside(t *testing.T) {
+	needQemu(t)
+	disk := window(t)
+	out, _, err := Settle(context.Background(), disk, Owner{VM: "web", VMUUID: "u-2", Disk: "root"}, "t")
+	if err != nil || out != SetAsideO {
+		t.Fatalf("Settle = %v, %v, want set aside", out, err)
+	}
+	if got := readDisk(t, disk); bytes.Contains(got, bytes.Repeat([]byte{0x5a}, 4096)) {
+		t.Fatal("another incarnation's data was committed")
 	}
 }

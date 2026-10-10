@@ -1045,16 +1045,19 @@ type PlacementSpec struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// A host pin restricts candidate selection but never bypasses hard
 	// constraints (capacity, labels, devices, anti-affinity, or replica caps).
-	Host          string            `protobuf:"bytes,1,opt,name=host,proto3" json:"host,omitempty"`
-	AntiAffinity  []string          `protobuf:"bytes,2,rep,name=anti_affinity,json=antiAffinity,proto3" json:"anti_affinity,omitempty"`
-	Affinity      []string          `protobuf:"bytes,3,rep,name=affinity,proto3" json:"affinity,omitempty"`
-	Require       map[string]string `protobuf:"bytes,4,rep,name=require,proto3" json:"require,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	Prefer        map[string]string `protobuf:"bytes,5,rep,name=prefer,proto3" json:"prefer,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	Spread        bool              `protobuf:"varint,6,opt,name=spread,proto3" json:"spread,omitempty"`                             // legacy; prefer policy
-	MaxPerNode    int32             `protobuf:"varint,7,opt,name=max_per_node,json=maxPerNode,proto3" json:"max_per_node,omitempty"` // 0 = unlimited
-	Policy        string            `protobuf:"bytes,8,opt,name=policy,proto3" json:"policy,omitempty"`                              // balance | bin-pack | spread-strict | cost-aware
-	Rebalance     *RebalanceSpec    `protobuf:"bytes,9,opt,name=rebalance,proto3" json:"rebalance,omitempty"`                        // day-2 reconciliation; nil inherits cluster default
-	NoMigrate     bool              `protobuf:"varint,10,opt,name=no_migrate,json=noMigrate,proto3" json:"no_migrate,omitempty"`     // VM opts out of all live migration
+	Host         string            `protobuf:"bytes,1,opt,name=host,proto3" json:"host,omitempty"`
+	AntiAffinity []string          `protobuf:"bytes,2,rep,name=anti_affinity,json=antiAffinity,proto3" json:"anti_affinity,omitempty"`
+	Affinity     []string          `protobuf:"bytes,3,rep,name=affinity,proto3" json:"affinity,omitempty"`
+	Require      map[string]string `protobuf:"bytes,4,rep,name=require,proto3" json:"require,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	Prefer       map[string]string `protobuf:"bytes,5,rep,name=prefer,proto3" json:"prefer,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	Spread       bool              `protobuf:"varint,6,opt,name=spread,proto3" json:"spread,omitempty"`                             // legacy; prefer policy
+	MaxPerNode   int32             `protobuf:"varint,7,opt,name=max_per_node,json=maxPerNode,proto3" json:"max_per_node,omitempty"` // 0 = unlimited
+	Policy       string            `protobuf:"bytes,8,opt,name=policy,proto3" json:"policy,omitempty"`                              // balance | bin-pack | spread-strict | cost-aware
+	Rebalance    *RebalanceSpec    `protobuf:"bytes,9,opt,name=rebalance,proto3" json:"rebalance,omitempty"`                        // day-2 reconciliation; nil inherits cluster default
+	NoMigrate    bool              `protobuf:"varint,10,opt,name=no_migrate,json=noMigrate,proto3" json:"no_migrate,omitempty"`     // VM opts out of all live migration
+	// failback: after a drain moved this VM off a host, move it back by live
+	// migration once that host is undrained (docs/migration-failover.md).
+	Failback      bool `protobuf:"varint,11,opt,name=failback,proto3" json:"failback,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1155,6 +1158,13 @@ func (x *PlacementSpec) GetRebalance() *RebalanceSpec {
 func (x *PlacementSpec) GetNoMigrate() bool {
 	if x != nil {
 		return x.NoMigrate
+	}
+	return false
+}
+
+func (x *PlacementSpec) GetFailback() bool {
+	if x != nil {
+		return x.Failback
 	}
 	return false
 }
@@ -5872,7 +5882,7 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\rCloudInitSpec\x12\x1a\n" +
 	"\buserdata\x18\x01 \x01(\tR\buserdata\x12\x1a\n" +
 	"\bmetadata\x18\x02 \x01(\tR\bmetadata\x12$\n" +
-	"\rnetworkconfig\x18\x03 \x01(\tR\rnetworkconfig\"\x89\x04\n" +
+	"\rnetworkconfig\x18\x03 \x01(\tR\rnetworkconfig\"\xa5\x04\n" +
 	"\rPlacementSpec\x12\x12\n" +
 	"\x04host\x18\x01 \x01(\tR\x04host\x12#\n" +
 	"\ranti_affinity\x18\x02 \x03(\tR\fantiAffinity\x12\x1a\n" +
@@ -5886,7 +5896,8 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\trebalance\x18\t \x01(\v2\x1a.litevirt.v1.RebalanceSpecR\trebalance\x12\x1d\n" +
 	"\n" +
 	"no_migrate\x18\n" +
-	" \x01(\bR\tnoMigrate\x1a:\n" +
+	" \x01(\bR\tnoMigrate\x12\x1a\n" +
+	"\bfailback\x18\v \x01(\bR\bfailback\x1a:\n" +
 	"\fRequireEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1a9\n" +

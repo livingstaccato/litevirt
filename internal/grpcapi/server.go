@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/netip"
 	"os"
 	"sync"
@@ -302,6 +303,11 @@ type Server struct {
 	// (internal/pki InstallQemuMigrationTLS) and reports whether they are in
 	// place. nil means never: a storage copy then falls to the plaintext guard.
 	migrationTLS func() (bool, error)
+	// migrationNetwork is migration.network: the IPv4 CIDR a migration's data
+	// should travel on (migration_network.go). Empty means the host's cluster
+	// address. localIPs is a test seam for the host's own addresses.
+	migrationNetwork string
+	localIPs         func() ([]net.IP, error)
 	// isoResolvedWithheld makes EnsureDisks answer as a target older than
 	// installer_iso_resolved does (no map), for tests of a new source against
 	// a main target.

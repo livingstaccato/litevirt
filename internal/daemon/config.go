@@ -14,6 +14,7 @@ import (
 
 	"github.com/litevirt/litevirt/internal/auth"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/grpcapi"
 	"github.com/litevirt/litevirt/internal/image"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/obs"
@@ -820,6 +821,12 @@ func LoadConfig() (*Config, error) {
 		return nil, err
 	}
 
+	if cfg.Migration.Network != "" {
+		if _, err := grpcapi.ParseMigrationNetwork(cfg.Migration.Network); err != nil {
+			return nil, err
+		}
+	}
+
 	// (No demote-vs-takeover timing invariant: majority reclaim is proof-gated, not
 	// timer-gated — see the QuorumLossDemoteAfterSec/KeepalivedStopTimeoutSec doc above.)
 	if cfg.QuorumLossDemoteAfterSec <= 0 || cfg.KeepalivedStopTimeoutSec <= 0 {
@@ -1088,6 +1095,15 @@ type MigrationConfig struct {
 	// such a migration is refused; set true only where the network between hosts
 	// is trusted.
 	AllowUnencryptedStorage bool `yaml:"allow_unencrypted_storage,omitempty"`
+	// Network is a dedicated migration network, an IPv4 CIDR like
+	// "10.20.0.0/24". A migration this node sends then moves its data (guest
+	// memory, and the disk blocks of a storage copy) to the target's address in
+	// that network instead of the address the host is dialed on, as Proxmox's
+	// `migration: network=` does. The control connection and the certificate
+	// checks stay on the cluster address. A target with no address there, or
+	// one that cannot answer, is moved over the cluster address with a
+	// warning. Default empty: the cluster address.
+	Network string `yaml:"network,omitempty"`
 }
 
 type CapacityConfig struct {

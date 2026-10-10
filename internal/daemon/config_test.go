@@ -575,3 +575,30 @@ func TestCapacityConfigPolicy_EmptyBlockIsDefaults(t *testing.T) {
 		t.Errorf("Policy() = %+v, want %+v", got, want)
 	}
 }
+
+// TestLoadConfig_MigrationNetwork: migration.network is an IPv4 CIDR. A value
+// the migration code cannot use refuses the boot, instead of every migration
+// quietly falling back to the cluster address later.
+//
+// Mutation: drop the ParseMigrationNetwork call in LoadConfig — the bad values
+// load.
+func TestLoadConfig_MigrationNetwork(t *testing.T) {
+	load := func(value string) (*Config, error) {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		body := "host_name: \"h\"\nmigration:\n  network: " + strconv.Quote(value) + "\n"
+		if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("LITEVIRT_CONFIG", path)
+		return LoadConfig()
+	}
+	cfg, err := load("10.20.0.0/24")
+	if err != nil || cfg.Migration.Network != "10.20.0.0/24" {
+		t.Fatalf("LoadConfig(10.20.0.0/24) = %+v, %v; want it accepted", cfg, err)
+	}
+	for _, bad := range []string{"10.20.0.1", "fd00::/64", "0.0.0.0/0", "lan"} {
+		if _, err := load(bad); err == nil || !strings.Contains(err.Error(), "migration.network") {
+			t.Errorf("LoadConfig(%q) = %v; want a load error naming migration.network", bad, err)
+		}
+	}
+}

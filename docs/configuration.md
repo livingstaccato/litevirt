@@ -841,6 +841,7 @@ forward, while it is stopped, with `lv update <vm> --cpu-mode host-model`.
 ```yaml
 migration:
   allow_unencrypted_storage: false   # default false
+  network: 10.20.0.0/24              # default empty: the cluster address
 ```
 
 `allow_unencrypted_storage` decides whether this node may **send** a migration
@@ -856,6 +857,14 @@ With the default, `false`, that plaintext copy is refused, and the error names
 the host without credentials and this setting. Set it to `true` only where the
 network between hosts is trusted, for example a dedicated, isolated migration
 VLAN. It is read on the source host, and only at daemon start.
+
+`network` is a dedicated migration network, an IPv4 CIDR, like Proxmox's
+`migration: network=`. A migration this node sends then moves its data (guest
+memory, and the disk blocks of a storage copy) to the target's address inside
+that network instead of the address the host is dialed on. Nothing needs setting
+on the target: the source asks it, in the request that already prepares the
+move, for the address of its own in the network. See
+[migration](migration-failover.md#a-dedicated-migration-network).
 
 Migrations of VMs on shared storage copy no disks. litevirt tunnels them through
 libvirt's TLS connection, and this setting does not affect them.

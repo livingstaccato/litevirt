@@ -21,7 +21,38 @@ message DrainHostRequest   { string name = 1; int32 parallel = 2; }
 message DrainProgress      { string vm_name = 1; string target_host = 2;
     MigrateStrategy strategy = 3; float progress_pct = 4;
     string status = 5; string error = 6; }
-message UndrainHostRequest { string name = 1; }
+message UndrainHostRequest {
+    string name = 1;
+    // failback: after the host is active again, move back the VMs a drain of
+    // it moved away, as FailbackHost does for every one of them (the
+    // operator asked, so a VM's own opt-in is not needed).
+    bool failback = 2;
+}
+// FailbackHost moves VMs a drain of the host moved away back to it, by live
+// migration, one at a time. Without all, only VMs that opted in (their
+// placement.failback, or the cluster failback policy) are considered.
+// dry_run reports what would move and why each other VM stays.
+message FailbackHostRequest {
+    string name    = 1;
+    bool   all     = 2;
+    bool   dry_run = 3;
+}
+// FailbackProgress is one VM's failback result. status: moved | would-move |
+// skipped | failed; reason says why for the last two.
+message FailbackProgress {
+    string vm_name  = 1;
+    string from_host = 2;
+    string status   = 3;
+    string reason   = 4;
+}
+message FailbackPolicyStatus {
+    bool   enabled    = 1;
+    string set_by     = 2;
+    string updated_at = 3;
+    // settable: this host may write the policy (failover_scope_v1 latched).
+    bool   settable   = 4;
+}
+message SetFailbackPolicyRequest { bool enabled = 1; }
 // Ordered shutdown of a host's running VMs (honors startup_order desc +
 // stop_delay_sec between VMs). Explicit operator action — NOT run on daemon
 // SIGTERM / restart. This is the consumer of vms.stop_delay_sec.
@@ -468,9 +499,15 @@ message CloneVMRequest {
     string mode         = 3;  // "" (auto) | "linked" | "full"
     string snapshot     = 4;  // optional: clone from this snapshot of the source
     string project      = 5;  // tenancy bucket for the clone ("" → source's)
-    string target_host  = 6;  // optional placement pin (else placement engine / host-pin)
+    // target_host: the host the clone ends up on. Empty (or the source's host)
+    // keeps it on the source's host. Another host gets a full copy streamed
+    // over the disk-transfer path a cold migration uses.
+    string target_host  = 6;
     string ip           = 7;  // optional static IP for the clone's first NIC
     bool   start        = 8;  // start the clone after creation
+    // target_pool: the storage pool, on the host the clone ends up on, that
+    // holds the clone's disks. Empty means that host's default disk directory.
+    string target_pool  = 9;
 }
 message ConvertToTemplateRequest { string name = 1; bool revert = 2; }
 message ExecVMRequest      { string name = 1; repeated string command = 2; }
@@ -2697,6 +2734,11 @@ message EnsureDisksRequest {
     // VM's first arrival in a directory another project's pool also maps, the
     // target admits only a file with these very bytes.
     map<string, string> installer_iso_sha256 = 7;
+    // migration_network is the source's migration.network (an IPv4 CIDR). When
+    // set, the target answers in migration_address with the address of its own
+    // that lies in that network, so the migration's data channel can use it.
+    // An older target ignores the field and never answers.
+    string migration_network = 8;
 }
 
 message DiskStub {
@@ -2725,6 +2767,11 @@ message EnsureDisksResponse {
     // file here than on the source). An older target never sets it: the
     // source then migrates the domain unchanged, as before.
     map<string, string> installer_iso_resolved = 4;
+    // migration_address: an IPv4 address of this host inside the request's
+    // migration_network. Empty when none was asked for, or this host has no
+    // address in that network; the source then moves the migration over the
+    // address the host is dialed on, and says so.
+    string migration_address = 5;
 }
 
 // EnsureFirmwareStateRequest pushes a Secure-Boot/vTPM VM's firmware-state bundle
@@ -3306,6 +3353,12 @@ service LiteVirt {
     rpc DrainHost(DrainHostRequest)            returns (stream DrainProgress);
     rpc ShutdownHostWorkloads(ShutdownHostWorkloadsRequest) returns (stream ShutdownProgress);
     rpc UndrainHost(UndrainHostRequest)        returns (Host);
+    // FailbackHost moves the VMs a drain moved off the host back to it by live
+    // migration, at a bounded rate. Get/SetFailbackPolicy read and change the
+    // cluster policy that makes an undrain do it by itself.
+    rpc FailbackHost(FailbackHostRequest)      returns (stream FailbackProgress);
+    rpc GetFailbackPolicy(google.protobuf.Empty) returns (FailbackPolicyStatus);
+    rpc SetFailbackPolicy(SetFailbackPolicyRequest) returns (FailbackPolicyStatus);
     rpc SetHostLabels(SetHostLabelsRequest)    returns (Host);
     rpc FenceHost(FenceHostRequest)            returns (FenceResult);
     rpc GetClusterHealth(GetClusterHealthRequest) returns (ClusterHealth);

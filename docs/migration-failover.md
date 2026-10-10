@@ -133,6 +133,47 @@ You can also set it as a per-VM default in compose:
       with-storage: true
 ```
 
+### A dedicated migration network
+
+By default a live migration's data goes to the target host's cluster address,
+the one its record names and peers dial. Set `migration.network` in the
+source's config to move it onto another network, as Proxmox's
+`migration: network=<CIDR>` does:
+
+```yaml
+migration:
+  network: 10.20.0.0/24
+```
+
+The source asks the target, in the request that already prepares the move, for
+the address of its own inside that network, and sends the guest's memory (and
+the blocks of a `--with-storage` copy) there. Set it on every host that sends
+migrations, which is every host; nothing is stored in the cluster, so a host
+with no address in the network is found out at the move, not at start.
+
+What stays on the cluster address is libvirt's control connection and the
+certificate check. The host certificate libvirt presents and the migration
+certificate QEMU presents carry the host's cluster address as their only IP
+name, so the network's address is in neither. The data channel therefore goes to
+the migration address while the certificate is still checked against the
+cluster address (libvirt's `tls.destination`): no certificate is reissued, and
+the migration network needs no new trust.
+
+A migration of a VM with no disk to copy normally rides inside libvirt's tunnel
+on the cluster address. To use the migration network it leaves the tunnel for
+QEMU's own stream, which is encrypted when both hosts hold migration-TLS
+credentials (`lv host install-migration-tls`). When one does not, the move stays
+in the tunnel on the cluster address, because the alternative is sending guest
+memory in plaintext.
+
+A move falls back to the cluster address, and is never refused for it, when the
+target has no address in the network, when it runs a build that predates the
+setting, or when it answers with an address outside the network. Each time, the
+source logs a warning and records a `vm.migrate.network_fallback` event on the
+VM (`lv events <vm>`) naming the address used. The same applies to drain's live
+moves. Ports 49152-49215 on the migration address must be reachable from the
+source, as for any direct migration.
+
 ## Cold migration
 
 `--cold` migrates a VM without moving a running guest live:

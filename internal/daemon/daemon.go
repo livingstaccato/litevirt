@@ -954,6 +954,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetDefaultCPUMode(d.cfg.VM.DefaultCPUMode)
 	svc.SetLiveResize(d.cfg.Enforcement.LiveResize)
 	svc.SetAllowUnencryptedStorageMigration(d.cfg.Migration.AllowUnencryptedStorage)
+	svc.SetMigrationNetwork(d.cfg.Migration.Network)
 	migrationTLS := d.migrationTLSInstaller()
 	svc.SetMigrationTLS(migrationTLS)
 	// Install once at start so the operator sees the state in the log; it runs

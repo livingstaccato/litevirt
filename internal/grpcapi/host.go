@@ -663,14 +663,23 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 	// target judges that file first (EnsureDisks with no stubs does only that).
 	// Where it resolves the ISO to another file (a link, a library
 	// directory), the destination definition carries that file.
-	_, _, cdromSources, ierr := s.ensureDisksOnTargetISO(ctx, target.Name, vm.Name, nil, false, true)
+	srcTLS := s.migrationNetwork != "" && s.migrationTLSReady()
+	ens, ierr := s.ensureDisksOnTargetNet(ctx, target.Name, vm.Name, nil, srcTLS, true)
 	if ierr != nil {
 		progress.Status = "error"
 		progress.Error = "target refused the installer ISO: " + ierr.Error()
 		return progress
 	}
+	cdromSources := ens.remap
+	route := s.chooseMigrationRoute(ctx, vm.Name, target, ens.migAddr, false, srcTLS && ens.tlsReady)
 	dconnuri := fmt.Sprintf("qemu+tls://%s/system", corrosion.URIHost(target.Address))
-	lerr := s.virt.MigrateToTarget(vm.Name, dconnuri, libvirt.MigrateParams{Live: true, CDROMSources: cdromSources})
+	mp := libvirt.MigrateParams{Live: true, CDROMSources: cdromSources}
+	if route.direct {
+		mp.Direct, mp.TLS = true, true
+		mp.TargetAddress = corrosion.URIHost(route.addr)
+		mp.TLSDestination = target.Address
+	}
+	lerr := s.virt.MigrateToTarget(vm.Name, dconnuri, mp)
 	if lerr == nil {
 		// Phase 4: drain move is an ownership transition (fresh-read CAS + increment).
 		//runningcheck:allow ownership handoff — this commit names the TARGET host while

@@ -198,6 +198,9 @@ message PlacementSpec {
     string                 policy        = 8;       // balance | bin-pack | spread-strict | cost-aware
     RebalanceSpec          rebalance     = 9;       // day-2 reconciliation; nil inherits cluster default
     bool                   no_migrate    = 10;      // VM opts out of all live migration
+    // failback: after a drain moved this VM off a host, move it back by live
+    // migration once that host is undrained (docs/migration-failover.md).
+    bool                   failback      = 11;
 }
 
 // RebalanceSpec: day-2 reconciliation policy. See docs/placement.md.

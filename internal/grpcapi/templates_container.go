@@ -152,6 +152,16 @@ func (s *Server) CloneContainer(ctx context.Context, req *pb.CloneContainerReque
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"source %q must be a template or stopped to clone (current: %s)", req.Source, src.State)
 	}
+	// A source with an unfinished conversion is not cloned: the copy would
+	// carry its marker, which names the SOURCE's target range, so the clone
+	// would be finished into (and share) that range and never start. Finishing
+	// the conversion first loses nothing; the clone could not run before.
+	if sc, ok := s.containerRuntime.(containerSecurer); ok {
+		if sec, serr := sc.ContainerSecurity(req.Source); serr == nil && sec.Converting {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"source %q has an unfinished conversion; finish it with lv ct convert %s, then clone it", req.Source, req.Source)
+		}
+	}
 	// Fail CLOSED on a read error — never clone onto a name we couldn't prove free
 	// (a later cleanup keyed on (host, name) could release an existing CT's NICs).
 	if existing, gerr := corrosion.GetContainer(ctx, s.db, s.hostName, req.Target); gerr != nil {

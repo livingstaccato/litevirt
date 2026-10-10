@@ -2,12 +2,14 @@ package grpcapi
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/auth"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/lxc"
 )
@@ -124,5 +126,86 @@ func TestRestoreContainer_SourceRowReadErrorIsUnavailable(t *testing.T) {
 	}
 	if !deleted {
 		t.Fatalf("the imported container was left behind: deleteCalls=%v", rt.deleteCalls)
+	}
+}
+
+// m-1. A source with an unfinished conversion is refused for cloning: its
+// copied marker names the SOURCE's target range, so the clone would share it
+// (and never start). Finish the conversion first.
+func TestCloneContainer_RefusesAConvertingSource(t *testing.T) {
+	s, rt := secServer(t)
+	seedSecCT(t, s, rt, "half", "stopped", corrosion.ContainerCreateSpec{Template: "download"})
+	rt.security = map[string]lxc.Security{"half": {Confinement: lxc.ConfinementLegacy, Converting: true,
+		ConvertTo: &lxc.ConvertOpts{IDMap: &lxc.IDMap{Base: 1_000_131_072, Size: lxc.IDMapSize}}}}
+	_, err := s.CloneContainer(adminCtx(), &pb.CloneContainerRequest{Source: "half", Target: "h2", HostName: "host-a"})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("clone of a converting source = %v; want FailedPrecondition", err)
+	}
+	if len(rt.cloneCalls) != 0 {
+		t.Fatalf("the refused clone copied the source: %+v", rt.cloneCalls)
+	}
+}
+
+// projectBoundCtx is a caller bound as Operator on /projects/<project> only,
+// with the auth engine loaded, so RBAC (not the legacy role) decides.
+func projectBoundCtx(t *testing.T, s *Server, user, project string) context.Context {
+	t.Helper()
+	ctx := context.Background()
+	if err := corrosion.InsertUser(ctx, s.db, user, "operator", "x"); err != nil {
+		t.Fatal(err)
+	}
+	if err := auth.SeedBuiltinRoles(ctx, s.db); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertRoleBinding(ctx, s.db, corrosion.RoleBindingRecord{
+		ID: user + "-p", Path: "/projects/" + project, Role: "Operator", Principal: "user:" + user + "@local", Propagate: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	e := auth.NewEngine(s.db)
+	if err := e.Reload(ctx); err != nil {
+		t.Fatal(err)
+	}
+	s.SetAuthEngine(e)
+	return userCtx(user, "operator")
+}
+
+// R2-I1. A restore renders a managed NIC on its network's own bridge, never
+// the archive spec's; a raw NIC is kept only for a caller with raw-bridge
+// authority or a peer move whose source row carries it — otherwise it is
+// dropped (and said), and the restore proceeds.
+func TestAuthorizeRestoredNICs(t *testing.T) {
+	s := testServer(t)
+	ctx := context.Background()
+	if err := corrosion.UpsertNetwork(ctx, s.db, corrosion.NetworkRecord{Name: "ctnet", Type: "bridge",
+		Config: `{"type":"bridge","interface":"br-ctnet"}`}); err != nil {
+		t.Fatal(err)
+	}
+	forged := corrosion.ContainerCreateSpec{Template: "download", Networks: []corrosion.ContainerNetwork{
+		{Name: "eth0", NetworkName: "ctnet", Bridge: "br-victim", MAC: "02:00:00:00:00:01"},
+		{Name: "eth1", Bridge: "br-mgmt"},
+	}}
+	scoped := projectBoundCtx(t, s, "carol", "acme")
+	out, dropped := s.authorizeRestoredNICs(scoped, forged, nil, false)
+	if len(out.Networks) != 1 || out.Networks[0].Bridge != "br-ctnet" || out.Networks[0].NetworkName != "ctnet" || out.Networks[0].MAC != "02:00:00:00:00:01" {
+		t.Fatalf("a scoped operator's restore NICs = %+v; want only eth0 on br-ctnet", out.Networks)
+	}
+	if !strings.Contains(strings.Join(dropped, " "), "br-mgmt") {
+		t.Errorf("the dropped raw NIC was not reported: %v", dropped)
+	}
+	// Raw-bridge authority (an admin) keeps the raw NIC; the managed bridge
+	// is still the network's.
+	out, _ = s.authorizeRestoredNICs(adminCtx(), forged, nil, false)
+	if len(out.Networks) != 2 || out.Networks[0].Bridge != "br-ctnet" || out.Networks[1].Bridge != "br-mgmt" {
+		t.Fatalf("an admin's restore NICs = %+v", out.Networks)
+	}
+	// A peer move keeps a raw NIC only when the source row records it.
+	src := &corrosion.ContainerRecord{CreateSpec: corrosion.EncodeCreateSpec(corrosion.ContainerCreateSpec{Template: "download",
+		Networks: []corrosion.ContainerNetwork{{Name: "eth1", Bridge: "br-mgmt"}}})}
+	if out, _ = s.authorizeRestoredNICs(adminCtx(), forged, src, true); len(out.Networks) != 2 {
+		t.Errorf("a peer move dropped the raw NIC its source row records: %+v", out.Networks)
+	}
+	if out, _ = s.authorizeRestoredNICs(adminCtx(), forged, nil, true); len(out.Networks) != 1 {
+		t.Errorf("a peer move with no source row kept a raw NIC: %+v", out.Networks)
 	}
 }

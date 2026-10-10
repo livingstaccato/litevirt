@@ -375,6 +375,56 @@ func (s *Server) noteStrippedHostAccess(ctx context.Context, action, name, strip
 	s.audit(ctx, action, name, "not carried (an admin re-applies host mounts/devices with lv ct convert --mount/--device, legacy confinement with lv ct convert --confinement legacy, a privileged mode by restoring as admin): "+stripped, "ok")
 }
 
+// authorizeRestoredNICs decides where a restored container's NICs attach.
+// The archive's spec names bridges, and a bridge is host access too, so none
+// is taken from it:
+//   - a managed NIC is rendered on its network's own bridge (resolveBridge,
+//     as create names it), whatever bridge the spec names;
+//   - a raw NIC (no managed network) is kept only for a caller with raw-bridge
+//     authority (admitRawBridge, as create requires), or — on a peer move,
+//     where the caller is the peer — when the SOURCE ROW records that raw NIC;
+//     otherwise it is dropped and reported, and the restore proceeds.
+//
+// A raw bridge that resolves to a managed network is that network's NIC.
+func (s *Server) authorizeRestoredNICs(ctx context.Context, cs corrosion.ContainerCreateSpec, source *corrosion.ContainerRecord, peer bool) (corrosion.ContainerCreateSpec, []string) {
+	var sourceRaw map[string]bool
+	if peer && source != nil {
+		sourceRaw = map[string]bool{}
+		for _, n := range corrosion.DecodeCreateSpec(source.CreateSpec).Networks {
+			if n.NetworkName == "" {
+				sourceRaw[n.Name+"\x00"+n.Bridge] = true
+			}
+		}
+	}
+	var out []corrosion.ContainerNetwork
+	var dropped []string
+	for _, n := range cs.Networks {
+		if n.NetworkName == "" {
+			if name, ok := s.resolveBridgeToNetwork(ctx, n.Bridge); ok {
+				n.NetworkName = name
+			}
+		}
+		if n.NetworkName != "" {
+			n.Bridge = resolveBridge(ctx, s.db, n.NetworkName)
+			out = append(out, n)
+			continue
+		}
+		keep := false
+		if peer {
+			keep = sourceRaw[n.Name+"\x00"+n.Bridge]
+		} else {
+			keep = s.admitRawBridge(ctx, n.Bridge) == nil
+		}
+		if keep {
+			out = append(out, n)
+			continue
+		}
+		dropped = append(dropped, "raw NIC "+n.Name+" on bridge "+n.Bridge)
+	}
+	cs.Networks = out
+	return cs, dropped
+}
+
 // noteDroppedArchiveConfig says what of an archived config the rebuild
 // dropped — network lines the spec does not render among them.
 func (s *Server) noteDroppedArchiveConfig(ctx context.Context, action, name string, dropped []string) {

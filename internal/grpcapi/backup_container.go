@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"time"
 
@@ -1125,7 +1126,9 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 		if strippedSec != "" {
 			stripped = strings.TrimSpace(stripped + " " + strippedSec)
 		}
-		if stripped != "" {
+		// Where its NICs attach: never a bridge the archive names.
+		authorized, droppedNICs := s.authorizeRestoredNICs(ctx, authorized, source, !operatorRestore)
+		if stripped != "" || !reflect.DeepEqual(authorized.Networks, corrosion.DecodeCreateSpec(spec.CreateSpec).Networks) {
 			spec.CreateSpec = corrosion.EncodeCreateSpec(authorized)
 		}
 		// The network as well: lxc.net.* comes from the authorized spec's
@@ -1140,7 +1143,7 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 			return err
 		}
 		s.noteStrippedHostAccess(ctx, "ct.restore", req.Name, stripped)
-		s.noteDroppedArchiveConfig(ctx, "ct.restore", req.Name, droppedCfg)
+		s.noteDroppedArchiveConfig(ctx, "ct.restore", req.Name, append(droppedNICs, droppedCfg...))
 	}
 	stateDetail := ""
 	if !req.Start {

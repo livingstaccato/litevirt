@@ -30,6 +30,7 @@ import (
 	"github.com/litevirt/litevirt/internal/opjournal"
 	"github.com/litevirt/litevirt/internal/pci"
 	"github.com/litevirt/litevirt/internal/pki"
+	"github.com/litevirt/litevirt/internal/smart"
 	"github.com/litevirt/litevirt/internal/tenancy"
 )
 
@@ -593,6 +594,8 @@ type Server struct {
 	lbMetrics        *metrics.LBMetrics
 	haMetrics        *metrics.HAHealthMetrics
 	dualRunMetrics   *metrics.DualRunMetrics
+	smartMetrics     *metrics.SMARTMetrics
+	smartRunner      smart.Runner // test seam; nil = real smartctl
 
 	// gatherRuntimeOverride is a test seam for the dual-run detector's per-host runtime
 	// gather (self-local + peer GetRuntimeInventory): when non-nil it replaces the real probes,

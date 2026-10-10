@@ -679,10 +679,15 @@ acme:
 
 # Notifications (#5). Optional shortcut: seed a catch-all webhook target+route
 # (min-severity warn) from config without using `lv notify` / the UI. Manage
-# additional targets/routes (webhook, Slack) via `lv notify` or the /notifications
+# additional targets/routes (webhook, Slack, email) via `lv notify` or the /notifications
 # page; they are CRDT-replicated cluster-wide.
 notifications:
   default_webhook: ""               # e.g. https://hooks.slack.com/services/…  (empty = none)
+
+# Disk SMART health check (smartctl): litevirt_disk_smart_* gauges plus
+# disk.smart.* notifications (see notifications.md). Informational only.
+smart:
+  interval: "1h"                    # Go duration; "0" or "off" disables
 
 # Telemetry: structured logging + distributed tracing over OTLP (see
 # telemetry.md). Metrics stay on Prometheus (metrics_port) — this block does NOT

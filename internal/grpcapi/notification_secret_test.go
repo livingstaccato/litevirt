@@ -66,3 +66,41 @@ func TestListNotificationTargets_OperatorStillSeesTheConfig(t *testing.T) {
 		}
 	}
 }
+
+const emailSecret = `{"host":"smtp.example.com","from":"lv@example.com","to":["ops@example.com"],"username":"u","password":"sm7pPassw0rd"}`
+
+// An SMTP password is never handed back by the list RPC, to any role — an
+// operator included, since managing a target never needs to read it back.
+func TestListNotificationTargets_EmailPasswordMaskedForEveryRole(t *testing.T) {
+	s := testServer(t)
+	if err := corrosion.InsertNotificationTarget(adminCtx(), s.db, corrosion.NotificationTarget{
+		ID: "tgt-mail", Name: "ops-mail", Type: "email", Config: emailSecret, Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, role := range []string{"viewer", "operator", "admin"} {
+		resp, err := s.ListNotificationTargets(userCtx("u", role), &pb.ListNotificationTargetsRequest{})
+		if err != nil {
+			t.Fatalf("%s list: %v", role, err)
+		}
+		if strings.Contains(resp.Targets[0].Config, "sm7pPassw0rd") {
+			t.Errorf("%s received the SMTP password: %q", role, resp.Targets[0].Config)
+		}
+	}
+	// operator still sees the non-secret routing config.
+	resp, _ := s.ListNotificationTargets(userCtx("u", "operator"), &pb.ListNotificationTargetsRequest{})
+	if !strings.Contains(resp.Targets[0].Config, "smtp.example.com") || !strings.Contains(resp.Targets[0].Config, "ops@example.com") {
+		t.Errorf("operator lost the non-secret config: %q", resp.Targets[0].Config)
+	}
+}
+
+func TestCreateNotificationTarget_EmailValidated(t *testing.T) {
+	s := testServer(t)
+	_, err := s.CreateNotificationTarget(adminCtx(), &pb.CreateNotificationTargetRequest{Name: "m", Type: "email", Config: `{"host":"h"}`, Enabled: true})
+	if err == nil {
+		t.Fatal("invalid email config accepted")
+	}
+	if _, err := s.CreateNotificationTarget(adminCtx(), &pb.CreateNotificationTargetRequest{Name: "m", Type: "email", Config: emailSecret, Enabled: true}); err != nil {
+		t.Fatalf("valid email config rejected: %v", err)
+	}
+}

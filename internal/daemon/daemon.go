@@ -1050,6 +1050,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetLBMetrics(metrics.NewLBMetrics())
 	svc.SetHAHealthMetrics(metrics.NewHAHealthMetrics())
 	svc.SetDualRunMetrics(metrics.NewDualRunMetrics())
+	svc.SetSMARTMetrics(metrics.NewSMARTMetrics())
 	svc.SetStoragePoolsByName(d.storagePoolRefs())
 	// Before this daemon serves: no cold-migration copy can be in flight yet.
 	svc.SweepColdMigrationScratch()
@@ -1276,6 +1277,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// two hosts and no DB owner disagrees with runtime. One node (the lease holder) does
 	// the work so the fleet pages once, not N times.
 	go svc.RunDualRunDetector(ctx, 60*time.Second)
+	// Per-host disk SMART health: gauges + a notification on a failing/prefail disk.
+	if iv := parseSMARTInterval(d.cfg.SMART.Interval); iv > 0 {
+		go svc.RunSMARTMonitor(ctx, iv)
+	}
 	// Effective-capacity sampler: every host publishes what it is ACTUALLY
 	// carrying (union of DB and runtime workloads), so placement counts rogue
 	// runtimes and refuses hosts whose observation is stale or incomplete.
@@ -2310,6 +2315,23 @@ func (d *Daemon) parsePCIRescanInterval() time.Duration {
 	if err != nil {
 		slog.Warn("invalid pci.rescan_interval", "value", s, "error", err)
 		return 0
+	}
+	return dur
+}
+
+// parseSMARTInterval parses smart.interval: empty = 1h default, "0"/"off" = disabled,
+// an unparseable value falls back to the default with a warning.
+func parseSMARTInterval(s string) time.Duration {
+	switch s {
+	case "":
+		return time.Hour
+	case "0", "off":
+		return 0
+	}
+	dur, err := time.ParseDuration(s)
+	if err != nil || dur < 0 {
+		slog.Warn("invalid smart.interval; using 1h", "value", s, "error", err)
+		return time.Hour
 	}
 	return dur
 }

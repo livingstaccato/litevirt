@@ -14,7 +14,8 @@ peers repair missed pushes through a peer-mTLS-only sensitive anti-entropy lane.
 
 - **Target** — a delivery destination. Types today: `webhook` (generic JSON
   POST of the notification) and `slack` (Slack incoming-webhook message with a
-  severity emoji). Config is `{"url": "…"}`.
+  severity emoji). Config is `{"url": "…"}`. `email` sends a plain-text email
+  over SMTP (see *Email targets* below).
 - **Route** — sends events whose **kind** matches an event-pattern glob and whose
   **severity** is at least `min_severity` to a target. A target receives nothing
   until a route points at it.
@@ -40,6 +41,9 @@ A notification has a `kind` (verb.noun), `severity` (`info` | `warn` | `error`),
 | `ha.lww.unresolved` | warn | a node is tracking unresolved equal-timestamp LWW ties |
 | `ha.dualrun.coverage` | warn | a workload-capable host could not be fully probed this pass — unreachable (segmented/down) OR returned a partial runtime (a local libvirt/container/ip probe errored, so its workload absence is unreliable); split-brain can't be ruled out there |
 | `quota.exceeded` | warn | a CreateVM is rejected by a project quota |
+| `disk.smart.failing` | error | a disk on this host fails its SMART overall-health self-assessment (subject `host:/dev/sdX`) |
+| `disk.smart.prefail` | warn | a disk still passes SMART but a prefailure attribute has tripped or the NVMe critical-warning flag is set |
+| `disk.smart.recovered` | info | a disk that was prefail/failing reports healthy again |
 | `test.notification` | info | `lv notify test` / the UI "Test" button |
 
 > **Route the `ha.vip.*` kinds if you enable VIP HA** (`enforcement.vip_self_demote` /
@@ -109,3 +113,59 @@ target + route (min-severity `warn`) without the CLI/UI — see
 Slack: paste an [incoming-webhook](https://api.slack.com/messaging/webhooks) URL
 as a `slack` target. Slack channels render the severity emoji + cluster +
 kind/subject at a glance.
+
+## Email targets
+
+An `email` target delivers each notification as a plain-text email over SMTP.
+Event routing is identical to the other types: a route (pattern + minimum
+severity) points at the target.
+
+```bash
+printf '%s' "$SMTP_PASSWORD" > /root/smtp.pw && chmod 600 /root/smtp.pw
+lv notify target add --name ops-mail --type email \
+    --smtp-host smtp.example.com --smtp-user lv@example.com \
+    --smtp-password-file /root/smtp.pw \
+    --from litevirt@example.com --to ops@example.com --to oncall@example.com
+lv notify route add --pattern "*" --target <target-id> --min-severity warn
+lv notify test <target-id>        # sends a real test email, like Proxmox's "Test"
+```
+
+| Flag | Meaning |
+|---|---|
+| `--smtp-host` / `--smtp-port` | relay; port defaults to 587 (`starttls`), 465 (`implicit`) or 25 (`none`) |
+| `--smtp-tls` | `starttls` (default: the relay MUST offer STARTTLS or nothing is sent), `implicit` (TLS from connect) or `none` |
+| `--smtp-tls-skip-verify` | do not verify the relay's certificate. **Certificate verification is on by default**; this is for a self-signed lab relay |
+| `--smtp-user` / `--smtp-password-file` | AUTH PLAIN credentials; the password comes from a file (or `-` for stdin), never a flag, so it stays out of shell history and `ps` |
+| `--from` / `--to` | sender and recipients (`--to` repeats) |
+
+Credentials are never sent before TLS is established, and a target with a
+username and `--smtp-tls none` is refused unless the relay is loopback. The
+SMTP password is stored in the target's config, in the same replicated,
+sensitive `notification_targets` table that holds webhook URLs; every list
+response (`lv notify target ls`, the API, the UI) masks it for every role, and
+it is never logged. To change it, delete and re-add the target. Subjects are
+`[cluster] severity: kind subject`, with newlines stripped so a hostile VM name
+cannot inject headers. Each email also carries cluster, kind, severity, subject
+and detail in the body.
+
+A host on an older binary that receives an `email` target treats it as an
+unknown type, logs a warning and skips it; the other targets keep working.
+
+## Disk SMART alerts
+
+Every host checks its own disks with `smartctl` (from smartmontools) on
+`smart.interval` (default `1h`; `0` or `off` disables) and:
+
+- exposes `litevirt_disk_smart_status{device,model,status}` (1 for the disk's
+  current status: `ok`, `prefail`, `failing` or `unknown`) and
+  `litevirt_disk_smart_available` (0 when `smartctl` is not installed) on that
+  host's Prometheus endpoint;
+- notifies `disk.smart.failing` (error) or `disk.smart.prefail` (warn) when a
+  disk enters or worsens into that state, and `disk.smart.recovered` (info) when
+  it clears. A standing failure is paged once per daemon run, not every pass; a
+  daemon restart pages it again.
+
+A host without `smartctl`, a virtual disk with no SMART support, or output that
+cannot be parsed reports `unknown`: it neither pages nor clears a standing
+failure. The check is informational only. It never fences a host, drains it or
+blocks a workload.

@@ -139,6 +139,10 @@ func (s *Server) ListNotificationTargets(ctx context.Context, _ *pb.ListNotifica
 	resp := &pb.ListNotificationTargetsResponse{}
 	for _, t := range targets {
 		pt := toPbTarget(t)
+		// An SMTP password is masked for EVERY role, operator included: unlike a
+		// webhook URL, which an operator needs to see to know what is being
+		// called, nothing about managing a target requires reading it back.
+		pt.Config = notify.RedactConfig(t.Type, t.Config)
 		if redactConfig {
 			pt.Config = redactedTargetConfig
 		}

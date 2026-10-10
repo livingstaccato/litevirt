@@ -785,6 +785,9 @@ lv run … --restart on-failure --restart-max-attempts 5 --restart-delay 5s --re
 ```bash
 lv notify target add --name ops-slack --type slack --url <incoming-webhook-url>
 lv notify target add --name ops-hook --type webhook --url <url>
+lv notify target add --name ops-mail --type email --smtp-host smtp.example.com \
+    --smtp-user lv@example.com --smtp-password-file /root/smtp.pw \
+    --from litevirt@example.com --to ops@example.com --to oncall@example.com
 lv notify target ls
 lv notify route add --pattern "backup.*" --target <target-id> --min-severity error
 lv notify route add --pattern "*" --target <target-id> --min-severity warn

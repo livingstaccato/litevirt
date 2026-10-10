@@ -2,7 +2,6 @@ package corrosion
 
 import (
 	"context"
-	"fmt"
 	"net"
 	"sort"
 	"strings"
@@ -105,11 +104,11 @@ func DeleteSecurityGroup(ctx context.Context, c *Client, id string) error {
 
 // InsertSGRule adds a rule to a security group.
 func InsertSGRule(ctx context.Context, c *Client, rule SGRule) error {
-	// F10: the firewall renderer only emits ipv4_addr sets, so an IPv6 CIDR
-	// would be silently dropped — the operator would believe IPv6 is filtered
-	// when it isn't. Reject it explicitly until ip6 rendering lands.
-	if isIPv6CIDR(rule.CIDR) {
-		return fmt.Errorf("IPv6 CIDR %q is not supported in security-group rules yet (only IPv4 is enforced); specify an IPv4 CIDR", rule.CIDR)
+	// An IPv6 rule renders as ip6 on this build, but a peer on an older
+	// build refuses its whole plan on one, so it waits for firewall_ipv6_v1
+	// (checkFirewallRuleFamily), and a malformed one is never written.
+	if err := c.checkFirewallRuleFamily(rule.CIDR, rule.Proto); err != nil {
+		return err
 	}
 	now := c.NowTS()
 	proto := rule.Proto

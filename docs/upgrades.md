@@ -779,6 +779,37 @@ release. Nothing is written to the table before then, and the scope stays
 below the latched token enters WAL quarantine, as below every latched token.
 Roll forward.
 
+### Firewall: per-NIC rules move to the bridge, IPv6 rules after the roll
+
+This release enforces per-NIC policy — security groups, the cluster and host
+tiers applied to each NIC, the default policy and the new NIC guards — in a
+`bridge litevirt-nic` table on every bridge port, instead of in the `inet`
+forward hook, where traffic between two guests on one bridge (and between a
+guest and its host) was never filtered at all (docs/firewall.md, "Where the
+rules are enforced"). Each host switches when it restarts on the new binary,
+replacing both tables in one `nft -f` transaction, so there is no window with
+neither applied. Rules that never took effect before take effect now: review
+security groups before the roll, and under default-deny allow what guests need
+from their own host (DNS to dnsmasq, for example). The daemon loads
+`nf_conntrack_bridge` for stateful matching on bridge ports.
+
+New NICs are guarded against spoofing by default; NICs that exist before the
+roll are not (docs/firewall.md, "NIC guards"). Guards are recorded in
+`cluster_policies`, so a NIC created before `failover_scope_v1` has latched is
+created unguarded.
+
+IPv6 firewall rules and ip-set elements are refused until the mandatory,
+replication-gated token `firewall_ipv6_v1` has latched, which it does once every
+host the cluster replicates to runs this release: an older renderer refuses its
+whole plan on an IPv6 rule.
+
+**Rolling a host back below this release** leaves the `bridge litevirt-nic`
+table in place, because the older binary does not know it. Delete it on that
+host (`nft delete table bridge litevirt-nic`) as part of the rollback: libvirt
+reuses `vnetN` names, so the stale chains would otherwise hold the next VM to
+get a name to another VM's policy. A binary rolled back below the latched
+`firewall_ipv6_v1` enters WAL quarantine, as below every latched token.
+
 ### Replica matching while the roll is in progress
 
 An upgraded host matches replicas by record and, for a file with no record,

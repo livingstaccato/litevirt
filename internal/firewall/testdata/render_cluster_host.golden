@@ -5,10 +5,10 @@ table inet litevirt-fw {
     chain forward {
         type filter hook forward priority filter; policy drop;
         ct state established,related accept
+        icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem, mld-listener-query, mld-listener-report, mld-listener-done, nd-router-solicit, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert, mld2-listener-report } accept
         ct state invalid drop
         jump cluster_default
         jump host_overrides
-        jump nic_dispatch
     }
 
     chain cluster_default {
@@ -17,9 +17,6 @@ table inet litevirt-fw {
 
     chain host_overrides {
         tcp dport 22 ip saddr 192.0.2.0/24 accept comment "ssh from jump"
-    }
-
-    chain nic_dispatch {
     }
 
 }

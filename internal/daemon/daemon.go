@@ -602,6 +602,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.wireLeaseMintClearance()
 	d.wireCredentialsSplitGate()
 	d.wireClusterPolicyGate()
+	d.wireFirewallIPv6Gate()
 	d.wireVoterConfigGate()
 	d.wireRecoveryClaimGate()
 
@@ -2957,6 +2958,16 @@ func (d *Daemon) runHostMembershipSplit(ctx context.Context) {
 func (d *Daemon) wireClusterPolicyGate() {
 	d.db.SetClusterPolicyGate(func() bool {
 		return d.checker.DurablyLatched(capabilities.FailoverScopeV1)
+	})
+}
+
+// wireFirewallIPv6Gate lets corrosion write an IPv6 firewall rule or ip-set
+// element only once firewall_ipv6_v1 is DURABLY latched: a peer on an older
+// build refuses its whole firewall plan on one. Unwired, the gate fails closed
+// and IPv6 rules are refused, as every earlier build refused them.
+func (d *Daemon) wireFirewallIPv6Gate() {
+	d.db.SetFirewallIPv6Gate(func() bool {
+		return d.checker.DurablyLatched(capabilities.FirewallIPv6V1)
 	})
 }
 

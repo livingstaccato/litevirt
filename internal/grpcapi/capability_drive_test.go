@@ -95,6 +95,10 @@ func TestDriveCapabilityActivation_FlagAwareBoundedDriver(t *testing.T) {
 		// recorded 'offline' and does not auto-activate such a host". The
 		// failover lease holder relies on whichever node holds it next.
 		capabilities.FenceStateV1: true,
+		// firewall_ipv6_v1: "this build renders IPv6 firewall rules". An
+		// older renderer refuses its whole plan on one, so none is written
+		// until every host that receives them can render them.
+		capabilities.FirewallIPv6V1: true,
 	}
 
 	// Cross-check the hand-written list against the ONE declaration, so adding a

@@ -3,6 +3,8 @@ package firewall
 import (
 	"context"
 	"fmt"
+	"log/slog"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -45,12 +47,43 @@ func (n NftBinary) bin() string {
 //
 // nft -f processes the whole input as ONE transaction, so the delete+recreate
 // is atomic — traffic never sees a half-applied or empty table.
+//
+// The per-NIC table (bridge family, NICTableName) is replaced in the same
+// transaction when the ruleset carries one, so moving enforcement between the
+// two tables never leaves a moment with neither applied. When it does not,
+// the bridge family is left out of the transaction entirely — so a host with
+// nothing to enforce per NIC never depends on nf_tables bridge support — and a
+// table an earlier apply left behind is deleted afterwards. That must happen:
+// libvirt reuses vnetN names, so a stale chain for vnet3 would hold whichever
+// VM gets vnet3 next to another VM's rules, MAC and addresses.
 func (n NftBinary) Apply(ctx context.Context, ruleset string) (string, error) {
 	preamble := fmt.Sprintf("table inet %s {}\ndelete table inet %s\n", TableName, TableName)
+	guarded := strings.Contains(ruleset, "table bridge "+NICTableName+" {")
+	if guarded {
+		EnsureBridgeConntrack(ctx)
+		preamble += fmt.Sprintf("table bridge %s {}\ndelete table bridge %s\n", NICTableName, NICTableName)
+	}
 	cmd := exec.CommandContext(ctx, n.bin(), "-f", "-")
 	cmd.Stdin = strings.NewReader(preamble + ruleset)
 	out, err := cmd.CombinedOutput()
-	return string(out), err
+	if err != nil || guarded {
+		return string(out), err
+	}
+	return n.dropStaleGuard(ctx)
+}
+
+// dropStaleGuard deletes the per-NIC table if one exists. A failed listing
+// means there is none (or no bridge family to hold one), which is not an
+// error; a failed delete of a table that exists is.
+func (n NftBinary) dropStaleGuard(ctx context.Context) (string, error) {
+	if err := exec.CommandContext(ctx, n.bin(), "list", "table", "bridge", NICTableName).Run(); err != nil {
+		return "", nil
+	}
+	out, err := exec.CommandContext(ctx, n.bin(), "delete", "table", "bridge", NICTableName).CombinedOutput()
+	if err != nil {
+		return string(out), fmt.Errorf("delete stale per-NIC table: %w", err)
+	}
+	return string(out), nil
 }
 
 // Flush drops the entire table — operators only need this on
@@ -58,7 +91,10 @@ func (n NftBinary) Apply(ctx context.Context, ruleset string) (string, error) {
 func (n NftBinary) Flush(ctx context.Context) (string, error) {
 	cmd := exec.CommandContext(ctx, n.bin(), "delete", "table", "inet", TableName)
 	out, err := cmd.CombinedOutput()
-	return string(out), err
+	if err != nil {
+		return string(out), err
+	}
+	return n.dropStaleGuard(ctx)
 }
 
 // Applier serialises Apply calls and short-circuits when the rendered
@@ -173,4 +209,24 @@ func (a *Applier) Reset() {
 	defer a.mu.Unlock()
 	a.lastSent = ""
 	a.lastApplyAt = time.Time{}
+}
+
+var bridgeConntrackOnce sync.Once
+
+// EnsureBridgeConntrack loads nf_conntrack_bridge, once per process. The
+// per-NIC table's `ct state established,related accept` recognises a reply on
+// a bridge port only with it; without it every bridged frame is untracked, and
+// the reply to a connection a guest opened is judged by the guest's ingress
+// rules like a new connection. A failure is logged, not fatal: the module may
+// be built in, and the rules still load.
+func EnsureBridgeConntrack(ctx context.Context) {
+	bridgeConntrackOnce.Do(func() {
+		if _, err := os.Stat("/sys/module/nf_conntrack_bridge"); err == nil {
+			return
+		}
+		if out, err := exec.CommandContext(ctx, "modprobe", "nf_conntrack_bridge").CombinedOutput(); err != nil {
+			slog.Error("firewall: could not load nf_conntrack_bridge; replies on bridge ports will be judged as new connections",
+				"error", err, "output", strings.TrimSpace(string(out)))
+		}
+	})
 }

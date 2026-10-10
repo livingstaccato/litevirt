@@ -138,8 +138,9 @@ func TestCorrosionPlanLoader_OneTapIsBoundOnce(t *testing.T) {
 	if len(plan.NICs) != 1 {
 		t.Fatalf("one device must be bound once, got %+v", plan.NICs)
 	}
-	if out, err := Render(plan); err != nil || strings.Count(out, "chain nic_vnet7 {") != 1 {
-		t.Errorf("want exactly one nic_vnet7 chain (err %v):\n%s", err, out)
+	plan.DefaultDeny = true // so the per-NIC table is rendered at all
+	if out, err := Render(plan); err != nil || strings.Count(out, "chain nic_in_vnet7 {") != 1 {
+		t.Errorf("want exactly one nic_in_vnet7 chain (err %v):\n%s", err, out)
 	}
 }
 
@@ -202,13 +203,7 @@ func TestCorrosionPlanLoader_DuplicateNameFailsClosed(t *testing.T) {
 		t.Fatalf("Render: %v", err)
 	}
 	chain := func(dev string) string {
-		head := "chain nic_" + dev + " {\n"
-		i := strings.Index(out, head)
-		if i < 0 {
-			t.Fatalf("no chain for %s:\n%s", dev, out)
-		}
-		body := out[i+len(head):]
-		return body[:strings.Index(body, "\n    }")]
+		return chainBody(t, out, "nic_in_"+dev) + chainBody(t, out, "nic_out_"+dev)
 	}
 	for _, dev := range []string{"vnet1", "lvc0web"} {
 		c := chain(dev)
@@ -229,4 +224,16 @@ func TestCorrosionPlanLoader_DuplicateNameFailsClosed(t *testing.T) {
 	if len(reported) != 1 || reported["web"] != 2 {
 		t.Errorf("OnDuplicateSGs = %v, want web=2 (one VM NIC, one container NIC)", reported)
 	}
+}
+
+// chainBody returns the rules of the named chain in a rendered ruleset.
+func chainBody(t *testing.T, out, name string) string {
+	t.Helper()
+	head := "chain " + name + " {\n"
+	i := strings.Index(out, head)
+	if i < 0 {
+		t.Fatalf("no chain %s:\n%s", name, out)
+	}
+	body := out[i+len(head):]
+	return body[:strings.Index(body, "\n    }")]
 }

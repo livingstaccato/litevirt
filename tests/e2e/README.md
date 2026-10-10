@@ -146,6 +146,7 @@ drive a local `lv`).
 | `E2E_LAB_PORT_BASE` | `2230` | node N's SSH is `127.0.0.1:(base+N)` |
 | `E2E_EVIDENCE_DIR` | (none) | per drill: `samples.log` (every sample), `timeline.txt`, extra evidence |
 | `E2E_DRILL_IMAGE` / `E2E_DRILL_MEMORY` | `cirros` / `128M` | the drills' own test VMs |
+| `E2E_GUEST_USER` / `E2E_GUEST_PASSWORD` | `cirros` / `gocubsgo` | login the firewall traffic case (`TestFirewall_TrafficBetweenVMs`) uses inside its guests, over SSH through the host node |
 | `LITEVIRT_E2E_DESTRUCTIVE` | (none) | `1` also runs drill 6, which destroys and rebuilds hosts |
 
 ### The drills

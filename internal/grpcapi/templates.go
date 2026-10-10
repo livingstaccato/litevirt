@@ -268,6 +268,7 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 	var netConfigs []lv.NetworkConfig
 	var ifaceRecords []corrosion.InterfaceRecord
 	var nicRecords []corrosion.NICRecord // v42 dual-write alongside ifaceRecords (vm_nics)
+	var guardRecords []corrosion.NICGuardRecord
 	for i, n := range srcSpec.Network {
 		mac := lv.GenerateMAC()
 		bridge := network.FlatBridgeName(n.Name)
@@ -304,6 +305,17 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 			TapDevice:      "",
 			SecurityGroups: encodeSecurityGroups(n.SecurityGroups),
 		})
+		// A clone's NICs are new NICs: each gets the default guard. The
+		// source's relaxations are not copied — relaxing a guard needs
+		// cluster-root network authority the cloning caller may not hold —
+		// and are set on the clone with `lv firewall nic-guard set`.
+		if !strings.HasPrefix(bridge, "direct:") {
+			guardRecords = append(guardRecords, corrosion.NICGuardRecord{VMName: req.Target, MAC: mac, Mode: corrosion.NICGuardOn})
+		}
+	}
+	if err := s.writeNewNICGuards(ctx, guardRecords); err != nil {
+		cleanup()
+		return nil, err
 	}
 
 	// ── Fresh cloud-init identity (new instance-id ⇒ clean first boot) ───
@@ -460,6 +472,9 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 	// clone therefore sat at 0 until someone enabled the default-off backfill,
 	// and became running-and-unprovable the moment it started.
 	s.assignOwnerEpochAtCreate(ctx, req.Target, state == "running")
+	if len(guardRecords) > 0 {
+		s.reconcileLocal(ctx)
+	}
 
 	slog.Info("VM cloned", "source", req.Source, "target", req.Target, "mode", mode, "why", modeWhy, "host", s.hostName)
 	s.audit(ctx, "vm.clone", req.Target, fmt.Sprintf("source=%s mode=%s", req.Source, mode), "ok")

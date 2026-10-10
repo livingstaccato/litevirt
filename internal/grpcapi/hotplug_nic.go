@@ -50,8 +50,18 @@ func attachNICRequestHash(vmName string, spec *pb.NetworkAttachment) string {
 	}
 	sgs := append([]string{}, spec.SecurityGroups...)
 	sortStrings(sgs)
-	sum := sha256.Sum256([]byte(fmt.Sprintf("attach-nic|%s|%s|%s|%s|%s|%s",
-		vmName, spec.Name, model, spec.Mac, spec.Ip, strings.Join(sgs, ","))))
+	key := fmt.Sprintf("attach-nic|%s|%s|%s|%s|%s|%s",
+		vmName, spec.Name, model, spec.Mac, spec.Ip, strings.Join(sgs, ","))
+	// The NIC guard joins the identity only when the request names one, so a
+	// request without guard settings hashes exactly as it did before guards
+	// existed — an older entry node's hash still matches.
+	if nicGuardExplicit(spec) {
+		allowed := append([]string{}, spec.AllowedAddresses...)
+		sortStrings(allowed)
+		key += fmt.Sprintf("|guard=%s|%s|%t|%t", strings.ToLower(spec.SpoofGuard), strings.Join(allowed, ","),
+			spec.AllowDhcpServer, spec.AllowRouterAdvertisement)
+	}
+	sum := sha256.Sum256([]byte(key))
 	return hex.EncodeToString(sum[:])
 }
 
@@ -128,7 +138,15 @@ func (s *Server) attachNICEntry(ctx context.Context, req *pb.AttachDeviceRequest
 		if err := s.admitManagedNetwork(ctx, vmRec.Project, spec.Name); err != nil {
 			return nil, err
 		}
+		// The entry node checked the caller's authority over the guard; the
+		// owner re-checks only what needs none.
+		if err := s.admitNICGuards(ctx, []*pb.NetworkAttachment{spec}, true); err != nil {
+			return nil, err
+		}
 		return s.attachNICOwner(ctx, req, vmRec.Name, opID, reqHash, "")
+	}
+	if err := s.admitNICGuards(ctx, []*pb.NetworkAttachment{spec}, false); err != nil {
+		return nil, err
 	}
 
 	principal := callerUsername(ctx) + "@" + callerRealm(ctx)
@@ -514,6 +532,14 @@ func (s *Server) executeNICAttach(ctx context.Context, vm *corrosion.VMRecord, s
 	}
 	s.appendOpStep(ctx, opID, epoch, corrosion.OpDeviceAttach, corrosion.OpStepClaimed)
 
+	// Record the guard before the NIC can carry traffic, so it is never live
+	// unguarded. A macvtap NIC bypasses the bridge where guards are enforced
+	// and gets no record.
+	if !strings.HasPrefix(bridge, "direct:") {
+		if err := s.writeNewNICGuards(ctx, []corrosion.NICGuardRecord{newNICGuardRecord(vm.Name, mac, spec)}); err != nil {
+			return s.failNICAttach(ctx, rb, codes.Internal, err)
+		}
+	}
 	if running {
 		if err := s.virt.AttachNIC(vm.Name, bridge, model, mac); err != nil {
 			return s.failNICAttach(ctx, rb, pciAttachErrorCode(err), pciAttachError("attach NIC", err))
@@ -559,6 +585,7 @@ func (s *Server) executeNICAttach(ctx context.Context, vm *corrosion.VMRecord, s
 			slog.Warn("nic attach: clear journal entry", "vm", vm.Name, "op", opID, "error", err)
 		}
 	}
+	s.reconcileLocal(ctx)
 	slog.Info("nic attached", "vm", vm.Name, "network", spec.Name, "mac", mac)
 	s.recordVMEvent(ctx, vm.Name, "device.attached", "ok", "nic "+mac)
 	s.publish("device.attached", vm.Name, "nic:"+mac)

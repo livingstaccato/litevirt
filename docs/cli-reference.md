@@ -948,7 +948,7 @@ See docs/configuration.md.
 lv hardware-ls <vm>                               # List a VM's disks/NICs/PCI devices
 lv attach-disk <vm> <disk> --size 50G [--bus virtio]
 lv detach-disk <vm> <disk>
-lv attach-nic <vm> <network> [--model virtio] [--mac ...]
+lv attach-nic <vm> <network> [--model virtio] [--mac ...] [--spoof-guard on|off] [--allow-address <ip>]
 lv detach-nic <vm> <mac>
 lv attach-pci <vm> --type gpu [--vendor 10de] [--count 1] [--sriov]
 lv detach-pci <vm> <pci-address>
@@ -1058,9 +1058,16 @@ lv firewall ipset rm <id>
 
 # Default forward policy (deny = drop anything not explicitly accepted):
 lv firewall default-deny <on|off> [--scope <host>]   # no --scope = cluster-wide
+
+# NIC guards (anti-spoofing). New NICs are guarded by default; relaxing one
+# needs cluster-root network authority. --allow replaces the list (repeatable).
+lv firewall nic-guard set <vm> --network <net>|--mac <mac> --mode on|off \
+    [--allow <ip-or-cidr>] [--allow-dhcp-server] [--allow-router-advertisement]
+lv firewall nic-guard ls [<vm>]
 ```
 
-See `docs/firewall.md` for the three-tier model.
+See `docs/firewall.md` for the three-tier model, where each tier is enforced
+(the `bridge litevirt-nic` table), IPv6 rules and NIC guards.
 
 ## Audit log
 

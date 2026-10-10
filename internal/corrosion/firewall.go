@@ -40,11 +40,11 @@ type FirewallDefault struct {
 }
 
 // normRule applies the same field defaults the renderer/security-group path
-// uses, and rejects IPv6 CIDRs (the renderer only emits ipv4_addr sets, so an
-// IPv6 rule would be silently unenforced — same guard as InsertSGRule).
-func normRule(r *FirewallRule) error {
-	if isIPv6CIDR(r.CIDR) {
-		return fmt.Errorf("IPv6 CIDR %q is not supported in firewall rules yet (only IPv4 is enforced); specify an IPv4 CIDR", r.CIDR)
+// uses, and refuses an IPv6 rule this build or an older peer could not render
+// (checkFirewallRuleFamily — same guard as InsertSGRule).
+func normRule(c *Client, r *FirewallRule) error {
+	if err := c.checkFirewallRuleFamily(r.CIDR, r.Proto); err != nil {
+		return err
 	}
 	if r.Proto == "" {
 		r.Proto = "all"
@@ -62,6 +62,9 @@ func normRule(r *FirewallRule) error {
 
 // InsertIPSet creates a named CIDR list.
 func InsertIPSet(ctx context.Context, c *Client, s IPSet) error {
+	if err := c.checkIPSetFamily(s.CIDRs); err != nil {
+		return err
+	}
 	cidrs, err := encodeSGs(s.CIDRs) // reuse the []string→JSON helper
 	if err != nil {
 		return err
@@ -106,7 +109,7 @@ func DeleteIPSet(ctx context.Context, c *Client, id string) error {
 
 // InsertClusterFirewallRule adds a rule to the cluster_default chain.
 func InsertClusterFirewallRule(ctx context.Context, c *Client, r FirewallRule) error {
-	if err := normRule(&r); err != nil {
+	if err := normRule(c, &r); err != nil {
 		return err
 	}
 	now := c.NowTS()
@@ -144,7 +147,7 @@ func InsertHostFirewallRule(ctx context.Context, c *Client, r FirewallRule) erro
 	if r.HostName == "" {
 		return fmt.Errorf("host firewall rule requires a host name")
 	}
-	if err := normRule(&r); err != nil {
+	if err := normRule(c, &r); err != nil {
 		return err
 	}
 	now := c.NowTS()

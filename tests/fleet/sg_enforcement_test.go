@@ -76,19 +76,25 @@ func renderPlan(t *testing.T, p firewall.Plan) string {
 	return out
 }
 
-// nicChain returns the body of the per-NIC chain for tap in a rendered ruleset,
-// or "" when there is none.
+// nicChain returns the bodies of the per-NIC chains for tap in a rendered
+// ruleset — its ingress chain, then its egress chain — or "" when there are
+// none.
 func nicChain(rendered, tap string) string {
-	head := "chain nic_" + strings.NewReplacer("-", "_", ".", "_").Replace(tap) + " {\n"
-	i := strings.Index(rendered, head)
-	if i < 0 {
-		return ""
+	dev := strings.NewReplacer("-", "_", ".", "_").Replace(tap)
+	var out string
+	for _, prefix := range []string{"nic_in_", "nic_out_"} {
+		head := "chain " + prefix + dev + " {\n"
+		i := strings.Index(rendered, head)
+		if i < 0 {
+			continue
+		}
+		body := rendered[i+len(head):]
+		if j := strings.Index(body, "\n    }"); j >= 0 {
+			body = body[:j]
+		}
+		out += body
 	}
-	body := rendered[i+len(head):]
-	if j := strings.Index(body, "\n    }"); j >= 0 {
-		body = body[:j]
-	}
-	return body
+	return out
 }
 
 // mustCreateSG creates a security group with one ingress tcp accept on port,

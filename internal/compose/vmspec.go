@@ -144,6 +144,11 @@ func BuildVMSpec(instanceName, baseName string, vm *VMDef, f *File) (*pb.VMSpec,
 			Ipv6:           n.IPv6,
 			Ipv6Gateway:    n.IPv6Gateway,
 			SecurityGroups: n.SecurityGroups,
+
+			SpoofGuard:               n.SpoofGuard,
+			AllowedAddresses:         n.AllowedAddresses,
+			AllowDhcpServer:          n.AllowDHCPServer,
+			AllowRouterAdvertisement: n.AllowRouterAdvertisement,
 		})
 	}
 

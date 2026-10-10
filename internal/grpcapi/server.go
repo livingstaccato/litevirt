@@ -1026,6 +1026,9 @@ func (s *Server) advertisedCapabilities() []string {
 	// (this binary decodes cluster_policies and honours failover_scope). The
 	// opt-in is the replicated policy row, which cannot be written until the
 	// ReplicationGated latch has formed.
+	// firewall_ipv6_v1 is not withheld either: it is a fact about the build
+	// (this binary renders IPv6 firewall rows), and no IPv6 row is written
+	// until the ReplicationGated latch has formed.
 	// claim_incarnation_v1 is not withheld either: it is the claim format this
 	// binary's voters keep (an incarnation in the key, the v2 accept, the
 	// legacy-key seal), a fact about the build.
@@ -1479,6 +1482,10 @@ func (s *Server) tokenEnabled(token string) bool {
 	case capabilities.FailoverScopeV1:
 		// No kill switch: the token says this build decodes cluster_policies
 		// and honours failover_scope. The opt-in is the replicated policy row.
+		return true
+	case capabilities.FirewallIPv6V1:
+		// No kill switch: the token says this build renders IPv6 firewall
+		// rows. The opt-in is writing one.
 		return true
 	case capabilities.VoterConfigV1:
 		// No kill switch: a node with voter_config_v1 off would count a

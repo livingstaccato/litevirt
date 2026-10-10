@@ -353,6 +353,16 @@ type NetworkAttachment struct {
 	// security-groups: definitions. Empty = inherit cluster + host
 	// rules only (no per-NIC SG layer).
 	SecurityGroups []string `yaml:"security-groups,omitempty"`
+
+	// NIC guard (anti-spoofing; docs/firewall.md "NIC guards"). SpoofGuard is
+	// "" (on, the default for a new NIC), "on" or "off". AllowedAddresses are
+	// extra source addresses or prefixes the guest may use beyond the ones
+	// litevirt assigns. Anything but the default needs cluster-root network
+	// authority at deploy.
+	SpoofGuard               string   `yaml:"spoof-guard,omitempty"`
+	AllowedAddresses         []string `yaml:"allowed-addresses,omitempty"`
+	AllowDHCPServer          bool     `yaml:"allow-dhcp-server,omitempty"`
+	AllowRouterAdvertisement bool     `yaml:"allow-router-advertisement,omitempty"`
 }
 
 // CloudInitDef holds cloud-init configuration.

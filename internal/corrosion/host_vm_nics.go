@@ -22,6 +22,11 @@ type HostVMNIC struct {
 	MAC            string
 	Ordinal        int
 	SecurityGroups []string
+	// IP is the address litevirt assigned the NIC (IPAM, NetBox or a static
+	// address in the spec), as its NIC row records it; "" when the guest gets
+	// one some other way, such as from a DHCP server's dynamic range. It may
+	// carry a prefix length ("10.0.0.5/24").
+	IP string
 }
 
 // ListHostVMNICs returns every live NIC of every live VM whose row places it on
@@ -40,7 +45,7 @@ type HostVMNIC struct {
 func ListHostVMNICs(ctx context.Context, c *Client, hostName string) ([]HostVMNIC, error) {
 	nicRows, err := c.Query(ctx,
 		`SELECT n.vm_name, n.id, n.network_name, n.model, n.mac, n.ordinal,
-		        COALESCE(n.security_groups, '') AS security_groups,
+		        COALESCE(n.security_groups, '') AS security_groups, COALESCE(n.ip, '') AS ip,
 		        n.updated_at, COALESCE(n.deleted_at, '') AS deleted_at,
 		        COALESCE(v.state, '') AS vm_state
 		 FROM vm_nics n
@@ -51,7 +56,7 @@ func ListHostVMNICs(ctx context.Context, c *Client, hostName string) ([]HostVMNI
 	}
 	ifaceRows, err := c.Query(ctx,
 		`SELECT i.vm_name, i.network_name, i.mac, i.ordinal,
-		        COALESCE(i.security_groups, '') AS security_groups,
+		        COALESCE(i.security_groups, '') AS security_groups, COALESCE(i.ip, '') AS ip,
 		        i.updated_at, COALESCE(i.deleted_at, '') AS deleted_at,
 		        COALESCE(v.state, '') AS vm_state
 		 FROM vm_interfaces i
@@ -72,6 +77,7 @@ func ListHostVMNICs(ctx context.Context, c *Client, hostName string) ([]HostVMNI
 			Model:          r.String("model"),
 			MAC:            r.String("mac"),
 			Ordinal:        r.Int("ordinal"),
+			IP:             r.String("ip"),
 			SecurityGroups: r.String("security_groups"),
 			UpdatedAt:      r.String("updated_at"),
 			DeletedAt:      r.String("deleted_at"),
@@ -93,6 +99,7 @@ func ListHostVMNICs(ctx context.Context, c *Client, hostName string) ([]HostVMNI
 			Model:          "virtio",
 			MAC:            mac,
 			Ordinal:        r.Int("ordinal"),
+			IP:             r.String("ip"),
 			SecurityGroups: r.String("security_groups"),
 			UpdatedAt:      r.String("updated_at"),
 			DeletedAt:      r.String("deleted_at"),
@@ -113,6 +120,7 @@ func ListHostVMNICs(ctx context.Context, c *Client, hostName string) ([]HostVMNI
 			MAC:            m.MAC,
 			Ordinal:        m.Ordinal,
 			SecurityGroups: decodeSGs(groups),
+			IP:             m.IP,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {

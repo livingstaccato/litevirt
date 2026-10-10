@@ -197,7 +197,7 @@ func (s *Server) AddSecurityGroupRule(ctx context.Context, req *pb.AddSecurityGr
 		PortRange: r.Port, CIDR: r.Cidr, Action: r.Action, Priority: int(r.Priority),
 	}
 	if err := corrosion.InsertSGRule(ctx, s.db, row); err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "add security group rule: %v", err)
+		return nil, status.Errorf(firewallWriteCode(err, codes.InvalidArgument), "add security group rule: %v", err)
 	}
 	// Read back, so the "after" (and the reply) is the rule as stored: the
 	// insert fills in defaults for an empty proto, action and priority.

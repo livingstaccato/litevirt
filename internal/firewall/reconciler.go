@@ -5,6 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/netip"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -271,6 +274,12 @@ type LoaderOptions struct {
 	// rather than stack up goroutines behind a hung libvirtd.
 	TapTimeout time.Duration
 
+	// TapBridge names the bridge a device is a port of ("" when it is none
+	// or cannot be told). nil reads /sys/class/net/<dev>/master. Routed
+	// traffic to and from those bridges is decided per NIC in the bridge
+	// table rather than a second time in the inet forward chain.
+	TapBridge func(dev string) string
+
 	// OnDuplicateSGs, when set, receives after every pass the security-group
 	// names that more than one live group holds and that a NIC on this host is
 	// bound to, each with the number of this host's NICs held at drop for it.
@@ -300,6 +309,10 @@ type LoaderOptions struct {
 // nodes racing, since the CRDT has no UNIQUE.
 func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, opts LoaderOptions) PlanLoader {
 	taps := &tapFetcher{}
+	tapBridge := opts.TapBridge
+	if tapBridge == nil {
+		tapBridge = sysfsMaster
+	}
 	return func(ctx context.Context) (Plan, error) {
 		plan := defaults
 
@@ -413,6 +426,19 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 				return plan, fmt.Errorf("read VM taps from libvirt (keeping the applied ruleset): %w", err)
 			}
 		}
+		// NIC guards. A read failure fails the pass like any other, keeping
+		// the applied ruleset: dropping the guards instead would unguard every
+		// NIC on the host while the database is unreadable.
+		var guards map[string]corrosion.NICGuardRecord
+		var subnets map[string]string
+		if len(ifaces) > 0 {
+			if guards, err = corrosion.ListNICGuards(ctx, db); err != nil {
+				return plan, err
+			}
+			if subnets, err = corrosion.NetworkSubnets(ctx, db); err != nil {
+				return plan, err
+			}
+		}
 		plan.NICs = plan.NICs[:0:0]
 		claimed := map[string]string{} // tap → the VM that holds it this pass
 		for _, ifc := range ifaces {
@@ -433,7 +459,12 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 				continue
 			}
 			claimed[tap] = ifc.VMName
-			plan.NICs = append(plan.NICs, bind(tap, ifc.VMName, ifc.SecurityGroups))
+			nb := bind(tap, ifc.VMName, ifc.SecurityGroups)
+			nb.Bridge = tapBridge(tap)
+			if rec, ok := guards[corrosion.NICGuardKey(ifc.VMName, ifc.MAC)]; ok {
+				nb.Guard = ResolveNICGuard(&rec, ifc.MAC, ifc.IP, subnets[ifc.NetworkName])
+			}
+			plan.NICs = append(plan.NICs, nb)
 		}
 
 		// Container NICs: identical per-NIC SG enforcement on the veth. The loader
@@ -448,7 +479,9 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 			if ifc.VethDevice == "" {
 				continue
 			}
-			plan.NICs = append(plan.NICs, bind(ifc.VethDevice, ifc.CtName, ifc.SecurityGroups))
+			nb := bind(ifc.VethDevice, ifc.CtName, ifc.SecurityGroups)
+			nb.Bridge = tapBridge(ifc.VethDevice)
+			plan.NICs = append(plan.NICs, nb)
 		}
 		if opts.OnDuplicateSGs != nil {
 			opts.OnDuplicateSGs(ambiguous)
@@ -464,6 +497,96 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 		plan.NAT, plan.HostIsolation = intentToNATIsolation(intents)
 		return plan, nil
 	}
+}
+
+// ResolveNICGuard turns a NIC's guard record into the renderer's guard, or
+// nil when the NIC is not guarded (no record, or an "off" one).
+//
+// Each address family is restricted only when something says which addresses
+// the guest owns in it: an address litevirt assigned (nicIP, the record's
+// Known list), the network's subnet when no address is assigned, or an
+// address the operator listed in Allowed. A family nothing is known about is
+// left unrestricted, because a guest served by a DHCP server or router
+// litevirt does not run has addresses nobody told it about, and cutting it off
+// would break it. The MAC, ARP, DHCP-server and router-advertisement guards
+// apply regardless.
+//
+// An entry that does not parse is skipped rather than allowed to reach the
+// renderer, which would refuse the whole ruleset.
+func ResolveNICGuard(rec *corrosion.NICGuardRecord, mac, nicIP, subnet string) *NICGuard {
+	if rec == nil || !rec.Guarded() {
+		return nil
+	}
+	g := &NICGuard{MAC: strings.ToLower(mac), AllowDHCPServer: rec.AllowDHCPServer, AllowRouterAdvert: rec.AllowRouterAdvert}
+	var v4, v6 []string
+	assigned4, assigned6 := false, false
+	add := func(s string, assigned bool) {
+		p, ok := parseGuardEntry(s, assigned)
+		if !ok {
+			if s != "" {
+				slog.Warn("firewall: skipping an unparseable NIC guard address", "vm", rec.VMName, "mac", mac, "address", s)
+			}
+			return
+		}
+		if p.Addr().Is4() {
+			v4 = append(v4, guardEntryString(p))
+			assigned4 = assigned4 || assigned
+		} else {
+			v6 = append(v6, guardEntryString(p))
+			assigned6 = assigned6 || assigned
+		}
+	}
+	add(nicIP, true)
+	for _, k := range rec.Known {
+		add(k, true)
+	}
+	for _, a := range rec.Allowed {
+		add(a, false)
+	}
+	if sp, err := netip.ParsePrefix(strings.TrimSpace(subnet)); err == nil && sp.Addr().Zone() == "" {
+		sp = sp.Masked()
+		if sp.Addr().Is4() && !assigned4 {
+			v4 = append(v4, sp.String())
+		} else if !sp.Addr().Is4() && !assigned6 {
+			v6 = append(v6, sp.String())
+		}
+	}
+	if len(v4) > 0 {
+		g.V4 = v4
+	}
+	if len(v6) > 0 {
+		g.V6 = v6
+	}
+	return g
+}
+
+// parseGuardEntry reads one guard address. An assigned address is a host
+// address even when written with its prefix length ("10.0.0.5/24" is
+// 10.0.0.5); an allowed entry's prefix length means a prefix.
+func parseGuardEntry(s string, assigned bool) (netip.Prefix, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return netip.Prefix{}, false
+	}
+	if p, err := netip.ParsePrefix(s); err == nil && p.Addr().Zone() == "" {
+		if assigned {
+			return netip.PrefixFrom(p.Addr(), p.Addr().BitLen()), true
+		}
+		return p.Masked(), true
+	}
+	if a, err := netip.ParseAddr(s); err == nil && a.Zone() == "" {
+		return netip.PrefixFrom(a, a.BitLen()), true
+	}
+	return netip.Prefix{}, false
+}
+
+// guardEntryString renders a host prefix as a bare address, the form nft
+// prints and the form operators write.
+func guardEntryString(p netip.Prefix) string {
+	if p.IsSingleIP() {
+		return p.Addr().String()
+	}
+	return p.String()
 }
 
 // failClosed is the chain body of a NIC whose groups cannot be resolved: drop
@@ -606,4 +729,24 @@ func countRules(p Plan) int {
 		n += len(nic.ExtraRules)
 	}
 	return n
+}
+
+// sysfsMaster reads the bridge a device is enslaved to from sysfs. A name
+// that is not a safe interface name is never returned: it is rendered into
+// the ruleset.
+func sysfsMaster(dev string) string {
+	if dev == "" || strings.ContainsAny(dev, "/ ") {
+		return ""
+	}
+	target, err := os.Readlink(filepath.Join("/sys/class/net", dev, "master"))
+	if err != nil {
+		return ""
+	}
+	name := filepath.Base(target)
+	for _, r := range name {
+		if !(r == '-' || r == '_' || r == '.' || (r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')) {
+			return ""
+		}
+	}
+	return name
 }

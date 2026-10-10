@@ -409,6 +409,12 @@ type Client struct {
 	// failover_scope_v1 latch. Fails CLOSED when unset: the table's shapes
 	// back-pressure a previous-release peer. See cluster_policy.go.
 	clusterPolicyGate atomic.Pointer[func() bool]
+	// firewallIPv6Gate, when non-nil and returning true, permits writing an
+	// IPv6 firewall rule or ip-set element. Injected via SetFirewallIPv6Gate,
+	// wired to the durable firewall_ipv6_v1 latch. Fails CLOSED when unset: a
+	// peer on an older build stops applying its firewall on one. See
+	// firewall_ipv6.go.
+	firewallIPv6Gate atomic.Pointer[func() bool]
 	// voterConfigGate, when set and returning true, permits WRITING
 	// voter_configs. Injected via SetVoterConfigGate, wired to the durable
 	// voter_config_v1 latch. Fails CLOSED when unset: that table's shapes

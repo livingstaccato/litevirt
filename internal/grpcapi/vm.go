@@ -110,6 +110,13 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	if err := s.RequirePerm(ctx, vmRBACPathFor(spec.Project, spec.Name), "vm.create", "operator"); err != nil {
 		return nil, err
 	}
+	// NIC guards: well formed, recordable when explicit, and — when they
+	// weaken the default — authorized at cluster root. A re-create of this VM
+	// carries the guards its original create stored in the spec.
+	_, recreate := replacedVMFor(ctx, spec.Name)
+	if err := s.admitNICGuards(ctx, spec.Network, recreate); err != nil {
+		return nil, err
+	}
 
 	// Idempotency: a lost-response retry carrying the same key replays the original
 	// result instead of creating a second VM. The check runs before the forward
@@ -568,6 +575,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	var netConfigs []lv.NetworkConfig
 	var ifaceRecords []corrosion.InterfaceRecord
 	var nicRecords []corrosion.NICRecord // v42 dual-write alongside ifaceRecords (vm_nics)
+	var guardRecords []corrosion.NICGuardRecord
 
 	// External-IPAM claims taken for this create. A NetBox claim is a synchronous
 	// REMOTE side-effect: it cannot join the local atomic write, so every failure
@@ -741,6 +749,21 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			TapDevice:      "",
 			SecurityGroups: encodeSecurityGroups(n.SecurityGroups),
 		})
+		// A macvtap NIC bypasses the bridge, where guards are enforced, so it
+		// gets no record rather than one that claims a protection it lacks.
+		if !strings.HasPrefix(bridge, "direct:") {
+			guardRecords = append(guardRecords, newNICGuardRecord(spec.Name, mac, n))
+		}
+	}
+
+	// Record the NIC guards before the domain is defined, so the VM never runs
+	// without the guard it was created with. A create that fails after this
+	// leaves records behind, which is harmless: they are keyed by VM name and
+	// MAC, and a NIC created under the same pair writes its own first.
+	if err := s.writeNewNICGuards(ctx, guardRecords); err != nil {
+		claims.releaseAll(ctx)
+		cleanupDisks()
+		return nil, err
 	}
 
 	// Build cloud-init network-config for interfaces with static IPs.
@@ -1050,6 +1073,11 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		// graduate or publish. The invariant it maintains lives on
 		// assignOwnerEpochAtCreate; do not restate it here, or the two copies drift.
 		s.assignOwnerEpochAtCreate(ctx, spec.Name, true)
+		// The guards apply from the first reconcile that sees the VM's row;
+		// run it now rather than on the next tick.
+		if len(guardRecords) > 0 {
+			s.reconcileLocal(ctx)
+		}
 	}
 
 	slog.Info("VM created successfully", "name", spec.Name, "host", s.hostName)

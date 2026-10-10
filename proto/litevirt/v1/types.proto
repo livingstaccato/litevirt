@@ -177,6 +177,15 @@ message NetworkAttachment {
     string          ipv6            = 7;
     string          ipv6_gateway    = 8;
     repeated string security_groups = 9;  // SG names bound to this NIC (distributed firewall)
+    // NIC guard (anti-spoofing, docs/firewall.md). Applied when the NIC is
+    // created or hot-attached; change it later with SetNICGuard.
+    //   spoof_guard: "" = the default for a new NIC (on), "on", or "off".
+    //   allowed_addresses: extra source addresses/prefixes the guest may use
+    //     beyond the ones litevirt assigns (VIPs, VRRP, static secondaries).
+    string          spoof_guard                = 10;
+    repeated string allowed_addresses          = 11;
+    bool            allow_dhcp_server          = 12;
+    bool            allow_router_advertisement = 13;
 }
 
 message CloudInitSpec {

@@ -358,6 +358,13 @@ Supports `s` (seconds), `m` (minutes), `h` (hours). Defaults to 30 seconds if no
         gateway: "10.0.1.1"
         trunk: [100, 101]           # VLAN trunk mode
         security-groups: ["web"]    # Per-NIC firewall (see "Firewall" below)
+        # NIC guard (anti-spoofing, docs/firewall.md "NIC guards"). A new NIC
+        # is guarded by default; anything below but the default needs
+        # cluster-root network authority at deploy.
+        spoof-guard: "on"           # on (default) | off
+        allowed-addresses: ["10.0.1.250"]   # extra sources the guest may use (a VIP)
+        allow-dhcp-server: false
+        allow-router-advertisement: false
 ```
 
 IPv6 can be set either by putting a v6 address in the `ip`/`gateway` fields, or

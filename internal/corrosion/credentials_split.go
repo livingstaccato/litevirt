@@ -278,16 +278,22 @@ func (c *Client) copyTS(r credentialSplitRow) string {
 // node whose row is behind the cluster produces a clear that loses to the
 // fresher row, and that row is cleared by the next pass on the node that holds
 // it.
-func (c *Client) clearTS(r credentialSplitRow) string {
+//
+// ok is false when the row's own timestamp cannot be read. There is then no
+// successor to stamp, and a fresh clock is exactly the hazard above, so the
+// caller leaves that row uncleared (and logs it) rather than guess.
+func clearTS(r credentialSplitRow) (ts string, ok bool) {
 	if hlc.IsHLC(r.srcTS) {
 		if p, ok := hlc.Parse(r.srcTS); ok {
 			p.NodeID += "+"
-			return p.String()
+			return p.String(), true
 		}
-	} else if t, err := time.Parse(time.RFC3339, r.srcTS); err == nil {
-		return t.Add(time.Microsecond).UTC().Format(nowTSLayout)
+		return "", false
 	}
-	return c.NowTS()
+	if t, err := time.Parse(time.RFC3339, r.srcTS); err == nil {
+		return t.Add(time.Microsecond).UTC().Format(nowTSLayout), true
+	}
+	return "", false
 }
 
 // credentialFor is the credential row a clear is paired with: the old column
@@ -318,7 +324,9 @@ func (c *Client) SplitCredentials(ctx context.Context) (CredentialSplitReport, e
 		return rep, nil
 	}
 	if c.MayClearCredentialColumns() {
-		return c.clearCredentialColumns(ctx)
+		rep, err := c.clearCredentialColumns(ctx)
+		c.afterCredentialPass(ctx, err)
+		return rep, err
 	}
 	var firstErr error
 	note := func(what string, err error) {
@@ -351,6 +359,7 @@ func (c *Client) SplitCredentials(ctx context.Context) (CredentialSplitReport, e
 			rep.note(c.copyTokenCredential(ctx, r.pk, r.oldVal, c.copyTS(r)), "token_credentials", note)
 		}
 	}
+	c.afterCredentialPass(ctx, firstErr)
 	return rep, firstErr
 }
 
@@ -393,6 +402,15 @@ func (c *Client) clearCredentialColumns(ctx context.Context) (CredentialSplitRep
 			firstErr = fmt.Errorf("%s: %w", what, err)
 		}
 	}
+	skipped := func(table string, r credentialSplitRow) bool {
+		if _, ok := clearTS(r); ok {
+			return false
+		}
+		slog.Warn("credentials clear: row has no readable updated_at to stamp its clear after; left uncleared",
+			"table", table, "key", r.pk, "updated_at", r.srcTS)
+		return true
+	}
+	stamp := func(r credentialSplitRow) string { ts, _ := clearTS(r); return ts }
 	count := func(table string, copied bool, err error) {
 		if err != nil {
 			note(table, err)
@@ -407,26 +425,38 @@ func (c *Client) clearCredentialColumns(ctx context.Context) (CredentialSplitRep
 	hosts, err := scanCredentialSplitRows(ctx, c, hostCredentialSplitScanSQL)
 	note("host_fence_credentials", err)
 	for _, r := range hosts {
+		if skipped("host_fence_credentials", r) {
+			continue
+		}
 		val, ts, copied := c.credentialFor(r)
-		count("host_fence_credentials", copied, c.clearHostCredential(ctx, r.pk, val, ts, c.clearTS(r)))
+		count("host_fence_credentials", copied, c.clearHostCredential(ctx, r.pk, val, ts, stamp(r)))
 	}
 	users, err := scanCredentialSplitRows(ctx, c, userCredentialSplitScanSQL)
 	note("user_credentials", err)
 	for _, r := range users {
+		if skipped("user_credentials", r) {
+			continue
+		}
 		val, ts, copied := c.credentialFor(r)
-		count("user_credentials", copied, c.clearUserCredential(ctx, r.pk, val, ts, c.clearTS(r)))
+		count("user_credentials", copied, c.clearUserCredential(ctx, r.pk, val, ts, stamp(r)))
 	}
 	tokens, err := scanCredentialSplitRows(ctx, c, tokenCredentialSplitScanSQL)
 	note("token_credentials", err)
 	for _, r := range tokens {
+		if skipped("token_credentials", r) {
+			continue
+		}
 		val, ts, copied := c.credentialFor(r)
-		count("token_credentials", copied, c.clearTokenCredential(ctx, r.pk, val, ts, c.clearTS(r)))
+		count("token_credentials", copied, c.clearTokenCredential(ctx, r.pk, val, ts, stamp(r)))
 	}
 	removed, err := c.Query(ctx, removedHostClearScanSQL)
 	note("hosts", err)
 	for _, row := range removed {
 		r := credentialSplitRow{pk: row.String("pk"), srcTS: row.String("src_ts")}
-		count("hosts", false, c.clearRemovedHostPass(ctx, r.pk, c.clearTS(r)))
+		if skipped("hosts", r) {
+			continue
+		}
+		count("hosts", false, c.clearRemovedHostPass(ctx, r.pk, stamp(r)))
 	}
 	return rep, firstErr
 }

@@ -191,6 +191,7 @@ var dataDirOwned = []string{
 	"credentials_unhydrated", // corrosion/isolation.go credentialsUnhydratedFile
 	"digest-invalidate",      // corrosion/digest_cache.go digestMarkerFile
 	"host_membership_live",   // corrosion/host_membership.go hostMembershipLiveFile
+	"credentials_split_live", // corrosion/credentials_live.go credentialsLiveFile
 	"genesis-pending",        // daemon.go genesisMarkerName; host_init.go genesisMarkerScript
 	"pool-uploads.json",      // storage_pool_confine.go poolUploadsFile
 	"nowts.hwm",              // corrosion/hwm.go (and nowts.hwm.lock)

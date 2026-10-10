@@ -288,6 +288,10 @@ func (ae *AntiEntropy) checkPeer(ctx context.Context, peerName string, localMap,
 	// usersUnjudged: this peer's users rows differ from ours and the pull that
 	// would have judged them did not complete. See checkSensitivePeer.
 	usersUnjudged := false
+	// remints carries this exchange's re-mint judgements from the public pull
+	// to the sensitive one (users_admin_guard.go). It lives exactly as long as
+	// this exchange with this peer.
+	remints := &remintScope{}
 	mismatched := ae.drift.mismatches(peerName, resp.Tables, localMap)
 	// Observation tables are repaired on their own, slower schedule; control
 	// state is repaired now (observation_tables.go). Observations are always
@@ -323,7 +327,7 @@ func (ae *AntiEntropy) checkPeer(ctx context.Context, peerName string, localMap,
 		// row made every repair cost the whole cluster's state (#262). And of
 		// those, only the buckets that differ, where the peer can say which.
 		scope := ae.bucketScope(ctx, client, peerName, pull)
-		kept, pullErr, mergeErr := ae.pullAndMerge(ctx, client, pull, scope, nil)
+		kept, pullErr, mergeErr := ae.pullAndMerge(ctx, client, pull, scope, nil, remints)
 		usersUnjudged = (pullErr != nil || mergeErr != nil) && slices.Contains(pull, "users")
 		if pullErr != nil {
 			slog.Warn("anti-entropy: dump RPC error", "peer", peerName, "error", pullErr)
@@ -342,7 +346,13 @@ func (ae *AntiEntropy) checkPeer(ctx context.Context, peerName string, localMap,
 		}
 	}
 
-	ae.checkSensitivePeer(ctx, client, peerName, sensitiveMap, full, usersUnjudged)
+	// users differed from this peer but was not pulled this cycle (a settled
+	// tie deferred it): nothing judged the peer's accounts, so its credentials
+	// wait as they do after a failed pull.
+	if slices.Contains(mismatched, "users") && !slices.Contains(pull, "users") {
+		usersUnjudged = true
+	}
+	ae.checkSensitivePeer(ctx, client, peerName, sensitiveMap, full, usersUnjudged, remints)
 	// A completed exchange with a seeded peer that is not holding its own audit
 	// rows leaves this replica holding everything that peer held: seeded too
 	// (audit_seeded.go). An older peer does not say, and does not seed.
@@ -394,7 +404,7 @@ func digestMismatches(peer string, remote []*pb.TableDigest, localMap map[string
 // row is refused and its hash remembered (users_admin_guard.go). When that pull
 // did not complete this cycle, nothing may have judged the peer's accounts
 // since this process started, so its credentials wait for a cycle that has.
-func (ae *AntiEntropy) checkSensitivePeer(ctx context.Context, client pb.LiteVirtClient, peerName string, localMap map[string]TableDigest, full, usersUnjudged bool) {
+func (ae *AntiEntropy) checkSensitivePeer(ctx context.Context, client pb.LiteVirtClient, peerName string, localMap map[string]TableDigest, full, usersUnjudged bool, remints *remintScope) {
 	if len(localMap) == 0 {
 		return
 	}
@@ -433,7 +443,7 @@ func (ae *AntiEntropy) checkSensitivePeer(ctx context.Context, client pb.LiteVir
 		scope = ae.bucketScope(ctx, client, peerName, mismatched)
 		req = &pb.SensitiveStateRequest{Sender: req.GetSender(), Tables: mismatched, Buckets: scope.wire(), BucketScheme: BucketScheme}
 	}
-	_, pullErr, mergeErr := ae.pullAndMerge(ctx, client, mismatched, scope, req)
+	_, pullErr, mergeErr := ae.pullAndMerge(ctx, client, mismatched, scope, req, remints)
 	if pullErr != nil {
 		if status.Code(pullErr) == codes.Unimplemented {
 			slog.Debug("anti-entropy: peer has no sensitive state dump RPC", "peer", peerName)

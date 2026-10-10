@@ -283,6 +283,7 @@ type pagedMerge struct {
 	// (the settled-tie proof).
 	keep map[string]bool
 
+	remints     *remintScope
 	parents     syncPayload
 	parentsDone bool
 	manifest    *mergeAuthorityManifest
@@ -313,6 +314,7 @@ func appendRows(p *syncPayload, table string, cols []string, rows [][]interface{
 }
 
 func (m *pagedMerge) mergeOne(st syncTable) {
+	st.remints = m.remints
 	mg, sk, err := m.c.mergeTable(st, m.allowed)
 	m.merged += mg
 	m.skipped += sk
@@ -381,8 +383,15 @@ func (m *pagedMerge) finish(start time.Time) error {
 // before a pull error stay merged: the merge is per-row idempotent and
 // non-destructive, and the next pass pulls again.
 func (c *Client) mergeTableRowsStream(recv func() (*pb.TableRowsPage, error), allowed, keep map[string]bool) (kept *syncPayload, rows map[string]int, pullErr, mergeErr error) {
+	return c.mergeTableRowsStreamScoped(recv, allowed, keep, nil)
+}
+
+// mergeTableRowsStreamScoped is mergeTableRowsStream inside one anti-entropy
+// exchange, whose re-mint judgements rs carries (nil: none).
+func (c *Client) mergeTableRowsStreamScoped(recv func() (*pb.TableRowsPage, error), allowed, keep map[string]bool, rs *remintScope) (kept *syncPayload, rows map[string]int, pullErr, mergeErr error) {
 	start := time.Now()
 	m := newPagedMerge(c, allowed, keep)
+	m.remints = rs
 	for {
 		p, err := recv()
 		if err == io.EOF {

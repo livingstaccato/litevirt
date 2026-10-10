@@ -409,6 +409,12 @@ type Client struct {
 	// behaviour. See host_membership_retire.go.
 	hostMembershipRetire atomic.Pointer[func() bool]
 
+	// credentialsLive is set once this node has completed a SplitCredentials
+	// pass with the split gate open (credentials_live.go); durable through
+	// credentialsLiveFile. credentialsLiveChecked makes the file read once.
+	credentialsLive        atomic.Bool
+	credentialsLiveChecked atomic.Bool
+
 	// hostMembershipGate, when non-nil and returning true, permits WRITING
 	// host_membership. Injected via SetHostMembershipGate, wired to the durable
 	// host_membership_split_v1 latch. Fails CLOSED when unset, for the

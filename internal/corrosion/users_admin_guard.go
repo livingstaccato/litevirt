@@ -184,12 +184,15 @@ func (r *Replicator) usersInsertRemintsALiveAdmin(ctx context.Context, tx *sql.T
 //     account has the same created_at, is never refused, and keeps repairing.
 //     Once the re-minting node has latched credentials_clear_v1 its users row
 //     carries '' and names no credential. The refusal is then remembered for
-//     the USERNAME, and the sensitive lane refuses any user_credentials row for
-//     it whose hash differs from the one this node holds for the account it
-//     kept. That also holds back an anti-entropy repair of a genuine rotation
-//     of that account for the life of the process — the WAL lane still
-//     delivers it — which is the price of not knowing which hash the refused
-//     account carries.
+//     the USERNAME, in the anti-entropy exchange with THAT peer only
+//     (remintScope), and that exchange's sensitive pull refuses any
+//     user_credentials row for the username whose hash differs from the one
+//     this node holds for the account it kept. The peer that holds the re-mint
+//     keeps offering it, so every exchange with it refuses again, including
+//     the first after a restart. The cost is confined to that peer: a genuine
+//     rotation of the account is still repaired from every other peer, and
+//     the WAL lane delivers it as usual. The judgement ends with the exchange;
+//     nothing is remembered across exchanges or peers.
 //     The memory is per process: checkPeer pulls the public lane first, and
 //     withholds user_credentials from the sensitive pull when the public pull
 //     that should have judged the peer's users rows did not complete.
@@ -202,26 +205,47 @@ func (r *Replicator) usersInsertRemintsALiveAdmin(ctx context.Context, tx *sql.T
 type refusedRemints struct {
 	mu     sync.Mutex
 	hashes map[string][]string
-	// unknown holds usernames whose refused users row carried no hash (its
-	// sender had cleared the old column, credentials_clear_v1).
+}
+
+// remintScope is one anti-entropy exchange's memory of the re-minted accounts
+// whose users row carried NO hash (credentials_clear_v1 had cleared it on the
+// sender), so the credential cannot be recognised by value. checkPeer creates
+// one per peer per cycle and hands it to both of that peer's pulls; nil means
+// no exchange (a reseed, a test merge) and judges nothing.
+type remintScope struct {
+	mu      sync.Mutex
 	unknown map[string]bool
+}
+
+func (s *remintScope) noteUnknown(username string) {
+	if s == nil || username == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.unknown == nil {
+		s.unknown = map[string]bool{}
+	}
+	s.unknown[username] = true
+}
+
+func (s *remintScope) hashUnknown(username string) bool {
+	if s == nil || username == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.unknown[username]
 }
 
 const refusedRemintsPerUser = 16
 
 func (m *refusedRemints) note(username, hash string) {
-	if username == "" {
+	if username == "" || hash == "" {
 		return
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if hash == "" {
-		if m.unknown == nil {
-			m.unknown = map[string]bool{}
-		}
-		m.unknown[username] = true
-		return
-	}
 	if m.hashes == nil {
 		m.hashes = map[string][]string{}
 	}
@@ -325,28 +349,18 @@ func withoutRefusedRemints(stmts []Statement, refused map[string]bool) []Stateme
 	return out
 }
 
-// hashUnknown reports whether a re-mint of username was refused with no hash
-// to recognise its credential by.
-func (m *refusedRemints) hashUnknown(username string) bool {
-	if username == "" {
-		return false
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.unknown[username]
-}
-
 // userCredentialOfRefusedRemint is the sensitive lane's check: the incoming
 // user_credentials row carries the hash of a re-minted users row this node
-// refused — or, where the refused row's old column had been cleared, a hash
-// other than the one this node holds for the account it kept.
+// refused — or, where the refused row's old column had been cleared and this
+// is the same exchange with the same peer (table.remints), a hash other than
+// the one this node holds for the account it kept.
 func (c *Client) userCredentialOfRefusedRemint(tx *sql.Tx, table syncTable, row []interface{}) (bool, error) {
 	idx := columnIndexMap(table.Columns)
 	username, hash := cellStr(row, idx, "username"), cellStr(row, idx, "password_hash")
 	if c.remints.refused(username, hash) {
 		return true, nil
 	}
-	if !c.remints.hashUnknown(username) {
+	if !table.remints.hashUnknown(username) {
 		return false, nil
 	}
 	var oldVal string

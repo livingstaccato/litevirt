@@ -2,6 +2,9 @@ package daemon
 
 import (
 	"context"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"testing"
 	"time"
 
@@ -62,5 +65,47 @@ func TestWireCredentialsClearGate_TracksTheDurableLatch(t *testing.T) {
 	if !onDisk() {
 		t.Error("CredentialsClearLatchedOnDisk does not see the marker the checker wrote; " +
 			"`lv user reset-admin` would write the secret into the old column after the clear")
+	}
+}
+
+// TestRunWiresEveryCredentialGate: the gate tests above call the wire
+// functions directly, so they pass with the call deleted from Run. An unwired
+// gate fails closed and looks exactly like a mid-roll. This pins the calls.
+func TestRunWiresEveryCredentialGate(t *testing.T) {
+	assertRunCalls(t, "wireCredentialsSplitGate", "wireCredentialsClearGate", "wireHostMembershipGate")
+}
+
+// assertRunCalls fails unless (*Daemon).Run calls each named method on d.
+func assertRunCalls(t *testing.T, names ...string) {
+	t.Helper()
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "daemon.go", nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	called := map[string]bool{}
+	for _, decl := range f.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Name.Name != "Run" || fn.Recv == nil || fn.Body == nil {
+			continue
+		}
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			if call, ok := n.(*ast.CallExpr); ok {
+				if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
+					if id, ok := sel.X.(*ast.Ident); ok && id.Name == "d" {
+						called[sel.Sel.Name] = true
+					}
+				}
+			}
+			return true
+		})
+	}
+	if len(called) == 0 {
+		t.Fatal("found no (*Daemon).Run in daemon.go")
+	}
+	for _, n := range names {
+		if !called[n] {
+			t.Errorf("(*Daemon).Run does not call d.%s(); the gate it wires stays closed", n)
+		}
 	}
 }

@@ -275,10 +275,28 @@ func EnsureUserShadow(ctx context.Context, db *corrosion.Client, p *Principal, d
 		// Refusing rather than namespacing: a rename would have to carry the row's
 		// RBAC bindings, tokens and sessions with it, and doing that silently
 		// during a login is a larger and more surprising act than declining one.
-		if p.Realm != "local" && existing.PasswordHash != "" {
-			return fmt.Errorf("user %q already exists as a local account; refusing to "+
-				"authenticate it from realm %q, because that would adopt the local account's "+
-				"role — rename one of the two", p.Subject, p.Realm)
+		//
+		// Once credentials_clear_v1 has latched, a local account's users row
+		// carries an EMPTY password_hash and its hash lives in user_credentials,
+		// which anti-entropy can deliver after the users row. An empty hash is
+		// then not proof of anything: UserLocalCredential reads the credential
+		// row, and when it cannot tell, the login is refused rather than guessed.
+		if p.Realm != "local" {
+			local, known, err := corrosion.UserLocalCredential(ctx, db, p.Subject)
+			if err != nil {
+				return fmt.Errorf("check whether %q is a local account: %w", p.Subject, err)
+			}
+			if !known {
+				return fmt.Errorf("user %q exists but its credential has not reached this node yet, "+
+					"so it cannot tell whether it is a local account; refusing to authenticate it "+
+					"from realm %q until it has (retry shortly, or log in through another node)",
+					p.Subject, p.Realm)
+			}
+			if local || existing.PasswordHash != "" {
+				return fmt.Errorf("user %q already exists as a local account; refusing to "+
+					"authenticate it from realm %q, because that would adopt the local account's "+
+					"role — rename one of the two", p.Subject, p.Realm)
+			}
 		}
 		return nil
 	}

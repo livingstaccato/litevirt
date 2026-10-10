@@ -7,6 +7,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/filerestore"
 )
 
 func auditCount(t *testing.T, s *Server, action string) int {
@@ -94,5 +95,76 @@ func TestFileRestoreCondition_RaisedAndResolved(t *testing.T) {
 	s.ReconcileFileRestoreCondition(ctx, nil)
 	if row, ok = get(); !ok || row.Lifecycle != corrosion.ConditionResolved || row.ResolvedAt == "" {
 		t.Fatalf("after the keys were removed: %+v", row)
+	}
+}
+
+// cancelOnDone is a stream whose client goes away as soon as it has the
+// final frame — what a real client does once it has its archive.
+type cancelOnDone struct {
+	progressStream[pb.RestoreBackupFilesChunk]
+	cancel context.CancelFunc
+}
+
+func (c *cancelOnDone) Send(m *pb.RestoreBackupFilesChunk) error {
+	_ = c.progressStream.Send(m)
+	if m.Done {
+		c.cancel()
+	}
+	return nil
+}
+
+// Lab 2: a successful extraction is audited although the client has gone
+// by the time the row is written (its stream context is cancelled).
+func TestFileRestore_AuditedAfterTheClientWentAway(t *testing.T) {
+	s := testServer(t)
+	s.dataDir = t.TempDir()
+	const ts = "2026-10-10T01:00:00Z"
+	s.SetBackupRepos(map[string]string{"r": ctBackup(t, s, ts)})
+	s.setFileRestorer(&fakeRestorer{barriers: "sandbox=on apparmor=on landlock=4 uid=3800000000"}, FileRestoreOptions{})
+	ctx, cancel := context.WithCancel(adminCtx())
+	defer cancel()
+	st := &cancelOnDone{progressStream: progressStream[pb.RestoreBackupFilesChunk]{ctx: ctx}, cancel: cancel}
+	if err := s.RestoreBackupFiles(&pb.RestoreBackupFilesRequest{
+		RepoPath: "r", Name: "box", DiskName: "rootfs", Timestamp: ts, Paths: []string{"/rootfs/root/notes.txt"},
+	}, st); err != nil {
+		t.Fatalf("RestoreBackupFiles: %v", err)
+	}
+	if ctx.Err() == nil {
+		t.Fatal("control: the client never went away")
+	}
+	a := lastAuditRow(t, s, "backup.file_restore")
+	if !a.found || a.result != "ok" || !strings.Contains(a.detail, "landlock=4") || !strings.Contains(a.detail, "paths=/rootfs/root/notes.txt") {
+		t.Fatalf("a successful extraction whose client left: audit row %+v", a)
+	}
+}
+
+// cancellingRestorer's client goes away while its restore VM starts.
+type cancellingRestorer struct {
+	*fakeRestorer
+	cancel context.CancelFunc
+}
+
+func (c *cancellingRestorer) Open(ctx context.Context, dev filerestore.BlockDevice, kind, format string) (fileRestoreConn, error) {
+	conn, err := c.fakeRestorer.Open(ctx, dev, kind, format)
+	c.cancel()
+	return conn, err
+}
+
+// Lab 2: a restore VM started without one of its barriers is audited even
+// when the caller that started it has already gone.
+func TestFileRestore_UnsandboxedAuditedAfterTheClientWentAway(t *testing.T) {
+	s := testServer(t)
+	s.dataDir = t.TempDir()
+	const ts = "2026-10-10T01:00:00Z"
+	s.SetBackupRepos(map[string]string{"r": ctBackup(t, s, ts)})
+	ctx, cancel := context.WithCancel(adminCtx())
+	defer cancel()
+	s.setFileRestorer(&cancellingRestorer{
+		fakeRestorer: &fakeRestorer{barriers: "sandbox=off apparmor=absent landlock=off uid=3800000001", reduced: true},
+		cancel:       cancel,
+	}, FileRestoreOptions{})
+	_, _ = s.ListBackupFiles(ctx, &pb.ListBackupFilesRequest{RepoPath: "r", Name: "box", DiskName: "rootfs", Timestamp: ts})
+	if u := lastAuditRow(t, s, "backup.file_restore_unsandboxed"); !u.found || !strings.Contains(u.detail, "sandbox=off") {
+		t.Fatalf("a restore VM without its barriers, whose caller left: audit row %+v", u)
 	}
 }

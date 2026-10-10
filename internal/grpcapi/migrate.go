@@ -1737,6 +1737,7 @@ func (s *Server) handOffColdFirmwareVM(ctx context.Context, vm *corrosion.VMReco
 	if err != nil {
 		return status.Errorf(codes.Internal, "reassign VM %q and its disks to %s: %v", vm.Name, targetHost.Name, err)
 	}
+	s.reverseReplicationAfterMove(cctx, "vm", vm.Name, "", s.hostName, targetHost.Name)
 	return nil
 }
 
@@ -2358,6 +2359,8 @@ func (s *Server) finishMigrationOnTarget(ctx context.Context, vm *corrosion.VMRe
 	ctx = context.WithoutCancel(ctx)
 	target := f.target.Name
 	s.enqueueMirrorSync(ctx, vm.Name, mirrorOpUpsert)
+	// The VM may now run on its own replica target: replicate back to this host.
+	s.reverseReplicationAfterMove(ctx, "vm", vm.Name, "", s.hostName, target)
 
 	// Re-attach equivalent VFs on the target host for any VFs detached pre-migration.
 	if len(f.detachedVFs) > 0 {

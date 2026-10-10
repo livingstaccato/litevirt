@@ -3333,6 +3333,28 @@ func (c *Coordinator) completeRestore(ctx context.Context, h *corrosion.HostReco
 	slog.Info("failover: container relocated via restore-from-backup", "container", ct.Name, "from", h.Name, "to", target)
 	c.audit(ctx, "ct.relocate.restored", ct.Name, "restored from backup to "+target+" after fencing "+h.Name, "ok")
 	c.noteRootfsStranded(ctx, h.Name, ct, target, "backup-restore")
+	c.reverseContainerReplication(ctx, h.Name, ct, target)
+}
+
+// reverseContainerReplication switches the direction of a relocated container's
+// replication schedule when it landed on its own replica target: the host it left
+// becomes the target (corrosion.ReverseReplicationOnMove). Never fails the
+// relocation; a schedule that cannot be re-pointed is audited as skipped.
+func (c *Coordinator) reverseContainerReplication(ctx context.Context, from string, ct corrosion.ContainerRecord, to string) {
+	revs, err := corrosion.ReverseReplicationOnMove(ctx, c.db, "container", ct.Name, ct.Project, from, to)
+	if err != nil {
+		slog.Warn("failover: could not switch a relocated container's replication direction", "container", ct.Name, "error", err)
+		return
+	}
+	for _, r := range revs {
+		if r.Skipped != "" {
+			c.audit(ctx, "replication.reverse", ct.Name,
+				"container relocated "+from+" -> "+to+" onto its own replica target; could not switch replication back: "+r.Skipped, "skipped")
+			continue
+		}
+		c.audit(ctx, "replication.reverse", ct.Name,
+			"container relocated "+from+" -> "+to+": replication now runs "+to+" -> "+r.ToHost+" ("+r.Repo+")", "ok")
+	}
 }
 
 // imageRecreateOrSkip is the tier-1 path: recreate from a re-pullable image, else
@@ -3444,6 +3466,7 @@ func (c *Coordinator) imageRecreateOrSkip(ctx context.Context, h *corrosion.Host
 	c.audit(ctx, "ct.relocate.recreate", ct.Name,
 		"relocated from "+h.Name+" to "+target+" (recreate from image)", "ok")
 	c.noteRootfsStranded(ctx, h.Name, ct, target, "image-recreate")
+	c.reverseContainerReplication(ctx, h.Name, ct, target)
 }
 
 // pickContainerTarget chooses a survivor via the placement engine, falling back

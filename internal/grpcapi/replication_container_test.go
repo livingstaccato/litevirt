@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -283,5 +284,27 @@ func TestRunContainerReplication_RefusesItsOwnHostAndAnInactiveTarget(t *testing
 	other.TargetHost = "host-b"
 	if err := s.runContainerReplication(context.Background(), other, time.Now()); err != nil {
 		t.Fatalf("a container this host does not hold is not an error: %v", err)
+	}
+}
+
+// Reversing a schedule onto the host a workload left puts new replicas there; it
+// must never replace a copy that host already holds. A replica is published
+// no-clobber, so a second write of the same replica fails and the first stands.
+func TestPublishRecordedReplica_NeverReplacesAnExistingReplica(t *testing.T) {
+	dir := t.TempDir()
+	rec := newReplicaRecord("_default", "web", "root", "sched", "20260101-000000", "qcow2")
+	write := func(content string) func(string) error {
+		return func(tmp string) error { return os.WriteFile(tmp, []byte(content), 0o644) }
+	}
+	path, err := publishRecordedReplica(context.Background(), dir, rec, write("the newer copy"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := publishRecordedReplica(context.Background(), dir, rec, write("an older copy")); err == nil {
+		t.Fatal("a second replica with the same name must be refused, not written over the first")
+	}
+	got, _ := os.ReadFile(path)
+	if string(got) != "the newer copy" {
+		t.Fatalf("the existing replica was overwritten: %q", got)
 	}
 }

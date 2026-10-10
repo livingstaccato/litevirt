@@ -29,6 +29,8 @@ A notification has a `kind` (verb.noun), `severity` (`info` | `warn` | `error`),
 | `backup.failed` | error | a `lv backup snapshot` / scheduled backup fails |
 | `host.fenced` | error / warn | the failover coordinator fences a host (warn = partial/manual) |
 | `replication.failed` | error | a scheduled replication run fails |
+| `replication.reversed` | info | a replicated VM or container moved onto its replica host and its schedule now replicates back to the host it left (docs/backups.md, "Reverse replication") |
+| `replication.reverse_skipped` | warn | the same move, but the host it left could not be made the target; the workload is replicating onto its own host until the schedule is replaced |
 | `host.security_updates` | warn | a host has pending OS security updates (docs/upgrades.md, "Pending OS updates"); sent when the counts change |
 | `host.updates` | info | a host has pending OS package updates, none of them security |
 | `ha.vip.no_holder` | error | a configured VIP is served by nobody (VIP HA enabled) — a VIP outage |

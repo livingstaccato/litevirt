@@ -854,9 +854,10 @@ lv replication schedule add <vm> --target-pool <pool> --cron "0 */4 * * *"
   [--incremental]          # transfer only dirty extents (raw replicas)
   [--auto-promote]         # failover may promote the freshest replica on host loss
   [--disabled]             # create the schedule disabled
-  [--scope vm|pool|cluster|project] [--pool-name <p>] [--project-name <p>]
+  [--scope vm|pool|cluster|project|container] [--pool-name <p>] [--project-name <p>]
+  [--container]            # a container: --target-host is the peer, --target-pool the backup repo on it
 lv replication schedule ls
-lv replication schedule rm <vm> --target-pool <pool> [--scope ...] [--pool-name <p>] [--project-name <p>]
+lv replication schedule rm <vm> --target-pool <pool> [--scope ...] [--container] [--pool-name <p>] [--project-name <p>]
 
 # Disaster recovery: bring a VM up from its replica.
 lv replication promote <vm>

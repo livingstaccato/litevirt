@@ -56,6 +56,7 @@ go test ./tests/e2e/ -v -timeout 10m -run TestError
 | `E2E_HOSTS` | (auto-detected) | Comma-separated host names |
 | `E2E_REST_URL` | `http://<first-host>:7446` | REST API base URL |
 | `E2E_REST_TOKEN` | (skip REST tests) | API token for REST tests |
+| `LV_E2E_DR_REPO` | (skip container replication test) | A backup repo name the second host has in `backup_repos`, initialised, to hold container replicas (`container_replication_test.go`). |
 | `E2E_SKIP_SLOW` | `0` | Set to `1` to skip migration/backup tests |
 
 ## Test phases

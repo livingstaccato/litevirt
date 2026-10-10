@@ -320,4 +320,60 @@ func TestContainerReplication_FencedHostsContainerComesUpOnTheReplicaHost(t *tes
 	if got := replicaHost.CT.Payload(name); got != "replicated-state" {
 		t.Fatalf("replica host payload = %q, want the replica's bytes (a recreate would be empty)", got)
 	}
+	// The container now runs on its replica target: the schedule replicates back to
+	// the host it left, rather than leaving it replicating onto itself.
+	if got := scheduleTarget(t, replicaHost, corrosion.ContainerScheduleKey(name), "dr"); got != victim.Name {
+		t.Fatalf("after the failover the schedule targets %q, want the host the container left, %q", got, victim.Name)
+	}
+}
+
+// A planned move onto the replica host switches the direction, the next replica
+// travels the other way with the container's bytes, and moving back switches it
+// again. The chunk store is what makes the reversed direction cheap: it sends only
+// what the target lacks.
+func TestContainerReplication_MigrateThereAndBackFollowsTheContainer(t *testing.T) {
+	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	a, b := c.Nodes[0], c.Nodes[1]
+	ctx := context.Background()
+	const name = "web"
+	replCT(t, c, a, name)
+	repoA := drRepo(t, a)
+	repoB := drRepo(t, b)
+	// drRepo registered "dr" on each node separately; both exist.
+	sched := ctSchedule(t, c, a, name, b.Name, 3, true)
+	a.CT.Seed(name, "on-a")
+	if err := a.Server.RunReplication(ctx, sched, time.Now().UTC().Add(-3*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	key := corrosion.ContainerScheduleKey(name)
+
+	if err := runMigrate(t, c, a, b, name, stagingRepo(t)); err != nil {
+		t.Fatalf("migrate a->b: %v", err)
+	}
+	if got := scheduleTarget(t, b, key, "dr"); got != a.Name {
+		t.Fatalf("after a->b the container's replica belongs on a, schedule says %q", got)
+	}
+	// The next run, from b, lands on a.
+	b.CT.Seed(name, "on-b")
+	rows, _ := corrosion.ListBackupSchedules(ctx, b.DB)
+	var onB corrosion.BackupScheduleRecord
+	for _, r := range rows {
+		if r.VMName == key {
+			onB = r
+		}
+	}
+	if err := b.Server.RunReplication(ctx, onB, time.Now().UTC().Add(-2*time.Minute)); err != nil {
+		t.Fatalf("replicate b->a: %v", err)
+	}
+	if ms := replicas(t, repoA, name); len(ms) != 1 {
+		t.Fatalf("a's repo holds %d replicas after the reversed run, want 1", len(ms))
+	}
+	_ = repoB
+
+	if err := runMigrate(t, c, b, a, name, stagingRepo(t)); err != nil {
+		t.Fatalf("migrate b->a (failback): %v", err)
+	}
+	if got := scheduleTarget(t, a, key, "dr"); got != b.Name {
+		t.Fatalf("after the failback the replica belongs on b again, schedule says %q", got)
+	}
 }

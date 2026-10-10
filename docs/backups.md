@@ -387,6 +387,91 @@ two weeks and an hour. When the schedule cannot be read the bound is 48 hours.
 not bounded: an operator who has seen the age and chosen it anyway is making a
 different decision.
 
+### Container replication
+
+`lv replication schedule add <container> --container` replicates a container
+the way a VM schedule replicates a disk. A container has no storage pool, so
+`--target-host` names the peer that holds the replica and `--target-pool` the
+backup repo on it: a logical repo name that peer has in its `backup_repos`
+config (or a repo registered cluster-wide). Use a repo kept for replicas.
+
+```bash
+lv replication schedule add web --container --cron "0 * * * *" \
+    --target-host hostB --target-pool dr --keep 3 --auto-promote
+lv replication schedule ls            # a container shows as ct:web
+lv replication schedule rm web --container --target-pool dr
+```
+
+Each run archives the container on its host, frozen while it is archived (a
+freeze that is unavailable leaves the replica crash-consistent, as for a
+backup), and streams it to the peer over the chunk store container backups,
+migrations and failover relocations already use, so a run sends only the chunks
+the peer does not hold. The peer keeps the newest `--keep` replicas of that
+container in that repo and removes the rest. A replica is a backup manifest
+marked as a replica: it is never a second running copy, and nothing else in the
+repo (a backup, another container's replica) is pruned by it. Reclaim the
+chunks with the repo's usual GC.
+
+A replica is ordered by the container's **ownership generation**, not by the
+clocks of the hosts that wrote it: the target refuses a replica of an earlier
+generation than one it holds, or an older one from the same host and
+generation, so the newer copy is never replaced by an older one; and a new
+generation (or the same generation from another host, after the container
+moved) removes the replicas it supersedes. The command refuses a target that is
+the container's own host, is not active, cannot run containers, or has no such
+repo; `--auto-promote` additionally needs the container to have a host-failure
+policy (`on_host_failure`), since failover never moves one without it.
+`--incremental` is for VM disks and is refused.
+
+**Promotion.** When a container's host is fenced, the failover coordinator
+places a container whose schedule has `--auto-promote` on the replica host when
+placement accepts it, and restores the newest replica there, through the same
+restore-relocation as a restore from backup: the same relocation proof, recovery
+claim and single-use token, so one copy exists at every moment. It restores the
+replica when it is newer than the newest backup it can reach, or when there is no
+backup. Like a VM, a replica older than two of the schedule's longest intervals
+plus an hour is not promoted automatically; the container then falls back to the
+backup or image-recreate path as if there were no replica. The schedule row's
+container is found by name and project; a name that exists in two projects needs
+`--project-name`.
+
+### Reverse replication
+
+After a replicated workload moves onto the host that holds its replica, the
+schedule replicates the other way: the host it left becomes the target. This
+happens when the VM is promoted from its replica (by failover or
+`lv replication promote`), when a VM is migrated or drained onto its replica
+host, when a container is relocated by failover or migrated onto its replica
+host, and again when it moves back (failback), so the direction follows the
+workload. The `replication.reversed` event (and a `replication.reverse` audit
+row) records each switch.
+
+Only a schedule with an **explicit `--target-host` equal to the host the
+workload moved onto** is switched. A schedule with no target host (a shared
+pool, or an auto-selected peer) already replicates away from wherever the
+workload runs; a schedule that targets a third host stays as it is; and a pool,
+project or cluster schedule is shared by many workloads, so none is re-pointed
+for one of them (a workload that lands on such a schedule's target host gets a
+same-host copy, as before).
+
+The switch changes only the target host. For a VM the incremental checkpoint of
+the old direction is dropped, since its dirty-bitmap anchor lives on the old
+source's disk: the first run in the new direction is a full push even on an
+`--incremental` schedule, and later ones are incremental again. A container
+needs no such step; the chunk store sends only what the target lacks, so a
+reversed run costs what has changed, not the whole container. Nothing on the old
+host is read, written or removed by the switch: replicas are only ever added
+there as new files, written without replacing an existing one, so a copy it
+holds (including the disk a failover set aside) is never overwritten by an
+older one.
+
+When the old host cannot be the target (it has no pool of that name, cannot run
+containers, or is gone), the schedule is left as it was and
+`replication.reverse_skipped` (warn) says so: the workload is then replicating
+onto its own host, which protects nothing, until the schedule is replaced. When
+the old host is simply down after a failover, the schedule is switched anyway and
+reports the missing target (`replication.failed`) on each run until it returns.
+
 ## Live restore
 
 `lv backup restore-live` exposes a manifest as an NBD source so a VM

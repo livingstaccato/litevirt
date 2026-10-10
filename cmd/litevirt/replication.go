@@ -38,10 +38,10 @@ func newReplicationScheduleCmd() *cobra.Command {
 func newReplicationScheduleAddCmd() *cobra.Command {
 	var cron, targetPool, targetHost, scope, poolName, projectName string
 	var keepReplicas int32
-	var disabled, incremental, autoPromote bool
+	var disabled, incremental, autoPromote, container bool
 	cmd := &cobra.Command{
-		Use:   "add <vm>",
-		Short: "Add or replace a replication schedule for a VM",
+		Use:   "add <vm|container>",
+		Short: "Add or replace a replication schedule for a VM or container",
 		Long: `Replicate a VM's disk to target-pool on a cron schedule, keeping the newest
 --keep point-in-time copies. The target is an explicit --target-host, a shared
 pool (nfs/ceph/iscsi), or — when neither — an auto-selected healthy peer with
@@ -49,9 +49,25 @@ the pool.
 
 --incremental transfers only dirty extents (raw replicas; full-copy fallback for
 a stopped VM or old libvirt). --auto-promote lets failover bring up the freshest
-replica if the VM's host is lost.`,
+replica if the VM's host is lost.
+
+--container replicates a container instead. A container has no storage pool, so
+--target-host names the peer that holds the replica and --target-pool the backup
+repo on it (a logical repo name that peer has in its backup_repos). The
+container is archived frozen and only the chunks the peer lacks are sent. With
+--auto-promote, failover restores the newest replica on that peer if the
+container's host is lost, through the same recovery claim as a restore from
+backup; the container needs a host-failure policy. --project-name picks the
+container when the name exists in more than one project.
+
+After a promotion, a failover or a migrate onto the replica host, the schedule
+replicates back to the host the workload left (docs/backups.md, "Reverse
+replication").`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if container {
+				scope = "container"
+			}
 			if scope == "" {
 				scope = "vm"
 			}
@@ -72,15 +88,16 @@ replica if the VM's host is lost.`,
 		},
 	}
 	cmd.Flags().StringVar(&cron, "cron", "", `5-field cron expression (e.g. "0 */4 * * *")`)
-	cmd.Flags().StringVar(&targetPool, "target-pool", "", "destination storage pool")
+	cmd.Flags().BoolVar(&container, "container", false, "the schedule is for a container (same as --scope container)")
+	cmd.Flags().StringVar(&targetPool, "target-pool", "", "destination storage pool (a container: the backup repo on --target-host)")
 	cmd.Flags().StringVar(&targetHost, "target-host", "", "explicit destination host (else shared-pool/auto peer)")
 	cmd.Flags().Int32Var(&keepReplicas, "keep", 0, "keep N newest replicas (0 = keep all)")
 	cmd.Flags().BoolVar(&incremental, "incremental", false, "transfer only dirty extents (raw replicas)")
 	cmd.Flags().BoolVar(&autoPromote, "auto-promote", false, "failover may promote the freshest replica on host loss")
 	cmd.Flags().BoolVar(&disabled, "disabled", false, "create the schedule disabled")
-	cmd.Flags().StringVar(&scope, "scope", "vm", "schedule scope: vm | pool | cluster | project")
+	cmd.Flags().StringVar(&scope, "scope", "vm", "schedule scope: vm | pool | cluster | project | container")
 	cmd.Flags().StringVar(&poolName, "pool-name", "", "pool name (scope=pool)")
-	cmd.Flags().StringVar(&projectName, "project-name", "", "project name (scope=project)")
+	cmd.Flags().StringVar(&projectName, "project-name", "", "project name (scope=project, or the container's project)")
 	_ = cmd.MarkFlagRequired("cron")
 	_ = cmd.MarkFlagRequired("target-pool")
 	return cmd
@@ -103,8 +120,12 @@ func newReplicationScheduleListCmd() *cobra.Command {
 				fmt.Printf("%-18s %-12s %-10s %-5s %-5s %-4s %-20s %s\n",
 					"VM", "POOL", "HOST", "INCR", "AUTO", "KEEP", "LAST RUN", "LAST ERR")
 				for _, s := range resp.Schedules {
+					name := s.VmName
+					if s.Scope == "container" {
+						name = "ct:" + name
+					}
 					fmt.Printf("%-18s %-12s %-10s %-5v %-5v %-4d %-20s %s\n",
-						s.VmName, s.TargetPool, defaultStr(s.TargetHost, "-"), s.Incremental, s.AutoPromote,
+						name, s.TargetPool, defaultStr(s.TargetHost, "-"), s.Incremental, s.AutoPromote,
 						s.KeepReplicas, defaultStr(s.LastRunAt, "-"), defaultStr(s.LastRunErr, "-"))
 				}
 				return nil
@@ -115,11 +136,15 @@ func newReplicationScheduleListCmd() *cobra.Command {
 
 func newReplicationScheduleRmCmd() *cobra.Command {
 	var targetPool, scope, poolName, projectName string
+	var container bool
 	cmd := &cobra.Command{
-		Use:   "rm <vm>",
+		Use:   "rm <vm|container>",
 		Short: "Remove a replication schedule",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if container {
+				scope = "container"
+			}
 			if scope == "" {
 				scope = "vm"
 			}
@@ -135,7 +160,8 @@ func newReplicationScheduleRmCmd() *cobra.Command {
 			})
 		},
 	}
-	cmd.Flags().StringVar(&targetPool, "target-pool", "", "destination pool (required to disambiguate)")
+	cmd.Flags().BoolVar(&container, "container", false, "the schedule is for a container (same as --scope container)")
+	cmd.Flags().StringVar(&targetPool, "target-pool", "", "destination pool, or a container's backup repo (required to disambiguate)")
 	cmd.Flags().StringVar(&scope, "scope", "vm", "schedule scope")
 	cmd.Flags().StringVar(&poolName, "pool-name", "", "pool name (scope=pool)")
 	cmd.Flags().StringVar(&projectName, "project-name", "", "project name (scope=project)")

@@ -176,12 +176,20 @@ func (r *Replicator) usersInsertRemintsALiveAdmin(ctx context.Context, tx *sql.T
 //     row is simply not part of what the entry wrote here.
 //   - Anti-entropy carries the users row on the public lane and its
 //     credential on the sensitive lane, in separate pulls with nothing to pair
-//     them by entry. Every writer puts the same hash in users.password_hash
-//     and user_credentials (dual-write; the old column is never cleared), so a
+//     them by entry. Until credentials_clear_v1 latches every writer puts the
+//     same hash in users.password_hash and user_credentials (dual-write), so a
 //     refused users row names the credential that belongs to it by VALUE. The
 //     refusal is remembered (refusedRemints) and the sensitive lane refuses a
 //     user_credentials row carrying a remembered hash. A rotation of the SAME
 //     account has the same created_at, is never refused, and keeps repairing.
+//     Once the re-minting node has latched credentials_clear_v1 its users row
+//     carries '' and names no credential. The refusal is then remembered for
+//     the USERNAME, and the sensitive lane refuses any user_credentials row for
+//     it whose hash differs from the one this node holds for the account it
+//     kept. That also holds back an anti-entropy repair of a genuine rotation
+//     of that account for the life of the process — the WAL lane still
+//     delivers it — which is the price of not knowing which hash the refused
+//     account carries.
 //     The memory is per process: checkPeer pulls the public lane first, and
 //     withholds user_credentials from the sensitive pull when the public pull
 //     that should have judged the peer's users rows did not complete.
@@ -194,16 +202,26 @@ func (r *Replicator) usersInsertRemintsALiveAdmin(ctx context.Context, tx *sql.T
 type refusedRemints struct {
 	mu     sync.Mutex
 	hashes map[string][]string
+	// unknown holds usernames whose refused users row carried no hash (its
+	// sender had cleared the old column, credentials_clear_v1).
+	unknown map[string]bool
 }
 
 const refusedRemintsPerUser = 16
 
 func (m *refusedRemints) note(username, hash string) {
-	if username == "" || hash == "" {
+	if username == "" {
 		return
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if hash == "" {
+		if m.unknown == nil {
+			m.unknown = map[string]bool{}
+		}
+		m.unknown[username] = true
+		return
+	}
 	if m.hashes == nil {
 		m.hashes = map[string][]string{}
 	}
@@ -307,12 +325,43 @@ func withoutRefusedRemints(stmts []Statement, refused map[string]bool) []Stateme
 	return out
 }
 
+// hashUnknown reports whether a re-mint of username was refused with no hash
+// to recognise its credential by.
+func (m *refusedRemints) hashUnknown(username string) bool {
+	if username == "" {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.unknown[username]
+}
+
 // userCredentialOfRefusedRemint is the sensitive lane's check: the incoming
 // user_credentials row carries the hash of a re-minted users row this node
-// refused.
-func (c *Client) userCredentialOfRefusedRemint(table syncTable, row []interface{}) bool {
+// refused — or, where the refused row's old column had been cleared, a hash
+// other than the one this node holds for the account it kept.
+func (c *Client) userCredentialOfRefusedRemint(tx *sql.Tx, table syncTable, row []interface{}) (bool, error) {
 	idx := columnIndexMap(table.Columns)
-	return c.remints.refused(cellStr(row, idx, "username"), cellStr(row, idx, "password_hash"))
+	username, hash := cellStr(row, idx, "username"), cellStr(row, idx, "password_hash")
+	if c.remints.refused(username, hash) {
+		return true, nil
+	}
+	if !c.remints.hashUnknown(username) {
+		return false, nil
+	}
+	var oldVal string
+	var credKey, credVal sql.NullString
+	err := tx.QueryRow(
+		`SELECT u.password_hash, c.username, c.password_hash
+		   FROM users u LEFT JOIN user_credentials c ON c.username = u.username AND c.deleted_at IS NULL
+		  WHERE u.username = ?`, username).Scan(&oldVal, &credKey, &credVal)
+	if err == sql.ErrNoRows {
+		return true, nil // no account of ours to compare with: refuse, never guess
+	}
+	if err != nil {
+		return false, err
+	}
+	return hash != resolveCredential(credKey.Valid, credVal.String, oldVal), nil
 }
 
 // noteRemintCredentialRefused records a refused credential on the shared merge

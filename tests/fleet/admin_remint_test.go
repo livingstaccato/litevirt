@@ -183,3 +183,49 @@ func TestFleet_AdminRemint_AntiEntropyHoldsCredentialsWhileUsersAreUnjudged(t *t
 	corrosion.NewAntiEntropy(a.DB, a.PKIDir, 0).RunOnce(ctx)
 	assertAdminHash(t, a, "after a pass that judged the peer's users rows")
 }
+
+// Once credentials_clear_v1 has latched on the re-minting node, its users row
+// carries an empty password_hash, so the refused row no longer names its
+// credential by value. The sensitive lane must still refuse the re-minted
+// account's credential: it differs from the account this node holds.
+func TestFleet_AdminRemint_AntiEntropyRefusesAClearedRemintsCredential(t *testing.T) {
+	c, a, b := remintCluster(t, true)
+	b.DB.SetCredentialsClearGate(func() bool { return true })
+	c.SetLinkFault(b, a, LinkFault{Block: true})
+	remintAdminOn(t, b)
+	if got := oldColumnOf(t, b, `SELECT password_hash FROM users WHERE username = 'admin'`); got != "" {
+		t.Fatalf("%s re-minted with password_hash %q; the scenario needs the cleared form", b.Name, got)
+	}
+
+	ctx := context.Background()
+	for i := 0; i < 2; i++ {
+		corrosion.NewAntiEntropy(a.DB, a.PKIDir, 0).RunOnce(ctx)
+		assertAdminHash(t, a, "after anti-entropy from a re-minting peer that clears its old columns")
+	}
+}
+
+// The control for the cleared form: a rotation of the SAME account by a node
+// that clears its old columns still repairs by anti-entropy alone.
+func TestFleet_AdminRemint_AntiEntropyStillRepairsAClearedRotation(t *testing.T) {
+	c, a, b := remintCluster(t, true)
+	a.DB.SetCredentialsClearGate(func() bool { return true })
+	b.DB.SetCredentialsClearGate(func() bool { return true })
+	c.SetLinkFault(b, a, LinkFault{Block: true})
+	if err := corrosion.UpdateUserPassword(context.Background(), b.DB, "admin", "rotated-hash"); err != nil {
+		t.Fatalf("rotate on %s: %v", b.Name, err)
+	}
+	corrosion.NewAntiEntropy(a.DB, a.PKIDir, 0).RunOnce(context.Background())
+	u, err := corrosion.GetUser(context.Background(), a.DB, "admin")
+	if err != nil || u == nil || u.PasswordHash != "rotated-hash" {
+		t.Fatalf("%s serves %+v (err %v) after anti-entropy, want the rotated hash", a.Name, u, err)
+	}
+}
+
+func oldColumnOf(t *testing.T, n *Node, query string) string {
+	t.Helper()
+	rows, err := n.DB.Query(context.Background(), query)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("%s: %q: rows=%d err=%v", n.Name, query, len(rows), err)
+	}
+	return rows[0].String("password_hash")
+}

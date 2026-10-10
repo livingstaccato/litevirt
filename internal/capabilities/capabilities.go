@@ -133,6 +133,33 @@ const (
 	// stored, not a policy.
 	CredentialsSplitV1 = "credentials_split_v1"
 
+	// CredentialsClearV1 is the second step of the secret-column move
+	// (docs/design/credentials-clear.md, colonelpanik/litevirt#268): once it
+	// has durably latched, hosts.ipmi_pass, users.password_hash and
+	// tokens.token_hash are EMPTIED, so the public rows and the operator-safe
+	// state dump stop carrying secrets. Writers write the credential row and ''
+	// in the old column, in the statement shapes the previous build already
+	// decodes, and the split pass clears what is left, re-emitting the
+	// credential row ahead of each clear in one batch.
+	//
+	// It states a fact about the BINARY, which is why it is mandatory and has
+	// no config flag: this build never needs the old column to find a secret.
+	// Its readers take the credential row whenever one exists, and so does the
+	// build before it (credentials_split_v1), which is the build a rollback
+	// lands on. A flag would only stop the latch forming
+	// (driveCapabilityLatches skips a flag-off token that has not latched), and
+	// the secrets would stay in the public dump.
+	//
+	// The claim must hold of every host still RECEIVING replication, not
+	// merely of every host that votes, so the token is in replicationGated: a
+	// host parked in `maintenance` on a build that reads only the old columns
+	// still receives the clears and still serves logins once it returns.
+	//
+	// The clear needs credentials_split_v1 as well: Client.MayClearCredentialColumns
+	// requires both gates, so a node never empties an old column before it is
+	// writing the credential tables.
+	CredentialsClearV1 = "credentials_clear_v1"
+
 	// HostMembershipSplitV1 gates moving a host's coordinator-owned membership
 	// facts — hosts.state and hosts.isolation_epoch/isolation_reason — out of
 	// the shared `hosts` row into host_membership, a row of their own with its
@@ -742,6 +769,18 @@ const (
 //     comes with a second token in a later one
 //     (docs/design/credentials-clear.md).
 //
+//   - credentials_clear_v1 has no stand-down either, and it is the one step
+//     of the secret move that is not undone by upgrading again: once it has
+//     latched, every node empties hosts.ipmi_pass, users.password_hash and
+//     tokens.token_hash. A binary rolled back one build, to
+//     credentials_split_v1, enters WAL quarantine like any rollback below a
+//     latched token, and still reads every secret, because that build reads
+//     the credential row whenever one exists and the clearing build keeps
+//     writing them. A binary rolled back TWO builds, below
+//     credentials_split_v1, reads only the old columns and finds nothing;
+//     that rollback is unsupported once this token has latched
+//     (docs/upgrades.md).
+//
 //   - host_membership_split_v1 has no stand-down either, and the same
 //     rollback shape as credentials_split_v1: a binary rolled back below it
 //     enters WAL quarantine, and cannot decode the host_membership statements
@@ -851,6 +890,10 @@ var supported = []string{
 	// be able to misreport, and a flag would keep the latch from forming on a
 	// fully rolled fleet.
 	CredentialsSplitV1,
+	// CredentialsClearV1 is advertised UNCONDITIONALLY: it says "this build
+	// never needs the old secret columns to find a secret", a fact about the
+	// binary.
+	CredentialsClearV1,
 	// HostMembershipSplitV1 is advertised UNCONDITIONALLY, for the same reason:
 	// it says "this build decodes host_membership's statement shapes and reads
 	// state and isolation from it", a fact about the binary.
@@ -901,7 +944,7 @@ var supported = []string{
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, FenceStateV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, CredentialsClearV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, FenceStateV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {
@@ -944,8 +987,13 @@ var replicationGated = map[string]bool{
 	// Confirmed against every replication recipient: the
 	// credential tables' shapes must be decodable by every host we stream to —
 	// a maintenance host on the previous build still receives every statement.
-	// (The old-column clear that also needs this is a later release's token.)
+	// (The old-column clear that also needs this is credentials_clear_v1.)
 	CredentialsSplitV1: true,
+	// Confirmed against every replication recipient: the clear must not reach
+	// a host that still reads only the old columns — a maintenance host on a
+	// build before credentials_split_v1 serves logins and fences once it
+	// returns to service.
+	CredentialsClearV1: true,
 	// Confirmed against every replication recipient: host_membership's shapes
 	// must be decodable by every host we stream to, a maintenance host on the
 	// previous build included.
@@ -998,6 +1046,9 @@ var mandatory = map[string]bool{
 	// not a policy. See CredentialsSplitV1 for why a flag would leave the
 	// secrets in the public dump forever.
 	CredentialsSplitV1: true,
+	// A fact about the binary (it never needs the old secret columns), not a
+	// policy. See CredentialsClearV1 and its stand-down note above `supported`.
+	CredentialsClearV1: true,
 	// A fact about the binary (it decodes and reads host_membership), not a
 	// policy. See HostMembershipSplitV1.
 	HostMembershipSplitV1: true,

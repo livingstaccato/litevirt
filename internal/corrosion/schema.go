@@ -2726,8 +2726,8 @@ var schemaDDL = []string{
 	// v56 credential tables — the secret halves of hosts, users and tokens,
 	// carried only by the peer-only sensitive lane (sensitiveTableNames). The
 	// public rows keep their old secret column, dual-written after
-	// credentials_split_v1 latches and cleared only by a later release; see
-	// credentials_split.go. Keyed on the
+	// credentials_split_v1 latches and emptied once credentials_clear_v1 has
+	// latched too; see credentials_split.go. Keyed on the
 	// parent's primary key, one row per parent. updated_at is the LWW key and,
 	// for a row the backfill wrote, it is the PARENT row's updated_at, so every
 	// node that backfills the same parent writes the same row.

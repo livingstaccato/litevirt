@@ -527,10 +527,10 @@ secrets to `host_fence_credentials`, `user_credentials` and
 `token_credentials`, which only the sensitive lane below carries. This release
 keeps writing the three old columns too, so a host still reading only those
 columns (one on the previous release, including one rolled back and under WAL
-quarantine) reads current secrets. The state dump therefore **still carries
-the secrets**. Clearing the old columns, after which the dump carries none, is a
-later release's step (see
-[upgrades.md](upgrades.md#secrets-move-to-the-sensitive-lane-after-the-roll) and
+quarantine) reads current secrets, and the state dump **still carries the
+secrets**. Once every host runs a build carrying `credentials_clear_v1` as
+well, the old columns are emptied and the dump carries none (see
+[upgrades.md](upgrades.md#the-old-secret-columns-are-emptied) and
 [design/credentials-clear.md](design/credentials-clear.md)).
 All three RPCs stay peer-only regardless: only a **peer** or **local-root**
 caller (a cluster host certificate) can read them. An operator or admin bearer,

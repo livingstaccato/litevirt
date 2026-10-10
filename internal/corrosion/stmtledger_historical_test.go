@@ -108,6 +108,10 @@ import (
 // instead). They moved from the current ledger to the credentials_split_clear_v56
 // family, receive-only, for a host still on that build. An ADDITION; no
 // previously accepted historical identity was removed or changed.
+// Not updated for credentials_clear_v1, which emits the users/tokens/hosts
+// clears again: their fingerprints moved from the historical ledger file back
+// to the generated one, while the credentials_split_clear_v56 family and its
+// identities in HistoricalShapes are unchanged, so this digest is too.
 // Updated again when VM create started recording each disk's bus: the create's
 // narrow vm_disks INSERT moved from the current ledger to the
 // vm_disks_create_insert_v130 family, receive-only, for peers that still create

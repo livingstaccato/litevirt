@@ -355,12 +355,19 @@ func HistoricalShapes() []HistoricalShape {
 	// The old-column clears of the first credentials_split_v1 build (fork
 	// b1c95566 through 53341a75, unreleased), which emptied
 	// users.password_hash and tokens.token_hash once the split had latched. The
-	// current tree dual-writes instead and never clears in this release
-	// (docs/design/credentials-clear.md). A host still on that build — the lab
+	// dual-write build that followed never cleared; the clear came back behind
+	// credentials_clear_v1 (docs/design/credentials-clear.md). A host still on
+	// that first build — the lab
 	// ran it — emits these during the roll onto this one, and dropping them
 	// would back-pressure its stream; they are receive-only here and LWW-gated
 	// like any full-PK update. (The hosts.ipmi_pass clear is the same shape as
 	// configure_host_v130's ipmi_pass-only variant, already above.)
+	//
+	// credentials_clear_v1 emits all three clears again, so their fingerprints
+	// are back in the generated ledger and the historical ledger file no longer
+	// lists them (the generator drops a shape the current tree emits). The
+	// family stays here, unchanged, so a later build that stops clearing still
+	// recognises them from the builds that did.
 	for _, sql := range []string{
 		`UPDATE users SET password_hash = ?, updated_at = ? WHERE username = ?`,
 		`UPDATE tokens SET token_hash = ?, updated_at = ? WHERE id = ?`,

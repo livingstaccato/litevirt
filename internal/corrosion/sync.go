@@ -340,12 +340,13 @@ type syncTable struct {
 // secret-bearing tables stay out of this list (see sensitiveTableNames). Three
 // tables here still have a secret COLUMN — hosts.ipmi_pass,
 // users.password_hash, tokens.token_hash. Once credentials_split_v1 has latched
-// the value also lives in a sensitive credential table, but this release keeps
-// writing the old column too so a host rolled back one release can still read
-// it; clearing it is a later release's step (credentials_split.go,
-// docs/design/credentials-clear.md). So the dump still carries them
-// unredacted, because it is the repair representation, which is one reason
-// GetStateDump/StreamStateDump are peer-only (host certificate).
+// the value also lives in a sensitive credential table, and the old column is
+// dual-written so a host on the build before can still read it. Once
+// credentials_clear_v1 has latched too, the old columns are emptied
+// (credentials_split.go, docs/design/credentials-clear.md) and the dump stops
+// carrying them. Until then it carries them unredacted, because it is the
+// repair representation, which is one reason GetStateDump/StreamStateDump are
+// peer-only (host certificate).
 var tableNames = []string{
 	"cluster", "hosts", "host_labels", "host_health",
 	"health_conditions", "health_evaluator_status", "host_capacity_observations",
@@ -1039,10 +1040,17 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 		}
 		// ...and the credential that belongs to a refused re-mint, which this
 		// lane carries apart from its users row (users_admin_guard.go).
-		if table.Name == "user_credentials" && c.userCredentialOfRefusedRemint(table, row) {
-			skipped++
-			c.deferAfterCommit(tx, func() { c.noteRemintCredentialRefused(pathAE) })
-			continue
+		if table.Name == "user_credentials" {
+			refused, rErr := c.userCredentialOfRefusedRemint(tx, table, row)
+			if rErr != nil {
+				_ = tx.Rollback()
+				return merged, skipped, rErr
+			}
+			if refused {
+				skipped++
+				c.deferAfterCommit(tx, func() { c.noteRemintCredentialRefused(pathAE) })
+				continue
+			}
 		}
 		// Natural-key identity resolution: for an identity table, resolve by the UNIQUE
 		// natural key (deterministic winner over the group), not the minted random id, so two

@@ -4,6 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
+
+	"github.com/litevirt/litevirt/internal/hlc"
 )
 
 // Secret columns on the sensitive lane (colonelpanik/litevirt#268).
@@ -38,12 +41,27 @@ import (
 // SplitCredentials copies an old-column value only where the credential table
 // has no row for it, and never touches the old column. So a host rolled
 // back to the previous release — which reads only the old column — still finds
-// every current secret there.
+// every current secret there. That lasts until credentials_clear_v1 latches
+// (CLEARING, below).
 //
-// Clearing the old columns is the NEXT release's step, behind a second
-// mandatory, ReplicationGated token (docs/design/credentials-clear.md). A
-// rollback from that release lands on this one, which already reads the
-// credential tables. Nothing in this release clears an old column.
+// CLEARING (credentials_clear_v1, docs/design/credentials-clear.md). Once a
+// second mandatory, ReplicationGated token has durably latched as well, the old
+// columns are emptied:
+//
+//   - every writer writes the credential row and '' in the old column, in the
+//     same statement shapes as before (oldColumnValue);
+//   - the split pass, for every parent row whose old column still holds a
+//     value, re-emits the credential row (copying the old value only where no
+//     live credential row exists) and clears the old column, in ONE batch, so
+//     this node's stream always carries the value ahead of the clear;
+//   - the clear is stamped just past the parent row's own updated_at, never
+//     with a fresh clock (clearTS).
+//
+// Readers need no change: they take the credential row whenever one exists,
+// and absorb never takes an empty value. A host rolled back one build lands on
+// the dual-write build, which reads the credential rows the same way. The
+// clear cannot latch while any replication recipient — a maintenance host
+// included — runs a build that reads only the old columns.
 //
 // READ RULE. A reader takes the live credential row whenever one exists, and
 // the old column only when none does. It never compares the credential row's
@@ -81,6 +99,34 @@ func (c *Client) MayWriteCredentialTables() bool {
 	return fn != nil && *fn != nil && (*fn)()
 }
 
+// SetCredentialsClearGate injects the predicate that permits CLEARING the old
+// secret columns. Wired at daemon start to
+// `checker.DurablyLatched(CredentialsClearV1)`. Nil-safe and FAIL CLOSED, like
+// the split gate: unwired, every old column keeps its secret, which is the
+// dual-write build's behaviour.
+func (c *Client) SetCredentialsClearGate(fn func() bool) { c.credentialsClear.Store(&fn) }
+
+// MayClearCredentialColumns reports whether this node empties the old secret
+// columns. It needs the split gate open too: a node never clears a column
+// before it writes the credential table that replaces it.
+func (c *Client) MayClearCredentialColumns() bool {
+	if !c.MayWriteCredentialTables() {
+		return false
+	}
+	fn := c.credentialsClear.Load()
+	return fn != nil && *fn != nil && (*fn)()
+}
+
+// oldColumnValue is what a writer puts in an old secret column: the secret
+// itself until credentials_clear_v1 has latched, where a host on the previous
+// builds reads it, and an empty string after, where nothing does.
+func (c *Client) oldColumnValue(secret string) string {
+	if c.MayClearCredentialColumns() {
+		return ""
+	}
+	return secret
+}
+
 // resolveCredential picks the secret a reader returns: the live credential
 // row's value when there is one, the parent's old column otherwise. See READ
 // RULE above.
@@ -110,10 +156,25 @@ const (
 		   updated_at = excluded.updated_at, deleted_at = NULL`
 )
 
+// The old-column clears (credentials_clear_v1). Each is a full-primary-key
+// UPDATE that binds updated_at, so a receiver LWW-gates it (DispFullPKUpdate).
+// None has a deleted_at guard: a tombstoned user's hash, a revoked token's hash
+// and a removed host's BMC password are secrets too. The previous build
+// decodes all three: the users and tokens forms are its
+// credentials_split_clear_v56 family, the hosts form is a configure_host_v130
+// subset.
+const (
+	hostsClearIPMIPassSQL     = `UPDATE hosts SET ipmi_pass = ?, updated_at = ? WHERE name = ?`
+	usersClearPasswordHashSQL = `UPDATE users SET password_hash = ?, updated_at = ? WHERE username = ?`
+	tokensClearTokenHashSQL   = `UPDATE tokens SET token_hash = ?, updated_at = ? WHERE id = ?`
+)
+
 // CredentialSplitReport is what one SplitCredentials pass did.
 type CredentialSplitReport struct {
 	// Copied counts old-column values written into a credential table.
 	Copied int
+	// Cleared counts old columns emptied (credentials_clear_v1 only).
+	Cleared int
 }
 
 // The pass reads each parent together with its credential row, including
@@ -146,6 +207,11 @@ const (
 		       c.deleted_at AS cred_deleted
 		  FROM tokens t LEFT JOIN token_credentials c ON c.token_id = t.id
 		 WHERE t.token_hash IS NOT NULL AND t.token_hash != ''`
+	// A REMOVED host's password is cleared and nothing else: its credential
+	// row was retired with it and is never re-emitted (see above).
+	removedHostClearScanSQL = `SELECT h.name AS pk, h.updated_at AS src_ts
+		  FROM hosts h
+		 WHERE h.deleted_at IS NOT NULL AND h.ipmi_pass IS NOT NULL AND h.ipmi_pass != ''`
 )
 
 // credentialSplitRow is one parent row the pass looked at.
@@ -198,16 +264,61 @@ func (c *Client) copyTS(r credentialSplitRow) string {
 	return c.NowTS()
 }
 
+// clearTS is the updated_at an old-column clear carries: the immediate
+// successor of the parent row's own updated_at — one microsecond past it, or,
+// for an HLC key, the same physical and logical time with the node id
+// extended — never NowTS.
+//
+// The clear has to beat the copy of the row it replaces, or anti-entropy would
+// carry the secret back from a peer that has not cleared yet. It must NOT beat
+// any real write the row has had since. Every node clears every row at about
+// the moment the latch forms. With a fresh clock, a revoke or delete a peer
+// issued a moment earlier, still in flight, would arrive older than the clear
+// and be LWW-skipped, and anti-entropy would then spread the un-revoked row. A
+// node whose row is behind the cluster produces a clear that loses to the
+// fresher row, and that row is cleared by the next pass on the node that holds
+// it.
+func (c *Client) clearTS(r credentialSplitRow) string {
+	if hlc.IsHLC(r.srcTS) {
+		if p, ok := hlc.Parse(r.srcTS); ok {
+			p.NodeID += "+"
+			return p.String()
+		}
+	} else if t, err := time.Parse(time.RFC3339, r.srcTS); err == nil {
+		return t.Add(time.Microsecond).UTC().Format(nowTSLayout)
+	}
+	return c.NowTS()
+}
+
+// credentialFor is the credential row a clear is paired with: the old column
+// when no live credential row exists, otherwise the credential row as it
+// stands, re-emitted so this node's stream carries it AHEAD of the clear. A
+// receiver then never applies a clear from this node before it holds the
+// value the clear hands over to.
+func (c *Client) credentialFor(r credentialSplitRow) (val, ts string, copied bool) {
+	if r.needsCopy() {
+		return r.oldVal, c.copyTS(r), true
+	}
+	return r.credVal, r.credTS, false
+}
+
 // SplitCredentials copies secrets from the old columns into the credential
 // tables. It does nothing unless the credentials_split_v1 gate is open, and it
-// is idempotent: it writes only where no live credential row exists. It never writes the old column — that stays the copy
-// a previous-release host reads. The daemon runs it at start and periodically.
-// Its writes replicate on the WAL lane and are repaired by anti-entropy on the
-// sensitive lane.
+// is idempotent: it writes only where no live credential row exists. Until
+// credentials_clear_v1 has latched it never writes the old column — that
+// stays the copy a previous-release host reads. Once it has, every old column
+// that still holds a value is cleared, in one batch with its credential row
+// (see CLEARING above). The daemon runs it at start and periodically. Its
+// writes replicate on the WAL lane and are repaired by anti-entropy: the
+// credential rows on the sensitive lane, the cleared parent rows on the public
+// one.
 func (c *Client) SplitCredentials(ctx context.Context) (CredentialSplitReport, error) {
 	var rep CredentialSplitReport
 	if !c.MayWriteCredentialTables() {
 		return rep, nil
+	}
+	if c.MayClearCredentialColumns() {
+		return c.clearCredentialColumns(ctx)
 	}
 	var firstErr error
 	note := func(what string, err error) {
@@ -265,4 +376,89 @@ func (c *Client) copyUserCredential(ctx context.Context, username, hash, updated
 
 func (c *Client) copyTokenCredential(ctx context.Context, tokenID, hash, updatedAt string) error {
 	return c.Execute(ctx, tokenCredentialUpsertSQL, tokenID, hash, updatedAt)
+}
+
+// clearCredentialColumns is SplitCredentials once credentials_clear_v1 has
+// latched: every old column that still holds a value is cleared, in one batch
+// with its credential row.
+func (c *Client) clearCredentialColumns(ctx context.Context) (CredentialSplitReport, error) {
+	var rep CredentialSplitReport
+	var firstErr error
+	note := func(what string, err error) {
+		if err == nil {
+			return
+		}
+		slog.Warn("credentials clear: pass incomplete; retrying next cycle", "table", what, "error", err)
+		if firstErr == nil {
+			firstErr = fmt.Errorf("%s: %w", what, err)
+		}
+	}
+	count := func(table string, copied bool, err error) {
+		if err != nil {
+			note(table, err)
+			return
+		}
+		if copied {
+			rep.Copied++
+		}
+		rep.Cleared++
+	}
+
+	hosts, err := scanCredentialSplitRows(ctx, c, hostCredentialSplitScanSQL)
+	note("host_fence_credentials", err)
+	for _, r := range hosts {
+		val, ts, copied := c.credentialFor(r)
+		count("host_fence_credentials", copied, c.clearHostCredential(ctx, r.pk, val, ts, c.clearTS(r)))
+	}
+	users, err := scanCredentialSplitRows(ctx, c, userCredentialSplitScanSQL)
+	note("user_credentials", err)
+	for _, r := range users {
+		val, ts, copied := c.credentialFor(r)
+		count("user_credentials", copied, c.clearUserCredential(ctx, r.pk, val, ts, c.clearTS(r)))
+	}
+	tokens, err := scanCredentialSplitRows(ctx, c, tokenCredentialSplitScanSQL)
+	note("token_credentials", err)
+	for _, r := range tokens {
+		val, ts, copied := c.credentialFor(r)
+		count("token_credentials", copied, c.clearTokenCredential(ctx, r.pk, val, ts, c.clearTS(r)))
+	}
+	removed, err := c.Query(ctx, removedHostClearScanSQL)
+	note("hosts", err)
+	for _, row := range removed {
+		r := credentialSplitRow{pk: row.String("pk"), srcTS: row.String("src_ts")}
+		count("hosts", false, c.clearRemovedHostPass(ctx, r.pk, c.clearTS(r)))
+	}
+	return rep, firstErr
+}
+
+// The per-table clears: the credential row, then the clear, in one
+// transaction. Both timestamps come from the caller — the credential row's
+// (copyTS, or the row's own when re-emitted) and the clear's updatedAt
+// (clearTS) — and neither is a fresh clock, by design.
+
+func (c *Client) clearHostCredential(ctx context.Context, host, pass, credTS, updatedAt string) error {
+	return c.ExecuteBatch(ctx, []Statement{
+		{SQL: HostFenceCredentialUpsertSQL, Params: []interface{}{host, pass, credTS}},
+		{SQL: hostsClearIPMIPassSQL, Params: []interface{}{"", updatedAt, host}},
+	})
+}
+
+func (c *Client) clearUserCredential(ctx context.Context, username, hash, credTS, updatedAt string) error {
+	return c.ExecuteBatch(ctx, []Statement{
+		{SQL: userCredentialUpsertSQL, Params: []interface{}{username, hash, credTS}},
+		{SQL: usersClearPasswordHashSQL, Params: []interface{}{"", updatedAt, username}},
+	})
+}
+
+func (c *Client) clearTokenCredential(ctx context.Context, tokenID, hash, credTS, updatedAt string) error {
+	return c.ExecuteBatch(ctx, []Statement{
+		{SQL: tokenCredentialUpsertSQL, Params: []interface{}{tokenID, hash, credTS}},
+		{SQL: tokensClearTokenHashSQL, Params: []interface{}{"", updatedAt, tokenID}},
+	})
+}
+
+// clearRemovedHostPass clears a removed host's BMC password alone, stamped with
+// the updatedAt its caller computed (clearTS).
+func (c *Client) clearRemovedHostPass(ctx context.Context, host, updatedAt string) error {
+	return c.Execute(ctx, hostsClearIPMIPassSQL, "", updatedAt, host)
 }

@@ -55,8 +55,11 @@ when it next starts.`,
 						return nil, err
 					}
 					// Write user_credentials too once this node has latched
-					// credentials_split_v1, as the daemon would.
+					// credentials_split_v1, and leave users.password_hash
+					// empty once it has latched credentials_clear_v1, as the
+					// daemon would.
 					db.SetCredentialsSplitGate(daemon.CredentialsSplitLatchedOnDisk(cfg.DataDir))
+					db.SetCredentialsClearGate(daemon.CredentialsClearLatchedOnDisk(cfg.DataDir))
 					return db, nil
 				},
 				dataDir: cfg.DataDir,

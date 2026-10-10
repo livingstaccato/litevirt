@@ -526,11 +526,11 @@ refuses the rotation's public-row half, so it holds the OLD password on a NEWER
 public row. A rule that preferred the newer row would serve the rotated-out
 password, and the pass would copy it over the credential row.
 
-This is the dual-write step of a column move, and the release stops there.
-Every old column still holds the current secret, so the public rows, and the
-operator-safe state dump built from them, **still carry the secrets in this
-release**. Clearing the old columns is a later release's step, behind a second
-mandatory, replication-gated token (see
+This is the dual-write step of a column move. Every old column still holds
+the current secret, so the public rows, and the operator-safe state dump built
+from them, **still carry the secrets until the second step below**: clearing
+the old columns, behind a second mandatory, replication-gated token (see
+[The old secret columns are emptied](#the-old-secret-columns-are-emptied) and
 [design/credentials-clear.md](design/credentials-clear.md)).
 
 Latches form per host, so for a few seconds after one host latches its
@@ -581,6 +581,53 @@ Until the token latches, `litevirt_ha_degraded{reason="capability_rollout_pendin
 is set, as it is for every mandatory token mid-roll. If it stays set after the
 roll, a host is still on the previous release — most often one in
 `maintenance`.
+
+### The old secret columns are emptied
+
+The second step of the move takes the secrets out of the public rows. It
+starts **on its own, after every host runs a build carrying the
+`credentials_clear_v1` capability token**; no flag starts it, and none stops
+it. The token is mandatory and replication-gated, like `credentials_split_v1`:
+it latches only once every memberlist member advertises it, a host parked in
+`maintenance` included, so no host that still reads only the old columns ever
+receives a clear.
+
+Once it has latched on a host (and `credentials_split_v1` has too):
+
+- every writer writes the secret to the credential table and an empty value
+  to the old column, in the same statements as before;
+- the pass that runs at start and every minute empties every old column that
+  still holds a value — a deleted user's hash, a revoked token's hash and a
+  removed host's BMC password included. Each clear goes out in one replicated
+  batch with the credential row it hands over to, credential row first;
+- each clear is stamped just after the public row's own `updated_at`, not
+  with the current time, so a revoke or delete a peer made just before the
+  clear, still in flight, still wins when it arrives;
+- readers do not change: they already take the credential row whenever one
+  exists.
+
+From then on no public row, and no operator-safe state dump, carries a
+password hash, an API token hash or an IPMI password. `lv user reset-admin`
+follows the same latch when it writes the local database directly.
+
+A host's latch forms a few seconds before or after its neighbours'. A host
+that has not latched yet still writes secrets to both places; the next pass
+on a latched host empties that old column again.
+
+**Rollback.** One build back — to the build that dual-writes — is the
+supported rollback. That binary enters WAL quarantine like any rollback below
+a latched token, and it still validates tokens, checks passwords and fences,
+because it reads the credential row whenever one exists and the credential
+rows hold every secret. Upgrading it again loses nothing. **A rollback two
+builds back, to a build before `credentials_split_v1`, is unsupported once
+`credentials_clear_v1` has latched**: that build reads only the old columns,
+which are empty, so it has no IPMI password, password hash or token hash to
+read. The startup rollback preflight refuses such a binary only if it carries
+the preflight.
+
+Until the token latches,
+`litevirt_ha_degraded{reason="capability_rollout_pending"}` is set, as for
+every mandatory token mid-roll.
 
 ### Host state moves to its own row after the roll
 

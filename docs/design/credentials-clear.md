@@ -1,8 +1,10 @@
-# Clearing the old secret columns (next release)
+# Clearing the old secret columns
 
-Status: **proposed, not implemented.** This note records the second half of
-the secret-column move (colonelpanik/litevirt#268) so that the release carrying
-`credentials_split_v1` does not have to.
+Status: **implemented** behind `credentials_clear_v1`. This note records the
+second half of the secret-column move (colonelpanik/litevirt#268). Operator
+documentation: [upgrades.md](../upgrades.md#the-old-secret-columns-are-emptied).
+"Next release" below means the build that carries `credentials_clear_v1`;
+"this release" means the dual-write build before it.
 
 ## Where this release leaves things
 
@@ -30,8 +32,7 @@ secret. Taking them out of the dump is the step described here.
 
 ## The next release: `credentials_clear_v1`
 
-A second token, proposed name `credentials_clear_v1`, with the same class as
-the first:
+A second token, `credentials_clear_v1`, with the same class as the first:
 
 - **Mandatory.** It states a fact about the binary: *this build never needs the
   old column to find a secret*. That is not a policy an operator can decline,
@@ -88,7 +89,19 @@ columns. The startup rollback preflight (`preflightCapabilityRollback`)
 refuses to start a binary that does not know a latched token, but only in
 builds that carry the preflight. docs/upgrades.md must say so in that release.
 
-## Tests the next release needs
+## One consequence outside the credential readers
+
+The anti-entropy refusal of a re-minted admin account
+(`users_admin_guard.go`, colonelpanik/litevirt#224) recognised the refused
+account's `user_credentials` row by VALUE: the refused `users` row carried the
+same hash. A re-minting node that has latched the clear sends `''` there, so the
+refusal is remembered by username instead, and the sensitive lane refuses a
+`user_credentials` row for that username whose hash differs from the one the
+receiving node holds. The cost: anti-entropy also holds back a genuine rotation
+of that one account, for the life of the process, after a re-mint has been
+refused; the WAL lane still delivers it.
+
+## Tests
 
 - Fleet: after `credentials_clear_v1` latches on every node, no public row and
   no public dump carries a secret, and login, token and fence still work from

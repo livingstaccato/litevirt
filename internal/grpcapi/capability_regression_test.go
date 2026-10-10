@@ -17,7 +17,8 @@ func TestCheckOneCapabilityHealth_DetectsPostLatchRegression(t *testing.T) {
 	// Both configured-on tokens already latched; split_brain still confirms active,
 	// but lww's peer support regressed (CapabilityActiveForHealth → false).
 	//
-	// lease_term_ledger_v1, credentials_split_v1, host_membership_split_v1,
+	// lease_term_ledger_v1, credentials_split_v1, credentials_clear_v1,
+	// host_membership_split_v1,
 	// failover_scope_v1, voter_config_v1, claim_incarnation_v1 and
 	// fence_state_v1 are latched too, not because this
 	// test is about them but because they
@@ -28,6 +29,7 @@ func TestCheckOneCapabilityHealth_DetectsPostLatchRegression(t *testing.T) {
 		capabilities.SplitBrainGateV1:      true,
 		capabilities.LeaseTermLedgerV1:     true,
 		capabilities.CredentialsSplitV1:    true,
+		capabilities.CredentialsClearV1:    true,
 		capabilities.HostMembershipSplitV1: true,
 		capabilities.FailoverScopeV1:       true,
 		capabilities.VoterConfigV1:         true,
@@ -39,6 +41,7 @@ func TestCheckOneCapabilityHealth_DetectsPostLatchRegression(t *testing.T) {
 		capabilities.SplitBrainGateV1:      true,  // still active
 		capabilities.LeaseTermLedgerV1:     true,  // still active
 		capabilities.CredentialsSplitV1:    true,  // still active
+		capabilities.CredentialsClearV1:    true,  // still active
 		capabilities.HostMembershipSplitV1: true,  // still active
 		capabilities.FailoverScopeV1:       true,  // still active
 		capabilities.VoterConfigV1:         true,  // still active

@@ -23,6 +23,11 @@ import (
 //     and LUN 1's boot sector is the image's (the image was written onto it);
 //   - no shared_lun health condition stands.
 //
+// It needs a build where the iscsi_lun_claim release feature can open (this
+// branch merged with feat/release-token, the daemon wiring
+// Server.SetReleaseFeatureGate) and an adopted voter generation: without
+// either, every iscsi create is refused and the first deploy fails saying so.
+//
 // Run it with:
 //
 //	LITEVIRT_E2E=1 LV_BIN=/usr/local/bin/litevirt E2E_LAB_DIR=~/litevirt-lab \

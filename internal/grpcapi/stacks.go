@@ -26,6 +26,8 @@ import (
 	"github.com/litevirt/litevirt/internal/image"
 	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/randid"
+
+	"github.com/litevirt/litevirt/internal/storage"
 )
 
 // DeployStack parses a compose YAML, runs the declarative planner to resolve all
@@ -2129,6 +2131,15 @@ func (s *Server) validateDeployDependencies(ctx context.Context, f *compose.File
 			poolNames = append(poolNames, p.Name)
 		}
 		for _, p := range compose.CheckStorage(composeYAML, f, poolNames) {
+			errs = append(errs, p.String())
+		}
+		fixed := map[string]bool{}
+		for _, p := range pools {
+			if _, _, ok := storage.FixedDevice(storage.Config{Driver: p.Driver}); ok {
+				fixed[p.Name] = true
+			}
+		}
+		for _, p := range compose.CheckFixedDeviceStorage(composeYAML, f, fixed) {
 			errs = append(errs, p.String())
 		}
 	}

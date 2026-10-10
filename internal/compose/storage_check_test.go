@@ -57,3 +57,55 @@ workloads:
 		t.Errorf("want exactly 3 problems (hot is a pool, warm a volume, tmp and scratch use the default, and a container disk does not resolve through volumes or pools); got:\n%s", dumpProblems(ps))
 	}
 }
+
+// An iscsi volume or pool is one LUN and holds one disk, so a VM that would
+// put two instances on one at once — more than one replica, or an update that
+// creates the new instance beside the old (blue-green, snapshot-and-replace) —
+// can never deploy. It is refused when the file is checked, where the disk is
+// written, rather than part-way through the rollout.
+//
+// Mutation: skip the replica count — the scaled VM is not reported and this
+// goes red.
+func TestCheckFixedDeviceStorage(t *testing.T) {
+	src := `name: s
+volumes:
+  lun1: { driver: iscsi, source: "iqn.2020-01.x:y" }
+vms:
+  scaled:
+    image: u
+    replicas: 2
+    disks:
+      root: { size: 20G, storage: lun1 }
+  bluegreen:
+    image: u
+    update: { strategy: blue-green }
+    disks:
+      data: { size: 1G, storage: lun2 }
+  ok:
+    image: u
+    update: { strategy: rolling }
+    disks:
+      root: { size: 20G, storage: lun3 }
+  local:
+    image: u
+    replicas: 3
+    disks:
+      root: 20G
+`
+	f, err := ParseBytes([]byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ps := CheckFixedDeviceStorage([]byte(src), f, map[string]bool{"lun2": true, "lun3": true})
+	for _, w := range []struct{ path, msg string }{
+		{"vms.scaled.disks.root.storage", `storage "lun1" is one iSCSI LUN and holds one disk, but VM "scaled" has 2 replicas`},
+		{"vms.bluegreen.disks.data.storage", `storage "lun2" is one iSCSI LUN and holds one disk, but VM "bluegreen" updates by blue-green`},
+	} {
+		if _, ok := findProblem(ps, w.path, w.msg); !ok {
+			t.Errorf("no problem %q at %s; got:\n%s", w.msg, w.path, dumpProblems(ps))
+		}
+	}
+	if len(ps) != 2 {
+		t.Errorf("want exactly 2 problems; got:\n%s", dumpProblems(ps))
+	}
+}

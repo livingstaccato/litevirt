@@ -1646,8 +1646,11 @@ domain may still hold state that can be resumed.
 ### Shared iSCSI LUN (`shared_lun`)
 
 The `shared_lun` evaluator raises `shared_lun` (subject kind `cluster`, subject
-the LUN) when more than one live disk is one iSCSI LUN — two VMs, or two disks
-of one VM, on iscsi pools that name the same portal, target and LUN. An iscsi
+the LUN) when more than one guest writes one iSCSI LUN — two VMs, or two disks
+of one VM, on iscsi pools that name the same target and LUN (through any
+portal), or a VM whose disk is a LUN that an OLDER linked clone reads as its
+base: a clone's source is always older than the clone, so a younger VM on its
+base took the LUN after the source was deleted with `--keep-disks`. An iscsi
 pool is one LUN and holds one disk ([storage.md](storage.md#iscsi-one-lun-one-disk)),
 and a create refuses a second disk on one; a cluster where an older build let
 it happen is what this reports. The evidence names every VM, disk and host on
@@ -1655,10 +1658,12 @@ the LUN; the involved hosts are the hosts those VMs are on.
 
 | Raised when | Clears when |
 |---|---|
-| A scan of the replica's `vm_disks` finds two or more live disks of live VMs whose recorded paths are one LUN (the portal compared with its port, the target case-insensitively). Observed (warning) on the first such scan, confirmed (critical) on the second. | Two consecutive scans find at most one disk on the LUN, under a valid decision gate. |
+| A scan of the replica's `vm_disks` finds two or more live disks of live VMs whose recorded paths are one LUN (the target compared case-insensitively, the portal ignored), or such a disk and an older linked clone layered on it. Observed (warning) on the first such scan, confirmed (critical) on the second. | Two consecutive scans find no such use, under a valid decision gate. |
 
-It runs on the dual-run detector's lease holder, once per detector pass. It
-**changes nothing**: no disk is touched, and it is not an ownership code, so
+It runs once a minute on whichever node holds its own lease
+(`shared_lun_detector`). It is detection only: the voter-majority LUN claim
+at create time is the prevention ([storage.md](storage.md#iscsi-one-lun-one-disk)).
+It **changes nothing**: no disk is touched, and it is not an ownership code, so
 admission — starting either VM included — does not read it. Refusing the start
 would not undo what both guests already wrote. Decide which VM keeps the LUN,
 stop the others, and move their disks to LUNs of their own (a pool per LUN).

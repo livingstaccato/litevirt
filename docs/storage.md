@@ -1085,47 +1085,94 @@ allocates nothing and hands each disk the same
 LUN are one block device written by two guests (or twice by one), and corrupt
 each other silently.
 
-So a create refuses a LUN another disk already is:
+A LUN is named by its target and LUN number: the same target and LUN reached
+through two portals — one per storage subnet, or multipath — is one LUN.
+
+**A create takes a LUN by a voter-majority claim.** The LUN's allocations are
+decided one at a time by the cluster's voters — the same single-decree claims
+recovery uses ([design/recovery-claims.md](design/recovery-claims.md)), at key
+`lun/<target>/lun<n>@<allocation>`. The decided value names the VM (by its
+uuid), the disk and the host that ran the create. So:
 
 - two disks of one VM on the same LUN — through one pool or two pools that
-  name the same portal, target and LUN — are refused before anything is
-  created;
-- a disk on a LUN that a live VM on **any** host already uses is refused,
-  naming that VM. The host creating the VM asks every other host (peer-only,
-  over mTLS) what it holds, committed or still being created, so two creates
-  on two hosts at the same moment cannot both take the LUN; at worst both are
-  refused and one retry goes through. A host that is offline, fenced or in
-  maintenance is not asked; any other host that cannot be asked refuses the
-  create (`Unavailable`) until it answers or is marked down. A host on an older
-  build is not asked; its committed disks arrive by replication;
-- a deleted VM's LUN is free again, and a VM that is rebuilt or re-created
-  under its own name takes back its own LUN.
+  name the same target and LUN — are refused before anything is created;
+- two creates on two hosts at the same moment cannot both take a LUN: only one
+  value is ever decided per allocation. The other is refused naming the VM —
+  `Aborted` while that create is still running (retry once it has finished),
+  `FailedPrecondition` once it holds the LUN;
+- a host cut off from a majority of the voters allocates no LUN at all; its
+  create is refused `Unavailable`. A LUN taken by a create on a host that
+  cannot be asked stays taken until that host answers;
+- a LUN is free again once the VM that took it is deleted, or its create
+  failed — proven by the host that ran the create — and no live VM uses it,
+  as a disk or as a **linked clone's base**: a clone made from an iscsi VM
+  reads its source's LUN, so deleting the source with `--keep-disks` does not
+  free the LUN while the clone exists;
+- a VM that is rebuilt (`lv rebuild`) or re-created by a rolling update takes
+  its own LUN over **exactly as it is**: nothing is written to it, and no
+  `overwrite` is needed. Its previous incarnation is recognised by its uuid
+  and disk name, or by the name and creation time of its rows — never by its
+  name alone. What the re-create would refuse about its LUNs is refused before
+  the teardown, with the VM left as it was.
+
+**Upgrading.** Allocation on an iscsi pool needs the release feature
+`iscsi_lun_claim`, which opens only once the whole cluster runs a build that
+knows LUN claims: an older voter cannot decide a
+LUN key, and an older host allocates without asking. Until it is open every
+create, rebuild or recreate with a disk on an iscsi pool is refused with "the
+cluster upgrade must finish first". Running VMs are not affected. Refusing is
+safer than the silent sharing older builds allowed.
+
+A compose file that would put two instances of a VM on one iscsi volume or pool
+at once — `replicas` above 1, or an `update: strategy` of `blue-green` or
+`snapshot-and-replace`, which create the new instance beside the old — is
+refused when the stack is deployed, where the disk is written.
 
 A cluster that already has two VMs on one LUN — an older build allowed it —
 is left as it is: litevirt does not touch those disks or refuse to start those
 VMs. It raises the `shared_lun` health condition naming them (see
 [diagnostics.md](diagnostics.md#shared-iscsi-lun-shared_lun)) and a
 `storage.lun_shared` notification; stop all but one and move the others'
-disks to LUNs of their own.
+disks to LUNs of their own. The claim is the prevention; `shared_lun` only
+detects.
+
+**What it does not cover.** Claims order litevirt's own creates. They do not
+stop something outside litevirt — another cluster, a host attaching the LUN by
+hand — from writing it. The storage-side guarantee is SCSI-3 persistent
+reservations on the LUN, which litevirt does not take (yet).
 
 **A root disk from an image is written onto the LUN.** The driver allocates
 nothing, so a root disk on an iscsi pool built on an image (`image:` in
 compose, `lv run --image … --storage <pool>`) has the image's guest contents
 written onto the LUN with `qemu-img convert` before the VM is first defined —
-never a blank LUN booting to the firmware shell. Before writing:
+never a blank LUN booting to the firmware shell. The image is opened with its
+format named (qcow2 or raw) and no backing chain. Before writing:
 
-- the LUN is not any VM's disk (the refusal above, held for the whole write);
+- the LUN is not any VM's disk (the claim above, held for the whole write);
 - the LUN is at least the image's virtual size, or the create is refused with
   both sizes. The disk's requested `size` is not applied: the disk is the LUN,
   at the size the SAN gave it;
-- the LUN is blank — zeros in its first and last MiB, where partition tables
-  (MBR, GPT and its backup), LVM labels and filesystem superblocks live — or
-  the disk sets `overwrite` (compose `overwrite: true`, `lv run --overwrite`).
-  A LUN holding data is refused otherwise, and an overwrite is audited.
+- the LUN is blank — zeros in its first and last MiB (partition tables: MBR,
+  GPT and its backup; LVM labels), in the 128 KiB from 1 MiB (where a first
+  partition's filesystem starts even when the partition table was wiped), and
+  in 64 KiB samples every GiB across the device (at most 256) — read past the
+  page cache. Otherwise the disk must set `overwrite` (compose
+  `overwrite: true`, `lv run --overwrite`), a one-shot acknowledgement for that
+  create that is never stored in the VM's spec. An overwrite is audited, after
+  the write, with its outcome.
+
+The probe is a sample. Data that lies only between the probed regions — a
+blank-looking LUN reused without being wiped — reaches the new guest when it
+grows its filesystem; litevirt does not wipe a LUN when a VM is deleted. A
+write that fails part-way (the write runs on, detached, even if the client
+gives up) leaves the LUN partly written, so a retry needs `overwrite`.
+
+`overwrite` is an accident interlock, not a permission boundary: whoever may
+create the VM on the pool may also attach the LUN as a data disk and write
+anything to it from the guest.
 
 A data disk on an iscsi pool, and a root disk with no image, is the LUN as it
-is: nothing is written. A rebuilt or re-created VM whose previous incarnation's
-disk row still names the LUN keeps the LUN as it is.
+is: nothing is written.
 
 To give each disk its own LUN, create the LUNs on the SAN and one pool per
 LUN, then name the pool on the disk:
@@ -1145,8 +1192,11 @@ vms:
       data: { size: "200G", storage: san-vm1-data }
 ```
 
-Give the portal with its port (`host:3260`): the device path is spelled from
-the option, and udev names the device with the port.
+A new iscsi pool records its portal as `host:port`, adding `:3260` when no
+port is given and resolving a host name to its IPv4 address (with a warning,
+or keeping the name when it does not resolve): the device path is spelled from
+the option, and udev names the device `ip-<address>:<port>-iscsi-…`. Pools
+created before keep the spelling their disks were recorded with.
 
 **Not implemented: LVM on an iSCSI LUN.** Proxmox's usual shared-SAN layout is
 one big LUN with a shared LVM volume group on it, carved into one logical

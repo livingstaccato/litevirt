@@ -52,7 +52,8 @@ You want:
 - **An iSCSI pool is one LUN = one disk.** PVE's shared LVM volume
   group on a SAN LUN (one LV per disk) has no litevirt equivalent yet;
   create a LUN per disk and an `iscsi` pool per LUN (`--option lun=N`).
-  litevirt refuses a second disk on a LUN. See
+  litevirt refuses a second disk on a LUN, deciding each LUN's owner by a
+  voter-majority claim. See
   [storage.md](storage.md#iscsi-one-lun-one-disk).
 
 ## Step 1 — Bootstrap a litevirt host alongside PVE

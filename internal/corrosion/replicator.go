@@ -1358,7 +1358,15 @@ func (r *Replicator) ApplyRemoteMutationsFrom(ctx context.Context, entries []*pb
 			r.client.observeMergeRejected("users", "wal", walRejectReason(err))
 			return 0, fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
 		}
+		// A use of a release feature this binary does not know quarantines
+		// it BEFORE anything else in this entry — or any later entry of the
+		// batch, which may carry the feature's data — is applied
+		// (release_features.go).
+		r.client.noteReleaseUseStatements(stmts)
 		for _, s := range stmts {
+			if releaseUseApplyHook != nil {
+				releaseUseApplyHook(s)
+			}
 			if remintCredentialStatement(s, refusedRemints) {
 				r.client.deferAfterCommit(tx, func() { r.client.noteRemintCredentialRefused(pathWAL) })
 				continue

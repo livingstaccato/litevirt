@@ -804,8 +804,11 @@ type Server struct {
 	// gate is the split-brain safety gate (Phase 1), implemented by *health.Checker.
 	// When set + enforced, ApplyLB (VIP takeover) requires local quorum. nil /
 	// pre-activation → unchanged. onGateRefused feeds the refusal metric (nil-safe).
-	gate          serverGate
-	onGateRefused func(action, reason string)
+	gate serverGate
+	// releaseFeatures opens a release feature (RequireReleaseFeature): the
+	// checker's RequireFeature in production. Nil refuses every feature.
+	releaseFeatures releaseFeatureGate
+	onGateRefused   func(action, reason string)
 	// vmStartObserver is told of every guest start (SetVMStartObserver).
 	vmStartObserver VMStartObserver
 

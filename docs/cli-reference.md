@@ -48,6 +48,9 @@ lv cluster converge [--all]        # Kick an immediate anti-entropy pass + repor
                                    #   (`lv cluster sync` is a deprecated alias)
 lv cluster failover-scope [cluster|region]  # Show or set whether failover quorum is cluster-wide or
                                    #   per region (see federation.md → Regions and failure)
+lv cluster upgrade-status          # Latched capability tokens on the connected host, whether each blocks a
+                                   #   rollback, and which release features are in use (see upgrades.md →
+                                   #   Rolling back after a release token latched)
 lv cluster acknowledge-lease-term --key <k> --term <n>   # Acknowledge a contested lease term on the connected host
 lv cluster voter ls                # Adopted voter generation; per member: host state, reachable, abstaining
 lv cluster voter init [--members a,b,c] [--yes]   # Start a voter generation by hand (unanimous); for a

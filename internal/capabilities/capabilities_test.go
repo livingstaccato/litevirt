@@ -118,3 +118,72 @@ func TestRetiredTokensAreDisjointFromAll(t *testing.T) {
 		}
 	}
 }
+
+// TestReleaseTokenRegistered pins the release token's registration. Every one
+// of these sets matters: Supported is what peers latch on, All is what the
+// checker loads markers for and what the rollback preflight treats as known,
+// Mandatory is what the HA monitor drives with no flag, and ReplicationGated is
+// what makes a maintenance host on the previous build hold the latch off.
+func TestReleaseTokenRegistered(t *testing.T) {
+	const tok = "release_2026_11_v1"
+	if ReleaseToken != tok || Release202611V1 != tok {
+		t.Fatalf("ReleaseToken = %q, Release202611V1 = %q, want %q: the marker name is frozen",
+			ReleaseToken, Release202611V1, tok)
+	}
+	if !slices.Contains(Supported(), tok) {
+		t.Errorf("Supported() does not advertise %s, so it can never latch", tok)
+	}
+	if !slices.Contains(All(), tok) {
+		t.Errorf("All() lacks %s, so its latch is lost across a restart and its marker quarantines", tok)
+	}
+	if !Mandatory(tok) {
+		t.Errorf("%s is not mandatory, so nothing drives its latch", tok)
+	}
+	if !ReplicationGated(tok) {
+		t.Errorf("%s is not replication-gated, so it latches across a maintenance host on the old build", tok)
+	}
+	if Retired(tok) {
+		t.Errorf("%s is retired", tok)
+	}
+}
+
+// TestReleaseTokenMarkerCarriesRollbackRule: the marker is what a LATER build's
+// rollback lands on, and the rule has to be on disk for that build to read.
+// A token with no rule keeps the historical content byte for byte.
+func TestReleaseTokenMarkerCarriesRollbackRule(t *testing.T) {
+	if got := string(MarkerContent(ReleaseToken)); got != "1\nrollback: safe_if_unused\n" {
+		t.Errorf("MarkerContent(%s) = %q, want the safe_if_unused rule", ReleaseToken, got)
+	}
+	if got := string(MarkerContent(SplitBrainGateV1)); got != "1\n" {
+		t.Errorf("MarkerContent(%s) = %q, want %q", SplitBrainGateV1, got, "1\n")
+	}
+	for tok := range rollbackRules {
+		if !slices.Contains(All(), tok) {
+			t.Errorf("rollback rule for %s, which is not a live token", tok)
+		}
+	}
+}
+
+// TestReleaseFeaturesAreWellFormed: a feature's name is written into a
+// replicated key ("release_feature/<token>/<feature>"), so a slash or an
+// upper-case letter would make two spellings of one feature, and its token must
+// be one this build knows.
+func TestReleaseFeaturesAreWellFormed(t *testing.T) {
+	for _, f := range Features() {
+		info, _ := LookupFeature(f)
+		if f == "" {
+			t.Errorf("an empty feature name is declared")
+		}
+		for _, r := range string(f) {
+			if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '_') {
+				t.Errorf("feature %q: %q is not a lower-case letter, digit or underscore", f, r)
+			}
+		}
+		if !slices.Contains(All(), info.Token) || RollbackRule(info.Token) != RollbackSafeIfUnused {
+			t.Errorf("feature %q gates on %q, which is not a live release token", f, info.Token)
+		}
+		if info.Description == "" {
+			t.Errorf("feature %q has no description for upgrade-status", f)
+		}
+	}
+}

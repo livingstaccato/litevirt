@@ -241,3 +241,39 @@ func TestPrintFailoverScope_MarksRegionsThatCannotFenceTheirOwn(t *testing.T) {
 		t.Errorf("cluster scope printed the region-scope warning:\n%s", buf.String())
 	}
 }
+
+// TestPrintUpgradeStatus: every latched token with its rollback verdict, and
+// every release feature — a newer release's included — with its used bit.
+func TestPrintUpgradeStatus(t *testing.T) {
+	st := &pb.UpgradeStatus{
+		ReleaseToken:     "release_2026_11_v1",
+		WalQuarantined:   true,
+		QuarantineReason: "a feature of a newer release this build does not know is in use: release_2099_01_v1",
+		Tokens: []*pb.UpgradeToken{
+			{Name: "split_brain_gate_v1", Durable: true, Mandatory: true, BlocksRollback: true},
+			{Name: "release_2026_11_v1", Durable: true, Mandatory: true, RollbackRule: "safe_if_unused"},
+		},
+		Features: []*pb.ReleaseFeatureStatus{
+			{Token: "release_2026_11_v1", Name: "widgets", Description: "Widgets on every VM", Declared: true,
+				Used: true, FirstUsedBy: "host-b"},
+			{Token: "release_2026_11_v1", Name: "gadgets", Description: "Gadgets on every host", Declared: true},
+			{Token: "release_2099_01_v1", Name: "sprockets", Used: true, FirstUsedBy: "host-c"},
+		},
+	}
+	var buf bytes.Buffer
+	printUpgradeStatus(&buf, st)
+	out := buf.String()
+	for _, want := range []string{
+		"Release token: release_2026_11_v1",
+		"WAL quarantine: yes — a feature of a newer release",
+		"split_brain_gate_v1  yes      yes        -               yes",
+		"release_2026_11_v1   yes      yes        safe_if_unused  no",
+		"widgets    yes   host-b",
+		"gadgets    no    -",
+		"sprockets  yes   host-c         (not known to this build",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output lacks %q:\n%s", want, out)
+		}
+	}
+}

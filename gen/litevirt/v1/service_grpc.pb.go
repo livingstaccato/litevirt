@@ -286,6 +286,7 @@ const (
 	LiteVirt_CrossRegionMigrate_FullMethodName         = "/litevirt.v1.LiteVirt/CrossRegionMigrate"
 	LiteVirt_GetFailoverScope_FullMethodName           = "/litevirt.v1.LiteVirt/GetFailoverScope"
 	LiteVirt_SetFailoverScope_FullMethodName           = "/litevirt.v1.LiteVirt/SetFailoverScope"
+	LiteVirt_GetUpgradeStatus_FullMethodName           = "/litevirt.v1.LiteVirt/GetUpgradeStatus"
 	LiteVirt_UpsertServiceEndpoint_FullMethodName      = "/litevirt.v1.LiteVirt/UpsertServiceEndpoint"
 	LiteVirt_ListServiceEndpoints_FullMethodName       = "/litevirt.v1.LiteVirt/ListServiceEndpoints"
 	LiteVirt_DeleteServiceEndpoint_FullMethodName      = "/litevirt.v1.LiteVirt/DeleteServiceEndpoint"
@@ -803,6 +804,11 @@ type LiteVirtClient interface {
 	// and while any voter is unreachable from the answering host.
 	GetFailoverScope(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*FailoverScopeStatus, error)
 	SetFailoverScope(ctx context.Context, in *SetFailoverScopeRequest, opts ...grpc.CallOption) (*FailoverScopeStatus, error)
+	// GetUpgradeStatus reports, as the answering host sees them, every
+	// capability token latched here, whether each blocks a rollback, and for
+	// each release token which of its features have been used cluster-wide
+	// (`lv cluster upgrade-status`, docs/upgrades.md). Viewer.
+	GetUpgradeStatus(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*UpgradeStatus, error)
 	// ── anycast services ──
 	// service_endpoints map a logical name (e.g. "api.litevirt.local")
 	// to N (ip, region) pairs. The embedded DNS server round-robins
@@ -3868,6 +3874,16 @@ func (c *liteVirtClient) SetFailoverScope(ctx context.Context, in *SetFailoverSc
 	return out, nil
 }
 
+func (c *liteVirtClient) GetUpgradeStatus(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*UpgradeStatus, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(UpgradeStatus)
+	err := c.cc.Invoke(ctx, LiteVirt_GetUpgradeStatus_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) UpsertServiceEndpoint(ctx context.Context, in *UpsertServiceEndpointRequest, opts ...grpc.CallOption) (*ServiceEndpoint, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ServiceEndpoint)
@@ -4635,6 +4651,11 @@ type LiteVirtServer interface {
 	// and while any voter is unreachable from the answering host.
 	GetFailoverScope(context.Context, *emptypb.Empty) (*FailoverScopeStatus, error)
 	SetFailoverScope(context.Context, *SetFailoverScopeRequest) (*FailoverScopeStatus, error)
+	// GetUpgradeStatus reports, as the answering host sees them, every
+	// capability token latched here, whether each blocks a rollback, and for
+	// each release token which of its features have been used cluster-wide
+	// (`lv cluster upgrade-status`, docs/upgrades.md). Viewer.
+	GetUpgradeStatus(context.Context, *emptypb.Empty) (*UpgradeStatus, error)
 	// ── anycast services ──
 	// service_endpoints map a logical name (e.g. "api.litevirt.local")
 	// to N (ip, region) pairs. The embedded DNS server round-robins
@@ -5549,6 +5570,9 @@ func (UnimplementedLiteVirtServer) GetFailoverScope(context.Context, *emptypb.Em
 }
 func (UnimplementedLiteVirtServer) SetFailoverScope(context.Context, *SetFailoverScopeRequest) (*FailoverScopeStatus, error) {
 	return nil, status.Error(codes.Unimplemented, "method SetFailoverScope not implemented")
+}
+func (UnimplementedLiteVirtServer) GetUpgradeStatus(context.Context, *emptypb.Empty) (*UpgradeStatus, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetUpgradeStatus not implemented")
 }
 func (UnimplementedLiteVirtServer) UpsertServiceEndpoint(context.Context, *UpsertServiceEndpointRequest) (*ServiceEndpoint, error) {
 	return nil, status.Error(codes.Unimplemented, "method UpsertServiceEndpoint not implemented")
@@ -10112,6 +10136,24 @@ func _LiteVirt_SetFailoverScope_Handler(srv interface{}, ctx context.Context, de
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_GetUpgradeStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(emptypb.Empty)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).GetUpgradeStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_GetUpgradeStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).GetUpgradeStatus(ctx, req.(*emptypb.Empty))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LiteVirt_UpsertServiceEndpoint_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(UpsertServiceEndpointRequest)
 	if err := dec(in); err != nil {
@@ -11501,6 +11543,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "SetFailoverScope",
 			Handler:    _LiteVirt_SetFailoverScope_Handler,
+		},
+		{
+			MethodName: "GetUpgradeStatus",
+			Handler:    _LiteVirt_GetUpgradeStatus_Handler,
 		},
 		{
 			MethodName: "UpsertServiceEndpoint",

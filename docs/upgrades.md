@@ -399,6 +399,65 @@ systemctl reset-failed litevirt
 systemctl restart litevirt
 ```
 
+### Rolling back after a release token latched
+
+A rolled-back binary that finds a durable activation marker for a capability
+token it has never heard of enters **WAL quarantine**: it stays up, but emits
+no replicated writes and advertises no capabilities until it is upgraded again
+or reseeded. That is right for a token whose latch changed what the cluster
+writes. It used to apply to every token, including one whose feature nobody
+had touched.
+
+From release `release_2026_11_v1` on, the features of a release share **one
+release token** instead of one token each, and each feature carries a **used
+bit**:
+
+- The release token (`release_2026_11_v1` for this release) is mandatory and
+  replication-gated. It latches by itself once every host the cluster
+  replicates to — a host in `maintenance` included — runs this release.
+  Latching it changes nothing on its own.
+- A feature of the release is refused, with `the cluster upgrade must finish
+  first (<feature> needs <token>)`, until the token has latched. The first time
+  it is used anywhere, the cluster records that it is used — a replicated row,
+  written and on the replication stream before the feature writes anything — and
+  if the record cannot be written, the feature's write is refused too. The
+  record is never cleared: nothing proves the feature's data has all gone.
+- A first use also re-checks, live, that every host the cluster replicates to
+  still advertises the token. A host rolled back after the latch therefore
+  holds every **first** use off for as long as it runs; features already in use
+  keep working.
+- The release token's marker carries a rollback rule, `rollback:
+  safe_if_unused`. A binary that understands the rule (this release and later)
+  rolled back below a release token quarantines **only if one of that token's
+  features has been used**. Unused, it starts normally; its peers report it in
+  `ha_degraded` because it does not advertise the token. If a use of a feature it
+  does not know arrives later by replication, it quarantines at that moment,
+  before the feature's data is applied.
+
+**What this does not change.** A binary built before `release_2026_11_v1`
+understands no rollback rule. Rolled back below any token it does not know —
+this release's token included — it quarantines, used or not. Tokens other than
+release tokens carry no rule and block a rollback once latched, as before.
+
+**Before you roll back**, ask the cluster what would block it:
+
+```bash
+lv cluster upgrade-status
+```
+
+It lists every token latched on the connected host with `BLOCKS ROLLBACK`, and
+every release feature with whether it is used and which host used it first.
+`BLOCKS ROLLBACK: no` on a release token means a host rolled back onto a build
+that knows the rule (see above) keeps running. A feature listed as *not known to
+this build* is a newer release's that has been used: this build is the one that
+would be quarantined, and is, if it is the binary answering.
+
+`LITEVIRT_UNSAFE_SKIP_ROLLBACK_CHECK=1` skips the startup check, the recorded
+uses included, as before (see [configuration.md](configuration.md)). A use that
+arrives by replication after startup still quarantines the node at run time;
+that ends with an upgrade back to a build that knows the token, a reseed, or a
+restart with the override set.
+
 ---
 
 ## Operator playbook for cluster-wide upgrades

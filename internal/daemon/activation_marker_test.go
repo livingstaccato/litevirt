@@ -53,7 +53,7 @@ func TestActivationMarkers_EveryReaderFindsWhatTheCheckerWrites(t *testing.T) {
 	d.wireActivationMarker()
 
 	creds, members := CredentialsSplitLatchedOnDisk(dataDir), HostMembershipLatchedOnDisk(dataDir)
-	if creds() || members() || len(preflightCapabilityRollback(dataDir)) > 0 {
+	if creds() || members() || len(preflightCapabilityRollback(dataDir, noUses)) > 0 {
 		t.Fatal("a reader sees a latch before anything has latched")
 	}
 	for _, tok := range []string{capabilities.CredentialsSplitV1, capabilities.HostMembershipSplitV1, future} {
@@ -67,7 +67,7 @@ func TestActivationMarkers_EveryReaderFindsWhatTheCheckerWrites(t *testing.T) {
 	if !members() {
 		t.Error("HostMembershipLatchedOnDisk does not find the marker the checker wrote")
 	}
-	if got := preflightCapabilityRollback(dataDir); len(got) != 1 || got[0] != future {
+	if got := preflightCapabilityRollback(dataDir, noUses); len(got) != 1 || got[0] != future {
 		t.Errorf("preflightCapabilityRollback = %v, want [%s]: the rollback check cannot see the "+
 			"markers the checker writes, so a rolled-back binary is never quarantined", got, future)
 	}

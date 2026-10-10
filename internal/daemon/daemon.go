@@ -318,7 +318,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// would, under the unit's OnFailure rollback, be a rollback loop; and the node
 	// has to stay up anyway so peers can see it degraded and an operator can reseed
 	// it. Fail-closed happens at the write path instead, wired below.
-	if toks := preflightCapabilityRollback(d.cfg.DataDir); len(toks) > 0 {
+	if toks := preflightCapabilityRollback(d.cfg.DataDir, releaseFeatureUseReader(ctx, d.db)); len(toks) > 0 {
 		d.rolledBackTokens = toks
 		slog.Error("preflight: this binary is a ROLLBACK below capability tokens this node "+
 			"already latched; entering WAL quarantine — no replicated writes will be emitted "+
@@ -846,6 +846,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Wire the split-brain gate onto the gRPC server BEFORE ReconcileLBs (below)
 	// re-applies VIPs, so an isolated/latched restart can't bring up a VIP ungated.
 	svc.SetGate(d.checker)
+	// Release features (capabilities.Feature) open through the checker's
+	// RequireFeature: the release token's latch plus the replicated used bit.
+	svc.SetReleaseFeatureGate(d.checker)
 	// The server can answer the lease-mint clearance from here on: it has the
 	// gate whose quorum and healthy-peer set its high-water read uses.
 	d.mintClearance.Store(svc)
@@ -1250,7 +1253,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// A rolled-back node stops advertising capabilities, so the cluster cannot
 	// latch anything further across a member that could not honour it, and peers
 	// raise ha_degraded against it.
-	svc.SetWALQuarantined(func() bool { return len(d.rolledBackTokens) > 0 })
+	// Quarantined below a latched token found at startup, OR since startup by
+	// a use of a newer release's feature arriving by replication.
+	svc.SetWALQuarantined(func() bool {
+		return len(d.rolledBackTokens) > 0 || len(d.db.ReleaseUseQuarantine()) > 0
+	})
 	go vipDemoter.Start(ctx)
 	// Partition pause (docs/design/partition-pause.md): on losing the execution
 	// quorum for T_pause, suspend/freeze every workload the majority would

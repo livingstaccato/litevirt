@@ -133,6 +133,25 @@ func ActivationMarkersOnDisk(dataDir string) ([]string, error) {
 	return toks, nil
 }
 
+// ActivationMarkerRollbackRule returns the rollback rule token's activation
+// marker in dataDir carries (capabilities.MarkerContent), or "" when the marker
+// has none. It reads the file, so it works for a token this build does not
+// know — which is the only case it is for. Lines other than
+// "<capabilities.MarkerRollbackKey>: <rule>" are ignored.
+func ActivationMarkerRollbackRule(dataDir, token string) (string, error) {
+	b, err := os.ReadFile(ActivationMarkerPath(dataDir, token))
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		k, v, ok := strings.Cut(line, ":")
+		if ok && strings.TrimSpace(k) == capabilities.MarkerRollbackKey {
+			return strings.TrimSpace(v), nil
+		}
+	}
+	return "", nil
+}
+
 // markerPathFor derives a token's durable activation marker path from the base.
 func markerPathFor(base, token string) string {
 	return base + activationMarkerSep + token
@@ -203,7 +222,9 @@ func (c *Checker) DurablyLatched(token string) bool {
 // retries — a silently-lost marker would let a restart mid-partition revert to the
 // legacy ungated path, exactly the failure the latch exists to prevent.
 func (c *Checker) persistActivationMarker(base, token string) {
-	if err := os.WriteFile(markerPathFor(base, token), []byte("1\n"), 0o600); err != nil {
+	// A release token's marker carries its rollback rule
+	// (capabilities.MarkerContent); every other marker is the historical "1".
+	if err := os.WriteFile(markerPathFor(base, token), capabilities.MarkerContent(token), 0o600); err != nil {
 		slog.Error("split-brain: failed to persist activation latch — enforcement will not survive a daemon restart until this write succeeds; retrying next cycle",
 			"capability", token, "path", markerPathFor(base, token), "error", err)
 		return

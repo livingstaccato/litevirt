@@ -3796,6 +3796,12 @@ service LiteVirt {
     rpc GetFailoverScope(google.protobuf.Empty)       returns (FailoverScopeStatus);
     rpc SetFailoverScope(SetFailoverScopeRequest)     returns (FailoverScopeStatus);
 
+    // GetUpgradeStatus reports, as the answering host sees them, every
+    // capability token latched here, whether each blocks a rollback, and for
+    // each release token which of its features have been used cluster-wide
+    // (`lv cluster upgrade-status`, docs/upgrades.md). Viewer.
+    rpc GetUpgradeStatus(google.protobuf.Empty)       returns (UpgradeStatus);
+
     // ── anycast services ──
     // service_endpoints map a logical name (e.g. "api.litevirt.local")
     // to N (ip, region) pairs. The embedded DNS server round-robins
@@ -4028,6 +4034,46 @@ message FailoverScopeRegion {
 
 message SetFailoverScopeRequest {
     string scope = 1;  // "cluster" | "region"
+}
+
+// UpgradeStatus is the answering host's view of the capability latches and the
+// release features recorded as used.
+message UpgradeStatus {
+    // release_token is the release token of the answering host's build.
+    string release_token = 1;
+    repeated UpgradeToken tokens = 2;
+    repeated ReleaseFeatureStatus features = 3;
+    // wal_quarantined is true while the answering host emits no replicated
+    // writes; quarantine_reason says why.
+    bool   wal_quarantined   = 4;
+    string quarantine_reason = 5;
+}
+
+// UpgradeToken is one capability token latched on the answering host.
+message UpgradeToken {
+    string name      = 1;
+    bool   durable   = 2;  // the latch's marker is on disk
+    bool   mandatory = 3;  // no config flag
+    // rollback_rule is the marker's rollback rule ("safe_if_unused") or "".
+    string rollback_rule = 4;
+    // blocks_rollback is true when a binary older than this token, but new
+    // enough to read its rollback rule, would quarantine on it: always for a
+    // token with no rule, and for a safe_if_unused token once one of its
+    // features is used. A binary that predates the rule quarantines on every
+    // token it does not know.
+    bool   blocks_rollback = 5;
+}
+
+// ReleaseFeatureStatus is one release feature: declared by this build, or
+// recorded as used under a token this build does not know.
+message ReleaseFeatureStatus {
+    string token         = 1;
+    string name          = 2;
+    string description   = 3;  // "" for a feature this build does not declare
+    bool   used          = 4;
+    string first_used_by = 5;  // the host that recorded the use
+    string recorded_at   = 6;
+    bool   declared      = 7;  // this build declares the feature
 }
 
 // CrossRegionMigrate refuses when source/target hosts are in the

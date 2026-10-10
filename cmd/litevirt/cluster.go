@@ -26,6 +26,7 @@ func newClusterCmd() *cobra.Command {
 		newClusterConvergeCmd(),
 		newClusterAckLeaseTermCmd(),
 		newClusterFailoverScopeCmd(),
+		newClusterUpgradeStatusCmd(),
 		newClusterISOLibraryModeCmd(),
 		newClusterVoterCmd(),
 		newClusterClaimCmd(),
@@ -112,6 +113,88 @@ func printFailoverScope(out io.Writer, st *pb.FailoverScopeStatus) {
 			"automatically fenced or recovered under region scope. Add voters (a witness counts), or\n"+
 			"run 'lv cluster failover-scope cluster'.\n", small)
 	}
+}
+
+// lv cluster upgrade-status — the capability tokens latched on the connected
+// host, whether each blocks a rollback, and which release features are in use
+// (capabilities.ReleaseToken, docs/upgrades.md).
+func newClusterUpgradeStatusCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "upgrade-status",
+		Short: "Show latched capability tokens, rollback blockers and release features in use",
+		Long: `Show, as the connected host sees them, every capability token latched on it,
+whether each would block rolling a host back below the build that introduced it,
+and which features of each release token have been used anywhere in the cluster.
+
+A token with no rollback rule blocks a rollback once latched: a host rolled back
+below it enters WAL quarantine. A release token carries the rule
+"safe_if_unused": a host rolled back below it, onto a build that understands the
+rule, quarantines only if one of its features has been used. A build older than
+the first release token understands no rule and quarantines on every token it
+does not know, used or not.
+
+A feature is marked used the first time it is used on any host, before that
+use writes anything, and stays marked: nothing proves its data has all gone.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				st, err := c.GetUpgradeStatus(ctx, &emptypb.Empty{})
+				if err != nil {
+					return fmt.Errorf("get upgrade status: %w", err)
+				}
+				printUpgradeStatus(os.Stdout, st)
+				return nil
+			})
+		},
+	}
+}
+
+func upgradeYesNo(b bool) string {
+	if b {
+		return "yes"
+	}
+	return "no"
+}
+
+func printUpgradeStatus(out io.Writer, st *pb.UpgradeStatus) {
+	fmt.Fprintf(out, "Release token: %s\n", st.GetReleaseToken())
+	if st.GetWalQuarantined() {
+		fmt.Fprintf(out, "WAL quarantine: yes — %s\n", st.GetQuarantineReason())
+	}
+	fmt.Fprintln(out)
+	w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
+	fmt.Fprintf(w, "TOKEN\tDURABLE\tMANDATORY\tROLLBACK RULE\tBLOCKS ROLLBACK\n")
+	for _, tk := range st.GetTokens() {
+		rule := tk.GetRollbackRule()
+		if rule == "" {
+			rule = "-"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", tk.GetName(), upgradeYesNo(tk.GetDurable()),
+			upgradeYesNo(tk.GetMandatory()), rule, upgradeYesNo(tk.GetBlocksRollback()))
+	}
+	w.Flush()
+	if len(st.GetTokens()) == 0 {
+		fmt.Fprintln(out, "(no capability token has latched on this host)")
+	}
+	fmt.Fprintln(out)
+	if len(st.GetFeatures()) == 0 {
+		fmt.Fprintln(out, "No release features are declared by this build or recorded as used.")
+		return
+	}
+	w = tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
+	fmt.Fprintf(w, "RELEASE TOKEN\tFEATURE\tUSED\tFIRST USED BY\tDESCRIPTION\n")
+	for _, f := range st.GetFeatures() {
+		desc := f.GetDescription()
+		if !f.GetDeclared() {
+			desc = "(not known to this build: a newer release's feature)"
+		}
+		by := f.GetFirstUsedBy()
+		if by == "" {
+			by = "-"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", f.GetToken(), f.GetName(), upgradeYesNo(f.GetUsed()), by, desc)
+	}
+	w.Flush()
 }
 
 // lv cluster acknowledge-lease-term — clear a contested lease term from the CONNECTED

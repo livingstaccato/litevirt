@@ -39,6 +39,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"time"
 )
 
 // RelayDemotedKeyPrefix is the cluster_policies key prefix of the demotion
@@ -59,6 +60,20 @@ type RelayDemotion struct {
 	Since string `json:"since"`
 	// Reason says why, for the operator.
 	Reason string `json:"reason"`
+	// HoldUntil, on a restore an operator made (`lv cluster relay-restore`),
+	// is when the lease holder may demote the host again (RFC 3339). Empty:
+	// no hold. It is the stand-down for a demotion the evaluator keeps
+	// re-deriving from a fault that is not the host's.
+	HoldUntil string `json:"hold_until,omitempty"`
+}
+
+// Held reports whether an operator's hold forbids demoting the host at now.
+func (d RelayDemotion) Held(now time.Time) bool {
+	if d.Demoted || d.HoldUntil == "" {
+		return false
+	}
+	until, err := time.Parse(time.RFC3339, d.HoldUntil)
+	return err == nil && now.Before(until)
 }
 
 // SetRelayHealthGate injects the predicate that permits writing demotion
@@ -93,10 +108,10 @@ func SetRelayDemotion(ctx context.Context, c *Client, host string, d RelayDemoti
 	return c.Execute(ctx, clusterPolicyUpsertSQL, RelayDemotedKeyPrefix+host, string(b), setBy, c.NowTS())
 }
 
-// ListRelayDemotions returns every host whose row says it is demoted. A row
-// whose value does not parse, or says demoted=false, is not a demotion: the
-// bytes are replicated, so every node reaches the same answer about it.
-func ListRelayDemotions(ctx context.Context, c *Client) (map[string]RelayDemotion, error) {
+// ListRelayRows returns every relay_demoted/<host> row that parses, by host,
+// demoted or restored. A row whose value does not parse is skipped: the bytes
+// are replicated, so every node reaches the same answer about it.
+func ListRelayRows(ctx context.Context, c *Client) (map[string]RelayDemotion, error) {
 	rows, err := c.Query(ctx,
 		`SELECT key, value FROM cluster_policies WHERE key >= ? AND key < ? AND deleted_at IS NULL`,
 		RelayDemotedKeyPrefix, RelayDemotedKeyPrefix+"\xff")
@@ -110,10 +125,26 @@ func ListRelayDemotions(ctx context.Context, c *Client) (map[string]RelayDemotio
 			continue
 		}
 		var d RelayDemotion
-		if json.Unmarshal([]byte(r.String("value")), &d) != nil || !d.Demoted {
+		if json.Unmarshal([]byte(r.String("value")), &d) != nil {
 			continue
 		}
 		out[strings.TrimPrefix(k, RelayDemotedKeyPrefix)] = d
+	}
+	return out, nil
+}
+
+// ListRelayDemotions returns every host whose row says it is demoted. A row
+// that does not parse, or says demoted=false, is not a demotion.
+func ListRelayDemotions(ctx context.Context, c *Client) (map[string]RelayDemotion, error) {
+	all, err := ListRelayRows(ctx, c)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]RelayDemotion, len(all))
+	for h, d := range all {
+		if d.Demoted {
+			out[h] = d
+		}
 	}
 	return out, nil
 }

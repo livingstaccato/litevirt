@@ -27,6 +27,17 @@ func (c RelayConfig) withDefaults() RelayConfig {
 	return c
 }
 
+// RelayCount is R, the number of relays an election over n nodes (self
+// included) elects: min(n, BaseRelays + ceil(n / NodesPerRelay)).
+func (c RelayConfig) RelayCount(n int) int {
+	c = c.withDefaults()
+	r := c.BaseRelays + (n+c.NodesPerRelay-1)/c.NodesPerRelay
+	if r > n {
+		r = n
+	}
+	return r
+}
+
 // RelaySet represents the current set of elected relays and leaf-to-relay assignments.
 type RelaySet struct {
 	relays          []string             // sorted relay hostnames
@@ -131,10 +142,7 @@ func ComputeRelays(members []PeerInfo, selfName string, cfg RelayConfig, relayEl
 	sort.Strings(names)
 
 	N := len(names)
-	R := cfg.BaseRelays + (N+cfg.NodesPerRelay-1)/cfg.NodesPerRelay
-	if R > N {
-		R = N
-	}
+	R := cfg.RelayCount(N)
 
 	// Eligible names first, then the rest, each half keeping sorted order. The
 	// result is still a total order every node derives identically, so the

@@ -815,11 +815,15 @@ const (
 //     demotion rows when it elects relays, and every node relies on every
 //     other electing the same set. What it licenses is bounded — a demotion
 //     withholds the relay ROLE only (the host stays a leaf), the lease holder
-//     never demotes below BaseRelays eligible hosts, changes at most one host
-//     per cycle, and restores a host after 10 minutes with no failing
-//     observer — so its stand-down is healing the link; the restore follows on
-//     its own. A binary rolled back below it enters WAL quarantine, as below
-//     every latched token.
+//     never demotes below the election's relay count, changes at most one
+//     host per cycle, and restores a host after 10 minutes below the
+//     demotion bar. Its stand-down is `lv cluster relay-restore <host>
+//     [--hold <duration>]` (admin, audited): it clears the demotion through
+//     the same replicated row at once and, with a hold, keeps the lease
+//     holder from demoting that host again — the answer to a demotion the
+//     evaluator keeps re-deriving from a fault that is not the host's. A
+//     binary rolled back below it enters WAL quarantine, as below every
+//     latched token.
 //
 // recovery_claim_v1 is NOT mandatory and HAS a flag, enforcement.recovery_claim,
 // which is its stand-down: false on every node and a restart returns recovery

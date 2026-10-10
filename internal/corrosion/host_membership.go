@@ -338,9 +338,12 @@ func membershipEpochIs(ctx context.Context, host string, want int64) func(tx *sq
 // which updated_at. Later statements in the entry override earlier ones.
 type unlatchedMembershipWrite struct {
 	host, ts string
-	// insert is true when the write is an INSERT INTO hosts: the row is new,
-	// so its columns the write did not set hold their fresh defaults.
+	// insert is true when the write is an INSERT INTO hosts, or a
+	// re-admission (readmitHostSQL): the identity row is written whole, so
+	// the write may create a missing membership row and revive a tombstoned
+	// one (re-review 2, N5). Re-admission keeps isolation by contract.
 	insert   bool
+	revive   bool
 	hasState bool
 	state    string
 	hasIso   bool
@@ -412,6 +415,9 @@ func unlatchedMembershipWrites(stmts []Statement) []unlatchedMembershipWrite {
 		if sh.Kind == KindInsert {
 			w.insert = true
 		}
+		if isReadmitStatement(s.SQL) {
+			w.insert, w.revive = true, true
+		}
 		if lwwOrder(w.ts, ts) < 0 {
 			w.ts = ts
 		}
@@ -470,6 +476,7 @@ const (
 		 WHERE host_name = ?`
 	absorbBothSQL = `UPDATE host_membership SET state = ?, isolation_epoch = ?, isolation_reason = ?, updated_at = ?
 		 WHERE host_name = ?`
+	absorbReviveSQL = `UPDATE host_membership SET state = ?, deleted_at = NULL, updated_at = ? WHERE host_name = ?`
 	absorbInsertSQL = `INSERT INTO host_membership (host_name, state, isolation_epoch, isolation_reason, updated_at, deleted_at)
 		 VALUES (?, ?, ?, ?, ?, NULL)`
 )
@@ -530,7 +537,8 @@ func absorbMembershipWrite(ctx context.Context, tx *sql.Tx, w unlatchedMembershi
 		return err
 	}
 	var memTS string
-	err = tx.QueryRowContext(ctx, `SELECT updated_at FROM host_membership WHERE host_name = ?`, w.host).Scan(&memTS)
+	var memDeleted sql.NullString
+	err = tx.QueryRowContext(ctx, `SELECT updated_at, deleted_at FROM host_membership WHERE host_name = ?`, w.host).Scan(&memTS, &memDeleted)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		if !mayInsert {
@@ -549,6 +557,12 @@ func absorbMembershipWrite(ctx context.Context, tx *sql.Tx, w unlatchedMembershi
 		return err
 	case lwwOrder(memTS, updatedAt) >= 0:
 		return nil // the membership row is as new or newer
+	}
+	if w.revive && memDeleted.Valid && w.hasState {
+		// A re-admission revives the host's tombstoned row: its state from
+		// the write, its isolation the tombstone's own (kept by contract).
+		_, err = tx.ExecContext(ctx, absorbReviveSQL, w.state, updatedAt, w.host)
+		return err
 	}
 	switch {
 	case w.hasState && w.hasIso:
@@ -732,3 +746,12 @@ func currentIsolation(ctx context.Context, c *Client, host string) (int64, strin
 	}
 	return cur.Epoch, cur.Reason, nil
 }
+
+// isReadmitStatement reports whether sqlText is readmitHostSQL. Its wire shape
+// has not changed across builds (host_readmit.go), so a peer on any supported
+// build sends exactly this text.
+func isReadmitStatement(sqlText string) bool {
+	return strings.Join(strings.Fields(sqlText), " ") == readmitNormalized
+}
+
+var readmitNormalized = strings.Join(strings.Fields(readmitHostSQL), " ")

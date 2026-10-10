@@ -43,24 +43,19 @@ const partitionResumeRPCTimeout = 3 * time.Second
 // voter, or one on a build without the RPC, is not an answer.
 func (s *Server) CheckPartitionResume(ctx context.Context, recs []health.PauseRecord) map[string]health.ResumeVerdict {
 	out := make(map[string]health.ResumeVerdict, len(recs))
-	voters, err := corrosion.VoterSet(ctx, s.db)
+	// A voter this node reads as unknown (no membership row, a frozen hosts
+	// copy) stays in the majority it must reach but is not asked: on the
+	// cluster's view it may be out of the voter set, and counting its clean
+	// answer could let a minority resume what the majority recovered — the
+	// rule the quorum count applies (corrosion.VotersNotCountedLive).
+	voters, uncounted, err := corrosion.VoterSetWithUncounted(ctx, s.db)
 	if err != nil {
 		for _, r := range recs {
 			out[r.Key()] = health.ResumeVerdict{Reason: "voter set unreadable: " + err.Error()}
 		}
 		return out
 	}
-	need := len(voters)/2 + 1
-	if voters[s.hostName] {
-		need--
-	}
-	names := make([]string, 0, len(voters))
-	for v := range voters {
-		if v != s.hostName {
-			names = append(names, v)
-		}
-	}
-	sort.Strings(names)
+	names, need := resumeAskSet(s.hostName, voters, uncounted)
 	req := &pb.ConfirmPartitionResumeRequest{}
 	for _, r := range recs {
 		req.Workloads = append(req.Workloads, &pb.PausedWorkload{Kind: claimKindOf(r.Kind), Name: r.Name,
@@ -198,4 +193,23 @@ func (s *Server) VerifySettleProof(ctx context.Context, p corrosion.ActionProof)
 		return corrosion.ClaimCertificate{}, fmt.Errorf("no claim verifier on this node: %w", err)
 	}
 	return corrosion.VerifyClaimCertificate(ctx, s.db, verifier, p)
+}
+
+// resumeAskSet is who CheckPartitionResume asks and how many clean answers it
+// needs: a majority of the whole voter set, counting this host when it is a
+// voter, asking every other voter except those this node reads as unknown —
+// who stay in the majority to reach but whose answers never count.
+func resumeAskSet(self string, voters, uncounted map[string]bool) (names []string, need int) {
+	need = len(voters)/2 + 1
+	if voters[self] && !uncounted[self] {
+		need--
+	}
+	names = make([]string, 0, len(voters))
+	for v := range voters {
+		if v != self && !uncounted[v] {
+			names = append(names, v)
+		}
+	}
+	sort.Strings(names)
+	return names, need
 }

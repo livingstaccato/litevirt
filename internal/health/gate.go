@@ -158,7 +158,7 @@ func VotingEligible(state string) bool { return corrosion.VotingEligible(state) 
 // docs/design/region-scoped-failover.md §2.4). The region-scoped counts are
 // RegionQuorumProof, ExecutionGate and DecisionGateForRegion.
 func (c *Checker) QuorumProof(ctx context.Context) (state QuorumState, live, needed int) {
-	voters, err := corrosion.VoterSet(ctx, c.db)
+	voters, uncounted, err := corrosion.VoterSetWithUncounted(ctx, c.db)
 	if err != nil {
 		// Can't read the host table → UNKNOWN, not No. For gates this still fails closed
 		// (Unknown refuses). But the VIPDemoter treats sustained No as a TRIGGER to demote
@@ -166,10 +166,6 @@ func (c *Checker) QuorumProof(ctx context.Context) (state QuorumState, live, nee
 		// watchdog, to self-fence); mapping a transient local DB error (e.g. anti-entropy
 		// lock contention) to No would stand a healthy, quorum-holding node's VIP down.
 		// Unknown = "neither proof nor loss" → no action, no loss-clock.
-		return QuorumUnknown, 0, 0
-	}
-	uncounted, err := corrosion.VotersNotCountedLive(ctx, c.db)
-	if err != nil {
 		return QuorumUnknown, 0, 0
 	}
 	state, live, needed = c.quorumOver(voters, uncounted)

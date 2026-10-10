@@ -219,7 +219,6 @@ func TestFleet_HostMembershipRetire_ANotLiveNeighboursDrainReachesARetiredNode(t
 // next cycle fences it as usual.
 func TestFleet_HostMembershipRetire_TheCoordinatorNeverFencesAnUnknownHost(t *testing.T) {
 	ctx := context.Background()
-	clock := NewVirtualClock(time.Now().UTC())
 	c := New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: 2676})
 	a, b, victim := c.Nodes[0], c.Nodes[1], c.Nodes[2]
 	insertVM(t, a, "vm-unknown", victim.Name)
@@ -229,6 +228,9 @@ func TestFleet_HostMembershipRetire_TheCoordinatorNeverFencesAnUnknownHost(t *te
 	}
 	c.WaitConverged(t, convergeTimeout)
 
+	// The observations come after the host's current life began (its
+	// membership row dates it from its hosts row, HostFenceLife).
+	clock := NewVirtualClock(time.Now().UTC())
 	c.Isolate(victim)
 	PublishHealth(t, a, victim.Name, 5, clock.Now())
 	PublishHealth(t, b, victim.Name, 5, clock.Now())

@@ -349,6 +349,38 @@ func VotersNotCountedLive(ctx context.Context, c *Client) (map[string]bool, erro
 	return out, nil
 }
 
+// VoterSetWithUncounted is VoterSet and VotersNotCountedLive from ONE read of
+// host state, so a membership row landing between two reads cannot make them
+// disagree (re-review 2, N4).
+func VoterSetWithUncounted(ctx context.Context, c *Client) (voters, uncounted map[string]bool, err error) {
+	cfg, err := AdoptedVoterConfig(ctx, c)
+	if err != nil {
+		return nil, nil, err
+	}
+	uncounted = map[string]bool{}
+	if cfg.Explicit() {
+		voters = make(map[string]bool, len(cfg.Members))
+		for _, m := range cfg.Members {
+			voters[m.Name] = true
+		}
+		return voters, uncounted, nil
+	}
+	states, err := resolvedHostStates(ctx, c)
+	if err != nil {
+		return nil, nil, err
+	}
+	voters = make(map[string]bool, len(states))
+	for name, state := range states {
+		if VotingEligible(state) {
+			voters[name] = true
+		}
+		if state == HostStateUnknown {
+			uncounted[name] = true
+		}
+	}
+	return voters, uncounted, nil
+}
+
 // DerivedVoterSet is the voter set as it was before any explicit generation:
 // every non-deleted host whose state is VotingEligible. Automatic genesis
 // proposes it as generation 1's members.

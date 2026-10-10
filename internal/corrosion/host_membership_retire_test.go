@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 )
 
 // retireLive is a node that has latched host_membership_split_v1, completed
@@ -191,11 +192,12 @@ func TestHostMembershipRetire_AFrozenWriterNeverInsertsFromTheFrozenCopy(t *test
 	}
 }
 
-// TestHostMembershipRetire_AFloorCopyDatesNothing (re-review m4): a split-pass
-// copy is stamped at a floor and records no state change, so it is no "active
-// since" boundary — HostActiveSince and HostFenceLife report none, as before
-// the split, rather than a boundary forty years back.
-func TestHostMembershipRetire_AFloorCopyDatesNothing(t *testing.T) {
+// TestHostMembershipRetire_AFloorCopyDatesItsHostsRow (re-review 2, N6): a
+// split-pass copy is stamped at the floor — the copied hosts row's instant
+// moved back by a fixed shift — and the readers undo the shift, so the "active
+// since" boundary is that hosts row's time, as before the split, decoded from
+// the copy's own stamp.
+func TestHostMembershipRetire_AFloorCopyDatesItsHostsRow(t *testing.T) {
 	ctx := context.Background()
 	c := newTestDB(t)
 	seedMembershipHosts(t, c, "h1")
@@ -203,17 +205,55 @@ func TestHostMembershipRetire_AFloorCopyDatesNothing(t *testing.T) {
 	if _, err := c.SplitHostMembership(ctx); err != nil {
 		t.Fatal(err)
 	}
-	floor, ok := membershipCopyTS("2026-06-01T00:00:00Z")
+	const hostsTS = "2026-06-01T00:00:00Z"
+	floor, ok := membershipCopyTS(hostsTS)
 	if !ok {
 		t.Fatal("floor")
 	}
 	if err := c.execLocal(ctx, `UPDATE host_membership SET state = 'active', updated_at = ? WHERE host_name = 'h1'`, floor); err != nil {
 		t.Fatal(err)
 	}
-	if at, ok, err := HostActiveSince(ctx, c, "h1"); err != nil || ok {
-		t.Errorf("HostActiveSince = %v ok=%v err=%v; a floor copy is no boundary", at, ok, err)
+	want, _ := time.Parse(time.RFC3339, hostsTS)
+	at, ok, err := HostActiveSince(ctx, c, "h1")
+	if err != nil || !ok || !at.Equal(want) {
+		t.Errorf("HostActiveSince = %v ok=%v err=%v, want %v (the copied hosts row's time)", at, ok, err, want)
 	}
-	if since, _, ok, err := HostFenceLife(ctx, c, "h1"); err != nil || ok {
-		t.Errorf("HostFenceLife = %v ok=%v err=%v; a floor copy is no boundary", since, ok, err)
+	since, _, ok, err := HostFenceLife(ctx, c, "h1")
+	if err != nil || !ok || !since.Equal(want.Add(-fenceLifeSkew).Truncate(time.Second)) {
+		t.Errorf("HostFenceLife = %v ok=%v err=%v, want %v less the skew", since, ok, err, want)
+	}
+}
+
+// TestHostMembershipRetire_AReadmissionCreatesOrRevivesTheRow (re-review 2,
+// N5): a re-admission from a node not writing host_membership yet rewrites the
+// identity row whole. On a retired node it creates the host's missing
+// membership row (a host removed before the split never had one) and revives a
+// tombstoned one, keeping that row's isolation — otherwise the host reads
+// unknown forever, as every later state write only updates an existing row.
+func TestHostMembershipRetire_AReadmissionCreatesOrRevivesTheRow(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	seedMembershipHosts(t, c, "h1", "h2")
+	retireLive(t, c)
+	for _, q := range []string{
+		`UPDATE hosts SET deleted_at = '2026-01-01T00:00:00Z' WHERE name IN ('h1', 'h2')`,
+		`DELETE FROM host_membership WHERE host_name = 'h1'`,
+		`UPDATE host_membership SET deleted_at = '2026-01-01T00:00:00Z', isolation_epoch = 9, isolation_reason = 'manual' WHERE host_name = 'h2'`,
+	} {
+		if err := c.execLocal(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, h := range []string{"h1", "h2"} {
+		applyAsReplicated(t, c, Statement{SQL: readmitHostSQL, Params: []interface{}{
+			"10.0.0.9", "root", 22, 7443, "joining", "new-" + h, "2999-01-01T00:00:00Z", h, "new-" + h}})
+	}
+	for _, h := range []string{"h1", "h2"} {
+		if got := resolvedState(t, c, h); got != "joining" {
+			t.Errorf("%s reads %q after its re-admission, want joining", h, got)
+		}
+	}
+	if got := membershipCol(t, c, "h2", "isolation_epoch"); got != "9" {
+		t.Errorf("h2's revived row has isolation_epoch %q, want the tombstone's 9", got)
 	}
 }

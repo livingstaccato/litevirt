@@ -82,9 +82,21 @@ release back, as v57's was.
   writer on a retired node that has no row for the host updates an existing
   row only (`hostMembershipStateOnlySQL`); the row, with that state, reaches
   this node by anti-entropy from any node that had it.
-- **A floor copy dates nothing** (re-review m4). `HostsActiveSince`,
-  `HostActiveSince` and `HostFenceLife` treat a floor-stamped row as "no
-  boundary known", which is how they judged before the split.
+- **A floor copy dates its hosts row** (re-review 2, N6). The floor is the
+  copied hosts row's instant moved back by a fixed shift, so `HostsActiveSince`,
+  `HostActiveSince` and `HostFenceLife` undo the shift and date the host's life
+  from that hosts row's time, as before the split — decoded from the copy's
+  own stamp, with no parent row read or compared.
+- **Unknown voters never answer a resume** (re-review 2, N4).
+  `CheckPartitionResume` keeps a voter it reads as unknown in the majority it
+  must reach but does not ask it, the rule the quorum count applies; both read
+  the voter set and the unknown set in one read
+  (`corrosion.VoterSetWithUncounted`).
+- **A re-admission creates or revives the row** (re-review 2, N5). A
+  re-admission from a node not writing host_membership yet rewrites the
+  identity row whole, so a retired node's absorb creates the host's missing
+  membership row and revives a tombstoned one (keeping its isolation), instead
+  of leaving the host unknown forever.
 - **Absorbing hosts-only writes stays (deviation from item 2 above).** A latch
   is per node: a neighbour that advertises the retire token but whose own
   `host_membership_split_v1` latch has not formed yet still writes `hosts`
@@ -108,9 +120,9 @@ release back, as v57's was.
   compared against its parent row's `updated_at`, which CLAUDE.md forbids.
   It is transient: before the retire latch the `hosts` copy is current, and
   any real or absorbed write wins.
-- **Re-admission** of a removed host on a retired node that has no live
-  membership row for it still inserts one, taking the isolation pair from the
-  `hosts` copy, as the identity row is rewritten whole.
+- **Re-admission** of a removed host that has no membership row at all (it
+  was removed before the split) creates one taking the isolation pair from the
+  `hosts` copy, the only one there is.
 
 ## Out of scope
 

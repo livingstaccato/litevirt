@@ -95,7 +95,7 @@ func TestImport_SetsAsideAStaleOverlay(t *testing.T) {
 	recordQemuImg(t)
 	s, _, live := pitServer(t)
 	windowOverlay(t, live)
-	if err := s.setAsideStaleOverlay(context.Background(), "web", "root", live); err != nil {
+	if err := s.setAsideStaleOverlay(context.Background(), "web", "root", live, ""); err != nil {
 		t.Fatal(err)
 	}
 	if pitoverlay.Present(live) {

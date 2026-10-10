@@ -10,6 +10,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/litevirt/litevirt/internal/auth"
+	"github.com/litevirt/litevirt/internal/pitoverlay"
 	"github.com/litevirt/litevirt/internal/storage"
 )
 
@@ -24,6 +25,9 @@ import (
 // and is exercised separately in production builds.
 func TestMain(m *testing.M) {
 	auth.BcryptCost = bcrypt.MinCost
+	// Test disks live in temporary directories, which may be a tmpfs; a
+	// layer-2 overlay is refused there in production (pitoverlay.Placement).
+	pitoverlay.AllowVolatileForTest()
 	// No test looks up a real NFS server name: each name gets an address of
 	// its own in the benchmarking range. Tests that need names to share an
 	// address, or to fail, override it themselves.

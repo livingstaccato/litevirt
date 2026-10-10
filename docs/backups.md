@@ -256,50 +256,100 @@ by the strongest method the host has, tried in this order:
    block-commit and pivot; a commit job already running is resumed, and a
    pivot that keeps failing is aborted so no job is left behind). Still
    point-in-time. The overlay is `.<disk file>.lv-pit` beside the disk, on the
-   same pool, so a failover target on shared storage sees it too.
+   same pool, so a failover target on shared storage sees it too. It is never
+   placed where it would not survive: a disk that is not a regular file (a
+   `/dev` block device, whose directory is devtmpfs) or a pool directory on
+   tmpfs takes the next step instead, because a reboot or a failover would
+   lose the overlay and the guest's writes in it.
 
    **Never delete a `.lv-pit` file.** While one exists it may hold the
-   guest's newest writes. It is bound to the exact disk file it was taken of
-   by a sidecar beside it (`.<disk file>.lv-pit.id`): the VM, its disk, and
-   the file's name, inode, size and modification time — not the device
-   number, which differs between hosts mounting one NFS export and can change
-   across a remount or reboot. The sidecar is written, and synced, before
-   anything relies on it: if it cannot be, no commit starts and the window is
-   kept open (reported) and retried. If the commit fails, the VM keeps
+   guest's newest writes. It is bound to the exact disk file it was taken of:
+   - before the snapshot, a new random token is written into an extended
+     attribute of the disk file (`user.litevirt.pit_window`) and synced. A
+     copy or restore of the file (`cp -p`, `rsync -a` without `-X`) does not
+     carry it, and a new file at the same path does not have it;
+   - a sidecar beside the overlay (`.<disk file>.lv-pit.id`) records the VM,
+     its disk, that token, and the file's inode, size and modification time —
+     not the device number, which differs between hosts mounting one NFS
+     export and can change across a remount or reboot.
+
+   On a filesystem without user extended attributes there is no token, and
+   the size and time bounds below decide alone. Local ext4, XFS, btrfs and
+   ZFS datasets, and tmpfs, have them; NFS has them only at version 4.2 (Linux
+   5.9 or later on both ends), so an export mounted at 4.1 or 3 has none. A
+   host that cannot read a token another host recorded (it mounts the export
+   at an older version) holds the VM rather than guess. zfs zvols, lvm-thin,
+   ceph and iscsi disks are block devices, which take no overlay at all.
+
+   The sidecar is written, and synced, before anything relies on it, and it
+   follows the commit: `committing` before the commit's first write to the
+   disk (every attempt renews its stamp, and a long commit renews it while it
+   runs), `pivoting` just before a live commit pivots the VM onto the disk,
+   and `committed` once it has. If a record cannot be written, the step it
+   records does not happen: no commit starts, no pivot is made, and the window
+   stays open, reported, and is retried. If the commit fails, the VM keeps
    running on the overlay and a `disk.pit_overlay_stranded` event and a
    `replication.pit_overlay_stranded` notification say so.
 
    Every later copy (replication, `lv replicate-volume`), move
    (`lv move-volume`, live or offline), migration, backup, clone, `lv start`,
    reconfigure, in-place restore, `lv rm` of a disk it keeps, failover restart
-   and the daemon's start-up sweep settles the overlay first:
-   - a running VM on the overlay is committed live;
-   - otherwise, if the overlay is bound to this VM's disk and the file is the
-     one it was taken of, unchanged since (or one a commit began writing, not
-     written long after that), it is committed offline (`qemu-img commit`,
-     without `-U`, pointing the overlay at the disk by its name beside it if
-     another host took it under another mount path), the persistent
-     definition is pointed back at the disk, and only then is the overlay
-     removed;
-   - if libvirt cannot say whether the VM runs, nothing is touched and the
-     operation is refused until it can;
-   - any other overlay cannot be verified (the running VM uses its disk
-     directly, or the overlay is another VM's, unbound, or of a file replaced
-     or written since). It is never committed (that could write stale blocks
-     over newer data) and never dropped (it may hold the guest's writes): the
-     VM is **held** — not started or defined on the bare disk, and the
-     operation refused — with a `disk.pit_overlay_held` event and a
-     `replication.pit_overlay_held` notification naming both files, and
-     `lv inspect <vm>` shows it as `pitOverlayHeld`. An admin decides with
-     `lv resolve-pit-overlay <vm> <disk> --commit` (write the overlay into the
-     disk) or `--discard` (delete it and its writes), each only with
-     `--confirm`; without it the command prints the two files and the
-     binding. It needs the VM stopped, is admin only, and is audited.
+   and the daemon's start-up sweep settles the overlay first. It judges it
+   against the disk as it is now — a **verdict**:
+   - **matches**: the disk is the file the overlay was taken of, unchanged.
+     It is committed (`qemu-img commit`, without `-U`, pointing the overlay at
+     the disk by its name beside it if another host took it under another
+     mount path), the persistent definition is pointed back at the disk, and
+     only then is the overlay removed. A running VM on the overlay is
+     committed live instead;
+   - **half-written**: a commit began and the disk is the file it was writing
+     — same token, no smaller and no older than when the overlay was taken,
+     and not written more than two hours after the last commit attempt. The
+     commit is finished the same way: only that makes the disk whole;
+   - **pivoted**: the overlay is already in the disk — the commit was
+     recorded, or a pivot was under way and the VM runs on its disk. It is
+     removed, never committed again over the guest's newer writes;
+   - **unknown**: anything else — the overlay is another VM's or unbound; the
+     disk was replaced, restored, re-created or written since; the token is
+     missing or another; the VM was found running on its disk without the
+     overlay (it is then marked so, and never committed automatically after);
+     or a pivot was under way and, with the VM off, it cannot be told whether
+     it landed. It is never committed (that could write stale blocks over
+     newer data) and never dropped (it may hold the guest's writes): the VM is
+     **held** — not started or defined on the bare disk, and the operation
+     refused. If libvirt cannot say whether the VM runs, nothing is touched
+     and the operation is refused until it can.
+
+   A hold is a `pit_overlay.held` health condition per disk (a warning:
+   `lv health` is degraded while it stands), and `lv inspect <vm>` shows it as
+   `pitOverlayHeld`, read from that condition. A `disk.pit_overlay_held` event
+   and a `replication.pit_overlay_held` notification name both files, the
+   verdict and what to do for it — once when the hold begins, then at most
+   daily. It resolves by itself once a later settle can commit the overlay or
+   finds it merged, or when the disk is deleted.
+
+   An admin decides with `lv resolve-pit-overlay <vm> <disk>`, which needs the
+   VM stopped, is admin only, and is audited. Without `--confirm` it does
+   nothing: it prints the verdict, the disk's identity then and now, the
+   overlay's backing file, and what each action would do.
+   - `--commit --confirm` writes the overlay into the disk, through the same
+     checks as every automatic commit, and is refused unless the verdict is
+     matches or half-written. `--force-commit` overrides the verdict, for
+     experts who have checked both files: if the disk is not what the overlay
+     was taken of, it overwrites newer data with older blocks. Even forced, an
+     overlay whose backing file is another file is never pointed at this disk.
+   - `--discard --confirm` deletes the overlay and its writes. Of a disk a
+     commit had begun writing (half-written, or unknown after a commit began)
+     it is refused unless `--accept-torn-disk` is given: without the overlay
+     that disk is inconsistent, and restoring it from a backup or a replica is
+     the alternative.
 
    When a disk is deleted (`lv rm`, rebuild), its overlay and sidecar are
    deleted with it. An import that finds an overlay where its new disk goes
-   renames it `.<disk file>.lv-pit.orphan-<time>` (never over an earlier one)
-   and reports it (`disk.pit_overlay_set_aside`); inspect it and delete it.
+   renames it `.<disk file>.lv-pit.orphan-<time>` (never over an earlier one
+   or its sidecar), says where the file it was taken of went if the import
+   moved that aside too, and reports it (`disk.pit_overlay_set_aside`);
+   inspect both, then delete them.
    The start-up sweep waits until the host's replica is trusted (caught up
    with a peer, or the cluster's only host), and on a shared pool touches only
    disks of VMs this host owns and has defined (others are left to their owner
@@ -478,6 +528,17 @@ storage that copy's mark is also kept in its host's replicated pool record.
 Each host rewrites only its own records, so no peer on an older build can drop
 a mark; a host rolled back to an older build drops the marks of the copies it
 recorded (local and replicated) the next time it rewrites those records.
+
+An older build knows nothing of `.lv-pit` overlays either. A host on one that
+restarts a VM whose window was open starts it on the bare disk, as it always
+did, and the window's writes are lost there; an upgraded host that later meets
+the overlay holds the VM once the disk has been written since — unless a commit
+had begun and its last attempt was under two hours before that write, in which
+case it is taken for the commit's own and the overlay is committed over it.
+Mixed-build failover of a VM in the middle of a layer-2 commit is that narrow.
+An older build shows the `pit_overlay.held` condition in `lv health` like any
+other, but never raises or resolves it, and an `lv` older than the daemon has
+no `--force-commit` or `--accept-torn-disk`: upgrade it to resolve a hold.
 
 Automatic promotion **refuses a replica older than two of the schedule's
 longest intervals plus an hour** (or one whose filename carries no readable

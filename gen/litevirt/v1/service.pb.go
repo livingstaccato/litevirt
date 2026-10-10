@@ -24919,13 +24919,19 @@ func (x *PromoteReplicaRequest) GetAcceptNotPointInTime() bool {
 }
 
 type ResolvePITOverlayRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	VmName        string                 `protobuf:"bytes,1,opt,name=vm_name,json=vmName,proto3" json:"vm_name,omitempty"`
-	DiskName      string                 `protobuf:"bytes,2,opt,name=disk_name,json=diskName,proto3" json:"disk_name,omitempty"`
-	Action        string                 `protobuf:"bytes,3,opt,name=action,proto3" json:"action,omitempty"`    // "commit" | "discard"
-	Confirm       bool                   `protobuf:"varint,4,opt,name=confirm,proto3" json:"confirm,omitempty"` // false: report what would be done, do nothing
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	VmName   string                 `protobuf:"bytes,1,opt,name=vm_name,json=vmName,proto3" json:"vm_name,omitempty"`
+	DiskName string                 `protobuf:"bytes,2,opt,name=disk_name,json=diskName,proto3" json:"disk_name,omitempty"`
+	Action   string                 `protobuf:"bytes,3,opt,name=action,proto3" json:"action,omitempty"`    // "commit" | "discard" | "" (report only, without confirm)
+	Confirm  bool                   `protobuf:"varint,4,opt,name=confirm,proto3" json:"confirm,omitempty"` // false: report the verdict and what would be done, do nothing
+	// force_commit commits whatever the verdict says (an expert's override;
+	// the backing file must still be the disk's). accept_torn_disk discards
+	// the overlay of a disk a commit had begun writing, leaving it
+	// inconsistent.
+	ForceCommit    bool `protobuf:"varint,5,opt,name=force_commit,json=forceCommit,proto3" json:"force_commit,omitempty"`
+	AcceptTornDisk bool `protobuf:"varint,6,opt,name=accept_torn_disk,json=acceptTornDisk,proto3" json:"accept_torn_disk,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *ResolvePITOverlayRequest) Reset() {
@@ -24986,15 +24992,37 @@ func (x *ResolvePITOverlayRequest) GetConfirm() bool {
 	return false
 }
 
+func (x *ResolvePITOverlayRequest) GetForceCommit() bool {
+	if x != nil {
+		return x.ForceCommit
+	}
+	return false
+}
+
+func (x *ResolvePITOverlayRequest) GetAcceptTornDisk() bool {
+	if x != nil {
+		return x.AcceptTornDisk
+	}
+	return false
+}
+
 type ResolvePITOverlayResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Overlay       string                 `protobuf:"bytes,1,opt,name=overlay,proto3" json:"overlay,omitempty"` // the overlay file
-	Disk          string                 `protobuf:"bytes,2,opt,name=disk,proto3" json:"disk,omitempty"`       // the disk file
-	Binding       string                 `protobuf:"bytes,3,opt,name=binding,proto3" json:"binding,omitempty"` // what its binding records, if anything
-	Done          bool                   `protobuf:"varint,4,opt,name=done,proto3" json:"done,omitempty"`      // the action was carried out
-	Status        string                 `protobuf:"bytes,5,opt,name=status,proto3" json:"status,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Overlay string                 `protobuf:"bytes,1,opt,name=overlay,proto3" json:"overlay,omitempty"` // the overlay file
+	Disk    string                 `protobuf:"bytes,2,opt,name=disk,proto3" json:"disk,omitempty"`       // the disk file
+	Binding string                 `protobuf:"bytes,3,opt,name=binding,proto3" json:"binding,omitempty"` // what its binding records, if anything
+	Done    bool                   `protobuf:"varint,4,opt,name=done,proto3" json:"done,omitempty"`      // the action was carried out
+	Status  string                 `protobuf:"bytes,5,opt,name=status,proto3" json:"status,omitempty"`
+	// verdict: matches | half-written | pivoted | unknown (pitoverlay.Assess).
+	Verdict        string `protobuf:"bytes,6,opt,name=verdict,proto3" json:"verdict,omitempty"`
+	VerdictReason  string `protobuf:"bytes,7,opt,name=verdict_reason,json=verdictReason,proto3" json:"verdict_reason,omitempty"`
+	Current        string `protobuf:"bytes,8,opt,name=current,proto3" json:"current,omitempty"`                            // the disk's identity now
+	BackingFile    string `protobuf:"bytes,9,opt,name=backing_file,json=backingFile,proto3" json:"backing_file,omitempty"` // the overlay's backing file
+	IfCommit       string `protobuf:"bytes,10,opt,name=if_commit,json=ifCommit,proto3" json:"if_commit,omitempty"`         // what --commit would do, or why it is refused
+	IfDiscard      string `protobuf:"bytes,11,opt,name=if_discard,json=ifDiscard,proto3" json:"if_discard,omitempty"`      // what --discard would do, or why it is refused
+	Recommendation string `protobuf:"bytes,12,opt,name=recommendation,proto3" json:"recommendation,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *ResolvePITOverlayResponse) Reset() {
@@ -25058,6 +25086,55 @@ func (x *ResolvePITOverlayResponse) GetDone() bool {
 func (x *ResolvePITOverlayResponse) GetStatus() string {
 	if x != nil {
 		return x.Status
+	}
+	return ""
+}
+
+func (x *ResolvePITOverlayResponse) GetVerdict() string {
+	if x != nil {
+		return x.Verdict
+	}
+	return ""
+}
+
+func (x *ResolvePITOverlayResponse) GetVerdictReason() string {
+	if x != nil {
+		return x.VerdictReason
+	}
+	return ""
+}
+
+func (x *ResolvePITOverlayResponse) GetCurrent() string {
+	if x != nil {
+		return x.Current
+	}
+	return ""
+}
+
+func (x *ResolvePITOverlayResponse) GetBackingFile() string {
+	if x != nil {
+		return x.BackingFile
+	}
+	return ""
+}
+
+func (x *ResolvePITOverlayResponse) GetIfCommit() string {
+	if x != nil {
+		return x.IfCommit
+	}
+	return ""
+}
+
+func (x *ResolvePITOverlayResponse) GetIfDiscard() string {
+	if x != nil {
+		return x.IfDiscard
+	}
+	return ""
+}
+
+func (x *ResolvePITOverlayResponse) GetRecommendation() string {
+	if x != nil {
+		return x.Recommendation
 	}
 	return ""
 }
@@ -36705,18 +36782,29 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\vno_localize\x18\a \x01(\bR\n" +
 	"noLocalize\x125\n" +
 	"\x05proof\x18\b \x01(\v2\x1f.litevirt.v1.RuntimeActionProofR\x05proof\x126\n" +
-	"\x18accept_not_point_in_time\x18\t \x01(\bR\x14acceptNotPointInTime\"\x82\x01\n" +
+	"\x18accept_not_point_in_time\x18\t \x01(\bR\x14acceptNotPointInTime\"\xcf\x01\n" +
 	"\x18ResolvePITOverlayRequest\x12\x17\n" +
 	"\avm_name\x18\x01 \x01(\tR\x06vmName\x12\x1b\n" +
 	"\tdisk_name\x18\x02 \x01(\tR\bdiskName\x12\x16\n" +
 	"\x06action\x18\x03 \x01(\tR\x06action\x12\x18\n" +
-	"\aconfirm\x18\x04 \x01(\bR\aconfirm\"\x8f\x01\n" +
+	"\aconfirm\x18\x04 \x01(\bR\aconfirm\x12!\n" +
+	"\fforce_commit\x18\x05 \x01(\bR\vforceCommit\x12(\n" +
+	"\x10accept_torn_disk\x18\x06 \x01(\bR\x0eacceptTornDisk\"\xf1\x02\n" +
 	"\x19ResolvePITOverlayResponse\x12\x18\n" +
 	"\aoverlay\x18\x01 \x01(\tR\aoverlay\x12\x12\n" +
 	"\x04disk\x18\x02 \x01(\tR\x04disk\x12\x18\n" +
 	"\abinding\x18\x03 \x01(\tR\abinding\x12\x12\n" +
 	"\x04done\x18\x04 \x01(\bR\x04done\x12\x16\n" +
-	"\x06status\x18\x05 \x01(\tR\x06status\"\xb5\x02\n" +
+	"\x06status\x18\x05 \x01(\tR\x06status\x12\x18\n" +
+	"\averdict\x18\x06 \x01(\tR\averdict\x12%\n" +
+	"\x0everdict_reason\x18\a \x01(\tR\rverdictReason\x12\x18\n" +
+	"\acurrent\x18\b \x01(\tR\acurrent\x12!\n" +
+	"\fbacking_file\x18\t \x01(\tR\vbackingFile\x12\x1b\n" +
+	"\tif_commit\x18\n" +
+	" \x01(\tR\bifCommit\x12\x1d\n" +
+	"\n" +
+	"if_discard\x18\v \x01(\tR\tifDiscard\x12&\n" +
+	"\x0erecommendation\x18\f \x01(\tR\x0erecommendation\"\xb5\x02\n" +
 	"\x16PromoteReplicaProgress\x12?\n" +
 	"\x05phase\x18\x01 \x01(\x0e2).litevirt.v1.PromoteReplicaProgress.PhaseR\x05phase\x12\x17\n" +
 	"\avm_name\x18\x02 \x01(\tR\x06vmName\x12\x12\n" +

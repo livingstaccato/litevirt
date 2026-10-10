@@ -119,12 +119,21 @@ type fakePITSnapshotter struct {
 	commitErr      error
 	quiesce        bool
 	calls          []string
+	// atSnapshot sees the disk at the instant the window opens.
+	atSnapshot func(diskPath string)
+	// pivotsRecorded counts the pivots recorded (beforePivot) before landing.
+	pivotsRecorded int
+	// commitTakes is how long a live commit runs before it is ready to pivot.
+	commitTakes time.Duration
 }
 
 func (f *fakePITSnapshotter) SnapshotDiskExternal(domain, diskPath, overlay string) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, "snapshot")
+	if f.atSnapshot != nil {
+		f.atSnapshot(diskPath)
+	}
 	if f.snapErr != nil {
 		if f.snapLeavesFile {
 			_ = os.WriteFile(overlay, []byte("overlay"), 0o600)
@@ -141,15 +150,28 @@ func (f *fakePITSnapshotter) SnapshotDiskExternal(domain, diskPath, overlay stri
 	return f.quiesce, nil
 }
 
-func (f *fakePITSnapshotter) CommitDiskOverlay(domain, diskPath, overlay, _ string) error {
+func (f *fakePITSnapshotter) CommitDiskOverlay(domain, diskPath, overlay, _ string, beforePivot func() error) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, "commit")
 	if f.commitErr != nil {
 		return f.commitErr
 	}
+	if f.commitTakes > 0 {
+		time.Sleep(f.commitTakes)
+	}
+	if f.onOverlay[overlay] && beforePivot != nil {
+		if err := beforePivot(); err != nil {
+			return err
+		}
+		f.pivotsRecorded++
+	}
 	delete(f.onOverlay, overlay)
 	return nil
+}
+
+func (f *fakePITSnapshotter) DomainRunsOnFile(domain, path string) (bool, error) {
+	return f.DomainUsesFile(domain, path)
 }
 
 func (f *fakePITSnapshotter) DomainUsesFile(domain, path string) (bool, error) {

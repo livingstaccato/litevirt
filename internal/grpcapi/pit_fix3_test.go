@@ -70,7 +70,7 @@ func TestCopy_AnUnboundWindowIsNotCommittedThenRetried(t *testing.T) {
 	snap := &fakePITSnapshotter{}
 	s.SetPointInTimeSnapshotter(snap)
 	prev := pitBind
-	pitBind = func(string, pitoverlay.Owner) error { return errors.New("EIO") }
+	pitBind = func(string, pitoverlay.Owner, pitoverlay.Window) error { return errors.New("EIO") }
 	if err := runRepl(t, s, time.Now()); err != nil {
 		t.Fatalf("RunReplication: %v", err)
 	}
@@ -93,10 +93,10 @@ func TestCopy_AnUnboundWindowIsNotCommittedThenRetried(t *testing.T) {
 	}
 }
 
-// Nit: a commit that pivoted before the daemon died, leaving the (now
-// committed) overlay, is recognised — the VM runs on its disk, the binding
-// says committing, the disk is the one the commit began on — and removed
-// without a hold or an alarm.
+// Nit, and N3 of round 4: a commit that pivoted before the daemon died,
+// leaving the (now merged) overlay, is recognised — the VM runs on its disk,
+// the binding recorded the pivot, the disk is the one the commit was writing
+// — and removed without a hold or an alarm.
 //
 // Mutation "already committed held": that branch is removed — red.
 func TestHeal_AnAlreadyCommittedOverlayIsRemovedQuietly(t *testing.T) {
@@ -105,6 +105,9 @@ func TestHeal_AnAlreadyCommittedOverlayIsRemovedQuietly(t *testing.T) {
 	s.SetPointInTimeSnapshotter(&fakePITSnapshotter{}) // the domain is on its disk
 	windowOverlay(t, live)
 	if err := pitoverlay.MarkCommitting(live); err != nil {
+		t.Fatal(err)
+	}
+	if err := pitoverlay.MarkPivoting(live); err != nil { // the crash: right after the pivot
 		t.Fatal(err)
 	}
 	disks, _ := corrosion.GetVMDisks(context.Background(), s.db, "web")
@@ -148,7 +151,9 @@ func TestResolvePITOverlay_CommitsAHeldOverlayOnlyWhenAnAdminConfirms(t *testing
 	if err != nil || resp.GetDone() || !pitoverlay.Present(live) {
 		t.Fatalf("unconfirmed resolve = %+v, %v; nothing may be done", resp, err)
 	}
-	req.Confirm = true
+	// The verdict is unknown (the base was written since): only a forced
+	// commit goes through.
+	req.Confirm, req.ForceCommit = true, true
 	if resp, err = s.ResolvePITOverlay(adminCtx(), req); err != nil || !resp.GetDone() {
 		t.Fatalf("confirmed resolve = %+v, %v", resp, err)
 	}

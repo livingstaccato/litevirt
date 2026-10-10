@@ -585,6 +585,10 @@ func (s *Server) deleteDiskAtRecordedLocation(ctx context.Context, d *corrosion.
 	// meets it. One already set aside (.orphan-*) is kept.
 	if err := pitoverlay.Remove(s.hostDiskFile(d.Path)); err != nil {
 		slog.Warn("delete: point-in-time overlay of a deleted disk not removed", "disk", d.Path, "error", err)
+		return nil
+	}
+	if d.VMName != "" {
+		s.ClearPITOverlayHold(ctx, d.VMName, d.DiskName)
 	}
 	return nil
 }

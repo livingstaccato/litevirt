@@ -366,6 +366,8 @@ func TestFleet_AnOverlayIsNeverCommittedOverABaseWrittenSince(t *testing.T) {
 		t.Fatalf("fencer fired %d times, want 1", got)
 	}
 	rec := health.NewReconciler(target.Name, filepath.Join(c.tmpRoot, target.Name, "data"), target.DB, target.Virt)
+	// As the daemon wires it: a hold is a durable, per-disk condition.
+	rec.SetPITOverlayReporter(target.Server.ReportPITOverlayHeld, target.Server.ClearPITOverlayHold)
 	rec.ReconcileOnce(ctx)
 
 	if diskHoldsTheWindow(t, disk) {
@@ -384,5 +386,30 @@ func TestFleet_AnOverlayIsNeverCommittedOverABaseWrittenSince(t *testing.T) {
 	}
 	if !held {
 		t.Error("the hold was not reported with the admin command")
+	}
+
+	// N4 of round 4: the hold is a degraded condition, per disk, that every
+	// node reads — here the coordinator — and lv inspect shows from it.
+	row, found, err := corrosion.GetHealthCondition(ctx, coord.DB, "pit_overlay", "pit_overlay.held", "disk", "pw2/root")
+	if err != nil || !found || row.Lifecycle == corrosion.ConditionResolved || row.Severity != corrosion.SeverityWarning {
+		t.Fatalf("held condition seen from %s = %+v (found %v, %v), want an open warning", coord.Name, row, found, err)
+	}
+	insp, err := c.SelfClient(coord).InspectVM(ctx, &pb.InspectVMRequest{Name: "pw2"})
+	if err != nil || !strings.Contains(insp.GetPitOverlayHeld(), "lv resolve-pit-overlay pw2 root") {
+		t.Fatalf("inspect from %s: %q, %v; want the hold", coord.Name, insp.GetPitOverlayHeld(), err)
+	}
+
+	// The hold clears when the overlay is gone (here an operator removed it
+	// by hand): the reconciler's next define of the VM (its start re-armed)
+	// settles nothing and resolves it.
+	if err := pitoverlay.Remove(disk); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.UpdateVMState(ctx, target.DB, "pw2", "pending", "re-armed"); err != nil {
+		t.Fatal(err)
+	}
+	rec.ReconcileOnce(ctx)
+	if row, _, _ := corrosion.GetHealthCondition(ctx, coord.DB, "pit_overlay", "pit_overlay.held", "disk", "pw2/root"); row.Lifecycle != corrosion.ConditionResolved {
+		t.Fatalf("the held condition did not resolve once the overlay was gone: %+v", row)
 	}
 }

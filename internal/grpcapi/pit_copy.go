@@ -2,12 +2,14 @@ package grpcapi
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -55,8 +57,13 @@ type PointInTimeSnapshotter interface {
 	// CommitDiskOverlay merges overlay back into diskPath (live, on an
 	// active domain on it) and points the persistent definition back at
 	// diskPath with diskFormat. An inactive domain's overlay is committed
-	// offline by the caller (pitoverlay) first.
-	CommitDiskOverlay(domain, diskPath, overlay, diskFormat string) error
+	// offline by the caller (pitoverlay) first. beforePivot, when set, runs
+	// once the commit is ready and before the pivot; if it fails nothing is
+	// pivoted.
+	CommitDiskOverlay(domain, diskPath, overlay, diskFormat string, beforePivot func() error) error
+	// DomainRunsOnFile reports whether the LIVE definition names path:
+	// whether qemu runs the disk on it now.
+	DomainRunsOnFile(domain, path string) (bool, error)
 	// DomainUsesFile reports whether the live or persistent definition
 	// names path.
 	DomainUsesFile(domain, path string) (bool, error)
@@ -251,12 +258,25 @@ const pitDiskFormat = "qcow2"
 // the overlay kept (it holds the guest's writes), and every later define,
 // start, move or copy of the disk commits it first (settlePITOverlays,
 // health's domainXMLFor), as does the daemon's start-up sweep.
+//
+// No overlay is placed where it would not survive (pitoverlay.Placement: a
+// /dev block disk's devtmpfs, a tmpfs); the copy goes on to the next layer.
+// Before the window opens the disk is given a new window token
+// (pitoverlay.OpenWindow), durably, and the binding records it.
 func (s *Server) copyViaExternalSnapshot(ctx context.Context, vm *corrosion.VMRecord, d *corrosion.DiskRecord, dst string, emit func(*pb.MoveVolumeProgress) error) (copyMethod, error) {
 	if s.pitSnapshotter == nil {
 		return "", errors.New("no snapshotter on this host")
 	}
 	if !s.domainActive(vm) {
 		return "", errors.New("the domain is not running or paused")
+	}
+	disk := s.hostDiskFile(d.Path)
+	if err := pitoverlay.Placement(disk); err != nil {
+		return "", fmt.Errorf("no overlay is placed here: %w", err)
+	}
+	win, err := pitoverlay.OpenWindow(disk)
+	if err != nil {
+		return "", err
 	}
 	overlay := pitOverlayPath(d.Path)
 	quiesced, err := s.pitSnapshotter.SnapshotDiskExternal(vm.Name, d.Path, overlay)
@@ -273,7 +293,7 @@ func (s *Server) copyViaExternalSnapshot(ctx context.Context, vm *corrosion.VMRe
 	// any other (a path reused, a disk rewritten). Fail closed: without a
 	// binding no commit starts — the window stays open, reported, and the
 	// next settle of the disk binds and commits it.
-	if berr := pitBind(s.hostDiskFile(d.Path), pitOwner(vm, d)); berr != nil {
+	if berr := pitBind(disk, pitOwner(vm, d), win); berr != nil {
 		s.reportStrandedOverlay(ctx, vm, d, overlay, fmt.Errorf("bind the overlay to its disk: %w", berr))
 		return "", fmt.Errorf("bind the overlay: %w", berr)
 	}
@@ -294,20 +314,21 @@ func (s *Server) copyViaExternalSnapshot(ctx context.Context, vm *corrosion.VMRe
 	return copyExternalSnapshot, nil
 }
 
-// commitPITOverlay live-commits overlay back into d (the domain is active
-// and on it) and removes it once nothing names it. A failure leaves the
-// overlay where it is — the domain runs on it — and says so loudly.
+// commitPITOverlay live-commits overlay back into d — the domain is active
+// and runs on it — and removes it once nothing names it. A failure leaves the
+// overlay where it is (the domain runs on it) and says so loudly.
+//
+// The binding follows the commit durably, so a crash at any point is
+// recognised: committing before the first base write (fail closed: no
+// record, no commit), pivoting just before the pivot (libvirt's beforePivot:
+// no record, no pivot), and committed once the domain has left the overlay.
+// A pivot that did not land puts it back to committing.
 func (s *Server) commitPITOverlay(ctx context.Context, vm *corrosion.VMRecord, d *corrosion.DiskRecord, overlay string) error {
-	// The commit writes the base: from here the binding vouches for the
-	// file, not its unchanged contents. Fail closed: a commit whose
-	// "committing" state could not be recorded durably never starts — the
-	// VM stays on the untouched base plus overlay, and a later settle
-	// retries.
 	disk := s.hostDiskFile(d.Path)
 	if !pitoverlay.Bound(disk) {
 		// The domain runs on the overlay, so the base has been frozen since
-		// the snapshot: bind it now.
-		if err := pitBind(disk, pitOwner(vm, d)); err != nil {
+		// the snapshot: bind it now, under a new window token.
+		if err := pitoverlay.Bind(disk, pitOwner(vm, d)); err != nil {
 			err = fmt.Errorf("bind the overlay before its commit: %w", err)
 			s.reportStrandedOverlay(ctx, vm, d, overlay, err)
 			return err
@@ -318,7 +339,20 @@ func (s *Server) commitPITOverlay(ctx context.Context, vm *corrosion.VMRecord, d
 		s.reportStrandedOverlay(ctx, vm, d, overlay, err)
 		return err
 	}
-	err := s.pitSnapshotter.CommitDiskOverlay(vm.Name, d.Path, overlay, pitDiskFormat)
+	stop := pitoverlay.KeepCommitting(ctx, disk)
+	err := s.pitSnapshotter.CommitDiskOverlay(vm.Name, d.Path, overlay, pitDiskFormat, func() error { return pitMarkPivoting(disk) })
+	stop()
+	// What happened, whatever CommitDiskOverlay said: the domain left the
+	// overlay (the pivot landed: the overlay is merged) or is still on it.
+	if on, qerr := s.pitSnapshotter.DomainRunsOnFile(vm.Name, overlay); qerr == nil {
+		if !on {
+			if merr := pitoverlay.MarkCommitted(disk); merr != nil {
+				slog.Warn("copy: a landed pivot not recorded committed; the pivoting record stands", "vm", vm.Name, "overlay", overlay, "error", merr)
+			}
+		} else if b, berr := pitoverlay.BindingOf(disk); berr == nil && b.State == pitoverlay.StatePivoting {
+			_ = pitMarkCommitting(disk) // the pivot did not land
+		}
+	}
 	if err == nil {
 		var used bool
 		used, err = s.pitSnapshotter.DomainUsesFile(vm.Name, overlay)
@@ -330,9 +364,11 @@ func (s *Server) commitPITOverlay(ctx context.Context, vm *corrosion.VMRecord, d
 		s.reportStrandedOverlay(ctx, vm, d, overlay, err)
 		return err
 	}
-	if rerr := pitoverlay.Remove(s.hostDiskFile(d.Path)); rerr != nil {
+	if rerr := pitoverlay.Remove(disk); rerr != nil {
 		slog.Warn("copy: committed point-in-time overlay not removed", "vm", vm.Name, "overlay", overlay, "error", rerr)
+		return nil
 	}
+	s.ClearPITOverlayHold(ctx, vm.Name, d.DiskName)
 	return nil
 }
 
@@ -353,14 +389,18 @@ func (s *Server) reportStrandedOverlay(ctx context.Context, vm *corrosion.VMReco
 // disk to this host). An overlay that may hold data is never deleted:
 //
 //   - the domain is active and runs on it: live commit and pivot;
-//   - the domain is not active (or not defined here) and the overlay is
-//     bound to this VM's disk as the file is now (pitoverlay.Check): commit
-//     it offline with qemu-img (no -U), point a persistent definition that
-//     names it back at the disk, and only then remove it;
-//   - anything else — the running VM uses its disk directly, or the overlay
-//     belongs to another VM or another or since-written file — is set aside
-//     under a new name, kept, and reported; committing it would write stale
-//     blocks over newer data;
+//   - the domain is active and runs on its disk: if the binding recorded a
+//     pivot (or a finished commit) and the disk is the file it was writing,
+//     the overlay is already merged — the persistent definition is pointed
+//     back at the disk and the overlay removed, without a hold. Otherwise the
+//     VM ran on its disk without the overlay: the binding is marked diverged
+//     (so a later offline settle never commits it over the newer writes) and
+//     the VM is held;
+//   - the domain is not active (or not defined here): pitoverlay.Assess
+//     decides. Matches or half-written: commit it offline with qemu-img (no
+//     -U); pivoted: nothing to commit. Then point a persistent definition
+//     that names it back at the disk, and only then remove it. Anything else
+//     holds the VM;
 //   - libvirt cannot say whether the domain runs: nothing is touched, and the
 //     caller retries later.
 //
@@ -370,9 +410,12 @@ func (s *Server) reportStrandedOverlay(ctx context.Context, vm *corrosion.VMReco
 func (s *Server) healPITOverlay(ctx context.Context, vm *corrosion.VMRecord, d *corrosion.DiskRecord) error {
 	disk := s.hostDiskFile(d.Path)
 	if !pitoverlay.Present(disk) {
+		s.ClearPITOverlayHold(ctx, vm.Name, d.DiskName)
 		return nil
 	}
 	overlay := pitOverlayPath(d.Path)
+	owner := pitOwner(vm, d)
+	committed := fmt.Sprintf("%s: an earlier point-in-time overlay %s was committed back into %s", d.DiskName, overlay, d.Path)
 	switch s.domainActivity(vm) {
 	case activityUnknown:
 		return fmt.Errorf("%s: a point-in-time overlay %s is present and libvirt cannot say whether %s is running; it is left as it is — retry once libvirt answers", d.DiskName, overlay, vm.Name)
@@ -380,38 +423,58 @@ func (s *Server) healPITOverlay(ctx context.Context, vm *corrosion.VMRecord, d *
 		if s.pitSnapshotter == nil {
 			return fmt.Errorf("%s: a point-in-time overlay %s is present and this host has no snapshotter to commit it", d.DiskName, overlay)
 		}
-		used, err := s.pitSnapshotter.DomainUsesFile(vm.Name, overlay)
+		on, err := s.pitSnapshotter.DomainRunsOnFile(vm.Name, overlay)
 		if err != nil {
 			return fmt.Errorf("%s: cannot tell whether the domain runs on the overlay %s: %w", d.DiskName, overlay, err)
 		}
-		if !used {
-			// The domain runs on its disk. If a commit had begun and the disk
-			// has not been written long after, it pivoted and the daemon died
-			// before removing the (now committed) overlay.
-			if b, berr := pitoverlay.BindingOf(disk); berr == nil && b.State == pitoverlay.StateCommitting && pitoverlay.Check(disk, pitOwner(vm, d)) == nil {
-				if err := pitoverlay.Remove(disk); err != nil {
-					return fmt.Errorf("%s: remove the already-committed overlay %s: %w", d.DiskName, overlay, err)
-				}
-				s.recordVMEventSeverity(ctx, vm.Name, "disk.pit_overlay_committed", "ok", "info",
-					fmt.Sprintf("%s: the point-in-time overlay %s had already been committed into %s (the VM runs on the disk); it was removed", d.DiskName, overlay, d.Path))
-				return nil
+		if on {
+			if err := s.commitPITOverlay(ctx, vm, d, overlay); err != nil {
+				return fmt.Errorf("%s: the domain runs on the point-in-time overlay %s and it could not be committed: %w", d.DiskName, overlay, err)
 			}
-			return s.holdPITOverlay(ctx, vm, d, errors.New("the running VM uses its disk directly, so the overlay cannot be committed live"))
+			break
 		}
-		if err := s.commitPITOverlay(ctx, vm, d, overlay); err != nil {
-			return fmt.Errorf("%s: the domain runs on the point-in-time overlay %s and it could not be committed: %w", d.DiskName, overlay, err)
+		// The domain runs on its disk.
+		a := pitoverlay.Assess(disk, owner, true)
+		if a.Verdict == pitoverlay.Pivoted {
+			// A pivot landed and the daemon died before the overlay went: it
+			// is merged. Point a definition that still names it back at the
+			// disk, then remove it.
+			if err := s.pitSnapshotter.CommitDiskOverlay(vm.Name, d.Path, overlay, pitDiskFormat, nil); err != nil {
+				s.reportStrandedOverlay(ctx, vm, d, overlay, err)
+				return fmt.Errorf("%s: point the definition back at %s: %w", d.DiskName, d.Path, err)
+			}
+			if used, err := s.pitSnapshotter.DomainUsesFile(vm.Name, overlay); err != nil || used {
+				return fmt.Errorf("%s: the domain still names the merged overlay %s (%v)", d.DiskName, overlay, err)
+			}
+			if err := pitoverlay.Remove(disk); err != nil {
+				return fmt.Errorf("%s: remove the already-committed overlay %s: %w", d.DiskName, overlay, err)
+			}
+			s.ClearPITOverlayHold(ctx, vm.Name, d.DiskName)
+			s.recordVMEventSeverity(ctx, vm.Name, "disk.pit_overlay_committed", "ok", "info",
+				fmt.Sprintf("%s: the point-in-time overlay %s had already been committed into %s (the VM runs on the disk); it was removed", d.DiskName, overlay, d.Path))
+			return nil
 		}
+		if b := a.Binding; b != nil && (b.State == pitoverlay.StateWindow || b.State == pitoverlay.StateCommitting || b.State == "") {
+			// No pivot was recorded, yet the VM runs on its disk: something
+			// started it there without the overlay. Its writes since are
+			// newer than the overlay's, so it is never committed now.
+			if err := pitoverlay.MarkDiverged(disk, "the running VM was found on its disk, not on the overlay, with no pivot recorded"); err != nil {
+				slog.Warn("point-in-time overlay: diverged not recorded", "vm", vm.Name, "overlay", overlay, "error", err)
+			}
+			a = pitoverlay.Assess(disk, owner, true)
+		}
+		return s.holdPITOverlay(ctx, vm, d, a)
 	default:
-		_, err := pitoverlay.CommitOffline(ctx, disk, pitOwner(vm, d))
+		_, err := pitoverlay.CommitOffline(ctx, disk, owner)
 		if errors.Is(err, pitoverlay.ErrNotOurs) {
-			return s.holdPITOverlay(ctx, vm, d, err)
+			return s.holdPITOverlay(ctx, vm, d, pitoverlay.Assess(disk, owner, false))
 		}
 		if err != nil {
 			s.reportStrandedOverlay(ctx, vm, d, overlay, err)
 			return fmt.Errorf("%s: commit the point-in-time overlay %s: %w", d.DiskName, overlay, err)
 		}
 		if s.pitSnapshotter != nil && s.virt != nil && s.virt.DomainExists(vm.Name) {
-			if err := s.pitSnapshotter.CommitDiskOverlay(vm.Name, d.Path, overlay, pitDiskFormat); err != nil {
+			if err := s.pitSnapshotter.CommitDiskOverlay(vm.Name, d.Path, overlay, pitDiskFormat, nil); err != nil {
 				s.reportStrandedOverlay(ctx, vm, d, overlay, err)
 				return fmt.Errorf("%s: point the definition back at %s: %w", d.DiskName, d.Path, err)
 			}
@@ -420,76 +483,181 @@ func (s *Server) healPITOverlay(ctx context.Context, vm *corrosion.VMRecord, d *
 			return fmt.Errorf("%s: remove the committed overlay %s: %w", d.DiskName, overlay, err)
 		}
 	}
-	s.recordVMEventSeverity(ctx, vm.Name, "disk.pit_overlay_committed", "ok", "info",
-		fmt.Sprintf("%s: an earlier point-in-time overlay %s was committed back into %s", d.DiskName, overlay, d.Path))
+	s.ClearPITOverlayHold(ctx, vm.Name, d.DiskName)
+	s.recordVMEventSeverity(ctx, vm.Name, "disk.pit_overlay_committed", "ok", "info", committed)
 	return nil
 }
 
-// pitBind and pitMarkCommitting are pitoverlay's, as variables so a test can
-// make them fail.
+// pitBind, pitMarkCommitting and pitMarkPivoting are pitoverlay's, as
+// variables so a test can make them fail.
 var (
-	pitBind           = pitoverlay.Bind
+	pitBind           = pitoverlay.BindWindow
 	pitMarkCommitting = pitoverlay.MarkCommitting
+	pitMarkPivoting   = pitoverlay.MarkPivoting
 )
 
+// The health condition of a disk held on its overlay: one per disk, subject
+// "<vm>/<disk>", a warning (it degrades the cluster's health) for as long as
+// the hold lasts.
+const (
+	pitHoldEvaluator = "pit_overlay"
+	pitHoldCode      = "pit_overlay.held"
+	pitHoldKind      = "disk"
+)
+
+// pitHoldRenotify is how often a hold that lasts is notified again.
+var pitHoldRenotify = 24 * time.Hour
+
 // vmEventPITOverlayHeld is the event of a VM held because an overlay could
-// not be verified; InspectVM shows the newest one as pit_overlay_held until
-// the overlay is resolved or committed.
+// not be verified.
 const vmEventPITOverlayHeld = "disk.pit_overlay_held"
 
-// pitResolveCommand is the admin's way out of a hold.
-func pitResolveCommand(vm, disk string) string {
-	return fmt.Sprintf("lv resolve-pit-overlay %s %s --commit|--discard --confirm", vm, disk)
+// pitHoldEvidence is the held condition's evidence.
+type pitHoldEvidence struct {
+	VM         string `json:"vm"`
+	Disk       string `json:"disk"`
+	Detail     string `json:"detail"`
+	NotifiedAt string `json:"notified_at"`
 }
 
 // holdPITOverlay refuses to go on with a disk whose overlay may hold the
 // guest's newest writes but cannot be verified against the disk: starting
 // the VM on the bare disk would drop them silently, and committing could
 // write stale blocks over newer data. The overlay is left exactly as it is;
-// an event and a notification name both files and the admin command that
-// decides. It returns the error the caller refuses with.
-func (s *Server) holdPITOverlay(ctx context.Context, vm *corrosion.VMRecord, d *corrosion.DiskRecord, why error) error {
+// the hold names both files, the verdict, and what the admin should do for
+// that verdict. It returns the error the caller refuses with.
+func (s *Server) holdPITOverlay(ctx context.Context, vm *corrosion.VMRecord, d *corrosion.DiskRecord, a pitoverlay.Assessment) error {
 	disk := s.hostDiskFile(d.Path)
-	detail := fmt.Sprintf("%s: the point-in-time overlay %s may hold %s's newest writes and cannot be verified against its disk %s (%v). The VM is held — not started on the bare disk — until an admin decides: %s",
-		d.DiskName, pitoverlay.Path(disk), vm.Name, disk, why, pitResolveCommand(vm.Name, d.DiskName))
-	s.ReportPITOverlayHeld(ctx, vm.Name, detail)
+	detail := pitoverlay.HoldDetail(vm.Name, d.DiskName, disk, a)
+	s.ReportPITOverlayHeld(ctx, vm.Name, d.DiskName, detail)
 	return status.Error(codes.FailedPrecondition, detail)
 }
 
-// ReportPITOverlayHeld is the event and notification of a VM held on an
-// overlay (here, or by the reconciler's define path).
-func (s *Server) ReportPITOverlayHeld(ctx context.Context, vmName, detail string) {
-	slog.Error("point-in-time overlay: VM held", "vm", vmName, "detail", detail)
+// pitHoldNotifiedLocal is the fallback when the condition cannot be read or
+// written: the last notice per host and disk, in this process.
+var pitHoldNotifiedLocal sync.Map
+
+// ReportPITOverlayHeld records a VM held on one disk's overlay (here, or by
+// the reconciler's define path) as a durable health condition, and sends
+// the event and notification once when the hold begins, then at most once a
+// day while it lasts — not on every operation that meets it.
+func (s *Server) ReportPITOverlayHeld(ctx context.Context, vmName, diskName, detail string) {
+	if !s.raisePITHold(ctx, vmName, diskName, detail) {
+		slog.Debug("point-in-time overlay: VM still held", "vm", vmName, "disk", diskName)
+		return
+	}
+	slog.Error("point-in-time overlay: VM held", "vm", vmName, "disk", diskName, "detail", detail)
 	s.recordVMEventSeverity(ctx, vmName, vmEventPITOverlayHeld, "error", "error", detail)
 	s.notify(ctx, notify.Notification{Kind: "replication.pit_overlay_held", Severity: notify.SevError, Subject: vmName, Detail: detail})
 }
 
-// pitOverlayHeldReason is the newest hold's detail, unless a later event
-// says the overlay was resolved or committed; "" otherwise.
+// raisePITHold raises or refreshes the disk's held condition and reports
+// whether to notify: the hold is new, or its last notice is pitHoldRenotify
+// old. An unchanged hold that needs no notice writes nothing.
+func (s *Server) raisePITHold(ctx context.Context, vmName, diskName, detail string) bool {
+	subject := vmName + "/" + diskName
+	now := time.Now().UTC()
+	local := func() bool {
+		key := s.hostName + "\x00" + subject
+		if last, ok := pitHoldNotifiedLocal.Load(key); ok && now.Sub(last.(time.Time)) < pitHoldRenotify {
+			return false
+		}
+		pitHoldNotifiedLocal.Store(key, now)
+		return true
+	}
+	if s.db == nil {
+		return local()
+	}
+	row, found, err := corrosion.GetHealthCondition(ctx, s.db, pitHoldEvaluator, pitHoldCode, pitHoldKind, subject)
+	if err != nil {
+		slog.Warn("point-in-time overlay: read the held condition", "subject", subject, "error", err)
+		return local()
+	}
+	open := found && row.Lifecycle != corrosion.ConditionResolved
+	var ev pitHoldEvidence
+	if open {
+		_ = json.Unmarshal([]byte(row.Evidence), &ev)
+	}
+	last, perr := time.Parse(time.RFC3339Nano, ev.NotifiedAt)
+	notifyNow := !open || perr != nil || now.Sub(last) >= pitHoldRenotify
+	if open && !notifyNow && ev.Detail == detail {
+		return false
+	}
+	ts := now.Format(time.RFC3339)
+	if !open {
+		row = corrosion.HealthCondition{Evaluator: pitHoldEvaluator, Code: pitHoldCode, SubjectKind: pitHoldKind, SubjectID: subject,
+			Lifecycle: corrosion.ConditionConfirmed, FirstSeen: ts, ConfirmedAt: ts}
+	}
+	ev.VM, ev.Disk, ev.Detail = vmName, diskName, detail
+	if notifyNow {
+		ev.NotifiedAt = now.Format(time.RFC3339Nano)
+	}
+	b, _ := json.Marshal(ev)
+	row.Evidence = string(b)
+	row.Severity = corrosion.SeverityWarning
+	row.Hosts = []string{s.hostName}
+	row.ObserveCount++
+	row.CleanCount = 0
+	row.LastSeen, row.ResolvedAt, row.Reporter = ts, "", s.hostName
+	if err := corrosion.UpsertHealthCondition(ctx, s.db, row); err != nil {
+		slog.Warn("point-in-time overlay: persist the held condition", "subject", subject, "error", err)
+		return local()
+	}
+	return notifyNow
+}
+
+// ClearPITOverlayHold resolves the disk's held condition, if one is open:
+// its overlay was committed, found merged, discarded, or went with its disk.
+func (s *Server) ClearPITOverlayHold(ctx context.Context, vmName, diskName string) {
+	subject := vmName + "/" + diskName
+	pitHoldNotifiedLocal.Delete(s.hostName + "\x00" + subject)
+	if s.db == nil {
+		return
+	}
+	row, found, err := corrosion.GetHealthCondition(ctx, s.db, pitHoldEvaluator, pitHoldCode, pitHoldKind, subject)
+	if err != nil || !found || row.Lifecycle == corrosion.ConditionResolved {
+		return
+	}
+	ts := time.Now().UTC().Format(time.RFC3339)
+	row.Lifecycle, row.ResolvedAt, row.LastSeen, row.Reporter = corrosion.ConditionResolved, ts, ts, s.hostName
+	row.ObserveCount, row.CleanCount = 0, row.CleanCount+1
+	if err := corrosion.UpsertHealthCondition(ctx, s.db, row); err != nil {
+		slog.Warn("point-in-time overlay: resolve the held condition", "subject", subject, "error", err)
+	}
+}
+
+// pitOverlayHeldReason is every open hold of vmName's disks, from the
+// durable conditions (one per disk); "" when none is held.
 func (s *Server) pitOverlayHeldReason(ctx context.Context, vmName string) string {
-	evs, err := corrosion.ListVMEvents(ctx, s.db, vmName, 100, "")
+	rows, err := corrosion.ListOpenHealthConditionsByCode(ctx, s.db, pitHoldEvaluator, pitHoldCode)
 	if err != nil {
 		return ""
 	}
-	for _, e := range evs { // newest first
-		switch e.Type {
-		case vmEventPITOverlayHeld:
-			return e.Detail
-		case "disk.pit_overlay_resolved", "disk.pit_overlay_committed":
-			return ""
+	var out []string
+	for _, r := range rows {
+		if r.SubjectKind != pitHoldKind || !strings.HasPrefix(r.SubjectID, vmName+"/") {
+			continue
+		}
+		var ev pitHoldEvidence
+		if json.Unmarshal([]byte(r.Evidence), &ev) == nil && ev.Detail != "" {
+			out = append(out, ev.Detail)
+		} else {
+			out = append(out, strings.TrimPrefix(r.SubjectID, vmName+"/")+": held on its point-in-time overlay")
 		}
 	}
-	return ""
+	return strings.Join(out, "\n")
 }
 
 // setAsideStaleOverlay sets aside any overlay beside a disk file that is
-// about to be written afresh (an import, a restore): it cannot belong to the
-// new contents.
+// about to be written afresh (an import): it cannot belong to the new
+// contents. baseAside, when the caller moved the file the overlay was taken
+// of aside too, is where that file went: the message names both, so the pair
+// can be found again.
 //
 // No VM's writes are dropped: the disk the overlay was taken of no longer
 // exists at this path (an import places only a new file), so the overlay is
 // kept under a new name, never committed, and reported.
-func (s *Server) setAsideStaleOverlay(ctx context.Context, vmName, diskName, disk string) error {
+func (s *Server) setAsideStaleOverlay(ctx context.Context, vmName, diskName, disk, baseAside string) error {
 	if !pitoverlay.Present(disk) {
 		return nil
 	}
@@ -497,8 +665,12 @@ func (s *Server) setAsideStaleOverlay(ctx context.Context, vmName, diskName, dis
 	if err != nil {
 		return fmt.Errorf("%s: set the stale point-in-time overlay %s aside: %w", diskName, pitoverlay.Path(disk), err)
 	}
-	detail := fmt.Sprintf("%s: a point-in-time overlay %s was left where the new disk %s is written; it cannot belong to the new disk and was kept as %s (inspect it, then delete it)",
-		diskName, pitoverlay.Path(disk), disk, to)
+	base := "the file it was taken of is no longer there"
+	if baseAside != "" {
+		base = "the file it was taken of was moved aside to " + baseAside + " (the overlay belongs with it)"
+	}
+	detail := fmt.Sprintf("%s: a point-in-time overlay %s was left where the new disk %s is written; it cannot belong to the new disk and was kept as %s, with its binding as %s.id; %s. Inspect them, then delete them",
+		diskName, pitoverlay.Path(disk), disk, to, to, base)
 	slog.Warn("point-in-time overlay set aside", "vm", vmName, "detail", detail)
 	s.recordVMEventSeverity(ctx, vmName, "disk.pit_overlay_set_aside", "warning", "warn", detail)
 	s.notify(ctx, notify.Notification{Kind: "replication.pit_overlay_set_aside", Severity: notify.SevWarn, Subject: vmName, Detail: detail})

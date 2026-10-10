@@ -1333,6 +1333,27 @@ destination keeps refusing is the cluster-wide stand-down left:
 recovered, then back on. See
 [design/recovery-claims.md](design/recovery-claims.md) §10 item 37.
 
+
+### A VM held on its point-in-time overlay (`pit_overlay.held`)
+
+Evaluator `pit_overlay`, subject kind `disk`, subject `<vm>/<disk>`, severity
+warning (it degrades the cluster's health). Raised, as a replicated row, by the
+host that held the VM: a layer-2 point-in-time copy left an overlay
+(`.<disk file>.lv-pit`) beside the disk that may hold the guest's newest writes
+and cannot be verified against the disk (docs/backups.md, "How a full replica
+is copied"). The VM is not started or defined on the bare disk while it stands.
+Its evidence carries the hold's text: the two files, the verdict
+(`matches`, `half-written`, `pivoted` or `unknown`) with its reason, and what to
+do for that verdict. `lv inspect <vm>` shows the same text as
+`pitOverlayHeld`, read from this row. The hold is notified once when it begins
+(`disk.pit_overlay_held` event, `replication.pit_overlay_held` notification) and
+then at most once a day while it lasts.
+
+It resolves when the hold clears: the overlay is committed or found already
+merged by any later start, copy, move or define of the disk; an admin resolves
+it with `lv resolve-pit-overlay <vm> <disk>`; or the disk is deleted. Run that
+command without `--confirm` first: it prints the verdict, the disk's identity
+then and now, and what `--commit` and `--discard` would each do.
 ### Deferred out-of-band stop sync after a restart or rejoin
 
 When a VM's domain is found shut off out of band (a crash, an external

@@ -1021,7 +1021,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// copy whose row a VERIFIED recovery-claim certificate gave to another
 	// host is stopped on that proof, and only on it.
 	reconciler.SetSettleVerifier(svc.VerifySettleProof)
-	reconciler.SetPITOverlayReporter(svc.ReportPITOverlayHeld)
+	reconciler.SetPITOverlayReporter(svc.ReportPITOverlayHeld, svc.ClearPITOverlayHold)
 	svc.SetLeaseTermReady(func() bool {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()

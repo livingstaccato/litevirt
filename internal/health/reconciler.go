@@ -110,8 +110,10 @@ type Reconciler struct {
 	// settleVerify / settleProofs are Layer 3 of partition pause (settle.go):
 	// the certificate check and the proof source. nil verifier settles nothing.
 	settleVerify SettleVerifier
-	pitReport    func(ctx context.Context, vm, detail string)
-	// pitHeldReported: the holds already reported (reportPITHeldOnce).
+	pitReport    func(ctx context.Context, vm, disk, detail string)
+	pitCleared   func(ctx context.Context, vm, disk string)
+	// pitHeldReported: the holds already reported when no reporter is wired
+	// (reportPITHeld).
 	pitHeldReported sync.Map
 	settleProofs    func(ctx context.Context, c *corrosion.Client, kind, name string) ([]corrosion.ProofRecord, error)
 	// settleDeclines rate-limits the decline report (settle_declined.go).
@@ -1723,14 +1725,12 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	}
 }
 
-// domainXMLFor builds vm's domain XML on this host from its stored spec and
-// the disk configs the caller resolved: the cloud-init ISO, the networks
-// (provisioned here), firmware and resources. On failure it returns "" with
-// whether a later attempt may succeed and what failed.
-// SetPITOverlayReporter wires the event and notification of a VM the define
-// path holds on an overlay it cannot verify (grpcapi.Server.ReportPITOverlayHeld).
-func (r *Reconciler) SetPITOverlayReporter(fn func(ctx context.Context, vm, detail string)) {
-	r.pitReport = fn
+// SetPITOverlayReporter wires the report of a VM the define path holds on an
+// overlay it cannot verify, and of a disk whose hold has cleared
+// (grpcapi.Server.ReportPITOverlayHeld and ClearPITOverlayHold: a durable,
+// per-disk health condition, notified once and then at most daily).
+func (r *Reconciler) SetPITOverlayReporter(held func(ctx context.Context, vm, disk, detail string), cleared func(ctx context.Context, vm, disk string)) {
+	r.pitReport, r.pitCleared = held, cleared
 }
 
 // settlePITOverlays settles each disk's point-in-time copy overlay
@@ -1738,21 +1738,21 @@ func (r *Reconciler) SetPITOverlayReporter(fn func(ctx context.Context, vm, deta
 // failed, or whose host died mid-window, left the guest's newest writes in it
 // — on a shared pool it travels here with the disk — and the definition names
 // only the disk. An overlay bound to this VM's disk as the file is now is
-// committed offline (no -U: a qemu still holding it fails this closed). Any
-// other cannot be verified, so the VM is HELD: not defined or started on the
-// bare disk, which would drop the overlay's writes; an admin resolves it
+// committed offline (no -U: a qemu still holding it fails this closed); one
+// already merged is removed. Any other cannot be verified, so the VM is
+// HELD: not defined or started on the bare disk, which would drop the
+// overlay's writes; the hold says what an admin should do for its verdict
 // (lv resolve-pit-overlay). Nothing replicated records an overlay; its fixed
 // name beside the disk is what finds it. A failure is the start's failure,
-// retried; a hold is reported once per overlay.
+// retried; a disk settled or without an overlay clears its hold.
 func (r *Reconciler) settlePITOverlays(ctx context.Context, vm corrosion.VMRecord, spec *pb.VMSpec, diskConfigs []lv.DiskConfig) string {
 	for _, dc := range diskConfigs {
 		owner := pitoverlay.Owner{VM: vm.Name, VMUUID: spec.GetUuid(), Disk: dc.Name}
 		out, err := pitoverlay.Settle(ctx, dc.Path, owner)
 		switch {
 		case out == pitoverlay.Held:
-			detail := fmt.Sprintf("%s: the point-in-time overlay %s may hold %s's newest writes and cannot be verified against its disk %s (%v). The VM is held — not started on the bare disk — until an admin decides: lv resolve-pit-overlay %s %s --commit|--discard --confirm",
-				dc.Name, pitoverlay.Path(dc.Path), vm.Name, dc.Path, err, vm.Name, dc.Name)
-			r.reportPITHeldOnce(ctx, vm.Name, dc.Path, detail)
+			detail := pitoverlay.HoldDetail(vm.Name, dc.Name, dc.Path, pitoverlay.Assess(dc.Path, owner, false))
+			r.reportPITHeld(ctx, vm.Name, dc.Name, detail)
 			return detail
 		case err != nil:
 			slog.Error("reconciler: a point-in-time overlay holds writes the disk lacks and could not be committed; not defining the VM",
@@ -1762,19 +1762,24 @@ func (r *Reconciler) settlePITOverlays(ctx context.Context, vm corrosion.VMRecor
 			slog.Warn("reconciler: committed a point-in-time overlay into the disk before defining the VM",
 				"vm", vm.Name, "disk", dc.Name, "overlay", pitoverlay.Path(dc.Path))
 		}
+		if r.pitCleared != nil {
+			r.pitCleared(ctx, vm.Name, dc.Name)
+		}
 	}
 	return ""
 }
 
-// reportPITHeldOnce reports a hold once per (VM, disk) for as long as this
+// reportPITHeld reports a hold through the wired reporter, which keeps it as
+// a durable condition and decides when to notify. Without one (a bare
+// reconciler) it records the event once per (VM, disk) for as long as this
 // process runs: the start is retried every pass.
-func (r *Reconciler) reportPITHeldOnce(ctx context.Context, vm, disk, detail string) {
-	key := vm + "\x00" + disk
-	if _, done := r.pitHeldReported.LoadOrStore(key, true); done {
+func (r *Reconciler) reportPITHeld(ctx context.Context, vm, disk, detail string) {
+	if r.pitReport != nil {
+		r.pitReport(ctx, vm, disk, detail)
 		return
 	}
-	if r.pitReport != nil {
-		r.pitReport(ctx, vm, detail)
+	key := vm + "\x00" + disk
+	if _, done := r.pitHeldReported.LoadOrStore(key, true); done {
 		return
 	}
 	slog.Error("reconciler: "+detail, "vm", vm)
@@ -1784,6 +1789,10 @@ func (r *Reconciler) reportPITHeldOnce(ctx context.Context, vm, disk, detail str
 	})
 }
 
+// domainXMLFor builds vm's domain XML on this host from its stored spec and
+// the disk configs the caller resolved: the cloud-init ISO, the networks
+// (provisioned here), firmware and resources. On failure it returns "" with
+// whether a later attempt may succeed and what failed.
 func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, spec *pb.VMSpec, diskConfigs []lv.DiskConfig) (domXML string, retryable bool, failure string) {
 	// Check for cloud-init ISO. The reconciler acts on a stored (possibly
 	// peer-replicated) row, so build the ISO path through the validated builder

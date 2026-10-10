@@ -155,6 +155,27 @@ func GetHealthCondition(ctx context.Context, c *Client, evaluator, code, subject
 	return scanHealthCondition(rows[0]), true, nil
 }
 
+// ListOpenHealthConditionsByCode returns the open (observed or confirmed)
+// conditions one evaluator raised under one code.
+func ListOpenHealthConditionsByCode(ctx context.Context, c *Client, evaluator, code string) ([]HealthCondition, error) {
+	rows, err := c.Query(ctx,
+		`SELECT evaluator, code, subject_kind, subject_id, lifecycle, severity, hosts,
+		        evidence, observe_count, clean_count, first_seen, last_seen,
+		        confirmed_at, resolved_at, reporter
+		 FROM health_conditions
+		 WHERE evaluator = ? AND code = ? AND lifecycle != 'resolved' AND deleted_at IS NULL
+		 ORDER BY subject_kind, subject_id`,
+		evaluator, code)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]HealthCondition, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, scanHealthCondition(r))
+	}
+	return out, nil
+}
+
 // ListHealthConditions returns every live condition. includeResolved=false
 // filters to observed+confirmed — the "active conditions" every consumer
 // (GetClusterHealth, admission) reads.

@@ -2,12 +2,15 @@ package storage
 
 import (
 	"context"
+	"errors"
+	"net"
 	"testing"
 )
 
 // An iscsi pool hands every disk the same device: the pool's LUN. The key a
-// pool's disks are compared by is the LUN itself, so two spellings of one LUN
-// must agree and two different LUNs must not.
+// pool's disks are compared by is the LUN itself — the target IQN and the LUN
+// number, whatever portal reaches it — so two spellings of one LUN must agree
+// and two different LUNs must not.
 func TestFixedDevice_ISCSIKeyIsTheLUN(t *testing.T) {
 	cfg := func(target, portal, lun string) Config {
 		o := map[string]string{}
@@ -30,6 +33,11 @@ func TestFixedDevice_ISCSIKeyIsTheLUN(t *testing.T) {
 	base := key(cfg("iqn.2020-01.com.example:store", "10.0.0.1", "3"))
 	for _, same := range []Config{
 		cfg("iqn.2020-01.com.example:store", "10.0.0.1:3260", "3"),
+		// One target reached through another portal (multipath, a second
+		// storage subnet) is the same LUN: an IQN is globally unique.
+		cfg("iqn.2020-01.com.example:store", "10.0.0.2", "3"),
+		cfg("iqn.2020-01.com.example:store", "10.0.0.1:3261", "3"),
+		cfg("iqn.2020-01.com.example:store", "", "3"),
 		cfg("IQN.2020-01.COM.EXAMPLE:STORE", "10.0.0.1", "3"),
 		cfg("iqn.2020-01.com.example:store", "10.0.0.1", "03"),
 	} {
@@ -40,14 +48,12 @@ func TestFixedDevice_ISCSIKeyIsTheLUN(t *testing.T) {
 	for _, other := range []Config{
 		cfg("iqn.2020-01.com.example:store", "10.0.0.1", "4"),
 		cfg("iqn.2020-01.com.example:other", "10.0.0.1", "3"),
-		cfg("iqn.2020-01.com.example:store", "10.0.0.2", "3"),
-		cfg("iqn.2020-01.com.example:store", "10.0.0.1:3261", "3"),
 	} {
 		if k := key(other); k == base {
 			t.Errorf("%+v keyed %q: a different LUN read as the same one", other.Options, k)
 		}
 	}
-	// No lun option is LUN 0, no portal the driver's 127.0.0.1 default.
+	// No lun option is LUN 0.
 	if a, b := key(cfg("iqn.x:y", "", "")), key(cfg("iqn.x:y", "127.0.0.1:3260", "0")); a != b {
 		t.Errorf("defaults keyed %q, want %q", a, b)
 	}
@@ -105,6 +111,37 @@ func TestFixedDevice_OnlyISCSI(t *testing.T) {
 	} {
 		if k, ok := FixedDeviceKeyOfPath(p); ok {
 			t.Errorf("path %q keyed to LUN %q", p, k)
+		}
+	}
+}
+
+// A NEW pool's portal is stored as host:port — the spelling udev names the
+// device with — and a host name is resolved to its IPv4 address with a
+// warning, not refused.
+//
+// Mutation: return the portal unchanged — this goes red.
+func TestNormalizeISCSIPortal(t *testing.T) {
+	lookup := func(host string) ([]net.IP, error) {
+		if host == "san.example" {
+			return []net.IP{net.ParseIP("fd00::5"), net.ParseIP("10.9.9.9")}, nil
+		}
+		return nil, errors.New("no such host")
+	}
+	for _, tc := range []struct {
+		in, want string
+		warn     bool
+	}{
+		{"10.0.0.1", "10.0.0.1:3260", false},
+		{"10.0.0.1:3261", "10.0.0.1:3261", false},
+		{"[fd00::1]", "[fd00::1]:3260", false},
+		{"san.example", "10.9.9.9:3260", true},
+		{"san.example:3270", "10.9.9.9:3270", true},
+		{"gone.example", "gone.example:3260", true},
+		{"", "", false},
+	} {
+		got, warn := NormalizeISCSIPortal(tc.in, lookup)
+		if got != tc.want || (warn != "") != tc.warn {
+			t.Errorf("NormalizeISCSIPortal(%q) = (%q, %q), want %q (warning %v)", tc.in, got, warn, tc.want, tc.warn)
 		}
 	}
 }

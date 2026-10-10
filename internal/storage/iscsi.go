@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"regexp"
 	"strconv"
 	"strings"
@@ -93,14 +94,34 @@ func iscsiDevicePath(target string, opts map[string]string) string {
 var iscsiByPathRe = regexp.MustCompile(`^/dev/disk/by-path/ip-(.*?)-iscsi-((?i:iqn|eui|naa)\..+)-lun-([^-/]+)$`)
 
 // iscsiLUNKey is the identity of one LUN, whatever a pool spells it as: the
-// portal with its port (3260 when none is given; the driver's 127.0.0.1 when no
-// portal is), the target lowercased (iSCSI names compare case-insensitively),
-// and the LUN number.
-func iscsiLUNKey(portal, target, lun string) string {
-	if portal == "" {
-		portal = "127.0.0.1"
+// target lowercased (iSCSI names compare case-insensitively) and the LUN
+// number. The portal is not part of it: one target is reached through several
+// portals (a portal per storage subnet, multipath), and an IQN is globally
+// unique, so two pools naming one target and LUN through two portals are one
+// LUN. Two arrays answering to one IQN are a misconfiguration worth refusing.
+func iscsiLUNKey(target, lun string) string {
+	if lun == "" {
+		lun = "0"
 	}
-	portal = strings.ToLower(portal)
+	if n, err := strconv.ParseUint(lun, 10, 64); err == nil {
+		lun = strconv.FormatUint(n, 10)
+	} else {
+		lun = strings.ToLower(lun)
+	}
+	return "iscsi:" + strings.ToLower(target) + "/lun" + lun
+}
+
+// NormalizeISCSIPortal is the portal a NEW iscsi pool stores: host:port,
+// with the iSCSI default port 3260 when none is given — udev names the device
+// ip-<host>:<port>-iscsi-..., so a pool without the port names a device that
+// never appears — and a host name resolved to its IPv4 address, for the same
+// reason. A name that does not resolve is kept, with the port, and a warning:
+// refusing it would refuse a pool create main accepted. Existing pools keep
+// their spelling: their disks' recorded paths must keep matching.
+func NormalizeISCSIPortal(portal string, lookup func(host string) ([]net.IP, error)) (normalized, warning string) {
+	if portal == "" {
+		return "", ""
+	}
 	host, port := portal, "3260"
 	if strings.HasPrefix(portal, "[") {
 		if i := strings.Index(portal, "]"); i >= 0 {
@@ -115,18 +136,27 @@ func iscsiLUNKey(portal, target, lun string) string {
 			port = p
 		}
 	}
-	if n, err := strconv.Atoi(port); err == nil {
-		port = strconv.Itoa(n)
+	bare := strings.Trim(host, "[]")
+	if net.ParseIP(bare) == nil && lookup != nil {
+		ips, err := lookup(bare)
+		var v4 net.IP
+		for _, ip := range ips {
+			if ip.To4() != nil {
+				v4 = ip.To4()
+				break
+			}
+		}
+		switch {
+		case err != nil || v4 == nil:
+			warning = fmt.Sprintf("iscsi portal %q does not resolve to an IPv4 address (%v); kept as %s:%s — the "+
+				"disk device path is spelled from it, so it must match how udev names the session", bare, err, host, port)
+		default:
+			warning = fmt.Sprintf("iscsi portal %q resolved to %s; the pool records the address, as udev names "+
+				"the device by it", bare, v4)
+			host = v4.String()
+		}
 	}
-	if lun == "" {
-		lun = "0"
-	}
-	if n, err := strconv.ParseUint(lun, 10, 64); err == nil {
-		lun = strconv.FormatUint(n, 10)
-	} else {
-		lun = strings.ToLower(lun)
-	}
-	return "iscsi:" + host + ":" + port + "/" + strings.ToLower(target) + "/lun" + lun
+	return host + ":" + port, warning
 }
 
 // FixedDevice reports whether a pool hands every disk on it the same device —
@@ -139,8 +169,7 @@ func FixedDevice(cfg Config) (key, device string, ok bool) {
 	if !strings.EqualFold(cfg.Driver, "iscsi") {
 		return "", "", false
 	}
-	return iscsiLUNKey(cfg.Options["portal"], cfg.Source, cfg.Options["lun"]),
-		iscsiDevicePath(cfg.Source, cfg.Options), true
+	return iscsiLUNKey(cfg.Source, cfg.Options["lun"]), iscsiDevicePath(cfg.Source, cfg.Options), true
 }
 
 // FixedDeviceKeyOfPath is FixedDevice's key for a recorded disk path: a path an
@@ -150,7 +179,7 @@ func FixedDeviceKeyOfPath(path string) (string, bool) {
 	if m == nil {
 		return "", false
 	}
-	return iscsiLUNKey(m[1], m[2], m[3]), true
+	return iscsiLUNKey(m[2], m[3]), true
 }
 
 func (d *iscsiDriver) DeleteDisk(_ context.Context, path string) error {

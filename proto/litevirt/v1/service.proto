@@ -1497,6 +1497,19 @@ message ContainerDetail {
     // host_detail is false when the container's host could not be reached and
     // the host-local fields (privilege, rootfs, backup availability) are unknown.
     bool   host_detail   = 13;
+    // stranded_rootfs are this container's own rootfs left on another host by
+    // a relocation off it (condition ct_rootfs_stranded): the relocated copy
+    // was recreated from its image or restored from a backup, and that data
+    // is there. Nothing removes it automatically.
+    repeated ContainerStrandedRootfs stranded_rootfs = 14;
+}
+
+message ContainerStrandedRootfs {
+    string host     = 1;  // the host holding it
+    string path     = 2;  // its rootfs there; "" until that host is back and has looked
+    string since    = 3;  // RFC3339
+    string how      = 4;  // image-recreate | backup-restore: how the container was relocated
+    string moved_to = 5;
 }
 
 message SnapshotContainerRequest       { string name = 1; string host_name = 2; string snapshot = 3; }

@@ -171,3 +171,13 @@ func (s *Server) NotifyVMDiskStranded(vm, host, detail string) {
 		Detail: host + ": " + detail,
 	})
 }
+
+// NotifyCTRootfsStranded is the coordinator's callback for a container
+// relocation that left the container's own rootfs on its failed host
+// (health/stranded_rootfs.go): a ct.rootfs.stranded notification.
+func (s *Server) NotifyCTRootfsStranded(ct, host, detail string) {
+	s.notify(context.Background(), notify.Notification{
+		Kind: "ct.rootfs.stranded", Severity: notify.SevWarn, Subject: ct,
+		Detail: host + ": " + detail,
+	})
+}

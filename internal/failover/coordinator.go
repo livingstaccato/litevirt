@@ -197,6 +197,9 @@ type Coordinator struct {
 	// host-local disks on the failed host (stranded_disk.go), so the daemon
 	// can raise the vm.disk.stranded notification.
 	OnDiskStranded func(vm, host, detail string)
+	// OnRootfsStranded, when set, is invoked after a container relocation
+	// leaves the container's own rootfs on the failed host.
+	OnRootfsStranded func(ct, host, detail string)
 	// Events, when set, carries the coordinator's workload events (a stopped
 	// workload left on a failed host, skip_stopped.go) to this host's live
 	// event stream. Optional; a VM's event is also kept in vm_events.
@@ -3329,6 +3332,7 @@ func (c *Coordinator) completeRestore(ctx context.Context, h *corrosion.HostReco
 	c.mCt(ActionRelocate, ResultSuccess, errClassNone)
 	slog.Info("failover: container relocated via restore-from-backup", "container", ct.Name, "from", h.Name, "to", target)
 	c.audit(ctx, "ct.relocate.restored", ct.Name, "restored from backup to "+target+" after fencing "+h.Name, "ok")
+	c.noteRootfsStranded(ctx, h.Name, ct, target, "backup-restore")
 }
 
 // imageRecreateOrSkip is the tier-1 path: recreate from a re-pullable image, else
@@ -3439,6 +3443,7 @@ func (c *Coordinator) imageRecreateOrSkip(ctx context.Context, h *corrosion.Host
 	slog.Info("failover: relocating container (image-recreate)", "container", ct.Name, "from", h.Name, "to", target)
 	c.audit(ctx, "ct.relocate.recreate", ct.Name,
 		"relocated from "+h.Name+" to "+target+" (recreate from image)", "ok")
+	c.noteRootfsStranded(ctx, h.Name, ct, target, "image-recreate")
 }
 
 // pickContainerTarget chooses a survivor via the placement engine, falling back

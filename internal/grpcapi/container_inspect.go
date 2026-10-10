@@ -14,6 +14,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 )
 
 // rootfsMeasureBudget bounds the rootfs walk, so inspecting a container with a
@@ -109,6 +110,16 @@ func (s *Server) containerDetailFromCluster(ctx context.Context, rec *corrosion.
 			Id: sn.ID, CtName: sn.CtName, HostName: sn.HostName, Name: sn.Name,
 			State: sn.State, SizeBytes: sn.SizeBytes, Type: sn.Type, CreatedAt: sn.CreatedAt,
 		})
+	}
+
+	// Its own rootfs a relocation left on another host (ct_rootfs_stranded).
+	// Best-effort: an unreadable record leaves the field empty.
+	if left, lerr := health.StrandedRootfsOf(ctx, s.db, rec.Name); lerr == nil {
+		for _, l := range left {
+			d.StrandedRootfs = append(d.StrandedRootfs, &pb.ContainerStrandedRootfs{
+				Host: l.Host, Path: l.Path, Since: l.Since, How: l.How, MovedTo: l.MovedTo,
+			})
+		}
 	}
 
 	bks, err := corrosion.ListContainerBackups(ctx, s.db, rec.Name, rec.Project)

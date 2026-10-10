@@ -966,7 +966,13 @@ Containers are not on this path. A container relocated off a failed host is
 recreated from its image (or restored from a backup) on another host, and its
 own container directory stays on the failed host: nothing sets it aside or
 removes it automatically, and a relocation back onto that host adopts it. It
-is not recorded as stranded either.
+is recorded the same way, though: the coordinator raises `ct_rootfs_stranded`
+(evaluator `ct_rootfs`, subject `container/<name>@<host>`, a warning), writes a
+`failover.rootfs-stranded` audit entry and sends a `ct.rootfs.stranded`
+notification; the host, once back, adds the rootfs path; `lv ct inspect <name>`
+shows it ("Left on <host>"). A relocation back onto that host that adopts the
+old rootfs writes a `ct.relocate.adopted` audit entry saying the container runs
+on that data, not a fresh image, and the record clears.
 
 The restart of a VM on its own host never rebuilds a missing disk. That case
 is `vm_disk_missing` in [diagnostics](diagnostics.md).

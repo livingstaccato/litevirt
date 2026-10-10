@@ -66,3 +66,26 @@ func (c *Coordinator) noteDiskStranded(ctx context.Context, host string, vm corr
 		c.OnDiskStranded(vm.Name, host, detail)
 	}
 }
+
+// noteRootfsStranded records that a relocation of ct from host to target
+// (how: image-recreate | backup-restore) left the container's own rootfs on
+// host (health/stranded_rootfs.go). Surface only: nothing is moved or
+// removed.
+func (c *Coordinator) noteRootfsStranded(ctx context.Context, host string, ct corrosion.ContainerRecord, target, how string) {
+	if ct.State == "pending" {
+		// A relocation onto host that host never carried out: the container
+		// never ran there, so none of its data is there.
+		return
+	}
+	detail, err := health.RecordStrandedRootfs(ctx, c.db, c.hostName, ct.Name, host, target, how, c.now())
+	if err != nil {
+		slog.Error("failover: could not record the rootfs a relocated container left on its failed host",
+			"container", ct.Name, "host", host, "error", err)
+		return
+	}
+	c.audit(ctx, "failover.rootfs-stranded", ct.Name, detail, "ok")
+	c.publish("ct.failover.rootfs_stranded", ct.Name, detail)
+	if c.OnRootfsStranded != nil {
+		c.OnRootfsStranded(ct.Name, host, detail)
+	}
+}

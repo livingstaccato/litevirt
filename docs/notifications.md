@@ -40,6 +40,7 @@ A notification has a `kind` (verb.noun), `severity` (`info` | `warn` | `error`),
 | `ha.lww.unresolved` | warn | a node is tracking unresolved equal-timestamp LWW ties |
 | `ha.dualrun.coverage` | warn | a workload-capable host could not be fully probed this pass — unreachable (segmented/down) OR returned a partial runtime (a local libvirt/container/ip probe errored, so its workload absence is unreliable); split-brain can't be ruled out there |
 | `quota.exceeded` | warn | a CreateVM is rejected by a project quota |
+| `ct.rootfs.stranded` | warn | a container relocated off a failed host left its own rootfs there (nothing removes it); the detail names the container and the host |
 | `vm.disk.stranded` | warn | a failover restarted a VM elsewhere and left its host-local disk on the failed host, or a host set such a disk (or an old copy a failover found) aside; the detail names the VM, the host and the path. See [migration-failover.md](migration-failover.md#the-real-disk-a-restart-leaves-behind) |
 | `test.notification` | info | `lv notify test` / the UI "Test" button |
 

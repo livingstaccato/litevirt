@@ -1816,6 +1816,19 @@ the host, the disks and what to do (see
 |---|---|
 | Failover leaves a restart-same VM with a host-local disk on its failed host. | The host is back and runs the VM again, or the VM moved or was deleted. A record for a host removed from the cluster clears once the VM is deleted or elsewhere. |
 
+### A relocated container's own rootfs is on another host (`ct_rootfs_stranded`)
+
+Failover relocated a container off a failed host, recreating it from its image
+or restoring it from a backup, and its own container directory, with what it
+wrote since, stayed on the failed host. The coordinator raises
+`ct_rootfs_stranded` (evaluator `ct_rootfs`, subject `container/<name>@<host>`,
+warning). When that host is back it adds the rootfs path to the evidence.
+Nothing moves or removes the rootfs; `lv ct inspect <name>` shows it.
+
+| Raised when | Clears when |
+|---|---|
+| A relocation moves the container off a host that ran it. | No container of that name is left on that host, or a relocation back adopted it (`ct.relocate.adopted` in the audit log). |
+
 ## NetBox IPAM: metrics and health findings
 
 Every counter below is registered on the same `/metrics` endpoint as the rest,

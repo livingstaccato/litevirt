@@ -1455,6 +1455,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	fc.RelocateRestoreTimeout = time.Duration(d.cfg.ContainerRestoreTimeoutSec) * time.Second
 	fc.OnFence = svc.NotifyHostFenced                                   // operator notification on fence (#5)
 	fc.OnDiskStranded = svc.NotifyVMDiskStranded                        // a VM restarted elsewhere left its host-local disk behind
+	fc.OnRootfsStranded = svc.NotifyCTRootfsStranded                    // a relocated container left its own rootfs behind
 	fc.Events = svc.EventBus()                                          // a stopped workload left on a failed host
 	fc.Metrics = metrics.NewFailoverMetrics()                           // structured failover counters (U9)
 	fc.SafeFenceEnforce = d.cfg.Enforcement.SafeFenceDefault            // safe-fence kill-switch (config AND SafeFenceDefaultV1)

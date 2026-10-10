@@ -32,6 +32,7 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/dns"
 	"github.com/litevirt/litevirt/internal/failover"
+	"github.com/litevirt/litevirt/internal/filerestore"
 	"github.com/litevirt/litevirt/internal/firewall"
 	"github.com/litevirt/litevirt/internal/grpcapi"
 	"github.com/litevirt/litevirt/internal/health"
@@ -1434,7 +1435,62 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// effectively (every schedule errors with ErrNoRepoConfigured until
 	// the operator adds a repo).
 	d.snapScheduler.Runner = grpcapi.BackupRunnerForScheduler(svc, d.cfg.BackupRepos)
-	svc.SetBackupRepos(d.cfg.BackupRepos)               // let RPC handlers resolve repo names
+	svc.SetBackupRepos(d.cfg.BackupRepos) // let RPC handlers resolve repo names
+	// Per-repo backup bandwidth limits. LoadConfig already refused a bad value.
+	if bw, err := d.cfg.BackupBandwidthLimits(); err == nil {
+		svc.SetBackupBandwidthLimits(bw)
+	} else {
+		slog.Error("backup_bwlimits", "error", err)
+	}
+	// Restore VMs a previous daemon left running (a crash, a restart, an
+	// upgrade) are killed whether or not file restore is still enabled.
+	frRunDir := fileRestoreRunDir(d.cfg.DataDir)
+	frUIDBase := d.cfg.FileRestore.UIDBase
+	if frUIDBase == 0 {
+		frUIDBase = filerestore.DefaultUIDBase
+	}
+	if n := filerestore.SweepStale(frRunDir, frUIDBase, d.cfg.Containers.ContainerIDRange()); n > 0 {
+		slog.Warn("file restore: killed restore VMs a previous daemon left running", "count", n)
+	}
+	if fr := d.cfg.FileRestore; fr.On() {
+		if err := filerestore.EnsureRestoreUser(); err != nil {
+			// File restore then refuses, naming the missing user.
+			slog.Warn("file restore: no restore VM user", "error", err)
+		}
+		// Round-1 builds kept the boot files in data_dir, owned by qemu's
+		// user; they are never read again.
+		_ = os.RemoveAll(filepath.Join(d.cfg.DataDir, "file-restore", "cache"))
+		idle := time.Duration(fr.IdleTimeoutSec) * time.Second
+		if idle <= 0 {
+			idle = 5 * time.Minute
+		}
+		svc.SetFileRestore(grpcapi.FileRestoreOptions{
+			Launcher: filerestore.NewLauncher(filerestore.Config{
+				QEMU: fr.QEMU, Kernel: fr.Kernel, ModulesDir: fr.ModulesDir,
+				MemoryMiB: fr.MemoryMiB, RunAs: fr.RunAs,
+				CacheDir: fileRestoreCacheDir(d.cfg.DataDir),
+				RunDir:   frRunDir,
+				OnTamper: svc.FileRestoreTampered,
+				// The agent outlives the host's idle timeout by a minute, so
+				// it only ever powers off on its own when the host is gone.
+				AgentIdle: idle + time.Minute,
+				Unsandboxed: filerestore.Barriers{
+					Seccomp: fr.AllowUnsandboxed.Seccomp, MAC: fr.AllowUnsandboxed.MAC, Root: fr.AllowUnsandboxed.Root,
+				},
+				AllowSharedRunAs: fr.AllowSharedRunAs,
+				UIDBase:          frUIDBase,
+				ContainerIDs:     d.cfg.Containers.ContainerIDRange(),
+			}),
+			IdleTimeout:     idle,
+			MaxSessions:     fr.MaxSessions,
+			MaxExtractions:  fr.MaxExtractions,
+			MaxExtractBytes: fr.ExtractLimit(),
+		})
+	}
+	// While a key that lifts a restore VM barrier is set, this host carries
+	// an informational file_restore_unsandboxed condition (resolved once it
+	// is not).
+	svc.ReconcileFileRestoreCondition(ctx, d.cfg.FileRestore.ReducedBarrierKeys())
 	svc.SweepTransferStaging()                          // clear orphaned peer-transfer staging repos from a prior incarnation
 	blockedCIDRs, _ := d.cfg.ImagePullBlockedPrefixes() // already validated in LoadConfig
 	svc.SetImageLimits(d.cfg.MaxImageBytes, time.Duration(d.cfg.ImagePullTimeoutSec)*time.Second, blockedCIDRs)
@@ -3052,4 +3108,24 @@ func (d *Daemon) wireLeaseTermLedgerGate() {
 	d.db.SetLeaseTermLedgerGate(func() bool {
 		return d.checker.DurablyLatched(capabilities.LeaseTermLedgerV1)
 	})
+}
+
+// fileRestoreCacheDir holds the restore VM's boot files: outside data_dir
+// (whose contents production qemus may be granted), root-owned, 0750 to the
+// restore user's group.
+func fileRestoreCacheDir(dataDir string) string {
+	if os.Geteuid() == 0 {
+		return "/var/cache/litevirt-restore"
+	}
+	return filepath.Join(dataDir, "file-restore", "boot-cache")
+}
+
+// fileRestoreRunDir is where restore VM sessions keep their NBD socket and
+// pidfile: under /run for a root daemon, outside data_dir, so a session never
+// shares a filesystem with state.db.
+func fileRestoreRunDir(dataDir string) string {
+	if os.Geteuid() == 0 {
+		return "/run/litevirt/file-restore"
+	}
+	return filepath.Join(dataDir, "file-restore", "run")
 }

@@ -954,6 +954,11 @@ message BackupSnapshotRequest {
     // repo name). The owner accepts it only from that peer over mTLS (host-cert CN
     // == sink_host); a non-peer request that sets it is rejected. Leave empty.
     string sink_host = 7;
+    // bwlimit_bytes_per_sec caps how fast this job reads the disk and, for a
+    // remote backup, sends chunks to the sink. 0 = no job limit. The daemon
+    // also applies the target repo's limit (daemon config backup_bwlimits);
+    // the lower of the two wins. An older daemon ignores the field.
+    int64 bwlimit_bytes_per_sec = 8;
 }
 message BackupSnapshotProgress {
     enum Phase {
@@ -1027,6 +1032,52 @@ message PushBackupResponse {
     int32 chunks_written = 1;
     int32 chunks_deduped = 2;
     int64 bytes_written  = 3;
+}
+
+// ListBackupFilesRequest names one backup (as RestoreFromBackup does) and a
+// path in it: "/" lists the backup's volumes (filesystems the restore VM
+// mounted: partitions, the whole disk, or "rootfs" of a container archive),
+// "/<volume>/<dir>" lists a directory.
+message ListBackupFilesRequest {
+    string repo_path = 1;
+    string name      = 2;  // VM or container name, as in the manifest
+    string disk_name = 3;  // "root" for a VM's root disk, "rootfs" for a container
+    string timestamp = 4;  // exact RFC3339
+    string path      = 5;  // empty = "/"
+}
+message BackupFileEntry {
+    string name        = 1;
+    string type        = 2;  // file | dir | symlink | other
+    int64  size        = 3;
+    uint32 mode        = 4;  // permission bits
+    int64  mtime_unix  = 5;
+    string link_target = 6;  // a symlink's target, shown only; never followed
+}
+message ListBackupFilesResponse {
+    string path                    = 1;
+    repeated BackupFileEntry entries = 2;
+    bool   truncated               = 3;  // more entries than one listing returns
+    int32  skipped                 = 4;  // entries left out (invalid or non-UTF-8 names)
+}
+// RestoreBackupFilesRequest selects paths ("/<volume>/<path>") to extract.
+// The answer is a tar archive streamed in chunks; nothing is written on the
+// daemon's host.
+message RestoreBackupFilesRequest {
+    string repo_path = 1;
+    string name      = 2;
+    string disk_name = 3;
+    string timestamp = 4;
+    repeated string paths = 5;
+    int64  max_bytes = 6;  // 0 = the daemon's limit; can only lower it
+}
+message RestoreBackupFilesChunk {
+    bytes  data      = 1;  // the next bytes of the tar archive
+    bool   done      = 2;  // last frame: the counts below are final
+    int32  entries   = 3;
+    int64  bytes     = 4;  // file bytes in the archive
+    int32  skipped   = 5;  // entries refused (names, types, links)
+    bool   truncated = 6;  // stopped at a size or entry limit
+    string status    = 7;
 }
 
 message RestoreFromBackupRequest {
@@ -1280,6 +1331,8 @@ message BackupContainerRequest {
     // forwarding to the owner, which accepts it only from that peer over mTLS
     // (CN == sink_host). Leave empty.
     string sink_host = 5;
+    // bwlimit_bytes_per_sec: see BackupSnapshotRequest.bwlimit_bytes_per_sec.
+    int64 bwlimit_bytes_per_sec = 6;
 }
 
 message BackupContainerProgress {
@@ -3518,6 +3571,12 @@ service LiteVirt {
     // ── Backup snapshots ──
     rpc BackupSnapshot(BackupSnapshotRequest)       returns (stream BackupSnapshotProgress);
     rpc RestoreFromBackup(RestoreFromBackupRequest) returns (stream RestoreFromBackupProgress);
+    // Single-file restore: browse a backup and extract files from it. The
+    // filesystem is read inside a throwaway restore VM, never on the host
+    // (docs/design/backup-file-restore.md). Same permission as a full restore
+    // of the VM or container; each extraction is audited.
+    rpc ListBackupFiles(ListBackupFilesRequest) returns (ListBackupFilesResponse);
+    rpc RestoreBackupFiles(RestoreBackupFilesRequest) returns (stream RestoreBackupFilesChunk);
 
     // ── Peer streaming backup transport (PR 4) ──
     // Move ONE manifest + only its missing chunks between two daemons over peer

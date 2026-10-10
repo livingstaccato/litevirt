@@ -118,6 +118,26 @@ Use this only when you understand the risk — for example, you've
 
 ---
 
+## First start after upgrading to a build with file restore
+
+The first start of a build with single-file restore (and file restore not
+disabled) creates the `litevirt-restore` system account, loads the
+`litevirt-restore-qemu` AppArmor profile where AppArmor is enabled, creates
+`/var/cache/litevirt-restore` and `/run/litevirt/file-restore`, and removes
+`/var/lib/litevirt/file-restore/cache` left by an earlier build. To avoid the
+account being created by the daemon, create it beforehand
+([installation.md](installation.md#what-file-restore-changes-on-the-host)); to
+avoid all of it, set `file_restore: {enabled: false}` before upgrading.
+
+Every start also kills any process running as one of the uids reserved for
+restore VMs (`file_restore.uid_base`, 64 uids from 3800000000) — but only
+after checking that range is no one else's: not the containers' id-map range,
+no `/etc/subuid` or `/etc/subgid` range, no account `getent passwd` knows.
+If you moved `containers.idmap_base` high enough that its range covers the
+reserved uids, an explicit `file_restore.uid_base` inside it refuses to load
+the config; with the default, the daemon starts and file restore is refused,
+naming the overlap — move `file_restore.uid_base`.
+
 ## How a normal upgrade flows
 
 ```

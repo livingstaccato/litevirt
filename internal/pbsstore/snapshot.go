@@ -52,6 +52,12 @@ type PushOptions struct {
 	// has been written or deduped against the repo. Use it to drive
 	// gRPC stream progress.
 	Progress func(PushProgress)
+
+	// RateLimit, if non-nil, is charged for every byte read from the source,
+	// after the read: a bandwidth limit (a job's own and/or its target's,
+	// see CombineLimiters). Holes and chunks inherited from a parent cost
+	// nothing, because they are not read.
+	RateLimit RateLimiter
 }
 
 // PushProgress is the per-chunk callback payload.
@@ -98,6 +104,9 @@ func PushDisk(ctx context.Context, repo *Repo, src io.Reader, opts PushOptions) 
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
+		}
+		if err := opts.waitRate(ctx, len(data)); err != nil {
+			return err
 		}
 		// Copy into a fresh slice so PutChunk can keep the bytes; the
 		// caller-supplied buffer is reused on the next iteration.

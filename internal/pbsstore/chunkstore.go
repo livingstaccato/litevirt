@@ -26,9 +26,11 @@
 //	    └── &lt;vm&gt;/
 //	        └── &lt;ts&gt;-&lt;disk&gt;.manifest.json
 //
-// A chunk file is the chunk's bytes verbatim (encryption layered on top
-// when enabled in 1.3.G — the on-disk filename is still the BLAKE3 of
-// the *plaintext* so dedup survives key rotation).
+// A chunk file is the chunk's bytes verbatim, or — in a repo with
+// "compression": "zstd" — a zstd frame of them (compression.go), with
+// encryption layered on top when enabled in 1.3.G. The on-disk filename is
+// always the BLAKE3 of the *plaintext* so dedup survives key rotation and
+// spans compressed and uncompressed repos.
 package pbsstore
 
 import (
@@ -51,7 +53,9 @@ import (
 	"lukechampine.com/blake3"
 )
 
-// SchemaVersion is bumped on incompatible repository-format changes.
+// SchemaVersion is the manifest schema_version this build writes, and the
+// repo.json schema_version of an uncompressed repo. A repo that may hold
+// compressed chunks is MaxRepoSchemaVersion (see compression.go).
 const SchemaVersion = 1
 
 // ChunkSize is the rolling window we feed into BLAKE3. 4 MiB matches
@@ -67,6 +71,9 @@ type RepoMeta struct {
 	SchemaVersion int    `json:"schema_version"`
 	CreatedAt     string `json:"created_at"`
 	Encryption    string `json:"encryption,omitempty"` // "" | "aes256gcm" (1.3.G)
+	// Compression is "" (none) or "zstd". A zstd repo is schema_version 2, so
+	// a release that cannot decompress refuses it at Open (compression.go).
+	Compression string `json:"compression,omitempty"`
 }
 
 // ChunkRef is a manifest entry pointing at one chunk in the store.
@@ -152,9 +159,32 @@ type Repo struct {
 	aead cipher.AEAD
 }
 
-// Init creates a new repository on disk. Refuses if the directory
-// already contains a repo.json.
+// Init creates a new, uncompressed, unencrypted repository on disk — the
+// format every release reads. Refuses if the directory already contains a
+// repo.json.
 func Init(root string) (*Repo, error) {
+	return InitWithOptions(root, InitOptions{})
+}
+
+// InitOptions selects a new repository's format.
+type InitOptions struct {
+	// Encryption is "" or EncryptionModeAESGCM. An encrypted repo needs
+	// SetKey before any chunk operation.
+	Encryption string
+	// Compression is "", CompressionNone or CompressionZstd.
+	Compression string
+}
+
+// InitWithOptions creates a new repository with the given format. Refuses if
+// the directory already contains a repo.json.
+func InitWithOptions(root string, opts InitOptions) (*Repo, error) {
+	if opts.Encryption != "" && opts.Encryption != EncryptionModeAESGCM {
+		return nil, fmt.Errorf("unsupported encryption mode %q", opts.Encryption)
+	}
+	compression, err := NormalizeCompression(opts.Compression)
+	if err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(root, 0750); err != nil {
 		return nil, fmt.Errorf("mkdir repo root: %w", err)
 	}
@@ -170,6 +200,11 @@ func Init(root string) (*Repo, error) {
 	meta := RepoMeta{
 		SchemaVersion: SchemaVersion,
 		CreatedAt:     time.Now().UTC().Format(time.RFC3339),
+		Encryption:    opts.Encryption,
+		Compression:   compression,
+	}
+	if compression != "" {
+		meta.SchemaVersion = repoSchemaCompressed
 	}
 	if err := writeJSONAtomic(metaPath, meta); err != nil {
 		return nil, fmt.Errorf("write repo.json: %w", err)
@@ -189,9 +224,12 @@ func Open(root string) (*Repo, error) {
 	if err := json.Unmarshal(data, &meta); err != nil {
 		return nil, fmt.Errorf("parse repo.json: %w", err)
 	}
-	if meta.SchemaVersion > SchemaVersion {
-		return nil, fmt.Errorf("repository schema-version %d newer than supported %d",
-			meta.SchemaVersion, SchemaVersion)
+	if meta.SchemaVersion > MaxRepoSchemaVersion {
+		return nil, fmt.Errorf("repository schema-version %d newer than supported %d; upgrade litevirt to read it",
+			meta.SchemaVersion, MaxRepoSchemaVersion)
+	}
+	if _, err := NormalizeCompression(meta.Compression); err != nil {
+		return nil, fmt.Errorf("repo.json: %w", err)
 	}
 	return &Repo{root: root, meta: meta}, nil
 }
@@ -221,7 +259,11 @@ func (r *Repo) PutChunk(data []byte) (id string, created bool, err error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0750); err != nil {
 		return "", false, fmt.Errorf("mkdir chunk dir: %w", err)
 	}
-	storage, err := r.encryptForStorage(data)
+	packed, err := r.compressForStorage(data)
+	if err != nil {
+		return "", false, fmt.Errorf("compress chunk: %w", err)
+	}
+	storage, err := r.encryptForStorage(packed)
 	if err != nil {
 		return "", false, fmt.Errorf("seal chunk: %w", err)
 	}
@@ -251,8 +293,8 @@ func (r *Repo) HasChunk(id string) bool {
 	return err == nil
 }
 
-// GetChunk reads a chunk, decrypts it (if the repo is encrypted), and
-// verifies the BLAKE3 hash matches the chunk's filename. Returns
+// GetChunk reads a chunk, decrypts it (if the repo is encrypted),
+// decompresses it (if it was stored compressed), and verifies the BLAKE3 hash matches the chunk's filename. Returns
 // ErrChunkMismatch on plaintext corruption and wraps ErrKeyMismatch
 // when AES-GCM authentication fails.
 func (r *Repo) GetChunk(id string) ([]byte, error) {
@@ -263,14 +305,11 @@ func (r *Repo) GetChunk(id string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read chunk %s: %w", id, err)
 	}
-	plaintext, err := r.decryptFromStorage(storage)
+	packed, err := r.decryptFromStorage(storage)
 	if err != nil {
 		return nil, err
 	}
-	if got := ChunkID(plaintext); got != id {
-		return nil, fmt.Errorf("%w: stored=%s actual=%s", ErrChunkMismatch, id, got)
-	}
-	return plaintext, nil
+	return decodeStored(id, packed)
 }
 
 // DeleteChunk removes a chunk. Used by GC; not exposed to callers

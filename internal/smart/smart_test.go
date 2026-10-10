@@ -170,3 +170,18 @@ func TestCheck_PassesStandbyFlagAndUsesSerialID(t *testing.T) {
 		t.Errorf("disks = %+v", r.Disks)
 	}
 }
+
+// The real standby shape has no serial/WWN, so Check labels it by device name
+// and Unknown: callers must treat that ID as "no identity", not as a new disk.
+func TestCheck_StandbyDiskIsUnknownWithDeviceNameID(t *testing.T) {
+	run := func(ctx context.Context, args ...string) ([]byte, error) {
+		if args[0] == "--scan" {
+			return []byte(`{"devices":[{"name":"/dev/sdc","type":"sat"}]}`), nil
+		}
+		return []byte(fixture(t, "ata_standby.json")), &exec.ExitError{}
+	}
+	r := Check(context.Background(), run)
+	if len(r.Disks) != 1 || r.Disks[0].Status != Unknown || r.Disks[0].ID != "/dev/sdc" {
+		t.Errorf("standby disk = %+v", r.Disks)
+	}
+}

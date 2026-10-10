@@ -337,7 +337,7 @@ func TestEmail_RedactConfig_CaseInsensitive(t *testing.T) {
 }
 
 func TestEmail_CanonicalConfig(t *testing.T) {
-	in := `{"Host":"h","FROM":"a@b.c","To":["x@y.z"],"Username":"u","Password":"pw","junk":1}`
+	in := `{"Host":"h","FROM":"a@b.c","To":["x@y.z"],"Username":"u","Password":"pw"}`
 	out, err := CanonicalConfig("email", in)
 	if err != nil {
 		t.Fatal(err)
@@ -352,8 +352,10 @@ func TestEmail_CanonicalConfig(t *testing.T) {
 	if m["password"] != "pw" || m["host"] != "h" {
 		t.Errorf("canonical config lost fields: %s", out)
 	}
-	if _, ok := m["junk"]; ok {
-		t.Errorf("unknown key persisted: %s", out)
+	// An unknown key is rejected, naming the key, rather than silently dropped.
+	_, err = CanonicalConfig("email", `{"host":"h","from":"a@b.c","to":["x@y.z"],"smtp_relay_extra":1}`)
+	if err == nil || !strings.Contains(err.Error(), "smtp_relay_extra") {
+		t.Errorf("unknown key not rejected by name: %v", err)
 	}
 	if !HasSecret("email", in) || HasSecret("email", `{"host":"h"}`) || HasSecret("webhook", in) {
 		t.Error("HasSecret wrong")
@@ -401,8 +403,15 @@ func TestEmail_HungServerHonoursDeadline(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	if err := tg.Send(ctx, testNote); err == nil {
-		t.Fatal("hung server reported success")
+	res := make(chan error, 1)
+	go func() { res <- tg.Send(ctx, testNote) }()
+	select {
+	case err := <-res:
+		if err == nil {
+			t.Fatal("hung server reported success")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Send ignored its context deadline")
 	}
 	if d := time.Since(start); d > 5*time.Second {
 		t.Errorf("Send held for %v past a 600ms deadline", d)

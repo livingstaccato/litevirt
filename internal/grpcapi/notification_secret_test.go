@@ -1,6 +1,8 @@
 package grpcapi
 
 import (
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"strings"
 	"testing"
 
@@ -164,5 +166,16 @@ func TestCreateNotificationTarget_EmailPasswordGatedOnCapability(t *testing.T) {
 	nopw := `{"host":"smtp.example.com","from":"lv@example.com","to":["ops@example.com"]}`
 	if _, err := s.CreateNotificationTarget(adminCtx(), &pb.CreateNotificationTargetRequest{Name: "m2", Type: "email", Config: nopw, Enabled: true}); err != nil {
 		t.Fatalf("passwordless email target refused: %v", err)
+	}
+}
+
+// N-5: an unknown key is refused with InvalidArgument naming it.
+func TestCreateNotificationTarget_EmailUnknownKeyRejectedByName(t *testing.T) {
+	s := testServer(t)
+	s.gate = latchedEmailGate()
+	cfg := `{"host":"h","from":"a@b.c","to":["x@y.z"],"passwrd":"typo"}`
+	_, err := s.CreateNotificationTarget(adminCtx(), &pb.CreateNotificationTargetRequest{Name: "m", Type: "email", Config: cfg, Enabled: true})
+	if err == nil || status.Code(err) != codes.InvalidArgument || !strings.Contains(err.Error(), "passwrd") {
+		t.Fatalf("want InvalidArgument naming the key, got %v", err)
 	}
 }

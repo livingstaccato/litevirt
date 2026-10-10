@@ -797,6 +797,18 @@ const (
 //     intact, and the incarnation-scoped one is left unread until it is
 //     upgraded again.
 //
+//   - email_target_secret_v1 has no flag either: it says this build masks an
+//     email notification target's SMTP password on read and in the create
+//     response, a fact about the binary. There is nothing to stand down: the
+//     token only ever allows creating a target WITH a password (a passwordless
+//     email target is always allowed), and a latched cluster that wants no
+//     password simply creates its targets without one or deletes them
+//     (`lv notify target rm`). A binary rolled back below it after it has
+//     latched enters WAL quarantine, as below every latched token; the
+//     stored rows survive and an older build would list their password
+//     unmasked, which is why creation waits for the latch. Never delete the
+//     name: move it to the retired set.
+//
 //   - fence_state_v1 has no flag either: it says this build resumes from an
 //     unverified fence recorded 'offline' and does not auto-activate such a
 //     host, which the lease holder relies on of every node. It changes only

@@ -145,7 +145,7 @@ SMTP password is stored in the target's config, in the same replicated,
 sensitive `notification_targets` table that holds webhook URLs; every list
 response (`lv notify target ls`, the API, the UI) masks it for every role, and
 it is never logged, and `CreateNotificationTarget` masks it in its own response too.
-The config is stored canonically (re-encoded from the validated struct, lowercase keys
+An unknown key in the email config is refused by name. The config is stored canonically (re-encoded from the validated struct, lowercase keys
 only) so a differently-cased `Password` key cannot dodge the masking. To change the
 password, delete and re-add the target.
 
@@ -186,6 +186,14 @@ number (WWN as a fallback, device name last), so a device renamed across a reboo
 neither re-pages nor strands a standing failure; a disk that is physically removed
 simply drops out. An NVMe critical warning of only the temperature bit is
 `warning`; any other bit is `prefail`.
+
+An `unknown` read (a smartctl hiccup, or a disk asleep under `-n standby`, whose
+output carries no serial) keeps the disk's tracked identity and last state: a
+standing failure neither re-pages nor is lost, and a disk that recovered while
+unknown emits `disk.smart.recovered` when it next reads healthy. `recovered`
+means the same physical disk: a disk that is removed stops being tracked and
+never emits it, and a replacement at the same device name is a new disk (a bad
+one pages; a healthy one is silent).
 
 A host without `smartctl`, a virtual disk with no SMART support, or output that
 cannot be parsed reports `unknown`: it neither pages nor clears a standing

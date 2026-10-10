@@ -22,6 +22,10 @@ import (
 // target types: the table is already a sensitive, replicated, viewer-redacted
 // store, so no second secret store is introduced. RedactConfig masks it in
 // every list response.
+//
+// Adding a field here: CanonicalConfig rejects unknown keys, so an older node
+// refuses a config that uses a newer field instead of storing it and losing it.
+// Ship such a field behind its own capability token.
 type emailConfig struct {
 	Host     string   `json:"host"`
 	Port     int      `json:"port,omitempty"`
@@ -260,7 +264,11 @@ func CanonicalConfig(typ, configJSON string) (string, error) {
 		return configJSON, nil
 	}
 	var c emailConfig
-	if err := json.Unmarshal([]byte(configJSON), &c); err != nil {
+	dec := json.NewDecoder(strings.NewReader(configJSON))
+	// An unknown key is refused by name rather than dropped by the re-encode
+	// below, so a typo (or a field a newer build added) never vanishes silently.
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&c); err != nil {
 		return "", fmt.Errorf("email target: bad config: %w", err)
 	}
 	b, err := json.Marshal(c)

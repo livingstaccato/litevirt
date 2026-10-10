@@ -23,13 +23,28 @@ const (
 // SetSMARTMetrics attaches the per-host disk SMART gauges.
 func (s *Server) SetSMARTMetrics(m *metrics.SMARTMetrics) { s.smartMetrics = m }
 
+// smartState is what the monitor carries between passes: each disk's last
+// definite status by identity, and the identity each device name last had. The
+// second map is what lets an Unknown read (a smartctl hiccup, a disk asleep
+// under -n standby, whose JSON carries no serial) find the disk it belongs to.
+type smartState struct {
+	status map[string]smart.Status // identity -> last definite status
+	devKey map[string]string       // device name -> identity from its last good read
+}
+
 // smartTransitions turns one SMART pass into the notifications it warrants and
-// the new per-device state. A device pages when it ENTERS (or worsens into) a
-// bad state and says so once when it recovers; it does not re-page every pass.
-// "unknown" never changes state: a smartctl hiccup must neither page nor
-// clear a standing failure.
-func smartTransitions(host string, prev map[string]smart.Status, disks []smart.Disk) ([]notify.Notification, map[string]smart.Status) {
-	next := make(map[string]smart.Status, len(disks))
+// the new state. A device pages when it ENTERS (or worsens into) a bad state and
+// says so once when it recovers; it does not re-page every pass. "unknown" never
+// changes state: a smartctl hiccup or a standby disk must neither page nor clear
+// a standing failure, nor lose the identity it is tracked under. A disk that
+// recovers while unknown emits "recovered" when it next reads healthy. A disk
+// that is physically removed stops being tracked and never emits "recovered".
+// A replacement at the same device name has a new identity and is a new disk.
+func smartTransitions(host string, prev *smartState, disks []smart.Disk) ([]notify.Notification, *smartState) {
+	if prev == nil {
+		prev = &smartState{}
+	}
+	next := &smartState{status: make(map[string]smart.Status, len(disks)), devKey: make(map[string]string, len(disks))}
 	var out []notify.Notification
 	for _, d := range disks {
 		// Keyed by the disk's identity (serial/WWN) so a rename across a reboot
@@ -38,15 +53,24 @@ func smartTransitions(host string, prev map[string]smart.Status, disks []smart.D
 		if key == "" {
 			key = d.Device
 		}
-		old, seen := prev[key]
 		st := d.Status
 		if st == smart.Unknown {
-			if seen {
-				next[key] = old
+			if _, ok := prev.status[key]; !ok {
+				// No identity on this read: fall back to the one this device
+				// name had on its last good read.
+				if k, ok := prev.devKey[d.Device]; ok {
+					key = k
+				}
+			}
+			if old, ok := prev.status[key]; ok {
+				next.status[key] = old
+				next.devKey[d.Device] = key
 			}
 			continue
 		}
-		next[key] = st
+		old, seen := prev.status[key]
+		next.status[key] = st
+		next.devKey[d.Device] = key
 		if seen && old == st {
 			continue
 		}
@@ -85,7 +109,7 @@ func (s *Server) RunSMARTMonitor(ctx context.Context, interval time.Duration) {
 	if run == nil {
 		run = smart.ExecRunner
 	}
-	prev := map[string]smart.Status{}
+	var prev *smartState
 	warnedMissing := false
 	pass := func() {
 		rep := smart.Check(ctx, run)

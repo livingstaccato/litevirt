@@ -45,7 +45,7 @@ func TestSMARTTransitions(t *testing.T) {
 	if len(ns) != 1 || ns[0].Kind != "disk.smart.failing" || ns[0].Subject != "h1:/dev/d" {
 		t.Errorf("escalation = %+v", ns)
 	}
-	if st["/dev/c"] != smart.Failing {
+	if st.status["/dev/c"] != smart.Failing {
 		t.Error("an unknown read cleared a standing failure")
 	}
 	ns, _ = smartTransitions("h1", st, []smart.Disk{d("/dev/c", smart.Failing)})
@@ -205,5 +205,33 @@ func TestSMARTMetrics_SwapIsAtomic(t *testing.T) {
 		if n := len(gaugeVals(t, reg, "litevirt_disk_smart_status")); n != 2 {
 			t.Fatalf("scrape %d saw %d series, want 2", i, n)
 		}
+	}
+}
+
+// N-1: an Unknown read carries no identity (a standby disk's JSON has no
+// serial, so Check labels it by device name). It must still find the disk it
+// belongs to: a standing failure neither re-pages nor is lost, and a recovery
+// that happened while unknown is announced when the disk next reads healthy.
+func TestSMARTTransitions_UnknownReadKeepsIdentityAndState(t *testing.T) {
+	failing := smart.Disk{Device: "/dev/sdc", ID: "serial:X", Status: smart.Failing}
+	asleep := smart.Disk{Device: "/dev/sdc", ID: "/dev/sdc", Status: smart.Unknown} // what Check yields for the standby fixture
+	ns, st := smartTransitions("h1", nil, []smart.Disk{failing})
+	if len(ns) != 1 {
+		t.Fatalf("first failing read = %+v", ns)
+	}
+	ns, st = smartTransitions("h1", st, []smart.Disk{asleep})
+	if len(ns) != 0 {
+		t.Fatalf("unknown read paged: %+v", ns)
+	}
+	ns, st = smartTransitions("h1", st, []smart.Disk{failing})
+	if len(ns) != 0 {
+		t.Errorf("standing failure re-paged after an unknown read: %+v", ns)
+	}
+	// Recovered while asleep: announced on the next healthy read.
+	_, st = smartTransitions("h1", st, []smart.Disk{asleep})
+	_, st = smartTransitions("h1", st, []smart.Disk{asleep}) // and across several unknown passes
+	ns, _ = smartTransitions("h1", st, []smart.Disk{{Device: "/dev/sdc", ID: "serial:X", Status: smart.OK}})
+	if len(ns) != 1 || ns[0].Kind != "disk.smart.recovered" {
+		t.Errorf("recovery after unknown reads = %+v", ns)
 	}
 }

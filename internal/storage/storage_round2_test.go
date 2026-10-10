@@ -271,20 +271,23 @@ func TestCephDriver_CreateDisk_WithSourceImage(t *testing.T) {
 }
 
 func TestCephDriver_CreateDisk_WithConfAndKeyring(t *testing.T) {
+	conf, keyring, _ := labCephFiles(t)
+	f := newFakeCeph()
 	d := &cephDriver{pool: "rbd", opts: map[string]string{
-		"conf":    "/etc/ceph/ceph.conf",
-		"keyring": "/etc/ceph/keyring",
-	}}
-	_, err := d.CreateDisk(context.Background(), DiskOptions{
+		"conf":    conf,
+		"keyring": keyring,
+	}, run: f.run}
+	path, err := d.CreateDisk(context.Background(), DiskOptions{
 		VMName:    "vm1",
 		DiskName:  "root",
 		SizeBytes: 5 * 1024 * 1024 * 1024,
 	})
-	if err == nil {
-		return
+	if err != nil {
+		t.Fatalf("CreateDisk: %v", err)
 	}
-	if !strings.Contains(err.Error(), "rbd create") {
-		t.Errorf("error should reference rbd create, got: %v", err)
+	// A keyring with no id is client.admin's, as for the rbd CLI.
+	if !strings.Contains(path, ":id=admin:keyring="+keyring) || f.called("create rbd/vm1-root") != 1 {
+		t.Errorf("path %q calls %v", path, f.calls)
 	}
 }
 

@@ -888,6 +888,134 @@ none older than 30 days; copy out a spec you still need.
   it is: the target judges what it would open, and refuses a pool ISO it
   cannot resolve there.
 
+## Ceph RBD pools
+
+A `ceph` pool puts VM disks in an RBD pool of an existing Ceph cluster (one
+litevirt deployed with `lv host ceph`, or any other). Every host that runs
+the pool's VMs authenticates with a **restricted client key** — never
+`client.admin`, and no admin keyring on any node.
+
+### Setting one up
+
+On the Ceph cluster, create the RBD pool and a client that can use only it:
+
+```bash
+ceph osd pool create lv
+rbd pool init lv
+ceph auth get-or-create client.litevirt mon 'profile rbd' osd 'profile rbd pool=lv' \
+    > ceph.client.litevirt.keyring
+```
+
+On every litevirt host, install the client tools and the qemu RBD driver
+(`ceph-common` and, on Debian/Ubuntu, `qemu-block-extra`), copy the cluster's
+`/etc/ceph/ceph.conf`, and install the keyring as
+`/etc/ceph/ceph.client.litevirt.keyring`, mode 0600, **at the same path on
+every host** (see "Live migration" below). Then create the pool on each host:
+
+```bash
+lv pool create ceph --driver ceph --source lv --host host-a \
+    --option id=litevirt \
+    --option conf=/etc/ceph/ceph.conf \
+    --option keyring=/etc/ceph/ceph.client.litevirt.keyring
+```
+
+`--option id=` is the client name without `client.`; a keyring with no id is
+`client.admin`'s, as for the `rbd` CLI. With an id and no `keyring` option,
+`/etc/ceph/ceph.client.<id>.keyring` is used when it exists. `--option
+mon_host=` lists the monitors explicitly; otherwise they are read from the
+conf's `mon_host` (cephadm's `[v2:…,v1:…]` form is understood, and the v1
+address is used). A conf other than `/etc/ceph/ceph.conf` must name
+`mon_host`, or a VM disk on the pool is refused: qemu reads only the default
+conf by itself. A conf or keyring path may not contain `:` or `\`.
+
+### How a VM disk authenticates
+
+qemu opens an RBD disk itself, and a libvirt domain cannot name a keyring
+file. So for each `(id, keyring)` a ceph pool on a host names, the daemon
+defines a **libvirt ceph secret** holding that client's key, read from the
+keyring:
+
+- The secret's UUID is derived from the client id and the keyring path
+  (UUIDv5), so every host with the keyring at the same path holds the same
+  secret. Its usage name is `litevirt/ceph/<uuid>`.
+- It is **ephemeral** (never written under `/etc/libvirt`) and **private**
+  (libvirt will not hand the value back). The key never appears in a log, an
+  event or an error.
+- It is defined when the pool is created, when the daemon starts, every 30
+  seconds after (a secret libvirtd lost on a restart is put back, and a value
+  is re-set when the keyring on disk changed), before every start of a VM with
+  a ceph disk, and on a live migration's target before the VM arrives.
+- It is removed once no ceph pool on the host and no disk recorded on the host
+  uses it — not while a disk still does, even after its pool was deleted.
+
+Each disk's domain definition is a network disk with the monitors as `<host>`
+elements and an `<auth username='litevirt'>` naming that secret:
+
+```xml
+<disk type='network' device='disk'>
+  <driver name='qemu' type='raw'/>
+  <source protocol='rbd' name='lv/web-1-root'>
+    <host name='10.78.0.22' port='6789'/>
+    <auth username='litevirt'>
+      <secret type='ceph' uuid='…'/>
+    </auth>
+  </source>
+  <target dev='vda' bus='virtio'/>
+</disk>
+```
+
+The disk's recorded path (`rbd:lv/web-1-root:id=litevirt:keyring=…:conf=…:mon_host=…`)
+carries what that element is built from. The monitors are the ones known when
+the disk was created; a cluster whose monitor addresses change needs its VMs'
+disks re-pointed (or a `mon_host` that still resolves).
+
+A pool with neither an id nor a keyring gives its disks no `<auth>`: qemu
+then uses Ceph's own defaults, which means `client.admin` and its keyring on
+every host. That is how such pools behaved before and is not recommended.
+
+### Disks
+
+- **Data disks** are `rbd create --image-feature layering` images of the
+  requested size, named `<vm>-<disk>`.
+- **Root disks from an image.** The image is fetched into the host's image
+  store by name, as for any pool (auto-pulled from a peer when missing), then
+  imported into the RBD pool **once per image content**: converted to raw,
+  `rbd import`ed as `lvimage+<image>+<sha256 prefix>`, given a protected
+  snapshot `@base`. Each VM's root disk is an `rbd clone` of that snapshot
+  (copy-on-write, as Proxmox does for templates on RBD), grown to the size
+  asked for (never shrunk). Concurrent imports of the same image on several
+  hosts are safe: each imports under a private name and only one rename wins.
+  A refreshed image has a new digest and becomes a new base; the old base
+  stays while clones of it exist.
+- **A failed create** removes every RBD image it created, whatever step failed.
+- **Clone** (`lv clone`) copies a ceph disk inside its pool with `rbd deep cp`
+  — nothing passes through the host, and a root disk's copy stays a clone of
+  the same base. The copy lands in the same pool, which the clone's project
+  must be allowed to use. `--mode linked` is refused for a VM with a ceph disk
+  (there is no file a qcow2 overlay could back on); auto mode copies.
+- **Delete** (`lv rm`) removes the VM's own images. It never removes an
+  imported base (`lvimage+…`), an image outside the pool, or one that has
+  snapshots (rbd refuses, so a clone made from one is never orphaned). An
+  image already gone is not an error.
+
+Unused bases are not removed automatically. To reclaim one, check that it has
+no clones and then remove it by hand:
+
+```bash
+rbd --id litevirt children lv/lvimage+cirros+0123456789abcdef@base   # must print nothing
+rbd --id litevirt snap unprotect lv/lvimage+cirros+0123456789abcdef@base
+rbd --id litevirt snap purge lv/lvimage+cirros+0123456789abcdef
+rbd --id litevirt rm lv/lvimage+cirros+0123456789abcdef
+```
+
+### Live migration
+
+A ceph disk is shared storage: a live migration moves only the guest's
+memory. The target needs a ceph pool of the **same name** whose keyring is at
+the **same path** as on the source, because the domain it receives names the
+secret by the UUID derived from that path. A target without it has no such
+secret, and the migration fails when the target's qemu opens the disk.
+
 ## Compose example
 
 ```yaml

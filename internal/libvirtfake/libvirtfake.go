@@ -88,6 +88,9 @@ type Fake struct {
 	// delivers to it. Guarded by f.mu.
 	eventCB libvirt.DomainEventCallback
 
+	// secrets models libvirt's secret store: UUID → ceph secret. Guarded by f.mu.
+	secrets map[string]fakeSecret
+
 	// Optional time source for events. Defaults to time.Now.
 	Now func() time.Time
 
@@ -220,6 +223,8 @@ type Fake struct {
 	FailMigrateToTarget func(name, dconnuri string) error
 	FailBlockPull       func(domain, disk string) error
 	FailPoolDestroy     func(name string) error
+	// FailDefineSecret, when set, makes DefineCephSecret fail for a UUID.
+	FailDefineSecret func(uuid string) error
 	// BlockJobStatusFn lets a scenario script block-job progress. Nil =
 	// "no job in progress" (Found=false), i.e. the pull is already done —
 	// the simplest happy path for the live-restore blockpull poll.
@@ -2052,4 +2057,79 @@ func (f *Fake) AbortedMigrations(name string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.abortedMigrations[name]
+}
+
+// fakeSecret is one ceph secret in the fake's store.
+type fakeSecret struct {
+	clientID string
+	value    []byte
+}
+
+// DefineCephSecret defines or redefines a ceph secret and sets its value. The
+// event recorded carries the client, never the value.
+func (f *Fake) DefineCephSecret(secretUUID, clientID string, value []byte) error {
+	if f.FailDefineSecret != nil {
+		if err := f.FailDefineSecret(secretUUID); err != nil {
+			return err
+		}
+	}
+	if len(value) == 0 {
+		return fmt.Errorf("ceph secret %s: empty value", secretUUID)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.secrets == nil {
+		f.secrets = map[string]fakeSecret{}
+	}
+	f.secrets[secretUUID] = fakeSecret{clientID: clientID, value: append([]byte(nil), value...)}
+	f.record("secret-define", secretUUID, "client="+clientID)
+	return nil
+}
+
+// HasSecret reports whether the secret is defined.
+func (f *Fake) HasSecret(secretUUID string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, ok := f.secrets[secretUUID]
+	return ok, nil
+}
+
+// ListCephSecrets returns every defined secret's UUID (the fake holds only
+// litevirt's).
+func (f *Fake) ListCephSecrets() ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, 0, len(f.secrets))
+	for u := range f.secrets {
+		out = append(out, u)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// UndefineSecret removes a secret; one not defined is not an error.
+func (f *Fake) UndefineSecret(secretUUID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.secrets[secretUUID]; ok {
+		delete(f.secrets, secretUUID)
+		f.record("secret-undefine", secretUUID, "")
+	}
+	return nil
+}
+
+// CephSecret returns a defined secret's client and value (test accessor).
+func (f *Fake) CephSecret(secretUUID string) (clientID string, value []byte, ok bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s, ok := f.secrets[secretUUID]
+	return s.clientID, append([]byte(nil), s.value...), ok
+}
+
+// DropSecrets forgets every secret, as a libvirtd restart does to ephemeral
+// ones.
+func (f *Fake) DropSecrets() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.secrets = nil
 }

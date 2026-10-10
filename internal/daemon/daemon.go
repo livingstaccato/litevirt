@@ -1051,6 +1051,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetHAHealthMetrics(metrics.NewHAHealthMetrics())
 	svc.SetDualRunMetrics(metrics.NewDualRunMetrics())
 	svc.SetStoragePoolsByName(d.storagePoolRefs())
+	// The ceph pools' libvirt secrets (ephemeral: gone after a libvirtd
+	// restart): defined now, then kept in line with the pools and keyrings.
+	svc.ReconcileCephSecrets(ctx)
+	go d.runCephSecretReconcile(ctx)
 	// Before this daemon serves: no cold-migration copy can be in flight yet.
 	svc.SweepColdMigrationScratch()
 	svc.SetReplicator(repl)
@@ -2154,6 +2158,28 @@ func (d *Daemon) refreshStoragePools(ctx context.Context) {
 		case <-ticker.C:
 			d.registerStoragePools(ctx)
 			d.refreshDBPoolCapacity(ctx)
+		}
+	}
+}
+
+// cephSecretReconcileInterval is how often the ceph pools' libvirt secrets are
+// checked: a libvirtd restart drops them (they are ephemeral), and a keyring
+// rotated on disk changes the value they must hold.
+const cephSecretReconcileInterval = 30 * time.Second
+
+// runCephSecretReconcile keeps the ceph pools' libvirt secrets defined and
+// current until ctx is cancelled (grpcapi.ReconcileCephSecrets).
+func (d *Daemon) runCephSecretReconcile(ctx context.Context) {
+	ticker := time.NewTicker(cephSecretReconcileInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if d.svc != nil {
+				d.svc.ReconcileCephSecrets(ctx)
+			}
 		}
 	}
 }

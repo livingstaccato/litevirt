@@ -227,3 +227,19 @@ func scanStoragePool(r Row) StoragePoolRecord {
 	}
 	return rec
 }
+
+// ListRBDDiskPathsForHost returns the paths of the live rbd ("rbd:…") VM disks
+// recorded on host — what decides which ceph secrets the host must keep.
+func ListRBDDiskPathsForHost(ctx context.Context, c *Client, host string) ([]string, error) {
+	rows, err := c.Query(ctx,
+		`SELECT path FROM vm_disks
+		 WHERE host_name = ? AND deleted_at IS NULL AND path LIKE 'rbd:%'`, host)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, r.String("path"))
+	}
+	return out, nil
+}

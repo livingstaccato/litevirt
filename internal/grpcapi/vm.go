@@ -33,6 +33,7 @@ import (
 	"github.com/litevirt/litevirt/internal/dns"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/hooks"
+	"github.com/litevirt/litevirt/internal/image"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/netbox"
 	"github.com/litevirt/litevirt/internal/network"
@@ -396,8 +397,22 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	var diskConfigs []lv.DiskConfig
 	var diskRecords []corrosion.DiskRecord
 	var createdDiskPaths []string
+	// A disk that is not a file (an rbd image) is removed by the driver that
+	// created it: os.Remove of "rbd:pool/image" removes nothing, which is how a
+	// failed create left its ceph images behind.
+	createdBy := map[string]storage.Driver{}
 	cleanupDisks := func() {
 		for _, p := range createdDiskPaths {
+			if drv := createdBy[p]; drv != nil {
+				// The request may be what failed (cancelled, timed out); the
+				// image this create made is removed regardless.
+				rmCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
+				if rmErr := drv.DeleteDisk(rmCtx, p); rmErr != nil {
+					slog.Warn("cleanup: failed to remove disk", "path", p, "error", rmErr)
+				}
+				cancel()
+				continue
+			}
 			if rmErr := os.Remove(p); rmErr != nil && !os.IsNotExist(rmErr) {
 				slog.Warn("cleanup: failed to remove disk", "path", p, "error", rmErr)
 			}
@@ -449,29 +464,52 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 
 		if d.Storage != "" {
 			// Use a named storage volume (nfs, ceph, iscsi, etc.).
+			// Every refusal from here on removes the disks earlier iterations
+			// created: a second disk on an unknown pool must not strand the first.
 			volCfg, volErr := s.resolveVolume(ctx, spec.StackName, d.Storage)
 			if volErr != nil {
+				cleanupDisks()
 				return nil, status.Errorf(codes.FailedPrecondition, "storage %q: %v", d.Storage, volErr)
 			}
 			drv, drvErr := storage.New(s.dataDir, volCfg)
 			if drvErr != nil {
+				cleanupDisks()
 				return nil, status.Errorf(codes.Internal, "storage driver %q: %v", d.Storage, drvErr)
 			}
 			if pErr := drv.Prepare(ctx); pErr != nil {
+				cleanupDisks()
 				return nil, status.Errorf(codes.Internal, "storage prepare %q: %v", d.Storage, pErr)
 			}
-			sourceImage := ""
+			// A ceph disk is opened by qemu through the pool's libvirt
+			// secret: without it the domain could not start, so it is
+			// defined before anything is allocated.
+			if _, sErr := s.ensureCephSecret(volCfg); sErr != nil {
+				cleanupDisks()
+				return nil, status.Errorf(codes.FailedPrecondition, "storage %q: %v", d.Storage, sErr)
+			}
+			sourceImage, sourceDigest := "", ""
 			if isRootDisk {
 				if sourceImage, err = s.poolRootDiskBacking(spec.Image, volCfg.Driver); err != nil {
+					cleanupDisks()
 					return nil, err
+				}
+				if sourceImage != "" && strings.EqualFold(volCfg.Driver, "ceph") {
+					// The base is named by the content's digest: the one the
+					// store recorded when it published the file, or the file's.
+					sourceDigest, _ = image.RecordedDigest(sourceImage)
 				}
 			}
 			diskPath, err = drv.CreateDisk(ctx, storage.DiskOptions{
-				VMName:      spec.Name,
-				DiskName:    d.Name,
-				SizeBytes:   parseDiskSizeBytes(d.Size),
-				SourceImage: sourceImage,
+				VMName:            spec.Name,
+				DiskName:          d.Name,
+				SizeBytes:         parseDiskSizeBytes(d.Size),
+				SourceImage:       sourceImage,
+				SourceImageName:   spec.Image,
+				SourceImageDigest: sourceDigest,
 			})
+			if err == nil && strings.HasPrefix(diskPath, "rbd:") {
+				createdBy[diskPath] = drv
+			}
 			storageType = volCfg.Driver
 			if storageType == "" {
 				storageType = "local"
@@ -505,7 +543,12 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		})
 
 		backingImage := ""
-		if isRootDisk {
+		if isRootDisk && !strings.HasPrefix(diskPath, "rbd:") {
+			// An rbd root disk is a clone of the image's base IN the pool and
+			// never needs the store's file again; recording the image would
+			// tell a peer that cannot find the disk as a file (an older build,
+			// on a failover) to "rebuild" it as a blank local overlay of the
+			// image. Without it, such a peer refuses the start instead.
 			backingImage = spec.Image
 		}
 		diskRecords = append(diskRecords, corrosion.DiskRecord{
@@ -1661,6 +1704,12 @@ func (s *Server) PrepareHardwareForStart(ctx context.Context, vm *corrosion.VMRe
 	// name no file outside the store.
 	if err := s.verifyImageBasesForStart(ctx, vm); err != nil {
 		return releasePreflight, err
+	}
+	// A ceph disk is opened through its pool's libvirt secret, which a
+	// libvirtd restart drops (it is ephemeral): put back before every start,
+	// on every start path, so none waits for the daemon's reconcile.
+	if err := s.ensureCephSecretsForVM(ctx, vm); err != nil {
+		return releasePreflight, status.Errorf(codes.FailedPrecondition, "start %q: %v", vm.Name, err)
 	}
 
 	// Adoption gate (fail-closed): a blocked VM must not (re)start under the active

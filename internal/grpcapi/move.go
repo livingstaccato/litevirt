@@ -557,6 +557,17 @@ func (s *Server) deleteDiskAtRecordedLocation(ctx context.Context, d *corrosion.
 	cfg := storage.Config{Driver: d.StorageType}
 	if pool, ok := s.lookupStoragePool(d.StorageVolume); ok {
 		cfg = storage.Config{Driver: pool.Driver, Source: pool.Source, Target: pool.Target, Options: pool.Options}
+	} else if strings.HasPrefix(d.Path, "rbd:") {
+		// A ceph disk whose pool is gone from this host (or not loaded yet)
+		// is removed as the identity its own locator names: with no --id and
+		// --keyring the rbd CLI would act as client.admin, which a node holding
+		// only a restricted key cannot.
+		spec, _, _ := strings.Cut(strings.TrimPrefix(d.Path, "rbd:"), ":")
+		pool := ""
+		if i := strings.LastIndexByte(spec, '/'); i > 0 {
+			pool = spec[:i] // pool[/namespace]
+		}
+		cfg = storage.Config{Driver: "ceph", Source: pool, Options: rbdPathOptions(d.Path)}
 	}
 	if cfg.Driver == "" {
 		cfg.Driver = "local"

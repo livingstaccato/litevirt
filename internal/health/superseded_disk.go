@@ -3,6 +3,7 @@ package health
 import (
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -97,3 +98,8 @@ func (r *Reconciler) setAsideSupersededDisk(vmName, proofID string, d corrosion.
 		"retention", "removed once past superseded_disk_retention_days; lv host superseded-disks lists it")
 	return aside, nil
 }
+
+// isNetworkDiskPath reports whether a disk path names a network disk (an rbd
+// image, "rbd:<pool>/<image>…") rather than a file or device on this host:
+// such a disk cannot be stat'ed, and is never missing from a host.
+func isNetworkDiskPath(p string) bool { return strings.HasPrefix(p, "rbd:") }

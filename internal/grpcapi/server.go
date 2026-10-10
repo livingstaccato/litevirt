@@ -610,6 +610,9 @@ type Server struct {
 	storagePoolsMu sync.RWMutex
 	storagePools   map[string]StoragePoolRef
 
+	// cephSecrets remembers the ceph secrets this daemon defined (ceph_secrets.go).
+	cephSecrets cephSecretMarks
+
 	// poolUploadsMu serializes the read-modify-write of <data_dir>/pool-uploads.json
 	// (storage_pool_confine.go).
 	poolUploadsMu sync.Mutex

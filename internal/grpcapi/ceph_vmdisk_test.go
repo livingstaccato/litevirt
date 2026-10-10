@@ -1,0 +1,416 @@
+package grpcapi
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/corrosion"
+	lv "github.com/litevirt/litevirt/internal/libvirt"
+	"github.com/litevirt/litevirt/internal/libvirtfake"
+	"github.com/litevirt/litevirt/internal/qcow2"
+	"github.com/litevirt/litevirt/internal/storage"
+)
+
+// cephWorld stands in for a ceph cluster behind the rbd CLI (and qemu-img's
+// convert to raw): which images exist, their protected snapshots, and every
+// command, as "<sub> <positional…>". Installed with storage.OverrideCephRunnerForTest.
+type cephWorld struct {
+	mu     sync.Mutex
+	images map[string]map[string]bool // ref → snapshot → protected
+	calls  []string
+}
+
+func installCephWorld(t *testing.T) *cephWorld {
+	t.Helper()
+	w := &cephWorld{images: map[string]map[string]bool{}}
+	t.Cleanup(storage.OverrideCephRunnerForTest(w.run))
+	return w
+}
+
+func (w *cephWorld) has(ref string) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	_, ok := w.images[ref]
+	return ok
+}
+
+func (w *cephWorld) count(prefix string) int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	n := 0
+	for _, c := range w.calls {
+		if strings.HasPrefix(c, prefix) {
+			n++
+		}
+	}
+	return n
+}
+
+func (w *cephWorld) run(_ context.Context, name string, args ...string) ([]byte, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if name == "qemu-img" {
+		w.calls = append(w.calls, "qemu-img convert")
+		return nil, os.WriteFile(args[len(args)-1], []byte("raw"), 0o600)
+	}
+	i := 0
+	for i < len(args) && strings.HasPrefix(args[i], "--") {
+		i += 2
+	}
+	var words, pos []string
+	for j := i; j < len(args); j++ {
+		if args[j] == "--" {
+			pos = args[j+1:]
+			break
+		}
+		words = append(words, args[j])
+	}
+	sub := words[0]
+	if sub == "snap" || sub == "deep" {
+		sub += " " + words[1]
+	}
+	w.calls = append(w.calls, strings.TrimSpace(sub+" "+strings.Join(pos, " ")))
+	missing := []byte("(2) No such file or directory")
+	switch sub {
+	case "create", "import", "clone", "deep cp":
+		dst := pos[len(pos)-1]
+		if _, ok := w.images[dst]; ok {
+			return []byte("(17) File exists"), errors.New("exit 17")
+		}
+		w.images[dst] = map[string]bool{}
+	case "info":
+		ref, snap, _ := strings.Cut(pos[0], "@")
+		s, ok := w.images[ref]
+		if !ok {
+			return missing, errors.New("exit 2")
+		}
+		if _, ok := s[snap]; snap != "" && !ok {
+			return missing, errors.New("exit 2")
+		}
+		return []byte(`{"size":1048576}`), nil
+	case "snap create", "snap protect":
+		ref, snap, _ := strings.Cut(pos[0], "@")
+		w.images[ref][snap] = sub == "snap protect"
+	case "rename":
+		w.images[pos[1]] = w.images[pos[0]]
+		delete(w.images, pos[0])
+	case "rm":
+		if _, ok := w.images[pos[0]]; !ok {
+			return missing, errors.New("exit 2")
+		}
+		delete(w.images, pos[0])
+	}
+	return nil, nil
+}
+
+// cephPoolFixture: a ceph pool "ceph" on test-host over rbd pool "lv", whose
+// nodes hold only a restricted client key (client.litevirt) — no admin key.
+type cephPoolFixture struct {
+	s       *Server
+	fake    *libvirtfake.Fake
+	world   *cephWorld
+	keyring string
+	key     []byte
+	secret  string
+}
+
+func writeKeyring(t *testing.T, path string, key []byte) {
+	t.Helper()
+	body := "[client.litevirt]\n\tkey = " + base64.StdEncoding.EncodeToString(key) + "\n\tcaps osd = \"profile rbd pool=lv\"\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func newCephPoolFixture(t *testing.T) *cephPoolFixture {
+	t.Helper()
+	s, fake := provableCreateServer(t)
+	f := &cephPoolFixture{s: s, fake: fake, world: installCephWorld(t)}
+	dir := t.TempDir()
+	conf := filepath.Join(dir, "ceph.conf")
+	if err := os.WriteFile(conf, []byte("[global]\nmon_host = [v2:10.78.0.22:3300/0,v1:10.78.0.22:6789/0]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.keyring = filepath.Join(dir, "ceph.client.litevirt.keyring")
+	f.key = []byte("restricted-client-key-bytes!")
+	writeKeyring(t, f.keyring, f.key)
+	f.secret = lv.CephSecretUUID("litevirt", f.keyring)
+	opts := map[string]string{"id": "litevirt", "conf": conf, "keyring": f.keyring}
+	if err := corrosion.UpsertStoragePool(context.Background(), s.db, corrosion.StoragePoolRecord{
+		HostName: "test-host", Name: "ceph", Driver: "ceph", Source: "lv", Options: opts, State: "active",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s.addStoragePoolRef("ceph", StoragePoolRef{Driver: "ceph", Source: "lv", Options: opts})
+	return f
+}
+
+func (f *cephPoolFixture) requireSecretValue(t *testing.T, want []byte) {
+	t.Helper()
+	client, val, ok := f.fake.CephSecret(f.secret)
+	if !ok {
+		t.Fatalf("ceph secret %s is not defined", f.secret)
+	}
+	if client != "litevirt" || !bytes.Equal(val, want) {
+		t.Fatalf("ceph secret holds client %q value %q, want client litevirt value %q", client, val, want)
+	}
+}
+
+// The secret's whole life on one host: defined from the pool's keyring,
+// put back after libvirtd drops it, re-set when the keyring is rotated, and
+// removed with the pool — unless a disk on this host still uses it.
+func TestCephSecret_Lifecycle(t *testing.T) {
+	f := newCephPoolFixture(t)
+	ctx := context.Background()
+
+	f.s.ReconcileCephSecrets(ctx)
+	f.requireSecretValue(t, f.key)
+
+	f.fake.DropSecrets() // a libvirtd restart: the secrets are ephemeral
+	f.s.ReconcileCephSecrets(ctx)
+	f.requireSecretValue(t, f.key)
+
+	rotated := []byte("a-rotated-client-key-value!!")
+	writeKeyring(t, f.keyring, rotated)
+	f.s.ReconcileCephSecrets(ctx)
+	f.requireSecretValue(t, rotated)
+
+	// A disk on this host uses it: deleting the pool keeps the secret.
+	if err := corrosion.InsertDisk(ctx, f.s.db, corrosion.DiskRecord{
+		VMName: "vm1", DiskName: "data", HostName: "test-host", StorageType: "ceph", StorageVolume: "ceph",
+		Path: "rbd:lv/vm1-data:id=litevirt:keyring=" + f.keyring,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.s.DeleteStoragePool(adminCtx(), &pb.DeleteStoragePoolRequest{Name: "ceph", Force: true}); err != nil {
+		t.Fatalf("DeleteStoragePool: %v", err)
+	}
+	if ok, _ := f.fake.HasSecret(f.secret); !ok {
+		t.Fatal("the secret of a disk still on this host was removed with its pool")
+	}
+	// Once nothing uses it, it goes.
+	if err := corrosion.SoftDeleteDisk(ctx, f.s.db, "vm1", "data"); err != nil {
+		t.Fatal(err)
+	}
+	f.s.ReconcileCephSecrets(ctx)
+	if ok, _ := f.fake.HasSecret(f.secret); ok {
+		t.Fatal("a secret no pool or disk uses was kept")
+	}
+}
+
+// A pool create defines its secret at once.
+func TestCephSecret_DefinedByPoolCreate(t *testing.T) {
+	f := newCephPoolFixture(t)
+	if _, err := f.s.ensureCephSecret(storage.Config{Driver: "ceph", Source: "lv", Options: map[string]string{"id": "litevirt", "keyring": f.keyring}}); err != nil {
+		t.Fatal(err)
+	}
+	f.requireSecretValue(t, f.key)
+	// The value is never in the fake's event log.
+	for _, e := range f.fake.EventLog() {
+		if strings.Contains(e.Note, string(f.key)) || strings.Contains(e.Note, base64.StdEncoding.EncodeToString(f.key)) {
+			t.Fatalf("event %+v carries the key", e)
+		}
+	}
+}
+
+func cephCreateRequest(name string, disks ...*pb.DiskSpec) *pb.CreateVMRequest {
+	req := disklessCreateRequest(name)
+	req.Spec.Disks = disks
+	return req
+}
+
+// Lab 2 B6 attempt 2: a data disk on a ceph pool with a restricted key. The
+// domain authenticates as client.litevirt through the pool's secret and finds
+// the monitors from the pool's ceph.conf.
+func TestCreateVM_CephDataDiskAuthenticatesWithTheRestrictedKey(t *testing.T) {
+	f := newCephPoolFixture(t)
+	if _, err := f.s.CreateVM(adminCtx(), cephCreateRequest("cephm", &pb.DiskSpec{Name: "data", Size: "1G", Storage: "ceph"})); err != nil {
+		t.Fatalf("CreateVM: %v", err)
+	}
+	if !f.world.has("lv/cephm-data") {
+		t.Fatalf("rbd image not created: %v", f.world.calls)
+	}
+	f.requireSecretValue(t, f.key)
+	x, _ := f.fake.DumpXML("cephm")
+	for _, want := range []string{
+		`<source protocol="rbd" name="lv/cephm-data">`,
+		`<host name="10.78.0.22" port="6789"></host>`,
+		`<auth username="litevirt">`,
+		`<secret type="ceph" uuid="` + f.secret + `"></secret>`,
+	} {
+		if !strings.Contains(x, want) {
+			t.Errorf("domain lacks %s:\n%s", want, x)
+		}
+	}
+}
+
+// Lab 2 B6 side effect: the failed create left lv/cephm-data behind. Every
+// rbd image a failed create made is removed.
+func TestCreateVM_FailedCreateRemovesItsCephImages(t *testing.T) {
+	f := newCephPoolFixture(t)
+	f.fake.FailDefineDomain = func(string) error { return errors.New("define fails") }
+	_, err := f.s.CreateVM(adminCtx(), cephCreateRequest("cephm",
+		&pb.DiskSpec{Name: "data", Size: "1G", Storage: "ceph"},
+		&pb.DiskSpec{Name: "logs", Size: "1G", Storage: "ceph"}))
+	if err == nil {
+		t.Fatal("CreateVM succeeded with a failing define")
+	}
+	for _, ref := range []string{"lv/cephm-data", "lv/cephm-logs"} {
+		if f.world.has(ref) {
+			t.Errorf("failed create left %s behind (calls %v)", ref, f.world.calls)
+		}
+	}
+}
+
+// A second disk on a pool that does not resolve fails the create after the
+// first disk exists: that one is removed too.
+func TestCreateVM_UnknownSecondPoolRemovesTheFirstCephImage(t *testing.T) {
+	f := newCephPoolFixture(t)
+	_, err := f.s.CreateVM(adminCtx(), cephCreateRequest("cephm",
+		&pb.DiskSpec{Name: "data", Size: "1G", Storage: "ceph"},
+		&pb.DiskSpec{Name: "more", Size: "1G", Storage: "no-such-pool"}))
+	if err == nil {
+		t.Fatal("CreateVM succeeded with an unknown pool")
+	}
+	if f.world.has("lv/cephm-data") {
+		t.Fatalf("the first disk's image was left behind: %v", f.world.calls)
+	}
+}
+
+// Lab 2 B6 attempt 1: a root disk on ceph from an image. The image (pulled
+// into the store by name, like any other) is imported into the pool once and
+// the root disk is a clone of its protected snapshot.
+func TestCreateVM_CephRootDiskFromImage(t *testing.T) {
+	f := newCephPoolFixture(t)
+	if err := qcow2.Create(f.s.images.ImagePath("cirros"), 1<<20, nil); err != nil {
+		t.Fatal(err)
+	}
+	req := cephCreateRequest("web", &pb.DiskSpec{Name: "root", Size: "1G", Storage: "ceph"})
+	req.Spec.Image = "cirros"
+	if _, err := f.s.CreateVM(adminCtx(), req); err != nil {
+		t.Fatalf("CreateVM: %v (calls %v)", err, f.world.calls)
+	}
+	if f.world.count("import") != 1 || f.world.count("clone lv/lvimage+cirros+") != 1 || !f.world.has("lv/web-root") {
+		t.Fatalf("root disk not cloned from an imported base: %v", f.world.calls)
+	}
+	disks, _ := corrosion.GetVMDisks(context.Background(), f.s.db, "web")
+	if len(disks) != 1 || !strings.HasPrefix(disks[0].Path, "rbd:lv/web-root:id=litevirt:") || disks[0].StorageType != "ceph" {
+		t.Fatalf("disk rows %+v", disks)
+	}
+	// No backing image is recorded: a peer that cannot see the rbd disk as a
+	// file (an older build, on a failover) must refuse, not rebuild it as a
+	// blank local overlay of the image.
+	if disks[0].BackingImage != "" {
+		t.Fatalf("an rbd root disk records backing image %q", disks[0].BackingImage)
+	}
+}
+
+// A VM clone on ceph copies inside the pool (rbd deep cp), and the clone's
+// disk is a ceph disk on the same pool, authenticating the same way.
+func TestCloneVM_CephDisksAreCopiedInThePool(t *testing.T) {
+	f := newCephPoolFixture(t)
+	ctx := adminCtx()
+	src := "rbd:lv/tpl-root:id=litevirt:keyring=" + f.keyring + `:mon_host=10.78.0.22\:6789`
+	f.world.images["lv/tpl-root"] = map[string]bool{}
+	spec, _ := json.Marshal(&pb.VMSpec{Name: "tpl", Cpu: 1, MemoryMib: 256})
+	if err := corrosion.InsertVM(ctx, f.s.db, corrosion.VMRecord{Name: "tpl", HostName: "test-host", State: "stopped", Spec: string(spec)},
+		nil, []corrosion.DiskRecord{{VMName: "tpl", DiskName: "root", HostName: "test-host", Path: src, SizeBytes: 1 << 30, StorageType: "ceph", StorageVolume: "ceph"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.s.CloneVM(ctx, &pb.CloneVMRequest{Source: "tpl", Target: "copy", Mode: "linked"}); err == nil {
+		t.Fatal("a linked clone of a ceph disk was accepted")
+	}
+	if _, err := f.s.CloneVM(ctx, &pb.CloneVMRequest{Source: "tpl", Target: "copy"}); err != nil {
+		t.Fatalf("CloneVM: %v (calls %v)", err, f.world.calls)
+	}
+	if f.world.count("deep cp lv/tpl-root lv/copy-root") != 1 {
+		t.Fatalf("not copied in the pool: %v", f.world.calls)
+	}
+	disks, _ := corrosion.GetVMDisks(context.Background(), f.s.db, "copy")
+	if len(disks) != 1 || disks[0].StorageType != "ceph" || disks[0].StorageVolume != "ceph" || !strings.HasPrefix(disks[0].Path, "rbd:lv/copy-root:") {
+		t.Fatalf("clone disk rows %+v", disks)
+	}
+	x, _ := f.fake.DumpXML("copy")
+	if !strings.Contains(x, fmt.Sprintf(`<secret type="ceph" uuid="%s">`, f.secret)) {
+		t.Fatalf("clone domain does not authenticate through the pool's secret:\n%s", x)
+	}
+}
+
+// A clone whose define fails removes the rbd copy it made.
+func TestCloneVM_FailedCephCloneRemovesTheCopy(t *testing.T) {
+	f := newCephPoolFixture(t)
+	ctx := adminCtx()
+	f.world.images["lv/tpl-root"] = map[string]bool{}
+	spec, _ := json.Marshal(&pb.VMSpec{Name: "tpl", Cpu: 1, MemoryMib: 256})
+	if err := corrosion.InsertVM(ctx, f.s.db, corrosion.VMRecord{Name: "tpl", HostName: "test-host", State: "stopped", Spec: string(spec)},
+		nil, []corrosion.DiskRecord{{VMName: "tpl", DiskName: "root", HostName: "test-host", Path: "rbd:lv/tpl-root", SizeBytes: 1 << 30, StorageType: "ceph", StorageVolume: "ceph"}}); err != nil {
+		t.Fatal(err)
+	}
+	f.fake.FailDefineDomain = func(string) error { return errors.New("define fails") }
+	if _, err := f.s.CloneVM(ctx, &pb.CloneVMRequest{Source: "tpl", Target: "copy"}); err == nil {
+		t.Fatal("clone succeeded with a failing define")
+	}
+	if f.world.has("lv/copy-root") {
+		t.Fatalf("failed clone left lv/copy-root behind: %v", f.world.calls)
+	}
+	if !f.world.has("lv/tpl-root") {
+		t.Fatal("the source's image was removed")
+	}
+}
+
+// Every start path puts the secret back first (PrepareHardwareForStart).
+func TestPrepareHardwareForStart_DefinesTheCephSecret(t *testing.T) {
+	f := newCephPoolFixture(t)
+	ctx := context.Background()
+	vm := corrosion.VMRecord{Name: "vm1", HostName: "test-host", State: "stopped"}
+	if err := corrosion.InsertVM(ctx, f.s.db, vm, nil, []corrosion.DiskRecord{{
+		VMName: "vm1", DiskName: "data", HostName: "test-host", StorageType: "ceph", StorageVolume: "ceph",
+		Path: "rbd:lv/vm1-data:id=litevirt:keyring=" + f.keyring,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	f.fake.DropSecrets()
+	if _, err := f.s.PrepareHardwareForStart(ctx, &vm); err != nil {
+		t.Fatalf("PrepareHardwareForStart: %v", err)
+	}
+	f.requireSecretValue(t, f.key)
+}
+
+// A ceph disk deleted after its pool left this host's pool list is removed as
+// the identity its locator names — never as client.admin, which a node with
+// only the restricted key cannot be.
+func TestDeleteRecordedVMDiskVolumes_CephDiskWithoutItsPool(t *testing.T) {
+	s := testServerWithLocks(t)
+	ctx := context.Background()
+	var rmArgs []string
+	t.Cleanup(storage.OverrideCephRunnerForTest(func(_ context.Context, name string, args ...string) ([]byte, error) {
+		for _, a := range args {
+			if a == "rm" {
+				rmArgs = args
+			}
+		}
+		return nil, nil
+	}))
+	insertTestVM(t, ctx, s.db, "vm1", "test-host", "stopped")
+	if err := corrosion.InsertDisk(ctx, s.db, corrosion.DiskRecord{
+		VMName: "vm1", DiskName: "data", HostName: "test-host", StorageType: "ceph", StorageVolume: "gone",
+		Path: "rbd:lv/vm1-data:id=litevirt:keyring=/etc/ceph/ceph.client.litevirt.keyring", DeleteWithVM: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s.deleteRecordedVMDiskVolumes(ctx, "vm1")
+	got := strings.Join(rmArgs, " ")
+	if !strings.Contains(got, "--id litevirt") || !strings.Contains(got, "--keyring /etc/ceph/ceph.client.litevirt.keyring") || !strings.HasSuffix(got, "rm -- lv/vm1-data") {
+		t.Fatalf("rbd rm args = %q, want the locator's identity and lv/vm1-data", got)
+	}
+}

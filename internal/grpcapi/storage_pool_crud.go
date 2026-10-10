@@ -17,6 +17,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/safename"
 	"github.com/litevirt/litevirt/internal/storage"
 )
@@ -240,6 +241,14 @@ func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoo
 		Target:  req.Target,
 		Options: req.Options,
 	})
+	// A ceph pool's VM disks authenticate through a libvirt secret defined
+	// from its keyring: defined now, so the first VM create does not wait for
+	// the daemon's reconcile. A failure is not the pool's (the rbd CLI just
+	// read the same keyring) and does not undo it; the reconcile retries, and
+	// a VM create on the pool refuses with the reason.
+	if _, err := s.ensureCephSecret(storage.Config{Driver: req.Driver, Source: req.Source, Target: req.Target, Options: req.Options}); err != nil {
+		slog.Warn("ceph pool created, but its libvirt secret is not defined yet", "pool", req.Name, "error", err)
+	}
 	slog.Info("storage pool created", "host", host, "name", req.Name, "driver", req.Driver)
 	return &pb.CreateStoragePoolResponse{Pool: storagePoolRecordToPB(rec)}, nil
 }
@@ -350,6 +359,14 @@ func (s *Server) DeleteStoragePool(ctx context.Context, req *pb.DeleteStoragePoo
 		return nil, status.Errorf(codes.Internal, "delete: %v", err)
 	}
 	s.removeStoragePoolRef(req.Name)
+	// The pool's ceph secret goes with it unless another pool, or a disk on
+	// this host, still uses it.
+	if strings.EqualFold(rec.Driver, "ceph") {
+		if auth, ok := storage.CephAuthOf(rec.Options); ok {
+			s.cephSecrets.forget(lv.CephSecretUUID(auth.ID, auth.Keyring))
+		}
+		s.ReconcileCephSecrets(ctx)
+	}
 	if ownDir != "" {
 		if err := os.Remove(ownDir); err != nil && !os.IsNotExist(err) {
 			slog.Warn("storage pool directory not removed", "pool", req.Name, "dir", ownDir, "error", err)

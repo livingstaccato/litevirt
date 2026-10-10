@@ -1124,8 +1124,19 @@ func (s *Server) sendReattachVFs(ctx context.Context, client pb.LiteVirtClient, 
 // EnsureCloudInit generates a cloud-init ISO on this host if it doesn't already exist.
 // Called by the source host before migration so the target has the ISO ready.
 func (s *Server) EnsureCloudInit(ctx context.Context, req *pb.EnsureCloudInitRequest) (*emptypb.Empty, error) {
-	if _, err := s.authorizeMigrationHelper(ctx, req.VmName); err != nil {
+	vm, err := s.authorizeMigrationHelper(ctx, req.VmName)
+	if err != nil {
 		return nil, err
+	}
+	// The domain a live migration hands this host names its ceph disks'
+	// secrets (the same UUIDs here as on the source: libvirt.CephSecretUUID).
+	// Put them back now in case libvirtd lost them, rather than let the
+	// incoming qemu fail to open its disks. Best effort: the reconcile
+	// defines them too, and the migration reports a failure itself.
+	if vm != nil {
+		if serr := s.ensureCephSecretsForVM(ctx, vm); serr != nil {
+			slog.Warn("migration target: ceph secret not defined", "vm", req.VmName, "error", serr)
+		}
 	}
 	isoPath, err := lv.SafeCloudInitISOPath(s.dataDir, req.VmName)
 	if err != nil {

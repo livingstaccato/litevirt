@@ -27,28 +27,23 @@ import (
 func diskBacking(path string) (diskType string, src diskSource, driverType string, err error) {
 	switch {
 	case strings.HasPrefix(path, "rbd:"):
-		name, hosts, unsupported := parseRBDLocator(strings.TrimPrefix(path, "rbd:"))
+		name, hosts, auth, unsupported := parseRBDLocator(strings.TrimPrefix(path, "rbd:"))
 		if len(unsupported) > 0 {
-			// Refuse rather than quietly emit a domain that ignores them. The
-			// ceph driver appends the pool's configured conf and keyring to the
-			// identifier it returns (internal/storage/ceph.go), and libvirt's
-			// <source protocol='rbd'> has nowhere to carry either: monitors are
-			// <host> children, and authentication is a sibling <auth> element
-			// naming a secret in libvirt's OWN store, not a path on disk.
-			//
-			// Dropping them produced a domain pointing at the right image with
-			// the DEFAULT credentials and configuration. That fails at start
-			// time, after the image has already been allocated, and nothing in
-			// between reports that the settings were discarded — the operator
-			// sees a pool that provisions fine and VMs that will not boot.
+			// Refuse rather than quietly emit a domain that ignores them.
+			// libvirt's <source protocol='rbd'> carries monitors as <host>
+			// children and an identity as <auth> naming a secret in libvirt's
+			// OWN store; a setting with neither form would be dropped, and the
+			// domain would point at the right image with the DEFAULT
+			// credentials and configuration — a failure at start time, after
+			// the image was allocated, with nothing reporting why.
 			return "", diskSource{}, "", fmt.Errorf(
 				"ceph disk %q carries connection option(s) %s that libvirt cannot express in a "+
-					"<disk type=\"network\"> source; libvirt authenticates RBD through a defined "+
-					"secret and reads monitors from <host> elements, so configure the pool with "+
-					"mon_host (and a libvirt ceph secret) instead of conf/keyring",
+					"<disk type=\"network\"> source; libvirt authenticates RBD through a ceph "+
+					"secret (the pool's id and keyring) and reads monitors from <host> elements "+
+					"(the pool's mon_host, or its conf's)",
 				name, strings.Join(unsupported, ", "))
 		}
-		return "network", diskSource{Protocol: "rbd", Name: name, Hosts: hosts}, "raw", nil
+		return "network", diskSource{Protocol: "rbd", Name: name, Hosts: hosts, Auth: auth}, "raw", nil
 	case strings.HasPrefix(path, "/dev/"):
 		return "block", diskSource{Dev: path}, "raw", nil
 	default:
@@ -56,46 +51,111 @@ func diskBacking(path string) (diskType string, src diskSource, driverType strin
 	}
 }
 
-// parseRBDLocator splits qemu's rbd URI body — "pool/image[:opt=val[:opt=val]]"
-// — into the image name libvirt wants in <source name=…> and any monitor
-// addresses carried in a mon_host option.
+// defaultCephConf is the ceph.conf qemu reads when a disk names none.
+const defaultCephConf = "/etc/ceph/ceph.conf"
+
+// parseRBDLocator splits qemu's rbd URI body —
+// "pool/image[:opt=val[:opt=val]]", with ':' and ';' inside a value escaped
+// as "\:" and "\;" — into the image name libvirt wants in <source name=…>,
+// the monitors (mon_host), and the identity (id, keyring) the disk
+// authenticates as.
 //
-// Monitors are optional: with none, qemu resolves them from the host's
-// ceph.conf, which is how the driver is configured today (it passes --conf/--id
-// to the rbd CLI and keeps no monitor list of its own). Parsing them anyway
-// means a pool that does carry them is not silently dropped.
-func parseRBDLocator(body string) (name string, hosts []diskSourceHost, unsupported []string) {
-	parts := strings.Split(body, ":")
+// The ceph driver writes the pool's id, keyring, conf and monitors into every
+// disk's locator (internal/storage/ceph.go diskLocator):
+//
+//   - id + keyring become <auth username=id> naming the ceph secret
+//     CephSecretUUID(id, keyring), which the daemon defines on every host from
+//     that keyring. A keyring with no id is client.admin's, as for the rbd CLI.
+//   - mon_host becomes <host> elements.
+//   - conf has no domain form. It is accepted when its monitors are in the
+//     locator (mon_host), or when it is the default ceph.conf, which qemu
+//     reads by itself; any other conf is refused.
+//
+// With none of them the domain carries no <auth> and no <host>, and qemu uses
+// ceph's defaults, as before.
+func parseRBDLocator(body string) (name string, hosts []diskSourceHost, auth *diskAuth, unsupported []string) {
+	parts := splitUnescaped(body, ':')
 	name = parts[0]
+	opts := map[string]string{}
+	var order []string
 	for _, opt := range parts[1:] {
 		key, value, ok := strings.Cut(opt, "=")
 		if !ok {
 			continue
 		}
-		if key != "mon_host" {
-			// Every other option is reported, not skipped. mon_host is the only
-			// one with a libvirt equivalent, so anything else here is a setting
-			// the caller asked for that the generated domain would not carry.
-			unsupported = append(unsupported, key)
-			continue
-		}
-		// A qemu rbd URI escapes the separators inside an option value, and
-		// ceph itself accepts both "," and ";" between monitors.
 		value = strings.ReplaceAll(value, `\;`, ";")
 		value = strings.ReplaceAll(value, `\:`, ":")
-		for _, mon := range strings.FieldsFunc(value, func(r rune) bool { return r == ',' || r == ';' }) {
+		if _, dup := opts[key]; !dup {
+			order = append(order, key)
+		}
+		opts[key] = value
+	}
+	for _, key := range order {
+		switch key {
+		case "mon_host", "id", "keyring", "conf":
+		default:
+			// Every other option is reported, not skipped: a setting the
+			// caller asked for that the generated domain would not carry.
+			unsupported = append(unsupported, key)
+		}
+	}
+	if v, ok := opts["mon_host"]; ok {
+		// ceph accepts both "," and ";" between monitors.
+		for _, mon := range strings.FieldsFunc(v, func(r rune) bool { return r == ',' || r == ';' }) {
 			mon = strings.TrimSpace(mon)
 			if mon == "" {
 				continue
 			}
-			host, port := mon, ""
-			// Only a host:port pair splits; a bare IPv6 literal has colons of
-			// its own and is left whole.
-			if h, p, found := strings.Cut(mon, ":"); found && !strings.Contains(h, ":") {
-				host, port = h, p
-			}
-			hosts = append(hosts, diskSourceHost{Name: host, Port: port})
+			hosts = append(hosts, splitMonHost(mon))
 		}
 	}
-	return name, hosts, unsupported
+	if conf, ok := opts["conf"]; ok && len(hosts) == 0 && conf != defaultCephConf {
+		unsupported = append(unsupported, "conf")
+	}
+	if keyring := opts["keyring"]; keyring != "" {
+		id := opts["id"]
+		if id == "" {
+			id = "admin"
+		}
+		auth = &diskAuth{Username: id, Secret: diskAuthSecret{Type: "ceph", UUID: CephSecretUUID(id, keyring)}}
+	} else if opts["id"] != "" {
+		// An identity with no key to authenticate it: libvirt can only name a
+		// secret, and there is no keyring to define one from.
+		unsupported = append(unsupported, "id")
+	}
+	return name, hosts, auth, unsupported
+}
+
+// splitMonHost splits one monitor address into host and port: "h:p",
+// "[v6]:p", or a bare host or IPv6 literal (no port).
+func splitMonHost(mon string) diskSourceHost {
+	if strings.HasPrefix(mon, "[") {
+		if end := strings.IndexByte(mon, ']'); end > 0 {
+			host, rest := mon[1:end], mon[end+1:]
+			return diskSourceHost{Name: host, Port: strings.TrimPrefix(rest, ":")}
+		}
+	}
+	// Only a host:port pair splits; a bare IPv6 literal has colons of its own
+	// and is left whole.
+	if h, p, found := strings.Cut(mon, ":"); found && !strings.Contains(p, ":") {
+		return diskSourceHost{Name: h, Port: p}
+	}
+	return diskSourceHost{Name: mon}
+}
+
+// splitUnescaped splits s at every sep not preceded by a backslash.
+func splitUnescaped(s string, sep byte) []string {
+	var out []string
+	start := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' {
+			i++
+			continue
+		}
+		if s[i] == sep {
+			out = append(out, s[start:i])
+			start = i + 1
+		}
+	}
+	return append(out, s[start:])
 }

@@ -52,7 +52,10 @@ func (s *Server) ResetAdminPassword(ctx context.Context, req *pb.ResetAdminPassw
 
 	actor := "root@" + s.hostName
 	detail := corrosion.ResetAdminAuditDetail("local-root", req.OsUser)
-	if err := corrosion.ResetAdminPassword(ctx, s.db, req.PasswordHash); err != nil {
+	if req.GetClearTwoFactor() {
+		detail += " clear_2fa=true"
+	}
+	if err := corrosion.ResetAdminPassword(ctx, s.db, req.PasswordHash, req.GetClearTwoFactor()); err != nil {
 		if errors.Is(err, corrosion.ErrNoLiveAdmin) {
 			s.auditAs(ctx, actor, "user.reset-admin", "admin", detail, "denied: no live admin account")
 			return nil, status.Error(codes.FailedPrecondition, err.Error())
@@ -61,5 +64,6 @@ func (s *Server) ResetAdminPassword(ctx context.Context, req *pb.ResetAdminPassw
 		return nil, status.Errorf(codes.Internal, "reset admin password: %v", err)
 	}
 	s.auditAs(ctx, actor, "user.reset-admin", "admin", detail, "ok")
+	s.kickStreams()
 	return &emptypb.Empty{}, nil
 }

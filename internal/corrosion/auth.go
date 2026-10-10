@@ -130,18 +130,41 @@ func InsertRoleBinding(ctx context.Context, c *Client, b RoleBindingRecord) erro
 	if !b.Propagate {
 		prop = 0
 	}
-	return c.Execute(ctx,
-		`INSERT INTO role_bindings (id, path, role, principal, propagate, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
-		b.ID, b.Path, b.Role, b.Principal, prop, now)
+	return c.Execute(ctx, roleBindingInsertSQL, b.ID, b.Path, b.Role, b.Principal, prop, now)
+}
+
+const roleBindingInsertSQL = `INSERT INTO role_bindings (id, path, role, principal, propagate, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?)`
+
+const roleBindingDeleteSQL = `UPDATE role_bindings SET deleted_at = ?, updated_at = ? WHERE id = ?`
+
+// SentinelRole is the role a delegated revoke leaves behind (NoAccess: no
+// verbs). See RevokeRoleBindingLeavingSentinel.
+const SentinelRole = "NoAccess"
+
+// RevokeRoleBindingLeavingSentinel tombstones binding id and, in the same
+// batch, binds sentinel — a NoAccess binding of the same principal at the same
+// path. A delegated revoke uses it so that no sequence of delegated revokes,
+// on any nodes, in any order, takes a principal to zero bindings: each leaves
+// its own sentinel, and a principal with zero bindings falls back to its
+// legacy role cluster-wide (t1-auth-review I3). Both statements are the
+// existing role_bindings shapes.
+func RevokeRoleBindingLeavingSentinel(ctx context.Context, c *Client, id string, sentinel RoleBindingRecord) error {
+	now := c.NowTS()
+	prop := 0
+	if sentinel.Propagate {
+		prop = 1
+	}
+	return c.ExecuteBatch(ctx, []Statement{
+		{SQL: roleBindingDeleteSQL, Params: []interface{}{nowRFC3339(), now, id}},
+		{SQL: roleBindingInsertSQL, Params: []interface{}{sentinel.ID, sentinel.Path, SentinelRole, sentinel.Principal, prop, now}},
+	})
 }
 
 // DeleteRoleBinding soft-deletes a binding by id.
 func DeleteRoleBinding(ctx context.Context, c *Client, id string) error {
 	now := c.NowTS()
-	return c.Execute(ctx,
-		`UPDATE role_bindings SET deleted_at = ?, updated_at = ? WHERE id = ?`,
-		nowRFC3339(), now, id)
+	return c.Execute(ctx, roleBindingDeleteSQL, nowRFC3339(), now, id)
 }
 
 // ListRoleBindings returns all active bindings. Used by the permission
@@ -231,12 +254,17 @@ type SessionRecord struct {
 
 // InsertSession creates a session row.
 func InsertSession(ctx context.Context, c *Client, s SessionRecord) error {
-	return c.Execute(ctx,
-		`INSERT INTO sessions
-		 (id, username, realm, ip, user_agent, created_at, last_used_at, expires_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		s.ID, s.Username, s.Realm, s.IP, s.UserAgent,
+	return c.Execute(ctx, sessionsInsertSQL, s.ID, s.Username, s.Realm, s.IP, s.UserAgent,
 		s.CreatedAt, s.LastUsedAt, s.ExpiresAt)
+}
+
+const sessionsInsertSQL = `INSERT INTO sessions
+		 (id, username, realm, ip, user_agent, created_at, last_used_at, expires_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+
+func sessionInsertStatement(s SessionRecord) Statement {
+	return Statement{SQL: sessionsInsertSQL, Params: []interface{}{s.ID, s.Username, s.Realm, s.IP, s.UserAgent,
+		s.CreatedAt, s.LastUsedAt, s.ExpiresAt}}
 }
 
 // GetSession returns a session by id, including revoked rows so the auth

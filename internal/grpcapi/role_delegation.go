@@ -42,6 +42,19 @@ package grpcapi
 //     creates it. A delegated grant names an existing user with its realm, or
 //     a group.
 //
+// Two more rules, from the fix round:
+//
+//  6. Delegation is explicit (t1-auth-review I7). Only a grant that NAMES
+//     perm.modify — perm.modify itself or perm.* — delegates. An existing "*"
+//     binding (Admin on a project) meant "full control of these resources"
+//     before delegation existed and does not silently become "may hand out
+//     roles here" on upgrade.
+//  7. Every delegated decision reads the bindings from this node's database
+//     at that moment, not from the engine snapshot, which a peer's change
+//     reaches only at the next ~30 s reload: a delegate whose PermissionAdmin
+//     was just revoked elsewhere cannot keep granting for the length of a
+//     reload interval once the revoke has replicated here.
+//
 // What it does not stop: a cluster admin who later widens a custom role's
 // verbs widens every binding of it, delegated ones included. Roles are
 // cluster-admin territory (built-ins cannot be changed).
@@ -89,17 +102,26 @@ func callerPrincipals(ctx context.Context) []string {
 	return principalsForCaller(callerUsername(ctx), callerRole(ctx), callerRealm(ctx))
 }
 
-// callerMayDelegate reports whether the caller holds perm.modify anywhere,
-// so a caller who could never be authorized by delegation keeps getting the
-// plain admin-required refusal it always got.
+// callerMayDelegate reports whether the caller holds perm.modify, by name,
+// anywhere (the live snapshot: a cheap precheck), so a caller who could never
+// be authorized by delegation keeps getting the plain admin-required refusal.
 func (s *Server) callerMayDelegate(ctx context.Context) bool {
 	return s != nil && s.authEngine != nil && callerUsername(ctx) != "" &&
-		s.authEngine.HoldsVerbAnywhere(callerPrincipals(ctx), auth.VerbPermModify)
+		s.authEngine.HoldsVerbExplicitlyAnywhere(callerPrincipals(ctx), auth.VerbPermModify)
+}
+
+// delegationEngine is a fresh engine over this node's database (rule 7).
+func (s *Server) delegationEngine(ctx context.Context) (*auth.Engine, error) {
+	e := auth.NewEngine(s.db)
+	if err := e.Reload(ctx); err != nil {
+		return nil, status.Errorf(codes.Unavailable, "read role bindings: %v", err)
+	}
+	return e, nil
 }
 
 // authorizeDelegatedPath checks rule 3 and that the caller holds perm.modify
-// at path, and returns the canonical path.
-func (s *Server) authorizeDelegatedPath(ctx context.Context, path string) (string, error) {
+// at path by name (rule 6), and returns the canonical path.
+func (s *Server) authorizeDelegatedPath(ctx context.Context, e *auth.Engine, path string) (string, error) {
 	cpath, err := delegablePath(path)
 	if err != nil {
 		return "", status.Errorf(codes.InvalidArgument, "delegated grant path %q: %v", path, err)
@@ -107,9 +129,9 @@ func (s *Server) authorizeDelegatedPath(ctx context.Context, path string) (strin
 	if scopes := callerScopePaths(ctx); len(scopes) > 0 && !pathAllowedByScopes(cpath, scopes) {
 		return "", status.Errorf(codes.PermissionDenied, "token scope does not cover %q", cpath)
 	}
-	if !s.authEngine.Allowed(callerPrincipals(ctx), auth.VerbPermModify, cpath) {
+	if !e.AllowedExplicit(callerPrincipals(ctx), auth.VerbPermModify, cpath) {
 		return "", status.Errorf(codes.PermissionDenied,
-			"caller %q lacks %s on %q: role grants there need a cluster admin or %s on that path",
+			"caller %q lacks %s on %q: role grants there need a cluster admin or an explicit %s grant on that path",
 			callerUsername(ctx), auth.VerbPermModify, cpath, auth.VerbPermModify)
 	}
 	return cpath, nil
@@ -117,13 +139,13 @@ func (s *Server) authorizeDelegatedPath(ctx context.Context, path string) (strin
 
 // refuseEscalation checks rules 1 and 2: role's grants are all held by the
 // caller at path (propagating grants only when the binding propagates).
-func (s *Server) refuseEscalation(ctx context.Context, path, role string, propagate bool) error {
-	verbs, ok := s.authEngine.RoleVerbs(role)
+func (s *Server) refuseEscalation(ctx context.Context, e *auth.Engine, path, role string, propagate bool) error {
+	verbs, ok := e.RoleVerbs(role)
 	if !ok {
 		return status.Errorf(codes.PermissionDenied,
 			"role %q is not defined; a delegated grant may only name an existing role", role)
 	}
-	held := s.authEngine.GrantsAt(callerPrincipals(ctx), path, propagate)
+	held := e.GrantsAt(callerPrincipals(ctx), path, propagate)
 	if missing := auth.UncoveredGrants(held, verbs); len(missing) > 0 {
 		where := "at " + path
 		if propagate {
@@ -136,87 +158,81 @@ func (s *Server) refuseEscalation(ctx context.Context, path, role string, propag
 	return nil
 }
 
-// principalSet resolves a binding principal to the principal set of every
-// caller it applies to that could change engine status with it (rule 4/5):
-// for a realm-qualified user, that user's full set; for a group, the group
-// alone. ok=false is a principal a delegated grant may not name.
-func (s *Server) principalSet(ctx context.Context, principal string) (set []string, ok bool, err error) {
+// principalSet resolves a binding principal to the canonical principal (a
+// user principal names the account as stored: user:Bob@local is the account
+// bob) and the principal set of every caller it applies to that could change
+// engine status with it (rules 4, 5). ok=false is a principal a delegated
+// grant may not name.
+func (s *Server) principalSet(ctx context.Context, principal string) (canonical string, set []string, ok bool, err error) {
 	if body, isUser := strings.CutPrefix(principal, "user:"); isUser {
 		name, realm, qualified := classifyUserPrincipal(body)
 		if !qualified {
-			return nil, false, nil
+			return "", nil, false, nil
 		}
 		u, err := corrosion.GetUser(ctx, s.db, name)
 		if err != nil {
-			return nil, false, err
+			return "", nil, false, err
 		}
 		if u == nil {
-			return nil, false, nil
+			return "", nil, false, nil
 		}
-		return principalsForCaller(name, u.Role, realm), true, nil
+		return "user:" + u.Username + "@" + realm, principalsForCaller(u.Username, u.Role, realm), true, nil
 	}
-	return []string{principal}, true, nil
+	return principal, []string{principal}, true, nil
 }
 
 // authorizeDelegatedGrant applies every rule to a grant from a caller who is
-// not a cluster admin, and returns the canonical path to store.
-func (s *Server) authorizeDelegatedGrant(ctx context.Context, path, role, principal string, propagate bool) (string, error) {
+// not a cluster admin, and returns the canonical path and principal to store.
+func (s *Server) authorizeDelegatedGrant(ctx context.Context, path, role, principal string, propagate bool) (string, string, error) {
 	if s.authEngine == nil {
-		return "", status.Error(codes.PermissionDenied, "role grants require admin (no RBAC engine on this node)")
+		return "", "", status.Error(codes.PermissionDenied, "role grants require admin (no RBAC engine on this node)")
 	}
-	cpath, err := s.authorizeDelegatedPath(ctx, path)
+	e, err := s.delegationEngine(ctx)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	if err := s.refuseEscalation(ctx, cpath, role, propagate); err != nil {
-		return "", err
-	}
-	set, ok, err := s.principalSet(ctx, principal)
+	cpath, err := s.authorizeDelegatedPath(ctx, e, path)
 	if err != nil {
-		return "", status.Errorf(codes.Internal, "resolve principal %q: %v", principal, err)
+		return "", "", err
+	}
+	if err := s.refuseEscalation(ctx, e, cpath, role, propagate); err != nil {
+		return "", "", err
+	}
+	canonical, set, ok, err := s.principalSet(ctx, principal)
+	if err != nil {
+		return "", "", status.Errorf(codes.Internal, "resolve principal %q: %v", principal, err)
 	}
 	if !ok {
-		return "", status.Errorf(codes.PermissionDenied,
+		return "", "", status.Errorf(codes.PermissionDenied,
 			"a delegated grant must name an existing user with its realm (user:<name>@<realm>) or a "+
 				"group (group:<group>@<realm>); %q is neither", principal)
 	}
-	if !s.authEngine.HasAnyBinding(set) {
-		return "", status.Errorf(codes.PermissionDenied,
+	if !e.HasAnyBinding(set) {
+		return "", "", status.Errorf(codes.PermissionDenied,
 			"%s has no role binding yet, so it is authorized by its legacy role cluster-wide; its first "+
 				"binding changes its access outside %s, and only a cluster admin may make it", principal, cpath)
 	}
-	return cpath, nil
+	return cpath, canonical, nil
 }
 
 // authorizeDelegatedRevoke applies the rules to a revoke from a caller who is
 // not a cluster admin. A binding to an undefined role grants nothing, so
-// revoking it cannot exceed the caller; the last-binding rule still applies.
-func (s *Server) authorizeDelegatedRevoke(ctx context.Context, b *corrosion.RoleBindingRecord) error {
-	if s.authEngine == nil {
-		return status.Error(codes.PermissionDenied, "role revokes require admin (no RBAC engine on this node)")
+// revoking it cannot exceed the caller. A sentinel is a cluster admin's to
+// remove. The revoke itself leaves a sentinel (RevokeRoleBindingLeavingSentinel).
+func (s *Server) authorizeDelegatedRevoke(ctx context.Context, e *auth.Engine, b *corrosion.RoleBindingRecord) error {
+	if b.Role == corrosion.SentinelRole {
+		return status.Errorf(codes.PermissionDenied,
+			"binding %s is a %s sentinel left by a delegated revoke; only a cluster admin removes it",
+			b.ID, corrosion.SentinelRole)
 	}
-	cpath, err := s.authorizeDelegatedPath(ctx, b.Path)
+	cpath, err := s.authorizeDelegatedPath(ctx, e, b.Path)
 	if err != nil {
 		return err
 	}
-	if _, defined := s.authEngine.RoleVerbs(b.Role); defined {
-		if err := s.refuseEscalation(ctx, cpath, b.Role, b.Propagate); err != nil {
+	if _, defined := e.RoleVerbs(b.Role); defined {
+		if err := s.refuseEscalation(ctx, e, cpath, b.Role, b.Propagate); err != nil {
 			return err
 		}
-	}
-	set, ok, err := s.principalSet(ctx, b.Principal)
-	if err != nil {
-		return status.Errorf(codes.Internal, "resolve principal %q: %v", b.Principal, err)
-	}
-	if !ok {
-		// A bare or unknown-user binding is inert: removing it changes no
-		// caller's engine status.
-		return nil
-	}
-	if !s.authEngine.HasAnyBindingExcept(set, b.ID) {
-		return status.Errorf(codes.PermissionDenied,
-			"binding %s is the last role binding of %s; removing it returns that principal to its legacy "+
-				"role cluster-wide, and only a cluster admin may do that", b.ID, b.Principal)
 	}
 	return nil
 }

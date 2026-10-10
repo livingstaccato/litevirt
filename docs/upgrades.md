@@ -829,7 +829,19 @@ runs this release. A previous-release host would neither decode the rows nor
 enforce them; it has no statement that touches the table, so it cannot undo a
 disable either. Delegated administration (`perm.modify`) needs no token: it
 writes the existing `role_bindings` shape, and its rules are enforced where a
-grant is created.
+grant is created. It needs an **explicit** `perm.modify` (or `perm.*`) grant:
+an existing `Admin` (`*`) binding on a project does **not** gain the right to
+grant or revoke roles there. To see who holds delegation:
+`lv role ls --role PermissionAdmin`.
+
+v64 also adds `session_factors` (what each session's login presented) and
+`user_enrollment_codes` (hashed first-enrollment codes), written under the
+same latch. A host below `login_policy_v1` does not enforce any of it: it
+accepts a disabled account's sessions and API tokens and does not confine
+password-only sessions. Keep such a host out of the client path until it is
+upgraded (docs/auth.md, "Rolling upgrade, and hosts below the latch"). From
+this release on, a host in WAL quarantine refuses every user credential and
+serves only local-root and peer mTLS.
 
 ### Recovery claims latch after the roll
 

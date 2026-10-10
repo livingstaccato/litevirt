@@ -50,10 +50,20 @@ const (
 	// UserAttrExpiresAt is the RFC3339 UTC instant the account stops
 	// authenticating, "" for never. An unparseable value reads as expired.
 	UserAttrExpiresAt = "expires_at"
+	// UserAttrSessionsNotBefore is the RFC3339 instant before which no session
+	// of the account is honoured, "" for none. A disable and an expiry set it,
+	// so a session minted before them stays dead after a re-enable, including
+	// one whose row reached a node after that node's revocation sweep had run
+	// (t1-auth-review m2). Never cleared by a re-enable.
+	UserAttrSessionsNotBefore = "sessions_not_before"
 
 	// LoginTwoFactorPolicyKey is the cluster_policies key of the mandatory
 	// second-factor policy.
 	LoginTwoFactorPolicyKey = "login_2fa_required"
+	// LoginTwoFactorSelfEnrollKey is the cluster_policies key of the policy's
+	// self-enrollment deadline: RFC3339, or "" (no row) for none, in which case
+	// an enrollment-only session enrolls only with an admin-issued code.
+	LoginTwoFactorSelfEnrollKey = "login_2fa_self_enroll_by"
 
 	// TwoFactorPolicyOff and TwoFactorPolicyAll are the policy's two fixed
 	// values; anything else is a comma-separated list of realm names.
@@ -99,6 +109,8 @@ type UserLifecycle struct {
 	Disabled bool
 	// ExpiresAt is the stored expiry, "" for never.
 	ExpiresAt string
+	// SessionsNotBefore is UserAttrSessionsNotBefore, "" for none.
+	SessionsNotBefore string
 	// Unreadable names a stored attribute this build could not parse. Such an
 	// account is inactive: see InactiveReason.
 	Unreadable string
@@ -124,6 +136,25 @@ func (l UserLifecycle) InactiveReason(now time.Time) string {
 		}
 	}
 	return ""
+}
+
+// SessionPredates reports whether a session created at createdAt (RFC3339)
+// is from before the account's last disable or expiry, and so is never
+// honoured again. An unparseable instant on either side predates: it fails
+// closed.
+func (l UserLifecycle) SessionPredates(createdAt string) bool {
+	if l.SessionsNotBefore == "" {
+		return false
+	}
+	nb, err := time.Parse(time.RFC3339, l.SessionsNotBefore)
+	if err != nil {
+		return true
+	}
+	ca, err := time.Parse(time.RFC3339, createdAt)
+	if err != nil {
+		return true
+	}
+	return ca.Before(nb)
 }
 
 // Unrestricted reports whether the account is enabled and has no expiry —
@@ -153,6 +184,8 @@ func (l *UserLifecycle) applyAttribute(attr, value string) {
 				l.Unreadable = fmt.Sprintf("expires_at=%q", value)
 			}
 		}
+	case UserAttrSessionsNotBefore:
+		l.SessionsNotBefore = value
 	}
 }
 
@@ -224,6 +257,11 @@ func SetUserLifecycle(ctx context.Context, c *Client, username string, disabled 
 	}
 	now := c.NowTS()
 	var stmts []Statement
+	if (disabled != nil && *disabled) || (expiresAt != nil && *expiresAt != "") {
+		// Sessions from before this instant are never honoured again (m2).
+		stmts = append(stmts, Statement{SQL: userLifecycleUpsertSQL,
+			Params: []interface{}{username, UserAttrSessionsNotBefore, nowRFC3339(), setBy, now}})
+	}
 	if disabled != nil {
 		v := "false"
 		if *disabled {
@@ -242,11 +280,11 @@ func SetUserLifecycle(ctx context.Context, c *Client, username string, disabled 
 	return c.ExecuteBatch(ctx, stmts)
 }
 
-// resetUserLifecycleStatements returns the statements that put username back
-// to the zero lifecycle (enabled, never expires), or nil when the gate is
-// closed — in which case no row can have been written by this node, and the
-// caller decides whether one written elsewhere matters.
-func resetUserLifecycleStatements(c *Client, username, setBy, now string) []Statement {
+// enableUserStatements returns the statements that clear username's disable
+// and expiry (and leave SessionsNotBefore, so nothing old revives), or nil when
+// the gate is closed — in which case no row can have been written by this
+// node, and the caller decides whether one written elsewhere matters.
+func enableUserStatements(c *Client, username, setBy, now string) []Statement {
 	if !c.MayWriteLoginPolicy() {
 		return nil
 	}
@@ -254,6 +292,31 @@ func resetUserLifecycleStatements(c *Client, username, setBy, now string) []Stat
 		{SQL: userLifecycleUpsertSQL, Params: []interface{}{username, UserAttrDisabled, "false", setBy, now}},
 		{SQL: userLifecycleUpsertSQL, Params: []interface{}{username, UserAttrExpiresAt, "", setBy, now}},
 	}
+}
+
+// ResetUserLifecycle starts username afresh: enabled, no expiry, and no
+// session from before now honoured. It is what an explicit CreateUser does to
+// a name, which may have belonged to a deleted, disabled account (DeleteUser
+// keeps the lifecycle on purpose; m3) — and whose old sessions must not come
+// back with the new account. With the gate closed it does nothing when there
+// is nothing to reset, and refuses (ErrLoginPolicyGateClosed) when a row a
+// latched peer wrote is there.
+func ResetUserLifecycle(ctx context.Context, c *Client, username, setBy string) error {
+	if !c.MayWriteLoginPolicy() {
+		rows, err := c.Query(ctx, `SELECT 1 FROM user_lifecycle WHERE username = ? AND deleted_at IS NULL LIMIT 1`, username)
+		if err != nil {
+			return err
+		}
+		if len(rows) > 0 {
+			return ErrLoginPolicyGateClosed
+		}
+		return nil
+	}
+	now := c.NowTS()
+	stmts := enableUserStatements(c, username, setBy, now)
+	stmts = append(stmts, Statement{SQL: userLifecycleUpsertSQL,
+		Params: []interface{}{username, UserAttrSessionsNotBefore, nowRFC3339(), setBy, now}})
+	return c.ExecuteBatch(ctx, stmts)
 }
 
 // OtherUnrestrictedAdminExists reports whether a live admin-role account
@@ -279,6 +342,35 @@ func OtherUnrestrictedAdminExists(ctx context.Context, c *Client, username strin
 	return false, nil
 }
 
+// usableAdmin reports whether username's account can log in now (enabled,
+// unexpired, readable): what the admin floor counts.
+func usableAdmin(ctx context.Context, c *Client, username string) (bool, error) {
+	l, err := GetUserLifecycle(ctx, c, username)
+	if err != nil {
+		return false, err
+	}
+	return l.InactiveReason(time.Now().UTC()) == "", nil
+}
+
+// UsableAdminExists reports whether some live admin-role account can log in
+// now. The admin floor raises no_unrestricted_admin while it cannot.
+func UsableAdminExists(ctx context.Context, c *Client) (bool, error) {
+	rows, err := c.Query(ctx, `SELECT username FROM users WHERE role = 'admin' AND deleted_at IS NULL`)
+	if err != nil {
+		return false, err
+	}
+	for _, r := range rows {
+		ok, err := usableAdmin(ctx, c, r.String("username"))
+		if err != nil {
+			return false, err
+		}
+		if ok {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // TwoFactorPolicy is the cluster-wide mandatory second-factor policy as this
 // node's replica holds it.
 type TwoFactorPolicy struct {
@@ -292,6 +384,19 @@ type TwoFactorPolicy struct {
 	Unknown   bool
 	SetBy     string
 	UpdatedAt string
+	// SelfEnrollBy is the self-enrollment deadline as stored, "" for none.
+	SelfEnrollBy string
+}
+
+// SelfEnrollOpen reports whether an enrollment-only session may enroll its
+// first factor without an admin-issued code at now. No deadline, an
+// unparseable one, or one that has passed: no (fail closed).
+func (p TwoFactorPolicy) SelfEnrollOpen(now time.Time) bool {
+	if p.SelfEnrollBy == "" {
+		return false
+	}
+	t, err := time.Parse(time.RFC3339, p.SelfEnrollBy)
+	return err == nil && now.Before(t)
 }
 
 // Requires reports whether a login through realm must present a second factor.
@@ -364,8 +469,16 @@ func GetTwoFactorPolicy(ctx context.Context, c *Client) (TwoFactorPolicy, error)
 	if err != nil {
 		return TwoFactorPolicy{}, err
 	}
+	selfBy := ""
+	if sr, err := c.Query(ctx,
+		`SELECT value FROM cluster_policies WHERE key = ? AND deleted_at IS NULL`,
+		LoginTwoFactorSelfEnrollKey); err != nil {
+		return TwoFactorPolicy{}, err
+	} else if len(sr) > 0 {
+		selfBy = sr[0].String("value")
+	}
 	if len(rows) == 0 {
-		return TwoFactorPolicy{Value: TwoFactorPolicyOff}, nil
+		return TwoFactorPolicy{Value: TwoFactorPolicyOff, SelfEnrollBy: selfBy}, nil
 	}
 	raw := rows[0].String("value")
 	p, perr := ParseTwoFactorPolicy(raw)
@@ -375,6 +488,7 @@ func GetTwoFactorPolicy(ctx context.Context, c *Client) (TwoFactorPolicy, error)
 	p.Value = raw
 	p.SetBy = rows[0].String("set_by")
 	p.UpdatedAt = rows[0].String("updated_at")
+	p.SelfEnrollBy = selfBy
 	return p, nil
 }
 
@@ -383,6 +497,10 @@ func GetTwoFactorPolicy(ctx context.Context, c *Client) (TwoFactorPolicy, error)
 // that table's gate (failover_scope_v1) as well as this one's: the shape is
 // registered, but a build that predates login_policy_v1 would read the row and
 // ignore it, so it may not be written while one is listening.
+//
+// The policy and its self-enrollment deadline (p.SelfEnrollBy, "" for none)
+// are written together, in one batch: every change of the policy restates the
+// deadline, so a window is open only because the latest change opened it.
 func SetTwoFactorPolicy(ctx context.Context, c *Client, p TwoFactorPolicy, setBy string) error {
 	if !c.MayWriteLoginPolicy() {
 		return ErrLoginPolicyGateClosed
@@ -390,7 +508,11 @@ func SetTwoFactorPolicy(ctx context.Context, c *Client, p TwoFactorPolicy, setBy
 	if !c.MayWriteClusterPolicy() {
 		return ErrClusterPolicyGateClosed
 	}
-	return c.Execute(ctx, clusterPolicyUpsertSQL, LoginTwoFactorPolicyKey, p.Value, setBy, c.NowTS())
+	now := c.NowTS()
+	return c.ExecuteBatch(ctx, []Statement{
+		{SQL: clusterPolicyUpsertSQL, Params: []interface{}{LoginTwoFactorPolicyKey, p.Value, setBy, now}},
+		{SQL: clusterPolicyUpsertSQL, Params: []interface{}{LoginTwoFactorSelfEnrollKey, p.SelfEnrollBy, setBy, now}},
+	})
 }
 
 // LiveSession is the slice of a session the policy change needs.

@@ -56,12 +56,13 @@ func (c *Client) EnsureAdminFloor(ctx context.Context, settle time.Duration) (st
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	live, err := c.Query(ctx,
-		`SELECT username FROM users WHERE role = 'admin' AND deleted_at IS NULL LIMIT 1`)
+	// Usable admins only (t1-auth-review I4): a live admin that is disabled
+	// or expired does not satisfy the floor.
+	usable, err := UsableAdminExists(ctx, c)
 	if err != nil {
 		return "", err
 	}
-	if len(live) > 0 {
+	if usable {
 		f.zeroSince = time.Time{}
 		return "", nil
 	}

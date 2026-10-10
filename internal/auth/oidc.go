@@ -234,6 +234,11 @@ func EnsureUserShadow(ctx context.Context, db *corrosion.Client, p *Principal, d
 	if p == nil || p.Subject == "" {
 		return errors.New("nil principal")
 	}
+	// Every lookup normalizes the name (corrosion.NormalizeUsername), and so
+	// does the shadow this writes: a directory subject typed `ALICE` is the
+	// account `alice`, never a second one beside it (t1-auth-review I2). On
+	// return p.Subject is the account's name as stored, which is what every
+	// per-account row is keyed on.
 	existing, err := corrosion.GetUser(ctx, db, p.Subject)
 	if err != nil {
 		return err
@@ -280,13 +285,22 @@ func EnsureUserShadow(ctx context.Context, db *corrosion.Client, p *Principal, d
 				"authenticate it from realm %q, because that would adopt the local account's "+
 				"role — rename one of the two", p.Subject, p.Realm)
 		}
+		p.Subject = existing.Username
 		return nil
 	}
 	role := defaultRole
 	if role == "" {
 		role = "viewer"
 	}
-	return corrosion.InsertUser(ctx, db, p.Subject, role, "")
+	name := corrosion.NormalizeUsername(p.Subject)
+	if name == "" {
+		return errors.New("empty subject")
+	}
+	if err := corrosion.InsertUser(ctx, db, name, role, ""); err != nil {
+		return err
+	}
+	p.Subject = name
+	return nil
 }
 
 // rememberFlow stores the per-login PKCE verifier + nonce under the CSRF

@@ -783,6 +783,14 @@ type Server struct {
 	// nil and the WebAuthn RPCs return Unimplemented.
 	webauthn *auth.WebAuthnService
 
+	// streamRecheckEvery is how often an open user-authenticated stream
+	// re-checks its credential (stream_watch.go); 0 = StreamRecheckInterval.
+	streamRecheckEvery time.Duration
+	// streamKick wakes every open stream's watcher to re-check now; replaced
+	// (closed) on each kick. Guarded by streamKickMu.
+	streamKickMu sync.Mutex
+	streamKick   chan struct{}
+
 	// backupSource opens guest-content backup sessions (pull-mode NBD).
 	// nil = legacy qcow2-container full backup. Set by daemon when libvirt
 	// is reachable. content-based rewrite.

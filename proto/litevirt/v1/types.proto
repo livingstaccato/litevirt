@@ -613,6 +613,9 @@ message User {
     // empty for an account that never expires.
     bool                           disabled   = 4;
     string                         expires_at = 5;
+    // status is "active", "disabled" or "expired", judged by the answering
+    // daemon's clock.
+    string                         status     = 6;
 }
 
 message Token {

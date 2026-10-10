@@ -85,7 +85,9 @@ func (s *Server) handleAccountPassword(w http.ResponseWriter, r *http.Request) {
 // without parsing.
 func (s *Server) handleWebAuthnBegin(w http.ResponseWriter, r *http.Request) {
 	ctx := s.uiBearerCtx(r)
-	resp, err := s.grpc.BeginWebAuthnRegistration(ctx, &pb.BeginWebAuthnRegistrationRequest{})
+	resp, err := s.grpc.BeginWebAuthnRegistration(ctx, &pb.BeginWebAuthnRegistrationRequest{
+		EnrollmentCode: r.Header.Get("X-Enrollment-Code"),
+	})
 	if err != nil {
 		writeWebAuthnError(w, err)
 		return
@@ -106,6 +108,7 @@ func (s *Server) handleWebAuthnFinish(w http.ResponseWriter, r *http.Request) {
 	ctx := s.uiBearerCtx(r)
 	resp, err := s.grpc.FinishWebAuthnRegistration(ctx, &pb.FinishWebAuthnRegistrationRequest{
 		AttestationJson: body,
+		EnrollmentCode:  r.Header.Get("X-Enrollment-Code"),
 	})
 	if err != nil {
 		writeWebAuthnError(w, err)

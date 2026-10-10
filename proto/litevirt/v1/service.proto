@@ -906,8 +906,20 @@ message LoginPolicy {
     string          updated_at       = 5;
     bool            settable         = 6;  // login_policy_v1 has latched here
     int32           sessions_revoked = 7;  // SetLoginPolicy only: sessions ended in newly covered realms
+    string          self_enroll_by   = 8;  // RFC3339; "" = enrollment needs an admin-issued code
+    repeated string warnings         = 9;  // e.g. a covered realm that is not configured on this node
 }
-message SetLoginPolicyRequest { string require_2fa = 1; }
+// SetLoginPolicyRequest: by default an enrollment-only session can enroll its
+// first factor only with an admin-issued enrollment code (IssueEnrollmentCode).
+// allow_self_enroll with enroll_by (RFC3339, in the future) lets it enroll
+// without one until enroll_by; after it, a code is required again.
+message SetLoginPolicyRequest { string require_2fa = 1; bool allow_self_enroll = 2; string enroll_by = 3; }
+// IssueEnrollmentCode mints a single-use, short-lived code with which an
+// enrollment-only session of username may enroll its first factor. Admin only.
+// ttl_seconds 0 = one hour; at most 24 hours. The code is shown once and
+// stored hashed.
+message IssueEnrollmentCodeRequest  { string username = 1; int64 ttl_seconds = 2; }
+message IssueEnrollmentCodeResponse { string code = 1; string expires_at = 2; }
 // CheckPermissionsRequest names permission gates (see grpcapi permGates), not
 // raw verbs, so the question cannot drift from the one the RPC asks.
 message CheckPermissionsRequest  { repeated string gates = 1; }
@@ -922,7 +934,10 @@ message ChangePasswordRequest { string username = 1; string old_password = 2; st
 // never leaves the process that writes the password file. os_user is the
 // invoking account as the CLI reports it (SUDO_USER when set); it is recorded
 // in the audit row as a claim, not as an authenticated identity.
-message ResetAdminPasswordRequest { string password_hash = 1; string os_user = 2; }
+// clear_two_factor also removes every second factor and recovery code of the
+// admin account (`lv user reset-admin --clear-2fa`); refused until
+// login_policy_v1 has latched here.
+message ResetAdminPasswordRequest { string password_hash = 1; string os_user = 2; bool clear_two_factor = 3; }
 message CreateTokenRequest {
     string username = 1;
     string name     = 2;
@@ -1574,7 +1589,9 @@ message TwoFactor {
 }
 message ListTwoFactorsRequest  { string username = 1; }  // empty = caller's own
 message ListTwoFactorsResponse { repeated TwoFactor factors = 1; }
-message EnrollTOTPRequest      { string username = 1; string label = 2; }
+// enrollment_code: required from an enrollment-only session unless the
+// policy's self-enrollment window is open (IssueEnrollmentCode).
+message EnrollTOTPRequest      { string username = 1; string label = 2; string enrollment_code = 3; }
 message EnrollTOTPResponse {
     string otpauth_url    = 1;  // for QR code rendering
     string secret_base32  = 2;  // for manual entry
@@ -1732,11 +1749,12 @@ message RestoreLiveProgress {
 // navigator.credentials.create /.get. The daemon holds the in-flight
 // session between Begin and Finish in memory; a Begin without a
 // matching Finish within 60s is garbage-collected.
-message BeginWebAuthnRegistrationRequest  { string username = 1; }
+message BeginWebAuthnRegistrationRequest  { string username = 1; string enrollment_code = 2; }
 message BeginWebAuthnRegistrationResponse { bytes options_json = 1; }
 message FinishWebAuthnRegistrationRequest {
     string username        = 1;
     bytes  attestation_json = 2;
+    string enrollment_code = 3;
 }
 // session_ended: as EnrollTOTPResponse.session_ended.
 message FinishWebAuthnRegistrationResponse { string credential_label = 1; bool session_ended = 2; }
@@ -3497,6 +3515,7 @@ service LiteVirt {
     // refused until login_policy_v1 has latched on every host.
     rpc GetLoginPolicy(google.protobuf.Empty) returns (LoginPolicy);
     rpc SetLoginPolicy(SetLoginPolicyRequest) returns (LoginPolicy);
+    rpc IssueEnrollmentCode(IssueEnrollmentCodeRequest) returns (IssueEnrollmentCodeResponse);
     rpc CreateToken(CreateTokenRequest)  returns (Token);
     rpc RevokeToken(RevokeTokenRequest)  returns (google.protobuf.Empty);
     // Whoami returns the authenticated caller's identity. Authenticated (NOT in

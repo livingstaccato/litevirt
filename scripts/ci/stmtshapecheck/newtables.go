@@ -157,6 +157,14 @@ var firstShapeAcks = map[string]string{
 		"latch cannot form, and nothing is written, while a previous-release peer is listening. Their " +
 		"callers (SetFailoverScope, SetISOLibraryMode, and ISO library uploads, pulls and removals) refuse " +
 		"on the same gate first",
+	"session_factors": "the only writer is corrosion.InsertSessionWithFactor, which writes the row only when " +
+		"Client.MayWriteLoginPolicy and otherwise inserts the session alone; the gate is wired to " +
+		"DurablyLatched(login_policy_v1) — mandatory and in capabilities.replicationGated, so confirmed against " +
+		"every memberlist recipient — and fails CLOSED when unwired",
+	"user_enrollment_codes": "every writer (corrosion.IssueEnrollmentCode and ConsumeEnrollmentCode) returns " +
+		"ErrLoginPolicyGateClosed unless Client.MayWriteLoginPolicy, wired to DurablyLatched(login_policy_v1) — " +
+		"mandatory and in capabilities.replicationGated — and failing CLOSED when unwired. Their RPCs " +
+		"(IssueEnrollmentCode, and enrollment from an enrollment-only session) refuse on the same latch first",
 	"user_lifecycle": "every writer (corrosion.SetUserLifecycle, and the reset statements DeleteUser and " +
 		"ResetAdminPassword append, all through the one userLifecycleUpsertSQL) writes only when " +
 		"Client.MayWriteLoginPolicy: SetUserLifecycle returns ErrLoginPolicyGateClosed, and " +

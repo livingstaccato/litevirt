@@ -10,6 +10,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
 // WebAuthn enrolment + login handlers.
@@ -32,6 +33,11 @@ func (s *Server) BeginWebAuthnRegistration(ctx context.Context, req *pb.BeginWeb
 	if err != nil {
 		return nil, err
 	}
+	// Checked here so a confined session is told before the browser
+	// ceremony; enforced (and the session ended) at Finish.
+	if _, err := s.firstEnrollment(ctx, req.GetEnrollmentCode(), false); err != nil {
+		return nil, err
+	}
 	opts, err := s.webauthn.BeginRegistration(ctx, target)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "begin registration: %v", err)
@@ -50,6 +56,10 @@ func (s *Server) FinishWebAuthnRegistration(ctx context.Context, req *pb.FinishW
 	if err != nil {
 		return nil, err
 	}
+	first, err := s.firstEnrollment(ctx, req.GetEnrollmentCode(), true)
+	if err != nil {
+		return nil, err
+	}
 	if err := s.webauthn.FinishRegistration(ctx, target, req.AttestationJson); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "finish registration: %v", err)
 	}
@@ -58,7 +68,10 @@ func (s *Server) FinishWebAuthnRegistration(ctx context.Context, req *pb.FinishW
 	// reference so the UI can show "registered key abc1234…".
 	label := credentialLabelFromAttestation(req.AttestationJson)
 	slog.Info("webauthn registered", "username", target, "label", label)
-	return &pb.FinishWebAuthnRegistrationResponse{CredentialLabel: label, SessionEnded: s.endEnrollmentSession(ctx)}, nil
+	if first {
+		s.noteFirstFactor(ctx, "webauthn")
+	}
+	return &pb.FinishWebAuthnRegistrationResponse{CredentialLabel: label, SessionEnded: first}, nil
 }
 
 func (s *Server) BeginWebAuthnLogin(ctx context.Context, req *pb.BeginWebAuthnLoginRequest) (*pb.BeginWebAuthnLoginResponse, error) {
@@ -68,7 +81,11 @@ func (s *Server) BeginWebAuthnLogin(ctx context.Context, req *pb.BeginWebAuthnLo
 	if req.Username == "" {
 		return nil, status.Error(codes.InvalidArgument, "username is required for login")
 	}
-	opts, err := s.webauthn.BeginLogin(ctx, req.Username)
+	username := req.Username
+	if u, err := corrosion.GetUser(ctx, s.db, username); err == nil && u != nil {
+		username = u.Username
+	}
+	opts, err := s.webauthn.BeginLogin(ctx, username)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "begin login: %v", err)
 	}
@@ -97,7 +114,11 @@ func (s *Server) FinishWebAuthnLogin(ctx context.Context, req *pb.FinishWebAuthn
 	// A valid assertion proves possession of the registered authenticator —
 	// strong, phishing-resistant auth on its own (passkey-style passwordless
 	// login). So a successful assertion mints a session directly.
-	if err := s.webauthn.FinishLogin(ctx, req.Username, req.AssertionJson); err != nil {
+	username := req.Username
+	if u, err := corrosion.GetUser(ctx, s.db, username); err == nil && u != nil {
+		username = u.Username
+	}
+	if err := s.webauthn.FinishLogin(ctx, username, req.AssertionJson); err != nil {
 		s.loginThrottle.fail(throttleKey)
 		s.audit(ctx, "auth.login", req.Username, "webauthn invalid assertion ip="+clientIP, "denied")
 		return nil, status.Errorf(codes.Unauthenticated, "finish login: %v", err)
@@ -105,7 +126,8 @@ func (s *Server) FinishWebAuthnLogin(ctx context.Context, req *pb.FinishWebAuthn
 	s.loginThrottle.success(throttleKey)
 
 	// WebAuthn users are shadowed into the local users table.
-	token, expiresAt, role, err := s.mintSession(ctx, req.Username, "local", clientIP, "webauthn")
+	// The assertion is itself the second factor, and is recorded as presented.
+	token, expiresAt, role, err := s.mintSession(ctx, username, "local", clientIP, "webauthn", "webauthn")
 	if err != nil {
 		return nil, err
 	}
@@ -136,6 +158,9 @@ func (s *Server) resolve2FATarget(ctx context.Context, requested string) (string
 		if err := RequireRole(ctx, "admin"); err != nil {
 			return "", err
 		}
+	}
+	if u, err := corrosion.GetUser(ctx, s.db, target); err == nil && u != nil {
+		target = u.Username
 	}
 	return target, nil
 }

@@ -494,7 +494,13 @@ import (
 //	     statement on users can reset it. Absent = enabled, never expires. A
 //	     previous-release node cannot decode the table's statements, and would
 //	     not enforce them, so nothing writes it until login_policy_v1 latches
-//	     (ReplicationGated). One new table.
+//	     (ReplicationGated). With it, two tables the mandatory second-factor
+//	     policy needs, written under the same gate and, like sessions, left out
+//	     of anti-entropy: session_factors (session_id PK: the second factor
+//	     a session's login presented, so a password-only session is never
+//	     re-derived into a full one) and user_enrollment_codes (username PK:
+//	     the admin-issued, single-use, short-lived first-enrollment code,
+//	     stored as a SHA-256). Three new tables.
 const CurrentSchemaVersion = 64
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
@@ -2906,11 +2912,34 @@ var schemaDDL = []string{
 		deleted_at TEXT,
 		PRIMARY KEY (username, attribute)
 	)`,
+	// v64 the second factor a session's login presented; no row = none.
+	// Written in the session's own batch; see login_factors.go.
+	`CREATE TABLE IF NOT EXISTS session_factors (
+		session_id   TEXT PRIMARY KEY,
+		method       TEXT NOT NULL,
+		presented_at TEXT NOT NULL,
+		updated_at   TEXT NOT NULL,
+		deleted_at   TEXT
+	)`,
+	// v64 an account's admin-issued first-enrollment code, hashed; see
+	// login_factors.go.
+	`CREATE TABLE IF NOT EXISTS user_enrollment_codes (
+		username   TEXT PRIMARY KEY,
+		code_hash  TEXT NOT NULL,
+		expires_at TEXT NOT NULL,
+		issued_by  TEXT NOT NULL DEFAULT '',
+		used_at    TEXT NOT NULL DEFAULT '',
+		updated_at TEXT NOT NULL,
+		deleted_at TEXT
+	)`,
 }
 
 // schemaIndexes are CREATE INDEX IF NOT EXISTS statements added after table creation.
 // These accelerate the most common query patterns (ListVMs by host, interfaces by VM, etc.).
 var schemaIndexes = []string{
+	// users by normalized name (corrosion.NormalizeUsername / GetUser): every
+	// authenticated request looks an account up this way.
+	`CREATE INDEX IF NOT EXISTS idx_users_username_norm ON users(lower(trim(username, ' ' || char(9) || char(10) || char(13))))`,
 	// vm_events: per-VM timeline (newest-first list + per-VM prune cap) and the
 	// cross-host live-stream poll (ts cursor).
 	`CREATE INDEX IF NOT EXISTS idx_vm_events_vm_ts ON vm_events(vm_name, ts)`,
@@ -3096,6 +3125,8 @@ var tablePrimaryKeys = map[string][]string{
 	"cluster_policies":        {"key"},
 	"voter_configs":           {"generation"},
 	"user_lifecycle":          {"username", "attribute"},
+	"session_factors":         {"session_id"},
+	"user_enrollment_codes":   {"username"},
 }
 
 // schemaMigrations contains ALTER TABLE statements for upgrading existing databases.
@@ -3470,7 +3501,7 @@ var createTableUnits = []struct {
 	{61, "local_abandoned_proofs"},
 	{62, "local_voter_seals"},
 	{63, "local_incarnation_claims"},
-	{64, "user_lifecycle"},
+	{64, "user_lifecycle"}, {64, "session_factors"}, {64, "user_enrollment_codes"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

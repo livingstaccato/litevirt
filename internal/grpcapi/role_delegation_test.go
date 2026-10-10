@@ -210,25 +210,23 @@ func TestDelegatedRevoke_Rules(t *testing.T) {
 	_, err = s.RevokeRole(patCtx(), &pb.RevokeRoleRequest{Id: "carol-admin-acme"})
 	wantCode(t, "revoke of a binding carrying more than the revoker holds", err, codes.PermissionDenied)
 
-	// bob holds bob-view (acme) and bob-other: revoking bob-view leaves one.
 	if _, err := s.RevokeRole(patCtx(), &pb.RevokeRoleRequest{Id: "bob-view"}); err != nil {
 		t.Fatalf("revoke of bob's acme binding: %v", err)
 	}
 	if s.authEngine.Allowed([]string{"user:bob@local"}, "vm.read", "/projects/acme") {
 		t.Error("the revoke did not take effect")
 	}
-	// carol-view is in acme, but after carol-admin-acme it is not carol's
-	// last... remove that one as admin, so carol-view IS her last.
+	// carol-view is her last binding once the admin removes the other: the
+	// delegated revoke goes through and leaves a NoAccess sentinel, so she
+	// never falls back to her legacy role (review I3).
 	if _, err := s.RevokeRole(adminCtx(), &pb.RevokeRoleRequest{Id: "carol-admin-acme"}); err != nil {
 		t.Fatal(err)
 	}
-	_, err = s.RevokeRole(patCtx(), &pb.RevokeRoleRequest{Id: "carol-view"})
-	wantCode(t, "revoke of a principal's last binding", err, codes.PermissionDenied)
-	if !strings.Contains(err.Error(), "last role binding") {
-		t.Errorf("last-binding refusal %q does not say why", err)
+	if _, err := s.RevokeRole(patCtx(), &pb.RevokeRoleRequest{Id: "carol-view"}); err != nil {
+		t.Fatalf("delegated revoke of carol's last binding: %v", err)
 	}
-	if b, _ := corrosion.GetRoleBinding(ctx, s.db, "carol-view"); b == nil {
-		t.Fatal("a refused revoke was written")
+	if !s.authEngine.HasAnyBinding([]string{"user:carol@local"}) {
+		t.Fatal("carol has no binding left in the live engine after a delegated revoke")
 	}
 }
 

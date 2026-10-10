@@ -39,6 +39,9 @@ const (
 	// requires a second factor for its realm and the account has none
 	// (login_policy.go).
 	ctxKeyEnrollOnly
+	// ctxKeyTokenID is the matched API token's id, so an open stream it
+	// authenticated can be re-checked (stream_watch.go).
+	ctxKeyTokenID
 )
 
 const (
@@ -223,6 +226,17 @@ func (s *Server) StreamAuthInterceptor(
 	if err := s.gateAuditHold(ctx, info.FullMethod, false); err != nil {
 		return err
 	}
+	// A stream authenticated by a USER credential is re-checked while it is
+	// open, and cut when the credential stops being one (stream_watch.go).
+	if userBearerIdentity(ctx) {
+		wctx, stop := s.watchStream(ctx)
+		defer stop()
+		err := handler(srv, &wrappedStream{ss, wctx})
+		if cut := streamCutCause(wctx); cut != nil {
+			return cut
+		}
+		return err
+	}
 	return handler(srv, &wrappedStream{ss, ctx})
 }
 
@@ -240,6 +254,9 @@ func (s *Server) authenticate(ctx context.Context) (context.Context, error) {
 				return nil, status.Error(codes.Unauthenticated, "authorization header must use Bearer scheme")
 			}
 			rawToken := strings.TrimPrefix(val, "Bearer ")
+			if err := s.refuseUserBearersInQuarantine(); err != nil {
+				return nil, err
+			}
 
 			if strings.HasPrefix(rawToken, SessionTokenPrefix) {
 				return s.authenticateSession(ctx, strings.TrimPrefix(rawToken, SessionTokenPrefix))
@@ -262,6 +279,7 @@ func (s *Server) authenticate(ctx context.Context) (context.Context, error) {
 			ctx = context.WithValue(ctx, ctxKeyRole, user.Role)
 			ctx = context.WithValue(ctx, ctxKeyRealm, "local")
 			ctx = context.WithValue(ctx, ctxKeyAuthMethod, authMethodToken)
+			ctx = context.WithValue(ctx, ctxKeyTokenID, user.TokenID)
 			if len(user.ScopePaths) > 0 {
 				ctx = context.WithValue(ctx, ctxKeyScopePaths, user.ScopePaths)
 			}
@@ -291,6 +309,9 @@ func (s *Server) authenticate(ctx context.Context) (context.Context, error) {
 	// continuation and stays admin (audits as system).
 	if kind == principalKindPeer && s.forwardedIdentityEnforced(ctx) {
 		if fwd := fwdBearerFromCtx(ctx); fwd != "" {
+			if err := s.refuseUserBearersInQuarantine(); err != nil {
+				return nil, err
+			}
 			return s.authenticateForwardedBearer(ctx, fwd)
 		}
 	}
@@ -561,10 +582,10 @@ func (s *Server) authenticateForwardedBearer(ctx context.Context, val string) (c
 			// the owner would churn the row across nodes.
 			return nil, status.Error(codes.Unavailable, "forwarded identity not yet visible on owner; retry")
 		}
-		if err := s.refuseInactiveAccount(ctx, user.Username); err != nil {
+		if err := s.refuseInactiveSession(ctx, user.Username, sess.CreatedAt); err != nil {
 			return nil, err
 		}
-		enrollOnly, err := s.sessionEnrollOnly(ctx, user.Username, sess.Realm)
+		enrollOnly, err := s.sessionEnrollOnly(ctx, sid, sess.Realm)
 		if err != nil {
 			return nil, err
 		}
@@ -578,6 +599,9 @@ func (s *Server) authenticateForwardedBearer(ctx context.Context, val string) (c
 		ctx = context.WithValue(ctx, ctxKeyRealm, sess.Realm)
 		ctx = context.WithValue(ctx, ctxKeyAuthMethod, authMethodSession)
 		ctx = context.WithValue(ctx, ctxKeyPrincipalKind, principalKindPeer)
+		// The relayed session's id, so an enrollment through this peer ends
+		// it exactly as one made on the entry node would (C1).
+		ctx = context.WithValue(ctx, ctxKeySessionID, sid)
 		// Preserve the relaying peer's transport CN so requirePeerCert /
 		// requireReplicationPeer (and audit) still see it through the promotion.
 		ctx = context.WithValue(ctx, ctxKeyMTLSCommonName, peerCommonName(ctx))
@@ -601,6 +625,7 @@ func (s *Server) authenticateForwardedBearer(ctx context.Context, val string) (c
 	ctx = context.WithValue(ctx, ctxKeyRole, user.Role)
 	ctx = context.WithValue(ctx, ctxKeyRealm, "local")
 	ctx = context.WithValue(ctx, ctxKeyAuthMethod, authMethodToken)
+	ctx = context.WithValue(ctx, ctxKeyTokenID, user.TokenID)
 	ctx = context.WithValue(ctx, ctxKeyPrincipalKind, principalKindPeer)
 	ctx = context.WithValue(ctx, ctxKeyMTLSCommonName, peerCommonName(ctx))
 	if len(user.ScopePaths) > 0 {
@@ -672,10 +697,10 @@ func (s *Server) authenticateSession(ctx context.Context, sid string) (context.C
 	// Checked on every request rather than at disable time, so a disable or
 	// an expiry takes effect on every node as soon as its replica has it,
 	// whatever happened to the session rows.
-	if err := s.refuseInactiveAccount(ctx, user.Username); err != nil {
+	if err := s.refuseInactiveSession(ctx, user.Username, sess.CreatedAt); err != nil {
 		return nil, err
 	}
-	enrollOnly, err := s.sessionEnrollOnly(ctx, user.Username, sess.Realm)
+	enrollOnly, err := s.sessionEnrollOnly(ctx, sid, sess.Realm)
 	if err != nil {
 		return nil, err
 	}

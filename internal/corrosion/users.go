@@ -3,6 +3,9 @@ package corrosion
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
@@ -25,6 +28,9 @@ type UserRecord struct {
 	// perms). A scoped token may only operate on paths that are under one
 	// of these prefixes.
 	ScopePaths []string
+	// TokenID is the matched API token's id, set only by ValidateToken, so an
+	// open stream authenticated by it can be re-checked without a bcrypt sweep.
+	TokenID string
 }
 
 // TokenRecord represents an API token.
@@ -74,19 +80,63 @@ func InsertUser(ctx context.Context, c *Client, username, role, passwordHash str
 
 const usersInsertSQL = `INSERT INTO users (username, role, password_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`
 
-// GetUser returns a user by username, or nil if not found.
+// usernameNormSQL is NormalizeUsername in SQL, over users.username. It must
+// stay the exact expression of idx_users_username_norm so the lookup uses it.
+const usernameNormSQL = `lower(trim(u.username, ' ' || char(9) || char(10) || char(13)))`
+
+// usernameTrimSet is the whitespace NormalizeUsername trims, the same set the
+// SQL above trims.
+const usernameTrimSet = " \t\n\r"
+
+// NormalizeUsername is how every account lookup compares names: surrounding
+// spaces, tabs and newlines removed, ASCII letters folded to lower case.
+// Directory realms match names case-insensitively and ignore insignificant
+// spaces, so a lookup that did not would let `ALICE` or `alice ` through a
+// directory bind as a different account from the disabled `alice`
+// (t1-auth-review I2). Only ASCII is folded, because SQLite's lower() folds
+// only ASCII and the two sides must agree exactly; a non-ASCII letter keeps
+// its case.
+func NormalizeUsername(s string) string {
+	s = strings.Trim(s, usernameTrimSet)
+	b := []byte(s)
+	for i, ch := range b {
+		if ch >= 'A' && ch <= 'Z' {
+			b[i] = ch + ('a' - 'A')
+		}
+	}
+	return string(b)
+}
+
+// ErrAmbiguousUsername is GetUser's refusal when two live accounts normalize
+// to one name. Normalization never merges them silently: every lookup of
+// either refuses until an operator renames or deletes one.
+var ErrAmbiguousUsername = errors.New("accounts differ only in case or surrounding spaces")
+
+// GetUser returns the live user whose name normalizes to username's
+// (NormalizeUsername), or nil if there is none. UserRecord.Username is the
+// name as stored, which is what every per-account row (lifecycle, factors,
+// sessions, tokens, bindings) is keyed on: callers use it, never their input.
+// Two live accounts that normalize alike is ErrAmbiguousUsername.
 func GetUser(ctx context.Context, c *Client, username string) (*UserRecord, error) {
 	rows, err := c.Query(ctx,
 		`SELECT u.username, u.role, u.password_hash, COALESCE(u.realm, 'local') AS realm, u.created_at,
 		        u.updated_at, c.username AS cred_key, c.password_hash AS cred_val, c.updated_at AS cred_ts
 		 FROM users u LEFT JOIN user_credentials c ON c.username = u.username AND c.deleted_at IS NULL
-		 WHERE u.username = ? AND u.deleted_at IS NULL`,
-		username)
+		 WHERE `+usernameNormSQL+` = ? AND u.deleted_at IS NULL`,
+		NormalizeUsername(username))
 	if err != nil {
 		return nil, err
 	}
 	if len(rows) == 0 {
 		return nil, nil
+	}
+	if len(rows) > 1 {
+		names := make([]string, len(rows))
+		for i, r := range rows {
+			names[i] = fmt.Sprintf("%q", r.String("username"))
+		}
+		return nil, fmt.Errorf("%w: %s — refusing to choose one; rename or delete all but one of them",
+			ErrAmbiguousUsername, strings.Join(names, ", "))
 	}
 	r := rows[0]
 	return &UserRecord{
@@ -134,24 +184,35 @@ func ListUsers(ctx context.Context, c *Client) ([]UserRecord, error) {
 
 // UpdateUserPassword updates the password hash for a user.
 func UpdateUserPassword(ctx context.Context, c *Client, username, passwordHash string) error {
-	now := c.NowTS()
+	stmts, err := updateUserPasswordStatements(ctx, c, username, passwordHash, c.NowTS())
+	if err != nil || len(stmts) == 0 {
+		return err
+	}
+	return c.ExecuteBatch(ctx, stmts)
+}
+
+// updateUserPasswordStatements is UpdateUserPassword's batch, for a caller that
+// must commit the password together with other writes (ResetAdminPassword).
+// No statements for an account that is not live once the credential table is
+// written.
+func updateUserPasswordStatements(ctx context.Context, c *Client, username, passwordHash, now string) ([]Statement, error) {
 	if c.MayWriteCredentialTables() {
 		// The credential row is written only for a LIVE user, matching the
 		// parent UPDATE's guard: resetting a deleted account's password must
 		// not give it a credential.
 		live, err := c.Query(ctx, `SELECT username FROM users WHERE username = ? AND deleted_at IS NULL`, username)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if len(live) == 0 {
-			return nil
+			return nil, nil
 		}
-		return c.ExecuteBatch(ctx, []Statement{
+		return []Statement{
 			{SQL: usersUpdatePasswordSQL, Params: []interface{}{passwordHash, now, username}},
 			{SQL: userCredentialUpsertSQL, Params: []interface{}{username, passwordHash, now}},
-		})
+		}, nil
 	}
-	return c.Execute(ctx, usersUpdatePasswordSQL, passwordHash, now, username)
+	return []Statement{{SQL: usersUpdatePasswordSQL, Params: []interface{}{passwordHash, now, username}}}, nil
 }
 
 const usersUpdatePasswordSQL = `UPDATE users SET password_hash = ?, updated_at = ? WHERE username = ? AND deleted_at IS NULL`
@@ -175,6 +236,25 @@ func DeleteUser(ctx context.Context, c *Client, username string) error {
 	stmts := []Statement{
 		{SQL: `UPDATE users SET deleted_at = ?, updated_at = ? WHERE username = ?`,
 			Params: []interface{}{marker, now, username}},
+	}
+	stmts = append(stmts, clearSecondFactorStatements(username, marker, now)...)
+	stmts = append(stmts, Statement{
+		SQL:    `UPDATE role_bindings SET deleted_at = ?, updated_at = ? WHERE (principal = ? OR principal = ?) AND deleted_at IS NULL`,
+		Params: []interface{}{marker, now, barePrincipal, localPrincipal}})
+	// The account's lifecycle (user_lifecycle) is deliberately LEFT as it is
+	// (t1-auth-review m3): a disabled account that is deleted must not come
+	// back enabled when the admin floor reinstates it or a directory login
+	// re-creates its shadow. Only an explicit CreateUser starts a name afresh
+	// (ResetUserLifecycle).
+	return c.ExecuteBatch(ctx, stmts)
+}
+
+// clearSecondFactorStatements tombstones every second factor, recovery code and
+// both active-set pointers of username: DeleteUser's cascade, and
+// `lv user reset-admin --clear-2fa`. The SQL text is DeleteUser's, so it adds
+// no statement shape.
+func clearSecondFactorStatements(username, marker, now string) []Statement {
+	return []Statement{
 		{SQL: `UPDATE user_2fa SET deleted_at = ?, updated_at = ? WHERE username = ? AND deleted_at IS NULL`,
 			Params: []interface{}{marker, now, username}},
 		{SQL: `UPDATE user_2fa_sets SET deleted_at = ?, updated_at = ? WHERE username = ? AND deleted_at IS NULL`,
@@ -183,15 +263,7 @@ func DeleteUser(ctx context.Context, c *Client, username string) error {
 			Params: []interface{}{marker, now, username}},
 		{SQL: `UPDATE recovery_code_sets SET deleted_at = ?, updated_at = ? WHERE username = ? AND deleted_at IS NULL`,
 			Params: []interface{}{marker, now, username}},
-		{SQL: `UPDATE role_bindings SET deleted_at = ?, updated_at = ? WHERE (principal = ? OR principal = ?) AND deleted_at IS NULL`,
-			Params: []interface{}{marker, now, barePrincipal, localPrincipal}},
 	}
-	// The account's lifecycle goes back to the zero value in the same batch, so
-	// a name deleted and later re-created starts enabled rather than inheriting
-	// a disable meant for the account that was removed. Only once
-	// login_policy_v1 has latched: before that no row can exist to reset.
-	stmts = append(stmts, resetUserLifecycleStatements(c, username, "user.delete", now)...)
-	return c.ExecuteBatch(ctx, stmts)
 }
 
 // InsertToken stores a new API token. scope_paths, when non-empty, is
@@ -218,6 +290,19 @@ func InsertToken(ctx context.Context, c *Client, t TokenRecord) error {
 }
 
 const tokensInsertSQL = `INSERT INTO tokens (id, username, name, token_hash, expires_at, scope_paths, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+
+// TokenLive reports whether token id is unrevoked, unexpired and belongs to a
+// live user: ValidateToken's verdict for a token already matched once.
+func TokenLive(ctx context.Context, c *Client, id string) (bool, error) {
+	rows, err := c.Query(ctx,
+		`SELECT 1 FROM tokens t JOIN users u ON u.username = t.username
+		 WHERE t.id = ? AND t.deleted_at IS NULL AND u.deleted_at IS NULL
+		   AND (t.expires_at IS NULL OR t.expires_at = '' OR t.expires_at > ?)`, id, nowRFC3339())
+	if err != nil {
+		return false, err
+	}
+	return len(rows) > 0, nil
+}
 
 // RevokeToken tombstones a token. updated_at is bumped alongside deleted_at so the
 // revocation wins LWW over a stale peer's still-live copy under anti-entropy.
@@ -266,6 +351,7 @@ func ValidateToken(ctx context.Context, c *Client, rawToken string) (*UserRecord
 			rec := &UserRecord{
 				Username: r.String("username"),
 				Role:     r.String("role"),
+				TokenID:  r.String("id"),
 			}
 			if raw := r.String("scope_paths"); raw != "" {
 				var paths []string
@@ -335,30 +421,45 @@ func looksLikeAPIToken(s string) bool {
 // failure, and it is loud -- the caller logs and audits it. A cluster with no
 // admin is not recoverable through any supported path.
 func ReinstateAdminIfNoneRemain(ctx context.Context, c *Client) (string, error) {
-	live, err := c.Query(ctx,
-		`SELECT username FROM users WHERE role = 'admin' AND deleted_at IS NULL LIMIT 1`)
+	// Counts only admins that can log in (t1-auth-review I4): a disabled or
+	// expired admin is not an administrator anyone can use.
+	usable, err := UsableAdminExists(ctx, c)
 	if err != nil {
 		return "", err
 	}
-	if len(live) > 0 {
+	if usable {
 		return "", nil
 	}
 	// Deterministic across replicas: newest tombstone, then username as the
-	// tiebreak so two deletes sharing a marker still resolve identically.
+	// tiebreak so two deletes sharing a marker still resolve identically. A
+	// tombstone whose account is itself disabled or expired is passed over —
+	// the floor never brings back an account an operator disabled (DeleteUser
+	// keeps the lifecycle; m3), and never re-enables a live one.
 	rows, err := c.Query(ctx,
 		`SELECT u.username, u.password_hash, u.updated_at,
 		        c.username AS cred_key, c.password_hash AS cred_val, c.updated_at AS cred_ts
 		 FROM users u LEFT JOIN user_credentials c ON c.username = u.username AND c.deleted_at IS NULL
 		 WHERE u.role = 'admin' AND u.deleted_at IS NOT NULL
-		 ORDER BY u.deleted_at DESC, u.username ASC LIMIT 1`)
+		 ORDER BY u.deleted_at DESC, u.username ASC`)
 	if err != nil {
 		return "", err
 	}
-	if len(rows) == 0 {
-		return "", nil // no admin ever existed; not this function's problem
+	pick := -1
+	for i, r := range rows {
+		ok, err := usableAdmin(ctx, c, r.String("username"))
+		if err != nil {
+			return "", err
+		}
+		if ok {
+			pick = i
+			break
+		}
 	}
-	victim := rows[0].String("username")
-	hash := resolveCredential(rows[0].String("cred_key") != "", rows[0].String("cred_val"), rows[0].String("password_hash"))
+	if pick < 0 {
+		return "", nil // nothing usable to bring back; the floor raises no_unrestricted_admin
+	}
+	victim := rows[pick].String("username")
+	hash := resolveCredential(rows[pick].String("cred_key") != "", rows[pick].String("cred_val"), rows[pick].String("password_hash"))
 	// The reactivation shape InsertUser already uses, with role and password
 	// written back unchanged. Deliberately NOT a new `SET deleted_at = NULL`
 	// statement: every replicated shape has to be in the compatibility ledger,

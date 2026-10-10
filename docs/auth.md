@@ -210,6 +210,9 @@ account cannot retain access through a lingering binding.
 
 `GrantRole` and `RevokeRole` are open to a cluster admin, and to any caller
 holding `perm.modify` at the binding's path (Proxmox: `Permissions.Modify`).
+The grant has to name it — `perm.modify` or `perm.*` — so an `Admin` (`*`)
+binding on a project means full control of what is under it, but not the
+right to hand out roles there.
 The built-in `PermissionAdmin` role carries it alone, so a project admin is two
 bindings:
 
@@ -232,18 +235,34 @@ grant or revoke is refused, and audited as `denied`, when:
 - **the path is outside the grantor's reach,** including through a sibling
   prefix (`/projects/acme2`), a `.`/`..`/empty segment, or a scoped API token
   whose scope does not cover it.
-- **it would be the principal's first binding, or remove its last.** A
-  principal with no binding is authorized by its legacy role cluster-wide;
-  its first binding ends that, and removing its last restores it. Either
-  changes access outside the delegated path, so only a cluster admin may.
+- **it would be the principal's first binding.** A principal with no binding
+  is authorized by its legacy role cluster-wide; its first binding ends that,
+  which changes its access outside the delegated path, so only a cluster
+  admin may.
+- **it revokes a `NoAccess` sentinel** (below); only a cluster admin removes
+  one.
 - **the principal is not resolvable:** a delegated grant names an existing
   user with its realm (`user:<name>@<realm>`) or a group, never a bare
   `user:<name>`, an unknown user, or an undefined role.
 
+A delegated revoke never empties a principal: in the same write it removes the
+binding and binds `NoAccess` for the same principal at the same path. A
+principal left with no binding at all would fall back to its legacy role
+cluster-wide — a legacy operator pinned to one project would become a
+cluster-wide operator again — and a "not the last binding" check could be beaten
+by two revokes on two nodes before either saw the other. Each revoke leaves its
+own sentinel, so that cannot happen in any order. Every delegated decision reads
+the bindings from the node's database at that moment, not the engine's
+periodically reloaded copy.
+
 A delegated revoke of a binding outside the caller's reach answers exactly as
 for a binding that does not exist. `lv role ls` shows a delegated admin its own
-bindings and those at the paths it administers. A cluster admin who later
-widens a custom role widens every binding of it, delegated ones included.
+bindings and those at the paths it administers. Bindings carry no record of who
+granted them: revoking a delegate's `PermissionAdmin` does not revoke what it
+granted, and a delegate may delegate further within its subtree (as in
+Proxmox). A cluster admin who later widens a custom role widens every binding of
+it, delegated ones included; check `lv role ls --role <role>` before editing
+one.
 
 ## Sessions
 
@@ -334,47 +353,82 @@ To disable a factor: `lv 2fa disable --method totp --label phone`.
 A cluster-wide policy decides which realms must present a second factor:
 
 ```bash
-lv 2fa policy                    # show it
-lv 2fa policy all                # every realm
-lv 2fa policy local,ldap:corp    # only these realms
-lv 2fa policy off                # the default
+lv 2fa policy                                   # show it
+lv 2fa policy all                               # every realm
+lv 2fa policy local,ldap:corp                   # only these realms
+lv 2fa policy off                               # the default
+lv 2fa policy all --allow-self-enroll --enroll-by 2026-11-01T00:00:00Z
+lv 2fa enroll-code bob [--ttl 1h]               # admin: bob's first-enrollment code
+lv 2fa enroll-totp --code <code>                # bob, from an enrollment-only session
 ```
 
 It is a replicated row (the `login_2fa_required` key of `cluster_policies`),
 so every node enforces the same rule. Setting it is admin only, and refused
-until `login_policy_v1` has latched on every host.
+until `login_policy_v1` has latched on every host. A realm the answering node
+does not have configured is set anyway and reported as a warning (a typo such
+as `ldap:crop` covers nothing).
 
+- **A session is full only if its login presented a second factor.** That is
+  recorded when the session is minted (`session_factors`) and read back for
+  the session's whole life; it is never re-derived from the account's factors
+  now. A password-only session stays confined even after a factor is enrolled
+  for the account — by its holder in another session, by an admin, or after a
+  lost-device reset — so whoever held only the password never inherits a full
+  session. A session opened on a node the policy had not reached yet is
+  confined as soon as it arrives.
 - **A covered user with a factor** must present it at every login, through
   every covered realm. The local realm always did this; the policy extends
   it to LDAP and OIDC. An OIDC code is single-use, so through an OIDC realm
-  the TOTP code has to arrive in the same `Login` call as the OIDC code.
-  WebAuthn login is itself a second factor.
-- **A covered user with no factor** is not locked out. Login returns an
-  enrollment-only session (`requires_2fa_enrollment`, no role): it can call
-  `Whoami`, `Logout`, `GetLoginPolicy`, list its factors and enroll one for
-  its own account (`lv 2fa enroll-totp`, or a security key at
-  `/account/2fa`), and every other call is refused. Enrolling ends that
-  session; the next login presents the new factor. The web UI sends such a
-  session to `/account/2fa`.
+  the TOTP code has to arrive in the same `Login` call as the OIDC code. No
+  shipped client (CLI or web UI) drives an OIDC login today, so an OIDC client
+  under a covering policy must send both itself. WebAuthn login is itself a
+  second factor.
+- **A login that presents no factor** gets an enrollment-only session
+  (`requires_2fa_enrollment`, no role): it can call `Whoami`, `Logout` and
+  `GetLoginPolicy`, list its own factors and, if the account has NO factor
+  yet, enroll one for itself (`lv 2fa enroll-totp`, or a security key at
+  `/account/2fa`); every other call, and every stream, is refused. The web UI
+  keeps such a session on `/account/2fa`. An account that already has a
+  factor cannot add one from such a session: log in again presenting it.
+- **The first factor needs an admin-issued code by default.** Anyone holding
+  only the password of an account with no factor could otherwise enroll their
+  own factor and lock the real user out. `lv 2fa enroll-code <user>` mints a
+  single-use code (shown once, stored as a SHA-256, valid for `--ttl`, at most
+  24 hours; issuing another replaces it), handed over out of band. The policy
+  can instead allow self-enrollment until a deadline (`--allow-self-enroll
+  --enroll-by <RFC3339>`); after the deadline a code is needed again, and
+  setting the policy without the flag closes the window. Enrolling ends the
+  enrollment-only session first — if it cannot be ended, nothing is enrolled —
+  and the next login presents the new factor. Every first-factor enrollment
+  from such a session is audited, published and sent as the
+  `auth.first_factor_enrolled` notification, so a claimed account is seen.
 - **It holds from the moment it is set.** Setting it ends every live session
-  in a realm it newly covers, the caller's own included, because a session
-  row does not record whether its login presented a factor. And it is
-  evaluated on every request, so an account whose last factor is removed
-  (`lv 2fa disable`, or an admin's reset for a lost device) is restricted to
-  enrollment at once.
+  in a realm it newly covers, the caller's own included, and open streams end
+  with them.
 - **API tokens are not subject to it.** They are administrator-issued
   automation with no interactive holder; scope them, give them an expiry,
   and revoke them with `lv user token-revoke`.
+- **The distributable `lv-cli` client certificate is not subject to it
+  either**: it authenticates as the cluster admin with no user behind it.
+  Turn on `auth.strict_mtls_identity` (below) so every operator must log in.
 
 A stored value this build does not understand (a later release's) is enforced
-as `all`. A node that cannot read the policy or a user's factors — including
-one whose credential tables a reseed has not repopulated yet — refuses the
-login or request rather than guess.
+as `all`. A node that cannot read the policy, a session's recorded factor, or
+a user's factors — including one whose credential tables a reseed has not
+repopulated yet — refuses the login, request or enrollment rather than guess.
 
-Recovery: the policy can never lock an account out, only ask it to enroll. An
-admin who lost their factor and recovery codes is recovered by another admin
-removing the factor (`lv 2fa disable --user <name> --method totp`), after
-which they enroll a new one at their next login.
+**Recovery.** The policy never locks an account out; it asks it to enroll,
+with a code. A user who lost their factor: an admin removes it (`lv 2fa
+disable --user <name> --method totp`) and issues a code (`lv 2fa enroll-code
+<name>`). The **only** admin who lost their factor and recovery codes: as root
+on a node, `lv user reset-admin --clear-2fa` removes the `admin` account's
+factors and recovery codes, gives it a new password, and prints an enrollment
+code; log in, `lv 2fa enroll-totp --code <code>`, and log in again with the
+new factor. As root on a node, `lv` with no stored session reaches the local
+daemon as local-root, which is admin: `sudo lv 2fa enroll-code admin`, `sudo
+lv user enable <admin>` and `sudo lv 2fa disable --user <admin> --method totp`
+all work there. Move `~/.config/litevirt/credentials.json` (root's) aside
+first, so the call is not made as a stale or disabled session.
 
 ## Account lifecycle (`lv user disable`, `lv user expire`)
 
@@ -385,6 +439,13 @@ lv user expire contractor 2026-12-31T00:00:00Z
 lv user expire contractor never              # clear the expiry
 lv user ls                                   # STATUS and EXPIRES columns
 ```
+
+Names are compared ignoring ASCII case and surrounding spaces at every
+lookup (`ALICE`, `alice ` and `alice` are one account), including the subject
+an LDAP or OIDC login maps to, so a disabled account is not reachable through
+a variant spelling. Two existing accounts that differ only that way are never
+merged: every lookup of either refuses, naming both, until one is renamed or
+deleted. New names are stored trimmed.
 
 A disabled account, or one past its expiry, cannot authenticate by any path:
 password and WebAuthn login through any realm (an LDAP or OIDC user is refused
@@ -399,30 +460,67 @@ someone who presents the account's credentials.
 
 Each attribute is its own replicated row (`user_lifecycle`), so a disable and
 an expiry change made on two nodes never undo each other. A value a node
-cannot read is treated as disabled. Deleting a user resets its lifecycle, so a
-name deleted and re-created starts enabled.
+cannot read is treated as disabled. A disable or an expiry also records the
+instant before which no session of the account is honoured again, so a
+session minted on another node before the disable stays dead after a
+re-enable even if its row arrived late. Deleting a user keeps its disable:
+the admin floor never brings back a disabled admin, and a directory login that
+re-creates a deleted, disabled LDAP or OIDC user's account finds it still
+disabled. An explicit `lv user create` starts the name afresh (enabled, and
+none of a former namesake's sessions honoured).
+
+**Where and when it holds.** Each node judges against its own replica and its
+own clock. A change takes effect on a node when its row arrives there: on the
+node where it was made at once, elsewhere within replication lag — and a node
+cut off from the cluster keeps accepting the account for as long as it is cut
+off. Expiry is compared with each node's wall clock, so a node whose clock runs
+S seconds slow accepts an expired account for S seconds (the LWW skew guard
+bounds how far a clock may drift); `lv user ls` STATUS is the answering
+daemon's verdict by its clock. **Open streams** — consoles, VNC, exec, event
+watches, and the web UI websockets and REST SSE built on them — are re-checked
+while open: one authenticated by a session or API token ends within 5 seconds
+of a disable, an expiry, a session or token revoke, or a policy change reaching
+the node, and at once on the node where the change was made.
 
 Admin only, audited as `user.account`. Refused for the cluster's last admin
-that is enabled with no expiry, and until `login_policy_v1` has latched on
-every host. Two admins restricting each other on two nodes at once can still
-race past that guard; `lv user reset-admin` re-enables the `admin` account,
-and is the documented recovery path.
+that is enabled with no expiry — `lv user delete` applies the same rule — and
+until `login_policy_v1` has latched on every host. Two admins restricting each
+other on two nodes at once can still race past that guard; every node then
+raises the `no_unrestricted_admin` health condition (critical), and the floor
+does NOT re-enable either admin itself. Recovery, as root on a node: `lv user
+reset-admin` re-enables the `admin` account; for an admin with another name,
+`sudo lv user enable <name>` with root's credentials.json moved aside.
 
 **The one credential a disable cannot reach** is the distributable `lv-cli`
 client certificate: it authenticates as the cluster admin with no user behind
 it. Turn on `auth.strict_mtls_identity` (below) so that a disabled operator
 cannot keep acting through it.
 
-### Rolling upgrade
+### Rolling upgrade, and hosts below the latch
 
 `login_policy_v1` is mandatory and replication-gated: every build that has the
 `user_lifecycle` table advertises it, and it latches only once every host the
-cluster replicates to does. Until then `lv user disable|enable|expire` and
-setting `lv 2fa policy` are refused, and nothing is written. A
-previous-release host therefore never receives a statement it cannot decode,
-never holds an account state it would not enforce, and — having no statement
-that names the table — cannot re-enable an account. A binary rolled back below
-the latch enters WAL quarantine and writes nothing.
+cluster replicates to does. Until then `lv user disable|enable|expire`,
+`lv 2fa enroll-code` and setting `lv 2fa policy` are refused, and nothing is
+written. A previous-release host therefore never receives a statement it
+cannot decode, never holds an account state it would not enforce, and —
+having no statement that names the table — cannot re-enable an account.
+
+What a host **below** the latch does and does not enforce, exactly:
+
+- A host on an older build (one admitted after the latch, or one rolled back
+  below it) does not read `user_lifecycle`, `session_factors` or the
+  second-factor policy at all. It does **not** refuse a disabled or expired
+  account's sessions or API tokens, does not confine password-only sessions,
+  and does not cut open streams. The post-latch `unsupported_member` health
+  condition is the signal. Keep such a host out of the client path, or revoke
+  the account's API tokens and sessions, until it is upgraded.
+- A host whose binary is below a token it already latched is in WAL
+  quarantine and writes nothing. From this release on, a quarantined host
+  also **refuses every user credential** — logins, sessions and API tokens,
+  direct or forwarded — and still serves local-root and peer mTLS, which are
+  how it is repaired. A binary older than this release does not have that
+  refusal: it is the case above.
 
 ## Migration from the legacy admin/operator/viewer roles
 

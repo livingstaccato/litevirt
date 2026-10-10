@@ -218,6 +218,29 @@ func (e *Engine) RemoveBinding(id string) {
 	e.removeWhere(func(b corrosion.RoleBindingRecord) bool { return b.ID != id })
 }
 
+// ReplaceBinding drops the binding with id and adds repl, in one snapshot
+// swap, so no reader sees the principal with neither. A delegated revoke uses
+// it for the NoAccess sentinel it leaves.
+func (e *Engine) ReplaceBinding(id string, repl corrosion.RoleBindingRecord) {
+	if e == nil {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	cur := e.snap.Load()
+	if cur == nil {
+		return
+	}
+	kept := make([]corrosion.RoleBindingRecord, 0, len(cur.bindings)+1)
+	for _, b := range cur.bindings {
+		if b.ID != id {
+			kept = append(kept, b)
+		}
+	}
+	kept = append(kept, repl)
+	e.snap.Store(&engineSnapshot{roleVerbs: cur.roleVerbs, bindings: kept})
+}
+
 // RemovePrincipal drops every binding for the given principal from the live
 // snapshot, in memory. DeleteUser uses this (once per resolvable principal
 // form) so a deleted user loses access immediately.
@@ -379,6 +402,80 @@ func (e *Engine) HasAnyBindingExcept(principalIDs []string, exceptID string) boo
 	}
 	for _, b := range snap.bindings {
 		if b.ID != exceptID && pSet[b.Principal] {
+			return true
+		}
+	}
+	return false
+}
+
+// explicitGrantMatches is verbMatches without the broad wildcards: a grant
+// matches verb only when it names it, or names its namespace ("perm.*"). "*",
+// "*.<suffix>" and wildcards spanning namespaces do not. Delegation is checked
+// this way (t1-auth-review I7): an Admin ("*") binding that predates
+// delegation meant "full control of these resources", and must not become
+// "may also hand out any role here" on upgrade.
+func explicitGrantMatches(grants []string, verb string) bool {
+	for _, g := range grants {
+		if g == verb {
+			return true
+		}
+		if strings.HasSuffix(g, ".*") && len(g) > 2 && !strings.Contains(g[:len(g)-2], "*") &&
+			strings.HasPrefix(verb, g[:len(g)-1]) {
+			return true
+		}
+	}
+	return false
+}
+
+// AllowedExplicit is Allowed with explicitGrantMatches: the verb must be
+// granted by name (or namespace) at path, not through "*".
+func (e *Engine) AllowedExplicit(principalIDs []string, verb, path string) bool {
+	if e == nil {
+		return false
+	}
+	snap := e.snap.Load()
+	if snap == nil {
+		return false
+	}
+	path = canonicalPath(path)
+	pSet := make(map[string]bool, len(principalIDs))
+	for _, p := range principalIDs {
+		pSet[p] = true
+	}
+	for _, b := range snap.bindings {
+		if !pSet[b.Principal] {
+			continue
+		}
+		bp := canonicalPath(b.Path)
+		if b.Propagate {
+			if !pathPrefixOf(bp, path) {
+				continue
+			}
+		} else if bp != path {
+			continue
+		}
+		if explicitGrantMatches(snap.roleVerbs[b.Role], verb) {
+			return true
+		}
+	}
+	return false
+}
+
+// HoldsVerbExplicitlyAnywhere is HoldsVerbAnywhere with explicitGrantMatches.
+func (e *Engine) HoldsVerbExplicitlyAnywhere(principalIDs []string, verb string) bool {
+	if e == nil {
+		return false
+	}
+	snap := e.snap.Load()
+	if snap == nil {
+		return false
+	}
+	pSet := make(map[string]bool, len(principalIDs))
+	for _, p := range principalIDs {
+		pSet[p] = true
+	}
+	for _, b := range snap.bindings {
+		if pSet[b.Principal] && explicitGrantMatches(snap.roleVerbs[b.Role], verb) {
 			return true
 		}
 	}

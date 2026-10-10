@@ -8,6 +8,8 @@ import (
 	"strings"
 
 	"github.com/go-ldap/ldap/v3"
+
+	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
 // LDAPConfig describes one LDAP/AD bind. Realm name becomes
@@ -137,7 +139,12 @@ func (r *LDAPRealm) Authenticate(ctx context.Context, creds Credentials) (*Princ
 		}
 	}
 
-	filter := substituteUser(r.cfg.UserFilter, creds.Username)
+	// The directory matches names case-insensitively and ignores surrounding
+	// spaces, so the subject is the normalized name, never the raw input:
+	// otherwise `ALICE` binds as the same directory entry as `alice` and
+	// becomes a different litevirt account (t1-auth-review I2).
+	username := strings.TrimSpace(creds.Username)
+	filter := substituteUser(r.cfg.UserFilter, username)
 	req := ldap.NewSearchRequest(
 		r.cfg.UserBaseDN,
 		ldap.ScopeWholeSubtree, ldap.NeverDerefAliases,
@@ -179,7 +186,7 @@ func (r *LDAPRealm) Authenticate(ctx context.Context, creds Credentials) (*Princ
 	groups = normalizeGroups(groups, r.cfg.GroupNameAttr)
 
 	p := &Principal{
-		Subject: creds.Username, // we use the supplied username as the realm subject
+		Subject: corrosion.NormalizeUsername(username),
 		Realm:   r.Name(),
 		Email:   firstAttr(entry, r.cfg.UserMailAttr),
 		Name:    firstAttr(entry, r.cfg.UserNameAttr),

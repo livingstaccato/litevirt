@@ -36,7 +36,7 @@ func bareEntryPeer(t *testing.T, s *Server) context.Context {
 // enforced cluster-wide.
 func forwardedAs(t *testing.T, s *Server, peer context.Context, user string) context.Context {
 	t.Helper()
-	token, _, _, err := s.mintSession(context.Background(), user, "local", "10.0.0.9", "test")
+	token, _, _, err := s.mintSession(context.Background(), user, "local", "10.0.0.9", "test", "")
 	if err != nil {
 		t.Fatalf("mintSession(%s): %v", user, err)
 	}

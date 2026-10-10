@@ -38,6 +38,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/notify"
 )
 
 // enrollmentOnlyMethods is everything an enrollment-only session may call:
@@ -68,21 +69,64 @@ func gateEnrollmentOnly(ctx context.Context, fullMethod string) error {
 		return nil
 	}
 	return status.Error(codes.PermissionDenied,
-		"the login policy requires a second factor for your account and none is enrolled: "+
-			"enroll one (`lv 2fa enroll-totp`, or Account in the web UI), then log in again")
+		"the login policy requires a second factor and this session's login presented none: "+
+			"log in again with your second factor, or, if you have none yet, enroll one "+
+			"(`lv 2fa enroll-totp --code <code from an admin>`, or Account in the web UI) and then log in again")
+}
+
+// revokeSessionFn is corrosion.RevokeSession, a variable so a test can make it
+// fail (TestC1_FailedRevokeFailsTheEnrollment).
+var revokeSessionFn = corrosion.RevokeSession
+
+// refuseUserBearersInQuarantine refuses every user credential on a node in WAL
+// quarantine: its binary is below a capability the cluster has latched, so it
+// may not enforce what that capability's rows say — a disable, the
+// second-factor policy, a later release's rules. Local-root and peer mTLS are
+// still served; they are how the node is repaired (t1-auth-review I8).
+func (s *Server) refuseUserBearersInQuarantine() error {
+	if s.db == nil {
+		return nil
+	}
+	if reason := s.db.WriteQuarantineReason(); reason != "" {
+		return status.Errorf(codes.Unavailable,
+			"this host is in WAL quarantine (%s) and accepts no user logins, sessions or API tokens; "+
+				"use another node", reason)
+	}
+	return nil
 }
 
 // refuseInactiveAccount fails unless username's account may authenticate now.
-// A read that fails refuses too (Unavailable, retryable): an unreadable
-// lifecycle cannot rule out a disable.
+// username must be the name as stored (corrosion.UserRecord.Username). A read
+// that fails refuses too (Unavailable, retryable): an unreadable lifecycle
+// cannot rule out a disable.
 func (s *Server) refuseInactiveAccount(ctx context.Context, username string) error {
+	_, err := s.accountLifecycle(ctx, username)
+	return err
+}
+
+func (s *Server) accountLifecycle(ctx context.Context, username string) (corrosion.UserLifecycle, error) {
 	life, err := corrosion.GetUserLifecycle(ctx, s.db, username)
 	if err != nil {
-		return status.Errorf(codes.Unavailable,
+		return life, status.Errorf(codes.Unavailable,
 			"could not confirm account %q is active; refusing rather than guessing: %v", username, err)
 	}
 	if reason := life.InactiveReason(time.Now().UTC()); reason != "" {
-		return status.Error(codes.Unauthenticated, reason)
+		return life, status.Error(codes.Unauthenticated, reason)
+	}
+	return life, nil
+}
+
+// refuseInactiveSession is refuseInactiveAccount for a session created at
+// createdAt: it also refuses a session from before the account's last disable
+// or expiry, so re-enabling an account revives none of its old sessions —
+// not even one whose row reached this node after the revocation sweep (m2).
+func (s *Server) refuseInactiveSession(ctx context.Context, username, createdAt string) error {
+	life, err := s.accountLifecycle(ctx, username)
+	if err != nil {
+		return err
+	}
+	if life.SessionPredates(createdAt) {
+		return status.Error(codes.Unauthenticated, "session predates the account's last disable or expiry")
 	}
 	return nil
 }
@@ -100,50 +144,125 @@ func (s *Server) secondFactorRequirement(ctx context.Context, username, realm st
 	if !p.Requires(realm) {
 		return false, false, nil
 	}
-	// An emptied credential table reads as "no factors", which would turn an
-	// enrolled account into an enrollment-only one — and let whoever holds the
-	// password enroll a factor of their own. Same refusal as LocalRealm's.
+	enrolled, err = s.hasSecondFactor(ctx, username)
+	return true, enrolled, err
+}
+
+// hasSecondFactor reports whether username has a factor enrolled, refusing to
+// guess on a node whose credential tables a reseed emptied: an empty user_2fa
+// there would read as "none", and an enrollment-only session could then enroll
+// a factor of its own beside the real one. Same refusal as LocalRealm's.
+func (s *Server) hasSecondFactor(ctx context.Context, username string) (bool, error) {
 	if s.db.CredentialsUnhydrated() {
-		return true, false, errors.New("this node's credential tables are not hydrated yet " +
+		return false, errors.New("this node's credential tables are not hydrated yet " +
 			"(a reseed emptied them); cannot tell whether a second factor is enrolled")
 	}
 	factors, err := corrosion.ListUser2FA(ctx, s.db, username)
 	if err != nil {
-		return true, false, fmt.Errorf("list enrolled second factors for %q: %w", username, err)
+		return false, fmt.Errorf("list enrolled second factors for %q: %w", username, err)
 	}
-	return true, len(factors) > 0, nil
+	return len(factors) > 0, nil
 }
 
-// sessionEnrollOnly reports whether a session through realm is
-// enrollment-only: the policy requires a second factor there and the account
-// has none. Evaluated on every request, so a policy switched on, or a user's
-// last factor removed, restricts a live session at once. A read that fails
-// refuses the request (Unavailable).
-func (s *Server) sessionEnrollOnly(ctx context.Context, username, realm string) (bool, error) {
-	required, enrolled, err := s.secondFactorRequirement(ctx, username, realm)
+// sessionEnrollOnly reports whether session sid, opened through realm, is
+// confined: the policy requires a second factor there, and the session's
+// login did not PRESENT one. That is a fact recorded when the session was
+// minted (session_factors), never re-derived from the account's factors now —
+// re-deriving it let a password-only session become a full one the moment
+// anyone enrolled a factor for the account (t1-auth-review C1). So a confined
+// session is confined for life. Evaluated on every request, so a policy
+// switched on restricts a live session at once. A read that fails refuses the
+// request (Unavailable).
+func (s *Server) sessionEnrollOnly(ctx context.Context, sid, realm string) (bool, error) {
+	p, err := corrosion.GetTwoFactorPolicy(ctx, s.db)
 	if err != nil {
 		return false, status.Errorf(codes.Unavailable,
-			"could not evaluate the second-factor policy for %q; refusing rather than guessing: %v", username, err)
+			"could not read the second-factor policy; refusing rather than guessing: %v", err)
 	}
-	return required && !enrolled, nil
+	if !p.Requires(realm) {
+		return false, nil
+	}
+	factor, err := corrosion.SessionFactor(ctx, s.db, sid)
+	if err != nil {
+		return false, status.Errorf(codes.Unavailable,
+			"could not read what this session's login presented; refusing rather than guessing: %v", err)
+	}
+	return factor == "", nil
 }
 
-// endEnrollmentSession revokes the caller's session when it is enrollment-only
-// and reports whether it did. The session proved a password and nothing else;
-// the factor it just enrolled has not been presented yet, so it does not get
-// to become a full session — the next login presents it.
-func (s *Server) endEnrollmentSession(ctx context.Context) bool {
-	sid := callerSessionID(ctx)
-	if !callerEnrollOnly(ctx) || sid == "" {
-		return false
+// firstEnrollment is what an enrollment from a confined session must clear
+// before anything is written (t1-auth-review C1, I5):
+//
+//   - the account has no factor yet. A confined session of an account that
+//     HAS one proved only the password, and may not add a factor beside the
+//     real one;
+//   - an admin-issued enrollment code, unless the policy's self-enrollment
+//     window is open;
+//   - with commit, the session itself is ended FIRST, and a failure to end it
+//     fails the enrollment: a confined session never outlives the factor it
+//     enrolled, and is never promoted. Then the code is used up.
+//
+// It reports whether the caller is enrolling a first factor from a confined
+// session; false (and nil) for every other caller, whom it leaves alone.
+func (s *Server) firstEnrollment(ctx context.Context, code string, commit bool) (bool, error) {
+	if !callerEnrollOnly(ctx) {
+		return false, nil
 	}
-	if err := corrosion.RevokeSession(ctx, s.db, sid); err != nil {
-		slog.Warn("could not end the enrollment-only session after enrollment; it ends at its expiry",
-			"user", callerUsername(ctx), "error", err)
-		return false
+	user := callerUsername(ctx)
+	has, err := s.hasSecondFactor(ctx, user)
+	if err != nil {
+		return false, status.Errorf(codes.Unavailable, "%v", err)
 	}
-	s.audit(ctx, "auth.enrollment_session_end", callerUsername(ctx), "session="+sid, "ok")
-	return true
+	if has {
+		return false, status.Error(codes.PermissionDenied,
+			"this session's login did not present your second factor, so it cannot enroll another: "+
+				"log in again presenting the one you have")
+	}
+	p, err := corrosion.GetTwoFactorPolicy(ctx, s.db)
+	if err != nil {
+		return false, status.Errorf(codes.Unavailable, "read the second-factor policy: %v", err)
+	}
+	selfOK := p.SelfEnrollOpen(time.Now().UTC())
+	if !selfOK {
+		if err := corrosion.CheckEnrollmentCode(ctx, s.db, user, code); err != nil {
+			s.audit(ctx, "2fa.enroll", user, "first factor without a valid enrollment code", "denied")
+			return false, status.Error(codes.PermissionDenied,
+				"enrolling your first factor needs an enrollment code from an administrator "+
+					"(`lv 2fa enroll-code <user>`): "+err.Error())
+		}
+	}
+	if !commit {
+		return true, nil
+	}
+	if sid := callerSessionID(ctx); sid != "" {
+		if err := revokeSessionFn(ctx, s.db, sid); err != nil {
+			return false, status.Errorf(codes.Unavailable,
+				"could not end this enrollment-only session, so nothing was enrolled: %v", err)
+		}
+		s.kickStreams()
+	}
+	if !selfOK {
+		if err := corrosion.ConsumeEnrollmentCode(ctx, s.db, user, code); err != nil {
+			return false, status.Error(codes.PermissionDenied,
+				"the enrollment code could not be used (used elsewhere, or expired): "+err.Error())
+		}
+	}
+	return true, nil
+}
+
+// noteFirstFactor records a first-factor enrollment from a confined session:
+// an audit row, an event and a notification (auth.first_factor_enrolled), so
+// an account claimed by whoever held only its password does not go unseen.
+func (s *Server) noteFirstFactor(ctx context.Context, method string) {
+	user := callerUsername(ctx)
+	detail := "method=" + method + " from an enrollment-only session"
+	s.audit(ctx, "auth.first_factor_enrolled", user, detail, "ok")
+	s.publish("auth.first_factor_enrolled", user, detail)
+	s.notify(ctx, notify.Notification{
+		Kind: "auth.first_factor_enrolled", Severity: notify.SevWarn, Subject: user,
+		Detail: user + " enrolled a first second factor (" + method + "); if that was not them, " +
+			"remove it (`lv 2fa disable --user " + user + "`) and reset the account's password",
+	})
 }
 
 // loginPolicySettable reports whether this host may write user_lifecycle and
@@ -251,16 +370,31 @@ func (s *Server) SetUserAccount(ctx context.Context, req *pb.SetUserAccountReque
 		ended = s.revokeUserSessions(ctx, user.Username)
 		detail = append(detail, fmt.Sprintf("sessions_ended=%d", ended))
 	}
+	// Open streams of the account are re-checked now, not at the next tick.
+	s.kickStreams()
 	s.audit(ctx, "user.account", user.Username, strings.Join(detail, " "), "ok")
 	s.publish("user.account", user.Username, strings.Join(detail, " "))
 	slog.Info("account state changed", "username", user.Username, "detail", strings.Join(detail, " "),
 		"by", callerUsername(ctx))
 
-	out := &pb.User{Username: user.Username, Role: user.Role, Disabled: next.Disabled, ExpiresAt: next.ExpiresAt}
+	out := &pb.User{Username: user.Username, Role: user.Role, Disabled: next.Disabled, ExpiresAt: next.ExpiresAt,
+		Status: accountStatus(next, time.Now().UTC())}
 	if t, err := time.Parse(time.RFC3339, user.CreatedAt); err == nil {
 		out.CreatedAt = timestamppb.New(t)
 	}
 	return out, nil
+}
+
+// accountStatus is User.status: "active", "disabled" or "expired", judged by
+// this daemon's clock (m1) — the clock every refusal on this node uses.
+func accountStatus(l corrosion.UserLifecycle, now time.Time) string {
+	if l.Disabled || l.Unreadable != "" {
+		return "disabled"
+	}
+	if l.InactiveReason(now) != "" {
+		return "expired"
+	}
+	return "active"
 }
 
 // revokeUserSessions ends every live session of username and returns how many
@@ -292,10 +426,10 @@ func (s *Server) GetLoginPolicy(ctx context.Context, _ *emptypb.Empty) (*pb.Logi
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "read the second-factor policy: %v", err)
 	}
-	return s.loginPolicyPB(p, 0), nil
+	return s.loginPolicyPB(p, 0, nil), nil
 }
 
-func (s *Server) loginPolicyPB(p corrosion.TwoFactorPolicy, revoked int) *pb.LoginPolicy {
+func (s *Server) loginPolicyPB(p corrosion.TwoFactorPolicy, revoked int, warnings []string) *pb.LoginPolicy {
 	v := p.Value
 	if p.Unknown {
 		v = fmt.Sprintf("%s (unknown to this build: enforced as %q)", p.Value, corrosion.TwoFactorPolicyAll)
@@ -308,6 +442,8 @@ func (s *Server) loginPolicyPB(p corrosion.TwoFactorPolicy, revoked int) *pb.Log
 		UpdatedAt:       p.UpdatedAt,
 		Settable:        s.loginPolicySettable(),
 		SessionsRevoked: int32(revoked),
+		SelfEnrollBy:    p.SelfEnrollBy,
+		Warnings:        warnings,
 	}
 }
 
@@ -328,8 +464,42 @@ func (s *Server) SetLoginPolicy(ctx context.Context, req *pb.SetLoginPolicyReque
 		return nil, status.Errorf(codes.InvalidArgument, "invalid policy %q: %v (valid: off, all, or a "+
 			"comma-separated list of realms)", req.GetRequire_2Fa(), err)
 	}
+	// Self-enrollment is the exception and has to be asked for, with an end:
+	// by default a first factor is enrolled only with an admin-issued code
+	// (t1-auth-review I5). Re-setting the policy without the flag closes any
+	// window an earlier change opened.
+	if req.GetAllowSelfEnroll() {
+		by, perr := time.Parse(time.RFC3339, req.GetEnrollBy())
+		if perr != nil {
+			return nil, status.Errorf(codes.InvalidArgument,
+				"--allow-self-enroll needs --enroll-by <RFC3339>, the instant self-enrollment ends: %v", perr)
+		}
+		if !by.After(time.Now()) {
+			return nil, status.Errorf(codes.InvalidArgument, "--enroll-by %s is not in the future", req.GetEnrollBy())
+		}
+		next.SelfEnrollBy = by.UTC().Format(time.RFC3339)
+	} else if req.GetEnrollBy() != "" {
+		return nil, status.Error(codes.InvalidArgument, "--enroll-by needs --allow-self-enroll")
+	}
 	if !s.loginPolicySettable() {
 		return nil, loginPolicyNotLatched()
+	}
+	// A realm named that this node does not have configured covers nothing
+	// here (a typo, or a realm configured elsewhere). Set anyway, and say so.
+	var warnings []string
+	if s.realmRegistry != nil || len(next.Realms) > 0 {
+		known := map[string]bool{"local": true}
+		if s.realmRegistry != nil {
+			for _, n := range s.realmRegistry.Names() {
+				known[n] = true
+			}
+		}
+		for _, r := range next.Realms {
+			if !known[r] {
+				warnings = append(warnings, fmt.Sprintf("realm %q is not configured on %s; the policy covers "+
+					"it only where it is", r, s.hostName))
+			}
+		}
 	}
 	prev, err := corrosion.GetTwoFactorPolicy(ctx, s.db)
 	if err != nil {
@@ -358,12 +528,49 @@ func (s *Server) SetLoginPolicy(ctx context.Context, req *pb.SetLoginPolicyReque
 			revoked++
 		}
 	}
-	detail := fmt.Sprintf("require_2fa=%s previous=%s sessions_ended=%d", next.Value, prev.Value, revoked)
+	s.kickStreams()
+	detail := fmt.Sprintf("require_2fa=%s previous=%s self_enroll_by=%s sessions_ended=%d",
+		next.Value, prev.Value, next.SelfEnrollBy, revoked)
 	s.audit(ctx, "auth.login_policy", corrosion.LoginTwoFactorPolicyKey, detail, "ok")
 	s.publish("auth.login_policy", next.Value, "set by "+callerUsername(ctx))
 	cur, err := corrosion.GetTwoFactorPolicy(ctx, s.db)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "read the policy back: %v", err)
 	}
-	return s.loginPolicyPB(cur, revoked), nil
+	return s.loginPolicyPB(cur, revoked, warnings), nil
+}
+
+// IssueEnrollmentCode mints the single-use, short-lived code with which an
+// enrollment-only session of an account enrolls its first factor (I5). Admin
+// only — local root included, which is how a sole admin whose factor was
+// cleared (`lv user reset-admin --clear-2fa`) gets one. The code is returned
+// once and stored hashed; issuing another replaces it.
+func (s *Server) IssueEnrollmentCode(ctx context.Context, req *pb.IssueEnrollmentCodeRequest) (*pb.IssueEnrollmentCodeResponse, error) {
+	if err := RequireRole(ctx, "admin"); err != nil {
+		return nil, err
+	}
+	ttl := time.Duration(req.GetTtlSeconds()) * time.Second
+	if req.GetTtlSeconds() < 0 || ttl > corrosion.EnrollmentCodeMaxTTL {
+		return nil, status.Errorf(codes.InvalidArgument, "an enrollment code lives between 1 second and %s",
+			corrosion.EnrollmentCodeMaxTTL)
+	}
+	if !s.loginPolicySettable() {
+		return nil, loginPolicyNotLatched()
+	}
+	user, err := corrosion.GetUser(ctx, s.db, req.GetUsername())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "look up user %q: %v", req.GetUsername(), err)
+	}
+	if user == nil {
+		return nil, status.Errorf(codes.NotFound, "user %q not found", req.GetUsername())
+	}
+	code, exp, err := corrosion.IssueEnrollmentCode(ctx, s.db, user.Username, ttl, callerUsername(ctx))
+	if err != nil {
+		if errors.Is(err, corrosion.ErrLoginPolicyGateClosed) {
+			return nil, status.Error(codes.FailedPrecondition, err.Error())
+		}
+		return nil, status.Errorf(codes.Internal, "issue enrollment code: %v", err)
+	}
+	s.audit(ctx, "2fa.enroll_code", user.Username, "expires_at="+exp, "ok")
+	return &pb.IssueEnrollmentCodeResponse{Code: code, ExpiresAt: exp}, nil
 }

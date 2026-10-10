@@ -28,6 +28,7 @@ A notification has a `kind` (verb.noun), `severity` (`info` | `warn` | `error`),
 |---|---|---|
 | `backup.failed` | error | a `lv backup snapshot` / scheduled backup fails |
 | `host.fenced` | error / warn | the failover coordinator fences a host (warn = partial/manual) |
+| `auth.first_factor_enrolled` | warn | an account enrolled its first second factor from an enrollment-only session (mandatory second-factor policy); if it was not the account's owner, remove the factor and reset the password |
 | `replication.failed` | error | a scheduled replication run fails |
 | `ha.vip.no_holder` | error | a configured VIP is served by nobody (VIP HA enabled) — a VIP outage |
 | `ha.vip.demotion_unfenced` | error | a minority node's VIP self-demote failed with no verified self-fence; the majority holds in the safe gap (VIP outage until an operator provides a fence / intervenes) |

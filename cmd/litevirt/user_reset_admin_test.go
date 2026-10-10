@@ -40,7 +40,7 @@ func offlineReset(t *testing.T, db *corrosion.Client, dataDir, pw string) error 
 	if err != nil {
 		t.Fatalf("mintAdminPassword: %v", err)
 	}
-	return resetAdminOffline(context.Background(), db, dataDir, pw, "root", password, hash, io.Discard)
+	return resetAdminOffline(context.Background(), db, dataDir, pw, "root", password, hash, false, io.Discard)
 }
 
 // `lv user reset-admin` must not resurrect a deliberately deleted admin.

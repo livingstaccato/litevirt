@@ -69,14 +69,14 @@ func (s *Server) GrantRole(ctx context.Context, req *pb.GrantRoleRequest) (*pb.G
 	path := req.Path
 	delegated := adminErr != nil
 	if delegated {
-		cpath, err := s.authorizeDelegatedGrant(ctx, req.Path, req.Role, principal, req.Propagate)
+		cpath, cprincipal, err := s.authorizeDelegatedGrant(ctx, req.Path, req.Role, principal, req.Propagate)
 		if err != nil {
 			s.audit(ctx, "role.grant", principal,
 				fmt.Sprintf("role=%s path=%s propagate=%t delegated: %s", req.Role, req.Path, req.Propagate,
 					status.Convert(err).Message()), "denied")
 			return nil, err
 		}
-		path = cpath
+		path, principal = cpath, cprincipal
 	}
 
 	id := mustHexID(16)
@@ -112,7 +112,9 @@ func (s *Server) GrantRole(ctx context.Context, req *pb.GrantRoleRequest) (*pb.G
 //
 // A caller holding perm.modify may revoke a binding at a path it administers,
 // within the rules in role_delegation.go (never a binding carrying more than
-// it holds, never a principal's last binding).
+// it holds, never a sentinel), and its revoke leaves a NoAccess sentinel for
+// the principal at that path, in the same batch, so no sequence of delegated
+// revokes ever empties a principal.
 func (s *Server) RevokeRole(ctx context.Context, req *pb.RevokeRoleRequest) (*pb.RevokeRoleResponse, error) {
 	adminErr := RequireRole(ctx, "admin")
 	if adminErr != nil && !s.callerMayDelegate(ctx) {
@@ -121,7 +123,12 @@ func (s *Server) RevokeRole(ctx context.Context, req *pb.RevokeRoleRequest) (*pb
 	if req.Id == "" {
 		return nil, status.Error(codes.InvalidArgument, "id is required")
 	}
+	var sentinel *corrosion.RoleBindingRecord
 	if adminErr != nil {
+		e, err := s.delegationEngine(ctx)
+		if err != nil {
+			return nil, err
+		}
 		b, err := corrosion.GetRoleBinding(ctx, s.db, req.Id)
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "look up binding: %v", err)
@@ -132,16 +139,28 @@ func (s *Server) RevokeRole(ctx context.Context, req *pb.RevokeRoleRequest) (*pb
 			// it does not administer.
 			return nil, status.Errorf(codes.PermissionDenied, "no binding %q that you may revoke", req.Id)
 		}
-		if _, err := s.authorizeDelegatedPath(ctx, b.Path); err != nil {
+		if _, err := s.authorizeDelegatedPath(ctx, e, b.Path); err != nil {
 			s.audit(ctx, "role.revoke", req.Id, "delegated: "+status.Convert(err).Message(), "denied")
 			return nil, status.Errorf(codes.PermissionDenied, "no binding %q that you may revoke", req.Id)
 		}
-		if err := s.authorizeDelegatedRevoke(ctx, b); err != nil {
+		if err := s.authorizeDelegatedRevoke(ctx, e, b); err != nil {
 			s.audit(ctx, "role.revoke", req.Id, "delegated: "+status.Convert(err).Message(), "denied")
 			return nil, err
 		}
+		sentinel = &corrosion.RoleBindingRecord{
+			ID: mustHexID(16), Path: b.Path, Role: corrosion.SentinelRole, Principal: b.Principal,
+		}
 	}
-	if err := corrosion.DeleteRoleBinding(ctx, s.db, req.Id); err != nil {
+	if sentinel != nil {
+		if err := corrosion.RevokeRoleBindingLeavingSentinel(ctx, s.db, req.Id, *sentinel); err != nil {
+			return nil, status.Errorf(codes.Internal, "delete binding: %v", err)
+		}
+		// In memory too, in the same step as the removal below: the snapshot
+		// must never hold the principal with neither binding.
+		if s.authEngine != nil {
+			s.authEngine.ReplaceBinding(req.Id, *sentinel)
+		}
+	} else if err := corrosion.DeleteRoleBinding(ctx, s.db, req.Id); err != nil {
 		return nil, status.Errorf(codes.Internal, "delete binding: %v", err)
 	}
 	// Apply the revoke to the live engine as an in-memory delta rather than a
@@ -149,13 +168,13 @@ func (s *Server) RevokeRole(ctx context.Context, req *pb.RevokeRoleRequest) (*pb
 	// successful DB re-read (a reload-based revoke that hit a transient failure
 	// would leave the binding enforced). The DB tombstone above makes it
 	// durable and keeps a later reload from resurrecting it.
-	if s.authEngine != nil {
+	if s.authEngine != nil && sentinel == nil {
 		s.authEngine.RemoveBinding(req.Id)
 	}
 	slog.Info("role binding revoked", "id", req.Id, "delegated", adminErr != nil)
 	detail := ""
-	if adminErr != nil {
-		detail = "delegated=true"
+	if sentinel != nil {
+		detail = "delegated=true sentinel=" + sentinel.ID
 	}
 	s.audit(ctx, "role.revoke", req.Id, detail, "ok")
 	return &pb.RevokeRoleResponse{}, nil
@@ -179,7 +198,7 @@ func (s *Server) ListRoleBindings(ctx context.Context, req *pb.ListRoleBindingsR
 		if scopes := callerScopePaths(ctx); len(scopes) > 0 && !pathAllowedByScopes(b.Path, scopes) {
 			return false
 		}
-		return s.authEngine.Allowed(callerPrincipals(ctx), auth.VerbPermModify, b.Path)
+		return s.authEngine.AllowedExplicit(callerPrincipals(ctx), auth.VerbPermModify, b.Path)
 	}
 
 	var rows []corrosion.RoleBindingRecord

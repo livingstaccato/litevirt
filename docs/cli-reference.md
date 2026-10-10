@@ -31,11 +31,15 @@ lv 2fa disable --method totp --label <l>   # Drop a single factor
 lv 2fa ls [--user <name>]                  # List enrolled factors
 lv 2fa policy                              # Show the mandatory second-factor policy
 lv 2fa policy off|all|<realm>[,<realm>...] # Set it (admin); ends sessions in newly covered realms
+  [--allow-self-enroll --enroll-by <RFC3339>] # let a first factor be enrolled without a code until then
+lv 2fa enroll-code <username> [--ttl 1h]   # Admin: single-use first-enrollment code (max 24h)
+lv 2fa enroll-totp --code <code>           # Enroll a first factor from an enrollment-only session
 ```
 
-Under a policy that covers their realm, a user with no factor gets an
-enrollment-only session at login: it can enroll a factor for its own account
-and nothing else, and the enrollment ends it. See `docs/auth.md`,
+Under a policy that covers their realm, a login that presents no factor gets
+an enrollment-only session: if the account has no factor yet it can enroll one
+for itself (with an admin-issued code, unless self-enrollment is open) and
+nothing else, and the enrollment ends it. See `docs/auth.md`,
 "Mandatory second factor".
 
 WebAuthn enrollment is browser-only; use the `/account/2fa` page.
@@ -989,6 +993,7 @@ lv user token-create <username> <token-name> [--expires <RFC3339>]
 lv user token-revoke <token-id>
 lv user reset-admin                # As root on a node: reset the EXISTING admin password (does not create one); audited as user.reset-admin
                                    # It also re-enables a disabled or expired admin account
+lv user reset-admin --clear-2fa    # Also remove the admin's second factors and print an enrollment code
 lv user disable <username>         # No login; sessions ended, sessions and API tokens refused (admin)
 lv user enable <username>          # Re-enable; API tokens work again, ended sessions stay ended (admin)
 lv user expire <username> <RFC3339|never>   # Stop authenticating at that instant; "never" clears it (admin)
@@ -1004,7 +1009,7 @@ no expiry, and until `login_policy_v1` has latched on every host. See
 ```bash
 lv role grant <role> <principal> --path <path> [--propagate]
 lv role revoke <binding-id>
-lv role ls [--principal user:alice]
+lv role ls [--principal user:alice] [--role <role>]
 ```
 
 Principals are `user:<name>` or `group:<name>@<realm>`. Paths are RBAC

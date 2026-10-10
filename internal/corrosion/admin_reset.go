@@ -39,7 +39,17 @@ var ErrNoLiveAdmin = errors.New("no live admin account in this node's local data
 // Nothing is lost by refusing: founding a cluster mints the admin through
 // `lv host init` and the daemon's founder path, and a joined node receives it by
 // replication.
-func ResetAdminPassword(ctx context.Context, c *Client, passwordHash string) error {
+//
+// clearTwoFactor (`--clear-2fa`) also removes every second factor and recovery
+// code of the account: the way back in for a sole admin who lost both under a
+// mandatory second-factor policy. It needs login_policy_v1 latched here, like
+// every other write the login rules make.
+//
+// Everything — the lifecycle re-enable, the factor clear and the password — is
+// ONE batch (t1-auth-review m4): a reset that half-lands would leave the
+// account re-enabled with its old password, or with a new password it still
+// cannot use.
+func ResetAdminPassword(ctx context.Context, c *Client, passwordHash string, clearTwoFactor bool) error {
 	existing, err := GetUser(ctx, c, "admin")
 	if err != nil {
 		// A read that fails must not read as absence.
@@ -48,18 +58,28 @@ func ResetAdminPassword(ctx context.Context, c *Client, passwordHash string) err
 	if existing == nil {
 		return ErrNoLiveAdmin
 	}
+	name := existing.Username
+	now := c.NowTS()
+	var stmts []Statement
+	if clearTwoFactor {
+		if !c.MayWriteLoginPolicy() {
+			return fmt.Errorf("--clear-2fa is refused until login_policy_v1 has latched on this node; " +
+				"nothing was changed")
+		}
+		stmts = append(stmts, clearSecondFactorStatements(name, nowRFC3339(), now)...)
+	}
 	// The recovery path must also recover an admin that cannot log in for a
 	// reason other than its password: a disable or an expiry (user_lifecycle).
 	// Without this, disabling or expiring every administrator — which the
 	// SetUserAccount guard refuses, but two admins on two nodes can still
 	// race into — would leave the cluster with no supported way back in.
-	life, err := GetUserLifecycle(ctx, c, "admin")
+	life, err := GetUserLifecycle(ctx, c, name)
 	if err != nil {
 		return fmt.Errorf("read the admin account's lifecycle: %w", err)
 	}
 	if !life.Unrestricted() {
-		stmts := resetUserLifecycleStatements(c, "admin", "user.reset-admin", c.NowTS())
-		if stmts == nil {
+		enable := enableUserStatements(c, name, "user.reset-admin", now)
+		if enable == nil {
 			// A row exists, so some node has latched login_policy_v1, but this
 			// one has not durably latched it yet. Its own latch follows within a
 			// capability sweep; writing before it would be the one write this
@@ -72,12 +92,15 @@ func ResetAdminPassword(ctx context.Context, c *Client, passwordHash string) err
 				"until login_policy_v1 has latched here; retry in a minute, or run `lv user enable admin` "+
 				"and `lv user expire admin never` from a node where it has", state)
 		}
-		if err := c.ExecuteBatch(ctx, stmts); err != nil {
-			return fmt.Errorf("re-enable the admin account: %w", err)
-		}
+		stmts = append(stmts, enable...)
 	}
-	if err := UpdateUserPassword(ctx, c, "admin", passwordHash); err != nil {
+	pw, err := updateUserPasswordStatements(ctx, c, name, passwordHash, now)
+	if err != nil {
 		return fmt.Errorf("update password: %w", err)
+	}
+	stmts = append(stmts, pw...)
+	if err := c.ExecuteBatch(ctx, stmts); err != nil {
+		return fmt.Errorf("reset the admin account: %w", err)
 	}
 	return nil
 }

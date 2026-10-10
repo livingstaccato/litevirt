@@ -139,6 +139,7 @@ func newUserListCmd() *cobra.Command {
 					}
 					fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", u.Username, u.Role, created,
 						userStatusLabel(u, time.Now()), orDash(u.GetExpiresAt()))
+					// STATUS is the daemon's verdict, by the daemon's clock (m1).
 				}
 				return w.Flush()
 			})
@@ -218,6 +219,10 @@ func newTokenRevokeCmd() *cobra.Command {
 
 // userStatusLabel is the STATUS column of `lv user ls`.
 func userStatusLabel(u *pb.User, now time.Time) string {
+	if st := u.GetStatus(); st != "" {
+		return st
+	}
+	// A daemon that predates User.status: judge it here.
 	if u.GetDisabled() {
 		return "disabled"
 	}

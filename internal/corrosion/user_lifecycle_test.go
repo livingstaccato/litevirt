@@ -2,6 +2,7 @@ package corrosion
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 )
@@ -111,21 +112,13 @@ func TestGetTwoFactorPolicy_NoRowIsOff(t *testing.T) {
 	}
 }
 
-// TestDeleteUser_ResetsLifecycleOnlyWhenWritable: the delete batch carries the
-// reset once the gate is open, and adds no user_lifecycle statement before.
-func TestDeleteUser_ResetsLifecycleOnlyWhenWritable(t *testing.T) {
+// TestDeleteUser_KeepsLifecycle: a delete leaves the account's disable in
+// place (review m3) — the floor or a directory login that brings the name back
+// must not bring it back enabled. ResetUserLifecycle (an explicit CreateUser)
+// is what starts a name afresh.
+func TestDeleteUser_KeepsLifecycle(t *testing.T) {
 	ctx := context.Background()
 	c := lifecycleDB(t)
-	if err := InsertUser(ctx, c, "bob", "viewer", "x"); err != nil {
-		t.Fatal(err)
-	}
-	if err := DeleteUser(ctx, c, "bob"); err != nil {
-		t.Fatal(err)
-	}
-	if rows, _ := c.Query(ctx, `SELECT 1 FROM user_lifecycle`); len(rows) != 0 {
-		t.Fatalf("DeleteUser wrote user_lifecycle with the gate closed")
-	}
-
 	c.SetLoginPolicyGate(func() bool { return true })
 	if err := InsertUser(ctx, c, "bob", "viewer", "x"); err != nil {
 		t.Fatal(err)
@@ -137,8 +130,53 @@ func TestDeleteUser_ResetsLifecycleOnlyWhenWritable(t *testing.T) {
 	if err := DeleteUser(ctx, c, "bob"); err != nil {
 		t.Fatal(err)
 	}
+	if l, err := GetUserLifecycle(ctx, c, "bob"); err != nil || !l.Disabled {
+		t.Fatalf("after delete: %+v %v, want still disabled", l, err)
+	}
+	if err := ResetUserLifecycle(ctx, c, "bob", "admin"); err != nil {
+		t.Fatal(err)
+	}
 	l, err := GetUserLifecycle(ctx, c, "bob")
-	if err != nil || !l.Unrestricted() {
-		t.Fatalf("after delete: %+v %v, want the zero lifecycle", l, err)
+	if err != nil || l.Disabled || l.ExpiresAt != "" || l.SessionsNotBefore == "" {
+		t.Fatalf("after ResetUserLifecycle: %+v %v, want enabled with sessions_not_before set", l, err)
+	}
+	// With the gate closed it refuses rather than leave a peer's disable.
+	c.SetLoginPolicyGate(nil)
+	if err := ResetUserLifecycle(ctx, c, "bob", "admin"); err != ErrLoginPolicyGateClosed {
+		t.Fatalf("gate closed with a row present: %v", err)
+	}
+	if err := ResetUserLifecycle(ctx, c, "nobody", "admin"); err != nil {
+		t.Fatalf("gate closed, nothing to reset: %v", err)
+	}
+}
+
+// TestNormalizeUsername: case and surrounding whitespace, ASCII only.
+func TestNormalizeUsername(t *testing.T) {
+	for in, want := range map[string]string{
+		"Alice": "alice", " alice\t": "alice", "ALICE\n": "alice", "Émile": "Émile", "a b": "a b",
+	} {
+		if got := NormalizeUsername(in); got != want {
+			t.Errorf("NormalizeUsername(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestGetUser_NormalizedAndAmbiguous: a lookup finds the stored spelling,
+// and refuses, naming both, when two accounts normalize alike.
+func TestGetUser_NormalizedAndAmbiguous(t *testing.T) {
+	ctx := context.Background()
+	c := lifecycleDB(t)
+	if err := InsertUser(ctx, c, "alice", "viewer", "x"); err != nil {
+		t.Fatal(err)
+	}
+	u, err := GetUser(ctx, c, " ALICE ")
+	if err != nil || u == nil || u.Username != "alice" {
+		t.Fatalf("GetUser(\" ALICE \") = %+v %v", u, err)
+	}
+	if err := InsertUser(ctx, c, "Alice", "admin", "y"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := GetUser(ctx, c, "alice"); err == nil || !strings.Contains(err.Error(), `"Alice"`) {
+		t.Fatalf("GetUser with two accounts differing in case: %v, want ErrAmbiguousUsername naming both", err)
 	}
 }

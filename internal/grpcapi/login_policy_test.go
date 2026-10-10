@@ -147,7 +147,7 @@ func TestAccountDisable_EveryCredentialStopsWorking(t *testing.T) {
 		t.Errorf("login refusal %q does not say the account is disabled", err)
 	}
 	// FinishWebAuthnLogin's only path to a session.
-	_, _, _, err = s.mintSession(context.Background(), "bob", "local", "10.0.0.9", "webauthn")
+	_, _, _, err = s.mintSession(context.Background(), "bob", "local", "10.0.0.9", "webauthn", "webauthn")
 	wantCode(t, "WebAuthn mint for a disabled account", err, codes.Unauthenticated)
 	// A wrong password still reads as a wrong password: the disabled state is
 	// told only to someone who holds the credential.
@@ -402,7 +402,7 @@ func TestResetAdmin_ReEnablesTheAdminAccount(t *testing.T) {
 	writeLifecycle(t, s, "admin", corrosion.UserAttrDisabled, "true")
 	writeLifecycle(t, s, "admin", corrosion.UserAttrExpiresAt, "2000-01-01T00:00:00Z")
 	hash, _ := bcrypt.GenerateFromPassword([]byte("fresh-password"), auth.BcryptCost)
-	if err := corrosion.ResetAdminPassword(context.Background(), s.db, string(hash)); err != nil {
+	if err := corrosion.ResetAdminPassword(context.Background(), s.db, string(hash), false); err != nil {
 		t.Fatalf("ResetAdminPassword: %v", err)
 	}
 	login(t, s, "admin", "fresh-password")
@@ -411,7 +411,7 @@ func TestResetAdmin_ReEnablesTheAdminAccount(t *testing.T) {
 	// account still cannot use.
 	writeLifecycle(t, s, "admin", corrosion.UserAttrDisabled, "true")
 	s.db.SetLoginPolicyGate(nil)
-	if err := corrosion.ResetAdminPassword(context.Background(), s.db, string(hash)); err == nil ||
+	if err := corrosion.ResetAdminPassword(context.Background(), s.db, string(hash), false); err == nil ||
 		!strings.Contains(err.Error(), "login_policy_v1") {
 		t.Fatalf("ResetAdminPassword with the gate closed on a disabled admin: %v, want a refusal naming login_policy_v1", err)
 	}
@@ -487,7 +487,11 @@ func TestTwoFactorPolicy_UnenrolledUserGetsEnrollmentOnlySession(t *testing.T) {
 	_, err = s.EnrollTOTP(actx, &pb.EnrollTOTPRequest{Username: "root2"})
 	wantCode(t, "enrollment-only admin enrolling another user", err, codes.PermissionDenied)
 
-	enr, err := s.EnrollTOTP(actx, &pb.EnrollTOTPRequest{Label: "phone"})
+	code, err := s.IssueEnrollmentCode(adminCtx(), &pb.IssueEnrollmentCodeRequest{Username: "bob"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	enr, err := s.EnrollTOTP(actx, &pb.EnrollTOTPRequest{Label: "phone", EnrollmentCode: code.GetCode()})
 	if err != nil || !enr.GetSessionEnded() {
 		t.Fatalf("self-enrollment: ended=%v err=%v, want the session ended", enr.GetSessionEnded(), err)
 	}
@@ -508,10 +512,12 @@ func TestTwoFactorPolicy_UnenrolledUserGetsEnrollmentOnlySession(t *testing.T) {
 	}
 }
 
-// TestTwoFactorPolicy_RemovingTheLastFactorRestrictsALiveSession: the policy
-// is evaluated per request, so an account whose factors are removed is
-// restricted at once rather than at its next login.
-func TestTwoFactorPolicy_RemovingTheLastFactorRestrictsALiveSession(t *testing.T) {
+// TestTwoFactorPolicy_SessionIsJudgedByWhatItsLoginPresented: a session is
+// full or confined by what its own login presented, recorded when it was
+// minted, never re-derived from the account's factors now (review C1). One
+// that presented a factor stays full when the factor is later removed (a
+// lost-device reset); the account's next login is confined.
+func TestTwoFactorPolicy_SessionIsJudgedByWhatItsLoginPresented(t *testing.T) {
 	s := loginPolicyServer(t)
 	seedAdmins(t, s)
 	seedUser(t, s, "bob", "operator", "bob-pw")
@@ -530,8 +536,12 @@ func TestTwoFactorPolicy_RemovingTheLastFactorRestrictsALiveSession(t *testing.T
 	if _, err := s.DisableTwoFactor(adminCtx(), &pb.DisableTwoFactorRequest{Username: "bob", Method: "totp", Label: "phone"}); err != nil {
 		t.Fatal(err)
 	}
-	wantCode(t, "the session after its last factor was removed",
-		runUnary(s, bearerCtx(r.Token), "/litevirt.v1.LiteVirt/ListHosts"), codes.PermissionDenied)
+	if err := runUnary(s, bearerCtx(r.Token), "/litevirt.v1.LiteVirt/ListHosts"); err != nil {
+		t.Fatalf("a session that presented a factor, after the factor was removed: %v", err)
+	}
+	if r2 := login(t, s, "bob", "bob-pw"); !r2.GetRequires_2FaEnrollment() {
+		t.Fatalf("the next login after the factor was removed: %+v, want enrollment-only", r2)
+	}
 }
 
 // fakeRealm authenticates any password (or OIDC code) as subject, so a test
@@ -707,9 +717,23 @@ func TestTwoFactorPolicy_UnhydratedCredentialsRefuse(t *testing.T) {
 	seedUser(t, s, "bob", "viewer", "bob-pw")
 	setPolicy(t, s, "all")
 	r := login(t, s, "bob", "bob-pw") // hydrated: enrollment-only
+	code, err := s.IssueEnrollmentCode(adminCtx(), &pb.IssueEnrollmentCodeRequest{Username: "bob"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	s.db.MarkCredentialsUnhydrated()
-	_, err := s.authenticate(bearerCtx(r.Token))
-	wantCode(t, "session on an unhydrated node", err, codes.Unavailable)
+	// The session is judged by what its login presented, which needs no
+	// factor table; it stays confined.
+	wantCode(t, "a confined session on an unhydrated node",
+		runUnary(s, bearerCtx(r.Token), "/litevirt.v1.LiteVirt/ListHosts"), codes.PermissionDenied)
+	// But it may not enroll: an empty user_2fa cannot tell "no factor" from
+	// "factor not here yet".
+	actx, aerr := s.authenticate(bearerCtx(r.Token))
+	if aerr != nil {
+		t.Fatal(aerr)
+	}
+	_, err = s.EnrollTOTP(actx, &pb.EnrollTOTPRequest{Label: "x", EnrollmentCode: code.GetCode()})
+	wantCode(t, "enrollment on an unhydrated node", err, codes.Unavailable)
 	_, err = s.Login(context.Background(), &pb.LoginRequest{Username: "bob", Password: "bob-pw"})
 	if err == nil {
 		t.Fatal("login on an unhydrated node under the policy succeeded")

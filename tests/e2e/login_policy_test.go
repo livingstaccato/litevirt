@@ -119,7 +119,8 @@ func TestLab_DelegatedAdminStaysInItsProject(t *testing.T) {
 		t.Fatalf("delegated grant inside the project on %s: %v\n%s", b, err, out)
 	}
 	rows := l.mustSQL(a, fmt.Sprintf(
-		`SELECT role FROM role_bindings WHERE principal = 'user:%s@local' AND path NOT LIKE '%s%%' AND deleted_at IS NULL`, bob, proj))
+		`SELECT role, path FROM role_bindings WHERE principal = 'user:%s@local' AND path != '%s'
+		   AND path NOT LIKE '%s/%%' AND deleted_at IS NULL`, bob, proj, proj))
 	if len(rows) != 0 {
 		t.Fatalf("bob holds bindings outside %s: %v", proj, rows)
 	}

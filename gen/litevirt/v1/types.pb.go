@@ -4531,8 +4531,11 @@ type User struct {
 	// user_lifecycle). A disabled or expired account cannot log in, and its
 	// sessions and API tokens stop authenticating. expires_at is RFC3339 UTC,
 	// empty for an account that never expires.
-	Disabled      bool   `protobuf:"varint,4,opt,name=disabled,proto3" json:"disabled,omitempty"`
-	ExpiresAt     string `protobuf:"bytes,5,opt,name=expires_at,json=expiresAt,proto3" json:"expires_at,omitempty"`
+	Disabled  bool   `protobuf:"varint,4,opt,name=disabled,proto3" json:"disabled,omitempty"`
+	ExpiresAt string `protobuf:"bytes,5,opt,name=expires_at,json=expiresAt,proto3" json:"expires_at,omitempty"`
+	// status is "active", "disabled" or "expired", judged by the answering
+	// daemon's clock.
+	Status        string `protobuf:"bytes,6,opt,name=status,proto3" json:"status,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -4598,6 +4601,13 @@ func (x *User) GetDisabled() bool {
 func (x *User) GetExpiresAt() string {
 	if x != nil {
 		return x.ExpiresAt
+	}
+	return ""
+}
+
+func (x *User) GetStatus() string {
+	if x != nil {
+		return x.Status
 	}
 	return ""
 }
@@ -6161,7 +6171,7 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\n" +
 	"created_at\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\x12\x12\n" +
 	"\x04type\x18\b \x01(\tR\x04type\x12#\n" +
-	"\rvmstate_bytes\x18\t \x01(\x03R\fvmstateBytes\"\xac\x01\n" +
+	"\rvmstate_bytes\x18\t \x01(\x03R\fvmstateBytes\"\xc4\x01\n" +
 	"\x04User\x12\x1a\n" +
 	"\busername\x18\x01 \x01(\tR\busername\x12\x12\n" +
 	"\x04role\x18\x02 \x01(\tR\x04role\x129\n" +
@@ -6169,7 +6179,8 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"created_at\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\x12\x1a\n" +
 	"\bdisabled\x18\x04 \x01(\bR\bdisabled\x12\x1d\n" +
 	"\n" +
-	"expires_at\x18\x05 \x01(\tR\texpiresAt\"\xd3\x01\n" +
+	"expires_at\x18\x05 \x01(\tR\texpiresAt\x12\x16\n" +
+	"\x06status\x18\x06 \x01(\tR\x06status\"\xd3\x01\n" +
 	"\x05Token\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x1a\n" +
 	"\busername\x18\x02 \x01(\tR\busername\x12\x12\n" +

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"log/slog"
 	"net"
+	"strings"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
@@ -45,6 +46,11 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 	}
 
 	clientIP := throttleClientIP(ctx)
+
+	// A node in WAL quarantine accepts no user login (I8).
+	if err := s.refuseUserBearersInQuarantine(); err != nil {
+		return nil, err
+	}
 
 	// Brute-force lockout: refuse early if this (username, IP) is currently
 	// locked out from too many recent failures. Keyed on the attempted
@@ -106,6 +112,16 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 		}
 	}
 
+	// Every per-account row is keyed on the name as stored, and every lookup
+	// normalizes (corrosion.NormalizeUsername): from here on the subject is
+	// the stored name, so `ALICE` is checked as the account `alice` is (I2).
+	if u, uerr := corrosion.GetUser(ctx, s.db, principal.Subject); uerr != nil {
+		s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" account lookup failed", "denied")
+		return nil, status.Errorf(codes.Internal, "look up account: %v", uerr)
+	} else if u != nil {
+		principal.Subject = u.Username
+	}
+
 	// Account lifecycle: a disabled or expired account gets no session, and
 	// no second-factor prompt either. Checked only after the credentials
 	// verified, so it tells nothing to someone who does not hold them.
@@ -153,7 +169,13 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 	// clear any accumulated failure state for this key.
 	s.loginThrottle.success(throttleKey)
 
-	token, expiresAt, role, err := s.mintSession(ctx, principal.Subject, realmName, clientIP, req.UserAgent)
+	// What this login PRESENTED is recorded on the session (C1): the session
+	// is a full one under the policy only if a factor was presented here.
+	presented := ""
+	if principal.Requires2FA {
+		presented = "totp"
+	}
+	token, expiresAt, role, err := s.mintSession(ctx, principal.Subject, realmName, clientIP, req.UserAgent, presented)
 	if err != nil {
 		return nil, err
 	}
@@ -181,7 +203,11 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 // returns the bearer token, hard-expiry (RFC3339), and the user's role. Shared
 // by password Login and the WebAuthn login flow so both produce identical
 // session semantics.
-func (s *Server) mintSession(ctx context.Context, username, realm, clientIP, userAgent string) (token, expiresAt, role string, err error) {
+//
+// factor is the second factor this login presented ("" for none); it is
+// recorded with the session (corrosion.InsertSessionWithFactor), and the
+// second-factor policy reads it back for the session's whole life.
+func (s *Server) mintSession(ctx context.Context, username, realm, clientIP, userAgent, factor string) (token, expiresAt, role string, err error) {
 	// Fail closed if a reseed ran while these credentials were being checked.
 	// See refuseIfReseedMovedSinceEntry: the interceptor's gate cannot drain a
 	// request that was already inside when the reseed started.
@@ -194,16 +220,20 @@ func (s *Server) mintSession(ctx context.Context, username, realm, clientIP, use
 	}
 	// Every login path ends here, so this is the one check no path can skip —
 	// the WebAuthn login reaches no other.
-	if err := s.refuseInactiveAccount(ctx, username); err != nil {
+	if err := s.refuseUserBearersInQuarantine(); err != nil {
 		return "", "", "", err
 	}
+	if err := s.refuseInactiveAccount(ctx, user.Username); err != nil {
+		return "", "", "", err
+	}
+	username = user.Username
 	id, ierr := newSessionID()
 	if ierr != nil {
 		return "", "", "", status.Errorf(codes.Internal, "generate session id: %v", ierr)
 	}
 	now := time.Now().UTC()
 	exp := now.Add(s.hardExpiry())
-	if serr := corrosion.InsertSession(ctx, s.db, corrosion.SessionRecord{
+	if serr := corrosion.InsertSessionWithFactor(ctx, s.db, corrosion.SessionRecord{
 		ID:         id,
 		Username:   username,
 		Realm:      realm,
@@ -212,7 +242,7 @@ func (s *Server) mintSession(ctx context.Context, username, realm, clientIP, use
 		CreatedAt:  now.Format(time.RFC3339),
 		LastUsedAt: now.Format(time.RFC3339),
 		ExpiresAt:  exp.Format(time.RFC3339),
-	}); serr != nil {
+	}, factor); serr != nil {
 		return "", "", "", status.Errorf(codes.Internal, "store session: %v", serr)
 	}
 	return SessionTokenPrefix + id, exp.Format(time.RFC3339), user.Role, nil
@@ -243,6 +273,7 @@ func (s *Server) Logout(ctx context.Context, _ *emptypb.Empty) (*emptypb.Empty, 
 	if err := corrosion.RevokeSession(ctx, s.db, sid); err != nil {
 		return nil, status.Errorf(codes.Internal, "revoke session: %v", err)
 	}
+	s.kickStreams()
 	slog.Info("user logged out", "username", callerUsername(ctx))
 	s.audit(ctx, "auth.logout", callerUsername(ctx), "session="+sid, "ok")
 	return &emptypb.Empty{}, nil
@@ -259,6 +290,9 @@ func (s *Server) ListSessions(ctx context.Context, req *pb.ListSessionsRequest) 
 	if target != caller {
 		if err := RequireRole(ctx, "admin"); err != nil {
 			return nil, err
+		}
+		if u, err := corrosion.GetUser(ctx, s.db, target); err == nil && u != nil {
+			target = u.Username
 		}
 	}
 	rows, err := corrosion.ListSessionsForUser(ctx, s.db, target)
@@ -302,6 +336,7 @@ func (s *Server) RevokeSession(ctx context.Context, req *pb.RevokeSessionRequest
 	if err := corrosion.RevokeSession(ctx, s.db, req.Id); err != nil {
 		return nil, status.Errorf(codes.Internal, "revoke session: %v", err)
 	}
+	s.kickStreams()
 	slog.Info("session revoked", "id", req.Id, "username", sess.Username, "by", callerUsername(ctx))
 	s.audit(ctx, "session.revoke", sess.Username, "session="+req.Id, "ok")
 	return &emptypb.Empty{}, nil
@@ -317,6 +352,9 @@ func (s *Server) verifyTOTP(ctx context.Context, username, code string) (bool, e
 // code-flow, which carries no username) falls back to IP-only so the bucket
 // is still meaningful.
 func loginThrottleKey(username, ip string) string {
+	// Normalized like every account lookup, so `ALICE` and `alice ` share
+	// alice's bucket instead of each getting a fresh allowance (I2).
+	username = corrosion.NormalizeUsername(username)
 	if username == "" {
 		username = "_anon"
 	}
@@ -336,7 +374,10 @@ func (s *Server) CreateUser(ctx context.Context, req *pb.CreateUserRequest) (*pb
 	if err := RequireRole(ctx, "admin"); err != nil {
 		return nil, err
 	}
-	if req.Username == "" {
+	// Stored trimmed: every lookup ignores surrounding whitespace and ASCII
+	// case (corrosion.NormalizeUsername), so the stored name must too.
+	username := strings.Trim(req.Username, " \t\r\n")
+	if username == "" {
 		return nil, status.Error(codes.InvalidArgument, "username required")
 	}
 	if req.Password == "" {
@@ -347,9 +388,25 @@ func (s *Server) CreateUser(ctx context.Context, req *pb.CreateUserRequest) (*pb
 		role = "viewer"
 	}
 
-	existing, _ := corrosion.GetUser(ctx, s.db, req.Username)
+	existing, gerr := corrosion.GetUser(ctx, s.db, username)
+	if gerr != nil {
+		return nil, status.Errorf(codes.Internal, "look up user %q: %v", username, gerr)
+	}
 	if existing != nil {
-		return nil, status.Errorf(codes.AlreadyExists, "user %q already exists", req.Username)
+		return nil, status.Errorf(codes.AlreadyExists, "user %q already exists (as %q: names are compared "+
+			"ignoring case and surrounding spaces)", username, existing.Username)
+	}
+	// An explicit CreateUser starts the name afresh: enabled, no expiry, and
+	// none of a deleted namesake's sessions honoured. DeleteUser keeps the
+	// lifecycle on purpose (m3), so this is the one place that clears it.
+	// Before inserting, so a refusal leaves nothing behind.
+	if err := corrosion.ResetUserLifecycle(ctx, s.db, username, callerUsername(ctx)); err != nil {
+		if errors.Is(err, corrosion.ErrLoginPolicyGateClosed) {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"%q belonged to an account with a disable or expiry, and this node cannot clear it until "+
+					"login_policy_v1 has latched here; retry shortly or create it on another node", username)
+		}
+		return nil, status.Errorf(codes.Internal, "reset account state of %q: %v", username, err)
 	}
 
 	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), auth.BcryptCost)
@@ -357,15 +414,15 @@ func (s *Server) CreateUser(ctx context.Context, req *pb.CreateUserRequest) (*pb
 		return nil, status.Errorf(codes.Internal, "hash password: %v", err)
 	}
 
-	if err := corrosion.InsertUser(ctx, s.db, req.Username, role, string(hash)); err != nil {
+	if err := corrosion.InsertUser(ctx, s.db, username, role, string(hash)); err != nil {
 		return nil, status.Errorf(codes.Internal, "create user: %v", err)
 	}
 
-	slog.Info("user created", "username", req.Username, "role", role)
-	s.publish("user.created", req.Username, "role="+role)
-	s.audit(ctx, "user.create", req.Username, "role="+role, "ok")
+	slog.Info("user created", "username", username, "role", role)
+	s.publish("user.created", username, "role="+role)
+	s.audit(ctx, "user.create", username, "role="+role, "ok")
 
-	return &pb.User{Username: req.Username, Role: role}, nil
+	return &pb.User{Username: username, Role: role, Status: "active"}, nil
 }
 
 func (s *Server) ListUsers(ctx context.Context, _ *emptypb.Empty) (*pb.ListUsersResponse, error) {
@@ -383,9 +440,11 @@ func (s *Server) ListUsers(ctx context.Context, _ *emptypb.Empty) (*pb.ListUsers
 	}
 
 	resp := &pb.ListUsersResponse{}
+	now := time.Now().UTC()
 	for _, u := range users {
 		life := lifecycles[u.Username]
-		pbUser := &pb.User{Username: u.Username, Role: u.Role, Disabled: life.Disabled, ExpiresAt: life.ExpiresAt}
+		pbUser := &pb.User{Username: u.Username, Role: u.Role, Disabled: life.Disabled, ExpiresAt: life.ExpiresAt,
+			Status: accountStatus(life, now)}
 		if u.CreatedAt != "" {
 			if t, err := time.Parse(time.RFC3339, u.CreatedAt); err == nil {
 				pbUser.CreatedAt = timestamppb.New(t)
@@ -424,23 +483,32 @@ func (s *Server) DeleteUser(ctx context.Context, req *pb.DeleteUserRequest) (*em
 		return nil, status.Errorf(codes.Internal, "look up user %q: %v", req.Username, err)
 	}
 	if target != nil && target.Role == "admin" {
-		other, oerr := corrosion.OtherLiveAdminExists(ctx, s.db, req.Username)
+		// Only an admin that can log in — enabled, with no expiry — counts
+		// as the one that remains (t1-auth-review I4): a disabled successor
+		// is "a live successor that cannot actually log in".
+		other, oerr := corrosion.OtherUnrestrictedAdminExists(ctx, s.db, target.Username)
 		if oerr != nil {
 			return nil, status.Errorf(codes.Internal,
 				"check for another admin before deleting %q: %v", req.Username, oerr)
 		}
 		if !other {
 			return nil, status.Errorf(codes.FailedPrecondition,
-				"user %q is the cluster's last admin account; create another admin first "+
+				"user %q is the cluster's last admin account that is enabled with no expiry; create or "+
+					"enable another admin first "+
 					"(`lv user create <username> --role admin`), or the cluster is left with no "+
 					"administrator",
 				req.Username)
 		}
 	}
 
-	if err := corrosion.DeleteUser(ctx, s.db, req.Username); err != nil {
+	name := req.Username
+	if target != nil {
+		name = target.Username
+	}
+	if err := corrosion.DeleteUser(ctx, s.db, name); err != nil {
 		return nil, status.Errorf(codes.Internal, "delete user: %v", err)
 	}
+	s.kickStreams()
 	// The OtherLiveAdminExists check above and this delete are two independent
 	// operations against replicated state, and nothing makes that pair atomic
 	// across LWW replicas. Two admins, one delete issued on each of two nodes:
@@ -470,8 +538,8 @@ func (s *Server) DeleteUser(ctx context.Context, req *pb.DeleteUserRequest) (*em
 	// the DB tombstone in corrosion.DeleteUser) so access is revoked without
 	// waiting for a reload.
 	if s.authEngine != nil {
-		s.authEngine.RemovePrincipal("user:" + req.Username)
-		s.authEngine.RemovePrincipal("user:" + req.Username + "@local")
+		s.authEngine.RemovePrincipal("user:" + name)
+		s.authEngine.RemovePrincipal("user:" + name + "@local")
 	}
 	slog.Info("user deleted", "username", req.Username)
 	s.publish("user.deleted", req.Username, "")
@@ -531,7 +599,7 @@ func (s *Server) CreateToken(ctx context.Context, req *pb.CreateTokenRequest) (*
 
 	if err := corrosion.InsertToken(ctx, s.db, corrosion.TokenRecord{
 		ID:         id,
-		Username:   req.Username,
+		Username:   user.Username,
 		Name:       req.Name,
 		TokenHash:  string(hash),
 		ExpiresAt:  expiresAt,
@@ -558,6 +626,7 @@ func (s *Server) RevokeToken(ctx context.Context, req *pb.RevokeTokenRequest) (*
 	if err := corrosion.RevokeToken(ctx, s.db, req.Id); err != nil {
 		return nil, status.Errorf(codes.Internal, "revoke token: %v", err)
 	}
+	s.kickStreams()
 	slog.Info("token revoked", "id", req.Id)
 	s.audit(ctx, "token.revoke", req.Id, "", "ok")
 	return &emptypb.Empty{}, nil

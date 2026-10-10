@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"text/tabwriter"
+	"time"
 
 	"github.com/spf13/cobra"
 	"google.golang.org/protobuf/types/known/emptypb"
@@ -68,7 +69,7 @@ func newTwoFactorCmd() *cobra.Command {
 		Use:   "2fa",
 		Short: "Manage two-factor authentication",
 	}
-	cmd.AddCommand(new2FAListCmd(), new2FAEnrollCmd(), new2FADisableCmd(), new2FAPolicyCmd())
+	cmd.AddCommand(new2FAListCmd(), new2FAEnrollCmd(), new2FADisableCmd(), new2FAPolicyCmd(), new2FAEnrollCodeCmd())
 	return cmd
 }
 
@@ -97,14 +98,14 @@ func new2FAListCmd() *cobra.Command {
 }
 
 func new2FAEnrollCmd() *cobra.Command {
-	var username, label string
+	var username, label, code string
 	cmd := &cobra.Command{
 		Use:   "enroll-totp",
 		Short: "Enroll a TOTP authenticator (returns provisioning URL + recovery codes)",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				resp, err := c.EnrollTOTP(ctx, &pb.EnrollTOTPRequest{
-					Username: username, Label: label,
+					Username: username, Label: label, EnrollmentCode: code,
 				})
 				if err != nil {
 					return err
@@ -125,6 +126,39 @@ func new2FAEnrollCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&username, "user", "", "Enroll for another user (admin only); empty = self")
 	cmd.Flags().StringVar(&label, "label", "", "Label for this factor (e.g. phone, yubikey)")
+	cmd.Flags().StringVar(&code, "code", "", "Enrollment code from an administrator (needed for a first factor under the login policy)")
+	return cmd
+}
+
+// new2FAEnrollCodeCmd issues the single-use code a user needs to enroll a first
+// factor from an enrollment-only session.
+func new2FAEnrollCodeCmd() *cobra.Command {
+	var ttl time.Duration
+	cmd := &cobra.Command{
+		Use:   "enroll-code <username>",
+		Short: "Issue a single-use code with which <username> enrolls a first factor (admin)",
+		Long: `Issue a single-use, short-lived enrollment code for <username> (admin only;
+works as root on a node through the local root channel). Under the mandatory
+second-factor policy, a user with no factor gets an enrollment-only session
+and needs this code to enroll one (` + "`lv 2fa enroll-totp --code <code>`" + `),
+unless the policy was set with --allow-self-enroll and its deadline has not
+passed. The code is shown once and stored hashed; issuing another replaces it.
+Hand it over out of band.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				r, err := c.IssueEnrollmentCode(ctx, &pb.IssueEnrollmentCodeRequest{
+					Username: args[0], TtlSeconds: int64(ttl / time.Second),
+				})
+				if err != nil {
+					return err
+				}
+				fmt.Printf("Enrollment code for %s (single use, until %s):\n  %s\n", args[0], r.GetExpiresAt(), r.GetCode())
+				return nil
+			})
+		},
+	}
+	cmd.Flags().DurationVar(&ttl, "ttl", time.Hour, "How long the code is valid (at most 24h)")
 	return cmd
 }
 
@@ -157,7 +191,9 @@ func new2FADisableCmd() *cobra.Command {
 // new2FAPolicyCmd shows or sets the cluster-wide mandatory second-factor
 // policy. One flat subcommand: no argument shows it.
 func new2FAPolicyCmd() *cobra.Command {
-	return &cobra.Command{
+	var allowSelf bool
+	var enrollBy string
+	cmd := &cobra.Command{
 		Use:   "policy [off|all|<realm>[,<realm>...]]",
 		Short: "Show or set the mandatory second-factor policy (admin to set)",
 		Long: `With no argument, show the cluster-wide second-factor policy.
@@ -169,8 +205,11 @@ With one, set it (admin only):
   local,ldap:corp     only the named realms require one
 
 A user in a covered realm with no factor enrolled is not locked out: login
-gives them an enrollment-only session that can enroll a factor
-(` + "`lv 2fa enroll-totp`" + `) and nothing else, and the enrollment ends it.
+gives them an enrollment-only session that can enroll a factor and nothing
+else, and the enrollment ends it. By default enrolling that first factor
+needs a single-use code from an administrator (` + "`lv 2fa enroll-code <user>`" + `).
+--allow-self-enroll --enroll-by <RFC3339> lets users enroll without one until
+the deadline; setting the policy again without the flag closes the window.
 Setting the policy ends every live session in a realm it newly covers,
 your own included. API tokens are not subject to it.
 
@@ -183,7 +222,9 @@ Refused until login_policy_v1 has latched on every host.`,
 				if len(args) == 0 {
 					p, err = c.GetLoginPolicy(ctx, &emptypb.Empty{})
 				} else {
-					p, err = c.SetLoginPolicy(ctx, &pb.SetLoginPolicyRequest{Require_2Fa: args[0]})
+					p, err = c.SetLoginPolicy(ctx, &pb.SetLoginPolicyRequest{
+						Require_2Fa: args[0], AllowSelfEnroll: allowSelf, EnrollBy: enrollBy,
+					})
 				}
 				if err != nil {
 					return err
@@ -191,6 +232,14 @@ Refused until login_policy_v1 has latched on every host.`,
 				fmt.Printf("Second factor required: %s\n", p.GetRequire_2Fa())
 				if p.GetSetBy() != "" {
 					fmt.Printf("Set by:                 %s at %s\n", p.GetSetBy(), p.GetUpdatedAt())
+				}
+				if p.GetSelfEnrollBy() != "" {
+					fmt.Printf("Self-enrollment until:  %s\n", p.GetSelfEnrollBy())
+				} else {
+					fmt.Println("Self-enrollment:        off (a first factor needs `lv 2fa enroll-code`)")
+				}
+				for _, w := range p.GetWarnings() {
+					fmt.Printf("Warning:                %s\n", w)
 				}
 				if !p.GetSettable() {
 					fmt.Println("Not settable here yet:  login_policy_v1 has not latched on every host")
@@ -202,6 +251,10 @@ Refused until login_policy_v1 has latched on every host.`,
 			})
 		},
 	}
+	cmd.Flags().BoolVar(&allowSelf, "allow-self-enroll", false,
+		"let users with no factor enroll their first one without an enrollment code, until --enroll-by")
+	cmd.Flags().StringVar(&enrollBy, "enroll-by", "", "RFC3339 instant self-enrollment ends (with --allow-self-enroll)")
+	return cmd
 }
 
 // shortID truncates session IDs for table output. Full id is required to

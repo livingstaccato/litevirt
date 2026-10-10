@@ -130,6 +130,7 @@ const (
 	LiteVirt_SetUserAccount_FullMethodName             = "/litevirt.v1.LiteVirt/SetUserAccount"
 	LiteVirt_GetLoginPolicy_FullMethodName             = "/litevirt.v1.LiteVirt/GetLoginPolicy"
 	LiteVirt_SetLoginPolicy_FullMethodName             = "/litevirt.v1.LiteVirt/SetLoginPolicy"
+	LiteVirt_IssueEnrollmentCode_FullMethodName        = "/litevirt.v1.LiteVirt/IssueEnrollmentCode"
 	LiteVirt_CreateToken_FullMethodName                = "/litevirt.v1.LiteVirt/CreateToken"
 	LiteVirt_RevokeToken_FullMethodName                = "/litevirt.v1.LiteVirt/RevokeToken"
 	LiteVirt_Whoami_FullMethodName                     = "/litevirt.v1.LiteVirt/Whoami"
@@ -499,6 +500,7 @@ type LiteVirtClient interface {
 	// refused until login_policy_v1 has latched on every host.
 	GetLoginPolicy(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*LoginPolicy, error)
 	SetLoginPolicy(ctx context.Context, in *SetLoginPolicyRequest, opts ...grpc.CallOption) (*LoginPolicy, error)
+	IssueEnrollmentCode(ctx context.Context, in *IssueEnrollmentCodeRequest, opts ...grpc.CallOption) (*IssueEnrollmentCodeResponse, error)
 	CreateToken(ctx context.Context, in *CreateTokenRequest, opts ...grpc.CallOption) (*Token, error)
 	RevokeToken(ctx context.Context, in *RevokeTokenRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// Whoami returns the authenticated caller's identity. Authenticated (NOT in
@@ -2163,6 +2165,16 @@ func (c *liteVirtClient) SetLoginPolicy(ctx context.Context, in *SetLoginPolicyR
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(LoginPolicy)
 	err := c.cc.Invoke(ctx, LiteVirt_SetLoginPolicy_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) IssueEnrollmentCode(ctx context.Context, in *IssueEnrollmentCodeRequest, opts ...grpc.CallOption) (*IssueEnrollmentCodeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(IssueEnrollmentCodeResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_IssueEnrollmentCode_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -4369,6 +4381,7 @@ type LiteVirtServer interface {
 	// refused until login_policy_v1 has latched on every host.
 	GetLoginPolicy(context.Context, *emptypb.Empty) (*LoginPolicy, error)
 	SetLoginPolicy(context.Context, *SetLoginPolicyRequest) (*LoginPolicy, error)
+	IssueEnrollmentCode(context.Context, *IssueEnrollmentCodeRequest) (*IssueEnrollmentCodeResponse, error)
 	CreateToken(context.Context, *CreateTokenRequest) (*Token, error)
 	RevokeToken(context.Context, *RevokeTokenRequest) (*emptypb.Empty, error)
 	// Whoami returns the authenticated caller's identity. Authenticated (NOT in
@@ -5130,6 +5143,9 @@ func (UnimplementedLiteVirtServer) GetLoginPolicy(context.Context, *emptypb.Empt
 }
 func (UnimplementedLiteVirtServer) SetLoginPolicy(context.Context, *SetLoginPolicyRequest) (*LoginPolicy, error) {
 	return nil, status.Error(codes.Unimplemented, "method SetLoginPolicy not implemented")
+}
+func (UnimplementedLiteVirtServer) IssueEnrollmentCode(context.Context, *IssueEnrollmentCodeRequest) (*IssueEnrollmentCodeResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method IssueEnrollmentCode not implemented")
 }
 func (UnimplementedLiteVirtServer) CreateToken(context.Context, *CreateTokenRequest) (*Token, error) {
 	return nil, status.Error(codes.Unimplemented, "method CreateToken not implemented")
@@ -7518,6 +7534,24 @@ func _LiteVirt_SetLoginPolicy_Handler(srv interface{}, ctx context.Context, dec 
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).SetLoginPolicy(ctx, req.(*SetLoginPolicyRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_IssueEnrollmentCode_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(IssueEnrollmentCodeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).IssueEnrollmentCode(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_IssueEnrollmentCode_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).IssueEnrollmentCode(ctx, req.(*IssueEnrollmentCodeRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -11069,6 +11103,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "SetLoginPolicy",
 			Handler:    _LiteVirt_SetLoginPolicy_Handler,
+		},
+		{
+			MethodName: "IssueEnrollmentCode",
+			Handler:    _LiteVirt_IssueEnrollmentCode_Handler,
 		},
 		{
 			MethodName: "CreateToken",

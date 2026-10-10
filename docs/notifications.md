@@ -28,7 +28,10 @@ A notification has a `kind` (verb.noun), `severity` (`info` | `warn` | `error`),
 |---|---|---|
 | `backup.failed` | error | a `lv backup snapshot` / scheduled backup fails |
 | `host.fenced` | error / warn | the failover coordinator fences a host (warn = partial/manual) |
-| `replication.failed` | error | a scheduled replication run fails |
+| `replication.failed` | error (warn when the target host is down) | a scheduled replication run starts failing or fails differently; a continuing failure is repeated at most hourly |
+| `replication.recovered` | info | a replication schedule that was failing replicates again |
+| `replication.suspended` | warn | a replication schedule targets the host its workload now runs on, and the move's switch did not arrive within 15 minutes: it does not replicate there |
+| `replication.replica_set_aside` | warn | a container replica was set aside, not removed: it is not proven to be contained in the data now replicated (`lv replication replicas`) |
 | `replication.reversed` | info | a replicated VM or container moved onto its replica host and its schedule now replicates back to the host it left (docs/backups.md, "Reverse replication") |
 | `replication.reverse_skipped` | warn | the same move, but the host it left could not be made the target; the workload is replicating onto its own host until the schedule is replaced |
 | `host.security_updates` | warn | a host has pending OS security updates (docs/upgrades.md, "Pending OS updates"); sent when the counts change |

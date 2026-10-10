@@ -859,6 +859,10 @@ lv replication schedule add <vm> --target-pool <pool> --cron "0 */4 * * *"
 lv replication schedule ls
 lv replication schedule rm <vm> --target-pool <pool> [--scope ...] [--container] [--pool-name <p>] [--project-name <p>]
 
+# A container's replicas on its replica host; remove the set-aside ones (admin).
+lv replication replicas <container> --target-pool <repo> [--host <h>] [--project-name <p>]
+  [--remove <timestamp>]   # a SET-ASIDE replica to remove (repeatable)
+
 # Disaster recovery: bring a VM up from its replica.
 lv replication promote <vm>
   [--pool <p>] [--host <h>]   # where the replica lives (default: from the VM's schedule)

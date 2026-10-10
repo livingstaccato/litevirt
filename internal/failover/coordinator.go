@@ -3070,6 +3070,11 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 
 		c.audit(ctx, "failover", vm.Name, "rescheduled from "+h.Name+" to "+targetName, "ok")
 		c.noteDiskStranded(ctx, h.Name, vm, targetName)
+		// The VM may now run on its own replica target: replicate back to the
+		// host it left (or leave the schedule suspended, reported by its runs).
+		corrosion.ReverseReplicationAudited(ctx, c.db, "vm", vm.Name, "", h.Name, targetName, func(detail, result string) {
+			c.audit(ctx, "replication.reverse", vm.Name, detail, result)
+		})
 	}
 
 	// Step 6: Relocate containers on the fenced host (B5). Unlike VMs, a
@@ -3341,20 +3346,9 @@ func (c *Coordinator) completeRestore(ctx context.Context, h *corrosion.HostReco
 // becomes the target (corrosion.ReverseReplicationOnMove). Never fails the
 // relocation; a schedule that cannot be re-pointed is audited as skipped.
 func (c *Coordinator) reverseContainerReplication(ctx context.Context, from string, ct corrosion.ContainerRecord, to string) {
-	revs, err := corrosion.ReverseReplicationOnMove(ctx, c.db, "container", ct.Name, ct.Project, from, to)
-	if err != nil {
-		slog.Warn("failover: could not switch a relocated container's replication direction", "container", ct.Name, "error", err)
-		return
-	}
-	for _, r := range revs {
-		if r.Skipped != "" {
-			c.audit(ctx, "replication.reverse", ct.Name,
-				"container relocated "+from+" -> "+to+" onto its own replica target; could not switch replication back: "+r.Skipped, "skipped")
-			continue
-		}
-		c.audit(ctx, "replication.reverse", ct.Name,
-			"container relocated "+from+" -> "+to+": replication now runs "+to+" -> "+r.ToHost+" ("+r.Repo+")", "ok")
-	}
+	corrosion.ReverseReplicationAudited(ctx, c.db, "container", ct.Name, ct.Project, from, to, func(detail, result string) {
+		c.audit(ctx, "replication.reverse", ct.Name, detail, result)
+	})
 }
 
 // imageRecreateOrSkip is the tier-1 path: recreate from a re-pullable image, else
@@ -3740,16 +3734,9 @@ func (c *Coordinator) containerReplicaHost(ctx context.Context, ct corrosion.Con
 	if err != nil {
 		return ""
 	}
-	norm := func(p string) string {
-		if p == "" {
-			return corrosion.DefaultProject
-		}
-		return p
-	}
-	project := norm(ct.Project)
 	for _, r := range rows {
-		if r.Type != "replication" || r.Scope != "container" || !r.Enabled || !r.AutoPromote || r.TargetHost == "" ||
-			r.VMName != corrosion.ContainerScheduleKey(ct.Name) || norm(r.ProjectName) != project {
+		if r.Type != "replication" || !r.Enabled || !r.AutoPromote || r.TargetHost == "" ||
+			!corrosion.ContainerScheduleIs(r, ct.Project, ct.Name) {
 			continue
 		}
 		for _, h := range candidates {

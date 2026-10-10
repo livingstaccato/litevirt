@@ -1478,6 +1478,46 @@ message ProbeContainerBackupsResponse {
     repeated ContainerBackupProbe results = 1;
 }
 
+// ContainerReplica is one scheduled replica of a container, held in a backup
+// repo's replica namespace on the replica host (docs/backups.md, "Container
+// replication").
+message ContainerReplica {
+    string timestamp    = 1;
+    // The host the replica was taken on, and that host's container row's
+    // created_at: one segment of the container's history.
+    string source       = 2;
+    string incarnation  = 3;
+    int64  owner_epoch  = 4;
+    int64  total_size   = 5;
+    // Set aside: superseded by a later replica that is not proven to contain
+    // it. Kept, never promoted automatically, removed only by an operator.
+    bool   set_aside        = 6;
+    string set_aside_reason = 7;
+    string stream       = 8;
+    string owner_id     = 9;
+}
+message ListContainerReplicasRequest {
+    string host    = 1; // the replica host ("" = the receiver)
+    string repo    = 2; // the schedule's target repo on that host
+    string project = 3;
+    string name    = 4;
+}
+message ListContainerReplicasResponse {
+    repeated ContainerReplica replicas = 1;
+}
+message RemoveContainerReplicasRequest {
+    string host    = 1;
+    string repo    = 2;
+    string project = 3;
+    string name    = 4;
+    // The set-aside replicas to remove, by timestamp. A replica that is not
+    // set aside is refused.
+    repeated string timestamps = 5;
+}
+message RemoveContainerReplicasResponse {
+    int32 removed = 1;
+}
+
 message ContainerDetail {
     Container container = 1;
     // privilege is "privileged" or "unprivileged", read from the container's
@@ -3550,6 +3590,11 @@ service LiteVirt {
     rpc ListContainers(ListContainersRequest)   returns (ListContainersResponse);
     rpc InspectContainer(InspectContainerRequest) returns (ContainerDetail);
     rpc ProbeContainerBackups(ProbeContainerBackupsRequest) returns (ProbeContainerBackupsResponse);
+    // A container's scheduled replicas in a repo's replica namespace on one
+    // host: a peer (failover), or a caller who may read its backups.
+    rpc ListContainerReplicas(ListContainerReplicasRequest) returns (ListContainerReplicasResponse);
+    // Remove SET-ASIDE container replicas (admin): the only way one goes.
+    rpc RemoveContainerReplicas(RemoveContainerReplicasRequest) returns (RemoveContainerReplicasResponse);
     rpc PullOCIImage(PullOCIImageRequest)       returns (google.protobuf.Empty);
     rpc BackupContainer(BackupContainerRequest)   returns (stream BackupContainerProgress);
     rpc RestoreContainer(RestoreContainerRequest) returns (stream RestoreContainerProgress);

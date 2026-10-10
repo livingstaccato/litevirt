@@ -16,7 +16,6 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
-	"github.com/litevirt/litevirt/internal/notify"
 	"github.com/litevirt/litevirt/internal/storage"
 	"github.com/litevirt/litevirt/internal/tenancy"
 )
@@ -52,6 +51,17 @@ func (s *Server) RunReplication(ctx context.Context, sched corrosion.BackupSched
 	if vm.HostName != s.hostName {
 		return nil // not ours; the owning host's scheduler handles it
 	}
+	err = s.runVMReplication(ctx, sched, vm, runAt)
+	s.replicationOutcome(ctx, sched, "vm", vm.Name, tenancy.NormalizeProject(vm.Project), sched.TargetHost, sched.TargetPool, "", err)
+	return err
+}
+
+// runVMReplication is one run of a VM's replication schedule on the VM's host.
+// Its outcome is reported by replicationOutcome (transitions only).
+func (s *Server) runVMReplication(ctx context.Context, sched corrosion.BackupScheduleRecord, vm *corrosion.VMRecord, runAt time.Time) error {
+	if err := s.mayReplicateVMAsOwner(ctx, vm); err != nil {
+		return err
+	}
 	unlock := s.lockVM(sched.VMName)
 	defer unlock()
 
@@ -78,7 +88,16 @@ func (s *Server) RunReplication(ctx context.Context, sched corrosion.BackupSched
 	case shared:
 		targetHost = s.hostName
 	case targetHost == s.hostName:
-		// explicit same-host
+		// An explicit target that is the host the VM runs on, on storage only
+		// this host reaches: the replica would sit beside the disk it
+		// protects and be lost with it. That is a VM that moved onto its
+		// replica target; the move switches the schedule to the host it left.
+		// It never runs here (a schedule with no target host still falls back
+		// to a local pool when no peer has one, below). A pool on shared
+		// storage (a mount other hosts reach) is usable from any of them.
+		if !s.poolOnSharedStore(ctx, sched.TargetPool) {
+			return s.suspendedOnOwnTarget(sched, "vm", vm.Name)
+		}
 	case targetHost != "":
 		// explicit peer → cross-host below
 	default:
@@ -143,10 +162,7 @@ func (s *Server) RunReplication(ctx context.Context, sched corrosion.BackupSched
 					"vm", sched.VMName, "pool", sched.TargetPool, "state", vm.State, "error", err)
 				s.recordVMEvent(ctx, sched.VMName, "disk.replicated", "error",
 					fmt.Sprintf("%s: incremental failed (%v) and the full-copy fallback is not point-in-time for a %s VM", sched.TargetPool, err, vm.State))
-				s.notify(ctx, notify.Notification{
-					Kind: "replication.failed", Severity: notify.SevError, Subject: sched.VMName,
-					Detail: fmt.Sprintf("incremental replication to %s failed and was not downgraded to a full copy: %v", sched.TargetPool, err),
-				})
+				// Reported by RunReplication's replicationOutcome, on a transition.
 				return fmt.Errorf("incremental replication of %q failed (%v) and %w", sched.VMName, err, errUnsafeFullCopyFallback)
 			}
 			slog.Warn("incremental replication fell back to full copy",
@@ -215,10 +231,6 @@ func (s *Server) replicateLocalWith(ctx context.Context, sched corrosion.BackupS
 	})
 	if err != nil {
 		s.recordVMEvent(ctx, sched.VMName, "disk.replicated", "error", fmt.Sprintf("%s → %s: %v", src.DiskName, sched.TargetPool, err))
-		s.notify(ctx, notify.Notification{
-			Kind: "replication.failed", Severity: notify.SevError, Subject: sched.VMName,
-			Detail: fmt.Sprintf("%s → %s: %v", src.DiskName, sched.TargetPool, err),
-		})
 		return fmt.Errorf("replicate %s: %w", src.DiskName, err)
 	}
 	// A main-build host promotes only top-level replicas (replica_mirror.go).
@@ -246,6 +258,7 @@ func (s *Server) replicateLocalWith(ctx context.Context, sched corrosion.BackupS
 // replica header), removes the scratch, then prunes that schedule's old
 // replicas on the peer.
 func (s *Server) replicateCrossHost(ctx context.Context, sched corrosion.BackupScheduleRecord, vm *corrosion.VMRecord, src *corrosion.DiskRecord, targetHost, ts string) error {
+	ctx = s.withReplicaOwner(ctx, vm)
 	key := replicaScheduleKey(sched)
 	rec := newReplicaRecord(vm.Project, sched.VMName, src.DiskName, key, ts, "qcow2")
 	// The receiver proves it records replicas BEFORE anything is spent on
@@ -424,6 +437,7 @@ func (s *Server) pruneTopLevelReplicasRemote(ctx context.Context, client pb.Lite
 // checkpoint chain and prunes old replicas. Returns an error to let the caller
 // fall back to a full qcow2 copy.
 func (s *Server) replicateIncremental(ctx context.Context, sched corrosion.BackupScheduleRecord, vm *corrosion.VMRecord, src *corrosion.DiskRecord, targetHost, ts string) error {
+	ctx = s.withReplicaOwner(ctx, vm)
 	key := replicaScheduleKey(sched)
 	// A receiver on an older build keeps main's top-level replicas: the
 	// fork base is the newest of those, and the push is main's.
@@ -435,22 +449,30 @@ func (s *Server) replicateIncremental(ctx context.Context, sched corrosion.Backu
 		}
 		legacy = l
 	}
-	var base string
-	if legacy {
-		base = s.newestLegacyRawReplica(ctx, sched.TargetPool, targetHost, replicaKeyOf(vm, src.DiskName))
-	} else {
-		base = s.newestRawReplica(ctx, sched.TargetPool, targetHost, vm.Project, sched.VMName, src.DiskName, key)
-	}
 	// Read the anchor from the per-VM replication_checkpoints table keyed by the
 	// REAL vm (sched.VMName), NOT sched.LastCheckpoint — for fan-out scopes the
 	// schedule row's vm_name is a sentinel, so sched.LastCheckpoint is always
 	// empty and incremental silently degraded to full copies (bug-sweep #6).
 	parentCP, _ := corrosion.GetReplicationCheckpoint(ctx, s.db, sched.VMName, sched.Repo)
+	// The fork base is the replica the run that created parentCP wrote, and no
+	// other: the dirty extents since parentCP applied to any other file graft
+	// increments onto a base they do not continue, a silently wrong replica.
+	// A checkpoint names its run (replCheckpointName of the run's time), and so
+	// does the replica that run wrote, so the base is chosen by that identity:
+	// not "the newest", which after a reversal or a re-targeted run can be a
+	// replica from another period or another source. No such replica on the
+	// target: a full push.
+	var base string
+	if anchor, ok := checkpointTaken(src.DiskName, parentCP); ok {
+		if legacy {
+			base = s.legacyRawReplicaTakenAt(ctx, sched.TargetPool, targetHost, replicaKeyOf(vm, src.DiskName), legacyReplicaName(sched.VMName, src.DiskName, anchor, "raw"))
+		} else {
+			base = s.rawReplicaTakenAt(ctx, sched.TargetPool, targetHost, vm.Project, sched.VMName, src.DiskName, key, anchor)
+		}
+	}
 	incrCP := ""
-	if base != "" && parentCP != "" {
-		incrCP = parentCP // both a base file and its checkpoint → real incremental
-	} else {
-		base = "" // can't fork safely → full push
+	if base != "" {
+		incrCP = parentCP // the base its own checkpoint continues → real incremental
 	}
 
 	newCP := replCheckpointName(src.DiskName, ts)
@@ -541,18 +563,28 @@ func (s *Server) advanceReplicationCheckpoint(ctx context.Context, vmName, repo,
 	return nil
 }
 
-// newestRawReplica returns the file of the newest raw replica this schedule
-// recorded for (project, vm, disk) in pool on host, or "" if none. It is the
-// fork base for an incremental push, so it is chosen from the VM's own
-// records only — never a file that merely shares a name prefix.
-func (s *Server) newestRawReplica(ctx context.Context, pool, host, project, vm, disk, schedule string) string {
-	best := ""
-	for _, r := range s.replicaRecordsOn(ctx, pool, host, project, vm) { // oldest first
-		if r.Disk == disk && r.Schedule == schedule && r.Format == "raw" {
-			best = r.File
+// rawReplicaTakenAt returns the file of the raw replica this schedule recorded
+// for (project, vm, disk) in pool on host at taken, or "" if there is none. It
+// is the fork base for an incremental push, so it is chosen from the VM's own
+// records only — never a file that merely shares a name prefix — and only the
+// one its checkpoint continues.
+func (s *Server) rawReplicaTakenAt(ctx context.Context, pool, host, project, vm, disk, schedule, taken string) string {
+	for _, r := range s.replicaRecordsOn(ctx, pool, host, project, vm) {
+		if r.Disk == disk && r.Schedule == schedule && r.Format == "raw" && r.Taken == taken {
+			return r.File
 		}
 	}
-	return best
+	return ""
+}
+
+// checkpointTaken is the run time a replication checkpoint names
+// (replCheckpointName), when it is one.
+func checkpointTaken(disk, cp string) (string, bool) {
+	taken, ok := strings.CutPrefix(cp, "lvrepl-"+sanitizeName(disk)+"-")
+	if !ok || !replicaTakenRE.MatchString(taken) {
+		return "", false
+	}
+	return taken, true
 }
 
 // replicaReceiverLegacy reports whether host is on a build that predates
@@ -566,22 +598,21 @@ func (s *Server) replicaReceiverLegacy(ctx context.Context, host, pool, project,
 	return proveReplicaRecords(ctx, client, pool, host, project, vm)
 }
 
-// newestLegacyRawReplica is the newest raw top-level replica of k's disk in
-// pool on host (an older build's: remoteReplicaNames matches it by its exact
+// legacyRawReplicaTakenAt is want when it is a raw top-level replica of k's disk
+// in pool on host (an older build's: remoteReplicaNames matches it by its exact
 // runner name, never one another project's VM could have written), or "".
-func (s *Server) newestLegacyRawReplica(ctx context.Context, pool, host string, k replicaKey) string {
+func (s *Server) legacyRawReplicaTakenAt(ctx context.Context, pool, host string, k replicaKey, want string) string {
 	client, closeConn, err := s.dialPeer(ctx, host)
 	if err != nil {
 		return ""
 	}
 	defer closeConn()
-	best := ""
-	for _, n := range s.remoteReplicaNames(ctx, client, pool, host, k, "", false) { // oldest first
-		if strings.HasSuffix(n, ".raw") {
-			best = n
+	for _, n := range s.remoteReplicaNames(ctx, client, pool, host, k, "", false) {
+		if n == want {
+			return n
 		}
 	}
-	return best
+	return ""
 }
 
 // applyIncrementLocal writes the new raw replica into a same-host pool.
@@ -846,9 +877,16 @@ func (s *Server) pruneTopLevelReplicas(ctx context.Context, dir string, k replic
 	if len(names) <= keep {
 		return 0
 	}
+	backing, berr := s.supersededBacking(ctx)
+	if berr != nil {
+		return 0 // cannot tell what a set-aside copy is layered on: prune nothing
+	}
 	deleted := 0
 	for _, n := range names[:len(names)-keep] {
 		p := filepath.Join(dir, n)
+		if backing.has(p) {
+			continue
+		}
 		if owners, err := s.replicaUsers(ctx, p); err != nil || len(owners) > 0 {
 			continue
 		}
@@ -998,4 +1036,14 @@ func (s *Server) sourceIsShutOff(vm *corrosion.VMRecord) bool {
 		return false
 	}
 	return st.State == "stopped" && st.Reason != "paused" && st.Reason != "pmsuspended"
+}
+
+// poolOnSharedStore reports whether pool's directory here is on storage other
+// hosts mount too (sharedStoreOf), so a replica in it outlives this host.
+func (s *Server) poolOnSharedStore(ctx context.Context, pool string) bool {
+	dir, err := s.replicaPoolDir(ctx, pool)
+	if err != nil {
+		return false
+	}
+	return sharedStoreOf(dir).Shared
 }

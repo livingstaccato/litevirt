@@ -3,6 +3,7 @@ package corrosion
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -69,7 +70,7 @@ func ScheduleKey(scope, vmName, poolName, projectName string) string {
 	case "cluster":
 		return "@cluster"
 	case "container":
-		return ContainerScheduleKey(vmName)
+		return ContainerScheduleKey(projectName, vmName)
 	default:
 		return vmName
 	}
@@ -82,16 +83,56 @@ func ScheduleKey(scope, vmName, poolName, projectName string) string {
 const containerScheduleKeyPrefix = "@ct:"
 
 // ContainerScheduleKey is the vm_name a container-scoped replication schedule is
-// stored under.
-func ContainerScheduleKey(name string) string { return containerScheduleKeyPrefix + name }
+// stored under: "@ct:<project>/<name>". The project is part of the identity
+// because a container name is unique per project, not cluster-wide: keyed by
+// name alone, one project's schedule add would replace another project's
+// schedule of the same name into the same repo. Neither a project nor a
+// container name can contain "/".
+func ContainerScheduleKey(project, name string) string {
+	return containerScheduleKeyPrefix + normalizeProject(project) + "/" + name
+}
 
-// ContainerScheduleName is the container a container-scoped schedule key names;
-// ok is false for any other key.
-func ContainerScheduleName(key string) (name string, ok bool) {
-	if len(key) > len(containerScheduleKeyPrefix) && key[:len(containerScheduleKeyPrefix)] == containerScheduleKeyPrefix {
-		return key[len(containerScheduleKeyPrefix):], true
+// ContainerScheduleName is the container a container-scoped schedule key names.
+// project is "" for the earlier "@ct:<name>" form, whose row records its project
+// only in project_name (ContainerScheduleIs reads both forms). ok is false for
+// any other key.
+func ContainerScheduleName(key string) (project, name string, ok bool) {
+	rest, found := strings.CutPrefix(key, containerScheduleKeyPrefix)
+	if !found || rest == "" {
+		return "", "", false
 	}
-	return "", false
+	if p, n, qualified := strings.Cut(rest, "/"); qualified {
+		if p == "" || n == "" {
+			return "", "", false
+		}
+		return p, n, true
+	}
+	return "", rest, true
+}
+
+// ContainerScheduleIs reports whether r is a container-scoped schedule of the
+// container name in project, in either key form.
+func ContainerScheduleIs(r BackupScheduleRecord, project, name string) bool {
+	if r.Scope != "container" {
+		return false
+	}
+	p, n, ok := ContainerScheduleName(r.VMName)
+	if !ok || n != name {
+		return false
+	}
+	if p == "" {
+		p = r.ProjectName
+	}
+	return normalizeProject(p) == normalizeProject(project)
+}
+
+// ContainerScheduleProject is the project of a container-scoped schedule row,
+// from its key when the key names one and from project_name otherwise.
+func ContainerScheduleProject(r BackupScheduleRecord) string {
+	if p, _, ok := ContainerScheduleName(r.VMName); ok && p != "" {
+		return p
+	}
+	return normalizeProject(r.ProjectName)
 }
 
 // UpsertBackupSchedule creates or replaces a schedule by (vm_name, repo).

@@ -206,3 +206,37 @@ func TestRepairVMOwner_ScopedTokenDenied(t *testing.T) {
 		t.Fatalf("in-scope repair: want allow, got %v", err)
 	}
 }
+
+// A repair moves the VM's ownership onto the host it runs on: a schedule that
+// replicated onto that host replicates back to the host the row named (I2).
+func TestRepairVMOwner_SwitchesReplicationOffTheNewOwner(t *testing.T) {
+	s := testServer(t)
+	s.hostName = "host-a"
+	fake := libvirtfake.New()
+	s.virt = fake
+	ctx := context.Background()
+	if err := corrosion.InsertVM(ctx, s.db,
+		corrosion.VMRecord{Name: "vm1", HostName: "host-b", State: "running", Spec: "{}"}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: "host-b", Address: "10.0.0.2", State: "active"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.UpsertStoragePool(ctx, s.db, corrosion.StoragePoolRecord{HostName: "host-b", Name: "dr", Driver: "local", Target: "/dr", State: "active"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.UpsertBackupSchedule(ctx, s.db, corrosion.BackupScheduleRecord{
+		VMName: "vm1", Scope: "vm", Repo: "dr", Cron: "0 * * * *", Enabled: true,
+		Type: "replication", TargetPool: "dr", TargetHost: "host-a",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fake.SetState("vm1", libvirtfake.StateRunning)
+	if _, err := s.RepairVMOwner(adminCtx(), &pb.RepairVMOwnerRequest{Name: "vm1", Host: "host-a"}); err != nil {
+		t.Fatal(err)
+	}
+	rows, _ := corrosion.ListBackupSchedules(ctx, s.db)
+	if len(rows) != 1 || rows[0].TargetHost != "host-b" {
+		t.Fatalf("after the repair the schedule = %+v, want it to target host-b", rows)
+	}
+}

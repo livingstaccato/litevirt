@@ -99,7 +99,7 @@ func seedContainerRow(t *testing.T, db *corrosion.Client, host, name, project st
 func containerReplSchedule(t *testing.T, db *corrosion.Client, name, project string) {
 	t.Helper()
 	if err := corrosion.UpsertBackupSchedule(context.Background(), db, corrosion.BackupScheduleRecord{
-		VMName: corrosion.ScheduleKey("container", name, "", ""), Scope: "container", ProjectName: project,
+		VMName: corrosion.ScheduleKey("container", name, "", project), Scope: "container", ProjectName: project,
 		Repo: "dr-repo", Cron: "0 2 * * *", Enabled: true, Type: "replication", TargetPool: "dr-repo",
 		TargetHost: "host-b", KeepReplicas: 2,
 	}); err != nil {
@@ -177,5 +177,32 @@ func TestScheduler_ContainerScheduleIsNotAVMSchedule(t *testing.T) {
 	defer repl.mu.Unlock()
 	if len(repl.calls) != 0 {
 		t.Fatalf("the container's schedule ran on the host of a same-named VM: %+v", repl.calls)
+	}
+}
+
+// A shared (pool, project, cluster) replication schedule whose explicit target
+// is this host does not replicate this host's own VMs: the replica would sit
+// beside the disk it protects.
+func TestScheduler_ASharedReplicationScheduleSkipsItsOwnTarget(t *testing.T) {
+	ctx := context.Background()
+	db := newSchedTestDB(t)
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{Name: "vm-on-b", HostName: "host-b", Spec: "{}", State: "running"}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.UpsertBackupSchedule(ctx, db, corrosion.BackupScheduleRecord{
+		VMName: "@cluster", Scope: "cluster", Repo: "dr", Cron: "0 2 * * *", Enabled: true,
+		Type: "replication", TargetPool: "dr", TargetHost: "host-b",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	repl := &recordingReplRunner{}
+	s := NewSnapshotScheduler(db, "host-b", &recordingRunner{})
+	s.ReplRunner = repl
+	s.Now = func() time.Time { return time.Date(2026, 1, 15, 2, 0, 0, 0, time.UTC) }
+	s.Tick(ctx)
+	repl.mu.Lock()
+	defer repl.mu.Unlock()
+	if len(repl.calls) != 0 {
+		t.Fatalf("the target host ran its own VMs into its own pool: %d run(s)", len(repl.calls))
 	}
 }

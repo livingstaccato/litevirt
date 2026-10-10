@@ -53,7 +53,7 @@ func insertReplicationSchedule(t *testing.T, s *Server, vm, pool string) {
 	t.Helper()
 	if err := corrosion.UpsertBackupSchedule(adminCtx(), s.db, corrosion.BackupScheduleRecord{
 		VMName: vm, Scope: "vm", Repo: pool, Cron: "0 0 * * *", Enabled: true,
-		Type: "replication", TargetPool: pool, TargetHost: s.hostName, KeepReplicas: 2,
+		Type: "replication", TargetPool: pool, KeepReplicas: 2, // no peer has it: the local pool
 	}); err != nil {
 		t.Fatal(err)
 	}

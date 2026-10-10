@@ -3,9 +3,13 @@ package grpcapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -14,8 +18,10 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/notify"
 	"github.com/litevirt/litevirt/internal/pbsstore"
+	"github.com/litevirt/litevirt/internal/safename"
 	"github.com/litevirt/litevirt/internal/scheduler"
 	"github.com/litevirt/litevirt/internal/tenancy"
 )
@@ -25,19 +31,38 @@ import (
 // A container's data is a rootfs directory on one host. Replicating it is the
 // container half of what a VM schedule does for a disk: on a cron schedule the
 // owning host archives the container (frozen, point-in-time) and streams the
-// result to a peer, which keeps the newest keep_replicas of them. Transport is
-// the one container backups, migrations and failover relocations already use: the
-// content-addressed chunk store, so a run sends only the chunks the peer does not
-// hold (an unchanged container costs almost nothing, and a reversed direction
-// never resends what the other side still has).
+// result to a peer. Transport is the one container backups, migrations and
+// failover relocations already use: the content-addressed chunk store, so a run
+// sends only the chunks the peer does not hold. A replica archive is cut into
+// content-defined chunks (pbsstore/cdc.go), so a file that grew in the middle of
+// the rootfs costs the chunks around it, not the rest of the archive.
 //
-// A replica is a backup manifest in a repo on the TARGET host, marked with a
-// containerReplicaMark. Promotion is not a second recovery path: when the host
-// holding the container is fenced, the failover coordinator restores it through
-// the ordinary restore-relocation, with the same proof, recovery claim and
-// single-use token, preferring the newest replica on the target host (see
-// RestoreContainerFromBackup). A replica is inert data, never a second running
-// copy, so "one copy at every moment" is the relocation's property, unchanged.
+// WHERE A REPLICA LIVES. In its own namespace, never among backups: a separate
+// chunk store under the target repo (<repo>/.ct-replicas/<project>), named on
+// the wire "ct-replicas:<project>:<repo>". Backup retention, `keep_last`, a
+// backup restore's search and a repo prune never see it. A build that predates
+// the namespace does not resolve that name, so it refuses a push rather than
+// mixing a replica into a backup repo.
+//
+// WHAT A REPLICA IS. A manifest carrying a containerReplicaMark: the stream, the
+// host it was taken on, that host's row incarnation (the container row's
+// created_at, unique per row) and owner epoch, and the container's provenance
+// chain: the points of its own history its current data descends from
+// (replicaBase). A replica becomes a live copy only through failover promotion
+// (RestoreContainerFromBackup), with the same proof, recovery claim and single-use
+// token as a restore from backup; RestoreContainer refuses any other restore of
+// a replica.
+//
+// NEVER LOSING THE NEWEST COPY. A run never deletes a replica it cannot prove is
+// contained in the data it carries. Within one segment of the container's
+// history (one host, one row incarnation) replicas are snapshots of one linear
+// history, so keep_replicas trims the oldest of them. A replica of another
+// segment goes only when the new replica's provenance chain names a point of
+// that segment at or after it was taken. Anything else is SET ASIDE: kept,
+// marked, reported once, never promoted automatically, and removed only by an
+// operator (`lv replication replicas --remove`). That is the failover that did
+// not restore from the replica: the restored container's chain does not reach
+// the replica, so its newer data is never pruned by the next run.
 
 // containerReplicaMark is carried in the manifest's embedded spec.
 type containerReplicaMark struct {
@@ -45,16 +70,109 @@ type containerReplicaMark struct {
 	Stream string `json:"stream"`
 	// Source is the host that produced the replica.
 	Source string `json:"source"`
-	// Epoch is the container's ownership generation (owner_epoch) when it was
-	// taken. A relocation mints the next one, so a replica of the old owner's
-	// data is recognisably an earlier generation whatever the clocks say.
+	// Incarnation is the source host's container row's created_at: with Source,
+	// it names one segment of the container's history.
+	Incarnation string `json:"incarnation,omitempty"`
+	// Epoch is that row's owner_epoch when the replica was taken.
 	Epoch int64 `json:"epoch"`
-	// Keep is how many replicas of this stream the target retains (0 = all).
+	// Keep is how many replicas of this segment the target retains (0 = all).
 	Keep int `json:"keep,omitempty"`
+	// Bases is the container's provenance chain when the replica was taken
+	// (replicaBase).
+	Bases []replicaBase `json:"bases,omitempty"`
 }
 
-// ContainerReplicaStream is the stream name for a schedule's target repo.
+// replicaBase is one point of a container's history its current data descends
+// from: the archive (replica, migration or backup) of segment (Source,
+// Incarnation) taken at Taken that a restore laid down. Every replica of that
+// segment taken at or before Taken is contained in the current data.
+type replicaBase struct {
+	Source      string `json:"source"`
+	Incarnation string `json:"incarnation"`
+	Taken       string `json:"taken"`
+}
+
+// maxReplicaBases bounds a provenance chain; the oldest points drop off, which
+// only ever costs a proof (a replica set aside instead of removed).
+const maxReplicaBases = 16
+
+// containerReplicaStream is the stream name for a schedule's target repo.
 func containerReplicaStream(repo string) string { return "ct-replica:" + repo }
+
+// ctReplicaRepoPrefix marks a wire repo name as a replica namespace.
+const ctReplicaRepoPrefix = "ct-replicas:"
+
+// ctReplicaDir is the namespace's directory under its base repo.
+const ctReplicaDir = ".ct-replicas"
+
+// containerReplicaRepo is the wire name of project's replica namespace in repo.
+func containerReplicaRepo(project, repo string) string {
+	return ctReplicaRepoPrefix + tenancy.NormalizeProject(project) + ":" + repo
+}
+
+// parseReplicaRepo splits a replica namespace's wire name. ok is false for any
+// other name.
+func parseReplicaRepo(name string) (project, repo string, ok bool) {
+	rest, found := strings.CutPrefix(name, ctReplicaRepoPrefix)
+	if !found {
+		return "", "", false
+	}
+	project, repo, found = strings.Cut(rest, ":")
+	if !found || repo == "" || safename.ValidateName(project) != nil {
+		return "", "", false
+	}
+	return project, repo, true
+}
+
+// replicaNamespacePath is project's replica namespace under a base repo path.
+func replicaNamespacePath(basePath, project string) string {
+	return filepath.Join(basePath, ctReplicaDir, project)
+}
+
+// lookupRepoPath resolves a logical backup repo name in this host's config or
+// the cluster registry.
+func (s *Server) lookupRepoPath(ctx context.Context, name string) (string, bool) {
+	if p, ok := s.backupRepos[name]; ok {
+		return p, true
+	}
+	if s.db != nil {
+		if p, err := corrosion.GetBackupRepoPath(ctx, s.db, name); err == nil && p != "" {
+			return p, true
+		}
+	}
+	return "", false
+}
+
+// openReplicaNamespace opens (create: or initialises) the replica namespace a
+// wire name names, refusing a base repo this host cannot resolve or one that is
+// encrypted (a peer push stores plaintext chunks).
+func (s *Server) openReplicaNamespace(ctx context.Context, wire string, create bool) (*pbsstore.Repo, error) {
+	project, repoName, ok := parseReplicaRepo(wire)
+	if !ok {
+		return nil, status.Errorf(codes.InvalidArgument, "%q is not a replica namespace", wire)
+	}
+	base, ok := s.lookupRepoPath(ctx, repoName)
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "unknown backup repo %q", repoName)
+	}
+	if br, err := pbsstore.Open(base); err != nil {
+		return nil, status.Errorf(codes.NotFound, "open repo %q: %v", repoName, err)
+	} else if br.IsEncrypted() {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"backup repo %q is encrypted, and a replica namespace in it would hold plaintext chunks; use a plaintext repo as the replica target", repoName)
+	}
+	path := replicaNamespacePath(base, project)
+	if r, err := pbsstore.Open(path); err == nil {
+		return r, nil
+	} else if !create {
+		return nil, status.Errorf(codes.NotFound, "repo %q holds no replicas of project %q", repoName, project)
+	}
+	r, err := pbsstore.Init(path)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "create replica namespace in %q: %v", repoName, err)
+	}
+	return r, nil
+}
 
 func replicaMarkOf(m *pbsstore.Manifest) *containerReplicaMark {
 	if m == nil || m.DiskName != containerBackupDisk || m.ContainerSpecJSON == "" {
@@ -76,7 +194,10 @@ func manifestSpec(m *pbsstore.Manifest) (containerBackupSpec, bool) {
 }
 
 // sameReplicaStream reports whether other is a replica of the same container
-// lineage in the same stream as m (both already known to carry marks).
+// lineage in the same stream as m (both already known to carry marks). A
+// manifest that records no owner_id is NOT of a lineage that records one: a
+// container deleted and re-created under the same name is another container,
+// and an old lineage's replicas must neither block nor be pruned by its runs.
 func sameReplicaStream(m, other *pbsstore.Manifest) bool {
 	a, b := replicaMarkOf(m), replicaMarkOf(other)
 	if a == nil || b == nil || a.Stream != b.Stream {
@@ -87,8 +208,7 @@ func sameReplicaStream(m, other *pbsstore.Manifest) bool {
 	if tenancy.NormalizeProject(sa.Project) != tenancy.NormalizeProject(sb.Project) {
 		return false
 	}
-	oa, ob := corrosion.DecodeCreateSpec(sa.CreateSpec).OwnerID, corrosion.DecodeCreateSpec(sb.CreateSpec).OwnerID
-	return oa == "" || ob == "" || oa == ob
+	return corrosion.DecodeCreateSpec(sa.CreateSpec).OwnerID == corrosion.DecodeCreateSpec(sb.CreateSpec).OwnerID
 }
 
 func manifestTime(m *pbsstore.Manifest) time.Time {
@@ -97,6 +217,28 @@ func manifestTime(m *pbsstore.Manifest) time.Time {
 		return time.Time{}
 	}
 	return t
+}
+
+// sameSegment reports whether two marks were taken in one segment of the
+// container's history: one host, one row incarnation. A mark that records no
+// incarnation (an earlier build's) is in no known segment.
+func sameSegment(a, b *containerReplicaMark) bool {
+	return a.Incarnation != "" && a.Source == b.Source && a.Incarnation == b.Incarnation
+}
+
+// containedIn reports whether the replica (mark pm, taken at taken) is proven
+// contained in data whose provenance chain is bases: a point of the replica's
+// own segment at or after it.
+func containedIn(pm *containerReplicaMark, taken string, bases []replicaBase) bool {
+	if pm.Incarnation == "" {
+		return false
+	}
+	for _, b := range bases {
+		if b.Source == pm.Source && b.Incarnation == pm.Incarnation && timestampAtOrBefore(taken, b.Taken) {
+			return true
+		}
+	}
+	return false
 }
 
 // replicaPeers returns the other replicas in repo of m's stream and lineage.
@@ -121,16 +263,40 @@ func replicaPeers(ctx context.Context, repo *pbsstore.Repo, m *pbsstore.Manifest
 var errStaleReplica = status.Error(codes.FailedPrecondition,
 	"push-backup: refusing a container replica older than one this repo already holds")
 
-// admitContainerReplica runs on the TARGET before a replica's manifest is
-// written. It refuses a replica that is older than one already held: an earlier
-// ownership generation (a previous owner's data arriving after the container was
-// relocated), or, within one generation and source host, an older timestamp. The
-// newer copy is never replaced by an older one. Anything that is not a replica
-// passes untouched.
-func admitContainerReplica(ctx context.Context, repo *pbsstore.Repo, m *pbsstore.Manifest) error {
+// admitContainerReplica runs on the TARGET before a manifest pushed into a
+// repo is written. A replica namespace takes replicas only, and a replica goes
+// only to a replica namespace. A replica is refused when:
+//   - the peer pushing it is not the host it says it was taken on;
+//   - this host's own view says that host may not be the container's owner: it
+//     is fenced or gone, or the container's live row is on another host, is
+//     another incarnation, or has moved past the replica's owner epoch (a stale
+//     or fenced source never adds a promotable copy);
+//   - a replica with its timestamp is already held (a replica is never replaced);
+//   - it is proven older than a replica already held: an earlier one of the same
+//     segment, or one a held replica's provenance chain contains.
+//
+// caller is the pushing peer's certificate CN.
+func (s *Server) admitContainerReplica(ctx context.Context, repo *pbsstore.Repo, m *pbsstore.Manifest, namespace bool, caller string) error {
 	mark := replicaMarkOf(m)
-	if mark == nil {
+	switch {
+	case mark == nil && namespace:
+		return status.Error(codes.InvalidArgument, "push-backup: a replica namespace holds container replicas only")
+	case mark == nil:
 		return nil
+	case !namespace:
+		return status.Error(codes.InvalidArgument,
+			"push-backup: a container replica goes to its replica namespace, never among backups")
+	}
+	if caller != "" && caller != mark.Source {
+		return status.Errorf(codes.PermissionDenied,
+			"push-backup: a replica taken on %q pushed by %q", mark.Source, caller)
+	}
+	spec, _ := manifestSpec(m)
+	if err := s.replicaSourceIsOwner(ctx, mark, tenancy.NormalizeProject(spec.Project), m.VMName); err != nil {
+		return err
+	}
+	if existing, err := repo.GetManifest(m.VMName, m.Timestamp, containerBackupDisk); err == nil && existing != nil {
+		return status.Errorf(codes.AlreadyExists, "push-backup: a replica of %s taken at %s is already held", m.VMName, m.Timestamp)
 	}
 	peers, err := replicaPeers(ctx, repo, m)
 	if err != nil {
@@ -138,43 +304,124 @@ func admitContainerReplica(ctx context.Context, repo *pbsstore.Repo, m *pbsstore
 	}
 	for i := range peers {
 		pm := replicaMarkOf(&peers[i])
-		switch {
-		case pm.Epoch > mark.Epoch:
+		if sameSegment(pm, mark) && manifestTime(&peers[i]).After(manifestTime(m)) {
 			return errStaleReplica
-		case pm.Epoch == mark.Epoch && pm.Source == mark.Source && manifestTime(&peers[i]).After(manifestTime(m)):
+		}
+		if containedIn(mark, m.Timestamp, pm.Bases) {
 			return errStaleReplica
 		}
 	}
 	return nil
 }
 
+// replicaSourceIsOwner checks, against this host's own replica of the cluster
+// state, that the host a replica was taken on may still be the container's
+// owner. A container this host has no live row for is not judged (its view may
+// lag the push); the owner's own checks and promotion's segment match cover it.
+func (s *Server) replicaSourceIsOwner(ctx context.Context, mark *containerReplicaMark, project, name string) error {
+	if s.db == nil {
+		return nil
+	}
+	h, err := corrosion.GetHost(ctx, s.db, mark.Source)
+	if err != nil {
+		return status.Errorf(codes.Unavailable, "push-backup: read host %q: %v", mark.Source, err)
+	}
+	if h == nil || h.State == "fenced" || h.State == "removed" {
+		return status.Errorf(codes.FailedPrecondition,
+			"push-backup: refusing a replica from %q: that host is fenced or not a cluster member here", mark.Source)
+	}
+	cts, err := corrosion.ListContainers(ctx, s.db, "")
+	if err != nil {
+		return status.Errorf(codes.Unavailable, "push-backup: read containers: %v", err)
+	}
+	for _, ct := range cts {
+		if ct.Name != name || tenancy.NormalizeProject(ct.Project) != project {
+			continue
+		}
+		switch {
+		case ct.HostName != mark.Source:
+			return status.Errorf(codes.FailedPrecondition,
+				"push-backup: refusing a replica of %s from %q: the container's row here is on %q", name, mark.Source, ct.HostName)
+		case mark.Incarnation != "" && ct.CreatedAt != "" && ct.CreatedAt != mark.Incarnation:
+			return status.Errorf(codes.FailedPrecondition,
+				"push-backup: refusing a replica of %s from %q: it was taken from an earlier incarnation of the row", name, mark.Source)
+		case ct.OwnerEpoch > mark.Epoch:
+			return status.Errorf(codes.FailedPrecondition,
+				"push-backup: refusing a replica of %s from %q at owner epoch %d: the row here is at %d", name, mark.Source, mark.Epoch, ct.OwnerEpoch)
+		}
+	}
+	return nil
+}
+
+// setAsideRecord is the sidecar that marks a replica set aside.
+type setAsideRecord struct {
+	Timestamp    string `json:"timestamp"`
+	Reason       string `json:"reason"`
+	SupersededBy string `json:"superseded_by"`
+	At           string `json:"at"`
+}
+
+func setAsidePath(repo *pbsstore.Repo, name, ts string) string {
+	return filepath.Join(repo.Root(), "set-aside", name, strings.ReplaceAll(ts, ":", "-")+".json")
+}
+
+func readSetAside(repo *pbsstore.Repo, name, ts string) (setAsideRecord, bool) {
+	b, err := os.ReadFile(setAsidePath(repo, name, ts))
+	if err != nil {
+		return setAsideRecord{}, false
+	}
+	var r setAsideRecord
+	if json.Unmarshal(b, &r) != nil {
+		return setAsideRecord{}, false
+	}
+	return r, true
+}
+
 // settleContainerReplicas runs on the TARGET after a replica's manifest is
-// written. It removes the replicas the new one supersedes: every earlier
-// ownership generation, and, within one generation, another source host's (the
-// container moved, and the new host's replica is the current one). It then keeps
-// the newest Keep of the same generation and source. Only replicas of the same
-// stream and lineage are ever touched: never a backup, never another container's.
-// Chunks are reclaimed by the repo's own GC. Best-effort: a failure leaves extra
-// replicas, never fewer than were pushed.
-func settleContainerReplicas(ctx context.Context, repo *pbsstore.Repo, m *pbsstore.Manifest) {
+// written. Within the new replica's segment it keeps the newest Keep. A replica
+// of another segment that the new one's provenance chain contains is removed;
+// any other is set aside (setAsideRecord) and returned, the first time only, so
+// the caller reports it once. Only replicas of the same stream and lineage are
+// touched. Chunks are reclaimed by the namespace's GC. Best-effort: a failure
+// leaves extra replicas, never fewer.
+func settleContainerReplicas(ctx context.Context, repo *pbsstore.Repo, m *pbsstore.Manifest) (setAside []pbsstore.Manifest) {
 	mark := replicaMarkOf(m)
 	if mark == nil {
-		return
+		return nil
 	}
 	peers, err := replicaPeers(ctx, repo, m)
 	if err != nil {
 		slog.Warn("container replica: read replicas to settle", "container", m.VMName, "error", err)
-		return
+		return nil
 	}
-	var del []pbsstore.Manifest
-	var same []pbsstore.Manifest
+	var del, same []pbsstore.Manifest
 	for i := range peers {
 		pm := replicaMarkOf(&peers[i])
 		switch {
-		case pm.Epoch < mark.Epoch, pm.Epoch == mark.Epoch && pm.Source != mark.Source:
-			del = append(del, peers[i])
-		case pm.Epoch == mark.Epoch:
+		case sameSegment(pm, mark):
 			same = append(same, peers[i])
+		case containedIn(pm, peers[i].Timestamp, mark.Bases):
+			del = append(del, peers[i])
+		default:
+			if _, already := readSetAside(repo, m.VMName, peers[i].Timestamp); already {
+				continue
+			}
+			rec := setAsideRecord{
+				Timestamp: peers[i].Timestamp, SupersededBy: m.Timestamp, At: time.Now().UTC().Format(time.RFC3339),
+				Reason: fmt.Sprintf("a replica taken on %s is not proven to be contained in the container's data now replicated from %s; kept until removed",
+					pm.Source, mark.Source),
+			}
+			b, _ := json.Marshal(rec)
+			p := setAsidePath(repo, m.VMName, peers[i].Timestamp)
+			if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
+				slog.Warn("container replica: record set-aside", "container", m.VMName, "error", err)
+				continue
+			}
+			if err := os.WriteFile(p, b, 0o640); err != nil {
+				slog.Warn("container replica: record set-aside", "container", m.VMName, "error", err)
+				continue
+			}
+			setAside = append(setAside, peers[i])
 		}
 	}
 	if mark.Keep > 0 {
@@ -184,24 +431,89 @@ func settleContainerReplicas(ctx context.Context, repo *pbsstore.Repo, m *pbssto
 			del = append(del, same[keepOthers:]...)
 		}
 	}
-	if len(del) == 0 {
+	if len(del) > 0 {
+		if err := pbsstore.ApplyPrune(repo, pbsstore.PrunePlan{Delete: del}); err != nil {
+			slog.Warn("container replica: prune", "container", m.VMName, "error", err)
+		}
+		if _, err := pbsstore.GC(ctx, repo); err != nil {
+			slog.Warn("container replica: gc", "container", m.VMName, "error", err)
+		}
+	}
+	return setAside
+}
+
+// containerBases is the container's provenance chain on this host: the one its
+// last restore here recorded (recordContainerBases), when that restore laid
+// down THIS row incarnation. Anything else (no record, or a record of an
+// earlier row) proves nothing, and nil is the safe answer: it only costs a
+// replica set aside instead of removed.
+func (s *Server) containerBases(rec *corrosion.ContainerRecord) []replicaBase {
+	b, err := os.ReadFile(s.containerBasesPath(rec.Project, rec.Name))
+	if err != nil {
+		return nil
+	}
+	var f containerBasesFile
+	if json.Unmarshal(b, &f) != nil || f.Incarnation == "" || f.Incarnation != rec.CreatedAt {
+		return nil
+	}
+	return f.Bases
+}
+
+// containerBasesFile is a container's provenance chain, host-local.
+type containerBasesFile struct {
+	Incarnation string        `json:"incarnation"`
+	Bases       []replicaBase `json:"bases"`
+}
+
+func (s *Server) containerBasesPath(project, name string) string {
+	return filepath.Join(s.dataDir, "ct-provenance", tenancy.NormalizeProject(project), name+".json")
+}
+
+// recordContainerBases records, after a restore laid down row incarnation
+// incarnation of project/name from an archive with spec taken at taken, the
+// container's provenance chain: that archive's own point, then the chain it
+// carried. Best-effort: a missing record only costs proofs.
+func (s *Server) recordContainerBases(project, name, incarnation string, spec containerBackupSpec, taken string) {
+	if safename.ValidateName(tenancy.NormalizeProject(project)) != nil {
 		return
 	}
-	if err := pbsstore.ApplyPrune(repo, pbsstore.PrunePlan{Delete: del}); err != nil {
-		slog.Warn("container replica: prune", "container", m.VMName, "error", err)
+	var bases []replicaBase
+	if spec.Source != "" && spec.Incarnation != "" {
+		bases = append(bases, replicaBase{Source: spec.Source, Incarnation: spec.Incarnation, Taken: taken})
+	}
+	bases = append(bases, spec.Bases...)
+	if len(bases) > maxReplicaBases {
+		bases = bases[:maxReplicaBases]
+	}
+	path := s.containerBasesPath(project, name)
+	b, _ := json.Marshal(containerBasesFile{Incarnation: incarnation, Bases: bases})
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+		slog.Warn("container restore: record provenance", "container", name, "error", err)
+		return
+	}
+	if err := os.WriteFile(path, b, 0o640); err != nil {
+		slog.Warn("container restore: record provenance", "container", name, "error", err)
 	}
 }
 
+// errReplicationSuspended is a run that did not replicate because the workload
+// runs on its own replica target: the replica would protect nothing. It is never
+// a success.
+var errReplicationSuspended = errors.New("replication suspended")
+
 // runContainerReplication is RunReplication for a container-scoped schedule: it
 // archives the container (frozen while it runs) into a local staging repo and
-// streams the manifest to the schedule's target host's repo, where the target
+// streams the manifest to the target host's replica namespace, where the target
 // applies admitContainerReplica and settleContainerReplicas.
 func (s *Server) runContainerReplication(ctx context.Context, sched corrosion.BackupScheduleRecord, runAt time.Time) (retErr error) {
-	name, ok := corrosion.ContainerScheduleName(sched.VMName)
+	keyProject, name, ok := corrosion.ContainerScheduleName(sched.VMName)
 	if !ok {
 		return fmt.Errorf("replication schedule %q is not a container schedule", sched.VMName)
 	}
-	project := tenancy.NormalizeProject(sched.ProjectName)
+	project := tenancy.NormalizeProject(keyProject)
+	if keyProject == "" {
+		project = tenancy.NormalizeProject(sched.ProjectName)
+	}
 	cts, err := corrosion.ListContainers(ctx, s.db, s.hostName)
 	if err != nil {
 		return fmt.Errorf("list containers: %w", err)
@@ -217,27 +529,28 @@ func (s *Server) runContainerReplication(ctx context.Context, sched corrosion.Ba
 		return nil // not ours; the owning host's scheduler runs it
 	}
 	repoName, target := sched.TargetPool, sched.TargetHost
+	var detail string
 	defer func() {
-		if retErr != nil {
-			s.audit(ctx, "ct.replicate", name, "project="+project+" → "+repoName+"@"+target, "error")
-			s.notify(ctx, notify.Notification{
-				Kind: "replication.failed", Severity: notify.SevError, Subject: name,
-				Detail: fmt.Sprintf("container %s → %s@%s: %v", name, repoName, target, retErr),
-			})
-		}
+		s.replicationOutcome(ctx, sched, "container", name, project, target, repoName, detail, retErr)
 	}()
+	if err := s.containerReplicationGate(ctx); err != nil {
+		return err
+	}
 	if repoName == "" || target == "" {
 		return fmt.Errorf("container replication of %q needs a target host and a target repo", name)
 	}
 	if target == s.hostName {
-		return fmt.Errorf("replica target %q is the host the container runs on, so the replica protects nothing; re-target the schedule (it follows a moved container on its own after a migrate or failover)", target)
+		return s.suspendedOnOwnTarget(sched, "container", name)
+	}
+	if err := s.mayReplicateAsOwner(ctx, rec); err != nil {
+		return err
 	}
 	th, err := corrosion.GetHost(ctx, s.db, target)
 	if err != nil {
 		return fmt.Errorf("look up target host %q: %w", target, err)
 	}
 	if th == nil || th.State != "active" {
-		return fmt.Errorf("replica target host %q is not active", target)
+		return &replTargetDownError{host: target}
 	}
 	if !corrosion.HostRunsContainers(*th) {
 		return fmt.Errorf("replica target host %q cannot run containers (%s is not true), so a replica there could never be promoted", target, corrosion.LabelLXCCapable)
@@ -271,18 +584,67 @@ func (s *Server) runContainerReplication(ctx context.Context, sched corrosion.Ba
 	}
 
 	mark := &containerReplicaMark{
-		Stream: containerReplicaStream(repoName), Source: s.hostName,
-		Epoch: rec.OwnerEpoch, Keep: sched.KeepReplicas,
+		Stream: containerReplicaStream(repoName), Source: s.hostName, Incarnation: rec.CreatedAt,
+		Epoch: rec.OwnerEpoch, Keep: sched.KeepReplicas, Bases: s.containerBases(rec),
 	}
 	manifest, err := s.archiveContainerAs(ctx, staging, rec, runAt.UTC().Format(time.RFC3339), mark, func(pbsstore.PushProgress) {})
 	if err != nil {
 		return fmt.Errorf("archive container: %w", err)
 	}
-	if err := s.pushManifestToPeerRepo(ctx, target, repoName, staging, manifest); err != nil {
+	if err := s.pushManifestToPeerRepo(ctx, target, containerReplicaRepo(project, repoName), staging, manifest); err != nil {
+		if status.Code(err) == codes.Unavailable {
+			return &replTargetDownError{host: target, err: err}
+		}
 		return fmt.Errorf("push replica to %s: %w", target, err)
 	}
-	s.audit(ctx, "ct.replicate", name, fmt.Sprintf("project=%s → %s@%s @ %s", project, repoName, target, manifest.Timestamp), "ok")
+	detail = fmt.Sprintf("project=%s → %s@%s @ %s", project, repoName, target, manifest.Timestamp)
 	return nil
+}
+
+// mayReplicateAsOwner refuses a run on a host that may no longer be the
+// container's owner: one that has self-fenced, lost the execution gate, is not
+// an active member in its own view, or whose on-disk owner-epoch marker says
+// its row is behind the runtime it holds. The target checks again on receipt
+// against its own view (replicaSourceIsOwner); this keeps a stale host from
+// even archiving.
+func (s *Server) mayReplicateAsOwner(ctx context.Context, rec *corrosion.ContainerRecord) error {
+	if reason, refused := s.execGateForAction(ctx, false); refused {
+		return fmt.Errorf("this host may not act as the container's owner now (%s)", reason)
+	}
+	if h, err := corrosion.GetHost(ctx, s.db, s.hostName); err == nil && h != nil && h.State != "active" && h.State != "maintenance" {
+		return fmt.Errorf("this host is %s, not an active member, so it does not replicate", h.State)
+	}
+	if s.containersRoot != "" {
+		if marker, found, err := health.ReadContainerOwnerEpochMarker(s.containersRoot, rec.Name); err == nil && found && marker > rec.OwnerEpoch {
+			return fmt.Errorf("the container's owner-epoch marker here (%d) is ahead of its row (%d); this host's view is not current", marker, rec.OwnerEpoch)
+		}
+	}
+	return nil
+}
+
+// containerReplicationGateFn opens the container_replication release feature.
+// Nil refuses.
+type containerReplicationGateFn func(ctx context.Context) error
+
+// SetContainerReplicationGate wires the gate container replication schedules,
+// runs and reversals go through (containerReplicationGate).
+func (s *Server) SetContainerReplicationGate(fn func(ctx context.Context) error) {
+	s.ctReplGate = fn
+}
+
+// containerReplicationGate is the one place container replication asks whether
+// the cluster may use it: feature container_replication of the release token
+// (capabilities.Feature, health.Checker.RequireFeature). Every host must run a
+// build that understands a container schedule row, a replica namespace and the
+// reversal's statement, or an older daemon would skip the row silently, keep
+// replicas without pruning, or delete the wrong schedule. Until the release-token
+// mechanism is wired here, nothing opens it: it refuses.
+func (s *Server) containerReplicationGate(ctx context.Context) error {
+	if s.ctReplGate == nil {
+		return status.Error(codes.FailedPrecondition,
+			"container replication needs every host on a release that has it (release feature container_replication); the cluster upgrade must finish first")
+	}
+	return s.ctReplGate(ctx)
 }
 
 // ctReplica is a promotable replica of a container, held by a host.
@@ -299,58 +661,213 @@ func (s *Server) containerReplicationSchedules(ctx context.Context, name, projec
 	}
 	var out []corrosion.BackupScheduleRecord
 	for _, r := range rows {
-		if r.Type != "replication" || r.Scope != "container" || r.VMName != corrosion.ContainerScheduleKey(name) {
-			continue
+		if r.Type == "replication" && corrosion.ContainerScheduleIs(r, project, name) {
+			out = append(out, r)
 		}
-		if tenancy.NormalizeProject(r.ProjectName) != tenancy.NormalizeProject(project) {
-			continue
-		}
-		out = append(out, r)
 	}
 	return out
 }
 
-// containerReplicaFor finds the replica a failover may promote onto targetHost: a
-// container-scoped schedule that allows auto-promote, targets that host, and
-// whose repo there holds a replica of this container's lineage no older than the
-// schedule's age bound. owner is the relocating row (nil when unreadable).
+// containerReplicaFor finds the replica a failover may promote onto targetHost:
+// a container-scoped schedule that allows auto-promote and targets that host,
+// whose namespace there holds a replica of this container's lineage taken from
+// the very row being relocated (its host and incarnation), not set aside, and no
+// older than the schedule's age bound. A replica of an earlier segment of the
+// container's history, or one a stale host pushed, is never promoted. owner is
+// the relocating row (nil when unreadable: then nothing is promotable).
 func (s *Server) containerReplicaFor(ctx context.Context, name string, owner *corrosion.ContainerRecord, targetHost string, now time.Time) (ctReplica, bool) {
-	project := tenancy.Default
-	var lineage corrosion.ContainerCreateSpec
-	if owner != nil {
-		project = tenancy.NormalizeProject(owner.Project)
-		lineage = probeLineage(corrosion.DecodeCreateSpec(owner.CreateSpec))
+	if owner == nil {
+		return ctReplica{}, false
 	}
+	project := tenancy.NormalizeProject(owner.Project)
 	for _, sched := range s.containerReplicationSchedules(ctx, name, project) {
 		if !sched.Enabled || !sched.AutoPromote || sched.TargetHost != targetHost || sched.TargetPool == "" {
 			continue
 		}
-		var probe *pb.ContainerBackupProbe
-		if targetHost == s.hostName {
-			probe = s.probeContainerBackupRepo(ctx, name, project, lineage, sched.TargetPool)
-		} else {
-			res, err := s.probePeerContainerBackups(ctx, targetHost, name, project, lineage, []string{sched.TargetPool})
-			if err != nil || len(res) != 1 {
-				slog.Warn("container failover: could not ask the replica host for its replicas", "container", name, "host", targetHost, "error", err)
-				continue
-			}
-			probe = res[0]
-		}
-		if !probe.Attributed || probe.LatestTimestamp == "" {
+		reps, err := s.listContainerReplicasOn(ctx, targetHost, sched.TargetPool, project, name)
+		if err != nil {
+			slog.Warn("container failover: could not ask the replica host for its replicas", "container", name, "host", targetHost, "error", err)
 			continue
 		}
-		ts, perr := time.Parse(time.RFC3339Nano, probe.LatestTimestamp)
+		var best *pb.ContainerReplica
+		for _, r := range reps {
+			if r.SetAside || r.Source != owner.HostName || r.Incarnation == "" || r.Incarnation != owner.CreatedAt ||
+				r.OwnerId != corrosion.DecodeCreateSpec(owner.CreateSpec).OwnerID {
+				continue
+			}
+			if best == nil || !timestampAtOrBefore(r.Timestamp, best.Timestamp) {
+				best = r
+			}
+		}
+		if best == nil {
+			continue
+		}
+		ts, perr := time.Parse(time.RFC3339Nano, best.Timestamp)
 		if perr != nil {
 			continue
 		}
 		if age := now.Sub(ts); age > autoPromoteAgeLimit(sched.Cron) {
 			slog.Warn("container failover: the replica is too old to promote automatically",
-				"container", name, "host", targetHost, "taken", probe.LatestTimestamp, "age", age.Round(time.Minute))
+				"container", name, "host", targetHost, "taken", best.Timestamp, "age", age.Round(time.Minute))
 			continue
 		}
-		return ctReplica{Host: targetHost, Repo: sched.TargetPool, Timestamp: probe.LatestTimestamp}, true
+		return ctReplica{Host: targetHost, Repo: containerReplicaRepo(project, sched.TargetPool), Timestamp: best.Timestamp}, true
 	}
 	return ctReplica{}, false
+}
+
+// listContainerReplicasOn lists project/name's replicas in repo's namespace on
+// host (this one or a peer).
+func (s *Server) listContainerReplicasOn(ctx context.Context, host, repo, project, name string) ([]*pb.ContainerReplica, error) {
+	if host == s.hostName {
+		return s.localContainerReplicas(ctx, repo, project, name)
+	}
+	c, closeConn, err := s.dialPeer(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	defer closeConn()
+	resp, err := c.ListContainerReplicas(ctx, &pb.ListContainerReplicasRequest{Host: host, Repo: repo, Project: project, Name: name})
+	if err != nil {
+		return nil, err
+	}
+	return resp.GetReplicas(), nil
+}
+
+// localContainerReplicas lists project/name's replicas in this host's namespace
+// of repo, oldest first. A namespace that does not exist holds none.
+func (s *Server) localContainerReplicas(ctx context.Context, repo, project, name string) ([]*pb.ContainerReplica, error) {
+	r, err := s.openReplicaNamespace(ctx, containerReplicaRepo(project, repo), false)
+	if status.Code(err) == codes.NotFound {
+		if _, ok := s.lookupRepoPath(ctx, repo); ok {
+			return nil, nil // the repo is here; it holds no replicas of the project yet
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	ms, err := r.ManifestsFor(ctx, name, containerBackupDisk)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "list replicas: %v", err)
+	}
+	var out []*pb.ContainerReplica
+	for i := range ms {
+		mark := replicaMarkOf(&ms[i])
+		if mark == nil {
+			continue
+		}
+		spec, _ := manifestSpec(&ms[i])
+		cr := &pb.ContainerReplica{
+			Timestamp: ms[i].Timestamp, Source: mark.Source, Incarnation: mark.Incarnation,
+			OwnerEpoch: mark.Epoch, TotalSize: ms[i].TotalSize, Stream: mark.Stream,
+			OwnerId: corrosion.DecodeCreateSpec(spec.CreateSpec).OwnerID,
+		}
+		if sa, ok := readSetAside(r, name, ms[i].Timestamp); ok {
+			cr.SetAside, cr.SetAsideReason = true, sa.Reason
+		}
+		out = append(out, cr)
+	}
+	return out, nil
+}
+
+// ListContainerReplicas lists a container's replicas in one repo's replica
+// namespace on one host: each one's time, the host and row incarnation it was
+// taken from, and whether it is set aside. A peer (failover choosing what to
+// promote) or a caller who may read the container's backups.
+func (s *Server) ListContainerReplicas(ctx context.Context, req *pb.ListContainerReplicasRequest) (*pb.ListContainerReplicasResponse, error) {
+	if err := validateReplicaRequest(req.GetName(), req.GetProject(), req.GetRepo()); err != nil {
+		return nil, err
+	}
+	project := tenancy.NormalizeProject(req.GetProject())
+	if s.requirePeerCert(ctx) != nil {
+		if err := s.RequirePerm(ctx, ctRBACPathFor(project, req.GetName()), "backup.read", "viewer"); err != nil {
+			return nil, err
+		}
+	}
+	if host := req.GetHost(); host != "" && host != s.hostName {
+		c, closeConn, err := s.dialPeer(ctx, host)
+		if err != nil {
+			return nil, status.Errorf(codes.Unavailable, "reach host %q: %v", host, err)
+		}
+		defer closeConn()
+		return c.ListContainerReplicas(ctx, req)
+	}
+	reps, err := s.localContainerReplicas(ctx, req.GetRepo(), project, req.GetName())
+	if err != nil {
+		return nil, err
+	}
+	return &pb.ListContainerReplicasResponse{Replicas: reps}, nil
+}
+
+// RemoveContainerReplicas removes SET-ASIDE replicas of a container from one
+// repo's replica namespace on one host: the explicit operator action that is the
+// only way a set-aside replica ever goes. A replica that is not set aside is
+// refused (its schedule keeps it). Admin on the container, or a peer forwarding
+// an admin's call.
+func (s *Server) RemoveContainerReplicas(ctx context.Context, req *pb.RemoveContainerReplicasRequest) (*pb.RemoveContainerReplicasResponse, error) {
+	if err := validateReplicaRequest(req.GetName(), req.GetProject(), req.GetRepo()); err != nil {
+		return nil, err
+	}
+	if len(req.GetTimestamps()) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "name the set-aside replicas to remove (timestamps)")
+	}
+	project := tenancy.NormalizeProject(req.GetProject())
+	peer := s.requirePeerCert(ctx) == nil
+	if !peer {
+		if err := s.RequirePerm(ctx, ctRBACPathFor(project, req.GetName()), "backup.prune", "admin"); err != nil {
+			return nil, err
+		}
+	}
+	if host := req.GetHost(); host != "" && host != s.hostName {
+		c, closeConn, err := s.dialPeer(ctx, host)
+		if err != nil {
+			return nil, status.Errorf(codes.Unavailable, "reach host %q: %v", host, err)
+		}
+		defer closeConn()
+		return c.RemoveContainerReplicas(ctx, req)
+	}
+	r, err := s.openReplicaNamespace(ctx, containerReplicaRepo(project, req.GetRepo()), false)
+	if err != nil {
+		return nil, err
+	}
+	var del []pbsstore.Manifest
+	for _, ts := range req.GetTimestamps() {
+		m, gerr := r.GetManifest(req.GetName(), ts, containerBackupDisk)
+		if gerr != nil {
+			return nil, status.Errorf(codes.NotFound, "no replica of %s taken at %s in %q", req.GetName(), ts, req.GetRepo())
+		}
+		if _, aside := readSetAside(r, req.GetName(), ts); !aside {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"the replica of %s taken at %s is not set aside; its schedule's keep_replicas decides when it goes", req.GetName(), ts)
+		}
+		del = append(del, *m)
+	}
+	if err := pbsstore.ApplyPrune(r, pbsstore.PrunePlan{Delete: del}); err != nil {
+		return nil, status.Errorf(codes.Internal, "remove replicas: %v", err)
+	}
+	for _, m := range del {
+		_ = os.Remove(setAsidePath(r, req.GetName(), m.Timestamp))
+	}
+	if _, err := pbsstore.GC(ctx, r); err != nil {
+		slog.Warn("container replica: gc after removal", "container", req.GetName(), "error", err)
+	}
+	s.forgetBackupManifests(r.Root(), req.GetName())
+	s.audit(ctx, "ct.replica.remove", req.GetName(),
+		fmt.Sprintf("project=%s repo=%s removed %d set-aside replica(s): %s", project, req.GetRepo(), len(del), strings.Join(req.GetTimestamps(), ", ")), "ok")
+	return &pb.RemoveContainerReplicasResponse{Removed: int32(len(del))}, nil
+}
+
+func validateReplicaRequest(name, project, repo string) error {
+	if err := safename.ValidateContainerName(name); err != nil {
+		return status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	if err := safename.ValidateName(tenancy.NormalizeProject(project)); err != nil {
+		return status.Errorf(codes.InvalidArgument, "project: %v", err)
+	}
+	if repo == "" {
+		return status.Error(codes.InvalidArgument, "repo required (the schedule's target_pool)")
+	}
+	return nil
 }
 
 // resolveContainerForSchedule finds the one live container name of project
@@ -381,6 +898,19 @@ func (s *Server) resolveContainerForSchedule(ctx context.Context, name, project 
 		"container name %q exists on %d hosts or projects; name the project (project_name)", name, len(found))
 }
 
+// containerScheduleRequestName reads a container schedule request's vm_name: the
+// container's name, or a schedule key (which a CLI sends so that a daemon that
+// predates container schedules never takes the name for a VM's).
+func containerScheduleRequestName(vmName, project string) (name, proj string) {
+	if p, n, ok := corrosion.ContainerScheduleName(vmName); ok {
+		if p != "" {
+			project = p
+		}
+		return n, project
+	}
+	return vmName, project
+}
+
 // createContainerReplicationSchedule is CreateReplicationSchedule for scope
 // "container": vm_name is the container, target_host the peer that holds the
 // replica, and target_pool the backup repo there (a logical name that host
@@ -389,7 +919,8 @@ func (s *Server) createContainerReplicationSchedule(ctx context.Context, req *pb
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return nil, err
 	}
-	if req.VmName == "" {
+	name, reqProject := containerScheduleRequestName(req.VmName, req.ProjectName)
+	if name == "" {
 		return nil, status.Error(codes.InvalidArgument, "the container name is required (vm_name)")
 	}
 	if req.TargetPool == "" || req.Cron == "" || req.TargetHost == "" {
@@ -403,7 +934,7 @@ func (s *Server) createContainerReplicationSchedule(ctx context.Context, req *pb
 	if _, err := scheduler.ParseCron(req.Cron); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid cron %q: %v", req.Cron, err)
 	}
-	ct, err := s.resolveContainerForSchedule(ctx, req.VmName, req.ProjectName)
+	ct, err := s.resolveContainerForSchedule(ctx, name, reqProject)
 	if err != nil {
 		return nil, err
 	}
@@ -432,27 +963,31 @@ func (s *Server) createContainerReplicationSchedule(ctx context.Context, req *pb
 			"container %q has no host-failure policy, so failover never moves it and auto-promote would never run; set one first (its on_host_failure is %q)",
 			ct.Name, ct.OnHostFailure)
 	}
-	// The target resolves the repo name in its own config; ask it, so a schedule
-	// that could never push is not stored. A peer that cannot answer the question
-	// (an older build) is not a reason to refuse.
-	lineage := probeLineage(corrosion.DecodeCreateSpec(ct.CreateSpec))
-	var res []*pb.ContainerBackupProbe
-	var perr error
-	if req.TargetHost == s.hostName {
-		res = []*pb.ContainerBackupProbe{s.probeContainerBackupRepo(ctx, ct.Name, project, lineage, req.TargetPool)}
-	} else {
-		res, perr = s.probePeerContainerBackups(ctx, req.TargetHost, ct.Name, project, lineage, []string{req.TargetPool})
-	}
-	if perr == nil {
-		if len(res) == 1 && !res[0].Opened && !res[0].Unreadable {
-			return nil, status.Errorf(codes.FailedPrecondition, "backup repo %q is not available on %q: %s", req.TargetPool, req.TargetHost, res[0].Detail)
+	// The target resolves the repo in its own config: ask it for the replica
+	// namespace, so a schedule that could never push is not stored. A peer that
+	// cannot answer (an older build) cannot hold a replica either.
+	if _, err := s.listContainerReplicasOn(ctx, req.TargetHost, req.TargetPool, project, ct.Name); err != nil {
+		if status.Code(err) == codes.Unimplemented {
+			return nil, status.Errorf(codes.FailedPrecondition, "target host %q runs a build without container replication", req.TargetHost)
 		}
-	} else if status.Code(perr) != codes.Unimplemented {
-		return nil, status.Errorf(codes.Unavailable, "cannot verify repo %q on %q: %v", req.TargetPool, req.TargetHost, perr)
+		return nil, status.Errorf(codes.FailedPrecondition, "backup repo %q is not usable for replicas on %q: %v", req.TargetPool, req.TargetHost, err)
+	}
+	// Last before the write: every host must understand the row it makes.
+	if err := s.containerReplicationGate(ctx); err != nil {
+		return nil, err
 	}
 
+	key := corrosion.ContainerScheduleKey(project, ct.Name)
+	// A schedule stored under the earlier name-only key keeps its identity.
+	if rows, lerr := corrosion.ListBackupSchedules(ctx, s.db); lerr == nil {
+		for _, r := range rows {
+			if r.Repo == req.TargetPool && r.VMName != key && corrosion.ContainerScheduleIs(r, project, ct.Name) {
+				key = r.VMName
+			}
+		}
+	}
 	rec := corrosion.BackupScheduleRecord{
-		VMName:       corrosion.ContainerScheduleKey(ct.Name),
+		VMName:       key,
 		ProjectName:  project,
 		Scope:        "container",
 		Repo:         req.TargetPool,
@@ -467,18 +1002,19 @@ func (s *Server) createContainerReplicationSchedule(ctx context.Context, req *pb
 	if err := corrosion.UpsertBackupSchedule(ctx, s.db, rec); err != nil {
 		return nil, status.Errorf(codes.Internal, "upsert replication schedule: %v", err)
 	}
-	s.audit(ctx, "replication.schedule", ct.Name, "container target="+req.TargetHost+":"+req.TargetPool+" cron="+req.Cron, "ok")
+	s.audit(ctx, "replication.schedule", ct.Name, "container project="+project+" target="+req.TargetHost+":"+req.TargetPool+" cron="+req.Cron, "ok")
 	return replScheduleToPB(rec), nil
 }
 
 // deleteContainerReplicationSchedule removes a container schedule. The row is
-// found by its key and repo and authorized on the project IT recorded, so a
-// schedule outlives, and can still be removed after, its container.
+// found by its container, project and repo, and authorized on the project IT
+// recorded, so a schedule outlives, and can still be removed after, its
+// container.
 func (s *Server) deleteContainerReplicationSchedule(ctx context.Context, req *pb.DeleteReplicationScheduleRequest) (*emptypb.Empty, error) {
-	if req.VmName == "" || req.TargetPool == "" {
+	name, project := containerScheduleRequestName(req.VmName, req.ProjectName)
+	if name == "" || req.TargetPool == "" {
 		return nil, status.Error(codes.InvalidArgument, "the container name (vm_name) and target_pool are required")
 	}
-	key := corrosion.ContainerScheduleKey(req.VmName)
 	rows, err := corrosion.ListBackupSchedules(ctx, s.db)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "list schedules: %v", err)
@@ -486,27 +1022,77 @@ func (s *Server) deleteContainerReplicationSchedule(ctx context.Context, req *pb
 	var row *corrosion.BackupScheduleRecord
 	for i := range rows {
 		r := rows[i]
-		if r.VMName != key || r.Repo != req.TargetPool || r.Type != "replication" {
+		if r.Repo != req.TargetPool || r.Type != "replication" || r.Scope != "container" {
 			continue
 		}
-		if req.ProjectName != "" && tenancy.NormalizeProject(r.ProjectName) != tenancy.NormalizeProject(req.ProjectName) {
+		rp, rn, ok := corrosion.ContainerScheduleName(r.VMName)
+		if !ok || rn != name {
+			continue
+		}
+		if rp == "" {
+			rp = r.ProjectName
+		}
+		if project != "" && tenancy.NormalizeProject(rp) != tenancy.NormalizeProject(project) {
 			continue
 		}
 		if row != nil {
-			return nil, status.Errorf(codes.InvalidArgument, "more than one project has a schedule for %q into %q; name the project (project_name)", req.VmName, req.TargetPool)
+			return nil, status.Errorf(codes.InvalidArgument, "more than one project has a schedule for %q into %q; name the project (project_name)", name, req.TargetPool)
 		}
 		row = &r
 	}
 	if row == nil {
 		return &emptypb.Empty{}, nil // nothing to remove, as for a VM
 	}
-	project := tenancy.NormalizeProject(row.ProjectName)
-	if err := s.requirePermResolved(ctx, true, ctRBACPathFor(project, req.VmName), ctRBACPathFor("", req.VmName),
-		"backup.schedule", "operator", containerWhat(req.VmName)); err != nil {
+	rowProject := corrosion.ContainerScheduleProject(*row)
+	if err := s.requirePermResolved(ctx, true, ctRBACPathFor(rowProject, name), ctRBACPathFor("", name),
+		"backup.schedule", "operator", containerWhat(name)); err != nil {
 		return nil, err
 	}
-	if err := corrosion.DeleteBackupSchedule(ctx, s.db, key, req.TargetPool); err != nil {
+	if err := corrosion.DeleteBackupSchedule(ctx, s.db, row.VMName, req.TargetPool); err != nil {
 		return nil, status.Errorf(codes.Internal, "delete replication schedule: %v", err)
 	}
+	s.audit(ctx, "replication.schedule.delete", name, "container project="+rowProject+" repo="+req.TargetPool, "ok")
 	return &emptypb.Empty{}, nil
+}
+
+// notifyReplicaSetAside reports replicas a run set aside, once each.
+func (s *Server) notifyReplicaSetAside(ctx context.Context, m *pbsstore.Manifest, aside []pbsstore.Manifest, repo string) {
+	if len(aside) == 0 {
+		return
+	}
+	var ts []string
+	for _, a := range aside {
+		ts = append(ts, a.Timestamp)
+	}
+	detail := fmt.Sprintf("%d replica(s) of container %s in %s were set aside, not removed: they are not proven to be contained in the data now replicated (%s). Inspect them with `lv replication replicas %s --host %s --target-pool <repo>`; they go only when removed: %s",
+		len(aside), m.VMName, repo, m.Timestamp, m.VMName, s.hostName, strings.Join(ts, ", "))
+	s.audit(ctx, "ct.replica.set_aside", m.VMName, detail, "ok")
+	s.notify(ctx, notify.Notification{Kind: "replication.replica_set_aside", Severity: notify.SevWarn, Subject: m.VMName, Detail: detail})
+}
+
+// admitReplicaPromotion is RestoreContainer's rule for a manifest that is a
+// scheduled replica: only a failover coordinator's restore-relocation over peer
+// mTLS (its proof, or its attempt token before enforcement) may lay it down, and
+// never a cold migrate or an operator restore. When the relocating row is visible
+// here, the replica must have been taken from it: its host and row incarnation.
+// (The coordinator chose it by the same rule from its own view: containerReplicaFor.)
+func (s *Server) admitReplicaPromotion(ctx context.Context, req *pb.RestoreContainerRequest, mark *containerReplicaMark) error {
+	if !s.isPeerRelocation(ctx, req.Proof != nil) || s.migrateSourceFromPeer(ctx) != "" {
+		return status.Error(codes.PermissionDenied,
+			"a container replica becomes a live copy only through failover promotion of the container it was taken from; restore a backup instead")
+	}
+	token := relocateTokenFromMD(ctx)
+	if token == "" && req.Proof != nil {
+		token = req.Proof.GetRelocationToken()
+	}
+	row, err := s.relocatingContainer(ctx, req.Name, s.hostName, token)
+	if err != nil {
+		return status.Errorf(codes.Unavailable, "read the relocating container: %v", err)
+	}
+	if row != nil && (row.HostName != mark.Source || mark.Incarnation == "" || row.CreatedAt != mark.Incarnation) {
+		return status.Errorf(codes.FailedPrecondition,
+			"the replica of %s taken at %s is from %s, not from the container being relocated (on %s); it is not promoted",
+			req.Name, req.Timestamp, mark.Source, row.HostName)
+	}
+	return nil
 }

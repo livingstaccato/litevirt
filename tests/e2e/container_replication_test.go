@@ -67,6 +67,9 @@ func TestContainerReplication_ReplicatesThenFollowsAPlannedMove(t *testing.T) {
 	// Every minute, so the run lands while the test waits.
 	if out, err := lvErr(t, "replication", "schedule", "add", name, "--container",
 		"--cron", "* * * * *", "--target-host", target, "--target-pool", repoName, "--keep", "2"); err != nil {
+		if strings.Contains(out+err.Error(), "cluster upgrade must finish first") {
+			t.Skipf("container replication is the container_replication release feature, not open on this cluster: %s", out)
+		}
 		t.Fatalf("schedule add: %v\n%s", err, out)
 	}
 	deadline := time.Now().Add(3 * time.Minute)
@@ -83,6 +86,11 @@ func TestContainerReplication_ReplicatesThenFollowsAPlannedMove(t *testing.T) {
 			t.Fatalf("no successful replication run within 3 minutes: %v", row)
 		}
 		time.Sleep(5 * time.Second)
+	}
+
+	// The replica is in the target repo's replica namespace, listed as current.
+	if out := lv(t, "replication", "replicas", name, "--host", target, "--target-pool", repoName); !strings.Contains(out, "current") {
+		t.Fatalf("the replica host lists no current replica of %s:\n%s", name, out)
 	}
 
 	// Move the container onto its replica host (cold migrate, as for any move).

@@ -880,6 +880,11 @@ func (v *VMChecker) migrateVM(ctx context.Context, vm corrosion.VMRecord) {
 		v.noteStateWriteFail(corrosion.OpVMHost, werr)
 		return
 	}
+	// The VM may now run on its own replica target: replicate back to this host.
+	// (The RPC path above switches it in MigrateVM's own finish.)
+	corrosion.ReverseReplicationAudited(ctx, v.db, "vm", vm.Name, "", v.hostName, target.Name, func(detail, result string) {
+		auditSystem(ctx, v.db, v.hostName, "replication.reverse", vm.Name, detail, result)
+	})
 	v.publish("vm.health.migrated", vm.Name, fmt.Sprintf("from=%s to=%s", v.hostName, target.Name))
 	slog.Info("vmcheck: VM migrated successfully", "vm", vm.Name, "to", target.Name)
 }

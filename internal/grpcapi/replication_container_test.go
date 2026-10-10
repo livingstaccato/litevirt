@@ -3,16 +3,20 @@ package grpcapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/pbsstore"
 )
 
@@ -53,55 +57,134 @@ func timestampsOf(t *testing.T, r *pbsstore.Repo, name string) map[string]bool {
 	return out
 }
 
-func mk(stream, source string, epoch int64, keep int) *containerReplicaMark {
-	return &containerReplicaMark{Stream: stream, Source: source, Epoch: epoch, Keep: keep}
+// mk is a replica mark of segment (source, inc).
+func mk(stream, source, inc string, keep int, bases ...replicaBase) *containerReplicaMark {
+	return &containerReplicaMark{Stream: stream, Source: source, Incarnation: inc, Keep: keep, Bases: bases}
 }
 
-func TestAdmitContainerReplica_RefusesAnEarlierGeneration(t *testing.T) {
+// admitT runs admitContainerReplica on a server that holds no rows (the
+// target's own view does not judge), as a replica namespace.
+func admitT(t *testing.T, r *pbsstore.Repo, m *pbsstore.Manifest) error {
+	t.Helper()
+	s := testServer(t)
+	for _, h := range []string{"host-a", "host-b", "host-d"} {
+		seedActiveHost(t, s, h, true)
+	}
+	return s.admitContainerReplica(context.Background(), r, m, true, "")
+}
+
+func TestAdmitContainerReplica_RefusesAnOlderCopyOfTheSameSegment(t *testing.T) {
 	r := newReplicaRepo(t)
-	put(t, r, replicaManifest("web", "2026-01-02T00:00:00Z", "_default", "o1", mk("s", "host-b", 3, 0)))
-	err := admitContainerReplica(context.Background(), r,
-		replicaManifest("web", "2026-01-03T00:00:00Z", "_default", "o1", mk("s", "host-a", 2, 0)))
+	put(t, r, replicaManifest("web", "2026-01-02T00:00:00Z", "_default", "o1", mk("s", "host-a", "inc-a", 0)))
+	err := admitT(t, r, replicaManifest("web", "2026-01-01T00:00:00Z", "_default", "o1", mk("s", "host-a", "inc-a", 0)))
 	if status.Code(err) != codes.FailedPrecondition {
-		t.Fatalf("an earlier ownership generation must be refused even with a newer timestamp, got %v", err)
+		t.Fatalf("an older copy of the same segment must be refused, got %v", err)
 	}
 }
 
-func TestAdmitContainerReplica_RefusesAnOlderCopyFromTheSameSource(t *testing.T) {
+// A replica a held replica's provenance chain contains is older than it,
+// whatever the clocks say: the newer copy is never replaced by an older one.
+func TestAdmitContainerReplica_RefusesACopyAHeldReplicaContains(t *testing.T) {
 	r := newReplicaRepo(t)
-	put(t, r, replicaManifest("web", "2026-01-02T00:00:00Z", "_default", "o1", mk("s", "host-a", 3, 0)))
-	err := admitContainerReplica(context.Background(), r,
-		replicaManifest("web", "2026-01-01T00:00:00Z", "_default", "o1", mk("s", "host-a", 3, 0)))
+	put(t, r, replicaManifest("web", "2026-01-01T00:00:00Z", "_default", "o1",
+		mk("s", "host-d", "inc-d", 0, replicaBase{Source: "host-a", Incarnation: "inc-a", Taken: "2026-01-05T00:00:00Z"})))
+	err := admitT(t, r, replicaManifest("web", "2026-01-04T00:00:00Z", "_default", "o1", mk("s", "host-a", "inc-a", 0)))
 	if status.Code(err) != codes.FailedPrecondition {
-		t.Fatalf("an older copy from the same generation and source must be refused, got %v", err)
+		t.Fatalf("a replica the held one descends from must be refused, got %v", err)
 	}
 }
 
-func TestAdmitContainerReplica_AdmitsNewerAndOtherStreams(t *testing.T) {
+func TestAdmitContainerReplica_AdmitsNewerAndUnrelated(t *testing.T) {
 	r := newReplicaRepo(t)
-	put(t, r, replicaManifest("web", "2026-01-02T00:00:00Z", "_default", "o1", mk("s", "host-a", 3, 0)))
-	ctx := context.Background()
+	put(t, r, replicaManifest("web", "2026-01-02T00:00:00Z", "_default", "o1", mk("s", "host-a", "inc-a", 0)))
 	for name, m := range map[string]*pbsstore.Manifest{
-		"newer same generation": replicaManifest("web", "2026-01-03T00:00:00Z", "_default", "o1", mk("s", "host-a", 3, 0)),
-		"later generation":      replicaManifest("web", "2026-01-01T00:00:00Z", "_default", "o1", mk("s", "host-b", 4, 0)),
-		"another stream":        replicaManifest("web", "2026-01-01T00:00:00Z", "_default", "o1", mk("other", "host-a", 1, 0)),
-		"another lineage":       replicaManifest("web", "2026-01-01T00:00:00Z", "_default", "o2", mk("s", "host-a", 1, 0)),
-		"another project":       replicaManifest("web", "2026-01-01T00:00:00Z", "prod", "o1", mk("s", "host-a", 1, 0)),
-		"a backup":              replicaManifest("web", "2026-01-01T00:00:00Z", "_default", "o1", nil),
+		"newer same segment":           replicaManifest("web", "2026-01-03T00:00:00Z", "_default", "o1", mk("s", "host-a", "inc-a", 0)),
+		"another segment, no relation": replicaManifest("web", "2026-01-01T00:00:00Z", "_default", "o1", mk("s", "host-b", "inc-b", 0)),
+		"another stream":               replicaManifest("web", "2026-01-01T01:00:00Z", "_default", "o1", mk("other", "host-a", "inc-a", 0)),
+		"another lineage":              replicaManifest("web", "2026-01-01T02:00:00Z", "_default", "o2", mk("s", "host-a", "inc-a", 0)),
+		"another project":              replicaManifest("web", "2026-01-01T03:00:00Z", "prod", "o1", mk("s", "host-a", "inc-a", 0)),
 	} {
-		if err := admitContainerReplica(ctx, r, m); err != nil {
+		if err := admitT(t, r, m); err != nil {
 			t.Errorf("%s: %v", name, err)
 		}
 	}
 }
 
-func TestSettleContainerReplicas_KeepsTheNewestN(t *testing.T) {
+// A namespace takes replicas only, a replica goes only to a namespace, and a
+// replica already held is never written over.
+func TestAdmitContainerReplica_NamespaceAndNoClobber(t *testing.T) {
+	s := testServer(t)
+	seedActiveHost(t, s, "host-a", true)
+	ctx := context.Background()
+	r := newReplicaRepo(t)
+	held := replicaManifest("web", "2026-01-02T00:00:00Z", "_default", "o1", mk("s", "host-a", "inc-a", 0))
+	put(t, r, held)
+	if err := s.admitContainerReplica(ctx, r, replicaManifest("web", "2026-01-03T00:00:00Z", "_default", "o1", nil), true, ""); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("a backup into a replica namespace: got %v", err)
+	}
+	if err := s.admitContainerReplica(ctx, r, replicaManifest("web", "2026-01-03T00:00:00Z", "_default", "o1", mk("s", "host-a", "inc-a", 0)), false, ""); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("a replica into a backup repo: got %v", err)
+	}
+	if err := s.admitContainerReplica(ctx, r, replicaManifest("web", "2026-01-02T00:00:00Z", "_default", "o1", mk("s", "host-a", "inc-a", 0)), true, ""); status.Code(err) != codes.AlreadyExists {
+		t.Errorf("a replica with a held replica's timestamp: got %v", err)
+	}
+	if err := s.admitContainerReplica(ctx, r, replicaManifest("web", "2026-01-03T00:00:00Z", "_default", "o1", mk("s", "host-a", "inc-a", 0)), true, "host-z"); status.Code(err) != codes.PermissionDenied {
+		t.Errorf("a replica pushed by a host other than its source: got %v", err)
+	}
+}
+
+// The target judges a push by its own view of who owns the container: a
+// fenced source, a row on another host, a later owner epoch or another row
+// incarnation refuse it; a container it holds no row for is admitted.
+func TestAdmitContainerReplica_RefusesAStaleOrFencedSource(t *testing.T) {
+	s := testServer(t)
+	ctx := context.Background()
+	for _, h := range []string{"host-a", "host-d"} {
+		seedActiveHost(t, s, h, true)
+	}
+	if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{
+		HostName: "host-a", Name: "web", State: "running", Image: "alpine", CreatedAt: "inc-a",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	r := newReplicaRepo(t)
+	push := func(source, inc string, epoch int64, name string) error {
+		m := mk("s", source, inc, 0)
+		m.Epoch = epoch
+		return s.admitContainerReplica(ctx, r, replicaManifest(name, time.Now().UTC().Format(time.RFC3339Nano), "_default", "o1", m), true, source)
+	}
+	if err := push("host-a", "inc-a", 0, "web"); err != nil {
+		t.Fatalf("the owner's own replica: %v", err)
+	}
+	if err := push("host-d", "inc-d", 0, "web"); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("a replica from a host the row is not on: %v", err)
+	}
+	if err := push("host-a", "inc-old", 0, "web"); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("a replica of an earlier row incarnation: %v", err)
+	}
+	if err := s.db.Execute(ctx, `UPDATE containers SET owner_epoch = 3 WHERE host_name = 'host-a' AND name = 'web'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := push("host-a", "inc-a", 2, "web"); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("a replica at an owner epoch the row has moved past: %v", err)
+	}
+	if err := push("host-d", "inc-d", 0, "unknown-here"); err != nil {
+		t.Errorf("a container this host holds no row for is not judged: %v", err)
+	}
+	if err := corrosion.UpdateHostState(ctx, s.db, "host-a", "fenced"); err != nil {
+		t.Fatal(err)
+	}
+	if err := push("host-a", "inc-a", 3, "web"); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("a replica from a fenced host: %v", err)
+	}
+}
+
+func TestSettleContainerReplicas_KeepsTheNewestNOfTheSegment(t *testing.T) {
 	r := newReplicaRepo(t)
 	for _, ts := range []string{"2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z", "2026-01-03T00:00:00Z", "2026-01-04T00:00:00Z"} {
-		put(t, r, replicaManifest("web", ts, "_default", "o1", mk("s", "host-a", 3, 2)))
+		put(t, r, replicaManifest("web", ts, "_default", "o1", mk("s", "host-a", "inc-a", 2)))
 	}
-	newest := replicaManifest("web", "2026-01-04T00:00:00Z", "_default", "o1", mk("s", "host-a", 3, 2))
-	settleContainerReplicas(context.Background(), r, newest)
+	settleContainerReplicas(context.Background(), r, replicaManifest("web", "2026-01-04T00:00:00Z", "_default", "o1", mk("s", "host-a", "inc-a", 2)))
 	got := timestampsOf(t, r, "web")
 	if len(got) != 2 || !got["2026-01-04T00:00:00Z"] || !got["2026-01-03T00:00:00Z"] {
 		t.Fatalf("want the newest 2 kept, got %v", got)
@@ -110,39 +193,148 @@ func TestSettleContainerReplicas_KeepsTheNewestN(t *testing.T) {
 
 func TestSettleContainerReplicas_NeverTouchesABackupOrAnotherContainersReplica(t *testing.T) {
 	r := newReplicaRepo(t)
-	put(t, r, replicaManifest("web", "2026-01-01T00:00:00Z", "_default", "o1", nil))                         // a backup
-	put(t, r, replicaManifest("web", "2026-01-01T01:00:00Z", "_default", "o2", mk("s", "host-a", 1, 1)))     // another lineage
-	put(t, r, replicaManifest("web", "2026-01-01T02:00:00Z", "prod", "o1", mk("s", "host-a", 1, 1)))         // another project
-	put(t, r, replicaManifest("web", "2026-01-01T03:00:00Z", "_default", "o1", mk("other", "host-a", 1, 1))) // another stream
-	put(t, r, replicaManifest("web", "2026-01-02T00:00:00Z", "_default", "o1", mk("s", "host-a", 5, 1)))
-	settleContainerReplicas(context.Background(), r, replicaManifest("web", "2026-01-02T00:00:00Z", "_default", "o1", mk("s", "host-a", 5, 1)))
-	if got := timestampsOf(t, r, "web"); len(got) != 5 {
+	put(t, r, replicaManifest("web", "2026-01-01T00:00:00Z", "_default", "o1", nil))                               // a backup
+	put(t, r, replicaManifest("web", "2026-01-01T01:00:00Z", "_default", "o2", mk("s", "host-a", "inc-a", 1)))     // another lineage
+	put(t, r, replicaManifest("web", "2026-01-01T02:00:00Z", "prod", "o1", mk("s", "host-a", "inc-a", 1)))         // another project
+	put(t, r, replicaManifest("web", "2026-01-01T03:00:00Z", "_default", "o1", mk("other", "host-a", "inc-a", 1))) // another stream
+	put(t, r, replicaManifest("web", "2026-01-01T04:00:00Z", "_default", "", mk("s", "host-a", "inc-a", 1)))       // no lineage recorded
+	m := replicaManifest("web", "2026-01-02T00:00:00Z", "_default", "o1", mk("s", "host-a", "inc-a", 1))
+	put(t, r, m)
+	if aside := settleContainerReplicas(context.Background(), r, m); len(aside) != 0 {
+		t.Fatalf("set aside another stream's or lineage's replicas: %v", aside)
+	}
+	if got := timestampsOf(t, r, "web"); len(got) != 6 {
 		t.Fatalf("only this stream's own superseded replicas may go; got %v", got)
 	}
 }
 
-func TestSettleContainerReplicas_SupersededGenerationsAndSourcesGo(t *testing.T) {
+// C1: the container came back up somewhere else, not from its replica (an image
+// re-create, a backup, a placement that could not use the replica host), and the
+// new owner's first replica arrives. Nothing proves the new data contains the
+// earlier replicas, which are the newest copy of the container's data: they are
+// set aside, reported once, and kept.
+func TestSettleContainerReplicas_AnUnprovenEarlierSegmentIsSetAsideNotDeleted(t *testing.T) {
 	r := newReplicaRepo(t)
-	// Earlier generation from the same host, and the same generation from another
-	// host (the container moved): both superseded whatever their timestamps say.
-	put(t, r, replicaManifest("web", "2026-02-01T00:00:00Z", "_default", "o1", mk("s", "host-a", 2, 0)))
-	put(t, r, replicaManifest("web", "2026-02-02T00:00:00Z", "_default", "o1", mk("s", "host-c", 3, 0)))
-	put(t, r, replicaManifest("web", "2026-01-05T00:00:00Z", "_default", "o1", mk("s", "host-a", 3, 0)))
-	settleContainerReplicas(context.Background(), r, replicaManifest("web", "2026-01-05T00:00:00Z", "_default", "o1", mk("s", "host-a", 3, 0)))
+	for _, ts := range []string{"2026-01-01T00:00:00Z", "2026-01-01T01:00:00Z"} {
+		put(t, r, replicaManifest("web", ts, "_default", "o1", mk("s", "host-a", "inc-a", 1)))
+	}
+	m := replicaManifest("web", "2026-01-02T00:00:00Z", "_default", "o1", mk("s", "host-d", "inc-d", 1))
+	put(t, r, m)
+	aside := settleContainerReplicas(context.Background(), r, m)
+	if got := timestampsOf(t, r, "web"); len(got) != 3 {
+		t.Fatalf("an earlier segment's replicas were deleted without proof: %v", got)
+	}
+	if len(aside) != 2 {
+		t.Fatalf("want both earlier replicas set aside (and reported), got %d", len(aside))
+	}
+	if _, ok := readSetAside(r, "web", "2026-01-01T01:00:00Z"); !ok {
+		t.Fatal("no set-aside record")
+	}
+	m2 := replicaManifest("web", "2026-01-03T00:00:00Z", "_default", "o1", mk("s", "host-d", "inc-d", 1))
+	put(t, r, m2)
+	if again := settleContainerReplicas(context.Background(), r, m2); len(again) != 0 {
+		t.Fatalf("a replica already set aside was reported again: %d", len(again))
+	}
 	got := timestampsOf(t, r, "web")
-	if len(got) != 1 || !got["2026-01-05T00:00:00Z"] {
-		t.Fatalf("a replica of an earlier generation, or of another source at this one, must go regardless of clocks; got %v", got)
+	if !got["2026-01-01T00:00:00Z"] || !got["2026-01-01T01:00:00Z"] || got["2026-01-02T00:00:00Z"] {
+		t.Fatalf("keep applies within the new segment only; set-aside replicas stay: %v", got)
+	}
+}
+
+// When the new data provably descends from an earlier replica (the restore laid
+// it down from that replica, a migrate carried it), every replica of that segment
+// taken at or before that point is contained in it and goes; a later one of the
+// same segment is not contained and is set aside.
+func TestSettleContainerReplicas_AProvenEarlierSegmentGoes(t *testing.T) {
+	r := newReplicaRepo(t)
+	for _, ts := range []string{"2026-01-01T00:00:00Z", "2026-01-01T01:00:00Z", "2026-01-01T02:00:00Z"} {
+		put(t, r, replicaManifest("web", ts, "_default", "o1", mk("s", "host-a", "inc-a", 0)))
+	}
+	m := replicaManifest("web", "2026-01-02T00:00:00Z", "_default", "o1",
+		mk("s", "host-d", "inc-d", 0, replicaBase{Source: "host-a", Incarnation: "inc-a", Taken: "2026-01-01T01:00:00Z"}))
+	put(t, r, m)
+	aside := settleContainerReplicas(context.Background(), r, m)
+	got := timestampsOf(t, r, "web")
+	if got["2026-01-01T00:00:00Z"] || got["2026-01-01T01:00:00Z"] {
+		t.Fatalf("replicas the new data contains must go: %v", got)
+	}
+	if !got["2026-01-01T02:00:00Z"] || len(aside) != 1 || aside[0].Timestamp != "2026-01-01T02:00:00Z" {
+		t.Fatalf("a replica taken after the point the new data descends from must be set aside: %v (aside %v)", got, aside)
 	}
 }
 
 func TestSettleContainerReplicas_KeepZeroKeepsEverythingCurrent(t *testing.T) {
 	r := newReplicaRepo(t)
 	for _, ts := range []string{"2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z", "2026-01-03T00:00:00Z"} {
-		put(t, r, replicaManifest("web", ts, "_default", "o1", mk("s", "host-a", 3, 0)))
+		put(t, r, replicaManifest("web", ts, "_default", "o1", mk("s", "host-a", "inc-a", 0)))
 	}
-	settleContainerReplicas(context.Background(), r, replicaManifest("web", "2026-01-03T00:00:00Z", "_default", "o1", mk("s", "host-a", 3, 0)))
+	settleContainerReplicas(context.Background(), r, replicaManifest("web", "2026-01-03T00:00:00Z", "_default", "o1", mk("s", "host-a", "inc-a", 0)))
 	if got := timestampsOf(t, r, "web"); len(got) != 3 {
 		t.Fatalf("keep 0 keeps all, got %v", got)
+	}
+}
+
+// M7: a container deleted and re-created under its name without an owner_id is
+// another container; the old one's replicas neither block nor are pruned by it.
+func TestSameReplicaStream_NoRecordedLineageIsAnotherLineage(t *testing.T) {
+	r := newReplicaRepo(t)
+	put(t, r, replicaManifest("web", "2026-01-05T00:00:00Z", "_default", "", mk("s", "host-a", "inc-old", 0,
+		replicaBase{Source: "host-a", Incarnation: "inc-new", Taken: "2026-02-01T00:00:00Z"})))
+	if err := admitT(t, r, replicaManifest("web", "2026-01-06T00:00:00Z", "_default", "o-new", mk("s", "host-a", "inc-new", 0))); err != nil {
+		t.Fatalf("an unrelated lineage's replica blocked a new container's: %v", err)
+	}
+}
+
+// A replica namespace is a store of its own under the repo: a push named for it
+// lands there, the repo's backup retention and a backup restore's search never
+// see it, and a replica is never taken for a backup.
+func TestReplicaNamespace_IsApartFromBackups(t *testing.T) {
+	s := testServer(t)
+	ctx := context.Background()
+	base := filepath.Join(t.TempDir(), "dr")
+	br, err := pbsstore.Init(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.SetBackupRepos(map[string]string{"dr": base})
+	ns, err := s.resolveRepoTarget(ctx, &pb.RepoTarget{RepoName: containerReplicaRepo("_default", "dr")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ns.Root() == br.Root() || filepath.Dir(filepath.Dir(ns.Root())) != base {
+		t.Fatalf("namespace root %q is not a store of its own under %q", ns.Root(), base)
+	}
+	put(t, br, replicaManifest("web", "2026-01-01T00:00:00Z", "_default", "o1", nil)) // the backup
+	for _, ts := range []string{"2026-01-02T00:00:00Z", "2026-01-03T00:00:00Z", "2026-01-04T00:00:00Z"} {
+		put(t, ns, replicaManifest("web", ts, "_default", "o1", mk("s", "host-a", "inc-a", 0)))
+	}
+	plan, err := pbsstore.PlanPrune(br, pbsstore.RetentionPolicy{KeepLast: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Keep) != 1 || plan.Keep[0].Timestamp != "2026-01-01T00:00:00Z" || len(plan.Delete) != 0 {
+		t.Fatalf("keep_last=1 on the repo must keep its one backup, untouched by replicas: %+v", plan)
+	}
+	if _, ts, err := s.findLatestContainerBackupFor("web", nil); err != nil || ts != "2026-01-01T00:00:00Z" {
+		t.Fatalf("a restore's newest backup = %q (%v), want the backup, never a replica", ts, err)
+	}
+	// Even a replica that found its way into a backup repo is not a backup.
+	put(t, br, replicaManifest("web", "2026-01-09T00:00:00Z", "_default", "o1", mk("s", "host-a", "inc-a", 0)))
+	if _, ts, _ := s.findLatestContainerBackupFor("web", nil); ts != "2026-01-01T00:00:00Z" {
+		t.Fatalf("a replica in a backup repo was taken for a backup: %q", ts)
+	}
+	if path, err := s.resolveBackupRepoPath(ctx, containerReplicaRepo("_default", "dr")); err != nil || path != ns.Root() {
+		t.Fatalf("a restore names the namespace by its wire name: %q %v", path, err)
+	}
+}
+
+// A replica is laid down only by a failover coordinator's relocation; an
+// operator restore and a cold migrate are refused.
+func TestAdmitReplicaPromotion_OnlyAPeerRelocation(t *testing.T) {
+	s := testServer(t)
+	mark := mk("s", "host-a", "inc-a", 0)
+	if err := s.admitReplicaPromotion(adminCtx(), &pb.RestoreContainerRequest{Name: "web", Timestamp: "2026-01-01T00:00:00Z"}, mark); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("an operator restore of a replica: got %v", err)
 	}
 }
 
@@ -176,15 +368,36 @@ func ctSchedReq(name, host, repo string) *pb.CreateReplicationScheduleRequest {
 	}
 }
 
+// replicaPeer answers ListContainerReplicas as a target host on this build.
+type replicaPeer struct {
+	pb.LiteVirtClient
+	err  error
+	reps []*pb.ContainerReplica
+}
+
+func (p *replicaPeer) ListContainerReplicas(context.Context, *pb.ListContainerReplicasRequest, ...grpc.CallOption) (*pb.ListContainerReplicasResponse, error) {
+	if p.err != nil {
+		return nil, p.err
+	}
+	return &pb.ListContainerReplicasResponse{Replicas: p.reps}, nil
+}
+
+// openGate opens the container_replication feature on s (the release token's
+// gate in production).
+func openCTGate(s *Server) { s.SetContainerReplicationGate(func(context.Context) error { return nil }) }
+
 func TestCreateContainerReplicationSchedule_UnverifiableRepoIsNotStored(t *testing.T) {
 	s := testServer(t)
+	openCTGate(s)
 	seedActiveHost(t, s, "host-b", true)
 	seedCTRow(t, s, "test-host", "web", "_default", "image-recreate")
-	// The target host is remote; the repo probe needs a peer, which this unit
-	// test has none of: an unreachable peer must refuse rather than store.
-	_, err := s.CreateReplicationSchedule(adminCtx(), ctSchedReq("web", "host-b", "dr"))
-	if err == nil {
-		t.Fatal("a schedule whose target repo cannot be verified must not be stored")
+	for _, perr := range []error{status.Error(codes.Unavailable, "down"), status.Error(codes.Unimplemented, "old build")} {
+		s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {
+			return &replicaPeer{err: perr}, func() {}, nil
+		}
+		if _, err := s.CreateReplicationSchedule(adminCtx(), ctSchedReq("web", "host-b", "dr")); err == nil {
+			t.Fatalf("a schedule whose target repo cannot be verified (%v) must not be stored", perr)
+		}
 	}
 	rows, _ := corrosion.ListBackupSchedules(context.Background(), s.db)
 	if len(rows) != 0 {
@@ -192,18 +405,44 @@ func TestCreateContainerReplicationSchedule_UnverifiableRepoIsNotStored(t *testi
 	}
 }
 
+// I8: until every host runs a release with container replication, no schedule
+// row is written for an older daemon to skip, keep or mistake for a VM's.
+func TestCreateContainerReplicationSchedule_RefusedBeforeTheReleaseFeature(t *testing.T) {
+	s := testServer(t)
+	seedActiveHost(t, s, "host-b", true)
+	seedCTRow(t, s, "test-host", "web", "_default", "image-recreate")
+	s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {
+		return &replicaPeer{}, func() {}, nil
+	}
+	if _, err := s.CreateReplicationSchedule(adminCtx(), ctSchedReq("web", "host-b", "dr")); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("a closed release gate must refuse the schedule, got %v", err)
+	}
+	if rows, _ := corrosion.ListBackupSchedules(context.Background(), s.db); len(rows) != 0 {
+		t.Fatalf("a schedule was stored with the gate closed: %+v", rows)
+	}
+	openCTGate(s)
+	if _, err := s.CreateReplicationSchedule(adminCtx(), ctSchedReq("web", "host-b", "dr")); err != nil {
+		t.Fatalf("with the gate open: %v", err)
+	}
+}
+
 func TestCreateContainerReplicationSchedule_Refusals(t *testing.T) {
 	s := testServer(t)
+	openCTGate(s)
+	s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {
+		return &replicaPeer{}, func() {}, nil
+	}
 	seedActiveHost(t, s, "host-b", true)
 	seedActiveHost(t, s, "host-nolxc", false)
 	seedCTRow(t, s, "test-host", "web", "_default", "image-recreate")
 	seedCTRow(t, s, "test-host", "plain", "_default", "")
 	ctx := adminCtx()
-	cases := []struct {
+	type tc struct {
 		name string
 		req  *pb.CreateReplicationScheduleRequest
 		want codes.Code
-	}{
+	}
+	cases := []tc{
 		{"onto its own host", ctSchedReq("web", "test-host", "dr"), codes.InvalidArgument},
 		{"missing target host", ctSchedReq("web", "", "dr"), codes.InvalidArgument},
 		{"missing repo", ctSchedReq("web", "host-b", ""), codes.InvalidArgument},
@@ -213,18 +452,10 @@ func TestCreateContainerReplicationSchedule_Refusals(t *testing.T) {
 	}
 	inc := ctSchedReq("web", "host-b", "dr")
 	inc.Incremental = true
-	cases = append(cases, struct {
-		name string
-		req  *pb.CreateReplicationScheduleRequest
-		want codes.Code
-	}{"incremental is a VM-disk notion", inc, codes.InvalidArgument})
+	cases = append(cases, tc{"incremental is a VM-disk notion", inc, codes.InvalidArgument})
 	ap := ctSchedReq("plain", "host-b", "dr")
 	ap.AutoPromote = true
-	cases = append(cases, struct {
-		name string
-		req  *pb.CreateReplicationScheduleRequest
-		want codes.Code
-	}{"auto-promote needs a failover policy", ap, codes.FailedPrecondition})
+	cases = append(cases, tc{"auto-promote needs a failover policy", ap, codes.FailedPrecondition})
 	for _, c := range cases {
 		_, err := s.CreateReplicationSchedule(ctx, c.req)
 		if status.Code(err) != c.want {
@@ -233,25 +464,84 @@ func TestCreateContainerReplicationSchedule_Refusals(t *testing.T) {
 	}
 }
 
+// I1: two projects' containers of one name replicating into one repo are two
+// schedules; adding one never replaces the other's target or auto-promote.
+func TestCreateContainerReplicationSchedule_TwoProjectsKeepTheirOwnSchedules(t *testing.T) {
+	s := testServer(t)
+	openCTGate(s)
+	s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {
+		return &replicaPeer{}, func() {}, nil
+	}
+	seedActiveHost(t, s, "host-b", true)
+	seedActiveHost(t, s, "host-c", true)
+	seedCTRow(t, s, "test-host", "web", "p1", "image-recreate")
+	seedCTRow(t, s, "host-c", "web", "p2", "image-recreate")
+	r1 := ctSchedReq("web", "host-b", "dr")
+	r1.ProjectName, r1.AutoPromote = "p1", true
+	if _, err := s.CreateReplicationSchedule(adminCtx(), r1); err != nil {
+		t.Fatal(err)
+	}
+	r2 := ctSchedReq("web", "host-b", "dr")
+	r2.ProjectName = "p2"
+	if _, err := s.CreateReplicationSchedule(adminCtx(), r2); err != nil {
+		t.Fatal(err)
+	}
+	rows, _ := corrosion.ListBackupSchedules(context.Background(), s.db)
+	if len(rows) != 2 {
+		t.Fatalf("want one schedule per project, got %+v", rows)
+	}
+	for _, r := range rows {
+		if corrosion.ContainerScheduleIs(r, "p1", "web") && (!r.AutoPromote || r.ProjectName != "p1") {
+			t.Fatalf("p2's add changed p1's schedule: %+v", r)
+		}
+	}
+	// Without a project the delete is ambiguous; with one it removes only that one.
+	if _, err := s.DeleteReplicationSchedule(adminCtx(), &pb.DeleteReplicationScheduleRequest{VmName: "web", Scope: "container", TargetPool: "dr"}); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("an ambiguous delete: got %v", err)
+	}
+	if _, err := s.DeleteReplicationSchedule(adminCtx(), &pb.DeleteReplicationScheduleRequest{VmName: "web", Scope: "container", TargetPool: "dr", ProjectName: "p2"}); err != nil {
+		t.Fatal(err)
+	}
+	rows, _ = corrosion.ListBackupSchedules(context.Background(), s.db)
+	if len(rows) != 1 || !corrosion.ContainerScheduleIs(rows[0], "p1", "web") {
+		t.Fatalf("the delete removed the wrong schedule: %+v", rows)
+	}
+}
+
 func TestContainerReplicationSchedule_ListAndDeleteUseTheContainerName(t *testing.T) {
 	s := testServer(t)
 	ctx := adminCtx()
-	rec := corrosion.BackupScheduleRecord{
-		VMName: corrosion.ContainerScheduleKey("web"), ProjectName: "_default", Scope: "container",
-		Repo: "dr", Cron: "0 * * * *", Enabled: true, Type: "replication", TargetPool: "dr", TargetHost: "host-b",
+	for _, key := range []string{corrosion.ContainerScheduleKey("_default", "web"), "@ct:legacy"} {
+		name := "web"
+		if key == "@ct:legacy" {
+			name = "legacy"
+		}
+		rec := corrosion.BackupScheduleRecord{
+			VMName: key, ProjectName: "_default", Scope: "container",
+			Repo: "dr", Cron: "0 * * * *", Enabled: true, Type: "replication", TargetPool: "dr", TargetHost: "host-b",
+		}
+		if err := corrosion.UpsertBackupSchedule(context.Background(), s.db, rec); err != nil {
+			t.Fatal(err)
+		}
+		resp, err := s.ListReplicationSchedules(ctx, &pb.ListReplicationSchedulesRequest{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for _, got := range resp.Schedules {
+			if got.VmName == name && got.Scope == "container" {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("a container schedule must list as its container %q: %+v", name, resp.Schedules)
+		}
 	}
-	if err := corrosion.UpsertBackupSchedule(context.Background(), s.db, rec); err != nil {
+	// Removable by name, or by the key a CLI sends, though the container is gone.
+	if _, err := s.DeleteReplicationSchedule(ctx, &pb.DeleteReplicationScheduleRequest{VmName: "web", Scope: "container", TargetPool: "dr"}); err != nil {
 		t.Fatal(err)
 	}
-	resp, err := s.ListReplicationSchedules(ctx, &pb.ListReplicationSchedulesRequest{})
-	if err != nil || len(resp.Schedules) != 1 {
-		t.Fatalf("list: %v %v", resp, err)
-	}
-	if got := resp.Schedules[0]; got.VmName != "web" || got.Scope != "container" {
-		t.Fatalf("a container schedule must list as its container, got vm %q scope %q", got.VmName, got.Scope)
-	}
-	// Removable though its container is gone: the row carries its own project.
-	if _, err := s.DeleteReplicationSchedule(ctx, &pb.DeleteReplicationScheduleRequest{VmName: "web", Scope: "container", TargetPool: "dr"}); err != nil {
+	if _, err := s.DeleteReplicationSchedule(ctx, &pb.DeleteReplicationScheduleRequest{VmName: "@ct:legacy", Scope: "container", TargetPool: "dr"}); err != nil {
 		t.Fatal(err)
 	}
 	rows, _ := corrosion.ListBackupSchedules(context.Background(), s.db)
@@ -262,16 +552,17 @@ func TestContainerReplicationSchedule_ListAndDeleteUseTheContainerName(t *testin
 
 func TestRunContainerReplication_RefusesItsOwnHostAndAnInactiveTarget(t *testing.T) {
 	s := testServer(t)
+	openCTGate(s)
 	seedCTRow(t, s, "test-host", "web", "_default", "image-recreate")
 	seedActiveHost(t, s, "host-b", true)
 	base := corrosion.BackupScheduleRecord{
-		VMName: corrosion.ContainerScheduleKey("web"), ProjectName: "_default", Scope: "container",
+		VMName: corrosion.ContainerScheduleKey("_default", "web"), ProjectName: "_default", Scope: "container",
 		Repo: "dr", Cron: "0 * * * *", Enabled: true, Type: "replication", TargetPool: "dr",
 	}
 	self := base
 	self.TargetHost = "test-host"
-	if err := s.runContainerReplication(context.Background(), self, time.Now()); err == nil {
-		t.Fatal("a replica onto the container's own host protects nothing and must be refused")
+	if err := s.runContainerReplication(context.Background(), self, time.Now()); err == nil || !isSuspended(err) {
+		t.Fatalf("a replica onto the container's own host protects nothing: it must be suspended, never a success: %v", err)
 	}
 	gone := base
 	gone.TargetHost = "ghost"
@@ -280,12 +571,21 @@ func TestRunContainerReplication_RefusesItsOwnHostAndAnInactiveTarget(t *testing
 	}
 	// Not ours: another host's container is that host's scheduler's to run.
 	other := base
-	other.VMName = corrosion.ContainerScheduleKey("elsewhere")
+	other.VMName = corrosion.ContainerScheduleKey("_default", "elsewhere")
 	other.TargetHost = "host-b"
 	if err := s.runContainerReplication(context.Background(), other, time.Now()); err != nil {
 		t.Fatalf("a container this host does not hold is not an error: %v", err)
 	}
+	// And nothing runs with the release feature closed.
+	s.SetContainerReplicationGate(nil)
+	tb := base
+	tb.TargetHost = "host-b"
+	if err := s.runContainerReplication(context.Background(), tb, time.Now()); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("a run with the release gate closed: %v", err)
+	}
 }
+
+func isSuspended(err error) bool { return errors.Is(err, errReplicationSuspended) }
 
 // Reversing a schedule onto the host a workload left puts new replicas there; it
 // must never replace a copy that host already holds. A replica is published
@@ -306,5 +606,74 @@ func TestPublishRecordedReplica_NeverReplacesAnExistingReplica(t *testing.T) {
 	got, _ := os.ReadFile(path)
 	if string(got) != "the newer copy" {
 		t.Fatalf("the existing replica was overwritten: %q", got)
+	}
+}
+
+// I3: failover promotes only a replica taken from the very row it relocates
+// (its host and row incarnation) and not set aside. A newer replica a stale
+// host pushed, one from an earlier segment, or a set-aside one is never chosen.
+func TestContainerReplicaFor_PromotesOnlyTheRelocatingRowsReplica(t *testing.T) {
+	s := testServer(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	at := func(d time.Duration) string { return now.Add(-d).Format(time.RFC3339) }
+	if err := corrosion.UpsertBackupSchedule(ctx, s.db, corrosion.BackupScheduleRecord{
+		VMName: corrosion.ContainerScheduleKey("_default", "web"), ProjectName: "_default", Scope: "container",
+		Repo: "dr", Cron: "0 * * * *", Enabled: true, Type: "replication", TargetPool: "dr", TargetHost: "host-b", AutoPromote: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	owner := &corrosion.ContainerRecord{HostName: "host-a", Name: "web", Project: "_default", CreatedAt: "inc-a"}
+	peer := &replicaPeer{reps: []*pb.ContainerReplica{
+		{Timestamp: at(50 * time.Minute), Source: "host-a", Incarnation: "inc-a"},                 // the one
+		{Timestamp: at(40 * time.Minute), Source: "host-x", Incarnation: "inc-x"},                 // another segment
+		{Timestamp: at(30 * time.Minute), Source: "host-a", Incarnation: "inc-old"},               // an earlier row
+		{Timestamp: at(20 * time.Minute), Source: "host-a", Incarnation: "inc-a", SetAside: true}, // set aside
+	}}
+	s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) { return peer, func() {}, nil }
+	rep, ok := s.containerReplicaFor(ctx, "web", owner, "host-b", now)
+	if !ok || rep.Timestamp != at(50*time.Minute) || rep.Repo != containerReplicaRepo("_default", "dr") {
+		t.Fatalf("promoted %+v (ok=%v), want the relocating row's own replica in the namespace", rep, ok)
+	}
+	if _, ok := s.containerReplicaFor(ctx, "web", nil, "host-b", now); ok {
+		t.Fatal("with the relocating row unreadable nothing is promotable")
+	}
+}
+
+// The provenance a restore recorded proves something only for the row that
+// restore laid down: a later row (a re-create, another restore) gets nothing.
+func TestContainerBases_OnlyForTheRowTheRestoreLaidDown(t *testing.T) {
+	s := testServer(t)
+	s.dataDir = t.TempDir()
+	spec := containerBackupSpec{Source: "host-a", Incarnation: "inc-a",
+		Bases: []replicaBase{{Source: "host-z", Incarnation: "inc-z", Taken: "2026-01-01T00:00:00Z"}}}
+	s.recordContainerBases("_default", "web", "row-1", spec, "2026-02-01T00:00:00Z")
+	got := s.containerBases(&corrosion.ContainerRecord{Name: "web", Project: "_default", CreatedAt: "row-1"})
+	if len(got) != 2 || got[0] != (replicaBase{Source: "host-a", Incarnation: "inc-a", Taken: "2026-02-01T00:00:00Z"}) {
+		t.Fatalf("chain = %+v, want the archive's own point then the chain it carried", got)
+	}
+	if got := s.containerBases(&corrosion.ContainerRecord{Name: "web", Project: "_default", CreatedAt: "row-2"}); got != nil {
+		t.Fatalf("another row incarnation inherited the chain: %+v", got)
+	}
+}
+
+// I3, sender: a host whose owner-epoch marker is ahead of the row it reads has a
+// view behind the runtime it holds; it does not replicate.
+func TestRunContainerReplication_RefusesWhenItsMarkerIsAhead(t *testing.T) {
+	s := testServer(t)
+	openCTGate(s)
+	s.containersRoot = t.TempDir()
+	seedCTRow(t, s, "test-host", "web", "_default", "image-recreate")
+	seedActiveHost(t, s, "host-b", true)
+	if err := health.WriteContainerOwnerEpochMarker(s.containersRoot, "web", 5); err != nil {
+		t.Fatal(err)
+	}
+	sched := corrosion.BackupScheduleRecord{
+		VMName: corrosion.ContainerScheduleKey("_default", "web"), ProjectName: "_default", Scope: "container",
+		Repo: "dr", Cron: "0 * * * *", Enabled: true, Type: "replication", TargetPool: "dr", TargetHost: "host-b",
+	}
+	err := s.runContainerReplication(context.Background(), sched, time.Now())
+	if err == nil || !strings.Contains(err.Error(), "marker") {
+		t.Fatalf("a run behind its own marker: %v, want refused", err)
 	}
 }

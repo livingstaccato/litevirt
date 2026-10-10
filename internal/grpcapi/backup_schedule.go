@@ -120,11 +120,14 @@ func (s *Server) scheduleRBACTarget(ctx context.Context, scope, vmName, poolName
 	case "container":
 		// A container schedule row records its container's project when it is
 		// made, so it authorizes on the container's own path.
-		name, ok := corrosion.ContainerScheduleName(vmName)
+		p, name, ok := corrosion.ContainerScheduleName(vmName)
 		if !ok {
 			name = vmName // a request names the container itself
 		}
-		return ctRBACPathFor(tenancy.NormalizeProject(projectName), name), true
+		if p == "" {
+			p = projectName
+		}
+		return ctRBACPathFor(tenancy.NormalizeProject(p), name), true
 	default:
 		if vm, err := corrosion.GetVM(ctx, s.db, vmName); err == nil && vm != nil {
 			return vmRBACPath(vm), true

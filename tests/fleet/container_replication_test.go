@@ -2,7 +2,6 @@ package fleet
 
 import (
 	"context"
-	"encoding/json"
 	"path/filepath"
 	"testing"
 	"time"
@@ -57,8 +56,17 @@ func drRepo(t *testing.T, target *Node) string {
 	return root
 }
 
+// openCTReplication opens the container_replication release feature on every
+// node, as a latched release token does in production.
+func openCTReplication(c *Cluster) {
+	for _, n := range c.Nodes {
+		n.Server.SetContainerReplicationGate(func(context.Context) error { return nil })
+	}
+}
+
 func ctSchedule(t *testing.T, c *Cluster, owner *Node, name, targetHost string, keep int32, autoPromote bool) corrosion.BackupScheduleRecord {
 	t.Helper()
+	openCTReplication(c)
 	if _, err := c.SelfClient(owner).CreateReplicationSchedule(context.Background(), &pb.CreateReplicationScheduleRequest{
 		VmName: name, Scope: "container", Cron: "0 * * * *", TargetHost: targetHost, TargetPool: "dr",
 		KeepReplicas: keep, Enabled: true, AutoPromote: autoPromote,
@@ -70,7 +78,7 @@ func ctSchedule(t *testing.T, c *Cluster, owner *Node, name, targetHost string, 
 		t.Fatal(err)
 	}
 	for _, r := range rows {
-		if r.Scope == "container" && r.VMName == corrosion.ContainerScheduleKey(name) {
+		if corrosion.ContainerScheduleIs(r, "", name) {
 			return r
 		}
 	}
@@ -78,24 +86,16 @@ func ctSchedule(t *testing.T, c *Cluster, owner *Node, name, targetHost string, 
 	return corrosion.BackupScheduleRecord{}
 }
 
-func replicaEpoch(t *testing.T, m pbsstore.Manifest) int64 {
-	t.Helper()
-	var spec struct {
-		Replica struct {
-			Epoch int64 `json:"epoch"`
-		} `json:"replica"`
-	}
-	if err := json.Unmarshal([]byte(m.ContainerSpecJSON), &spec); err != nil {
-		t.Fatal(err)
-	}
-	return spec.Replica.Epoch
-}
+// replicaNS is the default project's replica namespace in the repo at repo.
+func replicaNS(repo string) string { return filepath.Join(repo, ".ct-replicas", "_default") }
 
+// replicas lists name's replicas in the default project's replica namespace of
+// the repo at repo (none when it has none yet).
 func replicas(t *testing.T, repo, name string) []pbsstore.Manifest {
 	t.Helper()
-	r, err := pbsstore.Open(repo)
+	r, err := pbsstore.Open(replicaNS(repo))
 	if err != nil {
-		t.Fatal(err)
+		return nil
 	}
 	ms, err := r.ManifestsFor(context.Background(), name, "rootfs")
 	if err != nil {
@@ -225,10 +225,10 @@ func TestContainerReplication_ATooOldReplicaIsNotPromotedAutomatically(t *testin
 	}
 }
 
-// A replica of an earlier ownership generation arriving after a newer one is
-// refused at the target: the newer copy is never replaced by an older one, whatever
-// the timestamps say.
-func TestContainerReplication_AnOlderGenerationNeverReplacesANewerReplica(t *testing.T) {
+// A replica older than one the target already holds of the same segment of the
+// container's history is refused at the target: the newer copy is never
+// replaced by an older one.
+func TestContainerReplication_AnOlderCopyNeverReplacesANewerReplica(t *testing.T) {
 	c := New(t, Options{Nodes: 3, SharedCRDT: true})
 	a, b := c.Nodes[0], c.Nodes[1]
 	ctx := context.Background()
@@ -236,36 +236,17 @@ func TestContainerReplication_AnOlderGenerationNeverReplacesANewerReplica(t *tes
 	replCT(t, c, a, name)
 	repo := drRepo(t, b)
 	sched := ctSchedule(t, c, a, name, b.Name, 3, true)
-	setEpoch := func(e int) {
-		if err := a.DB.Execute(ctx, `UPDATE containers SET owner_epoch = ? WHERE host_name = ? AND name = ?`, e, a.Name, name); err != nil {
-			t.Fatal(err)
-		}
-	}
 	now := time.Now().UTC()
-	setEpoch(5)
-	a.CT.Seed(name, "epoch5")
-	if err := a.Server.RunReplication(ctx, sched, now.Add(-2*time.Minute)); err != nil {
+	a.CT.Seed(name, "newer")
+	if err := a.Server.RunReplication(ctx, sched, now.Add(-time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	// The same container, an earlier generation, a LATER wall-clock stamp.
-	setEpoch(4)
-	a.CT.Seed(name, "epoch4")
-	if err := a.Server.RunReplication(ctx, sched, now.Add(-time.Minute)); err == nil {
-		t.Fatal("a replica of an earlier ownership generation must be refused by the target")
+	a.CT.Seed(name, "older")
+	if err := a.Server.RunReplication(ctx, sched, now.Add(-2*time.Minute)); err == nil {
+		t.Fatal("a replica older than the one held must be refused by the target")
 	}
-	ms := replicas(t, repo, name)
-	if len(ms) != 1 {
-		t.Fatalf("the target holds %d replicas, want only the epoch-5 one", len(ms))
-	}
-	// And a later generation supersedes the earlier one.
-	setEpoch(6)
-	a.CT.Seed(name, "epoch6")
-	if err := a.Server.RunReplication(ctx, sched, now); err != nil {
-		t.Fatal(err)
-	}
-	// The earlier generation's replica is superseded and goes, keep_replicas or not.
-	if ms = replicas(t, repo, name); len(ms) != 1 || replicaEpoch(t, ms[0]) != 6 {
-		t.Fatalf("the epoch-6 replica must replace the epoch-5 one, got %d replica(s)", len(ms))
+	if ms := replicas(t, repo, name); len(ms) != 1 {
+		t.Fatalf("the target holds %d replicas, want only the newer one", len(ms))
 	}
 }
 
@@ -322,7 +303,7 @@ func TestContainerReplication_FencedHostsContainerComesUpOnTheReplicaHost(t *tes
 	}
 	// The container now runs on its replica target: the schedule replicates back to
 	// the host it left, rather than leaving it replicating onto itself.
-	if got := scheduleTarget(t, replicaHost, corrosion.ContainerScheduleKey(name), "dr"); got != victim.Name {
+	if got := scheduleTarget(t, replicaHost, corrosion.ContainerScheduleKey("_default", name), "dr"); got != victim.Name {
 		t.Fatalf("after the failover the schedule targets %q, want the host the container left, %q", got, victim.Name)
 	}
 }
@@ -345,7 +326,7 @@ func TestContainerReplication_MigrateThereAndBackFollowsTheContainer(t *testing.
 	if err := a.Server.RunReplication(ctx, sched, time.Now().UTC().Add(-3*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	key := corrosion.ContainerScheduleKey(name)
+	key := corrosion.ContainerScheduleKey("_default", name)
 
 	if err := runMigrate(t, c, a, b, name, stagingRepo(t)); err != nil {
 		t.Fatalf("migrate a->b: %v", err)
@@ -368,12 +349,34 @@ func TestContainerReplication_MigrateThereAndBackFollowsTheContainer(t *testing.
 	if ms := replicas(t, repoA, name); len(ms) != 1 {
 		t.Fatalf("a's repo holds %d replicas after the reversed run, want 1", len(ms))
 	}
-	_ = repoB
+	if ms := replicas(t, repoB, name); len(ms) != 1 {
+		t.Fatalf("b's repo holds %d replicas, want a's first one kept there", len(ms))
+	}
 
 	if err := runMigrate(t, c, b, a, name, stagingRepo(t)); err != nil {
 		t.Fatalf("migrate b->a (failback): %v", err)
 	}
 	if got := scheduleTarget(t, a, key, "dr"); got != b.Name {
 		t.Fatalf("after the failback the replica belongs on b again, schedule says %q", got)
+	}
+	// The run after the failback lands on b, where a's replica from before the
+	// moves is. The container's data provably descends from it (each migrate
+	// recorded the archive it laid down), so it is contained and goes; nothing
+	// is set aside.
+	rows, _ = corrosion.ListBackupSchedules(ctx, a.DB)
+	for _, r := range rows {
+		if r.VMName == key {
+			onB = r
+		}
+	}
+	if err := a.Server.RunReplication(ctx, onB, time.Now().UTC()); err != nil {
+		t.Fatalf("replicate a->b after the failback: %v", err)
+	}
+	list, err := c.SelfClient(b).ListContainerReplicas(ctx, &pb.ListContainerReplicasRequest{Repo: "dr", Project: "_default", Name: name})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Replicas) != 1 || list.Replicas[0].SetAside || list.Replicas[0].Source != a.Name {
+		t.Fatalf("b holds %+v, want only the new replica: the one from before the moves is proven contained", list.Replicas)
 	}
 }

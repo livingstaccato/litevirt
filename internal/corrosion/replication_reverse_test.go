@@ -55,7 +55,7 @@ func TestReverseReplicationOnMove_PromotedVMReplicatesBackToTheOldSource(t *test
 	if err := SetReplicationCheckpoint(ctx, db, "web", "dr", "cp-old"); err != nil {
 		t.Fatal(err)
 	}
-	revs, err := ReverseReplicationOnMove(ctx, db, "vm", "web", "", "host-a", "host-b")
+	revs, err := ReverseReplicationOnMove(ctx, db, "vm", "web", "", "host-a", "host-b", ReverseOptions{})
 	if err != nil || len(revs) != 1 || revs[0].Skipped != "" || revs[0].ToHost != "host-a" {
 		t.Fatalf("revs=%+v err=%v", revs, err)
 	}
@@ -75,11 +75,11 @@ func TestReverseReplicationOnMove_FailbackSwitchesItBack(t *testing.T) {
 	if err := UpsertBackupSchedule(ctx, db, vmSched("web", "dr", "host-b")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ReverseReplicationOnMove(ctx, db, "vm", "web", "", "host-a", "host-b"); err != nil {
+	if _, err := ReverseReplicationOnMove(ctx, db, "vm", "web", "", "host-a", "host-b", ReverseOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	// The VM moves back to host-a, which is now its replica target.
-	if _, err := ReverseReplicationOnMove(ctx, db, "vm", "web", "", "host-b", "host-a"); err != nil {
+	if _, err := ReverseReplicationOnMove(ctx, db, "vm", "web", "", "host-b", "host-a", ReverseOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	if got := schedulesOf(t, db)["web|dr"]; got.TargetHost != "host-b" {
@@ -102,7 +102,7 @@ func TestReverseReplicationOnMove_LeavesWhatAlreadyReplicatesAway(t *testing.T) 
 		t.Fatal(err)
 	}
 	for _, vm := range []string{"elsewhere", "auto", "web"} {
-		revs, err := ReverseReplicationOnMove(ctx, db, "vm", vm, "", "host-a", "host-b")
+		revs, err := ReverseReplicationOnMove(ctx, db, "vm", vm, "", "host-a", "host-b", ReverseOptions{})
 		if err != nil || len(revs) != 0 {
 			t.Fatalf("%s: revs=%+v err=%v, want nothing to do", vm, revs, err)
 		}
@@ -121,7 +121,7 @@ func TestReverseReplicationOnMove_OnlyTheWorkloadsOwnSchedule(t *testing.T) {
 	for _, r := range []BackupScheduleRecord{
 		vmSched("web", "dr", "host-b"),
 		vmSched("other", "dr", "host-b"),
-		{VMName: ContainerScheduleKey("web"), Scope: "container", ProjectName: "_default", Repo: "dr", Cron: "0 * * * *",
+		{VMName: ContainerScheduleKey("_default", "web"), Scope: "container", ProjectName: "_default", Repo: "dr", Cron: "0 * * * *",
 			Enabled: true, Type: "replication", TargetPool: "dr", TargetHost: "host-b"},
 		{VMName: "@cluster", Scope: "cluster", Repo: "dr", Cron: "0 * * * *", Enabled: true,
 			Type: "replication", TargetPool: "dr", TargetHost: "host-b"},
@@ -130,14 +130,14 @@ func TestReverseReplicationOnMove_OnlyTheWorkloadsOwnSchedule(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, err := ReverseReplicationOnMove(ctx, db, "vm", "web", "", "host-a", "host-b"); err != nil {
+	if _, err := ReverseReplicationOnMove(ctx, db, "vm", "web", "", "host-a", "host-b", ReverseOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	s := schedulesOf(t, db)
 	if s["web|dr"].TargetHost != "host-a" {
 		t.Fatalf("the VM's own schedule did not move: %+v", s["web|dr"])
 	}
-	for _, k := range []string{"other|dr", "@ct:web|dr", "@cluster|dr"} {
+	for _, k := range []string{"other|dr", ContainerScheduleKey("_default", "web") + "|dr", "@cluster|dr"} {
 		if s[k].TargetHost != "host-b" {
 			t.Errorf("%s was re-pointed by another workload's move: %+v", k, s[k])
 		}
@@ -147,20 +147,20 @@ func TestReverseReplicationOnMove_OnlyTheWorkloadsOwnSchedule(t *testing.T) {
 func TestReverseReplicationOnMove_Container(t *testing.T) {
 	db := reverseFixture(t)
 	ctx := context.Background()
-	ct := BackupScheduleRecord{VMName: ContainerScheduleKey("web"), Scope: "container", ProjectName: "prod", Repo: "dr",
+	ct := BackupScheduleRecord{VMName: ContainerScheduleKey("prod", "web"), Scope: "container", ProjectName: "prod", Repo: "dr",
 		Cron: "0 * * * *", Enabled: true, Type: "replication", TargetPool: "dr", TargetHost: "host-b", KeepReplicas: 2, AutoPromote: true}
 	if err := UpsertBackupSchedule(ctx, db, ct); err != nil {
 		t.Fatal(err)
 	}
 	// Another project's same-named container moving does not move this schedule.
-	if revs, _ := ReverseReplicationOnMove(ctx, db, "container", "web", "_default", "host-a", "host-b"); len(revs) != 0 {
+	if revs, _ := ReverseReplicationOnMove(ctx, db, "container", "web", "_default", "host-a", "host-b", ReverseOptions{}); len(revs) != 0 {
 		t.Fatalf("another project's container reversed this schedule: %+v", revs)
 	}
-	revs, err := ReverseReplicationOnMove(ctx, db, "container", "web", "prod", "host-a", "host-b")
+	revs, err := ReverseReplicationOnMove(ctx, db, "container", "web", "prod", "host-a", "host-b", ReverseOptions{})
 	if err != nil || len(revs) != 1 || revs[0].Skipped != "" {
 		t.Fatalf("revs=%+v err=%v", revs, err)
 	}
-	if got := schedulesOf(t, db)["@ct:web|dr"]; got.TargetHost != "host-a" || got.KeepReplicas != 2 || !got.AutoPromote {
+	if got := schedulesOf(t, db)[ContainerScheduleKey("prod", "web")+"|dr"]; got.TargetHost != "host-a" || got.KeepReplicas != 2 || !got.AutoPromote {
 		t.Fatalf("container schedule after reversal = %+v", got)
 	}
 }
@@ -179,7 +179,7 @@ func TestReverseReplicationOnMove_ReportsWhenTheOldHostCannotBeATarget(t *testin
 	if err := UpsertStoragePool(ctx, db, StoragePoolRecord{HostName: "host-b", Name: "scratch", Driver: "local", Target: "/x", State: "active"}); err != nil {
 		t.Fatal(err)
 	}
-	revs, err := ReverseReplicationOnMove(ctx, db, "vm", "lonely", "", "host-a", "host-b")
+	revs, err := ReverseReplicationOnMove(ctx, db, "vm", "lonely", "", "host-a", "host-b", ReverseOptions{})
 	if err != nil || len(revs) != 1 || revs[0].Skipped == "" {
 		t.Fatalf("a pool the old host lacks must be reported: revs=%+v err=%v", revs, err)
 	}
@@ -190,12 +190,12 @@ func TestReverseReplicationOnMove_ReportsWhenTheOldHostCannotBeATarget(t *testin
 	if err := SetHostLabel(ctx, db, "host-a", LabelLXCCapable, "false"); err != nil {
 		t.Fatal(err)
 	}
-	ct := BackupScheduleRecord{VMName: ContainerScheduleKey("web"), Scope: "container", Repo: "dr", Cron: "0 * * * *",
+	ct := BackupScheduleRecord{VMName: ContainerScheduleKey("", "web"), Scope: "container", Repo: "dr", Cron: "0 * * * *",
 		Enabled: true, Type: "replication", TargetPool: "dr", TargetHost: "host-b"}
 	if err := UpsertBackupSchedule(ctx, db, ct); err != nil {
 		t.Fatal(err)
 	}
-	revs, err = ReverseReplicationOnMove(ctx, db, "container", "web", "", "host-a", "host-b")
+	revs, err = ReverseReplicationOnMove(ctx, db, "container", "web", "", "host-a", "host-b", ReverseOptions{})
 	if err != nil || len(revs) != 1 || revs[0].Skipped == "" {
 		t.Fatalf("revs=%+v err=%v", revs, err)
 	}
@@ -213,18 +213,113 @@ func TestContainerScheduleKey_DoesNotCollideWithAVMSchedule(t *testing.T) {
 	if err := UpsertBackupSchedule(ctx, db, vmSched("web", "dr", "host-b")); err != nil {
 		t.Fatal(err)
 	}
-	if err := UpsertBackupSchedule(ctx, db, BackupScheduleRecord{VMName: ScheduleKey("container", "web", "", ""), Scope: "container",
+	ctKey := ScheduleKey("container", "web", "", "")
+	if err := UpsertBackupSchedule(ctx, db, BackupScheduleRecord{VMName: ctKey, Scope: "container",
 		Repo: "dr", Cron: "0 * * * *", Enabled: true, Type: "replication", TargetPool: "dr", TargetHost: "host-c"}); err != nil {
 		t.Fatal(err)
 	}
 	s := schedulesOf(t, db)
-	if len(s) != 2 || s["web|dr"].TargetHost != "host-b" || s["@ct:web|dr"].TargetHost != "host-c" {
+	if len(s) != 2 || s["web|dr"].TargetHost != "host-b" || s[ctKey+"|dr"].TargetHost != "host-c" {
 		t.Fatalf("the two schedules must coexist untouched: %+v", s)
 	}
-	if n, ok := ContainerScheduleName("@ct:web"); !ok || n != "web" {
+	if _, n, ok := ContainerScheduleName(ctKey); !ok || n != "web" {
 		t.Fatalf("name round trip: %q %v", n, ok)
 	}
-	if _, ok := ContainerScheduleName("web"); ok {
+	if _, _, ok := ContainerScheduleName("web"); ok {
 		t.Fatal("a VM key must not read as a container key")
+	}
+}
+
+// A container name is unique per project, not cluster-wide: two projects'
+// same-named containers replicating into the same repo are two schedules, and
+// adding one never replaces the other.
+func TestContainerScheduleKey_CarriesTheProject(t *testing.T) {
+	db := reverseFixture(t)
+	ctx := context.Background()
+	p1, p2 := ContainerScheduleKey("p1", "web"), ContainerScheduleKey("p2", "web")
+	if p1 == p2 {
+		t.Fatalf("two projects' containers share the key %q", p1)
+	}
+	for _, r := range []BackupScheduleRecord{
+		{VMName: p1, ProjectName: "p1", Scope: "container", Repo: "dr", Cron: "0 * * * *", Enabled: true,
+			Type: "replication", TargetPool: "dr", TargetHost: "host-b", AutoPromote: true},
+		{VMName: p2, ProjectName: "p2", Scope: "container", Repo: "dr", Cron: "0 * * * *", Enabled: true,
+			Type: "replication", TargetPool: "dr", TargetHost: "host-c"},
+	} {
+		if err := UpsertBackupSchedule(ctx, db, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := schedulesOf(t, db)
+	if len(s) != 2 || s[p1+"|dr"].TargetHost != "host-b" || !s[p1+"|dr"].AutoPromote || s[p2+"|dr"].TargetHost != "host-c" {
+		t.Fatalf("p2's schedule changed p1's: %+v", s)
+	}
+	for key, want := range map[string][2]string{p1: {"p1", "web"}, "@ct:web": {"", "web"}} {
+		if p, n, ok := ContainerScheduleName(key); !ok || p != want[0] || n != want[1] {
+			t.Errorf("ContainerScheduleName(%q) = %q %q %v", key, p, n, ok)
+		}
+	}
+	// The earlier name-only key is still its own project's schedule, read off
+	// project_name, and no other project's.
+	legacy := BackupScheduleRecord{VMName: "@ct:web", ProjectName: "p1", Scope: "container"}
+	if !ContainerScheduleIs(legacy, "p1", "web") || ContainerScheduleIs(legacy, "p2", "web") {
+		t.Fatal("a name-only key must match its row's project and only that")
+	}
+	if !ContainerScheduleIs(BackupScheduleRecord{VMName: p2, Scope: "container"}, "p2", "web") ||
+		ContainerScheduleIs(BackupScheduleRecord{VMName: p2, ProjectName: "p1", Scope: "container"}, "p1", "web") {
+		t.Fatal("a project-qualified key names its project, whatever project_name says")
+	}
+}
+
+// The switch changes target_host and nothing else: an edit of the same row that
+// lands between the reversal's read and its write (an operator disabling the
+// schedule on another node) survives it, in both write forms.
+func TestReverseReplicationOnMove_KeepsAConcurrentEditOfTheRow(t *testing.T) {
+	for _, targetOnly := range []bool{false, true} {
+		db := reverseFixture(t)
+		ctx := context.Background()
+		if err := UpsertBackupSchedule(ctx, db, vmSched("web", "dr", "host-b")); err != nil {
+			t.Fatal(err)
+		}
+		reverseBeforeWrite = func() {
+			edited := vmSched("web", "dr", "host-b")
+			edited.Enabled, edited.Cron, edited.KeepReplicas = false, "30 2 * * *", 9
+			if err := UpsertBackupSchedule(ctx, db, edited); err != nil {
+				t.Error(err)
+			}
+		}
+		revs, err := ReverseReplicationOnMove(ctx, db, "vm", "web", "", "host-a", "host-b", ReverseOptions{TargetOnly: targetOnly})
+		reverseBeforeWrite = nil
+		if err != nil || len(revs) != 1 {
+			t.Fatalf("targetOnly=%v: revs=%+v err=%v", targetOnly, revs, err)
+		}
+		got := schedulesOf(t, db)["web|dr"]
+		if got.TargetHost != "host-a" || got.Enabled || got.Cron != "30 2 * * *" || got.KeepReplicas != 9 {
+			t.Fatalf("targetOnly=%v: the concurrent edit was reverted: %+v", targetOnly, got)
+		}
+	}
+}
+
+// A schedule re-targeted meanwhile is not the reversal's to move.
+func TestReverseReplicationOnMove_ARetargetedScheduleIsLeftAlone(t *testing.T) {
+	for _, targetOnly := range []bool{false, true} {
+		db := reverseFixture(t)
+		ctx := context.Background()
+		if err := UpsertBackupSchedule(ctx, db, vmSched("web", "dr", "host-b")); err != nil {
+			t.Fatal(err)
+		}
+		reverseBeforeWrite = func() {
+			if err := UpsertBackupSchedule(ctx, db, vmSched("web", "dr", "host-c")); err != nil {
+				t.Error(err)
+			}
+		}
+		revs, err := ReverseReplicationOnMove(ctx, db, "vm", "web", "", "host-a", "host-b", ReverseOptions{TargetOnly: targetOnly})
+		reverseBeforeWrite = nil
+		if err != nil || len(revs) != 0 {
+			t.Fatalf("targetOnly=%v: revs=%+v err=%v", targetOnly, revs, err)
+		}
+		if got := schedulesOf(t, db)["web|dr"]; got.TargetHost != "host-c" {
+			t.Fatalf("targetOnly=%v: an operator's re-target was overwritten: %+v", targetOnly, got)
+		}
 	}
 }

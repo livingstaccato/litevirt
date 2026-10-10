@@ -12,6 +12,8 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/failover"
+	"github.com/litevirt/litevirt/internal/fence"
 	"github.com/litevirt/litevirt/internal/qcow2"
 )
 
@@ -225,5 +227,62 @@ func TestReplicationReverse_AColdMoveOntoTheReplicaHostSwitchesIt(t *testing.T) 
 	}
 	if got := scheduleTarget(t, sc.dst, "os1", "dr"); got != sc.src.Name {
 		t.Fatalf("after the cold move onto its replica host the schedule targets %q, want the host it left, %q", got, sc.src.Name)
+	}
+}
+
+// A host failure the coordinator recovers by rescheduling the VM onto a survivor
+// that holds one of its replicas switches that schedule back to the lost host
+// (I2): it is never left replicating onto the host the VM now runs on.
+func TestReplicationReverse_AFailoverRescheduleSwitchesTheScheduleItLandsOn(t *testing.T) {
+	c := New(t, Options{Nodes: 3, SharedCRDT: true})
+	ctx := context.Background()
+	a, b, victim := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	nowRFC := time.Now().UTC().Format(time.RFC3339)
+	for _, observer := range []string{a.Name, b.Name} {
+		if err := a.DB.Execute(ctx,
+			`INSERT OR REPLACE INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
+			 VALUES (?, ?, 'suspect', 5, NULL, ?)`, observer, victim.Name, nowRFC); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := corrosion.InsertVM(ctx, a.DB, corrosion.VMRecord{
+		Name: "web", HostName: victim.Name, Spec: `{"on_host_failure":"restart-any"}`, State: "running",
+	}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	// One schedule onto each survivor, each into a pool the victim has too:
+	// wherever the VM lands, exactly one of them must switch to the victim.
+	for _, n := range []*Node{a, b} {
+		pool := "dr-" + n.Name
+		for _, h := range []string{n.Name, victim.Name} {
+			if err := corrosion.UpsertStoragePool(ctx, a.DB, corrosion.StoragePoolRecord{HostName: h, Name: pool, Driver: "local", Target: "/" + pool, State: "active"}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := corrosion.UpsertBackupSchedule(ctx, a.DB, corrosion.BackupScheduleRecord{
+			VMName: "web", Scope: "vm", Repo: pool, Cron: "0 * * * *", Enabled: true,
+			Type: "replication", TargetPool: pool, TargetHost: n.Name,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	coord := failover.NewCoordinator(a.Name, a.DB)
+	coord.SetFencer(func(context.Context, fence.HostConfig) fence.Result {
+		return fence.Result{Method: "fleet-test", Success: true}
+	})
+	coord.RunOnce(ctx)
+	vm, _ := corrosion.GetVM(ctx, a.DB, "web")
+	if vm == nil || vm.HostName == victim.Name {
+		t.Fatalf("the premise: the VM must have been rescheduled off %s: %+v", victim.Name, vm)
+	}
+	other := a
+	if vm.HostName == a.Name {
+		other = b
+	}
+	if got := scheduleTarget(t, a, "web", "dr-"+vm.HostName); got != victim.Name {
+		t.Fatalf("the schedule onto %s (where the VM now runs) targets %q, want the lost host %s", vm.HostName, got, victim.Name)
+	}
+	if got := scheduleTarget(t, a, "web", "dr-"+other.Name); got != other.Name {
+		t.Fatalf("the schedule onto %s was changed: %q", other.Name, got)
 	}
 }

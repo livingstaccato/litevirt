@@ -18,6 +18,7 @@ func newReplicationCmd() *cobra.Command {
 	cmd.AddCommand(
 		newReplicationScheduleCmd(),
 		newReplicationPromoteCmd(),
+		newReplicationReplicasCmd(),
 	)
 	return cmd
 }
@@ -71,9 +72,13 @@ replication").`,
 			if scope == "" {
 				scope = "vm"
 			}
+			name := args[0]
+			if scope == "container" {
+				name = containerScheduleRef(projectName, name)
+			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				s, err := c.CreateReplicationSchedule(ctx, &pb.CreateReplicationScheduleRequest{
-					VmName: args[0], Cron: cron, TargetPool: targetPool, TargetHost: targetHost,
+					VmName: name, Cron: cron, TargetPool: targetPool, TargetHost: targetHost,
 					KeepReplicas: keepReplicas, Enabled: !disabled, Scope: scope,
 					PoolName: poolName, ProjectName: projectName,
 					Incremental: incremental, AutoPromote: autoPromote,
@@ -148,9 +153,13 @@ func newReplicationScheduleRmCmd() *cobra.Command {
 			if scope == "" {
 				scope = "vm"
 			}
+			name := args[0]
+			if scope == "container" {
+				name = containerScheduleRef(projectName, name)
+			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				if _, err := c.DeleteReplicationSchedule(ctx, &pb.DeleteReplicationScheduleRequest{
-					VmName: args[0], TargetPool: targetPool, Scope: scope,
+					VmName: name, TargetPool: targetPool, Scope: scope,
 					PoolName: poolName, ProjectName: projectName,
 				}); err != nil {
 					return fmt.Errorf("delete replication schedule: %w", err)
@@ -164,7 +173,75 @@ func newReplicationScheduleRmCmd() *cobra.Command {
 	cmd.Flags().StringVar(&targetPool, "target-pool", "", "destination pool, or a container's backup repo (required to disambiguate)")
 	cmd.Flags().StringVar(&scope, "scope", "vm", "schedule scope")
 	cmd.Flags().StringVar(&poolName, "pool-name", "", "pool name (scope=pool)")
-	cmd.Flags().StringVar(&projectName, "project-name", "", "project name (scope=project)")
+	cmd.Flags().StringVar(&projectName, "project-name", "", "project name (scope=project, or the container's project)")
+	_ = cmd.MarkFlagRequired("target-pool")
+	return cmd
+}
+
+// containerScheduleRef is what the CLI sends as a container schedule's vm_name:
+// the schedule key, never the bare name. A daemon that predates container
+// schedules reads an unknown scope's vm_name as a VM name; the key names no VM
+// (a VM name cannot hold '@' or ':'), so such a daemon can never act on a VM's
+// schedule of the same name. Without a project the key is the name-only form,
+// which a current daemon matches in any project.
+func containerScheduleRef(project, name string) string {
+	if project != "" {
+		return "@ct:" + project + "/" + name
+	}
+	return "@ct:" + name
+}
+
+func newReplicationReplicasCmd() *cobra.Command {
+	var host, repo, projectName string
+	var remove []string
+	cmd := &cobra.Command{
+		Use:   "replicas <container>",
+		Short: "List a container's replicas on its replica host, or remove set-aside ones",
+		Long: `List the scheduled replicas of a container that a host holds in one backup
+repo's replica namespace (--host, --target-pool: the schedule's target), with
+the host and row incarnation each was taken from.
+
+A replica is SET ASIDE when a later replica arrived from a part of the
+container's history that is not proven to contain it: typically the container
+came back after a host loss from its image or a backup rather than from this
+replica, so the set-aside replica may hold the newest copy of its data. A
+set-aside replica is never pruned by its schedule and never promoted by
+failover; it stays until removed here with --remove <timestamp> (admin).`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				if len(remove) > 0 {
+					resp, err := c.RemoveContainerReplicas(ctx, &pb.RemoveContainerReplicasRequest{
+						Host: host, Repo: repo, Project: projectName, Name: args[0], Timestamps: remove,
+					})
+					if err != nil {
+						return fmt.Errorf("remove replicas: %w", err)
+					}
+					fmt.Printf("removed %d set-aside replica(s) of %s from %s on %s\n", resp.Removed, args[0], repo, defaultStr(host, "this host"))
+					return nil
+				}
+				resp, err := c.ListContainerReplicas(ctx, &pb.ListContainerReplicasRequest{
+					Host: host, Repo: repo, Project: projectName, Name: args[0],
+				})
+				if err != nil {
+					return fmt.Errorf("list replicas: %w", err)
+				}
+				fmt.Printf("%-26s %-14s %-11s %-10s %s\n", "TAKEN", "FROM", "SIZE", "STATE", "WHY")
+				for _, r := range resp.Replicas {
+					state, why := "current", ""
+					if r.SetAside {
+						state, why = "set-aside", r.SetAsideReason
+					}
+					fmt.Printf("%-26s %-14s %-11d %-10s %s\n", r.Timestamp, r.Source, r.TotalSize, state, why)
+				}
+				return nil
+			})
+		},
+	}
+	cmd.Flags().StringVar(&host, "host", "", "the replica host (the schedule's --target-host)")
+	cmd.Flags().StringVar(&repo, "target-pool", "", "the backup repo on that host (the schedule's --target-pool)")
+	cmd.Flags().StringVar(&projectName, "project-name", "", "the container's project (default _default)")
+	cmd.Flags().StringArrayVar(&remove, "remove", nil, "remove the SET-ASIDE replica taken at this timestamp (repeatable; admin)")
 	_ = cmd.MarkFlagRequired("target-pool")
 	return cmd
 }

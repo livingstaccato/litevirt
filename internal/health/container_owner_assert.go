@@ -253,6 +253,9 @@ func (c *ContainerChecker) tryRekey(ctx context.Context, name string, remote cor
 		slog.Warn("ct-rekey: reclaimed container ownership — runs locally and no other host runs it",
 			"container", name, "from_host", remote.HostName, "to_host", c.hostName)
 		c.auditRekey(ctx, name, remote.HostName)
+		corrosion.ReverseReplicationAudited(ctx, c.db, "container", name, remote.Project, remote.HostName, c.hostName, func(detail, result string) {
+			auditSystem(ctx, c.db, c.hostName, "replication.reverse", name, detail, result)
+		})
 		c.publish("ct.runtime-owner-rekey", name, "reclaimed from "+remote.HostName)
 		c.observeRekey(name, "rekeyed")
 		c.clearOwnershipDebounce(name)

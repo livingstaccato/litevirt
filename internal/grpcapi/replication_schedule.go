@@ -58,7 +58,8 @@ func (s *Server) CreateReplicationSchedule(ctx context.Context, req *pb.CreateRe
 		// Verify the target pool actually EXISTS on the chosen host — including an
 		// EXPLICIT target_host — so we don't persist a schedule that fails every tick
 		// (the admission below no-ops on a missing pool, so it can't catch this).
-		if _, ok, err := corrosion.GetStoragePool(ctx, s.db, tgtHost, req.TargetPool); err != nil {
+		pool, ok, err := corrosion.GetStoragePool(ctx, s.db, tgtHost, req.TargetPool)
+		if err != nil {
 			return nil, status.Errorf(codes.Internal, "lookup target pool: %v", err)
 		} else if !ok {
 			return nil, status.Errorf(codes.FailedPrecondition,
@@ -68,6 +69,14 @@ func (s *Server) CreateReplicationSchedule(ctx context.Context, req *pb.CreateRe
 		// (The runner re-checks at run time too — defense in depth.)
 		if err := s.admitVMPoolUse(ctx, vm, tgtHost, req.TargetPool); err != nil {
 			return nil, err
+		}
+		// The runner never puts a replica beside the disk it protects
+		// (runVMReplication): a schedule that names the VM's own host for
+		// host-local storage would never run.
+		if req.TargetHost != "" && req.TargetHost == vm.HostName && !isSharedDriver(pool.Driver) && !s.poolOnSharedStore(ctx, req.TargetPool) {
+			return nil, status.Errorf(codes.InvalidArgument,
+				"target_host %q is the host vm %q runs on, and pool %q there is host-local: a replica there is lost with the VM; name another host, or omit target_host to use a local pool only when no peer has one",
+				req.TargetHost, req.VmName, req.TargetPool)
 		}
 	case "pool":
 		if req.PoolName == "" {
@@ -156,7 +165,7 @@ func replScheduleToPB(r corrosion.BackupScheduleRecord) *pb.ReplicationSchedule 
 		scope = "vm"
 	}
 	vmName := r.VMName
-	if name, ok := corrosion.ContainerScheduleName(r.VMName); ok && scope == "container" {
+	if _, name, ok := corrosion.ContainerScheduleName(r.VMName); ok && scope == "container" {
 		vmName = name // the container, not the key the row is stored under
 	}
 	return &pb.ReplicationSchedule{

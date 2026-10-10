@@ -2,6 +2,7 @@ package e2e
 
 import (
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -19,6 +20,11 @@ import (
 //
 // Needs nested KVM on the node and /dev/vhost-vsock (vhost_vsock module); a
 // refusal naming either is reported as the failure.
+//
+// Where the node has AppArmor enabled, the restore qemu MUST carry the
+// restore profile in enforce mode (a failure, never a skip). Set
+// E2E_EXPECT_APPARMOR=1 to also fail a node that has AppArmor off, so a lab
+// that lost it cannot pass vacuously.
 func TestLab_BackupFileRestore(t *testing.T) {
 	l := newLab(t)
 	host := labUpHosts(l, 1)[0]
@@ -75,8 +81,12 @@ func TestLab_BackupFileRestore(t *testing.T) {
 	}
 	uidStr := strings.TrimSpace(l.mustSSH(host, 30*time.Second, "ps -o uid= -p "+pid))
 	sec := l.mustSSH(host, 30*time.Second, "grep -E '^Seccomp:' /proc/"+pid+"/status")
-	aa := l.mustSSH(host, 30*time.Second, "cat /proc/"+pid+"/attr/current 2>/dev/null; cat /sys/module/apparmor/parameters/enabled 2>/dev/null || true")
-	l.saveEvidence("bkfr-qemu-user", uidStr+"\n"+sec+"\n"+aa)
+	nnp := strings.TrimSpace(l.mustSSH(host, 30*time.Second, "grep -E '^NoNewPrivs:' /proc/"+pid+"/status"))
+	// Read separately: an empty attr/current must not read as anything.
+	label := strings.TrimSpace(l.mustSSH(host, 30*time.Second, "cat /proc/"+pid+"/attr/apparmor/current 2>/dev/null || cat /proc/"+pid+"/attr/current 2>/dev/null || true"))
+	aaOn := strings.TrimSpace(l.mustSSH(host, 30*time.Second, "cat /sys/module/apparmor/parameters/enabled 2>/dev/null || true")) == "Y"
+	lsm := strings.TrimSpace(l.mustSSH(host, 30*time.Second, "cat /sys/kernel/security/lsm 2>/dev/null || true"))
+	l.saveEvidence("bkfr-qemu-user", fmt.Sprintf("uid %s\n%s\n%s\nlabel %q\napparmor enabled %v\nlsm %s", uidStr, sec, nnp, label, aaOn, lsm))
 	if uid, err := strconv.ParseUint(uidStr, 10, 32); err != nil || uid < 3800000000 || uid >= 3800000064 {
 		t.Errorf("the restore VM's qemu runs as uid %q, want one of the reserved per-session uids 3800000000..3800000063", uidStr)
 	}
@@ -87,9 +97,26 @@ func TestLab_BackupFileRestore(t *testing.T) {
 	if !strings.Contains(sec, "2") {
 		t.Errorf("the restore VM's qemu has no seccomp filter: %s", sec)
 	}
-	if strings.Contains(aa, "\nY") && !strings.Contains(aa, "litevirt-restore-qemu (enforce)") {
-		t.Errorf("AppArmor is on but the restore VM's qemu is not confined: %s", aa)
+	if f := strings.Fields(nnp); len(f) != 2 || f[1] != "1" {
+		t.Errorf("the restore VM's qemu does not run with no_new_privs: %q", nnp)
 	}
+	switch {
+	case aaOn && label != "litevirt-restore-qemu (enforce)":
+		t.Errorf("AppArmor is on but the restore VM's qemu is not confined by litevirt-restore-qemu in enforce mode: %q", label)
+	case !aaOn && os.Getenv("E2E_EXPECT_APPARMOR") == "1":
+		t.Errorf("E2E_EXPECT_APPARMOR=1 but AppArmor is off on %s: the profile checks would pass vacuously", host)
+	case !aaOn:
+		t.Logf("AppArmor is OFF on %s: the profile was not exercised (Landlock alone confines qemu; lsm=%s)", host, lsm)
+	}
+	if !aaOn && !strings.Contains(lsm, "landlock") {
+		t.Errorf("neither AppArmor nor Landlock on %s, yet a restore VM started without allow_unsandboxed: [mac]", host)
+	}
+	// Report only (tightening them is a separate change): the mode of the
+	// VM's own disks, which an escaped restore qemu on a host without a MAC
+	// barrier could otherwise read.
+	disks := l.mustSSH(host, 30*time.Second, "stat -c '%a %U:%G %n' /var/lib/litevirt /var/lib/litevirt/disks /var/lib/litevirt/disks/"+vm+"-* 2>&1 || true")
+	l.saveEvidence("bkfr-disk-modes", disks)
+	t.Logf("VM disk modes on %s:\n%s", host, disks)
 	// The boot files: root-owned, read-only to the restore group, outside
 	// /var/lib/litevirt.
 	cache := l.mustSSH(host, 30*time.Second, "stat -c '%U:%G %a %n' /var/cache/litevirt-restore /var/cache/litevirt-restore/* | grep -v sha256")
@@ -212,19 +239,85 @@ func TestLab_BackupFileRestore_ConcurrentSessionsIsolated(t *testing.T) {
 		t.Fatalf("two sessions share uid %s", qs[0].uid)
 	}
 	// As A's uid: B must be unreachable — no signal, no /proc/<B>/environ.
+	// Each negative needs its positive control (the same command as B's own
+	// uid succeeds), or a missing setpriv, a wrong pid or a dead qemu would
+	// pass it; and the refusal must be a permission error.
 	as := func(uid, cmd string) (string, error) {
-		return l.ssh(host, 30*time.Second, "setpriv --reuid="+uid+" --regid=$(getent group litevirt-restore | cut -d: -f3) --clear-groups "+cmd)
+		return l.ssh(host, 30*time.Second, "setpriv --reuid="+uid+" --regid=$(getent group litevirt-restore | cut -d: -f3) --clear-groups "+cmd+" 2>&1")
 	}
-	if out, err := as(qs[0].uid, "kill -0 "+qs[1].pid); err == nil {
-		t.Errorf("session A's uid can signal session B's qemu: %s", out)
+	denied := func(out string) bool {
+		return strings.Contains(out, "Operation not permitted") || strings.Contains(out, "Permission denied")
 	}
-	if out, err := as(qs[0].uid, "cat /proc/"+qs[1].pid+"/environ"); err == nil {
-		t.Errorf("session A's uid can read session B's qemu environment: %s", out)
+	if out, err := as(qs[1].uid, "kill -0 "+qs[1].pid); err != nil {
+		t.Fatalf("control: B's own uid cannot signal B's qemu, so the check below proves nothing: %v: %s", err, out)
+	}
+	if out, err := as(qs[0].uid, "kill -0 "+qs[1].pid); err == nil || !denied(out) {
+		t.Errorf("session A's uid signalling session B's qemu: err %v, %q; want a permission error", err, out)
+	}
+	aaOn := strings.TrimSpace(l.mustSSH(host, 30*time.Second, "cat /sys/module/apparmor/parameters/enabled 2>/dev/null || true")) == "Y"
+	if !aaOn {
+		// Under AppArmor, deny ptrace refuses environ even to B's own uid:
+		// there is no positive control, and the negative is not DAC's.
+		if out, err := as(qs[1].uid, "head -c 1 /proc/"+qs[1].pid+"/environ"); err != nil {
+			t.Fatalf("control: B's own uid cannot read B's environ: %v: %s", err, out)
+		}
+	}
+	if out, err := as(qs[0].uid, "head -c 1 /proc/"+qs[1].pid+"/environ"); err == nil || !denied(out) {
+		t.Errorf("session A's uid reading session B's qemu environment: err %v, %q; want a permission error", err, out)
 	}
 	if socks := strings.TrimSpace(l.mustSSH(host, 30*time.Second, "ls /run/litevirt/file-restore/s-*/nbd-*.sock 2>/dev/null || true")); socks != "" {
 		t.Errorf("an export socket is still connectable: %s", socks)
 	}
 	if denied := strings.TrimSpace(l.mustSSH(host, 30*time.Second, "dmesg 2>/dev/null | grep litevirt-restore-qemu | grep -i denied | tail -5 || true")); denied != "" {
 		t.Logf("AppArmor denials for the restore profile (review):\n%s", denied)
+	}
+}
+
+// R3-M1 / R2-M2: the uid-range sweep. A process running as a reserved
+// restore-VM uid, whatever its command line, is killed by a starting daemon
+// — here both a real restore qemu whose trampoline was SIGKILLed and a decoy
+// with an innocent command line (the sweep must not trust argv, which a
+// process can rewrite).
+func TestLab_BackupFileRestore_UIDRangeSweep(t *testing.T) {
+	l := newLab(t)
+	host := labUpHosts(l, 1)[0]
+	vm := l.createVMs(host, "bkfrs", host)[host]
+	repo := bkRepo(l, host, "e2e-bkfrs")
+	ts, _, _ := bkSnapshot(l, host, vm, repo)
+	if out, err := l.lv(host, "backup", "file-ls", "--repo", repo, "--vm", vm, "--timestamp", ts); err != nil {
+		t.Fatalf("file-ls: %v\n%s", err, out)
+	}
+	// The decoy: the last reserved uid (a session takes the lowest free one).
+	const decoyUID = "3800000063"
+	l.onRestore(func() { _, _ = l.ssh(host, 30*time.Second, "pkill -9 -u "+decoyUID+" || true") })
+	l.mustSSH(host, 30*time.Second, "setsid setpriv --reuid="+decoyUID+" --regid=65534 --clear-groups sleep 600 </dev/null >/dev/null 2>&1 &")
+	if out := strings.TrimSpace(l.mustSSH(host, 30*time.Second, "pgrep -u "+decoyUID+" sleep || true")); out == "" {
+		t.Fatal("control: the decoy is not running as the reserved uid")
+	}
+	// SIGKILL the trampoline (qemu's parent): the pidfile record of its qemu
+	// is then no longer the way back to it.
+	tramp := strings.TrimSpace(l.mustSSH(host, 30*time.Second, "pgrep -f '[_]_file-restore-exec' | head -1"))
+	if tramp == "" {
+		t.Fatal("no trampoline found")
+	}
+	l.mustSSH(host, 30*time.Second, "kill -9 "+tramp)
+	after := l.mustSSH(host, 30*time.Second, "pgrep -af '[l]itevirt-file-restore' || true")
+	l.saveEvidence("bkfrs-after-trampoline-kill", after)
+	if err := l.restartDaemon(host); err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+	if err := l.waitDaemon(host, 2*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		left := strings.TrimSpace(l.mustSSH(host, 30*time.Second, "ps -eo pid,uid,args | awk '$2>=3800000000 && $2<3800000064' || true"))
+		if left == "" {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("processes of reserved restore-VM uids survived the daemon's sweep:\n%s", left)
+		}
+		time.Sleep(2 * time.Second)
 	}
 }

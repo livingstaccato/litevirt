@@ -272,7 +272,23 @@ func (s *Server) openRestoreVM(ctx context.Context, fr fileRestorer, t *fileRest
 		}
 		return nil, status.Errorf(codes.Internal, "start restore VM: %v", err)
 	}
+	// A restore VM without one of its barriers (allow_unsandboxed,
+	// allow_shared_run_as) is audited when it starts — browsing included,
+	// which writes no other row.
+	if b, reduced := restoreVMBarriers(conn); reduced {
+		s.audit(ctx, "backup.file_restore_unsandboxed", t.key.name,
+			fmt.Sprintf("project=%s repo=%s ts=%s disk=%s %s", t.project, t.key.repo, t.key.ts, t.key.disk, b), "ok")
+	}
 	return conn, nil
+}
+
+// restoreVMBarriers is what isolates conn's restore VM
+// (filerestore.Session.FileRestoreBarriers), if it says.
+func restoreVMBarriers(conn fileRestoreConn) (string, bool) {
+	if b, ok := conn.(interface{ FileRestoreBarriers() (string, bool) }); ok {
+		return b.FileRestoreBarriers()
+	}
+	return "", false
 }
 
 // acquireBrowse returns the browsing session for t, booting a restore VM
@@ -530,12 +546,17 @@ func (s *Server) RestoreBackupFiles(req *pb.RestoreBackupFilesRequest, stream gr
 		return err
 	}
 	var st filerestore.TarStats
+	var barriers string
 	defer func() {
 		outcome := "ok"
 		if retErr != nil {
 			outcome = "error"
 		}
-		s.audit(ctx, "backup.file_restore", req.Name, fileRestoreAuditDetail(req, t.project, &st), outcome)
+		d := fileRestoreAuditDetail(req, t.project, &st)
+		if barriers != "" {
+			d += " " + barriers
+		}
+		s.audit(ctx, "backup.file_restore", req.Name, d, outcome)
 	}()
 	_, opts, err := s.fileRestorePreflight()
 	if err != nil {
@@ -549,6 +570,7 @@ func (s *Server) RestoreBackupFiles(req *pb.RestoreBackupFilesRequest, stream gr
 	if err != nil {
 		return err
 	}
+	barriers, _ = restoreVMBarriers(conn)
 	// An extraction runs on a VM of its own, killed on completion — and at
 	// once if the caller goes away or the extraction outlives its wall
 	// clock, which also ends a read the agent is stalling.

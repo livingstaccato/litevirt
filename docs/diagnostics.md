@@ -1783,6 +1783,29 @@ To recover, do one of these:
 - If its data is lost for good, run `lv rebuild <vm>`. It recreates the VM from
   its spec with blank disks and keeps its IP and MAC addresses.
 
+### File restore without a barrier (`file_restore_unsandboxed`)
+
+A host whose daemon config lets restore VMs run without one of their barriers
+raises `file_restore_unsandboxed` about **itself** (evaluator `file_restore`,
+subject `host/<name>`), with one writer per row like `observer_stalled`. The
+keys are `file_restore.allow_unsandboxed` (`seccomp`, `mac`, `root`, or `true`
+for all three) and `file_restore.allow_shared_run_as`; both are off by
+default and dangerous (see [backups](backups.md#single-file-restore)). It is
+not an ownership condition and never blocks admission.
+
+| Raised when | Clears when |
+|---|---|
+| The daemon starts with file restore on and either key set. Confirmed at once; **info** severity. The evidence lists the keys set (`allow_unsandboxed: [seccomp]`, `allow_shared_run_as`). | The daemon starts with neither key set, or with file restore off. |
+
+**What it means.** On this host a malicious backup meets one barrier fewer on
+its way to the host: no seccomp sandbox, no MAC (neither the AppArmor profile
+nor Landlock), a non-root daemon's own uid, or a shared qemu user. Every
+restore VM actually started that way is audited as
+`backup.file_restore_unsandboxed`, with `sandbox=on|off apparmor=on|off|absent
+landlock=<abi>|off uid=<n>`; the same summary is in every
+`backup.file_restore` row. Fix what the key works around (a qemu with seccomp,
+`apparmor_parser`, a kernel with Landlock, a root daemon) and remove the key.
+
 ## NetBox IPAM: metrics and health findings
 
 Every counter below is registered on the same `/metrics` endpoint as the rest,

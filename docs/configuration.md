@@ -628,20 +628,27 @@ file_restore:
   modules_dir: ""            # default /lib/modules/<running release>
   qemu: ""                   # default qemu-system-x86_64 / -aarch64 on PATH, or /usr/libexec/qemu-kvm
   memory_mib: 512            # the restore VM's memory (at least 256)
-  run_as: ""                 # user qemu is started as; default litevirt-restore (created at daemon start);
-                             # root, libvirt-qemu, qemu and nobody are refused (they own VM disks and keys)
+  run_as: ""                 # restore account whose group reads the boot files; default litevirt-restore
+                             # (created at daemon start). qemu runs as a per-session uid (uid_base), not as it.
+                             # root, libvirt-qemu, qemu and nobody are refused unless allow_shared_run_as
   idle_timeout_sec: 300      # a browsing session's VM is killed after this long unused
   max_sessions: 2            # restore VMs at once on this host (browsing and extracting)
   max_extractions: 1         # extractions at once on this host; each runs on a VM of its own
   max_extract_bytes: 16G     # per extraction; a request can only lower it
-  uid_base: 3800000000       # first of 64 uids reserved for restore VMs, one per session; must belong to no account
+  uid_base: 3800000000       # first of 64 uids reserved for restore VMs, one per session; must belong to no
+                             # account (NSS, getent), lie outside /etc/subuid, /etc/subgid and the containers'
+                             # idmap range (an explicit uid_base inside that range refuses to load)
   allow_shared_run_as: false # DANGEROUS. true permits run_as to be root or a shared qemu user (libvirt-qemu,
                              # qemu, nobody): the restore VM then shares an identity with production VMs.
-  allow_unsandboxed: false   # DANGEROUS. true lets a restore VM run without one of its barriers: qemu's
-                             # seccomp sandbox, its AppArmor profile (AppArmor on but apparmor_parser missing),
-                             # or a root daemon (a non-root daemon runs qemu as itself, with its data_dir and
-                             # keys). Each removes a barrier between a malicious backup and the host. Install a
-                             # qemu with seccomp and apparmor_parser, and run the daemon as root, instead.
+  allow_unsandboxed: false   # DANGEROUS. A list of the barriers a restore VM may run without, e.g. [seccomp]:
+                             #   seccomp - qemu's seccomp sandbox;
+                             #   mac     - mandatory access control: the AppArmor profile (AppArmor on but
+                             #             apparmor_parser missing) and Landlock (a host with neither);
+                             #   root    - a root daemon (a non-root daemon runs qemu as itself, with its
+                             #             data_dir and keys).
+                             # true lifts all three. Each removes a barrier between a malicious backup and the
+                             # host; while set, the host raises file_restore_unsandboxed. Install a qemu with
+                             # seccomp and apparmor_parser, use a kernel with Landlock, run the daemon as root.
 
 # Billing-event webhook. Empty disables (the default — events
 # are dropped). When set, `internal/billing` POSTs JSON

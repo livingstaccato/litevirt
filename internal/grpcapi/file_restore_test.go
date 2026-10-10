@@ -36,6 +36,9 @@ type fakeRestorer struct {
 	opens        int
 	closes       int
 	kind, format string
+	// barriers / reduced: what the fake restore VM reports isolated it.
+	barriers string
+	reduced  bool
 }
 
 func (f *fakeRestorer) Preflight() error { return f.preflight }
@@ -62,6 +65,12 @@ type countingConn struct {
 	*filerestoretest.Session
 	f    *fakeRestorer
 	once sync.Once
+}
+
+func (c *countingConn) FileRestoreBarriers() (string, bool) {
+	c.f.mu.Lock()
+	defer c.f.mu.Unlock()
+	return c.f.barriers, c.f.reduced
 }
 
 func (c *countingConn) Close() {

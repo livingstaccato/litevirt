@@ -1445,7 +1445,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if frUIDBase == 0 {
 		frUIDBase = filerestore.DefaultUIDBase
 	}
-	if n := filerestore.SweepStale(frRunDir, frUIDBase); n > 0 {
+	if n := filerestore.SweepStale(frRunDir, frUIDBase, d.cfg.Containers.ContainerIDRange()); n > 0 {
 		slog.Warn("file restore: killed restore VMs a previous daemon left running", "count", n)
 	}
 	if fr := d.cfg.FileRestore; fr.On() {
@@ -1469,10 +1469,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 				OnTamper: svc.FileRestoreTampered,
 				// The agent outlives the host's idle timeout by a minute, so
 				// it only ever powers off on its own when the host is gone.
-				AgentIdle:        idle + time.Minute,
-				AllowUnsandboxed: fr.AllowUnsandboxed,
+				AgentIdle: idle + time.Minute,
+				Unsandboxed: filerestore.Barriers{
+					Seccomp: fr.AllowUnsandboxed.Seccomp, MAC: fr.AllowUnsandboxed.MAC, Root: fr.AllowUnsandboxed.Root,
+				},
 				AllowSharedRunAs: fr.AllowSharedRunAs,
 				UIDBase:          frUIDBase,
+				ContainerIDs:     d.cfg.Containers.ContainerIDRange(),
 			}),
 			IdleTimeout:     idle,
 			MaxSessions:     fr.MaxSessions,
@@ -1480,6 +1483,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 			MaxExtractBytes: fr.ExtractLimit(),
 		})
 	}
+	// While a key that lifts a restore VM barrier is set, this host carries
+	// an informational file_restore_unsandboxed condition (resolved once it
+	// is not).
+	svc.ReconcileFileRestoreCondition(ctx, d.cfg.FileRestore.ReducedBarrierKeys())
 	svc.SweepTransferStaging()                          // clear orphaned peer-transfer staging repos from a prior incarnation
 	blockedCIDRs, _ := d.cfg.ImagePullBlockedPrefixes() // already validated in LoadConfig
 	svc.SetImageLimits(d.cfg.MaxImageBytes, time.Duration(d.cfg.ImagePullTimeoutSec)*time.Second, blockedCIDRs)

@@ -263,11 +263,17 @@ run as **root** for it (a non-root daemon refuses it). At start, the daemon:
   other account shares — otherwise file restore is refused, naming what
   differs. Restore VMs do not run as this account: each runs as its own uid
   from a reserved range (`file_restore.uid_base`, 64 uids from 3800000000,
-  which must belong to no account), with this account's group and `kvm`;
+  which must belong to no account NSS knows and lie outside `/etc/subuid`,
+  `/etc/subgid` and the containers' id-map range), with this account's group
+  and `kvm`. A starting daemon kills any process left running as one of
+  these uids;
 - **loads an AppArmor profile `litevirt-restore-qemu`** into the kernel where
   AppArmor is enabled (it stays loaded until reboot; nothing is written under
   `/etc/apparmor.d`). AppArmor enabled but `apparmor_parser` not installed
   refuses file restore;
+- **confines each restore qemu with Landlock** where the kernel has it
+  (`landlock` in `/sys/kernel/security/lsm`); nothing is installed for it. A
+  host with neither AppArmor nor Landlock refuses file restore;
 - **creates `/var/cache/litevirt-restore`** for the restore VM's boot files and
   `/run/litevirt/file-restore` for its sessions, and removes an older build's
   `/var/lib/litevirt/file-restore/cache`.

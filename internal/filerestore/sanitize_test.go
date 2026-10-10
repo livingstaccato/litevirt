@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"math"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -541,5 +542,48 @@ func TestSanitize_LinksAtEveryDepthStayCheap(t *testing.T) {
 	}
 	if el := time.Since(start); el > 10*time.Second {
 		t.Fatalf("%d records took %v", len(recs), el)
+	}
+}
+
+// R3-M2: a stream of symlinks that each open their own deep branch cannot
+// make the host hold a large trie: the trie and the number of links are
+// capped, and an extraction past the cap stops (ErrLimit) instead of
+// growing. 4096 links, each 254 one-character components deep in its own
+// top branch, cost about 250 MB of daemon heap with a node per map.
+func TestSanitize_LinkTrieMemoryBounded(t *testing.T) {
+	var recs []rec
+	for i := 0; i < 4096; i++ {
+		recs = append(recs, link("vda1/"+strconv.Itoa(i)+strings.Repeat("/a", 253)+"/l", "x"))
+	}
+	in := stream(t, false, recs...)
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	_, st, err := sanitize(t, in, []string{"vda1"}, TarLimits{})
+	runtime.ReadMemStats(&after)
+	if alloc := after.TotalAlloc - before.TotalAlloc; alloc > 64<<20 {
+		t.Errorf("one extraction allocated %d MB for %d symlinks", alloc>>20, len(recs))
+	}
+	if !errors.Is(err, ErrLimit) || !st.Truncated {
+		t.Errorf("past the trie's cap the extraction must stop: err %v, stats %+v", err, st)
+	}
+}
+
+// R3-M2: the number of symlinks one extraction tracks is capped too.
+func TestLinkTrie_CapsLinks(t *testing.T) {
+	old := maxLinks
+	defer func() { maxLinks = old }()
+	maxLinks = 3
+	var tr linkTrie
+	for i := 0; i < 3; i++ {
+		if !tr.add("v/l" + strconv.Itoa(i)) {
+			t.Fatalf("link %d refused under the cap", i)
+		}
+	}
+	if tr.add("v/l3") {
+		t.Fatal("a fourth link was tracked past a cap of three")
+	}
+	if !tr.underLink("v/l1/x") || tr.underLink("v/l9/x") || tr.underLink("v/l1") {
+		t.Fatal("the capped trie answers wrongly")
 	}
 }

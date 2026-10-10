@@ -82,12 +82,21 @@ func newFakeHost(t *testing.T, mode string, allowUnsandboxed bool) *fakeHost {
 	h := &fakeHost{bin: bin, run: filepath.Join(t.TempDir(), "run"), cach: filepath.Join(t.TempDir(), "cache")}
 	h.l = NewLauncher(Config{
 		QEMU: q, Kernel: kernel, ModulesDir: fakeModules(t), Agent: fakeAgent(t, "agent"),
-		CacheDir: h.cach, RunDir: h.run, BootTimeout: 2 * time.Second, AllowUnsandboxed: allowUnsandboxed,
+		CacheDir: h.cach, RunDir: h.run, BootTimeout: 2 * time.Second,
+		Unsandboxed: Barriers{Seccomp: allowUnsandboxed, MAC: allowUnsandboxed, Root: allowUnsandboxed},
 	})
 	h.l.kvmPath, h.l.vhostPath = dev, dev
 	h.l.checkAgent = func(string) error { return nil }
 	h.l.appArmorState = func() (bool, bool) { return false, false }
 	h.l.skipRootCheck = true
+	// The trampoline is this test binary (TestMain); the fake qemu logs
+	// into its own directory, which its Landlock ruleset must then allow.
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.l.trampoline = self
+	h.l.landlockExtra = landlockPolicy{RW: []string{bin}}
 	return h
 }
 
@@ -253,7 +262,7 @@ func TestSweepStale_KillsOnlyVerifiedRestoreVMs(t *testing.T) {
 	_ = os.WriteFile(filepath.Join(garbage, pidFile), []byte("1 0\n"), 0o600)
 
 	time.Sleep(100 * time.Millisecond) // let sh set up its argv
-	if n := SweepStale(run, 0); n != 1 {
+	if n := SweepStale(run, 0, [2]uint64{}); n != 1 {
 		t.Fatalf("killed %d, want 1", n)
 	}
 	done := make(chan error, 1)
@@ -285,7 +294,7 @@ func TestQemuCommand_CredentialsAndDeathSignal(t *testing.T) {
 	dev, _ := os.Open(os.DevNull)
 	defer dev.Close()
 	u := &qemuUser{name: "libvirt-qemu", uid: 64055, gid: 993, groups: []uint32{993, 64055}}
-	cmd, err := qemuCommand(baseSpec(), u, t.TempDir(), dev, &bytes.Buffer{}, &bytes.Buffer{}, "", "")
+	cmd, err := qemuCommand(baseSpec(), u, t.TempDir(), dev, &bytes.Buffer{}, &bytes.Buffer{}, "", "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -307,15 +316,23 @@ func TestQemuCommand_CredentialsAndDeathSignal(t *testing.T) {
 			t.Fatalf("qemu is asked to switch users itself: %v", cmd.Args)
 		}
 	}
-	cmd, _ = qemuCommand(baseSpec(), nil, t.TempDir(), dev, &bytes.Buffer{}, &bytes.Buffer{}, "", "")
+	cmd, _ = qemuCommand(baseSpec(), nil, t.TempDir(), dev, &bytes.Buffer{}, &bytes.Buffer{}, "", "", nil)
 	if cmd.SysProcAttr.Credential != nil {
 		t.Fatal("a non-root daemon set a credential")
 	}
 	// N-1: with AppArmor, the litevirt binary is exec'd first, to put qemu
 	// under the restore profile; the credential and death signal still apply.
-	cmd, _ = qemuCommand(baseSpec(), u, t.TempDir(), dev, &bytes.Buffer{}, &bytes.Buffer{}, "/usr/local/bin/litevirt", AppArmorProfile)
-	if cmd.Path != "/usr/local/bin/litevirt" || len(cmd.Args) < 4 || cmd.Args[1] != TrampolineArg || cmd.Args[2] != AppArmorProfile || cmd.Args[3] != "qemu-system-x86_64" {
+	cmd, _ = qemuCommand(baseSpec(), u, t.TempDir(), dev, &bytes.Buffer{}, &bytes.Buffer{}, "/usr/local/bin/litevirt", AppArmorProfile, nil)
+	if cmd.Path != "/usr/local/bin/litevirt" || len(cmd.Args) < 5 || cmd.Args[1] != TrampolineArg || cmd.Args[2] != AppArmorProfile ||
+		cmd.Args[3] != "-" || cmd.Args[4] != "qemu-system-x86_64" {
 		t.Fatalf("trampoline argv %v", cmd.Args)
+	}
+	// R3-I1: a Landlock ruleset alone also goes through the trampoline.
+	ll := &landlockPolicy{ABI: 6, Exec: []string{"/usr"}}
+	lcmd, _ := qemuCommand(baseSpec(), u, t.TempDir(), dev, &bytes.Buffer{}, &bytes.Buffer{}, "/usr/local/bin/litevirt", "", ll)
+	if len(lcmd.Args) < 5 || lcmd.Args[2] != "-" || !strings.Contains(lcmd.Args[3], `"abi":6`) || lcmd.Args[4] != "qemu-system-x86_64" ||
+		lcmd.SysProcAttr.Pdeathsig != syscall.SIGTERM {
+		t.Fatalf("Landlock-only trampoline argv %v", lcmd.Args)
 	}
 	// The trampoline gets SIGTERM, which it turns into qemu's death: the
 	// exec into a new AppArmor profile clears a child's death signal.
@@ -497,35 +514,6 @@ func TestSandboxProbe_CachedWithTTL(t *testing.T) {
 	}
 }
 
-// R2-I1 / R2-M2: the sweep also finds a restore VM by its reserved uid,
-// when its pidfile — or its trampoline — is gone.
-func TestSweepStale_ByReservedUID(t *testing.T) {
-	orphan := exec.Command("sh", "-c", "sleep 300; true", "-name", "litevirt-file-restore")
-	other := exec.Command("sh", "-c", "sleep 300; true", "-name", "something-else")
-	for _, c := range []*exec.Cmd{orphan, other} {
-		if err := c.Start(); err != nil {
-			t.Fatal(err)
-		}
-		c := c
-		t.Cleanup(func() { _ = c.Process.Kill(); _ = c.Wait() })
-	}
-	time.Sleep(100 * time.Millisecond)
-	// This test's own uid stands in for the reserved range.
-	if n := SweepStale(t.TempDir(), uint32(os.Getuid())); n < 1 {
-		t.Fatalf("killed %d, want the orphan", n)
-	}
-	done := make(chan error, 1)
-	go func() { done <- orphan.Wait() }()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("an orphaned restore VM in the reserved uid range survived the sweep")
-	}
-	if err := other.Process.Signal(syscall.Signal(0)); err != nil {
-		t.Fatal("a process that is not a restore VM was killed")
-	}
-}
-
 // Nit 5: a session's boot files are never collected while it uses them;
 // superseded ones go once no session uses them.
 func TestBootFilesGC(t *testing.T) {
@@ -647,23 +635,6 @@ func TestAccessibleTo(t *testing.T) {
 	}
 }
 
-// R2-I2: AppArmor fails closed — enabled with no parser refuses unless
-// allow_unsandboxed; no AppArmor at all runs (uid separation, seccomp).
-func TestAppArmorDecision(t *testing.T) {
-	if use, err := appArmorDecision(true, true)(false); !use || err != nil {
-		t.Errorf("enabled + parser: %v %v", use, err)
-	}
-	if _, err := appArmorDecision(true, false)(false); err == nil || !strings.Contains(err.Error(), "apparmor_parser") {
-		t.Errorf("enabled, no parser, no key: %v", err)
-	}
-	if use, err := appArmorDecision(true, false)(true); use || err != nil {
-		t.Errorf("enabled, no parser, key: %v %v", use, err)
-	}
-	if use, err := appArmorDecision(false, false)(false); use || err != nil {
-		t.Errorf("no AppArmor: %v %v", use, err)
-	}
-}
-
 // R2-I2: a non-root daemon refuses file restore unless allow_unsandboxed.
 func TestCheck_NonRootRefused(t *testing.T) {
 	if os.Geteuid() == 0 {
@@ -674,7 +645,12 @@ func TestCheck_NonRootRefused(t *testing.T) {
 	if err := h.l.Preflight(); err == nil || !strings.Contains(err.Error(), "root daemon") {
 		t.Fatalf("non-root without the key: %v", err)
 	}
-	h.l.cfg.AllowUnsandboxed = true
+	// Nit 6: the other barriers' keys do not lift this one.
+	h.l.cfg.Unsandboxed = Barriers{Seccomp: true, MAC: true}
+	if err := h.l.Preflight(); err == nil || !strings.Contains(err.Error(), "[root]") {
+		t.Fatalf("non-root with only seccomp and mac allowed: %v", err)
+	}
+	h.l.cfg.Unsandboxed = Barriers{Root: true}
 	if err := h.l.Preflight(); err != nil {
 		t.Fatalf("non-root with the key: %v", err)
 	}

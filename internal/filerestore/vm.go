@@ -46,7 +46,8 @@ const UIDSlots = 64
 const AppArmorProfile = "litevirt-restore-qemu"
 
 // TrampolineArg is the hidden first argument with which the litevirt binary
-// sets its AppArmor exec profile and execs qemu (agent.RunTrampoline).
+// confines itself (AppArmor exec profile, no_new_privs, Landlock) and execs
+// qemu (RunTrampoline).
 const TrampolineArg = "__file-restore-exec"
 
 // Config is the host side of file restore (daemon config `file_restore:`).
@@ -62,11 +63,11 @@ type Config struct {
 	// the litevirt binary, so this cannot go much lower.
 	MemoryMiB int
 	// RunAs is the restore account ("" = DefaultRestoreUser): a system
-	// account with no shell whose group reads the boot files. Each restore VM
-	// runs as its own uid from the reserved range (UIDBase), with that group
-	// and kvm only, so concurrent sessions cannot reach each other. root,
-	// libvirt-qemu, qemu and nobody are refused unless AllowSharedRunAs, which
-	// then runs qemu as that user itself.
+	// account with no shell whose group reads the boot files. qemu never runs
+	// as it: each restore VM runs as its own uid from the reserved range
+	// (UIDBase), with that group and kvm only, so concurrent sessions cannot
+	// reach each other. root, libvirt-qemu, qemu and nobody are refused
+	// unless AllowSharedRunAs, which then runs qemu as that user itself.
 	RunAs string
 	// UIDBase is the first reserved per-session uid (0 = DefaultUIDBase).
 	UIDBase uint32
@@ -90,14 +91,47 @@ type Config struct {
 	// it powers off on its own (0 = 10 minutes): the backstop when the
 	// daemon that started it is gone.
 	AgentIdle time.Duration
-	// AllowUnsandboxed lets a restore VM run without one of its barriers:
-	// qemu's seccomp sandbox, the AppArmor profile on a host that has
-	// AppArmor enabled but cannot load it, or a root daemon (a non-root
-	// daemon runs qemu as itself). DANGEROUS: each removes a barrier between a
-	// malicious backup and the host. Off by default: file restore is refused.
-	AllowUnsandboxed bool
+	// Unsandboxed names the barriers a restore VM may run without
+	// (file_restore.allow_unsandboxed). DANGEROUS: each removes a barrier
+	// between a malicious backup and the host. None by default: file restore
+	// is then refused.
+	Unsandboxed Barriers
 	// Agent is the binary run as the agent ("" = this running binary).
 	Agent string
+	// ContainerIDs is the host id range unprivileged containers are mapped
+	// into, [start, end) (containers.idmap_base, idmap_ranges): the reserved
+	// per-session uids must not fall in it.
+	ContainerIDs [2]uint64
+}
+
+// Barriers names restore VM barriers that file_restore.allow_unsandboxed
+// lets the operator do without, one at a time.
+type Barriers struct {
+	// Seccomp: run a restore VM whose qemu cannot install its seccomp
+	// sandbox.
+	Seccomp bool
+	// MAC: run a restore VM with no mandatory access control — neither the
+	// AppArmor profile (AppArmor on but apparmor_parser missing, or a
+	// non-root daemon) nor a Landlock ruleset (a kernel without Landlock).
+	MAC bool
+	// Root: run file restore under a non-root daemon, whose restore VMs run
+	// as the daemon's own user (which owns data_dir and its keys).
+	Root bool
+}
+
+// Names lists the barriers allowed away, as the config spells them.
+func (b Barriers) Names() []string {
+	var out []string
+	if b.Seccomp {
+		out = append(out, "seccomp")
+	}
+	if b.MAC {
+		out = append(out, "mac")
+	}
+	if b.Root {
+		out = append(out, "root")
+	}
+	return out
 }
 
 func (c Config) memory() int {

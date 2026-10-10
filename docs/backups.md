@@ -534,12 +534,23 @@ each other — with only the `litevirt-restore` group and `kvm`, its seccomp
 sandbox on and, where AppArmor is enabled, confined by the
 `litevirt-restore-qemu` profile (its boot files, its session's export socket
 and nonce, `/dev/kvm` and vsock; no IP, no abstract sockets, nothing under
-`/var/lib/litevirt`). Its disk export accepts exactly one connection, from
+`/var/lib/litevirt`), and — on every host whose kernel has it — inside a
+**Landlock** ruleset that allows qemu its own binary and libraries, its boot
+files, its session's directory and `/dev/kvm`, and nothing else: no VM disk
+(even a world-readable one), nothing under `/var/lib/litevirt` or
+`data_dir`, no writes, and, with Linux 6.7+, no TCP; with 6.12+, no abstract
+sockets and no signals out. The reserved uids are checked to be no one
+else's (not the containers' id-map range, `/etc/subuid`/`subgid`, or any
+account NSS knows). Its disk export accepts exactly one connection, from
 that qemu (checked by its socket credentials, process group and, under
 AppArmor, its confinement), and the socket is unlinked the moment qemu has
 it. The daemon must run as root for this; a non-root daemon refuses file
-restore. On a host without AppArmor (SELinux, or no LSM), the per-VM uid,
-the seccomp sandbox and the single-peer export are what isolate it. Its kernel copy and
+restore. On a host without AppArmor (SELinux, or no LSM), Landlock is the
+barrier between an escaped qemu and the host's files and network, alongside
+the per-VM uid, the seccomp sandbox and the single-peer export; **a host
+with neither AppArmor nor Landlock refuses file restore** (the uid alone does
+not keep an escaped qemu from world-readable VM disks or the host's
+network). Its kernel copy and
 initramfs are root-owned and read-only to that user
 (`/var/cache/litevirt-restore`), and re-verified against a recorded digest
 before every boot. It dies with the daemon, a restarted daemon kills any it
@@ -563,7 +574,10 @@ limits and threat model are in
 
 - **Permission:** the same as a full restore of that VM or container
   (`backup.restore` on the backup's project). Every extraction is audited as
-  `backup.file_restore`, with the paths and what was extracted.
+  `backup.file_restore`, with the paths, what was extracted, and what
+  isolated its restore VM (`sandbox=… apparmor=… landlock=… uid=…`). A restore
+  VM started without one of its barriers — browsing included — is also
+  audited as `backup.file_restore_unsandboxed`.
 - **Sessions:** browsing reuses one restore VM per backup, killed after five
   idle minutes; each extraction runs on a VM of its own, killed when it
   completes, when you cancel, or at its wall-clock limit (10 minutes, or the
@@ -574,19 +588,27 @@ limits and threat model are in
   stopped linked clone's disk-file backup (it is only the delta over its base)
   — restore the disk for those.
 - **Requirements:** KVM (read-write for the qemu user), `/dev/vhost-vsock`
-  (the `vhost_vsock` module), a qemu with seccomp support, and a kernel the
+  (the `vhost_vsock` module), a qemu with seccomp support, AppArmor or
+  Landlock (`landlock` in `/sys/kernel/security/lsm`; Ubuntu, Debian 12+,
+  Fedora and RHEL 9+ kernels have it), a root daemon, and a kernel the
   daemon can read (its own by default). Without them file restore is refused
   naming what is missing; a full restore keeps working. There is no fallback
   to mounting on the host. Whether qemu can install its seccomp sandbox is
   asked of qemu itself before each restore VM starts.
-- **`file_restore.allow_unsandboxed` is dangerous.** It lets a restore VM run
-  without one of its barriers — qemu's seccomp sandbox, its AppArmor profile
-  (AppArmor on but `apparmor_parser` missing), or a root daemon (a non-root
-  daemon runs qemu as itself, the user that owns `data_dir` and its keys) —
-  removing one between a malicious backup and the host. Install a qemu with
-  seccomp and `apparmor_parser`, and run the daemon as root, instead.
+- **`file_restore.allow_unsandboxed` is dangerous.** It names the barriers a
+  restore VM may run without, one at a time: `seccomp` (qemu's seccomp
+  sandbox), `mac` (the AppArmor profile when AppArmor is on but
+  `apparmor_parser` is missing, and Landlock when the host has neither), and
+  `root` (a non-root daemon, which runs qemu as itself, the user that owns
+  `data_dir` and its keys) — for example `allow_unsandboxed: [seccomp]`.
+  `true` lifts all three. Each removes a barrier between a malicious backup
+  and the host. Install a qemu with seccomp and `apparmor_parser`, use a
+  kernel with Landlock, and run the daemon as root, instead.
   **`file_restore.allow_shared_run_as`** separately permits `run_as` to be root
   or a shared qemu user, which then runs the VM itself — equally dangerous.
+  While either key is set the host carries an informational
+  `file_restore_unsandboxed` health condition
+  ([diagnostics](diagnostics.md#file-restore-without-a-barrier-file_restore_unsandboxed)).
 
 ## Containers
 

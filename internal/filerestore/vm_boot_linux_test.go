@@ -101,8 +101,9 @@ func bootLauncher(t *testing.T) *Launcher {
 		Kernel: kernel, Agent: agent, BootTimeout: 120 * time.Second,
 		CacheDir: filepath.Join(base, "cache"), RunDir: filepath.Join(base, "run"),
 		// A non-root daemon has no per-VM uid or profile: it runs only with
-		// the explicit, dangerous key. Root runs (lab 2) do not set it.
-		AllowUnsandboxed: os.Geteuid() != 0,
+		// the explicit, dangerous key — for that barrier alone, so Landlock
+		// still confines qemu. Root runs (lab 2) do not set it.
+		Unsandboxed: Barriers{Root: os.Geteuid() != 0},
 	})
 	if err := l.Preflight(); err != nil {
 		t.Fatalf("preflight: %v", err)

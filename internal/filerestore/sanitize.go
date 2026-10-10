@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"hash/maphash"
 	"io"
 	"path"
 	"strings"
@@ -147,54 +148,97 @@ func keyOfFolded(folded string) nameKey {
 
 // linkTrie holds the (folded) paths of the symlinks an archive holds, by
 // component, so "is any ancestor of this name a symlink?" is one walk down
-// the name — O(its length) whatever the depths of the links. Nodes are
-// bounded (maxTrieNodes).
+// the name — O(its length) whatever the depths of the links.
+//
+// Its memory is bounded by its node count, not by what the guest sends: one
+// flat map from (parent node, hash of component) to a node number, 16 bytes
+// of key and 4 of value per node, holding no string of the guest's. Nodes
+// (maxTrieNodes) and links (maxLinks) are capped; past either cap the
+// extraction stops (ErrLimit). A hash collision can only merge two
+// components, which makes a name look under a link that it is not under —
+// it is refused, never let through: a real link's path always maps to the
+// same nodes.
 type linkTrie struct {
-	root  trieNode
-	nodes int
+	seed  maphash.Seed
+	kids  map[trieKey]uint32 // (parent, component) -> node; node 0 is the root
+	link  []bool             // by node
+	links int
 }
 
-type trieNode struct {
-	kids map[string]*trieNode
-	link bool
+type trieKey struct {
+	parent uint32
+	comp   uint64
 }
 
-// maxTrieNodes bounds the trie (a var for tests).
-var maxTrieNodes = 1 << 20
+// maxTrieNodes and maxLinks bound the trie (vars for tests). 64 Ki nodes
+// cost about 3 MB and cover any real tree's symlinks.
+var (
+	maxTrieNodes = 1 << 16
+	maxLinks     = 1 << 14
+)
 
-// add records a symlink at folded; false when the trie is full.
+func (t *linkTrie) init() {
+	if t.kids == nil {
+		t.seed = maphash.MakeSeed()
+		t.kids = map[trieKey]uint32{}
+		t.link = []bool{false}
+	}
+}
+
+func (t *linkTrie) key(parent uint32, comp string) trieKey {
+	return trieKey{parent: parent, comp: maphash.String(t.seed, comp)}
+}
+
+// add records a symlink at folded; false, recording nothing, when that would
+// pass a cap.
 func (t *linkTrie) add(folded string) bool {
-	n := &t.root
-	for _, c := range strings.Split(folded, "/") {
-		next := n.kids[c]
-		if next == nil {
-			if t.nodes >= maxTrieNodes {
-				return false
-			}
-			if n.kids == nil {
-				n.kids = map[string]*trieNode{}
-			}
-			next = &trieNode{}
-			n.kids[c] = next
-			t.nodes++
+	t.init()
+	if t.links >= maxLinks {
+		return false
+	}
+	comps := strings.Split(folded, "/")
+	// Walk what exists; the rest are new nodes. Past a cap, nothing is
+	// recorded.
+	n, i := uint32(0), 0
+	for ; i < len(comps); i++ {
+		next, ok := t.kids[t.key(n, comps[i])]
+		if !ok {
+			break
 		}
 		n = next
 	}
-	n.link = true
+	if len(t.link)-1+len(comps)-i > maxTrieNodes {
+		return false
+	}
+	for ; i < len(comps); i++ {
+		next := uint32(len(t.link))
+		t.kids[t.key(n, comps[i])] = next
+		t.link = append(t.link, false)
+		n = next
+	}
+	if !t.link[n] {
+		t.link[n] = true
+		t.links++
+	}
 	return true
 }
 
 // underLink reports whether a proper ancestor of folded is a symlink.
 func (t *linkTrie) underLink(folded string) bool {
-	n := &t.root
+	if t.kids == nil {
+		return false
+	}
 	comps := strings.Split(folded, "/")
+	n := uint32(0)
 	for _, c := range comps[:len(comps)-1] {
-		if n = n.kids[c]; n == nil {
+		next, ok := t.kids[t.key(n, c)]
+		if !ok {
 			return false
 		}
-		if n.link {
+		if t.link[next] {
 			return true
 		}
+		n = next
 	}
 	return false
 }
@@ -310,6 +354,14 @@ func SanitizeStream(dst io.Writer, src *bufio.Reader, selections []string, lim T
 			limitErr = fmt.Errorf("%w: more than %d entries to track", ErrLimit, maxTracked)
 			break
 		}
+		// A link is tracked before its header is written: past the trie's
+		// caps the extraction stops, and the archive holds no link it does
+		// not know of.
+		if rec.Type == TypeSymlink && !links.add(folded) {
+			st.Truncated = true
+			limitErr = fmt.Errorf("%w: more symlinks than one extraction tracks (%d links, %d path components)", ErrLimit, maxLinks, maxTrieNodes)
+			break
+		}
 		h := &tar.Header{Name: name, Mode: int64(rec.Mode & 0o777), ModTime: clampTime(rec.MTime), Format: tar.FormatPAX}
 		switch rec.Type {
 		case TypeDir:
@@ -323,11 +375,6 @@ func SanitizeStream(dst io.Writer, src *bufio.Reader, selections []string, lim T
 			return st, err
 		}
 		seen[key] = struct{}{}
-		if rec.Type == TypeSymlink && !links.add(folded) {
-			st.Truncated = true
-			limitErr = fmt.Errorf("%w: too many symlink path components to track", ErrLimit)
-			break
-		}
 		if size > 0 {
 			before := cw.n
 			_, err := io.CopyN(tw, src, size)

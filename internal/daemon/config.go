@@ -17,6 +17,7 @@ import (
 	"github.com/litevirt/litevirt/internal/image"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/obs"
+	"github.com/litevirt/litevirt/internal/pbsstore"
 )
 
 const defaultConfigPath = "/etc/litevirt/config.yaml"
@@ -101,6 +102,14 @@ type Config struct {
 	// host backup data leave this empty; the scheduler then quietly
 	// skips any VM whose backup.repo cannot be resolved locally.
 	BackupRepos map[string]string `yaml:"backup_repos,omitempty"`
+
+	// BackupBWLimits caps, per backup repo (by logical name, as in
+	// backup_repos or a compose backup-repos block), how fast this host's
+	// backups into that repo read disks and send chunks: "100MiB", "512K",
+	// or a byte count, per second. One limit is shared by every backup job
+	// this host runs into the repo; a job's own --bwlimit can only lower it.
+	// Absent or 0 = no limit.
+	BackupBWLimits map[string]string `yaml:"backup_bwlimits,omitempty"`
 
 	// MaxImageBytes caps a single image pull/import (disk-fill guard);
 	// ImagePullTimeoutSec bounds a pull's total wall time (SSRF/slowloris
@@ -862,6 +871,11 @@ func LoadConfig() (*Config, error) {
 			cfg.VM.DefaultCPUMode, lv.CPUModeHostModel, lv.CPUModeHostPassthrough)
 	}
 
+	// A typo'd bandwidth limit must fail load, not silently run unlimited.
+	if _, err := cfg.BackupBandwidthLimits(); err != nil {
+		return nil, err
+	}
+
 	// Validate the image-pull deny policy now so a bad CIDR fails load loudly
 	// (never silently drop a configured security policy).
 	if _, err := cfg.ImagePullBlockedPrefixes(); err != nil {
@@ -1141,4 +1155,20 @@ func orDefault[T interface{ ~int | ~float64 }](v, d T) T {
 		return d
 	}
 	return v
+}
+
+// BackupBandwidthLimits parses backup_bwlimits into bytes per second per repo
+// name. Zero entries are dropped (no limit).
+func (c *Config) BackupBandwidthLimits() (map[string]int64, error) {
+	out := make(map[string]int64, len(c.BackupBWLimits))
+	for name, v := range c.BackupBWLimits {
+		bps, err := pbsstore.ParseRate(v)
+		if err != nil {
+			return nil, fmt.Errorf("config backup_bwlimits.%s: %w", name, err)
+		}
+		if bps > 0 {
+			out[name] = bps
+		}
+	}
+	return out, nil
 }

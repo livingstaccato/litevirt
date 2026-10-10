@@ -2,8 +2,8 @@
 
 litevirt's backup system mirrors Proxmox PBS in shape: a
 content-addressed deduped chunk store, BLAKE3 hashing, dirty-bitmap
-incrementals, AES-256-GCM encryption, mark-and-sweep GC, retention,
-cross-repo sync, and live restore.
+incrementals, zstd compression, AES-256-GCM encryption, mark-and-sweep GC,
+retention, cross-repo sync, bandwidth limits, and live restore.
 
 ## Application consistency (guest fs-freeze)
 
@@ -21,7 +21,7 @@ surface:
 
 | Surface | What |
 |---|---|
-| `lv backup repo …` | local repo management — init, ls, gc, verify, prune, sync |
+| `lv backup repo …` | local repo management — init, ls, gc, verify, prune, sync, set-compression |
 | `lv backup snapshot <vm>` | push a VM disk into a repo via the daemon (gRPC) |
 | `lv backup restore-from` | offline restore: stream chunks to a target disk path |
 | `lv backup restore-live` | live restore: serve manifest over NBD while the VM boots against a qcow2 overlay |
@@ -82,9 +82,80 @@ share even a single 4 MiB region (a guest OS image, a database WAL
 segment, untouched filesystem regions) share the chunk file — the
 second snapshot's manifest just references the existing chunk.
 
-Compression is left to the underlying filesystem. Most backup hosts
-already run on ZFS or btrfs with native lz4; layering Go-side
-compression would just contend.
+## Compression
+
+A repo created by `lv backup repo init` compresses each chunk with zstd
+before it is written (and before it is sealed, in an encrypted repo). The
+chunk id stays the BLAKE3 of the *uncompressed* bytes, so dedup is unchanged,
+spans compressed and uncompressed repos, and sync and peer streaming still
+move plain chunks — a DR copy can differ in compression from its source. A
+chunk zstd cannot shrink (already-compressed guest data) is stored as it is.
+
+```bash
+lv backup repo init /srv/backup/main                      # zstd (default)
+lv backup repo init /srv/backup/main --compression none   # uncompressed
+lv backup repo set-compression /srv/backup/main zstd      # existing repo
+```
+
+**Older releases refuse a compressed repo.** A compressed repo's `repo.json`
+says `"compression": "zstd"` and `"schema_version": 2`. Every release before
+backup compression opens schema 1 only, so it stops at `repository
+schema-version 2 newer than supported 1` before it reads anything — it never
+misreads a compressed chunk as corrupt, and its GC never touches the repo.
+That marker is permanent: `set-compression <path> none` stops compressing
+new chunks, but compressed chunks are already there, so the repo stays
+schema 2.
+
+So an **existing** repo is never compressed behind your back: it stays
+schema 1 and uncompressed, byte-identical to what earlier releases wrote,
+until `lv backup repo set-compression <path> zstd`. Run that once every host
+and backup host that reads the repo runs a release with compression. During
+a rolling upgrade, create a repo that a not-yet-upgraded host must use with
+`--compression none`. Turning compression on rewrites nothing: earlier
+backups stay as they are and keep restoring, and only chunks written from
+then on are compressed.
+
+A compressed chunk is a 4-byte marker followed by a zstd frame. Guest data
+is arbitrary and may begin with the same bytes, so a chunk is taken as
+compressed only when its decompressed bytes hash to the chunk id; otherwise
+the stored bytes must. Decompression stops at the 4 MiB chunk size, so a
+crafted chunk file in a shared repo cannot make a reader allocate more.
+
+Daemon-internal transfer staging repos are created uncompressed.
+
+## Bandwidth limits
+
+A backup can be rate-limited per job and per target repo:
+
+```bash
+lv backup snapshot postgres-1 --repo main --bwlimit 50MiB
+lv ct backup web --repo main --bwlimit 20MiB
+```
+
+```yaml
+# daemon config, on the host(s) running the backups
+backup_bwlimits:
+  main: 100MiB      # per second; "512K" or a byte count also work
+```
+
+- **Per job** — `--bwlimit` (the `bwlimit_bytes_per_sec` RPC field).
+- **Per target** — `backup_bwlimits:` in the daemon config, by repo name. One
+  limit is shared by every backup job that host runs into that repo, so a
+  scheduled fan-out over twenty VMs moves at the repo's rate in total, not
+  twenty times it. It applies to scheduled backups too, which have no
+  per-job limit of their own.
+
+When both are set, the lower wins. A limit covers the bytes read from the
+disk or container (holes, and regions an incremental inherits from its
+parent, are not read and cost nothing) and, for a remote backup, the chunks
+sent to the repo's host. For a remote backup the host you call (the repo's
+host) hands the lower of the job limit and its own `backup_bwlimits` entry
+for the repo to the host that reads the disk. A host on an older release
+ignores the field and backs up unlimited. Restores and replication are not
+rate-limited.
+
+A target limit is enforced per host: two hosts backing up into the same repo
+each get the full limit.
 
 ## Incremental backups
 

@@ -10117,9 +10117,14 @@ type BackupSnapshotRequest struct {
 	// PushBackup-stream the manifest back to sink_host (resolved there as a logical
 	// repo name). The owner accepts it only from that peer over mTLS (host-cert CN
 	// == sink_host); a non-peer request that sets it is rejected. Leave empty.
-	SinkHost      string `protobuf:"bytes,7,opt,name=sink_host,json=sinkHost,proto3" json:"sink_host,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	SinkHost string `protobuf:"bytes,7,opt,name=sink_host,json=sinkHost,proto3" json:"sink_host,omitempty"`
+	// bwlimit_bytes_per_sec caps how fast this job reads the disk and, for a
+	// remote backup, sends chunks to the sink. 0 = no job limit. The daemon
+	// also applies the target repo's limit (daemon config backup_bwlimits);
+	// the lower of the two wins. An older daemon ignores the field.
+	BwlimitBytesPerSec int64 `protobuf:"varint,8,opt,name=bwlimit_bytes_per_sec,json=bwlimitBytesPerSec,proto3" json:"bwlimit_bytes_per_sec,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *BackupSnapshotRequest) Reset() {
@@ -10199,6 +10204,13 @@ func (x *BackupSnapshotRequest) GetSinkHost() string {
 		return x.SinkHost
 	}
 	return ""
+}
+
+func (x *BackupSnapshotRequest) GetBwlimitBytesPerSec() int64 {
+	if x != nil {
+		return x.BwlimitBytesPerSec
+	}
+	return 0
 }
 
 type BackupSnapshotProgress struct {
@@ -12767,9 +12779,11 @@ type BackupContainerRequest struct {
 	// BackupSnapshotRequest.sink_host: the repo-owning sink daemon sets it when
 	// forwarding to the owner, which accepts it only from that peer over mTLS
 	// (CN == sink_host). Leave empty.
-	SinkHost      string `protobuf:"bytes,5,opt,name=sink_host,json=sinkHost,proto3" json:"sink_host,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	SinkHost string `protobuf:"bytes,5,opt,name=sink_host,json=sinkHost,proto3" json:"sink_host,omitempty"`
+	// bwlimit_bytes_per_sec: see BackupSnapshotRequest.bwlimit_bytes_per_sec.
+	BwlimitBytesPerSec int64 `protobuf:"varint,6,opt,name=bwlimit_bytes_per_sec,json=bwlimitBytesPerSec,proto3" json:"bwlimit_bytes_per_sec,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *BackupContainerRequest) Reset() {
@@ -12835,6 +12849,13 @@ func (x *BackupContainerRequest) GetSinkHost() string {
 		return x.SinkHost
 	}
 	return ""
+}
+
+func (x *BackupContainerRequest) GetBwlimitBytesPerSec() int64 {
+	if x != nil {
+		return x.BwlimitBytesPerSec
+	}
+	return 0
 }
 
 type BackupContainerProgress struct {
@@ -35315,7 +35336,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\vscope_paths\x18\x04 \x03(\tR\n" +
 	"scopePaths\"$\n" +
 	"\x12RevokeTokenRequest\x12\x0e\n" +
-	"\x02id\x18\x01 \x01(\tR\x02id\"\xe1\x01\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\"\x94\x02\n" +
 	"\x15BackupSnapshotRequest\x12\x17\n" +
 	"\avm_name\x18\x01 \x01(\tR\x06vmName\x12\x1b\n" +
 	"\tdisk_name\x18\x02 \x01(\tR\bdiskName\x12\x1b\n" +
@@ -35323,7 +35344,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\ttimestamp\x18\x04 \x01(\tR\ttimestamp\x12 \n" +
 	"\vincremental\x18\x05 \x01(\bR\vincremental\x12\x18\n" +
 	"\aquiesce\x18\x06 \x01(\tR\aquiesce\x12\x1b\n" +
-	"\tsink_host\x18\a \x01(\tR\bsinkHost\"\x95\x03\n" +
+	"\tsink_host\x18\a \x01(\tR\bsinkHost\x121\n" +
+	"\x15bwlimit_bytes_per_sec\x18\b \x01(\x03R\x12bwlimitBytesPerSec\"\x95\x03\n" +
 	"\x16BackupSnapshotProgress\x12?\n" +
 	"\x05phase\x18\x01 \x01(\x0e2).litevirt.v1.BackupSnapshotProgress.PhaseR\x05phase\x12'\n" +
 	"\x0fbytes_processed\x18\x02 \x01(\x03R\x0ebytesProcessed\x12\x1b\n" +
@@ -35554,13 +35576,14 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x03tag\x18\x04 \x01(\tR\x03tag\x12\x1a\n" +
 	"\busername\x18\x05 \x01(\tR\busername\x12\x1a\n" +
 	"\bpassword\x18\x06 \x01(\tR\bpassword\x12\x18\n" +
-	"\aproject\x18\a \x01(\tR\aproject\"\xa1\x01\n" +
+	"\aproject\x18\a \x01(\tR\aproject\"\xd4\x01\n" +
 	"\x16BackupContainerRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1b\n" +
 	"\thost_name\x18\x02 \x01(\tR\bhostName\x12\x1b\n" +
 	"\trepo_path\x18\x03 \x01(\tR\brepoPath\x12\x1c\n" +
 	"\ttimestamp\x18\x04 \x01(\tR\ttimestamp\x12\x1b\n" +
-	"\tsink_host\x18\x05 \x01(\tR\bsinkHost\"\xf6\x02\n" +
+	"\tsink_host\x18\x05 \x01(\tR\bsinkHost\x121\n" +
+	"\x15bwlimit_bytes_per_sec\x18\x06 \x01(\x03R\x12bwlimitBytesPerSec\"\xf6\x02\n" +
 	"\x17BackupContainerProgress\x12@\n" +
 	"\x05phase\x18\x01 \x01(\x0e2*.litevirt.v1.BackupContainerProgress.PhaseR\x05phase\x12'\n" +
 	"\x0fbytes_processed\x18\x02 \x01(\x03R\x0ebytesProcessed\x12\x1b\n" +

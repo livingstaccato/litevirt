@@ -30,6 +30,7 @@ func newBackupRepoCmd() *cobra.Command {
 		newBackupRepoGCCmd(),
 		newBackupRepoPruneCmd(),
 		newBackupRepoSyncCmd(),
+		newBackupRepoSetCompressionCmd(),
 	)
 	return cmd
 }
@@ -37,41 +38,79 @@ func newBackupRepoCmd() *cobra.Command {
 func newBackupRepoInitCmd() *cobra.Command {
 	var encrypted bool
 	var keyPath string
+	var compression string
 	cmd := &cobra.Command{
 		Use:   "init <path>",
 		Short: "Create a new backup repository",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			opts := pbsstore.InitOptions{Compression: compression}
+			var key []byte
 			if encrypted {
-				r, err := pbsstore.InitEncrypted(args[0], pbsstore.EncryptionModeAESGCM)
-				if err != nil {
-					return err
-				}
 				if keyPath == "" {
 					return errors.New("--encrypted requires --key-file (32 random bytes)")
 				}
-				key, err := readHexKey(keyPath)
+				k, err := readHexKey(keyPath)
 				if err != nil {
 					return err
 				}
-				if err := r.SetKey(key); err != nil {
-					return err
-				}
-				fmt.Printf("Encrypted repository initialised at %s\n", r.Root())
-				fmt.Println("Keep the key file safe — without it, no chunk can be decrypted.")
-				return nil
+				key = k
+				opts.Encryption = pbsstore.EncryptionModeAESGCM
 			}
-			r, err := pbsstore.Init(args[0])
+			r, err := pbsstore.InitWithOptions(args[0], opts)
 			if err != nil {
 				return err
 			}
-			fmt.Printf("Repository initialised at %s\n", r.Root())
+			if key != nil {
+				if err := r.SetKey(key); err != nil {
+					return err
+				}
+				fmt.Printf("Encrypted repository initialised at %s (compression: %s)\n", r.Root(), r.Compression())
+				fmt.Println("Keep the key file safe — without it, no chunk can be decrypted.")
+			} else {
+				fmt.Printf("Repository initialised at %s (compression: %s)\n", r.Root(), r.Compression())
+			}
+			if r.Compression() != pbsstore.CompressionNone {
+				fmt.Println("A compressed repository is not readable by litevirt releases without backup compression;",
+					"use --compression none if an older host must use it.")
+			}
 			return nil
 		},
 	}
 	cmd.Flags().BoolVar(&encrypted, "encrypted", false, "Mark the repo as AES-256-GCM encrypted")
 	cmd.Flags().StringVar(&keyPath, "key-file", "", "Path to a hex-encoded 32-byte key (only with --encrypted)")
+	cmd.Flags().StringVar(&compression, "compression", pbsstore.CompressionZstd,
+		"Chunk compression: zstd or none (none keeps the repo readable by releases without compression)")
 	return cmd
+}
+
+// newBackupRepoSetCompressionCmd changes whether an existing repo compresses
+// NEW chunks. Existing chunks are never rewritten, so every backup already in
+// the repo stays restorable either way.
+func newBackupRepoSetCompressionCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "set-compression <path> <zstd|none>",
+		Short: "Turn chunk compression on or off for new backups in a repository",
+		Long: `Turn zstd chunk compression on or off for chunks written from now on.
+
+Turning it on marks the repository schema_version 2: litevirt releases without
+backup compression then refuse to open it (cleanly, before reading anything)
+instead of misreading compressed chunks. Upgrade every host and backup host
+that uses the repository first. The marker stays if compression is later
+turned off, because compressed chunks may already be in the repository.`,
+		Args: cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			r, err := pbsstore.Open(args[0])
+			if err != nil {
+				return err
+			}
+			if err := r.SetCompression(args[1]); err != nil {
+				return err
+			}
+			fmt.Printf("Repository %s: compression %s for new chunks\n", r.Root(), r.Compression())
+			return nil
+		},
+	}
 }
 
 func newBackupRepoListCmd() *cobra.Command {

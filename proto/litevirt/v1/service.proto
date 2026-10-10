@@ -940,6 +940,11 @@ message BackupSnapshotRequest {
     // repo name). The owner accepts it only from that peer over mTLS (host-cert CN
     // == sink_host); a non-peer request that sets it is rejected. Leave empty.
     string sink_host = 7;
+    // bwlimit_bytes_per_sec caps how fast this job reads the disk and, for a
+    // remote backup, sends chunks to the sink. 0 = no job limit. The daemon
+    // also applies the target repo's limit (daemon config backup_bwlimits);
+    // the lower of the two wins. An older daemon ignores the field.
+    int64 bwlimit_bytes_per_sec = 8;
 }
 message BackupSnapshotProgress {
     enum Phase {
@@ -1266,6 +1271,8 @@ message BackupContainerRequest {
     // forwarding to the owner, which accepts it only from that peer over mTLS
     // (CN == sink_host). Leave empty.
     string sink_host = 5;
+    // bwlimit_bytes_per_sec: see BackupSnapshotRequest.bwlimit_bytes_per_sec.
+    int64 bwlimit_bytes_per_sec = 6;
 }
 
 message BackupContainerProgress {

@@ -608,6 +608,17 @@ backup_repos:
   main: /srv/backup/main
   offsite: /mnt/dr/offsite
 
+# Backup bandwidth limits, per repo (by logical name), per second: "100MiB",
+# "512K" or a byte count. One limit is shared by every backup job THIS host
+# runs into the repo (a scheduled fan-out moves at the repo's rate in total),
+# and covers the disk read and, for a remote backup, the chunks sent to the
+# repo's host. When this host is the repo's sink for a remote backup, it hands
+# its limit to the host that reads the disk. A job's own `--bwlimit` can only
+# lower it. Absent or 0 = no limit; an invalid value refuses to start the
+# daemon. See docs/backups.md#bandwidth-limits.
+backup_bwlimits:
+  offsite: 100MiB
+
 # Billing-event webhook. Empty disables (the default — events
 # are dropped). When set, `internal/billing` POSTs JSON
 # {kind, project, subject, vcpu, mem_mib, disk_gib, …, at} on every

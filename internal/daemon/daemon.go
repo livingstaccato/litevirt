@@ -1430,7 +1430,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// effectively (every schedule errors with ErrNoRepoConfigured until
 	// the operator adds a repo).
 	d.snapScheduler.Runner = grpcapi.BackupRunnerForScheduler(svc, d.cfg.BackupRepos)
-	svc.SetBackupRepos(d.cfg.BackupRepos)               // let RPC handlers resolve repo names
+	svc.SetBackupRepos(d.cfg.BackupRepos) // let RPC handlers resolve repo names
+	// Per-repo backup bandwidth limits. LoadConfig already refused a bad value.
+	if bw, err := d.cfg.BackupBandwidthLimits(); err == nil {
+		svc.SetBackupBandwidthLimits(bw)
+	} else {
+		slog.Error("backup_bwlimits", "error", err)
+	}
 	svc.SweepTransferStaging()                          // clear orphaned peer-transfer staging repos from a prior incarnation
 	blockedCIDRs, _ := d.cfg.ImagePullBlockedPrefixes() // already validated in LoadConfig
 	svc.SetImageLimits(d.cfg.MaxImageBytes, time.Duration(d.cfg.ImagePullTimeoutSec)*time.Second, blockedCIDRs)

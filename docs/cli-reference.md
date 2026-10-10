@@ -305,7 +305,7 @@ lv ct rm <name> --force                               # a running container: sto
 lv ct ls
 lv ct inspect <name> [--host <h>] [--size] [-o json]  # one container: limits, privilege, confinement, NICs, rootfs, snapshots, backups
 lv ct exec <name> -- <cmd> [args...]
-lv ct backup <name> --repo <dir>                       # full rootfs backup → dedup chunk store
+lv ct backup <name> --repo <dir> [--bwlimit <rate>]    # full rootfs backup → dedup chunk store
 lv ct restore <name> --repo <dir> --timestamp <ts> [--start]  # rebuild from a backup manifest
 lv ct migrate <name> <target-host> --repo <src-dir>    # cold-migrate (stop → stream → start)
 lv ct snapshot create <name> <snapshot>                # freeze+tar point-in-time snapshot
@@ -806,7 +806,11 @@ lv acme status [host]   # show the TLS cert the UI is serving (subject/issuer/SA
 
 ```bash
 # Repository management (host-local)
-lv backup repo init <path> [--encrypted --key-file <file>]
+lv backup repo init <path> [--encrypted --key-file <file>] [--compression zstd|none]
+#   --compression zstd (default): chunks are zstd-compressed; the repo is marked
+#   schema 2, which releases without backup compression refuse to open.
+#   --compression none: the format every release reads.
+lv backup repo set-compression <path> zstd|none   # for chunks written from now on
 lv backup repo ls <path>
 lv backup repo verify <path>
 lv backup repo gc <path>
@@ -823,7 +827,9 @@ lv backup schedule ls
 lv backup schedule rm [vm] --repo <repo> [--scope vm|pool|project|cluster] [--pool <p>] [--project <p>]
 
 # Push / restore via the daemon
-lv backup snapshot <vm> --repo <path> [--disk <name>] [--incremental] [--quiesce auto|off]
+lv backup snapshot <vm> --repo <path> [--disk <name>] [--incremental] [--quiesce auto|off] [--bwlimit <rate>]
+#   --bwlimit 50MiB: cap this backup's read (and remote send) rate, per second;
+#   the repo's backup_bwlimits limit still applies, and the lower one wins.
 #   --quiesce auto (default): freeze guest filesystems via the qemu-guest-agent for an
 #   application-consistent backup when the VM has an agent, else crash-consistent.
 #   --quiesce off: always crash-consistent. A freeze failure never fails the backup.

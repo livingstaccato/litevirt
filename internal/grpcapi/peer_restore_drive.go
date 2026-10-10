@@ -121,3 +121,29 @@ func (s *Server) drivePeerRestore(ctx context.Context, target, repoName, name, t
 	}
 	return drainRestoreStream(rs)
 }
+
+// drivePeerRestoreFromTargetRepo drives a container restore on target from a
+// manifest already in a repo the TARGET resolves in its own config (a scheduled
+// replica): nothing is pushed, the target opens the repo and restores from it.
+// The relocation proof and token ride exactly as in drivePeerRestore.
+func (s *Server) drivePeerRestoreFromTargetRepo(ctx context.Context, target, repoName, name, timestamp string, start bool, proof *pb.RuntimeActionProof, lineage relocationLineage, mdPairs ...string) (corrosion.RestoreOutcome, error) {
+	if s.migrateRestoreOverride != nil {
+		return s.migrateRestoreOverride(ctx, target, repoName, name, timestamp, start)
+	}
+	c, closeConn, err := s.dialPeer(ctx, target)
+	if err != nil {
+		return corrosion.RestoreNotAttempted, fmt.Errorf("dial target: %w", err)
+	}
+	defer closeConn()
+	octx := ctx
+	if len(mdPairs) > 0 {
+		octx = metadata.AppendToOutgoingContext(ctx, mdPairs...)
+	}
+	rs, e := c.RestoreContainer(octx, lineage.on(&pb.RestoreContainerRequest{
+		RepoPath: repoName, Name: name, Timestamp: timestamp, HostName: target, Start: start, Proof: proof,
+	}))
+	if e != nil {
+		return corrosion.RestoreNotAttempted, e
+	}
+	return drainRestoreStream(rs)
+}

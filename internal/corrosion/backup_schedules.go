@@ -7,9 +7,10 @@ import (
 )
 
 // BackupScheduleRecord is one row of the backup_schedules table. A schedule
-// targets one of four scopes (Scope): "vm" (back up VMName), "pool" (every VM
-// whose disks live on PoolName), "cluster" (every VM), or "project" (every VM
-// in ProjectName). The scheduler fans the non-vm scopes out per host at tick
+// targets one of five scopes (Scope): "vm" (back up VMName), "pool" (every VM
+// whose disks live on PoolName), "cluster" (every VM), "project" (every VM
+// in ProjectName), or "container" (replication only: one container, see
+// ContainerScheduleKey). The scheduler fans the non-vm scopes out per host at tick
 // time. VMName always holds the row's identity key — for non-vm scopes it is a
 // sentinel (see ScheduleKey) so several scopes can share one repo under the
 // (vm_name, repo) primary key.
@@ -17,7 +18,7 @@ type BackupScheduleRecord struct {
 	VMName      string
 	PoolName    string // set when Scope == "pool"
 	ProjectName string // set when Scope == "project"
-	Scope       string // "vm" | "pool" | "cluster" | "project"; "" treated as "vm"
+	Scope       string // "vm" | "pool" | "cluster" | "project" | "container"; "" treated as "vm"
 	Repo        string
 	Cron        string
 	KeepLast    int
@@ -67,9 +68,30 @@ func ScheduleKey(scope, vmName, poolName, projectName string) string {
 		return "@project:" + projectName
 	case "cluster":
 		return "@cluster"
+	case "container":
+		return ContainerScheduleKey(vmName)
 	default:
 		return vmName
 	}
+}
+
+// containerScheduleKeyPrefix keeps a container schedule's identity apart from a
+// VM of the same name under the (vm_name, repo) primary key, and keeps a
+// previous-release scheduler (which looks the key up among VMs and finds none)
+// from running it as a VM replication.
+const containerScheduleKeyPrefix = "@ct:"
+
+// ContainerScheduleKey is the vm_name a container-scoped replication schedule is
+// stored under.
+func ContainerScheduleKey(name string) string { return containerScheduleKeyPrefix + name }
+
+// ContainerScheduleName is the container a container-scoped schedule key names;
+// ok is false for any other key.
+func ContainerScheduleName(key string) (name string, ok bool) {
+	if len(key) > len(containerScheduleKeyPrefix) && key[:len(containerScheduleKeyPrefix)] == containerScheduleKeyPrefix {
+		return key[len(containerScheduleKeyPrefix):], true
+	}
+	return "", false
 }
 
 // UpsertBackupSchedule creates or replaces a schedule by (vm_name, repo).

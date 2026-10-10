@@ -54,6 +54,11 @@ type containerBackupSpec struct {
 	// resurrecting a container the operator had deliberately stopped. (Other details
 	// are transient — the reconciler overwrites them on its next sweep.)
 	StateDetail string `json:"state_detail,omitempty"`
+	// Replica marks the manifest as a scheduled replica of a container rather
+	// than a backup (replication_container.go). Absent on a backup, and ignored
+	// by a build that predates it, which reads the manifest as the backup it is
+	// shaped like.
+	Replica *containerReplicaMark `json:"replica,omitempty"`
 }
 
 // containerBackupDisk is the manifest "disk" name for a container — a container
@@ -382,6 +387,15 @@ func (s *Server) RestoreContainerFromBackup(ctx context.Context, ctName, targetH
 		owner = nil
 	}
 	repoName, timestamp, err := s.findLatestContainerBackupFor(ctName, owner)
+	// A scheduled replica already on the target (replication_container.go) is a
+	// source too: restoring it moves nothing over the wire, and when it is newer
+	// than the newest backup it is the better one. It is restored by the same
+	// call as a backup, under the same relocation proof and token, so it is no
+	// second recovery path and cannot start a second copy.
+	if rep, ok := s.containerReplicaFor(ctx, ctName, owner, targetHost, time.Now()); ok &&
+		(err != nil || !timestampAtOrBefore(rep.Timestamp, timestamp)) {
+		return s.driveRemoteRestoreVia(ctx, targetHost, rep.Repo, ctName, rep.Timestamp, token, relocationLineageOf(owner), true)
+	}
 	if err != nil {
 		return corrosion.RestoreNotAttempted, err
 	}
@@ -461,6 +475,14 @@ func (s *Server) removeRestoreMarker(name string) { _ = os.Remove(s.restoreMarke
 // frame/stream was lost) → RestoreUnknown, which the coordinator defers rather
 // than destructively falling back.
 func (s *Server) driveRemoteRestore(ctx context.Context, target, repoPath, name, timestamp, token string, lineage relocationLineage) (corrosion.RestoreOutcome, error) {
+	return s.driveRemoteRestoreVia(ctx, target, repoPath, name, timestamp, token, lineage, false)
+}
+
+// driveRemoteRestoreVia is driveRemoteRestore for a manifest that is either in a
+// repo this daemon resolves (repoOnTarget false: streamed to the target, or its
+// repo name handed over) or already in a repo the TARGET resolves in its own
+// config (repoOnTarget true: a scheduled replica, restored where it is).
+func (s *Server) driveRemoteRestoreVia(ctx context.Context, target, repoPath, name, timestamp, token string, lineage relocationLineage, repoOnTarget bool) (corrosion.RestoreOutcome, error) {
 	// Carry the attempt token to the target (on the RestoreContainer call) so it
 	// stamps the restored row. The transport (PR-4 push to staging vs. shared-repo
 	// fallback) is handled by drivePeerRestore.
@@ -487,6 +509,9 @@ func (s *Server) driveRemoteRestore(ctx context.Context, target, repoPath, name,
 			// defer and retry rather than silently downgrade.
 			return corrosion.RestoreNotAttempted, fmt.Errorf("relocation proof for token %s not found under enforcement; deferring", token)
 		}
+	}
+	if repoOnTarget {
+		return s.drivePeerRestoreFromTargetRepo(ctx, target, repoPath, name, timestamp, true, proof, lineage, md...)
 	}
 	return s.drivePeerRestore(ctx, target, repoPath, name, timestamp, true, proof, lineage, md...)
 }
@@ -608,11 +633,17 @@ func (s *Server) findLatestContainerBackupFor(ctName string, owner *corrosion.Co
 // quiesced the container (frozen for a live backup, or stopped for migration).
 // Shared by BackupContainer and MigrateContainer — one tested data path.
 func (s *Server) archiveContainer(ctx context.Context, repo *pbsstore.Repo, rec *corrosion.ContainerRecord, timestamp string, progress func(pbsstore.PushProgress)) (*pbsstore.Manifest, error) {
+	return s.archiveContainerAs(ctx, repo, rec, timestamp, nil, progress)
+}
+
+// archiveContainerAs is archiveContainer with the manifest optionally marked as
+// a replica (mark non-nil).
+func (s *Server) archiveContainerAs(ctx context.Context, repo *pbsstore.Repo, rec *corrosion.ContainerRecord, timestamp string, mark *containerReplicaMark, progress func(pbsstore.PushProgress)) (*pbsstore.Manifest, error) {
 	specJSON, _ := json.Marshal(containerBackupSpec{
 		Name: rec.Name, Image: rec.Image, CPULimit: rec.CPULimit, MemMiB: rec.MemMiB,
 		Labels: rec.Labels, RestartPolicy: rec.RestartPolicy, Project: rec.Project,
 		CreateSpec: rec.CreateSpec, OnHostFailure: rec.OnHostFailure, IsTemplate: rec.IsTemplate,
-		StateDetail: rec.StateDetail,
+		StateDetail: rec.StateDetail, Replica: mark,
 	})
 	// Pipe the export tar straight into the chunk store so we never buffer the
 	// whole rootfs. If PushDisk returns early (error), CloseWithError unblocks

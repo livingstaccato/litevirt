@@ -49,6 +49,16 @@ type manifestCacheEntry struct {
 	at time.Time
 }
 
+// forgetBackupManifests drops the cached manifest reads of container name in the
+// repo at path, so the next probe sees a manifest just written. The cache is
+// right to be reused for an inspect; it is wrong for a failover that must know
+// whether the replica a run just pushed is there.
+func (s *Server) forgetBackupManifests(path, name string) {
+	s.backupManifestMu.Lock()
+	defer s.backupManifestMu.Unlock()
+	delete(s.backupManifests, path+"\x00"+name)
+}
+
 // backupProbeSlots is the host's probe limiter.
 func (s *Server) backupProbeSlots() chan struct{} {
 	s.backupProbeOnce.Do(func() { s.backupProbeSem = make(chan struct{}, backupProbeConcurrency) })

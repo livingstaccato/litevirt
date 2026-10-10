@@ -39,6 +39,9 @@ var errCheckpointCommit = errors.New("replication checkpoint commit failed")
 // rejected with guidance (true cross-host transport of local-only storage is a
 // planned follow-up).
 func (s *Server) RunReplication(ctx context.Context, sched corrosion.BackupScheduleRecord, runAt time.Time) error {
+	if sched.Scope == "container" {
+		return s.runContainerReplication(ctx, sched, runAt)
+	}
 	if sched.TargetPool == "" {
 		return fmt.Errorf("replication schedule for %q missing target_pool", sched.VMName)
 	}

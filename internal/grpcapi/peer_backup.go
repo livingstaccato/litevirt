@@ -231,9 +231,20 @@ func (s *Server) PushBackup(stream grpc.ClientStreamingServer[pb.PushBackupFrame
 			return status.Errorf(codes.FailedPrecondition, "push-backup: manifest references chunk %s not present at destination", ref.ID)
 		}
 	}
+	// A scheduled container replica never replaces a newer copy of the same
+	// container with an older one (replication_container.go).
+	if err := admitContainerReplica(ctx, repo, &m); err != nil {
+		return err
+	}
 	// Manifest written LAST — every chunk it references is now confirmed present.
 	if err := repo.PutManifest(&m); err != nil {
 		return status.Errorf(codes.Internal, "push-backup: write manifest: %v", err)
+	}
+	if stagingToken == "" {
+		settleContainerReplicas(ctx, repo, &m)
+		if m.DiskName == containerBackupDisk {
+			s.forgetBackupManifests(repo.Root(), m.VMName)
+		}
 	}
 	// Mark committed only AFTER the close succeeds: if SendAndClose fails the source
 	// sees an error and won't drive the restore, so a staging repo whose manifest

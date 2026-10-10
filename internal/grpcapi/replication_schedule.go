@@ -19,6 +19,9 @@ func (s *Server) CreateReplicationSchedule(ctx context.Context, req *pb.CreateRe
 	if scope == "" {
 		scope = "vm"
 	}
+	if scope == "container" {
+		return s.createContainerReplicationSchedule(ctx, req)
+	}
 	if err := s.authorizeSchedule(ctx, scope, req.VmName, req.PoolName, req.ProjectName); err != nil {
 		return nil, err
 	}
@@ -131,6 +134,9 @@ func (s *Server) DeleteReplicationSchedule(ctx context.Context, req *pb.DeleteRe
 	if scope == "" {
 		scope = "vm"
 	}
+	if scope == "container" {
+		return s.deleteContainerReplicationSchedule(ctx, req)
+	}
 	if err := s.authorizeSchedule(ctx, scope, req.VmName, req.PoolName, req.ProjectName); err != nil {
 		return nil, err
 	}
@@ -149,8 +155,12 @@ func replScheduleToPB(r corrosion.BackupScheduleRecord) *pb.ReplicationSchedule 
 	if scope == "" {
 		scope = "vm"
 	}
+	vmName := r.VMName
+	if name, ok := corrosion.ContainerScheduleName(r.VMName); ok && scope == "container" {
+		vmName = name // the container, not the key the row is stored under
+	}
 	return &pb.ReplicationSchedule{
-		VmName:       r.VMName,
+		VmName:       vmName,
 		Cron:         r.Cron,
 		TargetPool:   r.TargetPool,
 		TargetHost:   r.TargetHost,

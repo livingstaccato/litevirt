@@ -3453,6 +3453,18 @@ func (c *Coordinator) imageRecreateOrSkip(ctx context.Context, h *corrosion.Host
 // collision-free target exists, with skipped=true when that refusal already
 // marked the container relocate-skipped (no host has a container runtime).
 func (c *Coordinator) pickContainerTarget(ctx context.Context, ct corrosion.ContainerRecord, candidates []corrosion.HostRecord) (target string, skipped bool) {
+	// A container replicated on a schedule that allows auto-promote is restored
+	// where its replica is, so the data is already there: place it on that host
+	// when it is a healthy candidate and placement accepts it, and only then fall
+	// back to placement over every candidate.
+	if rh := c.containerReplicaHost(ctx, ct, candidates); rh != "" {
+		req := c.containerPlacementRequest(ct)
+		req.PinHost = rh
+		if t, perr := placement.Select(ctx, c.db, req); perr == nil && t == rh && !c.targetHasLiveContainer(ctx, t, ct.Name) {
+			return t, false
+		}
+	}
+
 	// The single-VM Select path carries the full capacity model (observations,
 	// reserves, incomplete-host exclusion). There is deliberately NO
 	// round-robin fallback on its failure: the old one walked the raw healthy
@@ -3692,3 +3704,36 @@ func vmFailurePolicy(vm corrosion.VMRecord) string { return corrosion.VMFailureP
 // vmUsesFirmwareState reports whether a VM uses Secure Boot or a vTPM — i.e. has
 // host-local firmware state (NVRAM + swtpm) that can't survive its host dying (G1).
 func vmUsesFirmwareState(vm corrosion.VMRecord) bool { return corrosion.VMUsesFirmwareState(vm) }
+
+// containerReplicaHost is the host holding the replica of ct that a failover may
+// promote: the target of its enabled, auto-promote, container-scoped replication
+// schedule, when that host is one of the healthy candidates. "" when ct is not
+// replicated that way, or no restorer is wired to use a replica.
+func (c *Coordinator) containerReplicaHost(ctx context.Context, ct corrosion.ContainerRecord, candidates []corrosion.HostRecord) string {
+	if c.Restorer == nil {
+		return ""
+	}
+	rows, err := corrosion.ListBackupSchedules(ctx, c.db)
+	if err != nil {
+		return ""
+	}
+	norm := func(p string) string {
+		if p == "" {
+			return corrosion.DefaultProject
+		}
+		return p
+	}
+	project := norm(ct.Project)
+	for _, r := range rows {
+		if r.Type != "replication" || r.Scope != "container" || !r.Enabled || !r.AutoPromote || r.TargetHost == "" ||
+			r.VMName != corrosion.ContainerScheduleKey(ct.Name) || norm(r.ProjectName) != project {
+			continue
+		}
+		for _, h := range candidates {
+			if h.Name == r.TargetHost {
+				return r.TargetHost
+			}
+		}
+	}
+	return ""
+}

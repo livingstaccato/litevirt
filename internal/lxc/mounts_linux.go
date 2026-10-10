@@ -5,6 +5,7 @@ package lxc
 import (
 	"errors"
 	"fmt"
+	"log/syslog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -43,8 +44,10 @@ func probeMountAPI() error {
 
 // openBeneath opens rel beneath the allowed prefix — the prefix itself with
 // no symlink anywhere in it, and rel with no symlink, no magic link and no
-// escape — as an O_PATH fd. A symlink swapped in anywhere along the way is
-// refused by the kernel (ELOOP / EXDEV), never followed.
+// escape, and no crossing into another mount (RESOLVE_NO_XDEV: a filesystem
+// mounted over a path beneath the prefix after it was judged is not the tree
+// that was judged) — as an O_PATH fd. A symlink swapped in anywhere along the
+// way is refused by the kernel (ELOOP / EXDEV), never followed.
 func openBeneath(prefix, rel string) (int, error) {
 	dirfd, err := unix.Openat2(unix.AT_FDCWD, prefix, &unix.OpenHow{
 		Flags:   unix.O_PATH | unix.O_DIRECTORY | unix.O_CLOEXEC,
@@ -56,7 +59,7 @@ func openBeneath(prefix, rel string) (int, error) {
 	defer unix.Close(dirfd)
 	fd, err := unix.Openat2(dirfd, rel, &unix.OpenHow{
 		Flags:   unix.O_PATH | unix.O_CLOEXEC,
-		Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_MAGICLINKS,
+		Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_MAGICLINKS | unix.RESOLVE_NO_XDEV,
 	})
 	if err != nil {
 		return -1, fmt.Errorf("open %s beneath %s: %w", rel, prefix, err)
@@ -203,50 +206,119 @@ func RunHook(args []string) int {
 		hook = args[2]
 	}
 	if name == "" || strings.ContainsAny(name, "/\x00") || name == "." || name == ".." {
-		fmt.Fprintln(os.Stderr, "litevirt lxc hook: no valid LXC_NAME")
+		hookLog("no valid LXC_NAME")
 		return 1
 	}
 	dir := filepath.Join(stagingRoot, name)
 	switch hook {
 	case "post-stop":
-		ents, _ := os.ReadDir(dir)
-		for _, e := range ents {
-			unmountAll(filepath.Join(dir, e.Name()))
-		}
-		_ = os.RemoveAll(dir)
+		clearStaging(dir)
 		return 0
 	case "pre-start":
 	default:
-		fmt.Fprintf(os.Stderr, "litevirt lxc hook: unexpected hook type %q\n", hook)
+		hookLog("unexpected hook type %q", hook)
 		return 1
 	}
 	b, err := os.ReadFile(cfgPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "litevirt lxc hook: read %s: %v\n", cfgPath, err)
+		hookLog("read %s: %v", cfgPath, err)
 		return 1
 	}
 	mounts, err := hookMounts(string(b))
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "litevirt lxc hook: %s: %v\n", name, err)
+		hookLog("%s: %v", name, err)
 		return 1
 	}
+	devices, err := hookDevices(string(b))
+	if err != nil {
+		hookLog("%s: %v", name, err)
+		return 1
+	}
+	// Re-judged against this host's policy as it is now (the daemon rewrites
+	// it before every start it drives), not against the config: a reboot from
+	// inside the container runs this hook with no daemon in the loop.
+	policy, err := readHookPolicy()
+	if err != nil {
+		hookLog("%s: refusing to start: %v", name, err)
+		return 1
+	}
+	for _, m := range mounts {
+		if err := policy.judgeMount(m.prefix, filepath.Join(m.prefix, m.rel)); err != nil {
+			hookLog("%s: refusing to start: %v", name, err)
+			return 1
+		}
+	}
+	for _, d := range devices {
+		if err := policy.judgeDevice(d.source, d.kind, d.major, d.minor); err != nil {
+			hookLog("%s: refusing to start: %v", name, err)
+			return 1
+		}
+	}
 	if err := ensurePrivateStagingRoot(); err != nil {
-		fmt.Fprintf(os.Stderr, "litevirt lxc hook: %v\n", err)
+		hookLog("%v", err)
 		return 1
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		fmt.Fprintf(os.Stderr, "litevirt lxc hook: %v\n", err)
+		hookLog("%v", err)
 		return 1
 	}
 	for i, m := range mounts {
 		if want := stagingPath(name, i); m.staging != want {
-			fmt.Fprintf(os.Stderr, "litevirt lxc hook: %s: entry %d names %s, not %s\n", name, i, m.staging, want)
+			hookLog("%s: entry %d names %s, not %s", name, i, m.staging, want)
 			return 1
 		}
 		if err := stageMount(m); err != nil {
-			fmt.Fprintf(os.Stderr, "litevirt lxc hook: %s: refusing to start: %v\n", name, err)
+			// Unwind what was staged: a failed start leaves no host mount
+			// behind for post-stop (which LXC does not run) to miss.
+			clearStaging(dir)
+			hookLog("%s: refusing to start: %v", name, err)
 			return 1
 		}
 	}
 	return 0
+}
+
+// hookLog says one thing the hook did or refused, on stderr (LXC's log, when
+// the container has one) and in the system log under the tag
+// litevirt-lxc-hook, so a refused start — a reboot from inside the container
+// included, which no daemon call sees — leaves a record.
+func hookLog(format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	fmt.Fprintln(os.Stderr, "litevirt lxc hook: "+msg)
+	if w, err := syslog.New(syslog.LOG_WARNING|syslog.LOG_DAEMON, "litevirt-lxc-hook"); err == nil {
+		_ = w.Warning(msg)
+		_ = w.Close()
+	}
+}
+
+// clearStaging takes a container's staging mounts down and removes each
+// entry by itself — never RemoveAll, which would walk into a host tree still
+// mounted there and delete its contents. An entry still mounted, or a
+// directory not empty, stays and is said.
+func clearStaging(dir string) {
+	ents, _ := os.ReadDir(dir)
+	for _, e := range ents {
+		p := filepath.Join(dir, e.Name())
+		unmountAll(p)
+		if isMountpoint(p) {
+			hookLog("%s is still mounted; left in place", p)
+			continue
+		}
+		if err := os.Remove(p); err != nil {
+			hookLog("remove %s: %v", p, err)
+		}
+	}
+	_ = os.Remove(dir)
+}
+
+// exclusiveOpenBusyOS opens a block node O_EXCL: EBUSY means some kernel
+// claimant (a mount, swap, md, dm, btrfs, ZFS) holds it. Any other error
+// proves nothing either way.
+func exclusiveOpenBusyOS(p string) bool {
+	fd, err := unix.Open(p, unix.O_RDONLY|unix.O_EXCL|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return errors.Is(err, unix.EBUSY)
+	}
+	unix.Close(fd)
+	return false
 }

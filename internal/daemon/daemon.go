@@ -658,6 +658,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	lxcRunner.DefaultPidsMax = d.cfg.Containers.DefaultPidsMax
 	lxcRunner.IDMappedRootfs = d.cfg.Containers.IDMappedRootfs
 	lxcRunner.HostAccess = d.cfg.Containers.hostAccess(d.cfg.DataDir, d.cfg.PKIDir)
+	lxcRunner.HostAccess.Deny = append(lxcRunner.HostAccess.Deny, d.storeDenyStatic()...)
+	lxcRunner.HostAccess.DenyFunc = d.storeDenyDynamic
+	lxcRunner.HostAccess.BlockInUse = d.vmDiskBlockInUse
 	lxcRunner.SubIDSpan = &lxc.IDMap{Base: d.cfg.Containers.IDMapBase, Size: int64(d.cfg.Containers.IDMapRanges) * lxc.IDMapSize}
 	d.metrics = metrics.NewServer(d.cfg.MetricsPort, d.cfg.MetricsBind, d.db, d.virt, lxcRunner, d.cfg.HostName)
 	d.metrics.SetReplicationTargets(repl.Targets)

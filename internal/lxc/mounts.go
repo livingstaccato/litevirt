@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -61,13 +63,22 @@ type HostAccess struct {
 	MountPaths []string
 	// DevicePaths are the device nodes that may be passed through, exactly.
 	DevicePaths []string
-	// Deny are further trees no mount may come from or be an ancestor of:
-	// litevirt's data, PKI and database directories, the image store, storage
-	// pool targets and backup repos (the daemon fills them in).
+	// Deny are further static trees no mount may come from or be an ancestor
+	// of: litevirt's data and PKI directories (from the daemon config). The
+	// dynamic stores — pools, backup repos, the image store — come from
+	// DenyFunc, at every resolve.
 	Deny []string
 	// HookBinary is the executable LXC runs as the container's start hook
 	// (the litevirt binary, `<HookBinary> __lxc-hook`).
 	HookBinary string
+	// DenyFunc returns this host's stores as they are now — every storage
+	// pool's source and target, every backup repo, the image store, the
+	// restore cache — re-read at every resolve, so at every start. The daemon
+	// wires it; nil adds nothing.
+	DenyFunc func() []string
+	// BlockInUse reports why a block device (by number) is litevirt's — a VM
+	// disk on this host, compared by device number. The daemon wires it.
+	BlockInUse func(major, minor uint32) string
 }
 
 // hardDenyTrees are host trees no bind mount may come from, or be an
@@ -171,7 +182,48 @@ func deniedDeviceName(p string) bool {
 	case "/dev/mem", "/dev/kmem", "/dev/port", "/dev/kvm":
 		return true
 	}
-	return strings.HasPrefix(p, "/dev/vhost-")
+	// Raw access to disks with no block-layer check at all: SCSI generic,
+	// block SCSI generic, NVMe generic namespaces and NVMe controllers.
+	return strings.HasPrefix(p, "/dev/vhost-") || strings.HasPrefix(p, "/dev/bsg/") || rawDiskCharRe.MatchString(p)
+}
+
+var rawDiskCharRe = regexp.MustCompile(`^/dev/(sg[0-9]+|ng[0-9]+n[0-9]+|nvme[0-9]+)$`)
+
+// procDevicesPath is where the kernel lists its device majors (the bsg and
+// NVMe char majors are allocated dynamically).
+var procDevicesPath = "/proc/devices"
+
+// rawDiskCharMajors reads the dynamic char majors of bsg, nvme-generic and
+// nvme from /proc/devices.
+func rawDiskCharMajors() map[uint32]bool {
+	out := map[uint32]bool{}
+	b, err := os.ReadFile(procDevicesPath)
+	if err != nil {
+		return out
+	}
+	inChar := false
+	for _, line := range strings.Split(string(b), "\n") {
+		t := strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(t, "Character devices"):
+			inChar = true
+			continue
+		case strings.HasPrefix(t, "Block devices"):
+			inChar = false
+			continue
+		}
+		f := strings.Fields(t)
+		if !inChar || len(f) != 2 {
+			continue
+		}
+		switch f[1] {
+		case "bsg", "nvme-generic", "nvme":
+			if n, err := strconv.ParseUint(f[0], 10, 32); err == nil {
+				out[uint32(n)] = true
+			}
+		}
+	}
+	return out
 }
 
 // deniedDeviceNumber reports device numbers never passed through: physical
@@ -185,8 +237,10 @@ func deniedDeviceNumber(kind byte, major, minor uint32) bool {
 		return true
 	case major == 10 && (minor == 232 || minor == 238 || minor == 241):
 		return true
+	case major == 21: // SCSI generic
+		return true
 	}
-	return false
+	return rawDiskCharMajors()[major]
 }
 
 // ValidateHostAccess refuses an allowed-prefix list a host must not run with:
@@ -273,16 +327,33 @@ func resolveMount(m Mount, a HostAccess) (resolvedMount, error) {
 	return resolvedMount{}, fmt.Errorf("host path %q is neither a directory nor a regular file", resolved)
 }
 
-// mountinfoPath and sysDevBlock are where block-device use is read; tests
-// point them at fixtures.
+// Where block-device use is read; tests point them at fixtures.
 var (
 	mountinfoPath = "/proc/self/mountinfo"
 	sysDevBlock   = "/sys/dev/block"
+	procRoot      = "/proc"
+	swapsPath     = "/proc/swaps"
+	// statRdev reads a node's device numbers.
+	statRdev = func(p string) (uint32, uint32, bool) {
+		fi, err := os.Stat(p)
+		if err != nil {
+			return 0, 0, false
+		}
+		_, maj, mnr, ok := deviceNumbers(fi)
+		return maj, mnr, ok
+	}
+	// exclusiveOpenBusy reports whether the kernel refuses an exclusive open
+	// of the block node (EBUSY): a claim by a mount, swap, md, dm, btrfs, ZFS
+	// or anything else that holds it.
+	exclusiveOpenBusy = exclusiveOpenBusyOS
 )
 
-// blockDeviceInUse reports why a block device must not be passed through: it
-// (or one of its partitions) holds a mounted filesystem, or something — a
-// device-mapper or md device, a VM disk's LVM volume — is built on it.
+// blockDeviceInUse reports why a block device must not be passed through,
+// judged by its NUMBER (never a path, which a rename changes): it, one of its
+// partitions or the disk it is a partition of holds a mounted filesystem, is
+// swap, has a device built on it, is an attached loop or nbd device, is held
+// open by any process (qemu's VM disks), or the kernel refuses an exclusive
+// open of it.
 func blockDeviceInUse(major, minor uint32) string {
 	mounted := map[string]bool{}
 	if b, err := os.ReadFile(mountinfoPath); err == nil {
@@ -294,34 +365,121 @@ func blockDeviceInUse(major, minor uint32) string {
 	} else {
 		return "this host's mount table cannot be read (" + err.Error() + ")"
 	}
+	swap := map[string]bool{}
+	if b, err := os.ReadFile(swapsPath); err == nil {
+		for _, line := range strings.Split(string(b), "\n")[1:] {
+			if f := strings.Fields(line); len(f) > 0 {
+				if ma, mi, ok := statRdev(f[0]); ok {
+					swap[fmt.Sprintf("%d:%d", ma, mi)] = true
+				}
+			}
+		}
+	}
+	held := openDeviceNumbers()
 	check := func(dev string) string {
-		if mounted[dev] {
+		switch {
+		case mounted[dev]:
 			return "it holds a mounted filesystem"
+		case swap[dev]:
+			return "it is swap"
+		case held[dev] != "":
+			return "process " + held[dev] + " holds it open"
 		}
 		if ents, err := os.ReadDir(filepath.Join(sysDevBlock, dev, "holders")); err == nil && len(ents) > 0 {
 			return "another block device (" + ents[0].Name() + ") is built on it"
 		}
+		if _, err := os.Stat(filepath.Join(sysDevBlock, dev, "loop", "backing_file")); err == nil {
+			return "it is a loop device with a backing file"
+		}
+		if _, err := os.Stat(filepath.Join(sysDevBlock, dev, "pid")); err == nil {
+			return "it is a connected nbd device"
+		}
+		if exclusiveOpenBusy("/dev/block/" + dev) {
+			return "the kernel refuses an exclusive open (a mount, swap, md, dm, btrfs or ZFS holds it)"
+		}
 		return ""
 	}
-	self := fmt.Sprintf("%d:%d", major, minor)
-	if why := check(self); why != "" {
-		return why
-	}
-	// Its partitions: subdirectories of its sysfs node carrying a "partition" file.
-	ents, _ := os.ReadDir(filepath.Join(sysDevBlock, self))
-	for _, e := range ents {
-		if _, err := os.Stat(filepath.Join(sysDevBlock, self, e.Name(), "partition")); err != nil {
-			continue
-		}
-		dev, err := os.ReadFile(filepath.Join(sysDevBlock, self, e.Name(), "dev"))
-		if err != nil {
-			continue
-		}
-		if why := check(strings.TrimSpace(string(dev))); why != "" {
-			return "its partition " + e.Name() + ": " + why
+	for _, f := range blockFamily(major, minor) {
+		if why := check(f.dev); why != "" {
+			return f.what + why
 		}
 	}
 	return ""
+}
+
+// blockKin is one device of a block device's family, and how to name it.
+type blockKin struct{ dev, what string }
+
+// blockFamily is a block device, its partitions and — for a partition — the
+// disk it belongs to: passing any one through reaches the others' data.
+func blockFamily(major, minor uint32) []blockKin {
+	self := fmt.Sprintf("%d:%d", major, minor)
+	out := []blockKin{{self, ""}}
+	ents, _ := os.ReadDir(filepath.Join(sysDevBlock, self))
+	for _, e := range ents {
+		if dev := partitionDev(filepath.Join(sysDevBlock, self, e.Name())); dev != "" {
+			out = append(out, blockKin{dev, "its partition " + e.Name() + ": "})
+		}
+	}
+	if parent := parentDisk(self); parent != "" {
+		out = append(out, blockKin{parent, "the disk it is a partition of (" + parent + "): "})
+	}
+	return out
+}
+
+// partitionDev is the dev number of the partition whose sysfs dir is dir, or
+// "" when dir is not a partition.
+func partitionDev(dir string) string {
+	if _, err := os.Stat(filepath.Join(dir, "partition")); err != nil {
+		return ""
+	}
+	b, err := os.ReadFile(filepath.Join(dir, "dev"))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+// parentDisk is the dev number of the disk dev is a partition of, or "".
+func parentDisk(dev string) string {
+	disks, _ := os.ReadDir(sysDevBlock)
+	for _, d := range disks {
+		parts, _ := os.ReadDir(filepath.Join(sysDevBlock, d.Name()))
+		for _, p := range parts {
+			if partitionDev(filepath.Join(sysDevBlock, d.Name(), p.Name())) == dev {
+				return d.Name()
+			}
+		}
+	}
+	return ""
+}
+
+// openDeviceNumbers maps the device numbers any process holds open (its fds
+// naming a /dev node) to that process's pid. qemu opens a VM's raw disk
+// without a kernel claim, so this is how such a disk is seen.
+func openDeviceNumbers() map[string]string {
+	out := map[string]string{}
+	pids, _ := os.ReadDir(procRoot)
+	for _, p := range pids {
+		if _, err := strconv.Atoi(p.Name()); err != nil {
+			continue
+		}
+		fdDir := filepath.Join(procRoot, p.Name(), "fd")
+		fds, err := os.ReadDir(fdDir)
+		if err != nil {
+			continue
+		}
+		for _, fd := range fds {
+			target, err := os.Readlink(filepath.Join(fdDir, fd.Name()))
+			if err != nil || !strings.HasPrefix(target, "/dev/") {
+				continue
+			}
+			if ma, mi, ok := statRdev(target); ok {
+				out[fmt.Sprintf("%d:%d", ma, mi)] = p.Name()
+			}
+		}
+	}
+	return out
 }
 
 // resolveDevice judges one device on this host.
@@ -368,6 +526,17 @@ func resolveDevice(d Device, a HostAccess) (resolvedDevice, error) {
 		if why := blockDeviceInUse(major, minor); why != "" {
 			return resolvedDevice{}, fmt.Errorf("block device %q is the host's: %s", src, why)
 		}
+		if a.BlockInUse != nil {
+			for _, f := range blockFamily(major, minor) {
+				var ma, mi uint32
+				if _, err := fmt.Sscanf(f.dev, "%d:%d", &ma, &mi); err != nil {
+					continue
+				}
+				if why := a.BlockInUse(ma, mi); why != "" {
+					return resolvedDevice{}, fmt.Errorf("block device %q is litevirt's: %s%s", src, f.what, why)
+				}
+			}
+		}
 	}
 	return resolvedDevice{Source: src, Target: target, Kind: kind, Major: major, Minor: minor}, nil
 }
@@ -379,7 +548,11 @@ func ResolveHostAccess(mounts []Mount, devices []Device, access HostAccess) ([]r
 		if err := hostAccessSupported(); err != nil {
 			return nil, nil, fmt.Errorf("host bind mounts need the kernel's openat2 and new mount API (Linux 5.12+): %w", err)
 		}
+		if err := validateHookBinary(access.HookBinary); err != nil {
+			return nil, nil, fmt.Errorf("host bind mounts are staged by litevirt's start hook, and %w", err)
+		}
 	}
+	access.Deny = effectiveDeny(access)
 	var rm []resolvedMount
 	for _, m := range mounts {
 		r, err := resolveMount(m, access)
@@ -594,6 +767,42 @@ func (r *LxcRunner) SetHostAccess(name string, mounts []Mount, devices []Device)
 	return writeFileAtomic(cfgPath, []byte(cfg), 0o644)
 }
 
+// effectiveDeny is every protected tree beyond the hard ones: the static
+// list, the host's stores as they are now (DenyFunc), and the start hook's
+// own binary — a mount that contains it would let a container rewrite what
+// LXC runs as root.
+func effectiveDeny(a HostAccess) []string {
+	out := append([]string(nil), a.Deny...)
+	if a.DenyFunc != nil {
+		out = append(out, a.DenyFunc()...)
+	}
+	if a.HookBinary != "" {
+		out = append(out, a.HookBinary)
+	}
+	return out
+}
+
+// validateHookBinary refuses a start-hook binary LXC must not run as root: a
+// path a config line cannot carry, or a file or parent directory that is not
+// root-owned or is group- or world-writable. Tests replace it.
+var validateHookBinary = func(bin string) error {
+	if !safePathRe.MatchString(bin) {
+		return fmt.Errorf("its binary path %q holds characters a config line cannot carry", bin)
+	}
+	for p := bin; ; p = filepath.Dir(p) {
+		fi, err := os.Lstat(p)
+		if err != nil {
+			return fmt.Errorf("its binary %s: %w", bin, err)
+		}
+		if !ownedByRoot(fi) || fi.Mode().Perm()&0o022 != 0 {
+			return fmt.Errorf("its binary %s (at %s) is not root-owned and closed to group and others", bin, p)
+		}
+		if p == "/" {
+			return nil
+		}
+	}
+}
+
 // hostAccess is the runner's HostAccess with this runner's own LXC store
 // added to the protected trees.
 func (r *LxcRunner) hostAccess() HostAccess {
@@ -631,10 +840,22 @@ func (r *LxcRunner) checkHostAccessForStart(name string) error {
 		return err
 	}
 	want := renderHostAccessBlock(name, r.hostAccess().HookBinary, rm, rd)
-	if withoutHookLines(have) != withoutHookLines(want) {
-		return fmt.Errorf("its host-access block is not what was authorized for it (an admin re-applies the mounts with lv ct convert)")
+	if len(rm) > 0 {
+		// The hook re-judges every mount against this host's policy as it is
+		// now; it stages nothing without one.
+		if err := r.writeHookPolicy(); err != nil {
+			return fmt.Errorf("record this host's host-access policy for the start hook: %w", err)
+		}
 	}
 	if have != want {
+		// The record is the authority: whatever the block says — tampered
+		// options, an extra devices.allow, a device renumbered by a reboot, a
+		// longer allowed prefix — it is rendered again from the record, and
+		// the difference said, never kept.
+		if withoutHookLines(have) != withoutHookLines(want) {
+			slog.Warn("container: host-access block differed from its authorized record; rendered again from the record",
+				"container", name, "had", have, "now", want)
+		}
 		cfg := withHostAccessBlock(string(b), want)
 		return writeFileAtomic(cfgPath, []byte(cfg), 0o644)
 	}
@@ -670,8 +891,13 @@ const lxcSystemConfigDir = "/usr/share/lxc/config/"
 // keepConfigLine reports whether an imported config line survives.
 func keepConfigLine(key, val string) bool {
 	if key == "lxc.include" {
+		// Only the fragments litevirt's own create writes: LXC's common and
+		// userns baselines, generic or per distro. Not nesting.conf or any other.
 		c := filepath.Clean(val)
-		return strings.HasPrefix(c, lxcSystemConfigDir) && !strings.Contains(val, "..")
+		base := filepath.Base(c)
+		return filepath.Dir(c)+"/" == lxcSystemConfigDir && !strings.Contains(val, "..") &&
+			(base == "common.conf" || base == "userns.conf" ||
+				strings.HasSuffix(base, ".common.conf") || strings.HasSuffix(base, ".userns.conf"))
 	}
 	if strings.Contains(key, ".script.") || strings.Contains(key, ".hook") {
 		return false // lxc.net.N.script.up runs a host program as root
@@ -747,15 +973,47 @@ func sanitizeConfig(cfg string, keepSecurity bool) (string, []string) {
 // the authorized confinement and id range, and the host access from the
 // authorized mounts and devices (SetHostAccess). Restore, import, revert and
 // clone run it with what the caller was authorized to carry.
-func (r *LxcRunner) RebuildConfig(name, confinement string, idmapBase int64, mounts []Mount, devices []Device) error {
+func (r *LxcRunner) RebuildConfig(name, confinement string, idmapBase int64, nics []NetworkAttach, mounts []Mount, devices []Device) ([]string, error) {
 	dir := filepath.Join(r.lxcpath(), name)
 	cfgPath := filepath.Join(dir, "config")
 	b, err := os.ReadFile(cfgPath)
 	if err != nil {
-		return fmt.Errorf("read container config %s: %w", cfgPath, err)
+		return nil, fmt.Errorf("read container config %s: %w", cfgPath, err)
 	}
 	idmapped := parseSecurity(string(b)).IDMappedMount
-	clean, _ := SanitizeImportedConfig(string(b))
+	clean, dropped := SanitizeImportedConfig(string(b))
+	// The network too comes only from the authorized NICs: every lxc.net
+	// line found is dropped, and the spec's rendered as create renders them
+	// (none: create's default). One the spec would render identically is not
+	// reported as dropped. nil nics — a revert to the container's own
+	// snapshot, which no archive wrote — keeps the network as it is.
+	if nics != nil {
+		netCfg, err := NetworkConfig(nics)
+		if err != nil {
+			return nil, fmt.Errorf("render the authorized network: %w", err)
+		}
+		if netCfg == "" {
+			netCfg = defaultNetConfig()
+		}
+		want := map[string]bool{}
+		for _, l := range strings.Split(netCfg, "\n") {
+			if k, v := configKey(l); k != "" {
+				want[k+"="+v] = true
+			}
+		}
+		var kept []string
+		for _, line := range strings.Split(strings.TrimRight(clean, "\n"), "\n") {
+			k, v := configKey(line)
+			if strings.HasPrefix(k, "lxc.net.") {
+				if !want[k+"="+v] {
+					dropped = append(dropped, k+" = "+v)
+				}
+				continue
+			}
+			kept = append(kept, line)
+		}
+		clean = strings.Join(kept, "\n") + "\n" + strings.TrimLeft(netCfg, "\n")
+	}
 	var idmap *IDMap
 	if idmapBase != 0 {
 		idmap = &IDMap{Base: idmapBase, Size: IDMapSize}
@@ -765,7 +1023,174 @@ func (r *LxcRunner) RebuildConfig(name, confinement string, idmapBase int64, mou
 	}
 	clean = withSecurityBlock(clean, renderSecurityBlock(confinement, idmap, idmap != nil && idmapped))
 	if err := writeFileAtomic(cfgPath, []byte(clean), 0o644); err != nil {
+		return nil, err
+	}
+	return dropped, r.SetHostAccess(name, mounts, devices)
+}
+
+// hookPolicyPath is where the daemon leaves this host's host-access policy
+// for the start hook, rewritten before every start it drives. A reboot from
+// inside the container runs the hook without the daemon, so the hook judges
+// against the last policy the daemon wrote — never against the config alone.
+var hookPolicyPath = "/run/litevirt/lxc-hook-policy.json"
+
+// hookPolicy is this host's host-access policy as the start hook sees it:
+// the allowed prefixes and devices, and every protected tree (resolved).
+type hookPolicy struct {
+	MountPaths  []string `json:"mount_paths"`
+	DevicePaths []string `json:"device_paths"`
+	Deny        []string `json:"deny"`
+}
+
+// writeHookPolicy records this host's policy, as it is now, for the hook.
+func (r *LxcRunner) writeHookPolicy() error {
+	a := r.hostAccess()
+	p := hookPolicy{DevicePaths: append([]string(nil), a.DevicePaths...)}
+	for _, d := range effectiveDeny(a) {
+		if d == "" || !filepath.IsAbs(d) {
+			continue
+		}
+		p.Deny = append(p.Deny, filepath.Clean(d))
+		if rd := resolveIfExists(d); rd != filepath.Clean(d) {
+			p.Deny = append(p.Deny, rd)
+		}
+	}
+	for _, m := range a.MountPaths {
+		if !filepath.IsAbs(m) {
+			continue
+		}
+		if rm, err := filepath.EvalSymlinks(filepath.Clean(m)); err == nil {
+			p.MountPaths = append(p.MountPaths, rm)
+		}
+	}
+	b, err := json.Marshal(p)
+	if err != nil {
 		return err
 	}
-	return r.SetHostAccess(name, mounts, devices)
+	if err := os.MkdirAll(filepath.Dir(hookPolicyPath), 0o700); err != nil {
+		return err
+	}
+	return writeFileAtomic(hookPolicyPath, b, 0o600)
+}
+
+// readHookPolicy reads the policy the daemon left. A missing or unreadable
+// one is an error: the hook then stages nothing.
+func readHookPolicy() (hookPolicy, error) {
+	var p hookPolicy
+	b, err := os.ReadFile(hookPolicyPath)
+	if err != nil {
+		return p, fmt.Errorf("read this host's host-access policy: %w", err)
+	}
+	if err := json.Unmarshal(b, &p); err != nil {
+		return p, fmt.Errorf("parse this host's host-access policy %s: %w", hookPolicyPath, err)
+	}
+	return p, nil
+}
+
+// judgeMount re-judges one staged mount: its prefix must still be allowed
+// (an allowed prefix or beneath one), the source must lie beneath it, and
+// neither may touch a protected tree.
+func (p hookPolicy) judgeMount(prefix, src string) error {
+	prefix, src = filepath.Clean(prefix), filepath.Clean(src)
+	if !within(src, prefix) {
+		return fmt.Errorf("%s is not beneath %s", src, prefix)
+	}
+	allowed := false
+	for _, m := range p.MountPaths {
+		if m != "/" && within(prefix, filepath.Clean(m)) {
+			allowed = true
+		}
+	}
+	if !allowed {
+		return fmt.Errorf("%s is no longer under any containers.bind_mount_paths prefix on this host", prefix)
+	}
+	for _, q := range []string{prefix, src} {
+		if d := deniedTree(q, p.Deny); d != "" {
+			return fmt.Errorf("%s is, lies in or contains the protected tree %s", q, d)
+		}
+	}
+	return nil
+}
+
+// judgeDevice re-judges one device: still listed exactly, not a host-trust
+// node by name or number, the node still the number that was authorized,
+// and (a block device) not the host's.
+func (p hookPolicy) judgeDevice(src string, kind byte, major, minor uint32) error {
+	listed := false
+	for _, d := range p.DevicePaths {
+		if filepath.Clean(d) == src {
+			listed = true
+		}
+	}
+	if !listed {
+		return fmt.Errorf("device %s is no longer listed in containers.device_paths on this host", src)
+	}
+	if deniedDeviceName(src) || deniedDeviceNumber(kind, major, minor) {
+		return fmt.Errorf("device %s is never passed through", src)
+	}
+	fi, err := os.Lstat(src)
+	if err != nil {
+		return fmt.Errorf("device %s: %w", src, err)
+	}
+	k, ma, mi, ok := deviceNumbers(fi)
+	if !ok || fi.Mode()&fs.ModeSymlink != 0 || k != kind || ma != major || mi != minor {
+		return fmt.Errorf("device %s is no longer the node (%c %d:%d) that was authorized", src, kind, major, minor)
+	}
+	if kind == 'b' {
+		if why := blockDeviceInUse(major, minor); why != "" {
+			return fmt.Errorf("block device %s is the host's: %s", src, why)
+		}
+	}
+	return nil
+}
+
+// hookDevice is one device of the managed block, as the hook re-judges it.
+type hookDevice struct {
+	kind         byte
+	major, minor uint32
+	source       string
+}
+
+// hookDevices reads the managed block's device markers and the source each
+// one's mount entry names.
+func hookDevices(cfg string) ([]hookDevice, error) {
+	block, ok := hostAccessBlockOf(cfg)
+	if !ok {
+		return nil, fmt.Errorf("host-access block is not closed")
+	}
+	var out []hookDevice
+	var pending *hookDevice
+	for _, line := range strings.Split(block, "\n") {
+		if rest, ok := strings.CutPrefix(line, deviceMarker+" "); ok {
+			var k string
+			var ma, mi uint32
+			if n, err := fmt.Sscanf(rest, "%s %d:%d", &k, &ma, &mi); n != 3 || err != nil || (k != "c" && k != "b") {
+				return nil, fmt.Errorf("bad device marker %q", line)
+			}
+			pending = &hookDevice{kind: k[0], major: ma, minor: mi}
+			continue
+		}
+		if k, v := configKey(line); k == "lxc.mount.entry" && pending != nil {
+			f := strings.Fields(v)
+			if len(f) < 2 {
+				return nil, fmt.Errorf("bad device entry %q", line)
+			}
+			pending.source = filepath.Clean(f[0])
+			out = append(out, *pending)
+			pending = nil
+		}
+	}
+	return out, nil
+}
+
+// BlockDeviceNumber is the major:minor of the block device node at p, when p
+// is one (symlinks followed): how the daemon compares a VM's disk path with
+// a device asked for by a container.
+func BlockDeviceNumber(p string) (major, minor uint32, ok bool) {
+	fi, err := os.Stat(p)
+	if err != nil {
+		return 0, 0, false
+	}
+	kind, ma, mi, ok := deviceNumbers(fi)
+	return ma, mi, ok && kind == 'b'
 }

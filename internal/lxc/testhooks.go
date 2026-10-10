@@ -85,3 +85,12 @@ func UseSubIDFilesForTest(t Cleanuper, dir string) {
 	subIDsMu.Unlock()
 	t.Cleanup(func() { subUIDPath, subGIDPath, subIDsWanted = oldU, oldG, oldW })
 }
+
+// TrustHookBinaryForTest accepts any start-hook binary until t's cleanup: a
+// test driving the real runtime as an unprivileged user has no root-owned
+// binary to name.
+func TrustHookBinaryForTest(t Cleanuper) {
+	old := validateHookBinary
+	validateHookBinary = func(string) error { return nil }
+	t.Cleanup(func() { validateHookBinary = old })
+}

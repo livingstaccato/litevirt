@@ -114,3 +114,45 @@ func TestStageMount_AsRoot(t *testing.T) {
 		t.Fatal("stageMount followed a swapped-in symlink")
 	}
 }
+
+// m-a. post-stop and a failed pre-start remove each staging entry by
+// itself: a host tree still there (an unmount that failed) is never walked
+// and deleted.
+func TestClearStaging_NeverDeletesThroughAnEntry(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "c1")
+	if err := os.MkdirAll(filepath.Join(dir, "m0", "precious"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "m0", "precious", "data"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "m1"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	clearStaging(dir)
+	if _, err := os.Stat(filepath.Join(dir, "m0", "precious", "data")); err != nil {
+		t.Fatalf("clearing the staging dir deleted what lay beneath an entry: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "m1")); !os.IsNotExist(err) {
+		t.Errorf("an empty staging entry was not removed: %v", err)
+	}
+}
+
+// m-b. The hook re-judges each device against this host's policy now.
+func TestHookPolicy_JudgesDevices(t *testing.T) {
+	p := hookPolicy{DevicePaths: []string{"/dev/null"}}
+	if err := p.judgeDevice("/dev/null", 'c', 1, 3); err != nil {
+		t.Errorf("a listed device was refused: %v", err)
+	}
+	if err := (hookPolicy{}).judgeDevice("/dev/null", 'c', 1, 3); err == nil {
+		t.Error("a device no longer listed passed")
+	}
+	if err := p.judgeDevice("/dev/null", 'c', 1, 5); err == nil {
+		t.Error("a node whose number changed passed")
+	}
+	cfg := renderHostAccessBlock("c1", "/opt/lv/litevirt", nil, []resolvedDevice{{Source: "/dev/null", Target: "/dev/null", Kind: 'c', Major: 1, Minor: 3}})
+	ds, err := hookDevices(cfg)
+	if err != nil || len(ds) != 1 || ds[0] != (hookDevice{kind: 'c', major: 1, minor: 3, source: "/dev/null"}) {
+		t.Errorf("hookDevices = %+v, %v", ds, err)
+	}
+}

@@ -1404,6 +1404,23 @@ func HostRunsContainers(h HostRecord) bool {
 	return h.Labels[LabelLXCCapable] == "true"
 }
 
+// HostDiskPaths maps each absolute disk path of a VM placed on host to the
+// VM's name — what a container must never be handed as a device.
+func HostDiskPaths(ctx context.Context, c *Client, host string) (map[string]string, error) {
+	rows, err := c.Query(ctx,
+		`SELECT vm_name, path FROM vm_disks WHERE host_name = ? AND deleted_at IS NULL`, host)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]string{}
+	for _, r := range rows {
+		if p := r.String("path"); strings.HasPrefix(p, "/") {
+			out[p] = r.String("vm_name")
+		}
+	}
+	return out, nil
+}
+
 // HostPathInUse reports what of litevirt's on host already uses path — a VM
 // disk, or a storage pool's source or target — so it is never also handed to
 // a container as a host mount or device. "" when nothing does.

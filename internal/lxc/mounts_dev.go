@@ -24,3 +24,9 @@ func deviceNumbers(fi fs.FileInfo) (kind byte, major, minor uint32, ok bool) {
 	minor = uint32((rdev & 0xff) | ((rdev >> 12) & 0xffffff00))
 	return kind, major, minor, true
 }
+
+// ownedByRoot reports whether a file is owned by uid 0.
+func ownedByRoot(fi fs.FileInfo) bool {
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	return ok && st.Uid == 0
+}

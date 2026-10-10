@@ -10,9 +10,14 @@ import (
 // fakeKernelSupport makes the kernel probe pass for a test.
 func fakeKernelSupport(t *testing.T) {
 	t.Helper()
-	old := hostAccessSupported
+	old, oldBin, oldExcl, oldPol := hostAccessSupported, validateHookBinary, exclusiveOpenBusy, hookPolicyPath
 	hostAccessSupported = func() error { return nil }
-	t.Cleanup(func() { hostAccessSupported = old })
+	validateHookBinary = func(string) error { return nil }
+	exclusiveOpenBusy = func(string) bool { return false }
+	hookPolicyPath = filepath.Join(t.TempDir(), "policy.json")
+	t.Cleanup(func() {
+		hostAccessSupported, validateHookBinary, exclusiveOpenBusy, hookPolicyPath = old, oldBin, oldExcl, oldPol
+	})
 }
 
 // hostTree builds an allowed tree and a secret outside it:
@@ -264,8 +269,13 @@ func TestCheckHostAccessForStart(t *testing.T) {
 		{"mount source changed", stagingRoot + "/c1/m0", "/"},
 	} {
 		tamper(tc.old, tc.new)
-		if err := r.checkHostAccessForStart("c1"); err == nil {
-			t.Errorf("%s: the start check passed a tampered block", tc.name)
+		// The record is the authority: a tampered block is rendered again
+		// from it, not kept and not refused.
+		if err := r.checkHostAccessForStart("c1"); err != nil {
+			t.Errorf("%s: the start check refused instead of re-rendering: %v", tc.name, err)
+		}
+		if b, _ := os.ReadFile(filepath.Join(dir, "config")); string(b) != string(good) {
+			t.Errorf("%s: the tampered block was kept:\n%s", tc.name, b)
 		}
 	}
 	// A changed hook binary (an upgrade) is refreshed, not refused.
@@ -279,9 +289,13 @@ func TestCheckHostAccessForStart(t *testing.T) {
 	// A block with no authorized record behind it.
 	_ = os.WriteFile(filepath.Join(dir, "config"), good, 0o644)
 	_ = os.Rename(filepath.Join(dir, hostAccessFile), filepath.Join(dir, "saved"))
-	if err := r.checkHostAccessForStart("c1"); err == nil {
-		t.Error("a block nobody authorized passed")
+	if err := r.checkHostAccessForStart("c1"); err != nil {
+		t.Errorf("a block nobody authorized refused instead of being removed: %v", err)
 	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "config")); strings.Contains(string(b), "lxc.mount.entry") || strings.Contains(string(b), "devices.allow") {
+		t.Errorf("a block nobody authorized was kept:\n%s", b)
+	}
+	_ = os.WriteFile(filepath.Join(dir, "config"), good, 0o644)
 	// A record that cannot be read refuses; only a missing one reads as none —
 	// even for a config with no block, which "none" would otherwise pass.
 	_ = os.Mkdir(filepath.Join(dir, hostAccessFile), 0o700)
@@ -389,7 +403,7 @@ func TestRebuildConfig(t *testing.T) {
 	dir := containerDir(t, r, "c1", "lxc.uts.name = c1\nlxc.idmap = u 0 0 65536\nlxc.apparmor.profile = unconfined\n"+
 		mountBlockBegin+"\n# litevirt:mount rw dir / .\nlxc.mount.entry = /run/litevirt/ct/c1/m0 host none bind 0 0\n"+mountBlockEnd+"\n")
 	_ = os.WriteFile(filepath.Join(dir, hostAccessFile), []byte(`{"mounts":[{"host_path":"/","container_path":"/h","read_write":true}]}`), 0o600)
-	if err := r.RebuildConfig("c1", ConfinementDefault, 1_000_065_536, nil, nil); err != nil {
+	if _, err := r.RebuildConfig("c1", ConfinementDefault, 1_000_065_536, nil, nil, nil); err != nil {
 		t.Fatalf("RebuildConfig: %v", err)
 	}
 	b, _ := os.ReadFile(filepath.Join(dir, "config"))
@@ -404,7 +418,7 @@ func TestRebuildConfig(t *testing.T) {
 		t.Fatalf("the forged record survived the rebuild: %v", err)
 	}
 	// An admin-authorized mount is carried.
-	if err := r.RebuildConfig("c1", ConfinementDefault, 1_000_065_536, []Mount{{HostPath: filepath.Join(root, "allowed/data"), ContainerPath: "/srv"}}, nil); err != nil {
+	if _, err := r.RebuildConfig("c1", ConfinementDefault, 1_000_065_536, nil, []Mount{{HostPath: filepath.Join(root, "allowed/data"), ContainerPath: "/srv"}}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if b, _ := os.ReadFile(filepath.Join(dir, "config")); !strings.Contains(string(b), "srv none bind,ro,nosuid,nodev,create=dir") {

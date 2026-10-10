@@ -62,6 +62,15 @@ type VMConfig struct {
 
 	// PCI passthrough devices
 	Hostdevs []HostdevConfig
+	// USB passthrough devices, already resolved on this host (USBHostdevConfig).
+	USBHostdevs []USBHostdevConfig
+
+	// Memory hot-add (virtio-mem). HotplugMaxMiB > 0 boots the guest with a
+	// NUMA cell of HotplugBaseMiB plus a virtio-mem device covering
+	// HotplugMaxMiB-HotplugBaseMiB, of which MemoryMiB-HotplugBaseMiB is
+	// plugged. Both 0 = no hot-add. Exclusive with a balloon ceiling.
+	HotplugBaseMiB int
+	HotplugMaxMiB  int
 
 	// Secure Boot + vTPM (G1). SecureBoot uses the secboot/MS OVMF pair + SMM
 	// (q35-only); TPM adds an emulated TPM 2.0 device. LoaderPath/NvramTemplate
@@ -310,6 +319,20 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 		dom.CurrentMemory = &memory{Value: cfg.MemoryMiB * 1024, Unit: "KiB"}
 	}
 
+	// Memory hot-add: <maxMemory>, one NUMA cell holding the boot memory, and
+	// (below, in <devices>) the virtio-mem device covering the rest. <memory>
+	// is the cell plus the whole region, which is what libvirt computes anyway.
+	var hotplugDev *memoryDevice
+	if cfg.HotplugMaxMiB > 0 || cfg.HotplugBaseMiB > 0 {
+		if err := validateMemoryHotplug(cfg); err != nil {
+			return "", err
+		}
+		dom.Memory = memory{Value: cfg.HotplugMaxMiB * 1024, Unit: "KiB"}
+		dom.MaxMemory = &maxMemory{Slots: memoryHotplugSlots, Unit: "KiB", Value: cfg.HotplugMaxMiB * 1024}
+		dom.CurrentMemory = nil
+		hotplugDev = virtioMemDevice(cfg.HotplugMaxMiB-cfg.HotplugBaseMiB, cfg.MemoryMiB-cfg.HotplugBaseMiB)
+	}
+
 	// CPU mode: host-passthrough, host-model, or custom. A custom mode carries a
 	// <model> child; libvirt rejects <cpu mode='custom'/> without one, so the
 	// model is not optional (ValidateCPUMode enforces the pair upstream).
@@ -320,6 +343,23 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 			cd.Model = &cpuModel{Fallback: "allow", Name: cfg.CPUModel}
 		}
 		dom.CPUDef = cd
+	}
+	if hotplugDev != nil {
+		// virtio-mem plugs into a NUMA node, so the guest needs one. The cell
+		// spans every vCPU the domain can ever have (the hotplug ceiling too):
+		// libvirt refuses a vCPU outside every cell.
+		if dom.CPUDef == nil {
+			dom.CPUDef = &cpuDef{}
+		}
+		vcpus := cfg.CPU
+		if cfg.MaxCPU > vcpus {
+			vcpus = cfg.MaxCPU
+		}
+		cpus := "0"
+		if vcpus > 1 {
+			cpus = fmt.Sprintf("0-%d", vcpus-1)
+		}
+		dom.CPUDef.Numa = &cpuNuma{Cells: []numaCell{{ID: 0, CPUs: cpus, Memory: cfg.HotplugBaseMiB * 1024, Unit: "KiB"}}}
 	}
 
 	// Hugepages: back guest memory with host hugepages.
@@ -596,7 +636,7 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 			Type:    "pci",
 			Managed: "yes",
 			Source: hostdevSource{
-				Address: hostdevAddress{
+				Address: &hostdevAddress{
 					Domain:   parsed.Domain,
 					Bus:      parsed.Bus,
 					Slot:     parsed.Slot,
@@ -608,6 +648,18 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 			hostdev.Alias = &hostdevAlias{Name: hd.Alias}
 		}
 		dev.Hostdevs = append(dev.Hostdevs, hostdev)
+	}
+
+	// USB passthrough hostdevs.
+	for _, u := range cfg.USBHostdevs {
+		hd, err := usbHostdev(u)
+		if err != nil {
+			return "", err
+		}
+		dev.Hostdevs = append(dev.Hostdevs, hd)
+	}
+	if hotplugDev != nil {
+		dev.MemoryDevices = append(dev.MemoryDevices, *hotplugDev)
 	}
 
 	// Emulated TPM 2.0 (G1). State is pinned at TPMStateDir (when set) so it
@@ -743,6 +795,7 @@ type domain struct {
 	Type          string         `xml:"type,attr"`
 	Name          string         `xml:"name"`
 	UUID          string         `xml:"uuid,omitempty"` // stable VM identity; makes the libvirt-default swtpm path deterministic (G1)
+	MaxMemory     *maxMemory     `xml:"maxMemory,omitempty"`
 	Memory        memory         `xml:"memory"`
 	CurrentMemory *memory        `xml:"currentMemory,omitempty"`
 	VCPU          vcpu           `xml:"vcpu"`
@@ -765,9 +818,12 @@ type cpuDef struct {
 	// its own, outside a domain struct (see PatchInactiveCPUMode). Identical to
 	// the name the domain field tag already gives it.
 	XMLName xml.Name  `xml:"cpu"`
-	Mode    string    `xml:"mode,attr"`
+	Mode    string    `xml:"mode,attr,omitempty"`
 	Match   string    `xml:"match,attr,omitempty"`
 	Model   *cpuModel `xml:"model,omitempty"`
+	// Numa carries the guest NUMA cell memory hot-add needs. Nil otherwise,
+	// so every other <cpu> renders exactly as before.
+	Numa *cpuNuma `xml:"numa,omitempty"`
 }
 
 type cpuModel struct {
@@ -886,13 +942,15 @@ type devices struct {
 	Disks       []diskDevice       `xml:"disk"`
 	Interfaces  []interfaceDevice  `xml:"interface"`
 	Hostdevs    []hostdevDevice    `xml:"hostdev"`
-	Serials     []serialDevice     `xml:"serial"`
-	Consoles    []consoleDevice    `xml:"console"`
-	Channels    []channelDevice    `xml:"channel"`
-	Graphics    []graphicsDevice   `xml:"graphics"`
-	Videos      []videoDevice      `xml:"video"`
-	MemBalloon  *memballoon        `xml:"memballoon,omitempty"`
-	TPM         *tpmDevice         `xml:"tpm,omitempty"`
+	// MemoryDevices holds the virtio-mem device of a hot-add domain.
+	MemoryDevices []memoryDevice   `xml:"memory"`
+	Serials       []serialDevice   `xml:"serial"`
+	Consoles      []consoleDevice  `xml:"console"`
+	Channels      []channelDevice  `xml:"channel"`
+	Graphics      []graphicsDevice `xml:"graphics"`
+	Videos        []videoDevice    `xml:"video"`
+	MemBalloon    *memballoon      `xml:"memballoon,omitempty"`
+	TPM           *tpmDevice       `xml:"tpm,omitempty"`
 }
 
 // tpmDevice is an emulated TPM 2.0 (G1). State lives at Backend.Source.Path
@@ -1061,14 +1119,27 @@ type hostdevAlias struct {
 }
 
 type hostdevSource struct {
-	Address hostdevAddress `xml:"address"`
+	// Vendor/Product select a USB device by id; nil for PCI and for a USB
+	// device selected by bus/device address.
+	Vendor  *hostdevUSBID   `xml:"vendor,omitempty"`
+	Product *hostdevUSBID   `xml:"product,omitempty"`
+	Address *hostdevAddress `xml:"address,omitempty"`
 }
 
+// hostdevUSBID is a USB <vendor id=…/> or <product id=…/>.
+type hostdevUSBID struct {
+	ID string `xml:"id,attr"`
+}
+
+// hostdevAddress is a PCI source address (domain/bus/slot/function) or a USB
+// one (bus/device). Every attribute is omitempty so each kind renders only
+// its own; a PCI address always sets all four of its attributes.
 type hostdevAddress struct {
-	Domain   string `xml:"domain,attr"`
-	Bus      string `xml:"bus,attr"`
-	Slot     string `xml:"slot,attr"`
-	Function string `xml:"function,attr"`
+	Domain   string `xml:"domain,attr,omitempty"`
+	Bus      string `xml:"bus,attr,omitempty"`
+	Slot     string `xml:"slot,attr,omitempty"`
+	Function string `xml:"function,attr,omitempty"`
+	Device   string `xml:"device,attr,omitempty"`
 }
 
 // ParsedPCIAddr holds the four components of a PCI address.

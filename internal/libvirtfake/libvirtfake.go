@@ -215,8 +215,10 @@ type Fake struct {
 	FailHasManagedSaveImage func(name string) error
 	// FailSetVCPUs / FailSetMemory inject a resize primitive failure so scenarios
 	// can exercise partial-apply recovery (e.g. cpu ok, mem fails).
-	FailSetVCPUs        func(name string, count int) error
-	FailSetMemory       func(name string, memMiB int) error
+	FailSetVCPUs  func(name string, count int) error
+	FailSetMemory func(name string, memMiB int) error
+	// FailSetVirtioMem injects a memory hot-add primitive failure.
+	FailSetVirtioMem    func(name string, requestedMiB int) error
 	FailMigrateToTarget func(name, dconnuri string) error
 	FailBlockPull       func(domain, disk string) error
 	FailPoolDestroy     func(name string) error
@@ -1622,6 +1624,47 @@ func (f *Fake) SetMemory(domainName string, memMiB int) error {
 	f.record("set-memory", domainName, fmt.Sprintf("%d", memMiB))
 	return nil
 }
+
+// SetVirtioMemRequested models plugging memory into a hot-add domain: the
+// virtio-mem element's <requested> is rewritten in the persistent definition
+// and, when one is tracked, the live view — so DumpXML shows what libvirt
+// would. A domain with no virtio-mem device errors, as libvirt does.
+func (f *Fake) SetVirtioMemRequested(domainName string, requestedMiB int) error {
+	if f.FailSetVirtioMem != nil {
+		if err := f.FailSetVirtioMem(domainName, requestedMiB); err != nil {
+			return err
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cur, ok := f.xml[domainName]
+	if !ok {
+		return fmt.Errorf("libvirtfake: domain %q not defined", domainName)
+	}
+	rewrite := func(doc string) (string, error) {
+		elem, err := libvirt.VirtioMemUpdateXML(doc, requestedMiB)
+		if err != nil {
+			return "", err
+		}
+		return virtioMemElemRe.ReplaceAllLiteralString(doc, elem), nil
+	}
+	next, err := rewrite(cur)
+	if err != nil {
+		return err
+	}
+	f.xml[domainName] = next
+	if live, ok := f.activeXML[domainName]; ok {
+		if nl, lerr := rewrite(live); lerr == nil {
+			f.activeXML[domainName] = nl
+		}
+	}
+	f.record("set-virtio-mem", domainName, fmt.Sprintf("%d", requestedMiB))
+	return nil
+}
+
+// virtioMemElemRe matches the virtio-mem element SetVirtioMemRequested
+// rewrites (the same shape libvirt.VirtioMemUpdateXML reads).
+var virtioMemElemRe = regexp.MustCompile(`(?s)<memory\b[^>]*\bmodel=['"]virtio-mem['"][^>]*>.*?</memory>`)
 
 func (f *Fake) SetVCPUs(name string, count int) error {
 	if f.FailSetVCPUs != nil {

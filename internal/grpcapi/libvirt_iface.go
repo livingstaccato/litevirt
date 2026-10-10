@@ -124,6 +124,10 @@ type LibvirtBackend interface {
 
 	// Memory ballooning (#4): set the live balloon target (MiB) on a running VM.
 	SetMemory(domainName string, memMiB int) error
+	// SetVirtioMemRequested sets how much of a hot-add domain's virtio-mem
+	// region is plugged (MiB above the boot cell), persistent config first,
+	// then live when running.
+	SetVirtioMemRequested(domainName string, requestedMiB int) error
 
 	// SetVCPUs hot-adds (or reduces, guest permitting) the live vCPU count on a
 	// running domain, persisting to config too — for live CPU resize within the

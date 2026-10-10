@@ -95,7 +95,7 @@ func (c *Client) AttachHostdev(domainName, pciAddress string) error {
 		Type:    "pci",
 		Managed: "yes",
 		Source: hostdevSource{
-			Address: hostdevAddress{
+			Address: &hostdevAddress{
 				Domain:   parsed.Domain,
 				Bus:      parsed.Bus,
 				Slot:     parsed.Slot,
@@ -117,7 +117,7 @@ func (c *Client) AttachHostdevWithAlias(domainName, pciAddress, alias string) er
 		Type:    "pci",
 		Managed: "yes",
 		Source: hostdevSource{
-			Address: hostdevAddress{
+			Address: &hostdevAddress{
 				Domain:   parsed.Domain,
 				Bus:      parsed.Bus,
 				Slot:     parsed.Slot,
@@ -139,7 +139,7 @@ func (c *Client) DetachHostdev(domainName, pciAddress string) error {
 		Type:    "pci",
 		Managed: "yes",
 		Source: hostdevSource{
-			Address: hostdevAddress{
+			Address: &hostdevAddress{
 				Domain:   parsed.Domain,
 				Bus:      parsed.Bus,
 				Slot:     parsed.Slot,
@@ -162,7 +162,7 @@ func (c *Client) DetachHostdevConfig(domainName, pciAddress string) error {
 		Type:    "pci",
 		Managed: "yes",
 		Source: hostdevSource{
-			Address: hostdevAddress{
+			Address: &hostdevAddress{
 				Domain:   parsed.Domain,
 				Bus:      parsed.Bus,
 				Slot:     parsed.Slot,

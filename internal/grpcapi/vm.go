@@ -1681,6 +1681,12 @@ func (s *Server) PrepareHardwareForStart(ctx context.Context, vm *corrosion.VMRe
 	if err := s.verifyImageBasesForStart(ctx, vm); err != nil {
 		return releasePreflight, err
 	}
+	// USB passthrough is resolved again on the host that starts it: a
+	// bus-port's bus/device numbers change when the device is re-plugged, and
+	// the old numbers could by then name another device.
+	if err := s.refreshUSBHostdevsForStart(ctx, vm); err != nil {
+		return releasePreflight, err
+	}
 
 	// Adoption gate (fail-closed): a blocked VM must not (re)start under the active
 	// hardware_v2 regime — this covers ALL start callers (StartVM, RestartVM, restore/

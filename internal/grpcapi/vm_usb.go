@@ -111,7 +111,7 @@ func (s *Server) validateUSBMappings(ctx context.Context, devs []*pb.USBDeviceSp
 		}
 		if kind := m.MappingKind(); kind != corrosion.MappingKindUSB {
 			if kind == corrosion.MappingKindNone {
-				return status.Errorf(codes.FailedPrecondition, "resource mapping %q has no devices yet (lv mapping add-device --usb …)", d.Mapping)
+				return status.Errorf(codes.FailedPrecondition, "resource mapping %q has no devices yet (lv mapping add-device %s usb:<vendor>:<product> --host <host>)", d.Mapping, d.Mapping)
 			}
 			return status.Errorf(codes.InvalidArgument, "resource mapping %q holds %s devices, not USB devices", d.Mapping, kind)
 		}
@@ -388,4 +388,34 @@ func (s *Server) preflightUSBHotplugUpdate(ctx context.Context, req *pb.UpdateVM
 		probe.MemoryMib = req.MemoryMib
 	}
 	return applyUSBHotplugUpdate(req, probe)
+}
+
+// refreshUSBHostdevsForStart re-resolves a VM's USB devices on this host and
+// rewrites them into its persistent definition before it starts. A device this
+// host cannot resolve refuses the start: the guest never boots without a
+// device it asks for, nor with whatever now holds a stale bus/device number.
+func (s *Server) refreshUSBHostdevsForStart(ctx context.Context, vm *corrosion.VMRecord) error {
+	spec := parseSpecOrNil(vm.Spec)
+	if len(spec.GetUsbDevices()) == 0 || s.virt == nil {
+		return nil
+	}
+	usb, err := s.resolveUSBHostdevs(ctx, spec)
+	if err != nil {
+		return err
+	}
+	cur, err := s.virt.DumpXMLInactive(vm.Name)
+	if err != nil {
+		return status.Errorf(codes.Internal, "read the definition of %q to refresh its USB devices: %v", vm.Name, err)
+	}
+	next, err := lv.ReplaceUSBHostdevs(cur, usb)
+	if err != nil {
+		return status.Errorf(codes.Internal, "refresh USB devices of %q: %v", vm.Name, err)
+	}
+	if next == cur {
+		return nil
+	}
+	if err := s.virt.DefineDomain(next); err != nil {
+		return status.Errorf(codes.Internal, "redefine %q with its USB devices: %v", vm.Name, err)
+	}
+	return nil
 }

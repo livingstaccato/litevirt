@@ -103,7 +103,7 @@ func newMappingAddDeviceCmd() *cobra.Command {
 (0000:41:00.0) or a USB device: usb:<vendor>:<product> (usb:046d:c52b) or
 usb:<bus>-<port>[.<port>...] (usb:1-2, the device plugged into that port).
 A mapping holds PCI devices or USB devices, never both. A VM names a USB
-mapping with lv create --usb-mapping or lv update --usb-mapping.`,
+mapping with lv run --usb-mapping or lv update --usb-mapping.`,
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {

@@ -462,3 +462,38 @@ func TestAddMappingDevice_USBKind(t *testing.T) {
 		t.Fatalf("malformed USB address: %v; want InvalidArgument", err)
 	}
 }
+
+// Every start re-resolves a bus-port: a re-plugged device has a new device
+// number, and the old one must not stay in the definition.
+func TestPrepareHardwareForStart_RefreshesUSBBusPort(t *testing.T) {
+	root := t.TempDir()
+	dev := filepath.Join(root, "1-2")
+	if err := os.MkdirAll(dev, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(dev, "busnum"), []byte("1\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(dev, "devnum"), []byte("5\n"), 0o644)
+	defer lv.SetUSBSysfsRootForTest(root)()
+
+	s, fake := provableCreateServer(t)
+	enableUsbMountsMemory(s)
+	ctx := adminCtx()
+	if _, err := s.CreateVM(ctx, usbCreateRequest("u1", &pb.USBDeviceSpec{BusPort: "1-2"})); err != nil {
+		t.Fatalf("CreateVM: %v", err)
+	}
+	_ = os.WriteFile(filepath.Join(dev, "devnum"), []byte("9\n"), 0o644) // re-plugged
+	release, err := s.PrepareHardwareForStart(ctx, mustGetVM(t, s, "u1"))
+	if err != nil {
+		t.Fatalf("PrepareHardwareForStart: %v", err)
+	}
+	release()
+	x, _ := fake.DumpXMLInactive("u1")
+	if !strings.Contains(x, `device="9"`) || strings.Contains(x, `device="5"`) {
+		t.Fatalf("the start did not re-resolve the port:\n%s", x)
+	}
+	// Unplugged: the start is refused.
+	_ = os.RemoveAll(dev)
+	if _, err := s.PrepareHardwareForStart(ctx, mustGetVM(t, s, "u1")); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("start with the device gone = %v; want FailedPrecondition", err)
+	}
+}

@@ -190,17 +190,24 @@ func checkDnf(ctx context.Context, run Runner, bin string, refresh bool) Status 
 	names := ParseDnfCheckUpdate(string(out))
 	secOut, serr := run(ctx, bin, "-q", "--cacheonly", "updateinfo", "list", "--security")
 	var sec map[string]bool
+	secUnknown := false
 	if serr == nil {
-		sec = ParseDnfSecurity(string(secOut))
+		var readable bool
+		if sec, readable = ParseDnfSecurityChecked(string(secOut)); !readable {
+			secUnknown = true // a partial count would read as "only these"
+			if st.Err == "" {
+				st.Err = "security advisories listed in a form this build cannot read"
+			}
+		}
 	} else if st.Err == "" {
 		// Security metadata is optional (yum without the plugin): the total
 		// stands, the security count is unknown rather than zero.
 		st.Err = "security advisories unavailable: " + serr.Error()
 	}
 	for _, n := range names {
-		st.Packages = append(st.Packages, Pkg{Name: n, Security: sec[n]})
+		st.Packages = append(st.Packages, Pkg{Name: n, Security: sec[n] && !secUnknown})
 		st.Pending++
-		if sec[n] {
+		if sec[n] && !secUnknown {
 			st.Security++
 		}
 	}
@@ -243,20 +250,53 @@ func ParseDnfCheckUpdate(out string) []string {
 }
 
 // ParseDnfSecurity returns the set of package names named by
-// `dnf updateinfo list --security` ("ADVISORY Severity/Sec. name-ver-rel.arch").
+// `dnf updateinfo list --security` (ParseDnfSecurityChecked).
 func ParseDnfSecurity(out string) map[string]bool {
-	set := map[string]bool{}
+	set, _ := ParseDnfSecurityChecked(out)
+	return set
+}
+
+// ParseDnfSecurityChecked parses `dnf updateinfo list --security` in both
+// layouts:
+//
+//	dnf4: ADVISORY  Severity/Sec.  name-ver-rel.arch
+//	dnf5: ADVISORY  security  Severity  name-[epoch:]ver-rel.arch  issued-date issued-time
+//
+// ok is false when the output lists advisories this parser could not read: the
+// security count is then unknown, never zero.
+func ParseDnfSecurityChecked(out string) (set map[string]bool, ok bool) {
+	set = map[string]bool{}
+	unread := 0
 	sc := bufio.NewScanner(strings.NewReader(out))
 	for sc.Scan() {
 		f := strings.Fields(sc.Text())
-		if len(f) < 3 || !strings.Contains(f[1], "Sec") {
+		if len(f) < 3 || !advisoryID(f[0]) {
+			continue // headers, "Last metadata expiration check", blank lines
+		}
+		var nevra string
+		switch {
+		case strings.EqualFold(f[1], "security") && len(f) >= 4: // dnf5
+			nevra = f[3]
+		case strings.Contains(f[1], "Sec"): // dnf4
+			nevra = f[len(f)-1]
+		}
+		if n := nevraName(nevra); n != "" {
+			set[n] = true
 			continue
 		}
-		if n := nevraName(f[len(f)-1]); n != "" {
-			set[n] = true
-		}
+		unread++
 	}
-	return set
+	return set, unread == 0
+}
+
+// advisoryID reports whether s looks like an advisory id: letters, then a
+// '-', then digits (FEDORA-2024-1a2b3c, RHSA-2024:1234, ALSA-2024:0001).
+func advisoryID(s string) bool {
+	pre, rest, ok := strings.Cut(s, "-")
+	if !ok || pre == "" || rest == "" || strings.ToUpper(pre) != pre {
+		return false
+	}
+	return rest[0] >= '0' && rest[0] <= '9'
 }
 
 // nevraName strips ".arch", "-release" and "-version" off name-version-release.arch.

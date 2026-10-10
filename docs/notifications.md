@@ -39,6 +39,7 @@ A notification has a `kind` (verb.noun), `severity` (`info` | `warn` | `error`),
 | `ha.owner.epoch_suppressed` | error | under a latched `owner_epoch_v1`, a DB row is telling the owner-epoch check not to examine a VM while the runtime says that VM is running — a tombstoned row with a live disk-holder, a migration state parked well past its cutover window, or a `host_name` naming a host that is not in the cluster and so can never be probed |
 | `ha.lww.unresolved` | warn | a node is tracking unresolved equal-timestamp LWW ties |
 | `ha.dualrun.coverage` | warn | a workload-capable host could not be fully probed this pass — unreachable (segmented/down) OR returned a partial runtime (a local libvirt/container/ip probe errored, so its workload absence is unreliable); split-brain can't be ruled out there |
+| `storage.lun_shared` | warn / error / info | more than one disk is one iSCSI LUN (an older build allowed it): warn when first observed, error once confirmed on a second scan, info when resolved. The detail names the VMs and disks — see `shared_lun` in [diagnostics.md](diagnostics.md#shared-iscsi-lun-shared_lun) |
 | `quota.exceeded` | warn | a CreateVM is rejected by a project quota |
 | `test.notification` | info | `lv notify test` / the UI "Test" button |
 

@@ -1643,6 +1643,26 @@ domain may still hold state that can be resumed.
    run `virsh undefine --nvram <vm>` on that host. Use `--keep-nvram` instead
    if you want to keep the firmware variables.
 
+### Shared iSCSI LUN (`shared_lun`)
+
+The `shared_lun` evaluator raises `shared_lun` (subject kind `cluster`, subject
+the LUN) when more than one live disk is one iSCSI LUN — two VMs, or two disks
+of one VM, on iscsi pools that name the same portal, target and LUN. An iscsi
+pool is one LUN and holds one disk ([storage.md](storage.md#iscsi-one-lun-one-disk)),
+and a create refuses a second disk on one; a cluster where an older build let
+it happen is what this reports. The evidence names every VM, disk and host on
+the LUN; the involved hosts are the hosts those VMs are on.
+
+| Raised when | Clears when |
+|---|---|
+| A scan of the replica's `vm_disks` finds two or more live disks of live VMs whose recorded paths are one LUN (the portal compared with its port, the target case-insensitively). Observed (warning) on the first such scan, confirmed (critical) on the second. | Two consecutive scans find at most one disk on the LUN, under a valid decision gate. |
+
+It runs on the dual-run detector's lease holder, once per detector pass. It
+**changes nothing**: no disk is touched, and it is not an ownership code, so
+admission — starting either VM included — does not read it. Refusing the start
+would not undo what both guests already wrote. Decide which VM keeps the LUN,
+stop the others, and move their disks to LUNs of their own (a pool per LUN).
+
 ### Orphaned runtimes (`vm_orphan_runtime`, `ct_orphan_runtime`)
 
 Each host reports the workloads **litevirt created** that are still present on

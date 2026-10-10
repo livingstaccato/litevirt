@@ -11,7 +11,7 @@ or the host config; every VM disk references a pool by name.
 | `local` (default) | unused | dir override | qcow2 files under `<dataDir>/disks` |
 | `dir` | unused | required | qcow2 files in an arbitrary directory (e.g. an externally-mounted SAN LUN) |
 | `nfs` | `host:/export` | mountpoint override | mounted lazily by the daemon; survives restarts |
-| `iscsi` | IQN | unused | LUNs are pre-provisioned on the SAN; we discover and login |
+| `iscsi` | IQN | unused | **one pre-provisioned LUN per pool, and so one disk** — see [iSCSI: one LUN, one disk](#iscsi-one-lun-one-disk) |
 | `ceph` | pool name | unused | `rbd` CLI shell-out; CGO-free build supported |
 | `zfs` | parent dataset (`tank/litevirt`) | unused | zvol per disk; `volblocksize` tunable via options |
 | `btrfs` | absolute path on btrfs | unused | one subvolume per disk; qcow2 inside |
@@ -1075,10 +1075,90 @@ sender pipes straight into the remote CLI. Same-host uses a local pipe.
 Crash-consistent by default; quiesce-via-guest-agent for application
 consistency is a planned follow-up.
 
+## iSCSI: one LUN, one disk
+
+An `iscsi` pool is **one LUN** of one target: the LUN the operator created on
+the SAN, named by the pool's `lun` option (default `0`). litevirt does not
+carve it up. Every disk created on the pool *is* that LUN — the driver
+allocates nothing and hands each disk the same
+`/dev/disk/by-path/ip-<portal>-iscsi-<iqn>-lun-<n>` device. Two disks on one
+LUN are one block device written by two guests (or twice by one), and corrupt
+each other silently.
+
+So a create refuses a LUN another disk already is:
+
+- two disks of one VM on the same LUN — through one pool or two pools that
+  name the same portal, target and LUN — are refused before anything is
+  created;
+- a disk on a LUN that a live VM on **any** host already uses is refused,
+  naming that VM. The host creating the VM asks every other host (peer-only,
+  over mTLS) what it holds, committed or still being created, so two creates
+  on two hosts at the same moment cannot both take the LUN; at worst both are
+  refused and one retry goes through. A host that is offline, fenced or in
+  maintenance is not asked; any other host that cannot be asked refuses the
+  create (`Unavailable`) until it answers or is marked down. A host on an older
+  build is not asked; its committed disks arrive by replication;
+- a deleted VM's LUN is free again, and a VM that is rebuilt or re-created
+  under its own name takes back its own LUN.
+
+A cluster that already has two VMs on one LUN — an older build allowed it —
+is left as it is: litevirt does not touch those disks or refuse to start those
+VMs. It raises the `shared_lun` health condition naming them (see
+[diagnostics.md](diagnostics.md#shared-iscsi-lun-shared_lun)) and a
+`storage.lun_shared` notification; stop all but one and move the others'
+disks to LUNs of their own.
+
+**A root disk from an image is written onto the LUN.** The driver allocates
+nothing, so a root disk on an iscsi pool built on an image (`image:` in
+compose, `lv run --image … --storage <pool>`) has the image's guest contents
+written onto the LUN with `qemu-img convert` before the VM is first defined —
+never a blank LUN booting to the firmware shell. Before writing:
+
+- the LUN is not any VM's disk (the refusal above, held for the whole write);
+- the LUN is at least the image's virtual size, or the create is refused with
+  both sizes. The disk's requested `size` is not applied: the disk is the LUN,
+  at the size the SAN gave it;
+- the LUN is blank — zeros in its first and last MiB, where partition tables
+  (MBR, GPT and its backup), LVM labels and filesystem superblocks live — or
+  the disk sets `overwrite` (compose `overwrite: true`, `lv run --overwrite`).
+  A LUN holding data is refused otherwise, and an overwrite is audited.
+
+A data disk on an iscsi pool, and a root disk with no image, is the LUN as it
+is: nothing is written. A rebuilt or re-created VM whose previous incarnation's
+disk row still names the LUN keeps the LUN as it is.
+
+To give each disk its own LUN, create the LUNs on the SAN and one pool per
+LUN, then name the pool on the disk:
+
+```bash
+lv pool create san-vm1-root --driver iscsi --source iqn.2003-01.org.example:store \
+    --option portal=10.0.0.5:3260 --option lun=1
+lv pool create san-vm1-data --driver iscsi --source iqn.2003-01.org.example:store \
+    --option portal=10.0.0.5:3260 --option lun=2
+```
+
+```yaml
+vms:
+  vm1:
+    disks:
+      root: { size: "40G", storage: san-vm1-root }
+      data: { size: "200G", storage: san-vm1-data }
+```
+
+Give the portal with its port (`host:3260`): the device path is spelled from
+the option, and udev names the device with the port.
+
+**Not implemented: LVM on an iSCSI LUN.** Proxmox's usual shared-SAN layout is
+one big LUN with a shared LVM volume group on it, carved into one logical
+volume per disk. litevirt has no such driver — `lvm-thin` is a host-local
+volume group, not a shared one — so a LUN holds exactly one disk (see "Disks
+per pool" in the backend matrix below).
+
 ## Backend matrix
 
 |  | local | nfs | dir | btrfs | zfs | ceph | iscsi | lvm-thin |
 |---|---|---|---|---|---|---|---|---|
+| Disks per pool | many | many | many | many | many | many | **one** (the LUN; no LVM-on-LUN) | many |
 | Snapshots | qcow2 | qcow2 | qcow2 | atomic (subvol) | atomic (zvol) | atomic (rbd snap) | external | atomic (LV snap) |
 | Move (offline) | ✓ | ✓ | ✓ | ✓ | — | — | — | — |
 | Move (live) | ✓ | ✓ | ✓ | ✓ | — | — | — | — |

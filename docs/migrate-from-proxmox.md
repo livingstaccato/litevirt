@@ -49,6 +49,11 @@ You want:
   per-VM `qm set` lives in shell history; compose lives in git.
 - **Decentralised by design.** No primary node election. `lv`
   connects to whichever host is reachable.
+- **An iSCSI pool is one LUN = one disk.** PVE's shared LVM volume
+  group on a SAN LUN (one LV per disk) has no litevirt equivalent yet;
+  create a LUN per disk and an `iscsi` pool per LUN (`--option lun=N`).
+  litevirt refuses a second disk on a LUN. See
+  [storage.md](storage.md#iscsi-one-lun-one-disk).
 
 ## Step 1 — Bootstrap a litevirt host alongside PVE
 

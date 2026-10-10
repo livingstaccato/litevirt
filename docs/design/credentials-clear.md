@@ -66,7 +66,8 @@ Once `credentials_clear_v1` has durably latched on a node:
    anti-entropy would then spread the un-revoked row. The first clearing build
    had this rule and a test for it (`AnInFlightRevokeBeatsTheClear`, removed
    with it). Bring both back.
-4. **Readers need no change.** They already take the credential row whenever
+4. **Credential readers need no change** (but see the shadow-user guard
+   below). They already take the credential row whenever
    one exists, so a cleared column is transparent to them. The absorb step
    already ignores empty values, so the clears are never absorbed. A reader
    that ignores the old column entirely is the release *after* this one, if
@@ -97,9 +98,33 @@ account's `user_credentials` row by VALUE: the refused `users` row carried the
 same hash. A re-minting node that has latched the clear sends `''` there, so the
 refusal is remembered by username instead, and the sensitive lane refuses a
 `user_credentials` row for that username whose hash differs from the one the
-receiving node holds. The cost: anti-entropy also holds back a genuine rotation
-of that one account, for the life of the process, after a re-mint has been
-refused; the WAL lane still delivers it.
+receiving node holds — in the anti-entropy exchange with the peer that offered
+the re-mint, and only there (`remintScope`). The peer keeps offering it until
+an operator resolves the re-mint, so every exchange with it, including the
+first after a restart, refuses again. The cost stays with that peer: a genuine
+rotation of the account is still repaired from every other peer, and the WAL
+lane delivers it as usual. A deliberate attacker with a host certificate can
+therefore stop only its OWN copy of an account from repairing others.
+
+A node rolled back one build recognises a cleared re-mint by nothing: its
+refusal memory ignores an empty hash. Under WAL quarantine it still merges
+anti-entropy, so during a re-mint incident it can take the re-minted
+credential. docs/upgrades.md says to resolve a re-mint before rolling back.
+
+## A second consequence: external-realm shadow users
+
+`auth.EnsureUserShadow` refuses an LDAP or OIDC principal whose name belongs to
+a local account, and a non-empty `password_hash` was what identified a local
+account. After the clear every local account's old column is empty, and
+anti-entropy can deliver its users row before its credential row. The guard
+now reads the credential row (`corrosion.UserLocalCredential`) and refuses when
+it cannot tell. For that to hold, a missing credential row has to mean "not
+arrived yet", never "external": a node's first split pass gives every
+pre-existing external user an empty credential row at a floor timestamp
+(`credentials_live.go`), and `credentials_clear_v1` is advertised only by a node
+that has completed that pass, so the pass always runs before any clear. A node
+that first passes after the clear (a joiner) skips the materialisation when it
+holds any cleared row, and gets those rows from its peers.
 
 ## Tests
 

@@ -19,6 +19,7 @@ import (
 	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/auth"
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
@@ -233,6 +234,14 @@ func TestFleet_CredentialsClear_AMaintenanceHostOnThePreviousBuildHoldsTheLatchO
 		t.Fatal(err)
 	}
 	c.WaitConverged(t, convergeTimeout)
+	// Every node has completed a credentials split pass: credentials_clear_v1
+	// is advertised only by a node that has (corrosion.CredentialsLive).
+	latchAndSplit(t, c.Nodes...)
+	for _, n := range c.Nodes {
+		if !n.DB.CredentialsLive() {
+			t.Fatalf("%s is not credentials-live after its pass", n.Name)
+		}
+	}
 
 	var held atomic.Bool
 	held.Store(true)
@@ -286,4 +295,93 @@ func withoutToken(caps []string, tok string) []string {
 		}
 	}
 	return out
+}
+
+// TestFleet_CredentialsClear_AnExternalLoginNeverAdoptsALaggingLocalAccount:
+// anti-entropy merges users and user_credentials separately. After the clear, a
+// local account's users row carries an empty password_hash, so on a node that
+// received it before its credential row an empty hash proves nothing. An
+// external-realm login under that name must be refused there — never adopted —
+// and refused again once the credential arrives (it is a local account). An
+// external user that existed before the latch keeps logging in.
+func TestFleet_CredentialsClear_AnExternalLoginNeverAdoptsALaggingLocalAccount(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 2, IndependentReplicas: true, FaultSeed: 2691})
+	a, n := c.Nodes[0], c.Nodes[1]
+	if err := corrosion.InsertUser(ctx, a.DB, "ext", "viewer", ""); err != nil { // a pre-latch shadow
+		t.Fatal(err)
+	}
+	c.WaitConverged(t, convergeTimeout)
+	latchAndClear(t, a, n)
+	c.WaitConverged(t, convergeTimeout)
+
+	// n hears of bob only through its own anti-entropy, and only the public lane.
+	c.SetLinkFault(a, n, LinkFault{Block: true})
+	restore := a.DoNotImplement("GetSensitiveStateDigest")
+	if _, err := c.SelfClient(a).CreateUser(ctx, &pb.CreateUserRequest{
+		Username: "bob", Password: "b0b-pass", Role: "admin",
+	}); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	corrosion.NewAntiEntropy(n.DB, n.PKIDir, 0).RunOnce(ctx)
+	if u, err := corrosion.GetUser(ctx, n.DB, "bob"); err != nil || u == nil || u.PasswordHash != "" {
+		t.Fatalf("%s holds bob as %+v (err %v); the scenario needs the cleared users row without its credential", n.Name, u, err)
+	}
+	ldap := func(subject string) error {
+		return auth.EnsureUserShadow(ctx, n.DB, &auth.Principal{Subject: subject, Realm: "ldap:corp"}, "viewer")
+	}
+	if err := ldap("bob"); err == nil {
+		t.Fatal("an LDAP principal named bob adopted the local admin bob while its credential row was in flight")
+	}
+	if err := ldap("ext"); err != nil {
+		t.Errorf("a pre-latch external user was refused: %v", err)
+	}
+
+	restore()
+	corrosion.NewAntiEntropy(n.DB, n.PKIDir, 0).RunOnce(ctx)
+	if u, _ := corrosion.GetUser(ctx, n.DB, "bob"); u == nil || u.PasswordHash == "" {
+		t.Fatalf("bob's credential did not arrive on %s; the rest is vacuous", n.Name)
+	}
+	if err := ldap("bob"); err == nil {
+		t.Error("an LDAP principal named bob adopted the local admin bob after its credential arrived")
+	}
+}
+
+// TestFleet_CredentialsClear_AnUnlatchedNeighboursRotationReachesAClearedNode
+// backs keeping the absorb on a cleared node. Latches form per node, so a
+// neighbour on this build whose credentials_split_v1 latch has not formed yet
+// writes a password change to the old column only. A node that has latched the
+// clear must take it into its credential row at once, and its next pass
+// empties the old column again.
+func TestFleet_CredentialsClear_AnUnlatchedNeighboursRotationReachesAClearedNode(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 2, IndependentReplicas: true, FaultSeed: 2692})
+	a, b := c.Nodes[0], c.Nodes[1]
+	if _, err := c.SelfClient(a).CreateUser(ctx, &pb.CreateUserRequest{
+		Username: "lena", Password: "l3na-before", Role: "operator",
+	}); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	c.WaitConverged(t, convergeTimeout)
+	latchAndClear(t, a) // b has not latched credentials_split_v1
+	c.WaitConverged(t, convergeTimeout)
+
+	if _, err := c.SelfClient(b).ChangePassword(ctx, &pb.ChangePasswordRequest{
+		Username: "lena", NewPassword: "l3na-after",
+	}); err != nil {
+		t.Fatalf("ChangePassword via %s: %v", b.Name, err)
+	}
+	c.WaitConverged(t, convergeTimeout)
+	if login, err := c.SelfClient(a).Login(ctx, &pb.LoginRequest{Username: "lena", Password: "l3na-after"}); err != nil || login.Token == "" {
+		t.Errorf("%s refuses the rotation an unlatched neighbour made: %+v %v", a.Name, login, err)
+	}
+	if _, err := c.SelfClient(a).Login(ctx, &pb.LoginRequest{Username: "lena", Password: "l3na-before"}); err == nil {
+		t.Errorf("%s still accepts the rotated-out password", a.Name)
+	}
+	if _, err := a.DB.SplitCredentials(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := oldColumn(t, a, `SELECT password_hash FROM users WHERE username = 'lena'`); got != "" {
+		t.Errorf("%s: users.password_hash = %q after its next pass; the cleared node must empty it again", a.Name, got)
+	}
 }

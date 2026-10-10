@@ -19,7 +19,7 @@ import (
 // reports differently.
 //
 // The stand-down (legacyRepair) goes straight to the blob dump.
-func (ae *AntiEntropy) pullAndMerge(ctx context.Context, client pb.LiteVirtClient, tables []string, scope *pullScope, sensReq *pb.SensitiveStateRequest) (kept *syncPayload, pullErr, mergeErr error) {
+func (ae *AntiEntropy) pullAndMerge(ctx context.Context, client pb.LiteVirtClient, tables []string, scope *pullScope, sensReq *pb.SensitiveStateRequest, rs *remintScope) (kept *syncPayload, pullErr, mergeErr error) {
 	sensitive := sensReq != nil
 	allowed := replicatedTableSet
 	if sensitive {
@@ -60,7 +60,7 @@ func (ae *AntiEntropy) pullAndMerge(ctx context.Context, client pb.LiteVirtClien
 				}
 				return p, rerr
 			}
-			kept, rows, perr, merr := ae.client.mergeTableRowsStream(recv, allowed, keep)
+			kept, rows, perr, merr := ae.client.mergeTableRowsStreamScoped(recv, allowed, keep, rs)
 			if !older {
 				ae.client.observePulledRows(rows, tables, scope, sensitive)
 				return kept, perr, merr
@@ -81,7 +81,7 @@ func (ae *AntiEntropy) pullAndMerge(ctx context.Context, client pb.LiteVirtClien
 	if err != nil {
 		return nil, err, nil
 	}
-	payload, merr := ae.client.mergeRepairPull(data, tables, scope, sensitive)
+	payload, merr := ae.client.mergeRepairPullScoped(data, tables, scope, sensitive, rs)
 	return payload, nil, merr
 }
 

@@ -890,9 +890,11 @@ var supported = []string{
 	// be able to misreport, and a flag would keep the latch from forming on a
 	// fully rolled fleet.
 	CredentialsSplitV1,
-	// CredentialsClearV1 is advertised UNCONDITIONALLY: it says "this build
-	// never needs the old secret columns to find a secret", a fact about the
-	// binary.
+	// CredentialsClearV1 is mandatory but advertised only once this node has
+	// completed a credentials split pass (grpcapi's advertisement filter,
+	// corrosion.CredentialsLive): readiness, not a policy. So no clear can
+	// latch before every recipient has a credential row for every secret it
+	// holds, and a node's first pass always runs before any clear.
 	CredentialsClearV1,
 	// HostMembershipSplitV1 is advertised UNCONDITIONALLY, for the same reason:
 	// it says "this build decodes host_membership's statement shapes and reads

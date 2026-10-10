@@ -325,6 +325,9 @@ func lwwOrder(localTS, incomingTS string) int {
 // syncPayload is the full-state dump sent to joining nodes.
 type syncPayload struct {
 	Tables []syncTable `json:"tables"`
+	// remints is receiver-local, never serialized: the re-mint judgements of
+	// the anti-entropy exchange this payload belongs to (remintScope).
+	remints *remintScope
 }
 
 type syncTable struct {
@@ -334,6 +337,8 @@ type syncTable struct {
 	// authority is receiver-local merge metadata derived from the complete
 	// payload. It is never serialized.
 	authority *mergeAuthorityManifest
+	// remints is receiver-local, never serialized: see syncPayload.remints.
+	remints *remintScope
 }
 
 // tableNames are the tables carried by the public full-state dump. Wholly
@@ -645,6 +650,7 @@ func (c *Client) mergeStatePayloadLWWWithAllowlist(payload *syncPayload, allowed
 	var firstErr error
 	tables := authorityOrderedMergeTables(payload)
 	for _, table := range tables {
+		table.remints = payload.remints
 		m, s, err := c.mergeTable(table, allowedTables)
 		merged += m
 		skipped += s
@@ -1030,6 +1036,9 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 				// refuse this account's credential even if this chunk rolls back.
 				idx := columnIndexMap(table.Columns)
 				c.remints.note(cellStr(row, idx, "username"), cellStr(row, idx, "password_hash"))
+				if cellStr(row, idx, "password_hash") == "" {
+					table.remints.noteUnknown(cellStr(row, idx, "username"))
+				}
 				c.deferAfterCommit(tx, func() {
 					c.noteAdminRemintRefused(pathAE)
 					slog.Warn("anti-entropy: kept the local credential row",

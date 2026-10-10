@@ -590,7 +590,9 @@ starts **on its own, after every host runs a build carrying the
 it. The token is mandatory and replication-gated, like `credentials_split_v1`:
 it latches only once every memberlist member advertises it, a host parked in
 `maintenance` included, so no host that still reads only the old columns ever
-receives a clear.
+receives a clear. A host advertises it only after it has completed its first
+credentials split pass, so no old column anywhere is cleared before every
+host has a credential row for every secret it holds.
 
 Once it has latched on a host (and `credentials_split_v1` has too):
 
@@ -603,8 +605,16 @@ Once it has latched on a host (and `credentials_split_v1` has too):
 - each clear is stamped just after the public row's own `updated_at`, not
   with the current time, so a revoke or delete a peer made just before the
   clear, still in flight, still wins when it arrives;
-- readers do not change: they already take the credential row whenever one
-  exists.
+- password, token and IPMI readers do not change: they already take the
+  credential row whenever one exists;
+- an LDAP or OIDC login under a name that already has a users row reads the
+  credential row to decide whether that row is a local account, because an
+  empty `password_hash` no longer means "no local password". A host that has
+  received the account's users row but not yet its credential row (the two
+  are repaired separately) refuses that login with "its credential has not
+  reached this node yet" until it has, rather than guess. An external user
+  that existed before `credentials_split_v1` latched is given an empty
+  credential row by each host's first split pass, so it keeps logging in.
 
 From then on no public row, and no operator-safe state dump, carries a
 password hash, an API token hash or an IPMI password. `lv user reset-admin`
@@ -624,6 +634,22 @@ builds back, to a build before `credentials_split_v1`, is unsupported once
 which are empty, so it has no IPMI password, password hash or token hash to
 read. The startup rollback preflight refuses such a binary only if it carries
 the preflight.
+
+A host rolled back one build also loses one safeguard: that build recognises a
+re-minted admin account's credential (colonelpanik/litevirt#224) only by the
+hash on the refused users row, which is empty once the re-minting host has
+cleared. Under WAL quarantine it still merges anti-entropy, so during a
+re-mint incident it can take the re-minted credential. Resolve the re-mint
+(`lv user reset-admin` on the host you trust) before rolling a host back.
+
+**A host that was switched off across the latch.** The latch is confirmed
+against hosts that are in the cluster's membership at the time. A host that
+was off throughout is not asked, and if it runs a build before
+`credentials_split_v1` it holds no marker for either token, so the rollback
+preflight does not stop it either. Back online, it reads only the old
+columns, which are now empty: it cannot fence by IPMI and its logins fail.
+Upgrade such a host to at least the dual-write build before you power it on
+again.
 
 Until the token latches,
 `litevirt_ha_degraded{reason="capability_rollout_pending"}` is set, as for

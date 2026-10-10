@@ -149,6 +149,12 @@ func (ae *AntiEntropy) bucketScope(ctx context.Context, client pb.LiteVirtClient
 // first (observePulledRows), and returns the decoded payload for the
 // settled-tie proof. sensitive selects the lane's allowlist.
 func (c *Client) mergeRepairPull(data []byte, pull []string, scope *pullScope, sensitive bool) (*syncPayload, error) {
+	return c.mergeRepairPullScoped(data, pull, scope, sensitive, nil)
+}
+
+// mergeRepairPullScoped is mergeRepairPull inside one anti-entropy exchange,
+// whose re-mint judgements rs carries (nil: none).
+func (c *Client) mergeRepairPullScoped(data []byte, pull []string, scope *pullScope, sensitive bool, rs *remintScope) (*syncPayload, error) {
 	if len(data) == 0 {
 		return &syncPayload{}, nil
 	}
@@ -166,5 +172,6 @@ func (c *Client) mergeRepairPull(data []byte, pull []string, scope *pullScope, s
 	if sensitive {
 		allowed = sensitiveTableSet
 	}
+	payload.remints = rs
 	return payload, c.mergeStatePayloadLWWWithAllowlist(payload, allowed)
 }

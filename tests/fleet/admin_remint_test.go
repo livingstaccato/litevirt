@@ -229,3 +229,37 @@ func oldColumnOf(t *testing.T, n *Node, query string) string {
 	}
 	return rows[0].String("password_hash")
 }
+
+// The cleared re-mint refusal is scoped to the exchange with the peer that
+// holds the re-mint. A genuine rotation of the same account that this node
+// missed on the WAL is still repaired from any OTHER peer, even after the
+// re-minting peer's credential has been refused in the same pass.
+func TestFleet_AdminRemint_AClearedRemintDoesNotBlockARotationFromAnotherPeer(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: 2241})
+	a, b, x := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	for _, n := range c.Nodes {
+		n.DB.SetCredentialsSplitGate(func() bool { return true })
+	}
+	if err := corrosion.InsertUser(ctx, a.DB, "admin", "admin", clusterAdminHash); err != nil {
+		t.Fatalf("seed the cluster admin: %v", err)
+	}
+	c.WaitConverged(t, convergeTimeout)
+	b.DB.SetCredentialsClearGate(func() bool { return true })
+	x.DB.SetCredentialsClearGate(func() bool { return true })
+	c.SetLinkFault(b, a, LinkFault{Block: true})
+	c.SetLinkFault(x, a, LinkFault{Block: true})
+
+	if err := corrosion.UpdateUserPassword(ctx, x.DB, "admin", "rotated-hash"); err != nil {
+		t.Fatalf("rotate on %s: %v", x.Name, err)
+	}
+	remintAdminOn(t, b) // newest of all, and cleared
+	for i := 0; i < 2; i++ {
+		corrosion.NewAntiEntropy(a.DB, a.PKIDir, 0).RunOnce(ctx)
+	}
+	u, err := corrosion.GetUser(ctx, a.DB, "admin")
+	if err != nil || u == nil || u.PasswordHash != "rotated-hash" {
+		t.Fatalf("%s serves %+v (err %v), want the rotation repaired from %s: the refusal of %s's "+
+			"re-mint must not hold back the account's credential from other peers", a.Name, u, err, x.Name, b.Name)
+	}
+}

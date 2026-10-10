@@ -204,7 +204,6 @@ func TestCredentialsClear_AnInFlightRevokeBeatsTheClear(t *testing.T) {
 // TestCredentialsClear_ClearTSIsTheImmediateSuccessor pins the stamping rule
 // for both key formats.
 func TestCredentialsClear_ClearTSIsTheImmediateSuccessor(t *testing.T) {
-	c := newTestDB(t)
 	// Each source with keys a node could mint after seeing it, in the same
 	// format: every one of them must beat the clear.
 	for src, laters := range map[string][]string{
@@ -212,7 +211,10 @@ func TestCredentialsClear_ClearTSIsTheImmediateSuccessor(t *testing.T) {
 		"2026-01-01T00:00:00Z":           {"2026-01-01T00:00:00.000002000Z", "2026-01-01T00:00:01Z"},
 		"1767225600000-0003-node-a":      {"1767225600000-0004-node-a", "1767225600000-0004-a", "1767225600001-0000-a"},
 	} {
-		got := c.clearTS(credentialSplitRow{srcTS: src})
+		got, ok := clearTS(credentialSplitRow{srcTS: src})
+		if !ok {
+			t.Fatalf("clearTS(%q) could not stamp a readable timestamp", src)
+		}
 		if lwwOrder(got, src) <= 0 {
 			t.Errorf("clearTS(%q) = %q, not newer than the row it clears", src, got)
 		}
@@ -294,5 +296,97 @@ func TestCredentialsClear_NeedsTheSplitGate(t *testing.T) {
 		if old[k] == "" {
 			t.Errorf("%s was emptied with the split gate closed; it is this node's only copy", k)
 		}
+	}
+}
+
+// TestCredentialsClear_AnUnreadableTimestampIsNotClearedWithAFreshClock: a row
+// whose own updated_at cannot be read has no successor to stamp. It is left
+// uncleared rather than stamped with a fresh clock, which would beat an
+// in-flight revoke.
+func TestCredentialsClear_AnUnreadableTimestampIsNotClearedWithAFreshClock(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	seedSecrets(t, c, "$2a$10$h", "$2a$10$t", "p")
+	if err := c.execLocal(ctx, `UPDATE tokens SET updated_at = '', created_at = 'not-a-time' WHERE id = 'tok-1'`); err != nil {
+		t.Fatal(err)
+	}
+	openClearGates(c)
+	if _, err := c.SplitCredentials(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := oneString(t, c, `SELECT token_hash FROM tokens WHERE id = 'tok-1'`, "token_hash"); got != "$2a$10$t" {
+		t.Errorf("tokens.token_hash = %q: a row with no readable timestamp was cleared, so its clear "+
+			"was stamped with a fresh clock", got)
+	}
+	if got := oneString(t, c, `SELECT password_hash FROM users WHERE username = 'alice'`, "password_hash"); got != "" {
+		t.Errorf("users.password_hash = %q: the readable rows must still be cleared", got)
+	}
+}
+
+// TestCredentialsLive_FirstPassMaterialisesLegacyShadows: an external-realm
+// user created before the split latched has an empty old column and no
+// credential row. The pass that makes a node live gives it an empty credential
+// row at the floor timestamp, so from then on a missing credential row means
+// "not here yet" and never "external".
+func TestCredentialsLive_FirstPassMaterialisesLegacyShadows(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	if err := InsertUser(ctx, c, "ext", "viewer", ""); err != nil { // a shadow, pre-latch
+		t.Fatal(err)
+	}
+	if err := InsertUser(ctx, c, "alice", "operator", "$2a$10$alice"); err != nil {
+		t.Fatal(err)
+	}
+	if local, known, err := UserLocalCredential(ctx, c, "ext"); err != nil || local || !known {
+		t.Fatalf("pre-latch shadow: local=%v known=%v err=%v, want an external user", local, known, err)
+	}
+	c.SetCredentialsSplitGate(func() bool { return true })
+	if _, err := c.SplitCredentials(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !c.CredentialsLive() {
+		t.Fatal("a complete pass did not make the node live")
+	}
+	if got := oneString(t, c, `SELECT updated_at FROM user_credentials WHERE username = 'ext'`, "updated_at"); got != credentialFloorTS {
+		t.Errorf("the shadow's credential row is stamped %q, want the floor %q", got, credentialFloorTS)
+	}
+	for user, want := range map[string]bool{"ext": false, "alice": true} {
+		local, known, err := UserLocalCredential(ctx, c, user)
+		if err != nil || !known || local != want {
+			t.Errorf("UserLocalCredential(%s) = local %v known %v err %v, want local %v", user, local, known, err, want)
+		}
+	}
+}
+
+// TestCredentialsLive_AJoinerAfterTheClearMaterialisesNothing: a node that
+// already holds a cleared row reaches its first pass after the clear, so an
+// empty old column with no credential row may be a local account whose
+// credential row is still on its way. Nothing is materialised for it, and the
+// account is "unknown" until the row arrives.
+func TestCredentialsLive_AJoinerAfterTheClearMaterialisesNothing(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	for _, q := range []string{
+		`INSERT INTO users (username, role, password_hash, created_at, updated_at) VALUES ('alice', 'operator', '', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00.000000001Z')`,
+		`INSERT INTO user_credentials (username, password_hash, updated_at) VALUES ('alice', '$2a$10$alice', '2026-01-01T00:00:00Z')`,
+		`INSERT INTO users (username, role, password_hash, created_at, updated_at) VALUES ('bob', 'admin', '', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00.000000001Z')`,
+	} {
+		if err := c.execLocal(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, known, _ := UserLocalCredential(ctx, c, "bob"); known {
+		t.Error("before the first pass, with a cleared row in view, bob was judged known")
+	}
+	c.SetCredentialsSplitGate(func() bool { return true })
+	if _, err := c.SplitCredentials(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := tableCount(t, c, "user_credentials"); n != 1 {
+		t.Errorf("user_credentials holds %d rows; a joiner materialised a shadow for a lagging local account", n)
+	}
+	if _, known, err := UserLocalCredential(ctx, c, "bob"); err != nil || known {
+		t.Errorf("UserLocalCredential(bob) known=%v err=%v; a missing credential row on a cleared cluster "+
+			"must not read as an external user", known, err)
 	}
 }

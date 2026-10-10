@@ -250,27 +250,34 @@ Single-file restore (`lv backup file-ls` / `file-restore`,
 run as **root** for it (a non-root daemon refuses it). At start, the daemon:
 
 - **creates a system account `litevirt-restore`** if there is none — its own
-  group, in `kvm`, no home, no login shell. To create it yourself (or in your
-  configuration management) beforehand:
+  group, no other group, no home, no login shell. To create it yourself (or
+  in your configuration management) beforehand:
 
   ```bash
-  useradd --system --user-group --groups kvm --no-create-home \
+  useradd --system --user-group --no-create-home \
       --home-dir /nonexistent --shell /usr/sbin/nologin litevirt-restore
   ```
 
   An existing account of that name is used only if it looks like this — a
-  system uid, a nologin shell, no supplementary group but `kvm`, a uid no
-  other account shares — otherwise file restore is refused, naming what
-  differs. Restore VMs do not run as this account: each runs as its own uid
-  from a reserved range (`file_restore.uid_base`, 64 uids from 3800000000,
-  which must belong to no account NSS knows and lie outside `/etc/subuid`,
-  `/etc/subgid` and the containers' id-map range), with this account's group
-  and `kvm`. A starting daemon kills any process left running as one of
-  these uids;
+  system uid, a nologin shell, no supplementary group but `kvm` (which
+  earlier builds added), a uid no other account shares — otherwise file
+  restore is refused, naming what differs. Restore VMs do not run as this
+  account: each runs as its own uid from a reserved range
+  (`file_restore.uid_base`, 64 uids from 3800000000, which must belong to no
+  account NSS knows and lie outside `/etc/subuid`, `/etc/subgid` and the
+  containers' id-map range), with this account's group only. A starting
+  daemon kills any process left running as one of these uids;
+- **adds and removes POSIX ACL entries on `/dev/kvm`**: one per restore VM,
+  giving its uid read-write for as long as the session runs (`getfacl
+  /dev/kvm` shows them). A starting daemon removes any a daemon that died
+  left;
 - **loads an AppArmor profile `litevirt-restore-qemu`** into the kernel where
   AppArmor is enabled (it stays loaded until reboot; nothing is written under
-  `/etc/apparmor.d`). AppArmor enabled but `apparmor_parser` not installed
-  refuses file restore;
+  `/etc/apparmor.d`). With AppArmor enabled but `apparmor_parser` not
+  installed, restore VMs run under Landlock alone (a warning says so), or
+  file restore is refused on a kernel without Landlock;
+- **starts each restore qemu in a network namespace of its own** (nothing to
+  configure: it has a loopback interface only, down);
 - **confines each restore qemu with Landlock** where the kernel has it
   (`landlock` in `/sys/kernel/security/lsm`); nothing is installed for it. A
   host with neither AppArmor nor Landlock refuses file restore;

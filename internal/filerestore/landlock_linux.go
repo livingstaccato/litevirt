@@ -30,6 +30,13 @@ import (
 // 6 (Linux 6.12) abstract unix sockets and signals to processes outside the
 // ruleset are too. Older ABIs give the filesystem part only. The vhost-vsock
 // fd qemu inherits was opened before the ruleset and is not affected.
+//
+// What no Landlock ABI covers: UDP, and connect() to a pathname unix socket
+// (a filesystem object Landlock does not mediate). Under a root daemon qemu
+// runs in a network namespace of its own (qemuCommand), which takes away
+// UDP, TCP and abstract sockets on every ABI; pathname sockets are left to
+// DAC, which is why a restore VM's uid holds no group but the restore
+// account's (sessionCredential) — never kvm.
 
 // Landlock scopes (ABI 6), not yet named in x/sys.
 const (
@@ -186,7 +193,10 @@ func (l *Launcher) restorePolicy(h *host, sessionDir string, spec VMSpec) *landl
 			// reads the kernel where it is.
 			spec.Kernel, spec.Initrd,
 			// Its own /proc/<pid>: the exec stage resolves /proc/self, and
-			// qemu keeps that pid.
+			// qemu keeps that pid. The rule holds that procfs inode: should
+			// the kernel evict qemu's /proc/<pid> dentry and look it up
+			// again, the new inode is not covered and qemu loses its own
+			// /proc — closed, at the cost of availability only.
 			"/proc/self",
 			"/proc/sys/vm/overcommit_memory", "/proc/sys/kernel/cap_last_cap",
 			"/sys/devices/system/cpu", "/sys/devices/system/node",

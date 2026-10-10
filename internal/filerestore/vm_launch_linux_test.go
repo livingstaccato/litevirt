@@ -294,7 +294,7 @@ func TestQemuCommand_CredentialsAndDeathSignal(t *testing.T) {
 	dev, _ := os.Open(os.DevNull)
 	defer dev.Close()
 	u := &qemuUser{name: "libvirt-qemu", uid: 64055, gid: 993, groups: []uint32{993, 64055}}
-	cmd, err := qemuCommand(baseSpec(), u, t.TempDir(), dev, &bytes.Buffer{}, &bytes.Buffer{}, "", "", nil)
+	cmd, err := qemuCommand(baseSpec(), u, t.TempDir(), dev, &bytes.Buffer{}, &bytes.Buffer{}, "", "", nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -316,20 +316,20 @@ func TestQemuCommand_CredentialsAndDeathSignal(t *testing.T) {
 			t.Fatalf("qemu is asked to switch users itself: %v", cmd.Args)
 		}
 	}
-	cmd, _ = qemuCommand(baseSpec(), nil, t.TempDir(), dev, &bytes.Buffer{}, &bytes.Buffer{}, "", "", nil)
+	cmd, _ = qemuCommand(baseSpec(), nil, t.TempDir(), dev, &bytes.Buffer{}, &bytes.Buffer{}, "", "", nil, false)
 	if cmd.SysProcAttr.Credential != nil {
 		t.Fatal("a non-root daemon set a credential")
 	}
 	// N-1: with AppArmor, the litevirt binary is exec'd first, to put qemu
 	// under the restore profile; the credential and death signal still apply.
-	cmd, _ = qemuCommand(baseSpec(), u, t.TempDir(), dev, &bytes.Buffer{}, &bytes.Buffer{}, "/usr/local/bin/litevirt", AppArmorProfile, nil)
+	cmd, _ = qemuCommand(baseSpec(), u, t.TempDir(), dev, &bytes.Buffer{}, &bytes.Buffer{}, "/usr/local/bin/litevirt", AppArmorProfile, nil, false)
 	if cmd.Path != "/usr/local/bin/litevirt" || len(cmd.Args) < 5 || cmd.Args[1] != TrampolineArg || cmd.Args[2] != AppArmorProfile ||
 		cmd.Args[3] != "-" || cmd.Args[4] != "qemu-system-x86_64" {
 		t.Fatalf("trampoline argv %v", cmd.Args)
 	}
 	// R3-I1: a Landlock ruleset alone also goes through the trampoline.
 	ll := &landlockPolicy{ABI: 6, Exec: []string{"/usr"}}
-	lcmd, _ := qemuCommand(baseSpec(), u, t.TempDir(), dev, &bytes.Buffer{}, &bytes.Buffer{}, "/usr/local/bin/litevirt", "", ll)
+	lcmd, _ := qemuCommand(baseSpec(), u, t.TempDir(), dev, &bytes.Buffer{}, &bytes.Buffer{}, "/usr/local/bin/litevirt", "", ll, false)
 	if len(lcmd.Args) < 5 || lcmd.Args[2] != "-" || !strings.Contains(lcmd.Args[3], `"abi":6`) || lcmd.Args[4] != "qemu-system-x86_64" ||
 		lcmd.SysProcAttr.Pdeathsig != syscall.SIGTERM {
 		t.Fatalf("Landlock-only trampoline argv %v", lcmd.Args)
@@ -464,6 +464,7 @@ func TestValidateRestoreAccount(t *testing.T) {
 // released uid is reused.
 func TestAllocUID_DistinctPerSession(t *testing.T) {
 	l := NewLauncher(Config{UIDBase: 3_800_000_000})
+	l.kvmPath = aclDevice(t)
 	seen := map[uint32]bool{}
 	var rel []func()
 	for i := 0; i < UIDSlots; i++ {

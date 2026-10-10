@@ -29,8 +29,10 @@ type BlockDevice interface {
 // what was written (path, and why); the file is rebuilt before use.
 type TamperFunc func(path, why string)
 
-// DefaultRestoreUser is the dedicated user restore VMs run as: it owns
-// nothing — no VM disk, no key — and is in the kvm group only.
+// DefaultRestoreUser is the dedicated restore account: it owns nothing — no
+// VM disk, no key — and its group reads the restore VMs' boot files. Each
+// restore VM runs as its own uid from the reserved range (UIDBase) with that
+// group only.
 const DefaultRestoreUser = "litevirt-restore"
 
 // DefaultUIDBase is the first of the reserved uids restore VMs run as, one
@@ -65,8 +67,8 @@ type Config struct {
 	// RunAs is the restore account ("" = DefaultRestoreUser): a system
 	// account with no shell whose group reads the boot files. qemu never runs
 	// as it: each restore VM runs as its own uid from the reserved range
-	// (UIDBase), with that group and kvm only, so concurrent sessions cannot
-	// reach each other. root, libvirt-qemu, qemu and nobody are refused
+	// (UIDBase), with that group only — given /dev/kvm by an ACL entry, never
+	// the kvm group — so concurrent sessions cannot reach each other. root, libvirt-qemu, qemu and nobody are refused
 	// unless AllowSharedRunAs, which then runs qemu as that user itself.
 	RunAs string
 	// UIDBase is the first reserved per-session uid (0 = DefaultUIDBase).

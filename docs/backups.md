@@ -530,16 +530,23 @@ NBD socket), no network, vsock as its only channel, one vCPU and 512 MiB. The
 guest kernel parses the partition table and mounts each filesystem read-only
 inside the VM. Each restore VM's qemu runs as its own uid from a reserved
 range — so two sessions (possibly two tenants) cannot signal, trace or reach
-each other — with only the `litevirt-restore` group and `kvm`, its seccomp
-sandbox on and, where AppArmor is enabled, confined by the
+each other — with only the `litevirt-restore` group (never `kvm`: KVM is
+given to that uid alone by an ACL entry on `/dev/kvm`, removed when the
+session ends), in a network namespace of its own (no UDP, TCP or abstract
+sockets of the host), its seccomp sandbox on and, where AppArmor is enabled, confined by the
 `litevirt-restore-qemu` profile (its boot files, its session's export socket
 and nonce, `/dev/kvm` and vsock; no IP, no abstract sockets, nothing under
 `/var/lib/litevirt`), and — on every host whose kernel has it — inside a
 **Landlock** ruleset that allows qemu its own binary and libraries, its boot
-files, its session's directory and `/dev/kvm`, and nothing else: no VM disk
-(even a world-readable one), nothing under `/var/lib/litevirt` or
+files, its session's directory and `/dev/kvm`, and no other file: no VM
+disk (even a world-readable one), nothing under `/var/lib/litevirt` or
 `data_dir`, no writes, and, with Linux 6.7+, no TCP; with 6.12+, no abstract
-sockets and no signals out. The reserved uids are checked to be no one
+sockets and no signals out. Landlock does not cover UDP or `connect()` to a
+pathname unix socket on any kernel: the network namespace takes away the
+first, and the uid's lack of any shared group (DAC) the second. On a host
+without AppArmor and a kernel older than 6.7, TCP is held back by the
+network namespace alone; the audit row's `landlock=` (below 4) shows it,
+but such a VM is not reported as missing a barrier. The reserved uids are checked to be no one
 else's (not the containers' id-map range, `/etc/subuid`/`subgid`, or any
 account NSS knows). Its disk export accepts exactly one connection, from
 that qemu (checked by its socket credentials, process group and, under
@@ -587,8 +594,10 @@ limits and threat model are in
   partitions. Not LVM, LUKS, ZFS or md-raid inside the backup, and not a
   stopped linked clone's disk-file backup (it is only the delta over its base)
   — restore the disk for those.
-- **Requirements:** KVM (read-write for the qemu user), `/dev/vhost-vsock`
-  (the `vhost_vsock` module), a qemu with seccomp support, AppArmor or
+- **Requirements:** KVM (`/dev/kvm` on a filesystem with POSIX ACLs, as
+  devtmpfs is, or world read-write), `/dev/vhost-vsock` (the `vhost_vsock`
+  module), `qemu_fw_cfg` in the kernel's modules (on Ubuntu it is in
+  `linux-modules-extra-$(uname -r)`), a qemu with seccomp support, AppArmor or
   Landlock (`landlock` in `/sys/kernel/security/lsm`; Ubuntu, Debian 12+,
   Fedora and RHEL 9+ kernels have it), a root daemon, and a kernel the
   daemon can read (its own by default). Without them file restore is refused
@@ -597,8 +606,9 @@ limits and threat model are in
   asked of qemu itself before each restore VM starts.
 - **`file_restore.allow_unsandboxed` is dangerous.** It names the barriers a
   restore VM may run without, one at a time: `seccomp` (qemu's seccomp
-  sandbox), `mac` (the AppArmor profile when AppArmor is on but
-  `apparmor_parser` is missing, and Landlock when the host has neither), and
+  sandbox), `mac` (any MAC barrier, on a host with neither a loadable
+  AppArmor profile nor Landlock; AppArmor on without `apparmor_parser` but
+  with Landlock runs under Landlock and needs no key), and
   `root` (a non-root daemon, which runs qemu as itself, the user that owns
   `data_dir` and its keys) — for example `allow_unsandboxed: [seccomp]`.
   `true` lifts all three. Each removes a barrier between a malicious backup

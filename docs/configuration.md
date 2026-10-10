@@ -248,6 +248,13 @@ enforcement:
                               # (an old peer could drop max_cpu from a spec it rewrites), after which
                               # `lv update --cpu` grows a running VM's vCPUs live up to its ceiling.
                               # Enable fleet-uniformly; the flag is the reversible kill switch.
+  usb_mounts_memory: false    # allow SETTING a VM's USB passthrough devices and virtio-mem memory
+                              # hot-add, and a container's host bind mounts and device nodes. Refused
+                              # until usb_mounts_memory_v1 latches cluster-wide (an older peer would
+                              # drop the fields from a spec it rewrites, or place the workload without
+                              # them). Advertisement is build-static, like live_resize; this flag only
+                              # decides whether THIS node originates them. A workload that already has
+                              # them keeps them when it is turned off. See docs/passthrough.md.
   digest_v2: true             # emit the order-invariant anti-entropy row digest (digest_v2), which
                               # pairs each value with its column NAME instead of hashing values in
                               # physical column order — so a fresh-CREATE vs ALTER-upgraded node stop

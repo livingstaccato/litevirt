@@ -293,6 +293,10 @@ type Server struct {
 	// enfLiveResize is this node's kill-switch for TRUE live CPU/balloon resize
 	// (setting max_cpu); gated by this flag AND the LiveResizeV1 latch.
 	enfLiveResize bool
+	// enfUsbMountsMemory is this node's kill-switch for ORIGINATING USB
+	// passthrough, memory hot-add and container mounts/devices; gated by this
+	// flag AND the UsbMountsMemoryV1 latch (usbMountsMemoryActive).
+	enfUsbMountsMemory bool
 	// allowPlaintextStorageMigration is this node's
 	// migration.allow_unencrypted_storage. A storage-copying migration sends RAM
 	// and disk blocks over a direct, unencrypted QEMU stream, so MigrateVM refuses
@@ -1301,6 +1305,10 @@ func (s *Server) hardwareV2Ready() bool {
 // SetLiveResize sets this node's kill-switch for TRUE live CPU/balloon resize.
 func (s *Server) SetLiveResize(on bool) { s.enfLiveResize = on }
 
+// SetUsbMountsMemory sets this node's kill-switch for originating USB
+// passthrough, memory hot-add and container host mounts/devices.
+func (s *Server) SetUsbMountsMemory(on bool) { s.enfUsbMountsMemory = on }
+
 // SetAllowUnencryptedStorageMigration sets migration.allow_unencrypted_storage:
 // whether this node, as a migration source, may send a storage copy in
 // plaintext.
@@ -1457,6 +1465,8 @@ func (s *Server) tokenEnabled(token string) bool {
 		return s.enfOperationProtocol
 	case capabilities.LiveResizeV1:
 		return s.enfLiveResize
+	case capabilities.UsbMountsMemoryV1:
+		return s.enfUsbMountsMemory
 	case capabilities.CanonicalIdentityV1:
 		return s.enfCanonicalIdentity
 	case capabilities.ProjectAuthorityV1:

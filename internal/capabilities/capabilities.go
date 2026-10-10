@@ -496,6 +496,19 @@ const (
 	// StrictMTLSIdentityV1; advertised build-static (a flag-off peer is merely
 	// permissive — it just won't originate max_cpu).
 	LiveResizeV1 = "live_resize_v1"
+	// UsbMountsMemoryV1 gates three spec fields an older build does not know:
+	// a VM's usb_devices (USB passthrough), its memory_hotplug_max_mib/base
+	// (virtio-mem hot-add), and a container create spec's host bind mounts and
+	// device nodes. Setting any of them is refused until this latches, for the
+	// LiveResizeV1 reason: an older peer decodes the spec into a struct without
+	// those fields and drops them from any spec it rewrites, and an older
+	// coordinator would place, fail over or regenerate the workload without
+	// them — a USB VM restarted where its device is not, a container recreated
+	// without its mount. Understanding the fields is a property of the build,
+	// so advertisement is build-static, like LiveResizeV1.
+	// enforcement.usb_mounts_memory is the local kill switch on ORIGINATING
+	// them (default false); a workload that already carries them keeps them.
+	UsbMountsMemoryV1 = "usb_mounts_memory_v1"
 	// CanonicalIdentityV1 gates natural-key identity resolution for the tables that mint a
 	// random-UUID primary key but carry a UNIQUE natural key (snapshots (vm_name,name);
 	// container_snapshots (host_name,ct_name,name)). Two nodes can independently mint DIFFERENT
@@ -820,6 +833,10 @@ var supported = []string{
 	OperationProtocolV1,
 	CapacityAdmissionV1,
 	LiveResizeV1,
+	// UsbMountsMemoryV1 is advertised build-static, like LiveResizeV1: the
+	// latch says every peer's build understands the fields, and the local
+	// flag decides whether this node originates them.
+	UsbMountsMemoryV1,
 	CanonicalIdentityV1,
 	HardwareV2,
 	ProjectAuthorityV1,
@@ -901,7 +918,7 @@ var supported = []string{
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, FenceStateV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, FenceStateV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1, UsbMountsMemoryV1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {

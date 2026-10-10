@@ -503,6 +503,12 @@ type EnforcementConfig struct {
 	// latched cluster-wide (every peer must support it, else the field could be
 	// dropped by an old peer's spec rewrite). Default false; reversible kill switch.
 	LiveResize bool `yaml:"live_resize,omitempty"`
+	// UsbMountsMemory: allow USB passthrough, virtio-mem memory hot-add and
+	// container host bind mounts / device nodes to be SET. Refused until the
+	// usb_mounts_memory_v1 capability is latched cluster-wide (an old peer
+	// would drop the fields from a spec it rewrites). Default false; reversible
+	// kill switch — a workload that already has them keeps them.
+	UsbMountsMemory bool `yaml:"usb_mounts_memory,omitempty"`
 	// DigestV2: emit the order-invariant anti-entropy row digest (digest_v2) so
 	// column-order-only differences (fresh CREATE vs ALTER ADD COLUMN) stop showing as
 	// row-content divergence + perpetual no-op merges. Negotiated PAIRWISE by wire-field

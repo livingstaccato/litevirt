@@ -224,6 +224,7 @@ func enforceEveryToken(s *Server) {
 	s.enfIsolationEpoch = true
 	s.enfLiveResize = true
 	s.enfLWWSkew = true
+	s.enfUsbMountsMemory = true
 	s.enfOperationProtocol = true
 	s.enfOwnerEpoch = true
 	s.enfProjectAuthority = true

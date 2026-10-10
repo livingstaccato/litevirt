@@ -152,6 +152,32 @@ message VMSpec {
     // the ISO file each host judged (grpcapi/iso_identity.go).
     reserved 44;
     reserved "iso_identity";
+
+    // USB passthrough (Proxmox "usbN"). Each entry names one host USB device by
+    // vendor:product, by physical bus-port, or through a cluster-wide resource
+    // mapping. A raw (unmapped) device pins the VM to the host it lives on; a
+    // mapped one restricts placement to the hosts the mapping lists. Setting it
+    // is refused until usb_mounts_memory_v1 has latched: an older peer would
+    // drop the field from a spec it rewrites.
+    repeated USBDeviceSpec usb_devices = 60;
+
+    // Memory hot-add (virtio-mem). memory_hotplug_max_mib (> memory_mib) gives
+    // the domain a NUMA cell of memory_hotplug_base_mib boot memory plus a
+    // virtio-mem device covering the rest, so memory_mib can be raised live up
+    // to the max and the change persists and migrates. base is server-owned:
+    // the boot cell recorded when hot-add was enabled. 0 = no hot-add. Gated
+    // like usb_devices.
+    int32 memory_hotplug_max_mib  = 61;
+    int32 memory_hotplug_base_mib = 62;
+}
+
+// USBDeviceSpec selects one host USB device for passthrough. Exactly one of
+// (vendor and product), bus_port, or mapping is set.
+message USBDeviceSpec {
+    string vendor   = 1;  // USB vendor ID, 4 hex digits, e.g. "046d"
+    string product  = 2;  // USB product ID, 4 hex digits, e.g. "c52b"
+    string bus_port = 3;  // physical port "<bus>-<port>[.<port>...]", e.g. "1-2" or "3-1.4"
+    string mapping  = 4;  // cluster-wide resource mapping whose devices are USB
 }
 
 message DiskSpec {

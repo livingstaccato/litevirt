@@ -953,6 +953,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetOperationProtocol(d.cfg.Enforcement.OperationProtocol)
 	svc.SetDefaultCPUMode(d.cfg.VM.DefaultCPUMode)
 	svc.SetLiveResize(d.cfg.Enforcement.LiveResize)
+	svc.SetUsbMountsMemory(d.cfg.Enforcement.UsbMountsMemory)
 	svc.SetAllowUnencryptedStorageMigration(d.cfg.Migration.AllowUnencryptedStorage)
 	migrationTLS := d.migrationTLSInstaller()
 	svc.SetMigrationTLS(migrationTLS)

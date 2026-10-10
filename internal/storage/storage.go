@@ -125,7 +125,7 @@ func New(dataDir string, cfg Config) (Driver, error) {
 	case "ceph":
 		return &cephDriver{pool: cfg.Source, opts: cfg.Options}, nil
 	case "iscsi":
-		return &iscsiDriver{target: cfg.Source, opts: cfg.Options, run: realCmd}, nil
+		return &iscsiDriver{target: cfg.Source, opts: cfg.Options, run: iscsiRun}, nil
 	case "zfs":
 		return &zfsDriver{dataset: cfg.Source, opts: cfg.Options}, nil
 	case "btrfs":

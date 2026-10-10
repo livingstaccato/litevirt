@@ -22,6 +22,7 @@ import (
 	"github.com/litevirt/litevirt/internal/cloudinit"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
+	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/tenancy"
 )
@@ -269,7 +270,7 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 	var nicRecords []corrosion.NICRecord // v42 dual-write alongside ifaceRecords (vm_nics)
 	for i, n := range srcSpec.Network {
 		mac := lv.GenerateMAC()
-		bridge := n.Name
+		bridge := network.FlatBridgeName(n.Name)
 		if pb, perr := s.provisionForVM(ctx, n.Name); perr == nil && pb != "" {
 			bridge = pb
 		}

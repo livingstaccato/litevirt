@@ -145,8 +145,8 @@ The CLI lives at `lv sg …` and `lv firewall …`:
 # Per-NIC tier: CRUD on security groups (through the daemon; audited, needs sg.write)
 lv sg create web
 lv sg ls
-lv sg rule-add <sg-id> --direction ingress --proto tcp --port 80 --action accept
-lv sg rule-ls <sg-id>
+lv sg rule-add <sg-id-or-name> --direction ingress --proto tcp --port 80 --action accept
+lv sg rule-ls <sg-id-or-name>
 lv sg rm <sg-id>
 lv sg bind <vm> --network <net> --sg web        # bind SGs to a NIC at runtime
 

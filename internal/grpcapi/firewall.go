@@ -45,8 +45,9 @@ func (s *Server) ReloadFirewall(ctx context.Context, _ *emptypb.Empty) (*pb.Fire
 	sgs, err := corrosion.ListSecurityGroups(ctx, s.db, "")
 	if err == nil {
 		statusOut.SecurityGroups = int32(len(sgs))
+		counts := sgNameCounts(sgs)
 		for _, sg := range sgs {
-			rules, _ := corrosion.ListSGRules(ctx, s.db, sg.ID)
+			rules, _ := corrosion.ListSGRulesFor(ctx, s.db, sg, counts[sg.Name] == 1)
 			statusOut.RulesTotal += int32(len(rules))
 		}
 	}

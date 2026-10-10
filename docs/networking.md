@@ -80,6 +80,13 @@ The host bridge for an isolated network is `br-iso-<name>`; when that would
 exceed Linux's 15-char interface-name limit it is automatically shortened to a
 stable hashed form, so network names of any length work.
 
+A NIC on a network with no record attaches to a flat bridge named after the
+network. A name longer than 15 characters (a stack network is `<stack>_<name>`)
+uses a stable hashed `lvf-<11 hex>` bridge instead; shorter names keep their own
+name. A `bridge` network whose bridge name (its `--iface`, or its own name)
+is over 15 characters is refused at create. The cleanup of leftover flat stack bridges logs a removal that keeps
+failing once per bridge, not on every pass.
+
 An isolated network does not span hosts. Every host gets its own copy: its own
 `br-iso-<name>`, the subnet's first address as gateway, and its own `dnsmasq`
 leasing the same range. VMs on different hosts cannot reach each other over it,

@@ -37,6 +37,41 @@ func IsolatedBridgeName(networkName string) string {
 	return prefix + hex.EncodeToString(sum[:])[:maxIfaceName-len(prefix)]
 }
 
+// FlatBridgeName returns the host bridge a NIC on a network with no record
+// attaches to (flat-bridge mode). It is the network name itself when that fits
+// IFNAMSIZ, so every bridge that exists today keeps its name across a rolling
+// upgrade. A longer name could never be created (EnsureBridge refuses it), so
+// it maps to the stable hashed form "lvf-<11 hex>" (exactly 15 chars) instead
+// of failing the VM create or the leftover-bridge cleanup forever. Every site
+// that creates or removes a flat bridge MUST use this so the names agree.
+func FlatBridgeName(networkName string) string {
+	if len(networkName) <= maxIfaceName {
+		return networkName
+	}
+	const prefix = "lvf-"
+	sum := sha1.Sum([]byte(networkName))
+	return prefix + hex.EncodeToString(sum[:])[:maxIfaceName-len(prefix)]
+}
+
+// ValidateBridgeNetworkName refuses a plain bridge network whose bridge name
+// (its interface, or its own name when none is given) cannot be a Linux
+// interface: over 15 bytes the bridge can never be created, so the network would
+// persist and then fail every VM placed on it. Other types name their device
+// themselves (hashed, VNI or a given interface).
+func ValidateBridgeNetworkName(netType, networkName, iface string) error {
+	if netType != "" && netType != "bridge" {
+		return nil
+	}
+	dev := iface
+	if dev == "" {
+		dev = networkName
+	}
+	if len(dev) > maxIfaceName {
+		return fmt.Errorf("bridge name %q is %d bytes; a Linux interface name is at most %d. Give the network a shorter name or set --iface to a shorter bridge", dev, len(dev), maxIfaceName)
+	}
+	return nil
+}
+
 // BridgeName returns the host device a NIC on networkName attaches to: the
 // same name Provision returns for def. Code that needs the device without
 // provisioning (hot attach, restart, containers) must use this, so the NIC
@@ -67,7 +102,7 @@ func BridgeName(networkName string, def compose.NetworkDef) string {
 	if def.Interface != "" {
 		return def.Interface
 	}
-	return networkName
+	return FlatBridgeName(networkName)
 }
 
 // VTEPRecord holds a host's VTEP information for a network.

@@ -455,6 +455,10 @@ type Server struct {
 	// netReconcile is what ReconcileNetworksOnce has done on this host.
 	netReconcile netReconcileState
 
+	// leftoverBridgeWarned holds the bridge names whose leftover-removal failure
+	// was already logged, so the 30s reconcile pass does not repeat it.
+	leftoverBridgeWarned sync.Map
+
 	// bridgeEnsure is a test seam for host bridge availability and provisioning.
 	// Production leaves it nil, preserving the net.InterfaceByName +
 	// network.EnsureBridge validation path.

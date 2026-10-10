@@ -1755,7 +1755,7 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 	}
 	var netConfigs []lv.NetworkConfig
 	for _, iface := range ifaces {
-		bridge := iface.NetworkName
+		bridge := network.FlatBridgeName(iface.NetworkName)
 		// Provision network infrastructure (VXLAN tunnels, DHCP, NAT, bridges).
 		// This is critical after failover — the new host may not have the network set up.
 		provision := r.provision

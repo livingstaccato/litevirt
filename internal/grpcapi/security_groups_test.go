@@ -183,6 +183,9 @@ func TestSecurityGroupRPCs_NetworkAdminAllowed(t *testing.T) {
 func TestSecurityGroupRPCs_RejectBadRequests(t *testing.T) {
 	s := testServer(t)
 	ctx := adminCtxWithEngine(t, s)
+	if err := corrosion.InsertSecurityGroup(context.Background(), s.db, corrosion.SecurityGroup{ID: "sg-1", Name: "web"}); err != nil {
+		t.Fatal(err)
+	}
 	for name, err := range map[string]error{
 		"create without a name": func() error {
 			_, err := s.CreateSecurityGroup(ctx, &pb.CreateSecurityGroupRequest{})

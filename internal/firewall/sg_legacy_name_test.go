@@ -1,0 +1,85 @@
+package firewall
+
+import (
+	"bytes"
+	"context"
+	"log/slog"
+	"strings"
+	"testing"
+
+	"github.com/litevirt/litevirt/internal/corrosion"
+)
+
+// A rule an older client stored with the group's NAME in sg_id is rendered as
+// the group's own when the name is unambiguous, and not at all when two live
+// groups hold it.
+func TestCorrosionPlanLoader_LegacyNameRule(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		second    bool
+		wantRules int
+	}{
+		{"unambiguous", false, 1},
+		{"ambiguous", true, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			db := corrosion.NewTestClientT(t)
+			if err := corrosion.InitSchema(ctx, db); err != nil {
+				t.Fatal(err)
+			}
+			if err := corrosion.InsertSecurityGroup(ctx, db, corrosion.SecurityGroup{ID: "sg-1", Name: "web"}); err != nil {
+				t.Fatal(err)
+			}
+			if tc.second {
+				if err := corrosion.InsertSecurityGroup(ctx, db, corrosion.SecurityGroup{ID: "sg-2", Name: "web", StackName: "shop"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := corrosion.InsertSGRule(ctx, db, corrosion.SGRule{ID: "r1", SGID: "web",
+				Direction: "ingress", Proto: "tcp", PortRange: "22", Action: "accept"}); err != nil {
+				t.Fatal(err)
+			}
+			plan, err := CorrosionPlanLoader(db, "host-a", Plan{}, liveTaps(nil))(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := 0
+			for _, g := range plan.SecurityGroups {
+				got += len(g.Rules)
+			}
+			if got != tc.wantRules {
+				t.Errorf("rendered %d rules, want %d (%+v)", got, tc.wantRules, plan.SecurityGroups)
+			}
+		})
+	}
+}
+
+// An unattributable legacy rule is reported by the reconciler, once per rule.
+func TestCorrosionPlanLoader_AmbiguousLegacyRuleWarnsOnce(t *testing.T) {
+	ctx := context.Background()
+	db := corrosion.NewTestClientT(t)
+	if err := corrosion.InitSchema(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	for _, g := range []corrosion.SecurityGroup{{ID: "sg-1", Name: "web"}, {ID: "sg-2", Name: "web", StackName: "shop"}} {
+		if err := corrosion.InsertSecurityGroup(ctx, db, g); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := corrosion.InsertSGRule(ctx, db, corrosion.SGRule{ID: "warn-once-rule", SGID: "web", Direction: "ingress"}); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	defer slog.SetDefault(old)
+	for i := 0; i < 3; i++ {
+		if _, err := CorrosionPlanLoader(db, "host-a", Plan{}, liveTaps(nil))(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := strings.Count(buf.String(), "warn-once-rule"); n != 1 {
+		t.Errorf("warned %d times, want 1:\n%s", n, buf.String())
+	}
+}

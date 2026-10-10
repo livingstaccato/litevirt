@@ -253,21 +253,22 @@ func (c *Coordinator) evaluateRelayHealth(ctx context.Context, voters, fenceCand
 			eligible++
 		}
 		qualifies := o.observers > 0 && o.failing >= o.bar && !fenceCandidates[h.Name]
-		if qualifies && held {
-			if c.relay.heldLogged[h.Name] != holds[h.Name].Until {
-				c.relay.heldLogged[h.Name] = holds[h.Name].Until
-				slog.Warn("relay health: not demoting; an operator hold is in force",
-					"host", h.Name, "hold_until", holds[h.Name].Until, "by", holds[h.Name].By,
-					"failing", o.failing, "observers", o.observers)
-			}
-			qualifies = false
-		}
 		if qualifies {
+			// The window runs under a hold too, so the hold is reported when
+			// it actually stops a demotion — after the stable window — not on
+			// the first failing evaluation.
 			since, ok := c.relay.failingSince[h.Name]
 			if !ok {
 				c.relay.failingSince[h.Name] = now
 			} else if now.Sub(since) >= RelayDemoteWindow {
-				demote = append(demote, h.Name)
+				if !held {
+					demote = append(demote, h.Name)
+				} else if c.relay.heldLogged[h.Name] != holds[h.Name].Until {
+					c.relay.heldLogged[h.Name] = holds[h.Name].Until
+					slog.Warn("relay health: not demoting; an operator hold is in force",
+						"host", h.Name, "hold_until", holds[h.Name].Until, "by", holds[h.Name].By,
+						"failing", o.failing, "observers", o.observers)
+				}
 			}
 		} else {
 			delete(c.relay.failingSince, h.Name)

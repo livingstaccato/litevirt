@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/litevirt/litevirt/internal/failover"
+	"github.com/litevirt/litevirt/tests/e2e/hostls"
 )
 
 // relayRole reads litevirt_relay_role{member=<member>} from host's own
@@ -114,13 +115,11 @@ func TestRelayHealth_DegradedLinkBecomesALeafEverywhere(t *testing.T) {
 	if took < failover.RelayDemoteWindow {
 		t.Errorf("%s demoted after %s, inside the %s window", victim, took, failover.RelayDemoteWindow)
 	}
-	// Demoted, not fenced: two of four observers is below fence quorum.
+	// Demoted, not fenced: two of four observers is below fence quorum. The
+	// victim must still print HOST_ACTIVE (a fenced host prints HOST_OFFLINE).
 	if out, err := l.lv(l.hosts[len(l.hosts)-1], "host", "ls"); err == nil {
-		for _, line := range strings.Split(out, "\n") {
-			if f := strings.Fields(line); len(f) > 0 && f[0] == victim &&
-				(strings.Contains(line, "fenced") || strings.Contains(line, "offline")) {
-				t.Errorf("%s was fenced, not demoted: %s", victim, line)
-			}
+		if line, bad := hostls.TakenDown(out, victim); bad {
+			t.Errorf("%s was taken out of service, not just demoted: %s", victim, line)
 		}
 	}
 
@@ -145,20 +144,7 @@ func (l *lab) requireRelayDemotionRoom() {
 	if err != nil {
 		l.t.Fatalf("lv host ls: %v", err)
 	}
-	total, active := 0, 0
-	var notActive []string
-	for _, line := range strings.Split(out, "\n") {
-		f := strings.Fields(line)
-		if len(f) < 3 || f[0] == "NAME" {
-			continue
-		}
-		total++
-		if f[2] == "active" {
-			active++
-		} else {
-			notActive = append(notActive, f[0]+"="+f[2])
-		}
-	}
+	total, active, notActive := hostls.CountActive(out)
 	rows, err := l.sql(l.hosts[0], "SELECT name FROM hosts WHERE deleted_at IS NULL AND role = 'witness'")
 	if err != nil {
 		l.t.Fatalf("read witnesses: %v", err)

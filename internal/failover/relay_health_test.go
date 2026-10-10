@@ -794,3 +794,32 @@ func TestRelayHealth_RemovedHostsHoldIsEnded(t *testing.T) {
 		t.Fatalf("a live host's hold was touched: %+v", holds["h2"])
 	}
 }
+
+// The hold is reported when it stops a demotion — once the stable window has
+// run — not on the first failing evaluation (lab 1 saw it 5 s after the cut).
+//
+// Mutation: report on the first qualifying evaluation — logged before the
+// window, red.
+func TestRelayHealth_HoldIsReportedWhenItStopsADemotion(t *testing.T) {
+	f := newRelayFixture(t, 5, true)
+	if err := corrosion.SetRelayHold(context.Background(), f.db, "h1", corrosion.RelayHold{
+		Until: f.clk.Add(time.Hour).Format(time.RFC3339), By: "admin",
+	}, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	start := f.clk
+	for f.clk.Sub(start) < RelayDemoteWindow+3*relayPoll {
+		f.verdicts("h1", "h2", "h3")
+		f.cycle()
+		logged := f.c.relay.heldLogged["h1"] != ""
+		if f.clk.Sub(start) < RelayDemoteWindow && logged {
+			t.Fatalf("the hold was reported %s in, before the %s window", f.clk.Sub(start), RelayDemoteWindow)
+		}
+	}
+	if f.c.relay.heldLogged["h1"] == "" {
+		t.Fatal("the hold was never reported though it stopped a demotion")
+	}
+	if f.demoted("h1") {
+		t.Fatal("h1 demoted under a hold")
+	}
+}

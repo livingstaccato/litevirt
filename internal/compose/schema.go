@@ -187,7 +187,13 @@ type VMDef struct {
 	MaxCPU   int    `yaml:"max-cpu"`   // vCPU hotplug ceiling (> cpu) for live CPU hot-add; requires live_resize
 	CPUMode  string `yaml:"cpu-mode"`  // host-passthrough | host-model | custom (unset → host-model)
 	CPUModel string `yaml:"cpu-model"` // CPU model for cpu-mode: custom (e.g. x86-64-v3)
-	Memory   Memory `yaml:"memory"`    // int MiB or string "8G"
+	// Noisy-neighbour controls, both changeable on a running VM with no restart.
+	// cpu-limit caps the VM's total CPU in host cores (Proxmox cpulimit; fractions
+	// allowed, 0/unset = unlimited, at most cpu). cpu-shares is its relative CPU
+	// weight under contention (libvirt shares, default 1024; range 2-262144).
+	CPULimit  float64 `yaml:"cpu-limit"`
+	CPUShares int     `yaml:"cpu-shares"`
+	Memory    Memory  `yaml:"memory"` // int MiB or string "8G"
 	// Memory ballooning (#4). max-memory (> memory) raises the balloon ceiling
 	// so the guest can be inflated up to it; min-memory is the floor the host may
 	// reclaim to. Both accept int MiB or "8G" strings. 0/unset = fixed memory.
@@ -341,6 +347,10 @@ type NetworkAttachment struct {
 	Gateway string `yaml:"gateway"`
 	MAC     string `yaml:"mac"`
 	Trunk   []int  `yaml:"trunk"`
+
+	// Rate caps this NIC's bandwidth in MB/s in both directions (Proxmox rate=,
+	// fractions allowed). 0/unset = unlimited. Changeable on a running VM.
+	Rate float64 `yaml:"rate,omitempty"`
 
 	// IPv6 / IPv6Gateway are the v6 counterparts. Empty = use SLAAC
 	// (router advertisement) or DHCPv6 if the network is configured

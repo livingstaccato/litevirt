@@ -623,9 +623,10 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		// Direct (macvtap) networks return "direct:<iface>" from provisioning.
 		if strings.HasPrefix(bridge, "direct:") {
 			netConfigs = append(netConfigs, lv.NetworkConfig{
-				Direct: strings.TrimPrefix(bridge, "direct:"),
-				Model:  n.Model,
-				MAC:    mac,
+				Direct:   strings.TrimPrefix(bridge, "direct:"),
+				Model:    n.Model,
+				MAC:      mac,
+				RateMBps: n.RateMbSec,
 			})
 		} else {
 			// Bridge preflight: ensure the bridge exists on this host.
@@ -636,10 +637,11 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 					"network bridge %q not found on host %s and auto-create failed: %v", bridge, s.hostName, err)
 			}
 			netConfigs = append(netConfigs, lv.NetworkConfig{
-				Bridge: bridge,
-				Model:  n.Model,
-				MAC:    mac,
-				VLAN:   vlan,
+				Bridge:   bridge,
+				Model:    n.Model,
+				MAC:      mac,
+				VLAN:     vlan,
+				RateMBps: n.RateMbSec,
 			})
 		}
 
@@ -3946,7 +3948,8 @@ func isPureCPUGrowRequest(req *pb.UpdateVMRequest) bool {
 		req.GuestAgent == nil && req.MinMemoryMib == nil && req.MaxMemoryMib == nil &&
 		req.SecureBoot == nil && req.Tpm == nil && req.MaxCpu == nil &&
 		req.Restart == nil && req.Onboot == nil && req.StartupOrder == nil &&
-		req.StartDelaySec == nil && req.StopDelaySec == nil && !req.DisableVnc
+		req.StartDelaySec == nil && req.StopDelaySec == nil && !req.DisableVnc &&
+		!limitsRequested(req)
 }
 
 // liveGrowVCPU hot-adds vCPUs to a RUNNING VM in place (no stop). It is the pure
@@ -4032,6 +4035,19 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	}
 	if req.StopDelaySec != nil {
 		spec.StopDelaySec = *req.StopDelaySec
+	}
+
+	// Noisy-neighbour limits (cpu cap/weight, per-NIC rate). Validated against
+	// the VM's final vCPU count and folded into spec here; whether they are
+	// applied live or baked into a redefine is decided below. A vCPU change
+	// with a limit already set is validated too (see mergeLimitUpdate).
+	limitsReq := limitsRequested(req)
+	var limitsUp limitsUpdate
+	if limitsReq || (req.Cpu > 0 && spec.CpuLimit > 0) {
+		var lerr error
+		if limitsUp, lerr = mergeLimitUpdate(spec, req); lerr != nil {
+			return nil, lerr
+		}
 	}
 
 	// REDEFINE-class fields bake into the domain XML, so they need the VM stopped.
@@ -4343,13 +4359,44 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	// respects the mutation barrier AND touches only the spec, never cpu_actual/
 	// mem_actual (a running VM's live actuals must survive a metadata edit).
 	if !redefine {
+		limitsApplied := false
+		if limitsUp.any() {
+			// Applied to the domain BEFORE the spec is written, under the VM
+			// lock: a domain the spec does not yet describe is reconciled by
+			// the persist below, while a spec the domain does not follow would
+			// be a promise nothing keeps. Ownership and the operation barrier
+			// are re-checked because the lock was taken after the first read.
+			unlock := s.lockVM(req.Name)
+			defer unlock()
+			fresh, gerr := corrosion.GetVM(ctx, s.db, req.Name)
+			if gerr != nil || fresh == nil {
+				return nil, status.Errorf(codes.NotFound, "VM %q not found", req.Name)
+			}
+			if fresh.HostName != s.hostName {
+				return nil, status.Errorf(codes.Aborted, "ownership of %q moved to %s mid-operation; retry", req.Name, fresh.HostName)
+			}
+			if fresh.ActiveOperationID != "" {
+				return nil, status.Errorf(codes.FailedPrecondition, "cannot update limits of %q: an operation is in progress", req.Name)
+			}
+			if aerr := s.applyLimitsToDomain(ctx, req.Name, spec, limitsUp, false); aerr != nil {
+				s.revertLimits(ctx, req.Name, spec, limitsUp)
+				return nil, aerr
+			}
+			limitsApplied = true
+		}
 		applied, _, err := corrosion.MutateDesiredSpec(ctx, s.db, req.Name, func(string) (string, error) {
 			return string(specJSON), nil
 		})
 		if err != nil {
+			if limitsApplied {
+				s.revertLimits(ctx, req.Name, spec, limitsUp)
+			}
 			return nil, status.Errorf(codes.Internal, "update VM spec: %v", err)
 		}
 		if !applied {
+			if limitsApplied {
+				s.revertLimits(ctx, req.Name, spec, limitsUp)
+			}
 			return nil, status.Errorf(codes.FailedPrecondition,
 				"cannot update VM %q: an operation is in progress", req.Name)
 		}
@@ -4442,18 +4489,21 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	var netConfigs []lv.NetworkConfig
 	for _, iface := range ifaces {
 		bridge := resolveBridge(ctx, s.db, iface.NetworkName)
+		rate := compose.NICRate(spec, iface.Ordinal, iface.NetworkName)
 		if strings.HasPrefix(bridge, "direct:") {
 			netConfigs = append(netConfigs, lv.NetworkConfig{
-				Direct: strings.TrimPrefix(bridge, "direct:"),
-				Model:  "virtio",
-				MAC:    iface.MAC,
+				Direct:   strings.TrimPrefix(bridge, "direct:"),
+				Model:    "virtio",
+				MAC:      iface.MAC,
+				RateMBps: rate,
 			})
 			continue
 		}
 		netConfigs = append(netConfigs, lv.NetworkConfig{
-			Bridge: bridge,
-			Model:  "virtio",
-			MAC:    iface.MAC,
+			Bridge:   bridge,
+			Model:    "virtio",
+			MAC:      iface.MAC,
+			RateMBps: rate,
 		})
 	}
 
@@ -4486,6 +4536,21 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 				// keeps the call-site intent obvious.
 				if req.CpuMode != "" || req.CpuModel != "" {
 					patched, perr = lv.PatchInactiveCPUMode(patched, spec.CpuMode, spec.CpuModel)
+				}
+				// The cpu quota is per vCPU: a changed vCPU count, or a changed
+				// limit/weight, rewrites it in place rather than forcing the
+				// regeneration this path exists to avoid.
+				if perr == nil && (limitsUp.cpu || (req.Cpu > 0 && spec.CpuLimit > 0)) {
+					patched, perr = lv.PatchInactiveCPUTune(patched, spec.CpuLimit, int(spec.CpuShares), int(spec.Cpu))
+				}
+				if perr == nil {
+					for _, o := range limitsUp.nicOrdinals {
+						for _, iface := range ifaces {
+							if iface.Ordinal == o {
+								patched, _ = lv.PatchInterfaceBandwidth(patched, iface.MAC, spec.Network[o].RateMbSec)
+							}
+						}
+					}
 				}
 			}
 			if perr == nil {

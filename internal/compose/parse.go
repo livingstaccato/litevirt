@@ -548,6 +548,22 @@ func (v *validator) validate(f *File) {
 			}
 		}
 
+		// Noisy-neighbour limits. The daemon re-checks against the VM's final vCPU
+		// count; this catches the obvious mistakes at parse time, with a path.
+		if vm.CPULimit < 0 {
+			v.ps.add(p+".cpu-limit", "cpu-limit must be >= 0 (0 = unlimited)", "")
+		} else if vm.CPU > 0 && vm.CPULimit > float64(vm.CPU) {
+			v.ps.add(p+".cpu-limit", fmt.Sprintf("cpu-limit %v exceeds cpu %d, so it could never be reached", vm.CPULimit, vm.CPU), "use 0 for unlimited")
+		}
+		if vm.CPUShares != 0 && (vm.CPUShares < 2 || vm.CPUShares > 262144) {
+			v.ps.add(p+".cpu-shares", fmt.Sprintf("cpu-shares %d is outside 2..262144", vm.CPUShares), "0 keeps the default (1024)")
+		}
+		for i, n := range vm.Network {
+			if n.Rate < 0 {
+				v.ps.add(fmt.Sprintf("%s.network[%d].rate", p, i), "rate must be >= 0 MB/s (0 = unlimited)", "")
+			}
+		}
+
 		// Replicas validation
 		if vm.Replicas != nil && *vm.Replicas < 0 {
 			v.ps.add(p+".replicas", "replicas must be >= 0", "")

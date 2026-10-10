@@ -19,6 +19,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/cloudinit"
+	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/image"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
@@ -1756,6 +1757,7 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 	var netConfigs []lv.NetworkConfig
 	for _, iface := range ifaces {
 		bridge := iface.NetworkName
+		rate := compose.NICRate(spec, iface.Ordinal, iface.NetworkName)
 		// Provision network infrastructure (VXLAN tunnels, DHCP, NAT, bridges).
 		// This is critical after failover — the new host may not have the network set up.
 		provision := r.provision
@@ -1770,14 +1772,16 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 		}
 		if strings.HasPrefix(bridge, "direct:") {
 			netConfigs = append(netConfigs, lv.NetworkConfig{
-				Direct: strings.TrimPrefix(bridge, "direct:"),
-				Model:  "virtio",
-				MAC:    iface.MAC,
+				Direct:   strings.TrimPrefix(bridge, "direct:"),
+				Model:    "virtio",
+				MAC:      iface.MAC,
+				RateMBps: rate,
 			})
 		} else {
 			netConfigs = append(netConfigs, lv.NetworkConfig{
-				Bridge: bridge,
-				MAC:    iface.MAC,
+				Bridge:   bridge,
+				MAC:      iface.MAC,
+				RateMBps: rate,
 			})
 		}
 	}
@@ -1794,6 +1798,8 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 		Networks:     netConfigs,
 		CloudInitISO: cloudInitISO,
 		Boot:         spec.Boot,
+		CPULimit:     spec.CpuLimit,
+		CPUShares:    int(spec.CpuShares),
 	}
 	if vmCfg.Machine == "" {
 		vmCfg.Machine = "q35"

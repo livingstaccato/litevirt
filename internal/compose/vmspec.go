@@ -56,6 +56,8 @@ func BuildVMSpec(instanceName, baseName string, vm *VMDef, f *File) (*pb.VMSpec,
 		MaxCpu:        int32(vm.MaxCPU),
 		CpuMode:       vm.CPUMode,
 		CpuModel:      vm.CPUModel,
+		CpuLimit:      vm.CPULimit,
+		CpuShares:     int32(vm.CPUShares),
 		MemoryMib:     int32(vm.Memory),
 		MinMemoryMib:  int32(vm.MinMemory),
 		MaxMemoryMib:  int32(vm.MaxMemory),
@@ -144,6 +146,7 @@ func BuildVMSpec(instanceName, baseName string, vm *VMDef, f *File) (*pb.VMSpec,
 			Ipv6:           n.IPv6,
 			Ipv6Gateway:    n.IPv6Gateway,
 			SecurityGroups: n.SecurityGroups,
+			RateMbSec:      n.Rate,
 		})
 	}
 
@@ -409,4 +412,19 @@ func FindVMDef(f *File, instanceName string) (*VMDef, string) {
 		}
 	}
 	return nil, ""
+}
+
+// NICRate is the bandwidth cap (MB/s, 0 = unlimited) a VM spec declares for
+// the NIC at ordinal, trusted only when the spec's NIC at that position names
+// the same network — a hot-plugged NIC, or one a retarget moved, carries no
+// cap rather than another NIC's.
+func NICRate(spec *pb.VMSpec, ordinal int, network string) float64 {
+	if spec == nil || ordinal < 0 || ordinal >= len(spec.Network) {
+		return 0
+	}
+	n := spec.Network[ordinal]
+	if n == nil || (network != "" && n.Name != network) {
+		return 0
+	}
+	return n.RateMbSec
 }

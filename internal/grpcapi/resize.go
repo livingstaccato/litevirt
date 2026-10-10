@@ -389,6 +389,11 @@ func (s *Server) applyLiveResize(ctx context.Context, name string, target, apply
 		if err := s.virt.SetVCPUs(name, int(target.Cpu)); err != nil {
 			return fmt.Errorf("vcpus: %w", err)
 		}
+		// libvirt's quota is per vCPU, so the same total cap needs a new quota
+		// at the new count; hot-added vCPUs would otherwise run on the old one.
+		if err := s.reapplyCPULimit(name, target); err != nil {
+			return err
+		}
 	}
 	if target.MemoryMib != applyPrev.MemoryMib {
 		if err := s.virt.SetMemory(name, int(target.MemoryMib)); err != nil {
@@ -404,6 +409,14 @@ func (s *Server) applyLiveResize(ctx context.Context, name string, target, apply
 // server-owned fields (UUID, resolved addresses/MACs, unknown fields). The reconciler
 // / vmcheck read these fields fresh each sweep, so no domain redefine is needed.
 func (s *Server) applyLiveMetadata(ctx context.Context, name string, desired *pb.VMSpec, fields []string) error {
+	if limitFields, rest := splitLimitFields(fields); len(limitFields) > 0 {
+		// Applied through UpdateVM, which forwards to the owning host, tells
+		// libvirt (config and the running domain) and persists the spec.
+		if _, err := s.UpdateVM(ctx, limitUpdateFromDesired(name, desired, limitFields)); err != nil {
+			return err
+		}
+		fields = rest
+	}
 	if len(fields) == 0 {
 		return nil
 	}

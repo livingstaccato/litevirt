@@ -47,6 +47,10 @@ func (a Action) String() string {
 	}
 }
 
+// NICRateFieldPrefix prefixes the MetadataChanges field name of a per-NIC
+// bandwidth cap; the suffix is the NIC's 0-based position ("nic_rate_0").
+const NICRateFieldPrefix = "nic_rate_"
+
 // Delta is one changed field with its human-readable old→new values, retained
 // even when the plan's Max() downgrades to a coarser action (so a non-in-place
 // executor still has the full picture).
@@ -289,6 +293,19 @@ func Classify(desired, stored *pb.VMSpec, storedDisks []StoredDisk) ChangePlan {
 	metaIf(desired.Hooks != nil && !proto.Equal(desired.Hooks, stored.Hooks), "hooks", "", "")
 	metaIf(desired.StopTimeoutSec != 0 && desired.StopTimeoutSec != stored.StopTimeoutSec, "stop_timeout",
 		fmt.Sprintf("%ds", stored.StopTimeoutSec), fmt.Sprintf("%ds", desired.StopTimeoutSec))
+
+	// Noisy-neighbour limits: libvirt applies them to a running domain, so they
+	// are live. Plain equality, not inherit-on-unset: dropping cpu-limit from
+	// the file removes the cap, which is what a declarative file means.
+	metaIf(desired.CpuLimit != stored.CpuLimit, "cpu_limit", fmt.Sprintf("%g", stored.CpuLimit), fmt.Sprintf("%g", desired.CpuLimit))
+	metaIf(desired.CpuShares != stored.CpuShares, "cpu_shares", fmt.Sprintf("%d", stored.CpuShares), fmt.Sprintf("%d", desired.CpuShares))
+	for i := range desired.Network {
+		if i >= len(stored.Network) || desired.Network[i].GetName() != stored.Network[i].GetName() {
+			break // a topology change; the network bucket above owns it
+		}
+		metaIf(desired.Network[i].GetRateMbSec() != stored.Network[i].GetRateMbSec(), NICRateFieldPrefix+fmt.Sprintf("%d", i),
+			fmt.Sprintf("%g", stored.Network[i].GetRateMbSec()), fmt.Sprintf("%g", desired.Network[i].GetRateMbSec()))
+	}
 
 	// --- Delegated: owned by another path, recorded not ignored ---
 	if desired.Loadbalancer != nil && !proto.Equal(desired.Loadbalancer, stored.Loadbalancer) {

@@ -442,7 +442,17 @@ type VMSpec struct {
 	// Admin's absolute path). Every host that resolves iso later (a start, a
 	// migration target) refuses a pool of another kind, so a same-named pool
 	// elsewhere cannot stand in for it. Empty on VMs created before it existed.
-	IsoScope      string `protobuf:"bytes,43,opt,name=iso_scope,json=isoScope,proto3" json:"iso_scope,omitempty"`
+	IsoScope string `protobuf:"bytes,43,opt,name=iso_scope,json=isoScope,proto3" json:"iso_scope,omitempty"`
+	// cpu_limit caps the VM's total CPU time in host cores (Proxmox cpulimit):
+	// 2.5 lets the guest burn at most 2.5 cores however many vCPUs it has.
+	// 0 = unlimited. Rendered as the libvirt <cputune> period/quota (a PER-vCPU
+	// quota, so the render divides by the vCPU count). Additive; an older peer
+	// ignores it, which only means the cap is not applied there.
+	CpuLimit float64 `protobuf:"fixed64,45,opt,name=cpu_limit,json=cpuLimit,proto3" json:"cpu_limit,omitempty"`
+	// cpu_shares is the VM's relative CPU weight under contention (libvirt
+	// <cputune><shares>; 1024 is the kernel default, range 2..262144).
+	// 0 = leave at the default.
+	CpuShares     int32 `protobuf:"varint,46,opt,name=cpu_shares,json=cpuShares,proto3" json:"cpu_shares,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -778,6 +788,20 @@ func (x *VMSpec) GetIsoScope() string {
 	return ""
 }
 
+func (x *VMSpec) GetCpuLimit() float64 {
+	if x != nil {
+		return x.CpuLimit
+	}
+	return 0
+}
+
+func (x *VMSpec) GetCpuShares() int32 {
+	if x != nil {
+		return x.CpuShares
+	}
+	return 0
+}
+
 type DiskSpec struct {
 	state   protoimpl.MessageState `protogen:"open.v1"`
 	Name    string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
@@ -884,8 +908,11 @@ type NetworkAttachment struct {
 	Ipv6           string                 `protobuf:"bytes,7,opt,name=ipv6,proto3" json:"ipv6,omitempty"`
 	Ipv6Gateway    string                 `protobuf:"bytes,8,opt,name=ipv6_gateway,json=ipv6Gateway,proto3" json:"ipv6_gateway,omitempty"`
 	SecurityGroups []string               `protobuf:"bytes,9,rep,name=security_groups,json=securityGroups,proto3" json:"security_groups,omitempty"` // SG names bound to this NIC (distributed firewall)
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// rate_mb_sec caps this NIC's bandwidth in MB/s, both directions (Proxmox
+	// rate=). Rendered as the libvirt <bandwidth> average. 0 = unlimited.
+	RateMbSec     float64 `protobuf:"fixed64,10,opt,name=rate_mb_sec,json=rateMbSec,proto3" json:"rate_mb_sec,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *NetworkAttachment) Reset() {
@@ -979,6 +1006,13 @@ func (x *NetworkAttachment) GetSecurityGroups() []string {
 		return x.SecurityGroups
 	}
 	return nil
+}
+
+func (x *NetworkAttachment) GetRateMbSec() float64 {
+	if x != nil {
+		return x.RateMbSec
+	}
+	return 0
 }
 
 type CloudInitSpec struct {
@@ -5708,7 +5742,7 @@ var File_litevirt_v1_types_proto protoreflect.FileDescriptor
 
 const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\n" +
-	"\x17litevirt/v1/types.proto\x12\vlitevirt.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1bgoogle/protobuf/empty.proto\"\x8a\r\n" +
+	"\x17litevirt/v1/types.proto\x12\vlitevirt.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1bgoogle/protobuf/empty.proto\"\xc6\r\n" +
 	"\x06VMSpec\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1d\n" +
 	"\n" +
@@ -5759,7 +5793,10 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\amax_cpu\x18( \x01(\x05R\x06maxCpu\x12&\n" +
 	"\x0fon_host_failure\x18) \x01(\tR\ronHostFailure\x12\x1b\n" +
 	"\tcpu_model\x18* \x01(\tR\bcpuModel\x12\x1b\n" +
-	"\tiso_scope\x18+ \x01(\tR\bisoScope\x1a9\n" +
+	"\tiso_scope\x18+ \x01(\tR\bisoScope\x12\x1b\n" +
+	"\tcpu_limit\x18- \x01(\x01R\bcpuLimit\x12\x1d\n" +
+	"\n" +
+	"cpu_shares\x18. \x01(\x05R\tcpuShares\x1a9\n" +
 	"\vLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b,\x10-R\fiso_identity\"\xb5\x01\n" +
@@ -5770,7 +5807,7 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\x05cache\x18\x04 \x01(\tR\x05cache\x12\x14\n" +
 	"\x05image\x18\x05 \x01(\tR\x05image\x12\x18\n" +
 	"\astorage\x18\x06 \x01(\tR\astorage\x12)\n" +
-	"\x10controller_model\x18\a \x01(\tR\x0fcontrollerModel\"\xef\x01\n" +
+	"\x10controller_model\x18\a \x01(\tR\x0fcontrollerModel\"\x8f\x02\n" +
 	"\x11NetworkAttachment\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x14\n" +
 	"\x05model\x18\x02 \x01(\tR\x05model\x12\x0e\n" +
@@ -5780,7 +5817,9 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\x05trunk\x18\x06 \x03(\x05R\x05trunk\x12\x12\n" +
 	"\x04ipv6\x18\a \x01(\tR\x04ipv6\x12!\n" +
 	"\fipv6_gateway\x18\b \x01(\tR\vipv6Gateway\x12'\n" +
-	"\x0fsecurity_groups\x18\t \x03(\tR\x0esecurityGroups\"m\n" +
+	"\x0fsecurity_groups\x18\t \x03(\tR\x0esecurityGroups\x12\x1e\n" +
+	"\vrate_mb_sec\x18\n" +
+	" \x01(\x01R\trateMbSec\"m\n" +
 	"\rCloudInitSpec\x12\x1a\n" +
 	"\buserdata\x18\x01 \x01(\tR\buserdata\x12\x1a\n" +
 	"\bmetadata\x18\x02 \x01(\tR\bmetadata\x12$\n" +

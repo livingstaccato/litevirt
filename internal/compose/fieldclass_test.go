@@ -56,6 +56,8 @@ var vmFieldClass = map[string]string{
 	"Restart":         "live-metadata: reconciler reads the restart policy fresh",
 	"Devices":         "restart: passthrough devices are a redefine (not reconfigurable in place yet)",
 	"Resources":       "restart: resource tuning is a redefine (not reconfigurable in place yet)",
+	"CPULimit":        "live-metadata: applied to the running domain (schedinfo) and persisted in the spec; no restart",
+	"CPUShares":       "live-metadata: applied to the running domain (schedinfo) and persisted in the spec; no restart",
 	"DependsOn":       "ignored: ordering only, not a VM spec field",
 	"Labels":          "live-metadata: applied live via SetVMLabels",
 	"IPHint":          "ignored: server-resolved IP assignment hint",

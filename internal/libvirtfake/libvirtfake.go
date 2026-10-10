@@ -216,6 +216,8 @@ type Fake struct {
 	// FailSetVCPUs / FailSetMemory inject a resize primitive failure so scenarios
 	// can exercise partial-apply recovery (e.g. cpu ok, mem fails).
 	FailSetVCPUs        func(name string, count int) error
+	FailSetCPUTune      func(name string, limit float64, shares, vcpus int) error
+	FailSetNICRate      func(name, mac string, rateMBps float64) error
 	FailSetMemory       func(name string, memMiB int) error
 	FailMigrateToTarget func(name, dconnuri string) error
 	FailBlockPull       func(domain, disk string) error
@@ -1632,6 +1634,67 @@ func (f *Fake) SetVCPUs(name string, count int) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record("set-vcpus", name, fmt.Sprintf("%d", count))
+	return nil
+}
+
+// SetCPUTune models the libvirt scheduler-parameter write: it patches the
+// persistent XML and, for a running domain with a live override, the live XML,
+// exactly as the real primitive's config-then-live apply does.
+func (f *Fake) SetCPUTune(name string, limit float64, shares, vcpus int) error {
+	if f.FailSetCPUTune != nil {
+		if err := f.FailSetCPUTune(name, limit, shares, vcpus); err != nil {
+			return err
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.domains[name]; !ok {
+		return fmt.Errorf("libvirtfake: domain %q not found", name)
+	}
+	patch := func(x string) string {
+		out, err := libvirt.PatchInactiveCPUTune(x, limit, shares, vcpus)
+		if err != nil {
+			return x
+		}
+		return out
+	}
+	if x, ok := f.xml[name]; ok {
+		f.xml[name] = patch(x)
+	}
+	if x, ok := f.activeXML[name]; ok {
+		f.activeXML[name] = patch(x)
+	}
+	f.record("set-cputune", name, fmt.Sprintf("limit=%g shares=%d vcpus=%d", limit, shares, vcpus))
+	return nil
+}
+
+// SetNICRate models the libvirt interface-parameter write (see SetCPUTune).
+func (f *Fake) SetNICRate(name, mac string, rateMBps float64) error {
+	if f.FailSetNICRate != nil {
+		if err := f.FailSetNICRate(name, mac, rateMBps); err != nil {
+			return err
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.domains[name]; !ok {
+		return fmt.Errorf("libvirtfake: domain %q not found", name)
+	}
+	found := false
+	if x, ok := f.xml[name]; ok {
+		if out, hit := libvirt.PatchInterfaceBandwidth(x, mac, rateMBps); hit {
+			f.xml[name], found = out, true
+		}
+	}
+	if x, ok := f.activeXML[name]; ok {
+		if out, hit := libvirt.PatchInterfaceBandwidth(x, mac, rateMBps); hit {
+			f.activeXML[name], found = out, true
+		}
+	}
+	if !found {
+		return fmt.Errorf("libvirtfake: domain %q has no interface %s", name, mac)
+	}
+	f.record("set-nic-rate", name, fmt.Sprintf("%s=%g", mac, rateMBps))
 	return nil
 }
 

@@ -498,11 +498,18 @@ message UpdateVMRequest    { string name = 1; int32 cpu = 2;
     optional int32 max_cpu         = 20;  // set the vCPU hotplug ceiling (live_resize; latched)
     optional bool  allow_restart   = 21;  // permit a stop→redefine→start for a change that can't apply live
     string         cpu_model       = 23;  // CPU model for --cpu-mode custom; empty for any other mode
+    // Noisy-neighbour limits: applied LIVE (config + running domain), no restart.
+    optional double cpu_limit      = 24;  // cap in host cores; 0 clears the cap
+    optional int32  cpu_shares     = 25;  // relative CPU weight; 0 restores the default
+    repeated NICRateUpdate nic_rate = 26; // per-NIC bandwidth caps
 
     // allow_overcommit skips HOST capacity admission for a --restart-if-needed
     // reconfigure that GROWS the VM (project quota still applies). Audited.
     bool allow_overcommit = 22;
 }
+// NICRateUpdate sets (or, at 0, clears) one NIC's bandwidth cap in MB/s. The NIC
+// is named by its 0-based position in the VM's interface list.
+message NICRateUpdate { int32 ordinal = 1; double rate_mb_sec = 2; }
 // SetVMMemory (#4) sets the running balloon target (and persists it). target_mib
 // must be within [min_memory_mib, max_memory_mib] of the VM's spec; a live VM is
 // ballooned via virtio without a redefine.

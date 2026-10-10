@@ -37,6 +37,8 @@ func baseDomainConfig(spec *pb.VMSpec, disks []lv.DiskConfig, nets []lv.NetworkC
 		Networks:     nets,
 		Hostdevs:     hostdevs,
 		Boot:         spec.Boot,
+		CPULimit:     spec.CpuLimit,
+		CPUShares:    int(spec.CpuShares),
 	}
 	if r := spec.Resources; r != nil {
 		cfg.HugePages = r.Hugepages

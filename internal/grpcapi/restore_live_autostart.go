@@ -246,7 +246,7 @@ func (s *Server) autoDefineRestoredVM(
 			return "", "", status.Errorf(codes.FailedPrecondition,
 				"network bridge %q not available on host %s: %v", bridge, s.hostName, err)
 		}
-		netCfg = append(netCfg, lv.NetworkConfig{Bridge: bridge, Model: n.Model, MAC: mac})
+		netCfg = append(netCfg, lv.NetworkConfig{Bridge: bridge, Model: n.Model, MAC: mac, RateMBps: n.RateMbSec})
 		// The groups go on the legacy row as well as the vm_nics one: a peer on
 		// an older build renders this NIC's chain from vm_interfaces alone.
 		ifaceRecords = append(ifaceRecords, corrosion.InterfaceRecord{
@@ -280,6 +280,8 @@ func (s *Server) autoDefineRestoredVM(
 		Disks:       diskCfg,
 		Networks:    netCfg,
 		Boot:        spec.Boot,
+		CPULimit:    spec.CpuLimit,
+		CPUShares:   int(spec.CpuShares),
 	}
 	// Firmware fields (G1): point the domain at the just-materialized NVRAM
 	// (name-keyed) + the fresh UUID whose swtpm dir we re-homed the state into.

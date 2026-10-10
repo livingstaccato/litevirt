@@ -3,6 +3,8 @@ package compose
 import (
 	"testing"
 
+	"google.golang.org/protobuf/proto"
+
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 )
 
@@ -336,5 +338,46 @@ func TestClassify_MachineAliasMatchesPinnedType(t *testing.T) {
 		if got := Classify(d, st, StoredDisksFromSpec(st)).Max(); got != c.want {
 			t.Errorf("machine desired=%q stored=%q: Max()=%v, want %v", c.desired, c.stored, got, c.want)
 		}
+	}
+}
+
+func TestClassify_LimitChangesAreLive(t *testing.T) {
+	stored := &pb.VMSpec{Cpu: 2, CpuLimit: 1, CpuShares: 1024,
+		Network: []*pb.NetworkAttachment{{Name: "a", RateMbSec: 5}, {Name: "b"}}}
+	same := func() *pb.VMSpec { return proto.Clone(stored).(*pb.VMSpec) }
+
+	if p := Classify(same(), stored, nil); p.Max() != ActionNoChange {
+		t.Fatalf("identical specs plan %v (%s)", p.Max(), p.Reasons())
+	}
+	d := same()
+	d.CpuLimit, d.CpuShares = 1.5, 2048
+	d.Network[1].RateMbSec = 2
+	p := Classify(d, stored, nil)
+	if p.Max() != ActionLive || len(p.RestartReasons) > 0 || len(p.RecreateReasons) > 0 {
+		t.Fatalf("limit change plans %v restart=%v recreate=%v", p.Max(), p.RestartReasons, p.RecreateReasons)
+	}
+	got := map[string]string{}
+	for _, c := range p.MetadataChanges {
+		got[c.Field] = c.Old + ">" + c.New
+	}
+	for field, want := range map[string]string{"cpu_limit": "1>1.5", "cpu_shares": "1024>2048", "nic_rate_1": "0>2"} {
+		if got[field] != want {
+			t.Errorf("%s = %q, want %q (all: %v)", field, got[field], want, got)
+		}
+	}
+	if _, ok := got["nic_rate_0"]; ok {
+		t.Error("an unchanged NIC rate was reported")
+	}
+	// Removing the key removes the cap.
+	d = same()
+	d.CpuLimit = 0
+	if p := Classify(d, stored, nil); len(p.MetadataChanges) != 1 || p.MetadataChanges[0].Field != "cpu_limit" {
+		t.Errorf("dropping cpu-limit planned %+v", p.MetadataChanges)
+	}
+	// A rate change is not a network-topology change (which would recreate).
+	d = same()
+	d.Network[0].RateMbSec = 9
+	if p := Classify(d, stored, nil); p.Max() != ActionLive {
+		t.Errorf("rate change plans %v", p.Max())
 	}
 }

@@ -152,6 +152,17 @@ message VMSpec {
     // the ISO file each host judged (grpcapi/iso_identity.go).
     reserved 44;
     reserved "iso_identity";
+
+    // cpu_limit caps the VM's total CPU time in host cores (Proxmox cpulimit):
+    // 2.5 lets the guest burn at most 2.5 cores however many vCPUs it has.
+    // 0 = unlimited. Rendered as the libvirt <cputune> period/quota (a PER-vCPU
+    // quota, so the render divides by the vCPU count). Additive; an older peer
+    // ignores it, which only means the cap is not applied there.
+    double cpu_limit = 45;
+    // cpu_shares is the VM's relative CPU weight under contention (libvirt
+    // <cputune><shares>; 1024 is the kernel default, range 2..262144).
+    // 0 = leave at the default.
+    int32  cpu_shares = 46;
 }
 
 message DiskSpec {
@@ -177,6 +188,9 @@ message NetworkAttachment {
     string          ipv6            = 7;
     string          ipv6_gateway    = 8;
     repeated string security_groups = 9;  // SG names bound to this NIC (distributed firewall)
+    // rate_mb_sec caps this NIC's bandwidth in MB/s, both directions (Proxmox
+    // rate=). Rendered as the libvirt <bandwidth> average. 0 = unlimited.
+    double          rate_mb_sec     = 10;
 }
 
 message CloudInitSpec {

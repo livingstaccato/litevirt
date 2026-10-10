@@ -57,6 +57,12 @@ type VMConfig struct {
 	CPUPinning []int // host CPU IDs to pin vCPUs to
 	IOThreads  int   // number of IO threads (0 = default)
 
+	// CPULimit caps the VM's total CPU time in host cores (Proxmox cpulimit);
+	// 0 = unlimited. CPUShares is the relative CPU weight (libvirt <shares>);
+	// 0 = leave at the default. Both render into <cputune> (see CPUTuneQuota).
+	CPULimit  float64
+	CPUShares int
+
 	// NUMA policy
 	NUMAPolicy *NUMAPolicy
 
@@ -128,6 +134,9 @@ type NetworkConfig struct {
 	MAC    string
 	VLAN   int    // 0 = untagged, 1–4094 = 802.1Q VLAN ID
 	Direct string // non-empty = macvtap direct attach to this interface (e.g. "bond0.206")
+	// RateMBps caps this NIC's bandwidth in MB/s in both directions (Proxmox
+	// rate=), rendered as <bandwidth>. 0 = unlimited.
+	RateMBps float64
 }
 
 // MachineTypeFromXML extracts the resolved <os><type machine="…"> value from a
@@ -338,6 +347,22 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 		}
 		dom.CPUTune = ct
 	}
+	// CPU limit and shares: the noisy-neighbour controls. They share <cputune>
+	// with any pinning rendered above.
+	if cfg.CPULimit > 0 || cfg.CPUShares > 0 {
+		if dom.CPUTune == nil {
+			dom.CPUTune = &cpuTune{}
+		}
+		if cfg.CPUShares > 0 {
+			sh := uint64(cfg.CPUShares)
+			dom.CPUTune.Shares = &sh
+		}
+		if cfg.CPULimit > 0 {
+			period, quota := CPUTuneQuota(cfg.CPULimit, cfg.CPU)
+			dom.CPUTune.Period = &period
+			dom.CPUTune.Quota = &quota
+		}
+	}
 
 	// NUMA tune: bind guest memory to a specific host NUMA node.
 	if cfg.NUMAPolicy != nil && cfg.NUMAPolicy.PreferredNode >= 0 {
@@ -530,6 +555,7 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 				Model:  ifaceModel{Type: model},
 			}
 		}
+		iface.Bandwidth = bandwidthElement(n.RateMBps)
 		dev.Interfaces = append(dev.Interfaces, iface)
 	}
 
@@ -790,6 +816,9 @@ type memoryBacking struct {
 
 type cpuTune struct {
 	VCPUPin []vcpuPin `xml:"vcpupin"`
+	Shares  *uint64   `xml:"shares,omitempty"`
+	Period  *uint64   `xml:"period,omitempty"`
+	Quota   *int64    `xml:"quota,omitempty"`
 }
 
 type vcpuPin struct {
@@ -979,6 +1008,8 @@ type interfaceDevice struct {
 	MAC     ifaceMAC    `xml:"mac"`
 	Source  ifaceSource `xml:"source"`
 	Model   ifaceModel  `xml:"model"`
+	// Bandwidth is the per-NIC rate cap (<bandwidth>), nil when unlimited.
+	Bandwidth *ifaceBandwidth `xml:"bandwidth,omitempty"`
 }
 
 type ifaceMAC struct {

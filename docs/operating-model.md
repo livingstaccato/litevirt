@@ -260,8 +260,11 @@ of acting — it says nothing about whether the resulting rows have replicated.
   demotion at once for the whole cluster; `--hold 1h` keeps the lease holder
   from demoting it again until the hold runs out, for a fault that is not the
   host's. The hold is a row of its own (`relay_hold/<host>`) that the lease
-  holder never writes, so its own rows cannot erase it; a host found demoted
-  under a hold is restored at once. Nothing is
+  holder never writes for a host that exists, so its own rows cannot erase it;
+  a host found demoted under a hold is restored at once. A removed host's
+  hold and demotion both end, so a host later added under the name starts
+  clean. The listing shows who set a hold to an admin, and "an operator" (with
+  the time) to anyone else; the audit log records who. Nothing is
   demoted until the `relay_health_v1` token has latched
   ([upgrades.md](upgrades.md#health-aware-relays-need-every-host-upgraded)).
 - **A peer that stops acknowledging stops pinning the log.** `mutation_log` is

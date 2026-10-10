@@ -206,12 +206,13 @@ func (r *LDAPRealm) Authenticate(ctx context.Context, creds Credentials) (*Princ
 		return nil, fmt.Errorf("%w: %v", ErrInvalidCredentials, err)
 	}
 	p := &Principal{
-		Subject:    corrosion.NormalizeUsername(username),
-		ExternalID: entryImmutableID(entry),
-		Realm:      r.Name(),
-		Email:      firstAttr(entry, r.cfg.UserMailAttr),
-		Name:       firstAttr(entry, r.cfg.UserNameAttr),
-		Groups:     groups,
+		Subject:     corrosion.NormalizeUsername(username),
+		ExternalID:  entryImmutableID(entry),
+		ExternalIDs: entryImmutableIDs(entry),
+		Realm:       r.Name(),
+		Email:       firstAttr(entry, r.cfg.UserMailAttr),
+		Name:        firstAttr(entry, r.cfg.UserNameAttr),
+		Groups:      groups,
 		Claims: map[string]string{
 			"dn": entry.DN,
 		},
@@ -308,6 +309,30 @@ func entryImmutableID(e *ldap.Entry) string {
 		return a + ":" + string(raw)
 	}
 	return "dn:" + strings.ToLower(e.DN)
+}
+
+// entryImmutableIDs is every id entryImmutableID could have returned for the
+// entry, in the same order, and its DN form last (re-review 3, m-3). An
+// account bound to any of them matches the entry: the binding was made under
+// one of them when the directory returned a different set (389 DS enabling
+// its entryUUID plugin, an ACL change), so the entry is the same entry. The
+// login handler compares the BOUND id against this list, so a DN only ever
+// matches a binding that was itself made by DN — it never stands in for an
+// immutable id.
+func entryImmutableIDs(e *ldap.Entry) []string {
+	var out []string
+	for _, a := range immutableIDAttrs {
+		raw := e.GetRawAttributeValue(a)
+		if len(raw) == 0 {
+			continue
+		}
+		if a == "objectGUID" {
+			out = append(out, a+":"+hex.EncodeToString(raw))
+			continue
+		}
+		out = append(out, a+":"+string(raw))
+	}
+	return append(out, "dn:"+strings.ToLower(e.DN))
 }
 
 // SyncGroups is a no-op — group memberships are pulled at login time.

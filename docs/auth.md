@@ -53,7 +53,7 @@ Under `auth.realms[].ldap:`. `url` and `user_base_dn` are required; prefer
 
 | Key | Purpose |
 |---|---|
-| `user_filter` | LDAP filter selecting user entries (e.g. `(objectClass=person)`). |
+| `user_filter` | LDAP filter selecting the typed user's entry; `%s` stands for the typed name, e.g. `(&(objectClass=person)(uid=%s))`. Without `user_login_attr`, the attribute `%s` is compared against is the one whose value must equal the typed name, so a filter with no `%s` — `(objectClass=person)` alone — matches no login, and one with `%s` inside a longer value (`(userPrincipalName=%s@corp.example)`) needs `user_login_attr` (see the upgrade note in docs/upgrades.md). |
 | `group_base_dn` | Subtree searched for groups. |
 | `group_filter` | LDAP filter selecting group entries. |
 | `user_login_attr` | Attribute that must hold the typed login name. When set, the entry must carry it with exactly one value, equal to the typed name ignoring ASCII case and surrounding spaces; an entry where it is missing or multi-valued is refused, with no fall-through to other attributes. Unset: some value of an attribute `user_filter` matches the typed name against (`(uid=%s)` → `uid`), or the entry DN's RDN when its attribute is one of those, must equal the typed name that way. A directory that matched the filter by a looser rule (width or accent folding, a second attribute) does not log in. |
@@ -85,7 +85,46 @@ for the typed name must return exactly one entry, or the login is refused.
 When the directory re-creates a user's entry (a new id), an admin clears the
 binding with `lv user unbind <username> <realm>` (audited as
 `user.identity_unbind`), and the next login binds to the entry it comes
-through. Deleting the account clears its bindings too.
+through; a refused login's message names that command with its arguments.
+Deleting the account clears its bindings too. For one spelling of a
+case-duplicate pair, pass the exact stored name (`lv user delete --exact
+<name>` lists them).
+
+*Every id the entry carries counts.* An LDAP account bound under one id still
+logs in when the directory starts returning another one first — 389 DS
+enabling its `entryUUID` plugin, an ACL change that exposes `entryUUID` where
+only `nsUniqueId` or the DN was readable: the binding holds when it equals
+any of the entry's `entryUUID`, `objectGUID` and `nsUniqueId`, or its DN when
+the binding itself was made by DN. A DN never stands in for an immutable id,
+so an entry deleted and re-created at the same DN is still refused. These
+attributes must be server-assigned (they are on OpenLDAP, Active Directory and
+389 DS); a schema that lets users write them would let one entry claim
+another's id. OIDC has no second id: changing the provider's issuer URL
+changes every account's id, and each account then needs `lv user unbind
+<name> oidc:<realm>` (or keep the old issuer URL).
+
+*First binder wins.* A node that has not yet received an account's binding
+(replication lag, a partition) binds the entry that logs in through it. That
+binding is added beside the first rather than replacing it: every node
+resolves the bindings the same way, and the earliest holds when every other
+was made more than 5 s (`SessionCutoffSkewMargin`) after it. A login through
+the binding that holds clears the later ones. Bindings closer together than
+that cannot be ordered by clocks, so neither holds: the account's logins
+through that realm are refused, naming `lv user unbind <name> <realm>`, until
+an admin clears them. Every conflict is audited as `auth.identity_conflict`.
+One entry bound to two accounts by two nodes is decided the same way. A
+session minted through the later binding on the lagging node, before the
+first binding reached it, is not cut by the conflict; it lives until it
+expires or an admin revokes it (`lv session revoke`, or `lv user disable`).
+
+*Bindings are per realm.* An account bound in `ldap:corp` is still reachable
+by a first login of the same name through any other external realm, which
+binds it there: the name, not the realm, is the account (as on the previous
+release, `EnsureUserShadow`). One person using two realms is legitimate, but
+two external realms whose namespaces overlap and are governed differently hand
+accounts across: a name created in the laxer directory logs in as the account
+the stricter one's user owns. Configure such realms only with disjoint
+namespaces.
 
 ## Path-based RBAC
 
@@ -526,8 +565,18 @@ the name is re-created or the admin floor reinstates it. A session or token
 is also bound to the exact stored name it was issued for: once that spelling
 is deleted, it does not authenticate as another spelling of the name that
 survives, on any path (direct, forwarded by a peer, or an open stream). The
-cut-off has one-second resolution: a token created in the same second as a
-re-create is not refused by it.
+token cut-off allows for skew the way the session one does: a token stamped up
+to 5 s after it is refused, so a namesake's token minted by a node whose clock
+runs ahead does not survive a re-create. Re-creating a name the node knows
+had an account (a deleted row, or a token issued under it) puts the token
+cut-off at the create, and `lv user token-create` for it in the next 5 s is
+refused with a retry message rather than minting a token that would never
+work; for a name new to the node, and for sessions, the cut-off is set back
+by the margin and a second, so a login or token right after `lv user create`
+works at once (even just after a delete, as before). No other lifecycle
+write moves a cut-off backwards: a re-enable, an expiry change or
+`lv user reset-admin` just after a disable, or from a node whose clock is
+behind, keeps the later cut-off, and a login in its margin is told to retry.
 
 **Where and when it holds.** Each node judges against its own replica and its
 own clock. A change takes effect on a node when its row arrives there: on the
@@ -580,10 +629,19 @@ remove one, `lv user delete --exact <name>` lists every account named like it
 — id, exact stored name, creation time, role, realm, last login seen by the
 answering node, factors and tokens — and deletes nothing; then
 `lv user delete --exact <name> --id <id>` deletes the one chosen (admin,
-audited as an exact delete). An admin that is one of such a pair cannot log
-in, so it never counts as the admin that remains when the last-admin guard
-decides. A deleted account under a variant spelling is brought back under its
-own name by a directory login, so it keeps its disable.
+audited as an exact delete). The id alone chooses: typed as either spelling,
+it deletes the account the id names. An admin that is one of such a pair
+cannot log in, so it never counts as the admin that remains when the
+last-admin guard decides — except the spelling that survives the delete being
+decided: when a pair are the cluster's only admins, deleting one spelling by
+its id is allowed, and leaves the other usable. The admin floor, on the other
+hand, counts such a pair as admins present, so it never reinstates a deleted
+admin beside them; `no_unrestricted_admin` names the pair and the command
+instead, which root runs with credentials.json moved aside. A deleted
+account under a variant spelling is brought back under its own name by a
+directory login, so it keeps its disable. Every last-admin refusal names, with
+its arguments, what the refused admin can do instead: create an admin, enable
+one or lift its expiry, or resolve a pair.
 
 **The one credential a disable cannot reach** is the distributable `lv-cli`
 client certificate: it authenticates as the cluster admin with no user behind
@@ -718,14 +776,34 @@ reach and they still need to `lv login` to act.
 credential. It runs as root on a node and gives the existing `admin` account a
 new random password, written to `/etc/litevirt/admin-password` (mode 0600). It
 never creates an admin: on a node with no live admin it refuses, because a
-joining node's credential replicates in and a deleted admin stays deleted. If
+joining node's credential replicates in and a deleted admin stays deleted.
+`--user <name>` resets another admin-role account instead (refused for an
+account whose role is not admin); the reset prints the account it reset. If
 the `admin` account is disabled or has an expiry, the reset also clears both,
 so it recovers an account locked out by `lv user disable` or `lv user expire`
 too (on a node where `login_policy_v1` has latched; elsewhere it refuses and
 changes nothing).
 
+**The admin floor reinstates an account, never its credentials.** When admins
+are deleted on two nodes at once and no admin is left, every node's floor
+brings back the most recently deleted admin's account (`user.admin_reinstated`)
+— but with no password anyone knows, every session and API token revoked
+(durable cut-offs once `login_policy_v1` has latched), its second factors and
+enrollment code cleared. That holds for an admin deleted by a release before
+the login rules too, whose delete revoked nothing: its API tokens do not come
+back. Nobody can log in as the account until root, on a node, runs
+`lv user reset-admin --user <name>`; the `no_unrestricted_admin` condition
+names the account and the command until then. An external (LDAP or OIDC)
+admin stays external: it gets no local password, the directory bindings its
+delete cleared are restored, and it logs in through its realm as before (an
+admin deleted by an earlier release had no binding, and binds at its next
+login). Its old sessions, API tokens and second factors do not come back
+either. A previous-release host still
+runs the old floor, which restores the old password: finish the roll before
+deleting admins.
+
 Every reset is audited as `user.reset-admin`, attributed to `root@<host>`, with
-target `admin` and a detail of `via=<channel> os_user=<who>`. `os_user` is
+the reset account as target and a detail of `via=<channel> os_user=<who>`. `os_user` is
 `SUDO_USER` when set, otherwise the login name. The CLI reports it and the daemon
 records it as a claim, not as an authenticated identity. No password and no hash
 is ever written to the row. The CLI mints the password, keeps it, and sends only

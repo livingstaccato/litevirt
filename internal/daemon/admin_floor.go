@@ -2,7 +2,9 @@ package daemon
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -42,15 +44,16 @@ func (d *Daemon) checkAdminFloor(ctx context.Context, settle time.Duration) {
 	if who == "" {
 		return
 	}
+	note := corrosion.AdminReinstatementNote(ctx, d.db, who)
 	slog.Warn("the cluster had no live admin account (admins deleted at once on different "+
-		"nodes); the most recently deleted admin was reinstated", "reinstated", who)
+		"nodes); the most recently deleted admin was "+note, "reinstated", who)
 	if err := corrosion.InsertAuditLog(ctx, d.db, corrosion.AuditRecord{
 		ID:       randid.New(),
 		Username: "system",
 		HostName: d.cfg.HostName,
 		Action:   "user.admin_reinstated",
 		Target:   who,
-		Detail:   "no live admin remained after concurrent deletes",
+		Detail:   "no live admin remained after concurrent deletes; " + note,
 		Result:   "ok",
 	}); err != nil {
 		slog.Warn("audit log insert failed", "action", "user.admin_reinstated", "error", err)
@@ -61,30 +64,46 @@ func (d *Daemon) checkAdminFloor(ctx context.Context, settle time.Duration) {
 const (
 	adminFloorEvaluator = "auth"
 	// CondNoUnrestrictedAdmin is raised by each node while its replica holds no
-	// live admin account that is enabled and unexpired, and the floor had no
-	// usable deleted admin to bring back. The floor never re-enables a
-	// disabled admin itself — that would undo a deliberate disable of a
-	// compromised account (t1-auth-review I4) — so this names the recovery
-	// paths instead.
+	// admin account anyone can log in as: none enabled and unexpired (and the
+	// floor had no usable deleted admin to bring back), or only a
+	// case-duplicate pair, or only an account the floor reinstated that has no
+	// credential yet. The floor never re-enables a disabled admin itself —
+	// that would undo a deliberate disable of a compromised account
+	// (t1-auth-review I4) — so this names the recovery paths instead.
 	CondNoUnrestrictedAdmin = "no_unrestricted_admin"
 )
 
 // reportUsableAdmin raises or resolves no_unrestricted_admin about this node's
-// replica.
+// replica. It is raised while no admin can actually log in, and its evidence
+// names, for each admin root can bring back, the command that does it
+// (re-review 3, I1a): a case-duplicate admin pair, which the floor counts as
+// present rather than reinstate a deleted account beside it, and an account
+// the floor reinstated without its old password.
 func (d *Daemon) reportUsableAdmin(ctx context.Context) {
-	usable, err := corrosion.UsableAdminExists(ctx, d.db)
+	rep, err := corrosion.AdminLoginState(ctx, d.db)
 	if err != nil {
 		slog.Warn("admin floor: could not check for a usable admin", "error", err)
 		return
 	}
-	if ok, _ := d.db.ReplicaCaughtUp(); !ok && !usable {
+	if ok, _ := d.db.ReplicaCaughtUp(); !ok && !rep.Loggable {
 		return // cannot tell "none" from "none yet"
 	}
-	if !usable {
-		slog.Error("no admin account can log in: every live admin is disabled or expired. Recover as " +
-			"root on a node: `lv user reset-admin` re-enables the admin account, or `sudo lv user enable <admin>` " +
-			"with credentials.json moved aside")
+	recovery := []string{}
+	for _, name := range rep.AwaitingCredential {
+		recovery = append(recovery, fmt.Sprintf("as root on a node: lv user reset-admin --user %s "+
+			"(the admin floor reinstated %s without its old password)", name, name))
 	}
-	d.writeSelfConditionAs(ctx, adminFloorEvaluator, CondNoUnrestrictedAdmin, !usable, corrosion.SeverityCritical,
-		map[string]any{"recovery": "lv user reset-admin; or as root: lv user enable <admin>, lv user expire <admin> never"})
+	for _, norm := range rep.Ambiguous {
+		recovery = append(recovery, fmt.Sprintf("as root on a node, with credentials.json moved aside: "+
+			"lv user delete --exact %s (lists the duplicate admin accounts and their ids), then "+
+			"lv user delete --exact %s --id <ID> for the one to remove", norm, norm))
+	}
+	if len(recovery) == 0 {
+		recovery = append(recovery, "lv user reset-admin; or as root: lv user enable <admin>, lv user expire <admin> never")
+	}
+	if !rep.Loggable {
+		slog.Error("no admin account can log in. Recover as root on a node: " + strings.Join(recovery, "; or "))
+	}
+	d.writeSelfConditionAs(ctx, adminFloorEvaluator, CondNoUnrestrictedAdmin, !rep.Loggable, corrosion.SeverityCritical,
+		map[string]any{"recovery": strings.Join(recovery, "; or ")})
 }

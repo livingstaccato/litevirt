@@ -178,8 +178,11 @@ func (l UserLifecycle) SessionPredates(createdAt string) bool {
 }
 
 // TokenPredates reports whether an API token created at createdAt is from
-// before the account's last delete or re-create. Unparseable on either side
-// predates: it fails closed.
+// before the account's last delete or re-create, within
+// SessionCutoffSkewMargin as sessions are (re-review 3, m-6): a namesake's
+// token stamped by a node whose clock runs ahead must not read as made after
+// the cut-off. CreateToken refuses inside the margin, so no token is minted
+// that this refuses. Unparseable on either side predates: it fails closed.
 func (l UserLifecycle) TokenPredates(createdAt string) bool {
 	if l.TokensNotBefore == "" {
 		return false
@@ -192,7 +195,32 @@ func (l UserLifecycle) TokenPredates(createdAt string) bool {
 	if err != nil {
 		return true
 	}
-	return ca.Before(nb)
+	return ca.Before(nb.Add(SessionCutoffSkewMargin))
+}
+
+// laterCutoff is the cut-off a lifecycle write stores: proposed, unless the
+// stored one is later (re-review 3, m-5). A cut-off never moves backwards — a
+// write from a node whose clock is behind, or a reset-admin's set-back cut-off
+// right after a disable, would otherwise revive sessions minted between the
+// two. A stored value that does not parse is replaced: it predates everything
+// already, and the write is what repairs it.
+func laterCutoff(stored, proposed string) string {
+	st, err := time.Parse(time.RFC3339, stored)
+	if err != nil {
+		return proposed
+	}
+	pr, err := time.Parse(time.RFC3339, proposed)
+	if err != nil || st.After(pr) {
+		return stored
+	}
+	return proposed
+}
+
+// setBackCutoff is a cut-off set back by the skew margin and a second, so a
+// login or token made right after the write that stores it still works, while
+// everything minted before the change — at least a second before it — is cut.
+func setBackCutoff() string {
+	return time.Now().Add(-SessionCutoffSkewMargin - time.Second).UTC().Format(time.RFC3339)
 }
 
 // Unrestricted reports whether the account is enabled and has no expiry —
@@ -295,6 +323,10 @@ func SetUserLifecycle(ctx context.Context, c *Client, username string, disabled 
 	if !c.MayWriteLoginPolicy() {
 		return ErrLoginPolicyGateClosed
 	}
+	cur, err := GetUserLifecycle(ctx, c, username)
+	if err != nil {
+		return fmt.Errorf("read the account's lifecycle: %w", err)
+	}
 	now := c.NowTS()
 	var stmts []Statement
 	// EVERY change is a session cut-off (rereview m-a): a disable or an
@@ -303,7 +335,7 @@ func SetUserLifecycle(ctx context.Context, c *Client, username string, disabled 
 	// disable had not reached yet, or before an expiry that has since passed —
 	// is honoured afterwards.
 	stmts = append(stmts, Statement{SQL: userLifecycleUpsertSQL,
-		Params: []interface{}{username, UserAttrSessionsNotBefore, nowRFC3339(), setBy, now}})
+		Params: []interface{}{username, UserAttrSessionsNotBefore, laterCutoff(cur.SessionsNotBefore, nowRFC3339()), setBy, now}})
 	if disabled != nil && *disabled {
 		// A disable also voids an outstanding first-enrollment code (N3).
 		stmts = append(stmts, invalidateEnrollmentCodeStatement(username, now))
@@ -355,19 +387,44 @@ func ResetUserLifecycle(ctx context.Context, c *Client, username, setBy string) 
 		}
 		return nil
 	}
+	cur, err := GetUserLifecycle(ctx, c, username)
+	if err != nil {
+		return err
+	}
+	// Did this name have an account before, as far as this node knows: a
+	// deleted row, or an API token issued under it?
+	prior, err := c.Query(ctx,
+		`SELECT 1 FROM users WHERE username = ? AND deleted_at IS NOT NULL
+		 UNION ALL SELECT 1 FROM tokens WHERE username = ? LIMIT 1`, username, username)
+	if err != nil {
+		return err
+	}
 	now := c.NowTS()
 	stmts := enableUserStatements(c, username, setBy, now)
-	// The cut-off is set back by the skew margin: the namesake's sessions all
-	// predate its deletion, which predates this, while a login made right
-	// after the create must work at once.
-	cutoff := time.Now().Add(-SessionCutoffSkewMargin - time.Second).UTC().Format(time.RFC3339)
+	// The session cut-off is set back by the skew margin: the namesake's
+	// sessions all predate its deletion, which predates this, while a login
+	// made right after the create must work at once — also right after a
+	// delete, as on the previous release. That is why this one write may move
+	// the cut-off back (by at most the margin): the delete revoked every
+	// session this node holds in its own batch, and the set-back cut-off still
+	// refuses the namesake's sessions up to a second before the create.
 	stmts = append(stmts, Statement{SQL: userLifecycleUpsertSQL,
-		Params: []interface{}{username, UserAttrSessionsNotBefore, cutoff, setBy, now}})
+		Params: []interface{}{username, UserAttrSessionsNotBefore, setBackCutoff(), setBy, now}})
 	// A re-created name starts with no outstanding enrollment code (N3), and
-	// no token of the namesake (m-4).
+	// no token of the namesake (m-4). TokenPredates applies the skew margin
+	// (re-review 3, m-6). For a name this node knows had an account, the
+	// token cut-off is now — so a namesake's token stamped up to 5 s later by
+	// a clock running ahead is refused — and CreateToken refuses to mint a
+	// token inside that margin rather than hand out one that never works. For
+	// a name new to this node it is set back like the session one, so the
+	// usual create-then-token-create works at once.
+	tokenCut := setBackCutoff()
+	if len(prior) > 0 {
+		tokenCut = nowRFC3339()
+	}
 	stmts = append(stmts, invalidateEnrollmentCodeStatement(username, now))
 	stmts = append(stmts, Statement{SQL: userLifecycleUpsertSQL,
-		Params: []interface{}{username, UserAttrTokensNotBefore, nowRFC3339(), setBy, now}})
+		Params: []interface{}{username, UserAttrTokensNotBefore, laterCutoff(cur.TokensNotBefore, tokenCut), setBy, now}})
 	return c.ExecuteBatch(ctx, stmts)
 }
 
@@ -378,14 +435,22 @@ func ResetUserLifecycle(ctx context.Context, c *Client, username, setBy string) 
 // answer.
 //
 // An admin that is one of two accounts normalizing alike does not count:
-// every lookup of it is refused, so it cannot log in (rereview-2 m-7).
-func OtherUnrestrictedAdminExists(ctx context.Context, c *Client, username string) (bool, error) {
+// every lookup of it is refused, so it cannot log in (rereview-2 m-7). The
+// ambiguity is judged as it will be after the change (re-review 3, I1b): when
+// deleting, username's own row is left out, so deleting one spelling of a pair
+// counts the spelling that survives it. A disable or expiry leaves the row,
+// and the pair, in place.
+func OtherUnrestrictedAdminExists(ctx context.Context, c *Client, username string, deleting bool) (bool, error) {
 	rows, err := c.Query(ctx,
 		`SELECT username FROM users WHERE role = 'admin' AND deleted_at IS NULL AND username != ?`, username)
 	if err != nil {
 		return false, err
 	}
-	amb, err := ambiguousNames(ctx, c)
+	exclude := ""
+	if deleting {
+		exclude = username
+	}
+	amb, err := ambiguousNames(ctx, c, exclude)
 	if err != nil {
 		return false, err
 	}
@@ -414,21 +479,21 @@ func usableAdmin(ctx context.Context, c *Client, username string) (bool, error) 
 	return l.InactiveReason(time.Now().UTC()) == "", nil
 }
 
-// UsableAdminExists reports whether some live admin-role account can log in
-// now. The admin floor raises no_unrestricted_admin while it cannot.
+// UsableAdminExists reports whether some live admin-role account is enabled
+// and unexpired: what the admin floor counts. Reinstating a deleted admin is
+// the floor's answer to there being NONE.
+//
+// An admin that is one of a case-duplicate pair counts (re-review 3, I1a).
+// Neither spelling can log in while both are live, but each is reachable by
+// `lv user delete --exact` and its id, which root resolves; reinstating a
+// deliberately deleted admin beside them would be the worse repair. The
+// no_unrestricted_admin condition still names the pair (AdminLoginState).
 func UsableAdminExists(ctx context.Context, c *Client) (bool, error) {
 	rows, err := c.Query(ctx, `SELECT username FROM users WHERE role = 'admin' AND deleted_at IS NULL`)
 	if err != nil {
 		return false, err
 	}
-	amb, err := ambiguousNames(ctx, c)
-	if err != nil {
-		return false, err
-	}
 	for _, r := range rows {
-		if amb[NormalizeUsername(r.String("username"))] {
-			continue // refused at every login (m-7)
-		}
 		ok, err := usableAdmin(ctx, c, r.String("username"))
 		if err != nil {
 			return false, err
@@ -440,15 +505,78 @@ func UsableAdminExists(ctx context.Context, c *Client) (bool, error) {
 	return false, nil
 }
 
+// AdminLoginReport is what the no_unrestricted_admin condition says about the
+// cluster's admin accounts.
+type AdminLoginReport struct {
+	// Loggable: some admin is enabled, unexpired, unambiguous and has a
+	// credential. The condition is raised while this is false.
+	Loggable bool
+	// Ambiguous lists, by normalized name, the duplicate pairs of usable
+	// admins: neither spelling logs in until root deletes one by its id.
+	Ambiguous []string
+	// AwaitingCredential lists usable admins the admin floor reinstated
+	// without their old password: none logs in until root runs
+	// `lv user reset-admin --user <name>`.
+	AwaitingCredential []string
+}
+
+// AdminLoginState reports whether some admin can actually log in now, and,
+// when none can, the admins root can recover with a command. It is the
+// no_unrestricted_admin condition's question; the floor's is
+// UsableAdminExists, which counts the pairs and the reinstated accounts as
+// present so that it does not resurrect another account beside them.
+func AdminLoginState(ctx context.Context, c *Client) (AdminLoginReport, error) {
+	var rep AdminLoginReport
+	rows, err := c.Query(ctx,
+		`SELECT u.username, u.password_hash, c.username AS cred_key, c.password_hash AS cred_val
+		 FROM users u LEFT JOIN user_credentials c ON c.username = u.username AND c.deleted_at IS NULL
+		 WHERE u.role = 'admin' AND u.deleted_at IS NULL ORDER BY u.username`)
+	if err != nil {
+		return rep, err
+	}
+	amb, err := ambiguousNames(ctx, c, "")
+	if err != nil {
+		return rep, err
+	}
+	seenPair := map[string]bool{}
+	for _, r := range rows {
+		name := r.String("username")
+		ok, err := usableAdmin(ctx, c, name)
+		if err != nil {
+			return rep, err
+		}
+		if !ok {
+			continue
+		}
+		hash := resolveCredential(r.String("cred_key") != "", r.String("cred_val"), r.String("password_hash"))
+		switch norm := NormalizeUsername(name); {
+		case amb[norm]:
+			if !seenPair[norm] {
+				seenPair[norm] = true
+				rep.Ambiguous = append(rep.Ambiguous, norm)
+			}
+		case hash == ReinstatedAdminPasswordHash:
+			rep.AwaitingCredential = append(rep.AwaitingCredential, name)
+		default:
+			rep.Loggable = true
+		}
+	}
+	return rep, nil
+}
+
 // ambiguousNames is the set of normalized names two or more live accounts
-// share.
-func ambiguousNames(ctx context.Context, c *Client) (map[string]bool, error) {
+// share, leaving out the account stored exactly as exclude ("" leaves out
+// none).
+func ambiguousNames(ctx context.Context, c *Client, exclude string) (map[string]bool, error) {
 	rows, err := c.Query(ctx, `SELECT username FROM users WHERE deleted_at IS NULL`)
 	if err != nil {
 		return nil, err
 	}
 	seen := map[string]int{}
 	for _, r := range rows {
+		if exclude != "" && r.String("username") == exclude {
+			continue
+		}
 		seen[NormalizeUsername(r.String("username"))]++
 	}
 	out := map[string]bool{}

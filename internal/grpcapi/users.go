@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"slices"
 	"strings"
 	"time"
 
@@ -105,21 +106,27 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 
 	// One directory entry is one account (rereview-2 N5): an id already bound
 	// to another account of this realm does not log in as this one. Checked
-	// before the shadow, so a refused login creates no account.
+	// before the shadow, so a refused login creates no account. Every id the
+	// entry carries is checked (re-review 3, m-3), and the owner of an id
+	// bound to two accounts by two nodes is the first binding (m-1).
 	bindID := ""
 	if realmName != "local" && principal.ExternalID != "" {
 		bindID = principal.ExternalID
-		bound, berr := corrosion.AccountsBoundTo(ctx, s.db, realmName, bindID)
-		if berr != nil {
-			s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" identity binding unreadable", "denied")
-			return nil, status.Errorf(codes.Unavailable, "read the directory identity binding: %v", berr)
-		}
-		for _, other := range bound {
-			if corrosion.NormalizeUsername(other) != corrosion.NormalizeUsername(principal.Subject) {
+		for _, id := range entryIDs(principal) {
+			own, berr := corrosion.IdentityOwner(ctx, s.db, realmName, id)
+			if berr != nil {
+				s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" identity binding unreadable", "denied")
+				return nil, status.Errorf(codes.Unavailable, "read the directory identity binding: %v", berr)
+			}
+			if own.Contested() {
+				s.auditBindingConflict(ctx, principal.Subject, realmName, "directory id "+id+" bound to accounts", own)
+			}
+			if other := otherOwner(own, principal.Subject); other != "" {
 				s.audit(ctx, "auth.identity_mismatch", principal.Subject,
-					"realm="+realmName+" directory id "+bindID+" is bound to the account "+other, "denied")
+					"realm="+realmName+" directory id "+id+" is bound to the account "+other, "denied")
 				return nil, status.Errorf(codes.PermissionDenied,
-					"this directory entry is bound to another account; an administrator can clear the binding (lv user unbind)")
+					"this directory entry is bound to the account %q; an administrator can clear that binding: "+
+						"lv user unbind %s %s", other, other, realmName)
 			}
 		}
 	}
@@ -155,21 +162,43 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 	// The account is bound to the directory entry that first logged in to it
 	// after the upgrade (rereview-2 N5): another entry answering to the same
 	// name is refused, and audited, whatever its credentials.
+	//
+	// Bindings are first-binder-wins (re-review 3, m-1): a later binding a
+	// lagging node made beside the first never displaces it, two too close
+	// for clocks to order refuse every login until an administrator unbinds,
+	// and both are audited. The binding holds when it is ANY immutable id the
+	// entry carries (m-3), so a directory that starts returning a stronger id
+	// first does not lock the account out; a DN never stands in for one.
 	boundID := ""
+	var losingBindings []corrosion.IdentityBinding
 	if bindID != "" {
-		got, berr := corrosion.GetIdentityBinding(ctx, s.db, principal.Subject, realmName)
+		res, berr := corrosion.ResolveIdentityBinding(ctx, s.db, principal.Subject, realmName)
 		if berr != nil {
 			s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" identity binding unreadable", "denied")
 			return nil, status.Errorf(codes.Unavailable, "read the directory identity binding: %v", berr)
 		}
-		if got != "" && got != bindID {
+		if res.Contested() {
+			s.auditBindingConflict(ctx, principal.Subject, realmName, "account bound to directory ids", res)
+		}
+		if res.Conflict {
+			return nil, status.Errorf(codes.PermissionDenied,
+				"the account %q is bound to %d directory entries at once, and none was bound first; an "+
+					"administrator must clear the bindings: lv user unbind %s %s",
+				principal.Subject, len(res.All), principal.Subject, realmName)
+		}
+		got := res.Winner.ExternalID
+		if got != "" && !slices.Contains(entryIDs(principal), got) {
 			s.audit(ctx, "auth.identity_mismatch", principal.Subject,
 				"realm="+realmName+" bound to "+got+", login through "+bindID, "denied")
 			return nil, status.Errorf(codes.PermissionDenied,
-				"the account %q is bound to another directory entry; an administrator can clear the binding (lv user unbind)",
-				principal.Subject)
+				"the account %q is bound to another directory entry; if the directory re-created this user's "+
+					"entry, an administrator can clear the binding: lv user unbind %s %s",
+				principal.Subject, principal.Subject, realmName)
 		}
 		boundID = got
+		if res.Contested() {
+			losingBindings = res.All[1:]
+		}
 	}
 
 	// A login inside the skew margin after a lifecycle change would be
@@ -225,6 +254,19 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 	// the entry that just name-matched and proved its credentials. Before
 	// login_policy_v1 latches nothing is written and the login proceeds
 	// unbound, as on main.
+	// A login through the binding that won a conflict proves that entry once
+	// more; the losing bindings beside it are cleared, so the conflict is
+	// audited once rather than at every login, and an unbind is never needed
+	// to settle a conflict the rule already decided.
+	if len(losingBindings) > 0 {
+		if err := corrosion.ClearIdentityBindingRows(ctx, s.db, losingBindings); err == nil {
+			s.audit(ctx, "auth.identity_conflict", principal.Subject,
+				"realm="+realmName+" cleared the later bindings "+strings.Join(corrosion.IdentityResolution{All: losingBindings}.IDs(), ",")+
+					" after a login through the first, "+boundID, "ok")
+		} else if !errors.Is(err, corrosion.ErrLoginPolicyGateClosed) {
+			slog.Warn("could not clear the losing directory bindings", "user", principal.Subject, "realm", realmName, "error", err)
+		}
+	}
 	if bindID != "" && boundID == "" {
 		switch berr := corrosion.BindIdentity(ctx, s.db, principal.Subject, realmName, bindID); {
 		case berr == nil:
@@ -233,7 +275,9 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 		case errors.Is(berr, corrosion.ErrIdentityBindingConflict):
 			s.audit(ctx, "auth.identity_mismatch", principal.Subject,
 				"realm="+realmName+" directory id "+bindID+" is bound to another account", "denied")
-			return nil, status.Error(codes.PermissionDenied, "this directory entry is bound to another account")
+			return nil, status.Errorf(codes.PermissionDenied,
+				"this directory entry is bound to another account; `lv user unbind <account> %s` clears that "+
+					"binding (an administrator)", realmName)
 		default:
 			return nil, status.Errorf(codes.Unavailable, "record the directory identity binding: %v", berr)
 		}
@@ -267,6 +311,93 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 		ExpiresAt:              expiresAt,
 		Requires_2FaEnrollment: enrollOnly,
 	}, nil
+}
+
+// lastAdminRefusal is the message of a last-admin refusal. Every way out it
+// names is one the refused caller — a logged-in admin — can take, with its
+// arguments (re-review 3, I1b): create another admin, enable or un-expire a
+// restricted one, or resolve a case-duplicate admin pair, which counts as no
+// admin until one spelling is deleted by its id.
+func lastAdminRefusal(ctx context.Context, db *corrosion.Client, username, why string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "user %q is the cluster's last admin account that is enabled with no expiry, and %s. "+
+		"First make another admin usable: create one (`lv user create <username> --role admin`)", username, why)
+	users, err := corrosion.ListUsers(ctx, db)
+	if err == nil {
+		lifes, _ := corrosion.ListUserLifecycles(ctx, db)
+		seen := map[string]int{}
+		for _, u := range users {
+			seen[corrosion.NormalizeUsername(u.Username)]++
+		}
+		pairs := map[string]bool{}
+		for _, u := range users {
+			if u.Role != "admin" || u.Username == username {
+				continue
+			}
+			norm := corrosion.NormalizeUsername(u.Username)
+			switch l := lifes[u.Username]; {
+			case seen[norm] > 1 && !pairs[norm]:
+				pairs[norm] = true
+				fmt.Fprintf(&b, "; or resolve the duplicate admin accounts named like %q, which cannot log in "+
+					"while both exist (`lv user delete --exact %s` lists them, then `lv user delete --exact %s --id <ID>`)",
+					u.Username, norm, norm)
+			case seen[norm] > 1:
+			case l.Disabled:
+				fmt.Fprintf(&b, "; or enable %s (`lv user enable %s`)", u.Username, u.Username)
+			case l.ExpiresAt != "":
+				fmt.Fprintf(&b, "; or lift %s's expiry (`lv user expire %s never`)", u.Username, u.Username)
+			}
+		}
+	}
+	return b.String()
+}
+
+// entryIDs is every immutable id the principal's entry carries, its primary
+// ExternalID first.
+func entryIDs(p *auth.Principal) []string {
+	out := []string{p.ExternalID}
+	for _, id := range p.ExternalIDs {
+		if id != "" && !slices.Contains(out, id) {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// otherOwner is the account other than subject that owns an id by res, ""
+// when it is subject's or nobody's. A conflict between bindings of other
+// accounts makes each of them an owner subject is refused for.
+func otherOwner(res corrosion.IdentityResolution, subject string) string {
+	norm := corrosion.NormalizeUsername(subject)
+	if !res.Conflict {
+		if res.Winner.Username != "" && corrosion.NormalizeUsername(res.Winner.Username) != norm {
+			return res.Winner.Username
+		}
+		return ""
+	}
+	for _, b := range res.All {
+		if corrosion.NormalizeUsername(b.Username) != norm {
+			return b.Username
+		}
+	}
+	return ""
+}
+
+// auditBindingConflict records that a login found more than one binding where
+// one is the rule (re-review 3, m-1): a node bound an account or an entry
+// without having received the binding another node made first.
+func (s *Server) auditBindingConflict(ctx context.Context, subject, realm, what string, res corrosion.IdentityResolution) {
+	verdict := "resolved: first binding " + res.Winner.Username + "=" + res.Winner.ExternalID + " holds"
+	if res.Conflict {
+		verdict = "unresolved: no binding was first by more than the skew margin; logins refused until `lv user unbind`"
+	}
+	var parts []string
+	for _, b := range res.All {
+		parts = append(parts, b.Username+"="+b.ExternalID+"@"+b.BoundAt)
+	}
+	slog.Warn("directory identity binding conflict", "user", subject, "realm", realm, "bindings", parts, "verdict", verdict)
+	s.audit(ctx, "auth.identity_conflict", subject,
+		"realm="+realm+" "+what+" "+strings.Join(parts, ",")+"; "+verdict, "detected")
 }
 
 // mintSession creates a session row for an already-authenticated user and
@@ -573,11 +704,24 @@ func (s *Server) DeleteUser(ctx context.Context, req *pb.DeleteUserRequest) (*em
 				"an exact delete names the account by id: run `lv user delete --exact %s` without --id to list the accounts and their ids",
 				req.Username)
 		}
-		target, err = corrosion.GetUserExact(ctx, s.db, req.Username)
-		if err == nil && (target == nil || corrosion.VariantID(target.Username, target.CreatedAt) != req.GetExactId()) {
-			return nil, status.Errorf(codes.FailedPrecondition,
-				"no account %q with id %s; list them again with `lv user delete --exact %s`",
-				req.Username, req.GetExactId(), req.Username)
+		//
+		// The id alone names the account (re-review 3, m-9): it is looked up
+		// among every account named like the typed name, so typing the other
+		// spelling with the right id deletes the account the id names.
+		var vs []corrosion.UserVariant
+		vs, err = corrosion.UserVariants(ctx, s.db, req.Username)
+		if err == nil {
+			for _, v := range vs {
+				if v.ID == req.GetExactId() {
+					target, err = corrosion.GetUserExact(ctx, s.db, v.Username)
+					break
+				}
+			}
+			if err == nil && target == nil {
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"no account named like %q has id %s; list them again with `lv user delete --exact %s`",
+					req.Username, req.GetExactId(), req.Username)
+			}
 		}
 	} else {
 		target, err = corrosion.GetUser(ctx, s.db, req.Username)
@@ -589,18 +733,14 @@ func (s *Server) DeleteUser(ctx context.Context, req *pb.DeleteUserRequest) (*em
 		// Only an admin that can log in — enabled, with no expiry — counts
 		// as the one that remains (t1-auth-review I4): a disabled successor
 		// is "a live successor that cannot actually log in".
-		other, oerr := corrosion.OtherUnrestrictedAdminExists(ctx, s.db, target.Username)
+		other, oerr := corrosion.OtherUnrestrictedAdminExists(ctx, s.db, target.Username, true)
 		if oerr != nil {
 			return nil, status.Errorf(codes.Internal,
 				"check for another admin before deleting %q: %v", req.Username, oerr)
 		}
 		if !other {
-			return nil, status.Errorf(codes.FailedPrecondition,
-				"user %q is the cluster's last admin account that is enabled with no expiry; create or "+
-					"enable another admin first "+
-					"(`lv user create <username> --role admin`), or the cluster is left with no "+
-					"administrator",
-				req.Username)
+			return nil, status.Error(codes.FailedPrecondition, lastAdminRefusal(ctx, s.db, target.Username,
+				"deleting it would leave the cluster with no administrator"))
 		}
 	}
 
@@ -637,10 +777,11 @@ func (s *Server) DeleteUser(ctx context.Context, req *pb.DeleteUserRequest) (*em
 		context.WithoutCancel(ctx), s.db); rerr != nil {
 		slog.Error("could not verify an admin survived the delete", "deleted", req.Username, "error", rerr)
 	} else if reinstated != "" {
+		note := corrosion.AdminReinstatementNote(context.WithoutCancel(ctx), s.db, reinstated)
 		slog.Warn("deleting this user would have left the cluster with no administrator; "+
-			"the most recently deleted admin was reinstated",
+			"the most recently deleted admin was "+note,
 			"deleted", req.Username, "reinstated", reinstated)
-		s.audit(ctx, "user.admin_reinstated", reinstated, "", "ok")
+		s.audit(ctx, "user.admin_reinstated", reinstated, note, "ok")
 	}
 	// Drop the deleted user's bindings from the live engine immediately, in
 	// memory, for both the canonical and legacy-bare principal forms (matching
@@ -675,6 +816,17 @@ func (s *Server) CreateToken(ctx context.Context, req *pb.CreateTokenRequest) (*
 	user, err := corrosion.GetUser(ctx, s.db, req.Username)
 	if err != nil || user == nil {
 		return nil, status.Errorf(codes.NotFound, "user %q not found", req.Username)
+	}
+	// A token made inside the skew margin after the account's token cut-off (a
+	// re-create, a delete reinstated by the admin floor) would be refused by
+	// TokenPredates from its first use (re-review 3, m-6). Refuse to mint it
+	// rather than hand out a token that never works.
+	if life, lerr := corrosion.GetUserLifecycle(ctx, s.db, user.Username); lerr != nil {
+		return nil, status.Errorf(codes.Unavailable, "read the account state of %q: %v", user.Username, lerr)
+	} else if life.TokenPredates(time.Now().UTC().Format(time.RFC3339)) {
+		return nil, status.Errorf(codes.Unavailable,
+			"the account %q was re-created moments ago; create the token again in %s",
+			user.Username, corrosion.SessionCutoffSkewMargin)
 	}
 
 	// Generate a random 32-byte token

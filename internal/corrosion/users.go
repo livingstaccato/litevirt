@@ -317,7 +317,11 @@ func DeleteUserCounted(ctx context.Context, c *Client, username string) (session
 		// A deleted account's first-enrollment code goes with it (N3); its
 		// directory binding too, so a re-created name binds afresh (N5).
 		stmts = append(stmts, invalidateEnrollmentCodeStatement(username, now))
-		stmts = append(stmts, clearIdentityBindingsStatement(username, now))
+		clear, err := clearIdentityBindingsStatements(ctx, c, username, marker, now)
+		if err != nil {
+			return 0, 0, err
+		}
+		stmts = append(stmts, clear...)
 		// And the cut-offs are durable: a session or token this node never
 		// held (sessions are not anti-entropy repaired) is refused anyway
 		// once these replicate, whatever comes back under the name.
@@ -512,6 +516,19 @@ func looksLikeAPIToken(s string) bool {
 // Reinstating an account the operator deliberately deleted is the lesser
 // failure, and it is loud -- the caller logs and audits it. A cluster with no
 // admin is not recoverable through any supported path.
+//
+// What comes back is the ROW, never the account's old credentials (re-review
+// 3, I1a). The password is replaced by ReinstatedAdminPasswordHash, which no
+// password matches and which marks the account as local, so no directory
+// login adopts it either; every session and API token this node holds for it
+// is revoked and every second factor cleared; and, once login_policy_v1 has
+// latched, durable session and token cut-offs cover the ones it does not
+// hold. That matters most for an admin deleted by a build before the login
+// rules, whose delete revoked nothing: its never-expiring API tokens would
+// otherwise authenticate as cluster admin again. Root gives the account a
+// credential with `lv user reset-admin --user <name>`, which the
+// no_unrestricted_admin condition names until it does. All of it is ONE batch,
+// so the row never comes back without the revocations.
 func ReinstateAdminIfNoneRemain(ctx context.Context, c *Client) (string, error) {
 	// Counts only admins that can log in (t1-auth-review I4): a disabled or
 	// expired admin is not an administrator anyone can use.
@@ -528,7 +545,7 @@ func ReinstateAdminIfNoneRemain(ctx context.Context, c *Client) (string, error) 
 	// the floor never brings back an account an operator disabled (DeleteUser
 	// keeps the lifecycle; m3), and never re-enables a live one.
 	rows, err := c.Query(ctx,
-		`SELECT u.username, u.password_hash, u.updated_at,
+		`SELECT u.username, u.password_hash, u.updated_at, u.deleted_at,
 		        c.username AS cred_key, c.password_hash AS cred_val, c.updated_at AS cred_ts
 		 FROM users u LEFT JOIN user_credentials c ON c.username = u.username AND c.deleted_at IS NULL
 		 WHERE u.role = 'admin' AND u.deleted_at IS NOT NULL
@@ -551,25 +568,100 @@ func ReinstateAdminIfNoneRemain(ctx context.Context, c *Client) (string, error) 
 		return "", nil // nothing usable to bring back; the floor raises no_unrestricted_admin
 	}
 	victim := rows[pick].String("username")
-	hash := resolveCredential(rows[pick].String("cred_key") != "", rows[pick].String("cred_val"), rows[pick].String("password_hash"))
-	// The reactivation shape InsertUser already uses, with role and password
-	// written back unchanged. Deliberately NOT a new `SET deleted_at = NULL`
-	// statement: every replicated shape has to be in the compatibility ledger,
-	// and reusing the registered one keeps this off that ledger entirely.
-	now := c.NowTS()
-	if c.MayWriteCredentialTables() {
-		if err := c.ExecuteBatch(ctx, []Statement{
-			{SQL: usersReactivateSQL, Params: []interface{}{"admin", hash, now, victim}},
-			{SQL: userCredentialUpsertSQL, Params: []interface{}{victim, hash, now}},
-		}); err != nil {
-			return "", err
-		}
-		return victim, nil
+	// An external (LDAP/OIDC) admin has no local password — "" is what marks
+	// it, as in auth.EnsureUserShadow — and stays external.
+	external := resolveCredential(rows[pick].String("cred_key") != "", rows[pick].String("cred_val"),
+		rows[pick].String("password_hash")) == ""
+	stmts, err := reinstateAdminStatements(ctx, c, victim, external, rows[pick].String("deleted_at"))
+	if err != nil {
+		return "", err
 	}
-	if err := c.Execute(ctx, usersReactivateSQL, "admin", hash, now, victim); err != nil {
+	if err := c.ExecuteBatch(ctx, stmts); err != nil {
 		return "", err
 	}
 	return victim, nil
+}
+
+// AdminReinstatementNote says, for an account the floor just reinstated, how
+// anyone logs in as it again: the text the floor's log line and audit row
+// carry.
+func AdminReinstatementNote(ctx context.Context, c *Client, username string) string {
+	u, err := GetUser(ctx, c, username)
+	if err == nil && u != nil && u.PasswordHash == "" {
+		return "reinstated as an external (directory) admin with its directory binding; it logs in through " +
+			"its realm, and its old sessions, API tokens and second factors were not restored"
+	}
+	return "reinstated with no credential: give it one as root on a node with lv user reset-admin --user " + username
+}
+
+// ReinstatedAdminPasswordHash is the password hash of an account the admin
+// floor reinstated and root has not yet given a credential. It is not a bcrypt
+// hash, so no password matches it, and it is not "", so no directory login
+// adopts the account as an external shadow (auth.EnsureUserShadow). Root
+// replaces it with `lv user reset-admin --user <name>`.
+const ReinstatedAdminPasswordHash = "!reinstated-by-admin-floor: run lv user reset-admin --user"
+
+// reinstateAdminStatements is the floor's reinstatement of victim: the row,
+// without one credential it had (see ReinstateAdminIfNoneRemain). A local
+// admin gets ReinstatedAdminPasswordHash. An external (LDAP/OIDC) admin stays
+// external: no local password (""), so it logs in through its directory realm
+// as before, and the identity bindings its delete cleared are restored, so it
+// is still the entry it was bound to that logs in. Either way its sessions,
+// API tokens, second factors and enrollment code do not come back. Every
+// statement reuses a registered shape: the reactivation InsertUser uses, the
+// credential upsert, the per-row session and token revokes DeleteUser uses,
+// DeleteUser's second-factor clear, the binding upsert, and the lifecycle and
+// enrollment-code writes.
+func reinstateAdminStatements(ctx context.Context, c *Client, victim string, external bool, deletedAt string) ([]Statement, error) {
+	now := c.NowTS()
+	marker := nowRFC3339()
+	hash := ReinstatedAdminPasswordHash
+	if external {
+		hash = ""
+	}
+	stmts := []Statement{{SQL: usersReactivateSQL, Params: []interface{}{"admin", hash, now, victim}}}
+	if c.MayWriteCredentialTables() {
+		stmts = append(stmts, Statement{SQL: userCredentialUpsertSQL, Params: []interface{}{victim, hash, now}})
+	}
+	if external && c.MayWriteLoginPolicy() {
+		restore, err := restoreDeletedBindingsStatements(ctx, c, victim, deletedAt, now)
+		if err != nil {
+			return nil, err
+		}
+		stmts = append(stmts, restore...)
+	}
+	sessRows, err := c.Query(ctx, `SELECT id FROM sessions WHERE username = ? AND revoked_at IS NULL`, victim)
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range sessRows {
+		stmts = append(stmts, Statement{SQL: sessionRevokeSQL, Params: []interface{}{marker, r.String("id")}})
+	}
+	tokRows, err := c.Query(ctx, `SELECT id FROM tokens WHERE username = ? AND deleted_at IS NULL`, victim)
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range tokRows {
+		stmts = append(stmts, Statement{SQL: tokenRevokeSQL, Params: []interface{}{marker, now, r.String("id")}})
+	}
+	stmts = append(stmts, clearSecondFactorStatements(victim, marker, now)...)
+	if c.MayWriteLoginPolicy() {
+		life, err := GetUserLifecycle(ctx, c, victim)
+		if err != nil {
+			return nil, err
+		}
+		// Set back like a re-create's (ResetUserLifecycle), so the login root
+		// makes right after `reset-admin --user` works; never moved backwards.
+		cut := setBackCutoff()
+		stmts = append(stmts,
+			Statement{SQL: userLifecycleUpsertSQL, Params: []interface{}{victim, UserAttrSessionsNotBefore,
+				laterCutoff(life.SessionsNotBefore, cut), "admin-floor", now}},
+			Statement{SQL: userLifecycleUpsertSQL, Params: []interface{}{victim, UserAttrTokensNotBefore,
+				laterCutoff(life.TokensNotBefore, marker), "admin-floor", now}},
+			invalidateEnrollmentCodeStatement(victim, now),
+		)
+	}
+	return stmts, nil
 }
 
 // OtherLiveAdminExists reports whether the cluster still has a live admin-role

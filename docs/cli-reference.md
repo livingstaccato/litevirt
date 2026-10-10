@@ -988,7 +988,7 @@ lv user ls
 lv user delete <username>             # Revokes its sessions and API tokens in the same write
 lv user delete <username> --exact     # List the accounts named like <username> (case-duplicates) with ids; deletes nothing
 lv user delete <username> --exact --id <id>   # Delete the one chosen by id (admin, audited)
-lv user unbind <username> <realm>     # Clear an LDAP/OIDC account's directory binding; next login binds afresh (admin)
+lv user unbind <username> <realm>     # Clear an LDAP/OIDC account's directory bindings (all of them, a conflict too); next login binds afresh (admin)
 lv user passwd [username]           # Change your own password (or, as admin, another user's)
   [--old-password <p>] [--new-password <p>]   # prompts if unset; old not needed for an admin reset
 lv user token-create <username> <token-name> [--expires <RFC3339>]
@@ -997,6 +997,7 @@ lv user token-revoke <token-id>
 lv user reset-admin                # As root on a node: reset the EXISTING admin password (does not create one); audited as user.reset-admin
                                    # It also re-enables a disabled or expired admin account, and logs it out everywhere
 lv user reset-admin --clear-2fa    # Also remove the admin's second factors and print an enrollment code
+lv user reset-admin --user <name>  # Reset another admin-role account, e.g. the one the admin floor reinstated with no credential
 lv user disable <username>         # No login; sessions ended, sessions and API tokens refused (admin)
 lv user enable <username>          # Re-enable; API tokens work again, ended sessions stay ended (admin)
 lv user expire <username> <RFC3339|never>   # Stop authenticating at that instant; "never" clears it (admin)

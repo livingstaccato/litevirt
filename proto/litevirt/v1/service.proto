@@ -963,7 +963,15 @@ message ChangePasswordRequest { string username = 1; string old_password = 2; st
 // clear_two_factor also removes every second factor and recovery code of the
 // admin account (`lv user reset-admin --clear-2fa`); refused until
 // login_policy_v1 has latched here.
-message ResetAdminPasswordRequest { string password_hash = 1; string os_user = 2; bool clear_two_factor = 3; }
+// username names the admin-role account to reset (`lv user reset-admin
+// --user`); empty is "admin". It is how an operator gives an account the admin
+// floor reinstated its first credential: the floor never brings back a deleted
+// account's old password.
+message ResetAdminPasswordRequest { string password_hash = 1; string os_user = 2; bool clear_two_factor = 3; string username = 4; }
+// ResetAdminPasswordResponse names the account the daemon reset, as stored. A
+// daemon that predates the field answers with an empty name: it reset "admin"
+// whatever the request named, and the CLI says so.
+message ResetAdminPasswordResponse { string username = 1; }
 message CreateTokenRequest {
     string username = 1;
     string name     = 2;
@@ -3562,7 +3570,7 @@ service LiteVirt {
     // ResetAdminPassword replaces the local admin's password hash and records a
     // `user.reset-admin` audit row. Local root only: loopback, this host's own
     // certificate, no bearer. It resets an existing admin and never creates one.
-    rpc ResetAdminPassword(ResetAdminPasswordRequest) returns (google.protobuf.Empty);
+    rpc ResetAdminPassword(ResetAdminPasswordRequest) returns (ResetAdminPasswordResponse);
     rpc ListTwoFactors(ListTwoFactorsRequest) returns (ListTwoFactorsResponse);
     rpc EnrollTOTP(EnrollTOTPRequest)         returns (EnrollTOTPResponse);
     rpc DisableTwoFactor(DisableTwoFactorRequest) returns (google.protobuf.Empty);

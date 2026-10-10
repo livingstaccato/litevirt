@@ -834,6 +834,25 @@ an existing `Admin` (`*`) binding on a project does **not** gain the right to
 grant or revoke roles there. To see who holds delegation:
 `lv role ls --role PermissionAdmin`.
 
+**LDAP logins this release refuses.** The typed name must now literally be
+the login value of the one entry the search finds (docs/auth.md,
+`user_login_attr`). Check the realm config before the roll; these setups that
+logged in before are refused after it:
+- a `user_filter` with `%s` inside a longer value, such as
+  `(userPrincipalName=%s@corp.example)`, and no `user_login_attr`: no
+  attribute value equals the typed name. Set `user_login_attr` (for example
+  `sAMAccountName`) or match a whole attribute (`(uid=%s)`);
+- a `user_filter` with no `%s` at all (`(objectClass=person)`): every login is
+  refused. Use `(&(objectClass=person)(uid=%s))`;
+- a service account that cannot read the matched attribute (or
+  `user_login_attr`): grant it read access;
+- a typed name that differs from the stored one by more than ASCII case and
+  surrounding spaces (non-ASCII case, NFD, width or accent variants): users
+  type their name as stored.
+A search that finds two entries for one name is refused too. Each LDAP or
+OIDC account is bound to its directory entry at its first login after
+`login_policy_v1` latches.
+
 v64 also adds `session_factors` (what each session's login presented) and
 `user_enrollment_codes` (hashed first-enrollment codes), written under the
 same latch. A host below `login_policy_v1` does not enforce any of it: it

@@ -15,7 +15,9 @@ var ErrNoLiveAdmin = errors.New("no live admin account in this node's local data
 	"On a node that has joined a cluster the admin credential replicates in; " +
 	"wait for this node to converge and try again. On a brand-new cluster the " +
 	"founder's `lv host init` mints it. If the admin account was deliberately " +
-	"deleted, it stays deleted")
+	"deleted, it stays deleted; name another admin-role account with " +
+	"`lv user reset-admin --user <name>` (the one the admin floor reinstated, " +
+	"if it did)")
 
 // ResetAdminPassword replaces the local admin account's password hash. It is
 // the one write behind `lv user reset-admin`, shared by the daemon's local-root
@@ -50,13 +52,41 @@ var ErrNoLiveAdmin = errors.New("no live admin account in this node's local data
 // account re-enabled with its old password, or with a new password it still
 // cannot use.
 func ResetAdminPassword(ctx context.Context, c *Client, passwordHash string, clearTwoFactor bool) error {
-	existing, err := GetUser(ctx, c, "admin")
+	return ResetAdminPasswordFor(ctx, c, "admin", passwordHash, clearTwoFactor)
+}
+
+// ErrNotAnAdmin is ResetAdminPasswordFor's refusal of an account whose role is
+// not admin: reset-admin recovers administrators, it is not a way for root to
+// set any user's password.
+var ErrNotAnAdmin = errors.New("not an admin-role account; reset-admin resets an administrator's password only")
+
+// ResetAdminPasswordFor is ResetAdminPassword for the admin-role account named
+// username (`lv user reset-admin --user`; "" is "admin"). It is how root gives
+// an account the admin floor reinstated its first credential: the floor never
+// brings back a deleted account's old password (re-review 3, I1a).
+func ResetAdminPasswordFor(ctx context.Context, c *Client, username, passwordHash string, clearTwoFactor bool) error {
+	if username == "" {
+		username = "admin"
+	}
+	existing, err := GetUser(ctx, c, username)
+	if errors.Is(err, ErrAmbiguousUsername) {
+		return fmt.Errorf("%w. Two accounts are named like %q, and reset-admin cannot choose. As root, with "+
+			"credentials.json moved aside, run `lv user delete --exact %s` to list them with their ids, "+
+			"then `lv user delete --exact %s --id <ID>` for the one to remove, and run reset-admin again",
+			err, username, username, username)
+	}
 	if err != nil {
 		// A read that fails must not read as absence.
-		return fmt.Errorf("look up the admin account: %w", err)
+		return fmt.Errorf("look up the account %q: %w", username, err)
 	}
 	if existing == nil {
+		if username != "admin" {
+			return fmt.Errorf("%w (no live account named %q)", ErrNoLiveAdmin, username)
+		}
 		return ErrNoLiveAdmin
+	}
+	if existing.Role != "admin" {
+		return fmt.Errorf("%q is %w", existing.Username, ErrNotAnAdmin)
 	}
 	name := existing.Username
 	now := c.NowTS()
@@ -88,9 +118,9 @@ func ResetAdminPassword(ctx context.Context, c *Client, passwordHash string, cle
 			if state == "" {
 				state = "set to expire at " + life.ExpiresAt
 			}
-			return fmt.Errorf("the admin account is restricted (%s), and this node cannot clear that "+
-				"until login_policy_v1 has latched here; retry in a minute, or run `lv user enable admin` "+
-				"and `lv user expire admin never` from a node where it has", state)
+			return fmt.Errorf("the admin account %q is restricted (%s), and this node cannot clear that "+
+				"until login_policy_v1 has latched here; retry in a minute, or run `lv user enable %s` "+
+				"and `lv user expire %s never` from a node where it has", name, state, name, name)
 		}
 		stmts = append(stmts, enable...)
 		// A re-enable is a session cut-off here as in SetUserLifecycle
@@ -98,9 +128,14 @@ func ResetAdminPassword(ctx context.Context, c *Client, passwordHash string, cle
 		// had not reached — revives with it. Set back by the skew margin, as
 		// a re-create's is (ResetUserLifecycle), so the operator's login
 		// right after the reset works at once.
-		cutoff := time.Now().Add(-SessionCutoffSkewMargin - time.Second).UTC().Format(time.RFC3339)
+		//
+		// It never moves the stored cut-off backwards (re-review 3, m-5): a
+		// disable written in the last few seconds, or by a node whose clock
+		// runs ahead, keeps its later cut-off, and the operator's login waits
+		// out that margin instead.
 		stmts = append(stmts, Statement{SQL: userLifecycleUpsertSQL,
-			Params: []interface{}{name, UserAttrSessionsNotBefore, cutoff, "user.reset-admin", now}})
+			Params: []interface{}{name, UserAttrSessionsNotBefore,
+				laterCutoff(life.SessionsNotBefore, setBackCutoff()), "user.reset-admin", now}})
 	}
 	pw, err := updateUserPasswordStatements(ctx, c, name, passwordHash, now)
 	if err != nil {

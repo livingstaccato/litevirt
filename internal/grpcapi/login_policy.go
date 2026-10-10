@@ -370,16 +370,14 @@ func (s *Server) SetUserAccount(ctx context.Context, req *pb.SetUserAccountReque
 	// (the check and the write are not atomic across replicas); `lv user
 	// reset-admin` re-enables the admin account and is the recovery path.
 	if user.Role == "admin" && !next.Unrestricted() {
-		other, oerr := corrosion.OtherUnrestrictedAdminExists(ctx, s.db, user.Username)
+		other, oerr := corrosion.OtherUnrestrictedAdminExists(ctx, s.db, user.Username, false)
 		if oerr != nil {
 			return nil, status.Errorf(codes.Internal,
 				"check for another admin before restricting %q: %v", user.Username, oerr)
 		}
 		if !other {
-			return nil, status.Errorf(codes.FailedPrecondition,
-				"user %q is the cluster's last admin account that is enabled with no expiry; "+
-					"create or enable another admin first, or the cluster may be left with no "+
-					"administrator", user.Username)
+			return nil, status.Error(codes.FailedPrecondition, lastAdminRefusal(ctx, s.db, user.Username,
+				"restricting it may leave the cluster with no administrator"))
 		}
 	}
 	if err := corrosion.SetUserLifecycle(ctx, s.db, user.Username, req.Disabled, expires, callerUsername(ctx)); err != nil {
@@ -672,22 +670,31 @@ func (s *Server) ClearIdentityBinding(ctx context.Context, req *pb.ClearIdentity
 	if !s.loginPolicySettable() {
 		return nil, loginPolicyNotLatched()
 	}
+	// One spelling of a case-duplicate pair is unbound by its exact stored
+	// name (re-review 3, m-4): the normalized lookup refuses the pair.
 	name := req.GetUsername()
-	if u, err := corrosion.GetUser(ctx, s.db, name); err != nil {
+	u, err := corrosion.GetUser(ctx, s.db, name)
+	if errors.Is(err, corrosion.ErrAmbiguousUsername) {
+		u, err = corrosion.GetUserExact(ctx, s.db, name)
+		if err == nil && u == nil {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"two accounts are named like %q and neither is stored exactly so; `lv user delete --exact %s` "+
+					"lists their stored names: run lv user unbind with the one you mean", name, name)
+		}
+	}
+	if err != nil {
 		return nil, status.Errorf(codes.Internal, "look up user %q: %v", name, err)
-	} else if u != nil {
+	}
+	if u != nil {
 		name = u.Username
 	}
-	was, err := corrosion.GetIdentityBinding(ctx, s.db, name, req.GetRealm())
+	was, err := corrosion.ClearIdentityBinding(ctx, s.db, name, req.GetRealm())
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "read the identity binding: %v", err)
-	}
-	if err := corrosion.ClearIdentityBinding(ctx, s.db, name, req.GetRealm()); err != nil {
 		if errors.Is(err, corrosion.ErrLoginPolicyGateClosed) {
 			return nil, status.Error(codes.FailedPrecondition, err.Error())
 		}
 		return nil, status.Errorf(codes.Internal, "clear the identity binding: %v", err)
 	}
-	s.audit(ctx, "user.identity_unbind", name, "realm="+req.GetRealm()+" was="+was, "ok")
+	s.audit(ctx, "user.identity_unbind", name, "realm="+req.GetRealm()+" was="+strings.Join(was, ","), "ok")
 	return &emptypb.Empty{}, nil
 }

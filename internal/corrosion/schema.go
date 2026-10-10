@@ -502,9 +502,10 @@ import (
 //	     the admin-issued, single-use, short-lived first-enrollment code,
 //	     stored as a SHA-256 and bound to the node that issued it, which alone
 //	     may spend it; repaired by anti-entropy), and user_identity_bindings
-//	     ((username, realm) PK: the directory entry's immutable id an
-//	     external-realm account is bound to at its first login after the
-//	     upgrade, refused under any other). Four new tables.
+//	     ((username, realm, external_id) PK: the directory entry's immutable
+//	     id an external-realm account is bound to at its first login after the
+//	     upgrade, refused under any other; one row per id, first binder
+//	     wins). Four new tables.
 const CurrentSchemaVersion = 64
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
@@ -2938,7 +2939,9 @@ var schemaDDL = []string{
 		deleted_at TEXT
 	)`,
 	// v64 the directory identity an external-realm account is bound to; see
-	// identity_binding.go.
+	// identity_binding.go. One row per bound id, so a later binding made by a
+	// lagging node is added beside the first rather than replacing it
+	// (first binder wins, re-review 3 m-1).
 	`CREATE TABLE IF NOT EXISTS user_identity_bindings (
 		username    TEXT NOT NULL,
 		realm       TEXT NOT NULL,
@@ -2946,7 +2949,7 @@ var schemaDDL = []string{
 		bound_at    TEXT NOT NULL,
 		updated_at  TEXT NOT NULL,
 		deleted_at  TEXT,
-		PRIMARY KEY (username, realm)
+		PRIMARY KEY (username, realm, external_id)
 	)`,
 }
 
@@ -3145,7 +3148,7 @@ var tablePrimaryKeys = map[string][]string{
 	"user_lifecycle":          {"username", "attribute"},
 	"session_factors":         {"session_id"},
 	"user_enrollment_codes":   {"username"},
-	"user_identity_bindings":  {"username", "realm"},
+	"user_identity_bindings":  {"username", "realm", "external_id"},
 }
 
 // schemaMigrations contains ALTER TABLE statements for upgrading existing databases.

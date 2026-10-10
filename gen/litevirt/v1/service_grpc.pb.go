@@ -523,7 +523,7 @@ type LiteVirtClient interface {
 	// ResetAdminPassword replaces the local admin's password hash and records a
 	// `user.reset-admin` audit row. Local root only: loopback, this host's own
 	// certificate, no bearer. It resets an existing admin and never creates one.
-	ResetAdminPassword(ctx context.Context, in *ResetAdminPasswordRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	ResetAdminPassword(ctx context.Context, in *ResetAdminPasswordRequest, opts ...grpc.CallOption) (*ResetAdminPasswordResponse, error)
 	ListTwoFactors(ctx context.Context, in *ListTwoFactorsRequest, opts ...grpc.CallOption) (*ListTwoFactorsResponse, error)
 	EnrollTOTP(ctx context.Context, in *EnrollTOTPRequest, opts ...grpc.CallOption) (*EnrollTOTPResponse, error)
 	DisableTwoFactor(ctx context.Context, in *DisableTwoFactorRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
@@ -2255,9 +2255,9 @@ func (c *liteVirtClient) ChangePassword(ctx context.Context, in *ChangePasswordR
 	return out, nil
 }
 
-func (c *liteVirtClient) ResetAdminPassword(ctx context.Context, in *ResetAdminPasswordRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+func (c *liteVirtClient) ResetAdminPassword(ctx context.Context, in *ResetAdminPasswordRequest, opts ...grpc.CallOption) (*ResetAdminPasswordResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(emptypb.Empty)
+	out := new(ResetAdminPasswordResponse)
 	err := c.cc.Invoke(ctx, LiteVirt_ResetAdminPassword_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
@@ -4426,7 +4426,7 @@ type LiteVirtServer interface {
 	// ResetAdminPassword replaces the local admin's password hash and records a
 	// `user.reset-admin` audit row. Local root only: loopback, this host's own
 	// certificate, no bearer. It resets an existing admin and never creates one.
-	ResetAdminPassword(context.Context, *ResetAdminPasswordRequest) (*emptypb.Empty, error)
+	ResetAdminPassword(context.Context, *ResetAdminPasswordRequest) (*ResetAdminPasswordResponse, error)
 	ListTwoFactors(context.Context, *ListTwoFactorsRequest) (*ListTwoFactorsResponse, error)
 	EnrollTOTP(context.Context, *EnrollTOTPRequest) (*EnrollTOTPResponse, error)
 	DisableTwoFactor(context.Context, *DisableTwoFactorRequest) (*emptypb.Empty, error)
@@ -5194,7 +5194,7 @@ func (UnimplementedLiteVirtServer) CheckPermissions(context.Context, *CheckPermi
 func (UnimplementedLiteVirtServer) ChangePassword(context.Context, *ChangePasswordRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method ChangePassword not implemented")
 }
-func (UnimplementedLiteVirtServer) ResetAdminPassword(context.Context, *ResetAdminPasswordRequest) (*emptypb.Empty, error) {
+func (UnimplementedLiteVirtServer) ResetAdminPassword(context.Context, *ResetAdminPasswordRequest) (*ResetAdminPasswordResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ResetAdminPassword not implemented")
 }
 func (UnimplementedLiteVirtServer) ListTwoFactors(context.Context, *ListTwoFactorsRequest) (*ListTwoFactorsResponse, error) {

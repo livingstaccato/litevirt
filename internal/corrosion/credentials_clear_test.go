@@ -3,6 +3,8 @@ package corrosion
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -460,4 +462,122 @@ func TestCredentialsLive_TheFirstPassJudgesBeforeItsOwnClears(t *testing.T) {
 	if got := oneString(t, c, `SELECT password_hash FROM users WHERE username = 'local'`, "password_hash"); got != "" {
 		t.Errorf("the local account was not cleared (%q)", got)
 	}
+}
+
+// TestCredentialsLive_EvidenceIsPerUserAndBoundToTheRow (re-review 2, N1): the
+// baseline names users, bound to their row's created_at. A local account that
+// held a password at first start — and is cleared later — never matches it,
+// so a node that started holding rows does not take a cleared local account
+// for an external user; and a name deleted and created again does not match.
+func TestCredentialsLive_EvidenceIsPerUserAndBoundToTheRow(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	for _, q := range []string{
+		`INSERT INTO users (username, role, password_hash, created_at, updated_at) VALUES ('admin', 'admin', '$2a$10$stale', '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z')`,
+		`INSERT INTO users (username, role, password_hash, created_at, updated_at) VALUES ('ext', 'viewer', '', '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z')`,
+	} {
+		if err := c.execLocal(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := c.NoteCredentialsBaseline(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// Anti-entropy brings the cleared admin row; its credential lags.
+	if err := c.execLocal(ctx, `UPDATE users SET password_hash = '', updated_at = '2026-06-01T00:00:00Z' WHERE username = 'admin'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, known, err := UserLocalCredential(ctx, c, "admin"); err != nil || known {
+		t.Errorf("admin: known=%v err=%v; a local account cleared since the baseline read as external", known, err)
+	}
+	if local, known, _ := UserLocalCredential(ctx, c, "ext"); !known || local {
+		t.Errorf("ext: local=%v known=%v; the baseline's own external user", local, known)
+	}
+	// ext deleted and created again elsewhere: a new incarnation.
+	if err := c.execLocal(ctx, `UPDATE users SET created_at = '2026-07-01T00:00:00Z' WHERE username = 'ext'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, known, _ := UserLocalCredential(ctx, c, "ext"); known {
+		t.Error("a re-created ext matched the baseline of the user it replaced")
+	}
+	c.SetCredentialsSplitGate(func() bool { return true })
+	if _, err := c.SplitCredentials(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := tableCount(t, c, "user_credentials"); n != 0 {
+		t.Errorf("the first pass wrote %d floor rows; admin and the re-created ext have no evidence", n)
+	}
+}
+
+// TestCredentialsLive_TheBaselineIsBoundToItsStateDB (re-review 2, N7): a
+// baseline recorded for one state.db does not hold for another — a lost or
+// replaced database is recorded afresh from what it holds.
+func TestCredentialsLive_TheBaselineIsBoundToItsStateDB(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	// A baseline another state.db recorded, naming admin as external.
+	b, _ := json.Marshal(credentialsBaseline{Incarnation: "another-state-db",
+		Shadows: []userIdentity{{Username: "admin", CreatedAt: "2025-01-01T00:00:00Z"}}})
+	if err := os.WriteFile(filepath.Join(dir, credentialsBaselineFile), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c := newTestDB(t) // a fresh, empty state.db
+	c.dataDir = dir
+	if err := c.NoteCredentialsBaseline(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// The cleared admin row replicates in; its credential lags.
+	if err := c.execLocal(ctx, `INSERT INTO users (username, role, password_hash, created_at, updated_at)
+		VALUES ('admin', 'admin', '', '2025-01-01T00:00:00Z', '2026-06-01T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, known, err := UserLocalCredential(ctx, c, "admin"); err != nil || known {
+		t.Errorf("admin: known=%v err=%v; a baseline from another state.db was taken as this one's", known, err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, credentialsBaselineFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got credentialsBaseline
+	if err := json.Unmarshal(data, &got); err != nil || got.Incarnation == "another-state-db" || len(got.Shadows) != 0 {
+		t.Errorf("baseline file after a new state.db = %s; want this incarnation's, with no shadows", data)
+	}
+}
+
+// TestCredentialsLive_ExternalSeenIsBoundToTheRowAndRecordedAfterTheInsert
+// (re-review 2, N3).
+func TestCredentialsLive_ExternalSeenIsBoundToTheRowAndRecordedAfterTheInsert(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	if err := InsertUser(ctx, c, "bob", "viewer", ""); err != nil { // a pre-split shadow made here
+		t.Fatal(err)
+	}
+	if local, known, _ := UserLocalCredential(ctx, c, "bob"); !known || local {
+		t.Fatalf("bob: local=%v known=%v; this node made the shadow", local, known)
+	}
+	if err := DeleteUser(ctx, c, "bob"); err != nil {
+		t.Fatal(err)
+	}
+	// bob re-created as a local account elsewhere, its users row cleared and
+	// its credential row still on its way here.
+	if err := c.execLocal(ctx, `UPDATE users SET deleted_at = NULL, created_at = '2999-01-01T00:00:00Z', password_hash = '' WHERE username = 'bob'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, known, _ := UserLocalCredential(ctx, c, "bob"); known {
+		t.Error("a deleted shadow's record judged the re-created local bob external")
+	}
+	// A failed insert records nothing: carol already exists.
+	if err := c.execLocal(ctx, `INSERT INTO users (username, role, password_hash, created_at, updated_at) VALUES ('carol', 'operator', '', '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := InsertUser(ctx, c, "carol", "viewer", ""); err == nil {
+		t.Fatal("precondition: inserting an existing live carol succeeded")
+	}
+	c.externalSeenMu.Lock()
+	for id := range c.loadExternalSeenLocked() {
+		if id.Username == "carol" {
+			t.Errorf("a failed insert recorded carol as an external shadow (%+v)", id)
+		}
+	}
+	c.externalSeenMu.Unlock()
 }

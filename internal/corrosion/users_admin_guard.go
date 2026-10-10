@@ -86,6 +86,35 @@ func adminRemintRefused(localRole, localDeletedAt, localCreatedAt, incomingCreat
 	return incomingCreatedAt != localCreatedAt
 }
 
+// accountRemintRefused widens adminRemintRefused from admin accounts to every
+// live LOCAL account — one that holds a password, in its old column or a live
+// credential row. A different account under such a name (another created_at)
+// is not that account's update, whoever minted it: a node whose users table
+// had not caught up and created an external shadow under a name it could not
+// see is the common way, and before this the newer shadow replaced the local
+// account cluster-wide (pre-existing; found in the colonelpanik/litevirt#268
+// review). An account without a password (an external shadow) is still
+// replaced by LWW, as before.
+func accountRemintRefused(localRole, localDeletedAt, localCreatedAt, incomingCreatedAt string, localHasPassword bool) bool {
+	if adminRemintRefused(localRole, localDeletedAt, localCreatedAt, incomingCreatedAt) {
+		return true
+	}
+	if !localHasPassword {
+		return false
+	}
+	return adminRemintRefused("admin", localDeletedAt, localCreatedAt, incomingCreatedAt)
+}
+
+// localAccountHasPassword reports whether username's local account holds a
+// password: its old column, or a live credential row.
+func localAccountHasPassword(tx *sql.Tx, username string) (bool, error) {
+	var n int
+	err := tx.QueryRow(`SELECT COUNT(*) FROM users u
+		LEFT JOIN user_credentials k ON k.username = u.username AND k.deleted_at IS NULL
+		WHERE u.username = ? AND (u.password_hash != '' OR COALESCE(k.password_hash, '') != '')`, username).Scan(&n)
+	return n > 0, err
+}
+
 // usersAdminRemintIsRefused is the anti-entropy lane's adapter: it reads the
 // local row for the incoming row's PK and applies adminRemintRefused. Its
 // signature matches auditEvidenceGuard so it can only ever REFUSE.
@@ -99,11 +128,16 @@ func usersAdminRemintIsRefused(tx *sql.Tx, table syncTable, row []interface{}, p
 	if err != nil || !found {
 		return false, "", err
 	}
-	if adminRemintRefused(
+	hasPassword, err := localAccountHasPassword(tx, cellStr(localRow, idx, "username"))
+	if err != nil {
+		return false, "", err
+	}
+	if accountRemintRefused(
 		cellStr(localRow, idx, "role"),
 		cellStr(localRow, idx, "deleted_at"),
 		cellStr(localRow, idx, "created_at"),
 		cellStr(row, idx, "created_at"),
+		hasPassword,
 	) {
 		return true, "admin_remint", nil
 	}
@@ -147,7 +181,11 @@ func (r *Replicator) usersInsertRemintsALiveAdmin(ctx context.Context, tx *sql.T
 	if err != nil {
 		return false, err // unreadable is not "no live admin"
 	}
-	if !adminRemintRefused(role, deletedAt.String, createdAt, incomingCreatedAt) {
+	hasPassword, err := localAccountHasPassword(tx, username)
+	if err != nil {
+		return false, err
+	}
+	if !accountRemintRefused(role, deletedAt.String, createdAt, incomingCreatedAt, hasPassword) {
 		return false, nil
 	}
 	if hash, ok := insertParamString(s, sh, "password_hash"); ok {
@@ -409,7 +447,7 @@ func insertParamString(s Statement, sh StmtShape, col string) (string, bool) {
 // overwrite it replaces was completely silent, so being visible IS the fix.
 func (c *Client) noteAdminRemintRefused(path resolveTiePath) {
 	c.observeMergeRejected("users", string(path), "admin_remint")
-	slog.Warn("refused a replicated users row that re-mints a live admin account: "+
+	slog.Warn("refused a replicated users row that re-mints a live admin or local account: "+
 		"its created_at does not match the local row's, so it is a DIFFERENT account "+
 		"under the same name, not a password change. "+adminRemintAdvice,
 		"table", "users", "reason", "admin_remint", "path", string(path))

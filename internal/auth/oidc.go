@@ -223,6 +223,17 @@ func (r *OIDCRealm) Authenticate(ctx context.Context, creds Credentials) (*Princ
 // use if we add a back-channel claim-refresh.
 func (r *OIDCRealm) SyncGroups(ctx context.Context) error { return nil }
 
+// Errors EnsureUserShadow wraps, so the login RPC can answer with the right code.
+var (
+	// ErrShadowPending: transient; this node cannot decide yet. Retry.
+	ErrShadowPending = errors.New("not decidable on this node yet")
+	// ErrExternalUnproven: durable until an administrator marks the user
+	// external (`lv user mark-external`) or its credential row arrives.
+	ErrExternalUnproven = errors.New("not known to be an external user")
+	// ErrLocalAccount: the name belongs to a local account.
+	ErrLocalAccount = errors.New("a local account holds this name")
+)
+
 // EnsureUserShadow creates a row in the local users table for an OIDC
 // principal so existing handlers (RBAC, audit) can reference the user
 // by username. The shadow row has password_hash="" so password login is
@@ -279,26 +290,42 @@ func EnsureUserShadow(ctx context.Context, db *corrosion.Client, p *Principal, d
 		// Once credentials_clear_v1 has latched, a local account's users row
 		// carries an EMPTY password_hash and its hash lives in user_credentials,
 		// which anti-entropy can deliver after the users row. An empty hash is
-		// then not proof of anything: UserLocalCredential reads the credential
-		// row, and when it cannot tell, the login is refused rather than guessed.
+		// then not proof of anything: UserLocalCredential judges the row
+		// external only on positive evidence, and when it cannot tell the login
+		// is refused rather than guessed — transiently while this node is not
+		// credentials-live, durably once it is (an administrator then marks the
+		// user external with `lv user mark-external`).
 		if p.Realm != "local" {
 			local, known, err := corrosion.UserLocalCredential(ctx, db, p.Subject)
 			if err != nil {
 				return fmt.Errorf("check whether %q is a local account: %w", p.Subject, err)
 			}
 			if !known {
-				return fmt.Errorf("user %q exists but its credential has not reached this node yet, "+
-					"so it cannot tell whether it is a local account; refusing to authenticate it "+
-					"from realm %q until it has (retry shortly, or log in through another node)",
-					p.Subject, p.Realm)
+				if !db.CredentialsLive() {
+					return fmt.Errorf("%w: user %q exists but this node cannot tell yet whether it is "+
+						"a local account; retry shortly, or log in through another node", ErrShadowPending, p.Subject)
+				}
+				return fmt.Errorf("%w: user %q exists with no local password and no record that it is an "+
+					"external user. If it is one, an administrator can run `lv user mark-external %s`; "+
+					"if it is a local account, its credential has not reached this node yet",
+					ErrExternalUnproven, p.Subject, p.Subject)
 			}
 			if local || existing.PasswordHash != "" {
-				return fmt.Errorf("user %q already exists as a local account; refusing to "+
+				return fmt.Errorf("%w: user %q already exists as a local account; refusing to "+
 					"authenticate it from realm %q, because that would adopt the local account's "+
-					"role — rename one of the two", p.Subject, p.Realm)
+					"role — rename one of the two", ErrLocalAccount, p.Subject, p.Realm)
 			}
 		}
 		return nil
+	}
+	// A new shadow is a new users row, newer than anything the cluster holds
+	// under this name. On a node whose users table has not synced, "no row"
+	// may only mean "not here yet", and the shadow would replace the cluster's
+	// local account cluster-wide (pre-existing; colonelpanik/litevirt#268
+	// review). Wait for the node to sync.
+	if !db.UsersSynced() {
+		return fmt.Errorf("%w: this node has not synced its users yet, so it cannot tell whether %q "+
+			"is already an account; retry shortly, or log in through another node", ErrShadowPending, p.Subject)
 	}
 	role := defaultRole
 	if role == "" {

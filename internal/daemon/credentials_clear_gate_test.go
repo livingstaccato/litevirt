@@ -109,3 +109,54 @@ func assertRunCalls(t *testing.T, names ...string) {
 		}
 	}
 }
+
+// TestRunNotesTheCredentialsBaselineBeforeReplication (re-review 2, N8): the
+// credentials baseline is positive evidence only if it describes this node's
+// database BEFORE anything replicated in. Run must record it after InitSchema
+// and before the replicator and anti-entropy start; deleted, every legacy
+// external user is refused after the upgrade, and moved later, a joiner could
+// record rows it merely received.
+func TestRunNotesTheCredentialsBaselineBeforeReplication(t *testing.T) {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "daemon.go", nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pos := map[string]token.Pos{}
+	for _, decl := range f.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Name.Name != "Run" || fn.Recv == nil || fn.Body == nil {
+			continue
+		}
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			name := sel.Sel.Name
+			switch name {
+			case "InitSchema", "NoteCredentialsBaseline", "NewReplicator", "NewAntiEntropy":
+				if _, seen := pos[name]; !seen {
+					pos[name] = call.Pos()
+				}
+			}
+			return true
+		})
+	}
+	for _, n := range []string{"InitSchema", "NoteCredentialsBaseline", "NewReplicator", "NewAntiEntropy"} {
+		if pos[n] == token.NoPos {
+			t.Fatalf("(*Daemon).Run does not call %s", n)
+		}
+	}
+	if !(pos["InitSchema"] < pos["NoteCredentialsBaseline"]) {
+		t.Error("Run records the credentials baseline before InitSchema")
+	}
+	if !(pos["NoteCredentialsBaseline"] < pos["NewReplicator"] && pos["NoteCredentialsBaseline"] < pos["NewAntiEntropy"]) {
+		t.Error("Run records the credentials baseline after replication or anti-entropy starts: a joiner " +
+			"would record rows it merely received as its own")
+	}
+}

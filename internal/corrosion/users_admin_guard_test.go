@@ -155,13 +155,39 @@ func TestUsersMerge_ANonAdminRowIsUnaffected(t *testing.T) {
 	if err := InsertUser(ctx, c, "bob", "viewer", "old"); err != nil {
 		t.Fatalf("seed viewer: %v", err)
 	}
+	rows, _ := c.Query(ctx, `SELECT created_at FROM users WHERE username = 'bob'`)
+	createdAt := rows[0].String("created_at")
 
-	mergeUsersRow(t, c, usersRowCells("bob", "viewer", "new",
-		"2099-01-01T00:00:00Z", "2099-01-01T00:00:00Z"))
-
-	rows, _ := c.Query(ctx, `SELECT password_hash FROM users WHERE username = 'bob'`)
+	// An update of the SAME account (its created_at) converges as always.
+	mergeUsersRow(t, c, usersRowCells("bob", "viewer", "new", createdAt, "2099-01-01T00:00:00Z"))
+	rows, _ = c.Query(ctx, `SELECT password_hash FROM users WHERE username = 'bob'`)
 	if got := rows[0].String("password_hash"); got != "new" {
 		t.Errorf("password_hash = %q, want new — an ordinary user row stopped converging", got)
+	}
+}
+
+// TestUsersMerge_ADifferentAccountNeverReplacesALocalAccount (pre-existing on
+// main, found in the colonelpanik/litevirt#268 review): a row with another
+// created_at under a live local account's name — for example an external
+// shadow a stale node created — is a different account, and is refused just
+// as an admin re-mint is. Over an account without a password (a shadow) it
+// still converges by LWW.
+func TestUsersMerge_ADifferentAccountNeverReplacesALocalAccount(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+	if err := InsertUser(ctx, c, "carol", "operator", "carol-hash"); err != nil {
+		t.Fatal(err)
+	}
+	if err := InsertUser(ctx, c, "ext", "viewer", ""); err != nil {
+		t.Fatal(err)
+	}
+	mergeUsersRow(t, c, usersRowCells("carol", "viewer", "", "2098-01-01T00:00:00Z", "2099-01-01T00:00:00Z"))
+	mergeUsersRow(t, c, usersRowCells("ext", "operator", "ext-hash", "2098-01-01T00:00:00Z", "2099-01-01T00:00:00Z"))
+	if u, _ := GetUser(ctx, c, "carol"); u == nil || u.Role != "operator" || u.PasswordHash != "carol-hash" {
+		t.Errorf("carol = %+v: a different account replaced the live local account", u)
+	}
+	if u, _ := GetUser(ctx, c, "ext"); u == nil || u.Role != "operator" {
+		t.Errorf("ext = %+v: a shadow must still converge by LWW", u)
 	}
 }
 

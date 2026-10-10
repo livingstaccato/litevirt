@@ -64,19 +64,28 @@ func InsertUser(ctx context.Context, c *Client, username, role, passwordHash str
 		}
 		return c.Execute(ctx, usersReactivateSQL, role, passwordHash, now, username)
 	}
-	if passwordHash == "" && !split {
-		// An external-realm shadow made where no credential row can be
-		// written yet: remember it here, the positive evidence this node's
-		// first live pass replicates (credentials_live.go).
-		defer c.noteExternalShadow(username)
+	created := nowRFC3339()
+	if passwordHash != "" {
+		// A local account under this name: any record that this node made
+		// an external shadow of it is about an earlier incarnation.
+		c.forgetExternalShadow(username)
 	}
 	if split {
 		return c.ExecuteBatch(ctx, []Statement{
-			{SQL: usersInsertSQL, Params: []interface{}{username, role, c.oldColumnValue(passwordHash), nowRFC3339(), now}},
+			{SQL: usersInsertSQL, Params: []interface{}{username, role, c.oldColumnValue(passwordHash), created, now}},
 			{SQL: userCredentialUpsertSQL, Params: []interface{}{username, passwordHash, now}},
 		})
 	}
-	return c.Execute(ctx, usersInsertSQL, username, role, passwordHash, nowRFC3339(), now)
+	if err := c.Execute(ctx, usersInsertSQL, username, role, passwordHash, created, now); err != nil {
+		return err
+	}
+	if passwordHash == "" {
+		// An external-realm shadow made where no credential row can be
+		// written yet: positive evidence, bound to this row's identity, which
+		// this node's first live pass replicates (credentials_live.go).
+		c.noteExternalShadow(userIdentity{Username: username, CreatedAt: created})
+	}
+	return nil
 }
 
 const usersInsertSQL = `INSERT INTO users (username, role, password_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`
@@ -175,6 +184,7 @@ const usersUpdatePasswordSQL = `UPDATE users SET password_hash = ?, updated_at =
 // (Local users authenticate through the "local" realm; external OIDC/LDAP group
 // bindings are out of scope — they are not session-persisted yet.)
 func DeleteUser(ctx context.Context, c *Client, username string) error {
+	c.forgetExternalShadow(username)
 	now := c.NowTS()
 	marker := nowRFC3339()
 	barePrincipal := "user:" + username

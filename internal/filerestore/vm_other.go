@@ -5,6 +5,7 @@ package filerestore
 import (
 	"context"
 	"fmt"
+	"os"
 )
 
 // Launcher starts restore VMs; off Linux there are none.
@@ -31,3 +32,9 @@ func (s *Session) Close() {}
 
 // SweepStale does nothing off Linux.
 func SweepStale(string) int { return 0 }
+
+// RunTrampoline is never used off Linux.
+func RunTrampoline([]string) { os.Exit(2) }
+
+// EnsureRestoreUser does nothing off Linux.
+func EnsureRestoreUser() error { return nil }

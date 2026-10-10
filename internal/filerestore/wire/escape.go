@@ -10,19 +10,14 @@ import (
 // characters, DEL, and the Unicode bidi and invisible formatting controls
 // that can reorder or hide text (U+061C, U+200B–U+200F, U+202A–U+202E,
 // U+2060–U+2069, U+FEFF) are written as \x.. / \u.... Invalid UTF-8 bytes
-// are written as \x... A string with none of them is returned unchanged.
+// are written as \x... A backslash is written as \\, so an escape sequence
+// typed into a name cannot pass for an escaped character. A string with
+// none of them is returned unchanged.
 //
 // Names, symlink targets, agent errors and console output all pass through
 // it before they reach an operator's terminal.
 func Escape(s string) string {
-	clean := true
-	for i, r := range s {
-		if r == utf8.RuneError && !strings.HasPrefix(s[i:], "�") || unsafeRune(r) {
-			clean = false
-			break
-		}
-	}
-	if clean {
+	if !HasUnsafe(s) && !strings.ContainsRune(s, '\\') {
 		return s
 	}
 	var b strings.Builder
@@ -31,6 +26,8 @@ func Escape(s string) string {
 		switch {
 		case r == utf8.RuneError && n <= 1:
 			fmt.Fprintf(&b, `\x%02x`, s[i])
+		case r == '\\':
+			b.WriteString(`\\`)
 		case r < 0x80 && unsafeRune(r):
 			fmt.Fprintf(&b, `\x%02x`, r)
 		case unsafeRune(r):
@@ -41,6 +38,18 @@ func Escape(s string) string {
 		i += n
 	}
 	return b.String()
+}
+
+// HasUnsafe reports whether s holds anything Escape would rewrite other
+// than a backslash: a control, bidi or invisible character, or invalid
+// UTF-8.
+func HasUnsafe(s string) bool {
+	for i, r := range s {
+		if r == utf8.RuneError && !strings.HasPrefix(s[i:], "\uFFFD") || unsafeRune(r) {
+			return true
+		}
+	}
+	return false
 }
 
 func unsafeRune(r rune) bool {

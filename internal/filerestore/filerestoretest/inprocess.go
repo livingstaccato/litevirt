@@ -54,7 +54,7 @@ func Serve(srv *agent.Server) (*Session, error) {
 		guest.Close()
 	}()
 	s := &Session{Client: filerestore.NewClient(host), done: done}
-	if err := s.Client.Hello(Nonce); err != nil {
+	if err := s.Client.Hello(Nonce, 0); err != nil {
 		s.Close()
 		return nil, err
 	}

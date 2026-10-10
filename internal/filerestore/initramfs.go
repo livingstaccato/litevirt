@@ -36,15 +36,16 @@ import (
 // kernel is skipped; one that is neither built in nor present is skipped
 // too, unless it is required.
 var agentModules = []string{
-	"virtio_pci", "virtio_blk",
+	"virtio_pci", "virtio_blk", "qemu_fw_cfg",
 	"vsock", "vmw_vsock_virtio_transport_common", "vmw_vsock_virtio_transport",
 	"ext4", "xfs", "btrfs", "vfat", "isofs",
 	"nls_cp437", "nls_iso8859_1", "nls_utf8",
 }
 
 // requiredModules must be available (built in or as a module): without a
-// disk or a vsock transport the agent cannot work at all.
-var requiredModules = []string{"virtio_blk", "vsock", "vmw_vsock_virtio_transport"}
+// disk, a vsock transport, or fw_cfg (which carries the session nonce) the
+// agent cannot work at all.
+var requiredModules = []string{"virtio_blk", "vsock", "vmw_vsock_virtio_transport", "qemu_fw_cfg"}
 
 // modName normalizes a module file or name: basename without .ko and a
 // compression suffix, '-' as '_'.
@@ -314,53 +315,91 @@ func initramfsKey(spec InitramfsSpec) (string, error) {
 	return hex.EncodeToString(h.Sum(nil))[:32], nil
 }
 
-// cachedFileOK reports whether a cache file can be reused as it is: a
-// regular file, one link, owned by owner (or, for owner -1, by this
-// process) with mode 0400 — exactly what writeCacheFile leaves. Anything
-// else is rebuilt.
-func cachedFileOK(path string, owner int) bool {
+// The boot files (initramfs, kernel copy) are the daemon's: owned by it
+// (root in production), group the restore user's group, mode 0440, in a
+// directory that is 0750 the same way (/var/cache/litevirt-restore). qemu
+// can read them through its group and never write them. Beside each, a
+// root-only sidecar (<file>.sha256, 0600) records the digest written; every
+// reuse re-hashes the file against it, so a file changed by anyone is
+// rebuilt — and reported (TamperFunc) — before a restore VM boots it.
+
+const (
+	cacheFileMode = 0o440
+	cacheDirMode  = 0o750
+)
+
+// cachedFile checks a cache file before reuse: a regular file, one link,
+// owned by this process, group gid, mode 0440, whose content still hashes
+// to its sidecar's digest. ok=false with why="" means it does not exist.
+func cachedFile(path string, gid int) (ok bool, why string) {
 	var st unix.Stat_t
 	if err := unix.Lstat(path, &st); err != nil {
-		return false
+		return false, ""
 	}
-	want := owner
-	if want < 0 {
-		want = os.Geteuid()
+	switch {
+	case st.Mode&unix.S_IFMT != unix.S_IFREG:
+		return false, "not a regular file"
+	case st.Nlink != 1:
+		return false, fmt.Sprintf("%d links", st.Nlink)
+	case int(st.Uid) != os.Geteuid():
+		return false, fmt.Sprintf("owned by uid %d", st.Uid)
+	case int(st.Gid) != gid:
+		return false, fmt.Sprintf("group %d, want %d", st.Gid, gid)
+	case st.Mode&0o7777 != cacheFileMode:
+		return false, fmt.Sprintf("mode %o", st.Mode&0o7777)
 	}
-	return st.Mode&unix.S_IFMT == unix.S_IFREG && st.Nlink == 1 && int(st.Uid) == want && st.Mode&0o7777 == 0o400 && st.Size > 0
+	want, err := os.ReadFile(path + ".sha256")
+	if err != nil {
+		return false, "no recorded digest"
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return false, err.Error()
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return false, err.Error()
+	}
+	if got := hex.EncodeToString(h.Sum(nil)); got != strings.TrimSpace(string(want)) {
+		return false, "content does not match the digest recorded when it was written"
+	}
+	return true, ""
 }
 
-// prepareCacheDir makes the cache directory: the daemon's, traversable (so
-// a qemu running as another user can open the files it is given by name)
-// but not listable.
-func prepareCacheDir(dir string) error {
-	if err := os.MkdirAll(dir, 0o711); err != nil {
+// prepareCacheDir makes the cache directory: the daemon's, group gid, 0750
+// (qemu reads the files it is given through its group; no one else can
+// even look).
+func prepareCacheDir(dir string, gid int) error {
+	if err := os.MkdirAll(dir, cacheDirMode); err != nil {
 		return err
 	}
-	return os.Chmod(dir, 0o711)
+	if err := os.Chmod(dir, cacheDirMode); err != nil {
+		return err
+	}
+	return os.Chown(dir, -1, gid)
 }
 
-// writeCacheFile writes dst atomically with fill, mode 0400, owned by owner
-// (-1: this process), so only that user (and root) can read it.
-func writeCacheFile(dir, dst string, owner int, fill func(io.Writer) error) error {
+// writeCacheFile writes dst atomically with fill: owned by this process,
+// group gid, mode 0440, and records its digest in a 0600 sidecar.
+func writeCacheFile(dir, dst string, gid int, fill func(io.Writer) error) error {
 	tmp, err := os.CreateTemp(dir, ".tmp-*")
 	if err != nil {
 		return err
 	}
 	defer os.Remove(tmp.Name())
-	if err := fill(tmp); err != nil {
+	h := sha256.New()
+	if err := fill(io.MultiWriter(tmp, h)); err != nil {
 		tmp.Close()
 		return err
 	}
-	if err := tmp.Chmod(0o400); err != nil {
+	if err := tmp.Chown(-1, gid); err != nil {
 		tmp.Close()
 		return err
 	}
-	if owner >= 0 {
-		if err := tmp.Chown(owner, -1); err != nil {
-			tmp.Close()
-			return err
-		}
+	if err := tmp.Chmod(cacheFileMode); err != nil {
+		tmp.Close()
+		return err
 	}
 	if err := tmp.Sync(); err != nil {
 		tmp.Close()
@@ -369,56 +408,81 @@ func writeCacheFile(dir, dst string, owner int, fill func(io.Writer) error) erro
 	if err := tmp.Close(); err != nil {
 		return err
 	}
+	side, err := os.CreateTemp(dir, ".tmp-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(side.Name())
+	_ = side.Chmod(0o600)
+	if _, err := side.WriteString(hex.EncodeToString(h.Sum(nil)) + "\n"); err != nil {
+		side.Close()
+		return err
+	}
+	if err := side.Close(); err != nil {
+		return err
+	}
+	// The sidecar first: a reader never sees a new file with an old digest
+	// pass (it would mismatch and be rebuilt).
+	if err := os.Rename(side.Name(), dst+".sha256"); err != nil {
+		return err
+	}
 	return os.Rename(tmp.Name(), dst)
 }
 
+// ensureCacheFile returns dst, reusing it when it checks out, or writing it
+// with fill. A file that exists but does not check out is reported to
+// onTamper before it is rebuilt.
+func ensureCacheFile(dir, dst string, gid int, onTamper TamperFunc, fill func(io.Writer) error) error {
+	ok, why := cachedFile(dst, gid)
+	if ok {
+		return nil
+	}
+	if why != "" && onTamper != nil {
+		onTamper(dst, why)
+	}
+	if err := prepareCacheDir(dir, gid); err != nil {
+		return err
+	}
+	_ = os.Remove(dst)
+	return writeCacheFile(dir, dst, gid, fill)
+}
+
+// dropOthers removes the cache files matching glob other than keep (and
+// their sidecars).
+func dropOthers(glob, keep string) {
+	old, _ := filepath.Glob(glob)
+	for _, o := range old {
+		if o != keep && o != keep+".sha256" {
+			_ = os.Remove(o)
+		}
+	}
+}
+
 // EnsureInitramfs returns the path of an initramfs for spec under cacheDir,
-// building it if it is not there yet or is not exactly as built. owner is
-// the uid qemu runs as (-1: the daemon's own); the file is mode 0400 and
-// owned by it.
-func EnsureInitramfs(cacheDir string, spec InitramfsSpec, owner int) (string, error) {
+// building it if it is not there yet or does not check out (cachedFile).
+// gid is the restore user's group (the daemon's own gid when not root).
+func EnsureInitramfs(cacheDir string, spec InitramfsSpec, gid int, onTamper TamperFunc) (string, error) {
 	key, err := initramfsKey(spec)
 	if err != nil {
 		return "", fmt.Errorf("restore VM agent binary: %w", err)
 	}
 	dst := filepath.Join(cacheDir, "initramfs-"+key+".cpio")
-	if cachedFileOK(dst, owner) {
-		return dst, nil
-	}
-	if err := prepareCacheDir(cacheDir); err != nil {
+	if err := ensureCacheFile(cacheDir, dst, gid, onTamper, func(w io.Writer) error { return writeInitramfs(w, spec) }); err != nil {
 		return "", err
 	}
-	_ = os.Remove(dst)
-	if err := writeCacheFile(cacheDir, dst, owner, func(w io.Writer) error { return writeInitramfs(w, spec) }); err != nil {
-		return "", err
-	}
-	// Drop older builds.
-	if old, _ := filepath.Glob(filepath.Join(cacheDir, "initramfs-*.cpio")); len(old) > 0 {
-		for _, o := range old {
-			if o != dst {
-				_ = os.Remove(o)
-			}
-		}
-	}
+	dropOthers(filepath.Join(cacheDir, "initramfs-*"), dst)
 	return dst, nil
 }
 
-// ensureKernelCopy returns a copy of kernel that owner can read: the host's
-// own image is usually root-only (0600), and qemu runs as owner.
-func ensureKernelCopy(cacheDir, kernel string, owner int) (string, error) {
+// ensureKernelCopy returns a copy of kernel the restore group can read: the
+// host's own image is usually root-only (0600).
+func ensureKernelCopy(cacheDir, kernel string, gid int, onTamper TamperFunc) (string, error) {
 	h, err := fileHash(kernel)
 	if err != nil {
 		return "", err
 	}
 	dst := filepath.Join(cacheDir, "kernel-"+h[:32])
-	if cachedFileOK(dst, owner) {
-		return dst, nil
-	}
-	if err := prepareCacheDir(cacheDir); err != nil {
-		return "", err
-	}
-	_ = os.Remove(dst)
-	if err := writeCacheFile(cacheDir, dst, owner, func(w io.Writer) error {
+	if err := ensureCacheFile(cacheDir, dst, gid, onTamper, func(w io.Writer) error {
 		f, err := os.Open(kernel)
 		if err != nil {
 			return err
@@ -429,13 +493,7 @@ func ensureKernelCopy(cacheDir, kernel string, owner int) (string, error) {
 	}); err != nil {
 		return "", err
 	}
-	if old, _ := filepath.Glob(filepath.Join(cacheDir, "kernel-*")); len(old) > 0 {
-		for _, o := range old {
-			if o != dst {
-				_ = os.Remove(o)
-			}
-		}
-	}
+	dropOthers(filepath.Join(cacheDir, "kernel-*"), dst)
 	return dst, nil
 }
 

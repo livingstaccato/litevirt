@@ -11,7 +11,7 @@ func baseSpec() VMSpec {
 		QEMU: "qemu-system-x86_64", Kernel: "/var/lib/litevirt/file-restore/cache/kernel-x", Initrd: "/var/lib/litevirt/file-restore/cache/i.cpio",
 		MemoryMiB: 512, NBDSocket: "/run/litevirt/file-restore/s-1/nbd.sock", Export: "backup",
 		DiskFormat: "raw", Kind: KindFS, CID: 1234, VhostFD: 3, Arch: "amd64",
-		Nonce: "abc123", AgentIdleSec: 360, Sandbox: true,
+		NonceFile: "/run/litevirt/file-restore/s-1/nonce", AgentIdleSec: 360, Sandbox: true,
 	}
 }
 
@@ -83,10 +83,18 @@ func TestQemuArgs_Isolation(t *testing.T) {
 		t.Errorf("-sandbox %v", v)
 	}
 	app := argValues(args, "-append")
-	for _, want := range []string{"litevirt_filerestore=1", "litevirt_fr_kind=fs", "panic=-1", "litevirt_fr_nonce=abc123", "litevirt_fr_idle=360"} {
+	for _, want := range []string{"litevirt_filerestore=1", "litevirt_fr_kind=fs", "panic=-1", "litevirt_fr_idle=360"} {
 		if len(app) != 1 || !strings.Contains(app[0], want) {
 			t.Errorf("-append %v lacks %s", app, want)
 		}
+	}
+	// The nonce reaches the guest over fw_cfg from a file, never on the
+	// command line (any host user can read /proc/<pid>/cmdline).
+	if fw := argValues(args, "-fw_cfg"); len(fw) != 1 || fw[0] != "name=opt/litevirt/nonce,file=/run/litevirt/file-restore/s-1/nonce" {
+		t.Errorf("-fw_cfg %v", fw)
+	}
+	if strings.Contains(strings.Join(args, " "), "nonce=") {
+		t.Errorf("a nonce value on the command line: %v", args)
 	}
 }
 
@@ -120,12 +128,12 @@ func TestQemuArgs_Qcow2HasNoBacking(t *testing.T) {
 
 func TestQemuArgs_RejectsBadSpecs(t *testing.T) {
 	for name, mut := range map[string]func(*VMSpec){
-		"format":   func(s *VMSpec) { s.DiskFormat = "vmdk" },
-		"kind":     func(s *VMSpec) { s.Kind = "lvm" },
-		"cid":      func(s *VMSpec) { s.CID = 2 },
-		"vhostfd":  func(s *VMSpec) { s.VhostFD = 0 },
-		"nonce":    func(s *VMSpec) { s.Nonce = "" },
-		"nonce-ws": func(s *VMSpec) { s.Nonce = "a b" },
+		"format":      func(s *VMSpec) { s.DiskFormat = "vmdk" },
+		"kind":        func(s *VMSpec) { s.Kind = "lvm" },
+		"cid":         func(s *VMSpec) { s.CID = 2 },
+		"vhostfd":     func(s *VMSpec) { s.VhostFD = 0 },
+		"nonce":       func(s *VMSpec) { s.NonceFile = "" },
+		"nonce-comma": func(s *VMSpec) { s.NonceFile = "/a,b" },
 	} {
 		s := baseSpec()
 		mut(&s)
@@ -166,12 +174,25 @@ func TestConsoleRing_Bounded(t *testing.T) {
 	}
 }
 
+// The messages a real qemu prints when it cannot install its sandbox
+// (qemu-system-x86_64 10.2.1's strings; vl.c for a build without seccomp).
 func TestStderrClassifiers(t *testing.T) {
-	if !stderrSaysNoSeccomp("qemu-system-x86_64: -sandbox on: seccomp support is disabled") {
-		t.Error("no-seccomp message not recognized")
+	for _, real := range []string{
+		"qemu-system-x86_64: -sandbox on,obsolete=deny: -sandbox support is not enabled in this QEMU binary",
+		"qemu-system-x86_64: -sandbox on: failed to load seccomp syscall filter in kernel",
+		"qemu-system-x86_64: -sandbox on: failed to initialize seccomp context",
+	} {
+		if !stderrSaysNoSeccomp(real) {
+			t.Errorf("real message not recognized: %q", real)
+		}
 	}
-	if stderrSaysNoSeccomp("qemu-system-x86_64: could not load kernel") {
-		t.Error("an unrelated error read as no seccomp")
+	for _, other := range []string{
+		"qemu-system-x86_64: could not load kernel",
+		"qemu-system-x86_64: -sandbox on,bogus=1: Invalid parameter 'bogus'",
+	} {
+		if stderrSaysNoSeccomp(other) {
+			t.Errorf("an unrelated error read as no seccomp: %q", other)
+		}
 	}
 	if !stderrSaysCIDInUse("vhost-vsock: unable to set guest cid: Address already in use") {
 		t.Error("cid collision not recognized")

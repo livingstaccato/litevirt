@@ -1,6 +1,8 @@
 package filerestore
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -84,12 +86,17 @@ func (c *Client) roundTrip(req wire.Request) (wire.Response, error) {
 }
 
 // Hello checks the agent is the one this session booted: it must answer
-// with nonce, which only the session's kernel command line carries. Until
-// it has, nothing else is sent.
-func (c *Client) Hello(nonce string) error {
+// with nonce, which only the session's VM is given. Until it has, nothing
+// else is sent. timeout bounds the wait (0: the client's own).
+func (c *Client) Hello(nonce string, timeout time.Duration) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	saved := c.opTimeout
+	if timeout > 0 {
+		c.opTimeout = timeout
+	}
 	resp, err := c.roundTrip(wire.Request{Op: wire.OpHello})
+	c.opTimeout = saved
 	if err != nil {
 		return err
 	}
@@ -122,15 +129,92 @@ func (c *Client) List(p string) (entries []Entry, truncated bool, skipped int, e
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	resp, err := c.roundTrip(wire.Request{Op: wire.OpList, Path: clean})
+	if c.broken.Load() {
+		return nil, false, 0, ErrClientBroken
+	}
+	c.setDeadline(c.opTimeout)
+	defer c.setDeadline(0)
+	if err := c.c.Send(wire.Request{Op: wire.OpList, Path: clean}); err != nil {
+		c.broken.Store(true)
+		return nil, false, 0, fmt.Errorf("restore VM: %w", err)
+	}
+	line, err := wire.ReadLine(c.c.R, wire.MaxResponseLine)
 	if err != nil {
-		return nil, false, 0, err
+		c.broken.Store(true)
+		return nil, false, 0, fmt.Errorf("restore VM: %w", err)
+	}
+	resp, err := decodeListResponse(line)
+	if err != nil {
+		return nil, false, 0, fmt.Errorf("restore VM: %w", err)
 	}
 	if resp.Error != "" {
 		return nil, false, 0, errors.New(agentErr(resp.Error))
 	}
 	entries, skipped = SanitizeEntries(resp.Entries)
 	return entries, resp.Truncated, skipped, nil
+}
+
+// decodeListResponse decodes a listing reply entry by entry, keeping at
+// most MaxListEntries: what a hostile agent packs into the (bounded) line
+// beyond that is skipped while decoding, never materialized.
+func decodeListResponse(line []byte) (wire.Response, error) {
+	var resp wire.Response
+	dec := json.NewDecoder(bytes.NewReader(line))
+	if t, err := dec.Token(); err != nil || t != json.Delim('{') {
+		return resp, fmt.Errorf("malformed listing")
+	}
+	for dec.More() {
+		kt, err := dec.Token()
+		if err != nil {
+			return resp, err
+		}
+		key, _ := kt.(string)
+		switch key {
+		case "error":
+			if err := dec.Decode(&resp.Error); err != nil {
+				return resp, err
+			}
+		case "truncated":
+			if err := dec.Decode(&resp.Truncated); err != nil {
+				return resp, err
+			}
+		case "entries":
+			t, err := dec.Token()
+			if err != nil {
+				return resp, err
+			}
+			if t == nil {
+				continue // null
+			}
+			if t != json.Delim('[') {
+				return resp, fmt.Errorf("malformed listing")
+			}
+			for dec.More() {
+				if len(resp.Entries) >= wire.MaxListEntries {
+					var skip json.RawMessage
+					if err := dec.Decode(&skip); err != nil {
+						return resp, err
+					}
+					resp.Truncated = true
+					continue
+				}
+				var e wire.Entry
+				if err := dec.Decode(&e); err != nil {
+					return resp, err
+				}
+				resp.Entries = append(resp.Entries, e)
+			}
+			if _, err := dec.Token(); err != nil {
+				return resp, err
+			}
+		default:
+			var skip json.RawMessage
+			if err := dec.Decode(&skip); err != nil {
+				return resp, err
+			}
+		}
+	}
+	return resp, nil
 }
 
 // Tar writes a sanitized tar archive of paths to dst. Unless it returns nil

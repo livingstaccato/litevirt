@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"os/signal"
 	"os/user"
 	"path/filepath"
 	"runtime"
@@ -34,15 +35,19 @@ import (
 type Launcher struct {
 	cfg Config
 
-	// Test hooks: the device nodes and the agent check.
+	aaMu     sync.Mutex
+	aaLoaded string // the profile text loaded, so a change reloads it
+
+	// Test hooks.
 	kvmPath, vhostPath string
 	checkAgent         func(path string) error
+	appArmor           func() bool
 }
 
 // NewLauncher returns a launcher for cfg. Nothing is checked until
 // Preflight or Open.
 func NewLauncher(cfg Config) *Launcher {
-	return &Launcher{cfg: cfg, kvmPath: "/dev/kvm", vhostPath: "/dev/vhost-vsock", checkAgent: checkStaticELF}
+	return &Launcher{cfg: cfg, kvmPath: "/dev/kvm", vhostPath: "/dev/vhost-vsock", checkAgent: checkStaticELF, appArmor: appArmorEnabled}
 }
 
 func unavailable(format string, args ...any) error {
@@ -67,19 +72,48 @@ type qemuUser struct {
 // host is the checked environment for one Open.
 type host struct {
 	qemu, kernel, modules, agent string
-	user                         *qemuUser // nil: qemu runs as the daemon's own user (not root)
+	user                         *qemuUser // nil: qemu runs as the daemon's own user
+	gid                          int       // the group the boot files are readable by
+	appArmor                     bool
+	sandbox                      bool // this qemu installs its seccomp sandbox
+	sandboxMsg                   string
+}
+
+// EnsureRestoreUser creates DefaultRestoreUser if it does not exist: a
+// system user with its own group, no home and no shell, in the kvm group
+// (for /dev/kvm) and nothing else. Idempotent; a no-op unless root. The
+// daemon calls it at start.
+func EnsureRestoreUser() error {
+	if os.Geteuid() != 0 {
+		return nil
+	}
+	if _, err := user.Lookup(DefaultRestoreUser); err == nil {
+		return nil
+	}
+	args := []string{"--system", "--user-group", "--no-create-home", "--home-dir", "/nonexistent",
+		"--shell", "/usr/sbin/nologin", "--comment", "litevirt file-restore VMs"}
+	if _, err := user.LookupGroup("kvm"); err == nil {
+		args = append(args, "--groups", "kvm")
+	}
+	out, err := exec.Command("useradd", append(args, DefaultRestoreUser)...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("create user %s: %v: %s", DefaultRestoreUser, err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 // Preflight checks everything a restore VM needs, naming the first thing
 // missing (wrapped in ErrUnavailable). It is re-run for every session.
 func (l *Launcher) Preflight() error {
-	_, err := l.check()
+	_, err := l.check(context.Background(), false)
 	return err
 }
 
-func (l *Launcher) check() (*host, error) {
+// check checks the host; with probe it also asks qemu whether it can
+// install its sandbox (Open does, for every VM it starts).
+func (l *Launcher) check(ctx context.Context, probe bool) (*host, error) {
 	rel := kernelRelease()
-	h := &host{qemu: l.cfg.QEMU, kernel: l.cfg.Kernel, modules: l.cfg.ModulesDir, agent: l.cfg.Agent}
+	h := &host{qemu: l.cfg.QEMU, kernel: l.cfg.Kernel, modules: l.cfg.ModulesDir, agent: l.cfg.Agent, gid: os.Getgid()}
 	if h.kernel == "" {
 		h.kernel = "/boot/vmlinuz-" + rel
 	}
@@ -90,13 +124,15 @@ func (l *Launcher) check() (*host, error) {
 		h.agent = "/proc/self/exe"
 	}
 	if os.Geteuid() == 0 {
-		u, err := lookupQemuUser(l.cfg.RunAs)
+		u, err := lookupQemuUser(l.cfg.RunAs, l.cfg.AllowUnsandboxed)
 		if err != nil {
 			return nil, unavailable("%v", err)
 		}
-		h.user = u
-		if err := accessibleTo(l.kvmPath, u); err != nil {
-			return nil, unavailable("no usable KVM for qemu user %s: %v", u.name, err)
+		if u != nil {
+			h.user, h.gid = u, int(u.gid)
+			if err := accessibleTo(l.kvmPath, u); err != nil {
+				return nil, unavailable("no usable KVM for qemu user %s: %v", u.name, err)
+			}
 		}
 	} else if f, err := os.OpenFile(l.kvmPath, os.O_RDWR, 0); err != nil {
 		return nil, unavailable("no usable KVM (%s: %v)", l.kvmPath, err)
@@ -142,7 +178,54 @@ func (l *Launcher) check() (*host, error) {
 	if err := l.checkAgent(h.agent); err != nil {
 		return nil, unavailable("%v", err)
 	}
+	h.appArmor = os.Geteuid() == 0 && l.appArmor()
+	if !probe {
+		return h, nil
+	}
+	// Ask this qemu, as the user it will run as, whether it can install its
+	// seccomp sandbox — decided now, for this VM, never remembered.
+	h.sandbox, h.sandboxMsg = probeSandbox(ctx, h.qemu, h.user)
+	if !h.sandbox && !l.cfg.AllowUnsandboxed {
+		return nil, unavailable("this qemu cannot run with its seccomp sandbox (%s); refusing to run a restore VM without it — "+
+			"file_restore.allow_unsandboxed: true permits it, which is dangerous (see docs/backups.md)", wire.EscapeBounded(h.sandboxMsg, 300))
+	}
 	return h, nil
+}
+
+// sandboxOpts is qemu's seccomp sandbox for a restore VM.
+const sandboxOpts = "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny"
+
+// probeSandbox starts qemu with the sandbox and nothing else (no machine,
+// paused) as u. A qemu that cannot install it exits at once and says so; one
+// that can is still running after a moment and is killed. The answer comes
+// from qemu itself, not from guessing at its messages.
+func probeSandbox(ctx context.Context, qemu string, u *qemuUser) (ok bool, msg string) {
+	cmd := exec.CommandContext(ctx, qemu, "-sandbox", sandboxOpts, "-machine", "none", "-nodefaults",
+		"-no-user-config", "-display", "none", "-S")
+	var stderr bytes.Buffer
+	cmd.Stderr = &limitedBuffer{b: &stderr, max: 4 << 10}
+	cmd.Env = []string{"PATH=/usr/sbin:/usr/bin:/sbin:/bin"}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGKILL}
+	if u != nil {
+		cmd.SysProcAttr.Credential = &syscall.Credential{Uid: u.uid, Gid: u.gid, Groups: u.groups}
+	}
+	if err := cmd.Start(); err != nil {
+		return false, err.Error()
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		out := strings.TrimSpace(stderr.String())
+		if out == "" && err != nil {
+			out = err.Error()
+		}
+		return false, out
+	case <-time.After(800 * time.Millisecond):
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		<-done
+		return true, ""
+	}
 }
 
 // checkStaticELF refuses an agent binary that needs a dynamic loader: the
@@ -161,33 +244,50 @@ func checkStaticELF(path string) error {
 	return nil
 }
 
-// lookupQemuUser resolves the user qemu runs as. Never root.
-func lookupQemuUser(name string) (*qemuUser, error) {
-	names := []string{name}
+// sharedQemuUsers own production VM disks and the migration-TLS key
+// (libvirt's qemu user) or are shared with other daemons (nobody).
+var sharedQemuUsers = []string{"libvirt-qemu", "qemu", "nobody"}
+
+// lookupQemuUser resolves the user qemu runs as: the configured one or
+// DefaultRestoreUser. root and the shared users are refused unless
+// allowUnsafe; root then means no credential at all (nil).
+func lookupQemuUser(name string, allowUnsafe bool) (*qemuUser, error) {
 	if name == "" {
-		names = []string{"libvirt-qemu", "qemu", "nobody"}
+		name = DefaultRestoreUser
 	}
-	for _, n := range names {
-		u, err := user.Lookup(n)
-		if err != nil {
-			continue
+	u, err := user.Lookup(name)
+	if err != nil {
+		if name == DefaultRestoreUser {
+			return nil, fmt.Errorf("no user %s to run restore VMs as (the daemon creates it at start; create it with "+
+				"`useradd --system --user-group --groups kvm --shell /usr/sbin/nologin %s`)", name, name)
 		}
-		uid, _ := strconv.ParseUint(u.Uid, 10, 32)
-		gid, _ := strconv.ParseUint(u.Gid, 10, 32)
-		if uid == 0 {
-			return nil, fmt.Errorf("file_restore.run_as %q is root; qemu must run unprivileged", n)
+		return nil, fmt.Errorf("file_restore.run_as %q: %v", name, err)
+	}
+	uid, _ := strconv.ParseUint(u.Uid, 10, 32)
+	gid, _ := strconv.ParseUint(u.Gid, 10, 32)
+	if uid == 0 {
+		if !allowUnsafe {
+			return nil, fmt.Errorf("file_restore.run_as %q is root; restore VMs run as a dedicated unprivileged user (%s)", name, DefaultRestoreUser)
 		}
-		qu := &qemuUser{name: n, uid: uint32(uid), gid: uint32(gid)}
-		if gs, err := u.GroupIds(); err == nil {
-			for _, g := range gs {
-				if v, err := strconv.ParseUint(g, 10, 32); err == nil {
-					qu.groups = append(qu.groups, uint32(v))
-				}
+		return nil, nil
+	}
+	if !allowUnsafe {
+		for _, shared := range sharedQemuUsers {
+			if su, err := user.Lookup(shared); err == nil && su.Uid == u.Uid {
+				return nil, fmt.Errorf("file_restore.run_as %q is %s, which owns or shares production VM disks and keys; "+
+					"restore VMs run as a dedicated user (%s)", name, shared, DefaultRestoreUser)
 			}
 		}
-		return qu, nil
 	}
-	return nil, fmt.Errorf("no user to run qemu as (tried %s; set file_restore.run_as)", strings.Join(names, ", "))
+	qu := &qemuUser{name: name, uid: uint32(uid), gid: uint32(gid)}
+	if gs, err := u.GroupIds(); err == nil {
+		for _, g := range gs {
+			if v, err := strconv.ParseUint(g, 10, 32); err == nil {
+				qu.groups = append(qu.groups, uint32(v))
+			}
+		}
+	}
+	return qu, nil
 }
 
 // accessibleTo reports whether u may open path read-write by its mode bits.
@@ -223,6 +323,86 @@ func containsU32(s []uint32, v uint32) bool {
 	return false
 }
 
+// appArmorEnabled reports whether AppArmor is enabled and its parser is
+// installed.
+func appArmorEnabled() bool {
+	if b, err := os.ReadFile("/sys/module/apparmor/parameters/enabled"); err != nil || !strings.HasPrefix(string(b), "Y") {
+		return false
+	}
+	_, err := exec.LookPath("apparmor_parser")
+	return err == nil
+}
+
+// appArmorProfileText is the restore qemu's profile: the qemu binary and its
+// libraries and firmware, /dev/kvm and the vhost-vsock fd, the boot files,
+// and its own session's socket and nonce. Nothing else on the host —
+// not /var/lib/litevirt, not any VM disk, not any key.
+func appArmorProfileText(cacheDir, runDir string) string {
+	return `abi <abi/3.0>,
+include <tunables/global>
+
+profile ` + AppArmorProfile + ` flags=(attach_disconnected) {
+  include <abstractions/base>
+
+  /usr/bin/qemu-system-* mr,
+  /usr/libexec/qemu-kvm mr,
+  /{usr/,}lib{,32,64}/** mr,
+  /{usr/,}lib/@{multiarch}/** mr,
+  /usr/share/qemu/** r,
+  /usr/share/seabios/** r,
+  /usr/share/ipxe/** r,
+  /usr/lib/ipxe/** r,
+  /usr/share/OVMF/** r,
+  /etc/ld.so.cache r,
+  /proc/sys/vm/overcommit_memory r,
+  /proc/sys/kernel/cap_last_cap r,
+  /sys/devices/system/cpu/** r,
+  /sys/devices/system/node/** r,
+  /sys/kernel/mm/transparent_hugepage/** r,
+  /sys/module/vhost/parameters/** r,
+  owner @{PROC}/@{pid}/** r,
+  owner @{PROC}/@{pid}/task/*/comm rw,
+
+  /dev/kvm rw,
+  /dev/vhost-vsock rw,
+
+  ` + filepath.Join(cacheDir, "*") + ` r,
+  ` + filepath.Join(runDir, "s-*", "nbd.sock") + ` rw,
+  ` + filepath.Join(runDir, "s-*", "nonce") + ` r,
+  unix (connect, send, receive) type=stream,
+
+  signal (receive) peer=unconfined,
+  deny ptrace,
+  deny mount,
+  deny network inet,
+  deny network inet6,
+}
+`
+}
+
+// ensureProfile loads (or reloads, if its text changed) the restore qemu's
+// AppArmor profile from memory: nothing is written under /etc.
+func (l *Launcher) ensureProfile() error {
+	text := appArmorProfileText(l.cfg.CacheDir, l.cfg.RunDir)
+	l.aaMu.Lock()
+	defer l.aaMu.Unlock()
+	if l.aaLoaded == text && profileLoaded() {
+		return nil
+	}
+	cmd := exec.Command("apparmor_parser", "-r", "-W")
+	cmd.Stdin = strings.NewReader(text)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("load AppArmor profile %s: %v: %s", AppArmorProfile, err, strings.TrimSpace(string(out)))
+	}
+	l.aaLoaded = text
+	return nil
+}
+
+func profileLoaded() bool {
+	b, err := os.ReadFile("/sys/kernel/security/apparmor/profiles")
+	return err == nil && bytes.Contains(b, []byte(AppArmorProfile+" ("))
+}
+
 // Session is one running restore VM and its connection.
 type Session struct {
 	*Client
@@ -238,25 +418,26 @@ type Session struct {
 // Open boots a restore VM on dev and connects to its agent. kind is
 // KindFS or KindArchive; format is how qemu reads dev ("raw" or "qcow2").
 func (l *Launcher) Open(ctx context.Context, dev BlockDevice, kind, format string) (*Session, error) {
-	h, err := l.check()
+	h, err := l.check(ctx, true)
 	if err != nil {
 		return nil, err
 	}
 	if l.cfg.CacheDir == "" || l.cfg.RunDir == "" {
 		return nil, errors.New("file restore: no cache or run directory")
 	}
-	owner := -1
-	if h.user != nil {
-		owner = int(h.user.uid)
+	if h.appArmor {
+		if err := l.ensureProfile(); err != nil {
+			return nil, unavailable("%v", err)
+		}
 	}
-	initrd, err := EnsureInitramfs(l.cfg.CacheDir, InitramfsSpec{Agent: h.agent, ModulesDir: h.modules}, owner)
+	initrd, err := EnsureInitramfs(l.cfg.CacheDir, InitramfsSpec{Agent: h.agent, ModulesDir: h.modules}, h.gid, l.cfg.OnTamper)
 	if err != nil {
 		return nil, unavailable("build the restore VM initramfs: %v", err)
 	}
 	kernel := h.kernel
 	if h.user != nil {
-		// The host's kernel image is root-only; qemu gets its own copy.
-		if kernel, err = ensureKernelCopy(l.cfg.CacheDir, h.kernel, owner); err != nil {
+		// The host's kernel image is root-only; qemu reads a group copy.
+		if kernel, err = ensureKernelCopy(l.cfg.CacheDir, h.kernel, h.gid, l.cfg.OnTamper); err != nil {
 			return nil, unavailable("copy the kernel for the restore VM: %v", err)
 		}
 	}
@@ -268,7 +449,7 @@ func (l *Launcher) Open(ctx context.Context, dev BlockDevice, kind, format strin
 		return nil, err
 	}
 	if h.user != nil {
-		// qemu (another user) must reach the socket in here, and only that.
+		// qemu (another user) must reach the socket and nonce in here.
 		if err := os.Chmod(dir, 0o711); err != nil {
 			_ = os.RemoveAll(dir)
 			return nil, err
@@ -287,9 +468,16 @@ func (l *Launcher) Open(ctx context.Context, dev BlockDevice, kind, format strin
 	if err := s.nbd.ListenUnix(sock); err != nil {
 		return nil, err
 	}
+	nonce := newNonce()
+	nonceFile := filepath.Join(dir, "nonce")
+	if err := os.WriteFile(nonceFile, []byte(nonce), 0o400); err != nil {
+		return nil, err
+	}
 	if h.user != nil {
-		if err := os.Chown(sock, int(h.user.uid), int(h.user.gid)); err != nil {
-			return nil, err
+		for _, f := range []string{sock, nonceFile} {
+			if err := os.Chown(f, int(h.user.uid), int(h.user.gid)); err != nil {
+				return nil, err
+			}
 		}
 	}
 	go func() { _ = s.nbd.Serve(context.Background()) }()
@@ -297,20 +485,24 @@ func (l *Launcher) Open(ctx context.Context, dev BlockDevice, kind, format strin
 	spec := VMSpec{
 		QEMU: h.qemu, Kernel: kernel, Initrd: initrd, MemoryMiB: l.cfg.memory(),
 		NBDSocket: sock, Export: "backup", DiskFormat: format, Kind: kind,
-		Arch: runtime.GOARCH, VhostFD: 3, Nonce: newNonce(),
-		AgentIdleSec: int(l.cfg.agentIdle() / time.Second), Sandbox: true,
+		Arch: runtime.GOARCH, VhostFD: 3, NonceFile: nonceFile,
+		AgentIdleSec: int(l.cfg.agentIdle() / time.Second), Sandbox: h.sandbox,
+	}
+	if !h.sandbox {
+		slog.Warn("file restore: running a restore VM WITHOUT qemu's seccomp sandbox (file_restore.allow_unsandboxed)", "qemu", h.qemu, "why", h.sandboxMsg)
 	}
 	var lastErr error
 	for attempt := 0; attempt < 6; attempt++ {
 		spec.CID = randomCID()
 		var stderr bytes.Buffer
-		if err := l.start(s, spec, h.user, &stderr); err != nil {
+		if err := l.start(s, spec, h, &stderr); err != nil {
 			return nil, unavailable("start qemu: %v", err)
 		}
-		lastErr = s.dial(ctx, spec.CID, spec.Nonce, l.cfg.bootTimeout())
+		lastErr = s.dial(ctx, spec.CID, nonce, l.cfg.bootTimeout())
 		if lastErr == nil {
 			ok = true
-			slog.Info("file restore: restore VM up", "cid", spec.CID, "boot", time.Since(s.started).Round(time.Millisecond), "sandbox", spec.Sandbox)
+			slog.Info("file restore: restore VM up", "cid", spec.CID, "boot", time.Since(s.started).Round(time.Millisecond),
+				"sandbox", spec.Sandbox, "apparmor", h.appArmor)
 			return s, nil
 		}
 		s.kill() // qemu has exited (Wait done) before its stderr is read
@@ -319,11 +511,13 @@ func (l *Launcher) Open(ctx context.Context, dev BlockDevice, kind, format strin
 		case stderrSaysCIDInUse(out):
 			continue // a CID collision: pick another
 		case spec.Sandbox && stderrSaysNoSeccomp(out):
-			// Decided per attempt, never remembered: a later session asks again.
+			// The probe passed but the VM's sandbox failed: decide again,
+			// for this attempt only.
 			if !l.cfg.AllowUnsandboxed {
-				return nil, unavailable("this qemu has no seccomp sandbox (%s); refusing to run a restore VM without it — set file_restore.allow_unsandboxed: true to permit it", wire.EscapeBounded(out, 300))
+				return nil, unavailable("this qemu could not install its seccomp sandbox (%s); refusing to run a restore VM without it — "+
+					"file_restore.allow_unsandboxed: true permits it, which is dangerous (see docs/backups.md)", wire.EscapeBounded(out, 300))
 			}
-			slog.Warn("file restore: this qemu has no seccomp sandbox; running this restore VM without it (file_restore.allow_unsandboxed)", "qemu", h.qemu)
+			slog.Warn("file restore: this qemu could not install its seccomp sandbox; running this restore VM without it (file_restore.allow_unsandboxed)", "qemu", h.qemu)
 			spec.Sandbox = false
 			continue
 		}
@@ -351,13 +545,21 @@ func newNonce() string {
 // qemuCommand builds the qemu process: started as u (when the daemon is
 // root) with u's groups, in its own process group, killed when the daemon
 // dies. Go applies the parent-death signal AFTER the credential change, so
-// it survives it (a setuid inside qemu would have cleared it).
-func qemuCommand(spec VMSpec, u *qemuUser, dir string, vhost *os.File, stdout, stderr io.Writer) (*exec.Cmd, error) {
+// it survives it (a setuid inside qemu would have cleared it). With
+// profile set, the litevirt binary at trampoline runs first, as qemu's
+// parent in the same process group: it starts qemu under that AppArmor
+// profile and kills it on the SIGTERM the daemon's death sends it.
+func qemuCommand(spec VMSpec, u *qemuUser, dir string, vhost *os.File, stdout, stderr io.Writer, trampoline, profile string) (*exec.Cmd, error) {
 	args, err := qemuArgs(spec)
 	if err != nil {
 		return nil, err
 	}
-	cmd := exec.Command(spec.QEMU, args...)
+	var cmd *exec.Cmd
+	if profile != "" {
+		cmd = exec.Command(trampoline, append([]string{TrampolineArg, profile, spec.QEMU}, args...)...)
+	} else {
+		cmd = exec.Command(spec.QEMU, args...)
+	}
 	cmd.Stdin = nil
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
@@ -365,19 +567,27 @@ func qemuCommand(spec VMSpec, u *qemuUser, dir string, vhost *os.File, stdout, s
 	cmd.Env = []string{"PATH=/usr/sbin:/usr/bin:/sbin:/bin"}
 	cmd.ExtraFiles = []*os.File{vhost} // fd 3 = spec.VhostFD
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGKILL}
+	if profile != "" {
+		// The trampoline turns the daemon's death into qemu's (RunTrampoline).
+		cmd.SysProcAttr.Pdeathsig = syscall.SIGTERM
+	}
 	if u != nil {
 		cmd.SysProcAttr.Credential = &syscall.Credential{Uid: u.uid, Gid: u.gid, Groups: u.groups}
 	}
 	return cmd, nil
 }
 
-func (l *Launcher) start(s *Session, spec VMSpec, u *qemuUser, stderr *bytes.Buffer) error {
+func (l *Launcher) start(s *Session, spec VMSpec, h *host, stderr *bytes.Buffer) error {
 	vhost, err := os.OpenFile(l.vhostPath, os.O_RDWR, 0)
 	if err != nil {
 		return err
 	}
 	defer vhost.Close() // qemu holds its own copy
-	cmd, err := qemuCommand(spec, u, s.dir, vhost, s.console, &limitedBuffer{b: stderr, max: 16 << 10})
+	profile := ""
+	if h.appArmor {
+		profile = AppArmorProfile
+	}
+	cmd, err := qemuCommand(spec, h.user, s.dir, vhost, s.console, &limitedBuffer{b: stderr, max: 16 << 10}, h.agent, profile)
 	if err != nil {
 		return err
 	}
@@ -390,15 +600,21 @@ func (l *Launcher) start(s *Session, spec VMSpec, u *qemuUser, stderr *bytes.Buf
 		_ = c.Wait()
 		close(done)
 	}(cmd, s.exited)
-	// The pidfile lets a later daemon find and kill this VM if this one
-	// dies without doing so (SweepStale).
-	if err := os.WriteFile(filepath.Join(s.dir, pidFile), []byte(strconv.Itoa(cmd.Process.Pid)+"\n"), 0o600); err != nil {
-		return err
+	// The pidfile (pid and the uid it runs as) lets a later daemon find and
+	// kill this VM if this one dies without doing so (SweepStale).
+	uid := os.Geteuid()
+	if h.user != nil {
+		uid = int(h.user.uid)
 	}
-	return nil
+	return os.WriteFile(filepath.Join(s.dir, pidFile), []byte(fmt.Sprintf("%d %d\n", cmd.Process.Pid, uid)), 0o600)
 }
 
 const pidFile = "qemu.pid"
+
+// helloTimeout bounds one hello during boot: an agent (or a foreign VM on
+// the same CID) that accepts and never answers must not hold the boot past
+// its deadline.
+const helloTimeout = 5 * time.Second
 
 // dial connects to the agent, retrying while the VM boots, and checks the
 // agent answers with this session's nonce.
@@ -416,7 +632,14 @@ func (s *Session) dial(ctx context.Context, cid uint32, nonce string, timeout ti
 		conn, err := dialVsock(cid, wire.AgentPort)
 		if err == nil {
 			s.Client = NewClient(conn)
-			if err := s.Client.Hello(nonce); err == nil {
+			wait := helloTimeout
+			if left := time.Until(deadline); left < wait {
+				wait = left
+			}
+			if wait <= 0 {
+				wait = time.Second
+			}
+			if err := s.Client.Hello(nonce, wait); err == nil {
 				return nil
 			} else {
 				last = err
@@ -491,9 +714,11 @@ func (s *Session) Close() {
 
 // SweepStale kills the restore VMs a previous daemon left in runDir and
 // removes their session directories. A VM is killed only when its pidfile
-// names a live process whose command line is a restore VM of THAT session
-// (it names the session directory): a recycled pid is never touched.
-// Returns the number killed.
+// names a live process that runs as the uid the pidfile records and whose
+// command line is the restore VM of THAT session (it names the session's
+// socket); the process is held by a pidfd from before the checks to the
+// kill, so a pid recycled in between is never signalled. Returns the number
+// killed.
 func SweepStale(runDir string) int {
 	ents, err := os.ReadDir(runDir)
 	if err != nil {
@@ -505,8 +730,7 @@ func SweepStale(runDir string) int {
 			continue
 		}
 		dir := filepath.Join(runDir, e.Name())
-		if pid := readPid(filepath.Join(dir, pidFile)); pid > 1 && isRestoreVM(pid, dir) {
-			_ = syscall.Kill(pid, syscall.SIGKILL)
+		if pid, uid := readPid(filepath.Join(dir, pidFile)); pid > 1 && killVerified(pid, uid, dir) {
 			killed++
 		}
 		_ = os.RemoveAll(dir)
@@ -514,16 +738,64 @@ func SweepStale(runDir string) int {
 	return killed
 }
 
-func readPid(path string) int {
-	b, err := os.ReadFile(path)
-	if err != nil || len(b) > 32 {
-		return 0
-	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
+// killVerified SIGKILLs pid if it is still the restore VM of dir running as
+// uid.
+func killVerified(pid, uid int, dir string) bool {
+	pidfd, err := unix.PidfdOpen(pid, 0)
 	if err != nil {
-		return 0
+		return false // gone (or no pidfd support: never kill unverified)
 	}
-	return pid
+	defer unix.Close(pidfd)
+	if !isRestoreVM(pid, dir) || procUID(pid) != uid {
+		return false
+	}
+	// Still the process the checks read? (A dead one's pid may be reused;
+	// its pidfd then fails.)
+	if err := unix.PidfdSendSignal(pidfd, 0, nil, 0); err != nil {
+		return false
+	}
+	if unix.PidfdSendSignal(pidfd, unix.SIGKILL, nil, 0) != nil {
+		return false
+	}
+	// The session ran in its own process group (pgid = pid): a trampoline's
+	// qemu child goes with it.
+	_ = syscall.Kill(-pid, syscall.SIGKILL)
+	return true
+}
+
+func readPid(path string) (pid, uid int) {
+	b, err := os.ReadFile(path)
+	if err != nil || len(b) > 64 {
+		return 0, -1
+	}
+	f := strings.Fields(string(b))
+	if len(f) != 2 {
+		return 0, -1
+	}
+	pid, err1 := strconv.Atoi(f[0])
+	uid, err2 := strconv.Atoi(f[1])
+	if err1 != nil || err2 != nil {
+		return 0, -1
+	}
+	return pid, uid
+}
+
+// procUID is pid's real uid, or -1.
+func procUID(pid int) int {
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+	if err != nil {
+		return -1
+	}
+	for _, l := range strings.Split(string(b), "\n") {
+		if strings.HasPrefix(l, "Uid:") {
+			if f := strings.Fields(l); len(f) >= 2 {
+				if n, err := strconv.Atoi(f[1]); err == nil {
+					return n
+				}
+			}
+		}
+	}
+	return -1
 }
 
 // isRestoreVM reports whether pid's command line is the restore VM of the
@@ -560,4 +832,90 @@ func (l *limitedBuffer) Write(p []byte) (int, error) {
 		}
 	}
 	return len(p), nil
+}
+
+// RunTrampoline is the litevirt binary run as `litevirt __file-restore-exec
+// <profile> <qemu> <args...>` (already as the restore user, in the session's
+// process group). It runs in two stages:
+//
+//   - the parent stage stays as qemu's parent: it starts the second stage,
+//     and on SIGTERM (the parent-death signal the daemon gives it) or any end
+//     kills it and exits with its status;
+//   - the exec stage (`… __file-restore-exec --exec <profile> <qemu> …`) sets
+//     its AppArmor profile for its next exec and execs qemu in place, which
+//     starts confined.
+//
+// Two stages because AppArmor's on-exec profile applies to the task that set
+// it (not to a child it forks), and because the exec into a new profile is a
+// secure exec, across which the kernel clears the parent-death signal: a qemu
+// exec'd straight from the daemon would no longer die with it.
+func RunTrampoline(args []string) {
+	if len(args) >= 1 && args[0] == "--exec" {
+		runTrampolineExec(args[1:])
+		return
+	}
+	if len(args) < 2 {
+		fmt.Fprintln(os.Stderr, "file-restore exec: want <profile> <qemu> [args...]")
+		os.Exit(2)
+	}
+	sigs := make(chan os.Signal, 4)
+	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
+	cmd := exec.Command("/proc/self/exe", append([]string{TrampolineArg, "--exec"}, args...)...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, os.Stdout, os.Stderr
+	cmd.Env = os.Environ()
+	cmd.ExtraFiles = []*os.File{os.NewFile(3, "vhost-vsock")} // fd 3 stays fd 3
+	if err := cmd.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "file-restore exec: start: %v\n", err)
+		os.Exit(1)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case <-sigs:
+		_ = cmd.Process.Kill()
+		<-done
+		os.Exit(1)
+	case err := <-done:
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			os.Exit(ee.ExitCode() & 0xff)
+		}
+		if err != nil {
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+}
+
+func runTrampolineExec(args []string) {
+	if len(args) < 2 {
+		os.Exit(2)
+	}
+	profile, qemu := args[0], args[1]
+	if err := setExecProfile(profile); err != nil {
+		fmt.Fprintf(os.Stderr, "file-restore exec: set AppArmor profile %s: %v\n", profile, err)
+		os.Exit(1)
+	}
+	err := syscall.Exec(qemu, append([]string{qemu}, args[2:]...), os.Environ())
+	fmt.Fprintf(os.Stderr, "file-restore exec: exec %s: %v\n", qemu, err)
+	os.Exit(1)
+}
+
+// setExecProfile asks AppArmor to confine this process's next exec by
+// profile (aa_change_onexec).
+func setExecProfile(profile string) error {
+	msg := []byte("exec " + profile)
+	var err error
+	for _, p := range []string{"/proc/self/attr/apparmor/exec", "/proc/self/attr/exec"} {
+		var f *os.File
+		if f, err = os.OpenFile(p, os.O_WRONLY, 0); err != nil {
+			continue
+		}
+		_, err = f.Write(msg)
+		f.Close()
+		if err == nil {
+			return nil
+		}
+	}
+	return err
 }

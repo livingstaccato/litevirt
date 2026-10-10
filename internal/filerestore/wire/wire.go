@@ -25,9 +25,12 @@ const AgentPort = 5000
 const (
 	EnvAgent = "litevirt_filerestore" // "1": run as the restore agent
 	EnvKind  = "litevirt_fr_kind"     // KindFS or KindArchive
-	EnvNonce = "litevirt_fr_nonce"    // the session's nonce, echoed by OpHello
 	EnvIdle  = "litevirt_fr_idle"     // seconds without a request before the agent powers off
 )
+
+// FwCfgNonce is the fw_cfg item the session's nonce is handed to the guest
+// in; the agent echoes it to OpHello.
+const FwCfgNonce = "opt/litevirt/nonce"
 
 // What the restore VM's disk holds.
 const (

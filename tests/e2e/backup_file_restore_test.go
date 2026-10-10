@@ -50,6 +50,7 @@ func TestLab_BackupFileRestore(t *testing.T) {
 	// its isolation on the node, not in litevirt.
 	ps := l.mustSSH(host, 30*time.Second, "pgrep -af '[l]itevirt-file-restore' || true")
 	l.saveEvidence("bkfr-qemu", ps)
+	ps = strings.TrimSpace(ps)
 	for _, want := range []string{"-nic none", "-nodefaults", `"read-only":true`, "vhost-vsock-pci", "-sandbox on"} {
 		if !strings.Contains(ps, want) {
 			t.Errorf("the restore VM's command line lacks %q:\n%s", want, ps)
@@ -58,16 +59,39 @@ func TestLab_BackupFileRestore(t *testing.T) {
 	if strings.Contains(ps, "-netdev") {
 		t.Errorf("the restore VM has a network device:\n%s", ps)
 	}
-	// I-5: qemu runs as the unprivileged qemu user, with a seccomp filter.
-	pid := strings.Fields(strings.TrimSpace(ps))[0]
+	// qemu runs as the dedicated restore user (never libvirt-qemu or root),
+	// with a seccomp filter, confined by its AppArmor profile where AppArmor
+	// is on. The trampoline (its parent) carries the same arguments; pick qemu.
+	pid := ""
+	for _, ln := range strings.Split(strings.TrimSpace(ps), "\n") {
+		if f := strings.Fields(ln); len(f) > 1 && !strings.Contains(ln, "__file-restore-exec") {
+			pid = f[0]
+		}
+	}
+	if pid == "" {
+		t.Fatalf("no restore VM qemu in:\n%s", ps)
+	}
 	who := strings.TrimSpace(l.mustSSH(host, 30*time.Second, "ps -o user= -p "+pid))
 	sec := l.mustSSH(host, 30*time.Second, "grep -E '^Seccomp:' /proc/"+pid+"/status")
-	l.saveEvidence("bkfr-qemu-user", who+"\n"+sec)
-	if who == "root" || who == "" {
-		t.Errorf("the restore VM's qemu runs as %q, want the unprivileged qemu user", who)
+	aa := l.mustSSH(host, 30*time.Second, "cat /proc/"+pid+"/attr/current 2>/dev/null; cat /sys/module/apparmor/parameters/enabled 2>/dev/null || true")
+	l.saveEvidence("bkfr-qemu-user", who+"\n"+sec+"\n"+aa)
+	if who != "litevirt-restore" {
+		t.Errorf("the restore VM's qemu runs as %q, want the dedicated litevirt-restore", who)
 	}
 	if !strings.Contains(sec, "2") {
 		t.Errorf("the restore VM's qemu has no seccomp filter: %s", sec)
+	}
+	if strings.Contains(aa, "\nY") && !strings.Contains(aa, "litevirt-restore-qemu (enforce)") {
+		t.Errorf("AppArmor is on but the restore VM's qemu is not confined: %s", aa)
+	}
+	// The boot files: root-owned, read-only to the restore group, outside
+	// /var/lib/litevirt.
+	cache := l.mustSSH(host, 30*time.Second, "stat -c '%U:%G %a %n' /var/cache/litevirt-restore /var/cache/litevirt-restore/* | grep -v sha256")
+	l.saveEvidence("bkfr-cache", cache)
+	for _, ln := range strings.Split(strings.TrimSpace(cache), "\n") {
+		if !strings.HasPrefix(ln, "root:litevirt-restore 440 ") && !strings.HasPrefix(ln, "root:litevirt-restore 750 ") {
+			t.Errorf("restore boot file not root-owned and read-only to the restore group: %s", ln)
+		}
 	}
 
 	archive := "/var/tmp/e2e-bkfr-" + vm + ".tar"

@@ -9,9 +9,11 @@ import (
 	"io"
 	"path"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
+	"golang.org/x/text/cases"
 	"golang.org/x/text/unicode/norm"
 
 	"github.com/litevirt/litevirt/internal/filerestore/wire"
@@ -84,10 +86,13 @@ type TarLimits struct {
 
 // TarStats reports what SanitizeStream wrote and left out.
 type TarStats struct {
-	Entries   int
-	Bytes     int64
-	Skipped   int // entries refused (name, type, outside the selection, under a symlink, duplicate)
-	Truncated bool
+	Entries int
+	Bytes   int64 // file content bytes in the archive
+	Skipped int   // entries refused (name, type, outside the selection, under a symlink, duplicate)
+	// LinksDropped counts symlinks left out because their target is
+	// absolute or leads outside the archive (also counted in Skipped).
+	LinksDropped int
+	Truncated    bool
 }
 
 // ErrLimit means the extraction hit a bound; the archive written so far is
@@ -104,13 +109,28 @@ var maxRecords = 4 * DefaultMaxEntries
 // how long the names are. (A var for tests.)
 var maxTracked = DefaultMaxEntries
 
+// MaxDepth bounds the components of an extracted name. Real trees are far
+// shallower; the bound keeps the per-record work of the checks below small.
+const MaxDepth = 256
+
+// tarHeaderAllowance is what one tar header can cost beyond its name and
+// link target (the header block, a PAX block, padding), counted against
+// the archive's byte cap.
+const tarHeaderAllowance = 3 * 512
+
 // nameKey is the fixed-size key a name is remembered by: a hash of its
-// case-folded NFC form, so names that a case-insensitive or normalizing
-// filesystem (macOS, Windows) would extract to one path collide here too.
+// Unicode case-folded, NFC-normalized form, so names that a case-insensitive
+// or normalizing filesystem (macOS, Windows) would extract to one path
+// collide here too — "ſ" and "s", "ς" and "σ" included.
 type nameKey [16]byte
 
+// keyCalls counts keyOf calls (tests bound the per-record work).
+var keyCalls int64
+
 func keyOf(name string) nameKey {
-	sum := sha256.Sum256([]byte(norm.NFC.String(strings.ToLower(name))))
+	atomic.AddInt64(&keyCalls, 1)
+	// A Caser keeps state: one per call, never shared between goroutines.
+	sum := sha256.Sum256([]byte(norm.NFC.String(cases.Fold().String(norm.NFC.String(name)))))
 	var k nameKey
 	copy(k[:], sum[:16])
 	return k
@@ -120,19 +140,24 @@ func keyOf(name string) nameKey {
 // lines and file bytes) and writes a fresh tar archive to dst holding only
 // what is safe to hand a caller:
 //
-//   - names: relative, clean, no "..", every component a valid name, UTF-8,
+//   - names: relative, clean, no "..", at most MaxDepth components, every
+//     component a valid name, UTF-8 with no control or bidi characters,
 //     bounded, and inside one of the selected paths (selections are
 //     "<volume>/<path>", as the agent names entries);
 //   - types: directories, regular files and symlinks only;
+//   - a symlink only with a relative target that stays inside the archive
+//     (resolved against the link's own directory); an absolute or escaping
+//     one is left out and counted in LinksDropped;
 //   - no entry under a symlink this archive already holds, and no name twice
-//     — compared case-folded and NFC-normalized, so extracting the archive
-//     on a case-insensitive filesystem cannot write through a link either;
+//     — compared Unicode case-folded and NFC-normalized, so extracting the
+//     archive on a case-insensitive filesystem cannot write through a link
+//     either;
 //   - headers built from scratch: permission bits only (no setuid, setgid or
 //     sticky), no owner, no xattrs;
-//   - bounded: total file bytes and entries (ErrLimit, the archive still
-//     closed and valid), records read, names remembered, and each record
-//     line. A size is compared without overflow, and the bytes counted are
-//     the bytes written.
+//   - bounded: the whole archive's bytes, headers included (ErrLimit, the
+//     archive still closed and valid), entries, records read, names
+//     remembered, and each record line. A size is compared without
+//     overflow, and the bytes counted are the bytes written.
 //
 // The stream is not tar: no PAX records, sparse maps or long-name
 // extensions reach a parser here. It never resolves, opens or creates a
@@ -149,6 +174,7 @@ func SanitizeStream(dst io.Writer, src *bufio.Reader, selections []string, lim T
 	tw := tar.NewWriter(cw)
 	seen := map[nameKey]struct{}{}
 	symlinks := map[nameKey]struct{}{}
+	linkDepths := map[int]struct{}{} // depths (component counts) at which a symlink was written
 	records := 0
 	var discarded int64 // bytes of refused entries read and dropped
 	var limitErr error
@@ -174,17 +200,21 @@ func SanitizeStream(dst io.Writer, src *bufio.Reader, selections []string, lim T
 			return st, fmt.Errorf("restore VM sent a negative size for %q", wire.Escape(rec.Name))
 		}
 		name, ok := cleanTarName(rec.Name)
-		key := keyOf(name)
 		refuse := !ok || !underSelection(name, selections)
+		var key nameKey
 		if !refuse {
+			key = keyOf(name)
 			_, dup := seen[key]
-			refuse = dup || underSymlink(name, symlinks)
+			refuse = dup || underSymlink(name, symlinks, linkDepths)
 		}
 		if !refuse {
 			switch rec.Type {
 			case TypeDir, TypeFile:
 			case TypeSymlink:
-				refuse = rec.Link == "" || len(rec.Link) > MaxPathLen || !utf8.ValidString(rec.Link) || strings.ContainsRune(rec.Link, 0)
+				if !linkTargetOK(name, rec.Link) {
+					refuse = true
+					st.LinksDropped++
+				}
 			default:
 				refuse = true
 			}
@@ -203,8 +233,10 @@ func SanitizeStream(dst io.Writer, src *bufio.Reader, selections []string, lim T
 			}
 			continue
 		}
-		// Overflow-safe: size against what is left, never st.Bytes+size.
-		if st.Entries >= lim.MaxEntries || size > lim.MaxBytes-st.Bytes {
+		// Overflow-safe, and over the whole archive: this entry's header
+		// (name, link, blocks) and data against what is left of the cap.
+		cost := int64(len(name)+len(rec.Link)) + tarHeaderAllowance
+		if st.Entries >= lim.MaxEntries || size > lim.MaxBytes-cw.n || cost > lim.MaxBytes-cw.n-size {
 			st.Truncated = true
 			limitErr = ErrLimit
 			break
@@ -229,6 +261,7 @@ func SanitizeStream(dst io.Writer, src *bufio.Reader, selections []string, lim T
 		seen[key] = struct{}{}
 		if rec.Type == TypeSymlink {
 			symlinks[key] = struct{}{}
+			linkDepths[strings.Count(name, "/")+1] = struct{}{}
 		}
 		if size > 0 {
 			before := cw.n
@@ -245,6 +278,20 @@ func SanitizeStream(dst io.Writer, src *bufio.Reader, selections []string, lim T
 		return st, err
 	}
 	return st, limitErr
+}
+
+// linkTargetOK reports whether a symlink at name may point at target: a
+// relative target that, resolved against the link's directory, stays inside
+// the archive. An absolute target, or one whose ".." leads above the
+// archive's root, could make a later extraction (or a later archive
+// extracted into the same directory) write outside it.
+func linkTargetOK(name, target string) bool {
+	if target == "" || len(target) > MaxPathLen || !utf8.ValidString(target) || strings.ContainsRune(target, 0) ||
+		strings.HasPrefix(target, "/") || wire.HasUnsafe(target) {
+		return false
+	}
+	resolved := path.Clean(path.Join(path.Dir(name), target))
+	return resolved != ".." && !strings.HasPrefix(resolved, "../") && resolved != "."
 }
 
 // countingWriter counts the bytes written through it.
@@ -280,6 +327,9 @@ func cleanTarName(n string) (string, bool) {
 	if path.Clean(n) != n {
 		return "", false
 	}
+	if strings.Count(n, "/") >= MaxDepth || wire.HasUnsafe(n) {
+		return "", false // too deep, or a control, bidi or invisible character
+	}
 	for _, c := range strings.Split(n, "/") {
 		if !wire.ValidName(c) {
 			return "", false
@@ -299,13 +349,20 @@ func underSelection(name string, selections []string) bool {
 }
 
 // underSymlink reports whether any proper ancestor of name is (case-folded)
-// a symlink the archive already holds.
-func underSymlink(name string, symlinks map[nameKey]struct{}) bool {
+// a symlink the archive already holds. Only the ancestors at a depth where
+// some symlink was written are hashed, so a deep name costs one hash per
+// such depth, not one per component.
+func underSymlink(name string, symlinks map[nameKey]struct{}, depths map[int]struct{}) bool {
 	if len(symlinks) == 0 {
 		return false
 	}
+	depth := 0
 	for i := 0; i < len(name); i++ {
 		if name[i] == '/' {
+			depth++
+			if _, ok := depths[depth]; !ok {
+				continue
+			}
 			if _, ok := symlinks[keyOf(name[:i])]; ok {
 				return true
 			}

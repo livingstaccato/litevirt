@@ -1198,8 +1198,9 @@ type FileRestoreConfig struct {
 	QEMU string `yaml:"qemu,omitempty"`
 	// MemoryMiB is the restore VM's memory (default 512, minimum 256).
 	MemoryMiB int `yaml:"memory_mib,omitempty"`
-	// RunAs is the user qemu drops to (default libvirt-qemu, qemu or nobody,
-	// the first that exists).
+	// RunAs is the user a restore VM's qemu is started as (default
+	// litevirt-restore, created at daemon start; root, libvirt-qemu, qemu
+	// and nobody are refused unless allow_unsandboxed).
 	RunAs string `yaml:"run_as,omitempty"`
 	// IdleTimeoutSec kills a browsing session's restore VM after this long
 	// unused (default 300).

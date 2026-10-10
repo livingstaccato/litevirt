@@ -118,7 +118,7 @@ func TestSanitize_OnlySafeTypes(t *testing.T) {
 	got, st, err := sanitize(t, stream(t, false,
 		dir("vda1/dir"),
 		file("vda1/dir/f", "data"),
-		link("vda1/lnk", "/etc/shadow"),
+		link("vda1/lnk", "dir/f"),
 		rec{wire.Record{Name: "vda1/hard", Type: "hardlink", Link: "vda1/dir/f"}, ""},
 		rec{wire.Record{Name: "vda1/dev", Type: TypeOther}, ""},
 		rec{wire.Record{Name: "vda1/blk", Type: "blockdev"}, ""},
@@ -136,7 +136,7 @@ func TestSanitize_OnlySafeTypes(t *testing.T) {
 			t.Errorf("%s passed", refused)
 		}
 	}
-	if got["vda1/lnk"].h.Typeflag != tar.TypeSymlink || got["vda1/lnk"].h.Linkname != "/etc/shadow" {
+	if got["vda1/lnk"].h == nil || got["vda1/lnk"].h.Typeflag != tar.TypeSymlink || got["vda1/lnk"].h.Linkname != "dir/f" {
 		t.Errorf("symlink not kept as a symlink: %+v", got["vda1/lnk"].h)
 	}
 	if st.Skipped != 3 {
@@ -148,10 +148,11 @@ func TestSanitize_OnlySafeTypes(t *testing.T) {
 // symlink the archive holds, and no name twice.
 func TestSanitize_NothingThroughASymlink(t *testing.T) {
 	got, _, err := sanitize(t, stream(t, false,
-		link("vda1/esc", "/root/.ssh"),
+		// Targets inside the archive, so the links themselves are kept.
+		link("vda1/esc", "other"),
 		file("vda1/esc/authorized_keys", "ssh-ed25519 attacker"),
 		dir("vda1/d"),
-		link("vda1/d", "/etc"),
+		link("vda1/d", "other"),
 		file("vda1/d/cron.d", "x"),
 	), []string{"vda1"}, TarLimits{})
 	if err != nil {
@@ -176,9 +177,9 @@ func TestSanitize_NothingThroughASymlink(t *testing.T) {
 func TestSanitize_CaseAndNormalizationCollisions(t *testing.T) {
 	nfc, nfd := "vda1/café", "vda1/café"
 	got, st, err := sanitize(t, stream(t, false,
-		link("vda1/A", "/root/.ssh"),
+		link("vda1/A", "x"),
 		file("vda1/a/authorized_keys", "attacker"),
-		link(nfc, "/etc"),
+		link(nfc, "x"),
 		file(nfd+"/cron", "x"),
 		file("vda1/Readme", "1"),
 		file("vda1/README", "2"),
@@ -216,9 +217,11 @@ func TestSanitize_Limits(t *testing.T) {
 		file("vda1/b", strings.Repeat("b", 100)),
 		file("vda1/c", strings.Repeat("c", 100)),
 	)
-	got, st, err := sanitize(t, in, []string{"vda1"}, TarLimits{MaxBytes: 250})
+	// The cap is the whole archive's: each entry here costs its 512-byte
+	// header and padded data, plus the header allowance it is checked with.
+	got, st, err := sanitize(t, in, []string{"vda1"}, TarLimits{MaxBytes: 3000})
 	if !errors.Is(err, ErrLimit) || !st.Truncated {
-		t.Fatalf("want ErrLimit and Truncated at 250 bytes, got %v %+v", err, st)
+		t.Fatalf("want ErrLimit and Truncated at 3000 bytes, got %v %+v", err, st)
 	}
 	if len(got) != 2 || st.Bytes != 200 {
 		t.Fatalf("got %v (%d bytes), want a and b only", keys(got), st.Bytes)
@@ -374,5 +377,111 @@ func TestSelectionNamesAndPaths(t *testing.T) {
 	got, err := SelectionNames([]string{"/vda1/etc//hosts/"})
 	if err != nil || got[0] != "vda1/etc/hosts" {
 		t.Errorf("got %v %v", got, err)
+	}
+}
+
+// N-6: Unicode case folding, as APFS and NTFS apply it — "ſ" is "s", "ς"
+// is "σ" — not just ToLower.
+func TestSanitize_UnicodeCaseFolding(t *testing.T) {
+	got, st, err := sanitize(t, stream(t, false,
+		link("vda1/s", "x"),
+		file("vda1/ſ/authorized_keys", "attacker"), // ſ
+		file("vda1/σ", "1"),                        // σ
+		file("vda1/ς", "2"),                        // ς
+	), []string{"vda1"}, TarLimits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got["vda1/ſ/authorized_keys"]; ok {
+		t.Error("an entry under a symlink, spelled with ſ for s, passed")
+	}
+	if _, ok := got["vda1/ς"]; ok {
+		t.Error("ς passed beside σ")
+	}
+	if st.Skipped != 2 {
+		t.Errorf("skipped %d, want 2", st.Skipped)
+	}
+}
+
+// N-3: names have at most MaxDepth components, and a deep name costs a
+// hash per depth where a symlink was written, not one per component.
+func TestSanitize_DepthBoundedAndCheap(t *testing.T) {
+	deep := "vda1" + strings.Repeat("/d", MaxDepth)
+	got, _, err := sanitize(t, stream(t, false, file(deep, "x")), []string{"vda1"}, TarLimits{})
+	if err != nil || len(got) != 0 {
+		t.Fatalf("a %d-deep name: %v %v", MaxDepth+1, keys(got), err)
+	}
+	// One symlink at depth 2, then many deep records under other names.
+	recs := []rec{link("vda1/l", "x")}
+	for i := 0; i < 200; i++ {
+		recs = append(recs, file("vda1/q"+strconv.Itoa(i)+strings.Repeat("/d", 200), ""))
+	}
+	before := keyCalls
+	if _, _, err := sanitize(t, stream(t, false, recs...), []string{"vda1"}, TarLimits{}); err != nil {
+		t.Fatal(err)
+	}
+	// Per record: its own key, and one ancestor at the symlink's depth.
+	if calls := keyCalls - before; calls > int64(3*len(recs)) {
+		t.Fatalf("%d hashes for %d records of depth 200: the check grows with depth", calls, len(recs))
+	}
+}
+
+// Names with control, bidi or invisible characters never reach a tar.
+func TestSanitize_RefusesControlCharactersInNames(t *testing.T) {
+	got, st, err := sanitize(t, stream(t, false,
+		file("vda1/ok", "1"),
+		file("vda1/esc\x1b[2J", "2"),
+		file("vda1/nl\nname", "3"),
+		file("vda1/bidi‮gnp.exe", "4"),
+	), []string{"vda1"}, TarLimits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || st.Skipped != 3 {
+		t.Fatalf("got %v skipped %d", keys(got), st.Skipped)
+	}
+}
+
+// N-8: a symlink is kept only with a relative target that stays inside the
+// archive; absolute and escaping targets are left out and counted.
+func TestSanitize_SymlinkTargetsConfined(t *testing.T) {
+	got, st, err := sanitize(t, stream(t, false,
+		link("vda1/etc/rel", "hosts"),
+		link("vda1/etc/up", "../usr/share/x"),
+		link("vda1/top", "../vda2/other"),
+		link("vda1/abs", "/etc/shadow"),
+		link("vda1/esc", "../../.ssh"),
+		link("vda1/a/b/esc2", "../../../../home/u/.ssh"),
+		link("vda1/self", "."),
+	), []string{"vda1"}, TarLimits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, kept := range []string{"vda1/etc/rel", "vda1/etc/up", "vda1/top", "vda1/self"} {
+		if _, ok := got[kept]; !ok {
+			t.Errorf("%s (a target inside the archive) was dropped", kept)
+		}
+	}
+	for _, dropped := range []string{"vda1/abs", "vda1/esc", "vda1/a/b/esc2"} {
+		if _, ok := got[dropped]; ok {
+			t.Errorf("%s (an absolute or escaping target) was kept", dropped)
+		}
+	}
+	if st.LinksDropped != 3 {
+		t.Errorf("links dropped %d, want 3 (abs, esc, esc2)", st.LinksDropped)
+	}
+}
+
+// Nit: the byte cap covers the whole archive, headers included — empty
+// files with long names cannot stream past it.
+func TestSanitize_HeaderBytesCount(t *testing.T) {
+	var recs []rec
+	for i := 0; i < 1000; i++ {
+		recs = append(recs, file("vda1/"+strings.Repeat("n", 200)+strconv.Itoa(i), ""))
+	}
+	var out bytes.Buffer
+	st, err := SanitizeStream(&out, bufio.NewReader(bytes.NewReader(stream(t, false, recs...))), []string{"vda1"}, TarLimits{MaxBytes: 64 << 10})
+	if !errors.Is(err, ErrLimit) || int64(out.Len()) > 64<<10+2048 {
+		t.Fatalf("1000 empty files with 200-byte names under a 64 KiB cap: err=%v, archive %d bytes (%d entries)", err, out.Len(), st.Entries)
 	}
 }

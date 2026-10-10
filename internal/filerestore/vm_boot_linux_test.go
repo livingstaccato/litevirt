@@ -81,6 +81,22 @@ func bootLauncher(t *testing.T) *Launcher {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(base) })
 	_ = os.Chmod(base, 0o711)
+	if os.Geteuid() == 0 {
+		// As the daemon does at start.
+		if err := EnsureRestoreUser(); err != nil {
+			t.Fatal(err)
+		}
+		// The agent binary is also the AppArmor trampoline the restore user
+		// execs: put a copy where that user can reach it.
+		b, err := os.ReadFile(agent)
+		if err != nil {
+			t.Fatal(err)
+		}
+		agent = filepath.Join(base, "litevirt")
+		if err := os.WriteFile(agent, b, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
 	l := NewLauncher(Config{
 		Kernel: kernel, Agent: agent, BootTimeout: 120 * time.Second,
 		CacheDir: filepath.Join(base, "cache"), RunDir: filepath.Join(base, "run"),
@@ -134,12 +150,31 @@ func sameMounts(a, b []string) bool {
 // assertConfined checks, from /proc, that the running qemu is the
 // unprivileged user it should be (as root: the configured qemu user, never
 // root) with a seccomp filter on.
-func assertConfined(t *testing.T, s *Session) {
+// qemuPid is the session's qemu: the process started, or — with the
+// AppArmor trampoline — its child (which exec'd qemu).
+func qemuPid(t *testing.T, s *Session) int {
 	t.Helper()
 	if s.cmd == nil {
 		t.Fatal("no qemu process")
 	}
-	st, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", s.cmd.Process.Pid))
+	pid := s.cmd.Process.Pid
+	// Go forks from any of its threads: look at every task's children.
+	tasks, _ := filepath.Glob(fmt.Sprintf("/proc/%d/task/*/children", pid))
+	for _, tf := range tasks {
+		b, _ := os.ReadFile(tf)
+		if f := strings.Fields(string(b)); len(f) >= 1 {
+			if c, err := strconv.Atoi(f[0]); err == nil {
+				return c
+			}
+		}
+	}
+	return pid
+}
+
+func assertConfined(t *testing.T, s *Session) {
+	t.Helper()
+	pid := qemuPid(t, s)
+	st, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,16 +192,23 @@ func assertConfined(t *testing.T, s *Session) {
 	if seccomp != "2" {
 		t.Errorf("qemu runs without a seccomp filter (Seccomp: %q)", seccomp)
 	}
+	profile := ""
+	if b, err := os.ReadFile(fmt.Sprintf("/proc/%d/attr/current", pid)); err == nil {
+		profile = strings.TrimSpace(strings.TrimRight(string(b), "\x00"))
+	}
 	if os.Geteuid() == 0 {
 		if uid == "0" {
 			t.Errorf("qemu runs as root")
 		}
-		u, _ := lookupQemuUser("")
-		if u == nil || uid != strconv.FormatUint(uint64(u.uid), 10) {
-			t.Errorf("qemu runs as uid %s, want the qemu user %+v", uid, u)
+		u, _ := lookupQemuUser("", false)
+		if u == nil || u.name != DefaultRestoreUser || uid != strconv.FormatUint(uint64(u.uid), 10) {
+			t.Errorf("qemu runs as uid %s, want the dedicated %s %+v", uid, DefaultRestoreUser, u)
+		}
+		if appArmorEnabled() && !strings.HasPrefix(profile, AppArmorProfile+" (enforce)") {
+			t.Errorf("qemu is not confined by %s (attr/current %q)", AppArmorProfile, profile)
 		}
 	}
-	t.Logf("qemu pid %d: uid %s, seccomp %s", s.cmd.Process.Pid, uid, seccomp)
+	t.Logf("qemu pid %d: uid %s, seccomp %s, apparmor %q", pid, uid, seccomp, profile)
 }
 
 func assertGone(t *testing.T, l *Launcher) {
@@ -325,7 +367,7 @@ func TestRestoreVM_DiesWithTheDaemon(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Open: %v", err)
 		}
-		_ = os.WriteFile(os.Getenv("LITEVIRT_FR_PIDFILE"), []byte(strconv.Itoa(s.cmd.Process.Pid)), 0o644)
+		_ = os.WriteFile(os.Getenv("LITEVIRT_FR_PIDFILE"), []byte(strconv.Itoa(qemuPid(t, s))), 0o644)
 		os.Exit(0) // the daemon dies: no Close, no cleanup
 	}
 	_ = bootLauncher(t) // skips, loudly, without the environment

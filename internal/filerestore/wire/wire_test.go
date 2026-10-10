@@ -16,6 +16,7 @@ func TestEscape(t *testing.T) {
 		"c1\u009bcsi":          `c1\u009bcsi`,
 		"invoice\u202egnp.exe": `invoice\u202egnp.exe`,
 		"zw\u200bsp":           `zw\u200bsp`,
+		`typed\x1b`:            `typed\\x1b`, // a typed escape cannot pass for ESC
 		"bad\xffbyte":          `bad\xffbyte`,
 		"literal � stays":      "literal � stays",
 	} {

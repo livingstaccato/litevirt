@@ -147,8 +147,10 @@ func TestAgent_DoesNotFollowSymlinks(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := readTar(t, out.Bytes())
-	if e := got["vda1/linkdir"]; e.h == nil || e.h.Typeflag != tar.TypeSymlink || e.body != "" {
-		t.Fatalf("linkdir: %+v", e.h)
+	// Both are symlinks with absolute targets: left out of the archive
+	// (counted), never followed.
+	if _, ok := got["vda1/linkdir"]; ok {
+		t.Fatalf("a symlink to an absolute target was archived: %+v", got["vda1/linkdir"].h)
 	}
 	if strings.Contains(out.String(), "host secret") {
 		t.Fatal("the symlink target's content was extracted")
@@ -169,8 +171,10 @@ func TestAgent_ExtractADirectory(t *testing.T) {
 	if _, ok := got["vda1/etc/"]; !ok {
 		t.Error("the directory entry itself is missing")
 	}
-	if st.Entries != 5 {
-		t.Errorf("entries %d, want 5 (%v)", st.Entries, keys(got))
+	// etc/, hostname, ssh/, sshd_config; the escape symlink (to /etc/passwd)
+	// is left out and counted.
+	if st.Entries != 4 || st.LinksDropped != 1 {
+		t.Errorf("entries %d links dropped %d, want 4 and 1 (%v)", st.Entries, st.LinksDropped, keys(got))
 	}
 	if _, _, _, err := s.List("/vda1"); err != nil {
 		t.Fatalf("list after an extraction: %v", err)
@@ -292,7 +296,8 @@ func TestAgent_HonoursRequestLimits(t *testing.T) {
 	}
 	s := dirSession(t, root)
 	var out bytes.Buffer
-	st, err := s.Tar(&out, []string{"/vda1"}, filerestore.TarLimits{MaxBytes: 2500})
+	// The cap counts the whole archive, headers included.
+	st, err := s.Tar(&out, []string{"/vda1"}, filerestore.TarLimits{MaxBytes: 4000})
 	if err == nil || !st.Truncated {
 		t.Fatalf("want a truncated extraction, got %+v %v", st, err)
 	}

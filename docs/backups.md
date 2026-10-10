@@ -528,16 +528,29 @@ own kernel and an initramfs whose init is the litevirt binary itself, the
 backup attached read-only as its only disk (served from the repo over a local
 NBD socket), no network, vsock as its only channel, one vCPU and 512 MiB. The
 guest kernel parses the partition table and mounts each filesystem read-only
-inside the VM. qemu is started as an unprivileged user (`libvirt-qemu`) with
-its seccomp sandbox on; it dies with the daemon, a restarted daemon kills any
-it left, and the agent inside powers off on its own when no one talks to it.
+inside the VM. qemu is started as a dedicated user, `litevirt-restore` — it
+owns no VM disk and no key, and the daemon creates it at start — with its
+seccomp sandbox on and, where AppArmor is enabled, confined by the
+`litevirt-restore-qemu` profile (its boot files, its own session's socket,
+`/dev/kvm` and vsock; nothing under `/var/lib/litevirt`). Its kernel copy and
+initramfs are root-owned and read-only to that user
+(`/var/cache/litevirt-restore`), and re-verified against a recorded digest
+before every boot. It dies with the daemon, a restarted daemon kills any it
+left, and the agent inside powers off on its own when no one talks to it.
 The VM's console stays in a small in-memory buffer. Everything the VM
 returns is untrusted: it sends simple records, not tar, and the daemon builds
 the archive itself entry by entry — relative names inside what you selected,
 only directories, regular files and symlinks, nothing under a symlink (also
 compared case-insensitively), no owners, setuid bits or extended attributes,
-bounded sizes, counts and memory — and streams it to you. Nothing is written
-on the daemon's host. The architecture,
+bounded sizes, counts and memory — and streams it to you. A symlink is kept
+only when its target is relative and stays inside the archive; one with an
+absolute or escaping target is left out and counted. Nothing is written on
+the daemon's host.
+
+**Extract each archive into a new, empty directory**, and use your tar's
+protections (GNU tar: `tar -xf files.tar --no-overwrite-dir -C <new dir>`).
+Extracting two archives from the same backup into one directory lets a
+symlink from the first meet a path in the second. The architecture,
 limits and threat model are in
 [design/backup-file-restore.md](design/backup-file-restore.md).
 
@@ -557,8 +570,13 @@ limits and threat model are in
   (the `vhost_vsock` module), a qemu with seccomp support, and a kernel the
   daemon can read (its own by default). Without them file restore is refused
   naming what is missing; a full restore keeps working. There is no fallback
-  to mounting on the host. `file_restore.allow_unsandboxed: true` lets a
-  restore VM run on a qemu without seccomp, decided for each VM.
+  to mounting on the host. Whether qemu can install its seccomp sandbox is
+  asked of qemu itself before each restore VM starts.
+- **`file_restore.allow_unsandboxed` is dangerous.** It lets a restore VM run
+  without the seccomp sandbox (or as root or a shared qemu user), removing a
+  barrier between a malicious backup and the host: a guest that escapes qemu
+  then has every syscall as that user. Install a qemu with seccomp instead;
+  if you must use it, keep the dedicated `run_as` user.
 
 ## Containers
 

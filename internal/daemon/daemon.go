@@ -1445,6 +1445,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 		slog.Warn("file restore: killed restore VMs a previous daemon left running", "count", n)
 	}
 	if fr := d.cfg.FileRestore; fr.On() {
+		if err := filerestore.EnsureRestoreUser(); err != nil {
+			// File restore then refuses, naming the missing user.
+			slog.Warn("file restore: no restore VM user", "error", err)
+		}
+		// Round-1 builds kept the boot files in data_dir, owned by qemu's
+		// user; they are never read again.
+		_ = os.RemoveAll(filepath.Join(d.cfg.DataDir, "file-restore", "cache"))
 		idle := time.Duration(fr.IdleTimeoutSec) * time.Second
 		if idle <= 0 {
 			idle = 5 * time.Minute
@@ -1453,8 +1460,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 			Launcher: filerestore.NewLauncher(filerestore.Config{
 				QEMU: fr.QEMU, Kernel: fr.Kernel, ModulesDir: fr.ModulesDir,
 				MemoryMiB: fr.MemoryMiB, RunAs: fr.RunAs,
-				CacheDir: filepath.Join(d.cfg.DataDir, "file-restore", "cache"),
+				CacheDir: fileRestoreCacheDir(d.cfg.DataDir),
 				RunDir:   frRunDir,
+				OnTamper: svc.FileRestoreTampered,
 				// The agent outlives the host's idle timeout by a minute, so
 				// it only ever powers off on its own when the host is gone.
 				AgentIdle:        idle + time.Minute,
@@ -3073,6 +3081,16 @@ func (d *Daemon) wireLeaseTermLedgerGate() {
 	d.db.SetLeaseTermLedgerGate(func() bool {
 		return d.checker.DurablyLatched(capabilities.LeaseTermLedgerV1)
 	})
+}
+
+// fileRestoreCacheDir holds the restore VM's boot files: outside data_dir
+// (whose contents production qemus may be granted), root-owned, 0750 to the
+// restore user's group.
+func fileRestoreCacheDir(dataDir string) string {
+	if os.Geteuid() == 0 {
+		return "/var/cache/litevirt-restore"
+	}
+	return filepath.Join(dataDir, "file-restore", "boot-cache")
 }
 
 // fileRestoreRunDir is where restore VM sessions keep their NBD socket and

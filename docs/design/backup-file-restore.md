@@ -27,7 +27,7 @@ guest kernel exploited by a malicious filesystem controls the agent.
 ## 2. The restore VM
 
 ```
- daemon (host, root)                             restore VM (qemu as libvirt-qemu, seccomp)
+ daemon (host, root)                             restore VM (qemu as litevirt-restore, seccomp, AppArmor)
  ───────────────────                             ──────────────────────────────────────────
  repo ── pbsstore.ManifestReader                   host kernel copy, initramfs:
     │      (decrypts, decompresses, verifies)        /init = this litevirt binary
@@ -45,19 +45,27 @@ guest kernel exploited by a malicious filesystem controls the agent.
 
 - **Kernel.** The host's own (`/boot/vmlinuz-<release>`; `file_restore.kernel`).
   That image is usually root-only, so the daemon gives qemu a copy in its
-  cache, mode 0400, owned by the qemu user.
+  cache.
+- **Boot files.** The kernel copy and the initramfs live in
+  `/var/cache/litevirt-restore` — outside `/var/lib/litevirt`, which `lv host
+  init`'s shared AppArmor abstraction lets every production qemu write —
+  a directory that is `0750 root:litevirt-restore`. Each file is
+  `0440 root:litevirt-restore`: qemu reads it through its group and can never
+  write it. Beside each, a root-only `0600` sidecar records the sha256 the
+  daemon wrote; every reuse re-hashes the file against it (and checks owner,
+  group, mode and link count), and a file that does not match is reported
+  (`file_restore.tampered` notification, an error log) and rebuilt before any
+  restore VM boots it.
 - **Initramfs.** Built by the daemon from the litevirt binary it runs
   (`/proc/self/exe`, a static `CGO_ENABLED=0` build — preflight refuses a
   dynamically linked one, naming it) plus the kernel modules the agent may
   need, resolved through `modules.dep` (`virtio_blk`, `vsock`,
   `vmw_vsock_virtio_transport`, `ext4`, `xfs`, `btrfs`, `vfat`, `isofs`, NLS)
   and decompressed on the host. It is cached under
-  `<data_dir>/file-restore/cache` (0711 directory; file 0400, owned by the
-  qemu user), keyed by a hash of every byte that goes into it (the whole
-  binary, each module file, `modules.dep`), and rebuilt whenever the file on
-  disk is not exactly as written (owner, mode, link count). The binary
-  becomes the agent only as PID 1 with `litevirt_filerestore=1` on the kernel
-  command line.
+  the boot-file cache above, keyed by a hash of every byte that goes into it
+  (the whole binary, each module file, `modules.dep`). The binary becomes the
+  agent only as PID 1 with `litevirt_filerestore=1` on the kernel command
+  line.
 - **Disk.** The backup, served by the in-process NBD server over a unix
   socket, attached as the VM's only disk, read-only at both the NBD client
   node and the format node.
@@ -66,25 +74,50 @@ guest kernel exploited by a malicious filesystem controls the agent.
   file descriptor the daemon opened and hands qemu, with a random CID.
 - **Fixed resources.** One vCPU, `file_restore.memory_mib` (512 MiB default:
   the initramfs carries the litevirt binary).
-- **qemu's confinement.** As root, the daemon starts qemu already as the
-  unprivileged qemu user (`file_restore.run_as`: `libvirt-qemu`, `qemu` or
-  `nobody`; never root) with that user's groups — the credential is set in the
-  child before exec. qemu never switches users itself, so its seccomp sandbox
+- **qemu's user.** As root, the daemon starts qemu already as the dedicated
+  `litevirt-restore` user (`file_restore.run_as`), which it creates at start
+  (`useradd --system --user-group --groups kvm`, no home, no shell) and which
+  owns nothing: no VM disk, no key. `libvirt-qemu`, `qemu`, `nobody` and root
+  are refused — the first owns every running VM's disks (libvirt's dynamic
+  ownership) and the migration-TLS key, `nobody` is shared — unless
+  `allow_unsandboxed`. The credential is set in the child before exec; qemu
+  never switches users itself, so its seccomp sandbox
   (`-sandbox on,obsolete=deny,elevateprivileges=deny,spawn=deny,
-  resourcecontrol=deny`) and the user drop do not conflict. The qemu user needs
-  only read-write `/dev/kvm` (normally via the `kvm` group); preflight checks
-  it by mode bits and names the gap.
+  resourcecontrol=deny`) and the user drop do not conflict. The user needs
+  only read-write `/dev/kvm` (the `kvm` group); preflight checks it by mode
+  bits and names the gap.
+- **AppArmor.** Where AppArmor is enabled, the daemon loads the
+  `litevirt-restore-qemu` profile (from memory, nothing under `/etc`): qemu's
+  binary, libraries and firmware, `/dev/kvm` and `/dev/vhost-vsock`, the boot
+  files, its sessions' sockets and nonces — no IP networking, no ptrace, no
+  mount, nothing of `/var/lib/litevirt` or any VM disk. qemu is started
+  through a trampoline in the litevirt binary (`litevirt __file-restore-exec`,
+  as the restore user): its parent stage stays as qemu's parent; its exec
+  stage sets the profile for its next exec and execs qemu, which starts
+  confined. Two stages because AppArmor's on-exec profile applies only to the
+  task that sets it, and because the exec into a new profile is a secure exec,
+  across which the kernel clears the parent-death signal: the parent stage
+  keeps its own (SIGTERM from the daemon's death) and kills qemu on it.
+- **Seccomp, asked of qemu.** Before each restore VM, the daemon starts the
+  qemu binary with the sandbox and no machine (`-machine none -S`), as the
+  restore user. A qemu that cannot install the sandbox exits at once with its
+  own message; one that can is still running after a moment and is killed.
+  Without the sandbox, file restore is refused with qemu's message, unless
+  `file_restore.allow_unsandboxed` — **dangerous**: it removes the barrier
+  between an escaped guest and every syscall the qemu user has; install a qemu
+  with seccomp instead — decided for each VM, never remembered.
 - **Console.** The guest's serial console goes to qemu's stdout, into a
   64 KiB in-memory ring. Nothing the guest writes lands on the host's disk;
   its escaped tail only ever reaches an error message.
 - **Lifetime.**
   - qemu is started with a parent-death SIGKILL, which Go applies after the
     credential change, in its own process group: it dies with the daemon.
-  - Each session has a pidfile in `/run/litevirt/file-restore/s-*/` (outside
-    `data_dir`). A starting daemon kills any process named in one whose
-    command line is the restore VM of that very session (`-name
-    litevirt-file-restore` and that session's socket path) — never a
-    recycled pid — and removes the directories.
+  - Each session has a pidfile (pid and uid) in `/run/litevirt/file-restore/s-*/`
+    (outside `data_dir`). A starting daemon holds each named process by a
+    pidfd, kills it — and its process group — only if it still runs as that
+    uid with the restore VM's command line for that very session (`-name
+    litevirt-file-restore` and that session's socket path), never a recycled
+    pid, and removes the directories.
   - The agent powers the VM off on its own after `idle_timeout_sec + 60`
     seconds without a request (`litevirt_fr_idle` on the command line), the
     backstop for a host that went away.
@@ -98,12 +131,12 @@ guest kernel exploited by a malicious filesystem controls the agent.
     `file_restore.max_extractions` (1) of them extracting. A slot is reserved
     before a boot and no lock is held while a VM boots; concurrent callers for
     one backup share one boot.
-- **The right VM.** A random nonce on the kernel command line must come back
-  from the agent's hello before anything else is sent, so a foreign VM that
-  happened to hold the CID is never mistaken for the session's own.
-- **No seccomp.** A qemu built without seccomp is refused, naming the cause,
-  unless `file_restore.allow_unsandboxed: true`; that is decided for each VM,
-  never remembered.
+- **The right VM.** A random nonce, handed to the guest over fw_cfg from a
+  file only the restore user can read (never on qemu's command line, which
+  every host user can read), must come back from the agent's hello before
+  anything else is sent, so a foreign VM that happened to hold the CID is
+  never mistaken for the session's own. A hello that does not answer within
+  5 s (or the boot deadline) is dropped.
 
 Inside the VM the agent mounts `proc`, `sys` and `devtmpfs`, loads the
 modules, waits for `/dev/vda`, sets it read-only, and mounts each partition
@@ -138,6 +171,10 @@ One JSON request per line, one JSON response per line: `hello` (returns the
 nonce), `volumes`, `list`, `tar`, `shutdown`. Paths are `/<volume>/<path>`;
 `/` lists the volumes.
 
+A listing reply is decoded entry by entry, keeping at most 10 000: what a
+hostile agent packs into the (8 MiB) line beyond that is skipped while
+decoding, never materialized.
+
 An extraction is **not** sent as tar. The agent sends records: one JSON line
 (name, type, size, mode, mtime, link target; at most 16 KiB) followed by
 exactly `size` bytes for a regular file, and an end record. tar's extensions
@@ -159,19 +196,26 @@ The host (`filerestore/sanitize.go`) treats every response as hostile:
   become `other`; mode is permission bits only; a symlink target is bounded
   and shown, never followed.
 - **Extractions**, record by record:
-  - a name must be relative, already clean, without `..`, every component
-    valid, UTF-8, bounded, and inside one of the paths the caller selected;
+  - a name must be relative, already clean, without `..`, at most 256
+    components, every component valid, UTF-8 with no control, bidi or
+    invisible character, bounded, and inside one of the paths the caller
+    selected;
   - only directories, regular files and symlinks;
+  - a symlink only with a relative target that, resolved against the link's
+    directory, stays inside the archive; an absolute or escaping one is left
+    out and counted (`links_dropped` in the audit row and the status);
   - no entry below a symlink the archive already holds and no name twice —
-    both compared case-folded and NFC-normalized, so extracting the archive on
-    a case-insensitive or normalizing filesystem (macOS) cannot write through a
-    link either;
+    both compared with Unicode case folding and NFC normalization ("ſ" is "s",
+    "ς" is "σ"), so extracting the archive on a case-insensitive or
+    normalizing filesystem (macOS, Windows) cannot write through a link either;
+    the symlink check hashes only the ancestors at depths where a symlink was
+    written, so a deep name is cheap;
   - each tar header is built from scratch: permission bits without setuid,
     setgid or sticky, no owner, no extended attributes;
-  - bounded: file bytes (`file_restore.max_extract_bytes`, 16 GiB; a request
-    may only lower it) — a size is compared against what is left, never
-    added, so it cannot overflow, and the bytes counted are the bytes
-    written; refused entries' bytes (read to stay in step) under the same
+  - bounded: the whole archive's bytes, headers included
+    (`file_restore.max_extract_bytes`, 16 GiB; a request may only lower it) —
+    a size is compared against what is left, never added, so it cannot
+    overflow, and the bytes counted are the bytes written; refused entries' bytes (read to stay in step) under the same
     cap; entries (200 000); records read, refused ones included; the names
     remembered for the checks above, each as a fixed 16-byte key, so an
     extraction's memory does not grow with name length; each record line;
@@ -209,6 +253,12 @@ libvirt-qemu: /dev/kvm (mode 600, owner 0:0) is not read-write`, or
 There is no fallback to a host mount. A full restore (`restore-from`,
 `restore-live`, `lv ct restore`) is unaffected. `file_restore.enabled: false`
 turns the feature off.
+
+Extract each archive into a new, empty directory: the checks above hold
+within one archive, and two archives of one backup extracted into the same
+directory could otherwise meet a symlink of the first with a path of the
+second (only in-archive relative links pass, which narrows it to the
+directory itself).
 
 ## 8. Not supported
 

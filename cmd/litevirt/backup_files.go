@@ -133,9 +133,14 @@ func newBackupFileRestoreCmd() *cobra.Command {
 Paths are as file-ls shows them ("/<volume>/<path>"). The result is a tar
 archive written to -o (a new file; "-" for stdout); nothing is written on the
 daemon's host. The archive holds only directories, regular files and symlinks,
-with permission bits but no owners, setuid bits or extended attributes, and
-nothing under a symlink, so extracting it cannot write outside its directory
-through a link the backup carried.
+with permission bits but no owners, setuid bits or extended attributes;
+symlinks only with relative targets inside the archive (others are left out
+and counted), and nothing under a symlink.
+
+Extract each archive into a new, empty directory (GNU tar:
+tar -xf files.tar --no-overwrite-dir -C <new dir>): two archives of the same
+backup extracted into one directory could otherwise meet a symlink from the
+first with a path from the second.
 
 Needs the same permission as a full restore of the VM or container; every
 extraction is audited (backup.file_restore).`,

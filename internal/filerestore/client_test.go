@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"net"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -68,7 +69,7 @@ func TestClient_HelloNonce(t *testing.T) {
 		_ = c.Send(wire.Response{Nonce: "someone-else"})
 		return true
 	})
-	if err := cl.Hello("mine"); !errors.Is(err, ErrWrongVM) {
+	if err := cl.Hello("mine", 0); !errors.Is(err, ErrWrongVM) {
 		t.Fatalf("a wrong nonce: %v, want ErrWrongVM", err)
 	}
 	if _, err := cl.Volumes(); err == nil {
@@ -81,7 +82,7 @@ func TestClient_HelloNonce(t *testing.T) {
 		_ = c.Send(wire.Response{Nonce: "mine"})
 		return true
 	})
-	if err := ok.Hello("mine"); err != nil {
+	if err := ok.Hello("mine", 0); err != nil {
 		t.Fatalf("the right nonce: %v", err)
 	}
 }
@@ -99,5 +100,32 @@ func TestClient_AgentErrorsAreEscaped(t *testing.T) {
 	msg := err.Error()
 	if strings.ContainsAny(msg, "\x1b\u009b‮") || len(msg) > 700 {
 		t.Fatalf("agent error not escaped/bounded: %q (%d bytes)", msg[:80], len(msg))
+	}
+}
+
+// N-4: a listing reply packed with entries past the cap is not materialized
+// before the cap applies.
+func TestClient_ListingDecodedWithinTheCap(t *testing.T) {
+	var b strings.Builder
+	b.WriteString(`{"entries":[`)
+	for b.Len() < wire.MaxResponseLine-100 {
+		b.WriteString(`{},`)
+	}
+	b.WriteString(`{}]}`)
+	line := []byte(b.String() + "\n")
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	resp, err := decodeListResponse(line)
+	runtime.ReadMemStats(&after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Entries) != wire.MaxListEntries || !resp.Truncated {
+		t.Fatalf("kept %d entries truncated=%v", len(resp.Entries), resp.Truncated)
+	}
+	// ~2.8M empty objects would be ~200-400 MB as []Entry.
+	if alloc := after.TotalAlloc - before.TotalAlloc; alloc > 96<<20 {
+		t.Fatalf("decoding a capped listing allocated %d MB", alloc>>20)
 	}
 }

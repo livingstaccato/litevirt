@@ -129,9 +129,30 @@ func runAgent() error {
 	sort.Strings(names)
 	log.Printf("ready: volumes %v", names)
 
-	srv := NewServer(vols, os.Getenv(wire.EnvNonce))
+	nonce, err := readNonce()
+	if err != nil {
+		return err
+	}
+	srv := NewServer(vols, nonce)
 	srv.touch = func() { last.Store(time.Now().UnixNano()) }
 	return serveVsock(srv)
+}
+
+// readNonce reads the session's nonce from fw_cfg (the qemu_fw_cfg module
+// exposes it in sysfs).
+func readNonce() (string, error) {
+	p := "/sys/firmware/qemu_fw_cfg/by_name/" + wire.FwCfgNonce + "/raw"
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		b, err := os.ReadFile(p)
+		if err == nil && len(b) > 0 && len(b) <= 128 {
+			return strings.TrimSpace(string(b)), nil
+		}
+		if time.Now().After(deadline) {
+			return "", fmt.Errorf("no session nonce in fw_cfg (%s): %v", p, err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 // loadModules loads every module the initramfs lists, in order. A module

@@ -628,12 +628,16 @@ file_restore:
   modules_dir: ""            # default /lib/modules/<running release>
   qemu: ""                   # default qemu-system-x86_64 / -aarch64 on PATH, or /usr/libexec/qemu-kvm
   memory_mib: 512            # the restore VM's memory (at least 256)
-  run_as: ""                 # user qemu is started as (a root daemon); default libvirt-qemu, qemu or nobody
+  run_as: ""                 # user qemu is started as; default litevirt-restore (created at daemon start);
+                             # root, libvirt-qemu, qemu and nobody are refused (they own VM disks and keys)
   idle_timeout_sec: 300      # a browsing session's VM is killed after this long unused
   max_sessions: 2            # restore VMs at once on this host (browsing and extracting)
   max_extractions: 1         # extractions at once on this host; each runs on a VM of its own
   max_extract_bytes: 16G     # per extraction; a request can only lower it
-  allow_unsandboxed: false   # true lets a restore VM run when this qemu has no seccomp sandbox
+  allow_unsandboxed: false   # DANGEROUS. true lets a restore VM run without qemu's seccomp sandbox, or as
+                             # root or a shared qemu user. It removes a barrier between a malicious backup
+                             # and the host: a guest that escapes qemu gets every syscall as that user.
+                             # Install a qemu with seccomp instead; never combine it with a non-dedicated run_as.
 
 # Billing-event webhook. Empty disables (the default — events
 # are dropped). When set, `internal/billing` POSTs JSON

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -399,7 +400,7 @@ func TestFileRestore_MaxBytes(t *testing.T) {
 	st := &progressStream[pb.RestoreBackupFilesChunk]{ctx: adminCtx()}
 	if err := s.RestoreBackupFiles(&pb.RestoreBackupFilesRequest{
 		RepoPath: "r", Name: "box", DiskName: "rootfs", Timestamp: "2026-10-10T01:00:00Z",
-		Paths: []string{"/rootfs"}, MaxBytes: 6,
+		Paths: []string{"/rootfs"}, MaxBytes: 3500, // the whole archive, headers included
 	}, st); err != nil {
 		t.Fatal(err)
 	}
@@ -652,4 +653,69 @@ func TestFileRestore_ExtractionWallClock(t *testing.T) {
 	if extractWallClock(16<<30) < 4*time.Hour || extractWallClock(1<<20) != 10*time.Minute {
 		t.Fatalf("wall clock: %v / %v", extractWallClock(16<<30), extractWallClock(1<<20))
 	}
+}
+
+// breakableConn is a session whose connection can be marked broken.
+type breakableConn struct {
+	stallConn
+	broken atomic.Bool
+}
+
+func (b *breakableConn) Broken() bool { return b.broken.Load() }
+
+type breakableRestorer struct {
+	mu    sync.Mutex
+	conns []*breakableConn
+}
+
+func (r *breakableRestorer) Preflight() error { return nil }
+func (r *breakableRestorer) Open(context.Context, filerestore.BlockDevice, string, string) (fileRestoreConn, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	c := &breakableConn{stallConn: stallConn{closed: make(chan struct{})}}
+	r.conns = append(r.conns, c)
+	return c, nil
+}
+
+// Nit: a broken browsing session that a caller still holds keeps its slot
+// until that caller lets go — max_sessions is never exceeded by a VM nobody
+// counts — and is closed then.
+func TestFileRestore_BrokenHeldSessionKeepsItsSlot(t *testing.T) {
+	s := testServer(t)
+	s.dataDir = t.TempDir()
+	s.SetBackupRepos(map[string]string{"r": ctBackup(t, s, "2026-10-10T01:00:00Z")})
+	r := &breakableRestorer{}
+	s.setFileRestorer(r, FileRestoreOptions{MaxSessions: 2})
+	tgt, err := s.resolveFileRestoreTarget(adminCtx(), "r", "box", "rootfs", "2026-10-10T01:00:00Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, release1, err := s.acquireBrowse(context.Background(), tgt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.conns[0].broken.Store(true)
+	_, release2, err := s.acquireBrowse(context.Background(), tgt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.fileRestore.mu.Lock()
+	used := s.fileRestore.used()
+	s.fileRestore.mu.Unlock()
+	if used != 2 {
+		t.Fatalf("slots used %d with a held broken session and its replacement, want 2", used)
+	}
+	release1()
+	select {
+	case <-r.conns[0].closed:
+	default:
+		t.Fatal("the broken session was not closed when its holder let go")
+	}
+	s.fileRestore.mu.Lock()
+	used = s.fileRestore.used()
+	s.fileRestore.mu.Unlock()
+	if used != 1 {
+		t.Fatalf("slots used %d after the broken session's release, want 1", used)
+	}
+	release2()
 }

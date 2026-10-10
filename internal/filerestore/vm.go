@@ -25,6 +25,22 @@ type BlockDevice interface {
 	Size() int64
 }
 
+// TamperFunc is told about a boot file in the cache that no longer matches
+// what was written (path, and why); the file is rebuilt before use.
+type TamperFunc func(path, why string)
+
+// DefaultRestoreUser is the dedicated user restore VMs run as: it owns
+// nothing — no VM disk, no key — and is in the kvm group only.
+const DefaultRestoreUser = "litevirt-restore"
+
+// AppArmorProfile is the profile a restore VM's qemu is confined by where
+// AppArmor is enabled.
+const AppArmorProfile = "litevirt-restore-qemu"
+
+// TrampolineArg is the hidden first argument with which the litevirt binary
+// sets its AppArmor exec profile and execs qemu (agent.RunTrampoline).
+const TrampolineArg = "__file-restore-exec"
+
 // Config is the host side of file restore (daemon config `file_restore:`).
 type Config struct {
 	// QEMU is the qemu system emulator ("" = search the usual names).
@@ -37,13 +53,17 @@ type Config struct {
 	// MemoryMiB is the restore VM's memory (0 = 512). The initramfs holds
 	// the litevirt binary, so this cannot go much lower.
 	MemoryMiB int
-	// RunAs is the user qemu runs as when the daemon is root ("" = the
-	// first of libvirt-qemu, qemu, nobody that exists). qemu is started as
-	// that user; it never switches users itself.
+	// RunAs is the user qemu runs as when the daemon is root ("" =
+	// DefaultRestoreUser). qemu is started as that user; it never switches
+	// users itself. root, libvirt-qemu, qemu and nobody are refused (they
+	// own production disks or are shared) unless AllowUnsandboxed.
 	RunAs string
-	// CacheDir holds the cached initramfs and kernel copy (the daemon's
-	// <data_dir>/file-restore/cache: trusted, host-built files).
+	// CacheDir holds the initramfs and kernel copy: root-owned, group the
+	// restore user's, 0440, re-verified on every use
+	// (/var/cache/litevirt-restore).
 	CacheDir string
+	// OnTamper is told about a cache file that failed verification.
+	OnTamper TamperFunc
 	// RunDir holds each session's NBD socket and pidfile — outside
 	// data_dir (/run/litevirt/file-restore for a root daemon). Nothing the
 	// guest writes lands in it.
@@ -55,7 +75,9 @@ type Config struct {
 	// daemon that started it is gone.
 	AgentIdle time.Duration
 	// AllowUnsandboxed lets a restore VM run when this qemu has no seccomp
-	// sandbox. Off by default: without it, file restore is refused.
+	// sandbox, or as a user that is not a dedicated one. DANGEROUS: it
+	// removes a barrier between a malicious backup and the host. Off by
+	// default: without it, file restore is refused.
 	AllowUnsandboxed bool
 	// Agent is the binary run as the agent ("" = this running binary).
 	Agent string
@@ -97,8 +119,10 @@ type VMSpec struct {
 	// daemon), so qemu needs no access to the device node.
 	VhostFD int
 	Arch    string // GOARCH
-	// Nonce is echoed by the agent's hello; AgentIdleSec its own timeout.
-	Nonce        string
+	// NonceFile holds the nonce the agent's hello must echo, handed to the
+	// guest over fw_cfg (never on the command line, which any host user can
+	// read in /proc). AgentIdleSec is the agent's own idle timeout.
+	NonceFile    string
 	AgentIdleSec int
 	// Sandbox enables qemu's seccomp sandbox.
 	Sandbox bool
@@ -129,8 +153,8 @@ func qemuArgs(s VMSpec) ([]string, error) {
 	if s.VhostFD < 3 {
 		return nil, fmt.Errorf("vhost fd %d", s.VhostFD)
 	}
-	if s.Nonce == "" || strings.ContainsAny(s.Nonce, " \t\n\"") {
-		return nil, fmt.Errorf("nonce %q", s.Nonce)
+	if s.NonceFile == "" || strings.ContainsAny(s.NonceFile, ", \t\n") {
+		return nil, fmt.Errorf("nonce file %q", s.NonceFile)
 	}
 	machine, console := "q35,accel=kvm", "ttyS0"
 	if s.Arch == "arm64" {
@@ -169,9 +193,9 @@ func qemuArgs(s VMSpec) ([]string, error) {
 		"-initrd", s.Initrd,
 		"-append", strings.Join([]string{
 			"console=" + console, "panic=-1", "loglevel=4", "rdinit=/init",
-			wire.EnvAgent + "=1", wire.EnvKind + "=" + s.Kind,
-			wire.EnvNonce + "=" + s.Nonce, wire.EnvIdle + "=" + strconv.Itoa(idle),
+			wire.EnvAgent + "=1", wire.EnvKind + "=" + s.Kind, wire.EnvIdle + "=" + strconv.Itoa(idle),
 		}, " "),
+		"-fw_cfg", "name=" + wire.FwCfgNonce + ",file=" + s.NonceFile,
 		"-serial", "stdio",
 		"-nic", "none",
 		"-blockdev", string(src),
@@ -224,10 +248,28 @@ func (r *consoleRing) Tail(n int) string {
 	return strings.TrimSpace(wire.Escape(strings.ReplaceAll(s, "\n", " ")))
 }
 
-// stderrSaysNoSeccomp reports a qemu built without seccomp.
+// noSeccompMessages are what a real qemu prints when its -sandbox cannot
+// be installed: built without seccomp (qemu's vl.c), or the kernel or
+// libseccomp refusing the filter (qemu's system/qemu-seccomp.c; the strings
+// of qemu-system-x86_64 10.2.1).
+var noSeccompMessages = []string{
+	"-sandbox support is not enabled in this QEMU binary",
+	"failed to initialize seccomp context",
+	"failed to set seccomp rawrc attribute",
+	"failed to set seccomp thread synchronization",
+	"failed to add seccomp denylist rules",
+	"failed to load seccomp syscall filter in kernel",
+}
+
+// stderrSaysNoSeccomp reports a qemu that could not install its seccomp
+// sandbox.
 func stderrSaysNoSeccomp(s string) bool {
-	s = strings.ToLower(s)
-	return strings.Contains(s, "seccomp") && (strings.Contains(s, "disabled") || strings.Contains(s, "not supported") || strings.Contains(s, "unsupported"))
+	for _, m := range noSeccompMessages {
+		if strings.Contains(s, m) {
+			return true
+		}
+	}
+	return false
 }
 
 // stderrSaysCIDInUse reports a vsock CID another VM holds.

@@ -17,6 +17,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/filerestore"
+	"github.com/litevirt/litevirt/internal/notify"
 	"github.com/litevirt/litevirt/internal/pbsstore"
 	"github.com/litevirt/litevirt/internal/qcow2"
 )
@@ -53,6 +54,18 @@ func (a launcherAdapter) Open(ctx context.Context, dev filerestore.BlockDevice, 
 		return nil, err
 	}
 	return s, nil
+}
+
+// FileRestoreTampered is filerestore.Config.OnTamper: a restore VM boot
+// file in the cache did not match what the daemon wrote. It is rebuilt; this
+// raises the alarm, because something wrote to a root-owned file.
+func (s *Server) FileRestoreTampered(path, why string) {
+	slog.Error("file restore: a restore VM boot file failed verification and is rebuilt — something changed a root-owned file",
+		"path", path, "why", why)
+	s.notify(context.Background(), notify.Notification{
+		Kind: "file_restore.tampered", Severity: notify.SevError, Subject: path,
+		Detail: "restore VM boot file failed verification (" + why + "); rebuilt",
+	})
 }
 
 // FileRestoreOptions configures single-file restore on this daemon.
@@ -101,11 +114,12 @@ type frKey struct{ repo, name, disk, ts string }
 // frEntry is a cached browsing session. ready is closed once the boot ends;
 // conn is nil if it failed (err says why).
 type frEntry struct {
-	ready chan struct{}
-	conn  fileRestoreConn
-	err   error
-	last  time.Time
-	busy  int
+	ready   chan struct{}
+	conn    fileRestoreConn
+	err     error
+	last    time.Time
+	busy    int
+	retired bool // dropped from the map while busy; still counted (retiring)
 }
 
 // fileRestoreSessions holds the restore VMs of this host:
@@ -121,14 +135,14 @@ type fileRestoreSessions struct {
 	fr         fileRestorer
 	opts       FileRestoreOptions
 	m          map[frKey]*frEntry
-	booting    int // slots reserved by boots in progress (browse)
 	extracting int // extraction sessions running or booting
+	retiring   int // broken browse sessions still held by a caller
 	reaper     bool
 }
 
 // used is the number of restore VM slots taken. Caller holds mu.
 func (fs *fileRestoreSessions) used() int {
-	return len(fs.m) + fs.booting + fs.extracting
+	return len(fs.m) + fs.extracting + fs.retiring
 }
 
 // fileRestoreTarget is a resolved, authorized backup to read files from.
@@ -281,10 +295,14 @@ func (s *Server) acquireBrowse(ctx context.Context, t *fileRestoreTarget) (fileR
 					fs.mu.Unlock()
 					return e.conn, s.releaseBrowse(t.key, e), nil
 				}
-				// A failed or broken session: drop it and boot afresh.
+				// A failed or broken session: drop it and boot afresh. One a
+				// caller still holds keeps its slot until that caller lets go.
 				delete(fs.m, t.key)
 				if e.conn != nil && e.busy == 0 {
 					go e.conn.Close()
+				} else if e.conn != nil {
+					e.retired = true
+					fs.retiring++
 				}
 				fs.mu.Unlock()
 				continue
@@ -335,9 +353,13 @@ func (s *Server) releaseBrowse(key frKey, e *frEntry) func() {
 			fs.mu.Lock()
 			e.busy--
 			e.last = time.Now()
-			drop := e.conn.Broken() && e.busy == 0
+			drop := (e.retired || e.conn.Broken()) && e.busy == 0
 			if drop && fs.m[key] == e {
 				delete(fs.m, key)
+			}
+			if drop && e.retired {
+				e.retired = false
+				fs.retiring--
 			}
 			fs.mu.Unlock()
 			if drop {
@@ -557,6 +579,9 @@ func (s *Server) RestoreBackupFiles(req *pb.RestoreBackupFilesRequest, stream gr
 	if st.Skipped > 0 {
 		msg += fmt.Sprintf("; %d entries left out (unsafe names, links or types)", st.Skipped)
 	}
+	if st.LinksDropped > 0 {
+		msg += fmt.Sprintf(", %d of them symlinks with absolute or escaping targets", st.LinksDropped)
+	}
 	slog.Info("file restore: extracted", "name", req.Name, "ts", req.Timestamp, "entries", st.Entries, "bytes", st.Bytes)
 	return stream.Send(&pb.RestoreBackupFilesChunk{
 		Done: true, Entries: int32(st.Entries), Bytes: st.Bytes, Skipped: int32(st.Skipped),
@@ -588,7 +613,7 @@ func fileRestoreAuditDetail(req *pb.RestoreBackupFilesRequest, project string, s
 		d = "project=" + project + " " + d
 	}
 	if st != nil {
-		d += fmt.Sprintf(" entries=%d bytes=%d skipped=%d truncated=%v", st.Entries, st.Bytes, st.Skipped, st.Truncated)
+		d += fmt.Sprintf(" entries=%d bytes=%d skipped=%d links_dropped=%d truncated=%v", st.Entries, st.Bytes, st.Skipped, st.LinksDropped, st.Truncated)
 	}
 	return d
 }

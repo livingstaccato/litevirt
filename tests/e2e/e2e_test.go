@@ -34,6 +34,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -1731,38 +1732,125 @@ func TestConcurrent_MultipleVMCreate(t *testing.T) {
 // Backup & restore
 // ═══════════════════════════════════════════════════════════════════════════
 
+// TestVM_BackupRestore backs a running VM up into a backup repo, restores the
+// backup into a new file, damages the VM's disk, restores the backup over it
+// in place, and starts the VM again. The restored disk must hold exactly the
+// backup's content (qemu-img compare against the new-file restore), and the VM
+// must run on it.
+//
+// The raw full-disk `lv backup create` / `lv backup restore` RPCs are
+// deprecated and answer Unimplemented (docs/backups.md, "Deprecated: raw
+// full-disk backup/restore"); this uses their replacements, `lv backup
+// snapshot` and `lv backup restore-from`. A repo given as a path is local to
+// the daemon the CLI talks to, and the disk is checked with qemu-img on this
+// node, so the test runs on a cluster node with the VM placed here.
 func TestVM_BackupRestore(t *testing.T) {
 	if skipSlow {
 		t.Skip("slow test skipped")
 	}
 	requireImage(t)
+	if !localMode {
+		t.Skip("needs a cluster node: the repo path is host-local to the daemon the CLI talks to, and the disk is read with qemu-img here")
+	}
+	for _, bin := range []string{"qemu-img", "qemu-io"} {
+		if _, err := exec.LookPath(bin); err != nil {
+			t.Skipf("needs %s on this node", bin)
+		}
+	}
 
 	name := uniqueName("bk")
-	restoredName := uniqueName("rs")
-	backupFile := fmt.Sprintf("/tmp/e2e-backup-%d.qcow2", os.Getpid())
+	repo := filepath.Join(t.TempDir(), "repo")
+	var restored string
 	cleanup(t, func() {
 		lvErr(t, "rm", name, "--force")
-		lvErr(t, "rm", restoredName, "--force")
-		os.Remove(backupFile)
+		if restored != "" {
+			os.Remove(restored)
+		}
 	})
 
 	lv(t, "run", "--name", name, "--image", testImage,
 		"--cpu", "1", "--memory", "1024", "--disk", "5G",
-		"--host", hostNames[0])
+		"--host", localHost)
 	waitVM(t, name, "RUNNING", 2*time.Minute)
 
-	lv(t, "backup", "create", name, "-o", backupFile)
-
-	if _, err := os.Stat(backupFile); os.IsNotExist(err) {
-		t.Fatal("backup file not created")
+	lv(t, "backup", "repo", "init", repo)
+	out := lv(t, "backup", "snapshot", name, "--repo", repo)
+	m := regexp.MustCompile(`manifest=(\S+)`).FindStringSubmatch(out)
+	if m == nil {
+		t.Fatalf("backup snapshot named no manifest:\n%s", out)
+	}
+	ts := m[1]
+	if ls := lv(t, "backup", "repo", "ls", repo); !strings.Contains(ls, ts) || !strings.Contains(ls, name) {
+		t.Fatalf("repo ls does not list %s's manifest %s:\n%s", name, ts, ls)
 	}
 
-	lv(t, "backup", "restore", backupFile, "--name", restoredName,
-		"--cpu", "1", "--memory", "1024")
-	waitVM(t, restoredName, "RUNNING", 2*time.Minute)
+	lv(t, "stop", name)
+	waitVM(t, name, "VM_STOPPED", 2*time.Minute)
+	disk := vmRootDiskPath(t, name)
 
+	// Restore into a new file the daemon names: the backup's content.
+	out = lvLong(t, 5*time.Minute, "backup", "restore-from", "--repo", repo, "--vm", name, "--disk", "root", "--timestamp", ts)
+	m = regexp.MustCompile(`restored to (\S+)`).FindStringSubmatch(out)
+	if m == nil {
+		t.Fatalf("restore-from named no target:\n%s", out)
+	}
+	restored = m[1]
+	if restored == disk {
+		t.Fatalf("a restore without --in-place wrote over the VM's own disk %s", disk)
+	}
+
+	// Damage the VM's disk, so an in-place restore that writes nothing shows.
+	if o, err := exec.Command("qemu-io", "-f", "qcow2", "-c", "write -P 0xa5 0 1M", disk).CombinedOutput(); err != nil {
+		t.Fatalf("damage %s: %v\n%s", disk, err, o)
+	}
+	if o, err := exec.Command("qemu-img", "compare", "-U", "-f", "raw", "-F", "qcow2", restored, disk).CombinedOutput(); err == nil {
+		t.Fatalf("the damaged disk %s still matches the backup; the check below would prove nothing:\n%s", disk, o)
+	}
+
+	lvLong(t, 5*time.Minute, "backup", "restore-from", "--repo", repo, "--vm", name, "--disk", "root", "--timestamp", ts, "--in-place")
+	if got := vmRootDiskPath(t, name); got != disk {
+		t.Errorf("after the in-place restore %s's root disk is %s, was %s", name, got, disk)
+	}
+	if o, err := exec.Command("qemu-img", "compare", "-U", "-f", "raw", "-F", "qcow2", restored, disk).CombinedOutput(); err != nil {
+		t.Fatalf("the in-place restore of %s does not hold the backup's content: %v\n%s", disk, err, o)
+	}
+
+	lv(t, "start", name)
+	waitVM(t, name, "RUNNING", 2*time.Minute)
 	lv(t, "rm", name, "--force")
-	lv(t, "rm", restoredName, "--force")
+}
+
+// vmRootDiskPath is the path `lv inspect` records for a VM's root disk.
+func vmRootDiskPath(t *testing.T, name string) string {
+	t.Helper()
+	var v struct {
+		Disks []struct {
+			Name string `json:"name"`
+			Path string `json:"path"`
+		} `json:"disks"`
+	}
+	out := lv(t, "inspect", name)
+	if err := json.Unmarshal([]byte(out), &v); err != nil {
+		t.Fatalf("inspect %s: %v\n%s", name, err, out)
+	}
+	for _, d := range v.Disks {
+		if d.Name == "root" && d.Path != "" {
+			return d.Path
+		}
+	}
+	t.Fatalf("inspect %s records no root disk path:\n%s", name, out)
+	return ""
+}
+
+// lvLong is lv with a budget longer than lv's 2 minutes, for a command that
+// copies a disk. Fails the test on a non-zero exit.
+func lvLong(t *testing.T, budget time.Duration, args ...string) string {
+	t.Helper()
+	out, err := lvWithin(t, budget, args...)
+	if err != nil {
+		t.Fatalf("lv %s failed: %v\n%s", strings.Join(args, " "), err, out)
+	}
+	return out
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

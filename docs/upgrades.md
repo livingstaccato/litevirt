@@ -795,10 +795,13 @@ before.
 
 `relay_health_v1` is mandatory and replication-gated, like
 `failover_scope_v1`, with no flag: a flag would let one node elect a different
-relay set from its peers. A demotion withholds the relay role only, so the
-stand-down is healing the link; the host is restored after 10 minutes with no
-failing observer. A binary rolled back below the latched token enters WAL
-quarantine, as below every latched token. Roll forward.
+relay set from its peers. A demotion withholds the relay role only, and a host
+is restored on its own after 10 minutes below the demotion bar. The
+stand-down is `lv cluster relay-restore <host> [--hold <duration>]` (admin):
+it clears the demotion at once for the whole cluster and, with a hold, keeps
+the lease holder from demoting the host again until the hold runs out. A
+binary rolled back below the latched token enters WAL quarantine, as below
+every latched token. Roll forward.
 
 ### Replica matching while the roll is in progress
 

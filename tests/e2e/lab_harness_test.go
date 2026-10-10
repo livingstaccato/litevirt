@@ -288,12 +288,17 @@ func shellQuote(s string) string {
 
 // lv runs the CLI on host (mTLS as that host), bounded by two minutes.
 func (l *lab) lv(host string, args ...string) (string, error) {
+	return l.lvWithin(host, 2*time.Minute, args...)
+}
+
+// lvWithin is lv under budget, for a command that can outlast 2 minutes.
+func (l *lab) lvWithin(host string, budget time.Duration, args ...string) (string, error) {
 	q := make([]string, 0, len(args)+1)
 	q = append(q, shellQuote(l.lvPath))
 	for _, a := range args {
 		q = append(q, shellQuote(a))
 	}
-	return l.ssh(host, 2*time.Minute, strings.Join(q, " "))
+	return l.ssh(host, budget, strings.Join(q, " "))
 }
 
 func (l *lab) mustLV(host string, args ...string) string {

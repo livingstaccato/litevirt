@@ -61,13 +61,20 @@ func prepareISOLinks(l *lab, up []string) {
 	})
 }
 
+// isoMemory is the ISO VMs' memory. It is not drillMemory: a drill's VM only
+// has to be a running domain, but a drain shuts an ISO VM down, which takes a
+// booted guest. In 128 MiB cirros's UEFI GRUB fails with "can't allocate
+// kernel" and stops at "Press any key to continue", where no ACPI shutdown is
+// answered, so the drain's cold move waited out the stop timeout and failed.
+func isoMemory() string { return envOr("E2E_ISO_MEMORY", "256M") }
+
 // isoVM deploys a small VM pinned to host whose installer ISO is the link.
 func isoVM(l *lab, via, host string) string {
 	l.t.Helper()
 	stack := uniqueName("isomv")
 	name := stack + "-1"
 	yaml := fmt.Sprintf("name: %s\nvms:\n  %s:\n    image: %s\n    cpu: 1\n    memory: %s\n    iso: %s/x.iso\n    placement:\n      host: %s\n",
-		stack, name, drillImage(), drillMemory(), isoLinkDir, host)
+		stack, name, drillImage(), isoMemory(), isoLinkDir, host)
 	file := "/tmp/" + stack + ".yaml"
 	l.mustSSH(via, 30*time.Second, "echo "+base64.StdEncoding.EncodeToString([]byte(yaml))+" | base64 -d > "+file)
 	l.t.Cleanup(func() { l.deleteVMs(stack, map[string]string{host: name}) })
@@ -178,8 +185,15 @@ func TestLab_ISODrainOpensTheTargetsFile(t *testing.T) {
 	vm := isoVM(l, via, src)
 	requireISOOpened(l, src, vm, isoFileOf(src))
 
+	// The drain moves a VM with a host-local disk cold (docs/migration-failover.md,
+	// "Host drain"): it shuts the guest down and waits up to its stop timeout,
+	// never forcing it off, so the guest must have booted far enough to answer
+	// the ACPI shutdown.
+	l.waitGuestLogin(src, vm, 4*time.Minute)
 	t.Cleanup(func() { l.lv(via, "host", "undrain", src) })
-	out, err := l.lv(via, "host", "drain", src)
+	// The cold move can outlast lv's 2 minutes: the stop timeout (30 s), up to
+	// 5 more minutes for a late guest, the disk copy and the start on the target.
+	out, err := l.lvWithin(via, isoDrainBudget, "host", "drain", src)
 	if err != nil && !strings.Contains(out, "drain incomplete") {
 		t.Fatalf("drain %s: %v\n%s", src, err, out)
 	}
@@ -204,6 +218,33 @@ func TestLab_ISODrainOpensTheTargetsFile(t *testing.T) {
 			t.Fatalf("the drain's line for %s names no strategy: %q", vm, line)
 		}
 	})
+}
+
+// isoDrainBudget bounds `lv host drain` of a host holding one small VM moved
+// cold: its stop timeout, drainLateShutdownWait (5 min), the copy and the
+// start.
+const isoDrainBudget = 10 * time.Minute
+
+// waitGuestLogin waits until the guest of domain, on host, has finished
+// booting: its serial console answers a carriage return with a login prompt.
+// An earlier sign (the guest kernel running) is not enough to shut a guest
+// down: cirros reads the ACPI power button through acpid, which starts later
+// in its boot, and a press before that is lost, not queued.
+func (l *lab) waitGuestLogin(host, domain string, timeout time.Duration) {
+	l.t.Helper()
+	cmd := fmt.Sprintf(`(sleep 2; printf '\r'; sleep 3; printf '\035') | script -qec "timeout 10 %s console %s" /dev/null 2>&1 | tr -d '\r'`,
+		shellQuote(l.lvPath), shellQuote(domain))
+	deadline := time.Now().Add(timeout)
+	var out string
+	for time.Now().Before(deadline) {
+		out, _ = l.ssh(host, 30*time.Second, cmd)
+		if strings.Contains(out, "login:") {
+			l.mark("iso: the guest of %s on %s has booted (login prompt)", domain, host)
+			return
+		}
+		time.Sleep(5 * time.Second)
+	}
+	l.t.Fatalf("the guest of %s on %s showed no login prompt within %v, so it cannot answer a shutdown; last console output:\n%s", domain, host, timeout, out)
 }
 
 func TestLab_ISOMemoryRevertOpensTheJudgedFile(t *testing.T) {

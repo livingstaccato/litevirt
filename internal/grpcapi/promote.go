@@ -1117,6 +1117,9 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		if renamed || mac == "" {
 			mac = lv.GenerateMAC()
 		}
+		// The spec records the NIC's real MAC (as a clone does), so its queues
+		// are matched at every later redefine, not lost to the source's MAC.
+		n.Mac = mac
 		bridge := n.Name
 		if err := s.ensureBridge(bridge); err != nil {
 			os.Remove(livePath)

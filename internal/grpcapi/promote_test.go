@@ -6,8 +6,13 @@ import (
 	"strings"
 	"testing"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
@@ -166,5 +171,81 @@ func TestPromoteReplica_RenamedPopulatesHardwareTables(t *testing.T) {
 	}
 	if state != "pending" {
 		t.Errorf("hardware_adoption_state = %q, want pending (promote does not self-certify adoption)", state)
+	}
+}
+
+// promoteTuned promotes a renamed copy of a VM whose stored spec carries disk and
+// NIC tuning (and the source's NIC MAC), with the disk/NIC gate open or closed.
+func promoteTuned(t *testing.T, open bool, queues int32) (*Server, *libvirtfake.Fake, error) {
+	t.Helper()
+	s := testServer(t)
+	fake := libvirtfake.New()
+	s.virt = fake
+	s.gate = ioGate{on: open}
+	ctx := adminCtx()
+	poolDir := t.TempDir()
+	s.SetStoragePoolsByName(map[string]StoragePoolRef{"replica-pool": {Driver: "local", Target: poolDir}})
+	specJSON, _ := json.Marshal(&pb.VMSpec{
+		Name: "vm1", Cpu: 1, MemoryMib: 512,
+		Disks:   []*pb.DiskSpec{{Name: "root", Bus: "virtio", Discard: "unmap", Io: &pb.DiskIOLimits{ReadIopsSec: 321}}},
+		Network: []*pb.NetworkAttachment{{Name: "lo", Model: "virtio", Mac: "52:54:00:11:22:33", Queues: queues}},
+	})
+	if err := corrosion.InsertVM(ctx, s.db,
+		corrosion.VMRecord{Name: "vm1", HostName: "test-host", State: "running", Spec: string(specJSON)}, nil,
+		[]corrosion.DiskRecord{{VMName: "vm1", DiskName: "root", HostName: "test-host", Path: "/nonexistent-source", SizeBytes: 1 << 20, StorageType: "local"}},
+	); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	seedReplica(t, poolDir, "", "vm1", "root", "20260101-000000", "raw", 1<<20)
+	stream := &streamRecorder[pb.PromoteReplicaProgress]{ctx: ctx}
+	err := s.PromoteReplica(&pb.PromoteReplicaRequest{VmName: "vm1", NewName: "vm1-p", TargetPool: "replica-pool", NoLocalize: true}, stream)
+	return s, fake, err
+}
+
+// A promoted record's tuning goes through the gate: dropped before it opens (the
+// promote still works), kept and validated after, and the spec records the
+// promoted NIC's REAL MAC so its queues are matched at every later redefine.
+//
+// Mutations: delete the restrictRestoredTuning call in promote — the closed case
+// renders tuning and the invalid case succeeds; delete `n.Mac = mac` — the
+// redefine check goes red.
+func TestPromoteReplica_TuningIsGatedAndTheNICKeepsItsQueues(t *testing.T) {
+	// Gate closed: stripped.
+	s, fake, err := promoteTuned(t, false, 4)
+	if err != nil {
+		t.Fatalf("promote with the gate closed: %v", err)
+	}
+	if got := loadStoredSpec(t, s, "vm1-p"); specSetsDiskNICIO(got) {
+		t.Errorf("a closed gate stored tuning: %+v", got)
+	}
+	if x := fake.DefinedXML("vm1-p"); strings.Contains(x, "iotune") || strings.Contains(x, "queues=") {
+		t.Errorf("a closed gate rendered tuning:\n%s", x)
+	}
+
+	// Gate open: kept, and the NIC is found again after a redefine.
+	s, fake, err = promoteTuned(t, true, 4)
+	if err != nil {
+		t.Fatalf("promote with the gate open: %v", err)
+	}
+	if x := fake.DefinedXML("vm1-p"); !strings.Contains(x, "iotune") || !strings.Contains(x, "queues=") {
+		t.Errorf("an open gate dropped tuning:\n%s", x)
+	}
+	spec := loadStoredSpec(t, s, "vm1-p")
+	ifaces, _ := corrosion.GetVMInterfaces(adminCtx(), s.db, "vm1-p")
+	if len(ifaces) != 1 {
+		t.Fatalf("ifaces = %+v", ifaces)
+	}
+	if spec.Network[0].Mac != ifaces[0].MAC {
+		t.Errorf("the spec records MAC %q, the promoted NIC has %q", spec.Network[0].Mac, ifaces[0].MAC)
+	}
+	nets := []lv.NetworkConfig{{MAC: ifaces[0].MAC, SpecOrdinal: ifaces[0].Ordinal + 1}}
+	compose.ApplyNICTuning(nets, spec)
+	if nets[0].Queues != 4 {
+		t.Errorf("after the promote a redefine renders queues=%d, want 4 (the spec holds the source's MAC, not this NIC's)", nets[0].Queues)
+	}
+
+	// Gate open, invalid: refused.
+	if _, _, err := promoteTuned(t, true, 4096); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("queues 4096: %v, want InvalidArgument", err)
 	}
 }

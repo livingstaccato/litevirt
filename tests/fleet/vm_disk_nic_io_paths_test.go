@@ -13,6 +13,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/pbsstore"
@@ -126,4 +127,37 @@ func TestFleet_RestoreLiveTreatsAManifestsTuningAsUntrusted(t *testing.T) {
 		t.Errorf("a refused restore left a VM row (%s)", rec.State)
 	}
 	_ = io.EOF
+}
+
+// A RENAMED restore gives the NIC a fresh MAC; the spec it persists must record
+// that MAC, or the queues (matched by MAC, or by position onto an entry with none)
+// are dropped at the next redefine while the spec still says 4.
+//
+// Mutation: delete `n.Mac = mac` in autoDefineRestoredVM — red.
+func TestFleet_RenamedRestoreKeepsTheNICsQueuesAcrossARedefine(t *testing.T) {
+	c := New(t, Options{Nodes: 1})
+	n := c.Nodes[0]
+	ctx := context.Background()
+	setHostCapacity(t, c, n.Name, 64, 65536, nil)
+	n.Server.SetBridgeEnsure(n.Net.EnsureBridge)
+	latchIOFeature(t, c)
+	src := tunedSpec("bk")
+	src.Network[0].Mac = "52:54:00:11:22:33" // the source VM's MAC, carried in its backup
+	repo, ts := seedVMBackupWithSpec(t, src)
+	if err := drainRestore(t, c, n, repo, "bk", ts, "renamed"); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	spec := specOn(t, n, "renamed")
+	ifaces, err := corrosion.GetVMInterfaces(ctx, n.DB, "renamed")
+	if err != nil || len(ifaces) != 1 {
+		t.Fatalf("ifaces = %+v err=%v", ifaces, err)
+	}
+	if spec.Network[0].Mac != ifaces[0].MAC {
+		t.Errorf("the spec records MAC %q, the restored NIC has %q", spec.Network[0].Mac, ifaces[0].MAC)
+	}
+	nets := []lv.NetworkConfig{{MAC: ifaces[0].MAC, SpecOrdinal: ifaces[0].Ordinal + 1}}
+	compose.ApplyNICTuning(nets, spec)
+	if nets[0].Queues != 4 {
+		t.Errorf("a redefine of the restored VM renders queues=%d, want 4", nets[0].Queues)
+	}
 }

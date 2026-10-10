@@ -232,6 +232,8 @@ func (s *Server) SetDiskIO(ctx context.Context, req *pb.SetDiskIORequest) (*pb.V
 	oldCfg, haveCfg := ioTuneNow(s.virt.DumpXMLInactive, req.VmName, dev)
 	restore := func(why string) {
 		if !haveCfg {
+			slog.Error("SetDiskIO: the previous limits could not be read, so a failed step cannot be undone — the definition may hold limits the spec does not",
+				"vm", req.VmName, "disk", req.DiskName, "after", why)
 			return
 		}
 		if rerr := s.virt.SetDiskIOTune(req.VmName, dev, oldCfg); rerr != nil {
@@ -246,7 +248,10 @@ func (s *Server) SetDiskIO(ctx context.Context, req *pb.SetDiskIORequest) (*pb.V
 	if err := s.virt.SetDiskIOTune(req.VmName, dev, tune); err != nil {
 		if !(lv.IsNotFound(err) && vm.State != "running") {
 			restore("a failed set")
-			return nil, status.Errorf(codes.Internal, "set I/O limits (nothing was changed): %v", err)
+			if !haveCfg {
+				return nil, status.Errorf(codes.Internal, "set I/O limits failed and the previous limits could not be read to put them back, so the definition may have changed: %v", err)
+			}
+			return nil, status.Errorf(codes.Internal, "set I/O limits (the previous limits were kept): %v", err)
 		}
 	}
 	if s.ioSpecWriteHook != nil {
@@ -278,6 +283,9 @@ func (s *Server) SetDiskIO(ctx context.Context, req *pb.SetDiskIORequest) (*pb.V
 	})
 	if merr != nil || !applied {
 		restore("a failed spec write")
+		if !haveCfg {
+			return nil, status.Errorf(codes.Internal, "I/O limits were applied but not recorded in %q's spec, and the previous limits could not be read to take them back: %v", req.VmName, merr)
+		}
 		if merr != nil {
 			return nil, status.Errorf(codes.Internal, "I/O limits were not recorded in %q's spec, so they were taken back: %v", req.VmName, merr)
 		}

@@ -360,3 +360,17 @@ func TestUpdateVM_TuningRequestPatchesTheDefinitionInPlace(t *testing.T) {
 		t.Errorf("the patched definition lacks discard:\n%s", got)
 	}
 }
+
+// When the previous limits cannot be read, a failed step cannot be undone: the
+// error says so rather than claiming nothing changed.
+//
+// Mutation: drop the !haveCfg message — red.
+func TestSetDiskIO_SaysWhenThePreviousLimitsCouldNotBeRead(t *testing.T) {
+	s, fake, ctx := ioVM(t, "running")
+	fake.FailDumpXMLInactive = func(string) error { return status.Error(codes.Internal, "dump failed") }
+	fake.FailSetDiskIOTune = func(string, string) error { return status.Error(codes.Internal, "boom") }
+	_, err := s.SetDiskIO(ctx, &pb.SetDiskIORequest{VmName: "io", DiskName: "root", Limits: &pb.DiskIOLimits{TotalIopsSec: 5}})
+	if err == nil || !strings.Contains(err.Error(), "could not be read") {
+		t.Errorf("err = %v, want one saying the previous limits could not be read", err)
+	}
+}

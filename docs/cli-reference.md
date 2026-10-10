@@ -48,6 +48,8 @@ lv cluster converge [--all]        # Kick an immediate anti-entropy pass + repor
                                    #   (`lv cluster sync` is a deprecated alias)
 lv cluster failover-scope [cluster|region]  # Show or set whether failover quorum is cluster-wide or
                                    #   per region (see federation.md → Regions and failure)
+lv cluster failback [on|off]       # Show or set whether an undrain moves drained VMs back (see
+                                   #   migration-failover.md → Failback after maintenance)
 lv cluster acknowledge-lease-term --key <k> --term <n>   # Acknowledge a contested lease term on the connected host
 lv cluster voter ls                # Adopted voter generation; per member: host state, reachable, abstaining
 lv cluster voter init [--members a,b,c] [--yes]   # Start a voter generation by hand (unanimous); for a
@@ -83,7 +85,8 @@ lv host ls --names                        # Print only host names, one per line 
 lv host inspect <host>                    # Host details
 lv host drain <host> [--parallel 2]       # Evacuate VMs off host
 lv host shutdown-workloads <host>         # Stop VMs in reverse startup-order (honors stop-delay)
-lv host undrain <host>                    # Return host to scheduling
+lv host undrain <host> [--failback]       # Return host to scheduling (--failback: move back every VM a drain moved)
+lv host failback <host> [--all] [--dry-run]   # Live-migrate VMs a drain moved away back to the host
 lv host rm <host> [--force]               # Remove host (--force with running VMs); revokes its cert
 lv host rm --dead <host> [--dry-run]      # Remove a host fenced proof-grade and gone for good: checks the
                                           #   fence, `voter rm` if it votes, revokes + publishes the CRL,
@@ -877,7 +880,22 @@ lv clone <source> <new-name>       # Clone a template or stopped VM into a new V
   [--ip <ip>]                      # static IP for the clone's first NIC (default: DHCP)
   [--start]                        # start the clone after creation
   [--snapshot <name>]              # clone from this snapshot of the source
+  [--host <host>]                  # end up on another host: a full copy, moved there like `migrate --cold`
+  [--pool <pool>]                  # put the clone's disks in this file-based pool on that host
 ```
+
+`--host` makes the clone where the source's disks are, as a full copy (a linked
+clone cannot span hosts), then moves it to the host as `lv migrate <vm> <host>
+--cold` moves a stopped VM: its disks stream over the cluster's mTLS connection
+with a checksum, its domain is defined there, and the staged copy is removed
+once the handoff commits. The source host therefore needs room for the copy
+while it travels. `--pool` puts the disks in a pool: directly on the source's
+host, or, on another host, by a move-volume after the move. The caller needs the
+clone's permissions and the project must be allowed to use the pool; a move
+also needs `vm.migrate` on the new VM, and a pool on another host `vm.move`.
+When a later step fails, the clone is left as a complete stopped VM and the error
+names where it is and the command that finishes the job (`lv migrate`,
+`lv move-volume`, `lv start`).
 
 ## GitOps
 

@@ -17,6 +17,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/cloudinit"
@@ -92,6 +93,9 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 	if existing, _ := corrosion.GetVM(ctx, s.db, req.Target); existing != nil {
 		return nil, status.Errorf(codes.AlreadyExists, "VM %q already exists", req.Target)
 	}
+	if err := s.validateCloneTarget(ctx, req, src, project); err != nil {
+		return nil, err
+	}
 	// The clone is created where the source's disks live.
 	if src.HostName != s.hostName {
 		client, conn, perr := s.peerClient(ctx, src.HostName)
@@ -106,6 +110,27 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 		}
 		return vm, err
 	}
+	// A clone to another host is made here, where the source's disks are, as
+	// an ordinary full clone, and then moved to its host as `lv migrate --cold`
+	// moves any stopped VM: its disks streamed over the peer connection, its
+	// domain defined there, the staged copy removed once the handoff commits.
+	crossHost := req.TargetHost != "" && req.TargetHost != s.hostName
+	if !crossHost {
+		return s.cloneVMOnSource(ctx, req, src, project)
+	}
+	staged := proto.Clone(req).(*pb.CloneVMRequest)
+	staged.Start, staged.TargetHost, staged.TargetPool, staged.Mode = false, "", "", "full"
+	if _, err := s.cloneVMOnSource(ctx, staged, src, project); err != nil {
+		return nil, err
+	}
+	return s.finishCrossHostClone(ctx, req)
+}
+
+// cloneVMOnSource is CloneVM on the host that holds the source's disks, with
+// every permission check made and the target name known to be free. On the
+// source's host it places the disks in req.TargetPool when one is named.
+func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, src *corrosion.VMRecord, project string) (*pb.VM, error) {
+	var err error
 	// The source's lock, held until the clone's row exists (review M-1): a
 	// linked clone backs on the source's current layer before anything
 	// records that. A snapshot delete or restore of the source holds this
@@ -185,6 +210,19 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 	defer lease.release(ctx)
 
 	mode, modeWhy := s.cloneModeFor(ctx, req.Mode, srcDisks)
+	// A clone placed in a pool is its own copy: a linked one is an overlay on
+	// its source's file, which no other pool holds.
+	var tpool *cloneTargetPool
+	if req.TargetPool != "" {
+		if req.Mode == "linked" {
+			return nil, status.Error(codes.InvalidArgument,
+				"a linked clone cannot be placed in a storage pool: it is an overlay on its source's disk; use --mode full")
+		}
+		mode, modeWhy = "full", "a clone placed in pool "+req.TargetPool+" is a full copy"
+		if tpool, err = s.cloneTargetPoolFor(ctx, project, req.TargetPool, srcDisks); err != nil {
+			return nil, err
+		}
+	}
 	// Said to the caller (lv clone prints it), as auto may pick either.
 	_ = grpc.SetHeader(ctx, metadata.Pairs(CloneModeHeader, mode+": "+modeWhy))
 
@@ -209,18 +247,36 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 	}
 	for _, d := range srcDisks {
 		clonePath, err := s.images.SafeDiskPath(req.Target, d.DiskName)
+		if tpool != nil {
+			clonePath, err = tpool.diskPath(req.Target, d.DiskName)
+		}
 		if err != nil {
 			cleanup()
 			return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 		}
-		if err := os.MkdirAll(filepath.Dir(clonePath), 0755); err != nil {
+		if tpool != nil {
+			// Never onto a file that is already there: in a shared pool the
+			// derived "<vm>-<disk>.qcow2" can be another VM's disk.
+			if _, lerr := os.Lstat(s.hostDiskFile(clonePath)); lerr == nil {
+				cleanup()
+				return nil, status.Errorf(codes.AlreadyExists, "%s already exists in pool %q", clonePath, tpool.name)
+			}
+			if rerr := refuseSymlinkTarget(s.hostDiskFile(clonePath)); rerr != nil {
+				cleanup()
+				return nil, rerr
+			}
+		}
+		// hostFile is where this host's copy of the clone's disk file is: the
+		// recorded path itself, except under the hostDiskRoot test seam.
+		hostFile := s.hostDiskFile(clonePath)
+		if err := os.MkdirAll(filepath.Dir(hostFile), 0755); err != nil {
 			cleanup()
 			return nil, status.Errorf(codes.Internal, "prepare disk dir: %v", err)
 		}
 		size := uint64(d.SizeBytes)
 		var backing string
 		if mode == "linked" {
-			if err := qcow2.CreateWithBacking(clonePath, d.Path, size, nil); err != nil {
+			if err := qcow2.CreateWithBacking(hostFile, d.Path, size, nil); err != nil {
 				cleanup()
 				return nil, cloneDiskErr("create linked clone disk", d.DiskName, err)
 			}
@@ -235,17 +291,17 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 			// exactly those: a raw backing (a promoted VM's replica, guest
 			// content) is read as raw, never parsed for a header the guest may
 			// have written.
-			accepted, err := precheckChain(d.Path, s.diskChainRule(ctx, d))
+			accepted, err := precheckChain(s.hostDiskFile(d.Path), s.diskChainRule(ctx, d))
 			if err != nil {
 				cleanup()
 				return nil, status.Errorf(codes.FailedPrecondition, "full-clone disk %s: %v", d.DiskName, err)
 			}
-			if err := qcow2.ConvertConfined(ctx, d.Path, clonePath, &qcow2.Options{Uncompressed: true}, onlyAccepted(accepted)); err != nil {
+			if err := qcow2.ConvertConfined(ctx, s.hostDiskFile(d.Path), hostFile, &qcow2.Options{Uncompressed: true}, onlyAccepted(accepted)); err != nil {
 				cleanup()
 				return nil, cloneDiskErr("full-clone disk", d.DiskName, err)
 			}
 		}
-		created = append(created, clonePath)
+		created = append(created, hostFile)
 		bus, controller := "virtio", ""
 		if ds := diskSpecByName[d.DiskName]; ds != nil {
 			if ds.Bus != "" {
@@ -257,9 +313,13 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 		// The clone's own file is <data_dir>/disks on this host whatever the
 		// source's storage (SafeDiskPath): recorded as that, so no host
 		// takes a local file for shared storage (review I-3).
+		storageType, storageVolume := "local", ""
+		if tpool != nil {
+			storageType, storageVolume = tpool.storageType(), tpool.name
+		}
 		diskRecords = append(diskRecords, corrosion.DiskRecord{
 			VMName: req.Target, DiskName: d.DiskName, HostName: s.hostName, Path: clonePath,
-			SizeBytes: d.SizeBytes, StorageType: "local", BackingDisk: backing,
+			SizeBytes: d.SizeBytes, StorageType: storageType, StorageVolume: storageVolume, BackingDisk: backing,
 			TargetDev: lv.DiskDevName(bus, len(diskRecords)), Bus: bus,
 		})
 	}

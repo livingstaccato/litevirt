@@ -84,6 +84,12 @@ type Options struct {
 	// own DB and mutations must travel via the real Replicator —
 	// steered by the scenario unless IndependentReplicas starts its loop.
 	SharedCRDT bool
+	// SharedDataDir gives every node the SAME data directory string, as every
+	// host of a real cluster has /var/lib/litevirt. A disk's recorded path then
+	// names a file under every node's disk-artifact root, which a copy between
+	// hosts needs; pair it with SetHostDiskRootForTest so each node still has
+	// its own files.
+	SharedDataDir bool
 	// RegionByIndex assigns regions to nodes 0..N-1. Empty → all "default".
 	RegionByIndex []string
 	// NetBoxURL points every node's NetBox client at an external IPAM — in
@@ -740,6 +746,9 @@ func (c *Cluster) crossRegisterHosts() {
 
 func (c *Cluster) buildServer(n *Node) {
 	dataDir := filepath.Join(c.tmpRoot, n.Name, "data")
+	if c.opts.SharedDataDir {
+		dataDir = filepath.Join(c.tmpRoot, "shared-data")
+	}
 	if err := mkdirAll(dataDir); err != nil {
 		c.t.Fatalf("mkdir data for %s: %v", n.Name, err)
 	}

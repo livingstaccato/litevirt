@@ -145,10 +145,33 @@ func TestGetRelayHealth_ListsDemotionsAndHolds(t *testing.T) {
 		t.Fatalf("status = %+v, want latched with n1 and n2", st)
 	}
 	n1, n2 := st.GetHosts()[0], st.GetHosts()[1]
-	if n1.GetHost() != "n1" || n1.GetDemoted() || n1.GetHoldUntil() == "" || n1.GetHoldBy() != "admin" {
-		t.Errorf("n1 = %+v, want restored and held by admin", n1)
+	if n1.GetHost() != "n1" || n1.GetDemoted() || n1.GetHoldUntil() == "" || n1.GetHoldBy() != "an operator" {
+		t.Errorf("n1 = %+v, want restored and held, the author withheld from a viewer", n1)
 	}
 	if n2.GetHost() != "n2" || !n2.GetDemoted() || n2.GetSince() == "" || n2.GetReason() == "" {
 		t.Errorf("n2 = %+v, want demoted with since and reason", n2)
+	}
+}
+
+// The hold's author is a username: an admin sees it, a viewer sees only that
+// an operator set it, and when.
+//
+// Mutation: show the username to every role — the viewer sees "admin", red.
+func TestGetRelayHealth_HoldAuthorOnlyForAdmins(t *testing.T) {
+	s := relayRestoreServer(t, true)
+	if _, err := s.RestoreRelay(adminCtx(), &pb.RestoreRelayRequest{Host: "n1", HoldSeconds: 600}); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		ctx  context.Context
+		want string
+	}{{adminCtx(), "admin"}, {viewerCtx(), "an operator"}, {operatorCtx(), "an operator"}} {
+		st, err := s.GetRelayHealth(tc.ctx, nil)
+		if err != nil || len(st.GetHosts()) != 1 {
+			t.Fatalf("GetRelayHealth: %v %+v", err, st)
+		}
+		if e := st.GetHosts()[0]; e.GetHoldBy() != tc.want || e.GetHoldUntil() == "" {
+			t.Errorf("hold by = %q until %q, want %q with the time", e.GetHoldBy(), e.GetHoldUntil(), tc.want)
+		}
 	}
 }

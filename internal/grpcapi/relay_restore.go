@@ -66,7 +66,9 @@ func (s *Server) RestoreRelay(ctx context.Context, req *pb.RestoreRelayRequest) 
 	d := corrosion.RelayDemotion{
 		Demoted: false,
 		Since:   now.Format(time.RFC3339),
-		Reason:  "restored by " + user + " (lv cluster relay-restore)",
+		// No username in the replicated reason, which any viewer can list:
+		// the audit row names who.
+		Reason: "restored by an operator (lv cluster relay-restore)",
 	}
 	// The hold first, in its own row: a demotion the lease holder writes in
 	// the meantime then meets the hold on its re-read, and an evaluator's row
@@ -115,6 +117,9 @@ func (s *Server) GetRelayHealth(ctx context.Context, _ *emptypb.Empty) (*pb.Rela
 		return nil, status.Errorf(codes.Internal, "read relay holds: %v", err)
 	}
 	now := time.Now()
+	// Who set a hold is a username: shown to an admin, and to anyone else only
+	// as "an operator", with the time.
+	isAdmin := RequireRole(ctx, "admin") == nil
 	by := map[string]*pb.RelayHealthEntry{}
 	for host, d := range rows {
 		by[host] = &pb.RelayHealthEntry{Host: host, Demoted: d.Demoted, Since: d.Since, Reason: d.Reason}
@@ -128,7 +133,10 @@ func (s *Server) GetRelayHealth(ctx context.Context, _ *emptypb.Empty) (*pb.Rela
 			e = &pb.RelayHealthEntry{Host: host}
 			by[host] = e
 		}
-		e.HoldUntil, e.HoldBy = h.Until, h.By
+		e.HoldUntil, e.HoldBy = h.Until, "an operator"
+		if isAdmin {
+			e.HoldBy = h.By
+		}
 	}
 	out := &pb.RelayHealthStatus{Latched: s.db.MayWriteRelayDemotion()}
 	for _, e := range by {

@@ -31,7 +31,8 @@ package corrosion
 // the latch that proves every recipient decodes the shape.
 //
 // An operator's hold (`lv cluster relay-restore --hold`) is a relay_hold/<host>
-// row of its own, which the lease holder never writes.
+// row of its own, which the lease holder never writes for a host that exists
+// (it only ends the hold of a removed host).
 //
 // cluster_policies has no statement that deletes a row, so a restore writes
 // the row again with demoted=false, like iso_library's "{}" removal. Rows are
@@ -66,8 +67,9 @@ type RelayDemotion struct {
 }
 
 // RelayHoldKeyPrefix is the cluster_policies key prefix of an operator's
-// hold: relay_hold/<host>. It is a row of its own, written only by
-// `lv cluster relay-restore --hold`, never by the failover lease holder — so
+// hold: relay_hold/<host>. It is a row of its own, written by
+// `lv cluster relay-restore --hold`, and by the failover lease holder only to
+// end the hold of a host that has been removed — so
 // the lease holder's last-writer-wins demotion row can never erase a hold
 // that replicated to it a moment late.
 const RelayHoldKeyPrefix = "relay_hold/"

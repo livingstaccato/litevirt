@@ -764,3 +764,33 @@ func TestRelayHealth_NeverOnOneObserversWord(t *testing.T) {
 		t.Fatal("h1 demoted on one counted observer's word")
 	}
 }
+
+// A removed host's hold ends with it, as its demotion row does, so a host
+// later added under the name never starts out held. (cluster_policies has no
+// delete: the hold row is written again, expired.)
+//
+// Mutation: leave removed hosts' holds alone — the hold is still in force,
+// red.
+func TestRelayHealth_RemovedHostsHoldIsEnded(t *testing.T) {
+	f := newRelayFixture(t, 5, true)
+	ctx := context.Background()
+	if err := corrosion.SetRelayHold(ctx, f.db, "ghost", corrosion.RelayHold{
+		Until: f.clk.Add(time.Hour).Format(time.RFC3339), By: "admin",
+	}, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.SetRelayHold(ctx, f.db, "h2", corrosion.RelayHold{
+		Until: f.clk.Add(time.Hour).Format(time.RFC3339), By: "admin",
+	}, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	f.cycle()
+	f.cycle()
+	holds, _ := corrosion.ListRelayHolds(ctx, f.db)
+	if holds["ghost"].Active(f.clk) {
+		t.Fatalf("a removed host's hold is still in force: %+v", holds["ghost"])
+	}
+	if !holds["h2"].Active(f.clk) || holds["h2"].By != "admin" {
+		t.Fatalf("a live host's hold was touched: %+v", holds["h2"])
+	}
+}

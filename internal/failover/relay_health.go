@@ -32,7 +32,8 @@ package failover
 //   - Never demote a host an operator restored with a hold
 //     (`lv cluster relay-restore --hold`) until the hold runs out, and
 //     restore at once a host found demoted under one. The hold is a
-//     relay_hold/<host> row of its own, which this evaluator never writes, so
+//     relay_hold/<host> row of its own, which this evaluator never writes for
+//     a host that exists (it only ends a removed host's hold), so
 //     its last-writer-wins demotion row cannot erase a hold that reached it a
 //     moment late; and the hold is re-read just before a demotion is written.
 //
@@ -288,6 +289,22 @@ func (c *Coordinator) evaluateRelayHealth(ctx context.Context, voters, fenceCand
 	for name, row := range rows {
 		if row.Demoted && !seen[name] {
 			gone = append(gone, name)
+		}
+	}
+
+	// A removed host's hold ends with it, so a host later added under the
+	// name never starts out held. This is the one hold write the lease holder
+	// makes, and only for a name no host carries: an operator's hold on a
+	// host that exists is never touched.
+	for name, h := range holds {
+		if seen[name] || !h.Active(now) {
+			continue
+		}
+		end := corrosion.RelayHold{Until: now.UTC().Format(time.RFC3339), Since: h.Since, By: h.By}
+		if err := corrosion.SetRelayHold(ctx, c.db, name, end, c.hostName); err != nil {
+			slog.Warn("relay health: end a removed host's hold", "host", name, "error", err)
+		} else {
+			slog.Info("relay health: removed host's relay hold ended", "host", name)
 		}
 	}
 

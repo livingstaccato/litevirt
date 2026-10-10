@@ -67,6 +67,7 @@ func TestFleet_ForwardedCloneOfAMountedContainerNeedsAdmin(t *testing.T) {
 	entry, owner := c.Nodes[0], c.Nodes[1]
 	allowed, _ := filepath.EvalSymlinks(t.TempDir())
 	_ = os.MkdirAll(filepath.Join(allowed, "data"), 0o755)
+	lxc.TrustHookBinaryForTest(t)
 	owner.CT.SetHostAccessPolicy(lxc.HostAccess{MountPaths: []string{allowed}, HookBinary: "/opt/litevirt"})
 	mountedContainer(t, c, owner, "m", filepath.Join(allowed, "data"))
 	op := operatorOn(t, c, entry)
@@ -88,6 +89,51 @@ func TestFleet_ForwardedCloneOfAMountedContainerNeedsAdmin(t *testing.T) {
 	}
 }
 
+// N2. A privileged mode and legacy confinement are host escalation like a
+// mount, but a clone is never refused for them: an operator's clone — sent to
+// a node that is not the source's host, which runs the forwarded call as the
+// peer — lands unprivileged, in an id range of its own, with default
+// confinement, and audited. An admin's clone keeps the source's mode.
+func TestFleet_ForwardedCloneOfAPrivilegedContainerLandsUnprivileged(t *testing.T) {
+	c := New(t, Options{Nodes: 2, IndependentReplicas: true})
+	ctx := context.Background()
+	entry, owner := c.Nodes[0], c.Nodes[1]
+	owner.CT.Seed("p", "payload-p")
+	if err := corrosion.UpsertContainer(ctx, owner.DB, corrosion.ContainerRecord{
+		HostName: owner.Name, Name: "p", State: "stopped", Image: "docker.io/library/alpine:3.19",
+		CreateSpec: corrosion.EncodeCreateSpec(corrosion.ContainerCreateSpec{Template: "download", Distro: "alpine"}),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	c.WaitConverged(t, convergeTimeout)
+	op := operatorOn(t, c, entry)
+	if _, err := op.CloneContainer(ctx, &pb.CloneContainerRequest{Source: "p", Target: "x", HostName: owner.Name}); err != nil {
+		t.Fatalf("operator clone of a privileged container through %s was refused: %v", entry.Name, err)
+	}
+	rec, _ := corrosion.GetContainer(ctx, owner.DB, owner.Name, "x")
+	if rec == nil {
+		t.Fatal("the clone has no row")
+	}
+	spec := corrosion.DecodeCreateSpec(rec.CreateSpec)
+	if spec.IDMapBase == 0 || spec.Confinement != lxc.ConfinementDefault {
+		t.Errorf("an operator's clone of a privileged container recorded %+v; want an id range and default confinement", spec)
+	}
+	sec, err := owner.CT.ContainerSecurity("x")
+	if err != nil || sec.IDMap == nil || sec.IDMap.Base != spec.IDMapBase || sec.Confinement != lxc.ConfinementDefault {
+		t.Errorf("the clone's config runs %+v (%v); want unprivileged at %d with default confinement", sec, err, spec.IDMapBase)
+	}
+	if !auditedOn(t, owner, "ct.clone", "x", "privileged") {
+		t.Error("the clone's dropped privileged mode was not audited")
+	}
+	// Control: an admin's clone through the same entry node stays privileged.
+	if _, err := c.SelfClient(entry).CloneContainer(ctx, &pb.CloneContainerRequest{Source: "p", Target: "y", HostName: owner.Name}); err != nil {
+		t.Fatalf("admin clone: %v", err)
+	}
+	if rec, _ := corrosion.GetContainer(ctx, owner.DB, owner.Name, "y"); rec == nil || corrosion.DecodeCreateSpec(rec.CreateSpec).IDMapBase != 0 {
+		t.Errorf("an admin's clone did not keep the privileged mode: %+v", rec)
+	}
+}
+
 // §4/C2. A restore takes nothing that grants host access from the archive:
 // not a raw lxc.mount.entry in its config, not a forged managed block or its
 // authorized record, and not the mounts in its create spec — unless an admin
@@ -103,12 +149,17 @@ func TestFleet_RestoreCarriesNoUnauthorizedHostAccess(t *testing.T) {
 	}
 	allowed, _ := filepath.EvalSymlinks(t.TempDir())
 	_ = os.MkdirAll(filepath.Join(allowed, "data"), 0o755)
+	lxc.TrustHookBinaryForTest(t)
 	adminDst.CT.SetHostAccessPolicy(lxc.HostAccess{MountPaths: []string{allowed}, HookBinary: "/opt/litevirt"})
 
 	// A container whose archive carries everything a forger would put in it.
 	createSizedContainer(t, c, src, "ct", "", 0, 256)
 	cfgPath := filepath.Join(src.CT.dir("ct"), "config")
-	forged := "lxc.mount.entry = / host none rbind,rw 0 0\n" +
+	// The network too: a host NIC moved in (phys), a NIC on the host's
+	// interface (macvlan), a routed veth, an emptied namespace (none).
+	forged := "lxc.net.5.type = phys\nlxc.net.5.link = eth9\nlxc.net.6.type = macvlan\nlxc.net.6.link = bond0\n" +
+		"lxc.net.7.type = veth\nlxc.net.7.veth.mode = router\nlxc.net.8.type = none\n" +
+		"lxc.mount.entry = / host none rbind,rw 0 0\n" +
 		"# litevirt:host-access-begin\n# litevirt:mount rw dir / .\nlxc.mount.entry = /run/litevirt/ct/ct/m0 hostroot none bind 0 0\n# litevirt:host-access-end\n"
 	f, _ := os.OpenFile(cfgPath, os.O_APPEND|os.O_WRONLY, 0o644)
 	_, _ = f.WriteString(forged)
@@ -140,10 +191,16 @@ func TestFleet_RestoreCarriesNoUnauthorizedHostAccess(t *testing.T) {
 		}
 	}
 	got := opDst.CT.Config("ct")
-	for _, bad := range []string{"lxc.mount.entry", "host-access-begin", "hostroot"} {
+	for _, bad := range []string{"lxc.mount.entry", "host-access-begin", "hostroot", "phys", "eth9", "macvlan", "bond0", "veth.mode", "type = none", "lxc.net.5", "lxc.net.8"} {
 		if strings.Contains(got, bad) {
 			t.Errorf("operator-restored config still carries %q:\n%s", bad, got)
 		}
+	}
+	if !strings.Contains(got, "lxc.net.0.type = veth") {
+		t.Errorf("operator-restored config has no network rendered from its spec:\n%s", got)
+	}
+	if !auditedOn(t, opDst, "ct.restore", "ct", "lxc.net.5.type = phys") {
+		t.Error("the archive's dropped network lines were not audited")
 	}
 	if _, err := os.Stat(filepath.Join(opDst.CT.dir("ct"), "litevirt-host-access.json")); !os.IsNotExist(err) {
 		t.Errorf("the archive's authorized-host-access record survived the restore (%v)", err)

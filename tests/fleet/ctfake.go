@@ -104,10 +104,10 @@ func (f *CTFake) Config(name string) string {
 	return string(b)
 }
 
-func (f *CTFake) RebuildContainerConfig(_ context.Context, name string, cfg grpcapi.AuthorizedContainerConfig) error {
+func (f *CTFake) RebuildContainerConfig(_ context.Context, name string, cfg grpcapi.AuthorizedContainerConfig) ([]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.runner().RebuildConfig(name, cfg.Confinement, cfg.IDMapBase, fakeMounts(cfg.Mounts), fakeDevices(cfg.Devices))
+	return f.runner().RebuildConfig(name, cfg.Confinement, cfg.IDMapBase, grpcapi.LXCNICs(cfg), fakeMounts(cfg.Mounts), fakeDevices(cfg.Devices))
 }
 
 func (f *CTFake) SetContainerHostAccess(_ context.Context, name string, mounts []grpcapi.ContainerMountOpt, devices []grpcapi.ContainerDeviceOpt) error {

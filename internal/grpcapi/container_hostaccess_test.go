@@ -88,7 +88,7 @@ type fakeRebuild struct {
 	cfg  AuthorizedContainerConfig
 }
 
-func (f *fakeCTRuntime) RebuildContainerConfig(_ context.Context, name string, cfg AuthorizedContainerConfig) error {
+func (f *fakeCTRuntime) RebuildContainerConfig(_ context.Context, name string, cfg AuthorizedContainerConfig) ([]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.rebuilds = append(f.rebuilds, fakeRebuild{name, cfg})
@@ -96,7 +96,7 @@ func (f *fakeCTRuntime) RebuildContainerConfig(_ context.Context, name string, c
 		f.hostAccess = map[string][]ContainerMountOpt{}
 	}
 	f.hostAccess[name] = cfg.Mounts
-	return nil
+	return f.rebuildDropped, nil
 }
 
 func (f *fakeCTRuntime) SetContainerHostAccess(_ context.Context, name string, mounts []ContainerMountOpt, _ []ContainerDeviceOpt) error {

@@ -21,7 +21,6 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
-	"github.com/litevirt/litevirt/internal/lxc"
 	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/pbsstore"
 	"github.com/litevirt/litevirt/internal/safename"
@@ -1076,15 +1075,28 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	// in the archive's config is trusted (the import already dropped every line
 	// that grants host access or overrides confinement).
 	{
+		// The source row is what authorizes a peer move's host access and
+		// privilege: one that cannot be read fails the restore (Unavailable,
+		// retried), never reads as "no source" and strips a container's
+		// authorized mounts on a transient error.
 		var source *corrosion.ContainerRecord
+		var serr error
 		if migrateSource != "" {
-			source, _ = corrosion.GetContainer(ctx, s.db, migrateSource, req.Name)
+			source, serr = corrosion.GetContainer(ctx, s.db, migrateSource, req.Name)
 		} else if peerRelocation {
 			token := relocateTokenFromMD(ctx)
 			if token == "" && req.Proof != nil {
 				token = req.Proof.GetRelocationToken()
 			}
-			source, _ = s.relocatingContainer(ctx, req.Name, s.hostName, token)
+			source, serr = s.relocatingContainer(ctx, req.Name, s.hostName, token)
+		}
+		if serr != nil {
+			if delErr := s.containerRuntime.DeleteContainer(ctx, req.Name); delErr != nil {
+				slog.Warn("container restore: cleanup after the source row read failed also failed", "name", req.Name, "error", delErr)
+			}
+			s.removeRestoreMarker(req.Name)
+			s.audit(ctx, "ct.restore", req.Name, "project="+project+" (source row unreadable)", "error")
+			return status.Errorf(codes.Unavailable, "restore: read the source container's row (what authorizes its host access): %v", serr)
 		}
 		authorized, stripped := s.authorizeRestoredHostAccess(ctx, corrosion.DecodeCreateSpec(spec.CreateSpec), source, !operatorRestore)
 		// Privileged mode and legacy confinement are the same host-escalation
@@ -1100,11 +1112,7 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 				s.removeRestoreMarker(req.Name)
 				return status.Error(codes.PermissionDenied, "restoring a privileged container needs the admin role (this host cannot convert it to unprivileged)")
 			}
-			base, aerr := s.allocateIDMapBase(ctx, req.Name)
-			if aerr == nil {
-				aerr = sc.ConvertContainerSecurity(ctx, req.Name, lxc.ConvertOpts{
-					IDMap: &lxc.IDMap{Base: base, Size: lxc.IDMapSize}, Confinement: lxc.ConfinementDefault})
-			}
+			base, aerr := s.unprivilegeContainer(ctx, sc, req.Name)
 			if aerr != nil {
 				if delErr := s.containerRuntime.DeleteContainer(ctx, req.Name); delErr != nil {
 					slog.Warn("container restore: cleanup after the unprivileged move failed also failed", "name", req.Name, "error", delErr)
@@ -1120,7 +1128,11 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 		if stripped != "" {
 			spec.CreateSpec = corrosion.EncodeCreateSpec(authorized)
 		}
-		if err := s.rebuildContainerConfig(ctx, req.Name, authorized); err != nil {
+		// The network as well: lxc.net.* comes from the authorized spec's
+		// NICs alone, never the archive's (a phys, macvlan or router-mode NIC,
+		// or another tenant's bridge, is host access too).
+		droppedCfg, err := s.renderContainerConfig(ctx, req.Name, authorized, true)
+		if err != nil {
 			if delErr := s.containerRuntime.DeleteContainer(ctx, req.Name); delErr != nil {
 				slog.Warn("container restore: cleanup after the config rebuild failed also failed", "name", req.Name, "error", delErr)
 			}
@@ -1128,6 +1140,7 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 			return err
 		}
 		s.noteStrippedHostAccess(ctx, "ct.restore", req.Name, stripped)
+		s.noteDroppedArchiveConfig(ctx, "ct.restore", req.Name, droppedCfg)
 	}
 	stateDetail := ""
 	if !req.Start {

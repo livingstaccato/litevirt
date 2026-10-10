@@ -206,14 +206,27 @@ func lxcDevices(in []ContainerDeviceOpt) []lxc.Device {
 
 // RebuildContainerConfig renders a container's config from what was
 // authorized (lxc.LxcRunner.RebuildConfig).
-func (a *LXCRuntimeAdapter) RebuildContainerConfig(_ context.Context, name string, cfg AuthorizedContainerConfig) error {
+func (a *LXCRuntimeAdapter) RebuildContainerConfig(_ context.Context, name string, cfg AuthorizedContainerConfig) ([]string, error) {
 	rb, ok := a.Inner.(interface {
-		RebuildConfig(name, confinement string, idmapBase int64, mounts []lxc.Mount, devices []lxc.Device) error
+		RebuildConfig(name, confinement string, idmapBase int64, nics []lxc.NetworkAttach, mounts []lxc.Mount, devices []lxc.Device) ([]string, error)
 	})
 	if !ok {
-		return errors.New("this container runtime cannot render a container's config")
+		return nil, errors.New("this container runtime cannot render a container's config")
 	}
-	return rb.RebuildConfig(name, cfg.Confinement, cfg.IDMapBase, lxcMounts(cfg.Mounts), lxcDevices(cfg.Devices))
+	return rb.RebuildConfig(name, cfg.Confinement, cfg.IDMapBase, LXCNICs(cfg), lxcMounts(cfg.Mounts), lxcDevices(cfg.Devices))
+}
+
+// LXCNICs are the NICs a rebuild renders: nil (keep the config's network)
+// unless cfg.RenderNetwork, then exactly cfg.Networks (possibly none).
+func LXCNICs(cfg AuthorizedContainerConfig) []lxc.NetworkAttach {
+	if !cfg.RenderNetwork {
+		return nil
+	}
+	out := make([]lxc.NetworkAttach, 0, len(cfg.Networks))
+	for _, n := range cfg.Networks {
+		out = append(out, lxc.NetworkAttach{Name: n.Name, Bridge: n.Bridge, IP: n.IP, MAC: n.MAC, Veth: n.Veth, Gateway: n.Gateway})
+	}
+	return out
 }
 
 // SetContainerHostAccess records and renders a container's authorized host

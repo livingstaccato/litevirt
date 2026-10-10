@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"path/filepath"
 	"reflect"
@@ -13,6 +14,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/lxc"
+	"github.com/litevirt/litevirt/internal/network"
 )
 
 // Container host bind mounts and device nodes (Proxmox mpN / devN).
@@ -145,7 +147,8 @@ func hostAccessAudit(mounts []*pb.ContainerMount, devices []*pb.ContainerDevice)
 // through the adapter): security rendered from the confinement and id range,
 // host access from the mounts and devices, nothing kept from an archive.
 type hostAccessRebuilder interface {
-	RebuildContainerConfig(ctx context.Context, name string, cfg AuthorizedContainerConfig) error
+	// RebuildContainerConfig returns what of the config it dropped.
+	RebuildContainerConfig(ctx context.Context, name string, cfg AuthorizedContainerConfig) ([]string, error)
 }
 
 // AuthorizedContainerConfig is what a rebuilt container config is rendered from.
@@ -154,6 +157,12 @@ type AuthorizedContainerConfig struct {
 	IDMapBase   int64
 	Mounts      []ContainerMountOpt
 	Devices     []ContainerDeviceOpt
+	// RenderNetwork renders lxc.net.* from Networks alone (none: create's
+	// default), dropping every network line the config holds — a restore,
+	// whose config an archive wrote. Unset, the network is kept as it is (a
+	// revert or a clone of a config this host wrote).
+	RenderNetwork bool
+	Networks      []ContainerNICOpt
 }
 
 // rebuildContainerConfig renders name's config from the authorized spec cs.
@@ -163,12 +172,20 @@ type AuthorizedContainerConfig struct {
 // ever loosened by a rebuild. A runtime that cannot rebuild refuses, unless
 // there is nothing to render.
 func (s *Server) rebuildContainerConfig(ctx context.Context, name string, cs corrosion.ContainerCreateSpec) error {
+	_, err := s.renderContainerConfig(ctx, name, cs, false)
+	return err
+}
+
+// renderContainerConfig is rebuildContainerConfig that, with renderNetwork,
+// renders the network from cs as well, and returns what of the config was
+// dropped.
+func (s *Server) renderContainerConfig(ctx context.Context, name string, cs corrosion.ContainerCreateSpec, renderNetwork bool) ([]string, error) {
 	rb, ok := s.containerRuntime.(hostAccessRebuilder)
 	if !ok {
-		if len(cs.Mounts) > 0 || len(cs.Devices) > 0 {
-			return status.Error(codes.Unavailable, "this host's container runtime cannot render host mounts")
+		if len(cs.Mounts) > 0 || len(cs.Devices) > 0 || renderNetwork {
+			return nil, status.Error(codes.Unavailable, "this host's container runtime cannot render a container's config")
 		}
-		return nil
+		return nil, nil
 	}
 	cfg := AuthorizedContainerConfig{Confinement: cs.Confinement, IDMapBase: cs.IDMapBase}
 	if sc, ok := s.containerRuntime.(containerSecurer); ok {
@@ -182,10 +199,50 @@ func (s *Server) rebuildContainerConfig(ctx context.Context, name string, cs cor
 		}
 	}
 	cfg.Mounts, cfg.Devices = hostAccessOpts(cs)
-	if err := rb.RebuildContainerConfig(ctx, name, cfg); err != nil {
-		return status.Errorf(codes.Internal, "render %q's config from its authorized spec: %v", name, err)
+	if renderNetwork {
+		cfg.RenderNetwork = true
+		cfg.Networks = s.authorizedContainerNICs(ctx, name, cs)
 	}
-	return nil
+	dropped, err := rb.RebuildContainerConfig(ctx, name, cfg)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "render %q's config from its authorized spec: %v", name, err)
+	}
+	return dropped, nil
+}
+
+// authorizedContainerNICs are the runtime NICs of cs's networks, as a
+// relocation renders them: a managed NIC with its deterministic veth and the
+// subnet's prefix and gateway, a raw bridge as recorded.
+func (s *Server) authorizedContainerNICs(ctx context.Context, name string, cs corrosion.ContainerCreateSpec) []ContainerNICOpt {
+	out := make([]ContainerNICOpt, 0, len(cs.Networks))
+	haveGateway := false
+	for i, n := range cs.Networks {
+		if n.NetworkName == "" {
+			out = append(out, ContainerNICOpt{Name: n.Name, Bridge: n.Bridge, IP: n.IP, MAC: n.MAC})
+			continue
+		}
+		runIP, gw := network.ContainerAddress(n.IP, s.containerNetworkSubnet(ctx, n.NetworkName))
+		if haveGateway {
+			gw = ""
+		}
+		haveGateway = haveGateway || gw != ""
+		out = append(out, ContainerNICOpt{Name: n.Name, Bridge: n.Bridge, IP: runIP, MAC: n.MAC, Veth: containerVethName(name, i), Gateway: gw})
+	}
+	return out
+}
+
+// containerNetworkSubnet is a managed network's subnet, or "" (none, or
+// unreadable: the NIC then keeps its address as recorded).
+func (s *Server) containerNetworkSubnet(ctx context.Context, name string) string {
+	nr, err := corrosion.GetNetwork(ctx, s.db, name)
+	if err != nil || nr == nil {
+		return ""
+	}
+	var def struct{ Subnet string }
+	if json.Unmarshal([]byte(nr.Config), &def) != nil {
+		return ""
+	}
+	return def.Subnet
 }
 
 // sameHostAccess reports whether two specs carry the same mounts and devices.
@@ -281,6 +338,34 @@ func (s *Server) authorizeRestoredSecurity(ctx context.Context, cs corrosion.Con
 	return cs, strings.Join(what, " "), unprivilege
 }
 
+// unprivilegeContainer moves a stopped container that may not keep its
+// privileged mode or legacy confinement into an id range of its own (its
+// files shifted) with default confinement, and returns the range's base. A
+// conversion an earlier attempt left unfinished is finished into the range
+// its marker recorded — its files are already partly there — never a new one.
+func (s *Server) unprivilegeContainer(ctx context.Context, sc containerSecurer, name string) (int64, error) {
+	sec, err := sc.ContainerSecurity(name)
+	if err != nil {
+		return 0, err
+	}
+	var base int64
+	switch {
+	case sec.Converting && sec.ConvertTo != nil && sec.ConvertTo.IDMap != nil:
+		base = sec.ConvertTo.IDMap.Base
+	case sec.IDMap != nil:
+		base = sec.IDMap.Base // already unprivileged: only the confinement moves
+	default:
+		if base, err = s.allocateIDMapBase(ctx, name); err != nil {
+			return 0, err
+		}
+	}
+	if err := sc.ConvertContainerSecurity(ctx, name, lxc.ConvertOpts{
+		IDMap: &lxc.IDMap{Base: base, Size: lxc.IDMapSize}, Confinement: lxc.ConfinementDefault}); err != nil {
+		return 0, err
+	}
+	return base, nil
+}
+
 // noteStrippedHostAccess records host access a restore or clone did not carry.
 func (s *Server) noteStrippedHostAccess(ctx context.Context, action, name, stripped string) {
 	if stripped == "" {
@@ -288,6 +373,16 @@ func (s *Server) noteStrippedHostAccess(ctx context.Context, action, name, strip
 	}
 	slog.Warn("container: host access or privilege was not carried; an admin re-applies it", "container", name, "action", action, "stripped", stripped)
 	s.audit(ctx, action, name, "not carried (an admin re-applies host mounts/devices with lv ct convert --mount/--device, legacy confinement with lv ct convert --confinement legacy, a privileged mode by restoring as admin): "+stripped, "ok")
+}
+
+// noteDroppedArchiveConfig says what of an archived config the rebuild
+// dropped — network lines the spec does not render among them.
+func (s *Server) noteDroppedArchiveConfig(ctx context.Context, action, name string, dropped []string) {
+	if len(dropped) == 0 {
+		return
+	}
+	slog.Warn("container: the archive's config lines were not carried; the config was rendered from the authorized spec", "container", name, "action", action, "dropped", dropped)
+	s.audit(ctx, action, name, "archive config not carried (rendered from the authorized spec instead): "+strings.Join(dropped, "; "), "ok")
 }
 
 // cloneHostAccessAllowed refuses a non-admin clone of a container with host

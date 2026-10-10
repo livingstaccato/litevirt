@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -125,6 +126,13 @@ func (s *Server) CloneContainer(ctx context.Context, req *pb.CloneContainerReque
 		s.audit(ctx, "ct.clone", req.Target, "source="+req.Source+" host mounts/devices", "denied")
 		return nil, err
 	}
+	// A privileged mode and legacy confinement are the same host-escalation
+	// class as a host mount, but a clone is never refused for them: a
+	// non-admin's clone lands unprivileged, with default confinement. Ruled
+	// HERE, as the caller, and carried: the source's host sees only the peer.
+	if RequireRole(ctx, "admin") != nil {
+		req.Unprivileged = true
+	}
 	// The clone is created where the source's rootfs lives.
 	if host != s.hostName {
 		c, conn, derr := s.peerClient(ctx, host)
@@ -207,23 +215,12 @@ func (s *Server) CloneContainer(ctx context.Context, req *pb.CloneContainerReque
 		s.audit(ctx, "ct.clone", req.Target, "project="+project+" source="+req.Source, "error")
 		return nil, status.Errorf(codes.Internal, "clone: %v", err)
 	}
-	// The clone keeps its source's privilege mode exactly. An unprivileged
-	// source's copy carries the source's range; the clone is another
-	// container, so it moves to a fresh range of its own.
-	cloneBase := corrosion.DecodeCreateSpec(src.CreateSpec).IDMapBase
-	if cloneBase != 0 {
-		sc, ok := s.containerRuntime.(containerSecurer)
-		b, aerr := s.allocateIDMapBase(ctx, req.Target)
-		if aerr == nil && ok {
-			aerr = sc.ConvertContainerSecurity(ctx, req.Target, lxc.ConvertOpts{IDMap: &lxc.IDMap{Base: b, Size: lxc.IDMapSize}})
+	cloneBase, strippedSec, err := s.secureClone(ctx, req, corrosion.DecodeCreateSpec(src.CreateSpec))
+	if err != nil {
+		if delErr := s.containerRuntime.DeleteContainer(ctx, req.Target); delErr != nil {
+			slog.Warn("container clone: cleanup after the range move failed also failed", "name", req.Target, "error", delErr)
 		}
-		if aerr != nil {
-			if delErr := s.containerRuntime.DeleteContainer(ctx, req.Target); delErr != nil {
-				slog.Warn("container clone: cleanup after the range move failed also failed", "name", req.Target, "error", delErr)
-			}
-			return nil, status.Errorf(codes.Internal, "clone: move the clone to its own id range: %v", aerr)
-		}
-		cloneBase = b
+		return nil, err
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339)
@@ -240,6 +237,9 @@ func (s *Server) CloneContainer(ctx context.Context, req *pb.CloneContainerReque
 	cloneSpec.OwnerID = randid.New()
 	cloneSpec.RestoredFromOwnerID, cloneSpec.RestoredFromTS = "", ""
 	cloneSpec.IDMapBase = cloneBase
+	if strippedSec != "" {
+		cloneSpec.Confinement = lxc.ConfinementDefault
+	}
 	// The copied config is rendered again from the clone's spec: host access
 	// the source's spec records (judged admin-only before the forward) is
 	// carried; a managed block the spec does not record — a restored or
@@ -250,6 +250,7 @@ func (s *Server) CloneContainer(ctx context.Context, req *pb.CloneContainerReque
 		}
 		return nil, err
 	}
+	s.noteStrippedHostAccess(ctx, "ct.clone", req.Target, strippedSec)
 	s.stampContainerOwner(req.Target, project, corrosion.EncodeCreateSpec(cloneSpec))
 	rec := corrosion.ContainerRecord{
 		HostName: s.hostName, Name: req.Target, State: "stopped",
@@ -298,4 +299,64 @@ func (s *Server) CloneContainer(ctx context.Context, req *pb.CloneContainerReque
 	s.audit(ctx, "ct.clone", req.Target, fmt.Sprintf("project=%s source=%s", project, req.Source), "ok")
 	slog.Info("container cloned", "source", req.Source, "target", req.Target, "host", s.hostName)
 	return toPbContainer(rec), nil
+}
+
+// secureClone gives a fresh copy of a container (still stopped) its security:
+// an unprivileged copy moves out of its source's id range into one of its
+// own; a privileged one stays privileged only when the caller may hold it
+// (an admin), else it moves into a range of its own, its files shifted. A
+// non-admin's clone also drops legacy confinement. It returns the clone's
+// range base (0: privileged) and what was not carried.
+func (s *Server) secureClone(ctx context.Context, req *pb.CloneContainerRequest, srcSpec corrosion.ContainerCreateSpec) (int64, string, error) {
+	drop := req.Unprivileged || RequireRole(ctx, "admin") != nil
+	sc, ok := s.containerRuntime.(containerSecurer)
+	if !ok {
+		switch {
+		case drop && escalatedSecurity(srcSpec):
+			return 0, "", status.Error(codes.Unavailable, "this host cannot move a clone of a privileged container into an id range of its own")
+		case srcSpec.IDMapBase != 0:
+			return 0, "", status.Error(codes.Internal, "clone: this host cannot move the clone to its own id range")
+		}
+		return 0, "", nil
+	}
+	cur, err := sc.ContainerSecurity(req.Target)
+	if err != nil {
+		return 0, "", status.Errorf(codes.Internal, "clone: read the copy's security: %v", err)
+	}
+	// The source's row is the record; a row an earlier build wrote records
+	// neither, and the copy's config says.
+	conf := srcSpec.Confinement
+	if conf == "" {
+		conf = cur.Confinement
+	}
+	legacy := drop && conf != lxc.ConfinementDefault
+	var what []string
+	var base int64
+	switch {
+	case srcSpec.IDMapBase != 0 || cur.IDMap != nil:
+		// The copy carries its source's range; the clone is another container.
+		b, aerr := s.allocateIDMapBase(ctx, req.Target)
+		if aerr == nil {
+			to := lxc.ConvertOpts{IDMap: &lxc.IDMap{Base: b, Size: lxc.IDMapSize}}
+			if legacy {
+				to.Confinement = lxc.ConfinementDefault
+			}
+			aerr = sc.ConvertContainerSecurity(ctx, req.Target, to)
+		}
+		if aerr != nil {
+			return 0, "", status.Errorf(codes.Internal, "clone: move the clone to its own id range: %v", aerr)
+		}
+		base = b
+	case drop:
+		b, aerr := s.unprivilegeContainer(ctx, sc, req.Target)
+		if aerr != nil {
+			return 0, "", status.Errorf(codes.Internal, "clone: move the clone of a privileged container into an id range of its own: %v", aerr)
+		}
+		base = b
+		what = append(what, "privileged")
+	}
+	if legacy {
+		what = append(what, "confinement=legacy")
+	}
+	return base, strings.Join(what, " "), nil
 }

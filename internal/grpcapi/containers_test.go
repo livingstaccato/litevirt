@@ -18,12 +18,14 @@ import (
 // fakeCTRuntime captures every call so handler tests can assert
 // behaviour without standing up real LXC.
 type fakeCTRuntime struct {
-	mu          sync.Mutex
-	rebuilds    []fakeRebuild
-	hostAccess  map[string][]ContainerMountOpt
-	createCalls []CreateContainerOpts
-	startCalls  []string
-	stopCalls   []struct {
+	mu       sync.Mutex
+	rebuilds []fakeRebuild
+	// rebuildDropped is what each RebuildContainerConfig reports dropped.
+	rebuildDropped []string
+	hostAccess     map[string][]ContainerMountOpt
+	createCalls    []CreateContainerOpts
+	startCalls     []string
+	stopCalls      []struct {
 		Name    string
 		Timeout int
 	}

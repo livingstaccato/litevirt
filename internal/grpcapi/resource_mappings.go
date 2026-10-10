@@ -56,6 +56,37 @@ func (s *Server) resourceMapWriteAllowed(ctx context.Context, action, target, re
 	return err
 }
 
+// usbMappingEditAllowed refuses a non-admin change to a USB mapping's
+// devices — adding a USB device, removing a device from a mapping that holds
+// USB devices, or deleting such a mapping. A mapping's devices are what every
+// VM granted resourcemap.use on it receives at its next start: whoever edits
+// them hands out host hardware, raw USB being the admin role's alone. So no
+// resourcemap.write (Operator's) or resourcemap.use grant changes one, and a
+// mapping another tenant's VMs use is changed only by an admin. PCI mappings
+// keep resourcemap.write.
+func (s *Server) usbMappingEditAllowed(ctx context.Context, action, mapping, address, requested string) error {
+	usb := address != "" && corrosion.IsUSBMappingAddress(address)
+	if !usb {
+		m, err := corrosion.GetResourceMapping(ctx, s.db, mapping)
+		if err != nil {
+			return status.Errorf(codes.Internal, "read resource mapping %q: %v", mapping, err)
+		}
+		if m != nil {
+			k := m.MappingKind()
+			usb = k == corrosion.MappingKindUSB || k == corrosion.MappingKindMixed
+		}
+	}
+	if !usb {
+		return nil
+	}
+	if err := RequireRole(ctx, "admin"); err != nil {
+		err = status.Errorf(codes.PermissionDenied, "changing a USB mapping's devices hands out host USB devices, which requires the admin role (raw USB is the host's own)")
+		s.audit(ctx, action, mapping, requested+" "+err.Error(), "denied")
+		return err
+	}
+	return nil
+}
+
 // mappingDeviceKey renders the device a removal names, for the rows that have
 // no before-state to show it.
 func mappingDeviceKey(host, address string) string {
@@ -111,6 +142,9 @@ func (s *Server) DeleteResourceMapping(ctx context.Context, req *pb.DeleteResour
 	if err := s.resourceMapWriteAllowed(ctx, auditResourceMapRm, req.Name, "requested="+corrosion.AuditStateNone); err != nil {
 		return nil, err
 	}
+	if err := s.usbMappingEditAllowed(ctx, auditResourceMapRm, req.Name, "", "requested="+corrosion.AuditStateNone); err != nil {
+		return nil, err
+	}
 	// Read what is about to go, devices included: after this the audit row is
 	// the only record of which host devices the mapping handed out.
 	before := corrosion.ResourceMappingAuditState(ctx, s.db, req.Name)
@@ -137,6 +171,9 @@ func (s *Server) AddMappingDevice(ctx context.Context, req *pb.AddMappingDeviceR
 	}
 	requested := corrosion.MappingDevice{HostName: host, Address: req.Address, Vendor: req.Vendor, Device: req.Device}.AuditText()
 	if err := s.resourceMapWriteAllowed(ctx, auditResourceMapDeviceAdd, req.Mapping, "requested="+requested); err != nil {
+		return nil, err
+	}
+	if err := s.usbMappingEditAllowed(ctx, auditResourceMapDeviceAdd, req.Mapping, req.Address, "requested="+requested); err != nil {
 		return nil, err
 	}
 	if req.Mapping == "" || req.Address == "" {
@@ -174,6 +211,9 @@ func (s *Server) RemoveMappingDevice(ctx context.Context, req *pb.RemoveMappingD
 	}
 	device := mappingDeviceKey(host, req.Address)
 	if err := s.resourceMapWriteAllowed(ctx, auditResourceMapDeviceRm, req.Mapping, device+" requested="+corrosion.AuditStateNone); err != nil {
+		return nil, err
+	}
+	if err := s.usbMappingEditAllowed(ctx, auditResourceMapDeviceRm, req.Mapping, req.Address, device+" requested="+corrosion.AuditStateNone); err != nil {
 		return nil, err
 	}
 	// Read the device before it is tombstoned: after this the row is the only

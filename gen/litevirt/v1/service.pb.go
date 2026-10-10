@@ -14765,12 +14765,19 @@ func (x *ConvertContainerToTemplateRequest) GetRevert() bool {
 }
 
 type CloneContainerRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Source        string                 `protobuf:"bytes,1,opt,name=source,proto3" json:"source,omitempty"`
-	Target        string                 `protobuf:"bytes,2,opt,name=target,proto3" json:"target,omitempty"`
-	HostName      string                 `protobuf:"bytes,3,opt,name=host_name,json=hostName,proto3" json:"host_name,omitempty"` // source's host; empty = resolve by name
-	Project       string                 `protobuf:"bytes,4,opt,name=project,proto3" json:"project,omitempty"`                   // clone's tenancy project; empty = source's
-	Start         bool                   `protobuf:"varint,5,opt,name=start,proto3" json:"start,omitempty"`                      // start the clone after creation
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	Source   string                 `protobuf:"bytes,1,opt,name=source,proto3" json:"source,omitempty"`
+	Target   string                 `protobuf:"bytes,2,opt,name=target,proto3" json:"target,omitempty"`
+	HostName string                 `protobuf:"bytes,3,opt,name=host_name,json=hostName,proto3" json:"host_name,omitempty"` // source's host; empty = resolve by name
+	Project  string                 `protobuf:"bytes,4,opt,name=project,proto3" json:"project,omitempty"`                   // clone's tenancy project; empty = source's
+	Start    bool                   `protobuf:"varint,5,opt,name=start,proto3" json:"start,omitempty"`                      // start the clone after creation
+	// The entry node's ruling that the caller may not hold a privileged mode
+	// or legacy confinement (not an admin): the clone lands unprivileged, in
+	// an id range of its own with its files shifted, with default
+	// confinement, and is audited. Set by the node the caller reached before
+	// it forwards, since the source's host sees only the peer. Setting it
+	// can only lower what the clone holds.
+	Unprivileged  bool `protobuf:"varint,6,opt,name=unprivileged,proto3" json:"unprivileged,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -14836,6 +14843,13 @@ func (x *CloneContainerRequest) GetProject() string {
 func (x *CloneContainerRequest) GetStart() bool {
 	if x != nil {
 		return x.Start
+	}
+	return false
+}
+
+func (x *CloneContainerRequest) GetUnprivileged() bool {
+	if x != nil {
+		return x.Unprivileged
 	}
 	return false
 }
@@ -36115,13 +36129,14 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"!ConvertContainerToTemplateRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1b\n" +
 	"\thost_name\x18\x02 \x01(\tR\bhostName\x12\x16\n" +
-	"\x06revert\x18\x03 \x01(\bR\x06revert\"\x94\x01\n" +
+	"\x06revert\x18\x03 \x01(\bR\x06revert\"\xb8\x01\n" +
 	"\x15CloneContainerRequest\x12\x16\n" +
 	"\x06source\x18\x01 \x01(\tR\x06source\x12\x16\n" +
 	"\x06target\x18\x02 \x01(\tR\x06target\x12\x1b\n" +
 	"\thost_name\x18\x03 \x01(\tR\bhostName\x12\x18\n" +
 	"\aproject\x18\x04 \x01(\tR\aproject\x12\x14\n" +
-	"\x05start\x18\x05 \x01(\bR\x05start\"\xdd\x01\n" +
+	"\x05start\x18\x05 \x01(\bR\x05start\x12\"\n" +
+	"\funprivileged\x18\x06 \x01(\bR\funprivileged\"\xdd\x01\n" +
 	"\x0eFirewallStatus\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x12\x1f\n" +
 	"\vrules_total\x18\x02 \x01(\x05R\n" +

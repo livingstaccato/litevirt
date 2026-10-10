@@ -1567,6 +1567,13 @@ message CloneContainerRequest {
     string host_name = 3;  // source's host; empty = resolve by name
     string project   = 4;  // clone's tenancy project; empty = source's
     bool   start     = 5;  // start the clone after creation
+    // The entry node's ruling that the caller may not hold a privileged mode
+    // or legacy confinement (not an admin): the clone lands unprivileged, in
+    // an id range of its own with its files shifted, with default
+    // confinement, and is audited. Set by the node the caller reached before
+    // it forwards, since the source's host sees only the peer. Setting it
+    // can only lower what the clone holds.
+    bool   unprivileged = 6;
 }
 
 // FirewallStatus is the post-Reconcile snapshot the daemon hands back

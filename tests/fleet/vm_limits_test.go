@@ -2,6 +2,7 @@ package fleet
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
 )
@@ -47,9 +49,27 @@ const (
 	rateFor2      = `<inbound average="1953"`
 )
 
+// newLimitsNode is newUpdateNode with a real capability gate wired, on which
+// vm_limits_v1 has latched: this build is the whole fleet.
+func newLimitsNode(t *testing.T) (*Node, pb.LiteVirtClient) {
+	t.Helper()
+	c, node, client := newComposeFailNode(t)
+	node.Server.SetBridgeEnsure(node.Net.EnsureBridge)
+	gates := gateAll(t, c)
+	if !gates[node.Name].Enforced(context.Background(), capabilities.VMLimitsV1) {
+		t.Fatal("vm_limits_v1 did not latch on a uniform build — advertisement is build-static")
+	}
+	if _, err := client.CreateNetwork(context.Background(), &pb.CreateNetworkRequest{
+		Name: "hc", Type: "isolated", Subnet: "172.16.50.0/24", Dhcp: true,
+	}); err != nil {
+		t.Fatalf("CreateNetwork: %v", err)
+	}
+	return node, client
+}
+
 func setupLimitsVM(t *testing.T) (context.Context, *Node, pb.LiteVirtClient, vmIdentity) {
 	t.Helper()
-	node, client := newUpdateNode(t)
+	node, client := newLimitsNode(t)
 	ctx := context.Background()
 	deployClean(t, ctx, client, composeLimitsBase)
 	waitRunning(t, ctx, node, "db")
@@ -267,4 +287,127 @@ func TestFleet_VMLimitsSurviveFailoverRebuild(t *testing.T) {
 	// 2 cores over 4 vCPUs = 50000 each; 5 MB/s = 4883 KiB/s.
 	mustContain(t, "rebuilt domain", survivor.Virt.DefinedXML("db"),
 		"<quota>50000</quota>", "<shares>300</shares>", `<inbound average="4883"`, `<outbound average="4883"`)
+}
+
+// ── the vm_limits_v1 gate ──────────────────────────────────────────────────
+
+const limitlessCompose = `name: upd
+
+images:
+  test:
+    source: file:///dev/null
+
+vms:
+  db:
+    image: test
+    cpu: 2
+    memory: 512
+    placement:
+      host: node-0
+`
+
+func domainsDefined(n *Node) int {
+	c := 0
+	for _, e := range n.Virt.EventLog() {
+		if e.Op == "define" {
+			c++
+		}
+	}
+	return c
+}
+
+// Until vm_limits_v1 latches, a stack that sets a limit is refused before any
+// VM exists, and a stack without one deploys as it does on main. This node has
+// no gate wired, so the token has not latched.
+func TestFleet_VMLimitsRefusedUntilTheTokenLatches_Deploy(t *testing.T) {
+	_, node, client := newComposeFailNode(t)
+	ctx := context.Background()
+
+	limited := strings.Replace(limitlessCompose, "    memory: 512\n", "    memory: 512\n    cpu-limit: 1\n", 1)
+	stream, err := client.DeployStack(ctx, &pb.DeployStackRequest{ComposeYaml: limited})
+	if err == nil {
+		_, err = stream.Recv()
+	}
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(errText(err), "cluster upgrade") {
+		t.Fatalf("deploy with cpu-limit before the latch: err = %v, want FailedPrecondition naming the cluster upgrade", err)
+	}
+	if rec, _ := corrosion.GetVM(ctx, node.DB, "db"); rec != nil {
+		t.Errorf("a VM was created despite the refusal: %+v", rec)
+	}
+	if n := domainsDefined(node); n != 0 {
+		t.Errorf("%d domain(s) defined despite the refusal", n)
+	}
+
+	deployClean(t, ctx, client, limitlessCompose)
+	if rec, _ := corrosion.GetVM(ctx, node.DB, "db"); rec == nil {
+		t.Fatal("a limitless stack did not deploy before the latch")
+	}
+	// ...and a later edit that adds a limit is refused, leaving the VM as it was.
+	pre := node.Virt.DefinedXML("db")
+	stream, err = client.DeployStack(ctx, &pb.DeployStackRequest{ComposeYaml: limited})
+	if err == nil {
+		_, err = stream.Recv()
+	}
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("adding cpu-limit to a deployed stack before the latch: err = %v", err)
+	}
+	if got := node.Virt.DefinedXML("db"); got != pre || strings.Contains(got, "cputune") {
+		t.Errorf("a refused update changed the domain:\n%s", got)
+	}
+}
+
+// A limit sent to a VM another host owns is refused at the ENTRY node, before it
+// is forwarded: an older owner would apply nothing and drop the fields from the
+// spec it rewrites. The owner never sees the request.
+func TestFleet_VMLimitsAreNeverForwardedBeforeTheLatch(t *testing.T) {
+	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	entry, owner := c.Nodes[0], c.Nodes[1]
+	putVM(t, owner, "far", 2, "stopped")
+	owner.Virt.SetState("far", "stopped")
+	before := len(owner.Virt.EventLog())
+
+	limit := 1.0
+	_, err := c.SelfClient(entry).UpdateVM(context.Background(), &pb.UpdateVMRequest{Name: "far", CpuLimit: &limit})
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(errText(err), "cluster upgrade") {
+		t.Fatalf("err = %v, want FailedPrecondition naming the cluster upgrade", err)
+	}
+	for _, e := range owner.Virt.EventLog()[before:] {
+		t.Errorf("the owner was handed work for a refused limit: %s %s", e.Op, e.Note)
+	}
+	if got := specCPULimit(t, owner, "far"); got != 0 {
+		t.Errorf("cpu_limit persisted as %v despite the refusal", got)
+	}
+}
+
+func specCPULimit(t *testing.T, n *Node, name string) float64 {
+	t.Helper()
+	rec, err := corrosion.GetVM(context.Background(), n.DB, name)
+	if err != nil || rec == nil {
+		t.Fatalf("GetVM %s: %v %v", name, rec, err)
+	}
+	spec := &pb.VMSpec{}
+	if err := json.Unmarshal([]byte(rec.Spec), spec); err != nil {
+		t.Fatal(err)
+	}
+	return spec.CpuLimit
+}
+
+// CreateVM itself (not only the compose path in front of it) refuses a limit
+// before the token latches, and a limitless create on the same node works.
+func TestFleet_VMLimitsRefusedUntilTheTokenLatches_CreateVM(t *testing.T) {
+	_, node, client := newComposeFailNode(t)
+	ctx := context.Background()
+	spec := &pb.VMSpec{Name: "direct", Image: "test", Cpu: 2, MemoryMib: 512, CpuShares: 512,
+		Placement: &pb.PlacementSpec{Host: node.Name}}
+	_, err := client.CreateVM(ctx, &pb.CreateVMRequest{Spec: spec})
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(errText(err), "cluster upgrade") {
+		t.Fatalf("CreateVM with cpu_shares before the latch: err = %v, want FailedPrecondition naming the cluster upgrade", err)
+	}
+	if rec, _ := corrosion.GetVM(ctx, node.DB, "direct"); rec != nil || domainsDefined(node) != 0 {
+		t.Errorf("a refused create left state behind: row=%+v defines=%d", rec, domainsDefined(node))
+	}
+	spec.CpuShares = 0
+	if _, err := client.CreateVM(ctx, &pb.CreateVMRequest{Spec: spec}); err != nil {
+		t.Errorf("limitless CreateVM before the latch: %v", err)
+	}
 }

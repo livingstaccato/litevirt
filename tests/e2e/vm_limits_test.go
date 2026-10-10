@@ -87,9 +87,7 @@ func TestVM_NoisyNeighbourLimits_AppliedLiveAndPersisted(t *testing.T) {
 	cleanup(t, func() { lvErr(t, "rm", name, "--force") })
 
 	// 1 core over 2 vCPUs: 50000us per 100000us period per vCPU.
-	lv(t, "run", "--name", name, "--image", testImage,
-		"--cpu", "2", "--memory", "1024", "--disk", "5G", "--host", host,
-		"--cpu-limit", "1", "--cpu-shares", "2048")
+	runWithLimits(t, name, host)
 	waitVM(t, name, "RUNNING", 2*time.Minute)
 	wantSched(t, "at create", virshSched(t, name, false),
 		map[string]string{"cpu_shares": "2048", "vcpu_period": "100000", "vcpu_quota": "50000"})
@@ -155,9 +153,7 @@ func TestVM_NoisyNeighbourLimits_SurviveMigration(t *testing.T) {
 		t.Skipf("no local capacity (placed on %s)", host)
 	}
 	cleanup(t, func() { lvErr(t, "rm", name, "--force") })
-	lv(t, "run", "--name", name, "--image", testImage,
-		"--cpu", "2", "--memory", "1024", "--disk", "5G", "--host", host,
-		"--cpu-limit", "1", "--cpu-shares", "2048")
+	runWithLimits(t, name, host)
 	waitVM(t, name, "RUNNING", 2*time.Minute)
 	lv(t, "update", name, "--nic-rate", "0=2")
 	if out, err := lvErr(t, "migrate", name, target); err != nil {
@@ -178,5 +174,21 @@ func TestVM_NoisyNeighbourLimits_SurviveMigration(t *testing.T) {
 	}
 	if !strings.Contains(s, "<inbound average='1953'") {
 		t.Errorf("destination NIC lost its 2 MB/s cap:\n%s", s)
+	}
+}
+
+// runWithLimits creates the test VM with a cap and a weight, skipping when the
+// cluster refuses limits because vm_limits_v1 has not latched (a node is still
+// on an older build) — a rollout state, not a defect.
+func runWithLimits(t *testing.T, name, host string) {
+	t.Helper()
+	out, err := lvErr(t, "run", "--name", name, "--image", testImage,
+		"--cpu", "2", "--memory", "1024", "--disk", "5G", "--host", host,
+		"--cpu-limit", "1", "--cpu-shares", "2048")
+	if err != nil {
+		if strings.Contains(out+err.Error(), "cluster upgrade") {
+			t.Skipf("vm_limits_v1 has not latched (roll every node to this build first): %v", err)
+		}
+		t.Fatalf("lv run with limits: %v\n%s", err, out)
 	}
 }

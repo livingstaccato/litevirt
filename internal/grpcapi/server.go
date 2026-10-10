@@ -1028,6 +1028,10 @@ func (s *Server) advertisedCapabilities() []string {
 	// fence_state_v1 is not withheld either: it says what this binary's
 	// coordinator does with an unverified fence recorded 'offline', a fact
 	// about the build.
+	// vm_limits_v1 is not withheld either: it is a fact about the build (this
+	// binary renders, keeps and re-applies a VM's cpu/nic limits), and the
+	// guarantee is enforced where a limit is created — the entry node refuses
+	// one until the token has latched.
 	// hardware_v2 (CONTRACT h) is advertised only once this node is READY: its
 	// backfill audit pass has populated the typed-hardware tables (hwV2Ready) AND
 	// operation_protocol_v1 is active (the crash-safe operation journal is a hard
@@ -1489,6 +1493,11 @@ func (s *Server) tokenEnabled(token string) bool {
 		// No kill switch: it says this build resumes from an unverified fence
 		// recorded 'offline' and does not auto-activate such a host, which
 		// the failover lease holder relies on of every node.
+		return true
+	case capabilities.VMLimitsV1:
+		// No kill switch: it says this build keeps and re-applies a VM's
+		// cpu/nic limits, a fact about the binary. It enforces nothing on a
+		// workload without a limit; its stand-down is clearing them.
 		return true
 	case capabilities.LeaseTermV1:
 		return s.enfLeaseTerm

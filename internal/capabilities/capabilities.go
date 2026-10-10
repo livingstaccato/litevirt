@@ -286,6 +286,38 @@ const (
 	// replicates to, a maintenance host on the previous build included.
 	FenceStateV1 = "fence_state_v1"
 
+	// VMLimitsV1 gates setting the noisy-neighbour limits: a VM's cpu_limit and
+	// cpu_shares and a NIC's rate_mb_sec. Until it latches, a create or update
+	// that sets any of them is refused ("finish the cluster upgrade first");
+	// specs without limits behave exactly as before.
+	//
+	// It states a fact about the BINARY, which is why it is mandatory and has
+	// no config flag: this build renders the limits into the domain, re-applies
+	// them on every rebuild of the definition (redefine, failover, restore,
+	// promote, clone) and keeps them in the spec it rewrites. An older build
+	// does none of that, and the loss is silent: a VM created on it runs
+	// uncapped, and an older OWNER that rewrites a stored spec drops the fields,
+	// so a later failover rebuilds the VM without its cap. Nothing downstream
+	// can notice a cap that is gone from the spec, so the only safe moment to
+	// accept a limit is once no host can be an older build. The guarantee is
+	// enforced where the limit is CREATED (the entry node refuses before it
+	// creates or forwards anything), so no node relies on a peer enforcing it;
+	// the latch is what proves every peer can honour it.
+	//
+	// ReplicationGated: the claim is about every host that can come to own or
+	// rewrite a spec, not only the voting-eligible ones. A host in maintenance
+	// on the previous build is skipped by the voting sweep, still receives
+	// every spec the owner writes, and can still own VMs it may rewrite — so
+	// it must hold the latch off. Fail-closed costs only the feature.
+	//
+	// Stand-down: there is no flag to turn it off in an incident, and none is
+	// needed — it enforces nothing on a workload that carries no limit. To
+	// stop using the feature, clear the limits (lv update <vm> --cpu-limit 0
+	// --cpu-shares 0 --nic-rate <n>=0, or drop the keys from the compose file);
+	// the token stays latched, as every latch does. It is never reused: a build
+	// that stops needing it moves it to the retired set, it is not deleted.
+	VMLimitsV1 = "vm_limits_v1"
+
 	// RecoveryClaimV1 gates ENFORCEMENT of single-winner recovery claims
 	// (docs/design/recovery-claims.md §3, §5.1–§5.2,
 	// colonelpanik/litevirt#250): a failover coordinator collects a majority
@@ -872,6 +904,9 @@ var supported = []string{
 	// a recovery from an unverified fence recorded 'offline' and does not
 	// auto-activate such a host", a fact about the binary.
 	FenceStateV1,
+	// VMLimitsV1 is advertised UNCONDITIONALLY: it says "this build keeps and
+	// re-applies a VM's cpu/nic limits", a fact about the binary.
+	VMLimitsV1,
 	// RecoveryClaimV1 is advertised CONDITIONALLY: enforcement.recovery_claim
 	// (default on) on AND this node ready (split_brain_gate_v1 latched, voter_config_v1
 	// ready). Withheld while the flag is off because every flag-on node relies
@@ -901,7 +936,7 @@ var supported = []string{
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, FenceStateV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, FenceStateV1, VMLimitsV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {
@@ -963,6 +998,10 @@ var replicationGated = map[string]bool{
 	// failover lease, a maintenance host on the previous build included, and
 	// that build resumes only from 'fenced'. See FenceStateV1.
 	FenceStateV1: true,
+	// Confirmed against every replication recipient: a maintenance host on the
+	// previous build still receives every spec and can own and rewrite one,
+	// dropping the limit fields. See VMLimitsV1.
+	VMLimitsV1: true,
 	// Confirmed against every replication recipient: the claim_certificate
 	// column's statement shapes on runtime_action_proofs must be decodable by
 	// every host we stream to. Not mandatory: the flag is the opt-in.
@@ -1017,6 +1056,9 @@ var mandatory = map[string]bool{
 	// 'offline' and does not auto-activate such a host), and the lease holder
 	// relies on whichever node holds the lease next. See FenceStateV1.
 	FenceStateV1: true,
+	// A fact about the binary (it keeps and re-applies a VM's cpu/nic limits).
+	// Its stand-down is clearing the limits; see VMLimitsV1.
+	VMLimitsV1: true,
 }
 
 // Mandatory reports whether token is enforced with no config kill switch.

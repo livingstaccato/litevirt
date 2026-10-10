@@ -11,6 +11,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
@@ -35,6 +36,87 @@ type limitsUpdate struct {
 }
 
 func (u limitsUpdate) any() bool { return u.cpu || len(u.nicOrdinals) > 0 }
+
+// vmLimitsRefusal is what a create or update that sets a limit is refused with
+// until vm_limits_v1 has latched.
+const vmLimitsRefusal = "VM limits (cpu-limit, cpu-shares, NIC rate) cannot be set yet: an older host would ignore " +
+	"or drop them, so the cluster upgrade must finish first (vm_limits_v1 has not latched on every host)"
+
+// vmLimitsActive reports whether vm_limits_v1 has latched: every host this
+// node replicates to understands the limit fields. No config flag; a node with
+// no gate wired has not proved it.
+func (s *Server) vmLimitsActive(ctx context.Context) bool {
+	return s.gate != nil && s.gate.Enforced(ctx, capabilities.VMLimitsV1)
+}
+
+// specSetsLimits reports whether a create spec carries any limit. A zero is
+// not a limit.
+func specSetsLimits(spec *pb.VMSpec) bool {
+	if spec.GetCpuLimit() != 0 || spec.GetCpuShares() != 0 {
+		return true
+	}
+	for _, n := range spec.GetNetwork() {
+		if n.GetRateMbSec() != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// requestSetsLimits reports whether an update names a non-zero limit. Clearing
+// one (zero) sets nothing, so it is allowed before the latch: nothing can be
+// there to clear, and it must not block an operator undoing a limit.
+func requestSetsLimits(req *pb.UpdateVMRequest) bool {
+	if req.GetCpuLimit() != 0 || req.GetCpuShares() != 0 {
+		return true
+	}
+	for _, nr := range req.GetNicRate() {
+		if nr.GetRateMbSec() != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// refuseUnlatchedLimits refuses a create spec that sets a limit while
+// vm_limits_v1 is unlatched. It runs at the entry node, before anything is
+// created or forwarded.
+func (s *Server) refuseUnlatchedLimits(ctx context.Context, spec *pb.VMSpec) error {
+	if specSetsLimits(spec) && !s.vmLimitsActive(ctx) {
+		return status.Error(codes.FailedPrecondition, vmLimitsRefusal)
+	}
+	return nil
+}
+
+// refuseUnlatchedLimitUpdate is the update-side twin, run before the request is
+// forwarded to the owning host.
+func (s *Server) refuseUnlatchedLimitUpdate(ctx context.Context, req *pb.UpdateVMRequest) error {
+	if requestSetsLimits(req) && !s.vmLimitsActive(ctx) {
+		return status.Error(codes.FailedPrecondition, vmLimitsRefusal)
+	}
+	return nil
+}
+
+// refuseUnlatchedStackLimits refuses a compose file that sets a VM limit while
+// vm_limits_v1 is unlatched. Containers have no such limits and are skipped.
+func (s *Server) refuseUnlatchedStackLimits(ctx context.Context, f *compose.File) error {
+	if s.vmLimitsActive(ctx) {
+		return nil
+	}
+	for name, vm := range f.VMs {
+		if vm.Kind == compose.WorkloadKindLXC || vm.Kind == compose.WorkloadKindOCI {
+			continue
+		}
+		set := vm.CPULimit != 0 || vm.CPUShares != 0
+		for _, n := range vm.Network {
+			set = set || n.Rate != 0
+		}
+		if set {
+			return status.Errorf(codes.FailedPrecondition, "vm %q: %s", name, vmLimitsRefusal)
+		}
+	}
+	return nil
+}
 
 // limitsRequested reports whether req names any noisy-neighbour limit.
 func limitsRequested(req *pb.UpdateVMRequest) bool {

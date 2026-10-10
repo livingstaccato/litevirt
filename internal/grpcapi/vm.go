@@ -94,6 +94,9 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	if err != nil {
 		return nil, err
 	}
+	if err := s.refuseUnlatchedLimits(ctx, spec); err != nil {
+		return nil, err
+	}
 	// iso_scope is server-owned: a client's is dropped, and only a forwarded
 	// leg (a peer) carries the entry node's classification to the owner.
 	if sc := req.GetSpec().GetIsoScope(); sc != "" && s.requirePeerCert(ctx) == nil {
@@ -3969,6 +3972,11 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	}
 	if req.Name == "" {
 		return nil, status.Error(codes.InvalidArgument, "name required")
+	}
+	// Before anything is read or forwarded: an older owner would ignore a limit
+	// and drop it from the spec it rewrites (vm_limits_v1).
+	if err := s.refuseUnlatchedLimitUpdate(ctx, req); err != nil {
+		return nil, err
 	}
 	// updLease carries the commit FENCE for a quota-admitted grow: authority can
 	// move while the stop → redefine below is in flight, and committing then would

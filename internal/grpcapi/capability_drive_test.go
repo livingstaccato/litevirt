@@ -95,6 +95,9 @@ func TestDriveCapabilityActivation_FlagAwareBoundedDriver(t *testing.T) {
 		// recorded 'offline' and does not auto-activate such a host". The
 		// failover lease holder relies on whichever node holds it next.
 		capabilities.FenceStateV1: true,
+		// vm_limits_v1: "this build keeps and re-applies a VM's cpu/nic
+		// limits". Enforces nothing on a workload without one.
+		capabilities.VMLimitsV1: true,
 	}
 
 	// Cross-check the hand-written list against the ONE declaration, so adding a

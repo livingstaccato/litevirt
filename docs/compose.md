@@ -244,10 +244,15 @@ can be raised or removed live, so placement and project quota never count a capp
 VM as smaller than its `cpu`. `lv inspect <vm>` shows the stored values as
 `cpuLimit`, `cpuShares` and each network's `rateMbSec`.
 
-During a rolling upgrade, set a limit only once every host runs a build that
-understands it: an older host ignores the fields, so a VM created on one runs
-uncapped, and an older owner that rewrites a VM's stored spec drops them until
-the next `compose up` re-applies them.
+During a rolling upgrade a limit cannot be set until every host runs a build
+that understands it: setting `cpu-limit`, `cpu-shares` or a NIC `rate` is refused
+("finish the cluster upgrade first") until the `vm_limits_v1` capability has
+latched, because an older host would ignore the fields, and an older owner that
+rewrites a VM's stored spec would drop them. The refusal comes from the node the
+request enters, before anything is created or forwarded. Files and updates without
+limits are not affected, and clearing a limit (`0`) is always allowed. The token has
+no config flag: it states what the binary does, and it only affects workloads that
+carry a limit. To stop using the feature, clear the limits.
 
 With `replicas: 3`, VMs are named `web-1`, `web-2`, `web-3`. With `replicas: 1`, the base name is used directly.
 

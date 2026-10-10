@@ -2,13 +2,12 @@
 
 | | |
 |---|---|
-| Status | **Proposed**. Nothing in this document is implemented. |
+| Status | **Implemented** behind `host_membership_retire_v1`, with the deviations listed under "As implemented". |
 | Issue | colonelpanik/litevirt#267 |
 | Follows | schema v57, `host_membership_split_v1` |
 
-**Reading this document.** Present tense describes code that exists. Anything
-marked *proposed* does not exist yet, including the token and statement named
-below.
+**Reading this document.** It was written before the token existed; the
+section "As implemented" at the end records what the code does.
 
 ## Where v57 leaves things
 
@@ -50,6 +49,25 @@ Once it latches:
 Rolling back from the release that latched the retire token lands on the v57
 release, which reads `host_membership`. So the step is rollback-safe one
 release back, as v57's was.
+
+## As implemented
+
+- `host_membership_retire_v1` is mandatory, ReplicationGated and advertised
+  unconditionally. Its gate reads the durable marker on disk, like the split
+  gate (`internal/corrosion/host_membership_retire.go`).
+- The pure state and isolation writers — `UpdateHostState`,
+  `RecordFenceWithState`, `IsolateHost`, `ClearHostIsolation` — write
+  `host_membership` alone once a live node has latched it.
+- `InsertHost`, `AdmitHost`'s re-admission and `UpdateHostStartup` keep their
+  `hosts` statements, `state` included: each writes other `hosts` columns in
+  the same statement, so the row clock moves anyway, and keeping the shape
+  adds no ledger entry.
+- **Absorbing hosts-only writes stays (deviation from item 2 above).** A latch
+  is per node: a neighbour that advertises the retire token but whose own
+  `host_membership_split_v1` latch has not formed yet still writes `hosts`
+  alone, and a retired node must still take that write. A retired writer's
+  entries carry their `host_membership` statement and are never absorbed, so
+  keeping the absorb costs nothing.
 
 ## Out of scope
 

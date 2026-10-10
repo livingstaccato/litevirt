@@ -1219,11 +1219,14 @@ func RecordFenceWithState(ctx context.Context, c *Client, r FenceLogRecord, stat
 		if err != nil {
 			return err
 		}
-		return c.ExecuteBatch(ctx, []Statement{
+		stmts := []Statement{
 			{SQL: insertFenceLogSQL, Params: []interface{}{r.ID, r.HostName, r.Method, r.Result, now, r.Detail}},
-			{SQL: updateHostStateSQL, Params: []interface{}{state, uts, r.HostName}},
-			{SQL: hostMembershipStateSQL, Params: []interface{}{r.HostName, state, epoch, reason, uts}},
-		})
+		}
+		if !c.hostsCopyRetired(live) {
+			stmts = append(stmts, Statement{SQL: updateHostStateSQL, Params: []interface{}{state, uts, r.HostName}})
+		}
+		stmts = append(stmts, Statement{SQL: hostMembershipStateSQL, Params: []interface{}{r.HostName, state, epoch, reason, uts}})
+		return c.ExecuteBatch(ctx, stmts)
 	})
 }
 

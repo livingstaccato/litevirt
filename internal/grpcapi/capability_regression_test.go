@@ -26,28 +26,30 @@ func TestCheckOneCapabilityHealth_DetectsPostLatchRegression(t *testing.T) {
 	// one-per-cycle budget and the loop below would never reach the freshness
 	// check it is actually asserting on.
 	g.latched = map[string]bool{
-		capabilities.SplitBrainGateV1:      true,
-		capabilities.LeaseTermLedgerV1:     true,
-		capabilities.CredentialsSplitV1:    true,
-		capabilities.CredentialsClearV1:    true,
-		capabilities.HostMembershipSplitV1: true,
-		capabilities.FailoverScopeV1:       true,
-		capabilities.VoterConfigV1:         true,
-		capabilities.ClaimIncarnationV1:    true,
-		capabilities.FenceStateV1:          true,
-		capabilities.LWWSkewGuardV1:        true,
+		capabilities.SplitBrainGateV1:       true,
+		capabilities.LeaseTermLedgerV1:      true,
+		capabilities.CredentialsSplitV1:     true,
+		capabilities.CredentialsClearV1:     true,
+		capabilities.HostMembershipSplitV1:  true,
+		capabilities.HostMembershipRetireV1: true,
+		capabilities.FailoverScopeV1:        true,
+		capabilities.VoterConfigV1:          true,
+		capabilities.ClaimIncarnationV1:     true,
+		capabilities.FenceStateV1:           true,
+		capabilities.LWWSkewGuardV1:         true,
 	}
 	g.enforcedTok = map[string]bool{
-		capabilities.SplitBrainGateV1:      true,  // still active
-		capabilities.LeaseTermLedgerV1:     true,  // still active
-		capabilities.CredentialsSplitV1:    true,  // still active
-		capabilities.CredentialsClearV1:    true,  // still active
-		capabilities.HostMembershipSplitV1: true,  // still active
-		capabilities.FailoverScopeV1:       true,  // still active
-		capabilities.VoterConfigV1:         true,  // still active
-		capabilities.ClaimIncarnationV1:    true,  // still active
-		capabilities.FenceStateV1:          true,  // still active
-		capabilities.LWWSkewGuardV1:        false, // regressed: a peer stopped advertising
+		capabilities.SplitBrainGateV1:       true,  // still active
+		capabilities.LeaseTermLedgerV1:      true,  // still active
+		capabilities.CredentialsSplitV1:     true,  // still active
+		capabilities.CredentialsClearV1:     true,  // still active
+		capabilities.HostMembershipSplitV1:  true,  // still active
+		capabilities.HostMembershipRetireV1: true,  // still active
+		capabilities.FailoverScopeV1:        true,  // still active
+		capabilities.VoterConfigV1:          true,  // still active
+		capabilities.ClaimIncarnationV1:     true,  // still active
+		capabilities.FenceStateV1:           true,  // still active
+		capabilities.LWWSkewGuardV1:         false, // regressed: a peer stopped advertising
 	}
 	s := testServer(t) // real db so evaluateHADegraded's stranded-pending query is safe
 	s.gate = g

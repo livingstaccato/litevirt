@@ -403,6 +403,12 @@ type Client struct {
 	// columns keep their secrets, the dual-write build's behaviour.
 	credentialsClear atomic.Pointer[func() bool]
 
+	// hostMembershipRetire, when non-nil and returning true, stops the state
+	// and isolation writers writing the hosts copy (host_membership_retire_v1).
+	// Fails CLOSED when unset: both homes are written, the dual-write build's
+	// behaviour. See host_membership_retire.go.
+	hostMembershipRetire atomic.Pointer[func() bool]
+
 	// hostMembershipGate, when non-nil and returning true, permits WRITING
 	// host_membership. Injected via SetHostMembershipGate, wired to the durable
 	// host_membership_split_v1 latch. Fails CLOSED when unset, for the

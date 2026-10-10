@@ -195,6 +195,31 @@ const (
 	// split changes where a fact is stored, not a policy.
 	HostMembershipSplitV1 = "host_membership_split_v1"
 
+	// HostMembershipRetireV1 is the second step of the membership move
+	// (docs/design/host-membership-retire-old-columns.md,
+	// colonelpanik/litevirt#267): once it has durably latched, the state and
+	// isolation writers stop writing the hosts copy (hosts.state,
+	// hosts.isolation_epoch, hosts.isolation_reason) and write host_membership
+	// alone, so a fence or a drain no longer moves the hosts row's clock and
+	// cannot cost a concurrent version or resource report.
+	//
+	// It states a fact about the BINARY: this build never needs the hosts copy
+	// to know a host's state or isolation. Its readers resolve from
+	// host_membership, and so does the build before it
+	// (host_membership_split_v1), the build a rollback lands on. Mandatory, for
+	// the credentials_split_v1 reason: a flag would only stop the latch forming.
+	//
+	// ReplicationGated: the claim must hold of every host still RECEIVING
+	// replication, a maintenance host on a build that reads only hosts.state
+	// included, or that host would stop seeing fences and drains.
+	//
+	// The columns are never cleared (hosts.state is NOT NULL, and a clear would
+	// itself be the hosts write this token exists to stop). A writer whose
+	// hosts statement carries other columns too — InsertHost, a re-admission,
+	// the boot report — keeps its shape: the row clock moves for those columns
+	// anyway, and keeping the shape adds no ledger entry.
+	HostMembershipRetireV1 = "host_membership_retire_v1"
+
 	// FailoverScopeV1 gates the cluster-wide failover_scope policy
 	// (cluster_policies, schema v58; docs/design/region-scoped-failover.md).
 	// With the policy set to `region`, a host is fenced and its workloads
@@ -790,6 +815,13 @@ const (
 //     upgrading again loses nothing. Retiring the old columns is a later
 //     release's step (docs/design/host-membership-retire-old-columns.md).
 //
+//   - host_membership_retire_v1 has no stand-down either. Once it has
+//     latched, fences, drains and isolations stop writing the hosts copy. A
+//     binary rolled back one build, to host_membership_split_v1, enters WAL
+//     quarantine and still reads state and isolation from host_membership. A
+//     binary rolled back TWO builds reads only hosts.state, which no longer
+//     follows; that rollback is unsupported once this token has latched.
+//
 //   - failover_scope_v1 has no stand-down of its own: the policy it licenses
 //     does. `lv cluster failover-scope cluster` returns every coordinator to
 //     the cluster-wide quorum without touching the token. A binary rolled
@@ -898,6 +930,10 @@ var supported = []string{
 	// it says "this build decodes host_membership's statement shapes and reads
 	// state and isolation from it", a fact about the binary.
 	HostMembershipSplitV1,
+	// HostMembershipRetireV1 is advertised UNCONDITIONALLY: it says "this
+	// build never needs the hosts copy of state and isolation", a fact about
+	// the binary.
+	HostMembershipRetireV1,
 	// FailoverScopeV1 is advertised UNCONDITIONALLY: it says "this build
 	// decodes cluster_policies and honours failover_scope", a fact about the
 	// binary. The policy is the row, not a flag.
@@ -944,7 +980,7 @@ var supported = []string{
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, CredentialsClearV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, FenceStateV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, CredentialsClearV1, HostMembershipSplitV1, HostMembershipRetireV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, FenceStateV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {
@@ -998,6 +1034,10 @@ var replicationGated = map[string]bool{
 	// must be decodable by every host we stream to, a maintenance host on the
 	// previous build included.
 	HostMembershipSplitV1: true,
+	// Confirmed against every replication recipient: once the hosts copy stops
+	// being written, a host that reads state only from hosts would stop seeing
+	// fences and drains — a maintenance host on such a build included.
+	HostMembershipRetireV1: true,
 	// Confirmed against every replication recipient: cluster_policies' shapes
 	// must be decodable by every host we stream to.
 	FailoverScopeV1: true,
@@ -1052,6 +1092,9 @@ var mandatory = map[string]bool{
 	// A fact about the binary (it decodes and reads host_membership), not a
 	// policy. See HostMembershipSplitV1.
 	HostMembershipSplitV1: true,
+	// A fact about the binary (it never needs the hosts copy of state and
+	// isolation), not a policy. See HostMembershipRetireV1.
+	HostMembershipRetireV1: true,
 	// A fact about the binary (it decodes cluster_policies and honours
 	// failover_scope). The policy is the replicated row. See FailoverScopeV1.
 	FailoverScopeV1: true,

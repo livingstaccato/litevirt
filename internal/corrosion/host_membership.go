@@ -58,9 +58,10 @@ import (
 //     shapes, and host_membership. The hosts copy is what keeps a rollback of
 //     one release safe — a node back on the previous build reads hosts.state
 //     and nothing else, and it must still see every drain, fence and
-//     isolation. Nothing ever clears or freezes the hosts columns in this
-//     release; retiring them is a later release's step behind a second token
-//     (docs/design/host-membership-retire-old-columns.md).
+//     isolation. Nothing ever clears the hosts columns. Once
+//     host_membership_retire_v1 latches as well, the pure state and isolation
+//     writers stop writing them (host_membership_retire.go,
+//     docs/design/host-membership-retire-old-columns.md).
 //   - every reader reads state and isolation from host_membership ONLY,
 //     falling back to the hosts columns for a host that has no membership row
 //     yet.

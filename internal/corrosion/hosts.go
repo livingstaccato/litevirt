@@ -453,7 +453,8 @@ func decodeLabels(raw string) map[string]string {
 
 // UpdateHostState changes a host's state: hosts.state before the membership
 // split, and after it hosts.state AND host_membership.state in one batch under
-// one updated_at (host_membership.go). The hosts half keeps a node rolled back
+// one updated_at (host_membership.go) — host_membership alone once
+// host_membership_retire_v1 has latched (host_membership_retire.go). The hosts half keeps a node rolled back
 // one release reading the right state; the membership half is the copy that no
 // longer shares a clock with the host's own reports.
 func UpdateHostState(ctx context.Context, c *Client, name, state string) error {
@@ -465,6 +466,11 @@ func UpdateHostState(ctx context.Context, c *Client, name, state string) error {
 		epoch, reason, err := currentIsolation(ctx, c, name)
 		if err != nil {
 			return err
+		}
+		if c.hostsCopyRetired(live) {
+			return c.ExecuteBatch(ctx, []Statement{
+				{SQL: hostMembershipStateSQL, Params: []interface{}{name, state, epoch, reason, uts}},
+			})
 		}
 		return c.ExecuteBatch(ctx, []Statement{
 			{SQL: updateHostStateSQL, Params: []interface{}{state, uts, name}},

@@ -713,7 +713,34 @@ writes until it is upgraded again or reseeded, and it cannot decode the
 `host_membership` statements that latched peers keep sending. Upgrading it
 again loses nothing. Roll forward.
 
-Retiring the `hosts` copy is a later release's step, behind a second token; see
+### The `hosts` copy of host state is retired
+
+The second step stops writing the `hosts` copy. It starts **on its own, after
+every host runs a build carrying the `host_membership_retire_v1` capability
+token**; no flag starts or stops it. The token is mandatory and
+replication-gated: it latches only once every memberlist member advertises
+it, a host in `maintenance` included, so no host that reads state only from
+`hosts` stops seeing fences and drains.
+
+Once it has latched on a host that is writing `host_membership`, a state
+change, a fence, an isolation and the clearing of an isolation write
+`host_membership` alone. They no longer move the `hosts` row's `updated_at`,
+so they cannot cost a concurrent version or resource report on any replica.
+Readers do not change. The `hosts` columns are left as they are, never
+cleared: `hosts.state` is `NOT NULL`, and nothing reads the copy. Adding a
+host, re-admitting one and a host's boot report still write `hosts.state`
+in their existing statements, because those statements write the rest of the
+row anyway.
+
+A host whose own `host_membership_split_v1` latch has not formed yet still
+writes `hosts` alone, and every latched host still takes such a write into
+its `host_membership` row as described above.
+
+**Rollback.** One build back, to the build that dual-writes, is supported: it
+enters WAL quarantine and reads state and isolation from `host_membership`.
+**A rollback two builds back, below `host_membership_split_v1`, is
+unsupported once `host_membership_retire_v1` has latched**: that build reads
+`hosts.state` only, and it no longer follows. See
 [design/host-membership-retire-old-columns.md](design/host-membership-retire-old-columns.md).
 
 ### An unverified fence records `offline` after the roll

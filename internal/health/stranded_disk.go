@@ -412,16 +412,10 @@ func (r *Reconciler) tendStrandedDisk(ctx context.Context, vm *corrosion.VMRecor
 	}
 	fi, err := os.Lstat(d.Path)
 	if err != nil {
-		if os.IsNotExist(err) {
-			// Its directory missing is a volume not mounted (yet), not a
-			// disk gone: keep the entry and look again next pass.
-			if di, derr := os.Stat(filepath.Dir(d.Path)); derr != nil || !di.IsDir() {
-				return true, d
-			}
-			slog.Warn("reconciler: a disk a failover left on this host is no longer at its path; nothing to keep",
-				"vm", vm.Name, "path", d.Path)
-			return false, d
-		}
+		// Missing is not deleted: a volume not mounted (yet) — its mount
+		// point absent, or present and empty — reads exactly like a file
+		// gone. Nothing confirms a deletion, so the entry is kept and looked
+		// at again next pass; it clears with its VM.
 		return true, d
 	}
 	if !fi.Mode().IsRegular() {
@@ -779,9 +773,64 @@ func (r *Reconciler) startHeldVM(ctx context.Context, vm corrosion.VMRecord, st 
 		r.noteGateRefused(corrosion.ActionReschedule, ReasonStaleEpoch)
 		return true
 	}
+	// Saved state is never discarded by a cold boot: the VM stays held, and
+	// the operator resumes it (`lv start` restores a managed-save image).
+	if r.virt != nil {
+		if saved, merr := r.virt.HasManagedSaveImage(vm.Name); merr != nil || saved {
+			r.noteHeldSavedState(ctx, vm.Name, merr)
+			return true
+		}
+	}
 	slog.Warn("reconciler: starting a restart-same VM failover held for this host, on its real disk", "vm", vm.Name)
 	r.startPendingVM(ctx, vm)
+	// Once per hold: a start that took clears it, so a crash afterwards
+	// follows the VM's restart policy, never another held start.
+	if r.domainRunningHere(vm.Name) {
+		r.resolveHeld(ctx, vm.Name)
+	}
 	return true
+}
+
+// noteHeldSavedState records, once per VM in this process, that a held VM has
+// saved state and is left for the operator to resume.
+func (r *Reconciler) noteHeldSavedState(ctx context.Context, name string, merr error) {
+	r.heldSavedMu.Lock()
+	if r.heldSavedNoted == nil {
+		r.heldSavedNoted = map[string]bool{}
+	}
+	first := !r.heldSavedNoted[name]
+	r.heldSavedNoted[name] = true
+	r.heldSavedMu.Unlock()
+	if !first {
+		return
+	}
+	detail := fmt.Sprintf("%s is back, but held VM %s has saved state (a managed-save image) and is not cold-booted, "+
+		"which would discard it: resume it with `lv start %s`", r.hostName, name, name)
+	if merr != nil {
+		detail = fmt.Sprintf("%s is back, but whether held VM %s has saved state cannot be read (%v), so it is not "+
+			"started: check it, then `lv start %s`", r.hostName, name, merr, name)
+	}
+	slog.Warn("reconciler: not starting a held VM with saved state", "vm", name, "detail", detail)
+	if err := corrosion.InsertVMEvent(ctx, r.db, corrosion.VMEventRecord{
+		ID: randid.New(), VMName: name, HostName: r.hostName, Type: "vm.failover.held_saved_state",
+		Result: "ok", Severity: "warn", Detail: detail, Username: "reconciler",
+	}); err != nil {
+		slog.Warn("reconciler: record the held VM's saved-state event", "vm", name, "error", err)
+	}
+}
+
+// resolveHeld clears this host's vm_failover_held record for name.
+func (r *Reconciler) resolveHeld(ctx context.Context, name string) {
+	row, had, err := corrosion.GetHealthCondition(ctx, r.db, DiskMissingEvaluator, CondVMFailoverHeld, "vm", strandedSubject(name, r.hostName))
+	if err != nil || !had || row.Lifecycle == corrosion.ConditionResolved {
+		return
+	}
+	ts := r.now().UTC().Format(time.RFC3339)
+	row.Lifecycle, row.ResolvedAt, row.LastSeen, row.Reporter = corrosion.ConditionResolved, ts, ts, r.hostName
+	row.ObserveCount, row.CleanCount = 0, 1
+	if err := corrosion.UpsertHealthCondition(ctx, r.db, row); err != nil {
+		slog.Warn("reconciler: could not resolve vm_failover_held after the start", "vm", name, "error", err)
+	}
 }
 
 // domainRunningHere reports whether name's domain runs on this host.

@@ -883,7 +883,12 @@ on its host, and failover records why: the condition `vm_failover_held`
 `failover.skip` audit entry and a `vm.disk.stranded` notification, each naming
 the host and what you can do. When the host is back and active, it starts the
 VM on its real disk (the domain a power-off fence leaves shut off there is
-started, not recorded stopped), and the record clears. A host comes back
+started, not recorded stopped), and the record clears. It does so once:
+a VM that crashes after that follows its own restart policy. A stop recorded
+after the host read the VM as running (an `lv stop`, say) wins, and a held VM
+with saved state (a managed-save image) is never cold-booted: it stays held,
+a `vm.failover.held_saved_state` event says so, and `lv start <vm>` resumes
+it. A host comes back
 `fenced` when failover moved any other workload off it: run
 `lv host undrain <host>`. A removed host does not block this: adding the
 machine back under its name (`lv host add`) brings the held VM back with it.

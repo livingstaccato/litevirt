@@ -149,6 +149,10 @@ type Reconciler struct {
 	// onDiskStranded: notified for each disk this host sets aside
 	// (stranded_disk.go); nil = no notification.
 	onDiskStranded func(vm, host, detail string)
+	// heldSavedNoted: held VMs whose saved state was reported, once each
+	// (stranded_disk.go, noteHeldSavedState).
+	heldSavedMu    sync.Mutex
+	heldSavedNoted map[string]bool
 	// deferredTransfers: proof-less transfers parked in "starting" while their
 	// backing image transfers (missing_disk.go).
 	deferredTransfers deferredTransfers
@@ -1208,6 +1212,16 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	if err != nil || fresh == nil || fresh.HostName != vm.HostName {
 		slog.Info("reconciler: VM no longer assigned to this host after lock, releasing",
 			"vm", vm.Name)
+		r.releaseVMLock(ctx, vm.Name)
+		return
+	}
+	// A start decided from a running row (the self-heal, a held VM's start)
+	// is for a VM the walk read as running here. A stop recorded since —
+	// `lv stop`, or any other — wins: operator intent is never overridden
+	// by a start decided from an older read.
+	if vm.State == "running" && (fresh.State != "running" || IsOperatorStop(fresh.StateDetail)) {
+		slog.Info("reconciler: VM was stopped after the walk read it running; not starting it",
+			"vm", vm.Name, "state", fresh.State, "detail", fresh.StateDetail)
 		r.releaseVMLock(ctx, vm.Name)
 		return
 	}

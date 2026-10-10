@@ -19,6 +19,7 @@ import (
 func ioVM(t *testing.T, state string) (*Server, *libvirtfake.Fake, context.Context) {
 	t.Helper()
 	s := reconfigServer(t)
+	s.gate = ioGate{on: true} // feature gate open
 	fake := s.virt.(*libvirtfake.Fake)
 	ctx := adminCtx()
 	spec := &pb.VMSpec{Name: "io", Cpu: 2, MemoryMib: 512,

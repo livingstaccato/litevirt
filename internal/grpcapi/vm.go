@@ -110,6 +110,9 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	if err := validateSpecTuning(spec); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
+	if err := s.refuseUnlatchedDiskNICIO(ctx, spec); err != nil {
+		return nil, err
+	}
 	if err := s.RequirePerm(ctx, vmRBACPathFor(spec.Project, spec.Name), "vm.create", "operator"); err != nil {
 		return nil, err
 	}
@@ -504,7 +507,9 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		// this create persists — so it is this VM's setting from here on.
 		// baseDomainConfig renders discard, detect_zeroes and the throttle from
 		// that spec.
-		if d.Discard == "" {
+		// Only once the disk/NIC feature gate has opened: before it, an older owner
+		// would drop it, and the create must render exactly what main does.
+		if d.Discard == "" && s.diskNICIOActive(ctx) {
 			d.Discard = defaultDiscard(storageType, d.Bus)
 		}
 		diskConfigs = append(diskConfigs, lv.DiskConfig{
@@ -545,6 +550,12 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			Path: diskPath,
 			Bus:  "virtio",
 		})
+		// The implicit root disk gets the default discard like a named one
+		// (after the latch). It is recorded in the spec, which is what every
+		// later render reads; before the latch the spec stays as main's.
+		if def := defaultDiscard("local", "virtio"); def != "" && s.diskNICIOActive(ctx) {
+			spec.Disks = append(spec.Disks, &pb.DiskSpec{Name: "root", Size: "20G", Bus: "virtio", Discard: def})
+		}
 		diskRecords = append(diskRecords, corrosion.DiskRecord{
 			VMName:       spec.Name,
 			DiskName:     "root",
@@ -3989,6 +4000,13 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	}
 	if err := s.RequirePerm(ctx, vmRBACPath(vm), "vm.update", "operator"); err != nil {
 		return nil, err
+	}
+	// The hardware redefine renders disk/NIC tuning, which waits for the latch;
+	// refused at the entry node, before the call is forwarded.
+	if req.RedefineHardware {
+		if err := s.ioFeatureGate(ctx); err != nil {
+			return nil, err
+		}
 	}
 	// Forward to the owning host first — it has authoritative state.
 	if vm.HostName != s.hostName {

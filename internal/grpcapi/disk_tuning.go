@@ -39,6 +39,80 @@ func validateSpecTuning(spec *pb.VMSpec) error {
 	return nil
 }
 
+const diskNICIORefusal = "disk discard, I/O limits and NIC queues cannot be set yet: an older host would ignore " +
+	"or drop them, so the cluster upgrade must finish first (not every host is known to keep them)"
+
+// ioFeatureToken is a PLACEHOLDER for the shared release token ("this build
+// preserves the new spec fields"), which is not registered in the capabilities
+// package: nothing latches it, so until the swap the feature stays refused in a
+// real cluster (fail closed). Tests latch it with a wrapping gate.
+const ioFeatureToken = "vm_disk_nic_io_v1"
+
+// ioFeatureGate is the one place the disk/NIC tuning feature asks whether the
+// whole cluster keeps and re-applies it: nil when it does, else the
+// FailedPrecondition every refusal returns. Swapping in the shared release
+// token is a change to this function's body alone.
+func (s *Server) ioFeatureGate(ctx context.Context) error {
+	if s.gate != nil && s.gate.Enforced(ctx, ioFeatureToken) {
+		return nil
+	}
+	return status.Error(codes.FailedPrecondition, diskNICIORefusal)
+}
+
+// diskNICIOActive reports whether ioFeatureGate lets the feature through.
+func (s *Server) diskNICIOActive(ctx context.Context) bool { return s.ioFeatureGate(ctx) == nil }
+
+// specSetsDiskNICIO reports whether a spec sets discard, detect_zeroes, a disk
+// throttle (an empty one included: it is a clear, which only means something
+// to a spec that has one) or NIC queues.
+func specSetsDiskNICIO(spec *pb.VMSpec) bool {
+	for _, d := range spec.GetDisks() {
+		if d.GetDiscard() != "" || d.GetDetectZeroes() != "" || d.GetIo() != nil {
+			return true
+		}
+	}
+	for _, n := range spec.GetNetwork() {
+		if n.GetQueues() != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// refuseUnlatchedDiskNICIO is the entry-node gate: a spec that sets any of them
+// is refused until the token has latched, before anything is created or
+// forwarded. A spec that sets none passes, so the cluster behaves as before.
+func (s *Server) refuseUnlatchedDiskNICIO(ctx context.Context, spec *pb.VMSpec) error {
+	if specSetsDiskNICIO(spec) {
+		return s.ioFeatureGate(ctx)
+	}
+	return nil
+}
+
+// refuseUnlatchedStackDiskNICIO refuses a compose file that sets any of them,
+// up front, rather than by the Nth VM's create after N-1 are up.
+func (s *Server) refuseUnlatchedStackDiskNICIO(ctx context.Context, f *compose.File) error {
+	if s.diskNICIOActive(ctx) {
+		return nil
+	}
+	for name, vm := range f.VMs {
+		if vm.IsContainer() {
+			continue
+		}
+		set := false
+		for _, d := range vm.Disks {
+			set = set || d.Discard != "" || d.DetectZeroes != "" || d.IOTune != nil
+		}
+		for _, n := range vm.Network {
+			set = set || !n.Queues.IsZero()
+		}
+		if set {
+			return status.Errorf(codes.FailedPrecondition, "vm %q: %s", name, diskNICIORefusal)
+		}
+	}
+	return nil
+}
+
 // defaultDiscard is the discard a NEW disk gets when its spec leaves it unset:
 // "unmap" on thin-capable storage and a bus that carries TRIM, nothing
 // otherwise. It is stored in the spec at create, so it is a property of that
@@ -65,6 +139,13 @@ func (s *Server) SetDiskIO(ctx context.Context, req *pb.SetDiskIORequest) (*pb.V
 	tune := compose.IOTuneFromSpec(req.Limits)
 	if err := tune.Validate(); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	// Setting a limit waits for the latch, at the entry node, before the call is
+	// forwarded; clearing (nothing set) does not.
+	if !tune.IsZero() {
+		if err := s.ioFeatureGate(ctx); err != nil {
+			return nil, err
+		}
 	}
 	vm, err := corrosion.GetVM(ctx, s.db, req.VmName)
 	if err != nil || vm == nil {
@@ -219,6 +300,9 @@ func (s *Server) applyDesiredDiskIO(ctx context.Context, name string, desired *p
 // and NIC queues into the stored spec, ahead of the redefine that renders them.
 // A value the desired spec leaves unset keeps what is stored.
 func (s *Server) persistHardwareTuning(ctx context.Context, name string, desired *pb.VMSpec) error {
+	if err := s.ioFeatureGate(ctx); err != nil {
+		return err
+	}
 	applied, _, err := corrosion.MutateDesiredSpec(ctx, s.db, name, func(old string) (string, error) {
 		fresh := &pb.VMSpec{}
 		if old != "" {

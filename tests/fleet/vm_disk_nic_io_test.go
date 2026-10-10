@@ -6,9 +6,13 @@ import (
 	"strings"
 	"testing"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 )
 
@@ -58,9 +62,39 @@ func tuneOf(t *testing.T, node *Node, dev string) lv.IOTune {
 	return got
 }
 
+// ioLatchGate is a real capability gate on which the disk/NIC feature token
+// (a placeholder until the shared release token lands) has latched: this build
+// is the whole fleet.
+type ioLatchGate struct{ *health.Checker }
+
+func (g ioLatchGate) Enforced(ctx context.Context, tok string) bool {
+	return tok == "vm_disk_nic_io_v1" || g.Checker.Enforced(ctx, tok)
+}
+
+func latchIOFeature(t *testing.T, c *Cluster) {
+	t.Helper()
+	for _, n := range c.Nodes {
+		n.Server.SetGate(ioLatchGate{gateFor(t, c, n)})
+	}
+}
+
+// newTunedNode is newUpdateNode with the disk/NIC feature latched.
+func newTunedNode(t *testing.T) (*Node, pb.LiteVirtClient) {
+	t.Helper()
+	c, node, client := newComposeFailNode(t)
+	node.Server.SetBridgeEnsure(node.Net.EnsureBridge)
+	latchIOFeature(t, c)
+	if _, err := client.CreateNetwork(context.Background(), &pb.CreateNetworkRequest{
+		Name: "hc", Type: "isolated", Subnet: "172.16.50.0/24", Dhcp: true,
+	}); err != nil {
+		t.Fatalf("CreateNetwork: %v", err)
+	}
+	return node, client
+}
+
 func setupTunedVM(t *testing.T) (context.Context, *Node, pb.LiteVirtClient, vmIdentity) {
 	t.Helper()
-	node, client := newUpdateNode(t)
+	node, client := newTunedNode(t)
 	ctx := context.Background()
 	deployClean(t, ctx, client, composeTuneBase)
 	waitRunning(t, ctx, node, "db")
@@ -169,6 +203,7 @@ func TestFleet_ComposeDiscardAndQueuesChangeRestartTheSameVM(t *testing.T) {
 func TestFleet_SetDiskIOForwardsAndMigrationCarriesIt(t *testing.T) {
 	sc := newColdStoppedScenario(t)
 	ctx := context.Background()
+	latchIOFeature(t, sc.c)
 	if _, _, err := corrosion.MutateDesiredSpec(ctx, sc.src.DB, "os1", func(old string) (string, error) {
 		spec := &pb.VMSpec{}
 		if err := json.Unmarshal([]byte(old), spec); err != nil {
@@ -196,6 +231,11 @@ func TestFleet_SetDiskIOForwardsAndMigrationCarriesIt(t *testing.T) {
 		t.Fatal("the forwarding node defined a domain for a VM it does not own")
 	}
 
+	// The migration gate wants live health the scenario does not publish; the
+	// latch has done its work (the call above was accepted), so unwire it.
+	for _, n := range sc.c.Nodes {
+		n.Server.SetGate(nil)
+	}
 	if err := sc.migrateCold(t); err != nil {
 		t.Fatalf("migrate --cold: %v", err)
 	}
@@ -213,5 +253,117 @@ func TestFleet_SetDiskIOForwardsAndMigrationCarriesIt(t *testing.T) {
 	}
 	if spec.Disks[0].Io.GetTotalIopsSec() != 250 {
 		t.Errorf("the migrated VM's spec lost the limit: %+v", spec.Disks[0])
+	}
+}
+
+const composeNoTuning = `name: upd
+
+images:
+  test:
+    source: file:///dev/null
+
+vms:
+  db:
+    image: test
+    cpu: 2
+    memory: 512
+    placement:
+      host: node-0
+    disks:
+      root: 1G
+    network:
+      - name: hc
+`
+
+const composeImplicitRoot = `name: upd
+
+images:
+  test:
+    source: file:///dev/null
+
+vms:
+  db:
+    image: test
+    cpu: 2
+    memory: 512
+    placement:
+      host: node-0
+`
+
+// Before the token latches, a deploy that sets any tuning is refused before a
+// VM exists, and a deploy that sets none renders exactly what main does: no
+// discard default is stored or rendered, for an explicit or the implicit root.
+//
+// Mutations: drop the up-front refusal in DeployStack — the first stage goes
+// red; apply the create default without the latch check — the stored-spec and
+// XML checks go red.
+func TestFleet_DiskNICIORefusedUntilTheTokenLatches(t *testing.T) {
+	_, node, client := newComposeFailNode(t) // no gate wired: not latched
+	ctx := context.Background()
+	for name, y := range map[string]string{
+		"iotune":  composeTuneBase,
+		"discard": strings.Replace(composeNoTuning, "      root: 1G\n", "      root:\n        size: 1G\n        discard: on\n", 1),
+		"queues":  strings.Replace(composeNoTuning, "      - name: hc\n", "      - name: hc\n        queues: 2\n", 1),
+	} {
+		stream, err := client.DeployStack(ctx, &pb.DeployStackRequest{ComposeYaml: y})
+		if err == nil {
+			_, err = stream.Recv()
+		}
+		if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "cluster upgrade") {
+			t.Fatalf("%s before the latch: err = %v, want FailedPrecondition naming the cluster upgrade", name, err)
+		}
+		if rec, _ := corrosion.GetVM(ctx, node.DB, "db"); rec != nil {
+			t.Fatalf("%s: a VM was created despite the refusal", name)
+		}
+	}
+}
+
+func unlatchedCreateRendersAsMain(t *testing.T, y string, implicit bool) {
+	t.Helper()
+	ctx := context.Background()
+	n, c := newUpdateNode(t) // no gate wired: not latched
+	deployClean(t, ctx, c, y)
+	x := n.Virt.DefinedXML("db")
+	if strings.Contains(x, "discard") || strings.Contains(x, "iotune") || strings.Contains(x, "queues") {
+		t.Errorf("an unlatched create renders tuning:\n%s", x)
+	}
+	spec := storedSpec(t, ctx, n, "db")
+	for _, d := range spec.Disks {
+		if d.Discard != "" {
+			t.Errorf("an unlatched create stored discard %q", d.Discard)
+		}
+	}
+	if implicit && len(spec.Disks) != 0 {
+		t.Errorf("an unlatched create listed the implicit root in the spec: %+v", spec.Disks)
+	}
+}
+
+func TestFleet_DiskNICIOUnlatchedExplicitRootRendersAsMain(t *testing.T) {
+	unlatchedCreateRendersAsMain(t, composeNoTuning, false)
+}
+
+func TestFleet_DiskNICIOUnlatchedImplicitRootRendersAsMain(t *testing.T) {
+	unlatchedCreateRendersAsMain(t, composeImplicitRoot, true)
+}
+
+// After the latch the default also reaches the root disk a VM gets when no
+// disks are named: it is listed in the spec, with discard unmap, and rendered.
+//
+// Mutation: skip adding the implicit root to the spec — the spec check goes red.
+func TestFleet_ImplicitRootDiskGetsTheDefaultDiscardOnceLatched(t *testing.T) {
+	node, client := newTunedNode(t)
+	ctx := context.Background()
+	deployClean(t, ctx, client, composeImplicitRoot)
+	waitRunning(t, ctx, node, "db")
+	spec := storedSpec(t, ctx, node, "db")
+	if len(spec.Disks) != 1 || spec.Disks[0].Name != "root" || spec.Disks[0].Discard != "unmap" {
+		t.Fatalf("stored disks = %+v, want root with discard unmap", spec.Disks)
+	}
+	if !strings.Contains(node.Virt.DefinedXML("db"), `discard="unmap"`) {
+		t.Errorf("the implicit root does not render discard:\n%s", node.Virt.DefinedXML("db"))
+	}
+	// Re-applying the same (diskless) file is no change, and keeps the VM.
+	if phase, detail := planDetailFor(t, ctx, client, composeImplicitRoot, "db"); phase != string(compose.OpNoChange) {
+		t.Errorf("re-applying plans %s %q, want no change", phase, detail)
 	}
 }

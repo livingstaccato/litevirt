@@ -46,6 +46,12 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 		return status.Errorf(codes.InvalidArgument, "parse compose: %v", err)
 	}
 
+	// Disk/NIC tuning in the file is refused before anything is deployed, rather
+	// than by the Nth VM's create after the first N-1 are up (the disk/NIC feature gate).
+	if err := s.refuseUnlatchedStackDiskNICIO(ctx, f); err != nil {
+		return err
+	}
+
 	// A volume or backup repo that names a host path makes the daemon write
 	// there as root: the same authority a storage pool needs, before anything
 	// is pulled, provisioned or registered.

@@ -361,13 +361,27 @@ on the local store, btrfs, ZFS, thin LVM and Ceph, on a virtio, scsi or sata bus
 and nothing on NFS or iSCSI (the server may not support hole-punching or UNMAP) or
 on an IDE disk. The default is written into the VM's spec when it is created: a VM
 created before it keeps rendering no discard, and applying a file that leaves
-`discard:` out never changes a disk. (The root disk a VM gets when `disks:` names
-none is not listed in the spec and gets no default; name it to set one.)
+`discard:` out never changes a disk. The root disk a VM gets when `disks:` names
+none gets the default too, and is then listed in the spec as `root`. The default is
+written only once the whole cluster keeps these settings (see below); before
+that, a create renders exactly what an earlier release did.
 `detect_zeroes: unmap` additionally turns a guest write of zeroes into a discard; it
 is off unless you set it, because it costs CPU on every write. Changing either on an
 existing VM needs a restart: the deploy reconfigures and restarts the same VM, disks
 kept. Run `fstrim` in the guest (most distributions schedule it weekly) to reclaim
 space it freed before the setting was on.
+
+### Upgrading a cluster
+
+`discard`, `detect_zeroes`, `iotune` and `queues` are kept in the VM's spec, and a
+host on an older release would drop them when it rewrites a spec (a failover onto it
+would rebuild the VM without its throttle). So they are accepted only once the
+cluster-wide upgrade gate has opened, which needs every host, one in maintenance
+included, to be on a release that keeps them. Until then a create, update,
+compose deploy, recreate or `lv disk-io` that sets any of them is refused with
+`the cluster upgrade must finish first`, and nothing about a VM that sets none of
+them changes. The gate has no config flag and, once open, stays open; to stop
+using the feature, clear the settings (`lv disk-io <vm> --clear`, or drop the keys).
 
 ### I/O limits
 

@@ -231,8 +231,8 @@ func newSGRuleAddCmd() *cobra.Command {
 	var direction, proto, port, cidr, action string
 	var priority int
 	cmd := &cobra.Command{
-		Use:   "rule-add <sg-id>",
-		Short: "Add a rule to a security group",
+		Use:   "rule-add <sg-id-or-name>",
+		Short: "Add a rule to a security group (by id or name)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
@@ -259,8 +259,8 @@ func newSGRuleAddCmd() *cobra.Command {
 
 func newSGRuleListCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "rule-ls <sg-id>",
-		Short: "List rules in a security group",
+		Use:   "rule-ls <sg-id-or-name>",
+		Short: "List rules in a security group (by id or name)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			resp, err := listSecurityGroups(cmd, &pb.ListSecurityGroupsRequest{IncludeRules: true})
@@ -269,8 +269,20 @@ func newSGRuleListCmd() *cobra.Command {
 			}
 			w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 			fmt.Fprintln(w, "ID\tDIR\tPROTO\tPORT\tCIDR\tACTION\tPRIO")
+			// The argument is a group id or a group name.
+			want := args[0]
+			for _, g := range resp.GetGroups() {
+				if g.GetName() == want {
+					want = g.GetId()
+				}
+			}
+			for _, g := range resp.GetGroups() {
+				if g.GetId() == args[0] {
+					want = args[0]
+				}
+			}
 			for _, r := range resp.GetRules() {
-				if r.GetSgId() != args[0] {
+				if r.GetSgId() != want {
 					continue
 				}
 				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",

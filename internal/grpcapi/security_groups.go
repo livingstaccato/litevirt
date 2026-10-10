@@ -96,6 +96,43 @@ func liveSGNamed(ctx context.Context, db *corrosion.Client, name, exceptStack st
 	return nil, nil
 }
 
+// resolveSecurityGroup finds the live group a caller means by ref, which is a
+// group id or a group name (`lv sg ls` shows both). An id wins over a name. A
+// name two live groups hold is refused rather than guessed: the firewall will
+// not render such a group either.
+func (s *Server) resolveSecurityGroup(ctx context.Context, ref string) (*corrosion.SecurityGroup, error) {
+	sgs, err := corrosion.ListSecurityGroups(ctx, s.db, "")
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "list security groups: %v", err)
+	}
+	var byName []corrosion.SecurityGroup
+	for i := range sgs {
+		if sgs[i].ID == ref {
+			return &sgs[i], nil
+		}
+		if sgs[i].Name == ref {
+			byName = append(byName, sgs[i])
+		}
+	}
+	switch len(byName) {
+	case 0:
+		return nil, status.Errorf(codes.NotFound, "no security group with id or name %q (lv sg ls shows them)", ref)
+	case 1:
+		return &byName[0], nil
+	}
+	return nil, status.Errorf(codes.FailedPrecondition,
+		"%d security groups are named %q; use the group id (lv sg ls shows ids)", len(byName), ref)
+}
+
+// sgNameCounts counts live groups per name, for ListSGRulesFor's legacyByName.
+func sgNameCounts(sgs []corrosion.SecurityGroup) map[string]int {
+	m := make(map[string]int, len(sgs))
+	for _, g := range sgs {
+		m[g.Name]++
+	}
+	return m
+}
+
 // DeleteSecurityGroup tombstones a security group and every rule in it.
 // `lv sg rm`.
 func (s *Server) DeleteSecurityGroup(ctx context.Context, req *pb.DeleteSecurityGroupRequest) (*emptypb.Empty, error) {
@@ -115,6 +152,16 @@ func (s *Server) DeleteSecurityGroup(ctx context.Context, req *pb.DeleteSecurity
 	}
 	if err := corrosion.DeleteSGRules(ctx, s.db, req.Id); err != nil {
 		return nil, status.Errorf(codes.Internal, "delete security group rules: %v", err)
+	}
+	// Rules an older client stored under the group's name are read as the
+	// group's own (ListSGRulesFor), so they go with it; left behind they would
+	// attach to a later group of the same name.
+	if g, gerr := corrosion.GetSecurityGroup(ctx, s.db, req.Id); gerr == nil && g != nil && g.Name != "" {
+		if all, lerr := corrosion.ListSecurityGroups(ctx, s.db, ""); lerr == nil && sgNameCounts(all)[g.Name] == 1 {
+			if err := corrosion.DeleteSGRules(ctx, s.db, g.Name); err != nil {
+				return nil, status.Errorf(codes.Internal, "delete security group rules: %v", err)
+			}
+		}
 	}
 	if err := corrosion.DeleteSecurityGroup(ctx, s.db, req.Id); err != nil {
 		// The rules are already gone, so the change is recorded even though
@@ -137,8 +184,15 @@ func (s *Server) AddSecurityGroupRule(ctx context.Context, req *pb.AddSecurityGr
 	if r == nil || r.SgId == "" || r.Direction == "" {
 		return nil, status.Error(codes.InvalidArgument, "rule with sg_id and direction required")
 	}
+	// The rule belongs to a group, named by id or by (unique) name. Storing the
+	// argument verbatim is how `lv sg rule-add <name>` used to write a rule no
+	// group owned: the firewall renders rules by group id, so it never applied.
+	sg, rerr := s.resolveSecurityGroup(ctx, r.SgId)
+	if rerr != nil {
+		return nil, rerr
+	}
 	row := corrosion.SGRule{
-		ID: randid.New(), SGID: r.SgId, Direction: r.Direction, Proto: r.Proto,
+		ID: randid.New(), SGID: sg.ID, Direction: r.Direction, Proto: r.Proto,
 		PortRange: r.Port, CIDR: r.Cidr, Action: r.Action, Priority: int(r.Priority),
 	}
 	if err := corrosion.InsertSGRule(ctx, s.db, row); err != nil {
@@ -191,13 +245,18 @@ func (s *Server) ListSecurityGroups(ctx context.Context, req *pb.ListSecurityGro
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "list security groups: %v", err)
 	}
+	all, err := corrosion.ListSecurityGroups(ctx, s.db, "")
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "list security groups: %v", err)
+	}
+	counts := sgNameCounts(all)
 	resp := &pb.ListSecurityGroupsResponse{Groups: make([]*pb.SecurityGroup, 0, len(groups))}
 	for _, g := range groups {
 		resp.Groups = append(resp.Groups, toPbSecurityGroup(g))
 		if !req.GetIncludeRules() {
 			continue
 		}
-		rules, err := corrosion.ListSGRules(ctx, s.db, g.ID)
+		rules, err := corrosion.ListSGRulesFor(ctx, s.db, g, counts[g.Name] == 1)
 		if err != nil {
 			// A page that showed the group with no rules would read as "this
 			// group allows nothing", which is not what the host enforces.

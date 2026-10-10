@@ -352,7 +352,8 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 			if holders[sg.Name] > 1 {
 				continue
 			}
-			rules, err := corrosion.ListSGRules(ctx, db, sg.ID)
+			// holders[sg.Name] == 1 here: a duplicated name was skipped above.
+			rules, err := corrosion.ListSGRulesFor(ctx, db, sg, true)
 			if err != nil {
 				return plan, err
 			}

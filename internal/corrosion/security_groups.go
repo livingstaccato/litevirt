@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sort"
 	"strings"
 )
 
@@ -170,6 +171,36 @@ func ListSGRules(ctx context.Context, c *Client, sgID string) ([]SGRule, error) 
 			Priority:  r.Int("priority"),
 		}
 	}
+	return rules, nil
+}
+
+// ListSGRulesFor returns the rules of sg: those stored under its id, plus,
+// when legacyByName is true, those an older client stored with the group's NAME
+// in sg_id (`lv sg rule-add <name>` used to store the argument verbatim, so such
+// a rule never applied). Resolving them here, on read, is the whole repair —
+// nothing is rewritten. The caller passes legacyByName only when no other live
+// group holds the name: with two holders it is not in the data which group the
+// rule meant, so it stays unapplied rather than landing on a guess. Every
+// returned rule carries sg.ID in SGID, so callers filtering by group id see it.
+func ListSGRulesFor(ctx context.Context, c *Client, sg SecurityGroup, legacyByName bool) ([]SGRule, error) {
+	rules, err := ListSGRules(ctx, c, sg.ID)
+	if err != nil || !legacyByName || sg.Name == "" || sg.Name == sg.ID {
+		return rules, err
+	}
+	legacy, err := ListSGRules(ctx, c, sg.Name)
+	if err != nil {
+		return nil, err
+	}
+	for i := range legacy {
+		legacy[i].SGID = sg.ID
+	}
+	rules = append(rules, legacy...)
+	sort.SliceStable(rules, func(i, j int) bool {
+		if rules[i].Priority != rules[j].Priority {
+			return rules[i].Priority < rules[j].Priority
+		}
+		return rules[i].ID < rules[j].ID
+	})
 	return rules, nil
 }
 

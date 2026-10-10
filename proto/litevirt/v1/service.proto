@@ -600,7 +600,13 @@ message MigrateVMRequest { string vm_name = 1; string target_host = 2;
     // difference refuses with FailedPrecondition and moves nothing.
     bool   expect_drain_record = 5;
     string expect_host         = 6;
-    int64  expect_owner_epoch  = 7; }
+    int64  expect_owner_epoch  = 7;
+    // expect_placement_gen is the VM's placement generation the drain recorded.
+    // Every change of the VM's host advances it in the same batch, so the owner,
+    // which cannot own the VM without having the generation of the move that
+    // made it the owner, compares its own current value: any placement change
+    // since the drain, however the record travelled, refuses the move.
+    int64  expect_placement_gen = 8; }
 message MigrateProgress  { MigratePhase phase = 1; float memory_pct = 2;
     float disk_pct = 3; int64 memory_remaining = 4; int64 disk_remaining = 5;
     string status = 6; int64 downtime_ms = 7; string error = 8;
@@ -2664,6 +2670,10 @@ message PingResponse {
   // wall_clock got away without a companion flag because its zero value is not
   // a legal reading; an empty token list is, so it needs one.
   bool posture_reported = 8;
+  // migrate_preconditions: this build checks MigrateVMRequest's expect_*
+  // preconditions before it moves a VM. An older owner ignores them and moves the
+  // VM unconditionally, so failback skips a VM whose owner does not say so.
+  bool migrate_preconditions = 9;
 }
 
 // Ready: application-level readiness. Ping answers "is this daemon's TLS

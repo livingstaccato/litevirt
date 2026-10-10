@@ -367,21 +367,35 @@ undrain, the VMs the drain moved away return by live migration, at a bounded
 rate.
 
 A drain records, for every VM it moves, the host it left and the host it went
-to, with the VM's creation time and ownership epoch at that moment. The records
-are replicated, so any node can run the failback. Every writer that changes a
-VM's host (a migration, a failover, a drain) cancels the VM's record, so a record
-that is still there means nothing has moved the VM since. That only holds when
-every host does it, so records are written, and failback runs, only once every
-host runs this release. Until then a drain moves VMs as before and records
-nothing, `lv host failback` refuses ("failback waits for the upgrade"), and an
-undrain behaves exactly as it always has, saying so when the cluster policy is
-on.
+to, with the VM's creation time, ownership epoch and **placement generation** at
+that moment. The records are replicated, so any node can run the failback. The
+placement generation is a per-VM counter that every writer that changes a VM's
+host (a live or cold migration, a failover, a drain) advances in the same batch
+as the host change, so whichever host owns the VM has the generation of the move
+that made it the owner. A drained host's record can be the last thing it wrote
+before it was powered off, and may reach nobody until it returns, so failback
+does not rely on the record for this: the owner compares its own current
+generation with the recorded one, and any placement change since the drain, a
+hand move out and back included, stops the VM from being moved. Records, and the
+generation, are written only while cluster-wide policy writes are allowed
+(failover_scope_v1).
+
+**The gate is provisional.** Failback needs every host to run a release that
+advances the generation. Until that is guaranteed, no record is written and
+`lv host failback` refuses ("failback waits for the upgrade"); an undrain
+behaves exactly as it always has, and says so when the cluster policy is on. At
+present that check is the cluster-policy latch (failover_scope_v1), which builds
+from before this feature also advertise, so on a cluster that is mid-upgrade it
+does not yet guarantee it: finish rolling every host (and every host in
+maintenance) before relying on failback. It will be replaced by the release
+token that gates every feature of this kind.
 
 A VM returns only while its record still describes it exactly. One that an
 operator has since moved by hand, that a failover recovered, that was deleted
 and created again, or that a later drain moved again stays where it is, and the
 run says so. The check is made twice: by the daemon that decides, and again by
-the VM's owner under the VM's lock, on its own replica, just before the move. A
+the VM's owner under the VM's lock, on its own replica, just before the move
+(host, owner epoch and placement generation). An owner on a release that cannot make that check (it says so in its Ping) has its VMs skipped, never moved. A
 node that serves the failback from a replica that has not yet heard of an
 operator's move therefore cannot move that VM back; the owner refuses. A VM no
 drain moved is never touched.

@@ -899,7 +899,11 @@ with the same headroom a cold migration leaves, and refused if it would take the
 filesystem that holds running guests' disks that close to full. A request that
 entered at another node is carried to the source host with your identity; where
 forwarded identity is not enforced it is refused rather than run as a cluster
-peer. If the move fails, the staged copy is removed and nothing is left behind;
+peer. If the move fails, the staged copy is removed and nothing is left behind (a
+crash of the source host's daemon between staging and the move leaves the staged
+clone as a complete stopped VM there, whose events show `vm.clone.staged` without
+`vm.clone.moved`; `lv rm` removes it); the staged copy and a copy into a pool
+are admitted for space with headroom, a same-host clone is as it always was;
 if the move succeeded and a later step (the pool, the start) fails, the VM is
 complete on its host and the error names the command that finishes the job
 (`lv move-volume`, `lv start`).

@@ -108,7 +108,23 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 		if m := hdr.Get(CloneModeHeader); len(m) > 0 {
 			_ = grpc.SetHeader(ctx, metadata.Pairs(CloneModeHeader, m[0]))
 		}
+		// A source on an older release does not know destination_host or
+		// target_pool: it makes a plain same-host clone and answers success. Say
+		// so, rather than let the clone sit where it was not asked to be.
+		if err == nil && vm != nil && req.DestinationHost != "" && vm.HostName != req.DestinationHost {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"%s, where the clone is made, is on an older release that ignores destination_host and target_pool: "+
+					"the clone %q was made on %s instead of %s. Move it with `lv migrate %s %s --cold` or remove it with `lv rm %s`; "+
+					"finish upgrading %s to clone onto another host",
+				src.HostName, req.Target, vm.HostName, req.DestinationHost, req.Target, req.DestinationHost, req.Target, src.HostName)
+		}
 		return vm, err
+	}
+	if s.cloneAsOlderBuildForTest {
+		// What a source on a release before destination_host does with the
+		// request: the fields are unknown to it and the clone is made here.
+		req = proto.Clone(req).(*pb.CloneVMRequest)
+		req.DestinationHost, req.TargetPool = "", ""
 	}
 	// A clone to another host is made here, where the source's disks are, as
 	// an ordinary full clone, and then moved to its host as `lv migrate --cold`
@@ -116,7 +132,7 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 	// domain defined there, the staged copy removed once the handoff commits.
 	crossHost := req.DestinationHost != "" && req.DestinationHost != s.hostName
 	if !crossHost {
-		return s.cloneVMOnSource(ctx, req, src, project)
+		return s.cloneVMOnSource(ctx, req, src, project, false)
 	}
 	// The move, the pool step and the start run as the caller. A request that
 	// reached this host forwarded by a peer carries the caller only where
@@ -131,7 +147,7 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 	}
 	staged := proto.Clone(req).(*pb.CloneVMRequest)
 	staged.Start, staged.DestinationHost, staged.TargetPool, staged.Mode = false, "", "", "full"
-	if _, err := s.cloneVMOnSource(ctx, staged, src, project); err != nil {
+	if _, err := s.cloneVMOnSource(ctx, staged, src, project, true); err != nil {
 		return nil, err
 	}
 	return s.finishCrossHostClone(ctx, req)
@@ -140,7 +156,7 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 // cloneVMOnSource is CloneVM on the host that holds the source's disks, with
 // every permission check made and the target name known to be free. On the
 // source's host it places the disks in req.TargetPool when one is named.
-func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, src *corrosion.VMRecord, project string) (*pb.VM, error) {
+func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, src *corrosion.VMRecord, project string, staging bool) (*pb.VM, error) {
 	var err error
 	// The source's lock, held until the clone's row exists (review M-1): a
 	// linked clone backs on the source's current layer before anything
@@ -256,14 +272,15 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 			}
 		}
 	}
-	if mode == "full" {
-		// The default disk directory holds the running guests' disks too, so the
-		// copy is admitted against its free space, with headroom, first.
-		spaceDir := filepath.Dir(s.images.DiskPath(req.Target, "root"))
+	// Only a copy that is not where main puts a clone is admitted for space with
+	// headroom: the staged copy of a clone onto another host, and a copy into a
+	// pool. A same-host clone into the default directory is as on main.
+	if mode == "full" && (staging || tpool != nil) {
+		spaceDir, why := filepath.Dir(s.images.DiskPath(req.Target, "root")), "the staged copy"
 		if tpool != nil {
-			spaceDir = tpool.dir
+			spaceDir, why = tpool.dir, "the copy in pool "+tpool.name
 		}
-		if err := s.requireCloneSpace(ctx, spaceDir, srcDisks); err != nil {
+		if err := s.requireCloneSpace(ctx, spaceDir, srcDisks, why); err != nil {
 			return nil, err
 		}
 	}

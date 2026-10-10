@@ -50,16 +50,29 @@ func propagateFwdBearer(ctx context.Context) context.Context {
 	}
 	auth := md.Get("authorization")
 	if len(auth) == 0 || auth[0] == "" {
-		// A call that itself arrived forwarded carries the bearer under
-		// FwdBearerMDKey and no authorization: pass it on, or a second hop (an
-		// operation the entry node's peer continues on a third host) would
-		// reach its target as a plain peer, which is the system identity.
-		auth = md.Get(FwdBearerMDKey)
-	}
-	if len(auth) == 0 || auth[0] == "" {
 		return ctx
 	}
 	return metadata.AppendToOutgoingContext(ctx, FwdBearerMDKey, auth[0])
+}
+
+// RelayForwardedBearer is for a handler that continues a forwarded user's
+// request on a third host: the call that reached it carries the user's bearer
+// under FwdBearerMDKey and no authorization, so the dial's own propagation has
+// nothing to copy and the continuation would reach its target as a plain peer.
+// It puts the forwarded bearer on the outgoing context. It is a caller's
+// request, not a property of every peer dial, so no other chain changes identity.
+func RelayForwardedBearer(ctx context.Context) context.Context {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return ctx
+	}
+	if a := md.Get("authorization"); len(a) != 0 && a[0] != "" {
+		return ctx // the dial copies it
+	}
+	if f := md.Get(FwdBearerMDKey); len(f) != 0 && f[0] != "" {
+		return metadata.AppendToOutgoingContext(ctx, FwdBearerMDKey, f[0])
+	}
+	return ctx
 }
 
 func fwdBearerUnaryInterceptor(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {

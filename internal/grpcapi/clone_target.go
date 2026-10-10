@@ -12,13 +12,20 @@ package grpcapi
 // places the clone's disks in a pool: directly, on the source's host; after the
 // move, with MoveVolume, on another host.
 //
-// Permissions are the clone's own: backup.create on the source, vm.create in
-// the clone's project, and the project's right to use the pool
-// (admitPoolAttach, which every path that targets a pool enforces). The move is
-// run as the caller, so it also asks for vm.migrate on the new VM, and a move
-// into a pool asks for vm.move, as those verbs do anywhere else; a caller
-// without them is refused after the clone exists on the source host, and the
-// error says where the clone is.
+// Permissions are the clone's own (backup.create on the source, vm.create in the
+// clone's project, and the project's right to use the pool, admitPoolAttach,
+// which every path that targets a pool enforces), plus what the extra steps
+// need: vm.migrate for the move, vm.delete for the cleanup of a failed move,
+// vm.move for a pool on another host and vm.start for --start. All are checked
+// as the caller, up front, before a byte is copied. The steps run as the caller
+// too: the forwarded bearer is relayed (pki.RelayForwardedBearer), and a request
+// that arrived forwarded where forwarded identity is not enforced is refused
+// rather than run as a cluster peer.
+//
+// A failed move removes the staged copy. A daemon crash between staging and the
+// move's commit does not: the staged clone is then a complete stopped VM on the
+// source host (its events show vm.clone.staged without vm.clone.moved), and
+// `lv rm` removes it.
 
 import (
 	"context"
@@ -34,6 +41,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/pki"
 	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/safename"
 )
@@ -165,7 +173,7 @@ func (s *Server) cloneTargetPoolFor(ctx context.Context, project, name string, s
 // of the guests running on that filesystem pause when it fills, so a copy that
 // would take it that far is refused before it starts. need is the allocated size
 // of each source disk's chain, never less than the flatten's own estimate.
-func (s *Server) requireCloneSpace(ctx context.Context, dir string, srcDisks []corrosion.DiskRecord) error {
+func (s *Server) requireCloneSpace(ctx context.Context, dir string, srcDisks []corrosion.DiskRecord, why string) error {
 	var need uint64
 	for _, d := range srcDisks {
 		src := s.hostDiskFile(d.Path)
@@ -178,7 +186,19 @@ func (s *Server) requireCloneSpace(ctx context.Context, dir string, srcDisks []c
 		need += coldFlattenEstimate(alloc, info.VirtualSize)
 	}
 	probe := nearestExistingDir(s.hostDiskFile(dir))
-	return s.requireDiskSpace(probe, dir, "the clone's disks", need)
+	avail, total, err := s.diskSpace(probe)
+	if err != nil {
+		return status.Errorf(codes.FailedPrecondition, "clone: cannot read the free space of %s on %s: %v", dir, s.hostName, err)
+	}
+	headroom := coldDiskHeadroom(total)
+	if avail < need || avail-need < headroom {
+		return status.Errorf(codes.FailedPrecondition,
+			"cloning needs about %d MiB for %s in %s on %s, where %d MiB are free; it keeps at least %d MiB free there, because the "+
+				"thin-provisioned disks of the guests running on that filesystem pause when it fills. Free space there, "+
+				"clone to a pool or host with room, or clone the VM where its disks already are",
+			need>>20, why, dir, s.hostName, avail>>20, headroom>>20)
+	}
+	return nil
 }
 
 // finishCrossHostClone moves the staged clone to req.DestinationHost, puts its disks
@@ -192,6 +212,10 @@ func (s *Server) finishCrossHostClone(ctx context.Context, req *pb.CloneVMReques
 	// saying where it was going (the event below says).
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 4*time.Hour)
 	defer cancel()
+	// The pool step and the start run on the destination as the caller: a request
+	// that reached this host forwarded carries the caller's bearer under the
+	// forwarded-identity key, which the dial would not copy by itself.
+	ctx = pki.RelayForwardedBearer(ctx)
 	s.recordVMEvent(ctx, name, "vm.clone.staged", "ok", fmt.Sprintf("staged on %s for %s (pool %q, start %t)", s.hostName, th, req.TargetPool, req.Start))
 	if err := s.MigrateVM(&pb.MigrateVMRequest{
 		VmName: name, TargetHost: th, Strategy: pb.MigrateStrategy_MIGRATE_COLD,

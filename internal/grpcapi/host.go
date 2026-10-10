@@ -170,6 +170,8 @@ func (s *Server) Ping(ctx context.Context, _ *pb.PingRequest) (*pb.PingResponse,
 		// UNKNOWN bucket as an old binary — the fail-closed reading, and the
 		// honest one: that caller was told nothing either way.
 		PostureReported: disclosePosture,
+		// This build checks a migration's expect_* preconditions (failback.go).
+		MigratePreconditions: !s.pingWithoutMigratePreconditionsForTest,
 	}, nil
 }
 

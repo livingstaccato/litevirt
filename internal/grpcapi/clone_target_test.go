@@ -207,9 +207,10 @@ func TestCloneVM_CrossHostChecksEveryPermissionBeforeTheCopy(t *testing.T) {
 // Mutation: drop the requireCloneSpace call - the clone is made.
 func TestCloneVM_FullCopyIsRefusedWhenItWouldEndangerTheFilesystem(t *testing.T) {
 	s := cloneTargetServer(t)
+	addDirPool(t, s, "ssd")
 	// Room for the copy but not for the headroom a cold migration also leaves.
 	s.diskSpaceOverride = func(string) (uint64, uint64, error) { return 1<<30 + 8<<20, 100 << 30, nil }
-	_, err := s.CloneVM(adminCtx(), &pb.CloneVMRequest{Source: "tpl", Target: "tight", Mode: "full"})
+	_, err := s.CloneVM(adminCtx(), &pb.CloneVMRequest{Source: "tpl", Target: "tight", Mode: "full", TargetPool: "ssd"})
 	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "MiB") {
 		t.Fatalf("CloneVM on a nearly full filesystem = %v, want FailedPrecondition naming the sizes", err)
 	}
@@ -220,7 +221,7 @@ func TestCloneVM_FullCopyIsRefusedWhenItWouldEndangerTheFilesystem(t *testing.T)
 		t.Error("a refused clone left a disk file")
 	}
 	s.diskSpaceOverride = func(string) (uint64, uint64, error) { return 100 << 30, 100 << 30, nil }
-	if _, err := s.CloneVM(adminCtx(), &pb.CloneVMRequest{Source: "tpl", Target: "roomy", Mode: "full"}); err != nil {
+	if _, err := s.CloneVM(adminCtx(), &pb.CloneVMRequest{Source: "tpl", Target: "roomy", Mode: "full", TargetPool: "ssd"}); err != nil {
 		t.Fatalf("CloneVM with room: %v", err)
 	}
 }
@@ -244,5 +245,32 @@ func TestCloneVM_CrossHostRefusesToRunAsAPeerWhenIdentityIsNotForwarded(t *testi
 	}
 	if vm, _ := corrosion.GetVM(context.Background(), s.db, "fwd"); vm != nil {
 		t.Error("the refused clone left a VM row")
+	}
+}
+
+// A same-host clone behaves exactly as on main: it is refused for space only
+// when it cannot fit, never for the headroom a cold migration leaves. Only the
+// staged copy of a clone onto another host (and a copy into a pool) is admitted
+// with headroom, in the clone's own words.
+//
+// Mutation: run requireCloneSpace for every full clone - the same-host clone
+// below is refused.
+func TestCloneVM_SameHostCloneIsNotAdmittedWithHeadroom(t *testing.T) {
+	s := cloneTargetServer(t)
+	// Fits, but leaves less than the cold-move headroom.
+	s.diskSpaceOverride = func(string) (uint64, uint64, error) { return 1<<30 + 8<<20, 100 << 30, nil }
+	if _, err := s.CloneVM(adminCtx(), &pb.CloneVMRequest{Source: "tpl", Target: "same", Mode: "full"}); err != nil {
+		t.Fatalf("a same-host full clone that fits was refused: %v", err)
+	}
+	// A staged copy for another host is held to the headroom, with a clone's message.
+	if err := corrosion.InsertHost(context.Background(), s.db, corrosion.HostRecord{Name: "h2", Address: "10.0.0.4", SSHUser: "root", State: "active", CertSerial: "s3"}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := s.CloneVM(adminCtx(), &pb.CloneVMRequest{Source: "tpl", Target: "staged", DestinationHost: "h2"})
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "clone") || strings.Contains(err.Error(), "cold migration") {
+		t.Fatalf("a staged clone with no headroom = %v, want FailedPrecondition in the clone's own words", err)
+	}
+	if vm, _ := corrosion.GetVM(context.Background(), s.db, "staged"); vm != nil {
+		t.Error("the refused staged clone left a VM row")
 	}
 }

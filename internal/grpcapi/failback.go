@@ -173,11 +173,13 @@ func (f *failbackRuns) latest(host string) *failbackRun {
 }
 
 // failbackFeatureGate is the one place failback asks whether every host runs
-// the build that cancels a VM's drain record whenever its host changes (every
-// SpendDrainOrigin site). Until it passes, no record is written and nothing
-// fails back, and an undrain behaves exactly as it always has. It is a stub
-// over the durable failover_scope_v1 latch until the cluster's single release
-// token replaces it; nothing else in failback knows how the answer is reached.
+// the build that advances a VM's placement generation and cancels its drain
+// record whenever its host changes. Until it passes, no record is written and nothing
+// fails back, and an undrain behaves exactly as it always has. PROVISIONAL: it
+// stands on the durable failover_scope_v1 latch, which builds from before this
+// feature also advertise, so on a mixed cluster it does not yet guarantee what
+// it is named for. The cluster's single release token replaces its body before
+// this ships; nothing else in failback knows how the answer is reached.
 func (s *Server) failbackFeatureGate(ctx context.Context) error {
 	if s.gate != nil && s.gate.DurablyLatched(capabilities.FailoverScopeV1) {
 		return nil
@@ -188,8 +190,8 @@ func (s *Server) failbackFeatureGate(ctx context.Context) error {
 }
 
 // recordDrainOrigin notes that a drain of from moved vmName to to. It records
-// only a VM the drain really left on to, and only once drain_record_v1 has
-// latched; failback is otherwise unavailable for that VM, the safe direction.
+// only a VM the drain really left on to, and only once the failback
+// feature gate passes; failback is otherwise unavailable for that VM, the safe direction.
 func (s *Server) recordDrainOrigin(ctx context.Context, vmName, from, to string) {
 	if s.failbackFeatureGate(ctx) != nil {
 		slog.Info("drain: not recorded for failback: the upgrade has not finished on every host", "vm", vmName)
@@ -199,8 +201,9 @@ func (s *Server) recordDrainOrigin(ctx context.Context, vmName, from, to string)
 	if err != nil || vm == nil || vm.HostName != to {
 		return
 	}
+	gen, _ := corrosion.GetPlacementGen(ctx, s.db, vmName)
 	err = corrosion.PutDrainOrigin(ctx, s.db, corrosion.DrainOrigin{
-		VM: vmName, From: from, To: to, Epoch: vm.OwnerEpoch, CreatedAt: vm.CreatedAt,
+		VM: vmName, From: from, To: to, Epoch: vm.OwnerEpoch, CreatedAt: vm.CreatedAt, Gen: gen,
 	}, "drain")
 	if err != nil {
 		slog.Info("drain: not recorded for failback", "vm", vmName, "from", from, "to", to, "error", err)
@@ -213,11 +216,14 @@ const failbackPreconditionMarker = "failback precondition:"
 
 // checkDrainExpectation is the owner's half of a failback move, made under the
 // VM's lock against this host's own replica: this host owns the VM and is the
-// host the caller saw it on, the owner epoch is the one recorded, and the
-// drain record still stands, naming this host and the returning host. The
-// daemon that decided to move the VM read a replica that may lag; the host
-// that owns it cannot lag about where the VM is, nor about a migration it
-// made itself.
+// host the caller saw it on, the owner epoch is the one recorded, and the VM's
+// placement generation is the one the drain recorded. Every change of the VM's
+// host advances the generation in the batch that changes it, so the owner has
+// the generation of the move that made it the owner; this does not depend on
+// the drain's record, which may be the last thing a drained host wrote before it
+// went away, having reached nobody. The daemon that decided to move the VM read
+// a replica that may lag; the host that owns it cannot lag about where the VM
+// is.
 func (s *Server) checkDrainExpectation(ctx context.Context, req *pb.MigrateVMRequest, vm *corrosion.VMRecord) error {
 	refuse := func(why string) error {
 		return status.Errorf(codes.FailedPrecondition, "%s %s: it is not where the drain left it", failbackPreconditionMarker, why)
@@ -228,12 +234,15 @@ func (s *Server) checkDrainExpectation(ctx context.Context, req *pb.MigrateVMReq
 	if vm.OwnerEpoch != req.GetExpectOwnerEpoch() {
 		return refuse("the VM's ownership changed since the drain")
 	}
-	o, live, err := corrosion.GetLiveDrainOrigin(ctx, s.db, vm.Name)
+	// The generation, not the record: the owner cannot own the VM without having
+	// the generation of the move that made it the owner, whereas the drained
+	// host's record may be the last thing that host wrote before it went away.
+	gen, err := corrosion.GetPlacementGen(ctx, s.db, vm.Name)
 	if err != nil {
-		return status.Errorf(codes.Internal, "read the drain record of %q: %v", vm.Name, err)
+		return status.Errorf(codes.Internal, "read the placement generation of %q: %v", vm.Name, err)
 	}
-	if !live || o.To != s.hostName || o.From != req.GetTargetHost() || o.Epoch != req.GetExpectOwnerEpoch() || o.CreatedAt != vm.CreatedAt {
-		return refuse("the drain record no longer describes the VM (it was moved, or the record has not reached this host)")
+	if gen != req.GetExpectPlacementGen() {
+		return refuse("the VM's placement changed since the drain")
 	}
 	return nil
 }
@@ -424,7 +433,7 @@ func (s *Server) failbackOne(ctx context.Context, host string, o corrosion.Drain
 	if vm.CreatedAt != o.CreatedAt {
 		return stale("the VM was deleted and created again since the drain")
 	}
-	if vm.HostName != o.To || vm.OwnerEpoch != o.Epoch {
+	if gen, _ := corrosion.GetPlacementGen(ctx, s.db, o.VM); vm.HostName != o.To || vm.OwnerEpoch != o.Epoch || gen != o.Gen {
 		return stale(fmt.Sprintf("the VM was moved since the drain put it on %s (it is on %s): "+
 			"it was moved for another reason and stays where it is", o.To, vm.HostName))
 	}
@@ -463,12 +472,15 @@ func (s *Server) failbackOne(ctx context.Context, host string, o corrosion.Drain
 		return res
 	}
 
+	if why := s.ownerCannotCheck(ctx, o.To); why != "" {
+		return skip(why)
+	}
 	for try := 0; ; try++ {
 		err = s.MigrateVM(&pb.MigrateVMRequest{
 			VmName: vm.Name, TargetHost: host, Strategy: pb.MigrateStrategy_MIGRATE_LIVE,
 			// The owner checks, under the VM's lock and on its own replica, that
 			// the VM is still exactly where the drain left it (checkDrainExpectation).
-			ExpectDrainRecord: true, ExpectHost: o.To, ExpectOwnerEpoch: o.Epoch,
+			ExpectDrainRecord: true, ExpectHost: o.To, ExpectOwnerEpoch: o.Epoch, ExpectPlacementGen: o.Gen,
 		}, &discardMigrateStream{ctx: ctx})
 		if err == nil || try >= failbackNotActiveTries || !strings.Contains(err.Error(), "is not active") {
 			break
@@ -547,4 +559,29 @@ func SetFailbackPauseForTest(d time.Duration) (restore func()) {
 	old := failbackPause
 	failbackPause = d
 	return func() { failbackPause = old }
+}
+
+// ownerCannotCheck says why the VM's owner cannot be trusted to check a failback
+// move's preconditions ("" when it can): an owner on a release that predates
+// them ignores the expect_* fields and would migrate the VM unconditionally, so
+// the VM is skipped, never moved. This host is its own owner when it is the VM's
+// host; any other is asked, with Ping, which every release answers.
+func (s *Server) ownerCannotCheck(ctx context.Context, owner string) string {
+	if owner == s.hostName {
+		return ""
+	}
+	client, closer, err := s.dialPeer(ctx, owner)
+	if err != nil {
+		return "cannot reach the VM's host " + owner + " to confirm it checks the move: " + err.Error()
+	}
+	defer closer()
+	resp, err := client.Ping(ctx, &pb.PingRequest{})
+	if err != nil {
+		return "cannot ask the VM's host " + owner + " whether it checks the move: " + err.Error()
+	}
+	if !resp.GetMigratePreconditions() {
+		return "the VM's host " + owner + " runs an older release that cannot check that the VM is still where the drain left it: " +
+			"finish the upgrade, or move it with `lv migrate`"
+	}
+	return ""
 }

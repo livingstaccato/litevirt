@@ -3061,6 +3061,22 @@ func (d *Daemon) checkMigrationNetwork() error {
 	if err != nil {
 		return err
 	}
-	return grpcapi.CheckMigrationNetwork(n, d.cfg.Migration.AllowAnyNetwork,
-		net.ParseIP(netutil.OutboundIP()), net.ParseIP(d.cfg.AdvertiseAddress))
+	if err := grpcapi.CheckMigrationNetwork(n, d.cfg.Migration.AllowAnyNetwork,
+		net.ParseIP(netutil.OutboundIP()), net.ParseIP(d.cfg.AdvertiseAddress)); err != nil {
+		return err
+	}
+	// migration.address must be this host's own: a down NIC would send the data
+	// out by the default route, and an address copied from another host's config
+	// would send every source to the wrong host.
+	if a := net.ParseIP(d.cfg.Migration.Address); a != nil {
+		addrs, _ := net.InterfaceAddrs()
+		for _, x := range addrs {
+			if ipn, ok := x.(*net.IPNet); ok && ipn.IP.Equal(a) {
+				return nil
+			}
+		}
+		return fmt.Errorf("migration.address %s is not an address of this host: check the interface is up, "+
+			"and that the value was not copied from another host's config", a)
+	}
+	return nil
 }

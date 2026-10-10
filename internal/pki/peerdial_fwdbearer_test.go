@@ -66,21 +66,24 @@ func TestPropagateFwdBearer_PresentButEmptyIncomingMD(t *testing.T) {
 	}
 }
 
-// A call that itself arrived forwarded (the bearer under FwdBearerMDKey, no
-// authorization) passes the bearer on, so a continuation on a third host is
-// authorized as the user and not as the peer.
+// A bearer that arrived forwarded is relayed ONLY where a caller asks for it
+// (RelayForwardedBearer), not by every peer dial: the clone's own continuation
+// calls ask, a third hop of any other operation does not change identity.
 //
-// Mutation: drop the FwdBearerMDKey fallback in propagateFwdBearer.
-func TestPropagateFwdBearer_SecondHopKeepsTheCaller(t *testing.T) {
+// Mutation: make propagateFwdBearer relay FwdBearerMDKey again, or drop the
+// relay from RelayForwardedBearer.
+func TestForwardedBearerIsRelayedOnlyOnRequest(t *testing.T) {
 	in := metadata.NewIncomingContext(context.Background(), metadata.Pairs(FwdBearerMDKey, "Bearer lvs_abc"))
-	md, ok := metadata.FromOutgoingContext(propagateFwdBearer(in))
-	if !ok || len(md.Get(FwdBearerMDKey)) != 1 || md.Get(FwdBearerMDKey)[0] != "Bearer lvs_abc" {
-		t.Fatalf("second hop dropped the caller: %v", md)
+	if md, ok := metadata.FromOutgoingContext(propagateFwdBearer(in)); ok && len(md.Get(FwdBearerMDKey)) != 0 {
+		t.Fatalf("every peer dial relays a forwarded bearer: %v", md)
 	}
-	// An authorization bearer still wins over a forwarded one.
+	md, ok := metadata.FromOutgoingContext(RelayForwardedBearer(in))
+	if !ok || len(md.Get(FwdBearerMDKey)) != 1 || md.Get(FwdBearerMDKey)[0] != "Bearer lvs_abc" {
+		t.Fatalf("RelayForwardedBearer dropped the caller: %v", md)
+	}
+	// With an authorization bearer the dial's own propagation already carries it.
 	in = metadata.NewIncomingContext(context.Background(), metadata.Pairs("authorization", "Bearer mine", FwdBearerMDKey, "Bearer other"))
-	md, _ = metadata.FromOutgoingContext(propagateFwdBearer(in))
-	if got := md.Get(FwdBearerMDKey); len(got) != 1 || got[0] != "Bearer mine" {
-		t.Fatalf("outgoing = %v, want the authorization bearer", got)
+	if md, _ := metadata.FromOutgoingContext(RelayForwardedBearer(in)); len(md.Get(FwdBearerMDKey)) != 0 {
+		t.Fatalf("RelayForwardedBearer added a second bearer beside authorization: %v", md.Get(FwdBearerMDKey))
 	}
 }

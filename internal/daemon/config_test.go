@@ -642,11 +642,12 @@ func TestCheckMigrationNetworkAtStart(t *testing.T) {
 		advert  string
 		wantErr bool
 	}{
-		"unset":                {MigrationConfig{}, "", false},
-		"private, separate":    {MigrationConfig{Network: "10.20.0.0/24"}, "192.168.1.5", false},
-		"public":               {MigrationConfig{Network: "203.0.113.0/24"}, "192.168.1.5", true},
-		"public with override": {MigrationConfig{Network: "203.0.113.0/24", AllowAnyNetwork: true}, "192.168.1.5", false},
-		"contains the cluster": {MigrationConfig{Network: "192.168.0.0/16"}, "192.168.1.5", true},
+		"unset":                    {MigrationConfig{}, "", false},
+		"private, separate":        {MigrationConfig{Network: "10.20.0.0/24"}, "192.168.1.5", false},
+		"public":                   {MigrationConfig{Network: "203.0.113.0/24"}, "192.168.1.5", true},
+		"public with override":     {MigrationConfig{Network: "203.0.113.0/24", AllowAnyNetwork: true}, "192.168.1.5", false},
+		"contains the cluster":     {MigrationConfig{Network: "192.168.0.0/16"}, "192.168.1.5", true},
+		"address not on this host": {MigrationConfig{Network: "10.20.0.0/24", Address: "10.20.0.77"}, "192.168.1.5", true},
 	} {
 		d := &Daemon{cfg: &Config{Migration: tc.cfg, AdvertiseAddress: tc.advert}}
 		if err := d.checkMigrationNetwork(); (err != nil) != tc.wantErr {

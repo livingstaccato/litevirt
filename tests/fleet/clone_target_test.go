@@ -247,3 +247,19 @@ func TestFleet_Clone_ToAnotherHostIntoItsPool(t *testing.T) {
 		t.Errorf("no qcow2 at the pool path %s: %v", d.Path, err)
 	}
 }
+
+// A source on an older release ignores destination_host and makes a plain
+// same-host clone, answering success. The entry node, which asked for another
+// host, says so instead of reporting a clone that is not where it was asked for.
+//
+// Mutation: drop the host comparison after the forward in CloneVM - the call
+// succeeds and the clone sits on the source host.
+func TestFleet_Clone_ASourceThatIgnoresTheDestinationIsReported(t *testing.T) {
+	f := newCloneFleet(t)
+	f.src.Server.SetCloneAsOlderBuildForTest(true)
+	_, err := f.clone(t, &pb.CloneVMRequest{Target: "old1", DestinationHost: f.dst.Name})
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "older release") ||
+		!strings.Contains(err.Error(), "lv migrate old1 "+f.dst.Name+" --cold") {
+		t.Fatalf("clone through an older source = %v, want FailedPrecondition naming the older release and the way out", err)
+	}
+}

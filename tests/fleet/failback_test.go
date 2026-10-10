@@ -308,8 +308,8 @@ func TestFleet_Failback_AServingNodeThatLagsNeverMovesAVMAnOperatorMoved(t *test
 		t.Fatalf("failback: %v", err)
 	}
 	for _, vm := range []string{"hand", "again"} {
-		if p := got[vm]; p == nil || p.Status != "skipped" || !strings.Contains(p.Reason, "moved") {
-			t.Errorf("%s = %+v, want skipped: moved", vm, p)
+		if p := got[vm]; p == nil || p.Status != "skipped" || !strings.Contains(p.Reason, "since the drain") {
+			t.Errorf("%s = %+v, want skipped: since the drain", vm, p)
 		}
 	}
 	f.c.ClearLinkFaults()
@@ -614,5 +614,93 @@ func TestFleet_Failback_WaitsForTheUpgrade(t *testing.T) {
 	}
 	if f.vmAt(t, f.a, "w").HostName != f.b.Name {
 		t.Fatal("a VM moved back before the upgrade finished")
+	}
+}
+
+// The drained host's record is the last thing a drain writes and the first to be
+// lost when the host goes away: it powers off for maintenance before the record
+// has reached anyone. The VM, meanwhile, is moved by an operator out and back
+// (b -> x -> b), and no spend can cancel a record its mover never saw. When the
+// host returns its record finally replicates, and it still matches the VM's host
+// and owner epoch. A VM an operator placed by hand must not be moved: failback
+// may not depend on whether that record travelled in time.
+//
+// Mutation: drop the placement-generation comparison in checkDrainExpectation
+// and failbackOne - web is moved from b to a.
+func TestFleet_Failback_ARecordThatReplicatesLateNeverMovesAHandPlacedVM(t *testing.T) {
+	f := newFB(t, 3, true)
+	f.addVM(t, "web", f.a, nil)
+	f.xOut(t)
+	f.drain(t, f.b)
+	f.xIn(t)
+
+	// a powers off before its record reaches b or x: the record is on a alone.
+	f.c.Isolate(f.a)
+	for _, n := range []*Node{f.b, f.x} {
+		if _, err := n.DB.DB().Exec(`DELETE FROM cluster_policies WHERE key = 'drain_origin/web'`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rec := f.origins(t, f.a)
+	if len(rec) != 1 || len(f.origins(t, f.b)) != 0 || len(f.origins(t, f.x)) != 0 {
+		t.Fatalf("setup: a holds %d record(s), b %d, x %d; want a alone", len(rec), len(f.origins(t, f.b)), len(f.origins(t, f.x)))
+	}
+
+	// The operator moves web out and back while a is away.
+	emulateLibvirtMove(f.b, f.x)
+	if err := migrateAt(t, f.c, f.b, "web", f.x.Name); err != nil {
+		t.Fatalf("operator migrate: %v", err)
+	}
+	emulateLibvirtMove(f.x, f.b)
+	if err := migrateAt(t, f.c, f.x, "web", f.b.Name); err != nil {
+		t.Fatalf("operator migrate back: %v", err)
+	}
+	f.c.WaitConverged(t, convergeTimeout, f.b, f.x)
+
+	// a returns; its record replicates, unspent.
+	f.c.ClearLinkFaults()
+	if err := corrosion.PutDrainOrigin(context.Background(), f.a.DB, rec[0], "drain"); err != nil {
+		t.Fatal(err)
+	}
+	f.c.WaitConverged(t, convergeTimeout)
+	if o := f.origins(t, f.b); len(o) != 1 {
+		t.Fatalf("setup: b should now hold the late record, holds %+v", o)
+	}
+
+	f.undrainSettled(t, f.a)
+	emulateLibvirtMove(f.b, f.a)
+	got, err := f.failback(t, f.x, &pb.FailbackHostRequest{All: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := got["web"]; p != nil && p.Status == "moved" {
+		t.Fatalf("web was moved back although an operator placed it by hand: %+v", p)
+	}
+	if h := f.vmAt(t, f.a, "web").HostName; h != f.b.Name {
+		t.Fatalf("web is on %s, want it left on %s", h, f.b.Name)
+	}
+}
+
+// An owner on a release that does not check a failback move's preconditions
+// would migrate the VM unconditionally, so the VM is skipped, never moved.
+//
+// Mutation: drop the owner-capability check in failbackOne - the VM is moved by
+// an owner that ignores the preconditions.
+func TestFleet_Failback_SkipsAVMWhoseOwnerCannotCheckThePreconditions(t *testing.T) {
+	f := newFB(t, 2, true)
+	f.addVM(t, "old", f.a, nil)
+	f.drain(t, f.b)
+	f.undrainSettled(t, f.a)
+	f.b.Server.SetPingWithoutMigratePreconditionsForTest(true)
+	emulateLibvirtMove(f.b, f.a)
+	got, err := f.failback(t, f.a, &pb.FailbackHostRequest{All: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := got["old"]; p == nil || p.Status != "skipped" || !strings.Contains(p.Reason, "older release") {
+		t.Fatalf("old = %+v, want skipped: owner on an older release", p)
+	}
+	if h := f.vmAt(t, f.a, "old").HostName; h != f.b.Name || migrateCalls(f.b) != 0 {
+		t.Fatalf("the VM was moved by an owner that cannot check (on %s)", h)
 	}
 }

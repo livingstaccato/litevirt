@@ -73,13 +73,14 @@ func TestLocalAddressIn_NeverAFloatingAddress(t *testing.T) {
 			{net.ParseIP("10.20.0.4"), "vnet7"},       // a guest's
 			{net.ParseIP("169.254.1.1"), "eth1"},      // link-local
 			{net.ParseIP("10.20.0.9"), "eth1"},        // the real one
+			{net.ParseIP("10.20.0.99"), "eth1"},       // the one migration.address names
 		}, nil
 	})
 	if got := s.localAddressIn(ctx, "10.20.0.0/16"); got != "10.20.0.9" {
 		t.Errorf("answered %q, want the one real address 10.20.0.9", got)
 	}
-	s.SetMigrationAddress("10.20.0.77")
-	if got := s.localAddressIn(ctx, "10.20.0.0/16"); got != "10.20.0.77" {
+	s.SetMigrationAddress("10.20.0.99")
+	if got := s.localAddressIn(ctx, "10.20.0.0/16"); got != "10.20.0.99" {
 		t.Errorf("migration.address was not taken as given: %q", got)
 	}
 	s.SetMigrationAddress("192.168.9.9") // outside the network: ignored
@@ -193,5 +194,23 @@ func TestChooseMigrationRoute(t *testing.T) {
 				t.Errorf("warning recorded = %v, want %v", warned, c.wantWarn)
 			}
 		})
+	}
+}
+
+// migration.address is taken as given only while this host really holds it: a
+// down NIC, or an address copied from another host's config, is not answered
+// and does not satisfy "this host holds an address in the network".
+//
+// Mutation: trust the override without checking the host's addresses.
+func TestLocalAddressIn_IgnoresAMigrationAddressThisHostDoesNotHold(t *testing.T) {
+	s := testServer(t)
+	s.SetLocalIPsForTest(func() ([]net.IP, error) { return []net.IP{net.ParseIP("10.20.0.9")}, nil })
+	s.SetMigrationAddress("10.20.0.77")
+	if got := s.localAddressIn(context.Background(), "10.20.0.0/24"); got != "10.20.0.9" {
+		t.Fatalf("answered %q, want 10.20.0.9: 10.20.0.77 is not on this host", got)
+	}
+	s.SetLocalIPsForTest(func() ([]net.IP, error) { return []net.IP{net.ParseIP("192.168.1.5")}, nil })
+	if got := s.localAddressIn(context.Background(), "10.20.0.0/24"); got != "" {
+		t.Fatalf("answered %q for a host with no address in the network and a configured address that is not its own", got)
 	}
 }

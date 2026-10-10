@@ -50,7 +50,8 @@ Where the clone lives (default: the source's host, in its default disk directory
            clone ends up on. A clone in a pool is a full copy. Needs the project
            to be allowed to use the pool (and, on another host, the move-volume
            permission, vm.move).
-If the move fails, the staged copy is removed and nothing is left behind. If it
+If the move fails, the staged copy is removed and nothing is left behind (a crash of
+the daemon mid-clone can leave the staged VM: lv rm removes it). If it
 succeeded and a later step (the pool, the start) fails, the VM is complete on its
 host and the error names the command that finishes the job.
 

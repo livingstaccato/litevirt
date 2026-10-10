@@ -6310,8 +6310,14 @@ type MigrateVMRequest struct {
 	ExpectDrainRecord bool   `protobuf:"varint,5,opt,name=expect_drain_record,json=expectDrainRecord,proto3" json:"expect_drain_record,omitempty"`
 	ExpectHost        string `protobuf:"bytes,6,opt,name=expect_host,json=expectHost,proto3" json:"expect_host,omitempty"`
 	ExpectOwnerEpoch  int64  `protobuf:"varint,7,opt,name=expect_owner_epoch,json=expectOwnerEpoch,proto3" json:"expect_owner_epoch,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// expect_placement_gen is the VM's placement generation the drain recorded.
+	// Every change of the VM's host advances it in the same batch, so the owner,
+	// which cannot own the VM without having the generation of the move that
+	// made it the owner, compares its own current value: any placement change
+	// since the drain, however the record travelled, refuses the move.
+	ExpectPlacementGen int64 `protobuf:"varint,8,opt,name=expect_placement_gen,json=expectPlacementGen,proto3" json:"expect_placement_gen,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *MigrateVMRequest) Reset() {
@@ -6389,6 +6395,13 @@ func (x *MigrateVMRequest) GetExpectHost() string {
 func (x *MigrateVMRequest) GetExpectOwnerEpoch() int64 {
 	if x != nil {
 		return x.ExpectOwnerEpoch
+	}
+	return 0
+}
+
+func (x *MigrateVMRequest) GetExpectPlacementGen() int64 {
+	if x != nil {
+		return x.ExpectPlacementGen
 	}
 	return 0
 }
@@ -25521,8 +25534,12 @@ type PingResponse struct {
 	// wall_clock got away without a companion flag because its zero value is not
 	// a legal reading; an empty token list is, so it needs one.
 	PostureReported bool `protobuf:"varint,8,opt,name=posture_reported,json=postureReported,proto3" json:"posture_reported,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// migrate_preconditions: this build checks MigrateVMRequest's expect_*
+	// preconditions before it moves a VM. An older owner ignores them and moves the
+	// VM unconditionally, so failback skips a VM whose owner does not say so.
+	MigratePreconditions bool `protobuf:"varint,9,opt,name=migrate_preconditions,json=migratePreconditions,proto3" json:"migrate_preconditions,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *PingResponse) Reset() {
@@ -25607,6 +25624,13 @@ func (x *PingResponse) GetNotEnforcing() []string {
 func (x *PingResponse) GetPostureReported() bool {
 	if x != nil {
 		return x.PostureReported
+	}
+	return false
+}
+
+func (x *PingResponse) GetMigratePreconditions() bool {
+	if x != nil {
+		return x.MigratePreconditions
 	}
 	return false
 }
@@ -35459,7 +35483,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x13ExportStackResponse\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12!\n" +
 	"\fcompose_yaml\x18\x02 \x01(\tR\vcomposeYaml\x12!\n" +
-	"\fcompose_hash\x18\x03 \x01(\tR\vcomposeHash\"\xa8\x02\n" +
+	"\fcompose_hash\x18\x03 \x01(\tR\vcomposeHash\"\xda\x02\n" +
 	"\x10MigrateVMRequest\x12\x17\n" +
 	"\avm_name\x18\x01 \x01(\tR\x06vmName\x12\x1f\n" +
 	"\vtarget_host\x18\x02 \x01(\tR\n" +
@@ -35469,7 +35493,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x13expect_drain_record\x18\x05 \x01(\bR\x11expectDrainRecord\x12\x1f\n" +
 	"\vexpect_host\x18\x06 \x01(\tR\n" +
 	"expectHost\x12,\n" +
-	"\x12expect_owner_epoch\x18\a \x01(\x03R\x10expectOwnerEpoch\"\xfa\x02\n" +
+	"\x12expect_owner_epoch\x18\a \x01(\x03R\x10expectOwnerEpoch\x120\n" +
+	"\x14expect_placement_gen\x18\b \x01(\x03R\x12expectPlacementGen\"\xfa\x02\n" +
 	"\x0fMigrateProgress\x12/\n" +
 	"\x05phase\x18\x01 \x01(\x0e2\x19.litevirt.v1.MigratePhaseR\x05phase\x12\x1d\n" +
 	"\n" +
@@ -37056,7 +37081,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\n" +
 	"LOCALIZING\x10\x04\x12\b\n" +
 	"\x04DONE\x10\x05\"\r\n" +
-	"\vPingRequest\"\xa8\x02\n" +
+	"\vPingRequest\"\xdd\x02\n" +
 	"\fPingResponse\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x12\x18\n" +
 	"\aversion\x18\x02 \x01(\tR\aversion\x12%\n" +
@@ -37066,7 +37091,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"wall_clock\x18\x05 \x01(\tR\twallClock\x12'\n" +
 	"\x0fwal_quarantined\x18\x06 \x01(\bR\x0ewalQuarantined\x12#\n" +
 	"\rnot_enforcing\x18\a \x03(\tR\fnotEnforcing\x12)\n" +
-	"\x10posture_reported\x18\b \x01(\bR\x0fpostureReported\"\x0e\n" +
+	"\x10posture_reported\x18\b \x01(\bR\x0fpostureReported\x123\n" +
+	"\x15migrate_preconditions\x18\t \x01(\bR\x14migratePreconditions\"\x0e\n" +
 	"\fReadyRequest\"\x95\x01\n" +
 	"\rReadyResponse\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x12\x14\n" +

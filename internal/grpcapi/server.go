@@ -305,10 +305,12 @@ type Server struct {
 	// migrationNetwork is migration.network: the IPv4 CIDR a migration's data
 	// should travel on (migration_network.go). Empty means the host's cluster
 	// address. localIPs is a test seam for the host's own addresses.
-	migrationNetwork string
-	migrationDial    func(ctx context.Context, host, addr string) (pb.LiteVirtClient, func(), error)
-	migrationAddress string // migration.address: this host's own answer, when set
-	localIPs         func() ([]localAddr, error)
+	migrationNetwork                       string
+	pingWithoutMigratePreconditionsForTest bool // Ping answers as a release that does not check migration preconditions
+	cloneAsOlderBuildForTest               bool // CloneVM ignores destination_host and target_pool, as an older release does
+	migrationDial                          func(ctx context.Context, host, addr string) (pb.LiteVirtClient, func(), error)
+	migrationAddress                       string // migration.address: this host's own answer, when set
+	localIPs                               func() ([]localAddr, error)
 	// failbacks is the set of hosts a failback is running for (failback.go).
 	failbacks failbackRuns
 	// isoResolvedWithheld makes EnsureDisks answer as a target older than

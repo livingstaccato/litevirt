@@ -87,6 +87,11 @@ type DrainOrigin struct {
 	// after the move: the identity a later failback checks it still has.
 	Epoch     int64  `json:"epoch"`
 	CreatedAt string `json:"created_at"`
+	// Gen is the VM's placement generation right after the drain's move
+	// (GetPlacementGen). Failback proceeds only while the owner's generation is
+	// still this one, which does not depend on whether any other record
+	// replicated.
+	Gen int64 `json:"gen"`
 }
 
 // PutDrainOrigin records that a drain moved o.VM from o.From to o.To. A later
@@ -169,4 +174,47 @@ func SpendDrainOrigin(ctx context.Context, c *Client, vm string) {
 		return
 	}
 	_ = CollectDrainOrigin(ctx, c, vm, "moved")
+}
+
+// The placement generation: a per-VM counter, kept in cluster_policies
+// (placement_gen/<vm>), that every writer which changes a VM's host advances IN
+// THE SAME BATCH as the host change. Replication is ordered per origin, so a
+// host that has received the batch that made it the VM's owner has the
+// generation of that move, and the next move reads it and writes the next
+// number. A hand move out and back therefore leaves a generation two higher than
+// any drain record, whether or not that record ever reached the movers.
+//
+// Like every cluster_policies write it waits for the cluster-policy gate; with
+// the gate closed no generation is kept, and neither is any drain record.
+const placementGenKeyPrefix = "placement_gen/"
+
+// GetPlacementGen returns vm's placement generation on this node's replica; a VM
+// that has never been moved has 0.
+func GetPlacementGen(ctx context.Context, c *Client, vm string) (int64, error) {
+	rows, err := c.Query(ctx,
+		`SELECT value FROM cluster_policies WHERE key = ? AND deleted_at IS NULL`, placementGenKeyPrefix+vm)
+	if err != nil || len(rows) == 0 {
+		return 0, err
+	}
+	var n int64
+	if _, serr := fmt.Sscanf(rows[0].String("value"), "%d", &n); serr != nil || n < 0 {
+		return 0, nil
+	}
+	return n, nil
+}
+
+// placementGenStmts is the statement that advances vm's placement generation,
+// for the batch that changes its host; none while the gate is closed.
+func placementGenStmts(ctx context.Context, c *Client, vm string) []Statement {
+	if !c.MayWriteClusterPolicy() {
+		return nil
+	}
+	n, err := GetPlacementGen(ctx, c, vm)
+	if err != nil {
+		return nil
+	}
+	return []Statement{{
+		SQL:    clusterPolicyUpsertSQL,
+		Params: []interface{}{placementGenKeyPrefix + vm, fmt.Sprintf("%d", n+1), "placement", c.NowTS()},
+	}}
 }

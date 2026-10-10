@@ -146,7 +146,83 @@ func TestHostChangingWritersSpendTheDrainRecord(t *testing.T) {
 	if err := TransferVMOwnerFresh(ctx, c, "w", "h3", "running"); err != nil {
 		t.Fatal(err)
 	}
+	if n := oneString(t, c, `SELECT count(*) AS n FROM cluster_policies WHERE key LIKE 'drain_origin/%'`, "n"); n != "0" {
+		t.Fatalf("moving a VM no drain moved wrote %s drain record row(s)", n)
+	}
+}
+
+// Every writer that changes a VM's host advances the VM's placement generation
+// IN THE SAME BATCH as the host change, so whoever owns the VM has the
+// generation of the move that made it the owner, and a later move reads and
+// advances it. A VM no gate allows a row for gets none.
+//
+// Mutation: drop placementGenStmts from one writer - that row stays at 0.
+func TestHostChangingWritersAdvanceThePlacementGeneration(t *testing.T) {
+	ctx := context.Background()
+	type mover func(c *Client) error
+	rows := map[string]mover{
+		"RescheduleVMHost":     func(c *Client) error { return RescheduleVMHost(ctx, c, "v", "h3", "running") },
+		"TransferVMOwnerFresh": func(c *Client) error { return TransferVMOwnerFresh(ctx, c, "v", "h3", "running") },
+		"CommitMigrationOwnership": func(c *Client) error {
+			ok, err := CommitMigrationOwnership(ctx, c, "v", "h2", "h3", "running", nil)
+			if err == nil && !ok {
+				return errors.New("declined")
+			}
+			return err
+		},
+		"RepointMigratedVM": func(c *Client) error {
+			if err := UpdateVMState(ctx, c, "v", "migrating", ""); err != nil {
+				return err
+			}
+			ok, err := RepointMigratedVM(ctx, c, "v", "h2", "h3", "running")
+			if err == nil && !ok {
+				return errors.New("declined")
+			}
+			return err
+		},
+		"RekeyStoppedVM": func(c *Client) error {
+			if err := UpdateVMState(ctx, c, "v", "stopped", ""); err != nil {
+				return err
+			}
+			vm, _ := GetVM(ctx, c, "v")
+			return RekeyStoppedVM(ctx, c, "v", "h2", "h3", "stopped", vm.OwnerEpoch)
+		},
+	}
+	for name, move := range rows {
+		t.Run(name, func(t *testing.T) {
+			c := testClient(t)
+			openClusterPolicyGate(c)
+			if err := InsertVM(ctx, c, VMRecord{Name: "v", HostName: "h2", State: "running", Spec: `{}`}, nil, nil); err != nil {
+				t.Fatal(err)
+			}
+			if g, _ := GetPlacementGen(ctx, c, "v"); g != 0 {
+				t.Fatalf("a new VM starts at generation 0, has %d", g)
+			}
+			if err := move(c); err != nil {
+				t.Fatalf("%s: %v", name, err)
+			}
+			if g, err := GetPlacementGen(ctx, c, "v"); err != nil || g != 1 {
+				t.Fatalf("%s left generation %d (%v), want 1", name, g, err)
+			}
+			// The batch wrote it before any later reader could own the VM: a
+			// second move reads 1 and writes 2.
+			if err := TransferVMOwnerFresh(ctx, c, "v", "h4", "running"); err != nil {
+				t.Fatal(err)
+			}
+			if g, _ := GetPlacementGen(ctx, c, "v"); g != 2 {
+				t.Fatalf("the second move left generation %d, want 2", g)
+			}
+		})
+	}
+	// Gate closed (the cluster has not latched cluster_policies): no row.
+	c := testClient(t)
+	if err := InsertVM(ctx, c, VMRecord{Name: "w", HostName: "h2", State: "running", Spec: `{}`}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := TransferVMOwnerFresh(ctx, c, "w", "h3", "running"); err != nil {
+		t.Fatal(err)
+	}
 	if n := oneString(t, c, `SELECT count(*) AS n FROM cluster_policies`, "n"); n != "0" {
-		t.Fatalf("moving a VM no drain moved wrote %s cluster_policies row(s)", n)
+		t.Fatalf("a move with the gate closed wrote %s cluster_policies row(s)", n)
 	}
 }

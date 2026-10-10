@@ -243,12 +243,18 @@ func (s *Server) localAddressIn(ctx context.Context, cidr string) string {
 	if err != nil {
 		return ""
 	}
-	if a := net.ParseIP(s.migrationAddress); a != nil && a.To4() != nil && n.Contains(a) {
-		return a.To4().String()
-	}
 	addrs, err := s.listLocalAddrs()
 	if err != nil {
 		return ""
+	}
+	// migration.address is taken as given only while this host really holds it:
+	// a down NIC, or an address copied from another host's config, is ignored.
+	if a := net.ParseIP(s.migrationAddress); a != nil && a.To4() != nil && n.Contains(a) {
+		for _, l := range addrs {
+			if l.IP.Equal(a) {
+				return a.To4().String()
+			}
+		}
 	}
 	vips, bridges := s.floatingAddrs(ctx)
 	var in []string
@@ -410,4 +416,14 @@ func (s *Server) dialColdPeer(ctx context.Context, targetHost, vmName, diskAddr 
 		return fallback(fmt.Errorf("it does not answer: %v", err))
 	}
 	return client, closer, nil
+}
+
+// SetCloneAsOlderBuildForTest makes CloneVM here ignore destination_host and
+// target_pool, as a source on an older release does.
+func (s *Server) SetCloneAsOlderBuildForTest(on bool) { s.cloneAsOlderBuildForTest = on }
+
+// SetPingWithoutMigratePreconditionsForTest makes Ping answer as a release that
+// does not check a migration's expect_* preconditions.
+func (s *Server) SetPingWithoutMigratePreconditionsForTest(on bool) {
+	s.pingWithoutMigratePreconditionsForTest = on
 }

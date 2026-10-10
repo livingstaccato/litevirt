@@ -1090,7 +1090,15 @@ func UpdateVMStateStrict(ctx context.Context, c *Client, name, state, detail str
 // UpdateVMHost moves a VM's host assignment and state after migration.
 func UpdateVMHost(ctx context.Context, c *Client, name, hostName, state string) error {
 	now := c.NowTS()
-	return c.Execute(ctx, vmHostStateSQL, hostName, state, now, name)
+	err := c.Execute(ctx, vmHostStateSQL, hostName, state, now, name)
+	if err == nil {
+		if c.MayWriteClusterPolicy() {
+			n, _ := GetPlacementGen(ctx, c, name)
+			_ = c.Execute(ctx, clusterPolicyUpsertSQL, placementGenKeyPrefix+name, fmt.Sprintf("%d", n+1), "placement", c.NowTS())
+		}
+		SpendDrainOrigin(ctx, c, name)
+	}
+	return err
 }
 
 // TransferVMOwner is the Phase 4 ownership-transition primitive: one guarded
@@ -1104,6 +1112,14 @@ func UpdateVMHost(ctx context.Context, c *Client, name, hostName, state string) 
 // for same-host state changes only.
 func TransferVMOwner(ctx context.Context, c *Client, name, hostName, state string, expectedEpoch int64) error {
 	now := c.NowTS()
+	stmts := []Statement{{
+		SQL: `UPDATE vms
+		      SET host_name = ?, state = ?, state_detail = '',
+		          vm_owner_epoch = vm_owner_epoch + 1, updated_at = ?
+		      WHERE name = ? AND deleted_at IS NULL AND vm_owner_epoch = ?`,
+		Params: []interface{}{hostName, state, now, name, expectedEpoch},
+	}}
+	stmts = append(stmts, placementGenStmts(ctx, c, name)...)
 	applied, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
 		var epoch int64
 		if err := tx.QueryRow(
@@ -1115,13 +1131,7 @@ func TransferVMOwner(ctx context.Context, c *Client, name, hostName, state strin
 			return false, err
 		}
 		return epoch == expectedEpoch, nil
-	}, []Statement{{
-		SQL: `UPDATE vms
-		      SET host_name = ?, state = ?, state_detail = '',
-		          vm_owner_epoch = vm_owner_epoch + 1, updated_at = ?
-		      WHERE name = ? AND deleted_at IS NULL AND vm_owner_epoch = ?`,
-		Params: []interface{}{hostName, state, now, name, expectedEpoch},
-	}})
+	}, stmts)
 	if err != nil {
 		return err
 	}
@@ -1160,6 +1170,7 @@ func TransferVMOwnerWithDisks(ctx context.Context, c *Client, name, hostName, st
 			Params: []interface{}{hostName, now, name, d.DiskName},
 		})
 	}
+	stmts = append(stmts, placementGenStmts(ctx, c, name)...)
 	applied, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
 		var epoch int64
 		if err := tx.QueryRow(
@@ -1843,6 +1854,7 @@ func CommitMigrationOwnership(ctx context.Context, c *Client, vmName, sourceHost
 		})
 	}
 
+	stmts = append(stmts, placementGenStmts(ctx, c, vmName)...)
 	guard := func(tx *sql.Tx) (bool, error) {
 		var vmHost string
 		// A tombstone is a vanished VM: the parent statement would change nothing
@@ -1917,6 +1929,11 @@ const vmDiskHostMoveSQL = `UPDATE vm_disks SET host_name = ?, updated_at = ?
 // them. committed=false when the row is no longer the migration's.
 func RepointMigratedVM(ctx context.Context, c *Client, vmName, sourceHost, targetHost, finalState string) (bool, error) {
 	now := c.NowTS()
+	repoint := []Statement{{
+		SQL:    vmHostStateSQL,
+		Params: []interface{}{targetHost, finalState, now, vmName},
+	}}
+	repoint = append(repoint, placementGenStmts(ctx, c, vmName)...)
 	ok, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
 		var host, state string
 		switch err := tx.QueryRowContext(ctx, `SELECT host_name, state FROM vms WHERE name = ? AND deleted_at IS NULL`, vmName).
@@ -1927,10 +1944,7 @@ func RepointMigratedVM(ctx context.Context, c *Client, vmName, sourceHost, targe
 			return false, err
 		}
 		return host == sourceHost && state == "migrating", nil
-	}, []Statement{{
-		SQL:    vmHostStateSQL,
-		Params: []interface{}{targetHost, finalState, now, vmName},
-	}})
+	}, repoint)
 	if ok && err == nil {
 		SpendDrainOrigin(ctx, c, vmName)
 	}
@@ -1963,6 +1977,7 @@ func RescheduleVMHost(ctx context.Context, c *Client, name, hostName, state stri
 			Params: []interface{}{hostName, now, name, d.DiskName},
 		})
 	}
+	stmts = append(stmts, placementGenStmts(ctx, c, name)...)
 	applied, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
 		var startable bool
 		if err := tx.QueryRowContext(ctx,

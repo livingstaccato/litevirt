@@ -1404,11 +1404,13 @@ func HostRunsContainers(h HostRecord) bool {
 	return h.Labels[LabelLXCCapable] == "true"
 }
 
-// HostDiskPaths maps each absolute disk path of a VM placed on host to the
-// VM's name — what a container must never be handed as a device.
-func HostDiskPaths(ctx context.Context, c *Client, host string) (map[string]string, error) {
+// VMDiskPaths maps each absolute disk path of every VM in the cluster to the
+// VM's name — what a container must never be handed as a device. Every host's
+// rows, not only this one's: on shared storage a LUN backing a VM on another
+// host is visible here too.
+func VMDiskPaths(ctx context.Context, c *Client) (map[string]string, error) {
 	rows, err := c.Query(ctx,
-		`SELECT vm_name, path FROM vm_disks WHERE host_name = ? AND deleted_at IS NULL`, host)
+		`SELECT vm_name, path FROM vm_disks WHERE deleted_at IS NULL`)
 	if err != nil {
 		return nil, err
 	}

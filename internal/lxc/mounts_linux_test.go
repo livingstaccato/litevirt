@@ -96,8 +96,9 @@ func TestStageMount_AsRoot(t *testing.T) {
 	_ = os.WriteFile(filepath.Join(prefix, "data", "f"), []byte("ok"), 0o644)
 	_ = os.MkdirAll(filepath.Join(root, "secret"), 0o700)
 	m := hookMount{ro: true, prefix: prefix, rel: "data", staging: stagingPath("c1", 0)}
+	pol := hookPolicy{MountPaths: []string{prefix}}
 	_ = os.MkdirAll(filepath.Dir(m.staging), 0o700)
-	if err := stageMount(m); err != nil {
+	if err := stageMount(m, pol); err != nil {
 		t.Fatalf("stageMount: %v", err)
 	}
 	defer unmountAll(m.staging)
@@ -110,7 +111,7 @@ func TestStageMount_AsRoot(t *testing.T) {
 	unmountAll(m.staging)
 	_ = os.Rename(filepath.Join(prefix, "data"), filepath.Join(prefix, "data.old"))
 	_ = os.Symlink(filepath.Join(root, "secret"), filepath.Join(prefix, "data"))
-	if err := stageMount(m); err == nil {
+	if err := stageMount(m, pol); err == nil {
 		t.Fatal("stageMount followed a swapped-in symlink")
 	}
 }

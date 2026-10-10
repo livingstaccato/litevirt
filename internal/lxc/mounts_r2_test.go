@@ -141,7 +141,7 @@ func TestBlockDeviceInUse_ByNumber(t *testing.T) {
 	exclusiveOpenBusy = func(string) bool { return false }
 	// Device numbers by path, as stat would report them.
 	numbers := map[string][2]uint32{"/dev/fake-swap": {8, 48}, "/dev/fake-vmdisk": {8, 64}}
-	statRdev = func(p string) (uint32, uint32, bool) { n, ok := numbers[p]; return n[0], n[1], ok }
+	statRdev = func(p string) (byte, uint32, uint32, bool) { n, ok := numbers[p]; return 'b', n[0], n[1], ok }
 	// A qemu holding the VM disk open.
 	_ = os.MkdirAll(filepath.Join(procRoot, "4242", "fd"), 0o755)
 	_ = os.Symlink("/dev/fake-vmdisk", filepath.Join(procRoot, "4242", "fd", "17"))
@@ -196,19 +196,16 @@ func TestCheckHostAccessForStart_ReRendersFromTheRecord(t *testing.T) {
 	}
 }
 
-// m-b. The start hook re-judges against this host's policy as it is now:
-// the policy file the daemon writes before every start.
+// m-b / m-5. The start hook re-judges against this host's policy as it is
+// now, bounded by the container's own record: the per-container policy file
+// the daemon writes.
 func TestHookPolicy_RoundTripAndJudging(t *testing.T) {
 	root, access := hostTree(t)
-	dir := t.TempDir()
-	old := hookPolicyPath
-	t.Cleanup(func() { hookPolicyPath = old })
-	hookPolicyPath = filepath.Join(dir, "policy.json")
 	r := &LxcRunner{Lxcpath: t.TempDir(), HostAccess: access}
-	if err := r.writeHookPolicy(); err != nil {
+	if err := r.writeHookPolicy("c1", nil, nil); err != nil {
 		t.Fatalf("writeHookPolicy: %v", err)
 	}
-	p, err := readHookPolicy()
+	p, err := readHookPolicy("c1")
 	if err != nil {
 		t.Fatalf("readHookPolicy: %v", err)
 	}
@@ -219,8 +216,8 @@ func TestHookPolicy_RoundTripAndJudging(t *testing.T) {
 	if err := p.judgeMount(filepath.Join(root, "secret"), filepath.Join(root, "secret")); err == nil {
 		t.Error("a prefix no longer allowed passed the hook")
 	}
-	_ = os.Remove(hookPolicyPath)
-	if _, err := readHookPolicy(); err == nil {
+	_ = os.Remove(hookPolicyFile("c1"))
+	if _, err := readHookPolicy("c1"); err == nil {
 		t.Error("a missing policy read as allowing")
 	}
 }
@@ -283,8 +280,13 @@ func TestHookPolicy_JudgesProtectedTrees(t *testing.T) {
 	if err := p.judgeMount(allowed, filepath.Join(allowed, "pool", "disk")); err == nil {
 		t.Error("a source inside a protected store passed the hook")
 	}
-	if err := p.judgeMount(allowed, filepath.Join(allowed, "data")); err == nil {
-		t.Error("a prefix containing a protected store passed the hook")
+	// m-2: the prefix is not judged as a whole; a source disjoint from the
+	// store beneath it keeps working.
+	if err := p.judgeMount(allowed, filepath.Join(allowed, "data")); err != nil {
+		t.Errorf("a source beside a protected store was refused: %v", err)
+	}
+	if err := p.judgeMount(allowed, allowed); err == nil {
+		t.Error("a source containing a protected store passed the hook")
 	}
 	if err := (hookPolicy{MountPaths: []string{allowed}}).judgeMount(allowed, filepath.Join(allowed, "data")); err != nil {
 		t.Errorf("an allowed source was refused: %v", err)

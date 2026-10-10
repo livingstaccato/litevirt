@@ -10,13 +10,13 @@ import (
 // fakeKernelSupport makes the kernel probe pass for a test.
 func fakeKernelSupport(t *testing.T) {
 	t.Helper()
-	old, oldBin, oldExcl, oldPol := hostAccessSupported, validateHookBinary, exclusiveOpenBusy, hookPolicyPath
+	old, oldBin, oldExcl, oldPol := hostAccessSupported, validateHookBinary, exclusiveOpenBusy, hookPolicyDir
 	hostAccessSupported = func() error { return nil }
 	validateHookBinary = func(string) error { return nil }
 	exclusiveOpenBusy = func(string) bool { return false }
-	hookPolicyPath = filepath.Join(t.TempDir(), "policy.json")
+	hookPolicyDir = filepath.Join(t.TempDir(), "hook-policy")
 	t.Cleanup(func() {
-		hostAccessSupported, validateHookBinary, exclusiveOpenBusy, hookPolicyPath = old, oldBin, oldExcl, oldPol
+		hostAccessSupported, validateHookBinary, exclusiveOpenBusy, hookPolicyDir = old, oldBin, oldExcl, oldPol
 	})
 }
 
@@ -173,8 +173,9 @@ func TestResolveHostAccess_Devices(t *testing.T) {
 	if !strings.Contains(block, "lxc.cgroup2.devices.allow = c 1:3 rwm") || !strings.Contains(block, "lxc.mount.entry = /dev/null dev/null none bind,create=file 0 0") {
 		t.Fatalf("device block:\n%s", block)
 	}
-	if strings.Contains(block, "lxc.hook") {
-		t.Errorf("a devices-only block carries the mount hook:\n%s", block)
+	// m-6: a devices-only container runs the hook too (it re-judges them).
+	if !strings.Contains(block, "lxc.hook.pre-start") {
+		t.Errorf("a devices-only block lacks the start hook:\n%s", block)
 	}
 	// Exact listing only: /dev/zero is under /dev but not listed, and a
 	// listed entry is never a prefix of another node's name.

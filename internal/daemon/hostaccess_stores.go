@@ -58,18 +58,22 @@ func (d *Daemon) storeDenyDynamic() []string {
 	return out
 }
 
-// vmDiskBlockInUse reports a VM disk on this host that is the block device
-// major:minor, compared by device number (never by path, which a symlink or
-// a rename changes). A read that fails refuses.
+// vmDiskBlockInUse reports a VM disk — any VM's in the cluster, so a shared
+// LUN backing a VM on another host counts — that is the block device
+// major:minor here, compared by device number (never by path, which a
+// symlink or a rename changes). A read that fails refuses.
 func (d *Daemon) vmDiskBlockInUse(major, minor uint32) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	disks, err := corrosion.HostDiskPaths(ctx, d.db, d.cfg.HostName)
+	disks, err := corrosion.VMDiskPaths(ctx, d.db)
 	if err != nil {
 		return fmt.Sprintf("this host's VM disks cannot be read (%v)", err)
 	}
-	return diskWithNumber(disks, major, minor, lxc.BlockDeviceNumber)
+	return diskWithNumber(disks, major, minor, blockNumber)
 }
+
+// blockNumber reads a block node's number; tests replace it.
+var blockNumber = lxc.BlockDeviceNumber
 
 // diskWithNumber names the VM whose disk is the device major:minor, or "".
 func diskWithNumber(disks map[string]string, major, minor uint32, number func(string) (uint32, uint32, bool)) string {
@@ -79,4 +83,26 @@ func diskWithNumber(disks map[string]string, major, minor uint32, number func(st
 		}
 	}
 	return ""
+}
+
+// hookPolicyRefreshInterval is how often every container's start-hook policy
+// is rewritten from its record and this host's stores.
+const hookPolicyRefreshInterval = time.Minute
+
+// refreshHookPolicies keeps every container's start-hook policy current: at
+// daemon start, then once a minute, so a pool or repo created, or a prefix
+// withdrawn, reaches what an in-container reboot is judged against.
+func refreshHookPolicies(ctx context.Context, r interface{ RefreshHookPolicies() error }) {
+	t := time.NewTicker(hookPolicyRefreshInterval)
+	defer t.Stop()
+	for {
+		if err := r.RefreshHookPolicies(); err != nil {
+			slog.Warn("container host access: refreshing the start hook's policies", "err", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
 }

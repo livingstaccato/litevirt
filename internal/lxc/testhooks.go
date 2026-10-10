@@ -86,11 +86,16 @@ func UseSubIDFilesForTest(t Cleanuper, dir string) {
 	t.Cleanup(func() { subUIDPath, subGIDPath, subIDsWanted = oldU, oldG, oldW })
 }
 
-// TrustHookBinaryForTest accepts any start-hook binary until t's cleanup: a
-// test driving the real runtime as an unprivileged user has no root-owned
-// binary to name.
+// TrustHookBinaryForTest accepts any start-hook binary, and keeps the hook
+// policy files in a private temporary directory, until t's cleanup: a test
+// driving the real runtime as an unprivileged user has no root-owned binary to
+// name and cannot write /run/litevirt.
 func TrustHookBinaryForTest(t Cleanuper) {
-	old := validateHookBinary
+	old, oldDir := validateHookBinary, hookPolicyDir
 	validateHookBinary = func(string) error { return nil }
-	t.Cleanup(func() { validateHookBinary = old })
+	if dir, err := os.MkdirTemp("", "lv-hook-policy-"); err == nil {
+		hookPolicyDir = dir
+		t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	}
+	t.Cleanup(func() { validateHookBinary, hookPolicyDir = old, oldDir })
 }

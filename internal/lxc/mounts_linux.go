@@ -44,10 +44,10 @@ func probeMountAPI() error {
 
 // openBeneath opens rel beneath the allowed prefix — the prefix itself with
 // no symlink anywhere in it, and rel with no symlink, no magic link and no
-// escape, and no crossing into another mount (RESOLVE_NO_XDEV: a filesystem
-// mounted over a path beneath the prefix after it was judged is not the tree
-// that was judged) — as an O_PATH fd. A symlink swapped in anywhere along the
-// way is refused by the kernel (ELOOP / EXDEV), never followed.
+// escape — as an O_PATH fd. A symlink swapped in anywhere along the way is
+// refused by the kernel (ELOOP / EXDEV), never followed. A filesystem mounted
+// beneath the prefix (a NAS) is crossed: what was opened is judged by the
+// path the kernel resolved it to (stageMount, hookPolicy.judgeOpened).
 func openBeneath(prefix, rel string) (int, error) {
 	dirfd, err := unix.Openat2(unix.AT_FDCWD, prefix, &unix.OpenHow{
 		Flags:   unix.O_PATH | unix.O_DIRECTORY | unix.O_CLOEXEC,
@@ -59,7 +59,7 @@ func openBeneath(prefix, rel string) (int, error) {
 	defer unix.Close(dirfd)
 	fd, err := unix.Openat2(dirfd, rel, &unix.OpenHow{
 		Flags:   unix.O_PATH | unix.O_CLOEXEC,
-		Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_MAGICLINKS | unix.RESOLVE_NO_XDEV,
+		Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_MAGICLINKS,
 	})
 	if err != nil {
 		return -1, fmt.Errorf("open %s beneath %s: %w", rel, prefix, err)
@@ -150,12 +150,21 @@ func unmountAll(p string) {
 // beneath the prefix, clone exactly that tree (no submounts), set its
 // attributes, move it into place. Nothing between the open and the mount
 // goes through a path a container could rename.
-func stageMount(m hookMount) error {
+func stageMount(m hookMount, policy hookPolicy) error {
 	fd, err := openBeneath(m.prefix, m.rel)
 	if err != nil {
 		return err
 	}
 	defer unix.Close(fd)
+	// Judge what was opened, by the path the kernel resolved it to: a store
+	// or protected tree mounted over the source is refused here.
+	opened, err := openedPath(fd)
+	if err != nil {
+		return fmt.Errorf("resolve the opened %s/%s: %w", m.prefix, m.rel, err)
+	}
+	if err := policy.judgeOpened(m.prefix, opened); err != nil {
+		return err
+	}
 	var st unix.Stat_t
 	if err := unix.Fstat(fd, &st); err != nil {
 		return err
@@ -237,18 +246,26 @@ func RunHook(args []string) int {
 	// Re-judged against this host's policy as it is now (the daemon rewrites
 	// it before every start it drives), not against the config: a reboot from
 	// inside the container runs this hook with no daemon in the loop.
-	policy, err := readHookPolicy()
+	policy, err := readHookPolicy(name)
 	if err != nil {
 		hookLog("%s: refusing to start: %v", name, err)
 		return 1
 	}
 	for _, m := range mounts {
+		if err := policy.coversMount(m); err != nil {
+			hookLog("%s: refusing to start: %v", name, err)
+			return 1
+		}
 		if err := policy.judgeMount(m.prefix, filepath.Join(m.prefix, m.rel)); err != nil {
 			hookLog("%s: refusing to start: %v", name, err)
 			return 1
 		}
 	}
 	for _, d := range devices {
+		if err := policy.coversDevice(d); err != nil {
+			hookLog("%s: refusing to start: %v", name, err)
+			return 1
+		}
 		if err := policy.judgeDevice(d.source, d.kind, d.major, d.minor); err != nil {
 			hookLog("%s: refusing to start: %v", name, err)
 			return 1
@@ -267,7 +284,7 @@ func RunHook(args []string) int {
 			hookLog("%s: entry %d names %s, not %s", name, i, m.staging, want)
 			return 1
 		}
-		if err := stageMount(m); err != nil {
+		if err := stageMount(m, policy); err != nil {
 			// Unwind what was staged: a failed start leaves no host mount
 			// behind for post-stop (which LXC does not run) to miss.
 			clearStaging(dir)
@@ -289,6 +306,11 @@ func hookLog(format string, args ...any) {
 		_ = w.Warning(msg)
 		_ = w.Close()
 	}
+}
+
+// openedPath is the path the kernel resolved an O_PATH fd to.
+func openedPath(fd int) (string, error) {
+	return os.Readlink(fmt.Sprintf("/proc/self/fd/%d", fd))
 }
 
 // clearStaging takes a container's staging mounts down and removes each

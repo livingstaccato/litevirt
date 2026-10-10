@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
@@ -70,5 +71,56 @@ func TestVMDiskBlockInUse_ByNumber(t *testing.T) {
 	db.Close()
 	if why := d.vmDiskBlockInUse(8, 16); why == "" {
 		t.Error("an unreadable VM disk list passed a block device")
+	}
+}
+
+// m-3. A VM disk anywhere in the cluster is matched, not only this host's:
+// on shared storage a LUN backing a VM on another host is visible here under
+// some path, and is that VM's disk by number.
+func TestVMDiskBlockInUse_ClusterWide(t *testing.T) {
+	ctx := context.Background()
+	db := corrosion.NewTestClientT(t)
+	if err := corrosion.InitSchema(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{Name: "far", HostName: "h2", State: "running"}, nil,
+		[]corrosion.DiskRecord{{VMName: "far", DiskName: "root", HostName: "h2", Path: "/dev/disk/by-path/ip-10.0.0.9-lun-3", StorageType: "local"}}); err != nil {
+		t.Fatal(err)
+	}
+	old := blockNumber
+	t.Cleanup(func() { blockNumber = old })
+	blockNumber = func(p string) (uint32, uint32, bool) {
+		if p == "/dev/disk/by-path/ip-10.0.0.9-lun-3" {
+			return 8, 112, true
+		}
+		return 0, 0, false
+	}
+	d := &Daemon{db: db, cfg: &Config{HostName: "h1"}}
+	if why := d.vmDiskBlockInUse(8, 112); why == "" {
+		t.Error("a LUN backing a VM on another host passed as unused")
+	}
+}
+
+type countingRefresher struct{ n chan struct{} }
+
+func (c countingRefresher) RefreshHookPolicies() error { c.n <- struct{}{}; return nil }
+
+// m-5. The daemon rewrites every container's start-hook policy as soon as it
+// starts, not only at the next container start or tick.
+func TestRefreshHookPolicies_RunsAtStart(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	r := countingRefresher{n: make(chan struct{}, 4)}
+	done := make(chan struct{})
+	go func() { refreshHookPolicies(ctx, r); close(done) }()
+	select {
+	case <-r.n:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the hook policies were not refreshed at daemon start")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the refresh loop did not stop with its context")
 	}
 }

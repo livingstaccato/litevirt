@@ -371,8 +371,12 @@ func TestUpdateVM_MemoryHotplugLive(t *testing.T) {
 			t.Fatalf("%s: plugged %d MiB after shrink; want 1024", name, got)
 		}
 		for _, bad := range []int32{8192, 512, 2049} {
-			if _, err := s.UpdateVM(ctx, &pb.UpdateVMRequest{Name: name, MemoryMib: bad}); err == nil {
-				t.Errorf("%s: live resize to %d MiB accepted; outside the band or misaligned", name, bad)
+			_, err := s.UpdateVM(ctx, &pb.UpdateVMRequest{Name: name, MemoryMib: bad})
+			if c := status.Code(err); c != codes.FailedPrecondition && c != codes.InvalidArgument {
+				t.Errorf("%s: live resize to %d MiB = %v; want refused up front (outside the band or misaligned)", name, bad, err)
+			}
+			if got := loadStoredSpec(t, s, name).MemoryMib; got != 2048 {
+				t.Errorf("%s: a refused resize to %d MiB left the stored memory at %d", name, bad, got)
 			}
 		}
 	}

@@ -204,6 +204,10 @@ func TestSetVMMemory_NoVirtioMemFailsFastWithoutWedging(t *testing.T) {
 		if got := loadStoredSpec(t, s, "dr").MemoryMib; got != 1024 {
 			t.Fatalf("coordinated=%v: the refusal committed memory %d", coordinated, got)
 		}
+		// Refused before anything began: no operation was ever opened.
+		if rows, err := s.db.Query(ctx, `SELECT id FROM operations WHERE resource_id = ?`, "dr"); err != nil || len(rows) != 0 {
+			t.Fatalf("coordinated=%v: %d operation(s) opened for a refused resize (err %v)", coordinated, len(rows), err)
+		}
 	}
 }
 

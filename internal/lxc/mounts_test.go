@@ -463,3 +463,35 @@ func TestWithHostAccessBlock_ReplacesEarlierBlock(t *testing.T) {
 		t.Fatalf("unrelated lines lost:\n%s", cfg)
 	}
 }
+
+// An import strips the archive it lays down: a container exported with a raw
+// mount entry, a forged managed block and an authorized-host-access record
+// comes back with none of them.
+func TestImport_StripsHostAccessFromTheArchive(t *testing.T) {
+	r := &LxcRunner{Lxcpath: filepath.Join(t.TempDir(), "src"), IDMappedRootfs: "off"}
+	tpl := mkRootfs(t, filepath.Join(t.TempDir(), "tpl"))
+	if _, err := r.Create(t.Context(), CreateOpts{Name: "c1", Template: tpl}); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(r.Lxcpath, "c1")
+	f, _ := os.OpenFile(filepath.Join(dir, "config"), os.O_APPEND|os.O_WRONLY, 0o644)
+	_, _ = f.WriteString("lxc.mount.entry = / host none rbind,rw 0 0\n" + mountBlockBegin + "\n# litevirt:mount rw dir / .\nlxc.mount.entry = /run/litevirt/ct/c1/m0 h none bind 0 0\n" + mountBlockEnd + "\n")
+	f.Close()
+	_ = os.WriteFile(filepath.Join(dir, hostAccessFile), []byte(`{"mounts":[{"host_path":"/","container_path":"/h"}]}`), 0o600)
+	var archive strings.Builder
+	w := &stringWriter{&archive}
+	if err := r.ExportContainer(t.Context(), "c1", w); err != nil {
+		t.Fatal(err)
+	}
+	dst := &LxcRunner{Lxcpath: filepath.Join(t.TempDir(), "dst"), IDMappedRootfs: "off"}
+	if err := dst.ImportContainer(t.Context(), "c1", strings.NewReader(archive.String())); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(filepath.Join(dst.Lxcpath, "c1", "config"))
+	if strings.Contains(string(b), "lxc.mount.entry") || strings.Contains(string(b), mountBlockBegin) {
+		t.Fatalf("the imported config kept host access:\n%s", b)
+	}
+	if _, err := os.Stat(filepath.Join(dst.Lxcpath, "c1", hostAccessFile)); !os.IsNotExist(err) {
+		t.Fatalf("the imported record survived: %v", err)
+	}
+}

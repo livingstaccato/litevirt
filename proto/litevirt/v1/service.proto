@@ -2224,6 +2224,18 @@ message RecoveryClaimValue {
     string lease_key        = 11;
     string source_host      = 12;
     VoterConfigValue voter_config = 13;
+    // An iSCSI LUN allocation: the value a key of target_kind "lun" decides.
+    LUNAllocationValue lun = 14;
+}
+// LUNAllocationValue is which disk of which VM one allocation of a LUN is.
+message LUNAllocationValue {
+    string lun        = 1;  // storage.FixedDevice key: target and LUN number
+    int64  generation = 2;  // the key's allocation generation
+    string claim_id   = 3;  // the create that proposed it
+    string vm_id      = 4;  // the VM's uuid
+    string vm_name    = 5;
+    string disk       = 6;
+    string host       = 7;  // the host that ran the create
 }
 // ClaimAccept is one voter's signed accept.
 message ClaimAccept {
@@ -3905,12 +3917,11 @@ service LiteVirt {
 
     // ── iSCSI LUN holders (peer-only) ──
     //
-    // An iscsi pool is one LUN: every disk created on it IS that LUN. A create
-    // putting a disk on one first asks every other host which VMs hold the
-    // LUN — in its replica, and in a create of its own still in flight — so two
-    // creates on two hosts cannot both take it. A host on an older build
-    // answers Unimplemented; its committed disks still reach the asker by
-    // replication.
+    // An iscsi pool is one LUN: every disk created on it IS that LUN, and a
+    // create takes it by a voter-majority claim (target_kind "lun"). A LUN
+    // already decided for another create is free again only once that create
+    // is proven gone: the creating host is asked which VMs hold the LUN — in
+    // its replica, and in a create of its own still in flight.
     rpc LUNHolders(LUNHoldersRequest) returns (LUNHoldersResponse);
 
     // ── Re-create judgement (peer-only) ──
@@ -4615,10 +4626,11 @@ message ImportLeftoverStatusResponse {
 message LUNHoldersRequest {
     // LUN keys (storage.FixedDevice), at most 64.
     repeated string luns = 1;
-    // The VM being created. Its own disk rows — the incarnation a rebuild or a
-    // recreate replaces — hold nothing against it. An in-flight create of the
-    // same name on the answering host still does.
-    string vm_name = 2;
+    // The incarnation a rebuild or a recreate replaces — name and created_at,
+    // both or neither. Only that incarnation's own disk rows hold nothing
+    // against the asker; no name alone exempts anything.
+    string replaced_name       = 2;
+    string replaced_created_at = 3;
 }
 message LUNHolder {
     string lun       = 1;
@@ -4628,6 +4640,10 @@ message LUNHolder {
     string host_name = 4;
     // A create on the answering host holds it and has not committed yet.
     bool   in_flight = 5;
+    // The VM's uuid, where the answering host knows it.
+    string vm_id     = 6;
+    // The VM reads the LUN as its disk's base (a linked clone), not as its disk.
+    bool   backing   = 7;
 }
 message LUNHoldersResponse {
     repeated LUNHolder holders = 1;

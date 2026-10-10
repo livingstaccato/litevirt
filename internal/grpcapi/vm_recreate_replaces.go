@@ -19,6 +19,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
+	"github.com/litevirt/litevirt/internal/storage"
 )
 
 // A rebuild (RebuildVM) and a rolling recreate (serverOps.recreateAs)
@@ -64,6 +65,11 @@ type replacedVMKey struct{}
 type replacedVM struct {
 	name string
 	snap corrosion.VMDeleteSnapshot
+	// uuid is the incarnation's VM id and luns its iSCSI LUNs (LUN key →
+	// disk name): what lets the new incarnation take its own LUNs over
+	// (vm_lun_claim.go). Empty when unknown — then it takes over nothing.
+	uuid string
+	luns map[string]string
 }
 
 // withReplacedVM returns ctx carrying vm's identity into the create that
@@ -172,18 +178,49 @@ func acceptDeletedVMHeader(ctx context.Context, name string, hdr metadata.MD) {
 	}
 }
 
+// withReplacedLUNs adds to the replaced VM ctx carries for vm.Name the
+// incarnation's VM id (vm's spec uuid) and its iSCSI LUNs — from vm's disk
+// rows in this replica, tombstoned ones included — so the create that
+// re-creates it can take its own LUNs over. vm must be the incarnation ctx
+// carries (same created_at); anything else is left as it is.
+func (s *Server) withReplacedLUNs(ctx context.Context, vm *corrosion.VMRecord) context.Context {
+	if vm == nil {
+		return ctx
+	}
+	r, ok := replacedVMFor(ctx, vm.Name)
+	if !ok || r.snap.CreatedAt != vm.CreatedAt {
+		return ctx
+	}
+	if spec := vmSpecFor(vm); spec != nil {
+		r.uuid = spec.GetUuid()
+	}
+	if disks, err := corrosion.VMIncarnationDisks(ctx, s.db, vm.Name, vm.CreatedAt); err == nil {
+		for _, d := range disks {
+			if k, ok := storage.FixedDeviceKeyOfPath(d.Path); ok {
+				if r.luns == nil {
+					r.luns = map[string]string{}
+				}
+				r.luns[k] = d.DiskName
+			}
+		}
+	}
+	return context.WithValue(ctx, replacedVMKey{}, r)
+}
+
 // replacedVMMD is the metadata key that hands a replacedVM to the host a
 // re-create is forwarded to. That host honours it only from a peer host
 // (acceptReplacedVMMD), which hands one over only for a VM it has deleted.
 const replacedVMMD = "x-litevirt-recreate-replaces"
 
 type replacedVMWire struct {
-	Name           string `json:"name"`
-	CreatedAt      string `json:"created_at"`
-	HostName       string `json:"host_name"`
-	OwnerEpoch     int64  `json:"owner_epoch"`
-	SpecGeneration int64  `json:"spec_generation"`
-	IdentityHash   string `json:"identity_hash"`
+	Name           string            `json:"name"`
+	CreatedAt      string            `json:"created_at"`
+	HostName       string            `json:"host_name"`
+	OwnerEpoch     int64             `json:"owner_epoch"`
+	SpecGeneration int64             `json:"spec_generation"`
+	IdentityHash   string            `json:"identity_hash"`
+	UUID           string            `json:"uuid,omitempty"`
+	LUNs           map[string]string `json:"luns,omitempty"`
 }
 
 // withReplacedVMMD returns ctx with the replaced VM ctx holds for name added
@@ -196,6 +233,7 @@ func withReplacedVMMD(ctx context.Context, name string) context.Context {
 	b, err := json.Marshal(replacedVMWire{
 		Name: r.name, CreatedAt: r.snap.CreatedAt, HostName: r.snap.HostName,
 		OwnerEpoch: r.snap.OwnerEpoch, SpecGeneration: r.snap.SpecGeneration, IdentityHash: r.snap.IdentityHash,
+		UUID: r.uuid, LUNs: r.luns,
 	})
 	if err != nil {
 		return ctx
@@ -225,7 +263,7 @@ func (s *Server) acceptReplacedVMMD(ctx context.Context) context.Context {
 	return context.WithValue(ctx, replacedVMKey{}, replacedVM{name: w.Name, snap: corrosion.VMDeleteSnapshot{
 		CreatedAt: w.CreatedAt, HostName: w.HostName, OwnerEpoch: w.OwnerEpoch,
 		SpecGeneration: w.SpecGeneration, IdentityHash: w.IdentityHash,
-	}})
+	}, uuid: w.UUID, luns: w.LUNs})
 }
 
 func (s *Server) replacedTombstoneWaitBound() time.Duration {

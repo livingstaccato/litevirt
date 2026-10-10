@@ -38,7 +38,7 @@ func newLUNDisks(t *testing.T) *lunDisks {
 		}
 		return os.Open(f)
 	}
-	writeImageToDevice = func(_ context.Context, image, device string) error {
+	writeImageToDevice = func(_ context.Context, image, _, device string) error {
 		d.writes = append(d.writes, image+" → "+device)
 		f, err := os.OpenFile(d.files[device], os.O_WRONLY, 0)
 		if err != nil {

@@ -337,6 +337,14 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			return nil, status.Errorf(codes.FailedPrecondition,
 				"resolved create owner %q does not match local host %q", targetHost, s.hostName)
 		}
+		// An overwrite is audited where it was asked for, as the caller it was
+		// asked by, as well as on the owner that writes (writeImageOntoLUN).
+		for _, d := range spec.Disks {
+			if d.Overwrite && d.Storage != "" {
+				s.audit(ctx, "vm.create", spec.Name, fmt.Sprintf("overwrite requested for disk %s on storage %s; forwarded to %s",
+					d.Name, d.Storage, targetHost), "forwarded")
+			}
+		}
 		return s.forwardCreateVM(ctx, req, targetHost)
 	}
 	// Stable domain identity (G1): persisted in the spec so libvirt's default
@@ -385,7 +393,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// refuse naming the VM that holds it, before anything is created. Held
 	// until this create returns, by when its disk rows are committed here
 	// (vm_lun_claim.go).
-	releaseLUNs, ownLUNs, err := s.claimLUNs(ctx, spec)
+	releaseLUNs, keepLUNs, err := s.claimLUNs(ctx, spec)
 	if err != nil {
 		return nil, err
 	}
@@ -498,9 +506,9 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			if key, _, fixed := storage.FixedDevice(volCfg); fixed && err == nil {
 				fixedDevice = true
 				if sourceImage != "" {
-					if ownLUNs[key] {
-						slog.Warn("iSCSI root disk: the LUN is this VM's own previous disk; not writing the image over it",
-							"vm", spec.Name, "lun", diskPath)
+					if keepLUNs[key] {
+						slog.Info("iSCSI root disk: the re-created VM takes its previous incarnation's LUN over as it is; "+
+							"nothing is written", "vm", spec.Name, "disk", d.Name, "lun", diskPath)
 					} else if werr := s.writeImageOntoLUN(ctx, spec.Name, d.Name, spec.Image, sourceImage, diskPath, d.Overwrite); werr != nil {
 						cleanupDisks()
 						return nil, werr
@@ -1017,8 +1025,15 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		spec.Machine = pinned
 	}
 
-	// Serialize spec to JSON for storage
-	specJSON, _ := json.Marshal(spec)
+	// Serialize spec to JSON for storage. A disk's overwrite is a one-shot
+	// acknowledgement for this create, never a standing permission: a rebuild
+	// or a rolling recreate re-creates from the stored spec, and must not
+	// re-image a LUN because a create once said overwrite.
+	stored := proto.Clone(spec).(*pb.VMSpec)
+	for _, d := range stored.Disks {
+		d.Overwrite = false
+	}
+	specJSON, _ := json.Marshal(stored)
 
 	// Write to corrosion. Inserted "creating", not "running": the row lands at the
 	// vm_owner_epoch default of 0, and assignOwnerEpochAtCreate publishes it
@@ -3302,6 +3317,11 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 		st := status.Convert(err)
 		return nil, status.Errorf(st.Code(), "cannot rebuild %q: %s; nothing was changed", req.Name, st.Message())
 	}
+	// Its iSCSI LUNs too: a LUN the create would refuse is refused now.
+	if err := s.preflightLUNs(rctx, spec, vm); err != nil {
+		st := status.Convert(err)
+		return nil, status.Errorf(st.Code(), "cannot rebuild %q: %s; nothing was changed", req.Name, st.Message())
+	}
 
 	// Stop and undefine the current domain.
 	if vm.State == "running" {
@@ -3349,9 +3369,9 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	// The VM replaced is the row the delete actually tombstoned (its guard
 	// re-reads under the CAS); nil only when the row was already gone.
 	if deleted != nil {
-		rctx = withReplacedVM(rctx, deleted)
+		rctx = s.withReplacedLUNs(withReplacedVM(rctx, deleted), deleted)
 	} else {
-		rctx = withReplacedVM(rctx, vm)
+		rctx = s.withReplacedLUNs(withReplacedVM(rctx, vm), vm)
 	}
 	var out *pb.VM
 	if placed {

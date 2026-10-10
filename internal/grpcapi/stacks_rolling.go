@@ -69,6 +69,9 @@ func (o *serverOps) recreateAs(ctx context.Context, target, source string, desir
 				perr = o.s.recreatePreflight(ctx, spec, host)
 			}
 		}
+		if perr == nil {
+			perr = o.s.preflightLUNs(ctx, spec, cur)
+		}
 		if perr != nil {
 			st := status.Convert(perr)
 			return status.Errorf(st.Code(), "recreate %s: %s; nothing was deleted", target, st.Message())
@@ -98,6 +101,7 @@ func (o *serverOps) recreateAs(ctx context.Context, target, source string, desir
 		} else {
 			ctx = withReplacedVM(ctx, cur)
 		}
+		ctx = o.s.withReplacedLUNs(ctx, cur)
 	}
 	var err error
 	if decision != nil {

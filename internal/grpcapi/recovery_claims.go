@@ -204,6 +204,12 @@ func valueFromPB(v *pb.RecoveryClaimValue) *corrosion.ClaimValue {
 	if v == nil {
 		return nil
 	}
+	if l := v.GetLun(); l != nil {
+		return &corrosion.ClaimValue{LUN: &corrosion.LUNAllocation{
+			LUN: l.GetLun(), Generation: l.GetGeneration(), ClaimID: l.GetClaimId(), VMID: l.GetVmId(),
+			VMName: l.GetVmName(), Disk: l.GetDisk(), Host: l.GetHost(),
+		}}
+	}
 	if cfg := v.GetVoterConfig(); cfg != nil {
 		return &corrosion.ClaimValue{Config: &corrosion.VoterConfigValue{
 			Generation: cfg.GetGeneration(), Members: corrosion.SortMembers(membersFromPB(cfg.GetMembers())),
@@ -223,6 +229,12 @@ func valueFromPB(v *pb.RecoveryClaimValue) *corrosion.ClaimValue {
 func valueToPB(v *corrosion.ClaimValue) *pb.RecoveryClaimValue {
 	if v == nil {
 		return nil
+	}
+	if l := v.LUN; l != nil {
+		return &pb.RecoveryClaimValue{Lun: &pb.LUNAllocationValue{
+			Lun: l.LUN, Generation: l.Generation, ClaimId: l.ClaimID, VmId: l.VMID,
+			VmName: l.VMName, Disk: l.Disk, Host: l.Host,
+		}}
 	}
 	if v.Config != nil {
 		c := v.Config

@@ -560,6 +560,10 @@ type Server struct {
 	// lunClaims holds the iscsi LUNs this host's in-flight creates are taking,
 	// until their disk rows commit (vm_lun_claim.go).
 	lunClaims lunClaimRegistry
+	// releaseFeatureGate opens a release feature (SetReleaseFeatureGate); nil
+	// opens none.
+	releaseFeatureMu   sync.Mutex
+	releaseFeatureGate func(ctx context.Context, feature string) error
 	// rootfsSizes caches InspectContainer's measured rootfs sizes by path for
 	// rootfsSizeTTL; rootfsSizeMu guards it and serialises the walks.
 	rootfsSizeMu sync.Mutex

@@ -904,12 +904,11 @@ type LiteVirtClient interface {
 	ImportLeftoverStatus(ctx context.Context, in *ImportLeftoverStatusRequest, opts ...grpc.CallOption) (*ImportLeftoverStatusResponse, error)
 	// ── iSCSI LUN holders (peer-only) ──
 	//
-	// An iscsi pool is one LUN: every disk created on it IS that LUN. A create
-	// putting a disk on one first asks every other host which VMs hold the
-	// LUN — in its replica, and in a create of its own still in flight — so two
-	// creates on two hosts cannot both take it. A host on an older build
-	// answers Unimplemented; its committed disks still reach the asker by
-	// replication.
+	// An iscsi pool is one LUN: every disk created on it IS that LUN, and a
+	// create takes it by a voter-majority claim (target_kind "lun"). A LUN
+	// already decided for another create is free again only once that create
+	// is proven gone: the creating host is asked which VMs hold the LUN — in
+	// its replica, and in a create of its own still in flight.
 	LUNHolders(ctx context.Context, in *LUNHoldersRequest, opts ...grpc.CallOption) (*LUNHoldersResponse, error)
 	// ── Re-create judgement (peer-only) ──
 	//
@@ -4755,12 +4754,11 @@ type LiteVirtServer interface {
 	ImportLeftoverStatus(context.Context, *ImportLeftoverStatusRequest) (*ImportLeftoverStatusResponse, error)
 	// ── iSCSI LUN holders (peer-only) ──
 	//
-	// An iscsi pool is one LUN: every disk created on it IS that LUN. A create
-	// putting a disk on one first asks every other host which VMs hold the
-	// LUN — in its replica, and in a create of its own still in flight — so two
-	// creates on two hosts cannot both take it. A host on an older build
-	// answers Unimplemented; its committed disks still reach the asker by
-	// replication.
+	// An iscsi pool is one LUN: every disk created on it IS that LUN, and a
+	// create takes it by a voter-majority claim (target_kind "lun"). A LUN
+	// already decided for another create is free again only once that create
+	// is proven gone: the creating host is asked which VMs hold the LUN — in
+	// its replica, and in a create of its own still in flight.
 	LUNHolders(context.Context, *LUNHoldersRequest) (*LUNHoldersResponse, error)
 	// ── Re-create judgement (peer-only) ──
 	//

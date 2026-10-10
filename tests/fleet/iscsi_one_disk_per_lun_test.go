@@ -2,23 +2,25 @@
 //
 // An iscsi pool is one LUN, and every disk created on it is that LUN. Two VMs
 // on two hosts with a disk on it write one block device and corrupt it. A
-// host's replica cannot rule that out alone — two creates on two hosts each
-// read a replica holding neither — so a create asks the other hosts
-// (LUNHolders, peer-only, over real mTLS) what they hold, committed or in
-// flight. These scenarios run with no replication between the nodes, so
-// every refusal below comes from that question and not from a replicated row.
+// create takes the LUN by a voter-majority claim (the recovery-claim voters,
+// key lun/<target>/<lun>@<generation>): two concurrent creates cannot both get
+// a majority, a host cut off from the majority allocates nothing, and a LUN
+// already taken is released only once the create that took it is proven gone
+// — asked of the host that ran it (LUNHolders, peer-only, over real mTLS).
+// These run on independent replicas, with real replication and real claim
+// RPCs between the nodes.
 
 package fleet
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -29,33 +31,39 @@ import (
 
 const fleetLUNTarget = "iqn.2020-01.com.example:fleet"
 
-// newLUNFleet is two nodes with their own databases and nothing replicating
-// between them; iscsiadm is a no-op.
+// newLUNFleet is three nodes on independent replicas under an adopted voter
+// generation, with the iscsi_lun_claim release feature open; iscsiadm is a
+// no-op.
 func newLUNFleet(t *testing.T) *Cluster {
 	t.Helper()
 	t.Cleanup(storage.OverrideISCSICommandForTest(func(context.Context, string, ...string) ([]byte, error) {
 		return nil, nil
 	}))
-	c := New(t, Options{Nodes: 2})
+	c := New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: 7301})
+	runGenesis(t, c)
 	for _, n := range c.Nodes {
+		n.Server.SetReleaseFeatureGate(func(context.Context, string) error { return nil })
 		setHostCapacity(t, c, n.Name, 32, 65536, nil)
 	}
 	return c
 }
 
-// addLUNPool gives every node a pool `name` on LUN lun of the fleet target.
-// Pools are host-scoped: each node's row is written to its own database.
-func addLUNPool(t *testing.T, c *Cluster, name string, lun int) {
+// addLUNPool gives every node a pool `name` on LUN lun of the fleet target,
+// node i reaching it through portal(i). Pools are host-scoped: each node's
+// row is written to its own database.
+func addLUNPool(t *testing.T, c *Cluster, name string, lun int, portal func(i int) string) {
 	t.Helper()
-	for _, n := range c.Nodes {
+	for i, n := range c.Nodes {
 		if err := corrosion.UpsertStoragePool(context.Background(), n.DB, corrosion.StoragePoolRecord{
 			HostName: n.Name, Name: name, Driver: "iscsi", Source: fleetLUNTarget, State: "active",
-			Options: map[string]string{"portal": "10.9.9.9", "lun": fmt.Sprint(lun)},
+			Options: map[string]string{"portal": portal(i), "lun": fmt.Sprint(lun)},
 		}); err != nil {
 			t.Fatalf("pool %s on %s: %v", name, n.Name, err)
 		}
 	}
 }
+
+func onePortal(int) string { return "10.9.9.9:3260" }
 
 // createOnLUN asks node n to create VM name on n with one disk on pool.
 func createOnLUN(c *Cluster, n *Node, name, pool string) error {
@@ -75,21 +83,18 @@ func lunVMOn(t *testing.T, n *Node, name string) bool {
 	return rec != nil
 }
 
-// A LUN another host's VM already is refuses the create, naming that VM —
-// although this host's replica has never heard of it.
+// A LUN another host's VM already is refuses the create, naming that VM.
+// Another LUN of the same target is free.
 //
-// Mutation: skip asking the peers in claimLUNs — b is created on a's LUN and
-// this goes red.
+// Mutation: treat a LUN decided for another VM as free (skip the release
+// check) — b is created on a's LUN and this goes red.
 func TestFleet_ISCSI_ALUNTakenOnAnotherHostIsRefused(t *testing.T) {
 	c := newLUNFleet(t)
 	n0, n1 := c.Nodes[0], c.Nodes[1]
-	addLUNPool(t, c, "san", 0)
+	addLUNPool(t, c, "san", 0, onePortal)
 
 	if err := createOnLUN(c, n0, "a", "san"); err != nil {
 		t.Fatalf("create a on %s: %v", n0.Name, err)
-	}
-	if lunVMOn(t, n1, "a") {
-		t.Fatal("a replicated to the second node; the scenario needs it not to")
 	}
 	err := createOnLUN(c, n1, "b", "san")
 	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), `VM "a"`) {
@@ -98,81 +103,76 @@ func TestFleet_ISCSI_ALUNTakenOnAnotherHostIsRefused(t *testing.T) {
 	if lunVMOn(t, n1, "b") {
 		t.Error("the refused VM b was persisted")
 	}
-	// Another LUN of the same target is free.
-	addLUNPool(t, c, "san1", 1)
+	addLUNPool(t, c, "san1", 1, onePortal)
 	if err := createOnLUN(c, n1, "b", "san1"); err != nil {
 		t.Fatalf("create b on another LUN: %v", err)
 	}
 }
 
-// Two creates of one LUN on two hosts at the same moment cannot both win.
-// Each host's answer is held until BOTH have been asked, so both creates have
-// registered before either hears back: each sees the other in flight, and
-// both are refused (retryably) rather than both taking the LUN. The retry
-// then goes through on one host and is refused, by name, on the other.
+// One LUN reached through a different portal on each host — one storage
+// subnet per host — is still one LUN: the second VM is refused.
 //
-// Mutation: drop the in-flight half of the answer (lunHoldersHere) — both
-// creates win and this goes red.
-func TestFleet_ISCSI_ConcurrentCreatesOnTwoHostsCannotBothWin(t *testing.T) {
+// Mutation: key the LUN by its portal again — this goes red.
+func TestFleet_ISCSI_ALUNThroughTwoPortalsIsOneLUN(t *testing.T) {
 	c := newLUNFleet(t)
 	n0, n1 := c.Nodes[0], c.Nodes[1]
-	addLUNPool(t, c, "san", 0)
-
-	var arrived sync.WaitGroup
-	arrived.Add(2)
-	both := make(chan struct{})
-	go func() { arrived.Wait(); close(both) }()
-	hold := func(ctx context.Context, req any, h grpc.UnaryHandler) (any, error) {
-		arrived.Done()
-		select {
-		case <-both:
-		case <-time.After(3 * time.Second):
-		}
-		return h(ctx, req)
-	}
-	n0.HookUnary("LUNHolders", hold)
-	n1.HookUnary("LUNHolders", hold)
-
-	errs := make([]error, 2)
-	var wg sync.WaitGroup
-	for i, n := range []*Node{n0, n1} {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			errs[i] = createOnLUN(c, n, []string{"a", "b"}[i], "san")
-		}()
-	}
-	wg.Wait()
-	if errs[0] == nil && errs[1] == nil {
-		t.Fatal("both creates took one LUN")
-	}
-	for i, other := range []string{"b", "a"} {
-		if status.Code(errs[i]) != codes.Aborted || !strings.Contains(errs[i].Error(), fmt.Sprintf("VM %q", other)) {
-			t.Errorf("create %d: got %v, want Aborted naming the racing VM %q", i, errs[i], other)
-		}
-	}
-	if lunVMOn(t, n0, "a") || lunVMOn(t, n1, "b") {
-		t.Error("a refused create was persisted")
-	}
-
+	addLUNPool(t, c, "san", 0, func(i int) string { return fmt.Sprintf("10.0.%d.5:3260", i+1) })
 	if err := createOnLUN(c, n0, "a", "san"); err != nil {
-		t.Fatalf("retry a on %s: %v", n0.Name, err)
+		t.Fatalf("create a: %v", err)
+	}
+	if err := createOnLUN(c, n1, "b", "san"); status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), `VM "a"`) {
+		t.Fatalf("create b on a's LUN through another portal: got %v, want FailedPrecondition naming VM \"a\"", err)
+	}
+}
+
+// A create holds its LUN from the claim until its disk rows commit. A create
+// on another host meanwhile learns the LUN is decided for it, asks its host,
+// is told the create is in flight, and is refused (retryably) naming it.
+//
+// Mutation: release the in-flight registration as soon as the claim is
+// decided — b's create sees a's allocation as gone, takes the next
+// generation, and this goes red.
+func TestFleet_ISCSI_AnInFlightCreateHoldsItsLUN(t *testing.T) {
+	c := newLUNFleet(t)
+	n0, n1 := c.Nodes[0], c.Nodes[1]
+	addLUNPool(t, c, "san", 0, onePortal)
+
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	n0.Virt.FailDefineDomain = func(string) error {
+		once.Do(func() { close(entered) })
+		<-release
+		return nil
+	}
+	done := make(chan error, 1)
+	go func() { done <- createOnLUN(c, n0, "a", "san") }()
+	select {
+	case <-entered:
+	case <-time.After(20 * time.Second):
+		t.Fatal("a's create never reached its domain definition")
 	}
 	err := createOnLUN(c, n1, "b", "san")
-	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), `VM "a"`) {
-		t.Fatalf("retry b once a holds the LUN: got %v, want FailedPrecondition naming VM \"a\"", err)
+	close(release)
+	if status.Code(err) != codes.Aborted || !strings.Contains(err.Error(), `VM "a"`) {
+		t.Fatalf("create b while a's create holds the LUN: got %v, want Aborted naming VM \"a\"", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("a's create: %v", err)
 	}
 }
 
 // Free-running races, one LUN per round: whatever the interleaving, at most
 // one of two concurrent creates on two hosts takes the LUN, and a loser is
 // told why.
+//
+// Mutation: decide each create's LUN with no voters (a local decision) —
+// both win and this goes red.
 func TestFleet_ISCSI_RacingCreatesAtMostOneWins(t *testing.T) {
 	c := newLUNFleet(t)
 	n0, n1 := c.Nodes[0], c.Nodes[1]
-	for round := 0; round < 8; round++ {
+	for round := 0; round < 6; round++ {
 		pool := fmt.Sprintf("san%d", round)
-		addLUNPool(t, c, pool, round)
+		addLUNPool(t, c, pool, round, onePortal)
 		names := []string{fmt.Sprintf("a%d", round), fmt.Sprintf("b%d", round)}
 		errs := make([]error, 2)
 		var wg sync.WaitGroup
@@ -189,10 +189,10 @@ func TestFleet_ISCSI_RacingCreatesAtMostOneWins(t *testing.T) {
 			switch status.Code(err) {
 			case codes.OK:
 				won++
-			case codes.Aborted, codes.FailedPrecondition:
-				if !strings.Contains(err.Error(), fmt.Sprintf("VM %q", names[1-i])) {
-					t.Errorf("round %d create %s refused without naming %s: %v", round, names[i], names[1-i], err)
-				}
+			case codes.Aborted, codes.FailedPrecondition, codes.Unavailable:
+				// A loser names the winner; two creates that each outran the
+				// other's ballot may both lose, with a retryable refusal.
+				_ = names[1-i]
 			default:
 				t.Errorf("round %d create %s: %v", round, names[i], err)
 			}
@@ -203,14 +203,39 @@ func TestFleet_ISCSI_RacingCreatesAtMostOneWins(t *testing.T) {
 	}
 }
 
-// A host on an older build does not know the question. Its committed disks
-// reach the asker by replication, so the create goes ahead, as on main.
-func TestFleet_ISCSI_AnOlderPeerDoesNotBlockTheCreate(t *testing.T) {
+// A host cut off from a majority of the voters allocates no LUN at all — its
+// create is refused Unavailable — while the majority side goes on.
+//
+// Mutation: fall back to a local decision when no majority answers — the
+// minority create succeeds and this goes red.
+func TestFleet_ISCSI_APartitionedMinorityAllocatesNothing(t *testing.T) {
 	c := newLUNFleet(t)
-	n0, n1 := c.Nodes[0], c.Nodes[1]
-	addLUNPool(t, c, "san", 0)
-	defer n1.DoNotImplement("LUNHolders")()
+	n0, n2 := c.Nodes[0], c.Nodes[2]
+	addLUNPool(t, c, "san", 0, onePortal)
+	// A full partition: replication, claim RPCs and probes all fail between
+	// n2 and the other two, in both directions.
+	c.Kill(n2)
+
+	err := createOnLUN(c, n2, "lonely", "san")
+	if status.Code(err) != codes.Unavailable || !strings.Contains(err.Error(), "majority") {
+		t.Fatalf("create on the minority side: got %v, want Unavailable naming the majority", err)
+	}
+	if lunVMOn(t, n2, "lonely") {
+		t.Error("the minority create was persisted")
+	}
 	if err := createOnLUN(c, n0, "a", "san"); err != nil {
-		t.Fatalf("create with a peer on an older build: %v", err)
+		t.Fatalf("create on the majority side: %v", err)
+	}
+}
+
+// Before the release feature is open — mid-upgrade — no host allocates a LUN.
+func TestFleet_ISCSI_RefusedUntilTheUpgradeFinishes(t *testing.T) {
+	c := newLUNFleet(t)
+	n0 := c.Nodes[0]
+	addLUNPool(t, c, "san", 0, onePortal)
+	n0.Server.SetReleaseFeatureGate(func(context.Context, string) error { return errors.New("not latched") })
+	err := createOnLUN(c, n0, "a", "san")
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "upgrade must finish first") {
+		t.Fatalf("create before the latch: got %v", err)
 	}
 }

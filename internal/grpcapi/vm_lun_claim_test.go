@@ -3,7 +3,12 @@ package grpcapi
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net"
+	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"google.golang.org/grpc"
@@ -12,7 +17,10 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/events"
+	"github.com/litevirt/litevirt/internal/image"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
+	"github.com/litevirt/litevirt/internal/pki"
 	"github.com/litevirt/litevirt/internal/storage"
 )
 
@@ -20,20 +28,52 @@ const lunTestTarget = "iqn.2020-01.com.example:store"
 
 // lunTestServer is a server on test-host with three iscsi pools: lun0 and
 // lun0b are the SAME LUN spelled two ways, lun1 is another LUN of the target.
-// iscsiadm is a no-op.
+// It is the one voter of an adopted generation (so it decides LUN claims
+// alone), the iscsi_lun_claim release feature is open, and iscsiadm is a
+// no-op.
 func lunTestServer(t *testing.T) *Server {
 	t.Helper()
 	t.Cleanup(storage.OverrideISCSICommandForTest(func(context.Context, string, ...string) ([]byte, error) {
 		return nil, nil
 	}))
-	s := testServerR2(t)
-	s.virt = libvirtfake.New()
+	db, err := corrosion.NewSharedTestClient(fmt.Sprintf("luntest-%d", lunTestDB.Add(1)), "test-host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
 	ctx := adminCtx()
+	if err := corrosion.InitSchema(ctx, db); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	dataDir := t.TempDir()
+	store := image.NewStore(dataDir)
+	store.Init()
+	s := &Server{
+		hostName: "test-host", dataDir: dataDir, db: db, images: store, events: events.NewBus(),
+		vmLocks: make(map[string]*sync.Mutex), bridgeEnsure: func(string) error { return nil },
+		virt: libvirtfake.New(),
+	}
+	pkiDir := t.TempDir()
+	caCert, caKey := filepath.Join(pkiDir, "ca.crt"), filepath.Join(pkiDir, "ca.key")
+	if err := pki.GenerateCA(caCert, caKey); err != nil {
+		t.Fatal(err)
+	}
+	if err := pki.GenerateHostCert(caCert, caKey, filepath.Join(pkiDir, "host.crt"), filepath.Join(pkiDir, "host.key"),
+		s.hostName, net.ParseIP("127.0.0.1")); err != nil {
+		t.Fatal(err)
+	}
+	s.pkiDir = pkiDir
 	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
 		Name: "test-host", Address: "10.0.0.9", State: "active", CPUTotal: 8, MemTotal: 65536,
 	}); err != nil {
 		t.Fatalf("InsertHost: %v", err)
 	}
+	inc, err := s.db.VoterIncarnation(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adoptTestGeneration(t, s, []corrosion.VoterMember{{Name: s.hostName, Incarnation: inc}})
+	s.releaseFeatureGate = func(context.Context, string) error { return nil }
 	for name, opts := range map[string]map[string]string{
 		"lun0":  {"portal": "10.0.0.1", "lun": "0"},
 		"lun0b": {"portal": "10.0.0.1:3260"},
@@ -46,6 +86,22 @@ func lunTestServer(t *testing.T) *Server {
 		}
 	}
 	return s
+}
+
+var lunTestDB atomic.Int64
+
+// readoptTestGeneration moves s to generation 2 with members.
+func readoptTestGeneration(t *testing.T, s *Server, members []corrosion.VoterMember) {
+	t.Helper()
+	ctx := context.Background()
+	val := corrosion.VoterConfigValue{Generation: 2, Members: corrosion.SortMembers(members),
+		Change: corrosion.VoterChangeGenesis, CreatedBy: "test", CreatedAt: "test"}
+	if err := corrosion.WriteVoterConfig(ctx, s.db, val, corrosion.ClaimCertificate{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.RecordVoterAdoption(ctx, s.db, 2); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func lunVM(name string, pools ...string) *pb.CreateVMRequest {
@@ -126,7 +182,7 @@ func TestCreateVM_ISCSI_ADeletedVMsLUNIsFree(t *testing.T) {
 // create is admitted and this goes red.
 func TestCreateVM_ISCSI_AnInFlightCreateHoldsItsLUN(t *testing.T) {
 	s := lunTestServer(t)
-	_, release, _, _ := s.lunClaims.take("racer", []lunUse{{key: mustLUNKey(t, "10.0.0.1", "0"), disk: "root"}})
+	_, release, _, _ := s.lunClaims.take("racer", "racer-uuid", []lunUse{{key: mustLUNKey(t, "10.0.0.1", "0"), disk: "root"}})
 	if release == nil {
 		t.Fatal("take on an empty registry refused")
 	}
@@ -171,49 +227,53 @@ func (p *lunPeer) LUNHolders(_ context.Context, req *pb.LUNHoldersRequest, _ ...
 	return &pb.LUNHoldersResponse{Holders: p.holders}, nil
 }
 
-// What another host holds — in its replica or in a create of its own in
-// flight — refuses the create; this host's replica need not know of it.
+// A LUN an earlier allocation took for a create on another host is free only
+// once that host shows the create gone. Its answer decides: in flight refuses
+// (Aborted, naming the VM), a holder refuses (FailedPrecondition), nothing
+// lets the walk go on to the next allocation, and no answer refuses
+// (Unavailable) — what a host that cannot be asked took, it holds.
 //
-// Mutation: skip lunHoldersOnPeers in claimLUNs — the create is admitted
-// and the holder cases go red.
-func TestCreateVM_ISCSI_APeersHolderRefuses(t *testing.T) {
+// Mutation: treat an allocation decided for another create as gone without
+// asking its host — the in-flight and holder cases go red.
+func TestCreateVM_ISCSI_AnEarlierAllocationMustBeProvenGone(t *testing.T) {
 	key := func(t *testing.T) string { return mustLUNKey(t, "10.0.0.1", "0") }
 	for _, tc := range []struct {
 		name     string
-		state    string
 		peer     func(t *testing.T) *lunPeer
 		wantCode codes.Code
 		wantText string
 	}{
-		{"committed elsewhere", "active", func(t *testing.T) *lunPeer {
+		{"committed there", func(t *testing.T) *lunPeer {
 			return &lunPeer{holders: []*pb.LUNHolder{{Lun: key(t), VmName: "far", DiskName: "root", HostName: "peer-host"}}}
 		}, codes.FailedPrecondition, `VM "far"`},
-		{"in flight elsewhere", "active", func(t *testing.T) *lunPeer {
-			return &lunPeer{holders: []*pb.LUNHolder{{Lun: key(t), VmName: "racer", DiskName: "root", HostName: "peer-host", InFlight: true}}}
-		}, codes.Aborted, `VM "racer"`},
-		{"an answer never adds a LUN", "active", func(t *testing.T) *lunPeer {
-			return &lunPeer{holders: []*pb.LUNHolder{{Lun: "iscsi:other", VmName: "far", DiskName: "root"}}}
+		{"in flight there", func(t *testing.T) *lunPeer {
+			return &lunPeer{holders: []*pb.LUNHolder{{Lun: key(t), VmName: "far", DiskName: "root", HostName: "peer-host", InFlight: true}}}
+		}, codes.Aborted, `VM "far"`},
+		{"gone there", func(t *testing.T) *lunPeer { return &lunPeer{} }, codes.OK, ""},
+		{"an answer never adds a LUN", func(t *testing.T) *lunPeer {
+			return &lunPeer{holders: []*pb.LUNHolder{{Lun: "iscsi:other", VmName: "x", DiskName: "root"}}}
 		}, codes.OK, ""},
-		{"an active peer that cannot be asked", "active", func(t *testing.T) *lunPeer {
+		{"that host cannot be asked", func(t *testing.T) *lunPeer {
 			return &lunPeer{err: status.Error(codes.Unavailable, "connection refused")}
 		}, codes.Unavailable, "peer-host"},
-		{"an older build", "active", func(t *testing.T) *lunPeer {
-			return &lunPeer{err: status.Error(codes.Unimplemented, "unknown method LUNHolders")}
-		}, codes.OK, ""},
-		{"a peer marked offline", "offline", func(t *testing.T) *lunPeer {
-			return &lunPeer{err: errors.New("dial: no route to host")}
-		}, codes.OK, ""},
-		{"a peer in maintenance", "maintenance", func(t *testing.T) *lunPeer {
-			return &lunPeer{err: errors.New("dial: no route to host")}
-		}, codes.OK, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := lunTestServer(t)
 			ctx := adminCtx()
 			if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
-				Name: "peer-host", Address: "10.0.0.10", State: tc.state, CPUTotal: 8, MemTotal: 65536,
+				Name: "peer-host", Address: "10.0.0.10", State: "active", CPUTotal: 8, MemTotal: 65536,
 			}); err != nil {
 				t.Fatalf("InsertHost: %v", err)
+			}
+			// Allocation 0 of the LUN was decided for a create of VM "far" on
+			// peer-host, which this host's replica has never heard of.
+			cfg, err := corrosion.AdoptedVoterConfig(ctx, s.db)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.decideLUN(ctx, cfg, corrosion.LUNAllocation{LUN: key(t), Generation: 0, ClaimID: "far-claim",
+				VMID: "far-uuid", VMName: "far", Disk: "root", Host: "peer-host"}); err != nil {
+				t.Fatalf("decide allocation 0: %v", err)
 			}
 			peer := tc.peer(t)
 			s.peerClientOverride = func(_ context.Context, host string) (pb.LiteVirtClient, func(), error) {
@@ -222,17 +282,15 @@ func TestCreateVM_ISCSI_APeersHolderRefuses(t *testing.T) {
 				}
 				return peer, func() {}, nil
 			}
-			_, err := s.CreateVM(ctx, lunVM("b", "lun0"))
+			_, err = s.CreateVM(ctx, lunVM("b", "lun0"))
 			if status.Code(err) != tc.wantCode || (tc.wantText != "" && !strings.Contains(err.Error(), tc.wantText)) {
 				t.Fatalf("got %v, want %v containing %q", err, tc.wantCode, tc.wantText)
 			}
 			if tc.wantCode != codes.OK {
 				requireNoVM(t, s, "b")
 			}
-			if tc.state == "active" {
-				if peer.asked == nil || peer.asked.VmName != "b" || len(peer.asked.Luns) != 1 || peer.asked.Luns[0] != key(t) {
-					t.Errorf("peer asked %+v, want VM b and the one LUN", peer.asked)
-				}
+			if peer.asked == nil || len(peer.asked.Luns) != 1 || peer.asked.Luns[0] != key(t) {
+				t.Errorf("peer asked %+v, want the one LUN", peer.asked)
 			}
 		})
 	}
@@ -260,8 +318,8 @@ func TestCreateVM_ISCSI_NonISCSICreateAsksNoPeer(t *testing.T) {
 }
 
 // LUNHolders answers from this host's in-flight creates and its replica —
-// except the asking VM's own rows (the incarnation a recreate replaces) — and
-// only for peers.
+// except the rows of the incarnation the asker replaces, named by name AND
+// created_at; a name alone exempts nothing (review I-2) — and only for peers.
 //
 // Mutation: drop the in-flight half of lunHoldersHere — the racer is not
 // reported and this goes red.
@@ -272,7 +330,7 @@ func TestLUNHolders_AnswersInFlightAndReplica(t *testing.T) {
 		t.Fatalf("VM a: %v", err)
 	}
 	k0, k1 := mustLUNKey(t, "10.0.0.1", "0"), mustLUNKey(t, "10.0.0.1", "1")
-	_, release, _, _ := s.lunClaims.take("racer", []lunUse{{key: k1, disk: "data"}})
+	_, release, _, _ := s.lunClaims.take("racer", "racer-uuid", []lunUse{{key: k1, disk: "data"}})
 	defer release()
 
 	if _, err := s.LUNHolders(ctx, &pb.LUNHoldersRequest{Luns: []string{k0}}); status.Code(err) != codes.PermissionDenied &&
@@ -280,7 +338,7 @@ func TestLUNHolders_AnswersInFlightAndReplica(t *testing.T) {
 		t.Fatalf("LUNHolders from a non-peer: got %v, want a refusal", err)
 	}
 	pctx := peerCtxFor(t, s, "peer-host")
-	resp, err := s.LUNHolders(pctx, &pb.LUNHoldersRequest{Luns: []string{k0, k1}, VmName: "b"})
+	resp, err := s.LUNHolders(pctx, &pb.LUNHoldersRequest{Luns: []string{k0, k1}})
 	if err != nil {
 		t.Fatalf("LUNHolders: %v", err)
 	}
@@ -294,12 +352,32 @@ func TestLUNHolders_AnswersInFlightAndReplica(t *testing.T) {
 	if h := got[k1]; h == nil || h.VmName != "racer" || !h.InFlight {
 		t.Errorf("LUN 1 holder = %+v, want in-flight racer", h)
 	}
-	// The asking VM's own rows hold nothing against it.
-	resp, err = s.LUNHolders(pctx, &pb.LUNHoldersRequest{Luns: []string{k0}, VmName: "a"})
+	// A name alone exempts nothing: a duplicate create of "a" elsewhere must
+	// still be told a holds the LUN.
+	resp, err = s.LUNHolders(pctx, &pb.LUNHoldersRequest{Luns: []string{k0}, ReplacedName: "a"})
+	if err != nil {
+		t.Fatalf("LUNHolders: %v", err)
+	}
+	if len(resp.Holders) != 1 {
+		t.Errorf("a name alone exempted VM a's disk: %v", resp.Holders)
+	}
+	// Nor does the name with another incarnation's created_at (an earlier
+	// VM of the name, whose recreate this is not).
+	resp, err = s.LUNHolders(pctx, &pb.LUNHoldersRequest{Luns: []string{k0}, ReplacedName: "a", ReplacedCreatedAt: "2001-01-01T00:00:00Z"})
+	if err != nil {
+		t.Fatalf("LUNHolders: %v", err)
+	}
+	if len(resp.Holders) != 1 {
+		t.Errorf("another incarnation's created_at exempted VM a's disk: %v", resp.Holders)
+	}
+	// The incarnation a recreate replaces — name and created_at — holds
+	// nothing against it.
+	rec := vmRecord(t, s, "a")
+	resp, err = s.LUNHolders(pctx, &pb.LUNHoldersRequest{Luns: []string{k0}, ReplacedName: "a", ReplacedCreatedAt: rec.CreatedAt})
 	if err != nil {
 		t.Fatalf("LUNHolders: %v", err)
 	}
 	if len(resp.Holders) != 0 {
-		t.Errorf("VM a's own disk reported against it: %v", resp.Holders)
+		t.Errorf("the replaced incarnation's own disk reported against it: %v", resp.Holders)
 	}
 }

@@ -20,14 +20,22 @@ import (
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
-// enableUsbMountsMemory turns the local flag on and latches the token.
+// enableUsbMountsMemory opens the passthrough gate and latches any extra
+// tokens the scenario needs.
 func enableUsbMountsMemory(s *Server, extra ...string) {
-	s.SetUsbMountsMemory(true)
-	tok := map[string]bool{capabilities.UsbMountsMemoryV1: true}
-	for _, e := range extra {
-		tok[e] = true
+	s.SetPassthroughGate(nil)
+	if len(extra) > 0 {
+		tok := map[string]bool{}
+		for _, e := range extra {
+			tok[e] = true
+		}
+		s.SetGate(fakeServerGate{enforcedTok: tok})
 	}
-	s.SetGate(fakeServerGate{enforcedTok: tok})
+}
+
+// closePassthroughGate models a cluster still mid-upgrade.
+func closePassthroughGate(s *Server) {
+	s.SetPassthroughGate(func(context.Context) bool { return false })
 }
 
 func usbCreateRequest(name string, usb ...*pb.USBDeviceSpec) *pb.CreateVMRequest {
@@ -47,51 +55,37 @@ func addUSBMapping(t *testing.T, s *Server, name, host, addr string) {
 	}
 }
 
-// Setting USB passthrough needs the local flag AND the cluster latch; either
-// alone refuses, and a refusal writes nothing.
-func TestCreateVM_USBGatedOnFlagAndLatch(t *testing.T) {
+// Setting USB passthrough is refused while the release gate is closed (a
+// cluster mid-upgrade), and a refusal writes nothing; open, it is defined.
+func TestCreateVM_USBGated(t *testing.T) {
 	ctx := adminCtx()
 	dev := &pb.USBDeviceSpec{Vendor: "046D", Product: "0xC52B"}
-
-	for _, tc := range []struct {
-		name   string
-		flag   bool
-		latch  bool
-		wantOK bool
-	}{
-		{"neither", false, false, false},
-		{"flag only", true, false, false},
-		{"latch only", false, true, false},
-		{"both", true, true, true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			s, fake := provableCreateServer(t)
-			s.SetUsbMountsMemory(tc.flag)
-			if tc.latch {
-				s.SetGate(fakeServerGate{enforcedTok: map[string]bool{capabilities.UsbMountsMemoryV1: true}})
+	for _, open := range []bool{false, true} {
+		s, fake := provableCreateServer(t)
+		if !open {
+			closePassthroughGate(s)
+		}
+		_, err := s.CreateVM(ctx, usbCreateRequest("u1", dev))
+		if !open {
+			if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), passthroughRefusalText) {
+				t.Fatalf("CreateVM with the gate closed = %v; want the release refusal", err)
 			}
-			_, err := s.CreateVM(ctx, usbCreateRequest("u1", dev))
-			if !tc.wantOK {
-				if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), usbMountsMemoryRefusalText) {
-					t.Fatalf("CreateVM = %v; want the usb_mounts_memory refusal", err)
-				}
-				if row, _ := corrosion.GetVM(ctx, s.db, "u1"); row != nil {
-					t.Fatal("a refused create left a VM row")
-				}
-				return
+			if row, _ := corrosion.GetVM(ctx, s.db, "u1"); row != nil {
+				t.Fatal("a refused create left a VM row")
 			}
-			if err != nil {
-				t.Fatalf("CreateVM: %v", err)
-			}
-			spec := loadStoredSpec(t, s, "u1")
-			if len(spec.UsbDevices) != 1 || spec.UsbDevices[0].Vendor != "046d" || spec.UsbDevices[0].Product != "c52b" {
-				t.Fatalf("stored usb_devices = %v; want one normalized 046d:c52b", spec.UsbDevices)
-			}
-			x, _ := fake.DumpXMLInactive("u1")
-			if !strings.Contains(x, `type="usb"`) || !strings.Contains(x, `<vendor id="0x046d">`) || !strings.Contains(x, `<product id="0xc52b">`) {
-				t.Fatalf("defined domain lacks the USB hostdev:\n%s", x)
-			}
-		})
+			continue
+		}
+		if err != nil {
+			t.Fatalf("CreateVM: %v", err)
+		}
+		spec := loadStoredSpec(t, s, "u1")
+		if len(spec.UsbDevices) != 1 || spec.UsbDevices[0].Vendor != "046d" || spec.UsbDevices[0].Product != "c52b" {
+			t.Fatalf("stored usb_devices = %v; want one normalized 046d:c52b", spec.UsbDevices)
+		}
+		x, _ := fake.DumpXMLInactive("u1")
+		if !strings.Contains(x, `type="usb"`) || !strings.Contains(x, `<vendor id="0x046d">`) || !strings.Contains(x, `<product id="0xc52b">`) {
+			t.Fatalf("defined domain lacks the USB hostdev:\n%s", x)
+		}
 	}
 }
 
@@ -215,6 +209,7 @@ func TestUpdateVM_SetAndClearUSB(t *testing.T) {
 		seedSpecJSON(t, &pb.VMSpec{Name: "u", Cpu: 1, MemoryMib: 1024}))
 
 	set := &pb.UpdateVMRequest{Name: "u", SetUsbDevices: true, UsbDevices: []*pb.USBDeviceSpec{{Vendor: "046d", Product: "c52b"}}}
+	closePassthroughGate(s)
 	if _, err := s.UpdateVM(ctx, set); status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("set USB ungated: %v; want FailedPrecondition", err)
 	}
@@ -233,8 +228,8 @@ func TestUpdateVM_SetAndClearUSB(t *testing.T) {
 		t.Fatalf("redefined domain lacks the USB hostdev:\n%s", x)
 	}
 
-	// Clearing is allowed with the flag off: it removes a field, losing nothing.
-	s.SetUsbMountsMemory(false)
+	// Clearing is allowed with the gate closed: it removes a field, losing nothing.
+	closePassthroughGate(s)
 	if _, err := s.UpdateVM(ctx, &pb.UpdateVMRequest{Name: "u", SetUsbDevices: true}); err != nil {
 		t.Fatalf("clear USB: %v", err)
 	}
@@ -270,6 +265,7 @@ func TestCreateVM_MemoryHotplug(t *testing.T) {
 	req.Spec.MemoryHotplugMaxMib = 4096
 	req.Spec.MemoryHotplugBaseMib = 64 // server-owned: a client value is ignored
 
+	closePassthroughGate(s)
 	if _, err := s.CreateVM(ctx, req); status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("ungated hot-add create: %v; want FailedPrecondition", err)
 	}
@@ -282,7 +278,7 @@ func TestCreateVM_MemoryHotplug(t *testing.T) {
 		t.Fatalf("stored hot-add = max %d base %d; want 4096/1024", spec.MemoryHotplugMaxMib, spec.MemoryHotplugBaseMib)
 	}
 	x, _ := fake.DumpXMLInactive("m1")
-	for _, want := range []string{`<maxMemory slots="16" unit="KiB">4194304</maxMemory>`, `model="virtio-mem"`, `<cell id="0" cpus="0" memory="1048576" unit="KiB">`} {
+	for _, want := range []string{`<maxMemory slots="1" unit="KiB">4194304</maxMemory>`, `model="virtio-mem"`, `<cell id="0" cpus="0" memory="1048576" unit="KiB">`} {
 		if !strings.Contains(x, want) {
 			t.Errorf("domain lacks %s:\n%s", want, x)
 		}
@@ -390,6 +386,7 @@ func TestUpdateVM_EnableMemoryHotplugStopped(t *testing.T) {
 	insertTestVMWithSpec(t, ctx, s.db, "m", "test-host", "stopped",
 		seedSpecJSON(t, &pb.VMSpec{Name: "m", Cpu: 1, MemoryMib: 2048}))
 	req := &pb.UpdateVMRequest{Name: "m", MemoryHotplugMaxMib: proto.Int32(8192)}
+	closePassthroughGate(s)
 	if _, err := s.UpdateVM(ctx, req); status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("ungated: %v; want FailedPrecondition", err)
 	}

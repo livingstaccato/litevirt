@@ -2,6 +2,7 @@ package libvirt
 
 import (
 	"encoding/xml"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -188,6 +189,7 @@ func TestGenerateDomainXML_MemoryHotplugRejectsBadBand(t *testing.T) {
 		{MemoryMiB: 512, HotplugBaseMiB: 1024, HotplugMaxMiB: 2048},                      // current below base
 		{MemoryMiB: 1024, HotplugBaseMiB: 0, HotplugMaxMiB: 2048},                        // no boot cell
 		{MemoryMiB: 1024, MaxMemoryMiB: 1536, HotplugBaseMiB: 1024, HotplugMaxMiB: 2048}, // balloon ceiling too
+		{MemoryMiB: 1024, HugePages: true, HotplugBaseMiB: 1024, HotplugMaxMiB: 2048},    // hugepages
 	} {
 		c.Name, c.CPU = "m4", 1
 		if _, err := GenerateDomainXML(c); err == nil {
@@ -340,5 +342,20 @@ func TestParseUSBMappingAddress(t *testing.T) {
 		if _, err := ParseUSBMappingAddress(bad); err == nil {
 			t.Errorf("ParseUSBMappingAddress(%q) accepted", bad)
 		}
+	}
+}
+
+func TestVirtioMemCurrentAndPresence(t *testing.T) {
+	if !HasVirtioMem(virtioMemDomXML) || HasVirtioMem(usbDomXML) {
+		t.Fatal("HasVirtioMem disagrees with the fixtures")
+	}
+	if got, ok := VirtioMemCurrentMiB(virtioMemDomXML); !ok || got != 1024 {
+		t.Fatalf("VirtioMemCurrentMiB = %d, %v; want 1024", got, ok)
+	}
+	if _, ok := VirtioMemCurrentMiB(strings.Replace(virtioMemDomXML, "<current unit='KiB'>1048576</current>", "", 1)); ok {
+		t.Fatal("a device reporting no <current> was read as reporting one")
+	}
+	if _, err := VirtioMemUpdateXML(usbDomXML, 2); !errors.Is(err, ErrNoVirtioMem) {
+		t.Fatalf("VirtioMemUpdateXML on a domain without the device = %v; want ErrNoVirtioMem", err)
 	}
 }

@@ -2,6 +2,7 @@ package libvirt
 
 import (
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -196,9 +197,10 @@ func ReplaceUSBHostdevs(domXML string, usb []USBHostdevConfig) (string, error) {
 
 // ── Memory hot-add (virtio-mem) ──
 
-// memoryHotplugSlots is <maxMemory slots>. virtio-mem uses none, but libvirt
-// requires the attribute; 16 leaves room for DIMMs without a redefine.
-const memoryHotplugSlots = 16
+// memoryHotplugSlots is <maxMemory slots>. virtio-mem consumes no slot, but
+// libvirt requires the attribute. <maxMemory> equals the region's top, so no
+// DIMM fits beside it: one slot, and no claim of room for more.
+const memoryHotplugSlots = 1
 
 // virtioMemBlockKiB is the virtio-mem block size: the granularity memory is
 // plugged in, and the alignment the region and every request must keep. 2 MiB
@@ -224,6 +226,11 @@ func validateMemoryHotplug(cfg VMConfig) error {
 		return fmt.Errorf("hot-added memory %d MiB must be a multiple of %d MiB", cur-base, virtioMemBlockKiB/1024)
 	case cfg.MaxMemoryMiB > cur || cfg.MinMemoryMiB > 0:
 		return fmt.Errorf("memory hot-add and a balloon band (min/max memory) cannot be combined")
+	case cfg.HugePages:
+		// The 2 MiB block cannot be plugged into memory backed by larger
+		// hugepages (1 GiB on many hosts), so the pair is refused up front
+		// rather than failing at define or start.
+		return fmt.Errorf("memory hot-add and hugepages cannot be combined")
 	}
 	return nil
 }
@@ -291,7 +298,7 @@ var (
 func VirtioMemUpdateXML(domXML string, requestedMiB int) (string, error) {
 	elem := reVirtioMemElem.FindString(domXML)
 	if elem == "" {
-		return "", fmt.Errorf("domain has no virtio-mem device (memory hot-add is not configured)")
+		return "", ErrNoVirtioMem
 	}
 	if requestedMiB < 0 {
 		return "", fmt.Errorf("hot-added memory %d MiB is negative", requestedMiB)
@@ -349,4 +356,34 @@ func (c *Client) SetVirtioMemRequested(domainName string, requestedMiB int) erro
 		return fmt.Errorf("set hot-added memory of %q to %d MiB (live): %w", domainName, requestedMiB, err)
 	}
 	return nil
+}
+
+// ErrNoVirtioMem is a hot-add change on a domain defined without a virtio-mem
+// device: a definition that drifted from its spec. Retrying cannot fix it.
+var ErrNoVirtioMem = errors.New("domain has no virtio-mem device (memory hot-add is not configured in its definition)")
+
+// HasVirtioMem reports whether a domain XML carries a virtio-mem device.
+func HasVirtioMem(domXML string) bool { return reVirtioMemElem.MatchString(domXML) }
+
+var reVirtioMemCurrent = regexp.MustCompile(`<current\b[^>]*>(\d+)</current>`)
+
+// VirtioMemCurrentMiB is how much of the virtio-mem region the guest has
+// actually plugged (<current>, which libvirt reports in the live XML), and
+// whether the domain reports it at all. It can lag <requested> — a guest that
+// cannot offline its memory keeps it — so it, not the request, is what the
+// host is holding.
+func VirtioMemCurrentMiB(domXML string) (int, bool) {
+	elem := reVirtioMemElem.FindString(domXML)
+	if elem == "" {
+		return 0, false
+	}
+	m := reVirtioMemCurrent.FindStringSubmatch(elem)
+	if m == nil {
+		return 0, false
+	}
+	kib, err := strconv.Atoi(m[1])
+	if err != nil {
+		return 0, false
+	}
+	return kib / 1024, true
 }

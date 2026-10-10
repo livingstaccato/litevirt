@@ -7,7 +7,8 @@
 // definition is what a cold migration ships. Only the target can say which
 // device it has (a bus-port is read from its own sysfs), so the target
 // re-resolves the VM's USB devices before it defines the domain. Multi-node by
-// construction: the define runs in the target daemon, over real gRPC.
+// construction: the define runs in the target daemon, over real gRPC, and
+// on independent replicas the target knows the mapping only from replication.
 
 package fleet
 
@@ -43,7 +44,7 @@ func migrateUSB(t *testing.T, c *Cluster, src *Node, vm, target string, strategy
 }
 
 func TestFleet_ColdMigrationReResolvesMappedUSBOnTheTarget(t *testing.T) {
-	c := New(t, Options{Nodes: 3, SharedCRDT: true})
+	c := New(t, Options{Nodes: 3, IndependentReplicas: true})
 	t.Cleanup(c.Stop)
 	ctx := context.Background()
 	src, dst, other := c.Nodes[0], c.Nodes[1], c.Nodes[2]
@@ -65,6 +66,8 @@ func TestFleet_ColdMigrationReResolvesMappedUSBOnTheTarget(t *testing.T) {
 	}, nil, nil); err != nil {
 		t.Fatalf("InsertVM: %v", err)
 	}
+	// The mapping and the VM reach the target through replication alone.
+	c.WaitConverged(t, convergeTimeout)
 	if err := src.Virt.DefineDomain(`<domain type='kvm'><name>u1</name><uuid>11111111-2222-4333-8444-666666666666</uuid><devices>` +
 		`<hostdev mode='subsystem' type='usb' managed='yes'><source><vendor id='0x046d'/><product id='0xc52b'/></source></hostdev>` +
 		`</devices></domain>`); err != nil {
@@ -80,6 +83,7 @@ func TestFleet_ColdMigrationReResolvesMappedUSBOnTheTarget(t *testing.T) {
 	if err := migrateUSB(t, c, src, "u1", dst.Name, pb.MigrateStrategy_MIGRATE_COLD); err != nil {
 		t.Fatalf("cold migrate: %v", err)
 	}
+	c.WaitConverged(t, convergeTimeout)
 	x, err := dst.Virt.DumpXMLInactive("u1")
 	if err != nil {
 		t.Fatalf("target has no domain: %v", err)

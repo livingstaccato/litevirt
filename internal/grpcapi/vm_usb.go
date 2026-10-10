@@ -260,7 +260,10 @@ func validateMemoryHotplugSpec(spec *pb.VMSpec) error {
 			"memory %d MiB must be the boot memory %d MiB plus a multiple of 2 MiB", spec.MemoryMib, base)
 	case spec.MaxMemoryMib > spec.MemoryMib || spec.MinMemoryMib > 0:
 		return status.Error(codes.InvalidArgument,
-			"memory hot-add and a balloon band (--min-memory / --max-memory) cannot be combined")
+			"memory hot-add and a balloon band (--min-mem / --max-mem) cannot be combined")
+	case spec.GetResources().GetHugepages():
+		return status.Error(codes.InvalidArgument,
+			"memory hot-add and hugepages cannot be combined (the 2 MiB hot-add block does not fit larger hugepages)")
 	}
 	return nil
 }
@@ -273,14 +276,17 @@ func (s *Server) admitCreateUSBAndHotplug(ctx context.Context, spec *pb.VMSpec) 
 	if len(spec.UsbDevices) == 0 && spec.MemoryHotplugMaxMib == 0 {
 		return nil
 	}
-	if !s.usbMountsMemoryActive(ctx) {
+	if !s.passthroughFeaturesActive(ctx) {
 		what := "memory hot-add"
 		if len(spec.UsbDevices) > 0 {
 			what = "USB passthrough"
 		}
-		return usbMountsMemoryRefusal(what)
+		return passthroughRefusal(what)
 	}
 	if len(spec.UsbDevices) > 0 {
+		if err := s.authorizeUSBDevices(ctx, spec.UsbDevices); err != nil {
+			return err
+		}
 		pin := ""
 		if spec.Placement != nil {
 			pin = spec.Placement.Host
@@ -370,12 +376,12 @@ func (s *Server) preflightUSBHotplugUpdate(ctx context.Context, req *pb.UpdateVM
 		return nil
 	}
 	if (req.SetUsbDevices && len(req.UsbDevices) > 0) || (req.MemoryHotplugMaxMib != nil && *req.MemoryHotplugMaxMib != 0) {
-		if !s.usbMountsMemoryActive(ctx) {
+		if !s.passthroughFeaturesActive(ctx) {
 			what := "memory hot-add"
 			if req.SetUsbDevices && len(req.UsbDevices) > 0 {
 				what = "USB passthrough"
 			}
-			return usbMountsMemoryRefusal(what)
+			return passthroughRefusal(what)
 		}
 	}
 	if req.SetUsbDevices && len(req.UsbDevices) > 0 {
@@ -418,4 +424,76 @@ func (s *Server) refreshUSBHostdevsForStart(ctx context.Context, vm *corrosion.V
 		return status.Errorf(codes.Internal, "redefine %q with its USB devices: %v", vm.Name, err)
 	}
 	return nil
+}
+
+// rawUSBDenied is the refusal for a raw USB device without the admin role.
+const rawUSBDenied = "a raw USB device (vendor:product or bus-port) hands one of the host's own devices to the guest, which needs the admin role; name it through a USB resource mapping you may use instead"
+
+// authorizeUSBDevices is the caller's permission to pass these devices
+// through, judged where the caller is real — the entry node, before any
+// forward (a forwarded call runs as the peer, which must never be what
+// grants it). A raw device is the host's own and needs the admin role, as on
+// Proxmox VE (Sys.Modify on /). A mapped one needs resourcemap.use on
+// /mappings/<name> (Proxmox Mapping.Use); with no role bindings, the admin
+// role.
+func (s *Server) authorizeUSBDevices(ctx context.Context, devs []*pb.USBDeviceSpec) error {
+	seen := map[string]bool{}
+	for _, d := range devs {
+		if d == nil {
+			continue
+		}
+		if d.Mapping == "" {
+			if err := RequireRole(ctx, "admin"); err != nil {
+				return status.Error(codes.PermissionDenied, rawUSBDenied)
+			}
+			continue
+		}
+		if seen[d.Mapping] {
+			continue
+		}
+		seen[d.Mapping] = true
+		if err := s.RequirePerm(ctx, mappingRBACPath(d.Mapping), "resourcemap.use", "admin"); err != nil {
+			return status.Errorf(codes.PermissionDenied, "using resource mapping %q needs resourcemap.use on %s: %v",
+				d.Mapping, mappingRBACPath(d.Mapping), status.Convert(err).Message())
+		}
+	}
+	return nil
+}
+
+// mappingRBACPath is the permission path of one resource mapping.
+func mappingRBACPath(name string) string { return "/mappings/" + name }
+
+// admitRestoredUSBAndHotplug decides what a live restore's spec may carry of
+// USB passthrough and memory hot-add. Only the cluster's own row (fromExisting)
+// is server-side state that passed create's gates; it keeps them, judged again
+// here as a create would judge them (the gate, the caller's permission, the
+// devices on THIS host). A client-supplied or manifest spec grants neither:
+// both are stripped — the VM restores with fixed memory and no USB device —
+// and the strip is audited.
+func (s *Server) admitRestoredUSBAndHotplug(ctx context.Context, spec *pb.VMSpec, name string, fromExisting bool) error {
+	if len(spec.UsbDevices) == 0 && spec.MemoryHotplugMaxMib == 0 && spec.MemoryHotplugBaseMib == 0 {
+		return nil
+	}
+	if !fromExisting {
+		what := usbSummary(spec.UsbDevices)
+		if spec.MemoryHotplugMaxMib != 0 {
+			what = strings.TrimPrefix(what+fmt.Sprintf(",memory-hotplug-max=%d", spec.MemoryHotplugMaxMib), ",")
+		}
+		spec.UsbDevices = nil
+		spec.MemoryHotplugMaxMib, spec.MemoryHotplugBaseMib = 0, 0
+		s.audit(ctx, "vm.restore", name, "not carried from the restored spec (set them again with lv update): "+what, "ok")
+		return nil
+	}
+	if !s.passthroughFeaturesActive(ctx) {
+		return passthroughRefusal("restoring USB passthrough or memory hot-add")
+	}
+	if len(spec.UsbDevices) > 0 {
+		if err := s.authorizeUSBDevices(ctx, spec.UsbDevices); err != nil {
+			return err
+		}
+		if err := s.validateUSBForVM(ctx, spec.UsbDevices, s.hostName); err != nil {
+			return err
+		}
+	}
+	return validateMemoryHotplugSpec(spec)
 }

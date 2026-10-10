@@ -129,7 +129,7 @@ func newRunCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&allowOvercommit, "allow-overcommit", false,
 		"Skip the host capacity check for this VM (project quota still applies). For deliberate density on a host you know can take it; the bypass is audited.")
 	cmd.Flags().Int32Var(&memHotplugMax, "memory-hotplug-max", 0,
-		"Memory hot-add ceiling in MiB (virtio-mem; > --memory): memory can then be raised live up to it with lv set-memory or lv update --memory (needs enforcement.usb_mounts_memory)")
+		"Memory hot-add ceiling in MiB (virtio-mem; > --memory): memory can then be raised live up to it with lv set-memory or lv update --memory")
 	usb.register(cmd)
 	cmd.MarkFlagRequired("name")
 	return cmd

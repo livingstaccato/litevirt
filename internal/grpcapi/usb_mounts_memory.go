@@ -5,25 +5,34 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-
-	"github.com/litevirt/litevirt/internal/capabilities"
 )
 
-// usbMountsMemoryActive reports whether this node may originate a VM's
-// usb_devices / memory hot-add or a container's host mounts / devices: the
-// config flag AND the cluster-wide UsbMountsMemoryV1 latch, so no older peer
-// can drop the fields from a spec it rewrites or place the workload without
-// them. Same `flag && Enforced` shape as liveResizeActive.
-func (s *Server) usbMountsMemoryActive(ctx context.Context) bool {
-	return s.enfUsbMountsMemory && s.gate != nil && s.gate.Enforced(ctx, capabilities.UsbMountsMemoryV1)
+// passthroughFeaturesActive is the ONE gate for SETTING a VM's USB devices
+// or memory hot-add, or a container's host mounts and devices.
+//
+// An older peer decodes a spec into a struct without these fields and drops
+// them from any spec it rewrites, and an older coordinator would place, fail
+// over or recreate the workload without them. So in a mixed-version cluster
+// they must not be set. That is a fact about the release, and it is decided
+// by the cluster's shared release token (branch feat/release-token), which
+// wires passthroughGate; until it does, the features are on, as on Proxmox.
+// Clearing a field is never gated.
+func (s *Server) passthroughFeaturesActive(ctx context.Context) bool {
+	if s.passthroughGate == nil {
+		return true
+	}
+	return s.passthroughGate(ctx)
 }
 
-// usbMountsMemoryRefusalText is the fixed part of the refusal, matched by tests.
-const usbMountsMemoryRefusalText = "needs enforcement.usb_mounts_memory on this node and the usb_mounts_memory_v1 capability latched cluster-wide"
+// SetPassthroughGate wires the release gate for the passthrough features.
+func (s *Server) SetPassthroughGate(fn func(ctx context.Context) bool) { s.passthroughGate = fn }
 
-// usbMountsMemoryRefusal is the refusal for a request that sets one of the
-// gated fields while usbMountsMemoryActive is false.
-func usbMountsMemoryRefusal(what string) error {
+// passthroughRefusalText is the fixed part of the refusal, matched by tests.
+const passthroughRefusalText = "is not available until every host runs this release"
+
+// passthroughRefusal is the refusal for a request that sets one of the gated
+// fields while passthroughFeaturesActive is false.
+func passthroughRefusal(what string) error {
 	return status.Errorf(codes.FailedPrecondition,
-		"%s %s (an older peer would drop the setting)", what, usbMountsMemoryRefusalText)
+		"%s %s (an older host would drop the setting)", what, passthroughRefusalText)
 }

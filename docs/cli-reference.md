@@ -324,6 +324,8 @@ lv ct clone <source> <new-name> [--project p] [--start] # full-copy clone with a
 lv ct pull <image> --dest <name> [--project p]       # stage an OCI image; with --project only p (and Admin) may use it
 lv ct convert <name> --unprivileged [--confinement default]  # stopped ct → an id range of its own
 lv ct convert <name> --confinement default|legacy      # change confinement (legacy: Admin only)
+lv ct convert <name> --mount <host>:<ct>[:rw] --device <host>  # replace host mounts/devices (Admin only)
+lv ct convert <name> --clear-host-access               # remove them
 lv ct convert <name>                                  # finish an interrupted convert (the start refusal names it)
 lv ct create <name> --privileged                       # no user namespace, as earlier releases (Admin only)
 lv ct create <name> --confinement legacy               # AppArmor nesting, template seccomp/caps (Admin only)
@@ -758,7 +760,7 @@ lv set-memory <vm> <MiB>                   # live balloon target, within [min, m
 ## Memory hot-add and USB passthrough
 
 ```bash
-# virtio-mem: boot with 2 GiB, raise live up to 16 GiB (needs enforcement.usb_mounts_memory)
+# virtio-mem: boot with 2 GiB, raise live up to 16 GiB
 lv run --name db --image ubuntu --memory 2048 --memory-hotplug-max 16384
 lv set-memory db 8192                      # plug 6 GiB into the running guest
 lv update db --memory 4096                 # the same, through update

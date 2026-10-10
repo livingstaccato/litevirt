@@ -20,17 +20,17 @@ import (
 // Every assertion reads virsh, /proc or the container's own view, never
 // litevirt's report of what it did. Run on a cluster node (local mode) with:
 //
-//   - enforcement.usb_mounts_memory: true on EVERY node (else the tests skip
-//     with the gate's refusal, rather than fail);
+//   - every host on this release (else the tests skip with the release
+//     gate's refusal, rather than fail);
 //   - for the container test, LV_E2E_MOUNT_DIR naming a directory under this
 //     host's containers.bind_mount_paths.
 
-const gateRefusal = "usb_mounts_memory_v1"
+const gateRefusal = "is not available until every host runs this release"
 
 func skipIfGated(t *testing.T, out string, err error) {
 	t.Helper()
 	if err != nil && strings.Contains(out+err.Error(), gateRefusal) {
-		t.Skipf("enforcement.usb_mounts_memory is not on and latched cluster-wide: %s", strings.TrimSpace(out))
+		t.Skipf("the cluster is mid-upgrade: %s", strings.TrimSpace(out))
 	}
 }
 
@@ -87,6 +87,13 @@ func TestVM_MemoryHotplug_LivePlug(t *testing.T) {
 	}
 	if now := qemuPID(name); now == "" || now != pid {
 		t.Fatalf("qemu pid %q -> %q: the hot-add restarted the guest", pid, now)
+	}
+	// Unplug back down: libvirt reports what the guest actually gave back
+	// (<current>), which litevirt counts until it matches the request.
+	lv(t, "set-memory", name, "1024")
+	time.Sleep(5 * time.Second)
+	if live := virshXML(t, name, false); !strings.Contains(live, "<current unit='KiB'>") {
+		t.Errorf("the live virtio-mem device reports no <current> size:\n%s", live)
 	}
 	// Beyond the region is refused, not silently clamped.
 	if out, err := lvErr(t, "set-memory", name, "4096"); err == nil {
@@ -159,40 +166,90 @@ func TestVM_USBPassthrough_Definition(t *testing.T) {
 }
 
 // TestContainer_HostMount_ReadOnlyAndConfined: an admin's bind mount of an
-// allowed directory is visible in the container, read-only by default; a
-// symlink inside the allowed tree that points out of it is refused at create.
+// allowed directory is visible in the container and provably read-only —
+// the kernel's mount flags say ro,nosuid,nodev, a write fails with EROFS on a
+// directory the container's root could otherwise write, and container root
+// cannot remount it read-write. A symlink swapped in while the container is
+// stopped refuses the start, and one swapped in while it runs is not followed
+// by a reboot from inside it (the LXC start hook mounts from an fd).
 func TestContainer_HostMount_ReadOnlyAndConfined(t *testing.T) {
 	dir := os.Getenv("LV_E2E_MOUNT_DIR")
 	if dir == "" {
 		t.Skip("set LV_E2E_MOUNT_DIR to a directory under this host's containers.bind_mount_paths")
 	}
 	requireLXC(t)
-	marker := filepath.Join(dir, "lv-e2e-marker")
-	if err := os.WriteFile(marker, []byte("from-the-host\n"), 0o644); err != nil {
+	sub := filepath.Join(dir, "lv-e2e")
+	_ = os.RemoveAll(sub)
+	if err := os.MkdirAll(sub, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(sub)
+	// World-writable, so only the read-only mount can refuse a write.
+	_ = os.Chmod(sub, 0o777)
+	if err := os.WriteFile(filepath.Join(sub, "marker"), []byte("from-the-host\n"), 0o666); err != nil {
 		t.Fatalf("write marker: %v", err)
 	}
-	defer os.Remove(marker)
 
 	name := uniqueName("ctm")
 	cleanup(t, func() { lvErr(t, "ct", "rm", name, "--host", localHost, "--force") })
-	out, err := lvErr(t, "ct", "create", name, "--host", localHost, "--mount", dir+":/mnt/host")
+	out, err := lvErr(t, "ct", "create", name, "--host", localHost, "--mount", sub+":/mnt/host")
 	skipIfGated(t, out, err)
 	if err != nil {
 		t.Fatalf("ct create --mount: %v\n%s", err, out)
 	}
 	startCT(t, name)
-	got := lv(t, "ct", "exec", name, "--host", localHost, "--", "cat", "/mnt/host/lv-e2e-marker")
-	if !strings.Contains(got, "from-the-host") {
+	if got := lv(t, "ct", "exec", name, "--host", localHost, "--", "cat", "/mnt/host/marker"); !strings.Contains(got, "from-the-host") {
 		t.Fatalf("the container does not see the host file: %q", got)
 	}
-	if out, err := lvErr(t, "ct", "exec", name, "--host", localHost, "--", "touch", "/mnt/host/written"); err == nil &&
-		!strings.Contains(out, "Read-only") {
-		if _, serr := os.Stat(filepath.Join(dir, "written")); serr == nil {
-			os.Remove(filepath.Join(dir, "written"))
-			t.Fatal("a default (read-only) mount was writable from the container")
+	mi := lv(t, "ct", "exec", name, "--host", localHost, "--", "cat", "/proc/self/mountinfo")
+	var line string
+	for _, l := range strings.Split(mi, "\n") {
+		if f := strings.Fields(l); len(f) > 5 && f[4] == "/mnt/host" {
+			line = l
 		}
 	}
+	if line == "" {
+		t.Fatalf("/mnt/host is not a mount in the container:\n%s", mi)
+	}
+	opts := strings.Fields(line)[5]
+	for _, want := range []string{"ro", "nosuid", "nodev"} {
+		if !strings.Contains(","+opts+",", ","+want+",") {
+			t.Errorf("/mnt/host mount options %q lack %s", opts, want)
+		}
+	}
+	out, err = lvErr(t, "ct", "exec", name, "--host", localHost, "--", "touch", "/mnt/host/written")
+	if err == nil || !strings.Contains(out, "Read-only file system") {
+		t.Errorf("a write to the read-only mount = %v %q; want EROFS", err, out)
+	}
+	if _, serr := os.Stat(filepath.Join(sub, "written")); serr == nil {
+		t.Fatal("a read-only mount was written through")
+	}
+	if out, err := lvErr(t, "ct", "exec", name, "--host", localHost, "--", "mount", "-o", "remount,rw", "/mnt/host"); err == nil {
+		t.Fatalf("container root remounted the host mount read-write:\n%s", out)
+	}
 
+	// While it runs, swap the mounted directory for a symlink to /etc, then
+	// reboot from inside: the start hook must not follow it.
+	_ = os.Rename(sub, sub+".old")
+	defer os.RemoveAll(sub + ".old")
+	if err := os.Symlink("/etc", sub); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = lvErr(t, "ct", "exec", name, "--host", localHost, "--", "reboot")
+	time.Sleep(10 * time.Second)
+	if got, err := lvErr(t, "ct", "exec", name, "--host", localHost, "--", "ls", "/mnt/host"); err == nil && strings.Contains(got, "passwd") {
+		t.Fatalf("an in-container reboot followed a swapped-in symlink to /etc:\n%s", got)
+	}
+
+	// Stopped, the swapped tree refuses the start outright.
+	_, _ = lvErr(t, "ct", "stop", name, "--host", localHost)
+	waitCT(t, name, "stopped", 90*time.Second)
+	if out, err := lvErr(t, "ct", "start", name, "--host", localHost); err == nil {
+		t.Fatalf("a container whose mount source became a symlink started:\n%s", out)
+	}
+	_ = os.Remove(sub)
+
+	// A symlink out of the allowed tree is refused at create.
 	link := filepath.Join(dir, "lv-e2e-escape")
 	_ = os.Remove(link)
 	if err := os.Symlink("/etc", link); err != nil {

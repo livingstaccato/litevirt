@@ -188,7 +188,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	compose.NormalizeVMSpecResources(spec)
 	compose.NormalizeVMSpecResources(req.Spec)
 
-	// USB passthrough and memory hot-add: gated on usb_mounts_memory_v1, and
+	// USB passthrough and memory hot-add: gated on the release (passthroughFeaturesActive), and
 	// checked before placement (which a raw USB device or a mapping
 	// constrains). After the resource defaults, since the hot-add boot memory
 	// is the VM's memory. spec is req.Spec here, so the forwarded request
@@ -4032,6 +4032,13 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	}
 	if err := s.RequirePerm(ctx, vmRBACPath(vm), "vm.update", "operator"); err != nil {
 		return nil, err
+	}
+	// USB devices are the caller's to grant, judged here, as the caller,
+	// before the forward: the owner runs a forwarded call as the peer.
+	if req.SetUsbDevices {
+		if err := s.authorizeUSBDevices(ctx, req.UsbDevices); err != nil {
+			return nil, err
+		}
 	}
 	// Forward to the owning host first — it has authoritative state.
 	if vm.HostName != s.hostName {

@@ -248,13 +248,6 @@ enforcement:
                               # (an old peer could drop max_cpu from a spec it rewrites), after which
                               # `lv update --cpu` grows a running VM's vCPUs live up to its ceiling.
                               # Enable fleet-uniformly; the flag is the reversible kill switch.
-  usb_mounts_memory: false    # allow SETTING a VM's USB passthrough devices and virtio-mem memory
-                              # hot-add, and a container's host bind mounts and device nodes. Refused
-                              # until usb_mounts_memory_v1 latches cluster-wide (an older peer would
-                              # drop the fields from a spec it rewrites, or place the workload without
-                              # them). Advertisement is build-static, like live_resize; this flag only
-                              # decides whether THIS node originates them. A workload that already has
-                              # them keeps them when it is turned off. See docs/passthrough.md.
   digest_v2: true             # emit the order-invariant anti-entropy row digest (digest_v2), which
                               # pairs each value with its column NAME instead of hashing values in
                               # physical column order — so a fresh-CREATE vs ALTER-upgraded node stop
@@ -675,14 +668,17 @@ containers:
   # its files are shifted into the range at create), on, or off.
   idmapped_rootfs: auto
   # Host paths an ADMIN may pass into a container on THIS host (lv ct create
-  # --mount / --device; docs/passthrough.md). Each host path is resolved here,
-  # symlinks followed, and must land under one of these prefixes — at create
-  # and again at every start, so a container moved to a host that does not
-  # allow its paths does not start there. Mounts are read-only unless --mount
-  # asks for :rw, and always nosuid,nodev. Empty (the default) allows nothing.
-  # Allow only trees untrusted users cannot write.
+  # --mount / --device; docs/passthrough.md). A mount's host path is resolved
+  # here, symlinks followed, and must land under one of these prefixes; LXC's
+  # start hook mounts it from an fd on every start, never by path. A prefix
+  # that is, lies in or contains a protected tree (/, /etc, /run, the LXC
+  # store, litevirt's data and PKI directories, ...) is refused at load.
+  # Devices are listed EXACTLY, one node each (never a directory such as /dev;
+  # /dev/mem, /dev/kvm and /dev/vhost-* are refused). Mounts are read-only
+  # unless --mount asks for :rw, and always nosuid,nodev. Empty (the default)
+  # allows nothing. Allow only trees untrusted users cannot write.
   bind_mount_paths: []                # e.g. ["/srv/shared", "/mnt/media"]
-  device_paths: []                    # under /dev, e.g. ["/dev/ttyUSB0", "/dev/dri"]
+  device_paths: []                    # exact nodes, e.g. ["/dev/ttyUSB0", "/dev/dri/renderD128"]
 
 # ACME / autocert for the web UI cert (#13). When set, the daemon TERMINATES UI
 # TLS itself (port 7445) using a cert from the configured ACME directory, with an

@@ -641,7 +641,10 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 			break
 		}
 	}
-	if hostLocal {
+	// A VM with USB passthrough is never moved live (as on Proxmox VE): a
+	// mapped device is re-resolved on the target by the cold move, and a raw
+	// one has no target at all (placement keeps it on its host).
+	if hostLocal || len(parseSpecOrNil(fresh.Spec).GetUsbDevices()) > 0 {
 		return s.drainRunningVMCold(ctx, fresh, target, unlock, &adopted)
 	}
 

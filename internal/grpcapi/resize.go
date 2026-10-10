@@ -112,6 +112,17 @@ func (s *Server) resizeVMLive(ctx context.Context, name string, desired *pb.VMSp
 			return status.Errorf(codes.InvalidArgument,
 				"live resize target %d MiB must be the boot memory %d MiB plus a multiple of 2 MiB", wantMem, base)
 		}
+		// The running domain must actually have the region: one defined
+		// without it (by an older build, say) cannot plug anything, and a
+		// committed change it can never apply would hold the VM's operation
+		// barrier forever. Refused before anything is committed.
+		if live, xerr := s.virt.DumpXML(name); xerr != nil {
+			return status.Errorf(codes.Internal, "read domain XML for %q: %v", name, xerr)
+		} else if !lv.HasVirtioMem(live) {
+			return status.Errorf(codes.FailedPrecondition,
+				"VM %q runs without a virtio-mem device although its spec has memory hot-add; stop it and redefine it (lv update %s --memory-hotplug-max %d), then start it",
+				name, name, max)
+		}
 	} else if memDelta != 0 {
 		ceiling := stored.MaxMemoryMib
 		if ceiling == 0 {
@@ -157,8 +168,12 @@ func (s *Server) resizeVMLive(ctx context.Context, name string, desired *pb.VMSp
 	// then persist the desired spec + observed actuals under the barrier discipline.
 	// Documented best-effort — no F1 durability/recovery.
 	if err := s.applyLiveResize(ctx, name, target, stored); err != nil {
+		if errors.Is(err, lv.ErrNoVirtioMem) {
+			return status.Errorf(codes.FailedPrecondition, "live resize of %q: %v", name, err)
+		}
 		return status.Errorf(codes.Internal, "live resize: %v", err)
 	}
+	obsMem = s.hotplugHeldMiB(name, target, obsMem)
 	applied, newGen, err := corrosion.MutateDesiredSpec(ctx, s.db, name, func(old string) (string, error) {
 		fresh := &pb.VMSpec{}
 		if old != "" {
@@ -370,9 +385,33 @@ func (s *Server) driveResourceUpdate(ctx context.Context, vm *corrosion.VMRecord
 
 	var applyErr error
 	for attempt := 0; attempt < resizeApplyAttempts; attempt++ {
-		if applyErr = s.applyLiveResize(ctx, vm.Name, target, applyPrev); applyErr == nil {
+		if applyErr = s.applyLiveResize(ctx, vm.Name, target, applyPrev); applyErr == nil || errors.Is(applyErr, lv.ErrNoVirtioMem) {
 			break
 		}
+	}
+	if errors.Is(applyErr, lv.ErrNoVirtioMem) {
+		// The definition has no hot-add region (it drifted from the spec):
+		// no retry can apply this, so the operation ends here, failed, with
+		// the barrier cleared and the desired memory put back to what the
+		// domain holds — never left for a recovery that would retry forever.
+		if _, ferr := s.db.FailVMOperation(ctx, vm.Name, opID, ownerEpoch, newGen, "no virtio-mem device"); ferr != nil {
+			slog.Error("resize: failing an unappliable hot-add failed", "vm", vm.Name, "op", opID, "error", ferr)
+		}
+		if _, _, merr := corrosion.MutateDesiredSpec(ctx, s.db, vm.Name, func(old string) (string, error) {
+			fresh := &pb.VMSpec{}
+			if old != "" {
+				if uerr := json.Unmarshal([]byte(old), fresh); uerr != nil {
+					return "", uerr
+				}
+			}
+			fresh.MemoryMib = applyPrev.MemoryMib
+			b, err := json.Marshal(fresh)
+			return string(b), err
+		}); merr != nil {
+			slog.Error("resize: restoring the desired memory after an unappliable hot-add failed", "vm", vm.Name, "error", merr)
+		}
+		s.recordVMEvent(ctx, vm.Name, "vm.resized", "error", "memory hot-add refused: the domain has no virtio-mem device")
+		return status.Errorf(codes.FailedPrecondition, "live resize of %q: %v", vm.Name, applyErr)
 	}
 	if applyErr != nil {
 		// Persistent-config failure or an incomplete dimension: leave the operation
@@ -382,6 +421,7 @@ func (s *Server) driveResourceUpdate(ctx context.Context, vm *corrosion.VMRecord
 	}
 	s.appendOpStep(ctx, opID, ownerEpoch, corrosion.OpResourceUpdateRunning, corrosion.OpStepConfigApplied)
 	s.appendOpStep(ctx, opID, ownerEpoch, corrosion.OpResourceUpdateRunning, corrosion.OpStepLiveApplied)
+	obsMem = s.hotplugHeldMiB(vm.Name, target, obsMem)
 
 	if _, err := corrosion.UpdateObservedActuals(ctx, s.db, vm.Name, obsCPU, obsMem, ownerEpoch, newGen); err != nil {
 		slog.Error("resize: persisting actuals failed — accounting will lag until reconciled", "vm", vm.Name, "error", err)
@@ -588,4 +628,30 @@ func posOnly(d int) int {
 		return 0
 	}
 	return d
+}
+
+// hotplugHeldMiB is the memory a hot-add VM holds after a resize: the boot
+// cell plus the larger of what was requested and what the guest has actually
+// plugged (<current> in the live XML). An unplug the guest cannot complete
+// leaves the memory with QEMU, so placement and admission must keep counting
+// it until the two converge. Any other VM, or a domain that reports no
+// <current>, keeps obs.
+func (s *Server) hotplugHeldMiB(name string, target *pb.VMSpec, obs int) int {
+	if target.MemoryHotplugMaxMib <= 0 {
+		return obs
+	}
+	live, err := s.virt.DumpXML(name)
+	if err != nil {
+		return obs
+	}
+	cur, ok := lv.VirtioMemCurrentMiB(live)
+	if !ok {
+		return obs
+	}
+	if held := int(target.MemoryHotplugBaseMib) + cur; held > obs {
+		slog.Warn("memory hot-add: the guest still holds more than was requested; counting what it holds",
+			"vm", name, "requested_mib", target.MemoryMib, "held_mib", held)
+		return held
+	}
+	return obs
 }

@@ -140,3 +140,128 @@ func TestRelayHealthV1Registered(t *testing.T) {
 		t.Fatal("relay_health_v1 must be replication-gated: every replication recipient elects relays")
 	}
 }
+// TestReleaseTokenRegistered pins the release token's registration. Every one
+// of these sets matters: Supported is what peers latch on, All is what the
+// checker loads markers for and what the rollback preflight treats as known,
+// Mandatory is what the HA monitor drives with no flag, and ReplicationGated is
+// what makes a maintenance host on the previous build hold the latch off.
+func TestReleaseTokenRegistered(t *testing.T) {
+	const tok = "release_2026_11_v1"
+	if ReleaseToken != tok || Release202611V1 != tok {
+		t.Fatalf("ReleaseToken = %q, Release202611V1 = %q, want %q: the marker name is frozen",
+			ReleaseToken, Release202611V1, tok)
+	}
+	if !slices.Contains(Supported(), tok) {
+		t.Errorf("Supported() does not advertise %s, so it can never latch", tok)
+	}
+	if !slices.Contains(All(), tok) {
+		t.Errorf("All() lacks %s, so its latch is lost across a restart and its marker quarantines", tok)
+	}
+	if !Mandatory(tok) {
+		t.Errorf("%s is not mandatory, so nothing drives its latch", tok)
+	}
+	if !ReplicationGated(tok) {
+		t.Errorf("%s is not replication-gated, so it latches across a maintenance host on the old build", tok)
+	}
+	if Retired(tok) {
+		t.Errorf("%s is retired", tok)
+	}
+}
+
+// TestReleaseTokenMarkerCarriesRollbackRule: the marker is what a LATER build's
+// rollback lands on, and the rule has to be on disk for that build to read.
+// A token with no rule keeps the historical content byte for byte.
+func TestReleaseTokenMarkerCarriesRollbackRule(t *testing.T) {
+	if got := string(MarkerContent(ReleaseToken)); got != "1\nrollback: safe_if_unused\n" {
+		t.Errorf("MarkerContent(%s) = %q, want the safe_if_unused rule", ReleaseToken, got)
+	}
+	if got := string(MarkerContent(SplitBrainGateV1)); got != "1\n" {
+		t.Errorf("MarkerContent(%s) = %q, want %q", SplitBrainGateV1, got, "1\n")
+	}
+	for tok := range rollbackRules {
+		if !slices.Contains(All(), tok) {
+			t.Errorf("rollback rule for %s, which is not a live token", tok)
+		}
+	}
+}
+
+// TestReleaseFeaturesAreWellFormed: a feature's name is written into a
+// replicated key ("release_feature/<token>/<feature>"), so a slash or an
+// upper-case letter would make two spellings of one feature, and its token must
+// be one this build knows.
+func TestReleaseFeaturesAreWellFormed(t *testing.T) {
+	for _, f := range Features() {
+		info, _ := LookupFeature(f)
+		if f == "" {
+			t.Errorf("an empty feature name is declared")
+		}
+		for _, r := range string(f) {
+			if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '_') {
+				t.Errorf("feature %q: %q is not a lower-case letter, digit or underscore", f, r)
+			}
+		}
+		if !slices.Contains(All(), info.Token) || RollbackRule(info.Token) != RollbackSafeIfUnused {
+			t.Errorf("feature %q gates on %q, which is not a live release token", f, info.Token)
+		}
+		if info.Description == "" {
+			t.Errorf("feature %q has no description for upgrade-status", f)
+		}
+	}
+}
+
+// TestFeatureGrant_OnlyAMintedGrantForTheFeatureChecks: the zero value, and a
+// grant for another feature, refuse.
+func TestFeatureGrant_OnlyAMintedGrantForTheFeatureChecks(t *testing.T) {
+	var zero FeatureGrant
+	if zero.Check("widgets") == nil {
+		t.Error("the zero FeatureGrant passed Check")
+	}
+	g := mintGrant("widgets")
+	if err := g.Check("widgets"); err != nil {
+		t.Errorf("a grant for widgets: %v", err)
+	}
+	if g.Check("gadgets") == nil {
+		t.Error("a grant for widgets passed Check for gadgets")
+	}
+}
+
+// TestReleaseTokenRuleIsNotHonouredBelowIt: every build below the first
+// release token predates marker rules, so a rollback below it quarantines
+// whatever was used — upgrade-status must not say otherwise.
+func TestReleaseTokenRuleIsNotHonouredBelowIt(t *testing.T) {
+	if RuleHonouredBelow(Release202611V1) {
+		t.Errorf("RuleHonouredBelow(%s) = true; the build below it reads no rule", Release202611V1)
+	}
+	if RuleHonouredBelow(SplitBrainGateV1) {
+		t.Errorf("RuleHonouredBelow(%s) = true for a token with no rule", SplitBrainGateV1)
+	}
+}
+
+// TestHonoured: a (token, feature) pair is honoured only when this build
+// declares the feature under that token.
+func TestHonoured(t *testing.T) {
+	defer OverrideFeaturesForTest(map[Feature]FeatureInfo{"widgets": {Token: ReleaseToken, Description: "w"}})()
+	if !Honoured(ReleaseToken, "widgets") {
+		t.Error("a declared feature under its token is not honoured")
+	}
+	if Honoured(ReleaseToken, "gadgets") || Honoured("release_2099_01_v1", "widgets") {
+		t.Error("an undeclared pair is honoured")
+	}
+}
+
+// TestGrantMinter_ClaimedOnce: the gate claims the only minter at init; a
+// second claimant — any other package trying to mint grants — panics.
+func TestGrantMinter_ClaimedOnce(t *testing.T) {
+	grantMinterClaimed.Store(false)
+	t.Cleanup(func() { grantMinterClaimed.Store(false) })
+	mint := ClaimGrantMinter()
+	if mint("widgets").Check("widgets") != nil {
+		t.Fatal("the claimed minter's grant does not check")
+	}
+	defer func() {
+		if recover() == nil {
+			t.Fatal("a second ClaimGrantMinter did not panic")
+		}
+	}()
+	_ = ClaimGrantMinter()
+}

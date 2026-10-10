@@ -32,6 +32,13 @@ type AntiEntropy struct {
 	pkiDir   string
 	interval time.Duration
 
+	// probationPull answers VerifyReleaseProbation's pulls; nil uses the real
+	// pull (pullClusterPoliciesForProbation). Tests replace it.
+	probationPull probationPullFunc
+	// checkFrom answers OnUnknownReleaseToken's look; nil uses
+	// CheckReleaseUsesFrom. Tests replace it.
+	checkFrom func(ctx context.Context, peer string) error
+
 	// mu guards the trigger decision only (not the pass itself): a pass no-ops when one is
 	// already running or ran within antiEntropyCooldown. It never bypasses checkPeers's
 	// per-table digest-gating (merge only on mismatch) — it just decides whether to run.
@@ -57,6 +64,11 @@ type AntiEntropy struct {
 }
 
 // NewAntiEntropy creates an anti-entropy checker.
+// probationPullFunc pulls cluster_policies from peer for a probation check and
+// reports whether that peer is itself in release probation. A field so tests
+// can answer without dialling.
+type probationPullFunc func(ctx context.Context, peer string) (inProbation bool, err error)
+
 func NewAntiEntropy(client *Client, pkiDir string, interval time.Duration) *AntiEntropy {
 	if interval == 0 {
 		interval = 60 * time.Second
@@ -263,6 +275,14 @@ func (ae *AntiEntropy) checkPeer(ctx context.Context, peerName string, localMap,
 		slog.Warn("anti-entropy: NOT merging from an isolated peer",
 			"peer", peerName, "isolation_epoch", epoch, "reason", reason,
 			"fix", "reseed "+peerName+" to bring it back into the compatibility regime")
+		return false
+	}
+	// A peer that cannot keep the data of a release feature in use is not
+	// merged from either (release_features.go, SetReplicationSourceGate): its
+	// rows may be rewrites that dropped that data.
+	if err := ae.client.ReplicationSourceAllowed(ctx, peerName); err != nil {
+		slog.Warn("anti-entropy: NOT merging from a peer that cannot keep a release feature in use",
+			"peer", peerName, "error", err)
 		return false
 	}
 	client, conn, err := ae.peerClient(ctx, peerName)

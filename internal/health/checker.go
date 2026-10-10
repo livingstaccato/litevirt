@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/pki"
 )
@@ -179,6 +180,17 @@ type Checker struct {
 	// InQuorumRegainGraceFor reads them. Guarded by mu.
 	quorumLost       map[string]bool
 	quorumRegainedAt map[string]time.Time
+	// featuresRecorded is every release feature whose use this node has seen
+	// recorded (WithFeature). Monotone, like the record. Guarded by mu.
+	featuresRecorded map[capabilities.Feature]bool
+	// releaseConfirm asks a peer whether it holds a used record
+	// (SetReleaseUseConfirmer). Guarded by mu.
+	releaseConfirm ReleaseUseConfirmer
+	// unknownReleaseObserver / unknownReleaseSeen: a peer advertising a
+	// release token this build does not know (SetUnknownReleaseTokenObserver).
+	// Guarded by mu.
+	unknownReleaseObserver func(peer, token string)
+	unknownReleaseSeen     map[string]bool
 }
 
 // now reads the checker's local clock.

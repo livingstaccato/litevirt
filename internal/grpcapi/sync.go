@@ -464,6 +464,14 @@ func (s *Server) PushMutations(ctx context.Context, req *pb.ReplicateRequest) (*
 	if err := s.requireNotIsolated(ctx, req.Sender); err != nil {
 		return nil, err
 	}
+	if err := s.ReleaseSenderAllowed(ctx, req.Sender, req.SenderCapabilities); err != nil {
+		return nil, err
+	}
+	// And the ORIGIN of each relayed entry: a relay that has not latched the
+	// release token yet would otherwise pass on what it should have refused.
+	if err := s.releaseOriginsAllowed(ctx, req.Sender, req.Entries); err != nil {
+		return nil, err
+	}
 
 	// Schema-version skew check, keyed off DB-APPLIED schema (the columns each
 	// DB actually has), not the binary const. Both sides advertise/compare their

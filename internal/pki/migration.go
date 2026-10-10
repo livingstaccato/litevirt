@@ -1,16 +1,20 @@
 package pki
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/secretfile"
@@ -49,6 +53,67 @@ const (
 
 // MigrationDir is the host's migration-credential directory under pkiDir.
 func MigrationDir(pkiDir string) string { return filepath.Join(pkiDir, MigrationDirName) }
+
+// parseCABundle returns every certificate in a PEM bundle, in order. During a
+// rotation a host's ca.crt holds the old CA and the new one.
+func parseCABundle(data []byte) ([]*x509.Certificate, error) {
+	var cas []*x509.Certificate
+	for rest := data; ; {
+		var b *pem.Block
+		b, rest = pem.Decode(rest)
+		if b == nil {
+			break
+		}
+		if b.Type != "CERTIFICATE" {
+			continue
+		}
+		c, err := x509.ParseCertificate(b.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("parse a CA certificate: %w", err)
+		}
+		if !c.IsCA {
+			return nil, fmt.Errorf("%q in the CA bundle is not a CA", c.Subject.CommonName)
+		}
+		cas = append(cas, c)
+	}
+	if len(cas) == 0 {
+		return nil, errors.New("the CA bundle holds no certificate")
+	}
+	return cas, nil
+}
+
+// ValidateMigrationCredentials checks a host's migration set as QEMU will use
+// it: the key belongs to the certificate, and the certificate was issued by a
+// CA in the bundle and is valid at now. A push copies the files one at a time,
+// so a set read mid-push fails here instead of failing QEMU's handshake.
+func ValidateMigrationCredentials(ca, cert, key []byte, now time.Time) (*x509.Certificate, []*x509.Certificate, error) {
+	cas, err := parseCABundle(ca)
+	if err != nil {
+		return nil, nil, err
+	}
+	pair, err := tls.X509KeyPair(cert, key)
+	if err != nil {
+		return nil, cas, fmt.Errorf("the host key does not match its certificate "+
+			"(a credential push may be in progress): %w", err)
+	}
+	leaf, err := x509.ParseCertificate(pair.Certificate[0])
+	if err != nil {
+		return nil, cas, fmt.Errorf("parse the host certificate: %w", err)
+	}
+	pool := x509.NewCertPool()
+	for _, c := range cas {
+		pool.AddCert(c)
+	}
+	if _, err := leaf.Verify(x509.VerifyOptions{
+		Roots:       pool,
+		CurrentTime: now,
+		KeyUsages:   []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+	}); err != nil {
+		return leaf, cas, fmt.Errorf("the host certificate is not issued by a CA in %s, "+
+			"or has expired: %w", MigrationCAName, err)
+	}
+	return leaf, cas, nil
+}
 
 // GenerateMigrationCA creates the migration CA: a self-signed ECDSA P-256 CA,
 // distinct from the cluster CA. Host certificates are issued from it with
@@ -90,6 +155,25 @@ func GenerateMigrationCA(certPath, keyPath string) error {
 	return writePEM(keyPath, "EC PRIVATE KEY", keyDER)
 }
 
+// upToDate reports whether path already holds data with mode and, when uid is
+// not -1, that owner. The installer runs before every storage migration;
+// rewriting unchanged files would let two concurrent runs tear each other's
+// pair.
+func upToDate(path string, data []byte, mode os.FileMode, uid, gid int) bool {
+	st, err := os.Stat(path)
+	if err != nil || st.Mode().Perm() != mode {
+		return false
+	}
+	if uid >= 0 {
+		sys, ok := st.Sys().(*syscall.Stat_t)
+		if !ok || int(sys.Uid) != uid || int(sys.Gid) != gid {
+			return false
+		}
+	}
+	have, err := os.ReadFile(path)
+	return err == nil && bytes.Equal(have, data)
+}
+
 // InstallQemuMigrationTLS copies this host's migration credentials from
 // pkiDir/migration into qemuDir under the names libvirt reads for migration TLS.
 // The keys are written 0400 and, when keyUID >= 0, owned by keyUID:keyGID (the
@@ -116,6 +200,10 @@ func InstallQemuMigrationTLS(pkiDir, qemuDir string, keyUID, keyGID int) (bool, 
 		*f.dst = data
 	}
 
+	if _, _, err := ValidateMigrationCredentials(ca, cert, key, time.Now()); err != nil {
+		return false, fmt.Errorf("not installing migration credentials: %w", err)
+	}
+
 	if err := claimQemuTLSDir(qemuDir); err != nil {
 		return false, err
 	}
@@ -138,6 +226,9 @@ func InstallQemuMigrationTLS(pkiDir, qemuDir string, keyUID, keyGID int) (bool, 
 			// Owned by the QEMU user before it is renamed into place, so the key
 			// is never readable by anyone else, even briefly.
 			uid, gid = keyUID, keyGID
+		}
+		if upToDate(path, f.data, f.mode, uid, gid) {
+			continue
 		}
 		if err := secretfile.WriteOwned(path, f.data, f.mode, uid, gid); err != nil {
 			return false, fmt.Errorf("install %s: %w", path, err)

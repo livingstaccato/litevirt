@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
+	lv "github.com/litevirt/litevirt/internal/libvirt"
 )
 
 // The noisy-neighbour controls: a VM's CPU cap and weight and a NIC's bandwidth
@@ -34,7 +36,7 @@ vms:
     cpu: 2
     memory: 512
     cpu-limit: 1
-    cpu-shares: 2048
+    cpu-shares: 200
     placement:
       host: node-0
     network:
@@ -42,11 +44,13 @@ vms:
         rate: 2
 `
 
-// 2 MB/s = 2e6 B/s = 1953 KiB/s, both directions.
+// 1 core is a 100000us quota per 100000us period across the WHOLE domain
+// (global_quota), whatever the vCPU count; 2 MB/s = 2000 KB/s (libvirt's unit),
+// both directions; cpu-shares is the cgroup v2 weight.
 const (
-	quotaFor1Of2  = "<quota>50000</quota>"
-	sharesFor2048 = "<shares>2048</shares>"
-	rateFor2      = `<inbound average="1953"`
+	quotaFor1Core = "<global_quota>100000</global_quota>"
+	sharesFor200  = "<shares>200</shares>"
+	rateFor2      = `<inbound average="2000"`
 )
 
 // newLimitsNode is newUpdateNode with a real capability gate wired, on which
@@ -103,10 +107,10 @@ func mustNotContain(t *testing.T, what, xml string, nots ...string) {
 func TestFleet_VMLimitsAreRenderedAtCreate(t *testing.T) {
 	ctx, node, _, _ := setupLimitsVM(t)
 	xml := node.Virt.DefinedXML("db")
-	mustContain(t, "created domain", xml, quotaFor1Of2, "<period>100000</period>", sharesFor2048, rateFor2, `<outbound average="1953"`)
+	mustContain(t, "created domain", xml, quotaFor1Core, "<global_period>100000</global_period>", sharesFor200, rateFor2, `<outbound average="2000"`)
 	spec := storedSpec(t, ctx, node, "db")
-	if spec.CpuLimit != 1 || spec.CpuShares != 2048 || spec.Network[0].RateMbSec != 2 {
-		t.Errorf("stored spec limits = %v/%v/%v, want 1/2048/2", spec.CpuLimit, spec.CpuShares, spec.Network[0].RateMbSec)
+	if spec.CpuLimit != 1 || spec.CpuShares != 200 || spec.Network[0].RateMbSec != 2 {
+		t.Errorf("stored spec limits = %v/%v/%v, want 1/200/2", spec.CpuLimit, spec.CpuShares, spec.Network[0].RateMbSec)
 	}
 }
 
@@ -114,7 +118,7 @@ func TestFleet_ComposeLimitChangesApplyLiveToTheRunningVM(t *testing.T) {
 	ctx, node, client, before := setupLimitsVM(t)
 
 	next := edit(t, composeLimitsBase, "cpu-limit: 1\n", "cpu-limit: 1.5\n")
-	next = edit(t, next, "cpu-shares: 2048\n", "cpu-shares: 512\n")
+	next = edit(t, next, "cpu-shares: 200\n", "cpu-shares: 400\n")
 	next = edit(t, next, "rate: 2\n", "rate: 4\n")
 	if phase, detail := planDetailFor(t, ctx, client, next, "db"); phase != "update" || !strings.Contains(detail, "in place") {
 		t.Errorf("plan for a limit change = %s %q, want an update applied in place", phase, detail)
@@ -125,9 +129,9 @@ func TestFleet_ComposeLimitChangesApplyLiveToTheRunningVM(t *testing.T) {
 	assertSameVM(t, ctx, node, "db", before, from, false)
 
 	xml := node.Virt.DefinedXML("db")
-	// 1.5 cores over 2 vCPUs = 75000 per vCPU; 4 MB/s = 3906 KiB/s.
-	mustContain(t, "updated domain", xml, "<quota>75000</quota>", "<shares>512</shares>", `<inbound average="3906"`)
-	mustNotContain(t, "updated domain", xml, quotaFor1Of2, sharesFor2048, rateFor2)
+	// 1.5 cores = 150000us per period across the domain; 4 MB/s = 4000 KB/s.
+	mustContain(t, "updated domain", xml, "<global_quota>150000</global_quota>", "<shares>400</shares>", `<inbound average="4000"`)
+	mustNotContain(t, "updated domain", xml, quotaFor1Core, sharesFor200, rateFor2)
 	sawTune, sawRate := false, false
 	for _, e := range node.Virt.EventLog()[from:] {
 		switch e.Op {
@@ -143,8 +147,8 @@ func TestFleet_ComposeLimitChangesApplyLiveToTheRunningVM(t *testing.T) {
 		t.Errorf("limit change did not reach libvirt (cputune=%v nic-rate=%v)", sawTune, sawRate)
 	}
 	spec := storedSpec(t, ctx, node, "db")
-	if spec.CpuLimit != 1.5 || spec.CpuShares != 512 || spec.Network[0].RateMbSec != 4 {
-		t.Errorf("stored spec limits = %v/%v/%v, want 1.5/512/4", spec.CpuLimit, spec.CpuShares, spec.Network[0].RateMbSec)
+	if spec.CpuLimit != 1.5 || spec.CpuShares != 400 || spec.Network[0].RateMbSec != 4 {
+		t.Errorf("stored spec limits = %v/%v/%v, want 1.5/400/4", spec.CpuLimit, spec.CpuShares, spec.Network[0].RateMbSec)
 	}
 	// Converged.
 	if phase, detail := planDetailFor(t, ctx, client, next, "db"); phase != "no-change" {
@@ -152,11 +156,11 @@ func TestFleet_ComposeLimitChangesApplyLiveToTheRunningVM(t *testing.T) {
 	}
 
 	// Dropping the keys removes the caps — a declarative file's meaning.
-	bare := edit(t, next, "    cpu-limit: 1.5\n    cpu-shares: 512\n", "")
+	bare := edit(t, next, "    cpu-limit: 1.5\n    cpu-shares: 400\n", "")
 	bare = edit(t, bare, "        rate: 4\n", "")
 	deployClean(t, ctx, client, bare)
 	xml = node.Virt.DefinedXML("db")
-	mustNotContain(t, "uncapped domain", xml, "<quota>75000</quota>", "<bandwidth>")
+	mustNotContain(t, "uncapped domain", xml, "<global_quota>150000</global_quota>", "<bandwidth>")
 	spec = storedSpec(t, ctx, node, "db")
 	if spec.CpuLimit != 0 || spec.Network[0].RateMbSec != 0 {
 		t.Errorf("caps survived their removal: limit=%v rate=%v", spec.CpuLimit, spec.Network[0].RateMbSec)
@@ -174,8 +178,10 @@ func TestFleet_UpdateVMLimitsOnAStoppedVMEditTheConfigOnly(t *testing.T) {
 		t.Fatalf("UpdateVM: %v", err)
 	}
 	xml := node.Virt.DefinedXML("db")
-	// 0.5 over 2 vCPUs = 25000; shares 0 restores the 1024 default; 1 MB/s = 977 KiB/s.
-	mustContain(t, "stopped domain", xml, "<quota>25000</quota>", "<shares>1024</shares>", `<inbound average="977"`)
+	// 0.5 core = 50000us per period; shares 0 restores the HOST's default weight
+	// (100 on cgroup v2, never a hard-coded 1024); 1 MB/s = 1000 KB/s.
+	mustContain(t, "stopped domain", xml, "<global_quota>50000</global_quota>",
+		fmt.Sprintf("<shares>%d</shares>", lv.DefaultCPUWeight()), `<inbound average="1000"`)
 	if rec := storedSpec(t, ctx, node, "db"); rec.CpuLimit != 0.5 || rec.CpuShares != 0 {
 		t.Errorf("spec = limit %v shares %d, want 0.5 / 0 (default)", rec.CpuLimit, rec.CpuShares)
 	}
@@ -184,7 +190,7 @@ func TestFleet_UpdateVMLimitsOnAStoppedVMEditTheConfigOnly(t *testing.T) {
 func TestFleet_UpdateVMLimitsAreRefusedWhenInvalid(t *testing.T) {
 	ctx, node, client, _ := setupLimitsVM(t)
 	pre := node.Virt.DefinedXML("db")
-	tooBig, tooSmall, badShares := 3.0, 0.001, int32(1)
+	tooBig, tooSmall, badShares := 3.0, 0.001, int32(20000)
 	for name, req := range map[string]*pb.UpdateVMRequest{
 		"limit above vcpus":     {Name: "db", CpuLimit: &tooBig},
 		"limit below the floor": {Name: "db", CpuLimit: &tooSmall},
@@ -225,7 +231,7 @@ func TestFleet_UpdateVMLimitsRollBackWhenLibvirtRefuses(t *testing.T) {
 	}
 	// The CPU half had already been applied; it is put back, and the spec never moved.
 	xml := node.Virt.DefinedXML("db")
-	mustContain(t, "rolled-back domain", xml, quotaFor1Of2, rateFor2)
+	mustContain(t, "rolled-back domain", xml, quotaFor1Core, rateFor2)
 	if spec := storedSpec(t, ctx, node, "db"); spec.CpuLimit != 1 || spec.Network[0].RateMbSec != 2 {
 		t.Errorf("spec limits = %v/%v after a refused update, want 1/2", spec.CpuLimit, spec.Network[0].RateMbSec)
 	}
@@ -239,18 +245,17 @@ func TestFleet_VMLimitsSurviveRedefine(t *testing.T) {
 	if _, err := client.StopVM(ctx, &pb.StopVMRequest{Name: "db"}); err != nil {
 		t.Fatal(err)
 	}
-	// In-place patch: 2 → 4 vCPUs halves the per-vCPU quota for the same 1-core cap.
+	// In-place patch: 2 → 4 vCPUs moves nothing — the cap is the domain's, not per vCPU.
 	if _, err := client.UpdateVM(ctx, &pb.UpdateVMRequest{Name: "db", Cpu: 4}); err != nil {
 		t.Fatalf("UpdateVM cpu: %v", err)
 	}
-	mustContain(t, "resized domain", node.Virt.DefinedXML("db"), "<quota>25000</quota>", sharesFor2048, rateFor2)
-	mustNotContain(t, "resized domain", node.Virt.DefinedXML("db"), quotaFor1Of2)
+	mustContain(t, "resized domain", node.Virt.DefinedXML("db"), quotaFor1Core, sharesFor200, rateFor2)
 
 	// Full regeneration (a machine-type change cannot be patched in place).
 	if _, err := client.UpdateVM(ctx, &pb.UpdateVMRequest{Name: "db", Machine: "pc"}); err != nil {
 		t.Fatalf("UpdateVM machine: %v", err)
 	}
-	mustContain(t, "regenerated domain", node.Virt.DefinedXML("db"), "<quota>25000</quota>", sharesFor2048, rateFor2, `<outbound average="1953"`)
+	mustContain(t, "regenerated domain", node.Virt.DefinedXML("db"), quotaFor1Core, sharesFor200, rateFor2, `<outbound average="2000"`)
 }
 
 // A VM rebuilt on a new host after a failover is defined from its stored spec by
@@ -284,9 +289,9 @@ func TestFleet_VMLimitsSurviveFailoverRebuild(t *testing.T) {
 	rec.SetNetworkProvision(survivor.Net.Provision)
 	rec.ReconcileOnce(ctx)
 
-	// 2 cores over 4 vCPUs = 50000 each; 5 MB/s = 4883 KiB/s.
+	// 2 cores = 200000us per period across the domain; 5 MB/s = 5000 KB/s.
 	mustContain(t, "rebuilt domain", survivor.Virt.DefinedXML("db"),
-		"<quota>50000</quota>", "<shares>300</shares>", `<inbound average="4883"`, `<outbound average="4883"`)
+		"<global_quota>200000</global_quota>", "<shares>300</shares>", `<inbound average="5000"`, `<outbound average="5000"`)
 }
 
 // ── the vm_limits_v1 gate ──────────────────────────────────────────────────
@@ -365,6 +370,12 @@ func TestFleet_VMLimitsAreNeverForwardedBeforeTheLatch(t *testing.T) {
 	putVM(t, owner, "far", 2, "stopped")
 	owner.Virt.SetState("far", "stopped")
 	before := len(owner.Virt.EventLog())
+	// The OWNER has the token latched (the entry node has no gate, so it has
+	// not). A request forwarded to it would therefore be accepted and applied:
+	// the refusal below can only have come from the entry node.
+	if !gateFor(t, c, owner).Enforced(context.Background(), capabilities.VMLimitsV1) {
+		t.Fatal("vm_limits_v1 did not latch on the owner")
+	}
 
 	limit := 1.0
 	_, err := c.SelfClient(entry).UpdateVM(context.Background(), &pb.UpdateVMRequest{Name: "far", CpuLimit: &limit})
@@ -409,5 +420,31 @@ func TestFleet_VMLimitsRefusedUntilTheTokenLatches_CreateVM(t *testing.T) {
 	spec.CpuShares = 0
 	if _, err := client.CreateVM(ctx, &pb.CreateVMRequest{Spec: spec}); err != nil {
 		t.Errorf("limitless CreateVM before the latch: %v", err)
+	}
+}
+
+// A compose file that lowers the cpu count and the limit together deploys: the
+// reconfigure carries the new limit with the new count, so the old limit is
+// never judged against the new count.
+func TestFleet_ComposeShrinkWithAMatchingLimitDeploys(t *testing.T) {
+	node, client := newLimitsNode(t)
+	ctx := context.Background()
+	big := edit(t, composeLimitsBase, "    cpu: 2\n", "    cpu: 4\n")
+	big = edit(t, big, "cpu-limit: 1\n", "cpu-limit: 3\n")
+	deployClean(t, ctx, client, big)
+	waitRunning(t, ctx, node, "db")
+
+	small := edit(t, big, "    cpu: 4\n", "    cpu: 2\n")
+	small = edit(t, small, "cpu-limit: 3\n", "cpu-limit: 1\n")
+	deployClean(t, ctx, client, small)
+	waitRunning(t, ctx, node, "db")
+
+	spec := storedSpec(t, ctx, node, "db")
+	if spec.Cpu != 2 || spec.CpuLimit != 1 {
+		t.Errorf("spec cpu=%d limit=%v, want 2 / 1", spec.Cpu, spec.CpuLimit)
+	}
+	mustContain(t, "shrunk domain", node.Virt.DefinedXML("db"), quotaFor1Core, "<vcpu>2</vcpu>")
+	if phase, detail := planDetailFor(t, ctx, client, small, "db"); phase != "no-change" {
+		t.Errorf("re-applying the file plans %s %q, want no change", phase, detail)
 	}
 }

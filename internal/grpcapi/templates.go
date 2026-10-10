@@ -146,6 +146,10 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 	if src.Spec != "" {
 		_ = json.Unmarshal([]byte(src.Spec), &srcSpec)
 	}
+	// The clone carries the source's limits; judge them as a create's are.
+	if err := s.checkCopiedSpecLimits(ctx, &srcSpec); err != nil {
+		return nil, err
+	}
 
 	// A clone does not claim. It rebuilds the source's NIC list with fresh MACs
 	// and persists it directly, so on a NetBox-bound network it would either

@@ -59,7 +59,7 @@ type VMConfig struct {
 
 	// CPULimit caps the VM's total CPU time in host cores (Proxmox cpulimit);
 	// 0 = unlimited. CPUShares is the relative CPU weight (libvirt <shares>);
-	// 0 = leave at the default. Both render into <cputune> (see CPUTuneQuota).
+	// 0 = leave at the default. Both render into <cputune> (see GlobalQuota).
 	CPULimit  float64
 	CPUShares int
 
@@ -358,9 +358,9 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 			dom.CPUTune.Shares = &sh
 		}
 		if cfg.CPULimit > 0 {
-			period, quota := CPUTuneQuota(cfg.CPULimit, cfg.CPU)
-			dom.CPUTune.Period = &period
-			dom.CPUTune.Quota = &quota
+			period, quota := GlobalQuota(cfg.CPULimit)
+			dom.CPUTune.GlobalPeriod = &period
+			dom.CPUTune.GlobalQuota = &quota
 		}
 	}
 
@@ -817,8 +817,9 @@ type memoryBacking struct {
 type cpuTune struct {
 	VCPUPin []vcpuPin `xml:"vcpupin"`
 	Shares  *uint64   `xml:"shares,omitempty"`
-	Period  *uint64   `xml:"period,omitempty"`
-	Quota   *int64    `xml:"quota,omitempty"`
+	// GlobalPeriod/GlobalQuota cap the whole domain (cpu.max of its cgroup).
+	GlobalPeriod *uint64 `xml:"global_period,omitempty"`
+	GlobalQuota  *int64  `xml:"global_quota,omitempty"`
 }
 
 type vcpuPin struct {

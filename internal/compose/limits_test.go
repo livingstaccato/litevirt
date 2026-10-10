@@ -39,10 +39,11 @@ func TestParse_LimitsReachTheVMSpec(t *testing.T) {
 
 func TestParse_LimitsAreValidated(t *testing.T) {
 	for name, edit := range map[string][2]string{
-		"limit above cpu":  {"cpu-limit: 2.5", "cpu-limit: 5"},
-		"negative limit":   {"cpu-limit: 2.5", "cpu-limit: -1"},
-		"shares too small": {"cpu-shares: 2048", "cpu-shares: 1"},
-		"negative rate":    {"rate: 12.5", "rate: -2"},
+		"limit above cpu":               {"cpu-limit: 2.5", "cpu-limit: 5"},
+		"negative limit":                {"cpu-limit: 2.5", "cpu-limit: -1"},
+		"shares above the weight range": {"cpu-shares: 2048", "cpu-shares: 20000"},
+		"shares negative":               {"cpu-shares: 2048", "cpu-shares: -3"},
+		"negative rate":                 {"rate: 12.5", "rate: -2"},
 	} {
 		_, err := ParseBytes([]byte(strings.Replace(limitsYAML, edit[0], edit[1], 1)))
 		if err == nil {
@@ -64,5 +65,23 @@ func TestNICRate(t *testing.T) {
 	}
 	if NICRate(nil, 0, "a") != 0 {
 		t.Error("nil spec has a rate")
+	}
+}
+
+// cpu-limit, cpu-shares and rate are VM controls (libvirt cputune/bandwidth); a
+// container entry has no such thing, so setting one is an error, not a silent no-op.
+func TestParse_LimitsAreRejectedOnContainers(t *testing.T) {
+	for name, extra := range map[string]string{
+		"cpu-limit":  "    cpu-limit: 1\n",
+		"cpu-shares": "    cpu-shares: 200\n",
+	} {
+		y := "name: lim\nvms:\n  c:\n    kind: lxc\n    image: alpine:3.21\n    cpu: 2\n" + extra
+		if _, err := ParseBytes([]byte(y)); err == nil {
+			t.Errorf("%s on an lxc entry parsed without error", name)
+		}
+	}
+	y := "name: lim\nnetworks:\n  n1: {}\nvms:\n  c:\n    kind: oci\n    image: alpine:3.21\n    network:\n      - name: n1\n        rate: 5\n"
+	if _, err := ParseBytes([]byte(y)); err == nil {
+		t.Error("a NIC rate on an oci entry parsed without error")
 	}
 }

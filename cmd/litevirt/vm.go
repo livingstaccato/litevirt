@@ -105,7 +105,7 @@ func newRunCmd() *cobra.Command {
 			"AVX/AVX2/SSE4.2; host-passthrough adds nested virt but pins live migration to identical hardware)")
 	cmd.Flags().StringVar(&cpuModel, "cpu-model", "", "CPU model for --cpu-mode custom (e.g. x86-64-v3)")
 	cmd.Flags().Float64Var(&cpuLimit, "cpu-limit", 0, "Cap the VM's total CPU at this many host cores, fractions allowed, at most --cpu (0 = unlimited)")
-	cmd.Flags().Int32Var(&cpuShares, "cpu-shares", 0, "Relative CPU weight under contention, 2-262144 (default 1024)")
+	cmd.Flags().Int32Var(&cpuShares, "cpu-shares", 0, "CPU weight under contention, 1-10000: the cgroup v2 weight, Proxmox cpuunits (default 100)")
 	cmd.Flags().Int32Var(&memory, "memory", 4096, "Memory in MiB (boot allocation)")
 	cmd.Flags().Int32Var(&minMemory, "min-mem", 0, "Minimum memory in MiB the balloon may reclaim to (0 = none)")
 	cmd.Flags().Int32Var(&maxMemory, "max-mem", 0, "Maximum memory in MiB the guest may balloon up to (0 = fixed at --memory)")

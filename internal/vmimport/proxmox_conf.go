@@ -100,6 +100,19 @@ func parseProxmoxConfBytes(data []byte) (*ForeignVM, error) {
 
 	fv.MemoryMiB = atoiSafe(pc.keys["memory"]) // already MiB in Proxmox
 
+	// cpulimit, cpuunits and a NIC's rate= have litevirt equivalents, but an
+	// import does not carry them (they are a gated, validated create/update the
+	// import has not asked for). Say so, with the command to set them, rather
+	// than dropping them silently.
+	if v, ok := pc.keys["cpulimit"]; ok {
+		if f, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err != nil || f != 0 {
+			fv.Warnf("source sets cpulimit=%s (not imported); set it after the import with `lv update <vm> --cpu-limit <cores>`", strings.TrimSpace(v))
+		}
+	}
+	if v, ok := pc.keys["cpuunits"]; ok {
+		fv.Warnf("source sets cpuunits=%s (not imported); set it after the import with `lv update <vm> --cpu-shares <weight>` (the same cgroup weight)", strings.TrimSpace(v))
+	}
+
 	// Firmware: ovmf → uefi, seabios/absent → bios.
 	if strings.EqualFold(pc.keys["bios"], "ovmf") {
 		fv.Firmware = "uefi"
@@ -153,6 +166,12 @@ func parseProxmoxConfBytes(data []byte) (*ForeignVM, error) {
 	sortIndexedKeys(netKeys, "net")
 	for _, key := range netKeys {
 		if nic, ok := parseProxmoxNIC(pc.keys[key]); ok {
+			for _, kv := range strings.Split(pc.keys[key], ",") {
+				if k, v, _ := strings.Cut(strings.TrimSpace(kv), "="); strings.EqualFold(k, "rate") {
+					fv.Warnf("%s sets rate=%s MB/s (not imported); set it after the import with `lv update <vm> --nic-rate %d=%s`",
+						key, strings.TrimSpace(v), len(fv.NICs), strings.TrimSpace(v))
+				}
+			}
 			fv.NICs = append(fv.NICs, nic)
 		} else {
 			fv.Warnf("could not parse network device %q (%q); skipped", key, pc.keys[key])

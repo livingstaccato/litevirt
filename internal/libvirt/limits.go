@@ -3,6 +3,7 @@ package libvirt
 import (
 	"fmt"
 	"math"
+	"os"
 	"regexp"
 	"strings"
 
@@ -15,42 +16,53 @@ import (
 
 const (
 	// CPUPeriodUS is the CFS enforcement period litevirt uses (100 ms, the
-	// kernel default). Quota is expressed against it.
+	// kernel default). The cap is expressed against it.
 	CPUPeriodUS = 100000
-	// minCPUQuotaUS is libvirt's floor for a vCPU quota (1000 microseconds).
+	// minCPUQuotaUS is libvirt's floor for a quota (1000 microseconds).
 	minCPUQuotaUS = 1000
 
-	// CPUSharesMin / CPUSharesMax bound libvirt's <shares>.
-	CPUSharesMin = 2
-	CPUSharesMax = 262144
+	// CPUWeightMin / CPUWeightMax bound cpu-shares: Proxmox's cpuunits, which is
+	// the cgroup v2 cpu.weight. libvirt writes <shares> straight into cpu.weight
+	// on a unified-hierarchy host, and the kernel refuses anything outside this
+	// range when the domain starts or is tuned.
+	CPUWeightMin = 1
+	CPUWeightMax = 10000
 
-	// MinCPULimit is the smallest cap that survives division across vCPUs
-	// without dropping under libvirt's quota floor. It is checked per VM by
-	// ValidateCPULimit, which knows the vCPU count.
+	// MinCPULimit is the smallest cap libvirt's quota floor allows.
 	MinCPULimit = 0.01
 )
 
-// CPUTuneQuota converts a total-cores cap into libvirt's period and PER-VCPU
-// quota. libvirt's <quota> applies to each vCPU thread, while the cap an
-// operator states (Proxmox cpulimit) is for the whole VM, so a 4-vCPU guest
-// capped at 2 cores gets a quota of half a period per vCPU. A limit at or
-// above the vCPU count caps nothing and renders as a full period per vCPU.
-func CPUTuneQuota(limit float64, vcpus int) (period uint64, quota int64) {
-	if vcpus < 1 {
-		vcpus = 1
+// cgroupControllersFile exists only on a cgroup v2 (unified) host. A variable
+// so a test can point it elsewhere.
+var cgroupControllersFile = "/sys/fs/cgroup/cgroup.controllers"
+
+// DefaultCPUWeight is what an unconfigured VM's weight is on THIS host, and so
+// what clearing cpu-shares must write back: libvirt cannot unset <shares> on a
+// running domain, only set it. cgroup v2's cpu.weight defaults to 100, cgroup
+// v1's cpu.shares to 1024.
+func DefaultCPUWeight() int {
+	if _, err := os.Stat(cgroupControllersFile); err == nil {
+		return 100
 	}
-	q := int64(math.Round(limit / float64(vcpus) * CPUPeriodUS))
+	return 1024
+}
+
+// GlobalQuota converts a total-cores cap into libvirt's global period and
+// quota, which cap the WHOLE domain (its cgroup's cpu.max) the way Proxmox's
+// cpulimit does: a guest running one busy thread can use a full core of a
+// 2.5-core cap. The per-vCPU <quota> is deliberately not used — it would hold a
+// single-threaded guest to limit/vcpus. The quota may exceed one period: that is
+// a cap above one core.
+func GlobalQuota(limit float64) (period uint64, quota int64) {
+	q := int64(math.Round(limit * CPUPeriodUS))
 	if q < minCPUQuotaUS {
 		q = minCPUQuotaUS
-	}
-	if q > CPUPeriodUS {
-		q = CPUPeriodUS
 	}
 	return CPUPeriodUS, q
 }
 
 // ValidateCPULimit reports whether limit is a usable cap for a guest with vcpus
-// vCPUs: 0 (unlimited) or within [MinCPULimit-per-vCPU floor, vcpus].
+// vCPUs: 0 (unlimited) or within [MinCPULimit, vcpus].
 func ValidateCPULimit(limit float64, vcpus int) error {
 	if limit == 0 {
 		return nil
@@ -64,25 +76,26 @@ func ValidateCPULimit(limit float64, vcpus int) error {
 	if limit > float64(vcpus) {
 		return fmt.Errorf("cpu limit %v exceeds the VM's %d vCPUs — it could never be reached; use 0 for unlimited or a value up to %d", limit, vcpus, vcpus)
 	}
-	if limit/float64(vcpus)*CPUPeriodUS < minCPUQuotaUS {
-		return fmt.Errorf("cpu limit %v is too small for %d vCPUs (the smallest allowed is %.2f cores per vCPU)", limit, vcpus, float64(minCPUQuotaUS)/CPUPeriodUS)
+	if limit < MinCPULimit {
+		return fmt.Errorf("cpu limit %v is below the smallest cap libvirt allows (%.2f cores)", limit, MinCPULimit)
 	}
 	return nil
 }
 
-// ValidateCPUShares reports whether shares is 0 (default) or within libvirt's range.
+// ValidateCPUShares reports whether shares is 0 (default) or a cgroup v2
+// cpu.weight, 1..10000.
 func ValidateCPUShares(shares int) error {
 	if shares == 0 {
 		return nil
 	}
-	if shares < CPUSharesMin || shares > CPUSharesMax {
-		return fmt.Errorf("cpu shares %d is outside %d..%d (0 restores the default)", shares, CPUSharesMin, CPUSharesMax)
+	if shares < CPUWeightMin || shares > CPUWeightMax {
+		return fmt.Errorf("cpu shares %d is outside %d..%d (the cgroup weight; 0 restores the default)", shares, CPUWeightMin, CPUWeightMax)
 	}
 	return nil
 }
 
 // ValidateNICRate reports whether rate (MB/s) is 0 (unlimited) or a positive,
-// finite rate that rounds to at least 1 KiB/s.
+// finite rate that rounds to at least 1 KB/s.
 func ValidateNICRate(rate float64) error {
 	if rate == 0 {
 		return nil
@@ -90,15 +103,17 @@ func ValidateNICRate(rate float64) error {
 	if math.IsNaN(rate) || math.IsInf(rate, 0) || rate < 0 {
 		return fmt.Errorf("nic rate %v must be 0 (unlimited) or a positive MB/s", rate)
 	}
-	if rateKiBps(rate) < 1 || rate > 1e6 {
+	if rateKBps(rate) < 1 || rate > 1e6 {
 		return fmt.Errorf("nic rate %v MB/s is outside the supported range (0.001 .. 1000000)", rate)
 	}
 	return nil
 }
 
-// rateKiBps converts MB/s (Proxmox's unit: 10^6 bytes) to libvirt's KiB/s.
-func rateKiBps(rateMBps float64) uint64 {
-	return uint64(math.Round(rateMBps * 1e6 / 1024))
+// rateKBps converts MB/s (Proxmox's unit: 10^6 bytes) to libvirt's average,
+// which is kilobytes/s: libvirt hands it to tc as "<n>kbps", and iproute2
+// reads that as 1000 bytes per second, so the factor is 1000, not 1024.
+func rateKBps(rateMBps float64) uint64 {
+	return uint64(math.Round(rateMBps * 1000))
 }
 
 type ifaceBandwidth struct {
@@ -115,29 +130,28 @@ func bandwidthElement(rateMBps float64) *ifaceBandwidth {
 	if rateMBps <= 0 {
 		return nil
 	}
-	k := rateKiBps(rateMBps)
+	k := rateKBps(rateMBps)
 	return &ifaceBandwidth{Inbound: &ifaceRate{Average: k}, Outbound: &ifaceRate{Average: k}}
 }
 
 var (
-	reCPUTuneLimitElems = regexp.MustCompile(`[ \t]*<(shares|period|quota)\b[^>]*>[^<]*</(shares|period|quota)>\n?`)
+	reCPUTuneLimitElems = regexp.MustCompile(`[ \t]*<(shares|period|quota|global_period|global_quota)\b[^>]*>[^<]*</(shares|period|quota|global_period|global_quota)>\n?`)
 	reCPUTuneBlock      = regexp.MustCompile(`(?s)[ \t]*<cputune>.*?</cputune>\n?`)
 )
 
-// PatchInactiveCPUTune returns domainXML with the <shares>/<period>/<quota>
-// children of <cputune> set from limit/shares/vcpus, every other node (vcpupin
-// included) preserved. A zero limit and zero shares remove them. It keeps the
-// in-place CPU resize of a stopped VM honest: the quota is per vCPU, so a vCPU
-// count change must move it, and the patch exists precisely so a regeneration
-// does not reshuffle libvirt-assigned device addresses.
-func PatchInactiveCPUTune(domainXML string, limit float64, shares, vcpus int) (string, error) {
+// PatchInactiveCPUTune returns domainXML with the weight and the whole-domain
+// cap of <cputune> set from shares/limit, every other node (vcpupin included)
+// preserved. A zero limit and zero shares remove them (a stale per-vCPU
+// period/quota goes too). It exists so a stopped VM's limits change is an
+// in-place edit that keeps libvirt-assigned device addresses.
+func PatchInactiveCPUTune(domainXML string, limit float64, shares int) (string, error) {
 	var add strings.Builder
 	if shares > 0 {
 		fmt.Fprintf(&add, "    <shares>%d</shares>\n", shares)
 	}
 	if limit > 0 {
-		period, quota := CPUTuneQuota(limit, vcpus)
-		fmt.Fprintf(&add, "    <period>%d</period>\n    <quota>%d</quota>\n", period, quota)
+		period, quota := GlobalQuota(limit)
+		fmt.Fprintf(&add, "    <global_period>%d</global_period>\n    <global_quota>%d</global_quota>\n", period, quota)
 	}
 	loc := reCPUTuneBlock.FindStringIndex(domainXML)
 	if loc == nil {
@@ -166,15 +180,15 @@ func PatchInactiveCPUTune(domainXML string, limit float64, shares, vcpus int) (s
 
 // SetCPUTune applies a CPU cap and weight to a domain: the persistent config
 // first (so a refused write surfaces before any live change), then the running
-// domain. limit 0 removes the cap; shares 0 leaves the weight untouched.
-// vcpus is the domain's CURRENT vCPU count, which the per-vCPU quota is
-// derived from — call again after a vCPU hot-add.
-func (c *Client) SetCPUTune(name string, limit float64, shares, vcpus int) error {
-	if err := ValidateCPULimit(limit, vcpus); err != nil {
-		return err
-	}
+// domain. limit 0 removes the cap; shares 0 leaves the weight untouched. The
+// cap is the whole domain's (global_period/global_quota), so nothing about it
+// depends on the vCPU count.
+func (c *Client) SetCPUTune(name string, limit float64, shares int) error {
 	if err := ValidateCPUShares(shares); err != nil {
 		return err
+	}
+	if limit < 0 || math.IsNaN(limit) || math.IsInf(limit, 0) {
+		return fmt.Errorf("cpu limit %v must be 0 (unlimited) or a positive number of cores", limit)
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -184,15 +198,15 @@ func (c *Client) SetCPUTune(name string, limit float64, shares, vcpus int) error
 	}
 	var params []golibvirt.TypedParam
 	if limit > 0 {
-		period, quota := CPUTuneQuota(limit, vcpus)
+		period, quota := GlobalQuota(limit)
 		params = append(params,
-			golibvirt.TypedParam{Field: "vcpu_period", Value: *golibvirt.NewTypedParamValueUllong(period)},
-			golibvirt.TypedParam{Field: "vcpu_quota", Value: *golibvirt.NewTypedParamValueLlong(quota)})
+			golibvirt.TypedParam{Field: "global_period", Value: *golibvirt.NewTypedParamValueUllong(period)},
+			golibvirt.TypedParam{Field: "global_quota", Value: *golibvirt.NewTypedParamValueLlong(quota)})
 	} else {
 		// Unlimited: a negative quota is libvirt's "no limit".
 		params = append(params,
-			golibvirt.TypedParam{Field: "vcpu_period", Value: *golibvirt.NewTypedParamValueUllong(CPUPeriodUS)},
-			golibvirt.TypedParam{Field: "vcpu_quota", Value: *golibvirt.NewTypedParamValueLlong(-1)})
+			golibvirt.TypedParam{Field: "global_period", Value: *golibvirt.NewTypedParamValueUllong(CPUPeriodUS)},
+			golibvirt.TypedParam{Field: "global_quota", Value: *golibvirt.NewTypedParamValueLlong(-1)})
 	}
 	if shares > 0 {
 		params = append(params, golibvirt.TypedParam{Field: "cpu_shares", Value: *golibvirt.NewTypedParamValueUllong(uint64(shares))})
@@ -220,7 +234,7 @@ func (c *Client) SetNICRate(name, mac string, rateMBps float64) error {
 	if err != nil {
 		return fmt.Errorf("lookup domain %s: %w", name, err)
 	}
-	k := rateKiBps(rateMBps) // 0 clears the limit
+	k := rateKBps(rateMBps) // 0 clears the limit
 	mk := func(f string) golibvirt.TypedParam {
 		return golibvirt.TypedParam{Field: f, Value: *golibvirt.NewTypedParamValueUint(uint32(k))}
 	}
@@ -252,7 +266,7 @@ func PatchInterfaceBandwidth(domainXML, mac string, rateMBps float64) (string, b
 		}
 		ne := reBandwidthBlock.ReplaceAllString(e, "")
 		if rateMBps > 0 {
-			k := rateKiBps(rateMBps)
+			k := rateKBps(rateMBps)
 			if i := strings.LastIndex(ne, "</interface>"); i >= 0 {
 				ls := strings.LastIndex(ne[:i], "\n") + 1 // start of the closing tag's line
 				ind := ne[ls:i]

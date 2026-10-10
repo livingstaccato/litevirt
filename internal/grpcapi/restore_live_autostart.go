@@ -72,6 +72,11 @@ func (s *Server) autoDefineRestoredVM(
 	if err != nil {
 		return "", "", err
 	}
+	// A limit in the spec — an operator's --spec or one embedded in a backup,
+	// possibly from a cluster that has latched — is judged as a create's is.
+	if err := s.checkCopiedSpecLimits(ctx, spec); err != nil {
+		return "", "", err
+	}
 
 	originalName := spec.Name
 	targetName := req.NewName

@@ -389,11 +389,6 @@ func (s *Server) applyLiveResize(ctx context.Context, name string, target, apply
 		if err := s.virt.SetVCPUs(name, int(target.Cpu)); err != nil {
 			return fmt.Errorf("vcpus: %w", err)
 		}
-		// libvirt's quota is per vCPU, so the same total cap needs a new quota
-		// at the new count; hot-added vCPUs would otherwise run on the old one.
-		if err := s.reapplyCPULimit(name, target); err != nil {
-			return err
-		}
 	}
 	if target.MemoryMib != applyPrev.MemoryMib {
 		if err := s.virt.SetMemory(name, int(target.MemoryMib)); err != nil {

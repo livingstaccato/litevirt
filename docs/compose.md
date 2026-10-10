@@ -173,7 +173,7 @@ vms:
     cpu-mode: "host-model"    # host-passthrough | host-model | custom (default host-model)
     cpu-model: "x86-64-v3"    # required by cpu-mode: custom; invalid for any other mode
     cpu-limit: 2.5            # Cap on the VM's TOTAL CPU, in host cores (fractions ok; 0/unset = unlimited; at most cpu). Live
-    cpu-shares: 2048          # Relative CPU weight under contention (libvirt shares, default 1024; 2-262144). Live
+    cpu-shares: 200           # CPU weight under contention: cgroup v2 cpu.weight, Proxmox cpuunits (1-10000, default 100). Live
     memory: "4G"              # Memory: "4G", "4096M", or 4096 (MiB) — boot allocation
     min-memory: "1G"          # Ballooning floor the host may reclaim to (0 = none)
     max-memory: "8G"          # Ballooning ceiling the guest may inflate to (0 = fixed at memory)
@@ -218,17 +218,23 @@ block) refuses it: in-place never restarts a VM.
 Three settings keep one guest from starving its neighbours. They are the
 counterparts of Proxmox's `cpulimit`, `cpuunits` and the NIC `rate=`:
 
-- `cpu-limit` caps the VM's **total** CPU in host cores: `2.5` lets a 4-vCPU guest
-  burn at most two and a half cores however many of its vCPUs are busy. It must be
-  at most `cpu` (a cap above the vCPU count could never be reached) and at least
-  `0.01` per vCPU. libvirt's quota applies per vCPU, so litevirt divides the cap
-  across the vCPUs and re-derives it when `cpu` changes, including a live vCPU
-  hot-add.
-- `cpu-shares` is the VM's relative weight when the host is contended (libvirt
-  `<shares>`; the kernel default is 1024, the range 2-262144). It only matters
-  under contention: an idle host lets every guest run flat out.
+- `cpu-limit` caps the VM's **total** CPU in host cores, across all its vCPUs:
+  `2.5` lets a 4-vCPU guest burn at most two and a half cores in total, so one busy
+  thread can use a full core, exactly as Proxmox's `cpulimit` behaves. It must be at
+  most `cpu` (a cap above the vCPU count could never be reached) and at least `0.01`.
+  It is applied as libvirt's whole-domain `global_period`/`global_quota` (the
+  domain cgroup's `cpu.max`), so it does not depend on the vCPU count and a vCPU
+  change leaves it alone.
+- `cpu-shares` is the VM's weight when the host is contended: Proxmox's `cpuunits`,
+  which is the cgroup v2 `cpu.weight` (1-10000, default 100; libvirt writes
+  `<shares>` straight into it). `200` is twice the default, so the Proxmox
+  numbers carry over unchanged. Clearing it (`0`, or dropping the key) writes the
+  host's default weight back. On a cgroup v1 host the same number is a
+  `cpu.shares` value whose default is 1024. It only matters under contention:
+  an idle host lets every guest run flat out.
 - `rate` on a `network:` entry caps that NIC in MB/s (10^6 bytes), the same in
-  each direction, rendered as libvirt `<bandwidth>`. It is set per NIC, so a
+  each direction, rendered as libvirt `<bandwidth>` (whose `average` is in kilobytes
+  of 1000 bytes, so `rate: 10` is `average='10000'`). It is set per NIC, so a
   VM's management NIC can stay unthrottled.
 
 All three **apply to a running VM with no restart**: a deploy that changes them is
@@ -237,6 +243,8 @@ an in-place update (`~ update`, `applied in place`), as is `lv update`'s
 well as the running domain, so the value survives a reboot and a stopped VM takes
 it at its next start. They are carried through live and cold migration and rebuilt
 on failover from the stored spec. Dropping a key from the file removes that limit.
+
+`cpu-limit`, `cpu-shares` and `rate` apply to VMs only; setting one on an `lxc` or `oci` entry is an error.
 
 A capped VM is still **placed and charged for its full vCPU count**: the cap bounds
 how much CPU the guest may take, not how many cores it needs scheduled onto, and it
@@ -252,7 +260,11 @@ rewrites a VM's stored spec would drop them. The refusal comes from the node the
 request enters, before anything is created or forwarded. Files and updates without
 limits are not affected, and clearing a limit (`0`) is always allowed. The token has
 no config flag: it states what the binary does, and it only affects workloads that
-carry a limit. To stop using the feature, clear the limits.
+carry a limit. To stop using the feature, clear the limits. Clearing does not undo the latch: as
+with any mandatory capability token, once `vm_limits_v1` has latched (which it does on
+every cluster running this build, whether or not a limit was ever set), rolling back to
+a build that does not know it puts each node into WAL quarantine until it is upgraded
+again or reseeded.
 
 With `replicas: 3`, VMs are named `web-1`, `web-2`, `web-3`. With `replicas: 1`, the base name is used directly.
 

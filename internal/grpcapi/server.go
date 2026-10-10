@@ -339,6 +339,10 @@ type Server struct {
 	// repairLeaseHook is a test-only seam run while a compose repair holds the
 	// VM's start lease, before it touches the domain.
 	repairLeaseHook func(vmName string)
+
+	// limitsPreLockHook is a test-only seam run by a limits-only UpdateVM just
+	// before it takes the VM lock, to land a concurrent change in that window.
+	limitsPreLockHook func(vmName string)
 	// cutoverCrashHook is a test-only seam; see SetCutoverCrashHook.
 	cutoverCrashHook func(stage string) error
 	// enfAuditSignature is this node's kill-switch for tamper-evident audit logging.

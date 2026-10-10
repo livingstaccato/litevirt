@@ -3966,6 +3966,32 @@ func (s *Server) liveGrowVCPU(ctx context.Context, req *pb.UpdateVMRequest) (*pb
 	return s.vmToProto(ctx, req.Name)
 }
 
+// applyLiveMetadataFields folds an update's live-metadata fields (restart policy,
+// onboot, start/stop ordering) onto spec. A nil restart means "unchanged";
+// restart.condition "none" or "" CLEARS the policy. Run on the spec read before
+// the VM lock and again on the spec read under it.
+func applyLiveMetadataFields(spec *pb.VMSpec, req *pb.UpdateVMRequest) {
+	if req.Restart != nil {
+		if c := req.Restart.Condition; c == "" || c == "none" {
+			spec.Restart = nil
+		} else {
+			spec.Restart = req.Restart
+		}
+	}
+	if req.Onboot != nil {
+		spec.Onboot = *req.Onboot
+	}
+	if req.StartupOrder != nil {
+		spec.StartupOrder = *req.StartupOrder
+	}
+	if req.StartDelaySec != nil {
+		spec.StartDelaySec = *req.StartDelaySec
+	}
+	if req.StopDelaySec != nil {
+		spec.StopDelaySec = *req.StopDelaySec
+	}
+}
+
 func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM, error) {
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return nil, err
@@ -4025,25 +4051,7 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	// reconciler/vmcheck read these fresh from the spec each sweep, so no redefine
 	// is needed. A nil restart means "unchanged"; restart.condition=="none"|""
 	// CLEARS the policy. The optional scalars are nil when unchanged.
-	if req.Restart != nil {
-		if c := req.Restart.Condition; c == "" || c == "none" {
-			spec.Restart = nil
-		} else {
-			spec.Restart = req.Restart
-		}
-	}
-	if req.Onboot != nil {
-		spec.Onboot = *req.Onboot
-	}
-	if req.StartupOrder != nil {
-		spec.StartupOrder = *req.StartupOrder
-	}
-	if req.StartDelaySec != nil {
-		spec.StartDelaySec = *req.StartDelaySec
-	}
-	if req.StopDelaySec != nil {
-		spec.StopDelaySec = *req.StopDelaySec
-	}
+	applyLiveMetadataFields(spec, req)
 
 	// Noisy-neighbour limits (cpu cap/weight, per-NIC rate). Validated against
 	// the VM's final vCPU count and folded into spec here; whether they are
@@ -4051,11 +4059,9 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	// with a limit already set is validated too (see mergeLimitUpdate).
 	limitsReq := limitsRequested(req)
 	var limitsUp limitsUpdate
+	var limitsErr error
 	if limitsReq || (req.Cpu > 0 && spec.CpuLimit > 0) {
-		var lerr error
-		if limitsUp, lerr = mergeLimitUpdate(spec, req); lerr != nil {
-			return nil, lerr
-		}
+		limitsUp, limitsErr = mergeLimitUpdate(spec, req)
 	}
 
 	// REDEFINE-class fields bake into the domain XML, so they need the VM stopped.
@@ -4079,6 +4085,12 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	//
 	// max_cpu changes the vCPU-topology XML (<vcpu current=…>), which the value-only
 	// inactive-XML patch doesn't handle, so exclude it from the fast path.
+	// A limits-only update is judged again, on the spec read under the VM lock
+	// (below), so a refusal here is only final when a redefine is in play or
+	// no limit was named.
+	if limitsErr != nil && (redefine || !limitsReq) {
+		return nil, limitsErr
+	}
 	inPlaceEligible := redefine &&
 		req.Machine == "" && req.Firmware == "" &&
 		req.GuestAgent == nil && req.SecureBoot == nil && req.Tpm == nil &&
@@ -4368,12 +4380,15 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	// mem_actual (a running VM's live actuals must survive a metadata edit).
 	if !redefine {
 		limitsApplied := false
-		if limitsUp.any() {
+		persistSpec := func(string) (string, error) { return string(specJSON), nil }
+		if limitsReq {
 			// Applied to the domain BEFORE the spec is written, under the VM
 			// lock: a domain the spec does not yet describe is reconciled by
 			// the persist below, while a spec the domain does not follow would
-			// be a promise nothing keeps. Ownership and the operation barrier
-			// are re-checked because the lock was taken after the first read.
+			// be a promise nothing keeps.
+			if h := s.limitsPreLockHook; h != nil {
+				h(req.Name)
+			}
 			unlock := s.lockVM(req.Name)
 			defer unlock()
 			fresh, gerr := corrosion.GetVM(ctx, s.db, req.Name)
@@ -4386,15 +4401,43 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 			if fresh.ActiveOperationID != "" {
 				return nil, status.Errorf(codes.FailedPrecondition, "cannot update limits of %q: an operation is in progress", req.Name)
 			}
-			if aerr := s.applyLimitsToDomain(ctx, req.Name, spec, limitsUp, false); aerr != nil {
+			// Work from what the lock protects. The spec read before it may
+			// predate a change that completed while this waited (a live vCPU
+			// grow commits cpu and its actuals); validating and writing the old
+			// one would undo it.
+			cur := &pb.VMSpec{}
+			if fresh.Spec != "" {
+				if uerr := json.Unmarshal([]byte(fresh.Spec), cur); uerr != nil {
+					return nil, status.Errorf(codes.Internal, "parse stored spec: %v", uerr)
+				}
+			}
+			applyLiveMetadataFields(cur, req)
+			fup, lerr := mergeLimitUpdate(cur, req)
+			if lerr != nil {
+				return nil, lerr
+			}
+			limitsUp, spec = fup, cur
+			// The persisted spec is the request merged onto whatever is stored
+			// when the write lands, not a blob computed from an earlier read.
+			persistSpec = func(old string) (string, error) {
+				o := &pb.VMSpec{}
+				if old != "" {
+					if uerr := json.Unmarshal([]byte(old), o); uerr != nil {
+						return "", uerr
+					}
+				}
+				applyLiveMetadataFields(o, req)
+				limitsUp.applyTo(o)
+				b, merr := json.Marshal(o)
+				return string(b), merr
+			}
+			if aerr := s.applyLimitsToDomain(ctx, req.Name, spec, limitsUp); aerr != nil {
 				s.revertLimits(ctx, req.Name, spec, limitsUp)
 				return nil, aerr
 			}
 			limitsApplied = true
 		}
-		applied, _, err := corrosion.MutateDesiredSpec(ctx, s.db, req.Name, func(string) (string, error) {
-			return string(specJSON), nil
-		})
+		applied, _, err := corrosion.MutateDesiredSpec(ctx, s.db, req.Name, persistSpec)
 		if err != nil {
 			if limitsApplied {
 				s.revertLimits(ctx, req.Name, spec, limitsUp)
@@ -4545,11 +4588,11 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 				if req.CpuMode != "" || req.CpuModel != "" {
 					patched, perr = lv.PatchInactiveCPUMode(patched, spec.CpuMode, spec.CpuModel)
 				}
-				// The cpu quota is per vCPU: a changed vCPU count, or a changed
-				// limit/weight, rewrites it in place rather than forcing the
-				// regeneration this path exists to avoid.
-				if perr == nil && (limitsUp.cpu || (req.Cpu > 0 && spec.CpuLimit > 0)) {
-					patched, perr = lv.PatchInactiveCPUTune(patched, spec.CpuLimit, int(spec.CpuShares), int(spec.Cpu))
+				// A changed cap or weight is rewritten in place rather than forcing
+				// the regeneration this path exists to avoid. The cap is the
+				// domain's, so a vCPU count change alone moves nothing here.
+				if perr == nil && limitsUp.cpu {
+					patched, perr = lv.PatchInactiveCPUTune(patched, spec.CpuLimit, int(spec.CpuShares))
 				}
 				if perr == nil {
 					for _, o := range limitsUp.nicOrdinals {

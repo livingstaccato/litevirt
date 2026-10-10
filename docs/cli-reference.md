@@ -137,7 +137,7 @@ lv run --name <vm> --image <img> [flags]  # Create and start a VM
   --cpu-mode <mode>     # host-passthrough|host-model|custom (default host-model)
   --cpu-model <model>   # CPU model for --cpu-mode custom, e.g. x86-64-v3
   --cpu-limit <cores>   # cap total CPU at this many host cores (fractions ok, at most --cpu)
-  --cpu-shares <n>      # relative CPU weight under contention (2-262144, default 1024)
+  --cpu-shares <n>      # CPU weight under contention, 1-10000, default 100 (cgroup v2 cpu.weight = Proxmox cpuunits)
   --memory <mib>        # Memory in MiB (default 4096)
   --disk <size>         # Root disk size (default 20G)
   --host <name>         # Target host (auto-placed if omitted)

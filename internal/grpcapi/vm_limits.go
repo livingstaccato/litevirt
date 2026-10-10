@@ -2,7 +2,6 @@ package grpcapi
 
 import (
 	"context"
-	"fmt"
 	"strconv"
 	"strings"
 
@@ -17,25 +16,40 @@ import (
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 )
 
-// defaultCPUShares is the kernel's default CFS weight, which libvirt reports
-// and which "restore the default" writes back: libvirt has no way to unset a
-// <shares> on a running domain, only to set it to a value.
-const defaultCPUShares = 1024
-
 // limitsUpdate is what an UpdateVMRequest asks of the noisy-neighbour limits,
-// after validation. The new values live in the spec it was merged into.
+// after validation. applyTo folds it onto any copy of the spec, so the same
+// update can be merged onto whatever spec is current under the VM lock.
 type limitsUpdate struct {
-	cpu          bool // cpu_limit and/or cpu_shares changes
-	sharesTouch  bool // cpu_shares is named (0 = restore the default)
-	nicOrdinals  []int
-	nicNewRate   map[int]float64
-	nicPrevRate  map[int]float64
-	prevLimit    float64
-	prevShares   int32
-	prevSpecCPUs int32
+	cpu         bool // cpu_limit and/or cpu_shares change
+	limitTouch  bool
+	newLimit    float64
+	sharesTouch bool // cpu_shares is named (0 = restore the host's default weight)
+	newShares   int32
+	nicOrdinals []int
+	nicNewRate  map[int]float64
+
+	// What the update started from, for revertLimits.
+	prevLimit   float64
+	prevShares  int32
+	nicPrevRate map[int]float64
 }
 
 func (u limitsUpdate) any() bool { return u.cpu || len(u.nicOrdinals) > 0 }
+
+// applyTo sets the update's values on spec (leaving untouched limits alone).
+func (u limitsUpdate) applyTo(spec *pb.VMSpec) {
+	if u.limitTouch {
+		spec.CpuLimit = u.newLimit
+	}
+	if u.sharesTouch {
+		spec.CpuShares = u.newShares
+	}
+	for _, o := range u.nicOrdinals {
+		if o < len(spec.Network) && spec.Network[o] != nil {
+			spec.Network[o].RateMbSec = u.nicNewRate[o]
+		}
+	}
+}
 
 // vmLimitsRefusal is what a create or update that sets a limit is refused with
 // until vm_limits_v1 has latched.
@@ -129,7 +143,7 @@ func limitsRequested(req *pb.UpdateVMRequest) bool {
 func mergeLimitUpdate(spec *pb.VMSpec, req *pb.UpdateVMRequest) (limitsUpdate, error) {
 	up := limitsUpdate{
 		nicNewRate: map[int]float64{}, nicPrevRate: map[int]float64{},
-		prevLimit: spec.CpuLimit, prevShares: spec.CpuShares, prevSpecCPUs: spec.Cpu,
+		prevLimit: spec.CpuLimit, prevShares: spec.CpuShares,
 	}
 	cpus := spec.Cpu
 	if req.Cpu > 0 {
@@ -138,7 +152,7 @@ func mergeLimitUpdate(spec *pb.VMSpec, req *pb.UpdateVMRequest) (limitsUpdate, e
 	limit := spec.CpuLimit
 	if req.CpuLimit != nil {
 		limit = req.GetCpuLimit()
-		up.cpu = true
+		up.cpu, up.limitTouch, up.newLimit = true, true, limit
 	}
 	if err := lv.ValidateCPULimit(limit, int(cpus)); err != nil {
 		hint := ""
@@ -147,7 +161,6 @@ func mergeLimitUpdate(spec *pb.VMSpec, req *pb.UpdateVMRequest) (limitsUpdate, e
 		}
 		return up, status.Errorf(codes.InvalidArgument, "%v%s", err, hint)
 	}
-	spec.CpuLimit = limit
 	if req.CpuShares != nil {
 		sh := req.GetCpuShares()
 		if sh < 0 {
@@ -156,8 +169,7 @@ func mergeLimitUpdate(spec *pb.VMSpec, req *pb.UpdateVMRequest) (limitsUpdate, e
 		if err := lv.ValidateCPUShares(int(sh)); err != nil {
 			return up, status.Errorf(codes.InvalidArgument, "%v", err)
 		}
-		spec.CpuShares = sh
-		up.cpu, up.sharesTouch = true, true
+		up.cpu, up.sharesTouch, up.newShares = true, true, sh
 	}
 	seen := map[int]bool{}
 	for _, nr := range req.NicRate {
@@ -176,22 +188,28 @@ func mergeLimitUpdate(spec *pb.VMSpec, req *pb.UpdateVMRequest) (limitsUpdate, e
 		up.nicOrdinals = append(up.nicOrdinals, o)
 		up.nicPrevRate[o] = spec.Network[o].RateMbSec
 		up.nicNewRate[o] = nr.GetRateMbSec()
-		spec.Network[o].RateMbSec = nr.GetRateMbSec()
 	}
+	up.applyTo(spec)
 	return up, nil
 }
 
 // applyLimitsToDomain writes the merged limits to the libvirt domain — the
-// persistent config always, the running domain when there is one. A domain
-// that does not exist (a VM stranded in error, rebuilt from the spec at its
-// next start) is not an error: the spec is then the only home for the values.
-func (s *Server) applyLimitsToDomain(ctx context.Context, name string, spec *pb.VMSpec, up limitsUpdate, restoring bool) error {
+// persistent config always, the running domain when there is one. A domain that
+// does not exist (a VM stranded in error, rebuilt from the spec at its next
+// start) is not an error: the spec is then the only home for the values.
+func (s *Server) applyLimitsToDomain(ctx context.Context, name string, spec *pb.VMSpec, up limitsUpdate) error {
 	if up.cpu {
-		shares := int(spec.CpuShares)
-		if shares == 0 && up.sharesTouch {
-			shares = defaultCPUShares
+		// Only a named weight is written: an update that touches the cap alone
+		// leaves the weight where it is. Clearing writes the host's default
+		// (libvirt cannot unset <shares>, only set it).
+		shares := 0
+		if up.sharesTouch {
+			shares = int(spec.CpuShares)
+			if shares == 0 {
+				shares = lv.DefaultCPUWeight()
+			}
 		}
-		if err := s.virt.SetCPUTune(name, spec.CpuLimit, shares, int(spec.Cpu)); err != nil {
+		if err := s.virt.SetCPUTune(name, spec.CpuLimit, shares); err != nil {
 			if lv.IsNotFound(err) {
 				return nil
 			}
@@ -205,16 +223,25 @@ func (s *Server) applyLimitsToDomain(ctx context.Context, name string, spec *pb.
 	if err != nil {
 		return status.Errorf(codes.Internal, "read NICs for %q: %v", name, err)
 	}
-	macByOrdinal := make(map[int]string, len(nics))
+	byOrdinal := make(map[int]corrosion.NICRecord, len(nics))
 	for _, n := range nics {
-		macByOrdinal[n.Ordinal] = n.MAC
+		byOrdinal[n.Ordinal] = n
 	}
 	for _, o := range up.nicOrdinals {
-		mac, ok := macByOrdinal[o]
+		nic, ok := byOrdinal[o]
 		if !ok {
 			return status.Errorf(codes.FailedPrecondition, "VM %q has no NIC %d", name, o)
 		}
-		if err := s.virt.SetNICRate(name, mac, spec.Network[o].RateMbSec); err != nil {
+		// A spec entry describes the NIC at its position only while that NIC is
+		// still on the network the entry names; the rebuild paths (failover,
+		// redefine) apply the same test, so a cap set on a NIC that moved would
+		// be lost at the next rebuild.
+		if want := spec.Network[o].GetName(); nic.NetworkName != want {
+			return status.Errorf(codes.FailedPrecondition,
+				"NIC %d of %q is on network %q but the spec entry for it names %q; a rate set now would not survive a rebuild",
+				o, name, nic.NetworkName, want)
+		}
+		if err := s.virt.SetNICRate(name, nic.MAC, spec.Network[o].RateMbSec); err != nil {
 			if lv.IsNotFound(err) {
 				return nil
 			}
@@ -229,24 +256,23 @@ func (s *Server) applyLimitsToDomain(ctx context.Context, name string, spec *pb.
 func (s *Server) revertLimits(ctx context.Context, name string, spec *pb.VMSpec, up limitsUpdate) {
 	prev := proto.Clone(spec).(*pb.VMSpec)
 	prev.CpuLimit, prev.CpuShares = up.prevLimit, up.prevShares
-	prev.Cpu = up.prevSpecCPUs
 	for o, r := range up.nicPrevRate {
 		if o < len(prev.Network) {
 			prev.Network[o].RateMbSec = r
 		}
 	}
-	_ = s.applyLimitsToDomain(ctx, name, prev, up, true)
+	_ = s.applyLimitsToDomain(ctx, name, prev, up)
 }
 
-// reapplyCPULimit re-derives the per-vCPU quota after a vCPU count change.
-func (s *Server) reapplyCPULimit(name string, spec *pb.VMSpec) error {
-	if spec.CpuLimit <= 0 {
-		return nil
+// checkCopiedSpecLimits judges a spec a path takes from somewhere other than a
+// create request — a restore's --spec or manifest, a clone's source — the way a
+// create is judged: gated on vm_limits_v1, and validated against its own vCPU
+// count. Without it a limit reaches a stored spec by a side door.
+func (s *Server) checkCopiedSpecLimits(ctx context.Context, spec *pb.VMSpec) error {
+	if err := s.refuseUnlatchedLimits(ctx, spec); err != nil {
+		return err
 	}
-	if err := s.virt.SetCPUTune(name, spec.CpuLimit, 0, int(spec.Cpu)); err != nil && !lv.IsNotFound(err) {
-		return fmt.Errorf("cpu limit: %w", err)
-	}
-	return nil
+	return validateCreateLimits(spec)
 }
 
 // splitLimitFields separates the noisy-neighbour field names in a live-metadata

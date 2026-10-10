@@ -1,7 +1,9 @@
 package e2e
 
 import (
+	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -10,9 +12,10 @@ import (
 
 // The noisy-neighbour controls against a real hypervisor. tests/fleet injects
 // internal/libvirtfake, which only models the XML edit; whether libvirt accepts
-// the cputune period/quota, the scheduler write reaches the cgroup of a running
-// guest, and the <bandwidth> survives a migration is only knowable here. Every
-// assertion reads libvirt (virsh), not litevirt's report of what it did.
+// the cputune global quota, the scheduler write reaches the cgroup of a running
+// guest, the weight lands in cpu.weight, and the <bandwidth> shapes the tap and
+// survives a migration is only knowable here. Every assertion reads libvirt
+// (virsh), the cgroup or tc, not litevirt's report of what it did.
 //
 // Runs on a cluster node (virsh is local); skips elsewhere.
 
@@ -30,8 +33,12 @@ func virshSched(t *testing.T, domain string, config bool) map[string]string {
 	if err != nil {
 		t.Fatalf("virsh %v: %v\n%s", args, err, out)
 	}
+	return parseSched(string(out))
+}
+
+func parseSched(out string) map[string]string {
 	got := map[string]string{}
-	for _, line := range strings.Split(string(out), "\n") {
+	for _, line := range strings.Split(out, "\n") {
 		if m := schedKV.FindStringSubmatch(line); m != nil {
 			got[m[1]] = m[2]
 		}
@@ -39,8 +46,8 @@ func virshSched(t *testing.T, domain string, config bool) map[string]string {
 	return got
 }
 
-// virshIfaceRate returns the inbound/outbound average (KiB/s) libvirt reports
-// for a NIC, live or in the persistent config.
+// virshIfaceRate returns the inbound/outbound average libvirt reports for a
+// NIC, live or in the persistent config.
 func virshIfaceRate(t *testing.T, domain, mac string, config bool) (in, out string) {
 	t.Helper()
 	args := []string{"-c", "qemu:///system", "domiftune", domain, mac}
@@ -74,6 +81,37 @@ func wantSched(t *testing.T, when string, got map[string]string, want map[string
 	}
 }
 
+// domainCgroupFile reads a control file from the domain's cgroup (cgroup v2),
+// or "" when the host has no such cgroup layout. The scope name escapes the
+// VM name's dashes, so the pattern wildcards them.
+func domainCgroupFile(domain, file string) string {
+	pat := "/sys/fs/cgroup/machine.slice/machine-qemu*" + strings.ReplaceAll(domain, "-", "*") + "*.scope/" + file
+	m, _ := filepath.Glob(pat)
+	if len(m) == 0 {
+		return ""
+	}
+	b, err := os.ReadFile(m[0])
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+// tapOf returns the host tap device of a domain's first NIC.
+func tapOf(t *testing.T, domain string) string {
+	t.Helper()
+	out, err := exec.Command("virsh", "-c", "qemu:///system", "domiflist", domain).CombinedOutput()
+	if err != nil {
+		t.Fatalf("virsh domiflist: %v\n%s", err, out)
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if f := strings.Fields(line); len(f) >= 5 && strings.Count(f[len(f)-1], ":") == 5 {
+			return f[0]
+		}
+	}
+	return ""
+}
+
 func TestVM_NoisyNeighbourLimits_AppliedLiveAndPersisted(t *testing.T) {
 	if !virshAvailable() {
 		t.Skip("needs virsh on a cluster node")
@@ -86,11 +124,17 @@ func TestVM_NoisyNeighbourLimits_AppliedLiveAndPersisted(t *testing.T) {
 	}
 	cleanup(t, func() { lvErr(t, "rm", name, "--force") })
 
-	// 1 core over 2 vCPUs: 50000us per 100000us period per vCPU.
+	// A 1-core cap is 100000us of CPU per 100000us period for the WHOLE guest;
+	// the weight is cgroup v2's cpu.weight (default 100).
 	runWithLimits(t, name, host)
-	waitVM(t, name, "RUNNING", 2*time.Minute)
 	wantSched(t, "at create", virshSched(t, name, false),
-		map[string]string{"cpu_shares": "2048", "vcpu_period": "100000", "vcpu_quota": "50000"})
+		map[string]string{"cpu_shares": "200", "global_period": "100000", "global_quota": "100000"})
+	if got := domainCgroupFile(name, "cpu.weight"); got != "" && got != "200" {
+		t.Errorf("cgroup cpu.weight = %q, want 200 (the weight is passed through unconverted)", got)
+	}
+	if got := domainCgroupFile(name, "cpu.max"); got != "" && got != "100000 100000" {
+		t.Errorf("cgroup cpu.max = %q, want \"100000 100000\" (a whole-domain cap)", got)
+	}
 
 	macs := domIfaceMACs(t, name)
 	if len(macs) == 0 {
@@ -99,38 +143,57 @@ func TestVM_NoisyNeighbourLimits_AppliedLiveAndPersisted(t *testing.T) {
 
 	// Change everything on the RUNNING guest: no stop, same qemu process.
 	pid := qemuPID(name)
-	lv(t, "update", name, "--cpu-limit", "1.5", "--cpu-shares", "512", "--nic-rate", "0=4")
+	lv(t, "update", name, "--cpu-limit", "1.5", "--cpu-shares", "400", "--nic-rate", "0=4")
 	if got := qemuPID(name); pid == "" || got != pid {
 		t.Errorf("qemu pid %q -> %q: a limit change restarted the guest", pid, got)
 	}
-	live := map[string]string{"cpu_shares": "512", "vcpu_period": "100000", "vcpu_quota": "75000"}
+	live := map[string]string{"cpu_shares": "400", "global_period": "100000", "global_quota": "150000"}
 	wantSched(t, "live", virshSched(t, name, false), live)
-	// ...and in the persistent definition, so a reboot keeps it.
-	wantSched(t, "config", virshSched(t, name, true), live)
-	// 4 MB/s = 3906 KiB/s, both directions, live and persistent.
+	wantSched(t, "config", virshSched(t, name, true), live) // a reboot keeps it
+	if got := domainCgroupFile(name, "cpu.max"); got != "" && got != "150000 100000" {
+		t.Errorf("cgroup cpu.max = %q, want \"150000 100000\"", got)
+	}
+	// 4 MB/s is 4000 KB/s (libvirt's unit), live and persistent.
 	for _, config := range []bool{false, true} {
-		if in, out := virshIfaceRate(t, name, macs[0], config); in != "3906" || out != "3906" {
-			t.Errorf("domiftune (config=%v) = in %s out %s, want 3906/3906", config, in, out)
+		if in, out := virshIfaceRate(t, name, macs[0], config); in != "4000" || out != "4000" {
+			t.Errorf("domiftune (config=%v) = in %s out %s, want 4000/4000", config, in, out)
+		}
+	}
+	// ...and the tap is actually shaped: tc shows the class at 4 MB/s = 32Mbit,
+	// which is what pins libvirt's kilobyte as 1000 bytes.
+	if tap := tapOf(t, name); tap != "" {
+		if out, err := exec.Command("tc", "class", "show", "dev", tap).CombinedOutput(); err == nil &&
+			!strings.Contains(string(out), "32Mbit") {
+			t.Errorf("tc class show dev %s lacks a 32Mbit class for a 4 MB/s cap:\n%s", tap, out)
 		}
 	}
 	if out := lv(t, "inspect", name); !strings.Contains(out, "cpuLimit") || !strings.Contains(out, "rateMbSec") {
 		t.Errorf("lv inspect does not show the limits:\n%s", out)
 	}
 
-	// Removal.
+	// Removal. Clearing the weight writes the host's DEFAULT back, never a
+	// leftover or a hard-coded number: 100 on a cgroup v2 host.
 	lv(t, "update", name, "--cpu-limit", "0", "--cpu-shares", "0", "--nic-rate", "0=0")
 	got := virshSched(t, name, false)
-	if q := got["vcpu_quota"]; q != "-1" && q != "0" {
-		t.Errorf("cap not removed: vcpu_quota = %q", q)
+	if q := got["global_quota"]; q != "-1" && q != "0" {
+		t.Errorf("cap not removed: global_quota = %q", q)
+	}
+	if fileExists("/sys/fs/cgroup/cgroup.controllers") {
+		if got["cpu_shares"] != "100" {
+			t.Errorf("clearing cpu-shares left cpu_shares = %q, want the cgroup v2 default 100", got["cpu_shares"])
+		}
 	}
 	if in, out := virshIfaceRate(t, name, macs[0], false); in != "0" && in != "" || out != "0" && out != "" {
 		t.Errorf("NIC cap not removed: in %q out %q", in, out)
 	}
 }
 
+func fileExists(p string) bool { _, err := os.Stat(p); return err == nil }
+
 // A live migration carries the definition, so the destination's guest must run
 // under the same cap, weight and rate. Needs a second ACTIVE host reachable by
-// ssh from here; skips otherwise.
+// ssh from here; skips only when there is none. Once there is one, a failure to
+// migrate or to read the destination is a failure, not a skip.
 func TestVM_NoisyNeighbourLimits_SurviveMigration(t *testing.T) {
 	if !virshAvailable() {
 		t.Skip("needs virsh on a cluster node")
@@ -154,25 +217,24 @@ func TestVM_NoisyNeighbourLimits_SurviveMigration(t *testing.T) {
 	}
 	cleanup(t, func() { lvErr(t, "rm", name, "--force") })
 	runWithLimits(t, name, host)
-	waitVM(t, name, "RUNNING", 2*time.Minute)
 	lv(t, "update", name, "--nic-rate", "0=2")
 	if out, err := lvErr(t, "migrate", name, target); err != nil {
-		t.Skipf("migration to %s not possible here: %v\n%s", target, err, out)
+		t.Fatalf("migration to %s failed: %v\n%s", target, err, out)
 	}
 	waitVM(t, name, "RUNNING", 3*time.Minute)
 
 	out, err := exec.Command("timeout", "30", "ssh", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", target,
 		"virsh -c qemu:///system schedinfo "+name+"; virsh -c qemu:///system dumpxml "+name).CombinedOutput()
 	if err != nil {
-		t.Skipf("cannot ssh to %s to read its libvirt: %v", target, err)
+		t.Fatalf("cannot read libvirt on %s: %v\n%s", target, err, out)
 	}
 	s := string(out)
-	for _, want := range []string{`cpu_shares\s*:\s*2048`, `vcpu_quota\s*:\s*50000`} {
+	for _, want := range []string{`cpu_shares\s*:\s*200`, `global_quota\s*:\s*100000`} {
 		if !regexp.MustCompile(want).MatchString(s) {
 			t.Errorf("destination domain lacks %q:\n%s", want, s)
 		}
 	}
-	if !strings.Contains(s, "<inbound average='1953'") {
+	if !strings.Contains(s, "<inbound average='2000'") {
 		t.Errorf("destination NIC lost its 2 MB/s cap:\n%s", s)
 	}
 }
@@ -184,7 +246,7 @@ func runWithLimits(t *testing.T, name, host string) {
 	t.Helper()
 	out, err := lvErr(t, "run", "--name", name, "--image", testImage,
 		"--cpu", "2", "--memory", "1024", "--disk", "5G", "--host", host,
-		"--cpu-limit", "1", "--cpu-shares", "2048")
+		"--cpu-limit", "1", "--cpu-shares", "200")
 	if err != nil {
 		if strings.Contains(out+err.Error(), "cluster upgrade") {
 			t.Skipf("vm_limits_v1 has not latched (roll every node to this build first): %v", err)

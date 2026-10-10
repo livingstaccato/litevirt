@@ -216,7 +216,7 @@ type Fake struct {
 	// FailSetVCPUs / FailSetMemory inject a resize primitive failure so scenarios
 	// can exercise partial-apply recovery (e.g. cpu ok, mem fails).
 	FailSetVCPUs        func(name string, count int) error
-	FailSetCPUTune      func(name string, limit float64, shares, vcpus int) error
+	FailSetCPUTune      func(name string, limit float64, shares int) error
 	FailSetNICRate      func(name, mac string, rateMBps float64) error
 	FailSetMemory       func(name string, memMiB int) error
 	FailMigrateToTarget func(name, dconnuri string) error
@@ -1640,9 +1640,17 @@ func (f *Fake) SetVCPUs(name string, count int) error {
 // SetCPUTune models the libvirt scheduler-parameter write: it patches the
 // persistent XML and, for a running domain with a live override, the live XML,
 // exactly as the real primitive's config-then-live apply does.
-func (f *Fake) SetCPUTune(name string, limit float64, shares, vcpus int) error {
+func (f *Fake) SetCPUTune(name string, limit float64, shares int) error {
+	// Refuse what the real primitive refuses, so a caller cannot pass a value the
+	// fake accepts and libvirt would not.
+	if err := libvirt.ValidateCPUShares(shares); err != nil {
+		return err
+	}
+	if limit < 0 {
+		return fmt.Errorf("libvirtfake: negative cpu limit %v", limit)
+	}
 	if f.FailSetCPUTune != nil {
-		if err := f.FailSetCPUTune(name, limit, shares, vcpus); err != nil {
+		if err := f.FailSetCPUTune(name, limit, shares); err != nil {
 			return err
 		}
 	}
@@ -1652,7 +1660,7 @@ func (f *Fake) SetCPUTune(name string, limit float64, shares, vcpus int) error {
 		return fmt.Errorf("libvirtfake: domain %q not found", name)
 	}
 	patch := func(x string) string {
-		out, err := libvirt.PatchInactiveCPUTune(x, limit, shares, vcpus)
+		out, err := libvirt.PatchInactiveCPUTune(x, limit, shares)
 		if err != nil {
 			return x
 		}
@@ -1664,12 +1672,15 @@ func (f *Fake) SetCPUTune(name string, limit float64, shares, vcpus int) error {
 	if x, ok := f.activeXML[name]; ok {
 		f.activeXML[name] = patch(x)
 	}
-	f.record("set-cputune", name, fmt.Sprintf("limit=%g shares=%d vcpus=%d", limit, shares, vcpus))
+	f.record("set-cputune", name, fmt.Sprintf("limit=%g shares=%d", limit, shares))
 	return nil
 }
 
 // SetNICRate models the libvirt interface-parameter write (see SetCPUTune).
 func (f *Fake) SetNICRate(name, mac string, rateMBps float64) error {
+	if err := libvirt.ValidateNICRate(rateMBps); err != nil {
+		return err
+	}
 	if f.FailSetNICRate != nil {
 		if err := f.FailSetNICRate(name, mac, rateMBps); err != nil {
 			return err

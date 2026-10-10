@@ -170,7 +170,7 @@ stop), and 'lv set-memory' balloons memory live within the min/max bounds.`,
 		},
 	}
 	cmd.Flags().Float64Var(&cpuLimit, "cpu-limit", 0, "Cap the VM's total CPU at this many host cores, fractions allowed, at most --cpu (live; 0 removes the cap)")
-	cmd.Flags().Int32Var(&cpuShares, "cpu-shares", 0, "Relative CPU weight under contention, 2-262144, default 1024 (live; 0 restores the default)")
+	cmd.Flags().Int32Var(&cpuShares, "cpu-shares", 0, "CPU weight under contention, 1-10000: the cgroup v2 weight, Proxmox cpuunits, default 100 (live; 0 restores the default)")
 	cmd.Flags().StringArrayVar(&nicRates, "nic-rate", nil, "Cap one NIC's bandwidth, <nic>=<MB/s> with a 0-based NIC number, e.g. 0=12.5 (live; 0=0 removes it; repeatable)")
 	cmd.Flags().Int32Var(&cpu, "cpu", 0, "Number of vCPUs (VM must be stopped)")
 	cmd.Flags().Int32Var(&memory, "memory", 0, "Memory in MiB (VM must be stopped)")

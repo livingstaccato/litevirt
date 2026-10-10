@@ -316,6 +316,15 @@ const (
 	// --cpu-shares 0 --nic-rate <n>=0, or drop the keys from the compose file);
 	// the token stays latched, as every latch does. It is never reused: a build
 	// that stops needing it moves it to the retired set, it is not deleted.
+	//
+	// What clearing the limits does NOT undo is the latch's rollback cost, which
+	// is the ordinary price of a mandatory, unconditionally advertised token and
+	// applies to EVERY cluster that runs this build, including one that never
+	// set a limit: once it has latched, rolling back to a build that does not
+	// know vm_limits_v1 puts each node into WAL quarantine
+	// (preflightCapabilityRollback) until it is upgraded again or reseeded.
+	// Replication gating has one more side effect: a witness or maintenance host
+	// left on an older build holds the latch off, so the feature stays refused.
 	VMLimitsV1 = "vm_limits_v1"
 
 	// RecoveryClaimV1 gates ENFORCEMENT of single-winner recovery claims

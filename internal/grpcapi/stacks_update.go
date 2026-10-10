@@ -141,10 +141,18 @@ func (s *Server) reconfigureWithRestart(ctx context.Context, name string, desire
 		v := desired.Tpm
 		req.Tpm = &v
 	}
+	// The limits travel in the same update as the new size: a file that lowers
+	// the cpu count and the cap together must not have the old cap judged
+	// against the new count.
+	limitFields, otherFields := splitLimitFields(planMetadataFields(plan))
+	if len(limitFields) > 0 {
+		lr := limitUpdateFromDesired(name, desired, limitFields)
+		req.CpuLimit, req.CpuShares, req.NicRate = lr.CpuLimit, lr.CpuShares, lr.NicRate
+	}
 	if _, err := s.UpdateVM(ctx, req); err != nil {
 		return fmt.Errorf("reconfigure with restart: %w", err)
 	}
-	if fields := planMetadataFields(plan); len(fields) > 0 {
+	if fields := otherFields; len(fields) > 0 {
 		if err := s.applyLiveMetadata(ctx, name, desired, fields); err != nil {
 			return fmt.Errorf("metadata after reconfigure: %w", err)
 		}

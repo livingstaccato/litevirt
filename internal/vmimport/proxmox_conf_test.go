@@ -270,3 +270,41 @@ func TestGuessGuestOSProxmox(t *testing.T) {
 		}
 	}
 }
+
+// cpulimit, cpuunits and a NIC's rate= are noisy-neighbour settings litevirt now
+// has equivalents for, but an import does not carry them (setting one would be a
+// gated create the import has not asked for); it says so, naming what to run,
+// rather than dropping them silently.
+func TestParseProxmoxConf_WarnsAboutNoisyNeighbourSettings(t *testing.T) {
+	conf := `name: vm-300
+cores: 4
+memory: 2048
+cpulimit: 2.5
+cpuunits: 500
+scsi0: local-lvm:vm-300-disk-0,size=10G
+net0: virtio=AA:BB:CC:DD:EE:01,bridge=vmbr0,rate=12.5
+net1: virtio=AA:BB:CC:DD:EE:02,bridge=vmbr1
+`
+	fv, err := ParseProxmoxConf(writeConf(t, conf))
+	if err != nil {
+		t.Fatalf("ParseProxmoxConf: %v", err)
+	}
+	for _, want := range []string{"cpulimit=2.5", "cpuunits=500", "net0", "rate=12.5", "--cpu-limit", "--nic-rate"} {
+		found := false
+		for _, w := range fv.Warnings {
+			if strings.Contains(w, want) {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("no warning mentions %q; warnings: %v", want, fv.Warnings)
+		}
+	}
+	// A conf without them warns of nothing new, and cpulimit: 0 means unlimited.
+	fv, _ = ParseProxmoxConf(writeConf(t, "name: v\ncores: 1\nmemory: 512\ncpulimit: 0\nscsi0: local-lvm:vm-1-disk-0,size=1G\n"))
+	for _, w := range fv.Warnings {
+		if strings.Contains(w, "cpulimit") {
+			t.Errorf("cpulimit: 0 (unlimited) warned: %s", w)
+		}
+	}
+}

@@ -192,6 +192,8 @@ func (s *Server) RunDualRunDetector(ctx context.Context, interval time.Duration)
 			return
 		}
 		s.detectDualRunPass(ctx)
+		// Same lease, so one node writes the shared_lun conditions too.
+		s.detectSharedLUNs(ctx)
 	}
 	eval()
 	t := time.NewTicker(interval)

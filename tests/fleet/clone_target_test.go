@@ -263,3 +263,49 @@ func TestFleet_Clone_ASourceThatIgnoresTheDestinationIsReported(t *testing.T) {
 		t.Fatalf("clone through an older source = %v, want FailedPrecondition naming the older release and the way out", err)
 	}
 }
+
+// The rest of the same gap (re-review m6): a source on an older release also
+// ignores target_pool, so a clone into a pool on the source's own host — named
+// alone, or with destination_host equal to the source's host — is made in the
+// default directory and answered with success. The entry node reads the clone's
+// disks back and says so. A clone this release does make in the pool, through
+// the same forward, is not refused.
+//
+// Mutation: drop the pool comparison in cloneTargetIgnored - both older-source
+// clones succeed with their disks outside the pool.
+func TestFleet_Clone_ASourceThatIgnoresThePoolIsReported(t *testing.T) {
+	f := newCloneFleet(t)
+	poolDir := filepath.Join(f.c.tmpRoot, "pools", "src-ssd")
+	for _, d := range []string{poolDir, f.file(f.src, poolDir)} {
+		if err := mkdirAll(d); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := corrosion.UpsertStoragePool(context.Background(), f.entry.DB, corrosion.StoragePoolRecord{
+		HostName: f.src.Name, Name: "ssd", Driver: "dir", Target: poolDir, State: "active",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f.src.Server.SetStoragePoolsByName(map[string]grpcapi.StoragePoolRef{"ssd": {Driver: "dir", Target: poolDir}})
+
+	vm, err := f.clone(t, &pb.CloneVMRequest{Target: "inpool", TargetPool: "ssd"})
+	if err != nil {
+		t.Fatalf("a pool clone this release makes, through the forward: %v", err)
+	}
+	if len(vm.GetDisks()) != 1 || vm.GetDisks()[0].GetStorageVolume() != "ssd" {
+		t.Fatalf("the clone's disks = %+v, want one in pool ssd", vm.GetDisks())
+	}
+
+	f.src.Server.SetCloneAsOlderBuildForTest(true)
+	for _, req := range []*pb.CloneVMRequest{
+		{Target: "old2", TargetPool: "ssd"},
+		{Target: "old3", TargetPool: "ssd", DestinationHost: f.src.Name},
+	} {
+		_, err := f.clone(t, req)
+		if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "older release that ignores target_pool") ||
+			!strings.Contains(err.Error(), "lv move-volume "+req.Target+" root ssd") {
+			t.Errorf("clone %s (destination %q) through an older source = %v, want FailedPrecondition naming the older release and `lv move-volume`",
+				req.Target, req.DestinationHost, err)
+		}
+	}
+}

@@ -16,13 +16,17 @@ import (
 )
 
 // The policy is a cluster_policies write, so it waits for the same latch every
-// such write waits for, and nothing is written before it.
+// such write waits for, and it is data of the drain_failback release feature,
+// so it also waits for that feature's gate; nothing is written before both.
 //
-// Mutation: drop the failoverScopeSettable check in SetFailbackPolicy — the
-// first call succeeds (and writes) with the gate unwired.
+// Mutations: drop the failoverScopeSettable check in SetFailbackPolicy — the
+// first call is refused only by the release gate, not naming failover_scope_v1;
+// call corrosion.SetFailbackPolicy outside WithReleaseFeature — the write runs
+// with the release gate refusing; drop the release term from Settable.
 func TestSetFailbackPolicy_RefusedBeforeTheLatchThenRoundTrips(t *testing.T) {
 	s := scopeServer(t)
 	s.db.SetClusterPolicyGate(func() bool { return true })
+	s.SetReleaseFeatureGate(fakeFeatureGate{t: t, grant: true})
 	s.SetGate(fakeServerGate{durablyLatchedTok: map[string]bool{}})
 	_, err := s.SetFailbackPolicy(adminCtx(), &pb.SetFailbackPolicyRequest{Enabled: true})
 	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), capabilities.FailoverScopeV1) {
@@ -36,7 +40,27 @@ func TestSetFailbackPolicy_RefusedBeforeTheLatchThenRoundTrips(t *testing.T) {
 		t.Fatalf("GetFailbackPolicy before the latch = %+v, %v; want off and not settable", st, err)
 	}
 
+	// failover_scope_v1 latched, the release token not: the release gate's
+	// refusal is the answer, and nothing is written.
 	s.SetGate(latchedGate(allPeers))
+	refusal := status.Error(codes.FailedPrecondition, "the cluster upgrade must finish first (drain_failback needs "+capabilities.ReleaseToken+")")
+	s.SetReleaseFeatureGate(fakeFeatureGate{err: refusal})
+	if _, err = s.SetFailbackPolicy(adminCtx(), &pb.SetFailbackPolicyRequest{Enabled: true}); err == nil || err.Error() != refusal.Error() {
+		t.Fatalf("SetFailbackPolicy before the release token latched: %v, want %v", err, refusal)
+	}
+	if p, _ := corrosion.GetFailbackPolicy(context.Background(), s.db); p.Enabled || p.SetBy != "" {
+		t.Fatalf("a change the release gate refused was written: %+v", p)
+	}
+	if st, _ = s.GetFailbackPolicy(adminCtx(), &emptypb.Empty{}); st.GetSettable() {
+		t.Fatalf("settable before the release token latched: %+v", st)
+	}
+	// No gate wired at all: refused, fail closed.
+	s.SetReleaseFeatureGate(nil)
+	if _, err = s.SetFailbackPolicy(adminCtx(), &pb.SetFailbackPolicyRequest{Enabled: true}); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("SetFailbackPolicy with no release gate: %v, want FailedPrecondition", err)
+	}
+
+	s.SetReleaseFeatureGate(fakeFeatureGate{t: t, grant: true})
 	st, err = s.SetFailbackPolicy(adminCtx(), &pb.SetFailbackPolicyRequest{Enabled: true})
 	if err != nil || !st.GetEnabled() || !st.GetSettable() || st.GetUpdatedAt() == "" {
 		t.Fatalf("SetFailbackPolicy after the latch = %+v, %v", st, err)

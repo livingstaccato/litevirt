@@ -101,7 +101,8 @@ func newClusterFailbackCmd() *cobra.Command {
        since.
 
 The policy is replicated and cluster-wide. Changing it needs the admin role and
-refuses until every host runs a release that carries it (failover_scope_v1).`,
+refuses until every host runs a release that carries it: failover_scope_v1 and
+the drain_failback feature of the release token (lv cluster upgrade-status).`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
@@ -127,7 +128,7 @@ refuses until every host runs a release that carries it (failover_scope_v1).`,
 					fmt.Printf("Set by:   %s at %s\n", st.GetSetBy(), st.GetUpdatedAt())
 				}
 				if !st.GetSettable() {
-					fmt.Println("Changeable: no — failover_scope_v1 has not latched on every host yet")
+					fmt.Println("Changeable: no — the cluster upgrade has not finished (failover_scope_v1 and the release token must latch on every host)")
 				}
 				return nil
 			})

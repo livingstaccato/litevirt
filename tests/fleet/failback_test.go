@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"io"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -22,6 +23,7 @@ import (
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/grpcapi"
+	"github.com/litevirt/litevirt/internal/health"
 )
 
 type fbScenario struct {
@@ -29,32 +31,62 @@ type fbScenario struct {
 	a, b, x *Node // a is drained and returns; b receives its VMs; x is a third host (nil with two nodes)
 }
 
-// newFB starts nodes independent replicas. With latch, the cluster-policy gate
-// (failover_scope_v1) is open on every node, which is what failback's feature
-// gate stands on today; without it nothing may be recorded or failed back.
+// newFB starts nodes independent replicas, wired as the daemon wires the
+// release-feature gate. With latch, the upgrade has finished: the cluster-policy
+// gate (failover_scope_v1) and the release token, whose drain_failback feature
+// failback is, have latched on every node. Without it neither has, and nothing
+// may be recorded or failed back.
 func newFB(t *testing.T, nodes int, latch bool) *fbScenario {
+	t.Helper()
+	f, gates := startFB(t, nodes)
+	if latch {
+		latchFailoverScope(t, f.c, gates)
+		latchReleaseToken(t, f.c, gates)
+	}
+	return f
+}
+
+func startFB(t *testing.T, nodes int) (*fbScenario, map[string]*health.Checker) {
 	t.Helper()
 	c := New(t, Options{Nodes: nodes, IndependentReplicas: true})
 	t.Cleanup(c.Stop)
 	gates := enforceGate(t, c)
-	for _, n := range c.Nodes {
-		g := gates[n.Name]
-		n.DB.SetClusterPolicyGate(func() bool { return g.DurablyLatched(capabilities.FailoverScopeV1) })
-	}
-	if latch {
-		for _, n := range c.Nodes {
-			if !gates[n.Name].Enforced(context.Background(), capabilities.FailoverScopeV1) {
-				t.Fatalf("%s: failover_scope_v1 did not latch on a uniform fleet", n.Name)
-			}
-		}
-	}
+	wireReleaseFeatures(t, c, gates)
 	t.Cleanup(grpcapi.SetFailbackPauseForTest(time.Millisecond))
 	c.WaitConverged(t, convergeTimeout)
 	f := &fbScenario{c: c, a: c.Nodes[0], b: c.Nodes[1]}
 	if nodes > 2 {
 		f.x = c.Nodes[2]
 	}
-	return f
+	return f, gates
+}
+
+func latchFailoverScope(t *testing.T, c *Cluster, gates map[string]*health.Checker) {
+	t.Helper()
+	for _, n := range c.Nodes {
+		if !gates[n.Name].Enforced(context.Background(), capabilities.FailoverScopeV1) {
+			t.Fatalf("%s: failover_scope_v1 did not latch on a uniform fleet", n.Name)
+		}
+	}
+}
+
+// latchReleaseToken latches the release token on every node, the HA monitor's
+// job in production.
+func latchReleaseToken(t *testing.T, c *Cluster, gates map[string]*health.Checker) {
+	t.Helper()
+	for _, n := range c.Nodes {
+		n := n
+		eventually(t, 10*time.Second, n.Name+" to latch the release token", func() bool {
+			return gates[n.Name].Enforced(context.Background(), capabilities.ReleaseToken) &&
+				gates[n.Name].DurablyLatched(capabilities.ReleaseToken)
+		})
+	}
+}
+
+// fbGrant is the drain_failback grant a test hands a writer it calls directly
+// to stage a scenario.
+func fbGrant(t *testing.T) capabilities.FeatureGrant {
+	return capabilities.GrantForTest(t, capabilities.FeatureDrainFailback)
 }
 
 // addVM adds a running VM on n whose only disk is on shared storage, so a drain
@@ -378,7 +410,7 @@ func TestFleet_Failback_IsOptIn(t *testing.T) {
 	}
 
 	// The cluster policy opts every VM in.
-	if err := corrosion.SetFailbackPolicy(context.Background(), f.a.DB, true, "test"); err != nil {
+	if err := corrosion.SetFailbackPolicy(context.Background(), f.a.DB, fbGrant(t), true, "test"); err != nil {
 		t.Fatal(err)
 	}
 	f.c.WaitConverged(t, convergeTimeout)
@@ -549,7 +581,7 @@ func TestFleet_Failback_RefusesADrainingHostAndLeavesWhatItCannotMoveLive(t *tes
 			t.Fatal(err)
 		}
 		vm, _ := corrosion.GetVM(ctx, f.b.DB, name)
-		if err := corrosion.PutDrainOrigin(ctx, f.b.DB, corrosion.DrainOrigin{
+		if err := corrosion.PutDrainOrigin(ctx, f.b.DB, fbGrant(t), corrosion.DrainOrigin{
 			VM: name, From: f.a.Name, To: f.b.Name, Epoch: vm.OwnerEpoch, CreatedAt: vm.CreatedAt}, "test"); err != nil {
 			t.Fatal(err)
 		}
@@ -601,7 +633,7 @@ func TestFleet_Failback_WaitsForTheUpgrade(t *testing.T) {
 	for _, n := range f.c.Nodes {
 		n.DB.SetClusterPolicyGate(func() bool { return true })
 	}
-	if err := corrosion.SetFailbackPolicy(context.Background(), f.a.DB, true, "test"); err != nil {
+	if err := corrosion.SetFailbackPolicy(context.Background(), f.a.DB, fbGrant(t), true, "test"); err != nil {
 		t.Fatal(err)
 	}
 	h := f.undrain(t, f.a)
@@ -614,6 +646,131 @@ func TestFleet_Failback_WaitsForTheUpgrade(t *testing.T) {
 	}
 	if f.vmAt(t, f.a, "w").HostName != f.b.Name {
 		t.Fatal("a VM moved back before the upgrade finished")
+	}
+}
+
+// Mid-roll: failover_scope_v1 latched long ago (an older release carries it),
+// but one host still runs a build without the release token, so drain_failback
+// cannot be used. The drain moves the VM as always and records nothing, the
+// policy change is refused with the release refusal, failback refuses, and the
+// feature is used nowhere. Once that host is upgraded, the first write of the
+// feature's data records the use, and every replica holds that record by the
+// time the write returns: before the data, which is still travelling.
+//
+// Mutation: put back the failbackFeatureGate stub (the failover_scope_v1 latch)
+// - the drain records w; call corrosion.SetFailbackPolicy without the gate - the
+// policy is written mid-roll.
+func TestFleet_Failback_WaitsForTheReleaseToken(t *testing.T) {
+	ctx := context.Background()
+	f, gates := startFB(t, 3)
+	latchFailoverScope(t, f.c, gates)
+	f.xOut(t)
+	// x is still on the previous release: it advertises everything a build
+	// before the release token does, and not the token.
+	for _, n := range f.c.Nodes {
+		n := n
+		gates[n.Name].SetPeerPinger(func(pctx context.Context, host string) ([]string, time.Time, error) {
+			caps, wall, err := n.Server.PeerCapabilities(pctx, host)
+			if host == f.x.Name {
+				caps = slices.DeleteFunc(slices.Clone(caps), func(c string) bool { return c == capabilities.ReleaseToken })
+			}
+			return caps, wall, err
+		})
+	}
+
+	f.addVM(t, "w", f.a, nil)
+	f.drain(t, f.b)
+	if f.vmAt(t, f.b, "w").HostName != f.b.Name {
+		t.Fatal("the drain itself must not depend on the release token")
+	}
+	wantRefusal := "the cluster upgrade must finish first (" + string(capabilities.FeatureDrainFailback) + " needs " + capabilities.ReleaseToken + ")"
+	_, err := f.c.SelfClient(f.a).SetFailbackPolicy(ctx, &pb.SetFailbackPolicyRequest{Enabled: true})
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), wantRefusal) || !strings.Contains(err.Error(), f.x.Name) {
+		t.Fatalf("lv cluster failback on mid-roll = %v, want FailedPrecondition %q naming %s", err, wantRefusal, f.x.Name)
+	}
+	f.c.WaitConverged(t, convergeTimeout, f.a, f.b)
+	for _, n := range []*Node{f.a, f.b} {
+		if o := f.origins(t, n); len(o) != 0 {
+			t.Fatalf("%s holds drain records mid-roll: %+v", n.Name, o)
+		}
+		if p, _ := corrosion.GetFailbackPolicy(ctx, n.DB); p.Enabled || p.SetBy != "" {
+			t.Fatalf("%s holds a failback policy written mid-roll: %+v", n.Name, p)
+		}
+		if featureUsedOn(t, n, capabilities.ReleaseToken, string(capabilities.FeatureDrainFailback)) {
+			t.Fatalf("%s records drain_failback as used, mid-roll", n.Name)
+		}
+	}
+	h := f.undrain(t, f.a)
+	if h.FailbackStarted {
+		t.Fatalf("undrain mid-roll started a failback: %q", h.FailbackNote)
+	}
+	if _, err := f.failback(t, f.a, &pb.FailbackHostRequest{All: true}); status.Code(err) != codes.FailedPrecondition ||
+		!strings.Contains(err.Error(), wantRefusal) {
+		t.Fatalf("failback mid-roll = %v, want FailedPrecondition %q", err, wantRefusal)
+	}
+	if f.vmAt(t, f.a, "w").HostName != f.b.Name {
+		t.Fatal("a VM moved back mid-roll")
+	}
+
+	// x is upgraded: the token latches, and the first write of the feature's
+	// data records the use on every replica before it runs.
+	for _, n := range f.c.Nodes {
+		gates[n.Name].SetPeerPinger(n.Server.PeerCapabilities)
+	}
+	latchReleaseToken(t, f.c, gates)
+	var st *pb.FailbackPolicyStatus
+	eventually(t, 10*time.Second, "the failback policy to be accepted after the upgrade", func() bool {
+		st, err = f.c.SelfClient(f.a).SetFailbackPolicy(ctx, &pb.SetFailbackPolicyRequest{Enabled: true})
+		return err == nil
+	})
+	if !st.GetEnabled() || !st.GetSettable() {
+		t.Fatalf("policy after the upgrade = %+v", st)
+	}
+	for _, n := range f.c.Nodes {
+		if !featureUsedOn(t, n, capabilities.ReleaseToken, string(capabilities.FeatureDrainFailback)) {
+			t.Fatalf("%s does not hold the drain_failback use record although the policy write has returned", n.Name)
+		}
+	}
+	f.c.WaitConverged(t, convergeTimeout)
+	for _, n := range f.c.Nodes {
+		if p, _ := corrosion.GetFailbackPolicy(ctx, n.DB); !p.Enabled {
+			t.Fatalf("%s has not received the policy", n.Name)
+		}
+	}
+
+	// A drain now records what it moved, and the undrain, with the policy on,
+	// fails that VM back; w, drained before the upgrade, has no record and stays.
+	f.addVM(t, "w2", f.a, nil)
+	// The quorum view enforceGate seeded predates the gap since the checker's
+	// last beat, which it reads as a stall; the HA monitor beats and probes in
+	// production. One beat first, then a fresh view.
+	for _, n := range f.c.Nodes {
+		gates[n.Name].QuorumProof(ctx)
+		peers := map[string]bool{}
+		for _, o := range f.c.Nodes {
+			if o != n {
+				peers[o.Name] = true
+			}
+		}
+		gates[n.Name].SeedPeersForTests(peers)
+	}
+	f.drain(t, f.b)
+	if o := f.origins(t, f.x); len(o) != 1 || o[0].VM != "w2" {
+		t.Fatalf("records after the upgrade = %+v, want w2's alone", o)
+	}
+	emulateLibvirtMove(f.b, f.a)
+	if h := f.undrain(t, f.a); !h.FailbackStarted {
+		t.Fatalf("undrain with the policy on started no failback: %q", h.FailbackNote)
+	}
+	got, err := f.failback(t, f.a, &pb.FailbackHostRequest{Follow: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["w2"].GetStatus() != "moved" {
+		t.Fatalf("w2 = %+v, want moved", got["w2"])
+	}
+	if _, ok := got["w"]; ok || f.vmAt(t, f.a, "w").HostName != f.b.Name {
+		t.Fatalf("w, drained before the upgrade, was considered (%+v) or moved", got["w"])
 	}
 }
 
@@ -659,7 +816,7 @@ func TestFleet_Failback_ARecordThatReplicatesLateNeverMovesAHandPlacedVM(t *test
 
 	// a returns; its record replicates, unspent.
 	f.c.ClearLinkFaults()
-	if err := corrosion.PutDrainOrigin(context.Background(), f.a.DB, rec[0], "drain"); err != nil {
+	if err := corrosion.PutDrainOrigin(context.Background(), f.a.DB, fbGrant(t), rec[0], "drain"); err != nil {
 		t.Fatal(err)
 	}
 	f.c.WaitConverged(t, convergeTimeout)

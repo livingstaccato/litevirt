@@ -3,7 +3,10 @@ package corrosion
 // Failback after maintenance (docs/migration-failover.md, "Failback"): the
 // replicated state behind it. It lives in cluster_policies, written through its
 // one upsert (clusterPolicyUpsertSQL) and so behind the same failover_scope_v1
-// gate — no new table and no new statement shape. The rows:
+// gate — no new table and no new statement shape. The policy and the drain
+// records are the data of the drain_failback release feature, so their writers
+// also take that feature's grant; the placement generation below is not. The
+// rows:
 //
 //   - failback: the cluster policy, "on" or "off" (no row is off). With it on,
 //     an undrain moves back every VM a drain of that host moved away.
@@ -26,6 +29,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/litevirt/litevirt/internal/capabilities"
 )
 
 const (
@@ -64,9 +69,14 @@ func GetFailbackPolicy(ctx context.Context, c *Client) (FailbackPolicy, error) {
 	}, nil
 }
 
-// SetFailbackPolicy writes the policy. It refuses with ErrClusterPolicyGateClosed
+// SetFailbackPolicy writes the policy. It is data of the drain_failback release
+// feature, so it takes the grant of that feature's gate
+// (grpcapi.Server.WithReleaseFeature). It refuses with ErrClusterPolicyGateClosed
 // until failover_scope_v1 has latched.
-func SetFailbackPolicy(ctx context.Context, c *Client, enabled bool, setBy string) error {
+func SetFailbackPolicy(ctx context.Context, c *Client, g capabilities.FeatureGrant, enabled bool, setBy string) error {
+	if err := g.Check(capabilities.FeatureDrainFailback); err != nil {
+		return err
+	}
 	if !c.MayWriteClusterPolicy() {
 		return ErrClusterPolicyGateClosed
 	}
@@ -95,9 +105,16 @@ type DrainOrigin struct {
 }
 
 // PutDrainOrigin records that a drain moved o.VM from o.From to o.To. A later
-// drain of the same VM replaces the record. It refuses with
+// drain of the same VM replaces the record. The record is data of the
+// drain_failback release feature, so it takes the grant of that feature's gate
+// (grpcapi.Server.WithReleaseFeature): once any record exists, a rollback below
+// the release token quarantines rather than run a build that moves VMs without
+// advancing their placement generation. It refuses with
 // ErrClusterPolicyGateClosed until failover_scope_v1 has latched.
-func PutDrainOrigin(ctx context.Context, c *Client, o DrainOrigin, setBy string) error {
+func PutDrainOrigin(ctx context.Context, c *Client, g capabilities.FeatureGrant, o DrainOrigin, setBy string) error {
+	if err := g.Check(capabilities.FeatureDrainFailback); err != nil {
+		return err
+	}
 	if o.VM == "" || o.From == "" || o.To == "" || strings.ContainsAny(o.VM, "/%") {
 		return fmt.Errorf("invalid drain origin %+v", o)
 	}
@@ -138,7 +155,9 @@ func ListDrainOrigins(ctx context.Context, c *Client, host string) ([]DrainOrigi
 }
 
 // CollectDrainOrigin empties a VM's record (see the file comment): it was
-// failed back, or can never be.
+// failed back, or can never be. It takes no grant: it writes no new data, only
+// empties a record that exists because the feature was used, and it runs inside
+// writers that move a VM (SpendDrainOrigin), which must never be refused.
 func CollectDrainOrigin(ctx context.Context, c *Client, vm, setBy string) error {
 	if !c.MayWriteClusterPolicy() {
 		return ErrClusterPolicyGateClosed
@@ -164,8 +183,9 @@ func GetLiveDrainOrigin(ctx context.Context, c *Client, vm string) (DrainOrigin,
 
 // SpendDrainOrigin cancels vm's drain record, if it has a live one: the VM's
 // host has just changed, so the record no longer describes it. It is called by
-// every writer that changes a VM's host (grpcapi's failbackFeatureGate holds
-// failback back until every host does), after the change landed. A read first, so moving a VM no
+// every writer that changes a VM's host, after the change landed (no record
+// exists before the drain_failback release feature is used, and the release
+// token keeps a build that does not spend it off the cluster from then on). A read first, so moving a VM no
 // drain moved writes nothing, and best effort: a record that stays behind is
 // caught by the owner-side check failback makes, and by the owner epoch where
 // the writer bumps it.
@@ -185,7 +205,10 @@ func SpendDrainOrigin(ctx context.Context, c *Client, vm string) {
 // any drain record, whether or not that record ever reached the movers.
 //
 // Like every cluster_policies write it waits for the cluster-policy gate; with
-// the gate closed no generation is kept, and neither is any drain record.
+// the gate closed no generation is kept, and neither is any drain record. It is
+// NOT behind the drain_failback release feature: the generation is advanced by
+// every move whether or not failback is ever used, and it must already be
+// counting when the first drain record is written.
 const placementGenKeyPrefix = "placement_gen/"
 
 // GetPlacementGen returns vm's placement generation on this node's replica; a VM

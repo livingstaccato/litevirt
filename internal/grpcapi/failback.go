@@ -172,26 +172,32 @@ func (f *failbackRuns) latest(host string) *failbackRun {
 	return f.runs[host]
 }
 
-// failbackFeatureGate is the one place failback asks whether every host runs
-// the build that advances a VM's placement generation and cancels its drain
-// record whenever its host changes. Until it passes, no record is written and nothing
-// fails back, and an undrain behaves exactly as it always has. PROVISIONAL: it
-// stands on the durable failover_scope_v1 latch, which builds from before this
-// feature also advertise, so on a mixed cluster it does not yet guarantee what
-// it is named for. The cluster's single release token replaces its body before
-// this ships; nothing else in failback knows how the answer is reached.
-func (s *Server) failbackFeatureGate(ctx context.Context) error {
-	if s.gate != nil && s.gate.DurablyLatched(capabilities.FailoverScopeV1) {
+// failbackFeatureGate is the one place failback asks whether every host runs a
+// build that advances a VM's placement generation, spends its drain record
+// whenever its host changes, and checks a failback move's preconditions: the
+// drain_failback feature of the release token. It reads the durable latch only
+// and asks no peer (Server.ReleaseFeatureAvailable), so a drain, an undrain or
+// a failback mid-roll pays nothing for it, and it records no use: only a write
+// of the feature's data does (recordDrainOrigin, SetFailbackPolicy), through
+// WithReleaseFeature. A failback run writes no new data; it acts on records,
+// and a record exists only once the feature was used, after which a host rolled
+// back below the token quarantines instead of moving VMs without advancing their
+// generation. Until it passes no record is written, nothing fails back, and an
+// undrain behaves exactly as it always has.
+func (s *Server) failbackFeatureGate(_ context.Context) error {
+	if s.ReleaseFeatureAvailable(capabilities.FeatureDrainFailback) {
 		return nil
 	}
-	return status.Error(codes.FailedPrecondition,
-		"failback waits for the upgrade: not every host runs the release that records what a drain moved. "+
-			"Finish rolling every host (and every host in maintenance) to this release")
+	return status.Errorf(codes.FailedPrecondition,
+		"the cluster upgrade must finish first (%s needs %s): failback waits for the upgrade; "+
+			"finish rolling every host (and every host in maintenance) to this release — see `lv cluster upgrade-status`",
+		capabilities.FeatureDrainFailback, featureToken(capabilities.FeatureDrainFailback))
 }
 
 // recordDrainOrigin notes that a drain of from moved vmName to to. It records
-// only a VM the drain really left on to, and only once the failback
-// feature gate passes; failback is otherwise unavailable for that VM, the safe direction.
+// only a VM the drain really left on to, and only through the drain_failback
+// release feature's gate; when that refuses, failback is unavailable for that
+// VM, the safe direction, and the drain itself is never refused.
 func (s *Server) recordDrainOrigin(ctx context.Context, vmName, from, to string) {
 	if s.failbackFeatureGate(ctx) != nil {
 		slog.Info("drain: not recorded for failback: the upgrade has not finished on every host", "vm", vmName)
@@ -202,9 +208,10 @@ func (s *Server) recordDrainOrigin(ctx context.Context, vmName, from, to string)
 		return
 	}
 	gen, _ := corrosion.GetPlacementGen(ctx, s.db, vmName)
-	err = corrosion.PutDrainOrigin(ctx, s.db, corrosion.DrainOrigin{
-		VM: vmName, From: from, To: to, Epoch: vm.OwnerEpoch, CreatedAt: vm.CreatedAt, Gen: gen,
-	}, "drain")
+	o := corrosion.DrainOrigin{VM: vmName, From: from, To: to, Epoch: vm.OwnerEpoch, CreatedAt: vm.CreatedAt, Gen: gen}
+	err = s.WithReleaseFeature(ctx, capabilities.FeatureDrainFailback, func(ctx context.Context, g capabilities.FeatureGrant) error {
+		return corrosion.PutDrainOrigin(ctx, s.db, g, o, "drain")
+	})
 	if err != nil {
 		slog.Info("drain: not recorded for failback", "vm", vmName, "from", from, "to", to, "error", err)
 	}
@@ -282,8 +289,8 @@ func (s *Server) FailbackHost(req *pb.FailbackHostRequest, stream pb.LiteVirt_Fa
 	return run.follow(ctx, stream.Send)
 }
 
-// failbackPreflight refuses a failback that cannot run at all: the token has
-// not latched, the host is unknown or not active.
+// failbackPreflight refuses a failback that cannot run at all: the release
+// token has not latched, the host is unknown or not active.
 func (s *Server) failbackPreflight(ctx context.Context, host string) error {
 	if err := s.failbackFeatureGate(ctx); err != nil {
 		return err
@@ -523,7 +530,9 @@ func (s *Server) GetFailbackPolicy(ctx context.Context, _ *emptypb.Empty) (*pb.F
 
 // SetFailbackPolicy turns the cluster failback policy on or off. It refuses
 // until failover_scope_v1 has latched, as every cluster_policies write does: a
-// peer that cannot decode the table would stall on the write.
+// peer that cannot decode the table would stall on the write. The policy is
+// data of the drain_failback release feature, so the write goes through that
+// feature's gate too, which refuses until the release token has latched.
 func (s *Server) SetFailbackPolicy(ctx context.Context, req *pb.SetFailbackPolicyRequest) (*pb.FailbackPolicyStatus, error) {
 	if err := RequireRole(ctx, "admin"); err != nil {
 		return nil, err
@@ -533,11 +542,17 @@ func (s *Server) SetFailbackPolicy(ctx context.Context, req *pb.SetFailbackPolic
 			"the failback policy cannot be changed until failover_scope_v1 has latched on every host: "+
 				"finish rolling every host (and every host in maintenance) to this release first")
 	}
-	if err := corrosion.SetFailbackPolicy(ctx, s.db, req.GetEnabled(), callerUsername(ctx)); err != nil {
-		if errors.Is(err, corrosion.ErrClusterPolicyGateClosed) {
-			return nil, status.Error(codes.FailedPrecondition, err.Error())
+	err := s.WithReleaseFeature(ctx, capabilities.FeatureDrainFailback, func(ctx context.Context, g capabilities.FeatureGrant) error {
+		if err := corrosion.SetFailbackPolicy(ctx, s.db, g, req.GetEnabled(), callerUsername(ctx)); err != nil {
+			if errors.Is(err, corrosion.ErrClusterPolicyGateClosed) {
+				return status.Error(codes.FailedPrecondition, err.Error())
+			}
+			return status.Errorf(codes.Internal, "set failback policy: %v", err)
 		}
-		return nil, status.Errorf(codes.Internal, "set failback policy: %v", err)
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	s.audit(ctx, "cluster.failback", "failback", fmt.Sprintf("failback policy enabled=%t", req.GetEnabled()), "ok")
 	return s.failbackPolicyStatus(ctx)
@@ -549,7 +564,8 @@ func (s *Server) failbackPolicyStatus(ctx context.Context) (*pb.FailbackPolicySt
 		return nil, status.Errorf(codes.Internal, "read failback policy: %v", err)
 	}
 	return &pb.FailbackPolicyStatus{
-		Enabled: p.Enabled, SetBy: p.SetBy, UpdatedAt: p.UpdatedAt, Settable: s.failoverScopeSettable(),
+		Enabled: p.Enabled, SetBy: p.SetBy, UpdatedAt: p.UpdatedAt,
+		Settable: s.failoverScopeSettable() && s.ReleaseFeatureAvailable(capabilities.FeatureDrainFailback),
 	}, nil
 }
 

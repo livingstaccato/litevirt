@@ -380,15 +380,19 @@ hand move out and back included, stops the VM from being moved. Records, and the
 generation, are written only while cluster-wide policy writes are allowed
 (failover_scope_v1).
 
-**The gate is provisional.** Failback needs every host to run a release that
-advances the generation. Until that is guaranteed, no record is written and
-`lv host failback` refuses ("failback waits for the upgrade"); an undrain
-behaves exactly as it always has, and says so when the cluster policy is on. At
-present that check is the cluster-policy latch (failover_scope_v1), which builds
-from before this feature also advertise, so on a cluster that is mid-upgrade it
-does not yet guarantee it: finish rolling every host (and every host in
-maintenance) before relying on failback. It will be replaced by the release
-token that gates every feature of this kind.
+**The release gate.** Failback needs every host to run a release that
+advances the generation and checks a failback move's preconditions. It is the
+`drain_failback` feature of the release token (`lv cluster upgrade-status`;
+see upgrades.md, "Rolling back after a release token latched"). Until that
+token has latched on every host (and every host in maintenance), no record is
+written, `lv cluster failback on` refuses, and `lv host failback` refuses ("the
+cluster upgrade must finish first (drain_failback needs ...): failback waits for
+the upgrade"); an undrain behaves exactly as it always has, and says so when the
+cluster policy is on. Every drain after the latch records the VMs it moved, so
+the first drain marks `drain_failback` used: from then on a host rolled back
+below the release is quarantined rather than left to move VMs without advancing
+their generation. The placement generation itself is not behind the feature: it
+is kept from the moment cluster-wide policy writes are allowed.
 
 A VM returns only while its record still describes it exactly. One that an
 operator has since moved by hand, that a failover recovered, that was deleted

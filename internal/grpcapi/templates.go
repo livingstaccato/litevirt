@@ -111,12 +111,10 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 		// A source on an older release does not know destination_host or
 		// target_pool: it makes a plain same-host clone and answers success. Say
 		// so, rather than let the clone sit where it was not asked to be.
-		if err == nil && vm != nil && req.DestinationHost != "" && vm.HostName != req.DestinationHost {
-			return nil, status.Errorf(codes.FailedPrecondition,
-				"%s, where the clone is made, is on an older release that ignores destination_host and target_pool: "+
-					"the clone %q was made on %s instead of %s. Move it with `lv migrate %s %s --cold` or remove it with `lv rm %s`; "+
-					"finish upgrading %s to clone onto another host",
-				src.HostName, req.Target, vm.HostName, req.DestinationHost, req.Target, req.DestinationHost, req.Target, src.HostName)
+		if err == nil && vm != nil {
+			if ierr := cloneTargetIgnored(req, vm, src.HostName); ierr != nil {
+				return nil, ierr
+			}
 		}
 		return vm, err
 	}
@@ -151,6 +149,37 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 		return nil, err
 	}
 	return s.finishCrossHostClone(ctx, req)
+}
+
+// cloneTargetIgnored reports a clone that a source on an older release made as
+// a plain same-host clone, ignoring destination_host and target_pool, which it
+// does not know: the clone is on another host than the one asked for, or one of
+// its disks is not in the pool asked for. The answer it is judged by is the
+// clone as its final host reads it back (a cross-host clone's InspectVM there),
+// so a clone this release made where it was asked is never refused.
+func cloneTargetIgnored(req *pb.CloneVMRequest, vm *pb.VM, srcHost string) error {
+	if req.DestinationHost != "" && vm.GetHostName() != req.DestinationHost {
+		return status.Errorf(codes.FailedPrecondition,
+			"%s, where the clone is made, is on an older release that ignores destination_host and target_pool: "+
+				"the clone %q was made on %s instead of %s. Move it with `lv migrate %s %s --cold` or remove it with `lv rm %s`; "+
+				"finish upgrading %s to clone onto another host",
+			srcHost, req.Target, vm.GetHostName(), req.DestinationHost, req.Target, req.DestinationHost, req.Target, srcHost)
+	}
+	if req.TargetPool == "" {
+		return nil
+	}
+	for _, d := range vm.GetDisks() {
+		if d.GetStorageVolume() != req.TargetPool {
+			return status.Errorf(codes.FailedPrecondition,
+				"%s, where the clone is made, is on an older release that ignores target_pool: "+
+					"the clone %q was made on %s with its disk %q in the default directory, not in pool %q. "+
+					"Move it with `lv move-volume %s %s %s` or remove it with `lv rm %s`; "+
+					"finish upgrading %s to clone into a pool",
+				srcHost, req.Target, vm.GetHostName(), d.GetName(), req.TargetPool,
+				req.Target, d.GetName(), req.TargetPool, req.Target, srcHost)
+		}
+	}
+	return nil
 }
 
 // cloneVMOnSource is CloneVM on the host that holds the source's disks, with

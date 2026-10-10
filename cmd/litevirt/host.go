@@ -369,10 +369,10 @@ moved. --dry-run shows what would move and why each other VM stays. --follow
 attaches to the run an undrain started on this daemon instead of starting one.
 
 The host must be active (lv host undrain first). Failback also needs every host
-to run a release that tracks where drains put VMs; until then it refuses with
-"failback waits for the upgrade". That check is provisional: today it is the
-cluster-policy latch (failover_scope_v1), which older builds also advertise, so
-on a mixed cluster finish the upgrade before relying on failback.`,
+to run a release that tracks where drains put VMs: it is the drain_failback
+feature of the release token. Until that token has latched, drains record
+nothing and failback refuses ("the cluster upgrade must finish first ...
+failback waits for the upgrade"); lv cluster upgrade-status shows the token.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {

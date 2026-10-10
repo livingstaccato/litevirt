@@ -79,13 +79,17 @@ type FeatureInfo struct {
 // request. The firewall branch gates per-NIC guards — on by default for every
 // new NIC, so used on the first NIC created after the latch — on nic_guards,
 // and IPv6 rules on firewall_ipv6, so a cluster with no IPv6 rule can still
-// roll back below the release.
+// roll back below the release. drain_failback is used by default in the same
+// way: every drain after the latch records the VMs it moved, because
+// `lv host failback --all` may be asked for them later, so the first drain
+// after the latch marks it used. Its other data, the cluster failback policy,
+// is nothing failback can act on without those records, so it shares the bit.
 var releaseFeatures = map[Feature]FeatureInfo{
 	FeatureVMLimits:             {Token: Release202611V1, Description: "Per-VM CPU limit and shares, and NIC bandwidth limits"},
 	FeatureVMDiskNICIO:          {Token: Release202611V1, Description: "Per-disk I/O tuning and per-NIC tuning"},
 	FeatureEmailTargetSecret:    {Token: Release202611V1, Description: "Email notification targets with a stored SMTP secret"},
 	FeatureLoginPolicy:          {Token: Release202611V1, Description: "Cluster login policy"},
-	FeatureDrainFailback:        {Token: Release202611V1, Description: "Failback of the workloads a drain moved"},
+	FeatureDrainFailback:        {Token: Release202611V1, Description: "Failback after a drain: the record every drain writes of the VMs it moved, and the cluster failback policy", Writers: []string{"internal/corrosion.PutDrainOrigin", "internal/corrosion.SetFailbackPolicy"}},
 	FeatureFirewallIPv6:         {Token: Release202611V1, Description: "IPv6 security-group and firewall rules"},
 	FeatureNICGuards:            {Token: Release202611V1, Description: "Per-NIC anti-spoofing guards (MAC and IP); on by default for new NICs"},
 	FeatureUSBMountsMemory:      {Token: Release202611V1, Description: "VM USB devices and memory hot-add; container host mounts and devices"},

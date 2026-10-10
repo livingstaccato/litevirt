@@ -146,6 +146,7 @@ drive a local `lv`).
 | `E2E_LAB_PORT_BASE` | `2230` | node N's SSH is `127.0.0.1:(base+N)` |
 | `E2E_EVIDENCE_DIR` | (none) | per drill: `samples.log` (every sample), `timeline.txt`, extra evidence |
 | `E2E_DRILL_IMAGE` / `E2E_DRILL_MEMORY` | `cirros` / `128M` | the drills' own test VMs |
+| `E2E_RELAY_NETEM` | `loss 30%` | the `tc netem` impairment `TestRelayHealth_DegradedLinkBecomesALeafEverywhere` puts on node-1's cluster interface; it must make that node's readiness probes fail from at least a third of its peers on every probe for 2 minutes, so a heavier impairment may be needed if TCP retransmission hides 30% loss |
 | `LITEVIRT_E2E_DESTRUCTIVE` | (none) | `1` also runs drill 6, which destroys and rebuilds hosts |
 
 ### The drills

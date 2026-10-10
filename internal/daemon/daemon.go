@@ -1053,6 +1053,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetStoragePoolsByName(d.storagePoolRefs())
 	// The ceph pools' libvirt secrets (ephemeral: gone after a libvirtd
 	// restart): defined now, then kept in line with the pools and keyrings.
+	// An rbd disk's domain takes its monitors from its pool as configured on
+	// this host when the domain is defined, not from when the disk was made.
+	libvirt.SetCephMonitorResolver(svc.CephMonitorsForPool)
 	svc.ReconcileCephSecrets(ctx)
 	go d.runCephSecretReconcile(ctx)
 	// Before this daemon serves: no cold-migration copy can be in flight yet.
@@ -1941,6 +1944,13 @@ func (d *Daemon) registerStoragePools(ctx context.Context) {
 		}
 		if disksExp != "" {
 			opts[storage.DataDisksExportOption] = disksExp
+		}
+		// A ceph pool's row carries this host's key fingerprint, which the
+		// pool's other hosts compare theirs against (grpcapi/ceph_secrets.go).
+		if strings.EqualFold(p.Driver, "ceph") {
+			if fp, ok, err := storage.CephKeyFingerprintOf(p.Options); err == nil && ok {
+				opts[storage.CephKeyFPOption] = fp
+			}
 		}
 		if len(opts) > 0 {
 			rec.Options = opts

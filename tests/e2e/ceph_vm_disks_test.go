@@ -26,7 +26,8 @@ import (
 //     same secret), and is still running there;
 //   - a clone is an rbd copy in the pool, cloned from the same base;
 //   - delete removes every VM image and keeps the base;
-//   - a create that fails after its ceph disk exists leaves no image behind.
+//   - a create that fails after its ceph disk exists (proven from the daemon
+//     log) leaves no image behind.
 //
 // Run it with:
 //
@@ -186,22 +187,38 @@ func TestLab_CephVMDisks(t *testing.T) {
 		t.Fatalf("the base %s was removed with the VMs: %v\n%s", base, err, out)
 	}
 
-	// A create that fails after its ceph disk exists removes it: the second
-	// disk names a pool this host does not have, which CreateVM finds only
-	// once the first disk is made.
+	// A create that fails AFTER its ceph disk exists removes it. The second
+	// disk names a pool that exists in the cluster — a throwaway dir pool on
+	// dst only — so compose's cluster-wide storage check passes, and CreateVM
+	// on src fails resolving it there (resolveVolume: "… storage pool on host
+	// …") once the ceph disk has been made: compose creates disks in name
+	// order (sortedKeys), "data" before "zz". The daemon log on src proves the
+	// image was created, so the "nothing left" check is not vacuous.
 	badStack := stack + "-bad"
 	bad := badStack + "-1"
-	badYAML := fmt.Sprintf("name: %s\nvms:\n  %s:\n    cpu: 1\n    memory: %s\n    disks:\n      data:\n        size: \"64M\"\n        storage: %q\n      more:\n        size: \"64M\"\n        storage: %q\n    placement:\n      host: %s\n",
-		badStack, bad, drillMemory(), pool, "no-such-pool-"+stack, src)
+	elsewhere := "cephnohere-" + strings.TrimPrefix(stack, "e2e-")
+	elsewhereDir := "/var/tmp/" + elsewhere
+	l.mustSSH(dst, 30*time.Second, "mkdir -p "+shellQuote(elsewhereDir))
+	l.mustLV(dst, "pool", "create", elsewhere, "--driver", "dir", "--target", elsewhereDir, "--host", dst)
+	t.Cleanup(func() {
+		l.lv(dst, "pool", "delete", elsewhere, "--host", dst, "--force")
+		l.ssh(dst, 30*time.Second, "rmdir "+shellQuote(elsewhereDir))
+	})
+	badYAML := fmt.Sprintf("name: %s\nvms:\n  %s:\n    cpu: 1\n    memory: %s\n    disks:\n      data:\n        size: \"64M\"\n        storage: %q\n      zz:\n        size: \"64M\"\n        storage: %q\n    placement:\n      host: %s\n",
+		badStack, bad, drillMemory(), pool, elsewhere, src)
 	badFile := "/tmp/" + badStack + ".yaml"
 	l.mustSSH(src, 30*time.Second, "echo "+base64.StdEncoding.EncodeToString([]byte(badYAML))+" | base64 -d > "+badFile)
 	t.Cleanup(func() { l.deleteVMs(badStack, map[string]string{src: bad}) })
+	since := l.nodeNow(src)
 	out, err := l.lv(src, "compose", "up", "-f", badFile, "-y")
 	if err == nil {
-		t.Fatalf("a create with a disk on a missing pool succeeded:\n%s", out)
+		t.Fatalf("a create with a disk on a pool %s does not have succeeded:\n%s", src, out)
 	}
-	if !strings.Contains(out+err.Error(), "storage pool") {
-		t.Fatalf("the create did not fail at the missing pool (so no ceph disk was made first):\n%v\n%s", err, out)
+	if !strings.Contains(out+err.Error(), "storage pool on host") {
+		t.Fatalf("the create did not fail resolving the second disk on %s (so no ceph disk was made first):\n%v\n%s", src, err, out)
+	}
+	if made := l.journalSince(src, since, "Ceph RBD disk created.*"+bad+"-data"); !strings.Contains(made, bad+"-data") {
+		t.Fatalf("the daemon on %s never created %s-data, so the cleanup was not exercised", src, bad)
 	}
 	if ls, _ := rbd(src, "ls "+shellQuote(rbdPool)); strings.Contains(ls, bad+"-") {
 		t.Fatalf("the failed create left an image behind:\n%s", ls)

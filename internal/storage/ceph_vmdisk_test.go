@@ -3,13 +3,20 @@ package storage
 import (
 	"context"
 	"encoding/base64"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
+
+// rbdExit is a failed rbd command as exec reports it: rbd exits with the
+// errno of the failure (rbd.cc: return std::abs(r)).
+type rbdExit int
+
+func (e rbdExit) Error() string { return fmt.Sprintf("exit status %d", int(e)) }
+func (e rbdExit) ExitCode() int { return int(e) }
 
 // fakeCeph models the rbd semantics the VM-disk paths turn on: images and
 // their snapshots exist or not, clone/import/create/rename/deep cp refuse an
@@ -20,10 +27,22 @@ type fakeCeph struct {
 	sizes  map[string]int64
 	calls  []string
 	fail   map[string]error // subcommand → injected failure
+	// failOut is a failure with rbd's own output (subcommand → output, error).
+	failOut map[string]struct {
+		out []byte
+		err error
+	}
+	before      map[string]func() // subcommand → run just before it
+	partialCopy bool              // deep cp creates its destination, then fails
+	listing     []string          // what `rbd ls` prints
 }
 
 func newFakeCeph() *fakeCeph {
-	return &fakeCeph{images: map[string]map[string]bool{}, sizes: map[string]int64{}, fail: map[string]error{}}
+	return &fakeCeph{images: map[string]map[string]bool{}, sizes: map[string]int64{}, fail: map[string]error{},
+		failOut: map[string]struct {
+			out []byte
+			err error
+		}{}, before: map[string]func(){}}
 }
 
 func (f *fakeCeph) has(ref string) bool { _, ok := f.images[ref]; return ok }
@@ -40,7 +59,7 @@ func (f *fakeCeph) called(prefix string) int {
 	return n
 }
 
-func (f *fakeCeph) run(_ context.Context, name string, args ...string) ([]byte, error) {
+func (f *fakeCeph) run(ctx context.Context, name string, args ...string) ([]byte, error) {
 	if name == "qemu-img" {
 		f.calls = append(f.calls, "qemu-img "+strings.Join(args, " "))
 		if err := f.fail["qemu-img"]; err != nil {
@@ -64,18 +83,32 @@ func (f *fakeCeph) run(_ context.Context, name string, args ...string) ([]byte, 
 	if sub == "snap" || sub == "deep" {
 		sub += " " + words[1]
 	}
+	if ctx.Err() != nil {
+		// exec.CommandContext never starts a command on a cancelled context.
+		f.calls = append(f.calls, "CANCELLED "+strings.TrimSpace(sub+" "+strings.Join(pos, " ")))
+		return nil, ctx.Err()
+	}
 	f.calls = append(f.calls, strings.TrimSpace(sub+" "+strings.Join(pos, " ")))
+	if hook := f.before[sub]; hook != nil {
+		hook()
+	}
 	if err := f.fail[sub]; err != nil {
 		return []byte("rbd: injected failure"), err
+	}
+	if fo, ok := f.failOut[sub]; ok {
+		return fo.out, fo.err
 	}
 	exists := []byte("rbd: create error: (17) File exists")
 	missing := []byte("rbd: error opening image: (2) No such file or directory")
 	switch sub {
 	case "ls", "import":
+		if sub == "ls" {
+			return []byte(strings.Join(f.listing, "\n")), nil
+		}
 		if sub == "import" {
 			dst := pos[1]
 			if f.has(dst) {
-				return exists, errors.New("exit 17")
+				return exists, rbdExit(17)
 			}
 			f.images[dst] = map[string]bool{}
 			f.sizes[dst] = 512 << 20
@@ -83,41 +116,54 @@ func (f *fakeCeph) run(_ context.Context, name string, args ...string) ([]byte, 
 		return nil, nil
 	case "create":
 		if f.has(pos[0]) {
-			return exists, errors.New("exit 17")
+			return exists, rbdExit(17)
 		}
 		f.images[pos[0]] = map[string]bool{}
 		return nil, nil
 	case "info":
 		ref, snap, _ := strings.Cut(pos[0], "@")
 		if !f.has(ref) {
-			return missing, errors.New("exit 2")
+			return missing, rbdExit(2)
 		}
 		if snap != "" {
 			if _, ok := f.images[ref][snap]; !ok {
-				return missing, errors.New("exit 2")
+				return missing, rbdExit(2)
 			}
 		}
 		return []byte(fmt.Sprintf(`{"size":%d}`, f.sizes[ref])), nil
 	case "clone":
 		ref, snap, _ := strings.Cut(pos[0], "@")
 		if prot, ok := f.images[ref][snap]; !ok || !prot {
-			return []byte("rbd: parent snapshot must be protected"), errors.New("exit 22")
+			return []byte("rbd: parent snapshot must be protected"), rbdExit(22)
 		}
 		if f.has(pos[1]) {
-			return exists, errors.New("exit 17")
+			return exists, rbdExit(17)
 		}
 		f.images[pos[1]] = map[string]bool{}
 		f.sizes[pos[1]] = f.sizes[ref]
 		return nil, nil
 	case "deep cp":
+		// rbd opens the source first: a missing source never reaches the
+		// destination, and its output names no destination at all.
 		if !f.has(pos[0]) {
-			return missing, errors.New("exit 2")
+			return missing, rbdExit(2)
 		}
 		if f.has(pos[1]) {
-			return exists, errors.New("exit 17")
+			return exists, rbdExit(17)
 		}
 		f.images[pos[1]] = map[string]bool{}
 		f.sizes[pos[1]] = f.sizes[pos[0]]
+		if f.partialCopy {
+			return []byte("rbd: deep copy failed: (5) Input/output error"), rbdExit(5)
+		}
+		return nil, nil
+	case "snap purge":
+		for snap, prot := range f.images[pos[0]] {
+			if prot {
+				return []byte("rbd: snapshot is protected"), rbdExit(16)
+			}
+			delete(f.images[pos[0]], snap)
+		}
 		return nil, nil
 	case "resize":
 		f.sizes[pos[0]] = 1 // recorded; the size is asserted from the call
@@ -135,13 +181,13 @@ func (f *fakeCeph) run(_ context.Context, name string, args ...string) ([]byte, 
 	case "snap rm":
 		ref, snap, _ := strings.Cut(pos[0], "@")
 		if f.images[ref][snap] {
-			return []byte("rbd: snapshot is protected"), errors.New("exit 16")
+			return []byte("rbd: snapshot is protected"), rbdExit(16)
 		}
 		delete(f.images[ref], snap)
 		return nil, nil
 	case "rename":
 		if f.has(pos[1]) {
-			return exists, errors.New("exit 17")
+			return exists, rbdExit(17)
 		}
 		f.images[pos[1]] = f.images[pos[0]]
 		f.sizes[pos[1]] = f.sizes[pos[0]]
@@ -149,10 +195,10 @@ func (f *fakeCeph) run(_ context.Context, name string, args ...string) ([]byte, 
 		return nil, nil
 	case "rm":
 		if !f.has(pos[0]) {
-			return missing, errors.New("exit 2")
+			return missing, rbdExit(2)
 		}
 		if f.snaps(pos[0]) > 0 {
-			return []byte("rbd: image has snapshots - not removing"), errors.New("exit 39")
+			return []byte("rbd: image has snapshots - not removing"), rbdExit(39)
 		}
 		delete(f.images, pos[0])
 		return nil, nil
@@ -184,12 +230,15 @@ func labCephFiles(t *testing.T) (conf, keyring string, key []byte) {
 func TestCephDiskLocator_CarriesIdentityAndMonitors(t *testing.T) {
 	conf, keyring, _ := labCephFiles(t)
 	f := newFakeCeph()
-	d := &cephDriver{pool: "lv", opts: map[string]string{"id": "litevirt", "conf": conf, "keyring": keyring}, run: f.run}
+	d := &cephDriver{pool: "lv", name: "ceph", opts: map[string]string{"id": "litevirt", "conf": conf, "keyring": keyring}, run: f.run}
 	path, err := d.CreateDisk(context.Background(), DiskOptions{VMName: "vm", DiskName: "data", SizeBytes: 1 << 30})
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "rbd:lv/vm-data:id=litevirt:keyring=" + keyring + ":conf=" + conf + `:mon_host=10.78.0.22\:6789`
+	// I5: the monitors are NOT fixed into the locator: they are read from the
+	// pool (or its conf) each time a domain is defined. The litevirt pool the
+	// disk belongs to names its secret (I2).
+	want := "rbd:lv/vm-data:id=litevirt:keyring=" + keyring + ":conf=" + conf + ":lvpool=ceph"
 	if path != want {
 		t.Fatalf("locator\n got %q\nwant %q", path, want)
 	}
@@ -310,7 +359,7 @@ func TestCephEnsureBase_LosingTheRenameUsesTheWinner(t *testing.T) {
 // A clone whose resize fails is removed: the create leaves no image behind.
 func TestCephCreateDisk_FailedGrowRemovesTheClone(t *testing.T) {
 	f := newFakeCeph()
-	f.fail["resize"] = errors.New("exit 1")
+	f.fail["resize"] = rbdExit(1)
 	d := &cephDriver{pool: "lv", opts: map[string]string{}, run: f.run, scratch: t.TempDir()}
 	if _, err := d.CreateDisk(context.Background(), DiskOptions{VMName: "a", DiskName: "root", SizeBytes: 8 << 30, SourceImage: storeImage(t), SourceImageName: "cirros", SourceImageDigest: strings.Repeat("ef", 32)}); err == nil {
 		t.Fatal("expected the resize failure")
@@ -323,7 +372,7 @@ func TestCephCreateDisk_FailedGrowRemovesTheClone(t *testing.T) {
 // A failed import leaves no staging image and no base.
 func TestCephCreateDisk_FailedImportLeavesNothing(t *testing.T) {
 	f := newFakeCeph()
-	f.fail["snap protect"] = errors.New("exit 1")
+	f.fail["snap protect"] = rbdExit(1)
 	d := &cephDriver{pool: "lv", opts: map[string]string{}, run: f.run, scratch: t.TempDir()}
 	if _, err := d.CreateDisk(context.Background(), DiskOptions{VMName: "a", DiskName: "root", SourceImage: storeImage(t), SourceImageName: "cirros", SourceImageDigest: strings.Repeat("12", 32)}); err == nil {
 		t.Fatal("expected the protect failure")
@@ -385,5 +434,149 @@ func TestCephCloneDisk_DeepCopiesInsideThePool(t *testing.T) {
 	// The destination exists (another VM's): refused, and left alone.
 	if _, err := d.CloneDisk(context.Background(), "rbd:lv/src-root", DiskOptions{VMName: "dst", DiskName: "root"}); err == nil || !f.has("lv/dst-root") {
 		t.Fatalf("clone onto an existing image: err=%v, image kept=%v", err, f.has("lv/dst-root"))
+	}
+}
+
+// C1. A clone whose copy fails before it creates anything — here the source
+// image is gone — must never remove the destination name: that image is
+// another VM's (VM "a" disk "b-root" is VM "a-b" disk "root").
+func TestCephCloneDisk_NeverRemovesAnImageItDidNotCreate(t *testing.T) {
+	f := newFakeCeph()
+	f.images["lv/a-b-root"] = map[string]bool{} // VM a's data disk b-root
+	d := &cephDriver{pool: "lv", name: "ceph", opts: map[string]string{}, run: f.run}
+	if _, err := d.CloneDisk(context.Background(), "rbd:lv/gone-root", DiskOptions{VMName: "a-b", DiskName: "root"}); err == nil {
+		t.Fatal("clone of a missing source succeeded")
+	}
+	if !f.has("lv/a-b-root") {
+		t.Fatalf("the clone's rollback removed another VM's image: %v", f.calls)
+	}
+}
+
+// A copy that fails part-way leaves nothing: it went to a private staging
+// name, which is all the rollback removes, and the destination name was
+// never taken.
+func TestCephCloneDisk_PartialCopyIsRemoved(t *testing.T) {
+	f := newFakeCeph()
+	f.partialCopy = true
+	f.images["lv/src-root"] = map[string]bool{}
+	d := &cephDriver{pool: "lv", name: "ceph", opts: map[string]string{}, run: f.run}
+	if _, err := d.CloneDisk(context.Background(), "rbd:lv/src-root", DiskOptions{VMName: "dst", DiskName: "root"}); err == nil {
+		t.Fatal("a failed copy reported success")
+	}
+	for ref := range f.images {
+		if ref != "lv/src-root" {
+			t.Errorf("left behind: %s (calls %v)", ref, f.calls)
+		}
+	}
+	if f.called("deep cp lv/src-root lv/dst-root"+incomingMarker) != 1 {
+		t.Errorf("the copy did not go to a staging name: %v", f.calls)
+	}
+}
+
+// I3. rbd exits 2 (ENOENT) both for an image that is gone and for a keyring
+// or conf it cannot find. Only the first is "already deleted": a delete that
+// cannot reach the cluster must fail, not report success and orphan the image.
+func TestCephDeleteDisk_UnreachableClusterIsNotGone(t *testing.T) {
+	f := newFakeCeph()
+	f.images["lv/a-root"] = map[string]bool{}
+	keyringMissing := []byte("2026-10-10T10:00:00 auth: unable to find a keyring on /etc/ceph/ceph.client.x.keyring: (2) No such file or directory\nrbd: couldn't connect to the cluster!\n")
+	f.failOut["rm"] = struct {
+		out []byte
+		err error
+	}{keyringMissing, rbdExit(2)}
+	f.failOut["ls"] = f.failOut["rm"]
+	d := &cephDriver{pool: "lv", opts: map[string]string{"id": "x", "keyring": "/etc/ceph/ceph.client.x.keyring"}, run: f.run}
+	if err := d.DeleteDisk(context.Background(), "rbd:lv/a-root"); err == nil {
+		t.Fatal("a delete that could not reach the cluster reported success")
+	}
+}
+
+// An image that really is gone (the cluster answers, the image does not
+// exist) is deleted already.
+func TestCephDeleteDisk_GoneImageIsDeleted(t *testing.T) {
+	f := newFakeCeph()
+	d := &cephDriver{pool: "lv", opts: map[string]string{}, run: f.run}
+	if err := d.DeleteDisk(context.Background(), "rbd:lv/a-root"); err != nil {
+		t.Fatalf("an image already gone: %v", err)
+	}
+}
+
+// I4. A create cancelled while it grows its fresh clone still removes the
+// clone: rollback commands do not run on the cancelled request context.
+func TestCephCreateDisk_CancelledGrowStillRemovesTheClone(t *testing.T) {
+	f := newFakeCeph()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.before["resize"] = cancel
+	f.fail["resize"] = context.Canceled
+	d := &cephDriver{pool: "lv", opts: map[string]string{}, run: f.run, scratch: t.TempDir()}
+	if _, err := d.CreateDisk(ctx, DiskOptions{VMName: "a", DiskName: "root", SizeBytes: 8 << 30, SourceImage: storeImage(t), SourceImageName: "cirros", SourceImageDigest: strings.Repeat("34", 32)}); err == nil {
+		t.Fatal("a cancelled create succeeded")
+	}
+	if f.has("lv/a-root") {
+		t.Fatalf("the cancelled create left its clone: %v", f.calls)
+	}
+}
+
+// I4. A stale staging import (a crash after `snap protect`) is removed by the
+// next import's sweep: its protected snapshot is unprotected and purged first,
+// or rbd refuses the rm and it leaks forever.
+func TestCephSweepIncoming_RemovesAProtectedLeftover(t *testing.T) {
+	f := newFakeCeph()
+	stale := "lv/lvimage+cirros+0011" + incomingMarker + "1000-abc"
+	f.images[stale] = map[string]bool{"base": true}
+	d := &cephDriver{pool: "lv", opts: map[string]string{}, run: f.run}
+	f.listing = []string{strings.TrimPrefix(stale, "lv/")}
+	d.sweepIncoming(context.Background(), "lv/lvimage+cirros+0011", time.Unix(1000, 0).Add(48*time.Hour))
+	if f.has(stale) {
+		t.Fatalf("a protected stale import was left: %v", f.calls)
+	}
+}
+
+// M12 / M3. One escape-aware locator parser for every reader: a value with
+// escaped ':' or ';' anywhere in the option list is read whole.
+func TestParseCephLocator(t *testing.T) {
+	l, ok := ParseCephLocator(`rbd:lv/ns/vm-root:mon_host=10.0.0.1\:6789\;10.0.0.2\:6789:id=litevirt:keyring=/k:lvpool=ceph`)
+	if !ok {
+		t.Fatal("not parsed")
+	}
+	if l.Spec != "lv/ns/vm-root" || l.Pool != "lv/ns" || l.Image != "vm-root" {
+		t.Errorf("spec %q pool %q image %q", l.Spec, l.Pool, l.Image)
+	}
+	if l.Opts["id"] != "litevirt" || l.Opts["keyring"] != "/k" || l.Opts["lvpool"] != "ceph" || l.Opts["mon_host"] != "10.0.0.1:6789;10.0.0.2:6789" {
+		t.Errorf("opts %v", l.Opts)
+	}
+	for _, bad := range []string{"vm-root", "rbd:noslash", "rbd:lv/", "rbd:/img"} {
+		if _, ok := ParseCephLocator(bad); ok {
+			t.Errorf("%q parsed", bad)
+		}
+	}
+}
+
+// M7. A root disk cloned from an image bigger than the size asked for is the
+// image's size: the driver reports it, so the row records what exists.
+func TestCephDiskSize_ReportsTheImagesSize(t *testing.T) {
+	f := newFakeCeph()
+	f.images["lv/a-root"] = map[string]bool{}
+	f.sizes["lv/a-root"] = 4 << 30
+	d := &cephDriver{pool: "lv", opts: map[string]string{}, run: f.run}
+	got, err := d.DiskSize(context.Background(), "rbd:lv/a-root:id=x")
+	if err != nil || got != 4<<30 {
+		t.Fatalf("DiskSize = %d, %v; want 4 GiB", got, err)
+	}
+}
+
+// A pool's own mon_host option is kept in the locator as the fallback for a
+// host where the pool cannot be looked up; the pool's current value wins at
+// define time.
+func TestCephDiskLocator_PoolMonHostOptionIsAFallback(t *testing.T) {
+	f := newFakeCeph()
+	d := &cephDriver{pool: "lv", name: "ceph", opts: map[string]string{"mon_host": "10.0.0.1:6789,10.0.0.2"}, run: f.run}
+	path, err := d.CreateDisk(context.Background(), DiskOptions{VMName: "vm", DiskName: "data", SizeBytes: 1 << 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `rbd:lv/vm-data:lvpool=ceph:mon_host=10.0.0.1\:6789\;10.0.0.2`; path != want {
+		t.Fatalf("locator %q, want %q", path, want)
 	}
 }

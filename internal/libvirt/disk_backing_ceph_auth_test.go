@@ -1,6 +1,8 @@
 package libvirt
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -9,7 +11,7 @@ import (
 // becomes a network disk that authenticates as that client through a libvirt
 // ceph secret, with the monitors as <host> elements — no keyring path, no conf,
 // and never client.admin.
-const labLocator = `rbd:lv/vm-root:id=litevirt:keyring=/etc/ceph/ceph.client.litevirt.keyring:conf=/etc/ceph/ceph.conf:mon_host=10.78.0.22\:6789\;10.78.0.23\:6789`
+const labLocator = `rbd:lv/vm-root:id=litevirt:keyring=/etc/ceph/ceph.client.litevirt.keyring:conf=/etc/ceph/ceph.conf:lvpool=ceph:mon_host=10.78.0.22\:6789\;10.78.0.23\:6789`
 
 func TestDiskBacking_RestrictedKeyBecomesAuthAndHosts(t *testing.T) {
 	dt, src, drv, err := diskBacking(labLocator)
@@ -22,7 +24,7 @@ func TestDiskBacking_RestrictedKeyBecomesAuthAndHosts(t *testing.T) {
 	if len(src.Hosts) != 2 || src.Hosts[0] != (diskSourceHost{Name: "10.78.0.22", Port: "6789"}) || src.Hosts[1].Name != "10.78.0.23" {
 		t.Fatalf("hosts = %+v", src.Hosts)
 	}
-	want := CephSecretUUID("litevirt", "/etc/ceph/ceph.client.litevirt.keyring")
+	want := CephSecretUUID("ceph", "litevirt")
 	if src.Auth == nil || src.Auth.Username != "litevirt" || src.Auth.Secret.Type != "ceph" || src.Auth.Secret.UUID != want {
 		t.Fatalf("auth = %+v, want username litevirt, ceph secret %s", src.Auth, want)
 	}
@@ -39,7 +41,7 @@ func TestGenerateDomainXML_CephDiskAuthenticatesThroughTheSecret(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	u := CephSecretUUID("litevirt", "/etc/ceph/ceph.client.litevirt.keyring")
+	u := CephSecretUUID("ceph", "litevirt")
 	for _, want := range []string{
 		`<disk type="network" device="disk">`,
 		`<source protocol="rbd" name="lv/vm-root">`,
@@ -69,23 +71,81 @@ func TestMarshalNewDisk_CephCarriesAuth(t *testing.T) {
 	}
 }
 
-// The secret UUID is a function of the client and keyring path only, so every
-// host keeping the same keyring at the same path names the same secret — what
-// a live migration's destination needs. Different clients or keyrings differ.
-func TestCephSecretUUID_IsDerived(t *testing.T) {
-	a := CephSecretUUID("litevirt", "/etc/ceph/ceph.client.litevirt.keyring")
-	if a != CephSecretUUID("litevirt", "/etc/ceph//ceph.client.litevirt.keyring") {
-		t.Error("the same keyring spelled differently names another secret")
+// I2. The secret UUID is a function of the litevirt pool and the client
+// only — never of where a host keeps its keyring — so every host with the pool
+// names the same secret, whatever its filesystem layout. Different pools or
+// clients differ.
+func TestCephSecretUUID_IsPerPool(t *testing.T) {
+	a, ok := CephSecretOfLocator("rbd:lv/x:id=litevirt:keyring=/etc/ceph/ceph.client.litevirt.keyring:lvpool=ceph")
+	b, ok2 := CephSecretOfLocator("rbd:lv/x:id=litevirt:keyring=/srv/other/litevirt.keyring:lvpool=ceph")
+	if !ok || !ok2 || a != b {
+		t.Fatalf("one pool's disks name different secrets by keyring path: %q %q", a, b)
 	}
-	if a == CephSecretUUID("other", "/etc/ceph/ceph.client.litevirt.keyring") ||
-		a == CephSecretUUID("litevirt", "/srv/ceph/ceph.client.litevirt.keyring") {
-		t.Error("different identities share a secret")
+	if a != CephSecretUUID("ceph", "litevirt") {
+		t.Errorf("locator secret %q is not the pool's %q", a, CephSecretUUID("ceph", "litevirt"))
 	}
-	if u, ok := CephSecretOfLocator(labLocator); !ok || u != a {
-		t.Errorf("CephSecretOfLocator = %q %v, want %q", u, ok, a)
+	if a == CephSecretUUID("ceph2", "litevirt") || a == CephSecretUUID("ceph", "other") {
+		t.Error("different pools or clients share a secret")
 	}
 	if _, ok := CephSecretOfLocator("rbd:lv/x"); ok {
 		t.Error("a locator with no keyring names a secret")
+	}
+}
+
+// A keyring with no litevirt pool to name its secret by cannot authenticate.
+func TestDiskBacking_KeyringWithoutPoolIsRefused(t *testing.T) {
+	if _, _, _, err := diskBacking("rbd:lv/x:id=litevirt:keyring=/k"); err == nil || !strings.Contains(err.Error(), "lvpool") {
+		t.Fatalf("got %v, want a refusal naming lvpool", err)
+	}
+}
+
+// I5. The monitors come from the conf when the domain is defined, not when
+// the disk was made: a re-IP'd monitor set reaches the next start.
+func TestDiskBacking_MonitorsFromTheConfAtDefineTime(t *testing.T) {
+	conf := filepath.Join(t.TempDir(), "cluster.conf")
+	write := func(mon string) {
+		if err := os.WriteFile(conf, []byte("[global]\nmon_host = [v2:"+mon+":3300/0,v1:"+mon+":6789/0]\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	loc := "rbd:lv/x:id=litevirt:keyring=/k:conf=" + conf + ":lvpool=ceph"
+	write("10.0.0.1")
+	_, src, _, err := diskBacking(loc)
+	if err != nil || len(src.Hosts) != 1 || src.Hosts[0].Name != "10.0.0.1" {
+		t.Fatalf("hosts %+v, %v", src.Hosts, err)
+	}
+	write("10.0.0.9")
+	_, src, _, err = diskBacking(loc)
+	if err != nil || len(src.Hosts) != 1 || src.Hosts[0].Name != "10.0.0.9" {
+		t.Fatalf("after the conf changed: hosts %+v, %v; want the new monitor", src.Hosts, err)
+	}
+}
+
+// I5. The pool's current monitors (its mon_host option, or its conf) win over
+// a fallback fixed into the locator.
+func TestDiskBacking_PoolMonitorsWinOverTheLocators(t *testing.T) {
+	defer SetCephMonitorResolver(func(pool string) ([]string, bool) {
+		if pool == "ceph" {
+			return []string{"10.9.9.9:6789"}, true
+		}
+		return nil, false
+	})()
+	_, src, _, err := diskBacking(`rbd:lv/x:lvpool=ceph:mon_host=10.0.0.1\:6789`)
+	if err != nil || len(src.Hosts) != 1 || src.Hosts[0].Name != "10.9.9.9" {
+		t.Fatalf("hosts %+v, %v; want the pool's current monitor", src.Hosts, err)
+	}
+	// A pool this host does not have: the locator's fallback.
+	_, src, _, err = diskBacking(`rbd:lv/x:lvpool=gone:mon_host=10.0.0.1\:6789`)
+	if err != nil || len(src.Hosts) != 1 || src.Hosts[0].Name != "10.0.0.1" {
+		t.Fatalf("hosts %+v, %v; want the locator's fallback", src.Hosts, err)
+	}
+}
+
+// M3. The default conf however spelled is the default: accepted with no
+// monitors, as at create.
+func TestDiskBacking_DefaultConfSpelledDifferently(t *testing.T) {
+	if _, _, _, err := diskBacking("rbd:lv/x:conf=/etc/ceph//ceph.conf"); err != nil {
+		t.Fatalf("default conf with a doubled slash: %v", err)
 	}
 }
 

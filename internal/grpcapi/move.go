@@ -562,10 +562,9 @@ func (s *Server) deleteDiskAtRecordedLocation(ctx context.Context, d *corrosion.
 		// is removed as the identity its own locator names: with no --id and
 		// --keyring the rbd CLI would act as client.admin, which a node holding
 		// only a restricted key cannot.
-		spec, _, _ := strings.Cut(strings.TrimPrefix(d.Path, "rbd:"), ":")
 		pool := ""
-		if i := strings.LastIndexByte(spec, '/'); i > 0 {
-			pool = spec[:i] // pool[/namespace]
+		if l, ok := storage.ParseCephLocator(d.Path); ok {
+			pool = l.Pool // pool[/namespace]
 		}
 		cfg = storage.Config{Driver: "ceph", Source: pool, Options: rbdPathOptions(d.Path)}
 	}
@@ -664,6 +663,17 @@ func (s *Server) diskPathReferencedByOtherVM(ctx context.Context, vmName string,
 		slog.Warn("delete: shared-disk check failed; keeping disk to avoid removing a shared volume",
 			"vm", vmName, "disk", d.DiskName, "path", d.Path, "error", err)
 		return true
+	}
+	// An rbd image is named by its spec, whatever options a row's locator
+	// carries: two rows can name one image with different suffixes.
+	if l, ok := storage.ParseCephLocator(d.Path); ok {
+		more, err := corrosion.DisksNamingRBDImage(ctx, s.db, l.Spec)
+		if err != nil {
+			slog.Warn("delete: shared-disk check failed; keeping disk to avoid removing a shared volume",
+				"vm", vmName, "disk", d.DiskName, "path", d.Path, "error", err)
+			return true
+		}
+		refs = append(refs, more...)
 	}
 	for _, r := range refs {
 		if r.VMName == vmName {

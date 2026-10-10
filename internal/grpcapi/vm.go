@@ -401,6 +401,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// created it: os.Remove of "rbd:pool/image" removes nothing, which is how a
 	// failed create left its ceph images behind.
 	createdBy := map[string]storage.Driver{}
+	actualSize := map[string]int64{} // a pool disk's real size, when its driver says
 	cleanupDisks := func() {
 		for _, p := range createdDiskPaths {
 			if drv := createdBy[p]; drv != nil {
@@ -507,8 +508,20 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 				SourceImageName:   spec.Image,
 				SourceImageDigest: sourceDigest,
 			})
-			if err == nil && strings.HasPrefix(diskPath, "rbd:") {
+			// A disk that is not a file (an rbd image, a zvol, a thin LV) is
+			// removed by its driver on a rollback: os.Remove of its path
+			// removes nothing, or only the /dev symlink.
+			if err == nil && !isFileBasedDriver(volCfg.Driver) {
 				createdBy[diskPath] = drv
+			}
+			// A clone of an image bigger than the size asked for IS that size:
+			// the row records what exists, so accounting does not under-count.
+			if err == nil {
+				if sz, ok := drv.(storage.DiskSizer); ok {
+					if n, serr := sz.DiskSize(ctx, diskPath); serr == nil && n > 0 {
+						actualSize[diskPath] = n
+					}
+				}
 			}
 			storageType = volCfg.Driver
 			if storageType == "" {
@@ -551,12 +564,16 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			// image. Without it, such a peer refuses the start instead.
 			backingImage = spec.Image
 		}
+		recordedSize := parseDiskSizeBytes(d.Size)
+		if n := actualSize[diskPath]; n > recordedSize {
+			recordedSize = n
+		}
 		diskRecords = append(diskRecords, corrosion.DiskRecord{
 			VMName:        spec.Name,
 			DiskName:      d.Name,
 			HostName:      s.hostName,
 			Path:          diskPath,
-			SizeBytes:     parseDiskSizeBytes(d.Size),
+			SizeBytes:     recordedSize,
 			BackingImage:  backingImage,
 			StorageType:   storageType,
 			StorageVolume: d.Storage,
@@ -1708,7 +1725,7 @@ func (s *Server) PrepareHardwareForStart(ctx context.Context, vm *corrosion.VMRe
 	// A ceph disk is opened through its pool's libvirt secret, which a
 	// libvirtd restart drops (it is ephemeral): put back before every start,
 	// on every start path, so none waits for the daemon's reconcile.
-	if err := s.ensureCephSecretsForVM(ctx, vm); err != nil {
+	if err := s.ensureCephSecretsForVM(ctx, vm, ""); err != nil {
 		return releasePreflight, status.Errorf(codes.FailedPrecondition, "start %q: %v", vm.Name, err)
 	}
 
@@ -3791,6 +3808,7 @@ func (s *Server) resolveVolume(ctx context.Context, stackName, volumeName string
 		if f != nil {
 			if vol, ok := f.Volumes[volumeName]; ok {
 				cfg := storage.Config{
+					Name:    stackName + "/" + volumeName,
 					Driver:  vol.Driver,
 					Source:  vol.Source,
 					Target:  vol.Target,
@@ -3816,6 +3834,7 @@ func (s *Server) resolveVolume(ctx context.Context, stackName, volumeName string
 			return storage.Config{}, err
 		}
 		return storage.Config{
+			Name:    volumeName,
 			Driver:  pool.Driver,
 			Source:  pool.Source,
 			Target:  pool.Target,
@@ -3929,6 +3948,9 @@ func (s *Server) ResizeDisk(ctx context.Context, req *pb.ResizeDiskRequest) (*pb
 	}
 	if disk == nil {
 		return nil, status.Errorf(codes.NotFound, "disk %q not found on VM %q", req.DiskName, req.VmName)
+	}
+	if err := refuseRBDDisk(disk, "resize"); err != nil {
+		return nil, err
 	}
 
 	newSizeBytes := parseDiskSizeBytes(req.Size)

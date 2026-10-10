@@ -7,9 +7,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -25,6 +25,7 @@ import (
 // with native bindings if needed.
 type cephDriver struct {
 	pool string
+	name string            // the litevirt pool (or stack volume) this driver serves
 	opts map[string]string // keyring, conf, id, mon_host, …
 	run  cmdRunner         // nil → cephRunner; overridable in tests
 	// scratch is the directory an image is converted to raw in before it is
@@ -140,7 +141,10 @@ func (d *cephDriver) CreateDisk(ctx context.Context, opts DiskOptions) (string, 
 		// (never shrunk). The clone is this call's own: a failure removes it.
 		if opts.SizeBytes > 0 {
 			if err := d.growTo(ctx, dest, opts.SizeBytes); err != nil {
-				if out, rerr := d.rbd(ctx, d.rbdArgs("rm", "--", dest)...); rerr != nil {
+				cctx, cancel := cleanupCtx(ctx)
+				out, rerr := d.rbd(cctx, d.rbdArgs("rm", "--", dest)...)
+				cancel()
+				if rerr != nil {
 					slog.Warn("ceph: could not remove a clone whose resize failed", "image", dest, "error", rerr, "output", strings.TrimSpace(string(out)))
 				}
 				return "", err
@@ -168,17 +172,26 @@ func (d *cephDriver) CreateDisk(ctx context.Context, opts DiskOptions) (string, 
 
 // diskLocator is the identifier a disk on this pool is recorded and attached
 // by: "rbd:<pool>/<image>", then the client identity its domain authenticates
-// as (id, keyring), the pool's conf, and the monitors (mon_host) — the pool's
-// own mon_host option, or the ones its conf names. libvirt's
-// <disk type='network'> carries the monitors as <host> elements and the
-// identity as <auth> naming the pool's ceph secret (libvirt.CephSecretUUID);
-// see internal/libvirt/disk_backing.go.
+// as (id, keyring), the pool's conf, the litevirt pool it belongs to (lvpool,
+// which names its libvirt secret: libvirt.CephSecretUUID), and — only when the
+// pool sets one — the pool's mon_host option, kept as a fallback.
+//
+// Monitors are NOT fixed into the locator from the conf: the domain is given
+// the pool's current monitors (its mon_host option, else its conf's) each time
+// it is defined (internal/libvirt/disk_backing.go), so a re-IP'd monitor set
+// reaches every stopped VM at its next start. See docs/storage.md.
 func (d *cephDriver) diskLocator(imageName string) (string, error) {
 	path := fmt.Sprintf("rbd:%s/%s", d.pool, imageName)
 	for _, k := range []string{"conf", "keyring"} {
-		if v := d.opts[k]; strings.ContainsAny(v, ":\\") {
-			return "", fmt.Errorf("ceph %s %q cannot be carried in a disk locator (it contains ':' or '\\')", k, v)
+		if v := d.opts[k]; strings.ContainsAny(v, ":\\;=") {
+			return "", fmt.Errorf("ceph %s %q cannot be carried in a disk locator (it contains ':', '\\', ';' or '=')", k, v)
 		}
+	}
+	if id := d.opts["id"]; id != "" && !cephNameRe.MatchString(id) {
+		return "", fmt.Errorf("ceph id %q is not a client name", id)
+	}
+	if strings.ContainsAny(d.name, ":\\;=") {
+		return "", fmt.Errorf("storage %q cannot be carried in a disk locator", d.name)
 	}
 	if auth, ok := CephAuthOf(d.opts); ok {
 		path += ":id=" + auth.ID + ":keyring=" + auth.Keyring
@@ -187,29 +200,35 @@ func (d *cephDriver) diskLocator(imageName string) (string, error) {
 	if conf != "" {
 		path += ":conf=" + conf
 	}
-	var mons []string
-	if mh := strings.TrimSpace(d.opts["mon_host"]); mh != "" {
-		mons = ParseMonHost(mh)
-	} else if conf != "" {
-		m, err := CephMonHosts(conf)
-		if err != nil {
-			return "", fmt.Errorf("ceph pool %q: %w", d.pool, err)
-		}
-		if len(m) == 0 && filepath.Clean(conf) != DefaultCephConf() {
-			// qemu reads only the default conf by itself; the monitors of any
-			// other have to be in the domain.
-			return "", fmt.Errorf("ceph conf %s names no mon_host, so a VM disk cannot find the cluster; set mon_host there or as a pool option", conf)
-		}
-		mons = m
+	if d.name != "" {
+		path += ":lvpool=" + d.name
 	}
-	if len(mons) > 0 {
+	if mh := strings.TrimSpace(d.opts["mon_host"]); mh != "" {
+		mons := ParseMonHost(mh)
 		esc := make([]string, len(mons))
 		for i, m := range mons {
 			esc[i] = strings.ReplaceAll(m, ":", `\:`)
 		}
 		path += ":mon_host=" + strings.Join(esc, `\;`)
+	} else if conf != "" && !IsDefaultCephConf(conf) {
+		// qemu reads only the default conf by itself; any other one has to
+		// name the monitors the domain is given. Refused before anything is
+		// allocated.
+		m, err := CephMonHosts(conf)
+		if err != nil {
+			return "", fmt.Errorf("ceph pool %q: %w", d.pool, err)
+		}
+		if len(m) == 0 {
+			return "", fmt.Errorf("ceph conf %s names no mon_host, so a VM disk cannot find the cluster; set mon_host there or as a pool option", conf)
+		}
 	}
 	return path, nil
+}
+
+// cleanupCtx is the context a rollback runs on: never the request's own, which
+// may be exactly what was cancelled, and bounded.
+func cleanupCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
 }
 
 // ensureBase returns the protected snapshot of opts.SourceImage's content in
@@ -237,8 +256,10 @@ func (d *cephDriver) ensureBase(ctx context.Context, opts DiskOptions) (string, 
 	mu.(*sync.Mutex).Lock()
 	defer mu.(*sync.Mutex).Unlock()
 
-	if _, err := d.rbd(ctx, d.rbdArgs("info", "--", spec)...); err == nil {
+	if out, err := d.rbd(ctx, d.rbdArgs("info", "--", spec)...); err == nil {
 		return spec, nil
+	} else if rbdErrno(err) != rbdENOENT {
+		return "", fmt.Errorf("ceph base image: rbd info %s: %w: %s", spec, err, out)
 	}
 
 	tmpDir, err := os.MkdirTemp(d.scratch, ".litevirt-rbd-import-")
@@ -258,11 +279,13 @@ func (d *cephDriver) ensureBase(ctx context.Context, opts DiskOptions) (string, 
 	d.sweepIncoming(ctx, baseRef, time.Now())
 	incoming := fmt.Sprintf("%s%s%d-%s", baseRef, incomingMarker, time.Now().Unix(), randid.New()[:12])
 	removeIncoming := func(protected bool) {
+		cctx, cancel := cleanupCtx(ctx)
+		defer cancel()
 		if protected {
-			_, _ = d.rbd(ctx, d.rbdArgs("snap", "unprotect", "--", incoming+"@"+cephBaseSnap)...)
+			_, _ = d.rbd(cctx, d.rbdArgs("snap", "unprotect", "--", incoming+"@"+cephBaseSnap)...)
 		}
-		_, _ = d.rbd(ctx, d.rbdArgs("snap", "rm", "--", incoming+"@"+cephBaseSnap)...)
-		_, _ = d.rbd(ctx, d.rbdArgs("rm", "--", incoming)...)
+		_, _ = d.rbd(cctx, d.rbdArgs("snap", "rm", "--", incoming+"@"+cephBaseSnap)...)
+		_, _ = d.rbd(cctx, d.rbdArgs("rm", "--", incoming)...)
 	}
 	if out, err := d.rbd(ctx, d.rbdArgs("import", "--image-feature", "layering", "--", raw, incoming)...); err != nil {
 		removeIncoming(false)
@@ -290,17 +313,11 @@ func (d *cephDriver) ensureBase(ctx context.Context, opts DiskOptions) (string, 
 
 // growTo grows an image to sizeBytes (whole MiB, rounded up) when it is smaller.
 func (d *cephDriver) growTo(ctx context.Context, ref string, sizeBytes int64) error {
-	out, err := d.rbd(ctx, d.rbdArgs("info", "--format", "json", "--", ref)...)
+	size, err := d.imageSize(ctx, ref)
 	if err != nil {
-		return fmt.Errorf("rbd info %s: %w: %s", ref, err, out)
+		return err
 	}
-	var info struct {
-		Size int64 `json:"size"`
-	}
-	if err := json.Unmarshal(out, &info); err != nil {
-		return fmt.Errorf("rbd info %s: %w", ref, err)
-	}
-	if sizeBytes <= info.Size {
+	if sizeBytes <= size {
 		return nil
 	}
 	mib := (sizeBytes + (1<<20 - 1)) >> 20
@@ -323,51 +340,66 @@ func fileSHA256(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// rbdSpecOf splits a disk locator into its image spec ("pool[/ns]/image"),
-// the pool part and the image name.
-func rbdSpecOf(path string) (spec, pool, image string, ok bool) {
-	body, isRBD := strings.CutPrefix(path, "rbd:")
-	if !isRBD {
-		return "", "", "", false
-	}
-	spec, _, _ = strings.Cut(body, ":")
-	i := strings.LastIndexByte(spec, '/')
-	if i <= 0 || i == len(spec)-1 {
-		return "", "", "", false
-	}
-	return spec, spec[:i], spec[i+1:], true
-}
-
 // DeleteDisk removes the disk's own rbd image, and nothing else: never an
 // image outside this pool, never an imported base (other VMs' disks are its
 // clones), and never one with snapshots (rbd refuses that itself, so a clone
-// made from one of its snapshots is not orphaned). A disk already gone is not
-// an error.
+// made from one of its snapshots is not orphaned).
+//
+// An image already gone is not an error — but rbd exits ENOENT just the same
+// when it cannot find its keyring or conf, so "gone" is believed only once the
+// pool itself answers. A delete that cannot reach the cluster fails, rather
+// than reporting success and leaving the guest's data unrecorded in the pool.
 func (d *cephDriver) DeleteDisk(ctx context.Context, path string) error {
-	spec, pool, imageName, ok := rbdSpecOf(path)
+	l, ok := ParseCephLocator(path)
 	if !ok {
 		return fmt.Errorf("cannot parse Ceph image name from %q", path)
 	}
-	if d.pool != "" && pool != d.pool {
+	if d.pool != "" && l.Pool != d.pool {
 		return fmt.Errorf("ceph disk %q is not in pool %q; not removing it", path, d.pool)
 	}
-	if IsCephBaseImage(imageName) {
-		return fmt.Errorf("ceph image %q is an imported base other disks are cloned from; not removing it", spec)
+	if IsCephBaseImage(l.Image) {
+		return fmt.Errorf("ceph image %q is an imported base other disks are cloned from; not removing it", l.Spec)
 	}
-	out, err := d.rbd(ctx, d.rbdArgs("rm", "--", spec)...)
-	if err != nil {
-		if rbdNotFound(out) {
-			return nil
+	out, err := d.rbd(ctx, d.rbdArgs("rm", "--", l.Spec)...)
+	if err == nil {
+		return nil
+	}
+	if rbdErrno(err) == rbdENOENT {
+		if lsOut, lsErr := d.rbd(ctx, d.rbdArgs("ls", "--", l.Pool)...); lsErr == nil {
+			return nil // the pool answers; the image is not in it
+		} else {
+			return fmt.Errorf("rbd rm %s: %w: %s (and pool %s does not answer: %v: %s)", l.Image, err, out, l.Pool, lsErr, lsOut)
 		}
-		return fmt.Errorf("rbd rm %s: %w: %s", imageName, err, out)
 	}
-	return nil
+	return fmt.Errorf("rbd rm %s: %w: %s", l.Image, err, out)
 }
 
-// rbdNotFound reports whether rbd's output says the image does not exist.
-func rbdNotFound(out []byte) bool {
-	s := string(out)
-	return strings.Contains(s, "No such file or directory") || strings.Contains(s, "(2)")
+// DiskSize is the size of the image a disk locator names.
+func (d *cephDriver) DiskSize(ctx context.Context, path string) (int64, error) {
+	l, ok := ParseCephLocator(path)
+	if !ok {
+		return 0, fmt.Errorf("cannot parse Ceph image name from %q", path)
+	}
+	return d.imageSize(ctx, l.Spec)
+}
+
+func (d *cephDriver) imageSize(ctx context.Context, ref string) (int64, error) {
+	out, err := d.rbd(ctx, d.rbdArgs("info", "--format", "json", "--", ref)...)
+	if err != nil {
+		return 0, fmt.Errorf("rbd info %s: %w: %s", ref, err, out)
+	}
+	var info struct {
+		Size int64 `json:"size"`
+	}
+	if err := json.Unmarshal(out, &info); err != nil {
+		return 0, fmt.Errorf("rbd info %s: %w", ref, err)
+	}
+	return info.Size, nil
+}
+
+// DiskSizer is a driver that can say how big a disk it made is.
+type DiskSizer interface {
+	DiskSize(ctx context.Context, path string) (int64, error)
 }
 
 func (d *cephDriver) cloneFromImage(ctx context.Context, sourceImage, destImage string) error {
@@ -384,8 +416,13 @@ func (d *cephDriver) cloneFromImage(ctx context.Context, sourceImage, destImage 
 // own, independent of its source (a root disk's copy stays a clone of the
 // same imported base, which deep cp preserves), and nothing is copied
 // through the host. It returns the copy's locator.
+//
+// The copy is made under a private staging name and renamed into place (rbd
+// rename refuses an existing name), and a failure removes only the staging
+// name: the destination name may be another VM's image ("<vm>-<disk>" is
+// ambiguous across hyphens), and nothing here may remove what it did not make.
 func (d *cephDriver) CloneDisk(ctx context.Context, srcPath string, opts DiskOptions) (string, error) {
-	srcSpec, _, _, ok := rbdSpecOf(srcPath)
+	src, ok := ParseCephLocator(srcPath)
 	if !ok {
 		return "", fmt.Errorf("ceph clone source %q is not an rbd disk", srcPath)
 	}
@@ -395,16 +432,27 @@ func (d *cephDriver) CloneDisk(ctx context.Context, srcPath string, opts DiskOpt
 		return "", err
 	}
 	dest := d.pool + "/" + imageName
-	if out, err := d.rbd(ctx, d.rbdArgs("deep", "cp", "--", srcSpec, dest)...); err != nil {
-		// deep cp creates the destination; one that failed part-way is this
-		// call's own, and is removed. One that already existed (File exists)
-		// is someone else's and is left alone.
-		if !strings.Contains(string(out), "File exists") && !strings.Contains(string(out), "(17)") {
-			_, _ = d.rbd(ctx, d.rbdArgs("rm", "--", dest)...)
-		}
-		return "", fmt.Errorf("rbd deep cp %s → %s: %w: %s", srcSpec, dest, err, out)
+	staging := fmt.Sprintf("%s%s%d-%s", dest, incomingMarker, time.Now().Unix(), randid.New()[:12])
+	removeStaging := func() {
+		cctx, cancel := cleanupCtx(ctx)
+		defer cancel()
+		// deep cp copies the source's snapshots too; a staging copy is ours
+		// by name and has no children, so its snapshots go with it.
+		_, _ = d.rbd(cctx, d.rbdArgs("snap", "purge", "--", staging)...)
+		_, _ = d.rbd(cctx, d.rbdArgs("rm", "--", staging)...)
 	}
-	slog.Info("Ceph RBD disk cloned", "src", srcSpec, "dest", dest)
+	if out, err := d.rbd(ctx, d.rbdArgs("deep", "cp", "--", src.Spec, staging)...); err != nil {
+		removeStaging()
+		return "", fmt.Errorf("rbd deep cp %s → %s: %w: %s", src.Spec, dest, err, out)
+	}
+	if out, err := d.rbd(ctx, d.rbdArgs("rename", "--", staging, dest)...); err != nil {
+		removeStaging()
+		if rbdErrno(err) == rbdEEXIST {
+			return "", fmt.Errorf("ceph image %s already exists: %w", dest, fs.ErrExist)
+		}
+		return "", fmt.Errorf("rbd rename %s → %s: %w: %s", staging, dest, err, out)
+	}
+	slog.Info("Ceph RBD disk cloned", "src", src.Spec, "dest", dest)
 	return path, nil
 }
 
@@ -519,55 +567,6 @@ func (d *cephDriver) Replicate(ctx context.Context, opts ReplicateOptions) (err 
 	return nil
 }
 
-// CreateRBDSnapshot creates and protects a snapshot of an RBD image.
-// Exposed as a package-level helper because snapshot handlers manage
-// lifetime independently of any Driver instance.
-func CreateRBDSnapshot(ctx context.Context, pool, imageName, snapName string, opts map[string]string) error {
-	d := &cephDriver{pool: pool, opts: opts}
-	spec := fmt.Sprintf("%s/%s@%s", pool, imageName, snapName)
-	args := d.rbdArgs("snap", "create", spec)
-	out, err := exec.CommandContext(ctx, "rbd", args...).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("rbd snap create %s: %w: %s", spec, err, out)
-	}
-	protectArgs := d.rbdArgs("snap", "protect", spec)
-	out, err = exec.CommandContext(ctx, "rbd", protectArgs...).CombinedOutput()
-	if err != nil && !strings.Contains(string(out), "already protected") {
-		return fmt.Errorf("rbd snap protect %s: %w: %s", spec, err, out)
-	}
-	slog.Info("RBD snapshot created", "pool", pool, "image", imageName, "snap", snapName)
-	return nil
-}
-
-// CloneRBDSnapshot clones a protected snapshot into a new RBD image.
-func CloneRBDSnapshot(ctx context.Context, pool, srcImage, snapName, destImage string, opts map[string]string) error {
-	d := &cephDriver{pool: pool, opts: opts}
-	src := fmt.Sprintf("%s/%s@%s", pool, srcImage, snapName)
-	dst := fmt.Sprintf("%s/%s", pool, destImage)
-	args := d.rbdArgs("clone", "--image-feature", "layering", src, dst)
-	out, err := exec.CommandContext(ctx, "rbd", args...).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("rbd clone %s → %s: %w: %s", src, dst, err, out)
-	}
-	slog.Info("RBD snapshot cloned", "src", src, "dest", dst)
-	return nil
-}
-
-// DeleteRBDSnapshot unprotects (best-effort) and removes an RBD snapshot.
-func DeleteRBDSnapshot(ctx context.Context, pool, imageName, snapName string, opts map[string]string) error {
-	d := &cephDriver{pool: pool, opts: opts}
-	spec := fmt.Sprintf("%s/%s@%s", pool, imageName, snapName)
-	unprotectArgs := d.rbdArgs("snap", "unprotect", spec)
-	exec.CommandContext(ctx, "rbd", unprotectArgs...).CombinedOutput()
-	args := d.rbdArgs("snap", "rm", spec)
-	out, err := exec.CommandContext(ctx, "rbd", args...).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("rbd snap rm %s: %w: %s", spec, err, out)
-	}
-	slog.Info("RBD snapshot deleted", "pool", pool, "image", imageName, "snap", snapName)
-	return nil
-}
-
 // CephImageName extracts the image name from an "rbd:" path.
 //
 //	"rbd:litevirt/vm1-root:conf=/etc/ceph/ceph.conf" → "vm1-root"
@@ -627,7 +626,13 @@ func (d *cephDriver) sweepIncoming(ctx context.Context, dstRef string, now time.
 		if err != nil || now.Sub(time.Unix(t, 0)) < incomingMaxAge {
 			continue
 		}
-		if _, err := d.rbd(ctx, d.rbdArgs("rm", "--", pool+"/"+name)...); err == nil {
+		ref := pool + "/" + name
+		// A staging image is ours by name and has no children (nothing is
+		// cloned from an image before it is renamed into place), so a crash
+		// after `snap protect` is undone too: unprotect, purge, remove.
+		_, _ = d.rbd(ctx, d.rbdArgs("snap", "unprotect", "--", ref+"@"+cephBaseSnap)...)
+		_, _ = d.rbd(ctx, d.rbdArgs("snap", "purge", "--", ref)...)
+		if _, err := d.rbd(ctx, d.rbdArgs("rm", "--", ref)...); err == nil {
 			slog.Info("ceph: removed an incoming image a crashed copy left", "image", pool+"/"+name)
 		}
 	}

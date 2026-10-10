@@ -3,7 +3,9 @@ package storage
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -234,4 +236,33 @@ func monAddr(a string) string {
 		a = a[:i]
 	}
 	return strings.TrimSpace(a)
+}
+
+// CephKeyFPOption is the pool option the daemon records a ceph pool's key
+// fingerprint in, on its own host's row. Two hosts' rows of one pool that
+// disagree mean their keyrings hold different keys for the client: a VM
+// started or migrated onto the odd host would fail to open its disks. Set by
+// the daemon, never in a request.
+const CephKeyFPOption = "ceph_key_fp"
+
+// CephKeyFingerprint is a short, one-way fingerprint of a ceph key: enough to
+// tell two keys apart, nothing that helps recover one.
+func CephKeyFingerprint(key []byte) string {
+	h := sha256.Sum256(append([]byte("litevirt ceph key\x00"), key...))
+	return hex.EncodeToString(h[:8])
+}
+
+// CephKeyFingerprintOf reads the key a ceph pool's options name and returns
+// its fingerprint; ok is false for a pool with no keyring (no identity).
+func CephKeyFingerprintOf(opts map[string]string) (fp string, ok bool, err error) {
+	auth, ok := CephAuthOf(opts)
+	if !ok {
+		return "", false, nil
+	}
+	key, err := CephClientKey(auth.Keyring, auth.ID)
+	if err != nil {
+		return "", true, err
+	}
+	defer clear(key)
+	return CephKeyFingerprint(key), true, nil
 }

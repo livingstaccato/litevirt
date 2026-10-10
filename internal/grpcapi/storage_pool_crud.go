@@ -66,7 +66,7 @@ func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoo
 		return nil, status.Errorf(codes.InvalidArgument,
 			"unknown driver %q (supported: %v)", req.Driver, storage.SupportedDrivers)
 	}
-	for _, k := range []string{storage.NFSExportOption, storage.DataDisksExportOption} {
+	for _, k := range []string{storage.NFSExportOption, storage.DataDisksExportOption, storage.CephKeyFPOption} {
 		if _, ok := req.Options[k]; ok {
 			return nil, status.Errorf(codes.InvalidArgument,
 				"option %q is recorded by the daemon, not set in a request", k)
@@ -246,8 +246,14 @@ func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoo
 	// the daemon's reconcile. A failure is not the pool's (the rbd CLI just
 	// read the same keyring) and does not undo it; the reconcile retries, and
 	// a VM create on the pool refuses with the reason.
-	if _, err := s.ensureCephSecret(storage.Config{Driver: req.Driver, Source: req.Source, Target: req.Target, Options: req.Options}); err != nil {
+	poolCfg := storage.Config{Name: req.Name, Driver: req.Driver, Source: req.Source, Target: req.Target, Options: req.Options}
+	if u, err := s.ensureCephSecret(poolCfg); err != nil {
 		slog.Warn("ceph pool created, but its libvirt secret is not defined yet", "pool", req.Name, "error", err)
+	} else if u != "" {
+		if fp, ok, ferr := storage.CephKeyFingerprintOf(req.Options); ferr == nil && ok {
+			s.recordCephKeyFingerprint(ctx, req.Name, fp)
+			s.judgeCephKey(ctx, req.Name, fp)
+		}
 	}
 	slog.Info("storage pool created", "host", host, "name", req.Name, "driver", req.Driver)
 	return &pb.CreateStoragePoolResponse{Pool: storagePoolRecordToPB(rec)}, nil
@@ -363,7 +369,7 @@ func (s *Server) DeleteStoragePool(ctx context.Context, req *pb.DeleteStoragePoo
 	// this host, still uses it.
 	if strings.EqualFold(rec.Driver, "ceph") {
 		if auth, ok := storage.CephAuthOf(rec.Options); ok {
-			s.cephSecrets.forget(lv.CephSecretUUID(auth.ID, auth.Keyring))
+			s.cephSecrets.forget(lv.CephSecretUUID(req.Name, auth.ID))
 		}
 		s.ReconcileCephSecrets(ctx)
 	}

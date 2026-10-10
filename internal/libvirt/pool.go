@@ -118,14 +118,15 @@ func generatePoolXML(name, driver, source, target string, opts map[string]string
 		}
 		authXML := ""
 		if keyring := opts["keyring"]; keyring != "" {
-			// The pool authenticates as the same ceph secret its VM disks
-			// use (CephSecretUUID), which the daemon defines from the keyring.
+			// The pool authenticates as the same ceph secret its VM disks use
+			// (CephSecretUUID of the litevirt pool and client), which the
+			// daemon defines from the keyring.
 			id := opts["id"]
 			if id == "" {
 				id = "admin"
 			}
 			authXML = fmt.Sprintf("\n    <auth type='ceph' username='%s'>\n      <secret uuid='%s'/>\n    </auth>",
-				xmlEscape(id), CephSecretUUID(id, keyring))
+				xmlEscape(id), CephSecretUUID(name, id))
 		} else if id := opts["id"]; id != "" {
 			authXML = fmt.Sprintf("\n    <auth type='ceph' username='%s'/>", id)
 		}

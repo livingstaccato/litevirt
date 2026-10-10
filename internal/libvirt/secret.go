@@ -3,24 +3,27 @@ package libvirt
 import (
 	"fmt"
 	"log/slog"
-	"path/filepath"
 	"strings"
+	"sync"
 
 	golibvirt "github.com/digitalocean/go-libvirt"
 	"github.com/google/uuid"
+
+	"github.com/litevirt/litevirt/internal/storage"
 )
 
 // Ceph secrets. A domain's rbd disk authenticates as a ceph client through a
 // libvirt secret holding that client's key (<auth username=…><secret
 // type='ceph' uuid=…/>); no domain element can name a keyring file. litevirt
-// defines one secret per (client id, keyring path) a ceph pool on the host
-// names, from that keyring.
+// defines one secret per (litevirt pool, client id) on each host that has the
+// pool, from the keyring the host's pool names.
 //
-// The UUID is DERIVED from the pair rather than minted, so every host that
-// keeps the same keyring at the same path names the same secret: the domain
-// XML a live migration hands the destination refers to a secret the
-// destination already holds. Two pools sharing a client and keyring share the
-// secret, whose value is the same key either way.
+// The UUID is DERIVED from the pool name and the client id rather than minted
+// — and never from where a host keeps its keyring — so every host with the
+// pool names the same secret: the domain XML a live migration hands the
+// destination refers to a secret the destination holds, whatever its
+// filesystem layout. Whether the destination's keyring holds the same KEY is
+// checked separately (the pool rows' key fingerprints, grpcapi/ceph_secrets.go).
 //
 // The secrets are ephemeral (never written to /etc/libvirt) and private (the
 // value cannot be read back through libvirt); the daemon re-defines them
@@ -34,10 +37,43 @@ var cephSecretNamespace = uuid.MustParse("6f1b3c0e-6a52-5d0c-9a49-1c2f3b6e8d10")
 // defines; nothing else is ever undefined by it.
 const CephSecretUsagePrefix = "litevirt/ceph/"
 
-// CephSecretUUID is the libvirt secret a disk authenticating as client.<id>
-// with the key in keyring uses.
-func CephSecretUUID(id, keyring string) string {
-	return uuid.NewSHA1(cephSecretNamespace, []byte(id+"\x00"+filepath.Clean(keyring))).String()
+// CephSecretUUID is the libvirt secret the disks of litevirt pool `pool`
+// (a pool name, or "<stack>/<volume>") authenticating as client.<id> use.
+func CephSecretUUID(pool, id string) string {
+	return uuid.NewSHA1(cephSecretNamespace, []byte("pool\x00"+pool+"\x00"+id)).String()
+}
+
+// cephMonitorResolver returns a litevirt pool's current monitors on this host
+// (its mon_host option, else its conf's); ok false when the host does not have
+// the pool. Set once by the daemon (SetCephMonitorResolver).
+var (
+	cephMonitorMu       sync.RWMutex
+	cephMonitorResolver func(pool string) ([]string, bool)
+)
+
+// SetCephMonitorResolver makes every rbd disk's domain take its monitors from
+// the litevirt pool it names, as the pool is configured when the domain is
+// defined. It returns the restore.
+func SetCephMonitorResolver(f func(pool string) ([]string, bool)) (restore func()) {
+	cephMonitorMu.Lock()
+	prev := cephMonitorResolver
+	cephMonitorResolver = f
+	cephMonitorMu.Unlock()
+	return func() {
+		cephMonitorMu.Lock()
+		cephMonitorResolver = prev
+		cephMonitorMu.Unlock()
+	}
+}
+
+func poolMonitors(pool string) ([]string, bool) {
+	cephMonitorMu.RLock()
+	f := cephMonitorResolver
+	cephMonitorMu.RUnlock()
+	if f == nil || pool == "" {
+		return nil, false
+	}
+	return f(pool)
 }
 
 // cephSecretXML is the definition of a litevirt ceph secret. The value is set
@@ -157,13 +193,17 @@ func isNoSecret(err error) bool {
 // authenticates with, as its domain names it; ok is false for any other path
 // and for a locator naming no keyring.
 func CephSecretOfLocator(path string) (secretUUID string, ok bool) {
-	body, isRBD := strings.CutPrefix(path, "rbd:")
-	if !isRBD {
+	l, isRBD := storage.ParseCephLocator(path)
+	if !isRBD || l.Opts["keyring"] == "" || l.Opts["lvpool"] == "" {
 		return "", false
 	}
-	_, _, auth, _ := parseRBDLocator(body)
-	if auth == nil {
-		return "", false
+	return CephSecretUUID(l.Opts["lvpool"], cephID(l.Opts)), true
+}
+
+// cephID is the client a locator authenticates as: its id, or admin.
+func cephID(opts map[string]string) string {
+	if id := opts["id"]; id != "" {
+		return id
 	}
-	return auth.Secret.UUID, true
+	return "admin"
 }

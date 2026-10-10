@@ -1124,19 +1124,8 @@ func (s *Server) sendReattachVFs(ctx context.Context, client pb.LiteVirtClient, 
 // EnsureCloudInit generates a cloud-init ISO on this host if it doesn't already exist.
 // Called by the source host before migration so the target has the ISO ready.
 func (s *Server) EnsureCloudInit(ctx context.Context, req *pb.EnsureCloudInitRequest) (*emptypb.Empty, error) {
-	vm, err := s.authorizeMigrationHelper(ctx, req.VmName)
-	if err != nil {
+	if _, err := s.authorizeMigrationHelper(ctx, req.VmName); err != nil {
 		return nil, err
-	}
-	// The domain a live migration hands this host names its ceph disks'
-	// secrets (the same UUIDs here as on the source: libvirt.CephSecretUUID).
-	// Put them back now in case libvirtd lost them, rather than let the
-	// incoming qemu fail to open its disks. Best effort: the reconcile
-	// defines them too, and the migration reports a failure itself.
-	if vm != nil {
-		if serr := s.ensureCephSecretsForVM(ctx, vm); serr != nil {
-			slog.Warn("migration target: ceph secret not defined", "vm", req.VmName, "error", serr)
-		}
 	}
 	isoPath, err := lv.SafeCloudInitISOPath(s.dataDir, req.VmName)
 	if err != nil {
@@ -1195,6 +1184,13 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 			return nil, err
 		}
 		isoWarning, isoResolved = w, resolved
+		// The incoming domain names its ceph disks' secrets: defined here
+		// now, from this host's pool, or the migration is refused with the
+		// reason before libvirt is asked (libvirtd drops the secrets on a
+		// restart, and this host's keyring may hold another key).
+		if err := s.prepareIncomingCephDisks(ctx, rec); err != nil {
+			return nil, err
+		}
 	}
 	for _, stub := range req.Disks {
 		// Only ever create stubs in a real disk-artifact root (the disks dir or a
@@ -2073,7 +2069,9 @@ func (s *Server) ensureDisksOnTargetISO(ctx context.Context, targetHost, vmName 
 	if err != nil {
 		return nil, false, nil, err
 	}
-	if len(stubs) == 0 && !wantTLS && len(isoPaths) == 0 {
+	// A VM with an rbd disk always asks: the target defines (or refuses) the
+	// ceph secrets the domain names (prepareIncomingCephDisks).
+	if len(stubs) == 0 && !wantTLS && len(isoPaths) == 0 && !s.vmHasRBDDisk(ctx, vmName) {
 		return nil, false, nil, nil
 	}
 	client, conn, err := s.peerClient(ctx, targetHost)

@@ -1150,6 +1150,12 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			return status.Errorf(codes.Internal, "generate domain XML: %v", err)
 		}
 
+		// Promote bypasses PrepareHardwareForStart: the VM's ceph disks'
+		// secrets are put back here (libvirtd drops them on a restart).
+		if err := s.ensureCephSecretsForVM(ctx, vm, ""); err != nil {
+			os.Remove(livePath)
+			return status.Errorf(codes.FailedPrecondition, "promote %q: %v", vm.Name, err)
+		}
 		_ = send(&pb.PromoteReplicaProgress{
 			Phase: pb.PromoteReplicaProgress_DEFINING, VmName: targetName, Host: s.hostName,
 			Replica: replica, DiskPath: livePath, Status: "defining domain" + multiDiskNote,

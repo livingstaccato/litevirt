@@ -243,3 +243,40 @@ func ListRBDDiskPathsForHost(ctx context.Context, c *Client, host string) ([]str
 	}
 	return out, nil
 }
+
+// ListStoragePoolsNamed returns every host's live row of the pool name — what
+// the ceph key fingerprints of one pool are compared across.
+func ListStoragePoolsNamed(ctx context.Context, c *Client, name string) ([]StoragePoolRecord, error) {
+	rows, err := c.Query(ctx,
+		`SELECT host_name, name, driver, source, target, options, COALESCE(project, '') AS project, total_bytes, used_bytes, state
+		 FROM storage_pools WHERE name = ? AND deleted_at IS NULL`, name)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]StoragePoolRecord, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, scanStoragePool(r))
+	}
+	return out, nil
+}
+
+// DisksNamingRBDImage returns the live vm_disks rows whose path names the rbd
+// image spec ("<pool>[/<ns>]/<image>"), whatever options their locators carry:
+// "rbd:<spec>" or "rbd:<spec>:…". Two rows can name one image with different
+// option suffixes, so an exact path match is not a reference check for rbd.
+func DisksNamingRBDImage(ctx context.Context, c *Client, spec string) ([]DiskRecord, error) {
+	esc := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace("rbd:" + spec + ":")
+	rows, err := c.Query(ctx,
+		`SELECT vm_name, disk_name, host_name, path FROM vm_disks
+		 WHERE (path = ? OR path LIKE ? ESCAPE '\') AND deleted_at IS NULL`,
+		"rbd:"+spec, esc+"%")
+	if err != nil {
+		return nil, err
+	}
+	out := make([]DiskRecord, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, DiskRecord{VMName: r.String("vm_name"), DiskName: r.String("disk_name"),
+			HostName: r.String("host_name"), Path: r.String("path")})
+	}
+	return out, nil
+}

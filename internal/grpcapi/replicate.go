@@ -307,19 +307,13 @@ func nativeRefs(src *corrosion.DiskRecord, dstPool StoragePoolRef, leaf string) 
 // rbdPathOptions is the conf, keyring and id an "rbd:<pool>/<image>[:k=v...]"
 // disk path names for its cluster.
 func rbdPathOptions(path string) map[string]string {
-	rest, ok := strings.CutPrefix(path, "rbd:")
+	l, ok := storage.ParseCephLocator(path)
 	if !ok {
 		return nil
 	}
-	parts := strings.Split(rest, ":")
 	out := map[string]string{}
-	for _, kv := range parts[1:] {
-		k, v, ok := strings.Cut(kv, "=")
-		if !ok || v == "" {
-			continue
-		}
-		switch k {
-		case "conf", "keyring", "id":
+	for _, k := range []string{"conf", "keyring", "id"} {
+		if v := l.Opts[k]; v != "" {
 			out[k] = v
 		}
 	}

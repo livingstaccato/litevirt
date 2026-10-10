@@ -141,24 +141,19 @@ func TestImportClaimsAndAdopt_CarriesLUNAllocations(t *testing.T) {
 
 // ── fix round 2 ─────────────────────────────────────────────────────────────
 
-// With no voter generation adopted (genesis pending, or after a reset), a
-// voter still decides a LUN key — the proposer's electorate is the derived
-// voter set, every member of which must accept — but never a workload key.
+// A LUN key, like a workload key, is decided only under an adopted member
+// generation: with none (genesis pending, or after a reset) a voter refuses
+// it, so no proposer can decide a LUN over a set two replicas may count
+// differently (re-review 2, I-2).
 //
-// Mutation: refuse LUN keys without an adopted generation — this goes red.
-func TestClaimVoter_LUNKeysWithoutAGeneration(t *testing.T) {
+// Mutation: admit LUN keys without a generation — this goes red.
+func TestClaimVoter_LUNKeysNeedAGeneration(t *testing.T) {
 	ctx := context.Background()
 	ca := newClaimTestCA(t)
 	a := newClaimTestVoter(t, ca, "a")
-	k := lunKey(0)
-	if res, err := a.c.ClaimPrepare(ctx, k, testBallot(1, "b"), 0); err != nil || !res.Promised {
-		t.Fatalf("prepare at no generation: %+v %v", res, err)
-	}
-	if res, err := a.c.ClaimAccept(ctx, k, testBallot(1, "b"), lunValue(0, "c1", "web"), 0, a.signer, unreachable); err != nil || !res.Accepted {
-		t.Fatalf("accept at no generation: %+v %v", res, err)
-	}
-	if res, _ := a.c.ClaimPrepare(ctx, workloadKey(), testBallot(1, "b"), 0); res.Promised {
-		t.Fatalf("a workload key was promised with no generation: %+v", res)
+	res, err := a.c.ClaimPrepare(ctx, lunKey(0), testBallot(1, "b"), 0)
+	if err != nil || res.Promised || res.Refusal != RefusalNoVoterConfig {
+		t.Fatalf("a LUN key at no generation: %+v %v, want refused %s", res, err, RefusalNoVoterConfig)
 	}
 }
 

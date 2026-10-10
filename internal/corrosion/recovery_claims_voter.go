@@ -209,12 +209,6 @@ func (st voterStanding) admit(key ClaimKey, gen int64, v *ClaimValue) (string, s
 		if r, d := memberCheck(st.cfg); r != "" {
 			return r, d
 		}
-	case key.IsLUN():
-		// No member generation is adopted (genesis pending, or after a
-		// reset): a LUN key is decided over the proposer's DERIVED voter set,
-		// every member of which must accept (grpcapi lunElectorate). Any two
-		// such electorates, each more than half the cluster's hosts, share a
-		// voter, so this voter's promise is what keeps them apart.
 	default:
 		return RefusalNoVoterConfig, fmt.Sprintf("%s has adopted no member voter generation", st.me)
 	}

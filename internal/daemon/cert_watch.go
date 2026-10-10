@@ -95,9 +95,26 @@ func (w *certWatch) run(ctx context.Context) {
 	}
 }
 
+// addUI adds the web UI's custom certificate to the watch. Nil-safe.
+func (w *certWatch) addUI(u *uiTLS) {
+	if w == nil || u == nil {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.certs = append(w.certs, servedCert{
+		name:      "ui",
+		leaf:      u.CustomLeaf,
+		renewHint: fmt.Sprintf("lv host ui-cert set %s --cert <chain.pem> --key <key.pem>", w.host),
+	})
+}
+
 func (w *certWatch) tick(ctx context.Context, now time.Time) {
 	w.recordHostSerial(ctx)
-	for _, c := range w.certs {
+	w.mu.Lock()
+	certs := append([]servedCert(nil), w.certs...)
+	w.mu.Unlock()
+	for _, c := range certs {
 		leaf, err := c.leaf()
 		if err != nil || leaf == nil {
 			w.metrics.Clear(c.name)

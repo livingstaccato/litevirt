@@ -45,6 +45,8 @@ type KeyPairSource struct {
 	// check vets a changed pair before it replaces the served one. nil accepts
 	// any pair LoadX509KeyPair can load.
 	check func(leaf *x509.Certificate) error
+	// pairCheck vets EVERY pair, the first included, and may set pair.Leaf.
+	pairCheck func(pair *tls.Certificate) error
 
 	mu         sync.Mutex
 	cur        *tls.Certificate
@@ -77,6 +79,12 @@ func stampOf(path string) (fileStamp, error) {
 // is applied to every pair after the first; see KeyPairSource.
 func NewKeyPairSource(certPath, keyPath string, check func(*x509.Certificate) error) *KeyPairSource {
 	return &KeyPairSource{certPath: certPath, keyPath: keyPath, check: check}
+}
+
+// withPairCheck sets a check applied to every pair loaded, the first included.
+func (s *KeyPairSource) withPairCheck(fn func(*tls.Certificate) error) *KeyPairSource {
+	s.pairCheck = fn
+	return s
 }
 
 // Get returns the pair to serve, re-reading the files if they changed. It errs
@@ -113,6 +121,9 @@ func (s *KeyPairSource) reloadLocked() {
 	pair, err := tls.LoadX509KeyPair(s.certPath, s.keyPath)
 	if err == nil && pair.Leaf == nil && len(pair.Certificate) > 0 {
 		pair.Leaf, err = x509.ParseCertificate(pair.Certificate[0])
+	}
+	if err == nil && s.pairCheck != nil {
+		err = s.pairCheck(&pair)
 	}
 	if err == nil && !first && s.check != nil {
 		err = s.check(pair.Leaf)

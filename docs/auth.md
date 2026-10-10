@@ -421,7 +421,19 @@ could read as a failure:
    and the old certificate stops being accepted as that host.
 5. Only then is the old certificate **revoked** and the CRL published, as `lv host
    rm` does — so a renewal retires the old key instead of leaving a second valid
-   one. `--keep-old` skips this step.
+   one. `--keep-old` skips this step. A **voter** is the exception: the adopted
+   voter generation's certificate carries its votes signed with the old
+   certificate, and a node that adopts that generation later checks them against
+   the CRL ([recovery-claims.md §4.1](design/recovery-claims.md)), so revoking now
+   could leave such a node unable to adopt until the voter set next changes. For
+   a voter the command keeps the old certificate and prints its serial; revoke it
+   after the next `lv cluster voter` change with `lv host revoke-cert <host>
+   --serial <hex>`, or at once with `--revoke-old`. The old key itself is gone
+   from the host either way.
+
+`lv host revoke-cert` refuses the serial the cluster records for the host and the
+one the host presents, since revoking either would cut the host off; that is what
+`lv host rm` is for.
 
 The command refuses, touching nothing, when the cluster's recorded serial and the
 installed certificate disagree (a successor of an unrecorded certificate would be

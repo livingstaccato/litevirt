@@ -369,7 +369,7 @@ func AuditSigningGeneration(cert *x509.Certificate) int64 {
 // `lv host rotate-audit-key` is for, and the warning says so.
 func TightenPrivateKeys(pkiDir string) error {
 	var firstErr error
-	for _, name := range []string{"ca.key", "host.key", AuditSigningKeyName} {
+	for _, name := range []string{"ca.key", "host.key", AuditSigningKeyName, UIKeyName} {
 		path := filepath.Join(pkiDir, name)
 		if _, err := os.Stat(path); err != nil {
 			continue // not every node holds every key; ca.key lives on one

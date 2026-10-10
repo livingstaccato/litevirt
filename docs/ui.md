@@ -2,6 +2,40 @@
 
 The litevirt web UI runs on port 7445. It is built with Go templates and HTMX -- there is no JavaScript framework. All requests require authentication via a session cookie.
 
+## TLS
+
+By default the UI listens on `127.0.0.1` and speaks **plain HTTP**: it is meant
+to be reached through an SSH tunnel or a reverse proxy that terminates TLS. It
+speaks HTTPS itself in three cases, decided by `ui_tls` (configuration.md):
+
+| Source | How | Precedence |
+|---|---|---|
+| Custom certificate from your own PKI | `lv host ui-cert set <host> --cert chain.pem --key key.pem` | first |
+| ACME (step-ca, Let's Encrypt) | `acme:` in the config, `challenge: http-01` or `dns-01` | second |
+| The host's cluster certificate (cluster CA) | `ui_tls: on` | fallback |
+
+Under the default `ui_tls: auto` the UI is HTTPS while a custom certificate is
+installed or ACME is configured, and plain HTTP otherwise; `ui_tls: on` makes it
+HTTPS always. The decision is re-made while running, so installing, replacing or
+clearing a custom certificate takes effect within seconds without a restart.
+
+`lv host ui-cert set` checks the chain before sending anything — the key matches
+the certificate, the chain is in order (server certificate first, each followed
+by its issuer), nothing in it is expired or not yet valid, it is a server
+certificate, and its names cover the host's litevirt name or address (or every
+`--name` you pass) — and refuses with the reason. The key is installed as
+`/etc/litevirt/pki/ui.key`, mode `0600`, like the host's own key, and is never
+printed or logged. The daemon applies the same checks before serving a pair, so
+a hand-edited file that fails them is not served (the next source answers), and
+it stops serving an expired custom certificate. Its expiry is exported as
+`litevirt_certificate_expiry_timestamp_seconds{cert="ui"}` and notified like the
+host certificate (`certificate.expiring`, notifications.md). `lv host ui-cert
+clear` removes it; `lv acme status <host>` shows what is being served.
+
+The daemon logs a warning at startup when it serves plain HTTP on a
+non-loopback `ui_bind`, since logins then cross the network in clear unless a
+proxy is in front.
+
 ## VM Management
 
 ### Creating VMs

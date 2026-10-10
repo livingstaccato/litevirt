@@ -474,6 +474,7 @@ func (c *Coordinator) noteClaimRefused(ctx context.Context, action, kind, name, 
 	}
 	slog.Warn("failover: recovery claim formed no certificate; minting nothing, retrying next tick",
 		"kind", kind, "name", name, "from", host, "reason", reason, "detail", detail)
+	c.noteHold(host, kind+" "+name+": its recovery claim formed no certificate ("+reason+": "+detail+"); retried next tick")
 	c.retryClaimsFor(host)
 }
 
@@ -490,6 +491,8 @@ func (c *Coordinator) noteClaimLost(action, kind, name, host string, decided cor
 	slog.Warn("failover: another coordinator's recovery was decided for this workload; deferring to it",
 		"kind", kind, "name", name, "from", host, "decided_action", decided.Action,
 		"decided_dest", decided.DestHost, "decided_by", decided.Coordinator, "proof", decided.ID)
+	c.noteHold(host, kind+" "+name+": another coordinator's recovery was decided for it ("+decided.Action+" to "+
+		decided.DestHost+" by "+decided.Coordinator+"); deferring to it")
 	c.retryClaimsFor(host)
 }
 
@@ -563,6 +566,7 @@ func (c *Coordinator) claimContainerRelocation(ctx context.Context, h *corrosion
 // So the workload stays, deliberately, until the host returns or is removed
 // for good (§3.12); ha.claim.stranded names it with the command.
 func (c *Coordinator) noteClaimStranded(kind, name, host string, decided corrosion.ActionProof) {
+	c.noteHold(host, kind+" "+name+": its recovery was decided for this host before it failed; stranded until the host returns or `lv host rm --dead`")
 	if kind == "container" {
 		c.mCt(ActionRelocate, ResultRefused, ErrClaimStranded)
 	} else {

@@ -87,6 +87,18 @@ func (s *Server) NotifyHostFenced(host, method, result, detail string) {
 	})
 }
 
+// NotifyRecoveryStalled is the failover coordinator's OnRecoveryStalled
+// callback: a host.recovery.stalled notification naming the host, the
+// coordinator holding the failover lease and why its recovery is not
+// proceeding.
+func (s *Server) NotifyRecoveryStalled(host, coordinator, reason string, pending int, since time.Time) {
+	s.notify(context.Background(), notify.Notification{
+		Kind: notify.KindHostRecoveryStalled, Severity: notify.SevError, Subject: host,
+		Detail: fmt.Sprintf("coordinator=%s pending=%d since=%s reason=%s",
+			coordinator, pending, since.UTC().Format(time.RFC3339), reason),
+	})
+}
+
 // redactedTargetConfig replaces a notification target's config for a caller
 // below the operator floor. It is deliberately not valid JSON and not empty: an
 // empty string would read as "this target has no configuration", and anything

@@ -16,6 +16,12 @@ import (
 	"time"
 )
 
+// KindHostRecoveryStalled is the kind of the notification the failover
+// coordinator raises when a fenced or offline host's recoverable workloads
+// are still on it a while after its fence record (failover.EventRecoveryStalled
+// is the same string, for the event).
+const KindHostRecoveryStalled = "host.recovery.stalled"
+
 // Severity orders notifications so a route can subscribe to "warn and above".
 type Severity string
 

@@ -28,6 +28,7 @@ A notification has a `kind` (verb.noun), `severity` (`info` | `warn` | `error`),
 |---|---|---|
 | `backup.failed` | error | a `lv backup snapshot` / scheduled backup fails |
 | `host.fenced` | error / warn | the failover coordinator fences a host (warn = partial/manual) |
+| `host.recovery.stalled` | error | a `fenced`/`offline` host's recoverable workloads are still on it 60 s after its fence record; names the host, the leader coordinator and why it is not proceeding. Repeats at most every 10 minutes per host |
 | `replication.failed` | error | a scheduled replication run fails |
 | `ha.vip.no_holder` | error | a configured VIP is served by nobody (VIP HA enabled) — a VIP outage |
 | `ha.vip.demotion_unfenced` | error | a minority node's VIP self-demote failed with no verified self-fence; the majority holds in the safe gap (VIP outage until an operator provides a fence / intervenes) |

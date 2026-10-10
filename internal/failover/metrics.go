@@ -139,6 +139,10 @@ const (
 	// ErrJoining: quorum agreed a host failed, but it is a host `lv host add`
 	// admitted whose daemon has not started yet, so it is not fenced.
 	ErrJoining = "joining"
+	// ErrRetryHostAnswered: a failed fence was due a retry, but an observer
+	// saw the host answer after the attempt that failed, so it is not fenced
+	// again (retryStillDown).
+	ErrRetryHostAnswered = "retry_host_answered"
 )
 
 // nil-safe wrappers so the coordinator can increment unconditionally.

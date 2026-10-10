@@ -592,7 +592,11 @@ the lease next takes the recovery over from that record. It needs:
    relies on it.
 2. **The newest fence attempt succeeded.** That covers a verified `ipmi`
    power-off and an `ssh` or `best-effort` success. A host left `offline` by a
-   failed fence has a failed newest attempt and is not resumed from. The
+   failed fence has a failed newest attempt and is not resumed from; while a
+   quorum sees it down, the leader fences it again on a backoff (30 s,
+   doubling to 5 minutes), and a later successful fence by anyone — an
+   operator's `lv host fence` included — is resumed from on the leader's next
+   cycle. The
    resumed recovery passes the same safe-fence policy and
    `litevirt.fence_requires_confirmation` check the leader's would have.
 
@@ -605,9 +609,12 @@ What happens next depends on the fence:
   whatever happened to the host in between. The recovery then proceeds on the
   fresh fence, and a shared-disk VM is bound to it. If the re-fence fails,
   nothing is recovered. The failed attempt is now the newest on record, so the
-  host is not re-fenced every cycle; it is left `offline` for an operator,
-  counted as `phase=recovery, error_class=refence_failed` and raised as the
-  `refence_failed` health condition. Confirm it is off and run
+  host is not re-fenced every cycle, only on the failed-fence retry backoff
+  (30 s, doubling to 5 minutes, with the host's current strategy when that is
+  `ipmi` or `ssh` and the method that failed otherwise, and never once any
+  observer has seen the host answer since the failed attempt); it is left
+  `offline`, counted as `phase=recovery, error_class=refence_failed` and
+  raised as the `refence_failed` health condition. Confirm it is off and run
   `lv host fence-confirm <host>`, and the recovery resumes from the
   confirmation.
 - **An unverified (`ssh`, `best-effort`) fence** is resumed from directly while
@@ -1136,6 +1143,7 @@ Scrape `http://<host>:7444/metrics` for:
   `joining` (a host `lv host add` admitted whose daemon has not started, never fenced),
   `partition_pause_wait` (recovery waiting out a partitioned host's pause, design/partition-pause.md),
   `quorum_regain` (a fence deferred because this node itself regained the voter majority moments ago),
+  `retry_host_answered` (a failed fence not retried because an observer saw the host answer after it),
   and under region-scoped failover `region_too_small` / `region_scoped` — see
   [federation.md](federation.md#region-scoped-failover)). A skip is `result=skipped` with the reason in `error_class`
 - `litevirt_failover_vm_actions_total{action,result,error_class}` — per-VM failover actions

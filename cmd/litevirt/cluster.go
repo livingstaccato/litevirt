@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/spf13/cobra"
 	"google.golang.org/protobuf/types/known/emptypb"
@@ -26,6 +27,7 @@ func newClusterCmd() *cobra.Command {
 		newClusterConvergeCmd(),
 		newClusterAckLeaseTermCmd(),
 		newClusterFailoverScopeCmd(),
+		newClusterRelayRestoreCmd(),
 		newClusterISOLibraryModeCmd(),
 		newClusterVoterCmd(),
 		newClusterClaimCmd(),
@@ -36,6 +38,49 @@ func newClusterCmd() *cobra.Command {
 
 // lv cluster failover-scope [cluster|region] — show or change the cluster-wide
 // failover_scope policy (docs/design/region-scoped-failover.md).
+// lv cluster relay-restore <host> — clear a relay-health demotion now
+// (colonelpanik/litevirt#175). relay_health_v1's stand-down.
+func newClusterRelayRestoreCmd() *cobra.Command {
+	var hold time.Duration
+	cmd := &cobra.Command{
+		Use:   "relay-restore <host>",
+		Short: "Clear a host's relay-health demotion now, optionally holding off a new one",
+		Long: `The failover lease holder demotes a host from relay duty when a third of
+its voter observers keep failing their probes of it, and restores it on its
+own once they stop. This clears the demotion now, for the whole cluster: the
+host is relay-eligible again on every node at its next relay election.
+
+With --hold, the lease holder may not demote the host again until the hold
+runs out (at most 7 days): use it when the fault is not the host's, such as a
+bad observer, while the cause is fixed. Without a hold, a host whose probes
+still fail is demoted again after the ordinary 2-minute window.
+
+Needs the admin role, is audited, and refuses until every host runs a release
+carrying relay_health_v1 (before which no host is ever demoted).
+litevirt_relay_role shows each node's relay election.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				resp, err := c.RestoreRelay(ctx, &pb.RestoreRelayRequest{Host: args[0], HoldSeconds: int64(hold / time.Second)})
+				if err != nil {
+					return fmt.Errorf("restore relay: %w", err)
+				}
+				if resp.GetWasDemoted() {
+					fmt.Printf("%s: relay demotion cleared\n", resp.GetHost())
+				} else {
+					fmt.Printf("%s: was not demoted\n", resp.GetHost())
+				}
+				if resp.GetHoldUntil() != "" {
+					fmt.Printf("%s: not demoted again before %s\n", resp.GetHost(), resp.GetHoldUntil())
+				}
+				return nil
+			})
+		},
+	}
+	cmd.Flags().DurationVar(&hold, "hold", 0, "keep the host from being demoted again for this long (max 168h)")
+	return cmd
+}
+
 func newClusterFailoverScopeCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "failover-scope [cluster|region]",

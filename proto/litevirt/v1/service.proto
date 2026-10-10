@@ -3796,6 +3796,13 @@ service LiteVirt {
     rpc GetFailoverScope(google.protobuf.Empty)       returns (FailoverScopeStatus);
     rpc SetFailoverScope(SetFailoverScopeRequest)     returns (FailoverScopeStatus);
 
+    // RestoreRelay clears a relay-health demotion now (admin;
+    // colonelpanik/litevirt#175): it writes the host's relay_demoted row back
+    // to demoted=false, replicated and audited, and with hold_seconds > 0
+    // keeps the failover lease holder from demoting it again until the hold
+    // runs out. Refuses until relay_health_v1 has durably latched.
+    rpc RestoreRelay(RestoreRelayRequest)             returns (RestoreRelayResponse);
+
     // ── anycast services ──
     // service_endpoints map a logical name (e.g. "api.litevirt.local")
     // to N (ip, region) pairs. The embedded DNS server round-robins
@@ -4028,6 +4035,17 @@ message FailoverScopeRegion {
 
 message SetFailoverScopeRequest {
     string scope = 1;  // "cluster" | "region"
+}
+
+message RestoreRelayRequest {
+    string host         = 1;
+    int64  hold_seconds = 2;  // 0: no hold
+}
+
+message RestoreRelayResponse {
+    string host        = 1;
+    bool   was_demoted = 2;  // the host was demoted before this call
+    string hold_until  = 3;  // RFC 3339, empty with no hold
 }
 
 // CrossRegionMigrate refuses when source/target hosts are in the

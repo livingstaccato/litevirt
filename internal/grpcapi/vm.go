@@ -3827,7 +3827,11 @@ func (s *Server) resolveVolume(ctx context.Context, stackName, volumeName string
 	// 2. Try this host's storage pools: the cache, then the cluster table
 	// (a pool created since the cache was last refreshed, e.g. just after a
 	// restart, is only there).
-	if pool, ok := s.resolvePool(ctx, volumeName); ok {
+	pool, ok, perr := s.resolvePoolErr(ctx, volumeName)
+	if perr != nil {
+		return storage.Config{}, fmt.Errorf("storage %q: read this host's pools: %w", volumeName, perr)
+	}
+	if ok {
 		// The disk is created there: a pool created before the directory and
 		// source checks must not take one (nor be re-mounted for it).
 		if err := s.checkPoolForWrite(ctx, volumeName, pool); err != nil {
@@ -3846,10 +3850,10 @@ func (s *Server) resolveVolume(ctx context.Context, stackName, volumeName string
 	// the disk somewhere nobody asked for; a disk that wants local storage
 	// says so by naming no storage at all.
 	if stackName != "" {
-		return storage.Config{}, fmt.Errorf("storage %q is neither a volume of stack %q nor a storage pool on host %q",
-			volumeName, stackName, s.hostName)
+		return storage.Config{}, fmt.Errorf("storage %q is neither a volume of stack %q nor a storage pool on host %q: %w",
+			volumeName, stackName, s.hostName, errStorageNotFound)
 	}
-	return storage.Config{}, fmt.Errorf("storage %q is not a storage pool on host %q", volumeName, s.hostName)
+	return storage.Config{}, fmt.Errorf("storage %q is not a storage pool on host %q: %w", volumeName, s.hostName, errStorageNotFound)
 }
 
 // parseDiskSizeBytes converts a human-readable size string (e.g. "20G", "512M")

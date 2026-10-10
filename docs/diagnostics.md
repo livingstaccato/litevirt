@@ -1762,11 +1762,11 @@ Each host records a one-way fingerprint of the key its ceph pool's keyring
 holds on its own row of the pool. When another host's row of the same pool
 records a different key, the host raises `ceph_keyring_mismatch` (evaluator
 `ceph_pool`, subject `host/<pool>@<host>`, warning) naming itself and the
-hosts whose key differs. VMs of the pool are not started on a host whose key
-is held by fewer hosts than another key (a failover onto it fails with this
-reason), and a live migration onto a host whose key differs from the source
-host's is refused before libvirt is asked. Install the cluster's keyring for
-the client on the odd host; the next reconcile (30 s) resolves the condition.
+hosts whose key differs. It is a diagnostic: a start is gated on the host's
+own key opening each disk (`rbd info`), never on other hosts' rows; a live
+migration onto a host whose key differs from the source host's is refused
+before libvirt is asked. Install the cluster's keyring for the client on the
+odd host; the next reconcile (30 s) resolves the condition.
 See [storage.md](storage.md#ceph-rbd-pools).
 
 ### A VM's disk is missing on its own host (`vm_disk_missing`)

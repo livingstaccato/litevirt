@@ -1381,6 +1381,14 @@ func (f *Fake) MigrateToTarget(name, dconnuri string, p libvirt.MigrateParams) e
 		sort.Strings(pairs)
 		note += " cdroms=" + strings.Join(pairs, ",")
 	}
+	if len(p.RBDLocators) > 0 {
+		var names []string
+		for n := range p.RBDLocators {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		note += " rbd=" + strings.Join(names, ",")
+	}
 	f.record("migrate", name, note)
 	return nil
 }

@@ -34,7 +34,19 @@ type fakeCeph struct {
 	}
 	before      map[string]func() // subcommand → run just before it
 	partialCopy bool              // deep cp creates its destination, then fails
-	listing     []string          // what `rbd ls` prints
+	listing     []string          // what `rbd ls` prints; nil → the images in the pool
+	// A killed rbd client leaves a watch on the image it had open until the
+	// OSD's watch timeout (30 s): until then `rbd rm` refuses it with EBUSY.
+	now     time.Duration            // the fake's clock, advanced by cephSleep
+	watched map[string]time.Duration // image → when its dead client's watch expires
+}
+
+// installSleep makes the driver's retry waits advance the fake's clock.
+func (f *fakeCeph) installSleep(t *testing.T) {
+	t.Helper()
+	prev := cephSleep
+	cephSleep = func(ctx context.Context, d time.Duration) bool { f.now += d; return true }
+	t.Cleanup(func() { cephSleep = prev })
 }
 
 func newFakeCeph() *fakeCeph {
@@ -68,7 +80,7 @@ func (f *fakeCeph) run(ctx context.Context, name string, args ...string) ([]byte
 		return nil, os.WriteFile(args[len(args)-1], []byte("raw"), 0o600)
 	}
 	i := 0
-	for i < len(args) && strings.HasPrefix(args[i], "--") {
+	for i < len(args) && strings.HasPrefix(args[i], "-") && args[i] != "--" {
 		i += 2 // --id/--conf/--keyring <value>
 	}
 	var words, pos []string
@@ -88,6 +100,15 @@ func (f *fakeCeph) run(ctx context.Context, name string, args ...string) ([]byte
 		f.calls = append(f.calls, "CANCELLED "+strings.TrimSpace(sub+" "+strings.Join(pos, " ")))
 		return nil, ctx.Err()
 	}
+	if f.fail[sub] == context.Canceled && len(pos) > 0 {
+		// The command is killed mid-run: its image keeps the dead client's
+		// watch for 30 s.
+		if f.watched == nil {
+			f.watched = map[string]time.Duration{}
+		}
+		ref, _, _ := strings.Cut(pos[len(pos)-1], "@")
+		f.watched[ref] = f.now + 30*time.Second
+	}
 	f.calls = append(f.calls, strings.TrimSpace(sub+" "+strings.Join(pos, " ")))
 	if hook := f.before[sub]; hook != nil {
 		hook()
@@ -103,7 +124,16 @@ func (f *fakeCeph) run(ctx context.Context, name string, args ...string) ([]byte
 	switch sub {
 	case "ls", "import":
 		if sub == "ls" {
-			return []byte(strings.Join(f.listing, "\n")), nil
+			if f.listing != nil {
+				return []byte(strings.Join(f.listing, "\n")), nil
+			}
+			var names []string
+			for ref := range f.images {
+				if p, img, ok := strings.Cut(ref, "/"); ok && p == pos[0] {
+					names = append(names, img)
+				}
+			}
+			return []byte(strings.Join(names, "\n")), nil
 		}
 		if sub == "import" {
 			dst := pos[1]
@@ -196,6 +226,9 @@ func (f *fakeCeph) run(ctx context.Context, name string, args ...string) ([]byte
 	case "rm":
 		if !f.has(pos[0]) {
 			return missing, rbdExit(2)
+		}
+		if until, ok := f.watched[pos[0]]; ok && f.now < until {
+			return []byte("rbd: error: image still has watchers\nThis means the image is still open or the client using it crashed. Try again after closing/unmapping it or waiting 30s for the crashed client to timeout."), rbdExit(16)
 		}
 		if f.snaps(pos[0]) > 0 {
 			return []byte("rbd: image has snapshots - not removing"), rbdExit(39)
@@ -364,8 +397,10 @@ func TestCephCreateDisk_FailedGrowRemovesTheClone(t *testing.T) {
 	if _, err := d.CreateDisk(context.Background(), DiskOptions{VMName: "a", DiskName: "root", SizeBytes: 8 << 30, SourceImage: storeImage(t), SourceImageName: "cirros", SourceImageDigest: strings.Repeat("ef", 32)}); err == nil {
 		t.Fatal("expected the resize failure")
 	}
-	if f.has("lv/a-root") {
-		t.Fatalf("clone left behind after a failed create: %v", f.calls)
+	for ref := range f.images {
+		if !IsCephBaseImage(strings.TrimPrefix(ref, "lv/")) {
+			t.Fatalf("%s left behind after a failed create: %v", ref, f.calls)
+		}
 	}
 }
 
@@ -505,16 +540,23 @@ func TestCephDeleteDisk_GoneImageIsDeleted(t *testing.T) {
 // clone: rollback commands do not run on the cancelled request context.
 func TestCephCreateDisk_CancelledGrowStillRemovesTheClone(t *testing.T) {
 	f := newFakeCeph()
+	f.installSleep(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	f.before["resize"] = cancel
-	f.fail["resize"] = context.Canceled
+	f.fail["resize"] = context.Canceled // the rbd resize is killed: its image keeps a watch
 	d := &cephDriver{pool: "lv", opts: map[string]string{}, run: f.run, scratch: t.TempDir()}
 	if _, err := d.CreateDisk(ctx, DiskOptions{VMName: "a", DiskName: "root", SizeBytes: 8 << 30, SourceImage: storeImage(t), SourceImageName: "cirros", SourceImageDigest: strings.Repeat("34", 32)}); err == nil {
 		t.Fatal("a cancelled create succeeded")
 	}
-	if f.has("lv/a-root") {
-		t.Fatalf("the cancelled create left its clone: %v", f.calls)
+	for ref := range f.images {
+		if ref == "lv/a-root" || strings.Contains(ref, incomingMarker) {
+			t.Fatalf("the cancelled create left %s (calls %v)", ref, f.calls)
+		}
+	}
+	// N2: the clone is grown under a staging name, never under the VM's own.
+	if f.called("resize lv/a-root"+incomingMarker) != 1 {
+		t.Fatalf("the clone was not grown under a staging name: %v", f.calls)
 	}
 }
 
@@ -523,7 +565,7 @@ func TestCephCreateDisk_CancelledGrowStillRemovesTheClone(t *testing.T) {
 // or rbd refuses the rm and it leaks forever.
 func TestCephSweepIncoming_RemovesAProtectedLeftover(t *testing.T) {
 	f := newFakeCeph()
-	stale := "lv/lvimage+cirros+0011" + incomingMarker + "1000-abc"
+	stale := "lv/lvimage+cirros+0011" + incomingMarker + "1000-0123456789ab"
 	f.images[stale] = map[string]bool{"base": true}
 	d := &cephDriver{pool: "lv", opts: map[string]string{}, run: f.run}
 	f.listing = []string{strings.TrimPrefix(stale, "lv/")}
@@ -578,5 +620,129 @@ func TestCephDiskLocator_PoolMonHostOptionIsAFallback(t *testing.T) {
 	}
 	if want := `rbd:lv/vm-data:lvpool=ceph:mon_host=10.0.0.1\:6789\;10.0.0.2`; path != want {
 		t.Fatalf("locator %q, want %q", path, want)
+	}
+}
+
+// N2. A clone sweeps the stale staging copies a killed earlier clone left in
+// its pool before it copies.
+func TestCephCloneDisk_SweepsItsStaleStaging(t *testing.T) {
+	f := newFakeCeph()
+	f.installSleep(t)
+	f.images["lv/src-root"] = map[string]bool{}
+	stale := "lv/dst-root" + incomingMarker + "1000-0123456789ab"
+	f.images[stale] = map[string]bool{}
+	d := &cephDriver{pool: "lv", name: "ceph", opts: map[string]string{}, run: f.run}
+	if _, err := d.CloneDisk(context.Background(), "rbd:lv/src-root", DiskOptions{VMName: "dst", DiskName: "root"}); err != nil {
+		t.Fatal(err)
+	}
+	if f.has(stale) {
+		t.Fatalf("a stale staging copy was left: %v", f.calls)
+	}
+}
+
+// N2. A clone whose copy is killed leaves the dead client's watch on its
+// staging image; the rollback retries the rm until the watch expires.
+func TestCephCloneDisk_KilledCopyStagingIsRemovedAfterTheWatchExpires(t *testing.T) {
+	f := newFakeCeph()
+	f.installSleep(t)
+	f.images["lv/src-root"] = map[string]bool{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.before["deep cp"] = func() {
+		// rbd created the staging image, then was killed.
+		for _, c := range f.calls {
+			if strings.HasPrefix(c, "deep cp ") {
+				f.images[strings.Fields(c)[3]] = map[string]bool{}
+			}
+		}
+		cancel()
+	}
+	f.fail["deep cp"] = context.Canceled
+	d := &cephDriver{pool: "lv", name: "ceph", opts: map[string]string{}, run: f.run}
+	if _, err := d.CloneDisk(ctx, "rbd:lv/src-root", DiskOptions{VMName: "dst", DiskName: "root"}); err == nil {
+		t.Fatal("a killed copy succeeded")
+	}
+	for ref := range f.images {
+		if ref != "lv/src-root" {
+			t.Fatalf("left behind %s: %v", ref, f.calls)
+		}
+	}
+}
+
+// N4. The sweep removes only names the driver mints: a '+' marker (no VM,
+// disk or image name can hold '+') and a 12-hex random suffix. A user's VM
+// disk spelled like an old staging name is never touched.
+func TestCephSweepIncoming_NeverMatchesAUserName(t *testing.T) {
+	f := newFakeCeph()
+	f.installSleep(t)
+	user := "lv/web.litevirt-incoming-1-root" // VM "web.litevirt-incoming-1", disk "root"
+	notOurs := "lv/x+litevirt-incoming-1000-notarandomid"
+	ours := "lv/x+litevirt-incoming-1000-0123456789ab"
+	for _, ref := range []string{user, notOurs, ours} {
+		f.images[ref] = map[string]bool{}
+	}
+	d := &cephDriver{pool: "lv", opts: map[string]string{}, run: f.run}
+	d.sweepIncoming(context.Background(), "lv/x", time.Unix(1000, 0).Add(48*time.Hour))
+	if !f.has(user) || !f.has(notOurs) {
+		t.Fatalf("the sweep removed a name it did not mint: %v", f.calls)
+	}
+	if f.has(ours) {
+		t.Fatalf("the sweep left its own stale staging: %v", f.calls)
+	}
+}
+
+// N6. "Already gone" needs the pool to answer AND not list the image.
+func TestCephDeleteDisk_ListedImageIsNotGone(t *testing.T) {
+	f := newFakeCeph()
+	f.failOut["rm"] = struct {
+		out []byte
+		err error
+	}{[]byte("rbd: delete error: (2) No such file or directory"), rbdExit(2)}
+	f.listing = []string{"other", "a-root"}
+	d := &cephDriver{pool: "lv", opts: map[string]string{}, run: f.run}
+	if err := d.DeleteDisk(context.Background(), "rbd:lv/a-root"); err == nil {
+		t.Fatal("an image the pool still lists was reported deleted")
+	}
+}
+
+// N9. The rbd CLI uses the pool's mon_host option, as the domains do.
+func TestRbdArgs_PassesThePoolsMonHost(t *testing.T) {
+	d := &cephDriver{pool: "lv", opts: map[string]string{"id": "x", "mon_host": "[v2:10.0.0.1:3300/0,v1:10.0.0.1:6789/0] 10.0.0.2"}}
+	got := strings.Join(d.rbdArgs("ls", "--", "lv"), " ")
+	if !strings.Contains(got, "-m 10.0.0.1:6789,10.0.0.2 ") {
+		t.Fatalf("rbd args %q, want -m with the pool's monitors", got)
+	}
+}
+
+// N8. The zfs and lvm-thin drivers run their tools through the shared,
+// overridable runner, so a caller's rollback can be tested.
+func TestVolumeDrivers_RunThroughTheRunner(t *testing.T) {
+	var calls []string
+	defer OverrideVolumeRunnerForTest(func(_ context.Context, name string, args ...string) ([]byte, error) {
+		calls = append(calls, name+" "+strings.Join(args, " "))
+		return nil, nil
+	})()
+	ctx := context.Background()
+	z := &zfsDriver{dataset: "tank/lv", opts: map[string]string{}}
+	p, err := z.CreateDisk(ctx, DiskOptions{VMName: "vm", DiskName: "data", SizeBytes: 1 << 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := z.DeleteDisk(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	l := &lvmThinDriver{vg: "vg0", opts: map[string]string{"thinpool": "pool0"}}
+	lp, err := l.CreateDisk(ctx, DiskOptions{VMName: "vm", DiskName: "data", SizeBytes: 1 << 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.DeleteDisk(ctx, lp); err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Join(calls, "\n")
+	for _, want := range []string{"zfs create -V 1073741824 -- tank/lv/vm-data", "zfs destroy -r -- tank/lv/vm-data", "lvcreate ", "lvremove -f -- vg0/vm-data"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("runner calls lack %q:\n%s", want, got)
+		}
 	}
 }

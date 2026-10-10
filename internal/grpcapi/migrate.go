@@ -717,6 +717,9 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 			TLS:            useTLS,
 			TLSDestination: targetHost.Address,
 			CDROMSources:   cdromSources,
+			// The destination definition carries each rbd disk's monitors as
+			// its pool resolves them now (a re-addressed cluster's).
+			RBDLocators: s.rbdLocatorsOf(ctx, vm.Name),
 		})
 	}()
 

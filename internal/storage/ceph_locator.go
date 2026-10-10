@@ -1,9 +1,11 @@
 package storage
 
 import (
+	"context"
 	"errors"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // CephLocator is a ceph VM disk's recorded identifier, parsed:
@@ -72,7 +74,9 @@ func IsDefaultCephConf(conf string) bool {
 
 // rbd exits with the errno of what failed (rbd.cc: return std::abs(r)).
 const (
+	rbdEPERM  = 1
 	rbdENOENT = 2
+	rbdEACCES = 13
 	rbdEEXIST = 17
 )
 
@@ -84,4 +88,36 @@ func rbdErrno(err error) int {
 		return ec.ExitCode()
 	}
 	return -1
+}
+
+// rbdEBUSY is rbd's exit status for an image another client still watches —
+// a killed rbd's for up to the OSD watch timeout (30 s by default).
+const rbdEBUSY = 16
+
+// rbdBusyBudget is how long a rollback keeps retrying an rm that rbd refuses
+// as watched: past the 30 s a dead client's watch lasts, with margin.
+const rbdBusyBudget = 60 * time.Second
+
+// cephSleep waits d, or until ctx ends (false). Tests advance a fake clock.
+var cephSleep = func(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// volumeRunner is what the zfs and lvm-thin drivers run their tools with.
+var volumeRunner cmdRunner = realCmd
+
+// OverrideVolumeRunnerForTest replaces how the zfs and lvm-thin drivers run
+// zfs, lvcreate and the rest, for tests in other packages; it returns the
+// restore.
+func OverrideVolumeRunnerForTest(run func(ctx context.Context, name string, args ...string) ([]byte, error)) func() {
+	prev := volumeRunner
+	volumeRunner = run
+	return func() { volumeRunner = prev }
 }

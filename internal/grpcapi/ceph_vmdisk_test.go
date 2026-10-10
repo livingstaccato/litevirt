@@ -32,6 +32,9 @@ type cephWorld struct {
 	images map[string]map[string]bool // ref → snapshot → protected
 	sizes  map[string]int64
 	calls  []string
+	// infoExit makes `rbd info` exit with that errno (EACCES 13, ENOENT 2),
+	// as with a key the cluster does not accept.
+	infoExit int
 }
 
 // cephExit is a failed rbd command as exec reports it (rbd exits with the errno).
@@ -74,7 +77,7 @@ func (w *cephWorld) run(_ context.Context, name string, args ...string) ([]byte,
 		return nil, os.WriteFile(args[len(args)-1], []byte("raw"), 0o600)
 	}
 	i := 0
-	for i < len(args) && strings.HasPrefix(args[i], "--") {
+	for i < len(args) && strings.HasPrefix(args[i], "-") && args[i] != "--" {
 		i += 2
 	}
 	var words, pos []string
@@ -108,6 +111,9 @@ func (w *cephWorld) run(_ context.Context, name string, args ...string) ([]byte,
 			w.sizes[dst] = 1 << 30
 		}
 	case "info":
+		if w.infoExit != 0 {
+			return []byte("rbd: error opening image: injected"), cephExit(w.infoExit)
+		}
 		ref, snap, _ := strings.Cut(pos[0], "@")
 		s, ok := w.images[ref]
 		if !ok {
@@ -408,6 +414,7 @@ func TestPrepareHardwareForStart_DefinesTheCephSecret(t *testing.T) {
 	f := newCephPoolFixture(t)
 	ctx := context.Background()
 	vm := corrosion.VMRecord{Name: "vm1", HostName: "test-host", State: "stopped"}
+	f.world.images["lv/vm1-data"] = map[string]bool{}
 	if err := corrosion.InsertVM(ctx, f.s.db, vm, nil, []corrosion.DiskRecord{{
 		VMName: "vm1", DiskName: "data", HostName: "test-host", StorageType: "ceph", StorageVolume: "ceph",
 		Path: "rbd:lv/vm1-data:id=litevirt:keyring=" + f.keyring + ":lvpool=ceph",
@@ -454,6 +461,9 @@ func TestDeleteRecordedVMDiskVolumes_CephDiskWithoutItsPool(t *testing.T) {
 // fixture's pool.
 func (f *cephPoolFixture) insertCephVM(t *testing.T, name, host string) corrosion.VMRecord {
 	t.Helper()
+	f.world.mu.Lock()
+	f.world.images["lv/"+name+"-data"] = map[string]bool{}
+	f.world.mu.Unlock()
 	vm := corrosion.VMRecord{Name: name, HostName: host, State: "stopped", Spec: `{"name":"` + name + `","cpu":1,"memory_mib":256}`}
 	if err := corrosion.InsertVM(context.Background(), f.s.db, vm, nil, []corrosion.DiskRecord{{
 		VMName: name, DiskName: "data", HostName: host, StorageType: "ceph", StorageVolume: "ceph",
@@ -535,9 +545,12 @@ func TestCephKeyFingerprint_MismatchRaisesAConditionAndRefusesStarts(t *testing.
 		!strings.Contains(c.Evidence, "test-host") || len(c.Hosts) == 0 || c.Hosts[0] != "test-host" {
 		t.Fatalf("condition %+v, %v, %v; want an open warning naming test-host", c, ok, err)
 	}
+	// N3: the fingerprints are a diagnostic only — a host in the minority (a
+	// key rotation in progress, or rows of hosts that are down or gone) still
+	// starts what its own key can open; rbd itself is the proof.
 	vm := f.insertCephVM(t, "fo", "test-host")
-	if _, err := f.s.PrepareHardwareForStart(ctx, &vm); status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "keyring") {
-		t.Fatalf("start on the odd host: got %v, want FailedPrecondition naming the keyring", err)
+	if _, err := f.s.PrepareHardwareForStart(ctx, &vm); err != nil {
+		t.Fatalf("start on the minority host whose key opens the disk: %v", err)
 	}
 
 	f.peerPoolRow(t, "host-b", storage.CephKeyFingerprint(f.key))
@@ -601,5 +614,97 @@ func TestCephDisk_ResizeAndSnapshotAreRefusedClearly(t *testing.T) {
 	_, err = f.s.CreateSnapshot(adminCtx(), &pb.CreateSnapshotRequest{VmName: "rs", Name: "s1"})
 	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "ceph") {
 		t.Fatalf("snapshot: got %v, want FailedPrecondition naming ceph", err)
+	}
+}
+
+// N3. Every start proves this host's own key opens the disk (rbd info with
+// the pool's credentials), and refuses with the reason when it does not.
+func TestPrepareHardwareForStart_ProvesTheKeyWithRBD(t *testing.T) {
+	for _, tc := range []struct {
+		errno int
+		want  string
+	}{{13, "permission"}, {1, "permission"}, {2, "not in the cluster"}} {
+		f := newCephPoolFixture(t)
+		vm := f.insertCephVM(t, "pk", "test-host")
+		f.world.infoExit = tc.errno
+		_, err := f.s.PrepareHardwareForStart(context.Background(), &vm)
+		if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), tc.want) ||
+			!strings.Contains(err.Error(), "test-host") {
+			t.Fatalf("rbd info exit %d: got %v, want FailedPrecondition naming %q and the host", tc.errno, err, tc.want)
+		}
+	}
+}
+
+// N7. Only a pool this host definitely does not have falls back to the
+// locator's own keyring; storage that resolves to something else is refused.
+func TestCephSecretsForVM_RefusesStorageThatIsNotTheDisksPool(t *testing.T) {
+	f := newCephPoolFixture(t)
+	vm := f.insertCephVM(t, "nv", "test-host")
+	// The disk's storage name now resolves to a dir pool here.
+	f.s.addStoragePoolRef("ceph", StoragePoolRef{Driver: "dir", Target: t.TempDir()})
+	_, err := f.s.PrepareHardwareForStart(context.Background(), &vm)
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "is a dir pool") {
+		t.Fatalf("got %v, want a refusal saying the storage is a dir pool here", err)
+	}
+}
+
+// N1. A promote builds its domain from the replica (a local file); the VM's
+// rbd disks are not part of it, so their pool or keyring being absent here
+// never refuses a disaster-recovery promote.
+func TestPromoteReplica_IgnoresTheVMsRBDDisks(t *testing.T) {
+	s := testServer(t)
+	s.virt = libvirtfake.New()
+	ctx := adminCtx()
+	poolDir := t.TempDir()
+	s.SetStoragePoolsByName(map[string]StoragePoolRef{"replica-pool": {Driver: "local", Target: poolDir}})
+	specJSON, _ := json.Marshal(&pb.VMSpec{Name: "vm1", Cpu: 1, MemoryMib: 512})
+	if err := corrosion.InsertVM(ctx, s.db,
+		corrosion.VMRecord{Name: "vm1", HostName: "test-host", State: "running", Spec: string(specJSON)},
+		nil,
+		[]corrosion.DiskRecord{
+			{VMName: "vm1", DiskName: "root", HostName: "test-host", Path: "/nonexistent-source", SizeBytes: 1 << 20, StorageType: "local"},
+			{VMName: "vm1", DiskName: "data", HostName: "test-host", StorageType: "ceph", StorageVolume: "ceph",
+				Path: "rbd:lv/vm1-data:id=litevirt:keyring=/nonexistent/k:lvpool=ceph", SizeBytes: 1 << 30},
+		},
+	); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	seedReplica(t, poolDir, "", "vm1", "root", "20260101-000000", "raw", 1<<20)
+	stream := &streamRecorder[pb.PromoteReplicaProgress]{ctx: ctx}
+	if err := s.PromoteReplica(&pb.PromoteReplicaRequest{
+		VmName: "vm1", NewName: "vm1-promoted", TargetPool: "replica-pool", NoLocalize: true,
+	}, stream); err != nil {
+		t.Fatalf("PromoteReplica of a VM with an rbd data disk on a host without its pool: %v", err)
+	}
+}
+
+// N8 / M1. A failed create rolls a zvol back with the zfs driver (`zfs
+// destroy` of the zvol it made), never an unlink of its /dev symlink; and a
+// create refused at `zfs create` (the name exists) destroys nothing.
+func TestCreateVM_FailedCreateDestroysItsZvol(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		createFails bool
+	}{{"define fails", false}, {"zfs create refused", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, fake := provableCreateServer(t)
+			var calls []string
+			t.Cleanup(storage.OverrideVolumeRunnerForTest(func(_ context.Context, name string, args ...string) ([]byte, error) {
+				calls = append(calls, name+" "+strings.Join(args, " "))
+				if tc.createFails && len(args) > 0 && args[0] == "create" {
+					return []byte("cannot create 'tank/lv/z1-data': dataset already exists"), errors.New("exit status 1")
+				}
+				return nil, nil
+			}))
+			s.addStoragePoolRef("tank", StoragePoolRef{Driver: "zfs", Source: "tank/lv"})
+			fake.FailDefineDomain = func(string) error { return errors.New("define fails") }
+			if _, err := s.CreateVM(adminCtx(), cephCreateRequest("z1", &pb.DiskSpec{Name: "data", Size: "1G", Storage: "tank"})); err == nil {
+				t.Fatal("create succeeded")
+			}
+			destroyed := strings.Contains(strings.Join(calls, "\n"), "zfs destroy -r -- tank/lv/z1-data")
+			if destroyed == tc.createFails {
+				t.Fatalf("zfs destroy of the zvol: %v, want %v (calls %v)", destroyed, !tc.createFails, calls)
+			}
+		})
 	}
 }

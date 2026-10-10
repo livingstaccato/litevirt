@@ -956,10 +956,14 @@ pool names:
 fingerprint of its key (one-way, `ceph_key_fp`) on its own row of the pool.
 A host whose key differs from another host's raises the degraded condition
 `ceph_keyring_mismatch` (see [diagnostics.md](diagnostics.md)), naming the
-host. A host whose key is held by fewer hosts than another key refuses to
-start a VM of the pool (so a failover onto it fails with that reason, not
-libvirt's), and a live migration onto a host whose key differs from the
-source host's is refused before libvirt is asked.
+host. It is a diagnostic: rows of hosts that are down, removed or mid key
+rotation cannot vouch for anyone, so no start is refused by it. Instead every
+start of a VM with a ceph disk (failover restarts included) first proves the
+host's own key with `rbd info` on each disk as the pool's client, and refuses
+with the reason — permission denied, or the image not in the cluster the
+host's pool reaches — rather than libvirt's. A live migration onto a host
+whose recorded key differs from the source host's is refused before libvirt
+is asked.
 
 Each disk's domain definition is a network disk with the monitors as `<host>`
 elements and an `<auth username='litevirt'>` naming that secret:
@@ -984,8 +988,11 @@ from the pool on that host — its `mon_host` option, else its conf's — so aft
 the monitors are re-addressed, updating `/etc/ceph/ceph.conf` (or the pool's
 `mon_host`) on the hosts is all a stopped VM needs to start. Only a pool with
 a `mon_host` option also writes that list into the path, as the fallback for
-a host that does not have the pool. A running VM is not affected either way:
-librbd follows the cluster's monitor map.
+a host that does not have the pool. A running VM keeps working (librbd
+follows the cluster's monitor map), and a live migration hands the
+destination the monitors its pool resolves to at that moment, not the ones the
+running domain was defined with, so a re-addressed cluster's VMs migrate
+without a restart.
 
 A pool with neither an id nor a keyring gives its disks no `<auth>`: qemu
 then uses Ceph's own defaults, which means `client.admin` and its keyring on
@@ -1039,8 +1046,13 @@ A ceph disk is shared storage: a live migration moves only the guest's
 memory. The source always asks the target to prepare first (`EnsureDisks`):
 the target defines the secret the incoming domain names — the pool's, so the
 target needs a ceph pool of the **same name** and client — from its own
-keyring, and refuses the migration with the reason when it has no such pool,
-cannot read its keyring, or its key differs from the source's. An older
+keyring, proves that key opens each disk (`rbd info`), and refuses the
+migration with the reason when it cannot read its keyring, the key does not
+open the disk, its recorded key differs from the source's, or the disk's
+storage name is a different pool there. A target that does not have the pool
+at all serves the disk from the client and keyring the disk's recorded path
+names — if that keyring is readable there and opens the disk — and refuses
+otherwise; a target that cannot read its own pool list refuses. An older
 target build does not do this: the migration then fails when the target's qemu
 opens the disk, and the VM keeps running on the source.
 

@@ -13,8 +13,8 @@ import (
 // image, is never touched.
 func TestCephSweepIncoming_RemovesOnlyStaleIncomingImages(t *testing.T) {
 	now := time.Date(2026, 10, 11, 12, 0, 0, 0, time.UTC)
-	old := fmt.Sprintf("vm1-root-copy-a%s%d-abc", incomingMarker, now.Add(-48*time.Hour).Unix())
-	fresh := fmt.Sprintf("vm1-root-copy-b%s%d-def", incomingMarker, now.Add(-time.Hour).Unix())
+	old := fmt.Sprintf("vm1-root-copy-a%s%d-0123456789ab", incomingMarker, now.Add(-48*time.Hour).Unix())
+	fresh := fmt.Sprintf("vm1-root-copy-b%s%d-abcdef012345", incomingMarker, now.Add(-time.Hour).Unix())
 	listing := strings.Join([]string{"vm1-root", old, fresh, "db-root"}, "\n")
 	run, calls := stubRunner(func(sub string) ([]byte, error) {
 		if sub == "ls" {

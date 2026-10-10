@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"os/exec"
 	"strings"
 )
 
@@ -26,6 +25,11 @@ type lvmThinDriver struct {
 
 func (d *lvmThinDriver) String() string { return "lvm-thin" }
 
+// cmd runs an LVM tool through the shared runner (real exec by default).
+func (d *lvmThinDriver) cmd(ctx context.Context, name string, args ...string) ([]byte, error) {
+	return volumeRunner(ctx, name, args...)
+}
+
 func (d *lvmThinDriver) Prepare(ctx context.Context) error {
 	if d.vg == "" {
 		return fmt.Errorf("lvm-thin: volume group (Source) required")
@@ -33,8 +37,8 @@ func (d *lvmThinDriver) Prepare(ctx context.Context) error {
 	if d.opts["thinpool"] == "" {
 		return fmt.Errorf("lvm-thin: options.thinpool required")
 	}
-	out, err := exec.CommandContext(ctx, "lvs", "--noheadings", "-o", "lv_name", "--",
-		d.vg+"/"+d.opts["thinpool"]).CombinedOutput()
+	out, err := d.cmd(ctx, "lvs", "--noheadings", "-o", "lv_name", "--",
+		d.vg+"/"+d.opts["thinpool"])
 	if err != nil {
 		return fmt.Errorf("lvs %s/%s: %w: %s", d.vg, d.opts["thinpool"], err, out)
 	}
@@ -50,7 +54,7 @@ func (d *lvmThinDriver) CreateDisk(ctx context.Context, opts DiskOptions) (strin
 		"--name", lvName,
 		"--", d.vg,
 	}
-	if out, err := exec.CommandContext(ctx, "lvcreate", args...).CombinedOutput(); err != nil {
+	if out, err := d.cmd(ctx, "lvcreate", args...); err != nil {
 		return "", fmt.Errorf("lvcreate %s/%s: %w: %s", d.vg, lvName, err, out)
 	}
 	path := fmt.Sprintf("/dev/%s/%s", d.vg, lvName)
@@ -65,7 +69,7 @@ func (d *lvmThinDriver) DeleteDisk(ctx context.Context, path string) error {
 		return fmt.Errorf("lvm-thin: cannot derive vg/lv from %q", path)
 	}
 	vg, lv := parts[0], parts[1]
-	if out, err := exec.CommandContext(ctx, "lvremove", "-f", "--", vg+"/"+lv).CombinedOutput(); err != nil {
+	if out, err := d.cmd(ctx, "lvremove", "-f", "--", vg+"/"+lv); err != nil {
 		return fmt.Errorf("lvremove %s/%s: %w: %s", vg, lv, err, out)
 	}
 	return nil

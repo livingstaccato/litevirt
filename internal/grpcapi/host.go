@@ -670,7 +670,7 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 		return progress
 	}
 	dconnuri := fmt.Sprintf("qemu+tls://%s/system", corrosion.URIHost(target.Address))
-	lerr := s.virt.MigrateToTarget(vm.Name, dconnuri, libvirt.MigrateParams{Live: true, CDROMSources: cdromSources})
+	lerr := s.virt.MigrateToTarget(vm.Name, dconnuri, libvirt.MigrateParams{Live: true, CDROMSources: cdromSources, RBDLocators: s.rbdLocatorsOf(ctx, vm.Name)})
 	if lerr == nil {
 		// Phase 4: drain move is an ownership transition (fresh-read CAS + increment).
 		//runningcheck:allow ownership handoff — this commit names the TARGET host while

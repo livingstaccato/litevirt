@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -28,9 +29,10 @@ import (
 //
 // Whether two hosts' keyrings hold the same key is a separate question,
 // answered by the key fingerprint each host records on its own pool row
-// (storage.CephKeyFPOption): a host whose key differs from the others' raises
-// ceph_keyring_mismatch, and refuses to start, or to receive by migration, a
-// VM of that pool — with that reason, never libvirt's opaque one.
+// (storage.CephKeyFPOption): a host whose key differs from another's raises
+// ceph_keyring_mismatch (a diagnostic), and a live migration between two hosts
+// whose keys differ is refused with that reason. A start never trusts other
+// hosts' rows: it proves this host's own key opens the disk (`rbd info`).
 //
 // The secrets are ephemeral, so a libvirtd restart drops them. They are put
 // back by ReconcileCephSecrets, which the daemon runs at start and then
@@ -149,50 +151,20 @@ func (s *Server) cephKeyFingerprints(ctx context.Context, pool string) (map[stri
 	return out, nil
 }
 
-// cephKeyOddOneOut says whether this host's key (mine) is in a strict
-// minority among the hosts' recorded fingerprints of a pool: some other key
-// is held by more hosts than this one is. A tie is not decided against this
-// host — there is no telling which key is the cluster's.
-func cephKeyOddOneOut(mine string, fps map[string]string, self string) (odd bool, differing []string) {
-	count := map[string]int{mine: 1}
+// cephKeyDiffering lists the hosts whose recorded fingerprint of pool's key
+// differs from this host's (mine). A diagnostic only: it raises
+// ceph_keyring_mismatch, and never refuses a start — rows of hosts that are
+// down, removed or mid key rotation cannot vouch for or against this host;
+// every start proves this host's key with rbd itself (ProbeDisk).
+func cephKeyDiffering(mine string, fps map[string]string, self string) []string {
+	var differing []string
 	for h, fp := range fps {
-		if h == self {
-			continue
-		}
-		count[fp]++
-		if fp != mine {
+		if h != self && fp != mine {
 			differing = append(differing, h)
 		}
 	}
 	sort.Strings(differing)
-	for fp, n := range count {
-		if fp != mine && n > count[mine] {
-			return true, differing
-		}
-	}
-	return false, differing
-}
-
-// refuseOddCephKey refuses a start here of a VM on host pool `pool` when this
-// host's key is not the one the pool's other hosts hold.
-func (s *Server) refuseOddCephKey(ctx context.Context, pool string, cfg storage.Config) error {
-	if !isHostPool(pool) {
-		return nil
-	}
-	mine, ok, err := storage.CephKeyFingerprintOf(cfg.Options)
-	if err != nil || !ok {
-		return err
-	}
-	fps, err := s.cephKeyFingerprints(ctx, pool)
-	if err != nil {
-		return nil // the start's own failure is the clearer answer than a guess
-	}
-	if odd, differing := cephKeyOddOneOut(mine, fps, s.hostName); odd {
-		return fmt.Errorf("the keyring of ceph pool %q on %s holds a different key for client.%s than the pool's other hosts (%s): "+
-			"install the cluster's keyring for the client on %s (condition %s)",
-			pool, s.hostName, clientOf(cfg), strings.Join(differing, ", "), s.hostName, condCephKeyringMismatch)
-	}
-	return nil
+	return differing
 }
 
 // refuseCephKeyUnlikeSource refuses a migration onto this host of a VM whose
@@ -224,14 +196,20 @@ func clientOf(cfg storage.Config) string {
 	return "admin"
 }
 
+// errStorageNotFound is resolveVolume's "this host has no storage of that
+// name" — the one answer that lets a disk fall back to its own locator.
+var errStorageNotFound = errors.New("no such storage here")
+
 // ensureCephSecretsForVM defines, on this host, the secrets a VM's ceph
-// disks name, and checks this host can serve them. source is the host the VM
+// disks name, and proves this host can open them. source is the host the VM
 // is migrating from ("" for a start here). Each disk is served by the pool
 // (or stack volume) its locator names: its secret is defined from this host's
-// keyring for it, and must be the one the disk's domain names; this host's key
-// must be the pool's (refuseOddCephKey, refuseCephKeyUnlikeSource). A disk
-// whose pool this host does not have is served from its locator's own keyring
-// when that is readable here, and refused otherwise.
+// keyring for it and must be the one the disk's domain names, a migration's
+// target must hold the same key as the source (the pool rows' fingerprints),
+// and `rbd info` with this host's credentials must open the image. A disk
+// whose pool this host definitely does not have is served from its locator's
+// own client and keyring when that is readable here; any other failure to
+// resolve its storage refuses.
 func (s *Server) ensureCephSecretsForVM(ctx context.Context, vm *corrosion.VMRecord, source string) error {
 	if s.virt == nil {
 		return nil
@@ -248,35 +226,63 @@ func (s *Server) ensureCephSecretsForVM(ctx context.Context, vm *corrosion.VMRec
 		l, _ := storage.ParseCephLocator(d.Path)
 		pool := l.Opts["lvpool"]
 		cfg, rerr := s.resolveVolume(ctx, vm.StackName, d.StorageVolume)
-		if rerr != nil || !strings.EqualFold(cfg.Driver, "ceph") || cfg.Name != pool {
+		switch {
+		case errors.Is(rerr, errStorageNotFound):
 			// The pool is not on this host (any more): the disk's own locator
 			// names its client and keyring.
-			id := l.Opts["id"]
-			if id == "" {
-				id = "admin"
-			}
-			if derr := s.defineCephSecret(want, id, l.Opts["keyring"], false); derr != nil {
+			if derr := s.defineCephSecret(want, cephLocatorID(l), l.Opts["keyring"], false); derr != nil {
 				return fmt.Errorf("disk %s is on ceph pool %q, which %s does not have, and its keyring is not usable here: %w",
 					d.DiskName, pool, s.hostName, derr)
 			}
-			continue
+			cfg = storage.Config{Name: pool, Driver: "ceph", Source: l.Pool, Options: rbdPathOptions(d.Path)}
+		case rerr != nil:
+			return fmt.Errorf("disk %s: %w", d.DiskName, rerr)
+		case !strings.EqualFold(cfg.Driver, "ceph") || cfg.Name != pool:
+			return fmt.Errorf("disk %s is on ceph pool %q, but storage %q on %s is a %s pool; give the pool the same name and driver on every host",
+				d.DiskName, pool, d.StorageVolume, s.hostName, cfg.Driver)
+		default:
+			u, err := s.ensureCephSecret(cfg)
+			if err != nil {
+				return fmt.Errorf("disk %s: %w", d.DiskName, err)
+			}
+			if u != want {
+				return fmt.Errorf("disk %s authenticates as client.%s of ceph pool %q, but pool %q on %s names client.%s; give the pool the same id on every host",
+					d.DiskName, cephLocatorID(l), pool, pool, s.hostName, clientOf(cfg))
+			}
+			if err := s.refuseCephKeyUnlikeSource(ctx, pool, source, cfg); err != nil {
+				return err
+			}
 		}
-		u, err := s.ensureCephSecret(cfg)
+		drv, err := storage.New(s.dataDir, cfg)
 		if err != nil {
 			return fmt.Errorf("disk %s: %w", d.DiskName, err)
 		}
-		if u != want {
-			return fmt.Errorf("disk %s authenticates as client.%s of ceph pool %q, but pool %q on %s names client.%s; give the pool the same id on every host",
-				d.DiskName, cephLocatorID(l), pool, pool, s.hostName, clientOf(cfg))
-		}
-		if err := s.refuseOddCephKey(ctx, pool, cfg); err != nil {
-			return err
-		}
-		if err := s.refuseCephKeyUnlikeSource(ctx, pool, source, cfg); err != nil {
-			return err
+		if p, ok := drv.(storage.DiskProber); ok {
+			if err := p.ProbeDisk(ctx, d.Path); err != nil {
+				return fmt.Errorf("disk %s on %s: %w", d.DiskName, s.hostName, err)
+			}
 		}
 	}
 	return nil
+}
+
+// rbdLocatorsOf maps each rbd disk of a VM (by its image spec, the domain's
+// <source name>) to its recorded locator, for a migration to re-resolve.
+func (s *Server) rbdLocatorsOf(ctx context.Context, vmName string) map[string]string {
+	disks, err := corrosion.GetVMDisks(ctx, s.db, vmName)
+	if err != nil {
+		return nil
+	}
+	var out map[string]string
+	for _, d := range disks {
+		if l, ok := storage.ParseCephLocator(d.Path); ok {
+			if out == nil {
+				out = map[string]string{}
+			}
+			out[l.Spec] = d.Path
+		}
+	}
+	return out
 }
 
 func cephLocatorID(l storage.CephLocator) string {
@@ -350,7 +356,7 @@ func (s *Server) judgeCephKey(ctx context.Context, pool, mine string) {
 	if err != nil {
 		return
 	}
-	_, differing := cephKeyOddOneOut(mine, fps, s.hostName)
+	differing := cephKeyDiffering(mine, fps, s.hostName)
 	subject := pool + "@" + s.hostName
 	now := time.Now().UTC().Format(time.RFC3339)
 	row, found, err := corrosion.GetHealthCondition(ctx, s.db, cephPoolEvaluator, condCephKeyringMismatch, "host", subject)
@@ -380,7 +386,7 @@ func (s *Server) judgeCephKey(ctx context.Context, pool, mine string) {
 	row.Hosts = []string{s.hostName}
 	ev, _ := json.Marshal(map[string]any{
 		"pool": pool, "host": s.hostName, "differs_from": differing,
-		"detail": fmt.Sprintf("the keyring of ceph pool %q on %s holds a different key than on %s; VMs of the pool are not started on, or migrated to, the host whose key is in the minority",
+		"detail": fmt.Sprintf("the keyring of ceph pool %q on %s holds a different key than on %s; a live migration between hosts whose keys differ is refused, and a start proves the host's own key with rbd",
 			pool, s.hostName, strings.Join(differing, ", ")),
 	})
 	row.Evidence = string(ev)

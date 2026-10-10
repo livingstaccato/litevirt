@@ -102,6 +102,11 @@ func TestFleet_LiveMigrationDefinesTheCephSecretOnTheTarget(t *testing.T) {
 	if !ok || client != "litevirt" || !bytes.Equal(val, key) {
 		t.Fatalf("target secret: ok=%v client=%q value=%q; want client.litevirt's key", ok, client, val)
 	}
+	// N5: the source hands libvirt the rbd disk's locator, so the destination
+	// definition carries the pool's current monitors.
+	if note := migrateNote(t, src); !strings.Contains(note, " rbd=lv/cv-data") {
+		t.Fatalf("libvirt migration %q names no rbd disk to re-resolve", note)
+	}
 }
 
 // I2. A target whose keyring holds another key refuses before libvirt is

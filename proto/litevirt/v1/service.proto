@@ -3823,6 +3823,17 @@ service LiteVirt {
     rpc GetFailoverScope(google.protobuf.Empty)       returns (FailoverScopeStatus);
     rpc SetFailoverScope(SetFailoverScopeRequest)     returns (FailoverScopeStatus);
 
+    // RestoreRelay clears a relay-health demotion now (admin;
+    // colonelpanik/litevirt#175): it writes the host's relay_demoted row back
+    // to demoted=false, replicated and audited, and with hold_seconds > 0
+    // keeps the failover lease holder from demoting it again until the hold
+    // runs out. Refuses until relay_health_v1 has durably latched.
+    rpc RestoreRelay(RestoreRelayRequest)             returns (RestoreRelayResponse);
+    // GetRelayHealth lists every host with a relay demotion row or an
+    // operator hold (viewer): demoted or restored, since when and why, and
+    // any hold with its expiry.
+    rpc GetRelayHealth(google.protobuf.Empty)         returns (RelayHealthStatus);
+
     // ── anycast services ──
     // service_endpoints map a logical name (e.g. "api.litevirt.local")
     // to N (ip, region) pairs. The embedded DNS server round-robins
@@ -4055,6 +4066,31 @@ message FailoverScopeRegion {
 
 message SetFailoverScopeRequest {
     string scope = 1;  // "cluster" | "region"
+}
+
+message RestoreRelayRequest {
+    string host         = 1;
+    int64  hold_seconds = 2;  // 0: no hold
+}
+
+message RelayHealthEntry {
+    string host       = 1;
+    bool   demoted    = 2;
+    string since      = 3;  // RFC 3339: when the current state began
+    string reason     = 4;
+    string hold_until = 5;  // RFC 3339, empty with no hold in force
+    string hold_by    = 6;
+}
+
+message RelayHealthStatus {
+    repeated RelayHealthEntry hosts = 1;
+    bool latched = 2;  // relay_health_v1 has latched: demotions are in use
+}
+
+message RestoreRelayResponse {
+    string host        = 1;
+    bool   was_demoted = 2;  // the host was demoted before this call
+    string hold_until  = 3;  // RFC 3339, empty with no hold
 }
 
 // CrossRegionMigrate refuses when source/target hosts are in the

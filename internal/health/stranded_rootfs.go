@@ -10,7 +10,6 @@ import (
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/lxc"
-	"github.com/litevirt/litevirt/internal/randid"
 )
 
 // A container relocated off a failed host leaves its own rootfs there.
@@ -200,10 +199,7 @@ func (c *ContainerChecker) noteAdoptedRootfs(ctx context.Context, name string) {
 	}
 	detail := fmt.Sprintf("relocation onto %s adopted container %s's own rootfs, left here when it was relocated to %s: "+
 		"the container runs on that data, not on a fresh %s", c.hostName, name, ev.MovedTo, ev.How)
-	if err := corrosion.InsertAuditLog(ctx, c.db, corrosion.AuditRecord{
-		ID: randid.New(), Username: "containercheck", HostName: c.hostName,
-		Action: "ct.relocate.adopted", Target: name, Detail: detail, Result: "ok",
-	}); err != nil {
+	if err := c.auditContainer(ctx, "ct.relocate.adopted", name, detail); err != nil {
 		slog.Warn("containercheck: record the adopted rootfs", "container", name, "error", err)
 	}
 	c.publish("ct.relocate.adopted", name, detail)

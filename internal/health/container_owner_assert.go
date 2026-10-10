@@ -292,13 +292,19 @@ func (c *ContainerChecker) pruneOwnershipDebounce(stillCandidate map[string]bool
 }
 
 func (c *ContainerChecker) auditRekey(ctx context.Context, name, fromHost string) {
-	_ = corrosion.InsertAuditLog(ctx, c.db, corrosion.AuditRecord{
+	_ = c.auditContainer(ctx, "ct.runtime-owner-rekey", name, "reclaimed from "+fromHost+" (runs locally; no other host runs it)")
+}
+
+// auditContainer is the container sweep's one audit writer (signed through
+// InsertAuditLog on the daemon's client).
+func (c *ContainerChecker) auditContainer(ctx context.Context, action, name, detail string) error {
+	return corrosion.InsertAuditLog(ctx, c.db, corrosion.AuditRecord{
 		ID:       randid.New(),
 		Username: "system",
 		HostName: c.hostName,
-		Action:   "ct.runtime-owner-rekey",
+		Action:   action,
 		Target:   name,
-		Detail:   "reclaimed from " + fromHost + " (runs locally; no other host runs it)",
+		Detail:   detail,
 		Result:   "ok",
 	})
 }

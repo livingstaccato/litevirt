@@ -53,6 +53,10 @@ type Server struct {
 	// SupersededDisks (superseded_disks.go).
 	supersededRetentionDays int
 
+	// hostUpdates is host_updates: the read-only pending-OS-update check
+	// (host_updates.go).
+	hostUpdates HostUpdatesConfig
+
 	// isoLib holds the ISO library's per-host state: the sha256 cache of
 	// library files and the one-sync-pass-at-a-time lock (iso_library.go).
 	isoLib isoLibraryState

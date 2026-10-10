@@ -247,8 +247,14 @@ func (s *Server) promoteResolvedIn(ctx context.Context, req *pb.PromoteReplicaRe
 	}
 	replica := replicas[0]
 	if notPIT[replica] && !acceptNotPIT {
+		if req.Proof != nil {
+			// An automated promotion relayed here (a main-build coordinator
+			// during a rolling upgrade knows nothing of the mark): held, as
+			// loudly as this build's own coordinator holds it.
+			return status.Errorf(codes.FailedPrecondition, "%v", s.holdNotPointInTime(ctx, vm, pool, host, replica))
+		}
 		return status.Errorf(codes.FailedPrecondition,
-			"replica %s of vm %q (pool %s on %s) is NOT point-in-time: it was copied with qemu-img convert -U while the VM ran, after every point-in-time copy failed, and may be inconsistent. Promote it only if nothing better exists, with --accept-not-point-in-time",
+			"replica %s of vm %q (pool %s on %s) is NOT point-in-time: it was copied with qemu-img convert -U while the VM ran, after every point-in-time copy failed, and may be inconsistent. Promote it only if nothing better exists, with --accept-not-point-in-time (a CLI older than this daemon lacks the flag: upgrade it)",
 			replica, req.VmName, pool, host)
 	}
 	// Region-scoped failover keeps a recovery in the fenced host's region. The
@@ -278,6 +284,12 @@ func (s *Server) promoteResolvedIn(ctx context.Context, req *pb.PromoteReplicaRe
 		sched, _ := s.replicationScheduleForVM(ctx, req.VmName)
 		ageLimit = autoPromoteAgeLimit(sched.Cron)
 		if err := checkAutoPromoteReplicaAge(replica, time.Now(), ageLimit); err != nil {
+			// The newest point-in-time replica is too old. If a newer one
+			// exists that is not point-in-time, say why nothing is promoted:
+			// it is held, not merely stale.
+			if h, reps, marks, aerr := s.findReplicaHostPIT(ctx, req, vm, src.DiskName, pool, schedHost, false); aerr == nil && len(reps) > 0 && marks[reps[0]] && !acceptNotPIT {
+				return fmt.Errorf("%w; and %w", err, s.holdNotPointInTime(ctx, vm, pool, h, reps[0]))
+			}
 			return err
 		}
 	}
@@ -569,6 +581,12 @@ func (s *Server) findReplicaHostPIT(ctx context.Context, req *pb.PromoteReplicaR
 			if ts, ok := replicaTimestamp(n); ok && markedTaken[ts.UTC().Format("20060102-150405")] {
 				marks[n] = true
 			}
+			// A copy lv replicate-volume made with -U, promoted by name.
+			// Its record is read on the host that holds it, which is
+			// where a relayed promotion is decided.
+			if (h == "" || h == s.hostName) && s.poolCopyNotPIT(ctx, pool, n) {
+				marks[n] = true
+			}
 		}
 		if req.Replica != "" {
 			if slices.Contains(top, req.Replica) {
@@ -605,7 +623,7 @@ func (s *Server) findReplicaHostPIT(ctx context.Context, req *pb.PromoteReplicaR
 
 // errReplicaNotPointInTime marks an automatic promotion held because the
 // VM's only replicas are not point-in-time and the VM has not opted in.
-var errReplicaNotPointInTime = errors.New("the only replica is not point-in-time; automatic promotion holds the VM")
+var errReplicaNotPointInTime = fmt.Errorf("the only replica is not point-in-time; %w", corrosion.ErrPromoteHeld)
 
 // vmEventFailoverHeld is the event a held automatic promotion records;
 // InspectVM shows the newest one as failover_held while the VM's host is down.

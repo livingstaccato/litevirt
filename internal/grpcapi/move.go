@@ -199,6 +199,12 @@ func (s *Server) moveOneVolume(
 		return send(p)
 	}
 
+	// A point-in-time overlay an earlier copy left holds writes the disk's
+	// file lacks: settle it before either path reads the disk.
+	if err := s.healPITOverlay(ctx, vm, src); err != nil {
+		return status.Errorf(codes.FailedPrecondition, "%v", err)
+	}
+
 	// Anything not definitely shut off goes through libvirt blockdev-mirror,
 	// so the disk swap is online and the copy is never read from an image a
 	// qemu holds open: a paused or pm-suspended domain (which the store folds
@@ -247,11 +253,6 @@ func (s *Server) moveOneVolume(
 			Status: fmt.Sprintf("copying %s → %s", src.Path, dstPath),
 		}); err != nil {
 			return err
-		}
-		// An earlier point-in-time copy's overlay holds writes the disk's
-		// file does not: commit it (or refuse) before copying the file.
-		if err := s.healPITOverlay(ctx, vm, src); err != nil {
-			return status.Errorf(codes.FailedPrecondition, "%v", err)
 		}
 		// A new file, never one already there: in a shared pool the derived
 		// "<vm>-<disk>.qcow2" can be another VM's disk (VM "a" disk "b-root"

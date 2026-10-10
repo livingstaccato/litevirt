@@ -2805,7 +2805,18 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 				c.noteLeaseTermRefusal(ctx, "vm", vm.Name, h.Name)
 				continue
 			}
-			if err := c.autoPromote(ctx, h, vm, fenceEpoch, promoteTerm); err != nil {
+			if err := c.autoPromote(ctx, h, vm, fenceEpoch, promoteTerm); err != nil && errors.Is(err, corrosion.ErrPromoteHeld) && c.holdsDown(ctx, vm) {
+				// Held: the VM's only replicas are not point-in-time. A
+				// host-local disk cannot be restarted elsewhere, so a
+				// reschedule would only re-home the record onto a host that
+				// cannot start it and hide the hold; the VM stays where it
+				// is, down, until an operator promotes it by hand (the
+				// promotion's event names the command).
+				slog.Warn("failover: VM held down; its only replica is not point-in-time", "vm", vm.Name, "error", err)
+				c.mVM(ActionPromote, ResultSkipped, ErrPromoteFailed)
+				c.auditSkip(ctx, h.Name, vm.Name, "held: the only replica is not point-in-time", "held")
+				continue
+			} else if err != nil {
 				// Fall through to the reschedule path on ANY promote error, including a
 				// retryable Unavailable (e.g. the fence_epoch fencing_log row hasn't
 				// replicated to the replica host yet). This is NOT a downgrade to a
@@ -3528,6 +3539,26 @@ func (c *Coordinator) healthyHosts(ctx context.Context, excludeHost string) ([]c
 		}
 	}
 	return out, nil
+}
+
+// holdsDown reports whether a VM whose automatic promotion was held stays
+// down rather than falling back to a reschedule: any disk that is not on
+// shared storage (or disks that cannot be read) holds it. A VM whose disks
+// are all shared is rescheduled as before — restarting from its own live disk
+// beats any replica — and an event says so.
+func (c *Coordinator) holdsDown(ctx context.Context, vm corrosion.VMRecord) bool {
+	disks, err := corrosion.GetVMDisks(ctx, c.db, vm.Name)
+	if err != nil || len(disks) == 0 || corrosion.VMHasHostLocalDisk(disks) {
+		return true
+	}
+	detail := "automatic promotion held (the only replica is not point-in-time); every disk is on shared storage, so the VM is restarted from its own disk instead"
+	if ierr := corrosion.InsertVMEvent(ctx, c.db, corrosion.VMEventRecord{
+		ID: randid.New(), VMName: vm.Name, HostName: c.hostName, Type: "vm.failover.restart_shared",
+		Result: "ok", Severity: "warn", Detail: detail, Username: "failover-coordinator",
+	}); ierr != nil {
+		slog.Warn("failover: record the shared-disk restart event", "vm", vm.Name, "error", ierr)
+	}
+	return false
 }
 
 // vmNeedsFailover reports whether this VM is one the coordinator would ever try

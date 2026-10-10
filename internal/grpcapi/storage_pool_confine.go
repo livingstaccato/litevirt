@@ -69,17 +69,21 @@ const poolUploadsFile = "pool-uploads.json"
 // (pool_records.go); read from there it is bound by size and modification
 // time only (shared).
 type poolUpload struct {
-	Pool     string `json:"pool"`
-	Project  string `json:"project"`
-	VM       string `json:"vm,omitempty"`
-	VMUUID   string `json:"vm_uuid,omitempty"`
-	Disk     string `json:"disk,omitempty"`
-	Copy     bool   `json:"copy,omitempty"`
-	Uploader string `json:"uploader,omitempty"`
-	Peer     bool   `json:"peer,omitempty"`
-	Size     int64  `json:"size"`
-	MtimeNs  int64  `json:"mtime_ns"`
-	shared   bool
+	Pool    string `json:"pool"`
+	Project string `json:"project"`
+	VM      string `json:"vm,omitempty"`
+	VMUUID  string `json:"vm_uuid,omitempty"`
+	Disk    string `json:"disk,omitempty"`
+	Copy    bool   `json:"copy,omitempty"`
+	// NotPointInTime marks a copy (lv replicate-volume) made with qemu-img
+	// convert -U after every point-in-time copy failed: promoting it by name
+	// needs --accept-not-point-in-time. Absent reads as copies always read.
+	NotPointInTime bool   `json:"not_point_in_time,omitempty"`
+	Uploader       string `json:"uploader,omitempty"`
+	Peer           bool   `json:"peer,omitempty"`
+	Size           int64  `json:"size"`
+	MtimeNs        int64  `json:"mtime_ns"`
+	shared         bool
 }
 
 // poolRecords is every record of each file (by cleaned path): this host's
@@ -189,8 +193,32 @@ func (s *Server) recordPoolReplica(ctx context.Context, pool string, k replicaKe
 // recordPoolCopy records path, in pool, as a replicate-volume copy of k's
 // disk: the VM's project's, promotable when named, never a replica a
 // replication run made.
-func (s *Server) recordPoolCopy(ctx context.Context, pool string, k replicaKey, path string) error {
-	return s.writePoolUploadRecord(ctx, path, poolUpload{Pool: pool, Project: k.Project, VM: k.VM, VMUUID: s.vmUUIDOf(ctx, k), Disk: k.Disk, Copy: true})
+func (s *Server) recordPoolCopy(ctx context.Context, pool string, k replicaKey, path string, notPointInTime bool) error {
+	return s.writePoolUploadRecord(ctx, path, poolUpload{Pool: pool, Project: k.Project, VM: k.VM, VMUUID: s.vmUUIDOf(ctx, k), Disk: k.Disk, Copy: true, NotPointInTime: notPointInTime})
+}
+
+// poolCopyNotPIT reports whether name, a file at the top level of pool on
+// this host, is recorded as a copy that is not point-in-time — by this host,
+// or (shared storage) by any host.
+func (s *Server) poolCopyNotPIT(ctx context.Context, pool, name string) bool {
+	ref, ok := s.resolvePool(ctx, pool)
+	if !ok {
+		return false
+	}
+	dir, err := fileBasedPoolDir(s.dataDir, ref)
+	if err != nil {
+		return false
+	}
+	recs, err := s.loadPoolUploads(ctx, dir)
+	if err != nil {
+		return false
+	}
+	for _, u := range recs[filepath.Join(dir, name)] {
+		if u.NotPointInTime {
+			return true
+		}
+	}
+	return false
 }
 
 // vmUUIDOf is k's VM's incarnation uuid: k's own, or the live row's when it

@@ -239,23 +239,39 @@ backups too.
 full copy an `--incremental` run falls back to when its session fails — is made
 by the strongest method the host has, tried in this order:
 
-1. **Shut-off VM:** a plain `qemu-img convert` of the disk, *without* `-U`. If
-   the VM is in fact still running, qemu's image lock fails the copy rather
-   than letting it read a changing image. A paused or pm-suspended VM is not
-   shut off (qemu still holds its image) and takes the steps below.
+1. **Shut-off VM:** a plain `qemu-img convert` of the disk, *without* `-U`.
+   "Shut off" is what libvirt reports, whatever state the VM's record is in (a
+   VM in `error` whose domain is down is copied this way). If a qemu does hold
+   the image, its lock fails the copy rather than letting it read a changing
+   image. A paused or pm-suspended VM is not shut off (qemu still holds its
+   image) and takes the steps below.
 2. **Backup session:** a full pull-mode backup of the running disk (the same
    machinery backups and `--incremental` use, with no checkpoint, so no
    incremental chain is touched). Point-in-time and crash-consistent.
 3. **External snapshot:** when no session opens (an older libvirt, a failed
-   job), an external disk-only snapshot moves the guest's writes onto an
-   overlay — quiesced through the guest agent when one answers, otherwise
-   crash-consistent — the now-frozen disk file is copied, and the overlay is
-   committed back (active block-commit and pivot). Still point-in-time. The
-   overlay is `.<disk file>.lv-pit` beside the disk. If the commit fails, the VM
-   keeps running on the overlay, the overlay is kept, a
-   `disk.pit_overlay_stranded` event and a `replication.pit_overlay_stranded`
-   notification say so, and the next replication or move of that disk commits
-   it before copying. Do not delete that file while the VM uses it.
+   job), and only for a VM libvirt reports running or paused, an external
+   disk-only snapshot moves the guest's writes onto an overlay — quiesced
+   through the guest agent when one answers, otherwise crash-consistent — the
+   now-frozen disk file is copied, and the overlay is committed back (active
+   block-commit and pivot; a commit job already running is resumed, and a
+   pivot that keeps failing is aborted so no job is left behind). Still
+   point-in-time. The overlay is `.<disk file>.lv-pit` beside the disk, on the
+   same pool, so a failover target on shared storage sees it too.
+
+   **Never delete a `.lv-pit` file.** While one exists it may hold the
+   guest's newest writes. If the commit fails, the VM keeps running on the
+   overlay and a `disk.pit_overlay_stranded` event and a
+   `replication.pit_overlay_stranded` notification say so. Every later
+   copy (replication, `lv replicate-volume`), move (`lv move-volume`, live or
+   offline), migration, backup, clone, `lv start`, reconfigure, failover restart and
+   the daemon's start-up sweep settles the overlay first: a running VM on it
+   is committed live; otherwise the overlay is committed into the disk
+   offline (`qemu-img commit`, without `-U`), the persistent definition is
+   pointed back at the disk, and only then is the overlay removed. If it
+   cannot be settled, that operation is refused. An overlay found while the
+   running VM uses its disk directly is not committed (it would overwrite
+   newer data): it is renamed `.<disk file>.lv-pit.orphan-<time>`, kept, and
+   reported (`disk.pit_overlay_set_aside`).
 4. **Last resort:** when neither 2 nor 3 can be made, the copy is what earlier
    builds always made — `qemu-img convert -U` reading the image the guest has
    open. That copy is **not point-in-time** (it is smeared over however long it
@@ -396,12 +412,16 @@ last choice:
 
 - Automatic promotion never uses one while any point-in-time replica of the
   VM exists, even an older one.
-- When a VM's only replicas are not point-in-time, automatic promotion **holds
-  the VM down** by default: the replica is left untouched, the VM's record is
-  not changed, and a `vm.failover.held` event and a `replication.promote_held`
-  notification give the reason and the exact command that promotes it by hand.
-  `lv inspect <vm>` shows the same text as `failoverHeld` while the VM's host
-  is down.
+- When a VM's only replicas are not point-in-time (or its point-in-time ones
+  are all too old and a newer one is not point-in-time), automatic promotion
+  **holds the VM down** by default: the replica is left untouched, and a
+  `vm.failover.held` event and a `replication.promote_held` notification give
+  the reason and the exact command that promotes it by hand. A VM with any
+  disk that is not on shared storage is not rescheduled either — its record
+  stays on its failed host, `lv inspect <vm>` shows the hold as `failoverHeld`,
+  and the printed command works as printed. A VM whose disks are all on shared
+  storage is restarted from its own disk by its `on_host_failure` policy, as
+  before (a `vm.failover.restart_shared` event says so).
 - A VM can opt in, one VM at a time, to automatic promotion of such a replica
   when no point-in-time one exists: give it the label
   `litevirt.auto_promote_not_point_in_time=true` in its spec's `labels`. There is
@@ -412,10 +432,16 @@ last choice:
 - A manual `lv replication promote` of one is refused with a warning unless
   `--accept-not-point-in-time` is given, whatever the label says.
 
-During a rolling upgrade, a host on an older build does not know the mark: a
-failover it coordinates promotes the newest replica as before. A replica sent to
-a receiver on an older build is recorded without the mark, and the
-`disk.replica_not_point_in_time` event says so.
+During a rolling upgrade, a host on an older build does not know the mark. A
+failover it coordinates promotes the newest replica as before when the replica
+is on that host or another older one; when the replica host is upgraded, that
+host refuses the marked replica and holds the VM with the same event and
+notification, but the older coordinator then falls back to its reschedule. A
+replica sent to a receiver on an older build is recorded without the mark, and
+the `disk.replica_not_point_in_time` event says so. An `lv` older than the
+daemon has no `--accept-not-point-in-time` flag: upgrade it to promote a marked
+replica by hand. A `lv replicate-volume` copy made with `-U` is recorded as not
+point-in-time too, and promoting it by name needs the same flag.
 
 Automatic promotion **refuses a replica older than two of the schedule's
 longest intervals plus an hour** (or one whose filename carries no readable

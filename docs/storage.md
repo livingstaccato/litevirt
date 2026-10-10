@@ -922,8 +922,9 @@ Move a VM's disk to a different pool on the same host:
 lv move-volume web-1 root warm --delete-source
 ```
 
-**Shut-off VMs** — `qemu-img convert` (without `-U`, so a VM that is in fact still
-running fails the copy on qemu's image lock) from source to destination, then the inactive
+**Shut-off VMs** (as libvirt reports them, whatever the VM's record says) —
+`qemu-img convert` (without `-U`, so a VM that is in fact still running fails
+the copy on qemu's image lock) from source to destination, then the inactive
 libvirt domain's disk source is repointed and the disk record is updated in a single
 atomic write (host, path, driver, and pool together). The redefine happens *before*
 the DB commit, so a mid-move failure rolls back cleanly; if a prior attempt already

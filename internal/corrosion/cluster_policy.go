@@ -223,6 +223,13 @@ const LabelFailoverAnyRegion = "litevirt.failover_any_region"
 // ignores it, which is the default.
 const LabelAutoPromoteNotPointInTime = "litevirt.auto_promote_not_point_in_time"
 
+// ErrPromoteHeld is wrapped by an automatic promotion that deliberately holds
+// the VM down — its only replicas are not point-in-time and it has not opted
+// in (LabelAutoPromoteNotPointInTime). The failover coordinator does not
+// reschedule a held VM that has a host-local disk: a reschedule cannot start
+// it, would re-home its record, and would hide the hold.
+var ErrPromoteHeld = errors.New("automatic promotion held")
+
 // RegionQuorum is one region's voting strength, as `lv cluster failover-scope`
 // prints it and the coordinator's regions-without-quorum gauge counts it.
 type RegionQuorum struct {

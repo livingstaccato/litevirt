@@ -42,7 +42,7 @@ var errCheckpointCommit = errors.New("replication checkpoint commit failed")
 // the replica usable cluster-wide; for a non-shared pool a cross-host target is
 // rejected with guidance (true cross-host transport of local-only storage is a
 // planned follow-up).
-func (s *Server) RunReplication(ctx context.Context, sched corrosion.BackupScheduleRecord, runAt time.Time) error {
+func (s *Server) RunReplication(ctx context.Context, sched corrosion.BackupScheduleRecord, runAt time.Time) (err error) {
 	if sched.TargetPool == "" {
 		return fmt.Errorf("replication schedule for %q missing target_pool", sched.VMName)
 	}
@@ -108,7 +108,15 @@ func (s *Server) RunReplication(ctx context.Context, sched corrosion.BackupSched
 	// pit_retry.go) makes a point-in-time copy or none: it never takes the -U
 	// copy again. Any run settles the retry owed; a cron run that again
 	// takes the -U copy owes a new one.
-	s.pitRetry.take(pitRetryKey(sched))
+	owed := s.pitRetry.take(pitRetryKey(sched))
+	defer func() {
+		// A run that failed before its copy (a peer, a pool, a session)
+		// keeps the retry owed; a point-in-time retry that could not make
+		// one does not — the cron runs next.
+		if err != nil && owed && !errors.Is(err, errNoPointInTimeCopy) && !s.pitRetry.has(pitRetryKey(sched)) {
+			s.pitRetry.set(pitRetryKey(sched))
+		}
+	}()
 	allowForceShare := !scheduler.IsPointInTimeRetry(ctx)
 
 	// Incremental path (opt-in): transfer only dirty extents into a raw replica

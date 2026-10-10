@@ -23,6 +23,7 @@ import (
 	"github.com/litevirt/litevirt/internal/image"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/network"
+	"github.com/litevirt/litevirt/internal/pitoverlay"
 )
 
 const reconcileInterval = 15 * time.Second
@@ -1715,6 +1716,25 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 // (provisioned here), firmware and resources. On failure it returns "" with
 // whether a later attempt may succeed and what failed.
 func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, spec *pb.VMSpec, diskConfigs []lv.DiskConfig) (domXML string, retryable bool, failure string) {
+	// A point-in-time copy's overlay (pitoverlay) holds the guest's newest
+	// writes when a copy's commit failed or its host died mid-window — on a
+	// shared pool it travels here with the disk. The definition built below
+	// names only the disk, so commit the overlay into it first (offline, no
+	// -U: a qemu still holding it fails this closed) and never start without
+	// it. Nothing replicated records an overlay; its fixed name beside the
+	// disk is what finds it.
+	for _, dc := range diskConfigs {
+		had, err := pitoverlay.Settle(ctx, dc.Path)
+		if err != nil {
+			slog.Error("reconciler: a point-in-time overlay holds writes the disk lacks and could not be committed; not defining the VM",
+				"vm", vm.Name, "disk", dc.Name, "overlay", pitoverlay.Path(dc.Path), "error", err)
+			return "", true, fmt.Sprintf("disk %s: commit its point-in-time overlay %s: %v", dc.Name, pitoverlay.Path(dc.Path), err)
+		}
+		if had {
+			slog.Warn("reconciler: committed a point-in-time overlay into the disk before defining the VM",
+				"vm", vm.Name, "disk", dc.Name, "overlay", pitoverlay.Path(dc.Path))
+		}
+	}
 	// Check for cloud-init ISO. The reconciler acts on a stored (possibly
 	// peer-replicated) row, so build the ISO path through the validated builder
 	// — a malformed vm.Name must not escape the cloudinit dir.

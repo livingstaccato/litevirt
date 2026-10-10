@@ -3,13 +3,17 @@ package libvirtfake
 import (
 	"fmt"
 	"os"
+
+	"github.com/litevirt/litevirt/internal/qcow2"
 )
 
 // The point-in-time copy's external-snapshot layer (grpcapi.PointInTimeSnapshotter,
-// libvirt.Client.SnapshotDiskExternal and friends), modelled: a snapshot
-// creates the overlay file and puts the domain on it, a commit takes the
-// domain off it. The domain's disk file itself is never written, so a copy
-// of the "frozen" file is the disk's content.
+// libvirt.Client.SnapshotDiskExternal and friends), modelled: a snapshot of a
+// running or paused domain creates the overlay — a real qcow2 backed by the
+// disk, so qemu-img can commit it offline — and puts the domain on it; a
+// commit takes the domain off it. The domain's disk file itself is never
+// written, so a copy of the "frozen" file is the disk's content. A failed
+// commit models a pivot that never landed: the domain stays on the overlay.
 
 // SetPITFailures makes every later snapshot or commit fail with the error
 // given (nil: succeed).
@@ -25,10 +29,13 @@ func (f *Fake) SnapshotDiskExternal(domain, diskPath, overlay string) (bool, err
 	if f.pitSnapErr != nil {
 		return false, f.pitSnapErr
 	}
+	if st := f.domains[domain]; st != StateRunning && st != StatePaused {
+		return false, fmt.Errorf("libvirtfake: domain %s is %q; no live snapshot", domain, st)
+	}
 	if _, err := os.Lstat(overlay); err == nil {
 		return false, fmt.Errorf("libvirtfake: overlay %s exists", overlay)
 	}
-	if err := os.WriteFile(overlay, []byte("libvirtfake overlay"), 0o600); err != nil {
+	if err := qcow2.CreateWithBackingFormat(overlay, diskPath, "qcow2", 0, nil); err != nil {
 		return false, err
 	}
 	if f.pitOn == nil {
@@ -38,11 +45,13 @@ func (f *Fake) SnapshotDiskExternal(domain, diskPath, overlay string) (bool, err
 	return false, nil
 }
 
-func (f *Fake) CommitDiskOverlay(domain, diskPath, overlay string) error {
+func (f *Fake) CommitDiskOverlay(domain, diskPath, overlay, diskFormat string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.pitCommitErr != nil {
-		return f.pitCommitErr
+	if st := f.domains[domain]; st == StateRunning || st == StatePaused {
+		if f.pitCommitErr != nil {
+			return f.pitCommitErr
+		}
 	}
 	if f.pitOn[overlay] == domain {
 		delete(f.pitOn, overlay)

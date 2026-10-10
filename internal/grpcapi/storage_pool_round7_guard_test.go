@@ -183,6 +183,7 @@ func TestPoolRound7_AReplicateVolumeCopyIsTheVMsReplica(t *testing.T) {
 	}
 	upsertPool(t, s, corrosion.StoragePoolRecord{HostName: s.hostName, Name: "pa", Driver: "dir", Target: own, Project: "acme"})
 	insertPromotableVM(t, s, "web", "acme", s.hostName, "root")
+	s.SetBackupSource(sessionSource()) // web runs: its copy is point-in-time (layer 1)
 	pat := hostPathEngineCtx(t, s, "pat", "Operator", projectRBACBase("acme"))
 	// The daemon names an operator's copy; only an admin names the file.
 	copyRec := &streamRecorder[pb.ReplicateVolumeProgress]{ctx: pat}

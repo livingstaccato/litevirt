@@ -141,7 +141,7 @@ func (f *fakePITSnapshotter) SnapshotDiskExternal(domain, diskPath, overlay stri
 	return f.quiesce, nil
 }
 
-func (f *fakePITSnapshotter) CommitDiskOverlay(domain, diskPath, overlay string) error {
+func (f *fakePITSnapshotter) CommitDiskOverlay(domain, diskPath, overlay, _ string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, "commit")
@@ -210,6 +210,9 @@ func pitServer(t *testing.T) (*Server, string, string) {
 	s := testServer(t)
 	s.dataDir = t.TempDir()
 	dir := seedReplicationVM(t, s, "web", "running")
+	fake := libvirtfake.New()
+	fake.SetState("web", libvirtfake.StateRunning)
+	s.virt = fake
 	disks, err := corrosion.GetVMDisks(context.Background(), s.db, "web")
 	if err != nil || len(disks) != 1 {
 		t.Fatalf("disks: %v %v", disks, err)
@@ -359,8 +362,9 @@ func TestRunReplication_ExternalSnapshotWhenNoSession(t *testing.T) {
 	}
 }
 
-// A snapshot that fails leaves no overlay behind, even when libvirt left the
-// file: the next layer runs, and nothing litters the disk's directory.
+// A snapshot that fails leaves nothing in the overlay's place, even when
+// libvirt left a file there: the running VM is on its disk, so the file is
+// set aside (kept, never deleted) and the next layer runs.
 //
 // Mutation "no cleanup after a failed snapshot": copyViaExternalSnapshot
 // returns without healPITOverlay — red.
@@ -375,6 +379,9 @@ func TestRunReplication_FailedSnapshotLeavesNoOverlay(t *testing.T) {
 	}
 	if _, err := os.Stat(pitOverlayPath(live)); !os.IsNotExist(err) {
 		t.Errorf("a failed snapshot's overlay was left behind (%v)", err)
+	}
+	if aside, _ := filepath.Glob(pitOverlayPath(live) + ".orphan-*"); len(aside) != 1 {
+		t.Errorf("the left file was not kept aside: %v", aside)
 	}
 }
 

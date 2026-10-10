@@ -200,7 +200,7 @@ func (s *Server) ReplicateVolume(req *pb.ReplicateVolumeRequest, stream grpc.Ser
 	if filepath.Dir(dstPath) == filepath.Clean(dstDir) {
 		recErr := errors.New("its VM's row cannot be read")
 		if k, ok := s.replicaKeyFor(ctx, req.VmName, req.DiskName); ok {
-			recErr = s.recordPoolCopy(ctx, req.TargetPool, k, dstPath)
+			recErr = s.recordPoolCopy(ctx, req.TargetPool, k, dstPath, !res.method.pointInTime())
 		}
 		if recErr != nil {
 			slog.Warn("replicate: copy written but not recorded as the VM's; an admin can still promote it by name", "path", dstPath, "error", recErr)

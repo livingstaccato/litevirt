@@ -1449,6 +1449,11 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 	if vm.HostName != s.hostName {
 		return nil, status.Errorf(codes.Aborted, "ownership of %q moved to %s mid-operation; retry", req.Name, vm.HostName)
 	}
+	// A point-in-time overlay an earlier copy left holds writes the disk's
+	// file lacks: settle it before anything reads or starts the disk.
+	if err := s.settlePITOverlays(ctx, vm); err != nil {
+		return nil, err
+	}
 	// A VM failover moved here still stopped has its domain (re)defined by
 	// this host's reconciler under the VM's start lease. Take that lease for
 	// the start, so the start never runs into the middle of the define.
@@ -4084,6 +4089,11 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 			}
 			if fresh.ActiveOperationID != "" {
 				return nil, status.Errorf(codes.FailedPrecondition, "cannot reconfigure %q: an operation is in progress", req.Name)
+			}
+			// A point-in-time overlay an earlier copy left holds writes the
+			// disk's file lacks; the redefine below would drop it.
+			if err := s.settlePITOverlays(ctx, fresh); err != nil {
+				return nil, err
 			}
 			repair = compose.IsTransientOrErrorState(fresh.State)
 

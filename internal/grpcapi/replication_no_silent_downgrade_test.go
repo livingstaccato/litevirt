@@ -130,6 +130,6 @@ func TestRunReplication_APausedSourceDoesNotFallBack(t *testing.T) {
 	}
 	recs, err := listReplicaRecords(dir, "", "web-3")
 	if err != nil || len(recs) != 1 || !recs[0].NotPointInTime {
-		t.Fatalf("records %+v (%v): a paused source's plain copy is not point-in-time and must be marked", recs, err)
+		t.Fatalf("records %+v (%v): a paused source's copy is the -U one, not point-in-time, and must be marked", recs, err)
 	}
 }

@@ -1411,6 +1411,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Point-in-time copies fall back to an external disk-only snapshot when
 	// no backup session opens (grpcapi/pit_copy.go, layer 2).
 	svc.SetPointInTimeSnapshotter(d.virt)
+	// A daemon that died while a layer-2 copy was in its window left the VM
+	// on the overlay with no event: settle every such overlay now.
+	go svc.SweepPITOverlays(ctx)
 
 	// wire the WebAuthn second-factor engine. Empty
 	// rp_id disables — the gRPC handlers then return Unimplemented

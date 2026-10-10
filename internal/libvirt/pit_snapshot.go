@@ -3,6 +3,7 @@ package libvirt
 import (
 	"encoding/xml"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -27,6 +28,7 @@ import (
 // *golibvirt.Libvirt in production; a model in the tests.
 type pitAPI interface {
 	DomainLookupByName(name string) (golibvirt.Domain, error)
+	DomainGetState(dom golibvirt.Domain, flags uint32) (int32, int32, error)
 	DomainGetXMLDesc(dom golibvirt.Domain, flags golibvirt.DomainXMLFlags) (string, error)
 	DomainDefineXML(xml string) (golibvirt.Domain, error)
 	DomainSnapshotCreateXML(dom golibvirt.Domain, xml string, flags uint32) (golibvirt.DomainSnapshot, error)
@@ -38,11 +40,29 @@ type pitAPI interface {
 var _ pitAPI = (*golibvirt.Libvirt)(nil)
 
 // pitCommitPoll and pitCommitTimeout bound the wait for an active commit to
-// reach its ready state. Variables so the tests run without the real waits.
+// reach its ready state; pitPivotTries bounds the pivot attempts. Variables so
+// the tests run without the real waits.
 var (
 	pitCommitPoll    = 500 * time.Millisecond
 	pitCommitTimeout = 30 * time.Minute
+	pitPivotTries    = 5
 )
+
+// pitDomainActive reports whether the domain is running or paused — the only
+// states in which a disk-only snapshot is taken live and an active commit can
+// run. libvirt would also snapshot an inactive domain (offline, with
+// qemu-img), which no layer-2 copy wants.
+func pitDomainActive(v pitAPI, dom golibvirt.Domain) (bool, error) {
+	st, _, err := v.DomainGetState(dom, 0)
+	if err != nil {
+		return false, err
+	}
+	switch golibvirt.DomainState(st) {
+	case golibvirt.DomainRunning, golibvirt.DomainPaused, golibvirt.DomainBlocked, golibvirt.DomainPmsuspended:
+		return true, nil
+	}
+	return false, nil
+}
 
 // SnapshotDiskExternal creates an external disk-only snapshot of the disk
 // whose source is diskPath, putting the guest's new writes on overlay. It asks
@@ -57,6 +77,9 @@ func snapshotDiskExternal(v pitAPI, domain, diskPath, overlay string) (bool, err
 	dom, err := v.DomainLookupByName(domain)
 	if err != nil {
 		return false, fmt.Errorf("lookup domain %s: %w", domain, err)
+	}
+	if active, err := pitDomainActive(v, dom); err != nil || !active {
+		return false, fmt.Errorf("domain %s is not running or paused (%v); no live snapshot is taken", domain, err)
 	}
 	domXML, err := v.DomainGetXMLDesc(dom, 0)
 	if err != nil {
@@ -106,60 +129,170 @@ func pitSnapshotXML(domXML, diskPath, overlay string) (string, error) {
 
 // CommitDiskOverlay merges overlay back into diskPath and pivots the domain
 // onto diskPath: an active block-commit of the disk running on overlay. A
-// domain not running on overlay is left alone (nil). The persistent definition
-// is checked afterwards too: one that still names overlay is rewritten to
-// diskPath, since a restart from the overlay would lose every write made after
-// the pivot. The overlay file itself is the caller's to remove, once
-// DomainUsesFile says nothing references it.
-func (c *Client) CommitDiskOverlay(domain, diskPath, overlay string) error {
-	return commitDiskOverlay(c.virt, domain, diskPath, overlay)
+// commit job already running on that disk (one a dead daemon or a cancelled
+// call started) is resumed rather than started again. A pivot that keeps
+// failing is aborted, so the domain is left on the overlay with no job and the
+// next call can try again. The live part runs only on an active domain; an
+// inactive one is the caller's to commit offline (pitoverlay).
+//
+// The persistent definition is then repaired: a disk entry that still names
+// overlay is pointed back at diskPath with diskFormat as its driver type and
+// no <backingStore> — libvirt's post-snapshot entry is the overlay's, and a
+// restart from it would lose every write made after the pivot. The overlay
+// file itself is the caller's to remove, once DomainUsesFile says nothing
+// references it.
+func (c *Client) CommitDiskOverlay(domain, diskPath, overlay, diskFormat string) error {
+	return commitDiskOverlay(c.virt, domain, diskPath, overlay, diskFormat)
 }
 
-func commitDiskOverlay(v pitAPI, domain, diskPath, overlay string) error {
+func commitDiskOverlay(v pitAPI, domain, diskPath, overlay, diskFormat string) error {
 	dom, err := v.DomainLookupByName(domain)
 	if err != nil {
 		return fmt.Errorf("lookup domain %s: %w", domain, err)
 	}
-	live, err := v.DomainGetXMLDesc(dom, 0)
+	active, err := pitDomainActive(v, dom)
 	if err != nil {
-		return fmt.Errorf("dump domain xml: %w", err)
+		return fmt.Errorf("domain %s state: %w", domain, err)
 	}
-	if dev := diskTargetForSource(live, overlay); dev != "" {
+	if active {
+		live, err := v.DomainGetXMLDesc(dom, 0)
+		if err != nil {
+			return fmt.Errorf("dump domain xml: %w", err)
+		}
+		if dev := diskTargetForSource(live, overlay); dev != "" {
+			if err := activeCommitAndPivot(v, dom, dev, diskPath); err != nil {
+				return err
+			}
+			after, err := v.DomainGetXMLDesc(dom, 0)
+			if err != nil {
+				return fmt.Errorf("dump domain xml after pivot: %w", err)
+			}
+			if diskTargetForSource(after, overlay) != "" {
+				return fmt.Errorf("disk %s still runs on %s after the pivot", dev, overlay)
+			}
+		}
+	}
+	return repairPersistentDisk(v, dom, diskPath, overlay, diskFormat)
+}
+
+// activeCommitAndPivot commits dev's active layer down into diskPath and
+// pivots, resuming a commit job already there.
+func activeCommitAndPivot(v pitAPI, dom golibvirt.Domain, dev, diskPath string) error {
+	found, _, _, _, _, err := v.DomainGetBlockJobInfo(dom, dev, 0)
+	if err != nil {
+		return fmt.Errorf("block job of %s: %w", dev, err)
+	}
+	if found == 0 {
 		if err := v.DomainBlockCommit(dom, dev, golibvirt.OptString{diskPath}, golibvirt.OptString{}, 0,
 			golibvirt.DomainBlockCommitActive); err != nil {
 			return fmt.Errorf("block-commit %s: %w", dev, err)
 		}
-		if err := waitPITCommitReady(v, dom, dev); err != nil {
-			_ = v.DomainBlockJobAbort(dom, dev, 0)
-			return fmt.Errorf("block-commit %s: %w", dev, err)
-		}
-		if err := v.DomainBlockJobAbort(dom, dev, golibvirt.DomainBlockJobAbortPivot); err != nil {
-			return fmt.Errorf("pivot %s onto %s: %w", dev, diskPath, err)
-		}
-		after, err := v.DomainGetXMLDesc(dom, 0)
-		if err != nil {
-			return fmt.Errorf("dump domain xml after pivot: %w", err)
-		}
-		if diskTargetForSource(after, overlay) != "" {
-			return fmt.Errorf("disk %s still runs on %s after the pivot", dev, overlay)
-		}
 	}
+	if err := waitPITCommitReady(v, dom, dev); err != nil {
+		_ = v.DomainBlockJobAbort(dom, dev, 0)
+		return fmt.Errorf("block-commit %s: %w", dev, err)
+	}
+	var perr error
+	for i := 0; i < pitPivotTries; i++ {
+		if perr = v.DomainBlockJobAbort(dom, dev, golibvirt.DomainBlockJobAbortPivot); perr == nil {
+			return nil
+		}
+		time.Sleep(pitCommitPoll)
+	}
+	// Leave no job behind: the domain stays on the overlay, which keeps the
+	// guest's writes, and the next call starts the commit afresh.
+	_ = v.DomainBlockJobAbort(dom, dev, 0)
+	return fmt.Errorf("pivot %s onto %s (%d tries): %w", dev, diskPath, pitPivotTries, perr)
+}
+
+// repairPersistentDisk points a persistent disk entry that names overlay
+// back at diskPath.
+func repairPersistentDisk(v pitAPI, dom golibvirt.Domain, diskPath, overlay, diskFormat string) error {
 	inactive, err := v.DomainGetXMLDesc(dom, golibvirt.DomainXMLInactive)
 	if err != nil {
 		return fmt.Errorf("dump persistent domain xml: %w", err)
 	}
-	if dev := diskTargetForSource(inactive, overlay); dev != "" {
-		fixed, changed, err := RewriteDiskSourceFile(inactive, dev, overlay, diskPath)
-		if err != nil {
-			return fmt.Errorf("repoint persistent disk %s to %s: %w", dev, diskPath, err)
-		}
-		if changed {
-			if _, err := v.DomainDefineXML(fixed); err != nil {
-				return fmt.Errorf("redefine persistent disk %s on %s: %w", dev, diskPath, err)
-			}
+	fixed, changed, err := repairPITDiskXML(inactive, overlay, diskPath, diskFormat)
+	if err != nil {
+		return fmt.Errorf("repoint persistent disk to %s: %w", diskPath, err)
+	}
+	if changed {
+		if _, err := v.DomainDefineXML(fixed); err != nil {
+			return fmt.Errorf("redefine persistent disk on %s: %w", diskPath, err)
 		}
 	}
 	return nil
+}
+
+// repairPITDiskXML rewrites the <disk> element whose <source file> is overlay:
+// the source becomes diskPath, the driver type diskFormat, and every
+// <backingStore> inside it goes (libvirt re-probes the chain on define).
+func repairPITDiskXML(domXML, overlay, diskPath, diskFormat string) (string, bool, error) {
+	if diskFormat == "" {
+		diskFormat = "qcow2"
+	}
+	for _, q := range []string{"'", "\""} {
+		marker := "file=" + q + overlay + q
+		i := strings.Index(domXML, marker)
+		if i < 0 {
+			continue
+		}
+		start := strings.LastIndex(domXML[:i], "<disk ")
+		endRel := strings.Index(domXML[i:], "</disk>")
+		if start < 0 || endRel < 0 {
+			return "", false, fmt.Errorf("no <disk> element around %s", overlay)
+		}
+		end := i + endRel
+		disk := domXML[start:end]
+		disk = strings.Replace(disk, marker, "file="+q+diskPath+q, 1)
+		disk = stripBackingStore(disk)
+		disk = pitDriverTypeRE.ReplaceAllString(disk, "${1}"+diskFormat+"${3}")
+		return domXML[:start] + disk + domXML[end:], true, nil
+	}
+	return domXML, false, nil
+}
+
+var pitDriverTypeRE = regexp.MustCompile(`(<driver\b[^>]*\btype=['"])([^'"]*)(['"])`)
+
+// stripBackingStore removes every <backingStore> element (self-closing or
+// nested) from a disk element's text.
+func stripBackingStore(disk string) string {
+	for {
+		i := strings.Index(disk, "<backingStore")
+		if i < 0 {
+			return disk
+		}
+		gt := strings.Index(disk[i:], ">")
+		if gt < 0 {
+			return disk
+		}
+		if disk[i+gt-1] == '/' { // <backingStore/>
+			disk = disk[:i] + disk[i+gt+1:]
+			continue
+		}
+		depth, j := 0, i
+		for j < len(disk) {
+			o := strings.Index(disk[j:], "<backingStore")
+			c := strings.Index(disk[j:], "</backingStore>")
+			if c < 0 {
+				return disk
+			}
+			if o >= 0 && o < c {
+				og := strings.Index(disk[j+o:], ">")
+				if disk[j+o+og-1] != '/' {
+					depth++
+				}
+				j += o + og + 1
+				continue
+			}
+			depth--
+			j += c + len("</backingStore>")
+			if depth == 0 {
+				break
+			}
+		}
+		disk = disk[:i] + disk[j:]
+	}
 }
 
 func waitPITCommitReady(v pitAPI, dom golibvirt.Domain, dev string) error {
@@ -172,7 +305,7 @@ func waitPITCommitReady(v pitAPI, dom golibvirt.Domain, dev string) error {
 		if found == 0 {
 			return fmt.Errorf("the commit job ended before it was ready to pivot")
 		}
-		if end > 0 && cur >= end {
+		if cur >= end {
 			return nil
 		}
 		if time.Now().After(deadline) {

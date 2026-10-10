@@ -221,6 +221,7 @@ func newCTCreateCmd() *cobra.Command {
 	var restartMax int32
 	var onHostFailure, confinement string
 	var privileged bool
+	var mountFlags, deviceFlags []string
 	cmd := &cobra.Command{
 		Use:   "create <name>",
 		Short: "Create a new container (does not start it)",
@@ -229,6 +230,13 @@ func newCTCreateCmd() *cobra.Command {
 			nics, err := parseCTNetworks(networks)
 			if err != nil {
 				return err
+			}
+			mounts, devices, err := parseCTHostAccess(mountFlags, deviceFlags)
+			if err != nil {
+				return err
+			}
+			if useLocal && (len(mounts) > 0 || len(devices) > 0) {
+				return fmt.Errorf("--mount and --device go through the daemon, which judges them against containers.bind_mount_paths / device_paths; drop --local")
 			}
 			if useLocal {
 				r := lxc.NewLxcRunner()
@@ -250,6 +258,7 @@ func newCTCreateCmd() *cobra.Command {
 					Cpu: int32(cpu), MemoryMib: int32(memMiB), Networks: nics,
 					Project: project, OnHostFailure: onHostFailure,
 					Privileged: privileged, Confinement: confinement,
+					Mounts: mounts, Devices: devices,
 				}
 				if restart != "" && restart != "none" {
 					req.Restart = &pb.RestartPolicy{
@@ -280,6 +289,10 @@ func newCTCreateCmd() *cobra.Command {
 	cmd.Flags().StringVar(&project, "project", "", "Tenancy project (default: _default)")
 	cmd.Flags().BoolVar(&privileged, "privileged", false, "Create without a user namespace, as earlier releases did (Admin only; default: unprivileged, an id range of its own)")
 	cmd.Flags().StringVar(&confinement, "confinement", "", "default | legacy (legacy: AppArmor nesting allowed, the template's seccomp and capabilities; Admin only)")
+	cmd.Flags().StringArrayVar(&mountFlags, "mount", nil,
+		"Bind-mount a host path: <host-path>:<container-path>[:ro|rw] (repeatable; read-only unless :rw). Admin only; the host path must resolve under the host's containers.bind_mount_paths")
+	cmd.Flags().StringArrayVar(&deviceFlags, "device", nil,
+		"Pass a host device node through: <host-path>[:<container-path>] (repeatable, e.g. /dev/ttyUSB0). Admin only; must resolve under the host's containers.device_paths")
 	cmd.Flags().BoolVar(&useLocal, "local", false, "Use the host-local lxc-* runtime instead of gRPC")
 	cmd.Flags().StringVar(&restart, "restart", "", "Auto-restart policy: none | on-failure | always (default none). An operator `lv ct stop` is never auto-restarted; any other stop is treated as unexpected (containers have no stop reason).")
 	cmd.Flags().Int32Var(&restartMax, "restart-max-attempts", 0, "Max restart attempts within the window (0 = unlimited)")
@@ -712,3 +725,40 @@ hosts.) Run against the owning host (set LV_HOST).`,
 
 // keep emptypb used (gRPC-generated stubs reference it transitively)
 var _ = emptypb.Empty{}
+
+// parseCTHostAccess parses --mount <host>:<ct>[:ro|rw] and --device
+// <host>[:<ct>] into the request's mounts and devices. Paths are judged by the
+// daemon; this only splits them.
+func parseCTHostAccess(mounts, devices []string) ([]*pb.ContainerMount, []*pb.ContainerDevice, error) {
+	var ms []*pb.ContainerMount
+	for _, m := range mounts {
+		f := strings.Split(m, ":")
+		if len(f) < 2 || len(f) > 3 || f[0] == "" || f[1] == "" {
+			return nil, nil, fmt.Errorf("--mount %q: want <host-path>:<container-path>[:ro|rw]", m)
+		}
+		rw := false
+		if len(f) == 3 {
+			switch f[2] {
+			case "ro":
+			case "rw":
+				rw = true
+			default:
+				return nil, nil, fmt.Errorf("--mount %q: the mode is ro or rw, not %q", m, f[2])
+			}
+		}
+		ms = append(ms, &pb.ContainerMount{HostPath: f[0], ContainerPath: f[1], ReadWrite: rw})
+	}
+	var ds []*pb.ContainerDevice
+	for _, d := range devices {
+		f := strings.Split(d, ":")
+		if len(f) > 2 || f[0] == "" {
+			return nil, nil, fmt.Errorf("--device %q: want <host-path>[:<container-path>]", d)
+		}
+		dev := &pb.ContainerDevice{HostPath: f[0]}
+		if len(f) == 2 {
+			dev.ContainerPath = f[1]
+		}
+		ds = append(ds, dev)
+	}
+	return ms, ds, nil
+}

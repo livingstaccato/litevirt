@@ -199,6 +199,15 @@ type CreateOpts struct {
 	IDMap *IDMap
 	// PidsMax is written as lxc.cgroup2.pids.max when positive.
 	PidsMax int
+	// Mounts and Devices are host paths passed into the container. Create
+	// judges them against the runner's HostAccess on this host (mounts.go);
+	// the caller has already required the admin role.
+	Mounts  []Mount
+	Devices []Device
+
+	// resolved by Create before anything is written (resolveHostAccess).
+	resolvedMounts  []resolvedMount
+	resolvedDevices []resolvedDevice
 }
 
 // Validate checks cross-field invariants before any shell-out.
@@ -254,6 +263,10 @@ type LxcRunner struct {
 	// SubIDSpan is the whole id span containers are allocated from; root's
 	// subordinate range is added for all of it at once (ensureRootSubIDs).
 	SubIDSpan *IDMap
+
+	// HostAccess is what this host lets containers reach: the prefixes host
+	// bind mounts and device nodes must resolve under. Empty allows none.
+	HostAccess HostAccess
 
 	probeOnce     sync.Once
 	probeIDMapped bool
@@ -311,6 +324,15 @@ func (r *LxcRunner) Create(ctx context.Context, opts CreateOpts) (*Container, er
 	}
 	if opts.PidsMax == 0 {
 		opts.PidsMax = r.DefaultPidsMax
+	}
+	// Host mounts and devices are judged before anything is created, so a
+	// refusal leaves nothing behind.
+	if len(opts.Mounts) > 0 || len(opts.Devices) > 0 {
+		rm, rd, err := ResolveHostAccess(opts.Mounts, opts.Devices, r.HostAccess)
+		if err != nil {
+			return nil, fmt.Errorf("container %q: %w", opts.Name, err)
+		}
+		opts.resolvedMounts, opts.resolvedDevices = rm, rd
 	}
 	if opts.Template != "download" {
 		rootfs, ok, err := resolveRootfs(opts.Template)
@@ -1154,6 +1176,7 @@ func (r *LxcRunner) finalizeContainerConfig(opts CreateOpts) error {
 		cfg += fmt.Sprintf("%s = %d\n", pidsMaxKey, opts.PidsMax)
 	}
 	cfg = withSecurityBlock(cfg, renderSecurityBlock(opts.Confinement, opts.IDMap, opts.IDMap != nil && r.useIDMappedMount()))
+	cfg = withHostAccessBlock(cfg, renderHostAccessBlock(opts.resolvedMounts, opts.resolvedDevices))
 
 	if err := os.WriteFile(path, []byte(cfg), 0o644); err != nil {
 		return err

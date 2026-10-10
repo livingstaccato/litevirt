@@ -416,6 +416,15 @@ func (r *LxcRunner) prepareStart(name string) error {
 	if sec.Converting {
 		return fmt.Errorf("container %q has an unfinished conversion (to %s); finish it before starting: %s", name, describeConvert(sec.ConvertTo), convertCommand(name, sec.ConvertTo))
 	}
+	// Host mounts and devices are judged again, on this host, as they are
+	// now: a path that became a symlink or left the allowed tree, or a
+	// container brought here from a host that allowed what this one does not,
+	// is refused before lxc-start follows it.
+	if cfg, rerr := os.ReadFile(filepath.Join(r.lxcpath(), name, "config")); rerr == nil {
+		if err := VerifyHostAccess(string(cfg), r.HostAccess); err != nil {
+			return fmt.Errorf("container %q: %w (containers.bind_mount_paths / containers.device_paths on this host)", name, err)
+		}
+	}
 	// LXC refuses an unprivileged container whose range lies outside root's
 	// subordinate ranges (when the host hands them out): ensured on every
 	// start, so a container this host never created starts too.

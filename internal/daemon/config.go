@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -249,6 +250,14 @@ type ContainersConfig struct {
 	// "auto" (an idmapped mount where this host supports one, otherwise its
 	// files are shifted into the range), "on" or "off". Default "auto".
 	IDMappedRootfs string `yaml:"idmapped_rootfs"`
+	// BindMountPaths and DevicePaths are the host path prefixes an admin may
+	// bind-mount into a container, and the device nodes they may pass through.
+	// A path is resolved on this host (symlinks followed) and must land under
+	// one, at create and again at every start. Empty (the default) allows
+	// none. Per host: a container moved to a host that does not allow its
+	// paths does not start there.
+	BindMountPaths []string `yaml:"bind_mount_paths,omitempty"`
+	DevicePaths    []string `yaml:"device_paths,omitempty"`
 }
 
 // validate refuses container defaults that cannot work.
@@ -263,6 +272,16 @@ func (c ContainersConfig) validate() error {
 	}
 	if c.IDMapRanges <= 0 {
 		return fmt.Errorf("config containers.idmap_ranges: %d, want at least 1", c.IDMapRanges)
+	}
+	for _, p := range c.BindMountPaths {
+		if !filepath.IsAbs(p) {
+			return fmt.Errorf("config containers.bind_mount_paths: %q is not an absolute path", p)
+		}
+	}
+	for _, p := range c.DevicePaths {
+		if !filepath.IsAbs(p) || !(filepath.Clean(p) == "/dev" || strings.HasPrefix(filepath.Clean(p), "/dev/")) {
+			return fmt.Errorf("config containers.device_paths: %q is not a path under /dev", p)
+		}
 	}
 	// The ranges must leave the host's own ids (0-65535) alone and fit in 32
 	// bits (4294967295 is the kernel's invalid id).

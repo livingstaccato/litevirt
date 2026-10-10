@@ -35,6 +35,7 @@ func (a *LXCRuntimeAdapter) CreateContainer(ctx context.Context, opts CreateCont
 		CPULimit: opts.CPULimit, MemoryMiB: opts.MemoryMiB,
 		Network: nics, Labels: opts.Labels,
 		Confinement: opts.Confinement, IDMap: idmap,
+		Mounts: lxcMounts(opts.Mounts), Devices: lxcDevices(opts.Devices),
 	})
 	if err != nil {
 		return nil, err
@@ -185,4 +186,20 @@ func (a *LXCRuntimeAdapter) RevertContainerConverting(ctx context.Context, name 
 func (a *LXCRuntimeAdapter) SubIDConflict(base, size int64) (string, bool) {
 	owner, hit := lxc.SubIDConflict(&lxc.IDMap{Base: base, Size: size})
 	return owner, hit
+}
+
+func lxcMounts(in []ContainerMountOpt) []lxc.Mount {
+	out := make([]lxc.Mount, 0, len(in))
+	for _, m := range in {
+		out = append(out, lxc.Mount{HostPath: m.HostPath, ContainerPath: m.ContainerPath, ReadWrite: m.ReadWrite})
+	}
+	return out
+}
+
+func lxcDevices(in []ContainerDeviceOpt) []lxc.Device {
+	out := make([]lxc.Device, 0, len(in))
+	for _, d := range in {
+		out = append(out, lxc.Device{HostPath: d.HostPath, ContainerPath: d.ContainerPath})
+	}
+	return out
 }

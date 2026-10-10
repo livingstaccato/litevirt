@@ -1879,6 +1879,20 @@ type CreateContainerOpts struct {
 	// IDMapBase makes the container unprivileged in the range starting there;
 	// 0 is privileged.
 	IDMapBase int64
+	// Mounts and Devices are host paths passed into the container (admin
+	// only); the runtime judges them against this host's allowed prefixes.
+	Mounts  []ContainerMountOpt
+	Devices []ContainerDeviceOpt
+}
+
+// ContainerMountOpt mirrors lxc.Mount; ContainerDeviceOpt mirrors lxc.Device.
+type ContainerMountOpt struct {
+	HostPath, ContainerPath string
+	ReadWrite               bool
+}
+
+type ContainerDeviceOpt struct {
+	HostPath, ContainerPath string
 }
 
 // ContainerNICOpt mirrors lxc.NetworkAttach.

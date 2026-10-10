@@ -129,6 +129,11 @@ func (s *Server) CloneContainer(ctx context.Context, req *pb.CloneContainerReque
 	if s.containerRuntime == nil {
 		return nil, status.Error(codes.Unavailable, "container runtime not wired on this host")
 	}
+	// The clone holds its source's host mounts and devices: admin only.
+	if err := cloneHostAccessAllowed(ctx, *src); err != nil {
+		s.audit(ctx, "ct.clone", req.Target, "source="+req.Source+" host mounts/devices", "denied")
+		return nil, err
+	}
 	// Consistent rootfs: clone a template or a stopped container (a running
 	// container's rootfs isn't quiescent). Mirrors CloneVM.
 	if !src.IsTemplate && src.State != "stopped" {

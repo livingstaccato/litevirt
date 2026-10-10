@@ -181,6 +181,26 @@ type ContainerCreateSpec struct {
 	// and let any node report them.
 	IDMapBase   int64  `json:"idmap_base,omitempty"`
 	Confinement string `json:"confinement,omitempty"`
+	// Mounts and Devices are the host paths an admin passed into the
+	// container at create. They are also in its LXC config, which travels
+	// with it; these let a relocation recreate them (judged again by the
+	// recreating host) and let any node report them. Setting them is gated
+	// on usb_mounts_memory_v1, so no older peer rewrites a spec holding them.
+	Mounts  []ContainerHostMount  `json:"mounts,omitempty"`
+	Devices []ContainerHostDevice `json:"devices,omitempty"`
+}
+
+// ContainerHostMount is one host bind mount of a ContainerCreateSpec.
+type ContainerHostMount struct {
+	HostPath      string `json:"host_path"`
+	ContainerPath string `json:"container_path"`
+	ReadWrite     bool   `json:"read_write,omitempty"`
+}
+
+// ContainerHostDevice is one host device node of a ContainerCreateSpec.
+type ContainerHostDevice struct {
+	HostPath      string `json:"host_path"`
+	ContainerPath string `json:"container_path,omitempty"`
 }
 
 // ContainerNetwork is one NIC of a ContainerCreateSpec. It carries the create-

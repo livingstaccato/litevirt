@@ -87,6 +87,10 @@ func (s *Server) authorizeContainerCreate(ctx context.Context, req *pb.CreateCon
 		s.audit(ctx, "ct.create", req.Name, fmt.Sprintf("privileged=%v confinement=%s", req.Privileged, req.Confinement), "denied")
 		return err
 	}
+	if err := s.containerHostAccessRequest(ctx, req.Mounts, req.Devices); err != nil {
+		s.audit(ctx, "ct.create", req.Name, hostAccessAudit(req.Mounts, req.Devices), "denied")
+		return err
+	}
 	return nil
 }
 
@@ -284,12 +288,15 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		}
 		idmapBase = b
 	}
+	specMounts, specDevices := hostAccessSpec(req.Mounts, req.Devices)
+	optMounts, optDevices := hostAccessOpts(corrosion.ContainerCreateSpec{Mounts: specMounts, Devices: specDevices})
 	info, err := s.containerRuntime.CreateContainer(ctx, CreateContainerOpts{
 		Name: req.Name, Template: req.Template,
 		Distro: req.Distro, Release: req.Release, Arch: req.Arch,
 		CPULimit: int(req.Cpu), MemoryMiB: int(req.MemoryMib),
 		Networks: plan.lxcNics, Labels: req.Labels,
 		Confinement: confinement, IDMapBase: idmapBase,
+		Mounts: optMounts, Devices: optDevices,
 	})
 	if err != nil {
 		_ = s.releaseContainerNICs(ctx, req.Name)
@@ -306,6 +313,8 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		OwnerID:     randid.New(),
 		IDMapBase:   idmapBase,
 		Confinement: confinement,
+		Mounts:      specMounts,
+		Devices:     specDevices,
 	}
 	s.stampContainerOwner(info.Name, req.Project, corrosion.EncodeCreateSpec(createSpec))
 
@@ -350,7 +359,11 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		s.audit(ctx, "ct.create", info.Name, "image="+rec.Image, "error")
 		return nil, status.Errorf(codes.Internal, "create: record cluster state: %v", err)
 	}
-	s.audit(ctx, "ct.create", info.Name, "project="+tenancy.NormalizeProject(req.Project)+" image="+rec.Image, "ok")
+	auditDetail := "project=" + tenancy.NormalizeProject(req.Project) + " image=" + rec.Image
+	if ha := hostAccessAudit(req.Mounts, req.Devices); ha != "" {
+		auditDetail += " " + ha
+	}
+	s.audit(ctx, "ct.create", info.Name, auditDetail, "ok")
 	slog.Info("container created", "name", info.Name, "host", s.hostName)
 	return toPbContainer(rec), nil
 }
@@ -902,7 +915,9 @@ func (s *Server) forwardSimpleCT(
 
 func toPbContainer(r corrosion.ContainerRecord) *pb.Container {
 	privileged, confinement, base := containerSecurityOf(r)
+	mounts, devices := pbHostAccess(corrosion.DecodeCreateSpec(r.CreateSpec))
 	return &pb.Container{
+		Mounts: mounts, Devices: devices,
 		Privileged: privileged, Confinement: confinement, IdmapBase: base,
 		HostName: r.HostName, Name: r.Name, State: r.State,
 		Image: r.Image, CpuLimit: int32(r.CPULimit), MemoryMib: int32(r.MemMiB),

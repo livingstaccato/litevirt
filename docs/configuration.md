@@ -674,6 +674,15 @@ containers:
   # on Linux 5.19+, LXC 5+ and an ext4/xfs/btrfs container store, otherwise
   # its files are shifted into the range at create), on, or off.
   idmapped_rootfs: auto
+  # Host paths an ADMIN may pass into a container on THIS host (lv ct create
+  # --mount / --device; docs/passthrough.md). Each host path is resolved here,
+  # symlinks followed, and must land under one of these prefixes — at create
+  # and again at every start, so a container moved to a host that does not
+  # allow its paths does not start there. Mounts are read-only unless --mount
+  # asks for :rw, and always nosuid,nodev. Empty (the default) allows nothing.
+  # Allow only trees untrusted users cannot write.
+  bind_mount_paths: []                # e.g. ["/srv/shared", "/mnt/media"]
+  device_paths: []                    # under /dev, e.g. ["/dev/ttyUSB0", "/dev/dri"]
 
 # ACME / autocert for the web UI cert (#13). When set, the daemon TERMINATES UI
 # TLS itself (port 7445) using a cert from the configured ACME directory, with an

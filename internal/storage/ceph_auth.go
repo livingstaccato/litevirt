@@ -266,3 +266,12 @@ func CephKeyFingerprintOf(opts map[string]string) (fp string, ok bool, err error
 	defer clear(key)
 	return CephKeyFingerprint(key), true, nil
 }
+
+// OverrideCephConfDirForTest points ceph's default directory (its ceph.conf
+// and keyrings) at dir, for tests in other packages that must not depend on
+// the build host's /etc/ceph; it returns the restore.
+func OverrideCephConfDirForTest(dir string) func() {
+	prev := cephConfDir
+	cephConfDir = dir
+	return func() { cephConfDir = prev }
+}

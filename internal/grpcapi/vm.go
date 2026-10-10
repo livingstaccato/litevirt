@@ -1727,8 +1727,14 @@ func (s *Server) PrepareHardwareForStart(ctx context.Context, vm *corrosion.VMRe
 	// on every start path, so none waits for the daemon's reconcile.
 	if err := s.ensureCephSecretsForVM(ctx, vm, ""); err != nil {
 		// FailedPrecondition only for what an operator must fix; anything
-		// transient is Unavailable, which every start path retries.
-		return releasePreflight, status.Errorf(cephErrCode(err), "start %q: %v", vm.Name, err)
+		// transient is Unavailable, which every start path retries — and a
+		// deferral (health.ErrStartDeferred), which the reconciler re-drives
+		// instead of parking a proof-less start in error.
+		serr := status.Errorf(cephErrCode(err), "start %q: %v", vm.Name, err)
+		if cephErrCode(err) == codes.Unavailable {
+			serr = deferStart(serr)
+		}
+		return releasePreflight, serr
 	}
 	s.refreshRBDMonitors(ctx, vm.Name)
 

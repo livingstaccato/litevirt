@@ -149,6 +149,10 @@ type Reconciler struct {
 	// deferredTransfers: proof-less transfers parked in "starting" while their
 	// backing image transfers (missing_disk.go).
 	deferredTransfers deferredTransfers
+	// startDeferral / startDeferred: starts deferred for want of time or an
+	// answer from storage, walked first on the next pass (start_deferral.go).
+	startDeferral func(ctx context.Context, vm *corrosion.VMRecord) error
+	startDeferred startDeferredSet
 
 	// ownerMu guards ownershipFirstSeen, the debounce map recording when each VM
 	// was first observed running-locally-but-owned-elsewhere, so a transient
@@ -556,13 +560,19 @@ func specOnboot(specJSON string) bool {
 // gone or reassigned, the operator has since stopped it (operator-stop), or onboot
 // was disabled. So a returning quorum can't resurrect a VM the operator stood down
 // while it was absent. Idempotent: startPendingVM no-ops on an already-running domain.
-func (r *Reconciler) retryOnbootPending(ctx context.Context) {
+//
+// The only argument picks which of them this call retries: the ones whose
+// start was deferred last pass go before the walk, the rest after it.
+func (r *Reconciler) retryOnbootPending(ctx context.Context, only func(name string) bool) {
 	r.onbootMu.Lock()
 	names := make([]string, 0, len(r.onbootPending))
 	for name := range r.onbootPending {
-		names = append(names, name)
+		if only(name) {
+			names = append(names, name)
+		}
 	}
 	r.onbootMu.Unlock()
+	sort.Strings(names)
 	for _, name := range names {
 		if r.virt != nil && r.virt.DomainExists(name) {
 			if st, err := r.virt.DomainState(name); err == nil && st == "running" {
@@ -604,6 +614,13 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 
 	r.resolveDiskMissing(ctx)
 	r.cleanupRekeyLeftovers(ctx)
+
+	// Starts deferred last pass go first — the onboot retries among them
+	// too — so the same VMs are not the ones the walk's budget runs out on
+	// every pass (start_deferral.go).
+	deferred := r.startDeferred.take()
+	vms = deferredFirst(vms, deferred)
+	r.retryOnbootPending(ctx, func(name string) bool { return deferred[name] })
 
 	for _, vm := range vms {
 		switch vm.State {
@@ -831,7 +848,7 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 
 	// Retry any onboot autostart the split-brain gate refused during warmup/quorum
 	// loss, so a latched gate can't permanently strand it after a reboot.
-	r.retryOnbootPending(ctx)
+	r.retryOnbootPending(ctx, func(name string) bool { return !deferred[name] })
 }
 
 // selfFence detects split-brain: VMs running locally in libvirt that corrosion
@@ -1181,6 +1198,12 @@ func (r *Reconciler) provenOwnerLeftover(ctx context.Context, name, owner string
 }
 
 func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) {
+	// A start that would be deferred for want of time is left as it is
+	// before anything is done for it — no lease, no proof claimed, no
+	// define — and goes first on the next pass (start_deferral.go).
+	if r.deferredBeforeWork(ctx, vm) {
+		return
+	}
 	// Take a per-VM startup lease before doing anything destructive.
 	// Without this, two reconcilers on different hosts that both briefly
 	// see vm.HostName=self in CRDT-stale state would both call libvirt.Start
@@ -1647,6 +1670,12 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	// is a non-retryable operator-repair condition → terminalize the proof + set the VM error;
 	// a transient read/DB failure (Internal/Unavailable) re-arms for the next reconcile tick.
 	releaseHW, hwErr := r.hwPrepareStart(ctx, fresh)
+	if hwErr != nil && errors.Is(hwErr, ErrStartDeferred) {
+		// Not a failure: storage did not answer, or there was no time left
+		// to ask it. Re-driven next pass — never parked in error.
+		r.deferStart(ctx, vm.Name, proofID, transfer, hwErr)
+		return
+	}
 	if hwErr != nil {
 		slog.Warn("reconciler: hardware pre-start refused/failed — not starting VM", "vm", vm.Name, "error", hwErr)
 		r.noteGateRefused(corrosion.ActionReschedule, ReasonHardwareBlocked)

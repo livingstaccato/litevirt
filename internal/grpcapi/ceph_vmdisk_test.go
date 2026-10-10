@@ -9,9 +9,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -36,6 +38,14 @@ type cephWorld struct {
 	// errno: EPERM 1, ENOENT 2, ETIMEDOUT 110 …), printing infoOut.
 	infoExit int
 	infoOut  string
+	// infoDelay is how long each `rbd info` takes (outside the lock, so
+	// concurrent probes overlap as they do against a cluster).
+	infoDelay time.Duration
+	// trash is the pools' trash ("pool/id" → image name); trashRmExit
+	// makes `rbd trash rm` fail with that status.
+	trash       map[string]string
+	trashRmExit int
+	ids         map[string]string
 }
 
 // cephExit is a failed rbd command as exec reports it (rbd exits with the errno).
@@ -46,8 +56,10 @@ func (e cephExit) ExitCode() int { return int(e) }
 
 func installCephWorld(t *testing.T) *cephWorld {
 	t.Helper()
-	w := &cephWorld{images: map[string]map[string]bool{}, sizes: map[string]int64{}}
+	w := &cephWorld{images: map[string]map[string]bool{}, sizes: map[string]int64{}, trash: map[string]string{}, ids: map[string]string{}}
 	t.Cleanup(storage.OverrideCephRunnerForTest(w.run))
+	// Purges run only when a test runs them (storage.RunCephPurgesOnceForTest).
+	t.Cleanup(storage.OverrideCephPurgeLoopForTest())
 	return w
 }
 
@@ -71,6 +83,9 @@ func (w *cephWorld) count(prefix string) int {
 }
 
 func (w *cephWorld) run(_ context.Context, name string, args ...string) ([]byte, error) {
+	if w.infoDelay > 0 && slices.Contains(args, "info") && slices.Contains(args, "--client_mount_timeout") {
+		time.Sleep(w.infoDelay)
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if name == "qemu-img" {
@@ -90,7 +105,7 @@ func (w *cephWorld) run(_ context.Context, name string, args ...string) ([]byte,
 		words = append(words, args[j])
 	}
 	sub := words[0]
-	if sub == "snap" || sub == "deep" {
+	if sub == "snap" || sub == "deep" || sub == "trash" {
 		sub += " " + words[1]
 	}
 	w.calls = append(w.calls, strings.TrimSpace(sub+" "+strings.Join(pos, " ")))
@@ -123,7 +138,33 @@ func (w *cephWorld) run(_ context.Context, name string, args ...string) ([]byte,
 		if _, ok := s[snap]; snap != "" && !ok {
 			return missing, cephExit(2)
 		}
-		return []byte(fmt.Sprintf(`{"size":%d}`, w.sizes[ref])), nil
+		if w.ids[ref] == "" {
+			w.ids[ref] = fmt.Sprintf("1%011x", len(w.ids)+len(w.trash)+1)
+		}
+		return []byte(fmt.Sprintf(`{"size":%d,"id":"%s","snapshot_count":%d}`, w.sizes[ref], w.ids[ref], len(s))), nil
+	case "status":
+		if _, ok := w.images[pos[0]]; !ok {
+			return missing, cephExit(2)
+		}
+		return []byte(`{"watchers":[]}`), nil
+	case "trash mv":
+		if _, ok := w.images[pos[0]]; !ok {
+			return missing, cephExit(2)
+		}
+		pool, img, _ := strings.Cut(pos[0], "/")
+		w.trash[pool+"/"+w.ids[pos[0]]] = img
+		delete(w.images, pos[0])
+		delete(w.ids, pos[0])
+	case "trash rm":
+		if w.trashRmExit != 0 {
+			return []byte("rbd: error: (110) Connection timed out"), cephExit(w.trashRmExit)
+		}
+		if _, ok := w.trash[pos[0]]; !ok {
+			return missing, cephExit(2)
+		}
+		delete(w.trash, pos[0])
+	case "trash ls":
+		return []byte("[]"), nil
 	case "snap create", "snap protect":
 		ref, snap, _ := strings.Cut(pos[0], "@")
 		w.images[ref][snap] = sub == "snap protect"
@@ -436,11 +477,15 @@ func TestDeleteRecordedVMDiskVolumes_CephDiskWithoutItsPool(t *testing.T) {
 	s := testServerWithLocks(t)
 	ctx := context.Background()
 	var rmArgs []string
+	t.Cleanup(storage.OverrideCephPurgeLoopForTest())
 	t.Cleanup(storage.OverrideCephRunnerForTest(func(_ context.Context, name string, args ...string) ([]byte, error) {
-		for _, a := range args {
-			if a == "rm" {
-				rmArgs = args
-			}
+		switch {
+		case slices.Contains(args, "status"):
+			return []byte(`{"watchers":[]}`), nil
+		case slices.Contains(args, "info"):
+			return []byte(`{"id":"1abc"}`), nil
+		case slices.Contains(args, "mv"):
+			rmArgs = args
 		}
 		return nil, nil
 	}))
@@ -453,8 +498,8 @@ func TestDeleteRecordedVMDiskVolumes_CephDiskWithoutItsPool(t *testing.T) {
 	}
 	s.deleteRecordedVMDiskVolumes(ctx, "vm1")
 	got := strings.Join(rmArgs, " ")
-	if !strings.Contains(got, "--id litevirt") || !strings.Contains(got, "--keyring /etc/ceph/ceph.client.litevirt.keyring") || !strings.HasSuffix(got, "rm -- lv/vm1-data") {
-		t.Fatalf("rbd rm args = %q, want the locator's identity and lv/vm1-data", got)
+	if !strings.Contains(got, "--id litevirt") || !strings.Contains(got, "--keyring /etc/ceph/ceph.client.litevirt.keyring") || !strings.HasSuffix(got, "trash mv -- lv/vm1-data") {
+		t.Fatalf("rbd trash mv args = %q, want the locator's identity and lv/vm1-data", got)
 	}
 }
 

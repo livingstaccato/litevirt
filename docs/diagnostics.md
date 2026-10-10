@@ -1769,6 +1769,21 @@ before libvirt is asked. Install the cluster's keyring for the client on the
 odd host; the next reconcile (30 s) resolves the condition.
 See [storage.md](storage.md#ceph-rbd-pools).
 
+### A deleted ceph image is not purged from the trash (`ceph_trash_leftover`)
+
+A ceph image a VM delete (or a rollback of litevirt's own copy) removes is
+moved to its pool's trash, and its objects are purged in the background with
+`rbd trash rm <pool>/<id>`, retried until it succeeds and resumed after a
+daemon restart. While a purge this host owes has failed, the host raises
+`ceph_trash_leftover` (evaluator `ceph_pool`, subject `host/<host>`, warning).
+The evidence lists each leftover: its trash reference (`<pool>/<id>`), the
+image it was, when it was moved, the attempts, the last error, and the
+command that purges it by hand. The image's capacity stays used until then.
+Common causes: the cluster unreachable from the host, the image still watched
+by a client (another host's qemu), or snapshots on it. The condition resolves
+on the next reconcile (30 s) once no purge is failing. See
+[storage.md](storage.md#ceph-rbd-pools).
+
 ### A VM's disk is missing on its own host (`vm_disk_missing`)
 
 A start on the VM's own host never boots it from a blank disk. This covers the

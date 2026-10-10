@@ -1056,6 +1056,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// An rbd disk's domain takes its monitors from its pool as configured on
 	// this host when the domain is defined, not from when the disk was made.
 	libvirt.SetCephMonitorResolver(svc.CephMonitorsForPool)
+	// Deleted ceph images wait in their pool's trash for a background purge;
+	// the ones a previous run had not finished are resumed (and named by
+	// ceph_trash_leftover while they fail).
+	if err := storage.ResumeCephPurges(d.cfg.DataDir); err != nil {
+		slog.Warn("ceph: trash purges of a previous run not resumed", "error", err)
+	}
 	svc.ReconcileCephSecrets(ctx)
 	go d.runCephSecretReconcile(ctx)
 	// Before this daemon serves: no cold-migration copy can be in flight yet.
@@ -1079,6 +1085,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Wire reconciler callbacks now that gRPC server exists.
 	reconciler.SetOnVMStarted(svc.RefreshLBForStack)
 	reconciler.SetHardwareStartPreparer(svc.PrepareHardwareForStart)
+	// A start whose ceph key must be proven, late in a walk with no time left
+	// for it, is left untouched for the next pass rather than half-started.
+	reconciler.SetStartDeferral(svc.CephStartDeferral)
 	reconciler.SetAutoPullImage(svc.AutoPullImage)
 	reconciler.SetBackupInProgress(svc.BackupInProgress)
 	reconciler.SetNetworkProvision(svc.ProvisionNetworkHere) // a failover start provisions like a VM create

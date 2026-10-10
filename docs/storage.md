@@ -959,14 +959,22 @@ A host whose key differs from another host's raises the degraded condition
 host. It is a diagnostic: rows of hosts that are down, removed or mid key
 rotation cannot vouch for anyone, so no start is refused by it. Instead every
 start of a VM with a ceph disk (failover restarts included) first proves the
-host's own key with `rbd info` on each disk as the pool's client, bounded by
-rbd's own 5 s monitor and OSD timeouts. It refuses for good, with the reason,
-only when Ceph is unambiguous that an operator must act: permission denied
-(naming the keyring), or the image not in a pool that answers. Anything else —
-Ceph not answering in time, a cluster re-electing its monitors, an ambiguous
-error — is transient, and the start is retried, as it would be after a qemu
-start failure. A failover start whose remaining time is too short for the
-probe is deferred to the next pass. A live migration onto a host
+host's own key with `rbd info` as the pool's client. A VM's disks are probed
+at the same time, bounded together by 8 s and by rbd's own 5 s monitor and OSD
+timeouts (rbd runs under the C locale, so its messages are read the same on
+any host). A key a probe proved is taken as proven for 2 minutes for every
+disk of that pool and client — until its keyring changes — so the VMs a
+failover starts after the first on a pool need no probe; an image that is
+gone is still reported, by qemu, when the domain starts. The start refuses for
+good, with the reason, only when Ceph is unambiguous that an operator must
+act: permission denied (naming the keyring), or the image not in a pool that
+answers. Anything else — Ceph not answering in time, a cluster re-electing
+its monitors, an ambiguous error — is transient. A failover, onboot autostart
+or restart of a VM whose domain died is then **deferred**, never put in
+`error`: it waits in `starting` (a failover in `pending`, its proof kept) and
+the next reconcile pass starts it. A start the reconcile pass has no time
+left to probe for is deferred before anything is done for it. Deferred VMs
+are taken first on the next pass. A live migration onto a host
 whose recorded key differs from the source host's is refused before libvirt
 is asked.
 
@@ -994,7 +1002,9 @@ the monitors are re-addressed, updating `/etc/ceph/ceph.conf` (or the pool's
 `mon_host`) on the hosts is all a stopped VM needs to start. Only a pool with
 a `mon_host` option also writes that list into the path, as the fallback for
 a host that does not have the pool. Every start also rewrites the
-domain's persistent definition with the monitors its pool resolves to then. A
+domain's persistent definition with the monitors its pool resolves to then,
+when they differ from the ones it names (a disk recorded before litevirt
+named its pool and client in the path is left as it is). A
 disk whose pool does not resolve (or resolves to no monitors) keeps the
 `<host>` list it has; an empty list is never written. A running VM keeps working (librbd
 follows the cluster's monitor map), and a live migration hands the
@@ -1028,13 +1038,23 @@ every host. That is how such pools behaved before and is not recommended.
   (there is no file a qcow2 overlay could back on); auto mode copies.
 - **Delete** (`lv rm`) removes the VM's own images. It never removes an
   imported base (`lvimage+…`), an image outside the pool, one that has
-  snapshots (rbd refuses, so a clone made from one is never orphaned), or one
-  another VM's disk row still names. An image another client still has open is
-  retried for a few seconds and then refused as **in use**, naming the
-  watcher; a rollback of litevirt's own copy waits up to a minute for a killed
-  client's watch to lapse. An image already gone is not an error —
+  snapshots (as `rbd rm` refuses one, so a clone made from one is never
+  orphaned), or one another VM's disk row still names. An image is removed in
+  two steps, as `rbd rm` itself does: `rbd trash mv` — quick whatever the
+  image's size, and the delete succeeds then — and a background
+  `rbd trash rm <pool>/<id>` that deletes its objects (minutes for a large
+  image), retried until done and resumed after a daemon restart (the queue is
+  kept in `<data_dir>/ceph-trash-purges.json`). A purge that keeps failing is
+  named by `ceph_trash_leftover` (see [diagnostics.md](diagnostics.md)).
+  An image a client still has open is never moved: a delete waits up to 45 s
+  (a killed client's watch lapses in about 30) and then refuses it as
+  **in use**, naming the watcher; a rollback of litevirt's own copy waits up
+  to a minute. An image already gone is not an error —
   but only once the pool itself answers: a delete that cannot reach the
   cluster (a missing keyring or conf) fails instead of reporting success.
+  If an interrupted `rbd rm` left the image in the trash, that leftover is
+  purged too; an image of that name someone moved to the trash by hand is
+  left for them.
 - **Clone copies** are made under a private staging name and renamed into
   place, so a failed clone removes only its own copy, never an image that
   already had the destination's name.

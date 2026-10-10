@@ -39,6 +39,38 @@ type fakeCeph struct {
 	// OSD's watch timeout (30 s): until then `rbd rm` refuses it with EBUSY.
 	now     time.Duration            // the fake's clock, advanced by cephSleep
 	watched map[string]time.Duration // image → when its dead client's watch expires
+	// The pools' trash: "pool/id" → the image moved there, which `rbd trash
+	// rm` purges. Images get an id the first time `rbd info` reports one.
+	trash map[string]fakeTrashed
+	ids   map[string]string
+}
+
+type fakeTrashed struct {
+	name, source string
+	snaps        map[string]bool
+}
+
+// trashed lists the trash entries of pool as "id name".
+func (f *fakeCeph) trashed(pool string) []string {
+	var out []string
+	for k, e := range f.trash {
+		if p, id, _ := strings.Cut(k, "/"); p == pool {
+			out = append(out, id+" "+e.name)
+		}
+	}
+	return out
+}
+
+func (f *fakeCeph) idOf(ref string) string {
+	if f.ids == nil {
+		f.ids = map[string]string{}
+	}
+	if id, ok := f.ids[ref]; ok {
+		return id
+	}
+	id := fmt.Sprintf("1%011x", len(f.ids)+1+len(f.trash))
+	f.ids[ref] = id
+	return id
 }
 
 // installSleep makes the driver's retry waits advance the fake's clock.
@@ -92,7 +124,7 @@ func (f *fakeCeph) run(ctx context.Context, name string, args ...string) ([]byte
 		words = append(words, args[j])
 	}
 	sub := words[0]
-	if sub == "snap" || sub == "deep" {
+	if sub == "snap" || sub == "deep" || sub == "trash" {
 		sub += " " + words[1]
 	}
 	if ctx.Err() != nil {
@@ -160,7 +192,48 @@ func (f *fakeCeph) run(ctx context.Context, name string, args ...string) ([]byte
 				return missing, rbdExit(2)
 			}
 		}
-		return []byte(fmt.Sprintf(`{"size":%d}`, f.sizes[ref])), nil
+		return []byte(fmt.Sprintf(`{"size":%d,"id":"%s","snapshot_count":%d}`, f.sizes[ref], f.idOf(ref), len(f.images[ref]))), nil
+	case "status":
+		if !f.has(pos[0]) {
+			return missing, rbdExit(2)
+		}
+		if until, ok := f.watched[pos[0]]; ok && f.now < until {
+			return []byte(`{"watchers":[{"address":"10.78.0.13:0/3434","client":4242,"cookie":1}]}`), nil
+		}
+		return []byte(`{"watchers":[]}`), nil
+	case "trash mv":
+		if !f.has(pos[0]) {
+			return missing, rbdExit(2)
+		}
+		if until, ok := f.watched[pos[0]]; ok && f.now < until {
+			return []byte("rbd: deferred delete error: (16) Device or resource busy"), rbdExit(16)
+		}
+		pool, _, _ := strings.Cut(pos[0], "/")
+		if f.trash == nil {
+			f.trash = map[string]fakeTrashed{}
+		}
+		f.trash[pool+"/"+f.idOf(pos[0])] = fakeTrashed{name: pos[0][len(pool)+1:], source: "USER", snaps: f.images[pos[0]]}
+		delete(f.images, pos[0])
+		delete(f.ids, pos[0])
+		return nil, nil
+	case "trash rm":
+		e, ok := f.trash[pos[0]]
+		if !ok {
+			return []byte("rbd: error: image not in trash: (2) No such file or directory"), rbdExit(2)
+		}
+		if len(e.snaps) > 0 {
+			return []byte("rbd: image has snapshots - not removing"), rbdExit(39)
+		}
+		delete(f.trash, pos[0])
+		return nil, nil
+	case "trash ls":
+		var entries []string
+		for k, e := range f.trash {
+			if p, id, _ := strings.Cut(k, "/"); p == pos[0] {
+				entries = append(entries, fmt.Sprintf(`{"id":"%s","name":"%s","source":"%s"}`, id, e.name, e.source))
+			}
+		}
+		return []byte("[" + strings.Join(entries, ",") + "]"), nil
 	case "clone":
 		ref, snap, _ := strings.Cut(pos[0], "@")
 		if prot, ok := f.images[ref][snap]; !ok || !prot {
@@ -515,11 +588,11 @@ func TestCephDeleteDisk_UnreachableClusterIsNotGone(t *testing.T) {
 	f := newFakeCeph()
 	f.images["lv/a-root"] = map[string]bool{}
 	keyringMissing := []byte("2026-10-10T10:00:00 auth: unable to find a keyring on /etc/ceph/ceph.client.x.keyring: (2) No such file or directory\nrbd: couldn't connect to the cluster!\n")
-	f.failOut["rm"] = struct {
+	f.failOut["status"] = struct {
 		out []byte
 		err error
 	}{keyringMissing, rbdExit(2)}
-	f.failOut["ls"] = f.failOut["rm"]
+	f.failOut["ls"] = f.failOut["status"]
 	d := &cephDriver{pool: "lv", opts: map[string]string{"id": "x", "keyring": "/etc/ceph/ceph.client.x.keyring"}, run: f.run}
 	if err := d.DeleteDisk(context.Background(), "rbd:lv/a-root"); err == nil {
 		t.Fatal("a delete that could not reach the cluster reported success")
@@ -695,10 +768,10 @@ func TestCephSweepIncoming_NeverMatchesAUserName(t *testing.T) {
 // N6. "Already gone" needs the pool to answer AND not list the image.
 func TestCephDeleteDisk_ListedImageIsNotGone(t *testing.T) {
 	f := newFakeCeph()
-	f.failOut["rm"] = struct {
+	f.failOut["status"] = struct {
 		out []byte
 		err error
-	}{[]byte("rbd: delete error: (2) No such file or directory"), rbdExit(2)}
+	}{[]byte("rbd: error opening image a-root: (2) No such file or directory"), rbdExit(2)}
 	f.listing = []string{"other", "a-root"}
 	d := &cephDriver{pool: "lv", opts: map[string]string{}, run: f.run}
 	if err := d.DeleteDisk(context.Background(), "rbd:lv/a-root"); err == nil {
@@ -810,9 +883,7 @@ func TestCephProbeDisk_ClassifiesPermanentAndTransient(t *testing.T) {
 	}
 }
 
-// I-R2-1. The probe is bounded by rbd's own timeouts, and is not started at
-// all when the caller has less time left than that bound (the reconciler's
-// walk budget): the start is then deferred, not refused.
+// I-R2-1. The probe is bounded by rbd's own timeouts and by ProbeBound.
 func TestCephProbeDisk_IsBounded(t *testing.T) {
 	var seen []string
 	d := &cephDriver{pool: "lv", opts: map[string]string{}, run: probeRun("", 0, true, &seen)}
@@ -820,23 +891,26 @@ func TestCephProbeDisk_IsBounded(t *testing.T) {
 	if len(seen) != 1 || !strings.Contains(seen[0], "--client_mount_timeout") || !strings.Contains(seen[0], "--rados_osd_op_timeout") {
 		t.Fatalf("rbd info args %q, want rbd's own timeouts", seen)
 	}
-	seen = nil
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	err := d.ProbeDisk(ctx, "rbd:lv/x")
-	if err == nil || IsPermanentCephError(err) || len(seen) != 0 {
-		t.Fatalf("short budget: err %v, rbd calls %v; want a transient deferral and no rbd", err, seen)
-	}
 }
 
-// Lab 2: a killed client's watch makes `rbd rm` BLOCK about 30 s and then
-// succeed. Every rm therefore gets a context of its own that outlasts that,
-// even when its caller's is shorter.
-func TestCephRm_PerCallTimeoutOutlastsABlockingWatch(t *testing.T) {
+// Lab 2: a killed client's watch makes rbd BLOCK about 30 s on the image's
+// lock and then succeed. `rbd trash mv` takes that lock, so every move gets a
+// context of its own that outlasts it, even when its caller's is shorter.
+func TestCephTrashMove_PerCallTimeoutOutlastsABlockingWatch(t *testing.T) {
+	resetCephPurges(t)
 	var deadline time.Duration
+	moved := false
 	d := &cephDriver{pool: "lv", opts: map[string]string{}, run: func(ctx context.Context, _ string, args ...string) ([]byte, error) {
-		if dl, ok := ctx.Deadline(); ok {
-			deadline = time.Until(dl)
+		switch strings.Join(args[:2], " ") {
+		case "status --format":
+			return []byte(`{"watchers":[]}`), nil
+		case "info --format":
+			return []byte(`{"size":1,"id":"abc123"}`), nil
+		case "trash mv":
+			moved = true
+			if dl, ok := ctx.Deadline(); ok {
+				deadline = time.Until(dl)
+			}
 		}
 		return nil, nil
 	}}
@@ -845,32 +919,29 @@ func TestCephRm_PerCallTimeoutOutlastsABlockingWatch(t *testing.T) {
 	if err := d.DeleteDisk(ctx, "rbd:lv/a-root"); err != nil {
 		t.Fatal(err)
 	}
-	if deadline < 45*time.Second {
-		t.Fatalf("rbd rm ran with %v left, want at least 45 s", deadline)
+	if !moved || deadline < 45*time.Second {
+		t.Fatalf("rbd trash mv ran (%v) with %v left, want at least 45 s", moved, deadline)
 	}
 }
 
-// m2. A user delete of an image another client has open retries briefly,
-// then refuses with "in use" and who holds it — it does not wait out the
-// rollback budget.
+// m2. A user delete of an image another client has open waits out a dead
+// client's watch (30 s), then refuses with "in use" and who holds it — it
+// does not wait out the rollback budget, and never moves an image a live
+// client has open into the trash.
 func TestCephDeleteDisk_InUseRefusesQuickly(t *testing.T) {
 	f := newFakeCeph()
 	f.installSleep(t)
 	f.images["lv/a-root"] = map[string]bool{}
 	f.watched = map[string]time.Duration{"lv/a-root": time.Hour}
-	f.failOut["status"] = struct {
-		out []byte
-		err error
-	}{[]byte("Watchers:\n\twatcher=10.78.0.13:0/123 client.4242 cookie=1"), nil}
 	d := &cephDriver{pool: "lv", opts: map[string]string{}, run: f.run}
 	err := d.DeleteDisk(context.Background(), "rbd:lv/a-root")
 	if err == nil || !strings.Contains(err.Error(), "in use") || !strings.Contains(err.Error(), "10.78.0.13") {
 		t.Fatalf("got %v, want an 'in use' refusal naming the watcher", err)
 	}
-	if f.now > 15*time.Second {
+	if f.now > rbdBusyBudget-time.Second {
 		t.Fatalf("a user delete waited %v", f.now)
 	}
-	if !f.has("lv/a-root") {
-		t.Fatal("the image was removed")
+	if !f.has("lv/a-root") || f.called("trash mv") != 0 {
+		t.Fatalf("an image a live client has open was removed or trashed: %v", f.calls)
 	}
 }

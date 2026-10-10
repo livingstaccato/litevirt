@@ -212,14 +212,73 @@ var errStorageNotFound = errors.New("no such storage here")
 // whose pool this host definitely does not have is served from its locator's
 // own client and keyring when that is readable here; any other failure to
 // resolve its storage refuses.
+//
+// The probes (cephStartPlan lists the ones a remembered proof does not cover)
+// run concurrently under ONE storage.ProbeBound, and whether there is time for
+// them is judged once for the VM: a caller with less than that left (the
+// reconciler late in its walk) is answered transient — a deferral — before
+// any rbd runs.
 func (s *Server) ensureCephSecretsForVM(ctx context.Context, vm *corrosion.VMRecord, source string) error {
+	probes, err := s.cephStartPlan(ctx, vm, source)
+	if err != nil || len(probes) == 0 {
+		return err
+	}
+	if dl, ok := ctx.Deadline(); ok {
+		if left := time.Until(dl); left < storage.ProbeBound {
+			return transientCeph(fmt.Errorf("proving this host's ceph key for VM %s's disks on %s is deferred: it takes up to %v and the caller has %v left",
+				vm.Name, s.hostName, storage.ProbeBound, left.Round(time.Millisecond)))
+		}
+	}
+	pctx, cancel := context.WithTimeout(ctx, storage.ProbeBound)
+	defer cancel()
+	errs := make([]error, len(probes))
+	var wg sync.WaitGroup
+	for i, p := range probes {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[i] = p.prober.ProbeDisk(pctx, p.path)
+		}()
+	}
+	wg.Wait()
+	for i, p := range probes {
+		if errs[i] == nil && p.key != "" {
+			s.cephProofs.put(p.key)
+		}
+	}
+	// What an operator must fix is reported first: retrying cannot clear it.
+	for i, err := range errs {
+		if err != nil && storage.IsPermanentCephError(err) {
+			return permanentCeph(fmt.Errorf("disk %s on %s: %w", probes[i].disk, s.hostName, err))
+		}
+	}
+	for i, err := range errs {
+		if err != nil {
+			return transientCeph(fmt.Errorf("disk %s on %s: %w", probes[i].disk, s.hostName, err))
+		}
+	}
+	return nil
+}
+
+// cephProbe is one disk a start must still prove this host's key opens.
+type cephProbe struct {
+	disk, path string
+	prober     storage.DiskProber
+	key        string // cephProofKey of its pool and identity ("" → never remembered)
+}
+
+// cephStartPlan is ensureCephSecretsForVM up to the probes: each ceph disk's
+// secret defined and checked, and the probes still needed — those no proof
+// remembered within cephKeyProofTTL covers.
+func (s *Server) cephStartPlan(ctx context.Context, vm *corrosion.VMRecord, source string) ([]cephProbe, error) {
 	if s.virt == nil {
-		return nil
+		return nil, nil
 	}
 	disks, err := corrosion.GetVMDisks(ctx, s.db, vm.Name)
 	if err != nil {
-		return nil // the start path reports a missing disk list itself
+		return nil, nil // the start path reports a missing disk list itself
 	}
+	var probes []cephProbe
 	for _, d := range disks {
 		want, ok := lv.CephSecretOfLocator(d.Path)
 		if !ok {
@@ -233,45 +292,45 @@ func (s *Server) ensureCephSecretsForVM(ctx context.Context, vm *corrosion.VMRec
 			// The pool is not on this host (any more): the disk's own locator
 			// names its client and keyring.
 			if derr := s.defineCephSecret(want, cephLocatorID(l), l.Opts["keyring"], false); derr != nil {
-				return classedCeph(derr, fmt.Errorf("disk %s is on ceph pool %q, which %s does not have, and its keyring is not usable here: %w",
+				return nil, classedCeph(derr, fmt.Errorf("disk %s is on ceph pool %q, which %s does not have, and its keyring is not usable here: %w",
 					d.DiskName, pool, s.hostName, derr))
 			}
 			cfg = storage.Config{Name: pool, Driver: "ceph", Source: l.Pool, Options: rbdPathOptions(d.Path)}
 		case rerr != nil:
 			// Not "no such pool": this host's pools could not be read. The
 			// start is retried, as with any transient failure.
-			return transientCeph(fmt.Errorf("disk %s: %w", d.DiskName, rerr))
+			return nil, transientCeph(fmt.Errorf("disk %s: %w", d.DiskName, rerr))
 		case !strings.EqualFold(cfg.Driver, "ceph") || cfg.Name != pool:
-			return permanentCeph(fmt.Errorf("disk %s is on ceph pool %q, but storage %q on %s is a %s pool; give the pool the same name and driver on every host",
+			return nil, permanentCeph(fmt.Errorf("disk %s is on ceph pool %q, but storage %q on %s is a %s pool; give the pool the same name and driver on every host",
 				d.DiskName, pool, d.StorageVolume, s.hostName, cfg.Driver))
 		default:
 			u, err := s.ensureCephSecret(cfg)
 			if err != nil {
-				return classedCeph(err, fmt.Errorf("disk %s: %w", d.DiskName, err))
+				return nil, classedCeph(err, fmt.Errorf("disk %s: %w", d.DiskName, err))
 			}
 			if u != want {
-				return permanentCeph(fmt.Errorf("disk %s authenticates as client.%s of ceph pool %q, but pool %q on %s names client.%s; give the pool the same id on every host",
+				return nil, permanentCeph(fmt.Errorf("disk %s authenticates as client.%s of ceph pool %q, but pool %q on %s names client.%s; give the pool the same id on every host",
 					d.DiskName, cephLocatorID(l), pool, pool, s.hostName, clientOf(cfg)))
 			}
 			if err := s.refuseCephKeyUnlikeSource(ctx, pool, source, cfg); err != nil {
-				return err
+				return nil, err
 			}
 		}
 		drv, err := storage.New(s.dataDir, cfg)
 		if err != nil {
-			return permanentCeph(fmt.Errorf("disk %s: %w", d.DiskName, err))
+			return nil, permanentCeph(fmt.Errorf("disk %s: %w", d.DiskName, err))
 		}
-		if p, ok := drv.(storage.DiskProber); ok {
-			if err := p.ProbeDisk(ctx, d.Path); err != nil {
-				werr := fmt.Errorf("disk %s on %s: %w", d.DiskName, s.hostName, err)
-				if storage.IsPermanentCephError(err) {
-					return permanentCeph(werr)
-				}
-				return transientCeph(werr)
-			}
+		p, ok := drv.(storage.DiskProber)
+		if !ok {
+			continue
 		}
+		key := cephProofKey(cfg, l.Pool)
+		if key != "" && s.cephProofs.fresh(key) {
+			continue
+		}
+		probes = append(probes, cephProbe{disk: d.DiskName, path: d.Path, prober: p, key: key})
 	}
-	return nil
+	return probes, nil
 }
 
 // rbdLocatorsOf maps each rbd disk of a VM (by its image spec, the domain's
@@ -405,13 +464,17 @@ func (s *Server) judgeCephKey(ctx context.Context, pool, mine string) {
 }
 
 // ReconcileCephSecrets brings this host's litevirt ceph secrets in line with
-// its ceph pools: every pool's secret is defined (and its value re-set when
+// its ceph pools (and names, by ceph_trash_leftover, any image in a pool's
+// trash this host has failed to purge): every pool's secret is defined (and its value re-set when
 // the keyring changed or libvirt lost it), its key fingerprint recorded and
 // compared with the pool's other hosts, a disk whose pool is gone gets its
 // secret from its own locator, and a secret no pool and no disk recorded on
 // this host uses any more is removed. Nothing is removed on a partial view (a
 // listing that failed), nor within cephSecretGrace of its last definition.
 func (s *Server) ReconcileCephSecrets(ctx context.Context) {
+	if s.db != nil {
+		s.judgeCephTrash(ctx)
+	}
 	if s.virt == nil || s.db == nil {
 		return
 	}
@@ -579,8 +642,22 @@ func cephErrCode(err error) codes.Code {
 // does not otherwise re-resolve them, so a monitor the cluster retired would
 // stay in the definition. Best effort: a failure leaves the definition as it
 // was (it still names the monitors it started with last time).
+//
+// Only the disks this branch's locators describe (an identity and the
+// litevirt pool that names its secret: lv.CephSecretOfLocator) are refreshed;
+// a main-era rbd disk is left as it was defined, as it is everywhere else.
+// The definition is rewritten only when some disk's monitors differ from the
+// ones it names (lv.RefreshRBDHosts).
 func (s *Server) refreshRBDMonitors(ctx context.Context, vmName string) {
+	if s.virt == nil {
+		return
+	}
 	locators := s.rbdLocatorsOf(ctx, vmName)
+	for spec, loc := range locators {
+		if _, ok := lv.CephSecretOfLocator(loc); !ok {
+			delete(locators, spec)
+		}
+	}
 	if len(locators) == 0 || !s.virt.DomainExists(vmName) {
 		return
 	}

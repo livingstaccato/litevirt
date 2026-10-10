@@ -17,16 +17,22 @@ func TestCephSweepIncoming_RemovesOnlyStaleIncomingImages(t *testing.T) {
 	fresh := fmt.Sprintf("vm1-root-copy-b%s%d-abcdef012345", incomingMarker, now.Add(-time.Hour).Unix())
 	listing := strings.Join([]string{"vm1-root", old, fresh, "db-root"}, "\n")
 	run, calls := stubRunner(func(sub string) ([]byte, error) {
-		if sub == "ls" {
+		switch sub {
+		case "ls":
 			return []byte(listing), nil
+		case "status":
+			return []byte(`{"watchers":[]}`), nil
+		case "info":
+			return []byte(`{"id":"1abc"}`), nil
 		}
 		return nil, nil
 	})
+	resetCephPurges(t)
 	d := &cephDriver{pool: "copies", run: run}
 	d.sweepIncoming(context.Background(), "copies/vm1-root-copy-c", now)
 	var removed []string
 	for _, c := range *calls {
-		if len(c.args) > 0 && c.args[0] == "rm" {
+		if len(c.args) > 1 && c.args[0] == "trash" && c.args[1] == "mv" {
 			removed = append(removed, c.args[len(c.args)-1])
 		}
 	}

@@ -2,6 +2,7 @@ package e2e
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"strings"
@@ -25,7 +26,8 @@ import (
 //   - the VM boots, live-migrates to a second node (whose libvirt holds the
 //     same secret), and is still running there;
 //   - a clone is an rbd copy in the pool, cloned from the same base;
-//   - delete removes every VM image and keeps the base;
+//   - delete removes every VM image and keeps the base, through the pool's
+//     trash (rbd trash mv, then a background purge), leaving nothing there;
 //   - a create that fails after its ceph disk exists (proven from the daemon
 //     log) leaves no image behind.
 //
@@ -159,6 +161,7 @@ func TestLab_CephVMDisks(t *testing.T) {
 	l.mark("ceph: cloned %s → %s", vm, clone)
 
 	// Delete: every VM image goes, the base stays.
+	since0 := l.nodeNow(src)
 	if out, err := l.lv(dst, "rm", "--force", clone); err != nil {
 		t.Fatalf("lv rm %s: %v\n%s", clone, err, out)
 	}
@@ -185,6 +188,44 @@ func TestLab_CephVMDisks(t *testing.T) {
 	}
 	if out, err := rbd(src, "info "+shellQuote(base)); err != nil {
 		t.Fatalf("the base %s was removed with the VMs: %v\n%s", base, err, out)
+	}
+	// I-R3-3: the images went through the pool's trash (rbd trash mv, then a
+	// background rbd trash rm), and nothing of theirs is left there.
+	trashEmptyOf := func(prefixes ...string) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Minute)
+		for {
+			out, err := rbd(src, "trash ls --all --format json "+shellQuote(rbdPool))
+			if err != nil {
+				t.Fatalf("rbd trash ls: %v\n%s", err, out)
+			}
+			var entries []struct {
+				ID   string `json:"id"`
+				Name string `json:"name"`
+			}
+			if err := json.Unmarshal([]byte(out), &entries); err != nil {
+				t.Fatalf("rbd trash ls --format json: %v\n%s", err, out)
+			}
+			var left []string
+			for _, e := range entries {
+				for _, p := range prefixes {
+					if strings.HasPrefix(e.Name, p) {
+						left = append(left, rbdPool+"/"+e.ID+" ("+e.Name+")")
+					}
+				}
+			}
+			if len(left) == 0 {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("deleted images still in the trash after 5 min: %v", left)
+			}
+			time.Sleep(5 * time.Second)
+		}
+	}
+	trashEmptyOf(vm+"-", clone+"-")
+	if moved := l.journalSince(src, since0, "image moved to the trash"); !strings.Contains(moved, vm+"-root") {
+		t.Fatalf("the daemon on %s did not delete %s-root through the trash", src, vm)
 	}
 
 	// A create that fails AFTER its ceph disk exists removes it. The second
@@ -223,5 +264,6 @@ func TestLab_CephVMDisks(t *testing.T) {
 	if ls, _ := rbd(src, "ls "+shellQuote(rbdPool)); strings.Contains(ls, bad+"-") {
 		t.Fatalf("the failed create left an image behind:\n%s", ls)
 	}
+	trashEmptyOf(bad + "-")
 	l.mark("ceph: done")
 }

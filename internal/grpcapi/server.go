@@ -612,6 +612,8 @@ type Server struct {
 
 	// cephSecrets remembers the ceph secrets this daemon defined (ceph_secrets.go).
 	cephSecrets cephSecretMarks
+	// cephProofs remembers, briefly, the ceph keys a start proved (ceph_probe.go).
+	cephProofs cephKeyProofs
 
 	// poolUploadsMu serializes the read-modify-write of <data_dir>/pool-uploads.json
 	// (storage_pool_confine.go).

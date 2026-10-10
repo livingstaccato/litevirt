@@ -3,6 +3,8 @@ package libvirt
 import (
 	"strings"
 	"testing"
+
+	"github.com/litevirt/litevirt/internal/storage"
 )
 
 const rbdLiveXML = `<domain type='kvm'>
@@ -84,7 +86,11 @@ func TestRewriteRBDHosts_CompactSource(t *testing.T) {
 // m3. A disk whose locator does not resolve now (its non-default conf is
 // unreadable here and the pool is gone), or resolves to no monitors, keeps
 // the <host> list the running domain has; neither fails the migration.
+//
+// Whatever the build host's /etc/ceph holds: ceph's default directory is an
+// empty one here.
 func TestMigrationDomainXML_UnresolvedDiskKeepsItsHosts(t *testing.T) {
+	defer storage.OverrideCephConfDirForTest(t.TempDir())()
 	defer SetCephMonitorResolver(func(string) ([]string, bool) { return nil, false })()
 	p := MigrateParams{RBDLocators: map[string]string{
 		"lv/vm-root": "rbd:lv/vm-root:id=litevirt:keyring=/k:conf=/nonexistent/cluster.conf:lvpool=gone", // does not resolve
@@ -163,5 +169,53 @@ func TestMigrationDefinitions_RBDLocatorsAloneRewrite(t *testing.T) {
 	fetched = 0
 	if dest, _, _ := migrationDefinitions(MigrateParams{}, get, get); fetched != 0 || dest != "" {
 		t.Fatal("a plain migration fetched or rewrote the definitions")
+	}
+}
+
+// Minor (re-review 3, m3). A start rewrites the persistent definition only
+// when a disk's monitors DIFFER from what it names: the same monitors in
+// libvirt's own layout (indented, one <host> per line) are not a change, so
+// a start does not redefine the domain every time.
+func TestRefreshRBDHosts_SameMonitorsAreNoChange(t *testing.T) {
+	defer SetCephMonitorResolver(func(string) ([]string, bool) {
+		return []string{"10.0.0.1:6789", "10.0.0.2:6789"}, true
+	})()
+	out, changed, err := RefreshRBDHosts(rbdLiveXML, map[string]string{
+		"lv/vm-root": "rbd:lv/vm-root:id=litevirt:keyring=/k:lvpool=ceph"})
+	if err != nil || changed || out != rbdLiveXML {
+		t.Fatalf("changed=%v err=%v for monitors the definition already names:\n%s", changed, err, out)
+	}
+}
+
+// Only the disk whose monitors differ is rewritten; one that already names
+// its monitors keeps every byte.
+func TestRefreshRBDHosts_RewritesOnlyTheDiskThatDiffers(t *testing.T) {
+	defer SetCephMonitorResolver(func(string) ([]string, bool) {
+		return []string{"10.0.0.1:6789", "10.0.0.2:6789"}, true
+	})()
+	out, changed, err := RefreshRBDHosts(rbdLiveXML, map[string]string{
+		"lv/vm-root": "rbd:lv/vm-root:id=litevirt:keyring=/k:lvpool=ceph",
+		"lv/vm-data": "rbd:lv/vm-data:id=litevirt:keyring=/k:lvpool=ceph"})
+	if err != nil || !changed {
+		t.Fatalf("changed=%v err=%v; want the data disk given its monitors", changed, err)
+	}
+	keep := "<host name='10.0.0.1' port='6789'/>\n        <host name='10.0.0.2' port='6789'/>"
+	if !strings.Contains(out, keep) {
+		t.Fatalf("the root disk, which names its monitors already, was rewritten:\n%s", out)
+	}
+	if !strings.Contains(out, "<source protocol='rbd' name='lv/vm-data'><host name='10.0.0.1' port='6789'/><host name='10.0.0.2' port='6789'/></source>") {
+		t.Fatalf("the data disk was not given its monitors:\n%s", out)
+	}
+}
+
+// A monitor that moved to another port is a change.
+func TestRefreshRBDHosts_APortChangeIsAChange(t *testing.T) {
+	defer SetCephMonitorResolver(func(string) ([]string, bool) {
+		return []string{"10.0.0.1:3300", "10.0.0.2:6789"}, true
+	})()
+	out, changed, err := RefreshRBDHosts(rbdLiveXML, map[string]string{
+		"lv/vm-root": "rbd:lv/vm-root:id=litevirt:keyring=/k:lvpool=ceph"})
+	if err != nil || !changed || !strings.Contains(out, "<host name='10.0.0.1' port='3300'/>") {
+		t.Fatalf("changed=%v err=%v:\n%s", changed, err, out)
 	}
 }

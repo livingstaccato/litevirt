@@ -5,11 +5,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -37,7 +39,16 @@ type cephDriver struct {
 }
 
 // cephRunner is what a driver with no runner of its own runs commands with.
-var cephRunner cmdRunner = realCmd
+var cephRunner cmdRunner = cLocaleCmd
+
+// cLocaleCmd runs a command under the C locale: rbd's error text comes from
+// strerror, which glibc translates under the host's locale (systemd hands a
+// service the system's), and ProbeDisk reads that text.
+func cLocaleCmd(ctx context.Context, name string, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Env = append(os.Environ(), "LC_ALL=C")
+	return cmd.CombinedOutput()
+}
 
 // OverrideCephRunnerForTest replaces how ceph drivers built by New run rbd and
 // qemu-img, for tests in other packages; it returns the restore.
@@ -238,44 +249,9 @@ func (d *cephDriver) diskLocator(imageName string) (string, error) {
 
 // cleanupCtx is the context a rollback runs on: detached from the request's
 // own, which may be exactly what was cancelled, and bounded (with room for the
-// EBUSY retries of rmRetry).
+// watch waits of removeImage).
 func cleanupCtx(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(ctx), 3*time.Minute)
-}
-
-// rmRetry removes an image, retrying while rbd refuses it as watched (EBUSY):
-// a killed rbd client keeps its watch until the OSD times it out (30 s), and
-// a rollback that gave up at once would leak the image.
-func (d *cephDriver) rmRetry(ctx context.Context, ref string, budget time.Duration) ([]byte, error) {
-	wait, spent := time.Second, time.Duration(0)
-	for {
-		out, err := d.rmOnce(ctx, ref)
-		if err == nil || rbdErrno(err) != rbdEBUSY || spent >= budget {
-			return out, err
-		}
-		if !cephSleep(ctx, wait) {
-			return out, err
-		}
-		spent += wait
-		wait = min(wait*2, 10*time.Second)
-	}
-}
-
-// rmCallTimeout bounds ONE `rbd rm`. A dead client's watch makes rm block
-// until the OSD times the watch out (about 30 s on lab 2) and then succeed,
-// so the call outlasts that whatever its caller's deadline is.
-const rmCallTimeout = 50 * time.Second
-
-// userBusyBudget is how long a user's delete retries an image another
-// client has open before refusing it as in use (rollbacks wait rbdBusyBudget).
-const userBusyBudget = 5 * time.Second
-
-// rmOnce runs one `rbd rm` on a context of its own: detached from the
-// caller's (which may be shorter than a blocking watch) and bounded.
-func (d *cephDriver) rmOnce(ctx context.Context, ref string) ([]byte, error) {
-	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rmCallTimeout)
-	defer cancel()
-	return d.rbd(cctx, d.rbdArgs("rm", "--", ref)...)
 }
 
 // stagingName is a private name for an image this call is making, renamed
@@ -286,13 +262,14 @@ func stagingName(dest string) string {
 
 // removeStaging removes a staging image this call made, on a detached
 // context: snapshots first (a deep cp copies the source's; a staging image has
-// no children), then the image, retrying while a dead client's watch lasts.
+// no children), then the image (removeImage: to the trash once a dead client's
+// watch has gone, purged in the background).
 func (d *cephDriver) removeStaging(ctx context.Context, staging string) {
 	cctx, cancel := cleanupCtx(ctx)
 	defer cancel()
 	_, _ = d.rbd(cctx, d.rbdArgs("snap", "purge", "--", staging)...)
-	if out, err := d.rmRetry(cctx, staging, rbdBusyBudget); err != nil && rbdErrno(err) != rbdENOENT {
-		slog.Warn("ceph: a staging image was not removed; a later sweep removes it", "image", staging, "error", err, "output", strings.TrimSpace(string(out)))
+	if err := d.removeImage(cctx, staging, rbdBusyBudget); err != nil && rbdErrno(err) != rbdENOENT {
+		slog.Warn("ceph: a staging image was not removed; a later sweep removes it", "image", staging, "error", err)
 	}
 }
 
@@ -350,7 +327,7 @@ func (d *cephDriver) ensureBase(ctx context.Context, opts DiskOptions) (string, 
 			_, _ = d.rbd(cctx, d.rbdArgs("snap", "unprotect", "--", incoming+"@"+cephBaseSnap)...)
 		}
 		_, _ = d.rbd(cctx, d.rbdArgs("snap", "rm", "--", incoming+"@"+cephBaseSnap)...)
-		_, _ = d.rmRetry(cctx, incoming, rbdBusyBudget)
+		_ = d.removeImage(cctx, incoming, rbdBusyBudget)
 	}
 	if out, err := d.rbd(ctx, d.rbdArgs("import", "--image-feature", "layering", "--", raw, incoming)...); err != nil {
 		removeIncoming(false)
@@ -425,31 +402,33 @@ func (d *cephDriver) DeleteDisk(ctx context.Context, path string) error {
 	if IsCephBaseImage(l.Image) {
 		return fmt.Errorf("ceph image %q is an imported base other disks are cloned from; not removing it", l.Spec)
 	}
-	// A just-destroyed domain's qemu may still hold a watch for a moment:
-	// a short retry, then an image still open elsewhere is refused as in use
-	// — a user's delete never waits out the rollbacks' budget.
-	out, err := d.rmRetry(ctx, l.Spec, userBusyBudget)
+	// To the trash once no client watches it (a just-destroyed domain's qemu,
+	// or a killed client's watch, goes within about 30 s), then purged in the
+	// background; an image a live client still has open is refused as in use.
+	err := d.removeImage(ctx, l.Spec, userBusyBudget)
 	if err == nil {
 		return nil
 	}
-	if rbdErrno(err) == rbdEBUSY {
-		st, _ := d.rbd(ctx, d.rbdArgs("status", "--", l.Spec)...)
-		return fmt.Errorf("ceph image %s is in use (another client still has it open; stop the VM using it first): %s",
-			l.Spec, strings.TrimSpace(string(st)))
+	var inUse *cephInUseError
+	if errors.As(err, &inUse) {
+		return err
 	}
 	if rbdErrno(err) == rbdENOENT {
 		lsOut, lsErr := d.rbd(ctx, d.rbdArgs("ls", "--", l.Pool)...)
 		if lsErr != nil {
-			return fmt.Errorf("rbd rm %s: %w: %s (and pool %s does not answer: %v: %s)", l.Image, err, out, l.Pool, lsErr, lsOut)
+			return fmt.Errorf("delete ceph image %s: %w (and pool %s does not answer: %v: %s)", l.Spec, err, l.Pool, lsErr, lsOut)
 		}
 		for _, name := range strings.Fields(string(lsOut)) {
 			if name == l.Image {
-				return fmt.Errorf("rbd rm %s: %w: %s (but pool %s still lists it)", l.Image, err, out, l.Pool)
+				return fmt.Errorf("delete ceph image %s: %w (but pool %s still lists it)", l.Spec, err, l.Pool)
 			}
 		}
-		return nil // the pool answers and does not list the image
+		// The pool answers and does not list the image: deleted already —
+		// and an interrupted `rbd rm` may have left it in the trash.
+		d.claimTrashLeftovers(ctx, l.Pool, l.Image)
+		return nil
 	}
-	return fmt.Errorf("rbd rm %s: %w: %s", l.Image, err, out)
+	return fmt.Errorf("delete ceph image %s: %w", l.Spec, err)
 }
 
 // DiskSize is the size of the image a disk locator names.
@@ -476,11 +455,17 @@ func (d *cephDriver) imageSize(ctx context.Context, ref string) (int64, error) {
 }
 
 // Bounds of a start's probe: rbd's own monitor and OSD timeouts, and the
-// time a caller must have left for it to be started at all.
+// longest one probe takes (ProbeBound).
 const (
 	probeRBDTimeout = "5" // seconds: client_mount_timeout, rados_osd_op_timeout
 	probeBound      = 8 * time.Second
 )
+
+// ProbeBound is the longest ProbeDisk takes. A caller with a budget (the
+// reconciler's walk) checks it ONCE per VM, and probes the VM's disks
+// concurrently under one ProbeBound: whether there is time for it is the
+// caller's to judge, not each disk's.
+const ProbeBound = probeBound
 
 // ProbeDisk proves this driver's credentials open the disk's image: `rbd
 // info` as the pool's client, bounded by rbd's own timeouts. It is what a
@@ -492,17 +477,14 @@ const (
 // (as it does for a generic failure, so only its "Operation not permitted"
 // text counts), EACCES (13), or ENOENT (2) for an image a pool that answers
 // does not list. Everything else — a timeout, a killed rbd, an unreachable or
-// re-electing cluster, any other status — is transient. A caller with less
-// than probeBound left is answered transient at once, without starting rbd.
+// re-electing cluster, any other status — is transient. It runs bounded by
+// ProbeBound and by whatever its caller has left.
 func (d *cephDriver) ProbeDisk(ctx context.Context, path string) error {
 	l, ok := ParseCephLocator(path)
 	if !ok {
 		return fmt.Errorf("cannot parse Ceph image name from %q", path)
 	}
 	who := "client." + d.clientID()
-	if dl, has := ctx.Deadline(); has && time.Until(dl) < probeBound {
-		return &cephError{msg: fmt.Sprintf("probing %s as %s deferred: it needs up to %v and the caller has %v left", l.Spec, who, probeBound, time.Until(dl).Round(time.Millisecond))}
-	}
 	pctx, cancel := context.WithTimeout(ctx, probeBound)
 	defer cancel()
 	bounded := func(sub ...string) []string {
@@ -698,7 +680,7 @@ func (d *cephDriver) Replicate(ctx context.Context, opts ReplicateOptions) (err 
 		if !opts.Incremental {
 			cctx, cancel := cleanupCtx(ctx)
 			defer cancel()
-			_, _ = d.rmRetry(cctx, recvRef, rbdBusyBudget)
+			_ = d.removeImage(cctx, recvRef, rbdBusyBudget)
 		}
 	}
 
@@ -788,7 +770,7 @@ func (d *cephDriver) sweepIncoming(ctx context.Context, dstRef string, now time.
 		// after `snap protect` is undone too: unprotect, purge, remove.
 		_, _ = d.rbd(ctx, d.rbdArgs("snap", "unprotect", "--", ref+"@"+cephBaseSnap)...)
 		_, _ = d.rbd(ctx, d.rbdArgs("snap", "purge", "--", ref)...)
-		if _, err := d.rmRetry(ctx, ref, rbdBusyBudget); err == nil {
+		if err := d.removeImage(ctx, ref, rbdBusyBudget); err == nil {
 			slog.Info("ceph: removed an incoming image a crashed copy left", "image", pool+"/"+name)
 		}
 	}

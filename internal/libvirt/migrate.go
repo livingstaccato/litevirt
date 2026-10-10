@@ -1,6 +1,7 @@
 package libvirt
 
 import (
+	"encoding/xml"
 	"fmt"
 	"log/slog"
 
@@ -300,10 +301,21 @@ func ResolveRBDHosts(locators map[string]string) map[string][]diskSourceHost {
 }
 
 // RefreshRBDHosts rewrites a domain definition's rbd <host> lists with the
-// monitors each disk's locator resolves to now (ResolveRBDHosts); changed is
-// false when nothing differs.
+// monitors each disk's locator resolves to now (ResolveRBDHosts) — only the
+// disks whose monitors DIFFER from the ones the definition names (by name and
+// port, in order; libvirt's layout of them is no difference). changed is
+// false when no disk's do.
 func RefreshRBDHosts(domXML string, locators map[string]string) (out string, changed bool, err error) {
 	hosts := ResolveRBDHosts(locators)
+	current, err := rbdSourceHosts(domXML)
+	if err != nil {
+		return domXML, false, err
+	}
+	for name, list := range hosts {
+		if sameHosts(current[name], list) {
+			delete(hosts, name)
+		}
+	}
 	if len(hosts) == 0 {
 		return domXML, false, nil
 	}
@@ -312,4 +324,48 @@ func RefreshRBDHosts(domXML string, locators map[string]string) (out string, cha
 		return domXML, false, err
 	}
 	return out, out != domXML, nil
+}
+
+// rbdSourceHosts maps each rbd disk source of a domain (by its name) to the
+// <host> list it names.
+func rbdSourceHosts(domXML string) (map[string][]diskSourceHost, error) {
+	var dom struct {
+		Disks []struct {
+			Source struct {
+				Protocol string `xml:"protocol,attr"`
+				Name     string `xml:"name,attr"`
+				Hosts    []struct {
+					Name string `xml:"name,attr"`
+					Port string `xml:"port,attr"`
+				} `xml:"host"`
+			} `xml:"source"`
+		} `xml:"devices>disk"`
+	}
+	if err := xml.Unmarshal([]byte(domXML), &dom); err != nil {
+		return nil, fmt.Errorf("parse domain xml: %w", err)
+	}
+	out := map[string][]diskSourceHost{}
+	for _, d := range dom.Disks {
+		if d.Source.Protocol != "rbd" {
+			continue
+		}
+		list := []diskSourceHost{}
+		for _, h := range d.Source.Hosts {
+			list = append(list, diskSourceHost{Name: h.Name, Port: h.Port})
+		}
+		out[d.Source.Name] = list
+	}
+	return out, nil
+}
+
+func sameHosts(a, b []diskSourceHost) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Name != b[i].Name || a[i].Port != b[i].Port {
+			return false
+		}
+	}
+	return true
 }

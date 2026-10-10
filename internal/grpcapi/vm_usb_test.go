@@ -501,3 +501,17 @@ func TestPrepareHardwareForStart_RefreshesUSBBusPort(t *testing.T) {
 		t.Fatalf("start with the device gone = %v; want FailedPrecondition", err)
 	}
 }
+
+// The hot-add boot memory is server-owned even when hot-add is off: a client
+// cannot plant one in a spec that has no hot-add ceiling.
+func TestCreateVM_HotplugBaseIsServerOwned(t *testing.T) {
+	s, _ := provableCreateServer(t)
+	req := disklessCreateRequest("m0")
+	req.Spec.MemoryHotplugBaseMib = 64
+	if _, err := s.CreateVM(adminCtx(), req); err != nil {
+		t.Fatalf("CreateVM: %v", err)
+	}
+	if got := loadStoredSpec(t, s, "m0").MemoryHotplugBaseMib; got != 0 {
+		t.Fatalf("stored hot-add base = %d; a client-supplied base was kept", got)
+	}
+}

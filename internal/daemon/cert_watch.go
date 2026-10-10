@@ -242,6 +242,7 @@ type keyFileEvidence struct {
 
 // reportKeyFile raises, updates or resolves key_file_unsafe for pki_dir/name.
 func (w *certWatch) reportKeyFile(ctx context.Context, name string) {
+	wrote := false
 	if w.db == nil || w.pkiDir == "" {
 		return
 	}
@@ -256,11 +257,19 @@ func (w *certWatch) reportKeyFile(ctx context.Context, name string) {
 		w.keyState = map[string]string{}
 	}
 	last, seen := w.keyState[name]
-	w.keyState[name] = state
 	w.mu.Unlock()
 	if seen && last == state {
 		return
 	}
+	// Recorded as reported only once the write lands: a busy database or a
+	// quarantined replica at boot must not make the problem look reported.
+	defer func() {
+		if wrote {
+			w.mu.Lock()
+			w.keyState[name] = state
+			w.mu.Unlock()
+		}
+	}()
 	subject := w.host + "/" + name
 	ts := time.Now().UTC().Format(time.RFC3339)
 	cur, ok, err := corrosion.GetHealthCondition(ctx, w.db, certEvaluatorName, condKeyFileUnsafe, "host", subject)
@@ -270,8 +279,10 @@ func (w *certWatch) reportKeyFile(ctx context.Context, name string) {
 	if state == "" {
 		if ok && cur.Lifecycle != corrosion.ConditionResolved {
 			cur.Lifecycle, cur.ResolvedAt, cur.LastSeen, cur.Reporter = corrosion.ConditionResolved, ts, ts, w.host
-			_ = corrosion.UpsertHealthCondition(ctx, w.db, cur)
+			wrote = corrosion.UpsertHealthCondition(ctx, w.db, cur) == nil
+			return
 		}
+		wrote = true
 		return
 	}
 	slog.Warn("a private key this host serves is not held safely; serving it anyway (fix it as the condition says)",
@@ -281,7 +292,7 @@ func (w *certWatch) reportKeyFile(ctx context.Context, name string) {
 	if ok && cur.Lifecycle != corrosion.ConditionResolved && cur.FirstSeen != "" {
 		first = cur.FirstSeen
 	}
-	_ = corrosion.UpsertHealthCondition(ctx, w.db, corrosion.HealthCondition{
+	wrote = nil == corrosion.UpsertHealthCondition(ctx, w.db, corrosion.HealthCondition{
 		Evaluator: certEvaluatorName, Code: condKeyFileUnsafe, SubjectKind: "host", SubjectID: subject,
 		Lifecycle: corrosion.ConditionConfirmed, Severity: corrosion.SeverityWarning, Hosts: []string{w.host},
 		Evidence: string(ev), ObserveCount: 1, FirstSeen: first, LastSeen: ts, ConfirmedAt: first, Reporter: w.host,

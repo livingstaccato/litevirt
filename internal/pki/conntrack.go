@@ -9,9 +9,11 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/stats"
 )
 
 // Established connections and changed identities.
@@ -27,14 +29,30 @@ import (
 // established TLS connection with the certificates it was made with, and closes
 // the ones a judge says are no longer acceptable. The client reconnects with a
 // fresh handshake — which a renewed client passes with its new certificate,
-// and a revoked one fails. Sweeps run every few seconds, which bounds how long
-// a revocation takes to reach a live connection.
+// and a revoked one fails.
+//
+// A connection carrying an RPC in flight — a cold-disk migration stream, a
+// backup push — is not cut mid-transfer: it is closed once its RPCs finish, or
+// when StreamGrace runs out, whichever comes first. That bounds how long a
+// revoked or superseded certificate keeps a live connection (sweep interval +
+// StreamGrace) without failing a transfer that started legitimately before a
+// renewal. The tracker learns about RPCs through StatsHandler, which the
+// server must install alongside ServerCreds.
 type ConnTracker struct {
-	mu    sync.Mutex
-	conns map[*trackedConn]struct{}
+	mu     sync.Mutex
+	conns  map[*trackedConn]struct{}
+	byAddr map[string]*trackedConn
 	// served returns the serial this process presents at handshake time.
 	served func() string
+	// StreamGrace is how long a judged connection with RPCs in flight is
+	// left to finish. Zero means DefaultStreamGrace.
+	StreamGrace time.Duration
+	sweepMu     sync.Mutex
 }
+
+// DefaultStreamGrace bounds how long a connection that must be closed is left
+// to finish the RPCs it is carrying.
+const DefaultStreamGrace = 15 * time.Minute
 
 // TrackedConn is what a judge sees.
 type TrackedConn struct {
@@ -48,9 +66,12 @@ type TrackedConn struct {
 
 type trackedConn struct {
 	net.Conn
-	t    *ConnTracker
-	info TrackedConn
-	once sync.Once
+	t        *ConnTracker
+	info     TrackedConn
+	key      string
+	once     sync.Once
+	active   atomic.Int64
+	judgedAt time.Time // first sweep that wanted it closed; guarded by sweepMu
 }
 
 func (c *trackedConn) Close() error {
@@ -60,7 +81,7 @@ func (c *trackedConn) Close() error {
 
 // NewConnTracker returns a tracker for a server serving pkiDir's host identity.
 func NewConnTracker(pkiDir string) *ConnTracker {
-	return &ConnTracker{conns: map[*trackedConn]struct{}{}, served: func() string {
+	return &ConnTracker{conns: map[*trackedConn]struct{}{}, byAddr: map[string]*trackedConn{}, served: func() string {
 		c, err := ServedHostCertificate(pkiDir)
 		if err != nil {
 			return ""
@@ -69,10 +90,27 @@ func NewConnTracker(pkiDir string) *ConnTracker {
 	}}
 }
 
+func addrKey(local, remote net.Addr) string {
+	if local == nil || remote == nil {
+		return ""
+	}
+	return local.String() + "|" + remote.String()
+}
+
 func (t *ConnTracker) remove(c *trackedConn) {
 	t.mu.Lock()
 	delete(t.conns, c)
+	if t.byAddr[c.key] == c {
+		delete(t.byAddr, c.key)
+	}
 	t.mu.Unlock()
+}
+
+func (t *ConnTracker) grace() time.Duration {
+	if t.StreamGrace > 0 {
+		return t.StreamGrace
+	}
+	return DefaultStreamGrace
 }
 
 // ServerCreds wraps base so every connection it accepts is tracked.
@@ -90,12 +128,16 @@ func (c *trackingCreds) ServerHandshake(raw net.Conn) (net.Conn, credentials.Aut
 	if err != nil {
 		return conn, ai, err
 	}
-	tc := &trackedConn{Conn: conn, t: c.t, info: TrackedConn{ServedSerial: c.t.served(), Since: time.Now()}}
+	tc := &trackedConn{Conn: conn, t: c.t, info: TrackedConn{ServedSerial: c.t.served(), Since: time.Now()},
+		key: addrKey(conn.LocalAddr(), conn.RemoteAddr())}
 	if ti, ok := ai.(credentials.TLSInfo); ok && len(ti.State.PeerCertificates) > 0 {
 		tc.info.Peer = ti.State.PeerCertificates[0]
 	}
 	c.t.mu.Lock()
 	c.t.conns[tc] = struct{}{}
+	if tc.key != "" {
+		c.t.byAddr[tc.key] = tc
+	}
 	c.t.mu.Unlock()
 	return tc, ai, nil
 }
@@ -104,28 +146,84 @@ func (c *trackingCreds) Clone() credentials.TransportCredentials {
 	return &trackingCreds{TransportCredentials: c.TransportCredentials.Clone(), t: c.t}
 }
 
+// StatsHandler counts the RPCs in flight on each tracked connection.
+func (t *ConnTracker) StatsHandler() stats.Handler { return &connStats{t: t} }
+
+type connStats struct{ t *ConnTracker }
+type connKeyCtx struct{}
+type rpcConnCtx struct{}
+
+func (h *connStats) TagConn(ctx context.Context, info *stats.ConnTagInfo) context.Context {
+	return context.WithValue(ctx, connKeyCtx{}, addrKey(info.LocalAddr, info.RemoteAddr))
+}
+
+func (h *connStats) HandleConn(context.Context, stats.ConnStats) {}
+
+func (h *connStats) TagRPC(ctx context.Context, _ *stats.RPCTagInfo) context.Context {
+	key, _ := ctx.Value(connKeyCtx{}).(string)
+	h.t.mu.Lock()
+	tc := h.t.byAddr[key]
+	h.t.mu.Unlock()
+	if tc == nil {
+		return ctx
+	}
+	tc.active.Add(1)
+	return context.WithValue(ctx, rpcConnCtx{}, tc)
+}
+
+func (h *connStats) HandleRPC(ctx context.Context, s stats.RPCStats) {
+	if _, end := s.(*stats.End); !end {
+		return
+	}
+	if tc, ok := ctx.Value(rpcConnCtx{}).(*trackedConn); ok {
+		tc.active.Add(-1)
+	}
+}
+
 // Sweep closes every tracked connection judge rejects and returns how many.
+// The judge runs on a snapshot, outside the lock new handshakes take, so a
+// judge that reads the database never holds up the accept path. A rejected
+// connection with RPCs in flight is left to finish them, up to StreamGrace.
 func (t *ConnTracker) Sweep(judge func(TrackedConn) (bool, string)) int {
+	t.sweepMu.Lock()
+	defer t.sweepMu.Unlock()
 	t.mu.Lock()
-	var victims []*trackedConn
-	var whys []string
+	snap := make([]*trackedConn, 0, len(t.conns))
 	for c := range t.conns {
-		if drop, why := judge(c.info); drop {
-			victims = append(victims, c)
-			whys = append(whys, why)
-		}
+		snap = append(snap, c)
 	}
 	t.mu.Unlock()
-	for i, c := range victims {
+	now := time.Now()
+	closed := 0
+	for _, c := range snap {
+		drop, why := judge(c.info)
+		if !drop {
+			c.judgedAt = time.Time{}
+			continue
+		}
 		peer := ""
 		if c.info.Peer != nil {
 			peer = c.info.Peer.Subject.CommonName + "/" + c.info.Peer.SerialNumber.Text(16)
 		}
-		slog.Info("closing a connection made with a certificate that is no longer acceptable; the client "+
-			"reconnects with a fresh handshake", "peer", peer, "reason", whys[i])
+		if n := c.active.Load(); n > 0 {
+			if c.judgedAt.IsZero() {
+				c.judgedAt = now
+				slog.Info("a connection made with a certificate that is no longer acceptable carries RPCs in flight; "+
+					"closing it once they finish", "peer", peer, "reason", why, "in_flight", n, "grace", t.grace())
+			}
+			if now.Sub(c.judgedAt) < t.grace() {
+				continue
+			}
+			slog.Warn("closing a connection whose RPCs outlasted the grace period; they fail and must be retried",
+				"peer", peer, "reason", why, "in_flight", n)
+		} else {
+			slog.Info("closing a connection made with a certificate that is no longer acceptable; the client "+
+				"reconnects with a fresh handshake", "peer", peer, "reason", why)
+		}
 		_ = c.Close()
+		closed++
 	}
-	return len(victims)
+	return closed
 }
 
 // Len is the number of tracked connections.
@@ -135,8 +233,9 @@ func (t *ConnTracker) Len() int {
 	return len(t.conns)
 }
 
-// Run sweeps every `every` until ctx ends.
-func (t *ConnTracker) Run(ctx context.Context, every time.Duration, judge func(TrackedConn) (bool, string)) {
+// Run sweeps every `every` until ctx ends, with a fresh judge per sweep (so a
+// judge may cache what it reads for exactly one sweep).
+func (t *ConnTracker) Run(ctx context.Context, every time.Duration, newJudge func() func(TrackedConn) (bool, string)) {
 	tk := time.NewTicker(every)
 	defer tk.Stop()
 	for {
@@ -144,7 +243,7 @@ func (t *ConnTracker) Run(ctx context.Context, every time.Duration, judge func(T
 		case <-ctx.Done():
 			return
 		case <-tk.C:
-			t.Sweep(judge)
+			t.Sweep(newJudge())
 		}
 	}
 }

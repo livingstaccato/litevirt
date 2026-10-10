@@ -1582,9 +1582,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// one made with a certificate since revoked, or with a host certificate a
 	// renewal replaced, is closed and its client re-handshakes.
 	connTracker := pki.NewConnTracker(d.cfg.PKIDir)
-	go connTracker.Run(ctx, connSweepInterval, svc.ConnJudge(ctx))
+	go connTracker.Run(ctx, connSweepInterval, func() func(pki.TrackedConn) (bool, string) { return svc.ConnJudge(ctx) })
 	grpcOpts := []grpc.ServerOption{
 		grpc.Creds(connTracker.ServerCreds(credentials.NewTLS(tlsCfg))),
+		grpc.StatsHandler(connTracker.StatsHandler()),
 		grpc.ChainUnaryInterceptor(rpcMetrics.UnaryInterceptor(), svc.UnaryAuthInterceptor),
 		grpc.ChainStreamInterceptor(rpcMetrics.StreamInterceptor(), svc.StreamAuthInterceptor),
 		// Defense-in-depth for the legacy unary state-dump/replication paths: the

@@ -34,7 +34,7 @@ func newHostPKICmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return out(map[string]string{"staging": id, "csr": string(csr)})
+			return out(map[string]string{"staging": id, "csr": string(csr), "outside_key": pki.LegacyKeyOutside(dir)})
 		},
 	}
 	gen.Flags().StringVar(&name, "name", "", "the host name the request is for")
@@ -77,13 +77,21 @@ func newHostPKICmd() *cobra.Command {
 	}
 	rollback.Flags().StringVar(&to, "to", "", "the serial to switch back to")
 
+	var serial string
+	discard := &cobra.Command{
+		Use:  "discard",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error { return pki.DiscardIdentity(dir, serial) },
+	}
+	discard.Flags().StringVar(&serial, "serial", "", "the unused identity to delete")
+
 	commit := &cobra.Command{
 		Use:  "commit",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error { return pki.CommitRenewal(dir) },
 	}
 
-	for _, c := range []*cobra.Command{gen, install, abandon, rollback, commit} {
+	for _, c := range []*cobra.Command{gen, install, abandon, rollback, discard, commit} {
 		c.Hidden = true
 		cmd.AddCommand(c)
 	}

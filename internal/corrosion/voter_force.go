@@ -235,6 +235,9 @@ func (v *ClaimVerifier) verifySigned(certPEM, name string, payload, sig []byte) 
 	if v.revoked(c) {
 		return fmt.Errorf("certificate %s is revoked", c.SerialNumber.Text(16))
 	}
+	if err := v.pinRefuses(c, name); err != nil {
+		return err
+	}
 	pub, ok := c.PublicKey.(*ecdsa.PublicKey)
 	if !ok {
 		return fmt.Errorf("certificate key is not ECDSA")

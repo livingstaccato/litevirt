@@ -195,7 +195,18 @@ func (s *KeyPairSource) loadPairLenient() (tls.Certificate, error) {
 	} else {
 		s.warnedKey = ""
 	}
-	return tls.LoadX509KeyPair(s.certPath, s.keyPath)
+	// Bounded and regular-file-only, as on the strict path: neither ever
+	// refuses a real PEM pair, and both keep a planted FIFO or huge file from
+	// costing a read per handshake.
+	certPEM, err := readBounded(s.certPath)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	keyPEM, err := readBounded(s.keyPath)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	return tls.X509KeyPair(certPEM, keyPEM)
 }
 
 // KeyFileProblems lists what is wrong with how keyPath is held, each with its

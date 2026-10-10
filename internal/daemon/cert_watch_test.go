@@ -189,3 +189,30 @@ func TestCertWatch_RaisesAnUnsafeKeyFileWithoutRefusingIt(t *testing.T) {
 		t.Fatalf("the condition was not resolved once the key was fixed: %s", c.Lifecycle)
 	}
 }
+
+// A failed write does not mark the key problem as reported: once the database
+// works again the condition is raised.
+//
+// Mutation: record keyState before the write — the second tick sees the
+// problem as already reported and raises nothing.
+func TestCertWatch_RetriesAKeyFileReportThatFailedToWrite(t *testing.T) {
+	ctx := context.Background()
+	w, db, pkiDir := certWatchFixture(t, "node-0")
+	key := filepath.Join(pkiDir, "host.key")
+	outside := filepath.Join(t.TempDir(), "host.key")
+	if err := os.Rename(key, outside); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, key); err != nil {
+		t.Fatal(err)
+	}
+	broken := corrosion.NewTestClientT(t)
+	broken.Close()
+	w.db = broken
+	w.reportKeyFile(ctx, "host.key")
+	w.db = db
+	w.reportKeyFile(ctx, "host.key")
+	if _, ok, err := corrosion.GetHealthCondition(ctx, db, "certificate", "key_file_unsafe", "host", "node-0/host.key"); err != nil || !ok {
+		t.Fatalf("the report that failed to write was never retried: %v %v", ok, err)
+	}
+}

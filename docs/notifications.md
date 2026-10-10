@@ -46,6 +46,7 @@ A notification has a `kind` (verb.noun), `severity` (`info` | `warn` | `error`),
 | `certificate.expired` | error | that certificate is past its NotAfter |
 | `certificate.revocation_owed` | warn | a renewal's replaced certificate is not revoked yet because the newest voter generation still needs its signature; repeated daily until the cluster publishes the revocation itself. See [auth.md](auth.md#renewing-a-host-certificate-lv-host-renew-cert) |
 | `certificate.revoked` | info | an owed revocation was published |
+| `certificate.revocation_owed_tampered` | error | an owed revocation's row was marked done or its CRL replaced although the serial was never revoked; restored to owed where possible. See [auth.md](auth.md#renewing-a-host-certificate-lv-host-renew-cert) |
 | `test.notification` | info | `lv notify test` / the UI "Test" button |
 
 > **Route the `ha.vip.*` kinds if you enable VIP HA** (`enforcement.vip_self_demote` /

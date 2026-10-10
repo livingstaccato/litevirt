@@ -243,6 +243,9 @@ func TestRenewHostCert_RollsBackAndRevokesTheUnusedSuccessor(t *testing.T) {
 	if successor == "" || !crlHas(t, f.op, successor) {
 		t.Fatalf("the unused successor %q was not revoked", successor)
 	}
+	if _, err := os.Stat(filepath.Join(f.host, "host.d", successor)); !os.IsNotExist(err) {
+		t.Fatal("the unused successor's key pair was left on the host, for start-up recovery to find")
+	}
 }
 
 // A probe that only FAILS proves nothing: when the cluster already records the
@@ -424,5 +427,29 @@ func TestHostRevokeCert_Guards(t *testing.T) {
 	}
 	if !crlHas(t, f.op, f.prevSerial) {
 		t.Fatal("the replaced certificate was not revoked")
+	}
+}
+
+// The CA machine's copy of the replaced key (left by `lv host init`) is removed
+// by the renewal; a file there that is not that key is left alone.
+//
+// Mutation: skip removeCAMachineCopy — the copy outlives the renewal.
+func TestRenewHostCert_RemovesTheCAMachinesCopyOfTheReplacedKey(t *testing.T) {
+	f := newRenewFixture(t)
+	key, _ := os.ReadFile(filepath.Join(f.host, "host.key"))
+	if err := os.WriteFile(filepath.Join(f.op, "node-r.key"), key, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(f.op, "node-o.key"), key, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.run(t, RenewCertOptions{}, f.probe); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(f.op, "node-r.key")); !os.IsNotExist(err) {
+		t.Fatal("the CA machine still holds a copy of the replaced key")
+	}
+	if _, err := os.Stat(filepath.Join(f.op, "node-o.key")); err != nil {
+		t.Fatal("a file for another host was removed")
 	}
 }

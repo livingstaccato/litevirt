@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -176,9 +177,19 @@ func InstallRenewal(pkiDir, stagingID string, certPEM []byte) (prevSerial, newSe
 
 // ensureLinkedLayout converts the legacy two-file layout into the linked one
 // (see the package comment above), one consistent step at a time. Idempotent.
+//
+// A regular host.crt or host.key means the files, not `current`, are the
+// identity being served — the legacy layout, or a `lv host init` re-init that
+// wrote regular files over the links and left `current` naming an older pair.
+// So the copy happens whenever a regular file is present, whatever `current`
+// says, and `current` is then pointed at that copy before any link changes.
 func ensureLinkedLayout(pkiDir, curSerial string) error {
 	cur := filepath.Join(hostDir(pkiDir), currentLinkName)
-	if _, err := os.Lstat(cur); errors.Is(err, os.ErrNotExist) {
+	_, curErr := os.Lstat(cur)
+	if curErr != nil && !errors.Is(curErr, os.ErrNotExist) {
+		return curErr
+	}
+	if errors.Is(curErr, os.ErrNotExist) || hasRegularIdentityFile(pkiDir) {
 		dir := filepath.Join(hostDir(pkiDir), curSerial)
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return err
@@ -204,8 +215,6 @@ func ensureLinkedLayout(pkiDir, curSerial string) error {
 		if err := crashPoint("current-created"); err != nil {
 			return err
 		}
-	} else if err != nil {
-		return err
 	}
 	// Key first, then certificate — both now point at the pair `current`
 	// names, which until the switch is the very pair the regular files held.
@@ -223,6 +232,17 @@ func ensureLinkedLayout(pkiDir, curSerial string) error {
 		}
 	}
 	return nil
+}
+
+// hasRegularIdentityFile reports whether host.crt or host.key is a regular
+// file (not a link into host.d).
+func hasRegularIdentityFile(pkiDir string) bool {
+	for _, name := range []string{"host.crt", "host.key"} {
+		if fi, err := os.Lstat(filepath.Join(pkiDir, name)); err == nil && fi.Mode().IsRegular() {
+			return true
+		}
+	}
+	return false
 }
 
 // atomicSymlink points path at target with one rename.
@@ -248,12 +268,75 @@ func switchCurrent(pkiDir, serial string) error {
 
 // RollbackRenewal points the identity back at serial (one rename). An
 // identity that is already serial — the switch never happened — is left alone.
+// serial must be a hex serial naming a complete pair under host.d that
+// chains to the cluster CA and names the same host as the installed identity.
 func RollbackRenewal(pkiDir, serial string) error {
 	serial = strings.ToLower(serial)
-	if s, err := CertSerial(filepath.Join(pkiDir, "host.crt")); err == nil && strings.EqualFold(s, serial) {
+	if !hexSerialRE.MatchString(serial) {
+		return fmt.Errorf("invalid serial %q: want lower-case hex", serial)
+	}
+	cur, err := CertSerial(filepath.Join(pkiDir, "host.crt"))
+	if err == nil && strings.EqualFold(cur, serial) {
 		return nil
 	}
+	if err := checkStoredIdentity(pkiDir, serial); err != nil {
+		return err
+	}
 	return switchCurrent(pkiDir, serial)
+}
+
+var hexSerialRE = regexp.MustCompile(`^[0-9a-f]{1,64}$`)
+
+// checkStoredIdentity verifies host.d/<serial> is a matched pair for the host
+// the installed certificate names, chaining to the cluster CA.
+func checkStoredIdentity(pkiDir, serial string) error {
+	dir := filepath.Join(hostDir(pkiDir), serial)
+	pair, err := tls.LoadX509KeyPair(filepath.Join(dir, "host.crt"), filepath.Join(dir, "host.key"))
+	if err != nil {
+		return fmt.Errorf("identity %s: %w", serial, err)
+	}
+	leaf, err := x509.ParseCertificate(pair.Certificate[0])
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(leaf.SerialNumber.Text(16), serial) {
+		return fmt.Errorf("identity %s holds certificate %s", serial, leaf.SerialNumber.Text(16))
+	}
+	cn := ""
+	if installed := readLeafQuiet(filepath.Join(pkiDir, "host.crt")); installed != nil {
+		cn = installed.Subject.CommonName
+	}
+	return checkSameIdentity(pkiDir, cn, leaf, []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth})
+}
+
+func readLeafQuiet(path string) *x509.Certificate {
+	b, err := readBounded(path)
+	if err != nil {
+		return nil
+	}
+	c, err := ParseCertPEM(b)
+	if err != nil {
+		return nil
+	}
+	return c
+}
+
+// DiscardIdentity deletes host.d/<serial> — a successor that will never be
+// used (an abandoned or rolled-back renewal) — so no complete pair for a
+// revoked certificate is left for start-up recovery to find. The current
+// identity is refused.
+func DiscardIdentity(pkiDir, serial string) error {
+	serial = strings.ToLower(serial)
+	if !hexSerialRE.MatchString(serial) {
+		return fmt.Errorf("invalid serial %q: want lower-case hex", serial)
+	}
+	if cur, err := os.Readlink(filepath.Join(hostDir(pkiDir), currentLinkName)); err == nil && cur == serial {
+		return fmt.Errorf("identity %s is the current one", serial)
+	}
+	if s, err := CertSerial(filepath.Join(pkiDir, "host.crt")); err == nil && strings.EqualFold(s, serial) {
+		return fmt.Errorf("identity %s is the installed one", serial)
+	}
+	return os.RemoveAll(filepath.Join(hostDir(pkiDir), serial))
 }
 
 // CommitRenewal deletes every identity under host.d except the current one —
@@ -331,6 +414,10 @@ func RecoverHostIdentity(pkiDir, hostName string) (bool, error) {
 			[]x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth}) != nil {
 			continue
 		}
+		// A revoked identity is not one to come back on: its peers refuse it.
+		if IsCertRevoked(pkiDir, leaf.SerialNumber) {
+			continue
+		}
 		cands = append(cands, cand{e.Name(), leaf.NotBefore})
 	}
 	if len(cands) == 0 {
@@ -338,6 +425,19 @@ func RecoverHostIdentity(pkiDir, hostName string) (bool, error) {
 			hostDir(pkiDir), hostName)
 	}
 	sort.Slice(cands, func(i, j int) bool { return cands[i].nb.After(cands[j].nb) })
+	// Regular files that do not load are set aside, never overwritten: an
+	// operator may have placed them by hand.
+	stamp := time.Now().UTC().Format("20060102T150405Z")
+	for _, name := range []string{"host.crt", "host.key"} {
+		p := filepath.Join(pkiDir, name)
+		if fi, err := os.Lstat(p); err == nil && fi.Mode().IsRegular() {
+			aside := p + ".unloadable-" + stamp
+			if err := os.Rename(p, aside); err != nil {
+				return false, fmt.Errorf("set aside %s: %w", p, err)
+			}
+			slog.Warn("set aside a host identity file that did not load", "file", p, "now", aside)
+		}
+	}
 	if err := switchCurrent(pkiDir, cands[0].serial); err != nil {
 		return false, err
 	}
@@ -368,4 +468,24 @@ func RenewLocal(caCertPath, caKeyPath, pkiDir, hostName string) (prevSerial, new
 		return "", "", err
 	}
 	return InstallRenewal(pkiDir, id, certPEM)
+}
+
+// LegacyKeyOutside returns where host.key resolves when that is OUTSIDE
+// pkiDir (an arrangement main served), or "". A renewal copies such a key into
+// host.d and stops using it, but cannot know whether the outside file is used
+// for anything else, so it is reported for the operator to remove.
+func LegacyKeyOutside(pkiDir string) string {
+	key := filepath.Join(pkiDir, "host.key")
+	real, err := filepath.EvalSymlinks(key)
+	if err != nil {
+		return ""
+	}
+	dir, err := filepath.EvalSymlinks(pkiDir)
+	if err != nil {
+		return ""
+	}
+	if rel, err := filepath.Rel(dir, real); err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return real
+	}
+	return ""
 }

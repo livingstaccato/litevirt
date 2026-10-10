@@ -37,6 +37,11 @@ cluster publishes it by itself once that is safe; --revoke-old revokes now
 regardless, --keep-old not at all ('lv host revoke-cert' later). It refuses
 while hosts run different builds unless --force.
 
+Connections made with the old certificate are re-established within seconds;
+one carrying a long transfer (cold-disk migration, backup push) is left up to
+15 minutes to finish, and a transfer still running then fails and must be
+re-run — renew outside long transfers.
+
 Must run from the machine that holds the cluster CA private key (the one that
 ran 'lv host init'): there is no CSR flow. Peers on an older litevirt release do
 not recognise the successor and accept it once the host's re-recorded serial

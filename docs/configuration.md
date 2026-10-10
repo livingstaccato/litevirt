@@ -575,7 +575,11 @@ auth:
   # admitted for CA-issued HOST certificates instead of refused — wait for the
   # fleet to replicate, then set it back to false. It never relaxes the removal
   # tombstone (a decommissioned host stays out) and never lets a distributable
-  # client certificate act as a peer. Default false.
+  # client certificate act as a peer. While it is on it ALSO turns off the
+  # recovery-claim serial pin (accepts signed with a renewal's replaced key
+  # count again, in claim certificates and voter generations) and stops closing
+  # established connections made with a superseded host certificate — so turn
+  # it off as soon as the fleet has converged. See docs/auth.md. Default false.
   trust_rotated_peer_certs: false
   # Forwarded identity: when true (and the forwarded_identity_v1 capability is
   # active cluster-wide), the owning node re-authenticates a forwarded user's

@@ -176,6 +176,29 @@ func voterAnchor(ctx context.Context, db *corrosion.Client, v *corrosion.ClaimVe
 	return anchor, nil
 }
 
+// voterPinned pins voter-chain verification to recorded serials
+// (corrosion.ClaimVerifier.PinnedTo): an accept in a generation this node has
+// not adopted counts only when it is signed with the certificate the cluster
+// records for its voter, or that certificate's CA-attested successor.
+//
+// Without it, a renewed voter's REPLACED key — whose revocation may be owed
+// for the voter chain, or kept with --keep-old — together with one
+// compromised live host could sign a new generation that every node adopts,
+// and through it decide claims. The pin covers every generation above the
+// adopted one, the anchor search included; history at or below the anchor is
+// verified historically and is not pinned (it was signed with whatever each
+// voter held then). The cost is §4.1's, bounded the same way: a node that
+// adopts a generation decided BEFORE one of its signers renewed cannot count
+// that signer's accept until the voter set next changes, exactly as when the
+// replaced certificate is revoked. auth.trust_rotated_peer_certs turns the
+// pin off (verifierPolicy).
+func (s *Server) voterPinned(ctx context.Context, v *corrosion.ClaimVerifier) *corrosion.ClaimVerifier {
+	if v.SerialPinDisabled() {
+		return v
+	}
+	return v.PinnedTo(corrosion.RecordedHostSerial(ctx, s.db))
+}
+
 // memberAs reports whether this node is a member of cfg as the voter it is
 // now: its name with ITS incarnation. An entry under this node's name with
 // another incarnation is an earlier machine — removed and rebuilt under the
@@ -223,6 +246,7 @@ func (s *Server) AdoptVoterConfigs(ctx context.Context) (int64, error) {
 			if _, verifier, err = s.claimIdentity(); err != nil {
 				return adopted, err
 			}
+			verifier = s.voterPinned(ctx, verifier)
 			if inc, err = s.db.VoterIncarnation(ctx); err != nil {
 				return adopted, err
 			}

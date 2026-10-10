@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -84,8 +85,11 @@ const remotePKIDir = "/etc/litevirt/pki"
 type remotePKI interface {
 	// ReadFile returns path's contents, or ok=false when it does not exist.
 	ReadFile(path string) (data []byte, ok bool, err error)
-	// GenCSR has the host generate a new key and return a request for it.
-	GenCSR(hostName string) (staging string, csrPEM []byte, err error)
+	// GenCSR has the host generate a new key and return a request for it,
+	// plus where a legacy host.key outside the PKI directory lives ("" if none).
+	GenCSR(hostName string) (staging string, csrPEM []byte, outsideKey string, err error)
+	// DiscardIdentity deletes an unused identity (an abandoned successor).
+	DiscardIdentity(serial string) error
 	// InstallIdentity atomically switches the host to certPEM over the staged key.
 	InstallIdentity(staging string, certPEM []byte) error
 	// AbandonStaging discards a staged key that will not be installed.
@@ -193,7 +197,7 @@ func renewHostCert(ctx context.Context, c pb.LiteVirtClient, r remotePKI, probe 
 		return err
 	}
 
-	staging, csr, err := r.GenCSR(hostName)
+	staging, csr, outsideKey, err := r.GenCSR(hostName)
 	if err != nil {
 		return fmt.Errorf("have %s generate its new key (it needs this build of litevirt): %w", hostName, err)
 	}
@@ -226,6 +230,7 @@ func renewHostCert(ctx context.Context, c pb.LiteVirtClient, r remotePKI, probe 
 		case rerr == nil && ok && servedSerialOf(cur) == prevSerial:
 			// Positively not switched: the successor will never be presented.
 			_ = r.AbandonStaging(staging)
+			_ = r.DiscardIdentity(nextSerial)
 			return errors.Join(fmt.Errorf("install the renewed certificate on %s: %w", hostName, err),
 				abandonIssued(ctx, c, hostName, nextSerial, "it was never installed"))
 		default:
@@ -268,6 +273,7 @@ func renewHostCert(ctx context.Context, c pb.LiteVirtClient, r remotePKI, probe 
 					"the unused successor %s was NOT revoked — revoke it with `lv host revoke-cert %s --serial %s` once "+
 					"the host is confirmed on %s", hostName, prevSerial, err, nextSerial, hostName, nextSerial, prevSerial)
 			}
+			_ = r.DiscardIdentity(nextSerial)
 			return errors.Join(fmt.Errorf("%s did not start presenting the renewed certificate (%v); it is back on "+
 				"%s. Check `journalctl -u litevirt` on %s", hostName, perr, prevSerial, hostName),
 				abandonIssued(ctx, c, hostName, nextSerial, "the host never adopted it"))
@@ -286,6 +292,19 @@ func renewHostCert(ctx context.Context, c pb.LiteVirtClient, r remotePKI, probe 
 	fmt.Printf("Host certificate renewed for %s\n", hostName)
 	fmt.Printf("  serial %s replaces %s; valid until %s\n", nextSerial, prevSerial, next.NotAfter.UTC().Format(time.RFC3339))
 	fmt.Printf("  %s generated the new key itself and presents the certificate now — no restart\n", hostName)
+	if outsideKey != "" {
+		fmt.Printf("  NOTE: the replaced key was served from %s, outside %s; it is no longer used —\n", outsideKey, remotePKIDir)
+		fmt.Println("  remove it once nothing else needs it (the renewal cannot know)")
+	}
+	removeCAMachineCopy(pkiDir, hostName, prev)
+	if _, ok, err := r.ReadFile(filepath.Join(remotePKIDir, pki.AuditSigningCertName)); err == nil && !ok {
+		// Without a dedicated audit pair the daemon signs audit rows with the
+		// host key it loaded at boot — the REPLACED one — until it restarts,
+		// and audit verification does not consult the CRL. A restart (or
+		// rotate-audit-key, which restarts) retires it at a signed boundary.
+		fmt.Printf("  NOTE: %s signs audit rows with its host key and keeps using the replaced one until its\n", hostName)
+		fmt.Printf("  daemon restarts; run `lv host rotate-audit-key %s` to retire it now at a signed boundary\n", hostName)
+	}
 	if rejoin != nil {
 		fmt.Println("  the host's audit admission record was re-signed for the new serial")
 	}
@@ -333,8 +352,10 @@ func revokeReplaced(ctx context.Context, c pb.LiteVirtClient, hostName, serial s
 		return revokeAndPublishSerial(ctx, c, hostName, serial)
 	}
 	if err != nil {
-		return fmt.Errorf("the renewal is complete, but revoking the replaced certificate %s failed: %w. "+
-			"Retry with `lv host revoke-cert %s --serial %s`", serial, err, hostName, serial)
+		return fmt.Errorf("the renewal is complete, but handing the cluster the revocation of %s failed: %w. "+
+			"Nothing is revoked or owed yet. `lv host revoke-cert %s --serial %s` revokes it IMMEDIATELY, without "+
+			"the voter-chain check that would have held it as owed — use it once a voter change has happened "+
+			"since, or if revoking now is what you want", serial, err, hostName, serial)
 	}
 	if resp.Revoked {
 		if err := secretfile.Write(crlPath, crl, 0o644); err != nil {
@@ -364,6 +385,29 @@ func abandonIssued(ctx context.Context, c pb.LiteVirtClient, hostName, serial, w
 			"`lv host revoke-cert %s --serial %s`", serial, why, err, hostName, serial)
 	}
 	return nil
+}
+
+// removeCAMachineCopy deletes the copy of the replaced host key that `lv host
+// init` / `lv host add` left in this machine's pki directory (<host>.key), when
+// it is that key: a renewal retires the key, and a copy here would outlive it.
+func removeCAMachineCopy(pkiDir, hostName string, prev *x509.Certificate) {
+	keyPath := filepath.Join(pkiDir, hostName+".key")
+	b, err := os.ReadFile(keyPath)
+	if err != nil {
+		return
+	}
+	if _, err := tls.X509KeyPair(pemOfCert(prev), b); err != nil {
+		return // not the replaced key; leave it
+	}
+	if err := os.Remove(keyPath); err != nil {
+		fmt.Printf("  NOTE: could not remove this machine's copy of the replaced key %s: %v\n", keyPath, err)
+		return
+	}
+	fmt.Printf("  removed this machine's copy of the replaced key (%s)\n", keyPath)
+}
+
+func pemOfCert(c *x509.Certificate) []byte {
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: c.Raw})
 }
 
 // sameBuildEverywhere refuses a renewal while live hosts run different
@@ -703,16 +747,24 @@ func (t *sshRemotePKI) ReadFile(path string) ([]byte, bool, error) {
 
 const absentMarker = "__litevirt_file_absent__"
 
-func (t *sshRemotePKI) GenCSR(hostName string) (string, []byte, error) {
+func (t *sshRemotePKI) GenCSR(hostName string) (string, []byte, string, error) {
 	out, err := t.sc.RunOutput(hostPKICmd + " gen-csr --name " + ssh.ShellQuote(hostName))
 	if err != nil {
-		return "", nil, err
+		return "", nil, "", err
 	}
-	var v struct{ Staging, CSR string }
+	var v struct {
+		Staging    string
+		CSR        string
+		OutsideKey string `json:"outside_key"`
+	}
 	if err := json.Unmarshal(out, &v); err != nil || v.Staging == "" {
-		return "", nil, fmt.Errorf("unexpected answer from host-pki gen-csr: %q", strings.TrimSpace(string(out)))
+		return "", nil, "", fmt.Errorf("unexpected answer from host-pki gen-csr: %q", strings.TrimSpace(string(out)))
 	}
-	return v.Staging, []byte(v.CSR), nil
+	return v.Staging, []byte(v.CSR), v.OutsideKey, nil
+}
+
+func (t *sshRemotePKI) DiscardIdentity(serial string) error {
+	return t.sc.Run(hostPKICmd + " discard --serial " + ssh.ShellQuote(serial))
 }
 
 func (t *sshRemotePKI) InstallIdentity(staging string, certPEM []byte) error {
@@ -814,8 +866,14 @@ func (d *LocalRemotePKI) ReadFile(path string) ([]byte, bool, error) {
 	return b, err == nil, err
 }
 
-func (d *LocalRemotePKI) GenCSR(hostName string) (string, []byte, error) {
-	return pki.GenerateRenewalCSR(d.Dir, hostName)
+func (d *LocalRemotePKI) GenCSR(hostName string) (string, []byte, string, error) {
+	outside := pki.LegacyKeyOutside(d.Dir)
+	id, csr, err := pki.GenerateRenewalCSR(d.Dir, hostName)
+	return id, csr, outside, err
+}
+
+func (d *LocalRemotePKI) DiscardIdentity(serial string) error {
+	return pki.DiscardIdentity(d.Dir, serial)
 }
 
 func (d *LocalRemotePKI) InstallIdentity(staging string, certPEM []byte) error {

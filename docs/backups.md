@@ -248,7 +248,12 @@ by the strongest method the host has, tried in this order:
 2. **Backup session:** a full pull-mode backup of the running disk (the same
    machinery backups and `--incremental` use, with no checkpoint, so no
    incremental chain is touched). Point-in-time and crash-consistent.
-3. **External snapshot:** when no session opens (an older libvirt, a failed
+3. **External snapshot:** only on a host that holds the `pit_overlay`
+   release feature — the cluster-wide promise that every host serving the
+   pool understands the overlay this step leaves (see "Older builds" below).
+   This build does not hold it yet: it arrives with the release token, so
+   until then this step is skipped and the copy goes on to step 4, exactly as
+   before. When no session opens (an older libvirt, a failed
    job), and only for a VM libvirt reports running or paused, an external
    disk-only snapshot moves the guest's writes onto an overlay — quiesced
    through the guest agent when one answers, otherwise crash-consistent — the
@@ -283,11 +288,15 @@ by the strongest method the host has, tried in this order:
 
    The sidecar is written, and synced, before anything relies on it, and it
    follows the commit: `committing` before the commit's first write to the
-   disk (every attempt renews its stamp, and a long commit renews it while it
-   runs), `pivoting` just before a live commit pivots the VM onto the disk,
-   and `committed` once it has. If a record cannot be written, the step it
-   records does not happen: no commit starts, no pivot is made, and the window
-   stays open, reported, and is retried. If the commit fails, the VM keeps
+   disk (every attempt rewrites it, and a long commit rewrites it every ten
+   minutes while it runs); the disk as each attempt left it, failed or not,
+   once the attempt ends; `pivoting` just before a live commit pivots the VM
+   onto the disk; and `committed` once a recorded pivot has landed. If a
+   record cannot be written, the step it records does not happen: no commit
+   starts, no pivot is made, and the window stays open, reported, and is
+   retried. All the times compared are the filesystem's own (the disk's and
+   the sidecar's modification times), so a server clock that disagrees with
+   the hosts' does not matter. If the commit fails, the VM keeps
    running on the overlay and a `disk.pit_overlay_stranded` event and a
    `replication.pit_overlay_stranded` notification say so.
 
@@ -304,10 +313,15 @@ by the strongest method the host has, tried in this order:
      committed live instead;
    - **half-written**: a commit began and the disk is the file it was writing
      — same token, no smaller and no older than when the overlay was taken,
-     and not written more than two hours after the last commit attempt. The
-     commit is finished the same way: only that makes the disk whole;
+     and either exactly as the last attempt left it (nothing writes the disk
+     after a failed attempt, so a restore over it in place, which keeps its
+     inode and token, is caught) or, if the daemon died mid-attempt, written
+     no later than twelve minutes after the daemon last recorded the attempt.
+     The commit is finished the same way: only that makes the disk whole;
    - **pivoted**: the overlay is already in the disk — the commit was
-     recorded, or a pivot was under way and the VM runs on its disk. It is
+     recorded, or a pivot was recorded and the VM runs on its disk, written no
+     later than twelve minutes after that record (later, something else may
+     have started the VM there: it is marked diverged and held). It is
      removed, never committed again over the guest's newer writes;
    - **unknown**: anything else — the overlay is another VM's or unbound; the
      disk was replaced, restored, re-created or written since; the token is
@@ -328,21 +342,37 @@ by the strongest method the host has, tried in this order:
    daily. It resolves by itself once a later settle can commit the overlay or
    finds it merged, or when the disk is deleted.
 
-   An admin decides with `lv resolve-pit-overlay <vm> <disk>`, which needs the
-   VM stopped, is admin only, and is audited. Without `--confirm` it does
-   nothing: it prints the verdict, the disk's identity then and now, the
-   overlay's backing file, and what each action would do.
+   An admin decides with `lv resolve-pit-overlay <vm> <disk>`, which is admin
+   only and audited. Without `--confirm` it does nothing, and answers even
+   while the VM runs: it prints the verdict, the disk's and the overlay's
+   identity then and now, the overlay's backing file, and what each action
+   would do. For a pivot that was under way with the VM off, it compares the
+   two files' times: a disk written after the overlay means the pivot landed
+   (discard), an overlay written last means it did not (commit). Carrying an
+   action out (`--confirm`) needs the VM stopped.
    - `--commit --confirm` writes the overlay into the disk, through the same
      checks as every automatic commit, and is refused unless the verdict is
      matches or half-written. `--force-commit` overrides the verdict, for
      experts who have checked both files: if the disk is not what the overlay
      was taken of, it overwrites newer data with older blocks. Even forced, an
-     overlay whose backing file is another file is never pointed at this disk.
+     overlay whose backing file is another file (another name, or a file of
+     the same name in another directory of this host) is never pointed at
+     this disk. An overlay already in the disk (verdict pivoted, or a
+     committed binding) is refused even forced: committing it again writes
+     its old blocks over everything the guest wrote since. Only
+     `--overwrite-newer-writes` overrides that; `lv` prints the consequence
+     and, without the flag, asks for a typed `yes` on a terminal before it
+     sends anything.
    - `--discard --confirm` deletes the overlay and its writes. Of a disk a
      commit had begun writing (half-written, or unknown after a commit began)
      it is refused unless `--accept-torn-disk` is given: without the overlay
-     that disk is inconsistent, and restoring it from a backup or a replica is
-     the alternative.
+     that disk is inconsistent. To start over from a backup or a replica
+     instead, discard the overlay first (`--discard --accept-torn-disk`) and
+     only then restore the disk — a restore over it in place with the overlay
+     still beside it is not mistaken for the disk (the end record catches it),
+     but the VM stays held. `lv backup restore-from --in-place` does both: an
+     overlay that holds the VM is set aside (kept, as
+     `.<disk file>.lv-pit.orphan-<time>`) before the restore writes the disk.
 
    When a disk is deleted (`lv rm`, rebuild), its overlay and sidecar are
    deleted with it. An import that finds an overlay where its new disk goes
@@ -529,16 +559,25 @@ Each host rewrites only its own records, so no peer on an older build can drop
 a mark; a host rolled back to an older build drops the marks of the copies it
 recorded (local and replicated) the next time it rewrites those records.
 
-An older build knows nothing of `.lv-pit` overlays either. A host on one that
-restarts a VM whose window was open starts it on the bare disk, as it always
-did, and the window's writes are lost there; an upgraded host that later meets
-the overlay holds the VM once the disk has been written since — unless a commit
-had begun and its last attempt was under two hours before that write, in which
-case it is taken for the commit's own and the overlay is committed over it.
-Mixed-build failover of a VM in the middle of a layer-2 commit is that narrow.
-An older build shows the `pit_overlay.held` condition in `lv health` like any
-other, but never raises or resolves it, and an `lv` older than the daemon has
-no `--force-commit` or `--accept-torn-disk`: upgrade it to resolve a hold.
+**Older builds and `.lv-pit` overlays.** A build older than this one knows
+nothing of overlays: one that started a VM whose window was open would start
+it on the bare disk and drop the window's writes. So no overlay is made until
+every host serving the pool holds the `pit_overlay` release feature: until
+then the external-snapshot step is skipped (this build fails that gate closed
+until the release token is wired), which refuses nothing earlier builds did.
+A host below the feature — this build included, until it holds it — settles
+no overlay it finds, not even one it could verify: it holds the VM (the
+`pit_overlay.held` condition says why) rather than start it on that disk, and
+a binding written by a newer build than itself is never settled either.
+Before rolling a host back to a build OLDER than this one, settle every
+overlay on the pools it serves: `find <pool dir> -name '.*.lv-pit'` must find
+none (start or replicate each VM on an upgraded host, or resolve it with
+`lv resolve-pit-overlay`), because such a build has no hold and would start
+the VM on the bare disk. An older build shows the `pit_overlay.held`
+condition in `lv health` like any other, but never raises or resolves it, and
+an `lv` older than the daemon has none of `--force-commit`,
+`--accept-torn-disk` or `--overwrite-newer-writes`: upgrade it to resolve a
+hold.
 
 Automatic promotion **refuses a replica older than two of the schedule's
 longest intervals plus an hour** (or one whose filename carries no readable

@@ -24930,8 +24930,13 @@ type ResolvePITOverlayRequest struct {
 	// inconsistent.
 	ForceCommit    bool `protobuf:"varint,5,opt,name=force_commit,json=forceCommit,proto3" json:"force_commit,omitempty"`
 	AcceptTornDisk bool `protobuf:"varint,6,opt,name=accept_torn_disk,json=acceptTornDisk,proto3" json:"accept_torn_disk,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// overwrite_newer_writes lets force_commit go ahead on an overlay that is
+	// already in the disk (verdict pivoted, or a committed binding): the
+	// commit then writes the window's old blocks over everything the guest
+	// wrote since. Refused without it, whatever force_commit says.
+	OverwriteNewerWrites bool `protobuf:"varint,7,opt,name=overwrite_newer_writes,json=overwriteNewerWrites,proto3" json:"overwrite_newer_writes,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *ResolvePITOverlayRequest) Reset() {
@@ -25006,6 +25011,13 @@ func (x *ResolvePITOverlayRequest) GetAcceptTornDisk() bool {
 	return false
 }
 
+func (x *ResolvePITOverlayRequest) GetOverwriteNewerWrites() bool {
+	if x != nil {
+		return x.OverwriteNewerWrites
+	}
+	return false
+}
+
 type ResolvePITOverlayResponse struct {
 	state   protoimpl.MessageState `protogen:"open.v1"`
 	Overlay string                 `protobuf:"bytes,1,opt,name=overlay,proto3" json:"overlay,omitempty"` // the overlay file
@@ -25021,8 +25033,12 @@ type ResolvePITOverlayResponse struct {
 	IfCommit       string `protobuf:"bytes,10,opt,name=if_commit,json=ifCommit,proto3" json:"if_commit,omitempty"`         // what --commit would do, or why it is refused
 	IfDiscard      string `protobuf:"bytes,11,opt,name=if_discard,json=ifDiscard,proto3" json:"if_discard,omitempty"`      // what --discard would do, or why it is refused
 	Recommendation string `protobuf:"bytes,12,opt,name=recommendation,proto3" json:"recommendation,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	OverlayCurrent string `protobuf:"bytes,13,opt,name=overlay_current,json=overlayCurrent,proto3" json:"overlay_current,omitempty"` // the overlay's own identity now (its modification time)
+	// needs_overwrite_newer_writes: a forced commit of this overlay would
+	// overwrite the guest's newer writes, and needs overwrite_newer_writes.
+	NeedsOverwriteNewerWrites bool `protobuf:"varint,14,opt,name=needs_overwrite_newer_writes,json=needsOverwriteNewerWrites,proto3" json:"needs_overwrite_newer_writes,omitempty"`
+	unknownFields             protoimpl.UnknownFields
+	sizeCache                 protoimpl.SizeCache
 }
 
 func (x *ResolvePITOverlayResponse) Reset() {
@@ -25137,6 +25153,20 @@ func (x *ResolvePITOverlayResponse) GetRecommendation() string {
 		return x.Recommendation
 	}
 	return ""
+}
+
+func (x *ResolvePITOverlayResponse) GetOverlayCurrent() string {
+	if x != nil {
+		return x.OverlayCurrent
+	}
+	return ""
+}
+
+func (x *ResolvePITOverlayResponse) GetNeedsOverwriteNewerWrites() bool {
+	if x != nil {
+		return x.NeedsOverwriteNewerWrites
+	}
+	return false
 }
 
 type PromoteReplicaProgress struct {
@@ -36782,14 +36812,15 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\vno_localize\x18\a \x01(\bR\n" +
 	"noLocalize\x125\n" +
 	"\x05proof\x18\b \x01(\v2\x1f.litevirt.v1.RuntimeActionProofR\x05proof\x126\n" +
-	"\x18accept_not_point_in_time\x18\t \x01(\bR\x14acceptNotPointInTime\"\xcf\x01\n" +
+	"\x18accept_not_point_in_time\x18\t \x01(\bR\x14acceptNotPointInTime\"\x85\x02\n" +
 	"\x18ResolvePITOverlayRequest\x12\x17\n" +
 	"\avm_name\x18\x01 \x01(\tR\x06vmName\x12\x1b\n" +
 	"\tdisk_name\x18\x02 \x01(\tR\bdiskName\x12\x16\n" +
 	"\x06action\x18\x03 \x01(\tR\x06action\x12\x18\n" +
 	"\aconfirm\x18\x04 \x01(\bR\aconfirm\x12!\n" +
 	"\fforce_commit\x18\x05 \x01(\bR\vforceCommit\x12(\n" +
-	"\x10accept_torn_disk\x18\x06 \x01(\bR\x0eacceptTornDisk\"\xf1\x02\n" +
+	"\x10accept_torn_disk\x18\x06 \x01(\bR\x0eacceptTornDisk\x124\n" +
+	"\x16overwrite_newer_writes\x18\a \x01(\bR\x14overwriteNewerWrites\"\xdb\x03\n" +
 	"\x19ResolvePITOverlayResponse\x12\x18\n" +
 	"\aoverlay\x18\x01 \x01(\tR\aoverlay\x12\x12\n" +
 	"\x04disk\x18\x02 \x01(\tR\x04disk\x12\x18\n" +
@@ -36804,7 +36835,9 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	" \x01(\tR\bifCommit\x12\x1d\n" +
 	"\n" +
 	"if_discard\x18\v \x01(\tR\tifDiscard\x12&\n" +
-	"\x0erecommendation\x18\f \x01(\tR\x0erecommendation\"\xb5\x02\n" +
+	"\x0erecommendation\x18\f \x01(\tR\x0erecommendation\x12'\n" +
+	"\x0foverlay_current\x18\r \x01(\tR\x0eoverlayCurrent\x12?\n" +
+	"\x1cneeds_overwrite_newer_writes\x18\x0e \x01(\bR\x19needsOverwriteNewerWrites\"\xb5\x02\n" +
 	"\x16PromoteReplicaProgress\x12?\n" +
 	"\x05phase\x18\x01 \x01(\x0e2).litevirt.v1.PromoteReplicaProgress.PhaseR\x05phase\x12\x17\n" +
 	"\avm_name\x18\x02 \x01(\tR\x06vmName\x12\x12\n" +

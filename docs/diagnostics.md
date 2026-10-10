@@ -1349,9 +1349,13 @@ do for that verdict. `lv inspect <vm>` shows the same text as
 (`disk.pit_overlay_held` event, `replication.pit_overlay_held` notification) and
 then at most once a day while it lasts.
 
-It resolves when the hold clears: the overlay is committed or found already
+A host that does not hold the `pit_overlay` release feature raises it for any
+overlay it finds, verifiable or not: it settles none (docs/backups.md, "Older
+builds and `.lv-pit` overlays"). It resolves when the hold clears: the overlay is committed or found already
 merged by any later start, copy, move or define of the disk; an admin resolves
-it with `lv resolve-pit-overlay <vm> <disk>`; or the disk is deleted. Run that
+it with `lv resolve-pit-overlay <vm> <disk>`; `lv backup restore-from
+--in-place` sets the overlay aside before it restores; or the disk is deleted
+(a host that cannot see the disk never resolves it). Run that
 command without `--confirm` first: it prints the verdict, the disk's identity
 then and now, and what `--commit` and `--discard` would each do.
 ### Deferred out-of-band stop sync after a restart or rejoin

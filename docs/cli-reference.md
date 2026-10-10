@@ -521,6 +521,7 @@ lv move-volume <vm> <disk> <target-pool>       # Move a disk between pools (live
 lv replicate-volume <vm> <disk> <target-pool>  # Point-in-time copy: plain if shut off, else a backup session or external snapshot; a last-resort -U copy is reported NOT point-in-time
 lv resolve-pit-overlay <vm> <disk>                       # Admin: the verdict on a point-in-time overlay that holds a VM, and what each action would do (see backups.md)
 lv resolve-pit-overlay <vm> <disk> --commit --confirm    # Commit it; refused unless the verdict says it is safe (--force-commit overrides, experts only)
+lv resolve-pit-overlay <vm> <disk> --commit --force-commit --overwrite-newer-writes --confirm  # Expert only: commit an overlay already in the disk, over the guest's newer writes
 lv resolve-pit-overlay <vm> <disk> --discard --confirm   # Discard it; of a half-written disk only with --accept-torn-disk
 
 # Migrate every VM's volumes in a stack to a different pool (rolling, online):

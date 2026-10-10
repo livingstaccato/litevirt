@@ -1,15 +1,26 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 )
+
+// overwriteNewerWarning is printed, before anything is sent, when a forced
+// commit would write an overlay that is already in the disk over it again.
+const overwriteNewerWarning = `WARNING: this overlay is already in the disk (verdict %s). Committing it again
+writes the window's old blocks over everything the guest has written to the
+disk since: a silent rollback of part of the disk. Discarding it
+(--discard --confirm) loses nothing.
+  --commit would: %s
+`
 
 // forceCommitWarning is printed before a --force-commit is sent.
 const forceCommitWarning = `WARNING: --force-commit writes the overlay's blocks into the disk although
@@ -21,7 +32,7 @@ files yourself.
 `
 
 func newResolvePITOverlayCmd() *cobra.Command {
-	var commit, discard, confirm, forceCommit, acceptTorn bool
+	var commit, discard, confirm, forceCommit, acceptTorn, overwriteNewer bool
 	cmd := &cobra.Command{
 		Use:   "resolve-pit-overlay <vm> <disk>",
 		Short: "Show the verdict on, then commit or discard, a point-in-time copy overlay that holds a VM (admin)",
@@ -49,6 +60,11 @@ would do. The verdicts:
   --force-commit      with --commit: commit whatever the verdict (experts only;
                       the overlay's backing file must still be this disk)
   --discard           delete the overlay and its writes
+  --overwrite-newer-writes
+                      with --force-commit: commit an overlay that is already
+                      in the disk (verdict pivoted). That writes its old
+                      blocks over the guest's newer writes; refused without
+                      it, and asked for interactively if missing
   --accept-torn-disk  with --discard: discard although a commit had begun
                       writing the disk, which leaves it inconsistent; restoring
                       the disk from a backup or a replica is the alternative
@@ -68,6 +84,9 @@ The VM must not be running. Admin only. Audited.`,
 			if acceptTorn && !discard {
 				return fmt.Errorf("--accept-torn-disk goes with --discard")
 			}
+			if overwriteNewer && !forceCommit {
+				return fmt.Errorf("--overwrite-newer-writes goes with --force-commit")
+			}
 			action := ""
 			switch {
 			case commit:
@@ -75,13 +94,25 @@ The VM must not be running. Admin only. Audited.`,
 			case discard:
 				action = "discard"
 			}
-			if forceCommit {
-				fmt.Fprint(os.Stderr, forceCommitWarning)
-			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				if forceCommit && confirm {
+					// Ask the verdict first, and warn before anything is sent.
+					dry, err := c.ResolvePITOverlay(ctx, &pb.ResolvePITOverlayRequest{VmName: args[0], DiskName: args[1]})
+					if err != nil {
+						return fmt.Errorf("resolve point-in-time overlay: %w", err)
+					}
+					fmt.Fprint(os.Stderr, forceCommitWarning)
+					if dry.GetNeedsOverwriteNewerWrites() && !overwriteNewer {
+						fmt.Fprintf(os.Stderr, overwriteNewerWarning, dry.GetVerdict(), dry.GetIfCommit())
+						if !confirmOverwriteNewer(os.Stdin, os.Stderr) {
+							return fmt.Errorf("refused: the overlay is already in the disk; pass --overwrite-newer-writes (or answer yes) to overwrite the newer writes")
+						}
+						overwriteNewer = true
+					}
+				}
 				resp, err := c.ResolvePITOverlay(ctx, &pb.ResolvePITOverlayRequest{
 					VmName: args[0], DiskName: args[1], Action: action, Confirm: confirm,
-					ForceCommit: forceCommit, AcceptTornDisk: acceptTorn,
+					ForceCommit: forceCommit, AcceptTornDisk: acceptTorn, OverwriteNewerWrites: overwriteNewer,
 				})
 				if err != nil {
 					return fmt.Errorf("resolve point-in-time overlay: %w", err)
@@ -99,13 +130,24 @@ The VM must not be running. Admin only. Audited.`,
 	cmd.Flags().BoolVar(&confirm, "confirm", false, "carry the action out (without it, only report the verdict)")
 	cmd.Flags().BoolVar(&forceCommit, "force-commit", false, "with --commit: commit whatever the verdict (experts only)")
 	cmd.Flags().BoolVar(&acceptTorn, "accept-torn-disk", false, "with --discard: discard although a commit had begun writing the disk")
+	cmd.Flags().BoolVar(&overwriteNewer, "overwrite-newer-writes", false, "with --force-commit: commit an overlay already in the disk, over the guest's newer writes")
 	return cmd
+}
+
+// confirmOverwriteNewer asks, on a terminal only, for a typed "yes".
+func confirmOverwriteNewer(in io.Reader, out io.Writer) bool {
+	if !stdinIsTerminal() {
+		return false
+	}
+	fmt.Fprint(out, "Type yes to overwrite the newer writes: ")
+	line, _ := bufio.NewReader(in).ReadString('\n')
+	return strings.TrimSpace(line) == "yes"
 }
 
 func printPITResolve(w io.Writer, resp *pb.ResolvePITOverlayResponse) {
 	fmt.Fprintf(w, "Overlay:  %s\nDisk:     %s\nBinding:  %s\n", resp.GetOverlay(), resp.GetDisk(), resp.GetBinding())
 	if resp.GetVerdict() != "" {
-		fmt.Fprintf(w, "Now:      %s\nBacking:  %s\nVerdict:  %s", resp.GetCurrent(), resp.GetBackingFile(), resp.GetVerdict())
+		fmt.Fprintf(w, "Now:      %s\nOverlay now: %s\nBacking:  %s\nVerdict:  %s", resp.GetCurrent(), resp.GetOverlayCurrent(), resp.GetBackingFile(), resp.GetVerdict())
 		if r := resp.GetVerdictReason(); r != "" {
 			fmt.Fprintf(w, " (%s)", r)
 		}

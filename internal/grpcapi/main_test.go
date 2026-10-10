@@ -28,6 +28,9 @@ func TestMain(m *testing.M) {
 	// Test disks live in temporary directories, which may be a tmpfs; a
 	// layer-2 overlay is refused there in production (pitoverlay.Placement).
 	pitoverlay.AllowVolatileForTest()
+	// Layer 2 waits for the pit_overlay release feature, which fails closed
+	// until the release token is wired; the suite tests layer 2 with it open.
+	pitoverlay.OpenFeatureForTest()
 	// No test looks up a real NFS server name: each name gets an address of
 	// its own in the benchmarking range. Tests that need names to share an
 	// address, or to fail, override it themselves.

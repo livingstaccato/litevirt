@@ -236,37 +236,47 @@ func TestReplicateVolume_RunningVMIsPointInTime(t *testing.T) {
 		target, out = replicateVolume("layer 2")
 		writerAlive("layer 2", "l2")
 		stopWriter("l2")
-		if strings.Contains(out, "NOT point-in-time") {
-			t.Errorf("layer 2 made a copy that is not point-in-time:\n%s", out)
-		}
-		if d := lastReplicatedDetail(); !strings.Contains(d, "external snapshot") {
-			t.Errorf("layer 2's copy was not made by an external snapshot: %q", d)
-		}
-		requirePointInTime("layer 2 (external snapshot)", target)
-		if blk := l.mustSSH(h, 30*time.Second, "virsh domblklist "+shellQuote(vm)); !strings.Contains(blk, root) || strings.Contains(blk, ".lv-pit") {
-			t.Errorf("after layer 2 the VM does not run on its disk:\n%s", blk)
-		}
-		inactive := l.mustSSH(h, 30*time.Second, "virsh dumpxml --inactive "+shellQuote(vm))
-		if strings.Contains(inactive, ".lv-pit") || !strings.Contains(inactive, root) {
-			t.Errorf("after layer 2 the persistent definition does not name the disk alone:\n%s", inactive)
-		}
-		if strings.Contains(inactive, "<backingStore type") {
-			t.Errorf("after layer 2 the persistent definition keeps a backing chain:\n%s", inactive)
-		}
-		if job, _ := l.ssh(h, 30*time.Second, "virsh blockjob "+shellQuote(vm)+" "+shellQuote(root)+" --info"); !strings.Contains(job, "No current block job") {
-			t.Errorf("after layer 2 a block job is left on the disk: %s", job)
-		}
-		if l.fileExists(h, overlay) {
-			t.Errorf("after layer 2 the overlay %s is still there", overlay)
-		}
-		// The window's token was written on the real disk before the
-		// snapshot (round 4, N1). On a pool filesystem with user xattrs it
-		// is still there, 32 hex digits; a filesystem without them (NFS
-		// before 4.2) has none, and the binding recorded no_xattr.
-		if tok, err := l.ssh(h, 30*time.Second, "getfattr --only-values -n user.litevirt.pit_window "+shellQuote(root)+" 2>&1"); err != nil {
-			t.Logf("layer 2: no window token on %s (a filesystem without user xattrs?): %s", root, tok)
-		} else if tok = strings.TrimSpace(tok); len(tok) != 32 {
-			t.Errorf("layer 2: the window token on %s is %q, want 32 hex digits", root, tok)
+		if strings.Contains(out, "pit_overlay") {
+			// Layer 2 waits for the pit_overlay release feature (round 5,
+			// I3): until this build holds it, the copy takes the existing
+			// path, marked, and no overlay is ever made.
+			l.mark("layer 2 is gated on the pit_overlay release feature; the copy took the last layer")
+			if !strings.Contains(out, "NOT point-in-time") || l.fileExists(h, overlay) {
+				t.Errorf("a gated layer 2 made an overlay or an unmarked copy:\n%s", out)
+			}
+		} else {
+			if strings.Contains(out, "NOT point-in-time") {
+				t.Errorf("layer 2 made a copy that is not point-in-time:\n%s", out)
+			}
+			if d := lastReplicatedDetail(); !strings.Contains(d, "external snapshot") {
+				t.Errorf("layer 2's copy was not made by an external snapshot: %q", d)
+			}
+			requirePointInTime("layer 2 (external snapshot)", target)
+			if blk := l.mustSSH(h, 30*time.Second, "virsh domblklist "+shellQuote(vm)); !strings.Contains(blk, root) || strings.Contains(blk, ".lv-pit") {
+				t.Errorf("after layer 2 the VM does not run on its disk:\n%s", blk)
+			}
+			inactive := l.mustSSH(h, 30*time.Second, "virsh dumpxml --inactive "+shellQuote(vm))
+			if strings.Contains(inactive, ".lv-pit") || !strings.Contains(inactive, root) {
+				t.Errorf("after layer 2 the persistent definition does not name the disk alone:\n%s", inactive)
+			}
+			if strings.Contains(inactive, "<backingStore type") {
+				t.Errorf("after layer 2 the persistent definition keeps a backing chain:\n%s", inactive)
+			}
+			if job, _ := l.ssh(h, 30*time.Second, "virsh blockjob "+shellQuote(vm)+" "+shellQuote(root)+" --info"); !strings.Contains(job, "No current block job") {
+				t.Errorf("after layer 2 a block job is left on the disk: %s", job)
+			}
+			if l.fileExists(h, overlay) {
+				t.Errorf("after layer 2 the overlay %s is still there", overlay)
+			}
+			// The window's token was written on the real disk before the
+			// snapshot (round 4, N1). On a pool filesystem with user xattrs it
+			// is still there, 32 hex digits; a filesystem without them (NFS
+			// before 4.2) has none, and the binding recorded no_xattr.
+			if tok, err := l.ssh(h, 30*time.Second, "getfattr --only-values -n user.litevirt.pit_window "+shellQuote(root)+" 2>&1"); err != nil {
+				t.Logf("layer 2: no window token on %s (a filesystem without user xattrs?): %s", root, tok)
+			} else if tok = strings.TrimSpace(tok); len(tok) != 32 {
+				t.Errorf("layer 2: the window token on %s is %q, want 32 hex digits", root, tok)
+			}
 		}
 
 		// Leg 3: no session and no snapshot, so main's -U copy, marked.

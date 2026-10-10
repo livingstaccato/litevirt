@@ -95,18 +95,28 @@ func (s *Server) ResolvePITOverlay(ctx context.Context, req *pb.ResolvePITOverla
 	} else {
 		resp.Binding = "none: " + berr.Error()
 	}
-	if s.domainActivity(vm) != activityInactive {
-		return nil, status.Errorf(codes.FailedPrecondition, "vm %q is running or its state is unknown; stop it before resolving its overlay", vm.Name)
-	}
 	owner := pitOwner(vm, d)
+	activity := s.domainActivity(vm)
 	a := pitoverlay.Assess(disk, owner, false)
 	resp.Verdict, resp.VerdictReason = string(a.Verdict), a.Reason
-	resp.Current, resp.BackingFile = a.Current, a.Backing
+	resp.Current, resp.BackingFile, resp.OverlayCurrent = a.Current, a.Backing, a.OverlayCurrent
 	resp.IfCommit, resp.IfDiscard = a.Consequences()
 	resp.Recommendation = pitoverlay.HoldAdvice(vm.Name, d.DiskName, a)
+	// A commit of an overlay already in the disk writes the window's old
+	// blocks over everything the guest wrote since.
+	mergedAlready := a.Verdict == pitoverlay.Pivoted || (a.Binding != nil && a.Binding.State == pitoverlay.StateCommitted)
+	resp.NeedsOverwriteNewerWrites = mergedAlready
 	if !req.GetConfirm() {
+		// The dry run answers whatever the VM does: a hold on a running VM
+		// points the admin here.
 		resp.Status = fmt.Sprintf("verdict %s; nothing done — repeat with --commit or --discard, and --confirm", a.Verdict)
+		if activity != activityInactive {
+			resp.Status = fmt.Sprintf("verdict %s (the VM is running, so the disk may change); nothing done — stop the VM, then repeat with --commit or --discard, and --confirm", a.Verdict)
+		}
 		return resp, nil
+	}
+	if activity != activityInactive {
+		return nil, status.Errorf(codes.FailedPrecondition, "vm %q is running or its state is unknown; stop it before resolving its overlay", vm.Name)
 	}
 	repoint := func() error {
 		if s.pitSnapshotter != nil && s.virt != nil && s.virt.DomainExists(vm.Name) {
@@ -117,6 +127,12 @@ func (s *Server) ResolvePITOverlay(ctx context.Context, req *pb.ResolvePITOverla
 	switch req.GetAction() {
 	case "commit":
 		safe := a.Verdict == pitoverlay.Matches || a.Verdict == pitoverlay.HalfWritten
+		if !safe && req.GetForceCommit() && mergedAlready && !req.GetOverwriteNewerWrites() {
+			s.audit(ctx, "vm.pit_overlay.commit", vm.Name, fmt.Sprintf("%s → %s: forced commit refused, the overlay is already in the disk (verdict %s)", resp.Overlay, disk, a.Verdict), "denied")
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"forced commit refused: the overlay is already in the disk (verdict %s), so committing it again writes the window's old blocks over everything the guest has written to %s since — a silent rollback of part of the disk. Discard it instead (--discard --confirm). Only --overwrite-newer-writes, with --force-commit, overrides this",
+				a.Verdict, disk)
+		}
 		if !safe && !req.GetForceCommit() {
 			s.audit(ctx, "vm.pit_overlay.commit", vm.Name, fmt.Sprintf("%s → %s: refused, verdict %s (%s)", resp.Overlay, disk, a.Verdict, a.Reason), "denied")
 			return nil, status.Errorf(codes.FailedPrecondition,
@@ -135,6 +151,9 @@ func (s *Server) ResolvePITOverlay(ctx context.Context, req *pb.ResolvePITOverla
 				err = repoint()
 			}
 			resp.Status = fmt.Sprintf("FORCED commit into the disk against verdict %s (%s); the overlay is gone", a.Verdict, a.Reason)
+			if mergedAlready {
+				resp.Status = fmt.Sprintf("FORCED commit with --overwrite-newer-writes: the overlay's old blocks were written over the guest's newer writes (verdict %s); the overlay is gone", a.Verdict)
+			}
 		}
 		if err != nil {
 			s.audit(ctx, "vm.pit_overlay.commit", vm.Name, fmt.Sprintf("%s → %s: %v", resp.Overlay, disk, err), "error")

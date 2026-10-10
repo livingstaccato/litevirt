@@ -264,6 +264,12 @@ const pitDiskFormat = "qcow2"
 // Before the window opens the disk is given a new window token
 // (pitoverlay.OpenWindow), durably, and the binding records it.
 func (s *Server) copyViaExternalSnapshot(ctx context.Context, vm *corrosion.VMRecord, d *corrosion.DiskRecord, dst string, emit func(*pb.MoveVolumeProgress) error) (copyMethod, error) {
+	// No overlay before every host serving the pool understands one: an
+	// older build would start the VM on the bare disk and drop the
+	// window's writes. Until then the copy takes the existing path.
+	if open, why := pitoverlay.FeatureOpen(); !open {
+		return "", errors.New(why)
+	}
 	if s.pitSnapshotter == nil {
 		return "", errors.New("no snapshotter on this host")
 	}
@@ -342,16 +348,26 @@ func (s *Server) commitPITOverlay(ctx context.Context, vm *corrosion.VMRecord, d
 	stop := pitoverlay.KeepCommitting(ctx, disk)
 	err := s.pitSnapshotter.CommitDiskOverlay(vm.Name, d.Path, overlay, pitDiskFormat, func() error { return pitMarkPivoting(disk) })
 	stop()
-	// What happened, whatever CommitDiskOverlay said: the domain left the
-	// overlay (the pivot landed: the overlay is merged) or is still on it.
+	// What happened, whatever CommitDiskOverlay said. A recorded pivot on a
+	// running domain that left the overlay landed: the overlay is merged.
+	// Anything else is not recorded as merged: a pivot that did not land
+	// goes back to committing.
 	if on, qerr := s.pitSnapshotter.DomainRunsOnFile(vm.Name, overlay); qerr == nil {
-		if !on {
+		b, berr := pitoverlay.BindingOf(disk)
+		switch {
+		case berr != nil:
+		case !on && b.State == pitoverlay.StatePivoting && s.domainActive(vm):
 			if merr := pitoverlay.MarkCommitted(disk); merr != nil {
 				slog.Warn("copy: a landed pivot not recorded committed; the pivoting record stands", "vm", vm.Name, "overlay", overlay, "error", merr)
 			}
-		} else if b, berr := pitoverlay.BindingOf(disk); berr == nil && b.State == pitoverlay.StatePivoting {
+		case on && b.State == pitoverlay.StatePivoting:
 			_ = pitMarkCommitting(disk) // the pivot did not land
 		}
+	}
+	// The disk as this attempt left it (a binding still committing only):
+	// nothing writes it until the next attempt.
+	if eerr := pitoverlay.RecordAttemptEnd(disk); eerr != nil {
+		slog.Warn("copy: the end of a commit attempt not recorded", "vm", vm.Name, "overlay", overlay, "error", eerr)
 	}
 	if err == nil {
 		var used bool
@@ -415,6 +431,11 @@ func (s *Server) healPITOverlay(ctx context.Context, vm *corrosion.VMRecord, d *
 	}
 	overlay := pitOverlayPath(d.Path)
 	owner := pitOwner(vm, d)
+	if open, _ := pitoverlay.FeatureOpen(); !open {
+		// Below the pit_overlay feature this host settles no overlay — not
+		// even live: one present was made by a host above it. Held.
+		return s.holdPITOverlay(ctx, vm, d, pitoverlay.Assess(disk, owner, false))
+	}
 	committed := fmt.Sprintf("%s: an earlier point-in-time overlay %s was committed back into %s", d.DiskName, overlay, d.Path)
 	switch s.domainActivity(vm) {
 	case activityUnknown:
@@ -454,14 +475,23 @@ func (s *Server) healPITOverlay(ctx context.Context, vm *corrosion.VMRecord, d *
 				fmt.Sprintf("%s: the point-in-time overlay %s had already been committed into %s (the VM runs on the disk); it was removed", d.DiskName, overlay, d.Path))
 			return nil
 		}
-		if b := a.Binding; b != nil && (b.State == pitoverlay.StateWindow || b.State == pitoverlay.StateCommitting || b.State == "") {
-			// No pivot was recorded, yet the VM runs on its disk: something
-			// started it there without the overlay. Its writes since are
-			// newer than the overlay's, so it is never committed now.
-			if err := pitoverlay.MarkDiverged(disk, "the running VM was found on its disk, not on the overlay, with no pivot recorded"); err != nil {
+		if b := a.Binding; b != nil && !a.BelowFeature && b.State != pitoverlay.StateDiverged && b.State != pitoverlay.StateCommitted {
+			// No pivot is recorded that the disk's writes can be its own
+			// after (none at all, or one recorded long before them), yet the
+			// VM runs on its disk: something started it there without the
+			// overlay. Its writes since are newer than the overlay's, so it
+			// is never committed now.
+			why := "the running VM was found on its disk, not on the overlay, with no pivot recorded that its writes follow"
+			if err := pitMarkDiverged(disk, why); err != nil {
+				// Unrecorded, the binding may still read half-written: hold
+				// as unknown, never on the binding as it stands.
 				slog.Warn("point-in-time overlay: diverged not recorded", "vm", vm.Name, "overlay", overlay, "error", err)
+				a = pitoverlay.Assessment{Verdict: pitoverlay.Unknown, Binding: a.Binding, CommitBegan: a.CommitBegan,
+					Current: a.Current, Backing: a.Backing, DiskMtimeNs: a.DiskMtimeNs, OverlayMtimeNs: a.OverlayMtimeNs, OverlayCurrent: a.OverlayCurrent,
+					Reason: fmt.Sprintf("%s (and that could not be recorded: %v)", why, err)}
+			} else {
+				a = pitoverlay.Assess(disk, owner, true)
 			}
-			a = pitoverlay.Assess(disk, owner, true)
 		}
 		return s.holdPITOverlay(ctx, vm, d, a)
 	default:
@@ -494,6 +524,7 @@ var (
 	pitBind           = pitoverlay.BindWindow
 	pitMarkCommitting = pitoverlay.MarkCommitting
 	pitMarkPivoting   = pitoverlay.MarkPivoting
+	pitMarkDiverged   = pitoverlay.MarkDiverged
 )
 
 // The health condition of a disk held on its overlay: one per disk, subject

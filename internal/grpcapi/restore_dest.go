@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,7 +20,9 @@ import (
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/image"
+	"github.com/litevirt/litevirt/internal/notify"
 	"github.com/litevirt/litevirt/internal/pbsstore"
+	"github.com/litevirt/litevirt/internal/pitoverlay"
 	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/randid"
 	"github.com/litevirt/litevirt/internal/safename"
@@ -310,9 +313,36 @@ func (s *Server) inPlaceRestoreLocked(ctx context.Context, vmName, diskName stri
 	// writes over the disk: committed if it is this disk's as it is, else set
 	// aside — never committed later over the restored contents.
 	if err := s.healPITOverlay(ctx, vm, disk); err != nil {
-		return restoreDest{}, status.Errorf(codes.FailedPrecondition, "in_place: %v", err)
+		// A held overlay cannot be committed, and the restore is about to
+		// replace the disk it was taken of: set it aside (kept, never
+		// deleted) so it can never meet the restored disk, and go on. That
+		// is the advice a hold gives for a disk that cannot be trusted.
+		if serr := s.setAsideHeldOverlayForRestore(ctx, vm, disk, err); serr != nil {
+			return restoreDest{}, status.Errorf(codes.FailedPrecondition, "in_place: %v", serr)
+		}
 	}
 	return restoreDest{path: disk.Path, inPlace: true, disk: disk}, nil
+}
+
+// setAsideHeldOverlayForRestore sets aside disk's overlay that held the VM
+// (heal failed with held), for an in-place restore that replaces the disk.
+// Anything but a hold on a VM that is not running is refused (heldErr).
+func (s *Server) setAsideHeldOverlayForRestore(ctx context.Context, vm *corrosion.VMRecord, disk *corrosion.DiskRecord, heldErr error) error {
+	path := s.hostDiskFile(disk.Path)
+	if status.Code(heldErr) != codes.FailedPrecondition || !pitoverlay.Present(path) || s.domainActivity(vm) != activityInactive {
+		return heldErr
+	}
+	to, err := pitoverlay.SetAside(path, time.Now().UTC().Format("20060102-150405"))
+	if err != nil {
+		return fmt.Errorf("%v; and setting the overlay aside for the restore: %w", heldErr, err)
+	}
+	detail := fmt.Sprintf("%s: the in-place restore replaces the disk %s; its point-in-time overlay, which could not be verified, was set aside as %s (with its binding as %s.id), kept, so it never meets the restored disk. Inspect it, then delete it",
+		disk.DiskName, path, to, to)
+	slog.Warn("restore: point-in-time overlay set aside", "vm", vm.Name, "detail", detail)
+	s.ClearPITOverlayHold(ctx, vm.Name, disk.DiskName)
+	s.recordVMEventSeverity(ctx, vm.Name, "disk.pit_overlay_set_aside", "warning", "warn", detail)
+	s.notify(ctx, notify.Notification{Kind: "replication.pit_overlay_set_aside", Severity: notify.SevWarn, Subject: vm.Name, Detail: detail})
+	return nil
 }
 
 // vmDisksClosed reports whether nothing holds vm's disks open: the record says

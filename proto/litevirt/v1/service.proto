@@ -2535,6 +2535,11 @@ message ResolvePITOverlayRequest {
     // inconsistent.
     bool   force_commit     = 5;
     bool   accept_torn_disk = 6;
+    // overwrite_newer_writes lets force_commit go ahead on an overlay that is
+    // already in the disk (verdict pivoted, or a committed binding): the
+    // commit then writes the window's old blocks over everything the guest
+    // wrote since. Refused without it, whatever force_commit says.
+    bool   overwrite_newer_writes = 7;
 }
 message ResolvePITOverlayResponse {
     string overlay = 1; // the overlay file
@@ -2550,6 +2555,10 @@ message ResolvePITOverlayResponse {
     string if_commit      = 10; // what --commit would do, or why it is refused
     string if_discard     = 11; // what --discard would do, or why it is refused
     string recommendation = 12;
+    string overlay_current = 13; // the overlay's own identity now (its modification time)
+    // needs_overwrite_newer_writes: a forced commit of this overlay would
+    // overwrite the guest's newer writes, and needs overwrite_newer_writes.
+    bool   needs_overwrite_newer_writes = 14;
 }
 message PromoteReplicaProgress {
     enum Phase {

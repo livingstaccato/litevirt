@@ -45,7 +45,7 @@ func (f *Fake) SnapshotDiskExternal(domain, diskPath, overlay string) (bool, err
 	return false, nil
 }
 
-func (f *Fake) CommitDiskOverlay(domain, diskPath, overlay, diskFormat string) error {
+func (f *Fake) CommitDiskOverlay(domain, diskPath, overlay, diskFormat string, beforePivot func() error) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if st := f.domains[domain]; st == StateRunning || st == StatePaused {
@@ -54,9 +54,19 @@ func (f *Fake) CommitDiskOverlay(domain, diskPath, overlay, diskFormat string) e
 		}
 	}
 	if f.pitOn[overlay] == domain {
+		if beforePivot != nil {
+			if err := beforePivot(); err != nil {
+				return err
+			}
+		}
 		delete(f.pitOn, overlay)
 	}
 	return nil
+}
+
+// DomainRunsOnFile is DomainUsesFile: the model keeps one definition.
+func (f *Fake) DomainRunsOnFile(domain, path string) (bool, error) {
+	return f.DomainUsesFile(domain, path)
 }
 
 func (f *Fake) DomainUsesFile(domain, path string) (bool, error) {

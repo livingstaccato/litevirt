@@ -141,11 +141,16 @@ func pitSnapshotXML(domXML, diskPath, overlay string) (string, error) {
 // restart from it would lose every write made after the pivot. The overlay
 // file itself is the caller's to remove, once DomainUsesFile says nothing
 // references it.
-func (c *Client) CommitDiskOverlay(domain, diskPath, overlay, diskFormat string) error {
-	return commitDiskOverlay(c.virt, domain, diskPath, overlay, diskFormat)
+//
+// beforePivot, when set, runs once the commit is ready and before the pivot:
+// it records, durably, that a pivot is about to happen, so a daemon that dies
+// right after the pivot is known to have pivoted. If it fails, nothing is
+// pivoted: the job is aborted and the domain stays on the overlay.
+func (c *Client) CommitDiskOverlay(domain, diskPath, overlay, diskFormat string, beforePivot func() error) error {
+	return commitDiskOverlay(c.virt, domain, diskPath, overlay, diskFormat, beforePivot)
 }
 
-func commitDiskOverlay(v pitAPI, domain, diskPath, overlay, diskFormat string) error {
+func commitDiskOverlay(v pitAPI, domain, diskPath, overlay, diskFormat string, beforePivot func() error) error {
 	dom, err := v.DomainLookupByName(domain)
 	if err != nil {
 		return fmt.Errorf("lookup domain %s: %w", domain, err)
@@ -160,7 +165,7 @@ func commitDiskOverlay(v pitAPI, domain, diskPath, overlay, diskFormat string) e
 			return fmt.Errorf("dump domain xml: %w", err)
 		}
 		if dev := diskTargetForSource(live, overlay); dev != "" {
-			if err := activeCommitAndPivot(v, dom, dev, diskPath); err != nil {
+			if err := activeCommitAndPivot(v, dom, dev, diskPath, beforePivot); err != nil {
 				return err
 			}
 			after, err := v.DomainGetXMLDesc(dom, 0)
@@ -177,7 +182,7 @@ func commitDiskOverlay(v pitAPI, domain, diskPath, overlay, diskFormat string) e
 
 // activeCommitAndPivot commits dev's active layer down into diskPath and
 // pivots, resuming a commit job already there.
-func activeCommitAndPivot(v pitAPI, dom golibvirt.Domain, dev, diskPath string) error {
+func activeCommitAndPivot(v pitAPI, dom golibvirt.Domain, dev, diskPath string, beforePivot func() error) error {
 	found, typ, _, _, _, err := v.DomainGetBlockJobInfo(dom, dev, 0)
 	if err != nil {
 		return fmt.Errorf("block job of %s: %w", dev, err)
@@ -197,6 +202,15 @@ func activeCommitAndPivot(v pitAPI, dom golibvirt.Domain, dev, diskPath string) 
 	if err := waitPITCommitReady(v, dom, dev); err != nil {
 		_ = v.DomainBlockJobAbort(dom, dev, 0)
 		return fmt.Errorf("block-commit %s: %w", dev, err)
+	}
+	// Record the pivot before it happens: a daemon that dies right after it
+	// must find it recorded. No record, no pivot — the domain stays on the
+	// overlay with no job.
+	if beforePivot != nil {
+		if err := beforePivot(); err != nil {
+			_ = v.DomainBlockJobAbort(dom, dev, 0)
+			return fmt.Errorf("record the pivot of %s before it: %w", dev, err)
+		}
 	}
 	var perr error
 	for i := 0; i < pitPivotTries; i++ {
@@ -319,6 +333,24 @@ func waitPITCommitReady(v pitAPI, dom golibvirt.Domain, dev string) error {
 		}
 		time.Sleep(pitCommitPoll)
 	}
+}
+
+// DomainRunsOnFile reports whether the domain's LIVE definition names path as
+// a disk source: whether qemu runs the disk on it now.
+func (c *Client) DomainRunsOnFile(domain, path string) (bool, error) {
+	return domainRunsOnFile(c.virt, domain, path)
+}
+
+func domainRunsOnFile(v pitAPI, domain, path string) (bool, error) {
+	dom, err := v.DomainLookupByName(domain)
+	if err != nil {
+		return false, fmt.Errorf("lookup domain %s: %w", domain, err)
+	}
+	x, err := v.DomainGetXMLDesc(dom, 0)
+	if err != nil {
+		return false, fmt.Errorf("dump domain xml: %w", err)
+	}
+	return diskTargetForSource(x, path) != "", nil
 }
 
 // DomainUsesFile reports whether the domain's live or persistent definition

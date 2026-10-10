@@ -257,8 +257,8 @@ func TestSettle_ABaseNamedByAnotherHostsMountPath(t *testing.T) {
 	}
 }
 
-// R4: a "committing" binding vouches for the base only near the commit's
-// start. A base written long after it — a build that knows nothing of
+// R4: a "committing" binding vouches for the base only near its latest
+// commit attempt. A base written long after it — a build that knows nothing of
 // overlays ran the VM on it — is held, never overwritten.
 //
 // Mutation "committing unbounded": Check skips the CommitBound comparison —
@@ -271,6 +271,7 @@ func TestSettle_ACommitLongAgoAndABaseWrittenSinceIsHeld(t *testing.T) {
 	}
 	b, _ := readBinding(disk)
 	b.CommitStartedNs = time.Now().Add(-3 * time.Hour).UnixNano()
+	b.CommitAttemptNs = b.CommitStartedNs // the last attempt, too, long ago
 	if err := writeBinding(disk, b); err != nil {
 		t.Fatal(err)
 	}

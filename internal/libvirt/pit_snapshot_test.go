@@ -178,7 +178,7 @@ func TestPITCommit_PersistentDefinitionEndsOnTheDisk(t *testing.T) {
 	if _, err := snapshotDiskExternal(m, "web", "/pool/web-root.qcow2", "/pool/ov"); err != nil {
 		t.Fatal(err)
 	}
-	if err := commitDiskOverlay(m, "web", "/pool/web-root.qcow2", "/pool/ov", "qcow2"); err != nil {
+	if err := commitDiskOverlay(m, "web", "/pool/web-root.qcow2", "/pool/ov", "qcow2", nil); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 	if m.pivots != 1 || len(m.commits) != 1 || m.commits[0] != "vda→/pool/web-root.qcow2" {
@@ -201,7 +201,7 @@ func TestPITCommit_PersistentDefinitionEndsOnTheDisk(t *testing.T) {
 // A domain not on the overlay is left alone: no commit is started.
 func TestPITCommit_NotOnTheOverlayIsANoOp(t *testing.T) {
 	m := newPITModel()
-	if err := commitDiskOverlay(m, "web", "/pool/web-root.qcow2", "/pool/ov", "qcow2"); err != nil {
+	if err := commitDiskOverlay(m, "web", "/pool/web-root.qcow2", "/pool/ov", "qcow2", nil); err != nil {
 		t.Fatal(err)
 	}
 	if len(m.commits) != 0 || m.defined != "" {
@@ -220,7 +220,7 @@ func TestPITCommit_ResumesACommitJobAlreadyRunning(t *testing.T) {
 		t.Fatal(err)
 	}
 	m.jobRunning = true
-	if err := commitDiskOverlay(m, "web", "/pool/web-root.qcow2", "/pool/ov", "qcow2"); err != nil {
+	if err := commitDiskOverlay(m, "web", "/pool/web-root.qcow2", "/pool/ov", "qcow2", nil); err != nil {
 		t.Fatalf("commit with a job already running: %v", err)
 	}
 	if len(m.commits) != 0 {
@@ -247,7 +247,7 @@ func TestPITCommit_AFailedPivotIsRetriedThenAborted(t *testing.T) {
 		t.Fatal(err)
 	}
 	m.pivotFails = 2
-	if err := commitDiskOverlay(m, "web", "/pool/web-root.qcow2", "/pool/ov", "qcow2"); err != nil || m.pivots != 1 {
+	if err := commitDiskOverlay(m, "web", "/pool/web-root.qcow2", "/pool/ov", "qcow2", nil); err != nil || m.pivots != 1 {
 		t.Fatalf("two transient pivot failures: err %v pivots %d, want a retry that lands", err, m.pivots)
 	}
 
@@ -256,7 +256,7 @@ func TestPITCommit_AFailedPivotIsRetriedThenAborted(t *testing.T) {
 		t.Fatal(err)
 	}
 	m.pivotFails = 100
-	if err := commitDiskOverlay(m, "web", "/pool/web-root.qcow2", "/pool/ov", "qcow2"); err == nil {
+	if err := commitDiskOverlay(m, "web", "/pool/web-root.qcow2", "/pool/ov", "qcow2", nil); err == nil {
 		t.Fatal("a pivot that never lands reported success")
 	}
 	if m.aborts != 1 {
@@ -294,7 +294,7 @@ func TestPITCommit_InactiveDomainOnlyRepairsTheDefinition(t *testing.T) {
 		t.Fatal(err)
 	}
 	m.state = golibvirt.DomainShutoff
-	if err := commitDiskOverlay(m, "web", "/pool/web-root.qcow2", "/pool/ov", "qcow2"); err != nil {
+	if err := commitDiskOverlay(m, "web", "/pool/web-root.qcow2", "/pool/ov", "qcow2", nil); err != nil {
 		t.Fatalf("commit on an inactive domain: %v", err)
 	}
 	if len(m.commits) != 0 {
@@ -315,10 +315,50 @@ func TestPITCommit_NeverTouchesAnotherKindOfJob(t *testing.T) {
 		t.Fatal(err)
 	}
 	m.jobRunning, m.jobType = true, golibvirt.DomainBlockJobTypeCopy
-	if err := commitDiskOverlay(m, "web", "/pool/web-root.qcow2", "/pool/ov", "qcow2"); err == nil {
+	if err := commitDiskOverlay(m, "web", "/pool/web-root.qcow2", "/pool/ov", "qcow2", nil); err == nil {
 		t.Fatal("a commit ran over another kind of block job")
 	}
 	if m.pivots != 0 || m.aborts != 0 || len(m.commits) != 0 {
 		t.Errorf("pivots %d aborts %d commits %v: the other job was touched", m.pivots, m.aborts, m.commits)
+	}
+}
+
+// N3 of the round-4 review: a ready commit records, durably, that it is about
+// to pivot — before the pivot, never after — so a daemon that dies right
+// after the pivot is known to have pivoted. A record that fails stops the
+// pivot: the job is aborted and the domain stays on the overlay.
+//
+// Mutation "pivot not recorded" (beforePivot never called) — red. Mutation
+// "pivot despite a failed record" — red.
+func TestPITCommit_RecordsThePivotBeforeIt(t *testing.T) {
+	m := newPITModel()
+	if _, err := snapshotDiskExternal(m, "web", "/pool/web-root.qcow2", "/pool/ov"); err != nil {
+		t.Fatal(err)
+	}
+	pivotsAtRecord := -1
+	if err := commitDiskOverlay(m, "web", "/pool/web-root.qcow2", "/pool/ov", "qcow2", func() error {
+		pivotsAtRecord = m.pivots
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if pivotsAtRecord != 0 || m.pivots != 1 {
+		t.Fatalf("recorded with %d pivots done (want 0, before it), %d pivots in all", pivotsAtRecord, m.pivots)
+	}
+
+	m = newPITModel()
+	if _, err := snapshotDiskExternal(m, "web", "/pool/web-root.qcow2", "/pool/ov"); err != nil {
+		t.Fatal(err)
+	}
+	if err := commitDiskOverlay(m, "web", "/pool/web-root.qcow2", "/pool/ov", "qcow2", func() error {
+		return errors.New("ENOSPC")
+	}); err == nil {
+		t.Fatal("a commit whose pivot could not be recorded reported success")
+	}
+	if m.pivots != 0 || m.live["vda"] != "/pool/ov" {
+		t.Fatalf("pivots %d, live disk %q: it pivoted without the record", m.pivots, m.live["vda"])
+	}
+	if found, _, _, _, _, _ := m.DomainGetBlockJobInfo(golibvirt.Domain{}, "vda", 0); found != 0 {
+		t.Error("the unpivoted commit's job was left on the disk")
 	}
 }

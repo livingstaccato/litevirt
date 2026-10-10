@@ -396,6 +396,11 @@ type PlacementDef struct {
 	// it; storage motion not allowed). Set automatically by admission for
 	// VMs with non-migratable PCI passthrough.
 	NoMigrate bool `yaml:"no-migrate"`
+
+	// Failback: after a host drain moves this VM away, live-migrate it back
+	// once that host is undrained (docs/migration-failover.md#failback). It
+	// moves back only a VM the drain moved and nothing has moved since.
+	Failback bool `yaml:"failback"`
 }
 
 // RebalanceDef controls per-VM (or per-stack / per-cluster) rebalancer

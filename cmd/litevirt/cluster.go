@@ -26,6 +26,7 @@ func newClusterCmd() *cobra.Command {
 		newClusterConvergeCmd(),
 		newClusterAckLeaseTermCmd(),
 		newClusterFailoverScopeCmd(),
+		newClusterFailbackCmd(),
 		newClusterISOLibraryModeCmd(),
 		newClusterVoterCmd(),
 		newClusterClaimCmd(),
@@ -77,6 +78,56 @@ because a change made from one side of a partition reaches only that side.`,
 					}
 				}
 				printFailoverScope(os.Stdout, st)
+				return nil
+			})
+		},
+	}
+}
+
+// lv cluster failback [on|off] — show or change the cluster failback policy
+// (docs/migration-failover.md, "Failback after maintenance").
+func newClusterFailbackCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "failback [on|off]",
+		Short: "Show or set whether an undrain moves drained VMs back",
+		Long: `With no argument, show the failback policy.
+
+  off  (the default) an undrain moves nothing back. A VM can still opt in
+       itself (placement.failback in compose), or lv host failback <host> --all
+       moves them for one host.
+  on   undraining a host live-migrates back, in the background and one at a
+       time, every VM a drain of that host moved away and nothing has moved
+       since.
+
+The policy is replicated and cluster-wide. Changing it needs the admin role and
+refuses until every host runs a release that carries it (failover_scope_v1).`,
+		Args: cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				var st *pb.FailbackPolicyStatus
+				var err error
+				if len(args) == 1 {
+					if args[0] != "on" && args[0] != "off" {
+						return fmt.Errorf("failback policy is on or off, not %q", args[0])
+					}
+					st, err = c.SetFailbackPolicy(ctx, &pb.SetFailbackPolicyRequest{Enabled: args[0] == "on"})
+					if err != nil {
+						return fmt.Errorf("set failback policy: %w", err)
+					}
+				} else if st, err = c.GetFailbackPolicy(ctx, &emptypb.Empty{}); err != nil {
+					return fmt.Errorf("get failback policy: %w", err)
+				}
+				state := "off"
+				if st.GetEnabled() {
+					state = "on"
+				}
+				fmt.Printf("Failback: %s\n", state)
+				if st.GetSetBy() != "" {
+					fmt.Printf("Set by:   %s at %s\n", st.GetSetBy(), st.GetUpdatedAt())
+				}
+				if !st.GetSettable() {
+					fmt.Println("Changeable: no — failover_scope_v1 has not latched on every host yet")
+				}
 				return nil
 			})
 		},

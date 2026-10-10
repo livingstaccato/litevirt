@@ -466,6 +466,9 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 			failures++
 		} else if progress.Status == "done" && progress.Error != "" {
 			notStarted = append(notStarted, progress.VmName)
+		} else if progress.Status == "done" {
+			// Recorded so that undrain can move it back (failback.go).
+			s.recordDrainOrigin(ctx, progress.VmName, req.Name, progress.TargetHost)
 		}
 		if err := stream.Send(progress); err != nil {
 			return err
@@ -732,6 +735,9 @@ func (s *Server) UndrainHost(ctx context.Context, req *pb.UndrainHostRequest) (*
 	}
 	s.publish("host.undrained", req.Name, "")
 	s.audit(ctx, "host.undrain", req.Name, "", "ok")
+	// Moves back, in the background, the VMs a drain moved away that opted in
+	// to returning (failback.go). Nothing, when none did.
+	s.autoFailback(ctx, req.Name)
 
 	return s.InspectHost(ctx, &pb.InspectHostRequest{Name: req.Name})
 }

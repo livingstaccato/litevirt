@@ -915,12 +915,8 @@ func (x *DrainProgress) GetError() string {
 }
 
 type UndrainHostRequest struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	Name  string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	// failback: after the host is active again, move back the VMs a drain of
-	// it moved away, as FailbackHost does for every one of them (the
-	// operator asked, so a VM's own opt-in is not needed).
-	Failback      bool `protobuf:"varint,2,opt,name=failback,proto3" json:"failback,omitempty"`
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -960,13 +956,6 @@ func (x *UndrainHostRequest) GetName() string {
 		return x.Name
 	}
 	return ""
-}
-
-func (x *UndrainHostRequest) GetFailback() bool {
-	if x != nil {
-		return x.Failback
-	}
-	return false
 }
 
 // FailbackHost moves VMs a drain of the host moved away back to it, by live
@@ -34986,10 +34975,9 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\bstrategy\x18\x03 \x01(\x0e2\x1c.litevirt.v1.MigrateStrategyR\bstrategy\x12!\n" +
 	"\fprogress_pct\x18\x04 \x01(\x02R\vprogressPct\x12\x16\n" +
 	"\x06status\x18\x05 \x01(\tR\x06status\x12\x14\n" +
-	"\x05error\x18\x06 \x01(\tR\x05error\"D\n" +
+	"\x05error\x18\x06 \x01(\tR\x05error\"(\n" +
 	"\x12UndrainHostRequest\x12\x12\n" +
-	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1a\n" +
-	"\bfailback\x18\x02 \x01(\bR\bfailback\"T\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\"T\n" +
 	"\x13FailbackHostRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x10\n" +
 	"\x03all\x18\x02 \x01(\bR\x03all\x12\x17\n" +

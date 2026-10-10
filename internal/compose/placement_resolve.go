@@ -225,6 +225,9 @@ func MergePlacement(parent, child *PlacementDef) *PlacementDef {
 	if cCopy.NoMigrate {
 		out.NoMigrate = true
 	}
+	if cCopy.Failback {
+		out.Failback = true
+	}
 	if cCopy.Spread {
 		out.Spread = true
 	}

@@ -308,6 +308,8 @@ type Server struct {
 	// address. localIPs is a test seam for the host's own addresses.
 	migrationNetwork string
 	localIPs         func() ([]net.IP, error)
+	// failbacks is the set of hosts a failback is running for (failback.go).
+	failbacks failbackRuns
 	// isoResolvedWithheld makes EnsureDisks answer as a target older than
 	// installer_iso_resolved does (no map), for tests of a new source against
 	// a main target.

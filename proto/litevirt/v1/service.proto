@@ -21,13 +21,7 @@ message DrainHostRequest   { string name = 1; int32 parallel = 2; }
 message DrainProgress      { string vm_name = 1; string target_host = 2;
     MigrateStrategy strategy = 3; float progress_pct = 4;
     string status = 5; string error = 6; }
-message UndrainHostRequest {
-    string name = 1;
-    // failback: after the host is active again, move back the VMs a drain of
-    // it moved away, as FailbackHost does for every one of them (the
-    // operator asked, so a VM's own opt-in is not needed).
-    bool failback = 2;
-}
+message UndrainHostRequest { string name = 1; }
 // FailbackHost moves VMs a drain of the host moved away back to it, by live
 // migration, one at a time. Without all, only VMs that opted in (their
 // placement.failback, or the cluster failback policy) are considered.

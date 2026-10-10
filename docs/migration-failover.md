@@ -330,6 +330,55 @@ load-balancer apply there. A migration onto it is refused because its target is
 not `active`. A VM moved by a drain is started on its target, which is
 `active`.
 
+### Failback after maintenance
+
+`lv host undrain` returns a host to scheduling and moves nothing back. Failback
+is the opt-in that does, as Proxmox's HA failback property does: after the
+undrain, the VMs the drain moved away return by live migration, at a bounded
+rate.
+
+A drain records, for every VM it moves, the host it left and the host it went
+to, with the VM's creation time and ownership epoch at that moment. These
+records are replicated, so any node can run the failback, and they are written
+once `failover_scope_v1` has latched on every host (the same condition as
+`lv cluster failover-scope`); a drain on a cluster that has not latched it moves
+VMs as before and records nothing, so there is nothing to fail back.
+
+A VM returns only while its record still describes it exactly. One that an
+operator has since moved by hand (`lv migrate` spends its record), that a
+failover recovered (the ownership epoch no longer matches), that was deleted and
+created again, or that a later drain moved again stays where it is, and the run
+says so. A VM no drain moved is never touched.
+
+Opting in, any one of:
+
+- the VM: `placement.failback: true` in compose (see [compose](compose.md));
+- the cluster: `lv cluster failback on` returns every drained VM on undrain
+  (`lv cluster failback off`, the default, turns it off; admin role);
+- this run: `lv host undrain <host> --failback`, or
+  `lv host failback <host> --all`, which moves every VM the drain moved and
+  prints each result.
+
+With the policy on, or with a VM that opted in, `lv host undrain` starts the
+failback in the background on the daemon that served it and returns at once;
+progress is in the VM events (`vm.failback`) and the daemon log. `lv host
+failback <host>` runs it in the foreground and prints each VM's result, and
+`--dry-run` shows what would move without moving anything. Running it again
+after an interruption moves what is left.
+
+Each move is an ordinary live migration (`lv migrate`), so all of that move's
+checks hold, including the destination host's capacity admission and the
+split-brain gate. Before it, the returning host is checked as a placement target
+through the same hard filters as initial placement: capacity, required labels,
+devices, anti-affinity and per-node limits, and a VM pinned to another host
+stays there. A VM that fails any check is reported with the reason and left with
+its record. VMs move one at a time, with a pause between moves (20 seconds), so
+a returning host is not hit by every migration at once.
+
+Failback moves a running VM live. A VM that is stopped, or has a disk on
+host-local storage that a live move would have to copy, is reported and left;
+move it with `lv migrate <vm> <host> --cold`. The host must be `active`.
+
 ### A VM with no domain
 
 A drain by a build from before this behaviour moved a stopped VM by its record

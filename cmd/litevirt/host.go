@@ -29,6 +29,7 @@ func newHostCmd() *cobra.Command {
 		newHostDrainCmd(),
 		newHostShutdownWorkloadsCmd(),
 		newHostUndrainCmd(),
+		newHostFailbackCmd(),
 		newHostRmCmd(),
 		newHostLabelCmd(),
 		newHostFenceCmd(),
@@ -309,10 +310,19 @@ stop_timeout_sec is honored.`,
 }
 
 func newHostUndrainCmd() *cobra.Command {
-	return &cobra.Command{
+	var failback bool
+	cmd := &cobra.Command{
 		Use:   "undrain <host>",
 		Short: "Return host to active scheduling",
-		Args:  cobra.ExactArgs(1),
+		Long: `Return a draining or maintenance host to active scheduling.
+
+By itself this moves nothing back. VMs a drain moved away return when they opted
+in (placement.failback in compose) or the cluster policy is on (lv cluster
+failback on): the daemon then live-migrates them back in the background, one at
+a time. With --failback this run moves back every VM the drain moved, opted in
+or not, and prints each result; it is lv host failback <host> --all after the
+undrain.`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				h, err := c.UndrainHost(ctx, &pb.UndrainHostRequest{Name: args[0]})
@@ -320,10 +330,87 @@ func newHostUndrainCmd() *cobra.Command {
 					return fmt.Errorf("undrain: %w", err)
 				}
 				fmt.Printf("Host %s is now %s.\n", h.Name, h.State)
+				if failback {
+					return runFailback(ctx, c, args[0], true, false)
+				}
 				return nil
 			})
 		},
 	}
+	cmd.Flags().BoolVar(&failback, "failback", false, "After undraining, move back every VM the drain moved away")
+	return cmd
+}
+
+func newHostFailbackCmd() *cobra.Command {
+	var all, dryRun bool
+	cmd := &cobra.Command{
+		Use:   "failback <host>",
+		Short: "Move VMs a drain moved away back to the host, by live migration",
+		Long: `Move the VMs a drain of <host> moved away back to it, by live migration, one at
+a time with a pause between moves.
+
+Only a VM the drain moved, and that nothing has moved since, returns: one an
+operator migrated by hand, that failed over, or that a later drain moved again
+stays where it is, and the output says so. Each move is an ordinary live
+migration, after checking the host as a placement target (capacity, labels,
+devices, anti-affinity). A VM on host-local storage, or stopped, is reported and
+left; move it with lv migrate.
+
+Without --all only VMs that opted in return: placement.failback in compose, or
+the cluster policy (lv cluster failback on). --all moves every VM the drain
+moved. --dry-run shows what would move and why each other VM stays.
+
+The host must be active (lv host undrain first).`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				return runFailback(ctx, c, args[0], all, dryRun)
+			})
+		},
+	}
+	cmd.Flags().BoolVar(&all, "all", false, "Move back every VM the drain moved, not only those that opted in")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Report what would move; move nothing")
+	return cmd
+}
+
+// runFailback streams one failback and prints each VM's result. It returns an
+// error when any VM failed, so a script sees it.
+func runFailback(ctx context.Context, c pb.LiteVirtClient, host string, all, dryRun bool) error {
+	stream, err := c.FailbackHost(ctx, &pb.FailbackHostRequest{Name: host, All: all, DryRun: dryRun})
+	if err != nil {
+		return fmt.Errorf("failback: %w", err)
+	}
+	failed, n := 0, 0
+	for {
+		p, err := stream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("failback: %w", err)
+		}
+		n++
+		fmt.Println(failbackLine(p, host))
+		if p.Status == "failed" {
+			failed++
+		}
+	}
+	if n == 0 {
+		fmt.Printf("No VM was moved away from %s by a drain that is waiting to return.\n", host)
+	}
+	if failed > 0 {
+		return fmt.Errorf("failback: %d VM(s) did not move back", failed)
+	}
+	return nil
+}
+
+// failbackLine is one VM's line of failback output.
+func failbackLine(p *pb.FailbackProgress, host string) string {
+	line := fmt.Sprintf("  %s %s → %s [%s]", p.VmName, p.FromHost, host, p.Status)
+	if p.Reason != "" {
+		line += ": " + p.Reason
+	}
+	return line
 }
 
 // newHostPublishCRLCmd is the direct recovery path when a CRL was minted locally

@@ -996,6 +996,10 @@ func (s *Server) finalizeMigrationOwnership(ctx context.Context, vm *corrosion.V
 	if !committed {
 		return fmt.Errorf("ownership commit for VM %q did not land after retries: %w", vm.Name, lastErr)
 	}
+	// A live migration does not bump the VM's owner epoch, so a move by hand
+	// is told apart from the drain's own by spending the drain's record here
+	// (failback.go): the VM is wherever someone put it now.
+	s.spendDrainOrigin(fctx, vm.Name)
 
 	// A --with-storage migration COPIES each host-local disk to the target's own
 	// filesystem, leaving the source copy orphaned. Remove it (we run on the source

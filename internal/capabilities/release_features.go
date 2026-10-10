@@ -81,8 +81,9 @@ type FeatureInfo struct {
 // and IPv6 rules on firewall_ipv6, so a cluster with no IPv6 rule can still
 // roll back below the release.
 var releaseFeatures = map[Feature]FeatureInfo{
-	FeatureVMLimits:             {Token: Release202611V1, Description: "Per-VM CPU limit and shares, and NIC bandwidth limits"},
-	FeatureVMDiskNICIO:          {Token: Release202611V1, Description: "Per-disk I/O tuning and per-NIC tuning"},
+	FeatureVMLimits: {Token: Release202611V1, Description: "Per-VM CPU limit and shares, and NIC bandwidth limits"},
+	FeatureVMDiskNICIO: {Token: Release202611V1, Description: "Per-disk discard and I/O limits and per-NIC queues; discard defaults on for new disks",
+		Writers: []string{"internal/corrosion.InsertVMWithTuning", "internal/corrosion.MutateDesiredSpecTuning"}},
 	FeatureEmailTargetSecret:    {Token: Release202611V1, Description: "Email notification targets with a stored SMTP secret"},
 	FeatureLoginPolicy:          {Token: Release202611V1, Description: "Cluster login policy"},
 	FeatureDrainFailback:        {Token: Release202611V1, Description: "Failback of the workloads a drain moved"},

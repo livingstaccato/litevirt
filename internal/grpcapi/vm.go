@@ -27,6 +27,7 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/cloudinit"
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -389,6 +390,22 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 
 	slog.Info("creating VM", "name", spec.Name, "image", spec.Image, "cpu", spec.Cpu, "memory", spec.MemoryMib)
 
+	// Disk/NIC tuning is written by THIS node, so the feature's gate runs here,
+	// before anything is created. A spec that sets tuning needs the grant (the
+	// entry check above only fails fast); a spec that does not gets the default
+	// discard only when the gate opens, and otherwise creates exactly as main.
+	var ioG capabilities.FeatureGrant
+	if specSetsDiskNICIO(spec) {
+		g, gerr := s.ioGrant(ctx)
+		if gerr != nil {
+			return nil, gerr
+		}
+		ioG = g
+	} else if g, ok := s.ioGrantIfAvailable(ctx); ok {
+		ioG = g
+	}
+	ioGranted := ioG.Check(capabilities.FeatureVMDiskNICIO) == nil
+
 	// (spec.Uuid was minted above, before the ISO was resolved.)
 	// (Cpu/MemoryMib were defaulted before admission — see normalizeVMSpecResources.)
 
@@ -509,7 +526,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		// that spec.
 		// Only once the disk/NIC feature gate has opened: before it, an older owner
 		// would drop it, and the create must render exactly what main does.
-		if d.Discard == "" && s.diskNICIOActive(ctx) {
+		if d.Discard == "" && ioGranted {
 			d.Discard = defaultDiscard(storageType, d.Bus)
 		}
 		diskConfigs = append(diskConfigs, lv.DiskConfig{
@@ -553,7 +570,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		// The implicit root disk gets the default discard like a named one
 		// (after the latch). It is recorded in the spec, which is what every
 		// later render reads; before the latch the spec stays as main's.
-		if def := defaultDiscard("local", "virtio"); def != "" && s.diskNICIOActive(ctx) {
+		if def := defaultDiscard("local", "virtio"); def != "" && ioGranted {
 			spec.Disks = append(spec.Disks, &pb.DiskSpec{Name: "root", Size: "20G", Bus: "virtio", Discard: def})
 		}
 		diskRecords = append(diskRecords, corrosion.DiskRecord{
@@ -1045,7 +1062,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		lv.WipeFirmwareState(s.dataDir, spec.Name, spec.Uuid)
 		return nil, ferr
 	}
-	if err := corrosion.InsertVMWithHardware(ctx, s.db, vmRecord, ifaceRecords, diskRecords, nicRecords, pciIntents, true); err != nil {
+	if err := s.insertVMForSpec(ctx, spec, ioG, vmRecord, ifaceRecords, diskRecords, nicRecords, pciIntents, true); err != nil {
 		// Scoped to creates that took an EXTERNAL-IPAM claim, so every existing
 		// deployment keeps today's behaviour exactly. With a claim in play, a
 		// running VM with no row is the one state that lets the orphan sweeper
@@ -4065,6 +4082,17 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		spec.StopDelaySec = *req.StopDelaySec
 	}
 
+	// This node writes the tuning, so the feature's gate runs here (the entry
+	// node only failed fast), before anything is stopped or redefined.
+	var ioG capabilities.FeatureGrant
+	if requestsHardwareTuning(req) {
+		g, gerr := s.ioGrant(ctx)
+		if gerr != nil {
+			return nil, gerr
+		}
+		ioG = g
+	}
+
 	// Discard / detect_zeroes / queue changes ride in the request and are merged
 	// into THIS host's spec (the owner's, under the VM lock), validated before
 	// anything is stopped. The merged spec is only written after the domain has
@@ -4629,7 +4657,13 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	// half-applied firmware update). MutateDesiredSpec persists the desired spec and
 	// bumps spec_generation; UpdateObservedActuals then records the stopped VM's new
 	// cpu/mem actuals against that generation so a later start boots the right size.
-	applied, newGen, err := corrosion.MutateDesiredSpec(ctx, s.db, req.Name, func(string) (string, error) {
+	mutateSpec := corrosion.MutateDesiredSpec
+	if requestsHardwareTuning(req) {
+		mutateSpec = func(ctx context.Context, c *corrosion.Client, name string, fn func(string) (string, error)) (bool, int64, error) {
+			return corrosion.MutateDesiredSpecTuning(ctx, c, ioG, name, fn)
+		}
+	}
+	applied, newGen, err := mutateSpec(ctx, s.db, req.Name, func(string) (string, error) {
 		return string(specJSON), nil
 	})
 	if err != nil || !applied {

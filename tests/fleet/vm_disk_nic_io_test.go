@@ -6,14 +6,15 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
-	"github.com/litevirt/litevirt/internal/health"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 )
 
@@ -67,19 +68,31 @@ func tuneOf(t *testing.T, node *Node, dev string) lv.IOTune {
 	return got
 }
 
-// ioLatchGate is a real capability gate on which the disk/NIC feature token
-// (a placeholder until the shared release token lands) has latched: this build
-// is the whole fleet.
-type ioLatchGate struct{ *health.Checker }
-
-func (g ioLatchGate) Enforced(ctx context.Context, tok string) bool {
-	return tok == "vm_disk_nic_io_v1" || g.Checker.Enforced(ctx, tok)
-}
-
+// latchIOFeature opens the disk/NIC feature's gate for real on every node: the
+// production wiring of the release-feature gate, the shared release token
+// latched across the fleet, and the feature's first use recorded and
+// acknowledged by every host.
 func latchIOFeature(t *testing.T, c *Cluster) {
 	t.Helper()
+	ctx := context.Background()
+	gates := gateAll(t, c)
+	wireReleaseFeatures(t, c, gates)
 	for _, n := range c.Nodes {
-		n.Server.SetGate(ioLatchGate{gateFor(t, c, n)})
+		if !gates[n.Name].Enforced(ctx, capabilities.FailoverScopeV1) {
+			t.Fatalf("%s: failover_scope_v1 did not latch", n.Name)
+		}
+	}
+	c.WaitConverged(t, convergeTimeout)
+	for _, n := range c.Nodes {
+		n := n
+		var last error
+		eventually(t, 15*time.Second, n.Name+" to open the disk/NIC gate", func() bool {
+			last = n.Server.WithReleaseFeature(ctx, capabilities.FeatureVMDiskNICIO,
+				func(_ context.Context, g capabilities.FeatureGrant) error {
+					return g.Check(capabilities.FeatureVMDiskNICIO)
+				})
+			return last == nil
+		})
 	}
 }
 

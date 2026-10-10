@@ -376,12 +376,17 @@ space it freed before the setting was on.
 `discard`, `detect_zeroes`, `iotune` and `queues` are kept in the VM's spec, and a
 host on an older release would drop them when it rewrites a spec (a failover onto it
 would rebuild the VM without its throttle). So they are accepted only once the
-cluster-wide upgrade gate has opened, which needs every host, one in maintenance
-included, to be on a release that keeps them. Until then a create, update,
-compose deploy, recreate or `lv disk-io` that sets any of them is refused with
-`the cluster upgrade must finish first`, and nothing about a VM that sets none of
-them changes. The gate has no config flag and, once open, stays open; to stop
-using the feature, clear the settings (`lv disk-io <vm> --clear`, or drop the keys).
+release token (`release_2026_11_v1`, feature `vm_disk_nic_io`) has latched, which needs
+every host, one in maintenance included, to be on a release that keeps them. Until then
+a create, update, compose deploy, recreate or `lv disk-io` that sets any of them is
+refused with `the cluster upgrade must finish first (vm_disk_nic_io needs
+release_2026_11_v1)`, and nothing about a VM that sets none of them changes: a restore
+or promotion of a spec that carries them still works, with the tuning dropped. Once the
+token has latched, the first write of any of them (an unset discard also becomes the
+storage default on a new disk) records the feature as used, and a rollback below the
+release is then blocked (see upgrades.md, *Rolling back after a release token latched*).
+The gate has no config flag and, once open, stays open; to stop using the feature, clear
+the settings (`lv disk-io <vm> --clear`, or drop the keys).
 
 ### I/O limits
 

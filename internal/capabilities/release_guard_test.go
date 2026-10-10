@@ -233,7 +233,7 @@ var writersPending = map[Feature]bool{
 	"backup_zstd": true, "container_replication": true, "drain_failback": true,
 	"email_target_secret": true, "firewall_ipv6": true, "iscsi_lun_claim": true,
 	"login_policy": true, "nic_guards": true, "pit_overlay": true, "usb_mounts_memory": true,
-	"vm_disk_nic_io": true, "vm_limits": true,
+	"vm_limits": true,
 }
 
 func TestReleaseFeatureWriters_TakeAGrant(t *testing.T) {

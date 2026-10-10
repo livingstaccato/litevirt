@@ -78,9 +78,9 @@ vms:
 
 func TestVM_DiskDiscardIOLimitsAndNICQueues(t *testing.T) {
 	requireImage(t)
-	// The feature is refused until the cluster-wide upgrade gate opens (a
-	// placeholder today, the shared release token later). Until then this skips
-	// rather than reporting a product defect.
+	// The feature is refused until the shared release token has latched
+	// (vm_disk_nic_io under release_2026_11_v1). Until then this skips rather
+	// than reporting a product defect.
 
 	stack, vm := uniqueName("tune"), uniqueName("tv")
 	host := hostWithCapacity(t, 2, 1024)
@@ -94,7 +94,7 @@ func TestVM_DiskDiscardIOLimitsAndNICQueues(t *testing.T) {
 	file := tuneComposeFile(t, stack, vm, host, netName, 300)
 	if out, err := lvErr(t, "compose", "up", "-f", file, "-y"); err != nil {
 		if strings.Contains(out, "cluster upgrade must finish") {
-			t.Skipf("disk/NIC tuning is not open on this cluster yet (release-token swap pending): %s", out)
+			t.Skipf("disk/NIC tuning is not open on this cluster yet (the release token has not latched): %s", out)
 		}
 		t.Fatalf("compose up: %v\n%s", err, out)
 	}

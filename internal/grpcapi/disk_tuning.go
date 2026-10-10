@@ -12,6 +12,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
@@ -40,28 +41,48 @@ func validateSpecTuning(spec *pb.VMSpec) error {
 	return nil
 }
 
-const diskNICIORefusal = "disk discard, I/O limits and NIC queues cannot be set yet: an older host would ignore " +
-	"or drop them, so the cluster upgrade must finish first (not every host is known to keep them)"
-
-// ioFeatureToken is a PLACEHOLDER for the shared release token ("this build
-// preserves the new spec fields"), which is not registered in the capabilities
-// package: nothing latches it, so until the swap the feature stays refused in a
-// real cluster (fail closed). Tests latch it with a wrapping gate.
-const ioFeatureToken = "vm_disk_nic_io_v1"
-
-// ioFeatureGate is the one place the disk/NIC tuning feature asks whether the
-// whole cluster keeps and re-applies it: nil when it does, else the
-// FailedPrecondition every refusal returns. Swapping in the shared release
-// token is a change to this function's body alone.
+// ioFeatureGate is the entry-node check of the disk/NIC tuning feature
+// (capabilities.FeatureVMDiskNICIO): nil when its release token has latched
+// here, else the release gate's own refusal (FailedPrecondition, "the cluster
+// upgrade must finish first (vm_disk_nic_io needs ...)", naming the hosts still
+// to upgrade). It lets a request fail before anything is created or forwarded;
+// it grants nothing. The node that WRITES the tuning takes the grant itself
+// (ioGrant), so a forwarded request is gated there.
 func (s *Server) ioFeatureGate(ctx context.Context) error {
-	if s.gate != nil && s.gate.Enforced(ctx, ioFeatureToken) {
+	if s.ReleaseFeatureAvailable(capabilities.FeatureVMDiskNICIO) {
 		return nil
 	}
-	return status.Error(codes.FailedPrecondition, diskNICIORefusal)
+	return s.WithReleaseFeature(ctx, capabilities.FeatureVMDiskNICIO,
+		func(context.Context, capabilities.FeatureGrant) error { return nil })
 }
 
-// diskNICIOActive reports whether ioFeatureGate lets the feature through.
-func (s *Server) diskNICIOActive(ctx context.Context) bool { return s.ioFeatureGate(ctx) == nil }
+// ioGrant runs the feature's gate on THIS node, the one that will write the
+// tuning, and returns the grant its writers take. A refusal is the release
+// gate's error, unchanged.
+func (s *Server) ioGrant(ctx context.Context) (capabilities.FeatureGrant, error) {
+	var g capabilities.FeatureGrant
+	err := s.WithReleaseFeature(ctx, capabilities.FeatureVMDiskNICIO,
+		func(_ context.Context, got capabilities.FeatureGrant) error { g = got; return nil })
+	return g, err
+}
+
+// ioGrantIfAvailable is ioGrant for a caller that falls back rather than fails
+// (the create-time default discard, a restore's tuning): ok is false, with no
+// error, when the token has not latched here or the gate refuses, and the
+// caller behaves as main does. It asks no peer unless the token has latched.
+func (s *Server) ioGrantIfAvailable(ctx context.Context) (g capabilities.FeatureGrant, ok bool) {
+	if !s.ReleaseFeatureAvailable(capabilities.FeatureVMDiskNICIO) {
+		return g, false
+	}
+	g, err := s.ioGrant(ctx)
+	return g, err == nil
+}
+
+// diskNICIOActive reports whether the token has latched here (a hint: the write
+// still takes a grant through ioGrant).
+func (s *Server) diskNICIOActive(context.Context) bool {
+	return s.ReleaseFeatureAvailable(capabilities.FeatureVMDiskNICIO)
+}
 
 // specSetsDiskNICIO reports whether a spec sets discard, detect_zeroes, a disk
 // throttle (an empty one included: it is a clear, which only means something
@@ -93,7 +114,8 @@ func (s *Server) refuseUnlatchedDiskNICIO(ctx context.Context, spec *pb.VMSpec) 
 // refuseUnlatchedStackDiskNICIO refuses a compose file that sets any of them,
 // up front, rather than by the Nth VM's create after N-1 are up.
 func (s *Server) refuseUnlatchedStackDiskNICIO(ctx context.Context, f *compose.File) error {
-	if s.diskNICIOActive(ctx) {
+	gateErr := s.ioFeatureGate(ctx)
+	if gateErr == nil {
 		return nil
 	}
 	for name, vm := range f.VMs {
@@ -108,7 +130,7 @@ func (s *Server) refuseUnlatchedStackDiskNICIO(ctx context.Context, f *compose.F
 			set = set || !n.Queues.IsZero()
 		}
 		if set {
-			return status.Errorf(codes.FailedPrecondition, "vm %q: %s", name, diskNICIORefusal)
+			return status.Errorf(codes.FailedPrecondition, "vm %q: %s", name, status.Convert(gateErr).Message())
 		}
 	}
 	return nil
@@ -228,6 +250,18 @@ func (s *Server) SetDiskIO(ctx context.Context, req *pb.SetDiskIORequest) (*pb.V
 		dev = lv.DiskDevName(bus, len(spec.Disks))
 	}
 
+	// Setting a limit adds tuning to the spec: this node writes it, so it takes
+	// the feature's grant before anything is changed (a forwarded call is gated
+	// here, not on the entry node). Clearing adds nothing and takes none.
+	var grant capabilities.FeatureGrant
+	if !tune.IsZero() {
+		g, gerr := s.ioGrant(ctx)
+		if gerr != nil {
+			return nil, gerr
+		}
+		grant = g
+	}
+
 	// What the disk has now, so a partial failure can put it back.
 	oldCfg, haveCfg := ioTuneNow(s.virt.DumpXMLInactive, req.VmName, dev)
 	restore := func(why string) {
@@ -262,7 +296,13 @@ func (s *Server) SetDiskIO(ctx context.Context, req *pb.SetDiskIORequest) (*pb.V
 	if !tune.IsZero() {
 		stored = proto.Clone(req.Limits).(*pb.DiskIOLimits)
 	}
-	applied, _, merr := corrosion.MutateDesiredSpec(ctx, s.db, req.VmName, func(old string) (string, error) {
+	mutate := corrosion.MutateDesiredSpec
+	if !tune.IsZero() {
+		mutate = func(ctx context.Context, c *corrosion.Client, name string, fn func(string) (string, error)) (bool, int64, error) {
+			return corrosion.MutateDesiredSpecTuning(ctx, c, grant, name, fn)
+		}
+	}
+	applied, _, merr := mutate(ctx, s.db, req.VmName, func(old string) (string, error) {
 		fresh := &pb.VMSpec{}
 		if old != "" {
 			if uerr := json.Unmarshal([]byte(old), fresh); uerr != nil {
@@ -400,11 +440,15 @@ func applyTuningRequest(spec *pb.VMSpec, dbDisks []corrosion.DiskRecord, req *pb
 // would drop the fields anyway) and stripped=true says so; after it the values
 // are validated like a create's, so a hand-edited manifest cannot define a
 // domain libvirt refuses or open hundreds of queues.
-func (s *Server) restrictRestoredTuning(ctx context.Context, spec *pb.VMSpec) (stripped bool, err error) {
+//
+// When the tuning is kept, the grant is the feature's: the row this spec is
+// written to must go through insertVMForSpec with it.
+func (s *Server) restrictRestoredTuning(ctx context.Context, spec *pb.VMSpec) (stripped bool, grant capabilities.FeatureGrant, err error) {
 	if !specSetsDiskNICIO(spec) {
-		return false, nil
+		return false, grant, nil
 	}
-	if s.ioFeatureGate(ctx) != nil {
+	grant, ok := s.ioGrantIfAvailable(ctx)
+	if !ok {
 		for _, d := range spec.Disks {
 			d.Discard, d.DetectZeroes, d.Io = "", "", nil
 		}
@@ -412,12 +456,24 @@ func (s *Server) restrictRestoredTuning(ctx context.Context, spec *pb.VMSpec) (s
 			n.Queues = 0
 		}
 		slog.Warn("restore: the spec carries disk/NIC tuning and the cluster upgrade has not finished: tuning dropped", "vm", spec.GetName())
-		return true, nil
+		return true, grant, nil
 	}
 	if err := validateSpecTuning(spec); err != nil {
-		return false, status.Errorf(codes.InvalidArgument, "restored spec: %v", err)
+		return false, grant, status.Errorf(codes.InvalidArgument, "restored spec: %v", err)
 	}
-	return false, nil
+	return false, grant, nil
+}
+
+// insertVMForSpec writes a new VM row. A spec that carries disk or NIC tuning
+// goes through the feature's writer with its grant; any other spec is written
+// exactly as before, so nothing main allows waits on the release token.
+func (s *Server) insertVMForSpec(ctx context.Context, spec *pb.VMSpec, g capabilities.FeatureGrant, vm corrosion.VMRecord,
+	ifaces []corrosion.InterfaceRecord, disks []corrosion.DiskRecord, nics []corrosion.NICRecord,
+	pciIntents []corrosion.PCIIntentRecord, adopt bool) error {
+	if specSetsDiskNICIO(spec) {
+		return corrosion.InsertVMWithTuning(ctx, s.db, g, vm, ifaces, disks, nics, pciIntents, adopt)
+	}
+	return corrosion.InsertVMWithHardware(ctx, s.db, vm, ifaces, disks, nics, pciIntents, adopt)
 }
 
 // requestsHardwareTuning reports whether an UpdateVM request redefines the

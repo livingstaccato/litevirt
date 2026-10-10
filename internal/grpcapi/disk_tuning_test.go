@@ -19,7 +19,7 @@ import (
 func ioVM(t *testing.T, state string) (*Server, *libvirtfake.Fake, context.Context) {
 	t.Helper()
 	s := reconfigServer(t)
-	s.gate = ioGate{on: true} // feature gate open
+	s.SetReleaseFeatureGate(ioGate{t: t, on: true}) // feature gate open
 	fake := s.virt.(*libvirtfake.Fake)
 	ctx := adminCtx()
 	spec := &pb.VMSpec{Name: "io", Cpu: 2, MemoryMib: 512,
@@ -157,7 +157,7 @@ func TestSetDiskIO_Refusals(t *testing.T) {
 // Mutation: drop the synthesis — the implicit-root and hot-plugged cases go red.
 func TestSetDiskIO_DiskTheSpecDoesNotListIsThrottledAndRecorded(t *testing.T) {
 	s := reconfigServer(t)
-	s.gate = ioGate{on: true}
+	s.SetReleaseFeatureGate(ioGate{t: t, on: true})
 	fake := s.virt.(*libvirtfake.Fake)
 	ctx := adminCtx()
 	spec := &pb.VMSpec{Name: "io", Cpu: 2, MemoryMib: 512} // no Disks: the implicit-root shape

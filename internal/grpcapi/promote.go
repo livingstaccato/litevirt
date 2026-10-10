@@ -844,7 +844,8 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	spec.Name = targetName
 	// The stored tuning is validated again (and dropped before the gate opens)
 	// so a record from before a rollback cannot define what the cluster refuses.
-	if _, err := s.restrictRestoredTuning(ctx, &spec); err != nil {
+	_, ioG, err := s.restrictRestoredTuning(ctx, &spec)
+	if err != nil {
 		return err
 	}
 
@@ -1247,7 +1248,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		// PCI passthrough to carry (a disk replica has no hostdev record, so
 		// pciIntents is always nil here), and hardware_adoption_state stays at
 		// its schema default 'pending' for the Phase-6 backfill audit to confirm.
-		if err := corrosion.InsertVMWithHardware(ctx, s.db, rec, ifaceRecords, diskRecords, nicRecords, nil, false); err != nil {
+		if err := s.insertVMForSpec(ctx, &spec, ioG, rec, ifaceRecords, diskRecords, nicRecords, nil, false); err != nil {
 			return status.Errorf(codes.Internal, "persist promoted vm: %v", err)
 		}
 		// This branch and the transfer below are mutually EXCLUSIVE: a renamed

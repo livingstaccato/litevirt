@@ -181,7 +181,7 @@ func promoteTuned(t *testing.T, open bool, queues int32) (*Server, *libvirtfake.
 	s := testServer(t)
 	fake := libvirtfake.New()
 	s.virt = fake
-	s.gate = ioGate{on: open}
+	s.SetReleaseFeatureGate(ioGate{t: t, on: open})
 	ctx := adminCtx()
 	poolDir := t.TempDir()
 	s.SetStoragePoolsByName(map[string]StoragePoolRef{"replica-pool": {Driver: "local", Target: poolDir}})

@@ -2,11 +2,13 @@ package corrosion
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"math/rand"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc"
@@ -32,6 +34,16 @@ type AntiEntropy struct {
 	pkiDir   string
 	interval time.Duration
 
+	// probationPull answers VerifyReleaseProbation's pulls; nil uses the real
+	// pull (pullForProbation). Tests replace it.
+	probationPull probationPullFunc
+	// voterAdopter adopts newly merged voter generations for a probation round
+	// (SetVoterAdopter). Nil: the round waits for the daemon's adoption loop.
+	voterAdopter atomic.Pointer[func(ctx context.Context) (int64, error)]
+	// checkFrom answers OnUnknownReleaseToken's look; nil uses
+	// CheckReleaseUsesFrom. Tests replace it.
+	checkFrom func(ctx context.Context, peer string) error
+
 	// mu guards the trigger decision only (not the pass itself): a pass no-ops when one is
 	// already running or ran within antiEntropyCooldown. It never bypasses checkPeers's
 	// per-table digest-gating (merge only on mismatch) — it just decides whether to run.
@@ -55,6 +67,11 @@ type AntiEntropy struct {
 	// changed (antientropy_driftlog.go).
 	drift driftLog
 }
+
+// probationPullFunc pulls a peer's used records and voter view for a probation
+// check (pullForProbation) and returns its answer. A field so tests can answer
+// without dialling.
+type probationPullFunc func(ctx context.Context, peer string) (probationAnswer, error)
 
 // NewAntiEntropy creates an anti-entropy checker.
 func NewAntiEntropy(client *Client, pkiDir string, interval time.Duration) *AntiEntropy {
@@ -119,6 +136,15 @@ func (ae *AntiEntropy) RunSampledOnce(ctx context.Context) bool {
 }
 
 func (ae *AntiEntropy) runGuarded(pass func()) bool {
+	// A node in release probation takes no state from any peer
+	// (ReplicationSourceAllowed), so a pass now would spend itself with every
+	// peer refused, and the replica would wait one more interval after the
+	// lift to catch up. Skip it without counting it as run: the probation loop
+	// runs a pass right after the lift (daemon.RunReleaseProbation).
+	if ae.client.InReleaseProbation() {
+		slog.Debug("anti-entropy: pass skipped; this node is in release probation and takes no state until it lifts")
+		return false
+	}
 	ae.mu.Lock()
 	if ae.inProgress || (!ae.lastRan.IsZero() && time.Since(ae.lastRan) < antiEntropyCooldown) {
 		ae.mu.Unlock()
@@ -263,6 +289,19 @@ func (ae *AntiEntropy) checkPeer(ctx context.Context, peerName string, localMap,
 		slog.Warn("anti-entropy: NOT merging from an isolated peer",
 			"peer", peerName, "isolation_epoch", epoch, "reason", reason,
 			"fix", "reseed "+peerName+" to bring it back into the compatibility regime")
+		return false
+	}
+	// A peer that cannot keep the data of a release feature in use is not
+	// merged from either (release_features.go, SetReplicationSourceGate): its
+	// rows may be rewrites that dropped that data.
+	if err := ae.client.ReplicationSourceAllowed(ctx, peerName); err != nil {
+		if errors.Is(err, ErrReleaseProbation) {
+			// The refusal is this node's own state, not the peer's.
+			slog.Debug("anti-entropy: not merging; this node is in release probation", "peer", peerName)
+			return false
+		}
+		slog.Warn("anti-entropy: NOT merging from a peer that cannot keep a release feature in use",
+			"peer", peerName, "error", err)
 		return false
 	}
 	client, conn, err := ae.peerClient(ctx, peerName)

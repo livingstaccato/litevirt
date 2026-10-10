@@ -25071,8 +25071,18 @@ type PingResponse struct {
 	// that. Diagnostic and for peers' probation majority only. It is NOT
 	// wal_quarantined: the node keeps advertising, and no peer isolates it.
 	ReleaseProbation bool `protobuf:"varint,9,opt,name=release_probation,json=releaseProbation,proto3" json:"release_probation,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// voter_generation is the highest voter generation this node has ADOPTED
+	// (voter_configs, docs/design/recovery-claims.md §4), 0 when it has adopted
+	// none or has not run an adoption pass since it started. A node in release
+	// probation compares it with its own: a peer that reports a newer one shows
+	// that the voter set this node is counting is stale, so it adopts the newer
+	// generation (which its probation pull has just merged) and counts against
+	// that instead. Read only for that; a generation is adopted only once its
+	// certificate verifies, never because a peer reports it. (Tag 10: 9 is taken
+	// on another branch too, see the merge checklist.)
+	VoterGeneration int64 `protobuf:"varint,10,opt,name=voter_generation,json=voterGeneration,proto3" json:"voter_generation,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *PingResponse) Reset() {
@@ -25166,6 +25176,13 @@ func (x *PingResponse) GetReleaseProbation() bool {
 		return x.ReleaseProbation
 	}
 	return false
+}
+
+func (x *PingResponse) GetVoterGeneration() int64 {
+	if x != nil {
+		return x.VoterGeneration
+	}
+	return 0
 }
 
 // Ready: application-level readiness. Ping answers "is this daemon's TLS
@@ -31522,10 +31539,14 @@ func (x *ReleaseFeatureUseQuery) GetFeature() string {
 }
 
 type ReleaseFeatureUseHeld struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Held          bool                   `protobuf:"varint,1,opt,name=held,proto3" json:"held,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Held  bool                   `protobuf:"varint,1,opt,name=held,proto3" json:"held,omitempty"`
+	// in_release_probation: the answering host is in release probation, so it
+	// applies nothing pushed to it and cannot come to hold a new record until
+	// its probation lifts (lv cluster upgrade-status shows why it has not).
+	InReleaseProbation bool `protobuf:"varint,2,opt,name=in_release_probation,json=inReleaseProbation,proto3" json:"in_release_probation,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *ReleaseFeatureUseHeld) Reset() {
@@ -31561,6 +31582,13 @@ func (*ReleaseFeatureUseHeld) Descriptor() ([]byte, []int) {
 func (x *ReleaseFeatureUseHeld) GetHeld() bool {
 	if x != nil {
 		return x.Held
+	}
+	return false
+}
+
+func (x *ReleaseFeatureUseHeld) GetInReleaseProbation() bool {
+	if x != nil {
+		return x.InReleaseProbation
 	}
 	return false
 }
@@ -37051,7 +37079,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\n" +
 	"LOCALIZING\x10\x04\x12\b\n" +
 	"\x04DONE\x10\x05\"\r\n" +
-	"\vPingRequest\"\xd5\x02\n" +
+	"\vPingRequest\"\x80\x03\n" +
 	"\fPingResponse\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x12\x18\n" +
 	"\aversion\x18\x02 \x01(\tR\aversion\x12%\n" +
@@ -37062,7 +37090,9 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x0fwal_quarantined\x18\x06 \x01(\bR\x0ewalQuarantined\x12#\n" +
 	"\rnot_enforcing\x18\a \x03(\tR\fnotEnforcing\x12)\n" +
 	"\x10posture_reported\x18\b \x01(\bR\x0fpostureReported\x12+\n" +
-	"\x11release_probation\x18\t \x01(\bR\x10releaseProbation\"\x0e\n" +
+	"\x11release_probation\x18\t \x01(\bR\x10releaseProbation\x12)\n" +
+	"\x10voter_generation\x18\n" +
+	" \x01(\x03R\x0fvoterGeneration\"\x0e\n" +
 	"\fReadyRequest\"\x95\x01\n" +
 	"\rReadyResponse\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x12\x14\n" +
@@ -37541,9 +37571,10 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\bdeclared\x18\a \x01(\bR\bdeclared\"H\n" +
 	"\x16ReleaseFeatureUseQuery\x12\x14\n" +
 	"\x05token\x18\x01 \x01(\tR\x05token\x12\x18\n" +
-	"\afeature\x18\x02 \x01(\tR\afeature\"+\n" +
+	"\afeature\x18\x02 \x01(\tR\afeature\"]\n" +
 	"\x15ReleaseFeatureUseHeld\x12\x12\n" +
-	"\x04held\x18\x01 \x01(\bR\x04held\"\xaf\x01\n" +
+	"\x04held\x18\x01 \x01(\bR\x04held\x120\n" +
+	"\x14in_release_probation\x18\x02 \x01(\bR\x12inReleaseProbation\"\xaf\x01\n" +
 	"\x19CrossRegionMigrateRequest\x12\x17\n" +
 	"\avm_name\x18\x01 \x01(\tR\x06vmName\x12\x1f\n" +
 	"\vtarget_host\x18\x02 \x01(\tR\n" +

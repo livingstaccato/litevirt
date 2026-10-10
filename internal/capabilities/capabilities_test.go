@@ -255,7 +255,9 @@ func TestGrantMinter_ClaimedOnce(t *testing.T) {
 // under the NEXT release token, whose list is pinned here as a new entry.
 //
 // Editing an existing entry is a release-engineering decision, not a code
-// change: it is only ever right before that release has shipped.
+// change: it is only ever right before that release has shipped, as one
+// reviewed change to releaseFeatures and to this pin together.
+// (release_2026_11_v1 gained nic_guards that way, before it shipped.)
 var frozenReleaseFeatures = map[string][]Feature{
 	Release202611V1: {
 		"backup_zstd",
@@ -265,6 +267,7 @@ var frozenReleaseFeatures = map[string][]Feature{
 		"firewall_ipv6",
 		"iscsi_lun_claim",
 		"login_policy",
+		"nic_guards",
 		"pit_overlay",
 		"usb_mounts_memory",
 		"vm_disk_nic_io",

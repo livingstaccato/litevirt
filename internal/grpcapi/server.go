@@ -817,7 +817,10 @@ type Server struct {
 	// releaseRollout: the HA monitor's cached rollout answers
 	// (releaseRolloutLagging). Guarded by releasePeerMu.
 	releaseRollout map[string]*rolloutAnswer
-	onGateRefused  func(action, reason string)
+	// adoptedVoterGen is the voter generation AdoptVoterConfigs last found
+	// adopted, which Ping reports (PingResponse.voter_generation).
+	adoptedVoterGen atomic.Int64
+	onGateRefused   func(action, reason string)
 	// vmStartObserver is told of every guest start (SetVMStartObserver).
 	vmStartObserver VMStartObserver
 

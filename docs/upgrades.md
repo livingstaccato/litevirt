@@ -436,7 +436,9 @@ bit**:
   holds that record** before the write runs. A host that does not confirm in
   time refuses the write (`Unavailable`; retry), naming the host; for a voter
   the message adds that, if it is gone for good, `lv cluster voter rm <host>` is
-  the way out. If the record cannot be written at all, the
+  the way out — unless the host said it is in release probation, a live host
+  that applies nothing until it lifts: the message says that instead and points
+  at `lv cluster upgrade-status`. If the record cannot be written at all, the
   write is refused too. Every host that writes the feature's data puts its own
   copy of the record on its own replication stream first. The record is never
   cleared: nothing proves the feature's data has all gone.
@@ -477,31 +479,55 @@ bit**:
   dropped) and anti-entropy takes nothing, because a first use's data can
   reach it with its record pruned away. It is not quarantined: it keeps advertising, its Ping reports
   `release_probation` and never `wal_quarantined`, and no peer isolates it. It
-  pulls the cluster's used records from a majority of the other voters — not
-  counting itself, nor a WAL-quarantined voter, but counting a voter that is in
-  probation too, so hosts rolled back together (a whole-cluster rollback
-  included) lift together — and lifts (`release probation lifted` in the log),
+  pulls the cluster's used records from the voters until it holds answers from
+  a **majority of the whole voter set, its own seat counted** when it is a
+  voter: one other voter of three, two of four or five. Its own replica is
+  never an answer, nor is a WAL-quarantined voter; a voter that is in
+  probation too does count, so hosts rolled back together lift together. A
+  three-host cluster rolled back as a whole with one host dead therefore lifts
+  on the two survivors. It then lifts (`release probation lifted` in the log),
   or quarantines if a use is there. In a two-voter cluster the one other voter
   is enough; a one-voter cluster lifts on its own check, since no other voter
   could have acknowledged a use. A host whose replica holds no voter at all
-  asks a majority of its admitted members instead, and with none to ask stays
-  in probation. Nothing about a lift is remembered: the next boot below the
-  marker is a probation again, which costs one round (5s) when the voters
-  answer — a whole-cluster restart included, since probation voters count. The
-  voter set is this host's own view, which may be stale after a long absence:
-  a voter removed meanwhile and unreachable can keep it in probation. And
-  voters that were REMOVED while down (`lv cluster voter rm`, a
-  force-reconfigure) and missed a use, then come back on this release, vouch
-  for each other from that stale view and can lift together with no holder of
-  the record among them; the upgraded hosts still refuse their writes, and
-  anti-entropy brings them the record, which quarantines them. A voter majority that stays unreachable keeps it in
-  probation; `LITEVIRT_UNSAFE_SKIP_ROLLBACK_CHECK=1` and a restart is the
-  operator's way out, and `lv cluster upgrade-status` shows the probation.
+  asks a majority of its admitted members instead; with none to ask, it lifts
+  only if its replica holds no other host (a one-host cluster whose host is in
+  `maintenance`), and otherwise stays in probation. Nothing about a lift is
+  remembered: the next boot below the marker is a probation again, which costs
+  one round (5s) when the voters answer — a whole-cluster restart included,
+  since probation voters count. Anti-entropy passes are skipped while in
+  probation (they could take nothing), and one runs right after the lift, so
+  the replica catches up then rather than one interval later.
+
+  The voter set is this host's own view, which may be stale after an absence.
+  So the probation pull also merges each answering voter's voter view — the
+  voter generations, `hosts` and `host_membership`, none of which carries a
+  release feature's data — and each voter's Ping says which voter generation it
+  has adopted. When one is newer than this host's, the host adopts the newer
+  generations (each certificate verified, as always) and counts against the new
+  set; it never lifts while a voter reports a generation it cannot adopt yet.
+  A derived voter set that the merged `hosts` rows changed is recomputed too.
+  Voters that were REMOVED while down (`lv cluster voter rm`, a
+  force-reconfigure) and missed a use, then come back on this release with none
+  of the current voters reachable, can still vouch for each other from their
+  stale view and lift together with no holder of the record among them; the
+  upgraded hosts still refuse their writes, and anti-entropy brings them the
+  record, which quarantines them.
+
+  While it waits, the log line `release probation: a voter majority could not
+  be asked yet` names each voter it could not count and why (unreachable,
+  WAL-quarantined), and `lv cluster upgrade-status` shows the same list in the
+  probation's reason. A voter majority that stays unreachable keeps it in
+  probation: remove a voter that is gone for good with `lv cluster voter rm`
+  on a healthy host, or set `LITEVIRT_UNSAFE_SKIP_ROLLBACK_CHECK=1` and restart
+  this one.
 - A first use is acknowledged by every voter (one in `maintenance` included)
   and every host the cluster replicates to, so whichever voters a probation asks
   later, a majority of them holds it. A powered-off host that is neither does
   not hold a first use up; a voter that is gone for good does, until it is
-  removed from the voter set (`lv cluster voter rm`).
+  removed from the voter set (`lv cluster voter rm`). So does a host in release
+  probation, which applies nothing pushed to it until it lifts — normally one
+  5s round, well inside the 30s a first use waits; the refusal names it as in
+  probation.
 
 **Forward rolls refuse nothing.** While the cluster rolls to the NEXT release,
 the hosts still on this one see the new hosts advertise a release token they do
@@ -516,12 +542,22 @@ data, yet it advertises the token, counts toward its latch and is accepted as a
 sender: the first use would not be refused, and every such host would
 acknowledge it and then quarantine itself. So a feature added after a release
 ships — in a patch release too — is declared under the next release token,
-never a shipped one, and a test pins every release token's list. All eleven
+never a shipped one, and a test pins every release token's list. All twelve
 features of `release_2026_11_v1` are declared in this release (`lv cluster
 upgrade-status` lists them): `vm_limits`, `vm_disk_nic_io`,
 `email_target_secret`, `login_policy`, `drain_failback`, `firewall_ipv6`,
-`usb_mounts_memory`, `backup_zstd`, `container_replication`,
+`nic_guards`, `usb_mounts_memory`, `backup_zstd`, `container_replication`,
 `iscsi_lun_claim` and `pit_overlay`.
+
+One feature is one used bit: the first write of any of its data marks it used,
+and a rollback below the release then quarantines. So a feature written by
+default is kept apart from one written only on request. Per-NIC anti-spoofing
+guards are on by default for every new NIC, so they are their own feature,
+`nic_guards`, used from the first NIC created after the latch; IPv6
+security-group and firewall rules are `firewall_ipv6`, used only once someone
+writes one. `usb_mounts_memory` is one bit for VM USB devices, VM memory
+hot-add and container host mounts and devices: any one of them in use makes a
+rollback below the release quarantine.
 
 **What this does not change.** A binary built before `release_2026_11_v1`
 understands no rollback rule. Rolled back below any token it does not know —
@@ -557,7 +593,16 @@ binary answering.
 **Residuals.**
 - An origin a receiver has never heard from is not judged, so its entries
   relayed by another host are accepted until it first answers (asked in the
-  background); a known origin that turns bad is caught up to 30s late.
+  background); a known origin that turns bad is caught up to 30s late. As an
+  anti-entropy SOURCE, a peer never heard from is asked first, and one that
+  answers with nothing while not WAL-quarantined (self-fenced) is not pulled
+  from until it declares what it keeps; the pass pulls from another peer.
+- An origin KNOWN not to carry a used release token refuses the whole relayed
+  push that carries its entries, so the other origins' entries on that relay
+  stream wait behind it — back-pressure, nothing dropped, anti-entropy
+  carrying them meanwhile — until that host is upgraded again or removed. A
+  push is acknowledged as a whole, so skipping one origin's entries would lose
+  them. `release_feature_peer_refused` names the host.
 - A host with no marker that was away through the next release's latch and
   first use, and comes back on this release, emits replicated writes until its
   first Ping of a newer host leads it to their used records. Upgraded hosts with

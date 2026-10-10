@@ -690,3 +690,141 @@ func (g *availGate) WithFeature(context.Context, capabilities.Feature, func(cont
 }
 
 func (g *availGate) FeatureAvailable(capabilities.Feature) bool { return g.latched }
+
+// TestPing_ReportsTheAdoptedVoterGeneration (I-R4-2): Ping says which voter
+// generation this node has adopted — from memory, kept by the adoption pass —
+// so a peer in release probation can tell its own voter set is stale.
+func TestPing_ReportsTheAdoptedVoterGeneration(t *testing.T) {
+	ctx := context.Background()
+	s := testServer(t)
+	s.db.SetVoterConfigGate(func() bool { return true })
+	for g := int64(1); g <= 2; g++ {
+		v := corrosion.VoterConfigValue{Generation: g, Members: []corrosion.VoterMember{{Name: "test-host", Incarnation: "i"}},
+			Change: "test", CreatedBy: "test"}
+		if err := corrosion.WriteVoterConfig(ctx, s.db, v, corrosion.ClaimCertificate{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := corrosion.RecordVoterAdoption(ctx, s.db, 2); err != nil {
+		t.Fatal(err)
+	}
+	if g, err := s.AdoptVoterConfigs(ctx); err != nil || g != 2 {
+		t.Fatalf("AdoptVoterConfigs = %d, %v", g, err)
+	}
+	resp, err := s.Ping(ctx, &pb.PingRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.GetVoterGeneration() != 2 {
+		t.Fatalf("Ping voter_generation = %d, want 2", resp.GetVoterGeneration())
+	}
+}
+
+// holdsClient answers HoldsReleaseFeatureUse with a fixed reply.
+type holdsClient struct {
+	pb.LiteVirtClient
+	resp *pb.ReleaseFeatureUseHeld
+}
+
+func (f holdsClient) HoldsReleaseFeatureUse(context.Context, *pb.ReleaseFeatureUseQuery, ...grpc.CallOption) (*pb.ReleaseFeatureUseHeld, error) {
+	return f.resp, nil
+}
+
+// TestHoldsReleaseFeatureUse_SaysWhenInProbation (m1): a host in release
+// probation refuses every push, so it cannot come to hold a first use's record
+// until it lifts. It says so, and the asking side reports it as probation —
+// not as a host that might be gone, which the refusal would otherwise tell the
+// operator to remove from the voter set.
+func TestHoldsReleaseFeatureUse_SaysWhenInProbation(t *testing.T) {
+	ctx := context.Background()
+	s := upgradeStatusServer(t)
+	q := &pb.ReleaseFeatureUseQuery{Token: capabilities.ReleaseToken, Feature: "widgets"}
+	peer := peerCtxFor(t, s, "host-b") // registers host-b: a replicated write, made before the boot
+	s.db.EnterReleaseProbation([]string{"release_2099_01_v1"})
+	r, err := s.HoldsReleaseFeatureUse(peer, q)
+	if err != nil || r.GetHeld() || !r.GetInReleaseProbation() {
+		t.Fatalf("in probation: held=%v in_release_probation=%v err=%v, want false/true",
+			r.GetHeld(), r.GetInReleaseProbation(), err)
+	}
+	answer := &pb.ReleaseFeatureUseHeld{Held: false, InReleaseProbation: true}
+	s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {
+		return holdsClient{resp: answer}, func() {}, nil
+	}
+	if held, err := s.PeerHoldsReleaseFeatureUse(ctx, "host-b", capabilities.ReleaseToken, "widgets"); held ||
+		!errors.Is(err, corrosion.ErrReleaseProbation) {
+		t.Fatalf("a peer in probation: held=%v err=%v, want an error wrapping ErrReleaseProbation", held, err)
+	}
+	answer = &pb.ReleaseFeatureUseHeld{Held: true, InReleaseProbation: true}
+	if held, err := s.PeerHoldsReleaseFeatureUse(ctx, "host-b", capabilities.ReleaseToken, "widgets"); !held || err != nil {
+		t.Fatalf("a peer in probation that holds the record: held=%v err=%v", held, err)
+	}
+}
+
+// TestReleaseSourceAllowed_UnknownFencedPeerIsNotASource (m5): for
+// anti-entropy — not the push path — a peer this node has no list for is
+// asked now. One that answers with nothing while not WAL-quarantined (a
+// self-fenced host, or an older build that is fenced) and was never heard from
+// is not taken as a source, without an alarm; a peer last known to carry the
+// token still is, and so is a newcomer that advertises it.
+func TestReleaseSourceAllowed_UnknownFencedPeerIsNotASource(t *testing.T) {
+	ctx := context.Background()
+	s := releasePeerServer(t)
+	withTok := capabilities.Supported()
+	answers := map[string]*pb.PingResponse{
+		"known-fenced":    {Capabilities: []string{}},
+		"stranger-fenced": {Capabilities: []string{}},
+		"newcomer":        {Capabilities: withTok},
+		"stranger-old":    {Capabilities: []string{}, WalQuarantined: true},
+	}
+	s.peerClientOverride = func(_ context.Context, host string) (pb.LiteVirtClient, func(), error) {
+		return pingOnlyClient{resp: answers[host]}, func() {}, nil
+	}
+	s.notePeerCaps("known-fenced", withTok)
+	if err := s.ReleaseSourceAllowed(ctx, "known-fenced"); err != nil {
+		t.Fatalf("a fenced peer last known to carry the token: %v", err)
+	}
+	if err := s.ReleaseSourceAllowed(ctx, "newcomer"); err != nil {
+		t.Fatalf("a never-heard peer that advertises the token: %v", err)
+	}
+	if err := s.ReleaseSourceAllowed(ctx, "stranger-fenced"); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("a never-heard peer advertising nothing, not quarantined: %v, want FailedPrecondition", err)
+	}
+	if got := s.RefusedReleasePeers(); len(got) != 0 {
+		t.Fatalf("refused peers = %v: a fenced stranger raised the alarm", got)
+	}
+	if err := s.ReleaseSourceAllowed(ctx, "stranger-old"); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("a never-heard WAL-quarantined peer: %v, want FailedPrecondition", err)
+	}
+	// Relayed origins keep the rule they had: never refused for being unknown.
+	if err := s.ReleasePeerAllowed(ctx, "another-stranger"); err != nil {
+		t.Fatalf("a relayed origin never heard from: %v", err)
+	}
+}
+
+// TestReleaseRolloutCondition_PartialViewWritesNothing (m3): every node writes
+// the same row. A node that has just restarted — during a roll, every node in
+// turn — has asked only some hosts; it must not resolve, or rewrite, the row
+// another node wrote from a complete view.
+func TestReleaseRolloutCondition_PartialViewWritesNothing(t *testing.T) {
+	ctx := context.Background()
+	s := rolloutServer(t, false)
+	const then = "2026-01-01T00:00:00Z"
+	if err := corrosion.UpsertHealthCondition(ctx, s.db, corrosion.HealthCondition{
+		Evaluator: releaseRolloutEvaluator, Code: condReleaseRolloutPending, SubjectKind: "cluster",
+		SubjectID: capabilities.ReleaseToken, Severity: corrosion.SeverityInfo, Reporter: "another-host",
+		Hosts: []string{"peer-old"}, Lifecycle: corrosion.ConditionConfirmed, FirstSeen: then, ConfirmedAt: then, LastSeen: then,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s.evaluateReleaseRollout(ctx) // asks peer-new only
+	h, ok, err := corrosion.GetHealthCondition(ctx, s.db, releaseRolloutEvaluator, condReleaseRolloutPending, "cluster", capabilities.ReleaseToken)
+	if err != nil || !ok || h.Lifecycle == corrosion.ConditionResolved || !slices.Equal(h.Hosts, []string{"peer-old"}) ||
+		h.Reporter != "another-host" {
+		t.Fatalf("after one cycle with peer-old never asked: %+v ok=%v err=%v, want the row untouched", h, ok, err)
+	}
+	s.evaluateReleaseRollout(ctx) // asks peer-old: the view is complete
+	h, _, _ = corrosion.GetHealthCondition(ctx, s.db, releaseRolloutEvaluator, condReleaseRolloutPending, "cluster", capabilities.ReleaseToken)
+	if h.Lifecycle == corrosion.ConditionResolved || !slices.Equal(h.Hosts, []string{"peer-old"}) {
+		t.Fatalf("with a complete view: %+v, want it open naming peer-old", h)
+	}
+}

@@ -867,7 +867,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	corrosion.WireUnknownReleaseObserver(ctx, d.checker, ae)
 	// Take no replicated state from a peer that cannot keep a release feature
 	// in use: pushes are refused in PushMutations, pulls here.
-	d.db.SetReplicationSourceGate(svc.ReleasePeerAllowed)
+	d.db.SetReplicationSourceGate(svc.ReleaseSourceAllowed)
+	// A probation round that hears of a newer voter generation adopts it (each
+	// certificate verified) and counts against it (I-R4-2).
+	ae.SetVoterAdopter(svc.AdoptVoterConfigs)
 	// The server can answer the lease-mint clearance from here on: it has the
 	// gate whose quorum and healthy-peer set its high-water read uses.
 	d.mintClearance.Store(svc)

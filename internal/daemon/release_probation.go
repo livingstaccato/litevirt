@@ -29,7 +29,9 @@ func BootRollbackCheck(ctx context.Context, dataDir string, db *corrosion.Client
 // quarantines the node for good instead. It returns once there is no
 // probation: probation is entered only at boot. While it lasts the node emits
 // no replicated writes and applies nothing a peer pushes or anti-entropy
-// offers; only the probation pull itself is merged.
+// offers; only the probation pull itself is merged. Right after a lift it runs
+// one anti-entropy pass (m2): the scheduled passes skip while in probation, so
+// the replica catches up now rather than one interval later.
 func RunReleaseProbation(ctx context.Context, db *corrosion.Client, ae *corrosion.AntiEntropy) {
 	t := time.NewTicker(releaseProbationInterval)
 	defer t.Stop()
@@ -41,6 +43,7 @@ func RunReleaseProbation(ctx context.Context, db *corrosion.Client, ae *corrosio
 			// probation again (I-R3-1).
 			if len(db.ReleaseProbation()) == 0 {
 				slog.Info("release probation lifted")
+				ae.RunSampledOnce(ctx)
 				return
 			}
 		}

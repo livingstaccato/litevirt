@@ -68,7 +68,18 @@ type FeatureInfo struct {
 // branches lands, because it ships together (capabilities_test.go
 // frozenReleaseFeatures pins it, so adding to it fails CI). Each branch adds
 // only its Writers to its own entry and its writes through WithFeature; a
-// declared feature nobody writes yet is simply unused.
+// declared feature nobody writes yet is simply unused. Until the release
+// ships, the list may still be corrected — a feature's grain or description —
+// by one reviewed change to this map and to frozenReleaseFeatures together;
+// after it ships, never.
+//
+// GRAIN. One feature is one used bit: the first write of ANY of its data marks
+// it used, and from then on a rollback below the token quarantines. So a
+// feature must not bundle data written by default with data written only on
+// request. The firewall branch gates per-NIC guards — on by default for every
+// new NIC, so used on the first NIC created after the latch — on nic_guards,
+// and IPv6 rules on firewall_ipv6, so a cluster with no IPv6 rule can still
+// roll back below the release.
 var releaseFeatures = map[Feature]FeatureInfo{
 	FeatureVMLimits:             {Token: Release202611V1, Description: "Per-VM CPU limit and shares, and NIC bandwidth limits"},
 	FeatureVMDiskNICIO:          {Token: Release202611V1, Description: "Per-disk I/O tuning and per-NIC tuning"},
@@ -76,6 +87,7 @@ var releaseFeatures = map[Feature]FeatureInfo{
 	FeatureLoginPolicy:          {Token: Release202611V1, Description: "Cluster login policy"},
 	FeatureDrainFailback:        {Token: Release202611V1, Description: "Failback of the workloads a drain moved"},
 	FeatureFirewallIPv6:         {Token: Release202611V1, Description: "IPv6 security-group and firewall rules"},
+	FeatureNICGuards:            {Token: Release202611V1, Description: "Per-NIC anti-spoofing guards (MAC and IP); on by default for new NICs"},
 	FeatureUSBMountsMemory:      {Token: Release202611V1, Description: "VM USB devices and memory hot-add; container host mounts and devices"},
 	FeatureBackupZstd:           {Token: Release202611V1, Description: "zstd chunk compression in backup repositories"},
 	FeatureContainerReplication: {Token: Release202611V1, Description: "Container replication to a replica host"},
@@ -92,6 +104,7 @@ const (
 	FeatureLoginPolicy          Feature = "login_policy"
 	FeatureDrainFailback        Feature = "drain_failback"
 	FeatureFirewallIPv6         Feature = "firewall_ipv6"
+	FeatureNICGuards            Feature = "nic_guards"
 	FeatureUSBMountsMemory      Feature = "usb_mounts_memory"
 	FeatureBackupZstd           Feature = "backup_zstd"
 	FeatureContainerReplication Feature = "container_replication"

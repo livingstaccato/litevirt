@@ -232,7 +232,7 @@ func f() {
 var writersPending = map[Feature]bool{
 	"backup_zstd": true, "container_replication": true, "drain_failback": true,
 	"email_target_secret": true, "firewall_ipv6": true, "iscsi_lun_claim": true,
-	"login_policy": true, "pit_overlay": true, "usb_mounts_memory": true,
+	"login_policy": true, "nic_guards": true, "pit_overlay": true, "usb_mounts_memory": true,
 	"vm_disk_nic_io": true, "vm_limits": true,
 }
 
@@ -252,6 +252,159 @@ func TestReleaseFeatureWriters_TakeAGrant(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestReleaseFeatureWriters_PendingFeatureIsNotWritten (m4): a feature still in
+// writersPending is one no code writes yet. A branch that switches to it — any
+// non-test reference to its constant outside this package, a
+// WithReleaseFeature call or a FeatureAvailable check — must list its Writers
+// and delete it from writersPending in the same change; otherwise those
+// writers are never checked for a grant. This makes that step a test rather
+// than a checklist line.
+func TestReleaseFeatureWriters_PendingFeatureIsNotWritten(t *testing.T) {
+	root := filepath.Join("..", "..")
+	consts, err := featureConstants(filepath.Join(root, "internal", "capabilities"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(consts) != len(Features()) {
+		t.Fatalf("found %d feature constants %v, want one per declared feature (%d)", len(consts), consts, len(Features()))
+	}
+	refs, err := pendingFeatureRefs(root, consts, writersPending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range refs {
+		t.Error(r)
+	}
+}
+
+// The pending-feature check has teeth: a reference outside the package is
+// found, one in a test file or in internal/capabilities is not, and a feature
+// no longer pending may be referenced anywhere.
+func TestReleaseFeatureWriters_PendingCheckFindsAReference(t *testing.T) {
+	dir := t.TempDir()
+	write := func(rel, src string) {
+		t.Helper()
+		path := filepath.Join(dir, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("internal/x/x.go", `package x
+import "github.com/litevirt/litevirt/internal/capabilities"
+var _ = capabilities.FeatureWidgets
+var _ = capabilities.FeatureGadgets
+`)
+	write("internal/x/x_test.go", `package x
+import "github.com/litevirt/litevirt/internal/capabilities"
+var _ = capabilities.FeatureWidgets
+`)
+	write("internal/capabilities/c.go", `package capabilities
+var _ = capabilities.FeatureWidgets
+`)
+	consts := map[string]Feature{"FeatureWidgets": "widgets", "FeatureGadgets": "gadgets"}
+	refs, err := pendingFeatureRefs(dir, consts, map[Feature]bool{"widgets": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) != 1 || !strings.Contains(refs[0], "x.go") || !strings.Contains(refs[0], `"widgets"`) {
+		t.Fatalf("references = %v, want exactly the one to widgets in internal/x/x.go", refs)
+	}
+}
+
+// featureConstants maps each Feature constant declared in dir to its value.
+func featureConstants(dir string) (map[string]Feature, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]Feature{}
+	fset := token.NewFileSet()
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") || strings.HasSuffix(e.Name(), "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, filepath.Join(dir, e.Name()), nil, 0)
+		if err != nil {
+			return nil, err
+		}
+		for _, d := range f.Decls {
+			gd, ok := d.(*ast.GenDecl)
+			if !ok || gd.Tok != token.CONST {
+				continue
+			}
+			for _, sp := range gd.Specs {
+				vs, ok := sp.(*ast.ValueSpec)
+				if !ok {
+					continue
+				}
+				if id, ok := vs.Type.(*ast.Ident); !ok || id.Name != "Feature" {
+					continue
+				}
+				for i, n := range vs.Names {
+					if i >= len(vs.Values) {
+						continue
+					}
+					if lit, ok := vs.Values[i].(*ast.BasicLit); ok && lit.Kind == token.STRING {
+						if v, err := strconv.Unquote(lit.Value); err == nil {
+							out[n.Name] = Feature(v)
+						}
+					}
+				}
+			}
+		}
+	}
+	return out, nil
+}
+
+// pendingFeatureRefs lists every non-test reference, outside
+// internal/capabilities, to the constant of a feature still in pending.
+func pendingFeatureRefs(root string, consts map[string]Feature, pending map[Feature]bool) ([]string, error) {
+	fset := token.NewFileSet()
+	var out []string
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, _ := filepath.Rel(root, path)
+		rel = filepath.ToSlash(rel)
+		if d.IsDir() {
+			if rel == "gen" || rel == ".git" || strings.HasPrefix(rel, ".claude") || rel == "vendor" ||
+				rel == "internal/capabilities" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(rel, ".go") || strings.HasSuffix(rel, "_test.go") {
+			return nil
+		}
+		f, perr := parser.ParseFile(fset, path, nil, 0)
+		if perr != nil {
+			return perr
+		}
+		ast.Inspect(f, func(n ast.Node) bool {
+			sel, ok := n.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			pkg, ok := sel.X.(*ast.Ident)
+			if !ok || pkg.Name != "capabilities" {
+				return true
+			}
+			if feat, ok := consts[sel.Sel.Name]; ok && pending[feat] {
+				out = append(out, fmt.Sprintf("%s: capabilities.%s (feature %q) is used here but is still in "+
+					"writersPending: list its Writers and delete it from writersPending in the same change",
+					fset.Position(sel.Pos()), sel.Sel.Name, feat))
+			}
+			return true
+		})
+		return nil
+	})
+	return out, err
 }
 
 // The writer check has teeth.

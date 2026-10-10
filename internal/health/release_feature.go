@@ -252,6 +252,7 @@ func (c *Checker) awaitReleaseAcks(ctx context.Context, targets []string, tok, f
 		// Every pending recipient at once (N10), so one slow host costs one
 		// timeout per round, not one each.
 		held := make([]bool, len(pending))
+		probation := make([]bool, len(pending))
 		var wg sync.WaitGroup
 		for i, h := range pending {
 			wg.Add(1)
@@ -261,13 +262,16 @@ func (c *Checker) awaitReleaseAcks(ctx context.Context, targets []string, tok, f
 				ok, err := confirm(cctx, h, tok, feature)
 				cancel()
 				held[i] = err == nil && ok
+				probation[i] = errors.Is(err, corrosion.ErrReleaseProbation)
 			}(i, h)
 		}
 		wg.Wait()
 		var still []string
+		inProbation := map[string]bool{}
 		for i, h := range pending {
 			if !held[i] {
 				still = append(still, h)
+				inProbation[h] = probation[i]
 			}
 		}
 		pending = still
@@ -280,7 +284,13 @@ func (c *Checker) awaitReleaseAcks(ctx context.Context, targets []string, tok, f
 			voters, _ := c.voters(ctx)
 			var hints []string
 			for _, h := range pending {
-				if voters[h] {
+				switch {
+				case inProbation[h]:
+					// A live host that applies nothing until its probation
+					// lifts (m1): removing it is not the way out.
+					hints = append(hints, fmt.Sprintf("%s is in release probation and holds no new record until it "+
+						"lifts (see `lv cluster upgrade-status`)", h))
+				case voters[h]:
 					hints = append(hints, fmt.Sprintf("%s is a voter: if it is gone for good, `lv cluster voter rm %s` "+
 						"removes it and lets this proceed", h, h))
 				}

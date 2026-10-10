@@ -498,6 +498,9 @@ type Client struct {
 	releaseUseTripped map[string]bool
 	// releaseProbation: see EnterReleaseProbation. Guarded by releaseUseMu.
 	releaseProbation map[string]bool
+	// releaseProbationWaiting: see ReleaseProbationWaitingOn. Guarded by
+	// releaseUseMu.
+	releaseProbationWaiting []string
 	// replicationSourceGate: see SetReplicationSourceGate.
 	replicationSourceGate atomic.Pointer[func(ctx context.Context, peer string) error]
 }

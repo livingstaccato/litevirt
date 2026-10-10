@@ -14,6 +14,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -40,7 +41,7 @@ func wireReleaseFeatures(t *testing.T, c *Cluster, gates map[string]*health.Chec
 		n.DB.SetClusterPolicyGate(func() bool { return g.DurablyLatched(capabilities.FailoverScopeV1) })
 		g.SetReleaseUseConfirmer(n.Server.PeerHoldsReleaseFeatureUse)
 		n.Server.SetReleaseFeatureGate(g)
-		n.DB.SetReplicationSourceGate(n.Server.ReleasePeerAllowed)
+		n.DB.SetReplicationSourceGate(n.Server.ReleaseSourceAllowed)
 		// The daemon's predicate: a rollback quarantine or a tripped use, never
 		// a probation (N1).
 		n.Server.SetWALQuarantined(n.DB.WALQuarantined)
@@ -200,7 +201,7 @@ func TestFleet_ReleaseFeature_ProbationHoldsARolledBackNode(t *testing.T) {
 	if err := corrosion.InsertProject(ctx, x.DB, corrosion.ProjectRecord{Name: "after-probation"}); err != nil {
 		t.Fatalf("a write after probation lifted: %v", err)
 	}
-	x.DB.SetReplicationSourceGate(x.Server.ReleasePeerAllowed)
+	x.DB.SetReplicationSourceGate(x.Server.ReleaseSourceAllowed)
 
 	// x restarts below the token again. a records a use of the future feature
 	// while its stream to x (and to b, so b — on this build, in this harness —
@@ -428,20 +429,116 @@ func TestFleet_ReleaseFeature_SimultaneousRollbacksLift(t *testing.T) {
 
 // TestFleet_ReleaseFeature_QuarantinedVoterDoesNotVouch: through the real pull,
 // a voter whose Ping says wal_quarantined is not counted; once it is healthy
-// again, it is.
+// again, it is. The third voter is down, so y is the one other voter x can ask.
 func TestFleet_ReleaseFeature_QuarantinedVoterDoesNotVouch(t *testing.T) {
 	releaseFeatures(t)
 	ctx := context.Background()
 	c, _ := latchedFleet(t, 3, 1132)
 	x, y := c.Nodes[0], c.Nodes[1]
+	c.Kill(c.Nodes[2])
 	x.DB.EnterReleaseProbation([]string{"release_2099_01_v1"})
 	y.Server.SetWALQuarantined(func() bool { return true })
 	if lifted, _ := corrosion.NewAntiEntropy(x.DB, x.PKIDir, 0).VerifyReleaseProbation(ctx); lifted {
-		t.Fatalf("%s lifted on one healthy voter of two others, %s being WAL-quarantined", x.Name, y.Name)
+		t.Fatalf("%s lifted with %s WAL-quarantined and %s down", x.Name, y.Name, c.Nodes[2].Name)
 	}
 	y.Server.SetWALQuarantined(y.DB.WALQuarantined)
 	if lifted, err := corrosion.NewAntiEntropy(x.DB, x.PKIDir, 0).VerifyReleaseProbation(ctx); !lifted {
 		t.Fatalf("%s did not lift once %s was healthy (err %v)", x.Name, y.Name, err)
+	}
+}
+
+// TestFleet_ReleaseFeature_WholeClusterRollbackWithAHostDead is I-R4-1. A
+// three-node cluster rolls back below a release marker as a whole, and one
+// host does not come back. Every boot below the marker is a probation, and a
+// probation applies nothing, so the two survivors must lift on each other's
+// word alone — a majority of the voter set with their own seat counted — or
+// the control plane stays frozen until the dead host returns. Right after the
+// lift each runs an anti-entropy pass, so its replica catches up at once
+// rather than one interval later (m2).
+func TestFleet_ReleaseFeature_WholeClusterRollbackWithAHostDead(t *testing.T) {
+	releaseFeatures(t)
+	ctx := context.Background()
+	c, _ := latchedFleet(t, 3, 1135)
+	live, dead := c.Nodes[:2], c.Nodes[2]
+	const future = "release_2099_01_v1"
+	c.Kill(dead)
+	for _, n := range live {
+		dataDir := t.TempDir()
+		if err := os.WriteFile(health.ActivationMarkerPath(dataDir, future), []byte("1\nrollback: safe_if_unused\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if q := daemon.BootRollbackCheck(ctx, dataDir, n.DB); len(q) != 0 {
+			t.Fatalf("%s: quarantined %v with nothing used", n.Name, q)
+		}
+		if p := n.DB.ReleaseProbation(); !slices.Equal(p, []string{future}) {
+			t.Fatalf("%s: probation = %v, want [%s]", n.Name, p, future)
+		}
+		n.DB.MarkReplicaStale("test: rebooted below a release marker")
+	}
+	var wg sync.WaitGroup
+	for _, n := range live {
+		wg.Add(1)
+		go func(n *Node) {
+			defer wg.Done()
+			lctx, cancel := context.WithTimeout(ctx, convergeTimeout)
+			defer cancel()
+			daemon.RunReleaseProbation(lctx, n.DB, corrosion.NewAntiEntropy(n.DB, n.PKIDir, 0))
+		}(n)
+	}
+	wg.Wait()
+	for _, n := range live {
+		if p := n.DB.ReleaseProbation(); len(p) != 0 {
+			t.Fatalf("%s is still in probation %v with one voter of three dead: the control plane is frozen", n.Name, p)
+		}
+		if ok, why := n.DB.ReplicaCaughtUp(); !ok {
+			t.Fatalf("%s lifted but its replica has not caught up (%s): the first anti-entropy pass was spent in probation", n.Name, why)
+		}
+		if err := corrosion.InsertProject(ctx, n.DB, corrosion.ProjectRecord{Name: "after-" + n.Name}); err != nil {
+			t.Fatalf("%s: a write after the lift: %v", n.Name, err)
+		}
+	}
+}
+
+// TestFleet_ReleaseFeature_ProbationLearnsTheNewVoterSet is I-R4-2. x is away
+// while the voters change: x itself, then n2, then n1 are removed, leaving n0
+// the one voter. n1 and n2 then die, and x comes back below a release marker.
+// Its replica still says the voters are generation 1 — all four — so it would
+// need two of n0, n1 and n2, and only n0 answers. A probation applies nothing,
+// so nothing would ever tell it otherwise. The probation pull merges the voter
+// view, n0's Ping says it has adopted generation 4, and x adopts the newer
+// generations — each certificate verified — and lifts against {n0}.
+func TestFleet_ReleaseFeature_ProbationLearnsTheNewVoterSet(t *testing.T) {
+	releaseFeatures(t)
+	ctx := context.Background()
+	c, _ := latchedFleet(t, 4, 1136)
+	runGenesis(t, c)
+	n0, n1, n2, x := c.Nodes[0], c.Nodes[1], c.Nodes[2], c.Nodes[3]
+	c.Kill(x)
+	for _, step := range []struct {
+		host *Node
+		gen  int64
+	}{{x, 2}, {n2, 3}, {n1, 4}} {
+		resp, err := c.SelfClient(n0).ChangeVoterConfig(ctx, &pb.ChangeVoterConfigRequest{Op: "rm", Host: step.host.Name})
+		if err != nil || resp.GetGeneration() != step.gen {
+			t.Fatalf("rm %s: %+v %v", step.host.Name, resp, err)
+		}
+		adoptAll(t, c, step.gen, n0, n1, n2)
+	}
+	if got := voterNames(t, x); !slices.Equal(got, nodeNames(n0, n1, n2, x)) {
+		t.Fatalf("setup: %s's voter view = %v, want generation 1's four", x.Name, got)
+	}
+	c.Kill(n1)
+	c.Kill(n2)
+	x.DB.EnterReleaseProbation([]string{"release_2099_01_v1"})
+	c.SetLinkFaultBoth(x, n0, LinkFault{})
+	ae := corrosion.NewAntiEntropy(x.DB, x.PKIDir, 0)
+	ae.SetVoterAdopter(x.Server.AdoptVoterConfigs)
+	if lifted, err := ae.VerifyReleaseProbation(ctx); !lifted || err != nil {
+		t.Fatalf("%s did not lift (lifted=%v err=%v; waiting on %v; voter view %v): a stale voter set holds it",
+			x.Name, lifted, err, x.DB.ReleaseProbationWaitingOn(), voterNames(t, x))
+	}
+	if got := voterNames(t, x); !slices.Equal(got, nodeNames(n0)) {
+		t.Fatalf("%s's voter view after the lift = %v, want [%s]", x.Name, got, n0.Name)
 	}
 }
 

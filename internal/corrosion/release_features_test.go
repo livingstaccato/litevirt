@@ -542,34 +542,30 @@ func probationVoters(t *testing.T, others []string, pull func(peer string) (bool
 	}
 	c.EnterReleaseProbation([]string{futureReleaseToken})
 	ae := NewAntiEntropy(c, t.TempDir(), time.Minute)
-	ae.probationPull = func(_ context.Context, peer string) (bool, error) { return pull(peer) }
+	ae.probationPull = func(_ context.Context, peer string) (probationAnswer, error) {
+		excluded, err := pull(peer)
+		return probationAnswer{excluded: excluded}, err
+	}
 	return c, ae
 }
 
 // TestVerifyReleaseProbation_CountsOtherVotersInProbation (N3, C-R2-1): this
-// node's own replica is the one in doubt, so it does not count. A voter that
-// is itself in probation DOES count: every voter acknowledged a first use, so a
-// voter holding no record of one was not there for it, and its replica is as
-// good evidence as any other. Only a WAL-quarantined voter (a rollback below a
-// use, or a pre-rule build) is excluded.
+// node's own replica is the one in doubt, so it is never an answer. A voter
+// that is itself in probation DOES count: every voter acknowledged a first
+// use, so a voter holding no record of one was not there for it, and its
+// replica is as good evidence as any other. Only a WAL-quarantined voter (a
+// rollback below a use, or a pre-rule build) is excluded.
 func TestVerifyReleaseProbation_CountsOtherVotersInProbation(t *testing.T) {
 	ctx := context.Background()
-	// 3 voters: self, b answers, c unreachable. Self does not count: 1 < 2.
+	// 3 voters: self, b WAL-quarantined, c unreachable. Nobody counts: 0 < 1.
 	_, ae := probationVoters(t, []string{"voter-b", "voter-c"}, func(peer string) (bool, error) {
 		if peer == "voter-b" {
-			return false, nil
+			return true, nil
 		}
 		return false, errors.New("unreachable")
 	})
 	if lifted, _ := ae.VerifyReleaseProbation(ctx); lifted {
-		t.Fatal("probation lifted on one other voter of three: this node counted itself")
-	}
-	// b and c answer, but b is WAL-quarantined: 1 < 2.
-	_, ae = probationVoters(t, []string{"voter-b", "voter-c"}, func(peer string) (bool, error) {
-		return peer == "voter-b", nil
-	})
-	if lifted, _ := ae.VerifyReleaseProbation(ctx); lifted {
-		t.Fatal("probation lifted on the word of a WAL-quarantined peer")
+		t.Fatal("probation lifted on the word of a WAL-quarantined peer and its own replica")
 	}
 	// Both answer, both themselves in probation (a whole-cluster rollback):
 	// they count, and it lifts. The pull reports only quarantine as excluded.
@@ -590,6 +586,160 @@ func TestVerifyReleaseProbation_CountsOtherVotersInProbation(t *testing.T) {
 	_, ae = probationVoters(t, nil, func(string) (bool, error) { return false, errors.New("never asked") })
 	if lifted, _ := ae.VerifyReleaseProbation(ctx); !lifted {
 		t.Fatal("a one-voter cluster cannot lift probation: stuck")
+	}
+}
+
+// TestVerifyReleaseProbation_MajorityCountsOwnSeat (I-R4-1): the majority is
+// of the WHOLE voter set, this node's own seat counted when it is a voter. A
+// three-voter cluster with one voter dead must lift — every boot below a
+// marker is a probation, and probation applies nothing, so a voter that needs
+// every other voter freezes in both directions until the dead one returns.
+func TestVerifyReleaseProbation_MajorityCountsOwnSeat(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name     string
+		others   []string
+		answer   []string // the others that answer; the rest are unreachable
+		nonVoter bool
+		lifts    bool
+	}{
+		{"3 voters, 1 other answers", []string{"b", "c"}, []string{"b"}, false, true},
+		{"3 voters, none answers", []string{"b", "c"}, nil, false, false},
+		{"5 voters, 1 other answers", []string{"b", "c", "d", "e"}, []string{"b"}, false, false},
+		{"5 voters, 2 others answer", []string{"b", "c", "d", "e"}, []string{"b", "d"}, false, true},
+		{"4 voters, 1 other answers", []string{"b", "c", "d"}, []string{"c"}, false, false},
+		{"4 voters, 2 others answer", []string{"b", "c", "d"}, []string{"c", "d"}, false, true},
+		{"non-voter, 1 of 3 voters answers", []string{"b", "c", "d"}, []string{"b"}, true, false},
+		{"non-voter, 2 of 3 voters answer", []string{"b", "c", "d"}, []string{"b", "d"}, true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, ae := probationVoters(t, tc.others, func(peer string) (bool, error) {
+				if slices.Contains(tc.answer, peer) {
+					return false, nil
+				}
+				return false, errors.New("unreachable")
+			})
+			if tc.nonVoter {
+				c.liftReleaseProbation([]string{futureReleaseToken}) // a replicated write, made before the boot
+				if err := UpdateHostState(ctx, c, c.HostName(), "maintenance"); err != nil {
+					t.Fatal(err)
+				}
+				c.EnterReleaseProbation([]string{futureReleaseToken})
+			}
+			if lifted, err := ae.VerifyReleaseProbation(ctx); lifted != tc.lifts || err != nil {
+				t.Fatalf("lifted=%v err=%v, want lifted=%v", lifted, err, tc.lifts)
+			}
+		})
+	}
+}
+
+// TestVerifyReleaseProbation_NamesTheVotersItWaitsOn (I-R4-1): a probation
+// that stays names each voter it could not count, with why — in the
+// probation's reason, which `lv cluster upgrade-status` shows — and clears it
+// on the lift.
+func TestVerifyReleaseProbation_NamesTheVotersItWaitsOn(t *testing.T) {
+	ctx := context.Background()
+	down := map[string]bool{"b": true, "c": true}
+	c, ae := probationVoters(t, []string{"b", "c", "d", "e"}, func(peer string) (bool, error) {
+		if peer == "d" {
+			return true, nil
+		}
+		if down[peer] {
+			return false, errors.New("unreachable")
+		}
+		return false, nil
+	})
+	if lifted, _ := ae.VerifyReleaseProbation(ctx); lifted {
+		t.Fatal("lifted on one of four other voters")
+	}
+	want := []string{"b (unreachable)", "c (unreachable)", "d (WAL-quarantined)"}
+	if got := c.ReleaseProbationWaitingOn(); !slices.Equal(got, want) {
+		t.Fatalf("waiting on %v, want %v", got, want)
+	}
+	if r := c.QuarantineReason(); !strings.Contains(r, "b (unreachable), c (unreachable), d (WAL-quarantined)") {
+		t.Fatalf("probation reason %q does not name the voters it waits on", r)
+	}
+	down["b"] = false
+	if lifted, err := ae.VerifyReleaseProbation(ctx); !lifted || err != nil {
+		t.Fatalf("b and e answer: lifted=%v err=%v", lifted, err)
+	}
+	if got := c.ReleaseProbationWaitingOn(); len(got) != 0 {
+		t.Fatalf("still waiting on %v after the lift", got)
+	}
+}
+
+// staleVoterView seeds a replica that has ADOPTED generation 1 = gen1 and holds
+// generation 2 = gen2 unadopted, as a probation pull leaves it, with this node
+// in probation and its pulls answered by answer.
+func staleVoterView(t *testing.T, gen1, gen2 []string, answer map[string]probationAnswer) (*Client, *AntiEntropy, *[]string) {
+	t.Helper()
+	ctx := context.Background()
+	c := testClient(t)
+	c.SetVoterConfigGate(func() bool { return true })
+	members := func(names []string) []VoterMember {
+		var out []VoterMember
+		for _, n := range names {
+			out = append(out, VoterMember{Name: n, Incarnation: "inc-" + n})
+		}
+		return out
+	}
+	for g, names := range map[int64][]string{1: gen1, 2: gen2} {
+		if names == nil {
+			continue
+		}
+		v := VoterConfigValue{Generation: g, Members: members(names), Change: "test", CreatedBy: "test"}
+		if err := WriteVoterConfig(ctx, c, v, ClaimCertificate{}); err != nil {
+			t.Fatalf("write generation %d: %v", g, err)
+		}
+	}
+	if err := RecordVoterAdoption(ctx, c, 1); err != nil {
+		t.Fatal(err)
+	}
+	c.EnterReleaseProbation([]string{futureReleaseToken})
+	var asked []string
+	ae := NewAntiEntropy(c, t.TempDir(), time.Minute)
+	ae.probationPull = func(_ context.Context, peer string) (probationAnswer, error) {
+		asked = append(asked, peer)
+		if a, ok := answer[peer]; ok {
+			return a, nil
+		}
+		return probationAnswer{}, errors.New("unreachable")
+	}
+	return c, ae, &asked
+}
+
+// TestVerifyReleaseProbation_LearnsANewerVoterGeneration (I-R4-2): this node
+// was away while the voters were replaced — {A..E} became {A,B,F,G,H} — and
+// its replica still counts {A..E}, of which only A and B answer. A peer
+// reports the newer generation; the round adopts it (the merged row) and
+// counts against it: A, B and F are a majority of the new set, and it lifts.
+func TestVerifyReleaseProbation_LearnsANewerVoterGeneration(t *testing.T) {
+	ctx := context.Background()
+	ans := map[string]probationAnswer{"A": {voterGeneration: 2}, "B": {voterGeneration: 2}, "F": {voterGeneration: 2}}
+	c, ae, asked := staleVoterView(t, []string{"A", "B", "C", "D", "E"}, []string{"A", "B", "F", "G", "H"}, ans)
+	ae.SetVoterAdopter(func(ctx context.Context) (int64, error) {
+		return 2, RecordVoterAdoption(ctx, c, 2)
+	})
+	if lifted, err := ae.VerifyReleaseProbation(ctx); !lifted || err != nil {
+		t.Fatalf("lifted=%v err=%v (asked %v), want a lift against the newer generation", lifted, err, *asked)
+	}
+	if g, _ := AdoptedVoterGeneration(ctx, c); g != 2 {
+		t.Fatalf("adopted generation %d after the round, want 2", g)
+	}
+}
+
+// TestVerifyReleaseProbation_NeverLiftsOnAStaleGeneration (I-R4-2): a majority
+// of the voter set this node holds is not enough once a peer reports a newer
+// generation this node cannot adopt yet — the set it would count is gone.
+func TestVerifyReleaseProbation_NeverLiftsOnAStaleGeneration(t *testing.T) {
+	ctx := context.Background()
+	ans := map[string]probationAnswer{"A": {voterGeneration: 2}, "B": {voterGeneration: 1}}
+	c, ae, _ := staleVoterView(t, []string{"A", "B", "C"}, nil, ans)
+	if lifted, err := ae.VerifyReleaseProbation(ctx); lifted || err != nil {
+		t.Fatalf("lifted=%v err=%v on a stale voter set, want probation kept", lifted, err)
+	}
+	if w := strings.Join(c.ReleaseProbationWaitingOn(), " "); !strings.Contains(w, "voter generation 2") {
+		t.Fatalf("waiting on %q, want it to name the newer generation", w)
 	}
 }
 
@@ -664,7 +814,8 @@ func TestAntiEntropy_SensitivePullTakesClusterPoliciesFirst(t *testing.T) {
 // TestVerifyReleaseProbation_EmptyVoterSetAsksAdmittedMembers (m-R2-6): a
 // replica that holds no voter at all — no hosts row voting-eligible, no
 // adopted generation — never lifts having asked nobody. It asks a majority of
-// its admitted members instead, and with none to ask it stays in probation.
+// its admitted members instead, and with none to ask — and no row even for
+// itself, so nothing to show it is the only host (m6) — it stays in probation.
 func TestVerifyReleaseProbation_EmptyVoterSetAsksAdmittedMembers(t *testing.T) {
 	ctx := context.Background()
 	asked := map[string]int{}
@@ -683,9 +834,9 @@ func TestVerifyReleaseProbation_EmptyVoterSetAsksAdmittedMembers(t *testing.T) {
 		})
 		c.EnterReleaseProbation([]string{futureReleaseToken})
 		ae := NewAntiEntropy(c, t.TempDir(), time.Minute)
-		ae.probationPull = func(_ context.Context, peer string) (bool, error) {
+		ae.probationPull = func(_ context.Context, peer string) (probationAnswer, error) {
 			asked[peer]++
-			return false, answer[peer]
+			return probationAnswer{}, answer[peer]
 		}
 		return c, ae
 	}
@@ -703,6 +854,98 @@ func TestVerifyReleaseProbation_EmptyVoterSetAsksAdmittedMembers(t *testing.T) {
 	}
 	if len(c.ReleaseProbation()) != 0 {
 		t.Fatal("probation still set after it lifted")
+	}
+}
+
+// TestVerifyReleaseProbation_RecountsADerivedSetTheMergeChanged (I-R4-2): with
+// no voter generation the voter set is derived from the hosts rows, and the
+// probation pull merges those. When what it merged grows the set, the round
+// counts against the grown set before it lifts: {self, b, c} needs one other
+// answer, {self, b, c, d, e} two.
+func TestVerifyReleaseProbation_RecountsADerivedSetTheMergeChanged(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name    string
+		answers []string
+		lifts   bool
+	}{
+		{"only b answers", []string{"b"}, false},
+		{"b and d answer", []string{"b", "d"}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, ae := probationVoters(t, []string{"b", "c"}, nil)
+			ae.probationPull = func(_ context.Context, peer string) (probationAnswer, error) {
+				if peer == "b" {
+					// What b's voter view merges in: two more voting hosts. A
+					// probation applies nothing else, so the rows are written
+					// here as the merge would leave them.
+					c.liftReleaseProbation([]string{futureReleaseToken})
+					for _, h := range []string{"d", "e"} {
+						if err := InsertHost(ctx, c, HostRecord{Name: h, Address: "10.0.0.7", State: "active", Role: "worker"}); err != nil {
+							t.Fatal(err)
+						}
+					}
+					c.EnterReleaseProbation([]string{futureReleaseToken})
+				}
+				if slices.Contains(tc.answers, peer) {
+					return probationAnswer{}, nil
+				}
+				return probationAnswer{}, errors.New("unreachable")
+			}
+			if lifted, err := ae.VerifyReleaseProbation(ctx); lifted != tc.lifts || err != nil {
+				t.Fatalf("lifted=%v err=%v, want %v (waiting on %v)", lifted, err, tc.lifts, c.ReleaseProbationWaitingOn())
+			}
+		})
+	}
+}
+
+// TestVerifyReleaseProbation_LoneHostLifts (m6): a one-host cluster with no
+// voter generation whose only host is in maintenance has an empty voter set and
+// nobody to ask. No other host exists to have acknowledged a use, so it lifts —
+// as a one-voter cluster does — instead of staying frozen, unable even to run
+// `lv host maintenance exit`. With another host in the replica it stays.
+func TestVerifyReleaseProbation_LoneHostLifts(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	if err := InsertHost(ctx, c, HostRecord{Name: c.HostName(), Address: "10.0.0.9", State: "maintenance", Role: "worker"}); err != nil {
+		t.Fatal(err)
+	}
+	c.SetMembersForTests(func() []PeerInfo { return []PeerInfo{{Name: c.HostName()}} })
+	c.EnterReleaseProbation([]string{futureReleaseToken})
+	ae := NewAntiEntropy(c, t.TempDir(), time.Minute)
+	ae.probationPull = func(context.Context, string) (probationAnswer, error) {
+		return probationAnswer{}, errors.New("nobody to ask")
+	}
+	if lifted, err := ae.VerifyReleaseProbation(ctx); !lifted || err != nil {
+		t.Fatalf("the only host, in maintenance: lifted=%v err=%v", lifted, err)
+	}
+	if err := InsertHost(ctx, c, HostRecord{Name: "other", Address: "10.0.0.8", State: "maintenance", Role: "worker"}); err != nil {
+		t.Fatal(err)
+	}
+	c.EnterReleaseProbation([]string{futureReleaseToken})
+	if lifted, _ := ae.VerifyReleaseProbation(ctx); lifted {
+		t.Fatal("lifted with another host in the replica and nobody asked")
+	}
+	if w := strings.Join(c.ReleaseProbationWaitingOn(), " "); !strings.Contains(w, "no voter or admitted member") {
+		t.Fatalf("waiting on %q, want the reason", w)
+	}
+}
+
+// TestAntiEntropy_PassSkippedInProbationIsNotSpent (m2): a scheduled pass in
+// probation would take nothing from any peer. It is skipped and NOT counted as
+// run, so the pass right after the lift is not held back by the cooldown.
+func TestAntiEntropy_PassSkippedInProbationIsNotSpent(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	c.SetMembersForTests(func() []PeerInfo { return nil })
+	ae := NewAntiEntropy(c, t.TempDir(), time.Minute)
+	c.EnterReleaseProbation([]string{futureReleaseToken})
+	if ae.RunSampledOnce(ctx) {
+		t.Fatal("an anti-entropy pass ran in release probation")
+	}
+	c.liftReleaseProbation([]string{futureReleaseToken})
+	if !ae.RunSampledOnce(ctx) {
+		t.Fatal("the first pass after the lift did not run: the skipped pass was counted against the cooldown")
 	}
 }
 

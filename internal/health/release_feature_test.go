@@ -3,6 +3,7 @@ package health
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -363,6 +364,36 @@ func TestWithFeature_AckSetIncludesEveryVoter(t *testing.T) {
 	mu.Unlock()
 	if wrote, err := e.write(t, e.c, testFeature); err != nil || !wrote {
 		t.Fatalf("once host-c holds it: wrote=%v err=%v", wrote, err)
+	}
+}
+
+// TestWithFeature_ProbationHostIsNotCalledGone (m1): a voter that has not
+// acknowledged because it is in release probation — it refuses every push
+// until it lifts — is a live host. The refusal says it is in probation and
+// points at the status command; it does not tell the operator to remove it
+// from the voter set.
+func TestWithFeature_ProbationHostIsNotCalledGone(t *testing.T) {
+	e := newRelEnv(t)
+	gateHost(t, e.db, "host-c", "active", "worker")
+	e.db.SetMembersForTests(func() []corrosion.PeerInfo { return []corrosion.PeerInfo{{Name: "host-b"}, {Name: "host-c"}} })
+	e.c.SetVoterSetForTest(func(context.Context) (map[string]bool, error) {
+		return map[string]bool{"host-a": true, "host-b": true, "host-c": true}, nil
+	})
+	e.confirm = func(host string) (bool, error) {
+		if host == "host-c" {
+			return false, fmt.Errorf("%s: %w", host, corrosion.ErrReleaseProbation)
+		}
+		return true, nil
+	}
+	wrote, err := e.write(t, e.c, testFeature)
+	if status.Code(err) != codes.Unavailable || wrote {
+		t.Fatalf("first use with host-c in probation: wrote=%v err=%v, want Unavailable", wrote, err)
+	}
+	if !strings.Contains(err.Error(), "host-c is in release probation") ||
+		!strings.Contains(err.Error(), "`lv cluster upgrade-status`") ||
+		strings.Contains(err.Error(), "voter rm host-c") {
+		t.Fatalf("refusal = %v, want host-c named as in release probation with the status command, "+
+			"and no `lv cluster voter rm host-c`", err)
 	}
 }
 

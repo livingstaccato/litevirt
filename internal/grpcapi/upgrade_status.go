@@ -175,11 +175,14 @@ func (s *Server) HoldsReleaseFeatureUse(ctx context.Context, q *pb.ReleaseFeatur
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "read release feature use: %v", err)
 	}
-	return &pb.ReleaseFeatureUseHeld{Held: present}, nil
+	return &pb.ReleaseFeatureUseHeld{Held: present, InReleaseProbation: s.db.InReleaseProbation()}, nil
 }
 
 // PeerHoldsReleaseFeatureUse asks host whether its replica holds the used
-// record: health.ReleaseUseConfirmer in production.
+// record: health.ReleaseUseConfirmer in production. A host that does not hold
+// it and is in release probation — so applies nothing pushed to it until the
+// probation lifts — answers an error wrapping corrosion.ErrReleaseProbation,
+// so the refusal can say so rather than suggest removing a live voter (m1).
 func (s *Server) PeerHoldsReleaseFeatureUse(ctx context.Context, host, token, feature string) (bool, error) {
 	if host == s.hostName {
 		present, _, err := corrosion.ReleaseFeatureState(ctx, s.db, token, feature)
@@ -193,6 +196,9 @@ func (s *Server) PeerHoldsReleaseFeatureUse(ctx context.Context, host, token, fe
 	r, err := c.HoldsReleaseFeatureUse(ctx, &pb.ReleaseFeatureUseQuery{Token: token, Feature: feature})
 	if err != nil {
 		return false, err
+	}
+	if !r.GetHeld() && r.GetInReleaseProbation() {
+		return false, fmt.Errorf("%s: %w", host, corrosion.ErrReleaseProbation)
 	}
 	return r.GetHeld(), nil
 }
@@ -429,12 +435,54 @@ func (s *Server) ReleasePeerAllowed(ctx context.Context, peer string) error {
 	return nil
 }
 
+// ReleaseSourceAllowed judges a peer this node is about to take anti-entropy
+// state FROM (corrosion.Client.SetReplicationSourceGate). It is
+// ReleasePeerAllowed with one difference (m5): a peer this node has no list
+// for is asked now — anti-entropy runs in the background, not on the push
+// path — and one that answers with nothing while not WAL-quarantined (a
+// self-fenced host, or an older build that is fenced) and was never heard
+// from before is refused as a source until it declares what it keeps. That
+// costs nothing: the pass pulls from another peer. No alarm is raised for it.
+// An origin of relayed entries is still never refused for being unknown
+// (releaseOriginsAllowed).
+func (s *Server) ReleaseSourceAllowed(ctx context.Context, peer string) error {
+	toks := s.usedReleaseTokens(ctx)
+	if len(toks) == 0 || peer == s.hostName {
+		return nil
+	}
+	if _, known := s.peerCapsFor(peer); !known {
+		actx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		caps, quarantined, err := s.peerReleaseAnswer(actx, peer)
+		cancel()
+		switch {
+		case err != nil:
+			return status.Errorf(codes.FailedPrecondition,
+				"anti-entropy from %s refused: a release feature is in use and %s has not said whether it keeps "+
+					"its data (%v)", peer, peer, err)
+		case len(caps) == 0 && !quarantined:
+			return status.Errorf(codes.FailedPrecondition,
+				"anti-entropy from %s refused: a release feature is in use and %s, never heard from before, "+
+					"advertises nothing (self-fenced?); it is a source again once it declares what it keeps", peer, peer)
+		}
+		s.notePeerCaps(peer, caps)
+	}
+	return s.ReleasePeerAllowed(ctx, peer)
+}
+
 // releaseOriginsAllowed applies ReleasePeerAllowed to the origin of every
 // relayed entry, so a relay that has not caught up cannot pass on what it
 // should have refused. Only an origin KNOWN not to carry a used token refuses
 // the push: one never heard from, or self-fenced (an empty advertisement that
 // is not a WAL quarantine, refreshPeerCaps), is never judged on it, so one
 // origin's unknown state never holds up the other origins on the stream.
+//
+// An origin KNOWN not to carry a used token refuses the WHOLE push (m7), so
+// every other origin's entries behind it on that relay stream wait —
+// back-pressure, nothing dropped, anti-entropy carrying them meanwhile — until
+// that host is upgraded again or removed. That is intended: a push is
+// acknowledged as a whole, so applying the rest while skipping one origin's
+// entries would tell the relay they were delivered, and lose them. The
+// operator sees release_feature_peer_refused naming the host.
 func (s *Server) releaseOriginsAllowed(ctx context.Context, sender string, entries []*pb.MutationEntry) error {
 	if len(s.usedReleaseTokens(ctx)) == 0 {
 		return nil
@@ -620,12 +668,16 @@ type rolloutAnswer struct {
 // never asked first — so a cycle never fans out and an unreachable host costs
 // one bounded Ping per backoff, not one per cycle. An answer that carries the
 // token is trusted releasePeerPositiveTTL; one that does not, or no answer, is
-// re-asked after a backoff (releasePeerBackoffMin doubling to Max). A host not
-// yet asked is left out until it has been.
-func (s *Server) releaseRolloutLagging(ctx context.Context) ([]string, error) {
+// re-asked after a backoff (releasePeerBackoffMin doubling to Max).
+//
+// complete is false while some host of the latch's set has never been asked:
+// this node's view is partial (m3) — every node writes the same row, and one
+// that has just restarted, which during a roll is every node in turn, would
+// otherwise resolve or rewrite it from a view of nobody.
+func (s *Server) releaseRolloutLagging(ctx context.Context) (names []string, complete bool, err error) {
 	targets, _, err := s.releaseRolloutTargets(ctx)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	now := time.Now()
 	s.releasePeerMu.Lock()
@@ -667,23 +719,33 @@ func (s *Server) releaseRolloutLagging(ctx context.Context) ([]string, error) {
 		}
 		s.releasePeerMu.Unlock()
 	}
-	var names []string
+	complete = true
 	s.releasePeerMu.Lock()
 	for _, name := range targets {
-		if a := s.releaseRollout[name]; name != s.hostName && a != nil && !a.on {
+		if name == s.hostName {
+			continue
+		}
+		a := s.releaseRollout[name]
+		if a == nil {
+			complete = false
+			continue
+		}
+		if !a.on {
 			names = append(names, name)
 		}
 	}
 	s.releasePeerMu.Unlock()
 	sort.Strings(names)
-	return names, nil
+	return names, complete, nil
 }
 
 // evaluateReleaseRollout keeps the informational release_rollout_pending
 // condition (UX 3): open, naming the lagging hosts, while this build's release
 // token has not latched here and some host does not advertise it; resolved
-// once it latches or every host does. Written only on a change. Severity info:
-// an upgrade in progress is not a fault, and info does not degrade `lv health`.
+// once it latches or every host does. Written only on a change, and before the
+// latch only from a complete view — every host of the latch's set asked at
+// least once since this node started (m3). Severity info: an upgrade in
+// progress is not a fault, and info does not degrade `lv health`.
 func (s *Server) evaluateReleaseRollout(ctx context.Context) {
 	if s.gate == nil {
 		return
@@ -696,7 +758,8 @@ func (s *Server) evaluateReleaseRollout(ctx context.Context) {
 	open = open && prev.Lifecycle != corrosion.ConditionResolved
 	var names []string
 	if !s.gate.Latched(tok) {
-		if names, err = s.releaseRolloutLagging(ctx); err != nil {
+		var complete bool
+		if names, complete, err = s.releaseRolloutLagging(ctx); err != nil || !complete {
 			return
 		}
 	}

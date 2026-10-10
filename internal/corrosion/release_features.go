@@ -39,6 +39,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -223,10 +224,30 @@ func (c *Client) releaseUseQuarantineReason() string {
 		return "a feature of a newer release this build does not know is in use: " + strings.Join(toks, ",")
 	}
 	if toks := c.ReleaseProbation(); len(toks) > 0 {
-		return releaseProbationPrefix + "started below latched release token(s) " + strings.Join(toks, ",") +
+		reason := releaseProbationPrefix + "started below latched release token(s) " + strings.Join(toks, ",") +
 			" with no use recorded in this replica; waiting to confirm that with a voter majority"
+		if w := c.ReleaseProbationWaitingOn(); len(w) > 0 {
+			reason += "; waiting on: " + strings.Join(w, ", ")
+		}
+		return reason
 	}
 	return ""
+}
+
+// ReleaseProbationWaitingOn names what the last probation round could not
+// count — each voter not answering, with why — or is empty before the first
+// round and after a lift. `lv cluster upgrade-status` shows it in the
+// probation's reason.
+func (c *Client) ReleaseProbationWaitingOn() []string {
+	c.releaseUseMu.Lock()
+	defer c.releaseUseMu.Unlock()
+	return append([]string(nil), c.releaseProbationWaiting...)
+}
+
+func (c *Client) setReleaseProbationWaiting(w []string) {
+	c.releaseUseMu.Lock()
+	c.releaseProbationWaiting = append([]string(nil), w...)
+	c.releaseUseMu.Unlock()
 }
 
 // noteReleaseFeatureKey trips the quarantine when key records a use this
@@ -384,87 +405,245 @@ func (c *Client) ReleaseProbationRefusal() error {
 	return nil
 }
 
+// probationAnswer is one peer's answer to a probation pull.
+type probationAnswer struct {
+	// excluded: the peer reports itself WAL-quarantined and does not count.
+	excluded bool
+	// voterGeneration is the voter generation the peer has adopted (its Ping),
+	// 0 when it does not say.
+	voterGeneration int64
+}
+
+// probationVoterTables are the tables a probation pull merges after
+// cluster_policies (I-R4-2): the voter view. A probation applies nothing else,
+// so without them a host that was away while the voters changed would count
+// against a voter set that no longer exists, for good. They carry no release
+// feature's data.
+var probationVoterTables = []string{"voter_configs", "hosts", "host_membership"}
+
+// probationMaxPasses bounds how often one round recomputes the voter set after
+// what its pulls merged changed it.
+const probationMaxPasses = 3
+
+// SetVoterAdopter injects the voter adoption pass (grpcapi.Server.
+// AdoptVoterConfigs) a probation round runs when a peer reports a voter
+// generation newer than this node has adopted. Adoption verifies each
+// generation's certificate; a probation never counts against a generation it
+// has not adopted. Unset, the round waits for the daemon's adoption loop.
+func (ae *AntiEntropy) SetVoterAdopter(fn func(ctx context.Context) (int64, error)) {
+	if fn == nil {
+		ae.voterAdopter.Store(nil)
+		return
+	}
+	ae.voterAdopter.Store(&fn)
+}
+
+// probationQuorum is one voter set a probation counts against: the peers to
+// ask, how many of them must answer, and how it was derived.
+type probationQuorum struct {
+	others []string
+	need   int
+	// key identifies the set, so a round can tell when a merge changed it.
+	key string
+	// fallback: the replica holds no voter, so admitted members are asked.
+	fallback bool
+}
+
+// releaseProbationQuorum computes the set a probation round counts against.
+//
+// A voter set (VoterSet: the adopted generation, or the derived set) needs a
+// MAJORITY OF THE WHOLE SET, this node's own seat included when it is a voter
+// (I-R4-1): of a three-voter set it asks one other, of five two. Every voter
+// acknowledged any first use before its data was written
+// (health.Checker.WithFeature), so a voter holding no record was not a voter,
+// or not there, for any use; the majority is a hedge against a stale view, not
+// a requirement of that invariant, and counting its own seat lets a rolled-back
+// host lift with a minority of the voters dead. A one-voter set (this node)
+// needs nobody.
+//
+// A replica with no voter at all asks a majority of its admitted members
+// (m-R2-6), not counting its own seat. With no member to ask either, it lifts
+// only when its hosts table holds this host and no other (m6): a one-host
+// cluster whose host is in maintenance, which no other host could have
+// acknowledged a use on.
+func (ae *AntiEntropy) releaseProbationQuorum(ctx context.Context, self string) (probationQuorum, bool, error) {
+	voters, err := VoterSet(ctx, ae.client)
+	if err != nil {
+		return probationQuorum{}, false, fmt.Errorf("voter set: %w", err)
+	}
+	var q probationQuorum
+	for v := range voters {
+		if v != self {
+			q.others = append(q.others, v)
+		}
+	}
+	sort.Strings(q.others)
+	if len(voters) > 0 {
+		q.need = MajorityOf(len(voters))
+		if voters[self] {
+			q.need--
+		}
+		if q.need > len(q.others) {
+			q.need = len(q.others)
+		}
+		q.key = "voters:" + strings.Join(q.others, ",")
+		if voters[self] {
+			q.key += "+self"
+		}
+		return q, true, nil
+	}
+	q.fallback = true
+	for _, p := range ae.client.Members() {
+		if p.Name != "" && p.Name != self && !slices.Contains(q.others, p.Name) {
+			q.others = append(q.others, p.Name)
+		}
+	}
+	sort.Strings(q.others)
+	q.key = "members:" + strings.Join(q.others, ",")
+	if len(q.others) > 0 {
+		q.need = len(q.others)/2 + 1
+		return q, true, nil
+	}
+	hosts, err := ListHosts(ctx, ae.client)
+	if err != nil {
+		return q, false, fmt.Errorf("read hosts: %w", err)
+	}
+	selfSeen := false
+	for _, h := range hosts {
+		if h.Name != self {
+			return q, false, nil
+		}
+		selfSeen = true
+	}
+	// The only host there is: need 0. A replica that does not even hold this
+	// host's row knows nothing, and lifts on nothing (m-R2-6).
+	return q, selfSeen, nil
+}
+
 // VerifyReleaseProbation tries once to lift this node's release probation.
 //
-// It asks the OTHER voters (VoterSet: the newest adopted generation, or the
-// derived set, as THIS replica holds it — possibly stale after a long absence)
-// for their cluster_policies, whole and unscoped, merging each. This node's own
-// replica does not count: it is the one in doubt. A voter that is itself in
-// probation DOES count (C-R2-1): every voter acknowledged any first use before
-// its data was written (health.Checker.WithFeature), so a voter holding no
-// record was not a voter, or not there, for any use — its replica is as good
-// evidence as any other, and excluding it would leave hosts rolled back
-// together waiting on each other for good. Only a WAL-quarantined voter is not
-// counted. It needs a majority of the voter set from the others, capped at the
-// number of other voters: a two-voter cluster asks its one peer, and a
-// one-voter cluster lifts on its own check (nobody else was a voter to
-// acknowledge). A replica with no voter at all asks a majority of its admitted
-// members instead, and with none to ask does not lift (m-R2-6). The pull is
-// exempt from the replication-source gate (N2) and from probation.
+// It pulls, from the voters releaseProbationQuorum names, their
+// cluster_policies, whole and unscoped, then their voter view
+// (probationVoterTables), merging each. This node's own replica does not
+// count as an answer: it is the one in doubt. A voter that is itself in
+// probation DOES count (C-R2-1), so hosts rolled back together lift together;
+// only a WAL-quarantined voter is not counted.
+//
+// The voter set is this node's own view, which can be stale after an absence
+// (I-R4-2). The pull merges the voter view, and each answer carries the voter
+// generation the peer has adopted: a newer one than this node's makes the round
+// adopt it (SetVoterAdopter) and count against the new set instead, and the
+// round never lifts while a peer reports a generation this node has not
+// adopted. A derived set that the merged hosts rows changed is recomputed too.
+// The pull is exempt from the replication-source gate (N2) and from probation.
 //
 // Any use this build cannot honour, found in what was merged, trips the
 // permanent quarantine and probation stays. Otherwise probation lifts — for the
 // tokens this round checked only (N8). It returns false, with no error, when a
-// majority was not reached or a use was found.
+// majority was not reached or a use was found; the voters it is waiting on are
+// named in the log and in the probation's reason (ReleaseProbationWaitingOn).
 func (ae *AntiEntropy) VerifyReleaseProbation(ctx context.Context) (bool, error) {
 	checking := ae.client.ReleaseProbation()
 	if len(checking) == 0 {
 		return true, nil
 	}
-	voters, err := VoterSet(ctx, ae.client)
-	if err != nil {
-		return false, fmt.Errorf("voter set: %w", err)
-	}
 	self := ae.client.HostName()
-	others := make([]string, 0, len(voters))
-	for v := range voters {
-		if v != self {
-			others = append(others, v)
-		}
-	}
-	need := len(voters)/2 + 1
-	if need > len(others) {
-		need = len(others)
-	}
-	if len(voters) == 0 {
-		// No voter at all in this replica (m-R2-6): never lift having asked
-		// nobody. Ask a majority of the admitted members instead; with none,
-		// stay in probation.
-		for _, p := range ae.client.Members() {
-			if p.Name != "" && p.Name != self {
-				others = append(others, p.Name)
-			}
-		}
-		if len(others) == 0 {
-			slog.Warn("release probation: this replica holds no voter and no admitted member to ask; staying in probation")
-			return false, nil
-		}
-		need = len(others)/2 + 1
-	}
-	sort.Strings(others)
 	pull := ae.probationPull
 	if pull == nil {
-		pull = ae.pullClusterPoliciesForProbation
+		pull = ae.pullForProbation
 	}
-	have := 0
-	for _, peer := range others {
-		if have >= need {
-			break
+	counted := map[string]bool{} // answered, and not WAL-quarantined
+	why := map[string]string{}   // asked, and does not count: why
+	var newest, adopted int64    // highest generation an answer reported; this node's
+	var q probationQuorum
+	settled := false
+	for pass := 0; pass < probationMaxPasses && !settled; pass++ {
+		var ok bool
+		var err error
+		if q, ok, err = ae.releaseProbationQuorum(ctx, self); err != nil {
+			return false, err
 		}
-		excluded, err := pull(ctx, peer)
+		if !ok {
+			ae.client.setReleaseProbationWaiting([]string{"no voter or admitted member to ask, and this replica " +
+				"does not show this host as the only one"})
+			slog.Warn("release probation: this replica holds no voter and no admitted member to ask, and does " +
+				"not show this host as the only one; staying in probation — set " +
+				"LITEVIRT_UNSAFE_SKIP_ROLLBACK_CHECK=1 and restart to start without it (docs/upgrades.md)")
+			return false, nil
+		}
+		if adopted, err = AdoptedVoterGeneration(ctx, ae.client); err != nil {
+			return false, fmt.Errorf("adopted voter generation: %w", err)
+		}
+		for _, peer := range q.others {
+			if countIn(counted, q.others) >= q.need {
+				break
+			}
+			if counted[peer] || why[peer] != "" {
+				continue
+			}
+			ans, err := pull(ctx, peer)
+			switch {
+			case err != nil:
+				why[peer] = "unreachable"
+				slog.Debug("release probation: could not pull from a peer", "peer", peer, "error", err)
+			case ans.excluded:
+				why[peer] = "WAL-quarantined"
+				slog.Debug("release probation: not counting a WAL-quarantined peer", "peer", peer)
+			default:
+				counted[peer] = true
+				newest = max(newest, ans.voterGeneration)
+			}
+		}
+		if newest > adopted {
+			// This node's voter set is stale. The pulls merged the newer
+			// generations; adopt them (each certificate verified) and count
+			// against the new set.
+			if fn := ae.voterAdopter.Load(); fn != nil {
+				if _, err := (*fn)(ctx); err != nil {
+					slog.Debug("release probation: voter adoption did not complete", "error", err)
+				}
+			}
+			now, err := AdoptedVoterGeneration(ctx, ae.client)
+			if err != nil {
+				return false, fmt.Errorf("adopted voter generation: %w", err)
+			}
+			if now <= adopted {
+				msg := fmt.Sprintf("a peer has adopted voter generation %d and this node only %d, and cannot adopt "+
+					"the newer one yet", newest, adopted)
+				ae.client.setReleaseProbationWaiting([]string{msg})
+				slog.Warn("release probation: this node's voter set is stale and it cannot adopt the newer "+
+					"generation yet; staying in probation — set LITEVIRT_UNSAFE_SKIP_ROLLBACK_CHECK=1 and "+
+					"restart to start without it (docs/upgrades.md)", "peer_generation", newest, "adopted", adopted)
+				return false, nil
+			}
+			continue
+		}
+		next, ok, err := ae.releaseProbationQuorum(ctx, self)
 		if err != nil {
-			slog.Debug("release probation: could not pull cluster_policies", "peer", peer, "error", err)
-			continue
+			return false, err
 		}
-		if excluded {
-			slog.Debug("release probation: not counting a WAL-quarantined peer", "peer", peer)
-			continue
+		if ok && next.key != q.key {
+			continue // the merged hosts rows changed the derived set
 		}
-		have++
+		settled = true
 	}
-	if have < need {
-		slog.Warn("release probation: a voter majority could not be asked yet; staying in probation",
-			"asked", have, "need", need)
+	have := countIn(counted, q.others)
+	if !settled || have < q.need {
+		var missing []string
+		for _, peer := range q.others {
+			if !counted[peer] {
+				reason := why[peer]
+				if reason == "" {
+					reason = "not asked"
+				}
+				missing = append(missing, peer+" ("+reason+")")
+			}
+		}
+		ae.client.setReleaseProbationWaiting(missing)
+		slog.Warn("release probation: a voter majority could not be asked yet; staying in probation — if the "+
+			"voters not answering are gone for good, remove them with `lv cluster voter rm <host>` on a healthy "+
+			"host, or set LITEVIRT_UNSAFE_SKIP_ROLLBACK_CHECK=1 and restart this one to start without the check "+
+			"(docs/upgrades.md)", "answered", have, "need", q.need, "not_answering", strings.Join(missing, ", "))
 		return false, nil
 	}
 	uses, err := ListReleaseFeatureUses(ctx, ae.client)
@@ -478,34 +657,59 @@ func (ae *AntiEntropy) VerifyReleaseProbation(ctx context.Context) (bool, error)
 		return false, nil
 	}
 	slog.Info("release probation: a voter majority holds no use of a feature this build cannot keep; lifting",
-		"tokens", checking, "voters_asked", have)
+		"tokens", checking, "voters_asked", have, "voter_generation", adopted)
+	ae.client.setReleaseProbationWaiting(nil)
 	ae.client.liftReleaseProbation(checking)
 	return true, nil
 }
 
-// pullClusterPoliciesForProbation asks peer whether it is WAL-quarantined
-// (excluded), then pulls and merges its cluster_policies whole. NOT gated by
-// the replication-source gate (N2).
-func (ae *AntiEntropy) pullClusterPoliciesForProbation(ctx context.Context, peer string) (bool, error) {
+// countIn counts the members of set among names.
+func countIn(set map[string]bool, names []string) int {
+	n := 0
+	for _, x := range names {
+		if set[x] {
+			n++
+		}
+	}
+	return n
+}
+
+// pullForProbation asks peer whether it is WAL-quarantined (excluded) and
+// which voter generation it has adopted, then pulls and merges its
+// cluster_policies whole, alone and first — a use found there trips the
+// quarantine before anything else is merged — and then its voter view
+// (probationVoterTables). NOT gated by the replication-source gate (N2).
+func (ae *AntiEntropy) pullForProbation(ctx context.Context, peer string) (probationAnswer, error) {
 	pctx, cancel := context.WithTimeout(ctx, antiEntropyPeerTimeout)
 	defer cancel()
 	client, conn, err := ae.peerClient(pctx, peer)
 	if err != nil {
-		return false, err
+		return probationAnswer{}, err
 	}
 	defer conn.Close()
 	resp, err := client.Ping(pctx, &pb.PingRequest{})
 	if err != nil {
-		return false, err
+		return probationAnswer{}, err
 	}
 	if resp.GetWalQuarantined() {
-		return true, nil
+		return probationAnswer{excluded: true}, nil
 	}
 	_, perr, merr := ae.pullAndMerge(pctx, client, []string{"cluster_policies"}, nil, nil)
 	if perr != nil {
-		return false, perr
+		return probationAnswer{}, perr
 	}
-	return false, merr
+	if merr != nil {
+		return probationAnswer{}, merr
+	}
+	if len(ae.client.ReleaseUseQuarantine()) == 0 {
+		// The used records are what the answer is; the voter view only says
+		// whom to ask next. A failure here costs a stale view, not the answer.
+		if _, perr, merr := ae.pullAndMerge(pctx, client, probationVoterTables, nil, nil); perr != nil || merr != nil {
+			slog.Debug("release probation: could not merge a peer's voter view", "peer", peer,
+				"pull_error", perr, "merge_error", merr)
+		}
+	}
+	return probationAnswer{voterGeneration: resp.GetVoterGeneration()}, nil
 }
 
 // CheckReleaseUsesFrom pulls and merges peer's cluster_policies whole, so a

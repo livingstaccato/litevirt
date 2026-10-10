@@ -258,10 +258,10 @@ func ListHosts(ctx context.Context, c *Client) ([]HostRecord, error) {
 		return nil, err
 	}
 
-	live := c.HostMembershipLive()
+	frozen := c.hostsCopyFrozen()
 	hosts := make([]HostRecord, len(rows))
 	for i, r := range rows {
-		hosts[i] = scanHost(r, live)
+		hosts[i] = scanHost(r, frozen)
 	}
 	return hosts, nil
 }
@@ -347,7 +347,7 @@ func GetHost(ctx context.Context, c *Client, name string) (*HostRecord, error) {
 	if len(rows) == 0 {
 		return nil, nil
 	}
-	h := scanHost(rows[0], c.HostMembershipLive())
+	h := scanHost(rows[0], c.hostsCopyFrozen())
 	return &h, nil
 }
 
@@ -367,7 +367,7 @@ const hostSelectSQL = `SELECT h.name, h.address, h.ssh_user, h.ssh_port, h.grpc_
 			` + membershipCols + `
 		 FROM hosts h LEFT JOIN host_fence_credentials c ON c.host_name = h.name AND c.deleted_at IS NULL` + membershipJoins
 
-func scanHost(r Row, membershipLive bool) HostRecord {
+func scanHost(r Row, hostsCopyFrozen bool) HostRecord {
 	name := r.String("name")
 	return HostRecord{
 		Name:               name,
@@ -375,7 +375,7 @@ func scanHost(r Row, membershipLive bool) HostRecord {
 		SSHUser:            r.String("ssh_user"),
 		SSHPort:            r.Int("ssh_port"),
 		GRPCPort:           r.Int("grpc_port"),
-		State:              membershipRowFrom(r, name).resolve(membershipLive).State,
+		State:              membershipRowFrom(r, name).resolve(hostsCopyFrozen).State,
 		CertSerial:         r.String("cert_serial"),
 		CPUTotal:           r.Int("cpu_total"),
 		MemTotal:           r.Int("mem_total"),

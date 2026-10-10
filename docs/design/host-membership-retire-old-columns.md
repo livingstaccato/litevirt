@@ -62,6 +62,16 @@ release back, as v57's was.
   `hosts` statements, `state` included: each writes other `hosts` columns in
   the same statement, so the row clock moves anyway, and keeping the shape
   adds no ledger entry.
+- **Readers.** The membership row is read whenever one exists, live node
+  or not, and on a node that has latched the retire token a host with no row
+  reads as `unknown` (not `active`, voting-eligible) instead of from the
+  frozen copy (review M1).
+- **Copies.** Before the retire latch the split pass's copy is stamped at a
+  floor (the hosts row's time moved back 40 years), so it only fills an
+  absence; after it, the pass copies nothing (review H1: a copy stamped with
+  the hosts row's moving clock over a frozen state undid a fence
+  cluster-wide). An absorb on a retired node creates a missing row only from
+  a complete write (review L2).
 - **Absorbing hosts-only writes stays (deviation from item 2 above).** A latch
   is per node: a neighbour that advertises the retire token but whose own
   `host_membership_split_v1` latch has not formed yet still writes `hosts`

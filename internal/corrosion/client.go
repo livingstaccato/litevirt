@@ -1393,7 +1393,7 @@ func (c *Client) ExecuteEntriesGuarded(ctx context.Context, guard func(tx *sql.T
 	}
 	// Likewise a state or isolation write this node makes to hosts alone
 	// updates the membership row it holds (host_membership.go).
-	if err := absorbUnlatchedMembershipWrite(ctx, tx, mutated, c.MayWriteHostMembership()); err != nil {
+	if err := absorbUnlatchedMembershipWrite(ctx, tx, mutated, c.MayWriteHostMembership(), c.hostsCopyFrozen()); err != nil {
 		tx.Rollback()
 		c.mu.Unlock()
 		return false, err
@@ -1556,7 +1556,7 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 	}
 	// Likewise a state or isolation write this node makes to hosts alone
 	// updates the membership row it holds (host_membership.go).
-	if err := absorbUnlatchedMembershipWrite(ctx, tx, mutated, c.MayWriteHostMembership()); err != nil {
+	if err := absorbUnlatchedMembershipWrite(ctx, tx, mutated, c.MayWriteHostMembership(), c.hostsCopyFrozen()); err != nil {
 		tx.Rollback()
 		c.mu.Unlock()
 		return 0, err

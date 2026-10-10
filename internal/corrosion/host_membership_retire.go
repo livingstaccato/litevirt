@@ -17,9 +17,14 @@ package corrosion
 //
 // What does NOT change:
 //
-//   - Readers: they already resolve from host_membership on a live node.
+//   - Readers resolve from a present host_membership row on any node, live or
+//     not; a host with no row on a retired node reads as HostStateUnknown,
+//     never from the frozen copy (resolve).
+//   - The split pass copies nothing once retired, and copied before that at a
+//     floor timestamp (membershipCopyTS); an absorb creates a missing row only
+//     from a complete write.
 //   - The hosts columns are never cleared: hosts.state is NOT NULL, and a clear
-//     would be the very hosts write this retires. Nothing reads them.
+//     would be the very hosts write this retires.
 //   - Writers whose hosts statement carries other columns keep their shape —
 //     InsertHost (the row is created whole), AdmitHost's re-admission (the
 //     identity row is rewritten whole) and UpdateHostStartup (the host's own
@@ -45,13 +50,17 @@ func (c *Client) SetHostMembershipRetireGate(fn func() bool) {
 	c.hostMembershipRetire.Store(&fn)
 }
 
+// hostsCopyFrozen reports whether this node has latched the retire token,
+// live or not: from then on the hosts copy of a host with no membership row
+// may have stopped following (resolve), and a pass copies nothing from it.
+func (c *Client) hostsCopyFrozen() bool {
+	fn := c.hostMembershipRetire.Load()
+	return fn != nil && (*fn)()
+}
+
 // hostsCopyRetired reports whether a live membership writer skips the hosts
 // copy. Callers pass live (withMembershipWrite's argument): a node that is not
 // writing host_membership yet always writes hosts.
 func (c *Client) hostsCopyRetired(live bool) bool {
-	if !live {
-		return false
-	}
-	fn := c.hostMembershipRetire.Load()
-	return fn != nil && (*fn)()
+	return live && c.hostsCopyFrozen()
 }

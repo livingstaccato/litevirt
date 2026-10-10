@@ -752,21 +752,49 @@ Once it has latched on a host that is writing `host_membership`, a state
 change, a fence, an isolation and the clearing of an isolation write
 `host_membership` alone. They no longer move the `hosts` row's `updated_at`,
 so they cannot cost a concurrent version or resource report on any replica.
-Readers do not change. The `hosts` columns are left as they are, never
-cleared: `hosts.state` is `NOT NULL`, and nothing reads the copy. Adding a
-host, re-admitting one and a host's boot report still write `hosts.state`
-in their existing statements, because those statements write the rest of the
-row anyway.
+The `hosts` columns are left as they are, never cleared (`hosts.state` is
+`NOT NULL`), and they stop following. Adding a host, re-admitting one and a
+host's boot report still write `hosts.state` in their existing statements,
+because those statements write the rest of the row anyway.
+
+Readers change in two ways, both so that the frozen copy is never taken as
+current:
+
+- every host reads its state and isolation from its `host_membership` row
+  whenever one exists, including a host whose own `host_membership_split_v1`
+  latch has not formed yet;
+- on a host that has latched `host_membership_retire_v1`, a host with no
+  `host_membership` row reads as `unknown`: not `active`, so nothing is
+  placed on it, but still counted in every quorum's denominator. The split
+  pass no longer fills such a row from the `hosts` copy there, and a
+  hosts-only write fills one only when it carries the whole row (adding the
+  host) or both state and isolation. The row arrives from its peers by
+  replication or anti-entropy.
+
+Before the retire latch, a split pass that fills a missing `host_membership`
+row from the `hosts` copy stamps it decades in the past, so it fills an
+absence and never replaces a newer fence or drain.
 
 A host whose own `host_membership_split_v1` latch has not formed yet still
 writes `hosts` alone, and every latched host still takes such a write into
 its `host_membership` row as described above.
 
 **Rollback.** One build back, to the build that dual-writes, is supported: it
-enters WAL quarantine and reads state and isolation from `host_membership`.
+enters WAL quarantine and reads state and isolation from `host_membership`
+once it has completed a split pass. Until then that build reads the `hosts`
+copy, which no longer follows, so a fence or drain made after the retire
+latch is invisible to it for that first pass interval (about 10 seconds).
 **A rollback two builds back, below `host_membership_split_v1`, is
 unsupported once `host_membership_retire_v1` has latched**: that build reads
-`hosts.state` only, and it no longer follows. See
+`hosts.state` only, and it no longer follows.
+
+**A host that was switched off across the latch.** The latch is confirmed
+against hosts in the cluster's membership at the time; a host that was off
+throughout is not asked. If it runs a build before
+`host_membership_split_v1` it holds no marker for the token, the rollback
+preflight does not stop it, and back online it reads `hosts.state`, which no
+longer follows: it can count a fenced host as active. Upgrade such a host to
+at least the dual-write build before you power it on again. See
 [design/host-membership-retire-old-columns.md](design/host-membership-retire-old-columns.md).
 
 ### An unverified fence records `offline` after the roll

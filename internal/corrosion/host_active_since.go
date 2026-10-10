@@ -19,13 +19,11 @@ import (
 // toward a fence quorum, and a fence row older than it does not make the host
 // "recently fenced".
 //
-// A host with no membership row, or a node not reading host_membership yet,
-// is absent from the map: the caller then judges it as before.
+// A host with no membership row is absent from the map: the caller then
+// judges it as before. A present row is read on a live node or not, as
+// resolve reads it.
 func HostsActiveSince(ctx context.Context, c *Client) (map[string]time.Time, error) {
 	out := map[string]time.Time{}
-	if !c.HostMembershipLive() {
-		return out, nil
-	}
 	rows, err := scanMembership(ctx, c, ` WHERE h.deleted_at IS NULL`)
 	if err != nil {
 		return nil, err
@@ -41,9 +39,6 @@ func HostsActiveSince(ctx context.Context, c *Client) (map[string]time.Time, err
 // HostActiveSince is HostsActiveSince for one host: ok=false when host is not
 // recorded active in a membership row this node reads.
 func HostActiveSince(ctx context.Context, c *Client, host string) (time.Time, bool, error) {
-	if !c.HostMembershipLive() {
-		return time.Time{}, false, nil
-	}
 	rows, err := scanMembership(ctx, c, ` WHERE h.name = ? AND h.deleted_at IS NULL`, host)
 	if err != nil || len(rows) == 0 {
 		return time.Time{}, false, err
@@ -94,9 +89,6 @@ const fenceLifeSkew = 5 * time.Second
 // count for it (colonelpanik/litevirt#253). Its state write dates its life like
 // any other state's.
 func HostFenceLife(ctx context.Context, c *Client, host string) (since time.Time, state string, ok bool, err error) {
-	if !c.HostMembershipLive() {
-		return time.Time{}, "", false, nil
-	}
 	rows, err := scanMembership(ctx, c, ` WHERE h.name = ? AND h.deleted_at IS NULL`, host)
 	if err != nil || len(rows) == 0 {
 		return time.Time{}, "", false, err

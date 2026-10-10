@@ -110,3 +110,50 @@ func TestHostMembershipRetire_NeedsALiveNode(t *testing.T) {
 		t.Errorf("hosts.state = %q on a node not writing host_membership; it is the only copy", got)
 	}
 }
+
+// TestHostMembershipRetire_AFrozenNodeCreatesARowOnlyFromACompleteWrite: once
+// the hosts copy is frozen, an absorb that would CREATE a membership row fills
+// the columns the write did not set from that copy, stamped with the write's
+// new time — which could resurrect a cleared isolation. So a row is created
+// only from a write that carries everything: an INSERT INTO hosts, or one that
+// sets both state and isolation.
+func TestHostMembershipRetire_AFrozenNodeCreatesARowOnlyFromACompleteWrite(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	seedMembershipHosts(t, c, "h1")
+	retireLive(t, c)
+	if err := c.execLocal(ctx, `DELETE FROM host_membership WHERE host_name = 'h1'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.execLocal(ctx, `UPDATE hosts SET isolation_epoch = 7, isolation_reason = 'manual' WHERE name = 'h1'`); err != nil {
+		t.Fatal(err)
+	}
+	applyAsReplicated(t, c, Statement{SQL: updateHostStateSQL, Params: []interface{}{"draining", "2999-01-01T00:00:00Z", "h1"}})
+	if n := oneString(t, c, `SELECT COUNT(*) AS n FROM host_membership WHERE host_name = 'h1'`, "n"); n != "0" {
+		t.Errorf("a state-only hosts write created a membership row from the frozen copy's isolation")
+	}
+	applyAsReplicated(t, c, Statement{SQL: insertHostSQL, Params: []interface{}{
+		"h9", "10.0.0.9", "", 0, 0, "active", "s-h9", 0, 0, 0, "", "", "worker", 0.0, 0.0, -1, -1, "", "2999-01-01T00:00:00Z", "2999-01-01T00:00:01Z"}})
+	if got := membershipCol(t, c, "h9", "state"); got != "active" {
+		t.Errorf("an INSERT INTO hosts did not create its membership row (state %q)", got)
+	}
+}
+
+// TestHostMembershipRetire_AFrozenPassCopiesNothing: once retired, the hosts
+// copy is no source: a pass leaves a missing row missing, and the host reads as
+// unknown — never as the frozen 'active' — until its row arrives.
+func TestHostMembershipRetire_AFrozenPassCopiesNothing(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	seedMembershipHosts(t, c, "h1")
+	retireLive(t, c)
+	if err := c.execLocal(ctx, `DELETE FROM host_membership WHERE host_name = 'h1'`); err != nil {
+		t.Fatal(err)
+	}
+	if rep, err := c.SplitHostMembership(ctx); err != nil || rep.Copied != 0 {
+		t.Fatalf("pass = %+v err=%v; a retired node copied from the frozen hosts row", rep, err)
+	}
+	if got := resolvedState(t, c, "h1"); got != HostStateUnknown {
+		t.Errorf("a host with no membership row on a retired node reads %q, want %q", got, HostStateUnknown)
+	}
+}

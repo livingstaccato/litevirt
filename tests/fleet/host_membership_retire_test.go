@@ -102,3 +102,111 @@ func TestFleet_HostMembershipRetire_APreviousBuildNodeReadsStateCorrectly(t *tes
 		t.Errorf("%s reads %q after the previous build's dual-written change, want active", a.Name, got)
 	}
 }
+
+// TestFleet_HostMembershipRetire_AMissedRowNeverUndoesAFence (review H1). With
+// the hosts copy retired, a fence moves only host_membership, while unrelated
+// writes (a region change) keep moving the hosts row's clock over a hosts.state
+// that still says 'active'. A node that holds the hosts row but has lost or
+// not yet received the host's membership row must not copy that stale state
+// back — at the hosts row's newer time it would beat the fence everywhere. It
+// reads the host as unknown until anti-entropy brings the row, and every node
+// keeps reading it fenced.
+func TestFleet_HostMembershipRetire_AMissedRowNeverUndoesAFence(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: 2673})
+	a, b, n := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	c.WaitConverged(t, convergeTimeout)
+	h := n.Name
+	for _, node := range c.Nodes {
+		retireMembership(t, node)
+	}
+	c.WaitConverged(t, convergeTimeout)
+
+	if err := corrosion.RecordFenceWithState(ctx, a.DB, corrosion.FenceLogRecord{
+		ID: "f-h1", HostName: h, Method: "ipmi", Result: "fenced",
+	}, "fenced"); err != nil {
+		t.Fatal(err)
+	}
+	c.WaitConverged(t, convergeTimeout)
+	if err := corrosion.UpdateHostRegion(ctx, b.DB, h, "eu-west"); err != nil {
+		t.Fatal(err)
+	}
+	c.WaitConverged(t, convergeTimeout)
+	if got := oldColumn(t, n, `SELECT state FROM hosts WHERE name = ?`, h); got == "fenced" {
+		t.Fatalf("hosts.state follows the fence (%q); the scenario needs the retired copy", got)
+	}
+
+	// n misses the row (a merge that brought hosts but not host_membership).
+	n.DB.Mu().Lock()
+	_, err := n.DB.DB().Exec(`DELETE FROM host_membership WHERE host_name = ?`, h)
+	n.DB.Mu().Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := n.DB.SplitHostMembership(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := hostOn(t, n, h).State; got == "active" {
+		t.Errorf("%s reads the fenced host as active from the frozen hosts copy", n.Name)
+	}
+	time.Sleep(time.Second) // let anything the pass wrote replicate
+	for _, node := range []*Node{a, b} {
+		if got := hostOn(t, node, h).State; got != "fenced" {
+			t.Errorf("%s reads %s as %q after %s's pass, want fenced: a copy undid the fence", node.Name, h, got, n.Name)
+		}
+	}
+	corrosion.NewAntiEntropy(n.DB, n.PKIDir, 0).RunOnce(ctx)
+	if got := hostOn(t, n, h).State; got != "fenced" {
+		t.Errorf("%s reads %q after anti-entropy, want fenced", n.Name, got)
+	}
+}
+
+// TestFleet_HostMembershipRetire_ANotLiveNodeReadsTheRetiredFence (review M1):
+// a node whose own split latch has not formed must still read a fence made
+// after the retire latch, from the membership row it received — not the
+// frozen hosts copy.
+func TestFleet_HostMembershipRetire_ANotLiveNodeReadsTheRetiredFence(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 4, IndependentReplicas: true, FaultSeed: 2674})
+	a, d, h := c.Nodes[0], c.Nodes[3], c.Nodes[2].Name
+	c.WaitConverged(t, convergeTimeout)
+	for _, node := range c.Nodes[:3] {
+		retireMembership(t, node)
+	}
+	c.WaitConverged(t, convergeTimeout)
+	if err := corrosion.RecordFenceWithState(ctx, a.DB, corrosion.FenceLogRecord{
+		ID: "f-m1", HostName: h, Method: "ipmi", Result: "fenced",
+	}, "fenced"); err != nil {
+		t.Fatal(err)
+	}
+	c.WaitConverged(t, convergeTimeout)
+	if d.DB.HostMembershipLive() {
+		t.Fatal("the fourth node is live; the scenario needs one that is not")
+	}
+	if got := oldColumn(t, d, `SELECT state FROM hosts WHERE name = ?`, h); got == "fenced" {
+		t.Fatalf("hosts.state on %s says fenced; the scenario needs the retired copy", d.Name)
+	}
+	if got := hostOn(t, d, h).State; got != "fenced" {
+		t.Errorf("%s (not live) reads %s as %q, want fenced: it read the frozen hosts copy", d.Name, h, got)
+	}
+}
+
+// TestFleet_HostMembershipRetire_ANotLiveNeighboursDrainReachesARetiredNode
+// backs keeping the absorb (review L5): latches form per node, so a neighbour
+// whose split latch has not formed writes a drain to hosts alone, and a
+// retired node must take it into its membership row.
+func TestFleet_HostMembershipRetire_ANotLiveNeighboursDrainReachesARetiredNode(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: 2675})
+	a, b, h := c.Nodes[0], c.Nodes[1], c.Nodes[2].Name
+	c.WaitConverged(t, convergeTimeout)
+	retireMembership(t, a)
+	c.WaitConverged(t, convergeTimeout)
+	if err := corrosion.UpdateHostState(ctx, b.DB, h, "draining"); err != nil {
+		t.Fatal(err)
+	}
+	c.WaitConverged(t, convergeTimeout)
+	if got := hostOn(t, a, h).State; got != "draining" {
+		t.Errorf("%s (retired) reads %s as %q after a not-live neighbour's drain, want draining", a.Name, h, got)
+	}
+}

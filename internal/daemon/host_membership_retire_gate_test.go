@@ -64,3 +64,8 @@ func TestWireHostMembershipRetireGate_TracksTheDurableLatch(t *testing.T) {
 			"a state change still wrote the hosts row")
 	}
 }
+
+// TestRunWiresTheMembershipRetireGate: see TestRunWiresEveryCredentialGate.
+func TestRunWiresTheMembershipRetireGate(t *testing.T) {
+	assertRunCalls(t, "wireHostMembershipGate", "wireHostMembershipRetireGate")
+}

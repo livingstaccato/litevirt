@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -67,7 +68,7 @@ func (s *Server) diskNICIOActive(ctx context.Context) bool { return s.ioFeatureG
 // to a spec that has one) or NIC queues.
 func specSetsDiskNICIO(spec *pb.VMSpec) bool {
 	for _, d := range spec.GetDisks() {
-		if d.GetDiscard() != "" || d.GetDetectZeroes() != "" || d.GetIo() != nil {
+		if d.GetDiscard() != "" || d.GetDetectZeroes() != "" || compose.IOLimitsSet(d.GetIo()) {
 			return true
 		}
 	}
@@ -101,7 +102,7 @@ func (s *Server) refuseUnlatchedStackDiskNICIO(ctx context.Context, f *compose.F
 		}
 		set := false
 		for _, d := range vm.Disks {
-			set = set || d.Discard != "" || d.DetectZeroes != "" || d.IOTune != nil
+			set = set || d.Discard != "" || d.DetectZeroes != "" || (d.IOTune != nil && *d.IOTune != (compose.IOTuneDef{}))
 		}
 		for _, n := range vm.Network {
 			set = set || !n.Queues.IsZero()
@@ -185,34 +186,57 @@ func (s *Server) SetDiskIO(ctx context.Context, req *pb.SetDiskIORequest) (*pb.V
 	if err := json.Unmarshal([]byte(vm.Spec), &spec); err != nil {
 		return nil, status.Errorf(codes.Internal, "parse VM spec: %v", err)
 	}
-	var disk *pb.DiskSpec
+	key := compose.DiskKey(req.DiskName)
 	diskIdx := -1
+	bus := ""
 	for i, d := range spec.Disks {
-		name := d.GetName()
-		if name == "" {
-			name = "root"
-		}
-		if name == req.DiskName {
-			disk, diskIdx = d, i
+		if compose.DiskKey(d.GetName()) == key {
+			diskIdx, bus = i, d.GetBus()
 			break
 		}
 	}
-	if disk == nil {
-		return nil, status.Errorf(codes.NotFound,
-			"disk %q is not in %q's spec (I/O limits are kept in the spec, so a disk hot-plugged onto the VM cannot carry them)",
-			req.DiskName, req.VmName)
+	dev := ""
+	recs, rerr := corrosion.GetVMDisks(ctx, s.db, req.VmName)
+	if rerr != nil {
+		return nil, status.Errorf(codes.Internal, "list disks: %v", rerr)
 	}
-	bus := disk.Bus
+	var rec *corrosion.DiskRecord
+	for i := range recs {
+		if compose.DiskKey(recs[i].DiskName) == key && (recs[i].DeviceKind == "" || recs[i].DeviceKind == "disk") {
+			rec = &recs[i]
+			break
+		}
+	}
+	switch {
+	case diskIdx < 0 && rec == nil:
+		return nil, status.Errorf(codes.NotFound, "VM %q has no disk %q", req.VmName, req.DiskName)
+	case diskIdx < 0:
+		// The spec does not list a disk vm_disks has (an implicit root disk, a
+		// hot-plugged one): the entry is made when the limits are recorded, so
+		// every later render carries them.
+		bus = rec.Bus
+	}
 	if bus == "" {
 		bus = "virtio"
 	}
-	dev := lv.DiskDevName(bus, diskIdx)
-	if recs, rerr := corrosion.GetVMDisks(ctx, s.db, req.VmName); rerr == nil {
-		for _, r := range recs {
-			if r.DiskName == req.DiskName && r.TargetDev != "" {
-				dev = r.TargetDev
-				break
-			}
+	switch {
+	case rec != nil && rec.TargetDev != "":
+		dev = rec.TargetDev
+	case diskIdx >= 0:
+		dev = lv.DiskDevName(bus, diskIdx)
+	default:
+		dev = lv.DiskDevName(bus, len(spec.Disks))
+	}
+
+	// What the disk has now, so a partial failure can put it back.
+	oldCfg, haveCfg := ioTuneNow(s.virt.DumpXMLInactive, req.VmName, dev)
+	restore := func(why string) {
+		if !haveCfg {
+			return
+		}
+		if rerr := s.virt.SetDiskIOTune(req.VmName, dev, oldCfg); rerr != nil {
+			slog.Error("SetDiskIO: restoring the previous limits failed — the definition may hold limits the spec does not",
+				"vm", req.VmName, "disk", req.DiskName, "after", why, "error", rerr)
 		}
 	}
 
@@ -221,8 +245,12 @@ func (s *Server) SetDiskIO(ctx context.Context, req *pb.SetDiskIORequest) (*pb.V
 	// to throttle yet; its next define renders the spec.
 	if err := s.virt.SetDiskIOTune(req.VmName, dev, tune); err != nil {
 		if !(lv.IsNotFound(err) && vm.State != "running") {
-			return nil, status.Errorf(codes.Internal, "set I/O limits: %v", err)
+			restore("a failed set")
+			return nil, status.Errorf(codes.Internal, "set I/O limits (nothing was changed): %v", err)
 		}
+	}
+	if s.ioSpecWriteHook != nil {
+		s.ioSpecWriteHook()
 	}
 
 	var stored *pb.DiskIOLimits
@@ -236,30 +264,39 @@ func (s *Server) SetDiskIO(ctx context.Context, req *pb.SetDiskIORequest) (*pb.V
 				return "", uerr
 			}
 		}
+		found := false
 		for _, d := range fresh.Disks {
-			name := d.GetName()
-			if name == "" {
-				name = "root"
+			if compose.DiskKey(d.GetName()) == key {
+				d.Io, found = stored, true
 			}
-			if name == req.DiskName {
-				d.Io = stored
-			}
+		}
+		if !found {
+			fresh.Disks = append(fresh.Disks, &pb.DiskSpec{Name: key, Bus: bus, Io: stored})
 		}
 		b, jerr := json.Marshal(fresh)
 		return string(b), jerr
 	})
-	if merr != nil {
-		return nil, status.Errorf(codes.Internal,
-			"I/O limits applied to %q but not recorded in its spec: %v (a redefine would lose them; set them again)", req.VmName, merr)
-	}
-	if !applied {
+	if merr != nil || !applied {
+		restore("a failed spec write")
+		if merr != nil {
+			return nil, status.Errorf(codes.Internal, "I/O limits were not recorded in %q's spec, so they were taken back: %v", req.VmName, merr)
+		}
 		return nil, status.Errorf(codes.FailedPrecondition,
-			"I/O limits applied to %q but not recorded in its spec: an operation is in progress (set them again once it ends)", req.VmName)
+			"I/O limits were not recorded in %q's spec because an operation is in progress, so they were taken back; set them again once it ends", req.VmName)
 	}
 
 	slog.Info("disk I/O limits set", "vm", req.VmName, "disk", req.DiskName, "dev", dev, "cleared", tune.IsZero())
 	s.recordVMEvent(ctx, req.VmName, "disk.io", "ok", req.DiskName)
 	return s.vmToProto(ctx, req.VmName)
+}
+
+// ioTuneNow reads the throttle a domain definition carries for dev.
+func ioTuneNow(dump func(string) (string, error), vm, dev string) (lv.IOTune, bool) {
+	x, err := dump(vm)
+	if err != nil {
+		return lv.IOTune{}, false
+	}
+	return lv.DiskIOTuneFromXML(x, dev)
 }
 
 // applyDesiredDiskIO applies, through SetDiskIO, every disk throttle the
@@ -279,68 +316,154 @@ func (s *Server) applyDesiredDiskIO(ctx context.Context, name string, desired *p
 	storedByName := map[string]*pb.DiskSpec{}
 	for _, d := range stored.Disks {
 		if d != nil {
-			storedByName[d.Name] = d
+			storedByName[compose.DiskKey(d.Name)] = d
 		}
 	}
 	for _, d := range desired.Disks {
 		if d == nil || d.Io == nil {
 			continue
 		}
-		if sd, ok := storedByName[d.Name]; ok && compose.IOTuneFromSpec(sd.Io) == compose.IOTuneFromSpec(d.Io) {
+		var cur *pb.DiskIOLimits
+		if sd, ok := storedByName[compose.DiskKey(d.Name)]; ok {
+			cur = sd.Io
+		}
+		if compose.IOTuneFromSpec(cur) == compose.IOTuneFromSpec(d.Io) {
 			continue
 		}
-		if _, err := s.SetDiskIO(ctx, &pb.SetDiskIORequest{VmName: name, DiskName: d.Name, Limits: d.Io}); err != nil {
+		if _, err := s.SetDiskIO(ctx, &pb.SetDiskIORequest{VmName: name, DiskName: compose.DiskKey(d.Name), Limits: d.Io}); err != nil {
 			return fmt.Errorf("disk %s I/O limits: %w", d.Name, err)
 		}
 	}
 	return nil
 }
 
-// persistHardwareTuning writes the desired spec's disk discard / detect_zeroes
-// and NIC queues into the stored spec, ahead of the redefine that renders them.
-// A value the desired spec leaves unset keeps what is stored.
-func (s *Server) persistHardwareTuning(ctx context.Context, name string, desired *pb.VMSpec) error {
-	if err := s.ioFeatureGate(ctx); err != nil {
-		return err
+// applyTuningRequest merges an UpdateVM request's discard / detect_zeroes and
+// queue changes into spec, validating the result. It touches only the in-memory
+// spec: the owner writes it after the domain has the setting. A disk the spec
+// does not list but vm_disks has gets its entry made here.
+func applyTuningRequest(spec *pb.VMSpec, dbDisks []corrosion.DiskRecord, req *pb.UpdateVMRequest) error {
+	for _, u := range req.GetDiskTuning() {
+		key := compose.DiskKey(u.GetName())
+		var d *pb.DiskSpec
+		for _, c := range spec.Disks {
+			if compose.DiskKey(c.GetName()) == key {
+				d = c
+				break
+			}
+		}
+		if d == nil {
+			for _, r := range dbDisks {
+				if compose.DiskKey(r.DiskName) == key && (r.DeviceKind == "" || r.DeviceKind == "disk") {
+					d = &pb.DiskSpec{Name: key, Bus: r.Bus}
+					spec.Disks = append(spec.Disks, d)
+					break
+				}
+			}
+		}
+		if d == nil {
+			return status.Errorf(codes.NotFound, "VM %q has no disk %q", spec.GetName(), u.GetName())
+		}
+		if v := compose.NormalizeDiscard(u.GetDiscard()); v != "" {
+			d.Discard = v
+		}
+		if v := strings.ToLower(strings.TrimSpace(u.GetDetectZeroes())); v != "" {
+			d.DetectZeroes = v
+		}
+		if err := compose.ValidateDiskTuning(d); err != nil {
+			return status.Errorf(codes.InvalidArgument, "disk %q: %v", u.GetName(), err)
+		}
 	}
-	applied, _, err := corrosion.MutateDesiredSpec(ctx, s.db, name, func(old string) (string, error) {
-		fresh := &pb.VMSpec{}
-		if old != "" {
-			if uerr := json.Unmarshal([]byte(old), fresh); uerr != nil {
-				return "", uerr
-			}
+	for _, u := range req.GetNicQueues() {
+		i := int(u.GetOrdinal())
+		if i < 0 || i >= len(spec.Network) {
+			return status.Errorf(codes.NotFound, "VM %q has no NIC %d in its spec", spec.GetName(), i)
 		}
-		byName := map[string]*pb.DiskSpec{}
-		for _, d := range desired.Disks {
-			if d != nil {
-				byName[d.Name] = d
-			}
+		if err := compose.ValidateQueues(spec.Network[i].GetModel(), u.GetQueues()); err != nil {
+			return status.Errorf(codes.InvalidArgument, "NIC %d: %v", i, err)
 		}
-		for _, d := range fresh.Disks {
-			dd, ok := byName[d.Name]
-			if !ok {
-				continue
-			}
-			if dd.Discard != "" {
-				d.Discard = dd.Discard
-			}
-			if dd.DetectZeroes != "" {
-				d.DetectZeroes = dd.DetectZeroes
-			}
-		}
-		for i, n := range fresh.Network {
-			if i < len(desired.Network) && desired.Network[i].GetQueues() != 0 {
-				n.Queues = desired.Network[i].Queues
-			}
-		}
-		b, jerr := json.Marshal(fresh)
-		return string(b), jerr
-	})
-	if err != nil {
-		return status.Errorf(codes.Internal, "record the disk and NIC tuning of %q: %v", name, err)
-	}
-	if !applied {
-		return status.Errorf(codes.FailedPrecondition, "cannot record the disk and NIC tuning of %q: an operation is in progress", name)
+		spec.Network[i].Queues = u.GetQueues()
 	}
 	return nil
+}
+
+// restrictRestoredTuning is the gate for a spec that did not come from a
+// validated create: a backup manifest or a promoted record. Before the gate
+// opens the tuning is STRIPPED (a restore main allows still works; older peers
+// would drop the fields anyway) and stripped=true says so; after it the values
+// are validated like a create's, so a hand-edited manifest cannot define a
+// domain libvirt refuses or open hundreds of queues.
+func (s *Server) restrictRestoredTuning(ctx context.Context, spec *pb.VMSpec) (stripped bool, err error) {
+	if !specSetsDiskNICIO(spec) {
+		return false, nil
+	}
+	if s.ioFeatureGate(ctx) != nil {
+		for _, d := range spec.Disks {
+			d.Discard, d.DetectZeroes, d.Io = "", "", nil
+		}
+		for _, n := range spec.Network {
+			n.Queues = 0
+		}
+		slog.Warn("restore: the spec carries disk/NIC tuning and the cluster upgrade has not finished: tuning dropped", "vm", spec.GetName())
+		return true, nil
+	}
+	if err := validateSpecTuning(spec); err != nil {
+		return false, status.Errorf(codes.InvalidArgument, "restored spec: %v", err)
+	}
+	return false, nil
+}
+
+// requestsHardwareTuning reports whether an UpdateVM request redefines the
+// domain for disk/NIC tuning: its payload, or the explicit regenerate flag.
+func requestsHardwareTuning(req *pb.UpdateVMRequest) bool {
+	return req.GetRedefineHardware() || len(req.GetDiskTuning()) > 0 || len(req.GetNicQueues()) > 0
+}
+
+// patchTuningInPlace applies a request's discard / detect_zeroes / queue
+// changes to the persistent definition by patching it (the merged spec holds the
+// final values), so the addresses libvirt assigned are not reshuffled.
+func patchTuningInPlace(x string, req *pb.UpdateVMRequest, spec *pb.VMSpec, disks []lv.DiskConfig, ifaces []corrosion.InterfaceRecord) (string, error) {
+	var err error
+	for _, u := range req.GetDiskTuning() {
+		key := compose.DiskKey(u.GetName())
+		var sd *pb.DiskSpec
+		for _, d := range spec.Disks {
+			if compose.DiskKey(d.GetName()) == key {
+				sd = d
+			}
+		}
+		dev := ""
+		for i, dc := range disks {
+			if compose.DiskKey(dc.Name) == key {
+				if dev = dc.TargetDev; dev == "" {
+					dev = lv.DiskDevName(dc.Bus, i)
+				}
+			}
+		}
+		if sd == nil || dev == "" {
+			return "", fmt.Errorf("disk %q not found for an in-place patch", u.GetName())
+		}
+		if x, err = lv.PatchInactiveDiskDriver(x, dev, sd.Discard, sd.DetectZeroes); err != nil {
+			return "", err
+		}
+	}
+	for _, u := range req.GetNicQueues() {
+		mac := ""
+		if o := int(u.GetOrdinal()); o >= 0 && o < len(spec.Network) {
+			mac = spec.Network[o].GetMac()
+		}
+		if mac == "" {
+			for _, ic := range ifaces {
+				if ic.Ordinal == int(u.GetOrdinal()) {
+					mac = ic.MAC
+				}
+			}
+		}
+		if mac == "" {
+			return "", fmt.Errorf("NIC %d has no MAC to patch by", u.GetOrdinal())
+		}
+		if x, err = lv.PatchInactiveNICQueues(x, mac, int(spec.Network[u.GetOrdinal()].GetQueues())); err != nil {
+			return "", err
+		}
+	}
+	return x, nil
 }

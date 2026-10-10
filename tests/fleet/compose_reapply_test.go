@@ -101,7 +101,9 @@ func TestFleet_ComposeReapplyWithCloudInitDoesNotRecreate(t *testing.T) {
 	if err != nil || afterRestart == nil {
 		t.Fatalf("GetVM after migration: vm=%v err=%v", afterRestart, err)
 	}
-	if !strings.Contains(afterRestart.Spec, `"network":[{"name":"lan"}]`) {
+	// (The NIC's assigned MAC is recorded in the spec at create, so the entry is
+	// matched on its name, not on being the whole object.)
+	if !strings.Contains(afterRestart.Spec, `"network":[{"name":"lan"`) || strings.Contains(afterRestart.Spec, "box-1_lan") || strings.Contains(afterRestart.Spec, "ci-stack_lan") {
 		t.Errorf("startup migration rewrote the external network attachment in the stored spec: %s", afterRestart.Spec)
 	}
 

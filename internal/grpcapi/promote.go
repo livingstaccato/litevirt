@@ -842,6 +842,11 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		return status.Errorf(codes.Internal, "parse vm spec: %v", err)
 	}
 	spec.Name = targetName
+	// The stored tuning is validated again (and dropped before the gate opens)
+	// so a record from before a rollback cannot define what the cluster refuses.
+	if _, err := s.restrictRestoredTuning(ctx, &spec); err != nil {
+		return err
+	}
 
 	// A RENAMED promotion writes a SECOND VM row from this spec, with fresh MACs
 	// and no claim, while the original still holds its addresses — a guaranteed

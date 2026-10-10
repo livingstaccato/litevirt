@@ -1771,14 +1771,16 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 		}
 		if strings.HasPrefix(bridge, "direct:") {
 			netConfigs = append(netConfigs, lv.NetworkConfig{
-				Direct: strings.TrimPrefix(bridge, "direct:"),
-				Model:  "virtio",
-				MAC:    iface.MAC,
+				Direct:      strings.TrimPrefix(bridge, "direct:"),
+				Model:       "virtio",
+				MAC:         iface.MAC,
+				SpecOrdinal: iface.Ordinal + 1,
 			})
 		} else {
 			netConfigs = append(netConfigs, lv.NetworkConfig{
-				Bridge: bridge,
-				MAC:    iface.MAC,
+				Bridge:      bridge,
+				MAC:         iface.MAC,
+				SpecOrdinal: iface.Ordinal + 1,
 			})
 		}
 	}

@@ -229,8 +229,9 @@ lasts. A running VM is throttled live and its definition updated; the limits are
 in the VM's spec, so a restart, a failover start and a migration carry them. **Each call
 sets the complete set of limits for the disk**: one you do not name is unlimited
 afterwards, and `--clear` removes them all. A `--total-*` limit cannot be combined with
-the `--read-*` / `--write-*` of the same kind. The disk must be one in the VM's spec (not
-a hot-plugged one). The same limits are the `iotune:` key of a compose disk; see
+the `--read-*` / `--write-*` of the same kind. A disk the VM's spec does not list yet (the implicit
+root disk, a hot-plugged one) is throttled too; its entry is made in the spec. If a step
+fails partway the previous limits are put back and the spec is left as it was. The same limits are the `iotune:` key of a compose disk; see
 [compose.md](compose.md).
 
 `lv cutover <vm>` gives the `<vm>-next` replacement the original's name. The replaced

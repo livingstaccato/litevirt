@@ -1088,8 +1088,8 @@ consistency is a planned follow-up.
 
 **Discard (TRIM).** A new VM's disk gets `discard=unmap` by default on `local`,
 `dir`, `btrfs`, `zfs`, `lvm-thin` and `ceph` (on a virtio, scsi or sata bus), so a
-guest's `fstrim` returns the space to the pool. It is not defaulted on `nfs` or `iscsi`,
-whose server may not support it, nor for an existing VM; set `discard:` on a compose
+guest's `fstrim` returns the space to the pool. It is not defaulted on `nfs` or `iscsi`
+(whether a TRIM frees anything there depends on the server), nor for an existing VM; set `discard:` on a compose
 disk to choose either way (see [compose.md](compose.md)).
 
 The **Snapshots** row describes each backend's *native* snapshot capability

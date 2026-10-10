@@ -75,8 +75,11 @@ func TestGenerateDomainXML_NICQueues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(x, `<driver name="vhost" queues="4"`) {
-		t.Errorf("virtio NIC with queues=4 lacks the vhost driver:\n%s", x)
+	// No driver name: libvirt then uses vhost-net when the host has it and falls
+	// back to qemu userspace when it does not. Forcing name=vhost would turn a
+	// host without /dev/vhost-net into a failed start or migration.
+	if !strings.Contains(x, `<driver queues="4"`) || strings.Contains(x, "vhost") {
+		t.Errorf("virtio NIC with queues=4 must render <driver queues=4> with no vhost name:\n%s", x)
 	}
 	// One queue is the default, and a non-virtio model has no multiqueue.
 	for _, n := range []NetworkConfig{{Queues: 1}, {Queues: 0}, {Queues: 4, Model: "e1000"}} {
@@ -179,5 +182,64 @@ func TestIOTuneTypedParamsSendEveryField(t *testing.T) {
 		if !seen[f] {
 			t.Errorf("field %s not sent", f)
 		}
+	}
+}
+
+// qemu refuses a burst whose length times its ceiling overflows its limit
+// (THROTTLE_VALUE_MAX), which libvirt accepts into the config: a definition that
+// then cannot start. Refused here instead.
+func TestIOTuneValidateBurstLengthOverflow(t *testing.T) {
+	bad := IOTune{WriteBytesSec: 1 << 20, WriteBytesSecMax: 20 << 30, BurstSec: 100000}
+	if err := bad.Validate(); err == nil || !strings.Contains(err.Error(), "burst") {
+		t.Errorf("overflowing burst: %v", err)
+	}
+	ok := IOTune{WriteBytesSec: 1 << 20, WriteBytesSecMax: 20 << 30, BurstSec: 10}
+	if err := ok.Validate(); err != nil {
+		t.Errorf("sane burst refused: %v", err)
+	}
+}
+
+const patchDomain = `<domain type='kvm'><name>p</name><devices>
+<disk type='file' device='disk'><driver name='qemu' type='qcow2' cache='writeback' discard='unmap'/><source file='/a'/><target dev='vda' bus='virtio'/></disk>
+<disk type='file' device='disk'><driver name='qemu' type='qcow2'/><source file='/b'/><target dev='vdb' bus='virtio'/></disk>
+<interface type='bridge'><mac address='52:54:00:aa:bb:01'/><source bridge='br0'/><model type='virtio'/></interface>
+<interface type='bridge'><mac address='52:54:00:aa:bb:02'/><source bridge='br0'/><model type='virtio'/><driver name='vhost' queues='4'/></interface>
+</devices></domain>`
+
+// A discard/detect_zeroes/queues change reaches the inactive definition by
+// patching it, so libvirt-assigned PCI addresses survive (the in-place path).
+func TestPatchInactiveDriverTuning(t *testing.T) {
+	out, err := PatchInactiveDiskDriver(patchDomain, "vdb", "unmap", "unmap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, `<source file='/b'/>`) || strings.Count(out, "discard") != 2 || !strings.Contains(out, "detect_zeroes") {
+		t.Errorf("vdb not patched (or another disk disturbed):\n%s", out)
+	}
+	// An empty value removes the attribute, and only on the named disk.
+	out, err = PatchInactiveDiskDriver(patchDomain, "vda", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, "discard") || !strings.Contains(out, "cache='writeback'") {
+		t.Errorf("vda discard not removed cleanly:\n%s", out)
+	}
+	if _, err := PatchInactiveDiskDriver(patchDomain, "vdz", "unmap", ""); err == nil {
+		t.Error("patching a disk the domain lacks succeeded")
+	}
+
+	out, err = PatchInactiveNICQueues(patchDomain, "52:54:00:AA:BB:01", 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, `<driver queues='8'/>`) || !strings.Contains(out, "queues='4'") {
+		t.Errorf("NIC 01 not given queues=8 (and NIC 02 kept):\n%s", out)
+	}
+	out, err = PatchInactiveNICQueues(patchDomain, "52:54:00:aa:bb:02", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, "queues") || strings.Contains(out, "vhost") {
+		t.Errorf("NIC 02 queues not removed:\n%s", out)
 	}
 }

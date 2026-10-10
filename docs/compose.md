@@ -358,7 +358,7 @@ Supports `s` (seconds), `m` (minutes), `h` (hours). Defaults to 30 seconds if no
 backend (qcow2 on a filesystem, ZFS, thin LVM, Ceph RBD) gets back the space the
 guest freed; `ignore` drops it. **A new VM's disk with no `discard:` gets `unmap`
 on the local store, btrfs, ZFS, thin LVM and Ceph, on a virtio, scsi or sata bus**,
-and nothing on NFS or iSCSI (the server may not support hole-punching or UNMAP) or
+and nothing on NFS or iSCSI (whether a TRIM frees anything there depends on the server's own space accounting, so it is left to you; a `dir` pool that sits on NFS gets the default too) or
 on an IDE disk. The default is written into the VM's spec when it is created: a VM
 created before it keeps rendering no discard, and applying a file that leaves
 `discard:` out never changes a disk. The root disk a VM gets when `disks:` names
@@ -400,8 +400,11 @@ A `total_*` key cannot be combined with the `read_*` / `write_*` of the same kin
 Changing `iotune:` in the file throttles the **running** disk in place (no restart)
 and updates the definition; `iotune: {}` removes every limit. The same can be done
 without the file: [`lv disk-io`](cli-reference.md). The limits are kept in the VM's
-spec, so a restart, a failover start and a migration carry them. They apply to
-disks listed in the spec, not to one hot-plugged later.
+spec, so a restart, a failover start and a migration carry them. A disk the spec does
+not list yet (the root disk a VM got before disks were recorded, a hot-plugged one) is
+throttled too: its entry is made in the spec when the limits are set. The limits are
+per VM: a disk shared by several VMs is throttled separately in each, so the aggregate
+is not bounded (libvirt's `group_name` is not supported).
 
 ## Networks
 
@@ -417,12 +420,17 @@ disks listed in the spec, not to one hot-plugged later.
         queues: 4                   # virtio-net multiqueue (1-64, or auto)
 ```
 
-`queues:` gives a virtio NIC that many queue pairs (`<driver name='vhost'
-queues='N'/>`), so a guest with several vCPUs spreads network interrupts and
+`queues:` gives a virtio NIC that many queue pairs (`<driver queues='N'/>`; libvirt
+uses vhost-net when the host has it and qemu's userspace backend when it does not,
+so a migration or failover onto a host without vhost-net still works), so a guest with several vCPUs spreads network interrupts and
 packets across them. It is off unless set (one queue); `queues: auto` is one per
 vCPU up to 8, none for a single-vCPU guest. Only the virtio model takes it. Inside
 the guest, enable the queues with `ethtool -L <nic> combined N`. A change needs a
-restart: the deploy reconfigures and restarts the same VM, disks kept.
+restart: the deploy reconfigures and restarts the same VM, disks kept. An unset
+`queues:` inherits what the VM has, so removing the key from the file does not turn
+multiqueue off: write `queues: 1`. `queues: auto` is resolved from `cpu:` when the file
+is read, so changing `cpu:` in the file changes the queue count with it (which makes a
+vCPU grow a restart), and `lv update --cpu` never re-resolves it; write a number to pin it.
 
 IPv6 can be set either by putting a v6 address in the `ip`/`gateway` fields, or
 via the dedicated `ipv6:` / `ipv6-gateway:` fields (which also enable dual-stack

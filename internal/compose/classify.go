@@ -461,7 +461,7 @@ func classifyTuning(desired, stored *pb.VMSpec, p *ChangePlan) {
 	storedDisks := make(map[string]*pb.DiskSpec, len(stored.Disks))
 	for _, d := range stored.Disks {
 		if d != nil {
-			storedDisks[d.Name] = d
+			storedDisks[DiskKey(d.Name)] = d
 		}
 	}
 	ioChanged := false
@@ -469,9 +469,12 @@ func classifyTuning(desired, stored *pb.VMSpec, p *ChangePlan) {
 		if dd == nil {
 			continue
 		}
-		sd, ok := storedDisks[dd.Name]
+		// A disk the stored spec does not list (an implicit root, a hot-plugged
+		// disk) is compared against an empty entry, so a setting the file names
+		// is seen; the owner makes the entry from vm_disks when it applies it.
+		sd, ok := storedDisks[DiskKey(dd.Name)]
 		if !ok {
-			continue
+			sd = &pb.DiskSpec{}
 		}
 		if dd.Discard != "" && dd.Discard != sd.Discard {
 			p.RestartReasons = append(p.RestartReasons,

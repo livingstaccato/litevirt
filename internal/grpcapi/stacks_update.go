@@ -142,12 +142,11 @@ func (s *Server) reconfigureWithRestart(ctx context.Context, name string, desire
 		req.Tpm = &v
 	}
 	if plan.TuningRedefine {
-		// Discard, detect_zeroes and NIC queues are rendered from the stored
-		// spec: record them first, then have UpdateVM redefine from it.
-		if err := s.persistHardwareTuning(ctx, name, desired); err != nil {
-			return err
-		}
-		req.RedefineHardware = true
+		// Discard, detect_zeroes and NIC queues travel IN the request: whichever
+		// host owns the VM applies them to its own spec and writes it only after
+		// the redefine, so a deploy entering on another node cannot lose them to
+		// a spec it overwrote, and a failed redefine leaves the spec untouched.
+		req.DiskTuning, req.NicQueues = tuningUpdates(desired, stored)
 	}
 	if _, err := s.UpdateVM(ctx, req); err != nil {
 		return fmt.Errorf("reconfigure with restart: %w", err)
@@ -223,4 +222,45 @@ func (s *Server) applyPlannedUpdate(ctx context.Context, action planner.VMAction
 		return gate.waitCreated(ctx, action)
 	}
 	return nil
+}
+
+// tuningUpdates lists what the desired spec changes in the stored one's disk
+// discard / detect_zeroes and NIC queues; a value left unset inherits.
+func tuningUpdates(desired, stored *pb.VMSpec) ([]*pb.DiskTuningUpdate, []*pb.NICQueuesUpdate) {
+	cur := map[string]*pb.DiskSpec{}
+	for _, d := range stored.Disks {
+		if d != nil {
+			cur[compose.DiskKey(d.Name)] = d
+		}
+	}
+	var disks []*pb.DiskTuningUpdate
+	for _, d := range desired.Disks {
+		if d == nil || (d.Discard == "" && d.DetectZeroes == "") {
+			continue
+		}
+		c := cur[compose.DiskKey(d.Name)]
+		if c == nil {
+			c = &pb.DiskSpec{}
+		}
+		u := &pb.DiskTuningUpdate{Name: compose.DiskKey(d.Name)}
+		if d.Discard != "" && d.Discard != c.Discard {
+			u.Discard = d.Discard
+		}
+		if d.DetectZeroes != "" && d.DetectZeroes != c.DetectZeroes {
+			u.DetectZeroes = d.DetectZeroes
+		}
+		if u.Discard != "" || u.DetectZeroes != "" {
+			disks = append(disks, u)
+		}
+	}
+	var nics []*pb.NICQueuesUpdate
+	for i, n := range desired.Network {
+		if n == nil || n.Queues == 0 || i >= len(stored.Network) || stored.Network[i] == nil {
+			continue
+		}
+		if n.Queues != stored.Network[i].Queues {
+			nics = append(nics, &pb.NICQueuesUpdate{Ordinal: int32(i), Queues: n.Queues})
+		}
+	}
+	return disks, nics
 }

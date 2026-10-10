@@ -502,11 +502,23 @@ message UpdateVMRequest    { string name = 1; int32 cpu = 2;
     // NIC tuning (discard, detect_zeroes, queues) with no other change — the
     // compose reconfigure persists the tuning first, then sets this.
     bool           redefine_hardware = 30;
+    // disk_tuning / nic_queues carry the discard, detect_zeroes and queue changes
+    // themselves, so the OWNING host applies them to its own spec under the VM
+    // lock and writes the spec only after the domain has them. Both imply
+    // redefine_hardware.
+    repeated DiskTuningUpdate disk_tuning = 31;
+    repeated NICQueuesUpdate  nic_queues  = 32;
 
     // allow_overcommit skips HOST capacity admission for a --restart-if-needed
     // reconfigure that GROWS the VM (project quota still applies). Audited.
     bool allow_overcommit = 22;
 }
+// DiskTuningUpdate changes one disk's discard / detect_zeroes (an empty value
+// leaves it as stored).
+message DiskTuningUpdate { string name = 1; string discard = 2; string detect_zeroes = 3; }
+// NICQueuesUpdate changes the virtio-net queue count of the NIC at this position
+// in the VM's spec (1 turns multiqueue off).
+message NICQueuesUpdate  { int32 ordinal = 1; int32 queues = 2; }
 // SetVMMemory (#4) sets the running balloon target (and persists it). target_mib
 // must be within [min_memory_mib, max_memory_mib] of the VM's spec; a live VM is
 // ballooned via virtio without a redefine.

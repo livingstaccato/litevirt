@@ -80,6 +80,19 @@ func ValidateQueues(model string, queues int32) error {
 	return nil
 }
 
+// DiskKey is a disk's name as every matcher compares it: an empty name in a
+// stored spec is the root disk.
+func DiskKey(name string) string {
+	if name == "" {
+		return "root"
+	}
+	return name
+}
+
+// IOLimitsSet reports whether a throttle names any limit. An empty message is a
+// clear (`iotune: {}`), which sets nothing.
+func IOLimitsSet(l *pb.DiskIOLimits) bool { return !IOTuneFromSpec(l).IsZero() }
+
 // ApplyDiskTuning copies each stored disk's discard, detect_zeroes and
 // throttle onto the DiskConfig of the same name. A disk the spec does not name
 // (a hot-plugged one, a cdrom) is left as it is.
@@ -92,17 +105,13 @@ func ApplyDiskTuning(disks []libvirt.DiskConfig, spec *pb.VMSpec) {
 		if d == nil {
 			continue
 		}
-		name := d.Name
-		if name == "" {
-			name = "root"
-		}
-		byName[name] = d
+		byName[DiskKey(d.Name)] = d
 	}
 	for i := range disks {
 		if disks[i].IsISO {
 			continue
 		}
-		d, ok := byName[disks[i].Name]
+		d, ok := byName[DiskKey(disks[i].Name)]
 		if !ok {
 			continue
 		}
@@ -132,8 +141,20 @@ func ApplyNICTuning(nets []libvirt.NetworkConfig, spec *pb.VMSpec) {
 				}
 			}
 		}
-		if match == nil && len(spec.Network) == len(nets) && spec.Network[i] != nil && spec.Network[i].Mac == "" {
-			match = spec.Network[i]
+		// A spec entry that recorded no MAC is found by its position: the NIC's
+		// ordinal when the caller knows it (so a hot-plugged or detached NIC
+		// elsewhere does not move it), else its place in an equal-length list.
+		if match == nil {
+			pos := -1
+			switch {
+			case nets[i].SpecOrdinal > 0:
+				pos = nets[i].SpecOrdinal - 1
+			case len(spec.Network) == len(nets):
+				pos = i
+			}
+			if pos >= 0 && pos < len(spec.Network) && spec.Network[pos] != nil && spec.Network[pos].Mac == "" {
+				match = spec.Network[pos]
+			}
 		}
 		if match != nil {
 			nets[i].Queues = int(match.Queues)

@@ -42,6 +42,10 @@ func TestDiskNICIOGate_UnlatchedRefusesEveryWayOfSettingTuning(t *testing.T) {
 			t.Errorf("create with %s: err = %v, want FailedPrecondition naming the cluster upgrade", name, err)
 		}
 	}
+	// A compose clear (`iotune: {}`) sets nothing: it is not refused.
+	if err := s.refuseUnlatchedDiskNICIO(ctx, &pb.VMSpec{Disks: []*pb.DiskSpec{{Name: "root", Io: &pb.DiskIOLimits{}}}}); err != nil {
+		t.Errorf("an empty iotune was refused before the latch: %v", err)
+	}
 	// A spec with none of them is not refused.
 	if err := s.refuseUnlatchedDiskNICIO(ctx, &pb.VMSpec{Disks: []*pb.DiskSpec{{Name: "root"}}, Network: []*pb.NetworkAttachment{{Name: "n"}}}); err != nil {
 		t.Errorf("an untuned spec was refused: %v", err)
@@ -90,20 +94,13 @@ func TestDiskNICIOGate_SetDiskIO(t *testing.T) {
 	}
 }
 
-// The compose reconfigure's hardware redefine (UpdateVM with redefine_hardware)
-// is refused before the latch, as is persisting tuning into the spec.
-func TestDiskNICIOGate_HardwareRedefineAndPersist(t *testing.T) {
+// UpdateVM's explicit hardware redefine is refused before the latch, as is a
+// request carrying tuning (below).
+func TestDiskNICIOGate_HardwareRedefine(t *testing.T) {
 	s, _, ctx := ioVM(t, "stopped")
 	s.gate = ioGate{on: false}
 	if _, err := s.UpdateVM(ctx, &pb.UpdateVMRequest{Name: "io", RedefineHardware: true}); status.Code(err) != codes.FailedPrecondition {
 		t.Errorf("UpdateVM redefine_hardware before the latch: %v", err)
-	}
-	err := s.persistHardwareTuning(ctx, "io", &pb.VMSpec{Disks: []*pb.DiskSpec{{Name: "root", Discard: "ignore"}}})
-	if status.Code(err) != codes.FailedPrecondition {
-		t.Errorf("persistHardwareTuning before the latch: %v", err)
-	}
-	if got := loadStoredSpec(t, s, "io").Disks[0].Discard; got != "" {
-		t.Errorf("a refused persist wrote discard %q", got)
 	}
 }
 
@@ -119,5 +116,61 @@ func TestDiskNICIOGate_CreateVMRefusesUnlatched(t *testing.T) {
 	}})
 	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "cluster upgrade") {
 		t.Errorf("CreateVM with discard before the latch: %v", err)
+	}
+}
+
+// UpdateVM carries the tuning itself (the owner applies it): before the latch a
+// request naming any is refused at the entry node, and a refusal changes nothing.
+func TestDiskNICIOGate_UpdateVMTuningRequestUnlatched(t *testing.T) {
+	s, _, ctx := ioVM(t, "stopped")
+	s.gate = ioGate{on: false}
+	for name, req := range map[string]*pb.UpdateVMRequest{
+		"disk": {Name: "io", DiskTuning: []*pb.DiskTuningUpdate{{Name: "root", Discard: "ignore"}}},
+		"nic":  {Name: "io", NicQueues: []*pb.NICQueuesUpdate{{Ordinal: 0, Queues: 4}}},
+	} {
+		if _, err := s.UpdateVM(ctx, req); status.Code(err) != codes.FailedPrecondition {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+}
+
+// Restore-live and promote take their spec from a backup manifest or a caller:
+// before the gate opens the tuning is stripped (a restore main allows must still
+// work), and after it the values are validated.
+//
+// Mutations: skip the strip — the unlatched case goes red; skip validation — the
+// latched invalid case goes red.
+func TestRestrictRestoredTuning(t *testing.T) {
+	mk := func() *pb.VMSpec {
+		return &pb.VMSpec{Name: "r",
+			Disks:   []*pb.DiskSpec{{Name: "root", Discard: "unmap", DetectZeroes: "on", Io: &pb.DiskIOLimits{ReadIopsSec: 5}}},
+			Network: []*pb.NetworkAttachment{{Name: "n", Queues: 4}}}
+	}
+	ctx := context.Background()
+	un := &Server{gate: ioGate{on: false}}
+	spec := mk()
+	stripped, err := un.restrictRestoredTuning(ctx, spec)
+	if err != nil || !stripped || specSetsDiskNICIO(spec) {
+		t.Errorf("unlatched: stripped=%v err=%v spec=%+v", stripped, err, spec)
+	}
+	if untouched := (&pb.VMSpec{Disks: []*pb.DiskSpec{{Name: "root"}}}); true {
+		if st, err := un.restrictRestoredTuning(ctx, untouched); st || err != nil {
+			t.Errorf("a spec with no tuning reported stripped=%v err=%v", st, err)
+		}
+	}
+	la := &Server{gate: ioGate{on: true}}
+	spec = mk()
+	if st, err := la.restrictRestoredTuning(ctx, spec); err != nil || st || !specSetsDiskNICIO(spec) {
+		t.Errorf("latched valid: stripped=%v err=%v", st, err)
+	}
+	bad := mk()
+	bad.Network[0].Queues = 4096
+	if _, err := la.restrictRestoredTuning(ctx, bad); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("latched, queues 4096: %v, want InvalidArgument", err)
+	}
+	bad = mk()
+	bad.Disks[0].Io = &pb.DiskIOLimits{TotalBytesSec: 1, ReadBytesSec: 1}
+	if _, err := la.restrictRestoredTuning(ctx, bad); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("latched, total with read: %v, want InvalidArgument", err)
 	}
 }

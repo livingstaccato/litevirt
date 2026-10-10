@@ -111,6 +111,15 @@ func (t IOTune) Validate() error {
 	if t.TotalIopsSec > 0 && (t.ReadIopsSec > 0 || t.WriteIopsSec > 0) {
 		return fmt.Errorf("total_iops_sec cannot be combined with read_iops_sec or write_iops_sec")
 	}
+	// qemu refuses a burst whose length times its ceiling overflows its limit,
+	// which libvirt accepts into the config: a definition that cannot start.
+	if t.BurstSec > 0 {
+		for _, l := range all {
+			if l.burst > 0 && t.BurstSec > maxIOTuneValue/l.burst {
+				return fmt.Errorf("%s_max (%d) held for burst_seconds %d is more than qemu allows (%d)", l.name, l.burst, t.BurstSec, int64(maxIOTuneValue))
+			}
+		}
+	}
 	if t.BurstSec < 0 || t.BurstSec > maxIOTuneValue {
 		return fmt.Errorf("burst_seconds %d out of range", t.BurstSec)
 	}
@@ -319,4 +328,88 @@ func DiskIOTuneFromXML(domXML, dev string) (IOTune, bool) {
 		return t, true
 	}
 	return IOTune{}, false
+}
+
+var (
+	driverTagRe = regexp.MustCompile(`<driver\b[^>]*/?>`)
+	attrRe      = func(name string) *regexp.Regexp { return regexp.MustCompile(`\s+` + name + `=(?:'[^']*'|"[^"]*")`) }
+	macAttrRe   = regexp.MustCompile(`<mac\s+address=['"]([^'"]*)['"]`)
+	ifaceBlock  = regexp.MustCompile(`(?s)<interface\b.*?</interface>`)
+)
+
+// setAttr returns a <driver .../> tag with attribute name set to val, or
+// removed when val is empty.
+func setDriverAttr(tag, name, val string) string {
+	tag = attrRe(name).ReplaceAllString(tag, "")
+	if val == "" {
+		return tag
+	}
+	end := strings.LastIndex(tag, "/>")
+	if end < 0 {
+		end = strings.LastIndex(tag, ">")
+	}
+	return tag[:end] + " " + name + "='" + val + "'" + tag[end:]
+}
+
+// PatchInactiveDiskDriver sets (or, for "", removes) the discard and
+// detect_zeroes attributes of the <driver> of the disk whose target is dev in
+// the persistent definition. Patching rather than regenerating keeps the
+// addresses libvirt assigned, which a guest may key licensing or a static NIC
+// configuration off.
+func PatchInactiveDiskDriver(domXML, dev, discard, detectZeroes string) (string, error) {
+	needle1, needle2 := "<target dev='"+dev+"'", `<target dev="`+dev+`"`
+	found := false
+	out := diskBlockRe.ReplaceAllStringFunc(domXML, func(block string) string {
+		if !strings.Contains(block, needle1) && !strings.Contains(block, needle2) {
+			return block
+		}
+		found = true
+		return driverTagRe.ReplaceAllStringFunc(block, func(tag string) string {
+			tag = setDriverAttr(tag, "discard", discard)
+			return setDriverAttr(tag, "detect_zeroes", detectZeroes)
+		})
+	})
+	if !found {
+		return "", fmt.Errorf("no disk with target %q", dev)
+	}
+	return out, nil
+}
+
+// PatchInactiveNICQueues sets the queue count of the interface with this MAC in
+// the persistent definition (below 2 removes it). The <driver> element is
+// created when the NIC has none, and removed again when nothing is left in it.
+func PatchInactiveNICQueues(domXML, mac string, queues int) (string, error) {
+	want := strings.ToLower(strings.TrimSpace(mac))
+	found := false
+	out := ifaceBlock.ReplaceAllStringFunc(domXML, func(block string) string {
+		m := macAttrRe.FindStringSubmatch(block)
+		if m == nil || strings.ToLower(m[1]) != want {
+			return block
+		}
+		found = true
+		val := ""
+		if queues >= 2 {
+			val = fmt.Sprint(queues)
+		}
+		if driverTagRe.MatchString(block) {
+			return driverTagRe.ReplaceAllStringFunc(block, func(tag string) string {
+				tag = setDriverAttr(tag, "queues", val)
+				// A driver left holding nothing (or only the vhost name an earlier
+				// build forced) goes away.
+				rest := attrRe("name").ReplaceAllString(tag, "")
+				if val == "" && strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(rest, "<driver"), "/>")) == "" {
+					return ""
+				}
+				return tag
+			})
+		}
+		if val == "" {
+			return block
+		}
+		return strings.Replace(block, "</interface>", "<driver queues='"+val+"'/>\n    </interface>", 1)
+	})
+	if !found {
+		return "", fmt.Errorf("no interface with MAC %q", mac)
+	}
+	return out, nil
 }

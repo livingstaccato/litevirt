@@ -3,6 +3,7 @@ package fleet
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -48,6 +49,10 @@ vms:
       interval: 1h
       action: alert
 `
+
+func hasQueues(x string, n int) bool {
+	return strings.Contains(x, fmt.Sprintf("queues=%q", fmt.Sprint(n))) || strings.Contains(x, fmt.Sprintf("queues='%d'", n))
+}
 
 func tuneOf(t *testing.T, node *Node, dev string) lv.IOTune {
 	t.Helper()
@@ -105,7 +110,7 @@ func setupTunedVM(t *testing.T) (context.Context, *Node, pb.LiteVirtClient, vmId
 // unset discard to unmap on the local store (stored in the spec, so it is the
 // VM's own setting from here on).
 //
-// Mutations: drop the DiskConfig.IOTune copy in CreateVM — the iotune read goes
+// Mutations: drop ApplyDiskTuning from baseDomainConfig — the iotune read goes
 // red; drop ApplyNICTuning — the queues check goes red; drop the create-time
 // default — the data disk's spec/XML checks go red.
 func TestFleet_ComposeCreateRendersDiskAndNICTuning(t *testing.T) {
@@ -117,13 +122,16 @@ func TestFleet_ComposeCreateRendersDiskAndNICTuning(t *testing.T) {
 	if got := tuneOf(t, node, "vdb"); !got.IsZero() {
 		t.Errorf("vdb names no limit but is throttled: %+v", got)
 	}
-	if !strings.Contains(x, `<driver name="vhost" queues="2"`) {
-		t.Errorf("the NIC has no vhost multiqueue driver:\n%s", x)
+	if !hasQueues(x, 2) || strings.Contains(x, "vhost") {
+		t.Errorf("the NIC has no multiqueue driver (or it forces vhost):\n%s", x)
 	}
 	if n := strings.Count(x, `discard="unmap"`); n != 2 {
 		t.Errorf("%d disks render discard=unmap, want both (the local-store default)\n%s", n, x)
 	}
 	spec := storedSpec(t, ctx, node, "db")
+	if spec.Network[0].Mac == "" {
+		t.Errorf("the NIC's assigned MAC was not recorded in the spec, so its queues cannot follow it through a hot-plug")
+	}
 	if spec.Disks[1].Discard != "unmap" || spec.Network[0].Queues != 2 || spec.Disks[0].Io.GetReadIopsSec() != 500 {
 		t.Errorf("stored spec = %+v / %+v / %+v", spec.Disks[0], spec.Disks[1], spec.Network[0])
 	}
@@ -181,7 +189,7 @@ func TestFleet_ComposeDiscardAndQueuesChangeRestartTheSameVM(t *testing.T) {
 	deployClean(t, ctx, client, next)
 	assertSameVM(t, ctx, node, "db", before, from, true)
 	x := node.Virt.DefinedXML("db")
-	if !strings.Contains(x, `discard="ignore"`) || !strings.Contains(x, `queues="4"`) {
+	if !strings.Contains(x, "discard='ignore'") && !strings.Contains(x, `discard="ignore"`) || !hasQueues(x, 4) {
 		t.Errorf("redefined domain lacks the new discard/queues:\n%s", x)
 	}
 	spec := storedSpec(t, ctx, node, "db")
@@ -195,15 +203,17 @@ func TestFleet_ComposeDiscardAndQueuesChangeRestartTheSameVM(t *testing.T) {
 }
 
 // A limit set from another node is forwarded to the owner, throttles the disk
-// there, and is carried by a cold migration to the target: the destination's
-// definition has it, and so does the VM's spec.
+// there, is recorded in the spec and replicated, and is carried by a cold
+// migration to the target: the destination's definition has it, and so does the
+// VM's spec. Independent replicas: the write reaches the other node by
+// replication, not through a shared database.
 //
 // Mutations: make SetDiskIO apply locally instead of forwarding — the owner's
-// XML check goes red; drop the spec write — the migrated spec check goes red.
+// XML check goes red; drop the spec write — the replicated/migrated spec checks
+// go red.
 func TestFleet_SetDiskIOForwardsAndMigrationCarriesIt(t *testing.T) {
-	sc := newColdStoppedScenario(t)
+	sc := newColdStoppedScenarioWith(t, Options{Nodes: 2, IndependentReplicas: true, FaultSeed: 91})
 	ctx := context.Background()
-	latchIOFeature(t, sc.c)
 	if _, _, err := corrosion.MutateDesiredSpec(ctx, sc.src.DB, "os1", func(old string) (string, error) {
 		spec := &pb.VMSpec{}
 		if err := json.Unmarshal([]byte(old), spec); err != nil {
@@ -215,6 +225,8 @@ func TestFleet_SetDiskIOForwardsAndMigrationCarriesIt(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed spec disks: %v", err)
 	}
+	sc.c.WaitConverged(t, convergeTimeout)
+	latchIOFeature(t, sc.c)
 
 	// dst is not the owner: the call is forwarded.
 	if _, err := sc.c.SelfClient(sc.dst).SetDiskIO(ctx, &pb.SetDiskIORequest{
@@ -229,6 +241,10 @@ func TestFleet_SetDiskIOForwardsAndMigrationCarriesIt(t *testing.T) {
 	}
 	if sc.dst.Virt.DomainExists("os1") {
 		t.Fatal("the forwarding node defined a domain for a VM it does not own")
+	}
+	sc.c.WaitConverged(t, convergeTimeout)
+	if got := specOn(t, sc.dst, "os1").Disks[0].Io.GetTotalIopsSec(); got != 250 {
+		t.Fatalf("the limit did not replicate to the non-owner's spec: %d", got)
 	}
 
 	// The migration gate wants live health the scenario does not publish; the
@@ -246,14 +262,22 @@ func TestFleet_SetDiskIOForwardsAndMigrationCarriesIt(t *testing.T) {
 	if got, _ := lv.DiskIOTuneFromXML(dstXML, "vda"); got != want {
 		t.Errorf("the migrated domain's throttle = %+v, want %+v", got, want)
 	}
-	vm := sc.vm(t)
-	var spec pb.VMSpec
-	if err := json.Unmarshal([]byte(vm.Spec), &spec); err != nil {
-		t.Fatal(err)
+	if got := specOn(t, sc.dst, "os1").Disks[0].Io.GetTotalIopsSec(); got != 250 {
+		t.Errorf("the migrated VM's spec lost the limit: %d", got)
 	}
-	if spec.Disks[0].Io.GetTotalIopsSec() != 250 {
-		t.Errorf("the migrated VM's spec lost the limit: %+v", spec.Disks[0])
+}
+
+func specOn(t *testing.T, n *Node, vm string) *pb.VMSpec {
+	t.Helper()
+	rec, err := corrosion.GetVM(context.Background(), n.DB, vm)
+	if err != nil || rec == nil {
+		t.Fatalf("GetVM(%s) on %s: %v %v", vm, n.Name, rec, err)
 	}
+	spec := &pb.VMSpec{}
+	if err := json.Unmarshal([]byte(rec.Spec), spec); err != nil {
+		t.Fatalf("parse spec on %s: %v", n.Name, err)
+	}
+	return spec
 }
 
 const composeNoTuning = `name: upd

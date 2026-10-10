@@ -58,3 +58,41 @@ func TestStartPendingVM_RendersDiskAndNICTuningFromTheSpec(t *testing.T) {
 		t.Errorf("the started domain lost its NIC queues:\n%s", x)
 	}
 }
+
+// A NIC hot-plugged after the create has a vm_interfaces row and no spec entry,
+// and a compose NIC with no `mac:` recorded none in the spec. The started domain
+// still gives the tuned NIC its queues: it is matched by ordinal, not by the
+// length of the list.
+//
+// Mutation: drop SpecOrdinal from the reconciler's NetworkConfig — the queues go
+// to no NIC and the check goes red.
+func TestStartPendingVM_TunedNICKeepsItsQueuesAfterAHotPlug(t *testing.T) {
+	db := testReconcilerDB(t)
+	ctx := context.Background()
+	diskPath := filepath.Join(t.TempDir(), "vm2-root.img")
+	if err := os.WriteFile(diskPath, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	spec, _ := json.Marshal(&pb.VMSpec{Name: "vm2", Cpu: 2, MemoryMib: 512,
+		Disks:   []*pb.DiskSpec{{Name: "root", Bus: "virtio"}},
+		Network: []*pb.NetworkAttachment{{Name: "br0", Queues: 4}}}) // one entry, no MAC
+	if err := corrosion.InsertVM(ctx, db,
+		corrosion.VMRecord{Name: "vm2", HostName: "node-a", Spec: string(spec), State: "running", CPUActual: 2, MemActual: 512},
+		[]corrosion.InterfaceRecord{
+			{VMName: "vm2", NetworkName: "br0", Ordinal: 0, MAC: "52:54:00:aa:bb:01"},
+			{VMName: "vm2", NetworkName: "br1", Ordinal: 1, MAC: "52:54:00:aa:bb:02"}, // hot-plugged
+		},
+		[]corrosion.DiskRecord{{VMName: "vm2", DiskName: "root", HostName: "node-a", Path: diskPath, StorageType: "local", SizeBytes: 1 << 30}},
+	); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	r, fake, _ := sharedDiskReconciler(t, db)
+	fresh, _ := corrosion.GetVM(ctx, db, "vm2")
+	r.startPendingVM(ctx, *fresh)
+
+	x := fake.DefinedXML("vm2")
+	first, second, q := strings.Index(x, "aa:bb:01"), strings.Index(x, "aa:bb:02"), strings.Index(x, "queues=")
+	if first < 0 || second < 0 || q < first || q > second || strings.Count(x, "queues=") != 1 {
+		t.Errorf("the tuned NIC (aa:bb:01) must carry the only queues attribute:\n%s", x)
+	}
+}

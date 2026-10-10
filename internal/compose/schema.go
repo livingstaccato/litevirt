@@ -366,7 +366,7 @@ type NetworkAttachment struct {
 	// rules only (no per-NIC SG layer).
 	SecurityGroups []string `yaml:"security-groups,omitempty"`
 
-	// Queues is the virtio-net multiqueue count (<driver name='vhost'
+	// Queues is the virtio-net multiqueue count (<driver
 	// queues='N'/>): 1 to 64, or "auto" for one per vCPU up to 8. Unset or 1
 	// is a single queue. Virtio model only; applies on the next define.
 	Queues NICQueues `yaml:"queues,omitempty"`

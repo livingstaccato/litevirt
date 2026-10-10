@@ -149,15 +149,110 @@ func TestSetDiskIO_Refusals(t *testing.T) {
 	}
 }
 
-// A disk hot-plugged onto the VM is in vm_disks but not in the spec, and the
-// limits live in the spec: refusing is better than a throttle the next redefine
-// silently drops.
-func TestSetDiskIO_HotPluggedDiskIsRefusedPlainly(t *testing.T) {
-	s, _, ctx := ioVM(t, "running")
-	_, err := s.SetDiskIO(ctx, &pb.SetDiskIORequest{VmName: "io", DiskName: "hot", Limits: &pb.DiskIOLimits{TotalIopsSec: 5}})
-	if status.Code(err) != codes.NotFound || !strings.Contains(err.Error(), "spec") {
-		t.Errorf("err = %v", err)
+// A disk the spec does not list is throttled all the same when vm_disks has it
+// (an implicit root disk, a hot-plugged one): the entry is made in the spec, so
+// every later render carries the limit. A disk nobody has is refused with a
+// message that names it.
+//
+// Mutation: drop the synthesis — the implicit-root and hot-plugged cases go red.
+func TestSetDiskIO_DiskTheSpecDoesNotListIsThrottledAndRecorded(t *testing.T) {
+	s := reconfigServer(t)
+	s.gate = ioGate{on: true}
+	fake := s.virt.(*libvirtfake.Fake)
+	ctx := adminCtx()
+	spec := &pb.VMSpec{Name: "io", Cpu: 2, MemoryMib: 512} // no Disks: the implicit-root shape
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{Name: "io", HostName: "test-host", State: "running",
+		CPUActual: 2, MemActual: 512, Spec: seedSpecJSON(t, spec)}, nil, []corrosion.DiskRecord{
+		{VMName: "io", DiskName: "root", HostName: "test-host", Path: "/d/io-root.qcow2", StorageType: "local", TargetDev: "vda", Bus: "virtio", SizeBytes: 1 << 30},
+		{VMName: "io", DiskName: "hot", HostName: "test-host", Path: "/d/io-hot.qcow2", StorageType: "local", TargetDev: "vdb", Bus: "virtio", SizeBytes: 1 << 30},
+	}); err != nil {
+		t.Fatal(err)
 	}
+	x, _ := lv.GenerateDomainXML(lv.VMConfig{Name: "io", CPU: 2, MemoryMiB: 512, Disks: []lv.DiskConfig{
+		{Name: "root", Path: "/d/io-root.qcow2", Bus: "virtio"}, {Name: "hot", Path: "/d/io-hot.qcow2", Bus: "virtio"}}})
+	if err := fake.DefineDomain(x); err != nil {
+		t.Fatal(err)
+	}
+	fake.SetState("io", libvirtfake.StateRunning)
+
+	for disk, dev := range map[string]string{"root": "vda", "hot": "vdb"} {
+		if _, err := s.SetDiskIO(ctx, &pb.SetDiskIORequest{VmName: "io", DiskName: disk, Limits: &pb.DiskIOLimits{TotalIopsSec: 77}}); err != nil {
+			t.Fatalf("%s: %v", disk, err)
+		}
+		if got := ioOf(t, fake, dev, true); got.TotalIopsSec != 77 {
+			t.Errorf("%s: persistent throttle = %+v", disk, got)
+		}
+	}
+	got := loadStoredSpec(t, s, "io")
+	if len(got.Disks) != 2 || got.Disks[0].Name != "root" || got.Disks[0].Io.GetTotalIopsSec() != 77 || got.Disks[1].Io.GetTotalIopsSec() != 77 {
+		t.Errorf("the spec did not record the limits of the unlisted disks: %+v", got.Disks)
+	}
+	_, err := s.SetDiskIO(ctx, &pb.SetDiskIORequest{VmName: "io", DiskName: "nope", Limits: &pb.DiskIOLimits{TotalIopsSec: 5}})
+	if status.Code(err) != codes.NotFound || !strings.Contains(err.Error(), `"nope"`) || strings.Contains(err.Error(), "hot-plugged") {
+		t.Errorf("unknown disk: %v, want NotFound naming the disk and no false hot-plug claim", err)
+	}
+}
+
+// A failure partway through leaves the cluster as it was: the persistent
+// definition keeps the old limit when the live call fails, and both come back
+// when the spec cannot be written; the spec is unchanged in every case.
+//
+// Mutations: drop the restore after a live failure — the inactive-XML check goes
+// red; drop the restore after a spec failure — the XML checks go red.
+func TestSetDiskIO_RollsBackOnPartialFailure(t *testing.T) {
+	old := &pb.DiskIOLimits{ReadIopsSec: 100}
+	next := &pb.DiskIOLimits{ReadIopsSec: 900, WriteBytesSec: 1 << 20}
+	fresh := func(t *testing.T) (*Server, *libvirtfake.Fake, context.Context) {
+		s, fake, ctx := ioVM(t, "running")
+		if _, err := s.SetDiskIO(ctx, &pb.SetDiskIORequest{VmName: "io", DiskName: "root", Limits: old}); err != nil {
+			t.Fatal(err)
+		}
+		return s, fake, ctx
+	}
+	assertOld := func(t *testing.T, s *Server, fake *libvirtfake.Fake) {
+		t.Helper()
+		for _, inactive := range []bool{true, false} {
+			if got := ioOf(t, fake, "vda", inactive); got.ReadIopsSec != 100 || got.WriteBytesSec != 0 {
+				t.Errorf("(inactive=%v) throttle = %+v, want the old read_iops_sec=100 only", inactive, got)
+			}
+		}
+		if got := loadStoredSpec(t, s, "io").Disks[0].Io; got.GetReadIopsSec() != 100 || got.GetWriteBytesSec() != 0 {
+			t.Errorf("spec limits = %+v, want unchanged", got)
+		}
+	}
+
+	t.Run("config step fails", func(t *testing.T) {
+		s, fake, ctx := fresh(t)
+		fake.FailSetDiskIOTune = func(string, string) error { return status.Error(codes.Internal, "boom") }
+		if _, err := s.SetDiskIO(ctx, &pb.SetDiskIORequest{VmName: "io", DiskName: "root", Limits: next}); err == nil {
+			t.Fatal("swallowed")
+		}
+		assertOld(t, s, fake)
+	})
+	t.Run("live step fails after the config took it", func(t *testing.T) {
+		s, fake, ctx := fresh(t)
+		fake.FailSetDiskIOTuneLive = func(string, string) error { return status.Error(codes.Internal, "job lock timeout") }
+		if _, err := s.SetDiskIO(ctx, &pb.SetDiskIORequest{VmName: "io", DiskName: "root", Limits: next}); err == nil {
+			t.Fatal("swallowed")
+		}
+		fake.FailSetDiskIOTuneLive = nil
+		assertOld(t, s, fake)
+	})
+	t.Run("spec write fails after libvirt took it", func(t *testing.T) {
+		s, fake, ctx := fresh(t)
+		s.ioSpecWriteHook = func() {
+			op := corrosion.OperationRecord{ID: "op-race", Method: "UpdateVM", ResourceKind: "vm", ResourceID: "io",
+				OperationKind: string(corrosion.OpResourceUpdateRunning), RequestHash: "h"}
+			cur, _ := corrosion.GetVM(ctx, s.db, "io")
+			if ok, err := s.db.BeginVMOperation(ctx, op, seedSpecJSON(t, loadStoredSpec(t, s, "io")), cur.OwnerEpoch, cur.SpecGeneration); err != nil || !ok {
+				t.Errorf("BeginVMOperation: ok=%v err=%v", ok, err)
+			}
+		}
+		if _, err := s.SetDiskIO(ctx, &pb.SetDiskIORequest{VmName: "io", DiskName: "root", Limits: next}); err == nil {
+			t.Fatal("swallowed")
+		}
+		assertOld(t, s, fake)
+	})
 }
 
 func TestValidateSpecTuningNormalizesAndRefuses(t *testing.T) {
@@ -205,5 +300,63 @@ func TestIsPureCPUGrowRequest_RefusesHardwareRedefine(t *testing.T) {
 	}
 	if isPureCPUGrowRequest(&pb.UpdateVMRequest{Name: "x", Cpu: 4, RedefineHardware: true}) {
 		t.Error("a cpu grow carrying a hardware redefine took the live path")
+	}
+}
+
+// UpdateVM carries the discard / detect_zeroes / queues change and applies it
+// to ITS spec, writing the spec only after the domain has the setting. A define
+// failure therefore leaves the spec as it was: it never claims what the domain
+// lacks, and the operator's re-apply still plans the change.
+//
+// Mutations: write the spec before the define — the failure case goes red; drop
+// the tuning merge — the success case goes red.
+func TestUpdateVM_TuningRequestWritesTheSpecOnlyAfterTheDefine(t *testing.T) {
+	s, fake, ctx := ioVM(t, "stopped")
+	req := &pb.UpdateVMRequest{Name: "io", DiskTuning: []*pb.DiskTuningUpdate{{Name: "root", Discard: "unmap"}}}
+
+	fake.FailDefineDomain = func(string) error { return status.Error(codes.Internal, "define refused") }
+	if _, err := s.UpdateVM(ctx, req); err == nil {
+		t.Fatal("a define failure was swallowed")
+	}
+	fake.FailDefineDomain = nil
+	if got := loadStoredSpec(t, s, "io").Disks[0].Discard; got != "" {
+		t.Fatalf("the spec claims discard %q after a failed define", got)
+	}
+
+	if _, err := s.UpdateVM(ctx, req); err != nil {
+		t.Fatalf("UpdateVM: %v", err)
+	}
+	if got := loadStoredSpec(t, s, "io").Disks[0].Discard; got != "unmap" {
+		t.Errorf("spec discard = %q, want unmap", got)
+	}
+	if x := fake.DefinedXML("io"); !strings.Contains(x, `discard="unmap"`) && !strings.Contains(x, `discard='unmap'`) {
+		t.Errorf("the redefined domain lacks discard:\n%s", x)
+	}
+	// An invalid value is refused before anything is touched.
+	bad := &pb.UpdateVMRequest{Name: "io", DiskTuning: []*pb.DiskTuningUpdate{{Name: "root", DetectZeroes: "unmap", Discard: "ignore"}}}
+	if _, err := s.UpdateVM(ctx, bad); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("detect_zeroes unmap with discard ignore: %v, want InvalidArgument", err)
+	}
+}
+
+// A discard change patches the persistent definition instead of regenerating
+// it, so what libvirt assigned (PCI addresses a Windows guest keys licensing and
+// a static NIC configuration off) survives.
+//
+// Mutation: make the in-place path ineligible for tuning — the marker is lost.
+func TestUpdateVM_TuningRequestPatchesTheDefinitionInPlace(t *testing.T) {
+	s, fake, ctx := ioVM(t, "stopped")
+	x, _ := fake.DumpXMLInactive("io")
+	marked := strings.Replace(x, "<name>io</name>", "<name>io</name><description>libvirt-assigned-marker</description>", 1)
+	fake.SetInactiveXML("io", marked)
+	if _, err := s.UpdateVM(ctx, &pb.UpdateVMRequest{Name: "io", DiskTuning: []*pb.DiskTuningUpdate{{Name: "root", Discard: "unmap"}}}); err != nil {
+		t.Fatalf("UpdateVM: %v", err)
+	}
+	got := fake.DefinedXML("io")
+	if !strings.Contains(got, "libvirt-assigned-marker") {
+		t.Errorf("the definition was regenerated, not patched:\n%s", got)
+	}
+	if !strings.Contains(got, "discard='unmap'") && !strings.Contains(got, `discard="unmap"`) {
+		t.Errorf("the patched definition lacks discard:\n%s", got)
 	}
 }

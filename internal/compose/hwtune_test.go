@@ -177,3 +177,41 @@ func TestApplyTuning(t *testing.T) {
 		t.Error("auto queues is one per vCPU up to 8, none for one vCPU")
 	}
 }
+
+// A NIC hot-plugged after the create has a vm_interfaces row but no spec entry,
+// and a compose NIC without `mac:` has a spec entry that recorded none. Matching
+// by ordinal keeps the tuned NIC's queues when another NIC comes or goes.
+//
+// Mutation: drop the ordinal branch — the hot-plug case goes red.
+func TestApplyNICTuning_SurvivesHotPlugAndDetachByOrdinal(t *testing.T) {
+	spec := &pb.VMSpec{Network: []*pb.NetworkAttachment{{Name: "a", Queues: 4}}} // no MAC recorded
+	// Hot-plug: the DB has two NICs (ordinals 1, 2 -> SpecOrdinal 1, 2), one more than the spec.
+	nets := []libvirt.NetworkConfig{{MAC: "52:54:00:00:00:01", SpecOrdinal: 1}, {MAC: "52:54:00:00:00:02", SpecOrdinal: 2}}
+	ApplyNICTuning(nets, spec)
+	if nets[0].Queues != 4 || nets[1].Queues != 0 {
+		t.Errorf("after a hot-plug nets = %+v, want NIC 1 keeps 4 queues and the new NIC none", nets)
+	}
+	// The tuned NIC detached and another stays: it is not given NIC 1's queues.
+	nets = []libvirt.NetworkConfig{{MAC: "52:54:00:00:00:02", SpecOrdinal: 2}}
+	spec.Network[0].Mac = "52:54:00:00:00:01"
+	ApplyNICTuning(nets, spec)
+	if nets[0].Queues != 0 {
+		t.Errorf("a different NIC took the detached NIC's queues: %+v", nets)
+	}
+}
+
+// One name rule everywhere: an empty disk name is "root".
+func TestDiskKeyAndEmptyNameMatching(t *testing.T) {
+	if DiskKey("") != "root" || DiskKey("data") != "data" {
+		t.Error("DiskKey")
+	}
+	stored := &pb.VMSpec{Disks: []*pb.DiskSpec{{Name: "", Bus: "virtio", Discard: "unmap"}}}
+	same := &pb.VMSpec{Disks: []*pb.DiskSpec{{Name: "root", Bus: "virtio", Discard: "unmap"}}}
+	if p := Classify(same, stored, StoredDisksFromSpec(stored)); p.TuningRedefine {
+		t.Errorf("a stored empty-name disk is root: an unchanged discard was seen as a change: %+v", p)
+	}
+	d := &pb.VMSpec{Disks: []*pb.DiskSpec{{Name: "root", Bus: "virtio", Discard: "ignore"}}}
+	if p := Classify(d, stored, StoredDisksFromSpec(stored)); !p.TuningRedefine {
+		t.Errorf("a stored empty-name disk is root: the discard change was not seen: %+v", p)
+	}
+}

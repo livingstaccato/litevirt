@@ -136,10 +136,15 @@ type NetworkConfig struct {
 	MAC    string
 	VLAN   int    // 0 = untagged, 1–4094 = 802.1Q VLAN ID
 	Direct string // non-empty = macvtap direct attach to this interface (e.g. "bond0.206")
-	// Queues is the virtio-net multiqueue count: <driver name='vhost'
-	// queues='N'/>. Below 2 emits nothing (a single queue is the default). Only
-	// the virtio model takes it.
+	// Queues is the virtio-net multiqueue count: <driver queues='N'/>. Below 2
+	// emits nothing (a single queue is the default). Only the virtio model takes
+	// it.
 	Queues int
+	// SpecOrdinal is the NIC's 1-based position in the VM's spec (its
+	// vm_interfaces ordinal + 1); 0 = unknown. It lets the stored queue count
+	// find its NIC when the spec recorded no MAC, however many NICs have been
+	// hot-plugged or detached since.
+	SpecOrdinal int
 }
 
 // MachineTypeFromXML extracts the resolved <os><type machine="…"> value from a
@@ -547,7 +552,10 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 			}
 		}
 		if n.Queues >= 2 && model == "virtio" {
-			iface.Driver = &ifaceDriver{Name: "vhost", Queues: n.Queues}
+			// No driver name: libvirt picks vhost-net when the host has it and
+			// qemu userspace when it does not. Naming vhost would turn a host
+			// without /dev/vhost-net into a failed start or migration.
+			iface.Driver = &ifaceDriver{Queues: n.Queues}
 		}
 		dev.Interfaces = append(dev.Interfaces, iface)
 	}
@@ -1005,7 +1013,7 @@ type interfaceDevice struct {
 	Driver  *ifaceDriver `xml:"driver,omitempty"`
 }
 
-// ifaceDriver is the NIC's <driver>: vhost with N queues for virtio multiqueue.
+// ifaceDriver is the NIC's <driver>: N queues for virtio multiqueue.
 type ifaceDriver struct {
 	Name   string `xml:"name,attr,omitempty"`
 	Queues int    `xml:"queues,attr,omitempty"`

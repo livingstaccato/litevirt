@@ -615,6 +615,9 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		mac := n.Mac
 		if mac == "" {
 			mac = lv.GenerateMAC()
+			// Recorded in the spec so the NIC keeps its identity (its queue
+			// count) however many NICs are hot-plugged or detached later.
+			n.Mac = mac
 		}
 
 		// Attempt network provisioning if the network is defined in the stack.
@@ -3967,7 +3970,7 @@ func isPureCPUGrowRequest(req *pb.UpdateVMRequest) bool {
 		req.GuestAgent == nil && req.MinMemoryMib == nil && req.MaxMemoryMib == nil &&
 		req.SecureBoot == nil && req.Tpm == nil && req.MaxCpu == nil &&
 		req.Restart == nil && req.Onboot == nil && req.StartupOrder == nil &&
-		req.StartDelaySec == nil && req.StopDelaySec == nil && !req.DisableVnc && !req.RedefineHardware
+		req.StartDelaySec == nil && req.StopDelaySec == nil && !req.DisableVnc && !requestsHardwareTuning(req)
 }
 
 // liveGrowVCPU hot-adds vCPUs to a RUNNING VM in place (no stop). It is the pure
@@ -4003,7 +4006,7 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	}
 	// The hardware redefine renders disk/NIC tuning, which waits for the latch;
 	// refused at the entry node, before the call is forwarded.
-	if req.RedefineHardware {
+	if requestsHardwareTuning(req) {
 		if err := s.ioFeatureGate(ctx); err != nil {
 			return nil, err
 		}
@@ -4062,13 +4065,24 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		spec.StopDelaySec = *req.StopDelaySec
 	}
 
+	// Discard / detect_zeroes / queue changes ride in the request and are merged
+	// into THIS host's spec (the owner's, under the VM lock), validated before
+	// anything is stopped. The merged spec is only written after the domain has
+	// the setting, so it never claims what the domain lacks.
+	if len(req.DiskTuning) > 0 || len(req.NicQueues) > 0 {
+		tdisks, _ := corrosion.GetVMDisks(ctx, s.db, req.Name)
+		if err := applyTuningRequest(spec, tdisks, req); err != nil {
+			return nil, err
+		}
+	}
+
 	// REDEFINE-class fields bake into the domain XML, so they need the VM stopped.
 	// Only require stopped (and redefine) when one of them is actually changing —
 	// a metadata-only update applies live above.
 	redefine := req.Cpu > 0 || req.MemoryMib > 0 || req.CpuMode != "" || req.CpuModel != "" ||
 		req.Machine != "" || req.Firmware != "" ||
 		req.GuestAgent != nil || req.MinMemoryMib != nil || req.MaxMemoryMib != nil ||
-		req.SecureBoot != nil || req.Tpm != nil || req.MaxCpu != nil || req.RedefineHardware
+		req.SecureBoot != nil || req.Tpm != nil || req.MaxCpu != nil || requestsHardwareTuning(req)
 	// A cpu/memory(+bounds)/cpu-mode redefine can be applied by patching the
 	// inactive domain XML in place rather than regenerating it, so libvirt-assigned
 	// details (PCI slot addresses, controller models) survive — which matters for
@@ -4472,16 +4486,18 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		bridge := resolveBridge(ctx, s.db, iface.NetworkName)
 		if strings.HasPrefix(bridge, "direct:") {
 			netConfigs = append(netConfigs, lv.NetworkConfig{
-				Direct: strings.TrimPrefix(bridge, "direct:"),
-				Model:  "virtio",
-				MAC:    iface.MAC,
+				Direct:      strings.TrimPrefix(bridge, "direct:"),
+				Model:       "virtio",
+				MAC:         iface.MAC,
+				SpecOrdinal: iface.Ordinal + 1,
 			})
 			continue
 		}
 		netConfigs = append(netConfigs, lv.NetworkConfig{
-			Bridge: bridge,
-			Model:  "virtio",
-			MAC:    iface.MAC,
+			Bridge:      bridge,
+			Model:       "virtio",
+			MAC:         iface.MAC,
+			SpecOrdinal: iface.Ordinal + 1,
 		})
 	}
 
@@ -4515,6 +4531,11 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 				if req.CpuMode != "" || req.CpuModel != "" {
 					patched, perr = lv.PatchInactiveCPUMode(patched, spec.CpuMode, spec.CpuModel)
 				}
+			}
+			if perr == nil && (len(req.DiskTuning) > 0 || len(req.NicQueues) > 0) {
+				// discard / detect_zeroes / queues patch into the existing
+				// definition too, so the addresses libvirt assigned survive.
+				patched, perr = patchTuningInPlace(patched, req, spec, diskConfigs, ifaces)
 			}
 			if perr == nil {
 				domXML = patched

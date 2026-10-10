@@ -73,6 +73,13 @@ func (s *Server) autoDefineRestoredVM(
 	if err != nil {
 		return "", "", err
 	}
+	// The spec is a manifest's or a caller's, never a validated create: its
+	// disk/NIC tuning is dropped before the gate opens and validated after.
+	if stripped, rerr := s.restrictRestoredTuning(ctx, spec); rerr != nil {
+		return "", "", rerr
+	} else if stripped {
+		_ = send(&pb.RestoreLiveProgress{Status: "the backup's disk/NIC tuning is not applied: the cluster upgrade has not finished"})
+	}
 
 	originalName := spec.Name
 	targetName := req.NewName

@@ -1141,10 +1141,11 @@ func (r *LxcRunner) RefreshHookPolicies() error {
 			}
 			continue
 		}
+		// A record that no longer resolves here yields nothing (rm, rd nil):
+		// its policy then authorizes nothing.
 		rm, rd, rerr := ResolveHostAccess(auth.Mounts, auth.Devices, r.hostAccess())
 		if rerr != nil {
 			slog.Warn("container: its host access no longer resolves on this host; its start hook will refuse it", "container", name, "error", rerr)
-			rm, rd = nil, nil
 		}
 		if err := r.writeHookPolicy(name, rm, rd); err != nil {
 			errs = append(errs, err)

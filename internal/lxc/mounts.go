@@ -1254,6 +1254,13 @@ func (p hookPolicy) judgeDevice(src string, kind byte, major, minor uint32) erro
 	return nil
 }
 
+// hookMount is one mount the hook stages, read from the config's markers.
+type hookMount struct {
+	ro, file    bool
+	prefix, rel string
+	staging     string
+}
+
 // hookDevice is one device of the managed block, as the hook re-judges it.
 type hookDevice struct {
 	kind         byte

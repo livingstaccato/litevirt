@@ -67,13 +67,6 @@ func openBeneath(prefix, rel string) (int, error) {
 	return fd, nil
 }
 
-// hookMount is one mount the hook stages, read from the config's markers.
-type hookMount struct {
-	ro, file    bool
-	prefix, rel string
-	staging     string
-}
-
 // hookMounts reads the managed block's mount markers and the staging paths
 // their entries name.
 func hookMounts(cfg string) ([]hookMount, error) {

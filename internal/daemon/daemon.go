@@ -1625,15 +1625,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	// Start web UI (connects back to local gRPC as a client).
 	go func() {
-		clientTLS, err := pki.ClientTLSConfig(d.cfg.PKIDir)
-		if err != nil {
-			slog.Warn("UI client TLS config failed", "error", err)
-			return
-		}
-		localConn, err := grpc.NewClient(fmt.Sprintf("127.0.0.1:%d", d.cfg.GRPCPort),
-			grpc.WithTransportCredentials(credentials.NewTLS(clientTLS)),
-			grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(localMaxRecvMsgSize)),
-		)
+		// Recycled when this host's certificate is renewed: the connection
+		// made with the replaced one accepts no new RPC (pki.RecyclingConn).
+		localConn, err := d.localRecyclingConn()
 		if err != nil {
 			slog.Warn("UI gRPC dial failed", "error", err)
 			return
@@ -1668,15 +1662,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Start REST API gateway.
 	if d.cfg.RESTPort > 0 {
 		go func() {
-			restTLS, err := pki.ClientTLSConfig(d.cfg.PKIDir)
-			if err != nil {
-				slog.Warn("REST client TLS config failed", "error", err)
-				return
-			}
-			restConn, err := grpc.NewClient(fmt.Sprintf("127.0.0.1:%d", d.cfg.GRPCPort),
-				grpc.WithTransportCredentials(credentials.NewTLS(restTLS)),
-				grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(localMaxRecvMsgSize)),
-			)
+			restConn, err := d.localRecyclingConn()
 			if err != nil {
 				slog.Warn("REST gRPC dial failed", "error", err)
 				return

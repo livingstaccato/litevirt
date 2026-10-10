@@ -430,19 +430,30 @@ could read as a failure:
    `certificate/key_file_unsafe` condition naming the file and the fix (move,
    `chown` or `chmod 600`); a key readable by others is tightened.
    **Established connections** are judged on every RPC, not only at the
-   handshake. A connection made with a REVOKED certificate (or on which the
-   host served one) refuses its next RPC and is closed at once, streams in
-   flight included. A connection made with a certificate the CA has
-   **replaced** — see "Superseded certificates" below — starts no new RPC: the
-   next one is refused with `Unavailable`, and the client reconnects and
-   presents its renewed certificate. Only the RPCs already in flight on it — a
-   cold-disk migration stream, a backup push — are left to finish, and the
-   connection is closed when the last one ends, or after 15 minutes; one cut
-   by that bound fails and must be re-run (cold-disk migration and peer backup
-   streams do not resume), so renew outside long transfers. A host's own UI
-   and REST clients are such clients too: while a browser keeps an event
-   stream open on the old connection, UI requests that need a new RPC fail
-   until the page is reloaded or 15 minutes pass.
+   handshake. A connection made with a certificate the CA has **replaced** —
+   see "Superseded certificates" below — starts no new RPC: the next one is
+   refused with `Unavailable`, and the client reconnects and presents its
+   renewed certificate. Only the RPCs already in flight on it — a cold-disk
+   migration stream, a backup push — are left to finish, and the connection
+   is closed when the last one ends, or after 15 minutes; one cut by that
+   bound fails and must be re-run (cold-disk migration and peer backup streams
+   do not resume), so renew outside long transfers. That holds once the
+   replaced certificate is REVOKED too, as step 7 does at once: a revoked
+   certificate with a standing CA-issued successor was revoked because it was
+   renewed, and its connections drain the same way. A cold-disk migration
+   opens a fresh connection for each disk, so one renewed mid-copy finishes
+   the disk in flight and copies the rest with the renewed certificate.
+   A certificate revoked with **no** successor — `lv host rm`, `lv host
+   revoke-cert` of a live identity — is the emergency path: a connection made
+   with it (or on which the host served it) refuses its next RPC and is closed
+   at once, streams in flight included. If you renewed because a key was
+   stolen, a connection the thief opened before the renewal is not cut at
+   once but drained: it starts nothing new, and what it had in flight runs out
+   within 15 minutes; restart the daemons to cut it sooner. A host's own UI
+   and REST clients reconnect by themselves when the host's certificate
+   changes: the next request goes over a new connection with the renewed
+   certificate, while a console or event stream already open on the old one
+   runs on until it ends (or 15 minutes pass).
 5. The command dials the host and **confirms** it presents the new certificate.
    It switches back only when the host demonstrably still presents the old one
    and the cluster does not record the new one; a probe that merely fails proves
@@ -499,6 +510,16 @@ revocation is published regardless. Only the CA can take a successor back: a
 successor it revokes unused (an abandoned renewal) hands the identity back to
 its predecessor; one revoked because it was renewed in turn does not.
 
+The record is fail-closed against loss: a `superseded.pem` the node cannot
+read (unreadable, not a regular file, over 16 MiB) is left exactly as it is
+and never written over, what the node learns meanwhile is kept in memory, and
+the read is retried; once it succeeds, both are merged and saved. If the
+installed CRL cannot be parsed, the node treats nothing in it as revoked — the
+CRL's fail-open rule — so an abandoned (revoked unused) successor looks
+standing there, and the predecessor it would hand back is refused on that node
+until the CRL is readable again; `certificate/crl_install_failed` reports that
+node.
+
 A node that holds no successor for a certificate does not refuse it on that
 ground; revocation is what ends it everywhere. Until it is revoked — while it is
 owed, or after `--keep-old` — the replaced certificate still authenticates as a
@@ -511,20 +532,35 @@ while that recovery switch is on, a replaced key's accepts DO count there.
 #### Renewing a voter
 
 A node that adopts a voter generation decided BEFORE one of its signers renewed
-cannot count that signer's pre-renewal accept (§4.1's cost). Most of the time
-this is invisible: every node adopts within seconds. A node that was offline,
-whose import was retrying, or that was admitted later can be left one
-generation short. It raises `certificate/voter_generation_stuck`, naming the
-generation and the fix: **decide one more voter change** from a node that has
-adopted the newest generation — `lv cluster voter add <host>`, or `lv cluster
-voter rm <host>` and then add it back. Its accepts carry current certificates,
-it becomes the stuck node's anchor, and the node adopts through it; the
-condition clears. If a MAJORITY of the newest generation's members are stuck
-like this, no change can be decided (a voter answers only at its adopted
-generation): set `auth.trust_rotated_peer_certs: true` on the stuck nodes and
-restart them, let them adopt, decide one voter change, then set it back to
-`false` and restart again. To avoid all of this, renew voters only when `lv
-cluster voter ls` shows every node on the newest generation.
+cannot count that signer's pre-renewal accept as it stands (§4.1's cost): the
+pin refuses it, and once the renewal has revoked the replaced certificate, so
+does revocation. Most of the time this is invisible: every node adopts within
+seconds. A node that was offline, whose import was retrying, or that was
+admitted later can be left one generation short.
+
+Such a node asks the renewed voter to **re-attest** its accept: the voter
+re-signs, with its current certificate, the accept it recorded in its own
+durable claim state when it voted — the same key, generation, ballot and
+value, never anything taken from the row or the caller — and the node adopts
+the generation with that accept counted. Nothing is relaxed: the re-signed
+accept is checked like any other, the replaced certificate counts for nothing,
+and a voter asked about a generation it never accepted has nothing to give, so
+a forged generation gets nothing. This works however many members are stuck,
+including a MAJORITY of the newest generation, where no voter change could be
+decided (a voter answers only at its adopted generation) and
+`auth.trust_rotated_peer_certs` would not help (it relaxes the pin, never
+revocation).
+
+While the renewed voter cannot re-attest — unreachable, or on an older build
+— the node raises `certificate/voter_generation_stuck`, naming the generation,
+the voter it is waiting on, and the fixes: bring that host back on this build,
+or **decide one more voter change** from a node that has adopted the newest
+generation — `lv cluster voter add <host>`, or `lv cluster voter rm <host>`
+and then add it back. Its accepts carry current certificates, it becomes the
+stuck node's anchor, and the node adopts through it; the condition clears. A
+voter change needs a majority of the newest generation, so when a majority is
+stuck, re-attestation is the way out. To avoid all of this, renew voters only
+when `lv cluster voter ls` shows every node on the newest generation.
 
 The renewal deletes the replaced key from the host's PKI directory and the copy
 `lv host init`/`lv host add` left on the CA machine (`<host>.key`, when it is

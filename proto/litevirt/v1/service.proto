@@ -2479,6 +2479,12 @@ message AcceptRecoveryClaimResponse {
 }
 message GetRecoveryClaimRequest {
     RecoveryClaimKey key = 1;
+    // reattest: for a voter_config key whose accept this voter signed with a
+    // host certificate a renewal has since replaced, also return the same
+    // accept re-signed with its current certificate (reattested). It re-signs
+    // only the accept recorded in its own durable claim state, never a value
+    // it did not accept. An older build ignores the field.
+    bool reattest = 2;
 }
 message GetRecoveryClaimResponse {
     PrepareRecoveryClaimResponse state = 1;  // promised/accepted ballot and value, voter, incarnation
@@ -2486,6 +2492,7 @@ message GetRecoveryClaimResponse {
     string last_refusal_reason         = 3;  // this voter's most recent refusal for the key (memory only)
     string last_refusal_detail         = 4;
     int64  adopted_generation          = 5;
+    ClaimAccept reattested             = 6;  // with reattest: the accept above, re-signed with the current certificate
 }
 message ListRecoveryClaimsRequest {
     int64 config_generation = 1;  // the generation the importer is leaving

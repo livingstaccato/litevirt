@@ -102,14 +102,20 @@ func (is *identityServer) client(t *testing.T) healthpb.HealthClient {
 // starts on it — even while the client holds a stream open, which used to keep
 // the connection usable for up to the full grace. The stream already in
 // flight finishes; when it ends the connection closes, and the client's next
-// call reconnects with its renewed certificate. A REVOKED certificate gets no
-// grace at all: the new RPC is refused and the connection, stream included, is
-// cut at once.
+// call reconnects with its renewed certificate.
+//
+// That holds after the replaced certificate is REVOKED too, as `lv host
+// renew-cert` does at once (re-review 3, I1): a revoked certificate with a
+// standing CA-issued successor was revoked because it was renewed, so the
+// per-RPC gate and the tracker's sweep drain its connection rather than cut
+// it. A revoked certificate with NO successor gets no grace at all: the new
+// RPC is refused and the connection, stream included, is cut at once.
 //
 // Mutations: drop connIdentityGate from UnaryAuthInterceptor — the new unary
 // RPC on the replaced certificate's connection succeeds; make the revoked
 // case drain instead of closing (immediate=false) — the stream on a revoked
-// certificate survives.
+// certificate survives; make revokedByRenewal report false — the stream on
+// the renewed-away, revoked certificate is cut.
 func TestConnIdentityGate_NoNewRPCOnAReplacedOrRevokedIdentity(t *testing.T) {
 	ctx := context.Background()
 	s := testServer(t)
@@ -131,6 +137,7 @@ func TestConnIdentityGate_NoNewRPCOnAReplacedOrRevokedIdentity(t *testing.T) {
 
 	// node-c renews, and the server learns it from the renewed host's own
 	// handshake on a NEW connection.
+	replaced, _ := pki.CertSerial(filepath.Join(is.cliDir, "host.crt"))
 	if _, _, err := pki.RenewLocal(filepath.Join(is.cliDir, "ca.crt"), filepath.Join(is.cliDir, "ca.key"), is.cliDir, "node-c"); err != nil {
 		t.Fatal(err)
 	}
@@ -143,10 +150,21 @@ func TestConnIdentityGate_NoNewRPCOnAReplacedOrRevokedIdentity(t *testing.T) {
 	if status.Code(err) != codes.Unavailable || !strings.Contains(err.Error(), "replaced") {
 		t.Fatalf("a new RPC on a replaced certificate's connection: %v, want Unavailable naming the replacement", err)
 	}
+	// The renewal revokes the replaced certificate at once. The connection
+	// keeps draining — the gate and the sweep both judge it a renewal's — and
+	// a new RPC on it is still refused.
+	if err := pki.GenerateCRL(is.caCert, is.caKey, filepath.Join(is.srvDir, "crl.pem"), []string{replaced}); err != nil {
+		t.Fatal(err)
+	}
+	_, err = hc.Check(ctx, &healthpb.HealthCheckRequest{})
+	if status.Code(err) != codes.Unavailable || !strings.Contains(err.Error(), "replaced") {
+		t.Fatalf("a new RPC on a renewed-away, revoked certificate's connection: %v, want Unavailable naming the renewal", err)
+	}
+	is.tracker.Sweep(s.ConnJudge(ctx))
 	// The stream in flight is left to finish.
 	is.health.SetServingStatus("", healthpb.HealthCheckResponse_NOT_SERVING)
 	if _, err := stream.Recv(); err != nil {
-		t.Fatalf("the stream in flight was cut: %v", err)
+		t.Fatalf("the stream in flight on the renewed-away certificate's connection was cut: %v", err)
 	}
 	cancelStream()
 	deadline := time.Now().Add(5 * time.Second)
@@ -217,11 +235,98 @@ func TestConnJudge_SupersededDrainsRevokedClosesAtOnce(t *testing.T) {
 	if !v.Close || v.Immediate || !strings.Contains(v.Reason, "replaced") {
 		t.Fatalf("a replaced certificate's connection: %+v, want it drained", v)
 	}
+	// Revoked, as the renewal does at once: it still drains.
+	if err := pki.GenerateCRL(is.caCert, is.caKey, filepath.Join(is.srvDir, "crl.pem"),
+		[]string{strings.ToLower(old.SerialNumber.Text(16))}); err != nil {
+		t.Fatal(err)
+	}
+	if v := s.ConnJudge(ctx)(pki.TrackedConn{Peer: old}); !v.Close || v.Immediate {
+		t.Fatalf("a renewed-away, revoked certificate's connection: %+v, want it drained", v)
+	}
 	if err := pki.GenerateCRL(is.caCert, is.caKey, filepath.Join(is.srvDir, "crl.pem"),
 		[]string{strings.ToLower(succ.SerialNumber.Text(16))}); err != nil {
 		t.Fatal(err)
 	}
 	if v := s.ConnJudge(ctx)(pki.TrackedConn{Peer: succ}); !v.Close || !v.Immediate {
 		t.Fatalf("a revoked certificate's connection: %+v, want it closed at once", v)
+	}
+}
+
+// The other direction of I1: THIS host renews, and its replaced certificate is
+// revoked at once. A connection on which it served the replaced certificate —
+// a peer streaming a backup or a disk to it — drains: no new RPC, the stream
+// in flight finishes. The served certificate is a renewal's even before the
+// certificate watch has recorded the successor (the gate records the host's
+// current certificate itself). A served certificate revoked with no
+// successor still cuts the connection at once.
+//
+// Mutations: make servedRevokedByRenewal report false — the stream is cut;
+// drop its NoteSuccessor of the current certificate — likewise, since nothing
+// else has recorded the successor here.
+func TestConnIdentity_ARenewedServerDrainsTheConnectionsItServedTheOldCertificateOn(t *testing.T) {
+	ctx := context.Background()
+	s := testServer(t)
+	is := newIdentityServer(t, s)
+	hc := is.client(t)
+	sctx, cancelStream := context.WithCancel(ctx)
+	defer cancelStream()
+	stream, err := hc.Watch(sctx, &healthpb.HealthCheckRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stream.Recv(); err != nil {
+		t.Fatalf("open the stream: %v", err)
+	}
+
+	replaced, _ := pki.CertSerial(filepath.Join(is.srvDir, "host.crt"))
+	if _, _, err := pki.RenewLocal(is.caCert, is.caKey, is.srvDir, s.hostName); err != nil {
+		t.Fatal(err)
+	}
+	if err := pki.GenerateCRL(is.caCert, is.caKey, filepath.Join(is.srvDir, "crl.pem"), []string{replaced}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := hc.Check(ctx, &healthpb.HealthCheckRequest{}); status.Code(err) != codes.Unavailable ||
+		!strings.Contains(err.Error(), "renewal") {
+		t.Fatalf("a new RPC where this host served its renewed-away certificate: %v, want Unavailable naming the renewal", err)
+	}
+	is.tracker.Sweep(s.ConnJudge(ctx))
+	is.health.SetServingStatus("", healthpb.HealthCheckResponse_NOT_SERVING)
+	if _, err := stream.Recv(); err != nil {
+		t.Fatalf("the stream in flight where this host served its renewed-away certificate was cut: %v", err)
+	}
+	cancelStream()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := hc.Check(ctx, &healthpb.HealthCheckRequest{}); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the client did not reconnect to the renewed certificate after the stream ended: %v", err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Now the CURRENT served certificate is revoked, with no successor: cut.
+	stream2, err := hc.Watch(ctx, &healthpb.HealthCheckRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stream2.Recv(); err != nil {
+		t.Fatal(err)
+	}
+	current, _ := pki.CertSerial(filepath.Join(is.srvDir, "host.crt"))
+	if err := pki.GenerateCRL(is.caCert, is.caKey, filepath.Join(is.srvDir, "crl.pem"), []string{replaced, current}); err != nil {
+		t.Fatal(err)
+	}
+	is.tracker.Sweep(s.ConnJudge(ctx))
+	done := make(chan error, 1)
+	go func() { _, err := stream2.Recv(); done <- err }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("the stream where this host served a revoked certificate delivered after the revocation")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stream where this host served a certificate revoked with no successor was not cut")
 	}
 }

@@ -582,9 +582,10 @@ auth:
   # certificate. Because such a node does not pin, the cluster also HOLDS the
   # revocation of a renewal's replaced certificate while any node has it on
   # (each node reports it as a certificate/trust_rotated_peer_certs
-  # condition). Turn it off as soon as the fleet has converged. It is also the
-  # last-resort way out of a voter chain stuck after a renewal (docs/auth.md,
-  # "Renewing a voter"). Default false.
+  # condition). Turn it off as soon as the fleet has converged. It is NOT a way
+  # out of a voter chain stuck after a renewal: it relaxes the pin, never
+  # revocation, and a renewal revokes the replaced certificate — the renewed
+  # voter's re-attestation is (docs/auth.md, "Renewing a voter"). Default false.
   trust_rotated_peer_certs: false
   # Forwarded identity: when true (and the forwarded_identity_v1 capability is
   # active cluster-wide), the owning node re-authenticates a forwarded user's

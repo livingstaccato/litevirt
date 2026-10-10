@@ -487,6 +487,9 @@ type ClaimVerifier struct {
 	// replaced (pki.SupersededBy) does not count.
 	pinned bool
 	noPin  bool
+	// renewalBlind (RenewalBlind): an accept signed with a certificate the CA
+	// has replaced counts, revoked or not. Diagnosis only.
+	renewalBlind bool
 }
 
 // WithRevoked returns a copy of v that also treats serials as revoked: the
@@ -544,6 +547,52 @@ func (v *ClaimVerifier) WithoutSerialPin() *ClaimVerifier {
 	return &h
 }
 
+// RenewalBlind returns a copy of v that COUNTS an accept signed with a
+// certificate the CA has replaced (a standing successor this node holds,
+// pki.SupersededBy) — not pinned, and its revocation disregarded, since `lv
+// host renew-cert` revokes the replaced certificate BECAUSE it was renewed.
+// Everything else is checked as v does.
+//
+// It answers one question and must never decide anything: "does this
+// certificate fail ONLY because one of its signers renewed since?" A
+// generation that passes RenewalBlind but not v is one this node is stuck
+// below by a renewal (voter_generation_stuck), and the signers whose accepts
+// it cannot count are the ones asked to re-attest them.
+func (v *ClaimVerifier) RenewalBlind() *ClaimVerifier {
+	if v == nil {
+		return nil
+	}
+	h := *v
+	h.pinned, h.noPin, h.renewalBlind = false, true, true
+	return &h
+}
+
+// SupersededAccepts lists the voters whose accepts in cert are signed with a
+// certificate the CA has replaced, as far as this node knows (a standing
+// successor it holds). They are the accepts a renewal took out of the count.
+func (v *ClaimVerifier) SupersededAccepts(cert ClaimCertificate) []string {
+	if v == nil {
+		return nil
+	}
+	for _, a := range cert.Accepts {
+		v.noteSuccessors(a.CertPEM)
+	}
+	var out []string
+	seen := map[string]bool{}
+	for _, a := range cert.Accepts {
+		c, err := parseCertPEM([]byte(a.CertPEM))
+		if err != nil || seen[a.Voter] {
+			continue
+		}
+		if pki.SupersededError(v.pkiDir, c) != nil {
+			seen[a.Voter] = true
+			out = append(out, a.Voter)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 // SerialPinDisabled reports whether WithoutSerialPin made v.
 func (v *ClaimVerifier) SerialPinDisabled() bool { return v != nil && v.noPin }
 
@@ -583,6 +632,9 @@ func (v *ClaimVerifier) Historical() *ClaimVerifier {
 // revoked reports whether c's certificate counts as revoked for this verifier.
 func (v *ClaimVerifier) revoked(c *x509.Certificate) bool {
 	if v.historical {
+		return false
+	}
+	if v.renewalBlind && pki.SupersededError(v.pkiDir, c) != nil {
 		return false
 	}
 	if v.extraRevoked[strings.ToLower(c.SerialNumber.Text(16))] {

@@ -5,6 +5,8 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
+	"fmt"
+	"io/fs"
 	"log/slog"
 	"path/filepath"
 	"strings"
@@ -52,10 +54,27 @@ type supersession struct {
 	successor *x509.Certificate
 }
 
+// maxSupersededBytes bounds superseded.pem: about ten thousand successors.
+const maxSupersededBytes = 16 << 20
+
+// supersededRetryEvery spaces the re-reads of an unreadable superseded.pem:
+// the store is consulted on every RPC.
+var supersededRetryEvery = 30 * time.Second
+
 type supersessionStore struct {
 	pkiDir string
 	mu     sync.Mutex
 	loaded bool
+	// fileRead: superseded.pem has been read (or is absent). Until it has,
+	// the file is never written: a write would replace evidence this node
+	// cannot see with only what it learned since. fileErr is the last read
+	// error, logged once per distinct error.
+	fileRead bool
+	fileErr  string
+	fileNext time.Time // no read retry before this
+	// unsaved: evidence held in memory that the file does not have yet.
+	unsaved bool
+
 	ca     *x509.Certificate
 	roots  *x509.CertPool
 	byPrev map[string][]supersession // predecessor serial (lower-case hex) -> successors seen
@@ -73,10 +92,12 @@ func supersessionsFor(pkiDir string) *supersessionStore {
 	return v.(*supersessionStore)
 }
 
-// loadLocked reads the CA and the evidence file once. A missing CA leaves the
-// store empty and retried on the next call; nothing can be verified without it.
+// loadLocked reads the CA once, and the evidence file until it has been read.
+// A missing CA leaves the store empty and retried on the next call; nothing
+// can be verified without it.
 func (s *supersessionStore) loadLocked() bool {
 	if s.loaded {
+		s.readFileLocked()
 		return true
 	}
 	if s.pkiDir == "" {
@@ -95,24 +116,55 @@ func (s *supersessionStore) loadLocked() bool {
 	s.byPrev, s.known = map[string][]supersession{}, map[string]bool{}
 	s.crl = newCRLChecker(s.pkiDir, ca)
 	s.loaded = true
-	if b, err := readBounded(filepath.Join(s.pkiDir, supersededFile)); err == nil {
-		for rest := b; ; {
-			var block *pem.Block
-			block, rest = pem.Decode(rest)
-			if block == nil {
-				break
-			}
-			if block.Type != "CERTIFICATE" {
-				continue
-			}
-			c, err := x509.ParseCertificate(block.Bytes)
-			if err != nil {
-				continue
-			}
-			s.addLocked(c) // re-verified: the file is evidence, not authority
+	s.readFileLocked()
+	return true
+}
+
+// readFileLocked merges superseded.pem into the store, once it can be read.
+// A file that does not exist yet is an empty one. Any other read error —
+// unreadable, not a regular file, oversized — fails CLOSED for the evidence:
+// the file is left exactly as it is and never written over (persistLocked
+// refuses until a read succeeds), what is learned meanwhile is kept in
+// memory, and the read is retried on the next call. When it succeeds the
+// file's evidence and the memory's are merged, and the union is written back.
+func (s *supersessionStore) readFileLocked() {
+	if s.fileRead || time.Now().Before(s.fileNext) {
+		return
+	}
+	path := filepath.Join(s.pkiDir, supersededFile)
+	b, err := readBoundedN(path, maxSupersededBytes)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		if err.Error() != s.fileErr {
+			s.fileErr = err.Error()
+			slog.Error("cannot read this node's record of replaced host certificates; it is left untouched and not "+
+				"written over, and new evidence is kept in memory until it can be read",
+				"file", path, "error", err)
+		}
+		s.fileNext = time.Now().Add(supersededRetryEvery)
+		return
+	}
+	s.fileRead, s.fileErr = true, ""
+	for rest := b; ; {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		c, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			continue
+		}
+		s.addLocked(c) // re-verified: the file is evidence, not authority
+	}
+	if s.unsaved {
+		if err := s.persistLocked(); err != nil {
+			slog.Warn("could not persist the proof that a host certificate was replaced; it is kept in memory",
+				"file", path, "error", err)
 		}
 	}
-	return true
 }
 
 // addLocked records c when it is a CA-issued host certificate naming a
@@ -167,6 +219,10 @@ func NoteSuccessor(pkiDir string, cert *x509.Certificate) bool {
 }
 
 func (s *supersessionStore) persistLocked() error {
+	s.unsaved = true
+	if !s.fileRead {
+		return fmt.Errorf("%s could not be read (%s); not writing over it", supersededFile, s.fileErr)
+	}
 	var buf bytes.Buffer
 	for _, list := range s.byPrev {
 		for _, e := range list {
@@ -175,7 +231,11 @@ func (s *supersessionStore) persistLocked() error {
 			}
 		}
 	}
-	return secretfile.Write(filepath.Join(s.pkiDir, supersededFile), buf.Bytes(), 0o644)
+	if err := secretfile.Write(filepath.Join(s.pkiDir, supersededFile), buf.Bytes(), 0o644); err != nil {
+		return err
+	}
+	s.unsaved = false
+	return nil
 }
 
 // SupersededBy reports the serial of a CA-issued successor of the certificate

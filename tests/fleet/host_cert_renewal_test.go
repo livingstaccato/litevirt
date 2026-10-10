@@ -92,7 +92,10 @@ func pushAs(t *testing.T, pkiDir, sender string, target *Node) error {
 //
 // Mutations: drop the RenewedFromSerial clause in grpcapi isTrustedHostCN —
 // step 1's push is refused (PermissionDenied); set Certificates statically in
-// pki.ServerTLSConfig — step 1 sees the old serial served.
+// pki.ServerTLSConfig — step 1 sees the old serial served; accept any
+// CA-issued host certificate whatever the recorded serial (isTrustedHostCN)
+// — step 2b's peer, which holds no proof of the renewal, accepts the
+// replaced certificate.
 func TestFleet_HostCertRenewalKeepsThePeerTrusted(t *testing.T) {
 	ctx := context.Background()
 	c := New(t, Options{Nodes: 3})
@@ -130,6 +133,28 @@ func TestFleet_HostCertRenewalKeepsThePeerTrusted(t *testing.T) {
 	}
 	if err := pushAs(t, a.PKIDir, a.Name, b); status.Code(err) == codes.PermissionDenied {
 		t.Fatalf("%s refused the renewed and recorded %s: %v", b.Name, a.Name, err)
+	}
+
+	// 2b. (re-review 3, m4) A peer that has NOT seen the successor — no
+	// handshake with the renewed certificate, so it holds no CA proof of the
+	// replacement — still refuses the old certificate as a peer, on the
+	// column pin alone (isTrustedHostCN: the recorded serial moved on, and
+	// the old certificate is not its successor). The row reaches it by
+	// replication through another node; here it is written straight into its
+	// database, which is what that delivery amounts to.
+	fresh := c.Nodes[2]
+	if _, ok := pki.SupersededBy(fresh.PKIDir, a.Name, oldSerial); ok {
+		t.Fatalf("fixture: %s already holds the proof that %s's certificate was replaced", fresh.Name, a.Name)
+	}
+	if _, err := corrosion.RecordOwnCertSerial(ctx, fresh.DB, a.Name, newSerial); err != nil {
+		t.Fatal(err)
+	}
+	if err := pushAs(t, oldDir, a.Name, fresh); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("%s, holding no proof of the renewal, accepted %s's REPLACED certificate after its record moved on: %v",
+			fresh.Name, a.Name, err)
+	}
+	if _, ok := pki.SupersededBy(fresh.PKIDir, a.Name, oldSerial); ok {
+		t.Fatalf("fixture: %s learned the successor during the check, so the column pin was not what refused", fresh.Name)
 	}
 
 	// 3. revocation of the old serial stops it at the handshake.

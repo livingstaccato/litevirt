@@ -40,10 +40,10 @@ now regardless, --keep-old not at all ('lv host revoke-cert' later). It refuses
 while hosts run different builds unless --force.
 
 A connection made with the old certificate accepts no new RPC once a node knows
-the certificate was replaced; its client reconnects with the new one. RPCs
-already in flight on it (a cold-disk migration, a backup push) are left up to
-15 minutes to finish, and a transfer still running then fails and must be
-re-run — renew outside long transfers.
+the certificate was replaced, revoked yet or not; its client reconnects with
+the new one. RPCs already in flight on it (a cold-disk migration, a backup
+push) are left up to 15 minutes to finish, and a transfer still running then
+fails and must be re-run — renew outside long transfers.
 
 Must run from the machine that holds the cluster CA private key (the one that
 ran 'lv host init'): there is no CSR flow. Peers on an older litevirt release do

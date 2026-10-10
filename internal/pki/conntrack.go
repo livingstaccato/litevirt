@@ -38,10 +38,15 @@ import (
 // connection superseded by a renewal — a cold-disk migration stream, a backup
 // push that started legitimately before it — and only until they finish or
 // StreamGrace runs out, whichever comes first; the connection is closed the
-// moment its last RPC ends. A REVOKED identity gets no grace at all: revocation
-// is the emergency path, and its connection is closed at once, in-flight RPCs
-// included. The tracker learns about RPCs through StatsHandler, which the
-// server must install alongside ServerCreds.
+// moment its last RPC ends. That holds whether or not the replaced certificate
+// has been revoked yet: `lv host renew-cert` revokes it at once, and a
+// certificate with a standing CA-issued successor (SupersededBy) was revoked
+// because it was renewed. A REVOKED identity with no successor gets no grace
+// at all: that revocation is the emergency path (`lv host rm`, `lv host
+// revoke-cert` of a live identity, a stolen key), and its connection is closed
+// at once (Verdict.Immediate), in-flight RPCs included. The judge decides
+// which; the tracker learns about RPCs through StatsHandler, which the server
+// must install alongside ServerCreds.
 type ConnTracker struct {
 	mu     sync.Mutex
 	conns  map[*trackedConn]struct{}
@@ -88,7 +93,8 @@ type Verdict struct {
 	// Close: the connection is no longer acceptable. It drains — no new RPC —
 	// and is closed once its RPCs in flight end, or after StreamGrace.
 	Close bool
-	// Immediate closes it at once, RPCs in flight included (revocation).
+	// Immediate closes it at once, RPCs in flight included (a revocation that
+	// is not a renewal's).
 	Immediate bool
 	Reason    string
 }

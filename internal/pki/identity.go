@@ -243,7 +243,10 @@ func KeyFileProblems(keyPath string) []string {
 }
 
 // readBounded reads a regular file of at most maxServingChainBytes.
-func readBounded(path string) ([]byte, error) {
+func readBounded(path string) ([]byte, error) { return readBoundedN(path, maxServingChainBytes) }
+
+// readBoundedN reads a regular file of at most limit bytes.
+func readBoundedN(path string, limit int) ([]byte, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -256,12 +259,12 @@ func readBounded(path string) ([]byte, error) {
 	if !fi.Mode().IsRegular() {
 		return nil, fmt.Errorf("%s is not a regular file", path)
 	}
-	b, err := io.ReadAll(io.LimitReader(f, maxServingChainBytes+1))
+	b, err := io.ReadAll(io.LimitReader(f, int64(limit)+1))
 	if err != nil {
 		return nil, err
 	}
-	if len(b) > maxServingChainBytes {
-		return nil, fmt.Errorf("%s is larger than %d bytes", path, maxServingChainBytes)
+	if len(b) > limit {
+		return nil, fmt.Errorf("%s is larger than %d bytes", path, limit)
 	}
 	return b, nil
 }

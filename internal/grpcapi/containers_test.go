@@ -19,6 +19,8 @@ import (
 // behaviour without standing up real LXC.
 type fakeCTRuntime struct {
 	mu          sync.Mutex
+	rebuilds    []fakeRebuild
+	hostAccess  map[string][]ContainerMountOpt
 	createCalls []CreateContainerOpts
 	startCalls  []string
 	stopCalls   []struct {

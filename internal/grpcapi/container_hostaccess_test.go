@@ -1,6 +1,7 @@
 package grpcapi
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -8,7 +9,6 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
-	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
@@ -31,16 +31,16 @@ func TestCreateContainer_HostAccessIsAdminOnlyAndGated(t *testing.T) {
 	if _, err := s.CreateContainer(ctOperatorCtx(), opOnlyDevice); status.Code(err) != codes.PermissionDenied {
 		t.Fatalf("operator with a device: %v; want PermissionDenied", err)
 	}
+	closePassthroughGate(s)
 	if _, err := s.CreateContainer(adminCtx(), hostAccessReq("c1")); status.Code(err) != codes.FailedPrecondition ||
-		!strings.Contains(err.Error(), usbMountsMemoryRefusalText) {
-		t.Fatalf("admin with the gate closed: %v; want the usb_mounts_memory refusal", err)
+		!strings.Contains(err.Error(), passthroughRefusalText) {
+		t.Fatalf("admin with the gate closed: %v; want the release refusal", err)
 	}
 	if len(rt.createCalls) != 0 {
 		t.Fatalf("a refused create reached the runtime: %+v", rt.createCalls)
 	}
 
-	s.SetUsbMountsMemory(true)
-	s.SetGate(fakeServerGate{enforcedTok: map[string]bool{capabilities.UsbMountsMemoryV1: true}})
+	enableUsbMountsMemory(s)
 	bad := hostAccessReq("c3")
 	bad.Mounts[0].HostPath = "/srv/data\nlxc.mount.entry = / host none bind 0 0"
 	if _, err := s.CreateContainer(adminCtx(), bad); status.Code(err) != codes.InvalidArgument {
@@ -80,4 +80,42 @@ func TestCloneContainer_HostAccessIsAdminOnly(t *testing.T) {
 	if _, err := s.CloneContainer(adminCtx(), &pb.CloneContainerRequest{Source: "m", Target: "m2", HostName: "host-a"}); err != nil {
 		t.Fatalf("admin clone: %v", err)
 	}
+}
+
+// fakeRebuild is one RebuildContainerConfig the fake runtime was asked for.
+type fakeRebuild struct {
+	name string
+	cfg  AuthorizedContainerConfig
+}
+
+func (f *fakeCTRuntime) RebuildContainerConfig(_ context.Context, name string, cfg AuthorizedContainerConfig) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rebuilds = append(f.rebuilds, fakeRebuild{name, cfg})
+	if f.hostAccess == nil {
+		f.hostAccess = map[string][]ContainerMountOpt{}
+	}
+	f.hostAccess[name] = cfg.Mounts
+	return nil
+}
+
+func (f *fakeCTRuntime) SetContainerHostAccess(_ context.Context, name string, mounts []ContainerMountOpt, _ []ContainerDeviceOpt) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.hostAccess == nil {
+		f.hostAccess = map[string][]ContainerMountOpt{}
+	}
+	f.hostAccess[name] = mounts
+	return nil
+}
+
+func (f *fakeCTRuntime) lastRebuild(name string) (fakeRebuild, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := len(f.rebuilds) - 1; i >= 0; i-- {
+		if f.rebuilds[i].name == name {
+			return f.rebuilds[i], true
+		}
+	}
+	return fakeRebuild{}, false
 }

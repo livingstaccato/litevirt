@@ -2,6 +2,9 @@ package grpcapi
 
 import (
 	"context"
+	"log/slog"
+	"path/filepath"
+	"reflect"
 	"strings"
 
 	"google.golang.org/grpc/codes"
@@ -28,18 +31,39 @@ const hostAccessDenied = "bind-mounting a host path or passing a host device int
 // containerHostAccessRequest is a create's check of the mounts and devices it
 // asks for: the admin role, the usb_mounts_memory_v1 gate, and paths that can
 // be judged at all. The owning host judges them against its allowed prefixes.
-func (s *Server) containerHostAccessRequest(ctx context.Context, mounts []*pb.ContainerMount, devices []*pb.ContainerDevice) error {
+func (s *Server) containerHostAccessRequest(ctx context.Context, host string, mounts []*pb.ContainerMount, devices []*pb.ContainerDevice) error {
 	if len(mounts) == 0 && len(devices) == 0 {
 		return nil
 	}
 	if err := RequireRole(ctx, "admin"); err != nil {
 		return status.Error(codes.PermissionDenied, hostAccessDenied)
 	}
-	if !s.usbMountsMemoryActive(ctx) {
-		return usbMountsMemoryRefusal("container host mounts and devices")
+	if !s.passthroughFeaturesActive(ctx) {
+		return passthroughRefusal("container host mounts and devices")
 	}
 	if err := lxc.CheckHostAccessShape(lxcMountsFromPb(mounts), lxcDevicesFromPb(devices)); err != nil {
 		return status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	// Nothing litevirt already uses on the target host — a VM disk, a pool's
+	// device or directory — is handed to a container as well.
+	if host == "" {
+		host = s.hostName
+	}
+	var paths []string
+	for _, m := range mounts {
+		paths = append(paths, m.GetHostPath())
+	}
+	for _, d := range devices {
+		paths = append(paths, d.GetHostPath())
+	}
+	for _, p := range paths {
+		user, err := corrosion.HostPathInUse(ctx, s.db, host, filepath.Clean(p))
+		if err != nil {
+			return status.Errorf(codes.Internal, "check what uses %s on %s: %v", p, host, err)
+		}
+		if user != "" {
+			return status.Errorf(codes.FailedPrecondition, "%s on %s is %s; it is never also passed into a container", p, host, user)
+		}
 	}
 	return nil
 }
@@ -114,6 +138,106 @@ func hostAccessAudit(mounts []*pb.ContainerMount, devices []*pb.ContainerDevice)
 		parts = append(parts, "device="+d.GetHostPath())
 	}
 	return strings.Join(parts, " ")
+}
+
+// hostAccessRebuilder is the runtime half that makes a container's config
+// litevirt's own again from what was authorized (lxc.LxcRunner.RebuildConfig
+// through the adapter): security rendered from the confinement and id range,
+// host access from the mounts and devices, nothing kept from an archive.
+type hostAccessRebuilder interface {
+	RebuildContainerConfig(ctx context.Context, name string, cfg AuthorizedContainerConfig) error
+}
+
+// AuthorizedContainerConfig is what a rebuilt container config is rendered from.
+type AuthorizedContainerConfig struct {
+	Confinement string
+	IDMapBase   int64
+	Mounts      []ContainerMountOpt
+	Devices     []ContainerDeviceOpt
+}
+
+// rebuildContainerConfig renders name's config from the authorized spec cs.
+// The security is cs's; where cs records none (an earlier build's
+// container), what the config holds now — set by litevirt's own convert — is
+// kept, and so is an id range the config holds that cs does not: neither is
+// ever loosened by a rebuild. A runtime that cannot rebuild refuses, unless
+// there is nothing to render.
+func (s *Server) rebuildContainerConfig(ctx context.Context, name string, cs corrosion.ContainerCreateSpec) error {
+	rb, ok := s.containerRuntime.(hostAccessRebuilder)
+	if !ok {
+		if len(cs.Mounts) > 0 || len(cs.Devices) > 0 {
+			return status.Error(codes.Unavailable, "this host's container runtime cannot render host mounts")
+		}
+		return nil
+	}
+	cfg := AuthorizedContainerConfig{Confinement: cs.Confinement, IDMapBase: cs.IDMapBase}
+	if sc, ok := s.containerRuntime.(containerSecurer); ok {
+		if cur, err := sc.ContainerSecurity(name); err == nil {
+			if cfg.Confinement == "" {
+				cfg.Confinement = cur.Confinement
+			}
+			if cfg.IDMapBase == 0 && cur.IDMap != nil {
+				cfg.IDMapBase = cur.IDMap.Base
+			}
+		}
+	}
+	cfg.Mounts, cfg.Devices = hostAccessOpts(cs)
+	if err := rb.RebuildContainerConfig(ctx, name, cfg); err != nil {
+		return status.Errorf(codes.Internal, "render %q's config from its authorized spec: %v", name, err)
+	}
+	return nil
+}
+
+// sameHostAccess reports whether two specs carry the same mounts and devices.
+func sameHostAccess(a, b corrosion.ContainerCreateSpec) bool {
+	return reflect.DeepEqual(a.Mounts, b.Mounts) && reflect.DeepEqual(a.Devices, b.Devices)
+}
+
+// withoutHostAccess returns cs without its mounts and devices, and a
+// description of what was dropped ("" when nothing was).
+func withoutHostAccess(cs corrosion.ContainerCreateSpec) (corrosion.ContainerCreateSpec, string) {
+	if len(cs.Mounts) == 0 && len(cs.Devices) == 0 {
+		return cs, ""
+	}
+	mounts, devices := pbHostAccess(cs)
+	what := hostAccessAudit(mounts, devices)
+	cs.Mounts, cs.Devices = nil, nil
+	return cs, what
+}
+
+// authorizeRestoredHostAccess decides which host mounts and devices a
+// restored container may carry. They come from a backup's create spec, which
+// grants nothing on its own:
+//   - an operator restore keeps them only for a caller with the admin role,
+//     while the release gate is open;
+//   - a peer-driven relocation or cold migration keeps them only when they
+//     are exactly what the SOURCE ROW (replicated, admin-authorized) records.
+//
+// Anything else is stripped; stripped describes what, for the audit row and
+// the admin who re-applies them (lv ct convert --mount/--device).
+func (s *Server) authorizeRestoredHostAccess(ctx context.Context, cs corrosion.ContainerCreateSpec, source *corrosion.ContainerRecord, peer bool) (corrosion.ContainerCreateSpec, string) {
+	if len(cs.Mounts) == 0 && len(cs.Devices) == 0 {
+		return cs, ""
+	}
+	if peer {
+		if source != nil && sameHostAccess(cs, corrosion.DecodeCreateSpec(source.CreateSpec)) {
+			return cs, ""
+		}
+		return withoutHostAccess(cs)
+	}
+	if RequireRole(ctx, "admin") == nil && s.passthroughFeaturesActive(ctx) {
+		return cs, ""
+	}
+	return withoutHostAccess(cs)
+}
+
+// noteStrippedHostAccess records host access a restore or clone did not carry.
+func (s *Server) noteStrippedHostAccess(ctx context.Context, action, name, stripped string) {
+	if stripped == "" {
+		return
+	}
+	slog.Warn("container: host mounts/devices were not carried; an admin re-applies them with lv ct convert", "container", name, "action", action, "stripped", stripped)
+	s.audit(ctx, action, name, "host access not carried (an admin re-applies it with lv ct convert --mount/--device): "+stripped, "ok")
 }
 
 // cloneHostAccessAllowed refuses a non-admin clone of a container with host

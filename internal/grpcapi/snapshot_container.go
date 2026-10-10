@@ -296,6 +296,12 @@ func (s *Server) RevertContainerSnapshot(ctx context.Context, req *pb.RevertCont
 		s.audit(ctx, "ct.snapshot.revert", req.Name, "project="+project, "error")
 		return nil, err
 	}
+	// The snapshot is a past state of the config: render it from the row's
+	// authorized spec instead (host access included), as a restore does.
+	if err := s.rebuildContainerConfig(ctx, rec.Name, corrosion.DecodeCreateSpec(rec.CreateSpec)); err != nil {
+		s.audit(ctx, "ct.snapshot.revert", req.Name, "project="+project, "error")
+		return nil, err
+	}
 	if wasRunning {
 		if err := s.refuseOverlappingRange(ctx, req.Name); err != nil {
 			s.audit(ctx, "ct.snapshot.revert", req.Name, "project="+project+" (restart refused: id range overlap)", "error")

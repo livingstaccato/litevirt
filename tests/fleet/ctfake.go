@@ -76,6 +76,60 @@ type CTFake struct {
 
 	ensureIDRangeErr error
 	ensuredRanges    []int64
+
+	// access is the host-access policy the real lxc renderer judges mounts
+	// and devices against (SetHostAccessPolicy).
+	access lxc.HostAccess
+}
+
+// SetHostAccessPolicy sets the containers.bind_mount_paths / device_paths
+// this node's runtime judges host access against.
+func (f *CTFake) SetHostAccessPolicy(a lxc.HostAccess) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.access = a
+}
+
+// runner is the REAL lxc config renderer over this fake's on-disk containers:
+// rebuilds and host access run the production code on the fake's configs.
+func (f *CTFake) runner() *lxc.LxcRunner {
+	return &lxc.LxcRunner{Lxcpath: f.root, HostAccess: f.access}
+}
+
+// Config reads back a container's config ("" if absent).
+func (f *CTFake) Config(name string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	b, _ := os.ReadFile(filepath.Join(f.dir(name), "config"))
+	return string(b)
+}
+
+func (f *CTFake) RebuildContainerConfig(_ context.Context, name string, cfg grpcapi.AuthorizedContainerConfig) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.runner().RebuildConfig(name, cfg.Confinement, cfg.IDMapBase, fakeMounts(cfg.Mounts), fakeDevices(cfg.Devices))
+}
+
+func (f *CTFake) SetContainerHostAccess(_ context.Context, name string, mounts []grpcapi.ContainerMountOpt, devices []grpcapi.ContainerDeviceOpt) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.runner().SetHostAccess(name, fakeMounts(mounts), fakeDevices(devices))
+}
+
+func fakeMounts(in []grpcapi.ContainerMountOpt) []lxc.Mount {
+	var out []lxc.Mount
+	for _, m := range in {
+		out = append(out, lxc.Mount{HostPath: m.HostPath, ContainerPath: m.ContainerPath, ReadWrite: m.ReadWrite})
+	}
+	return out
+}
+
+func fakeDevices(in []grpcapi.ContainerDeviceOpt) []lxc.Device {
+	var out []lxc.Device
+	for _, d := range in {
+		out = append(out, lxc.Device{HostPath: d.HostPath, ContainerPath: d.ContainerPath})
+	}
+	return out
 }
 
 // NewCTFake returns a container runtime rooted at dir. The directory is
@@ -448,6 +502,11 @@ func (f *CTFake) ImportContainer(_ context.Context, name string, r io.Reader) er
 	if err := extractTar(r, base); err != nil {
 		return err
 	}
+	// As the real runtime does: an imported config keeps only what litevirt
+	// writes, and an imported host-access record authorizes nothing.
+	if err := lxc.SanitizeImportedDir(base); err != nil {
+		return err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.state[name] = "stopped"
@@ -651,4 +710,11 @@ func (f *CTFake) EnsureContainerIDRange(base, size int64) error {
 	}
 	f.ensuredRanges = append(f.ensuredRanges, base)
 	return nil
+}
+
+// CreateCalls returns the CreateContainer requests this runtime received.
+func (f *CTFake) CreateCalls() []grpcapi.CreateContainerOpts {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]grpcapi.CreateContainerOpts(nil), f.createCalls...)
 }

@@ -279,6 +279,14 @@ func (s *Server) ConvertContainer(ctx context.Context, req *pb.ConvertContainerR
 	if err != nil {
 		return nil, err
 	}
+	// Host mounts and devices are the admin's to grant: judged HERE, as the
+	// caller, before the forward (the owner runs a forwarded call as the peer).
+	if req.SetHostAccess {
+		if err := s.containerHostAccessRequest(ctx, host, req.Mounts, req.Devices); err != nil {
+			s.audit(ctx, "ct.convert", req.Name, hostAccessAudit(req.Mounts, req.Devices), "denied")
+			return nil, err
+		}
+	}
 	if host != s.hostName {
 		c, closer, derr := s.dialPeer(ctx, host)
 		if derr != nil {
@@ -312,9 +320,14 @@ func (s *Server) ConvertContainer(ctx context.Context, req *pb.ConvertContainerR
 			"container %q must be stopped to convert (lv ct stop %s); it is %s", req.Name, req.Name, got)
 	}
 	spec := corrosion.DecodeCreateSpec(rec.CreateSpec)
+	if req.SetHostAccess && !req.Unprivileged && req.Confinement == "" {
+		if cur, cerr := sc.ContainerSecurity(req.Name); cerr != nil || !cur.Converting {
+			return s.setContainerHostAccess(ctx, rec, project, req.Mounts, req.Devices)
+		}
+	}
 	if !req.Unprivileged && req.Confinement == "" {
 		if cur, cerr := sc.ContainerSecurity(req.Name); cerr != nil || !cur.Converting {
-			return nil, status.Error(codes.InvalidArgument, "nothing to convert: pass --unprivileged and/or --confinement")
+			return nil, status.Error(codes.InvalidArgument, "nothing to convert: pass --unprivileged, --confinement, or --mount/--device/--clear-host-access")
 		}
 	}
 	to := lxc.ConvertOpts{Confinement: req.Confinement}
@@ -355,6 +368,44 @@ func (s *Server) ConvertContainer(ctx context.Context, req *pb.ConvertContainerR
 		return nil, status.Errorf(codes.Internal, "converted, but recording it failed (lv ct inspect may show the old settings): %v", err)
 	}
 	s.audit(ctx, "ct.convert", req.Name, fmt.Sprintf("project=%s idmap_base=%d confinement=%s", project, spec.IDMapBase, spec.Confinement), "ok")
+	if req.SetHostAccess {
+		return s.setContainerHostAccess(ctx, rec, project, req.Mounts, req.Devices)
+	}
+	return toPbContainer(*rec), nil
+}
+
+// hostAccessSetter is the runtime half of lv ct convert --mount/--device
+// (lxc.LxcRunner.SetHostAccess through the adapter).
+type hostAccessSetter interface {
+	SetContainerHostAccess(ctx context.Context, name string, mounts []ContainerMountOpt, devices []ContainerDeviceOpt) error
+}
+
+// setContainerHostAccess replaces a stopped container's host mounts and
+// devices, already authorized by the caller (ConvertContainer judged them
+// before any forward): the runtime records and renders them, judged against
+// this host, then the row records them.
+func (s *Server) setContainerHostAccess(ctx context.Context, rec *corrosion.ContainerRecord, project string, mounts []*pb.ContainerMount, devices []*pb.ContainerDevice) (*pb.Container, error) {
+	hs, ok := s.containerRuntime.(hostAccessSetter)
+	if !ok {
+		return nil, status.Error(codes.Unavailable, "this host's container runtime cannot render host mounts")
+	}
+	specMounts, specDevices := hostAccessSpec(mounts, devices)
+	optMounts, optDevices := hostAccessOpts(corrosion.ContainerCreateSpec{Mounts: specMounts, Devices: specDevices})
+	if err := hs.SetContainerHostAccess(ctx, rec.Name, optMounts, optDevices); err != nil {
+		s.audit(ctx, "ct.convert", rec.Name, hostAccessAudit(mounts, devices), "error")
+		return nil, status.Errorf(codes.FailedPrecondition, "set host access of %q: %v", rec.Name, err)
+	}
+	spec := corrosion.DecodeCreateSpec(rec.CreateSpec)
+	spec.Mounts, spec.Devices = specMounts, specDevices
+	rec.CreateSpec = corrosion.EncodeCreateSpec(spec)
+	if err := corrosion.UpsertContainer(ctx, s.db, *rec); err != nil {
+		return nil, status.Errorf(codes.Internal, "host access set, but recording it failed: %v", err)
+	}
+	detail := hostAccessAudit(mounts, devices)
+	if detail == "" {
+		detail = "host access cleared"
+	}
+	s.audit(ctx, "ct.convert", rec.Name, "project="+project+" "+detail, "ok")
 	return toPbContainer(*rec), nil
 }
 

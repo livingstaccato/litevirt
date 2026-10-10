@@ -1068,6 +1068,36 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 		}
 		spec.CreateSpec = remapped
 	}
+	// Host mounts and devices come from the backup's create spec, which grants
+	// nothing: kept only for an admin's operator restore, or for a peer-driven
+	// move whose SOURCE ROW authorized exactly them; stripped otherwise, and
+	// said so. Then the config is rendered from the authorized spec — nothing
+	// in the archive's config is trusted (the import already dropped every line
+	// that grants host access or overrides confinement).
+	{
+		var source *corrosion.ContainerRecord
+		if migrateSource != "" {
+			source, _ = corrosion.GetContainer(ctx, s.db, migrateSource, req.Name)
+		} else if peerRelocation {
+			token := relocateTokenFromMD(ctx)
+			if token == "" && req.Proof != nil {
+				token = req.Proof.GetRelocationToken()
+			}
+			source, _ = s.relocatingContainer(ctx, req.Name, s.hostName, token)
+		}
+		authorized, stripped := s.authorizeRestoredHostAccess(ctx, corrosion.DecodeCreateSpec(spec.CreateSpec), source, !operatorRestore)
+		if stripped != "" {
+			spec.CreateSpec = corrosion.EncodeCreateSpec(authorized)
+		}
+		if err := s.rebuildContainerConfig(ctx, req.Name, authorized); err != nil {
+			if delErr := s.containerRuntime.DeleteContainer(ctx, req.Name); delErr != nil {
+				slog.Warn("container restore: cleanup after the config rebuild failed also failed", "name", req.Name, "error", delErr)
+			}
+			s.removeRestoreMarker(req.Name)
+			return err
+		}
+		s.noteStrippedHostAccess(ctx, "ct.restore", req.Name, stripped)
+	}
 	stateDetail := ""
 	if !req.Start {
 		stateDetail = spec.StateDetail

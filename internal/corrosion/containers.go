@@ -185,7 +185,7 @@ type ContainerCreateSpec struct {
 	// container at create. They are also in its LXC config, which travels
 	// with it; these let a relocation recreate them (judged again by the
 	// recreating host) and let any node report them. Setting them is gated
-	// on usb_mounts_memory_v1, so no older peer rewrites a spec holding them.
+	// on the release gate, so no older peer rewrites a spec holding them.
 	Mounts  []ContainerHostMount  `json:"mounts,omitempty"`
 	Devices []ContainerHostDevice `json:"devices,omitempty"`
 }
@@ -1402,4 +1402,33 @@ func decodeContainerLabels(raw string) map[string]string {
 // said so. Every decision about whether a host can run a container uses it.
 func HostRunsContainers(h HostRecord) bool {
 	return h.Labels[LabelLXCCapable] == "true"
+}
+
+// HostPathInUse reports what of litevirt's on host already uses path — a VM
+// disk, or a storage pool's source or target — so it is never also handed to
+// a container as a host mount or device. "" when nothing does.
+func HostPathInUse(ctx context.Context, c *Client, host, path string) (string, error) {
+	rows, err := c.Query(ctx,
+		`SELECT vm_name FROM vm_disks WHERE host_name = ? AND path = ? AND deleted_at IS NULL LIMIT 1`, host, path)
+	if err != nil {
+		return "", err
+	}
+	if len(rows) > 0 {
+		return "the disk of VM " + rows[0].String("vm_name"), nil
+	}
+	pools, err := ListStoragePoolsForHost(ctx, c, host)
+	if err != nil {
+		return "", err
+	}
+	for _, p := range pools {
+		for _, pp := range []string{p.Source, p.Target} {
+			if pp == "" || !strings.HasPrefix(pp, "/") {
+				continue
+			}
+			if path == pp || strings.HasPrefix(path, strings.TrimSuffix(pp, "/")+"/") || strings.HasPrefix(pp, strings.TrimSuffix(path, "/")+"/") {
+				return "storage pool " + p.Name, nil
+			}
+		}
+	}
+	return "", nil
 }

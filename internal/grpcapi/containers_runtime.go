@@ -203,3 +203,27 @@ func lxcDevices(in []ContainerDeviceOpt) []lxc.Device {
 	}
 	return out
 }
+
+// RebuildContainerConfig renders a container's config from what was
+// authorized (lxc.LxcRunner.RebuildConfig).
+func (a *LXCRuntimeAdapter) RebuildContainerConfig(_ context.Context, name string, cfg AuthorizedContainerConfig) error {
+	rb, ok := a.Inner.(interface {
+		RebuildConfig(name, confinement string, idmapBase int64, mounts []lxc.Mount, devices []lxc.Device) error
+	})
+	if !ok {
+		return errors.New("this container runtime cannot render a container's config")
+	}
+	return rb.RebuildConfig(name, cfg.Confinement, cfg.IDMapBase, lxcMounts(cfg.Mounts), lxcDevices(cfg.Devices))
+}
+
+// SetContainerHostAccess records and renders a container's authorized host
+// access (lxc.LxcRunner.SetHostAccess).
+func (a *LXCRuntimeAdapter) SetContainerHostAccess(_ context.Context, name string, mounts []ContainerMountOpt, devices []ContainerDeviceOpt) error {
+	sh, ok := a.Inner.(interface {
+		SetHostAccess(name string, mounts []lxc.Mount, devices []lxc.Device) error
+	})
+	if !ok {
+		return errors.New("this container runtime cannot render host mounts")
+	}
+	return sh.SetHostAccess(name, lxcMounts(mounts), lxcDevices(devices))
+}

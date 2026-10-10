@@ -1255,6 +1255,12 @@ message ConvertContainerRequest {
     string name = 2;
     bool unprivileged = 3;
     string confinement = 4;
+    // set_host_access replaces the container's host bind mounts and device
+    // nodes with mounts/devices (empty clears them): how an admin re-applies
+    // what a restore did not carry. Adding any needs the admin role.
+    bool set_host_access = 5;
+    repeated ContainerMount  mounts  = 6;
+    repeated ContainerDevice devices = 7;
 }
 
 message StartContainerRequest  { string host_name = 1; string name = 2; }

@@ -87,7 +87,7 @@ func (s *Server) authorizeContainerCreate(ctx context.Context, req *pb.CreateCon
 		s.audit(ctx, "ct.create", req.Name, fmt.Sprintf("privileged=%v confinement=%s", req.Privileged, req.Confinement), "denied")
 		return err
 	}
-	if err := s.containerHostAccessRequest(ctx, req.Mounts, req.Devices); err != nil {
+	if err := s.containerHostAccessRequest(ctx, req.HostName, req.Mounts, req.Devices); err != nil {
 		s.audit(ctx, "ct.create", req.Name, hostAccessAudit(req.Mounts, req.Devices), "denied")
 		return err
 	}

@@ -17,6 +17,7 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/image"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
+	"github.com/litevirt/litevirt/internal/lxc"
 	"github.com/litevirt/litevirt/internal/obs"
 )
 
@@ -273,15 +274,16 @@ func (c ContainersConfig) validate() error {
 	if c.IDMapRanges <= 0 {
 		return fmt.Errorf("config containers.idmap_ranges: %d, want at least 1", c.IDMapRanges)
 	}
-	for _, p := range c.BindMountPaths {
-		if !filepath.IsAbs(p) {
-			return fmt.Errorf("config containers.bind_mount_paths: %q is not an absolute path", p)
-		}
-	}
-	for _, p := range c.DevicePaths {
-		if !filepath.IsAbs(p) || !(filepath.Clean(p) == "/dev" || strings.HasPrefix(filepath.Clean(p), "/dev/")) {
-			return fmt.Errorf("config containers.device_paths: %q is not a path under /dev", p)
-		}
+	return nil
+}
+
+// validateHostAccess refuses allowed host paths a host must not run with: a
+// bind-mount prefix that is, lies in, or contains a protected tree (so never
+// "/"; litevirt's own data and PKI directories among them), and a device entry
+// that is not an exact, permitted node under /dev.
+func (c ContainersConfig) validateHostAccess(dataDir, pkiDir string) error {
+	if err := lxc.ValidateHostAccess(c.hostAccess(dataDir, pkiDir)); err != nil {
+		return fmt.Errorf("config %w", err)
 	}
 	// The ranges must leave the host's own ids (0-65535) alone and fit in 32
 	// bits (4294967295 is the kernel's invalid id).
@@ -522,12 +524,6 @@ type EnforcementConfig struct {
 	// latched cluster-wide (every peer must support it, else the field could be
 	// dropped by an old peer's spec rewrite). Default false; reversible kill switch.
 	LiveResize bool `yaml:"live_resize,omitempty"`
-	// UsbMountsMemory: allow USB passthrough, virtio-mem memory hot-add and
-	// container host bind mounts / device nodes to be SET. Refused until the
-	// usb_mounts_memory_v1 capability is latched cluster-wide (an old peer
-	// would drop the fields from a spec it rewrites). Default false; reversible
-	// kill switch — a workload that already has them keeps them.
-	UsbMountsMemory bool `yaml:"usb_mounts_memory,omitempty"`
 	// DigestV2: emit the order-invariant anti-entropy row digest (digest_v2) so
 	// column-order-only differences (fresh CREATE vs ALTER ADD COLUMN) stop showing as
 	// row-content divergence + perpetual no-op merges. Negotiated PAIRWISE by wire-field
@@ -842,6 +838,9 @@ func LoadConfig() (*Config, error) {
 	}
 
 	if err := cfg.Containers.validate(); err != nil {
+		return nil, err
+	}
+	if err := cfg.Containers.validateHostAccess(cfg.DataDir, cfg.PKIDir); err != nil {
 		return nil, err
 	}
 
@@ -1168,4 +1167,19 @@ func orDefault[T interface{ ~int | ~float64 }](v, d T) T {
 		return d
 	}
 	return v
+}
+
+// hostAccess is what this host lets containers reach, with litevirt's own
+// directories protected.
+func (c ContainersConfig) hostAccess(dataDir, pkiDir string) lxc.HostAccess {
+	exe, _ := os.Executable()
+	if r, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = r
+	}
+	return lxc.HostAccess{
+		MountPaths:  c.BindMountPaths,
+		DevicePaths: c.DevicePaths,
+		Deny:        []string{dataDir, pkiDir},
+		HookBinary:  exe,
+	}
 }

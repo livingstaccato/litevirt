@@ -657,10 +657,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	lxcRunner.HostName = d.cfg.HostName
 	lxcRunner.DefaultPidsMax = d.cfg.Containers.DefaultPidsMax
 	lxcRunner.IDMappedRootfs = d.cfg.Containers.IDMappedRootfs
-	lxcRunner.HostAccess = lxc.HostAccess{
-		MountPaths:  d.cfg.Containers.BindMountPaths,
-		DevicePaths: d.cfg.Containers.DevicePaths,
-	}
+	lxcRunner.HostAccess = d.cfg.Containers.hostAccess(d.cfg.DataDir, d.cfg.PKIDir)
 	lxcRunner.SubIDSpan = &lxc.IDMap{Base: d.cfg.Containers.IDMapBase, Size: int64(d.cfg.Containers.IDMapRanges) * lxc.IDMapSize}
 	d.metrics = metrics.NewServer(d.cfg.MetricsPort, d.cfg.MetricsBind, d.db, d.virt, lxcRunner, d.cfg.HostName)
 	d.metrics.SetReplicationTargets(repl.Targets)
@@ -957,7 +954,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetOperationProtocol(d.cfg.Enforcement.OperationProtocol)
 	svc.SetDefaultCPUMode(d.cfg.VM.DefaultCPUMode)
 	svc.SetLiveResize(d.cfg.Enforcement.LiveResize)
-	svc.SetUsbMountsMemory(d.cfg.Enforcement.UsbMountsMemory)
 	svc.SetAllowUnencryptedStorageMigration(d.cfg.Migration.AllowUnencryptedStorage)
 	migrationTLS := d.migrationTLSInstaller()
 	svc.SetMigrationTLS(migrationTLS)

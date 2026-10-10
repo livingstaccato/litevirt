@@ -116,6 +116,15 @@ func (s *Server) CloneContainer(ctx context.Context, req *pb.CloneContainerReque
 		s.audit(ctx, "ct.clone", req.Target, "project="+project, "denied")
 		return nil, err
 	}
+	// The clone holds its source's host mounts and devices, which only the
+	// admin role grants. Judged HERE, as the caller, before the forward: the
+	// source's host runs a forwarded call as the peer, which must never be
+	// what grants it. That host strips any host access the clone's
+	// authorized spec does not carry (rebuildContainerConfig).
+	if err := cloneHostAccessAllowed(ctx, *src); err != nil {
+		s.audit(ctx, "ct.clone", req.Target, "source="+req.Source+" host mounts/devices", "denied")
+		return nil, err
+	}
 	// The clone is created where the source's rootfs lives.
 	if host != s.hostName {
 		c, conn, derr := s.peerClient(ctx, host)
@@ -128,11 +137,6 @@ func (s *Server) CloneContainer(ctx context.Context, req *pb.CloneContainerReque
 	}
 	if s.containerRuntime == nil {
 		return nil, status.Error(codes.Unavailable, "container runtime not wired on this host")
-	}
-	// The clone holds its source's host mounts and devices: admin only.
-	if err := cloneHostAccessAllowed(ctx, *src); err != nil {
-		s.audit(ctx, "ct.clone", req.Target, "source="+req.Source+" host mounts/devices", "denied")
-		return nil, err
 	}
 	// Consistent rootfs: clone a template or a stopped container (a running
 	// container's rootfs isn't quiescent). Mirrors CloneVM.
@@ -236,6 +240,16 @@ func (s *Server) CloneContainer(ctx context.Context, req *pb.CloneContainerReque
 	cloneSpec.OwnerID = randid.New()
 	cloneSpec.RestoredFromOwnerID, cloneSpec.RestoredFromTS = "", ""
 	cloneSpec.IDMapBase = cloneBase
+	// The copied config is rendered again from the clone's spec: host access
+	// the source's spec records (judged admin-only before the forward) is
+	// carried; a managed block the spec does not record — a restored or
+	// earlier container's — is not.
+	if err := s.rebuildContainerConfig(ctx, req.Target, cloneSpec); err != nil {
+		if delErr := s.containerRuntime.DeleteContainer(ctx, req.Target); delErr != nil {
+			slog.Warn("container clone: cleanup after the config rebuild failed also failed", "name", req.Target, "error", delErr)
+		}
+		return nil, err
+	}
 	s.stampContainerOwner(req.Target, project, corrosion.EncodeCreateSpec(cloneSpec))
 	rec := corrosion.ContainerRecord{
 		HostName: s.hostName, Name: req.Target, State: "stopped",

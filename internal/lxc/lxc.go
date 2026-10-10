@@ -204,10 +204,6 @@ type CreateOpts struct {
 	// the caller has already required the admin role.
 	Mounts  []Mount
 	Devices []Device
-
-	// resolved by Create before anything is written (resolveHostAccess).
-	resolvedMounts  []resolvedMount
-	resolvedDevices []resolvedDevice
 }
 
 // Validate checks cross-field invariants before any shell-out.
@@ -328,11 +324,9 @@ func (r *LxcRunner) Create(ctx context.Context, opts CreateOpts) (*Container, er
 	// Host mounts and devices are judged before anything is created, so a
 	// refusal leaves nothing behind.
 	if len(opts.Mounts) > 0 || len(opts.Devices) > 0 {
-		rm, rd, err := ResolveHostAccess(opts.Mounts, opts.Devices, r.HostAccess)
-		if err != nil {
+		if _, _, err := ResolveHostAccess(opts.Mounts, opts.Devices, r.hostAccess()); err != nil {
 			return nil, fmt.Errorf("container %q: %w", opts.Name, err)
 		}
-		opts.resolvedMounts, opts.resolvedDevices = rm, rd
 	}
 	if opts.Template != "download" {
 		rootfs, ok, err := resolveRootfs(opts.Template)
@@ -817,6 +811,14 @@ func (r *LxcRunner) importContainerMarked(ctx context.Context, name string, src 
 	if err := rewriteRootFSPathAt(staged, filepath.Join(dir, "rootfs")); err != nil {
 		return err
 	}
+	// The archive is untrusted: its config keeps only what litevirt itself
+	// writes (no mounts, hooks, foreign includes, device rules or confinement
+	// overrides), and its authorized host-access record is not an
+	// authorization here. The caller renders security and host access again
+	// from the authorized spec (RebuildConfig).
+	if err := SanitizeImportedDir(staged); err != nil {
+		return err
+	}
 	if b, rerr := os.ReadFile(filepath.Join(staged, "config")); rerr == nil {
 		if sec := parseSecurity(string(b)); sec.IDMap != nil {
 			if err := r.ensureRootSubIDs(sec.IDMap); err != nil {
@@ -1176,10 +1178,16 @@ func (r *LxcRunner) finalizeContainerConfig(opts CreateOpts) error {
 		cfg += fmt.Sprintf("%s = %d\n", pidsMaxKey, opts.PidsMax)
 	}
 	cfg = withSecurityBlock(cfg, renderSecurityBlock(opts.Confinement, opts.IDMap, opts.IDMap != nil && r.useIDMappedMount()))
-	cfg = withHostAccessBlock(cfg, renderHostAccessBlock(opts.resolvedMounts, opts.resolvedDevices))
 
 	if err := os.WriteFile(path, []byte(cfg), 0o644); err != nil {
 		return err
+	}
+	// Host mounts and devices, recorded as authorized and rendered (the
+	// caller required the admin role; Create judged them already).
+	if len(opts.Mounts) > 0 || len(opts.Devices) > 0 {
+		if err := r.SetHostAccess(opts.Name, opts.Mounts, opts.Devices); err != nil {
+			return err
+		}
 	}
 	// When a static IP is requested, configure the guest's own networking too —
 	// otherwise the stock image's boot-time DHCP client flushes the address LXC
@@ -1508,4 +1516,33 @@ func securityDiffers(sec Security, to ConvertOpts) bool {
 		return true
 	}
 	return to.Confinement != "" && to.Confinement != sec.Confinement
+}
+
+// SanitizeImportedDir strips an imported container directory's config to
+// what an imported config may keep and removes its host-access record.
+func SanitizeImportedDir(dir string) error {
+	cfgPath := filepath.Join(dir, "config")
+	b, err := os.ReadFile(cfgPath)
+	if errors.Is(err, fs.ErrNotExist) {
+		b = nil // nothing to sanitize; the record still goes
+	} else if err != nil {
+		return fmt.Errorf("read imported config: %w", err)
+	}
+	if b == nil {
+		if err := os.Remove(filepath.Join(dir, hostAccessFile)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+		return nil
+	}
+	clean, dropped := sanitizeConfig(string(b), true)
+	if len(dropped) > 0 {
+		slog.Warn("container import: dropped config lines an imported container may not carry", "dir", filepath.Base(dir), "keys", dropped)
+	}
+	if err := os.WriteFile(cfgPath, []byte(clean), 0o644); err != nil {
+		return err
+	}
+	if err := os.Remove(filepath.Join(dir, hostAccessFile)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return nil
 }

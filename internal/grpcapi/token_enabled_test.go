@@ -31,7 +31,6 @@ func TestTokenEnabledCoversEverySupportedToken(t *testing.T) {
 	s.rbacRealm = true
 	s.enfOperationProtocol = true
 	s.enfLiveResize = true
-	s.enfUsbMountsMemory = true
 	s.enfCanonicalIdentity = true
 	s.enfProjectAuthority = true
 	s.enfAuditSignature = true

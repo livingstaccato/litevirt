@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/netip"
 	"os"
 	"sync"
@@ -307,7 +306,9 @@ type Server struct {
 	// should travel on (migration_network.go). Empty means the host's cluster
 	// address. localIPs is a test seam for the host's own addresses.
 	migrationNetwork string
-	localIPs         func() ([]net.IP, error)
+	migrationDial    func(ctx context.Context, host, addr string) (pb.LiteVirtClient, func(), error)
+	migrationAddress string // migration.address: this host's own answer, when set
+	localIPs         func() ([]localAddr, error)
 	// failbacks is the set of hosts a failback is running for (failback.go).
 	failbacks failbackRuns
 	// isoResolvedWithheld makes EnsureDisks answer as a target older than

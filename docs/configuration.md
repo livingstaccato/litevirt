@@ -842,6 +842,8 @@ forward, while it is stopped, with `lv update <vm> --cpu-mode host-model`.
 migration:
   allow_unencrypted_storage: false   # default false
   network: 10.20.0.0/24              # default empty: the cluster address
+  address: 10.20.0.7                 # optional: this host's own address in that network
+  allow_any_network: false           # default false: refuse a non-private network, or one holding the cluster address
 ```
 
 `allow_unencrypted_storage` decides whether this node may **send** a migration
@@ -863,7 +865,12 @@ VLAN. It is read on the source host, and only at daemon start.
 memory, and the disk blocks of a storage copy) to the target's address inside
 that network instead of the address the host is dialed on. Nothing needs setting
 on the target: the source asks it, in the request that already prepares the
-move, for the address of its own in the network. See
+move, for the address of its own in the network, or `address` if you set one
+there (use it where a host holds several addresses in the network). The daemon
+refuses to start with a `network` that is not inside a private range or that
+contains the host's cluster or default-route address, unless `allow_any_network`
+is `true`. The network carries live moves and the disk stream of cold moves and
+clone copies, and an unencrypted storage copy stays on the cluster address. See
 [migration](migration-failover.md#a-dedicated-migration-network).
 
 Migrations of VMs on shared storage copy no disks. litevirt tunnels them through

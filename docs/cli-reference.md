@@ -85,8 +85,8 @@ lv host ls --names                        # Print only host names, one per line 
 lv host inspect <host>                    # Host details
 lv host drain <host> [--parallel 2]       # Evacuate VMs off host
 lv host shutdown-workloads <host>         # Stop VMs in reverse startup-order (honors stop-delay)
-lv host undrain <host> [--failback]       # Return host to scheduling (--failback: move back every VM a drain moved)
-lv host failback <host> [--all] [--dry-run]   # Live-migrate VMs a drain moved away back to the host
+lv host undrain <host> [--failback]       # Return host to scheduling (--failback: wait for the failback it started and print results)
+lv host failback <host> [--all] [--dry-run] [--follow]   # Live-migrate VMs a drain moved away back to the host
 lv host rm <host> [--force]               # Remove host (--force with running VMs); revokes its cert
 lv host rm --dead <host> [--dry-run]      # Remove a host fenced proof-grade and gone for good: checks the
                                           #   fence, `voter rm` if it votes, revokes + publishes the CRL,
@@ -891,11 +891,18 @@ with a checksum, its domain is defined there, and the staged copy is removed
 once the handoff commits. The source host therefore needs room for the copy
 while it travels. `--pool` puts the disks in a pool: directly on the source's
 host, or, on another host, by a move-volume after the move. The caller needs the
-clone's permissions and the project must be allowed to use the pool; a move
-also needs `vm.migrate` on the new VM, and a pool on another host `vm.move`.
-When a later step fails, the clone is left as a complete stopped VM and the error
-names where it is and the command that finishes the job (`lv migrate`,
-`lv move-volume`, `lv start`).
+clone's permissions and the project must be allowed to use the pool; a clone on
+another host also needs `vm.migrate` and `vm.delete` on the new VM, `vm.move` for
+a pool there and `vm.start` for `--start`. All are checked as you, before any
+copy starts. The staged copy is admitted against the source host's free space
+with the same headroom a cold migration leaves, and refused if it would take the
+filesystem that holds running guests' disks that close to full. A request that
+entered at another node is carried to the source host with your identity; where
+forwarded identity is not enforced it is refused rather than run as a cluster
+peer. If the move fails, the staged copy is removed and nothing is left behind;
+if the move succeeded and a later step (the pool, the start) fails, the VM is
+complete on its host and the error names the command that finishes the job
+(`lv move-volume`, `lv start`).
 
 ## GitOps
 

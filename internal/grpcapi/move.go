@@ -565,7 +565,9 @@ func (s *Server) deleteDiskAtRecordedLocation(ctx context.Context, d *corrosion.
 	if err != nil {
 		return fmt.Errorf("construct %s driver: %w", cfg.Driver, err)
 	}
-	return drv.DeleteDisk(ctx, d.Path)
+	// hostDiskFile is the recorded path itself, except under the per-node file
+	// root a multi-node test gives each node.
+	return drv.DeleteDisk(ctx, s.hostDiskFile(d.Path))
 }
 
 // diskPathReferencedByOtherVM reports whether a disk's path is still in use by a

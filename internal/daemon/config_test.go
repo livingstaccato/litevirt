@@ -602,3 +602,55 @@ func TestLoadConfig_MigrationNetwork(t *testing.T) {
 		}
 	}
 }
+
+// migration.address must be inside migration.network, and means nothing
+// without it.
+//
+// Mutation: drop the address checks in LoadConfig - the bad rows load.
+func TestLoadConfig_MigrationAddress(t *testing.T) {
+	load := func(body string) (*Config, error) {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(path, []byte("host_name: \"h\"\n"+body), 0644); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("LITEVIRT_CONFIG", path)
+		return LoadConfig()
+	}
+	if cfg, err := load("migration:\n  network: 10.20.0.0/24\n  address: 10.20.0.7\n  allow_any_network: true\n"); err != nil ||
+		cfg.Migration.Address != "10.20.0.7" || !cfg.Migration.AllowAnyNetwork {
+		t.Fatalf("a valid address: %+v %v", cfg, err)
+	}
+	for name, body := range map[string]string{
+		"outside the network": "migration:\n  network: 10.20.0.0/24\n  address: 10.30.0.7\n",
+		"not an address":      "migration:\n  network: 10.20.0.0/24\n  address: nope\n",
+		"no network":          "migration:\n  address: 10.20.0.7\n",
+	} {
+		if _, err := load(body); err == nil || !strings.Contains(err.Error(), "migration.address") {
+			t.Errorf("%s: %v, want a load error naming migration.address", name, err)
+		}
+	}
+}
+
+// The daemon refuses to start with a migration network that would send
+// migration data out the uplink or the cluster interface, unless told.
+//
+// Mutation: make checkMigrationNetwork return nil - the public and cluster rows
+// are accepted.
+func TestCheckMigrationNetworkAtStart(t *testing.T) {
+	for name, tc := range map[string]struct {
+		cfg     MigrationConfig
+		advert  string
+		wantErr bool
+	}{
+		"unset":                {MigrationConfig{}, "", false},
+		"private, separate":    {MigrationConfig{Network: "10.20.0.0/24"}, "192.168.1.5", false},
+		"public":               {MigrationConfig{Network: "203.0.113.0/24"}, "192.168.1.5", true},
+		"public with override": {MigrationConfig{Network: "203.0.113.0/24", AllowAnyNetwork: true}, "192.168.1.5", false},
+		"contains the cluster": {MigrationConfig{Network: "192.168.0.0/16"}, "192.168.1.5", true},
+	} {
+		d := &Daemon{cfg: &Config{Migration: tc.cfg, AdvertiseAddress: tc.advert}}
+		if err := d.checkMigrationNetwork(); (err != nil) != tc.wantErr {
+			t.Errorf("%s: %v, want error=%v", name, err, tc.wantErr)
+		}
+	}
+}

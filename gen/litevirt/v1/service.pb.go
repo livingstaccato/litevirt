@@ -963,10 +963,14 @@ func (x *UndrainHostRequest) GetName() string {
 // placement.failback, or the cluster failback policy) are considered.
 // dry_run reports what would move and why each other VM stays.
 type FailbackHostRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	All           bool                   `protobuf:"varint,2,opt,name=all,proto3" json:"all,omitempty"`
-	DryRun        bool                   `protobuf:"varint,3,opt,name=dry_run,json=dryRun,proto3" json:"dry_run,omitempty"`
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	Name   string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	All    bool                   `protobuf:"varint,2,opt,name=all,proto3" json:"all,omitempty"`
+	DryRun bool                   `protobuf:"varint,3,opt,name=dry_run,json=dryRun,proto3" json:"dry_run,omitempty"`
+	// follow attaches to the run on this daemon for the host (the one an
+	// undrain started, running or finished) and streams its results, instead
+	// of starting one. all and dry_run are ignored.
+	Follow        bool `protobuf:"varint,4,opt,name=follow,proto3" json:"follow,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1018,6 +1022,13 @@ func (x *FailbackHostRequest) GetAll() bool {
 func (x *FailbackHostRequest) GetDryRun() bool {
 	if x != nil {
 		return x.DryRun
+	}
+	return false
+}
+
+func (x *FailbackHostRequest) GetFollow() bool {
+	if x != nil {
+		return x.Follow
 	}
 	return false
 }
@@ -4588,17 +4599,20 @@ type CloneVMRequest struct {
 	Mode     string                 `protobuf:"bytes,3,opt,name=mode,proto3" json:"mode,omitempty"`         // "" (auto) | "linked" | "full"
 	Snapshot string                 `protobuf:"bytes,4,opt,name=snapshot,proto3" json:"snapshot,omitempty"` // optional: clone from this snapshot of the source
 	Project  string                 `protobuf:"bytes,5,opt,name=project,proto3" json:"project,omitempty"`   // tenancy bucket for the clone ("" → source's)
-	// target_host: the host the clone ends up on. Empty (or the source's host)
-	// keeps it on the source's host. Another host gets a full copy streamed
-	// over the disk-transfer path a cold migration uses.
+	// target_host is not used (an older design's placement pin); see
+	// destination_host.
 	TargetHost string `protobuf:"bytes,6,opt,name=target_host,json=targetHost,proto3" json:"target_host,omitempty"`
 	Ip         string `protobuf:"bytes,7,opt,name=ip,proto3" json:"ip,omitempty"`        // optional static IP for the clone's first NIC
 	Start      bool   `protobuf:"varint,8,opt,name=start,proto3" json:"start,omitempty"` // start the clone after creation
 	// target_pool: the storage pool, on the host the clone ends up on, that
 	// holds the clone's disks. Empty means that host's default disk directory.
-	TargetPool    string `protobuf:"bytes,9,opt,name=target_pool,json=targetPool,proto3" json:"target_pool,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	TargetPool string `protobuf:"bytes,9,opt,name=target_pool,json=targetPool,proto3" json:"target_pool,omitempty"`
+	// destination_host is the host the clone ends up on, as target_host was
+	// meant to be: empty keeps it on the source's host. Field 6 stays
+	// ignored, as it always was, so a client that sets it is not newly refused.
+	DestinationHost string `protobuf:"bytes,10,opt,name=destination_host,json=destinationHost,proto3" json:"destination_host,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *CloneVMRequest) Reset() {
@@ -4690,6 +4704,13 @@ func (x *CloneVMRequest) GetStart() bool {
 func (x *CloneVMRequest) GetTargetPool() string {
 	if x != nil {
 		return x.TargetPool
+	}
+	return ""
+}
+
+func (x *CloneVMRequest) GetDestinationHost() string {
+	if x != nil {
+		return x.DestinationHost
 	}
 	return ""
 }
@@ -6274,13 +6295,23 @@ func (x *ExportStackResponse) GetComposeHash() string {
 
 // ── Migration ──
 type MigrateVMRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	VmName        string                 `protobuf:"bytes,1,opt,name=vm_name,json=vmName,proto3" json:"vm_name,omitempty"`
-	TargetHost    string                 `protobuf:"bytes,2,opt,name=target_host,json=targetHost,proto3" json:"target_host,omitempty"`
-	Strategy      MigrateStrategy        `protobuf:"varint,3,opt,name=strategy,proto3,enum=litevirt.v1.MigrateStrategy" json:"strategy,omitempty"`
-	WithStorage   bool                   `protobuf:"varint,4,opt,name=with_storage,json=withStorage,proto3" json:"with_storage,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	VmName      string                 `protobuf:"bytes,1,opt,name=vm_name,json=vmName,proto3" json:"vm_name,omitempty"`
+	TargetHost  string                 `protobuf:"bytes,2,opt,name=target_host,json=targetHost,proto3" json:"target_host,omitempty"`
+	Strategy    MigrateStrategy        `protobuf:"varint,3,opt,name=strategy,proto3,enum=litevirt.v1.MigrateStrategy" json:"strategy,omitempty"`
+	WithStorage bool                   `protobuf:"varint,4,opt,name=with_storage,json=withStorage,proto3" json:"with_storage,omitempty"`
+	// expect_drain_record makes the migration conditional on a drain record:
+	// the host that OWNS the VM when it runs must be expect_host, at owner
+	// epoch expect_owner_epoch, and its own replica must still hold a live
+	// drain record naming it and target_host (the host the drain moved the VM
+	// off). Failback sets it, so the check is made by the owner under the VM's
+	// lock, not by the daemon that decided on a replica that may lag. Any
+	// difference refuses with FailedPrecondition and moves nothing.
+	ExpectDrainRecord bool   `protobuf:"varint,5,opt,name=expect_drain_record,json=expectDrainRecord,proto3" json:"expect_drain_record,omitempty"`
+	ExpectHost        string `protobuf:"bytes,6,opt,name=expect_host,json=expectHost,proto3" json:"expect_host,omitempty"`
+	ExpectOwnerEpoch  int64  `protobuf:"varint,7,opt,name=expect_owner_epoch,json=expectOwnerEpoch,proto3" json:"expect_owner_epoch,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *MigrateVMRequest) Reset() {
@@ -6339,6 +6370,27 @@ func (x *MigrateVMRequest) GetWithStorage() bool {
 		return x.WithStorage
 	}
 	return false
+}
+
+func (x *MigrateVMRequest) GetExpectDrainRecord() bool {
+	if x != nil {
+		return x.ExpectDrainRecord
+	}
+	return false
+}
+
+func (x *MigrateVMRequest) GetExpectHost() string {
+	if x != nil {
+		return x.ExpectHost
+	}
+	return ""
+}
+
+func (x *MigrateVMRequest) GetExpectOwnerEpoch() int64 {
+	if x != nil {
+		return x.ExpectOwnerEpoch
+	}
+	return 0
 }
 
 type MigrateProgress struct {
@@ -34977,11 +35029,12 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x06status\x18\x05 \x01(\tR\x06status\x12\x14\n" +
 	"\x05error\x18\x06 \x01(\tR\x05error\"(\n" +
 	"\x12UndrainHostRequest\x12\x12\n" +
-	"\x04name\x18\x01 \x01(\tR\x04name\"T\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\"l\n" +
 	"\x13FailbackHostRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x10\n" +
 	"\x03all\x18\x02 \x01(\bR\x03all\x12\x17\n" +
-	"\adry_run\x18\x03 \x01(\bR\x06dryRun\"x\n" +
+	"\adry_run\x18\x03 \x01(\bR\x06dryRun\x12\x16\n" +
+	"\x06follow\x18\x04 \x01(\bR\x06follow\"x\n" +
 	"\x10FailbackProgress\x12\x17\n" +
 	"\avm_name\x18\x01 \x01(\tR\x06vmName\x12\x1b\n" +
 	"\tfrom_host\x18\x02 \x01(\tR\bfromHost\x12\x16\n" +
@@ -35260,7 +35313,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x13RekeyBindingRequest\x12\x18\n" +
 	"\anetwork\x18\x01 \x01(\tR\anetwork\"0\n" +
 	"\x14ResumeBindingRequest\x12\x18\n" +
-	"\anetwork\x18\x01 \x01(\tR\anetwork\"\xf2\x01\n" +
+	"\anetwork\x18\x01 \x01(\tR\anetwork\"\x9d\x02\n" +
 	"\x0eCloneVMRequest\x12\x16\n" +
 	"\x06source\x18\x01 \x01(\tR\x06source\x12\x16\n" +
 	"\x06target\x18\x02 \x01(\tR\x06target\x12\x12\n" +
@@ -35272,7 +35325,9 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x02ip\x18\a \x01(\tR\x02ip\x12\x14\n" +
 	"\x05start\x18\b \x01(\bR\x05start\x12\x1f\n" +
 	"\vtarget_pool\x18\t \x01(\tR\n" +
-	"targetPool\"F\n" +
+	"targetPool\x12)\n" +
+	"\x10destination_host\x18\n" +
+	" \x01(\tR\x0fdestinationHost\"F\n" +
 	"\x18ConvertToTemplateRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x16\n" +
 	"\x06revert\x18\x02 \x01(\bR\x06revert\"=\n" +
@@ -35404,13 +35459,17 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x13ExportStackResponse\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12!\n" +
 	"\fcompose_yaml\x18\x02 \x01(\tR\vcomposeYaml\x12!\n" +
-	"\fcompose_hash\x18\x03 \x01(\tR\vcomposeHash\"\xa9\x01\n" +
+	"\fcompose_hash\x18\x03 \x01(\tR\vcomposeHash\"\xa8\x02\n" +
 	"\x10MigrateVMRequest\x12\x17\n" +
 	"\avm_name\x18\x01 \x01(\tR\x06vmName\x12\x1f\n" +
 	"\vtarget_host\x18\x02 \x01(\tR\n" +
 	"targetHost\x128\n" +
 	"\bstrategy\x18\x03 \x01(\x0e2\x1c.litevirt.v1.MigrateStrategyR\bstrategy\x12!\n" +
-	"\fwith_storage\x18\x04 \x01(\bR\vwithStorage\"\xfa\x02\n" +
+	"\fwith_storage\x18\x04 \x01(\bR\vwithStorage\x12.\n" +
+	"\x13expect_drain_record\x18\x05 \x01(\bR\x11expectDrainRecord\x12\x1f\n" +
+	"\vexpect_host\x18\x06 \x01(\tR\n" +
+	"expectHost\x12,\n" +
+	"\x12expect_owner_epoch\x18\a \x01(\x03R\x10expectOwnerEpoch\"\xfa\x02\n" +
 	"\x0fMigrateProgress\x12/\n" +
 	"\x05phase\x18\x01 \x01(\x0e2\x19.litevirt.v1.MigratePhaseR\x05phase\x12\x1d\n" +
 	"\n" +

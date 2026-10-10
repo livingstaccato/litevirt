@@ -94,7 +94,7 @@ func (s *Server) copyColdDisksToTarget(ctx context.Context, targetHost, vmName s
 					"repair the VM's disks before migrating it", d.DiskName, vmName, d.Path, s.hostName)
 		}
 	}
-	client, closeConn, err := s.dialPeer(ctx, targetHost)
+	client, closeConn, err := s.dialColdPeer(ctx, targetHost, vmName, abort.diskAddr)
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable, "cannot reach %s to copy the disks of VM %q: %v", targetHost, vmName, err)
 	}

@@ -1,9 +1,8 @@
-// Fleet scenarios for failback after maintenance: a drain records what it moved,
-// and an undrain (or `lv host failback`) moves exactly those VMs back by live
-// migration, never one that was moved for another reason.
-//
-// Multi-node by construction: the drain runs on the drained host, the record
-// replicates, and the move back is a migration from another host's daemon.
+// Fleet scenarios for failback after maintenance, on INDEPENDENT replicas: every
+// node has its own database and the production push loop carries the drain
+// record, the spend of it and every ownership change between them, so a node's
+// decision can be made on a replica that lags a peer's. SharedCRDT, which has
+// one database and so no lag, cannot reach any of the races below.
 package fleet
 
 import (
@@ -16,30 +15,50 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/litevirt/litevirt/internal/corrosion"
-	"github.com/litevirt/litevirt/internal/grpcapi"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
+	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/grpcapi"
 )
 
 type fbScenario struct {
-	c    *Cluster
-	a, b *Node // a is drained and returns; b receives its VMs
+	c       *Cluster
+	a, b, x *Node // a is drained and returns; b receives its VMs; x is a third host (nil with two nodes)
 }
 
-func newFB(t *testing.T, nodes int) *fbScenario {
+// newFB starts nodes independent replicas. With latch, the cluster-policy gate
+// (failover_scope_v1) is open on every node, which is what failback's feature
+// gate stands on today; without it nothing may be recorded or failed back.
+func newFB(t *testing.T, nodes int, latch bool) *fbScenario {
 	t.Helper()
-	c := New(t, Options{Nodes: nodes, SharedCRDT: true})
+	c := New(t, Options{Nodes: nodes, IndependentReplicas: true})
 	t.Cleanup(c.Stop)
+	gates := enforceGate(t, c)
 	for _, n := range c.Nodes {
-		n.DB.SetClusterPolicyGate(func() bool { return true })
+		g := gates[n.Name]
+		n.DB.SetClusterPolicyGate(func() bool { return g.DurablyLatched(capabilities.FailoverScopeV1) })
+	}
+	if latch {
+		for _, n := range c.Nodes {
+			if !gates[n.Name].Enforced(context.Background(), capabilities.FailoverScopeV1) {
+				t.Fatalf("%s: failover_scope_v1 did not latch on a uniform fleet", n.Name)
+			}
+		}
 	}
 	t.Cleanup(grpcapi.SetFailbackPauseForTest(time.Millisecond))
-	return &fbScenario{c: c, a: c.Nodes[0], b: c.Nodes[1]}
+	c.WaitConverged(t, convergeTimeout)
+	f := &fbScenario{c: c, a: c.Nodes[0], b: c.Nodes[1]}
+	if nodes > 2 {
+		f.x = c.Nodes[2]
+	}
+	return f
 }
 
 // addVM adds a running VM on n whose only disk is on shared storage, so a drain
-// live-migrates it and a failback may.
+// live-migrates it and a failback may. The row is written on n and travels.
 func (f *fbScenario) addVM(t *testing.T, name string, n *Node, place *pb.PlacementSpec) {
 	t.Helper()
 	spec, err := json.Marshal(&pb.VMSpec{Name: name, Cpu: 1, MemoryMib: 256, Placement: place})
@@ -54,26 +73,45 @@ func (f *fbScenario) addVM(t *testing.T, name string, n *Node, place *pb.Placeme
 	}); err != nil {
 		t.Fatalf("InsertVM %s: %v", name, err)
 	}
-	if err := n.Virt.DefineDomain(`<domain type='kvm'><name>` + name + `</name><uuid>` + uuid.NewSHA1(uuid.NameSpaceOID, []byte(name)).String() + `</uuid><devices>` +
-		`<disk type='file' device='disk'><driver name='qemu' type='qcow2'/><source file='` + disk + `'/><target dev='vda'/></disk>` +
-		`</devices></domain>`); err != nil {
+	if err := n.Virt.DefineDomain(`<domain type='kvm'><name>` + name + `</name><uuid>` + uuid.NewSHA1(uuid.NameSpaceOID, []byte(name)).String() +
+		`</uuid><devices><disk type='file' device='disk'><driver name='qemu' type='qcow2'/><source file='` + disk + `'/><target dev='vda'/></disk></devices></domain>`); err != nil {
 		t.Fatalf("define %s: %v", name, err)
 	}
 	if err := n.Virt.StartDomain(name); err != nil {
 		t.Fatalf("start %s: %v", name, err)
 	}
+	f.c.WaitConverged(t, convergeTimeout)
 }
 
-func (f *fbScenario) vm(t *testing.T, name string) *corrosion.VMRecord {
+// fillA puts a VM on a that takes all the memory the placement engine will
+// give it, so no other VM fits there. The row is written on a and travels.
+func (f *fbScenario) fillA(t *testing.T) {
 	t.Helper()
-	vm, err := corrosion.GetVM(context.Background(), f.a.DB, name)
+	h, err := corrosion.GetHost(context.Background(), f.a.DB, f.a.Name)
+	if err != nil || h == nil {
+		t.Fatalf("GetHost: %v %v", h, err)
+	}
+	spec, _ := json.Marshal(&pb.VMSpec{Name: "hog", Cpu: 1, MemoryMib: int32(h.MemTotal)})
+	if err := corrosion.InsertVM(context.Background(), f.a.DB, corrosion.VMRecord{
+		Name: "hog", HostName: f.a.Name, State: "running", Spec: string(spec), CPUActual: 1, MemActual: int(h.MemTotal),
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM hog: %v", err)
+	}
+	f.a.Virt.SetState("hog", "running")
+	f.c.WaitConverged(t, convergeTimeout)
+}
+
+func (f *fbScenario) vmAt(t *testing.T, n *Node, name string) *corrosion.VMRecord {
+	t.Helper()
+	vm, err := corrosion.GetVM(context.Background(), n.DB, name)
 	if err != nil || vm == nil {
-		t.Fatalf("GetVM %s: %v %v", name, vm, err)
+		t.Fatalf("GetVM %s on %s: %v %v", name, n.Name, vm, err)
 	}
 	return vm
 }
 
-// drain drains a, whose VMs land on dst (libvirt's move emulated a -> dst).
+// drain drains a, whose VMs land on dst (libvirt's move emulated a -> dst), and
+// lets the records travel.
 func (f *fbScenario) drain(t *testing.T, dst *Node) {
 	t.Helper()
 	emulateLibvirtMove(f.a, dst)
@@ -93,131 +131,258 @@ func (f *fbScenario) drain(t *testing.T, dst *Node) {
 			t.Fatalf("drain of %s: %s", p.VmName, p.Error)
 		}
 	}
+	f.c.WaitConverged(t, convergeTimeout)
 }
 
-func (f *fbScenario) undrain(t *testing.T) {
+// undrain undrains a at node at. Host state is written on one node and travels,
+// like everything else here; the other replicas hear of it shortly, and a move
+// whose owner is still behind waits for that (failbackNotActiveWait).
+func (f *fbScenario) undrain(t *testing.T, at *Node) *pb.Host {
 	t.Helper()
-	if _, err := f.c.SelfClient(f.a).UndrainHost(context.Background(), &pb.UndrainHostRequest{Name: f.a.Name}); err != nil {
+	h, err := f.c.SelfClient(at).UndrainHost(context.Background(), &pb.UndrainHostRequest{Name: f.a.Name})
+	if err != nil {
 		t.Fatalf("UndrainHost: %v", err)
 	}
+	return h
 }
 
-// failback runs FailbackHost for a and returns each VM's frame.
-func (f *fbScenario) failback(t *testing.T, all, dry bool) (map[string]*pb.FailbackProgress, error) {
+// undrainSettled is undrain, then lets every replica hear it, for a scenario that
+// serves the failback from another node.
+func (f *fbScenario) undrainSettled(t *testing.T, at *Node) {
 	t.Helper()
-	st, err := f.c.SelfClient(f.a).FailbackHost(context.Background(), &pb.FailbackHostRequest{Name: f.a.Name, All: all, DryRun: dry})
-	if err != nil {
-		return nil, err
+	f.undrain(t, at)
+	f.c.WaitConverged(t, convergeTimeout)
+}
+
+// xOut takes the third host out of placement for the drain, and xIn puts it
+// back, each as a write on one node that travels (a per-node write would leave
+// the replicas apart for good).
+func (f *fbScenario) xOut(t *testing.T) {
+	t.Helper()
+	if err := corrosion.UpdateHostState(context.Background(), f.a.DB, f.x.Name, "maintenance"); err != nil {
+		t.Fatal(err)
 	}
+	f.c.WaitConverged(t, convergeTimeout)
+}
+
+func (f *fbScenario) xIn(t *testing.T) {
+	t.Helper()
+	if err := corrosion.UpdateHostState(context.Background(), f.a.DB, f.x.Name, "active"); err != nil {
+		t.Fatal(err)
+	}
+	f.c.WaitConverged(t, convergeTimeout)
+}
+
+func collect(t *testing.T, st interface {
+	Recv() (*pb.FailbackProgress, error)
+}) (map[string]*pb.FailbackProgress, error) {
+	t.Helper()
 	got := map[string]*pb.FailbackProgress{}
 	for {
-		p, rerr := st.Recv()
-		if rerr == io.EOF {
+		p, err := st.Recv()
+		if err == io.EOF {
 			return got, nil
 		}
-		if rerr != nil {
-			return got, rerr
+		if err != nil {
+			return got, err
 		}
 		got[p.VmName] = p
 	}
 }
 
-func (f *fbScenario) origins(t *testing.T) []corrosion.DrainOrigin {
+// failback runs FailbackHost for a on the daemon at, and returns each VM's frame.
+func (f *fbScenario) failback(t *testing.T, at *Node, req *pb.FailbackHostRequest) (map[string]*pb.FailbackProgress, error) {
 	t.Helper()
-	o, err := corrosion.ListDrainOrigins(context.Background(), f.a.DB, f.a.Name)
+	req.Name = f.a.Name
+	st, err := f.c.SelfClient(at).FailbackHost(context.Background(), req)
+	if err != nil {
+		return nil, err
+	}
+	return collect(t, st)
+}
+
+func (f *fbScenario) origins(t *testing.T, n *Node) []corrosion.DrainOrigin {
+	t.Helper()
+	o, err := corrosion.ListDrainOrigins(context.Background(), n.DB, f.a.Name)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return o
 }
 
-func waitHost(t *testing.T, f *fbScenario, vm, host string) {
+func waitHostOf(t *testing.T, f *fbScenario, vm, host string) {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		if f.vm(t, vm).HostName == host {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Fatalf("%s is on %s, want %s", vm, f.vm(t, vm).HostName, host)
+	eventually(t, 10*time.Second, vm+" on "+host, func() bool { return f.vmAt(t, f.a, vm).HostName == host })
 }
 
-// A drain records what it moved; failback --all moves it back live, and the
-// record is spent.
+// A drain records what it moved, the record reaches the other nodes, and a
+// failback served by a node that is neither the returning host nor the VM's
+// host moves it back live, through the owner.
 //
-// Mutation: skip the recordDrainOrigin call in DrainHost — no record, so the
-// VM is never offered for failback and stays on b.
+// Mutation: skip recordDrainOrigin in DrainHost - nothing to fail back.
 func TestFleet_Failback_MovesADrainedVMBack(t *testing.T) {
-	f := newFB(t, 2)
+	f := newFB(t, 3, true)
 	f.addVM(t, "web", f.a, nil)
+	f.xOut(t) // the drain can only choose b
 	f.drain(t, f.b)
-	if vm := f.vm(t, "web"); vm.HostName != f.b.Name {
-		t.Fatalf("drain left web on %s, want %s", vm.HostName, f.b.Name)
+	if vm := f.vmAt(t, f.x, "web"); vm.HostName != f.b.Name {
+		t.Fatalf("x sees web on %s, want %s", vm.HostName, f.b.Name)
 	}
-	if o := f.origins(t); len(o) != 1 || o[0].VM != "web" || o[0].To != f.b.Name {
-		t.Fatalf("drain records = %+v, want one for web -> %s", o, f.b.Name)
+	for _, n := range f.c.Nodes {
+		if o := f.origins(t, n); len(o) != 1 || o[0].VM != "web" || o[0].To != f.b.Name {
+			t.Fatalf("%s holds drain records %+v, want one for web -> %s", n.Name, o, f.b.Name)
+		}
 	}
+	f.xIn(t)
+	f.undrainSettled(t, f.a)
 
-	f.undrain(t)
 	emulateLibvirtMove(f.b, f.a)
-	got, err := f.failback(t, true, false)
+	got, err := f.failback(t, f.x, &pb.FailbackHostRequest{All: true})
 	if err != nil {
 		t.Fatalf("failback: %v", err)
 	}
 	if p := got["web"]; p == nil || p.Status != "moved" {
 		t.Fatalf("failback result for web = %+v, want moved", p)
 	}
-	if vm := f.vm(t, "web"); vm.HostName != f.a.Name || vm.State != "running" {
-		t.Fatalf("web = host %s state %s after failback, want %s running", vm.HostName, vm.State, f.a.Name)
-	}
+	waitHostOf(t, f, "web", f.a.Name)
 	if n := migrateCalls(f.b); n != 1 {
 		t.Errorf("b started %d libvirt migrations, want the one live move back", n)
 	}
-	if o := f.origins(t); len(o) != 0 {
-		t.Errorf("the drain record survived the move back: %+v", o)
+	f.c.WaitConverged(t, convergeTimeout)
+	for _, n := range f.c.Nodes {
+		if o := f.origins(t, n); len(o) != 0 {
+			t.Errorf("%s still holds a spent record: %+v", n.Name, o)
+		}
 	}
 }
 
-// Undrain alone moves nothing; the VM's own opt-in, or the cluster policy,
-// makes it move back by itself.
+// The race that mattered: the node that serves the failback has not yet heard
+// that an operator moved the VM. Its replica still shows the VM where the drain
+// put it, with a live record. The move must not happen: the OWNER re-checks,
+// under the VM's lock, on its own replica.
 //
-// Mutation: drop the `!policyOn && !spec.GetPlacement().GetFailback()` opt-in
-// test — the control VM moves back too.
+// Two operator moves, each a different way to look untouched to a lagging node:
+// "hand" moved on to the third host, "again" moved there and back (its owner
+// epoch unchanged, only the spend of its record says so).
+//
+// Mutation: drop the checkDrainExpectation call in migrateOwnedVM - hand is
+// live-migrated from x to a, again from b to a.
+func TestFleet_Failback_AServingNodeThatLagsNeverMovesAVMAnOperatorMoved(t *testing.T) {
+	f := newFB(t, 3, true)
+	f.addVM(t, "hand", f.a, nil)
+	f.addVM(t, "again", f.a, nil)
+	f.xOut(t)
+	f.drain(t, f.b)
+	f.xIn(t)
+	f.undrainSettled(t, f.a)
+
+	// a hears nothing more from b or x until the end.
+	f.c.SetLinkFault(f.b, f.a, LinkFault{Block: true})
+	f.c.SetLinkFault(f.x, f.a, LinkFault{Block: true})
+
+	emulateLibvirtMove(f.b, f.x)
+	if err := migrateAt(t, f.c, f.b, "hand", f.x.Name); err != nil {
+		t.Fatalf("operator migrate: %v", err)
+	}
+	if err := migrateAt(t, f.c, f.b, "again", f.x.Name); err != nil {
+		t.Fatalf("operator migrate: %v", err)
+	}
+	emulateLibvirtMove(f.x, f.b)
+	if err := migrateAt(t, f.c, f.x, "again", f.b.Name); err != nil {
+		t.Fatalf("operator migrate back: %v", err)
+	}
+	f.c.WaitConverged(t, convergeTimeout, f.b, f.x)
+	for _, vm := range []string{"hand", "again"} {
+		if h := f.vmAt(t, f.a, vm).HostName; h != f.b.Name {
+			t.Fatalf("a already knows %s moved (on %s): the scenario needs a lagging replica", vm, h)
+		}
+	}
+	if o := f.origins(t, f.a); len(o) != 2 {
+		t.Fatalf("a's replica should still hold both live records, holds %+v", o)
+	}
+
+	emulateLibvirtMove(f.b, f.a)
+	emulateLibvirtMove(f.x, f.a)
+	got, err := f.failback(t, f.a, &pb.FailbackHostRequest{All: true})
+	if err != nil {
+		t.Fatalf("failback: %v", err)
+	}
+	for _, vm := range []string{"hand", "again"} {
+		if p := got[vm]; p == nil || p.Status != "skipped" || !strings.Contains(p.Reason, "moved") {
+			t.Errorf("%s = %+v, want skipped: moved", vm, p)
+		}
+	}
+	f.c.ClearLinkFaults()
+	f.c.WaitConverged(t, convergeTimeout)
+	if h := f.vmAt(t, f.a, "hand").HostName; h != f.x.Name {
+		t.Errorf("hand is on %s, want it left on %s", h, f.x.Name)
+	}
+	if h := f.vmAt(t, f.a, "again").HostName; h != f.b.Name {
+		t.Errorf("again is on %s, want it left on %s", h, f.b.Name)
+	}
+}
+
+// A VM whose ownership was transferred by something that is not a migration (a
+// failover re-homes it) no longer matches its record's owner epoch.
+//
+// Mutation: drop the owner-epoch comparison in checkDrainExpectation and in
+// failbackOne.
+func TestFleet_Failback_LeavesAVMWhoseOwnershipChanged(t *testing.T) {
+	f := newFB(t, 2, true)
+	f.addVM(t, "failedover", f.a, nil)
+	f.drain(t, f.b)
+	f.undrainSettled(t, f.a)
+	if err := corrosion.TransferVMOwnerFresh(context.Background(), f.b.DB, "failedover", f.b.Name, "running"); err != nil {
+		t.Fatal(err)
+	}
+	f.c.WaitConverged(t, convergeTimeout)
+	emulateLibvirtMove(f.b, f.a)
+	got, err := f.failback(t, f.b, &pb.FailbackHostRequest{All: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := got["failedover"]; p != nil && p.Status == "moved" {
+		t.Fatalf("failedover = %+v, want it left", p)
+	}
+	if h := f.vmAt(t, f.b, "failedover").HostName; h != f.b.Name {
+		t.Errorf("failedover is on %s, want %s", h, f.b.Name)
+	}
+}
+
+// Opt-in: an undrain moves back only the VMs that opted in (their own flag, or
+// the cluster policy), in the background, and says so.
+//
+// Mutation: drop the opt-in test in failbackOne - the control VM moves too.
 func TestFleet_Failback_IsOptIn(t *testing.T) {
-	f := newFB(t, 2)
+	f := newFB(t, 2, true)
 	f.addVM(t, "plain", f.a, nil)
 	f.addVM(t, "optin", f.a, &pb.PlacementSpec{Failback: true})
 	f.drain(t, f.b)
 
-	// An undrain moves the opted-in VM back by itself, in the background, and
-	// only that one.
 	emulateLibvirtMove(f.b, f.a)
-	f.undrain(t)
-	waitHost(t, f, "optin", f.a.Name)
+	h := f.undrain(t, f.a)
+	if !h.FailbackStarted || !strings.Contains(h.FailbackNote, "started in the background") || !strings.Contains(h.FailbackNote, "restarts") {
+		t.Fatalf("undrain reply = started %v note %q; want it to say a run started and that a restart ends it", h.FailbackStarted, h.FailbackNote)
+	}
+	waitHostOf(t, f, "optin", f.a.Name)
 	time.Sleep(100 * time.Millisecond)
-	if f.vm(t, "plain").HostName != f.b.Name {
+	if f.vmAt(t, f.a, "plain").HostName != f.b.Name {
 		t.Fatal("undrain moved back a VM that did not opt in")
 	}
-
-	// Asked for explicitly, without --all, the one that did not opt in is
-	// reported and left, and its record kept for a later opt-in.
-	got, err := f.failback(t, false, false)
+	got, err := f.failback(t, f.a, &pb.FailbackHostRequest{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if p := got["plain"]; p == nil || p.Status != "skipped" || !strings.Contains(p.Reason, "not opted in") {
 		t.Fatalf("plain = %+v, want skipped: not opted in", p)
 	}
-	if o := f.origins(t); len(o) != 1 || o[0].VM != "plain" {
-		t.Fatalf("records = %+v, want only plain's kept", o)
-	}
 
 	// The cluster policy opts every VM in.
 	if err := corrosion.SetFailbackPolicy(context.Background(), f.a.DB, true, "test"); err != nil {
 		t.Fatal(err)
 	}
-	got, err = f.failback(t, false, false)
+	f.c.WaitConverged(t, convergeTimeout)
+	got, err = f.failback(t, f.a, &pb.FailbackHostRequest{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,106 +391,84 @@ func TestFleet_Failback_IsOptIn(t *testing.T) {
 	}
 }
 
-// A VM an operator moved by hand since the drain stays where it is - wherever
-// it went, including back onto the host the drain put it on. A migration spends
-// the drain's record; any other ownership transfer (a failover, say) bumps the
-// owner epoch, which no longer matches the record.
+// `lv host undrain --failback` is one run: the command follows the run the
+// undrain started instead of starting a second, never errors for it, and never
+// moves a VM that did not opt in. A second, non-following request while the run
+// is going is refused with the way to follow it.
 //
-// Mutation: drop the s.spendDrainOrigin call in finalizeMigrationOwnership —
-// "again" (moved on and back by hand) is moved to a. Drop the
-// `vm.OwnerEpoch != o.Epoch` half of the staleness check - "failedover" is.
-func TestFleet_Failback_LeavesAVMAnOperatorMoved(t *testing.T) {
-	f := newFB(t, 3)
-	c := f.c.Nodes[2]
-	setHostCapacity(t, f.c, c.Name, 1, 1024, nil) // the drain can only choose b
-	f.addVM(t, "hand", f.a, nil)
-	f.addVM(t, "again", f.a, nil)
-	f.addVM(t, "failedover", f.a, nil)
+// Mutation: make FailbackHost start a run without looking at the running one -
+// the command races its own run and one of the two is refused at random.
+func TestFleet_Failback_UndrainFollowsItsOwnRun(t *testing.T) {
+	f := newFB(t, 2, true)
+	defer grpcapi.SetFailbackPauseForTest(1500 * time.Millisecond)()
+	f.addVM(t, "o1", f.a, &pb.PlacementSpec{Failback: true})
+	f.addVM(t, "o2", f.a, &pb.PlacementSpec{Failback: true})
+	f.addVM(t, "plain", f.a, nil)
 	f.drain(t, f.b)
-	setHostCapacity(t, f.c, c.Name, 64, 65536, nil)
 
-	// hand: moved on to c by an operator.
-	emulateLibvirtMove(f.b, c)
-	if err := migrateAt(t, f.c, f.b, "hand", c.Name); err != nil {
-		t.Fatalf("operator migrate: %v", err)
-	}
-	// again: moved to c and back to b by an operator.
-	if err := migrateAt(t, f.c, f.b, "again", c.Name); err != nil {
-		t.Fatalf("operator migrate: %v", err)
-	}
-	emulateLibvirtMove(c, f.b)
-	if err := migrateAt(t, f.c, c, "again", f.b.Name); err != nil {
-		t.Fatalf("operator migrate back: %v", err)
-	}
-	// failedover: still on b, but its ownership was transferred since (a
-	// failover re-homes it to the host it is on).
-	if err := corrosion.TransferVMOwnerFresh(context.Background(), f.a.DB, "failedover", f.b.Name, "running"); err != nil {
-		t.Fatal(err)
-	}
-
-	f.undrain(t)
 	emulateLibvirtMove(f.b, f.a)
-	got, err := f.failback(t, true, false)
+	h := f.undrain(t, f.a)
+	if !h.FailbackStarted {
+		t.Fatalf("undrain did not start the run: %q", h.FailbackNote)
+	}
+	// While it runs (the pause holds it between o1 and o2):
+	if _, err := f.failback(t, f.a, &pb.FailbackHostRequest{All: true}); status.Code(err) != codes.FailedPrecondition ||
+		!strings.Contains(err.Error(), "--follow") {
+		t.Fatalf("a second run while one is going = %v, want FailedPrecondition naming --follow", err)
+	}
+	got, err := f.failback(t, f.a, &pb.FailbackHostRequest{Follow: true})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("following the run: %v", err)
 	}
-	if p := got["failedover"]; p == nil || p.Status != "skipped" || !strings.Contains(p.Reason, "moved since the drain") {
-		t.Errorf("failedover = %+v, want skipped: moved since the drain", p)
-	}
-	for _, vm := range []string{"hand", "again"} {
-		if p := got[vm]; p != nil && p.Status == "moved" {
-			t.Errorf("%s was moved back although an operator had moved it: %+v", vm, p)
+	for _, vm := range []string{"o1", "o2"} {
+		if p := got[vm]; p == nil || p.Status != "moved" {
+			t.Errorf("%s = %+v, want moved", vm, p)
 		}
 	}
-	if h := f.vm(t, "hand").HostName; h != c.Name {
-		t.Errorf("hand is on %s, want it left on %s", h, c.Name)
+	if p := got["plain"]; p == nil || p.Status != "skipped" {
+		t.Errorf("plain = %+v, want skipped", p)
 	}
-	for _, vm := range []string{"again", "failedover"} {
-		if h := f.vm(t, vm).HostName; h != f.b.Name {
-			t.Errorf("%s is on %s, want it left on %s", vm, h, f.b.Name)
-		}
+	if f.vmAt(t, f.a, "plain").HostName != f.b.Name {
+		t.Errorf("a VM that did not opt in was moved")
 	}
-	if n := len(f.origins(t)); n != 0 {
-		t.Errorf("%d stale record(s) kept; they can never apply again", n)
+	// A follow after the run has finished still sees every result.
+	got, err = f.failback(t, f.a, &pb.FailbackHostRequest{Follow: true})
+	if err != nil || len(got) != 3 {
+		t.Errorf("a late follow = %d results, %v; want the whole finished run", len(got), err)
 	}
 }
 
-// Placement is respected: anti-affinity with a VM now on the returning host, and
-// the host's capacity, each keep the VM where it is, with the reason.
+// Placement is respected: anti-affinity with a VM now on the returning host and
+// the host's capacity each keep the VM where it is, with the reason.
 //
-// Mutation: skip the placement.ValidatePinned call — both move back.
+// Mutation: skip the placement.ValidatePinned call.
 func TestFleet_Failback_RespectsPlacement(t *testing.T) {
-	f := newFB(t, 2)
+	f := newFB(t, 2, true)
 	f.addVM(t, "apart", f.a, &pb.PlacementSpec{AntiAffinity: []string{"blocker"}})
 	f.addVM(t, "big", f.a, nil)
 	f.drain(t, f.b)
-	f.undrain(t)
-	f.addVM(t, "blocker", f.a, nil) // arrives on a after the drain
+	f.undrainSettled(t, f.a)
+	f.addVM(t, "blocker", f.a, nil)
+	f.fillA(t)
 
-	// a can hold neither the anti-affine VM nor, with its capacity cut, big.
-	setHostCapacity(t, f.c, f.a.Name, 1, 1024, nil)
-	got, err := f.failback(t, true, false)
+	got, err := f.failback(t, f.b, &pb.FailbackHostRequest{All: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, vm := range []string{"apart", "big"} {
-		p := got[vm]
-		if p == nil || p.Status != "skipped" || !strings.Contains(p.Reason, "not a valid placement") {
+		if p := got[vm]; p == nil || p.Status != "skipped" || !strings.Contains(p.Reason, "not a valid placement") {
 			t.Errorf("%s = %+v, want skipped: not a valid placement", vm, p)
 		}
-		if h := f.vm(t, vm).HostName; h != f.b.Name {
+		if h := f.vmAt(t, f.b, vm).HostName; h != f.b.Name {
 			t.Errorf("%s was moved to %s against placement", vm, h)
 		}
 	}
-
-	// Control: the same VMs once the objections are gone.
-	setHostCapacity(t, f.c, f.a.Name, 64, 65536, nil)
-	if err := corrosion.UpdateVMState(context.Background(), f.a.DB, "blocker", "stopped", ""); err != nil {
-		t.Fatal(err)
+	if _, err := f.c.SelfClient(f.a).DeleteVM(context.Background(), &pb.DeleteVMRequest{Name: "hog"}); err != nil {
+		t.Fatalf("delete hog: %v", err)
 	}
-	// blocker still counts for anti-affinity while stopped, so only big moves.
+	f.c.WaitConverged(t, convergeTimeout)
 	emulateLibvirtMove(f.b, f.a)
-	got, err = f.failback(t, true, false)
+	got, err = f.failback(t, f.b, &pb.FailbackHostRequest{All: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -334,22 +477,21 @@ func TestFleet_Failback_RespectsPlacement(t *testing.T) {
 	}
 }
 
-// Moves are one at a time with a pause between them: the rate bound.
+// Moves are one at a time with a pause between them.
 //
-// Mutation: drop the failbackPause wait in runFailback — the two moves are
-// back to back and the run is far shorter than one pause.
+// Mutation: drop the failbackPause wait in runFailback.
 func TestFleet_Failback_MovesAtABoundedRate(t *testing.T) {
-	f := newFB(t, 2)
+	f := newFB(t, 2, true)
 	pause := 400 * time.Millisecond
 	defer grpcapi.SetFailbackPauseForTest(pause)()
 	f.addVM(t, "r1", f.a, nil)
 	f.addVM(t, "r2", f.a, nil)
 	f.drain(t, f.b)
-	f.undrain(t)
+	f.undrainSettled(t, f.a)
 	emulateLibvirtMove(f.b, f.a)
 
 	start := time.Now()
-	got, err := f.failback(t, true, false)
+	got, err := f.failback(t, f.b, &pb.FailbackHostRequest{All: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -361,41 +503,35 @@ func TestFleet_Failback_MovesAtABoundedRate(t *testing.T) {
 	}
 }
 
-// --dry-run reports and moves nothing.
+// --dry-run reports and moves nothing, and spends nothing.
 func TestFleet_Failback_DryRunMovesNothing(t *testing.T) {
-	f := newFB(t, 2)
+	f := newFB(t, 2, true)
 	f.addVM(t, "d1", f.a, nil)
 	f.drain(t, f.b)
-	f.undrain(t)
-	got, err := f.failback(t, true, true)
+	f.undrainSettled(t, f.a)
+	got, err := f.failback(t, f.b, &pb.FailbackHostRequest{All: true, DryRun: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if p := got["d1"]; p == nil || p.Status != "would-move" {
 		t.Fatalf("dry run = %+v, want would-move", p)
 	}
-	if f.vm(t, "d1").HostName != f.b.Name || migrateCalls(f.b) != 0 {
-		t.Fatal("a dry run moved a VM")
-	}
-	if len(f.origins(t)) != 1 {
-		t.Fatal("a dry run spent the record")
+	if f.vmAt(t, f.b, "d1").HostName != f.b.Name || migrateCalls(f.b) != 0 || len(f.origins(t, f.b)) != 1 {
+		t.Fatal("a dry run moved a VM or spent a record")
 	}
 }
 
-// The host must be active, and a VM that is stopped or has a host-local disk is
-// reported and left with its record.
+// The host must be active; a stopped VM and one with a host-local disk are
+// reported, on the VM's events, and left with their records.
 func TestFleet_Failback_RefusesADrainingHostAndLeavesWhatItCannotMoveLive(t *testing.T) {
-	f := newFB(t, 2)
+	f := newFB(t, 2, true)
 	f.addVM(t, "live", f.a, nil)
 	f.drain(t, f.b)
-
-	if _, err := f.failback(t, true, false); err == nil || !strings.Contains(err.Error(), "undrain") {
+	if _, err := f.failback(t, f.b, &pb.FailbackHostRequest{All: true}); err == nil || !strings.Contains(err.Error(), "undrain") {
 		t.Fatalf("failback to a draining host = %v, want refused, naming undrain", err)
 	}
-	f.undrain(t)
+	f.undrainSettled(t, f.a)
 
-	// A stopped VM and one with a host-local disk, each with a record as a
-	// drain would have left it.
 	ctx := context.Background()
 	for _, name := range []string{"stopped", "local"} {
 		state, disk := "running", "nfs"
@@ -418,8 +554,9 @@ func TestFleet_Failback_RefusesADrainingHostAndLeavesWhatItCannotMoveLive(t *tes
 			t.Fatal(err)
 		}
 	}
+	f.c.WaitConverged(t, convergeTimeout)
 	emulateLibvirtMove(f.b, f.a)
-	got, err := f.failback(t, true, false)
+	got, err := f.failback(t, f.b, &pb.FailbackHostRequest{All: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -432,24 +569,50 @@ func TestFleet_Failback_RefusesADrainingHostAndLeavesWhatItCannotMoveLive(t *tes
 	if got["live"].GetStatus() != "moved" {
 		t.Errorf("live = %+v, want moved", got["live"])
 	}
-	if n := len(f.origins(t)); n != 2 {
+	evs, _ := corrosion.ListVMEvents(ctx, f.b.DB, "local", 20, "")
+	found := false
+	for _, e := range evs {
+		found = found || (e.Type == "vm.failback" && strings.Contains(e.Detail, "host-local"))
+	}
+	if !found {
+		t.Errorf("the skip of local is not on the VM's events: %+v", evs)
+	}
+	if n := len(f.origins(t, f.b)); n != 2 {
 		t.Errorf("%d records left, want the two that could not move live", n)
 	}
 }
 
-// Until failover_scope_v1 has latched nothing is written to cluster_policies, so
-// a drain records nothing and failback has nothing to move.
-func TestFleet_Failback_DrainRecordsNothingBeforeTheGateOpens(t *testing.T) {
-	f := newFB(t, 2)
-	for _, n := range f.c.Nodes {
-		n.DB.SetClusterPolicyGate(func() bool { return false })
-	}
+// Until every host runs the release that cancels drain records, nothing is
+// recorded, failback refuses and says it waits for the upgrade, and an undrain
+// behaves as it always has (and says so when the policy is on).
+//
+// Mutation: drop the failbackFeatureGate call in recordDrainOrigin - a record
+// reaches every replica; drop it in failbackPreflight - the failback runs.
+func TestFleet_Failback_WaitsForTheUpgrade(t *testing.T) {
+	f := newFB(t, 2, false)
 	f.addVM(t, "w", f.a, nil)
 	f.drain(t, f.b)
-	if f.vm(t, "w").HostName != f.b.Name {
+	if f.vmAt(t, f.b, "w").HostName != f.b.Name {
 		t.Fatal("the drain itself must not depend on the gate")
 	}
 	for _, n := range f.c.Nodes {
 		assertNoPolicyStatements(t, n)
+	}
+	for _, n := range f.c.Nodes {
+		n.DB.SetClusterPolicyGate(func() bool { return true })
+	}
+	if err := corrosion.SetFailbackPolicy(context.Background(), f.a.DB, true, "test"); err != nil {
+		t.Fatal(err)
+	}
+	h := f.undrain(t, f.a)
+	if h.FailbackStarted || !strings.Contains(h.FailbackNote, "waits for the upgrade") {
+		t.Fatalf("undrain reply = started %v note %q, want it to say failback waits for the upgrade", h.FailbackStarted, h.FailbackNote)
+	}
+	if _, err := f.failback(t, f.a, &pb.FailbackHostRequest{All: true}); status.Code(err) != codes.FailedPrecondition ||
+		!strings.Contains(err.Error(), "waits for the upgrade") {
+		t.Fatalf("failback before the upgrade = %v, want FailedPrecondition: waits for the upgrade", err)
+	}
+	if f.vmAt(t, f.a, "w").HostName != f.b.Name {
+		t.Fatal("a VM moved back before the upgrade finished")
 	}
 }

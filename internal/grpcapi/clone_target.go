@@ -27,12 +27,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/safename"
 )
 
@@ -40,7 +42,7 @@ import (
 // done, on whichever node entered the call and again on the source's host.
 func (s *Server) validateCloneTarget(ctx context.Context, req *pb.CloneVMRequest, src *corrosion.VMRecord, project string) error {
 	poolHost := src.HostName
-	if th := req.TargetHost; th != "" && th != src.HostName {
+	if th := req.DestinationHost; th != "" && th != src.HostName {
 		h, err := corrosion.GetHost(ctx, s.db, th)
 		if err != nil || h == nil {
 			return status.Errorf(codes.NotFound, "target host %q not found", th)
@@ -56,6 +58,24 @@ func (s *Server) validateCloneTarget(ctx context.Context, req *pb.CloneVMRequest
 				"a linked clone cannot be made on another host: it is an overlay on its source's disk, which only "+src.HostName+" holds; use --mode full")
 		}
 		poolHost = th
+		// Every permission the whole clone needs, before a byte is copied: the
+		// move runs as the caller (so vm.migrate), a pool on that host takes a
+		// move-volume (vm.move), --start a start, and a move that fails is
+		// cleaned up by deleting the staged copy (vm.delete). A caller who lacks
+		// one is refused now, not after the copy.
+		newVM := vmRBACPathFor(project, req.Target)
+		verbs := []string{"vm.migrate", "vm.delete"}
+		if req.TargetPool != "" {
+			verbs = append(verbs, "vm.move")
+		}
+		if req.Start {
+			verbs = append(verbs, "vm.start")
+		}
+		for _, v := range verbs {
+			if err := s.RequirePerm(ctx, newVM, v, "operator"); err != nil {
+				return err
+			}
+		}
 	}
 	if req.TargetPool == "" {
 		return nil
@@ -140,12 +160,39 @@ func (s *Server) cloneTargetPoolFor(ctx context.Context, project, name string, s
 	return &cloneTargetPool{name: name, ref: ref, dir: dir}, nil
 }
 
-// finishCrossHostClone moves the staged clone to req.TargetHost, puts its disks
+// requireCloneSpace refuses a full clone whose copy would not fit in dir with
+// the headroom a cold migration also leaves (requireDiskSpace): the thin disks
+// of the guests running on that filesystem pause when it fills, so a copy that
+// would take it that far is refused before it starts. need is the allocated size
+// of each source disk's chain, never less than the flatten's own estimate.
+func (s *Server) requireCloneSpace(ctx context.Context, dir string, srcDisks []corrosion.DiskRecord) error {
+	var need uint64
+	for _, d := range srcDisks {
+		src := s.hostDiskFile(d.Path)
+		alloc, aerr := chainAllocated(src)
+		info, ierr := qcow2.Info(src)
+		if aerr != nil || ierr != nil {
+			need += uint64(max(d.SizeBytes, 0)) // cannot measure: the declared size
+			continue
+		}
+		need += coldFlattenEstimate(alloc, info.VirtualSize)
+	}
+	probe := nearestExistingDir(s.hostDiskFile(dir))
+	return s.requireDiskSpace(probe, dir, "the clone's disks", need)
+}
+
+// finishCrossHostClone moves the staged clone to req.DestinationHost, puts its disks
 // in req.TargetPool, and starts it when asked. Each step leaves a complete VM
 // behind if the next fails, and the error says where it is and the command that
 // finishes the job.
 func (s *Server) finishCrossHostClone(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, error) {
-	th, name := req.TargetHost, req.Target
+	th, name := req.DestinationHost, req.Target
+	// Detached from the request, with a deadline: a client that goes away after
+	// the copy is made must not strand a staged VM on the wrong host with nothing
+	// saying where it was going (the event below says).
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 4*time.Hour)
+	defer cancel()
+	s.recordVMEvent(ctx, name, "vm.clone.staged", "ok", fmt.Sprintf("staged on %s for %s (pool %q, start %t)", s.hostName, th, req.TargetPool, req.Start))
 	if err := s.MigrateVM(&pb.MigrateVMRequest{
 		VmName: name, TargetHost: th, Strategy: pb.MigrateStrategy_MIGRATE_COLD,
 	}, &discardMigrateStream{ctx: ctx}); err != nil {
@@ -153,10 +200,20 @@ func (s *Server) finishCrossHostClone(ctx context.Context, req *pb.CloneVMReques
 		if code == codes.OK || code == codes.Unknown {
 			code = codes.Internal
 		}
+		// The staged copy is only a copy: it holds nothing the source does not,
+		// and the target-side files of the failed move were removed by the move's
+		// own abort. Remove it, so a failed clone leaves nothing on the source
+		// host's disks. If the delete itself fails, say where it is.
+		if _, derr := s.DeleteVM(ctx, &pb.DeleteVMRequest{Name: name}); derr != nil {
+			return nil, status.Errorf(code,
+				"VM %q was cloned on %s but could not be moved to %s: %s. The staged copy could not be removed (%s): "+
+					"it is a complete, stopped VM on %s; delete it with `lv rm %s`, or move it with `lv migrate %s %s --cold`",
+				name, s.hostName, th, status.Convert(err).Message(), status.Convert(derr).Message(), s.hostName, name, name, th)
+		}
+		s.recordVMEvent(ctx, name, "vm.clone.staged", "error", "the move to "+th+" failed and the staged copy was removed: "+status.Convert(err).Message())
 		return nil, status.Errorf(code,
-			"VM %q was cloned on %s but could not be moved to %s: %s. It is a complete, stopped VM on %s: "+
-				"move it with `lv migrate %s %s --cold`, or delete it with `lv rm %s`",
-			name, s.hostName, th, status.Convert(err).Message(), s.hostName, name, th, name)
+			"VM %q could not be cloned onto %s: %s. The staged copy on %s was removed; nothing is left behind",
+			name, th, status.Convert(err).Message(), s.hostName)
 	}
 	s.recordVMEvent(ctx, name, "vm.clone.moved", "ok", fmt.Sprintf("cloned on %s, moved to %s", s.hostName, th))
 

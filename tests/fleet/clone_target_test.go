@@ -88,7 +88,7 @@ func (f *cloneFleet) vm(t *testing.T, name string) *corrosion.VMRecord {
 // the source and the host assertion fails.
 func TestFleet_Clone_ToAnotherHost(t *testing.T) {
 	f := newCloneFleet(t)
-	vm, err := f.clone(t, &pb.CloneVMRequest{Target: "c1", TargetHost: f.dst.Name})
+	vm, err := f.clone(t, &pb.CloneVMRequest{Target: "c1", DestinationHost: f.dst.Name})
 	if err != nil {
 		t.Fatalf("clone to another host: %v", err)
 	}
@@ -127,7 +127,7 @@ func TestFleet_Clone_ToAnotherHost(t *testing.T) {
 // --start starts it on the target.
 func TestFleet_Clone_ToAnotherHostAndStart(t *testing.T) {
 	f := newCloneFleet(t)
-	if _, err := f.clone(t, &pb.CloneVMRequest{Target: "c2", TargetHost: f.dst.Name, Start: true}); err != nil {
+	if _, err := f.clone(t, &pb.CloneVMRequest{Target: "c2", DestinationHost: f.dst.Name, Start: true}); err != nil {
 		t.Fatalf("clone: %v", err)
 	}
 	if rec := f.vm(t, "c2"); rec.HostName != f.dst.Name || rec.State != "running" {
@@ -142,13 +142,13 @@ func TestFleet_Clone_ToAnotherHostAndStart(t *testing.T) {
 }
 
 // A target that will not take the disk (a file it did not make is already at
-// the path) leaves the clone, whole, on the source's host, and the error says
-// where it is and how to finish.
+// the path) leaves NOTHING behind: the staged copy on the source host is
+// removed (row, disk file, domain), the target's own file is untouched, and the
+// error says the copy was removed.
 //
-// Mutation: roll the clone back (delete it) when the move fails — the VM row
-// is gone and the assertion fails; drop the guidance from the message — the
-// error check fails.
-func TestFleet_Clone_FailedMoveLeavesTheCloneOnTheSource(t *testing.T) {
+// Mutation: skip the DeleteVM cleanup in finishCrossHostClone - the staged
+// clone, a full disk on the source filesystem, stays.
+func TestFleet_Clone_FailedMoveRemovesTheStagedCopy(t *testing.T) {
 	f := newCloneFleet(t)
 	store := image.NewStore(filepath.Join(f.c.tmpRoot, "shared-data"))
 	blocker := f.file(f.dst, store.DiskPath("c3", "root"))
@@ -159,40 +159,50 @@ func TestFleet_Clone_FailedMoveLeavesTheCloneOnTheSource(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err := f.clone(t, &pb.CloneVMRequest{Target: "c3", TargetHost: f.dst.Name})
+	_, err := f.clone(t, &pb.CloneVMRequest{Target: "c3", DestinationHost: f.dst.Name})
 	if err == nil {
 		t.Fatal("the clone claimed success although the target refused the disk")
 	}
-	for _, want := range []string{"cloned on " + f.src.Name, "could not be moved to " + f.dst.Name, "lv migrate c3 " + f.dst.Name + " --cold"} {
+	for _, want := range []string{"could not be cloned onto " + f.dst.Name, "staged copy on " + f.src.Name + " was removed"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q lacks %q", err, want)
 		}
 	}
-	rec := f.vm(t, "c3")
-	if rec.HostName != f.src.Name || rec.State != "stopped" {
-		t.Fatalf("clone row = host %s state %s, want %s stopped", rec.HostName, rec.State, f.src.Name)
+	if vm, _ := corrosion.GetVM(context.Background(), f.entry.DB, "c3"); vm != nil {
+		t.Errorf("the staged VM row is still there: host %s state %s", vm.HostName, vm.State)
 	}
-	if _, err := os.Stat(f.file(f.src, store.DiskPath("c3", "root"))); err != nil {
-		t.Errorf("the clone's disk is missing from the source: %v", err)
+	if _, err := os.Stat(f.file(f.src, store.DiskPath("c3", "root"))); !os.IsNotExist(err) {
+		t.Errorf("the staged disk is still on the source host (stat err %v)", err)
+	}
+	if f.src.Virt.DomainExists("c3") {
+		t.Errorf("the staged domain is still defined on the source host")
 	}
 	if b, _ := os.ReadFile(blocker); string(b) != "not made by this clone" {
 		t.Errorf("the file the target already had was overwritten: %q", b)
+	}
+	evs, _ := corrosion.ListVMEvents(context.Background(), f.entry.DB, "c3", 20, "")
+	staged := false
+	for _, e := range evs {
+		staged = staged || e.Type == "vm.clone.staged"
+	}
+	if !staged {
+		t.Errorf("no vm.clone.staged event names where the clone was going")
 	}
 }
 
 // Refusals before anything is made.
 func TestFleet_Clone_ToAnotherHostRefusals(t *testing.T) {
 	f := newCloneFleet(t)
-	if _, err := f.clone(t, &pb.CloneVMRequest{Target: "c4", TargetHost: "nowhere"}); status.Code(err) != codes.NotFound {
+	if _, err := f.clone(t, &pb.CloneVMRequest{Target: "c4", DestinationHost: "nowhere"}); status.Code(err) != codes.NotFound {
 		t.Errorf("unknown host = %v, want NotFound", err)
 	}
-	if _, err := f.clone(t, &pb.CloneVMRequest{Target: "c4", TargetHost: f.dst.Name, Mode: "linked"}); status.Code(err) != codes.InvalidArgument {
+	if _, err := f.clone(t, &pb.CloneVMRequest{Target: "c4", DestinationHost: f.dst.Name, Mode: "linked"}); status.Code(err) != codes.InvalidArgument {
 		t.Errorf("linked on another host = %v, want InvalidArgument", err)
 	}
 	if err := corrosion.UpdateHostState(context.Background(), f.entry.DB, f.dst.Name, "draining"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.clone(t, &pb.CloneVMRequest{Target: "c4", TargetHost: f.dst.Name}); status.Code(err) != codes.FailedPrecondition {
+	if _, err := f.clone(t, &pb.CloneVMRequest{Target: "c4", DestinationHost: f.dst.Name}); status.Code(err) != codes.FailedPrecondition {
 		t.Errorf("draining host = %v, want FailedPrecondition", err)
 	}
 	if vm, _ := corrosion.GetVM(context.Background(), f.entry.DB, "c4"); vm != nil {
@@ -221,7 +231,7 @@ func TestFleet_Clone_ToAnotherHostIntoItsPool(t *testing.T) {
 	// The daemon seeds this from config and the replicated table at start.
 	f.dst.Server.SetStoragePoolsByName(map[string]grpcapi.StoragePoolRef{"ssd": {Driver: "dir", Target: poolDir}})
 
-	if _, err := f.clone(t, &pb.CloneVMRequest{Target: "c5", TargetHost: f.dst.Name, TargetPool: "ssd"}); err != nil {
+	if _, err := f.clone(t, &pb.CloneVMRequest{Target: "c5", DestinationHost: f.dst.Name, TargetPool: "ssd"}); err != nil {
 		t.Fatalf("clone into a pool on another host: %v", err)
 	}
 	rec := f.vm(t, "c5")

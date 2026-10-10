@@ -42,14 +42,17 @@ Where the clone lives (default: the source's host, in its default disk directory
            disks are, then moved to that host the way lv migrate --cold moves a
            stopped VM: its disks stream over the cluster's mTLS connection, its
            domain is defined there, and the staged copy is removed. A linked
-           clone cannot be made on another host. Needs the migrate permission
-           on the new VM as well as the clone permissions.
+           clone cannot be made on another host. Needs vm.migrate and vm.delete
+           on the new VM (vm.start with --start) as well as the clone
+           permissions, all checked as you before the copy starts, and room
+           for the staged copy on the source host.
   --pool   a file-based storage pool (local, dir, nfs, btrfs) on the host the
            clone ends up on. A clone in a pool is a full copy. Needs the project
            to be allowed to use the pool (and, on another host, the move-volume
-           permission).
-If a later step fails, the clone is left as a complete stopped VM and the error
-names where it is and the command that finishes the job.
+           permission, vm.move).
+If the move fails, the staged copy is removed and nothing is left behind. If it
+succeeded and a later step (the pool, the start) fails, the VM is complete on its
+host and the error names the command that finishes the job.
 
 Examples:
   lv clone ubuntu-template web-01
@@ -61,15 +64,15 @@ Examples:
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				var hdr metadata.MD
 				vm, err := c.CloneVM(ctx, &pb.CloneVMRequest{
-					Source:     args[0],
-					Target:     args[1],
-					Mode:       mode,
-					Project:    project,
-					Ip:         ip,
-					Start:      start,
-					Snapshot:   snapshot,
-					TargetHost: host,
-					TargetPool: pool,
+					Source:          args[0],
+					Target:          args[1],
+					Mode:            mode,
+					Project:         project,
+					Ip:              ip,
+					Start:           start,
+					Snapshot:        snapshot,
+					DestinationHost: host,
+					TargetPool:      pool,
 				}, grpc.Header(&hdr))
 				if err != nil {
 					return fmt.Errorf("clone VM: %w", err)

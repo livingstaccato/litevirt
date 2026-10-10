@@ -2,11 +2,14 @@ package fleet
 
 import (
 	"context"
+	"errors"
 	"net"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
@@ -167,5 +170,112 @@ func TestFleet_MigrationNetwork_UnsetChangesNothing(t *testing.T) {
 	}
 	if hasMigrationFallbackEvent(t, src, "mem3") {
 		t.Errorf("a cluster with no migration network was warned about it")
+	}
+}
+
+// A source with no address in the network sends nothing to the target's
+// address there: the default route would carry it. The move falls back with the
+// warning.
+//
+// Mutation: drop the source-address check in chooseMigrationRoute - the note
+// records addr=10.9.0.2.
+func TestFleet_MigrationNetwork_SourceWithoutAnAddressFallsBack(t *testing.T) {
+	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	defer c.Stop()
+	src, dst := c.Nodes[0], c.Nodes[1]
+	migrationTLSReady(src, true)
+	migrationTLSReady(dst, true)
+	onMigrationNet(dst, 2, false)
+	src.Server.SetLocalIPsForTest(func() ([]net.IP, error) { return []net.IP{net.IPv4(127, 0, 0, 1)}, nil })
+	src.Server.SetMigrationNetwork("10.9.0.0/24")
+	storageMigrationVM(t, src, filepath.Join(c.tmpRoot, dst.Name, "data", "disks", "pp1-root.qcow2"), 1<<30)
+
+	if err := runStorageMigration(t, c, src, dst.Name); err != nil {
+		t.Fatalf("migration: %v", err)
+	}
+	if note := lastMigrateNote(src); !strings.Contains(note, "addr=127.0.0.1") {
+		t.Errorf("libvirt migrate = %q; want the cluster address", note)
+	}
+	if !hasMigrationFallbackEvent(t, src, "pp1") {
+		t.Errorf("no fallback warning on the VM's events")
+	}
+}
+
+// An unencrypted storage copy (the operator allowed it) never goes onto the
+// migration network: it stays where a main build kept it.
+//
+// Mutation: choose the migration address for an unencrypted storage copy - the
+// note records addr=10.9.0.2 with tls=false.
+func TestFleet_MigrationNetwork_UnencryptedStorageCopyStaysOnTheClusterAddress(t *testing.T) {
+	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	defer c.Stop()
+	src, dst := c.Nodes[0], c.Nodes[1]
+	migrationTLSReady(src, false)
+	migrationTLSReady(dst, false)
+	src.Server.SetAllowUnencryptedStorageMigration(true)
+	onMigrationNet(src, 1, true)
+	onMigrationNet(dst, 2, false)
+	storageMigrationVM(t, src, filepath.Join(c.tmpRoot, dst.Name, "data", "disks", "pp1-root.qcow2"), 1<<30)
+
+	if err := runStorageMigration(t, c, src, dst.Name); err != nil {
+		t.Fatalf("migration: %v", err)
+	}
+	note := lastMigrateNote(src)
+	if !strings.Contains(note, "tls=false") || !strings.Contains(note, "addr=127.0.0.1") {
+		t.Errorf("libvirt migrate = %q; want the cluster address, unencrypted, as on main", note)
+	}
+	if !hasMigrationFallbackEvent(t, src, "pp1") {
+		t.Errorf("no warning that the copy stayed off the migration network")
+	}
+}
+
+// A cold move's disk stream (a stopped VM's migration, a drain's cold move, the
+// clone copy) is dialed at the target's migration address, and the bytes still
+// arrive.
+//
+// Mutation: drop `abort.diskAddr = route.addr` - the dial seam is never asked.
+func TestFleet_MigrationNetwork_ColdDiskStreamUsesTheMigrationAddress(t *testing.T) {
+	sc := newColdStoppedScenario(t)
+	onMigrationNet(sc.src, 1, true)
+	onMigrationNet(sc.dst, 2, false)
+	var asked []string
+	sc.src.Server.SetMigrationDialForTest(func(ctx context.Context, host, addr string) (pb.LiteVirtClient, func(), error) {
+		asked = append(asked, host+"@"+addr)
+		return sc.c.PeerClient(sc.src, sc.dst), func() {}, nil
+	})
+	if err := sc.migrateCold(t); err != nil {
+		t.Fatalf("cold migration: %v", err)
+	}
+	if len(asked) != 1 || asked[0] != sc.dst.Name+"@10.9.0.2" {
+		t.Fatalf("the disk stream was dialed at %v, want %s@10.9.0.2", asked, sc.dst.Name)
+	}
+	if got, err := os.ReadFile(sc.file(sc.dst, sc.disk)); err != nil || string(got) != string(sc.payload) {
+		t.Errorf("the disk did not arrive intact (err %v)", err)
+	}
+	if hasMigrationFallbackEvent(t, sc.src, "os1") {
+		t.Errorf("a move that used the network recorded a fallback")
+	}
+}
+
+// A migration address that does not answer is a warning, not a refusal: the
+// disk stream goes to the cluster address.
+//
+// Mutation: return the dial error from dialColdPeer instead of falling back -
+// the migration fails.
+func TestFleet_MigrationNetwork_ColdDiskStreamFallsBackWhenTheNetworkIsDown(t *testing.T) {
+	sc := newColdStoppedScenario(t)
+	onMigrationNet(sc.src, 1, true)
+	onMigrationNet(sc.dst, 2, false)
+	sc.src.Server.SetMigrationDialForTest(func(ctx context.Context, host, addr string) (pb.LiteVirtClient, func(), error) {
+		return nil, nil, errors.New("no route to host")
+	})
+	if err := sc.migrateCold(t); err != nil {
+		t.Fatalf("a down migration network must not refuse the move: %v", err)
+	}
+	if got, err := os.ReadFile(sc.file(sc.dst, sc.disk)); err != nil || string(got) != string(sc.payload) {
+		t.Errorf("the disk did not arrive intact (err %v)", err)
+	}
+	if !hasMigrationFallbackEvent(t, sc.src, "os1") {
+		t.Errorf("no fallback warning on the VM's events")
 	}
 }

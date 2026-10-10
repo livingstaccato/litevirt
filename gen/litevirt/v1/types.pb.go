@@ -4216,8 +4216,14 @@ type Host struct {
 	// numerator for disk_total_gib. Daemons before this field carried this
 	// figure in disk_used_gib.
 	DiskAllocatedGib int64 `protobuf:"varint,22,opt,name=disk_allocated_gib,json=diskAllocatedGib,proto3" json:"disk_allocated_gib,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// Set only in UndrainHost's reply: what the undrain did about failback.
+	// failback_started: a background failback run was started on the answering
+	// daemon (follow it with FailbackHost follow=true). failback_note says why
+	// not, or what to do, in words; empty when there is nothing to say.
+	FailbackStarted bool   `protobuf:"varint,23,opt,name=failback_started,json=failbackStarted,proto3" json:"failback_started,omitempty"`
+	FailbackNote    string `protobuf:"bytes,24,opt,name=failback_note,json=failbackNote,proto3" json:"failback_note,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *Host) Reset() {
@@ -4402,6 +4408,20 @@ func (x *Host) GetDiskAllocatedGib() int64 {
 		return x.DiskAllocatedGib
 	}
 	return 0
+}
+
+func (x *Host) GetFailbackStarted() bool {
+	if x != nil {
+		return x.FailbackStarted
+	}
+	return false
+}
+
+func (x *Host) GetFailbackNote() string {
+	if x != nil {
+		return x.FailbackNote
+	}
+	return ""
 }
 
 type Image struct {
@@ -6190,7 +6210,7 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\rselector_kind\x18\x02 \x01(\tR\fselectorKind\x121\n" +
 	"\adesired\x18\x03 \x01(\v2\x17.litevirt.v1.DeviceSpecR\adesired\x128\n" +
 	"\amembers\x18\x04 \x03(\v2\x1e.litevirt.v1.HardwarePCIMemberR\amembers\x12\x14\n" +
-	"\x05state\x18\x05 \x01(\tR\x05state\"\x93\a\n" +
+	"\x05state\x18\x05 \x01(\tR\x05state\"\xe3\a\n" +
 	"\x04Host\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x18\n" +
 	"\aaddress\x18\x02 \x01(\tR\aaddress\x12,\n" +
@@ -6219,7 +6239,9 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\x06region\x18\x14 \x01(\tR\x06region\x12\x1f\n" +
 	"\vcert_serial\x18\x15 \x01(\tR\n" +
 	"certSerial\x12,\n" +
-	"\x12disk_allocated_gib\x18\x16 \x01(\x03R\x10diskAllocatedGib\x1a9\n" +
+	"\x12disk_allocated_gib\x18\x16 \x01(\x03R\x10diskAllocatedGib\x12)\n" +
+	"\x10failback_started\x18\x17 \x01(\bR\x0ffailbackStarted\x12#\n" +
+	"\rfailback_note\x18\x18 \x01(\tR\ffailbackNote\x1a9\n" +
 	"\vLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x99\x02\n" +

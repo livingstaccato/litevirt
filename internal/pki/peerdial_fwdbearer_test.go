@@ -65,3 +65,22 @@ func TestPropagateFwdBearer_PresentButEmptyIncomingMD(t *testing.T) {
 		t.Errorf("propagated fwd-bearer from empty inbound MD: %v", md.Get(FwdBearerMDKey))
 	}
 }
+
+// A call that itself arrived forwarded (the bearer under FwdBearerMDKey, no
+// authorization) passes the bearer on, so a continuation on a third host is
+// authorized as the user and not as the peer.
+//
+// Mutation: drop the FwdBearerMDKey fallback in propagateFwdBearer.
+func TestPropagateFwdBearer_SecondHopKeepsTheCaller(t *testing.T) {
+	in := metadata.NewIncomingContext(context.Background(), metadata.Pairs(FwdBearerMDKey, "Bearer lvs_abc"))
+	md, ok := metadata.FromOutgoingContext(propagateFwdBearer(in))
+	if !ok || len(md.Get(FwdBearerMDKey)) != 1 || md.Get(FwdBearerMDKey)[0] != "Bearer lvs_abc" {
+		t.Fatalf("second hop dropped the caller: %v", md)
+	}
+	// An authorization bearer still wins over a forwarded one.
+	in = metadata.NewIncomingContext(context.Background(), metadata.Pairs("authorization", "Bearer mine", FwdBearerMDKey, "Bearer other"))
+	md, _ = metadata.FromOutgoingContext(propagateFwdBearer(in))
+	if got := md.Get(FwdBearerMDKey); len(got) != 1 || got[0] != "Bearer mine" {
+		t.Fatalf("outgoing = %v, want the authorization bearer", got)
+	}
+}

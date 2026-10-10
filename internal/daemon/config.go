@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"net"
 	"net/netip"
 	"net/url"
 	"os"
@@ -822,9 +823,18 @@ func LoadConfig() (*Config, error) {
 	}
 
 	if cfg.Migration.Network != "" {
-		if _, err := grpcapi.ParseMigrationNetwork(cfg.Migration.Network); err != nil {
+		n, err := grpcapi.ParseMigrationNetwork(cfg.Migration.Network)
+		if err != nil {
 			return nil, err
 		}
+		if cfg.Migration.Address != "" {
+			a := net.ParseIP(cfg.Migration.Address)
+			if a == nil || a.To4() == nil || !n.Contains(a) {
+				return nil, fmt.Errorf("migration.address %q is not an IPv4 address inside migration.network %s", cfg.Migration.Address, cfg.Migration.Network)
+			}
+		}
+	} else if cfg.Migration.Address != "" {
+		return nil, fmt.Errorf("migration.address is set without migration.network")
 	}
 
 	// (No demote-vs-takeover timing invariant: majority reclaim is proof-gated, not
@@ -1104,6 +1114,16 @@ type MigrationConfig struct {
 	// one that cannot answer, is moved over the cluster address with a
 	// warning. Default empty: the cluster address.
 	Network string `yaml:"network,omitempty"`
+	// Address is this host's own address in Network, answered to a source that
+	// asks for it, instead of the one chosen among the host's addresses there.
+	// Set it where the host holds more than one address in the network, or a
+	// floating one a plain choice could pick. It must be inside Network.
+	Address string `yaml:"address,omitempty"`
+	// AllowAnyNetwork accepts a Network that is not inside a private (RFC 1918)
+	// range, or that contains this host's cluster or default-route address.
+	// Default false: such a network would send migration data out the uplink
+	// or the cluster interface, and the daemon refuses to start with one.
+	AllowAnyNetwork bool `yaml:"allow_any_network,omitempty"`
 }
 
 type CapacityConfig struct {

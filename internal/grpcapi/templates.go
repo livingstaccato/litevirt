@@ -114,12 +114,23 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 	// an ordinary full clone, and then moved to its host as `lv migrate --cold`
 	// moves any stopped VM: its disks streamed over the peer connection, its
 	// domain defined there, the staged copy removed once the handoff commits.
-	crossHost := req.TargetHost != "" && req.TargetHost != s.hostName
+	crossHost := req.DestinationHost != "" && req.DestinationHost != s.hostName
 	if !crossHost {
 		return s.cloneVMOnSource(ctx, req, src, project)
 	}
+	// The move, the pool step and the start run as the caller. A request that
+	// reached this host forwarded by a peer carries the caller only where
+	// forwarded identity is enforced; where it is not, every step here would run
+	// as the peer (admin), which no permission check of the caller's has judged
+	// at this host. Refused, with the way out, rather than run as admin.
+	if kind, _ := ctx.Value(ctxKeyPrincipalKind).(string); kind == principalKindPeer && fwdBearerFromCtx(ctx) != "" && !s.forwardedIdentityEnforced(ctx) {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"a clone onto another host entered at a node other than %s, where it is made, would run its move as a cluster peer, not as you, "+
+				"because forwarded identity is not enforced: send the request to %s (LV_HOST=%s), or enforce forwarded identity",
+			s.hostName, s.hostName, s.hostName)
+	}
 	staged := proto.Clone(req).(*pb.CloneVMRequest)
-	staged.Start, staged.TargetHost, staged.TargetPool, staged.Mode = false, "", "", "full"
+	staged.Start, staged.DestinationHost, staged.TargetPool, staged.Mode = false, "", "", "full"
 	if _, err := s.cloneVMOnSource(ctx, staged, src, project); err != nil {
 		return nil, err
 	}
@@ -243,6 +254,17 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 			if e := os.Remove(p); e != nil && !os.IsNotExist(e) {
 				slog.Warn("clone cleanup: remove disk", "path", p, "error", e)
 			}
+		}
+	}
+	if mode == "full" {
+		// The default disk directory holds the running guests' disks too, so the
+		// copy is admitted against its free space, with headroom, first.
+		spaceDir := filepath.Dir(s.images.DiskPath(req.Target, "root"))
+		if tpool != nil {
+			spaceDir = tpool.dir
+		}
+		if err := s.requireCloneSpace(ctx, spaceDir, srcDisks); err != nil {
+			return nil, err
 		}
 	}
 	for _, d := range srcDisks {

@@ -50,6 +50,13 @@ func propagateFwdBearer(ctx context.Context) context.Context {
 	}
 	auth := md.Get("authorization")
 	if len(auth) == 0 || auth[0] == "" {
+		// A call that itself arrived forwarded carries the bearer under
+		// FwdBearerMDKey and no authorization: pass it on, or a second hop (an
+		// operation the entry node's peer continues on a third host) would
+		// reach its target as a plain peer, which is the system identity.
+		auth = md.Get(FwdBearerMDKey)
+	}
+	if len(auth) == 0 || auth[0] == "" {
 		return ctx
 	}
 	return metadata.AppendToOutgoingContext(ctx, FwdBearerMDKey, auth[0])

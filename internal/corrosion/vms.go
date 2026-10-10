@@ -1128,6 +1128,7 @@ func TransferVMOwner(ctx context.Context, c *Client, name, hostName, state strin
 	if !applied {
 		return ErrNoRowsAffected
 	}
+	SpendDrainOrigin(ctx, c, name)
 	return nil
 }
 
@@ -1177,6 +1178,7 @@ func TransferVMOwnerWithDisks(ctx context.Context, c *Client, name, hostName, st
 	if !applied {
 		return ErrNoRowsAffected
 	}
+	SpendDrainOrigin(ctx, c, name)
 	return nil
 }
 
@@ -1892,7 +1894,11 @@ func CommitMigrationOwnership(ctx context.Context, c *Client, vmName, sourceHost
 		return true, nil
 	}
 
-	return c.ExecuteBatchGuarded(ctx, guard, stmts)
+	ok, err := c.ExecuteBatchGuarded(ctx, guard, stmts)
+	if ok && err == nil {
+		SpendDrainOrigin(ctx, c, vmName)
+	}
+	return ok, err
 }
 
 // vmDiskHostMoveSQL repoints one disk row at a host. Every site that moves a
@@ -1911,7 +1917,7 @@ const vmDiskHostMoveSQL = `UPDATE vm_disks SET host_name = ?, updated_at = ?
 // them. committed=false when the row is no longer the migration's.
 func RepointMigratedVM(ctx context.Context, c *Client, vmName, sourceHost, targetHost, finalState string) (bool, error) {
 	now := c.NowTS()
-	return c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+	ok, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
 		var host, state string
 		switch err := tx.QueryRowContext(ctx, `SELECT host_name, state FROM vms WHERE name = ? AND deleted_at IS NULL`, vmName).
 			Scan(&host, &state); {
@@ -1925,6 +1931,10 @@ func RepointMigratedVM(ctx context.Context, c *Client, vmName, sourceHost, targe
 		SQL:    vmHostStateSQL,
 		Params: []interface{}{targetHost, finalState, now, vmName},
 	}})
+	if ok && err == nil {
+		SpendDrainOrigin(ctx, c, vmName)
+	}
+	return ok, err
 }
 
 // RescheduleVMHost re-keys a VM to hostName in state, with its disk rows, in
@@ -1975,6 +1985,7 @@ func RescheduleVMHost(ctx context.Context, c *Client, name, hostName, state stri
 	if !applied {
 		return ErrNoRowsAffected
 	}
+	SpendDrainOrigin(ctx, c, name)
 	return nil
 }
 

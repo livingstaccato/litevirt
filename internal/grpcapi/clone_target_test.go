@@ -8,12 +8,14 @@ import (
 	"testing"
 
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/image"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
+	"github.com/litevirt/litevirt/internal/pki"
 )
 
 func cloneTargetServer(t *testing.T) *Server {
@@ -101,10 +103,10 @@ func TestCloneVM_TargetRefusals(t *testing.T) {
 		code codes.Code
 		want string
 	}{
-		{"unknown host", &pb.CloneVMRequest{TargetHost: "nowhere"}, codes.NotFound, "not found"},
-		{"draining host", &pb.CloneVMRequest{TargetHost: "draining"}, codes.FailedPrecondition, "not active"},
-		{"witness host", &pb.CloneVMRequest{TargetHost: "wit"}, codes.FailedPrecondition, "witness"},
-		{"linked on another host", &pb.CloneVMRequest{TargetHost: "h2", Mode: "linked"}, codes.InvalidArgument, "linked clone"},
+		{"unknown host", &pb.CloneVMRequest{DestinationHost: "nowhere"}, codes.NotFound, "not found"},
+		{"draining host", &pb.CloneVMRequest{DestinationHost: "draining"}, codes.FailedPrecondition, "not active"},
+		{"witness host", &pb.CloneVMRequest{DestinationHost: "wit"}, codes.FailedPrecondition, "witness"},
+		{"linked on another host", &pb.CloneVMRequest{DestinationHost: "h2", Mode: "linked"}, codes.InvalidArgument, "linked clone"},
 		{"linked in a pool", &pb.CloneVMRequest{TargetPool: "ssd", Mode: "linked"}, codes.InvalidArgument, "linked clone"},
 		{"unknown pool", &pb.CloneVMRequest{TargetPool: "nope"}, codes.NotFound, "not configured"},
 		{"block pool", &pb.CloneVMRequest{TargetPool: "ceph1"}, codes.FailedPrecondition, "not file-based"},
@@ -149,5 +151,98 @@ func TestCloneVM_IntoAPoolNeverOverwritesAFile(t *testing.T) {
 	}
 	if vm, _ := corrosion.GetVM(context.Background(), s.db, "c2"); vm != nil {
 		t.Fatal("a refused clone left a VM row")
+	}
+}
+
+// Every permission the whole clone needs is checked, as the caller, before a
+// byte is copied: a caller who may clone but not migrate, delete (the cleanup of
+// a failed move), move a volume (a pool on the target) or start is refused up
+// front, and nothing is made on the source host.
+//
+// Mutation: drop the verb loop in validateCloneTarget - each row reaches the
+// copy and is refused later, or not at all, and leaves a VM row or a disk.
+func TestCloneVM_CrossHostChecksEveryPermissionBeforeTheCopy(t *testing.T) {
+	all := []string{"vm.create", "backup.create", "vm.migrate", "vm.delete", "vm.move", "vm.start"}
+	ctx0 := context.Background()
+	for _, missing := range []string{"vm.migrate", "vm.delete", "vm.move", "vm.start"} {
+		t.Run("without "+missing, func(t *testing.T) {
+			s := cloneTargetServer(t)
+			if err := corrosion.InsertHost(ctx0, s.db, corrosion.HostRecord{Name: "h2", Address: "10.0.0.4", SSHUser: "root", State: "active", CertSerial: "s3"}); err != nil {
+				t.Fatal(err)
+			}
+			if err := corrosion.UpsertStoragePool(ctx0, s.db, corrosion.StoragePoolRecord{HostName: "h2", Name: "ssd", Driver: "dir", Target: t.TempDir(), State: "active"}); err != nil {
+				t.Fatal(err)
+			}
+			var verbs []string
+			for _, v := range all {
+				if v != missing {
+					verbs = append(verbs, v)
+				}
+			}
+			if err := corrosion.InsertRole(ctx0, s.db, corrosion.RoleRecord{Name: "Cloner", Verbs: verbs}); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.db.Execute(ctx0, `UPDATE vms SET project = ?, updated_at = ? WHERE name = ?`, "beta", s.db.NowTS(), "tpl"); err != nil {
+				t.Fatal(err)
+			}
+			ctx := boundAtCtx(t, s, "carol", "operator", "Cloner", "/projects/beta")
+			_, err := s.CloneVM(ctx, &pb.CloneVMRequest{Source: "tpl", Target: "c9", Project: "beta", DestinationHost: "h2", TargetPool: "ssd", Start: true})
+			if status.Code(err) != codes.PermissionDenied {
+				t.Fatalf("CloneVM without %s = %v, want PermissionDenied", missing, err)
+			}
+			if vm, _ := corrosion.GetVM(ctx0, s.db, "c9"); vm != nil {
+				t.Errorf("a refused clone left a VM row")
+			}
+			if _, err := os.Stat(s.images.DiskPath("c9", "root")); err == nil {
+				t.Errorf("a refused clone had already copied its disk")
+			}
+		})
+	}
+}
+
+// The copy is admitted against the source host's free space with the cold-move
+// headroom, before it starts: a clone that would take the filesystem that holds
+// the running guests' disks that close to full is refused with the number.
+//
+// Mutation: drop the requireCloneSpace call - the clone is made.
+func TestCloneVM_FullCopyIsRefusedWhenItWouldEndangerTheFilesystem(t *testing.T) {
+	s := cloneTargetServer(t)
+	// Room for the copy but not for the headroom a cold migration also leaves.
+	s.diskSpaceOverride = func(string) (uint64, uint64, error) { return 1<<30 + 8<<20, 100 << 30, nil }
+	_, err := s.CloneVM(adminCtx(), &pb.CloneVMRequest{Source: "tpl", Target: "tight", Mode: "full"})
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "MiB") {
+		t.Fatalf("CloneVM on a nearly full filesystem = %v, want FailedPrecondition naming the sizes", err)
+	}
+	if vm, _ := corrosion.GetVM(context.Background(), s.db, "tight"); vm != nil {
+		t.Error("a refused clone left a VM row")
+	}
+	if _, err := os.Stat(s.images.DiskPath("tight", "root")); err == nil {
+		t.Error("a refused clone left a disk file")
+	}
+	s.diskSpaceOverride = func(string) (uint64, uint64, error) { return 100 << 30, 100 << 30, nil }
+	if _, err := s.CloneVM(adminCtx(), &pb.CloneVMRequest{Source: "tpl", Target: "roomy", Mode: "full"}); err != nil {
+		t.Fatalf("CloneVM with room: %v", err)
+	}
+}
+
+// A cross-host clone that reached the host where it is made forwarded by a
+// peer, while forwarded identity is not enforced, would run its move as the
+// peer (admin). It is refused with the way out, not run as admin.
+//
+// Mutation: drop the forwarded-identity refusal in CloneVM - the clone proceeds
+// (and fails later, or runs as admin).
+func TestCloneVM_CrossHostRefusesToRunAsAPeerWhenIdentityIsNotForwarded(t *testing.T) {
+	s := cloneTargetServer(t)
+	if err := corrosion.InsertHost(context.Background(), s.db, corrosion.HostRecord{Name: "h2", Address: "10.0.0.4", SSHUser: "root", State: "active", CertSerial: "s3"}); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.WithValue(adminCtx(), ctxKeyPrincipalKind, principalKindPeer)
+	ctx = metadata.NewIncomingContext(ctx, metadata.Pairs(pki.FwdBearerMDKey, "token"))
+	_, err := s.CloneVM(ctx, &pb.CloneVMRequest{Source: "tpl", Target: "fwd", DestinationHost: "h2"})
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "forwarded identity") {
+		t.Fatalf("CloneVM = %v, want FailedPrecondition naming forwarded identity", err)
+	}
+	if vm, _ := corrosion.GetVM(context.Background(), s.db, "fwd"); vm != nil {
+		t.Error("the refused clone left a VM row")
 	}
 }

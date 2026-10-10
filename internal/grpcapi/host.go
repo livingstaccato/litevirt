@@ -674,7 +674,7 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 		return progress
 	}
 	cdromSources := ens.remap
-	route := s.chooseMigrationRoute(ctx, vm.Name, target, ens.migAddr, false, srcTLS && ens.tlsReady)
+	route := s.chooseMigrationRoute(ctx, vm.Name, target, ens.migAddr, routeMemory, srcTLS && ens.tlsReady)
 	dconnuri := fmt.Sprintf("qemu+tls://%s/system", corrosion.URIHost(target.Address))
 	mp := libvirt.MigrateParams{Live: true, CDROMSources: cdromSources}
 	if route.direct {
@@ -735,11 +735,14 @@ func (s *Server) UndrainHost(ctx context.Context, req *pb.UndrainHostRequest) (*
 	}
 	s.publish("host.undrained", req.Name, "")
 	s.audit(ctx, "host.undrain", req.Name, "", "ok")
+	reply, err := s.InspectHost(ctx, &pb.InspectHostRequest{Name: req.Name})
+	if err != nil {
+		return nil, err
+	}
 	// Moves back, in the background, the VMs a drain moved away that opted in
-	// to returning (failback.go). Nothing, when none did.
-	s.autoFailback(ctx, req.Name)
-
-	return s.InspectHost(ctx, &pb.InspectHostRequest{Name: req.Name})
+	// to returning (failback.go), and says so in the reply.
+	s.autoFailback(ctx, req.Name, reply)
+	return reply, nil
 }
 
 // SetHostLabels sets or removes labels on a host.

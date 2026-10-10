@@ -140,3 +140,33 @@ func CollectDrainOrigin(ctx context.Context, c *Client, vm, setBy string) error 
 	}
 	return c.Execute(ctx, clusterPolicyUpsertSQL, drainOriginKeyPrefix+vm, "{}", setBy, c.NowTS())
 }
+
+// GetLiveDrainOrigin returns vm's drain record on this node's replica, and
+// whether it holds a live one (a collected record is not).
+func GetLiveDrainOrigin(ctx context.Context, c *Client, vm string) (DrainOrigin, bool, error) {
+	rows, err := c.Query(ctx,
+		`SELECT value FROM cluster_policies WHERE key = ? AND deleted_at IS NULL`, drainOriginKeyPrefix+vm)
+	if err != nil || len(rows) == 0 {
+		return DrainOrigin{}, false, err
+	}
+	var o DrainOrigin
+	if json.Unmarshal([]byte(rows[0].String("value")), &o) != nil || o.From == "" || o.To == "" {
+		return DrainOrigin{}, false, nil
+	}
+	o.VM = vm
+	return o, true, nil
+}
+
+// SpendDrainOrigin cancels vm's drain record, if it has a live one: the VM's
+// host has just changed, so the record no longer describes it. It is called by
+// every writer that changes a VM's host (grpcapi's failbackFeatureGate holds
+// failback back until every host does), after the change landed. A read first, so moving a VM no
+// drain moved writes nothing, and best effort: a record that stays behind is
+// caught by the owner-side check failback makes, and by the owner epoch where
+// the writer bumps it.
+func SpendDrainOrigin(ctx context.Context, c *Client, vm string) {
+	if _, live, err := GetLiveDrainOrigin(ctx, c, vm); err != nil || !live {
+		return
+	}
+	_ = CollectDrainOrigin(ctx, c, vm, "moved")
+}

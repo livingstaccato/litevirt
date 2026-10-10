@@ -71,6 +71,7 @@ func RekeyStoppedVM(ctx context.Context, c *Client, name, fromHost, destHost, st
 	if !applied {
 		return ErrNoRowsAffected
 	}
+	SpendDrainOrigin(ctx, c, name)
 	return nil
 }
 
@@ -113,6 +114,7 @@ func RekeyStoppedVMClaimed(ctx context.Context, c *Client, name, fromHost, destH
 	if !applied {
 		return ErrNoRowsAffected
 	}
+	SpendDrainOrigin(ctx, c, name)
 	return nil
 }
 

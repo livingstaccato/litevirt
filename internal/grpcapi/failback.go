@@ -35,6 +35,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -43,6 +44,7 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/placement"
 )
@@ -51,6 +53,15 @@ import (
 // returning host is not hit by every migration at once. A variable so tests
 // need not wait.
 var failbackPause = 20 * time.Second
+
+// failbackNotActiveWait and failbackNotActiveTries bound the wait for the
+// VM's owner to hear that the returning host is active again: an undrain
+// writes the host's state on one node, and the owner, which decides the move on
+// its own replica, can be a moment behind. Only that refusal is waited out.
+var (
+	failbackNotActiveWait  = 500 * time.Millisecond
+	failbackNotActiveTries = 30
+)
 
 // Failback result statuses (pb.FailbackProgress.Status).
 const (
@@ -65,35 +76,125 @@ type failbackOpts struct {
 	dryRun bool
 }
 
-// failbackRuns holds the hosts a failback is running for.
-type failbackRuns struct {
+// failbackRun is one failback on this daemon for one host: its results so far,
+// whether it has finished, and a way to wait for more. A run is kept after it
+// finishes, so the command that follows the run an undrain started sees every
+// result even if the run was quicker than the command.
+type failbackRun struct {
+	host    string
+	all     bool
+	started time.Time
+
 	mu      sync.Mutex
-	running map[string]bool
+	results []*pb.FailbackProgress
+	done    bool
+	err     error
+	wake    chan struct{} // closed and replaced whenever the run changes
 }
 
-func (f *failbackRuns) begin(host string) bool {
+func newFailbackRun(host string, all bool) *failbackRun {
+	return &failbackRun{host: host, all: all, started: time.Now(), wake: make(chan struct{})}
+}
+
+func (r *failbackRun) emit(p *pb.FailbackProgress) {
+	r.mu.Lock()
+	r.results = append(r.results, p)
+	close(r.wake)
+	r.wake = make(chan struct{})
+	r.mu.Unlock()
+}
+
+func (r *failbackRun) finish(err error) {
+	r.mu.Lock()
+	r.done, r.err = true, err
+	close(r.wake)
+	r.wake = make(chan struct{})
+	r.mu.Unlock()
+}
+
+// follow sends every result, past and to come, until the run is done or ctx is.
+func (r *failbackRun) follow(ctx context.Context, send func(*pb.FailbackProgress) error) error {
+	next := 0
+	for {
+		r.mu.Lock()
+		batch := append([]*pb.FailbackProgress(nil), r.results[next:]...)
+		done, err, wake := r.done, r.err, r.wake
+		r.mu.Unlock()
+		for _, p := range batch {
+			if serr := send(p); serr != nil {
+				return serr
+			}
+		}
+		next += len(batch)
+		if done && len(batch) == 0 {
+			return err
+		}
+		if done {
+			continue
+		}
+		select {
+		case <-wake:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// failbackRuns holds the latest run per host on this daemon.
+type failbackRuns struct {
+	mu   sync.Mutex
+	runs map[string]*failbackRun
+}
+
+// start registers a new run for host, unless one is still running.
+func (f *failbackRuns) start(host string, all bool) (*failbackRun, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.running == nil {
-		f.running = map[string]bool{}
+	if cur := f.runs[host]; cur != nil {
+		cur.mu.Lock()
+		running := !cur.done
+		cur.mu.Unlock()
+		if running {
+			return cur, false
+		}
 	}
-	if f.running[host] {
-		return false
+	if f.runs == nil {
+		f.runs = map[string]*failbackRun{}
 	}
-	f.running[host] = true
-	return true
+	r := newFailbackRun(host, all)
+	f.runs[host] = r
+	return r, true
 }
 
-func (f *failbackRuns) end(host string) {
+func (f *failbackRuns) latest(host string) *failbackRun {
 	f.mu.Lock()
-	delete(f.running, host)
-	f.mu.Unlock()
+	defer f.mu.Unlock()
+	return f.runs[host]
+}
+
+// failbackFeatureGate is the one place failback asks whether every host runs
+// the build that cancels a VM's drain record whenever its host changes (every
+// SpendDrainOrigin site). Until it passes, no record is written and nothing
+// fails back, and an undrain behaves exactly as it always has. It is a stub
+// over the durable failover_scope_v1 latch until the cluster's single release
+// token replaces it; nothing else in failback knows how the answer is reached.
+func (s *Server) failbackFeatureGate(ctx context.Context) error {
+	if s.gate != nil && s.gate.DurablyLatched(capabilities.FailoverScopeV1) {
+		return nil
+	}
+	return status.Error(codes.FailedPrecondition,
+		"failback waits for the upgrade: not every host runs the release that records what a drain moved. "+
+			"Finish rolling every host (and every host in maintenance) to this release")
 }
 
 // recordDrainOrigin notes that a drain of from moved vmName to to. It records
-// only a VM the drain really left on to, and says so in the log when it cannot:
-// failback is then unavailable for that VM, which is the safe direction.
+// only a VM the drain really left on to, and only once drain_record_v1 has
+// latched; failback is otherwise unavailable for that VM, the safe direction.
 func (s *Server) recordDrainOrigin(ctx context.Context, vmName, from, to string) {
+	if s.failbackFeatureGate(ctx) != nil {
+		slog.Info("drain: not recorded for failback: the upgrade has not finished on every host", "vm", vmName)
+		return
+	}
 	vm, err := corrosion.GetVM(ctx, s.db, vmName)
 	if err != nil || vm == nil || vm.HostName != to {
 		return
@@ -106,74 +207,78 @@ func (s *Server) recordDrainOrigin(ctx context.Context, vmName, from, to string)
 	}
 }
 
-// spendDrainOrigin collects vmName's drain record, when it has one: a live
-// migration has just moved the VM, so the record no longer describes where it
-// is. A read first, so a migration of a VM no drain moved writes nothing.
-func (s *Server) spendDrainOrigin(ctx context.Context, vmName string) {
-	rows, err := s.db.Query(ctx,
-		`SELECT value FROM cluster_policies WHERE key = ? AND deleted_at IS NULL AND value != '{}'`,
-		"drain_origin/"+vmName)
-	if err != nil || len(rows) == 0 {
-		return
+// failbackPreconditionMarker begins the message of the owner-side refusal of a
+// failback move, which failbackOne reports as a skip rather than a failure.
+const failbackPreconditionMarker = "failback precondition:"
+
+// checkDrainExpectation is the owner's half of a failback move, made under the
+// VM's lock against this host's own replica: this host owns the VM and is the
+// host the caller saw it on, the owner epoch is the one recorded, and the
+// drain record still stands, naming this host and the returning host. The
+// daemon that decided to move the VM read a replica that may lag; the host
+// that owns it cannot lag about where the VM is, nor about a migration it
+// made itself.
+func (s *Server) checkDrainExpectation(ctx context.Context, req *pb.MigrateVMRequest, vm *corrosion.VMRecord) error {
+	refuse := func(why string) error {
+		return status.Errorf(codes.FailedPrecondition, "%s %s: it is not where the drain left it", failbackPreconditionMarker, why)
 	}
-	if err := corrosion.CollectDrainOrigin(ctx, s.db, vmName, "migrate"); err != nil {
-		slog.Warn("migrate: could not spend the drain record; failback may move this VM back", "vm", vmName, "error", err)
+	if req.GetExpectHost() != s.hostName || vm.HostName != s.hostName {
+		return refuse(fmt.Sprintf("the VM was moved since the drain (the caller saw it on %s, it is on %s)", req.GetExpectHost(), vm.HostName))
 	}
+	if vm.OwnerEpoch != req.GetExpectOwnerEpoch() {
+		return refuse("the VM's ownership changed since the drain")
+	}
+	o, live, err := corrosion.GetLiveDrainOrigin(ctx, s.db, vm.Name)
+	if err != nil {
+		return status.Errorf(codes.Internal, "read the drain record of %q: %v", vm.Name, err)
+	}
+	if !live || o.To != s.hostName || o.From != req.GetTargetHost() || o.Epoch != req.GetExpectOwnerEpoch() || o.CreatedAt != vm.CreatedAt {
+		return refuse("the drain record no longer describes the VM (it was moved, or the record has not reached this host)")
+	}
+	return nil
 }
 
-// FailbackHost moves the VMs a drain moved off host back to it.
+// FailbackHost moves the VMs a drain moved off host back to it, or follows the
+// run an undrain started.
 func (s *Server) FailbackHost(req *pb.FailbackHostRequest, stream pb.LiteVirt_FailbackHostServer) error {
 	ctx := stream.Context()
 	if err := RequireRole(ctx, "admin"); err != nil {
 		return err
 	}
-	if req.GetName() == "" {
+	host := req.GetName()
+	if host == "" {
 		return status.Error(codes.InvalidArgument, "host name required")
 	}
-	return s.runFailback(ctx, req.GetName(), failbackOpts{all: req.GetAll(), dryRun: req.GetDryRun()},
-		func(p *pb.FailbackProgress) error { return stream.Send(p) })
-}
-
-// autoFailback is what an undrain starts: a failback of the VMs that opted in,
-// in the background, when there is anything to move. It returns at once.
-func (s *Server) autoFailback(ctx context.Context, host string) {
-	origins, err := corrosion.ListDrainOrigins(ctx, s.db, host)
-	if err != nil || len(origins) == 0 {
-		return
-	}
-	// Only when something would move: the policy is on, or a VM with a record
-	// opted in. An undrain that has nothing to do starts nothing.
-	if p, perr := corrosion.GetFailbackPolicy(ctx, s.db); perr != nil || !p.Enabled {
-		optedIn := false
-		for _, o := range origins {
-			vm, gerr := corrosion.GetVM(ctx, s.db, o.VM)
-			if gerr != nil || vm == nil || vm.Spec == "" {
-				continue
-			}
-			var spec pb.VMSpec
-			if json.Unmarshal([]byte(vm.Spec), &spec) == nil && spec.GetPlacement().GetFailback() {
-				optedIn = true
-				break
-			}
+	if req.GetFollow() {
+		run := s.failbacks.latest(host)
+		if run == nil {
+			return status.Errorf(codes.NotFound, "no failback to %q has run on %s", host, s.hostName)
 		}
-		if !optedIn {
-			return
-		}
+		return run.follow(ctx, stream.Send)
 	}
-	bg := context.WithValue(context.WithoutCancel(ctx), ctxKeyRole, "admin")
-	bg = context.WithValue(bg, ctxKeyUsername, "system:failback")
+	if err := s.failbackPreflight(ctx, host); err != nil {
+		return err
+	}
+	run, ok := s.failbacks.start(host, req.GetAll())
+	if !ok {
+		return status.Errorf(codes.FailedPrecondition,
+			"a failback to host %q is already running on %s (started %s): follow it with `lv host failback %s --follow`",
+			host, s.hostName, run.started.Format(time.RFC3339), host)
+	}
+	rctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	go func() {
-		err := s.runFailback(bg, host, failbackOpts{}, func(p *pb.FailbackProgress) error {
-			slog.Info("failback", "host", host, "vm", p.VmName, "status", p.Status, "reason", p.Reason)
-			return nil
-		})
-		if err != nil {
-			slog.Warn("failback ended early", "host", host, "error", err)
-		}
+		run.finish(s.runFailback(rctx, run, failbackOpts{all: req.GetAll(), dryRun: req.GetDryRun()}))
 	}()
+	return run.follow(ctx, stream.Send)
 }
 
-func (s *Server) runFailback(ctx context.Context, host string, opts failbackOpts, emit func(*pb.FailbackProgress) error) error {
+// failbackPreflight refuses a failback that cannot run at all: the token has
+// not latched, the host is unknown or not active.
+func (s *Server) failbackPreflight(ctx context.Context, host string) error {
+	if err := s.failbackFeatureGate(ctx); err != nil {
+		return err
+	}
 	h, err := corrosion.GetHost(ctx, s.db, host)
 	if err != nil || h == nil {
 		return status.Errorf(codes.NotFound, "host %q not found", host)
@@ -182,11 +287,75 @@ func (s *Server) runFailback(ctx context.Context, host string, opts failbackOpts
 		return status.Errorf(codes.FailedPrecondition,
 			"host %q is %s: failback returns VMs to an active host (`lv host undrain %s` first)", host, h.State, host)
 	}
-	if !s.failbacks.begin(host) {
-		return status.Errorf(codes.FailedPrecondition, "a failback to host %q is already running", host)
-	}
-	defer s.failbacks.end(host)
+	return nil
+}
 
+// autoFailback is what an undrain starts: a failback of the VMs that opted in,
+// in the background, when there is anything to move. It returns at once and
+// says, for the undrain's reply, what it did.
+func (s *Server) autoFailback(ctx context.Context, host string, h *pb.Host) {
+	policy, perr := corrosion.GetFailbackPolicy(ctx, s.db)
+	if s.failbackFeatureGate(ctx) != nil {
+		if perr == nil && policy.Enabled {
+			h.FailbackNote = "failback waits for the upgrade: not every host runs the release that records drains, " +
+				"so nothing was recorded for the cluster failback policy to move back; this undrain behaved as it always has"
+		}
+		return
+	}
+	origins, err := corrosion.ListDrainOrigins(ctx, s.db, host)
+	if err != nil || len(origins) == 0 {
+		return
+	}
+	// Only when something would move: the policy is on, or a VM with a record
+	// opted in.
+	optedIn := perr == nil && policy.Enabled
+	for _, o := range origins {
+		if optedIn {
+			break
+		}
+		vm, gerr := corrosion.GetVM(ctx, s.db, o.VM)
+		if gerr != nil || vm == nil || vm.Spec == "" {
+			continue
+		}
+		var spec pb.VMSpec
+		if json.Unmarshal([]byte(vm.Spec), &spec) == nil && spec.GetPlacement().GetFailback() {
+			optedIn = true
+		}
+	}
+	if !optedIn {
+		h.FailbackNote = fmt.Sprintf("%d VM(s) a drain moved from %s have not opted in to failback; "+
+			"`lv host failback %s --all` moves them back", len(origins), host, host)
+		return
+	}
+	run, ok := s.failbacks.start(host, false)
+	if !ok {
+		h.FailbackStarted = true
+		h.FailbackNote = "a failback to " + host + " is already running on " + s.hostName
+		return
+	}
+	h.FailbackStarted = true
+	h.FailbackNote = fmt.Sprintf("failback of up to %d VM(s) started in the background on %s; "+
+		"it ends if that daemon restarts, and `lv host failback %s` finishes what is left", len(origins), s.hostName, host)
+	// The run is the daemon's own, not the undrain caller's: an explicit system
+	// identity and none of the caller's metadata, so a session that expires
+	// during a long run cannot fail its later moves and every hop is audited as
+	// the system.
+	bg := context.WithValue(context.Background(), ctxKeyRole, "admin")
+	bg = context.WithValue(bg, ctxKeyUsername, "system:failback")
+	go func() {
+		err := s.runFailback(bg, run, failbackOpts{})
+		if err != nil {
+			slog.Warn("failback ended early", "host", host, "error", err)
+		}
+		run.finish(err)
+	}()
+}
+
+func (s *Server) runFailback(ctx context.Context, run *failbackRun, opts failbackOpts) error {
+	host := run.host
+	if err := s.failbackPreflight(ctx, host); err != nil {
+		return err
+	}
 	origins, err := corrosion.ListDrainOrigins(ctx, s.db, host)
 	if err != nil {
 		return status.Errorf(codes.Internal, "read drain records: %v", err)
@@ -205,8 +374,9 @@ func (s *Server) runFailback(ctx context.Context, host string, opts failbackOpts
 		// A VM is evaluated against the host's CURRENT state: an operator may
 		// have drained it again while an earlier VM was moving.
 		if cur, gerr := corrosion.GetHost(ctx, s.db, host); gerr != nil || cur == nil || cur.State != "active" {
-			return emit(&pb.FailbackProgress{VmName: o.VM, FromHost: o.To, Status: failbackSkipped,
+			run.emit(&pb.FailbackProgress{VmName: o.VM, FromHost: o.To, Status: failbackSkipped,
 				Reason: "host " + host + " is no longer active; stopped"})
+			return nil
 		}
 		if moved && !opts.dryRun {
 			select {
@@ -219,9 +389,18 @@ func (s *Server) runFailback(ctx context.Context, host string, opts failbackOpts
 		if res.Status == failbackMoved {
 			moved = true
 		}
-		if err := emit(res); err != nil {
-			return err
+		// Every result that is not a plain "not opted in" is on the VM's own
+		// events, so a skip is findable after the run, not only in a log.
+		if !opts.dryRun && !strings.HasPrefix(res.Reason, "not opted in") {
+			result := "ok"
+			if res.Status == failbackFailed {
+				result = "error"
+			}
+			if res.Status != failbackMoved && res.Status != failbackWouldMove { // a move records its own event
+				s.recordVMEvent(ctx, o.VM, "vm.failback", result, fmt.Sprintf("failback to %s: %s: %s", host, res.Status, res.Reason))
+			}
 		}
+		run.emit(res)
 	}
 	return nil
 }
@@ -284,12 +463,33 @@ func (s *Server) failbackOne(ctx context.Context, host string, o corrosion.Drain
 		return res
 	}
 
-	err = s.MigrateVM(&pb.MigrateVMRequest{
-		VmName: vm.Name, TargetHost: host, Strategy: pb.MigrateStrategy_MIGRATE_LIVE,
-	}, &discardMigrateStream{ctx: ctx})
+	for try := 0; ; try++ {
+		err = s.MigrateVM(&pb.MigrateVMRequest{
+			VmName: vm.Name, TargetHost: host, Strategy: pb.MigrateStrategy_MIGRATE_LIVE,
+			// The owner checks, under the VM's lock and on its own replica, that
+			// the VM is still exactly where the drain left it (checkDrainExpectation).
+			ExpectDrainRecord: true, ExpectHost: o.To, ExpectOwnerEpoch: o.Epoch,
+		}, &discardMigrateStream{ctx: ctx})
+		if err == nil || try >= failbackNotActiveTries || !strings.Contains(err.Error(), "is not active") {
+			break
+		}
+		select {
+		case <-time.After(failbackNotActiveWait):
+		case <-ctx.Done():
+			err = ctx.Err()
+		}
+		if ctx.Err() != nil {
+			break
+		}
+	}
 	if err != nil {
+		msg := status.Convert(err).Message()
+		if strings.Contains(msg, failbackPreconditionMarker) {
+			res.Status, res.Reason = failbackSkipped, strings.TrimSpace(strings.TrimPrefix(msg[strings.Index(msg, failbackPreconditionMarker):], failbackPreconditionMarker))
+			return res
+		}
 		s.recordVMEvent(ctx, vm.Name, "vm.failback", "error", "failback to "+host+" failed: "+err.Error())
-		res.Status, res.Reason = failbackFailed, status.Convert(err).Message()
+		res.Status, res.Reason = failbackFailed, msg
 		return res
 	}
 	if cerr := corrosion.CollectDrainOrigin(ctx, s.db, vm.Name, "failback"); cerr != nil && !errors.Is(cerr, corrosion.ErrClusterPolicyGateClosed) {

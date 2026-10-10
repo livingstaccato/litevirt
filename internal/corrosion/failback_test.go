@@ -81,3 +81,72 @@ func TestDrainOrigins_PutListCollect(t *testing.T) {
 		t.Fatal("a VM name with a slash was accepted into the key")
 	}
 }
+
+// Every writer that changes a VM's host cancels the VM's drain record, and
+// writes nothing for a VM no drain moved.
+//
+// Mutation: drop SpendDrainOrigin from RescheduleVMHost, RekeyStoppedVM,
+// RepointMigratedVM or CommitMigrationOwnership - that row keeps its record.
+func TestHostChangingWritersSpendTheDrainRecord(t *testing.T) {
+	ctx := context.Background()
+	type mover func(c *Client) error
+	rows := map[string]mover{
+		"RescheduleVMHost":     func(c *Client) error { return RescheduleVMHost(ctx, c, "v", "h3", "running") },
+		"TransferVMOwnerFresh": func(c *Client) error { return TransferVMOwnerFresh(ctx, c, "v", "h3", "running") },
+		"CommitMigrationOwnership": func(c *Client) error {
+			ok, err := CommitMigrationOwnership(ctx, c, "v", "h2", "h3", "running", nil)
+			if err == nil && !ok {
+				return errors.New("declined")
+			}
+			return err
+		},
+		"RepointMigratedVM": func(c *Client) error {
+			if err := UpdateVMState(ctx, c, "v", "migrating", ""); err != nil {
+				return err
+			}
+			ok, err := RepointMigratedVM(ctx, c, "v", "h2", "h3", "running")
+			if err == nil && !ok {
+				return errors.New("declined")
+			}
+			return err
+		},
+		"RekeyStoppedVM": func(c *Client) error {
+			if err := UpdateVMState(ctx, c, "v", "stopped", ""); err != nil {
+				return err
+			}
+			vm, _ := GetVM(ctx, c, "v")
+			return RekeyStoppedVM(ctx, c, "v", "h2", "h3", "stopped", vm.OwnerEpoch)
+		},
+	}
+	for name, move := range rows {
+		t.Run(name, func(t *testing.T) {
+			c := testClient(t)
+			openClusterPolicyGate(c)
+			if err := InsertVM(ctx, c, VMRecord{Name: "v", HostName: "h2", State: "running", Spec: `{}`}, nil, nil); err != nil {
+				t.Fatal(err)
+			}
+			vm, _ := GetVM(ctx, c, "v")
+			if err := PutDrainOrigin(ctx, c, DrainOrigin{VM: "v", From: "h1", To: "h2", Epoch: vm.OwnerEpoch, CreatedAt: vm.CreatedAt}, "drain"); err != nil {
+				t.Fatal(err)
+			}
+			if err := move(c); err != nil {
+				t.Fatalf("%s: %v", name, err)
+			}
+			if got, _ := ListDrainOrigins(ctx, c, "h1"); len(got) != 0 {
+				t.Fatalf("%s left the drain record: %+v", name, got)
+			}
+		})
+	}
+	// A VM no drain moved: nothing is written.
+	c := testClient(t)
+	openClusterPolicyGate(c)
+	if err := InsertVM(ctx, c, VMRecord{Name: "w", HostName: "h2", State: "running", Spec: `{}`}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := TransferVMOwnerFresh(ctx, c, "w", "h3", "running"); err != nil {
+		t.Fatal(err)
+	}
+	if n := oneString(t, c, `SELECT count(*) AS n FROM cluster_policies`, "n"); n != "0" {
+		t.Fatalf("moving a VM no drain moved wrote %s cluster_policies row(s)", n)
+	}
+}

@@ -256,6 +256,9 @@ func boundedTelemetryShutdown(shutdown func(context.Context) error, timeout time
 }
 
 func (d *Daemon) Run(ctx context.Context) error {
+	if err := d.checkMigrationNetwork(); err != nil {
+		return err
+	}
 	// Boot order is load-bearing: arm the post-upgrade watchdog FIRST, then run
 	// telemetry setup (which can block on a slow/unreachable collector — production
 	// sets none of the PROVIDE_*_TIMEOUT caps). If setup ran first and hung, a
@@ -955,6 +958,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetLiveResize(d.cfg.Enforcement.LiveResize)
 	svc.SetAllowUnencryptedStorageMigration(d.cfg.Migration.AllowUnencryptedStorage)
 	svc.SetMigrationNetwork(d.cfg.Migration.Network)
+	svc.SetMigrationAddress(d.cfg.Migration.Address)
 	migrationTLS := d.migrationTLSInstaller()
 	svc.SetMigrationTLS(migrationTLS)
 	// Install once at start so the operator sees the state in the log; it runs
@@ -3043,4 +3047,20 @@ func (d *Daemon) wireLeaseTermLedgerGate() {
 	d.db.SetLeaseTermLedgerGate(func() bool {
 		return d.checker.DurablyLatched(capabilities.LeaseTermLedgerV1)
 	})
+}
+
+// checkMigrationNetwork refuses a migration.network that would send migration
+// data out the uplink or the cluster interface (grpcapi.CheckMigrationNetwork):
+// one outside the private ranges, or containing this host's cluster address or
+// its default-route source address.
+func (d *Daemon) checkMigrationNetwork() error {
+	if d.cfg.Migration.Network == "" {
+		return nil
+	}
+	n, err := grpcapi.ParseMigrationNetwork(d.cfg.Migration.Network)
+	if err != nil {
+		return err
+	}
+	return grpcapi.CheckMigrationNetwork(n, d.cfg.Migration.AllowAnyNetwork,
+		net.ParseIP(netutil.OutboundIP()), net.ParseIP(d.cfg.AdvertiseAddress))
 }

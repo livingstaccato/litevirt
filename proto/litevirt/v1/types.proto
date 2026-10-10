@@ -593,6 +593,12 @@ message Host {
     // numerator for disk_total_gib. Daemons before this field carried this
     // figure in disk_used_gib.
     int64                          disk_allocated_gib = 22;
+    // Set only in UndrainHost's reply: what the undrain did about failback.
+    // failback_started: a background failback run was started on the answering
+    // daemon (follow it with FailbackHost follow=true). failback_note says why
+    // not, or what to do, in words; empty when there is nothing to say.
+    bool                           failback_started = 23;
+    string                         failback_note    = 24;
 }
 
 message Image {

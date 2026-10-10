@@ -193,6 +193,13 @@ func (s *Server) sourceGateRefused(ctx context.Context, vm *corrosion.VMRecord, 
 // its whole step, calls this directly for its cold moves (drainColdMove), with
 // the same lock discipline.
 func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, vm *corrosion.VMRecord, send func(pb.MigratePhase, float32, float32) error, unlock func(), adopted *bool, opts ownedMigrateOpts) error {
+	// A failback move is conditional on the VM still being where the drain left
+	// it, judged here, by its owner under its lock (failback.go).
+	if req.GetExpectDrainRecord() {
+		if err := s.checkDrainExpectation(ctx, req, vm); err != nil {
+			return err
+		}
+	}
 	// Secure Boot / vTPM firmware-state travel (G1). A firmware VM's NVRAM + swtpm
 	// are host-local and bind BitLocker, so they need a CONSISTENT capture:
 	//   - LIVE is refused: libvirt's native swtpm/NVRAM carry is not yet validated
@@ -561,7 +568,11 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 		createdStubs, dstTLS, cdromSources = ens.created, ens.tlsReady, ens.remap
 		abort.createdStubs = createdStubs
 		useTLS = srcTLS && dstTLS
-		route = s.chooseMigrationRoute(ctx, vm.Name, *targetHost, ens.migAddr, true, useTLS)
+		kind := routeStorage
+		if fwVM || coldStopped {
+			kind = routeCold
+		}
+		route = s.chooseMigrationRoute(ctx, vm.Name, *targetHost, ens.migAddr, kind, useTLS)
 		if !useTLS && !s.allowPlaintextStorageMigration {
 			// This host could encrypt; the target cannot (no credentials, or an
 			// older build that never answers). The abort undoes the stubs.
@@ -581,9 +592,16 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 			return eerr
 		}
 		cdromSources = ens.remap
-		if !(fwVM || coldStopped) {
-			route = s.chooseMigrationRoute(ctx, vm.Name, *targetHost, ens.migAddr, false, srcTLS && ens.tlsReady)
+		if fwVM || coldStopped {
+			route = s.chooseMigrationRoute(ctx, vm.Name, *targetHost, ens.migAddr, routeCold, true)
+		} else {
+			route = s.chooseMigrationRoute(ctx, vm.Name, *targetHost, ens.migAddr, routeMemory, srcTLS && ens.tlsReady)
 		}
+	}
+	if route.onNetwork {
+		// A cold move's disk stream (and the clone copy, which is one) is dialed
+		// at this address; a live move's data is not (migration_network.go).
+		abort.diskAddr = route.addr
 	}
 
 	// A STOPPED VM — every Secure-Boot/vTPM VM, and any other VM migrated with
@@ -996,10 +1014,6 @@ func (s *Server) finalizeMigrationOwnership(ctx context.Context, vm *corrosion.V
 	if !committed {
 		return fmt.Errorf("ownership commit for VM %q did not land after retries: %w", vm.Name, lastErr)
 	}
-	// A live migration does not bump the VM's owner epoch, so a move by hand
-	// is told apart from the drain's own by spending the drain's record here
-	// (failback.go): the VM is wherever someone put it now.
-	s.spendDrainOrigin(fctx, vm.Name)
 
 	// A --with-storage migration COPIES each host-local disk to the target's own
 	// filesystem, leaving the source copy orphaned. Remove it (we run on the source
@@ -1285,7 +1299,7 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 		// take the other end.
 		resp.MigrationTlsReady = s.migrationTLSReady()
 	}
-	s.answerMigrationNetwork(req, resp)
+	s.answerMigrationNetwork(ctx, req, resp)
 	return resp, nil
 }
 
@@ -2033,8 +2047,15 @@ func copiedByStorageMigration(d corrosion.DiskRecord) bool {
 // refusal and the copy itself must agree, or an untyped disk is left behind by
 // a move that copies none. Removal paths keep the stricter
 // isHostLocalDiskDriver: they delete, and an untyped row proves less.
+//
+// It agrees with corrosion.DiskIsShared, which is the cluster's definition of
+// shared storage, on every driver whose disk is a plain file a move can copy:
+// btrfs is host-local there, so it is here too (a clone or MoveVolume into a
+// btrfs pool makes such a disk). TestIsHostLocalDiskAgreesWithDiskIsShared pins
+// the two together. zfs and lvm are not shared either, but their disks are
+// volumes, not files, so no move here copies them; they stay as they were.
 func isHostLocalDisk(d corrosion.DiskRecord) bool {
-	return d.StorageType == "" || isHostLocalDiskDriver(d.StorageType)
+	return d.StorageType == "" || isHostLocalDiskDriver(d.StorageType) || strings.EqualFold(d.StorageType, "btrfs")
 }
 
 // storageMigrationTargets is the migrate_disks list of a --with-storage
@@ -2469,6 +2490,9 @@ type migrationAbort struct {
 	// lease an earlier attempt left — the restart anchor of VFs still out of
 	// the guest — is not this attempt's to end.
 	leaseWritten bool
+	// diskAddr is the target's address in migration.network, when the cold disk
+	// copy is to use it ("" = the cluster address).
+	diskAddr string
 }
 
 // undoMigrationAttempt is MigrateVM's exit path for an attempt that ended before

@@ -1882,6 +1882,10 @@ func TestVM_AttachDetachDisk(t *testing.T) {
 	lv(t, "rm", name, "--force")
 }
 
+// TestVM_AttachDetachNIC hot-attaches a NIC to a running VM and detaches it
+// by its MAC. `lv run` creates a VM with no NIC, so the MAC is the one the
+// attach added (a MAC inspect did not list before it), and after the detach
+// inspect must no longer list it.
 func TestVM_AttachDetachNIC(t *testing.T) {
 	requireImage(t)
 	netName := uniqueName("n")
@@ -1894,10 +1898,18 @@ func TestVM_AttachDetachNIC(t *testing.T) {
 	lv(t, "network", "create", netName, "--type", "bridge",
 		"--subnet", "172.32.0.0/24", "--dhcp")
 
+	host := hostWithCapacity(t, 1, 1024)
 	lv(t, "run", "--name", vmName, "--image", testImage,
 		"--cpu", "1", "--memory", "1024", "--disk", "5G",
-		"--host", hostNames[0])
+		"--host", host)
 	waitVM(t, vmName, "RUNNING", 2*time.Minute)
+	// A NIC hot-plugged while the guest is still in its firmware or early boot
+	// is not ejected by a detach right after it: the guest drops the unplug
+	// request (see TestVM_DetachNIC_ActuallyRemovesItFromTheDomain).
+	waitGuestKernel(t, vmName, host, 3*time.Minute)
+
+	macRe := regexp.MustCompile(`52:54:00(:[0-9a-f]{2}){3}`)
+	before := macRe.FindAllString(lv(t, "inspect", vmName), -1)
 
 	lv(t, "attach-nic", vmName, netName)
 
@@ -1905,20 +1917,71 @@ func TestVM_AttachDetachNIC(t *testing.T) {
 	if !strings.Contains(out, netName) {
 		t.Error("attached NIC not in inspect output")
 	}
-
-	// Detach by MAC. This used to run only `if len(macs) >= 2`, which meant a run
-	// that parsed fewer MACs skipped the detach and still passed — the half of
-	// this test with the actual risk in it, silently opted out of. If the MACs
-	// can't be found the attach assertion above was already wrong, so fail.
-	macRe := regexp.MustCompile(`52:54:00:[0-9a-f:]+`)
-	macs := macRe.FindAllString(out, -1)
-	if len(macs) < 2 {
-		t.Fatalf("expected at least 2 MACs in inspect after attaching a NIC, found %d (%v)", len(macs), macs)
+	var added []string
+	for _, m := range macRe.FindAllString(out, -1) {
+		if !containsMAC(before, m) && !containsMAC(added, m) {
+			added = append(added, m)
+		}
 	}
-	lv(t, "detach-nic", vmName, macs[len(macs)-1])
+	// The detach used to run only when inspect showed two MACs, and later
+	// failed when it did not: lv run makes no NIC, so the attach adds the only
+	// one. Exactly one new MAC is the attach's; none means it did nothing.
+	if len(added) != 1 {
+		t.Fatalf("attach-nic should add exactly one MAC to inspect; before %v, after %v", before, macRe.FindAllString(out, -1))
+	}
+	mac := added[0]
+
+	// PCI hot-unplug is cooperative: a guest that has not enumerated the new
+	// device yet does not answer the first request, so retry for a while (see
+	// TestVM_DetachNIC_ActuallyRemovesItFromTheDomain).
+	var lastOut string
+	var lastErr error
+	detached := false
+	for deadline := time.Now().Add(5 * time.Minute); time.Now().Before(deadline); time.Sleep(15 * time.Second) {
+		if lastOut, lastErr = lvErr(t, "detach-nic", vmName, mac); lastErr == nil {
+			detached = true
+			break
+		}
+	}
+	if !detached {
+		t.Fatalf("detach-nic %s never succeeded: %v\n%s", mac, lastErr, lastOut)
+	}
+	if after := lv(t, "inspect", vmName); strings.Contains(after, mac) {
+		t.Errorf("detach-nic %s succeeded but inspect still lists it:\n%s", mac, after)
+	}
+	if virshAvailable() && host == localHost {
+		if macs := domIfaceMACs(t, vmName); containsMAC(macs, mac) {
+			t.Errorf("detach-nic %s succeeded but the domain still has it (virsh domiflist: %v)", mac, macs)
+		}
+	}
 
 	lv(t, "rm", vmName, "--force")
 	lv(t, "network", "rm", netName, "--force")
+}
+
+// waitGuestKernel waits until the guest kernel of domain, on host, is up: its
+// virtio balloon driver has reported memory statistics, which virsh
+// dommemstat shows as a non-zero last_update (the firmware and boot loader
+// report none). It needs virsh for host; elsewhere it waits a fixed minute,
+// longer than a small guest takes to boot.
+func waitGuestKernel(t *testing.T, domain, host string, timeout time.Duration) {
+	t.Helper()
+	if !virshAvailable() || host != localHost {
+		t.Logf("cannot ask libvirt on %s whether %s has booted; waiting a minute", host, domain)
+		time.Sleep(time.Minute)
+		return
+	}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		out, _ := exec.Command("virsh", "-c", "qemu:///system", "dommemstat", domain).CombinedOutput()
+		for _, line := range strings.Split(string(out), "\n") {
+			if f := strings.Fields(line); len(f) == 2 && f[0] == "last_update" && f[1] != "0" {
+				return
+			}
+		}
+		time.Sleep(3 * time.Second)
+	}
+	t.Fatalf("the guest kernel of %s never reported balloon statistics within %v; it did not boot", domain, timeout)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

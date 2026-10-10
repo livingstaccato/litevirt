@@ -189,7 +189,7 @@ type Checker struct {
 	// unknownReleaseObserver / unknownReleaseSeen: a peer advertising a
 	// release token this build does not know (SetUnknownReleaseTokenObserver).
 	// Guarded by mu.
-	unknownReleaseObserver func(token string)
+	unknownReleaseObserver func(peer, token string)
 	unknownReleaseSeen     map[string]bool
 }
 

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"sync/atomic"
 )
 
 // Release features: the closed set of features a release token opens, and the
@@ -38,6 +39,11 @@ type Feature string
 type FeatureInfo struct {
 	Token       string
 	Description string
+	// Writers names every function that writes the feature's data, as
+	// "<package dir>.<Func>" or "<package dir>.<Type>.<Method>" (for example
+	// "internal/corrosion.UpdateVMLimits"). Each must take a FeatureGrant;
+	// release_guard_test.go checks it.
+	Writers []string
 }
 
 // releaseFeatures is THE closed set of release features this build knows,
@@ -139,10 +145,11 @@ func RuleHonouredBelow(token string) bool {
 // feature's use is recorded, replicated and on this node's own outgoing stream.
 // A writer of a feature's data takes one and calls Check before it writes.
 //
-// The zero value grants nothing. Only health.Checker.WithFeature mints one
-// (MintFeatureGrant), which the release-feature guard
-// (internal/capabilities/release_guard_test.go) enforces: a grant obtained any
-// other way would let a write skip the used bit a rollback relies on.
+// The zero value grants nothing. Only health.Checker.WithFeature mints one,
+// through the minter it claims at init (ClaimGrantMinter); a second claim
+// panics, and the release-feature guard (release_guard_test.go) fails the
+// build on any other caller. A grant obtained any other way would let a write
+// skip the used bit a rollback relies on.
 type FeatureGrant struct {
 	feature Feature
 	minted  bool
@@ -163,9 +170,31 @@ func (g FeatureGrant) Check(f Feature) error {
 // Feature is the feature g was minted for ("" for the zero value).
 func (g FeatureGrant) Feature() Feature { return g.feature }
 
-// MintFeatureGrant mints a grant for f. ONLY health.Checker.WithFeature may
-// call it, after the gate has passed; the release-feature guard fails the
-// build for any other caller.
-func MintFeatureGrant(f Feature) FeatureGrant {
+// mintGrant makes a grant for f. Reached only through ClaimGrantMinter, which
+// the gate claims at init, and GrantForTest.
+func mintGrant(f Feature) FeatureGrant {
 	return FeatureGrant{feature: f, minted: true}
+}
+
+// grantMinterClaimed records that the one minter has been handed out.
+var grantMinterClaimed atomic.Bool
+
+// ClaimGrantMinter hands out the only function that mints FeatureGrants. The
+// release-feature gate (health/release_feature.go) claims it in a package
+// variable initialiser; a second claim panics, so no other package can mint a
+// grant without the binary failing at start. release_guard_test.go also fails
+// the build on any other caller.
+func ClaimGrantMinter() func(Feature) FeatureGrant {
+	if !grantMinterClaimed.CompareAndSwap(false, true) {
+		panic("capabilities: the FeatureGrant minter is already claimed (by health.Checker.WithFeature); " +
+			"a release feature's write must go through that gate")
+	}
+	return mintGrant
+}
+
+// GrantForTest mints a grant for a test's fake gate. Test code only: the
+// release-feature guard fails the build on any non-test caller.
+func GrantForTest(t interface{ Helper() }, f Feature) FeatureGrant {
+	t.Helper()
+	return mintGrant(f)
 }

@@ -32,6 +32,10 @@ type AntiEntropy struct {
 	pkiDir   string
 	interval time.Duration
 
+	// probationPull answers VerifyReleaseProbation's pulls; nil uses the real
+	// pull (pullClusterPoliciesForProbation). Tests replace it.
+	probationPull probationPullFunc
+
 	// mu guards the trigger decision only (not the pass itself): a pass no-ops when one is
 	// already running or ran within antiEntropyCooldown. It never bypasses checkPeers's
 	// per-table digest-gating (merge only on mismatch) — it just decides whether to run.
@@ -57,6 +61,11 @@ type AntiEntropy struct {
 }
 
 // NewAntiEntropy creates an anti-entropy checker.
+// probationPullFunc pulls cluster_policies from peer for a probation check and
+// reports whether that peer is itself in release probation. A field so tests
+// can answer without dialling.
+type probationPullFunc func(ctx context.Context, peer string) (inProbation bool, err error)
+
 func NewAntiEntropy(client *Client, pkiDir string, interval time.Duration) *AntiEntropy {
 	if interval == 0 {
 		interval = 60 * time.Second

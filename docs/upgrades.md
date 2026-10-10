@@ -429,22 +429,43 @@ bit**:
   still advertises the token. A host rolled back after the latch therefore
   holds every **first** use off for as long as it runs; features already in use
   keep working.
-- Once a feature is in use, an upgraded host **refuses replication** (pushes
-  and anti-entropy pulls) from a peer that does not advertise its token — a host
-  rolled back, or back from a long absence on an older build. The refusal is
-  back-pressure, nothing is dropped, and it raises
+- Once a feature is in use, an upgraded host **refuses replication** from a
+  peer that cannot keep its data. A push is judged by what the sender declares
+  in it (every push carries the sender's advertised capabilities; an older
+  build carries none), so an upgraded sender is never refused for being hard to
+  reach. Relayed entries are judged by their origin's last declared or answered
+  list, and anti-entropy pulls the same way. The refusal is back-pressure,
+  nothing is dropped, and it raises
   `litevirt_ha_degraded{reason="release_feature_peer_refused"}` with an event
-  naming the peer. Upgrade that host again, or remove it.
+  naming the peers, again whenever a new peer joins them. Upgrade that host
+  again, or remove it.
 - The release token's marker carries a rollback rule, `rollback:
   safe_if_unused`. A binary that understands the rule (this release and later)
   rolled back below a release token quarantines **if one of that token's
   features has been used** — or if any feature it does not declare is recorded
   used under a token it does know. If its own replica shows no use, it does not
-  take that on trust: it starts in **release probation**, emitting no replicated
-  writes and advertising nothing, until it has pulled the cluster's records from
-  a majority of the voters. No use there: probation lifts (`release probation
-  lifted` in the log). A use there: it quarantines. A host that sees a peer
-  advertise a release token it does not know enters the same probation.
+  take that on trust: it starts in **release probation**. In probation it emits
+  no replicated writes (they fail with "this node is in release probation"), but
+  it is not quarantined: it keeps advertising, its Ping reports
+  `release_probation` and never `wal_quarantined`, and no peer isolates it. It
+  pulls the cluster's used records from a majority of the other voters — not
+  counting itself or a voter that is itself in probation — and lifts (`release
+  probation lifted` in the log), or quarantines if a use is there. In a
+  two-voter cluster the one other voter is enough. A voter majority that stays
+  unreachable keeps it in probation; `LITEVIRT_UNSAFE_SKIP_ROLLBACK_CHECK=1` and
+  a restart is the operator's way out.
+- A first use is acknowledged by every voter (one in `maintenance` included)
+  and every host the cluster replicates to, so whichever voters a probation asks
+  later, a majority of them holds it. A powered-off host that is neither does
+  not hold a first use up; a voter that is gone for good does, until it is
+  removed from the voter set (`lv cluster voter rm`).
+
+**Forward rolls refuse nothing.** While the cluster rolls to the NEXT release,
+the hosts still on this one see the new hosts advertise a release token they do
+not know. That token cannot latch — let alone have a used feature — while they
+do not advertise it, so they only take a look at the advertising host's used
+records, in the background, and keep writing. A use found there (one recorded
+while they were away) quarantines them, as any use arriving does.
 
 **What this does not change.** A binary built before `release_2026_11_v1`
 understands no rollback rule. Rolled back below any token it does not know —
@@ -477,10 +498,17 @@ feature listed as *not known to this build* is a newer release's that has been
 used: this build is the one that would be quarantined, and is, if it is the
 binary answering.
 
-**Residuals.** An origin that a receiver cannot reach is not judged, so its
-entries relayed by another host are accepted until it answers. A peer that
-rolls back and restarts in under five seconds can have its first pushes
-accepted on an answer from before its restart.
+**Residuals.**
+- An origin a receiver has never heard from and cannot reach is not judged, so
+  its entries relayed by another host are accepted until it answers once.
+- A host with no marker that was away through the next release's latch and
+  first use, and comes back on this release, emits replicated writes until its
+  first Ping of a newer host leads it to their used records. Upgraded hosts with
+  the use refuse those writes, so this is defence in depth only.
+- A probation asks the newest voter generation. A first use is acknowledged by
+  the voters of its time and by every replication recipient; a voter added later
+  received the record by replication before it could vote, unless it joined from
+  a reseed taken before the use — which a reseed from a current peer is not.
 
 `LITEVIRT_UNSAFE_SKIP_ROLLBACK_CHECK=1` skips the startup check, the recorded
 uses and the startup probation included, as before (see

@@ -464,7 +464,7 @@ func (s *Server) PushMutations(ctx context.Context, req *pb.ReplicateRequest) (*
 	if err := s.requireNotIsolated(ctx, req.Sender); err != nil {
 		return nil, err
 	}
-	if err := s.ReleasePeerAllowed(ctx, req.Sender); err != nil {
+	if err := s.ReleaseSenderAllowed(ctx, req.Sender, req.SenderCapabilities); err != nil {
 		return nil, err
 	}
 	// And the ORIGIN of each relayed entry: a relay that has not latched the

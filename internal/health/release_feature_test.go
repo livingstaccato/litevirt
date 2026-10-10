@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -28,6 +29,7 @@ type relEnv struct {
 	bAdvertises atomic.Bool
 	bHolds      atomic.Bool
 	confirmed   atomic.Int32
+	confirm     func(host string) (bool, error)
 }
 
 func newRelEnv(t *testing.T) *relEnv {
@@ -61,6 +63,9 @@ func (e *relEnv) checker() *Checker {
 	})
 	c.SetReleaseUseConfirmer(func(_ context.Context, host, token, feature string) (bool, error) {
 		e.confirmed.Add(1)
+		if e.confirm != nil {
+			return e.confirm(host)
+		}
 		return host == "host-b" && e.bHolds.Load(), nil
 	})
 	c.SetActivationMarker(ActivationMarkerBase(e.dir))
@@ -292,7 +297,7 @@ func TestWithFeature_WriteErrorIsReturned(t *testing.T) {
 func TestUnknownReleaseTokenFromAPeerIsReported(t *testing.T) {
 	e := newRelEnv(t)
 	var seen []string
-	e.c.SetUnknownReleaseTokenObserver(func(tok string) { seen = append(seen, tok) })
+	e.c.SetUnknownReleaseTokenObserver(func(peer, tok string) { seen = append(seen, tok) })
 	e.c.SetPeerPinger(func(context.Context, string) ([]string, time.Time, error) {
 		return append(capabilities.Supported(), "release_2099_01_v1", "something_else_v9"), time.Time{}, nil
 	})
@@ -304,5 +309,79 @@ func TestUnknownReleaseTokenFromAPeerIsReported(t *testing.T) {
 		if s != "release_2099_01_v1" {
 			t.Fatalf("observer saw %q, which is not an unknown release token", s)
 		}
+	}
+}
+
+// TestUnknownReleaseToken_ObserverWiredLater (N7): a token seen before the
+// observer is wired is not swallowed.
+func TestUnknownReleaseToken_ObserverWiredLater(t *testing.T) {
+	e := newRelEnv(t)
+	e.c.SetPeerPinger(func(context.Context, string) ([]string, time.Time, error) {
+		return append(capabilities.Supported(), "release_2099_01_v1"), time.Time{}, nil
+	})
+	e.c.CapabilityActive(context.Background(), capabilities.SplitBrainGateV1)
+	var seen []string
+	e.c.SetUnknownReleaseTokenObserver(func(peer, tok string) { seen = append(seen, peer+"/"+tok) })
+	e.c.CapabilityActive(context.Background(), capabilities.ReleaseToken)
+	if len(seen) != 1 || !strings.HasSuffix(seen[0], "/release_2099_01_v1") {
+		t.Fatalf("observer saw %v, want one report of release_2099_01_v1", seen)
+	}
+}
+
+// TestWithFeature_AckSetIncludesEveryVoter (N3): a voter in maintenance is not
+// a replication recipient right now, but a later probation majority may ask it,
+// so a first use waits for it too. A powered-off maintenance host that is not a
+// voter does not block.
+func TestWithFeature_AckSetIncludesEveryVoter(t *testing.T) {
+	e := newRelEnv(t)
+	gateHost(t, e.db, "host-c", "maintenance", "worker") // voter, in maintenance, not a member
+	gateHost(t, e.db, "host-d", "maintenance", "worker") // not a voter, powered off
+	e.c.SetVoterSetForTest(func(context.Context) (map[string]bool, error) {
+		return map[string]bool{"host-a": true, "host-b": true, "host-c": true}, nil
+	})
+	var mu sync.Mutex
+	asked := map[string]bool{}
+	cHolds := false
+	e.confirm = func(host string) (bool, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		asked[host] = true
+		return host == "host-b" || (host == "host-c" && cHolds), nil
+	}
+	wrote, err := e.write(t, e.c, testFeature)
+	if status.Code(err) != codes.Unavailable || wrote || !strings.Contains(err.Error(), "host-c") {
+		t.Fatalf("first use with voter host-c not holding the record: wrote=%v err=%v, want Unavailable naming host-c", wrote, err)
+	}
+	mu.Lock()
+	if asked["host-d"] {
+		t.Error("host-d, a powered-off non-voter, was asked to acknowledge")
+	}
+	cHolds = true
+	mu.Unlock()
+	if wrote, err := e.write(t, e.c, testFeature); err != nil || !wrote {
+		t.Fatalf("once host-c holds it: wrote=%v err=%v", wrote, err)
+	}
+}
+
+// TestWithFeature_AcksAreAskedInParallel (N10): one slow recipient does not
+// add its delay to every other's.
+func TestWithFeature_AcksAreAskedInParallel(t *testing.T) {
+	e := newRelEnv(t)
+	for _, h := range []string{"host-c", "host-d", "host-e"} {
+		gateHost(t, e.db, h, "active", "worker")
+	}
+	e.db.SetMembersForTests(func() []corrosion.PeerInfo {
+		return []corrosion.PeerInfo{{Name: "host-b"}, {Name: "host-c"}, {Name: "host-d"}, {Name: "host-e"}}
+	})
+	e.confirm = func(string) (bool, error) {
+		time.Sleep(150 * time.Millisecond)
+		return true, nil
+	}
+	start := time.Now()
+	if _, err := e.write(t, e.c, testFeature); err != nil {
+		t.Fatalf("WithFeature: %v", err)
+	}
+	if d := time.Since(start); d > 450*time.Millisecond {
+		t.Fatalf("four 150ms acknowledgements took %v: asked one at a time", d)
 	}
 }

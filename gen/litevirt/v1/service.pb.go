@@ -25065,8 +25065,14 @@ type PingResponse struct {
 	// wall_clock got away without a companion flag because its zero value is not
 	// a legal reading; an empty token list is, so it needs one.
 	PostureReported bool `protobuf:"varint,8,opt,name=posture_reported,json=postureReported,proto3" json:"posture_reported,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// release_probation is true while this node is in RELEASE PROBATION: rolled
+	// back below a release token none of whose features is recorded used in its
+	// own replica, it emits no replicated writes until a voter majority confirms
+	// that. Diagnostic and for peers' probation majority only. It is NOT
+	// wal_quarantined: the node keeps advertising, and no peer isolates it.
+	ReleaseProbation bool `protobuf:"varint,9,opt,name=release_probation,json=releaseProbation,proto3" json:"release_probation,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *PingResponse) Reset() {
@@ -25151,6 +25157,13 @@ func (x *PingResponse) GetNotEnforcing() []string {
 func (x *PingResponse) GetPostureReported() bool {
 	if x != nil {
 		return x.PostureReported
+	}
+	return false
+}
+
+func (x *PingResponse) GetReleaseProbation() bool {
+	if x != nil {
+		return x.ReleaseProbation
 	}
 	return false
 }
@@ -28363,8 +28376,13 @@ type ReplicateRequest struct {
 	// belief used to apply the push locally and forward nothing. Absent (false)
 	// from a released peer, which reproduces exactly that prior behaviour.
 	ReceiverIsRelay bool `protobuf:"varint,6,opt,name=receiver_is_relay,json=receiverIsRelay,proto3" json:"receiver_is_relay,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// sender_capabilities is the capability set the sender advertises at the
+	// moment of the push, the same list its Ping returns. A receiver with a
+	// release feature in use refuses a sender whose declaration lacks that
+	// release token, without dialling it back (an older build sends nothing).
+	SenderCapabilities []string `protobuf:"bytes,7,rep,name=sender_capabilities,json=senderCapabilities,proto3" json:"sender_capabilities,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *ReplicateRequest) Reset() {
@@ -28437,6 +28455,13 @@ func (x *ReplicateRequest) GetReceiverIsRelay() bool {
 		return x.ReceiverIsRelay
 	}
 	return false
+}
+
+func (x *ReplicateRequest) GetSenderCapabilities() []string {
+	if x != nil {
+		return x.SenderCapabilities
+	}
+	return nil
 }
 
 type ReplicateResponse struct {
@@ -36901,7 +36926,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\n" +
 	"LOCALIZING\x10\x04\x12\b\n" +
 	"\x04DONE\x10\x05\"\r\n" +
-	"\vPingRequest\"\xa8\x02\n" +
+	"\vPingRequest\"\xd5\x02\n" +
 	"\fPingResponse\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x12\x18\n" +
 	"\aversion\x18\x02 \x01(\tR\aversion\x12%\n" +
@@ -36911,7 +36936,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"wall_clock\x18\x05 \x01(\tR\twallClock\x12'\n" +
 	"\x0fwal_quarantined\x18\x06 \x01(\bR\x0ewalQuarantined\x12#\n" +
 	"\rnot_enforcing\x18\a \x03(\tR\fnotEnforcing\x12)\n" +
-	"\x10posture_reported\x18\b \x01(\bR\x0fpostureReported\"\x0e\n" +
+	"\x10posture_reported\x18\b \x01(\bR\x0fpostureReported\x12+\n" +
+	"\x11release_probation\x18\t \x01(\bR\x10releaseProbation\"\x0e\n" +
 	"\fReadyRequest\"\x95\x01\n" +
 	"\rReadyResponse\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x12\x14\n" +
@@ -37146,14 +37172,15 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x03seq\x18\x01 \x01(\x03R\x03seq\x12\x10\n" +
 	"\x03hlc\x18\x02 \x01(\tR\x03hlc\x12\x16\n" +
 	"\x06origin\x18\x03 \x01(\tR\x06origin\x12\x14\n" +
-	"\x05stmts\x18\x04 \x01(\tR\x05stmts\"\x84\x02\n" +
+	"\x05stmts\x18\x04 \x01(\tR\x05stmts\"\xb5\x02\n" +
 	"\x10ReplicateRequest\x12\x16\n" +
 	"\x06sender\x18\x01 \x01(\tR\x06sender\x12\x1b\n" +
 	"\tafter_seq\x18\x02 \x01(\x03R\bafterSeq\x124\n" +
 	"\aentries\x18\x03 \x03(\v2\x1a.litevirt.v1.MutationEntryR\aentries\x12%\n" +
 	"\x0esender_version\x18\x04 \x01(\tR\rsenderVersion\x122\n" +
 	"\x15sender_schema_version\x18\x05 \x01(\x05R\x13senderSchemaVersion\x12*\n" +
-	"\x11receiver_is_relay\x18\x06 \x01(\bR\x0freceiverIsRelay\"7\n" +
+	"\x11receiver_is_relay\x18\x06 \x01(\bR\x0freceiverIsRelay\x12/\n" +
+	"\x13sender_capabilities\x18\a \x03(\tR\x12senderCapabilities\"7\n" +
 	"\x11ReplicateResponse\x12\"\n" +
 	"\rapplied_up_to\x18\x01 \x01(\x03R\vappliedUpTo\"A\n" +
 	"\n" +

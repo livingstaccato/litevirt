@@ -29,6 +29,9 @@ type Replicator struct {
 	pkiDir   string
 	relayCfg RelayConfig
 
+	// advertised: see SetAdvertisedCapabilities.
+	advertised atomic.Pointer[func() []string]
+
 	// afterReplicateOnceForTests runs between a push attempt and the wait that
 	// follows it. Test seam only: it is how a test lands a local write in the
 	// window a lost wakeup lives in.
@@ -637,6 +640,9 @@ func (r *Replicator) replicateOnce(ctx context.Context, peerName string) (int, e
 		// fan out even if its own copy of hosts.state disagrees with ours. The
 		// relay set is read under the lock because syncPeers replaces it.
 		ReceiverIsRelay: r.peerIsRelay(peerName),
+		// What this node advertises right now, so a receiver with a release
+		// feature in use can judge it without dialling back (N4).
+		SenderCapabilities: r.advertisedCapabilities(),
 	})
 	if err != nil {
 		return 0, fmt.Errorf("push mutations: %w", err)

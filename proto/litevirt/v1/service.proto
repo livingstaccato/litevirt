@@ -2589,6 +2589,12 @@ message PingResponse {
   // wall_clock got away without a companion flag because its zero value is not
   // a legal reading; an empty token list is, so it needs one.
   bool posture_reported = 8;
+  // release_probation is true while this node is in RELEASE PROBATION: rolled
+  // back below a release token none of whose features is recorded used in its
+  // own replica, it emits no replicated writes until a voter majority confirms
+  // that. Diagnostic and for peers' probation majority only. It is NOT
+  // wal_quarantined: the node keeps advertising, and no peer isolates it.
+  bool release_probation = 9;
 }
 
 // Ready: application-level readiness. Ping answers "is this daemon's TLS
@@ -3123,6 +3129,11 @@ message ReplicateRequest {
     // belief used to apply the push locally and forward nothing. Absent (false)
     // from a released peer, which reproduces exactly that prior behaviour.
     bool   receiver_is_relay       = 6;
+    // sender_capabilities is the capability set the sender advertises at the
+    // moment of the push, the same list its Ping returns. A receiver with a
+    // release feature in use refuses a sender whose declaration lacks that
+    // release token, without dialling it back (an older build sends nothing).
+    repeated string sender_capabilities = 7;
 }
 
 message ReplicateResponse {

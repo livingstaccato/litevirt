@@ -167,6 +167,7 @@ func (s *Server) RunHAHealthMonitor(ctx context.Context, interval time.Duration)
 	// first still is changes nothing an operator can observe — the gauge is
 	// already 1 and no event fires. The set changing IS the news.
 	var prevUnsupported []degradedCapability
+	var prevRefused []string
 	eval := func() {
 		// One peer op per cycle, split between the two axes so neither starves the
 		// other: mostly spent latching an unlatched token (round-robin, so one
@@ -187,6 +188,7 @@ func (s *Server) RunHAHealthMonitor(ctx context.Context, interval time.Duration)
 		// isolation. One peer per cycle, so this adds no fan-out.
 		s.recordSelfReportedIsolation(ctx)
 		cur, unsupported := s.evaluateHADegraded(ctx)
+		curRefused := s.releasePeerRefusedNow()
 		// Rollout observability: per-feature config intent, latch state, and
 		// whether the feature is degraded. Written AFTER the evaluation because
 		// the degraded set comes from it, and for EVERY supported token rather
@@ -206,7 +208,8 @@ func (s *Server) RunHAHealthMonitor(ctx context.Context, interval time.Duration)
 			on := cur[r]
 			s.haMetrics.Set(r, on)
 			switch {
-			case on && !prev[r], degradedSetGrew(r, on, prev[r], unsupported, prevUnsupported):
+			case on && !prev[r], degradedSetGrew(r, on, prev[r], unsupported, prevUnsupported),
+				r == haReleasePeerRefused && on && releasePeerRefusedGrew(prevRefused, curRefused):
 				detail := haDegradedDetail(r, s.hostName, unsupported)
 				if r == haReleasePeerRefused {
 					detail += " (" + s.releasePeerRefusedDetail() + ")"
@@ -219,6 +222,7 @@ func (s *Server) RunHAHealthMonitor(ctx context.Context, interval time.Duration)
 		}
 		prev = cur
 		prevUnsupported = unsupported
+		prevRefused = curRefused
 	}
 	eval()
 	t := time.NewTicker(interval)

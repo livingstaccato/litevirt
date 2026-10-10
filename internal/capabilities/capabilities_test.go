@@ -195,7 +195,7 @@ func TestFeatureGrant_OnlyAMintedGrantForTheFeatureChecks(t *testing.T) {
 	if zero.Check("widgets") == nil {
 		t.Error("the zero FeatureGrant passed Check")
 	}
-	g := MintFeatureGrant("widgets")
+	g := mintGrant("widgets")
 	if err := g.Check("widgets"); err != nil {
 		t.Errorf("a grant for widgets: %v", err)
 	}
@@ -226,4 +226,21 @@ func TestHonoured(t *testing.T) {
 	if Honoured(ReleaseToken, "gadgets") || Honoured("release_2099_01_v1", "widgets") {
 		t.Error("an undeclared pair is honoured")
 	}
+}
+
+// TestGrantMinter_ClaimedOnce: the gate claims the only minter at init; a
+// second claimant — any other package trying to mint grants — panics.
+func TestGrantMinter_ClaimedOnce(t *testing.T) {
+	grantMinterClaimed.Store(false)
+	t.Cleanup(func() { grantMinterClaimed.Store(false) })
+	mint := ClaimGrantMinter()
+	if mint("widgets").Check("widgets") != nil {
+		t.Fatal("the claimed minter's grant does not check")
+	}
+	defer func() {
+		if recover() == nil {
+			t.Fatal("a second ClaimGrantMinter did not panic")
+		}
+	}()
+	_ = ClaimGrantMinter()
 }

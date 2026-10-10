@@ -41,6 +41,7 @@ import (
 	"sort"
 	"strings"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
 )
 
@@ -210,6 +211,9 @@ func (c *Client) ReleaseUseQuarantine() []string {
 	return out
 }
 
+// releaseProbationPrefix starts the probation refusal reason.
+const releaseProbationPrefix = "release probation: "
+
 // releaseUseQuarantineReason is the write refusal while tripped or in
 // probation, or "".
 func (c *Client) releaseUseQuarantineReason() string {
@@ -217,7 +221,7 @@ func (c *Client) releaseUseQuarantineReason() string {
 		return "a feature of a newer release this build does not know is in use: " + strings.Join(toks, ",")
 	}
 	if toks := c.ReleaseProbation(); len(toks) > 0 {
-		return "release probation: started below latched release token(s) " + strings.Join(toks, ",") +
+		return releaseProbationPrefix + "started below latched release token(s) " + strings.Join(toks, ",") +
 			" with no use recorded in this replica; waiting to confirm that with a voter majority"
 	}
 	return ""
@@ -335,51 +339,87 @@ func (c *Client) ReleaseProbation() []string {
 	return out
 }
 
-// liftReleaseProbation ends probation for every token in it.
-func (c *Client) liftReleaseProbation() {
+// liftReleaseProbation ends probation for tokens — the set a verification
+// round checked — and only those (N8): a token added since stays.
+func (c *Client) liftReleaseProbation(tokens []string) {
 	c.releaseUseMu.Lock()
-	c.releaseProbation = nil
+	for _, t := range tokens {
+		delete(c.releaseProbation, t)
+	}
 	c.releaseUseMu.Unlock()
 }
 
-// VerifyReleaseProbation tries once to lift this node's release probation. It
-// pulls cluster_policies whole — unscoped, not bucketed — from voters until it
-// holds a voter MAJORITY's view (this node counts if it is a voter), merging
-// each, so any use recorded on a majority is now here and has tripped the
-// quarantine. If none of the recorded uses is one this build cannot honour,
-// probation lifts and it returns true. It returns false, with no error, when a
-// majority was not reached or a use was found; probation then stays (the
-// latter also quarantines, permanently). A recorded use was acknowledged by
-// every host replicating at the time (health.Checker.WithFeature), so any one
-// voter that was up holds it; a majority keeps that true across a voter that
-// has since lost its state.
+// WALQuarantined reports a ROLLBACK quarantine: the injected predicate (a
+// marker for a token this build does not know) or a tripped release use. It is
+// what Ping reports as wal_quarantined, and what makes a peer record a
+// rolled_back_latch isolation. Release PROBATION is deliberately not part of it
+// (N1): probation refuses this node's own replicated writes, but the node keeps
+// advertising and is not a rollback below anything known to be used.
+func (c *Client) WALQuarantined() bool {
+	if c.writeQuarantine != nil && c.writeQuarantine() != "" {
+		return true
+	}
+	return len(c.ReleaseUseQuarantine()) > 0
+}
+
+// InReleaseProbation reports whether this node is in release probation.
+func (c *Client) InReleaseProbation() bool { return len(c.ReleaseProbation()) > 0 }
+
+// VerifyReleaseProbation tries once to lift this node's release probation.
+//
+// It asks the OTHER voters (VoterSet: the newest adopted generation, or the
+// derived set) for their cluster_policies, whole and unscoped, merging each.
+// Two kinds of answer do not count (N3): this node's own replica — the one in
+// doubt — and a peer that is itself in probation, which is in the same doubt.
+// It needs a majority of the voter set from the others, capped at the number
+// of other voters, so a two-voter cluster asks its one peer and a one-voter
+// cluster has nobody else to ask. A first use is acknowledged by every voter
+// and every replication recipient (health.Checker.WithFeature), so a use made
+// while this node was away is held by every voter that was up — and a voter
+// majority meets that set. The pull is exempt from the replication-source gate
+// (N2): reading cluster_policies is harmless from any peer.
+//
+// Any use this build cannot honour, found in what was merged, trips the
+// permanent quarantine and probation stays. Otherwise probation lifts — for the
+// tokens this round checked only (N8). It returns false, with no error, when a
+// majority was not reached or a use was found.
 func (ae *AntiEntropy) VerifyReleaseProbation(ctx context.Context) (bool, error) {
-	if len(ae.client.ReleaseProbation()) == 0 {
+	checking := ae.client.ReleaseProbation()
+	if len(checking) == 0 {
 		return true, nil
 	}
 	voters, err := VoterSet(ctx, ae.client)
 	if err != nil {
 		return false, fmt.Errorf("voter set: %w", err)
 	}
-	need := len(voters)/2 + 1
-	have := 0
 	self := ae.client.HostName()
-	if voters[self] {
-		have++
-	}
-	names := make([]string, 0, len(voters))
+	others := make([]string, 0, len(voters))
 	for v := range voters {
 		if v != self {
-			names = append(names, v)
+			others = append(others, v)
 		}
 	}
-	sort.Strings(names)
-	for _, peer := range names {
+	sort.Strings(others)
+	need := len(voters)/2 + 1
+	if need > len(others) {
+		need = len(others)
+	}
+	pull := ae.probationPull
+	if pull == nil {
+		pull = ae.pullClusterPoliciesForProbation
+	}
+	have := 0
+	for _, peer := range others {
 		if have >= need {
 			break
 		}
-		if err := ae.pullClusterPolicies(ctx, peer); err != nil {
+		inProbation, err := pull(ctx, peer)
+		if err != nil {
 			slog.Debug("release probation: could not pull cluster_policies", "peer", peer, "error", err)
+			continue
+		}
+		if inProbation {
+			slog.Debug("release probation: not counting a peer that is itself in probation", "peer", peer)
 			continue
 		}
 		have++
@@ -400,16 +440,40 @@ func (ae *AntiEntropy) VerifyReleaseProbation(ctx context.Context) (bool, error)
 		return false, nil
 	}
 	slog.Info("release probation: a voter majority holds no use of a feature this build cannot keep; lifting",
-		"tokens", ae.client.ReleaseProbation(), "voters_asked", have)
-	ae.client.liftReleaseProbation()
+		"tokens", checking, "voters_asked", have)
+	ae.client.liftReleaseProbation(checking)
 	return true, nil
 }
 
-// pullClusterPolicies pulls and merges cluster_policies whole from peer.
-func (ae *AntiEntropy) pullClusterPolicies(ctx context.Context, peer string) error {
-	if err := ae.client.ReplicationSourceAllowed(ctx, peer); err != nil {
-		return err
+// pullClusterPoliciesForProbation asks peer whether it is in probation, then
+// pulls and merges its cluster_policies whole. NOT gated by the
+// replication-source gate (N2).
+func (ae *AntiEntropy) pullClusterPoliciesForProbation(ctx context.Context, peer string) (bool, error) {
+	pctx, cancel := context.WithTimeout(ctx, antiEntropyPeerTimeout)
+	defer cancel()
+	client, conn, err := ae.peerClient(pctx, peer)
+	if err != nil {
+		return false, err
 	}
+	defer conn.Close()
+	resp, err := client.Ping(pctx, &pb.PingRequest{})
+	if err != nil {
+		return false, err
+	}
+	if resp.GetReleaseProbation() || resp.GetWalQuarantined() {
+		return true, nil
+	}
+	_, perr, merr := ae.pullAndMerge(pctx, client, []string{"cluster_policies"}, nil, nil)
+	if perr != nil {
+		return false, perr
+	}
+	return false, merr
+}
+
+// CheckReleaseUsesFrom pulls and merges peer's cluster_policies whole, so a
+// use recorded there that this build cannot honour trips the quarantine. It
+// blocks nothing while it runs. NOT gated by the replication-source gate.
+func (ae *AntiEntropy) CheckReleaseUsesFrom(ctx context.Context, peer string) error {
 	pctx, cancel := context.WithTimeout(ctx, antiEntropyPeerTimeout)
 	defer cancel()
 	client, conn, err := ae.peerClient(pctx, peer)
@@ -422,6 +486,19 @@ func (ae *AntiEntropy) pullClusterPolicies(ctx context.Context, peer string) err
 		return perr
 	}
 	return merr
+}
+
+// OnUnknownReleaseToken is what a node does when a peer advertises a release
+// token this build does not know — a forward roll, normally (N2). It does NOT
+// enter probation and refuses nothing: the token is replication-gated, so it
+// cannot latch, and so cannot have a use, while this node is admitted and does
+// not advertise it. It looks at that peer's cluster_policies anyway, so a use
+// made while this node was away is found and trips the quarantine.
+func (ae *AntiEntropy) OnUnknownReleaseToken(ctx context.Context, peer, token string) {
+	if err := ae.CheckReleaseUsesFrom(ctx, peer); err != nil {
+		slog.Debug("release feature: could not look at a newer peer's used records", "peer", peer,
+			"token", token, "error", err)
+	}
 }
 
 // SetReplicationSourceGate injects the predicate deciding whether this node
@@ -444,4 +521,23 @@ func (c *Client) ReplicationSourceAllowed(ctx context.Context, peer string) erro
 		return nil
 	}
 	return (*fn)(ctx, peer)
+}
+
+// SetAdvertisedCapabilities injects what this node advertises, sent with every
+// push as ReplicateRequest.sender_capabilities so a receiver can judge it
+// without dialling back (grpcapi.Server.SetReplicator wires it).
+func (r *Replicator) SetAdvertisedCapabilities(fn func() []string) {
+	if fn == nil {
+		r.advertised.Store(nil)
+		return
+	}
+	r.advertised.Store(&fn)
+}
+
+// advertisedCapabilities is what the push declares; nil when unwired.
+func (r *Replicator) advertisedCapabilities() []string {
+	if fn := r.advertised.Load(); fn != nil {
+		return (*fn)()
+	}
+	return nil
 }

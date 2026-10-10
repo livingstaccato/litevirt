@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -30,10 +31,11 @@ func (c *Checker) SetReleaseUseConfirmer(fn ReleaseUseConfirmer) {
 }
 
 // SetUnknownReleaseTokenObserver injects what to do when a peer's Ping
-// advertises a release token this build does not know: the daemon puts the node
-// in release probation (corrosion.Client.EnterReleaseProbation). Called once
-// per token per Checker.
-func (c *Checker) SetUnknownReleaseTokenObserver(fn func(token string)) {
+// advertises a release token this build does not know: the daemon looks at
+// that peer's used records without blocking anything
+// (corrosion.AntiEntropy.OnUnknownReleaseToken) — never a probation (N2).
+// Called once per token per Checker.
+func (c *Checker) SetUnknownReleaseTokenObserver(fn func(peer, token string)) {
 	c.mu.Lock()
 	c.unknownReleaseObserver = fn
 	c.mu.Unlock()
@@ -41,7 +43,7 @@ func (c *Checker) SetUnknownReleaseTokenObserver(fn func(token string)) {
 
 // noteAdvertised reports, once per token, a release token a peer advertises
 // that this build does not know.
-func (c *Checker) noteAdvertised(caps []string) {
+func (c *Checker) noteAdvertised(peer string, caps []string) {
 	for _, tok := range caps {
 		if !strings.HasPrefix(tok, "release_") || corrosion.ReleaseTokenKnown(tok) {
 			continue
@@ -49,16 +51,24 @@ func (c *Checker) noteAdvertised(caps []string) {
 		c.mu.Lock()
 		fn := c.unknownReleaseObserver
 		seen := c.unknownReleaseSeen[tok]
-		if c.unknownReleaseSeen == nil {
-			c.unknownReleaseSeen = map[string]bool{}
+		// Marked seen only once someone was told (N7): a token seen before the
+		// observer is wired is reported on the next Ping that carries it.
+		if fn != nil && !seen {
+			if c.unknownReleaseSeen == nil {
+				c.unknownReleaseSeen = map[string]bool{}
+			}
+			c.unknownReleaseSeen[tok] = true
 		}
-		c.unknownReleaseSeen[tok] = true
 		c.mu.Unlock()
 		if fn != nil && !seen {
-			fn(tok)
+			fn(peer, tok)
 		}
 	}
 }
+
+// mintGrant is the only FeatureGrant minter, claimed at init: no other package
+// can claim it after this one has.
+var mintGrant = capabilities.ClaimGrantMinter()
 
 // releaseAckTimeout bounds how long a first use waits for every recipient to
 // acknowledge its record. A var so tests can shrink it.
@@ -101,7 +111,7 @@ func (c *Checker) WithFeature(ctx context.Context, feature capabilities.Feature,
 	if err := c.requireFeature(ctx, feature); err != nil {
 		return err
 	}
-	return write(ctx, capabilities.MintFeatureGrant(feature))
+	return write(ctx, mintGrant(feature))
 }
 
 // requireFeature is WithFeature's gate (see there).
@@ -178,8 +188,11 @@ func (c *Checker) requireFeature(ctx context.Context, feature capabilities.Featu
 }
 
 // releaseRecipients re-confirms, from fresh Pings, that every host this node
-// replicates to (and every voter) advertises tok, and returns them, this node
-// excluded.
+// replicates to (and every voting-eligible host) advertises tok, and returns
+// the hosts that must acknowledge a first use, this node excluded: those, plus
+// every member of the voter set (N3) — a voter in maintenance included,
+// because a later probation majority is drawn from the voter set. A powered-off
+// maintenance host that is not a voter is neither, and does not block.
 func (c *Checker) releaseRecipients(ctx context.Context, tok string) ([]string, error) {
 	if ok, reason := c.CapabilityActive(ctx, tok); !ok {
 		return nil, fmt.Errorf("a host this one replicates to does not advertise it now (%s); a host "+
@@ -189,11 +202,21 @@ func (c *Checker) releaseRecipients(ctx context.Context, tok string) ([]string, 
 	if err != nil {
 		return nil, fmt.Errorf("read hosts: %v", err)
 	}
-	var out []string
+	voters, err := c.voters(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("read the voter set: %v", err)
+	}
+	set := map[string]bool{}
 	for _, h := range c.activationTargets(hosts, tok) {
-		if h != c.hostName {
-			out = append(out, h)
-		}
+		set[h] = true
+	}
+	for v := range voters {
+		set[v] = true
+	}
+	delete(set, c.hostName)
+	out := make([]string, 0, len(set))
+	for h := range set {
+		out = append(out, h)
 	}
 	sort.Strings(out)
 	return out, nil
@@ -215,12 +238,24 @@ func (c *Checker) awaitReleaseAcks(ctx context.Context, targets []string, tok, f
 	deadline := time.Now().Add(releaseAckTimeout)
 	pending := append([]string(nil), targets...)
 	for {
+		// Every pending recipient at once (N10), so one slow host costs one
+		// timeout per round, not one each.
+		held := make([]bool, len(pending))
+		var wg sync.WaitGroup
+		for i, h := range pending {
+			wg.Add(1)
+			go func(i int, h string) {
+				defer wg.Done()
+				cctx, cancel := context.WithTimeout(ctx, capActivationTimeout)
+				ok, err := confirm(cctx, h, tok, feature)
+				cancel()
+				held[i] = err == nil && ok
+			}(i, h)
+		}
+		wg.Wait()
 		var still []string
-		for _, h := range pending {
-			cctx, cancel := context.WithTimeout(ctx, capActivationTimeout)
-			held, err := confirm(cctx, h, tok, feature)
-			cancel()
-			if err != nil || !held {
+		for i, h := range pending {
+			if !held[i] {
 				still = append(still, h)
 			}
 		}

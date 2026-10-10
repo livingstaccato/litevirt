@@ -813,7 +813,7 @@ type Server struct {
 	releaseUsed        []string
 	releaseUsedAt      time.Time
 	releasePeerRefused map[string]time.Time
-	releasePeerChecks  map[string]releasePeerCheck
+	releasePeerLast    map[string][]string
 	onGateRefused      func(action, reason string)
 	// vmStartObserver is told of every guest start (SetVMStartObserver).
 	vmStartObserver VMStartObserver
@@ -2151,6 +2151,11 @@ func (s *Server) SetDNSDomain(domain string) {
 // SetReplicator attaches the WAL-based replicator to the server.
 func (s *Server) SetReplicator(r *corrosion.Replicator) {
 	s.replicator = r
+	// Every push declares what this node advertises (ReplicateRequest.
+	// sender_capabilities), so a receiver can judge it without dialling back.
+	if r != nil {
+		r.SetAdvertisedCapabilities(s.AdvertisedCapabilities)
+	}
 }
 
 // SetStoragePools configures host-level storage pool references for volume resolution.

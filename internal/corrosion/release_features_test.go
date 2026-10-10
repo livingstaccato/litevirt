@@ -398,7 +398,7 @@ func TestReleaseProbation_RefusesWritesUntilLifted(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "probation") {
 		t.Fatalf("a replicated write in probation: %v, want a probation refusal", err)
 	}
-	c.liftReleaseProbation()
+	c.liftReleaseProbation([]string{futureReleaseToken})
 	if err := InsertProject(ctx, c, ProjectRecord{Name: "acme"}); err != nil {
 		t.Fatalf("a write after probation lifted: %v", err)
 	}
@@ -480,5 +480,142 @@ func TestVerifyReleaseProbation_NeedsAVoterMajority(t *testing.T) {
 	}
 	if got := c.ReleaseProbation(); !slices.Equal(got, []string{futureReleaseToken}) {
 		t.Fatalf("ReleaseProbation = %v, want it kept", got)
+	}
+}
+
+// TestWALQuarantined_IsNotProbation (N1): probation refuses this node's own
+// replicated writes, but it is not a rollback quarantine. Reporting it as one
+// (Ping's wal_quarantined) gets the node isolated by its peers until a reseed.
+func TestWALQuarantined_IsNotProbation(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	c.EnterReleaseProbation([]string{futureReleaseToken})
+	if c.WALQuarantined() {
+		t.Fatal("a node in release probation reports WAL quarantine")
+	}
+	if c.QuarantineReason() == "" {
+		t.Fatal("probation does not refuse replicated writes")
+	}
+	err := InsertProject(ctx, c, ProjectRecord{Name: "acme"})
+	if err == nil || !strings.Contains(err.Error(), "release probation") || strings.Contains(err.Error(), "reseed required") {
+		t.Fatalf("refusal in probation = %v, want it to name the probation and not ask for a reseed (N9)", err)
+	}
+	c.liftReleaseProbation([]string{futureReleaseToken})
+	c.SetWriteQuarantine(func() string { return "rolled back below latched token(s): x" })
+	if !c.WALQuarantined() {
+		t.Fatal("a rollback quarantine is not reported")
+	}
+	c.SetWriteQuarantine(nil)
+	r := NewReplicator(c, "", RelayConfig{})
+	if _, err := r.ApplyRemoteMutations(ctx, replayEntry(t, "n2", "3000000000000-0000-n2",
+		releaseUseStatement(futureReleaseToken, "widgets", "3000000000000-0000-n2"))); err != nil {
+		t.Fatal(err)
+	}
+	if !c.WALQuarantined() {
+		t.Fatal("a tripped release use is not reported as WAL quarantine")
+	}
+}
+
+// TestLiftReleaseProbation_OnlyTheCheckedTokens (N8): a token that entered
+// probation after a verification round began is not lifted by it.
+func TestLiftReleaseProbation_OnlyTheCheckedTokens(t *testing.T) {
+	c := testClient(t)
+	c.EnterReleaseProbation([]string{"release_2099_01_v1"})
+	checked := c.ReleaseProbation()
+	c.EnterReleaseProbation([]string{"release_2099_02_v1"})
+	c.liftReleaseProbation(checked)
+	if got := c.ReleaseProbation(); !slices.Equal(got, []string{"release_2099_02_v1"}) {
+		t.Fatalf("ReleaseProbation = %v, want the later token kept", got)
+	}
+}
+
+// probationVoters seeds a voter set {self, others...} and returns a client in
+// probation whose pulls are answered by pull.
+func probationVoters(t *testing.T, others []string, pull func(peer string) (bool, error)) (*Client, *AntiEntropy) {
+	t.Helper()
+	ctx := context.Background()
+	c := testClient(t)
+	for _, h := range append([]string{c.HostName()}, others...) {
+		if err := InsertHost(ctx, c, HostRecord{Name: h, Address: "10.0.0.9", State: "active", Role: "worker"}); err != nil {
+			t.Fatalf("InsertHost %s: %v", h, err)
+		}
+	}
+	c.EnterReleaseProbation([]string{futureReleaseToken})
+	ae := NewAntiEntropy(c, t.TempDir(), time.Minute)
+	ae.probationPull = func(_ context.Context, peer string) (bool, error) { return pull(peer) }
+	return c, ae
+}
+
+// TestVerifyReleaseProbation_CountsOnlyOtherVotersNotInProbation (N3): this
+// node's own replica is the one in doubt, and a peer in probation is in the
+// same doubt, so neither counts toward the majority.
+func TestVerifyReleaseProbation_CountsOnlyOtherVotersNotInProbation(t *testing.T) {
+	ctx := context.Background()
+	// 3 voters: self, b answers, c unreachable. Self does not count: 1 < 2.
+	_, ae := probationVoters(t, []string{"voter-b", "voter-c"}, func(peer string) (bool, error) {
+		if peer == "voter-b" {
+			return false, nil
+		}
+		return false, errors.New("unreachable")
+	})
+	if lifted, _ := ae.VerifyReleaseProbation(ctx); lifted {
+		t.Fatal("probation lifted on one other voter of three: this node counted itself")
+	}
+	// b and c answer, but b is itself in probation: 1 < 2.
+	_, ae = probationVoters(t, []string{"voter-b", "voter-c"}, func(peer string) (bool, error) {
+		return peer == "voter-b", nil
+	})
+	if lifted, _ := ae.VerifyReleaseProbation(ctx); lifted {
+		t.Fatal("probation lifted on the word of a peer that is itself in probation")
+	}
+	// Both answer and neither is in probation: lifted.
+	c, ae := probationVoters(t, []string{"voter-b", "voter-c"}, func(string) (bool, error) { return false, nil })
+	if lifted, err := ae.VerifyReleaseProbation(ctx); !lifted || err != nil {
+		t.Fatalf("both other voters answered: lifted=%v err=%v", lifted, err)
+	}
+	if len(c.ReleaseProbation()) != 0 {
+		t.Fatal("probation still set after it lifted")
+	}
+	// Two voters: the one other voter is the whole of what can be asked.
+	_, ae = probationVoters(t, []string{"voter-b"}, func(string) (bool, error) { return false, nil })
+	if lifted, _ := ae.VerifyReleaseProbation(ctx); !lifted {
+		t.Fatal("a two-voter cluster cannot lift probation: stuck")
+	}
+}
+
+type sensitiveRowsClient struct {
+	fakeRowsClient
+	calls []string
+}
+
+func (f *sensitiveRowsClient) StreamTableRows(ctx context.Context, req *pb.TableDumpRequest, o ...grpc.CallOption) (grpc.ServerStreamingClient[pb.TableRowsPage], error) {
+	f.calls = append(f.calls, "public:"+strings.Join(req.Tables, ","))
+	return f.fakeRowsClient.StreamTableRows(ctx, req, o...)
+}
+
+func (f *sensitiveRowsClient) StreamSensitiveTableRows(_ context.Context, _ *pb.SensitiveStateRequest, _ ...grpc.CallOption) (grpc.ServerStreamingClient[pb.TableRowsPage], error) {
+	f.calls = append(f.calls, "sensitive")
+	f.tripped = append(f.tripped, f.recv.ReleaseUseQuarantine())
+	return &pageStream{pages: []*pb.TableRowsPage{{Final: true}}}, nil
+}
+
+// TestAntiEntropy_SensitivePullTakesClusterPoliciesFirst (N6): feature data in
+// a sensitive table must not merge ahead of its used record either.
+func TestAntiEntropy_SensitivePullTakesClusterPoliciesFirst(t *testing.T) {
+	ctx := context.Background()
+	src := testClient(t)
+	openClusterPolicyGate(src)
+	if err := RecordReleaseFeatureUse(ctx, src, futureReleaseToken, "widgets", "n3", false); err != nil {
+		t.Fatal(err)
+	}
+	c := testClient(t)
+	f := &sensitiveRowsClient{fakeRowsClient: fakeRowsClient{t: t, src: src, recv: c}}
+	ae := NewAntiEntropy(c, "", time.Minute)
+	_, _, _ = ae.pullAndMerge(ctx, f, []string{"user_credentials"}, nil, &pb.SensitiveStateRequest{})
+	if len(f.calls) < 2 || f.calls[0] != "public:cluster_policies" || f.calls[1] != "sensitive" {
+		t.Fatalf("calls = %v, want cluster_policies pulled before the sensitive lane", f.calls)
+	}
+	if len(f.tripped) == 0 || !slices.Equal(f.tripped[len(f.tripped)-1], []string{futureReleaseToken}) {
+		t.Fatalf("quarantine at the sensitive pull = %v, want [%s]", f.tripped, futureReleaseToken)
 	}
 }

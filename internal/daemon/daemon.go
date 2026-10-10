@@ -120,9 +120,6 @@ type Daemon struct {
 	// reseed it, but it emits no replicated writes.
 	rolledBackTokens []string
 
-	// releaseProbationKick wakes runReleaseProbation (kickReleaseProbation).
-	releaseProbationKick chan struct{}
-
 	// exitFunc terminates the process on a watchdog rollback. Defaults to os.Exit;
 	// overridable in tests.
 	exitFunc func(int)
@@ -657,10 +654,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	ae.SetRelayConfig(relayCfg)
 	ae.SetLegacyRepair(d.cfg.AntiEntropyLegacyRepair)
 	go ae.Start(ctx)
-	// Release probation is lifted only by asking a voter majority. A peer
-	// advertising a release token this build does not know starts one too:
-	// this node may have been away while it latched and hold no marker.
-	d.releaseProbationKick = make(chan struct{}, 1)
+	// Release probation (entered only from a marker at boot) is lifted only by
+	// asking a voter majority.
 	go d.runReleaseProbation(ctx, ae)
 
 	// Start metrics server. Create the LXC runner ONCE here and share it with the
@@ -863,9 +858,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// WithFeature: the release token's latch plus the replicated used bit.
 	svc.SetReleaseFeatureGate(d.checker)
 	d.checker.SetReleaseUseConfirmer(svc.PeerHoldsReleaseFeatureUse)
-	d.checker.SetUnknownReleaseTokenObserver(func(tok string) {
-		d.db.EnterReleaseProbation([]string{tok})
-		d.kickReleaseProbation()
+	// A peer advertising a release token this build does not know is, almost
+	// always, a forward roll: a non-blocking look at its used records, never a
+	// probation (N2). Probation comes only from a marker at boot.
+	d.checker.SetUnknownReleaseTokenObserver(func(peer, tok string) {
+		go ae.OnUnknownReleaseToken(ctx, peer, tok)
 	})
 	// Take no replicated state from a peer that cannot keep a release feature
 	// in use: pushes are refused in PushMutations, pulls here.
@@ -1276,8 +1273,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// raise ha_degraded against it.
 	// Quarantined below a latched token found at startup, OR since startup by
 	// a use of a newer release's feature arriving by replication.
+	// A rollback quarantine or a tripped release use — never a release
+	// probation, which is not a rollback below anything known to be used and
+	// must not get this node isolated by its peers (N1).
 	svc.SetWALQuarantined(func() bool {
-		return len(d.rolledBackTokens) > 0 || d.db.QuarantineReason() != ""
+		return len(d.rolledBackTokens) > 0 || d.db.WALQuarantined()
 	})
 	go vipDemoter.Start(ctx)
 	// Partition pause (docs/design/partition-pause.md): on losing the execution

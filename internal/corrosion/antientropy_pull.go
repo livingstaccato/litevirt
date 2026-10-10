@@ -28,7 +28,9 @@ func (ae *AntiEntropy) pullAndMerge(ctx context.Context, client pb.LiteVirtClien
 	// keeps what it merged, so cluster_policies is pulled ALONE first, whole.
 	// Done on the receiver: reordering the sender's ranks would make every
 	// paged pull from this build fail an older receiver's page-order check.
-	if !sensitive && len(tables) > 1 && slices.Contains(tables, "cluster_policies") {
+	// The sensitive lane carries feature data too (a secret a feature stores),
+	// and has no cluster_policies of its own: pull the public one first (N6).
+	if (sensitive || len(tables) > 1) && (sensitive || slices.Contains(tables, "cluster_policies")) {
 		if _, perr, merr := ae.pullAndMerge(ctx, client, []string{"cluster_policies"}, nil, nil); perr != nil || merr != nil {
 			return nil, perr, merr
 		}

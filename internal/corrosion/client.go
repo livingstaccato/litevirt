@@ -531,6 +531,10 @@ func (c *Client) QuarantineReason() string { return c.quarantineReason() }
 // carrying changes no peer will ever see, which is the precise failure the
 // quarantine exists to prevent.
 func errQuarantined(reason string) error {
+	if strings.HasPrefix(reason, releaseProbationPrefix) {
+		return fmt.Errorf("write refused: this node is in release probation (%s); it lifts by itself once a "+
+			"voter majority has been asked, see docs/upgrades.md", reason)
+	}
 	return fmt.Errorf("write refused: node is under WAL quarantine (%s); operator reseed required", reason)
 }
 

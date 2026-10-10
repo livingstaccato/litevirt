@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
@@ -127,6 +128,10 @@ func TestGetUpgradeStatus_ShowsUsesOfUnknownTokens(t *testing.T) {
 	}
 }
 
+type t0 struct{}
+
+func (t0) Helper() {}
+
 type fakeFeatureGate struct {
 	err   error
 	grant bool
@@ -139,7 +144,7 @@ func (g fakeFeatureGate) WithFeature(ctx context.Context, f capabilities.Feature
 	}
 	var grant capabilities.FeatureGrant
 	if g.grant {
-		grant = capabilities.MintFeatureGrant(f)
+		grant = capabilities.GrantForTest(t0{}, f)
 	}
 	return write(ctx, grant)
 }
@@ -188,53 +193,142 @@ func TestHoldsReleaseFeatureUse(t *testing.T) {
 	}
 }
 
-// TestPushMutations_RefusesAPeerThatCannotKeepAUsedFeature (I6): once a
-// feature of a latched release token is in use, a peer that does not advertise
-// the token — rolled back, or back from a long absence on an older build — has
-// its replication back-pressured, not applied, and the refusal is an HA
-// condition naming it.
-func TestPushMutations_RefusesAPeerThatCannotKeepAUsedFeature(t *testing.T) {
-	ctx := context.Background()
+func crlEntry(origin, hlc string) []*pb.MutationEntry {
+	b, _ := json.Marshal([]corrosion.Statement{{
+		SQL:    "INSERT OR REPLACE INTO crl_versions (host, version, updated_at)\n\t\t\t\t VALUES (?, ?, ?)",
+		Params: []interface{}{origin + "-" + hlc, float64(3), hlc},
+	}})
+	return []*pb.MutationEntry{{Seq: 1, Hlc: hlc, Origin: origin, Stmts: string(b)}}
+}
+
+func crlApplied(t *testing.T, s *Server, origin, hlc string) bool {
+	t.Helper()
+	rows, _ := s.db.Query(context.Background(), `SELECT 1 AS one FROM crl_versions WHERE host = ?`, origin+"-"+hlc)
+	return len(rows) > 0
+}
+
+// releasePeerServer has a feature of the release token in use, and a gate
+// that has NOT latched the token here (N5: a recorded use proves the latch
+// formed somewhere, which is enough) and cannot dial any peer back (N4).
+func releasePeerServer(t *testing.T) *Server {
+	t.Helper()
 	s := upgradeStatusServer(t)
 	s.replicator = corrosion.NewReplicator(s.db, "", corrosion.RelayConfig{})
-	s.gate = fakeServerGate{
-		enforcedTok: map[string]bool{capabilities.ReleaseToken: true},
-		supportsTok: map[string]map[string]bool{
-			"old-peer": {capabilities.SplitBrainGateV1: true},
-			"new-peer": {capabilities.ReleaseToken: true},
-		},
-	}
-	const hlc = "2000000000002-0000-n9"
-	entry := func(host string) []*pb.MutationEntry {
-		b, _ := json.Marshal([]corrosion.Statement{{
-			SQL:    "INSERT OR REPLACE INTO crl_versions (host, version, updated_at)\n\t\t\t\t VALUES (?, ?, ?)",
-			Params: []interface{}{host, float64(3), hlc},
-		}})
-		return []*pb.MutationEntry{{Seq: 1, Hlc: hlc, Origin: host, Stmts: string(b)}}
-	}
-	// Nothing used yet: the old peer is accepted, as on main.
-	if _, err := s.PushMutations(replicationPeerCtx("old-peer"), &pb.ReplicateRequest{Sender: "old-peer", Entries: entry("old-peer")}); err != nil {
-		t.Fatalf("PushMutations from an old peer with nothing used: %v", err)
-	}
-	if err := corrosion.RecordReleaseFeatureUse(ctx, s.db, capabilities.ReleaseToken, "widgets", "test-host", true); err != nil {
+	s.gate = fakeServerGate{}
+	if err := corrosion.RecordReleaseFeatureUse(context.Background(), s.db, capabilities.ReleaseToken, "widgets", "test-host", true); err != nil {
 		t.Fatal(err)
 	}
-	s.resetReleasePeerCache()
-	_, err := s.PushMutations(replicationPeerCtx("old-peer"), &pb.ReplicateRequest{Sender: "old-peer", Entries: entry("old-peer-2")})
-	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), capabilities.ReleaseToken) {
-		t.Fatalf("PushMutations from an old peer after a use: %v, want FailedPrecondition naming %s", err, capabilities.ReleaseToken)
+	return s
+}
+
+// TestPushMutations_JudgesTheSenderByItsDeclaration (I6, N4, N5): once a feature
+// is used, a sender whose declared capabilities lack the release token is
+// back-pressured; one that declares it is accepted though this node cannot dial
+// it back (asymmetric links); an older build declares nothing and is refused.
+// This node need not have latched the token itself.
+func TestPushMutations_JudgesTheSenderByItsDeclaration(t *testing.T) {
+	ctx := context.Background()
+	s := releasePeerServer(t)
+	withTok := capabilities.Supported()
+	if _, err := s.PushMutations(replicationPeerCtx("new-peer"), &pb.ReplicateRequest{
+		Sender: "new-peer", Entries: crlEntry("new-peer", "2000000000001-0000-n1"), SenderCapabilities: withTok,
+	}); err != nil || !crlApplied(t, s, "new-peer", "2000000000001-0000-n1") {
+		t.Fatalf("a sender declaring the token, not dialable back: err=%v", err)
 	}
-	if rows, _ := s.db.Query(ctx, `SELECT 1 AS one FROM crl_versions WHERE host = 'old-peer-2'`); len(rows) != 0 {
-		t.Fatal("the refused push was applied")
-	}
-	if _, err := s.PushMutations(replicationPeerCtx("new-peer"), &pb.ReplicateRequest{Sender: "new-peer", Entries: entry("new-peer")}); err != nil {
-		t.Fatalf("PushMutations from an upgraded peer: %v", err)
+	for name, caps := range map[string][]string{
+		"declares nothing (an older build)": nil,
+		"declares without the token":        {capabilities.SplitBrainGateV1},
+	} {
+		_, err := s.PushMutations(replicationPeerCtx("old-peer"), &pb.ReplicateRequest{
+			Sender: "old-peer", Entries: crlEntry("old-peer", "2000000000002-0000-n2"), SenderCapabilities: caps,
+		})
+		if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), capabilities.ReleaseToken) {
+			t.Fatalf("%s: %v, want FailedPrecondition naming %s", name, err, capabilities.ReleaseToken)
+		}
+		if crlApplied(t, s, "old-peer", "2000000000002-0000-n2") {
+			t.Fatalf("%s: the refused push was applied", name)
+		}
 	}
 	cur, _ := s.evaluateHADegraded(ctx)
 	if !cur[haReleasePeerRefused] {
 		t.Fatalf("HA reasons = %v, want %s", cur, haReleasePeerRefused)
 	}
-	if d := s.releasePeerRefusedDetail(); !strings.Contains(d, "old-peer") {
-		t.Fatalf("detail %q does not name the refused peer", d)
+	if d := s.releasePeerRefusedDetail(); !strings.Contains(d, "old-peer") || strings.Contains(d, "new-peer") {
+		t.Fatalf("detail %q does not name exactly the refused peer", d)
+	}
+}
+
+// TestPushMutations_NothingUsedAcceptsEveryone: with no release feature in
+// use, a sender that declares nothing is accepted, as on main.
+func TestPushMutations_NothingUsedAcceptsEveryone(t *testing.T) {
+	s := upgradeStatusServer(t)
+	s.replicator = corrosion.NewReplicator(s.db, "", corrosion.RelayConfig{})
+	if _, err := s.PushMutations(replicationPeerCtx("old-peer"), &pb.ReplicateRequest{
+		Sender: "old-peer", Entries: crlEntry("old-peer", "2000000000003-0000-n2"),
+	}); err != nil {
+		t.Fatalf("PushMutations with nothing used: %v", err)
+	}
+}
+
+// TestPushMutations_RelayedOriginJudgedByItsLastAnswer (residual a): an origin
+// this node cannot reach is judged by the last thing it declared; one never
+// heard from is not judged.
+func TestPushMutations_RelayedOriginJudgedByItsLastAnswer(t *testing.T) {
+	s := releasePeerServer(t)
+	withTok := capabilities.Supported()
+	// old-peer once pushed directly, declaring no release token, and was refused.
+	_, _ = s.PushMutations(replicationPeerCtx("old-peer"), &pb.ReplicateRequest{
+		Sender: "old-peer", Entries: crlEntry("old-peer", "2000000000004-0000-n2"), SenderCapabilities: []string{capabilities.SplitBrainGateV1},
+	})
+	// Its entries relayed by an upgraded peer: refused by origin.
+	_, err := s.PushMutations(replicationPeerCtx("relay"), &pb.ReplicateRequest{
+		Sender: "relay", Entries: crlEntry("old-peer", "2000000000005-0000-n2"), SenderCapabilities: withTok,
+	})
+	if status.Code(err) != codes.FailedPrecondition || crlApplied(t, s, "old-peer", "2000000000005-0000-n2") {
+		t.Fatalf("relayed entries of an origin last seen without the token: %v", err)
+	}
+	// An origin never heard from, and unreachable, is not judged.
+	if _, err := s.PushMutations(replicationPeerCtx("relay"), &pb.ReplicateRequest{
+		Sender: "relay", Entries: crlEntry("stranger", "2000000000006-0000-n3"), SenderCapabilities: withTok,
+	}); err != nil {
+		t.Fatalf("relayed entries of an unknown, unreachable origin: %v", err)
+	}
+	// old-peer upgraded: its declaration replaces the old answer.
+	if _, err := s.PushMutations(replicationPeerCtx("old-peer"), &pb.ReplicateRequest{
+		Sender: "old-peer", Entries: crlEntry("old-peer", "2000000000007-0000-n2"), SenderCapabilities: withTok,
+	}); err != nil {
+		t.Fatalf("old-peer after upgrading: %v", err)
+	}
+	if _, err := s.PushMutations(replicationPeerCtx("relay"), &pb.ReplicateRequest{
+		Sender: "relay", Entries: crlEntry("old-peer", "2000000000008-0000-n2"), SenderCapabilities: withTok,
+	}); err != nil {
+		t.Fatalf("relayed entries of old-peer after it upgraded: %v", err)
+	}
+}
+
+// TestReleasePeerRefusedGrew (N12): a peer newly refused while the reason is
+// already raised is news.
+func TestReleasePeerRefusedGrew(t *testing.T) {
+	if !releasePeerRefusedGrew([]string{"a"}, []string{"a", "b"}) {
+		t.Error("a second refused peer is not reported")
+	}
+	if releasePeerRefusedGrew([]string{"a", "b"}, []string{"a"}) || releasePeerRefusedGrew([]string{"a"}, []string{"a"}) {
+		t.Error("no new peer, but reported")
+	}
+}
+
+// TestPing_ProbationIsNotWALQuarantine (N1): a node in release probation keeps
+// advertising, never reports wal_quarantined, and says release_probation.
+func TestPing_ProbationIsNotWALQuarantine(t *testing.T) {
+	s := testServer(t)
+	s.SetWALQuarantined(s.db.WALQuarantined)
+	s.db.EnterReleaseProbation([]string{"release_2099_01_v1"})
+	resp, err := s.Ping(context.Background(), &pb.PingRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.GetWalQuarantined() || !resp.GetReleaseProbation() || !slices.Contains(resp.GetCapabilities(), capabilities.ReleaseToken) {
+		t.Fatalf("Ping in probation: wal_quarantined=%v release_probation=%v caps=%v, want false/true/advertising",
+			resp.GetWalQuarantined(), resp.GetReleaseProbation(), resp.GetCapabilities())
 	}
 }

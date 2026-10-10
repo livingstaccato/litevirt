@@ -160,6 +160,10 @@ func (s *Server) Ping(ctx context.Context, _ *pb.PingRequest) (*pb.PingResponse,
 		// records our isolation on the strength of this, because we cannot
 		// record it ourselves.
 		WalQuarantined: s.walQuarantinedNow(),
+		// Release probation is its own state (N1): this node refuses its own
+		// replicated writes but is not a rollback below anything known to be
+		// used, keeps advertising, and must not be isolated for it.
+		ReleaseProbation: s.db != nil && s.db.InReleaseProbation(),
 		// The other self-report: tokens advertised above but NOT acted on,
 		// because their kill-switch is off here. DIAGNOSTIC ONLY — see
 		// PingResponse.not_enforcing and notEnforcingTokens.

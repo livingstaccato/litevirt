@@ -563,6 +563,7 @@ func (c *Coordinator) claimContainerRelocation(ctx context.Context, h *corrosion
 // So the workload stays, deliberately, until the host returns or is removed
 // for good (§3.12); ha.claim.stranded names it with the command.
 func (c *Coordinator) noteClaimStranded(kind, name, host string, decided corrosion.ActionProof) {
+	c.noteHold(host, kind+" "+name+": its recovery was decided for this host before it failed; stranded until the host returns or `lv host rm --dead`")
 	if kind == "container" {
 		c.mCt(ActionRelocate, ResultRefused, ErrClaimStranded)
 	} else {

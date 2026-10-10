@@ -179,6 +179,15 @@ type Coordinator struct {
 	// on its own clock; the failed-fence retry counts its backoff from it
 	// when that is later than the row (fenceRetryDue).
 	lastFenceAt map[string]time.Time
+	// retrying is the plan of the failed-fence retry failover is running, or
+	// nil for any other fence; it decides whether the fence notifies
+	// (fenceNotifies).
+	retrying *fenceRetry
+	// retryNotified is, per host, when a failed retry last notified.
+	retryNotified map[string]time.Time
+	// cycleCandidates is the set of fence candidates of the current cycle,
+	// for the stall alert's default reason.
+	cycleCandidates map[string]bool
 	// holdReason is, per host, why its recovery last did not proceed; the
 	// stall alert names it (alertStalledRecoveries).
 	holdReason map[string]string
@@ -719,6 +728,10 @@ func (c *Coordinator) run(ctx context.Context) {
 	}
 	c.clearRegionDeclined(declined)
 	sort.Slice(candidates, func(i, j int) bool { return candidates[i].target < candidates[j].target })
+	c.cycleCandidates = make(map[string]bool, len(candidates))
+	for _, cand := range candidates {
+		c.cycleCandidates[cand.target] = true
+	}
 
 	for _, cand := range candidates {
 		// Re-validate lease before each destructive action: long fence runs
@@ -813,7 +826,7 @@ func (c *Coordinator) run(ctx context.Context) {
 		// backoff has passed (fenceRetryDue); it goes down the fence path
 		// below although it is recorded 'offline'.
 		retry := false
-		retryMethod := ""
+		var retryPlan fenceRetry
 		if !afresh && (h.State == "offline" || h.State == "maintenance" || h.State == "fenced") {
 			// A 'fenced' host is normally finished with — the fence ran and its
 			// recovery ran with it. But the two halves can land on different
@@ -854,12 +867,10 @@ func (c *Coordinator) run(ctx context.Context) {
 			// A fence that FAILED does not park the host: once its backoff
 			// has passed, it is fenced again (fenceRetryDue).
 			if !afresh && !recorded {
-				var next time.Time
-				if retry, next, retryMethod = c.fenceRetryDue(ctx, h); retry {
-					slog.Warn("failover: the newest fence of this host failed; fencing it again with the same method",
-						"host", target, "method", retryMethod, "observers", cand.observers)
-				} else if !next.IsZero() {
-					c.noteHold(target, "fence failed; retrying at "+next.UTC().Format(time.RFC3339))
+				retryPlan = c.fenceRetryDue(ctx, h)
+				retry = retryPlan.Due
+				if !retry && !retryPlan.Next.IsZero() {
+					c.noteHold(target, "fence failed; retrying at "+retryPlan.Next.UTC().Format(time.RFC3339))
 				}
 			}
 		}
@@ -950,13 +961,27 @@ func (c *Coordinator) run(ctx context.Context) {
 			"region_scoped", c.scope.region)
 
 		if retry {
-			// A retry repeats the method that failed (fenceRetryDue), as a
-			// re-fence repeats the recorded one.
+			// Immediately before the fence, under the lease the candidate
+			// loop re-validated: a host anyone has seen answer since the
+			// attempt that failed is never fenced again (retryStillDown).
+			if why, down := c.retryStillDown(ctx, target, retryPlan.FailedAt); !down {
+				slog.Warn("failover: not retrying the fence of a host that answered after the attempt that failed",
+					"host", target, "failed_at", retryPlan.FailedAt.UTC().Format(time.RFC3339), "reason", why)
+				c.mAttempt(PhaseSkip, ResultSkipped, ErrRetryHostAnswered)
+				c.noteHold(target, "fence failed, and the host has answered since; not retried: "+why)
+				continue
+			}
+			slog.Warn("failover: the newest fence of this host failed; fencing it again",
+				"host", target, "strategy", retryPlan.Strategy, "failures", retryPlan.Failures, "observers", cand.observers)
+			// The retry runs retryStrategy, never weaker than the host's
+			// current strategy allows, as a re-fence runs the recorded method.
 			again := *h
-			again.FenceStrategy = retryMethod
+			again.FenceStrategy = retryPlan.Strategy
 			h = &again
+			c.retrying = &retryPlan
 		}
 		c.failover(ctx, h)
+		c.retrying = nil
 	}
 
 	// A one-way condition raised for a host that is no longer a fence
@@ -1030,7 +1055,7 @@ func (c *Coordinator) stepDownGauges() {
 	c.mRegionsWithoutQuorum(0)
 	// The stall alert is the leader's too: a node that takes the lease back
 	// starts its clocks afresh rather than alerting on a stale one.
-	c.stallSince, c.stallAlerted = nil, nil
+	c.stallSince, c.stallAlerted, c.holdReason = nil, nil, nil
 }
 
 // resolvePendingRelocations re-derives every relocate-restore marker in the
@@ -1736,6 +1761,13 @@ func (c *Coordinator) fenceStillStands(ctx context.Context, host string, at time
 	if !c.observerStreakSpans(ctx, host, at) {
 		return "no observer has watched the host stay down since the fence", false
 	}
+	return c.answeredSince(ctx, host, at)
+}
+
+// answeredSince is fenceStillStands' second half: it reports false, and why,
+// when some observer's latest verdict about host — healthy or unready — is
+// newer than `at` (less fenceSkewMargin). It fails closed on a read error.
+func (c *Coordinator) answeredSince(ctx context.Context, host string, at time.Time) (string, bool) {
 	rows, err := c.db.Query(ctx,
 		`SELECT observer, status, consecutive_failures, updated_at FROM host_health WHERE target = ?`, host)
 	if err != nil {
@@ -2354,8 +2386,13 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) (fe
 		c.writeFenceLog(ctx, rec)
 	}
 
-	if c.OnFence != nil {
+	if c.OnFence != nil && c.fenceNotifies(h.Name, fr) {
 		c.OnFence(h.Name, fr.Method, logResult, fr.Detail)
+	}
+	if fr.Success {
+		// A fence that succeeded answers whatever held the recovery back;
+		// recoverFenced records anything that holds it now.
+		delete(c.holdReason, h.Name)
 	}
 
 	// Say so, at the moment it matters, when the fence proves nothing. The row
@@ -2389,7 +2426,11 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) (fe
 	// one that relocated VMs must stay manual to avoid split-brain. Absent
 	// entirely — the resuming-leader case — means "not mine to judge", which
 	// recoverHosts reads as manual-undrain-only. See recoverHosts.
-	c.fenceRelocated[h.Name] = false
+	// A retry or re-fence of a host this coordinator already recovered from
+	// must not erase "VMs moved": only the first commit seeds it.
+	if _, seen := c.fenceRelocated[h.Name]; !seen {
+		c.fenceRelocated[h.Name] = false
+	}
 	c.noteFencedOn(h.Name, rec.ID)
 
 	// recoverFenced sees the host as this fence recorded it, so it does not
@@ -2698,12 +2739,16 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 	// when the fence wasn't proof-grade (best-effort/SSH) — the executor then fails
 	// a shared-disk transfer closed while a local-disk transfer still proceeds.
 	fenceEpoch := c.proofGradeFenceRef(ctx, h.Name)
+	// Recovery is running: whatever held it back before no longer does, and
+	// a refusal below records what holds it now (the stall alert's reason).
+	delete(c.holdReason, h.Name)
 
 	// Step 3: Find VMs that should be restarted.
 	vms, err := corrosion.ListVMs(ctx, c.db, "", h.Name)
 	if err != nil {
 		slog.Error("failover: list VMs", "host", h.Name, "error", err)
 		c.mAttempt(PhaseFence, ResultError, ErrDBError)
+		c.noteHold(h.Name, "recovery could not list the host's VMs: "+err.Error())
 		return
 	}
 
@@ -2712,11 +2757,13 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 	if err != nil {
 		slog.Error("failover: list healthy hosts", "host", h.Name, "error", err)
 		c.mAttempt(PhaseFence, ResultError, ErrDBError)
+		c.noteHold(h.Name, "recovery could not list healthy hosts: "+err.Error())
 		return
 	}
 	if len(candidates) == 0 {
 		slog.Warn("failover: no healthy hosts available for VM rescheduling", "host", h.Name)
 		c.mAttempt(PhaseFence, ResultRefused, ErrNoCandidates)
+		c.noteHold(h.Name, "no healthy host to recover its workloads onto")
 		return
 	}
 	// A spec pin to a host that is down is ignored for this recovery
@@ -2727,6 +2774,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 	if err != nil {
 		slog.Error("failover: list hosts", "host", h.Name, "error", err)
 		c.mAttempt(PhaseFence, ResultError, ErrDBError)
+		c.noteHold(h.Name, "recovery could not list hosts: "+err.Error())
 		return
 	}
 	hostState := make(map[string]string, len(allHosts))
@@ -2818,6 +2866,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 				"vm", vm.Name, "condition", code)
 			c.noteGateRefused(corrosion.ActionReschedule, health.ReasonOwnershipDispute)
 			c.mVM(ActionReschedule, ResultRefused, ErrOwnershipDispute)
+			c.noteHold(h.Name, "VM "+vm.Name+": active ownership condition "+code+"; resolve the dispute")
 			c.auditSkip(ctx, h.Name, vm.Name, "active ownership condition "+code+" — automated recovery refused", "refused")
 			continue
 		}
@@ -2973,6 +3022,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 			observations, c.now(), placementReqs); err != nil {
 			slog.Error("failover: batch placement failed — affected VMs are left for operator recovery, NOT round-robined",
 				"host", h.Name, "error", err)
+			c.noteHold(h.Name, "batch placement failed: "+err.Error())
 			for i := range plans {
 				if plans[i].needsPlacement {
 					c.mVM(ActionReschedule, ResultError, ErrPlacementFailed)
@@ -3001,6 +3051,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 				slog.Warn("failover: no eligible host for VM — left for operator recovery, NOT round-robined",
 					"vm", vm.Name, "from", h.Name, "reason", result.Err)
 				c.mVM(ActionReschedule, ResultSkipped, ErrPlacementFailed)
+				c.noteHold(h.Name, "VM "+vm.Name+": "+detail)
 				c.auditSkip(ctx, h.Name, vm.Name, detail, "skipped")
 				continue
 			}

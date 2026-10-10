@@ -93,7 +93,7 @@ func (s *Server) NotifyHostFenced(host, method, result, detail string) {
 // proceeding.
 func (s *Server) NotifyRecoveryStalled(host, coordinator, reason string, pending int, since time.Time) {
 	s.notify(context.Background(), notify.Notification{
-		Kind: "host.recovery.stalled", Severity: notify.SevError, Subject: host,
+		Kind: notify.KindHostRecoveryStalled, Severity: notify.SevError, Subject: host,
 		Detail: fmt.Sprintf("coordinator=%s pending=%d since=%s reason=%s",
 			coordinator, pending, since.UTC().Format(time.RFC3339), reason),
 	})

@@ -103,6 +103,11 @@ func TestFenceWake_OperatorFenceAfterOwnFailedFenceRecoversNextCycle(t *testing.
 	if got := vmHost(t, db, ctx); got != "alive" {
 		t.Errorf("VM on %q after further cycles, want it left on alive", got)
 	}
+	// Mutation M22: keep the hold reason when recovery runs — the stale
+	// "fence failed" survives the recovery.
+	if r, ok := c.holdReason["down"]; ok {
+		t.Errorf("hold reason %q survived the recovery that ran", r)
+	}
 }
 
 // A coordinator whose own fence failed does not park the host: it fences it
@@ -184,23 +189,35 @@ func TestFenceWake_RetryBackoffDoublesToItsCap(t *testing.T) {
 }
 
 // A manual fence is never retried: it cannot succeed, and its recovery waits
-// for `lv host fence-confirm`, which the confirmation path owns.
+// for `lv host fence-confirm`, which the confirmation path owns. Nor is a
+// watchdog fence of a peer: fence.Execute refuses it for any host but the
+// caller, so it can only fail.
 //
 // Mutation M5: let fenceRetryDue accept a manual attempt — a second manual
 // fence runs.
-func TestFenceWake_ManualFenceIsNotRetried(t *testing.T) {
-	db, ctx := seedDownHost(t, "manual", nil)
-	c := newTestCoordinator("coordinator", db)
-	fences := 0
-	c.SetFencer(func(ctx context.Context, h fence.HostConfig) fence.Result {
-		fences++
-		return manualFencer()(ctx, h)
-	})
-	c.run(ctx)
-	ageFenceRows(t, db, ctx, 10*time.Minute)
-	c.run(ctx)
-	if fences != 1 {
-		t.Errorf("the coordinator ran %d manual fences, want 1", fences)
+// Mutation M17: let retryableFenceMethod accept watchdog — a second watchdog
+// fence runs.
+func TestFenceWake_ManualAndWatchdogFencesAreNotRetried(t *testing.T) {
+	for _, tc := range []struct {
+		strategy string
+		result   fence.Result
+	}{
+		{"manual", fence.Result{Method: "manual", Detail: "operator must confirm", Success: false}},
+		{"watchdog", fence.Result{Method: "watchdog", Detail: "watchdog fence only for the local node", Success: false}},
+	} {
+		t.Run(tc.strategy, func(t *testing.T) {
+			db, ctx := seedDownHost(t, tc.strategy, nil)
+			c := newTestCoordinator("coordinator", db)
+			fences := 0
+			c.SetFencer(countingFencer(&fences, tc.result))
+			c.run(ctx)
+			ageFenceRows(t, db, ctx, 10*time.Minute)
+			c.lastFenceAt = nil
+			c.run(ctx)
+			if fences != 1 {
+				t.Errorf("the coordinator ran %d %s fences, want 1", fences, tc.strategy)
+			}
+		})
 	}
 }
 
@@ -288,5 +305,290 @@ func TestFenceWake_RecoveredHostDoesNotAlert(t *testing.T) {
 	c.run(ctx)
 	if alerts != 0 {
 		t.Errorf("%d stall alert(s) for a host with nothing left on it", alerts)
+	}
+}
+
+// thirdVoter adds a third voter observing 'down' as failing, so one observer
+// can see the host answer while a quorum (2 of 3) still counts it down.
+func thirdVoter(t *testing.T, db *corrosion.Client, ctx context.Context) {
+	t.Helper()
+	ensureVoter(t, db, "third")
+	if err := db.Execute(ctx,
+		`INSERT OR REPLACE INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
+		 VALUES ('third', 'down', 'suspect', ?, NULL, strftime('%Y-%m-%dT%H:%M:%SZ','now'))`,
+		offlineThreshold); err != nil {
+		t.Fatalf("insert health: %v", err)
+	}
+}
+
+// aliveAnswers records that the observer 'alive' has just seen 'down' answer.
+func aliveAnswers(t *testing.T, db *corrosion.Client, ctx context.Context) {
+	t.Helper()
+	if err := db.Execute(ctx,
+		`UPDATE host_health SET status = 'healthy', consecutive_failures = 0,
+		 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE observer = 'alive' AND target = 'down'`); err != nil {
+		t.Fatalf("alive answers: %v", err)
+	}
+}
+
+// A host anyone has seen answer since the fence attempt that failed is not
+// fenced again, though a quorum's rows still count it down: a partition that
+// heals between attempts must not have its host powered off as it returns.
+//
+// Mutation M15: retryStillDown answers true — the retry runs.
+func TestFenceWake_HostThatAnsweredSinceTheFailureIsNotRetried(t *testing.T) {
+	db, ctx := seedDownHost(t, "ssh", nil)
+	thirdVoter(t, db, ctx)
+	c := newTestCoordinator("coordinator", db)
+	fences := 0
+	c.SetFencer(countingFencer(&fences, sshFailedFence, sshFence))
+	c.run(ctx)
+	if fences != 1 {
+		t.Fatalf("fixture: %d fences, want the one failed fence", fences)
+	}
+	ageFenceRows(t, db, ctx, fenceRetryBase+time.Second)
+	c.lastFenceAt = nil
+	aliveAnswers(t, db, ctx)
+
+	c.run(ctx)
+	if fences != 1 {
+		t.Errorf("the coordinator fenced a host an observer saw answer after the failed attempt (%d fences)", fences)
+	}
+	if got := vmHost(t, db, ctx); got != "down" {
+		t.Errorf("VM moved to %q", got)
+	}
+}
+
+// A retry runs the host's CURRENT strategy when it is ipmi or ssh: an
+// operator who fixes a failed SSH fence by configuring IPMI has the next
+// retry use it.
+//
+// Mutation M16: retryStrategy always repeats the failed method — the retry
+// runs ssh.
+func TestFenceWake_RetryHonoursAFixedStrategy(t *testing.T) {
+	db, ctx := seedDownHost(t, "ssh", nil)
+	c := newTestCoordinator("coordinator", db)
+	var strategies []string
+	c.SetFencer(func(_ context.Context, h fence.HostConfig) fence.Result {
+		strategies = append(strategies, h.FenceStrategy)
+		if h.FenceStrategy == "ipmi" {
+			return fence.Result{Method: "ipmi", Success: true, Detail: "verified off"}
+		}
+		return sshFailedFence
+	})
+	c.run(ctx)
+	if err := db.Execute(ctx, `UPDATE hosts SET fence_strategy = 'ipmi' WHERE name = 'down'`); err != nil {
+		t.Fatalf("switch strategy: %v", err)
+	}
+	ageFenceRows(t, db, ctx, fenceRetryBase+time.Second)
+	c.lastFenceAt = nil
+	c.run(ctx)
+	if len(strategies) != 2 || strategies[1] != "ipmi" {
+		t.Fatalf("fence strategies = %v, want the retry to run the operator's ipmi", strategies)
+	}
+	if got := vmHost(t, db, ctx); got != "alive" {
+		t.Errorf("VM still on %q after the IPMI retry succeeded", got)
+	}
+}
+
+// The fence gates hold a due retry back exactly as they hold a first fence.
+//
+// Mutation M12: drop the LocalStall gate — local-stall retries.
+// Mutation M13: drop the QuorumRegain gate — quorum-regain retries.
+// Mutation M14: drop the recentlyFenced gate — recently-fenced retries.
+func TestFenceWake_FenceGatesHoldARetryBack(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(*testing.T, *corrosion.Client, context.Context, *Coordinator)
+	}{
+		{"local-stall", func(_ *testing.T, _ *corrosion.Client, _ context.Context, c *Coordinator) {
+			c.LocalStall = func() bool { return true }
+		}},
+		{"quorum-regain", func(_ *testing.T, _ *corrosion.Client, _ context.Context, c *Coordinator) {
+			c.QuorumRegain = func(context.Context, string) bool { return true }
+		}},
+		{"recently-fenced", func(t *testing.T, db *corrosion.Client, ctx context.Context, _ *Coordinator) {
+			// A success four minutes ago, older than the failure: the newest
+			// attempt still failed, so the retry is due, but a fence is recent.
+			if err := db.Execute(ctx,
+				`INSERT INTO fencing_log (id, host_name, method, result, timestamp, detail) VALUES ('older-ok', 'down', 'ssh', 'fenced', ?, 'earlier')`,
+				time.Now().Add(-4*time.Minute).UTC().Format(time.RFC3339)); err != nil {
+				t.Fatalf("seed older success: %v", err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, ctx := seedDownHost(t, "ssh", nil)
+			c := newTestCoordinator("coordinator", db)
+			fences := 0
+			c.SetFencer(countingFencer(&fences, sshFailedFence, sshFence))
+			c.run(ctx)
+			ageFenceRows(t, db, ctx, fenceRetryBase+time.Second)
+			c.lastFenceAt = nil
+			tc.setup(t, db, ctx, c)
+			c.run(ctx)
+			if fences != 1 {
+				t.Errorf("a due retry ran under the %s gate (%d fences)", tc.name, fences)
+			}
+		})
+	}
+}
+
+// An adopted fence goes through resumeActionFor like a successor's: an
+// operator's SSH fence of a host an observer has seen answer since does not
+// stand, and the leader recovers nothing from it.
+//
+// Mutation M11: treat a declined resume as resumeFromRecord — the VM moves.
+func TestFenceWake_AnAdoptedFenceThatDoesNotStandIsDeclined(t *testing.T) {
+	db, ctx := seedDownHost(t, "ssh", nil)
+	thirdVoter(t, db, ctx)
+	lengthenStreak(t, db, ctx, 2*time.Minute)
+	c := newTestCoordinator("coordinator", db)
+	fences := 0
+	c.SetFencer(countingFencer(&fences, sshFailedFence))
+	c.run(ctx)
+	ageFenceRows(t, db, ctx, 10*time.Second)
+	operatorFences(t, db, ctx)
+	aliveAnswers(t, db, ctx)
+
+	c.run(ctx)
+	if got := vmHost(t, db, ctx); got != "down" {
+		t.Errorf("VM moved to %q on an operator fence an observer saw the host answer after", got)
+	}
+}
+
+// Losing the lease drops the stall clock, the last alert and the hold
+// reasons: the node that takes the lease back alerts from its own view.
+//
+// Mutation M18: keep the stall state across a step-down — the regained
+// leader stays silent inside the repeat window.
+func TestFenceWake_StepDownResetsTheStallClock(t *testing.T) {
+	db, ctx := seedDownHost(t, "ipmi", nil)
+	c := newTestCoordinator("coordinator", db)
+	c.SetFencer(func(context.Context, fence.HostConfig) fence.Result {
+		return fence.Result{Method: "ipmi", Success: false, Detail: "BMC unreachable"}
+	})
+	now := time.Now()
+	c.Now = func() time.Time { return now }
+	alerts := 0
+	c.OnRecoveryStalled = func(string, string, string, int, time.Time) { alerts++ }
+
+	c.run(ctx)
+	now = now.Add(recoveryStallAfter + time.Second)
+	c.run(ctx)
+	if alerts != 1 {
+		t.Fatalf("fixture: %d alerts, want 1", alerts)
+	}
+
+	// Another node holds the lease: this one steps down.
+	if err := db.Execute(ctx, `UPDATE leader_election SET holder = 'other', expires_at = ? WHERE key = 'failover'`,
+		now.Add(time.Minute).UTC().Format(time.RFC3339)); err != nil {
+		t.Fatalf("hand the lease over: %v", err)
+	}
+	c.run(ctx)
+	if c.stallSince != nil || c.stallAlerted != nil || c.holdReason != nil {
+		t.Errorf("stall state survived the step-down: since=%v alerted=%v reasons=%v", c.stallSince, c.stallAlerted, c.holdReason)
+	}
+
+	// Its lease runs out; this node leads again, inside the repeat window.
+	now = now.Add(2 * time.Minute)
+	c.run(ctx)
+	if alerts != 2 {
+		t.Errorf("alerts = %d after regaining the lease; the new tenure alerts from its own view", alerts)
+	}
+}
+
+// A failed retry does not repeat the host.fenced notification until its
+// backoff has reached the cap, and then at most once per retryNotifyEvery.
+//
+// Mutation M19: fenceNotifies always true — every failed retry notifies.
+func TestFenceWake_FailedRetriesNotifySparingly(t *testing.T) {
+	c := NewCoordinator("coordinator", nil)
+	now := time.Now()
+	c.Now = func() time.Time { return now }
+	failed := fence.Result{Method: "ipmi", Success: false}
+	if !c.fenceNotifies("down", failed) {
+		t.Error("a first fence that failed must notify")
+	}
+	notified := 0
+	for n := 1; n <= 8; n++ {
+		c.retrying = &fenceRetry{Failures: n}
+		if c.fenceNotifies("down", failed) {
+			notified++
+		}
+		now = now.Add(fenceRetryDelay(n))
+	}
+	// Failures 2..4 are under the cap; the 5th reaches it and notifies; the
+	// rest fall inside the hour.
+	if notified != 1 {
+		t.Errorf("%d of 8 failed retries notified, want 1", notified)
+	}
+	now = now.Add(retryNotifyEvery)
+	if !c.fenceNotifies("down", failed) {
+		t.Error("a failed retry at the cap an hour later must notify again")
+	}
+	c.retrying = &fenceRetry{Failures: 1}
+	if !c.fenceNotifies("down", fence.Result{Method: "ipmi", Success: true}) {
+		t.Error("a retry that succeeded must notify")
+	}
+}
+
+// The stall alert names what holds the recovery NOW, not the refusal before
+// it: after the operator's fence is adopted, a recovery that cannot place the
+// VM is reported as that, not as the leader's earlier failed fence.
+//
+// Mutation M24: drop the placement hold reason — the alert does not say why
+// the recovery that ran left the VM.
+func TestFenceWake_StallReasonIsWhatHoldsTheRecoveryNow(t *testing.T) {
+	db, ctx := seedDownHost(t, "ssh", nil)
+	lengthenStreak(t, db, ctx, 2*time.Minute)
+	c := newTestCoordinator("coordinator", db)
+	c.SetFencer(countingFencer(new(int), sshFailedFence))
+	now := time.Now()
+	c.Now = func() time.Time { return now }
+	var reasons []string
+	c.OnRecoveryStalled = func(_, _, reason string, _ int, _ time.Time) { reasons = append(reasons, reason) }
+
+	c.run(ctx)
+	if !strings.Contains(c.holdReason["down"], "fence failed") {
+		t.Fatalf("fixture: hold reason %q, want the failed fence", c.holdReason["down"])
+	}
+	// Nowhere to put the VM: the only other workload host is in maintenance
+	// (the coordinator itself is a witness, which places nothing).
+	if err := corrosion.UpdateHostState(ctx, db, "alive", "maintenance"); err != nil {
+		t.Fatalf("UpdateHostState: %v", err)
+	}
+	ageFenceRows(t, db, ctx, 10*time.Second)
+	operatorFences(t, db, ctx)
+	c.run(ctx)
+	now = now.Add(recoveryStallAfter + time.Second)
+	c.run(ctx)
+	if len(reasons) != 1 || !strings.Contains(reasons[0], "no eligible host") || strings.Contains(reasons[0], "fence failed") {
+		t.Errorf("stall reasons = %q, want the recovery's own (no eligible host), not the stale failed fence", reasons)
+	}
+}
+
+// A retried fence does not erase what an earlier recovery by this
+// coordinator recorded: VMs moved, so the host waits for `lv host undrain`.
+//
+// Mutation M23: seed fenceRelocated false on every commit — the retry resets
+// it, and recoverHosts could return the host to service on its own.
+func TestFenceWake_ARetryKeepsVMsMoved(t *testing.T) {
+	db, ctx := seedDownHost(t, "ssh", nil)
+	c := newTestCoordinator("coordinator", db)
+	// Both fences fail, so no recovery runs that could set it true again.
+	fences := 0
+	c.SetFencer(countingFencer(&fences, sshFailedFence))
+	c.fenceRelocated["down"] = true // an earlier recovery of this outage moved VMs
+
+	c.run(ctx)
+	ageFenceRows(t, db, ctx, fenceRetryBase+time.Second)
+	c.lastFenceAt = nil
+	c.run(ctx)
+	if fences != 2 {
+		t.Fatalf("fixture: %d fences, want the failed fence and its retry", fences)
+	}
+	if !c.fenceRelocated["down"] {
+		t.Error("a fence of the host reset fenceRelocated: the record that VMs moved is gone")
 	}
 }

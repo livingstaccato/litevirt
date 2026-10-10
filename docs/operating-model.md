@@ -245,8 +245,26 @@ of acting — it says nothing about whether the resulting rows have replicated.
   does not park the host: while a quorum still sees it down, the leader fences
   it again on a backoff — 30 s after the failed attempt, doubling per
   consecutive failure to a 5-minute cap, read from `fencing_log` so a restart
-  or a new leader keeps the schedule — and recovers on the first success. A
-  `manual` fence is not retried; `lv host fence-confirm` resumes it.
+  or a new leader keeps the schedule — and recovers on the first success.
+  - **Which strategy a retry runs:** the host's current strategy when it is
+    `ipmi` or `ssh`, so fixing the cause with
+    `lv host config <host> --fence-strategy ipmi` (and the BMC credentials)
+    takes effect on the next retry. Otherwise the method that failed is
+    repeated: a host switched to `best-effort` is never "recovered" on a failed
+    best-effort fence.
+  - **What is never retried:** a `manual` fence (`lv host fence-confirm`
+    resumes it), a `watchdog` fence of a peer (it cannot succeed), and a host
+    any observer has seen answer since the attempt that failed. That last
+    check is made immediately before each retry, so a partition that heals
+    between attempts does not power off a host that has just come back.
+  - **Notifications:** the first failure raises `host.fenced` (warn); failed
+    retries do not, until the backoff has reached its cap, and then at most
+    once an hour per host. Every attempt still writes its `fencing_log` row.
+  - **What ends the retries:** the host answering again (it returns to
+    `active` once a quorum sees it healthy); `lv host fence-confirm <host>`
+    once you have confirmed it off, which resumes the recovery;
+    `lv host config <host> --fence-strategy manual`; or
+    `lv host rm --dead <host>` for a host that is gone for good.
 - **A fence recorded by anyone wakes the leader.** A successful fence of a
   quorum-down host recorded after the leader handled it — an operator's
   `lv host fence`, or another coordinator's — is picked up on the leader's
@@ -257,9 +275,14 @@ of acting — it says nothing about whether the resulting rows have replicated.
   workloads are still on it 60 s after its fence record, the leader logs
   "recovery of a fenced host has stalled" and emits a `host.recovery.stalled`
   event and notification naming the host, the coordinator and why it is not
-  proceeding (a failed fence and its next retry, a confirmation it waits for,
-  a partition pause, a fence that no longer stands). It repeats at most every
-  10 minutes per host while the condition lasts.
+  proceeding (a failed fence and its next retry, a host that answered since, a
+  confirmation it waits for, a partition pause, a fence that no longer stands,
+  no host to place on, a stranded claim, or "not a fence candidate this
+  cycle"). It repeats at most every 10 minutes per host while the condition
+  lasts. It ends when the workloads are recovered or leave the host:
+  resolve the reason it names, `lv host undrain <host>` or
+  `lv host rm --dead <host>` for the host, or set the workload's
+  `on_host_failure` to `none` if it is meant to stay.
 - **A new VM is never published `running` before it can prove its
   generation.** Every path that creates a VM row — `CreateVM`, template
   instantiation, import, live-restore autostart and a renamed replica

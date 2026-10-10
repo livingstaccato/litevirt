@@ -610,7 +610,9 @@ What happens next depends on the fence:
   fresh fence, and a shared-disk VM is bound to it. If the re-fence fails,
   nothing is recovered. The failed attempt is now the newest on record, so the
   host is not re-fenced every cycle, only on the failed-fence retry backoff
-  (30 s, doubling to 5 minutes, with the host's current strategy); it is left
+  (30 s, doubling to 5 minutes, with the host's current strategy when that is
+  `ipmi` or `ssh` and the method that failed otherwise, and never once any
+  observer has seen the host answer since the failed attempt); it is left
   `offline`, counted as `phase=recovery, error_class=refence_failed` and
   raised as the `refence_failed` health condition. Confirm it is off and run
   `lv host fence-confirm <host>`, and the recovery resumes from the
@@ -1044,6 +1046,7 @@ Scrape `http://<host>:7444/metrics` for:
   `joining` (a host `lv host add` admitted whose daemon has not started, never fenced),
   `partition_pause_wait` (recovery waiting out a partitioned host's pause, design/partition-pause.md),
   `quorum_regain` (a fence deferred because this node itself regained the voter majority moments ago),
+  `retry_host_answered` (a failed fence not retried because an observer saw the host answer after it),
   and under region-scoped failover `region_too_small` / `region_scoped` — see
   [federation.md](federation.md#region-scoped-failover)). A skip is `result=skipped` with the reason in `error_class`
 - `litevirt_failover_vm_actions_total{action,result,error_class}` — per-VM failover actions

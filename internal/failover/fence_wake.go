@@ -8,6 +8,7 @@ import (
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/fence"
+	"github.com/litevirt/litevirt/internal/notify"
 )
 
 // A host this coordinator has handled for its down-episode (c.fenced) is not
@@ -44,8 +45,38 @@ const (
 
 	// EventRecoveryStalled is the event action, and the notification kind,
 	// of a stall alert.
-	EventRecoveryStalled = "host.recovery.stalled"
+	EventRecoveryStalled = notify.KindHostRecoveryStalled
+
+	// retryNotifyEvery bounds how often a failed fence RETRY notifies
+	// (fenceNotifies), once its backoff has reached fenceRetryMax.
+	retryNotifyEvery = time.Hour
 )
+
+// fenceNotifies reports whether the fence fr of host, just run, raises the
+// operator's host.fenced notification (OnFence). Every fence does, except a
+// failed RETRY of a failed fence: the first failure has notified, and the
+// stall alert carries the ongoing state. A failed retry notifies again only
+// once its backoff has reached fenceRetryMax, and then at most once per
+// retryNotifyEvery per host. The fencing_log row is written either way; the
+// backoff caps its rate.
+func (c *Coordinator) fenceNotifies(host string, fr fence.Result) bool {
+	r := c.retrying
+	if r == nil || fr.Success {
+		return true
+	}
+	if fenceRetryDelay(r.Failures+1) < fenceRetryMax {
+		return false
+	}
+	now := c.now()
+	if last, ok := c.retryNotified[host]; ok && now.Sub(last) < retryNotifyEvery {
+		return false
+	}
+	if c.retryNotified == nil {
+		c.retryNotified = map[string]time.Time{}
+	}
+	c.retryNotified[host] = now
+	return true
+}
 
 // fenceRetryDelay is the wait after the n-th consecutive failed fence attempt
 // (n >= 1) before the next one: fenceRetryBase doubling to fenceRetryMax.
@@ -61,52 +92,82 @@ func fenceRetryDelay(n int) time.Duration {
 }
 
 // retryableFenceMethod reports whether a failed attempt with method is worth
-// repeating. A manual fence cannot succeed (the confirmation path owns it),
-// and a best-effort fence already proceeded on its failure.
+// repeating. A manual fence cannot succeed (the confirmation path owns it), a
+// best-effort fence already proceeded on its failure, and a watchdog fence of
+// a peer always fails: fence.Execute refuses the watchdog strategy for any
+// host but the caller itself, and the coordinator never fences itself.
 func retryableFenceMethod(method string) bool {
 	switch method {
-	case "ipmi", "ssh", "watchdog":
+	case "ipmi", "ssh":
 		return true
 	}
 	return false
 }
 
+// retryStrategy is the strategy a retry of a failed `failed` fence of a host
+// whose strategy is now `current` runs. The operator's current strategy wins
+// when it is one a retry can run — `ipmi` or `ssh`, so configuring working
+// BMC credentials after an SSH fence failed is honoured on the next retry.
+// Otherwise (best-effort, watchdog, unset) the method that failed is
+// repeated: a host switched to best-effort since an IPMI fence failed would
+// otherwise "recover" on a failed best-effort fence, which proceeds anyway.
+func retryStrategy(current, failed string) string {
+	switch s := fence.ResolveStrategy(current); s {
+	case "ipmi", "ssh":
+		return s
+	}
+	return failed
+}
+
+// fenceRetry is fenceRetryDue's answer for one host.
+type fenceRetry struct {
+	// Due is true when the host is to be fenced again now.
+	Due bool
+	// Next is when the retry falls due; zero when no retry applies at all.
+	Next time.Time
+	// FailedAt is the newest failed attempt the retry repeats.
+	FailedAt time.Time
+	// Strategy is the strategy the retry runs (retryStrategy).
+	Strategy string
+	// Failures counts the consecutive failed attempts of this life of the
+	// host since its newest success or confirmation, FailedAt's included.
+	Failures int
+}
+
 // fenceRetryDue reports whether h, left 'offline' by a fence attempt that
 // FAILED, is due to be fenced again, when it will be if not yet, and the
-// method to fence it with: the one that failed. A retry never runs a weaker
-// strategy than the attempt it repeats — a host switched to best-effort since
-// an IPMI fence failed would otherwise "recover" on a failed best-effort
-// fence, which proceeds anyway.
+// strategy to fence it with (retryStrategy).
 //
 // It reads fencing_log, so a restart or a new leader keeps the schedule: the
 // delay is fenceRetryDelay of the number of consecutive failed attempts since
-// the newest successful attempt or operator confirmation, counted from the
-// newest failed attempt — or from this coordinator's own last fence of the
-// host, if that is later on its clock (lastFenceAt). The row is stamped with
-// the clock of whoever fenced, and a row from a clock running behind ours
-// must not make the retry due at once. It is not due when the newest row is
-// a successful attempt or a confirmation (those resume through recordedFence
-// and the confirmation paths), when the failed method cannot succeed on a
-// retry, or when the host's strategy is now manual. The caller supplies that
-// h is quorum-down, by construction.
-func (c *Coordinator) fenceRetryDue(ctx context.Context, h *corrosion.HostRecord) (bool, time.Time, string) {
+// the newest successful attempt or operator confirmation — counting only
+// attempts of the host's current life (corrosion.HostFenceLife), so failures
+// of an earlier outage do not start this one at the cap — from the newest
+// failed attempt, or from this coordinator's own last fence of the host if
+// that is later on its clock (lastFenceAt). The row is stamped with the clock
+// of whoever fenced, and a row from a clock running behind ours must not make
+// the retry due at once.
+//
+// It is not due when the newest row is a successful attempt or a
+// confirmation (those resume through recordedFence and the confirmation
+// paths), when the failed method cannot succeed on a retry, or when the host's
+// strategy is now manual. The caller supplies that h is quorum-down, by
+// construction, and checks immediately before the fence that nobody has seen
+// it answer since FailedAt (retryStillDown).
+func (c *Coordinator) fenceRetryDue(ctx context.Context, h *corrosion.HostRecord) fenceRetry {
 	if h == nil || h.State != "offline" || fence.ResolveStrategy(h.FenceStrategy) == "manual" {
-		return false, time.Time{}, ""
+		return fenceRetry{}
 	}
 	rows, err := c.db.Query(ctx,
 		`SELECT method, result, timestamp FROM fencing_log WHERE host_name = ?`, h.Name)
 	if err != nil {
 		slog.Warn("failover: fencing_log read for a fence retry failed", "host", h.Name, "error", err)
 		c.mAttempt(PhaseRecovery, ResultError, ErrDBError)
-		return false, time.Time{}, ""
+		return fenceRetry{}
 	}
 	var settled, newestFailed time.Time // newest success/confirmation, newest failure
 	var newestFailedMethod string
-	type attempt struct {
-		at     time.Time
-		method string
-	}
-	var failed []attempt
+	var failed []time.Time
 	for _, r := range rows {
 		ts, perr := time.Parse(time.RFC3339, r.String("timestamp"))
 		if perr != nil {
@@ -118,7 +179,7 @@ func (c *Coordinator) fenceRetryDue(ctx context.Context, h *corrosion.HostRecord
 				settled = ts
 			}
 		case fence.LogPartial:
-			failed = append(failed, attempt{ts, r.String("method")})
+			failed = append(failed, ts)
 			// A same-second tie between failures keeps the first read; the
 			// method of either is from the same run of failures.
 			if ts.After(newestFailed) {
@@ -131,11 +192,15 @@ func (c *Coordinator) fenceRetryDue(ctx context.Context, h *corrosion.HostRecord
 	// readNewestFenceAttempt; a confirmation in the same second is taken as
 	// the operator's answer to the failure).
 	if newestFailed.IsZero() || newestFailed.Before(settled) || !retryableFenceMethod(newestFailedMethod) {
-		return false, time.Time{}, ""
+		return fenceRetry{}
+	}
+	life, _, lifeKnown, lerr := corrosion.HostFenceLife(ctx, c.db, h.Name)
+	if lerr != nil {
+		lifeKnown = false // count every failure: the longer delay, the safe side
 	}
 	n := 0
-	for _, f := range failed {
-		if f.at.After(settled) {
+	for _, at := range failed {
+		if at.After(settled) && (!lifeKnown || !at.Before(life)) {
 			n++
 		}
 	}
@@ -144,7 +209,26 @@ func (c *Coordinator) fenceRetryDue(ctx context.Context, h *corrosion.HostRecord
 		from = own
 	}
 	next := from.Add(fenceRetryDelay(n))
-	return !c.now().Before(next), next, newestFailedMethod
+	return fenceRetry{
+		Due:      !c.now().Before(next),
+		Next:     next,
+		FailedAt: newestFailed,
+		Strategy: retryStrategy(h.FenceStrategy, newestFailedMethod),
+		Failures: n,
+	}
+}
+
+// retryStillDown reports whether host may be fenced again for a fence attempt
+// that failed at failedAt: nobody has seen it answer since. It is the second
+// half of fenceStillStands keyed on the failed attempt, read immediately
+// before the retry, under the lease. The candidate set the retry came from
+// was read at the top of the cycle, and the moment a retry is most dangerous
+// is the moment the outage ends: a partition heals, the observers' rows still
+// count failures for a probe interval, and an SSH power-off that failed
+// across the partition now succeeds against a host that has just come back.
+// A host that answered is never retried; it fails closed on a read error.
+func (c *Coordinator) retryStillDown(ctx context.Context, host string, failedAt time.Time) (string, bool) {
+	return c.answeredSince(ctx, host, failedAt)
 }
 
 // fenceAuthorityChanged reports whether h, cached as handled (c.fenced), has
@@ -157,11 +241,11 @@ func (c *Coordinator) fenceAuthorityChanged(ctx context.Context, h *corrosion.Ho
 			"host", h.Name, "fence_id", rec.ID, "method", rec.Method, "fenced_at", rec.TS)
 		return true
 	}
-	due, next, _ := c.fenceRetryDue(ctx, h)
-	if !due && !next.IsZero() {
-		c.noteHold(h.Name, "fence failed; retrying at "+next.UTC().Format(time.RFC3339))
+	r := c.fenceRetryDue(ctx, h)
+	if !r.Due && !r.Next.IsZero() {
+		c.noteHold(h.Name, "fence failed; retrying at "+r.Next.UTC().Format(time.RFC3339))
 	}
-	return due
+	return r.Due
 }
 
 // noteFencedOn records the fence (fencing_log id) this coordinator's recovery
@@ -188,6 +272,7 @@ func (c *Coordinator) noteHold(host, reason string) {
 func (c *Coordinator) forgetHost(host string) {
 	delete(c.fencedOn, host)
 	delete(c.lastFenceAt, host)
+	delete(c.retryNotified, host)
 	delete(c.holdReason, host)
 	delete(c.stallSince, host)
 	delete(c.stallAlerted, host)
@@ -236,7 +321,12 @@ func (c *Coordinator) alertStalledRecoveries(ctx context.Context, pending map[st
 		}
 		c.stallAlerted[host] = now
 		reason := c.holdReason[host]
-		if reason == "" {
+		switch {
+		case reason != "":
+		case !c.cycleCandidates[host]:
+			reason = "not a fence candidate this cycle: no quorum of observers sees it down (or region-scoped failover declined it); " +
+				"if it is down, confirm it off with 'lv host fence-confirm " + host + "'"
+		default:
 			reason = "recovery ran and left workloads on the host; see the failover log on " + c.hostName
 		}
 		slog.Error("failover: recovery of a fenced host has stalled",

@@ -92,6 +92,15 @@ func cutOff(c *Cluster, n *Node) {
 	}
 }
 
+// probeCTRuntimes has every node list its containers in its runtime
+// inventory, as an LXC-capable host does, whether or not the machine running
+// the test has the lxc tooling: a replica restore asks each host's runtime.
+func probeCTRuntimes(c *Cluster) {
+	for _, n := range c.Nodes {
+		n.Server.SetLXCCapableForTest(true)
+	}
+}
+
 // relocateOnDB moves name's row from `from` to `to` on n's database and marks
 // `from` fenced there: the end state of a failover relocation (the coordinator's
 // tombstone of the old row and the new owner's row), arriving everywhere by
@@ -127,6 +136,7 @@ func TestReplicationIndependent_AFailoverThatDidNotUseTheReplicaKeepsIt(t *testi
 	c := New(t, Options{Nodes: 3, IndependentReplicas: true})
 	a, b, d := c.Nodes[0], c.Nodes[1], c.Nodes[2]
 	ctx := context.Background()
+	probeCTRuntimes(c)
 	c.WaitConverged(t, convergeTimeout)
 	const name = "web"
 	replCT(t, c, a, name)
@@ -181,19 +191,36 @@ func TestReplicationIndependent_AFailoverThatDidNotUseTheReplicaKeepsIt(t *testi
 	if _, err := c.SelfClient(b).RestoreContainerReplica(ctx, restore); status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("restoring a replica of a container that lives on %s: %v, want refused", d.Name, err)
 	}
+	// The container is deleted on d: its runtime, then its row.
+	if err := d.CT.DeleteContainer(ctx, name); err != nil {
+		t.Fatal(err)
+	}
 	if err := corrosion.DeleteContainer(ctx, d.DB, d.Name, name); err != nil {
 		t.Fatal(err)
 	}
 	waitForRepl(t, b.Name+" to see the container gone", func() bool { return containerHostOn(t, b, name) == "" })
 	// a, the host the replica was taken on, is asked too: while it is cut off
-	// it still sees its own row live, and the restore is refused.
-	if _, err := c.SelfClient(b).RestoreContainerReplica(ctx, restore); status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), a.Name) {
-		t.Fatalf("a restore while %s, the replica's source, still sees the container live: %v, want refused", a.Name, err)
+	// it still sees its own row live, and the restore is refused. a is cut off
+	// from replication only, so it answers: "still sees" is its answer, not a
+	// host that could not be asked ("cannot confirm").
+	if _, err := c.SelfClient(b).RestoreContainerReplica(ctx, restore); status.Code(err) != codes.FailedPrecondition ||
+		!strings.Contains(err.Error(), a.Name+" still sees") {
+		t.Fatalf("a restore while %s, the replica's source, still sees the container live: %v, want refused because it still sees it", a.Name, err)
 	}
-	// a comes back (fenced, so it runs nothing) and learns the container moved
-	// and is gone: now every host that could hold it says so.
+	// a comes back and learns the container moved and is gone. Its rows say
+	// so, but its runtime still holds web, with the data from before the
+	// loss: a copy with no row, which may be newer than the replica.
 	c.ClearLinkFaults()
 	waitForRepl(t, a.Name+" to see the container gone", func() bool { return containerHostOn(t, a, name) == "" })
+	if _, err := c.SelfClient(b).RestoreContainerReplica(ctx, restore); status.Code(err) != codes.FailedPrecondition ||
+		!strings.Contains(err.Error(), a.Name+" runs "+name+" with no live row") {
+		t.Fatalf("a restore while %s still holds the container's runtime: %v, want refused because it runs it with no row", a.Name, err)
+	}
+	// The operator deals with a's copy; now every host that could hold the
+	// container says it holds none.
+	if err := a.CT.DeleteContainer(ctx, name); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := c.SelfClient(b).RestoreContainerReplica(ctx, restore); err != nil {
 		t.Fatalf("restoring the set-aside replica: %v", err)
 	}
@@ -646,6 +673,7 @@ func TestReplicationIndependent_ARestoreAsksTheHostAMigrateMovedTo(t *testing.T)
 	c := New(t, Options{Nodes: 3, IndependentReplicas: true})
 	a, b, tg := c.Nodes[0], c.Nodes[1], c.Nodes[2]
 	ctx := context.Background()
+	probeCTRuntimes(c)
 	c.WaitConverged(t, convergeTimeout)
 	const name = "web"
 	replCT(t, c, a, name)
@@ -673,6 +701,10 @@ func TestReplicationIndependent_ARestoreAsksTheHostAMigrateMovedTo(t *testing.T)
 	moved.HostName, moved.CreatedAt = b.Name, ""
 	moved.CreateSpec, _ = corrosion.WithNewPlacement(moved.CreateSpec)
 	if err := corrosion.UpsertContainer(ctx, b.DB, moved); err != nil {
+		t.Fatal(err)
+	}
+	// The migrate removes the container's runtime from a, then its row.
+	if err := a.CT.DeleteContainer(ctx, name); err != nil {
 		t.Fatal(err)
 	}
 	if err := corrosion.DeleteContainer(ctx, a.DB, a.Name, name); err != nil {
@@ -726,5 +758,61 @@ func TestReplicationIndependent_ARestoreWithNoRowAsksTheReplicasSource(t *testin
 	}
 	if tg.CT.Exists(name) {
 		t.Fatal("a second copy was laid down")
+	}
+}
+
+// R4-I1: a stale delete tombstones web's row on every host while web keeps
+// running on a (the kvm003-f3 lab, 2026-09-30, with a container). Every host's
+// rows say web is gone, a's included. a's runtime says otherwise, and it holds
+// data newer than the replica: the restore is refused, naming a. Once a's copy
+// is dealt with, the same restore goes through.
+func TestReplicationIndependent_ARestoreAsksEveryHostsRuntime(t *testing.T) {
+	c := New(t, Options{Nodes: 3, IndependentReplicas: true})
+	a, b, tg := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	ctx := context.Background()
+	probeCTRuntimes(c)
+	c.WaitConverged(t, convergeTimeout)
+	const name = "web"
+	replCT(t, c, a, name)
+	repo := drRepo(t, tg)
+	c.WaitConverged(t, convergeTimeout)
+	sched := ctSchedule(t, c, a, name, tg.Name, 2, true)
+	c.WaitConverged(t, convergeTimeout)
+	a.CT.Seed(name, "replicated")
+	if err := a.Server.RunReplication(ctx, sched, time.Now().UTC().Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	ms := replicas(t, repo, name)
+	if len(ms) != 1 {
+		t.Fatalf("premise: one replica, got %d", len(ms))
+	}
+	// The stale delete, served on b; a's runtime keeps running and writing.
+	if err := corrosion.DeleteContainer(ctx, b.DB, a.Name, name); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range c.Nodes {
+		waitForRepl(t, n.Name+" to apply the tombstone", func() bool { return containerHostOn(t, n, name) == "" })
+	}
+	a.CT.Seed(name, "written after the replica")
+	if !a.CT.Exists(name) {
+		t.Fatalf("premise: %s still holds web's runtime", a.Name)
+	}
+	restore := &pb.RestoreContainerReplicaRequest{Repo: "dr", Project: "_default", Name: name, Timestamp: ms[0].Timestamp}
+	_, err := c.SelfClient(tg).RestoreContainerReplica(ctx, restore)
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), a.Name+" runs "+name+" with no live row") {
+		t.Fatalf("a restore while %s runs the container with no row: %v, want refused naming %s", a.Name, err, a.Name)
+	}
+	if tg.CT.Exists(name) {
+		t.Fatal("a second copy was laid down")
+	}
+	// Not vacuous: with a's copy gone, nothing else refuses.
+	if err := a.CT.DeleteContainer(ctx, name); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.SelfClient(tg).RestoreContainerReplica(ctx, restore); err != nil {
+		t.Fatalf("the restore once %s no longer runs it: %v", a.Name, err)
+	}
+	if got := tg.CT.Payload(name); got != "replicated" {
+		t.Fatalf("the restored container holds %q, want the replica's data", got)
 	}
 }

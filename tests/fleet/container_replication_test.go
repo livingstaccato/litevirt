@@ -9,6 +9,9 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/failover"
@@ -530,5 +533,38 @@ func TestContainerReplication_ARunThatLosesTheMintArchivesUnderTheWinnersPlaceme
 				t.Fatalf("a run that lost the mint archived a replica of placement %q, want the minted %q", got, want)
 			}
 		})
+	}
+}
+
+// R4-n3: the mint rewrites create_spec, which is part of the identity of a
+// guarded re-key or tombstone of the row still in flight. A run mints only
+// for a container whose runtime it holds, so a row whose runtime has already
+// left (a migrate or relocation between its runtime and its row) is not
+// rewritten under those statements: the run ends as a move, and the row is
+// left as it was.
+func TestContainerReplication_NoPlacementIsMintedWithoutTheRuntime(t *testing.T) {
+	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	a, b := c.Nodes[0], c.Nodes[1]
+	ctx := context.Background()
+	const name = "web"
+	replCT(t, c, a, name)
+	drRepo(t, b)
+	sched := ctSchedule(t, c, a, name, b.Name, 2, true)
+	if err := a.DB.Execute(ctx, `UPDATE containers SET create_spec = '' WHERE host_name = ? AND name = ?`, a.Name, name); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.CT.DeleteContainer(ctx, name); err != nil {
+		t.Fatal(err)
+	}
+	err := a.Server.RunReplication(ctx, sched, time.Now().UTC().Add(-time.Minute))
+	if status.Code(err) != codes.Aborted {
+		t.Fatalf("a run for a container whose runtime is not here: %v, want Aborted", err)
+	}
+	row, gerr := corrosion.GetContainer(ctx, a.DB, a.Name, name)
+	if gerr != nil || row == nil {
+		t.Fatalf("row: %v", gerr)
+	}
+	if row.CreateSpec != "" {
+		t.Fatalf("a placement was minted for a container whose runtime is not here: create_spec %q", row.CreateSpec)
 	}
 }

@@ -791,6 +791,11 @@ type Server struct {
 	// nil = container RPCs return Unavailable. Tests inject a fake.
 	containerRuntime ContainerRuntime
 
+	// lxcCapableForTest, when set, stands in for lxcCapable on this server
+	// only (SetLXCCapableForTest). nil = the host's real lxc tooling probe.
+	// Atomic: a fleet scenario sets it while the node's loops are running.
+	lxcCapableForTest atomic.Pointer[bool]
+
 	// liveMover drives libvirt blockdev-mirror for running-VM
 	// MoveVolume calls. nil = MoveVolume on a running
 	// VM returns Unimplemented (the legacy 1.2.E behaviour).

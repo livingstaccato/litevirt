@@ -210,8 +210,10 @@ its schedule and never promoted by failover. A replica is ORPHANED when no
 schedule replicates the container into this host and repo any more.
 
 --restore <timestamp> lays that replica down as the container, stopped, on the
-replica host (admin). It is refused while the container lives anywhere: remove
-that one first, so there is never a second runnable copy.
+replica host (admin). It is refused while the container lives anywhere, as a
+row or as a runtime on some host, and while any member of the cluster cannot
+be asked: deal with that copy, or bring the member back or remove it, first, so
+there is never a second runnable copy.
 
 --remove <timestamp> deletes a set-aside or orphaned replica (admin). It may be
 the only copy of the data: it asks first unless --yes.`,

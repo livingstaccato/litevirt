@@ -682,6 +682,14 @@ func (s *Server) placedContainerRow(ctx context.Context, project string, rec *co
 		if corrosion.PlacementOf(row.CreateSpec) != "" {
 			return row, nil
 		}
+		// The mint rewrites create_spec, part of the identity of a guarded
+		// re-key or tombstone of this row that may still be in flight. A row
+		// whose runtime has already left this host is such a row: leave it
+		// as it is, and let the next run, on whichever host holds the
+		// container, mint.
+		if here, err := s.containerRuntime.ContainerExists(ctx, rec.Name); err != nil || !here {
+			return nil, status.Errorf(codes.Aborted, "container %s's runtime is not on this host (%v), so no placement id is minted for it; the next run replicates it", rec.Name, err)
+		}
 		spec, applied, err := corrosion.MintContainerPlacementSpec(ctx, s.db, s.hostName, rec.Name, row.CreateSpec)
 		if err != nil {
 			return nil, fmt.Errorf("give the container a placement id: %w", err)
@@ -1357,21 +1365,40 @@ func (s *Server) replicaSourceOf(ctx context.Context, project, repo, name, ts st
 const noLiveCopyAskTimeout = 15 * time.Second
 
 // confirmNoLiveCopy is the positive "no live copy anywhere" a replica restore
-// needs. This host's own view has already been checked, and it can lag: a row
-// and its tombstone travel on different hosts' streams, and a replica arrives
-// by a direct push ahead of the row it is of. So it asks, each for its own
-// view, which always includes its own rows:
+// needs. This host's own rows have already been checked, and they can lag: a
+// row and its tombstone travel on different hosts' streams, and a replica
+// arrives by a direct push ahead of the row it is of. So it asks
 //
 //   - source, the host the replica was taken on (known with no row at all);
 //   - every host that holds a row of the name in this view, tombstones
 //     included: a row is evidence that host had it, whichever is newest;
-//   - every other non-removed member, of which a majority of the voters must
-//     answer, so a host whose row this view never received is outvoted only
-//     by hosts that have seen more.
+//   - every other member that has not been removed, and every voter: a
+//     migrate onto a host whose row reached nobody else leaves the container
+//     on a host only it knows about,
 //
-// Any host that answers that it sees the container live refuses. A required
-// host that cannot be asked refuses, with the remedy: no answer is never
-// absence. A host removed from the cluster runs nothing and is not asked.
+// and every one of them must answer, each from its own view and its own
+// runtime (this host answers for its runtime too):
+//
+//   - its rows: no live row of the container, on any host;
+//   - its runtime: no container of the name on it, unless its own live row
+//     there is another project's container of that name (runtime names are
+//     not project-scoped). A container that runs with no live row anywhere (a
+//     stale delete tombstoned it, or a create, migrate or import stopped
+//     between the runtime and the row) is a live copy, and may hold newer data
+//     than the replica.
+//
+// Any host that holds or sees a live copy refuses. Any host that cannot answer
+// refuses, with the reason and the remedy: no answer is never absence, and an
+// inventory that is incomplete, or holds the name in a state it could not
+// read, is no answer. A host removed from the cluster (`lv host rm`) is
+// neither asked nor counted: removing it is the operator's statement that it
+// runs nothing, and there is no majority for it to count in, since every other
+// member must answer.
+//
+// The cost: one member that cannot be reached (down, partitioned, or behind a
+// firewall) blocks every replica restore until it is back or removed. Each
+// restore asks each member twice, for its unpaged container list and for its
+// runtime of this one container, all in parallel within noLiveCopyAskTimeout.
 func (s *Server) confirmNoLiveCopy(ctx context.Context, project, name, source string) error {
 	required := map[string]string{source: "the host the replica was taken on"}
 	rows, err := s.db.Query(ctx,
@@ -1407,7 +1434,7 @@ func (s *Server) confirmNoLiveCopy(ctx context.Context, project, name, source st
 		ask[h.Name] = true
 		stateOf[h.Name] = h.State
 	}
-	delete(ask, s.hostName) // this host's own view, checked by the caller
+	delete(ask, s.hostName) // this host: its rows were checked by the caller, its runtime below
 	for h := range ask {
 		removed, rerr := corrosion.HostRemoved(ctx, s.db, h)
 		if rerr != nil {
@@ -1415,13 +1442,11 @@ func (s *Server) confirmNoLiveCopy(ctx context.Context, project, name, source st
 		}
 		if removed || stateOf[h] == "removed" {
 			delete(ask, h)
-			delete(required, h)
-			delete(voters, h)
 		}
 	}
 
 	type answer struct {
-		host, liveOn string
+		host, copyOf string
 		err          error
 	}
 	actx, cancel := context.WithTimeout(ctx, noLiveCopyAskTimeout)
@@ -1429,69 +1454,68 @@ func (s *Server) confirmNoLiveCopy(ctx context.Context, project, name, source st
 	results := make(chan answer, len(ask))
 	for h := range ask {
 		go func(h string) {
-			liveOn, err := s.liveCopySeenBy(actx, h, project, name)
-			results <- answer{host: h, liveOn: liveOn, err: err}
+			copyOf, err := s.liveCopySeenBy(actx, h, project, name)
+			results <- answer{host: h, copyOf: copyOf, err: err}
 		}(h)
 	}
-	confirmed := map[string]bool{s.hostName: true}
 	missing := map[string]error{}
-	var live []answer
-	for range ask {
-		a := <-results
+	var live []string
+	record := func(a answer) {
 		switch {
+		case a.copyOf != "":
+			live = append(live, a.copyOf)
 		case a.err != nil:
 			missing[a.host] = a.err
-		case a.liveOn != "":
-			live = append(live, a)
-		default:
-			confirmed[a.host] = true
 		}
+	}
+	selfCopy, selfErr := s.localRuntimeCopy(ctx, project, name)
+	record(answer{host: s.hostName, copyOf: selfCopy, err: selfErr})
+	for range ask {
+		record(<-results)
 	}
 	if len(live) > 0 {
-		sort.Slice(live, func(i, j int) bool { return live[i].host < live[j].host })
+		sort.Strings(live)
 		return status.Errorf(codes.FailedPrecondition,
-			"%s still sees %s live on %s; restoring its replica would make a second runnable copy",
-			live[0].host, name, live[0].liveOn)
+			"%s; restoring its replica would make a second runnable copy", strings.Join(live, "; "))
 	}
-	var unconfirmed []string
-	for h := range required {
-		if !confirmed[h] {
-			unconfirmed = append(unconfirmed, h)
-		}
+	if len(missing) == 0 {
+		return nil
 	}
-	if len(unconfirmed) > 0 {
-		sort.Strings(unconfirmed)
-		h := unconfirmed[0]
-		return status.Errorf(codes.FailedPrecondition,
-			"cannot confirm with %s (%s) that it holds no live %s (%v): bring it back, or remove it from the cluster, before restoring a replica",
-			h, required[h], name, missing[h])
-	}
-	var yes int
 	var silent []string
-	for v := range voters {
-		if confirmed[v] {
-			yes++
-		} else {
-			silent = append(silent, v)
-		}
+	for h := range missing {
+		silent = append(silent, h)
 	}
-	if len(voters) == 0 || yes*2 <= len(voters) {
-		sort.Strings(silent)
+	sort.Strings(silent)
+	h := silent[0]
+	role := required[h]
+	if role == "" {
+		role = "a member of the cluster"
+	}
+	switch _, known := stateOf[h]; {
+	case h == s.hostName:
 		return status.Errorf(codes.FailedPrecondition,
-			"only %d of %d voters confirmed they see no live %s (no answer from %s): a majority must, before restoring a replica",
-			yes, len(voters), name, strings.Join(silent, ", "))
+			"cannot confirm with %s (this host) that it holds no live %s (%v): its own runtime must be readable before a replica is restored onto it",
+			h, name, missing[h])
+	case !known:
+		return status.Errorf(codes.FailedPrecondition,
+			"cannot confirm with %s (%s), which this cluster has no record of, that it holds no live %s (%v): it must rejoin the cluster before this replica can be restored",
+			h, role, name, missing[h])
 	}
-	return nil
+	return status.Errorf(codes.FailedPrecondition,
+		"cannot confirm with %s (%s) that it holds no live %s (%v): bring it back, or remove it from the cluster (lv host rm), before restoring a replica",
+		h, role, name, missing[h])
 }
 
-// liveCopySeenBy asks host for its own view of project/name: the host a live
-// row of it is on, or "" for a positive none.
+// liveCopySeenBy asks host for its own view of project/name, rows and
+// runtime: a phrase naming the live copy it holds or sees, or "" for a
+// positive none.
 func (s *Server) liveCopySeenBy(ctx context.Context, host, project, name string) (string, error) {
 	c, closeConn, err := s.dialPeer(ctx, host)
 	if err != nil {
 		return "", err
 	}
 	defer closeConn()
+	otherHere := false
 	token := ""
 	for {
 		resp, err := c.ListContainers(ctx, &pb.ListContainersRequest{PageToken: token})
@@ -1499,12 +1523,64 @@ func (s *Server) liveCopySeenBy(ctx context.Context, host, project, name string)
 			return "", err
 		}
 		for _, ct := range resp.GetContainers() {
-			if ct.GetName() == name && tenancy.NormalizeProject(ct.GetProject()) == project {
-				return ct.GetHostName(), nil
+			if ct.GetName() != name {
+				continue
+			}
+			if tenancy.NormalizeProject(ct.GetProject()) == project {
+				return fmt.Sprintf("%s still sees %s live on %s", host, name, ct.GetHostName()), nil
+			}
+			if ct.GetHostName() == host {
+				otherHere = true
 			}
 		}
 		if token = resp.GetNextPageToken(); token == "" {
-			return "", nil
+			break
 		}
 	}
+	inv, err := c.GetRuntimeInventory(ctx, &pb.GetRuntimeInventoryRequest{Kind: corrosion.WorkloadContainer, Name: name})
+	if err != nil {
+		return "", fmt.Errorf("read its runtime: %w", err)
+	}
+	return runtimeCopyOn(host, name, inventoryFromProto(inv), otherHere)
+}
+
+// localRuntimeCopy is liveCopySeenBy's runtime half for this host. Its import
+// would refuse to lay a container over an existing one anyway; this says why.
+func (s *Server) localRuntimeCopy(ctx context.Context, project, name string) (string, error) {
+	cts, err := corrosion.ListContainers(ctx, s.db, "")
+	if err != nil {
+		return "", fmt.Errorf("read its containers: %w", err)
+	}
+	otherHere := false
+	for _, ct := range cts {
+		if ct.Name == name && ct.HostName == s.hostName && tenancy.NormalizeProject(ct.Project) != project {
+			otherHere = true
+		}
+	}
+	return runtimeCopyOn(s.hostName, name, s.collectRuntimeInventory(ctx), otherHere)
+}
+
+// runtimeCopyOn reads host's runtime inventory for the container name: a
+// phrase naming the copy when the host holds one, "" for a positive none, or
+// an error when the inventory cannot vouch. otherHere says host's own live row
+// of that name on itself is another project's container, which is then what
+// its runtime of that name is.
+func runtimeCopyOn(host, name string, inv runtimeInventory, otherHere bool) (string, error) {
+	w, found := inv.find(corrosion.WorkloadContainer, name)
+	switch {
+	case found && otherHere:
+		return "", nil
+	case found && (w.State == health.RuntimeRunning || w.State == health.RuntimeDefinedStopped):
+		return fmt.Sprintf("%s runs %s with no live row of it, an orphaned runtime that may hold newer data than the replica (see %s)",
+			host, name, health.CondCTOrphanRuntime), nil
+	case found:
+		detail := w.State
+		if w.ProbeError != "" {
+			detail += ": " + w.ProbeError
+		}
+		return "", fmt.Errorf("its runtime holds %s in a state it could not read (%s)", name, detail)
+	case !inv.Complete:
+		return "", fmt.Errorf("its runtime inventory is incomplete, so absence is unproven (%s)", strings.Join(inv.Errors, "; "))
+	}
+	return "", nil
 }

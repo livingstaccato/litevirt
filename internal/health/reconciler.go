@@ -146,6 +146,9 @@ type Reconciler struct {
 
 	// transferDisks: disks a pending transfer rebuilt here (superseded_disk.go).
 	transferDisks transferDisks
+	// onDiskStranded: notified for each disk this host sets aside
+	// (stranded_disk.go); nil = no notification.
+	onDiskStranded func(vm, host, detail string)
 	// deferredTransfers: proof-less transfers parked in "starting" while their
 	// backing image transfers (missing_disk.go).
 	deferredTransfers deferredTransfers
@@ -603,6 +606,7 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 	}
 
 	r.resolveDiskMissing(ctx)
+	r.tendStrandedDisks(ctx)
 	r.cleanupRekeyLeftovers(ctx)
 
 	for _, vm := range vms {
@@ -1515,7 +1519,7 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	var diskConfigs []lv.DiskConfig
 	for _, d := range diskRecords {
 		if transfer {
-			if _, err := r.setAsideSupersededDisk(vm.Name, proofID, d); err != nil {
+			if _, err := r.setAsideSupersededDisk(ctx, vm.Name, proofID, d); err != nil {
 				r.failPendingStart(ctx, vm.Name, proofID, true,
 					fmt.Sprintf("set aside the old copy of disk %s found at %s: %v", d.DiskName, d.Path, err))
 				return

@@ -2196,13 +2196,23 @@ func (x *ListHostDevicesResponse) GetDevices() []*PCIDevice {
 }
 
 // SupersededDisksRequest is `lv host superseded-disks <host>`: the disk copies
-// a failover start set aside on that host (<path>.superseded-<time>), and, with
-// purge (admin), the removal of every one not held.
+// a failover set aside on that host (<path>.superseded-<time>), and, with
+// purge (admin), the removal of every one neither retained nor held.
+//
+// remove_paths and restore_path (admin) act on named copies only. A client
+// sends them WITH purge set and older_than_sec at supersededNamedOnlySec
+// (9e9 s, ~285 years): an older host, which does not know these fields, then
+// still requires admin at the entry and purges nothing (no copy is that old),
+// instead of answering a viewer, or purging every copy that is not held. The
+// client tells such a host by its answer: no copy marked removed, no
+// restored path.
 type SupersededDisksRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Host          string                 `protobuf:"bytes,1,opt,name=host,proto3" json:"host,omitempty"`                                        // "" = the host answering
-	Purge         bool                   `protobuf:"varint,2,opt,name=purge,proto3" json:"purge,omitempty"`                                     // remove every copy that is not held
+	Purge         bool                   `protobuf:"varint,2,opt,name=purge,proto3" json:"purge,omitempty"`                                     // remove every copy that is neither retained nor held
 	OlderThanSec  int64                  `protobuf:"varint,3,opt,name=older_than_sec,json=olderThanSec,proto3" json:"older_than_sec,omitempty"` // purge only copies set aside at least this long ago
+	RemovePaths   []string               `protobuf:"bytes,4,rep,name=remove_paths,json=removePaths,proto3" json:"remove_paths,omitempty"`       // remove exactly these copies, retained or not (never a held one)
+	RestorePath   string                 `protobuf:"bytes,5,opt,name=restore_path,json=restorePath,proto3" json:"restore_path,omitempty"`       // put this copy back as its VM's disk (the VM stopped on this host)
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2258,6 +2268,20 @@ func (x *SupersededDisksRequest) GetOlderThanSec() int64 {
 	return 0
 }
 
+func (x *SupersededDisksRequest) GetRemovePaths() []string {
+	if x != nil {
+		return x.RemovePaths
+	}
+	return nil
+}
+
+func (x *SupersededDisksRequest) GetRestorePath() string {
+	if x != nil {
+		return x.RestorePath
+	}
+	return ""
+}
+
 type SupersededDisk struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Path          string                 `protobuf:"bytes,1,opt,name=path,proto3" json:"path,omitempty"`                                 // the copy
@@ -2266,8 +2290,9 @@ type SupersededDisk struct {
 	SizeBytes     int64                  `protobuf:"varint,4,opt,name=size_bytes,json=sizeBytes,proto3" json:"size_bytes,omitempty"`
 	VmName        string                 `protobuf:"bytes,5,opt,name=vm_name,json=vmName,proto3" json:"vm_name,omitempty"` // the VM whose disk is at disk_path now; "" when none
 	VmState       string                 `protobuf:"bytes,6,opt,name=vm_state,json=vmState,proto3" json:"vm_state,omitempty"`
-	Held          string                 `protobuf:"bytes,7,opt,name=held,proto3" json:"held,omitempty"`        // why it is kept whatever its age; "" when not held
-	Removed       bool                   `protobuf:"varint,8,opt,name=removed,proto3" json:"removed,omitempty"` // removed by this request
+	Held          string                 `protobuf:"bytes,7,opt,name=held,proto3" json:"held,omitempty"`         // why it is kept even from a named removal; "" when not held
+	Removed       bool                   `protobuf:"varint,8,opt,name=removed,proto3" json:"removed,omitempty"`  // removed by this request
+	Retained      string                 `protobuf:"bytes,9,opt,name=retained,proto3" json:"retained,omitempty"` // why the sweep and a bare purge keep it (its VM exists); "" when not retained
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2358,11 +2383,21 @@ func (x *SupersededDisk) GetRemoved() bool {
 	return false
 }
 
+func (x *SupersededDisk) GetRetained() string {
+	if x != nil {
+		return x.Retained
+	}
+	return ""
+}
+
 type SupersededDisksResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Host          string                 `protobuf:"bytes,1,opt,name=host,proto3" json:"host,omitempty"`
 	Disks         []*SupersededDisk      `protobuf:"bytes,2,rep,name=disks,proto3" json:"disks,omitempty"`
 	RetentionDays int32                  `protobuf:"varint,3,opt,name=retention_days,json=retentionDays,proto3" json:"retention_days,omitempty"` // superseded_disk_retention_days there; 0 = kept until removed
+	Restored      string                 `protobuf:"bytes,4,opt,name=restored,proto3" json:"restored,omitempty"`                                 // the copy restore_path put back; "" when none
+	RestoredTo    string                 `protobuf:"bytes,5,opt,name=restored_to,json=restoredTo,proto3" json:"restored_to,omitempty"`           // the disk path it is now
+	SetAside      string                 `protobuf:"bytes,6,opt,name=set_aside,json=setAside,proto3" json:"set_aside,omitempty"`                 // where the file it replaced was set aside; "" when there was none
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2416,6 +2451,27 @@ func (x *SupersededDisksResponse) GetRetentionDays() int32 {
 		return x.RetentionDays
 	}
 	return 0
+}
+
+func (x *SupersededDisksResponse) GetRestored() string {
+	if x != nil {
+		return x.Restored
+	}
+	return ""
+}
+
+func (x *SupersededDisksResponse) GetRestoredTo() string {
+	if x != nil {
+		return x.RestoredTo
+	}
+	return ""
+}
+
+func (x *SupersededDisksResponse) GetSetAside() string {
+	if x != nil {
+		return x.SetAside
+	}
+	return ""
 }
 
 type ConfigureHostRequest struct {
@@ -34654,11 +34710,13 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\vtype_filter\x18\x02 \x01(\tR\n" +
 	"typeFilter\"K\n" +
 	"\x17ListHostDevicesResponse\x120\n" +
-	"\adevices\x18\x01 \x03(\v2\x16.litevirt.v1.PCIDeviceR\adevices\"h\n" +
+	"\adevices\x18\x01 \x03(\v2\x16.litevirt.v1.PCIDeviceR\adevices\"\xae\x01\n" +
 	"\x16SupersededDisksRequest\x12\x12\n" +
 	"\x04host\x18\x01 \x01(\tR\x04host\x12\x14\n" +
 	"\x05purge\x18\x02 \x01(\bR\x05purge\x12$\n" +
-	"\x0eolder_than_sec\x18\x03 \x01(\x03R\folderThanSec\"\xe4\x01\n" +
+	"\x0eolder_than_sec\x18\x03 \x01(\x03R\folderThanSec\x12!\n" +
+	"\fremove_paths\x18\x04 \x03(\tR\vremovePaths\x12!\n" +
+	"\frestore_path\x18\x05 \x01(\tR\vrestorePath\"\x80\x02\n" +
 	"\x0eSupersededDisk\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x12\x1b\n" +
 	"\tdisk_path\x18\x02 \x01(\tR\bdiskPath\x12 \n" +
@@ -34669,11 +34727,16 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\avm_name\x18\x05 \x01(\tR\x06vmName\x12\x19\n" +
 	"\bvm_state\x18\x06 \x01(\tR\avmState\x12\x12\n" +
 	"\x04held\x18\a \x01(\tR\x04held\x12\x18\n" +
-	"\aremoved\x18\b \x01(\bR\aremoved\"\x87\x01\n" +
+	"\aremoved\x18\b \x01(\bR\aremoved\x12\x1a\n" +
+	"\bretained\x18\t \x01(\tR\bretained\"\xe1\x01\n" +
 	"\x17SupersededDisksResponse\x12\x12\n" +
 	"\x04host\x18\x01 \x01(\tR\x04host\x121\n" +
 	"\x05disks\x18\x02 \x03(\v2\x1b.litevirt.v1.SupersededDiskR\x05disks\x12%\n" +
-	"\x0eretention_days\x18\x03 \x01(\x05R\rretentionDays\"\x91\x04\n" +
+	"\x0eretention_days\x18\x03 \x01(\x05R\rretentionDays\x12\x1a\n" +
+	"\brestored\x18\x04 \x01(\tR\brestored\x12\x1f\n" +
+	"\vrestored_to\x18\x05 \x01(\tR\n" +
+	"restoredTo\x12\x1b\n" +
+	"\tset_aside\x18\x06 \x01(\tR\bsetAside\"\x91\x04\n" +
 	"\x14ConfigureHostRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12%\n" +
 	"\x0efence_strategy\x18\x02 \x01(\tR\rfenceStrategy\x12!\n" +

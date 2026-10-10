@@ -1073,6 +1073,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	reconciler.SetOnVMStarted(svc.RefreshLBForStack)
 	reconciler.SetHardwareStartPreparer(svc.PrepareHardwareForStart)
 	reconciler.SetAutoPullImage(svc.AutoPullImage)
+	reconciler.SetDiskStrandedObserver(svc.NotifyVMDiskStranded)
 	reconciler.SetBackupInProgress(svc.BackupInProgress)
 	reconciler.SetNetworkProvision(svc.ProvisionNetworkHere) // a failover start provisions like a VM create
 	// Runtime owner-assert (Phase 3): corroborate a locally-running VM whose DB
@@ -1453,6 +1454,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	fc.Restorer = svc // implements failover.ContainerRestorer (tier-2 relocate-from-backup)
 	fc.RelocateRestoreTimeout = time.Duration(d.cfg.ContainerRestoreTimeoutSec) * time.Second
 	fc.OnFence = svc.NotifyHostFenced                                   // operator notification on fence (#5)
+	fc.OnDiskStranded = svc.NotifyVMDiskStranded                        // a VM restarted elsewhere left its host-local disk behind
 	fc.Events = svc.EventBus()                                          // a stopped workload left on a failed host
 	fc.Metrics = metrics.NewFailoverMetrics()                           // structured failover counters (U9)
 	fc.SafeFenceEnforce = d.cfg.Enforcement.SafeFenceDefault            // safe-fence kill-switch (config AND SafeFenceDefaultV1)
@@ -2682,10 +2684,11 @@ func (d *Daemon) runAuthEngineReload(ctx context.Context) {
 	}
 }
 
-// runSupersededDiskSweep removes, hourly, the disk copies a failover start set
+// runSupersededDiskSweep removes, hourly, the disk copies a failover set
 // aside on this host (<path>.superseded-<time>) once they are older than
-// superseded_disk_retention_days, except while their VM is in a failed or
-// unfinished start (health.PurgeSupersededDisks). 0 keeps every copy.
+// superseded_disk_retention_days and the VM they came from no longer exists
+// (health.PurgeSupersededDisks): while it exists, only an operator removes
+// them. 0 keeps every copy.
 func (d *Daemon) runSupersededDiskSweep(ctx context.Context) {
 	days := d.cfg.SupersededDiskRetentionDays
 	if days <= 0 {

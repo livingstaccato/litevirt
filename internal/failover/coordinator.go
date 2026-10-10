@@ -193,6 +193,10 @@ type Coordinator struct {
 	// OnFence, when set, is invoked after a fence is recorded so the daemon can
 	// emit an operator notification (#5). Best-effort; must not block.
 	OnFence func(host, method, result, detail string)
+	// OnDiskStranded, when set, is invoked after a reschedule leaves a VM's
+	// host-local disks on the failed host (stranded_disk.go), so the daemon
+	// can raise the vm.disk.stranded notification.
+	OnDiskStranded func(vm, host, detail string)
 	// Events, when set, carries the coordinator's workload events (a stopped
 	// workload left on a failed host, skip_stopped.go) to this host's live
 	// event stream. Optional; a VM's event is also kept in vm_events.
@@ -3048,6 +3052,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 		c.mVM(ActionReschedule, ResultSuccess, errClassNone)
 
 		c.audit(ctx, "failover", vm.Name, "rescheduled from "+h.Name+" to "+targetName, "ok")
+		c.noteDiskStranded(ctx, h.Name, vm, targetName)
 	}
 
 	// Step 6: Relocate containers on the fenced host (B5). Unlike VMs, a

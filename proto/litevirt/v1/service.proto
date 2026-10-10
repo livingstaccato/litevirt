@@ -128,12 +128,22 @@ message ListHostDevicesRequest  { string name = 1; string type_filter = 2; }
 message ListHostDevicesResponse { repeated PCIDevice devices = 1; }
 
 // SupersededDisksRequest is `lv host superseded-disks <host>`: the disk copies
-// a failover start set aside on that host (<path>.superseded-<time>), and, with
-// purge (admin), the removal of every one not held.
+// a failover set aside on that host (<path>.superseded-<time>), and, with
+// purge (admin), the removal of every one neither retained nor held.
+//
+// remove_paths and restore_path (admin) act on named copies only. A client
+// sends them WITH purge set and older_than_sec at supersededNamedOnlySec
+// (9e9 s, ~285 years): an older host, which does not know these fields, then
+// still requires admin at the entry and purges nothing (no copy is that old),
+// instead of answering a viewer, or purging every copy that is not held. The
+// client tells such a host by its answer: no copy marked removed, no
+// restored path.
 message SupersededDisksRequest {
     string host           = 1;  // "" = the host answering
-    bool   purge          = 2;  // remove every copy that is not held
+    bool   purge          = 2;  // remove every copy that is neither retained nor held
     int64  older_than_sec = 3;  // purge only copies set aside at least this long ago
+    repeated string remove_paths = 4;  // remove exactly these copies, retained or not (never a held one)
+    string restore_path   = 5;  // put this copy back as its VM's disk (the VM stopped on this host)
 }
 message SupersededDisk {
     string path         = 1;  // the copy
@@ -142,13 +152,17 @@ message SupersededDisk {
     int64  size_bytes   = 4;
     string vm_name      = 5;  // the VM whose disk is at disk_path now; "" when none
     string vm_state     = 6;
-    string held         = 7;  // why it is kept whatever its age; "" when not held
+    string held         = 7;  // why it is kept even from a named removal; "" when not held
     bool   removed      = 8;  // removed by this request
+    string retained     = 9;  // why the sweep and a bare purge keep it (its VM exists); "" when not retained
 }
 message SupersededDisksResponse {
     string                  host           = 1;
     repeated SupersededDisk disks          = 2;
     int32                   retention_days = 3;  // superseded_disk_retention_days there; 0 = kept until removed
+    string                  restored       = 4;  // the copy restore_path put back; "" when none
+    string                  restored_to    = 5;  // the disk path it is now
+    string                  set_aside      = 6;  // where the file it replaced was set aside; "" when there was none
 }
 message ConfigureHostRequest {
     string name = 1;

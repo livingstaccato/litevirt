@@ -2588,6 +2588,18 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 		})
 	}
 
+	// Host-local disks a failover left on another host (vm_disk_stranded).
+	// Best-effort: an unreadable record leaves the field empty.
+	if stranded, serr := health.StrandedDisksOf(ctx, s.db, name); serr == nil {
+		for _, sd := range stranded {
+			for _, d := range sd.Disks {
+				pbVM.StrandedDisks = append(pbVM.StrandedDisks, &pb.VMStrandedDisk{
+					Host: sd.Host, Disk: d.Disk, Path: d.Path, Copy: d.Copy, Since: d.Since,
+				})
+			}
+		}
+	}
+
 	// VNC address — only available for running VMs on this host
 	if vm.HostName == s.hostName && state == "running" && s.virt != nil {
 		if port, err := s.virt.GetVMVNCPort(name); err == nil && port >= 0 {

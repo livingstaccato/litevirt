@@ -138,3 +138,84 @@ func TestImportClaimsAndAdopt_CarriesLUNAllocations(t *testing.T) {
 		t.Errorf("key string %q", k.String())
 	}
 }
+
+// ── fix round 2 ─────────────────────────────────────────────────────────────
+
+// With no voter generation adopted (genesis pending, or after a reset), a
+// voter still decides a LUN key — the proposer's electorate is the derived
+// voter set, every member of which must accept — but never a workload key.
+//
+// Mutation: refuse LUN keys without an adopted generation — this goes red.
+func TestClaimVoter_LUNKeysWithoutAGeneration(t *testing.T) {
+	ctx := context.Background()
+	ca := newClaimTestCA(t)
+	a := newClaimTestVoter(t, ca, "a")
+	k := lunKey(0)
+	if res, err := a.c.ClaimPrepare(ctx, k, testBallot(1, "b"), 0); err != nil || !res.Promised {
+		t.Fatalf("prepare at no generation: %+v %v", res, err)
+	}
+	if res, err := a.c.ClaimAccept(ctx, k, testBallot(1, "b"), lunValue(0, "c1", "web"), 0, a.signer, unreachable); err != nil || !res.Accepted {
+		t.Fatalf("accept at no generation: %+v %v", res, err)
+	}
+	if res, _ := a.c.ClaimPrepare(ctx, workloadKey(), testBallot(1, "b"), 0); res.Promised {
+		t.Fatalf("a workload key was promised with no generation: %+v", res)
+	}
+}
+
+// A host is proven removed by its tombstone, never by a row this replica
+// simply does not have.
+//
+// Mutation: report a host with no row at all as removed — this goes red.
+func TestHostRemoved_NeedsATombstone(t *testing.T) {
+	ctx := context.Background()
+	c := NewTestClientT(t)
+	if err := InitSchema(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	if gone, err := HostRemoved(ctx, c, "never-heard-of"); err != nil || gone {
+		t.Fatalf("a host with no row here: removed=%v err=%v", gone, err)
+	}
+	if err := InsertHost(ctx, c, HostRecord{Name: "h", Address: "10.0.0.1", State: "active"}); err != nil {
+		t.Fatal(err)
+	}
+	if gone, _ := HostRemoved(ctx, c, "h"); gone {
+		t.Fatal("a live host reported removed")
+	}
+	if err := DeleteHost(ctx, c, "h"); err != nil {
+		t.Fatal(err)
+	}
+	if gone, err := HostRemoved(ctx, c, "h"); err != nil || !gone {
+		t.Fatalf("a tombstoned host: removed=%v err=%v", gone, err)
+	}
+}
+
+// The per-LUN "resolved up to" checkpoint only moves forward, and is written
+// only where cluster_policies may be written.
+//
+// Mutation: write it unconditionally (drop the max) — the regression case
+// goes red.
+func TestLUNResolved_MovesForwardOnly(t *testing.T) {
+	ctx := context.Background()
+	c := NewTestClientT(t)
+	if err := InitSchema(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	if g, err := GetLUNResolved(ctx, c, "iscsi:x/lun0"); err != nil || g != 0 {
+		t.Fatalf("no checkpoint: %d %v", g, err)
+	}
+	if err := AdvanceLUNResolved(ctx, c, "iscsi:x/lun0", 4, "h"); err != nil {
+		t.Fatal(err)
+	}
+	if g, _ := GetLUNResolved(ctx, c, "iscsi:x/lun0"); g != 0 {
+		t.Fatalf("written behind a closed cluster-policy gate: %d", g)
+	}
+	c.SetClusterPolicyGate(func() bool { return true })
+	for _, step := range []struct{ to, want int64 }{{4, 4}, {2, 4}, {7, 7}} {
+		if err := AdvanceLUNResolved(ctx, c, "iscsi:x/lun0", step.to, "h"); err != nil {
+			t.Fatal(err)
+		}
+		if g, _ := GetLUNResolved(ctx, c, "iscsi:x/lun0"); g != step.want {
+			t.Fatalf("advance to %d: checkpoint %d, want %d", step.to, g, step.want)
+		}
+	}
+}

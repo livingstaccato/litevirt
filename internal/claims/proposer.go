@@ -258,6 +258,60 @@ func (p *Proposer) Decide(ctx context.Context, spec Spec) (Outcome, error) {
 	return Outcome{}, lastErr
 }
 
+// Learn runs phase 1 only, at a fresh ballot, and returns the accepted value
+// with the highest ballot that any promise of a quorum reports — a value some
+// proposer has PROPOSED at the key, chosen or not — or found=false when no
+// promise of the quorum reports one. It decides nothing; its promises only
+// make a lower-ballot proposer at the key retry higher.
+func (p *Proposer) Learn(ctx context.Context, spec Spec) (value *corrosion.ClaimValue, found bool, err error) {
+	maxRounds := spec.MaxRounds
+	if maxRounds <= 0 {
+		maxRounds = 8
+	}
+	round := spec.StartRound
+	if round == 0 {
+		round = 1
+	}
+	var lastErr error
+	for attempt := 0; attempt < maxRounds; attempt++ {
+		if err := ctx.Err(); err != nil {
+			if lastErr != nil {
+				return nil, false, lastErr
+			}
+			return nil, false, err
+		}
+		b := p.ballot(spec.Key, round, false)
+		promises, refusals := p.prepareAll(ctx, spec, b)
+		var stale corrosion.Ballot
+		for _, r := range refusals {
+			if r.reason == corrosion.RefusalBallotStale && corrosion.CompareBallots(r.promised, stale) > 0 {
+				stale = r.promised
+			}
+		}
+		if len(promises) >= spec.PrepareQuorum {
+			var best corrosion.Ballot
+			for _, pr := range promises {
+				if pr.State.Value != nil && !pr.State.Accepted.IsZero() && corrosion.CompareBallots(pr.State.Accepted, best) > 0 {
+					best, value = pr.State.Accepted, pr.State.Value
+				}
+			}
+			return value, value != nil, nil
+		}
+		lastErr = &NoMajorityError{Phase: "prepare", Got: len(promises), Need: spec.PrepareQuorum,
+			Refusals: publicRefusals(refusals)}
+		if stale.IsZero() {
+			return nil, false, lastErr
+		}
+		round = stale.Round + 1
+		select {
+		case <-ctx.Done():
+			return nil, false, lastErr
+		case <-time.After(p.backoff(attempt)):
+		}
+	}
+	return nil, false, lastErr
+}
+
 // try runs both phases at one ballot. stale is the highest promise a voter
 // refused us with, zero when no refusal was about the ballot.
 func (p *Proposer) try(ctx context.Context, spec Spec, b corrosion.Ballot, own map[string]bool) (Outcome, corrosion.Ballot, error) {

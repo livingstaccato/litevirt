@@ -41,6 +41,7 @@ package corrosion
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -207,4 +208,42 @@ func DisksReferencingName(ctx context.Context, c *Client, name string) ([]DiskRe
 			Path: r.String("path"), BackingImage: r.String("backing_image"), BackingDisk: r.String("backing_disk")}
 	}
 	return out, nil
+}
+
+// lunResolvedKeyPrefix keys, in cluster_policies, the per-LUN checkpoint of
+// iSCSI LUN allocations (grpcapi vm_lun_claim.go): every allocation of the
+// LUN below the stored generation is decided and proven gone, so a create
+// starts its walk there.
+const lunResolvedKeyPrefix = "lun_resolved/"
+
+// GetLUNResolved returns the LUN's checkpoint in this replica, 0 when none.
+// It is a hint: a walker checks it against the voters before trusting it.
+func GetLUNResolved(ctx context.Context, c *Client, lun string) (int64, error) {
+	rows, err := c.Query(ctx,
+		`SELECT value FROM cluster_policies WHERE key = ? AND deleted_at IS NULL`, lunResolvedKeyPrefix+lun)
+	if err != nil || len(rows) == 0 {
+		return 0, err
+	}
+	g, err := strconv.ParseInt(rows[0].String("value"), 10, 64)
+	if err != nil || g < 0 {
+		return 0, nil // unreadable: no checkpoint, the walk starts at 0
+	}
+	return g, nil
+}
+
+// AdvanceLUNResolved moves the LUN's checkpoint forward to g. It never moves
+// it back (a concurrent writer's LWW win can, which only costs a longer walk),
+// and writes nothing where cluster_policies may not be written yet.
+func AdvanceLUNResolved(ctx context.Context, c *Client, lun string, g int64, setBy string) error {
+	if !c.MayWriteClusterPolicy() {
+		return nil
+	}
+	cur, err := GetLUNResolved(ctx, c, lun)
+	if err != nil {
+		return err
+	}
+	if g <= cur {
+		return nil
+	}
+	return c.Execute(ctx, clusterPolicyUpsertSQL, lunResolvedKeyPrefix+lun, strconv.FormatInt(g, 10), setBy, c.NowTS())
 }

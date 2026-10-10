@@ -203,12 +203,20 @@ func (st voterStanding) admit(key ClaimKey, gen int64, v *ClaimValue) (string, s
 		}
 		return "", ""
 	}
-	// A workload key.
-	if !st.cfg.Explicit() {
+	// A workload key, or a LUN key.
+	switch {
+	case st.cfg.Explicit():
+		if r, d := memberCheck(st.cfg); r != "" {
+			return r, d
+		}
+	case key.IsLUN():
+		// No member generation is adopted (genesis pending, or after a
+		// reset): a LUN key is decided over the proposer's DERIVED voter set,
+		// every member of which must accept (grpcapi lunElectorate). Any two
+		// such electorates, each more than half the cluster's hosts, share a
+		// voter, so this voter's promise is what keeps them apart.
+	default:
 		return RefusalNoVoterConfig, fmt.Sprintf("%s has adopted no member voter generation", st.me)
-	}
-	if r, d := memberCheck(st.cfg); r != "" {
-		return r, d
 	}
 	if st.sealed {
 		// §4.4 rule 1: deciding g+1 seals g for workload keys.

@@ -10,21 +10,26 @@
 // starts, moves or copies the disk settles it first.
 //
 // An overlay is bound to the very base file it was taken from: a sidecar
-// beside it (Bind) records the VM, its disk, and the base's device, inode,
-// size and modification time. A path can be reused — a VM deleted and
-// re-created under the same name, a disk restored or rebuilt in place — and
-// a base can be written after the overlay was taken (a build that knows
-// nothing of overlays restarted the VM on it). Committing the overlay into
-// such a file would write stale blocks over newer data. So:
+// beside it (Bind) records the VM, its disk, and the base's name in its
+// directory, inode, size and modification time — the identity the repo uses
+// for every file binding, WITHOUT the device number, which differs between
+// two hosts mounting one NFS export and can change across a remount or
+// reboot. A path can be reused — a VM deleted and re-created under the same
+// name, a disk restored or rebuilt in place — and a base can be written after
+// the overlay was taken (a build that knows nothing of overlays restarted the
+// VM on it). Committing the overlay into such a file would write stale blocks
+// over newer data. So:
 //
 //   - an overlay is committed only into the base its sidecar names, unchanged
 //     since (or, in the "committing" state a commit enters first, the same
-//     file a commit was already writing);
+//     file a commit was writing, not written well after that commit began);
 //   - any other overlay — no sidecar, another VM or disk, another or changed
-//     base — is set aside under a new name, kept, never committed and never
-//     deleted;
+//     base — cannot be verified: the caller HOLDS the VM (never starts it on
+//     the bare disk, which would drop the overlay's writes) until an admin
+//     resolves it with `lv resolve-pit-overlay`, committing or discarding it;
 //   - a committed (emptied) overlay is removed with its sidecar; an overlay is
-//     deleted otherwise only with its disk, by the disk's own deletion.
+//     deleted otherwise only with its disk, by the disk's own deletion, or by
+//     that admin's discard.
 //
 // Commits run offline here with qemu-img, WITHOUT -U, so a qemu still
 // holding either file fails the commit rather than racing it.
@@ -40,6 +45,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/qcow2"
 )
@@ -82,14 +88,27 @@ const (
 // overlay was taken.
 type Binding struct {
 	Owner
-	Dev     uint64 `json:"dev"`
+	// Name is the base's file name in its (and the overlay's) directory:
+	// the path relative to the pool, the same on every host that mounts it.
+	Name    string `json:"name"`
+	Dev     uint64 `json:"dev"` // diagnostics only: never compared
 	Ino     uint64 `json:"ino"`
 	Size    int64  `json:"size"`
 	MtimeNs int64  `json:"mtime_ns"`
 	State   string `json:"state"`
+	// CommitStartedNs is when the first commit began (StateCommitting).
+	CommitStartedNs int64 `json:"commit_started_ns,omitempty"`
 }
 
-func identity(disk string) (dev, ino uint64, size, mtimeNs int64, err error) {
+// CommitBound is how long after a commit began the base may still be
+// written by that commit. A base modified later than that was written by
+// something else (a build that knows nothing of overlays ran the VM on it),
+// and the overlay is not committed over it.
+var CommitBound = 2 * time.Hour
+
+// identity is the base file's identity. A variable so a test can model a
+// host that sees the same file under another device number.
+var identity = func(disk string) (dev, ino uint64, size, mtimeNs int64, err error) {
 	fi, err := os.Stat(disk)
 	if err != nil {
 		return 0, 0, 0, 0, err
@@ -108,8 +127,17 @@ func Bind(disk string, owner Owner) error {
 	if err != nil {
 		return err
 	}
-	return writeBinding(disk, Binding{Owner: owner, Dev: dev, Ino: ino, Size: size, MtimeNs: mt, State: StateWindow})
+	return writeBinding(disk, Binding{Owner: owner, Name: filepath.Base(disk), Dev: dev, Ino: ino, Size: size, MtimeNs: mt, State: StateWindow})
 }
+
+// Bound reports whether disk's overlay has a readable binding.
+func Bound(disk string) bool {
+	_, err := readBinding(disk)
+	return err == nil
+}
+
+// BindingOf returns disk's overlay's binding.
+func BindingOf(disk string) (Binding, error) { return readBinding(disk) }
 
 func writeBinding(disk string, b Binding) error {
 	data, err := json.Marshal(b)
@@ -131,7 +159,17 @@ func writeBinding(disk string, b Binding) error {
 		_ = os.Remove(tmp)
 		return err
 	}
-	return os.Rename(tmp, SidecarPath(disk))
+	if err := os.Rename(tmp, SidecarPath(disk)); err != nil {
+		return err
+	}
+	// Durable before anything relies on it: a "committing" binding must
+	// survive a crash that happens after the commit's first base write.
+	d, err := os.Open(filepath.Dir(disk))
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 func readBinding(disk string) (Binding, error) {
@@ -155,6 +193,7 @@ func MarkCommitting(disk string) error {
 		return nil
 	}
 	b.State = StateCommitting
+	b.CommitStartedNs = time.Now().UnixNano()
 	return writeBinding(disk, b)
 }
 
@@ -181,21 +220,31 @@ func Check(disk string, owner Owner) error {
 	if b.VM != owner.VM || b.Disk != owner.Disk || (b.VMUUID != "" && owner.VMUUID != "" && b.VMUUID != owner.VMUUID) {
 		return fmt.Errorf("%s: %w (taken of vm %q disk %q, not vm %q disk %q)", ov, ErrNotOurs, b.VM, b.Disk, owner.VM, owner.Disk)
 	}
-	dev, ino, size, mt, err := identity(disk)
+	_, ino, size, mt, err := identity(disk)
 	if err != nil {
 		return fmt.Errorf("%s: %w (its disk: %v)", ov, ErrNotOurs, err)
 	}
-	if dev != b.Dev || ino != b.Ino {
+	if (b.Name != "" && b.Name != filepath.Base(disk)) || ino != b.Ino {
 		return fmt.Errorf("%s: %w (the disk at %s is another file than the one it was taken of)", ov, ErrNotOurs, disk)
 	}
-	if b.State != StateCommitting && (size != b.Size || mt != b.MtimeNs) {
-		return fmt.Errorf("%s: %w (the disk %s was written after it was taken)", ov, ErrNotOurs, disk)
+	switch b.State {
+	case StateCommitting:
+		if b.CommitStartedNs != 0 && mt > b.CommitStartedNs+int64(CommitBound) {
+			return fmt.Errorf("%s: %w (the disk %s was written long after its commit began, by something else)", ov, ErrNotOurs, disk)
+		}
+	default:
+		if size != b.Size || mt != b.MtimeNs {
+			return fmt.Errorf("%s: %w (the disk %s was written after it was taken)", ov, ErrNotOurs, disk)
+		}
 	}
 	info, err := qcow2.Info(ov)
 	if err != nil {
 		return fmt.Errorf("%s: %w (%v)", ov, ErrNotOurs, err)
 	}
-	if info.BackingFile != disk && filepath.Join(filepath.Dir(ov), info.BackingFile) != disk {
+	// The overlay names its base by the absolute path it had on the host
+	// that took it; another host may mount the pool elsewhere. Its base is
+	// the file of that name beside it.
+	if filepath.Base(info.BackingFile) != filepath.Base(disk) {
 		return fmt.Errorf("%s: %w (its backing file is %q)", ov, ErrNotOurs, info.BackingFile)
 	}
 	return nil
@@ -222,10 +271,45 @@ func CommitOffline(ctx context.Context, disk string, owner Owner) (bool, error) 
 	if err := MarkCommitting(disk); err != nil {
 		return true, fmt.Errorf("mark %s committing: %w", Path(disk), err)
 	}
-	if out, err := Command(ctx, "qemu-img", "commit", "-f", "qcow2", Path(disk)).CombinedOutput(); err != nil {
-		return true, fmt.Errorf("qemu-img commit %s into %s: %v: %s", Path(disk), disk, err, out)
+	return true, commitInto(ctx, disk)
+}
+
+// commitInto runs qemu-img commit of disk's overlay into disk, pointing the
+// overlay's header at disk first when it names the base by a path this host
+// does not have (another host's mount point).
+func commitInto(ctx context.Context, disk string) error {
+	info, err := qcow2.Info(Path(disk))
+	if err != nil {
+		return fmt.Errorf("%s: %v", Path(disk), err)
 	}
-	return true, nil
+	if info.BackingFile != disk && filepath.Join(filepath.Dir(disk), info.BackingFile) != disk {
+		if out, err := Command(ctx, "qemu-img", "rebase", "-u", "-f", "qcow2", "-F", "qcow2", "-b", disk, Path(disk)).CombinedOutput(); err != nil {
+			return fmt.Errorf("point %s at %s: %v: %s", Path(disk), disk, err, out)
+		}
+	}
+	if out, err := Command(ctx, "qemu-img", "commit", "-f", "qcow2", Path(disk)).CombinedOutput(); err != nil {
+		return fmt.Errorf("qemu-img commit %s into %s: %v: %s", Path(disk), disk, err, out)
+	}
+	return nil
+}
+
+// ForceCommit commits disk's overlay into disk without checking its binding:
+// an admin's explicit, confirmed decision (lv resolve-pit-overlay --commit)
+// for an overlay that could not be verified. The overlay is then removed.
+// Still offline and without -U.
+func ForceCommit(ctx context.Context, disk string) error {
+	if _, err := os.Lstat(Path(disk)); err != nil {
+		return err
+	}
+	if Bound(disk) {
+		if err := MarkCommitting(disk); err != nil {
+			return err
+		}
+	}
+	if err := commitInto(ctx, disk); err != nil {
+		return err
+	}
+	return Remove(disk)
 }
 
 // Remove removes disk's overlay and its binding. Call it only after a commit
@@ -244,6 +328,14 @@ func Remove(disk string) error {
 // it is NEVER deleted — and returns its new name.
 func SetAside(disk, stamp string) (string, error) {
 	to := Path(disk) + ".orphan-" + stamp
+	// Never over an earlier orphan: a second set-aside within the same
+	// stamp takes a further suffix.
+	for i := 1; ; i++ {
+		if _, err := os.Lstat(to); errors.Is(err, fs.ErrNotExist) {
+			break
+		}
+		to = fmt.Sprintf("%s.orphan-%s-%d", Path(disk), stamp, i)
+	}
 	if err := os.Rename(Path(disk), to); err != nil {
 		return "", err
 	}
@@ -259,26 +351,23 @@ type Outcome int
 const (
 	None      Outcome = iota // no overlay
 	Committed                // committed into the disk and removed
-	SetAsideO                // not this disk's: set aside, kept
+	Held                     // could not be verified: left as it is; the VM must not start
 )
 
 // Settle commits disk's overlay offline and removes it when it is owner's
-// overlay of the disk as it is; any other overlay is set aside (aside names
-// it). For a caller about to define or rewrite the disk from its record (so
-// no definition names the overlay).
-func Settle(ctx context.Context, disk string, owner Owner, stamp string) (out Outcome, aside string, err error) {
+// overlay of the disk as it is. Any other overlay is left untouched and
+// reported Held (err wraps ErrNotOurs with the reason): the caller must not
+// start or define the VM on the bare disk. For a caller about to define the
+// disk from its record (so no definition names the overlay).
+func Settle(ctx context.Context, disk string, owner Owner) (Outcome, error) {
 	had, err := CommitOffline(ctx, disk, owner)
 	switch {
 	case !had:
-		return None, "", nil
+		return None, nil
 	case errors.Is(err, ErrNotOurs):
-		to, serr := SetAside(disk, stamp)
-		if serr != nil {
-			return None, "", fmt.Errorf("%v; and setting it aside: %w", err, serr)
-		}
-		return SetAsideO, to, nil
+		return Held, err
 	case err != nil:
-		return None, "", err
+		return None, err
 	}
-	return Committed, "", Remove(disk)
+	return Committed, Remove(disk)
 }

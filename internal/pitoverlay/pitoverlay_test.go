@@ -3,6 +3,7 @@ package pitoverlay
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -43,6 +44,12 @@ func window(t *testing.T) string {
 
 var owner = Owner{VM: "web", VMUUID: "u-1", Disk: "root"}
 
+func windowWrite(t *testing.T, disk string) bool {
+	t.Helper()
+	got := readDisk(t, disk)
+	return len(got) >= 131072 && bytes.Equal(got[65536:131072], bytes.Repeat([]byte{0x5a}, 65536))
+}
+
 func readDisk(t *testing.T, disk string) []byte {
 	t.Helper()
 	out := filepath.Join(t.TempDir(), "o.raw")
@@ -60,14 +67,13 @@ func readDisk(t *testing.T, disk string) []byte {
 func TestSettle_KeepsTheWindowsWrites(t *testing.T) {
 	needQemu(t)
 	disk := window(t)
-	out, _, err := Settle(context.Background(), disk, owner, "t")
-	if err != nil || out != Committed {
+	if out, err := Settle(context.Background(), disk, owner); err != nil || out != Committed {
 		t.Fatalf("Settle = %v, %v", out, err)
 	}
 	if Present(disk) {
 		t.Error("the committed overlay is still there")
 	}
-	if got := readDisk(t, disk); !bytes.Equal(got[65536:131072], bytes.Repeat([]byte{0x5a}, 65536)) {
+	if !windowWrite(t, disk) {
 		t.Fatal("the window's write is not in the disk: it was lost")
 	}
 }
@@ -84,7 +90,7 @@ func TestSettle_NeverDeletesAnOverlayItCannotCommit(t *testing.T) {
 		return exec.CommandContext(ctx, "false")
 	}
 	defer func() { Command = prev }()
-	if _, _, err := Settle(context.Background(), disk, owner, "t"); err == nil {
+	if _, err := Settle(context.Background(), disk, owner); err == nil {
 		t.Fatal("a failed commit reported success")
 	}
 	if !Present(disk) {
@@ -96,8 +102,8 @@ func TestSettle_NeverDeletesAnOverlayItCannotCommit(t *testing.T) {
 // was kept, so the second run finishes the job.
 //
 // Mutation "no committing state": CommitOffline does not MarkCommitting —
-// red (the written disk no longer matches the window and the overlay is set
-// aside instead of committed).
+// red (the written disk no longer matches the window and the VM is held
+// instead of the overlay being committed).
 func TestSettle_ACrashMidCommitIsFinishedByTheNextSettle(t *testing.T) {
 	needQemu(t)
 	disk := window(t)
@@ -107,19 +113,16 @@ func TestSettle_ACrashMidCommitIsFinishedByTheNextSettle(t *testing.T) {
 	if !Present(disk) {
 		t.Fatal("CommitOffline removed the overlay; only Remove may")
 	}
-	// The commit wrote the disk; the binding, now "committing", still
-	// vouches for the file, so the next settle finishes the job.
-	if out, _, err := Settle(context.Background(), disk, owner, "t"); err != nil || out != Committed {
+	if out, err := Settle(context.Background(), disk, owner); err != nil || out != Committed {
 		t.Fatalf("the next Settle = %v, %v", out, err)
 	}
-	if got := readDisk(t, disk); !bytes.Equal(got[65536:131072], bytes.Repeat([]byte{0x5a}, 65536)) {
+	if !windowWrite(t, disk) {
 		t.Fatal("the window's write is not in the disk")
 	}
 }
 
-// A file at the overlay's name that is not this disk's overlay is refused
-// and left alone.
-func TestCommitOffline_RefusesAnotherDisksOverlay(t *testing.T) {
+// An overlay whose backing file is another disk is held, never committed.
+func TestSettle_HoldsAnotherDisksOverlay(t *testing.T) {
 	needQemu(t)
 	disk := filepath.Join(t.TempDir(), "a.qcow2")
 	other := filepath.Join(t.TempDir(), "b.qcow2")
@@ -134,18 +137,17 @@ func TestCommitOffline_RefusesAnotherDisksOverlay(t *testing.T) {
 	if err := Bind(disk, owner); err != nil {
 		t.Fatal(err)
 	}
-	out, aside, err := Settle(context.Background(), disk, owner, "t")
-	if err != nil || out != SetAsideO {
-		t.Fatalf("Settle = %v, %v; an overlay of another disk must be set aside", out, err)
+	out, err := Settle(context.Background(), disk, owner)
+	if out != Held || !errors.Is(err, ErrNotOurs) {
+		t.Fatalf("Settle = %v, %v; another disk's overlay must hold", out, err)
 	}
-	if _, err := os.Stat(aside); err != nil {
-		t.Fatalf("the set-aside overlay is gone: %v", err)
+	if !Present(disk) {
+		t.Fatal("the held overlay was moved or removed")
 	}
 }
 
-// (a) A disk deleted and re-created at the same path (a VM re-created under
-// the same name) never receives the old overlay's data: the overlay is set
-// aside, kept.
+// (a) A disk re-created at the same path never receives the old overlay's
+// data: the VM is held and the overlay left as it was.
 //
 // Mutation "file identity ignored": Check takes the file's identity from the
 // sidecar instead of the file — red.
@@ -160,18 +162,15 @@ func TestSettle_ARecreatedDiskNeverReceivesTheOldOverlay(t *testing.T) {
 	}
 	// The same owner (a rebuild keeps the VM's identity): only the file's
 	// own identity tells the new disk from the old.
-	out, aside, err := Settle(context.Background(), disk, owner, "t")
-	if err != nil || out != SetAsideO {
-		t.Fatalf("Settle = %v, %v, want the old overlay set aside", out, err)
+	out, err := Settle(context.Background(), disk, owner)
+	if out != Held || err == nil {
+		t.Fatalf("Settle = %v, %v, want held", out, err)
 	}
-	if got := readDisk(t, disk); bytes.Contains(got, bytes.Repeat([]byte{0x5a}, 4096)) {
+	if windowWrite(t, disk) {
 		t.Fatal("the re-created disk received the old VM's data")
 	}
-	if _, err := os.Stat(aside); err != nil {
-		t.Fatalf("the old overlay was not kept: %v", err)
-	}
-	if _, err := os.Stat(aside + ".id"); err != nil {
-		t.Errorf("its binding was not kept beside it: %v", err)
+	if !Present(disk) || !Bound(disk) {
+		t.Fatal("the held overlay or its binding was not left in place")
 	}
 }
 
@@ -188,9 +187,8 @@ func TestSettle_ABaseWrittenSinceIsNeverOverwritten(t *testing.T) {
 	if out, err := exec.Command("qemu-io", "-f", "qcow2", "-c", "write -P 0x33 65536 65536", disk).CombinedOutput(); err != nil {
 		t.Fatalf("write the base: %v %s", err, out)
 	}
-	out, _, err := Settle(context.Background(), disk, owner, "t")
-	if err != nil || out != SetAsideO {
-		t.Fatalf("Settle = %v, %v, want set aside", out, err)
+	if out, err := Settle(context.Background(), disk, owner); out != Held || err == nil {
+		t.Fatalf("Settle = %v, %v, want held", out, err)
 	}
 	if got := readDisk(t, disk); !bytes.Equal(got[65536:131072], bytes.Repeat([]byte{0x33}, 65536)) {
 		t.Fatal("the newer write in the base was overwritten by the old overlay")
@@ -201,14 +199,110 @@ func TestSettle_ABaseWrittenSinceIsNeverOverwritten(t *testing.T) {
 // never committed, even into an unchanged file.
 //
 // Mutation "owner not checked": Check skips the owner comparison — red.
-func TestSettle_AnotherIncarnationsOverlayIsSetAside(t *testing.T) {
+func TestSettle_AnotherIncarnationsOverlayIsHeld(t *testing.T) {
 	needQemu(t)
 	disk := window(t)
-	out, _, err := Settle(context.Background(), disk, Owner{VM: "web", VMUUID: "u-2", Disk: "root"}, "t")
-	if err != nil || out != SetAsideO {
-		t.Fatalf("Settle = %v, %v, want set aside", out, err)
+	out, err := Settle(context.Background(), disk, Owner{VM: "web", VMUUID: "u-2", Disk: "root"})
+	if out != Held || err == nil {
+		t.Fatalf("Settle = %v, %v, want held", out, err)
 	}
-	if got := readDisk(t, disk); bytes.Contains(got, bytes.Repeat([]byte{0x5a}, 4096)) {
+	if windowWrite(t, disk) {
 		t.Fatal("another incarnation's data was committed")
+	}
+}
+
+// R1: the same unchanged file seen under another device number — another
+// host mounting the same NFS export, or a remount or reboot renumbering it —
+// is the same file, and the overlay is committed.
+//
+// Mutation "device compared": Check also requires the recorded device number
+// — red.
+func TestSettle_AnotherDeviceNumberIsTheSameFile(t *testing.T) {
+	needQemu(t)
+	disk := window(t)
+	prev := identity
+	identity = func(d string) (uint64, uint64, int64, int64, error) {
+		dev, ino, size, mt, err := prev(d)
+		return dev + 7, ino, size, mt, err
+	}
+	defer func() { identity = prev }()
+	if out, err := Settle(context.Background(), disk, owner); err != nil || out != Committed {
+		t.Fatalf("Settle on another host's device number = %v, %v, want committed", out, err)
+	}
+	if !windowWrite(t, disk) {
+		t.Fatal("the window's write is not in the disk")
+	}
+}
+
+// R1: an overlay names its base by the absolute path it had where it was
+// taken; on a host that mounts the pool elsewhere the base is the file of
+// that name beside it, and the commit goes there.
+//
+// Mutation "no rebase": commitInto skips repointing the overlay — red.
+func TestSettle_ABaseNamedByAnotherHostsMountPath(t *testing.T) {
+	needQemu(t)
+	disk := window(t)
+	elsewhere := filepath.Join("/srv/another-mount", filepath.Base(disk))
+	if out, err := exec.Command("qemu-img", "rebase", "-u", "-f", "qcow2", "-F", "qcow2", "-b", elsewhere, Path(disk)).CombinedOutput(); err != nil {
+		t.Fatalf("rebase: %v %s", err, out)
+	}
+	if err := Bind(disk, owner); err != nil { // the rebase wrote nothing to the base; rebind is idempotent
+		t.Fatal(err)
+	}
+	if out, err := Settle(context.Background(), disk, owner); err != nil || out != Committed {
+		t.Fatalf("Settle = %v, %v, want committed", out, err)
+	}
+	if !windowWrite(t, disk) {
+		t.Fatal("the window's write is not in the disk")
+	}
+}
+
+// R4: a "committing" binding vouches for the base only near the commit's
+// start. A base written long after it — a build that knows nothing of
+// overlays ran the VM on it — is held, never overwritten.
+//
+// Mutation "committing unbounded": Check skips the CommitBound comparison —
+// red.
+func TestSettle_ACommitLongAgoAndABaseWrittenSinceIsHeld(t *testing.T) {
+	needQemu(t)
+	disk := window(t)
+	if err := MarkCommitting(disk); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := readBinding(disk)
+	b.CommitStartedNs = time.Now().Add(-3 * time.Hour).UnixNano()
+	if err := writeBinding(disk, b); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("qemu-io", "-f", "qcow2", "-c", "write -P 0x33 65536 65536", disk).CombinedOutput(); err != nil {
+		t.Fatalf("write the base: %v %s", err, out)
+	}
+	if out, err := Settle(context.Background(), disk, owner); out != Held || err == nil {
+		t.Fatalf("Settle = %v, %v, want held", out, err)
+	}
+}
+
+// SetAside never replaces an earlier orphan.
+//
+// Mutation "orphan clobbered": SetAside renames over an existing orphan — red.
+func TestSetAside_NeverOverAnEarlierOrphan(t *testing.T) {
+	needQemu(t)
+	disk := window(t)
+	first, err := SetAside(disk, "same")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := qcow2.CreateWithBackingFormat(Path(disk), disk, "qcow2", 1<<20, nil); err != nil {
+		t.Fatal(err)
+	}
+	second, err := SetAside(disk, "same")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == second {
+		t.Fatalf("both set-asides landed on %s", first)
+	}
+	if _, err := os.Stat(first); err != nil {
+		t.Fatalf("the first orphan is gone: %v", err)
 	}
 }

@@ -331,10 +331,11 @@ func TestFleet_AHeldPromotionStaysDownAndItsCommandWorks(t *testing.T) {
 
 // N1(c) of the #256 review, multi-node: the overlay a dead host left is NOT
 // committed when the base has been written since — as when a host that knows
-// nothing of overlays restarted the VM on the base mid-roll. The target's
-// define sets it aside and keeps the newer base.
+// nothing of overlays restarted the VM on the base mid-roll — and the VM is
+// not started on the bare disk either: the target's define holds it.
 //
-// Mutation "binding ignored": pitoverlay.Check accepts any sidecar — red.
+// Mutations: "binding ignored" (pitoverlay.Check accepts any sidecar) and
+// "define ignores a hold" (the reconciler defines past a Held settle) — red.
 func TestFleet_AnOverlayIsNeverCommittedOverABaseWrittenSince(t *testing.T) {
 	c := New(t, Options{Nodes: 3, SharedCRDT: true})
 	ctx := context.Background()
@@ -370,7 +371,10 @@ func TestFleet_AnOverlayIsNeverCommittedOverABaseWrittenSince(t *testing.T) {
 	if diskHoldsTheWindow(t, disk) {
 		t.Fatal("the stale overlay was committed over the base written since")
 	}
-	if aside, _ := filepath.Glob(pitoverlay.Path(disk) + ".orphan-*"); len(aside) == 0 {
-		t.Fatal("the stale overlay was not kept")
+	if !pitoverlay.Present(disk) {
+		t.Fatal("the held overlay was moved or removed")
+	}
+	if target.Virt.DomainExists("pw2") {
+		t.Fatal("pw2 was defined on its bare disk while an overlay it cannot verify may hold its writes")
 	}
 }

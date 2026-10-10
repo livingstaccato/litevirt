@@ -2524,6 +2524,19 @@ message PromoteReplicaRequest {
     // (--accept-not-point-in-time).
     bool   accept_not_point_in_time = 9;
 }
+message ResolvePITOverlayRequest {
+    string vm_name   = 1;
+    string disk_name = 2;
+    string action    = 3; // "commit" | "discard"
+    bool   confirm   = 4; // false: report what would be done, do nothing
+}
+message ResolvePITOverlayResponse {
+    string overlay = 1; // the overlay file
+    string disk    = 2; // the disk file
+    string binding = 3; // what its binding records, if anything
+    bool   done    = 4; // the action was carried out
+    string status  = 5;
+}
 message PromoteReplicaProgress {
     enum Phase {
         PHASE_UNKNOWN = 0;
@@ -3840,6 +3853,11 @@ service LiteVirt {
     // against an overlay backed by the chosen replica on the host that holds
     // it, then localizes via blockpull. Disaster recovery after host loss.
     rpc PromoteReplica(PromoteReplicaRequest) returns (stream PromoteReplicaProgress);
+    // ResolvePITOverlay decides, as an admin, what happens to a point-in-time
+    // copy overlay that could not be verified against its disk and holds the
+    // VM: commit it into the disk, or discard it. Without confirm it only says
+    // what it would do. Audited. lv resolve-pit-overlay.
+    rpc ResolvePITOverlay(ResolvePITOverlayRequest) returns (ResolvePITOverlayResponse);
 
     // ── tamper-evident audit log ──
     // VerifyAuditChain walks each host's audit sub-chain (a row's

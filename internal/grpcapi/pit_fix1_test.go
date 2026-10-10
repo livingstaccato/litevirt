@@ -77,12 +77,15 @@ func TestHeal_InactiveDomainCommitsTheOverlayNeverDeletesIt(t *testing.T) {
 	}
 }
 
-// C1: an overlay found while the running VM uses its disk directly (it moved
-// on without it) is neither committed (it would overwrite newer data) nor
-// deleted: it is set aside, kept, and reported.
+// C1, round 3: an overlay found while the running VM uses its disk directly
+// (it moved on without it) cannot be verified: it is neither committed (that
+// could overwrite newer data) nor dropped (it may hold writes). The VM is
+// held — the copy refused with the admin command — and the overlay is left
+// exactly as it is.
 //
-// Mutation "stale overlay deleted": SetAside becomes a remove — red.
-func TestHeal_ActiveDomainOnItsDiskSetsTheOverlayAside(t *testing.T) {
+// Mutation "unverified overlay dropped": the hold becomes a removal of the
+// overlay — red.
+func TestHeal_ActiveDomainOnItsDiskIsHeld(t *testing.T) {
 	recordQemuImg(t)
 	s, _, live := pitServer(t)
 	s.SetPointInTimeSnapshotter(&fakePITSnapshotter{})
@@ -90,21 +93,18 @@ func TestHeal_ActiveDomainOnItsDiskSetsTheOverlayAside(t *testing.T) {
 	windowOverlay(t, live)
 	before, _ := os.ReadFile(pitoverlay.Path(live))
 
-	if err := runRepl(t, s, time.Now()); err != nil {
-		t.Fatalf("RunReplication: %v", err)
+	err := runRepl(t, s, time.Now())
+	if err == nil || !strings.Contains(err.Error(), "lv resolve-pit-overlay web root") {
+		t.Fatalf("RunReplication = %v, want refused naming the admin command", err)
 	}
-	aside, _ := filepath.Glob(pitoverlay.Path(live) + ".orphan-*[0-9]")
-	if len(aside) != 1 {
-		t.Fatalf("set-aside copies %v, want the overlay kept under a new name", aside)
-	}
-	if after, _ := os.ReadFile(aside[0]); !bytes.Equal(after, before) {
-		t.Error("the set-aside overlay changed")
+	if after, _ := os.ReadFile(pitoverlay.Path(live)); !bytes.Equal(after, before) {
+		t.Error("the held overlay changed or went")
 	}
 	if holdsTheWindowsWrite(t, live) {
-		t.Error("a stale overlay was committed over the disk the VM runs on")
+		t.Error("an unverified overlay was committed over the disk the VM runs on")
 	}
-	if !slices.Contains(pitEventTypes(t, s, "web"), "disk.pit_overlay_set_aside") {
-		t.Errorf("no set-aside event: %v", pitEventTypes(t, s, "web"))
+	if !slices.Contains(pitEventTypes(t, s, "web"), vmEventPITOverlayHeld) {
+		t.Errorf("no hold event: %v", pitEventTypes(t, s, "web"))
 	}
 }
 

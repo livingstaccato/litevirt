@@ -362,13 +362,14 @@ func TestRunReplication_ExternalSnapshotWhenNoSession(t *testing.T) {
 	}
 }
 
-// A snapshot that fails leaves nothing in the overlay's place, even when
-// libvirt left a file there: the running VM is on its disk, so the file is
-// set aside (kept, never deleted) and the next layer runs.
+// A snapshot that fails and leaves a file at the overlay's name (libvirt's
+// atomic snapshot should not) never has that file committed or dropped: it
+// cannot be verified, so the VM is held on it — loudly — and the copy itself
+// still gets made by the next layer.
 //
-// Mutation "no cleanup after a failed snapshot": copyViaExternalSnapshot
-// returns without healPITOverlay — red.
-func TestRunReplication_FailedSnapshotLeavesNoOverlay(t *testing.T) {
+// Mutation "no settle after a failed snapshot": copyViaExternalSnapshot
+// returns without healPITOverlay — red (no hold reported).
+func TestRunReplication_AFailedSnapshotsLeftoverHoldsTheVM(t *testing.T) {
 	recordQemuImg(t)
 	s, _, live := pitServer(t)
 	s.SetBackupSource(failingBackupSource{})
@@ -377,11 +378,11 @@ func TestRunReplication_FailedSnapshotLeavesNoOverlay(t *testing.T) {
 	if err := runRepl(t, s, time.Now()); err != nil {
 		t.Fatalf("RunReplication: %v", err)
 	}
-	if _, err := os.Stat(pitOverlayPath(live)); !os.IsNotExist(err) {
-		t.Errorf("a failed snapshot's overlay was left behind (%v)", err)
+	if _, err := os.Stat(pitOverlayPath(live)); err != nil {
+		t.Errorf("the leftover file was moved or removed (%v)", err)
 	}
-	if aside, _ := filepath.Glob(pitOverlayPath(live) + ".orphan-*"); len(aside) != 1 {
-		t.Errorf("the left file was not kept aside: %v", aside)
+	if !slices.Contains(pitEventTypes(t, s, "web"), vmEventPITOverlayHeld) {
+		t.Errorf("no hold reported: %v", pitEventTypes(t, s, "web"))
 	}
 }
 

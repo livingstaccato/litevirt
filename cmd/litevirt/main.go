@@ -97,6 +97,7 @@ func newRootCmd() *cobra.Command {
 		newMigrateCmd(),
 		newMoveVolumeCmd(),
 		newReplicateVolumeCmd(),
+		newResolvePITOverlayCmd(),
 		newReplicationCmd(),
 		newStackCmd(),
 		newImageCmd(),

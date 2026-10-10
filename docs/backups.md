@@ -260,31 +260,50 @@ by the strongest method the host has, tried in this order:
 
    **Never delete a `.lv-pit` file.** While one exists it may hold the
    guest's newest writes. It is bound to the exact disk file it was taken of
-   by a sidecar beside it (`.<disk file>.lv-pit.id`: the VM, its disk, and
-   the file's device, inode, size and modification time). If the commit
-   fails, the VM keeps running on the overlay and a
-   `disk.pit_overlay_stranded` event and a `replication.pit_overlay_stranded`
-   notification say so. Every later copy (replication, `lv replicate-volume`),
-   move (`lv move-volume`, live or offline), migration, backup, clone,
-   `lv start`, reconfigure, in-place restore, failover restart and the
-   daemon's start-up sweep settles the overlay first: a running VM on it is
-   committed live; otherwise, if the overlay is bound to this VM's disk and
-   the file is the one it was taken of, unchanged since (or one a commit had
-   already started writing), it is committed offline (`qemu-img commit`,
-   without `-U`), the persistent definition is pointed back at the disk, and
-   only then is the overlay removed. If libvirt cannot say whether the VM
-   runs, nothing is touched and the operation is refused until it can. Any
-   other overlay — the running VM uses its disk directly, or the overlay is
-   another VM's, unbound, or of a file replaced or written since — is never
-   committed (it would write stale blocks over newer data): it is renamed
-   `.<disk file>.lv-pit.orphan-<time>` (with its sidecar), kept, and reported
-   (`disk.pit_overlay_set_aside`, `replication.pit_overlay_set_aside`, naming
-   both files). An import sets aside an overlay at its new disk's path. When a
-   disk is deleted (`lv rm`, rebuild), its overlay and sidecar are deleted
-   with it; set-aside copies are kept. The start-up sweep waits until the
-   host's replica has caught up, and on a shared pool touches only disks of
-   VMs this host owns and has defined (others are left to their owner and
-   reported as `disk.pit_overlay_left`).
+   by a sidecar beside it (`.<disk file>.lv-pit.id`): the VM, its disk, and
+   the file's name, inode, size and modification time — not the device
+   number, which differs between hosts mounting one NFS export and can change
+   across a remount or reboot. The sidecar is written, and synced, before
+   anything relies on it: if it cannot be, no commit starts and the window is
+   kept open (reported) and retried. If the commit fails, the VM keeps
+   running on the overlay and a `disk.pit_overlay_stranded` event and a
+   `replication.pit_overlay_stranded` notification say so.
+
+   Every later copy (replication, `lv replicate-volume`), move
+   (`lv move-volume`, live or offline), migration, backup, clone, `lv start`,
+   reconfigure, in-place restore, `lv rm` of a disk it keeps, failover restart
+   and the daemon's start-up sweep settles the overlay first:
+   - a running VM on the overlay is committed live;
+   - otherwise, if the overlay is bound to this VM's disk and the file is the
+     one it was taken of, unchanged since (or one a commit began writing, not
+     written long after that), it is committed offline (`qemu-img commit`,
+     without `-U`, pointing the overlay at the disk by its name beside it if
+     another host took it under another mount path), the persistent
+     definition is pointed back at the disk, and only then is the overlay
+     removed;
+   - if libvirt cannot say whether the VM runs, nothing is touched and the
+     operation is refused until it can;
+   - any other overlay cannot be verified (the running VM uses its disk
+     directly, or the overlay is another VM's, unbound, or of a file replaced
+     or written since). It is never committed (that could write stale blocks
+     over newer data) and never dropped (it may hold the guest's writes): the
+     VM is **held** — not started or defined on the bare disk, and the
+     operation refused — with a `disk.pit_overlay_held` event and a
+     `replication.pit_overlay_held` notification naming both files, and
+     `lv inspect <vm>` shows it as `pitOverlayHeld`. An admin decides with
+     `lv resolve-pit-overlay <vm> <disk> --commit` (write the overlay into the
+     disk) or `--discard` (delete it and its writes), each only with
+     `--confirm`; without it the command prints the two files and the
+     binding. It needs the VM stopped, is admin only, and is audited.
+
+   When a disk is deleted (`lv rm`, rebuild), its overlay and sidecar are
+   deleted with it. An import that finds an overlay where its new disk goes
+   renames it `.<disk file>.lv-pit.orphan-<time>` (never over an earlier one)
+   and reports it (`disk.pit_overlay_set_aside`); inspect it and delete it.
+   The start-up sweep waits until the host's replica is trusted (caught up
+   with a peer, or the cluster's only host), and on a shared pool touches only
+   disks of VMs this host owns and has defined (others are left to their owner
+   and reported as `disk.pit_overlay_left`).
 4. **Last resort:** when neither 2 nor 3 can be made, the copy is what earlier
    builds always made — `qemu-img convert -U` reading the image the guest has
    open. That copy is **not point-in-time** (it is smeared over however long it

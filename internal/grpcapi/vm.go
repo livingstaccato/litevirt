@@ -2195,6 +2195,14 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		}
 	}
 
+	// A disk the delete keeps (--keep-disks, delete_with_vm=false, or one
+	// another VM references) must not be left without a point-in-time
+	// overlay's writes: settle it first, while the domain can still be
+	// committed live. One that cannot be verified refuses the delete.
+	if err := s.settleKeptPITOverlays(ctx, vm, req.KeepDisks); err != nil {
+		return nil, err
+	}
+
 	// Stop it. Ask libvirt, not only the row: an ACTIVE domain (running, or
 	// paused — which the row does not call "running") survives the undefine
 	// below as a transient domain that keeps running, and the disks would then be
@@ -2513,6 +2521,8 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 	}
 	// Why automatic failover is holding the VM down, if it is.
 	pbVM.FailoverHeld = s.failoverHeldReason(ctx, vm)
+	// Why the VM is held on a point-in-time overlay, if it is.
+	pbVM.PitOverlayHeld = s.pitOverlayHeldReason(ctx, vm.Name)
 
 	// Interfaces — run IP discovery fallback if IP is unknown.
 	ifaces, _ := corrosion.GetVMInterfaces(ctx, s.db, name)

@@ -481,6 +481,10 @@ message VM {
     // point-in-time), with the command that promotes it by hand. Empty when
     // nothing is held. Set by InspectVM/GetVM.
     string                         failover_held = 17;
+    // pit_overlay_held says why the VM is held on a point-in-time copy
+    // overlay that could not be verified against its disk, with the admin
+    // command that resolves it (lv resolve-pit-overlay). Empty otherwise.
+    string                         pit_overlay_held = 18;
 }
 
 message VMInterface {

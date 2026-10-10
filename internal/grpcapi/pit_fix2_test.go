@@ -39,8 +39,8 @@ func TestDeleteDisk_TakesItsOverlayWithIt(t *testing.T) {
 }
 
 // N1(c): an overlay whose base was written since it was taken (a build that
-// knows nothing of overlays restarted the VM on the base) is set aside —
-// kept, named in an event — and never committed over the newer data.
+// knows nothing of overlays restarted the VM on the base) is never committed
+// over the newer data, nor dropped: the VM is held, named in an event.
 //
 // Mutation "binding ignored": healPITOverlay's offline branch commits without
 // pitoverlay.Check (CommitOffline's check removed) — red.
@@ -55,18 +55,17 @@ func TestHeal_ABaseWrittenSinceIsNeverOverwritten(t *testing.T) {
 		t.Fatalf("write the base: %v %s", err, out)
 	}
 
-	if err := runRepl(t, s, time.Now()); err != nil {
-		t.Fatalf("RunReplication: %v", err)
+	if err := runRepl(t, s, time.Now()); err == nil {
+		t.Fatal("a copy went on with an overlay it could not verify")
 	}
 	if holdsTheWindowsWrite(t, live) {
 		t.Fatal("the stale overlay was committed over a base written since")
 	}
-	aside, _ := filepath.Glob(pitoverlay.Path(live) + ".orphan-*")
-	if len(aside) == 0 {
-		t.Fatal("the stale overlay was not kept")
+	if !pitoverlay.Present(live) {
+		t.Fatal("the held overlay was moved or removed")
 	}
-	if !slices.Contains(pitEventTypes(t, s, "web"), "disk.pit_overlay_set_aside") {
-		t.Errorf("no set-aside event: %v", pitEventTypes(t, s, "web"))
+	if !slices.Contains(pitEventTypes(t, s, "web"), vmEventPITOverlayHeld) {
+		t.Errorf("no hold event: %v", pitEventTypes(t, s, "web"))
 	}
 }
 

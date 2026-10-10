@@ -111,7 +111,9 @@ type Reconciler struct {
 	// the certificate check and the proof source. nil verifier settles nothing.
 	settleVerify SettleVerifier
 	pitReport    func(ctx context.Context, vm, detail string)
-	settleProofs func(ctx context.Context, c *corrosion.Client, kind, name string) ([]corrosion.ProofRecord, error)
+	// pitHeldReported: the holds already reported (reportPITHeldOnce).
+	pitHeldReported sync.Map
+	settleProofs    func(ctx context.Context, c *corrosion.Client, kind, name string) ([]corrosion.ProofRecord, error)
 	// settleDeclines rate-limits the decline report (settle_declined.go).
 	settleDeclines   settleDeclineTracker
 	onVMStarted      func(ctx context.Context, stackName string)       // optional: called after VM starts (LB refresh)
@@ -1725,8 +1727,8 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 // the disk configs the caller resolved: the cloud-init ISO, the networks
 // (provisioned here), firmware and resources. On failure it returns "" with
 // whether a later attempt may succeed and what failed.
-// SetPITOverlayReporter wires the event and notification of a point-in-time
-// overlay the define path set aside (grpcapi.Server.ReportPITOverlaySetAside).
+// SetPITOverlayReporter wires the event and notification of a VM the define
+// path holds on an overlay it cannot verify (grpcapi.Server.ReportPITOverlayHeld).
 func (r *Reconciler) SetPITOverlayReporter(fn func(ctx context.Context, vm, detail string)) {
 	r.pitReport = fn
 }
@@ -1736,16 +1738,22 @@ func (r *Reconciler) SetPITOverlayReporter(fn func(ctx context.Context, vm, deta
 // failed, or whose host died mid-window, left the guest's newest writes in it
 // — on a shared pool it travels here with the disk — and the definition names
 // only the disk. An overlay bound to this VM's disk as the file is now is
-// committed offline (no -U: a qemu still holding it fails this closed);
-// any other — another VM's, or one the disk was written past — is set aside,
-// kept and reported, never committed over newer data. Nothing replicated
-// records an overlay; its fixed name beside the disk is what finds it. A
-// failure is the start's failure, retried.
+// committed offline (no -U: a qemu still holding it fails this closed). Any
+// other cannot be verified, so the VM is HELD: not defined or started on the
+// bare disk, which would drop the overlay's writes; an admin resolves it
+// (lv resolve-pit-overlay). Nothing replicated records an overlay; its fixed
+// name beside the disk is what finds it. A failure is the start's failure,
+// retried; a hold is reported once per overlay.
 func (r *Reconciler) settlePITOverlays(ctx context.Context, vm corrosion.VMRecord, spec *pb.VMSpec, diskConfigs []lv.DiskConfig) string {
 	for _, dc := range diskConfigs {
 		owner := pitoverlay.Owner{VM: vm.Name, VMUUID: spec.GetUuid(), Disk: dc.Name}
-		out, aside, err := pitoverlay.Settle(ctx, dc.Path, owner, time.Now().UTC().Format("20060102-150405"))
+		out, err := pitoverlay.Settle(ctx, dc.Path, owner)
 		switch {
+		case out == pitoverlay.Held:
+			detail := fmt.Sprintf("%s: the point-in-time overlay %s may hold %s's newest writes and cannot be verified against its disk %s (%v). The VM is held — not started on the bare disk — until an admin decides: lv resolve-pit-overlay %s %s --commit|--discard --confirm",
+				dc.Name, pitoverlay.Path(dc.Path), vm.Name, dc.Path, err, vm.Name, dc.Name)
+			r.reportPITHeldOnce(ctx, vm.Name, dc.Path, detail)
+			return detail
 		case err != nil:
 			slog.Error("reconciler: a point-in-time overlay holds writes the disk lacks and could not be committed; not defining the VM",
 				"vm", vm.Name, "disk", dc.Name, "overlay", pitoverlay.Path(dc.Path), "error", err)
@@ -1753,21 +1761,27 @@ func (r *Reconciler) settlePITOverlays(ctx context.Context, vm corrosion.VMRecor
 		case out == pitoverlay.Committed:
 			slog.Warn("reconciler: committed a point-in-time overlay into the disk before defining the VM",
 				"vm", vm.Name, "disk", dc.Name, "overlay", pitoverlay.Path(dc.Path))
-		case out == pitoverlay.SetAsideO:
-			detail := fmt.Sprintf("%s: the point-in-time overlay %s does not belong to %s as it is now, so it was not committed (that could write stale blocks over newer data); it was kept as %s for an operator to inspect",
-				dc.Name, pitoverlay.Path(dc.Path), dc.Path, aside)
-			if r.pitReport != nil {
-				r.pitReport(ctx, vm.Name, detail)
-			} else {
-				slog.Error("reconciler: "+detail, "vm", vm.Name)
-				_ = corrosion.InsertVMEvent(ctx, r.db, corrosion.VMEventRecord{
-					ID: randid.New(), VMName: vm.Name, HostName: r.hostName, Type: "disk.pit_overlay_set_aside",
-					Result: "error", Severity: "error", Detail: detail, Username: "reconciler",
-				})
-			}
 		}
 	}
 	return ""
+}
+
+// reportPITHeldOnce reports a hold once per (VM, disk) for as long as this
+// process runs: the start is retried every pass.
+func (r *Reconciler) reportPITHeldOnce(ctx context.Context, vm, disk, detail string) {
+	key := vm + "\x00" + disk
+	if _, done := r.pitHeldReported.LoadOrStore(key, true); done {
+		return
+	}
+	if r.pitReport != nil {
+		r.pitReport(ctx, vm, detail)
+		return
+	}
+	slog.Error("reconciler: "+detail, "vm", vm)
+	_ = corrosion.InsertVMEvent(ctx, r.db, corrosion.VMEventRecord{
+		ID: randid.New(), VMName: vm, HostName: r.hostName, Type: "disk.pit_overlay_held",
+		Result: "error", Severity: "error", Detail: detail, Username: "reconciler",
+	})
 }
 
 func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, spec *pb.VMSpec, diskConfigs []lv.DiskConfig) (domXML string, retryable bool, failure string) {

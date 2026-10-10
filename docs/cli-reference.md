@@ -519,6 +519,7 @@ path. See `docs/storage.md`, "Installer ISOs".
 ```bash
 lv move-volume <vm> <disk> <target-pool>       # Move a disk between pools (live or offline)
 lv replicate-volume <vm> <disk> <target-pool>  # Point-in-time copy: plain if shut off, else a backup session or external snapshot; a last-resort -U copy is reported NOT point-in-time
+lv resolve-pit-overlay <vm> <disk> --commit|--discard [--confirm]  # Admin: decide a point-in-time overlay that holds a VM (see backups.md); without --confirm only reports
 
 # Migrate every VM's volumes in a stack to a different pool (rolling, online):
 lv stack migrate-volumes <stack> --to <pool>

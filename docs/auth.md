@@ -56,13 +56,14 @@ Under `auth.realms[].ldap:`. `url` and `user_base_dn` are required; prefer
 | `user_filter` | LDAP filter selecting user entries (e.g. `(objectClass=person)`). |
 | `group_base_dn` | Subtree searched for groups. |
 | `group_filter` | LDAP filter selecting group entries. |
-| `user_name_attr` | Attribute read as the login/subject name. |
+| `user_login_attr` | Attribute whose value is the account's login name, read back from the directory entry and used as the litevirt account name. Default: the attributes `user_filter` matches the typed name against (`(uid=%s)` → `uid`), then the entry DN's RDN. The typed name is never used: a directory matches case, width and space variants of a name, and each would otherwise be a separate account. An entry with no login value is refused. |
+| `user_name_attr` | Attribute read as the display name. |
 | `user_mail_attr` | Attribute read as the email address. |
 | `user_group_attr` | Attribute on the user entry listing group membership (typically `memberOf`). |
 | `group_name_attr` | Attribute on a group entry holding its name. |
 | `skip_tls_verify` | Disables certificate verification on the LDAPS connection. **Leave off outside a lab** — it makes directory traffic, including bind credentials, trivially interceptable. |
 
-As with OIDC, changing `user_name_attr` or `group_name_attr` re-keys principal
+As with OIDC, changing `user_login_attr` or `group_name_attr` re-keys principal
 ids and invalidates existing role bindings.
 
 ## Path-based RBAC
@@ -101,7 +102,7 @@ Built-in roles (seeded by `auth.SeedBuiltinRoles`):
 | BackupOperator | `backup.*`, `snapshot.*`, `vm.read` |
 | NetworkAdmin | `network.*`, `lb.*`, `sg.*` |
 | PermissionAdmin | `perm.modify` (delegated administration; see below) |
-| NoAccess | (none) |
+| NoAccess | (none): grants nothing and denies nothing (bindings are union-only); it keeps a principal bound, off its legacy-role fallback |
 
 `--allow-overcommit` (CreateVM/StartVM/UpdateVM) additionally requires
 `vm.overcommit`: bypassing the host capacity check is an operator-level
@@ -394,7 +395,15 @@ as `ldap:crop` covers nothing).
   only the password of an account with no factor could otherwise enroll their
   own factor and lock the real user out. `lv 2fa enroll-code <user>` mints a
   single-use code (shown once, stored as a SHA-256, valid for `--ttl`, at most
-  24 hours; issuing another replaces it), handed over out of band. The policy
+  24 hours; issuing another replaces it), handed over out of band. The code is
+  **bound to the node that issued it**: it is checked and spent there alone, in
+  one guarded write, so it is single-use cluster-wide even across a partition.
+  Used on any other node it is refused with a message naming the issuing node
+  — log in through that node, or have an admin issue a new code where you are.
+  A disable, a delete or a re-create of the account, or an admin enrolling a
+  factor for it, voids an outstanding code. A WebAuthn enrollment verifies the
+  attestation before it spends the code or ends the session, so a failed
+  ceremony leaves both. The policy
   can instead allow self-enrollment until a deadline (`--allow-self-enroll
   --enroll-by <RFC3339>`); after the deadline a code is needed again, and
   setting the policy without the flag closes the window. Enrolling ends the
@@ -421,7 +430,9 @@ repopulated yet — refuses the login, request or enrollment rather than guess.
 with a code. A user who lost their factor: an admin removes it (`lv 2fa
 disable --user <name> --method totp`) and issues a code (`lv 2fa enroll-code
 <name>`). The **only** admin who lost their factor and recovery codes: as root
-on a node, `lv user reset-admin --clear-2fa` removes the `admin` account's
+on a node that is not in WAL quarantine (a quarantined node accepts local root
+but refuses every replicated write, so no account change can be made on it),
+`lv user reset-admin --clear-2fa` removes the `admin` account's
 factors and recovery codes, gives it a new password, and prints an enrollment
 code; log in, `lv 2fa enroll-totp --code <code>`, and log in again with the
 new factor. As root on a node, `lv` with no stored session reaches the local
@@ -461,9 +472,17 @@ someone who presents the account's credentials.
 Each attribute is its own replicated row (`user_lifecycle`), so a disable and
 an expiry change made on two nodes never undo each other. A value a node
 cannot read is treated as disabled. A disable or an expiry also records the
-instant before which no session of the account is honoured again, so a
-session minted on another node before the disable stays dead after a
-re-enable even if its row arrived late. Deleting a user keeps its disable:
+instant before which no session of the account is honoured again — and so
+does every later lifecycle change: a re-enable, an expiry set, changed or
+cleared, a re-create. The comparison allows for clock skew in the refusing
+direction (`SessionCutoffSkewMargin`, 5 s, the failover coordinator's skew
+margin): a session created up to 5 s after a change is refused too, and a
+login in those 5 s is told to retry. So a session minted before a disable —
+on another node, by a clock up to 5 s ahead, or on a node the disable had not
+reached yet — stays dead after the re-enable, and an expiry that passed and is
+then extended revives nothing. A clock more than 5 s off is the LWW skew
+guard's to report; such a node can still mint a session that survives a
+re-enable. Deleting a user keeps its disable:
 the admin floor never brings back a disabled admin, and a directory login that
 re-creates a deleted, disabled LDAP or OIDC user's account finds it still
 disabled. An explicit `lv user create` starts the name afresh (enabled, and
@@ -476,20 +495,37 @@ cut off from the cluster keeps accepting the account for as long as it is cut
 off. Expiry is compared with each node's wall clock, so a node whose clock runs
 S seconds slow accepts an expired account for S seconds (the LWW skew guard
 bounds how far a clock may drift); `lv user ls` STATUS is the answering
-daemon's verdict by its clock. **Open streams** — consoles, VNC, exec, event
-watches, and the web UI websockets and REST SSE built on them — are re-checked
-while open: one authenticated by a session or API token ends within 5 seconds
-of a disable, an expiry, a session or token revoke, or a policy change reaching
-the node, and at once on the node where the change was made.
+daemon's verdict by its clock. **Open streams** — serial consoles, VNC, log
+follows, event watches, and the web UI websockets and REST SSE built on them —
+are re-checked while open: one authenticated by a session or API token ends
+within 5 seconds of a disable, an expiry, a delete, a session or token revoke,
+or a policy change reaching the node (a recheck every 3 s, each allowed 2 s;
+a recheck that fails or does not finish in time ends the stream), and at once
+on the node where the change was made. The console and VNC handlers close the
+PTY or VNC socket themselves; any other handler still blocked 2 s after the
+cut has its RPC ended. Exec (`lv exec`, the UI exec page) is one RPC per
+command, each authenticated on its own. Deleting a user also revokes its
+sessions and API tokens.
 
 Admin only, audited as `user.account`. Refused for the cluster's last admin
 that is enabled with no expiry — `lv user delete` applies the same rule — and
 until `login_policy_v1` has latched on every host. Two admins restricting each
 other on two nodes at once can still race past that guard; every node then
 raises the `no_unrestricted_admin` health condition (critical), and the floor
-does NOT re-enable either admin itself. Recovery, as root on a node: `lv user
-reset-admin` re-enables the `admin` account; for an admin with another name,
-`sudo lv user enable <name>` with root's credentials.json moved aside.
+does NOT re-enable either admin itself. Recovery, as root on a node that is
+not in WAL quarantine: `lv user reset-admin` re-enables the `admin` account;
+for an admin with another name, `sudo lv user enable <name>` with root's
+credentials.json moved aside. In a whole-fleet rollback below a latched token
+every node is quarantined, and no account change is possible anywhere until
+the fleet is upgraded again; local root still reaches every running daemon.
+
+**Duplicate spellings.** Two accounts whose names differ only in case or
+surrounding spaces (left over from before names were normalized, or created
+on two nodes at once) are never merged: every lookup of either — a login, a
+session, an API token, `lv user`, reset-admin — refuses, naming both. Remove
+one with `lv user delete --exact <name as stored>` (admin, audited as an exact
+delete). A deleted account under a variant spelling is brought back under its
+own name by a directory login, so it keeps its disable.
 
 **The one credential a disable cannot reach** is the distributable `lv-cli`
 client certificate: it authenticates as the cluster admin with no user behind

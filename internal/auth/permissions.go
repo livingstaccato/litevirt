@@ -629,8 +629,10 @@ var BuiltinRoles = []BuiltinRole{
 			"Bind it beside the roles to delegate, e.g. Operator + PermissionAdmin on /projects/acme.",
 	},
 	{
-		Name:        "NoAccess",
-		Verbs:       []string{},
-		Description: "Explicit deny-all. Useful for binding to revoked groups.",
+		Name:  "NoAccess",
+		Verbs: []string{},
+		Description: "Grants nothing. Bindings are union-only, so it cannot deny what another binding grants; " +
+			"what it does is keep a principal bound, and so off its cluster-wide legacy-role fallback. " +
+			"A delegated revoke leaves one as a sentinel.",
 	},
 }

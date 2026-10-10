@@ -148,6 +148,49 @@ func GetUser(ctx context.Context, c *Client, username string) (*UserRecord, erro
 	}, nil
 }
 
+// GetUserExact is GetUser matching the name as stored, byte for byte, with no
+// normalization: only for an operator removing one of two accounts that
+// normalize alike (`lv user delete --exact`), which GetUser refuses.
+func GetUserExact(ctx context.Context, c *Client, username string) (*UserRecord, error) {
+	rows, err := c.Query(ctx,
+		`SELECT u.username, u.role, u.password_hash, COALESCE(u.realm, 'local') AS realm, u.created_at,
+		        u.updated_at, c.username AS cred_key, c.password_hash AS cred_val, c.updated_at AS cred_ts
+		 FROM users u LEFT JOIN user_credentials c ON c.username = u.username AND c.deleted_at IS NULL
+		 WHERE u.username = ? AND u.deleted_at IS NULL`, username)
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	r := rows[0]
+	return &UserRecord{
+		Username:     r.String("username"),
+		Role:         r.String("role"),
+		PasswordHash: resolveCredential(r.String("cred_key") != "", r.String("cred_val"), r.String("password_hash")),
+		Realm:        r.String("realm"),
+		CreatedAt:    r.String("created_at"),
+	}, nil
+}
+
+// DeletedVariantOf returns the stored name of the newest tombstoned account
+// whose name normalizes like username, or "" when there is none. A directory
+// login re-creates a deleted shadow under THAT name, so the account comes
+// back with its own lifecycle — a disabled legacy `Bob` stays disabled when
+// `bob` logs in again (rereview m-d).
+func DeletedVariantOf(ctx context.Context, c *Client, username string) (string, error) {
+	rows, err := c.Query(ctx,
+		`SELECT u.username FROM users u WHERE `+usernameNormSQL+` = ? AND u.deleted_at IS NOT NULL
+		 ORDER BY u.deleted_at DESC, u.username ASC LIMIT 1`, NormalizeUsername(username))
+	if err != nil {
+		return "", err
+	}
+	if len(rows) == 0 {
+		return "", nil
+	}
+	return rows[0].String("username"), nil
+}
+
 // UsersEverExisted reports whether this node's local database carries any user
 // row at all, tombstoned or not.
 //
@@ -241,6 +284,10 @@ func DeleteUser(ctx context.Context, c *Client, username string) error {
 	stmts = append(stmts, Statement{
 		SQL:    `UPDATE role_bindings SET deleted_at = ?, updated_at = ? WHERE (principal = ? OR principal = ?) AND deleted_at IS NULL`,
 		Params: []interface{}{marker, now, barePrincipal, localPrincipal}})
+	if c.MayWriteLoginPolicy() {
+		// A deleted account's first-enrollment code goes with it (N3).
+		stmts = append(stmts, invalidateEnrollmentCodeStatement(username, now))
+	}
 	// The account's lifecycle (user_lifecycle) is deliberately LEFT as it is
 	// (t1-auth-review m3): a disabled account that is deleted must not come
 	// back enabled when the admin floor reinstates it or a directory login

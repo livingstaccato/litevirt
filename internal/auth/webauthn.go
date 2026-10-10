@@ -100,29 +100,51 @@ func (s *WebAuthnService) BeginRegistration(ctx context.Context, username string
 // FinishRegistration validates the browser's signed attestation and
 // persists the resulting credential under user_2fa.
 func (s *WebAuthnService) FinishRegistration(ctx context.Context, username string, attestation []byte) error {
-	sess := s.takeSession(username)
-	if sess == nil {
-		return errors.New("no in-flight registration session")
-	}
-	user, err := s.loadUser(ctx, username)
+	cred, err := s.VerifyRegistration(ctx, username, attestation)
 	if err != nil {
 		return err
 	}
+	return s.StoreRegistration(ctx, username, cred)
+}
+
+// VerifiedCredential is an attestation VerifyRegistration accepted, not yet
+// stored.
+type VerifiedCredential struct{ cred *wapkg.Credential }
+
+// VerifyRegistration validates the browser's signed attestation and returns
+// the credential without storing it, so a caller can do what must happen
+// only for a GOOD attestation — end an enrollment-only session, spend an
+// enrollment code — in between (rereview N3). It consumes the in-flight
+// challenge either way.
+func (s *WebAuthnService) VerifyRegistration(ctx context.Context, username string, attestation []byte) (*VerifiedCredential, error) {
+	sess := s.takeSession(username)
+	if sess == nil {
+		return nil, errors.New("no in-flight registration session")
+	}
+	user, err := s.loadUser(ctx, username)
+	if err != nil {
+		return nil, err
+	}
 	parsed, err := protocol.ParseCredentialCreationResponseBody(bytesReader(attestation))
 	if err != nil {
-		return fmt.Errorf("parse attestation: %w", err)
+		return nil, fmt.Errorf("parse attestation: %w", err)
 	}
 	cred, err := s.engine.CreateCredential(user, *sess, parsed)
 	if err != nil {
-		return fmt.Errorf("verify attestation: %w", err)
+		return nil, fmt.Errorf("verify attestation: %w", err)
 	}
-	blob, err := json.Marshal(cred)
+	return &VerifiedCredential{cred: cred}, nil
+}
+
+// StoreRegistration persists a credential VerifyRegistration accepted.
+func (s *WebAuthnService) StoreRegistration(ctx context.Context, username string, v *VerifiedCredential) error {
+	blob, err := json.Marshal(v.cred)
 	if err != nil {
 		return err
 	}
 	return corrosion.InsertUser2FA(ctx, s.db, corrosion.User2FARecord{
 		Username: username, Method: "webauthn",
-		Secret: string(blob), Label: credLabel(cred.ID),
+		Secret: string(blob), Label: credLabel(v.cred.ID),
 	})
 }
 

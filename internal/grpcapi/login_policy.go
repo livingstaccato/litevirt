@@ -95,6 +95,21 @@ func (s *Server) refuseUserBearersInQuarantine() error {
 	return nil
 }
 
+// refuseAmbiguousAccount refuses an API token whose account is one of two
+// that normalize alike. A token names its account by exact stored name and so
+// never passed through GetUser's duplicate refusal; a token of a legacy `ALICE`
+// shadow would otherwise keep working beside a disabled `alice` (rereview m-d).
+func (s *Server) refuseAmbiguousAccount(ctx context.Context, username string) error {
+	if _, err := corrosion.GetUser(ctx, s.db, username); err != nil {
+		if errors.Is(err, corrosion.ErrAmbiguousUsername) {
+			return status.Errorf(codes.Unauthenticated, "%v (an administrator must remove one: "+
+				"`lv user delete --exact <name>`)", err)
+		}
+		return status.Errorf(codes.Unavailable, "could not confirm account %q: %v", username, err)
+	}
+	return nil
+}
+
 // refuseInactiveAccount fails unless username's account may authenticate now.
 // username must be the name as stored (corrosion.UserRecord.Username). A read
 // that fails refuses too (Unavailable, retryable): an unreadable lifecycle
@@ -224,7 +239,12 @@ func (s *Server) firstEnrollment(ctx context.Context, code string, commit bool) 
 	}
 	selfOK := p.SelfEnrollOpen(time.Now().UTC())
 	if !selfOK {
-		if err := corrosion.CheckEnrollmentCode(ctx, s.db, user, code); err != nil {
+		if err := corrosion.CheckEnrollmentCode(ctx, s.db, user, code, s.hostName); err != nil {
+			var elsewhere corrosion.ErrEnrollmentCodeElsewhere
+			if errors.As(err, &elsewhere) {
+				s.audit(ctx, "2fa.enroll", user, "enrollment code issued on "+elsewhere.Node, "denied")
+				return false, status.Error(codes.FailedPrecondition, err.Error())
+			}
 			s.audit(ctx, "2fa.enroll", user, "first factor without a valid enrollment code", "denied")
 			return false, status.Error(codes.PermissionDenied,
 				"enrolling your first factor needs an enrollment code from an administrator "+
@@ -242,7 +262,7 @@ func (s *Server) firstEnrollment(ctx context.Context, code string, commit bool) 
 		s.kickStreams()
 	}
 	if !selfOK {
-		if err := corrosion.ConsumeEnrollmentCode(ctx, s.db, user, code); err != nil {
+		if err := corrosion.ConsumeEnrollmentCode(ctx, s.db, user, code, s.hostName); err != nil {
 			return false, status.Error(codes.PermissionDenied,
 				"the enrollment code could not be used (used elsewhere, or expired): "+err.Error())
 		}
@@ -383,6 +403,26 @@ func (s *Server) SetUserAccount(ctx context.Context, req *pb.SetUserAccountReque
 		out.CreatedAt = timestamppb.New(t)
 	}
 	return out, nil
+}
+
+// revokeUserTokens revokes every live API token of username and returns how
+// many. Best effort: a deleted account's tokens are refused at authentication
+// anyway (ValidateToken and TokenLive join the live users row).
+func (s *Server) revokeUserTokens(ctx context.Context, username string) int {
+	rows, err := s.db.Query(ctx, `SELECT id FROM tokens WHERE username = ? AND deleted_at IS NULL`, username)
+	if err != nil {
+		slog.Warn("could not list API tokens to revoke them", "username", username, "error", err)
+		return 0
+	}
+	n := 0
+	for _, r := range rows {
+		if err := corrosion.RevokeToken(ctx, s.db, r.String("id")); err != nil {
+			slog.Warn("could not revoke an API token", "username", username, "error", err)
+			continue
+		}
+		n++
+	}
+	return n
 }
 
 // accountStatus is User.status: "active", "disabled" or "expired", judged by
@@ -564,13 +604,13 @@ func (s *Server) IssueEnrollmentCode(ctx context.Context, req *pb.IssueEnrollmen
 	if user == nil {
 		return nil, status.Errorf(codes.NotFound, "user %q not found", req.GetUsername())
 	}
-	code, exp, err := corrosion.IssueEnrollmentCode(ctx, s.db, user.Username, ttl, callerUsername(ctx))
+	code, exp, err := corrosion.IssueEnrollmentCode(ctx, s.db, user.Username, ttl, callerUsername(ctx), s.hostName)
 	if err != nil {
 		if errors.Is(err, corrosion.ErrLoginPolicyGateClosed) {
 			return nil, status.Error(codes.FailedPrecondition, err.Error())
 		}
 		return nil, status.Errorf(codes.Internal, "issue enrollment code: %v", err)
 	}
-	s.audit(ctx, "2fa.enroll_code", user.Username, "expires_at="+exp, "ok")
+	s.audit(ctx, "2fa.enroll_code", user.Username, "expires_at="+exp+" issued_on="+s.hostName, "ok")
 	return &pb.IssueEnrollmentCodeResponse{Code: code, ExpiresAt: exp}, nil
 }

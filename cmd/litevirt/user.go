@@ -148,13 +148,18 @@ func newUserListCmd() *cobra.Command {
 }
 
 func newUserDeleteCmd() *cobra.Command {
-	return &cobra.Command{
+	var exact bool
+	cmd := &cobra.Command{
 		Use:   "delete <username>",
-		Short: "Delete a user",
-		Args:  cobra.ExactArgs(1),
+		Short: "Delete a user (its sessions and API tokens are revoked)",
+		Long: `Delete a user. Its sessions and API tokens are revoked and its open streams
+end. Names are matched ignoring case and surrounding spaces; two accounts that
+differ only that way are refused by every lookup — remove one with --exact,
+which matches the name exactly as stored (admin, audited).`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
-				_, err := c.DeleteUser(ctx, &pb.DeleteUserRequest{Username: args[0]})
+				_, err := c.DeleteUser(ctx, &pb.DeleteUserRequest{Username: args[0], Exact: exact})
 				if err != nil {
 					return err
 				}
@@ -163,6 +168,8 @@ func newUserDeleteCmd() *cobra.Command {
 			})
 		},
 	}
+	cmd.Flags().BoolVar(&exact, "exact", false, "match the name exactly as stored (to remove one of two case-duplicates)")
+	return cmd
 }
 
 func newTokenCreateCmd() *cobra.Command {

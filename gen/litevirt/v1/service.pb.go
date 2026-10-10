@@ -9666,9 +9666,13 @@ func (x *ListUsersResponse) GetUsers() []*User {
 	return nil
 }
 
+// exact: match username as stored, byte for byte, instead of by normalized
+// name — the way to remove one of two accounts that differ only in case or
+// surrounding spaces, which every normalized lookup refuses (admin, audited).
 type DeleteUserRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Username      string                 `protobuf:"bytes,1,opt,name=username,proto3" json:"username,omitempty"`
+	Exact         bool                   `protobuf:"varint,2,opt,name=exact,proto3" json:"exact,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -9708,6 +9712,13 @@ func (x *DeleteUserRequest) GetUsername() string {
 		return x.Username
 	}
 	return ""
+}
+
+func (x *DeleteUserRequest) GetExact() bool {
+	if x != nil {
+		return x.Exact
+	}
+	return false
 }
 
 type WhoamiResponse struct {
@@ -35712,9 +35723,10 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\bpassword\x18\x02 \x01(\tR\bpassword\x12\x12\n" +
 	"\x04role\x18\x03 \x01(\tR\x04role\"<\n" +
 	"\x11ListUsersResponse\x12'\n" +
-	"\x05users\x18\x01 \x03(\v2\x11.litevirt.v1.UserR\x05users\"/\n" +
+	"\x05users\x18\x01 \x03(\v2\x11.litevirt.v1.UserR\x05users\"E\n" +
 	"\x11DeleteUserRequest\x12\x1a\n" +
-	"\busername\x18\x01 \x01(\tR\busername\"\xad\x01\n" +
+	"\busername\x18\x01 \x01(\tR\busername\x12\x14\n" +
+	"\x05exact\x18\x02 \x01(\bR\x05exact\"\xad\x01\n" +
 	"\x0eWhoamiResponse\x12\x1a\n" +
 	"\busername\x18\x01 \x01(\tR\busername\x12\x12\n" +
 	"\x04role\x18\x02 \x01(\tR\x04role\x12\x14\n" +

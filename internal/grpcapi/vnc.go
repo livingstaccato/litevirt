@@ -117,7 +117,15 @@ func (s *Server) ProxyVNC(stream grpc.BidiStreamingServer[pb.VNCData, pb.VNCData
 		}
 	}()
 
-	err = <-errCh
+	// As ConsoleVM: a cut credential ends the stream's context, and the VNC
+	// socket is closed here so neither direction outlives it.
+	select {
+	case err = <-errCh:
+	case <-ctx.Done():
+		_ = conn.Close()
+		slog.Info("VNC proxy session ended: its stream was cut", "vm", vmName)
+		return streamEndError(ctx)
+	}
 	slog.Info("VNC proxy session ended", "vm", vmName)
 	if err != nil {
 		return status.Errorf(codes.Internal, "VNC proxy error: %v", err)

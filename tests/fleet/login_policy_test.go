@@ -6,6 +6,7 @@ package fleet
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"google.golang.org/grpc/codes"
@@ -155,21 +156,22 @@ func TestFleet_TwoFactorPolicySetOnOneNodeEnforcedOnAnother(t *testing.T) {
 	if _, err := bob.ListHosts(ctx, &pb.ListHostsRequest{}); status.Code(err) != codes.PermissionDenied {
 		t.Fatalf("ListHosts from an enrollment-only session: %v, want PermissionDenied", err)
 	}
-	// A first factor needs an admin-issued code (review I5); issued on
-	// node-0, used on node-2 once it has replicated.
+	// A first factor needs an admin-issued code (review I5), and a code is
+	// spent only on the node that issued it (rereview N3): one issued on
+	// node-0 is refused on node-2, naming node-0, once it has replicated.
 	code, err := c.SelfClient(a).IssueEnrollmentCode(ctx, &pb.IssueEnrollmentCodeRequest{Username: "bob"})
 	if err != nil {
 		t.Fatalf("IssueEnrollmentCode: %v", err)
 	}
-	var enr *pb.EnrollTOTPResponse
-	eventually(t, convergeTimeout, "the enrollment code to work on "+cc.Name, func() bool {
-		r, err := bob.EnrollTOTP(ctx, &pb.EnrollTOTPRequest{Label: "phone", EnrollmentCode: code.GetCode()})
-		if err != nil {
-			return false
-		}
-		enr = r
-		return true
+	eventually(t, convergeTimeout, "node-0's code refused on "+cc.Name+" naming node-0", func() bool {
+		_, err := bob.EnrollTOTP(ctx, &pb.EnrollTOTPRequest{Label: "phone", EnrollmentCode: code.GetCode()})
+		return status.Code(err) == codes.FailedPrecondition && strings.Contains(err.Error(), a.Name)
 	})
+	here, err := c.SelfClient(cc).IssueEnrollmentCode(ctx, &pb.IssueEnrollmentCodeRequest{Username: "bob"})
+	if err != nil {
+		t.Fatalf("IssueEnrollmentCode on %s: %v", cc.Name, err)
+	}
+	enr, err := bob.EnrollTOTP(ctx, &pb.EnrollTOTPRequest{Label: "phone", EnrollmentCode: here.GetCode()})
 	if err != nil || !enr.GetSessionEnded() {
 		t.Fatalf("EnrollTOTP from the enrollment-only session: ended=%v err=%v", enr.GetSessionEnded(), err)
 	}

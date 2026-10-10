@@ -86,6 +86,12 @@ func (s *Server) EnrollTOTP(ctx context.Context, req *pb.EnrollTOTPRequest) (*pb
 	s.audit(ctx, "2fa.enroll", target, "method=totp label="+req.Label, "ok")
 	if first {
 		s.noteFirstFactor(ctx, "totp")
+	} else if target != caller {
+		// An administrator enrolled a factor for the account: an outstanding
+		// first-enrollment code has nothing left to do (rereview m-b).
+		if err := corrosion.InvalidateEnrollmentCode(ctx, s.db, target); err != nil {
+			slog.Warn("could not void the enrollment code of an account an admin enrolled", "user", target, "error", err)
+		}
 	}
 	return &pb.EnrollTOTPResponse{
 		OtpauthUrl:    res.OtpAuthURL,

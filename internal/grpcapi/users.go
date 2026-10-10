@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"strings"
@@ -223,8 +224,16 @@ func (s *Server) mintSession(ctx context.Context, username, realm, clientIP, use
 	if err := s.refuseUserBearersInQuarantine(); err != nil {
 		return "", "", "", err
 	}
-	if err := s.refuseInactiveAccount(ctx, user.Username); err != nil {
-		return "", "", "", err
+	life, lerr := s.accountLifecycle(ctx, user.Username)
+	if lerr != nil {
+		return "", "", "", lerr
+	}
+	// A session minted inside the skew margin after a lifecycle change would
+	// be refused on its first use (corrosion.SessionCutoffSkewMargin); say so
+	// now instead of handing out a dead bearer.
+	if life.SessionPredates(time.Now().UTC().Format(time.RFC3339)) {
+		return "", "", "", status.Errorf(codes.Unavailable,
+			"the account was changed moments ago; log in again in %s", corrosion.SessionCutoffSkewMargin)
 	}
 	username = user.Username
 	id, ierr := newSessionID()
@@ -478,7 +487,18 @@ func (s *Server) DeleteUser(ctx context.Context, req *pb.DeleteUserRequest) (*em
 	// A lookup that FAILS is not a report that the user is harmless. Falling
 	// through on an unreadable database would skip the guard in exactly the
 	// conditions where its answer matters most.
-	target, err := corrosion.GetUser(ctx, s.db, req.Username)
+	//
+	// Exact (`lv user delete --exact`) names the account as stored, byte for
+	// byte: the one way to remove one of two accounts that differ only in case
+	// or surrounding spaces, which every normalized lookup refuses (rereview
+	// m-d). It is audited as such.
+	var target *corrosion.UserRecord
+	var err error
+	if req.GetExact() {
+		target, err = corrosion.GetUserExact(ctx, s.db, req.Username)
+	} else {
+		target, err = corrosion.GetUser(ctx, s.db, req.Username)
+	}
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "look up user %q: %v", req.Username, err)
 	}
@@ -508,6 +528,12 @@ func (s *Server) DeleteUser(ctx context.Context, req *pb.DeleteUserRequest) (*em
 	if err := corrosion.DeleteUser(ctx, s.db, name); err != nil {
 		return nil, status.Errorf(codes.Internal, "delete user: %v", err)
 	}
+	// A deleted account's credentials end with it, as a disable's do
+	// (rereview N2): its sessions and API tokens are revoked — so a floor
+	// reinstatement or a re-create brings none of them back — and its open
+	// streams are re-checked now and cut.
+	ended := s.revokeUserSessions(ctx, name)
+	revokedTokens := s.revokeUserTokens(ctx, name)
 	s.kickStreams()
 	// The OtherLiveAdminExists check above and this delete are two independent
 	// operations against replicated state, and nothing makes that pair atomic
@@ -541,9 +567,13 @@ func (s *Server) DeleteUser(ctx context.Context, req *pb.DeleteUserRequest) (*em
 		s.authEngine.RemovePrincipal("user:" + name)
 		s.authEngine.RemovePrincipal("user:" + name + "@local")
 	}
-	slog.Info("user deleted", "username", req.Username)
-	s.publish("user.deleted", req.Username, "")
-	s.audit(ctx, "user.delete", req.Username, "", "ok")
+	slog.Info("user deleted", "username", name, "sessions_ended", ended, "tokens_revoked", revokedTokens)
+	s.publish("user.deleted", name, "")
+	detail := fmt.Sprintf("sessions_ended=%d tokens_revoked=%d", ended, revokedTokens)
+	if req.GetExact() {
+		detail += " exact"
+	}
+	s.audit(ctx, "user.delete", name, detail, "ok")
 	return &emptypb.Empty{}, nil
 }
 

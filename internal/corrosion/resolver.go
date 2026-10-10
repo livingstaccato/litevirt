@@ -408,6 +408,9 @@ var capabilityMap = map[string]tableResolver{
 	// admins disagreeing about whether an account may log in. Never coin-flip
 	// that into "enabled".
 	"user_lifecycle": {category: "policy", chain: policyChain()},
+	// v64 first-enrollment codes: a tie between two different codes is never
+	// coin-flipped into one of them.
+	"user_enrollment_codes": {category: "policy", chain: policyChain()},
 	// v56 credential tables: a tie naming two different secrets is never
 	// coin-flipped into one of them — tombstone wins, anything else differing
 	// goes to a human, same as the rest of this block.

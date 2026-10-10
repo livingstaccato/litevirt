@@ -162,7 +162,14 @@ func TestAccountDisable_EveryCredentialStopsWorking(t *testing.T) {
 	}
 	_, err = s.authenticate(bearerCtx(sess))
 	wantCode(t, "the session the disable ended, after re-enable", err, codes.Unauthenticated)
-	login(t, s, "bob", "bob-pw")
+	// A login inside the skew margin after the re-enable is told to retry
+	// (it would mint a session the cut-off refuses); after it, it works.
+	_, err = s.Login(context.Background(), &pb.LoginRequest{Username: "bob", Password: "bob-pw"})
+	wantCode(t, "a login inside the cut-off margin", err, codes.Unavailable)
+	time.Sleep(corrosion.SessionCutoffSkewMargin + 1100*time.Millisecond)
+	if _, err := s.authenticate(bearerCtx(login(t, s, "bob", "bob-pw").Token)); err != nil {
+		t.Fatalf("a session minted after the margin: %v", err)
+	}
 }
 
 // TestAccountDisable_RefusedBeforeTheSessionRevokeArrives: on a node the
@@ -227,7 +234,9 @@ func TestAccountExpiry_ExpiredRefusedFutureAllowed(t *testing.T) {
 	seedUser(t, s, "carol", "viewer", "carol-pw")
 	tok := mintAPIToken(t, s, "carol")
 
-	setExpiry(t, s, "carol", time.Now().Add(time.Hour).UTC().Format(time.RFC3339))
+	// A future expiry as a replica holds it (setting one through the RPC is
+	// also a session cut-off, tested in the fix-round tests).
+	writeLifecycle(t, s, "carol", corrosion.UserAttrExpiresAt, time.Now().Add(time.Hour).UTC().Format(time.RFC3339))
 	sess := login(t, s, "carol", "carol-pw").Token
 	if _, err := s.authenticate(bearerCtx(tok)); err != nil {
 		t.Fatalf("token with a future expiry: %v", err)

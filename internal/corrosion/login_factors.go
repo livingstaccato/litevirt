@@ -10,11 +10,16 @@ package corrosion
 //     factor for the account.
 //   - user_enrollment_codes: the admin-issued, single-use, short-lived code an
 //     enrollment-only session needs to enroll its first factor, stored as a
-//     SHA-256 of a 160-bit random value.
+//     SHA-256 of a 160-bit random value, and BOUND TO THE NODE THAT ISSUED IT
+//     (issued_on). It is checked and used up only there, in one guarded
+//     update, so "single use" holds cluster-wide without consensus: a
+//     partition cannot let it be spent once on each side (rereview N3). A
+//     disable, a delete or a re-create of the account tombstones it.
 //
 // Both are written only once login_policy_v1 has latched (the same gate as
-// user_lifecycle), are replicated through the WAL, and are left out of
-// anti-entropy like sessions: they are as short-lived as what they describe.
+// user_lifecycle). session_factors is left out of anti-entropy like sessions;
+// user_enrollment_codes is repaired by it (public lane — the column is a hash
+// of a random value), so every replica converges on one row per account.
 
 import (
 	"context"
@@ -23,6 +28,7 @@ import (
 	"encoding/base32"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -69,19 +75,49 @@ const (
 // expired code: they are not told apart.
 var ErrEnrollmentCodeInvalid = errors.New("enrollment code missing, wrong, used or expired")
 
-const enrollmentCodeUpsertSQL = `INSERT INTO user_enrollment_codes (username, code_hash, expires_at, issued_by, used_at, updated_at, deleted_at)
-	 VALUES (?, ?, ?, ?, '', ?, NULL)
+const enrollmentCodeUpsertSQL = `INSERT INTO user_enrollment_codes (username, code_hash, expires_at, issued_by, issued_on, used_at, updated_at, deleted_at)
+	 VALUES (?, ?, ?, ?, ?, '', ?, NULL)
 	 ON CONFLICT(username) DO UPDATE SET code_hash = excluded.code_hash, expires_at = excluded.expires_at,
-	   issued_by = excluded.issued_by, used_at = '', updated_at = excluded.updated_at, deleted_at = NULL`
+	   issued_by = excluded.issued_by, issued_on = excluded.issued_on, used_at = '', updated_at = excluded.updated_at,
+	   deleted_at = NULL`
+
+// enrollmentCodeTombstoneSQL invalidates username's code: a disable, a delete,
+// a re-create, or an admin enrolling a factor for the account.
+const enrollmentCodeTombstoneSQL = `UPDATE user_enrollment_codes SET deleted_at = ?, updated_at = ?
+	 WHERE username = ? AND deleted_at IS NULL`
+
+// invalidateEnrollmentCodeStatement is the statement other batches append.
+func invalidateEnrollmentCodeStatement(username, now string) Statement {
+	return Statement{SQL: enrollmentCodeTombstoneSQL, Params: []interface{}{nowRFC3339(), now, username}}
+}
+
+// InvalidateEnrollmentCode tombstones username's outstanding code. A no-op
+// with the gate closed (no code can exist).
+func InvalidateEnrollmentCode(ctx context.Context, c *Client, username string) error {
+	if !c.MayWriteLoginPolicy() {
+		return nil
+	}
+	st := invalidateEnrollmentCodeStatement(username, c.NowTS())
+	return c.ExecuteBatch(ctx, []Statement{st})
+}
+
+// ErrEnrollmentCodeElsewhere is the refusal for a code issued on another node.
+type ErrEnrollmentCodeElsewhere struct{ Node string }
+
+func (e ErrEnrollmentCodeElsewhere) Error() string {
+	return fmt.Sprintf("this enrollment code was issued on node %s and can be used only there: log in "+
+		"through %s, or ask an administrator to issue a new code on this node", e.Node, e.Node)
+}
 
 func enrollmentCodeHash(code string) string {
 	sum := sha256.Sum256([]byte(strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(code), "-", ""))))
 	return hex.EncodeToString(sum[:])
 }
 
-// IssueEnrollmentCode mints username's enrollment code, replacing any earlier
-// one, and returns it (shown once) with its expiry. Gated on login_policy_v1.
-func IssueEnrollmentCode(ctx context.Context, c *Client, username string, ttl time.Duration, issuedBy string) (string, string, error) {
+// IssueEnrollmentCode mints username's enrollment code, bound to node issuedOn
+// (this node), replacing any earlier one, and returns it (shown once) with its
+// expiry. Gated on login_policy_v1.
+func IssueEnrollmentCode(ctx context.Context, c *Client, username string, ttl time.Duration, issuedBy, issuedOn string) (string, string, error) {
 	if ttl <= 0 {
 		ttl = EnrollmentCodeDefaultTTL
 	}
@@ -98,20 +134,21 @@ func IssueEnrollmentCode(ctx context.Context, c *Client, username string, ttl ti
 	enc := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(raw) // 32 chars
 	code := enc[0:8] + "-" + enc[8:16] + "-" + enc[16:24] + "-" + enc[24:32]
 	exp := time.Now().Add(ttl).UTC().Format(time.RFC3339)
-	if err := c.Execute(ctx, enrollmentCodeUpsertSQL, username, enrollmentCodeHash(code), exp, issuedBy, c.NowTS()); err != nil {
+	if err := c.Execute(ctx, enrollmentCodeUpsertSQL, username, enrollmentCodeHash(code), exp, issuedBy, issuedOn, c.NowTS()); err != nil {
 		return "", "", err
 	}
 	return code, exp, nil
 }
 
 // CheckEnrollmentCode reports whether code is username's live, unused,
-// unexpired code, without using it up (WebAuthn's begin step).
-func CheckEnrollmentCode(ctx context.Context, c *Client, username, code string) error {
+// unexpired code, issued on node `here`, without using it up (WebAuthn's
+// begin step). A matching code issued elsewhere is ErrEnrollmentCodeElsewhere.
+func CheckEnrollmentCode(ctx context.Context, c *Client, username, code, here string) error {
 	if strings.TrimSpace(code) == "" {
 		return ErrEnrollmentCodeInvalid
 	}
 	rows, err := c.Query(ctx,
-		`SELECT 1 FROM user_enrollment_codes WHERE username = ? AND code_hash = ? AND used_at = ''
+		`SELECT issued_on FROM user_enrollment_codes WHERE username = ? AND code_hash = ? AND used_at = ''
 		   AND expires_at > ? AND deleted_at IS NULL`,
 		username, enrollmentCodeHash(code), nowRFC3339())
 	if err != nil {
@@ -120,24 +157,26 @@ func CheckEnrollmentCode(ctx context.Context, c *Client, username, code string) 
 	if len(rows) == 0 {
 		return ErrEnrollmentCodeInvalid
 	}
+	if on := rows[0].String("issued_on"); on != here {
+		return ErrEnrollmentCodeElsewhere{Node: on}
+	}
 	return nil
 }
 
-// ConsumeEnrollmentCode uses code up: a guarded update that changes a row only
-// while it is live, unused and unexpired, so two uses on this node cannot both
-// succeed. Two uses on two nodes inside one replication window can; the code
-// is held by one person and lives at most a day.
-func ConsumeEnrollmentCode(ctx context.Context, c *Client, username, code string) error {
-	if strings.TrimSpace(code) == "" {
-		return ErrEnrollmentCodeInvalid
+// ConsumeEnrollmentCode uses code up, on the node that issued it: one guarded
+// update that changes a row only while it is live, unused, unexpired and
+// issued here, so it succeeds at most once anywhere.
+func ConsumeEnrollmentCode(ctx context.Context, c *Client, username, code, here string) error {
+	if err := CheckEnrollmentCode(ctx, c, username, code, here); err != nil {
+		return err
 	}
 	if !c.MayWriteLoginPolicy() {
 		return ErrLoginPolicyGateClosed
 	}
 	n, err := c.ExecuteRowsStrict(ctx,
 		`UPDATE user_enrollment_codes SET used_at = ?, updated_at = ?
-		 WHERE username = ? AND code_hash = ? AND used_at = '' AND expires_at > ? AND deleted_at IS NULL`,
-		nowRFC3339(), c.NowTS(), username, enrollmentCodeHash(code), nowRFC3339())
+		 WHERE username = ? AND code_hash = ? AND issued_on = ? AND used_at = '' AND expires_at > ? AND deleted_at IS NULL`,
+		nowRFC3339(), c.NowTS(), username, enrollmentCodeHash(code), here, nowRFC3339())
 	if err != nil {
 		return err
 	}

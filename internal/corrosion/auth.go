@@ -149,13 +149,30 @@ const SentinelRole = "NoAccess"
 // its own sentinel, and a principal with zero bindings falls back to its
 // legacy role cluster-wide (t1-auth-review I3). Both statements are the
 // existing role_bindings shapes.
-func RevokeRoleBindingLeavingSentinel(ctx context.Context, c *Client, id string, sentinel RoleBindingRecord) error {
+//
+// At most one sentinel is kept per (principal, path): when one is already
+// there the revoke only tombstones (rereview m-c), so a delegate looping
+// grant and revoke at one path cannot grow the table. Two revokes on two nodes
+// at once can each add one; a duplicate grants nothing and is harmless. It
+// reports whether it added one.
+func RevokeRoleBindingLeavingSentinel(ctx context.Context, c *Client, id string, sentinel RoleBindingRecord) (bool, error) {
 	now := c.NowTS()
+	existing, err := c.Query(ctx,
+		`SELECT id FROM role_bindings WHERE principal = ? AND path = ? AND role = ? AND deleted_at IS NULL AND id != ? LIMIT 1`,
+		sentinel.Principal, sentinel.Path, SentinelRole, id)
+	if err != nil {
+		return false, err
+	}
+	if len(existing) > 0 {
+		return false, c.ExecuteBatch(ctx, []Statement{
+			{SQL: roleBindingDeleteSQL, Params: []interface{}{nowRFC3339(), now, id}},
+		})
+	}
 	prop := 0
 	if sentinel.Propagate {
 		prop = 1
 	}
-	return c.ExecuteBatch(ctx, []Statement{
+	return true, c.ExecuteBatch(ctx, []Statement{
 		{SQL: roleBindingDeleteSQL, Params: []interface{}{nowRFC3339(), now, id}},
 		{SQL: roleBindingInsertSQL, Params: []interface{}{sentinel.ID, sentinel.Path, SentinelRole, sentinel.Principal, prop, now}},
 	})

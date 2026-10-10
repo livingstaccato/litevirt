@@ -230,7 +230,7 @@ func resetAdminOffline(ctx context.Context, db *corrosion.Client, dataDir, pwPat
 	fmt.Fprintf(out, "New password written to %s\n", pwPath)
 	if clear2FA {
 		fmt.Fprintln(out, "Every second factor of the admin account was removed.")
-		code, exp, err := corrosion.IssueEnrollmentCode(ctx, db, "admin", 0, "root (reset-admin)")
+		code, exp, err := corrosion.IssueEnrollmentCode(ctx, db, "admin", 0, "root (reset-admin)", db.HostName())
 		printEnrollmentCode(out, code, exp, err)
 	}
 	return nil

@@ -495,12 +495,13 @@ import (
 //	     previous-release node cannot decode the table's statements, and would
 //	     not enforce them, so nothing writes it until login_policy_v1 latches
 //	     (ReplicationGated). With it, two tables the mandatory second-factor
-//	     policy needs, written under the same gate and, like sessions, left out
-//	     of anti-entropy: session_factors (session_id PK: the second factor
+//	     policy needs, written under the same gate: session_factors (left out
+//	     of anti-entropy like sessions; session_id PK: the second factor
 //	     a session's login presented, so a password-only session is never
 //	     re-derived into a full one) and user_enrollment_codes (username PK:
 //	     the admin-issued, single-use, short-lived first-enrollment code,
-//	     stored as a SHA-256). Three new tables.
+//	     stored as a SHA-256 and bound to the node that issued it, which alone
+//	     may spend it; repaired by anti-entropy). Three new tables.
 const CurrentSchemaVersion = 64
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
@@ -2928,6 +2929,7 @@ var schemaDDL = []string{
 		code_hash  TEXT NOT NULL,
 		expires_at TEXT NOT NULL,
 		issued_by  TEXT NOT NULL DEFAULT '',
+		issued_on  TEXT NOT NULL DEFAULT '',
 		used_at    TEXT NOT NULL DEFAULT '',
 		updated_at TEXT NOT NULL,
 		deleted_at TEXT

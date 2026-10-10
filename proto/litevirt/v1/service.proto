@@ -879,7 +879,10 @@ message LoginResponse      {
 message ListRealmsResponse { repeated string realms = 1; }
 message CreateUserRequest  { string username = 1; string password = 2; string role = 3; }
 message ListUsersResponse  { repeated User users = 1; }
-message DeleteUserRequest  { string username = 1; }
+// exact: match username as stored, byte for byte, instead of by normalized
+// name — the way to remove one of two accounts that differ only in case or
+// surrounding spaces, which every normalized lookup refuses (admin, audited).
+message DeleteUserRequest  { string username = 1; bool exact = 2; }
 message WhoamiResponse     {
     string username = 1; string role = 2; string realm = 3; string expires_at = 4;
     // requires_2fa_enrollment: this is an enrollment-only session (see

@@ -985,7 +985,7 @@ show the VM deleted and no domain of that name is defined there.
 ```bash
 lv user create <username> --role admin|operator|viewer
 lv user ls
-lv user delete <username>
+lv user delete <username> [--exact]   # --exact: match the name as stored (resolve a case-duplicate)
 lv user passwd [username]           # Change your own password (or, as admin, another user's)
   [--old-password <p>] [--new-password <p>]   # prompts if unset; old not needed for an admin reset
 lv user token-create <username> <token-name> [--expires <RFC3339>]

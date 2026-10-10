@@ -229,13 +229,7 @@ func (s *Server) StreamAuthInterceptor(
 	// A stream authenticated by a USER credential is re-checked while it is
 	// open, and cut when the credential stops being one (stream_watch.go).
 	if userBearerIdentity(ctx) {
-		wctx, stop := s.watchStream(ctx)
-		defer stop()
-		err := handler(srv, &wrappedStream{ss, wctx})
-		if cut := streamCutCause(wctx); cut != nil {
-			return cut
-		}
-		return err
+		return s.serveWatched(ctx, srv, ss, handler)
 	}
 	return handler(srv, &wrappedStream{ss, ctx})
 }
@@ -272,6 +266,9 @@ func (s *Server) authenticate(ctx context.Context) (context.Context, error) {
 			// A disabled or expired account's tokens stop working with it. Not
 			// subject to the second-factor policy: an API token is
 			// administrator-issued automation with no interactive holder.
+			if err := s.refuseAmbiguousAccount(ctx, user.Username); err != nil {
+				return nil, err
+			}
 			if err := s.refuseInactiveAccount(ctx, user.Username); err != nil {
 				return nil, err
 			}
@@ -617,6 +614,9 @@ func (s *Server) authenticateForwardedBearer(ctx context.Context, val string) (c
 	}
 	if user == nil {
 		return nil, status.Error(codes.Unauthenticated, "forwarded identity: invalid or expired token")
+	}
+	if err := s.refuseAmbiguousAccount(ctx, user.Username); err != nil {
+		return nil, err
 	}
 	if err := s.refuseInactiveAccount(ctx, user.Username); err != nil {
 		return nil, err

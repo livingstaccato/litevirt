@@ -152,13 +152,18 @@ func (s *Server) RevokeRole(ctx context.Context, req *pb.RevokeRoleRequest) (*pb
 		}
 	}
 	if sentinel != nil {
-		if err := corrosion.RevokeRoleBindingLeavingSentinel(ctx, s.db, req.Id, *sentinel); err != nil {
+		added, err := corrosion.RevokeRoleBindingLeavingSentinel(ctx, s.db, req.Id, *sentinel)
+		if err != nil {
 			return nil, status.Errorf(codes.Internal, "delete binding: %v", err)
 		}
 		// In memory too, in the same step as the removal below: the snapshot
 		// must never hold the principal with neither binding.
 		if s.authEngine != nil {
-			s.authEngine.ReplaceBinding(req.Id, *sentinel)
+			if added {
+				s.authEngine.ReplaceBinding(req.Id, *sentinel)
+			} else {
+				s.authEngine.RemoveBinding(req.Id) // a sentinel is already there
+			}
 		}
 	} else if err := corrosion.DeleteRoleBinding(ctx, s.db, req.Id); err != nil {
 		return nil, status.Errorf(codes.Internal, "delete binding: %v", err)

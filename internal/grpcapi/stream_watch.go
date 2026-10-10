@@ -19,21 +19,34 @@ package grpcapi
 // open no stream at all). The first failure cancels the stream's context and
 // the stream ends with Unauthenticated.
 //
-// THE BOUND: an open stream ends within StreamRecheckInterval (5 s) of the
-// change reaching this node's replica, and at once on the node where the
-// change was made. A node the change has not reached yet keeps the stream —
-// the same bound as every other refusal (docs/auth.md).
+// THE BOUND: an open stream ends within 5 s of the change reaching this node's
+// replica — a recheck every StreamRecheckInterval (3 s), each with its own
+// StreamRecheckTimeout (2 s) — and at once on the node where the change was
+// made. A recheck that fails, or does not finish within its timeout (a stuck
+// replica, a reseed holding the lock), ends the stream: it fails closed, so the
+// bound holds whatever the replica is doing. A node the change has not reached
+// yet keeps the stream — the same bound as every other refusal (docs/auth.md).
+//
+// ENDING IT FOR REAL (rereview N1). Cancelling a derived context ends nothing
+// by itself: grpc-go's RecvMsg and SendMsg are bound to the transport, and the
+// console and VNC handlers block in them and in reads of the PTY or socket. So
+// the cut is made three ways: the handlers that hold a device (ConsoleVM,
+// ProxyVNC) select on the stream context and close the PTY or socket when it
+// ends; the stream handed to every handler refuses SendMsg and RecvMsg once
+// cut; and the interceptor returns the cut error after streamCutGrace even if
+// a handler is still blocked, which ends the RPC and so the transport.
 //
 // Bearerless mTLS streams (peer, local-root) are not user credentials and are
-// not watched. A read that fails while re-checking does not cut the stream on
-// its own: it is retried at the next tick, and cut only after three in a row,
-// so a busy replica does not drop every console.
+// not watched.
 
 import (
 	"context"
 	"errors"
+	"log/slog"
+	"sync/atomic"
 	"time"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -41,17 +54,31 @@ import (
 )
 
 // StreamRecheckInterval is how often an open user stream re-checks its
-// credential when nothing on this node has changed.
-const StreamRecheckInterval = 5 * time.Second
+// credential when nothing on this node has changed, and StreamRecheckTimeout
+// how long one recheck may take; together they are the documented 5 s.
+const (
+	StreamRecheckInterval = 3 * time.Second
+	StreamRecheckTimeout  = 2 * time.Second
+)
 
-// streamRecheckFailuresToCut is how many consecutive failed reads end a stream.
-const streamRecheckFailuresToCut = 3
+// streamCutGrace is how long the interceptor waits, after a cut, for the
+// handler to return on its own before it ends the RPC regardless.
+const streamCutGrace = 2 * time.Second
 
 func (s *Server) streamRecheckInterval() time.Duration {
 	if s.streamRecheckEvery > 0 {
 		return s.streamRecheckEvery
 	}
 	return StreamRecheckInterval
+}
+
+// streamRecheckTimeout is one recheck's deadline: StreamRecheckTimeout, or
+// the test interval when that is shorter.
+func (s *Server) streamRecheckTimeout() time.Duration {
+	if s.streamRecheckEvery > 0 && s.streamRecheckEvery < StreamRecheckTimeout {
+		return s.streamRecheckEvery
+	}
+	return StreamRecheckTimeout
 }
 
 // userBearerIdentity reports whether ctx was authenticated by a user
@@ -98,7 +125,6 @@ func (s *Server) watchStream(ctx context.Context) (context.Context, func()) {
 	go func() {
 		t := time.NewTicker(s.streamRecheckInterval())
 		defer t.Stop()
-		failures := 0
 		for {
 			kick := s.kickChan()
 			select {
@@ -109,16 +135,13 @@ func (s *Server) watchStream(ctx context.Context) (context.Context, func()) {
 			case <-t.C:
 			case <-kick:
 			}
-			err := s.recheckStreamIdentity(wctx)
+			err := s.recheckWithTimeout(wctx)
 			var transient errTransientRecheck
 			switch {
 			case err == nil:
-				failures = 0
 			case errors.As(err, &transient):
-				failures++
-				if failures < streamRecheckFailuresToCut {
-					continue
-				}
+				// Fail closed: a credential that cannot be confirmed within
+				// the bound is not one.
 				cancel(errStreamCut{status.Errorf(codes.Unauthenticated,
 					"stream ended: its credential could not be re-checked: %v", transient.err)})
 				return
@@ -132,6 +155,91 @@ func (s *Server) watchStream(ctx context.Context) (context.Context, func()) {
 		close(stopped)
 		cancel(nil)
 	}
+}
+
+// recheckWithTimeout runs one recheck under its own deadline. A recheck that
+// has not answered by then is a failed one (errTransientRecheck), whatever it
+// is blocked on.
+func (s *Server) recheckWithTimeout(ctx context.Context) error {
+	rctx, cancel := context.WithTimeout(ctx, s.streamRecheckTimeout())
+	defer cancel()
+	res := make(chan error, 1)
+	go func() {
+		if h := recheckHook.Load(); h != nil {
+			(*h)(rctx)
+		}
+		res <- s.recheckStreamIdentity(rctx)
+	}()
+	select {
+	case err := <-res:
+		return err
+	case <-rctx.Done():
+		return errTransientRecheck{errors.New("recheck did not finish within " + s.streamRecheckTimeout().String())}
+	}
+}
+
+// watchedStream is the stream a watched handler gets: its context is the
+// watcher's, and once that is cut it refuses to send or receive, so a handler
+// that loops on Send/Recv stops at its next call.
+type watchedStream struct {
+	grpc.ServerStream
+	ctx context.Context
+}
+
+func (w *watchedStream) Context() context.Context { return w.ctx }
+
+func (w *watchedStream) SendMsg(m any) error {
+	if cut := streamCutCause(w.ctx); cut != nil {
+		return cut
+	}
+	return w.ServerStream.SendMsg(m)
+}
+
+func (w *watchedStream) RecvMsg(m any) error {
+	if cut := streamCutCause(w.ctx); cut != nil {
+		return cut
+	}
+	return w.ServerStream.RecvMsg(m)
+}
+
+// serveWatched runs handler on a watched stream and ends it on a cut: the
+// handler is given streamCutGrace to return on its own (the device-holding
+// handlers close their PTY or socket and do), and then the cut error is
+// returned regardless, which ends the RPC and with it the transport the
+// handler is blocked on.
+func (s *Server) serveWatched(ctx context.Context, srv any, ss grpc.ServerStream, handler grpc.StreamHandler) error {
+	wctx, stop := s.watchStream(ctx)
+	defer stop()
+	done := make(chan error, 1)
+	go func() { done <- handler(srv, &watchedStream{ServerStream: ss, ctx: wctx}) }()
+	select {
+	case err := <-done:
+		if cut := streamCutCause(wctx); cut != nil {
+			return cut
+		}
+		return err
+	case <-wctx.Done():
+	}
+	cut := streamCutCause(wctx)
+	if cut == nil {
+		// The transport ended, not a cut: wait for the handler as before.
+		return <-done
+	}
+	select {
+	case <-done:
+	case <-time.After(streamCutGrace):
+		slog.Warn("a stream handler did not return after its credential was cut; ending the RPC")
+	}
+	return cut
+}
+
+// streamEndError is what a handler returns when its stream context ended: the
+// watcher's cut error, or the context's own.
+func streamEndError(ctx context.Context) error {
+	if cut := streamCutCause(ctx); cut != nil {
+		return cut
+	}
+	return status.FromContextError(ctx.Err()).Err()
 }
 
 // streamCutCause returns the Unauthenticated error a watcher ended ctx with,
@@ -166,6 +274,15 @@ func (s *Server) recheckStreamIdentity(ctx context.Context) error {
 	}
 	switch callerAuthMethod(ctx) {
 	case authMethodSession:
+		// A deleted account's sessions end with it (rereview N2); the token
+		// branch gets this from TokenLive's join.
+		u, err := corrosion.GetUser(ctx, s.db, user)
+		if err != nil {
+			return errTransientRecheck{err}
+		}
+		if u == nil {
+			return status.Error(codes.Unauthenticated, "stream ended: account deleted")
+		}
 		sid := callerSessionID(ctx)
 		sess, err := corrosion.GetSession(ctx, s.db, sid)
 		if err != nil {
@@ -200,3 +317,7 @@ func (s *Server) recheckStreamIdentity(ctx context.Context) error {
 	}
 	return nil
 }
+
+// recheckHook, when set (tests only), runs at the start of every stream
+// recheck with that recheck's context.
+var recheckHook atomic.Pointer[func(context.Context)]

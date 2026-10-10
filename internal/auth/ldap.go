@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strings"
 
 	"github.com/go-ldap/ldap/v3"
@@ -42,6 +43,13 @@ type LDAPConfig struct {
 	// "%s" is replaced with the user DN. Defaults to:
 	//   (&(objectClass=group)(member=%s))
 	GroupFilter string
+
+	// UserLoginAttr is the attribute whose value IS the account's login name,
+	// read back from the directory entry and used as the litevirt subject.
+	// Empty: every attribute UserFilter matches the typed name against
+	// ("(uid=%s)" → uid), in filter order, then the entry DN's own RDN when
+	// it is one of those. The typed name is never the subject (rereview N4).
+	UserLoginAttr string
 
 	// Attributes — overridable so non-standard schemas can be handled.
 	UserNameAttr  string // default "cn"
@@ -150,7 +158,7 @@ func (r *LDAPRealm) Authenticate(ctx context.Context, creds Credentials) (*Princ
 		ldap.ScopeWholeSubtree, ldap.NeverDerefAliases,
 		2, 0, false, // SizeLimit=2 → fast-fail on duplicates
 		filter,
-		[]string{"dn", r.cfg.UserNameAttr, r.cfg.UserMailAttr, r.cfg.UserGroupAttr},
+		append([]string{"dn", r.cfg.UserNameAttr, r.cfg.UserMailAttr, r.cfg.UserGroupAttr}, r.loginAttrs()...),
 		nil,
 	)
 	res, err := conn.Search(req)
@@ -185,8 +193,19 @@ func (r *LDAPRealm) Authenticate(ctx context.Context, creds Credentials) (*Princ
 	}
 	groups = normalizeGroups(groups, r.cfg.GroupNameAttr)
 
+	// The subject is the DIRECTORY's own value for the login attribute, not
+	// what was typed: a directory matches width, case and space variants of a
+	// name (RFC 4518 string preparation: `ａｌｉｃｅ`, `alice\u00a0`, `ALICE`
+	// all bind as alice's entry), and taking the typed form made each variant
+	// a different, never-disabled litevirt account (rereview N4).
+	// Normalization stays as the second line of defence.
+	login := r.entryLogin(entry)
+	if login == "" {
+		return nil, fmt.Errorf("%w: directory entry %q has no login attribute (%s); set user_login_attr",
+			ErrInvalidCredentials, entry.DN, strings.Join(r.loginAttrs(), ", "))
+	}
 	p := &Principal{
-		Subject: corrosion.NormalizeUsername(username),
+		Subject: corrosion.NormalizeUsername(login),
 		Realm:   r.Name(),
 		Email:   firstAttr(entry, r.cfg.UserMailAttr),
 		Name:    firstAttr(entry, r.cfg.UserNameAttr),
@@ -196,6 +215,49 @@ func (r *LDAPRealm) Authenticate(ctx context.Context, creds Credentials) (*Princ
 		},
 	}
 	return p, nil
+}
+
+// filterAttrRe finds each "(attr=%s)" in a user filter.
+var filterAttrRe = regexp.MustCompile(`\(([A-Za-z][A-Za-z0-9-]*)=%s\)`)
+
+// loginAttrs is the attributes the login name may be read from, in order:
+// UserLoginAttr, then each attribute UserFilter matches the typed name against.
+func (r *LDAPRealm) loginAttrs() []string {
+	var out []string
+	seen := map[string]bool{}
+	add := func(a string) {
+		if a != "" && !seen[strings.ToLower(a)] {
+			seen[strings.ToLower(a)] = true
+			out = append(out, a)
+		}
+	}
+	add(r.cfg.UserLoginAttr)
+	for _, m := range filterAttrRe.FindAllStringSubmatch(r.cfg.UserFilter, -1) {
+		add(m[1])
+	}
+	return out
+}
+
+// entryLogin reads the login name from the entry: the first login attribute
+// with a value, else the DN's RDN value when its attribute is a login
+// attribute. "" when there is none.
+func (r *LDAPRealm) entryLogin(e *ldap.Entry) string {
+	attrs := r.loginAttrs()
+	for _, a := range attrs {
+		if v := strings.TrimSpace(firstAttr(e, a)); v != "" {
+			return v
+		}
+	}
+	if dn, err := ldap.ParseDN(e.DN); err == nil && len(dn.RDNs) > 0 {
+		for _, av := range dn.RDNs[0].Attributes {
+			for _, a := range attrs {
+				if strings.EqualFold(av.Type, a) && strings.TrimSpace(av.Value) != "" {
+					return strings.TrimSpace(av.Value)
+				}
+			}
+		}
+	}
+	return ""
 }
 
 // SyncGroups is a no-op — group memberships are pulled at login time.

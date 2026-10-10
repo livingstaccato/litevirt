@@ -180,3 +180,42 @@ func TestGetUser_NormalizedAndAmbiguous(t *testing.T) {
 		t.Fatalf("GetUser with two accounts differing in case: %v, want ErrAmbiguousUsername naming both", err)
 	}
 }
+
+// TestGC_PrunesExpiredSessionsWithTheirFactors (rereview m-g): sessions past
+// their hard expiry by the retention go, and their session_factors rows with
+// them; a live session and its row stay.
+func TestGC_PrunesExpiredSessionsWithTheirFactors(t *testing.T) {
+	ctx := context.Background()
+	c := lifecycleDB(t)
+	c.SetLoginPolicyGate(func() bool { return true })
+	old := time.Now().Add(-48 * time.Hour).UTC()
+	now := time.Now().UTC()
+	for id, exp := range map[string]time.Time{"dead": old.Add(time.Hour), "live": now.Add(time.Hour)} {
+		created := old
+		if id == "live" {
+			created = now
+		}
+		if err := InsertSessionWithFactor(ctx, c, SessionRecord{
+			ID: id, Username: "bob", Realm: "local", CreatedAt: created.Format(time.RFC3339),
+			LastUsedAt: created.Format(time.RFC3339), ExpiresAt: exp.Format(time.RFC3339),
+		}, "totp"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := GCSupersededRows(ctx, c, time.Hour, 7*24*time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	for table, want := range map[string]string{"sessions": "live", "session_factors": "live"} {
+		col := "id"
+		if table == "session_factors" {
+			col = "session_id"
+		}
+		rows, err := c.Query(ctx, `SELECT `+col+` AS k FROM `+table)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) != 1 || rows[0].String("k") != want {
+			t.Fatalf("%s after GC: %v, want only %q", table, rows, want)
+		}
+	}
+}

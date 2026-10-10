@@ -115,6 +115,30 @@ func GCSupersededRows(ctx context.Context, c *Client, coreRetention, orphanReten
 		return counts, err
 	}
 
+	// sessions — core: past their hard expiry by the retention. Inert:
+	// authentication refuses a session past expires_at, so a copy a peer
+	// still holds cannot authenticate if it re-merges. sessions are left out
+	// of anti-entropy, so nothing re-merges them anyway. Nothing pruned them
+	// before, so they grew by one row per login, forever.
+	sessCutoff := now.Add(-coreRetention).Format(time.RFC3339)
+	if err := sweep("sessions",
+		`DELETE FROM sessions -- full-state-delete-ok: past hard expiry, inert (authentication refuses an expired session)
+		 WHERE expires_at < ?`,
+		sessCutoff); err != nil {
+		return counts, err
+	}
+	// session_factors — with their sessions (rereview m-g): a row whose
+	// session is gone or past its hard expiry by the retention. Inert: the
+	// row only ever confines or frees ITS session, which can no longer
+	// authenticate.
+	if err := sweep("session_factors",
+		`DELETE FROM session_factors -- full-state-delete-ok: its session is pruned or past hard expiry, inert
+		 WHERE presented_at < ?
+		   AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.id = session_factors.session_id AND s.expires_at >= ?)`,
+		sessCutoff, sessCutoff); err != nil {
+		return counts, err
+	}
+
 	// NOTE: runtime_action_proofs must NEVER be added to THIS local-only sweep. Unlike the
 	// inert rows above, a plain local delete of a proof is union-unsafe: a direct-RPC
 	// executor re-seeds a carried proof via WriteActionProof (INSERT OR IGNORE) and then

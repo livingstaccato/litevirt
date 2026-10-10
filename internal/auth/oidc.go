@@ -296,6 +296,15 @@ func EnsureUserShadow(ctx context.Context, db *corrosion.Client, p *Principal, d
 	if name == "" {
 		return errors.New("empty subject")
 	}
+	// A deleted account under a variant spelling (a legacy `Bob` shadow from
+	// before names were normalized) is brought back under ITS name, so it
+	// returns with its own lifecycle: a disabled `Bob` stays disabled when
+	// `bob` logs in again, instead of a fresh `bob` row with none.
+	if variant, err := corrosion.DeletedVariantOf(ctx, db, name); err != nil {
+		return err
+	} else if variant != "" {
+		name = variant
+	}
 	if err := corrosion.InsertUser(ctx, db, name, role, ""); err != nil {
 		return err
 	}

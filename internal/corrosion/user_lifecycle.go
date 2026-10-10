@@ -138,10 +138,22 @@ func (l UserLifecycle) InactiveReason(now time.Time) string {
 	return ""
 }
 
+// SessionCutoffSkewMargin widens every session cut-off, in the refusing
+// direction. The cut-off is the changing node's wall clock and a session's
+// created_at is the minting node's, both to the second: a session minted a
+// moment before a disable by a clock running ahead, or in the same second,
+// would otherwise read as minted after it and survive the re-enable
+// (rereview m-a). Sessions created up to this long after the cut-off are
+// refused too. 5 s is the failover coordinator's fenceSkewMargin, the margin
+// the repo already budgets for wall-clock disagreement between nodes; a clock
+// further off than that is the LWW skew guard's to report.
+const SessionCutoffSkewMargin = 5 * time.Second
+
 // SessionPredates reports whether a session created at createdAt (RFC3339)
-// is from before the account's last disable or expiry, and so is never
-// honoured again. An unparseable instant on either side predates: it fails
-// closed.
+// is from before the account's last lifecycle change (disable, re-enable,
+// expiry set or changed, re-create), within SessionCutoffSkewMargin, and so is
+// never honoured again. An unparseable instant on either side predates: it
+// fails closed.
 func (l UserLifecycle) SessionPredates(createdAt string) bool {
 	if l.SessionsNotBefore == "" {
 		return false
@@ -154,7 +166,7 @@ func (l UserLifecycle) SessionPredates(createdAt string) bool {
 	if err != nil {
 		return true
 	}
-	return ca.Before(nb)
+	return ca.Before(nb.Add(SessionCutoffSkewMargin))
 }
 
 // Unrestricted reports whether the account is enabled and has no expiry —
@@ -257,10 +269,16 @@ func SetUserLifecycle(ctx context.Context, c *Client, username string, disabled 
 	}
 	now := c.NowTS()
 	var stmts []Statement
-	if (disabled != nil && *disabled) || (expiresAt != nil && *expiresAt != "") {
-		// Sessions from before this instant are never honoured again (m2).
-		stmts = append(stmts, Statement{SQL: userLifecycleUpsertSQL,
-			Params: []interface{}{username, UserAttrSessionsNotBefore, nowRFC3339(), setBy, now}})
+	// EVERY change is a session cut-off (rereview m-a): a disable or an
+	// expiry so its sessions stay dead, and a re-enable or an extended expiry
+	// too, so nothing minted before it — by a clock ahead, or on a node the
+	// disable had not reached yet, or before an expiry that has since passed —
+	// is honoured afterwards.
+	stmts = append(stmts, Statement{SQL: userLifecycleUpsertSQL,
+		Params: []interface{}{username, UserAttrSessionsNotBefore, nowRFC3339(), setBy, now}})
+	if disabled != nil && *disabled {
+		// A disable also voids an outstanding first-enrollment code (N3).
+		stmts = append(stmts, invalidateEnrollmentCodeStatement(username, now))
 	}
 	if disabled != nil {
 		v := "false"
@@ -273,9 +291,6 @@ func SetUserLifecycle(ctx context.Context, c *Client, username string, disabled 
 	if expiresAt != nil {
 		stmts = append(stmts, Statement{SQL: userLifecycleUpsertSQL,
 			Params: []interface{}{username, UserAttrExpiresAt, *expiresAt, setBy, now}})
-	}
-	if len(stmts) == 0 {
-		return nil
 	}
 	return c.ExecuteBatch(ctx, stmts)
 }
@@ -314,8 +329,14 @@ func ResetUserLifecycle(ctx context.Context, c *Client, username, setBy string) 
 	}
 	now := c.NowTS()
 	stmts := enableUserStatements(c, username, setBy, now)
+	// The cut-off is set back by the skew margin: the namesake's sessions all
+	// predate its deletion, which predates this, while a login made right
+	// after the create must work at once.
+	cutoff := time.Now().Add(-SessionCutoffSkewMargin - time.Second).UTC().Format(time.RFC3339)
 	stmts = append(stmts, Statement{SQL: userLifecycleUpsertSQL,
-		Params: []interface{}{username, UserAttrSessionsNotBefore, nowRFC3339(), setBy, now}})
+		Params: []interface{}{username, UserAttrSessionsNotBefore, cutoff, setBy, now}})
+	// A re-created name starts with no outstanding enrollment code (N3).
+	stmts = append(stmts, invalidateEnrollmentCodeStatement(username, now))
 	return c.ExecuteBatch(ctx, stmts)
 }
 

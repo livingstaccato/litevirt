@@ -56,12 +56,22 @@ func (s *Server) FinishWebAuthnRegistration(ctx context.Context, req *pb.FinishW
 	if err != nil {
 		return nil, err
 	}
+	// The code and the window are checked first, the attestation verified
+	// next, and only a GOOD attestation ends the enrollment-only session and
+	// spends the code (rereview N3): a bad one leaves both.
+	if _, err := s.firstEnrollment(ctx, req.GetEnrollmentCode(), false); err != nil {
+		return nil, err
+	}
+	verified, err := s.webauthn.VerifyRegistration(ctx, target, req.AttestationJson)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "finish registration: %v", err)
+	}
 	first, err := s.firstEnrollment(ctx, req.GetEnrollmentCode(), true)
 	if err != nil {
 		return nil, err
 	}
-	if err := s.webauthn.FinishRegistration(ctx, target, req.AttestationJson); err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "finish registration: %v", err)
+	if err := s.webauthn.StoreRegistration(ctx, target, verified); err != nil {
+		return nil, status.Errorf(codes.Internal, "store credential: %v", err)
 	}
 	// We don't have a clean handle on the new credential ID at this
 	// layer — return the digest of the attestation as a stable

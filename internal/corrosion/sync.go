@@ -419,6 +419,10 @@ var tableNames = []string{
 	// like any other cluster fact. Nothing secret. Written only once
 	// login_policy_v1 has latched (user_lifecycle.go).
 	"user_lifecycle",
+	// v64 first-enrollment codes (hashed, node-bound, at most a day). Repaired
+	// here so every replica converges on one row per account — a re-issue on
+	// one node and a use on another otherwise leave two answers.
+	"user_enrollment_codes",
 }
 
 // sensitiveTableNames are secret-bearing tables repaired only by the peer-mTLS

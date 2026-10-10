@@ -50,6 +50,9 @@ lv cluster failover-scope [cluster|region]  # Show or set whether failover quoru
                                    #   per region (see federation.md → Regions and failure)
 lv cluster failback [on|off]       # Show or set whether an undrain moves drained VMs back (see
                                    #   migration-failover.md → Failback after maintenance)
+lv cluster upgrade-status          # Latched capability tokens on the connected host, whether each blocks a
+                                   #   rollback, and which release features are in use (see upgrades.md →
+                                   #   Rolling back after a release token latched)
 lv cluster acknowledge-lease-term --key <k> --term <n>   # Acknowledge a contested lease term on the connected host
 lv cluster voter ls                # Adopted voter generation; per member: host state, reachable, abstaining
 lv cluster voter init [--members a,b,c] [--yes]   # Start a voter generation by hand (unanimous); for a

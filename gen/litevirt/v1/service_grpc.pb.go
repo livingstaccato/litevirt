@@ -287,6 +287,7 @@ const (
 	LiteVirt_GetFailoverScope_FullMethodName           = "/litevirt.v1.LiteVirt/GetFailoverScope"
 	LiteVirt_SetFailoverScope_FullMethodName           = "/litevirt.v1.LiteVirt/SetFailoverScope"
 	LiteVirt_RestoreRelay_FullMethodName               = "/litevirt.v1.LiteVirt/RestoreRelay"
+	LiteVirt_GetRelayHealth_FullMethodName             = "/litevirt.v1.LiteVirt/GetRelayHealth"
 	LiteVirt_UpsertServiceEndpoint_FullMethodName      = "/litevirt.v1.LiteVirt/UpsertServiceEndpoint"
 	LiteVirt_ListServiceEndpoints_FullMethodName       = "/litevirt.v1.LiteVirt/ListServiceEndpoints"
 	LiteVirt_DeleteServiceEndpoint_FullMethodName      = "/litevirt.v1.LiteVirt/DeleteServiceEndpoint"
@@ -810,6 +811,10 @@ type LiteVirtClient interface {
 	// keeps the failover lease holder from demoting it again until the hold
 	// runs out. Refuses until relay_health_v1 has durably latched.
 	RestoreRelay(ctx context.Context, in *RestoreRelayRequest, opts ...grpc.CallOption) (*RestoreRelayResponse, error)
+	// GetRelayHealth lists every host with a relay demotion row or an
+	// operator hold (viewer): demoted or restored, since when and why, and
+	// any hold with its expiry.
+	GetRelayHealth(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*RelayHealthStatus, error)
 	// ── anycast services ──
 	// service_endpoints map a logical name (e.g. "api.litevirt.local")
 	// to N (ip, region) pairs. The embedded DNS server round-robins
@@ -3885,6 +3890,16 @@ func (c *liteVirtClient) RestoreRelay(ctx context.Context, in *RestoreRelayReque
 	return out, nil
 }
 
+func (c *liteVirtClient) GetRelayHealth(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*RelayHealthStatus, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RelayHealthStatus)
+	err := c.cc.Invoke(ctx, LiteVirt_GetRelayHealth_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) UpsertServiceEndpoint(ctx context.Context, in *UpsertServiceEndpointRequest, opts ...grpc.CallOption) (*ServiceEndpoint, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ServiceEndpoint)
@@ -4658,6 +4673,10 @@ type LiteVirtServer interface {
 	// keeps the failover lease holder from demoting it again until the hold
 	// runs out. Refuses until relay_health_v1 has durably latched.
 	RestoreRelay(context.Context, *RestoreRelayRequest) (*RestoreRelayResponse, error)
+	// GetRelayHealth lists every host with a relay demotion row or an
+	// operator hold (viewer): demoted or restored, since when and why, and
+	// any hold with its expiry.
+	GetRelayHealth(context.Context, *emptypb.Empty) (*RelayHealthStatus, error)
 	// ── anycast services ──
 	// service_endpoints map a logical name (e.g. "api.litevirt.local")
 	// to N (ip, region) pairs. The embedded DNS server round-robins
@@ -5575,6 +5594,9 @@ func (UnimplementedLiteVirtServer) SetFailoverScope(context.Context, *SetFailove
 }
 func (UnimplementedLiteVirtServer) RestoreRelay(context.Context, *RestoreRelayRequest) (*RestoreRelayResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method RestoreRelay not implemented")
+}
+func (UnimplementedLiteVirtServer) GetRelayHealth(context.Context, *emptypb.Empty) (*RelayHealthStatus, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetRelayHealth not implemented")
 }
 func (UnimplementedLiteVirtServer) UpsertServiceEndpoint(context.Context, *UpsertServiceEndpointRequest) (*ServiceEndpoint, error) {
 	return nil, status.Error(codes.Unimplemented, "method UpsertServiceEndpoint not implemented")
@@ -10156,6 +10178,24 @@ func _LiteVirt_RestoreRelay_Handler(srv interface{}, ctx context.Context, dec fu
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_GetRelayHealth_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(emptypb.Empty)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).GetRelayHealth(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_GetRelayHealth_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).GetRelayHealth(ctx, req.(*emptypb.Empty))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LiteVirt_UpsertServiceEndpoint_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(UpsertServiceEndpointRequest)
 	if err := dec(in); err != nil {
@@ -11549,6 +11589,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "RestoreRelay",
 			Handler:    _LiteVirt_RestoreRelay_Handler,
+		},
+		{
+			MethodName: "GetRelayHealth",
+			Handler:    _LiteVirt_GetRelayHealth_Handler,
 		},
 		{
 			MethodName: "UpsertServiceEndpoint",

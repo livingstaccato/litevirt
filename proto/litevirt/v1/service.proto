@@ -3802,6 +3802,10 @@ service LiteVirt {
     // keeps the failover lease holder from demoting it again until the hold
     // runs out. Refuses until relay_health_v1 has durably latched.
     rpc RestoreRelay(RestoreRelayRequest)             returns (RestoreRelayResponse);
+    // GetRelayHealth lists every host with a relay demotion row or an
+    // operator hold (viewer): demoted or restored, since when and why, and
+    // any hold with its expiry.
+    rpc GetRelayHealth(google.protobuf.Empty)         returns (RelayHealthStatus);
 
     // ── anycast services ──
     // service_endpoints map a logical name (e.g. "api.litevirt.local")
@@ -4040,6 +4044,20 @@ message SetFailoverScopeRequest {
 message RestoreRelayRequest {
     string host         = 1;
     int64  hold_seconds = 2;  // 0: no hold
+}
+
+message RelayHealthEntry {
+    string host       = 1;
+    bool   demoted    = 2;
+    string since      = 3;  // RFC 3339: when the current state began
+    string reason     = 4;
+    string hold_until = 5;  // RFC 3339, empty with no hold in force
+    string hold_by    = 6;
+}
+
+message RelayHealthStatus {
+    repeated RelayHealthEntry hosts = 1;
+    bool latched = 2;  // relay_health_v1 has latched: demotions are in use
 }
 
 message RestoreRelayResponse {

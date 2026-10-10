@@ -36,31 +36,45 @@ func newClusterCmd() *cobra.Command {
 	return cmd
 }
 
-// lv cluster failover-scope [cluster|region] — show or change the cluster-wide
-// failover_scope policy (docs/design/region-scoped-failover.md).
-// lv cluster relay-restore <host> — clear a relay-health demotion now
-// (colonelpanik/litevirt#175). relay_health_v1's stand-down.
+// lv cluster relay-restore [host] — list relay-health demotions and holds,
+// or clear one host's demotion now (colonelpanik/litevirt#175).
+// relay_health_v1's stand-down.
 func newClusterRelayRestoreCmd() *cobra.Command {
 	var hold time.Duration
 	cmd := &cobra.Command{
-		Use:   "relay-restore <host>",
-		Short: "Clear a host's relay-health demotion now, optionally holding off a new one",
-		Long: `The failover lease holder demotes a host from relay duty when a third of
-its voter observers keep failing their probes of it, and restores it on its
-own once they stop. This clears the demotion now, for the whole cluster: the
+		Use:   "relay-restore [host]",
+		Short: "List relay-health demotions and holds, or clear a host's demotion now",
+		Long: `With no argument, list every host the failover lease holder has demoted
+from relay duty, or that has been restored, with since when and why, and every
+operator hold in force with its expiry.
+
+The lease holder demotes a host from relay duty when enough of its voter
+observers keep failing their probes of it (a third, never fewer than 2, a
+majority of a voter set of 4 or fewer), and restores it on its own once they
+stop. With a host, this clears the demotion now, for the whole cluster: the
 host is relay-eligible again on every node at its next relay election.
 
 With --hold, the lease holder may not demote the host again until the hold
 runs out (at most 7 days): use it when the fault is not the host's, such as a
 bad observer, while the cause is fixed. Without a hold, a host whose probes
-still fail is demoted again after the ordinary 2-minute window.
+still fail is demoted again after the ordinary 2-minute window, and any
+earlier hold on it ends.
 
-Needs the admin role, is audited, and refuses until every host runs a release
-carrying relay_health_v1 (before which no host is ever demoted).
-litevirt_relay_role shows each node's relay election.`,
-		Args: cobra.ExactArgs(1),
+Clearing needs the admin role, is audited, and refuses until every host runs
+a release carrying relay_health_v1 (before which no host is ever demoted).
+litevirt_relay_demoted and litevirt_relay_hold_seconds show the same state as
+metrics; litevirt_relay_role shows each node's relay election.`,
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				if len(args) == 0 {
+					st, err := c.GetRelayHealth(ctx, &emptypb.Empty{})
+					if err != nil {
+						return fmt.Errorf("get relay health: %w", err)
+					}
+					printRelayHealth(os.Stdout, st)
+					return nil
+				}
 				resp, err := c.RestoreRelay(ctx, &pb.RestoreRelayRequest{Host: args[0], HoldSeconds: int64(hold / time.Second)})
 				if err != nil {
 					return fmt.Errorf("restore relay: %w", err)
@@ -81,6 +95,41 @@ litevirt_relay_role shows each node's relay election.`,
 	return cmd
 }
 
+// printRelayHealth prints the demotion and hold table.
+func printRelayHealth(out io.Writer, st *pb.RelayHealthStatus) {
+	if !st.GetLatched() {
+		fmt.Fprintln(out, "relay_health_v1 has not latched: no host is demoted until every host runs a release carrying it.")
+	}
+	if len(st.GetHosts()) == 0 {
+		fmt.Fprintln(out, "No relay demotions or holds.")
+		return
+	}
+	w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(w, "HOST\tSTATE\tSINCE\tHOLD UNTIL\tREASON")
+	dash := func(s string) string {
+		if s == "" {
+			return "-"
+		}
+		return s
+	}
+	for _, e := range st.GetHosts() {
+		state := "restored"
+		if e.GetDemoted() {
+			state = "demoted"
+		} else if e.GetSince() == "" {
+			state = "held"
+		}
+		hold := e.GetHoldUntil()
+		if hold != "" && e.GetHoldBy() != "" {
+			hold += " (" + e.GetHoldBy() + ")"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", e.GetHost(), state, dash(e.GetSince()), dash(hold), dash(e.GetReason()))
+	}
+	w.Flush()
+}
+
+// lv cluster failover-scope [cluster|region] — show or change the cluster-wide
+// failover_scope policy (docs/design/region-scoped-failover.md).
 func newClusterFailoverScopeCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "failover-scope [cluster|region]",

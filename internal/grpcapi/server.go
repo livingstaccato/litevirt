@@ -1028,6 +1028,9 @@ func (s *Server) advertisedCapabilities() []string {
 	// fence_state_v1 is not withheld either: it says what this binary's
 	// coordinator does with an unverified fence recorded 'offline', a fact
 	// about the build.
+	// relay_health_v1 is not withheld either: it says this binary reads the
+	// relay demotion rows when it elects relays, a fact about the build. The
+	// demotion rows are not written until the ReplicationGated latch forms.
 	// hardware_v2 (CONTRACT h) is advertised only once this node is READY: its
 	// backfill audit pass has populated the typed-hardware tables (hwV2Ready) AND
 	// operation_protocol_v1 is active (the crash-safe operation journal is a hard
@@ -1489,6 +1492,11 @@ func (s *Server) tokenEnabled(token string) bool {
 		// No kill switch: it says this build resumes from an unverified fence
 		// recorded 'offline' and does not auto-activate such a host, which
 		// the failover lease holder relies on of every node.
+		return true
+	case capabilities.RelayHealthV1:
+		// No kill switch: it says this build reads the relay demotion rows
+		// when it elects relays, and every node relies on every other
+		// electing the same set.
 		return true
 	case capabilities.LeaseTermV1:
 		return s.enfLeaseTerm

@@ -334,6 +334,13 @@ type Coordinator struct {
 	// (partition_pause.go). In memory: a successor re-derives the wait from
 	// the self-pause fence record, anchored at its own first sight of it.
 	pauseWaits map[string]pauseWait
+
+	// RelayConfig is the replicator's relay configuration; its BaseRelays is
+	// the floor below which relay health never demotes (relay_health.go).
+	// Zero is corrosion.RelayConfig's default.
+	RelayConfig corrosion.RelayConfig
+	// relay is the lease holder's relay-health hysteresis (relay_health.go).
+	relay relayHealthState
 	// oneWay records the hosts partition_one_way is raised for.
 	oneWay map[string]bool
 }
@@ -698,6 +705,17 @@ func (c *Coordinator) run(ctx context.Context) {
 	}
 	c.clearRegionDeclined(declined)
 	sort.Slice(candidates, func(i, j int) bool { return candidates[i].target < candidates[j].target })
+
+	// Relay health (colonelpanik/litevirt#175): demote a host whose probes
+	// keep failing from relay duty, or restore one, as a replicated row every
+	// node's relay election reads. Before any fence, so a fence that ends the
+	// cycle early does not starve it, and told which hosts are fence
+	// candidates — those are fenced, not demoted. It never fails the cycle.
+	fenceCandidates := make(map[string]bool, len(candidates))
+	for _, cand := range candidates {
+		fenceCandidates[cand.target] = true
+	}
+	c.evaluateRelayHealth(ctx, voters, fenceCandidates)
 
 	for _, cand := range candidates {
 		// Re-validate lease before each destructive action: long fence runs

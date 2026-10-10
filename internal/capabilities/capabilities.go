@@ -286,6 +286,28 @@ const (
 	// replicates to, a maintenance host on the previous build included.
 	FenceStateV1 = "fence_state_v1"
 
+	// RelayHealthV1 gates health-aware relay election
+	// (colonelpanik/litevirt#175, internal/corrosion/relay_health.go). Once
+	// latched, the failover lease holder may DEMOTE a host whose probes keep
+	// failing from enough voters, by writing a relay_demoted/<host> row in
+	// cluster_policies, and every node's RelayEligibleHosts treats that host
+	// as ineligible: a leaf, never a relay.
+	//
+	// It states a fact about the BINARY, which is why it is mandatory and has
+	// no config flag: this build READS the demotion rows when it elects
+	// relays. The relay set is only useful if every node computes the same
+	// one, and a previous-release peer decodes the row but ignores the key,
+	// so it would keep the demoted host as a relay while every upgraded node
+	// dropped it. A flag would do the same thing on purpose: one node
+	// electing a different set from its peers.
+	//
+	// ReplicationGated: the claim is about what every host still receiving
+	// replication READS, a maintenance host on the previous build included,
+	// because every one of them elects relays from what it receives. The
+	// write also needs the cluster_policies gate (failover_scope_v1), which
+	// proves the shape decodes.
+	RelayHealthV1 = "relay_health_v1"
+
 	// RecoveryClaimV1 gates ENFORCEMENT of single-winner recovery claims
 	// (docs/design/recovery-claims.md §3, §5.1–§5.2,
 	// colonelpanik/litevirt#250): a failover coordinator collects a majority
@@ -789,6 +811,16 @@ const (
 //     runs on one. A binary rolled back below it enters WAL quarantine, as
 //     below every latched token.
 //
+//   - relay_health_v1 has no flag either: it says this build reads the
+//     demotion rows when it elects relays, and every node relies on every
+//     other electing the same set. What it licenses is bounded — a demotion
+//     withholds the relay ROLE only (the host stays a leaf), the lease holder
+//     never demotes below BaseRelays eligible hosts, changes at most one host
+//     per cycle, and restores a host after 10 minutes with no failing
+//     observer — so its stand-down is healing the link; the restore follows on
+//     its own. A binary rolled back below it enters WAL quarantine, as below
+//     every latched token.
+//
 // recovery_claim_v1 is NOT mandatory and HAS a flag, enforcement.recovery_claim,
 // which is its stand-down: false on every node and a restart returns recovery
 // authorization to the pre-claim behaviour; voters keep answering and keep
@@ -872,6 +904,9 @@ var supported = []string{
 	// a recovery from an unverified fence recorded 'offline' and does not
 	// auto-activate such a host", a fact about the binary.
 	FenceStateV1,
+	// RelayHealthV1 is advertised UNCONDITIONALLY: it says "this build reads
+	// the relay_demoted rows when it elects relays", a fact about the binary.
+	RelayHealthV1,
 	// RecoveryClaimV1 is advertised CONDITIONALLY: enforcement.recovery_claim
 	// (default on) on AND this node ready (split_brain_gate_v1 latched, voter_config_v1
 	// ready). Withheld while the flag is off because every flag-on node relies
@@ -901,7 +936,7 @@ var supported = []string{
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, FenceStateV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, FenceStateV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1, RelayHealthV1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {
@@ -963,6 +998,10 @@ var replicationGated = map[string]bool{
 	// failover lease, a maintenance host on the previous build included, and
 	// that build resumes only from 'fenced'. See FenceStateV1.
 	FenceStateV1: true,
+	// Confirmed against every replication recipient: each of them elects
+	// relays from what it receives, so each must read the demotion rows. See
+	// RelayHealthV1.
+	RelayHealthV1: true,
 	// Confirmed against every replication recipient: the claim_certificate
 	// column's statement shapes on runtime_action_proofs must be decodable by
 	// every host we stream to. Not mandatory: the flag is the opt-in.
@@ -1017,6 +1056,10 @@ var mandatory = map[string]bool{
 	// 'offline' and does not auto-activate such a host), and the lease holder
 	// relies on whichever node holds the lease next. See FenceStateV1.
 	FenceStateV1: true,
+	// A fact about the binary (it reads the relay demotion rows when it
+	// elects relays), and every node relies on every other electing the same
+	// set. See RelayHealthV1.
+	RelayHealthV1: true,
 }
 
 // Mandatory reports whether token is enforced with no config kill switch.

@@ -52,15 +52,30 @@ var relayEligibleStates = map[string]bool{"active": true}
 // Witnesses are excluded: they host no workloads and exist to break ties, so
 // handing them the cluster's replication fan-out is the opposite of their
 // purpose.
+//
+// So is a host the failover lease holder has DEMOTED for failing probes
+// (relay_health.go, colonelpanik/litevirt#175). The demotion is a replicated
+// row, so every node reads the same verdict; it withholds the relay role only,
+// and the host stays a leaf. A failed read of the rows is a failed read of
+// eligibility — nil, like a failed hosts read — because ignoring it would let
+// this one node elect a set its peers do not.
 func RelayEligibleHosts(ctx context.Context, c *Client) map[string]bool {
 	hosts, err := ListHosts(ctx, c)
 	if err != nil {
 		slog.Warn("relay: read host states for eligibility; falling back to name order", "error", err)
 		return nil
 	}
+	demoted, err := ListRelayDemotions(ctx, c)
+	if err != nil {
+		slog.Warn("relay: read relay demotions for eligibility; falling back to name order", "error", err)
+		return nil
+	}
 	out := make(map[string]bool, len(hosts))
 	for _, h := range hosts {
 		if h.IsWitness() {
+			continue
+		}
+		if _, ok := demoted[h.Name]; ok {
 			continue
 		}
 		if relayEligibleStates[h.State] {
@@ -202,6 +217,19 @@ func (rs *RelaySet) IsRelay(hostname string) bool {
 // Relays returns the sorted relay hostnames.
 func (rs *RelaySet) Relays() []string {
 	return rs.relays
+}
+
+// Roles maps every node of the election to whether it is a relay (true) or a
+// leaf (false). It is what litevirt_relay_role reports.
+func (rs *RelaySet) Roles() map[string]bool {
+	out := make(map[string]bool, len(rs.relays)+len(rs.leafAssignments))
+	for _, r := range rs.relays {
+		out[r] = true
+	}
+	for l := range rs.leafAssignments {
+		out[l] = false
+	}
+	return out
 }
 
 // AssignedRelays returns the [primary, backup] relay pair for a leaf node.

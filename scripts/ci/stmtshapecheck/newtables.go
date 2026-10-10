@@ -148,7 +148,8 @@ var firstShapeAcks = map[string]string{
 		"than the voting members only. It fails CLOSED when unwired (lv user reset-admin wires it to " +
 		"the same durable marker), so the latch cannot form while a previous-release peer is listening",
 	"cluster_policies": "every writer (corrosion.SetFailoverScope, SetISOLibraryMode, PutISOCatalogEntry, " +
-		"CollectISOCatalogEntry and PutISOLibraryHostAck, " +
+		"CollectISOCatalogEntry, PutISOLibraryHostAck and SetRelayDemotion — the last additionally behind " +
+		"Client.MayWriteRelayDemotion, the durable relay_health_v1 marker — " +
 		"all through the one clusterPolicyUpsertSQL) returns " +
 		"ErrClusterPolicyGateClosed unless Client.MayWriteClusterPolicy. The daemon wires that gate to " +
 		"DurablyLatched(failover_scope_v1) — mandatory, so advertised by every build carrying this table and " +

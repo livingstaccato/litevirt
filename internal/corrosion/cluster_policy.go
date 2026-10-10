@@ -6,7 +6,10 @@ package corrosion
 // read by every node from its own replica. Its keys are failover_scope and
 // the ISO library's (iso_library.go: iso_library_mode, one iso_library/<file>
 // row per sync-mode library file and one iso_library_host/<host> row per
-// host), all written through clusterPolicyUpsertSQL.
+// host), the pool records' (pool_records.go) and relay health's
+// (relay_health.go: one relay_demoted/<host> row per host the failover lease
+// holder has demoted from relay duty), all written through
+// clusterPolicyUpsertSQL.
 // failover_scope says whether a host is fenced and its workloads recovered by a
 // quorum of the whole cluster (the default, and what every cluster did before
 // v58) or by a quorum of its own region's voters

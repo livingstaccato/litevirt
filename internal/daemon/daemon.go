@@ -660,6 +660,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	lxcRunner.SubIDSpan = &lxc.IDMap{Base: d.cfg.Containers.IDMapBase, Size: int64(d.cfg.Containers.IDMapRanges) * lxc.IDMapSize}
 	d.metrics = metrics.NewServer(d.cfg.MetricsPort, d.cfg.MetricsBind, d.db, d.virt, lxcRunner, d.cfg.HostName)
 	d.metrics.SetReplicationTargets(repl.Targets)
+	d.metrics.SetRelayRoles(repl.RelayRoles)
 	// metrics_port: 0 DISABLES the endpoint, matching rest_port below and what
 	// docs/configuration.md says about it. Without the guard, 0 composed ":0"
 	// and bound an EPHEMERAL port on every interface — an unauthenticated
@@ -683,6 +684,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// so its replica-promoter (auto_promote recovery) can be wired first.
 	fc := failover.NewCoordinator(d.cfg.HostName, d.db)
 	fc.SetCapacityPolicy(capacity)
+	// The relay-health floor is the replicator's own BaseRelays.
+	fc.RelayConfig = relayCfg
 
 	// Start rebalance coordinator. Leader-gated; safe to start on
 	// every host. Defaults to dry-run on every VM unless compose says otherwise.
@@ -2953,6 +2956,12 @@ func (d *Daemon) runHostMembershipSplit(ctx context.Context) {
 func (d *Daemon) wireClusterPolicyGate() {
 	d.db.SetClusterPolicyGate(func() bool {
 		return d.checker.DurablyLatched(capabilities.FailoverScopeV1)
+	})
+	// The relay demotion rows ride in cluster_policies, and are also unread by
+	// a previous-release peer, which would elect a different relay set: they
+	// wait for relay_health_v1 as well (corrosion/relay_health.go).
+	d.db.SetRelayHealthGate(func() bool {
+		return d.checker.DurablyLatched(capabilities.RelayHealthV1)
 	})
 }
 

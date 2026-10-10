@@ -649,10 +649,25 @@ re-mint incident it can take the re-minted credential. Resolve the re-mint
 against hosts that are in the cluster's membership at the time. A host that
 was off throughout is not asked, and if it runs a build before
 `credentials_split_v1` it holds no marker for either token, so the rollback
-preflight does not stop it either. Back online, it reads only the old
-columns, which are now empty: it cannot fence by IPMI and its logins fail.
-Upgrade such a host to at least the dual-write build before you power it on
-again.
+preflight does not stop it either. Back online on that build, it reads only
+the old columns, which are now empty: it cannot fence by IPMI and its logins
+fail. Do not bring it back with its old data. The safe path is to remove it
+and add it again as a fresh host: `lv host rm <host>` from a running host,
+wipe its data directory, then `lv host add` it on this build, so it joins
+with an empty database and takes every row, credential rows included, from
+the cluster. (Bringing it back on the dual-write build reads empty secrets;
+bringing it back with its old database on this build is safe for logins —
+evidence that a user is external is kept per user and bound to that user's
+row, so a local account cleared since is never taken for one — but it holds
+stale state for everything else until anti-entropy has caught up.)
+
+**External users after the roll.** An LDAP or OIDC user created before
+`credentials_split_v1` latched has no credential row until a host that held it
+then runs its first split pass on this build. If no such host does — for
+example, the old hosts were replaced by new ones instead of being upgraded in
+place — logins under that name are refused with `FailedPrecondition` until an
+administrator runs `lv user mark-external <username>` (docs/auth.md). Upgrade
+at least one existing host in place before retiring the rest to avoid it.
 
 Until the token latches,
 `litevirt_ha_degraded{reason="capability_rollout_pending"}` is set, as for

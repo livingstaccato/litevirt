@@ -28,6 +28,41 @@ Roles map to *principal IDs*: `user:<subject>@<realm>` and
 `group:<name>@<realm>`. Bind a role to a principal in the engine and the
 caller gets the role's verbs at the binding's path.
 
+### External users and local accounts share one name space
+
+A user's first LDAP or OIDC login creates a row in the users table with no
+local password (a "shadow"), so roles and audit can name it. Because users
+are keyed by name alone, an external login is refused when the name belongs
+to a local account, which would otherwise hand the external principal that
+account's role.
+
+Once `credentials_clear_v1` has latched (docs/upgrades.md), every local
+account's users row also has an empty password column, so a host decides
+"external" only on positive evidence: an empty credential row for the user,
+written when the shadow was made after `credentials_split_v1`, by a host's
+first split pass for a shadow that host could vouch for, or by an
+administrator. When a host cannot tell, the login is refused:
+
+- `Unavailable` ("retry") while the host has not synced or not finished its
+  first credentials pass: retry, or log in through another host;
+- `FailedPrecondition`, naming the command below, when the host is up to date
+  and still holds no evidence. That is an external user created before
+  `credentials_split_v1` latched on a host that has since been removed without
+  running this build. If the user is external, an administrator marks it:
+
+  ```bash
+  lv user mark-external <username>
+  ```
+
+  The command is audited (`user.mark-external`), admin-only, refused for an
+  account that holds a local password, and refused while the host it runs on
+  has not caught up with its peers. The mark is an empty credential row with a
+  timestamp older than any real write, so it never replaces a password.
+
+A host that has not synced its users table yet also refuses to create a NEW
+shadow (`Unavailable`): "no row under this name" there may only mean the
+local account has not arrived, and the new row would replace it everywhere.
+
 ### OIDC realm keys
 
 Under `auth.realms[].oidc:`. `issuer_url`, `client_id`, and `redirect_url` are

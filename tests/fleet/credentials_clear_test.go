@@ -510,3 +510,92 @@ func TestFleet_CredentialsClear_ASettledUsersTieDoesNotHoldBackCredentials(t *te
 			"back the peer's credentials, and the rotated-out password keeps working", u)
 	}
 }
+
+// TestFleet_CredentialsClear_AStaleNodesShadowNeverReplacesALocalAccount
+// (re-review 2, Info; pre-existing on main): a node whose users table is behind
+// — cut off while a local account was created — finds no row under that name
+// and creates an external shadow for an LDAP login. That row is newer than the
+// cluster's local account; before this, it replaced the account cluster-wide
+// (role and password). Every node that holds the local account must refuse
+// it: a different account under a live local account's name.
+func TestFleet_CredentialsClear_AStaleNodesShadowNeverReplacesALocalAccount(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: 2694})
+	a, b, j := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	c.WaitConverged(t, convergeTimeout)
+	c.Isolate(j)
+	if _, err := c.SelfClient(a).CreateUser(ctx, &pb.CreateUserRequest{
+		Username: "carol", Password: "c4rol-pass", Role: "operator",
+	}); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	c.WaitConverged(t, convergeTimeout, a, b)
+
+	// j's replica caught up before it was cut off, so nothing tells it its
+	// users table is behind: the shadow is created there. users.created_at
+	// has one-second resolution; a real shadow comes later than this.
+	time.Sleep(1100 * time.Millisecond)
+	_ = auth.EnsureUserShadow(ctx, j.DB, &auth.Principal{Subject: "carol", Realm: "ldap:corp"}, "viewer")
+	c.ClearLinkFaults()
+	time.Sleep(2 * time.Second)
+	for _, n := range []*Node{a, b} {
+		corrosion.NewAntiEntropy(n.DB, n.PKIDir, 0).RunOnce(ctx)
+	}
+	for _, n := range []*Node{a, b} {
+		u, gerr := corrosion.GetUser(ctx, n.DB, "carol")
+		if gerr != nil || u == nil || u.Role != "operator" || u.PasswordHash == "" {
+			t.Errorf("%s holds carol as %+v (err %v): a stale node's shadow replaced the local account", n.Name, u, gerr)
+		}
+		if _, lerr := c.SelfClient(n).Login(ctx, &pb.LoginRequest{Username: "carol", Password: "c4rol-pass"}); lerr != nil {
+			t.Errorf("%s: carol's local password no longer works: %v", n.Name, lerr)
+		}
+	}
+}
+
+// TestFleet_CredentialsClear_AHostBackFromOfflineNeverTakesACleardLocalAccountForExternal
+// (re-review 2, N1): a host that was off across the clear and comes back with
+// its old database records a baseline from that database — where admin still
+// had a password. Its sensitive lane lags; the cleared admin row arrives. An
+// LDAP principal named admin is refused there, and its first pass writes no
+// floor row for admin.
+func TestFleet_CredentialsClear_AHostBackFromOfflineNeverTakesACleardLocalAccountForExternal(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: 2695})
+	a, b, s := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	if err := corrosion.InsertUser(ctx, a.DB, "admin", "admin", "$2a$10$cluster-admin-hash"); err != nil {
+		t.Fatal(err)
+	}
+	c.WaitConverged(t, convergeTimeout)
+	c.Isolate(s) // switched off with its database
+	latchAndClear(t, a, b)
+	c.WaitConverged(t, convergeTimeout, a, b)
+
+	// s comes back on this build: the baseline is recorded from its old rows.
+	if err := s.DB.NoteCredentialsBaseline(ctx); err != nil {
+		t.Fatal(err)
+	}
+	c.ClearLinkFaults()
+	c.SetLinkFault(a, s, LinkFault{Block: true})
+	c.SetLinkFault(b, s, LinkFault{Block: true})
+	restoreA := a.DoNotImplement("GetSensitiveStateDigest")
+	restoreB := b.DoNotImplement("GetSensitiveStateDigest")
+	defer restoreA()
+	defer restoreB()
+	corrosion.NewAntiEntropy(s.DB, s.PKIDir, 0).RunOnce(ctx)
+	if got := oldColumn(t, s, `SELECT password_hash FROM users WHERE username = 'admin'`); got != "" {
+		t.Fatalf("precondition: %s still holds admin's old hash", s.Name)
+	}
+	ldap := func() error {
+		return auth.EnsureUserShadow(ctx, s.DB, &auth.Principal{Subject: "admin", Realm: "ldap:corp"}, "viewer")
+	}
+	if err := ldap(); err == nil {
+		t.Fatal("an LDAP principal adopted the cleared local admin on a host back from offline")
+	}
+	latchAndSplit(t, s)
+	if err := ldap(); err == nil {
+		t.Fatal("after its first pass, the host let an LDAP principal adopt the cleared local admin")
+	}
+	if rows, err := s.DB.Query(ctx, `SELECT COUNT(*) AS n FROM user_credentials WHERE username = 'admin'`); err != nil || rows[0].Int64("n") != 0 {
+		t.Errorf("the host wrote a floor credential row for the cleared local admin (err %v)", err)
+	}
+}

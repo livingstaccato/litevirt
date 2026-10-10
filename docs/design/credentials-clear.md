@@ -138,12 +138,16 @@ credential row arrives it refuses an external login under that name
 lasts until its sensitive lane merges. A node whose gates open together
 decides before its own clears are in view.
 
-Known limit: a host that holds its users rows across an outage spanning the
-clear (switched off with data, upgraded to this build while off) records a
-"held" baseline and may treat a cleared local account as external if its
-first pass runs before anti-entropy has brought the cleared rows' credentials.
-docs/upgrades.md already requires such a host to be upgraded before it rejoins;
-reseed it instead if it was off across the latch.
+The evidence is PER USER and bound to the users row's identity (username and
+created_at): the credentials baseline lists the users that had an empty old
+column and no credential row in this node's own database when this build
+first started on it (fsynced, bound to the state.db incarnation, recorded
+before replication starts), and the external-seen set lists the shadows this
+node created itself. A local account that is cleared later never matches it,
+and neither does a name deleted and created again. Where no host holds
+evidence for a pre-split external user (its hosts were replaced, not
+upgraded), an administrator states it with `lv user mark-external`, which
+writes the same floor row.
 
 ## Tests
 

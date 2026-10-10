@@ -22,6 +22,7 @@ func newUserCmd() *cobra.Command {
 		newUserCreateCmd(),
 		newUserListCmd(),
 		newUserDeleteCmd(),
+		newUserMarkExternalCmd(),
 		newUserPasswdCmd(),
 		newTokenCreateCmd(),
 		newTokenRevokeCmd(),
@@ -152,6 +153,25 @@ func newUserDeleteCmd() *cobra.Command {
 					return err
 				}
 				fmt.Printf("Deleted user %q\n", args[0])
+				return nil
+			})
+		},
+	}
+}
+
+// newUserMarkExternalCmd marks an existing user with no local password as an
+// external-realm (LDAP/OIDC) user (docs/auth.md).
+func newUserMarkExternalCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "mark-external <username>",
+		Short: "Mark a user with no local password as an external-realm (LDAP/OIDC) user",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				if _, err := c.MarkUserExternal(ctx, &pb.MarkUserExternalRequest{Username: args[0]}); err != nil {
+					return err
+				}
+				fmt.Printf("Marked user %q as an external-realm user\n", args[0])
 				return nil
 			})
 		},

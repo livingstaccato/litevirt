@@ -220,33 +220,48 @@ of acting — it says nothing about whether the resulting rows have replicated.
   Every node elects the same relays (`internal/corrosion/relay.go`): `active`,
   non-witness hosts first, in name order, then the rest. A host whose probes
   keep failing is a poor relay, so the failover lease holder reads the voters'
-  probe verdicts and **demotes** it: when at least a third of its voter
-  observers (minimum one) report probe failures on every evaluation across 2
-  minutes, and the host is not a fence candidate, it writes a
+  probe verdicts and **demotes** it: when enough of its voter observers report
+  probe failures on every evaluation across 2 minutes — a third of them, never
+  fewer than 2, and a majority of the voters when there are 4 or fewer (an
+  adopted voter generation can be that small in a large cluster, where a third
+  would be a single voter's view); one rule for voter and non-voter hosts — and the host is not a fence candidate, it writes a
   `relay_demoted/<host>` row in `cluster_policies`, and every node then treats
   the host as ineligible. It stays a leaf and keeps receiving replication; only
   the relay role is withheld.
   - An observer's standing healthy verdict counts whatever its age (a healthy
     verdict is published once, when it changes); a failing verdict counts only
     while it is fresh (failing verdicts are re-published every probe).
-  - An observer failing more than half of the hosts it observes is the fault,
-    not its targets, and is not counted.
+  - An observer failing more than half of the active, non-witness hosts it
+    observes is the fault, not its targets, and is not counted. Verdicts about
+    hosts that are down (offline, fenced, in maintenance), removed or
+    tombstoned do not count toward that: every live observer fails a
+    powered-off host.
   - A demoted host is restored after 10 minutes below that bar, with at least
     one active observer holding a verdict on it.
   - At most one host changes per cycle. A demotion never leaves fewer eligible
     hosts than the election's relay count (the base of 3 plus one per 50
-    hosts), so a demoted host is never elected back in to fill a slot; and if
-    every host is ineligible, relays are still elected by name order.
+    hosts), counting only hosts in gossip membership, so a demoted host is
+    never elected back in to fill a slot; and if every host is ineligible,
+    relays are still elected by name order.
   - An alternating fail/ok pattern never demotes: one evaluation below the bar
     restarts the window.
   - The demotion row of a removed host is cleared, so a host later added under
     that name does not start out demoted.
 
+  **Seeing it:** `lv cluster relay-restore` with no argument lists every
+  demoted or restored host with since when and why, and every operator hold
+  with its expiry. `litevirt_relay_demoted` (1 per demoted host) and
+  `litevirt_relay_hold_seconds` (time left on each hold) report the same
+  state; `litevirt_relay_role` shows each node's election, one series per
+  member (1 relay, 0 leaf) — a demoted host reads 0 on every node, but so does
+  any leaf.
+
   **Stand-down:** `lv cluster relay-restore <host>` (admin, audited) clears a
   demotion at once for the whole cluster; `--hold 1h` keeps the lease holder
   from demoting it again until the hold runs out, for a fault that is not the
-  host's. `litevirt_relay_role` shows each node's election, one series per
-  member (1 relay, 0 leaf); a demoted host reads 0 on every node. Nothing is
+  host's. The hold is a row of its own (`relay_hold/<host>`) that the lease
+  holder never writes, so its own rows cannot erase it; a host found demoted
+  under a hold is restored at once. Nothing is
   demoted until the `relay_health_v1` token has latched
   ([upgrades.md](upgrades.md#health-aware-relays-need-every-host-upgraded)).
 - **A peer that stops acknowledging stops pinning the log.** `mutation_log` is

@@ -797,6 +797,7 @@ before.
 `failover_scope_v1`, with no flag: a flag would let one node elect a different
 relay set from its peers. A demotion withholds the relay role only, and a host
 is restored on its own after 10 minutes below the demotion bar. The
+state is listed by `lv cluster relay-restore` with no argument, and the
 stand-down is `lv cluster relay-restore <host> [--hold <duration>]` (admin):
 it clears the demotion at once for the whole cluster and, with a hold, keeps
 the lease holder from demoting the host again until the hold runs out. A

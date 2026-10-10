@@ -171,9 +171,13 @@ func TestResolveHostAccess_Devices(t *testing.T) {
 	if strings.Contains(block, "lxc.hook") {
 		t.Errorf("a devices-only block carries the mount hook:\n%s", block)
 	}
-	// Exact listing only: /dev/zero is under /dev but not listed.
+	// Exact listing only: /dev/zero is under /dev but not listed, and a
+	// listed entry is never a prefix of another node's name.
 	if _, _, err := ResolveHostAccess(nil, []Device{{HostPath: "/dev/zero"}}, access); err == nil {
 		t.Error("a device not listed exactly was allowed")
+	}
+	if _, _, err := ResolveHostAccess(nil, []Device{{HostPath: "/dev/null"}}, HostAccess{DevicePaths: []string{"/dev/nul"}}); err == nil {
+		t.Error("a listed name allowed every node it is a prefix of")
 	}
 	// Even listed, the kernel-memory and KVM nodes are refused.
 	for _, p := range []string{"/dev/mem", "/dev/kmem", "/dev/port", "/dev/kvm", "/dev/vhost-net"} {
@@ -278,10 +282,17 @@ func TestCheckHostAccessForStart(t *testing.T) {
 	if err := r.checkHostAccessForStart("c1"); err == nil {
 		t.Error("a block nobody authorized passed")
 	}
-	// A record that cannot be read refuses; only a missing one reads as none.
+	// A record that cannot be read refuses; only a missing one reads as none —
+	// even for a config with no block, which "none" would otherwise pass.
 	_ = os.Mkdir(filepath.Join(dir, hostAccessFile), 0o700)
 	if err := r.checkHostAccessForStart("c1"); err == nil {
 		t.Error("an unreadable record read as nothing authorized")
+	}
+	r3 := &LxcRunner{Lxcpath: t.TempDir()}
+	d3 := containerDir(t, r3, "c3", "lxc.uts.name = c3\n")
+	_ = os.Mkdir(filepath.Join(d3, hostAccessFile), 0o700)
+	if err := r3.checkHostAccessForStart("c3"); err == nil {
+		t.Error("an unreadable record (no block) did not refuse the start")
 	}
 	_ = os.Remove(filepath.Join(dir, hostAccessFile))
 	_ = os.WriteFile(filepath.Join(dir, hostAccessFile), []byte("{"), 0o600)

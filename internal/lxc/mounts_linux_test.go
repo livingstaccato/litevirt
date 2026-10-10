@@ -38,6 +38,17 @@ func TestOpenBeneath_SwappedSymlinkIsNotFollowed(t *testing.T) {
 		unix.Close(fd)
 		t.Fatal("a symlink swapped in after the check was followed")
 	}
+	// A symlink that stays INSIDE the prefix is refused too: it would hand
+	// the container another tree the admin did not name (another container's).
+	_ = os.Remove(filepath.Join(prefix, "data"))
+	_ = os.MkdirAll(filepath.Join(prefix, "other"), 0o755)
+	if err := os.Symlink("other", filepath.Join(prefix, "data")); err != nil {
+		t.Fatal(err)
+	}
+	if fd, err := openBeneath(prefix, "data"); err == nil {
+		unix.Close(fd)
+		t.Fatal("a symlink to another tree inside the prefix was followed")
+	}
 	// A symlink in a deeper component, an escape and an absolute rel too.
 	_ = os.MkdirAll(filepath.Join(prefix, "d2"), 0o755)
 	_ = os.Symlink("../../secret", filepath.Join(prefix, "d2", "up"))

@@ -51,6 +51,16 @@ func WorkloadsOnRemovedHost(ctx context.Context, c *Client, host string) ([]stri
 // still blocks the name: it is the claim path's to recover, and a new machine
 // would start it (kvm003 drill 6). A container failover marked
 // relocate-skipped was running when its host died, so it still blocks.
+//
+// A VM failover HELD on the machine does not block either: a restart-same VM
+// with a host-local disk, which failover leaves on its host to wait for it
+// (an open vm_failover_held record naming the host, internal/failover
+// restart_same.go). Like a stopped one its data is on the removed machine,
+// and the machine coming back is the hold's own exit; on main the claim path
+// had moved such a VM, so the name was admitted. A different machine under
+// the name would refuse to start it on a disk it does not have
+// (vm_disk_missing), never rebuild it blank. Read at admission, from the
+// record alone: nothing is written for it.
 func WorkloadsBlockingReadmission(ctx context.Context, c *Client, host string) ([]string, error) {
 	live, err := c.Query(ctx, `SELECT 1 FROM hosts WHERE name = ? AND deleted_at IS NULL`, host)
 	if err != nil {
@@ -61,6 +71,10 @@ func WorkloadsBlockingReadmission(ctx context.Context, c *Client, host string) (
 	}
 	rows, err := c.Query(ctx, `SELECT 'vm/' || name AS w FROM vms
 		  WHERE host_name = ? AND deleted_at IS NULL AND state <> 'stopped'
+		    AND NOT EXISTS (SELECT 1 FROM health_conditions hc
+		      WHERE hc.evaluator = 'vm_disk' AND hc.code = 'vm_failover_held' AND hc.subject_kind = 'vm'
+		        AND hc.subject_id = vms.name || '@' || vms.host_name
+		        AND hc.lifecycle <> 'resolved' AND hc.deleted_at IS NULL)
 		UNION SELECT 'ct/' || name AS w FROM containers
 		  WHERE host_name = ? AND deleted_at IS NULL
 		    AND NOT (state = 'stopped' AND COALESCE(state_detail, '') <> ?)`,

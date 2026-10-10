@@ -1,6 +1,7 @@
 package health
 
 import (
+	"context"
 	"log/slog"
 	"os"
 	"sync"
@@ -23,7 +24,8 @@ import (
 //
 // So on a transfer the file is set aside (renamed, not deleted: it may hold
 // the only copy of data an operator wants back; superseded_retention.go says
-// when it goes) and the start treats the disk
+// when it goes, and stranded_disk.go records it on the VM) and the start
+// treats the disk
 // as missing — rebuilding the overlay at its recorded size, or failing if
 // there is nothing to rebuild from. The one file a transfer keeps is a disk it
 // rebuilt itself, for this same proof, on an earlier attempt that then failed
@@ -75,7 +77,7 @@ func (t *transferDisks) builtFor(path, proofID string) bool {
 // setAsideSupersededDisk renames a file found at a host-local disk's path at
 // the start of an ownership transfer onto this host, and returns where it went
 // ("" when nothing was there or it was kept).
-func (r *Reconciler) setAsideSupersededDisk(vmName, proofID string, d corrosion.DiskRecord) (string, error) {
+func (r *Reconciler) setAsideSupersededDisk(ctx context.Context, vmName, proofID string, d corrosion.DiskRecord) (string, error) {
 	if !isHostLocalDisk(d) || d.Path == "" {
 		return "", nil
 	}
@@ -94,6 +96,10 @@ func (r *Reconciler) setAsideSupersededDisk(vmName, proofID string, d corrosion.
 	}
 	slog.Warn("reconciler: a failover onto this host found an old copy of the VM's disk; set it aside and will not boot it",
 		"vm", vmName, "disk", d.DiskName, "path", d.Path, "set_aside_to", aside,
-		"retention", "removed once past superseded_disk_retention_days; lv host superseded-disks lists it")
+		"retention", "kept while the VM exists; lv host superseded-disks lists it")
+	// It may be the only copy of data the VM held before an earlier failover:
+	// recorded, with its path, on the VM (stranded_disk.go).
+	r.surfaceSetAside(ctx, vmName, d.DiskName, d.Path, aside,
+		"a failover onto "+r.hostName+" found an old copy of the VM's disk and set it aside")
 	return aside, nil
 }

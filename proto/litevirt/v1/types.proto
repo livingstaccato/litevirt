@@ -476,6 +476,19 @@ message VM {
     // Set by InspectVM/GetVM; not by ListVMs.
     string                         health        = 15;
     string                         health_detail = 16; // why, in words: the probe's last failure reason, etc.
+    // stranded_disks are the VM's host-local disks a failover left on another
+    // host: the VM was restarted elsewhere on a disk rebuilt from its image,
+    // and its real data is there (condition vm_disk_stranded). Each is kept
+    // while the VM exists. Set by InspectVM/GetVM; not by ListVMs.
+    repeated VMStrandedDisk        stranded_disks = 17;
+}
+
+message VMStrandedDisk {
+    string host  = 1;  // the host holding it
+    string disk  = 2;
+    string path  = 3;  // the disk's path on that host
+    string copy  = 4;  // where that host set it aside; "" while it is still at path (host down)
+    string since = 5;  // RFC3339
 }
 
 message VMInterface {

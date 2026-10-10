@@ -870,34 +870,132 @@ Set in compose `migrate` section:
 | Policy | Behavior |
 |--------|----------|
 | `restart-any` | Restart on any available healthy host |
-| `restart-same` | Wait for original host to recover |
+| `restart-same` | With any host-local disk: wait for the original host, which starts it there on its real disk when it is back. With every disk on shared storage: restart on any available healthy host, like `restart-any`, on its real disks |
 | `none` | Do not reschedule |
 
 A policy applies to every VM on the failed host except a stopped one, which
 is never started by failover: see *Stopped workloads* below.
 
+A `restart-same` VM with a host-local disk is not restarted anywhere else,
+because that would start it on a disk rebuilt blank from its image. It stays
+on its host, and failover records why: the condition `vm_failover_held`
+(subject `vm/<name>@<host>`, a warning), a `vm.failover.held` event, a
+`failover.skip` audit entry and a `vm.disk.stranded` notification, each naming
+the host and what you can do. When the host is back and active, it starts the
+VM on its real disk (the domain a power-off fence leaves shut off there is
+started, not recorded stopped), and the record clears. It does so once:
+a VM that crashes after that follows its own restart policy. A stop recorded
+after the host read the VM as running (an `lv stop`, say) wins, and a held VM
+with saved state (a managed-save image) is never cold-booted: it stays held,
+a `vm.failover.held_saved_state` event says so, and `lv start <vm>` resumes
+it. A host comes back
+`fenced` when failover moved any other workload off it: run
+`lv host undrain <host>`. A removed host does not block this: adding the
+machine back under its name (`lv host add`) brings the held VM back with it.
+If the host is gone for good, its data is gone with it: promote a replica if
+there is one (`lv replication promote <vm>`), or remove the host first
+(`lv host rm --dead <host>`, try `--dry-run`) and then the VM (`lv rm <vm>`),
+and create it again; `lv rm` cannot reach a VM on a host that is fenced but
+not removed. The coordinator decides the hold once per fence, so changing the
+policy afterwards takes effect only at the next failover decision for that
+host. There is no
+command that moves it elsewhere onto a blank disk. It counts in the failover metrics with error class `held_for_host`. Before this
+release a `restart-same` VM was restarted on any healthy host whatever its
+disks, because the original host is never available while it is fenced.
+
 A VM with a local disk that is restarted on another host does not get its disk
 back, because the disk stayed on the failed host. The new host rebuilds the disk
-from the VM's image at the disk's recorded size. The new host might still have
-an old copy of the disk from an earlier stay there. The restart never boots that
+from the VM's image at the disk's recorded size. That is the cost
+`restart-any` accepts for a local disk (`lv compose` warns about it when it
+plans such a VM); a VM whose data matters more than its uptime has no failure
+policy (`none`) and waits for its host. The new host might still have an old
+copy of the disk from an earlier stay there. The restart never boots that
 copy. It renames the copy to `<disk path>.superseded-<time>` next to the new
 disk. Each failover rebuilds the disk from the image, so each copy holds its
 own data and not an older version of the current disk.
 
-A host removes a renamed copy once it is older than
-`superseded_disk_retention_days` (default 7 days; `0` keeps every copy). It
-checks hourly. The age comes from the time in the file name. While the VM the
-copy came from is in `error`, `pending` or `starting`, the copy is held, whatever
-its age: a restart that failed may need it put back. The host removes it on
-the first check after the VM leaves that state.
+#### The real disk a restart leaves behind
+
+The restart is not silent, and the real disk is not lost:
+
+- The coordinator records the disk it left on the failed host: the condition
+  `vm_disk_stranded` (subject `vm/<name>@<host>`, a warning, see
+  [diagnostics](diagnostics.md)), a `vm.failover.disk_stranded` event in the
+  VM's history, a `failover.disk-stranded` audit entry and a
+  `vm.disk.stranded` notification. `lv inspect <vm>` lists it under
+  `strandedDisks`, with the host and the path.
+- When the failed host is back, it renames the disk to
+  `<disk path>.superseded-<time>`, so nothing that later moves the VM onto that
+  host can take its place, and records the new name (`lv inspect` shows it as
+  `copy`). It does this only for a host the record names, while the VM's
+  record names another host, and never under a domain of that name that is
+  running there or holds a saved state.
+- An old copy that a restart sets aside, as above, is recorded the same way on
+  the host that holds it.
+
+A copy is retained while the VM it came from exists, in any state: the host
+never removes it on its own. While that VM is in `error`, `pending` or
+`starting` it is also held, because a restart that failed may need it put
+back. Once the VM is deleted, its copies are removed by their host when they
+are older than `superseded_disk_retention_days` (default 7 days; `0` keeps
+every copy). The host checks hourly; the age comes from the time in the file
+name. Before this rule a copy was held only while its VM was in `error`,
+`pending` or `starting`, so seven days after the VM was running again on a
+rebuilt disk the only copy of its data from before the failover was deleted.
 
 To see the copies on a host, with the VM each came from, when it was set aside
-and whether it is held, run `lv host superseded-disks <host>`. Add `--purge`
-to remove every copy that is not held now, whatever its age, and
-`--older-than <duration>` to remove only older ones. Purging needs the admin
-role and is audited (`host.superseded_disks.purge`). To keep a copy, move it
-somewhere else. The check finds copies next to the disk paths the cluster
-records and in the data directory's `disks/` folder.
+and whether it is retained or held, run `lv host superseded-disks <host>`.
+These need the admin role and are audited:
+
+- `--purge` removes every copy that is neither retained nor held, whatever its
+  age; `--older-than <duration>` narrows it (`host.superseded_disks.purge`).
+- `--remove <copy>` removes exactly the named copy, retained or not, never a
+  held one; repeat it to name more (`host.superseded_disks.remove`).
+- `--restore <copy>` puts the copy back as its VM's disk
+  (`host.superseded_disks.restore`). The VM must be stopped on that host. The
+  file it replaces is not deleted: it is set aside and retained in turn.
+
+To run a VM on the real disk a failover left on a host, once that host is
+back:
+
+```bash
+lv host undrain <host>               # it comes back fenced; a migration onto it needs it active
+lv stop <vm>
+lv migrate <vm> <host> --cold        # the stopped VM moves there with its current disk
+lv host superseded-disks <host>      # find the copy
+lv host superseded-disks <host> --restore <copy>
+lv start <vm>
+```
+
+The disk the VM ran on since the failover is kept beside it as another copy;
+remove it with `--remove` once it is not needed. The check finds copies next to
+the disk paths the cluster records and in the data directory's `disks/` folder.
+
+During a rolling upgrade a host on the previous release keeps copies by the
+old rule, from the VM's state alone; nothing this release writes changes a
+VM's state, so it removes nothing it would not have removed before. Two
+consequences follow. A failed host that comes back on the previous release
+does not set the real disk aside, so a cold migration back onto it is refused
+on the occupied path: rename the file there to
+`<disk path>.superseded-<time>` yourself (never delete it), or upgrade the host
+first. And a later failover back onto a host on the previous release sets the
+disk aside by the old rule, and that host's sweep removes it after
+`superseded_disk_retention_days`: upgrade a host before it takes failovers
+back. Ask a host
+on this release for `--remove` and `--restore`: a host on the previous release
+answers with the listing and removes nothing, and the command says so.
+
+Containers are not on this path. A container relocated off a failed host is
+recreated from its image (or restored from a backup) on another host, and its
+own container directory stays on the failed host: nothing sets it aside or
+removes it automatically, and a relocation back onto that host adopts it. It
+is recorded the same way, though: the coordinator raises `ct_rootfs_stranded`
+(evaluator `ct_rootfs`, subject `container/<name>@<host>`, a warning), writes a
+`failover.rootfs-stranded` audit entry and sends a `ct.rootfs.stranded`
+notification; the host, once back, adds the rootfs path; `lv ct inspect <name>`
+shows it ("Left on <host>"). A relocation back onto that host that adopts the
+old rootfs writes a `ct.relocate.adopted` audit entry saying the container runs
+on that data, not a fresh image, and the record clears.
 
 The restart of a VM on its own host never rebuilds a missing disk. That case
 is `vm_disk_missing` in [diagnostics](diagnostics.md).
@@ -953,12 +1051,11 @@ A VM left on the failed host is exactly as it was when the host comes back:
 start it there with `lv start`. A stopped container is always left in place
 and is not relocated.
 
-Restarting a VM that has a host-local disk somewhere else costs the data. The
-new host rebuilds the disk blank from the image. The real disk stays on the
-failed host, where nothing records it any more. A later failover back onto
-that host renames it to `.superseded-<time>`, and it is deleted after
-`superseded_disk_retention_days`. A running VM's failure policy accepts that
-cost; a stopped VM's never does.
+Restarting a VM that has a host-local disk somewhere else costs the VM its
+data until an operator puts it back. The new host rebuilds the disk blank from
+the image, and the real disk stays on the failed host, recorded and kept (see
+*The real disk a restart leaves behind* above). A running VM's failure policy
+accepts that cost; a stopped VM's never does.
 
 The rule is enforced twice. The coordinator decides a stopped VM before
 anything else, before auto-promote. Its write then re-reads the VM's state in

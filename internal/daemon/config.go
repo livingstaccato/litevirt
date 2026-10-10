@@ -132,10 +132,12 @@ type Config struct {
 	VMEventMaxPerVM           int `yaml:"vm_event_max_per_vm"`
 	VMEventPruneHours         int `yaml:"vm_event_prune_hours"`
 
-	// SupersededDiskRetentionDays: how long a disk copy a failover start set
-	// aside (<path>.superseded-<time>) is kept before this host removes it. A
-	// copy is kept whatever its age while its VM is in error, pending or
-	// starting. 0 keeps every copy until removed by hand. Default 7.
+	// SupersededDiskRetentionDays: how long a disk copy a failover set aside
+	// (<path>.superseded-<time>) is kept, once the VM it came from no longer
+	// exists, before this host removes it. While that VM exists the copy is
+	// kept whatever its age and removed only by an operator
+	// (`lv host superseded-disks <host> --remove <copy>`). 0 keeps every copy
+	// until removed by hand. Default 7.
 	SupersededDiskRetentionDays int `yaml:"superseded_disk_retention_days"`
 
 	// Superseded-row GC retention. The core retention applies to provably-inert

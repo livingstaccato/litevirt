@@ -248,9 +248,13 @@ func (c *ContainerChecker) sweep(ctx context.Context) {
 	// exists but its DB row points elsewhere, and its lease must NOT be reclaimed
 	// out from under the pending re-key.
 	if names, lerr := c.runtime.List(ctx); lerr == nil {
+		local := make(map[string]bool, len(names))
 		for _, n := range names {
 			live[n] = true
+			local[n] = true
 		}
+		// Rootfs a relocation off this host left here (stranded_rootfs.go).
+		c.tendStrandedRootfs(ctx, local)
 	}
 	if _, err := network.ReleaseOrphanContainerLeases(ctx, c.db, c.hostName, live, orphanLeaseMinAge); err != nil {
 		slog.Warn("containercheck: orphan-lease GC failed", "error", err)
@@ -311,6 +315,9 @@ func (c *ContainerChecker) recreateRelocated(ctx context.Context, ct corrosion.C
 		if !c.writeRelocatedNICs(ctx, ct.Name, ifs) {
 			return // row write failed → keep the marker, retry next sweep
 		}
+		// One a relocation off this host left behind is adopted as before,
+		// and now said (stranded_rootfs.go) — once the adopt's rows are in.
+		c.noteAdoptedRootfs(ctx, ct.Name)
 		if _, err := network.ReserveContainerNICs(ctx, c.db, c.hostName, ct.Name, relocateLeaseProof(ct), ifs); err != nil {
 			slog.Warn("containercheck: relocate IP re-reservation incomplete", "container", ct.Name, "error", err)
 		}

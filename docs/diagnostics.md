@@ -1783,6 +1783,54 @@ To recover, do one of these:
 - If its data is lost for good, run `lv rebuild <vm>`. It recreates the VM from
   its spec with blank disks and keeps its IP and MAC addresses.
 
+### A VM's real disk is on another host (`vm_disk_stranded`)
+
+A failover restarted a VM with a host-local disk on another host, on a disk
+rebuilt from its image, because that host could not reach the real one (see
+[VM failure policies](migration-failover.md#the-real-disk-a-restart-leaves-behind)).
+The coordinator raises `vm_disk_stranded` (evaluator `vm_disk`, subject
+`vm/<name>@<host>`, warning) naming the host that holds the real disk. The
+evidence lists each disk: its `path` there, and once the host is back and has
+set it aside, its `copy` (`<path>.superseded-<time>`). A host that sets aside an
+old copy it found at a failover start records it the same way. `lv inspect
+<vm>` shows the same list as `strandedDisks`.
+
+| Raised when | Clears when |
+|---|---|
+| A failover restarts the VM elsewhere and leaves a host-local disk on the failed host, or a host sets a copy of the VM's disk aside. | Nothing is left to keep: every copy was removed (`--remove`) or restored (`--restore`), or the VM was deleted. A record for a host removed from the cluster clears once the VM is deleted. |
+
+Every copy is kept while the VM exists. To run the VM on its real disk again,
+or to give the data up, see the commands in
+[migration-failover.md](migration-failover.md#the-real-disk-a-restart-leaves-behind).
+
+### A restart-same VM waits for its host (`vm_failover_held`)
+
+A VM with `on-host-failure: restart-same` and a host-local disk was on a host
+that failed. Failover left it there instead of restarting it elsewhere on a
+disk rebuilt blank from its image. The coordinator raises `vm_failover_held`
+(evaluator `vm_disk`, subject `vm/<name>@<host>`, warning); the evidence names
+the host, the disks and what to do (see
+[VM failure policies](migration-failover.md#vm-failure-policies)). A held VM
+still counts in the failover's stranded-workloads gauge: it is a workload on a
+down host that no other host runs.
+
+| Raised when | Clears when |
+|---|---|
+| Failover leaves a restart-same VM with a host-local disk on its failed host. | The host is back and the VM runs there again (a host that comes back `fenced` needs `lv host undrain <host>` first), or, once the host is back, the VM is on another host or deleted. A record for a host removed from the cluster clears once the VM is deleted or on another host. |
+
+### A relocated container's own rootfs is on another host (`ct_rootfs_stranded`)
+
+Failover relocated a container off a failed host, recreating it from its image
+or restoring it from a backup, and its own container directory, with what it
+wrote since, stayed on the failed host. The coordinator raises
+`ct_rootfs_stranded` (evaluator `ct_rootfs`, subject `container/<name>@<host>`,
+warning). When that host is back it adds the rootfs path to the evidence.
+Nothing moves or removes the rootfs; `lv ct inspect <name>` shows it.
+
+| Raised when | Clears when |
+|---|---|
+| A relocation moves the container off a host that ran it. | No container of that name is left on that host, or a relocation back adopted it (`ct.relocate.adopted` in the audit log). |
+
 ## NetBox IPAM: metrics and health findings
 
 Every counter below is registered on the same `/metrics` endpoint as the rest,

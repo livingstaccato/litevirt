@@ -24,14 +24,14 @@ import (
 // would write unsigned rows that a host under a signing contract cannot
 // legitimately produce, and every node would report them as tampering.
 var auditWriters = map[string]struct{ dir, test string }{
-	"grpcapi.(*Server).auditAs":             {"internal/grpcapi", "TestAuditWriter_RPCRowsAreSigned"},
-	"corrosion.FoldPendingAudit":            {"internal/corrosion", "TestFoldPendingAudit_OneSignedRowAtTheTimeItHappened"},
-	"failover.(*Coordinator).audit":         {"internal/failover", "TestAuditWriter_CoordinatorRowsAreSigned"},
-	"health.(*Reconciler).auditOwnerAssert": {"internal/health", "TestAuditWriter_OwnerAssertRowsAreSigned"},
-	"health.(*ContainerChecker).auditRekey": {"internal/health", "TestAuditWriter_OwnerAssertRowsAreSigned"},
-	"health.auditSettle":                    {"internal/health", "TestAuditWriter_SettleRowsAreSigned"},
-	"daemon.(*Daemon).checkAdminFloor":      {"internal/daemon", "TestAuditWriter_AdminFloorRowsAreSigned"},
-	"corrosion.RecordAuditSeededAssertion":  {"internal/corrosion", "TestAuditSeeded_AnAssertionIsAuditedOnceSigned"},
+	"grpcapi.(*Server).auditAs":                 {"internal/grpcapi", "TestAuditWriter_RPCRowsAreSigned"},
+	"corrosion.FoldPendingAudit":                {"internal/corrosion", "TestFoldPendingAudit_OneSignedRowAtTheTimeItHappened"},
+	"failover.(*Coordinator).audit":             {"internal/failover", "TestAuditWriter_CoordinatorRowsAreSigned"},
+	"health.(*Reconciler).auditOwnerAssert":     {"internal/health", "TestAuditWriter_OwnerAssertRowsAreSigned"},
+	"health.(*ContainerChecker).auditContainer": {"internal/health", "TestAuditWriter_OwnerAssertRowsAreSigned"},
+	"health.auditSettle":                        {"internal/health", "TestAuditWriter_SettleRowsAreSigned"},
+	"daemon.(*Daemon).checkAdminFloor":          {"internal/daemon", "TestAuditWriter_AdminFloorRowsAreSigned"},
+	"corrosion.RecordAuditSeededAssertion":      {"internal/corrosion", "TestAuditSeeded_AnAssertionIsAuditedOnceSigned"},
 }
 
 // rawAuditInserts are the only non-test files allowed to spell an INSERT into

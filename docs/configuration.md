@@ -626,10 +626,12 @@ vm_event_error_retention_days: 90
 vm_event_max_per_vm: 1000
 vm_event_prune_hours: 24
 
-# Disk copies a failover start set aside (<disk path>.superseded-<time>, see
-# migration-failover.md "VM failure policies") are removed by their host once
-# older than this, except while their VM is in error, pending or starting.
-# 0 keeps every copy until removed with `lv host superseded-disks --purge`.
+# Disk copies a failover set aside (<disk path>.superseded-<time>, see
+# migration-failover.md "VM failure policies") are kept while the VM they came
+# from exists, whatever its state: only `lv host superseded-disks <host>
+# --remove <copy>` removes one then. Once the VM is gone, its copies are
+# removed by their host when older than this. 0 keeps every copy until removed
+# with `lv host superseded-disks --purge` or `--remove`.
 superseded_disk_retention_days: 7
 
 # Post-upgrade health watchdog. After a self-upgrade re-exec, verify the NEW

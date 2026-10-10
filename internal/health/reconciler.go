@@ -146,6 +146,13 @@ type Reconciler struct {
 
 	// transferDisks: disks a pending transfer rebuilt here (superseded_disk.go).
 	transferDisks transferDisks
+	// onDiskStranded: notified for each disk this host sets aside
+	// (stranded_disk.go); nil = no notification.
+	onDiskStranded func(vm, host, detail string)
+	// heldSavedNoted: held VMs whose saved state was reported, once each
+	// (stranded_disk.go, noteHeldSavedState).
+	heldSavedMu    sync.Mutex
+	heldSavedNoted map[string]bool
 	// deferredTransfers: proof-less transfers parked in "starting" while their
 	// backing image transfers (missing_disk.go).
 	deferredTransfers deferredTransfers
@@ -603,6 +610,7 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 	}
 
 	r.resolveDiskMissing(ctx)
+	r.tendStrandedDisks(ctx)
 	r.cleanupRekeyLeftovers(ctx)
 
 	for _, vm := range vms {
@@ -709,6 +717,12 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 			} else if pending {
 				slog.Info("reconciler: VM is shut off with a cutover handoff still owed — not syncing",
 					"vm", vm.Name)
+				break
+			}
+			// A restart-same VM failover held for this host is owed a start,
+			// not a stop sync: a power-off fence leaves its domain defined
+			// and shut off here (stranded_disk.go, startHeldVM).
+			if r.startHeldVM(ctx, vm, st) {
 				break
 			}
 			newState, detail, sync := classifyStop(st.State, st.Reason)
@@ -1201,6 +1215,16 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		r.releaseVMLock(ctx, vm.Name)
 		return
 	}
+	// A start decided from a running row (the self-heal, a held VM's start)
+	// is for a VM the walk read as running here. A stop recorded since —
+	// `lv stop`, or any other — wins: operator intent is never overridden
+	// by a start decided from an older read.
+	if vm.State == "running" && (fresh.State != "running" || IsOperatorStop(fresh.StateDetail)) {
+		slog.Info("reconciler: VM was stopped after the walk read it running; not starting it",
+			"vm", vm.Name, "state", fresh.State, "detail", fresh.StateDetail)
+		r.releaseVMLock(ctx, vm.Name)
+		return
+	}
 	// Releasing the lease is CLEANUP, and cleanup must not inherit the caller's
 	// deadline. reconcilePass bounds this walk with reconcileWalkBudget; on the
 	// very case that budget exists for, it expires mid-start and the DELETE
@@ -1515,7 +1539,7 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	var diskConfigs []lv.DiskConfig
 	for _, d := range diskRecords {
 		if transfer {
-			if _, err := r.setAsideSupersededDisk(vm.Name, proofID, d); err != nil {
+			if _, err := r.setAsideSupersededDisk(ctx, vm.Name, proofID, d); err != nil {
 				r.failPendingStart(ctx, vm.Name, proofID, true,
 					fmt.Sprintf("set aside the old copy of disk %s found at %s: %v", d.DiskName, d.Path, err))
 				return

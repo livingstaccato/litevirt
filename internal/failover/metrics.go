@@ -106,6 +106,10 @@ const (
 	// ErrStopped: the workload is stopped, so failover leaves it on its
 	// host with its disks and never starts or moves it.
 	ErrStopped = "stopped"
+	// ErrHeldForHost: a restart-same VM with a host-local disk is left on its
+	// failed host to wait for it, never restarted elsewhere on a blank disk
+	// (restart_same.go).
+	ErrHeldForHost = "held_for_host"
 	// ErrLocalStall: quorum agreed a host failed, but this coordinator itself
 	// stopped running within health.StallGrace, so the fence is deferred.
 	ErrLocalStall = "local_stall"

@@ -112,6 +112,14 @@ func printContainerDetail(d *pb.ContainerDetail) error {
 	if err := w.Flush(); err != nil {
 		return err
 	}
+	for _, l := range d.GetStrandedRootfs() {
+		where := l.GetHost()
+		if l.GetPath() != "" {
+			where += ":" + l.GetPath()
+		}
+		fmt.Printf("\nLeft on %s: its own rootfs from before a relocation (%s to %s, %s); nothing removes it\n",
+			where, l.GetHow(), orDash(l.GetMovedTo()), orDash(l.GetSince()))
+	}
 	if !d.GetHostDetail() {
 		fmt.Printf("\n(host %s did not answer: privilege, rootfs and backup availability are unknown)\n", c.GetHostName())
 	}

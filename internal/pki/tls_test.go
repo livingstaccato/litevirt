@@ -41,8 +41,14 @@ func TestServerTLSConfig(t *testing.T) {
 	if cfg.MinVersion != tls.VersionTLS13 {
 		t.Error("should enforce TLS 1.3 minimum")
 	}
-	if len(cfg.Certificates) != 1 {
-		t.Errorf("expected 1 cert, got %d", len(cfg.Certificates))
+	// The identity is served by GetCertificate, never pinned in Certificates:
+	// peers dial IP literals (no SNI), and crypto/tls only consults the getter
+	// for such a hello when Certificates is empty.
+	if len(cfg.Certificates) != 0 {
+		t.Errorf("a static server certificate would shadow the hot-reloaded one, got %d", len(cfg.Certificates))
+	}
+	if c, err := cfg.GetCertificate(&tls.ClientHelloInfo{}); err != nil || c == nil {
+		t.Errorf("GetCertificate: %v, %v", c, err)
 	}
 	if cfg.ClientCAs == nil {
 		t.Error("ClientCAs should not be nil")
@@ -175,8 +181,11 @@ func TestPeerTLSConfig(t *testing.T) {
 	if cfg.ClientCAs == nil {
 		t.Error("ClientCAs should not be nil")
 	}
-	if len(cfg.Certificates) != 1 {
-		t.Errorf("expected 1 cert, got %d", len(cfg.Certificates))
+	if c, err := cfg.GetCertificate(&tls.ClientHelloInfo{}); err != nil || c == nil {
+		t.Errorf("GetCertificate: %v, %v", c, err)
+	}
+	if c, err := cfg.GetClientCertificate(&tls.CertificateRequestInfo{}); err != nil || c == nil {
+		t.Errorf("GetClientCertificate: %v, %v", c, err)
 	}
 }
 

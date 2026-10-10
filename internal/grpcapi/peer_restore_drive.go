@@ -79,7 +79,21 @@ func (s *Server) drivePeerRestore(ctx context.Context, target, repoName, name, t
 	if err != nil {
 		return corrosion.RestoreNotAttempted, fmt.Errorf("dial target: %w", err)
 	}
-	defer closeConn()
+	defer func() { closeConn() }()
+	// restoreClient is a FRESH connection for RestoreContainer. The push can run
+	// for minutes, and a renewal of either host's certificate meanwhile drains
+	// the connection it was made on: the push in flight finishes, but no new
+	// RPC starts there (pki.ConnTracker), so the restore must not reuse it.
+	restoreClient := func() (pb.LiteVirtClient, error) {
+		closeConn()
+		rc, rclose, err := s.dialPeer(ctx, target)
+		if err != nil {
+			closeConn = func() {}
+			return nil, fmt.Errorf("dial target for the restore: %w", err)
+		}
+		closeConn = rclose
+		return rc, nil
+	}
 
 	octx := ctx
 	if len(mdPairs) > 0 {
@@ -97,7 +111,11 @@ func (s *Server) drivePeerRestore(ctx context.Context, target, repoName, name, t
 		token, perr := s.pushManifestToStaging(ctx, c, srcRepo, name, timestamp)
 		switch {
 		case perr == nil:
-			rs, e := c.RestoreContainer(octx, lineage.on(&pb.RestoreContainerRequest{
+			rc, derr := restoreClient()
+			if derr != nil {
+				return corrosion.RestoreNotAttempted, derr
+			}
+			rs, e := rc.RestoreContainer(octx, lineage.on(&pb.RestoreContainerRequest{
 				StagingToken: token, Name: name, Timestamp: timestamp, HostName: target, Start: start, Proof: proof,
 			}))
 			if e != nil {
@@ -113,6 +131,12 @@ func (s *Server) drivePeerRestore(ctx context.Context, target, repoName, name, t
 
 	// Shared-repo fallback: the target re-opens repoName in its own config (the
 	// pre-PR-4 behavior; only works when the repo is reachable from both hosts).
+	if srcRepo != nil {
+		// The refused push used c; the restore gets its own connection too.
+		if c, err = restoreClient(); err != nil {
+			return corrosion.RestoreNotAttempted, err
+		}
+	}
 	rs, e := c.RestoreContainer(octx, lineage.on(&pb.RestoreContainerRequest{
 		RepoPath: repoName, Name: name, Timestamp: timestamp, HostName: target, Start: start, Proof: proof,
 	}))

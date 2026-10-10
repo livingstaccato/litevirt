@@ -7,6 +7,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 )
 
 // The explicit voter set (colonelpanik/litevirt#251 step 2,
@@ -178,6 +180,36 @@ func ListVoterConfigs(ctx context.Context, c *Client) ([]*VoterConfig, error) {
 		}
 		out = append(out, v)
 	}
+	return out, nil
+}
+
+// VoterConfigsFromPages decodes the voter_configs rows of a paged table pull
+// (StreamTableRows) — a PEER's rows, oldest generation first, tombstoned rows
+// skipped. They are unverified: what a peer's database holds says nothing
+// until its certificate verifies here.
+func VoterConfigsFromPages(pages []*pb.TableRowsPage) ([]*VoterConfig, error) {
+	var out []*VoterConfig
+	for _, p := range pages {
+		if p.GetTable() != "voter_configs" {
+			continue
+		}
+		rows, err := decodePageRows(p)
+		if err != nil {
+			return nil, err
+		}
+		for _, vals := range rows {
+			r := Row{Columns: p.GetColumns(), Values: vals}
+			if r.String("deleted_at") != "" {
+				continue
+			}
+			v, err := scanVoterConfig(r)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, v)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Generation < out[j].Generation })
 	return out, nil
 }
 

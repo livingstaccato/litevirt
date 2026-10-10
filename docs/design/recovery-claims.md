@@ -603,8 +603,11 @@ pending, the same way every other gate refusal does:
    `cert.value_digest`, and each `voter_incarnation` matches that member's
    entry.
 5. For each accept: `cert_pem` chains to the cluster CA, its CN equals `voter`,
-   it is not listed in `cluster_crl`, and `signature` verifies over the accept
-   payload.
+   it is not listed in `cluster_crl`, the destination holds no standing
+   CA-issued renewal successor of it (the serial pin, `ClaimVerifier.WithSerialPin`;
+   see docs/auth.md, "Superseded certificates" — its authority is the
+   successor's CA signature, never the peer-writable `hosts.cert_serial`), and
+   `signature` verifies over the accept payload.
 
 Signatures, not a live read, are what make this safe. A certificate in a
 replicated row can be written by any peer. Without signatures, a forged row
@@ -885,6 +888,30 @@ reset or genesis boundary pins nothing below it, and nothing below it governs
 anything any more. Judging each signature "as of the time it was signed" by
 timestamps instead would trust a `created_at` that the signers themselves
 chose.
+
+The same pin applies above the anchor: an accept signed with a certificate
+the CA has since replaced by a renewal does not count, whether or not it is
+revoked yet (`lv host renew-cert` revokes it at once). A generation decided
+before one of its signers renewed is therefore adopted after that through one
+of two things:
+
+- **Re-attestation.** The adopting node asks each signer whose accept is
+  signed with a replaced certificate to re-sign it with its current one
+  (`GetRecoveryClaim` with `reattest`). The voter re-signs only the accept in
+  its own durable state for that key — same generation, ballot and value
+  digest — so it adds no vote it did not cast, and a forged row gets nothing
+  from an honest voter. The re-signed accepts join the row's certificate in
+  memory and the result is verified with the pin and today's CRL in force.
+  This needs no majority of anything, so it is also the way out when a
+  majority of the newest generation is stuck below it, where no voter change
+  can be decided (a voter answers a `voter_config` key only at its adopted
+  generation). It is not a new replicated shape and needs no token: the
+  stored row is unchanged, and an older voter ignores the request field.
+- **A newer anchor.** One more voter change, decided with current
+  certificates, anchors the chain above the stuck generation as above.
+
+While neither has happened, `certificate/voter_generation_stuck` names the
+voter it waits on and the voter change that makes an anchor.
 
 If no generation above the adopted one verifies today, there is no anchor,
 and the node adopts nothing whose certificate leans on a revoked key. One

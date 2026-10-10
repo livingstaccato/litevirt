@@ -134,7 +134,7 @@ func (x MoveVolumeProgress_Phase) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use MoveVolumeProgress_Phase.Descriptor instead.
 func (MoveVolumeProgress_Phase) EnumDescriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{84, 0}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{86, 0}
 }
 
 type ReplicateVolumeProgress_Phase int32
@@ -186,7 +186,7 @@ func (x ReplicateVolumeProgress_Phase) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use ReplicateVolumeProgress_Phase.Descriptor instead.
 func (ReplicateVolumeProgress_Phase) EnumDescriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{86, 0}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{88, 0}
 }
 
 type StackVolumeProgress_Stage int32
@@ -247,7 +247,7 @@ func (x StackVolumeProgress_Stage) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use StackVolumeProgress_Stage.Descriptor instead.
 func (StackVolumeProgress_Stage) EnumDescriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{89, 0}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{91, 0}
 }
 
 type BackupSnapshotProgress_Phase int32
@@ -299,7 +299,7 @@ func (x BackupSnapshotProgress_Phase) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use BackupSnapshotProgress_Phase.Descriptor instead.
 func (BackupSnapshotProgress_Phase) EnumDescriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{143, 0}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{145, 0}
 }
 
 type RestoreFromBackupProgress_Phase int32
@@ -348,7 +348,7 @@ func (x RestoreFromBackupProgress_Phase) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use RestoreFromBackupProgress_Phase.Descriptor instead.
 func (RestoreFromBackupProgress_Phase) EnumDescriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{153, 0}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{155, 0}
 }
 
 type BackupContainerProgress_Phase int32
@@ -400,7 +400,7 @@ func (x BackupContainerProgress_Phase) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use BackupContainerProgress_Phase.Descriptor instead.
 func (BackupContainerProgress_Phase) EnumDescriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{179, 0}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{181, 0}
 }
 
 type RestoreContainerProgress_Phase int32
@@ -452,7 +452,7 @@ func (x RestoreContainerProgress_Phase) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use RestoreContainerProgress_Phase.Descriptor instead.
 func (RestoreContainerProgress_Phase) EnumDescriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{181, 0}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{183, 0}
 }
 
 type MigrateContainerProgress_Phase int32
@@ -516,7 +516,7 @@ func (x MigrateContainerProgress_Phase) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use MigrateContainerProgress_Phase.Descriptor instead.
 func (MigrateContainerProgress_Phase) EnumDescriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{183, 0}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{185, 0}
 }
 
 type RestoreLiveProgress_Phase int32
@@ -580,7 +580,7 @@ func (x RestoreLiveProgress_Phase) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use RestoreLiveProgress_Phase.Descriptor instead.
 func (RestoreLiveProgress_Phase) EnumDescriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{227, 0}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{229, 0}
 }
 
 type PromoteReplicaProgress_Phase int32
@@ -638,7 +638,7 @@ func (x PromoteReplicaProgress_Phase) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use PromoteReplicaProgress_Phase.Descriptor instead.
 func (PromoteReplicaProgress_Phase) EnumDescriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{365, 0}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{367, 0}
 }
 
 // ── Hosts ──
@@ -1348,6 +1348,141 @@ func (x *PublishCRLResponse) GetVersion() int64 {
 	return 0
 }
 
+// RevokeReplacedCertificateRequest carries a CRL the CA machine minted with the
+// replaced serial of host added (`lv host renew-cert`). The daemon publishes it
+// at once when that is safe for the voter chain, and otherwise records it as a
+// revocation owed and publishes it as soon as it is.
+type RevokeReplacedCertificateRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Host          string                 `protobuf:"bytes,1,opt,name=host,proto3" json:"host,omitempty"`
+	Serial        string                 `protobuf:"bytes,2,opt,name=serial,proto3" json:"serial,omitempty"`               // lower-case hex
+	CrlPem        string                 `protobuf:"bytes,3,opt,name=crl_pem,json=crlPem,proto3" json:"crl_pem,omitempty"` // must verify against the cluster CA and list serial
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RevokeReplacedCertificateRequest) Reset() {
+	*x = RevokeReplacedCertificateRequest{}
+	mi := &file_litevirt_v1_service_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RevokeReplacedCertificateRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RevokeReplacedCertificateRequest) ProtoMessage() {}
+
+func (x *RevokeReplacedCertificateRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_litevirt_v1_service_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RevokeReplacedCertificateRequest.ProtoReflect.Descriptor instead.
+func (*RevokeReplacedCertificateRequest) Descriptor() ([]byte, []int) {
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *RevokeReplacedCertificateRequest) GetHost() string {
+	if x != nil {
+		return x.Host
+	}
+	return ""
+}
+
+func (x *RevokeReplacedCertificateRequest) GetSerial() string {
+	if x != nil {
+		return x.Serial
+	}
+	return ""
+}
+
+func (x *RevokeReplacedCertificateRequest) GetCrlPem() string {
+	if x != nil {
+		return x.CrlPem
+	}
+	return ""
+}
+
+// revoked: published now. held: recorded as owed (reason says why); the
+// cluster publishes it once the newest voter generation still verifies with
+// the serial revoked.
+type RevokeReplacedCertificateResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Revoked       bool                   `protobuf:"varint,1,opt,name=revoked,proto3" json:"revoked,omitempty"`
+	Held          bool                   `protobuf:"varint,2,opt,name=held,proto3" json:"held,omitempty"`
+	Reason        string                 `protobuf:"bytes,3,opt,name=reason,proto3" json:"reason,omitempty"`
+	Version       int64                  `protobuf:"varint,4,opt,name=version,proto3" json:"version,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RevokeReplacedCertificateResponse) Reset() {
+	*x = RevokeReplacedCertificateResponse{}
+	mi := &file_litevirt_v1_service_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RevokeReplacedCertificateResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RevokeReplacedCertificateResponse) ProtoMessage() {}
+
+func (x *RevokeReplacedCertificateResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_litevirt_v1_service_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RevokeReplacedCertificateResponse.ProtoReflect.Descriptor instead.
+func (*RevokeReplacedCertificateResponse) Descriptor() ([]byte, []int) {
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *RevokeReplacedCertificateResponse) GetRevoked() bool {
+	if x != nil {
+		return x.Revoked
+	}
+	return false
+}
+
+func (x *RevokeReplacedCertificateResponse) GetHeld() bool {
+	if x != nil {
+		return x.Held
+	}
+	return false
+}
+
+func (x *RevokeReplacedCertificateResponse) GetReason() string {
+	if x != nil {
+		return x.Reason
+	}
+	return ""
+}
+
+func (x *RevokeReplacedCertificateResponse) GetVersion() int64 {
+	if x != nil {
+		return x.Version
+	}
+	return 0
+}
+
 type FenceResult struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	HostName      string                 `protobuf:"bytes,1,opt,name=host_name,json=hostName,proto3" json:"host_name,omitempty"`
@@ -1360,7 +1495,7 @@ type FenceResult struct {
 
 func (x *FenceResult) Reset() {
 	*x = FenceResult{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[13]
+	mi := &file_litevirt_v1_service_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1372,7 +1507,7 @@ func (x *FenceResult) String() string {
 func (*FenceResult) ProtoMessage() {}
 
 func (x *FenceResult) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[13]
+	mi := &file_litevirt_v1_service_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1385,7 +1520,7 @@ func (x *FenceResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FenceResult.ProtoReflect.Descriptor instead.
 func (*FenceResult) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{13}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *FenceResult) GetHostName() string {
@@ -1431,7 +1566,7 @@ type GetClusterHealthRequest struct {
 
 func (x *GetClusterHealthRequest) Reset() {
 	*x = GetClusterHealthRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[14]
+	mi := &file_litevirt_v1_service_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1443,7 +1578,7 @@ func (x *GetClusterHealthRequest) String() string {
 func (*GetClusterHealthRequest) ProtoMessage() {}
 
 func (x *GetClusterHealthRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[14]
+	mi := &file_litevirt_v1_service_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1456,7 +1591,7 @@ func (x *GetClusterHealthRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetClusterHealthRequest.ProtoReflect.Descriptor instead.
 func (*GetClusterHealthRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{14}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *GetClusterHealthRequest) GetIncludeResolved() bool {
@@ -1489,7 +1624,7 @@ type HealthCondition struct {
 
 func (x *HealthCondition) Reset() {
 	*x = HealthCondition{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[15]
+	mi := &file_litevirt_v1_service_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1501,7 +1636,7 @@ func (x *HealthCondition) String() string {
 func (*HealthCondition) ProtoMessage() {}
 
 func (x *HealthCondition) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[15]
+	mi := &file_litevirt_v1_service_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1514,7 +1649,7 @@ func (x *HealthCondition) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HealthCondition.ProtoReflect.Descriptor instead.
 func (*HealthCondition) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{15}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *HealthCondition) GetEvaluator() string {
@@ -1635,7 +1770,7 @@ type HealthEvaluatorStatus struct {
 
 func (x *HealthEvaluatorStatus) Reset() {
 	*x = HealthEvaluatorStatus{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[16]
+	mi := &file_litevirt_v1_service_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1647,7 +1782,7 @@ func (x *HealthEvaluatorStatus) String() string {
 func (*HealthEvaluatorStatus) ProtoMessage() {}
 
 func (x *HealthEvaluatorStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[16]
+	mi := &file_litevirt_v1_service_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1660,7 +1795,7 @@ func (x *HealthEvaluatorStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HealthEvaluatorStatus.ProtoReflect.Descriptor instead.
 func (*HealthEvaluatorStatus) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{16}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *HealthEvaluatorStatus) GetEvaluator() string {
@@ -1712,7 +1847,7 @@ type ConnectivityEdge struct {
 
 func (x *ConnectivityEdge) Reset() {
 	*x = ConnectivityEdge{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[17]
+	mi := &file_litevirt_v1_service_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1724,7 +1859,7 @@ func (x *ConnectivityEdge) String() string {
 func (*ConnectivityEdge) ProtoMessage() {}
 
 func (x *ConnectivityEdge) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[17]
+	mi := &file_litevirt_v1_service_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1737,7 +1872,7 @@ func (x *ConnectivityEdge) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ConnectivityEdge.ProtoReflect.Descriptor instead.
 func (*ConnectivityEdge) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{17}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *ConnectivityEdge) GetObserver() string {
@@ -1794,7 +1929,7 @@ type HostCapacityAssessment struct {
 
 func (x *HostCapacityAssessment) Reset() {
 	*x = HostCapacityAssessment{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[18]
+	mi := &file_litevirt_v1_service_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1806,7 +1941,7 @@ func (x *HostCapacityAssessment) String() string {
 func (*HostCapacityAssessment) ProtoMessage() {}
 
 func (x *HostCapacityAssessment) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[18]
+	mi := &file_litevirt_v1_service_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1819,7 +1954,7 @@ func (x *HostCapacityAssessment) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HostCapacityAssessment.ProtoReflect.Descriptor instead.
 func (*HostCapacityAssessment) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{18}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *HostCapacityAssessment) GetHostName() string {
@@ -1917,7 +2052,7 @@ type ClusterHealth struct {
 
 func (x *ClusterHealth) Reset() {
 	*x = ClusterHealth{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[19]
+	mi := &file_litevirt_v1_service_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1929,7 +2064,7 @@ func (x *ClusterHealth) String() string {
 func (*ClusterHealth) ProtoMessage() {}
 
 func (x *ClusterHealth) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[19]
+	mi := &file_litevirt_v1_service_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1942,7 +2077,7 @@ func (x *ClusterHealth) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ClusterHealth.ProtoReflect.Descriptor instead.
 func (*ClusterHealth) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{19}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *ClusterHealth) GetOverall() string {
@@ -1996,7 +2131,7 @@ type RescanHostRequest struct {
 
 func (x *RescanHostRequest) Reset() {
 	*x = RescanHostRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[20]
+	mi := &file_litevirt_v1_service_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2008,7 +2143,7 @@ func (x *RescanHostRequest) String() string {
 func (*RescanHostRequest) ProtoMessage() {}
 
 func (x *RescanHostRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[20]
+	mi := &file_litevirt_v1_service_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2021,7 +2156,7 @@ func (x *RescanHostRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RescanHostRequest.ProtoReflect.Descriptor instead.
 func (*RescanHostRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{20}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *RescanHostRequest) GetName() string {
@@ -2043,7 +2178,7 @@ type RescanHostResponse struct {
 
 func (x *RescanHostResponse) Reset() {
 	*x = RescanHostResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[21]
+	mi := &file_litevirt_v1_service_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2055,7 +2190,7 @@ func (x *RescanHostResponse) String() string {
 func (*RescanHostResponse) ProtoMessage() {}
 
 func (x *RescanHostResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[21]
+	mi := &file_litevirt_v1_service_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2068,7 +2203,7 @@ func (x *RescanHostResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RescanHostResponse.ProtoReflect.Descriptor instead.
 func (*RescanHostResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{21}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *RescanHostResponse) GetAdded() int32 {
@@ -2109,7 +2244,7 @@ type ListHostDevicesRequest struct {
 
 func (x *ListHostDevicesRequest) Reset() {
 	*x = ListHostDevicesRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[22]
+	mi := &file_litevirt_v1_service_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2121,7 +2256,7 @@ func (x *ListHostDevicesRequest) String() string {
 func (*ListHostDevicesRequest) ProtoMessage() {}
 
 func (x *ListHostDevicesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[22]
+	mi := &file_litevirt_v1_service_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2134,7 +2269,7 @@ func (x *ListHostDevicesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListHostDevicesRequest.ProtoReflect.Descriptor instead.
 func (*ListHostDevicesRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{22}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *ListHostDevicesRequest) GetName() string {
@@ -2160,7 +2295,7 @@ type ListHostDevicesResponse struct {
 
 func (x *ListHostDevicesResponse) Reset() {
 	*x = ListHostDevicesResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[23]
+	mi := &file_litevirt_v1_service_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2172,7 +2307,7 @@ func (x *ListHostDevicesResponse) String() string {
 func (*ListHostDevicesResponse) ProtoMessage() {}
 
 func (x *ListHostDevicesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[23]
+	mi := &file_litevirt_v1_service_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2185,7 +2320,7 @@ func (x *ListHostDevicesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListHostDevicesResponse.ProtoReflect.Descriptor instead.
 func (*ListHostDevicesResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{23}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *ListHostDevicesResponse) GetDevices() []*PCIDevice {
@@ -2219,7 +2354,7 @@ type SupersededDisksRequest struct {
 
 func (x *SupersededDisksRequest) Reset() {
 	*x = SupersededDisksRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[24]
+	mi := &file_litevirt_v1_service_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2231,7 +2366,7 @@ func (x *SupersededDisksRequest) String() string {
 func (*SupersededDisksRequest) ProtoMessage() {}
 
 func (x *SupersededDisksRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[24]
+	mi := &file_litevirt_v1_service_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2244,7 +2379,7 @@ func (x *SupersededDisksRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SupersededDisksRequest.ProtoReflect.Descriptor instead.
 func (*SupersededDisksRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{24}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *SupersededDisksRequest) GetHost() string {
@@ -2299,7 +2434,7 @@ type SupersededDisk struct {
 
 func (x *SupersededDisk) Reset() {
 	*x = SupersededDisk{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[25]
+	mi := &file_litevirt_v1_service_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2311,7 +2446,7 @@ func (x *SupersededDisk) String() string {
 func (*SupersededDisk) ProtoMessage() {}
 
 func (x *SupersededDisk) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[25]
+	mi := &file_litevirt_v1_service_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2324,7 +2459,7 @@ func (x *SupersededDisk) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SupersededDisk.ProtoReflect.Descriptor instead.
 func (*SupersededDisk) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{25}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *SupersededDisk) GetPath() string {
@@ -2404,7 +2539,7 @@ type SupersededDisksResponse struct {
 
 func (x *SupersededDisksResponse) Reset() {
 	*x = SupersededDisksResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[26]
+	mi := &file_litevirt_v1_service_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2416,7 +2551,7 @@ func (x *SupersededDisksResponse) String() string {
 func (*SupersededDisksResponse) ProtoMessage() {}
 
 func (x *SupersededDisksResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[26]
+	mi := &file_litevirt_v1_service_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2429,7 +2564,7 @@ func (x *SupersededDisksResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SupersededDisksResponse.ProtoReflect.Descriptor instead.
 func (*SupersededDisksResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{26}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *SupersededDisksResponse) GetHost() string {
@@ -2513,7 +2648,7 @@ type ConfigureHostRequest struct {
 
 func (x *ConfigureHostRequest) Reset() {
 	*x = ConfigureHostRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[27]
+	mi := &file_litevirt_v1_service_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2525,7 +2660,7 @@ func (x *ConfigureHostRequest) String() string {
 func (*ConfigureHostRequest) ProtoMessage() {}
 
 func (x *ConfigureHostRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[27]
+	mi := &file_litevirt_v1_service_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2538,7 +2673,7 @@ func (x *ConfigureHostRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ConfigureHostRequest.ProtoReflect.Descriptor instead.
 func (*ConfigureHostRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{27}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *ConfigureHostRequest) GetName() string {
@@ -2654,7 +2789,7 @@ type CreateVMRequest struct {
 
 func (x *CreateVMRequest) Reset() {
 	*x = CreateVMRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[28]
+	mi := &file_litevirt_v1_service_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2666,7 +2801,7 @@ func (x *CreateVMRequest) String() string {
 func (*CreateVMRequest) ProtoMessage() {}
 
 func (x *CreateVMRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[28]
+	mi := &file_litevirt_v1_service_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2679,7 +2814,7 @@ func (x *CreateVMRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateVMRequest.ProtoReflect.Descriptor instead.
 func (*CreateVMRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{28}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *CreateVMRequest) GetSpec() *VMSpec {
@@ -2720,7 +2855,7 @@ type ListVMsRequest struct {
 
 func (x *ListVMsRequest) Reset() {
 	*x = ListVMsRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[29]
+	mi := &file_litevirt_v1_service_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2732,7 +2867,7 @@ func (x *ListVMsRequest) String() string {
 func (*ListVMsRequest) ProtoMessage() {}
 
 func (x *ListVMsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[29]
+	mi := &file_litevirt_v1_service_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2745,7 +2880,7 @@ func (x *ListVMsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListVMsRequest.ProtoReflect.Descriptor instead.
 func (*ListVMsRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{29}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *ListVMsRequest) GetStackName() string {
@@ -2793,7 +2928,7 @@ type ListVMsResponse struct {
 
 func (x *ListVMsResponse) Reset() {
 	*x = ListVMsResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[30]
+	mi := &file_litevirt_v1_service_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2805,7 +2940,7 @@ func (x *ListVMsResponse) String() string {
 func (*ListVMsResponse) ProtoMessage() {}
 
 func (x *ListVMsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[30]
+	mi := &file_litevirt_v1_service_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2818,7 +2953,7 @@ func (x *ListVMsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListVMsResponse.ProtoReflect.Descriptor instead.
 func (*ListVMsResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{30}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *ListVMsResponse) GetVms() []*VM {
@@ -2844,7 +2979,7 @@ type InspectVMRequest struct {
 
 func (x *InspectVMRequest) Reset() {
 	*x = InspectVMRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[31]
+	mi := &file_litevirt_v1_service_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2856,7 +2991,7 @@ func (x *InspectVMRequest) String() string {
 func (*InspectVMRequest) ProtoMessage() {}
 
 func (x *InspectVMRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[31]
+	mi := &file_litevirt_v1_service_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2869,7 +3004,7 @@ func (x *InspectVMRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InspectVMRequest.ProtoReflect.Descriptor instead.
 func (*InspectVMRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{31}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *InspectVMRequest) GetName() string {
@@ -2888,7 +3023,7 @@ type ListVMHardwareRequest struct {
 
 func (x *ListVMHardwareRequest) Reset() {
 	*x = ListVMHardwareRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[32]
+	mi := &file_litevirt_v1_service_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2900,7 +3035,7 @@ func (x *ListVMHardwareRequest) String() string {
 func (*ListVMHardwareRequest) ProtoMessage() {}
 
 func (x *ListVMHardwareRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[32]
+	mi := &file_litevirt_v1_service_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2913,7 +3048,7 @@ func (x *ListVMHardwareRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListVMHardwareRequest.ProtoReflect.Descriptor instead.
 func (*ListVMHardwareRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{32}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{34}
 }
 
 func (x *ListVMHardwareRequest) GetVmName() string {
@@ -2934,7 +3069,7 @@ type ListVMHardwareResponse struct {
 
 func (x *ListVMHardwareResponse) Reset() {
 	*x = ListVMHardwareResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[33]
+	mi := &file_litevirt_v1_service_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2946,7 +3081,7 @@ func (x *ListVMHardwareResponse) String() string {
 func (*ListVMHardwareResponse) ProtoMessage() {}
 
 func (x *ListVMHardwareResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[33]
+	mi := &file_litevirt_v1_service_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2959,7 +3094,7 @@ func (x *ListVMHardwareResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListVMHardwareResponse.ProtoReflect.Descriptor instead.
 func (*ListVMHardwareResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{33}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *ListVMHardwareResponse) GetDevices() []*HardwareDevice {
@@ -3001,7 +3136,7 @@ type StartVMRequest struct {
 
 func (x *StartVMRequest) Reset() {
 	*x = StartVMRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[34]
+	mi := &file_litevirt_v1_service_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3013,7 +3148,7 @@ func (x *StartVMRequest) String() string {
 func (*StartVMRequest) ProtoMessage() {}
 
 func (x *StartVMRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[34]
+	mi := &file_litevirt_v1_service_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3026,7 +3161,7 @@ func (x *StartVMRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StartVMRequest.ProtoReflect.Descriptor instead.
 func (*StartVMRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{34}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{36}
 }
 
 func (x *StartVMRequest) GetName() string {
@@ -3054,7 +3189,7 @@ type StopVMRequest struct {
 
 func (x *StopVMRequest) Reset() {
 	*x = StopVMRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[35]
+	mi := &file_litevirt_v1_service_proto_msgTypes[37]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3066,7 +3201,7 @@ func (x *StopVMRequest) String() string {
 func (*StopVMRequest) ProtoMessage() {}
 
 func (x *StopVMRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[35]
+	mi := &file_litevirt_v1_service_proto_msgTypes[37]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3079,7 +3214,7 @@ func (x *StopVMRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StopVMRequest.ProtoReflect.Descriptor instead.
 func (*StopVMRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{35}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{37}
 }
 
 func (x *StopVMRequest) GetName() string {
@@ -3112,7 +3247,7 @@ type RestartVMRequest struct {
 
 func (x *RestartVMRequest) Reset() {
 	*x = RestartVMRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[36]
+	mi := &file_litevirt_v1_service_proto_msgTypes[38]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3124,7 +3259,7 @@ func (x *RestartVMRequest) String() string {
 func (*RestartVMRequest) ProtoMessage() {}
 
 func (x *RestartVMRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[36]
+	mi := &file_litevirt_v1_service_proto_msgTypes[38]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3137,7 +3272,7 @@ func (x *RestartVMRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RestartVMRequest.ProtoReflect.Descriptor instead.
 func (*RestartVMRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{36}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{38}
 }
 
 func (x *RestartVMRequest) GetName() string {
@@ -3166,7 +3301,7 @@ type DeleteVMRequest struct {
 
 func (x *DeleteVMRequest) Reset() {
 	*x = DeleteVMRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[37]
+	mi := &file_litevirt_v1_service_proto_msgTypes[39]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3178,7 +3313,7 @@ func (x *DeleteVMRequest) String() string {
 func (*DeleteVMRequest) ProtoMessage() {}
 
 func (x *DeleteVMRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[37]
+	mi := &file_litevirt_v1_service_proto_msgTypes[39]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3191,7 +3326,7 @@ func (x *DeleteVMRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteVMRequest.ProtoReflect.Descriptor instead.
 func (*DeleteVMRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{37}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{39}
 }
 
 func (x *DeleteVMRequest) GetName() string {
@@ -3239,7 +3374,7 @@ type RepairVMOwnerRequest struct {
 
 func (x *RepairVMOwnerRequest) Reset() {
 	*x = RepairVMOwnerRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[38]
+	mi := &file_litevirt_v1_service_proto_msgTypes[40]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3251,7 +3386,7 @@ func (x *RepairVMOwnerRequest) String() string {
 func (*RepairVMOwnerRequest) ProtoMessage() {}
 
 func (x *RepairVMOwnerRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[38]
+	mi := &file_litevirt_v1_service_proto_msgTypes[40]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3264,7 +3399,7 @@ func (x *RepairVMOwnerRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RepairVMOwnerRequest.ProtoReflect.Descriptor instead.
 func (*RepairVMOwnerRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{38}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{40}
 }
 
 func (x *RepairVMOwnerRequest) GetName() string {
@@ -3291,7 +3426,7 @@ type RepairVMOwnerResponse struct {
 
 func (x *RepairVMOwnerResponse) Reset() {
 	*x = RepairVMOwnerResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[39]
+	mi := &file_litevirt_v1_service_proto_msgTypes[41]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3303,7 +3438,7 @@ func (x *RepairVMOwnerResponse) String() string {
 func (*RepairVMOwnerResponse) ProtoMessage() {}
 
 func (x *RepairVMOwnerResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[39]
+	mi := &file_litevirt_v1_service_proto_msgTypes[41]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3316,7 +3451,7 @@ func (x *RepairVMOwnerResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RepairVMOwnerResponse.ProtoReflect.Descriptor instead.
 func (*RepairVMOwnerResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{39}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{41}
 }
 
 func (x *RepairVMOwnerResponse) GetHost() string {
@@ -3348,7 +3483,7 @@ type CheckVIPParticipantRequest struct {
 
 func (x *CheckVIPParticipantRequest) Reset() {
 	*x = CheckVIPParticipantRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[40]
+	mi := &file_litevirt_v1_service_proto_msgTypes[42]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3360,7 +3495,7 @@ func (x *CheckVIPParticipantRequest) String() string {
 func (*CheckVIPParticipantRequest) ProtoMessage() {}
 
 func (x *CheckVIPParticipantRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[40]
+	mi := &file_litevirt_v1_service_proto_msgTypes[42]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3373,7 +3508,7 @@ func (x *CheckVIPParticipantRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CheckVIPParticipantRequest.ProtoReflect.Descriptor instead.
 func (*CheckVIPParticipantRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{40}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{42}
 }
 
 func (x *CheckVIPParticipantRequest) GetVip() string {
@@ -3392,7 +3527,7 @@ type CheckVIPParticipantResponse struct {
 
 func (x *CheckVIPParticipantResponse) Reset() {
 	*x = CheckVIPParticipantResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[41]
+	mi := &file_litevirt_v1_service_proto_msgTypes[43]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3404,7 +3539,7 @@ func (x *CheckVIPParticipantResponse) String() string {
 func (*CheckVIPParticipantResponse) ProtoMessage() {}
 
 func (x *CheckVIPParticipantResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[41]
+	mi := &file_litevirt_v1_service_proto_msgTypes[43]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3417,7 +3552,7 @@ func (x *CheckVIPParticipantResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CheckVIPParticipantResponse.ProtoReflect.Descriptor instead.
 func (*CheckVIPParticipantResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{41}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{43}
 }
 
 func (x *CheckVIPParticipantResponse) GetClaims() bool {
@@ -3437,7 +3572,7 @@ type RelayCheckVIPParticipantRequest struct {
 
 func (x *RelayCheckVIPParticipantRequest) Reset() {
 	*x = RelayCheckVIPParticipantRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[42]
+	mi := &file_litevirt_v1_service_proto_msgTypes[44]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3449,7 +3584,7 @@ func (x *RelayCheckVIPParticipantRequest) String() string {
 func (*RelayCheckVIPParticipantRequest) ProtoMessage() {}
 
 func (x *RelayCheckVIPParticipantRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[42]
+	mi := &file_litevirt_v1_service_proto_msgTypes[44]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3462,7 +3597,7 @@ func (x *RelayCheckVIPParticipantRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RelayCheckVIPParticipantRequest.ProtoReflect.Descriptor instead.
 func (*RelayCheckVIPParticipantRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{42}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{44}
 }
 
 func (x *RelayCheckVIPParticipantRequest) GetTargetHost() string {
@@ -3488,7 +3623,7 @@ type RelayCheckVIPParticipantResponse struct {
 
 func (x *RelayCheckVIPParticipantResponse) Reset() {
 	*x = RelayCheckVIPParticipantResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[43]
+	mi := &file_litevirt_v1_service_proto_msgTypes[45]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3500,7 +3635,7 @@ func (x *RelayCheckVIPParticipantResponse) String() string {
 func (*RelayCheckVIPParticipantResponse) ProtoMessage() {}
 
 func (x *RelayCheckVIPParticipantResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[43]
+	mi := &file_litevirt_v1_service_proto_msgTypes[45]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3513,7 +3648,7 @@ func (x *RelayCheckVIPParticipantResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RelayCheckVIPParticipantResponse.ProtoReflect.Descriptor instead.
 func (*RelayCheckVIPParticipantResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{43}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{45}
 }
 
 func (x *RelayCheckVIPParticipantResponse) GetResult() RelayVIPResult {
@@ -3536,7 +3671,7 @@ type CheckLBPresentRequest struct {
 
 func (x *CheckLBPresentRequest) Reset() {
 	*x = CheckLBPresentRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[44]
+	mi := &file_litevirt_v1_service_proto_msgTypes[46]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3548,7 +3683,7 @@ func (x *CheckLBPresentRequest) String() string {
 func (*CheckLBPresentRequest) ProtoMessage() {}
 
 func (x *CheckLBPresentRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[44]
+	mi := &file_litevirt_v1_service_proto_msgTypes[46]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3561,7 +3696,7 @@ func (x *CheckLBPresentRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CheckLBPresentRequest.ProtoReflect.Descriptor instead.
 func (*CheckLBPresentRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{44}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{46}
 }
 
 func (x *CheckLBPresentRequest) GetLbName() string {
@@ -3580,7 +3715,7 @@ type CheckLBPresentResponse struct {
 
 func (x *CheckLBPresentResponse) Reset() {
 	*x = CheckLBPresentResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[45]
+	mi := &file_litevirt_v1_service_proto_msgTypes[47]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3592,7 +3727,7 @@ func (x *CheckLBPresentResponse) String() string {
 func (*CheckLBPresentResponse) ProtoMessage() {}
 
 func (x *CheckLBPresentResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[45]
+	mi := &file_litevirt_v1_service_proto_msgTypes[47]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3605,7 +3740,7 @@ func (x *CheckLBPresentResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CheckLBPresentResponse.ProtoReflect.Descriptor instead.
 func (*CheckLBPresentResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{45}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{47}
 }
 
 func (x *CheckLBPresentResponse) GetPresent() bool {
@@ -3636,7 +3771,7 @@ type GetRuntimeInventoryRequest struct {
 
 func (x *GetRuntimeInventoryRequest) Reset() {
 	*x = GetRuntimeInventoryRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[46]
+	mi := &file_litevirt_v1_service_proto_msgTypes[48]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3648,7 +3783,7 @@ func (x *GetRuntimeInventoryRequest) String() string {
 func (*GetRuntimeInventoryRequest) ProtoMessage() {}
 
 func (x *GetRuntimeInventoryRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[46]
+	mi := &file_litevirt_v1_service_proto_msgTypes[48]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3661,7 +3796,7 @@ func (x *GetRuntimeInventoryRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetRuntimeInventoryRequest.ProtoReflect.Descriptor instead.
 func (*GetRuntimeInventoryRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{46}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{48}
 }
 
 func (x *GetRuntimeInventoryRequest) GetKind() string {
@@ -3710,7 +3845,7 @@ type RuntimeWorkload struct {
 
 func (x *RuntimeWorkload) Reset() {
 	*x = RuntimeWorkload{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[47]
+	mi := &file_litevirt_v1_service_proto_msgTypes[49]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3722,7 +3857,7 @@ func (x *RuntimeWorkload) String() string {
 func (*RuntimeWorkload) ProtoMessage() {}
 
 func (x *RuntimeWorkload) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[47]
+	mi := &file_litevirt_v1_service_proto_msgTypes[49]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3735,7 +3870,7 @@ func (x *RuntimeWorkload) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RuntimeWorkload.ProtoReflect.Descriptor instead.
 func (*RuntimeWorkload) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{47}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{49}
 }
 
 func (x *RuntimeWorkload) GetKind() string {
@@ -3836,7 +3971,7 @@ type RuntimeInventory struct {
 
 func (x *RuntimeInventory) Reset() {
 	*x = RuntimeInventory{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[48]
+	mi := &file_litevirt_v1_service_proto_msgTypes[50]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3848,7 +3983,7 @@ func (x *RuntimeInventory) String() string {
 func (*RuntimeInventory) ProtoMessage() {}
 
 func (x *RuntimeInventory) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[48]
+	mi := &file_litevirt_v1_service_proto_msgTypes[50]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3861,7 +3996,7 @@ func (x *RuntimeInventory) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RuntimeInventory.ProtoReflect.Descriptor instead.
 func (*RuntimeInventory) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{48}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{50}
 }
 
 func (x *RuntimeInventory) GetHost() string {
@@ -3935,7 +4070,7 @@ type OrphanProofRequest struct {
 
 func (x *OrphanProofRequest) Reset() {
 	*x = OrphanProofRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[49]
+	mi := &file_litevirt_v1_service_proto_msgTypes[51]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3947,7 +4082,7 @@ func (x *OrphanProofRequest) String() string {
 func (*OrphanProofRequest) ProtoMessage() {}
 
 func (x *OrphanProofRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[49]
+	mi := &file_litevirt_v1_service_proto_msgTypes[51]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3960,7 +4095,7 @@ func (x *OrphanProofRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use OrphanProofRequest.ProtoReflect.Descriptor instead.
 func (*OrphanProofRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{49}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{51}
 }
 
 func (x *OrphanProofRequest) GetVmUuid() string {
@@ -4003,7 +4138,7 @@ type OrphanProofResponse struct {
 
 func (x *OrphanProofResponse) Reset() {
 	*x = OrphanProofResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[50]
+	mi := &file_litevirt_v1_service_proto_msgTypes[52]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4015,7 +4150,7 @@ func (x *OrphanProofResponse) String() string {
 func (*OrphanProofResponse) ProtoMessage() {}
 
 func (x *OrphanProofResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[50]
+	mi := &file_litevirt_v1_service_proto_msgTypes[52]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4028,7 +4163,7 @@ func (x *OrphanProofResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use OrphanProofResponse.ProtoReflect.Descriptor instead.
 func (*OrphanProofResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{50}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{52}
 }
 
 func (x *OrphanProofResponse) GetHost() string {
@@ -4096,7 +4231,7 @@ type MembershipHost struct {
 
 func (x *MembershipHost) Reset() {
 	*x = MembershipHost{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[51]
+	mi := &file_litevirt_v1_service_proto_msgTypes[53]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4108,7 +4243,7 @@ func (x *MembershipHost) String() string {
 func (*MembershipHost) ProtoMessage() {}
 
 func (x *MembershipHost) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[51]
+	mi := &file_litevirt_v1_service_proto_msgTypes[53]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4121,7 +4256,7 @@ func (x *MembershipHost) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MembershipHost.ProtoReflect.Descriptor instead.
 func (*MembershipHost) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{51}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{53}
 }
 
 func (x *MembershipHost) GetName() string {
@@ -4169,7 +4304,7 @@ type MembershipViewResponse struct {
 
 func (x *MembershipViewResponse) Reset() {
 	*x = MembershipViewResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[52]
+	mi := &file_litevirt_v1_service_proto_msgTypes[54]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4181,7 +4316,7 @@ func (x *MembershipViewResponse) String() string {
 func (*MembershipViewResponse) ProtoMessage() {}
 
 func (x *MembershipViewResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[52]
+	mi := &file_litevirt_v1_service_proto_msgTypes[54]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4194,7 +4329,7 @@ func (x *MembershipViewResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MembershipViewResponse.ProtoReflect.Descriptor instead.
 func (*MembershipViewResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{52}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{54}
 }
 
 func (x *MembershipViewResponse) GetHost() string {
@@ -4245,7 +4380,7 @@ type RekeyBindingRequest struct {
 
 func (x *RekeyBindingRequest) Reset() {
 	*x = RekeyBindingRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[53]
+	mi := &file_litevirt_v1_service_proto_msgTypes[55]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4257,7 +4392,7 @@ func (x *RekeyBindingRequest) String() string {
 func (*RekeyBindingRequest) ProtoMessage() {}
 
 func (x *RekeyBindingRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[53]
+	mi := &file_litevirt_v1_service_proto_msgTypes[55]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4270,7 +4405,7 @@ func (x *RekeyBindingRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RekeyBindingRequest.ProtoReflect.Descriptor instead.
 func (*RekeyBindingRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{53}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{55}
 }
 
 func (x *RekeyBindingRequest) GetNetwork() string {
@@ -4295,7 +4430,7 @@ type ResumeBindingRequest struct {
 
 func (x *ResumeBindingRequest) Reset() {
 	*x = ResumeBindingRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[54]
+	mi := &file_litevirt_v1_service_proto_msgTypes[56]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4307,7 +4442,7 @@ func (x *ResumeBindingRequest) String() string {
 func (*ResumeBindingRequest) ProtoMessage() {}
 
 func (x *ResumeBindingRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[54]
+	mi := &file_litevirt_v1_service_proto_msgTypes[56]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4320,7 +4455,7 @@ func (x *ResumeBindingRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResumeBindingRequest.ProtoReflect.Descriptor instead.
 func (*ResumeBindingRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{54}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{56}
 }
 
 func (x *ResumeBindingRequest) GetNetwork() string {
@@ -4350,7 +4485,7 @@ type CloneVMRequest struct {
 
 func (x *CloneVMRequest) Reset() {
 	*x = CloneVMRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[55]
+	mi := &file_litevirt_v1_service_proto_msgTypes[57]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4362,7 +4497,7 @@ func (x *CloneVMRequest) String() string {
 func (*CloneVMRequest) ProtoMessage() {}
 
 func (x *CloneVMRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[55]
+	mi := &file_litevirt_v1_service_proto_msgTypes[57]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4375,7 +4510,7 @@ func (x *CloneVMRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CloneVMRequest.ProtoReflect.Descriptor instead.
 func (*CloneVMRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{55}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{57}
 }
 
 func (x *CloneVMRequest) GetSource() string {
@@ -4444,7 +4579,7 @@ type ConvertToTemplateRequest struct {
 
 func (x *ConvertToTemplateRequest) Reset() {
 	*x = ConvertToTemplateRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[56]
+	mi := &file_litevirt_v1_service_proto_msgTypes[58]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4456,7 +4591,7 @@ func (x *ConvertToTemplateRequest) String() string {
 func (*ConvertToTemplateRequest) ProtoMessage() {}
 
 func (x *ConvertToTemplateRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[56]
+	mi := &file_litevirt_v1_service_proto_msgTypes[58]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4469,7 +4604,7 @@ func (x *ConvertToTemplateRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ConvertToTemplateRequest.ProtoReflect.Descriptor instead.
 func (*ConvertToTemplateRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{56}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{58}
 }
 
 func (x *ConvertToTemplateRequest) GetName() string {
@@ -4496,7 +4631,7 @@ type ExecVMRequest struct {
 
 func (x *ExecVMRequest) Reset() {
 	*x = ExecVMRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[57]
+	mi := &file_litevirt_v1_service_proto_msgTypes[59]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4508,7 +4643,7 @@ func (x *ExecVMRequest) String() string {
 func (*ExecVMRequest) ProtoMessage() {}
 
 func (x *ExecVMRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[57]
+	mi := &file_litevirt_v1_service_proto_msgTypes[59]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4521,7 +4656,7 @@ func (x *ExecVMRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecVMRequest.ProtoReflect.Descriptor instead.
 func (*ExecVMRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{57}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{59}
 }
 
 func (x *ExecVMRequest) GetName() string {
@@ -4549,7 +4684,7 @@ type ExecVMResponse struct {
 
 func (x *ExecVMResponse) Reset() {
 	*x = ExecVMResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[58]
+	mi := &file_litevirt_v1_service_proto_msgTypes[60]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4561,7 +4696,7 @@ func (x *ExecVMResponse) String() string {
 func (*ExecVMResponse) ProtoMessage() {}
 
 func (x *ExecVMResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[58]
+	mi := &file_litevirt_v1_service_proto_msgTypes[60]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4574,7 +4709,7 @@ func (x *ExecVMResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecVMResponse.ProtoReflect.Descriptor instead.
 func (*ExecVMResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{58}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{60}
 }
 
 func (x *ExecVMResponse) GetExitCode() int32 {
@@ -4607,7 +4742,7 @@ type ConsoleInput struct {
 
 func (x *ConsoleInput) Reset() {
 	*x = ConsoleInput{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[59]
+	mi := &file_litevirt_v1_service_proto_msgTypes[61]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4619,7 +4754,7 @@ func (x *ConsoleInput) String() string {
 func (*ConsoleInput) ProtoMessage() {}
 
 func (x *ConsoleInput) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[59]
+	mi := &file_litevirt_v1_service_proto_msgTypes[61]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4632,7 +4767,7 @@ func (x *ConsoleInput) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ConsoleInput.ProtoReflect.Descriptor instead.
 func (*ConsoleInput) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{59}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{61}
 }
 
 func (x *ConsoleInput) GetData() []byte {
@@ -4651,7 +4786,7 @@ type ConsoleOutput struct {
 
 func (x *ConsoleOutput) Reset() {
 	*x = ConsoleOutput{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[60]
+	mi := &file_litevirt_v1_service_proto_msgTypes[62]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4663,7 +4798,7 @@ func (x *ConsoleOutput) String() string {
 func (*ConsoleOutput) ProtoMessage() {}
 
 func (x *ConsoleOutput) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[60]
+	mi := &file_litevirt_v1_service_proto_msgTypes[62]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4676,7 +4811,7 @@ func (x *ConsoleOutput) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ConsoleOutput.ProtoReflect.Descriptor instead.
 func (*ConsoleOutput) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{60}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{62}
 }
 
 func (x *ConsoleOutput) GetData() []byte {
@@ -4697,7 +4832,7 @@ type SetVMIPRequest struct {
 
 func (x *SetVMIPRequest) Reset() {
 	*x = SetVMIPRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[61]
+	mi := &file_litevirt_v1_service_proto_msgTypes[63]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4709,7 +4844,7 @@ func (x *SetVMIPRequest) String() string {
 func (*SetVMIPRequest) ProtoMessage() {}
 
 func (x *SetVMIPRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[61]
+	mi := &file_litevirt_v1_service_proto_msgTypes[63]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4722,7 +4857,7 @@ func (x *SetVMIPRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetVMIPRequest.ProtoReflect.Descriptor instead.
 func (*SetVMIPRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{61}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{63}
 }
 
 func (x *SetVMIPRequest) GetName() string {
@@ -4756,7 +4891,7 @@ type SetBootOrderRequest struct {
 
 func (x *SetBootOrderRequest) Reset() {
 	*x = SetBootOrderRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[62]
+	mi := &file_litevirt_v1_service_proto_msgTypes[64]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4768,7 +4903,7 @@ func (x *SetBootOrderRequest) String() string {
 func (*SetBootOrderRequest) ProtoMessage() {}
 
 func (x *SetBootOrderRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[62]
+	mi := &file_litevirt_v1_service_proto_msgTypes[64]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4781,7 +4916,7 @@ func (x *SetBootOrderRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetBootOrderRequest.ProtoReflect.Descriptor instead.
 func (*SetBootOrderRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{62}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{64}
 }
 
 func (x *SetBootOrderRequest) GetName() string {
@@ -4808,7 +4943,7 @@ type RebuildVMRequest struct {
 
 func (x *RebuildVMRequest) Reset() {
 	*x = RebuildVMRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[63]
+	mi := &file_litevirt_v1_service_proto_msgTypes[65]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4820,7 +4955,7 @@ func (x *RebuildVMRequest) String() string {
 func (*RebuildVMRequest) ProtoMessage() {}
 
 func (x *RebuildVMRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[63]
+	mi := &file_litevirt_v1_service_proto_msgTypes[65]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4833,7 +4968,7 @@ func (x *RebuildVMRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RebuildVMRequest.ProtoReflect.Descriptor instead.
 func (*RebuildVMRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{63}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{65}
 }
 
 func (x *RebuildVMRequest) GetName() string {
@@ -4852,7 +4987,7 @@ type CutoverVMRequest struct {
 
 func (x *CutoverVMRequest) Reset() {
 	*x = CutoverVMRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[64]
+	mi := &file_litevirt_v1_service_proto_msgTypes[66]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4864,7 +4999,7 @@ func (x *CutoverVMRequest) String() string {
 func (*CutoverVMRequest) ProtoMessage() {}
 
 func (x *CutoverVMRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[64]
+	mi := &file_litevirt_v1_service_proto_msgTypes[66]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4877,7 +5012,7 @@ func (x *CutoverVMRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CutoverVMRequest.ProtoReflect.Descriptor instead.
 func (*CutoverVMRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{64}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{66}
 }
 
 func (x *CutoverVMRequest) GetVmName() string {
@@ -4932,7 +5067,7 @@ type UpdateVMRequest struct {
 
 func (x *UpdateVMRequest) Reset() {
 	*x = UpdateVMRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[65]
+	mi := &file_litevirt_v1_service_proto_msgTypes[67]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4944,7 +5079,7 @@ func (x *UpdateVMRequest) String() string {
 func (*UpdateVMRequest) ProtoMessage() {}
 
 func (x *UpdateVMRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[65]
+	mi := &file_litevirt_v1_service_proto_msgTypes[67]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4957,7 +5092,7 @@ func (x *UpdateVMRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpdateVMRequest.ProtoReflect.Descriptor instead.
 func (*UpdateVMRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{65}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{67}
 }
 
 func (x *UpdateVMRequest) GetName() string {
@@ -5135,7 +5270,7 @@ type SetVMMemoryRequest struct {
 
 func (x *SetVMMemoryRequest) Reset() {
 	*x = SetVMMemoryRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[66]
+	mi := &file_litevirt_v1_service_proto_msgTypes[68]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5147,7 +5282,7 @@ func (x *SetVMMemoryRequest) String() string {
 func (*SetVMMemoryRequest) ProtoMessage() {}
 
 func (x *SetVMMemoryRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[66]
+	mi := &file_litevirt_v1_service_proto_msgTypes[68]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5160,7 +5295,7 @@ func (x *SetVMMemoryRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetVMMemoryRequest.ProtoReflect.Descriptor instead.
 func (*SetVMMemoryRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{66}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{68}
 }
 
 func (x *SetVMMemoryRequest) GetName() string {
@@ -5196,7 +5331,7 @@ type SetVMLabelsRequest struct {
 
 func (x *SetVMLabelsRequest) Reset() {
 	*x = SetVMLabelsRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[67]
+	mi := &file_litevirt_v1_service_proto_msgTypes[69]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5208,7 +5343,7 @@ func (x *SetVMLabelsRequest) String() string {
 func (*SetVMLabelsRequest) ProtoMessage() {}
 
 func (x *SetVMLabelsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[67]
+	mi := &file_litevirt_v1_service_proto_msgTypes[69]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5221,7 +5356,7 @@ func (x *SetVMLabelsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetVMLabelsRequest.ProtoReflect.Descriptor instead.
 func (*SetVMLabelsRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{67}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{69}
 }
 
 func (x *SetVMLabelsRequest) GetName() string {
@@ -5249,7 +5384,7 @@ type ResizeDiskRequest struct {
 
 func (x *ResizeDiskRequest) Reset() {
 	*x = ResizeDiskRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[68]
+	mi := &file_litevirt_v1_service_proto_msgTypes[70]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5261,7 +5396,7 @@ func (x *ResizeDiskRequest) String() string {
 func (*ResizeDiskRequest) ProtoMessage() {}
 
 func (x *ResizeDiskRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[68]
+	mi := &file_litevirt_v1_service_proto_msgTypes[70]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5274,7 +5409,7 @@ func (x *ResizeDiskRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResizeDiskRequest.ProtoReflect.Descriptor instead.
 func (*ResizeDiskRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{68}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{70}
 }
 
 func (x *ResizeDiskRequest) GetVmName() string {
@@ -5308,7 +5443,7 @@ type VNCData struct {
 
 func (x *VNCData) Reset() {
 	*x = VNCData{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[69]
+	mi := &file_litevirt_v1_service_proto_msgTypes[71]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5320,7 +5455,7 @@ func (x *VNCData) String() string {
 func (*VNCData) ProtoMessage() {}
 
 func (x *VNCData) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[69]
+	mi := &file_litevirt_v1_service_proto_msgTypes[71]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5333,7 +5468,7 @@ func (x *VNCData) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VNCData.ProtoReflect.Descriptor instead.
 func (*VNCData) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{69}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{71}
 }
 
 func (x *VNCData) GetData() []byte {
@@ -5358,7 +5493,7 @@ type DeployStackRequest struct {
 
 func (x *DeployStackRequest) Reset() {
 	*x = DeployStackRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[70]
+	mi := &file_litevirt_v1_service_proto_msgTypes[72]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5370,7 +5505,7 @@ func (x *DeployStackRequest) String() string {
 func (*DeployStackRequest) ProtoMessage() {}
 
 func (x *DeployStackRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[70]
+	mi := &file_litevirt_v1_service_proto_msgTypes[72]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5383,7 +5518,7 @@ func (x *DeployStackRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeployStackRequest.ProtoReflect.Descriptor instead.
 func (*DeployStackRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{70}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{72}
 }
 
 func (x *DeployStackRequest) GetComposeYaml() string {
@@ -5442,7 +5577,7 @@ type DeployProgress struct {
 
 func (x *DeployProgress) Reset() {
 	*x = DeployProgress{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[71]
+	mi := &file_litevirt_v1_service_proto_msgTypes[73]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5454,7 +5589,7 @@ func (x *DeployProgress) String() string {
 func (*DeployProgress) ProtoMessage() {}
 
 func (x *DeployProgress) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[71]
+	mi := &file_litevirt_v1_service_proto_msgTypes[73]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5467,7 +5602,7 @@ func (x *DeployProgress) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeployProgress.ProtoReflect.Descriptor instead.
 func (*DeployProgress) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{71}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{73}
 }
 
 func (x *DeployProgress) GetPhase() string {
@@ -5522,7 +5657,7 @@ type DeleteStackRequest struct {
 
 func (x *DeleteStackRequest) Reset() {
 	*x = DeleteStackRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[72]
+	mi := &file_litevirt_v1_service_proto_msgTypes[74]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5534,7 +5669,7 @@ func (x *DeleteStackRequest) String() string {
 func (*DeleteStackRequest) ProtoMessage() {}
 
 func (x *DeleteStackRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[72]
+	mi := &file_litevirt_v1_service_proto_msgTypes[74]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5547,7 +5682,7 @@ func (x *DeleteStackRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteStackRequest.ProtoReflect.Descriptor instead.
 func (*DeleteStackRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{72}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{74}
 }
 
 func (x *DeleteStackRequest) GetName() string {
@@ -5575,7 +5710,7 @@ type DeleteProgress struct {
 
 func (x *DeleteProgress) Reset() {
 	*x = DeleteProgress{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[73]
+	mi := &file_litevirt_v1_service_proto_msgTypes[75]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5587,7 +5722,7 @@ func (x *DeleteProgress) String() string {
 func (*DeleteProgress) ProtoMessage() {}
 
 func (x *DeleteProgress) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[73]
+	mi := &file_litevirt_v1_service_proto_msgTypes[75]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5600,7 +5735,7 @@ func (x *DeleteProgress) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteProgress.ProtoReflect.Descriptor instead.
 func (*DeleteProgress) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{73}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{75}
 }
 
 func (x *DeleteProgress) GetVmName() string {
@@ -5633,7 +5768,7 @@ type ListStacksResponse struct {
 
 func (x *ListStacksResponse) Reset() {
 	*x = ListStacksResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[74]
+	mi := &file_litevirt_v1_service_proto_msgTypes[76]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5645,7 +5780,7 @@ func (x *ListStacksResponse) String() string {
 func (*ListStacksResponse) ProtoMessage() {}
 
 func (x *ListStacksResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[74]
+	mi := &file_litevirt_v1_service_proto_msgTypes[76]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5658,7 +5793,7 @@ func (x *ListStacksResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListStacksResponse.ProtoReflect.Descriptor instead.
 func (*ListStacksResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{74}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{76}
 }
 
 func (x *ListStacksResponse) GetStacks() []*StackSummary {
@@ -5683,7 +5818,7 @@ type StackSummary struct {
 
 func (x *StackSummary) Reset() {
 	*x = StackSummary{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[75]
+	mi := &file_litevirt_v1_service_proto_msgTypes[77]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5695,7 +5830,7 @@ func (x *StackSummary) String() string {
 func (*StackSummary) ProtoMessage() {}
 
 func (x *StackSummary) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[75]
+	mi := &file_litevirt_v1_service_proto_msgTypes[77]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5708,7 +5843,7 @@ func (x *StackSummary) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StackSummary.ProtoReflect.Descriptor instead.
 func (*StackSummary) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{75}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{77}
 }
 
 func (x *StackSummary) GetName() string {
@@ -5769,7 +5904,7 @@ type DiffStackRequest struct {
 
 func (x *DiffStackRequest) Reset() {
 	*x = DiffStackRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[76]
+	mi := &file_litevirt_v1_service_proto_msgTypes[78]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5781,7 +5916,7 @@ func (x *DiffStackRequest) String() string {
 func (*DiffStackRequest) ProtoMessage() {}
 
 func (x *DiffStackRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[76]
+	mi := &file_litevirt_v1_service_proto_msgTypes[78]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5794,7 +5929,7 @@ func (x *DiffStackRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DiffStackRequest.ProtoReflect.Descriptor instead.
 func (*DiffStackRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{76}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{78}
 }
 
 func (x *DiffStackRequest) GetComposeYaml() string {
@@ -5813,7 +5948,7 @@ type DiffStackResponse struct {
 
 func (x *DiffStackResponse) Reset() {
 	*x = DiffStackResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[77]
+	mi := &file_litevirt_v1_service_proto_msgTypes[79]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5825,7 +5960,7 @@ func (x *DiffStackResponse) String() string {
 func (*DiffStackResponse) ProtoMessage() {}
 
 func (x *DiffStackResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[77]
+	mi := &file_litevirt_v1_service_proto_msgTypes[79]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5838,7 +5973,7 @@ func (x *DiffStackResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DiffStackResponse.ProtoReflect.Descriptor instead.
 func (*DiffStackResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{77}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{79}
 }
 
 func (x *DiffStackResponse) GetEntries() []*DiffEntry {
@@ -5859,7 +5994,7 @@ type DiffEntry struct {
 
 func (x *DiffEntry) Reset() {
 	*x = DiffEntry{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[78]
+	mi := &file_litevirt_v1_service_proto_msgTypes[80]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5871,7 +6006,7 @@ func (x *DiffEntry) String() string {
 func (*DiffEntry) ProtoMessage() {}
 
 func (x *DiffEntry) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[78]
+	mi := &file_litevirt_v1_service_proto_msgTypes[80]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5884,7 +6019,7 @@ func (x *DiffEntry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DiffEntry.ProtoReflect.Descriptor instead.
 func (*DiffEntry) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{78}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{80}
 }
 
 func (x *DiffEntry) GetVmName() string {
@@ -5917,7 +6052,7 @@ type ExportStackRequest struct {
 
 func (x *ExportStackRequest) Reset() {
 	*x = ExportStackRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[79]
+	mi := &file_litevirt_v1_service_proto_msgTypes[81]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5929,7 +6064,7 @@ func (x *ExportStackRequest) String() string {
 func (*ExportStackRequest) ProtoMessage() {}
 
 func (x *ExportStackRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[79]
+	mi := &file_litevirt_v1_service_proto_msgTypes[81]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5942,7 +6077,7 @@ func (x *ExportStackRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExportStackRequest.ProtoReflect.Descriptor instead.
 func (*ExportStackRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{79}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{81}
 }
 
 func (x *ExportStackRequest) GetName() string {
@@ -5963,7 +6098,7 @@ type ExportStackResponse struct {
 
 func (x *ExportStackResponse) Reset() {
 	*x = ExportStackResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[80]
+	mi := &file_litevirt_v1_service_proto_msgTypes[82]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5975,7 +6110,7 @@ func (x *ExportStackResponse) String() string {
 func (*ExportStackResponse) ProtoMessage() {}
 
 func (x *ExportStackResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[80]
+	mi := &file_litevirt_v1_service_proto_msgTypes[82]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5988,7 +6123,7 @@ func (x *ExportStackResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExportStackResponse.ProtoReflect.Descriptor instead.
 func (*ExportStackResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{80}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{82}
 }
 
 func (x *ExportStackResponse) GetName() string {
@@ -6025,7 +6160,7 @@ type MigrateVMRequest struct {
 
 func (x *MigrateVMRequest) Reset() {
 	*x = MigrateVMRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[81]
+	mi := &file_litevirt_v1_service_proto_msgTypes[83]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6037,7 +6172,7 @@ func (x *MigrateVMRequest) String() string {
 func (*MigrateVMRequest) ProtoMessage() {}
 
 func (x *MigrateVMRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[81]
+	mi := &file_litevirt_v1_service_proto_msgTypes[83]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6050,7 +6185,7 @@ func (x *MigrateVMRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MigrateVMRequest.ProtoReflect.Descriptor instead.
 func (*MigrateVMRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{81}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{83}
 }
 
 func (x *MigrateVMRequest) GetVmName() string {
@@ -6100,7 +6235,7 @@ type MigrateProgress struct {
 
 func (x *MigrateProgress) Reset() {
 	*x = MigrateProgress{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[82]
+	mi := &file_litevirt_v1_service_proto_msgTypes[84]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6112,7 +6247,7 @@ func (x *MigrateProgress) String() string {
 func (*MigrateProgress) ProtoMessage() {}
 
 func (x *MigrateProgress) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[82]
+	mi := &file_litevirt_v1_service_proto_msgTypes[84]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6125,7 +6260,7 @@ func (x *MigrateProgress) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MigrateProgress.ProtoReflect.Descriptor instead.
 func (*MigrateProgress) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{82}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{84}
 }
 
 func (x *MigrateProgress) GetPhase() MigratePhase {
@@ -6228,7 +6363,7 @@ type MoveVolumeRequest struct {
 
 func (x *MoveVolumeRequest) Reset() {
 	*x = MoveVolumeRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[83]
+	mi := &file_litevirt_v1_service_proto_msgTypes[85]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6240,7 +6375,7 @@ func (x *MoveVolumeRequest) String() string {
 func (*MoveVolumeRequest) ProtoMessage() {}
 
 func (x *MoveVolumeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[83]
+	mi := &file_litevirt_v1_service_proto_msgTypes[85]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6253,7 +6388,7 @@ func (x *MoveVolumeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MoveVolumeRequest.ProtoReflect.Descriptor instead.
 func (*MoveVolumeRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{83}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{85}
 }
 
 func (x *MoveVolumeRequest) GetVmName() string {
@@ -6298,7 +6433,7 @@ type MoveVolumeProgress struct {
 
 func (x *MoveVolumeProgress) Reset() {
 	*x = MoveVolumeProgress{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[84]
+	mi := &file_litevirt_v1_service_proto_msgTypes[86]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6310,7 +6445,7 @@ func (x *MoveVolumeProgress) String() string {
 func (*MoveVolumeProgress) ProtoMessage() {}
 
 func (x *MoveVolumeProgress) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[84]
+	mi := &file_litevirt_v1_service_proto_msgTypes[86]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6323,7 +6458,7 @@ func (x *MoveVolumeProgress) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MoveVolumeProgress.ProtoReflect.Descriptor instead.
 func (*MoveVolumeProgress) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{84}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{86}
 }
 
 func (x *MoveVolumeProgress) GetPhase() MoveVolumeProgress_Phase {
@@ -6395,7 +6530,7 @@ type ReplicateVolumeRequest struct {
 
 func (x *ReplicateVolumeRequest) Reset() {
 	*x = ReplicateVolumeRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[85]
+	mi := &file_litevirt_v1_service_proto_msgTypes[87]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6407,7 +6542,7 @@ func (x *ReplicateVolumeRequest) String() string {
 func (*ReplicateVolumeRequest) ProtoMessage() {}
 
 func (x *ReplicateVolumeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[85]
+	mi := &file_litevirt_v1_service_proto_msgTypes[87]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6420,7 +6555,7 @@ func (x *ReplicateVolumeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReplicateVolumeRequest.ProtoReflect.Descriptor instead.
 func (*ReplicateVolumeRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{85}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{87}
 }
 
 func (x *ReplicateVolumeRequest) GetVmName() string {
@@ -6466,7 +6601,7 @@ type ReplicateVolumeProgress struct {
 
 func (x *ReplicateVolumeProgress) Reset() {
 	*x = ReplicateVolumeProgress{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[86]
+	mi := &file_litevirt_v1_service_proto_msgTypes[88]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6478,7 +6613,7 @@ func (x *ReplicateVolumeProgress) String() string {
 func (*ReplicateVolumeProgress) ProtoMessage() {}
 
 func (x *ReplicateVolumeProgress) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[86]
+	mi := &file_litevirt_v1_service_proto_msgTypes[88]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6491,7 +6626,7 @@ func (x *ReplicateVolumeProgress) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReplicateVolumeProgress.ProtoReflect.Descriptor instead.
 func (*ReplicateVolumeProgress) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{86}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{88}
 }
 
 func (x *ReplicateVolumeProgress) GetPhase() ReplicateVolumeProgress_Phase {
@@ -6579,7 +6714,7 @@ type MigrateStackVolumesRequest struct {
 
 func (x *MigrateStackVolumesRequest) Reset() {
 	*x = MigrateStackVolumesRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[87]
+	mi := &file_litevirt_v1_service_proto_msgTypes[89]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6591,7 +6726,7 @@ func (x *MigrateStackVolumesRequest) String() string {
 func (*MigrateStackVolumesRequest) ProtoMessage() {}
 
 func (x *MigrateStackVolumesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[87]
+	mi := &file_litevirt_v1_service_proto_msgTypes[89]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6604,7 +6739,7 @@ func (x *MigrateStackVolumesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MigrateStackVolumesRequest.ProtoReflect.Descriptor instead.
 func (*MigrateStackVolumesRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{87}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{89}
 }
 
 func (x *MigrateStackVolumesRequest) GetStackName() string {
@@ -6674,7 +6809,7 @@ type VolumePlacement struct {
 
 func (x *VolumePlacement) Reset() {
 	*x = VolumePlacement{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[88]
+	mi := &file_litevirt_v1_service_proto_msgTypes[90]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6686,7 +6821,7 @@ func (x *VolumePlacement) String() string {
 func (*VolumePlacement) ProtoMessage() {}
 
 func (x *VolumePlacement) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[88]
+	mi := &file_litevirt_v1_service_proto_msgTypes[90]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6699,7 +6834,7 @@ func (x *VolumePlacement) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VolumePlacement.ProtoReflect.Descriptor instead.
 func (*VolumePlacement) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{88}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{90}
 }
 
 func (x *VolumePlacement) GetVmName() string {
@@ -6746,7 +6881,7 @@ type StackVolumeProgress struct {
 
 func (x *StackVolumeProgress) Reset() {
 	*x = StackVolumeProgress{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[89]
+	mi := &file_litevirt_v1_service_proto_msgTypes[91]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6758,7 +6893,7 @@ func (x *StackVolumeProgress) String() string {
 func (*StackVolumeProgress) ProtoMessage() {}
 
 func (x *StackVolumeProgress) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[89]
+	mi := &file_litevirt_v1_service_proto_msgTypes[91]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6771,7 +6906,7 @@ func (x *StackVolumeProgress) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StackVolumeProgress.ProtoReflect.Descriptor instead.
 func (*StackVolumeProgress) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{89}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{91}
 }
 
 func (x *StackVolumeProgress) GetVmName() string {
@@ -6872,7 +7007,7 @@ type PullImageRequest struct {
 
 func (x *PullImageRequest) Reset() {
 	*x = PullImageRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[90]
+	mi := &file_litevirt_v1_service_proto_msgTypes[92]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6884,7 +7019,7 @@ func (x *PullImageRequest) String() string {
 func (*PullImageRequest) ProtoMessage() {}
 
 func (x *PullImageRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[90]
+	mi := &file_litevirt_v1_service_proto_msgTypes[92]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6897,7 +7032,7 @@ func (x *PullImageRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PullImageRequest.ProtoReflect.Descriptor instead.
 func (*PullImageRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{90}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{92}
 }
 
 func (x *PullImageRequest) GetName() string {
@@ -6947,7 +7082,7 @@ type PullProgress struct {
 
 func (x *PullProgress) Reset() {
 	*x = PullProgress{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[91]
+	mi := &file_litevirt_v1_service_proto_msgTypes[93]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6959,7 +7094,7 @@ func (x *PullProgress) String() string {
 func (*PullProgress) ProtoMessage() {}
 
 func (x *PullProgress) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[91]
+	mi := &file_litevirt_v1_service_proto_msgTypes[93]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6972,7 +7107,7 @@ func (x *PullProgress) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PullProgress.ProtoReflect.Descriptor instead.
 func (*PullProgress) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{91}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{93}
 }
 
 func (x *PullProgress) GetHostName() string {
@@ -7012,7 +7147,7 @@ type ListImagesResponse struct {
 
 func (x *ListImagesResponse) Reset() {
 	*x = ListImagesResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[92]
+	mi := &file_litevirt_v1_service_proto_msgTypes[94]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7024,7 +7159,7 @@ func (x *ListImagesResponse) String() string {
 func (*ListImagesResponse) ProtoMessage() {}
 
 func (x *ListImagesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[92]
+	mi := &file_litevirt_v1_service_proto_msgTypes[94]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7037,7 +7172,7 @@ func (x *ListImagesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListImagesResponse.ProtoReflect.Descriptor instead.
 func (*ListImagesResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{92}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{94}
 }
 
 func (x *ListImagesResponse) GetImages() []*Image {
@@ -7057,7 +7192,7 @@ type DeleteImageRequest struct {
 
 func (x *DeleteImageRequest) Reset() {
 	*x = DeleteImageRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[93]
+	mi := &file_litevirt_v1_service_proto_msgTypes[95]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7069,7 +7204,7 @@ func (x *DeleteImageRequest) String() string {
 func (*DeleteImageRequest) ProtoMessage() {}
 
 func (x *DeleteImageRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[93]
+	mi := &file_litevirt_v1_service_proto_msgTypes[95]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7082,7 +7217,7 @@ func (x *DeleteImageRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteImageRequest.ProtoReflect.Descriptor instead.
 func (*DeleteImageRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{93}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{95}
 }
 
 func (x *DeleteImageRequest) GetName() string {
@@ -7112,7 +7247,7 @@ type ImportImageRequest struct {
 
 func (x *ImportImageRequest) Reset() {
 	*x = ImportImageRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[94]
+	mi := &file_litevirt_v1_service_proto_msgTypes[96]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7124,7 +7259,7 @@ func (x *ImportImageRequest) String() string {
 func (*ImportImageRequest) ProtoMessage() {}
 
 func (x *ImportImageRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[94]
+	mi := &file_litevirt_v1_service_proto_msgTypes[96]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7137,7 +7272,7 @@ func (x *ImportImageRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ImportImageRequest.ProtoReflect.Descriptor instead.
 func (*ImportImageRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{94}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{96}
 }
 
 func (x *ImportImageRequest) GetName() string {
@@ -7186,7 +7321,7 @@ type ImportImageResponse struct {
 
 func (x *ImportImageResponse) Reset() {
 	*x = ImportImageResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[95]
+	mi := &file_litevirt_v1_service_proto_msgTypes[97]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7198,7 +7333,7 @@ func (x *ImportImageResponse) String() string {
 func (*ImportImageResponse) ProtoMessage() {}
 
 func (x *ImportImageResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[95]
+	mi := &file_litevirt_v1_service_proto_msgTypes[97]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7211,7 +7346,7 @@ func (x *ImportImageResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ImportImageResponse.ProtoReflect.Descriptor instead.
 func (*ImportImageResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{95}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{97}
 }
 
 func (x *ImportImageResponse) GetName() string {
@@ -7245,7 +7380,7 @@ type PushImageRequest struct {
 
 func (x *PushImageRequest) Reset() {
 	*x = PushImageRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[96]
+	mi := &file_litevirt_v1_service_proto_msgTypes[98]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7257,7 +7392,7 @@ func (x *PushImageRequest) String() string {
 func (*PushImageRequest) ProtoMessage() {}
 
 func (x *PushImageRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[96]
+	mi := &file_litevirt_v1_service_proto_msgTypes[98]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7270,7 +7405,7 @@ func (x *PushImageRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PushImageRequest.ProtoReflect.Descriptor instead.
 func (*PushImageRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{96}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{98}
 }
 
 func (x *PushImageRequest) GetName() string {
@@ -7301,7 +7436,7 @@ type PruneImagesRequest struct {
 
 func (x *PruneImagesRequest) Reset() {
 	*x = PruneImagesRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[97]
+	mi := &file_litevirt_v1_service_proto_msgTypes[99]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7313,7 +7448,7 @@ func (x *PruneImagesRequest) String() string {
 func (*PruneImagesRequest) ProtoMessage() {}
 
 func (x *PruneImagesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[97]
+	mi := &file_litevirt_v1_service_proto_msgTypes[99]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7326,7 +7461,7 @@ func (x *PruneImagesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PruneImagesRequest.ProtoReflect.Descriptor instead.
 func (*PruneImagesRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{97}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{99}
 }
 
 func (x *PruneImagesRequest) GetName() string {
@@ -7361,7 +7496,7 @@ type PruneImagesResponse struct {
 
 func (x *PruneImagesResponse) Reset() {
 	*x = PruneImagesResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[98]
+	mi := &file_litevirt_v1_service_proto_msgTypes[100]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7373,7 +7508,7 @@ func (x *PruneImagesResponse) String() string {
 func (*PruneImagesResponse) ProtoMessage() {}
 
 func (x *PruneImagesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[98]
+	mi := &file_litevirt_v1_service_proto_msgTypes[100]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7386,7 +7521,7 @@ func (x *PruneImagesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PruneImagesResponse.ProtoReflect.Descriptor instead.
 func (*PruneImagesResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{98}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{100}
 }
 
 func (x *PruneImagesResponse) GetHostName() string {
@@ -7421,7 +7556,7 @@ type PushImageProgress struct {
 
 func (x *PushImageProgress) Reset() {
 	*x = PushImageProgress{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[99]
+	mi := &file_litevirt_v1_service_proto_msgTypes[101]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7433,7 +7568,7 @@ func (x *PushImageProgress) String() string {
 func (*PushImageProgress) ProtoMessage() {}
 
 func (x *PushImageProgress) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[99]
+	mi := &file_litevirt_v1_service_proto_msgTypes[101]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7446,7 +7581,7 @@ func (x *PushImageProgress) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PushImageProgress.ProtoReflect.Descriptor instead.
 func (*PushImageProgress) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{99}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{101}
 }
 
 func (x *PushImageProgress) GetStatus() string {
@@ -7480,7 +7615,7 @@ type BuildImageRequest struct {
 
 func (x *BuildImageRequest) Reset() {
 	*x = BuildImageRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[100]
+	mi := &file_litevirt_v1_service_proto_msgTypes[102]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7492,7 +7627,7 @@ func (x *BuildImageRequest) String() string {
 func (*BuildImageRequest) ProtoMessage() {}
 
 func (x *BuildImageRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[100]
+	mi := &file_litevirt_v1_service_proto_msgTypes[102]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7505,7 +7640,7 @@ func (x *BuildImageRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BuildImageRequest.ProtoReflect.Descriptor instead.
 func (*BuildImageRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{100}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{102}
 }
 
 func (x *BuildImageRequest) GetVmName() string {
@@ -7532,7 +7667,7 @@ type BuildImageResponse struct {
 
 func (x *BuildImageResponse) Reset() {
 	*x = BuildImageResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[101]
+	mi := &file_litevirt_v1_service_proto_msgTypes[103]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7544,7 +7679,7 @@ func (x *BuildImageResponse) String() string {
 func (*BuildImageResponse) ProtoMessage() {}
 
 func (x *BuildImageResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[101]
+	mi := &file_litevirt_v1_service_proto_msgTypes[103]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7557,7 +7692,7 @@ func (x *BuildImageResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BuildImageResponse.ProtoReflect.Descriptor instead.
 func (*BuildImageResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{101}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{103}
 }
 
 func (x *BuildImageResponse) GetName() string {
@@ -7584,7 +7719,7 @@ type BackupVMRequest struct {
 
 func (x *BackupVMRequest) Reset() {
 	*x = BackupVMRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[102]
+	mi := &file_litevirt_v1_service_proto_msgTypes[104]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7596,7 +7731,7 @@ func (x *BackupVMRequest) String() string {
 func (*BackupVMRequest) ProtoMessage() {}
 
 func (x *BackupVMRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[102]
+	mi := &file_litevirt_v1_service_proto_msgTypes[104]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7609,7 +7744,7 @@ func (x *BackupVMRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BackupVMRequest.ProtoReflect.Descriptor instead.
 func (*BackupVMRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{102}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{104}
 }
 
 func (x *BackupVMRequest) GetVmName() string {
@@ -7630,7 +7765,7 @@ type BackupChunk struct {
 
 func (x *BackupChunk) Reset() {
 	*x = BackupChunk{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[103]
+	mi := &file_litevirt_v1_service_proto_msgTypes[105]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7642,7 +7777,7 @@ func (x *BackupChunk) String() string {
 func (*BackupChunk) ProtoMessage() {}
 
 func (x *BackupChunk) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[103]
+	mi := &file_litevirt_v1_service_proto_msgTypes[105]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7655,7 +7790,7 @@ func (x *BackupChunk) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BackupChunk.ProtoReflect.Descriptor instead.
 func (*BackupChunk) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{103}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{105}
 }
 
 func (x *BackupChunk) GetData() []byte {
@@ -7693,7 +7828,7 @@ type RestoreVMRequest struct {
 
 func (x *RestoreVMRequest) Reset() {
 	*x = RestoreVMRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[104]
+	mi := &file_litevirt_v1_service_proto_msgTypes[106]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7705,7 +7840,7 @@ func (x *RestoreVMRequest) String() string {
 func (*RestoreVMRequest) ProtoMessage() {}
 
 func (x *RestoreVMRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[104]
+	mi := &file_litevirt_v1_service_proto_msgTypes[106]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7718,7 +7853,7 @@ func (x *RestoreVMRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RestoreVMRequest.ProtoReflect.Descriptor instead.
 func (*RestoreVMRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{104}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{106}
 }
 
 func (x *RestoreVMRequest) GetName() string {
@@ -7790,7 +7925,7 @@ type ImportVMRequest struct {
 
 func (x *ImportVMRequest) Reset() {
 	*x = ImportVMRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[105]
+	mi := &file_litevirt_v1_service_proto_msgTypes[107]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7802,7 +7937,7 @@ func (x *ImportVMRequest) String() string {
 func (*ImportVMRequest) ProtoMessage() {}
 
 func (x *ImportVMRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[105]
+	mi := &file_litevirt_v1_service_proto_msgTypes[107]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7815,7 +7950,7 @@ func (x *ImportVMRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ImportVMRequest.ProtoReflect.Descriptor instead.
 func (*ImportVMRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{105}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{107}
 }
 
 func (x *ImportVMRequest) GetSourceFormat() string {
@@ -7923,7 +8058,7 @@ type ImportVMProgress struct {
 
 func (x *ImportVMProgress) Reset() {
 	*x = ImportVMProgress{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[106]
+	mi := &file_litevirt_v1_service_proto_msgTypes[108]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7935,7 +8070,7 @@ func (x *ImportVMProgress) String() string {
 func (*ImportVMProgress) ProtoMessage() {}
 
 func (x *ImportVMProgress) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[106]
+	mi := &file_litevirt_v1_service_proto_msgTypes[108]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7948,7 +8083,7 @@ func (x *ImportVMProgress) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ImportVMProgress.ProtoReflect.Descriptor instead.
 func (*ImportVMProgress) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{106}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{108}
 }
 
 func (x *ImportVMProgress) GetPhase() string {
@@ -8008,7 +8143,7 @@ type CreateSnapshotRequest struct {
 
 func (x *CreateSnapshotRequest) Reset() {
 	*x = CreateSnapshotRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[107]
+	mi := &file_litevirt_v1_service_proto_msgTypes[109]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8020,7 +8155,7 @@ func (x *CreateSnapshotRequest) String() string {
 func (*CreateSnapshotRequest) ProtoMessage() {}
 
 func (x *CreateSnapshotRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[107]
+	mi := &file_litevirt_v1_service_proto_msgTypes[109]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8033,7 +8168,7 @@ func (x *CreateSnapshotRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateSnapshotRequest.ProtoReflect.Descriptor instead.
 func (*CreateSnapshotRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{107}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{109}
 }
 
 func (x *CreateSnapshotRequest) GetVmName() string {
@@ -8066,7 +8201,7 @@ type ListSnapshotsRequest struct {
 
 func (x *ListSnapshotsRequest) Reset() {
 	*x = ListSnapshotsRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[108]
+	mi := &file_litevirt_v1_service_proto_msgTypes[110]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8078,7 +8213,7 @@ func (x *ListSnapshotsRequest) String() string {
 func (*ListSnapshotsRequest) ProtoMessage() {}
 
 func (x *ListSnapshotsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[108]
+	mi := &file_litevirt_v1_service_proto_msgTypes[110]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8091,7 +8226,7 @@ func (x *ListSnapshotsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListSnapshotsRequest.ProtoReflect.Descriptor instead.
 func (*ListSnapshotsRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{108}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{110}
 }
 
 func (x *ListSnapshotsRequest) GetVmName() string {
@@ -8110,7 +8245,7 @@ type ListSnapshotsResponse struct {
 
 func (x *ListSnapshotsResponse) Reset() {
 	*x = ListSnapshotsResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[109]
+	mi := &file_litevirt_v1_service_proto_msgTypes[111]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8122,7 +8257,7 @@ func (x *ListSnapshotsResponse) String() string {
 func (*ListSnapshotsResponse) ProtoMessage() {}
 
 func (x *ListSnapshotsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[109]
+	mi := &file_litevirt_v1_service_proto_msgTypes[111]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8135,7 +8270,7 @@ func (x *ListSnapshotsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListSnapshotsResponse.ProtoReflect.Descriptor instead.
 func (*ListSnapshotsResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{109}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{111}
 }
 
 func (x *ListSnapshotsResponse) GetSnapshots() []*Snapshot {
@@ -8155,7 +8290,7 @@ type RestoreSnapshotRequest struct {
 
 func (x *RestoreSnapshotRequest) Reset() {
 	*x = RestoreSnapshotRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[110]
+	mi := &file_litevirt_v1_service_proto_msgTypes[112]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8167,7 +8302,7 @@ func (x *RestoreSnapshotRequest) String() string {
 func (*RestoreSnapshotRequest) ProtoMessage() {}
 
 func (x *RestoreSnapshotRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[110]
+	mi := &file_litevirt_v1_service_proto_msgTypes[112]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8180,7 +8315,7 @@ func (x *RestoreSnapshotRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RestoreSnapshotRequest.ProtoReflect.Descriptor instead.
 func (*RestoreSnapshotRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{110}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{112}
 }
 
 func (x *RestoreSnapshotRequest) GetVmName() string {
@@ -8207,7 +8342,7 @@ type DeleteSnapshotRequest struct {
 
 func (x *DeleteSnapshotRequest) Reset() {
 	*x = DeleteSnapshotRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[111]
+	mi := &file_litevirt_v1_service_proto_msgTypes[113]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8219,7 +8354,7 @@ func (x *DeleteSnapshotRequest) String() string {
 func (*DeleteSnapshotRequest) ProtoMessage() {}
 
 func (x *DeleteSnapshotRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[111]
+	mi := &file_litevirt_v1_service_proto_msgTypes[113]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8232,7 +8367,7 @@ func (x *DeleteSnapshotRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteSnapshotRequest.ProtoReflect.Descriptor instead.
 func (*DeleteSnapshotRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{111}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{113}
 }
 
 func (x *DeleteSnapshotRequest) GetVmName() string {
@@ -8272,7 +8407,7 @@ type CreateNetworkRequest struct {
 
 func (x *CreateNetworkRequest) Reset() {
 	*x = CreateNetworkRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[112]
+	mi := &file_litevirt_v1_service_proto_msgTypes[114]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8284,7 +8419,7 @@ func (x *CreateNetworkRequest) String() string {
 func (*CreateNetworkRequest) ProtoMessage() {}
 
 func (x *CreateNetworkRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[112]
+	mi := &file_litevirt_v1_service_proto_msgTypes[114]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8297,7 +8432,7 @@ func (x *CreateNetworkRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateNetworkRequest.ProtoReflect.Descriptor instead.
 func (*CreateNetworkRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{112}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{114}
 }
 
 func (x *CreateNetworkRequest) GetName() string {
@@ -8407,7 +8542,7 @@ type GetNetworkRequest struct {
 
 func (x *GetNetworkRequest) Reset() {
 	*x = GetNetworkRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[113]
+	mi := &file_litevirt_v1_service_proto_msgTypes[115]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8419,7 +8554,7 @@ func (x *GetNetworkRequest) String() string {
 func (*GetNetworkRequest) ProtoMessage() {}
 
 func (x *GetNetworkRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[113]
+	mi := &file_litevirt_v1_service_proto_msgTypes[115]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8432,7 +8567,7 @@ func (x *GetNetworkRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetNetworkRequest.ProtoReflect.Descriptor instead.
 func (*GetNetworkRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{113}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{115}
 }
 
 func (x *GetNetworkRequest) GetName() string {
@@ -8452,7 +8587,7 @@ type DeleteNetworkRequest struct {
 
 func (x *DeleteNetworkRequest) Reset() {
 	*x = DeleteNetworkRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[114]
+	mi := &file_litevirt_v1_service_proto_msgTypes[116]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8464,7 +8599,7 @@ func (x *DeleteNetworkRequest) String() string {
 func (*DeleteNetworkRequest) ProtoMessage() {}
 
 func (x *DeleteNetworkRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[114]
+	mi := &file_litevirt_v1_service_proto_msgTypes[116]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8477,7 +8612,7 @@ func (x *DeleteNetworkRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteNetworkRequest.ProtoReflect.Descriptor instead.
 func (*DeleteNetworkRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{114}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{116}
 }
 
 func (x *DeleteNetworkRequest) GetName() string {
@@ -8503,7 +8638,7 @@ type ListNetworksResponse struct {
 
 func (x *ListNetworksResponse) Reset() {
 	*x = ListNetworksResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[115]
+	mi := &file_litevirt_v1_service_proto_msgTypes[117]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8515,7 +8650,7 @@ func (x *ListNetworksResponse) String() string {
 func (*ListNetworksResponse) ProtoMessage() {}
 
 func (x *ListNetworksResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[115]
+	mi := &file_litevirt_v1_service_proto_msgTypes[117]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8528,7 +8663,7 @@ func (x *ListNetworksResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListNetworksResponse.ProtoReflect.Descriptor instead.
 func (*ListNetworksResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{115}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{117}
 }
 
 func (x *ListNetworksResponse) GetNetworks() []*NetworkInfo {
@@ -8556,7 +8691,7 @@ type NetworkInfo struct {
 
 func (x *NetworkInfo) Reset() {
 	*x = NetworkInfo{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[116]
+	mi := &file_litevirt_v1_service_proto_msgTypes[118]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8568,7 +8703,7 @@ func (x *NetworkInfo) String() string {
 func (*NetworkInfo) ProtoMessage() {}
 
 func (x *NetworkInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[116]
+	mi := &file_litevirt_v1_service_proto_msgTypes[118]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8581,7 +8716,7 @@ func (x *NetworkInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NetworkInfo.ProtoReflect.Descriptor instead.
 func (*NetworkInfo) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{116}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{118}
 }
 
 func (x *NetworkInfo) GetName() string {
@@ -8663,7 +8798,7 @@ type ListLBResponse struct {
 
 func (x *ListLBResponse) Reset() {
 	*x = ListLBResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[117]
+	mi := &file_litevirt_v1_service_proto_msgTypes[119]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8675,7 +8810,7 @@ func (x *ListLBResponse) String() string {
 func (*ListLBResponse) ProtoMessage() {}
 
 func (x *ListLBResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[117]
+	mi := &file_litevirt_v1_service_proto_msgTypes[119]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8688,7 +8823,7 @@ func (x *ListLBResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListLBResponse.ProtoReflect.Descriptor instead.
 func (*ListLBResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{117}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{119}
 }
 
 func (x *ListLBResponse) GetLbs() []*LoadBalancer {
@@ -8707,7 +8842,7 @@ type InspectLBRequest struct {
 
 func (x *InspectLBRequest) Reset() {
 	*x = InspectLBRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[118]
+	mi := &file_litevirt_v1_service_proto_msgTypes[120]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8719,7 +8854,7 @@ func (x *InspectLBRequest) String() string {
 func (*InspectLBRequest) ProtoMessage() {}
 
 func (x *InspectLBRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[118]
+	mi := &file_litevirt_v1_service_proto_msgTypes[120]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8732,7 +8867,7 @@ func (x *InspectLBRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InspectLBRequest.ProtoReflect.Descriptor instead.
 func (*InspectLBRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{118}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{120}
 }
 
 func (x *InspectLBRequest) GetName() string {
@@ -8752,7 +8887,7 @@ type DisableBackendRequest struct {
 
 func (x *DisableBackendRequest) Reset() {
 	*x = DisableBackendRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[119]
+	mi := &file_litevirt_v1_service_proto_msgTypes[121]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8764,7 +8899,7 @@ func (x *DisableBackendRequest) String() string {
 func (*DisableBackendRequest) ProtoMessage() {}
 
 func (x *DisableBackendRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[119]
+	mi := &file_litevirt_v1_service_proto_msgTypes[121]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8777,7 +8912,7 @@ func (x *DisableBackendRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DisableBackendRequest.ProtoReflect.Descriptor instead.
 func (*DisableBackendRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{119}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{121}
 }
 
 func (x *DisableBackendRequest) GetLbName() string {
@@ -8804,7 +8939,7 @@ type EnableBackendRequest struct {
 
 func (x *EnableBackendRequest) Reset() {
 	*x = EnableBackendRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[120]
+	mi := &file_litevirt_v1_service_proto_msgTypes[122]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8816,7 +8951,7 @@ func (x *EnableBackendRequest) String() string {
 func (*EnableBackendRequest) ProtoMessage() {}
 
 func (x *EnableBackendRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[120]
+	mi := &file_litevirt_v1_service_proto_msgTypes[122]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8829,7 +8964,7 @@ func (x *EnableBackendRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EnableBackendRequest.ProtoReflect.Descriptor instead.
 func (*EnableBackendRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{120}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{122}
 }
 
 func (x *EnableBackendRequest) GetLbName() string {
@@ -8866,7 +9001,7 @@ type ApplyLBRequest struct {
 
 func (x *ApplyLBRequest) Reset() {
 	*x = ApplyLBRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[121]
+	mi := &file_litevirt_v1_service_proto_msgTypes[123]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8878,7 +9013,7 @@ func (x *ApplyLBRequest) String() string {
 func (*ApplyLBRequest) ProtoMessage() {}
 
 func (x *ApplyLBRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[121]
+	mi := &file_litevirt_v1_service_proto_msgTypes[123]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8891,7 +9026,7 @@ func (x *ApplyLBRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ApplyLBRequest.ProtoReflect.Descriptor instead.
 func (*ApplyLBRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{121}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{123}
 }
 
 func (x *ApplyLBRequest) GetLbName() string {
@@ -8953,7 +9088,7 @@ type RemoveLBRequest struct {
 
 func (x *RemoveLBRequest) Reset() {
 	*x = RemoveLBRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[122]
+	mi := &file_litevirt_v1_service_proto_msgTypes[124]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8965,7 +9100,7 @@ func (x *RemoveLBRequest) String() string {
 func (*RemoveLBRequest) ProtoMessage() {}
 
 func (x *RemoveLBRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[122]
+	mi := &file_litevirt_v1_service_proto_msgTypes[124]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8978,7 +9113,7 @@ func (x *RemoveLBRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RemoveLBRequest.ProtoReflect.Descriptor instead.
 func (*RemoveLBRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{122}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{124}
 }
 
 func (x *RemoveLBRequest) GetLbName() string {
@@ -9003,7 +9138,7 @@ type CreateLBRequest struct {
 
 func (x *CreateLBRequest) Reset() {
 	*x = CreateLBRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[123]
+	mi := &file_litevirt_v1_service_proto_msgTypes[125]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9015,7 +9150,7 @@ func (x *CreateLBRequest) String() string {
 func (*CreateLBRequest) ProtoMessage() {}
 
 func (x *CreateLBRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[123]
+	mi := &file_litevirt_v1_service_proto_msgTypes[125]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9028,7 +9163,7 @@ func (x *CreateLBRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateLBRequest.ProtoReflect.Descriptor instead.
 func (*CreateLBRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{123}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{125}
 }
 
 func (x *CreateLBRequest) GetName() string {
@@ -9097,7 +9232,7 @@ type UpdateLBRequest struct {
 
 func (x *UpdateLBRequest) Reset() {
 	*x = UpdateLBRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[124]
+	mi := &file_litevirt_v1_service_proto_msgTypes[126]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9109,7 +9244,7 @@ func (x *UpdateLBRequest) String() string {
 func (*UpdateLBRequest) ProtoMessage() {}
 
 func (x *UpdateLBRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[124]
+	mi := &file_litevirt_v1_service_proto_msgTypes[126]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9122,7 +9257,7 @@ func (x *UpdateLBRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpdateLBRequest.ProtoReflect.Descriptor instead.
 func (*UpdateLBRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{124}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{126}
 }
 
 func (x *UpdateLBRequest) GetName() string {
@@ -9197,7 +9332,7 @@ type DeleteLBRequest struct {
 
 func (x *DeleteLBRequest) Reset() {
 	*x = DeleteLBRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[125]
+	mi := &file_litevirt_v1_service_proto_msgTypes[127]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9209,7 +9344,7 @@ func (x *DeleteLBRequest) String() string {
 func (*DeleteLBRequest) ProtoMessage() {}
 
 func (x *DeleteLBRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[125]
+	mi := &file_litevirt_v1_service_proto_msgTypes[127]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9222,7 +9357,7 @@ func (x *DeleteLBRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteLBRequest.ProtoReflect.Descriptor instead.
 func (*DeleteLBRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{125}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{127}
 }
 
 func (x *DeleteLBRequest) GetName() string {
@@ -9241,7 +9376,7 @@ type LBStatsRequest struct {
 
 func (x *LBStatsRequest) Reset() {
 	*x = LBStatsRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[126]
+	mi := &file_litevirt_v1_service_proto_msgTypes[128]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9253,7 +9388,7 @@ func (x *LBStatsRequest) String() string {
 func (*LBStatsRequest) ProtoMessage() {}
 
 func (x *LBStatsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[126]
+	mi := &file_litevirt_v1_service_proto_msgTypes[128]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9266,7 +9401,7 @@ func (x *LBStatsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LBStatsRequest.ProtoReflect.Descriptor instead.
 func (*LBStatsRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{126}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{128}
 }
 
 func (x *LBStatsRequest) GetName() string {
@@ -9286,7 +9421,7 @@ type DrainBackendRequest struct {
 
 func (x *DrainBackendRequest) Reset() {
 	*x = DrainBackendRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[127]
+	mi := &file_litevirt_v1_service_proto_msgTypes[129]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9298,7 +9433,7 @@ func (x *DrainBackendRequest) String() string {
 func (*DrainBackendRequest) ProtoMessage() {}
 
 func (x *DrainBackendRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[127]
+	mi := &file_litevirt_v1_service_proto_msgTypes[129]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9311,7 +9446,7 @@ func (x *DrainBackendRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DrainBackendRequest.ProtoReflect.Descriptor instead.
 func (*DrainBackendRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{127}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{129}
 }
 
 func (x *DrainBackendRequest) GetLbName() string {
@@ -9338,7 +9473,7 @@ type DrainBackendResponse struct {
 
 func (x *DrainBackendResponse) Reset() {
 	*x = DrainBackendResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[128]
+	mi := &file_litevirt_v1_service_proto_msgTypes[130]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9350,7 +9485,7 @@ func (x *DrainBackendResponse) String() string {
 func (*DrainBackendResponse) ProtoMessage() {}
 
 func (x *DrainBackendResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[128]
+	mi := &file_litevirt_v1_service_proto_msgTypes[130]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9363,7 +9498,7 @@ func (x *DrainBackendResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DrainBackendResponse.ProtoReflect.Descriptor instead.
 func (*DrainBackendResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{128}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{130}
 }
 
 func (x *DrainBackendResponse) GetStatus() string {
@@ -9401,7 +9536,7 @@ type LoginRequest struct {
 
 func (x *LoginRequest) Reset() {
 	*x = LoginRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[129]
+	mi := &file_litevirt_v1_service_proto_msgTypes[131]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9413,7 +9548,7 @@ func (x *LoginRequest) String() string {
 func (*LoginRequest) ProtoMessage() {}
 
 func (x *LoginRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[129]
+	mi := &file_litevirt_v1_service_proto_msgTypes[131]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9426,7 +9561,7 @@ func (x *LoginRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LoginRequest.ProtoReflect.Descriptor instead.
 func (*LoginRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{129}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{131}
 }
 
 func (x *LoginRequest) GetUsername() string {
@@ -9498,7 +9633,7 @@ type LoginResponse struct {
 
 func (x *LoginResponse) Reset() {
 	*x = LoginResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[130]
+	mi := &file_litevirt_v1_service_proto_msgTypes[132]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9510,7 +9645,7 @@ func (x *LoginResponse) String() string {
 func (*LoginResponse) ProtoMessage() {}
 
 func (x *LoginResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[130]
+	mi := &file_litevirt_v1_service_proto_msgTypes[132]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9523,7 +9658,7 @@ func (x *LoginResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LoginResponse.ProtoReflect.Descriptor instead.
 func (*LoginResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{130}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{132}
 }
 
 func (x *LoginResponse) GetToken() string {
@@ -9570,7 +9705,7 @@ type ListRealmsResponse struct {
 
 func (x *ListRealmsResponse) Reset() {
 	*x = ListRealmsResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[131]
+	mi := &file_litevirt_v1_service_proto_msgTypes[133]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9582,7 +9717,7 @@ func (x *ListRealmsResponse) String() string {
 func (*ListRealmsResponse) ProtoMessage() {}
 
 func (x *ListRealmsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[131]
+	mi := &file_litevirt_v1_service_proto_msgTypes[133]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9595,7 +9730,7 @@ func (x *ListRealmsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListRealmsResponse.ProtoReflect.Descriptor instead.
 func (*ListRealmsResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{131}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{133}
 }
 
 func (x *ListRealmsResponse) GetRealms() []string {
@@ -9616,7 +9751,7 @@ type CreateUserRequest struct {
 
 func (x *CreateUserRequest) Reset() {
 	*x = CreateUserRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[132]
+	mi := &file_litevirt_v1_service_proto_msgTypes[134]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9628,7 +9763,7 @@ func (x *CreateUserRequest) String() string {
 func (*CreateUserRequest) ProtoMessage() {}
 
 func (x *CreateUserRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[132]
+	mi := &file_litevirt_v1_service_proto_msgTypes[134]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9641,7 +9776,7 @@ func (x *CreateUserRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateUserRequest.ProtoReflect.Descriptor instead.
 func (*CreateUserRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{132}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{134}
 }
 
 func (x *CreateUserRequest) GetUsername() string {
@@ -9674,7 +9809,7 @@ type ListUsersResponse struct {
 
 func (x *ListUsersResponse) Reset() {
 	*x = ListUsersResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[133]
+	mi := &file_litevirt_v1_service_proto_msgTypes[135]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9686,7 +9821,7 @@ func (x *ListUsersResponse) String() string {
 func (*ListUsersResponse) ProtoMessage() {}
 
 func (x *ListUsersResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[133]
+	mi := &file_litevirt_v1_service_proto_msgTypes[135]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9699,7 +9834,7 @@ func (x *ListUsersResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListUsersResponse.ProtoReflect.Descriptor instead.
 func (*ListUsersResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{133}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{135}
 }
 
 func (x *ListUsersResponse) GetUsers() []*User {
@@ -9718,7 +9853,7 @@ type DeleteUserRequest struct {
 
 func (x *DeleteUserRequest) Reset() {
 	*x = DeleteUserRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[134]
+	mi := &file_litevirt_v1_service_proto_msgTypes[136]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9730,7 +9865,7 @@ func (x *DeleteUserRequest) String() string {
 func (*DeleteUserRequest) ProtoMessage() {}
 
 func (x *DeleteUserRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[134]
+	mi := &file_litevirt_v1_service_proto_msgTypes[136]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9743,7 +9878,7 @@ func (x *DeleteUserRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteUserRequest.ProtoReflect.Descriptor instead.
 func (*DeleteUserRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{134}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{136}
 }
 
 func (x *DeleteUserRequest) GetUsername() string {
@@ -9765,7 +9900,7 @@ type WhoamiResponse struct {
 
 func (x *WhoamiResponse) Reset() {
 	*x = WhoamiResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[135]
+	mi := &file_litevirt_v1_service_proto_msgTypes[137]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9777,7 +9912,7 @@ func (x *WhoamiResponse) String() string {
 func (*WhoamiResponse) ProtoMessage() {}
 
 func (x *WhoamiResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[135]
+	mi := &file_litevirt_v1_service_proto_msgTypes[137]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9790,7 +9925,7 @@ func (x *WhoamiResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WhoamiResponse.ProtoReflect.Descriptor instead.
 func (*WhoamiResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{135}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{137}
 }
 
 func (x *WhoamiResponse) GetUsername() string {
@@ -9832,7 +9967,7 @@ type CheckPermissionsRequest struct {
 
 func (x *CheckPermissionsRequest) Reset() {
 	*x = CheckPermissionsRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[136]
+	mi := &file_litevirt_v1_service_proto_msgTypes[138]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9844,7 +9979,7 @@ func (x *CheckPermissionsRequest) String() string {
 func (*CheckPermissionsRequest) ProtoMessage() {}
 
 func (x *CheckPermissionsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[136]
+	mi := &file_litevirt_v1_service_proto_msgTypes[138]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9857,7 +9992,7 @@ func (x *CheckPermissionsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CheckPermissionsRequest.ProtoReflect.Descriptor instead.
 func (*CheckPermissionsRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{136}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{138}
 }
 
 func (x *CheckPermissionsRequest) GetGates() []string {
@@ -9877,7 +10012,7 @@ type CheckPermissionsResponse struct {
 
 func (x *CheckPermissionsResponse) Reset() {
 	*x = CheckPermissionsResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[137]
+	mi := &file_litevirt_v1_service_proto_msgTypes[139]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9889,7 +10024,7 @@ func (x *CheckPermissionsResponse) String() string {
 func (*CheckPermissionsResponse) ProtoMessage() {}
 
 func (x *CheckPermissionsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[137]
+	mi := &file_litevirt_v1_service_proto_msgTypes[139]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9902,7 +10037,7 @@ func (x *CheckPermissionsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CheckPermissionsResponse.ProtoReflect.Descriptor instead.
 func (*CheckPermissionsResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{137}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{139}
 }
 
 func (x *CheckPermissionsResponse) GetAllowed() map[string]bool {
@@ -9925,7 +10060,7 @@ type ChangePasswordRequest struct {
 
 func (x *ChangePasswordRequest) Reset() {
 	*x = ChangePasswordRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[138]
+	mi := &file_litevirt_v1_service_proto_msgTypes[140]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9937,7 +10072,7 @@ func (x *ChangePasswordRequest) String() string {
 func (*ChangePasswordRequest) ProtoMessage() {}
 
 func (x *ChangePasswordRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[138]
+	mi := &file_litevirt_v1_service_proto_msgTypes[140]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9950,7 +10085,7 @@ func (x *ChangePasswordRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChangePasswordRequest.ProtoReflect.Descriptor instead.
 func (*ChangePasswordRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{138}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{140}
 }
 
 func (x *ChangePasswordRequest) GetUsername() string {
@@ -9990,7 +10125,7 @@ type ResetAdminPasswordRequest struct {
 
 func (x *ResetAdminPasswordRequest) Reset() {
 	*x = ResetAdminPasswordRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[139]
+	mi := &file_litevirt_v1_service_proto_msgTypes[141]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10002,7 +10137,7 @@ func (x *ResetAdminPasswordRequest) String() string {
 func (*ResetAdminPasswordRequest) ProtoMessage() {}
 
 func (x *ResetAdminPasswordRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[139]
+	mi := &file_litevirt_v1_service_proto_msgTypes[141]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10015,7 +10150,7 @@ func (x *ResetAdminPasswordRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResetAdminPasswordRequest.ProtoReflect.Descriptor instead.
 func (*ResetAdminPasswordRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{139}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{141}
 }
 
 func (x *ResetAdminPasswordRequest) GetPasswordHash() string {
@@ -10047,7 +10182,7 @@ type CreateTokenRequest struct {
 
 func (x *CreateTokenRequest) Reset() {
 	*x = CreateTokenRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[140]
+	mi := &file_litevirt_v1_service_proto_msgTypes[142]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10059,7 +10194,7 @@ func (x *CreateTokenRequest) String() string {
 func (*CreateTokenRequest) ProtoMessage() {}
 
 func (x *CreateTokenRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[140]
+	mi := &file_litevirt_v1_service_proto_msgTypes[142]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10072,7 +10207,7 @@ func (x *CreateTokenRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateTokenRequest.ProtoReflect.Descriptor instead.
 func (*CreateTokenRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{140}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{142}
 }
 
 func (x *CreateTokenRequest) GetUsername() string {
@@ -10112,7 +10247,7 @@ type RevokeTokenRequest struct {
 
 func (x *RevokeTokenRequest) Reset() {
 	*x = RevokeTokenRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[141]
+	mi := &file_litevirt_v1_service_proto_msgTypes[143]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10124,7 +10259,7 @@ func (x *RevokeTokenRequest) String() string {
 func (*RevokeTokenRequest) ProtoMessage() {}
 
 func (x *RevokeTokenRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[141]
+	mi := &file_litevirt_v1_service_proto_msgTypes[143]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10137,7 +10272,7 @@ func (x *RevokeTokenRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RevokeTokenRequest.ProtoReflect.Descriptor instead.
 func (*RevokeTokenRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{141}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{143}
 }
 
 func (x *RevokeTokenRequest) GetId() string {
@@ -10180,7 +10315,7 @@ type BackupSnapshotRequest struct {
 
 func (x *BackupSnapshotRequest) Reset() {
 	*x = BackupSnapshotRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[142]
+	mi := &file_litevirt_v1_service_proto_msgTypes[144]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10192,7 +10327,7 @@ func (x *BackupSnapshotRequest) String() string {
 func (*BackupSnapshotRequest) ProtoMessage() {}
 
 func (x *BackupSnapshotRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[142]
+	mi := &file_litevirt_v1_service_proto_msgTypes[144]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10205,7 +10340,7 @@ func (x *BackupSnapshotRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BackupSnapshotRequest.ProtoReflect.Descriptor instead.
 func (*BackupSnapshotRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{142}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{144}
 }
 
 func (x *BackupSnapshotRequest) GetVmName() string {
@@ -10277,7 +10412,7 @@ type BackupSnapshotProgress struct {
 
 func (x *BackupSnapshotProgress) Reset() {
 	*x = BackupSnapshotProgress{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[143]
+	mi := &file_litevirt_v1_service_proto_msgTypes[145]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10289,7 +10424,7 @@ func (x *BackupSnapshotProgress) String() string {
 func (*BackupSnapshotProgress) ProtoMessage() {}
 
 func (x *BackupSnapshotProgress) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[143]
+	mi := &file_litevirt_v1_service_proto_msgTypes[145]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10302,7 +10437,7 @@ func (x *BackupSnapshotProgress) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BackupSnapshotProgress.ProtoReflect.Descriptor instead.
 func (*BackupSnapshotProgress) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{143}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{145}
 }
 
 func (x *BackupSnapshotProgress) GetPhase() BackupSnapshotProgress_Phase {
@@ -10386,7 +10521,7 @@ type RepoTarget struct {
 
 func (x *RepoTarget) Reset() {
 	*x = RepoTarget{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[144]
+	mi := &file_litevirt_v1_service_proto_msgTypes[146]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10398,7 +10533,7 @@ func (x *RepoTarget) String() string {
 func (*RepoTarget) ProtoMessage() {}
 
 func (x *RepoTarget) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[144]
+	mi := &file_litevirt_v1_service_proto_msgTypes[146]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10411,7 +10546,7 @@ func (x *RepoTarget) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RepoTarget.ProtoReflect.Descriptor instead.
 func (*RepoTarget) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{144}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{146}
 }
 
 func (x *RepoTarget) GetRepoName() string {
@@ -10438,7 +10573,7 @@ type HasChunksRequest struct {
 
 func (x *HasChunksRequest) Reset() {
 	*x = HasChunksRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[145]
+	mi := &file_litevirt_v1_service_proto_msgTypes[147]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10450,7 +10585,7 @@ func (x *HasChunksRequest) String() string {
 func (*HasChunksRequest) ProtoMessage() {}
 
 func (x *HasChunksRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[145]
+	mi := &file_litevirt_v1_service_proto_msgTypes[147]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10463,7 +10598,7 @@ func (x *HasChunksRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HasChunksRequest.ProtoReflect.Descriptor instead.
 func (*HasChunksRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{145}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{147}
 }
 
 func (x *HasChunksRequest) GetTarget() *RepoTarget {
@@ -10489,7 +10624,7 @@ type HasChunksResponse struct {
 
 func (x *HasChunksResponse) Reset() {
 	*x = HasChunksResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[146]
+	mi := &file_litevirt_v1_service_proto_msgTypes[148]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10501,7 +10636,7 @@ func (x *HasChunksResponse) String() string {
 func (*HasChunksResponse) ProtoMessage() {}
 
 func (x *HasChunksResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[146]
+	mi := &file_litevirt_v1_service_proto_msgTypes[148]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10514,7 +10649,7 @@ func (x *HasChunksResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HasChunksResponse.ProtoReflect.Descriptor instead.
 func (*HasChunksResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{146}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{148}
 }
 
 func (x *HasChunksResponse) GetPresent() []bool {
@@ -10543,7 +10678,7 @@ type PushBackupFrame struct {
 
 func (x *PushBackupFrame) Reset() {
 	*x = PushBackupFrame{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[147]
+	mi := &file_litevirt_v1_service_proto_msgTypes[149]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10555,7 +10690,7 @@ func (x *PushBackupFrame) String() string {
 func (*PushBackupFrame) ProtoMessage() {}
 
 func (x *PushBackupFrame) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[147]
+	mi := &file_litevirt_v1_service_proto_msgTypes[149]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10568,7 +10703,7 @@ func (x *PushBackupFrame) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PushBackupFrame.ProtoReflect.Descriptor instead.
 func (*PushBackupFrame) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{147}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{149}
 }
 
 func (x *PushBackupFrame) GetFrame() isPushBackupFrame_Frame {
@@ -10636,7 +10771,7 @@ type PushBackupHeader struct {
 
 func (x *PushBackupHeader) Reset() {
 	*x = PushBackupHeader{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[148]
+	mi := &file_litevirt_v1_service_proto_msgTypes[150]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10648,7 +10783,7 @@ func (x *PushBackupHeader) String() string {
 func (*PushBackupHeader) ProtoMessage() {}
 
 func (x *PushBackupHeader) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[148]
+	mi := &file_litevirt_v1_service_proto_msgTypes[150]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10661,7 +10796,7 @@ func (x *PushBackupHeader) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PushBackupHeader.ProtoReflect.Descriptor instead.
 func (*PushBackupHeader) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{148}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{150}
 }
 
 func (x *PushBackupHeader) GetTarget() *RepoTarget {
@@ -10684,7 +10819,7 @@ type PushChunkFrame struct {
 
 func (x *PushChunkFrame) Reset() {
 	*x = PushChunkFrame{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[149]
+	mi := &file_litevirt_v1_service_proto_msgTypes[151]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10696,7 +10831,7 @@ func (x *PushChunkFrame) String() string {
 func (*PushChunkFrame) ProtoMessage() {}
 
 func (x *PushChunkFrame) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[149]
+	mi := &file_litevirt_v1_service_proto_msgTypes[151]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10709,7 +10844,7 @@ func (x *PushChunkFrame) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PushChunkFrame.ProtoReflect.Descriptor instead.
 func (*PushChunkFrame) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{149}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{151}
 }
 
 func (x *PushChunkFrame) GetChunkId() string {
@@ -10757,7 +10892,7 @@ type PushManifestFrame struct {
 
 func (x *PushManifestFrame) Reset() {
 	*x = PushManifestFrame{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[150]
+	mi := &file_litevirt_v1_service_proto_msgTypes[152]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10769,7 +10904,7 @@ func (x *PushManifestFrame) String() string {
 func (*PushManifestFrame) ProtoMessage() {}
 
 func (x *PushManifestFrame) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[150]
+	mi := &file_litevirt_v1_service_proto_msgTypes[152]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10782,7 +10917,7 @@ func (x *PushManifestFrame) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PushManifestFrame.ProtoReflect.Descriptor instead.
 func (*PushManifestFrame) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{150}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{152}
 }
 
 func (x *PushManifestFrame) GetData() []byte {
@@ -10810,7 +10945,7 @@ type PushBackupResponse struct {
 
 func (x *PushBackupResponse) Reset() {
 	*x = PushBackupResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[151]
+	mi := &file_litevirt_v1_service_proto_msgTypes[153]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10822,7 +10957,7 @@ func (x *PushBackupResponse) String() string {
 func (*PushBackupResponse) ProtoMessage() {}
 
 func (x *PushBackupResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[151]
+	mi := &file_litevirt_v1_service_proto_msgTypes[153]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10835,7 +10970,7 @@ func (x *PushBackupResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PushBackupResponse.ProtoReflect.Descriptor instead.
 func (*PushBackupResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{151}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{153}
 }
 
 func (x *PushBackupResponse) GetChunksWritten() int32 {
@@ -10879,7 +11014,7 @@ type RestoreFromBackupRequest struct {
 
 func (x *RestoreFromBackupRequest) Reset() {
 	*x = RestoreFromBackupRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[152]
+	mi := &file_litevirt_v1_service_proto_msgTypes[154]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10891,7 +11026,7 @@ func (x *RestoreFromBackupRequest) String() string {
 func (*RestoreFromBackupRequest) ProtoMessage() {}
 
 func (x *RestoreFromBackupRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[152]
+	mi := &file_litevirt_v1_service_proto_msgTypes[154]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10904,7 +11039,7 @@ func (x *RestoreFromBackupRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RestoreFromBackupRequest.ProtoReflect.Descriptor instead.
 func (*RestoreFromBackupRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{152}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{154}
 }
 
 func (x *RestoreFromBackupRequest) GetRepoPath() string {
@@ -10964,7 +11099,7 @@ type RestoreFromBackupProgress struct {
 
 func (x *RestoreFromBackupProgress) Reset() {
 	*x = RestoreFromBackupProgress{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[153]
+	mi := &file_litevirt_v1_service_proto_msgTypes[155]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10976,7 +11111,7 @@ func (x *RestoreFromBackupProgress) String() string {
 func (*RestoreFromBackupProgress) ProtoMessage() {}
 
 func (x *RestoreFromBackupProgress) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[153]
+	mi := &file_litevirt_v1_service_proto_msgTypes[155]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10989,7 +11124,7 @@ func (x *RestoreFromBackupProgress) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RestoreFromBackupProgress.ProtoReflect.Descriptor instead.
 func (*RestoreFromBackupProgress) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{153}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{155}
 }
 
 func (x *RestoreFromBackupProgress) GetPhase() RestoreFromBackupProgress_Phase {
@@ -11050,7 +11185,7 @@ type VerifyBackupRepoRequest struct {
 
 func (x *VerifyBackupRepoRequest) Reset() {
 	*x = VerifyBackupRepoRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[154]
+	mi := &file_litevirt_v1_service_proto_msgTypes[156]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11062,7 +11197,7 @@ func (x *VerifyBackupRepoRequest) String() string {
 func (*VerifyBackupRepoRequest) ProtoMessage() {}
 
 func (x *VerifyBackupRepoRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[154]
+	mi := &file_litevirt_v1_service_proto_msgTypes[156]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11075,7 +11210,7 @@ func (x *VerifyBackupRepoRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VerifyBackupRepoRequest.ProtoReflect.Descriptor instead.
 func (*VerifyBackupRepoRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{154}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{156}
 }
 
 func (x *VerifyBackupRepoRequest) GetRepo() string {
@@ -11096,7 +11231,7 @@ type VerifyBackupRepoResponse struct {
 
 func (x *VerifyBackupRepoResponse) Reset() {
 	*x = VerifyBackupRepoResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[155]
+	mi := &file_litevirt_v1_service_proto_msgTypes[157]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11108,7 +11243,7 @@ func (x *VerifyBackupRepoResponse) String() string {
 func (*VerifyBackupRepoResponse) ProtoMessage() {}
 
 func (x *VerifyBackupRepoResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[155]
+	mi := &file_litevirt_v1_service_proto_msgTypes[157]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11121,7 +11256,7 @@ func (x *VerifyBackupRepoResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VerifyBackupRepoResponse.ProtoReflect.Descriptor instead.
 func (*VerifyBackupRepoResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{155}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{157}
 }
 
 func (x *VerifyBackupRepoResponse) GetChunksChecked() int64 {
@@ -11154,7 +11289,7 @@ type GarbageCollectBackupRepoRequest struct {
 
 func (x *GarbageCollectBackupRepoRequest) Reset() {
 	*x = GarbageCollectBackupRepoRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[156]
+	mi := &file_litevirt_v1_service_proto_msgTypes[158]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11166,7 +11301,7 @@ func (x *GarbageCollectBackupRepoRequest) String() string {
 func (*GarbageCollectBackupRepoRequest) ProtoMessage() {}
 
 func (x *GarbageCollectBackupRepoRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[156]
+	mi := &file_litevirt_v1_service_proto_msgTypes[158]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11179,7 +11314,7 @@ func (x *GarbageCollectBackupRepoRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GarbageCollectBackupRepoRequest.ProtoReflect.Descriptor instead.
 func (*GarbageCollectBackupRepoRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{156}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{158}
 }
 
 func (x *GarbageCollectBackupRepoRequest) GetRepo() string {
@@ -11204,7 +11339,7 @@ type GarbageCollectBackupRepoResponse struct {
 
 func (x *GarbageCollectBackupRepoResponse) Reset() {
 	*x = GarbageCollectBackupRepoResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[157]
+	mi := &file_litevirt_v1_service_proto_msgTypes[159]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11216,7 +11351,7 @@ func (x *GarbageCollectBackupRepoResponse) String() string {
 func (*GarbageCollectBackupRepoResponse) ProtoMessage() {}
 
 func (x *GarbageCollectBackupRepoResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[157]
+	mi := &file_litevirt_v1_service_proto_msgTypes[159]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11229,7 +11364,7 @@ func (x *GarbageCollectBackupRepoResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GarbageCollectBackupRepoResponse.ProtoReflect.Descriptor instead.
 func (*GarbageCollectBackupRepoResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{157}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{159}
 }
 
 func (x *GarbageCollectBackupRepoResponse) GetManifestsScanned() int64 {
@@ -11296,7 +11431,7 @@ type BackupRepoSnapshot struct {
 
 func (x *BackupRepoSnapshot) Reset() {
 	*x = BackupRepoSnapshot{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[158]
+	mi := &file_litevirt_v1_service_proto_msgTypes[160]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11308,7 +11443,7 @@ func (x *BackupRepoSnapshot) String() string {
 func (*BackupRepoSnapshot) ProtoMessage() {}
 
 func (x *BackupRepoSnapshot) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[158]
+	mi := &file_litevirt_v1_service_proto_msgTypes[160]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11321,7 +11456,7 @@ func (x *BackupRepoSnapshot) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BackupRepoSnapshot.ProtoReflect.Descriptor instead.
 func (*BackupRepoSnapshot) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{158}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{160}
 }
 
 func (x *BackupRepoSnapshot) GetTimestamp() string {
@@ -11379,7 +11514,7 @@ type ListBackupRepoSnapshotsRequest struct {
 
 func (x *ListBackupRepoSnapshotsRequest) Reset() {
 	*x = ListBackupRepoSnapshotsRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[159]
+	mi := &file_litevirt_v1_service_proto_msgTypes[161]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11391,7 +11526,7 @@ func (x *ListBackupRepoSnapshotsRequest) String() string {
 func (*ListBackupRepoSnapshotsRequest) ProtoMessage() {}
 
 func (x *ListBackupRepoSnapshotsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[159]
+	mi := &file_litevirt_v1_service_proto_msgTypes[161]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11404,7 +11539,7 @@ func (x *ListBackupRepoSnapshotsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListBackupRepoSnapshotsRequest.ProtoReflect.Descriptor instead.
 func (*ListBackupRepoSnapshotsRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{159}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{161}
 }
 
 func (x *ListBackupRepoSnapshotsRequest) GetRepo() string {
@@ -11424,7 +11559,7 @@ type ListBackupRepoSnapshotsResponse struct {
 
 func (x *ListBackupRepoSnapshotsResponse) Reset() {
 	*x = ListBackupRepoSnapshotsResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[160]
+	mi := &file_litevirt_v1_service_proto_msgTypes[162]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11436,7 +11571,7 @@ func (x *ListBackupRepoSnapshotsResponse) String() string {
 func (*ListBackupRepoSnapshotsResponse) ProtoMessage() {}
 
 func (x *ListBackupRepoSnapshotsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[160]
+	mi := &file_litevirt_v1_service_proto_msgTypes[162]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11449,7 +11584,7 @@ func (x *ListBackupRepoSnapshotsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListBackupRepoSnapshotsResponse.ProtoReflect.Descriptor instead.
 func (*ListBackupRepoSnapshotsResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{160}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{162}
 }
 
 func (x *ListBackupRepoSnapshotsResponse) GetEncryption() string {
@@ -11483,7 +11618,7 @@ type PruneBackupRepoRequest struct {
 
 func (x *PruneBackupRepoRequest) Reset() {
 	*x = PruneBackupRepoRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[161]
+	mi := &file_litevirt_v1_service_proto_msgTypes[163]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11495,7 +11630,7 @@ func (x *PruneBackupRepoRequest) String() string {
 func (*PruneBackupRepoRequest) ProtoMessage() {}
 
 func (x *PruneBackupRepoRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[161]
+	mi := &file_litevirt_v1_service_proto_msgTypes[163]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11508,7 +11643,7 @@ func (x *PruneBackupRepoRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PruneBackupRepoRequest.ProtoReflect.Descriptor instead.
 func (*PruneBackupRepoRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{161}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{163}
 }
 
 func (x *PruneBackupRepoRequest) GetRepo() string {
@@ -11571,7 +11706,7 @@ type PruneBackupRepoResponse struct {
 
 func (x *PruneBackupRepoResponse) Reset() {
 	*x = PruneBackupRepoResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[162]
+	mi := &file_litevirt_v1_service_proto_msgTypes[164]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11583,7 +11718,7 @@ func (x *PruneBackupRepoResponse) String() string {
 func (*PruneBackupRepoResponse) ProtoMessage() {}
 
 func (x *PruneBackupRepoResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[162]
+	mi := &file_litevirt_v1_service_proto_msgTypes[164]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11596,7 +11731,7 @@ func (x *PruneBackupRepoResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PruneBackupRepoResponse.ProtoReflect.Descriptor instead.
 func (*PruneBackupRepoResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{162}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{164}
 }
 
 func (x *PruneBackupRepoResponse) GetKeep() []*BackupRepoSnapshot {
@@ -11630,7 +11765,7 @@ type SyncBackupRepoRequest struct {
 
 func (x *SyncBackupRepoRequest) Reset() {
 	*x = SyncBackupRepoRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[163]
+	mi := &file_litevirt_v1_service_proto_msgTypes[165]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11642,7 +11777,7 @@ func (x *SyncBackupRepoRequest) String() string {
 func (*SyncBackupRepoRequest) ProtoMessage() {}
 
 func (x *SyncBackupRepoRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[163]
+	mi := &file_litevirt_v1_service_proto_msgTypes[165]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11655,7 +11790,7 @@ func (x *SyncBackupRepoRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SyncBackupRepoRequest.ProtoReflect.Descriptor instead.
 func (*SyncBackupRepoRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{163}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{165}
 }
 
 func (x *SyncBackupRepoRequest) GetSource() string {
@@ -11684,7 +11819,7 @@ type SyncBackupRepoResponse struct {
 
 func (x *SyncBackupRepoResponse) Reset() {
 	*x = SyncBackupRepoResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[164]
+	mi := &file_litevirt_v1_service_proto_msgTypes[166]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11696,7 +11831,7 @@ func (x *SyncBackupRepoResponse) String() string {
 func (*SyncBackupRepoResponse) ProtoMessage() {}
 
 func (x *SyncBackupRepoResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[164]
+	mi := &file_litevirt_v1_service_proto_msgTypes[166]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11709,7 +11844,7 @@ func (x *SyncBackupRepoResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SyncBackupRepoResponse.ProtoReflect.Descriptor instead.
 func (*SyncBackupRepoResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{164}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{166}
 }
 
 func (x *SyncBackupRepoResponse) GetManifestsCopied() int64 {
@@ -11764,7 +11899,7 @@ type Container struct {
 
 func (x *Container) Reset() {
 	*x = Container{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[165]
+	mi := &file_litevirt_v1_service_proto_msgTypes[167]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11776,7 +11911,7 @@ func (x *Container) String() string {
 func (*Container) ProtoMessage() {}
 
 func (x *Container) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[165]
+	mi := &file_litevirt_v1_service_proto_msgTypes[167]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11789,7 +11924,7 @@ func (x *Container) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Container.ProtoReflect.Descriptor instead.
 func (*Container) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{165}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{167}
 }
 
 func (x *Container) GetHostName() string {
@@ -11909,7 +12044,7 @@ type ContainerNetwork struct {
 
 func (x *ContainerNetwork) Reset() {
 	*x = ContainerNetwork{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[166]
+	mi := &file_litevirt_v1_service_proto_msgTypes[168]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11921,7 +12056,7 @@ func (x *ContainerNetwork) String() string {
 func (*ContainerNetwork) ProtoMessage() {}
 
 func (x *ContainerNetwork) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[166]
+	mi := &file_litevirt_v1_service_proto_msgTypes[168]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11934,7 +12069,7 @@ func (x *ContainerNetwork) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ContainerNetwork.ProtoReflect.Descriptor instead.
 func (*ContainerNetwork) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{166}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{168}
 }
 
 func (x *ContainerNetwork) GetName() string {
@@ -12010,7 +12145,7 @@ type CreateContainerRequest struct {
 
 func (x *CreateContainerRequest) Reset() {
 	*x = CreateContainerRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[167]
+	mi := &file_litevirt_v1_service_proto_msgTypes[169]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12022,7 +12157,7 @@ func (x *CreateContainerRequest) String() string {
 func (*CreateContainerRequest) ProtoMessage() {}
 
 func (x *CreateContainerRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[167]
+	mi := &file_litevirt_v1_service_proto_msgTypes[169]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12035,7 +12170,7 @@ func (x *CreateContainerRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateContainerRequest.ProtoReflect.Descriptor instead.
 func (*CreateContainerRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{167}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{169}
 }
 
 func (x *CreateContainerRequest) GetHostName() string {
@@ -12174,7 +12309,7 @@ type PrepareContainerTargetRequest struct {
 
 func (x *PrepareContainerTargetRequest) Reset() {
 	*x = PrepareContainerTargetRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[168]
+	mi := &file_litevirt_v1_service_proto_msgTypes[170]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12186,7 +12321,7 @@ func (x *PrepareContainerTargetRequest) String() string {
 func (*PrepareContainerTargetRequest) ProtoMessage() {}
 
 func (x *PrepareContainerTargetRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[168]
+	mi := &file_litevirt_v1_service_proto_msgTypes[170]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12199,7 +12334,7 @@ func (x *PrepareContainerTargetRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PrepareContainerTargetRequest.ProtoReflect.Descriptor instead.
 func (*PrepareContainerTargetRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{168}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{170}
 }
 
 func (x *PrepareContainerTargetRequest) GetIdmapBase() int64 {
@@ -12246,7 +12381,7 @@ type ConvertContainerRequest struct {
 
 func (x *ConvertContainerRequest) Reset() {
 	*x = ConvertContainerRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[169]
+	mi := &file_litevirt_v1_service_proto_msgTypes[171]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12258,7 +12393,7 @@ func (x *ConvertContainerRequest) String() string {
 func (*ConvertContainerRequest) ProtoMessage() {}
 
 func (x *ConvertContainerRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[169]
+	mi := &file_litevirt_v1_service_proto_msgTypes[171]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12271,7 +12406,7 @@ func (x *ConvertContainerRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ConvertContainerRequest.ProtoReflect.Descriptor instead.
 func (*ConvertContainerRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{169}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{171}
 }
 
 func (x *ConvertContainerRequest) GetHostName() string {
@@ -12312,7 +12447,7 @@ type StartContainerRequest struct {
 
 func (x *StartContainerRequest) Reset() {
 	*x = StartContainerRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[170]
+	mi := &file_litevirt_v1_service_proto_msgTypes[172]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12324,7 +12459,7 @@ func (x *StartContainerRequest) String() string {
 func (*StartContainerRequest) ProtoMessage() {}
 
 func (x *StartContainerRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[170]
+	mi := &file_litevirt_v1_service_proto_msgTypes[172]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12337,7 +12472,7 @@ func (x *StartContainerRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StartContainerRequest.ProtoReflect.Descriptor instead.
 func (*StartContainerRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{170}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{172}
 }
 
 func (x *StartContainerRequest) GetHostName() string {
@@ -12365,7 +12500,7 @@ type StopContainerRequest struct {
 
 func (x *StopContainerRequest) Reset() {
 	*x = StopContainerRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[171]
+	mi := &file_litevirt_v1_service_proto_msgTypes[173]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12377,7 +12512,7 @@ func (x *StopContainerRequest) String() string {
 func (*StopContainerRequest) ProtoMessage() {}
 
 func (x *StopContainerRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[171]
+	mi := &file_litevirt_v1_service_proto_msgTypes[173]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12390,7 +12525,7 @@ func (x *StopContainerRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StopContainerRequest.ProtoReflect.Descriptor instead.
 func (*StopContainerRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{171}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{173}
 }
 
 func (x *StopContainerRequest) GetHostName() string {
@@ -12427,7 +12562,7 @@ type DeleteContainerRequest struct {
 
 func (x *DeleteContainerRequest) Reset() {
 	*x = DeleteContainerRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[172]
+	mi := &file_litevirt_v1_service_proto_msgTypes[174]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12439,7 +12574,7 @@ func (x *DeleteContainerRequest) String() string {
 func (*DeleteContainerRequest) ProtoMessage() {}
 
 func (x *DeleteContainerRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[172]
+	mi := &file_litevirt_v1_service_proto_msgTypes[174]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12452,7 +12587,7 @@ func (x *DeleteContainerRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteContainerRequest.ProtoReflect.Descriptor instead.
 func (*DeleteContainerRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{172}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{174}
 }
 
 func (x *DeleteContainerRequest) GetHostName() string {
@@ -12487,7 +12622,7 @@ type ExecContainerRequest struct {
 
 func (x *ExecContainerRequest) Reset() {
 	*x = ExecContainerRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[173]
+	mi := &file_litevirt_v1_service_proto_msgTypes[175]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12499,7 +12634,7 @@ func (x *ExecContainerRequest) String() string {
 func (*ExecContainerRequest) ProtoMessage() {}
 
 func (x *ExecContainerRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[173]
+	mi := &file_litevirt_v1_service_proto_msgTypes[175]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12512,7 +12647,7 @@ func (x *ExecContainerRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecContainerRequest.ProtoReflect.Descriptor instead.
 func (*ExecContainerRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{173}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{175}
 }
 
 func (x *ExecContainerRequest) GetHostName() string {
@@ -12547,7 +12682,7 @@ type ExecContainerResponse struct {
 
 func (x *ExecContainerResponse) Reset() {
 	*x = ExecContainerResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[174]
+	mi := &file_litevirt_v1_service_proto_msgTypes[176]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12559,7 +12694,7 @@ func (x *ExecContainerResponse) String() string {
 func (*ExecContainerResponse) ProtoMessage() {}
 
 func (x *ExecContainerResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[174]
+	mi := &file_litevirt_v1_service_proto_msgTypes[176]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12572,7 +12707,7 @@ func (x *ExecContainerResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecContainerResponse.ProtoReflect.Descriptor instead.
 func (*ExecContainerResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{174}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{176}
 }
 
 func (x *ExecContainerResponse) GetStdout() []byte {
@@ -12607,7 +12742,7 @@ type ListContainersRequest struct {
 
 func (x *ListContainersRequest) Reset() {
 	*x = ListContainersRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[175]
+	mi := &file_litevirt_v1_service_proto_msgTypes[177]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12619,7 +12754,7 @@ func (x *ListContainersRequest) String() string {
 func (*ListContainersRequest) ProtoMessage() {}
 
 func (x *ListContainersRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[175]
+	mi := &file_litevirt_v1_service_proto_msgTypes[177]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12632,7 +12767,7 @@ func (x *ListContainersRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListContainersRequest.ProtoReflect.Descriptor instead.
 func (*ListContainersRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{175}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{177}
 }
 
 func (x *ListContainersRequest) GetHostName() string {
@@ -12666,7 +12801,7 @@ type ListContainersResponse struct {
 
 func (x *ListContainersResponse) Reset() {
 	*x = ListContainersResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[176]
+	mi := &file_litevirt_v1_service_proto_msgTypes[178]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12678,7 +12813,7 @@ func (x *ListContainersResponse) String() string {
 func (*ListContainersResponse) ProtoMessage() {}
 
 func (x *ListContainersResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[176]
+	mi := &file_litevirt_v1_service_proto_msgTypes[178]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12691,7 +12826,7 @@ func (x *ListContainersResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListContainersResponse.ProtoReflect.Descriptor instead.
 func (*ListContainersResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{176}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{178}
 }
 
 func (x *ListContainersResponse) GetContainers() []*Container {
@@ -12731,7 +12866,7 @@ type PullOCIImageRequest struct {
 
 func (x *PullOCIImageRequest) Reset() {
 	*x = PullOCIImageRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[177]
+	mi := &file_litevirt_v1_service_proto_msgTypes[179]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12743,7 +12878,7 @@ func (x *PullOCIImageRequest) String() string {
 func (*PullOCIImageRequest) ProtoMessage() {}
 
 func (x *PullOCIImageRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[177]
+	mi := &file_litevirt_v1_service_proto_msgTypes[179]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12756,7 +12891,7 @@ func (x *PullOCIImageRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PullOCIImageRequest.ProtoReflect.Descriptor instead.
 func (*PullOCIImageRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{177}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{179}
 }
 
 func (x *PullOCIImageRequest) GetHostName() string {
@@ -12830,7 +12965,7 @@ type BackupContainerRequest struct {
 
 func (x *BackupContainerRequest) Reset() {
 	*x = BackupContainerRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[178]
+	mi := &file_litevirt_v1_service_proto_msgTypes[180]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12842,7 +12977,7 @@ func (x *BackupContainerRequest) String() string {
 func (*BackupContainerRequest) ProtoMessage() {}
 
 func (x *BackupContainerRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[178]
+	mi := &file_litevirt_v1_service_proto_msgTypes[180]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12855,7 +12990,7 @@ func (x *BackupContainerRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BackupContainerRequest.ProtoReflect.Descriptor instead.
 func (*BackupContainerRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{178}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{180}
 }
 
 func (x *BackupContainerRequest) GetName() string {
@@ -12909,7 +13044,7 @@ type BackupContainerProgress struct {
 
 func (x *BackupContainerProgress) Reset() {
 	*x = BackupContainerProgress{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[179]
+	mi := &file_litevirt_v1_service_proto_msgTypes[181]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12921,7 +13056,7 @@ func (x *BackupContainerProgress) String() string {
 func (*BackupContainerProgress) ProtoMessage() {}
 
 func (x *BackupContainerProgress) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[179]
+	mi := &file_litevirt_v1_service_proto_msgTypes[181]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12934,7 +13069,7 @@ func (x *BackupContainerProgress) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BackupContainerProgress.ProtoReflect.Descriptor instead.
 func (*BackupContainerProgress) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{179}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{181}
 }
 
 func (x *BackupContainerProgress) GetPhase() BackupContainerProgress_Phase {
@@ -13030,7 +13165,7 @@ type RestoreContainerRequest struct {
 
 func (x *RestoreContainerRequest) Reset() {
 	*x = RestoreContainerRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[180]
+	mi := &file_litevirt_v1_service_proto_msgTypes[182]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13042,7 +13177,7 @@ func (x *RestoreContainerRequest) String() string {
 func (*RestoreContainerRequest) ProtoMessage() {}
 
 func (x *RestoreContainerRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[180]
+	mi := &file_litevirt_v1_service_proto_msgTypes[182]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13055,7 +13190,7 @@ func (x *RestoreContainerRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RestoreContainerRequest.ProtoReflect.Descriptor instead.
 func (*RestoreContainerRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{180}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{182}
 }
 
 func (x *RestoreContainerRequest) GetRepoPath() string {
@@ -13142,7 +13277,7 @@ type RestoreContainerProgress struct {
 
 func (x *RestoreContainerProgress) Reset() {
 	*x = RestoreContainerProgress{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[181]
+	mi := &file_litevirt_v1_service_proto_msgTypes[183]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13154,7 +13289,7 @@ func (x *RestoreContainerProgress) String() string {
 func (*RestoreContainerProgress) ProtoMessage() {}
 
 func (x *RestoreContainerProgress) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[181]
+	mi := &file_litevirt_v1_service_proto_msgTypes[183]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13167,7 +13302,7 @@ func (x *RestoreContainerProgress) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RestoreContainerProgress.ProtoReflect.Descriptor instead.
 func (*RestoreContainerProgress) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{181}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{183}
 }
 
 func (x *RestoreContainerProgress) GetPhase() RestoreContainerProgress_Phase {
@@ -13232,7 +13367,7 @@ type MigrateContainerRequest struct {
 
 func (x *MigrateContainerRequest) Reset() {
 	*x = MigrateContainerRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[182]
+	mi := &file_litevirt_v1_service_proto_msgTypes[184]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13244,7 +13379,7 @@ func (x *MigrateContainerRequest) String() string {
 func (*MigrateContainerRequest) ProtoMessage() {}
 
 func (x *MigrateContainerRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[182]
+	mi := &file_litevirt_v1_service_proto_msgTypes[184]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13257,7 +13392,7 @@ func (x *MigrateContainerRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MigrateContainerRequest.ProtoReflect.Descriptor instead.
 func (*MigrateContainerRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{182}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{184}
 }
 
 func (x *MigrateContainerRequest) GetName() string {
@@ -13300,7 +13435,7 @@ type MigrateContainerProgress struct {
 
 func (x *MigrateContainerProgress) Reset() {
 	*x = MigrateContainerProgress{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[183]
+	mi := &file_litevirt_v1_service_proto_msgTypes[185]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13312,7 +13447,7 @@ func (x *MigrateContainerProgress) String() string {
 func (*MigrateContainerProgress) ProtoMessage() {}
 
 func (x *MigrateContainerProgress) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[183]
+	mi := &file_litevirt_v1_service_proto_msgTypes[185]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13325,7 +13460,7 @@ func (x *MigrateContainerProgress) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MigrateContainerProgress.ProtoReflect.Descriptor instead.
 func (*MigrateContainerProgress) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{183}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{185}
 }
 
 func (x *MigrateContainerProgress) GetPhase() MigrateContainerProgress_Phase {
@@ -13375,7 +13510,7 @@ type ContainerSnapshot struct {
 
 func (x *ContainerSnapshot) Reset() {
 	*x = ContainerSnapshot{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[184]
+	mi := &file_litevirt_v1_service_proto_msgTypes[186]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13387,7 +13522,7 @@ func (x *ContainerSnapshot) String() string {
 func (*ContainerSnapshot) ProtoMessage() {}
 
 func (x *ContainerSnapshot) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[184]
+	mi := &file_litevirt_v1_service_proto_msgTypes[186]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13400,7 +13535,7 @@ func (x *ContainerSnapshot) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ContainerSnapshot.ProtoReflect.Descriptor instead.
 func (*ContainerSnapshot) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{184}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{186}
 }
 
 func (x *ContainerSnapshot) GetId() string {
@@ -13477,7 +13612,7 @@ type InspectContainerRequest struct {
 
 func (x *InspectContainerRequest) Reset() {
 	*x = InspectContainerRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[185]
+	mi := &file_litevirt_v1_service_proto_msgTypes[187]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13489,7 +13624,7 @@ func (x *InspectContainerRequest) String() string {
 func (*InspectContainerRequest) ProtoMessage() {}
 
 func (x *InspectContainerRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[185]
+	mi := &file_litevirt_v1_service_proto_msgTypes[187]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13502,7 +13637,7 @@ func (x *InspectContainerRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InspectContainerRequest.ProtoReflect.Descriptor instead.
 func (*InspectContainerRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{185}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{187}
 }
 
 func (x *InspectContainerRequest) GetName() string {
@@ -13542,7 +13677,7 @@ type ContainerInterfaceDetail struct {
 
 func (x *ContainerInterfaceDetail) Reset() {
 	*x = ContainerInterfaceDetail{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[186]
+	mi := &file_litevirt_v1_service_proto_msgTypes[188]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13554,7 +13689,7 @@ func (x *ContainerInterfaceDetail) String() string {
 func (*ContainerInterfaceDetail) ProtoMessage() {}
 
 func (x *ContainerInterfaceDetail) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[186]
+	mi := &file_litevirt_v1_service_proto_msgTypes[188]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13567,7 +13702,7 @@ func (x *ContainerInterfaceDetail) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ContainerInterfaceDetail.ProtoReflect.Descriptor instead.
 func (*ContainerInterfaceDetail) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{186}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{188}
 }
 
 func (x *ContainerInterfaceDetail) GetName() string {
@@ -13645,7 +13780,7 @@ type ContainerBackupRef struct {
 
 func (x *ContainerBackupRef) Reset() {
 	*x = ContainerBackupRef{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[187]
+	mi := &file_litevirt_v1_service_proto_msgTypes[189]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13657,7 +13792,7 @@ func (x *ContainerBackupRef) String() string {
 func (*ContainerBackupRef) ProtoMessage() {}
 
 func (x *ContainerBackupRef) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[187]
+	mi := &file_litevirt_v1_service_proto_msgTypes[189]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13670,7 +13805,7 @@ func (x *ContainerBackupRef) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ContainerBackupRef.ProtoReflect.Descriptor instead.
 func (*ContainerBackupRef) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{187}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{189}
 }
 
 func (x *ContainerBackupRef) GetRepo() string {
@@ -13755,7 +13890,7 @@ type ProbeContainerBackupsRequest struct {
 
 func (x *ProbeContainerBackupsRequest) Reset() {
 	*x = ProbeContainerBackupsRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[188]
+	mi := &file_litevirt_v1_service_proto_msgTypes[190]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13767,7 +13902,7 @@ func (x *ProbeContainerBackupsRequest) String() string {
 func (*ProbeContainerBackupsRequest) ProtoMessage() {}
 
 func (x *ProbeContainerBackupsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[188]
+	mi := &file_litevirt_v1_service_proto_msgTypes[190]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13780,7 +13915,7 @@ func (x *ProbeContainerBackupsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ProbeContainerBackupsRequest.ProtoReflect.Descriptor instead.
 func (*ProbeContainerBackupsRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{188}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{190}
 }
 
 func (x *ProbeContainerBackupsRequest) GetName() string {
@@ -13848,7 +13983,7 @@ type ContainerBackupProbe struct {
 
 func (x *ContainerBackupProbe) Reset() {
 	*x = ContainerBackupProbe{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[189]
+	mi := &file_litevirt_v1_service_proto_msgTypes[191]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13860,7 +13995,7 @@ func (x *ContainerBackupProbe) String() string {
 func (*ContainerBackupProbe) ProtoMessage() {}
 
 func (x *ContainerBackupProbe) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[189]
+	mi := &file_litevirt_v1_service_proto_msgTypes[191]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13873,7 +14008,7 @@ func (x *ContainerBackupProbe) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ContainerBackupProbe.ProtoReflect.Descriptor instead.
 func (*ContainerBackupProbe) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{189}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{191}
 }
 
 func (x *ContainerBackupProbe) GetRepo() string {
@@ -13948,7 +14083,7 @@ type ProbeContainerBackupsResponse struct {
 
 func (x *ProbeContainerBackupsResponse) Reset() {
 	*x = ProbeContainerBackupsResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[190]
+	mi := &file_litevirt_v1_service_proto_msgTypes[192]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13960,7 +14095,7 @@ func (x *ProbeContainerBackupsResponse) String() string {
 func (*ProbeContainerBackupsResponse) ProtoMessage() {}
 
 func (x *ProbeContainerBackupsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[190]
+	mi := &file_litevirt_v1_service_proto_msgTypes[192]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13973,7 +14108,7 @@ func (x *ProbeContainerBackupsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ProbeContainerBackupsResponse.ProtoReflect.Descriptor instead.
 func (*ProbeContainerBackupsResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{190}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{192}
 }
 
 func (x *ProbeContainerBackupsResponse) GetResults() []*ContainerBackupProbe {
@@ -14014,7 +14149,7 @@ type ContainerDetail struct {
 
 func (x *ContainerDetail) Reset() {
 	*x = ContainerDetail{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[191]
+	mi := &file_litevirt_v1_service_proto_msgTypes[193]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -14026,7 +14161,7 @@ func (x *ContainerDetail) String() string {
 func (*ContainerDetail) ProtoMessage() {}
 
 func (x *ContainerDetail) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[191]
+	mi := &file_litevirt_v1_service_proto_msgTypes[193]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -14039,7 +14174,7 @@ func (x *ContainerDetail) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ContainerDetail.ProtoReflect.Descriptor instead.
 func (*ContainerDetail) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{191}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{193}
 }
 
 func (x *ContainerDetail) GetContainer() *Container {
@@ -14153,7 +14288,7 @@ type ContainerStrandedRootfs struct {
 
 func (x *ContainerStrandedRootfs) Reset() {
 	*x = ContainerStrandedRootfs{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[192]
+	mi := &file_litevirt_v1_service_proto_msgTypes[194]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -14165,7 +14300,7 @@ func (x *ContainerStrandedRootfs) String() string {
 func (*ContainerStrandedRootfs) ProtoMessage() {}
 
 func (x *ContainerStrandedRootfs) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[192]
+	mi := &file_litevirt_v1_service_proto_msgTypes[194]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -14178,7 +14313,7 @@ func (x *ContainerStrandedRootfs) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ContainerStrandedRootfs.ProtoReflect.Descriptor instead.
 func (*ContainerStrandedRootfs) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{192}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{194}
 }
 
 func (x *ContainerStrandedRootfs) GetHost() string {
@@ -14227,7 +14362,7 @@ type SnapshotContainerRequest struct {
 
 func (x *SnapshotContainerRequest) Reset() {
 	*x = SnapshotContainerRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[193]
+	mi := &file_litevirt_v1_service_proto_msgTypes[195]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -14239,7 +14374,7 @@ func (x *SnapshotContainerRequest) String() string {
 func (*SnapshotContainerRequest) ProtoMessage() {}
 
 func (x *SnapshotContainerRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[193]
+	mi := &file_litevirt_v1_service_proto_msgTypes[195]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -14252,7 +14387,7 @@ func (x *SnapshotContainerRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SnapshotContainerRequest.ProtoReflect.Descriptor instead.
 func (*SnapshotContainerRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{193}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{195}
 }
 
 func (x *SnapshotContainerRequest) GetName() string {
@@ -14286,7 +14421,7 @@ type ListContainerSnapshotsRequest struct {
 
 func (x *ListContainerSnapshotsRequest) Reset() {
 	*x = ListContainerSnapshotsRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[194]
+	mi := &file_litevirt_v1_service_proto_msgTypes[196]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -14298,7 +14433,7 @@ func (x *ListContainerSnapshotsRequest) String() string {
 func (*ListContainerSnapshotsRequest) ProtoMessage() {}
 
 func (x *ListContainerSnapshotsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[194]
+	mi := &file_litevirt_v1_service_proto_msgTypes[196]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -14311,7 +14446,7 @@ func (x *ListContainerSnapshotsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListContainerSnapshotsRequest.ProtoReflect.Descriptor instead.
 func (*ListContainerSnapshotsRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{194}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{196}
 }
 
 func (x *ListContainerSnapshotsRequest) GetName() string {
@@ -14337,7 +14472,7 @@ type ListContainerSnapshotsResponse struct {
 
 func (x *ListContainerSnapshotsResponse) Reset() {
 	*x = ListContainerSnapshotsResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[195]
+	mi := &file_litevirt_v1_service_proto_msgTypes[197]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -14349,7 +14484,7 @@ func (x *ListContainerSnapshotsResponse) String() string {
 func (*ListContainerSnapshotsResponse) ProtoMessage() {}
 
 func (x *ListContainerSnapshotsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[195]
+	mi := &file_litevirt_v1_service_proto_msgTypes[197]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -14362,7 +14497,7 @@ func (x *ListContainerSnapshotsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListContainerSnapshotsResponse.ProtoReflect.Descriptor instead.
 func (*ListContainerSnapshotsResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{195}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{197}
 }
 
 func (x *ListContainerSnapshotsResponse) GetSnapshots() []*ContainerSnapshot {
@@ -14383,7 +14518,7 @@ type RevertContainerSnapshotRequest struct {
 
 func (x *RevertContainerSnapshotRequest) Reset() {
 	*x = RevertContainerSnapshotRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[196]
+	mi := &file_litevirt_v1_service_proto_msgTypes[198]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -14395,7 +14530,7 @@ func (x *RevertContainerSnapshotRequest) String() string {
 func (*RevertContainerSnapshotRequest) ProtoMessage() {}
 
 func (x *RevertContainerSnapshotRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[196]
+	mi := &file_litevirt_v1_service_proto_msgTypes[198]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -14408,7 +14543,7 @@ func (x *RevertContainerSnapshotRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RevertContainerSnapshotRequest.ProtoReflect.Descriptor instead.
 func (*RevertContainerSnapshotRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{196}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{198}
 }
 
 func (x *RevertContainerSnapshotRequest) GetName() string {
@@ -14443,7 +14578,7 @@ type DeleteContainerSnapshotRequest struct {
 
 func (x *DeleteContainerSnapshotRequest) Reset() {
 	*x = DeleteContainerSnapshotRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[197]
+	mi := &file_litevirt_v1_service_proto_msgTypes[199]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -14455,7 +14590,7 @@ func (x *DeleteContainerSnapshotRequest) String() string {
 func (*DeleteContainerSnapshotRequest) ProtoMessage() {}
 
 func (x *DeleteContainerSnapshotRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[197]
+	mi := &file_litevirt_v1_service_proto_msgTypes[199]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -14468,7 +14603,7 @@ func (x *DeleteContainerSnapshotRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteContainerSnapshotRequest.ProtoReflect.Descriptor instead.
 func (*DeleteContainerSnapshotRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{197}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{199}
 }
 
 func (x *DeleteContainerSnapshotRequest) GetName() string {
@@ -14504,7 +14639,7 @@ type ConvertContainerToTemplateRequest struct {
 
 func (x *ConvertContainerToTemplateRequest) Reset() {
 	*x = ConvertContainerToTemplateRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[198]
+	mi := &file_litevirt_v1_service_proto_msgTypes[200]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -14516,7 +14651,7 @@ func (x *ConvertContainerToTemplateRequest) String() string {
 func (*ConvertContainerToTemplateRequest) ProtoMessage() {}
 
 func (x *ConvertContainerToTemplateRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[198]
+	mi := &file_litevirt_v1_service_proto_msgTypes[200]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -14529,7 +14664,7 @@ func (x *ConvertContainerToTemplateRequest) ProtoReflect() protoreflect.Message 
 
 // Deprecated: Use ConvertContainerToTemplateRequest.ProtoReflect.Descriptor instead.
 func (*ConvertContainerToTemplateRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{198}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{200}
 }
 
 func (x *ConvertContainerToTemplateRequest) GetName() string {
@@ -14566,7 +14701,7 @@ type CloneContainerRequest struct {
 
 func (x *CloneContainerRequest) Reset() {
 	*x = CloneContainerRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[199]
+	mi := &file_litevirt_v1_service_proto_msgTypes[201]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -14578,7 +14713,7 @@ func (x *CloneContainerRequest) String() string {
 func (*CloneContainerRequest) ProtoMessage() {}
 
 func (x *CloneContainerRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[199]
+	mi := &file_litevirt_v1_service_proto_msgTypes[201]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -14591,7 +14726,7 @@ func (x *CloneContainerRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CloneContainerRequest.ProtoReflect.Descriptor instead.
 func (*CloneContainerRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{199}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{201}
 }
 
 func (x *CloneContainerRequest) GetSource() string {
@@ -14645,7 +14780,7 @@ type FirewallStatus struct {
 
 func (x *FirewallStatus) Reset() {
 	*x = FirewallStatus{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[200]
+	mi := &file_litevirt_v1_service_proto_msgTypes[202]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -14657,7 +14792,7 @@ func (x *FirewallStatus) String() string {
 func (*FirewallStatus) ProtoMessage() {}
 
 func (x *FirewallStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[200]
+	mi := &file_litevirt_v1_service_proto_msgTypes[202]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -14670,7 +14805,7 @@ func (x *FirewallStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FirewallStatus.ProtoReflect.Descriptor instead.
 func (*FirewallStatus) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{200}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{202}
 }
 
 func (x *FirewallStatus) GetHostName() string {
@@ -14726,7 +14861,7 @@ type BindSecurityGroupsRequest struct {
 
 func (x *BindSecurityGroupsRequest) Reset() {
 	*x = BindSecurityGroupsRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[201]
+	mi := &file_litevirt_v1_service_proto_msgTypes[203]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -14738,7 +14873,7 @@ func (x *BindSecurityGroupsRequest) String() string {
 func (*BindSecurityGroupsRequest) ProtoMessage() {}
 
 func (x *BindSecurityGroupsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[201]
+	mi := &file_litevirt_v1_service_proto_msgTypes[203]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -14751,7 +14886,7 @@ func (x *BindSecurityGroupsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BindSecurityGroupsRequest.ProtoReflect.Descriptor instead.
 func (*BindSecurityGroupsRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{201}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{203}
 }
 
 func (x *BindSecurityGroupsRequest) GetVmName() string {
@@ -14791,7 +14926,7 @@ type Session struct {
 
 func (x *Session) Reset() {
 	*x = Session{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[202]
+	mi := &file_litevirt_v1_service_proto_msgTypes[204]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -14803,7 +14938,7 @@ func (x *Session) String() string {
 func (*Session) ProtoMessage() {}
 
 func (x *Session) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[202]
+	mi := &file_litevirt_v1_service_proto_msgTypes[204]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -14816,7 +14951,7 @@ func (x *Session) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Session.ProtoReflect.Descriptor instead.
 func (*Session) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{202}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{204}
 }
 
 func (x *Session) GetId() string {
@@ -14884,7 +15019,7 @@ type ListSessionsRequest struct {
 
 func (x *ListSessionsRequest) Reset() {
 	*x = ListSessionsRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[203]
+	mi := &file_litevirt_v1_service_proto_msgTypes[205]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -14896,7 +15031,7 @@ func (x *ListSessionsRequest) String() string {
 func (*ListSessionsRequest) ProtoMessage() {}
 
 func (x *ListSessionsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[203]
+	mi := &file_litevirt_v1_service_proto_msgTypes[205]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -14909,7 +15044,7 @@ func (x *ListSessionsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListSessionsRequest.ProtoReflect.Descriptor instead.
 func (*ListSessionsRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{203}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{205}
 }
 
 func (x *ListSessionsRequest) GetUsername() string {
@@ -14928,7 +15063,7 @@ type ListSessionsResponse struct {
 
 func (x *ListSessionsResponse) Reset() {
 	*x = ListSessionsResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[204]
+	mi := &file_litevirt_v1_service_proto_msgTypes[206]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -14940,7 +15075,7 @@ func (x *ListSessionsResponse) String() string {
 func (*ListSessionsResponse) ProtoMessage() {}
 
 func (x *ListSessionsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[204]
+	mi := &file_litevirt_v1_service_proto_msgTypes[206]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -14953,7 +15088,7 @@ func (x *ListSessionsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListSessionsResponse.ProtoReflect.Descriptor instead.
 func (*ListSessionsResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{204}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{206}
 }
 
 func (x *ListSessionsResponse) GetSessions() []*Session {
@@ -14972,7 +15107,7 @@ type RevokeSessionRequest struct {
 
 func (x *RevokeSessionRequest) Reset() {
 	*x = RevokeSessionRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[205]
+	mi := &file_litevirt_v1_service_proto_msgTypes[207]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -14984,7 +15119,7 @@ func (x *RevokeSessionRequest) String() string {
 func (*RevokeSessionRequest) ProtoMessage() {}
 
 func (x *RevokeSessionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[205]
+	mi := &file_litevirt_v1_service_proto_msgTypes[207]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -14997,7 +15132,7 @@ func (x *RevokeSessionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RevokeSessionRequest.ProtoReflect.Descriptor instead.
 func (*RevokeSessionRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{205}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{207}
 }
 
 func (x *RevokeSessionRequest) GetId() string {
@@ -15020,7 +15155,7 @@ type TwoFactor struct {
 
 func (x *TwoFactor) Reset() {
 	*x = TwoFactor{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[206]
+	mi := &file_litevirt_v1_service_proto_msgTypes[208]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -15032,7 +15167,7 @@ func (x *TwoFactor) String() string {
 func (*TwoFactor) ProtoMessage() {}
 
 func (x *TwoFactor) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[206]
+	mi := &file_litevirt_v1_service_proto_msgTypes[208]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -15045,7 +15180,7 @@ func (x *TwoFactor) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TwoFactor.ProtoReflect.Descriptor instead.
 func (*TwoFactor) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{206}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{208}
 }
 
 func (x *TwoFactor) GetMethod() string {
@@ -15085,7 +15220,7 @@ type ListTwoFactorsRequest struct {
 
 func (x *ListTwoFactorsRequest) Reset() {
 	*x = ListTwoFactorsRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[207]
+	mi := &file_litevirt_v1_service_proto_msgTypes[209]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -15097,7 +15232,7 @@ func (x *ListTwoFactorsRequest) String() string {
 func (*ListTwoFactorsRequest) ProtoMessage() {}
 
 func (x *ListTwoFactorsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[207]
+	mi := &file_litevirt_v1_service_proto_msgTypes[209]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -15110,7 +15245,7 @@ func (x *ListTwoFactorsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListTwoFactorsRequest.ProtoReflect.Descriptor instead.
 func (*ListTwoFactorsRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{207}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{209}
 }
 
 func (x *ListTwoFactorsRequest) GetUsername() string {
@@ -15129,7 +15264,7 @@ type ListTwoFactorsResponse struct {
 
 func (x *ListTwoFactorsResponse) Reset() {
 	*x = ListTwoFactorsResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[208]
+	mi := &file_litevirt_v1_service_proto_msgTypes[210]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -15141,7 +15276,7 @@ func (x *ListTwoFactorsResponse) String() string {
 func (*ListTwoFactorsResponse) ProtoMessage() {}
 
 func (x *ListTwoFactorsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[208]
+	mi := &file_litevirt_v1_service_proto_msgTypes[210]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -15154,7 +15289,7 @@ func (x *ListTwoFactorsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListTwoFactorsResponse.ProtoReflect.Descriptor instead.
 func (*ListTwoFactorsResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{208}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{210}
 }
 
 func (x *ListTwoFactorsResponse) GetFactors() []*TwoFactor {
@@ -15174,7 +15309,7 @@ type EnrollTOTPRequest struct {
 
 func (x *EnrollTOTPRequest) Reset() {
 	*x = EnrollTOTPRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[209]
+	mi := &file_litevirt_v1_service_proto_msgTypes[211]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -15186,7 +15321,7 @@ func (x *EnrollTOTPRequest) String() string {
 func (*EnrollTOTPRequest) ProtoMessage() {}
 
 func (x *EnrollTOTPRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[209]
+	mi := &file_litevirt_v1_service_proto_msgTypes[211]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -15199,7 +15334,7 @@ func (x *EnrollTOTPRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EnrollTOTPRequest.ProtoReflect.Descriptor instead.
 func (*EnrollTOTPRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{209}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{211}
 }
 
 func (x *EnrollTOTPRequest) GetUsername() string {
@@ -15227,7 +15362,7 @@ type EnrollTOTPResponse struct {
 
 func (x *EnrollTOTPResponse) Reset() {
 	*x = EnrollTOTPResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[210]
+	mi := &file_litevirt_v1_service_proto_msgTypes[212]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -15239,7 +15374,7 @@ func (x *EnrollTOTPResponse) String() string {
 func (*EnrollTOTPResponse) ProtoMessage() {}
 
 func (x *EnrollTOTPResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[210]
+	mi := &file_litevirt_v1_service_proto_msgTypes[212]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -15252,7 +15387,7 @@ func (x *EnrollTOTPResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EnrollTOTPResponse.ProtoReflect.Descriptor instead.
 func (*EnrollTOTPResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{210}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{212}
 }
 
 func (x *EnrollTOTPResponse) GetOtpauthUrl() string {
@@ -15287,7 +15422,7 @@ type DisableTwoFactorRequest struct {
 
 func (x *DisableTwoFactorRequest) Reset() {
 	*x = DisableTwoFactorRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[211]
+	mi := &file_litevirt_v1_service_proto_msgTypes[213]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -15299,7 +15434,7 @@ func (x *DisableTwoFactorRequest) String() string {
 func (*DisableTwoFactorRequest) ProtoMessage() {}
 
 func (x *DisableTwoFactorRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[211]
+	mi := &file_litevirt_v1_service_proto_msgTypes[213]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -15312,7 +15447,7 @@ func (x *DisableTwoFactorRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DisableTwoFactorRequest.ProtoReflect.Descriptor instead.
 func (*DisableTwoFactorRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{211}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{213}
 }
 
 func (x *DisableTwoFactorRequest) GetUsername() string {
@@ -15356,7 +15491,7 @@ type RoleBinding struct {
 
 func (x *RoleBinding) Reset() {
 	*x = RoleBinding{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[212]
+	mi := &file_litevirt_v1_service_proto_msgTypes[214]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -15368,7 +15503,7 @@ func (x *RoleBinding) String() string {
 func (*RoleBinding) ProtoMessage() {}
 
 func (x *RoleBinding) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[212]
+	mi := &file_litevirt_v1_service_proto_msgTypes[214]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -15381,7 +15516,7 @@ func (x *RoleBinding) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RoleBinding.ProtoReflect.Descriptor instead.
 func (*RoleBinding) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{212}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{214}
 }
 
 func (x *RoleBinding) GetId() string {
@@ -15438,7 +15573,7 @@ type GrantRoleRequest struct {
 
 func (x *GrantRoleRequest) Reset() {
 	*x = GrantRoleRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[213]
+	mi := &file_litevirt_v1_service_proto_msgTypes[215]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -15450,7 +15585,7 @@ func (x *GrantRoleRequest) String() string {
 func (*GrantRoleRequest) ProtoMessage() {}
 
 func (x *GrantRoleRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[213]
+	mi := &file_litevirt_v1_service_proto_msgTypes[215]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -15463,7 +15598,7 @@ func (x *GrantRoleRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GrantRoleRequest.ProtoReflect.Descriptor instead.
 func (*GrantRoleRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{213}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{215}
 }
 
 func (x *GrantRoleRequest) GetPath() string {
@@ -15503,7 +15638,7 @@ type GrantRoleResponse struct {
 
 func (x *GrantRoleResponse) Reset() {
 	*x = GrantRoleResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[214]
+	mi := &file_litevirt_v1_service_proto_msgTypes[216]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -15515,7 +15650,7 @@ func (x *GrantRoleResponse) String() string {
 func (*GrantRoleResponse) ProtoMessage() {}
 
 func (x *GrantRoleResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[214]
+	mi := &file_litevirt_v1_service_proto_msgTypes[216]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -15528,7 +15663,7 @@ func (x *GrantRoleResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GrantRoleResponse.ProtoReflect.Descriptor instead.
 func (*GrantRoleResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{214}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{216}
 }
 
 func (x *GrantRoleResponse) GetBinding() *RoleBinding {
@@ -15547,7 +15682,7 @@ type RevokeRoleRequest struct {
 
 func (x *RevokeRoleRequest) Reset() {
 	*x = RevokeRoleRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[215]
+	mi := &file_litevirt_v1_service_proto_msgTypes[217]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -15559,7 +15694,7 @@ func (x *RevokeRoleRequest) String() string {
 func (*RevokeRoleRequest) ProtoMessage() {}
 
 func (x *RevokeRoleRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[215]
+	mi := &file_litevirt_v1_service_proto_msgTypes[217]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -15572,7 +15707,7 @@ func (x *RevokeRoleRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RevokeRoleRequest.ProtoReflect.Descriptor instead.
 func (*RevokeRoleRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{215}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{217}
 }
 
 func (x *RevokeRoleRequest) GetId() string {
@@ -15590,7 +15725,7 @@ type RevokeRoleResponse struct {
 
 func (x *RevokeRoleResponse) Reset() {
 	*x = RevokeRoleResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[216]
+	mi := &file_litevirt_v1_service_proto_msgTypes[218]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -15602,7 +15737,7 @@ func (x *RevokeRoleResponse) String() string {
 func (*RevokeRoleResponse) ProtoMessage() {}
 
 func (x *RevokeRoleResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[216]
+	mi := &file_litevirt_v1_service_proto_msgTypes[218]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -15615,7 +15750,7 @@ func (x *RevokeRoleResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RevokeRoleResponse.ProtoReflect.Descriptor instead.
 func (*RevokeRoleResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{216}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{218}
 }
 
 type ListRoleBindingsRequest struct {
@@ -15627,7 +15762,7 @@ type ListRoleBindingsRequest struct {
 
 func (x *ListRoleBindingsRequest) Reset() {
 	*x = ListRoleBindingsRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[217]
+	mi := &file_litevirt_v1_service_proto_msgTypes[219]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -15639,7 +15774,7 @@ func (x *ListRoleBindingsRequest) String() string {
 func (*ListRoleBindingsRequest) ProtoMessage() {}
 
 func (x *ListRoleBindingsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[217]
+	mi := &file_litevirt_v1_service_proto_msgTypes[219]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -15652,7 +15787,7 @@ func (x *ListRoleBindingsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListRoleBindingsRequest.ProtoReflect.Descriptor instead.
 func (*ListRoleBindingsRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{217}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{219}
 }
 
 func (x *ListRoleBindingsRequest) GetPrincipal() string {
@@ -15671,7 +15806,7 @@ type ListRoleBindingsResponse struct {
 
 func (x *ListRoleBindingsResponse) Reset() {
 	*x = ListRoleBindingsResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[218]
+	mi := &file_litevirt_v1_service_proto_msgTypes[220]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -15683,7 +15818,7 @@ func (x *ListRoleBindingsResponse) String() string {
 func (*ListRoleBindingsResponse) ProtoMessage() {}
 
 func (x *ListRoleBindingsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[218]
+	mi := &file_litevirt_v1_service_proto_msgTypes[220]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -15696,7 +15831,7 @@ func (x *ListRoleBindingsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListRoleBindingsResponse.ProtoReflect.Descriptor instead.
 func (*ListRoleBindingsResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{218}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{220}
 }
 
 func (x *ListRoleBindingsResponse) GetBindings() []*RoleBinding {
@@ -15719,7 +15854,7 @@ type NormalizeRoleBindingsRequest struct {
 
 func (x *NormalizeRoleBindingsRequest) Reset() {
 	*x = NormalizeRoleBindingsRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[219]
+	mi := &file_litevirt_v1_service_proto_msgTypes[221]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -15731,7 +15866,7 @@ func (x *NormalizeRoleBindingsRequest) String() string {
 func (*NormalizeRoleBindingsRequest) ProtoMessage() {}
 
 func (x *NormalizeRoleBindingsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[219]
+	mi := &file_litevirt_v1_service_proto_msgTypes[221]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -15744,7 +15879,7 @@ func (x *NormalizeRoleBindingsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NormalizeRoleBindingsRequest.ProtoReflect.Descriptor instead.
 func (*NormalizeRoleBindingsRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{219}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{221}
 }
 
 func (x *NormalizeRoleBindingsRequest) GetDryRun() bool {
@@ -15764,7 +15899,7 @@ type NormalizeRoleBindingsResponse struct {
 
 func (x *NormalizeRoleBindingsResponse) Reset() {
 	*x = NormalizeRoleBindingsResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[220]
+	mi := &file_litevirt_v1_service_proto_msgTypes[222]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -15776,7 +15911,7 @@ func (x *NormalizeRoleBindingsResponse) String() string {
 func (*NormalizeRoleBindingsResponse) ProtoMessage() {}
 
 func (x *NormalizeRoleBindingsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[220]
+	mi := &file_litevirt_v1_service_proto_msgTypes[222]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -15789,7 +15924,7 @@ func (x *NormalizeRoleBindingsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NormalizeRoleBindingsResponse.ProtoReflect.Descriptor instead.
 func (*NormalizeRoleBindingsResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{220}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{222}
 }
 
 func (x *NormalizeRoleBindingsResponse) GetNormalized() int32 {
@@ -15819,7 +15954,7 @@ type GetVMOperationRequest struct {
 
 func (x *GetVMOperationRequest) Reset() {
 	*x = GetVMOperationRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[221]
+	mi := &file_litevirt_v1_service_proto_msgTypes[223]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -15831,7 +15966,7 @@ func (x *GetVMOperationRequest) String() string {
 func (*GetVMOperationRequest) ProtoMessage() {}
 
 func (x *GetVMOperationRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[221]
+	mi := &file_litevirt_v1_service_proto_msgTypes[223]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -15844,7 +15979,7 @@ func (x *GetVMOperationRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetVMOperationRequest.ProtoReflect.Descriptor instead.
 func (*GetVMOperationRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{221}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{223}
 }
 
 func (x *GetVMOperationRequest) GetVmName() string {
@@ -15865,7 +16000,7 @@ type OperationStepInfo struct {
 
 func (x *OperationStepInfo) Reset() {
 	*x = OperationStepInfo{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[222]
+	mi := &file_litevirt_v1_service_proto_msgTypes[224]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -15877,7 +16012,7 @@ func (x *OperationStepInfo) String() string {
 func (*OperationStepInfo) ProtoMessage() {}
 
 func (x *OperationStepInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[222]
+	mi := &file_litevirt_v1_service_proto_msgTypes[224]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -15890,7 +16025,7 @@ func (x *OperationStepInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use OperationStepInfo.ProtoReflect.Descriptor instead.
 func (*OperationStepInfo) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{222}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{224}
 }
 
 func (x *OperationStepInfo) GetStepName() string {
@@ -15931,7 +16066,7 @@ type GetVMOperationResponse struct {
 
 func (x *GetVMOperationResponse) Reset() {
 	*x = GetVMOperationResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[223]
+	mi := &file_litevirt_v1_service_proto_msgTypes[225]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -15943,7 +16078,7 @@ func (x *GetVMOperationResponse) String() string {
 func (*GetVMOperationResponse) ProtoMessage() {}
 
 func (x *GetVMOperationResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[223]
+	mi := &file_litevirt_v1_service_proto_msgTypes[225]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -15956,7 +16091,7 @@ func (x *GetVMOperationResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetVMOperationResponse.ProtoReflect.Descriptor instead.
 func (*GetVMOperationResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{223}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{225}
 }
 
 func (x *GetVMOperationResponse) GetHasActive() bool {
@@ -16032,7 +16167,7 @@ type AbortVMOperationRequest struct {
 
 func (x *AbortVMOperationRequest) Reset() {
 	*x = AbortVMOperationRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[224]
+	mi := &file_litevirt_v1_service_proto_msgTypes[226]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -16044,7 +16179,7 @@ func (x *AbortVMOperationRequest) String() string {
 func (*AbortVMOperationRequest) ProtoMessage() {}
 
 func (x *AbortVMOperationRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[224]
+	mi := &file_litevirt_v1_service_proto_msgTypes[226]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -16057,7 +16192,7 @@ func (x *AbortVMOperationRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AbortVMOperationRequest.ProtoReflect.Descriptor instead.
 func (*AbortVMOperationRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{224}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{226}
 }
 
 func (x *AbortVMOperationRequest) GetVmName() string {
@@ -16085,7 +16220,7 @@ type AbortVMOperationResponse struct {
 
 func (x *AbortVMOperationResponse) Reset() {
 	*x = AbortVMOperationResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[225]
+	mi := &file_litevirt_v1_service_proto_msgTypes[227]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -16097,7 +16232,7 @@ func (x *AbortVMOperationResponse) String() string {
 func (*AbortVMOperationResponse) ProtoMessage() {}
 
 func (x *AbortVMOperationResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[225]
+	mi := &file_litevirt_v1_service_proto_msgTypes[227]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -16110,7 +16245,7 @@ func (x *AbortVMOperationResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AbortVMOperationResponse.ProtoReflect.Descriptor instead.
 func (*AbortVMOperationResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{225}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{227}
 }
 
 func (x *AbortVMOperationResponse) GetAborted() bool {
@@ -16192,7 +16327,7 @@ type RestoreLiveRequest struct {
 
 func (x *RestoreLiveRequest) Reset() {
 	*x = RestoreLiveRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[226]
+	mi := &file_litevirt_v1_service_proto_msgTypes[228]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -16204,7 +16339,7 @@ func (x *RestoreLiveRequest) String() string {
 func (*RestoreLiveRequest) ProtoMessage() {}
 
 func (x *RestoreLiveRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[226]
+	mi := &file_litevirt_v1_service_proto_msgTypes[228]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -16217,7 +16352,7 @@ func (x *RestoreLiveRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RestoreLiveRequest.ProtoReflect.Descriptor instead.
 func (*RestoreLiveRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{226}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{228}
 }
 
 func (x *RestoreLiveRequest) GetRepoPath() string {
@@ -16310,7 +16445,7 @@ type RestoreLiveProgress struct {
 
 func (x *RestoreLiveProgress) Reset() {
 	*x = RestoreLiveProgress{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[227]
+	mi := &file_litevirt_v1_service_proto_msgTypes[229]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -16322,7 +16457,7 @@ func (x *RestoreLiveProgress) String() string {
 func (*RestoreLiveProgress) ProtoMessage() {}
 
 func (x *RestoreLiveProgress) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[227]
+	mi := &file_litevirt_v1_service_proto_msgTypes[229]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -16335,7 +16470,7 @@ func (x *RestoreLiveProgress) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RestoreLiveProgress.ProtoReflect.Descriptor instead.
 func (*RestoreLiveProgress) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{227}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{229}
 }
 
 func (x *RestoreLiveProgress) GetPhase() RestoreLiveProgress_Phase {
@@ -16387,7 +16522,7 @@ type BeginWebAuthnRegistrationRequest struct {
 
 func (x *BeginWebAuthnRegistrationRequest) Reset() {
 	*x = BeginWebAuthnRegistrationRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[228]
+	mi := &file_litevirt_v1_service_proto_msgTypes[230]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -16399,7 +16534,7 @@ func (x *BeginWebAuthnRegistrationRequest) String() string {
 func (*BeginWebAuthnRegistrationRequest) ProtoMessage() {}
 
 func (x *BeginWebAuthnRegistrationRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[228]
+	mi := &file_litevirt_v1_service_proto_msgTypes[230]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -16412,7 +16547,7 @@ func (x *BeginWebAuthnRegistrationRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BeginWebAuthnRegistrationRequest.ProtoReflect.Descriptor instead.
 func (*BeginWebAuthnRegistrationRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{228}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{230}
 }
 
 func (x *BeginWebAuthnRegistrationRequest) GetUsername() string {
@@ -16431,7 +16566,7 @@ type BeginWebAuthnRegistrationResponse struct {
 
 func (x *BeginWebAuthnRegistrationResponse) Reset() {
 	*x = BeginWebAuthnRegistrationResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[229]
+	mi := &file_litevirt_v1_service_proto_msgTypes[231]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -16443,7 +16578,7 @@ func (x *BeginWebAuthnRegistrationResponse) String() string {
 func (*BeginWebAuthnRegistrationResponse) ProtoMessage() {}
 
 func (x *BeginWebAuthnRegistrationResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[229]
+	mi := &file_litevirt_v1_service_proto_msgTypes[231]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -16456,7 +16591,7 @@ func (x *BeginWebAuthnRegistrationResponse) ProtoReflect() protoreflect.Message 
 
 // Deprecated: Use BeginWebAuthnRegistrationResponse.ProtoReflect.Descriptor instead.
 func (*BeginWebAuthnRegistrationResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{229}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{231}
 }
 
 func (x *BeginWebAuthnRegistrationResponse) GetOptionsJson() []byte {
@@ -16476,7 +16611,7 @@ type FinishWebAuthnRegistrationRequest struct {
 
 func (x *FinishWebAuthnRegistrationRequest) Reset() {
 	*x = FinishWebAuthnRegistrationRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[230]
+	mi := &file_litevirt_v1_service_proto_msgTypes[232]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -16488,7 +16623,7 @@ func (x *FinishWebAuthnRegistrationRequest) String() string {
 func (*FinishWebAuthnRegistrationRequest) ProtoMessage() {}
 
 func (x *FinishWebAuthnRegistrationRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[230]
+	mi := &file_litevirt_v1_service_proto_msgTypes[232]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -16501,7 +16636,7 @@ func (x *FinishWebAuthnRegistrationRequest) ProtoReflect() protoreflect.Message 
 
 // Deprecated: Use FinishWebAuthnRegistrationRequest.ProtoReflect.Descriptor instead.
 func (*FinishWebAuthnRegistrationRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{230}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{232}
 }
 
 func (x *FinishWebAuthnRegistrationRequest) GetUsername() string {
@@ -16527,7 +16662,7 @@ type FinishWebAuthnRegistrationResponse struct {
 
 func (x *FinishWebAuthnRegistrationResponse) Reset() {
 	*x = FinishWebAuthnRegistrationResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[231]
+	mi := &file_litevirt_v1_service_proto_msgTypes[233]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -16539,7 +16674,7 @@ func (x *FinishWebAuthnRegistrationResponse) String() string {
 func (*FinishWebAuthnRegistrationResponse) ProtoMessage() {}
 
 func (x *FinishWebAuthnRegistrationResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[231]
+	mi := &file_litevirt_v1_service_proto_msgTypes[233]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -16552,7 +16687,7 @@ func (x *FinishWebAuthnRegistrationResponse) ProtoReflect() protoreflect.Message
 
 // Deprecated: Use FinishWebAuthnRegistrationResponse.ProtoReflect.Descriptor instead.
 func (*FinishWebAuthnRegistrationResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{231}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{233}
 }
 
 func (x *FinishWebAuthnRegistrationResponse) GetCredentialLabel() string {
@@ -16571,7 +16706,7 @@ type BeginWebAuthnLoginRequest struct {
 
 func (x *BeginWebAuthnLoginRequest) Reset() {
 	*x = BeginWebAuthnLoginRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[232]
+	mi := &file_litevirt_v1_service_proto_msgTypes[234]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -16583,7 +16718,7 @@ func (x *BeginWebAuthnLoginRequest) String() string {
 func (*BeginWebAuthnLoginRequest) ProtoMessage() {}
 
 func (x *BeginWebAuthnLoginRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[232]
+	mi := &file_litevirt_v1_service_proto_msgTypes[234]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -16596,7 +16731,7 @@ func (x *BeginWebAuthnLoginRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BeginWebAuthnLoginRequest.ProtoReflect.Descriptor instead.
 func (*BeginWebAuthnLoginRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{232}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{234}
 }
 
 func (x *BeginWebAuthnLoginRequest) GetUsername() string {
@@ -16615,7 +16750,7 @@ type BeginWebAuthnLoginResponse struct {
 
 func (x *BeginWebAuthnLoginResponse) Reset() {
 	*x = BeginWebAuthnLoginResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[233]
+	mi := &file_litevirt_v1_service_proto_msgTypes[235]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -16627,7 +16762,7 @@ func (x *BeginWebAuthnLoginResponse) String() string {
 func (*BeginWebAuthnLoginResponse) ProtoMessage() {}
 
 func (x *BeginWebAuthnLoginResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[233]
+	mi := &file_litevirt_v1_service_proto_msgTypes[235]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -16640,7 +16775,7 @@ func (x *BeginWebAuthnLoginResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BeginWebAuthnLoginResponse.ProtoReflect.Descriptor instead.
 func (*BeginWebAuthnLoginResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{233}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{235}
 }
 
 func (x *BeginWebAuthnLoginResponse) GetOptionsJson() []byte {
@@ -16660,7 +16795,7 @@ type FinishWebAuthnLoginRequest struct {
 
 func (x *FinishWebAuthnLoginRequest) Reset() {
 	*x = FinishWebAuthnLoginRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[234]
+	mi := &file_litevirt_v1_service_proto_msgTypes[236]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -16672,7 +16807,7 @@ func (x *FinishWebAuthnLoginRequest) String() string {
 func (*FinishWebAuthnLoginRequest) ProtoMessage() {}
 
 func (x *FinishWebAuthnLoginRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[234]
+	mi := &file_litevirt_v1_service_proto_msgTypes[236]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -16685,7 +16820,7 @@ func (x *FinishWebAuthnLoginRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FinishWebAuthnLoginRequest.ProtoReflect.Descriptor instead.
 func (*FinishWebAuthnLoginRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{234}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{236}
 }
 
 func (x *FinishWebAuthnLoginRequest) GetUsername() string {
@@ -16714,7 +16849,7 @@ type FinishWebAuthnLoginResponse struct {
 
 func (x *FinishWebAuthnLoginResponse) Reset() {
 	*x = FinishWebAuthnLoginResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[235]
+	mi := &file_litevirt_v1_service_proto_msgTypes[237]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -16726,7 +16861,7 @@ func (x *FinishWebAuthnLoginResponse) String() string {
 func (*FinishWebAuthnLoginResponse) ProtoMessage() {}
 
 func (x *FinishWebAuthnLoginResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[235]
+	mi := &file_litevirt_v1_service_proto_msgTypes[237]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -16739,7 +16874,7 @@ func (x *FinishWebAuthnLoginResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FinishWebAuthnLoginResponse.ProtoReflect.Descriptor instead.
 func (*FinishWebAuthnLoginResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{235}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{237}
 }
 
 func (x *FinishWebAuthnLoginResponse) GetToken() string {
@@ -16780,7 +16915,7 @@ type GetVMStatsRequest struct {
 
 func (x *GetVMStatsRequest) Reset() {
 	*x = GetVMStatsRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[236]
+	mi := &file_litevirt_v1_service_proto_msgTypes[238]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -16792,7 +16927,7 @@ func (x *GetVMStatsRequest) String() string {
 func (*GetVMStatsRequest) ProtoMessage() {}
 
 func (x *GetVMStatsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[236]
+	mi := &file_litevirt_v1_service_proto_msgTypes[238]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -16805,7 +16940,7 @@ func (x *GetVMStatsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetVMStatsRequest.ProtoReflect.Descriptor instead.
 func (*GetVMStatsRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{236}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{238}
 }
 
 func (x *GetVMStatsRequest) GetName() string {
@@ -16824,7 +16959,7 @@ type GetHostStatsRequest struct {
 
 func (x *GetHostStatsRequest) Reset() {
 	*x = GetHostStatsRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[237]
+	mi := &file_litevirt_v1_service_proto_msgTypes[239]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -16836,7 +16971,7 @@ func (x *GetHostStatsRequest) String() string {
 func (*GetHostStatsRequest) ProtoMessage() {}
 
 func (x *GetHostStatsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[237]
+	mi := &file_litevirt_v1_service_proto_msgTypes[239]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -16849,7 +16984,7 @@ func (x *GetHostStatsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetHostStatsRequest.ProtoReflect.Descriptor instead.
 func (*GetHostStatsRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{237}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{239}
 }
 
 func (x *GetHostStatsRequest) GetName() string {
@@ -16876,7 +17011,7 @@ type ClusterStatus struct {
 
 func (x *ClusterStatus) Reset() {
 	*x = ClusterStatus{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[238]
+	mi := &file_litevirt_v1_service_proto_msgTypes[240]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -16888,7 +17023,7 @@ func (x *ClusterStatus) String() string {
 func (*ClusterStatus) ProtoMessage() {}
 
 func (x *ClusterStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[238]
+	mi := &file_litevirt_v1_service_proto_msgTypes[240]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -16901,7 +17036,7 @@ func (x *ClusterStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ClusterStatus.ProtoReflect.Descriptor instead.
 func (*ClusterStatus) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{238}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{240}
 }
 
 func (x *ClusterStatus) GetClusterName() string {
@@ -16969,7 +17104,7 @@ type StreamEventsRequest struct {
 
 func (x *StreamEventsRequest) Reset() {
 	*x = StreamEventsRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[239]
+	mi := &file_litevirt_v1_service_proto_msgTypes[241]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -16981,7 +17116,7 @@ func (x *StreamEventsRequest) String() string {
 func (*StreamEventsRequest) ProtoMessage() {}
 
 func (x *StreamEventsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[239]
+	mi := &file_litevirt_v1_service_proto_msgTypes[241]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -16994,7 +17129,7 @@ func (x *StreamEventsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StreamEventsRequest.ProtoReflect.Descriptor instead.
 func (*StreamEventsRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{239}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{241}
 }
 
 func (x *StreamEventsRequest) GetEventTypes() []string {
@@ -17019,7 +17154,7 @@ type ListAuditLogRequest struct {
 
 func (x *ListAuditLogRequest) Reset() {
 	*x = ListAuditLogRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[240]
+	mi := &file_litevirt_v1_service_proto_msgTypes[242]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -17031,7 +17166,7 @@ func (x *ListAuditLogRequest) String() string {
 func (*ListAuditLogRequest) ProtoMessage() {}
 
 func (x *ListAuditLogRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[240]
+	mi := &file_litevirt_v1_service_proto_msgTypes[242]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -17044,7 +17179,7 @@ func (x *ListAuditLogRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListAuditLogRequest.ProtoReflect.Descriptor instead.
 func (*ListAuditLogRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{240}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{242}
 }
 
 func (x *ListAuditLogRequest) GetLimit() int32 {
@@ -17104,7 +17239,7 @@ type AuditEntry struct {
 
 func (x *AuditEntry) Reset() {
 	*x = AuditEntry{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[241]
+	mi := &file_litevirt_v1_service_proto_msgTypes[243]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -17116,7 +17251,7 @@ func (x *AuditEntry) String() string {
 func (*AuditEntry) ProtoMessage() {}
 
 func (x *AuditEntry) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[241]
+	mi := &file_litevirt_v1_service_proto_msgTypes[243]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -17129,7 +17264,7 @@ func (x *AuditEntry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AuditEntry.ProtoReflect.Descriptor instead.
 func (*AuditEntry) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{241}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{243}
 }
 
 func (x *AuditEntry) GetTimestamp() string {
@@ -17190,7 +17325,7 @@ type ListAuditLogResponse struct {
 
 func (x *ListAuditLogResponse) Reset() {
 	*x = ListAuditLogResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[242]
+	mi := &file_litevirt_v1_service_proto_msgTypes[244]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -17202,7 +17337,7 @@ func (x *ListAuditLogResponse) String() string {
 func (*ListAuditLogResponse) ProtoMessage() {}
 
 func (x *ListAuditLogResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[242]
+	mi := &file_litevirt_v1_service_proto_msgTypes[244]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -17215,7 +17350,7 @@ func (x *ListAuditLogResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListAuditLogResponse.ProtoReflect.Descriptor instead.
 func (*ListAuditLogResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{242}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{244}
 }
 
 func (x *ListAuditLogResponse) GetEntries() []*AuditEntry {
@@ -17238,7 +17373,7 @@ type ListVMEventsRequest struct {
 
 func (x *ListVMEventsRequest) Reset() {
 	*x = ListVMEventsRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[243]
+	mi := &file_litevirt_v1_service_proto_msgTypes[245]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -17250,7 +17385,7 @@ func (x *ListVMEventsRequest) String() string {
 func (*ListVMEventsRequest) ProtoMessage() {}
 
 func (x *ListVMEventsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[243]
+	mi := &file_litevirt_v1_service_proto_msgTypes[245]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -17263,7 +17398,7 @@ func (x *ListVMEventsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListVMEventsRequest.ProtoReflect.Descriptor instead.
 func (*ListVMEventsRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{243}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{245}
 }
 
 func (x *ListVMEventsRequest) GetVmName() string {
@@ -17304,7 +17439,7 @@ type VMEvent struct {
 
 func (x *VMEvent) Reset() {
 	*x = VMEvent{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[244]
+	mi := &file_litevirt_v1_service_proto_msgTypes[246]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -17316,7 +17451,7 @@ func (x *VMEvent) String() string {
 func (*VMEvent) ProtoMessage() {}
 
 func (x *VMEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[244]
+	mi := &file_litevirt_v1_service_proto_msgTypes[246]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -17329,7 +17464,7 @@ func (x *VMEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VMEvent.ProtoReflect.Descriptor instead.
 func (*VMEvent) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{244}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{246}
 }
 
 func (x *VMEvent) GetId() string {
@@ -17404,7 +17539,7 @@ type ListVMEventsResponse struct {
 
 func (x *ListVMEventsResponse) Reset() {
 	*x = ListVMEventsResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[245]
+	mi := &file_litevirt_v1_service_proto_msgTypes[247]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -17416,7 +17551,7 @@ func (x *ListVMEventsResponse) String() string {
 func (*ListVMEventsResponse) ProtoMessage() {}
 
 func (x *ListVMEventsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[245]
+	mi := &file_litevirt_v1_service_proto_msgTypes[247]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -17429,7 +17564,7 @@ func (x *ListVMEventsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListVMEventsResponse.ProtoReflect.Descriptor instead.
 func (*ListVMEventsResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{245}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{247}
 }
 
 func (x *ListVMEventsResponse) GetEvents() []*VMEvent {
@@ -17450,7 +17585,7 @@ type CreateResourceMappingRequest struct {
 
 func (x *CreateResourceMappingRequest) Reset() {
 	*x = CreateResourceMappingRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[246]
+	mi := &file_litevirt_v1_service_proto_msgTypes[248]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -17462,7 +17597,7 @@ func (x *CreateResourceMappingRequest) String() string {
 func (*CreateResourceMappingRequest) ProtoMessage() {}
 
 func (x *CreateResourceMappingRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[246]
+	mi := &file_litevirt_v1_service_proto_msgTypes[248]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -17475,7 +17610,7 @@ func (x *CreateResourceMappingRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateResourceMappingRequest.ProtoReflect.Descriptor instead.
 func (*CreateResourceMappingRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{246}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{248}
 }
 
 func (x *CreateResourceMappingRequest) GetName() string {
@@ -17500,7 +17635,7 @@ type ListResourceMappingsRequest struct {
 
 func (x *ListResourceMappingsRequest) Reset() {
 	*x = ListResourceMappingsRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[247]
+	mi := &file_litevirt_v1_service_proto_msgTypes[249]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -17512,7 +17647,7 @@ func (x *ListResourceMappingsRequest) String() string {
 func (*ListResourceMappingsRequest) ProtoMessage() {}
 
 func (x *ListResourceMappingsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[247]
+	mi := &file_litevirt_v1_service_proto_msgTypes[249]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -17525,7 +17660,7 @@ func (x *ListResourceMappingsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListResourceMappingsRequest.ProtoReflect.Descriptor instead.
 func (*ListResourceMappingsRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{247}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{249}
 }
 
 type ListResourceMappingsResponse struct {
@@ -17537,7 +17672,7 @@ type ListResourceMappingsResponse struct {
 
 func (x *ListResourceMappingsResponse) Reset() {
 	*x = ListResourceMappingsResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[248]
+	mi := &file_litevirt_v1_service_proto_msgTypes[250]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -17549,7 +17684,7 @@ func (x *ListResourceMappingsResponse) String() string {
 func (*ListResourceMappingsResponse) ProtoMessage() {}
 
 func (x *ListResourceMappingsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[248]
+	mi := &file_litevirt_v1_service_proto_msgTypes[250]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -17562,7 +17697,7 @@ func (x *ListResourceMappingsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListResourceMappingsResponse.ProtoReflect.Descriptor instead.
 func (*ListResourceMappingsResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{248}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{250}
 }
 
 func (x *ListResourceMappingsResponse) GetMappings() []*ResourceMapping {
@@ -17581,7 +17716,7 @@ type DeleteResourceMappingRequest struct {
 
 func (x *DeleteResourceMappingRequest) Reset() {
 	*x = DeleteResourceMappingRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[249]
+	mi := &file_litevirt_v1_service_proto_msgTypes[251]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -17593,7 +17728,7 @@ func (x *DeleteResourceMappingRequest) String() string {
 func (*DeleteResourceMappingRequest) ProtoMessage() {}
 
 func (x *DeleteResourceMappingRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[249]
+	mi := &file_litevirt_v1_service_proto_msgTypes[251]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -17606,7 +17741,7 @@ func (x *DeleteResourceMappingRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteResourceMappingRequest.ProtoReflect.Descriptor instead.
 func (*DeleteResourceMappingRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{249}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{251}
 }
 
 func (x *DeleteResourceMappingRequest) GetName() string {
@@ -17631,7 +17766,7 @@ type AddMappingDeviceRequest struct {
 
 func (x *AddMappingDeviceRequest) Reset() {
 	*x = AddMappingDeviceRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[250]
+	mi := &file_litevirt_v1_service_proto_msgTypes[252]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -17643,7 +17778,7 @@ func (x *AddMappingDeviceRequest) String() string {
 func (*AddMappingDeviceRequest) ProtoMessage() {}
 
 func (x *AddMappingDeviceRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[250]
+	mi := &file_litevirt_v1_service_proto_msgTypes[252]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -17656,7 +17791,7 @@ func (x *AddMappingDeviceRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AddMappingDeviceRequest.ProtoReflect.Descriptor instead.
 func (*AddMappingDeviceRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{250}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{252}
 }
 
 func (x *AddMappingDeviceRequest) GetMapping() string {
@@ -17705,7 +17840,7 @@ type RemoveMappingDeviceRequest struct {
 
 func (x *RemoveMappingDeviceRequest) Reset() {
 	*x = RemoveMappingDeviceRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[251]
+	mi := &file_litevirt_v1_service_proto_msgTypes[253]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -17717,7 +17852,7 @@ func (x *RemoveMappingDeviceRequest) String() string {
 func (*RemoveMappingDeviceRequest) ProtoMessage() {}
 
 func (x *RemoveMappingDeviceRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[251]
+	mi := &file_litevirt_v1_service_proto_msgTypes[253]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -17730,7 +17865,7 @@ func (x *RemoveMappingDeviceRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RemoveMappingDeviceRequest.ProtoReflect.Descriptor instead.
 func (*RemoveMappingDeviceRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{251}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{253}
 }
 
 func (x *RemoveMappingDeviceRequest) GetMapping() string {
@@ -17767,7 +17902,7 @@ type CreateNotificationTargetRequest struct {
 
 func (x *CreateNotificationTargetRequest) Reset() {
 	*x = CreateNotificationTargetRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[252]
+	mi := &file_litevirt_v1_service_proto_msgTypes[254]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -17779,7 +17914,7 @@ func (x *CreateNotificationTargetRequest) String() string {
 func (*CreateNotificationTargetRequest) ProtoMessage() {}
 
 func (x *CreateNotificationTargetRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[252]
+	mi := &file_litevirt_v1_service_proto_msgTypes[254]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -17792,7 +17927,7 @@ func (x *CreateNotificationTargetRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateNotificationTargetRequest.ProtoReflect.Descriptor instead.
 func (*CreateNotificationTargetRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{252}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{254}
 }
 
 func (x *CreateNotificationTargetRequest) GetName() string {
@@ -17831,7 +17966,7 @@ type ListNotificationTargetsRequest struct {
 
 func (x *ListNotificationTargetsRequest) Reset() {
 	*x = ListNotificationTargetsRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[253]
+	mi := &file_litevirt_v1_service_proto_msgTypes[255]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -17843,7 +17978,7 @@ func (x *ListNotificationTargetsRequest) String() string {
 func (*ListNotificationTargetsRequest) ProtoMessage() {}
 
 func (x *ListNotificationTargetsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[253]
+	mi := &file_litevirt_v1_service_proto_msgTypes[255]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -17856,7 +17991,7 @@ func (x *ListNotificationTargetsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListNotificationTargetsRequest.ProtoReflect.Descriptor instead.
 func (*ListNotificationTargetsRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{253}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{255}
 }
 
 type ListNotificationTargetsResponse struct {
@@ -17868,7 +18003,7 @@ type ListNotificationTargetsResponse struct {
 
 func (x *ListNotificationTargetsResponse) Reset() {
 	*x = ListNotificationTargetsResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[254]
+	mi := &file_litevirt_v1_service_proto_msgTypes[256]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -17880,7 +18015,7 @@ func (x *ListNotificationTargetsResponse) String() string {
 func (*ListNotificationTargetsResponse) ProtoMessage() {}
 
 func (x *ListNotificationTargetsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[254]
+	mi := &file_litevirt_v1_service_proto_msgTypes[256]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -17893,7 +18028,7 @@ func (x *ListNotificationTargetsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListNotificationTargetsResponse.ProtoReflect.Descriptor instead.
 func (*ListNotificationTargetsResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{254}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{256}
 }
 
 func (x *ListNotificationTargetsResponse) GetTargets() []*NotificationTarget {
@@ -17912,7 +18047,7 @@ type DeleteNotificationTargetRequest struct {
 
 func (x *DeleteNotificationTargetRequest) Reset() {
 	*x = DeleteNotificationTargetRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[255]
+	mi := &file_litevirt_v1_service_proto_msgTypes[257]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -17924,7 +18059,7 @@ func (x *DeleteNotificationTargetRequest) String() string {
 func (*DeleteNotificationTargetRequest) ProtoMessage() {}
 
 func (x *DeleteNotificationTargetRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[255]
+	mi := &file_litevirt_v1_service_proto_msgTypes[257]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -17937,7 +18072,7 @@ func (x *DeleteNotificationTargetRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteNotificationTargetRequest.ProtoReflect.Descriptor instead.
 func (*DeleteNotificationTargetRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{255}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{257}
 }
 
 func (x *DeleteNotificationTargetRequest) GetId() string {
@@ -17956,7 +18091,7 @@ type TestNotificationTargetRequest struct {
 
 func (x *TestNotificationTargetRequest) Reset() {
 	*x = TestNotificationTargetRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[256]
+	mi := &file_litevirt_v1_service_proto_msgTypes[258]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -17968,7 +18103,7 @@ func (x *TestNotificationTargetRequest) String() string {
 func (*TestNotificationTargetRequest) ProtoMessage() {}
 
 func (x *TestNotificationTargetRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[256]
+	mi := &file_litevirt_v1_service_proto_msgTypes[258]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -17981,7 +18116,7 @@ func (x *TestNotificationTargetRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TestNotificationTargetRequest.ProtoReflect.Descriptor instead.
 func (*TestNotificationTargetRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{256}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{258}
 }
 
 func (x *TestNotificationTargetRequest) GetId() string {
@@ -18003,7 +18138,7 @@ type CreateNotificationRouteRequest struct {
 
 func (x *CreateNotificationRouteRequest) Reset() {
 	*x = CreateNotificationRouteRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[257]
+	mi := &file_litevirt_v1_service_proto_msgTypes[259]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -18015,7 +18150,7 @@ func (x *CreateNotificationRouteRequest) String() string {
 func (*CreateNotificationRouteRequest) ProtoMessage() {}
 
 func (x *CreateNotificationRouteRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[257]
+	mi := &file_litevirt_v1_service_proto_msgTypes[259]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -18028,7 +18163,7 @@ func (x *CreateNotificationRouteRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateNotificationRouteRequest.ProtoReflect.Descriptor instead.
 func (*CreateNotificationRouteRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{257}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{259}
 }
 
 func (x *CreateNotificationRouteRequest) GetEventPattern() string {
@@ -18067,7 +18202,7 @@ type ListNotificationRoutesRequest struct {
 
 func (x *ListNotificationRoutesRequest) Reset() {
 	*x = ListNotificationRoutesRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[258]
+	mi := &file_litevirt_v1_service_proto_msgTypes[260]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -18079,7 +18214,7 @@ func (x *ListNotificationRoutesRequest) String() string {
 func (*ListNotificationRoutesRequest) ProtoMessage() {}
 
 func (x *ListNotificationRoutesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[258]
+	mi := &file_litevirt_v1_service_proto_msgTypes[260]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -18092,7 +18227,7 @@ func (x *ListNotificationRoutesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListNotificationRoutesRequest.ProtoReflect.Descriptor instead.
 func (*ListNotificationRoutesRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{258}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{260}
 }
 
 type ListNotificationRoutesResponse struct {
@@ -18104,7 +18239,7 @@ type ListNotificationRoutesResponse struct {
 
 func (x *ListNotificationRoutesResponse) Reset() {
 	*x = ListNotificationRoutesResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[259]
+	mi := &file_litevirt_v1_service_proto_msgTypes[261]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -18116,7 +18251,7 @@ func (x *ListNotificationRoutesResponse) String() string {
 func (*ListNotificationRoutesResponse) ProtoMessage() {}
 
 func (x *ListNotificationRoutesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[259]
+	mi := &file_litevirt_v1_service_proto_msgTypes[261]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -18129,7 +18264,7 @@ func (x *ListNotificationRoutesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListNotificationRoutesResponse.ProtoReflect.Descriptor instead.
 func (*ListNotificationRoutesResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{259}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{261}
 }
 
 func (x *ListNotificationRoutesResponse) GetRoutes() []*NotificationRoute {
@@ -18148,7 +18283,7 @@ type DeleteNotificationRouteRequest struct {
 
 func (x *DeleteNotificationRouteRequest) Reset() {
 	*x = DeleteNotificationRouteRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[260]
+	mi := &file_litevirt_v1_service_proto_msgTypes[262]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -18160,7 +18295,7 @@ func (x *DeleteNotificationRouteRequest) String() string {
 func (*DeleteNotificationRouteRequest) ProtoMessage() {}
 
 func (x *DeleteNotificationRouteRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[260]
+	mi := &file_litevirt_v1_service_proto_msgTypes[262]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -18173,7 +18308,7 @@ func (x *DeleteNotificationRouteRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteNotificationRouteRequest.ProtoReflect.Descriptor instead.
 func (*DeleteNotificationRouteRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{260}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{262}
 }
 
 func (x *DeleteNotificationRouteRequest) GetId() string {
@@ -18201,7 +18336,7 @@ type RegistryCredential struct {
 
 func (x *RegistryCredential) Reset() {
 	*x = RegistryCredential{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[261]
+	mi := &file_litevirt_v1_service_proto_msgTypes[263]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -18213,7 +18348,7 @@ func (x *RegistryCredential) String() string {
 func (*RegistryCredential) ProtoMessage() {}
 
 func (x *RegistryCredential) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[261]
+	mi := &file_litevirt_v1_service_proto_msgTypes[263]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -18226,7 +18361,7 @@ func (x *RegistryCredential) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RegistryCredential.ProtoReflect.Descriptor instead.
 func (*RegistryCredential) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{261}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{263}
 }
 
 func (x *RegistryCredential) GetScope() string {
@@ -18285,7 +18420,7 @@ type SetRegistryCredentialRequest struct {
 
 func (x *SetRegistryCredentialRequest) Reset() {
 	*x = SetRegistryCredentialRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[262]
+	mi := &file_litevirt_v1_service_proto_msgTypes[264]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -18297,7 +18432,7 @@ func (x *SetRegistryCredentialRequest) String() string {
 func (*SetRegistryCredentialRequest) ProtoMessage() {}
 
 func (x *SetRegistryCredentialRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[262]
+	mi := &file_litevirt_v1_service_proto_msgTypes[264]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -18310,7 +18445,7 @@ func (x *SetRegistryCredentialRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetRegistryCredentialRequest.ProtoReflect.Descriptor instead.
 func (*SetRegistryCredentialRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{262}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{264}
 }
 
 func (x *SetRegistryCredentialRequest) GetGlobal() bool {
@@ -18351,7 +18486,7 @@ type ListRegistryCredentialsRequest struct {
 
 func (x *ListRegistryCredentialsRequest) Reset() {
 	*x = ListRegistryCredentialsRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[263]
+	mi := &file_litevirt_v1_service_proto_msgTypes[265]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -18363,7 +18498,7 @@ func (x *ListRegistryCredentialsRequest) String() string {
 func (*ListRegistryCredentialsRequest) ProtoMessage() {}
 
 func (x *ListRegistryCredentialsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[263]
+	mi := &file_litevirt_v1_service_proto_msgTypes[265]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -18376,7 +18511,7 @@ func (x *ListRegistryCredentialsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListRegistryCredentialsRequest.ProtoReflect.Descriptor instead.
 func (*ListRegistryCredentialsRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{263}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{265}
 }
 
 func (x *ListRegistryCredentialsRequest) GetAll() bool {
@@ -18402,7 +18537,7 @@ type ListRegistryCredentialsResponse struct {
 
 func (x *ListRegistryCredentialsResponse) Reset() {
 	*x = ListRegistryCredentialsResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[264]
+	mi := &file_litevirt_v1_service_proto_msgTypes[266]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -18414,7 +18549,7 @@ func (x *ListRegistryCredentialsResponse) String() string {
 func (*ListRegistryCredentialsResponse) ProtoMessage() {}
 
 func (x *ListRegistryCredentialsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[264]
+	mi := &file_litevirt_v1_service_proto_msgTypes[266]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -18427,7 +18562,7 @@ func (x *ListRegistryCredentialsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListRegistryCredentialsResponse.ProtoReflect.Descriptor instead.
 func (*ListRegistryCredentialsResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{264}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{266}
 }
 
 func (x *ListRegistryCredentialsResponse) GetCredentials() []*RegistryCredential {
@@ -18447,7 +18582,7 @@ type DeleteRegistryCredentialRequest struct {
 
 func (x *DeleteRegistryCredentialRequest) Reset() {
 	*x = DeleteRegistryCredentialRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[265]
+	mi := &file_litevirt_v1_service_proto_msgTypes[267]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -18459,7 +18594,7 @@ func (x *DeleteRegistryCredentialRequest) String() string {
 func (*DeleteRegistryCredentialRequest) ProtoMessage() {}
 
 func (x *DeleteRegistryCredentialRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[265]
+	mi := &file_litevirt_v1_service_proto_msgTypes[267]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -18472,7 +18607,7 @@ func (x *DeleteRegistryCredentialRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteRegistryCredentialRequest.ProtoReflect.Descriptor instead.
 func (*DeleteRegistryCredentialRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{265}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{267}
 }
 
 func (x *DeleteRegistryCredentialRequest) GetGlobal() bool {
@@ -18503,7 +18638,7 @@ type CreateClusterFirewallRuleRequest struct {
 
 func (x *CreateClusterFirewallRuleRequest) Reset() {
 	*x = CreateClusterFirewallRuleRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[266]
+	mi := &file_litevirt_v1_service_proto_msgTypes[268]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -18515,7 +18650,7 @@ func (x *CreateClusterFirewallRuleRequest) String() string {
 func (*CreateClusterFirewallRuleRequest) ProtoMessage() {}
 
 func (x *CreateClusterFirewallRuleRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[266]
+	mi := &file_litevirt_v1_service_proto_msgTypes[268]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -18528,7 +18663,7 @@ func (x *CreateClusterFirewallRuleRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateClusterFirewallRuleRequest.ProtoReflect.Descriptor instead.
 func (*CreateClusterFirewallRuleRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{266}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{268}
 }
 
 func (x *CreateClusterFirewallRuleRequest) GetRule() *FirewallRule {
@@ -18546,7 +18681,7 @@ type ListClusterFirewallRulesRequest struct {
 
 func (x *ListClusterFirewallRulesRequest) Reset() {
 	*x = ListClusterFirewallRulesRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[267]
+	mi := &file_litevirt_v1_service_proto_msgTypes[269]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -18558,7 +18693,7 @@ func (x *ListClusterFirewallRulesRequest) String() string {
 func (*ListClusterFirewallRulesRequest) ProtoMessage() {}
 
 func (x *ListClusterFirewallRulesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[267]
+	mi := &file_litevirt_v1_service_proto_msgTypes[269]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -18571,7 +18706,7 @@ func (x *ListClusterFirewallRulesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListClusterFirewallRulesRequest.ProtoReflect.Descriptor instead.
 func (*ListClusterFirewallRulesRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{267}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{269}
 }
 
 type ListClusterFirewallRulesResponse struct {
@@ -18583,7 +18718,7 @@ type ListClusterFirewallRulesResponse struct {
 
 func (x *ListClusterFirewallRulesResponse) Reset() {
 	*x = ListClusterFirewallRulesResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[268]
+	mi := &file_litevirt_v1_service_proto_msgTypes[270]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -18595,7 +18730,7 @@ func (x *ListClusterFirewallRulesResponse) String() string {
 func (*ListClusterFirewallRulesResponse) ProtoMessage() {}
 
 func (x *ListClusterFirewallRulesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[268]
+	mi := &file_litevirt_v1_service_proto_msgTypes[270]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -18608,7 +18743,7 @@ func (x *ListClusterFirewallRulesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListClusterFirewallRulesResponse.ProtoReflect.Descriptor instead.
 func (*ListClusterFirewallRulesResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{268}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{270}
 }
 
 func (x *ListClusterFirewallRulesResponse) GetRules() []*FirewallRule {
@@ -18627,7 +18762,7 @@ type DeleteClusterFirewallRuleRequest struct {
 
 func (x *DeleteClusterFirewallRuleRequest) Reset() {
 	*x = DeleteClusterFirewallRuleRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[269]
+	mi := &file_litevirt_v1_service_proto_msgTypes[271]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -18639,7 +18774,7 @@ func (x *DeleteClusterFirewallRuleRequest) String() string {
 func (*DeleteClusterFirewallRuleRequest) ProtoMessage() {}
 
 func (x *DeleteClusterFirewallRuleRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[269]
+	mi := &file_litevirt_v1_service_proto_msgTypes[271]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -18652,7 +18787,7 @@ func (x *DeleteClusterFirewallRuleRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteClusterFirewallRuleRequest.ProtoReflect.Descriptor instead.
 func (*DeleteClusterFirewallRuleRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{269}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{271}
 }
 
 func (x *DeleteClusterFirewallRuleRequest) GetId() string {
@@ -18671,7 +18806,7 @@ type CreateHostFirewallRuleRequest struct {
 
 func (x *CreateHostFirewallRuleRequest) Reset() {
 	*x = CreateHostFirewallRuleRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[270]
+	mi := &file_litevirt_v1_service_proto_msgTypes[272]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -18683,7 +18818,7 @@ func (x *CreateHostFirewallRuleRequest) String() string {
 func (*CreateHostFirewallRuleRequest) ProtoMessage() {}
 
 func (x *CreateHostFirewallRuleRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[270]
+	mi := &file_litevirt_v1_service_proto_msgTypes[272]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -18696,7 +18831,7 @@ func (x *CreateHostFirewallRuleRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateHostFirewallRuleRequest.ProtoReflect.Descriptor instead.
 func (*CreateHostFirewallRuleRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{270}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{272}
 }
 
 func (x *CreateHostFirewallRuleRequest) GetRule() *FirewallRule {
@@ -18715,7 +18850,7 @@ type ListHostFirewallRulesRequest struct {
 
 func (x *ListHostFirewallRulesRequest) Reset() {
 	*x = ListHostFirewallRulesRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[271]
+	mi := &file_litevirt_v1_service_proto_msgTypes[273]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -18727,7 +18862,7 @@ func (x *ListHostFirewallRulesRequest) String() string {
 func (*ListHostFirewallRulesRequest) ProtoMessage() {}
 
 func (x *ListHostFirewallRulesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[271]
+	mi := &file_litevirt_v1_service_proto_msgTypes[273]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -18740,7 +18875,7 @@ func (x *ListHostFirewallRulesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListHostFirewallRulesRequest.ProtoReflect.Descriptor instead.
 func (*ListHostFirewallRulesRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{271}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{273}
 }
 
 func (x *ListHostFirewallRulesRequest) GetHostName() string {
@@ -18759,7 +18894,7 @@ type ListHostFirewallRulesResponse struct {
 
 func (x *ListHostFirewallRulesResponse) Reset() {
 	*x = ListHostFirewallRulesResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[272]
+	mi := &file_litevirt_v1_service_proto_msgTypes[274]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -18771,7 +18906,7 @@ func (x *ListHostFirewallRulesResponse) String() string {
 func (*ListHostFirewallRulesResponse) ProtoMessage() {}
 
 func (x *ListHostFirewallRulesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[272]
+	mi := &file_litevirt_v1_service_proto_msgTypes[274]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -18784,7 +18919,7 @@ func (x *ListHostFirewallRulesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListHostFirewallRulesResponse.ProtoReflect.Descriptor instead.
 func (*ListHostFirewallRulesResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{272}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{274}
 }
 
 func (x *ListHostFirewallRulesResponse) GetRules() []*FirewallRule {
@@ -18803,7 +18938,7 @@ type DeleteHostFirewallRuleRequest struct {
 
 func (x *DeleteHostFirewallRuleRequest) Reset() {
 	*x = DeleteHostFirewallRuleRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[273]
+	mi := &file_litevirt_v1_service_proto_msgTypes[275]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -18815,7 +18950,7 @@ func (x *DeleteHostFirewallRuleRequest) String() string {
 func (*DeleteHostFirewallRuleRequest) ProtoMessage() {}
 
 func (x *DeleteHostFirewallRuleRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[273]
+	mi := &file_litevirt_v1_service_proto_msgTypes[275]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -18828,7 +18963,7 @@ func (x *DeleteHostFirewallRuleRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteHostFirewallRuleRequest.ProtoReflect.Descriptor instead.
 func (*DeleteHostFirewallRuleRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{273}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{275}
 }
 
 func (x *DeleteHostFirewallRuleRequest) GetId() string {
@@ -18848,7 +18983,7 @@ type CreateIpSetRequest struct {
 
 func (x *CreateIpSetRequest) Reset() {
 	*x = CreateIpSetRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[274]
+	mi := &file_litevirt_v1_service_proto_msgTypes[276]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -18860,7 +18995,7 @@ func (x *CreateIpSetRequest) String() string {
 func (*CreateIpSetRequest) ProtoMessage() {}
 
 func (x *CreateIpSetRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[274]
+	mi := &file_litevirt_v1_service_proto_msgTypes[276]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -18873,7 +19008,7 @@ func (x *CreateIpSetRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateIpSetRequest.ProtoReflect.Descriptor instead.
 func (*CreateIpSetRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{274}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{276}
 }
 
 func (x *CreateIpSetRequest) GetName() string {
@@ -18898,7 +19033,7 @@ type ListIpSetsRequest struct {
 
 func (x *ListIpSetsRequest) Reset() {
 	*x = ListIpSetsRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[275]
+	mi := &file_litevirt_v1_service_proto_msgTypes[277]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -18910,7 +19045,7 @@ func (x *ListIpSetsRequest) String() string {
 func (*ListIpSetsRequest) ProtoMessage() {}
 
 func (x *ListIpSetsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[275]
+	mi := &file_litevirt_v1_service_proto_msgTypes[277]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -18923,7 +19058,7 @@ func (x *ListIpSetsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListIpSetsRequest.ProtoReflect.Descriptor instead.
 func (*ListIpSetsRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{275}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{277}
 }
 
 type ListIpSetsResponse struct {
@@ -18935,7 +19070,7 @@ type ListIpSetsResponse struct {
 
 func (x *ListIpSetsResponse) Reset() {
 	*x = ListIpSetsResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[276]
+	mi := &file_litevirt_v1_service_proto_msgTypes[278]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -18947,7 +19082,7 @@ func (x *ListIpSetsResponse) String() string {
 func (*ListIpSetsResponse) ProtoMessage() {}
 
 func (x *ListIpSetsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[276]
+	mi := &file_litevirt_v1_service_proto_msgTypes[278]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -18960,7 +19095,7 @@ func (x *ListIpSetsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListIpSetsResponse.ProtoReflect.Descriptor instead.
 func (*ListIpSetsResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{276}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{278}
 }
 
 func (x *ListIpSetsResponse) GetIpsets() []*IpSet {
@@ -18979,7 +19114,7 @@ type DeleteIpSetRequest struct {
 
 func (x *DeleteIpSetRequest) Reset() {
 	*x = DeleteIpSetRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[277]
+	mi := &file_litevirt_v1_service_proto_msgTypes[279]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -18991,7 +19126,7 @@ func (x *DeleteIpSetRequest) String() string {
 func (*DeleteIpSetRequest) ProtoMessage() {}
 
 func (x *DeleteIpSetRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[277]
+	mi := &file_litevirt_v1_service_proto_msgTypes[279]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19004,7 +19139,7 @@ func (x *DeleteIpSetRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteIpSetRequest.ProtoReflect.Descriptor instead.
 func (*DeleteIpSetRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{277}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{279}
 }
 
 func (x *DeleteIpSetRequest) GetId() string {
@@ -19024,7 +19159,7 @@ type SetFirewallDefaultRequest struct {
 
 func (x *SetFirewallDefaultRequest) Reset() {
 	*x = SetFirewallDefaultRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[278]
+	mi := &file_litevirt_v1_service_proto_msgTypes[280]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19036,7 +19171,7 @@ func (x *SetFirewallDefaultRequest) String() string {
 func (*SetFirewallDefaultRequest) ProtoMessage() {}
 
 func (x *SetFirewallDefaultRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[278]
+	mi := &file_litevirt_v1_service_proto_msgTypes[280]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19049,7 +19184,7 @@ func (x *SetFirewallDefaultRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetFirewallDefaultRequest.ProtoReflect.Descriptor instead.
 func (*SetFirewallDefaultRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{278}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{280}
 }
 
 func (x *SetFirewallDefaultRequest) GetScope() string {
@@ -19074,7 +19209,7 @@ type ListFirewallDefaultsRequest struct {
 
 func (x *ListFirewallDefaultsRequest) Reset() {
 	*x = ListFirewallDefaultsRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[279]
+	mi := &file_litevirt_v1_service_proto_msgTypes[281]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19086,7 +19221,7 @@ func (x *ListFirewallDefaultsRequest) String() string {
 func (*ListFirewallDefaultsRequest) ProtoMessage() {}
 
 func (x *ListFirewallDefaultsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[279]
+	mi := &file_litevirt_v1_service_proto_msgTypes[281]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19099,7 +19234,7 @@ func (x *ListFirewallDefaultsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListFirewallDefaultsRequest.ProtoReflect.Descriptor instead.
 func (*ListFirewallDefaultsRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{279}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{281}
 }
 
 type ListFirewallDefaultsResponse struct {
@@ -19111,7 +19246,7 @@ type ListFirewallDefaultsResponse struct {
 
 func (x *ListFirewallDefaultsResponse) Reset() {
 	*x = ListFirewallDefaultsResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[280]
+	mi := &file_litevirt_v1_service_proto_msgTypes[282]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19123,7 +19258,7 @@ func (x *ListFirewallDefaultsResponse) String() string {
 func (*ListFirewallDefaultsResponse) ProtoMessage() {}
 
 func (x *ListFirewallDefaultsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[280]
+	mi := &file_litevirt_v1_service_proto_msgTypes[282]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19136,7 +19271,7 @@ func (x *ListFirewallDefaultsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListFirewallDefaultsResponse.ProtoReflect.Descriptor instead.
 func (*ListFirewallDefaultsResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{280}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{282}
 }
 
 func (x *ListFirewallDefaultsResponse) GetDefaults() []*FirewallDefault {
@@ -19160,7 +19295,7 @@ type CreateSecurityGroupRequest struct {
 
 func (x *CreateSecurityGroupRequest) Reset() {
 	*x = CreateSecurityGroupRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[281]
+	mi := &file_litevirt_v1_service_proto_msgTypes[283]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19172,7 +19307,7 @@ func (x *CreateSecurityGroupRequest) String() string {
 func (*CreateSecurityGroupRequest) ProtoMessage() {}
 
 func (x *CreateSecurityGroupRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[281]
+	mi := &file_litevirt_v1_service_proto_msgTypes[283]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19185,7 +19320,7 @@ func (x *CreateSecurityGroupRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateSecurityGroupRequest.ProtoReflect.Descriptor instead.
 func (*CreateSecurityGroupRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{281}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{283}
 }
 
 func (x *CreateSecurityGroupRequest) GetName() string {
@@ -19211,7 +19346,7 @@ type DeleteSecurityGroupRequest struct {
 
 func (x *DeleteSecurityGroupRequest) Reset() {
 	*x = DeleteSecurityGroupRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[282]
+	mi := &file_litevirt_v1_service_proto_msgTypes[284]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19223,7 +19358,7 @@ func (x *DeleteSecurityGroupRequest) String() string {
 func (*DeleteSecurityGroupRequest) ProtoMessage() {}
 
 func (x *DeleteSecurityGroupRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[282]
+	mi := &file_litevirt_v1_service_proto_msgTypes[284]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19236,7 +19371,7 @@ func (x *DeleteSecurityGroupRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteSecurityGroupRequest.ProtoReflect.Descriptor instead.
 func (*DeleteSecurityGroupRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{282}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{284}
 }
 
 func (x *DeleteSecurityGroupRequest) GetId() string {
@@ -19255,7 +19390,7 @@ type AddSecurityGroupRuleRequest struct {
 
 func (x *AddSecurityGroupRuleRequest) Reset() {
 	*x = AddSecurityGroupRuleRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[283]
+	mi := &file_litevirt_v1_service_proto_msgTypes[285]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19267,7 +19402,7 @@ func (x *AddSecurityGroupRuleRequest) String() string {
 func (*AddSecurityGroupRuleRequest) ProtoMessage() {}
 
 func (x *AddSecurityGroupRuleRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[283]
+	mi := &file_litevirt_v1_service_proto_msgTypes[285]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19280,7 +19415,7 @@ func (x *AddSecurityGroupRuleRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AddSecurityGroupRuleRequest.ProtoReflect.Descriptor instead.
 func (*AddSecurityGroupRuleRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{283}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{285}
 }
 
 func (x *AddSecurityGroupRuleRequest) GetRule() *SecurityGroupRule {
@@ -19299,7 +19434,7 @@ type RemoveSecurityGroupRuleRequest struct {
 
 func (x *RemoveSecurityGroupRuleRequest) Reset() {
 	*x = RemoveSecurityGroupRuleRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[284]
+	mi := &file_litevirt_v1_service_proto_msgTypes[286]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19311,7 +19446,7 @@ func (x *RemoveSecurityGroupRuleRequest) String() string {
 func (*RemoveSecurityGroupRuleRequest) ProtoMessage() {}
 
 func (x *RemoveSecurityGroupRuleRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[284]
+	mi := &file_litevirt_v1_service_proto_msgTypes[286]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19324,7 +19459,7 @@ func (x *RemoveSecurityGroupRuleRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RemoveSecurityGroupRuleRequest.ProtoReflect.Descriptor instead.
 func (*RemoveSecurityGroupRuleRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{284}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{286}
 }
 
 func (x *RemoveSecurityGroupRuleRequest) GetId() string {
@@ -19348,7 +19483,7 @@ type ListSecurityGroupsRequest struct {
 
 func (x *ListSecurityGroupsRequest) Reset() {
 	*x = ListSecurityGroupsRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[285]
+	mi := &file_litevirt_v1_service_proto_msgTypes[287]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19360,7 +19495,7 @@ func (x *ListSecurityGroupsRequest) String() string {
 func (*ListSecurityGroupsRequest) ProtoMessage() {}
 
 func (x *ListSecurityGroupsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[285]
+	mi := &file_litevirt_v1_service_proto_msgTypes[287]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19373,7 +19508,7 @@ func (x *ListSecurityGroupsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListSecurityGroupsRequest.ProtoReflect.Descriptor instead.
 func (*ListSecurityGroupsRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{285}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{287}
 }
 
 func (x *ListSecurityGroupsRequest) GetStackName() string {
@@ -19400,7 +19535,7 @@ type ListSecurityGroupsResponse struct {
 
 func (x *ListSecurityGroupsResponse) Reset() {
 	*x = ListSecurityGroupsResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[286]
+	mi := &file_litevirt_v1_service_proto_msgTypes[288]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19412,7 +19547,7 @@ func (x *ListSecurityGroupsResponse) String() string {
 func (*ListSecurityGroupsResponse) ProtoMessage() {}
 
 func (x *ListSecurityGroupsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[286]
+	mi := &file_litevirt_v1_service_proto_msgTypes[288]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19425,7 +19560,7 @@ func (x *ListSecurityGroupsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListSecurityGroupsResponse.ProtoReflect.Descriptor instead.
 func (*ListSecurityGroupsResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{286}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{288}
 }
 
 func (x *ListSecurityGroupsResponse) GetGroups() []*SecurityGroup {
@@ -19451,7 +19586,7 @@ type ListStoragePoolsRequest struct {
 
 func (x *ListStoragePoolsRequest) Reset() {
 	*x = ListStoragePoolsRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[287]
+	mi := &file_litevirt_v1_service_proto_msgTypes[289]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19463,7 +19598,7 @@ func (x *ListStoragePoolsRequest) String() string {
 func (*ListStoragePoolsRequest) ProtoMessage() {}
 
 func (x *ListStoragePoolsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[287]
+	mi := &file_litevirt_v1_service_proto_msgTypes[289]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19476,7 +19611,7 @@ func (x *ListStoragePoolsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListStoragePoolsRequest.ProtoReflect.Descriptor instead.
 func (*ListStoragePoolsRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{287}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{289}
 }
 
 type ListStoragePoolsResponse struct {
@@ -19488,7 +19623,7 @@ type ListStoragePoolsResponse struct {
 
 func (x *ListStoragePoolsResponse) Reset() {
 	*x = ListStoragePoolsResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[288]
+	mi := &file_litevirt_v1_service_proto_msgTypes[290]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19500,7 +19635,7 @@ func (x *ListStoragePoolsResponse) String() string {
 func (*ListStoragePoolsResponse) ProtoMessage() {}
 
 func (x *ListStoragePoolsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[288]
+	mi := &file_litevirt_v1_service_proto_msgTypes[290]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19513,7 +19648,7 @@ func (x *ListStoragePoolsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListStoragePoolsResponse.ProtoReflect.Descriptor instead.
 func (*ListStoragePoolsResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{288}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{290}
 }
 
 func (x *ListStoragePoolsResponse) GetPools() []*StoragePool {
@@ -19542,7 +19677,7 @@ type CreateStoragePoolRequest struct {
 
 func (x *CreateStoragePoolRequest) Reset() {
 	*x = CreateStoragePoolRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[289]
+	mi := &file_litevirt_v1_service_proto_msgTypes[291]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19554,7 +19689,7 @@ func (x *CreateStoragePoolRequest) String() string {
 func (*CreateStoragePoolRequest) ProtoMessage() {}
 
 func (x *CreateStoragePoolRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[289]
+	mi := &file_litevirt_v1_service_proto_msgTypes[291]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19567,7 +19702,7 @@ func (x *CreateStoragePoolRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateStoragePoolRequest.ProtoReflect.Descriptor instead.
 func (*CreateStoragePoolRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{289}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{291}
 }
 
 func (x *CreateStoragePoolRequest) GetName() string {
@@ -19628,7 +19763,7 @@ type CreateStoragePoolResponse struct {
 
 func (x *CreateStoragePoolResponse) Reset() {
 	*x = CreateStoragePoolResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[290]
+	mi := &file_litevirt_v1_service_proto_msgTypes[292]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19640,7 +19775,7 @@ func (x *CreateStoragePoolResponse) String() string {
 func (*CreateStoragePoolResponse) ProtoMessage() {}
 
 func (x *CreateStoragePoolResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[290]
+	mi := &file_litevirt_v1_service_proto_msgTypes[292]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19653,7 +19788,7 @@ func (x *CreateStoragePoolResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateStoragePoolResponse.ProtoReflect.Descriptor instead.
 func (*CreateStoragePoolResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{290}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{292}
 }
 
 func (x *CreateStoragePoolResponse) GetPool() *StoragePool {
@@ -19675,7 +19810,7 @@ type DeleteStoragePoolRequest struct {
 
 func (x *DeleteStoragePoolRequest) Reset() {
 	*x = DeleteStoragePoolRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[291]
+	mi := &file_litevirt_v1_service_proto_msgTypes[293]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19687,7 +19822,7 @@ func (x *DeleteStoragePoolRequest) String() string {
 func (*DeleteStoragePoolRequest) ProtoMessage() {}
 
 func (x *DeleteStoragePoolRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[291]
+	mi := &file_litevirt_v1_service_proto_msgTypes[293]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19700,7 +19835,7 @@ func (x *DeleteStoragePoolRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteStoragePoolRequest.ProtoReflect.Descriptor instead.
 func (*DeleteStoragePoolRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{291}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{293}
 }
 
 func (x *DeleteStoragePoolRequest) GetName() string {
@@ -19739,7 +19874,7 @@ type DeleteStoragePoolResponse struct {
 
 func (x *DeleteStoragePoolResponse) Reset() {
 	*x = DeleteStoragePoolResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[292]
+	mi := &file_litevirt_v1_service_proto_msgTypes[294]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19751,7 +19886,7 @@ func (x *DeleteStoragePoolResponse) String() string {
 func (*DeleteStoragePoolResponse) ProtoMessage() {}
 
 func (x *DeleteStoragePoolResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[292]
+	mi := &file_litevirt_v1_service_proto_msgTypes[294]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19764,7 +19899,7 @@ func (x *DeleteStoragePoolResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteStoragePoolResponse.ProtoReflect.Descriptor instead.
 func (*DeleteStoragePoolResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{292}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{294}
 }
 
 type GetStoragePoolRequest struct {
@@ -19777,7 +19912,7 @@ type GetStoragePoolRequest struct {
 
 func (x *GetStoragePoolRequest) Reset() {
 	*x = GetStoragePoolRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[293]
+	mi := &file_litevirt_v1_service_proto_msgTypes[295]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19789,7 +19924,7 @@ func (x *GetStoragePoolRequest) String() string {
 func (*GetStoragePoolRequest) ProtoMessage() {}
 
 func (x *GetStoragePoolRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[293]
+	mi := &file_litevirt_v1_service_proto_msgTypes[295]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19802,7 +19937,7 @@ func (x *GetStoragePoolRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetStoragePoolRequest.ProtoReflect.Descriptor instead.
 func (*GetStoragePoolRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{293}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{295}
 }
 
 func (x *GetStoragePoolRequest) GetName() string {
@@ -19828,7 +19963,7 @@ type GetStoragePoolResponse struct {
 
 func (x *GetStoragePoolResponse) Reset() {
 	*x = GetStoragePoolResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[294]
+	mi := &file_litevirt_v1_service_proto_msgTypes[296]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19840,7 +19975,7 @@ func (x *GetStoragePoolResponse) String() string {
 func (*GetStoragePoolResponse) ProtoMessage() {}
 
 func (x *GetStoragePoolResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[294]
+	mi := &file_litevirt_v1_service_proto_msgTypes[296]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19853,7 +19988,7 @@ func (x *GetStoragePoolResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetStoragePoolResponse.ProtoReflect.Descriptor instead.
 func (*GetStoragePoolResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{294}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{296}
 }
 
 func (x *GetStoragePoolResponse) GetPool() *StoragePool {
@@ -19884,7 +20019,7 @@ type StoragePoolContent struct {
 
 func (x *StoragePoolContent) Reset() {
 	*x = StoragePoolContent{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[295]
+	mi := &file_litevirt_v1_service_proto_msgTypes[297]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19896,7 +20031,7 @@ func (x *StoragePoolContent) String() string {
 func (*StoragePoolContent) ProtoMessage() {}
 
 func (x *StoragePoolContent) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[295]
+	mi := &file_litevirt_v1_service_proto_msgTypes[297]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19909,7 +20044,7 @@ func (x *StoragePoolContent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StoragePoolContent.ProtoReflect.Descriptor instead.
 func (*StoragePoolContent) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{295}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{297}
 }
 
 func (x *StoragePoolContent) GetName() string {
@@ -19978,7 +20113,7 @@ type ListStoragePoolContentsRequest struct {
 
 func (x *ListStoragePoolContentsRequest) Reset() {
 	*x = ListStoragePoolContentsRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[296]
+	mi := &file_litevirt_v1_service_proto_msgTypes[298]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19990,7 +20125,7 @@ func (x *ListStoragePoolContentsRequest) String() string {
 func (*ListStoragePoolContentsRequest) ProtoMessage() {}
 
 func (x *ListStoragePoolContentsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[296]
+	mi := &file_litevirt_v1_service_proto_msgTypes[298]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20003,7 +20138,7 @@ func (x *ListStoragePoolContentsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListStoragePoolContentsRequest.ProtoReflect.Descriptor instead.
 func (*ListStoragePoolContentsRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{296}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{298}
 }
 
 func (x *ListStoragePoolContentsRequest) GetPoolName() string {
@@ -20029,7 +20164,7 @@ type ListStoragePoolContentsResponse struct {
 
 func (x *ListStoragePoolContentsResponse) Reset() {
 	*x = ListStoragePoolContentsResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[297]
+	mi := &file_litevirt_v1_service_proto_msgTypes[299]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20041,7 +20176,7 @@ func (x *ListStoragePoolContentsResponse) String() string {
 func (*ListStoragePoolContentsResponse) ProtoMessage() {}
 
 func (x *ListStoragePoolContentsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[297]
+	mi := &file_litevirt_v1_service_proto_msgTypes[299]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20054,7 +20189,7 @@ func (x *ListStoragePoolContentsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListStoragePoolContentsResponse.ProtoReflect.Descriptor instead.
 func (*ListStoragePoolContentsResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{297}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{299}
 }
 
 func (x *ListStoragePoolContentsResponse) GetContents() []*StoragePoolContent {
@@ -20078,7 +20213,7 @@ type UploadStoragePoolContentRequest struct {
 
 func (x *UploadStoragePoolContentRequest) Reset() {
 	*x = UploadStoragePoolContentRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[298]
+	mi := &file_litevirt_v1_service_proto_msgTypes[300]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20090,7 +20225,7 @@ func (x *UploadStoragePoolContentRequest) String() string {
 func (*UploadStoragePoolContentRequest) ProtoMessage() {}
 
 func (x *UploadStoragePoolContentRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[298]
+	mi := &file_litevirt_v1_service_proto_msgTypes[300]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20103,7 +20238,7 @@ func (x *UploadStoragePoolContentRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UploadStoragePoolContentRequest.ProtoReflect.Descriptor instead.
 func (*UploadStoragePoolContentRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{298}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{300}
 }
 
 func (x *UploadStoragePoolContentRequest) GetPoolName() string {
@@ -20144,7 +20279,7 @@ type UploadStoragePoolContentResponse struct {
 
 func (x *UploadStoragePoolContentResponse) Reset() {
 	*x = UploadStoragePoolContentResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[299]
+	mi := &file_litevirt_v1_service_proto_msgTypes[301]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20156,7 +20291,7 @@ func (x *UploadStoragePoolContentResponse) String() string {
 func (*UploadStoragePoolContentResponse) ProtoMessage() {}
 
 func (x *UploadStoragePoolContentResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[299]
+	mi := &file_litevirt_v1_service_proto_msgTypes[301]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20169,7 +20304,7 @@ func (x *UploadStoragePoolContentResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UploadStoragePoolContentResponse.ProtoReflect.Descriptor instead.
 func (*UploadStoragePoolContentResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{299}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{301}
 }
 
 func (x *UploadStoragePoolContentResponse) GetPath() string {
@@ -20204,7 +20339,7 @@ type PushReplicaRequest struct {
 
 func (x *PushReplicaRequest) Reset() {
 	*x = PushReplicaRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[300]
+	mi := &file_litevirt_v1_service_proto_msgTypes[302]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20216,7 +20351,7 @@ func (x *PushReplicaRequest) String() string {
 func (*PushReplicaRequest) ProtoMessage() {}
 
 func (x *PushReplicaRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[300]
+	mi := &file_litevirt_v1_service_proto_msgTypes[302]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20229,7 +20364,7 @@ func (x *PushReplicaRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PushReplicaRequest.ProtoReflect.Descriptor instead.
 func (*PushReplicaRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{300}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{302}
 }
 
 func (x *PushReplicaRequest) GetPoolName() string {
@@ -20270,7 +20405,7 @@ type PushReplicaResponse struct {
 
 func (x *PushReplicaResponse) Reset() {
 	*x = PushReplicaResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[301]
+	mi := &file_litevirt_v1_service_proto_msgTypes[303]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20282,7 +20417,7 @@ func (x *PushReplicaResponse) String() string {
 func (*PushReplicaResponse) ProtoMessage() {}
 
 func (x *PushReplicaResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[301]
+	mi := &file_litevirt_v1_service_proto_msgTypes[303]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20295,7 +20430,7 @@ func (x *PushReplicaResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PushReplicaResponse.ProtoReflect.Descriptor instead.
 func (*PushReplicaResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{301}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{303}
 }
 
 func (x *PushReplicaResponse) GetPath() string {
@@ -20331,7 +20466,7 @@ type DeleteStoragePoolContentRequest struct {
 
 func (x *DeleteStoragePoolContentRequest) Reset() {
 	*x = DeleteStoragePoolContentRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[302]
+	mi := &file_litevirt_v1_service_proto_msgTypes[304]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20343,7 +20478,7 @@ func (x *DeleteStoragePoolContentRequest) String() string {
 func (*DeleteStoragePoolContentRequest) ProtoMessage() {}
 
 func (x *DeleteStoragePoolContentRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[302]
+	mi := &file_litevirt_v1_service_proto_msgTypes[304]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20356,7 +20491,7 @@ func (x *DeleteStoragePoolContentRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteStoragePoolContentRequest.ProtoReflect.Descriptor instead.
 func (*DeleteStoragePoolContentRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{302}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{304}
 }
 
 func (x *DeleteStoragePoolContentRequest) GetPoolName() string {
@@ -20406,7 +20541,7 @@ type ISOEntry struct {
 
 func (x *ISOEntry) Reset() {
 	*x = ISOEntry{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[303]
+	mi := &file_litevirt_v1_service_proto_msgTypes[305]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20418,7 +20553,7 @@ func (x *ISOEntry) String() string {
 func (*ISOEntry) ProtoMessage() {}
 
 func (x *ISOEntry) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[303]
+	mi := &file_litevirt_v1_service_proto_msgTypes[305]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20431,7 +20566,7 @@ func (x *ISOEntry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ISOEntry.ProtoReflect.Descriptor instead.
 func (*ISOEntry) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{303}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{305}
 }
 
 func (x *ISOEntry) GetRef() string {
@@ -20493,7 +20628,7 @@ type ListISOsRequest struct {
 
 func (x *ListISOsRequest) Reset() {
 	*x = ListISOsRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[304]
+	mi := &file_litevirt_v1_service_proto_msgTypes[306]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20505,7 +20640,7 @@ func (x *ListISOsRequest) String() string {
 func (*ListISOsRequest) ProtoMessage() {}
 
 func (x *ListISOsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[304]
+	mi := &file_litevirt_v1_service_proto_msgTypes[306]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20518,7 +20653,7 @@ func (x *ListISOsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListISOsRequest.ProtoReflect.Descriptor instead.
 func (*ListISOsRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{304}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{306}
 }
 
 func (x *ListISOsRequest) GetHost() string {
@@ -20544,7 +20679,7 @@ type ListISOsResponse struct {
 
 func (x *ListISOsResponse) Reset() {
 	*x = ListISOsResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[305]
+	mi := &file_litevirt_v1_service_proto_msgTypes[307]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20556,7 +20691,7 @@ func (x *ListISOsResponse) String() string {
 func (*ListISOsResponse) ProtoMessage() {}
 
 func (x *ListISOsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[305]
+	mi := &file_litevirt_v1_service_proto_msgTypes[307]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20569,7 +20704,7 @@ func (x *ListISOsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListISOsResponse.ProtoReflect.Descriptor instead.
 func (*ListISOsResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{305}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{307}
 }
 
 func (x *ListISOsResponse) GetIsos() []*ISOEntry {
@@ -20592,7 +20727,7 @@ type PullISORequest struct {
 
 func (x *PullISORequest) Reset() {
 	*x = PullISORequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[306]
+	mi := &file_litevirt_v1_service_proto_msgTypes[308]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20604,7 +20739,7 @@ func (x *PullISORequest) String() string {
 func (*PullISORequest) ProtoMessage() {}
 
 func (x *PullISORequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[306]
+	mi := &file_litevirt_v1_service_proto_msgTypes[308]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20617,7 +20752,7 @@ func (x *PullISORequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PullISORequest.ProtoReflect.Descriptor instead.
 func (*PullISORequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{306}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{308}
 }
 
 func (x *PullISORequest) GetRef() string {
@@ -20666,7 +20801,7 @@ type PullISOResponse struct {
 
 func (x *PullISOResponse) Reset() {
 	*x = PullISOResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[307]
+	mi := &file_litevirt_v1_service_proto_msgTypes[309]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20678,7 +20813,7 @@ func (x *PullISOResponse) String() string {
 func (*PullISOResponse) ProtoMessage() {}
 
 func (x *PullISOResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[307]
+	mi := &file_litevirt_v1_service_proto_msgTypes[309]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20691,7 +20826,7 @@ func (x *PullISOResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PullISOResponse.ProtoReflect.Descriptor instead.
 func (*PullISOResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{307}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{309}
 }
 
 func (x *PullISOResponse) GetRef() string {
@@ -20727,7 +20862,7 @@ type ISOLibraryMode struct {
 
 func (x *ISOLibraryMode) Reset() {
 	*x = ISOLibraryMode{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[308]
+	mi := &file_litevirt_v1_service_proto_msgTypes[310]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20739,7 +20874,7 @@ func (x *ISOLibraryMode) String() string {
 func (*ISOLibraryMode) ProtoMessage() {}
 
 func (x *ISOLibraryMode) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[308]
+	mi := &file_litevirt_v1_service_proto_msgTypes[310]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20752,7 +20887,7 @@ func (x *ISOLibraryMode) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ISOLibraryMode.ProtoReflect.Descriptor instead.
 func (*ISOLibraryMode) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{308}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{310}
 }
 
 func (x *ISOLibraryMode) GetMode() string {
@@ -20792,7 +20927,7 @@ type SetISOLibraryModeRequest struct {
 
 func (x *SetISOLibraryModeRequest) Reset() {
 	*x = SetISOLibraryModeRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[309]
+	mi := &file_litevirt_v1_service_proto_msgTypes[311]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20804,7 +20939,7 @@ func (x *SetISOLibraryModeRequest) String() string {
 func (*SetISOLibraryModeRequest) ProtoMessage() {}
 
 func (x *SetISOLibraryModeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[309]
+	mi := &file_litevirt_v1_service_proto_msgTypes[311]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20817,7 +20952,7 @@ func (x *SetISOLibraryModeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetISOLibraryModeRequest.ProtoReflect.Descriptor instead.
 func (*SetISOLibraryModeRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{309}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{311}
 }
 
 func (x *SetISOLibraryModeRequest) GetMode() string {
@@ -20837,7 +20972,7 @@ type FetchISOLibraryFileRequest struct {
 
 func (x *FetchISOLibraryFileRequest) Reset() {
 	*x = FetchISOLibraryFileRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[310]
+	mi := &file_litevirt_v1_service_proto_msgTypes[312]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20849,7 +20984,7 @@ func (x *FetchISOLibraryFileRequest) String() string {
 func (*FetchISOLibraryFileRequest) ProtoMessage() {}
 
 func (x *FetchISOLibraryFileRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[310]
+	mi := &file_litevirt_v1_service_proto_msgTypes[312]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20862,7 +20997,7 @@ func (x *FetchISOLibraryFileRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FetchISOLibraryFileRequest.ProtoReflect.Descriptor instead.
 func (*FetchISOLibraryFileRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{310}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{312}
 }
 
 func (x *FetchISOLibraryFileRequest) GetName() string {
@@ -20888,7 +21023,7 @@ type FetchISOLibraryFileChunk struct {
 
 func (x *FetchISOLibraryFileChunk) Reset() {
 	*x = FetchISOLibraryFileChunk{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[311]
+	mi := &file_litevirt_v1_service_proto_msgTypes[313]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20900,7 +21035,7 @@ func (x *FetchISOLibraryFileChunk) String() string {
 func (*FetchISOLibraryFileChunk) ProtoMessage() {}
 
 func (x *FetchISOLibraryFileChunk) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[311]
+	mi := &file_litevirt_v1_service_proto_msgTypes[313]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20913,7 +21048,7 @@ func (x *FetchISOLibraryFileChunk) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FetchISOLibraryFileChunk.ProtoReflect.Descriptor instead.
 func (*FetchISOLibraryFileChunk) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{311}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{313}
 }
 
 func (x *FetchISOLibraryFileChunk) GetChunk() []byte {
@@ -20946,7 +21081,7 @@ type PushReplicaIncrementRequest struct {
 
 func (x *PushReplicaIncrementRequest) Reset() {
 	*x = PushReplicaIncrementRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[312]
+	mi := &file_litevirt_v1_service_proto_msgTypes[314]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20958,7 +21093,7 @@ func (x *PushReplicaIncrementRequest) String() string {
 func (*PushReplicaIncrementRequest) ProtoMessage() {}
 
 func (x *PushReplicaIncrementRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[312]
+	mi := &file_litevirt_v1_service_proto_msgTypes[314]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20971,7 +21106,7 @@ func (x *PushReplicaIncrementRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PushReplicaIncrementRequest.ProtoReflect.Descriptor instead.
 func (*PushReplicaIncrementRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{312}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{314}
 }
 
 func (x *PushReplicaIncrementRequest) GetPoolName() string {
@@ -21041,7 +21176,7 @@ type PushReplicaIncrementResponse struct {
 
 func (x *PushReplicaIncrementResponse) Reset() {
 	*x = PushReplicaIncrementResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[313]
+	mi := &file_litevirt_v1_service_proto_msgTypes[315]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21053,7 +21188,7 @@ func (x *PushReplicaIncrementResponse) String() string {
 func (*PushReplicaIncrementResponse) ProtoMessage() {}
 
 func (x *PushReplicaIncrementResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[313]
+	mi := &file_litevirt_v1_service_proto_msgTypes[315]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21066,7 +21201,7 @@ func (x *PushReplicaIncrementResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PushReplicaIncrementResponse.ProtoReflect.Descriptor instead.
 func (*PushReplicaIncrementResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{313}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{315}
 }
 
 func (x *PushReplicaIncrementResponse) GetPath() string {
@@ -21112,7 +21247,7 @@ type ReplicaRecord struct {
 
 func (x *ReplicaRecord) Reset() {
 	*x = ReplicaRecord{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[314]
+	mi := &file_litevirt_v1_service_proto_msgTypes[316]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21124,7 +21259,7 @@ func (x *ReplicaRecord) String() string {
 func (*ReplicaRecord) ProtoMessage() {}
 
 func (x *ReplicaRecord) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[314]
+	mi := &file_litevirt_v1_service_proto_msgTypes[316]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21137,7 +21272,7 @@ func (x *ReplicaRecord) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReplicaRecord.ProtoReflect.Descriptor instead.
 func (*ReplicaRecord) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{314}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{316}
 }
 
 func (x *ReplicaRecord) GetProject() string {
@@ -21209,7 +21344,7 @@ type ListReplicasRequest struct {
 
 func (x *ListReplicasRequest) Reset() {
 	*x = ListReplicasRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[315]
+	mi := &file_litevirt_v1_service_proto_msgTypes[317]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21221,7 +21356,7 @@ func (x *ListReplicasRequest) String() string {
 func (*ListReplicasRequest) ProtoMessage() {}
 
 func (x *ListReplicasRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[315]
+	mi := &file_litevirt_v1_service_proto_msgTypes[317]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21234,7 +21369,7 @@ func (x *ListReplicasRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListReplicasRequest.ProtoReflect.Descriptor instead.
 func (*ListReplicasRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{315}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{317}
 }
 
 func (x *ListReplicasRequest) GetPoolName() string {
@@ -21274,7 +21409,7 @@ type ListReplicasResponse struct {
 
 func (x *ListReplicasResponse) Reset() {
 	*x = ListReplicasResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[316]
+	mi := &file_litevirt_v1_service_proto_msgTypes[318]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21286,7 +21421,7 @@ func (x *ListReplicasResponse) String() string {
 func (*ListReplicasResponse) ProtoMessage() {}
 
 func (x *ListReplicasResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[316]
+	mi := &file_litevirt_v1_service_proto_msgTypes[318]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21299,7 +21434,7 @@ func (x *ListReplicasResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListReplicasResponse.ProtoReflect.Descriptor instead.
 func (*ListReplicasResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{316}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{318}
 }
 
 func (x *ListReplicasResponse) GetReplicas() []*ReplicaRecord {
@@ -21326,7 +21461,7 @@ type PruneReplicasRequest struct {
 
 func (x *PruneReplicasRequest) Reset() {
 	*x = PruneReplicasRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[317]
+	mi := &file_litevirt_v1_service_proto_msgTypes[319]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21338,7 +21473,7 @@ func (x *PruneReplicasRequest) String() string {
 func (*PruneReplicasRequest) ProtoMessage() {}
 
 func (x *PruneReplicasRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[317]
+	mi := &file_litevirt_v1_service_proto_msgTypes[319]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21351,7 +21486,7 @@ func (x *PruneReplicasRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PruneReplicasRequest.ProtoReflect.Descriptor instead.
 func (*PruneReplicasRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{317}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{319}
 }
 
 func (x *PruneReplicasRequest) GetPoolName() string {
@@ -21412,7 +21547,7 @@ type PruneReplicasResponse struct {
 
 func (x *PruneReplicasResponse) Reset() {
 	*x = PruneReplicasResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[318]
+	mi := &file_litevirt_v1_service_proto_msgTypes[320]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21424,7 +21559,7 @@ func (x *PruneReplicasResponse) String() string {
 func (*PruneReplicasResponse) ProtoMessage() {}
 
 func (x *PruneReplicasResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[318]
+	mi := &file_litevirt_v1_service_proto_msgTypes[320]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21437,7 +21572,7 @@ func (x *PruneReplicasResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PruneReplicasResponse.ProtoReflect.Descriptor instead.
 func (*PruneReplicasResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{318}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{320}
 }
 
 func (x *PruneReplicasResponse) GetDeleted() int32 {
@@ -21518,7 +21653,7 @@ type RuntimeActionProof struct {
 
 func (x *RuntimeActionProof) Reset() {
 	*x = RuntimeActionProof{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[319]
+	mi := &file_litevirt_v1_service_proto_msgTypes[321]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21530,7 +21665,7 @@ func (x *RuntimeActionProof) String() string {
 func (*RuntimeActionProof) ProtoMessage() {}
 
 func (x *RuntimeActionProof) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[319]
+	mi := &file_litevirt_v1_service_proto_msgTypes[321]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21543,7 +21678,7 @@ func (x *RuntimeActionProof) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RuntimeActionProof.ProtoReflect.Descriptor instead.
 func (*RuntimeActionProof) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{319}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{321}
 }
 
 func (x *RuntimeActionProof) GetId() string {
@@ -21668,7 +21803,7 @@ type AcknowledgeLeaseTermTieRequest struct {
 
 func (x *AcknowledgeLeaseTermTieRequest) Reset() {
 	*x = AcknowledgeLeaseTermTieRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[320]
+	mi := &file_litevirt_v1_service_proto_msgTypes[322]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21680,7 +21815,7 @@ func (x *AcknowledgeLeaseTermTieRequest) String() string {
 func (*AcknowledgeLeaseTermTieRequest) ProtoMessage() {}
 
 func (x *AcknowledgeLeaseTermTieRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[320]
+	mi := &file_litevirt_v1_service_proto_msgTypes[322]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21693,7 +21828,7 @@ func (x *AcknowledgeLeaseTermTieRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AcknowledgeLeaseTermTieRequest.ProtoReflect.Descriptor instead.
 func (*AcknowledgeLeaseTermTieRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{320}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{322}
 }
 
 func (x *AcknowledgeLeaseTermTieRequest) GetKey() string {
@@ -21722,7 +21857,7 @@ type AcknowledgeLeaseTermTieResponse struct {
 
 func (x *AcknowledgeLeaseTermTieResponse) Reset() {
 	*x = AcknowledgeLeaseTermTieResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[321]
+	mi := &file_litevirt_v1_service_proto_msgTypes[323]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21734,7 +21869,7 @@ func (x *AcknowledgeLeaseTermTieResponse) String() string {
 func (*AcknowledgeLeaseTermTieResponse) ProtoMessage() {}
 
 func (x *AcknowledgeLeaseTermTieResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[321]
+	mi := &file_litevirt_v1_service_proto_msgTypes[323]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21747,7 +21882,7 @@ func (x *AcknowledgeLeaseTermTieResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AcknowledgeLeaseTermTieResponse.ProtoReflect.Descriptor instead.
 func (*AcknowledgeLeaseTermTieResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{321}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{323}
 }
 
 func (x *AcknowledgeLeaseTermTieResponse) GetAcknowledged() bool {
@@ -21770,7 +21905,7 @@ type GetLeaseTermHighWaterRequest struct {
 
 func (x *GetLeaseTermHighWaterRequest) Reset() {
 	*x = GetLeaseTermHighWaterRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[322]
+	mi := &file_litevirt_v1_service_proto_msgTypes[324]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21782,7 +21917,7 @@ func (x *GetLeaseTermHighWaterRequest) String() string {
 func (*GetLeaseTermHighWaterRequest) ProtoMessage() {}
 
 func (x *GetLeaseTermHighWaterRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[322]
+	mi := &file_litevirt_v1_service_proto_msgTypes[324]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21795,7 +21930,7 @@ func (x *GetLeaseTermHighWaterRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetLeaseTermHighWaterRequest.ProtoReflect.Descriptor instead.
 func (*GetLeaseTermHighWaterRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{322}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{324}
 }
 
 func (x *GetLeaseTermHighWaterRequest) GetKey() string {
@@ -21832,7 +21967,7 @@ type GetLeaseTermHighWaterResponse struct {
 
 func (x *GetLeaseTermHighWaterResponse) Reset() {
 	*x = GetLeaseTermHighWaterResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[323]
+	mi := &file_litevirt_v1_service_proto_msgTypes[325]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21844,7 +21979,7 @@ func (x *GetLeaseTermHighWaterResponse) String() string {
 func (*GetLeaseTermHighWaterResponse) ProtoMessage() {}
 
 func (x *GetLeaseTermHighWaterResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[323]
+	mi := &file_litevirt_v1_service_proto_msgTypes[325]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21857,7 +21992,7 @@ func (x *GetLeaseTermHighWaterResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetLeaseTermHighWaterResponse.ProtoReflect.Descriptor instead.
 func (*GetLeaseTermHighWaterResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{323}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{325}
 }
 
 func (x *GetLeaseTermHighWaterResponse) GetKey() string {
@@ -21912,7 +22047,7 @@ type RecoveryClaimKey struct {
 
 func (x *RecoveryClaimKey) Reset() {
 	*x = RecoveryClaimKey{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[324]
+	mi := &file_litevirt_v1_service_proto_msgTypes[326]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21924,7 +22059,7 @@ func (x *RecoveryClaimKey) String() string {
 func (*RecoveryClaimKey) ProtoMessage() {}
 
 func (x *RecoveryClaimKey) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[324]
+	mi := &file_litevirt_v1_service_proto_msgTypes[326]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21937,7 +22072,7 @@ func (x *RecoveryClaimKey) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RecoveryClaimKey.ProtoReflect.Descriptor instead.
 func (*RecoveryClaimKey) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{324}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{326}
 }
 
 func (x *RecoveryClaimKey) GetTargetKind() string {
@@ -21986,7 +22121,7 @@ type ClaimBallot struct {
 
 func (x *ClaimBallot) Reset() {
 	*x = ClaimBallot{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[325]
+	mi := &file_litevirt_v1_service_proto_msgTypes[327]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21998,7 +22133,7 @@ func (x *ClaimBallot) String() string {
 func (*ClaimBallot) ProtoMessage() {}
 
 func (x *ClaimBallot) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[325]
+	mi := &file_litevirt_v1_service_proto_msgTypes[327]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -22011,7 +22146,7 @@ func (x *ClaimBallot) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ClaimBallot.ProtoReflect.Descriptor instead.
 func (*ClaimBallot) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{325}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{327}
 }
 
 func (x *ClaimBallot) GetRound() uint64 {
@@ -22045,7 +22180,7 @@ type ClaimVoterMember struct {
 
 func (x *ClaimVoterMember) Reset() {
 	*x = ClaimVoterMember{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[326]
+	mi := &file_litevirt_v1_service_proto_msgTypes[328]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -22057,7 +22192,7 @@ func (x *ClaimVoterMember) String() string {
 func (*ClaimVoterMember) ProtoMessage() {}
 
 func (x *ClaimVoterMember) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[326]
+	mi := &file_litevirt_v1_service_proto_msgTypes[328]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -22070,7 +22205,7 @@ func (x *ClaimVoterMember) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ClaimVoterMember.ProtoReflect.Descriptor instead.
 func (*ClaimVoterMember) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{326}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{328}
 }
 
 func (x *ClaimVoterMember) GetName() string {
@@ -22102,7 +22237,7 @@ type VoterConfigValue struct {
 
 func (x *VoterConfigValue) Reset() {
 	*x = VoterConfigValue{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[327]
+	mi := &file_litevirt_v1_service_proto_msgTypes[329]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -22114,7 +22249,7 @@ func (x *VoterConfigValue) String() string {
 func (*VoterConfigValue) ProtoMessage() {}
 
 func (x *VoterConfigValue) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[327]
+	mi := &file_litevirt_v1_service_proto_msgTypes[329]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -22127,7 +22262,7 @@ func (x *VoterConfigValue) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VoterConfigValue.ProtoReflect.Descriptor instead.
 func (*VoterConfigValue) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{327}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{329}
 }
 
 func (x *VoterConfigValue) GetGeneration() int64 {
@@ -22188,7 +22323,7 @@ type RecoveryClaimValue struct {
 
 func (x *RecoveryClaimValue) Reset() {
 	*x = RecoveryClaimValue{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[328]
+	mi := &file_litevirt_v1_service_proto_msgTypes[330]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -22200,7 +22335,7 @@ func (x *RecoveryClaimValue) String() string {
 func (*RecoveryClaimValue) ProtoMessage() {}
 
 func (x *RecoveryClaimValue) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[328]
+	mi := &file_litevirt_v1_service_proto_msgTypes[330]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -22213,7 +22348,7 @@ func (x *RecoveryClaimValue) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RecoveryClaimValue.ProtoReflect.Descriptor instead.
 func (*RecoveryClaimValue) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{328}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{330}
 }
 
 func (x *RecoveryClaimValue) GetId() string {
@@ -22324,7 +22459,7 @@ type ClaimAccept struct {
 
 func (x *ClaimAccept) Reset() {
 	*x = ClaimAccept{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[329]
+	mi := &file_litevirt_v1_service_proto_msgTypes[331]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -22336,7 +22471,7 @@ func (x *ClaimAccept) String() string {
 func (*ClaimAccept) ProtoMessage() {}
 
 func (x *ClaimAccept) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[329]
+	mi := &file_litevirt_v1_service_proto_msgTypes[331]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -22349,7 +22484,7 @@ func (x *ClaimAccept) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ClaimAccept.ProtoReflect.Descriptor instead.
 func (*ClaimAccept) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{329}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{331}
 }
 
 func (x *ClaimAccept) GetVoter() string {
@@ -22422,7 +22557,7 @@ type PrepareRecoveryClaimRequest struct {
 
 func (x *PrepareRecoveryClaimRequest) Reset() {
 	*x = PrepareRecoveryClaimRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[330]
+	mi := &file_litevirt_v1_service_proto_msgTypes[332]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -22434,7 +22569,7 @@ func (x *PrepareRecoveryClaimRequest) String() string {
 func (*PrepareRecoveryClaimRequest) ProtoMessage() {}
 
 func (x *PrepareRecoveryClaimRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[330]
+	mi := &file_litevirt_v1_service_proto_msgTypes[332]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -22447,7 +22582,7 @@ func (x *PrepareRecoveryClaimRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PrepareRecoveryClaimRequest.ProtoReflect.Descriptor instead.
 func (*PrepareRecoveryClaimRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{330}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{332}
 }
 
 func (x *PrepareRecoveryClaimRequest) GetKey() *RecoveryClaimKey {
@@ -22490,7 +22625,7 @@ type RecoveryClaimSupersede struct {
 
 func (x *RecoveryClaimSupersede) Reset() {
 	*x = RecoveryClaimSupersede{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[331]
+	mi := &file_litevirt_v1_service_proto_msgTypes[333]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -22502,7 +22637,7 @@ func (x *RecoveryClaimSupersede) String() string {
 func (*RecoveryClaimSupersede) ProtoMessage() {}
 
 func (x *RecoveryClaimSupersede) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[331]
+	mi := &file_litevirt_v1_service_proto_msgTypes[333]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -22515,7 +22650,7 @@ func (x *RecoveryClaimSupersede) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RecoveryClaimSupersede.ProtoReflect.Descriptor instead.
 func (*RecoveryClaimSupersede) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{331}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{333}
 }
 
 func (x *RecoveryClaimSupersede) GetPriorCertificate() string {
@@ -22565,7 +22700,7 @@ type AbandonRecoveryProofRequest struct {
 
 func (x *AbandonRecoveryProofRequest) Reset() {
 	*x = AbandonRecoveryProofRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[332]
+	mi := &file_litevirt_v1_service_proto_msgTypes[334]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -22577,7 +22712,7 @@ func (x *AbandonRecoveryProofRequest) String() string {
 func (*AbandonRecoveryProofRequest) ProtoMessage() {}
 
 func (x *AbandonRecoveryProofRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[332]
+	mi := &file_litevirt_v1_service_proto_msgTypes[334]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -22590,7 +22725,7 @@ func (x *AbandonRecoveryProofRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AbandonRecoveryProofRequest.ProtoReflect.Descriptor instead.
 func (*AbandonRecoveryProofRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{332}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{334}
 }
 
 func (x *AbandonRecoveryProofRequest) GetKey() *RecoveryClaimKey {
@@ -22642,7 +22777,7 @@ type ReleaseLegacyHeldClaimRequest struct {
 
 func (x *ReleaseLegacyHeldClaimRequest) Reset() {
 	*x = ReleaseLegacyHeldClaimRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[333]
+	mi := &file_litevirt_v1_service_proto_msgTypes[335]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -22654,7 +22789,7 @@ func (x *ReleaseLegacyHeldClaimRequest) String() string {
 func (*ReleaseLegacyHeldClaimRequest) ProtoMessage() {}
 
 func (x *ReleaseLegacyHeldClaimRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[333]
+	mi := &file_litevirt_v1_service_proto_msgTypes[335]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -22667,7 +22802,7 @@ func (x *ReleaseLegacyHeldClaimRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReleaseLegacyHeldClaimRequest.ProtoReflect.Descriptor instead.
 func (*ReleaseLegacyHeldClaimRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{333}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{335}
 }
 
 func (x *ReleaseLegacyHeldClaimRequest) GetKind() string {
@@ -22696,7 +22831,7 @@ type ReleaseLegacyHeldClaimResponse struct {
 
 func (x *ReleaseLegacyHeldClaimResponse) Reset() {
 	*x = ReleaseLegacyHeldClaimResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[334]
+	mi := &file_litevirt_v1_service_proto_msgTypes[336]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -22708,7 +22843,7 @@ func (x *ReleaseLegacyHeldClaimResponse) String() string {
 func (*ReleaseLegacyHeldClaimResponse) ProtoMessage() {}
 
 func (x *ReleaseLegacyHeldClaimResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[334]
+	mi := &file_litevirt_v1_service_proto_msgTypes[336]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -22721,7 +22856,7 @@ func (x *ReleaseLegacyHeldClaimResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReleaseLegacyHeldClaimResponse.ProtoReflect.Descriptor instead.
 func (*ReleaseLegacyHeldClaimResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{334}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{336}
 }
 
 func (x *ReleaseLegacyHeldClaimResponse) GetDestHost() string {
@@ -22761,7 +22896,7 @@ type AbandonRecoveryProofResponse struct {
 
 func (x *AbandonRecoveryProofResponse) Reset() {
 	*x = AbandonRecoveryProofResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[335]
+	mi := &file_litevirt_v1_service_proto_msgTypes[337]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -22773,7 +22908,7 @@ func (x *AbandonRecoveryProofResponse) String() string {
 func (*AbandonRecoveryProofResponse) ProtoMessage() {}
 
 func (x *AbandonRecoveryProofResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[335]
+	mi := &file_litevirt_v1_service_proto_msgTypes[337]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -22786,7 +22921,7 @@ func (x *AbandonRecoveryProofResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AbandonRecoveryProofResponse.ProtoReflect.Descriptor instead.
 func (*AbandonRecoveryProofResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{335}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{337}
 }
 
 func (x *AbandonRecoveryProofResponse) GetAbandonment() string {
@@ -22807,7 +22942,7 @@ type PlanDeadHostRemovalRequest struct {
 
 func (x *PlanDeadHostRemovalRequest) Reset() {
 	*x = PlanDeadHostRemovalRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[336]
+	mi := &file_litevirt_v1_service_proto_msgTypes[338]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -22819,7 +22954,7 @@ func (x *PlanDeadHostRemovalRequest) String() string {
 func (*PlanDeadHostRemovalRequest) ProtoMessage() {}
 
 func (x *PlanDeadHostRemovalRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[336]
+	mi := &file_litevirt_v1_service_proto_msgTypes[338]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -22832,7 +22967,7 @@ func (x *PlanDeadHostRemovalRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PlanDeadHostRemovalRequest.ProtoReflect.Descriptor instead.
 func (*PlanDeadHostRemovalRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{336}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{338}
 }
 
 func (x *PlanDeadHostRemovalRequest) GetName() string {
@@ -22854,7 +22989,7 @@ type StrandedRecovery struct {
 
 func (x *StrandedRecovery) Reset() {
 	*x = StrandedRecovery{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[337]
+	mi := &file_litevirt_v1_service_proto_msgTypes[339]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -22866,7 +23001,7 @@ func (x *StrandedRecovery) String() string {
 func (*StrandedRecovery) ProtoMessage() {}
 
 func (x *StrandedRecovery) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[337]
+	mi := &file_litevirt_v1_service_proto_msgTypes[339]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -22879,7 +23014,7 @@ func (x *StrandedRecovery) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StrandedRecovery.ProtoReflect.Descriptor instead.
 func (*StrandedRecovery) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{337}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{339}
 }
 
 func (x *StrandedRecovery) GetKind() string {
@@ -22920,7 +23055,7 @@ type ForceReconfigureVotersRequest struct {
 
 func (x *ForceReconfigureVotersRequest) Reset() {
 	*x = ForceReconfigureVotersRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[338]
+	mi := &file_litevirt_v1_service_proto_msgTypes[340]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -22932,7 +23067,7 @@ func (x *ForceReconfigureVotersRequest) String() string {
 func (*ForceReconfigureVotersRequest) ProtoMessage() {}
 
 func (x *ForceReconfigureVotersRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[338]
+	mi := &file_litevirt_v1_service_proto_msgTypes[340]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -22945,7 +23080,7 @@ func (x *ForceReconfigureVotersRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ForceReconfigureVotersRequest.ProtoReflect.Descriptor instead.
 func (*ForceReconfigureVotersRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{338}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{340}
 }
 
 func (x *ForceReconfigureVotersRequest) GetLost() []string {
@@ -22975,7 +23110,7 @@ type ForcedFenceEvidence struct {
 
 func (x *ForcedFenceEvidence) Reset() {
 	*x = ForcedFenceEvidence{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[339]
+	mi := &file_litevirt_v1_service_proto_msgTypes[341]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -22987,7 +23122,7 @@ func (x *ForcedFenceEvidence) String() string {
 func (*ForcedFenceEvidence) ProtoMessage() {}
 
 func (x *ForcedFenceEvidence) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[339]
+	mi := &file_litevirt_v1_service_proto_msgTypes[341]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -23000,7 +23135,7 @@ func (x *ForcedFenceEvidence) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ForcedFenceEvidence.ProtoReflect.Descriptor instead.
 func (*ForcedFenceEvidence) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{339}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{341}
 }
 
 func (x *ForcedFenceEvidence) GetHost() string {
@@ -23054,7 +23189,7 @@ type ForceReconfigureVotersResponse struct {
 
 func (x *ForceReconfigureVotersResponse) Reset() {
 	*x = ForceReconfigureVotersResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[340]
+	mi := &file_litevirt_v1_service_proto_msgTypes[342]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -23066,7 +23201,7 @@ func (x *ForceReconfigureVotersResponse) String() string {
 func (*ForceReconfigureVotersResponse) ProtoMessage() {}
 
 func (x *ForceReconfigureVotersResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[340]
+	mi := &file_litevirt_v1_service_proto_msgTypes[342]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -23079,7 +23214,7 @@ func (x *ForceReconfigureVotersResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ForceReconfigureVotersResponse.ProtoReflect.Descriptor instead.
 func (*ForceReconfigureVotersResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{340}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{342}
 }
 
 func (x *ForceReconfigureVotersResponse) GetFromGeneration() int64 {
@@ -23150,7 +23285,7 @@ type SignForcedVoterConfigRequest struct {
 
 func (x *SignForcedVoterConfigRequest) Reset() {
 	*x = SignForcedVoterConfigRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[341]
+	mi := &file_litevirt_v1_service_proto_msgTypes[343]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -23162,7 +23297,7 @@ func (x *SignForcedVoterConfigRequest) String() string {
 func (*SignForcedVoterConfigRequest) ProtoMessage() {}
 
 func (x *SignForcedVoterConfigRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[341]
+	mi := &file_litevirt_v1_service_proto_msgTypes[343]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -23175,7 +23310,7 @@ func (x *SignForcedVoterConfigRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SignForcedVoterConfigRequest.ProtoReflect.Descriptor instead.
 func (*SignForcedVoterConfigRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{341}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{343}
 }
 
 func (x *SignForcedVoterConfigRequest) GetFromGeneration() int64 {
@@ -23218,7 +23353,7 @@ type SignForcedVoterConfigResponse struct {
 
 func (x *SignForcedVoterConfigResponse) Reset() {
 	*x = SignForcedVoterConfigResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[342]
+	mi := &file_litevirt_v1_service_proto_msgTypes[344]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -23230,7 +23365,7 @@ func (x *SignForcedVoterConfigResponse) String() string {
 func (*SignForcedVoterConfigResponse) ProtoMessage() {}
 
 func (x *SignForcedVoterConfigResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[342]
+	mi := &file_litevirt_v1_service_proto_msgTypes[344]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -23243,7 +23378,7 @@ func (x *SignForcedVoterConfigResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SignForcedVoterConfigResponse.ProtoReflect.Descriptor instead.
 func (*SignForcedVoterConfigResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{342}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{344}
 }
 
 func (x *SignForcedVoterConfigResponse) GetVoter() string {
@@ -23287,7 +23422,7 @@ type PausedWorkload struct {
 
 func (x *PausedWorkload) Reset() {
 	*x = PausedWorkload{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[343]
+	mi := &file_litevirt_v1_service_proto_msgTypes[345]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -23299,7 +23434,7 @@ func (x *PausedWorkload) String() string {
 func (*PausedWorkload) ProtoMessage() {}
 
 func (x *PausedWorkload) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[343]
+	mi := &file_litevirt_v1_service_proto_msgTypes[345]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -23312,7 +23447,7 @@ func (x *PausedWorkload) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PausedWorkload.ProtoReflect.Descriptor instead.
 func (*PausedWorkload) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{343}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{345}
 }
 
 func (x *PausedWorkload) GetKind() string {
@@ -23352,7 +23487,7 @@ type ConfirmPartitionResumeRequest struct {
 
 func (x *ConfirmPartitionResumeRequest) Reset() {
 	*x = ConfirmPartitionResumeRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[344]
+	mi := &file_litevirt_v1_service_proto_msgTypes[346]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -23364,7 +23499,7 @@ func (x *ConfirmPartitionResumeRequest) String() string {
 func (*ConfirmPartitionResumeRequest) ProtoMessage() {}
 
 func (x *ConfirmPartitionResumeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[344]
+	mi := &file_litevirt_v1_service_proto_msgTypes[346]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -23377,7 +23512,7 @@ func (x *ConfirmPartitionResumeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ConfirmPartitionResumeRequest.ProtoReflect.Descriptor instead.
 func (*ConfirmPartitionResumeRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{344}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{346}
 }
 
 func (x *ConfirmPartitionResumeRequest) GetWorkloads() []*PausedWorkload {
@@ -23406,7 +23541,7 @@ type PausedWorkloadView struct {
 
 func (x *PausedWorkloadView) Reset() {
 	*x = PausedWorkloadView{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[345]
+	mi := &file_litevirt_v1_service_proto_msgTypes[347]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -23418,7 +23553,7 @@ func (x *PausedWorkloadView) String() string {
 func (*PausedWorkloadView) ProtoMessage() {}
 
 func (x *PausedWorkloadView) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[345]
+	mi := &file_litevirt_v1_service_proto_msgTypes[347]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -23431,7 +23566,7 @@ func (x *PausedWorkloadView) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PausedWorkloadView.ProtoReflect.Descriptor instead.
 func (*PausedWorkloadView) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{345}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{347}
 }
 
 func (x *PausedWorkloadView) GetKind() string {
@@ -23494,7 +23629,7 @@ type ConfirmPartitionResumeResponse struct {
 
 func (x *ConfirmPartitionResumeResponse) Reset() {
 	*x = ConfirmPartitionResumeResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[346]
+	mi := &file_litevirt_v1_service_proto_msgTypes[348]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -23506,7 +23641,7 @@ func (x *ConfirmPartitionResumeResponse) String() string {
 func (*ConfirmPartitionResumeResponse) ProtoMessage() {}
 
 func (x *ConfirmPartitionResumeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[346]
+	mi := &file_litevirt_v1_service_proto_msgTypes[348]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -23519,7 +23654,7 @@ func (x *ConfirmPartitionResumeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ConfirmPartitionResumeResponse.ProtoReflect.Descriptor instead.
 func (*ConfirmPartitionResumeResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{346}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{348}
 }
 
 func (x *ConfirmPartitionResumeResponse) GetVoter() string {
@@ -23555,7 +23690,7 @@ type InspectRecoveryClaimRequest struct {
 
 func (x *InspectRecoveryClaimRequest) Reset() {
 	*x = InspectRecoveryClaimRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[347]
+	mi := &file_litevirt_v1_service_proto_msgTypes[349]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -23567,7 +23702,7 @@ func (x *InspectRecoveryClaimRequest) String() string {
 func (*InspectRecoveryClaimRequest) ProtoMessage() {}
 
 func (x *InspectRecoveryClaimRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[347]
+	mi := &file_litevirt_v1_service_proto_msgTypes[349]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -23580,7 +23715,7 @@ func (x *InspectRecoveryClaimRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InspectRecoveryClaimRequest.ProtoReflect.Descriptor instead.
 func (*InspectRecoveryClaimRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{347}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{349}
 }
 
 func (x *InspectRecoveryClaimRequest) GetKind() string {
@@ -23633,7 +23768,7 @@ type RecoveryClaimVoterView struct {
 
 func (x *RecoveryClaimVoterView) Reset() {
 	*x = RecoveryClaimVoterView{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[348]
+	mi := &file_litevirt_v1_service_proto_msgTypes[350]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -23645,7 +23780,7 @@ func (x *RecoveryClaimVoterView) String() string {
 func (*RecoveryClaimVoterView) ProtoMessage() {}
 
 func (x *RecoveryClaimVoterView) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[348]
+	mi := &file_litevirt_v1_service_proto_msgTypes[350]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -23658,7 +23793,7 @@ func (x *RecoveryClaimVoterView) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RecoveryClaimVoterView.ProtoReflect.Descriptor instead.
 func (*RecoveryClaimVoterView) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{348}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{350}
 }
 
 func (x *RecoveryClaimVoterView) GetVoter() string {
@@ -23771,7 +23906,7 @@ type RecoveryClaimAttemptView struct {
 
 func (x *RecoveryClaimAttemptView) Reset() {
 	*x = RecoveryClaimAttemptView{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[349]
+	mi := &file_litevirt_v1_service_proto_msgTypes[351]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -23783,7 +23918,7 @@ func (x *RecoveryClaimAttemptView) String() string {
 func (*RecoveryClaimAttemptView) ProtoMessage() {}
 
 func (x *RecoveryClaimAttemptView) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[349]
+	mi := &file_litevirt_v1_service_proto_msgTypes[351]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -23796,7 +23931,7 @@ func (x *RecoveryClaimAttemptView) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RecoveryClaimAttemptView.ProtoReflect.Descriptor instead.
 func (*RecoveryClaimAttemptView) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{349}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{351}
 }
 
 func (x *RecoveryClaimAttemptView) GetKey() *RecoveryClaimKey {
@@ -23838,7 +23973,7 @@ type InspectRecoveryClaimResponse struct {
 
 func (x *InspectRecoveryClaimResponse) Reset() {
 	*x = InspectRecoveryClaimResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[350]
+	mi := &file_litevirt_v1_service_proto_msgTypes[352]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -23850,7 +23985,7 @@ func (x *InspectRecoveryClaimResponse) String() string {
 func (*InspectRecoveryClaimResponse) ProtoMessage() {}
 
 func (x *InspectRecoveryClaimResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[350]
+	mi := &file_litevirt_v1_service_proto_msgTypes[352]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -23863,7 +23998,7 @@ func (x *InspectRecoveryClaimResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InspectRecoveryClaimResponse.ProtoReflect.Descriptor instead.
 func (*InspectRecoveryClaimResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{350}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{352}
 }
 
 func (x *InspectRecoveryClaimResponse) GetGeneration() int64 {
@@ -23903,7 +24038,7 @@ type PlanDeadHostRemovalResponse struct {
 
 func (x *PlanDeadHostRemovalResponse) Reset() {
 	*x = PlanDeadHostRemovalResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[351]
+	mi := &file_litevirt_v1_service_proto_msgTypes[353]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -23915,7 +24050,7 @@ func (x *PlanDeadHostRemovalResponse) String() string {
 func (*PlanDeadHostRemovalResponse) ProtoMessage() {}
 
 func (x *PlanDeadHostRemovalResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[351]
+	mi := &file_litevirt_v1_service_proto_msgTypes[353]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -23928,7 +24063,7 @@ func (x *PlanDeadHostRemovalResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PlanDeadHostRemovalResponse.ProtoReflect.Descriptor instead.
 func (*PlanDeadHostRemovalResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{351}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{353}
 }
 
 func (x *PlanDeadHostRemovalResponse) GetHost() string {
@@ -24010,7 +24145,7 @@ type PrepareRecoveryClaimResponse struct {
 
 func (x *PrepareRecoveryClaimResponse) Reset() {
 	*x = PrepareRecoveryClaimResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[352]
+	mi := &file_litevirt_v1_service_proto_msgTypes[354]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -24022,7 +24157,7 @@ func (x *PrepareRecoveryClaimResponse) String() string {
 func (*PrepareRecoveryClaimResponse) ProtoMessage() {}
 
 func (x *PrepareRecoveryClaimResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[352]
+	mi := &file_litevirt_v1_service_proto_msgTypes[354]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -24035,7 +24170,7 @@ func (x *PrepareRecoveryClaimResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PrepareRecoveryClaimResponse.ProtoReflect.Descriptor instead.
 func (*PrepareRecoveryClaimResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{352}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{354}
 }
 
 func (x *PrepareRecoveryClaimResponse) GetPromised() bool {
@@ -24120,7 +24255,7 @@ type AcceptRecoveryClaimRequest struct {
 
 func (x *AcceptRecoveryClaimRequest) Reset() {
 	*x = AcceptRecoveryClaimRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[353]
+	mi := &file_litevirt_v1_service_proto_msgTypes[355]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -24132,7 +24267,7 @@ func (x *AcceptRecoveryClaimRequest) String() string {
 func (*AcceptRecoveryClaimRequest) ProtoMessage() {}
 
 func (x *AcceptRecoveryClaimRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[353]
+	mi := &file_litevirt_v1_service_proto_msgTypes[355]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -24145,7 +24280,7 @@ func (x *AcceptRecoveryClaimRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AcceptRecoveryClaimRequest.ProtoReflect.Descriptor instead.
 func (*AcceptRecoveryClaimRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{353}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{355}
 }
 
 func (x *AcceptRecoveryClaimRequest) GetKey() *RecoveryClaimKey {
@@ -24190,7 +24325,7 @@ type AcceptRecoveryClaimResponse struct {
 
 func (x *AcceptRecoveryClaimResponse) Reset() {
 	*x = AcceptRecoveryClaimResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[354]
+	mi := &file_litevirt_v1_service_proto_msgTypes[356]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -24202,7 +24337,7 @@ func (x *AcceptRecoveryClaimResponse) String() string {
 func (*AcceptRecoveryClaimResponse) ProtoMessage() {}
 
 func (x *AcceptRecoveryClaimResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[354]
+	mi := &file_litevirt_v1_service_proto_msgTypes[356]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -24215,7 +24350,7 @@ func (x *AcceptRecoveryClaimResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AcceptRecoveryClaimResponse.ProtoReflect.Descriptor instead.
 func (*AcceptRecoveryClaimResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{354}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{356}
 }
 
 func (x *AcceptRecoveryClaimResponse) GetAccepted() bool {
@@ -24261,15 +24396,21 @@ func (x *AcceptRecoveryClaimResponse) GetRefusalDetail() string {
 }
 
 type GetRecoveryClaimRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Key           *RecoveryClaimKey      `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Key   *RecoveryClaimKey      `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	// reattest: for a voter_config key whose accept this voter signed with a
+	// host certificate a renewal has since replaced, also return the same
+	// accept re-signed with its current certificate (reattested). It re-signs
+	// only the accept recorded in its own durable claim state, never a value
+	// it did not accept. An older build ignores the field.
+	Reattest      bool `protobuf:"varint,2,opt,name=reattest,proto3" json:"reattest,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *GetRecoveryClaimRequest) Reset() {
 	*x = GetRecoveryClaimRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[355]
+	mi := &file_litevirt_v1_service_proto_msgTypes[357]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -24281,7 +24422,7 @@ func (x *GetRecoveryClaimRequest) String() string {
 func (*GetRecoveryClaimRequest) ProtoMessage() {}
 
 func (x *GetRecoveryClaimRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[355]
+	mi := &file_litevirt_v1_service_proto_msgTypes[357]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -24294,7 +24435,7 @@ func (x *GetRecoveryClaimRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetRecoveryClaimRequest.ProtoReflect.Descriptor instead.
 func (*GetRecoveryClaimRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{355}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{357}
 }
 
 func (x *GetRecoveryClaimRequest) GetKey() *RecoveryClaimKey {
@@ -24304,6 +24445,13 @@ func (x *GetRecoveryClaimRequest) GetKey() *RecoveryClaimKey {
 	return nil
 }
 
+func (x *GetRecoveryClaimRequest) GetReattest() bool {
+	if x != nil {
+		return x.Reattest
+	}
+	return false
+}
+
 type GetRecoveryClaimResponse struct {
 	state             protoimpl.MessageState        `protogen:"open.v1"`
 	State             *PrepareRecoveryClaimResponse `protobuf:"bytes,1,opt,name=state,proto3" json:"state,omitempty"` // promised/accepted ballot and value, voter, incarnation
@@ -24311,13 +24459,14 @@ type GetRecoveryClaimResponse struct {
 	LastRefusalReason string                        `protobuf:"bytes,3,opt,name=last_refusal_reason,json=lastRefusalReason,proto3" json:"last_refusal_reason,omitempty"` // this voter's most recent refusal for the key (memory only)
 	LastRefusalDetail string                        `protobuf:"bytes,4,opt,name=last_refusal_detail,json=lastRefusalDetail,proto3" json:"last_refusal_detail,omitempty"`
 	AdoptedGeneration int64                         `protobuf:"varint,5,opt,name=adopted_generation,json=adoptedGeneration,proto3" json:"adopted_generation,omitempty"`
+	Reattested        *ClaimAccept                  `protobuf:"bytes,6,opt,name=reattested,proto3" json:"reattested,omitempty"` // with reattest: the accept above, re-signed with the current certificate
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
 
 func (x *GetRecoveryClaimResponse) Reset() {
 	*x = GetRecoveryClaimResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[356]
+	mi := &file_litevirt_v1_service_proto_msgTypes[358]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -24329,7 +24478,7 @@ func (x *GetRecoveryClaimResponse) String() string {
 func (*GetRecoveryClaimResponse) ProtoMessage() {}
 
 func (x *GetRecoveryClaimResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[356]
+	mi := &file_litevirt_v1_service_proto_msgTypes[358]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -24342,7 +24491,7 @@ func (x *GetRecoveryClaimResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetRecoveryClaimResponse.ProtoReflect.Descriptor instead.
 func (*GetRecoveryClaimResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{356}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{358}
 }
 
 func (x *GetRecoveryClaimResponse) GetState() *PrepareRecoveryClaimResponse {
@@ -24380,6 +24529,13 @@ func (x *GetRecoveryClaimResponse) GetAdoptedGeneration() int64 {
 	return 0
 }
 
+func (x *GetRecoveryClaimResponse) GetReattested() *ClaimAccept {
+	if x != nil {
+		return x.Reattested
+	}
+	return nil
+}
+
 type ListRecoveryClaimsRequest struct {
 	state            protoimpl.MessageState `protogen:"open.v1"`
 	ConfigGeneration int64                  `protobuf:"varint,1,opt,name=config_generation,json=configGeneration,proto3" json:"config_generation,omitempty"` // the generation the importer is leaving
@@ -24389,7 +24545,7 @@ type ListRecoveryClaimsRequest struct {
 
 func (x *ListRecoveryClaimsRequest) Reset() {
 	*x = ListRecoveryClaimsRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[357]
+	mi := &file_litevirt_v1_service_proto_msgTypes[359]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -24401,7 +24557,7 @@ func (x *ListRecoveryClaimsRequest) String() string {
 func (*ListRecoveryClaimsRequest) ProtoMessage() {}
 
 func (x *ListRecoveryClaimsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[357]
+	mi := &file_litevirt_v1_service_proto_msgTypes[359]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -24414,7 +24570,7 @@ func (x *ListRecoveryClaimsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListRecoveryClaimsRequest.ProtoReflect.Descriptor instead.
 func (*ListRecoveryClaimsRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{357}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{359}
 }
 
 func (x *ListRecoveryClaimsRequest) GetConfigGeneration() int64 {
@@ -24441,7 +24597,7 @@ type RecoveryClaimState struct {
 
 func (x *RecoveryClaimState) Reset() {
 	*x = RecoveryClaimState{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[358]
+	mi := &file_litevirt_v1_service_proto_msgTypes[360]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -24453,7 +24609,7 @@ func (x *RecoveryClaimState) String() string {
 func (*RecoveryClaimState) ProtoMessage() {}
 
 func (x *RecoveryClaimState) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[358]
+	mi := &file_litevirt_v1_service_proto_msgTypes[360]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -24466,7 +24622,7 @@ func (x *RecoveryClaimState) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RecoveryClaimState.ProtoReflect.Descriptor instead.
 func (*RecoveryClaimState) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{358}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{360}
 }
 
 func (x *RecoveryClaimState) GetHeader() bool {
@@ -24540,7 +24696,7 @@ type GetVoterConfigRequest struct {
 
 func (x *GetVoterConfigRequest) Reset() {
 	*x = GetVoterConfigRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[359]
+	mi := &file_litevirt_v1_service_proto_msgTypes[361]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -24552,7 +24708,7 @@ func (x *GetVoterConfigRequest) String() string {
 func (*GetVoterConfigRequest) ProtoMessage() {}
 
 func (x *GetVoterConfigRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[359]
+	mi := &file_litevirt_v1_service_proto_msgTypes[361]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -24565,7 +24721,7 @@ func (x *GetVoterConfigRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetVoterConfigRequest.ProtoReflect.Descriptor instead.
 func (*GetVoterConfigRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{359}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{361}
 }
 
 type VoterMemberStatus struct {
@@ -24582,7 +24738,7 @@ type VoterMemberStatus struct {
 
 func (x *VoterMemberStatus) Reset() {
 	*x = VoterMemberStatus{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[360]
+	mi := &file_litevirt_v1_service_proto_msgTypes[362]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -24594,7 +24750,7 @@ func (x *VoterMemberStatus) String() string {
 func (*VoterMemberStatus) ProtoMessage() {}
 
 func (x *VoterMemberStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[360]
+	mi := &file_litevirt_v1_service_proto_msgTypes[362]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -24607,7 +24763,7 @@ func (x *VoterMemberStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VoterMemberStatus.ProtoReflect.Descriptor instead.
 func (*VoterMemberStatus) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{360}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{362}
 }
 
 func (x *VoterMemberStatus) GetName() string {
@@ -24671,7 +24827,7 @@ type GetVoterConfigResponse struct {
 
 func (x *GetVoterConfigResponse) Reset() {
 	*x = GetVoterConfigResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[361]
+	mi := &file_litevirt_v1_service_proto_msgTypes[363]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -24683,7 +24839,7 @@ func (x *GetVoterConfigResponse) String() string {
 func (*GetVoterConfigResponse) ProtoMessage() {}
 
 func (x *GetVoterConfigResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[361]
+	mi := &file_litevirt_v1_service_proto_msgTypes[363]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -24696,7 +24852,7 @@ func (x *GetVoterConfigResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetVoterConfigResponse.ProtoReflect.Descriptor instead.
 func (*GetVoterConfigResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{361}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{363}
 }
 
 func (x *GetVoterConfigResponse) GetReportingHost() string {
@@ -24788,7 +24944,7 @@ type ChangeVoterConfigRequest struct {
 
 func (x *ChangeVoterConfigRequest) Reset() {
 	*x = ChangeVoterConfigRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[362]
+	mi := &file_litevirt_v1_service_proto_msgTypes[364]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -24800,7 +24956,7 @@ func (x *ChangeVoterConfigRequest) String() string {
 func (*ChangeVoterConfigRequest) ProtoMessage() {}
 
 func (x *ChangeVoterConfigRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[362]
+	mi := &file_litevirt_v1_service_proto_msgTypes[364]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -24813,7 +24969,7 @@ func (x *ChangeVoterConfigRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChangeVoterConfigRequest.ProtoReflect.Descriptor instead.
 func (*ChangeVoterConfigRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{362}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{364}
 }
 
 func (x *ChangeVoterConfigRequest) GetOp() string {
@@ -24857,7 +25013,7 @@ type ChangeVoterConfigResponse struct {
 
 func (x *ChangeVoterConfigResponse) Reset() {
 	*x = ChangeVoterConfigResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[363]
+	mi := &file_litevirt_v1_service_proto_msgTypes[365]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -24869,7 +25025,7 @@ func (x *ChangeVoterConfigResponse) String() string {
 func (*ChangeVoterConfigResponse) ProtoMessage() {}
 
 func (x *ChangeVoterConfigResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[363]
+	mi := &file_litevirt_v1_service_proto_msgTypes[365]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -24882,7 +25038,7 @@ func (x *ChangeVoterConfigResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChangeVoterConfigResponse.ProtoReflect.Descriptor instead.
 func (*ChangeVoterConfigResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{363}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{365}
 }
 
 func (x *ChangeVoterConfigResponse) GetGeneration() int64 {
@@ -24940,7 +25096,7 @@ type PromoteReplicaRequest struct {
 
 func (x *PromoteReplicaRequest) Reset() {
 	*x = PromoteReplicaRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[364]
+	mi := &file_litevirt_v1_service_proto_msgTypes[366]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -24952,7 +25108,7 @@ func (x *PromoteReplicaRequest) String() string {
 func (*PromoteReplicaRequest) ProtoMessage() {}
 
 func (x *PromoteReplicaRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[364]
+	mi := &file_litevirt_v1_service_proto_msgTypes[366]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -24965,7 +25121,7 @@ func (x *PromoteReplicaRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PromoteReplicaRequest.ProtoReflect.Descriptor instead.
 func (*PromoteReplicaRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{364}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{366}
 }
 
 func (x *PromoteReplicaRequest) GetVmName() string {
@@ -25038,7 +25194,7 @@ type PromoteReplicaProgress struct {
 
 func (x *PromoteReplicaProgress) Reset() {
 	*x = PromoteReplicaProgress{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[365]
+	mi := &file_litevirt_v1_service_proto_msgTypes[367]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -25050,7 +25206,7 @@ func (x *PromoteReplicaProgress) String() string {
 func (*PromoteReplicaProgress) ProtoMessage() {}
 
 func (x *PromoteReplicaProgress) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[365]
+	mi := &file_litevirt_v1_service_proto_msgTypes[367]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -25063,7 +25219,7 @@ func (x *PromoteReplicaProgress) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PromoteReplicaProgress.ProtoReflect.Descriptor instead.
 func (*PromoteReplicaProgress) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{365}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{367}
 }
 
 func (x *PromoteReplicaProgress) GetPhase() PromoteReplicaProgress_Phase {
@@ -25117,7 +25273,7 @@ type PingRequest struct {
 
 func (x *PingRequest) Reset() {
 	*x = PingRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[366]
+	mi := &file_litevirt_v1_service_proto_msgTypes[368]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -25129,7 +25285,7 @@ func (x *PingRequest) String() string {
 func (*PingRequest) ProtoMessage() {}
 
 func (x *PingRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[366]
+	mi := &file_litevirt_v1_service_proto_msgTypes[368]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -25142,7 +25298,7 @@ func (x *PingRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PingRequest.ProtoReflect.Descriptor instead.
 func (*PingRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{366}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{368}
 }
 
 type PingResponse struct {
@@ -25215,7 +25371,7 @@ type PingResponse struct {
 
 func (x *PingResponse) Reset() {
 	*x = PingResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[367]
+	mi := &file_litevirt_v1_service_proto_msgTypes[369]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -25227,7 +25383,7 @@ func (x *PingResponse) String() string {
 func (*PingResponse) ProtoMessage() {}
 
 func (x *PingResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[367]
+	mi := &file_litevirt_v1_service_proto_msgTypes[369]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -25240,7 +25396,7 @@ func (x *PingResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PingResponse.ProtoReflect.Descriptor instead.
 func (*PingResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{367}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{369}
 }
 
 func (x *PingResponse) GetHostName() string {
@@ -25318,7 +25474,7 @@ type ReadyRequest struct {
 
 func (x *ReadyRequest) Reset() {
 	*x = ReadyRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[368]
+	mi := &file_litevirt_v1_service_proto_msgTypes[370]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -25330,7 +25486,7 @@ func (x *ReadyRequest) String() string {
 func (*ReadyRequest) ProtoMessage() {}
 
 func (x *ReadyRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[368]
+	mi := &file_litevirt_v1_service_proto_msgTypes[370]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -25343,7 +25499,7 @@ func (x *ReadyRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReadyRequest.ProtoReflect.Descriptor instead.
 func (*ReadyRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{368}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{370}
 }
 
 type ReadyResponse struct {
@@ -25372,7 +25528,7 @@ type ReadyResponse struct {
 
 func (x *ReadyResponse) Reset() {
 	*x = ReadyResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[369]
+	mi := &file_litevirt_v1_service_proto_msgTypes[371]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -25384,7 +25540,7 @@ func (x *ReadyResponse) String() string {
 func (*ReadyResponse) ProtoMessage() {}
 
 func (x *ReadyResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[369]
+	mi := &file_litevirt_v1_service_proto_msgTypes[371]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -25397,7 +25553,7 @@ func (x *ReadyResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReadyResponse.ProtoReflect.Descriptor instead.
 func (*ReadyResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{369}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{371}
 }
 
 func (x *ReadyResponse) GetHostName() string {
@@ -25437,7 +25593,7 @@ type FetchBinaryRequest struct {
 
 func (x *FetchBinaryRequest) Reset() {
 	*x = FetchBinaryRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[370]
+	mi := &file_litevirt_v1_service_proto_msgTypes[372]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -25449,7 +25605,7 @@ func (x *FetchBinaryRequest) String() string {
 func (*FetchBinaryRequest) ProtoMessage() {}
 
 func (x *FetchBinaryRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[370]
+	mi := &file_litevirt_v1_service_proto_msgTypes[372]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -25462,7 +25618,7 @@ func (x *FetchBinaryRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FetchBinaryRequest.ProtoReflect.Descriptor instead.
 func (*FetchBinaryRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{370}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{372}
 }
 
 type FetchBinaryChunk struct {
@@ -25477,7 +25633,7 @@ type FetchBinaryChunk struct {
 
 func (x *FetchBinaryChunk) Reset() {
 	*x = FetchBinaryChunk{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[371]
+	mi := &file_litevirt_v1_service_proto_msgTypes[373]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -25489,7 +25645,7 @@ func (x *FetchBinaryChunk) String() string {
 func (*FetchBinaryChunk) ProtoMessage() {}
 
 func (x *FetchBinaryChunk) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[371]
+	mi := &file_litevirt_v1_service_proto_msgTypes[373]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -25502,7 +25658,7 @@ func (x *FetchBinaryChunk) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FetchBinaryChunk.ProtoReflect.Descriptor instead.
 func (*FetchBinaryChunk) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{371}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{373}
 }
 
 func (x *FetchBinaryChunk) GetChunk() []byte {
@@ -25546,7 +25702,7 @@ type ProvisionNetworkRequest struct {
 
 func (x *ProvisionNetworkRequest) Reset() {
 	*x = ProvisionNetworkRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[372]
+	mi := &file_litevirt_v1_service_proto_msgTypes[374]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -25558,7 +25714,7 @@ func (x *ProvisionNetworkRequest) String() string {
 func (*ProvisionNetworkRequest) ProtoMessage() {}
 
 func (x *ProvisionNetworkRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[372]
+	mi := &file_litevirt_v1_service_proto_msgTypes[374]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -25571,7 +25727,7 @@ func (x *ProvisionNetworkRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ProvisionNetworkRequest.ProtoReflect.Descriptor instead.
 func (*ProvisionNetworkRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{372}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{374}
 }
 
 func (x *ProvisionNetworkRequest) GetName() string {
@@ -25614,7 +25770,7 @@ type EnsureCloudInitRequest struct {
 
 func (x *EnsureCloudInitRequest) Reset() {
 	*x = EnsureCloudInitRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[373]
+	mi := &file_litevirt_v1_service_proto_msgTypes[375]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -25626,7 +25782,7 @@ func (x *EnsureCloudInitRequest) String() string {
 func (*EnsureCloudInitRequest) ProtoMessage() {}
 
 func (x *EnsureCloudInitRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[373]
+	mi := &file_litevirt_v1_service_proto_msgTypes[375]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -25639,7 +25795,7 @@ func (x *EnsureCloudInitRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EnsureCloudInitRequest.ProtoReflect.Descriptor instead.
 func (*EnsureCloudInitRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{373}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{375}
 }
 
 func (x *EnsureCloudInitRequest) GetVmName() string {
@@ -25692,7 +25848,7 @@ type EnsureDisksRequest struct {
 
 func (x *EnsureDisksRequest) Reset() {
 	*x = EnsureDisksRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[374]
+	mi := &file_litevirt_v1_service_proto_msgTypes[376]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -25704,7 +25860,7 @@ func (x *EnsureDisksRequest) String() string {
 func (*EnsureDisksRequest) ProtoMessage() {}
 
 func (x *EnsureDisksRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[374]
+	mi := &file_litevirt_v1_service_proto_msgTypes[376]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -25717,7 +25873,7 @@ func (x *EnsureDisksRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EnsureDisksRequest.ProtoReflect.Descriptor instead.
 func (*EnsureDisksRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{374}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{376}
 }
 
 func (x *EnsureDisksRequest) GetVmName() string {
@@ -25779,7 +25935,7 @@ type DiskStub struct {
 
 func (x *DiskStub) Reset() {
 	*x = DiskStub{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[375]
+	mi := &file_litevirt_v1_service_proto_msgTypes[377]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -25791,7 +25947,7 @@ func (x *DiskStub) String() string {
 func (*DiskStub) ProtoMessage() {}
 
 func (x *DiskStub) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[375]
+	mi := &file_litevirt_v1_service_proto_msgTypes[377]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -25804,7 +25960,7 @@ func (x *DiskStub) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DiskStub.ProtoReflect.Descriptor instead.
 func (*DiskStub) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{375}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{377}
 }
 
 func (x *DiskStub) GetPath() string {
@@ -25849,7 +26005,7 @@ type EnsureDisksResponse struct {
 
 func (x *EnsureDisksResponse) Reset() {
 	*x = EnsureDisksResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[376]
+	mi := &file_litevirt_v1_service_proto_msgTypes[378]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -25861,7 +26017,7 @@ func (x *EnsureDisksResponse) String() string {
 func (*EnsureDisksResponse) ProtoMessage() {}
 
 func (x *EnsureDisksResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[376]
+	mi := &file_litevirt_v1_service_proto_msgTypes[378]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -25874,7 +26030,7 @@ func (x *EnsureDisksResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EnsureDisksResponse.ProtoReflect.Descriptor instead.
 func (*EnsureDisksResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{376}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{378}
 }
 
 func (x *EnsureDisksResponse) GetCreatedPaths() []string {
@@ -25925,7 +26081,7 @@ type EnsureFirmwareStateRequest struct {
 
 func (x *EnsureFirmwareStateRequest) Reset() {
 	*x = EnsureFirmwareStateRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[377]
+	mi := &file_litevirt_v1_service_proto_msgTypes[379]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -25937,7 +26093,7 @@ func (x *EnsureFirmwareStateRequest) String() string {
 func (*EnsureFirmwareStateRequest) ProtoMessage() {}
 
 func (x *EnsureFirmwareStateRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[377]
+	mi := &file_litevirt_v1_service_proto_msgTypes[379]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -25950,7 +26106,7 @@ func (x *EnsureFirmwareStateRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EnsureFirmwareStateRequest.ProtoReflect.Descriptor instead.
 func (*EnsureFirmwareStateRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{377}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{379}
 }
 
 func (x *EnsureFirmwareStateRequest) GetVmName() string {
@@ -26010,7 +26166,7 @@ type EnsureFirmwareStateResponse struct {
 
 func (x *EnsureFirmwareStateResponse) Reset() {
 	*x = EnsureFirmwareStateResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[378]
+	mi := &file_litevirt_v1_service_proto_msgTypes[380]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -26022,7 +26178,7 @@ func (x *EnsureFirmwareStateResponse) String() string {
 func (*EnsureFirmwareStateResponse) ProtoMessage() {}
 
 func (x *EnsureFirmwareStateResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[378]
+	mi := &file_litevirt_v1_service_proto_msgTypes[380]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -26035,7 +26191,7 @@ func (x *EnsureFirmwareStateResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EnsureFirmwareStateResponse.ProtoReflect.Descriptor instead.
 func (*EnsureFirmwareStateResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{378}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{380}
 }
 
 func (x *EnsureFirmwareStateResponse) GetDomainDefined() bool {
@@ -26063,7 +26219,7 @@ type RollbackFirmwareStateRequest struct {
 
 func (x *RollbackFirmwareStateRequest) Reset() {
 	*x = RollbackFirmwareStateRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[379]
+	mi := &file_litevirt_v1_service_proto_msgTypes[381]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -26075,7 +26231,7 @@ func (x *RollbackFirmwareStateRequest) String() string {
 func (*RollbackFirmwareStateRequest) ProtoMessage() {}
 
 func (x *RollbackFirmwareStateRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[379]
+	mi := &file_litevirt_v1_service_proto_msgTypes[381]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -26088,7 +26244,7 @@ func (x *RollbackFirmwareStateRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RollbackFirmwareStateRequest.ProtoReflect.Descriptor instead.
 func (*RollbackFirmwareStateRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{379}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{381}
 }
 
 func (x *RollbackFirmwareStateRequest) GetVmName() string {
@@ -26123,7 +26279,7 @@ type RollbackFirmwareStateResponse struct {
 
 func (x *RollbackFirmwareStateResponse) Reset() {
 	*x = RollbackFirmwareStateResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[380]
+	mi := &file_litevirt_v1_service_proto_msgTypes[382]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -26135,7 +26291,7 @@ func (x *RollbackFirmwareStateResponse) String() string {
 func (*RollbackFirmwareStateResponse) ProtoMessage() {}
 
 func (x *RollbackFirmwareStateResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[380]
+	mi := &file_litevirt_v1_service_proto_msgTypes[382]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -26148,7 +26304,7 @@ func (x *RollbackFirmwareStateResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RollbackFirmwareStateResponse.ProtoReflect.Descriptor instead.
 func (*RollbackFirmwareStateResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{380}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{382}
 }
 
 func (x *RollbackFirmwareStateResponse) GetRemoved() bool {
@@ -26201,7 +26357,7 @@ type ReceiveMigrationDiskRequest struct {
 
 func (x *ReceiveMigrationDiskRequest) Reset() {
 	*x = ReceiveMigrationDiskRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[381]
+	mi := &file_litevirt_v1_service_proto_msgTypes[383]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -26213,7 +26369,7 @@ func (x *ReceiveMigrationDiskRequest) String() string {
 func (*ReceiveMigrationDiskRequest) ProtoMessage() {}
 
 func (x *ReceiveMigrationDiskRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[381]
+	mi := &file_litevirt_v1_service_proto_msgTypes[383]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -26226,7 +26382,7 @@ func (x *ReceiveMigrationDiskRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReceiveMigrationDiskRequest.ProtoReflect.Descriptor instead.
 func (*ReceiveMigrationDiskRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{381}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{383}
 }
 
 func (x *ReceiveMigrationDiskRequest) GetVmName() string {
@@ -26301,7 +26457,7 @@ type ReceiveMigrationDiskResponse struct {
 
 func (x *ReceiveMigrationDiskResponse) Reset() {
 	*x = ReceiveMigrationDiskResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[382]
+	mi := &file_litevirt_v1_service_proto_msgTypes[384]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -26313,7 +26469,7 @@ func (x *ReceiveMigrationDiskResponse) String() string {
 func (*ReceiveMigrationDiskResponse) ProtoMessage() {}
 
 func (x *ReceiveMigrationDiskResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[382]
+	mi := &file_litevirt_v1_service_proto_msgTypes[384]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -26326,7 +26482,7 @@ func (x *ReceiveMigrationDiskResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReceiveMigrationDiskResponse.ProtoReflect.Descriptor instead.
 func (*ReceiveMigrationDiskResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{382}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{384}
 }
 
 func (x *ReceiveMigrationDiskResponse) GetSizeBytes() int64 {
@@ -26360,7 +26516,7 @@ type CheckCPUCompatibilityRequest struct {
 
 func (x *CheckCPUCompatibilityRequest) Reset() {
 	*x = CheckCPUCompatibilityRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[383]
+	mi := &file_litevirt_v1_service_proto_msgTypes[385]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -26372,7 +26528,7 @@ func (x *CheckCPUCompatibilityRequest) String() string {
 func (*CheckCPUCompatibilityRequest) ProtoMessage() {}
 
 func (x *CheckCPUCompatibilityRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[383]
+	mi := &file_litevirt_v1_service_proto_msgTypes[385]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -26385,7 +26541,7 @@ func (x *CheckCPUCompatibilityRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CheckCPUCompatibilityRequest.ProtoReflect.Descriptor instead.
 func (*CheckCPUCompatibilityRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{383}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{385}
 }
 
 func (x *CheckCPUCompatibilityRequest) GetCpuXml() string {
@@ -26413,7 +26569,7 @@ type CheckCPUCompatibilityResponse struct {
 
 func (x *CheckCPUCompatibilityResponse) Reset() {
 	*x = CheckCPUCompatibilityResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[384]
+	mi := &file_litevirt_v1_service_proto_msgTypes[386]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -26425,7 +26581,7 @@ func (x *CheckCPUCompatibilityResponse) String() string {
 func (*CheckCPUCompatibilityResponse) ProtoMessage() {}
 
 func (x *CheckCPUCompatibilityResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[384]
+	mi := &file_litevirt_v1_service_proto_msgTypes[386]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -26438,7 +26594,7 @@ func (x *CheckCPUCompatibilityResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CheckCPUCompatibilityResponse.ProtoReflect.Descriptor instead.
 func (*CheckCPUCompatibilityResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{384}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{386}
 }
 
 func (x *CheckCPUCompatibilityResponse) GetRunnable() bool {
@@ -26489,7 +26645,7 @@ type CleanupMigrationArtifactsRequest struct {
 
 func (x *CleanupMigrationArtifactsRequest) Reset() {
 	*x = CleanupMigrationArtifactsRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[385]
+	mi := &file_litevirt_v1_service_proto_msgTypes[387]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -26501,7 +26657,7 @@ func (x *CleanupMigrationArtifactsRequest) String() string {
 func (*CleanupMigrationArtifactsRequest) ProtoMessage() {}
 
 func (x *CleanupMigrationArtifactsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[385]
+	mi := &file_litevirt_v1_service_proto_msgTypes[387]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -26514,7 +26670,7 @@ func (x *CleanupMigrationArtifactsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CleanupMigrationArtifactsRequest.ProtoReflect.Descriptor instead.
 func (*CleanupMigrationArtifactsRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{385}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{387}
 }
 
 func (x *CleanupMigrationArtifactsRequest) GetVmName() string {
@@ -26570,7 +26726,7 @@ type SyncVTEPRequest struct {
 
 func (x *SyncVTEPRequest) Reset() {
 	*x = SyncVTEPRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[386]
+	mi := &file_litevirt_v1_service_proto_msgTypes[388]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -26582,7 +26738,7 @@ func (x *SyncVTEPRequest) String() string {
 func (*SyncVTEPRequest) ProtoMessage() {}
 
 func (x *SyncVTEPRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[386]
+	mi := &file_litevirt_v1_service_proto_msgTypes[388]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -26595,7 +26751,7 @@ func (x *SyncVTEPRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SyncVTEPRequest.ProtoReflect.Descriptor instead.
 func (*SyncVTEPRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{386}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{388}
 }
 
 func (x *SyncVTEPRequest) GetNetworkName() string {
@@ -26634,7 +26790,7 @@ type GetVMIPRequest struct {
 
 func (x *GetVMIPRequest) Reset() {
 	*x = GetVMIPRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[387]
+	mi := &file_litevirt_v1_service_proto_msgTypes[389]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -26646,7 +26802,7 @@ func (x *GetVMIPRequest) String() string {
 func (*GetVMIPRequest) ProtoMessage() {}
 
 func (x *GetVMIPRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[387]
+	mi := &file_litevirt_v1_service_proto_msgTypes[389]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -26659,7 +26815,7 @@ func (x *GetVMIPRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetVMIPRequest.ProtoReflect.Descriptor instead.
 func (*GetVMIPRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{387}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{389}
 }
 
 func (x *GetVMIPRequest) GetMac() string {
@@ -26699,7 +26855,7 @@ type GetVMIPResponse struct {
 
 func (x *GetVMIPResponse) Reset() {
 	*x = GetVMIPResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[388]
+	mi := &file_litevirt_v1_service_proto_msgTypes[390]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -26711,7 +26867,7 @@ func (x *GetVMIPResponse) String() string {
 func (*GetVMIPResponse) ProtoMessage() {}
 
 func (x *GetVMIPResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[388]
+	mi := &file_litevirt_v1_service_proto_msgTypes[390]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -26724,7 +26880,7 @@ func (x *GetVMIPResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetVMIPResponse.ProtoReflect.Descriptor instead.
 func (*GetVMIPResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{388}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{390}
 }
 
 func (x *GetVMIPResponse) GetIp() string {
@@ -26743,7 +26899,7 @@ type RefreshLBRequest struct {
 
 func (x *RefreshLBRequest) Reset() {
 	*x = RefreshLBRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[389]
+	mi := &file_litevirt_v1_service_proto_msgTypes[391]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -26755,7 +26911,7 @@ func (x *RefreshLBRequest) String() string {
 func (*RefreshLBRequest) ProtoMessage() {}
 
 func (x *RefreshLBRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[389]
+	mi := &file_litevirt_v1_service_proto_msgTypes[391]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -26768,7 +26924,7 @@ func (x *RefreshLBRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RefreshLBRequest.ProtoReflect.Descriptor instead.
 func (*RefreshLBRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{389}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{391}
 }
 
 func (x *RefreshLBRequest) GetStackName() string {
@@ -26790,7 +26946,7 @@ type UpdateFDBRequest struct {
 
 func (x *UpdateFDBRequest) Reset() {
 	*x = UpdateFDBRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[390]
+	mi := &file_litevirt_v1_service_proto_msgTypes[392]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -26802,7 +26958,7 @@ func (x *UpdateFDBRequest) String() string {
 func (*UpdateFDBRequest) ProtoMessage() {}
 
 func (x *UpdateFDBRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[390]
+	mi := &file_litevirt_v1_service_proto_msgTypes[392]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -26815,7 +26971,7 @@ func (x *UpdateFDBRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpdateFDBRequest.ProtoReflect.Descriptor instead.
 func (*UpdateFDBRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{390}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{392}
 }
 
 func (x *UpdateFDBRequest) GetVni() int32 {
@@ -26877,7 +27033,7 @@ type TableDigest struct {
 
 func (x *TableDigest) Reset() {
 	*x = TableDigest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[391]
+	mi := &file_litevirt_v1_service_proto_msgTypes[393]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -26889,7 +27045,7 @@ func (x *TableDigest) String() string {
 func (*TableDigest) ProtoMessage() {}
 
 func (x *TableDigest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[391]
+	mi := &file_litevirt_v1_service_proto_msgTypes[393]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -26902,7 +27058,7 @@ func (x *TableDigest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TableDigest.ProtoReflect.Descriptor instead.
 func (*TableDigest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{391}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{393}
 }
 
 func (x *TableDigest) GetName() string {
@@ -26969,7 +27125,7 @@ type StateDigestResponse struct {
 
 func (x *StateDigestResponse) Reset() {
 	*x = StateDigestResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[392]
+	mi := &file_litevirt_v1_service_proto_msgTypes[394]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -26981,7 +27137,7 @@ func (x *StateDigestResponse) String() string {
 func (*StateDigestResponse) ProtoMessage() {}
 
 func (x *StateDigestResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[392]
+	mi := &file_litevirt_v1_service_proto_msgTypes[394]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -26994,7 +27150,7 @@ func (x *StateDigestResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StateDigestResponse.ProtoReflect.Descriptor instead.
 func (*StateDigestResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{392}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{394}
 }
 
 func (x *StateDigestResponse) GetHostName() string {
@@ -27030,7 +27186,7 @@ type TriggerAntiEntropyRequest struct {
 
 func (x *TriggerAntiEntropyRequest) Reset() {
 	*x = TriggerAntiEntropyRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[393]
+	mi := &file_litevirt_v1_service_proto_msgTypes[395]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -27042,7 +27198,7 @@ func (x *TriggerAntiEntropyRequest) String() string {
 func (*TriggerAntiEntropyRequest) ProtoMessage() {}
 
 func (x *TriggerAntiEntropyRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[393]
+	mi := &file_litevirt_v1_service_proto_msgTypes[395]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -27055,7 +27211,7 @@ func (x *TriggerAntiEntropyRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TriggerAntiEntropyRequest.ProtoReflect.Descriptor instead.
 func (*TriggerAntiEntropyRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{393}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{395}
 }
 
 func (x *TriggerAntiEntropyRequest) GetAll() bool {
@@ -27077,7 +27233,7 @@ type TriggerAntiEntropyResponse struct {
 
 func (x *TriggerAntiEntropyResponse) Reset() {
 	*x = TriggerAntiEntropyResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[394]
+	mi := &file_litevirt_v1_service_proto_msgTypes[396]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -27089,7 +27245,7 @@ func (x *TriggerAntiEntropyResponse) String() string {
 func (*TriggerAntiEntropyResponse) ProtoMessage() {}
 
 func (x *TriggerAntiEntropyResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[394]
+	mi := &file_litevirt_v1_service_proto_msgTypes[396]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -27102,7 +27258,7 @@ func (x *TriggerAntiEntropyResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TriggerAntiEntropyResponse.ProtoReflect.Descriptor instead.
 func (*TriggerAntiEntropyResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{394}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{396}
 }
 
 func (x *TriggerAntiEntropyResponse) GetTriggered() []string {
@@ -27147,7 +27303,7 @@ type ClusterStateDigestResponse struct {
 
 func (x *ClusterStateDigestResponse) Reset() {
 	*x = ClusterStateDigestResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[395]
+	mi := &file_litevirt_v1_service_proto_msgTypes[397]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -27159,7 +27315,7 @@ func (x *ClusterStateDigestResponse) String() string {
 func (*ClusterStateDigestResponse) ProtoMessage() {}
 
 func (x *ClusterStateDigestResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[395]
+	mi := &file_litevirt_v1_service_proto_msgTypes[397]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -27172,7 +27328,7 @@ func (x *ClusterStateDigestResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ClusterStateDigestResponse.ProtoReflect.Descriptor instead.
 func (*ClusterStateDigestResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{395}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{397}
 }
 
 func (x *ClusterStateDigestResponse) GetHosts() []*StateDigestResponse {
@@ -27205,7 +27361,7 @@ type StateDumpResponse struct {
 
 func (x *StateDumpResponse) Reset() {
 	*x = StateDumpResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[396]
+	mi := &file_litevirt_v1_service_proto_msgTypes[398]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -27217,7 +27373,7 @@ func (x *StateDumpResponse) String() string {
 func (*StateDumpResponse) ProtoMessage() {}
 
 func (x *StateDumpResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[396]
+	mi := &file_litevirt_v1_service_proto_msgTypes[398]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -27230,7 +27386,7 @@ func (x *StateDumpResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StateDumpResponse.ProtoReflect.Descriptor instead.
 func (*StateDumpResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{396}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{398}
 }
 
 func (x *StateDumpResponse) GetData() []byte {
@@ -27254,7 +27410,7 @@ type StateDumpChunk struct {
 
 func (x *StateDumpChunk) Reset() {
 	*x = StateDumpChunk{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[397]
+	mi := &file_litevirt_v1_service_proto_msgTypes[399]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -27266,7 +27422,7 @@ func (x *StateDumpChunk) String() string {
 func (*StateDumpChunk) ProtoMessage() {}
 
 func (x *StateDumpChunk) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[397]
+	mi := &file_litevirt_v1_service_proto_msgTypes[399]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -27279,7 +27435,7 @@ func (x *StateDumpChunk) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StateDumpChunk.ProtoReflect.Descriptor instead.
 func (*StateDumpChunk) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{397}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{399}
 }
 
 func (x *StateDumpChunk) GetData() []byte {
@@ -27321,7 +27477,7 @@ type TableDumpRequest struct {
 
 func (x *TableDumpRequest) Reset() {
 	*x = TableDumpRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[398]
+	mi := &file_litevirt_v1_service_proto_msgTypes[400]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -27333,7 +27489,7 @@ func (x *TableDumpRequest) String() string {
 func (*TableDumpRequest) ProtoMessage() {}
 
 func (x *TableDumpRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[398]
+	mi := &file_litevirt_v1_service_proto_msgTypes[400]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -27346,7 +27502,7 @@ func (x *TableDumpRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TableDumpRequest.ProtoReflect.Descriptor instead.
 func (*TableDumpRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{398}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{400}
 }
 
 func (x *TableDumpRequest) GetTables() []string {
@@ -27380,7 +27536,7 @@ type BucketSet struct {
 
 func (x *BucketSet) Reset() {
 	*x = BucketSet{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[399]
+	mi := &file_litevirt_v1_service_proto_msgTypes[401]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -27392,7 +27548,7 @@ func (x *BucketSet) String() string {
 func (*BucketSet) ProtoMessage() {}
 
 func (x *BucketSet) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[399]
+	mi := &file_litevirt_v1_service_proto_msgTypes[401]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -27405,7 +27561,7 @@ func (x *BucketSet) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BucketSet.ProtoReflect.Descriptor instead.
 func (*BucketSet) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{399}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{401}
 }
 
 func (x *BucketSet) GetBuckets() []uint32 {
@@ -27434,7 +27590,7 @@ type SensitiveStateRequest struct {
 
 func (x *SensitiveStateRequest) Reset() {
 	*x = SensitiveStateRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[400]
+	mi := &file_litevirt_v1_service_proto_msgTypes[402]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -27446,7 +27602,7 @@ func (x *SensitiveStateRequest) String() string {
 func (*SensitiveStateRequest) ProtoMessage() {}
 
 func (x *SensitiveStateRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[400]
+	mi := &file_litevirt_v1_service_proto_msgTypes[402]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -27459,7 +27615,7 @@ func (x *SensitiveStateRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SensitiveStateRequest.ProtoReflect.Descriptor instead.
 func (*SensitiveStateRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{400}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{402}
 }
 
 func (x *SensitiveStateRequest) GetSender() string {
@@ -27509,7 +27665,7 @@ type TableRowsPage struct {
 
 func (x *TableRowsPage) Reset() {
 	*x = TableRowsPage{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[401]
+	mi := &file_litevirt_v1_service_proto_msgTypes[403]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -27521,7 +27677,7 @@ func (x *TableRowsPage) String() string {
 func (*TableRowsPage) ProtoMessage() {}
 
 func (x *TableRowsPage) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[401]
+	mi := &file_litevirt_v1_service_proto_msgTypes[403]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -27534,7 +27690,7 @@ func (x *TableRowsPage) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TableRowsPage.ProtoReflect.Descriptor instead.
 func (*TableRowsPage) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{401}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{403}
 }
 
 func (x *TableRowsPage) GetTable() string {
@@ -27586,7 +27742,7 @@ type BucketDigestRequest struct {
 
 func (x *BucketDigestRequest) Reset() {
 	*x = BucketDigestRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[402]
+	mi := &file_litevirt_v1_service_proto_msgTypes[404]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -27598,7 +27754,7 @@ func (x *BucketDigestRequest) String() string {
 func (*BucketDigestRequest) ProtoMessage() {}
 
 func (x *BucketDigestRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[402]
+	mi := &file_litevirt_v1_service_proto_msgTypes[404]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -27611,7 +27767,7 @@ func (x *BucketDigestRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BucketDigestRequest.ProtoReflect.Descriptor instead.
 func (*BucketDigestRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{402}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{404}
 }
 
 func (x *BucketDigestRequest) GetSender() string {
@@ -27650,7 +27806,7 @@ type BucketDigest struct {
 
 func (x *BucketDigest) Reset() {
 	*x = BucketDigest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[403]
+	mi := &file_litevirt_v1_service_proto_msgTypes[405]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -27662,7 +27818,7 @@ func (x *BucketDigest) String() string {
 func (*BucketDigest) ProtoMessage() {}
 
 func (x *BucketDigest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[403]
+	mi := &file_litevirt_v1_service_proto_msgTypes[405]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -27675,7 +27831,7 @@ func (x *BucketDigest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BucketDigest.ProtoReflect.Descriptor instead.
 func (*BucketDigest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{403}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{405}
 }
 
 func (x *BucketDigest) GetIndex() uint32 {
@@ -27719,7 +27875,7 @@ type TableBucketDigests struct {
 
 func (x *TableBucketDigests) Reset() {
 	*x = TableBucketDigests{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[404]
+	mi := &file_litevirt_v1_service_proto_msgTypes[406]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -27731,7 +27887,7 @@ func (x *TableBucketDigests) String() string {
 func (*TableBucketDigests) ProtoMessage() {}
 
 func (x *TableBucketDigests) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[404]
+	mi := &file_litevirt_v1_service_proto_msgTypes[406]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -27744,7 +27900,7 @@ func (x *TableBucketDigests) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TableBucketDigests.ProtoReflect.Descriptor instead.
 func (*TableBucketDigests) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{404}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{406}
 }
 
 func (x *TableBucketDigests) GetName() string {
@@ -27781,7 +27937,7 @@ type BucketDigestResponse struct {
 
 func (x *BucketDigestResponse) Reset() {
 	*x = BucketDigestResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[405]
+	mi := &file_litevirt_v1_service_proto_msgTypes[407]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -27793,7 +27949,7 @@ func (x *BucketDigestResponse) String() string {
 func (*BucketDigestResponse) ProtoMessage() {}
 
 func (x *BucketDigestResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[405]
+	mi := &file_litevirt_v1_service_proto_msgTypes[407]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -27806,7 +27962,7 @@ func (x *BucketDigestResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BucketDigestResponse.ProtoReflect.Descriptor instead.
 func (*BucketDigestResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{405}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{407}
 }
 
 func (x *BucketDigestResponse) GetScheme() uint32 {
@@ -27847,7 +28003,7 @@ type DiagnoseDivergenceRequest struct {
 
 func (x *DiagnoseDivergenceRequest) Reset() {
 	*x = DiagnoseDivergenceRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[406]
+	mi := &file_litevirt_v1_service_proto_msgTypes[408]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -27859,7 +28015,7 @@ func (x *DiagnoseDivergenceRequest) String() string {
 func (*DiagnoseDivergenceRequest) ProtoMessage() {}
 
 func (x *DiagnoseDivergenceRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[406]
+	mi := &file_litevirt_v1_service_proto_msgTypes[408]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -27872,7 +28028,7 @@ func (x *DiagnoseDivergenceRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DiagnoseDivergenceRequest.ProtoReflect.Descriptor instead.
 func (*DiagnoseDivergenceRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{406}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{408}
 }
 
 func (x *DiagnoseDivergenceRequest) GetIncludeSensitive() bool {
@@ -27902,7 +28058,7 @@ type NodeRowMeta struct {
 
 func (x *NodeRowMeta) Reset() {
 	*x = NodeRowMeta{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[407]
+	mi := &file_litevirt_v1_service_proto_msgTypes[409]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -27914,7 +28070,7 @@ func (x *NodeRowMeta) String() string {
 func (*NodeRowMeta) ProtoMessage() {}
 
 func (x *NodeRowMeta) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[407]
+	mi := &file_litevirt_v1_service_proto_msgTypes[409]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -27927,7 +28083,7 @@ func (x *NodeRowMeta) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeRowMeta.ProtoReflect.Descriptor instead.
 func (*NodeRowMeta) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{407}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{409}
 }
 
 func (x *NodeRowMeta) GetHost() string {
@@ -27990,7 +28146,7 @@ type DivergenceRow struct {
 
 func (x *DivergenceRow) Reset() {
 	*x = DivergenceRow{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[408]
+	mi := &file_litevirt_v1_service_proto_msgTypes[410]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -28002,7 +28158,7 @@ func (x *DivergenceRow) String() string {
 func (*DivergenceRow) ProtoMessage() {}
 
 func (x *DivergenceRow) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[408]
+	mi := &file_litevirt_v1_service_proto_msgTypes[410]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -28015,7 +28171,7 @@ func (x *DivergenceRow) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DivergenceRow.ProtoReflect.Descriptor instead.
 func (*DivergenceRow) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{408}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{410}
 }
 
 func (x *DivergenceRow) GetTable() string {
@@ -28072,7 +28228,7 @@ type SemanticViolationPB struct {
 
 func (x *SemanticViolationPB) Reset() {
 	*x = SemanticViolationPB{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[409]
+	mi := &file_litevirt_v1_service_proto_msgTypes[411]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -28084,7 +28240,7 @@ func (x *SemanticViolationPB) String() string {
 func (*SemanticViolationPB) ProtoMessage() {}
 
 func (x *SemanticViolationPB) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[409]
+	mi := &file_litevirt_v1_service_proto_msgTypes[411]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -28097,7 +28253,7 @@ func (x *SemanticViolationPB) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SemanticViolationPB.ProtoReflect.Descriptor instead.
 func (*SemanticViolationPB) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{409}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{411}
 }
 
 func (x *SemanticViolationPB) GetKind() string {
@@ -28150,7 +28306,7 @@ type DivergenceReport struct {
 
 func (x *DivergenceReport) Reset() {
 	*x = DivergenceReport{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[410]
+	mi := &file_litevirt_v1_service_proto_msgTypes[412]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -28162,7 +28318,7 @@ func (x *DivergenceReport) String() string {
 func (*DivergenceReport) ProtoMessage() {}
 
 func (x *DivergenceReport) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[410]
+	mi := &file_litevirt_v1_service_proto_msgTypes[412]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -28175,7 +28331,7 @@ func (x *DivergenceReport) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DivergenceReport.ProtoReflect.Descriptor instead.
 func (*DivergenceReport) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{410}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{412}
 }
 
 func (x *DivergenceReport) GetNodesScanned() []string {
@@ -28238,7 +28394,7 @@ type ScanSensitiveRequest struct {
 
 func (x *ScanSensitiveRequest) Reset() {
 	*x = ScanSensitiveRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[411]
+	mi := &file_litevirt_v1_service_proto_msgTypes[413]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -28250,7 +28406,7 @@ func (x *ScanSensitiveRequest) String() string {
 func (*ScanSensitiveRequest) ProtoMessage() {}
 
 func (x *ScanSensitiveRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[411]
+	mi := &file_litevirt_v1_service_proto_msgTypes[413]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -28263,7 +28419,7 @@ func (x *ScanSensitiveRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ScanSensitiveRequest.ProtoReflect.Descriptor instead.
 func (*ScanSensitiveRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{411}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{413}
 }
 
 func (x *ScanSensitiveRequest) GetSender() string {
@@ -28304,7 +28460,7 @@ type SensitiveRowMetaPB struct {
 
 func (x *SensitiveRowMetaPB) Reset() {
 	*x = SensitiveRowMetaPB{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[412]
+	mi := &file_litevirt_v1_service_proto_msgTypes[414]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -28316,7 +28472,7 @@ func (x *SensitiveRowMetaPB) String() string {
 func (*SensitiveRowMetaPB) ProtoMessage() {}
 
 func (x *SensitiveRowMetaPB) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[412]
+	mi := &file_litevirt_v1_service_proto_msgTypes[414]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -28329,7 +28485,7 @@ func (x *SensitiveRowMetaPB) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SensitiveRowMetaPB.ProtoReflect.Descriptor instead.
 func (*SensitiveRowMetaPB) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{412}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{414}
 }
 
 func (x *SensitiveRowMetaPB) GetTable() string {
@@ -28384,7 +28540,7 @@ type ScanSensitiveResponse struct {
 
 func (x *ScanSensitiveResponse) Reset() {
 	*x = ScanSensitiveResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[413]
+	mi := &file_litevirt_v1_service_proto_msgTypes[415]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -28396,7 +28552,7 @@ func (x *ScanSensitiveResponse) String() string {
 func (*ScanSensitiveResponse) ProtoMessage() {}
 
 func (x *ScanSensitiveResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[413]
+	mi := &file_litevirt_v1_service_proto_msgTypes[415]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -28409,7 +28565,7 @@ func (x *ScanSensitiveResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ScanSensitiveResponse.ProtoReflect.Descriptor instead.
 func (*ScanSensitiveResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{413}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{415}
 }
 
 func (x *ScanSensitiveResponse) GetHostName() string {
@@ -28438,7 +28594,7 @@ type MutationEntry struct {
 
 func (x *MutationEntry) Reset() {
 	*x = MutationEntry{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[414]
+	mi := &file_litevirt_v1_service_proto_msgTypes[416]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -28450,7 +28606,7 @@ func (x *MutationEntry) String() string {
 func (*MutationEntry) ProtoMessage() {}
 
 func (x *MutationEntry) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[414]
+	mi := &file_litevirt_v1_service_proto_msgTypes[416]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -28463,7 +28619,7 @@ func (x *MutationEntry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MutationEntry.ProtoReflect.Descriptor instead.
 func (*MutationEntry) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{414}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{416}
 }
 
 func (x *MutationEntry) GetSeq() int64 {
@@ -28513,7 +28669,7 @@ type ReplicateRequest struct {
 
 func (x *ReplicateRequest) Reset() {
 	*x = ReplicateRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[415]
+	mi := &file_litevirt_v1_service_proto_msgTypes[417]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -28525,7 +28681,7 @@ func (x *ReplicateRequest) String() string {
 func (*ReplicateRequest) ProtoMessage() {}
 
 func (x *ReplicateRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[415]
+	mi := &file_litevirt_v1_service_proto_msgTypes[417]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -28538,7 +28694,7 @@ func (x *ReplicateRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReplicateRequest.ProtoReflect.Descriptor instead.
 func (*ReplicateRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{415}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{417}
 }
 
 func (x *ReplicateRequest) GetSender() string {
@@ -28592,7 +28748,7 @@ type ReplicateResponse struct {
 
 func (x *ReplicateResponse) Reset() {
 	*x = ReplicateResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[416]
+	mi := &file_litevirt_v1_service_proto_msgTypes[418]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -28604,7 +28760,7 @@ func (x *ReplicateResponse) String() string {
 func (*ReplicateResponse) ProtoMessage() {}
 
 func (x *ReplicateResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[416]
+	mi := &file_litevirt_v1_service_proto_msgTypes[418]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -28617,7 +28773,7 @@ func (x *ReplicateResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReplicateResponse.ProtoReflect.Descriptor instead.
 func (*ReplicateResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{416}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{418}
 }
 
 func (x *ReplicateResponse) GetAppliedUpTo() int64 {
@@ -28637,7 +28793,7 @@ type AckRequest struct {
 
 func (x *AckRequest) Reset() {
 	*x = AckRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[417]
+	mi := &file_litevirt_v1_service_proto_msgTypes[419]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -28649,7 +28805,7 @@ func (x *AckRequest) String() string {
 func (*AckRequest) ProtoMessage() {}
 
 func (x *AckRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[417]
+	mi := &file_litevirt_v1_service_proto_msgTypes[419]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -28662,7 +28818,7 @@ func (x *AckRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AckRequest.ProtoReflect.Descriptor instead.
 func (*AckRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{417}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{419}
 }
 
 func (x *AckRequest) GetSender() string {
@@ -28691,7 +28847,7 @@ type GetVMLogsRequest struct {
 
 func (x *GetVMLogsRequest) Reset() {
 	*x = GetVMLogsRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[418]
+	mi := &file_litevirt_v1_service_proto_msgTypes[420]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -28703,7 +28859,7 @@ func (x *GetVMLogsRequest) String() string {
 func (*GetVMLogsRequest) ProtoMessage() {}
 
 func (x *GetVMLogsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[418]
+	mi := &file_litevirt_v1_service_proto_msgTypes[420]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -28716,7 +28872,7 @@ func (x *GetVMLogsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetVMLogsRequest.ProtoReflect.Descriptor instead.
 func (*GetVMLogsRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{418}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{420}
 }
 
 func (x *GetVMLogsRequest) GetName() string {
@@ -28749,7 +28905,7 @@ type VMLogChunk struct {
 
 func (x *VMLogChunk) Reset() {
 	*x = VMLogChunk{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[419]
+	mi := &file_litevirt_v1_service_proto_msgTypes[421]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -28761,7 +28917,7 @@ func (x *VMLogChunk) String() string {
 func (*VMLogChunk) ProtoMessage() {}
 
 func (x *VMLogChunk) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[419]
+	mi := &file_litevirt_v1_service_proto_msgTypes[421]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -28774,7 +28930,7 @@ func (x *VMLogChunk) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VMLogChunk.ProtoReflect.Descriptor instead.
 func (*VMLogChunk) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{419}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{421}
 }
 
 func (x *VMLogChunk) GetData() []byte {
@@ -28797,7 +28953,7 @@ type UpgradeHostRequest struct {
 
 func (x *UpgradeHostRequest) Reset() {
 	*x = UpgradeHostRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[420]
+	mi := &file_litevirt_v1_service_proto_msgTypes[422]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -28809,7 +28965,7 @@ func (x *UpgradeHostRequest) String() string {
 func (*UpgradeHostRequest) ProtoMessage() {}
 
 func (x *UpgradeHostRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[420]
+	mi := &file_litevirt_v1_service_proto_msgTypes[422]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -28822,7 +28978,7 @@ func (x *UpgradeHostRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpgradeHostRequest.ProtoReflect.Descriptor instead.
 func (*UpgradeHostRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{420}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{422}
 }
 
 func (x *UpgradeHostRequest) GetChunk() []byte {
@@ -28867,7 +29023,7 @@ type UpgradeHostResponse struct {
 
 func (x *UpgradeHostResponse) Reset() {
 	*x = UpgradeHostResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[421]
+	mi := &file_litevirt_v1_service_proto_msgTypes[423]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -28879,7 +29035,7 @@ func (x *UpgradeHostResponse) String() string {
 func (*UpgradeHostResponse) ProtoMessage() {}
 
 func (x *UpgradeHostResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[421]
+	mi := &file_litevirt_v1_service_proto_msgTypes[423]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -28892,7 +29048,7 @@ func (x *UpgradeHostResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpgradeHostResponse.ProtoReflect.Descriptor instead.
 func (*UpgradeHostResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{421}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{423}
 }
 
 func (x *UpgradeHostResponse) GetHostName() string {
@@ -28948,7 +29104,7 @@ type UninstallHostRequest struct {
 
 func (x *UninstallHostRequest) Reset() {
 	*x = UninstallHostRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[422]
+	mi := &file_litevirt_v1_service_proto_msgTypes[424]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -28960,7 +29116,7 @@ func (x *UninstallHostRequest) String() string {
 func (*UninstallHostRequest) ProtoMessage() {}
 
 func (x *UninstallHostRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[422]
+	mi := &file_litevirt_v1_service_proto_msgTypes[424]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -28973,7 +29129,7 @@ func (x *UninstallHostRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UninstallHostRequest.ProtoReflect.Descriptor instead.
 func (*UninstallHostRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{422}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{424}
 }
 
 func (x *UninstallHostRequest) GetKeepData() bool {
@@ -29000,7 +29156,7 @@ type UninstallHostResponse struct {
 
 func (x *UninstallHostResponse) Reset() {
 	*x = UninstallHostResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[423]
+	mi := &file_litevirt_v1_service_proto_msgTypes[425]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -29012,7 +29168,7 @@ func (x *UninstallHostResponse) String() string {
 func (*UninstallHostResponse) ProtoMessage() {}
 
 func (x *UninstallHostResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[423]
+	mi := &file_litevirt_v1_service_proto_msgTypes[425]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -29025,7 +29181,7 @@ func (x *UninstallHostResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UninstallHostResponse.ProtoReflect.Descriptor instead.
 func (*UninstallHostResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{423}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{425}
 }
 
 func (x *UninstallHostResponse) GetHostName() string {
@@ -29056,7 +29212,7 @@ type ExecuteCreateVMRequest struct {
 
 func (x *ExecuteCreateVMRequest) Reset() {
 	*x = ExecuteCreateVMRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[424]
+	mi := &file_litevirt_v1_service_proto_msgTypes[426]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -29068,7 +29224,7 @@ func (x *ExecuteCreateVMRequest) String() string {
 func (*ExecuteCreateVMRequest) ProtoMessage() {}
 
 func (x *ExecuteCreateVMRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[424]
+	mi := &file_litevirt_v1_service_proto_msgTypes[426]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -29081,7 +29237,7 @@ func (x *ExecuteCreateVMRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecuteCreateVMRequest.ProtoReflect.Descriptor instead.
 func (*ExecuteCreateVMRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{424}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{426}
 }
 
 func (x *ExecuteCreateVMRequest) GetRequest() *CreateVMRequest {
@@ -29123,7 +29279,7 @@ type AdmitHostRequest struct {
 
 func (x *AdmitHostRequest) Reset() {
 	*x = AdmitHostRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[425]
+	mi := &file_litevirt_v1_service_proto_msgTypes[427]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -29135,7 +29291,7 @@ func (x *AdmitHostRequest) String() string {
 func (*AdmitHostRequest) ProtoMessage() {}
 
 func (x *AdmitHostRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[425]
+	mi := &file_litevirt_v1_service_proto_msgTypes[427]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -29148,7 +29304,7 @@ func (x *AdmitHostRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AdmitHostRequest.ProtoReflect.Descriptor instead.
 func (*AdmitHostRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{425}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{427}
 }
 
 func (x *AdmitHostRequest) GetName() string {
@@ -29198,7 +29354,7 @@ type AdmitHostResponse struct {
 
 func (x *AdmitHostResponse) Reset() {
 	*x = AdmitHostResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[426]
+	mi := &file_litevirt_v1_service_proto_msgTypes[428]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -29210,7 +29366,7 @@ func (x *AdmitHostResponse) String() string {
 func (*AdmitHostResponse) ProtoMessage() {}
 
 func (x *AdmitHostResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[426]
+	mi := &file_litevirt_v1_service_proto_msgTypes[428]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -29223,7 +29379,7 @@ func (x *AdmitHostResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AdmitHostResponse.ProtoReflect.Descriptor instead.
 func (*AdmitHostResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{426}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{428}
 }
 
 func (x *AdmitHostResponse) GetAuditTailSeq() int64 {
@@ -29274,7 +29430,7 @@ type HostNetwork struct {
 
 func (x *HostNetwork) Reset() {
 	*x = HostNetwork{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[427]
+	mi := &file_litevirt_v1_service_proto_msgTypes[429]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -29286,7 +29442,7 @@ func (x *HostNetwork) String() string {
 func (*HostNetwork) ProtoMessage() {}
 
 func (x *HostNetwork) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[427]
+	mi := &file_litevirt_v1_service_proto_msgTypes[429]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -29299,7 +29455,7 @@ func (x *HostNetwork) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HostNetwork.ProtoReflect.Descriptor instead.
 func (*HostNetwork) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{427}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{429}
 }
 
 func (x *HostNetwork) GetHostName() string {
@@ -29423,7 +29579,7 @@ type ListHostNetworksRequest struct {
 
 func (x *ListHostNetworksRequest) Reset() {
 	*x = ListHostNetworksRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[428]
+	mi := &file_litevirt_v1_service_proto_msgTypes[430]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -29435,7 +29591,7 @@ func (x *ListHostNetworksRequest) String() string {
 func (*ListHostNetworksRequest) ProtoMessage() {}
 
 func (x *ListHostNetworksRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[428]
+	mi := &file_litevirt_v1_service_proto_msgTypes[430]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -29448,7 +29604,7 @@ func (x *ListHostNetworksRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListHostNetworksRequest.ProtoReflect.Descriptor instead.
 func (*ListHostNetworksRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{428}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{430}
 }
 
 func (x *ListHostNetworksRequest) GetHostName() string {
@@ -29467,7 +29623,7 @@ type ListHostNetworksResponse struct {
 
 func (x *ListHostNetworksResponse) Reset() {
 	*x = ListHostNetworksResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[429]
+	mi := &file_litevirt_v1_service_proto_msgTypes[431]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -29479,7 +29635,7 @@ func (x *ListHostNetworksResponse) String() string {
 func (*ListHostNetworksResponse) ProtoMessage() {}
 
 func (x *ListHostNetworksResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[429]
+	mi := &file_litevirt_v1_service_proto_msgTypes[431]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -29492,7 +29648,7 @@ func (x *ListHostNetworksResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListHostNetworksResponse.ProtoReflect.Descriptor instead.
 func (*ListHostNetworksResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{429}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{431}
 }
 
 func (x *ListHostNetworksResponse) GetNetworks() []*HostNetwork {
@@ -29511,7 +29667,7 @@ type UpsertHostNetworkRequest struct {
 
 func (x *UpsertHostNetworkRequest) Reset() {
 	*x = UpsertHostNetworkRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[430]
+	mi := &file_litevirt_v1_service_proto_msgTypes[432]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -29523,7 +29679,7 @@ func (x *UpsertHostNetworkRequest) String() string {
 func (*UpsertHostNetworkRequest) ProtoMessage() {}
 
 func (x *UpsertHostNetworkRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[430]
+	mi := &file_litevirt_v1_service_proto_msgTypes[432]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -29536,7 +29692,7 @@ func (x *UpsertHostNetworkRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpsertHostNetworkRequest.ProtoReflect.Descriptor instead.
 func (*UpsertHostNetworkRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{430}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{432}
 }
 
 func (x *UpsertHostNetworkRequest) GetNetwork() *HostNetwork {
@@ -29555,7 +29711,7 @@ type PlanHostNetworkRequest struct {
 
 func (x *PlanHostNetworkRequest) Reset() {
 	*x = PlanHostNetworkRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[431]
+	mi := &file_litevirt_v1_service_proto_msgTypes[433]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -29567,7 +29723,7 @@ func (x *PlanHostNetworkRequest) String() string {
 func (*PlanHostNetworkRequest) ProtoMessage() {}
 
 func (x *PlanHostNetworkRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[431]
+	mi := &file_litevirt_v1_service_proto_msgTypes[433]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -29580,7 +29736,7 @@ func (x *PlanHostNetworkRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PlanHostNetworkRequest.ProtoReflect.Descriptor instead.
 func (*PlanHostNetworkRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{431}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{433}
 }
 
 func (x *PlanHostNetworkRequest) GetHostName() string {
@@ -29604,7 +29760,7 @@ type PlanHostNetworkResponse struct {
 
 func (x *PlanHostNetworkResponse) Reset() {
 	*x = PlanHostNetworkResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[432]
+	mi := &file_litevirt_v1_service_proto_msgTypes[434]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -29616,7 +29772,7 @@ func (x *PlanHostNetworkResponse) String() string {
 func (*PlanHostNetworkResponse) ProtoMessage() {}
 
 func (x *PlanHostNetworkResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[432]
+	mi := &file_litevirt_v1_service_proto_msgTypes[434]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -29629,7 +29785,7 @@ func (x *PlanHostNetworkResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PlanHostNetworkResponse.ProtoReflect.Descriptor instead.
 func (*PlanHostNetworkResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{432}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{434}
 }
 
 func (x *PlanHostNetworkResponse) GetRendered() string {
@@ -29686,7 +29842,7 @@ type ApplyHostNetworkRequest struct {
 
 func (x *ApplyHostNetworkRequest) Reset() {
 	*x = ApplyHostNetworkRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[433]
+	mi := &file_litevirt_v1_service_proto_msgTypes[435]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -29698,7 +29854,7 @@ func (x *ApplyHostNetworkRequest) String() string {
 func (*ApplyHostNetworkRequest) ProtoMessage() {}
 
 func (x *ApplyHostNetworkRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[433]
+	mi := &file_litevirt_v1_service_proto_msgTypes[435]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -29711,7 +29867,7 @@ func (x *ApplyHostNetworkRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ApplyHostNetworkRequest.ProtoReflect.Descriptor instead.
 func (*ApplyHostNetworkRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{433}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{435}
 }
 
 func (x *ApplyHostNetworkRequest) GetHostName() string {
@@ -29738,7 +29894,7 @@ type DeleteHostNetworkRequest struct {
 
 func (x *DeleteHostNetworkRequest) Reset() {
 	*x = DeleteHostNetworkRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[434]
+	mi := &file_litevirt_v1_service_proto_msgTypes[436]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -29750,7 +29906,7 @@ func (x *DeleteHostNetworkRequest) String() string {
 func (*DeleteHostNetworkRequest) ProtoMessage() {}
 
 func (x *DeleteHostNetworkRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[434]
+	mi := &file_litevirt_v1_service_proto_msgTypes[436]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -29763,7 +29919,7 @@ func (x *DeleteHostNetworkRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteHostNetworkRequest.ProtoReflect.Descriptor instead.
 func (*DeleteHostNetworkRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{434}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{436}
 }
 
 func (x *DeleteHostNetworkRequest) GetHostName() string {
@@ -29791,7 +29947,7 @@ type IsolateHostRequest struct {
 
 func (x *IsolateHostRequest) Reset() {
 	*x = IsolateHostRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[435]
+	mi := &file_litevirt_v1_service_proto_msgTypes[437]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -29803,7 +29959,7 @@ func (x *IsolateHostRequest) String() string {
 func (*IsolateHostRequest) ProtoMessage() {}
 
 func (x *IsolateHostRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[435]
+	mi := &file_litevirt_v1_service_proto_msgTypes[437]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -29816,7 +29972,7 @@ func (x *IsolateHostRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use IsolateHostRequest.ProtoReflect.Descriptor instead.
 func (*IsolateHostRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{435}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{437}
 }
 
 func (x *IsolateHostRequest) GetName() string {
@@ -29844,7 +30000,7 @@ type HostIsolationStatus struct {
 
 func (x *HostIsolationStatus) Reset() {
 	*x = HostIsolationStatus{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[436]
+	mi := &file_litevirt_v1_service_proto_msgTypes[438]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -29856,7 +30012,7 @@ func (x *HostIsolationStatus) String() string {
 func (*HostIsolationStatus) ProtoMessage() {}
 
 func (x *HostIsolationStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[436]
+	mi := &file_litevirt_v1_service_proto_msgTypes[438]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -29869,7 +30025,7 @@ func (x *HostIsolationStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HostIsolationStatus.ProtoReflect.Descriptor instead.
 func (*HostIsolationStatus) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{436}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{438}
 }
 
 func (x *HostIsolationStatus) GetHostName() string {
@@ -29907,7 +30063,7 @@ type ReseedHostRequest struct {
 
 func (x *ReseedHostRequest) Reset() {
 	*x = ReseedHostRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[437]
+	mi := &file_litevirt_v1_service_proto_msgTypes[439]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -29919,7 +30075,7 @@ func (x *ReseedHostRequest) String() string {
 func (*ReseedHostRequest) ProtoMessage() {}
 
 func (x *ReseedHostRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[437]
+	mi := &file_litevirt_v1_service_proto_msgTypes[439]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -29932,7 +30088,7 @@ func (x *ReseedHostRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReseedHostRequest.ProtoReflect.Descriptor instead.
 func (*ReseedHostRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{437}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{439}
 }
 
 func (x *ReseedHostRequest) GetName() string {
@@ -29968,7 +30124,7 @@ type ReseedHostResponse struct {
 
 func (x *ReseedHostResponse) Reset() {
 	*x = ReseedHostResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[438]
+	mi := &file_litevirt_v1_service_proto_msgTypes[440]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -29980,7 +30136,7 @@ func (x *ReseedHostResponse) String() string {
 func (*ReseedHostResponse) ProtoMessage() {}
 
 func (x *ReseedHostResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[438]
+	mi := &file_litevirt_v1_service_proto_msgTypes[440]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -29993,7 +30149,7 @@ func (x *ReseedHostResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReseedHostResponse.ProtoReflect.Descriptor instead.
 func (*ReseedHostResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{438}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{440}
 }
 
 func (x *ReseedHostResponse) GetHostName() string {
@@ -30036,7 +30192,7 @@ type PreflightUpgradeRequest struct {
 
 func (x *PreflightUpgradeRequest) Reset() {
 	*x = PreflightUpgradeRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[439]
+	mi := &file_litevirt_v1_service_proto_msgTypes[441]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -30048,7 +30204,7 @@ func (x *PreflightUpgradeRequest) String() string {
 func (*PreflightUpgradeRequest) ProtoMessage() {}
 
 func (x *PreflightUpgradeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[439]
+	mi := &file_litevirt_v1_service_proto_msgTypes[441]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -30061,7 +30217,7 @@ func (x *PreflightUpgradeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PreflightUpgradeRequest.ProtoReflect.Descriptor instead.
 func (*PreflightUpgradeRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{439}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{441}
 }
 
 func (x *PreflightUpgradeRequest) GetTargetHost() string {
@@ -30082,7 +30238,7 @@ type PreflightUpgradeResponse struct {
 
 func (x *PreflightUpgradeResponse) Reset() {
 	*x = PreflightUpgradeResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[440]
+	mi := &file_litevirt_v1_service_proto_msgTypes[442]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -30094,7 +30250,7 @@ func (x *PreflightUpgradeResponse) String() string {
 func (*PreflightUpgradeResponse) ProtoMessage() {}
 
 func (x *PreflightUpgradeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[440]
+	mi := &file_litevirt_v1_service_proto_msgTypes[442]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -30107,7 +30263,7 @@ func (x *PreflightUpgradeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PreflightUpgradeResponse.ProtoReflect.Descriptor instead.
 func (*PreflightUpgradeResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{440}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{442}
 }
 
 func (x *PreflightUpgradeResponse) GetOk() bool {
@@ -30142,7 +30298,7 @@ type PreflightFinding struct {
 
 func (x *PreflightFinding) Reset() {
 	*x = PreflightFinding{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[441]
+	mi := &file_litevirt_v1_service_proto_msgTypes[443]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -30154,7 +30310,7 @@ func (x *PreflightFinding) String() string {
 func (*PreflightFinding) ProtoMessage() {}
 
 func (x *PreflightFinding) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[441]
+	mi := &file_litevirt_v1_service_proto_msgTypes[443]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -30167,7 +30323,7 @@ func (x *PreflightFinding) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PreflightFinding.ProtoReflect.Descriptor instead.
 func (*PreflightFinding) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{441}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{443}
 }
 
 func (x *PreflightFinding) GetSeverity() string {
@@ -30200,7 +30356,7 @@ type GetSpiceInfoRequest struct {
 
 func (x *GetSpiceInfoRequest) Reset() {
 	*x = GetSpiceInfoRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[442]
+	mi := &file_litevirt_v1_service_proto_msgTypes[444]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -30212,7 +30368,7 @@ func (x *GetSpiceInfoRequest) String() string {
 func (*GetSpiceInfoRequest) ProtoMessage() {}
 
 func (x *GetSpiceInfoRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[442]
+	mi := &file_litevirt_v1_service_proto_msgTypes[444]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -30225,7 +30381,7 @@ func (x *GetSpiceInfoRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetSpiceInfoRequest.ProtoReflect.Descriptor instead.
 func (*GetSpiceInfoRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{442}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{444}
 }
 
 func (x *GetSpiceInfoRequest) GetVmName() string {
@@ -30246,7 +30402,7 @@ type GetSpiceInfoResponse struct {
 
 func (x *GetSpiceInfoResponse) Reset() {
 	*x = GetSpiceInfoResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[443]
+	mi := &file_litevirt_v1_service_proto_msgTypes[445]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -30258,7 +30414,7 @@ func (x *GetSpiceInfoResponse) String() string {
 func (*GetSpiceInfoResponse) ProtoMessage() {}
 
 func (x *GetSpiceInfoResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[443]
+	mi := &file_litevirt_v1_service_proto_msgTypes[445]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -30271,7 +30427,7 @@ func (x *GetSpiceInfoResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetSpiceInfoResponse.ProtoReflect.Descriptor instead.
 func (*GetSpiceInfoResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{443}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{445}
 }
 
 func (x *GetSpiceInfoResponse) GetHost() string {
@@ -30314,7 +30470,7 @@ type RebalanceProposal struct {
 
 func (x *RebalanceProposal) Reset() {
 	*x = RebalanceProposal{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[444]
+	mi := &file_litevirt_v1_service_proto_msgTypes[446]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -30326,7 +30482,7 @@ func (x *RebalanceProposal) String() string {
 func (*RebalanceProposal) ProtoMessage() {}
 
 func (x *RebalanceProposal) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[444]
+	mi := &file_litevirt_v1_service_proto_msgTypes[446]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -30339,7 +30495,7 @@ func (x *RebalanceProposal) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RebalanceProposal.ProtoReflect.Descriptor instead.
 func (*RebalanceProposal) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{444}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{446}
 }
 
 func (x *RebalanceProposal) GetId() string {
@@ -30434,7 +30590,7 @@ type ListRebalanceProposalsRequest struct {
 
 func (x *ListRebalanceProposalsRequest) Reset() {
 	*x = ListRebalanceProposalsRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[445]
+	mi := &file_litevirt_v1_service_proto_msgTypes[447]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -30446,7 +30602,7 @@ func (x *ListRebalanceProposalsRequest) String() string {
 func (*ListRebalanceProposalsRequest) ProtoMessage() {}
 
 func (x *ListRebalanceProposalsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[445]
+	mi := &file_litevirt_v1_service_proto_msgTypes[447]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -30459,7 +30615,7 @@ func (x *ListRebalanceProposalsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListRebalanceProposalsRequest.ProtoReflect.Descriptor instead.
 func (*ListRebalanceProposalsRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{445}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{447}
 }
 
 func (x *ListRebalanceProposalsRequest) GetStatusFilter() string {
@@ -30497,7 +30653,7 @@ type ListRebalanceProposalsResponse struct {
 
 func (x *ListRebalanceProposalsResponse) Reset() {
 	*x = ListRebalanceProposalsResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[446]
+	mi := &file_litevirt_v1_service_proto_msgTypes[448]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -30509,7 +30665,7 @@ func (x *ListRebalanceProposalsResponse) String() string {
 func (*ListRebalanceProposalsResponse) ProtoMessage() {}
 
 func (x *ListRebalanceProposalsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[446]
+	mi := &file_litevirt_v1_service_proto_msgTypes[448]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -30522,7 +30678,7 @@ func (x *ListRebalanceProposalsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListRebalanceProposalsResponse.ProtoReflect.Descriptor instead.
 func (*ListRebalanceProposalsResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{446}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{448}
 }
 
 func (x *ListRebalanceProposalsResponse) GetProposals() []*RebalanceProposal {
@@ -30555,7 +30711,7 @@ type RunRebalanceRequest struct {
 
 func (x *RunRebalanceRequest) Reset() {
 	*x = RunRebalanceRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[447]
+	mi := &file_litevirt_v1_service_proto_msgTypes[449]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -30567,7 +30723,7 @@ func (x *RunRebalanceRequest) String() string {
 func (*RunRebalanceRequest) ProtoMessage() {}
 
 func (x *RunRebalanceRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[447]
+	mi := &file_litevirt_v1_service_proto_msgTypes[449]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -30580,7 +30736,7 @@ func (x *RunRebalanceRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RunRebalanceRequest.ProtoReflect.Descriptor instead.
 func (*RunRebalanceRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{447}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{449}
 }
 
 func (x *RunRebalanceRequest) GetDryRun() bool {
@@ -30599,7 +30755,7 @@ type RunRebalanceResponse struct {
 
 func (x *RunRebalanceResponse) Reset() {
 	*x = RunRebalanceResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[448]
+	mi := &file_litevirt_v1_service_proto_msgTypes[450]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -30611,7 +30767,7 @@ func (x *RunRebalanceResponse) String() string {
 func (*RunRebalanceResponse) ProtoMessage() {}
 
 func (x *RunRebalanceResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[448]
+	mi := &file_litevirt_v1_service_proto_msgTypes[450]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -30624,7 +30780,7 @@ func (x *RunRebalanceResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RunRebalanceResponse.ProtoReflect.Descriptor instead.
 func (*RunRebalanceResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{448}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{450}
 }
 
 func (x *RunRebalanceResponse) GetProposalsEmitted() int32 {
@@ -30643,7 +30799,7 @@ type ApproveRebalanceProposalRequest struct {
 
 func (x *ApproveRebalanceProposalRequest) Reset() {
 	*x = ApproveRebalanceProposalRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[449]
+	mi := &file_litevirt_v1_service_proto_msgTypes[451]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -30655,7 +30811,7 @@ func (x *ApproveRebalanceProposalRequest) String() string {
 func (*ApproveRebalanceProposalRequest) ProtoMessage() {}
 
 func (x *ApproveRebalanceProposalRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[449]
+	mi := &file_litevirt_v1_service_proto_msgTypes[451]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -30668,7 +30824,7 @@ func (x *ApproveRebalanceProposalRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ApproveRebalanceProposalRequest.ProtoReflect.Descriptor instead.
 func (*ApproveRebalanceProposalRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{449}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{451}
 }
 
 func (x *ApproveRebalanceProposalRequest) GetId() string {
@@ -30688,7 +30844,7 @@ type RejectRebalanceProposalRequest struct {
 
 func (x *RejectRebalanceProposalRequest) Reset() {
 	*x = RejectRebalanceProposalRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[450]
+	mi := &file_litevirt_v1_service_proto_msgTypes[452]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -30700,7 +30856,7 @@ func (x *RejectRebalanceProposalRequest) String() string {
 func (*RejectRebalanceProposalRequest) ProtoMessage() {}
 
 func (x *RejectRebalanceProposalRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[450]
+	mi := &file_litevirt_v1_service_proto_msgTypes[452]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -30713,7 +30869,7 @@ func (x *RejectRebalanceProposalRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RejectRebalanceProposalRequest.ProtoReflect.Descriptor instead.
 func (*RejectRebalanceProposalRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{450}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{452}
 }
 
 func (x *RejectRebalanceProposalRequest) GetId() string {
@@ -30738,7 +30894,7 @@ type ListRegionsRequest struct {
 
 func (x *ListRegionsRequest) Reset() {
 	*x = ListRegionsRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[451]
+	mi := &file_litevirt_v1_service_proto_msgTypes[453]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -30750,7 +30906,7 @@ func (x *ListRegionsRequest) String() string {
 func (*ListRegionsRequest) ProtoMessage() {}
 
 func (x *ListRegionsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[451]
+	mi := &file_litevirt_v1_service_proto_msgTypes[453]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -30763,7 +30919,7 @@ func (x *ListRegionsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListRegionsRequest.ProtoReflect.Descriptor instead.
 func (*ListRegionsRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{451}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{453}
 }
 
 type ListRegionsResponse struct {
@@ -30775,7 +30931,7 @@ type ListRegionsResponse struct {
 
 func (x *ListRegionsResponse) Reset() {
 	*x = ListRegionsResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[452]
+	mi := &file_litevirt_v1_service_proto_msgTypes[454]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -30787,7 +30943,7 @@ func (x *ListRegionsResponse) String() string {
 func (*ListRegionsResponse) ProtoMessage() {}
 
 func (x *ListRegionsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[452]
+	mi := &file_litevirt_v1_service_proto_msgTypes[454]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -30800,7 +30956,7 @@ func (x *ListRegionsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListRegionsResponse.ProtoReflect.Descriptor instead.
 func (*ListRegionsResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{452}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{454}
 }
 
 func (x *ListRegionsResponse) GetRegions() []string {
@@ -30819,7 +30975,7 @@ type RegionStatusRequest struct {
 
 func (x *RegionStatusRequest) Reset() {
 	*x = RegionStatusRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[453]
+	mi := &file_litevirt_v1_service_proto_msgTypes[455]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -30831,7 +30987,7 @@ func (x *RegionStatusRequest) String() string {
 func (*RegionStatusRequest) ProtoMessage() {}
 
 func (x *RegionStatusRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[453]
+	mi := &file_litevirt_v1_service_proto_msgTypes[455]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -30844,7 +31000,7 @@ func (x *RegionStatusRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RegionStatusRequest.ProtoReflect.Descriptor instead.
 func (*RegionStatusRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{453}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{455}
 }
 
 func (x *RegionStatusRequest) GetRegion() string {
@@ -30863,7 +31019,7 @@ type RegionStatusResponse struct {
 
 func (x *RegionStatusResponse) Reset() {
 	*x = RegionStatusResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[454]
+	mi := &file_litevirt_v1_service_proto_msgTypes[456]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -30875,7 +31031,7 @@ func (x *RegionStatusResponse) String() string {
 func (*RegionStatusResponse) ProtoMessage() {}
 
 func (x *RegionStatusResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[454]
+	mi := &file_litevirt_v1_service_proto_msgTypes[456]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -30888,7 +31044,7 @@ func (x *RegionStatusResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RegionStatusResponse.ProtoReflect.Descriptor instead.
 func (*RegionStatusResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{454}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{456}
 }
 
 func (x *RegionStatusResponse) GetStatuses() []*RegionStatus {
@@ -30911,7 +31067,7 @@ type RegionStatus struct {
 
 func (x *RegionStatus) Reset() {
 	*x = RegionStatus{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[455]
+	mi := &file_litevirt_v1_service_proto_msgTypes[457]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -30923,7 +31079,7 @@ func (x *RegionStatus) String() string {
 func (*RegionStatus) ProtoMessage() {}
 
 func (x *RegionStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[455]
+	mi := &file_litevirt_v1_service_proto_msgTypes[457]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -30936,7 +31092,7 @@ func (x *RegionStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RegionStatus.ProtoReflect.Descriptor instead.
 func (*RegionStatus) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{455}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{457}
 }
 
 func (x *RegionStatus) GetName() string {
@@ -30991,7 +31147,7 @@ type FailoverScopeStatus struct {
 
 func (x *FailoverScopeStatus) Reset() {
 	*x = FailoverScopeStatus{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[456]
+	mi := &file_litevirt_v1_service_proto_msgTypes[458]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -31003,7 +31159,7 @@ func (x *FailoverScopeStatus) String() string {
 func (*FailoverScopeStatus) ProtoMessage() {}
 
 func (x *FailoverScopeStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[456]
+	mi := &file_litevirt_v1_service_proto_msgTypes[458]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -31016,7 +31172,7 @@ func (x *FailoverScopeStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FailoverScopeStatus.ProtoReflect.Descriptor instead.
 func (*FailoverScopeStatus) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{456}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{458}
 }
 
 func (x *FailoverScopeStatus) GetScope() string {
@@ -31073,7 +31229,7 @@ type FailoverScopeRegion struct {
 
 func (x *FailoverScopeRegion) Reset() {
 	*x = FailoverScopeRegion{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[457]
+	mi := &file_litevirt_v1_service_proto_msgTypes[459]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -31085,7 +31241,7 @@ func (x *FailoverScopeRegion) String() string {
 func (*FailoverScopeRegion) ProtoMessage() {}
 
 func (x *FailoverScopeRegion) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[457]
+	mi := &file_litevirt_v1_service_proto_msgTypes[459]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -31098,7 +31254,7 @@ func (x *FailoverScopeRegion) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FailoverScopeRegion.ProtoReflect.Descriptor instead.
 func (*FailoverScopeRegion) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{457}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{459}
 }
 
 func (x *FailoverScopeRegion) GetName() string {
@@ -31159,7 +31315,7 @@ type SetFailoverScopeRequest struct {
 
 func (x *SetFailoverScopeRequest) Reset() {
 	*x = SetFailoverScopeRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[458]
+	mi := &file_litevirt_v1_service_proto_msgTypes[460]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -31171,7 +31327,7 @@ func (x *SetFailoverScopeRequest) String() string {
 func (*SetFailoverScopeRequest) ProtoMessage() {}
 
 func (x *SetFailoverScopeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[458]
+	mi := &file_litevirt_v1_service_proto_msgTypes[460]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -31184,7 +31340,7 @@ func (x *SetFailoverScopeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetFailoverScopeRequest.ProtoReflect.Descriptor instead.
 func (*SetFailoverScopeRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{458}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{460}
 }
 
 func (x *SetFailoverScopeRequest) GetScope() string {
@@ -31204,7 +31360,7 @@ type RestoreRelayRequest struct {
 
 func (x *RestoreRelayRequest) Reset() {
 	*x = RestoreRelayRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[459]
+	mi := &file_litevirt_v1_service_proto_msgTypes[461]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -31216,7 +31372,7 @@ func (x *RestoreRelayRequest) String() string {
 func (*RestoreRelayRequest) ProtoMessage() {}
 
 func (x *RestoreRelayRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[459]
+	mi := &file_litevirt_v1_service_proto_msgTypes[461]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -31229,7 +31385,7 @@ func (x *RestoreRelayRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RestoreRelayRequest.ProtoReflect.Descriptor instead.
 func (*RestoreRelayRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{459}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{461}
 }
 
 func (x *RestoreRelayRequest) GetHost() string {
@@ -31260,7 +31416,7 @@ type RelayHealthEntry struct {
 
 func (x *RelayHealthEntry) Reset() {
 	*x = RelayHealthEntry{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[460]
+	mi := &file_litevirt_v1_service_proto_msgTypes[462]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -31272,7 +31428,7 @@ func (x *RelayHealthEntry) String() string {
 func (*RelayHealthEntry) ProtoMessage() {}
 
 func (x *RelayHealthEntry) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[460]
+	mi := &file_litevirt_v1_service_proto_msgTypes[462]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -31285,7 +31441,7 @@ func (x *RelayHealthEntry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RelayHealthEntry.ProtoReflect.Descriptor instead.
 func (*RelayHealthEntry) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{460}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{462}
 }
 
 func (x *RelayHealthEntry) GetHost() string {
@@ -31340,7 +31496,7 @@ type RelayHealthStatus struct {
 
 func (x *RelayHealthStatus) Reset() {
 	*x = RelayHealthStatus{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[461]
+	mi := &file_litevirt_v1_service_proto_msgTypes[463]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -31352,7 +31508,7 @@ func (x *RelayHealthStatus) String() string {
 func (*RelayHealthStatus) ProtoMessage() {}
 
 func (x *RelayHealthStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[461]
+	mi := &file_litevirt_v1_service_proto_msgTypes[463]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -31365,7 +31521,7 @@ func (x *RelayHealthStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RelayHealthStatus.ProtoReflect.Descriptor instead.
 func (*RelayHealthStatus) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{461}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{463}
 }
 
 func (x *RelayHealthStatus) GetHosts() []*RelayHealthEntry {
@@ -31393,7 +31549,7 @@ type RestoreRelayResponse struct {
 
 func (x *RestoreRelayResponse) Reset() {
 	*x = RestoreRelayResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[462]
+	mi := &file_litevirt_v1_service_proto_msgTypes[464]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -31405,7 +31561,7 @@ func (x *RestoreRelayResponse) String() string {
 func (*RestoreRelayResponse) ProtoMessage() {}
 
 func (x *RestoreRelayResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[462]
+	mi := &file_litevirt_v1_service_proto_msgTypes[464]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -31418,7 +31574,7 @@ func (x *RestoreRelayResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RestoreRelayResponse.ProtoReflect.Descriptor instead.
 func (*RestoreRelayResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{462}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{464}
 }
 
 func (x *RestoreRelayResponse) GetHost() string {
@@ -31465,7 +31621,7 @@ type CrossRegionMigrateRequest struct {
 
 func (x *CrossRegionMigrateRequest) Reset() {
 	*x = CrossRegionMigrateRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[463]
+	mi := &file_litevirt_v1_service_proto_msgTypes[465]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -31477,7 +31633,7 @@ func (x *CrossRegionMigrateRequest) String() string {
 func (*CrossRegionMigrateRequest) ProtoMessage() {}
 
 func (x *CrossRegionMigrateRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[463]
+	mi := &file_litevirt_v1_service_proto_msgTypes[465]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -31490,7 +31646,7 @@ func (x *CrossRegionMigrateRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CrossRegionMigrateRequest.ProtoReflect.Descriptor instead.
 func (*CrossRegionMigrateRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{463}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{465}
 }
 
 func (x *CrossRegionMigrateRequest) GetVmName() string {
@@ -31541,7 +31697,7 @@ type ServiceEndpoint struct {
 
 func (x *ServiceEndpoint) Reset() {
 	*x = ServiceEndpoint{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[464]
+	mi := &file_litevirt_v1_service_proto_msgTypes[466]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -31553,7 +31709,7 @@ func (x *ServiceEndpoint) String() string {
 func (*ServiceEndpoint) ProtoMessage() {}
 
 func (x *ServiceEndpoint) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[464]
+	mi := &file_litevirt_v1_service_proto_msgTypes[466]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -31566,7 +31722,7 @@ func (x *ServiceEndpoint) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ServiceEndpoint.ProtoReflect.Descriptor instead.
 func (*ServiceEndpoint) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{464}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{466}
 }
 
 func (x *ServiceEndpoint) GetServiceName() string {
@@ -31609,7 +31765,7 @@ type UpsertServiceEndpointRequest struct {
 
 func (x *UpsertServiceEndpointRequest) Reset() {
 	*x = UpsertServiceEndpointRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[465]
+	mi := &file_litevirt_v1_service_proto_msgTypes[467]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -31621,7 +31777,7 @@ func (x *UpsertServiceEndpointRequest) String() string {
 func (*UpsertServiceEndpointRequest) ProtoMessage() {}
 
 func (x *UpsertServiceEndpointRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[465]
+	mi := &file_litevirt_v1_service_proto_msgTypes[467]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -31634,7 +31790,7 @@ func (x *UpsertServiceEndpointRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpsertServiceEndpointRequest.ProtoReflect.Descriptor instead.
 func (*UpsertServiceEndpointRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{465}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{467}
 }
 
 func (x *UpsertServiceEndpointRequest) GetServiceName() string {
@@ -31674,7 +31830,7 @@ type ListServiceEndpointsRequest struct {
 
 func (x *ListServiceEndpointsRequest) Reset() {
 	*x = ListServiceEndpointsRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[466]
+	mi := &file_litevirt_v1_service_proto_msgTypes[468]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -31686,7 +31842,7 @@ func (x *ListServiceEndpointsRequest) String() string {
 func (*ListServiceEndpointsRequest) ProtoMessage() {}
 
 func (x *ListServiceEndpointsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[466]
+	mi := &file_litevirt_v1_service_proto_msgTypes[468]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -31699,7 +31855,7 @@ func (x *ListServiceEndpointsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListServiceEndpointsRequest.ProtoReflect.Descriptor instead.
 func (*ListServiceEndpointsRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{466}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{468}
 }
 
 func (x *ListServiceEndpointsRequest) GetServiceName() string {
@@ -31718,7 +31874,7 @@ type ListServiceEndpointsResponse struct {
 
 func (x *ListServiceEndpointsResponse) Reset() {
 	*x = ListServiceEndpointsResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[467]
+	mi := &file_litevirt_v1_service_proto_msgTypes[469]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -31730,7 +31886,7 @@ func (x *ListServiceEndpointsResponse) String() string {
 func (*ListServiceEndpointsResponse) ProtoMessage() {}
 
 func (x *ListServiceEndpointsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[467]
+	mi := &file_litevirt_v1_service_proto_msgTypes[469]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -31743,7 +31899,7 @@ func (x *ListServiceEndpointsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListServiceEndpointsResponse.ProtoReflect.Descriptor instead.
 func (*ListServiceEndpointsResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{467}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{469}
 }
 
 func (x *ListServiceEndpointsResponse) GetEndpoints() []*ServiceEndpoint {
@@ -31763,7 +31919,7 @@ type DeleteServiceEndpointRequest struct {
 
 func (x *DeleteServiceEndpointRequest) Reset() {
 	*x = DeleteServiceEndpointRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[468]
+	mi := &file_litevirt_v1_service_proto_msgTypes[470]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -31775,7 +31931,7 @@ func (x *DeleteServiceEndpointRequest) String() string {
 func (*DeleteServiceEndpointRequest) ProtoMessage() {}
 
 func (x *DeleteServiceEndpointRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[468]
+	mi := &file_litevirt_v1_service_proto_msgTypes[470]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -31788,7 +31944,7 @@ func (x *DeleteServiceEndpointRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteServiceEndpointRequest.ProtoReflect.Descriptor instead.
 func (*DeleteServiceEndpointRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{468}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{470}
 }
 
 func (x *DeleteServiceEndpointRequest) GetServiceName() string {
@@ -31827,7 +31983,7 @@ type BackupSchedule struct {
 
 func (x *BackupSchedule) Reset() {
 	*x = BackupSchedule{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[469]
+	mi := &file_litevirt_v1_service_proto_msgTypes[471]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -31839,7 +31995,7 @@ func (x *BackupSchedule) String() string {
 func (*BackupSchedule) ProtoMessage() {}
 
 func (x *BackupSchedule) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[469]
+	mi := &file_litevirt_v1_service_proto_msgTypes[471]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -31852,7 +32008,7 @@ func (x *BackupSchedule) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BackupSchedule.ProtoReflect.Descriptor instead.
 func (*BackupSchedule) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{469}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{471}
 }
 
 func (x *BackupSchedule) GetVmName() string {
@@ -31973,7 +32129,7 @@ type CreateBackupScheduleRequest struct {
 
 func (x *CreateBackupScheduleRequest) Reset() {
 	*x = CreateBackupScheduleRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[470]
+	mi := &file_litevirt_v1_service_proto_msgTypes[472]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -31985,7 +32141,7 @@ func (x *CreateBackupScheduleRequest) String() string {
 func (*CreateBackupScheduleRequest) ProtoMessage() {}
 
 func (x *CreateBackupScheduleRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[470]
+	mi := &file_litevirt_v1_service_proto_msgTypes[472]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -31998,7 +32154,7 @@ func (x *CreateBackupScheduleRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateBackupScheduleRequest.ProtoReflect.Descriptor instead.
 func (*CreateBackupScheduleRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{470}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{472}
 }
 
 func (x *CreateBackupScheduleRequest) GetVmName() string {
@@ -32093,7 +32249,7 @@ type ListBackupSchedulesRequest struct {
 
 func (x *ListBackupSchedulesRequest) Reset() {
 	*x = ListBackupSchedulesRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[471]
+	mi := &file_litevirt_v1_service_proto_msgTypes[473]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -32105,7 +32261,7 @@ func (x *ListBackupSchedulesRequest) String() string {
 func (*ListBackupSchedulesRequest) ProtoMessage() {}
 
 func (x *ListBackupSchedulesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[471]
+	mi := &file_litevirt_v1_service_proto_msgTypes[473]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -32118,7 +32274,7 @@ func (x *ListBackupSchedulesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListBackupSchedulesRequest.ProtoReflect.Descriptor instead.
 func (*ListBackupSchedulesRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{471}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{473}
 }
 
 type ListBackupSchedulesResponse struct {
@@ -32130,7 +32286,7 @@ type ListBackupSchedulesResponse struct {
 
 func (x *ListBackupSchedulesResponse) Reset() {
 	*x = ListBackupSchedulesResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[472]
+	mi := &file_litevirt_v1_service_proto_msgTypes[474]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -32142,7 +32298,7 @@ func (x *ListBackupSchedulesResponse) String() string {
 func (*ListBackupSchedulesResponse) ProtoMessage() {}
 
 func (x *ListBackupSchedulesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[472]
+	mi := &file_litevirt_v1_service_proto_msgTypes[474]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -32155,7 +32311,7 @@ func (x *ListBackupSchedulesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListBackupSchedulesResponse.ProtoReflect.Descriptor instead.
 func (*ListBackupSchedulesResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{472}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{474}
 }
 
 func (x *ListBackupSchedulesResponse) GetSchedules() []*BackupSchedule {
@@ -32178,7 +32334,7 @@ type DeleteBackupScheduleRequest struct {
 
 func (x *DeleteBackupScheduleRequest) Reset() {
 	*x = DeleteBackupScheduleRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[473]
+	mi := &file_litevirt_v1_service_proto_msgTypes[475]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -32190,7 +32346,7 @@ func (x *DeleteBackupScheduleRequest) String() string {
 func (*DeleteBackupScheduleRequest) ProtoMessage() {}
 
 func (x *DeleteBackupScheduleRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[473]
+	mi := &file_litevirt_v1_service_proto_msgTypes[475]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -32203,7 +32359,7 @@ func (x *DeleteBackupScheduleRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteBackupScheduleRequest.ProtoReflect.Descriptor instead.
 func (*DeleteBackupScheduleRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{473}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{475}
 }
 
 func (x *DeleteBackupScheduleRequest) GetVmName() string {
@@ -32263,7 +32419,7 @@ type ReplicationSchedule struct {
 
 func (x *ReplicationSchedule) Reset() {
 	*x = ReplicationSchedule{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[474]
+	mi := &file_litevirt_v1_service_proto_msgTypes[476]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -32275,7 +32431,7 @@ func (x *ReplicationSchedule) String() string {
 func (*ReplicationSchedule) ProtoMessage() {}
 
 func (x *ReplicationSchedule) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[474]
+	mi := &file_litevirt_v1_service_proto_msgTypes[476]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -32288,7 +32444,7 @@ func (x *ReplicationSchedule) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReplicationSchedule.ProtoReflect.Descriptor instead.
 func (*ReplicationSchedule) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{474}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{476}
 }
 
 func (x *ReplicationSchedule) GetVmName() string {
@@ -32401,7 +32557,7 @@ type CreateReplicationScheduleRequest struct {
 
 func (x *CreateReplicationScheduleRequest) Reset() {
 	*x = CreateReplicationScheduleRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[475]
+	mi := &file_litevirt_v1_service_proto_msgTypes[477]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -32413,7 +32569,7 @@ func (x *CreateReplicationScheduleRequest) String() string {
 func (*CreateReplicationScheduleRequest) ProtoMessage() {}
 
 func (x *CreateReplicationScheduleRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[475]
+	mi := &file_litevirt_v1_service_proto_msgTypes[477]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -32426,7 +32582,7 @@ func (x *CreateReplicationScheduleRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateReplicationScheduleRequest.ProtoReflect.Descriptor instead.
 func (*CreateReplicationScheduleRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{475}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{477}
 }
 
 func (x *CreateReplicationScheduleRequest) GetVmName() string {
@@ -32514,7 +32670,7 @@ type ListReplicationSchedulesRequest struct {
 
 func (x *ListReplicationSchedulesRequest) Reset() {
 	*x = ListReplicationSchedulesRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[476]
+	mi := &file_litevirt_v1_service_proto_msgTypes[478]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -32526,7 +32682,7 @@ func (x *ListReplicationSchedulesRequest) String() string {
 func (*ListReplicationSchedulesRequest) ProtoMessage() {}
 
 func (x *ListReplicationSchedulesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[476]
+	mi := &file_litevirt_v1_service_proto_msgTypes[478]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -32539,7 +32695,7 @@ func (x *ListReplicationSchedulesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListReplicationSchedulesRequest.ProtoReflect.Descriptor instead.
 func (*ListReplicationSchedulesRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{476}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{478}
 }
 
 type ListReplicationSchedulesResponse struct {
@@ -32551,7 +32707,7 @@ type ListReplicationSchedulesResponse struct {
 
 func (x *ListReplicationSchedulesResponse) Reset() {
 	*x = ListReplicationSchedulesResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[477]
+	mi := &file_litevirt_v1_service_proto_msgTypes[479]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -32563,7 +32719,7 @@ func (x *ListReplicationSchedulesResponse) String() string {
 func (*ListReplicationSchedulesResponse) ProtoMessage() {}
 
 func (x *ListReplicationSchedulesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[477]
+	mi := &file_litevirt_v1_service_proto_msgTypes[479]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -32576,7 +32732,7 @@ func (x *ListReplicationSchedulesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListReplicationSchedulesResponse.ProtoReflect.Descriptor instead.
 func (*ListReplicationSchedulesResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{477}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{479}
 }
 
 func (x *ListReplicationSchedulesResponse) GetSchedules() []*ReplicationSchedule {
@@ -32599,7 +32755,7 @@ type DeleteReplicationScheduleRequest struct {
 
 func (x *DeleteReplicationScheduleRequest) Reset() {
 	*x = DeleteReplicationScheduleRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[478]
+	mi := &file_litevirt_v1_service_proto_msgTypes[480]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -32611,7 +32767,7 @@ func (x *DeleteReplicationScheduleRequest) String() string {
 func (*DeleteReplicationScheduleRequest) ProtoMessage() {}
 
 func (x *DeleteReplicationScheduleRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[478]
+	mi := &file_litevirt_v1_service_proto_msgTypes[480]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -32624,7 +32780,7 @@ func (x *DeleteReplicationScheduleRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteReplicationScheduleRequest.ProtoReflect.Descriptor instead.
 func (*DeleteReplicationScheduleRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{478}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{480}
 }
 
 func (x *DeleteReplicationScheduleRequest) GetVmName() string {
@@ -32754,7 +32910,7 @@ type VerifyAuditChainResponse struct {
 
 func (x *VerifyAuditChainResponse) Reset() {
 	*x = VerifyAuditChainResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[479]
+	mi := &file_litevirt_v1_service_proto_msgTypes[481]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -32766,7 +32922,7 @@ func (x *VerifyAuditChainResponse) String() string {
 func (*VerifyAuditChainResponse) ProtoMessage() {}
 
 func (x *VerifyAuditChainResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[479]
+	mi := &file_litevirt_v1_service_proto_msgTypes[481]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -32779,7 +32935,7 @@ func (x *VerifyAuditChainResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VerifyAuditChainResponse.ProtoReflect.Descriptor instead.
 func (*VerifyAuditChainResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{479}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{481}
 }
 
 func (x *VerifyAuditChainResponse) GetRowsChecked() int32 {
@@ -33001,7 +33157,7 @@ type RetireAuditKeyRequest struct {
 
 func (x *RetireAuditKeyRequest) Reset() {
 	*x = RetireAuditKeyRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[480]
+	mi := &file_litevirt_v1_service_proto_msgTypes[482]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -33013,7 +33169,7 @@ func (x *RetireAuditKeyRequest) String() string {
 func (*RetireAuditKeyRequest) ProtoMessage() {}
 
 func (x *RetireAuditKeyRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[480]
+	mi := &file_litevirt_v1_service_proto_msgTypes[482]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -33026,7 +33182,7 @@ func (x *RetireAuditKeyRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RetireAuditKeyRequest.ProtoReflect.Descriptor instead.
 func (*RetireAuditKeyRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{480}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{482}
 }
 
 func (x *RetireAuditKeyRequest) GetHostName() string {
@@ -33098,7 +33254,7 @@ type RetireAuditKeyResponse struct {
 
 func (x *RetireAuditKeyResponse) Reset() {
 	*x = RetireAuditKeyResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[481]
+	mi := &file_litevirt_v1_service_proto_msgTypes[483]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -33110,7 +33266,7 @@ func (x *RetireAuditKeyResponse) String() string {
 func (*RetireAuditKeyResponse) ProtoMessage() {}
 
 func (x *RetireAuditKeyResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[481]
+	mi := &file_litevirt_v1_service_proto_msgTypes[483]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -33123,7 +33279,7 @@ func (x *RetireAuditKeyResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RetireAuditKeyResponse.ProtoReflect.Descriptor instead.
 func (*RetireAuditKeyResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{481}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{483}
 }
 
 func (x *RetireAuditKeyResponse) GetRetiredKeyId() string {
@@ -33167,7 +33323,7 @@ type ExportAuditChainRequest struct {
 
 func (x *ExportAuditChainRequest) Reset() {
 	*x = ExportAuditChainRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[482]
+	mi := &file_litevirt_v1_service_proto_msgTypes[484]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -33179,7 +33335,7 @@ func (x *ExportAuditChainRequest) String() string {
 func (*ExportAuditChainRequest) ProtoMessage() {}
 
 func (x *ExportAuditChainRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[482]
+	mi := &file_litevirt_v1_service_proto_msgTypes[484]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -33192,7 +33348,7 @@ func (x *ExportAuditChainRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExportAuditChainRequest.ProtoReflect.Descriptor instead.
 func (*ExportAuditChainRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{482}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{484}
 }
 
 func (x *ExportAuditChainRequest) GetSince() string {
@@ -33242,7 +33398,7 @@ type ExportAuditChainResponse struct {
 
 func (x *ExportAuditChainResponse) Reset() {
 	*x = ExportAuditChainResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[483]
+	mi := &file_litevirt_v1_service_proto_msgTypes[485]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -33254,7 +33410,7 @@ func (x *ExportAuditChainResponse) String() string {
 func (*ExportAuditChainResponse) ProtoMessage() {}
 
 func (x *ExportAuditChainResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[483]
+	mi := &file_litevirt_v1_service_proto_msgTypes[485]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -33267,7 +33423,7 @@ func (x *ExportAuditChainResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExportAuditChainResponse.ProtoReflect.Descriptor instead.
 func (*ExportAuditChainResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{483}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{485}
 }
 
 func (x *ExportAuditChainResponse) GetJson() string {
@@ -33304,7 +33460,7 @@ type Project struct {
 
 func (x *Project) Reset() {
 	*x = Project{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[484]
+	mi := &file_litevirt_v1_service_proto_msgTypes[486]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -33316,7 +33472,7 @@ func (x *Project) String() string {
 func (*Project) ProtoMessage() {}
 
 func (x *Project) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[484]
+	mi := &file_litevirt_v1_service_proto_msgTypes[486]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -33329,7 +33485,7 @@ func (x *Project) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Project.ProtoReflect.Descriptor instead.
 func (*Project) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{484}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{486}
 }
 
 func (x *Project) GetName() string {
@@ -33378,7 +33534,7 @@ type CreateProjectRequest struct {
 
 func (x *CreateProjectRequest) Reset() {
 	*x = CreateProjectRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[485]
+	mi := &file_litevirt_v1_service_proto_msgTypes[487]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -33390,7 +33546,7 @@ func (x *CreateProjectRequest) String() string {
 func (*CreateProjectRequest) ProtoMessage() {}
 
 func (x *CreateProjectRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[485]
+	mi := &file_litevirt_v1_service_proto_msgTypes[487]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -33403,7 +33559,7 @@ func (x *CreateProjectRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateProjectRequest.ProtoReflect.Descriptor instead.
 func (*CreateProjectRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{485}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{487}
 }
 
 func (x *CreateProjectRequest) GetName() string {
@@ -33436,7 +33592,7 @@ type ListProjectsResponse struct {
 
 func (x *ListProjectsResponse) Reset() {
 	*x = ListProjectsResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[486]
+	mi := &file_litevirt_v1_service_proto_msgTypes[488]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -33448,7 +33604,7 @@ func (x *ListProjectsResponse) String() string {
 func (*ListProjectsResponse) ProtoMessage() {}
 
 func (x *ListProjectsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[486]
+	mi := &file_litevirt_v1_service_proto_msgTypes[488]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -33461,7 +33617,7 @@ func (x *ListProjectsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListProjectsResponse.ProtoReflect.Descriptor instead.
 func (*ListProjectsResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{486}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{488}
 }
 
 func (x *ListProjectsResponse) GetProjects() []*Project {
@@ -33480,7 +33636,7 @@ type GetProjectRequest struct {
 
 func (x *GetProjectRequest) Reset() {
 	*x = GetProjectRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[487]
+	mi := &file_litevirt_v1_service_proto_msgTypes[489]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -33492,7 +33648,7 @@ func (x *GetProjectRequest) String() string {
 func (*GetProjectRequest) ProtoMessage() {}
 
 func (x *GetProjectRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[487]
+	mi := &file_litevirt_v1_service_proto_msgTypes[489]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -33505,7 +33661,7 @@ func (x *GetProjectRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetProjectRequest.ProtoReflect.Descriptor instead.
 func (*GetProjectRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{487}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{489}
 }
 
 func (x *GetProjectRequest) GetName() string {
@@ -33524,7 +33680,7 @@ type DeleteProjectRequest struct {
 
 func (x *DeleteProjectRequest) Reset() {
 	*x = DeleteProjectRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[488]
+	mi := &file_litevirt_v1_service_proto_msgTypes[490]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -33536,7 +33692,7 @@ func (x *DeleteProjectRequest) String() string {
 func (*DeleteProjectRequest) ProtoMessage() {}
 
 func (x *DeleteProjectRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[488]
+	mi := &file_litevirt_v1_service_proto_msgTypes[490]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -33549,7 +33705,7 @@ func (x *DeleteProjectRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteProjectRequest.ProtoReflect.Descriptor instead.
 func (*DeleteProjectRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{488}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{490}
 }
 
 func (x *DeleteProjectRequest) GetName() string {
@@ -33574,7 +33730,7 @@ type ProjectQuota struct {
 
 func (x *ProjectQuota) Reset() {
 	*x = ProjectQuota{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[489]
+	mi := &file_litevirt_v1_service_proto_msgTypes[491]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -33586,7 +33742,7 @@ func (x *ProjectQuota) String() string {
 func (*ProjectQuota) ProtoMessage() {}
 
 func (x *ProjectQuota) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[489]
+	mi := &file_litevirt_v1_service_proto_msgTypes[491]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -33599,7 +33755,7 @@ func (x *ProjectQuota) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ProjectQuota.ProtoReflect.Descriptor instead.
 func (*ProjectQuota) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{489}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{491}
 }
 
 func (x *ProjectQuota) GetProjectName() string {
@@ -33660,7 +33816,7 @@ type SetProjectQuotaRequest struct {
 
 func (x *SetProjectQuotaRequest) Reset() {
 	*x = SetProjectQuotaRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[490]
+	mi := &file_litevirt_v1_service_proto_msgTypes[492]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -33672,7 +33828,7 @@ func (x *SetProjectQuotaRequest) String() string {
 func (*SetProjectQuotaRequest) ProtoMessage() {}
 
 func (x *SetProjectQuotaRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[490]
+	mi := &file_litevirt_v1_service_proto_msgTypes[492]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -33685,7 +33841,7 @@ func (x *SetProjectQuotaRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetProjectQuotaRequest.ProtoReflect.Descriptor instead.
 func (*SetProjectQuotaRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{490}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{492}
 }
 
 func (x *SetProjectQuotaRequest) GetQuota() *ProjectQuota {
@@ -33704,7 +33860,7 @@ type GetProjectQuotaRequest struct {
 
 func (x *GetProjectQuotaRequest) Reset() {
 	*x = GetProjectQuotaRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[491]
+	mi := &file_litevirt_v1_service_proto_msgTypes[493]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -33716,7 +33872,7 @@ func (x *GetProjectQuotaRequest) String() string {
 func (*GetProjectQuotaRequest) ProtoMessage() {}
 
 func (x *GetProjectQuotaRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[491]
+	mi := &file_litevirt_v1_service_proto_msgTypes[493]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -33729,7 +33885,7 @@ func (x *GetProjectQuotaRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetProjectQuotaRequest.ProtoReflect.Descriptor instead.
 func (*GetProjectQuotaRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{491}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{493}
 }
 
 func (x *GetProjectQuotaRequest) GetProjectName() string {
@@ -33755,7 +33911,7 @@ type ProjectUsage struct {
 
 func (x *ProjectUsage) Reset() {
 	*x = ProjectUsage{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[492]
+	mi := &file_litevirt_v1_service_proto_msgTypes[494]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -33767,7 +33923,7 @@ func (x *ProjectUsage) String() string {
 func (*ProjectUsage) ProtoMessage() {}
 
 func (x *ProjectUsage) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[492]
+	mi := &file_litevirt_v1_service_proto_msgTypes[494]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -33780,7 +33936,7 @@ func (x *ProjectUsage) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ProjectUsage.ProtoReflect.Descriptor instead.
 func (*ProjectUsage) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{492}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{494}
 }
 
 func (x *ProjectUsage) GetProjectName() string {
@@ -33848,7 +34004,7 @@ type GetProjectUsageRequest struct {
 
 func (x *GetProjectUsageRequest) Reset() {
 	*x = GetProjectUsageRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[493]
+	mi := &file_litevirt_v1_service_proto_msgTypes[495]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -33860,7 +34016,7 @@ func (x *GetProjectUsageRequest) String() string {
 func (*GetProjectUsageRequest) ProtoMessage() {}
 
 func (x *GetProjectUsageRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[493]
+	mi := &file_litevirt_v1_service_proto_msgTypes[495]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -33873,7 +34029,7 @@ func (x *GetProjectUsageRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetProjectUsageRequest.ProtoReflect.Descriptor instead.
 func (*GetProjectUsageRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{493}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{495}
 }
 
 func (x *GetProjectUsageRequest) GetProjectName() string {
@@ -33925,7 +34081,7 @@ type ReserveProjectCapacityRequest struct {
 
 func (x *ReserveProjectCapacityRequest) Reset() {
 	*x = ReserveProjectCapacityRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[494]
+	mi := &file_litevirt_v1_service_proto_msgTypes[496]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -33937,7 +34093,7 @@ func (x *ReserveProjectCapacityRequest) String() string {
 func (*ReserveProjectCapacityRequest) ProtoMessage() {}
 
 func (x *ReserveProjectCapacityRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[494]
+	mi := &file_litevirt_v1_service_proto_msgTypes[496]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -33950,7 +34106,7 @@ func (x *ReserveProjectCapacityRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReserveProjectCapacityRequest.ProtoReflect.Descriptor instead.
 func (*ReserveProjectCapacityRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{494}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{496}
 }
 
 func (x *ReserveProjectCapacityRequest) GetProject() string {
@@ -34061,7 +34217,7 @@ type ReserveProjectCapacityResponse struct {
 
 func (x *ReserveProjectCapacityResponse) Reset() {
 	*x = ReserveProjectCapacityResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[495]
+	mi := &file_litevirt_v1_service_proto_msgTypes[497]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -34073,7 +34229,7 @@ func (x *ReserveProjectCapacityResponse) String() string {
 func (*ReserveProjectCapacityResponse) ProtoMessage() {}
 
 func (x *ReserveProjectCapacityResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[495]
+	mi := &file_litevirt_v1_service_proto_msgTypes[497]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -34086,7 +34242,7 @@ func (x *ReserveProjectCapacityResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReserveProjectCapacityResponse.ProtoReflect.Descriptor instead.
 func (*ReserveProjectCapacityResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{495}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{497}
 }
 
 func (x *ReserveProjectCapacityResponse) GetLeaseId() string {
@@ -34113,7 +34269,7 @@ type ReleaseProjectCapacityRequest struct {
 
 func (x *ReleaseProjectCapacityRequest) Reset() {
 	*x = ReleaseProjectCapacityRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[496]
+	mi := &file_litevirt_v1_service_proto_msgTypes[498]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -34125,7 +34281,7 @@ func (x *ReleaseProjectCapacityRequest) String() string {
 func (*ReleaseProjectCapacityRequest) ProtoMessage() {}
 
 func (x *ReleaseProjectCapacityRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[496]
+	mi := &file_litevirt_v1_service_proto_msgTypes[498]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -34138,7 +34294,7 @@ func (x *ReleaseProjectCapacityRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReleaseProjectCapacityRequest.ProtoReflect.Descriptor instead.
 func (*ReleaseProjectCapacityRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{496}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{498}
 }
 
 func (x *ReleaseProjectCapacityRequest) GetProject() string {
@@ -34175,7 +34331,7 @@ type ReserveHostCapacityRequest struct {
 
 func (x *ReserveHostCapacityRequest) Reset() {
 	*x = ReserveHostCapacityRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[497]
+	mi := &file_litevirt_v1_service_proto_msgTypes[499]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -34187,7 +34343,7 @@ func (x *ReserveHostCapacityRequest) String() string {
 func (*ReserveHostCapacityRequest) ProtoMessage() {}
 
 func (x *ReserveHostCapacityRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[497]
+	mi := &file_litevirt_v1_service_proto_msgTypes[499]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -34200,7 +34356,7 @@ func (x *ReserveHostCapacityRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReserveHostCapacityRequest.ProtoReflect.Descriptor instead.
 func (*ReserveHostCapacityRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{497}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{499}
 }
 
 func (x *ReserveHostCapacityRequest) GetHost() string {
@@ -34277,7 +34433,7 @@ type ReserveHostCapacityResponse struct {
 
 func (x *ReserveHostCapacityResponse) Reset() {
 	*x = ReserveHostCapacityResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[498]
+	mi := &file_litevirt_v1_service_proto_msgTypes[500]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -34289,7 +34445,7 @@ func (x *ReserveHostCapacityResponse) String() string {
 func (*ReserveHostCapacityResponse) ProtoMessage() {}
 
 func (x *ReserveHostCapacityResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[498]
+	mi := &file_litevirt_v1_service_proto_msgTypes[500]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -34302,7 +34458,7 @@ func (x *ReserveHostCapacityResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReserveHostCapacityResponse.ProtoReflect.Descriptor instead.
 func (*ReserveHostCapacityResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{498}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{500}
 }
 
 func (x *ReserveHostCapacityResponse) GetLeaseId() string {
@@ -34321,7 +34477,7 @@ type ReleaseHostCapacityRequest struct {
 
 func (x *ReleaseHostCapacityRequest) Reset() {
 	*x = ReleaseHostCapacityRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[499]
+	mi := &file_litevirt_v1_service_proto_msgTypes[501]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -34333,7 +34489,7 @@ func (x *ReleaseHostCapacityRequest) String() string {
 func (*ReleaseHostCapacityRequest) ProtoMessage() {}
 
 func (x *ReleaseHostCapacityRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[499]
+	mi := &file_litevirt_v1_service_proto_msgTypes[501]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -34346,7 +34502,7 @@ func (x *ReleaseHostCapacityRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReleaseHostCapacityRequest.ProtoReflect.Descriptor instead.
 func (*ReleaseHostCapacityRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{499}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{501}
 }
 
 func (x *ReleaseHostCapacityRequest) GetLeaseId() string {
@@ -34381,7 +34537,7 @@ type FenceHostPosture struct {
 
 func (x *FenceHostPosture) Reset() {
 	*x = FenceHostPosture{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[500]
+	mi := &file_litevirt_v1_service_proto_msgTypes[502]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -34393,7 +34549,7 @@ func (x *FenceHostPosture) String() string {
 func (*FenceHostPosture) ProtoMessage() {}
 
 func (x *FenceHostPosture) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[500]
+	mi := &file_litevirt_v1_service_proto_msgTypes[502]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -34406,7 +34562,7 @@ func (x *FenceHostPosture) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FenceHostPosture.ProtoReflect.Descriptor instead.
 func (*FenceHostPosture) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{500}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{502}
 }
 
 func (x *FenceHostPosture) GetHost() string {
@@ -34509,7 +34665,7 @@ type FenceReadiness struct {
 
 func (x *FenceReadiness) Reset() {
 	*x = FenceReadiness{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[501]
+	mi := &file_litevirt_v1_service_proto_msgTypes[503]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -34521,7 +34677,7 @@ func (x *FenceReadiness) String() string {
 func (*FenceReadiness) ProtoMessage() {}
 
 func (x *FenceReadiness) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[501]
+	mi := &file_litevirt_v1_service_proto_msgTypes[503]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -34534,7 +34690,7 @@ func (x *FenceReadiness) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FenceReadiness.ProtoReflect.Descriptor instead.
 func (*FenceReadiness) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{501}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{503}
 }
 
 func (x *FenceReadiness) GetCapabilityLatched() bool {
@@ -34617,7 +34773,7 @@ type FenceEvent struct {
 
 func (x *FenceEvent) Reset() {
 	*x = FenceEvent{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[502]
+	mi := &file_litevirt_v1_service_proto_msgTypes[504]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -34629,7 +34785,7 @@ func (x *FenceEvent) String() string {
 func (*FenceEvent) ProtoMessage() {}
 
 func (x *FenceEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[502]
+	mi := &file_litevirt_v1_service_proto_msgTypes[504]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -34642,7 +34798,7 @@ func (x *FenceEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FenceEvent.ProtoReflect.Descriptor instead.
 func (*FenceEvent) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{502}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{504}
 }
 
 func (x *FenceEvent) GetHost() string {
@@ -34707,7 +34863,7 @@ type ImportLeftoverFile struct {
 
 func (x *ImportLeftoverFile) Reset() {
 	*x = ImportLeftoverFile{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[503]
+	mi := &file_litevirt_v1_service_proto_msgTypes[505]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -34719,7 +34875,7 @@ func (x *ImportLeftoverFile) String() string {
 func (*ImportLeftoverFile) ProtoMessage() {}
 
 func (x *ImportLeftoverFile) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[503]
+	mi := &file_litevirt_v1_service_proto_msgTypes[505]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -34732,7 +34888,7 @@ func (x *ImportLeftoverFile) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ImportLeftoverFile.ProtoReflect.Descriptor instead.
 func (*ImportLeftoverFile) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{503}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{505}
 }
 
 func (x *ImportLeftoverFile) GetName() string {
@@ -34781,7 +34937,7 @@ type ImportLeftoverStatusRequest struct {
 
 func (x *ImportLeftoverStatusRequest) Reset() {
 	*x = ImportLeftoverStatusRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[504]
+	mi := &file_litevirt_v1_service_proto_msgTypes[506]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -34793,7 +34949,7 @@ func (x *ImportLeftoverStatusRequest) String() string {
 func (*ImportLeftoverStatusRequest) ProtoMessage() {}
 
 func (x *ImportLeftoverStatusRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[504]
+	mi := &file_litevirt_v1_service_proto_msgTypes[506]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -34806,7 +34962,7 @@ func (x *ImportLeftoverStatusRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ImportLeftoverStatusRequest.ProtoReflect.Descriptor instead.
 func (*ImportLeftoverStatusRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{504}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{506}
 }
 
 func (x *ImportLeftoverStatusRequest) GetPool() string {
@@ -34834,7 +34990,7 @@ type ImportLeftoverStatusResponse struct {
 
 func (x *ImportLeftoverStatusResponse) Reset() {
 	*x = ImportLeftoverStatusResponse{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[505]
+	mi := &file_litevirt_v1_service_proto_msgTypes[507]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -34846,7 +35002,7 @@ func (x *ImportLeftoverStatusResponse) String() string {
 func (*ImportLeftoverStatusResponse) ProtoMessage() {}
 
 func (x *ImportLeftoverStatusResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[505]
+	mi := &file_litevirt_v1_service_proto_msgTypes[507]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -34859,7 +35015,7 @@ func (x *ImportLeftoverStatusResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ImportLeftoverStatusResponse.ProtoReflect.Descriptor instead.
 func (*ImportLeftoverStatusResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{505}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{507}
 }
 
 func (x *ImportLeftoverStatusResponse) GetDead() []string {
@@ -34880,7 +35036,7 @@ type PreflightRecreateVMRequest struct {
 
 func (x *PreflightRecreateVMRequest) Reset() {
 	*x = PreflightRecreateVMRequest{}
-	mi := &file_litevirt_v1_service_proto_msgTypes[506]
+	mi := &file_litevirt_v1_service_proto_msgTypes[508]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -34892,7 +35048,7 @@ func (x *PreflightRecreateVMRequest) String() string {
 func (*PreflightRecreateVMRequest) ProtoMessage() {}
 
 func (x *PreflightRecreateVMRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_service_proto_msgTypes[506]
+	mi := &file_litevirt_v1_service_proto_msgTypes[508]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -34905,7 +35061,7 @@ func (x *PreflightRecreateVMRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PreflightRecreateVMRequest.ProtoReflect.Descriptor instead.
 func (*PreflightRecreateVMRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{506}
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{508}
 }
 
 func (x *PreflightRecreateVMRequest) GetSpec() *VMSpec {
@@ -34966,7 +35122,16 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x11PublishCRLRequest\x12\x17\n" +
 	"\acrl_pem\x18\x01 \x01(\tR\x06crlPem\".\n" +
 	"\x12PublishCRLResponse\x12\x18\n" +
-	"\aversion\x18\x01 \x01(\x03R\aversion\"r\n" +
+	"\aversion\x18\x01 \x01(\x03R\aversion\"g\n" +
+	" RevokeReplacedCertificateRequest\x12\x12\n" +
+	"\x04host\x18\x01 \x01(\tR\x04host\x12\x16\n" +
+	"\x06serial\x18\x02 \x01(\tR\x06serial\x12\x17\n" +
+	"\acrl_pem\x18\x03 \x01(\tR\x06crlPem\"\x83\x01\n" +
+	"!RevokeReplacedCertificateResponse\x12\x18\n" +
+	"\arevoked\x18\x01 \x01(\bR\arevoked\x12\x12\n" +
+	"\x04held\x18\x02 \x01(\bR\x04held\x12\x16\n" +
+	"\x06reason\x18\x03 \x01(\tR\x06reason\x12\x18\n" +
+	"\aversion\x18\x04 \x01(\x03R\aversion\"r\n" +
 	"\vFenceResult\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x12\x16\n" +
 	"\x06method\x18\x02 \x01(\tR\x06method\x12\x16\n" +
@@ -36855,15 +37020,19 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x06accept\x18\x03 \x01(\v2\x18.litevirt.v1.ClaimAcceptR\x06accept\x12\x14\n" +
 	"\x05voter\x18\x04 \x01(\tR\x05voter\x12%\n" +
 	"\x0erefusal_reason\x18\x05 \x01(\tR\rrefusalReason\x12%\n" +
-	"\x0erefusal_detail\x18\x06 \x01(\tR\rrefusalDetail\"J\n" +
+	"\x0erefusal_detail\x18\x06 \x01(\tR\rrefusalDetail\"f\n" +
 	"\x17GetRecoveryClaimRequest\x12/\n" +
-	"\x03key\x18\x01 \x01(\v2\x1d.litevirt.v1.RecoveryClaimKeyR\x03key\"\x9c\x02\n" +
+	"\x03key\x18\x01 \x01(\v2\x1d.litevirt.v1.RecoveryClaimKeyR\x03key\x12\x1a\n" +
+	"\breattest\x18\x02 \x01(\bR\breattest\"\xd6\x02\n" +
 	"\x18GetRecoveryClaimResponse\x12?\n" +
 	"\x05state\x18\x01 \x01(\v2).litevirt.v1.PrepareRecoveryClaimResponseR\x05state\x120\n" +
 	"\x06accept\x18\x02 \x01(\v2\x18.litevirt.v1.ClaimAcceptR\x06accept\x12.\n" +
 	"\x13last_refusal_reason\x18\x03 \x01(\tR\x11lastRefusalReason\x12.\n" +
 	"\x13last_refusal_detail\x18\x04 \x01(\tR\x11lastRefusalDetail\x12-\n" +
-	"\x12adopted_generation\x18\x05 \x01(\x03R\x11adoptedGeneration\"H\n" +
+	"\x12adopted_generation\x18\x05 \x01(\x03R\x11adoptedGeneration\x128\n" +
+	"\n" +
+	"reattested\x18\x06 \x01(\v2\x18.litevirt.v1.ClaimAcceptR\n" +
+	"reattested\"H\n" +
 	"\x19ListRecoveryClaimsRequest\x12+\n" +
 	"\x11config_generation\x18\x01 \x01(\x03R\x10configGeneration\"\x80\x03\n" +
 	"\x12RecoveryClaimState\x12\x16\n" +
@@ -37699,7 +37868,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x0eRelayVIPResult\x12\x15\n" +
 	"\x11RELAY_VIP_UNKNOWN\x10\x00\x12\x14\n" +
 	"\x10RELAY_VIP_CLAIMS\x10\x01\x12\x17\n" +
-	"\x13RELAY_VIP_NO_CLAIMS\x10\x022\x9a\xc8\x01\n" +
+	"\x13RELAY_VIP_NO_CLAIMS\x10\x022\x96\xc9\x01\n" +
 	"\bLiteVirt\x12J\n" +
 	"\tListHosts\x12\x1d.litevirt.v1.ListHostsRequest\x1a\x1e.litevirt.v1.ListHostsResponse\x12A\n" +
 	"\vInspectHost\x12\x1f.litevirt.v1.InspectHostRequest\x1a\x11.litevirt.v1.Host\x12H\n" +
@@ -37722,7 +37891,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\n" +
 	"ReseedHost\x12\x1e.litevirt.v1.ReseedHostRequest\x1a\x1f.litevirt.v1.ReseedHostResponse\x12M\n" +
 	"\n" +
-	"PublishCRL\x12\x1e.litevirt.v1.PublishCRLRequest\x1a\x1f.litevirt.v1.PublishCRLResponse\x12M\n" +
+	"PublishCRL\x12\x1e.litevirt.v1.PublishCRLRequest\x1a\x1f.litevirt.v1.PublishCRLResponse\x12z\n" +
+	"\x19RevokeReplacedCertificate\x12-.litevirt.v1.RevokeReplacedCertificateRequest\x1a..litevirt.v1.RevokeReplacedCertificateResponse\x12M\n" +
 	"\n" +
 	"RescanHost\x12\x1e.litevirt.v1.RescanHostRequest\x1a\x1f.litevirt.v1.RescanHostResponse\x12\\\n" +
 	"\x0fListHostDevices\x12#.litevirt.v1.ListHostDevicesRequest\x1a$.litevirt.v1.ListHostDevicesResponse\x12\\\n" +
@@ -38029,7 +38199,7 @@ func file_litevirt_v1_service_proto_rawDescGZIP() []byte {
 }
 
 var file_litevirt_v1_service_proto_enumTypes = make([]protoimpl.EnumInfo, 11)
-var file_litevirt_v1_service_proto_msgTypes = make([]protoimpl.MessageInfo, 521)
+var file_litevirt_v1_service_proto_msgTypes = make([]protoimpl.MessageInfo, 523)
 var file_litevirt_v1_service_proto_goTypes = []any{
 	(RelayVIPResult)(0),                        // 0: litevirt.v1.RelayVIPResult
 	(MoveVolumeProgress_Phase)(0),              // 1: litevirt.v1.MoveVolumeProgress.Phase
@@ -38055,1325 +38225,1330 @@ var file_litevirt_v1_service_proto_goTypes = []any{
 	(*RemoveHostRequest)(nil),                  // 21: litevirt.v1.RemoveHostRequest
 	(*PublishCRLRequest)(nil),                  // 22: litevirt.v1.PublishCRLRequest
 	(*PublishCRLResponse)(nil),                 // 23: litevirt.v1.PublishCRLResponse
-	(*FenceResult)(nil),                        // 24: litevirt.v1.FenceResult
-	(*GetClusterHealthRequest)(nil),            // 25: litevirt.v1.GetClusterHealthRequest
-	(*HealthCondition)(nil),                    // 26: litevirt.v1.HealthCondition
-	(*HealthEvaluatorStatus)(nil),              // 27: litevirt.v1.HealthEvaluatorStatus
-	(*ConnectivityEdge)(nil),                   // 28: litevirt.v1.ConnectivityEdge
-	(*HostCapacityAssessment)(nil),             // 29: litevirt.v1.HostCapacityAssessment
-	(*ClusterHealth)(nil),                      // 30: litevirt.v1.ClusterHealth
-	(*RescanHostRequest)(nil),                  // 31: litevirt.v1.RescanHostRequest
-	(*RescanHostResponse)(nil),                 // 32: litevirt.v1.RescanHostResponse
-	(*ListHostDevicesRequest)(nil),             // 33: litevirt.v1.ListHostDevicesRequest
-	(*ListHostDevicesResponse)(nil),            // 34: litevirt.v1.ListHostDevicesResponse
-	(*SupersededDisksRequest)(nil),             // 35: litevirt.v1.SupersededDisksRequest
-	(*SupersededDisk)(nil),                     // 36: litevirt.v1.SupersededDisk
-	(*SupersededDisksResponse)(nil),            // 37: litevirt.v1.SupersededDisksResponse
-	(*ConfigureHostRequest)(nil),               // 38: litevirt.v1.ConfigureHostRequest
-	(*CreateVMRequest)(nil),                    // 39: litevirt.v1.CreateVMRequest
-	(*ListVMsRequest)(nil),                     // 40: litevirt.v1.ListVMsRequest
-	(*ListVMsResponse)(nil),                    // 41: litevirt.v1.ListVMsResponse
-	(*InspectVMRequest)(nil),                   // 42: litevirt.v1.InspectVMRequest
-	(*ListVMHardwareRequest)(nil),              // 43: litevirt.v1.ListVMHardwareRequest
-	(*ListVMHardwareResponse)(nil),             // 44: litevirt.v1.ListVMHardwareResponse
-	(*StartVMRequest)(nil),                     // 45: litevirt.v1.StartVMRequest
-	(*StopVMRequest)(nil),                      // 46: litevirt.v1.StopVMRequest
-	(*RestartVMRequest)(nil),                   // 47: litevirt.v1.RestartVMRequest
-	(*DeleteVMRequest)(nil),                    // 48: litevirt.v1.DeleteVMRequest
-	(*RepairVMOwnerRequest)(nil),               // 49: litevirt.v1.RepairVMOwnerRequest
-	(*RepairVMOwnerResponse)(nil),              // 50: litevirt.v1.RepairVMOwnerResponse
-	(*CheckVIPParticipantRequest)(nil),         // 51: litevirt.v1.CheckVIPParticipantRequest
-	(*CheckVIPParticipantResponse)(nil),        // 52: litevirt.v1.CheckVIPParticipantResponse
-	(*RelayCheckVIPParticipantRequest)(nil),    // 53: litevirt.v1.RelayCheckVIPParticipantRequest
-	(*RelayCheckVIPParticipantResponse)(nil),   // 54: litevirt.v1.RelayCheckVIPParticipantResponse
-	(*CheckLBPresentRequest)(nil),              // 55: litevirt.v1.CheckLBPresentRequest
-	(*CheckLBPresentResponse)(nil),             // 56: litevirt.v1.CheckLBPresentResponse
-	(*GetRuntimeInventoryRequest)(nil),         // 57: litevirt.v1.GetRuntimeInventoryRequest
-	(*RuntimeWorkload)(nil),                    // 58: litevirt.v1.RuntimeWorkload
-	(*RuntimeInventory)(nil),                   // 59: litevirt.v1.RuntimeInventory
-	(*OrphanProofRequest)(nil),                 // 60: litevirt.v1.OrphanProofRequest
-	(*OrphanProofResponse)(nil),                // 61: litevirt.v1.OrphanProofResponse
-	(*MembershipHost)(nil),                     // 62: litevirt.v1.MembershipHost
-	(*MembershipViewResponse)(nil),             // 63: litevirt.v1.MembershipViewResponse
-	(*RekeyBindingRequest)(nil),                // 64: litevirt.v1.RekeyBindingRequest
-	(*ResumeBindingRequest)(nil),               // 65: litevirt.v1.ResumeBindingRequest
-	(*CloneVMRequest)(nil),                     // 66: litevirt.v1.CloneVMRequest
-	(*ConvertToTemplateRequest)(nil),           // 67: litevirt.v1.ConvertToTemplateRequest
-	(*ExecVMRequest)(nil),                      // 68: litevirt.v1.ExecVMRequest
-	(*ExecVMResponse)(nil),                     // 69: litevirt.v1.ExecVMResponse
-	(*ConsoleInput)(nil),                       // 70: litevirt.v1.ConsoleInput
-	(*ConsoleOutput)(nil),                      // 71: litevirt.v1.ConsoleOutput
-	(*SetVMIPRequest)(nil),                     // 72: litevirt.v1.SetVMIPRequest
-	(*SetBootOrderRequest)(nil),                // 73: litevirt.v1.SetBootOrderRequest
-	(*RebuildVMRequest)(nil),                   // 74: litevirt.v1.RebuildVMRequest
-	(*CutoverVMRequest)(nil),                   // 75: litevirt.v1.CutoverVMRequest
-	(*UpdateVMRequest)(nil),                    // 76: litevirt.v1.UpdateVMRequest
-	(*SetVMMemoryRequest)(nil),                 // 77: litevirt.v1.SetVMMemoryRequest
-	(*SetVMLabelsRequest)(nil),                 // 78: litevirt.v1.SetVMLabelsRequest
-	(*ResizeDiskRequest)(nil),                  // 79: litevirt.v1.ResizeDiskRequest
-	(*VNCData)(nil),                            // 80: litevirt.v1.VNCData
-	(*DeployStackRequest)(nil),                 // 81: litevirt.v1.DeployStackRequest
-	(*DeployProgress)(nil),                     // 82: litevirt.v1.DeployProgress
-	(*DeleteStackRequest)(nil),                 // 83: litevirt.v1.DeleteStackRequest
-	(*DeleteProgress)(nil),                     // 84: litevirt.v1.DeleteProgress
-	(*ListStacksResponse)(nil),                 // 85: litevirt.v1.ListStacksResponse
-	(*StackSummary)(nil),                       // 86: litevirt.v1.StackSummary
-	(*DiffStackRequest)(nil),                   // 87: litevirt.v1.DiffStackRequest
-	(*DiffStackResponse)(nil),                  // 88: litevirt.v1.DiffStackResponse
-	(*DiffEntry)(nil),                          // 89: litevirt.v1.DiffEntry
-	(*ExportStackRequest)(nil),                 // 90: litevirt.v1.ExportStackRequest
-	(*ExportStackResponse)(nil),                // 91: litevirt.v1.ExportStackResponse
-	(*MigrateVMRequest)(nil),                   // 92: litevirt.v1.MigrateVMRequest
-	(*MigrateProgress)(nil),                    // 93: litevirt.v1.MigrateProgress
-	(*MoveVolumeRequest)(nil),                  // 94: litevirt.v1.MoveVolumeRequest
-	(*MoveVolumeProgress)(nil),                 // 95: litevirt.v1.MoveVolumeProgress
-	(*ReplicateVolumeRequest)(nil),             // 96: litevirt.v1.ReplicateVolumeRequest
-	(*ReplicateVolumeProgress)(nil),            // 97: litevirt.v1.ReplicateVolumeProgress
-	(*MigrateStackVolumesRequest)(nil),         // 98: litevirt.v1.MigrateStackVolumesRequest
-	(*VolumePlacement)(nil),                    // 99: litevirt.v1.VolumePlacement
-	(*StackVolumeProgress)(nil),                // 100: litevirt.v1.StackVolumeProgress
-	(*PullImageRequest)(nil),                   // 101: litevirt.v1.PullImageRequest
-	(*PullProgress)(nil),                       // 102: litevirt.v1.PullProgress
-	(*ListImagesResponse)(nil),                 // 103: litevirt.v1.ListImagesResponse
-	(*DeleteImageRequest)(nil),                 // 104: litevirt.v1.DeleteImageRequest
-	(*ImportImageRequest)(nil),                 // 105: litevirt.v1.ImportImageRequest
-	(*ImportImageResponse)(nil),                // 106: litevirt.v1.ImportImageResponse
-	(*PushImageRequest)(nil),                   // 107: litevirt.v1.PushImageRequest
-	(*PruneImagesRequest)(nil),                 // 108: litevirt.v1.PruneImagesRequest
-	(*PruneImagesResponse)(nil),                // 109: litevirt.v1.PruneImagesResponse
-	(*PushImageProgress)(nil),                  // 110: litevirt.v1.PushImageProgress
-	(*BuildImageRequest)(nil),                  // 111: litevirt.v1.BuildImageRequest
-	(*BuildImageResponse)(nil),                 // 112: litevirt.v1.BuildImageResponse
-	(*BackupVMRequest)(nil),                    // 113: litevirt.v1.BackupVMRequest
-	(*BackupChunk)(nil),                        // 114: litevirt.v1.BackupChunk
-	(*RestoreVMRequest)(nil),                   // 115: litevirt.v1.RestoreVMRequest
-	(*ImportVMRequest)(nil),                    // 116: litevirt.v1.ImportVMRequest
-	(*ImportVMProgress)(nil),                   // 117: litevirt.v1.ImportVMProgress
-	(*CreateSnapshotRequest)(nil),              // 118: litevirt.v1.CreateSnapshotRequest
-	(*ListSnapshotsRequest)(nil),               // 119: litevirt.v1.ListSnapshotsRequest
-	(*ListSnapshotsResponse)(nil),              // 120: litevirt.v1.ListSnapshotsResponse
-	(*RestoreSnapshotRequest)(nil),             // 121: litevirt.v1.RestoreSnapshotRequest
-	(*DeleteSnapshotRequest)(nil),              // 122: litevirt.v1.DeleteSnapshotRequest
-	(*CreateNetworkRequest)(nil),               // 123: litevirt.v1.CreateNetworkRequest
-	(*GetNetworkRequest)(nil),                  // 124: litevirt.v1.GetNetworkRequest
-	(*DeleteNetworkRequest)(nil),               // 125: litevirt.v1.DeleteNetworkRequest
-	(*ListNetworksResponse)(nil),               // 126: litevirt.v1.ListNetworksResponse
-	(*NetworkInfo)(nil),                        // 127: litevirt.v1.NetworkInfo
-	(*ListLBResponse)(nil),                     // 128: litevirt.v1.ListLBResponse
-	(*InspectLBRequest)(nil),                   // 129: litevirt.v1.InspectLBRequest
-	(*DisableBackendRequest)(nil),              // 130: litevirt.v1.DisableBackendRequest
-	(*EnableBackendRequest)(nil),               // 131: litevirt.v1.EnableBackendRequest
-	(*ApplyLBRequest)(nil),                     // 132: litevirt.v1.ApplyLBRequest
-	(*RemoveLBRequest)(nil),                    // 133: litevirt.v1.RemoveLBRequest
-	(*CreateLBRequest)(nil),                    // 134: litevirt.v1.CreateLBRequest
-	(*UpdateLBRequest)(nil),                    // 135: litevirt.v1.UpdateLBRequest
-	(*DeleteLBRequest)(nil),                    // 136: litevirt.v1.DeleteLBRequest
-	(*LBStatsRequest)(nil),                     // 137: litevirt.v1.LBStatsRequest
-	(*DrainBackendRequest)(nil),                // 138: litevirt.v1.DrainBackendRequest
-	(*DrainBackendResponse)(nil),               // 139: litevirt.v1.DrainBackendResponse
-	(*LoginRequest)(nil),                       // 140: litevirt.v1.LoginRequest
-	(*LoginResponse)(nil),                      // 141: litevirt.v1.LoginResponse
-	(*ListRealmsResponse)(nil),                 // 142: litevirt.v1.ListRealmsResponse
-	(*CreateUserRequest)(nil),                  // 143: litevirt.v1.CreateUserRequest
-	(*ListUsersResponse)(nil),                  // 144: litevirt.v1.ListUsersResponse
-	(*DeleteUserRequest)(nil),                  // 145: litevirt.v1.DeleteUserRequest
-	(*WhoamiResponse)(nil),                     // 146: litevirt.v1.WhoamiResponse
-	(*CheckPermissionsRequest)(nil),            // 147: litevirt.v1.CheckPermissionsRequest
-	(*CheckPermissionsResponse)(nil),           // 148: litevirt.v1.CheckPermissionsResponse
-	(*ChangePasswordRequest)(nil),              // 149: litevirt.v1.ChangePasswordRequest
-	(*ResetAdminPasswordRequest)(nil),          // 150: litevirt.v1.ResetAdminPasswordRequest
-	(*CreateTokenRequest)(nil),                 // 151: litevirt.v1.CreateTokenRequest
-	(*RevokeTokenRequest)(nil),                 // 152: litevirt.v1.RevokeTokenRequest
-	(*BackupSnapshotRequest)(nil),              // 153: litevirt.v1.BackupSnapshotRequest
-	(*BackupSnapshotProgress)(nil),             // 154: litevirt.v1.BackupSnapshotProgress
-	(*RepoTarget)(nil),                         // 155: litevirt.v1.RepoTarget
-	(*HasChunksRequest)(nil),                   // 156: litevirt.v1.HasChunksRequest
-	(*HasChunksResponse)(nil),                  // 157: litevirt.v1.HasChunksResponse
-	(*PushBackupFrame)(nil),                    // 158: litevirt.v1.PushBackupFrame
-	(*PushBackupHeader)(nil),                   // 159: litevirt.v1.PushBackupHeader
-	(*PushChunkFrame)(nil),                     // 160: litevirt.v1.PushChunkFrame
-	(*PushManifestFrame)(nil),                  // 161: litevirt.v1.PushManifestFrame
-	(*PushBackupResponse)(nil),                 // 162: litevirt.v1.PushBackupResponse
-	(*RestoreFromBackupRequest)(nil),           // 163: litevirt.v1.RestoreFromBackupRequest
-	(*RestoreFromBackupProgress)(nil),          // 164: litevirt.v1.RestoreFromBackupProgress
-	(*VerifyBackupRepoRequest)(nil),            // 165: litevirt.v1.VerifyBackupRepoRequest
-	(*VerifyBackupRepoResponse)(nil),           // 166: litevirt.v1.VerifyBackupRepoResponse
-	(*GarbageCollectBackupRepoRequest)(nil),    // 167: litevirt.v1.GarbageCollectBackupRepoRequest
-	(*GarbageCollectBackupRepoResponse)(nil),   // 168: litevirt.v1.GarbageCollectBackupRepoResponse
-	(*BackupRepoSnapshot)(nil),                 // 169: litevirt.v1.BackupRepoSnapshot
-	(*ListBackupRepoSnapshotsRequest)(nil),     // 170: litevirt.v1.ListBackupRepoSnapshotsRequest
-	(*ListBackupRepoSnapshotsResponse)(nil),    // 171: litevirt.v1.ListBackupRepoSnapshotsResponse
-	(*PruneBackupRepoRequest)(nil),             // 172: litevirt.v1.PruneBackupRepoRequest
-	(*PruneBackupRepoResponse)(nil),            // 173: litevirt.v1.PruneBackupRepoResponse
-	(*SyncBackupRepoRequest)(nil),              // 174: litevirt.v1.SyncBackupRepoRequest
-	(*SyncBackupRepoResponse)(nil),             // 175: litevirt.v1.SyncBackupRepoResponse
-	(*Container)(nil),                          // 176: litevirt.v1.Container
-	(*ContainerNetwork)(nil),                   // 177: litevirt.v1.ContainerNetwork
-	(*CreateContainerRequest)(nil),             // 178: litevirt.v1.CreateContainerRequest
-	(*PrepareContainerTargetRequest)(nil),      // 179: litevirt.v1.PrepareContainerTargetRequest
-	(*ConvertContainerRequest)(nil),            // 180: litevirt.v1.ConvertContainerRequest
-	(*StartContainerRequest)(nil),              // 181: litevirt.v1.StartContainerRequest
-	(*StopContainerRequest)(nil),               // 182: litevirt.v1.StopContainerRequest
-	(*DeleteContainerRequest)(nil),             // 183: litevirt.v1.DeleteContainerRequest
-	(*ExecContainerRequest)(nil),               // 184: litevirt.v1.ExecContainerRequest
-	(*ExecContainerResponse)(nil),              // 185: litevirt.v1.ExecContainerResponse
-	(*ListContainersRequest)(nil),              // 186: litevirt.v1.ListContainersRequest
-	(*ListContainersResponse)(nil),             // 187: litevirt.v1.ListContainersResponse
-	(*PullOCIImageRequest)(nil),                // 188: litevirt.v1.PullOCIImageRequest
-	(*BackupContainerRequest)(nil),             // 189: litevirt.v1.BackupContainerRequest
-	(*BackupContainerProgress)(nil),            // 190: litevirt.v1.BackupContainerProgress
-	(*RestoreContainerRequest)(nil),            // 191: litevirt.v1.RestoreContainerRequest
-	(*RestoreContainerProgress)(nil),           // 192: litevirt.v1.RestoreContainerProgress
-	(*MigrateContainerRequest)(nil),            // 193: litevirt.v1.MigrateContainerRequest
-	(*MigrateContainerProgress)(nil),           // 194: litevirt.v1.MigrateContainerProgress
-	(*ContainerSnapshot)(nil),                  // 195: litevirt.v1.ContainerSnapshot
-	(*InspectContainerRequest)(nil),            // 196: litevirt.v1.InspectContainerRequest
-	(*ContainerInterfaceDetail)(nil),           // 197: litevirt.v1.ContainerInterfaceDetail
-	(*ContainerBackupRef)(nil),                 // 198: litevirt.v1.ContainerBackupRef
-	(*ProbeContainerBackupsRequest)(nil),       // 199: litevirt.v1.ProbeContainerBackupsRequest
-	(*ContainerBackupProbe)(nil),               // 200: litevirt.v1.ContainerBackupProbe
-	(*ProbeContainerBackupsResponse)(nil),      // 201: litevirt.v1.ProbeContainerBackupsResponse
-	(*ContainerDetail)(nil),                    // 202: litevirt.v1.ContainerDetail
-	(*ContainerStrandedRootfs)(nil),            // 203: litevirt.v1.ContainerStrandedRootfs
-	(*SnapshotContainerRequest)(nil),           // 204: litevirt.v1.SnapshotContainerRequest
-	(*ListContainerSnapshotsRequest)(nil),      // 205: litevirt.v1.ListContainerSnapshotsRequest
-	(*ListContainerSnapshotsResponse)(nil),     // 206: litevirt.v1.ListContainerSnapshotsResponse
-	(*RevertContainerSnapshotRequest)(nil),     // 207: litevirt.v1.RevertContainerSnapshotRequest
-	(*DeleteContainerSnapshotRequest)(nil),     // 208: litevirt.v1.DeleteContainerSnapshotRequest
-	(*ConvertContainerToTemplateRequest)(nil),  // 209: litevirt.v1.ConvertContainerToTemplateRequest
-	(*CloneContainerRequest)(nil),              // 210: litevirt.v1.CloneContainerRequest
-	(*FirewallStatus)(nil),                     // 211: litevirt.v1.FirewallStatus
-	(*BindSecurityGroupsRequest)(nil),          // 212: litevirt.v1.BindSecurityGroupsRequest
-	(*Session)(nil),                            // 213: litevirt.v1.Session
-	(*ListSessionsRequest)(nil),                // 214: litevirt.v1.ListSessionsRequest
-	(*ListSessionsResponse)(nil),               // 215: litevirt.v1.ListSessionsResponse
-	(*RevokeSessionRequest)(nil),               // 216: litevirt.v1.RevokeSessionRequest
-	(*TwoFactor)(nil),                          // 217: litevirt.v1.TwoFactor
-	(*ListTwoFactorsRequest)(nil),              // 218: litevirt.v1.ListTwoFactorsRequest
-	(*ListTwoFactorsResponse)(nil),             // 219: litevirt.v1.ListTwoFactorsResponse
-	(*EnrollTOTPRequest)(nil),                  // 220: litevirt.v1.EnrollTOTPRequest
-	(*EnrollTOTPResponse)(nil),                 // 221: litevirt.v1.EnrollTOTPResponse
-	(*DisableTwoFactorRequest)(nil),            // 222: litevirt.v1.DisableTwoFactorRequest
-	(*RoleBinding)(nil),                        // 223: litevirt.v1.RoleBinding
-	(*GrantRoleRequest)(nil),                   // 224: litevirt.v1.GrantRoleRequest
-	(*GrantRoleResponse)(nil),                  // 225: litevirt.v1.GrantRoleResponse
-	(*RevokeRoleRequest)(nil),                  // 226: litevirt.v1.RevokeRoleRequest
-	(*RevokeRoleResponse)(nil),                 // 227: litevirt.v1.RevokeRoleResponse
-	(*ListRoleBindingsRequest)(nil),            // 228: litevirt.v1.ListRoleBindingsRequest
-	(*ListRoleBindingsResponse)(nil),           // 229: litevirt.v1.ListRoleBindingsResponse
-	(*NormalizeRoleBindingsRequest)(nil),       // 230: litevirt.v1.NormalizeRoleBindingsRequest
-	(*NormalizeRoleBindingsResponse)(nil),      // 231: litevirt.v1.NormalizeRoleBindingsResponse
-	(*GetVMOperationRequest)(nil),              // 232: litevirt.v1.GetVMOperationRequest
-	(*OperationStepInfo)(nil),                  // 233: litevirt.v1.OperationStepInfo
-	(*GetVMOperationResponse)(nil),             // 234: litevirt.v1.GetVMOperationResponse
-	(*AbortVMOperationRequest)(nil),            // 235: litevirt.v1.AbortVMOperationRequest
-	(*AbortVMOperationResponse)(nil),           // 236: litevirt.v1.AbortVMOperationResponse
-	(*RestoreLiveRequest)(nil),                 // 237: litevirt.v1.RestoreLiveRequest
-	(*RestoreLiveProgress)(nil),                // 238: litevirt.v1.RestoreLiveProgress
-	(*BeginWebAuthnRegistrationRequest)(nil),   // 239: litevirt.v1.BeginWebAuthnRegistrationRequest
-	(*BeginWebAuthnRegistrationResponse)(nil),  // 240: litevirt.v1.BeginWebAuthnRegistrationResponse
-	(*FinishWebAuthnRegistrationRequest)(nil),  // 241: litevirt.v1.FinishWebAuthnRegistrationRequest
-	(*FinishWebAuthnRegistrationResponse)(nil), // 242: litevirt.v1.FinishWebAuthnRegistrationResponse
-	(*BeginWebAuthnLoginRequest)(nil),          // 243: litevirt.v1.BeginWebAuthnLoginRequest
-	(*BeginWebAuthnLoginResponse)(nil),         // 244: litevirt.v1.BeginWebAuthnLoginResponse
-	(*FinishWebAuthnLoginRequest)(nil),         // 245: litevirt.v1.FinishWebAuthnLoginRequest
-	(*FinishWebAuthnLoginResponse)(nil),        // 246: litevirt.v1.FinishWebAuthnLoginResponse
-	(*GetVMStatsRequest)(nil),                  // 247: litevirt.v1.GetVMStatsRequest
-	(*GetHostStatsRequest)(nil),                // 248: litevirt.v1.GetHostStatsRequest
-	(*ClusterStatus)(nil),                      // 249: litevirt.v1.ClusterStatus
-	(*StreamEventsRequest)(nil),                // 250: litevirt.v1.StreamEventsRequest
-	(*ListAuditLogRequest)(nil),                // 251: litevirt.v1.ListAuditLogRequest
-	(*AuditEntry)(nil),                         // 252: litevirt.v1.AuditEntry
-	(*ListAuditLogResponse)(nil),               // 253: litevirt.v1.ListAuditLogResponse
-	(*ListVMEventsRequest)(nil),                // 254: litevirt.v1.ListVMEventsRequest
-	(*VMEvent)(nil),                            // 255: litevirt.v1.VMEvent
-	(*ListVMEventsResponse)(nil),               // 256: litevirt.v1.ListVMEventsResponse
-	(*CreateResourceMappingRequest)(nil),       // 257: litevirt.v1.CreateResourceMappingRequest
-	(*ListResourceMappingsRequest)(nil),        // 258: litevirt.v1.ListResourceMappingsRequest
-	(*ListResourceMappingsResponse)(nil),       // 259: litevirt.v1.ListResourceMappingsResponse
-	(*DeleteResourceMappingRequest)(nil),       // 260: litevirt.v1.DeleteResourceMappingRequest
-	(*AddMappingDeviceRequest)(nil),            // 261: litevirt.v1.AddMappingDeviceRequest
-	(*RemoveMappingDeviceRequest)(nil),         // 262: litevirt.v1.RemoveMappingDeviceRequest
-	(*CreateNotificationTargetRequest)(nil),    // 263: litevirt.v1.CreateNotificationTargetRequest
-	(*ListNotificationTargetsRequest)(nil),     // 264: litevirt.v1.ListNotificationTargetsRequest
-	(*ListNotificationTargetsResponse)(nil),    // 265: litevirt.v1.ListNotificationTargetsResponse
-	(*DeleteNotificationTargetRequest)(nil),    // 266: litevirt.v1.DeleteNotificationTargetRequest
-	(*TestNotificationTargetRequest)(nil),      // 267: litevirt.v1.TestNotificationTargetRequest
-	(*CreateNotificationRouteRequest)(nil),     // 268: litevirt.v1.CreateNotificationRouteRequest
-	(*ListNotificationRoutesRequest)(nil),      // 269: litevirt.v1.ListNotificationRoutesRequest
-	(*ListNotificationRoutesResponse)(nil),     // 270: litevirt.v1.ListNotificationRoutesResponse
-	(*DeleteNotificationRouteRequest)(nil),     // 271: litevirt.v1.DeleteNotificationRouteRequest
-	(*RegistryCredential)(nil),                 // 272: litevirt.v1.RegistryCredential
-	(*SetRegistryCredentialRequest)(nil),       // 273: litevirt.v1.SetRegistryCredentialRequest
-	(*ListRegistryCredentialsRequest)(nil),     // 274: litevirt.v1.ListRegistryCredentialsRequest
-	(*ListRegistryCredentialsResponse)(nil),    // 275: litevirt.v1.ListRegistryCredentialsResponse
-	(*DeleteRegistryCredentialRequest)(nil),    // 276: litevirt.v1.DeleteRegistryCredentialRequest
-	(*CreateClusterFirewallRuleRequest)(nil),   // 277: litevirt.v1.CreateClusterFirewallRuleRequest
-	(*ListClusterFirewallRulesRequest)(nil),    // 278: litevirt.v1.ListClusterFirewallRulesRequest
-	(*ListClusterFirewallRulesResponse)(nil),   // 279: litevirt.v1.ListClusterFirewallRulesResponse
-	(*DeleteClusterFirewallRuleRequest)(nil),   // 280: litevirt.v1.DeleteClusterFirewallRuleRequest
-	(*CreateHostFirewallRuleRequest)(nil),      // 281: litevirt.v1.CreateHostFirewallRuleRequest
-	(*ListHostFirewallRulesRequest)(nil),       // 282: litevirt.v1.ListHostFirewallRulesRequest
-	(*ListHostFirewallRulesResponse)(nil),      // 283: litevirt.v1.ListHostFirewallRulesResponse
-	(*DeleteHostFirewallRuleRequest)(nil),      // 284: litevirt.v1.DeleteHostFirewallRuleRequest
-	(*CreateIpSetRequest)(nil),                 // 285: litevirt.v1.CreateIpSetRequest
-	(*ListIpSetsRequest)(nil),                  // 286: litevirt.v1.ListIpSetsRequest
-	(*ListIpSetsResponse)(nil),                 // 287: litevirt.v1.ListIpSetsResponse
-	(*DeleteIpSetRequest)(nil),                 // 288: litevirt.v1.DeleteIpSetRequest
-	(*SetFirewallDefaultRequest)(nil),          // 289: litevirt.v1.SetFirewallDefaultRequest
-	(*ListFirewallDefaultsRequest)(nil),        // 290: litevirt.v1.ListFirewallDefaultsRequest
-	(*ListFirewallDefaultsResponse)(nil),       // 291: litevirt.v1.ListFirewallDefaultsResponse
-	(*CreateSecurityGroupRequest)(nil),         // 292: litevirt.v1.CreateSecurityGroupRequest
-	(*DeleteSecurityGroupRequest)(nil),         // 293: litevirt.v1.DeleteSecurityGroupRequest
-	(*AddSecurityGroupRuleRequest)(nil),        // 294: litevirt.v1.AddSecurityGroupRuleRequest
-	(*RemoveSecurityGroupRuleRequest)(nil),     // 295: litevirt.v1.RemoveSecurityGroupRuleRequest
-	(*ListSecurityGroupsRequest)(nil),          // 296: litevirt.v1.ListSecurityGroupsRequest
-	(*ListSecurityGroupsResponse)(nil),         // 297: litevirt.v1.ListSecurityGroupsResponse
-	(*ListStoragePoolsRequest)(nil),            // 298: litevirt.v1.ListStoragePoolsRequest
-	(*ListStoragePoolsResponse)(nil),           // 299: litevirt.v1.ListStoragePoolsResponse
-	(*CreateStoragePoolRequest)(nil),           // 300: litevirt.v1.CreateStoragePoolRequest
-	(*CreateStoragePoolResponse)(nil),          // 301: litevirt.v1.CreateStoragePoolResponse
-	(*DeleteStoragePoolRequest)(nil),           // 302: litevirt.v1.DeleteStoragePoolRequest
-	(*DeleteStoragePoolResponse)(nil),          // 303: litevirt.v1.DeleteStoragePoolResponse
-	(*GetStoragePoolRequest)(nil),              // 304: litevirt.v1.GetStoragePoolRequest
-	(*GetStoragePoolResponse)(nil),             // 305: litevirt.v1.GetStoragePoolResponse
-	(*StoragePoolContent)(nil),                 // 306: litevirt.v1.StoragePoolContent
-	(*ListStoragePoolContentsRequest)(nil),     // 307: litevirt.v1.ListStoragePoolContentsRequest
-	(*ListStoragePoolContentsResponse)(nil),    // 308: litevirt.v1.ListStoragePoolContentsResponse
-	(*UploadStoragePoolContentRequest)(nil),    // 309: litevirt.v1.UploadStoragePoolContentRequest
-	(*UploadStoragePoolContentResponse)(nil),   // 310: litevirt.v1.UploadStoragePoolContentResponse
-	(*PushReplicaRequest)(nil),                 // 311: litevirt.v1.PushReplicaRequest
-	(*PushReplicaResponse)(nil),                // 312: litevirt.v1.PushReplicaResponse
-	(*DeleteStoragePoolContentRequest)(nil),    // 313: litevirt.v1.DeleteStoragePoolContentRequest
-	(*ISOEntry)(nil),                           // 314: litevirt.v1.ISOEntry
-	(*ListISOsRequest)(nil),                    // 315: litevirt.v1.ListISOsRequest
-	(*ListISOsResponse)(nil),                   // 316: litevirt.v1.ListISOsResponse
-	(*PullISORequest)(nil),                     // 317: litevirt.v1.PullISORequest
-	(*PullISOResponse)(nil),                    // 318: litevirt.v1.PullISOResponse
-	(*ISOLibraryMode)(nil),                     // 319: litevirt.v1.ISOLibraryMode
-	(*SetISOLibraryModeRequest)(nil),           // 320: litevirt.v1.SetISOLibraryModeRequest
-	(*FetchISOLibraryFileRequest)(nil),         // 321: litevirt.v1.FetchISOLibraryFileRequest
-	(*FetchISOLibraryFileChunk)(nil),           // 322: litevirt.v1.FetchISOLibraryFileChunk
-	(*PushReplicaIncrementRequest)(nil),        // 323: litevirt.v1.PushReplicaIncrementRequest
-	(*PushReplicaIncrementResponse)(nil),       // 324: litevirt.v1.PushReplicaIncrementResponse
-	(*ReplicaRecord)(nil),                      // 325: litevirt.v1.ReplicaRecord
-	(*ListReplicasRequest)(nil),                // 326: litevirt.v1.ListReplicasRequest
-	(*ListReplicasResponse)(nil),               // 327: litevirt.v1.ListReplicasResponse
-	(*PruneReplicasRequest)(nil),               // 328: litevirt.v1.PruneReplicasRequest
-	(*PruneReplicasResponse)(nil),              // 329: litevirt.v1.PruneReplicasResponse
-	(*RuntimeActionProof)(nil),                 // 330: litevirt.v1.RuntimeActionProof
-	(*AcknowledgeLeaseTermTieRequest)(nil),     // 331: litevirt.v1.AcknowledgeLeaseTermTieRequest
-	(*AcknowledgeLeaseTermTieResponse)(nil),    // 332: litevirt.v1.AcknowledgeLeaseTermTieResponse
-	(*GetLeaseTermHighWaterRequest)(nil),       // 333: litevirt.v1.GetLeaseTermHighWaterRequest
-	(*GetLeaseTermHighWaterResponse)(nil),      // 334: litevirt.v1.GetLeaseTermHighWaterResponse
-	(*RecoveryClaimKey)(nil),                   // 335: litevirt.v1.RecoveryClaimKey
-	(*ClaimBallot)(nil),                        // 336: litevirt.v1.ClaimBallot
-	(*ClaimVoterMember)(nil),                   // 337: litevirt.v1.ClaimVoterMember
-	(*VoterConfigValue)(nil),                   // 338: litevirt.v1.VoterConfigValue
-	(*RecoveryClaimValue)(nil),                 // 339: litevirt.v1.RecoveryClaimValue
-	(*ClaimAccept)(nil),                        // 340: litevirt.v1.ClaimAccept
-	(*PrepareRecoveryClaimRequest)(nil),        // 341: litevirt.v1.PrepareRecoveryClaimRequest
-	(*RecoveryClaimSupersede)(nil),             // 342: litevirt.v1.RecoveryClaimSupersede
-	(*AbandonRecoveryProofRequest)(nil),        // 343: litevirt.v1.AbandonRecoveryProofRequest
-	(*ReleaseLegacyHeldClaimRequest)(nil),      // 344: litevirt.v1.ReleaseLegacyHeldClaimRequest
-	(*ReleaseLegacyHeldClaimResponse)(nil),     // 345: litevirt.v1.ReleaseLegacyHeldClaimResponse
-	(*AbandonRecoveryProofResponse)(nil),       // 346: litevirt.v1.AbandonRecoveryProofResponse
-	(*PlanDeadHostRemovalRequest)(nil),         // 347: litevirt.v1.PlanDeadHostRemovalRequest
-	(*StrandedRecovery)(nil),                   // 348: litevirt.v1.StrandedRecovery
-	(*ForceReconfigureVotersRequest)(nil),      // 349: litevirt.v1.ForceReconfigureVotersRequest
-	(*ForcedFenceEvidence)(nil),                // 350: litevirt.v1.ForcedFenceEvidence
-	(*ForceReconfigureVotersResponse)(nil),     // 351: litevirt.v1.ForceReconfigureVotersResponse
-	(*SignForcedVoterConfigRequest)(nil),       // 352: litevirt.v1.SignForcedVoterConfigRequest
-	(*SignForcedVoterConfigResponse)(nil),      // 353: litevirt.v1.SignForcedVoterConfigResponse
-	(*PausedWorkload)(nil),                     // 354: litevirt.v1.PausedWorkload
-	(*ConfirmPartitionResumeRequest)(nil),      // 355: litevirt.v1.ConfirmPartitionResumeRequest
-	(*PausedWorkloadView)(nil),                 // 356: litevirt.v1.PausedWorkloadView
-	(*ConfirmPartitionResumeResponse)(nil),     // 357: litevirt.v1.ConfirmPartitionResumeResponse
-	(*InspectRecoveryClaimRequest)(nil),        // 358: litevirt.v1.InspectRecoveryClaimRequest
-	(*RecoveryClaimVoterView)(nil),             // 359: litevirt.v1.RecoveryClaimVoterView
-	(*RecoveryClaimAttemptView)(nil),           // 360: litevirt.v1.RecoveryClaimAttemptView
-	(*InspectRecoveryClaimResponse)(nil),       // 361: litevirt.v1.InspectRecoveryClaimResponse
-	(*PlanDeadHostRemovalResponse)(nil),        // 362: litevirt.v1.PlanDeadHostRemovalResponse
-	(*PrepareRecoveryClaimResponse)(nil),       // 363: litevirt.v1.PrepareRecoveryClaimResponse
-	(*AcceptRecoveryClaimRequest)(nil),         // 364: litevirt.v1.AcceptRecoveryClaimRequest
-	(*AcceptRecoveryClaimResponse)(nil),        // 365: litevirt.v1.AcceptRecoveryClaimResponse
-	(*GetRecoveryClaimRequest)(nil),            // 366: litevirt.v1.GetRecoveryClaimRequest
-	(*GetRecoveryClaimResponse)(nil),           // 367: litevirt.v1.GetRecoveryClaimResponse
-	(*ListRecoveryClaimsRequest)(nil),          // 368: litevirt.v1.ListRecoveryClaimsRequest
-	(*RecoveryClaimState)(nil),                 // 369: litevirt.v1.RecoveryClaimState
-	(*GetVoterConfigRequest)(nil),              // 370: litevirt.v1.GetVoterConfigRequest
-	(*VoterMemberStatus)(nil),                  // 371: litevirt.v1.VoterMemberStatus
-	(*GetVoterConfigResponse)(nil),             // 372: litevirt.v1.GetVoterConfigResponse
-	(*ChangeVoterConfigRequest)(nil),           // 373: litevirt.v1.ChangeVoterConfigRequest
-	(*ChangeVoterConfigResponse)(nil),          // 374: litevirt.v1.ChangeVoterConfigResponse
-	(*PromoteReplicaRequest)(nil),              // 375: litevirt.v1.PromoteReplicaRequest
-	(*PromoteReplicaProgress)(nil),             // 376: litevirt.v1.PromoteReplicaProgress
-	(*PingRequest)(nil),                        // 377: litevirt.v1.PingRequest
-	(*PingResponse)(nil),                       // 378: litevirt.v1.PingResponse
-	(*ReadyRequest)(nil),                       // 379: litevirt.v1.ReadyRequest
-	(*ReadyResponse)(nil),                      // 380: litevirt.v1.ReadyResponse
-	(*FetchBinaryRequest)(nil),                 // 381: litevirt.v1.FetchBinaryRequest
-	(*FetchBinaryChunk)(nil),                   // 382: litevirt.v1.FetchBinaryChunk
-	(*ProvisionNetworkRequest)(nil),            // 383: litevirt.v1.ProvisionNetworkRequest
-	(*EnsureCloudInitRequest)(nil),             // 384: litevirt.v1.EnsureCloudInitRequest
-	(*EnsureDisksRequest)(nil),                 // 385: litevirt.v1.EnsureDisksRequest
-	(*DiskStub)(nil),                           // 386: litevirt.v1.DiskStub
-	(*EnsureDisksResponse)(nil),                // 387: litevirt.v1.EnsureDisksResponse
-	(*EnsureFirmwareStateRequest)(nil),         // 388: litevirt.v1.EnsureFirmwareStateRequest
-	(*EnsureFirmwareStateResponse)(nil),        // 389: litevirt.v1.EnsureFirmwareStateResponse
-	(*RollbackFirmwareStateRequest)(nil),       // 390: litevirt.v1.RollbackFirmwareStateRequest
-	(*RollbackFirmwareStateResponse)(nil),      // 391: litevirt.v1.RollbackFirmwareStateResponse
-	(*ReceiveMigrationDiskRequest)(nil),        // 392: litevirt.v1.ReceiveMigrationDiskRequest
-	(*ReceiveMigrationDiskResponse)(nil),       // 393: litevirt.v1.ReceiveMigrationDiskResponse
-	(*CheckCPUCompatibilityRequest)(nil),       // 394: litevirt.v1.CheckCPUCompatibilityRequest
-	(*CheckCPUCompatibilityResponse)(nil),      // 395: litevirt.v1.CheckCPUCompatibilityResponse
-	(*CleanupMigrationArtifactsRequest)(nil),   // 396: litevirt.v1.CleanupMigrationArtifactsRequest
-	(*SyncVTEPRequest)(nil),                    // 397: litevirt.v1.SyncVTEPRequest
-	(*GetVMIPRequest)(nil),                     // 398: litevirt.v1.GetVMIPRequest
-	(*GetVMIPResponse)(nil),                    // 399: litevirt.v1.GetVMIPResponse
-	(*RefreshLBRequest)(nil),                   // 400: litevirt.v1.RefreshLBRequest
-	(*UpdateFDBRequest)(nil),                   // 401: litevirt.v1.UpdateFDBRequest
-	(*TableDigest)(nil),                        // 402: litevirt.v1.TableDigest
-	(*StateDigestResponse)(nil),                // 403: litevirt.v1.StateDigestResponse
-	(*TriggerAntiEntropyRequest)(nil),          // 404: litevirt.v1.TriggerAntiEntropyRequest
-	(*TriggerAntiEntropyResponse)(nil),         // 405: litevirt.v1.TriggerAntiEntropyResponse
-	(*ClusterStateDigestResponse)(nil),         // 406: litevirt.v1.ClusterStateDigestResponse
-	(*StateDumpResponse)(nil),                  // 407: litevirt.v1.StateDumpResponse
-	(*StateDumpChunk)(nil),                     // 408: litevirt.v1.StateDumpChunk
-	(*TableDumpRequest)(nil),                   // 409: litevirt.v1.TableDumpRequest
-	(*BucketSet)(nil),                          // 410: litevirt.v1.BucketSet
-	(*SensitiveStateRequest)(nil),              // 411: litevirt.v1.SensitiveStateRequest
-	(*TableRowsPage)(nil),                      // 412: litevirt.v1.TableRowsPage
-	(*BucketDigestRequest)(nil),                // 413: litevirt.v1.BucketDigestRequest
-	(*BucketDigest)(nil),                       // 414: litevirt.v1.BucketDigest
-	(*TableBucketDigests)(nil),                 // 415: litevirt.v1.TableBucketDigests
-	(*BucketDigestResponse)(nil),               // 416: litevirt.v1.BucketDigestResponse
-	(*DiagnoseDivergenceRequest)(nil),          // 417: litevirt.v1.DiagnoseDivergenceRequest
-	(*NodeRowMeta)(nil),                        // 418: litevirt.v1.NodeRowMeta
-	(*DivergenceRow)(nil),                      // 419: litevirt.v1.DivergenceRow
-	(*SemanticViolationPB)(nil),                // 420: litevirt.v1.SemanticViolationPB
-	(*DivergenceReport)(nil),                   // 421: litevirt.v1.DivergenceReport
-	(*ScanSensitiveRequest)(nil),               // 422: litevirt.v1.ScanSensitiveRequest
-	(*SensitiveRowMetaPB)(nil),                 // 423: litevirt.v1.SensitiveRowMetaPB
-	(*ScanSensitiveResponse)(nil),              // 424: litevirt.v1.ScanSensitiveResponse
-	(*MutationEntry)(nil),                      // 425: litevirt.v1.MutationEntry
-	(*ReplicateRequest)(nil),                   // 426: litevirt.v1.ReplicateRequest
-	(*ReplicateResponse)(nil),                  // 427: litevirt.v1.ReplicateResponse
-	(*AckRequest)(nil),                         // 428: litevirt.v1.AckRequest
-	(*GetVMLogsRequest)(nil),                   // 429: litevirt.v1.GetVMLogsRequest
-	(*VMLogChunk)(nil),                         // 430: litevirt.v1.VMLogChunk
-	(*UpgradeHostRequest)(nil),                 // 431: litevirt.v1.UpgradeHostRequest
-	(*UpgradeHostResponse)(nil),                // 432: litevirt.v1.UpgradeHostResponse
-	(*UninstallHostRequest)(nil),               // 433: litevirt.v1.UninstallHostRequest
-	(*UninstallHostResponse)(nil),              // 434: litevirt.v1.UninstallHostResponse
-	(*ExecuteCreateVMRequest)(nil),             // 435: litevirt.v1.ExecuteCreateVMRequest
-	(*AdmitHostRequest)(nil),                   // 436: litevirt.v1.AdmitHostRequest
-	(*AdmitHostResponse)(nil),                  // 437: litevirt.v1.AdmitHostResponse
-	(*HostNetwork)(nil),                        // 438: litevirt.v1.HostNetwork
-	(*ListHostNetworksRequest)(nil),            // 439: litevirt.v1.ListHostNetworksRequest
-	(*ListHostNetworksResponse)(nil),           // 440: litevirt.v1.ListHostNetworksResponse
-	(*UpsertHostNetworkRequest)(nil),           // 441: litevirt.v1.UpsertHostNetworkRequest
-	(*PlanHostNetworkRequest)(nil),             // 442: litevirt.v1.PlanHostNetworkRequest
-	(*PlanHostNetworkResponse)(nil),            // 443: litevirt.v1.PlanHostNetworkResponse
-	(*ApplyHostNetworkRequest)(nil),            // 444: litevirt.v1.ApplyHostNetworkRequest
-	(*DeleteHostNetworkRequest)(nil),           // 445: litevirt.v1.DeleteHostNetworkRequest
-	(*IsolateHostRequest)(nil),                 // 446: litevirt.v1.IsolateHostRequest
-	(*HostIsolationStatus)(nil),                // 447: litevirt.v1.HostIsolationStatus
-	(*ReseedHostRequest)(nil),                  // 448: litevirt.v1.ReseedHostRequest
-	(*ReseedHostResponse)(nil),                 // 449: litevirt.v1.ReseedHostResponse
-	(*PreflightUpgradeRequest)(nil),            // 450: litevirt.v1.PreflightUpgradeRequest
-	(*PreflightUpgradeResponse)(nil),           // 451: litevirt.v1.PreflightUpgradeResponse
-	(*PreflightFinding)(nil),                   // 452: litevirt.v1.PreflightFinding
-	(*GetSpiceInfoRequest)(nil),                // 453: litevirt.v1.GetSpiceInfoRequest
-	(*GetSpiceInfoResponse)(nil),               // 454: litevirt.v1.GetSpiceInfoResponse
-	(*RebalanceProposal)(nil),                  // 455: litevirt.v1.RebalanceProposal
-	(*ListRebalanceProposalsRequest)(nil),      // 456: litevirt.v1.ListRebalanceProposalsRequest
-	(*ListRebalanceProposalsResponse)(nil),     // 457: litevirt.v1.ListRebalanceProposalsResponse
-	(*RunRebalanceRequest)(nil),                // 458: litevirt.v1.RunRebalanceRequest
-	(*RunRebalanceResponse)(nil),               // 459: litevirt.v1.RunRebalanceResponse
-	(*ApproveRebalanceProposalRequest)(nil),    // 460: litevirt.v1.ApproveRebalanceProposalRequest
-	(*RejectRebalanceProposalRequest)(nil),     // 461: litevirt.v1.RejectRebalanceProposalRequest
-	(*ListRegionsRequest)(nil),                 // 462: litevirt.v1.ListRegionsRequest
-	(*ListRegionsResponse)(nil),                // 463: litevirt.v1.ListRegionsResponse
-	(*RegionStatusRequest)(nil),                // 464: litevirt.v1.RegionStatusRequest
-	(*RegionStatusResponse)(nil),               // 465: litevirt.v1.RegionStatusResponse
-	(*RegionStatus)(nil),                       // 466: litevirt.v1.RegionStatus
-	(*FailoverScopeStatus)(nil),                // 467: litevirt.v1.FailoverScopeStatus
-	(*FailoverScopeRegion)(nil),                // 468: litevirt.v1.FailoverScopeRegion
-	(*SetFailoverScopeRequest)(nil),            // 469: litevirt.v1.SetFailoverScopeRequest
-	(*RestoreRelayRequest)(nil),                // 470: litevirt.v1.RestoreRelayRequest
-	(*RelayHealthEntry)(nil),                   // 471: litevirt.v1.RelayHealthEntry
-	(*RelayHealthStatus)(nil),                  // 472: litevirt.v1.RelayHealthStatus
-	(*RestoreRelayResponse)(nil),               // 473: litevirt.v1.RestoreRelayResponse
-	(*CrossRegionMigrateRequest)(nil),          // 474: litevirt.v1.CrossRegionMigrateRequest
-	(*ServiceEndpoint)(nil),                    // 475: litevirt.v1.ServiceEndpoint
-	(*UpsertServiceEndpointRequest)(nil),       // 476: litevirt.v1.UpsertServiceEndpointRequest
-	(*ListServiceEndpointsRequest)(nil),        // 477: litevirt.v1.ListServiceEndpointsRequest
-	(*ListServiceEndpointsResponse)(nil),       // 478: litevirt.v1.ListServiceEndpointsResponse
-	(*DeleteServiceEndpointRequest)(nil),       // 479: litevirt.v1.DeleteServiceEndpointRequest
-	(*BackupSchedule)(nil),                     // 480: litevirt.v1.BackupSchedule
-	(*CreateBackupScheduleRequest)(nil),        // 481: litevirt.v1.CreateBackupScheduleRequest
-	(*ListBackupSchedulesRequest)(nil),         // 482: litevirt.v1.ListBackupSchedulesRequest
-	(*ListBackupSchedulesResponse)(nil),        // 483: litevirt.v1.ListBackupSchedulesResponse
-	(*DeleteBackupScheduleRequest)(nil),        // 484: litevirt.v1.DeleteBackupScheduleRequest
-	(*ReplicationSchedule)(nil),                // 485: litevirt.v1.ReplicationSchedule
-	(*CreateReplicationScheduleRequest)(nil),   // 486: litevirt.v1.CreateReplicationScheduleRequest
-	(*ListReplicationSchedulesRequest)(nil),    // 487: litevirt.v1.ListReplicationSchedulesRequest
-	(*ListReplicationSchedulesResponse)(nil),   // 488: litevirt.v1.ListReplicationSchedulesResponse
-	(*DeleteReplicationScheduleRequest)(nil),   // 489: litevirt.v1.DeleteReplicationScheduleRequest
-	(*VerifyAuditChainResponse)(nil),           // 490: litevirt.v1.VerifyAuditChainResponse
-	(*RetireAuditKeyRequest)(nil),              // 491: litevirt.v1.RetireAuditKeyRequest
-	(*RetireAuditKeyResponse)(nil),             // 492: litevirt.v1.RetireAuditKeyResponse
-	(*ExportAuditChainRequest)(nil),            // 493: litevirt.v1.ExportAuditChainRequest
-	(*ExportAuditChainResponse)(nil),           // 494: litevirt.v1.ExportAuditChainResponse
-	(*Project)(nil),                            // 495: litevirt.v1.Project
-	(*CreateProjectRequest)(nil),               // 496: litevirt.v1.CreateProjectRequest
-	(*ListProjectsResponse)(nil),               // 497: litevirt.v1.ListProjectsResponse
-	(*GetProjectRequest)(nil),                  // 498: litevirt.v1.GetProjectRequest
-	(*DeleteProjectRequest)(nil),               // 499: litevirt.v1.DeleteProjectRequest
-	(*ProjectQuota)(nil),                       // 500: litevirt.v1.ProjectQuota
-	(*SetProjectQuotaRequest)(nil),             // 501: litevirt.v1.SetProjectQuotaRequest
-	(*GetProjectQuotaRequest)(nil),             // 502: litevirt.v1.GetProjectQuotaRequest
-	(*ProjectUsage)(nil),                       // 503: litevirt.v1.ProjectUsage
-	(*GetProjectUsageRequest)(nil),             // 504: litevirt.v1.GetProjectUsageRequest
-	(*ReserveProjectCapacityRequest)(nil),      // 505: litevirt.v1.ReserveProjectCapacityRequest
-	(*ReserveProjectCapacityResponse)(nil),     // 506: litevirt.v1.ReserveProjectCapacityResponse
-	(*ReleaseProjectCapacityRequest)(nil),      // 507: litevirt.v1.ReleaseProjectCapacityRequest
-	(*ReserveHostCapacityRequest)(nil),         // 508: litevirt.v1.ReserveHostCapacityRequest
-	(*ReserveHostCapacityResponse)(nil),        // 509: litevirt.v1.ReserveHostCapacityResponse
-	(*ReleaseHostCapacityRequest)(nil),         // 510: litevirt.v1.ReleaseHostCapacityRequest
-	(*FenceHostPosture)(nil),                   // 511: litevirt.v1.FenceHostPosture
-	(*FenceReadiness)(nil),                     // 512: litevirt.v1.FenceReadiness
-	(*FenceEvent)(nil),                         // 513: litevirt.v1.FenceEvent
-	(*ImportLeftoverFile)(nil),                 // 514: litevirt.v1.ImportLeftoverFile
-	(*ImportLeftoverStatusRequest)(nil),        // 515: litevirt.v1.ImportLeftoverStatusRequest
-	(*ImportLeftoverStatusResponse)(nil),       // 516: litevirt.v1.ImportLeftoverStatusResponse
-	(*PreflightRecreateVMRequest)(nil),         // 517: litevirt.v1.PreflightRecreateVMRequest
-	nil,                                        // 518: litevirt.v1.ListHostsRequest.LabelFilterEntry
-	nil,                                        // 519: litevirt.v1.SetHostLabelsRequest.LabelsEntry
-	nil,                                        // 520: litevirt.v1.ListVMsRequest.LabelFilterEntry
-	nil,                                        // 521: litevirt.v1.SetVMLabelsRequest.LabelsEntry
-	nil,                                        // 522: litevirt.v1.ImportVMRequest.NetMapEntry
-	nil,                                        // 523: litevirt.v1.ImportVMRequest.DiskMapEntry
-	nil,                                        // 524: litevirt.v1.CheckPermissionsResponse.AllowedEntry
-	nil,                                        // 525: litevirt.v1.CreateContainerRequest.LabelsEntry
-	nil,                                        // 526: litevirt.v1.CreateStoragePoolRequest.OptionsEntry
-	nil,                                        // 527: litevirt.v1.EnsureDisksRequest.InstallerIsoSha256Entry
-	nil,                                        // 528: litevirt.v1.EnsureDisksResponse.InstallerIsoResolvedEntry
-	nil,                                        // 529: litevirt.v1.TableDumpRequest.BucketsEntry
-	nil,                                        // 530: litevirt.v1.SensitiveStateRequest.BucketsEntry
-	nil,                                        // 531: litevirt.v1.PlanHostNetworkResponse.ConflictsEntry
-	(*Host)(nil),                               // 532: litevirt.v1.Host
-	(MigrateStrategy)(0),                       // 533: litevirt.v1.MigrateStrategy
-	(*PCIDevice)(nil),                          // 534: litevirt.v1.PCIDevice
-	(*VMSpec)(nil),                             // 535: litevirt.v1.VMSpec
-	(*VM)(nil),                                 // 536: litevirt.v1.VM
-	(*HardwareDevice)(nil),                     // 537: litevirt.v1.HardwareDevice
-	(*RestartPolicy)(nil),                      // 538: litevirt.v1.RestartPolicy
-	(*timestamppb.Timestamp)(nil),              // 539: google.protobuf.Timestamp
-	(DiffOp)(0),                                // 540: litevirt.v1.DiffOp
-	(MigratePhase)(0),                          // 541: litevirt.v1.MigratePhase
-	(*Image)(nil),                              // 542: litevirt.v1.Image
-	(*Snapshot)(nil),                           // 543: litevirt.v1.Snapshot
-	(*LoadBalancer)(nil),                       // 544: litevirt.v1.LoadBalancer
-	(*LBBackend)(nil),                          // 545: litevirt.v1.LBBackend
-	(*LBPort)(nil),                             // 546: litevirt.v1.LBPort
-	(*LBBackendAddress)(nil),                   // 547: litevirt.v1.LBBackendAddress
-	(*User)(nil),                               // 548: litevirt.v1.User
-	(*ClusterEvent)(nil),                       // 549: litevirt.v1.ClusterEvent
-	(*ResourceMapping)(nil),                    // 550: litevirt.v1.ResourceMapping
-	(*NotificationTarget)(nil),                 // 551: litevirt.v1.NotificationTarget
-	(*NotificationRoute)(nil),                  // 552: litevirt.v1.NotificationRoute
-	(*FirewallRule)(nil),                       // 553: litevirt.v1.FirewallRule
-	(*IpSet)(nil),                              // 554: litevirt.v1.IpSet
-	(*FirewallDefault)(nil),                    // 555: litevirt.v1.FirewallDefault
-	(*SecurityGroupRule)(nil),                  // 556: litevirt.v1.SecurityGroupRule
-	(*SecurityGroup)(nil),                      // 557: litevirt.v1.SecurityGroup
-	(*StoragePool)(nil),                        // 558: litevirt.v1.StoragePool
-	(*emptypb.Empty)(nil),                      // 559: google.protobuf.Empty
-	(*AttachDeviceRequest)(nil),                // 560: litevirt.v1.AttachDeviceRequest
-	(*DetachDeviceRequest)(nil),                // 561: litevirt.v1.DetachDeviceRequest
-	(*LBKeepalivedRequest)(nil),                // 562: litevirt.v1.LBKeepalivedRequest
-	(*LBStatsResponse)(nil),                    // 563: litevirt.v1.LBStatsResponse
-	(*LBKeepalivedResponse)(nil),               // 564: litevirt.v1.LBKeepalivedResponse
-	(*Token)(nil),                              // 565: litevirt.v1.Token
-	(*VMStats)(nil),                            // 566: litevirt.v1.VMStats
-	(*HostResourceStats)(nil),                  // 567: litevirt.v1.HostResourceStats
+	(*RevokeReplacedCertificateRequest)(nil),   // 24: litevirt.v1.RevokeReplacedCertificateRequest
+	(*RevokeReplacedCertificateResponse)(nil),  // 25: litevirt.v1.RevokeReplacedCertificateResponse
+	(*FenceResult)(nil),                        // 26: litevirt.v1.FenceResult
+	(*GetClusterHealthRequest)(nil),            // 27: litevirt.v1.GetClusterHealthRequest
+	(*HealthCondition)(nil),                    // 28: litevirt.v1.HealthCondition
+	(*HealthEvaluatorStatus)(nil),              // 29: litevirt.v1.HealthEvaluatorStatus
+	(*ConnectivityEdge)(nil),                   // 30: litevirt.v1.ConnectivityEdge
+	(*HostCapacityAssessment)(nil),             // 31: litevirt.v1.HostCapacityAssessment
+	(*ClusterHealth)(nil),                      // 32: litevirt.v1.ClusterHealth
+	(*RescanHostRequest)(nil),                  // 33: litevirt.v1.RescanHostRequest
+	(*RescanHostResponse)(nil),                 // 34: litevirt.v1.RescanHostResponse
+	(*ListHostDevicesRequest)(nil),             // 35: litevirt.v1.ListHostDevicesRequest
+	(*ListHostDevicesResponse)(nil),            // 36: litevirt.v1.ListHostDevicesResponse
+	(*SupersededDisksRequest)(nil),             // 37: litevirt.v1.SupersededDisksRequest
+	(*SupersededDisk)(nil),                     // 38: litevirt.v1.SupersededDisk
+	(*SupersededDisksResponse)(nil),            // 39: litevirt.v1.SupersededDisksResponse
+	(*ConfigureHostRequest)(nil),               // 40: litevirt.v1.ConfigureHostRequest
+	(*CreateVMRequest)(nil),                    // 41: litevirt.v1.CreateVMRequest
+	(*ListVMsRequest)(nil),                     // 42: litevirt.v1.ListVMsRequest
+	(*ListVMsResponse)(nil),                    // 43: litevirt.v1.ListVMsResponse
+	(*InspectVMRequest)(nil),                   // 44: litevirt.v1.InspectVMRequest
+	(*ListVMHardwareRequest)(nil),              // 45: litevirt.v1.ListVMHardwareRequest
+	(*ListVMHardwareResponse)(nil),             // 46: litevirt.v1.ListVMHardwareResponse
+	(*StartVMRequest)(nil),                     // 47: litevirt.v1.StartVMRequest
+	(*StopVMRequest)(nil),                      // 48: litevirt.v1.StopVMRequest
+	(*RestartVMRequest)(nil),                   // 49: litevirt.v1.RestartVMRequest
+	(*DeleteVMRequest)(nil),                    // 50: litevirt.v1.DeleteVMRequest
+	(*RepairVMOwnerRequest)(nil),               // 51: litevirt.v1.RepairVMOwnerRequest
+	(*RepairVMOwnerResponse)(nil),              // 52: litevirt.v1.RepairVMOwnerResponse
+	(*CheckVIPParticipantRequest)(nil),         // 53: litevirt.v1.CheckVIPParticipantRequest
+	(*CheckVIPParticipantResponse)(nil),        // 54: litevirt.v1.CheckVIPParticipantResponse
+	(*RelayCheckVIPParticipantRequest)(nil),    // 55: litevirt.v1.RelayCheckVIPParticipantRequest
+	(*RelayCheckVIPParticipantResponse)(nil),   // 56: litevirt.v1.RelayCheckVIPParticipantResponse
+	(*CheckLBPresentRequest)(nil),              // 57: litevirt.v1.CheckLBPresentRequest
+	(*CheckLBPresentResponse)(nil),             // 58: litevirt.v1.CheckLBPresentResponse
+	(*GetRuntimeInventoryRequest)(nil),         // 59: litevirt.v1.GetRuntimeInventoryRequest
+	(*RuntimeWorkload)(nil),                    // 60: litevirt.v1.RuntimeWorkload
+	(*RuntimeInventory)(nil),                   // 61: litevirt.v1.RuntimeInventory
+	(*OrphanProofRequest)(nil),                 // 62: litevirt.v1.OrphanProofRequest
+	(*OrphanProofResponse)(nil),                // 63: litevirt.v1.OrphanProofResponse
+	(*MembershipHost)(nil),                     // 64: litevirt.v1.MembershipHost
+	(*MembershipViewResponse)(nil),             // 65: litevirt.v1.MembershipViewResponse
+	(*RekeyBindingRequest)(nil),                // 66: litevirt.v1.RekeyBindingRequest
+	(*ResumeBindingRequest)(nil),               // 67: litevirt.v1.ResumeBindingRequest
+	(*CloneVMRequest)(nil),                     // 68: litevirt.v1.CloneVMRequest
+	(*ConvertToTemplateRequest)(nil),           // 69: litevirt.v1.ConvertToTemplateRequest
+	(*ExecVMRequest)(nil),                      // 70: litevirt.v1.ExecVMRequest
+	(*ExecVMResponse)(nil),                     // 71: litevirt.v1.ExecVMResponse
+	(*ConsoleInput)(nil),                       // 72: litevirt.v1.ConsoleInput
+	(*ConsoleOutput)(nil),                      // 73: litevirt.v1.ConsoleOutput
+	(*SetVMIPRequest)(nil),                     // 74: litevirt.v1.SetVMIPRequest
+	(*SetBootOrderRequest)(nil),                // 75: litevirt.v1.SetBootOrderRequest
+	(*RebuildVMRequest)(nil),                   // 76: litevirt.v1.RebuildVMRequest
+	(*CutoverVMRequest)(nil),                   // 77: litevirt.v1.CutoverVMRequest
+	(*UpdateVMRequest)(nil),                    // 78: litevirt.v1.UpdateVMRequest
+	(*SetVMMemoryRequest)(nil),                 // 79: litevirt.v1.SetVMMemoryRequest
+	(*SetVMLabelsRequest)(nil),                 // 80: litevirt.v1.SetVMLabelsRequest
+	(*ResizeDiskRequest)(nil),                  // 81: litevirt.v1.ResizeDiskRequest
+	(*VNCData)(nil),                            // 82: litevirt.v1.VNCData
+	(*DeployStackRequest)(nil),                 // 83: litevirt.v1.DeployStackRequest
+	(*DeployProgress)(nil),                     // 84: litevirt.v1.DeployProgress
+	(*DeleteStackRequest)(nil),                 // 85: litevirt.v1.DeleteStackRequest
+	(*DeleteProgress)(nil),                     // 86: litevirt.v1.DeleteProgress
+	(*ListStacksResponse)(nil),                 // 87: litevirt.v1.ListStacksResponse
+	(*StackSummary)(nil),                       // 88: litevirt.v1.StackSummary
+	(*DiffStackRequest)(nil),                   // 89: litevirt.v1.DiffStackRequest
+	(*DiffStackResponse)(nil),                  // 90: litevirt.v1.DiffStackResponse
+	(*DiffEntry)(nil),                          // 91: litevirt.v1.DiffEntry
+	(*ExportStackRequest)(nil),                 // 92: litevirt.v1.ExportStackRequest
+	(*ExportStackResponse)(nil),                // 93: litevirt.v1.ExportStackResponse
+	(*MigrateVMRequest)(nil),                   // 94: litevirt.v1.MigrateVMRequest
+	(*MigrateProgress)(nil),                    // 95: litevirt.v1.MigrateProgress
+	(*MoveVolumeRequest)(nil),                  // 96: litevirt.v1.MoveVolumeRequest
+	(*MoveVolumeProgress)(nil),                 // 97: litevirt.v1.MoveVolumeProgress
+	(*ReplicateVolumeRequest)(nil),             // 98: litevirt.v1.ReplicateVolumeRequest
+	(*ReplicateVolumeProgress)(nil),            // 99: litevirt.v1.ReplicateVolumeProgress
+	(*MigrateStackVolumesRequest)(nil),         // 100: litevirt.v1.MigrateStackVolumesRequest
+	(*VolumePlacement)(nil),                    // 101: litevirt.v1.VolumePlacement
+	(*StackVolumeProgress)(nil),                // 102: litevirt.v1.StackVolumeProgress
+	(*PullImageRequest)(nil),                   // 103: litevirt.v1.PullImageRequest
+	(*PullProgress)(nil),                       // 104: litevirt.v1.PullProgress
+	(*ListImagesResponse)(nil),                 // 105: litevirt.v1.ListImagesResponse
+	(*DeleteImageRequest)(nil),                 // 106: litevirt.v1.DeleteImageRequest
+	(*ImportImageRequest)(nil),                 // 107: litevirt.v1.ImportImageRequest
+	(*ImportImageResponse)(nil),                // 108: litevirt.v1.ImportImageResponse
+	(*PushImageRequest)(nil),                   // 109: litevirt.v1.PushImageRequest
+	(*PruneImagesRequest)(nil),                 // 110: litevirt.v1.PruneImagesRequest
+	(*PruneImagesResponse)(nil),                // 111: litevirt.v1.PruneImagesResponse
+	(*PushImageProgress)(nil),                  // 112: litevirt.v1.PushImageProgress
+	(*BuildImageRequest)(nil),                  // 113: litevirt.v1.BuildImageRequest
+	(*BuildImageResponse)(nil),                 // 114: litevirt.v1.BuildImageResponse
+	(*BackupVMRequest)(nil),                    // 115: litevirt.v1.BackupVMRequest
+	(*BackupChunk)(nil),                        // 116: litevirt.v1.BackupChunk
+	(*RestoreVMRequest)(nil),                   // 117: litevirt.v1.RestoreVMRequest
+	(*ImportVMRequest)(nil),                    // 118: litevirt.v1.ImportVMRequest
+	(*ImportVMProgress)(nil),                   // 119: litevirt.v1.ImportVMProgress
+	(*CreateSnapshotRequest)(nil),              // 120: litevirt.v1.CreateSnapshotRequest
+	(*ListSnapshotsRequest)(nil),               // 121: litevirt.v1.ListSnapshotsRequest
+	(*ListSnapshotsResponse)(nil),              // 122: litevirt.v1.ListSnapshotsResponse
+	(*RestoreSnapshotRequest)(nil),             // 123: litevirt.v1.RestoreSnapshotRequest
+	(*DeleteSnapshotRequest)(nil),              // 124: litevirt.v1.DeleteSnapshotRequest
+	(*CreateNetworkRequest)(nil),               // 125: litevirt.v1.CreateNetworkRequest
+	(*GetNetworkRequest)(nil),                  // 126: litevirt.v1.GetNetworkRequest
+	(*DeleteNetworkRequest)(nil),               // 127: litevirt.v1.DeleteNetworkRequest
+	(*ListNetworksResponse)(nil),               // 128: litevirt.v1.ListNetworksResponse
+	(*NetworkInfo)(nil),                        // 129: litevirt.v1.NetworkInfo
+	(*ListLBResponse)(nil),                     // 130: litevirt.v1.ListLBResponse
+	(*InspectLBRequest)(nil),                   // 131: litevirt.v1.InspectLBRequest
+	(*DisableBackendRequest)(nil),              // 132: litevirt.v1.DisableBackendRequest
+	(*EnableBackendRequest)(nil),               // 133: litevirt.v1.EnableBackendRequest
+	(*ApplyLBRequest)(nil),                     // 134: litevirt.v1.ApplyLBRequest
+	(*RemoveLBRequest)(nil),                    // 135: litevirt.v1.RemoveLBRequest
+	(*CreateLBRequest)(nil),                    // 136: litevirt.v1.CreateLBRequest
+	(*UpdateLBRequest)(nil),                    // 137: litevirt.v1.UpdateLBRequest
+	(*DeleteLBRequest)(nil),                    // 138: litevirt.v1.DeleteLBRequest
+	(*LBStatsRequest)(nil),                     // 139: litevirt.v1.LBStatsRequest
+	(*DrainBackendRequest)(nil),                // 140: litevirt.v1.DrainBackendRequest
+	(*DrainBackendResponse)(nil),               // 141: litevirt.v1.DrainBackendResponse
+	(*LoginRequest)(nil),                       // 142: litevirt.v1.LoginRequest
+	(*LoginResponse)(nil),                      // 143: litevirt.v1.LoginResponse
+	(*ListRealmsResponse)(nil),                 // 144: litevirt.v1.ListRealmsResponse
+	(*CreateUserRequest)(nil),                  // 145: litevirt.v1.CreateUserRequest
+	(*ListUsersResponse)(nil),                  // 146: litevirt.v1.ListUsersResponse
+	(*DeleteUserRequest)(nil),                  // 147: litevirt.v1.DeleteUserRequest
+	(*WhoamiResponse)(nil),                     // 148: litevirt.v1.WhoamiResponse
+	(*CheckPermissionsRequest)(nil),            // 149: litevirt.v1.CheckPermissionsRequest
+	(*CheckPermissionsResponse)(nil),           // 150: litevirt.v1.CheckPermissionsResponse
+	(*ChangePasswordRequest)(nil),              // 151: litevirt.v1.ChangePasswordRequest
+	(*ResetAdminPasswordRequest)(nil),          // 152: litevirt.v1.ResetAdminPasswordRequest
+	(*CreateTokenRequest)(nil),                 // 153: litevirt.v1.CreateTokenRequest
+	(*RevokeTokenRequest)(nil),                 // 154: litevirt.v1.RevokeTokenRequest
+	(*BackupSnapshotRequest)(nil),              // 155: litevirt.v1.BackupSnapshotRequest
+	(*BackupSnapshotProgress)(nil),             // 156: litevirt.v1.BackupSnapshotProgress
+	(*RepoTarget)(nil),                         // 157: litevirt.v1.RepoTarget
+	(*HasChunksRequest)(nil),                   // 158: litevirt.v1.HasChunksRequest
+	(*HasChunksResponse)(nil),                  // 159: litevirt.v1.HasChunksResponse
+	(*PushBackupFrame)(nil),                    // 160: litevirt.v1.PushBackupFrame
+	(*PushBackupHeader)(nil),                   // 161: litevirt.v1.PushBackupHeader
+	(*PushChunkFrame)(nil),                     // 162: litevirt.v1.PushChunkFrame
+	(*PushManifestFrame)(nil),                  // 163: litevirt.v1.PushManifestFrame
+	(*PushBackupResponse)(nil),                 // 164: litevirt.v1.PushBackupResponse
+	(*RestoreFromBackupRequest)(nil),           // 165: litevirt.v1.RestoreFromBackupRequest
+	(*RestoreFromBackupProgress)(nil),          // 166: litevirt.v1.RestoreFromBackupProgress
+	(*VerifyBackupRepoRequest)(nil),            // 167: litevirt.v1.VerifyBackupRepoRequest
+	(*VerifyBackupRepoResponse)(nil),           // 168: litevirt.v1.VerifyBackupRepoResponse
+	(*GarbageCollectBackupRepoRequest)(nil),    // 169: litevirt.v1.GarbageCollectBackupRepoRequest
+	(*GarbageCollectBackupRepoResponse)(nil),   // 170: litevirt.v1.GarbageCollectBackupRepoResponse
+	(*BackupRepoSnapshot)(nil),                 // 171: litevirt.v1.BackupRepoSnapshot
+	(*ListBackupRepoSnapshotsRequest)(nil),     // 172: litevirt.v1.ListBackupRepoSnapshotsRequest
+	(*ListBackupRepoSnapshotsResponse)(nil),    // 173: litevirt.v1.ListBackupRepoSnapshotsResponse
+	(*PruneBackupRepoRequest)(nil),             // 174: litevirt.v1.PruneBackupRepoRequest
+	(*PruneBackupRepoResponse)(nil),            // 175: litevirt.v1.PruneBackupRepoResponse
+	(*SyncBackupRepoRequest)(nil),              // 176: litevirt.v1.SyncBackupRepoRequest
+	(*SyncBackupRepoResponse)(nil),             // 177: litevirt.v1.SyncBackupRepoResponse
+	(*Container)(nil),                          // 178: litevirt.v1.Container
+	(*ContainerNetwork)(nil),                   // 179: litevirt.v1.ContainerNetwork
+	(*CreateContainerRequest)(nil),             // 180: litevirt.v1.CreateContainerRequest
+	(*PrepareContainerTargetRequest)(nil),      // 181: litevirt.v1.PrepareContainerTargetRequest
+	(*ConvertContainerRequest)(nil),            // 182: litevirt.v1.ConvertContainerRequest
+	(*StartContainerRequest)(nil),              // 183: litevirt.v1.StartContainerRequest
+	(*StopContainerRequest)(nil),               // 184: litevirt.v1.StopContainerRequest
+	(*DeleteContainerRequest)(nil),             // 185: litevirt.v1.DeleteContainerRequest
+	(*ExecContainerRequest)(nil),               // 186: litevirt.v1.ExecContainerRequest
+	(*ExecContainerResponse)(nil),              // 187: litevirt.v1.ExecContainerResponse
+	(*ListContainersRequest)(nil),              // 188: litevirt.v1.ListContainersRequest
+	(*ListContainersResponse)(nil),             // 189: litevirt.v1.ListContainersResponse
+	(*PullOCIImageRequest)(nil),                // 190: litevirt.v1.PullOCIImageRequest
+	(*BackupContainerRequest)(nil),             // 191: litevirt.v1.BackupContainerRequest
+	(*BackupContainerProgress)(nil),            // 192: litevirt.v1.BackupContainerProgress
+	(*RestoreContainerRequest)(nil),            // 193: litevirt.v1.RestoreContainerRequest
+	(*RestoreContainerProgress)(nil),           // 194: litevirt.v1.RestoreContainerProgress
+	(*MigrateContainerRequest)(nil),            // 195: litevirt.v1.MigrateContainerRequest
+	(*MigrateContainerProgress)(nil),           // 196: litevirt.v1.MigrateContainerProgress
+	(*ContainerSnapshot)(nil),                  // 197: litevirt.v1.ContainerSnapshot
+	(*InspectContainerRequest)(nil),            // 198: litevirt.v1.InspectContainerRequest
+	(*ContainerInterfaceDetail)(nil),           // 199: litevirt.v1.ContainerInterfaceDetail
+	(*ContainerBackupRef)(nil),                 // 200: litevirt.v1.ContainerBackupRef
+	(*ProbeContainerBackupsRequest)(nil),       // 201: litevirt.v1.ProbeContainerBackupsRequest
+	(*ContainerBackupProbe)(nil),               // 202: litevirt.v1.ContainerBackupProbe
+	(*ProbeContainerBackupsResponse)(nil),      // 203: litevirt.v1.ProbeContainerBackupsResponse
+	(*ContainerDetail)(nil),                    // 204: litevirt.v1.ContainerDetail
+	(*ContainerStrandedRootfs)(nil),            // 205: litevirt.v1.ContainerStrandedRootfs
+	(*SnapshotContainerRequest)(nil),           // 206: litevirt.v1.SnapshotContainerRequest
+	(*ListContainerSnapshotsRequest)(nil),      // 207: litevirt.v1.ListContainerSnapshotsRequest
+	(*ListContainerSnapshotsResponse)(nil),     // 208: litevirt.v1.ListContainerSnapshotsResponse
+	(*RevertContainerSnapshotRequest)(nil),     // 209: litevirt.v1.RevertContainerSnapshotRequest
+	(*DeleteContainerSnapshotRequest)(nil),     // 210: litevirt.v1.DeleteContainerSnapshotRequest
+	(*ConvertContainerToTemplateRequest)(nil),  // 211: litevirt.v1.ConvertContainerToTemplateRequest
+	(*CloneContainerRequest)(nil),              // 212: litevirt.v1.CloneContainerRequest
+	(*FirewallStatus)(nil),                     // 213: litevirt.v1.FirewallStatus
+	(*BindSecurityGroupsRequest)(nil),          // 214: litevirt.v1.BindSecurityGroupsRequest
+	(*Session)(nil),                            // 215: litevirt.v1.Session
+	(*ListSessionsRequest)(nil),                // 216: litevirt.v1.ListSessionsRequest
+	(*ListSessionsResponse)(nil),               // 217: litevirt.v1.ListSessionsResponse
+	(*RevokeSessionRequest)(nil),               // 218: litevirt.v1.RevokeSessionRequest
+	(*TwoFactor)(nil),                          // 219: litevirt.v1.TwoFactor
+	(*ListTwoFactorsRequest)(nil),              // 220: litevirt.v1.ListTwoFactorsRequest
+	(*ListTwoFactorsResponse)(nil),             // 221: litevirt.v1.ListTwoFactorsResponse
+	(*EnrollTOTPRequest)(nil),                  // 222: litevirt.v1.EnrollTOTPRequest
+	(*EnrollTOTPResponse)(nil),                 // 223: litevirt.v1.EnrollTOTPResponse
+	(*DisableTwoFactorRequest)(nil),            // 224: litevirt.v1.DisableTwoFactorRequest
+	(*RoleBinding)(nil),                        // 225: litevirt.v1.RoleBinding
+	(*GrantRoleRequest)(nil),                   // 226: litevirt.v1.GrantRoleRequest
+	(*GrantRoleResponse)(nil),                  // 227: litevirt.v1.GrantRoleResponse
+	(*RevokeRoleRequest)(nil),                  // 228: litevirt.v1.RevokeRoleRequest
+	(*RevokeRoleResponse)(nil),                 // 229: litevirt.v1.RevokeRoleResponse
+	(*ListRoleBindingsRequest)(nil),            // 230: litevirt.v1.ListRoleBindingsRequest
+	(*ListRoleBindingsResponse)(nil),           // 231: litevirt.v1.ListRoleBindingsResponse
+	(*NormalizeRoleBindingsRequest)(nil),       // 232: litevirt.v1.NormalizeRoleBindingsRequest
+	(*NormalizeRoleBindingsResponse)(nil),      // 233: litevirt.v1.NormalizeRoleBindingsResponse
+	(*GetVMOperationRequest)(nil),              // 234: litevirt.v1.GetVMOperationRequest
+	(*OperationStepInfo)(nil),                  // 235: litevirt.v1.OperationStepInfo
+	(*GetVMOperationResponse)(nil),             // 236: litevirt.v1.GetVMOperationResponse
+	(*AbortVMOperationRequest)(nil),            // 237: litevirt.v1.AbortVMOperationRequest
+	(*AbortVMOperationResponse)(nil),           // 238: litevirt.v1.AbortVMOperationResponse
+	(*RestoreLiveRequest)(nil),                 // 239: litevirt.v1.RestoreLiveRequest
+	(*RestoreLiveProgress)(nil),                // 240: litevirt.v1.RestoreLiveProgress
+	(*BeginWebAuthnRegistrationRequest)(nil),   // 241: litevirt.v1.BeginWebAuthnRegistrationRequest
+	(*BeginWebAuthnRegistrationResponse)(nil),  // 242: litevirt.v1.BeginWebAuthnRegistrationResponse
+	(*FinishWebAuthnRegistrationRequest)(nil),  // 243: litevirt.v1.FinishWebAuthnRegistrationRequest
+	(*FinishWebAuthnRegistrationResponse)(nil), // 244: litevirt.v1.FinishWebAuthnRegistrationResponse
+	(*BeginWebAuthnLoginRequest)(nil),          // 245: litevirt.v1.BeginWebAuthnLoginRequest
+	(*BeginWebAuthnLoginResponse)(nil),         // 246: litevirt.v1.BeginWebAuthnLoginResponse
+	(*FinishWebAuthnLoginRequest)(nil),         // 247: litevirt.v1.FinishWebAuthnLoginRequest
+	(*FinishWebAuthnLoginResponse)(nil),        // 248: litevirt.v1.FinishWebAuthnLoginResponse
+	(*GetVMStatsRequest)(nil),                  // 249: litevirt.v1.GetVMStatsRequest
+	(*GetHostStatsRequest)(nil),                // 250: litevirt.v1.GetHostStatsRequest
+	(*ClusterStatus)(nil),                      // 251: litevirt.v1.ClusterStatus
+	(*StreamEventsRequest)(nil),                // 252: litevirt.v1.StreamEventsRequest
+	(*ListAuditLogRequest)(nil),                // 253: litevirt.v1.ListAuditLogRequest
+	(*AuditEntry)(nil),                         // 254: litevirt.v1.AuditEntry
+	(*ListAuditLogResponse)(nil),               // 255: litevirt.v1.ListAuditLogResponse
+	(*ListVMEventsRequest)(nil),                // 256: litevirt.v1.ListVMEventsRequest
+	(*VMEvent)(nil),                            // 257: litevirt.v1.VMEvent
+	(*ListVMEventsResponse)(nil),               // 258: litevirt.v1.ListVMEventsResponse
+	(*CreateResourceMappingRequest)(nil),       // 259: litevirt.v1.CreateResourceMappingRequest
+	(*ListResourceMappingsRequest)(nil),        // 260: litevirt.v1.ListResourceMappingsRequest
+	(*ListResourceMappingsResponse)(nil),       // 261: litevirt.v1.ListResourceMappingsResponse
+	(*DeleteResourceMappingRequest)(nil),       // 262: litevirt.v1.DeleteResourceMappingRequest
+	(*AddMappingDeviceRequest)(nil),            // 263: litevirt.v1.AddMappingDeviceRequest
+	(*RemoveMappingDeviceRequest)(nil),         // 264: litevirt.v1.RemoveMappingDeviceRequest
+	(*CreateNotificationTargetRequest)(nil),    // 265: litevirt.v1.CreateNotificationTargetRequest
+	(*ListNotificationTargetsRequest)(nil),     // 266: litevirt.v1.ListNotificationTargetsRequest
+	(*ListNotificationTargetsResponse)(nil),    // 267: litevirt.v1.ListNotificationTargetsResponse
+	(*DeleteNotificationTargetRequest)(nil),    // 268: litevirt.v1.DeleteNotificationTargetRequest
+	(*TestNotificationTargetRequest)(nil),      // 269: litevirt.v1.TestNotificationTargetRequest
+	(*CreateNotificationRouteRequest)(nil),     // 270: litevirt.v1.CreateNotificationRouteRequest
+	(*ListNotificationRoutesRequest)(nil),      // 271: litevirt.v1.ListNotificationRoutesRequest
+	(*ListNotificationRoutesResponse)(nil),     // 272: litevirt.v1.ListNotificationRoutesResponse
+	(*DeleteNotificationRouteRequest)(nil),     // 273: litevirt.v1.DeleteNotificationRouteRequest
+	(*RegistryCredential)(nil),                 // 274: litevirt.v1.RegistryCredential
+	(*SetRegistryCredentialRequest)(nil),       // 275: litevirt.v1.SetRegistryCredentialRequest
+	(*ListRegistryCredentialsRequest)(nil),     // 276: litevirt.v1.ListRegistryCredentialsRequest
+	(*ListRegistryCredentialsResponse)(nil),    // 277: litevirt.v1.ListRegistryCredentialsResponse
+	(*DeleteRegistryCredentialRequest)(nil),    // 278: litevirt.v1.DeleteRegistryCredentialRequest
+	(*CreateClusterFirewallRuleRequest)(nil),   // 279: litevirt.v1.CreateClusterFirewallRuleRequest
+	(*ListClusterFirewallRulesRequest)(nil),    // 280: litevirt.v1.ListClusterFirewallRulesRequest
+	(*ListClusterFirewallRulesResponse)(nil),   // 281: litevirt.v1.ListClusterFirewallRulesResponse
+	(*DeleteClusterFirewallRuleRequest)(nil),   // 282: litevirt.v1.DeleteClusterFirewallRuleRequest
+	(*CreateHostFirewallRuleRequest)(nil),      // 283: litevirt.v1.CreateHostFirewallRuleRequest
+	(*ListHostFirewallRulesRequest)(nil),       // 284: litevirt.v1.ListHostFirewallRulesRequest
+	(*ListHostFirewallRulesResponse)(nil),      // 285: litevirt.v1.ListHostFirewallRulesResponse
+	(*DeleteHostFirewallRuleRequest)(nil),      // 286: litevirt.v1.DeleteHostFirewallRuleRequest
+	(*CreateIpSetRequest)(nil),                 // 287: litevirt.v1.CreateIpSetRequest
+	(*ListIpSetsRequest)(nil),                  // 288: litevirt.v1.ListIpSetsRequest
+	(*ListIpSetsResponse)(nil),                 // 289: litevirt.v1.ListIpSetsResponse
+	(*DeleteIpSetRequest)(nil),                 // 290: litevirt.v1.DeleteIpSetRequest
+	(*SetFirewallDefaultRequest)(nil),          // 291: litevirt.v1.SetFirewallDefaultRequest
+	(*ListFirewallDefaultsRequest)(nil),        // 292: litevirt.v1.ListFirewallDefaultsRequest
+	(*ListFirewallDefaultsResponse)(nil),       // 293: litevirt.v1.ListFirewallDefaultsResponse
+	(*CreateSecurityGroupRequest)(nil),         // 294: litevirt.v1.CreateSecurityGroupRequest
+	(*DeleteSecurityGroupRequest)(nil),         // 295: litevirt.v1.DeleteSecurityGroupRequest
+	(*AddSecurityGroupRuleRequest)(nil),        // 296: litevirt.v1.AddSecurityGroupRuleRequest
+	(*RemoveSecurityGroupRuleRequest)(nil),     // 297: litevirt.v1.RemoveSecurityGroupRuleRequest
+	(*ListSecurityGroupsRequest)(nil),          // 298: litevirt.v1.ListSecurityGroupsRequest
+	(*ListSecurityGroupsResponse)(nil),         // 299: litevirt.v1.ListSecurityGroupsResponse
+	(*ListStoragePoolsRequest)(nil),            // 300: litevirt.v1.ListStoragePoolsRequest
+	(*ListStoragePoolsResponse)(nil),           // 301: litevirt.v1.ListStoragePoolsResponse
+	(*CreateStoragePoolRequest)(nil),           // 302: litevirt.v1.CreateStoragePoolRequest
+	(*CreateStoragePoolResponse)(nil),          // 303: litevirt.v1.CreateStoragePoolResponse
+	(*DeleteStoragePoolRequest)(nil),           // 304: litevirt.v1.DeleteStoragePoolRequest
+	(*DeleteStoragePoolResponse)(nil),          // 305: litevirt.v1.DeleteStoragePoolResponse
+	(*GetStoragePoolRequest)(nil),              // 306: litevirt.v1.GetStoragePoolRequest
+	(*GetStoragePoolResponse)(nil),             // 307: litevirt.v1.GetStoragePoolResponse
+	(*StoragePoolContent)(nil),                 // 308: litevirt.v1.StoragePoolContent
+	(*ListStoragePoolContentsRequest)(nil),     // 309: litevirt.v1.ListStoragePoolContentsRequest
+	(*ListStoragePoolContentsResponse)(nil),    // 310: litevirt.v1.ListStoragePoolContentsResponse
+	(*UploadStoragePoolContentRequest)(nil),    // 311: litevirt.v1.UploadStoragePoolContentRequest
+	(*UploadStoragePoolContentResponse)(nil),   // 312: litevirt.v1.UploadStoragePoolContentResponse
+	(*PushReplicaRequest)(nil),                 // 313: litevirt.v1.PushReplicaRequest
+	(*PushReplicaResponse)(nil),                // 314: litevirt.v1.PushReplicaResponse
+	(*DeleteStoragePoolContentRequest)(nil),    // 315: litevirt.v1.DeleteStoragePoolContentRequest
+	(*ISOEntry)(nil),                           // 316: litevirt.v1.ISOEntry
+	(*ListISOsRequest)(nil),                    // 317: litevirt.v1.ListISOsRequest
+	(*ListISOsResponse)(nil),                   // 318: litevirt.v1.ListISOsResponse
+	(*PullISORequest)(nil),                     // 319: litevirt.v1.PullISORequest
+	(*PullISOResponse)(nil),                    // 320: litevirt.v1.PullISOResponse
+	(*ISOLibraryMode)(nil),                     // 321: litevirt.v1.ISOLibraryMode
+	(*SetISOLibraryModeRequest)(nil),           // 322: litevirt.v1.SetISOLibraryModeRequest
+	(*FetchISOLibraryFileRequest)(nil),         // 323: litevirt.v1.FetchISOLibraryFileRequest
+	(*FetchISOLibraryFileChunk)(nil),           // 324: litevirt.v1.FetchISOLibraryFileChunk
+	(*PushReplicaIncrementRequest)(nil),        // 325: litevirt.v1.PushReplicaIncrementRequest
+	(*PushReplicaIncrementResponse)(nil),       // 326: litevirt.v1.PushReplicaIncrementResponse
+	(*ReplicaRecord)(nil),                      // 327: litevirt.v1.ReplicaRecord
+	(*ListReplicasRequest)(nil),                // 328: litevirt.v1.ListReplicasRequest
+	(*ListReplicasResponse)(nil),               // 329: litevirt.v1.ListReplicasResponse
+	(*PruneReplicasRequest)(nil),               // 330: litevirt.v1.PruneReplicasRequest
+	(*PruneReplicasResponse)(nil),              // 331: litevirt.v1.PruneReplicasResponse
+	(*RuntimeActionProof)(nil),                 // 332: litevirt.v1.RuntimeActionProof
+	(*AcknowledgeLeaseTermTieRequest)(nil),     // 333: litevirt.v1.AcknowledgeLeaseTermTieRequest
+	(*AcknowledgeLeaseTermTieResponse)(nil),    // 334: litevirt.v1.AcknowledgeLeaseTermTieResponse
+	(*GetLeaseTermHighWaterRequest)(nil),       // 335: litevirt.v1.GetLeaseTermHighWaterRequest
+	(*GetLeaseTermHighWaterResponse)(nil),      // 336: litevirt.v1.GetLeaseTermHighWaterResponse
+	(*RecoveryClaimKey)(nil),                   // 337: litevirt.v1.RecoveryClaimKey
+	(*ClaimBallot)(nil),                        // 338: litevirt.v1.ClaimBallot
+	(*ClaimVoterMember)(nil),                   // 339: litevirt.v1.ClaimVoterMember
+	(*VoterConfigValue)(nil),                   // 340: litevirt.v1.VoterConfigValue
+	(*RecoveryClaimValue)(nil),                 // 341: litevirt.v1.RecoveryClaimValue
+	(*ClaimAccept)(nil),                        // 342: litevirt.v1.ClaimAccept
+	(*PrepareRecoveryClaimRequest)(nil),        // 343: litevirt.v1.PrepareRecoveryClaimRequest
+	(*RecoveryClaimSupersede)(nil),             // 344: litevirt.v1.RecoveryClaimSupersede
+	(*AbandonRecoveryProofRequest)(nil),        // 345: litevirt.v1.AbandonRecoveryProofRequest
+	(*ReleaseLegacyHeldClaimRequest)(nil),      // 346: litevirt.v1.ReleaseLegacyHeldClaimRequest
+	(*ReleaseLegacyHeldClaimResponse)(nil),     // 347: litevirt.v1.ReleaseLegacyHeldClaimResponse
+	(*AbandonRecoveryProofResponse)(nil),       // 348: litevirt.v1.AbandonRecoveryProofResponse
+	(*PlanDeadHostRemovalRequest)(nil),         // 349: litevirt.v1.PlanDeadHostRemovalRequest
+	(*StrandedRecovery)(nil),                   // 350: litevirt.v1.StrandedRecovery
+	(*ForceReconfigureVotersRequest)(nil),      // 351: litevirt.v1.ForceReconfigureVotersRequest
+	(*ForcedFenceEvidence)(nil),                // 352: litevirt.v1.ForcedFenceEvidence
+	(*ForceReconfigureVotersResponse)(nil),     // 353: litevirt.v1.ForceReconfigureVotersResponse
+	(*SignForcedVoterConfigRequest)(nil),       // 354: litevirt.v1.SignForcedVoterConfigRequest
+	(*SignForcedVoterConfigResponse)(nil),      // 355: litevirt.v1.SignForcedVoterConfigResponse
+	(*PausedWorkload)(nil),                     // 356: litevirt.v1.PausedWorkload
+	(*ConfirmPartitionResumeRequest)(nil),      // 357: litevirt.v1.ConfirmPartitionResumeRequest
+	(*PausedWorkloadView)(nil),                 // 358: litevirt.v1.PausedWorkloadView
+	(*ConfirmPartitionResumeResponse)(nil),     // 359: litevirt.v1.ConfirmPartitionResumeResponse
+	(*InspectRecoveryClaimRequest)(nil),        // 360: litevirt.v1.InspectRecoveryClaimRequest
+	(*RecoveryClaimVoterView)(nil),             // 361: litevirt.v1.RecoveryClaimVoterView
+	(*RecoveryClaimAttemptView)(nil),           // 362: litevirt.v1.RecoveryClaimAttemptView
+	(*InspectRecoveryClaimResponse)(nil),       // 363: litevirt.v1.InspectRecoveryClaimResponse
+	(*PlanDeadHostRemovalResponse)(nil),        // 364: litevirt.v1.PlanDeadHostRemovalResponse
+	(*PrepareRecoveryClaimResponse)(nil),       // 365: litevirt.v1.PrepareRecoveryClaimResponse
+	(*AcceptRecoveryClaimRequest)(nil),         // 366: litevirt.v1.AcceptRecoveryClaimRequest
+	(*AcceptRecoveryClaimResponse)(nil),        // 367: litevirt.v1.AcceptRecoveryClaimResponse
+	(*GetRecoveryClaimRequest)(nil),            // 368: litevirt.v1.GetRecoveryClaimRequest
+	(*GetRecoveryClaimResponse)(nil),           // 369: litevirt.v1.GetRecoveryClaimResponse
+	(*ListRecoveryClaimsRequest)(nil),          // 370: litevirt.v1.ListRecoveryClaimsRequest
+	(*RecoveryClaimState)(nil),                 // 371: litevirt.v1.RecoveryClaimState
+	(*GetVoterConfigRequest)(nil),              // 372: litevirt.v1.GetVoterConfigRequest
+	(*VoterMemberStatus)(nil),                  // 373: litevirt.v1.VoterMemberStatus
+	(*GetVoterConfigResponse)(nil),             // 374: litevirt.v1.GetVoterConfigResponse
+	(*ChangeVoterConfigRequest)(nil),           // 375: litevirt.v1.ChangeVoterConfigRequest
+	(*ChangeVoterConfigResponse)(nil),          // 376: litevirt.v1.ChangeVoterConfigResponse
+	(*PromoteReplicaRequest)(nil),              // 377: litevirt.v1.PromoteReplicaRequest
+	(*PromoteReplicaProgress)(nil),             // 378: litevirt.v1.PromoteReplicaProgress
+	(*PingRequest)(nil),                        // 379: litevirt.v1.PingRequest
+	(*PingResponse)(nil),                       // 380: litevirt.v1.PingResponse
+	(*ReadyRequest)(nil),                       // 381: litevirt.v1.ReadyRequest
+	(*ReadyResponse)(nil),                      // 382: litevirt.v1.ReadyResponse
+	(*FetchBinaryRequest)(nil),                 // 383: litevirt.v1.FetchBinaryRequest
+	(*FetchBinaryChunk)(nil),                   // 384: litevirt.v1.FetchBinaryChunk
+	(*ProvisionNetworkRequest)(nil),            // 385: litevirt.v1.ProvisionNetworkRequest
+	(*EnsureCloudInitRequest)(nil),             // 386: litevirt.v1.EnsureCloudInitRequest
+	(*EnsureDisksRequest)(nil),                 // 387: litevirt.v1.EnsureDisksRequest
+	(*DiskStub)(nil),                           // 388: litevirt.v1.DiskStub
+	(*EnsureDisksResponse)(nil),                // 389: litevirt.v1.EnsureDisksResponse
+	(*EnsureFirmwareStateRequest)(nil),         // 390: litevirt.v1.EnsureFirmwareStateRequest
+	(*EnsureFirmwareStateResponse)(nil),        // 391: litevirt.v1.EnsureFirmwareStateResponse
+	(*RollbackFirmwareStateRequest)(nil),       // 392: litevirt.v1.RollbackFirmwareStateRequest
+	(*RollbackFirmwareStateResponse)(nil),      // 393: litevirt.v1.RollbackFirmwareStateResponse
+	(*ReceiveMigrationDiskRequest)(nil),        // 394: litevirt.v1.ReceiveMigrationDiskRequest
+	(*ReceiveMigrationDiskResponse)(nil),       // 395: litevirt.v1.ReceiveMigrationDiskResponse
+	(*CheckCPUCompatibilityRequest)(nil),       // 396: litevirt.v1.CheckCPUCompatibilityRequest
+	(*CheckCPUCompatibilityResponse)(nil),      // 397: litevirt.v1.CheckCPUCompatibilityResponse
+	(*CleanupMigrationArtifactsRequest)(nil),   // 398: litevirt.v1.CleanupMigrationArtifactsRequest
+	(*SyncVTEPRequest)(nil),                    // 399: litevirt.v1.SyncVTEPRequest
+	(*GetVMIPRequest)(nil),                     // 400: litevirt.v1.GetVMIPRequest
+	(*GetVMIPResponse)(nil),                    // 401: litevirt.v1.GetVMIPResponse
+	(*RefreshLBRequest)(nil),                   // 402: litevirt.v1.RefreshLBRequest
+	(*UpdateFDBRequest)(nil),                   // 403: litevirt.v1.UpdateFDBRequest
+	(*TableDigest)(nil),                        // 404: litevirt.v1.TableDigest
+	(*StateDigestResponse)(nil),                // 405: litevirt.v1.StateDigestResponse
+	(*TriggerAntiEntropyRequest)(nil),          // 406: litevirt.v1.TriggerAntiEntropyRequest
+	(*TriggerAntiEntropyResponse)(nil),         // 407: litevirt.v1.TriggerAntiEntropyResponse
+	(*ClusterStateDigestResponse)(nil),         // 408: litevirt.v1.ClusterStateDigestResponse
+	(*StateDumpResponse)(nil),                  // 409: litevirt.v1.StateDumpResponse
+	(*StateDumpChunk)(nil),                     // 410: litevirt.v1.StateDumpChunk
+	(*TableDumpRequest)(nil),                   // 411: litevirt.v1.TableDumpRequest
+	(*BucketSet)(nil),                          // 412: litevirt.v1.BucketSet
+	(*SensitiveStateRequest)(nil),              // 413: litevirt.v1.SensitiveStateRequest
+	(*TableRowsPage)(nil),                      // 414: litevirt.v1.TableRowsPage
+	(*BucketDigestRequest)(nil),                // 415: litevirt.v1.BucketDigestRequest
+	(*BucketDigest)(nil),                       // 416: litevirt.v1.BucketDigest
+	(*TableBucketDigests)(nil),                 // 417: litevirt.v1.TableBucketDigests
+	(*BucketDigestResponse)(nil),               // 418: litevirt.v1.BucketDigestResponse
+	(*DiagnoseDivergenceRequest)(nil),          // 419: litevirt.v1.DiagnoseDivergenceRequest
+	(*NodeRowMeta)(nil),                        // 420: litevirt.v1.NodeRowMeta
+	(*DivergenceRow)(nil),                      // 421: litevirt.v1.DivergenceRow
+	(*SemanticViolationPB)(nil),                // 422: litevirt.v1.SemanticViolationPB
+	(*DivergenceReport)(nil),                   // 423: litevirt.v1.DivergenceReport
+	(*ScanSensitiveRequest)(nil),               // 424: litevirt.v1.ScanSensitiveRequest
+	(*SensitiveRowMetaPB)(nil),                 // 425: litevirt.v1.SensitiveRowMetaPB
+	(*ScanSensitiveResponse)(nil),              // 426: litevirt.v1.ScanSensitiveResponse
+	(*MutationEntry)(nil),                      // 427: litevirt.v1.MutationEntry
+	(*ReplicateRequest)(nil),                   // 428: litevirt.v1.ReplicateRequest
+	(*ReplicateResponse)(nil),                  // 429: litevirt.v1.ReplicateResponse
+	(*AckRequest)(nil),                         // 430: litevirt.v1.AckRequest
+	(*GetVMLogsRequest)(nil),                   // 431: litevirt.v1.GetVMLogsRequest
+	(*VMLogChunk)(nil),                         // 432: litevirt.v1.VMLogChunk
+	(*UpgradeHostRequest)(nil),                 // 433: litevirt.v1.UpgradeHostRequest
+	(*UpgradeHostResponse)(nil),                // 434: litevirt.v1.UpgradeHostResponse
+	(*UninstallHostRequest)(nil),               // 435: litevirt.v1.UninstallHostRequest
+	(*UninstallHostResponse)(nil),              // 436: litevirt.v1.UninstallHostResponse
+	(*ExecuteCreateVMRequest)(nil),             // 437: litevirt.v1.ExecuteCreateVMRequest
+	(*AdmitHostRequest)(nil),                   // 438: litevirt.v1.AdmitHostRequest
+	(*AdmitHostResponse)(nil),                  // 439: litevirt.v1.AdmitHostResponse
+	(*HostNetwork)(nil),                        // 440: litevirt.v1.HostNetwork
+	(*ListHostNetworksRequest)(nil),            // 441: litevirt.v1.ListHostNetworksRequest
+	(*ListHostNetworksResponse)(nil),           // 442: litevirt.v1.ListHostNetworksResponse
+	(*UpsertHostNetworkRequest)(nil),           // 443: litevirt.v1.UpsertHostNetworkRequest
+	(*PlanHostNetworkRequest)(nil),             // 444: litevirt.v1.PlanHostNetworkRequest
+	(*PlanHostNetworkResponse)(nil),            // 445: litevirt.v1.PlanHostNetworkResponse
+	(*ApplyHostNetworkRequest)(nil),            // 446: litevirt.v1.ApplyHostNetworkRequest
+	(*DeleteHostNetworkRequest)(nil),           // 447: litevirt.v1.DeleteHostNetworkRequest
+	(*IsolateHostRequest)(nil),                 // 448: litevirt.v1.IsolateHostRequest
+	(*HostIsolationStatus)(nil),                // 449: litevirt.v1.HostIsolationStatus
+	(*ReseedHostRequest)(nil),                  // 450: litevirt.v1.ReseedHostRequest
+	(*ReseedHostResponse)(nil),                 // 451: litevirt.v1.ReseedHostResponse
+	(*PreflightUpgradeRequest)(nil),            // 452: litevirt.v1.PreflightUpgradeRequest
+	(*PreflightUpgradeResponse)(nil),           // 453: litevirt.v1.PreflightUpgradeResponse
+	(*PreflightFinding)(nil),                   // 454: litevirt.v1.PreflightFinding
+	(*GetSpiceInfoRequest)(nil),                // 455: litevirt.v1.GetSpiceInfoRequest
+	(*GetSpiceInfoResponse)(nil),               // 456: litevirt.v1.GetSpiceInfoResponse
+	(*RebalanceProposal)(nil),                  // 457: litevirt.v1.RebalanceProposal
+	(*ListRebalanceProposalsRequest)(nil),      // 458: litevirt.v1.ListRebalanceProposalsRequest
+	(*ListRebalanceProposalsResponse)(nil),     // 459: litevirt.v1.ListRebalanceProposalsResponse
+	(*RunRebalanceRequest)(nil),                // 460: litevirt.v1.RunRebalanceRequest
+	(*RunRebalanceResponse)(nil),               // 461: litevirt.v1.RunRebalanceResponse
+	(*ApproveRebalanceProposalRequest)(nil),    // 462: litevirt.v1.ApproveRebalanceProposalRequest
+	(*RejectRebalanceProposalRequest)(nil),     // 463: litevirt.v1.RejectRebalanceProposalRequest
+	(*ListRegionsRequest)(nil),                 // 464: litevirt.v1.ListRegionsRequest
+	(*ListRegionsResponse)(nil),                // 465: litevirt.v1.ListRegionsResponse
+	(*RegionStatusRequest)(nil),                // 466: litevirt.v1.RegionStatusRequest
+	(*RegionStatusResponse)(nil),               // 467: litevirt.v1.RegionStatusResponse
+	(*RegionStatus)(nil),                       // 468: litevirt.v1.RegionStatus
+	(*FailoverScopeStatus)(nil),                // 469: litevirt.v1.FailoverScopeStatus
+	(*FailoverScopeRegion)(nil),                // 470: litevirt.v1.FailoverScopeRegion
+	(*SetFailoverScopeRequest)(nil),            // 471: litevirt.v1.SetFailoverScopeRequest
+	(*RestoreRelayRequest)(nil),                // 472: litevirt.v1.RestoreRelayRequest
+	(*RelayHealthEntry)(nil),                   // 473: litevirt.v1.RelayHealthEntry
+	(*RelayHealthStatus)(nil),                  // 474: litevirt.v1.RelayHealthStatus
+	(*RestoreRelayResponse)(nil),               // 475: litevirt.v1.RestoreRelayResponse
+	(*CrossRegionMigrateRequest)(nil),          // 476: litevirt.v1.CrossRegionMigrateRequest
+	(*ServiceEndpoint)(nil),                    // 477: litevirt.v1.ServiceEndpoint
+	(*UpsertServiceEndpointRequest)(nil),       // 478: litevirt.v1.UpsertServiceEndpointRequest
+	(*ListServiceEndpointsRequest)(nil),        // 479: litevirt.v1.ListServiceEndpointsRequest
+	(*ListServiceEndpointsResponse)(nil),       // 480: litevirt.v1.ListServiceEndpointsResponse
+	(*DeleteServiceEndpointRequest)(nil),       // 481: litevirt.v1.DeleteServiceEndpointRequest
+	(*BackupSchedule)(nil),                     // 482: litevirt.v1.BackupSchedule
+	(*CreateBackupScheduleRequest)(nil),        // 483: litevirt.v1.CreateBackupScheduleRequest
+	(*ListBackupSchedulesRequest)(nil),         // 484: litevirt.v1.ListBackupSchedulesRequest
+	(*ListBackupSchedulesResponse)(nil),        // 485: litevirt.v1.ListBackupSchedulesResponse
+	(*DeleteBackupScheduleRequest)(nil),        // 486: litevirt.v1.DeleteBackupScheduleRequest
+	(*ReplicationSchedule)(nil),                // 487: litevirt.v1.ReplicationSchedule
+	(*CreateReplicationScheduleRequest)(nil),   // 488: litevirt.v1.CreateReplicationScheduleRequest
+	(*ListReplicationSchedulesRequest)(nil),    // 489: litevirt.v1.ListReplicationSchedulesRequest
+	(*ListReplicationSchedulesResponse)(nil),   // 490: litevirt.v1.ListReplicationSchedulesResponse
+	(*DeleteReplicationScheduleRequest)(nil),   // 491: litevirt.v1.DeleteReplicationScheduleRequest
+	(*VerifyAuditChainResponse)(nil),           // 492: litevirt.v1.VerifyAuditChainResponse
+	(*RetireAuditKeyRequest)(nil),              // 493: litevirt.v1.RetireAuditKeyRequest
+	(*RetireAuditKeyResponse)(nil),             // 494: litevirt.v1.RetireAuditKeyResponse
+	(*ExportAuditChainRequest)(nil),            // 495: litevirt.v1.ExportAuditChainRequest
+	(*ExportAuditChainResponse)(nil),           // 496: litevirt.v1.ExportAuditChainResponse
+	(*Project)(nil),                            // 497: litevirt.v1.Project
+	(*CreateProjectRequest)(nil),               // 498: litevirt.v1.CreateProjectRequest
+	(*ListProjectsResponse)(nil),               // 499: litevirt.v1.ListProjectsResponse
+	(*GetProjectRequest)(nil),                  // 500: litevirt.v1.GetProjectRequest
+	(*DeleteProjectRequest)(nil),               // 501: litevirt.v1.DeleteProjectRequest
+	(*ProjectQuota)(nil),                       // 502: litevirt.v1.ProjectQuota
+	(*SetProjectQuotaRequest)(nil),             // 503: litevirt.v1.SetProjectQuotaRequest
+	(*GetProjectQuotaRequest)(nil),             // 504: litevirt.v1.GetProjectQuotaRequest
+	(*ProjectUsage)(nil),                       // 505: litevirt.v1.ProjectUsage
+	(*GetProjectUsageRequest)(nil),             // 506: litevirt.v1.GetProjectUsageRequest
+	(*ReserveProjectCapacityRequest)(nil),      // 507: litevirt.v1.ReserveProjectCapacityRequest
+	(*ReserveProjectCapacityResponse)(nil),     // 508: litevirt.v1.ReserveProjectCapacityResponse
+	(*ReleaseProjectCapacityRequest)(nil),      // 509: litevirt.v1.ReleaseProjectCapacityRequest
+	(*ReserveHostCapacityRequest)(nil),         // 510: litevirt.v1.ReserveHostCapacityRequest
+	(*ReserveHostCapacityResponse)(nil),        // 511: litevirt.v1.ReserveHostCapacityResponse
+	(*ReleaseHostCapacityRequest)(nil),         // 512: litevirt.v1.ReleaseHostCapacityRequest
+	(*FenceHostPosture)(nil),                   // 513: litevirt.v1.FenceHostPosture
+	(*FenceReadiness)(nil),                     // 514: litevirt.v1.FenceReadiness
+	(*FenceEvent)(nil),                         // 515: litevirt.v1.FenceEvent
+	(*ImportLeftoverFile)(nil),                 // 516: litevirt.v1.ImportLeftoverFile
+	(*ImportLeftoverStatusRequest)(nil),        // 517: litevirt.v1.ImportLeftoverStatusRequest
+	(*ImportLeftoverStatusResponse)(nil),       // 518: litevirt.v1.ImportLeftoverStatusResponse
+	(*PreflightRecreateVMRequest)(nil),         // 519: litevirt.v1.PreflightRecreateVMRequest
+	nil,                                        // 520: litevirt.v1.ListHostsRequest.LabelFilterEntry
+	nil,                                        // 521: litevirt.v1.SetHostLabelsRequest.LabelsEntry
+	nil,                                        // 522: litevirt.v1.ListVMsRequest.LabelFilterEntry
+	nil,                                        // 523: litevirt.v1.SetVMLabelsRequest.LabelsEntry
+	nil,                                        // 524: litevirt.v1.ImportVMRequest.NetMapEntry
+	nil,                                        // 525: litevirt.v1.ImportVMRequest.DiskMapEntry
+	nil,                                        // 526: litevirt.v1.CheckPermissionsResponse.AllowedEntry
+	nil,                                        // 527: litevirt.v1.CreateContainerRequest.LabelsEntry
+	nil,                                        // 528: litevirt.v1.CreateStoragePoolRequest.OptionsEntry
+	nil,                                        // 529: litevirt.v1.EnsureDisksRequest.InstallerIsoSha256Entry
+	nil,                                        // 530: litevirt.v1.EnsureDisksResponse.InstallerIsoResolvedEntry
+	nil,                                        // 531: litevirt.v1.TableDumpRequest.BucketsEntry
+	nil,                                        // 532: litevirt.v1.SensitiveStateRequest.BucketsEntry
+	nil,                                        // 533: litevirt.v1.PlanHostNetworkResponse.ConflictsEntry
+	(*Host)(nil),                               // 534: litevirt.v1.Host
+	(MigrateStrategy)(0),                       // 535: litevirt.v1.MigrateStrategy
+	(*PCIDevice)(nil),                          // 536: litevirt.v1.PCIDevice
+	(*VMSpec)(nil),                             // 537: litevirt.v1.VMSpec
+	(*VM)(nil),                                 // 538: litevirt.v1.VM
+	(*HardwareDevice)(nil),                     // 539: litevirt.v1.HardwareDevice
+	(*RestartPolicy)(nil),                      // 540: litevirt.v1.RestartPolicy
+	(*timestamppb.Timestamp)(nil),              // 541: google.protobuf.Timestamp
+	(DiffOp)(0),                                // 542: litevirt.v1.DiffOp
+	(MigratePhase)(0),                          // 543: litevirt.v1.MigratePhase
+	(*Image)(nil),                              // 544: litevirt.v1.Image
+	(*Snapshot)(nil),                           // 545: litevirt.v1.Snapshot
+	(*LoadBalancer)(nil),                       // 546: litevirt.v1.LoadBalancer
+	(*LBBackend)(nil),                          // 547: litevirt.v1.LBBackend
+	(*LBPort)(nil),                             // 548: litevirt.v1.LBPort
+	(*LBBackendAddress)(nil),                   // 549: litevirt.v1.LBBackendAddress
+	(*User)(nil),                               // 550: litevirt.v1.User
+	(*ClusterEvent)(nil),                       // 551: litevirt.v1.ClusterEvent
+	(*ResourceMapping)(nil),                    // 552: litevirt.v1.ResourceMapping
+	(*NotificationTarget)(nil),                 // 553: litevirt.v1.NotificationTarget
+	(*NotificationRoute)(nil),                  // 554: litevirt.v1.NotificationRoute
+	(*FirewallRule)(nil),                       // 555: litevirt.v1.FirewallRule
+	(*IpSet)(nil),                              // 556: litevirt.v1.IpSet
+	(*FirewallDefault)(nil),                    // 557: litevirt.v1.FirewallDefault
+	(*SecurityGroupRule)(nil),                  // 558: litevirt.v1.SecurityGroupRule
+	(*SecurityGroup)(nil),                      // 559: litevirt.v1.SecurityGroup
+	(*StoragePool)(nil),                        // 560: litevirt.v1.StoragePool
+	(*emptypb.Empty)(nil),                      // 561: google.protobuf.Empty
+	(*AttachDeviceRequest)(nil),                // 562: litevirt.v1.AttachDeviceRequest
+	(*DetachDeviceRequest)(nil),                // 563: litevirt.v1.DetachDeviceRequest
+	(*LBKeepalivedRequest)(nil),                // 564: litevirt.v1.LBKeepalivedRequest
+	(*LBStatsResponse)(nil),                    // 565: litevirt.v1.LBStatsResponse
+	(*LBKeepalivedResponse)(nil),               // 566: litevirt.v1.LBKeepalivedResponse
+	(*Token)(nil),                              // 567: litevirt.v1.Token
+	(*VMStats)(nil),                            // 568: litevirt.v1.VMStats
+	(*HostResourceStats)(nil),                  // 569: litevirt.v1.HostResourceStats
 }
 var file_litevirt_v1_service_proto_depIdxs = []int32{
-	518, // 0: litevirt.v1.ListHostsRequest.label_filter:type_name -> litevirt.v1.ListHostsRequest.LabelFilterEntry
-	532, // 1: litevirt.v1.ListHostsResponse.hosts:type_name -> litevirt.v1.Host
-	533, // 2: litevirt.v1.DrainProgress.strategy:type_name -> litevirt.v1.MigrateStrategy
-	519, // 3: litevirt.v1.SetHostLabelsRequest.labels:type_name -> litevirt.v1.SetHostLabelsRequest.LabelsEntry
-	26,  // 4: litevirt.v1.ClusterHealth.conditions:type_name -> litevirt.v1.HealthCondition
-	27,  // 5: litevirt.v1.ClusterHealth.evaluators:type_name -> litevirt.v1.HealthEvaluatorStatus
-	28,  // 6: litevirt.v1.ClusterHealth.connectivity:type_name -> litevirt.v1.ConnectivityEdge
-	29,  // 7: litevirt.v1.ClusterHealth.capacity:type_name -> litevirt.v1.HostCapacityAssessment
-	534, // 8: litevirt.v1.RescanHostResponse.devices:type_name -> litevirt.v1.PCIDevice
-	534, // 9: litevirt.v1.ListHostDevicesResponse.devices:type_name -> litevirt.v1.PCIDevice
-	36,  // 10: litevirt.v1.SupersededDisksResponse.disks:type_name -> litevirt.v1.SupersededDisk
-	535, // 11: litevirt.v1.CreateVMRequest.spec:type_name -> litevirt.v1.VMSpec
-	520, // 12: litevirt.v1.ListVMsRequest.label_filter:type_name -> litevirt.v1.ListVMsRequest.LabelFilterEntry
-	536, // 13: litevirt.v1.ListVMsResponse.vms:type_name -> litevirt.v1.VM
-	537, // 14: litevirt.v1.ListVMHardwareResponse.devices:type_name -> litevirt.v1.HardwareDevice
+	520, // 0: litevirt.v1.ListHostsRequest.label_filter:type_name -> litevirt.v1.ListHostsRequest.LabelFilterEntry
+	534, // 1: litevirt.v1.ListHostsResponse.hosts:type_name -> litevirt.v1.Host
+	535, // 2: litevirt.v1.DrainProgress.strategy:type_name -> litevirt.v1.MigrateStrategy
+	521, // 3: litevirt.v1.SetHostLabelsRequest.labels:type_name -> litevirt.v1.SetHostLabelsRequest.LabelsEntry
+	28,  // 4: litevirt.v1.ClusterHealth.conditions:type_name -> litevirt.v1.HealthCondition
+	29,  // 5: litevirt.v1.ClusterHealth.evaluators:type_name -> litevirt.v1.HealthEvaluatorStatus
+	30,  // 6: litevirt.v1.ClusterHealth.connectivity:type_name -> litevirt.v1.ConnectivityEdge
+	31,  // 7: litevirt.v1.ClusterHealth.capacity:type_name -> litevirt.v1.HostCapacityAssessment
+	536, // 8: litevirt.v1.RescanHostResponse.devices:type_name -> litevirt.v1.PCIDevice
+	536, // 9: litevirt.v1.ListHostDevicesResponse.devices:type_name -> litevirt.v1.PCIDevice
+	38,  // 10: litevirt.v1.SupersededDisksResponse.disks:type_name -> litevirt.v1.SupersededDisk
+	537, // 11: litevirt.v1.CreateVMRequest.spec:type_name -> litevirt.v1.VMSpec
+	522, // 12: litevirt.v1.ListVMsRequest.label_filter:type_name -> litevirt.v1.ListVMsRequest.LabelFilterEntry
+	538, // 13: litevirt.v1.ListVMsResponse.vms:type_name -> litevirt.v1.VM
+	539, // 14: litevirt.v1.ListVMHardwareResponse.devices:type_name -> litevirt.v1.HardwareDevice
 	0,   // 15: litevirt.v1.RelayCheckVIPParticipantResponse.result:type_name -> litevirt.v1.RelayVIPResult
-	58,  // 16: litevirt.v1.RuntimeInventory.workloads:type_name -> litevirt.v1.RuntimeWorkload
-	62,  // 17: litevirt.v1.MembershipViewResponse.hosts:type_name -> litevirt.v1.MembershipHost
-	538, // 18: litevirt.v1.UpdateVMRequest.restart:type_name -> litevirt.v1.RestartPolicy
-	521, // 19: litevirt.v1.SetVMLabelsRequest.labels:type_name -> litevirt.v1.SetVMLabelsRequest.LabelsEntry
-	86,  // 20: litevirt.v1.ListStacksResponse.stacks:type_name -> litevirt.v1.StackSummary
-	539, // 21: litevirt.v1.StackSummary.created_at:type_name -> google.protobuf.Timestamp
-	89,  // 22: litevirt.v1.DiffStackResponse.entries:type_name -> litevirt.v1.DiffEntry
-	540, // 23: litevirt.v1.DiffEntry.operation:type_name -> litevirt.v1.DiffOp
-	533, // 24: litevirt.v1.MigrateVMRequest.strategy:type_name -> litevirt.v1.MigrateStrategy
-	541, // 25: litevirt.v1.MigrateProgress.phase:type_name -> litevirt.v1.MigratePhase
+	60,  // 16: litevirt.v1.RuntimeInventory.workloads:type_name -> litevirt.v1.RuntimeWorkload
+	64,  // 17: litevirt.v1.MembershipViewResponse.hosts:type_name -> litevirt.v1.MembershipHost
+	540, // 18: litevirt.v1.UpdateVMRequest.restart:type_name -> litevirt.v1.RestartPolicy
+	523, // 19: litevirt.v1.SetVMLabelsRequest.labels:type_name -> litevirt.v1.SetVMLabelsRequest.LabelsEntry
+	88,  // 20: litevirt.v1.ListStacksResponse.stacks:type_name -> litevirt.v1.StackSummary
+	541, // 21: litevirt.v1.StackSummary.created_at:type_name -> google.protobuf.Timestamp
+	91,  // 22: litevirt.v1.DiffStackResponse.entries:type_name -> litevirt.v1.DiffEntry
+	542, // 23: litevirt.v1.DiffEntry.operation:type_name -> litevirt.v1.DiffOp
+	535, // 24: litevirt.v1.MigrateVMRequest.strategy:type_name -> litevirt.v1.MigrateStrategy
+	543, // 25: litevirt.v1.MigrateProgress.phase:type_name -> litevirt.v1.MigratePhase
 	1,   // 26: litevirt.v1.MoveVolumeProgress.phase:type_name -> litevirt.v1.MoveVolumeProgress.Phase
 	2,   // 27: litevirt.v1.ReplicateVolumeProgress.phase:type_name -> litevirt.v1.ReplicateVolumeProgress.Phase
-	99,  // 28: litevirt.v1.MigrateStackVolumesRequest.placements:type_name -> litevirt.v1.VolumePlacement
+	101, // 28: litevirt.v1.MigrateStackVolumesRequest.placements:type_name -> litevirt.v1.VolumePlacement
 	3,   // 29: litevirt.v1.StackVolumeProgress.stage:type_name -> litevirt.v1.StackVolumeProgress.Stage
-	542, // 30: litevirt.v1.ListImagesResponse.images:type_name -> litevirt.v1.Image
-	522, // 31: litevirt.v1.ImportVMRequest.net_map:type_name -> litevirt.v1.ImportVMRequest.NetMapEntry
-	523, // 32: litevirt.v1.ImportVMRequest.disk_map:type_name -> litevirt.v1.ImportVMRequest.DiskMapEntry
-	543, // 33: litevirt.v1.ListSnapshotsResponse.snapshots:type_name -> litevirt.v1.Snapshot
-	127, // 34: litevirt.v1.ListNetworksResponse.networks:type_name -> litevirt.v1.NetworkInfo
-	544, // 35: litevirt.v1.ListLBResponse.lbs:type_name -> litevirt.v1.LoadBalancer
-	545, // 36: litevirt.v1.ApplyLBRequest.backends:type_name -> litevirt.v1.LBBackend
-	546, // 37: litevirt.v1.ApplyLBRequest.ports:type_name -> litevirt.v1.LBPort
-	330, // 38: litevirt.v1.ApplyLBRequest.proof:type_name -> litevirt.v1.RuntimeActionProof
-	546, // 39: litevirt.v1.CreateLBRequest.ports:type_name -> litevirt.v1.LBPort
-	547, // 40: litevirt.v1.CreateLBRequest.backends:type_name -> litevirt.v1.LBBackendAddress
-	546, // 41: litevirt.v1.UpdateLBRequest.ports:type_name -> litevirt.v1.LBPort
-	547, // 42: litevirt.v1.UpdateLBRequest.add_backends:type_name -> litevirt.v1.LBBackendAddress
-	548, // 43: litevirt.v1.ListUsersResponse.users:type_name -> litevirt.v1.User
-	524, // 44: litevirt.v1.CheckPermissionsResponse.allowed:type_name -> litevirt.v1.CheckPermissionsResponse.AllowedEntry
+	544, // 30: litevirt.v1.ListImagesResponse.images:type_name -> litevirt.v1.Image
+	524, // 31: litevirt.v1.ImportVMRequest.net_map:type_name -> litevirt.v1.ImportVMRequest.NetMapEntry
+	525, // 32: litevirt.v1.ImportVMRequest.disk_map:type_name -> litevirt.v1.ImportVMRequest.DiskMapEntry
+	545, // 33: litevirt.v1.ListSnapshotsResponse.snapshots:type_name -> litevirt.v1.Snapshot
+	129, // 34: litevirt.v1.ListNetworksResponse.networks:type_name -> litevirt.v1.NetworkInfo
+	546, // 35: litevirt.v1.ListLBResponse.lbs:type_name -> litevirt.v1.LoadBalancer
+	547, // 36: litevirt.v1.ApplyLBRequest.backends:type_name -> litevirt.v1.LBBackend
+	548, // 37: litevirt.v1.ApplyLBRequest.ports:type_name -> litevirt.v1.LBPort
+	332, // 38: litevirt.v1.ApplyLBRequest.proof:type_name -> litevirt.v1.RuntimeActionProof
+	548, // 39: litevirt.v1.CreateLBRequest.ports:type_name -> litevirt.v1.LBPort
+	549, // 40: litevirt.v1.CreateLBRequest.backends:type_name -> litevirt.v1.LBBackendAddress
+	548, // 41: litevirt.v1.UpdateLBRequest.ports:type_name -> litevirt.v1.LBPort
+	549, // 42: litevirt.v1.UpdateLBRequest.add_backends:type_name -> litevirt.v1.LBBackendAddress
+	550, // 43: litevirt.v1.ListUsersResponse.users:type_name -> litevirt.v1.User
+	526, // 44: litevirt.v1.CheckPermissionsResponse.allowed:type_name -> litevirt.v1.CheckPermissionsResponse.AllowedEntry
 	4,   // 45: litevirt.v1.BackupSnapshotProgress.phase:type_name -> litevirt.v1.BackupSnapshotProgress.Phase
-	155, // 46: litevirt.v1.HasChunksRequest.target:type_name -> litevirt.v1.RepoTarget
-	159, // 47: litevirt.v1.PushBackupFrame.header:type_name -> litevirt.v1.PushBackupHeader
-	160, // 48: litevirt.v1.PushBackupFrame.chunk:type_name -> litevirt.v1.PushChunkFrame
-	161, // 49: litevirt.v1.PushBackupFrame.manifest:type_name -> litevirt.v1.PushManifestFrame
-	155, // 50: litevirt.v1.PushBackupHeader.target:type_name -> litevirt.v1.RepoTarget
+	157, // 46: litevirt.v1.HasChunksRequest.target:type_name -> litevirt.v1.RepoTarget
+	161, // 47: litevirt.v1.PushBackupFrame.header:type_name -> litevirt.v1.PushBackupHeader
+	162, // 48: litevirt.v1.PushBackupFrame.chunk:type_name -> litevirt.v1.PushChunkFrame
+	163, // 49: litevirt.v1.PushBackupFrame.manifest:type_name -> litevirt.v1.PushManifestFrame
+	157, // 50: litevirt.v1.PushBackupHeader.target:type_name -> litevirt.v1.RepoTarget
 	5,   // 51: litevirt.v1.RestoreFromBackupProgress.phase:type_name -> litevirt.v1.RestoreFromBackupProgress.Phase
-	169, // 52: litevirt.v1.ListBackupRepoSnapshotsResponse.snapshots:type_name -> litevirt.v1.BackupRepoSnapshot
-	169, // 53: litevirt.v1.PruneBackupRepoResponse.keep:type_name -> litevirt.v1.BackupRepoSnapshot
-	169, // 54: litevirt.v1.PruneBackupRepoResponse.delete:type_name -> litevirt.v1.BackupRepoSnapshot
-	538, // 55: litevirt.v1.Container.restart:type_name -> litevirt.v1.RestartPolicy
-	177, // 56: litevirt.v1.CreateContainerRequest.networks:type_name -> litevirt.v1.ContainerNetwork
-	525, // 57: litevirt.v1.CreateContainerRequest.labels:type_name -> litevirt.v1.CreateContainerRequest.LabelsEntry
-	538, // 58: litevirt.v1.CreateContainerRequest.restart:type_name -> litevirt.v1.RestartPolicy
-	176, // 59: litevirt.v1.ListContainersResponse.containers:type_name -> litevirt.v1.Container
+	171, // 52: litevirt.v1.ListBackupRepoSnapshotsResponse.snapshots:type_name -> litevirt.v1.BackupRepoSnapshot
+	171, // 53: litevirt.v1.PruneBackupRepoResponse.keep:type_name -> litevirt.v1.BackupRepoSnapshot
+	171, // 54: litevirt.v1.PruneBackupRepoResponse.delete:type_name -> litevirt.v1.BackupRepoSnapshot
+	540, // 55: litevirt.v1.Container.restart:type_name -> litevirt.v1.RestartPolicy
+	179, // 56: litevirt.v1.CreateContainerRequest.networks:type_name -> litevirt.v1.ContainerNetwork
+	527, // 57: litevirt.v1.CreateContainerRequest.labels:type_name -> litevirt.v1.CreateContainerRequest.LabelsEntry
+	540, // 58: litevirt.v1.CreateContainerRequest.restart:type_name -> litevirt.v1.RestartPolicy
+	178, // 59: litevirt.v1.ListContainersResponse.containers:type_name -> litevirt.v1.Container
 	6,   // 60: litevirt.v1.BackupContainerProgress.phase:type_name -> litevirt.v1.BackupContainerProgress.Phase
-	330, // 61: litevirt.v1.RestoreContainerRequest.proof:type_name -> litevirt.v1.RuntimeActionProof
+	332, // 61: litevirt.v1.RestoreContainerRequest.proof:type_name -> litevirt.v1.RuntimeActionProof
 	7,   // 62: litevirt.v1.RestoreContainerProgress.phase:type_name -> litevirt.v1.RestoreContainerProgress.Phase
 	8,   // 63: litevirt.v1.MigrateContainerProgress.phase:type_name -> litevirt.v1.MigrateContainerProgress.Phase
-	200, // 64: litevirt.v1.ProbeContainerBackupsResponse.results:type_name -> litevirt.v1.ContainerBackupProbe
-	176, // 65: litevirt.v1.ContainerDetail.container:type_name -> litevirt.v1.Container
-	197, // 66: litevirt.v1.ContainerDetail.interfaces:type_name -> litevirt.v1.ContainerInterfaceDetail
-	195, // 67: litevirt.v1.ContainerDetail.snapshots:type_name -> litevirt.v1.ContainerSnapshot
-	198, // 68: litevirt.v1.ContainerDetail.backups:type_name -> litevirt.v1.ContainerBackupRef
-	203, // 69: litevirt.v1.ContainerDetail.stranded_rootfs:type_name -> litevirt.v1.ContainerStrandedRootfs
-	195, // 70: litevirt.v1.ListContainerSnapshotsResponse.snapshots:type_name -> litevirt.v1.ContainerSnapshot
-	213, // 71: litevirt.v1.ListSessionsResponse.sessions:type_name -> litevirt.v1.Session
-	217, // 72: litevirt.v1.ListTwoFactorsResponse.factors:type_name -> litevirt.v1.TwoFactor
-	223, // 73: litevirt.v1.GrantRoleResponse.binding:type_name -> litevirt.v1.RoleBinding
-	223, // 74: litevirt.v1.ListRoleBindingsResponse.bindings:type_name -> litevirt.v1.RoleBinding
-	233, // 75: litevirt.v1.GetVMOperationResponse.steps:type_name -> litevirt.v1.OperationStepInfo
-	535, // 76: litevirt.v1.RestoreLiveRequest.spec:type_name -> litevirt.v1.VMSpec
+	202, // 64: litevirt.v1.ProbeContainerBackupsResponse.results:type_name -> litevirt.v1.ContainerBackupProbe
+	178, // 65: litevirt.v1.ContainerDetail.container:type_name -> litevirt.v1.Container
+	199, // 66: litevirt.v1.ContainerDetail.interfaces:type_name -> litevirt.v1.ContainerInterfaceDetail
+	197, // 67: litevirt.v1.ContainerDetail.snapshots:type_name -> litevirt.v1.ContainerSnapshot
+	200, // 68: litevirt.v1.ContainerDetail.backups:type_name -> litevirt.v1.ContainerBackupRef
+	205, // 69: litevirt.v1.ContainerDetail.stranded_rootfs:type_name -> litevirt.v1.ContainerStrandedRootfs
+	197, // 70: litevirt.v1.ListContainerSnapshotsResponse.snapshots:type_name -> litevirt.v1.ContainerSnapshot
+	215, // 71: litevirt.v1.ListSessionsResponse.sessions:type_name -> litevirt.v1.Session
+	219, // 72: litevirt.v1.ListTwoFactorsResponse.factors:type_name -> litevirt.v1.TwoFactor
+	225, // 73: litevirt.v1.GrantRoleResponse.binding:type_name -> litevirt.v1.RoleBinding
+	225, // 74: litevirt.v1.ListRoleBindingsResponse.bindings:type_name -> litevirt.v1.RoleBinding
+	235, // 75: litevirt.v1.GetVMOperationResponse.steps:type_name -> litevirt.v1.OperationStepInfo
+	537, // 76: litevirt.v1.RestoreLiveRequest.spec:type_name -> litevirt.v1.VMSpec
 	9,   // 77: litevirt.v1.RestoreLiveProgress.phase:type_name -> litevirt.v1.RestoreLiveProgress.Phase
-	532, // 78: litevirt.v1.ClusterStatus.hosts:type_name -> litevirt.v1.Host
-	549, // 79: litevirt.v1.ClusterStatus.recent_events:type_name -> litevirt.v1.ClusterEvent
-	252, // 80: litevirt.v1.ListAuditLogResponse.entries:type_name -> litevirt.v1.AuditEntry
-	255, // 81: litevirt.v1.ListVMEventsResponse.events:type_name -> litevirt.v1.VMEvent
-	550, // 82: litevirt.v1.ListResourceMappingsResponse.mappings:type_name -> litevirt.v1.ResourceMapping
-	551, // 83: litevirt.v1.ListNotificationTargetsResponse.targets:type_name -> litevirt.v1.NotificationTarget
-	552, // 84: litevirt.v1.ListNotificationRoutesResponse.routes:type_name -> litevirt.v1.NotificationRoute
-	272, // 85: litevirt.v1.ListRegistryCredentialsResponse.credentials:type_name -> litevirt.v1.RegistryCredential
-	553, // 86: litevirt.v1.CreateClusterFirewallRuleRequest.rule:type_name -> litevirt.v1.FirewallRule
-	553, // 87: litevirt.v1.ListClusterFirewallRulesResponse.rules:type_name -> litevirt.v1.FirewallRule
-	553, // 88: litevirt.v1.CreateHostFirewallRuleRequest.rule:type_name -> litevirt.v1.FirewallRule
-	553, // 89: litevirt.v1.ListHostFirewallRulesResponse.rules:type_name -> litevirt.v1.FirewallRule
-	554, // 90: litevirt.v1.ListIpSetsResponse.ipsets:type_name -> litevirt.v1.IpSet
-	555, // 91: litevirt.v1.ListFirewallDefaultsResponse.defaults:type_name -> litevirt.v1.FirewallDefault
-	556, // 92: litevirt.v1.AddSecurityGroupRuleRequest.rule:type_name -> litevirt.v1.SecurityGroupRule
-	557, // 93: litevirt.v1.ListSecurityGroupsResponse.groups:type_name -> litevirt.v1.SecurityGroup
-	556, // 94: litevirt.v1.ListSecurityGroupsResponse.rules:type_name -> litevirt.v1.SecurityGroupRule
-	558, // 95: litevirt.v1.ListStoragePoolsResponse.pools:type_name -> litevirt.v1.StoragePool
-	526, // 96: litevirt.v1.CreateStoragePoolRequest.options:type_name -> litevirt.v1.CreateStoragePoolRequest.OptionsEntry
-	558, // 97: litevirt.v1.CreateStoragePoolResponse.pool:type_name -> litevirt.v1.StoragePool
-	558, // 98: litevirt.v1.GetStoragePoolResponse.pool:type_name -> litevirt.v1.StoragePool
-	306, // 99: litevirt.v1.ListStoragePoolContentsResponse.contents:type_name -> litevirt.v1.StoragePoolContent
-	325, // 100: litevirt.v1.PushReplicaRequest.replica:type_name -> litevirt.v1.ReplicaRecord
-	314, // 101: litevirt.v1.ListISOsResponse.isos:type_name -> litevirt.v1.ISOEntry
-	325, // 102: litevirt.v1.PushReplicaIncrementRequest.replica:type_name -> litevirt.v1.ReplicaRecord
-	325, // 103: litevirt.v1.ListReplicasResponse.replicas:type_name -> litevirt.v1.ReplicaRecord
-	337, // 104: litevirt.v1.VoterConfigValue.members:type_name -> litevirt.v1.ClaimVoterMember
-	338, // 105: litevirt.v1.RecoveryClaimValue.voter_config:type_name -> litevirt.v1.VoterConfigValue
-	336, // 106: litevirt.v1.ClaimAccept.ballot:type_name -> litevirt.v1.ClaimBallot
-	335, // 107: litevirt.v1.ClaimAccept.key:type_name -> litevirt.v1.RecoveryClaimKey
-	335, // 108: litevirt.v1.PrepareRecoveryClaimRequest.key:type_name -> litevirt.v1.RecoveryClaimKey
-	336, // 109: litevirt.v1.PrepareRecoveryClaimRequest.ballot:type_name -> litevirt.v1.ClaimBallot
-	342, // 110: litevirt.v1.PrepareRecoveryClaimRequest.supersede:type_name -> litevirt.v1.RecoveryClaimSupersede
-	339, // 111: litevirt.v1.RecoveryClaimSupersede.prior_value:type_name -> litevirt.v1.RecoveryClaimValue
-	335, // 112: litevirt.v1.AbandonRecoveryProofRequest.key:type_name -> litevirt.v1.RecoveryClaimKey
-	350, // 113: litevirt.v1.ForceReconfigureVotersResponse.fences:type_name -> litevirt.v1.ForcedFenceEvidence
-	338, // 114: litevirt.v1.SignForcedVoterConfigRequest.value:type_name -> litevirt.v1.VoterConfigValue
-	350, // 115: litevirt.v1.SignForcedVoterConfigRequest.fences:type_name -> litevirt.v1.ForcedFenceEvidence
-	354, // 116: litevirt.v1.ConfirmPartitionResumeRequest.workloads:type_name -> litevirt.v1.PausedWorkload
-	356, // 117: litevirt.v1.ConfirmPartitionResumeResponse.views:type_name -> litevirt.v1.PausedWorkloadView
-	335, // 118: litevirt.v1.RecoveryClaimAttemptView.key:type_name -> litevirt.v1.RecoveryClaimKey
-	359, // 119: litevirt.v1.RecoveryClaimAttemptView.voters:type_name -> litevirt.v1.RecoveryClaimVoterView
-	360, // 120: litevirt.v1.InspectRecoveryClaimResponse.attempts:type_name -> litevirt.v1.RecoveryClaimAttemptView
-	348, // 121: litevirt.v1.PlanDeadHostRemovalResponse.stranded:type_name -> litevirt.v1.StrandedRecovery
-	336, // 122: litevirt.v1.PrepareRecoveryClaimResponse.promised_ballot:type_name -> litevirt.v1.ClaimBallot
-	336, // 123: litevirt.v1.PrepareRecoveryClaimResponse.accepted_ballot:type_name -> litevirt.v1.ClaimBallot
-	339, // 124: litevirt.v1.PrepareRecoveryClaimResponse.accepted_value:type_name -> litevirt.v1.RecoveryClaimValue
-	336, // 125: litevirt.v1.PrepareRecoveryClaimResponse.legacy_accepted_ballot:type_name -> litevirt.v1.ClaimBallot
-	339, // 126: litevirt.v1.PrepareRecoveryClaimResponse.legacy_accepted_value:type_name -> litevirt.v1.RecoveryClaimValue
-	335, // 127: litevirt.v1.AcceptRecoveryClaimRequest.key:type_name -> litevirt.v1.RecoveryClaimKey
-	336, // 128: litevirt.v1.AcceptRecoveryClaimRequest.ballot:type_name -> litevirt.v1.ClaimBallot
-	339, // 129: litevirt.v1.AcceptRecoveryClaimRequest.value:type_name -> litevirt.v1.RecoveryClaimValue
-	336, // 130: litevirt.v1.AcceptRecoveryClaimResponse.promised_ballot:type_name -> litevirt.v1.ClaimBallot
-	340, // 131: litevirt.v1.AcceptRecoveryClaimResponse.accept:type_name -> litevirt.v1.ClaimAccept
-	335, // 132: litevirt.v1.GetRecoveryClaimRequest.key:type_name -> litevirt.v1.RecoveryClaimKey
-	363, // 133: litevirt.v1.GetRecoveryClaimResponse.state:type_name -> litevirt.v1.PrepareRecoveryClaimResponse
-	340, // 134: litevirt.v1.GetRecoveryClaimResponse.accept:type_name -> litevirt.v1.ClaimAccept
-	335, // 135: litevirt.v1.RecoveryClaimState.key:type_name -> litevirt.v1.RecoveryClaimKey
-	336, // 136: litevirt.v1.RecoveryClaimState.promised:type_name -> litevirt.v1.ClaimBallot
-	336, // 137: litevirt.v1.RecoveryClaimState.accepted:type_name -> litevirt.v1.ClaimBallot
-	339, // 138: litevirt.v1.RecoveryClaimState.value:type_name -> litevirt.v1.RecoveryClaimValue
-	371, // 139: litevirt.v1.GetVoterConfigResponse.members:type_name -> litevirt.v1.VoterMemberStatus
-	337, // 140: litevirt.v1.ChangeVoterConfigResponse.members:type_name -> litevirt.v1.ClaimVoterMember
-	330, // 141: litevirt.v1.PromoteReplicaRequest.proof:type_name -> litevirt.v1.RuntimeActionProof
-	10,  // 142: litevirt.v1.PromoteReplicaProgress.phase:type_name -> litevirt.v1.PromoteReplicaProgress.Phase
-	386, // 143: litevirt.v1.EnsureDisksRequest.disks:type_name -> litevirt.v1.DiskStub
-	527, // 144: litevirt.v1.EnsureDisksRequest.installer_iso_sha256:type_name -> litevirt.v1.EnsureDisksRequest.InstallerIsoSha256Entry
-	528, // 145: litevirt.v1.EnsureDisksResponse.installer_iso_resolved:type_name -> litevirt.v1.EnsureDisksResponse.InstallerIsoResolvedEntry
-	402, // 146: litevirt.v1.StateDigestResponse.tables:type_name -> litevirt.v1.TableDigest
-	403, // 147: litevirt.v1.ClusterStateDigestResponse.hosts:type_name -> litevirt.v1.StateDigestResponse
-	529, // 148: litevirt.v1.TableDumpRequest.buckets:type_name -> litevirt.v1.TableDumpRequest.BucketsEntry
-	530, // 149: litevirt.v1.SensitiveStateRequest.buckets:type_name -> litevirt.v1.SensitiveStateRequest.BucketsEntry
-	414, // 150: litevirt.v1.TableBucketDigests.buckets:type_name -> litevirt.v1.BucketDigest
-	415, // 151: litevirt.v1.BucketDigestResponse.tables:type_name -> litevirt.v1.TableBucketDigests
-	418, // 152: litevirt.v1.DivergenceRow.per_node:type_name -> litevirt.v1.NodeRowMeta
-	419, // 153: litevirt.v1.DivergenceReport.rows:type_name -> litevirt.v1.DivergenceRow
-	420, // 154: litevirt.v1.DivergenceReport.violations:type_name -> litevirt.v1.SemanticViolationPB
-	423, // 155: litevirt.v1.ScanSensitiveResponse.rows:type_name -> litevirt.v1.SensitiveRowMetaPB
-	425, // 156: litevirt.v1.ReplicateRequest.entries:type_name -> litevirt.v1.MutationEntry
-	39,  // 157: litevirt.v1.ExecuteCreateVMRequest.request:type_name -> litevirt.v1.CreateVMRequest
-	438, // 158: litevirt.v1.ListHostNetworksResponse.networks:type_name -> litevirt.v1.HostNetwork
-	438, // 159: litevirt.v1.UpsertHostNetworkRequest.network:type_name -> litevirt.v1.HostNetwork
-	531, // 160: litevirt.v1.PlanHostNetworkResponse.conflicts:type_name -> litevirt.v1.PlanHostNetworkResponse.ConflictsEntry
-	452, // 161: litevirt.v1.PreflightUpgradeResponse.findings:type_name -> litevirt.v1.PreflightFinding
-	455, // 162: litevirt.v1.ListRebalanceProposalsResponse.proposals:type_name -> litevirt.v1.RebalanceProposal
-	466, // 163: litevirt.v1.RegionStatusResponse.statuses:type_name -> litevirt.v1.RegionStatus
-	468, // 164: litevirt.v1.FailoverScopeStatus.regions:type_name -> litevirt.v1.FailoverScopeRegion
-	471, // 165: litevirt.v1.RelayHealthStatus.hosts:type_name -> litevirt.v1.RelayHealthEntry
-	475, // 166: litevirt.v1.ListServiceEndpointsResponse.endpoints:type_name -> litevirt.v1.ServiceEndpoint
-	480, // 167: litevirt.v1.ListBackupSchedulesResponse.schedules:type_name -> litevirt.v1.BackupSchedule
-	485, // 168: litevirt.v1.ListReplicationSchedulesResponse.schedules:type_name -> litevirt.v1.ReplicationSchedule
-	495, // 169: litevirt.v1.ListProjectsResponse.projects:type_name -> litevirt.v1.Project
-	500, // 170: litevirt.v1.SetProjectQuotaRequest.quota:type_name -> litevirt.v1.ProjectQuota
-	511, // 171: litevirt.v1.FenceReadiness.hosts:type_name -> litevirt.v1.FenceHostPosture
-	513, // 172: litevirt.v1.FenceReadiness.recent_fences:type_name -> litevirt.v1.FenceEvent
-	511, // 173: litevirt.v1.FenceReadiness.recovery_claim_hosts:type_name -> litevirt.v1.FenceHostPosture
-	514, // 174: litevirt.v1.ImportLeftoverStatusRequest.files:type_name -> litevirt.v1.ImportLeftoverFile
-	535, // 175: litevirt.v1.PreflightRecreateVMRequest.spec:type_name -> litevirt.v1.VMSpec
-	410, // 176: litevirt.v1.TableDumpRequest.BucketsEntry.value:type_name -> litevirt.v1.BucketSet
-	410, // 177: litevirt.v1.SensitiveStateRequest.BucketsEntry.value:type_name -> litevirt.v1.BucketSet
-	11,  // 178: litevirt.v1.LiteVirt.ListHosts:input_type -> litevirt.v1.ListHostsRequest
-	13,  // 179: litevirt.v1.LiteVirt.InspectHost:input_type -> litevirt.v1.InspectHostRequest
-	14,  // 180: litevirt.v1.LiteVirt.DrainHost:input_type -> litevirt.v1.DrainHostRequest
-	17,  // 181: litevirt.v1.LiteVirt.ShutdownHostWorkloads:input_type -> litevirt.v1.ShutdownHostWorkloadsRequest
-	16,  // 182: litevirt.v1.LiteVirt.UndrainHost:input_type -> litevirt.v1.UndrainHostRequest
-	19,  // 183: litevirt.v1.LiteVirt.SetHostLabels:input_type -> litevirt.v1.SetHostLabelsRequest
-	20,  // 184: litevirt.v1.LiteVirt.FenceHost:input_type -> litevirt.v1.FenceHostRequest
-	25,  // 185: litevirt.v1.LiteVirt.GetClusterHealth:input_type -> litevirt.v1.GetClusterHealthRequest
-	559, // 186: litevirt.v1.LiteVirt.GetFenceReadiness:input_type -> google.protobuf.Empty
-	21,  // 187: litevirt.v1.LiteVirt.RemoveHost:input_type -> litevirt.v1.RemoveHostRequest
-	436, // 188: litevirt.v1.LiteVirt.AdmitHost:input_type -> litevirt.v1.AdmitHostRequest
-	439, // 189: litevirt.v1.LiteVirt.ListHostNetworks:input_type -> litevirt.v1.ListHostNetworksRequest
-	441, // 190: litevirt.v1.LiteVirt.UpsertHostNetwork:input_type -> litevirt.v1.UpsertHostNetworkRequest
-	442, // 191: litevirt.v1.LiteVirt.PlanHostNetwork:input_type -> litevirt.v1.PlanHostNetworkRequest
-	444, // 192: litevirt.v1.LiteVirt.ApplyHostNetwork:input_type -> litevirt.v1.ApplyHostNetworkRequest
-	445, // 193: litevirt.v1.LiteVirt.DeleteHostNetwork:input_type -> litevirt.v1.DeleteHostNetworkRequest
-	446, // 194: litevirt.v1.LiteVirt.IsolateHost:input_type -> litevirt.v1.IsolateHostRequest
-	448, // 195: litevirt.v1.LiteVirt.ReseedHost:input_type -> litevirt.v1.ReseedHostRequest
-	22,  // 196: litevirt.v1.LiteVirt.PublishCRL:input_type -> litevirt.v1.PublishCRLRequest
-	31,  // 197: litevirt.v1.LiteVirt.RescanHost:input_type -> litevirt.v1.RescanHostRequest
-	33,  // 198: litevirt.v1.LiteVirt.ListHostDevices:input_type -> litevirt.v1.ListHostDevicesRequest
-	35,  // 199: litevirt.v1.LiteVirt.SupersededDisks:input_type -> litevirt.v1.SupersededDisksRequest
-	431, // 200: litevirt.v1.LiteVirt.UpgradeHost:input_type -> litevirt.v1.UpgradeHostRequest
-	431, // 201: litevirt.v1.LiteVirt.PreStageUpgrade:input_type -> litevirt.v1.UpgradeHostRequest
-	381, // 202: litevirt.v1.LiteVirt.FetchBinary:input_type -> litevirt.v1.FetchBinaryRequest
-	433, // 203: litevirt.v1.LiteVirt.UninstallHost:input_type -> litevirt.v1.UninstallHostRequest
-	38,  // 204: litevirt.v1.LiteVirt.ConfigureHost:input_type -> litevirt.v1.ConfigureHostRequest
-	39,  // 205: litevirt.v1.LiteVirt.CreateVM:input_type -> litevirt.v1.CreateVMRequest
-	40,  // 206: litevirt.v1.LiteVirt.ListVMs:input_type -> litevirt.v1.ListVMsRequest
-	42,  // 207: litevirt.v1.LiteVirt.InspectVM:input_type -> litevirt.v1.InspectVMRequest
-	43,  // 208: litevirt.v1.LiteVirt.ListVMHardware:input_type -> litevirt.v1.ListVMHardwareRequest
-	45,  // 209: litevirt.v1.LiteVirt.StartVM:input_type -> litevirt.v1.StartVMRequest
-	46,  // 210: litevirt.v1.LiteVirt.StopVM:input_type -> litevirt.v1.StopVMRequest
-	47,  // 211: litevirt.v1.LiteVirt.RestartVM:input_type -> litevirt.v1.RestartVMRequest
-	48,  // 212: litevirt.v1.LiteVirt.DeleteVM:input_type -> litevirt.v1.DeleteVMRequest
-	49,  // 213: litevirt.v1.LiteVirt.RepairVMOwner:input_type -> litevirt.v1.RepairVMOwnerRequest
-	57,  // 214: litevirt.v1.LiteVirt.GetRuntimeInventory:input_type -> litevirt.v1.GetRuntimeInventoryRequest
-	60,  // 215: litevirt.v1.LiteVirt.CollectOrphanProof:input_type -> litevirt.v1.OrphanProofRequest
-	559, // 216: litevirt.v1.LiteVirt.GetMembershipView:input_type -> google.protobuf.Empty
-	51,  // 217: litevirt.v1.LiteVirt.CheckVIPParticipant:input_type -> litevirt.v1.CheckVIPParticipantRequest
-	53,  // 218: litevirt.v1.LiteVirt.RelayCheckVIPParticipant:input_type -> litevirt.v1.RelayCheckVIPParticipantRequest
-	55,  // 219: litevirt.v1.LiteVirt.CheckLBPresent:input_type -> litevirt.v1.CheckLBPresentRequest
-	66,  // 220: litevirt.v1.LiteVirt.CloneVM:input_type -> litevirt.v1.CloneVMRequest
-	67,  // 221: litevirt.v1.LiteVirt.ConvertToTemplate:input_type -> litevirt.v1.ConvertToTemplateRequest
-	68,  // 222: litevirt.v1.LiteVirt.ExecVM:input_type -> litevirt.v1.ExecVMRequest
-	70,  // 223: litevirt.v1.LiteVirt.ConsoleVM:input_type -> litevirt.v1.ConsoleInput
-	72,  // 224: litevirt.v1.LiteVirt.SetVMIP:input_type -> litevirt.v1.SetVMIPRequest
-	73,  // 225: litevirt.v1.LiteVirt.SetBootOrder:input_type -> litevirt.v1.SetBootOrderRequest
-	74,  // 226: litevirt.v1.LiteVirt.RebuildVM:input_type -> litevirt.v1.RebuildVMRequest
-	75,  // 227: litevirt.v1.LiteVirt.CutoverVM:input_type -> litevirt.v1.CutoverVMRequest
-	76,  // 228: litevirt.v1.LiteVirt.UpdateVM:input_type -> litevirt.v1.UpdateVMRequest
-	77,  // 229: litevirt.v1.LiteVirt.SetVMMemory:input_type -> litevirt.v1.SetVMMemoryRequest
-	78,  // 230: litevirt.v1.LiteVirt.SetVMLabels:input_type -> litevirt.v1.SetVMLabelsRequest
-	560, // 231: litevirt.v1.LiteVirt.AttachDevice:input_type -> litevirt.v1.AttachDeviceRequest
-	561, // 232: litevirt.v1.LiteVirt.DetachDevice:input_type -> litevirt.v1.DetachDeviceRequest
-	79,  // 233: litevirt.v1.LiteVirt.ResizeDisk:input_type -> litevirt.v1.ResizeDiskRequest
-	80,  // 234: litevirt.v1.LiteVirt.ProxyVNC:input_type -> litevirt.v1.VNCData
-	429, // 235: litevirt.v1.LiteVirt.GetVMLogs:input_type -> litevirt.v1.GetVMLogsRequest
-	81,  // 236: litevirt.v1.LiteVirt.DeployStack:input_type -> litevirt.v1.DeployStackRequest
-	83,  // 237: litevirt.v1.LiteVirt.DeleteStack:input_type -> litevirt.v1.DeleteStackRequest
-	559, // 238: litevirt.v1.LiteVirt.ListStacks:input_type -> google.protobuf.Empty
-	87,  // 239: litevirt.v1.LiteVirt.DiffStack:input_type -> litevirt.v1.DiffStackRequest
-	90,  // 240: litevirt.v1.LiteVirt.ExportStack:input_type -> litevirt.v1.ExportStackRequest
-	92,  // 241: litevirt.v1.LiteVirt.MigrateVM:input_type -> litevirt.v1.MigrateVMRequest
-	94,  // 242: litevirt.v1.LiteVirt.MoveVolume:input_type -> litevirt.v1.MoveVolumeRequest
-	96,  // 243: litevirt.v1.LiteVirt.ReplicateVolume:input_type -> litevirt.v1.ReplicateVolumeRequest
-	98,  // 244: litevirt.v1.LiteVirt.MigrateStackVolumes:input_type -> litevirt.v1.MigrateStackVolumesRequest
-	101, // 245: litevirt.v1.LiteVirt.PullImage:input_type -> litevirt.v1.PullImageRequest
-	559, // 246: litevirt.v1.LiteVirt.ListImages:input_type -> google.protobuf.Empty
-	104, // 247: litevirt.v1.LiteVirt.DeleteImage:input_type -> litevirt.v1.DeleteImageRequest
-	105, // 248: litevirt.v1.LiteVirt.ImportImage:input_type -> litevirt.v1.ImportImageRequest
-	107, // 249: litevirt.v1.LiteVirt.PushImage:input_type -> litevirt.v1.PushImageRequest
-	111, // 250: litevirt.v1.LiteVirt.BuildImage:input_type -> litevirt.v1.BuildImageRequest
-	108, // 251: litevirt.v1.LiteVirt.PruneImages:input_type -> litevirt.v1.PruneImagesRequest
-	113, // 252: litevirt.v1.LiteVirt.BackupVM:input_type -> litevirt.v1.BackupVMRequest
-	115, // 253: litevirt.v1.LiteVirt.RestoreVM:input_type -> litevirt.v1.RestoreVMRequest
-	116, // 254: litevirt.v1.LiteVirt.ImportVM:input_type -> litevirt.v1.ImportVMRequest
-	118, // 255: litevirt.v1.LiteVirt.CreateSnapshot:input_type -> litevirt.v1.CreateSnapshotRequest
-	119, // 256: litevirt.v1.LiteVirt.ListSnapshots:input_type -> litevirt.v1.ListSnapshotsRequest
-	121, // 257: litevirt.v1.LiteVirt.RestoreSnapshot:input_type -> litevirt.v1.RestoreSnapshotRequest
-	122, // 258: litevirt.v1.LiteVirt.DeleteSnapshot:input_type -> litevirt.v1.DeleteSnapshotRequest
-	123, // 259: litevirt.v1.LiteVirt.CreateNetwork:input_type -> litevirt.v1.CreateNetworkRequest
-	124, // 260: litevirt.v1.LiteVirt.GetNetwork:input_type -> litevirt.v1.GetNetworkRequest
-	125, // 261: litevirt.v1.LiteVirt.DeleteNetwork:input_type -> litevirt.v1.DeleteNetworkRequest
-	559, // 262: litevirt.v1.LiteVirt.ListNetworks:input_type -> google.protobuf.Empty
-	64,  // 263: litevirt.v1.LiteVirt.RekeyBinding:input_type -> litevirt.v1.RekeyBindingRequest
-	65,  // 264: litevirt.v1.LiteVirt.ResumeBinding:input_type -> litevirt.v1.ResumeBindingRequest
-	559, // 265: litevirt.v1.LiteVirt.ListLoadBalancers:input_type -> google.protobuf.Empty
-	129, // 266: litevirt.v1.LiteVirt.InspectLoadBalancer:input_type -> litevirt.v1.InspectLBRequest
-	134, // 267: litevirt.v1.LiteVirt.CreateLoadBalancer:input_type -> litevirt.v1.CreateLBRequest
-	135, // 268: litevirt.v1.LiteVirt.UpdateLoadBalancer:input_type -> litevirt.v1.UpdateLBRequest
-	136, // 269: litevirt.v1.LiteVirt.DeleteLoadBalancer:input_type -> litevirt.v1.DeleteLBRequest
-	137, // 270: litevirt.v1.LiteVirt.LBStats:input_type -> litevirt.v1.LBStatsRequest
-	138, // 271: litevirt.v1.LiteVirt.DrainBackend:input_type -> litevirt.v1.DrainBackendRequest
-	130, // 272: litevirt.v1.LiteVirt.DisableBackend:input_type -> litevirt.v1.DisableBackendRequest
-	131, // 273: litevirt.v1.LiteVirt.EnableBackend:input_type -> litevirt.v1.EnableBackendRequest
-	132, // 274: litevirt.v1.LiteVirt.ApplyLB:input_type -> litevirt.v1.ApplyLBRequest
-	133, // 275: litevirt.v1.LiteVirt.RemoveLB:input_type -> litevirt.v1.RemoveLBRequest
-	562, // 276: litevirt.v1.LiteVirt.LBKeepalivedRunning:input_type -> litevirt.v1.LBKeepalivedRequest
-	140, // 277: litevirt.v1.LiteVirt.Login:input_type -> litevirt.v1.LoginRequest
-	559, // 278: litevirt.v1.LiteVirt.ListRealms:input_type -> google.protobuf.Empty
-	559, // 279: litevirt.v1.LiteVirt.Logout:input_type -> google.protobuf.Empty
-	214, // 280: litevirt.v1.LiteVirt.ListSessions:input_type -> litevirt.v1.ListSessionsRequest
-	216, // 281: litevirt.v1.LiteVirt.RevokeSession:input_type -> litevirt.v1.RevokeSessionRequest
-	143, // 282: litevirt.v1.LiteVirt.CreateUser:input_type -> litevirt.v1.CreateUserRequest
-	559, // 283: litevirt.v1.LiteVirt.ListUsers:input_type -> google.protobuf.Empty
-	145, // 284: litevirt.v1.LiteVirt.DeleteUser:input_type -> litevirt.v1.DeleteUserRequest
-	151, // 285: litevirt.v1.LiteVirt.CreateToken:input_type -> litevirt.v1.CreateTokenRequest
-	152, // 286: litevirt.v1.LiteVirt.RevokeToken:input_type -> litevirt.v1.RevokeTokenRequest
-	559, // 287: litevirt.v1.LiteVirt.Whoami:input_type -> google.protobuf.Empty
-	147, // 288: litevirt.v1.LiteVirt.CheckPermissions:input_type -> litevirt.v1.CheckPermissionsRequest
-	149, // 289: litevirt.v1.LiteVirt.ChangePassword:input_type -> litevirt.v1.ChangePasswordRequest
-	150, // 290: litevirt.v1.LiteVirt.ResetAdminPassword:input_type -> litevirt.v1.ResetAdminPasswordRequest
-	218, // 291: litevirt.v1.LiteVirt.ListTwoFactors:input_type -> litevirt.v1.ListTwoFactorsRequest
-	220, // 292: litevirt.v1.LiteVirt.EnrollTOTP:input_type -> litevirt.v1.EnrollTOTPRequest
-	222, // 293: litevirt.v1.LiteVirt.DisableTwoFactor:input_type -> litevirt.v1.DisableTwoFactorRequest
-	224, // 294: litevirt.v1.LiteVirt.GrantRole:input_type -> litevirt.v1.GrantRoleRequest
-	226, // 295: litevirt.v1.LiteVirt.RevokeRole:input_type -> litevirt.v1.RevokeRoleRequest
-	228, // 296: litevirt.v1.LiteVirt.ListRoleBindings:input_type -> litevirt.v1.ListRoleBindingsRequest
-	230, // 297: litevirt.v1.LiteVirt.NormalizeRoleBindings:input_type -> litevirt.v1.NormalizeRoleBindingsRequest
-	232, // 298: litevirt.v1.LiteVirt.GetVMOperation:input_type -> litevirt.v1.GetVMOperationRequest
-	235, // 299: litevirt.v1.LiteVirt.AbortVMOperation:input_type -> litevirt.v1.AbortVMOperationRequest
-	239, // 300: litevirt.v1.LiteVirt.BeginWebAuthnRegistration:input_type -> litevirt.v1.BeginWebAuthnRegistrationRequest
-	241, // 301: litevirt.v1.LiteVirt.FinishWebAuthnRegistration:input_type -> litevirt.v1.FinishWebAuthnRegistrationRequest
-	243, // 302: litevirt.v1.LiteVirt.BeginWebAuthnLogin:input_type -> litevirt.v1.BeginWebAuthnLoginRequest
-	245, // 303: litevirt.v1.LiteVirt.FinishWebAuthnLogin:input_type -> litevirt.v1.FinishWebAuthnLoginRequest
-	237, // 304: litevirt.v1.LiteVirt.RestoreLive:input_type -> litevirt.v1.RestoreLiveRequest
-	212, // 305: litevirt.v1.LiteVirt.BindSecurityGroups:input_type -> litevirt.v1.BindSecurityGroupsRequest
-	559, // 306: litevirt.v1.LiteVirt.ReloadFirewall:input_type -> google.protobuf.Empty
-	153, // 307: litevirt.v1.LiteVirt.BackupSnapshot:input_type -> litevirt.v1.BackupSnapshotRequest
-	163, // 308: litevirt.v1.LiteVirt.RestoreFromBackup:input_type -> litevirt.v1.RestoreFromBackupRequest
-	156, // 309: litevirt.v1.LiteVirt.HasChunks:input_type -> litevirt.v1.HasChunksRequest
-	158, // 310: litevirt.v1.LiteVirt.PushBackup:input_type -> litevirt.v1.PushBackupFrame
-	165, // 311: litevirt.v1.LiteVirt.VerifyBackupRepo:input_type -> litevirt.v1.VerifyBackupRepoRequest
-	167, // 312: litevirt.v1.LiteVirt.GarbageCollectBackupRepo:input_type -> litevirt.v1.GarbageCollectBackupRepoRequest
-	172, // 313: litevirt.v1.LiteVirt.PruneBackupRepo:input_type -> litevirt.v1.PruneBackupRepoRequest
-	174, // 314: litevirt.v1.LiteVirt.SyncBackupRepo:input_type -> litevirt.v1.SyncBackupRepoRequest
-	170, // 315: litevirt.v1.LiteVirt.ListBackupRepoSnapshots:input_type -> litevirt.v1.ListBackupRepoSnapshotsRequest
-	178, // 316: litevirt.v1.LiteVirt.CreateContainer:input_type -> litevirt.v1.CreateContainerRequest
-	181, // 317: litevirt.v1.LiteVirt.StartContainer:input_type -> litevirt.v1.StartContainerRequest
-	182, // 318: litevirt.v1.LiteVirt.StopContainer:input_type -> litevirt.v1.StopContainerRequest
-	183, // 319: litevirt.v1.LiteVirt.DeleteContainer:input_type -> litevirt.v1.DeleteContainerRequest
-	184, // 320: litevirt.v1.LiteVirt.ExecContainer:input_type -> litevirt.v1.ExecContainerRequest
-	186, // 321: litevirt.v1.LiteVirt.ListContainers:input_type -> litevirt.v1.ListContainersRequest
-	196, // 322: litevirt.v1.LiteVirt.InspectContainer:input_type -> litevirt.v1.InspectContainerRequest
-	199, // 323: litevirt.v1.LiteVirt.ProbeContainerBackups:input_type -> litevirt.v1.ProbeContainerBackupsRequest
-	188, // 324: litevirt.v1.LiteVirt.PullOCIImage:input_type -> litevirt.v1.PullOCIImageRequest
-	189, // 325: litevirt.v1.LiteVirt.BackupContainer:input_type -> litevirt.v1.BackupContainerRequest
-	191, // 326: litevirt.v1.LiteVirt.RestoreContainer:input_type -> litevirt.v1.RestoreContainerRequest
-	193, // 327: litevirt.v1.LiteVirt.MigrateContainer:input_type -> litevirt.v1.MigrateContainerRequest
-	204, // 328: litevirt.v1.LiteVirt.SnapshotContainer:input_type -> litevirt.v1.SnapshotContainerRequest
-	205, // 329: litevirt.v1.LiteVirt.ListContainerSnapshots:input_type -> litevirt.v1.ListContainerSnapshotsRequest
-	207, // 330: litevirt.v1.LiteVirt.RevertContainerSnapshot:input_type -> litevirt.v1.RevertContainerSnapshotRequest
-	208, // 331: litevirt.v1.LiteVirt.DeleteContainerSnapshot:input_type -> litevirt.v1.DeleteContainerSnapshotRequest
-	209, // 332: litevirt.v1.LiteVirt.ConvertContainerToTemplate:input_type -> litevirt.v1.ConvertContainerToTemplateRequest
-	210, // 333: litevirt.v1.LiteVirt.CloneContainer:input_type -> litevirt.v1.CloneContainerRequest
-	180, // 334: litevirt.v1.LiteVirt.ConvertContainer:input_type -> litevirt.v1.ConvertContainerRequest
-	179, // 335: litevirt.v1.LiteVirt.PrepareContainerTarget:input_type -> litevirt.v1.PrepareContainerTargetRequest
-	247, // 336: litevirt.v1.LiteVirt.GetVMStats:input_type -> litevirt.v1.GetVMStatsRequest
-	248, // 337: litevirt.v1.LiteVirt.GetHostStats:input_type -> litevirt.v1.GetHostStatsRequest
-	559, // 338: litevirt.v1.LiteVirt.GetClusterStatus:input_type -> google.protobuf.Empty
-	250, // 339: litevirt.v1.LiteVirt.StreamEvents:input_type -> litevirt.v1.StreamEventsRequest
-	251, // 340: litevirt.v1.LiteVirt.ListAuditLog:input_type -> litevirt.v1.ListAuditLogRequest
-	254, // 341: litevirt.v1.LiteVirt.ListVMEvents:input_type -> litevirt.v1.ListVMEventsRequest
-	298, // 342: litevirt.v1.LiteVirt.ListStoragePools:input_type -> litevirt.v1.ListStoragePoolsRequest
-	300, // 343: litevirt.v1.LiteVirt.CreateStoragePool:input_type -> litevirt.v1.CreateStoragePoolRequest
-	302, // 344: litevirt.v1.LiteVirt.DeleteStoragePool:input_type -> litevirt.v1.DeleteStoragePoolRequest
-	304, // 345: litevirt.v1.LiteVirt.GetStoragePool:input_type -> litevirt.v1.GetStoragePoolRequest
-	307, // 346: litevirt.v1.LiteVirt.ListStoragePoolContents:input_type -> litevirt.v1.ListStoragePoolContentsRequest
-	309, // 347: litevirt.v1.LiteVirt.UploadStoragePoolContent:input_type -> litevirt.v1.UploadStoragePoolContentRequest
-	257, // 348: litevirt.v1.LiteVirt.CreateResourceMapping:input_type -> litevirt.v1.CreateResourceMappingRequest
-	258, // 349: litevirt.v1.LiteVirt.ListResourceMappings:input_type -> litevirt.v1.ListResourceMappingsRequest
-	260, // 350: litevirt.v1.LiteVirt.DeleteResourceMapping:input_type -> litevirt.v1.DeleteResourceMappingRequest
-	261, // 351: litevirt.v1.LiteVirt.AddMappingDevice:input_type -> litevirt.v1.AddMappingDeviceRequest
-	262, // 352: litevirt.v1.LiteVirt.RemoveMappingDevice:input_type -> litevirt.v1.RemoveMappingDeviceRequest
-	263, // 353: litevirt.v1.LiteVirt.CreateNotificationTarget:input_type -> litevirt.v1.CreateNotificationTargetRequest
-	264, // 354: litevirt.v1.LiteVirt.ListNotificationTargets:input_type -> litevirt.v1.ListNotificationTargetsRequest
-	266, // 355: litevirt.v1.LiteVirt.DeleteNotificationTarget:input_type -> litevirt.v1.DeleteNotificationTargetRequest
-	267, // 356: litevirt.v1.LiteVirt.TestNotificationTarget:input_type -> litevirt.v1.TestNotificationTargetRequest
-	268, // 357: litevirt.v1.LiteVirt.CreateNotificationRoute:input_type -> litevirt.v1.CreateNotificationRouteRequest
-	269, // 358: litevirt.v1.LiteVirt.ListNotificationRoutes:input_type -> litevirt.v1.ListNotificationRoutesRequest
-	271, // 359: litevirt.v1.LiteVirt.DeleteNotificationRoute:input_type -> litevirt.v1.DeleteNotificationRouteRequest
-	273, // 360: litevirt.v1.LiteVirt.SetRegistryCredential:input_type -> litevirt.v1.SetRegistryCredentialRequest
-	274, // 361: litevirt.v1.LiteVirt.ListRegistryCredentials:input_type -> litevirt.v1.ListRegistryCredentialsRequest
-	276, // 362: litevirt.v1.LiteVirt.DeleteRegistryCredential:input_type -> litevirt.v1.DeleteRegistryCredentialRequest
-	277, // 363: litevirt.v1.LiteVirt.CreateClusterFirewallRule:input_type -> litevirt.v1.CreateClusterFirewallRuleRequest
-	278, // 364: litevirt.v1.LiteVirt.ListClusterFirewallRules:input_type -> litevirt.v1.ListClusterFirewallRulesRequest
-	280, // 365: litevirt.v1.LiteVirt.DeleteClusterFirewallRule:input_type -> litevirt.v1.DeleteClusterFirewallRuleRequest
-	281, // 366: litevirt.v1.LiteVirt.CreateHostFirewallRule:input_type -> litevirt.v1.CreateHostFirewallRuleRequest
-	282, // 367: litevirt.v1.LiteVirt.ListHostFirewallRules:input_type -> litevirt.v1.ListHostFirewallRulesRequest
-	284, // 368: litevirt.v1.LiteVirt.DeleteHostFirewallRule:input_type -> litevirt.v1.DeleteHostFirewallRuleRequest
-	285, // 369: litevirt.v1.LiteVirt.CreateIpSet:input_type -> litevirt.v1.CreateIpSetRequest
-	286, // 370: litevirt.v1.LiteVirt.ListIpSets:input_type -> litevirt.v1.ListIpSetsRequest
-	288, // 371: litevirt.v1.LiteVirt.DeleteIpSet:input_type -> litevirt.v1.DeleteIpSetRequest
-	289, // 372: litevirt.v1.LiteVirt.SetFirewallDefault:input_type -> litevirt.v1.SetFirewallDefaultRequest
-	290, // 373: litevirt.v1.LiteVirt.ListFirewallDefaults:input_type -> litevirt.v1.ListFirewallDefaultsRequest
-	292, // 374: litevirt.v1.LiteVirt.CreateSecurityGroup:input_type -> litevirt.v1.CreateSecurityGroupRequest
-	293, // 375: litevirt.v1.LiteVirt.DeleteSecurityGroup:input_type -> litevirt.v1.DeleteSecurityGroupRequest
-	294, // 376: litevirt.v1.LiteVirt.AddSecurityGroupRule:input_type -> litevirt.v1.AddSecurityGroupRuleRequest
-	295, // 377: litevirt.v1.LiteVirt.RemoveSecurityGroupRule:input_type -> litevirt.v1.RemoveSecurityGroupRuleRequest
-	296, // 378: litevirt.v1.LiteVirt.ListSecurityGroups:input_type -> litevirt.v1.ListSecurityGroupsRequest
-	313, // 379: litevirt.v1.LiteVirt.DeleteStoragePoolContent:input_type -> litevirt.v1.DeleteStoragePoolContentRequest
-	315, // 380: litevirt.v1.LiteVirt.ListISOs:input_type -> litevirt.v1.ListISOsRequest
-	317, // 381: litevirt.v1.LiteVirt.PullISO:input_type -> litevirt.v1.PullISORequest
-	559, // 382: litevirt.v1.LiteVirt.GetISOLibraryMode:input_type -> google.protobuf.Empty
-	320, // 383: litevirt.v1.LiteVirt.SetISOLibraryMode:input_type -> litevirt.v1.SetISOLibraryModeRequest
-	321, // 384: litevirt.v1.LiteVirt.FetchISOLibraryFile:input_type -> litevirt.v1.FetchISOLibraryFileRequest
-	323, // 385: litevirt.v1.LiteVirt.PushReplicaIncrement:input_type -> litevirt.v1.PushReplicaIncrementRequest
-	326, // 386: litevirt.v1.LiteVirt.ListReplicas:input_type -> litevirt.v1.ListReplicasRequest
-	311, // 387: litevirt.v1.LiteVirt.PushReplica:input_type -> litevirt.v1.PushReplicaRequest
-	328, // 388: litevirt.v1.LiteVirt.PruneReplicas:input_type -> litevirt.v1.PruneReplicasRequest
-	377, // 389: litevirt.v1.LiteVirt.Ping:input_type -> litevirt.v1.PingRequest
-	379, // 390: litevirt.v1.LiteVirt.Ready:input_type -> litevirt.v1.ReadyRequest
-	383, // 391: litevirt.v1.LiteVirt.ProvisionNetwork:input_type -> litevirt.v1.ProvisionNetworkRequest
-	397, // 392: litevirt.v1.LiteVirt.SyncVTEP:input_type -> litevirt.v1.SyncVTEPRequest
-	398, // 393: litevirt.v1.LiteVirt.GetVMIPRemote:input_type -> litevirt.v1.GetVMIPRequest
-	400, // 394: litevirt.v1.LiteVirt.RefreshLB:input_type -> litevirt.v1.RefreshLBRequest
-	401, // 395: litevirt.v1.LiteVirt.UpdateFDB:input_type -> litevirt.v1.UpdateFDBRequest
-	384, // 396: litevirt.v1.LiteVirt.EnsureCloudInit:input_type -> litevirt.v1.EnsureCloudInitRequest
-	385, // 397: litevirt.v1.LiteVirt.EnsureDisks:input_type -> litevirt.v1.EnsureDisksRequest
-	388, // 398: litevirt.v1.LiteVirt.EnsureFirmwareState:input_type -> litevirt.v1.EnsureFirmwareStateRequest
-	390, // 399: litevirt.v1.LiteVirt.RollbackFirmwareState:input_type -> litevirt.v1.RollbackFirmwareStateRequest
-	396, // 400: litevirt.v1.LiteVirt.CleanupMigrationArtifacts:input_type -> litevirt.v1.CleanupMigrationArtifactsRequest
-	392, // 401: litevirt.v1.LiteVirt.ReceiveMigrationDisk:input_type -> litevirt.v1.ReceiveMigrationDiskRequest
-	394, // 402: litevirt.v1.LiteVirt.CheckCPUCompatibility:input_type -> litevirt.v1.CheckCPUCompatibilityRequest
-	559, // 403: litevirt.v1.LiteVirt.GetStateDigest:input_type -> google.protobuf.Empty
-	331, // 404: litevirt.v1.LiteVirt.AcknowledgeLeaseTermTie:input_type -> litevirt.v1.AcknowledgeLeaseTermTieRequest
-	333, // 405: litevirt.v1.LiteVirt.GetLeaseTermHighWater:input_type -> litevirt.v1.GetLeaseTermHighWaterRequest
-	559, // 406: litevirt.v1.LiteVirt.GetStateDump:input_type -> google.protobuf.Empty
-	559, // 407: litevirt.v1.LiteVirt.StreamStateDump:input_type -> google.protobuf.Empty
-	409, // 408: litevirt.v1.LiteVirt.StreamTableDump:input_type -> litevirt.v1.TableDumpRequest
-	411, // 409: litevirt.v1.LiteVirt.GetSensitiveStateDigest:input_type -> litevirt.v1.SensitiveStateRequest
-	411, // 410: litevirt.v1.LiteVirt.StreamSensitiveStateDump:input_type -> litevirt.v1.SensitiveStateRequest
-	413, // 411: litevirt.v1.LiteVirt.GetTableBucketDigests:input_type -> litevirt.v1.BucketDigestRequest
-	409, // 412: litevirt.v1.LiteVirt.StreamTableRows:input_type -> litevirt.v1.TableDumpRequest
-	411, // 413: litevirt.v1.LiteVirt.StreamSensitiveTableRows:input_type -> litevirt.v1.SensitiveStateRequest
-	404, // 414: litevirt.v1.LiteVirt.TriggerAntiEntropy:input_type -> litevirt.v1.TriggerAntiEntropyRequest
-	559, // 415: litevirt.v1.LiteVirt.GetClusterStateDigest:input_type -> google.protobuf.Empty
-	341, // 416: litevirt.v1.LiteVirt.PrepareRecoveryClaim:input_type -> litevirt.v1.PrepareRecoveryClaimRequest
-	364, // 417: litevirt.v1.LiteVirt.AcceptRecoveryClaim:input_type -> litevirt.v1.AcceptRecoveryClaimRequest
-	366, // 418: litevirt.v1.LiteVirt.GetRecoveryClaim:input_type -> litevirt.v1.GetRecoveryClaimRequest
-	368, // 419: litevirt.v1.LiteVirt.ListRecoveryClaims:input_type -> litevirt.v1.ListRecoveryClaimsRequest
-	343, // 420: litevirt.v1.LiteVirt.AbandonRecoveryProof:input_type -> litevirt.v1.AbandonRecoveryProofRequest
-	344, // 421: litevirt.v1.LiteVirt.ReleaseLegacyHeldClaim:input_type -> litevirt.v1.ReleaseLegacyHeldClaimRequest
-	347, // 422: litevirt.v1.LiteVirt.PlanDeadHostRemoval:input_type -> litevirt.v1.PlanDeadHostRemovalRequest
-	349, // 423: litevirt.v1.LiteVirt.ForceReconfigureVoters:input_type -> litevirt.v1.ForceReconfigureVotersRequest
-	352, // 424: litevirt.v1.LiteVirt.SignForcedVoterConfig:input_type -> litevirt.v1.SignForcedVoterConfigRequest
-	358, // 425: litevirt.v1.LiteVirt.InspectRecoveryClaim:input_type -> litevirt.v1.InspectRecoveryClaimRequest
-	355, // 426: litevirt.v1.LiteVirt.ConfirmPartitionResume:input_type -> litevirt.v1.ConfirmPartitionResumeRequest
-	370, // 427: litevirt.v1.LiteVirt.GetVoterConfig:input_type -> litevirt.v1.GetVoterConfigRequest
-	373, // 428: litevirt.v1.LiteVirt.ChangeVoterConfig:input_type -> litevirt.v1.ChangeVoterConfigRequest
-	417, // 429: litevirt.v1.LiteVirt.DiagnoseDivergence:input_type -> litevirt.v1.DiagnoseDivergenceRequest
-	422, // 430: litevirt.v1.LiteVirt.ScanSensitiveDivergence:input_type -> litevirt.v1.ScanSensitiveRequest
-	426, // 431: litevirt.v1.LiteVirt.PushMutations:input_type -> litevirt.v1.ReplicateRequest
-	428, // 432: litevirt.v1.LiteVirt.AckMutations:input_type -> litevirt.v1.AckRequest
-	456, // 433: litevirt.v1.LiteVirt.ListRebalanceProposals:input_type -> litevirt.v1.ListRebalanceProposalsRequest
-	458, // 434: litevirt.v1.LiteVirt.RunRebalance:input_type -> litevirt.v1.RunRebalanceRequest
-	460, // 435: litevirt.v1.LiteVirt.ApproveRebalanceProposal:input_type -> litevirt.v1.ApproveRebalanceProposalRequest
-	461, // 436: litevirt.v1.LiteVirt.RejectRebalanceProposal:input_type -> litevirt.v1.RejectRebalanceProposalRequest
-	453, // 437: litevirt.v1.LiteVirt.GetSpiceInfo:input_type -> litevirt.v1.GetSpiceInfoRequest
-	450, // 438: litevirt.v1.LiteVirt.PreflightUpgrade:input_type -> litevirt.v1.PreflightUpgradeRequest
-	462, // 439: litevirt.v1.LiteVirt.ListRegions:input_type -> litevirt.v1.ListRegionsRequest
-	464, // 440: litevirt.v1.LiteVirt.RegionStatus:input_type -> litevirt.v1.RegionStatusRequest
-	474, // 441: litevirt.v1.LiteVirt.CrossRegionMigrate:input_type -> litevirt.v1.CrossRegionMigrateRequest
-	559, // 442: litevirt.v1.LiteVirt.GetFailoverScope:input_type -> google.protobuf.Empty
-	469, // 443: litevirt.v1.LiteVirt.SetFailoverScope:input_type -> litevirt.v1.SetFailoverScopeRequest
-	470, // 444: litevirt.v1.LiteVirt.RestoreRelay:input_type -> litevirt.v1.RestoreRelayRequest
-	559, // 445: litevirt.v1.LiteVirt.GetRelayHealth:input_type -> google.protobuf.Empty
-	476, // 446: litevirt.v1.LiteVirt.UpsertServiceEndpoint:input_type -> litevirt.v1.UpsertServiceEndpointRequest
-	477, // 447: litevirt.v1.LiteVirt.ListServiceEndpoints:input_type -> litevirt.v1.ListServiceEndpointsRequest
-	479, // 448: litevirt.v1.LiteVirt.DeleteServiceEndpoint:input_type -> litevirt.v1.DeleteServiceEndpointRequest
-	481, // 449: litevirt.v1.LiteVirt.CreateBackupSchedule:input_type -> litevirt.v1.CreateBackupScheduleRequest
-	482, // 450: litevirt.v1.LiteVirt.ListBackupSchedules:input_type -> litevirt.v1.ListBackupSchedulesRequest
-	484, // 451: litevirt.v1.LiteVirt.DeleteBackupSchedule:input_type -> litevirt.v1.DeleteBackupScheduleRequest
-	486, // 452: litevirt.v1.LiteVirt.CreateReplicationSchedule:input_type -> litevirt.v1.CreateReplicationScheduleRequest
-	487, // 453: litevirt.v1.LiteVirt.ListReplicationSchedules:input_type -> litevirt.v1.ListReplicationSchedulesRequest
-	489, // 454: litevirt.v1.LiteVirt.DeleteReplicationSchedule:input_type -> litevirt.v1.DeleteReplicationScheduleRequest
-	375, // 455: litevirt.v1.LiteVirt.PromoteReplica:input_type -> litevirt.v1.PromoteReplicaRequest
-	559, // 456: litevirt.v1.LiteVirt.VerifyAuditChain:input_type -> google.protobuf.Empty
-	493, // 457: litevirt.v1.LiteVirt.ExportAuditChain:input_type -> litevirt.v1.ExportAuditChainRequest
-	491, // 458: litevirt.v1.LiteVirt.RetireAuditKey:input_type -> litevirt.v1.RetireAuditKeyRequest
-	496, // 459: litevirt.v1.LiteVirt.CreateProject:input_type -> litevirt.v1.CreateProjectRequest
-	559, // 460: litevirt.v1.LiteVirt.ListProjects:input_type -> google.protobuf.Empty
-	498, // 461: litevirt.v1.LiteVirt.GetProject:input_type -> litevirt.v1.GetProjectRequest
-	499, // 462: litevirt.v1.LiteVirt.DeleteProject:input_type -> litevirt.v1.DeleteProjectRequest
-	501, // 463: litevirt.v1.LiteVirt.SetProjectQuota:input_type -> litevirt.v1.SetProjectQuotaRequest
-	502, // 464: litevirt.v1.LiteVirt.GetProjectQuota:input_type -> litevirt.v1.GetProjectQuotaRequest
-	504, // 465: litevirt.v1.LiteVirt.GetProjectUsage:input_type -> litevirt.v1.GetProjectUsageRequest
-	435, // 466: litevirt.v1.LiteVirt.ExecuteCreateVM:input_type -> litevirt.v1.ExecuteCreateVMRequest
-	505, // 467: litevirt.v1.LiteVirt.ReserveProjectCapacity:input_type -> litevirt.v1.ReserveProjectCapacityRequest
-	507, // 468: litevirt.v1.LiteVirt.ReleaseProjectCapacity:input_type -> litevirt.v1.ReleaseProjectCapacityRequest
-	508, // 469: litevirt.v1.LiteVirt.ReserveHostCapacity:input_type -> litevirt.v1.ReserveHostCapacityRequest
-	510, // 470: litevirt.v1.LiteVirt.ReleaseHostCapacity:input_type -> litevirt.v1.ReleaseHostCapacityRequest
-	515, // 471: litevirt.v1.LiteVirt.ImportLeftoverStatus:input_type -> litevirt.v1.ImportLeftoverStatusRequest
-	517, // 472: litevirt.v1.LiteVirt.PreflightRecreateVM:input_type -> litevirt.v1.PreflightRecreateVMRequest
-	12,  // 473: litevirt.v1.LiteVirt.ListHosts:output_type -> litevirt.v1.ListHostsResponse
-	532, // 474: litevirt.v1.LiteVirt.InspectHost:output_type -> litevirt.v1.Host
-	15,  // 475: litevirt.v1.LiteVirt.DrainHost:output_type -> litevirt.v1.DrainProgress
-	18,  // 476: litevirt.v1.LiteVirt.ShutdownHostWorkloads:output_type -> litevirt.v1.ShutdownProgress
-	532, // 477: litevirt.v1.LiteVirt.UndrainHost:output_type -> litevirt.v1.Host
-	532, // 478: litevirt.v1.LiteVirt.SetHostLabels:output_type -> litevirt.v1.Host
-	24,  // 479: litevirt.v1.LiteVirt.FenceHost:output_type -> litevirt.v1.FenceResult
-	30,  // 480: litevirt.v1.LiteVirt.GetClusterHealth:output_type -> litevirt.v1.ClusterHealth
-	512, // 481: litevirt.v1.LiteVirt.GetFenceReadiness:output_type -> litevirt.v1.FenceReadiness
-	559, // 482: litevirt.v1.LiteVirt.RemoveHost:output_type -> google.protobuf.Empty
-	437, // 483: litevirt.v1.LiteVirt.AdmitHost:output_type -> litevirt.v1.AdmitHostResponse
-	440, // 484: litevirt.v1.LiteVirt.ListHostNetworks:output_type -> litevirt.v1.ListHostNetworksResponse
-	438, // 485: litevirt.v1.LiteVirt.UpsertHostNetwork:output_type -> litevirt.v1.HostNetwork
-	443, // 486: litevirt.v1.LiteVirt.PlanHostNetwork:output_type -> litevirt.v1.PlanHostNetworkResponse
-	559, // 487: litevirt.v1.LiteVirt.ApplyHostNetwork:output_type -> google.protobuf.Empty
-	559, // 488: litevirt.v1.LiteVirt.DeleteHostNetwork:output_type -> google.protobuf.Empty
-	447, // 489: litevirt.v1.LiteVirt.IsolateHost:output_type -> litevirt.v1.HostIsolationStatus
-	449, // 490: litevirt.v1.LiteVirt.ReseedHost:output_type -> litevirt.v1.ReseedHostResponse
-	23,  // 491: litevirt.v1.LiteVirt.PublishCRL:output_type -> litevirt.v1.PublishCRLResponse
-	32,  // 492: litevirt.v1.LiteVirt.RescanHost:output_type -> litevirt.v1.RescanHostResponse
-	34,  // 493: litevirt.v1.LiteVirt.ListHostDevices:output_type -> litevirt.v1.ListHostDevicesResponse
-	37,  // 494: litevirt.v1.LiteVirt.SupersededDisks:output_type -> litevirt.v1.SupersededDisksResponse
-	432, // 495: litevirt.v1.LiteVirt.UpgradeHost:output_type -> litevirt.v1.UpgradeHostResponse
-	432, // 496: litevirt.v1.LiteVirt.PreStageUpgrade:output_type -> litevirt.v1.UpgradeHostResponse
-	382, // 497: litevirt.v1.LiteVirt.FetchBinary:output_type -> litevirt.v1.FetchBinaryChunk
-	434, // 498: litevirt.v1.LiteVirt.UninstallHost:output_type -> litevirt.v1.UninstallHostResponse
-	532, // 499: litevirt.v1.LiteVirt.ConfigureHost:output_type -> litevirt.v1.Host
-	536, // 500: litevirt.v1.LiteVirt.CreateVM:output_type -> litevirt.v1.VM
-	41,  // 501: litevirt.v1.LiteVirt.ListVMs:output_type -> litevirt.v1.ListVMsResponse
-	536, // 502: litevirt.v1.LiteVirt.InspectVM:output_type -> litevirt.v1.VM
-	44,  // 503: litevirt.v1.LiteVirt.ListVMHardware:output_type -> litevirt.v1.ListVMHardwareResponse
-	536, // 504: litevirt.v1.LiteVirt.StartVM:output_type -> litevirt.v1.VM
-	536, // 505: litevirt.v1.LiteVirt.StopVM:output_type -> litevirt.v1.VM
-	536, // 506: litevirt.v1.LiteVirt.RestartVM:output_type -> litevirt.v1.VM
-	559, // 507: litevirt.v1.LiteVirt.DeleteVM:output_type -> google.protobuf.Empty
-	50,  // 508: litevirt.v1.LiteVirt.RepairVMOwner:output_type -> litevirt.v1.RepairVMOwnerResponse
-	59,  // 509: litevirt.v1.LiteVirt.GetRuntimeInventory:output_type -> litevirt.v1.RuntimeInventory
-	61,  // 510: litevirt.v1.LiteVirt.CollectOrphanProof:output_type -> litevirt.v1.OrphanProofResponse
-	63,  // 511: litevirt.v1.LiteVirt.GetMembershipView:output_type -> litevirt.v1.MembershipViewResponse
-	52,  // 512: litevirt.v1.LiteVirt.CheckVIPParticipant:output_type -> litevirt.v1.CheckVIPParticipantResponse
-	54,  // 513: litevirt.v1.LiteVirt.RelayCheckVIPParticipant:output_type -> litevirt.v1.RelayCheckVIPParticipantResponse
-	56,  // 514: litevirt.v1.LiteVirt.CheckLBPresent:output_type -> litevirt.v1.CheckLBPresentResponse
-	536, // 515: litevirt.v1.LiteVirt.CloneVM:output_type -> litevirt.v1.VM
-	536, // 516: litevirt.v1.LiteVirt.ConvertToTemplate:output_type -> litevirt.v1.VM
-	69,  // 517: litevirt.v1.LiteVirt.ExecVM:output_type -> litevirt.v1.ExecVMResponse
-	71,  // 518: litevirt.v1.LiteVirt.ConsoleVM:output_type -> litevirt.v1.ConsoleOutput
-	536, // 519: litevirt.v1.LiteVirt.SetVMIP:output_type -> litevirt.v1.VM
-	536, // 520: litevirt.v1.LiteVirt.SetBootOrder:output_type -> litevirt.v1.VM
-	536, // 521: litevirt.v1.LiteVirt.RebuildVM:output_type -> litevirt.v1.VM
-	536, // 522: litevirt.v1.LiteVirt.CutoverVM:output_type -> litevirt.v1.VM
-	536, // 523: litevirt.v1.LiteVirt.UpdateVM:output_type -> litevirt.v1.VM
-	536, // 524: litevirt.v1.LiteVirt.SetVMMemory:output_type -> litevirt.v1.VM
-	536, // 525: litevirt.v1.LiteVirt.SetVMLabels:output_type -> litevirt.v1.VM
-	536, // 526: litevirt.v1.LiteVirt.AttachDevice:output_type -> litevirt.v1.VM
-	536, // 527: litevirt.v1.LiteVirt.DetachDevice:output_type -> litevirt.v1.VM
-	536, // 528: litevirt.v1.LiteVirt.ResizeDisk:output_type -> litevirt.v1.VM
-	80,  // 529: litevirt.v1.LiteVirt.ProxyVNC:output_type -> litevirt.v1.VNCData
-	430, // 530: litevirt.v1.LiteVirt.GetVMLogs:output_type -> litevirt.v1.VMLogChunk
-	82,  // 531: litevirt.v1.LiteVirt.DeployStack:output_type -> litevirt.v1.DeployProgress
-	84,  // 532: litevirt.v1.LiteVirt.DeleteStack:output_type -> litevirt.v1.DeleteProgress
-	85,  // 533: litevirt.v1.LiteVirt.ListStacks:output_type -> litevirt.v1.ListStacksResponse
-	88,  // 534: litevirt.v1.LiteVirt.DiffStack:output_type -> litevirt.v1.DiffStackResponse
-	91,  // 535: litevirt.v1.LiteVirt.ExportStack:output_type -> litevirt.v1.ExportStackResponse
-	93,  // 536: litevirt.v1.LiteVirt.MigrateVM:output_type -> litevirt.v1.MigrateProgress
-	95,  // 537: litevirt.v1.LiteVirt.MoveVolume:output_type -> litevirt.v1.MoveVolumeProgress
-	97,  // 538: litevirt.v1.LiteVirt.ReplicateVolume:output_type -> litevirt.v1.ReplicateVolumeProgress
-	100, // 539: litevirt.v1.LiteVirt.MigrateStackVolumes:output_type -> litevirt.v1.StackVolumeProgress
-	102, // 540: litevirt.v1.LiteVirt.PullImage:output_type -> litevirt.v1.PullProgress
-	103, // 541: litevirt.v1.LiteVirt.ListImages:output_type -> litevirt.v1.ListImagesResponse
-	559, // 542: litevirt.v1.LiteVirt.DeleteImage:output_type -> google.protobuf.Empty
-	106, // 543: litevirt.v1.LiteVirt.ImportImage:output_type -> litevirt.v1.ImportImageResponse
-	110, // 544: litevirt.v1.LiteVirt.PushImage:output_type -> litevirt.v1.PushImageProgress
-	112, // 545: litevirt.v1.LiteVirt.BuildImage:output_type -> litevirt.v1.BuildImageResponse
-	109, // 546: litevirt.v1.LiteVirt.PruneImages:output_type -> litevirt.v1.PruneImagesResponse
-	114, // 547: litevirt.v1.LiteVirt.BackupVM:output_type -> litevirt.v1.BackupChunk
-	536, // 548: litevirt.v1.LiteVirt.RestoreVM:output_type -> litevirt.v1.VM
-	117, // 549: litevirt.v1.LiteVirt.ImportVM:output_type -> litevirt.v1.ImportVMProgress
-	543, // 550: litevirt.v1.LiteVirt.CreateSnapshot:output_type -> litevirt.v1.Snapshot
-	120, // 551: litevirt.v1.LiteVirt.ListSnapshots:output_type -> litevirt.v1.ListSnapshotsResponse
-	536, // 552: litevirt.v1.LiteVirt.RestoreSnapshot:output_type -> litevirt.v1.VM
-	559, // 553: litevirt.v1.LiteVirt.DeleteSnapshot:output_type -> google.protobuf.Empty
-	127, // 554: litevirt.v1.LiteVirt.CreateNetwork:output_type -> litevirt.v1.NetworkInfo
-	127, // 555: litevirt.v1.LiteVirt.GetNetwork:output_type -> litevirt.v1.NetworkInfo
-	559, // 556: litevirt.v1.LiteVirt.DeleteNetwork:output_type -> google.protobuf.Empty
-	126, // 557: litevirt.v1.LiteVirt.ListNetworks:output_type -> litevirt.v1.ListNetworksResponse
-	559, // 558: litevirt.v1.LiteVirt.RekeyBinding:output_type -> google.protobuf.Empty
-	559, // 559: litevirt.v1.LiteVirt.ResumeBinding:output_type -> google.protobuf.Empty
-	128, // 560: litevirt.v1.LiteVirt.ListLoadBalancers:output_type -> litevirt.v1.ListLBResponse
-	544, // 561: litevirt.v1.LiteVirt.InspectLoadBalancer:output_type -> litevirt.v1.LoadBalancer
-	544, // 562: litevirt.v1.LiteVirt.CreateLoadBalancer:output_type -> litevirt.v1.LoadBalancer
-	544, // 563: litevirt.v1.LiteVirt.UpdateLoadBalancer:output_type -> litevirt.v1.LoadBalancer
-	559, // 564: litevirt.v1.LiteVirt.DeleteLoadBalancer:output_type -> google.protobuf.Empty
-	563, // 565: litevirt.v1.LiteVirt.LBStats:output_type -> litevirt.v1.LBStatsResponse
-	139, // 566: litevirt.v1.LiteVirt.DrainBackend:output_type -> litevirt.v1.DrainBackendResponse
-	544, // 567: litevirt.v1.LiteVirt.DisableBackend:output_type -> litevirt.v1.LoadBalancer
-	544, // 568: litevirt.v1.LiteVirt.EnableBackend:output_type -> litevirt.v1.LoadBalancer
-	559, // 569: litevirt.v1.LiteVirt.ApplyLB:output_type -> google.protobuf.Empty
-	559, // 570: litevirt.v1.LiteVirt.RemoveLB:output_type -> google.protobuf.Empty
-	564, // 571: litevirt.v1.LiteVirt.LBKeepalivedRunning:output_type -> litevirt.v1.LBKeepalivedResponse
-	141, // 572: litevirt.v1.LiteVirt.Login:output_type -> litevirt.v1.LoginResponse
-	142, // 573: litevirt.v1.LiteVirt.ListRealms:output_type -> litevirt.v1.ListRealmsResponse
-	559, // 574: litevirt.v1.LiteVirt.Logout:output_type -> google.protobuf.Empty
-	215, // 575: litevirt.v1.LiteVirt.ListSessions:output_type -> litevirt.v1.ListSessionsResponse
-	559, // 576: litevirt.v1.LiteVirt.RevokeSession:output_type -> google.protobuf.Empty
-	548, // 577: litevirt.v1.LiteVirt.CreateUser:output_type -> litevirt.v1.User
-	144, // 578: litevirt.v1.LiteVirt.ListUsers:output_type -> litevirt.v1.ListUsersResponse
-	559, // 579: litevirt.v1.LiteVirt.DeleteUser:output_type -> google.protobuf.Empty
-	565, // 580: litevirt.v1.LiteVirt.CreateToken:output_type -> litevirt.v1.Token
-	559, // 581: litevirt.v1.LiteVirt.RevokeToken:output_type -> google.protobuf.Empty
-	146, // 582: litevirt.v1.LiteVirt.Whoami:output_type -> litevirt.v1.WhoamiResponse
-	148, // 583: litevirt.v1.LiteVirt.CheckPermissions:output_type -> litevirt.v1.CheckPermissionsResponse
-	559, // 584: litevirt.v1.LiteVirt.ChangePassword:output_type -> google.protobuf.Empty
-	559, // 585: litevirt.v1.LiteVirt.ResetAdminPassword:output_type -> google.protobuf.Empty
-	219, // 586: litevirt.v1.LiteVirt.ListTwoFactors:output_type -> litevirt.v1.ListTwoFactorsResponse
-	221, // 587: litevirt.v1.LiteVirt.EnrollTOTP:output_type -> litevirt.v1.EnrollTOTPResponse
-	559, // 588: litevirt.v1.LiteVirt.DisableTwoFactor:output_type -> google.protobuf.Empty
-	225, // 589: litevirt.v1.LiteVirt.GrantRole:output_type -> litevirt.v1.GrantRoleResponse
-	227, // 590: litevirt.v1.LiteVirt.RevokeRole:output_type -> litevirt.v1.RevokeRoleResponse
-	229, // 591: litevirt.v1.LiteVirt.ListRoleBindings:output_type -> litevirt.v1.ListRoleBindingsResponse
-	231, // 592: litevirt.v1.LiteVirt.NormalizeRoleBindings:output_type -> litevirt.v1.NormalizeRoleBindingsResponse
-	234, // 593: litevirt.v1.LiteVirt.GetVMOperation:output_type -> litevirt.v1.GetVMOperationResponse
-	236, // 594: litevirt.v1.LiteVirt.AbortVMOperation:output_type -> litevirt.v1.AbortVMOperationResponse
-	240, // 595: litevirt.v1.LiteVirt.BeginWebAuthnRegistration:output_type -> litevirt.v1.BeginWebAuthnRegistrationResponse
-	242, // 596: litevirt.v1.LiteVirt.FinishWebAuthnRegistration:output_type -> litevirt.v1.FinishWebAuthnRegistrationResponse
-	244, // 597: litevirt.v1.LiteVirt.BeginWebAuthnLogin:output_type -> litevirt.v1.BeginWebAuthnLoginResponse
-	246, // 598: litevirt.v1.LiteVirt.FinishWebAuthnLogin:output_type -> litevirt.v1.FinishWebAuthnLoginResponse
-	238, // 599: litevirt.v1.LiteVirt.RestoreLive:output_type -> litevirt.v1.RestoreLiveProgress
-	559, // 600: litevirt.v1.LiteVirt.BindSecurityGroups:output_type -> google.protobuf.Empty
-	211, // 601: litevirt.v1.LiteVirt.ReloadFirewall:output_type -> litevirt.v1.FirewallStatus
-	154, // 602: litevirt.v1.LiteVirt.BackupSnapshot:output_type -> litevirt.v1.BackupSnapshotProgress
-	164, // 603: litevirt.v1.LiteVirt.RestoreFromBackup:output_type -> litevirt.v1.RestoreFromBackupProgress
-	157, // 604: litevirt.v1.LiteVirt.HasChunks:output_type -> litevirt.v1.HasChunksResponse
-	162, // 605: litevirt.v1.LiteVirt.PushBackup:output_type -> litevirt.v1.PushBackupResponse
-	166, // 606: litevirt.v1.LiteVirt.VerifyBackupRepo:output_type -> litevirt.v1.VerifyBackupRepoResponse
-	168, // 607: litevirt.v1.LiteVirt.GarbageCollectBackupRepo:output_type -> litevirt.v1.GarbageCollectBackupRepoResponse
-	173, // 608: litevirt.v1.LiteVirt.PruneBackupRepo:output_type -> litevirt.v1.PruneBackupRepoResponse
-	175, // 609: litevirt.v1.LiteVirt.SyncBackupRepo:output_type -> litevirt.v1.SyncBackupRepoResponse
-	171, // 610: litevirt.v1.LiteVirt.ListBackupRepoSnapshots:output_type -> litevirt.v1.ListBackupRepoSnapshotsResponse
-	176, // 611: litevirt.v1.LiteVirt.CreateContainer:output_type -> litevirt.v1.Container
-	559, // 612: litevirt.v1.LiteVirt.StartContainer:output_type -> google.protobuf.Empty
-	559, // 613: litevirt.v1.LiteVirt.StopContainer:output_type -> google.protobuf.Empty
-	559, // 614: litevirt.v1.LiteVirt.DeleteContainer:output_type -> google.protobuf.Empty
-	185, // 615: litevirt.v1.LiteVirt.ExecContainer:output_type -> litevirt.v1.ExecContainerResponse
-	187, // 616: litevirt.v1.LiteVirt.ListContainers:output_type -> litevirt.v1.ListContainersResponse
-	202, // 617: litevirt.v1.LiteVirt.InspectContainer:output_type -> litevirt.v1.ContainerDetail
-	201, // 618: litevirt.v1.LiteVirt.ProbeContainerBackups:output_type -> litevirt.v1.ProbeContainerBackupsResponse
-	559, // 619: litevirt.v1.LiteVirt.PullOCIImage:output_type -> google.protobuf.Empty
-	190, // 620: litevirt.v1.LiteVirt.BackupContainer:output_type -> litevirt.v1.BackupContainerProgress
-	192, // 621: litevirt.v1.LiteVirt.RestoreContainer:output_type -> litevirt.v1.RestoreContainerProgress
-	194, // 622: litevirt.v1.LiteVirt.MigrateContainer:output_type -> litevirt.v1.MigrateContainerProgress
-	195, // 623: litevirt.v1.LiteVirt.SnapshotContainer:output_type -> litevirt.v1.ContainerSnapshot
-	206, // 624: litevirt.v1.LiteVirt.ListContainerSnapshots:output_type -> litevirt.v1.ListContainerSnapshotsResponse
-	559, // 625: litevirt.v1.LiteVirt.RevertContainerSnapshot:output_type -> google.protobuf.Empty
-	559, // 626: litevirt.v1.LiteVirt.DeleteContainerSnapshot:output_type -> google.protobuf.Empty
-	176, // 627: litevirt.v1.LiteVirt.ConvertContainerToTemplate:output_type -> litevirt.v1.Container
-	176, // 628: litevirt.v1.LiteVirt.CloneContainer:output_type -> litevirt.v1.Container
-	176, // 629: litevirt.v1.LiteVirt.ConvertContainer:output_type -> litevirt.v1.Container
-	559, // 630: litevirt.v1.LiteVirt.PrepareContainerTarget:output_type -> google.protobuf.Empty
-	566, // 631: litevirt.v1.LiteVirt.GetVMStats:output_type -> litevirt.v1.VMStats
-	567, // 632: litevirt.v1.LiteVirt.GetHostStats:output_type -> litevirt.v1.HostResourceStats
-	249, // 633: litevirt.v1.LiteVirt.GetClusterStatus:output_type -> litevirt.v1.ClusterStatus
-	549, // 634: litevirt.v1.LiteVirt.StreamEvents:output_type -> litevirt.v1.ClusterEvent
-	253, // 635: litevirt.v1.LiteVirt.ListAuditLog:output_type -> litevirt.v1.ListAuditLogResponse
-	256, // 636: litevirt.v1.LiteVirt.ListVMEvents:output_type -> litevirt.v1.ListVMEventsResponse
-	299, // 637: litevirt.v1.LiteVirt.ListStoragePools:output_type -> litevirt.v1.ListStoragePoolsResponse
-	301, // 638: litevirt.v1.LiteVirt.CreateStoragePool:output_type -> litevirt.v1.CreateStoragePoolResponse
-	303, // 639: litevirt.v1.LiteVirt.DeleteStoragePool:output_type -> litevirt.v1.DeleteStoragePoolResponse
-	305, // 640: litevirt.v1.LiteVirt.GetStoragePool:output_type -> litevirt.v1.GetStoragePoolResponse
-	308, // 641: litevirt.v1.LiteVirt.ListStoragePoolContents:output_type -> litevirt.v1.ListStoragePoolContentsResponse
-	310, // 642: litevirt.v1.LiteVirt.UploadStoragePoolContent:output_type -> litevirt.v1.UploadStoragePoolContentResponse
-	550, // 643: litevirt.v1.LiteVirt.CreateResourceMapping:output_type -> litevirt.v1.ResourceMapping
-	259, // 644: litevirt.v1.LiteVirt.ListResourceMappings:output_type -> litevirt.v1.ListResourceMappingsResponse
-	559, // 645: litevirt.v1.LiteVirt.DeleteResourceMapping:output_type -> google.protobuf.Empty
-	550, // 646: litevirt.v1.LiteVirt.AddMappingDevice:output_type -> litevirt.v1.ResourceMapping
-	550, // 647: litevirt.v1.LiteVirt.RemoveMappingDevice:output_type -> litevirt.v1.ResourceMapping
-	551, // 648: litevirt.v1.LiteVirt.CreateNotificationTarget:output_type -> litevirt.v1.NotificationTarget
-	265, // 649: litevirt.v1.LiteVirt.ListNotificationTargets:output_type -> litevirt.v1.ListNotificationTargetsResponse
-	559, // 650: litevirt.v1.LiteVirt.DeleteNotificationTarget:output_type -> google.protobuf.Empty
-	559, // 651: litevirt.v1.LiteVirt.TestNotificationTarget:output_type -> google.protobuf.Empty
-	552, // 652: litevirt.v1.LiteVirt.CreateNotificationRoute:output_type -> litevirt.v1.NotificationRoute
-	270, // 653: litevirt.v1.LiteVirt.ListNotificationRoutes:output_type -> litevirt.v1.ListNotificationRoutesResponse
-	559, // 654: litevirt.v1.LiteVirt.DeleteNotificationRoute:output_type -> google.protobuf.Empty
-	272, // 655: litevirt.v1.LiteVirt.SetRegistryCredential:output_type -> litevirt.v1.RegistryCredential
-	275, // 656: litevirt.v1.LiteVirt.ListRegistryCredentials:output_type -> litevirt.v1.ListRegistryCredentialsResponse
-	559, // 657: litevirt.v1.LiteVirt.DeleteRegistryCredential:output_type -> google.protobuf.Empty
-	553, // 658: litevirt.v1.LiteVirt.CreateClusterFirewallRule:output_type -> litevirt.v1.FirewallRule
-	279, // 659: litevirt.v1.LiteVirt.ListClusterFirewallRules:output_type -> litevirt.v1.ListClusterFirewallRulesResponse
-	559, // 660: litevirt.v1.LiteVirt.DeleteClusterFirewallRule:output_type -> google.protobuf.Empty
-	553, // 661: litevirt.v1.LiteVirt.CreateHostFirewallRule:output_type -> litevirt.v1.FirewallRule
-	283, // 662: litevirt.v1.LiteVirt.ListHostFirewallRules:output_type -> litevirt.v1.ListHostFirewallRulesResponse
-	559, // 663: litevirt.v1.LiteVirt.DeleteHostFirewallRule:output_type -> google.protobuf.Empty
-	554, // 664: litevirt.v1.LiteVirt.CreateIpSet:output_type -> litevirt.v1.IpSet
-	287, // 665: litevirt.v1.LiteVirt.ListIpSets:output_type -> litevirt.v1.ListIpSetsResponse
-	559, // 666: litevirt.v1.LiteVirt.DeleteIpSet:output_type -> google.protobuf.Empty
-	559, // 667: litevirt.v1.LiteVirt.SetFirewallDefault:output_type -> google.protobuf.Empty
-	291, // 668: litevirt.v1.LiteVirt.ListFirewallDefaults:output_type -> litevirt.v1.ListFirewallDefaultsResponse
-	557, // 669: litevirt.v1.LiteVirt.CreateSecurityGroup:output_type -> litevirt.v1.SecurityGroup
-	559, // 670: litevirt.v1.LiteVirt.DeleteSecurityGroup:output_type -> google.protobuf.Empty
-	556, // 671: litevirt.v1.LiteVirt.AddSecurityGroupRule:output_type -> litevirt.v1.SecurityGroupRule
-	559, // 672: litevirt.v1.LiteVirt.RemoveSecurityGroupRule:output_type -> google.protobuf.Empty
-	297, // 673: litevirt.v1.LiteVirt.ListSecurityGroups:output_type -> litevirt.v1.ListSecurityGroupsResponse
-	559, // 674: litevirt.v1.LiteVirt.DeleteStoragePoolContent:output_type -> google.protobuf.Empty
-	316, // 675: litevirt.v1.LiteVirt.ListISOs:output_type -> litevirt.v1.ListISOsResponse
-	318, // 676: litevirt.v1.LiteVirt.PullISO:output_type -> litevirt.v1.PullISOResponse
-	319, // 677: litevirt.v1.LiteVirt.GetISOLibraryMode:output_type -> litevirt.v1.ISOLibraryMode
-	319, // 678: litevirt.v1.LiteVirt.SetISOLibraryMode:output_type -> litevirt.v1.ISOLibraryMode
-	322, // 679: litevirt.v1.LiteVirt.FetchISOLibraryFile:output_type -> litevirt.v1.FetchISOLibraryFileChunk
-	324, // 680: litevirt.v1.LiteVirt.PushReplicaIncrement:output_type -> litevirt.v1.PushReplicaIncrementResponse
-	327, // 681: litevirt.v1.LiteVirt.ListReplicas:output_type -> litevirt.v1.ListReplicasResponse
-	312, // 682: litevirt.v1.LiteVirt.PushReplica:output_type -> litevirt.v1.PushReplicaResponse
-	329, // 683: litevirt.v1.LiteVirt.PruneReplicas:output_type -> litevirt.v1.PruneReplicasResponse
-	378, // 684: litevirt.v1.LiteVirt.Ping:output_type -> litevirt.v1.PingResponse
-	380, // 685: litevirt.v1.LiteVirt.Ready:output_type -> litevirt.v1.ReadyResponse
-	559, // 686: litevirt.v1.LiteVirt.ProvisionNetwork:output_type -> google.protobuf.Empty
-	559, // 687: litevirt.v1.LiteVirt.SyncVTEP:output_type -> google.protobuf.Empty
-	399, // 688: litevirt.v1.LiteVirt.GetVMIPRemote:output_type -> litevirt.v1.GetVMIPResponse
-	559, // 689: litevirt.v1.LiteVirt.RefreshLB:output_type -> google.protobuf.Empty
-	559, // 690: litevirt.v1.LiteVirt.UpdateFDB:output_type -> google.protobuf.Empty
-	559, // 691: litevirt.v1.LiteVirt.EnsureCloudInit:output_type -> google.protobuf.Empty
-	387, // 692: litevirt.v1.LiteVirt.EnsureDisks:output_type -> litevirt.v1.EnsureDisksResponse
-	389, // 693: litevirt.v1.LiteVirt.EnsureFirmwareState:output_type -> litevirt.v1.EnsureFirmwareStateResponse
-	391, // 694: litevirt.v1.LiteVirt.RollbackFirmwareState:output_type -> litevirt.v1.RollbackFirmwareStateResponse
-	559, // 695: litevirt.v1.LiteVirt.CleanupMigrationArtifacts:output_type -> google.protobuf.Empty
-	393, // 696: litevirt.v1.LiteVirt.ReceiveMigrationDisk:output_type -> litevirt.v1.ReceiveMigrationDiskResponse
-	395, // 697: litevirt.v1.LiteVirt.CheckCPUCompatibility:output_type -> litevirt.v1.CheckCPUCompatibilityResponse
-	403, // 698: litevirt.v1.LiteVirt.GetStateDigest:output_type -> litevirt.v1.StateDigestResponse
-	332, // 699: litevirt.v1.LiteVirt.AcknowledgeLeaseTermTie:output_type -> litevirt.v1.AcknowledgeLeaseTermTieResponse
-	334, // 700: litevirt.v1.LiteVirt.GetLeaseTermHighWater:output_type -> litevirt.v1.GetLeaseTermHighWaterResponse
-	407, // 701: litevirt.v1.LiteVirt.GetStateDump:output_type -> litevirt.v1.StateDumpResponse
-	408, // 702: litevirt.v1.LiteVirt.StreamStateDump:output_type -> litevirt.v1.StateDumpChunk
-	408, // 703: litevirt.v1.LiteVirt.StreamTableDump:output_type -> litevirt.v1.StateDumpChunk
-	403, // 704: litevirt.v1.LiteVirt.GetSensitiveStateDigest:output_type -> litevirt.v1.StateDigestResponse
-	408, // 705: litevirt.v1.LiteVirt.StreamSensitiveStateDump:output_type -> litevirt.v1.StateDumpChunk
-	416, // 706: litevirt.v1.LiteVirt.GetTableBucketDigests:output_type -> litevirt.v1.BucketDigestResponse
-	412, // 707: litevirt.v1.LiteVirt.StreamTableRows:output_type -> litevirt.v1.TableRowsPage
-	412, // 708: litevirt.v1.LiteVirt.StreamSensitiveTableRows:output_type -> litevirt.v1.TableRowsPage
-	405, // 709: litevirt.v1.LiteVirt.TriggerAntiEntropy:output_type -> litevirt.v1.TriggerAntiEntropyResponse
-	406, // 710: litevirt.v1.LiteVirt.GetClusterStateDigest:output_type -> litevirt.v1.ClusterStateDigestResponse
-	363, // 711: litevirt.v1.LiteVirt.PrepareRecoveryClaim:output_type -> litevirt.v1.PrepareRecoveryClaimResponse
-	365, // 712: litevirt.v1.LiteVirt.AcceptRecoveryClaim:output_type -> litevirt.v1.AcceptRecoveryClaimResponse
-	367, // 713: litevirt.v1.LiteVirt.GetRecoveryClaim:output_type -> litevirt.v1.GetRecoveryClaimResponse
-	369, // 714: litevirt.v1.LiteVirt.ListRecoveryClaims:output_type -> litevirt.v1.RecoveryClaimState
-	346, // 715: litevirt.v1.LiteVirt.AbandonRecoveryProof:output_type -> litevirt.v1.AbandonRecoveryProofResponse
-	345, // 716: litevirt.v1.LiteVirt.ReleaseLegacyHeldClaim:output_type -> litevirt.v1.ReleaseLegacyHeldClaimResponse
-	362, // 717: litevirt.v1.LiteVirt.PlanDeadHostRemoval:output_type -> litevirt.v1.PlanDeadHostRemovalResponse
-	351, // 718: litevirt.v1.LiteVirt.ForceReconfigureVoters:output_type -> litevirt.v1.ForceReconfigureVotersResponse
-	353, // 719: litevirt.v1.LiteVirt.SignForcedVoterConfig:output_type -> litevirt.v1.SignForcedVoterConfigResponse
-	361, // 720: litevirt.v1.LiteVirt.InspectRecoveryClaim:output_type -> litevirt.v1.InspectRecoveryClaimResponse
-	357, // 721: litevirt.v1.LiteVirt.ConfirmPartitionResume:output_type -> litevirt.v1.ConfirmPartitionResumeResponse
-	372, // 722: litevirt.v1.LiteVirt.GetVoterConfig:output_type -> litevirt.v1.GetVoterConfigResponse
-	374, // 723: litevirt.v1.LiteVirt.ChangeVoterConfig:output_type -> litevirt.v1.ChangeVoterConfigResponse
-	421, // 724: litevirt.v1.LiteVirt.DiagnoseDivergence:output_type -> litevirt.v1.DivergenceReport
-	424, // 725: litevirt.v1.LiteVirt.ScanSensitiveDivergence:output_type -> litevirt.v1.ScanSensitiveResponse
-	427, // 726: litevirt.v1.LiteVirt.PushMutations:output_type -> litevirt.v1.ReplicateResponse
-	559, // 727: litevirt.v1.LiteVirt.AckMutations:output_type -> google.protobuf.Empty
-	457, // 728: litevirt.v1.LiteVirt.ListRebalanceProposals:output_type -> litevirt.v1.ListRebalanceProposalsResponse
-	459, // 729: litevirt.v1.LiteVirt.RunRebalance:output_type -> litevirt.v1.RunRebalanceResponse
-	455, // 730: litevirt.v1.LiteVirt.ApproveRebalanceProposal:output_type -> litevirt.v1.RebalanceProposal
-	455, // 731: litevirt.v1.LiteVirt.RejectRebalanceProposal:output_type -> litevirt.v1.RebalanceProposal
-	454, // 732: litevirt.v1.LiteVirt.GetSpiceInfo:output_type -> litevirt.v1.GetSpiceInfoResponse
-	451, // 733: litevirt.v1.LiteVirt.PreflightUpgrade:output_type -> litevirt.v1.PreflightUpgradeResponse
-	463, // 734: litevirt.v1.LiteVirt.ListRegions:output_type -> litevirt.v1.ListRegionsResponse
-	465, // 735: litevirt.v1.LiteVirt.RegionStatus:output_type -> litevirt.v1.RegionStatusResponse
-	93,  // 736: litevirt.v1.LiteVirt.CrossRegionMigrate:output_type -> litevirt.v1.MigrateProgress
-	467, // 737: litevirt.v1.LiteVirt.GetFailoverScope:output_type -> litevirt.v1.FailoverScopeStatus
-	467, // 738: litevirt.v1.LiteVirt.SetFailoverScope:output_type -> litevirt.v1.FailoverScopeStatus
-	473, // 739: litevirt.v1.LiteVirt.RestoreRelay:output_type -> litevirt.v1.RestoreRelayResponse
-	472, // 740: litevirt.v1.LiteVirt.GetRelayHealth:output_type -> litevirt.v1.RelayHealthStatus
-	475, // 741: litevirt.v1.LiteVirt.UpsertServiceEndpoint:output_type -> litevirt.v1.ServiceEndpoint
-	478, // 742: litevirt.v1.LiteVirt.ListServiceEndpoints:output_type -> litevirt.v1.ListServiceEndpointsResponse
-	559, // 743: litevirt.v1.LiteVirt.DeleteServiceEndpoint:output_type -> google.protobuf.Empty
-	480, // 744: litevirt.v1.LiteVirt.CreateBackupSchedule:output_type -> litevirt.v1.BackupSchedule
-	483, // 745: litevirt.v1.LiteVirt.ListBackupSchedules:output_type -> litevirt.v1.ListBackupSchedulesResponse
-	559, // 746: litevirt.v1.LiteVirt.DeleteBackupSchedule:output_type -> google.protobuf.Empty
-	485, // 747: litevirt.v1.LiteVirt.CreateReplicationSchedule:output_type -> litevirt.v1.ReplicationSchedule
-	488, // 748: litevirt.v1.LiteVirt.ListReplicationSchedules:output_type -> litevirt.v1.ListReplicationSchedulesResponse
-	559, // 749: litevirt.v1.LiteVirt.DeleteReplicationSchedule:output_type -> google.protobuf.Empty
-	376, // 750: litevirt.v1.LiteVirt.PromoteReplica:output_type -> litevirt.v1.PromoteReplicaProgress
-	490, // 751: litevirt.v1.LiteVirt.VerifyAuditChain:output_type -> litevirt.v1.VerifyAuditChainResponse
-	494, // 752: litevirt.v1.LiteVirt.ExportAuditChain:output_type -> litevirt.v1.ExportAuditChainResponse
-	492, // 753: litevirt.v1.LiteVirt.RetireAuditKey:output_type -> litevirt.v1.RetireAuditKeyResponse
-	495, // 754: litevirt.v1.LiteVirt.CreateProject:output_type -> litevirt.v1.Project
-	497, // 755: litevirt.v1.LiteVirt.ListProjects:output_type -> litevirt.v1.ListProjectsResponse
-	495, // 756: litevirt.v1.LiteVirt.GetProject:output_type -> litevirt.v1.Project
-	559, // 757: litevirt.v1.LiteVirt.DeleteProject:output_type -> google.protobuf.Empty
-	500, // 758: litevirt.v1.LiteVirt.SetProjectQuota:output_type -> litevirt.v1.ProjectQuota
-	500, // 759: litevirt.v1.LiteVirt.GetProjectQuota:output_type -> litevirt.v1.ProjectQuota
-	503, // 760: litevirt.v1.LiteVirt.GetProjectUsage:output_type -> litevirt.v1.ProjectUsage
-	536, // 761: litevirt.v1.LiteVirt.ExecuteCreateVM:output_type -> litevirt.v1.VM
-	506, // 762: litevirt.v1.LiteVirt.ReserveProjectCapacity:output_type -> litevirt.v1.ReserveProjectCapacityResponse
-	559, // 763: litevirt.v1.LiteVirt.ReleaseProjectCapacity:output_type -> google.protobuf.Empty
-	509, // 764: litevirt.v1.LiteVirt.ReserveHostCapacity:output_type -> litevirt.v1.ReserveHostCapacityResponse
-	559, // 765: litevirt.v1.LiteVirt.ReleaseHostCapacity:output_type -> google.protobuf.Empty
-	516, // 766: litevirt.v1.LiteVirt.ImportLeftoverStatus:output_type -> litevirt.v1.ImportLeftoverStatusResponse
-	559, // 767: litevirt.v1.LiteVirt.PreflightRecreateVM:output_type -> google.protobuf.Empty
-	473, // [473:768] is the sub-list for method output_type
-	178, // [178:473] is the sub-list for method input_type
-	178, // [178:178] is the sub-list for extension type_name
-	178, // [178:178] is the sub-list for extension extendee
-	0,   // [0:178] is the sub-list for field type_name
+	534, // 78: litevirt.v1.ClusterStatus.hosts:type_name -> litevirt.v1.Host
+	551, // 79: litevirt.v1.ClusterStatus.recent_events:type_name -> litevirt.v1.ClusterEvent
+	254, // 80: litevirt.v1.ListAuditLogResponse.entries:type_name -> litevirt.v1.AuditEntry
+	257, // 81: litevirt.v1.ListVMEventsResponse.events:type_name -> litevirt.v1.VMEvent
+	552, // 82: litevirt.v1.ListResourceMappingsResponse.mappings:type_name -> litevirt.v1.ResourceMapping
+	553, // 83: litevirt.v1.ListNotificationTargetsResponse.targets:type_name -> litevirt.v1.NotificationTarget
+	554, // 84: litevirt.v1.ListNotificationRoutesResponse.routes:type_name -> litevirt.v1.NotificationRoute
+	274, // 85: litevirt.v1.ListRegistryCredentialsResponse.credentials:type_name -> litevirt.v1.RegistryCredential
+	555, // 86: litevirt.v1.CreateClusterFirewallRuleRequest.rule:type_name -> litevirt.v1.FirewallRule
+	555, // 87: litevirt.v1.ListClusterFirewallRulesResponse.rules:type_name -> litevirt.v1.FirewallRule
+	555, // 88: litevirt.v1.CreateHostFirewallRuleRequest.rule:type_name -> litevirt.v1.FirewallRule
+	555, // 89: litevirt.v1.ListHostFirewallRulesResponse.rules:type_name -> litevirt.v1.FirewallRule
+	556, // 90: litevirt.v1.ListIpSetsResponse.ipsets:type_name -> litevirt.v1.IpSet
+	557, // 91: litevirt.v1.ListFirewallDefaultsResponse.defaults:type_name -> litevirt.v1.FirewallDefault
+	558, // 92: litevirt.v1.AddSecurityGroupRuleRequest.rule:type_name -> litevirt.v1.SecurityGroupRule
+	559, // 93: litevirt.v1.ListSecurityGroupsResponse.groups:type_name -> litevirt.v1.SecurityGroup
+	558, // 94: litevirt.v1.ListSecurityGroupsResponse.rules:type_name -> litevirt.v1.SecurityGroupRule
+	560, // 95: litevirt.v1.ListStoragePoolsResponse.pools:type_name -> litevirt.v1.StoragePool
+	528, // 96: litevirt.v1.CreateStoragePoolRequest.options:type_name -> litevirt.v1.CreateStoragePoolRequest.OptionsEntry
+	560, // 97: litevirt.v1.CreateStoragePoolResponse.pool:type_name -> litevirt.v1.StoragePool
+	560, // 98: litevirt.v1.GetStoragePoolResponse.pool:type_name -> litevirt.v1.StoragePool
+	308, // 99: litevirt.v1.ListStoragePoolContentsResponse.contents:type_name -> litevirt.v1.StoragePoolContent
+	327, // 100: litevirt.v1.PushReplicaRequest.replica:type_name -> litevirt.v1.ReplicaRecord
+	316, // 101: litevirt.v1.ListISOsResponse.isos:type_name -> litevirt.v1.ISOEntry
+	327, // 102: litevirt.v1.PushReplicaIncrementRequest.replica:type_name -> litevirt.v1.ReplicaRecord
+	327, // 103: litevirt.v1.ListReplicasResponse.replicas:type_name -> litevirt.v1.ReplicaRecord
+	339, // 104: litevirt.v1.VoterConfigValue.members:type_name -> litevirt.v1.ClaimVoterMember
+	340, // 105: litevirt.v1.RecoveryClaimValue.voter_config:type_name -> litevirt.v1.VoterConfigValue
+	338, // 106: litevirt.v1.ClaimAccept.ballot:type_name -> litevirt.v1.ClaimBallot
+	337, // 107: litevirt.v1.ClaimAccept.key:type_name -> litevirt.v1.RecoveryClaimKey
+	337, // 108: litevirt.v1.PrepareRecoveryClaimRequest.key:type_name -> litevirt.v1.RecoveryClaimKey
+	338, // 109: litevirt.v1.PrepareRecoveryClaimRequest.ballot:type_name -> litevirt.v1.ClaimBallot
+	344, // 110: litevirt.v1.PrepareRecoveryClaimRequest.supersede:type_name -> litevirt.v1.RecoveryClaimSupersede
+	341, // 111: litevirt.v1.RecoveryClaimSupersede.prior_value:type_name -> litevirt.v1.RecoveryClaimValue
+	337, // 112: litevirt.v1.AbandonRecoveryProofRequest.key:type_name -> litevirt.v1.RecoveryClaimKey
+	352, // 113: litevirt.v1.ForceReconfigureVotersResponse.fences:type_name -> litevirt.v1.ForcedFenceEvidence
+	340, // 114: litevirt.v1.SignForcedVoterConfigRequest.value:type_name -> litevirt.v1.VoterConfigValue
+	352, // 115: litevirt.v1.SignForcedVoterConfigRequest.fences:type_name -> litevirt.v1.ForcedFenceEvidence
+	356, // 116: litevirt.v1.ConfirmPartitionResumeRequest.workloads:type_name -> litevirt.v1.PausedWorkload
+	358, // 117: litevirt.v1.ConfirmPartitionResumeResponse.views:type_name -> litevirt.v1.PausedWorkloadView
+	337, // 118: litevirt.v1.RecoveryClaimAttemptView.key:type_name -> litevirt.v1.RecoveryClaimKey
+	361, // 119: litevirt.v1.RecoveryClaimAttemptView.voters:type_name -> litevirt.v1.RecoveryClaimVoterView
+	362, // 120: litevirt.v1.InspectRecoveryClaimResponse.attempts:type_name -> litevirt.v1.RecoveryClaimAttemptView
+	350, // 121: litevirt.v1.PlanDeadHostRemovalResponse.stranded:type_name -> litevirt.v1.StrandedRecovery
+	338, // 122: litevirt.v1.PrepareRecoveryClaimResponse.promised_ballot:type_name -> litevirt.v1.ClaimBallot
+	338, // 123: litevirt.v1.PrepareRecoveryClaimResponse.accepted_ballot:type_name -> litevirt.v1.ClaimBallot
+	341, // 124: litevirt.v1.PrepareRecoveryClaimResponse.accepted_value:type_name -> litevirt.v1.RecoveryClaimValue
+	338, // 125: litevirt.v1.PrepareRecoveryClaimResponse.legacy_accepted_ballot:type_name -> litevirt.v1.ClaimBallot
+	341, // 126: litevirt.v1.PrepareRecoveryClaimResponse.legacy_accepted_value:type_name -> litevirt.v1.RecoveryClaimValue
+	337, // 127: litevirt.v1.AcceptRecoveryClaimRequest.key:type_name -> litevirt.v1.RecoveryClaimKey
+	338, // 128: litevirt.v1.AcceptRecoveryClaimRequest.ballot:type_name -> litevirt.v1.ClaimBallot
+	341, // 129: litevirt.v1.AcceptRecoveryClaimRequest.value:type_name -> litevirt.v1.RecoveryClaimValue
+	338, // 130: litevirt.v1.AcceptRecoveryClaimResponse.promised_ballot:type_name -> litevirt.v1.ClaimBallot
+	342, // 131: litevirt.v1.AcceptRecoveryClaimResponse.accept:type_name -> litevirt.v1.ClaimAccept
+	337, // 132: litevirt.v1.GetRecoveryClaimRequest.key:type_name -> litevirt.v1.RecoveryClaimKey
+	365, // 133: litevirt.v1.GetRecoveryClaimResponse.state:type_name -> litevirt.v1.PrepareRecoveryClaimResponse
+	342, // 134: litevirt.v1.GetRecoveryClaimResponse.accept:type_name -> litevirt.v1.ClaimAccept
+	342, // 135: litevirt.v1.GetRecoveryClaimResponse.reattested:type_name -> litevirt.v1.ClaimAccept
+	337, // 136: litevirt.v1.RecoveryClaimState.key:type_name -> litevirt.v1.RecoveryClaimKey
+	338, // 137: litevirt.v1.RecoveryClaimState.promised:type_name -> litevirt.v1.ClaimBallot
+	338, // 138: litevirt.v1.RecoveryClaimState.accepted:type_name -> litevirt.v1.ClaimBallot
+	341, // 139: litevirt.v1.RecoveryClaimState.value:type_name -> litevirt.v1.RecoveryClaimValue
+	373, // 140: litevirt.v1.GetVoterConfigResponse.members:type_name -> litevirt.v1.VoterMemberStatus
+	339, // 141: litevirt.v1.ChangeVoterConfigResponse.members:type_name -> litevirt.v1.ClaimVoterMember
+	332, // 142: litevirt.v1.PromoteReplicaRequest.proof:type_name -> litevirt.v1.RuntimeActionProof
+	10,  // 143: litevirt.v1.PromoteReplicaProgress.phase:type_name -> litevirt.v1.PromoteReplicaProgress.Phase
+	388, // 144: litevirt.v1.EnsureDisksRequest.disks:type_name -> litevirt.v1.DiskStub
+	529, // 145: litevirt.v1.EnsureDisksRequest.installer_iso_sha256:type_name -> litevirt.v1.EnsureDisksRequest.InstallerIsoSha256Entry
+	530, // 146: litevirt.v1.EnsureDisksResponse.installer_iso_resolved:type_name -> litevirt.v1.EnsureDisksResponse.InstallerIsoResolvedEntry
+	404, // 147: litevirt.v1.StateDigestResponse.tables:type_name -> litevirt.v1.TableDigest
+	405, // 148: litevirt.v1.ClusterStateDigestResponse.hosts:type_name -> litevirt.v1.StateDigestResponse
+	531, // 149: litevirt.v1.TableDumpRequest.buckets:type_name -> litevirt.v1.TableDumpRequest.BucketsEntry
+	532, // 150: litevirt.v1.SensitiveStateRequest.buckets:type_name -> litevirt.v1.SensitiveStateRequest.BucketsEntry
+	416, // 151: litevirt.v1.TableBucketDigests.buckets:type_name -> litevirt.v1.BucketDigest
+	417, // 152: litevirt.v1.BucketDigestResponse.tables:type_name -> litevirt.v1.TableBucketDigests
+	420, // 153: litevirt.v1.DivergenceRow.per_node:type_name -> litevirt.v1.NodeRowMeta
+	421, // 154: litevirt.v1.DivergenceReport.rows:type_name -> litevirt.v1.DivergenceRow
+	422, // 155: litevirt.v1.DivergenceReport.violations:type_name -> litevirt.v1.SemanticViolationPB
+	425, // 156: litevirt.v1.ScanSensitiveResponse.rows:type_name -> litevirt.v1.SensitiveRowMetaPB
+	427, // 157: litevirt.v1.ReplicateRequest.entries:type_name -> litevirt.v1.MutationEntry
+	41,  // 158: litevirt.v1.ExecuteCreateVMRequest.request:type_name -> litevirt.v1.CreateVMRequest
+	440, // 159: litevirt.v1.ListHostNetworksResponse.networks:type_name -> litevirt.v1.HostNetwork
+	440, // 160: litevirt.v1.UpsertHostNetworkRequest.network:type_name -> litevirt.v1.HostNetwork
+	533, // 161: litevirt.v1.PlanHostNetworkResponse.conflicts:type_name -> litevirt.v1.PlanHostNetworkResponse.ConflictsEntry
+	454, // 162: litevirt.v1.PreflightUpgradeResponse.findings:type_name -> litevirt.v1.PreflightFinding
+	457, // 163: litevirt.v1.ListRebalanceProposalsResponse.proposals:type_name -> litevirt.v1.RebalanceProposal
+	468, // 164: litevirt.v1.RegionStatusResponse.statuses:type_name -> litevirt.v1.RegionStatus
+	470, // 165: litevirt.v1.FailoverScopeStatus.regions:type_name -> litevirt.v1.FailoverScopeRegion
+	473, // 166: litevirt.v1.RelayHealthStatus.hosts:type_name -> litevirt.v1.RelayHealthEntry
+	477, // 167: litevirt.v1.ListServiceEndpointsResponse.endpoints:type_name -> litevirt.v1.ServiceEndpoint
+	482, // 168: litevirt.v1.ListBackupSchedulesResponse.schedules:type_name -> litevirt.v1.BackupSchedule
+	487, // 169: litevirt.v1.ListReplicationSchedulesResponse.schedules:type_name -> litevirt.v1.ReplicationSchedule
+	497, // 170: litevirt.v1.ListProjectsResponse.projects:type_name -> litevirt.v1.Project
+	502, // 171: litevirt.v1.SetProjectQuotaRequest.quota:type_name -> litevirt.v1.ProjectQuota
+	513, // 172: litevirt.v1.FenceReadiness.hosts:type_name -> litevirt.v1.FenceHostPosture
+	515, // 173: litevirt.v1.FenceReadiness.recent_fences:type_name -> litevirt.v1.FenceEvent
+	513, // 174: litevirt.v1.FenceReadiness.recovery_claim_hosts:type_name -> litevirt.v1.FenceHostPosture
+	516, // 175: litevirt.v1.ImportLeftoverStatusRequest.files:type_name -> litevirt.v1.ImportLeftoverFile
+	537, // 176: litevirt.v1.PreflightRecreateVMRequest.spec:type_name -> litevirt.v1.VMSpec
+	412, // 177: litevirt.v1.TableDumpRequest.BucketsEntry.value:type_name -> litevirt.v1.BucketSet
+	412, // 178: litevirt.v1.SensitiveStateRequest.BucketsEntry.value:type_name -> litevirt.v1.BucketSet
+	11,  // 179: litevirt.v1.LiteVirt.ListHosts:input_type -> litevirt.v1.ListHostsRequest
+	13,  // 180: litevirt.v1.LiteVirt.InspectHost:input_type -> litevirt.v1.InspectHostRequest
+	14,  // 181: litevirt.v1.LiteVirt.DrainHost:input_type -> litevirt.v1.DrainHostRequest
+	17,  // 182: litevirt.v1.LiteVirt.ShutdownHostWorkloads:input_type -> litevirt.v1.ShutdownHostWorkloadsRequest
+	16,  // 183: litevirt.v1.LiteVirt.UndrainHost:input_type -> litevirt.v1.UndrainHostRequest
+	19,  // 184: litevirt.v1.LiteVirt.SetHostLabels:input_type -> litevirt.v1.SetHostLabelsRequest
+	20,  // 185: litevirt.v1.LiteVirt.FenceHost:input_type -> litevirt.v1.FenceHostRequest
+	27,  // 186: litevirt.v1.LiteVirt.GetClusterHealth:input_type -> litevirt.v1.GetClusterHealthRequest
+	561, // 187: litevirt.v1.LiteVirt.GetFenceReadiness:input_type -> google.protobuf.Empty
+	21,  // 188: litevirt.v1.LiteVirt.RemoveHost:input_type -> litevirt.v1.RemoveHostRequest
+	438, // 189: litevirt.v1.LiteVirt.AdmitHost:input_type -> litevirt.v1.AdmitHostRequest
+	441, // 190: litevirt.v1.LiteVirt.ListHostNetworks:input_type -> litevirt.v1.ListHostNetworksRequest
+	443, // 191: litevirt.v1.LiteVirt.UpsertHostNetwork:input_type -> litevirt.v1.UpsertHostNetworkRequest
+	444, // 192: litevirt.v1.LiteVirt.PlanHostNetwork:input_type -> litevirt.v1.PlanHostNetworkRequest
+	446, // 193: litevirt.v1.LiteVirt.ApplyHostNetwork:input_type -> litevirt.v1.ApplyHostNetworkRequest
+	447, // 194: litevirt.v1.LiteVirt.DeleteHostNetwork:input_type -> litevirt.v1.DeleteHostNetworkRequest
+	448, // 195: litevirt.v1.LiteVirt.IsolateHost:input_type -> litevirt.v1.IsolateHostRequest
+	450, // 196: litevirt.v1.LiteVirt.ReseedHost:input_type -> litevirt.v1.ReseedHostRequest
+	22,  // 197: litevirt.v1.LiteVirt.PublishCRL:input_type -> litevirt.v1.PublishCRLRequest
+	24,  // 198: litevirt.v1.LiteVirt.RevokeReplacedCertificate:input_type -> litevirt.v1.RevokeReplacedCertificateRequest
+	33,  // 199: litevirt.v1.LiteVirt.RescanHost:input_type -> litevirt.v1.RescanHostRequest
+	35,  // 200: litevirt.v1.LiteVirt.ListHostDevices:input_type -> litevirt.v1.ListHostDevicesRequest
+	37,  // 201: litevirt.v1.LiteVirt.SupersededDisks:input_type -> litevirt.v1.SupersededDisksRequest
+	433, // 202: litevirt.v1.LiteVirt.UpgradeHost:input_type -> litevirt.v1.UpgradeHostRequest
+	433, // 203: litevirt.v1.LiteVirt.PreStageUpgrade:input_type -> litevirt.v1.UpgradeHostRequest
+	383, // 204: litevirt.v1.LiteVirt.FetchBinary:input_type -> litevirt.v1.FetchBinaryRequest
+	435, // 205: litevirt.v1.LiteVirt.UninstallHost:input_type -> litevirt.v1.UninstallHostRequest
+	40,  // 206: litevirt.v1.LiteVirt.ConfigureHost:input_type -> litevirt.v1.ConfigureHostRequest
+	41,  // 207: litevirt.v1.LiteVirt.CreateVM:input_type -> litevirt.v1.CreateVMRequest
+	42,  // 208: litevirt.v1.LiteVirt.ListVMs:input_type -> litevirt.v1.ListVMsRequest
+	44,  // 209: litevirt.v1.LiteVirt.InspectVM:input_type -> litevirt.v1.InspectVMRequest
+	45,  // 210: litevirt.v1.LiteVirt.ListVMHardware:input_type -> litevirt.v1.ListVMHardwareRequest
+	47,  // 211: litevirt.v1.LiteVirt.StartVM:input_type -> litevirt.v1.StartVMRequest
+	48,  // 212: litevirt.v1.LiteVirt.StopVM:input_type -> litevirt.v1.StopVMRequest
+	49,  // 213: litevirt.v1.LiteVirt.RestartVM:input_type -> litevirt.v1.RestartVMRequest
+	50,  // 214: litevirt.v1.LiteVirt.DeleteVM:input_type -> litevirt.v1.DeleteVMRequest
+	51,  // 215: litevirt.v1.LiteVirt.RepairVMOwner:input_type -> litevirt.v1.RepairVMOwnerRequest
+	59,  // 216: litevirt.v1.LiteVirt.GetRuntimeInventory:input_type -> litevirt.v1.GetRuntimeInventoryRequest
+	62,  // 217: litevirt.v1.LiteVirt.CollectOrphanProof:input_type -> litevirt.v1.OrphanProofRequest
+	561, // 218: litevirt.v1.LiteVirt.GetMembershipView:input_type -> google.protobuf.Empty
+	53,  // 219: litevirt.v1.LiteVirt.CheckVIPParticipant:input_type -> litevirt.v1.CheckVIPParticipantRequest
+	55,  // 220: litevirt.v1.LiteVirt.RelayCheckVIPParticipant:input_type -> litevirt.v1.RelayCheckVIPParticipantRequest
+	57,  // 221: litevirt.v1.LiteVirt.CheckLBPresent:input_type -> litevirt.v1.CheckLBPresentRequest
+	68,  // 222: litevirt.v1.LiteVirt.CloneVM:input_type -> litevirt.v1.CloneVMRequest
+	69,  // 223: litevirt.v1.LiteVirt.ConvertToTemplate:input_type -> litevirt.v1.ConvertToTemplateRequest
+	70,  // 224: litevirt.v1.LiteVirt.ExecVM:input_type -> litevirt.v1.ExecVMRequest
+	72,  // 225: litevirt.v1.LiteVirt.ConsoleVM:input_type -> litevirt.v1.ConsoleInput
+	74,  // 226: litevirt.v1.LiteVirt.SetVMIP:input_type -> litevirt.v1.SetVMIPRequest
+	75,  // 227: litevirt.v1.LiteVirt.SetBootOrder:input_type -> litevirt.v1.SetBootOrderRequest
+	76,  // 228: litevirt.v1.LiteVirt.RebuildVM:input_type -> litevirt.v1.RebuildVMRequest
+	77,  // 229: litevirt.v1.LiteVirt.CutoverVM:input_type -> litevirt.v1.CutoverVMRequest
+	78,  // 230: litevirt.v1.LiteVirt.UpdateVM:input_type -> litevirt.v1.UpdateVMRequest
+	79,  // 231: litevirt.v1.LiteVirt.SetVMMemory:input_type -> litevirt.v1.SetVMMemoryRequest
+	80,  // 232: litevirt.v1.LiteVirt.SetVMLabels:input_type -> litevirt.v1.SetVMLabelsRequest
+	562, // 233: litevirt.v1.LiteVirt.AttachDevice:input_type -> litevirt.v1.AttachDeviceRequest
+	563, // 234: litevirt.v1.LiteVirt.DetachDevice:input_type -> litevirt.v1.DetachDeviceRequest
+	81,  // 235: litevirt.v1.LiteVirt.ResizeDisk:input_type -> litevirt.v1.ResizeDiskRequest
+	82,  // 236: litevirt.v1.LiteVirt.ProxyVNC:input_type -> litevirt.v1.VNCData
+	431, // 237: litevirt.v1.LiteVirt.GetVMLogs:input_type -> litevirt.v1.GetVMLogsRequest
+	83,  // 238: litevirt.v1.LiteVirt.DeployStack:input_type -> litevirt.v1.DeployStackRequest
+	85,  // 239: litevirt.v1.LiteVirt.DeleteStack:input_type -> litevirt.v1.DeleteStackRequest
+	561, // 240: litevirt.v1.LiteVirt.ListStacks:input_type -> google.protobuf.Empty
+	89,  // 241: litevirt.v1.LiteVirt.DiffStack:input_type -> litevirt.v1.DiffStackRequest
+	92,  // 242: litevirt.v1.LiteVirt.ExportStack:input_type -> litevirt.v1.ExportStackRequest
+	94,  // 243: litevirt.v1.LiteVirt.MigrateVM:input_type -> litevirt.v1.MigrateVMRequest
+	96,  // 244: litevirt.v1.LiteVirt.MoveVolume:input_type -> litevirt.v1.MoveVolumeRequest
+	98,  // 245: litevirt.v1.LiteVirt.ReplicateVolume:input_type -> litevirt.v1.ReplicateVolumeRequest
+	100, // 246: litevirt.v1.LiteVirt.MigrateStackVolumes:input_type -> litevirt.v1.MigrateStackVolumesRequest
+	103, // 247: litevirt.v1.LiteVirt.PullImage:input_type -> litevirt.v1.PullImageRequest
+	561, // 248: litevirt.v1.LiteVirt.ListImages:input_type -> google.protobuf.Empty
+	106, // 249: litevirt.v1.LiteVirt.DeleteImage:input_type -> litevirt.v1.DeleteImageRequest
+	107, // 250: litevirt.v1.LiteVirt.ImportImage:input_type -> litevirt.v1.ImportImageRequest
+	109, // 251: litevirt.v1.LiteVirt.PushImage:input_type -> litevirt.v1.PushImageRequest
+	113, // 252: litevirt.v1.LiteVirt.BuildImage:input_type -> litevirt.v1.BuildImageRequest
+	110, // 253: litevirt.v1.LiteVirt.PruneImages:input_type -> litevirt.v1.PruneImagesRequest
+	115, // 254: litevirt.v1.LiteVirt.BackupVM:input_type -> litevirt.v1.BackupVMRequest
+	117, // 255: litevirt.v1.LiteVirt.RestoreVM:input_type -> litevirt.v1.RestoreVMRequest
+	118, // 256: litevirt.v1.LiteVirt.ImportVM:input_type -> litevirt.v1.ImportVMRequest
+	120, // 257: litevirt.v1.LiteVirt.CreateSnapshot:input_type -> litevirt.v1.CreateSnapshotRequest
+	121, // 258: litevirt.v1.LiteVirt.ListSnapshots:input_type -> litevirt.v1.ListSnapshotsRequest
+	123, // 259: litevirt.v1.LiteVirt.RestoreSnapshot:input_type -> litevirt.v1.RestoreSnapshotRequest
+	124, // 260: litevirt.v1.LiteVirt.DeleteSnapshot:input_type -> litevirt.v1.DeleteSnapshotRequest
+	125, // 261: litevirt.v1.LiteVirt.CreateNetwork:input_type -> litevirt.v1.CreateNetworkRequest
+	126, // 262: litevirt.v1.LiteVirt.GetNetwork:input_type -> litevirt.v1.GetNetworkRequest
+	127, // 263: litevirt.v1.LiteVirt.DeleteNetwork:input_type -> litevirt.v1.DeleteNetworkRequest
+	561, // 264: litevirt.v1.LiteVirt.ListNetworks:input_type -> google.protobuf.Empty
+	66,  // 265: litevirt.v1.LiteVirt.RekeyBinding:input_type -> litevirt.v1.RekeyBindingRequest
+	67,  // 266: litevirt.v1.LiteVirt.ResumeBinding:input_type -> litevirt.v1.ResumeBindingRequest
+	561, // 267: litevirt.v1.LiteVirt.ListLoadBalancers:input_type -> google.protobuf.Empty
+	131, // 268: litevirt.v1.LiteVirt.InspectLoadBalancer:input_type -> litevirt.v1.InspectLBRequest
+	136, // 269: litevirt.v1.LiteVirt.CreateLoadBalancer:input_type -> litevirt.v1.CreateLBRequest
+	137, // 270: litevirt.v1.LiteVirt.UpdateLoadBalancer:input_type -> litevirt.v1.UpdateLBRequest
+	138, // 271: litevirt.v1.LiteVirt.DeleteLoadBalancer:input_type -> litevirt.v1.DeleteLBRequest
+	139, // 272: litevirt.v1.LiteVirt.LBStats:input_type -> litevirt.v1.LBStatsRequest
+	140, // 273: litevirt.v1.LiteVirt.DrainBackend:input_type -> litevirt.v1.DrainBackendRequest
+	132, // 274: litevirt.v1.LiteVirt.DisableBackend:input_type -> litevirt.v1.DisableBackendRequest
+	133, // 275: litevirt.v1.LiteVirt.EnableBackend:input_type -> litevirt.v1.EnableBackendRequest
+	134, // 276: litevirt.v1.LiteVirt.ApplyLB:input_type -> litevirt.v1.ApplyLBRequest
+	135, // 277: litevirt.v1.LiteVirt.RemoveLB:input_type -> litevirt.v1.RemoveLBRequest
+	564, // 278: litevirt.v1.LiteVirt.LBKeepalivedRunning:input_type -> litevirt.v1.LBKeepalivedRequest
+	142, // 279: litevirt.v1.LiteVirt.Login:input_type -> litevirt.v1.LoginRequest
+	561, // 280: litevirt.v1.LiteVirt.ListRealms:input_type -> google.protobuf.Empty
+	561, // 281: litevirt.v1.LiteVirt.Logout:input_type -> google.protobuf.Empty
+	216, // 282: litevirt.v1.LiteVirt.ListSessions:input_type -> litevirt.v1.ListSessionsRequest
+	218, // 283: litevirt.v1.LiteVirt.RevokeSession:input_type -> litevirt.v1.RevokeSessionRequest
+	145, // 284: litevirt.v1.LiteVirt.CreateUser:input_type -> litevirt.v1.CreateUserRequest
+	561, // 285: litevirt.v1.LiteVirt.ListUsers:input_type -> google.protobuf.Empty
+	147, // 286: litevirt.v1.LiteVirt.DeleteUser:input_type -> litevirt.v1.DeleteUserRequest
+	153, // 287: litevirt.v1.LiteVirt.CreateToken:input_type -> litevirt.v1.CreateTokenRequest
+	154, // 288: litevirt.v1.LiteVirt.RevokeToken:input_type -> litevirt.v1.RevokeTokenRequest
+	561, // 289: litevirt.v1.LiteVirt.Whoami:input_type -> google.protobuf.Empty
+	149, // 290: litevirt.v1.LiteVirt.CheckPermissions:input_type -> litevirt.v1.CheckPermissionsRequest
+	151, // 291: litevirt.v1.LiteVirt.ChangePassword:input_type -> litevirt.v1.ChangePasswordRequest
+	152, // 292: litevirt.v1.LiteVirt.ResetAdminPassword:input_type -> litevirt.v1.ResetAdminPasswordRequest
+	220, // 293: litevirt.v1.LiteVirt.ListTwoFactors:input_type -> litevirt.v1.ListTwoFactorsRequest
+	222, // 294: litevirt.v1.LiteVirt.EnrollTOTP:input_type -> litevirt.v1.EnrollTOTPRequest
+	224, // 295: litevirt.v1.LiteVirt.DisableTwoFactor:input_type -> litevirt.v1.DisableTwoFactorRequest
+	226, // 296: litevirt.v1.LiteVirt.GrantRole:input_type -> litevirt.v1.GrantRoleRequest
+	228, // 297: litevirt.v1.LiteVirt.RevokeRole:input_type -> litevirt.v1.RevokeRoleRequest
+	230, // 298: litevirt.v1.LiteVirt.ListRoleBindings:input_type -> litevirt.v1.ListRoleBindingsRequest
+	232, // 299: litevirt.v1.LiteVirt.NormalizeRoleBindings:input_type -> litevirt.v1.NormalizeRoleBindingsRequest
+	234, // 300: litevirt.v1.LiteVirt.GetVMOperation:input_type -> litevirt.v1.GetVMOperationRequest
+	237, // 301: litevirt.v1.LiteVirt.AbortVMOperation:input_type -> litevirt.v1.AbortVMOperationRequest
+	241, // 302: litevirt.v1.LiteVirt.BeginWebAuthnRegistration:input_type -> litevirt.v1.BeginWebAuthnRegistrationRequest
+	243, // 303: litevirt.v1.LiteVirt.FinishWebAuthnRegistration:input_type -> litevirt.v1.FinishWebAuthnRegistrationRequest
+	245, // 304: litevirt.v1.LiteVirt.BeginWebAuthnLogin:input_type -> litevirt.v1.BeginWebAuthnLoginRequest
+	247, // 305: litevirt.v1.LiteVirt.FinishWebAuthnLogin:input_type -> litevirt.v1.FinishWebAuthnLoginRequest
+	239, // 306: litevirt.v1.LiteVirt.RestoreLive:input_type -> litevirt.v1.RestoreLiveRequest
+	214, // 307: litevirt.v1.LiteVirt.BindSecurityGroups:input_type -> litevirt.v1.BindSecurityGroupsRequest
+	561, // 308: litevirt.v1.LiteVirt.ReloadFirewall:input_type -> google.protobuf.Empty
+	155, // 309: litevirt.v1.LiteVirt.BackupSnapshot:input_type -> litevirt.v1.BackupSnapshotRequest
+	165, // 310: litevirt.v1.LiteVirt.RestoreFromBackup:input_type -> litevirt.v1.RestoreFromBackupRequest
+	158, // 311: litevirt.v1.LiteVirt.HasChunks:input_type -> litevirt.v1.HasChunksRequest
+	160, // 312: litevirt.v1.LiteVirt.PushBackup:input_type -> litevirt.v1.PushBackupFrame
+	167, // 313: litevirt.v1.LiteVirt.VerifyBackupRepo:input_type -> litevirt.v1.VerifyBackupRepoRequest
+	169, // 314: litevirt.v1.LiteVirt.GarbageCollectBackupRepo:input_type -> litevirt.v1.GarbageCollectBackupRepoRequest
+	174, // 315: litevirt.v1.LiteVirt.PruneBackupRepo:input_type -> litevirt.v1.PruneBackupRepoRequest
+	176, // 316: litevirt.v1.LiteVirt.SyncBackupRepo:input_type -> litevirt.v1.SyncBackupRepoRequest
+	172, // 317: litevirt.v1.LiteVirt.ListBackupRepoSnapshots:input_type -> litevirt.v1.ListBackupRepoSnapshotsRequest
+	180, // 318: litevirt.v1.LiteVirt.CreateContainer:input_type -> litevirt.v1.CreateContainerRequest
+	183, // 319: litevirt.v1.LiteVirt.StartContainer:input_type -> litevirt.v1.StartContainerRequest
+	184, // 320: litevirt.v1.LiteVirt.StopContainer:input_type -> litevirt.v1.StopContainerRequest
+	185, // 321: litevirt.v1.LiteVirt.DeleteContainer:input_type -> litevirt.v1.DeleteContainerRequest
+	186, // 322: litevirt.v1.LiteVirt.ExecContainer:input_type -> litevirt.v1.ExecContainerRequest
+	188, // 323: litevirt.v1.LiteVirt.ListContainers:input_type -> litevirt.v1.ListContainersRequest
+	198, // 324: litevirt.v1.LiteVirt.InspectContainer:input_type -> litevirt.v1.InspectContainerRequest
+	201, // 325: litevirt.v1.LiteVirt.ProbeContainerBackups:input_type -> litevirt.v1.ProbeContainerBackupsRequest
+	190, // 326: litevirt.v1.LiteVirt.PullOCIImage:input_type -> litevirt.v1.PullOCIImageRequest
+	191, // 327: litevirt.v1.LiteVirt.BackupContainer:input_type -> litevirt.v1.BackupContainerRequest
+	193, // 328: litevirt.v1.LiteVirt.RestoreContainer:input_type -> litevirt.v1.RestoreContainerRequest
+	195, // 329: litevirt.v1.LiteVirt.MigrateContainer:input_type -> litevirt.v1.MigrateContainerRequest
+	206, // 330: litevirt.v1.LiteVirt.SnapshotContainer:input_type -> litevirt.v1.SnapshotContainerRequest
+	207, // 331: litevirt.v1.LiteVirt.ListContainerSnapshots:input_type -> litevirt.v1.ListContainerSnapshotsRequest
+	209, // 332: litevirt.v1.LiteVirt.RevertContainerSnapshot:input_type -> litevirt.v1.RevertContainerSnapshotRequest
+	210, // 333: litevirt.v1.LiteVirt.DeleteContainerSnapshot:input_type -> litevirt.v1.DeleteContainerSnapshotRequest
+	211, // 334: litevirt.v1.LiteVirt.ConvertContainerToTemplate:input_type -> litevirt.v1.ConvertContainerToTemplateRequest
+	212, // 335: litevirt.v1.LiteVirt.CloneContainer:input_type -> litevirt.v1.CloneContainerRequest
+	182, // 336: litevirt.v1.LiteVirt.ConvertContainer:input_type -> litevirt.v1.ConvertContainerRequest
+	181, // 337: litevirt.v1.LiteVirt.PrepareContainerTarget:input_type -> litevirt.v1.PrepareContainerTargetRequest
+	249, // 338: litevirt.v1.LiteVirt.GetVMStats:input_type -> litevirt.v1.GetVMStatsRequest
+	250, // 339: litevirt.v1.LiteVirt.GetHostStats:input_type -> litevirt.v1.GetHostStatsRequest
+	561, // 340: litevirt.v1.LiteVirt.GetClusterStatus:input_type -> google.protobuf.Empty
+	252, // 341: litevirt.v1.LiteVirt.StreamEvents:input_type -> litevirt.v1.StreamEventsRequest
+	253, // 342: litevirt.v1.LiteVirt.ListAuditLog:input_type -> litevirt.v1.ListAuditLogRequest
+	256, // 343: litevirt.v1.LiteVirt.ListVMEvents:input_type -> litevirt.v1.ListVMEventsRequest
+	300, // 344: litevirt.v1.LiteVirt.ListStoragePools:input_type -> litevirt.v1.ListStoragePoolsRequest
+	302, // 345: litevirt.v1.LiteVirt.CreateStoragePool:input_type -> litevirt.v1.CreateStoragePoolRequest
+	304, // 346: litevirt.v1.LiteVirt.DeleteStoragePool:input_type -> litevirt.v1.DeleteStoragePoolRequest
+	306, // 347: litevirt.v1.LiteVirt.GetStoragePool:input_type -> litevirt.v1.GetStoragePoolRequest
+	309, // 348: litevirt.v1.LiteVirt.ListStoragePoolContents:input_type -> litevirt.v1.ListStoragePoolContentsRequest
+	311, // 349: litevirt.v1.LiteVirt.UploadStoragePoolContent:input_type -> litevirt.v1.UploadStoragePoolContentRequest
+	259, // 350: litevirt.v1.LiteVirt.CreateResourceMapping:input_type -> litevirt.v1.CreateResourceMappingRequest
+	260, // 351: litevirt.v1.LiteVirt.ListResourceMappings:input_type -> litevirt.v1.ListResourceMappingsRequest
+	262, // 352: litevirt.v1.LiteVirt.DeleteResourceMapping:input_type -> litevirt.v1.DeleteResourceMappingRequest
+	263, // 353: litevirt.v1.LiteVirt.AddMappingDevice:input_type -> litevirt.v1.AddMappingDeviceRequest
+	264, // 354: litevirt.v1.LiteVirt.RemoveMappingDevice:input_type -> litevirt.v1.RemoveMappingDeviceRequest
+	265, // 355: litevirt.v1.LiteVirt.CreateNotificationTarget:input_type -> litevirt.v1.CreateNotificationTargetRequest
+	266, // 356: litevirt.v1.LiteVirt.ListNotificationTargets:input_type -> litevirt.v1.ListNotificationTargetsRequest
+	268, // 357: litevirt.v1.LiteVirt.DeleteNotificationTarget:input_type -> litevirt.v1.DeleteNotificationTargetRequest
+	269, // 358: litevirt.v1.LiteVirt.TestNotificationTarget:input_type -> litevirt.v1.TestNotificationTargetRequest
+	270, // 359: litevirt.v1.LiteVirt.CreateNotificationRoute:input_type -> litevirt.v1.CreateNotificationRouteRequest
+	271, // 360: litevirt.v1.LiteVirt.ListNotificationRoutes:input_type -> litevirt.v1.ListNotificationRoutesRequest
+	273, // 361: litevirt.v1.LiteVirt.DeleteNotificationRoute:input_type -> litevirt.v1.DeleteNotificationRouteRequest
+	275, // 362: litevirt.v1.LiteVirt.SetRegistryCredential:input_type -> litevirt.v1.SetRegistryCredentialRequest
+	276, // 363: litevirt.v1.LiteVirt.ListRegistryCredentials:input_type -> litevirt.v1.ListRegistryCredentialsRequest
+	278, // 364: litevirt.v1.LiteVirt.DeleteRegistryCredential:input_type -> litevirt.v1.DeleteRegistryCredentialRequest
+	279, // 365: litevirt.v1.LiteVirt.CreateClusterFirewallRule:input_type -> litevirt.v1.CreateClusterFirewallRuleRequest
+	280, // 366: litevirt.v1.LiteVirt.ListClusterFirewallRules:input_type -> litevirt.v1.ListClusterFirewallRulesRequest
+	282, // 367: litevirt.v1.LiteVirt.DeleteClusterFirewallRule:input_type -> litevirt.v1.DeleteClusterFirewallRuleRequest
+	283, // 368: litevirt.v1.LiteVirt.CreateHostFirewallRule:input_type -> litevirt.v1.CreateHostFirewallRuleRequest
+	284, // 369: litevirt.v1.LiteVirt.ListHostFirewallRules:input_type -> litevirt.v1.ListHostFirewallRulesRequest
+	286, // 370: litevirt.v1.LiteVirt.DeleteHostFirewallRule:input_type -> litevirt.v1.DeleteHostFirewallRuleRequest
+	287, // 371: litevirt.v1.LiteVirt.CreateIpSet:input_type -> litevirt.v1.CreateIpSetRequest
+	288, // 372: litevirt.v1.LiteVirt.ListIpSets:input_type -> litevirt.v1.ListIpSetsRequest
+	290, // 373: litevirt.v1.LiteVirt.DeleteIpSet:input_type -> litevirt.v1.DeleteIpSetRequest
+	291, // 374: litevirt.v1.LiteVirt.SetFirewallDefault:input_type -> litevirt.v1.SetFirewallDefaultRequest
+	292, // 375: litevirt.v1.LiteVirt.ListFirewallDefaults:input_type -> litevirt.v1.ListFirewallDefaultsRequest
+	294, // 376: litevirt.v1.LiteVirt.CreateSecurityGroup:input_type -> litevirt.v1.CreateSecurityGroupRequest
+	295, // 377: litevirt.v1.LiteVirt.DeleteSecurityGroup:input_type -> litevirt.v1.DeleteSecurityGroupRequest
+	296, // 378: litevirt.v1.LiteVirt.AddSecurityGroupRule:input_type -> litevirt.v1.AddSecurityGroupRuleRequest
+	297, // 379: litevirt.v1.LiteVirt.RemoveSecurityGroupRule:input_type -> litevirt.v1.RemoveSecurityGroupRuleRequest
+	298, // 380: litevirt.v1.LiteVirt.ListSecurityGroups:input_type -> litevirt.v1.ListSecurityGroupsRequest
+	315, // 381: litevirt.v1.LiteVirt.DeleteStoragePoolContent:input_type -> litevirt.v1.DeleteStoragePoolContentRequest
+	317, // 382: litevirt.v1.LiteVirt.ListISOs:input_type -> litevirt.v1.ListISOsRequest
+	319, // 383: litevirt.v1.LiteVirt.PullISO:input_type -> litevirt.v1.PullISORequest
+	561, // 384: litevirt.v1.LiteVirt.GetISOLibraryMode:input_type -> google.protobuf.Empty
+	322, // 385: litevirt.v1.LiteVirt.SetISOLibraryMode:input_type -> litevirt.v1.SetISOLibraryModeRequest
+	323, // 386: litevirt.v1.LiteVirt.FetchISOLibraryFile:input_type -> litevirt.v1.FetchISOLibraryFileRequest
+	325, // 387: litevirt.v1.LiteVirt.PushReplicaIncrement:input_type -> litevirt.v1.PushReplicaIncrementRequest
+	328, // 388: litevirt.v1.LiteVirt.ListReplicas:input_type -> litevirt.v1.ListReplicasRequest
+	313, // 389: litevirt.v1.LiteVirt.PushReplica:input_type -> litevirt.v1.PushReplicaRequest
+	330, // 390: litevirt.v1.LiteVirt.PruneReplicas:input_type -> litevirt.v1.PruneReplicasRequest
+	379, // 391: litevirt.v1.LiteVirt.Ping:input_type -> litevirt.v1.PingRequest
+	381, // 392: litevirt.v1.LiteVirt.Ready:input_type -> litevirt.v1.ReadyRequest
+	385, // 393: litevirt.v1.LiteVirt.ProvisionNetwork:input_type -> litevirt.v1.ProvisionNetworkRequest
+	399, // 394: litevirt.v1.LiteVirt.SyncVTEP:input_type -> litevirt.v1.SyncVTEPRequest
+	400, // 395: litevirt.v1.LiteVirt.GetVMIPRemote:input_type -> litevirt.v1.GetVMIPRequest
+	402, // 396: litevirt.v1.LiteVirt.RefreshLB:input_type -> litevirt.v1.RefreshLBRequest
+	403, // 397: litevirt.v1.LiteVirt.UpdateFDB:input_type -> litevirt.v1.UpdateFDBRequest
+	386, // 398: litevirt.v1.LiteVirt.EnsureCloudInit:input_type -> litevirt.v1.EnsureCloudInitRequest
+	387, // 399: litevirt.v1.LiteVirt.EnsureDisks:input_type -> litevirt.v1.EnsureDisksRequest
+	390, // 400: litevirt.v1.LiteVirt.EnsureFirmwareState:input_type -> litevirt.v1.EnsureFirmwareStateRequest
+	392, // 401: litevirt.v1.LiteVirt.RollbackFirmwareState:input_type -> litevirt.v1.RollbackFirmwareStateRequest
+	398, // 402: litevirt.v1.LiteVirt.CleanupMigrationArtifacts:input_type -> litevirt.v1.CleanupMigrationArtifactsRequest
+	394, // 403: litevirt.v1.LiteVirt.ReceiveMigrationDisk:input_type -> litevirt.v1.ReceiveMigrationDiskRequest
+	396, // 404: litevirt.v1.LiteVirt.CheckCPUCompatibility:input_type -> litevirt.v1.CheckCPUCompatibilityRequest
+	561, // 405: litevirt.v1.LiteVirt.GetStateDigest:input_type -> google.protobuf.Empty
+	333, // 406: litevirt.v1.LiteVirt.AcknowledgeLeaseTermTie:input_type -> litevirt.v1.AcknowledgeLeaseTermTieRequest
+	335, // 407: litevirt.v1.LiteVirt.GetLeaseTermHighWater:input_type -> litevirt.v1.GetLeaseTermHighWaterRequest
+	561, // 408: litevirt.v1.LiteVirt.GetStateDump:input_type -> google.protobuf.Empty
+	561, // 409: litevirt.v1.LiteVirt.StreamStateDump:input_type -> google.protobuf.Empty
+	411, // 410: litevirt.v1.LiteVirt.StreamTableDump:input_type -> litevirt.v1.TableDumpRequest
+	413, // 411: litevirt.v1.LiteVirt.GetSensitiveStateDigest:input_type -> litevirt.v1.SensitiveStateRequest
+	413, // 412: litevirt.v1.LiteVirt.StreamSensitiveStateDump:input_type -> litevirt.v1.SensitiveStateRequest
+	415, // 413: litevirt.v1.LiteVirt.GetTableBucketDigests:input_type -> litevirt.v1.BucketDigestRequest
+	411, // 414: litevirt.v1.LiteVirt.StreamTableRows:input_type -> litevirt.v1.TableDumpRequest
+	413, // 415: litevirt.v1.LiteVirt.StreamSensitiveTableRows:input_type -> litevirt.v1.SensitiveStateRequest
+	406, // 416: litevirt.v1.LiteVirt.TriggerAntiEntropy:input_type -> litevirt.v1.TriggerAntiEntropyRequest
+	561, // 417: litevirt.v1.LiteVirt.GetClusterStateDigest:input_type -> google.protobuf.Empty
+	343, // 418: litevirt.v1.LiteVirt.PrepareRecoveryClaim:input_type -> litevirt.v1.PrepareRecoveryClaimRequest
+	366, // 419: litevirt.v1.LiteVirt.AcceptRecoveryClaim:input_type -> litevirt.v1.AcceptRecoveryClaimRequest
+	368, // 420: litevirt.v1.LiteVirt.GetRecoveryClaim:input_type -> litevirt.v1.GetRecoveryClaimRequest
+	370, // 421: litevirt.v1.LiteVirt.ListRecoveryClaims:input_type -> litevirt.v1.ListRecoveryClaimsRequest
+	345, // 422: litevirt.v1.LiteVirt.AbandonRecoveryProof:input_type -> litevirt.v1.AbandonRecoveryProofRequest
+	346, // 423: litevirt.v1.LiteVirt.ReleaseLegacyHeldClaim:input_type -> litevirt.v1.ReleaseLegacyHeldClaimRequest
+	349, // 424: litevirt.v1.LiteVirt.PlanDeadHostRemoval:input_type -> litevirt.v1.PlanDeadHostRemovalRequest
+	351, // 425: litevirt.v1.LiteVirt.ForceReconfigureVoters:input_type -> litevirt.v1.ForceReconfigureVotersRequest
+	354, // 426: litevirt.v1.LiteVirt.SignForcedVoterConfig:input_type -> litevirt.v1.SignForcedVoterConfigRequest
+	360, // 427: litevirt.v1.LiteVirt.InspectRecoveryClaim:input_type -> litevirt.v1.InspectRecoveryClaimRequest
+	357, // 428: litevirt.v1.LiteVirt.ConfirmPartitionResume:input_type -> litevirt.v1.ConfirmPartitionResumeRequest
+	372, // 429: litevirt.v1.LiteVirt.GetVoterConfig:input_type -> litevirt.v1.GetVoterConfigRequest
+	375, // 430: litevirt.v1.LiteVirt.ChangeVoterConfig:input_type -> litevirt.v1.ChangeVoterConfigRequest
+	419, // 431: litevirt.v1.LiteVirt.DiagnoseDivergence:input_type -> litevirt.v1.DiagnoseDivergenceRequest
+	424, // 432: litevirt.v1.LiteVirt.ScanSensitiveDivergence:input_type -> litevirt.v1.ScanSensitiveRequest
+	428, // 433: litevirt.v1.LiteVirt.PushMutations:input_type -> litevirt.v1.ReplicateRequest
+	430, // 434: litevirt.v1.LiteVirt.AckMutations:input_type -> litevirt.v1.AckRequest
+	458, // 435: litevirt.v1.LiteVirt.ListRebalanceProposals:input_type -> litevirt.v1.ListRebalanceProposalsRequest
+	460, // 436: litevirt.v1.LiteVirt.RunRebalance:input_type -> litevirt.v1.RunRebalanceRequest
+	462, // 437: litevirt.v1.LiteVirt.ApproveRebalanceProposal:input_type -> litevirt.v1.ApproveRebalanceProposalRequest
+	463, // 438: litevirt.v1.LiteVirt.RejectRebalanceProposal:input_type -> litevirt.v1.RejectRebalanceProposalRequest
+	455, // 439: litevirt.v1.LiteVirt.GetSpiceInfo:input_type -> litevirt.v1.GetSpiceInfoRequest
+	452, // 440: litevirt.v1.LiteVirt.PreflightUpgrade:input_type -> litevirt.v1.PreflightUpgradeRequest
+	464, // 441: litevirt.v1.LiteVirt.ListRegions:input_type -> litevirt.v1.ListRegionsRequest
+	466, // 442: litevirt.v1.LiteVirt.RegionStatus:input_type -> litevirt.v1.RegionStatusRequest
+	476, // 443: litevirt.v1.LiteVirt.CrossRegionMigrate:input_type -> litevirt.v1.CrossRegionMigrateRequest
+	561, // 444: litevirt.v1.LiteVirt.GetFailoverScope:input_type -> google.protobuf.Empty
+	471, // 445: litevirt.v1.LiteVirt.SetFailoverScope:input_type -> litevirt.v1.SetFailoverScopeRequest
+	472, // 446: litevirt.v1.LiteVirt.RestoreRelay:input_type -> litevirt.v1.RestoreRelayRequest
+	561, // 447: litevirt.v1.LiteVirt.GetRelayHealth:input_type -> google.protobuf.Empty
+	478, // 448: litevirt.v1.LiteVirt.UpsertServiceEndpoint:input_type -> litevirt.v1.UpsertServiceEndpointRequest
+	479, // 449: litevirt.v1.LiteVirt.ListServiceEndpoints:input_type -> litevirt.v1.ListServiceEndpointsRequest
+	481, // 450: litevirt.v1.LiteVirt.DeleteServiceEndpoint:input_type -> litevirt.v1.DeleteServiceEndpointRequest
+	483, // 451: litevirt.v1.LiteVirt.CreateBackupSchedule:input_type -> litevirt.v1.CreateBackupScheduleRequest
+	484, // 452: litevirt.v1.LiteVirt.ListBackupSchedules:input_type -> litevirt.v1.ListBackupSchedulesRequest
+	486, // 453: litevirt.v1.LiteVirt.DeleteBackupSchedule:input_type -> litevirt.v1.DeleteBackupScheduleRequest
+	488, // 454: litevirt.v1.LiteVirt.CreateReplicationSchedule:input_type -> litevirt.v1.CreateReplicationScheduleRequest
+	489, // 455: litevirt.v1.LiteVirt.ListReplicationSchedules:input_type -> litevirt.v1.ListReplicationSchedulesRequest
+	491, // 456: litevirt.v1.LiteVirt.DeleteReplicationSchedule:input_type -> litevirt.v1.DeleteReplicationScheduleRequest
+	377, // 457: litevirt.v1.LiteVirt.PromoteReplica:input_type -> litevirt.v1.PromoteReplicaRequest
+	561, // 458: litevirt.v1.LiteVirt.VerifyAuditChain:input_type -> google.protobuf.Empty
+	495, // 459: litevirt.v1.LiteVirt.ExportAuditChain:input_type -> litevirt.v1.ExportAuditChainRequest
+	493, // 460: litevirt.v1.LiteVirt.RetireAuditKey:input_type -> litevirt.v1.RetireAuditKeyRequest
+	498, // 461: litevirt.v1.LiteVirt.CreateProject:input_type -> litevirt.v1.CreateProjectRequest
+	561, // 462: litevirt.v1.LiteVirt.ListProjects:input_type -> google.protobuf.Empty
+	500, // 463: litevirt.v1.LiteVirt.GetProject:input_type -> litevirt.v1.GetProjectRequest
+	501, // 464: litevirt.v1.LiteVirt.DeleteProject:input_type -> litevirt.v1.DeleteProjectRequest
+	503, // 465: litevirt.v1.LiteVirt.SetProjectQuota:input_type -> litevirt.v1.SetProjectQuotaRequest
+	504, // 466: litevirt.v1.LiteVirt.GetProjectQuota:input_type -> litevirt.v1.GetProjectQuotaRequest
+	506, // 467: litevirt.v1.LiteVirt.GetProjectUsage:input_type -> litevirt.v1.GetProjectUsageRequest
+	437, // 468: litevirt.v1.LiteVirt.ExecuteCreateVM:input_type -> litevirt.v1.ExecuteCreateVMRequest
+	507, // 469: litevirt.v1.LiteVirt.ReserveProjectCapacity:input_type -> litevirt.v1.ReserveProjectCapacityRequest
+	509, // 470: litevirt.v1.LiteVirt.ReleaseProjectCapacity:input_type -> litevirt.v1.ReleaseProjectCapacityRequest
+	510, // 471: litevirt.v1.LiteVirt.ReserveHostCapacity:input_type -> litevirt.v1.ReserveHostCapacityRequest
+	512, // 472: litevirt.v1.LiteVirt.ReleaseHostCapacity:input_type -> litevirt.v1.ReleaseHostCapacityRequest
+	517, // 473: litevirt.v1.LiteVirt.ImportLeftoverStatus:input_type -> litevirt.v1.ImportLeftoverStatusRequest
+	519, // 474: litevirt.v1.LiteVirt.PreflightRecreateVM:input_type -> litevirt.v1.PreflightRecreateVMRequest
+	12,  // 475: litevirt.v1.LiteVirt.ListHosts:output_type -> litevirt.v1.ListHostsResponse
+	534, // 476: litevirt.v1.LiteVirt.InspectHost:output_type -> litevirt.v1.Host
+	15,  // 477: litevirt.v1.LiteVirt.DrainHost:output_type -> litevirt.v1.DrainProgress
+	18,  // 478: litevirt.v1.LiteVirt.ShutdownHostWorkloads:output_type -> litevirt.v1.ShutdownProgress
+	534, // 479: litevirt.v1.LiteVirt.UndrainHost:output_type -> litevirt.v1.Host
+	534, // 480: litevirt.v1.LiteVirt.SetHostLabels:output_type -> litevirt.v1.Host
+	26,  // 481: litevirt.v1.LiteVirt.FenceHost:output_type -> litevirt.v1.FenceResult
+	32,  // 482: litevirt.v1.LiteVirt.GetClusterHealth:output_type -> litevirt.v1.ClusterHealth
+	514, // 483: litevirt.v1.LiteVirt.GetFenceReadiness:output_type -> litevirt.v1.FenceReadiness
+	561, // 484: litevirt.v1.LiteVirt.RemoveHost:output_type -> google.protobuf.Empty
+	439, // 485: litevirt.v1.LiteVirt.AdmitHost:output_type -> litevirt.v1.AdmitHostResponse
+	442, // 486: litevirt.v1.LiteVirt.ListHostNetworks:output_type -> litevirt.v1.ListHostNetworksResponse
+	440, // 487: litevirt.v1.LiteVirt.UpsertHostNetwork:output_type -> litevirt.v1.HostNetwork
+	445, // 488: litevirt.v1.LiteVirt.PlanHostNetwork:output_type -> litevirt.v1.PlanHostNetworkResponse
+	561, // 489: litevirt.v1.LiteVirt.ApplyHostNetwork:output_type -> google.protobuf.Empty
+	561, // 490: litevirt.v1.LiteVirt.DeleteHostNetwork:output_type -> google.protobuf.Empty
+	449, // 491: litevirt.v1.LiteVirt.IsolateHost:output_type -> litevirt.v1.HostIsolationStatus
+	451, // 492: litevirt.v1.LiteVirt.ReseedHost:output_type -> litevirt.v1.ReseedHostResponse
+	23,  // 493: litevirt.v1.LiteVirt.PublishCRL:output_type -> litevirt.v1.PublishCRLResponse
+	25,  // 494: litevirt.v1.LiteVirt.RevokeReplacedCertificate:output_type -> litevirt.v1.RevokeReplacedCertificateResponse
+	34,  // 495: litevirt.v1.LiteVirt.RescanHost:output_type -> litevirt.v1.RescanHostResponse
+	36,  // 496: litevirt.v1.LiteVirt.ListHostDevices:output_type -> litevirt.v1.ListHostDevicesResponse
+	39,  // 497: litevirt.v1.LiteVirt.SupersededDisks:output_type -> litevirt.v1.SupersededDisksResponse
+	434, // 498: litevirt.v1.LiteVirt.UpgradeHost:output_type -> litevirt.v1.UpgradeHostResponse
+	434, // 499: litevirt.v1.LiteVirt.PreStageUpgrade:output_type -> litevirt.v1.UpgradeHostResponse
+	384, // 500: litevirt.v1.LiteVirt.FetchBinary:output_type -> litevirt.v1.FetchBinaryChunk
+	436, // 501: litevirt.v1.LiteVirt.UninstallHost:output_type -> litevirt.v1.UninstallHostResponse
+	534, // 502: litevirt.v1.LiteVirt.ConfigureHost:output_type -> litevirt.v1.Host
+	538, // 503: litevirt.v1.LiteVirt.CreateVM:output_type -> litevirt.v1.VM
+	43,  // 504: litevirt.v1.LiteVirt.ListVMs:output_type -> litevirt.v1.ListVMsResponse
+	538, // 505: litevirt.v1.LiteVirt.InspectVM:output_type -> litevirt.v1.VM
+	46,  // 506: litevirt.v1.LiteVirt.ListVMHardware:output_type -> litevirt.v1.ListVMHardwareResponse
+	538, // 507: litevirt.v1.LiteVirt.StartVM:output_type -> litevirt.v1.VM
+	538, // 508: litevirt.v1.LiteVirt.StopVM:output_type -> litevirt.v1.VM
+	538, // 509: litevirt.v1.LiteVirt.RestartVM:output_type -> litevirt.v1.VM
+	561, // 510: litevirt.v1.LiteVirt.DeleteVM:output_type -> google.protobuf.Empty
+	52,  // 511: litevirt.v1.LiteVirt.RepairVMOwner:output_type -> litevirt.v1.RepairVMOwnerResponse
+	61,  // 512: litevirt.v1.LiteVirt.GetRuntimeInventory:output_type -> litevirt.v1.RuntimeInventory
+	63,  // 513: litevirt.v1.LiteVirt.CollectOrphanProof:output_type -> litevirt.v1.OrphanProofResponse
+	65,  // 514: litevirt.v1.LiteVirt.GetMembershipView:output_type -> litevirt.v1.MembershipViewResponse
+	54,  // 515: litevirt.v1.LiteVirt.CheckVIPParticipant:output_type -> litevirt.v1.CheckVIPParticipantResponse
+	56,  // 516: litevirt.v1.LiteVirt.RelayCheckVIPParticipant:output_type -> litevirt.v1.RelayCheckVIPParticipantResponse
+	58,  // 517: litevirt.v1.LiteVirt.CheckLBPresent:output_type -> litevirt.v1.CheckLBPresentResponse
+	538, // 518: litevirt.v1.LiteVirt.CloneVM:output_type -> litevirt.v1.VM
+	538, // 519: litevirt.v1.LiteVirt.ConvertToTemplate:output_type -> litevirt.v1.VM
+	71,  // 520: litevirt.v1.LiteVirt.ExecVM:output_type -> litevirt.v1.ExecVMResponse
+	73,  // 521: litevirt.v1.LiteVirt.ConsoleVM:output_type -> litevirt.v1.ConsoleOutput
+	538, // 522: litevirt.v1.LiteVirt.SetVMIP:output_type -> litevirt.v1.VM
+	538, // 523: litevirt.v1.LiteVirt.SetBootOrder:output_type -> litevirt.v1.VM
+	538, // 524: litevirt.v1.LiteVirt.RebuildVM:output_type -> litevirt.v1.VM
+	538, // 525: litevirt.v1.LiteVirt.CutoverVM:output_type -> litevirt.v1.VM
+	538, // 526: litevirt.v1.LiteVirt.UpdateVM:output_type -> litevirt.v1.VM
+	538, // 527: litevirt.v1.LiteVirt.SetVMMemory:output_type -> litevirt.v1.VM
+	538, // 528: litevirt.v1.LiteVirt.SetVMLabels:output_type -> litevirt.v1.VM
+	538, // 529: litevirt.v1.LiteVirt.AttachDevice:output_type -> litevirt.v1.VM
+	538, // 530: litevirt.v1.LiteVirt.DetachDevice:output_type -> litevirt.v1.VM
+	538, // 531: litevirt.v1.LiteVirt.ResizeDisk:output_type -> litevirt.v1.VM
+	82,  // 532: litevirt.v1.LiteVirt.ProxyVNC:output_type -> litevirt.v1.VNCData
+	432, // 533: litevirt.v1.LiteVirt.GetVMLogs:output_type -> litevirt.v1.VMLogChunk
+	84,  // 534: litevirt.v1.LiteVirt.DeployStack:output_type -> litevirt.v1.DeployProgress
+	86,  // 535: litevirt.v1.LiteVirt.DeleteStack:output_type -> litevirt.v1.DeleteProgress
+	87,  // 536: litevirt.v1.LiteVirt.ListStacks:output_type -> litevirt.v1.ListStacksResponse
+	90,  // 537: litevirt.v1.LiteVirt.DiffStack:output_type -> litevirt.v1.DiffStackResponse
+	93,  // 538: litevirt.v1.LiteVirt.ExportStack:output_type -> litevirt.v1.ExportStackResponse
+	95,  // 539: litevirt.v1.LiteVirt.MigrateVM:output_type -> litevirt.v1.MigrateProgress
+	97,  // 540: litevirt.v1.LiteVirt.MoveVolume:output_type -> litevirt.v1.MoveVolumeProgress
+	99,  // 541: litevirt.v1.LiteVirt.ReplicateVolume:output_type -> litevirt.v1.ReplicateVolumeProgress
+	102, // 542: litevirt.v1.LiteVirt.MigrateStackVolumes:output_type -> litevirt.v1.StackVolumeProgress
+	104, // 543: litevirt.v1.LiteVirt.PullImage:output_type -> litevirt.v1.PullProgress
+	105, // 544: litevirt.v1.LiteVirt.ListImages:output_type -> litevirt.v1.ListImagesResponse
+	561, // 545: litevirt.v1.LiteVirt.DeleteImage:output_type -> google.protobuf.Empty
+	108, // 546: litevirt.v1.LiteVirt.ImportImage:output_type -> litevirt.v1.ImportImageResponse
+	112, // 547: litevirt.v1.LiteVirt.PushImage:output_type -> litevirt.v1.PushImageProgress
+	114, // 548: litevirt.v1.LiteVirt.BuildImage:output_type -> litevirt.v1.BuildImageResponse
+	111, // 549: litevirt.v1.LiteVirt.PruneImages:output_type -> litevirt.v1.PruneImagesResponse
+	116, // 550: litevirt.v1.LiteVirt.BackupVM:output_type -> litevirt.v1.BackupChunk
+	538, // 551: litevirt.v1.LiteVirt.RestoreVM:output_type -> litevirt.v1.VM
+	119, // 552: litevirt.v1.LiteVirt.ImportVM:output_type -> litevirt.v1.ImportVMProgress
+	545, // 553: litevirt.v1.LiteVirt.CreateSnapshot:output_type -> litevirt.v1.Snapshot
+	122, // 554: litevirt.v1.LiteVirt.ListSnapshots:output_type -> litevirt.v1.ListSnapshotsResponse
+	538, // 555: litevirt.v1.LiteVirt.RestoreSnapshot:output_type -> litevirt.v1.VM
+	561, // 556: litevirt.v1.LiteVirt.DeleteSnapshot:output_type -> google.protobuf.Empty
+	129, // 557: litevirt.v1.LiteVirt.CreateNetwork:output_type -> litevirt.v1.NetworkInfo
+	129, // 558: litevirt.v1.LiteVirt.GetNetwork:output_type -> litevirt.v1.NetworkInfo
+	561, // 559: litevirt.v1.LiteVirt.DeleteNetwork:output_type -> google.protobuf.Empty
+	128, // 560: litevirt.v1.LiteVirt.ListNetworks:output_type -> litevirt.v1.ListNetworksResponse
+	561, // 561: litevirt.v1.LiteVirt.RekeyBinding:output_type -> google.protobuf.Empty
+	561, // 562: litevirt.v1.LiteVirt.ResumeBinding:output_type -> google.protobuf.Empty
+	130, // 563: litevirt.v1.LiteVirt.ListLoadBalancers:output_type -> litevirt.v1.ListLBResponse
+	546, // 564: litevirt.v1.LiteVirt.InspectLoadBalancer:output_type -> litevirt.v1.LoadBalancer
+	546, // 565: litevirt.v1.LiteVirt.CreateLoadBalancer:output_type -> litevirt.v1.LoadBalancer
+	546, // 566: litevirt.v1.LiteVirt.UpdateLoadBalancer:output_type -> litevirt.v1.LoadBalancer
+	561, // 567: litevirt.v1.LiteVirt.DeleteLoadBalancer:output_type -> google.protobuf.Empty
+	565, // 568: litevirt.v1.LiteVirt.LBStats:output_type -> litevirt.v1.LBStatsResponse
+	141, // 569: litevirt.v1.LiteVirt.DrainBackend:output_type -> litevirt.v1.DrainBackendResponse
+	546, // 570: litevirt.v1.LiteVirt.DisableBackend:output_type -> litevirt.v1.LoadBalancer
+	546, // 571: litevirt.v1.LiteVirt.EnableBackend:output_type -> litevirt.v1.LoadBalancer
+	561, // 572: litevirt.v1.LiteVirt.ApplyLB:output_type -> google.protobuf.Empty
+	561, // 573: litevirt.v1.LiteVirt.RemoveLB:output_type -> google.protobuf.Empty
+	566, // 574: litevirt.v1.LiteVirt.LBKeepalivedRunning:output_type -> litevirt.v1.LBKeepalivedResponse
+	143, // 575: litevirt.v1.LiteVirt.Login:output_type -> litevirt.v1.LoginResponse
+	144, // 576: litevirt.v1.LiteVirt.ListRealms:output_type -> litevirt.v1.ListRealmsResponse
+	561, // 577: litevirt.v1.LiteVirt.Logout:output_type -> google.protobuf.Empty
+	217, // 578: litevirt.v1.LiteVirt.ListSessions:output_type -> litevirt.v1.ListSessionsResponse
+	561, // 579: litevirt.v1.LiteVirt.RevokeSession:output_type -> google.protobuf.Empty
+	550, // 580: litevirt.v1.LiteVirt.CreateUser:output_type -> litevirt.v1.User
+	146, // 581: litevirt.v1.LiteVirt.ListUsers:output_type -> litevirt.v1.ListUsersResponse
+	561, // 582: litevirt.v1.LiteVirt.DeleteUser:output_type -> google.protobuf.Empty
+	567, // 583: litevirt.v1.LiteVirt.CreateToken:output_type -> litevirt.v1.Token
+	561, // 584: litevirt.v1.LiteVirt.RevokeToken:output_type -> google.protobuf.Empty
+	148, // 585: litevirt.v1.LiteVirt.Whoami:output_type -> litevirt.v1.WhoamiResponse
+	150, // 586: litevirt.v1.LiteVirt.CheckPermissions:output_type -> litevirt.v1.CheckPermissionsResponse
+	561, // 587: litevirt.v1.LiteVirt.ChangePassword:output_type -> google.protobuf.Empty
+	561, // 588: litevirt.v1.LiteVirt.ResetAdminPassword:output_type -> google.protobuf.Empty
+	221, // 589: litevirt.v1.LiteVirt.ListTwoFactors:output_type -> litevirt.v1.ListTwoFactorsResponse
+	223, // 590: litevirt.v1.LiteVirt.EnrollTOTP:output_type -> litevirt.v1.EnrollTOTPResponse
+	561, // 591: litevirt.v1.LiteVirt.DisableTwoFactor:output_type -> google.protobuf.Empty
+	227, // 592: litevirt.v1.LiteVirt.GrantRole:output_type -> litevirt.v1.GrantRoleResponse
+	229, // 593: litevirt.v1.LiteVirt.RevokeRole:output_type -> litevirt.v1.RevokeRoleResponse
+	231, // 594: litevirt.v1.LiteVirt.ListRoleBindings:output_type -> litevirt.v1.ListRoleBindingsResponse
+	233, // 595: litevirt.v1.LiteVirt.NormalizeRoleBindings:output_type -> litevirt.v1.NormalizeRoleBindingsResponse
+	236, // 596: litevirt.v1.LiteVirt.GetVMOperation:output_type -> litevirt.v1.GetVMOperationResponse
+	238, // 597: litevirt.v1.LiteVirt.AbortVMOperation:output_type -> litevirt.v1.AbortVMOperationResponse
+	242, // 598: litevirt.v1.LiteVirt.BeginWebAuthnRegistration:output_type -> litevirt.v1.BeginWebAuthnRegistrationResponse
+	244, // 599: litevirt.v1.LiteVirt.FinishWebAuthnRegistration:output_type -> litevirt.v1.FinishWebAuthnRegistrationResponse
+	246, // 600: litevirt.v1.LiteVirt.BeginWebAuthnLogin:output_type -> litevirt.v1.BeginWebAuthnLoginResponse
+	248, // 601: litevirt.v1.LiteVirt.FinishWebAuthnLogin:output_type -> litevirt.v1.FinishWebAuthnLoginResponse
+	240, // 602: litevirt.v1.LiteVirt.RestoreLive:output_type -> litevirt.v1.RestoreLiveProgress
+	561, // 603: litevirt.v1.LiteVirt.BindSecurityGroups:output_type -> google.protobuf.Empty
+	213, // 604: litevirt.v1.LiteVirt.ReloadFirewall:output_type -> litevirt.v1.FirewallStatus
+	156, // 605: litevirt.v1.LiteVirt.BackupSnapshot:output_type -> litevirt.v1.BackupSnapshotProgress
+	166, // 606: litevirt.v1.LiteVirt.RestoreFromBackup:output_type -> litevirt.v1.RestoreFromBackupProgress
+	159, // 607: litevirt.v1.LiteVirt.HasChunks:output_type -> litevirt.v1.HasChunksResponse
+	164, // 608: litevirt.v1.LiteVirt.PushBackup:output_type -> litevirt.v1.PushBackupResponse
+	168, // 609: litevirt.v1.LiteVirt.VerifyBackupRepo:output_type -> litevirt.v1.VerifyBackupRepoResponse
+	170, // 610: litevirt.v1.LiteVirt.GarbageCollectBackupRepo:output_type -> litevirt.v1.GarbageCollectBackupRepoResponse
+	175, // 611: litevirt.v1.LiteVirt.PruneBackupRepo:output_type -> litevirt.v1.PruneBackupRepoResponse
+	177, // 612: litevirt.v1.LiteVirt.SyncBackupRepo:output_type -> litevirt.v1.SyncBackupRepoResponse
+	173, // 613: litevirt.v1.LiteVirt.ListBackupRepoSnapshots:output_type -> litevirt.v1.ListBackupRepoSnapshotsResponse
+	178, // 614: litevirt.v1.LiteVirt.CreateContainer:output_type -> litevirt.v1.Container
+	561, // 615: litevirt.v1.LiteVirt.StartContainer:output_type -> google.protobuf.Empty
+	561, // 616: litevirt.v1.LiteVirt.StopContainer:output_type -> google.protobuf.Empty
+	561, // 617: litevirt.v1.LiteVirt.DeleteContainer:output_type -> google.protobuf.Empty
+	187, // 618: litevirt.v1.LiteVirt.ExecContainer:output_type -> litevirt.v1.ExecContainerResponse
+	189, // 619: litevirt.v1.LiteVirt.ListContainers:output_type -> litevirt.v1.ListContainersResponse
+	204, // 620: litevirt.v1.LiteVirt.InspectContainer:output_type -> litevirt.v1.ContainerDetail
+	203, // 621: litevirt.v1.LiteVirt.ProbeContainerBackups:output_type -> litevirt.v1.ProbeContainerBackupsResponse
+	561, // 622: litevirt.v1.LiteVirt.PullOCIImage:output_type -> google.protobuf.Empty
+	192, // 623: litevirt.v1.LiteVirt.BackupContainer:output_type -> litevirt.v1.BackupContainerProgress
+	194, // 624: litevirt.v1.LiteVirt.RestoreContainer:output_type -> litevirt.v1.RestoreContainerProgress
+	196, // 625: litevirt.v1.LiteVirt.MigrateContainer:output_type -> litevirt.v1.MigrateContainerProgress
+	197, // 626: litevirt.v1.LiteVirt.SnapshotContainer:output_type -> litevirt.v1.ContainerSnapshot
+	208, // 627: litevirt.v1.LiteVirt.ListContainerSnapshots:output_type -> litevirt.v1.ListContainerSnapshotsResponse
+	561, // 628: litevirt.v1.LiteVirt.RevertContainerSnapshot:output_type -> google.protobuf.Empty
+	561, // 629: litevirt.v1.LiteVirt.DeleteContainerSnapshot:output_type -> google.protobuf.Empty
+	178, // 630: litevirt.v1.LiteVirt.ConvertContainerToTemplate:output_type -> litevirt.v1.Container
+	178, // 631: litevirt.v1.LiteVirt.CloneContainer:output_type -> litevirt.v1.Container
+	178, // 632: litevirt.v1.LiteVirt.ConvertContainer:output_type -> litevirt.v1.Container
+	561, // 633: litevirt.v1.LiteVirt.PrepareContainerTarget:output_type -> google.protobuf.Empty
+	568, // 634: litevirt.v1.LiteVirt.GetVMStats:output_type -> litevirt.v1.VMStats
+	569, // 635: litevirt.v1.LiteVirt.GetHostStats:output_type -> litevirt.v1.HostResourceStats
+	251, // 636: litevirt.v1.LiteVirt.GetClusterStatus:output_type -> litevirt.v1.ClusterStatus
+	551, // 637: litevirt.v1.LiteVirt.StreamEvents:output_type -> litevirt.v1.ClusterEvent
+	255, // 638: litevirt.v1.LiteVirt.ListAuditLog:output_type -> litevirt.v1.ListAuditLogResponse
+	258, // 639: litevirt.v1.LiteVirt.ListVMEvents:output_type -> litevirt.v1.ListVMEventsResponse
+	301, // 640: litevirt.v1.LiteVirt.ListStoragePools:output_type -> litevirt.v1.ListStoragePoolsResponse
+	303, // 641: litevirt.v1.LiteVirt.CreateStoragePool:output_type -> litevirt.v1.CreateStoragePoolResponse
+	305, // 642: litevirt.v1.LiteVirt.DeleteStoragePool:output_type -> litevirt.v1.DeleteStoragePoolResponse
+	307, // 643: litevirt.v1.LiteVirt.GetStoragePool:output_type -> litevirt.v1.GetStoragePoolResponse
+	310, // 644: litevirt.v1.LiteVirt.ListStoragePoolContents:output_type -> litevirt.v1.ListStoragePoolContentsResponse
+	312, // 645: litevirt.v1.LiteVirt.UploadStoragePoolContent:output_type -> litevirt.v1.UploadStoragePoolContentResponse
+	552, // 646: litevirt.v1.LiteVirt.CreateResourceMapping:output_type -> litevirt.v1.ResourceMapping
+	261, // 647: litevirt.v1.LiteVirt.ListResourceMappings:output_type -> litevirt.v1.ListResourceMappingsResponse
+	561, // 648: litevirt.v1.LiteVirt.DeleteResourceMapping:output_type -> google.protobuf.Empty
+	552, // 649: litevirt.v1.LiteVirt.AddMappingDevice:output_type -> litevirt.v1.ResourceMapping
+	552, // 650: litevirt.v1.LiteVirt.RemoveMappingDevice:output_type -> litevirt.v1.ResourceMapping
+	553, // 651: litevirt.v1.LiteVirt.CreateNotificationTarget:output_type -> litevirt.v1.NotificationTarget
+	267, // 652: litevirt.v1.LiteVirt.ListNotificationTargets:output_type -> litevirt.v1.ListNotificationTargetsResponse
+	561, // 653: litevirt.v1.LiteVirt.DeleteNotificationTarget:output_type -> google.protobuf.Empty
+	561, // 654: litevirt.v1.LiteVirt.TestNotificationTarget:output_type -> google.protobuf.Empty
+	554, // 655: litevirt.v1.LiteVirt.CreateNotificationRoute:output_type -> litevirt.v1.NotificationRoute
+	272, // 656: litevirt.v1.LiteVirt.ListNotificationRoutes:output_type -> litevirt.v1.ListNotificationRoutesResponse
+	561, // 657: litevirt.v1.LiteVirt.DeleteNotificationRoute:output_type -> google.protobuf.Empty
+	274, // 658: litevirt.v1.LiteVirt.SetRegistryCredential:output_type -> litevirt.v1.RegistryCredential
+	277, // 659: litevirt.v1.LiteVirt.ListRegistryCredentials:output_type -> litevirt.v1.ListRegistryCredentialsResponse
+	561, // 660: litevirt.v1.LiteVirt.DeleteRegistryCredential:output_type -> google.protobuf.Empty
+	555, // 661: litevirt.v1.LiteVirt.CreateClusterFirewallRule:output_type -> litevirt.v1.FirewallRule
+	281, // 662: litevirt.v1.LiteVirt.ListClusterFirewallRules:output_type -> litevirt.v1.ListClusterFirewallRulesResponse
+	561, // 663: litevirt.v1.LiteVirt.DeleteClusterFirewallRule:output_type -> google.protobuf.Empty
+	555, // 664: litevirt.v1.LiteVirt.CreateHostFirewallRule:output_type -> litevirt.v1.FirewallRule
+	285, // 665: litevirt.v1.LiteVirt.ListHostFirewallRules:output_type -> litevirt.v1.ListHostFirewallRulesResponse
+	561, // 666: litevirt.v1.LiteVirt.DeleteHostFirewallRule:output_type -> google.protobuf.Empty
+	556, // 667: litevirt.v1.LiteVirt.CreateIpSet:output_type -> litevirt.v1.IpSet
+	289, // 668: litevirt.v1.LiteVirt.ListIpSets:output_type -> litevirt.v1.ListIpSetsResponse
+	561, // 669: litevirt.v1.LiteVirt.DeleteIpSet:output_type -> google.protobuf.Empty
+	561, // 670: litevirt.v1.LiteVirt.SetFirewallDefault:output_type -> google.protobuf.Empty
+	293, // 671: litevirt.v1.LiteVirt.ListFirewallDefaults:output_type -> litevirt.v1.ListFirewallDefaultsResponse
+	559, // 672: litevirt.v1.LiteVirt.CreateSecurityGroup:output_type -> litevirt.v1.SecurityGroup
+	561, // 673: litevirt.v1.LiteVirt.DeleteSecurityGroup:output_type -> google.protobuf.Empty
+	558, // 674: litevirt.v1.LiteVirt.AddSecurityGroupRule:output_type -> litevirt.v1.SecurityGroupRule
+	561, // 675: litevirt.v1.LiteVirt.RemoveSecurityGroupRule:output_type -> google.protobuf.Empty
+	299, // 676: litevirt.v1.LiteVirt.ListSecurityGroups:output_type -> litevirt.v1.ListSecurityGroupsResponse
+	561, // 677: litevirt.v1.LiteVirt.DeleteStoragePoolContent:output_type -> google.protobuf.Empty
+	318, // 678: litevirt.v1.LiteVirt.ListISOs:output_type -> litevirt.v1.ListISOsResponse
+	320, // 679: litevirt.v1.LiteVirt.PullISO:output_type -> litevirt.v1.PullISOResponse
+	321, // 680: litevirt.v1.LiteVirt.GetISOLibraryMode:output_type -> litevirt.v1.ISOLibraryMode
+	321, // 681: litevirt.v1.LiteVirt.SetISOLibraryMode:output_type -> litevirt.v1.ISOLibraryMode
+	324, // 682: litevirt.v1.LiteVirt.FetchISOLibraryFile:output_type -> litevirt.v1.FetchISOLibraryFileChunk
+	326, // 683: litevirt.v1.LiteVirt.PushReplicaIncrement:output_type -> litevirt.v1.PushReplicaIncrementResponse
+	329, // 684: litevirt.v1.LiteVirt.ListReplicas:output_type -> litevirt.v1.ListReplicasResponse
+	314, // 685: litevirt.v1.LiteVirt.PushReplica:output_type -> litevirt.v1.PushReplicaResponse
+	331, // 686: litevirt.v1.LiteVirt.PruneReplicas:output_type -> litevirt.v1.PruneReplicasResponse
+	380, // 687: litevirt.v1.LiteVirt.Ping:output_type -> litevirt.v1.PingResponse
+	382, // 688: litevirt.v1.LiteVirt.Ready:output_type -> litevirt.v1.ReadyResponse
+	561, // 689: litevirt.v1.LiteVirt.ProvisionNetwork:output_type -> google.protobuf.Empty
+	561, // 690: litevirt.v1.LiteVirt.SyncVTEP:output_type -> google.protobuf.Empty
+	401, // 691: litevirt.v1.LiteVirt.GetVMIPRemote:output_type -> litevirt.v1.GetVMIPResponse
+	561, // 692: litevirt.v1.LiteVirt.RefreshLB:output_type -> google.protobuf.Empty
+	561, // 693: litevirt.v1.LiteVirt.UpdateFDB:output_type -> google.protobuf.Empty
+	561, // 694: litevirt.v1.LiteVirt.EnsureCloudInit:output_type -> google.protobuf.Empty
+	389, // 695: litevirt.v1.LiteVirt.EnsureDisks:output_type -> litevirt.v1.EnsureDisksResponse
+	391, // 696: litevirt.v1.LiteVirt.EnsureFirmwareState:output_type -> litevirt.v1.EnsureFirmwareStateResponse
+	393, // 697: litevirt.v1.LiteVirt.RollbackFirmwareState:output_type -> litevirt.v1.RollbackFirmwareStateResponse
+	561, // 698: litevirt.v1.LiteVirt.CleanupMigrationArtifacts:output_type -> google.protobuf.Empty
+	395, // 699: litevirt.v1.LiteVirt.ReceiveMigrationDisk:output_type -> litevirt.v1.ReceiveMigrationDiskResponse
+	397, // 700: litevirt.v1.LiteVirt.CheckCPUCompatibility:output_type -> litevirt.v1.CheckCPUCompatibilityResponse
+	405, // 701: litevirt.v1.LiteVirt.GetStateDigest:output_type -> litevirt.v1.StateDigestResponse
+	334, // 702: litevirt.v1.LiteVirt.AcknowledgeLeaseTermTie:output_type -> litevirt.v1.AcknowledgeLeaseTermTieResponse
+	336, // 703: litevirt.v1.LiteVirt.GetLeaseTermHighWater:output_type -> litevirt.v1.GetLeaseTermHighWaterResponse
+	409, // 704: litevirt.v1.LiteVirt.GetStateDump:output_type -> litevirt.v1.StateDumpResponse
+	410, // 705: litevirt.v1.LiteVirt.StreamStateDump:output_type -> litevirt.v1.StateDumpChunk
+	410, // 706: litevirt.v1.LiteVirt.StreamTableDump:output_type -> litevirt.v1.StateDumpChunk
+	405, // 707: litevirt.v1.LiteVirt.GetSensitiveStateDigest:output_type -> litevirt.v1.StateDigestResponse
+	410, // 708: litevirt.v1.LiteVirt.StreamSensitiveStateDump:output_type -> litevirt.v1.StateDumpChunk
+	418, // 709: litevirt.v1.LiteVirt.GetTableBucketDigests:output_type -> litevirt.v1.BucketDigestResponse
+	414, // 710: litevirt.v1.LiteVirt.StreamTableRows:output_type -> litevirt.v1.TableRowsPage
+	414, // 711: litevirt.v1.LiteVirt.StreamSensitiveTableRows:output_type -> litevirt.v1.TableRowsPage
+	407, // 712: litevirt.v1.LiteVirt.TriggerAntiEntropy:output_type -> litevirt.v1.TriggerAntiEntropyResponse
+	408, // 713: litevirt.v1.LiteVirt.GetClusterStateDigest:output_type -> litevirt.v1.ClusterStateDigestResponse
+	365, // 714: litevirt.v1.LiteVirt.PrepareRecoveryClaim:output_type -> litevirt.v1.PrepareRecoveryClaimResponse
+	367, // 715: litevirt.v1.LiteVirt.AcceptRecoveryClaim:output_type -> litevirt.v1.AcceptRecoveryClaimResponse
+	369, // 716: litevirt.v1.LiteVirt.GetRecoveryClaim:output_type -> litevirt.v1.GetRecoveryClaimResponse
+	371, // 717: litevirt.v1.LiteVirt.ListRecoveryClaims:output_type -> litevirt.v1.RecoveryClaimState
+	348, // 718: litevirt.v1.LiteVirt.AbandonRecoveryProof:output_type -> litevirt.v1.AbandonRecoveryProofResponse
+	347, // 719: litevirt.v1.LiteVirt.ReleaseLegacyHeldClaim:output_type -> litevirt.v1.ReleaseLegacyHeldClaimResponse
+	364, // 720: litevirt.v1.LiteVirt.PlanDeadHostRemoval:output_type -> litevirt.v1.PlanDeadHostRemovalResponse
+	353, // 721: litevirt.v1.LiteVirt.ForceReconfigureVoters:output_type -> litevirt.v1.ForceReconfigureVotersResponse
+	355, // 722: litevirt.v1.LiteVirt.SignForcedVoterConfig:output_type -> litevirt.v1.SignForcedVoterConfigResponse
+	363, // 723: litevirt.v1.LiteVirt.InspectRecoveryClaim:output_type -> litevirt.v1.InspectRecoveryClaimResponse
+	359, // 724: litevirt.v1.LiteVirt.ConfirmPartitionResume:output_type -> litevirt.v1.ConfirmPartitionResumeResponse
+	374, // 725: litevirt.v1.LiteVirt.GetVoterConfig:output_type -> litevirt.v1.GetVoterConfigResponse
+	376, // 726: litevirt.v1.LiteVirt.ChangeVoterConfig:output_type -> litevirt.v1.ChangeVoterConfigResponse
+	423, // 727: litevirt.v1.LiteVirt.DiagnoseDivergence:output_type -> litevirt.v1.DivergenceReport
+	426, // 728: litevirt.v1.LiteVirt.ScanSensitiveDivergence:output_type -> litevirt.v1.ScanSensitiveResponse
+	429, // 729: litevirt.v1.LiteVirt.PushMutations:output_type -> litevirt.v1.ReplicateResponse
+	561, // 730: litevirt.v1.LiteVirt.AckMutations:output_type -> google.protobuf.Empty
+	459, // 731: litevirt.v1.LiteVirt.ListRebalanceProposals:output_type -> litevirt.v1.ListRebalanceProposalsResponse
+	461, // 732: litevirt.v1.LiteVirt.RunRebalance:output_type -> litevirt.v1.RunRebalanceResponse
+	457, // 733: litevirt.v1.LiteVirt.ApproveRebalanceProposal:output_type -> litevirt.v1.RebalanceProposal
+	457, // 734: litevirt.v1.LiteVirt.RejectRebalanceProposal:output_type -> litevirt.v1.RebalanceProposal
+	456, // 735: litevirt.v1.LiteVirt.GetSpiceInfo:output_type -> litevirt.v1.GetSpiceInfoResponse
+	453, // 736: litevirt.v1.LiteVirt.PreflightUpgrade:output_type -> litevirt.v1.PreflightUpgradeResponse
+	465, // 737: litevirt.v1.LiteVirt.ListRegions:output_type -> litevirt.v1.ListRegionsResponse
+	467, // 738: litevirt.v1.LiteVirt.RegionStatus:output_type -> litevirt.v1.RegionStatusResponse
+	95,  // 739: litevirt.v1.LiteVirt.CrossRegionMigrate:output_type -> litevirt.v1.MigrateProgress
+	469, // 740: litevirt.v1.LiteVirt.GetFailoverScope:output_type -> litevirt.v1.FailoverScopeStatus
+	469, // 741: litevirt.v1.LiteVirt.SetFailoverScope:output_type -> litevirt.v1.FailoverScopeStatus
+	475, // 742: litevirt.v1.LiteVirt.RestoreRelay:output_type -> litevirt.v1.RestoreRelayResponse
+	474, // 743: litevirt.v1.LiteVirt.GetRelayHealth:output_type -> litevirt.v1.RelayHealthStatus
+	477, // 744: litevirt.v1.LiteVirt.UpsertServiceEndpoint:output_type -> litevirt.v1.ServiceEndpoint
+	480, // 745: litevirt.v1.LiteVirt.ListServiceEndpoints:output_type -> litevirt.v1.ListServiceEndpointsResponse
+	561, // 746: litevirt.v1.LiteVirt.DeleteServiceEndpoint:output_type -> google.protobuf.Empty
+	482, // 747: litevirt.v1.LiteVirt.CreateBackupSchedule:output_type -> litevirt.v1.BackupSchedule
+	485, // 748: litevirt.v1.LiteVirt.ListBackupSchedules:output_type -> litevirt.v1.ListBackupSchedulesResponse
+	561, // 749: litevirt.v1.LiteVirt.DeleteBackupSchedule:output_type -> google.protobuf.Empty
+	487, // 750: litevirt.v1.LiteVirt.CreateReplicationSchedule:output_type -> litevirt.v1.ReplicationSchedule
+	490, // 751: litevirt.v1.LiteVirt.ListReplicationSchedules:output_type -> litevirt.v1.ListReplicationSchedulesResponse
+	561, // 752: litevirt.v1.LiteVirt.DeleteReplicationSchedule:output_type -> google.protobuf.Empty
+	378, // 753: litevirt.v1.LiteVirt.PromoteReplica:output_type -> litevirt.v1.PromoteReplicaProgress
+	492, // 754: litevirt.v1.LiteVirt.VerifyAuditChain:output_type -> litevirt.v1.VerifyAuditChainResponse
+	496, // 755: litevirt.v1.LiteVirt.ExportAuditChain:output_type -> litevirt.v1.ExportAuditChainResponse
+	494, // 756: litevirt.v1.LiteVirt.RetireAuditKey:output_type -> litevirt.v1.RetireAuditKeyResponse
+	497, // 757: litevirt.v1.LiteVirt.CreateProject:output_type -> litevirt.v1.Project
+	499, // 758: litevirt.v1.LiteVirt.ListProjects:output_type -> litevirt.v1.ListProjectsResponse
+	497, // 759: litevirt.v1.LiteVirt.GetProject:output_type -> litevirt.v1.Project
+	561, // 760: litevirt.v1.LiteVirt.DeleteProject:output_type -> google.protobuf.Empty
+	502, // 761: litevirt.v1.LiteVirt.SetProjectQuota:output_type -> litevirt.v1.ProjectQuota
+	502, // 762: litevirt.v1.LiteVirt.GetProjectQuota:output_type -> litevirt.v1.ProjectQuota
+	505, // 763: litevirt.v1.LiteVirt.GetProjectUsage:output_type -> litevirt.v1.ProjectUsage
+	538, // 764: litevirt.v1.LiteVirt.ExecuteCreateVM:output_type -> litevirt.v1.VM
+	508, // 765: litevirt.v1.LiteVirt.ReserveProjectCapacity:output_type -> litevirt.v1.ReserveProjectCapacityResponse
+	561, // 766: litevirt.v1.LiteVirt.ReleaseProjectCapacity:output_type -> google.protobuf.Empty
+	511, // 767: litevirt.v1.LiteVirt.ReserveHostCapacity:output_type -> litevirt.v1.ReserveHostCapacityResponse
+	561, // 768: litevirt.v1.LiteVirt.ReleaseHostCapacity:output_type -> google.protobuf.Empty
+	518, // 769: litevirt.v1.LiteVirt.ImportLeftoverStatus:output_type -> litevirt.v1.ImportLeftoverStatusResponse
+	561, // 770: litevirt.v1.LiteVirt.PreflightRecreateVM:output_type -> google.protobuf.Empty
+	475, // [475:771] is the sub-list for method output_type
+	179, // [179:475] is the sub-list for method input_type
+	179, // [179:179] is the sub-list for extension type_name
+	179, // [179:179] is the sub-list for extension extendee
+	0,   // [0:179] is the sub-list for field type_name
 }
 
 func init() { file_litevirt_v1_service_proto_init() }
@@ -39382,21 +39557,21 @@ func file_litevirt_v1_service_proto_init() {
 		return
 	}
 	file_litevirt_v1_types_proto_init()
-	file_litevirt_v1_service_proto_msgTypes[27].OneofWrappers = []any{}
-	file_litevirt_v1_service_proto_msgTypes[65].OneofWrappers = []any{}
-	file_litevirt_v1_service_proto_msgTypes[147].OneofWrappers = []any{
+	file_litevirt_v1_service_proto_msgTypes[29].OneofWrappers = []any{}
+	file_litevirt_v1_service_proto_msgTypes[67].OneofWrappers = []any{}
+	file_litevirt_v1_service_proto_msgTypes[149].OneofWrappers = []any{
 		(*PushBackupFrame_Header)(nil),
 		(*PushBackupFrame_Chunk)(nil),
 		(*PushBackupFrame_Manifest)(nil),
 	}
-	file_litevirt_v1_service_proto_msgTypes[480].OneofWrappers = []any{}
+	file_litevirt_v1_service_proto_msgTypes[482].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_litevirt_v1_service_proto_rawDesc), len(file_litevirt_v1_service_proto_rawDesc)),
 			NumEnums:      11,
-			NumMessages:   521,
+			NumMessages:   523,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

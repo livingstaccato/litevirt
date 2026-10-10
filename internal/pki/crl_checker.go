@@ -8,13 +8,15 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"time"
 )
 
 // crlChecker is the revocation oracle for mTLS handshakes. It loads the cluster
 // CRL, verifies its signature against the CA, and caches the parsed revoked-set,
-// reloading only when the file's mtime changes — so a freshly-revoked cert takes
-// effect WITHOUT a daemon restart, while steady-state handshakes don't re-parse.
+// reloading only when the file changes — its mtime, size or inode (a CRL is
+// installed by rename, so every install is a new inode; mtime alone has the
+// kernel's coarse tick, and two installs inside one tick looked unchanged) —
+// so a freshly-revoked cert takes effect WITHOUT a daemon restart, while
+// steady-state handshakes don't re-parse.
 //
 // Fail-safe policy (deliberate, for cluster availability):
 //   - no CRL file              → nothing revoked (allow);
@@ -33,7 +35,7 @@ type crlChecker struct {
 	caCert  *x509.Certificate // for signature verification; nil → skip verify (legacy)
 
 	mu      sync.Mutex
-	mtime   time.Time
+	stamp   fileStamp
 	loaded  bool
 	revoked map[string]bool // serial (lowercase hex) → revoked
 }
@@ -58,18 +60,18 @@ func (c *crlChecker) isRevoked(serial *big.Int) bool {
 
 // refreshLocked reloads the CRL if the file changed since the last load.
 func (c *crlChecker) refreshLocked() {
-	fi, err := os.Stat(c.crlPath)
+	st, err := stampOf(c.crlPath)
 	if err != nil {
 		// No CRL → nothing revoked. Reset so a deleted CRL stops enforcing.
 		c.revoked = nil
 		c.loaded = false
-		c.mtime = time.Time{}
+		c.stamp = fileStamp{}
 		return
 	}
-	if c.loaded && fi.ModTime().Equal(c.mtime) {
+	if c.loaded && st.ino == c.stamp.ino && st.size == c.stamp.size && st.mod.Equal(c.stamp.mod) {
 		return // unchanged
 	}
-	c.mtime = fi.ModTime()
+	c.stamp = st
 	c.loaded = true
 	c.revoked = nil // default to "not enforcing" until we have a verified set
 

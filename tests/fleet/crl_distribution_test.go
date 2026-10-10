@@ -336,9 +336,13 @@ func TestFleet_TwoNodesPublishingTheSameCRLConvergeWithoutARewriteFault(t *testi
 	ctx := context.Background()
 	a, b := c.Node("node-0"), c.Node("node-1")
 
+	// The serial is no node's: revoking B's own certificate would cut off
+	// every connection to and from B — the established ones included, which
+	// now accept no further RPC (connIdentityGate) — and this test is about
+	// the CRL rows converging, not about B.
 	crlPath := filepath.Join(a.PKIDir, "crl.pem")
 	if err := pki.AppendToCRL(filepath.Join(a.PKIDir, "ca.crt"),
-		filepath.Join(a.PKIDir, "ca.key"), crlPath, hostSerial(t, b).Text(16)); err != nil {
+		filepath.Join(a.PKIDir, "ca.key"), crlPath, "dead77"); err != nil {
 		t.Fatalf("mint CRL: %v", err)
 	}
 	body, err := os.ReadFile(crlPath)

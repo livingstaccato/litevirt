@@ -107,7 +107,9 @@ func CertificateAuthorizesProof(certJSON string, p ActionProof) (ClaimCertificat
 //     members of it signed at one ballot, each with the incarnation its entry
 //     records;
 //  5. every counted accept's certificate chains to the cluster CA, names the
-//     voter, is not revoked, and its signature verifies.
+//     voter, is not revoked, has not been replaced by a CA-issued renewal this
+//     node holds proof of (ClaimVerifier.WithSerialPin), and its signature
+//     verifies.
 //
 // It reads nothing but this node's own replica and makes no RPC: execution
 // stays independent of voter reachability beyond the quorum ExecutionGate
@@ -145,6 +147,9 @@ func VerifyClaimCertificate(ctx context.Context, c *Client, v *ClaimVerifier, p 
 	}
 	if !cfg.Explicit() {
 		return cert, fmt.Errorf("voter generation %d has no members to have certified anything", cert.ConfigGeneration)
+	}
+	if !v.Pinned() && !v.SerialPinDisabled() {
+		v = v.WithSerialPin()
 	}
 	err = v.Verify(cert, CertExpectation{
 		Key: cert.Key, ValueDigest: cert.ValueDigest, ConfigGeneration: cert.ConfigGeneration,

@@ -12,11 +12,13 @@ package grpcapi
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
@@ -66,17 +68,72 @@ func (s *Server) RestoreRelay(ctx context.Context, req *pb.RestoreRelayRequest) 
 		Since:   now.Format(time.RFC3339),
 		Reason:  "restored by " + user + " (lv cluster relay-restore)",
 	}
-	if hold > 0 {
-		d.HoldUntil = now.Add(hold).Format(time.RFC3339)
+	// The hold first, in its own row: a demotion the lease holder writes in
+	// the meantime then meets the hold on its re-read, and an evaluator's row
+	// can never overwrite it.
+	holds, err := corrosion.ListRelayHolds(ctx, s.db)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "read relay holds: %v", err)
+	}
+	holdUntil := ""
+	if prevHold, ok := holds[host]; hold > 0 || (ok && prevHold.Active(now)) {
+		// A zero hold ends any earlier one.
+		h := corrosion.RelayHold{Until: now.Add(hold).Format(time.RFC3339), Since: now.Format(time.RFC3339), By: user}
+		if err := corrosion.SetRelayHold(ctx, s.db, host, h, user); err != nil {
+			return nil, status.Errorf(codes.Internal, "hold relay %s: %v", host, err)
+		}
+		if hold > 0 {
+			holdUntil = h.Until
+		}
 	}
 	if err := corrosion.SetRelayDemotion(ctx, s.db, host, d, user); err != nil {
 		return nil, status.Errorf(codes.Internal, "restore relay %s: %v", host, err)
 	}
 	detail := fmt.Sprintf("relay demotion cleared (was demoted: %v)", hasRow && prev.Demoted)
-	if d.HoldUntil != "" {
-		detail += "; held until " + d.HoldUntil
+	if holdUntil != "" {
+		detail += "; held until " + holdUntil
 	}
 	s.audit(ctx, "cluster.relay_restore", host, detail, "ok")
 	s.publish("cluster.relay_restore", host, detail)
-	return &pb.RestoreRelayResponse{Host: host, WasDemoted: hasRow && prev.Demoted, HoldUntil: d.HoldUntil}, nil
+	return &pb.RestoreRelayResponse{Host: host, WasDemoted: hasRow && prev.Demoted, HoldUntil: holdUntil}, nil
+}
+
+// GetRelayHealth lists every host with a relay demotion row or an operator
+// hold, as this host's replica holds them: `lv cluster relay-restore` with no
+// argument. A restored row with no hold in force is listed too — it says when
+// and by whom the last restore was made.
+func (s *Server) GetRelayHealth(ctx context.Context, _ *emptypb.Empty) (*pb.RelayHealthStatus, error) {
+	if err := RequireRole(ctx, "viewer"); err != nil {
+		return nil, err
+	}
+	rows, err := corrosion.ListRelayRows(ctx, s.db)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "read relay demotions: %v", err)
+	}
+	holds, err := corrosion.ListRelayHolds(ctx, s.db)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "read relay holds: %v", err)
+	}
+	now := time.Now()
+	by := map[string]*pb.RelayHealthEntry{}
+	for host, d := range rows {
+		by[host] = &pb.RelayHealthEntry{Host: host, Demoted: d.Demoted, Since: d.Since, Reason: d.Reason}
+	}
+	for host, h := range holds {
+		if !h.Active(now) {
+			continue
+		}
+		e := by[host]
+		if e == nil {
+			e = &pb.RelayHealthEntry{Host: host}
+			by[host] = e
+		}
+		e.HoldUntil, e.HoldBy = h.Until, h.By
+	}
+	out := &pb.RelayHealthStatus{Latched: s.db.MayWriteRelayDemotion()}
+	for _, e := range by {
+		out.Hosts = append(out.Hosts, e)
+	}
+	sort.Slice(out.Hosts, func(i, j int) bool { return out.Hosts[i].Host < out.Hosts[j].Host })
+	return out, nil
 }

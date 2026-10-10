@@ -8,7 +8,8 @@ package corrosion
 // row per sync-mode library file and one iso_library_host/<host> row per
 // host), the pool records' (pool_records.go) and relay health's
 // (relay_health.go: one relay_demoted/<host> row per host the failover lease
-// holder has demoted from relay duty), all written through
+// holder has demoted from relay duty, and one relay_hold/<host> row per
+// operator hold), all written through
 // clusterPolicyUpsertSQL.
 // failover_scope says whether a host is fenced and its workloads recovered by a
 // quorum of the whole cluster (the default, and what every cluster did before

@@ -1,7 +1,10 @@
 package metrics
 
 import (
+	"context"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
@@ -67,5 +70,60 @@ func TestCollect_RelayRoleAbsentWhenUnwired(t *testing.T) {
 		if containsStr(m.Desc().String(), "litevirt_relay_role") {
 			t.Fatal("litevirt_relay_role reported with no relay election wired")
 		}
+	}
+}
+
+// litevirt_relay_demoted and litevirt_relay_hold_seconds make demotions and
+// holds visible: litevirt_relay_role reads 0 for every leaf, demoted or not,
+// so it cannot say which host to restore, and a forgotten hold would switch
+// demotion off for its host silently.
+//
+// Mutation: skip the hold series — no hold reported, red.
+func TestCollect_RelayDemotionsAndHoldsAreVisible(t *testing.T) {
+	db := initTestDB(t)
+	db.SetClusterPolicyGate(func() bool { return true })
+	db.SetRelayHealthGate(func() bool { return true })
+	ctx := context.Background()
+	if err := corrosion.SetRelayDemotion(ctx, db, "a", corrosion.RelayDemotion{Demoted: true, Reason: "probes"}, "lease"); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.SetRelayDemotion(ctx, db, "b", corrosion.RelayDemotion{Demoted: false, Reason: "restored"}, "lease"); err != nil {
+		t.Fatal(err)
+	}
+	until := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+	if err := corrosion.SetRelayHold(ctx, db, "c", corrosion.RelayHold{Until: until, By: "admin"}, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.SetRelayHold(ctx, db, "d", corrosion.RelayHold{Until: time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)}, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	c := newCollector(db, nil, nil, "x")
+	series := func(name string) map[string]float64 {
+		ch := make(chan prometheus.Metric, 400)
+		c.Collect(ch)
+		close(ch)
+		out := map[string]float64{}
+		for m := range ch {
+			if !strings.Contains(m.Desc().String(), `"`+name+`"`) {
+				continue
+			}
+			var dm dto.Metric
+			if err := m.Write(&dm); err != nil {
+				t.Fatal(err)
+			}
+			for _, lp := range dm.GetLabel() {
+				if lp.GetName() == "member" {
+					out[lp.GetValue()] = dm.GetGauge().GetValue()
+				}
+			}
+		}
+		return out
+	}
+	if got := series("litevirt_relay_demoted"); len(got) != 1 || got["a"] != 1 {
+		t.Errorf("litevirt_relay_demoted = %v, want only a=1 (b is restored)", got)
+	}
+	got := series("litevirt_relay_hold_seconds")
+	if len(got) != 1 || got["c"] < 3500 || got["c"] > 3600 {
+		t.Errorf("litevirt_relay_hold_seconds = %v, want only c≈3600 (d's hold has run out)", got)
 	}
 }

@@ -30,6 +30,9 @@ package corrosion
 // The cluster_policies gate (failover_scope_v1) must hold too, because that is
 // the latch that proves every recipient decodes the shape.
 //
+// An operator's hold (`lv cluster relay-restore --hold`) is a relay_hold/<host>
+// row of its own, which the lease holder never writes.
+//
 // cluster_policies has no statement that deletes a row, so a restore writes
 // the row again with demoted=false, like iso_library's "{}" removal. Rows are
 // bounded by host names, never by history.
@@ -60,20 +63,65 @@ type RelayDemotion struct {
 	Since string `json:"since"`
 	// Reason says why, for the operator.
 	Reason string `json:"reason"`
-	// HoldUntil, on a restore an operator made (`lv cluster relay-restore`),
-	// is when the lease holder may demote the host again (RFC 3339). Empty:
-	// no hold. It is the stand-down for a demotion the evaluator keeps
-	// re-deriving from a fault that is not the host's.
-	HoldUntil string `json:"hold_until,omitempty"`
 }
 
-// Held reports whether an operator's hold forbids demoting the host at now.
-func (d RelayDemotion) Held(now time.Time) bool {
-	if d.Demoted || d.HoldUntil == "" {
-		return false
-	}
-	until, err := time.Parse(time.RFC3339, d.HoldUntil)
+// RelayHoldKeyPrefix is the cluster_policies key prefix of an operator's
+// hold: relay_hold/<host>. It is a row of its own, written only by
+// `lv cluster relay-restore --hold`, never by the failover lease holder — so
+// the lease holder's last-writer-wins demotion row can never erase a hold
+// that replicated to it a moment late.
+const RelayHoldKeyPrefix = "relay_hold/"
+
+// RelayHold is the value of a relay_hold/<host> row.
+type RelayHold struct {
+	// Until is when the lease holder may demote the host again (RFC 3339).
+	Until string `json:"until"`
+	// Since is when the hold was set, and By who set it.
+	Since string `json:"since"`
+	By    string `json:"by"`
+}
+
+// Active reports whether the hold forbids demoting the host at now.
+func (h RelayHold) Active(now time.Time) bool {
+	until, err := time.Parse(time.RFC3339, h.Until)
 	return err == nil && now.Before(until)
+}
+
+// SetRelayHold writes host's hold row, behind the same gate as a demotion.
+// A hold ending at or before now (a zero hold) ends any earlier one.
+func SetRelayHold(ctx context.Context, c *Client, host string, h RelayHold, setBy string) error {
+	if !c.MayWriteRelayDemotion() {
+		return ErrRelayHealthGateClosed
+	}
+	b, err := json.Marshal(h)
+	if err != nil {
+		return err
+	}
+	return c.Execute(ctx, clusterPolicyUpsertSQL, RelayHoldKeyPrefix+host, string(b), setBy, c.NowTS())
+}
+
+// ListRelayHolds returns every relay_hold/<host> row that parses, by host,
+// expired ones included (Active says which hold).
+func ListRelayHolds(ctx context.Context, c *Client) (map[string]RelayHold, error) {
+	rows, err := c.Query(ctx,
+		`SELECT key, value FROM cluster_policies WHERE key >= ? AND key < ? AND deleted_at IS NULL`,
+		RelayHoldKeyPrefix, RelayHoldKeyPrefix+"\xff")
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]RelayHold, len(rows))
+	for _, r := range rows {
+		k := r.String("key")
+		if !strings.HasPrefix(k, RelayHoldKeyPrefix) {
+			continue
+		}
+		var h RelayHold
+		if json.Unmarshal([]byte(r.String("value")), &h) != nil {
+			continue
+		}
+		out[strings.TrimPrefix(k, RelayHoldKeyPrefix)] = h
+	}
+	return out, nil
 }
 
 // SetRelayHealthGate injects the predicate that permits writing demotion

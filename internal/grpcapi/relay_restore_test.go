@@ -51,12 +51,12 @@ func TestRestoreRelay_ClearsTheDemotionAndHolds(t *testing.T) {
 	if !corrosion.RelayEligibleHosts(ctx, s.db)["n1"] {
 		t.Fatal("n1 still ineligible after the restore")
 	}
-	rows, err := corrosion.ListRelayRows(ctx, s.db)
+	holds, err := corrosion.ListRelayHolds(ctx, s.db)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !rows["n1"].Held(time.Now()) || rows["n1"].Held(time.Now().Add(2*time.Hour)) {
-		t.Fatalf("row = %+v, want held for about an hour", rows["n1"])
+	if h := holds["n1"]; !h.Active(time.Now()) || h.Active(time.Now().Add(2*time.Hour)) || h.By != "admin" {
+		t.Fatalf("hold = %+v, want held by admin for about an hour", h)
 	}
 	got := lastAuditRow(t, s, "cluster.relay_restore")
 	if !got.found || got.user != "admin" || got.target != "n1" || !strings.Contains(got.detail, "was demoted: true") {
@@ -100,5 +100,55 @@ func TestRestoreRelay_ValidatesItsArguments(t *testing.T) {
 		if _, err := s.RestoreRelay(adminCtx(), tc.req); status.Code(err) != tc.code {
 			t.Errorf("RestoreRelay(%+v) = %v, want %s", tc.req, err, tc.code)
 		}
+	}
+}
+
+// A restore without a hold ends an earlier hold: the operator's latest word
+// stands.
+//
+// Mutation: leave an earlier hold alone on a zero hold — it stays in force,
+// red.
+func TestRestoreRelay_ZeroHoldEndsAnEarlierHold(t *testing.T) {
+	s := relayRestoreServer(t, true)
+	ctx := context.Background()
+	if _, err := s.RestoreRelay(adminCtx(), &pb.RestoreRelayRequest{Host: "n1", HoldSeconds: 3600}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RestoreRelay(adminCtx(), &pb.RestoreRelayRequest{Host: "n1"}); err != nil {
+		t.Fatal(err)
+	}
+	holds, _ := corrosion.ListRelayHolds(ctx, s.db)
+	if holds["n1"].Active(time.Now().Add(time.Second)) {
+		t.Fatalf("hold %+v still in force after a restore without one", holds["n1"])
+	}
+}
+
+// GetRelayHealth makes demotions and holds visible to any viewer: which host
+// is demoted, since when and why, and which is held until when, by whom.
+//
+// Mutation: leave holds out of the listing — the held host is missing, red.
+func TestGetRelayHealth_ListsDemotionsAndHolds(t *testing.T) {
+	s := relayRestoreServer(t, true)
+	ctx := context.Background()
+	if err := corrosion.SetRelayDemotion(ctx, s.db, "n2",
+		corrosion.RelayDemotion{Demoted: true, Since: "2026-10-10T00:00:00Z", Reason: "2 of 4 voter observers"}, "lease"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RestoreRelay(adminCtx(), &pb.RestoreRelayRequest{Host: "n1", HoldSeconds: 600}); err != nil {
+		t.Fatal(err)
+	}
+	st, err := s.GetRelayHealth(viewerCtx(), nil)
+	if err != nil {
+		t.Fatalf("GetRelayHealth as viewer: %v", err)
+	}
+	if !st.GetLatched() || len(st.GetHosts()) != 2 {
+		t.Fatalf("status = %+v, want latched with n1 and n2", st)
+	}
+	n1, n2 := st.GetHosts()[0], st.GetHosts()[1]
+	if n1.GetHost() != "n1" || n1.GetDemoted() || n1.GetHoldUntil() == "" || n1.GetHoldBy() != "admin" {
+		t.Errorf("n1 = %+v, want restored and held by admin", n1)
+	}
+	if n2.GetHost() != "n2" || !n2.GetDemoted() || n2.GetSince() == "" || n2.GetReason() == "" {
+		t.Errorf("n2 = %+v, want demoted with since and reason", n2)
 	}
 }

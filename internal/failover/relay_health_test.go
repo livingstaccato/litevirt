@@ -47,8 +47,65 @@ func newRelayFixture(t *testing.T, n int, latched bool) *relayFixture {
 	f.c = newTestCoordinator(f.hosts[n-1], db)
 	f.c.Now = func() time.Time { return f.clk }
 	f.c.RelayConfig = corrosion.RelayConfig{BaseRelays: 2}
+	f.members(f.hosts...)
 	f.steady()
 	return f
+}
+
+// members sets the gossip membership the coordinator's floor counts over
+// (self excluded, as Members() reports it).
+func (f *relayFixture) members(names ...string) {
+	var ps []corrosion.PeerInfo
+	for _, n := range names {
+		if n != f.c.hostName {
+			ps = append(ps, corrosion.PeerInfo{Name: n})
+		}
+	}
+	f.db.SetMembersForTests(func() []corrosion.PeerInfo { return ps })
+}
+
+// down takes hosts out of service (fenced), as a multi-host incident does:
+// every live observer keeps failing them with a climbing count, and gossip
+// no longer lists them.
+func (f *relayFixture) down(hosts ...string) {
+	f.t.Helper()
+	isDown := map[string]bool{}
+	for _, h := range hosts {
+		isDown[h] = true
+		if err := corrosion.UpdateHostState(context.Background(), f.db, h, "fenced"); err != nil {
+			f.t.Fatalf("fence %s: %v", h, err)
+		}
+	}
+	var up []string
+	for _, h := range f.hosts {
+		if !isDown[h] {
+			up = append(up, h)
+		}
+	}
+	f.members(up...)
+}
+
+// failDown is one probe round of the down hosts by every live host.
+func (f *relayFixture) failDown(down ...string) {
+	f.t.Helper()
+	for _, d := range down {
+		var live []string
+		for _, h := range f.hosts {
+			if !contains(down, h) {
+				live = append(live, h)
+			}
+		}
+		f.verdicts(d, live...)
+	}
+}
+
+func contains(xs []string, x string) bool {
+	for _, y := range xs {
+		if y == x {
+			return true
+		}
+	}
+	return false
 }
 
 // steady is the cluster's first probe round — every observer publishes a
@@ -494,9 +551,8 @@ func TestRelayHealth_RemovedHostsDemotionIsCleared(t *testing.T) {
 func TestRelayHealth_OperatorHoldPreventsDemotion(t *testing.T) {
 	f := newRelayFixture(t, 5, true)
 	hold := 5 * time.Minute
-	if err := corrosion.SetRelayDemotion(context.Background(), f.db, "h1", corrosion.RelayDemotion{
-		Demoted: false, Since: f.clk.Format(time.RFC3339), Reason: "operator",
-		HoldUntil: f.clk.Add(hold).Format(time.RFC3339),
+	if err := corrosion.SetRelayHold(context.Background(), f.db, "h1", corrosion.RelayHold{
+		Until: f.clk.Add(hold).Format(time.RFC3339), Since: f.clk.Format(time.RFC3339), By: "admin",
 	}, "admin"); err != nil {
 		t.Fatal(err)
 	}
@@ -515,9 +571,196 @@ func TestRelayHealth_OperatorHoldPreventsDemotion(t *testing.T) {
 	if !f.demoted("h1") {
 		t.Fatal("h1 not demoted after the hold ran out")
 	}
-	var d corrosion.RelayDemotion
-	rows, _ := f.db.Query(context.Background(), `SELECT value FROM cluster_policies WHERE key = 'relay_demoted/h1'`)
-	if len(rows) != 1 || json.Unmarshal([]byte(rows[0].String("value")), &d) != nil || d.HoldUntil != "" {
-		t.Fatalf("the evaluator's demotion row should carry no hold: %v", rows)
+	var h corrosion.RelayHold
+	rows, _ := f.db.Query(context.Background(), `SELECT value FROM cluster_policies WHERE key = 'relay_hold/h1'`)
+	if len(rows) != 1 || json.Unmarshal([]byte(rows[0].String("value")), &h) != nil || h.By != "admin" {
+		t.Fatalf("the operator's hold row must be untouched by the evaluator: %v", rows)
+	}
+}
+
+// The evaluator's demotion row and an operator's hold are different rows, so
+// the evaluator's last-writer-wins write can never erase a hold: a demotion
+// that raced the hold's replication (written after it, by a lease holder
+// that had not seen it) leaves the hold in place, and the next evaluation
+// restores the host because a hold is in force.
+//
+// Mutation: do not restore a host found demoted under a hold — it stays
+// demoted for the whole hold, red.
+func TestRelayHealth_AHoldSurvivesARacingDemotion(t *testing.T) {
+	f := newRelayFixture(t, 5, true)
+	ctx := context.Background()
+	if err := corrosion.SetRelayHold(ctx, f.db, "h1", corrosion.RelayHold{
+		Until: f.clk.Add(time.Hour).Format(time.RFC3339), By: "admin",
+	}, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	// The racing lease holder's demotion, written after the hold.
+	if err := corrosion.SetRelayDemotion(ctx, f.db, "h1",
+		corrosion.RelayDemotion{Demoted: true, Since: f.clk.Format(time.RFC3339), Reason: "raced"}, "h5"); err != nil {
+		t.Fatal(err)
+	}
+	f.verdicts("h1", "h2", "h3")
+	f.cycle()
+	if f.demoted("h1") {
+		t.Fatal("h1 left demoted under an operator hold")
+	}
+	holds, _ := corrosion.ListRelayHolds(ctx, f.db)
+	if !holds["h1"].Active(f.clk) || holds["h1"].By != "admin" {
+		t.Fatalf("the hold did not survive the evaluator: %+v", holds["h1"])
+	}
+}
+
+// A multi-host incident: two hosts are fenced (every live observer fails them,
+// freshly, every probe), and two more, X and Y, have degraded links that
+// observers h3 and h4 fail. h3 and h4 then fail 4 of the 6 hosts they hold a
+// verdict on — but two of those are DOWN, which says nothing about h3 and h4.
+// Counted, the discount removes exactly the observers that see the fault and
+// X is never demoted.
+//
+// Mutation: count verdicts about every host in the discount (round 1) — h3
+// and h4 are discounted and X is not demoted, red.
+func TestRelayHealth_HostsDownDoNotDiscountTheirObservers(t *testing.T) {
+	f := newRelayFixture(t, 7, true) // the lease holder is h7
+	f.down("h5", "h6")
+	for i := 0; i < int(3*RelayDemoteWindow/relayPoll) && !f.demoted("h1"); i++ {
+		f.failDown("h5", "h6")
+		f.verdicts("h1", "h3", "h4")
+		f.verdicts("h2", "h3", "h4")
+		f.cycle()
+	}
+	if !f.demoted("h1") {
+		t.Fatal("h1 not demoted: 2 of 4 live voter observers fail it, while two other hosts are down")
+	}
+}
+
+// The same with three hosts down, and with stale tombstoned rows and rows
+// about removed hosts in the observers' history: none of them is a host the
+// evaluator judges, so none counts toward an observer's discount.
+//
+// Mutations: as above — red; and counting tombstoned rows about live hosts
+// in the discount — h3 is discounted, red.
+func TestRelayHealth_TombstonedAndRemovedRowsDoNotDiscount(t *testing.T) {
+	f := newRelayFixture(t, 8, true) // the lease holder is h8
+	f.down("h5", "h6", "h7")
+	ctx := context.Background()
+	// h3 once observed hosts since removed (rows left behind, some
+	// tombstoned), and its last verdicts on them were failing.
+	for i, ghost := range []string{"g1", "g2", "g3", "g4"} {
+		deleted := "NULL"
+		if i%2 == 0 {
+			deleted = "'" + f.clk.Format(time.RFC3339) + "'"
+		}
+		if err := f.db.Execute(ctx,
+			`INSERT OR REPLACE INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at, deleted_at)
+			 VALUES ('h3', ?, 'suspect', 9, NULL, ?, `+deleted+`)`, ghost, f.clk.Format(time.RFC3339Nano)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Tombstoned failing verdicts about two live hosts, too: counted, they
+	// alone put h3 over half of the live hosts it observes.
+	if err := f.db.Execute(ctx, `UPDATE host_health SET consecutive_failures = 7, updated_at = ?, deleted_at = ?
+		WHERE observer = 'h3' AND target IN ('h2', 'h4')`, f.clk.Format(time.RFC3339Nano), f.clk.Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < int(3*RelayDemoteWindow/relayPoll) && !f.demoted("h1"); i++ {
+		f.failDown("h5", "h6", "h7")
+		f.verdicts("h1", "h3", "h4")
+		// Those rows stay fresh, as a previous-release receiver's copy of a
+		// live verdict marked deleted does (observation_replace.go).
+		if err := f.db.Execute(ctx, `UPDATE host_health SET updated_at = ?
+			WHERE observer = 'h3' AND (target LIKE 'g%' OR target IN ('h2', 'h4'))`, f.clk.Format(time.RFC3339Nano)); err != nil {
+			t.Fatal(err)
+		}
+		f.cycle()
+	}
+	if !f.demoted("h1") {
+		t.Fatal("h1 not demoted: 2 of 4 live voter observers fail it")
+	}
+}
+
+// Under a small voter set — an adopted generation of 3 in a 6-host cluster —
+// a third of the observers is a single voter's view. The bar is never below
+// 2, and with 4 or fewer voters it is a majority of them; the same rule for
+// a voter and a non-voter target.
+//
+// Mutation: the bar without its floors (a third, minimum one) — h5 and h2 are
+// demoted on one voter's word, red.
+func TestRelayHealth_ASmallVoterSetNeedsAMajority(t *testing.T) {
+	f := newRelayFixture(t, 6, true)
+	ctx := context.Background()
+	voters := map[string]bool{"h1": true, "h2": true, "h3": true}
+	run := func(target string, failing ...string) {
+		for i := 0; i < int(3*RelayDemoteWindow/relayPoll) && !f.demoted(target); i++ {
+			f.verdicts(target, failing...)
+			f.clk = f.clk.Add(relayPoll)
+			f.c.evaluateRelayHealth(ctx, voters, nil)
+		}
+	}
+	run("h5", "h1") // non-voter target, one voter failing
+	if f.demoted("h5") {
+		t.Fatal("non-voter h5 demoted on one of three voters' word")
+	}
+	run("h2", "h1") // voter target, one voter failing
+	if f.demoted("h2") {
+		t.Fatal("voter h2 demoted on one of three voters' word")
+	}
+	run("h4", "h1", "h2") // control: a majority of the voters
+	if !f.demoted("h4") {
+		t.Fatal("control: h4 not demoted with 2 of 3 voters failing it")
+	}
+}
+
+// The floor counts only hosts the election can see: an active host missing
+// from gossip membership is never elected, so counting it toward the floor
+// let a demotion through that the election then filled back in.
+//
+// Mutation: count every active host toward the floor — h2 is demoted too, red.
+func TestRelayHealth_TheFloorCountsOnlyMembers(t *testing.T) {
+	f := newRelayFixture(t, 5, true)
+	f.members("h1", "h2", "h3") // h4 active but not in membership; self h5
+	for i := 0; i < int(3*RelayDemoteWindow/relayPoll); i++ {
+		f.verdicts("h1", "h3", "h4")
+		f.verdicts("h2", "h3", "h4")
+		f.cycle()
+	}
+	if !f.demoted("h1") {
+		t.Fatal("h1 not demoted: 4 member hosts eligible, R = 3, one demotion fits")
+	}
+	if f.demoted("h2") {
+		t.Fatal("h2 demoted too: 2 member hosts left eligible is below R = 3")
+	}
+}
+
+// Never on one observer's word, whatever the cluster size: with two of five
+// voters discounted (they fail every host), three are counted, a third of the
+// two observers a voter host has is one — and one failing observer is still
+// not enough.
+//
+// Mutation: drop the floor of 2 — h1 is demoted on h3's word alone, red.
+func TestRelayHealth_NeverOnOneObserversWord(t *testing.T) {
+	f := newRelayFixture(t, 5, true)
+	ctx := context.Background()
+	voters, err := corrosion.VoterSet(ctx, f.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < int(3*RelayDemoteWindow/relayPoll); i++ {
+		for _, target := range f.hosts {
+			var failing []string
+			for _, bad := range []string{"h4", "h5"} {
+				if bad != target {
+					failing = append(failing, bad)
+				}
+			}
+			if target == "h1" {
+				failing = append(failing, "h3")
+			}
+			f.verdicts(target, failing...)
+		}
+		f.clk = f.clk.Add(relayPoll)
+		f.c.evaluateRelayHealth(ctx, voters, nil)
+	}
+	if f.demoted("h1") {
+		t.Fatal("h1 demoted on one counted observer's word")
 	}
 }

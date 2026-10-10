@@ -41,6 +41,12 @@ type DiskOptions struct {
 	Format string
 	// SourceImage is an optional backing file or snapshot to clone from.
 	SourceImage string
+	// SourceImageName and SourceImageDigest name the image store image
+	// SourceImage is a file of, and its content's sha256. The ceph driver
+	// imports that content into the pool once, under a name made of both;
+	// with no digest it hashes the file.
+	SourceImageName   string
+	SourceImageDigest string
 	// ClusterSize overrides the qcow2 cluster size (e.g. "64K", "2M").
 	// Empty = qcow2 package default of 64K. Ignored for raw/block formats.
 	ClusterSize string
@@ -73,6 +79,11 @@ type Driver interface {
 // Config is the parsed VolumeDef from a compose file or host pool config.
 // Each pool produces one Driver via New().
 type Config struct {
+	// Name is the pool (or "<stack>/<volume>" for a stack's compose volume)
+	// this config was resolved from. The ceph driver records it in every disk
+	// locator: it names the disk's libvirt secret and where its monitors are
+	// looked up when a domain is defined.
+	Name   string
 	Driver string // see SupportedDrivers
 	Source string // driver-specific (NFS server:/path, Ceph pool, ZFS dataset, …)
 	Target string // local mount/path override; empty = derive
@@ -123,7 +134,7 @@ func New(dataDir string, cfg Config) (Driver, error) {
 			run:            realCmd,
 		}, nil
 	case "ceph":
-		return &cephDriver{pool: cfg.Source, opts: cfg.Options}, nil
+		return &cephDriver{pool: cfg.Source, name: cfg.Name, opts: cfg.Options, scratch: dataDir}, nil
 	case "iscsi":
 		return &iscsiDriver{target: cfg.Source, opts: cfg.Options, run: realCmd}, nil
 	case "zfs":

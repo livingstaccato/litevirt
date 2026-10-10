@@ -291,6 +291,11 @@ func (s *Server) pushBackup(
 			ChunksDeduped:  int32(p.ChunksDeduped),
 		})
 	}
+	// Unimplemented, as the stopped-VM container path has always answered
+	// for a ceph disk (containerBackupUnsupported).
+	if err := refuseRBDDiskWith(codes.Unimplemented, disk, "snapshot backup"); err != nil {
+		return nil, err
+	}
 	// A multi-disk Secure-Boot/vTPM VM can't be backed up as a consistent set
 	// (firmware is VM-global but only the root manifest carries it). Refuse for
 	// ANY disk — not just root — so it can't be bypassed by targeting a data disk

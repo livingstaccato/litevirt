@@ -1,7 +1,9 @@
 package libvirt
 
 import (
+	"encoding/xml"
 	"fmt"
+	"log/slog"
 
 	golibvirt "github.com/digitalocean/go-libvirt"
 )
@@ -32,6 +34,11 @@ type MigrateParams struct {
 	// sources; libvirt allows a disk's source to change in it. Empty: the
 	// domain migrates as it is.
 	CDROMSources map[string]string
+	// RBDLocators names, for each rbd disk (by its source name, "pool/image"),
+	// the disk's recorded locator: the destination definition carries the
+	// monitors that locator resolves to NOW (its pool's current mon_host or
+	// conf), not the ones the running domain was defined with.
+	RBDLocators map[string]string
 	// DestXML and PersistXML are the definitions MigrateToTarget builds from
 	// CDROMSources; callers leave them empty.
 	DestXML    string
@@ -54,18 +61,22 @@ func (c *Client) MigrateToTarget(name, dconnuri string, p MigrateParams) error {
 		_ = c.virt.DomainMigrateSetMaxDowntime(dom, uint64(p.MaxDowntimeMS), 0)
 	}
 
-	if len(p.CDROMSources) > 0 {
-		live, err := c.virt.DomainGetXMLDesc(dom, golibvirt.DomainXMLSecure|golibvirt.DomainXMLMigratable)
+	live := func() (string, error) {
+		x, err := c.virt.DomainGetXMLDesc(dom, golibvirt.DomainXMLSecure|golibvirt.DomainXMLMigratable)
 		if err != nil {
-			return fmt.Errorf("get migratable XML for %q: %w", name, err)
+			return "", fmt.Errorf("get migratable XML for %q: %w", name, err)
 		}
-		persist, err := c.virt.DomainGetXMLDesc(dom, golibvirt.DomainXMLSecure|golibvirt.DomainXMLMigratable|golibvirt.DomainXMLInactive)
+		return x, nil
+	}
+	persist := func() (string, error) {
+		x, err := c.virt.DomainGetXMLDesc(dom, golibvirt.DomainXMLSecure|golibvirt.DomainXMLMigratable|golibvirt.DomainXMLInactive)
 		if err != nil {
-			return fmt.Errorf("get persistent migratable XML for %q: %w", name, err)
+			return "", fmt.Errorf("get persistent migratable XML for %q: %w", name, err)
 		}
-		if p.DestXML, p.PersistXML, err = MigrationCDROMXML(live, persist, p.CDROMSources); err != nil {
-			return fmt.Errorf("domain %q: %w", name, err)
-		}
+		return x, nil
+	}
+	if p.DestXML, p.PersistXML, err = migrationDefinitions(p, live, persist); err != nil {
+		return fmt.Errorf("domain %q: %w", name, err)
 	}
 
 	flags, params := migrationFlagsAndParams(p)
@@ -218,4 +229,143 @@ func (c *Client) AbortMigration(name string) error {
 		return fmt.Errorf("lookup domain %q: %w", name, err)
 	}
 	return c.virt.DomainAbortJob(dom)
+}
+
+// MigrationDomainXML builds the destination and persistent definitions a
+// migration hands libvirt: CD-ROMs pointed at the files the destination
+// resolved (CDROMSources), and every rbd disk named in RBDLocators given the
+// monitors its locator resolves to now — its pool's current mon_host or conf
+// on this host — in place of the ones the running domain was defined with,
+// which a monitor re-address may have retired. Both empty: "" (the domain
+// migrates as it is).
+func MigrationDomainXML(live, persist string, p MigrateParams) (dest, persistOut string, err error) {
+	if len(p.CDROMSources) == 0 && len(p.RBDLocators) == 0 {
+		return "", "", nil
+	}
+	dest, persistOut = live, persist
+	if len(p.CDROMSources) > 0 {
+		if dest, persistOut, err = MigrationCDROMXML(live, persist, p.CDROMSources); err != nil {
+			return "", "", err
+		}
+	}
+	if len(p.RBDLocators) > 0 {
+		hosts := ResolveRBDHosts(p.RBDLocators)
+		if dest, err = RewriteRBDHosts(dest, hosts); err != nil {
+			return "", "", err
+		}
+		if persistOut, err = RewriteRBDHosts(persistOut, hosts); err != nil {
+			return "", "", err
+		}
+	}
+	return dest, persistOut, nil
+}
+
+// migrationDefinitions is MigrateToTarget's choice: with CD-ROM remaps or rbd
+// locators it fetches the live and persistent definitions and builds the
+// destination ones (MigrationDomainXML); otherwise the domain migrates as it
+// is ("", "").
+func migrationDefinitions(p MigrateParams, live, persist func() (string, error)) (string, string, error) {
+	if len(p.CDROMSources) == 0 && len(p.RBDLocators) == 0 {
+		return "", "", nil
+	}
+	l, err := live()
+	if err != nil {
+		return "", "", err
+	}
+	ps, err := persist()
+	if err != nil {
+		return "", "", err
+	}
+	return MigrationDomainXML(l, ps, p)
+}
+
+// ResolveRBDHosts resolves, for each rbd disk (by image spec), the monitors
+// its locator names now (diskBacking: the pool's current mon_host or conf).
+// A disk that does not resolve, or resolves to no monitors, is left out: its
+// definition keeps the <host> list it has — never an empty one, which would
+// leave qemu to whatever ceph.conf the host happens to have.
+func ResolveRBDHosts(locators map[string]string) map[string][]diskSourceHost {
+	hosts := make(map[string][]diskSourceHost, len(locators))
+	for name, loc := range locators {
+		_, src, _, err := diskBacking(loc)
+		if err != nil {
+			slog.Warn("rbd disk monitors not re-resolved; keeping its current <host> list", "disk", name, "error", err)
+			continue
+		}
+		if len(src.Hosts) == 0 {
+			continue
+		}
+		hosts[name] = src.Hosts
+	}
+	return hosts
+}
+
+// RefreshRBDHosts rewrites a domain definition's rbd <host> lists with the
+// monitors each disk's locator resolves to now (ResolveRBDHosts) — only the
+// disks whose monitors DIFFER from the ones the definition names (by name and
+// port, in order; libvirt's layout of them is no difference). changed is
+// false when no disk's do.
+func RefreshRBDHosts(domXML string, locators map[string]string) (out string, changed bool, err error) {
+	hosts := ResolveRBDHosts(locators)
+	current, err := rbdSourceHosts(domXML)
+	if err != nil {
+		return domXML, false, err
+	}
+	for name, list := range hosts {
+		if sameHosts(current[name], list) {
+			delete(hosts, name)
+		}
+	}
+	if len(hosts) == 0 {
+		return domXML, false, nil
+	}
+	out, err = RewriteRBDHosts(domXML, hosts)
+	if err != nil {
+		return domXML, false, err
+	}
+	return out, out != domXML, nil
+}
+
+// rbdSourceHosts maps each rbd disk source of a domain (by its name) to the
+// <host> list it names.
+func rbdSourceHosts(domXML string) (map[string][]diskSourceHost, error) {
+	var dom struct {
+		Disks []struct {
+			Source struct {
+				Protocol string `xml:"protocol,attr"`
+				Name     string `xml:"name,attr"`
+				Hosts    []struct {
+					Name string `xml:"name,attr"`
+					Port string `xml:"port,attr"`
+				} `xml:"host"`
+			} `xml:"source"`
+		} `xml:"devices>disk"`
+	}
+	if err := xml.Unmarshal([]byte(domXML), &dom); err != nil {
+		return nil, fmt.Errorf("parse domain xml: %w", err)
+	}
+	out := map[string][]diskSourceHost{}
+	for _, d := range dom.Disks {
+		if d.Source.Protocol != "rbd" {
+			continue
+		}
+		list := []diskSourceHost{}
+		for _, h := range d.Source.Hosts {
+			list = append(list, diskSourceHost{Name: h.Name, Port: h.Port})
+		}
+		out[d.Source.Name] = list
+	}
+	return out, nil
+}
+
+func sameHosts(a, b []diskSourceHost) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Name != b[i].Name || a[i].Port != b[i].Port {
+			return false
+		}
+	}
+	return true
 }

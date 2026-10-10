@@ -14,13 +14,14 @@ import (
 // directory, where whoever can upload to the pool can place a file of that
 // name (a crafted qcow2 that chains to a host file). So for those drivers it
 // is the image store's own file, by absolute path, and that file must be
-// standalone. Ceph clones from a named RBD snapshot and keeps its name.
+// standalone. Ceph takes the same file: it imports the file's content into
+// the pool once (a protected base snapshot) and clones each root disk from it
+// (storage/ceph.go ensureBase), so a ceph root disk is built from exactly the
+// image a file-based one is — an image name the auto-pull fetched, never an
+// rbd snapshot the caller names.
 func (s *Server) poolRootDiskBacking(img, driver string) (string, error) {
 	if img == "" {
 		return "", nil
-	}
-	if driver == "ceph" {
-		return img, nil
 	}
 	if err := safename.ValidateImageName(img); err != nil {
 		return "", status.Errorf(codes.InvalidArgument, "image %q: %v", img, err)

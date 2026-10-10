@@ -78,13 +78,13 @@ func hostUICertSet(r remotePKI, hostName, addr string, opts UICertOptions) error
 		{path: filepath.Join(remotePKIDir, pki.UIKeyName), data: keyPEM, mode: 0o600},
 		{path: filepath.Join(remotePKIDir, pki.UICertName), data: chainPEM, mode: 0o644},
 	}
-	if err := r.Install(files); err != nil {
-		if rbErr := r.Rollback(files); rbErr != nil {
+	if err := r.InstallFiles(files); err != nil {
+		if rbErr := r.RollbackFiles(files); rbErr != nil {
 			return fmt.Errorf("install the UI certificate on %s: %w (restoring the previous one failed: %v)", hostName, err, rbErr)
 		}
 		return fmt.Errorf("install the UI certificate on %s: %w (the previous one, if any, was restored)", hostName, err)
 	}
-	if err := r.Commit(files); err != nil {
+	if err := r.CommitFiles(files); err != nil {
 		fmt.Printf("  NOTE: could not remove the previous certificate's backup in %s: %v\n", remotePKIDir, err)
 	}
 	fmt.Printf("UI certificate installed on %s\n", hostName)

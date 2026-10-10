@@ -480,7 +480,71 @@ type ClaimVerifier struct {
 	// historical is set on the copy Historical returns: a certificate
 	// revoked since still counts. Nothing else is relaxed.
 	historical bool
+	// extraRevoked are serials (lower-case hex) treated as revoked in addition
+	// to the installed CRL — the "what if" WithRevoked asks.
+	extraRevoked map[string]bool
+	// pin, when set (PinnedTo), returns the certificate serial recorded for a
+	// voter; an accept signed with any other certificate does not count.
+	pin   func(voter string) (serial string, ok bool, err error)
+	noPin bool
 }
+
+// WithRevoked returns a copy of v that also treats serials as revoked: the
+// question "would this still verify if these were revoked?" asked before a
+// revocation is published (a renewed voter's replaced certificate).
+func (v *ClaimVerifier) WithRevoked(serials ...string) *ClaimVerifier {
+	if v == nil {
+		return nil
+	}
+	h := *v
+	h.extraRevoked = map[string]bool{}
+	for k := range v.extraRevoked {
+		h.extraRevoked[k] = true
+	}
+	for _, s := range serials {
+		h.extraRevoked[strings.ToLower(s)] = true
+	}
+	return &h
+}
+
+// PinnedTo returns a copy of v that also requires each accept's certificate to
+// be the one recorded for its voter (hosts.cert_serial), or the CA-attested
+// successor of it (pki.RenewedFromSerial) while a renewal's re-recorded serial
+// is still replicating.
+//
+// Without it, §3.10 step 5 asks only for a CA-issued, unrevoked certificate
+// naming the voter, so the key of a certificate a renewal replaced — revocation
+// of which may be held for the voter chain (§4.1) — could still sign accepts.
+// lookup returning ok=false (no live row, an unknown serial) leaves that voter
+// unpinned, as peer trust does for a host it has no row for; an error refuses.
+// Historical verification is never pinned: history was signed by whatever a
+// voter held then.
+func (v *ClaimVerifier) PinnedTo(lookup func(voter string) (string, bool, error)) *ClaimVerifier {
+	if v == nil {
+		return nil
+	}
+	h := *v
+	h.pin = lookup
+	return &h
+}
+
+// Pinned reports whether v checks accepts against recorded serials.
+func (v *ClaimVerifier) Pinned() bool { return v != nil && v.pin != nil }
+
+// WithoutSerialPin returns a copy of v that VerifyClaimCertificate does not
+// pin: the auth.trust_rotated_peer_certs recovery mode, for a fleet whose
+// recorded serials went stale and which peer trust already relaxes.
+func (v *ClaimVerifier) WithoutSerialPin() *ClaimVerifier {
+	if v == nil {
+		return nil
+	}
+	h := *v
+	h.pin, h.noPin = nil, true
+	return &h
+}
+
+// SerialPinDisabled reports whether WithoutSerialPin made v.
+func (v *ClaimVerifier) SerialPinDisabled() bool { return v != nil && v.noPin }
 
 // LoadClaimVerifier loads the cluster CA from pkiDir. Revocation is read from
 // the CRL bundle installed in pkiDir (the CA-verified union of every published
@@ -517,7 +581,35 @@ func (v *ClaimVerifier) Historical() *ClaimVerifier {
 
 // revoked reports whether c's certificate counts as revoked for this verifier.
 func (v *ClaimVerifier) revoked(c *x509.Certificate) bool {
-	return !v.historical && pki.IsCertRevoked(v.pkiDir, c.SerialNumber)
+	if v.historical {
+		return false
+	}
+	if v.extraRevoked[strings.ToLower(c.SerialNumber.Text(16))] {
+		return true
+	}
+	return pki.IsCertRevoked(v.pkiDir, c.SerialNumber)
+}
+
+// pinRefuses reports why c may not sign as voter under v's serial pin, or nil.
+func (v *ClaimVerifier) pinRefuses(c *x509.Certificate, voter string) error {
+	if v.historical || v.pin == nil {
+		return nil
+	}
+	recorded, ok, err := v.pin(voter)
+	if err != nil {
+		return fmt.Errorf("read the certificate recorded for %s: %w", voter, err)
+	}
+	if !ok || recorded == "" {
+		return nil
+	}
+	presented := strings.ToLower(c.SerialNumber.Text(16))
+	if strings.EqualFold(presented, recorded) {
+		return nil
+	}
+	if prev, isRenewal := pki.RenewedFromSerial(c); isRenewal && strings.EqualFold(prev, recorded) {
+		return nil
+	}
+	return fmt.Errorf("signed with certificate %s, but the certificate recorded for %s is %s", presented, voter, recorded)
 }
 
 // CertExpectation is what a certificate must certify, and who may certify it.
@@ -600,6 +692,9 @@ func (v *ClaimVerifier) verifyAccept(cert ClaimCertificate, a ClaimAccept, elect
 	}
 	if v.revoked(c) {
 		return fmt.Errorf("certificate %s is revoked", c.SerialNumber.Text(16))
+	}
+	if err := v.pinRefuses(c, a.Voter); err != nil {
+		return err
 	}
 	pub, ok := c.PublicKey.(*ecdsa.PublicKey)
 	if !ok {

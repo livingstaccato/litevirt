@@ -19,9 +19,9 @@ import (
 	"github.com/litevirt/litevirt/internal/pki"
 )
 
-// installRenewal renews n's host certificate in place, the way `lv host
-// renew-cert` installs it (key first, each file by rename), and returns the
-// new serial plus a pki dir holding the PREVIOUS pair.
+// installRenewal renews n's host certificate in place through the host-side
+// install `lv host renew-cert` drives (key generated in n's pki dir, one atomic
+// switch), and returns the new serial plus a pki dir holding the PREVIOUS pair.
 func installRenewal(t *testing.T, c *Cluster, n *Node) (string, string) {
 	t.Helper()
 	oldDir := t.TempDir()
@@ -34,31 +34,11 @@ func installRenewal(t *testing.T, c *Cluster, n *Node) (string, string) {
 			t.Fatal(err)
 		}
 	}
-	prev, err := pki.ServedHostCertificate(n.PKIDir)
+	_, next, err := pki.RenewLocal(c.caCert, c.caKey, n.PKIDir, n.Name)
 	if err != nil {
 		t.Fatal(err)
 	}
-	certPEM, keyPEM, err := pki.RenewHostCert(c.caCert, c.caKey, prev, n.Name)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, f := range []struct {
-		name string
-		data []byte
-	}{{"host.key", keyPEM}, {"host.crt", certPEM}} {
-		tmp := filepath.Join(n.PKIDir, ".renew-"+f.name)
-		if err := os.WriteFile(tmp, f.data, 0o600); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Rename(tmp, filepath.Join(n.PKIDir, f.name)); err != nil {
-			t.Fatal(err)
-		}
-	}
-	next, err := pki.ParseCertPEM(certPEM)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return strings.ToLower(next.SerialNumber.Text(16)), oldDir
+	return next, oldDir
 }
 
 // servedSerial dials target as source and returns the serial target presents.

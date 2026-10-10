@@ -68,24 +68,28 @@ func RenewedFromSerial(cert *x509.Certificate) (string, bool) {
 	return "", false
 }
 
-// RenewHostCert mints a successor to prev for the host named hostName: a new
-// key, the same subject and SANs, a fresh five-year validity, and the
-// predecessor's serial in the renewal extension. It returns the PEM-encoded
-// certificate and private key; nothing is written.
+// SignRenewal signs a successor to prev for the host named hostName over the
+// public key in csrPEM — a request the HOST generated (GenerateRenewalCSR), so
+// the new private key never leaves it. The certificate keeps prev's subject
+// and SANs (the request's own names are ignored: the CA decides what a host
+// certificate says), gets a fresh five-year validity, and carries the
+// predecessor's serial in the renewal extension.
 //
 // prev must be a host certificate this CA issued to hostName. Renewing anything
 // else would either mint a certificate peers refuse (another CA's) or hand a
-// host a certificate in another host's name.
-func RenewHostCert(caCertPath, caKeyPath string, prev *x509.Certificate, hostName string) (certPEM, keyPEM []byte, err error) {
+// host a certificate in another host's name. The request must be signed by its
+// key (proof of possession) and carry a P-256 ECDSA key, the only kind every
+// consumer of a host key accepts (the recovery-claim signer requires ECDSA).
+func SignRenewal(caCertPath, caKeyPath string, prev *x509.Certificate, hostName string, csrPEM []byte) ([]byte, error) {
 	caCert, caKey, err := loadCA(caCertPath, caKeyPath)
 	if err != nil {
-		return nil, nil, fmt.Errorf("load CA: %w", err)
+		return nil, fmt.Errorf("load CA: %w", err)
 	}
 	if prev == nil {
-		return nil, nil, fmt.Errorf("no certificate to renew")
+		return nil, fmt.Errorf("no certificate to renew")
 	}
 	if prev.Subject.CommonName != hostName {
-		return nil, nil, fmt.Errorf("the installed certificate names %q, not %q", prev.Subject.CommonName, hostName)
+		return nil, fmt.Errorf("the installed certificate names %q, not %q", prev.Subject.CommonName, hostName)
 	}
 	pool := x509.NewCertPool()
 	pool.AddCert(caCert)
@@ -97,23 +101,36 @@ func RenewHostCert(caCertPath, caKeyPath string, prev *x509.Certificate, hostNam
 		KeyUsages:   []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		CurrentTime: prev.NotAfter.Add(-time.Minute),
 	}); err != nil {
-		return nil, nil, fmt.Errorf("the installed certificate was not issued by this cluster CA: %w", err)
+		return nil, fmt.Errorf("the installed certificate was not issued by this cluster CA: %w", err)
 	}
 	if !hasUsage(prev, x509.ExtKeyUsageClientAuth) {
-		return nil, nil, fmt.Errorf("the installed certificate is not a host certificate (no client-auth usage)")
+		return nil, fmt.Errorf("the installed certificate is not a host certificate (no client-auth usage)")
 	}
-
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	block, _ := pem.Decode(csrPEM)
+	if block == nil || block.Type != "CERTIFICATE REQUEST" {
+		return nil, fmt.Errorf("no certificate request")
+	}
+	csr, err := x509.ParseCertificateRequest(block.Bytes)
 	if err != nil {
-		return nil, nil, fmt.Errorf("generate host key: %w", err)
+		return nil, fmt.Errorf("parse the certificate request: %w", err)
+	}
+	if err := csr.CheckSignature(); err != nil {
+		return nil, fmt.Errorf("the certificate request is not signed by its key: %w", err)
+	}
+	pub, ok := csr.PublicKey.(*ecdsa.PublicKey)
+	if !ok || pub.Curve != elliptic.P256() {
+		return nil, fmt.Errorf("the certificate request's key is not a P-256 ECDSA key")
+	}
+	if prevPub, ok := prev.PublicKey.(*ecdsa.PublicKey); ok && prevPub.Equal(pub) {
+		return nil, fmt.Errorf("the certificate request reuses the installed key; a renewal needs a new one")
 	}
 	serial, err := randomSerial()
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	ext, err := asn1.Marshal(prev.SerialNumber)
 	if err != nil {
-		return nil, nil, fmt.Errorf("encode predecessor serial: %w", err)
+		return nil, fmt.Errorf("encode predecessor serial: %w", err)
 	}
 	template := &x509.Certificate{
 		SerialNumber: serial,
@@ -129,16 +146,11 @@ func RenewHostCert(caCertPath, caKeyPath string, prev *x509.Certificate, hostNam
 		ExtKeyUsage:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 		ExtraExtensions: []pkix.Extension{{Id: hostCertRenewalOfOID, Critical: false, Value: ext}},
 	}
-	certDER, err := x509.CreateCertificate(rand.Reader, template, caCert, &key.PublicKey, caKey)
+	certDER, err := x509.CreateCertificate(rand.Reader, template, caCert, pub, caKey)
 	if err != nil {
-		return nil, nil, fmt.Errorf("create host cert: %w", err)
+		return nil, fmt.Errorf("create host cert: %w", err)
 	}
-	keyDER, err := x509.MarshalECPrivateKey(key)
-	if err != nil {
-		return nil, nil, fmt.Errorf("marshal host key: %w", err)
-	}
-	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER}),
-		pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), nil
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER}), nil
 }
 
 func hasUsage(c *x509.Certificate, u x509.ExtKeyUsage) bool {

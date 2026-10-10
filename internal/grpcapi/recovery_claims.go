@@ -89,7 +89,7 @@ func (s *Server) claimIdentity() (*corrosion.ClaimSigner, *corrosion.ClaimVerifi
 	defer c.mu.Unlock()
 	if c.signer != nil && c.verifier != nil {
 		s.followRenewedIdentityLocked(c)
-		return c.signer, c.verifier, nil
+		return c.signer, s.verifierPolicy(c.verifier), nil
 	}
 	if c.loadErr != nil && time.Since(c.loadedAt) < claimIdentityRetry {
 		return nil, nil, c.loadErr
@@ -106,7 +106,18 @@ func (s *Server) claimIdentity() (*corrosion.ClaimSigner, *corrosion.ClaimVerifi
 		return nil, nil, c.loadErr
 	}
 	c.signer, c.verifier, c.loadErr = signer, verifier, nil
-	return signer, verifier, nil
+	return signer, s.verifierPolicy(verifier), nil
+}
+
+// verifierPolicy applies this node's recovery switch to the claim verifier:
+// under auth.trust_rotated_peer_certs the serial pin is off, exactly as peer
+// trust's is, because a fleet whose recorded serials went stale would
+// otherwise refuse every claim certificate too.
+func (s *Server) verifierPolicy(v *corrosion.ClaimVerifier) *corrosion.ClaimVerifier {
+	if s.trustRotatedPeerCerts {
+		return v.WithoutSerialPin()
+	}
+	return v
 }
 
 // followRenewedIdentityLocked moves the cached signer onto the host identity

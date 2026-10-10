@@ -18,107 +18,44 @@ import (
 	"google.golang.org/grpc"
 )
 
-// dirTarget is a remotePKI over a local directory standing in for the host's
-// /etc/litevirt/pki.
-type dirTarget struct {
-	dir      string
-	failMv   bool
-	reloaded bool
-}
-
-func (d *dirTarget) local(path string) string {
-	return filepath.Join(d.dir, strings.TrimPrefix(path, remotePKIDir+"/"))
-}
-
-func (d *dirTarget) ReadFile(path string) ([]byte, bool, error) {
-	b, err := os.ReadFile(d.local(path))
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, false, nil
-	}
-	return b, err == nil, err
-}
-
-func (d *dirTarget) Install(files []installFile) error {
-	for _, f := range files {
-		st := d.local(stagedPath(f.path))
-		if err := os.WriteFile(st, f.data, f.mode); err != nil {
-			return err
-		}
-		if err := os.Chmod(st, f.mode); err != nil {
-			return err
-		}
-	}
-	for _, f := range files {
-		if b, err := os.ReadFile(d.local(f.path)); err == nil {
-			if err := os.WriteFile(d.local(f.path+preRenewSuffix), b, 0o600); err != nil {
-				return err
-			}
-		}
-	}
-	if d.failMv {
-		return errors.New("mv: injected failure")
-	}
-	for _, f := range files {
-		if err := os.Rename(d.local(stagedPath(f.path)), d.local(f.path)); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (d *dirTarget) Rollback(files []installFile) error {
-	for _, f := range files {
-		b := d.local(f.path + preRenewSuffix)
-		if _, err := os.Stat(b); err == nil {
-			if err := os.Rename(b, d.local(f.path)); err != nil {
-				return err
-			}
-		}
-		os.Remove(d.local(stagedPath(f.path)))
-	}
-	return nil
-}
-
-func (d *dirTarget) Commit(files []installFile) error {
-	for _, f := range files {
-		os.Remove(d.local(f.path + preRenewSuffix))
-	}
-	return nil
-}
-
-func (d *dirTarget) ReloadLibvirtTLS() error { d.reloaded = true; return nil }
-
-func (d *dirTarget) Remove(paths []string) error {
-	for _, p := range paths {
-		if err := os.Remove(d.local(p)); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
-	}
-	return nil
-}
+// dirTarget is the host side over a test directory.
+type dirTarget = LocalRemotePKI
 
 type renewTestClient struct {
 	pb.LiteVirtClient
 	recorded  func() string
+	versions  map[string]string
 	published int
-	voters    []string
-}
-
-func (c *renewTestClient) GetVoterConfig(context.Context, *pb.GetVoterConfigRequest, ...grpc.CallOption) (*pb.GetVoterConfigResponse, error) {
-	resp := &pb.GetVoterConfigResponse{AdoptedGeneration: 3, Explicit: len(c.voters) > 0}
-	for _, v := range c.voters {
-		resp.Members = append(resp.Members, &pb.VoterMemberStatus{Name: v})
-	}
-	return resp, nil
+	// hold makes RevokeReplacedCertificate answer "owed".
+	hold      bool
+	revokeReq []string // serials asked to revoke via RevokeReplacedCertificate
 }
 
 func (c *renewTestClient) ListHosts(context.Context, *pb.ListHostsRequest, ...grpc.CallOption) (*pb.ListHostsResponse, error) {
-	return &pb.ListHostsResponse{Hosts: []*pb.Host{{Name: "node-r", Address: "10.0.0.9", CertSerial: c.recorded()}}}, nil
+	hosts := []*pb.Host{{Name: "node-r", Address: "10.0.0.9", CertSerial: c.recorded(), Version: c.versions["node-r"]},
+		{Name: "node-o", Address: "10.0.0.10", CertSerial: "0ddba11", Version: c.versions["node-o"]}}
+	return &pb.ListHostsResponse{Hosts: hosts}, nil
 }
 
 func (c *renewTestClient) PublishCRL(context.Context, *pb.PublishCRLRequest, ...grpc.CallOption) (*pb.PublishCRLResponse, error) {
 	c.published++
 	return &pb.PublishCRLResponse{Version: 3}, nil
+}
+
+func (c *renewTestClient) RevokeReplacedCertificate(_ context.Context, req *pb.RevokeReplacedCertificateRequest, _ ...grpc.CallOption) (*pb.RevokeReplacedCertificateResponse, error) {
+	listed := false
+	for _, s := range pki.CRLSerials([]byte(req.CrlPem)) {
+		listed = listed || s == req.Serial
+	}
+	if !listed {
+		return nil, errors.New("CRL does not list the serial")
+	}
+	c.revokeReq = append(c.revokeReq, req.Serial)
+	if c.hold {
+		return &pb.RevokeReplacedCertificateResponse{Held: true, Reason: "voter generation 3 would not verify"}, nil
+	}
+	c.published++
+	return &pb.RevokeReplacedCertificateResponse{Revoked: true, Version: 4}, nil
 }
 
 type renewFixture struct {
@@ -156,16 +93,15 @@ func newRenewFixture(t *testing.T) *renewFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f := &renewFixture{op: op, host: host, prevSerial: strings.ToLower(prev), target: &dirTarget{dir: host}}
+	f := &renewFixture{op: op, host: host, prevSerial: strings.ToLower(prev), target: &dirTarget{Dir: host}}
 	// The daemon's re-record: the cluster follows whatever the host serves.
-	f.client = &renewTestClient{recorded: func() string {
+	f.client = &renewTestClient{versions: map[string]string{"node-r": "v1", "node-o": "v1"}, recorded: func() string {
 		c, err := pki.ServedHostCertificate(host)
 		if err != nil {
 			return f.prevSerial
 		}
 		return strings.ToLower(c.SerialNumber.Text(16))
 	}}
-	// The running daemon has loaded its identity before any renewal.
 	if _, err := pki.ServedHostCertificate(host); err != nil {
 		t.Fatal(err)
 	}
@@ -180,9 +116,18 @@ func (f *renewFixture) probe(context.Context) (*x509.Certificate, error) {
 func (f *renewFixture) run(t *testing.T, opts RenewCertOptions, probe servedCertProbe) error {
 	t.Helper()
 	if opts.Wait == 0 {
-		opts.Wait = time.Millisecond
+		opts.Wait = 10 * time.Millisecond
 	}
 	return renewHostCert(context.Background(), f.client, f.target, probe, "node-r", opts)
+}
+
+func (f *renewFixture) served(t *testing.T) string {
+	t.Helper()
+	c, err := pki.ServedHostCertificate(f.host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.ToLower(c.SerialNumber.Text(16))
 }
 
 func crlHas(t *testing.T, op, serial string) bool {
@@ -199,11 +144,23 @@ func crlHas(t *testing.T, op, serial string) bool {
 	return false
 }
 
-// A renewal installs a successor (key 0600), the running host serves it, and
-// only then is the old certificate revoked and the CRL published.
+func noKeyFilesUnder(t *testing.T, dir string) {
+	t.Helper()
+	_ = filepath.Walk(dir, func(p string, fi os.FileInfo, err error) error {
+		if err == nil && !fi.IsDir() && strings.HasSuffix(p, ".key") && !strings.HasSuffix(p, "ca.key") && !strings.HasSuffix(p, "client.key") {
+			t.Errorf("a private key landed on the CA machine: %s", p)
+		}
+		return nil
+	})
+}
+
+// A renewal: the host generates the key, the CA signs only the request, the
+// running host serves the successor, and the replaced certificate is revoked
+// through the cluster (RevokeReplacedCertificate), after which this machine's
+// crl.pem carries it.
 //
-// Mutations: install the key with mode 0644 — the mode check fails; skip
-// revokeHostCert — the old serial is not in the CRL.
+// Mutations: skip revokeReplaced — nothing is revoked; skip the crl.pem update
+// on a published revocation — the local CRL misses the serial.
 func TestRenewHostCert_InstallsConfirmsAndRevokes(t *testing.T) {
 	f := newRenewFixture(t)
 	if err := f.run(t, RenewCertOptions{}, f.probe); err != nil {
@@ -223,49 +180,124 @@ func TestRenewHostCert_InstallsConfirmsAndRevokes(t *testing.T) {
 	if from, ok := pki.RenewedFromSerial(served); !ok || from != f.prevSerial {
 		t.Fatalf("the host serves %s, not a successor of %s", served.SerialNumber.Text(16), f.prevSerial)
 	}
-	if !crlHas(t, f.op, f.prevSerial) || f.client.published != 1 {
-		t.Fatalf("the replaced certificate was not revoked and published (published=%d)", f.client.published)
+	if len(f.client.revokeReq) != 1 || f.client.revokeReq[0] != f.prevSerial || !crlHas(t, f.op, f.prevSerial) {
+		t.Fatalf("the replaced certificate was not revoked (asked %v)", f.client.revokeReq)
 	}
 	if crlHas(t, f.op, served.SerialNumber.Text(16)) {
 		t.Fatal("the renewed certificate was revoked")
 	}
-	for _, n := range []string{"host.crt" + preRenewSuffix, "host.key" + preRenewSuffix, ".host.key.renew"} {
-		if _, err := os.Stat(filepath.Join(f.host, n)); err == nil {
-			t.Fatalf("%s was left behind (a second copy of a key)", n)
-		}
+	if _, err := os.Stat(filepath.Join(f.host, "host.d", f.prevSerial)); !os.IsNotExist(err) {
+		t.Fatal("the replaced key was left on the host")
 	}
+	noKeyFilesUnder(t, f.op)
 	if !f.target.reloaded {
 		t.Fatal("libvirt's TLS listener was not asked to reload")
 	}
 }
 
-// A host that does not start presenting the successor gets its old pair back,
-// and nothing is revoked — revoking a certificate the host still presents
-// would cut it off from every peer.
+// When the cluster holds the revocation as owed, this machine's crl.pem must
+// NOT carry the serial: the next CRL minted here would publish it early.
 //
-// Mutation: drop the Rollback in the probe-failure branch — host.crt stays the
-// unserved successor; or revoke before confirming — the CRL holds the old serial.
-func TestRenewHostCert_RollsBackWhenTheHostDoesNotPresentIt(t *testing.T) {
+// Mutation: write the minted CRL to crl.pem on a held answer too.
+func TestRenewHostCert_AnOwedRevocationStaysOutOfTheLocalCRL(t *testing.T) {
+	f := newRenewFixture(t)
+	f.client.hold = true
+	if err := f.run(t, RenewCertOptions{}, f.probe); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.client.revokeReq) != 1 {
+		t.Fatal("the revocation was not handed to the cluster")
+	}
+	if crlHas(t, f.op, f.prevSerial) {
+		t.Fatal("a held revocation was written to the local crl.pem")
+	}
+}
+
+// A host that demonstrably still presents the old certificate, with the new
+// one unrecorded, is switched back — and the successor nobody presents is
+// revoked.
+//
+// Mutation: skip abandonIssued after the rollback — the successor stays valid.
+func TestRenewHostCert_RollsBackAndRevokesTheUnusedSuccessor(t *testing.T) {
 	f := newRenewFixture(t)
 	prevPEM, _ := os.ReadFile(filepath.Join(f.host, "host.crt"))
-	stuck := func(context.Context) (*x509.Certificate, error) { return pki.ParseCertPEM(prevPEM) }
-	if err := f.run(t, RenewCertOptions{}, stuck); err == nil {
+	old, _ := pki.ParseCertPEM(prevPEM)
+	f.client.recorded = func() string { return f.prevSerial }
+	stuck := func(context.Context) (*x509.Certificate, error) { return old, nil }
+	err := f.run(t, RenewCertOptions{}, stuck)
+	if err == nil {
 		t.Fatal("a renewal the host never presented reported success")
 	}
-	now, _ := os.ReadFile(filepath.Join(f.host, "host.crt"))
-	if string(now) != string(prevPEM) {
-		t.Fatal("the previous certificate was not restored")
+	if got := f.served(t); got != f.prevSerial {
+		t.Fatalf("the host was not switched back (serves %s)", got)
 	}
-	if crlHas(t, f.op, f.prevSerial) || f.client.published != 0 {
-		t.Fatal("a certificate the host still presents was revoked")
+	if crlHas(t, f.op, f.prevSerial) {
+		t.Fatal("the certificate the host still presents was revoked")
 	}
-	if _, err := tlsPairMatches(f.host); err != nil {
-		t.Fatalf("the restored pair does not match: %v", err)
+	var successor string
+	for _, e := range readRenewalLog(f.op) {
+		if e.State == "abandoned" {
+			successor = e.Serial
+		}
+	}
+	if successor == "" || !crlHas(t, f.op, successor) {
+		t.Fatalf("the unused successor %q was not revoked", successor)
+	}
+}
+
+// A probe that only FAILS proves nothing: when the cluster already records the
+// successor, the host adopted it, and rolling back would cut it off.
+//
+// Mutation: roll back on any probe error — the host ends on the old
+// certificate while the cluster records the new one.
+func TestRenewHostCert_AProbeErrorAfterAdoptionDoesNotRollBack(t *testing.T) {
+	f := newRenewFixture(t)
+	blind := func(ctx context.Context) (*x509.Certificate, error) {
+		_, _ = f.probe(ctx) // the daemon still adopts at its own handshakes
+		return nil, errors.New("connection refused")
+	}
+	if err := f.run(t, RenewCertOptions{}, blind); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.served(t); got == f.prevSerial {
+		t.Fatal("rolled back a renewal the cluster had recorded")
+	}
+	if !crlHas(t, f.op, f.prevSerial) {
+		t.Fatal("the replaced certificate was not revoked")
+	}
+}
+
+// A probe that fails while nothing is recorded: leave everything as it is.
+func TestRenewHostCert_AnUnconfirmedRenewalIsLeftAlone(t *testing.T) {
+	f := newRenewFixture(t)
+	f.client.recorded = func() string { return f.prevSerial }
+	blind := func(context.Context) (*x509.Certificate, error) { return nil, errors.New("timeout") }
+	if err := f.run(t, RenewCertOptions{}, blind); err == nil {
+		t.Fatal("an unconfirmed renewal reported success")
+	}
+	if got := f.served(t); got == f.prevSerial {
+		t.Fatal("rolled back on a probe that proved nothing")
+	}
+	if f.client.published != 0 || len(f.client.revokeReq) != 0 {
+		t.Fatal("revoked something without knowing what the host presents")
+	}
+}
+
+// An install that reports an error after the switch (a dropped connection)
+// is recognised from the host's files and completes.
+func TestRenewHostCert_AnErrorAfterTheSwitchCompletes(t *testing.T) {
+	f := newRenewFixture(t)
+	f.target.FailInstallAfterSwitch = true
+	if err := f.run(t, RenewCertOptions{}, f.probe); err != nil {
+		t.Fatal(err)
+	}
+	if !crlHas(t, f.op, f.prevSerial) {
+		t.Fatal("the renewal did not complete")
 	}
 }
 
 // When the cluster's record and the installed certificate disagree, nothing is
-// touched: a successor of an unrecorded certificate is refused by every peer.
+// touched.
 //
 // Mutation: drop the recorded-serial comparison — the renewal proceeds.
 func TestRenewHostCert_RefusesWhenTheRecordDisagrees(t *testing.T) {
@@ -273,12 +305,26 @@ func TestRenewHostCert_RefusesWhenTheRecordDisagrees(t *testing.T) {
 	f.client.recorded = func() string { return "deadbeef" }
 	before, _ := os.ReadFile(filepath.Join(f.host, "host.crt"))
 	err := f.run(t, RenewCertOptions{}, f.probe)
-	if err == nil || !strings.Contains(err.Error(), "records certificate deadbeef") {
+	if err == nil || !strings.Contains(err.Error(), `records certificate "deadbeef"`) {
 		t.Fatalf("got %v, want a refusal naming the recorded serial", err)
 	}
 	after, _ := os.ReadFile(filepath.Join(f.host, "host.crt"))
 	if string(after) != string(before) {
 		t.Fatal("the host certificate was changed despite the refusal")
+	}
+}
+
+// Mixed builds refuse without --force.
+//
+// Mutation: drop sameBuildEverywhere — the renewal proceeds.
+func TestRenewHostCert_RefusesMixedBuildsWithoutForce(t *testing.T) {
+	f := newRenewFixture(t)
+	f.client.versions["node-o"] = "v0"
+	if err := f.run(t, RenewCertOptions{}, f.probe); err == nil || !strings.Contains(err.Error(), "different build") {
+		t.Fatalf("got %v, want a mixed-build refusal", err)
+	}
+	if err := f.run(t, RenewCertOptions{Force: true}, f.probe); err != nil {
+		t.Fatalf("--force: %v", err)
 	}
 }
 
@@ -288,16 +334,14 @@ func TestRenewHostCert_KeepOldDoesNotRevoke(t *testing.T) {
 	if err := f.run(t, RenewCertOptions{KeepOld: true}, f.probe); err != nil {
 		t.Fatal(err)
 	}
-	if crlHas(t, f.op, f.prevSerial) || f.client.published != 0 {
+	if crlHas(t, f.op, f.prevSerial) || f.client.published != 0 || len(f.client.revokeReq) != 0 {
 		t.Fatal("--keep-old revoked the previous certificate")
 	}
 }
 
-// A re-added host's audit admission record is bound to its certificate serial;
-// the renewal re-signs it so the daemon still honours it on the next start.
+// A re-added host's audit admission record is re-signed for the new serial.
 //
-// Mutation: skip resignedRejoin — LoadAuditRejoin rejects the record as
-// "left over from an earlier admission".
+// Mutation: skip resignedRejoin — LoadAuditRejoin rejects the record.
 func TestRenewHostCert_CarriesTheAuditRejoinRecord(t *testing.T) {
 	f := newRenewFixture(t)
 	rj, err := corrosion.SignAuditRejoin(f.op, "node-r", f.prevSerial, 12, "abc")
@@ -320,7 +364,8 @@ func TestRenewHostCert_CarriesTheAuditRejoinRecord(t *testing.T) {
 	}
 }
 
-// A record that does not verify is not laundered into a valid one.
+// A record that does not verify is not laundered; the signed successor is
+// revoked since it will never be installed.
 func TestRenewHostCert_RefusesToResignAForgedRejoinRecord(t *testing.T) {
 	f := newRenewFixture(t)
 	forged := corrosion.AuditRejoin{Host: "node-r", CertSerial: f.prevSerial, Seq: 1, Hash: "x", Signature: "00"}
@@ -331,56 +376,53 @@ func TestRenewHostCert_RefusesToResignAForgedRejoinRecord(t *testing.T) {
 	if err := f.run(t, RenewCertOptions{}, f.probe); err == nil {
 		t.Fatal("re-signed an admission record the CA never signed")
 	}
+	if f.served(t) != f.prevSerial {
+		t.Fatal("installed a renewal after refusing")
+	}
 }
 
-func tlsPairMatches(dir string) (bool, error) {
-	_, err := pki.NewKeyPairSource(filepath.Join(dir, "host.crt"), filepath.Join(dir, "host.key"), nil).Get()
-	return err == nil, err
-}
-
-// A voter's replaced certificate is not revoked by default: the adopted voter
-// generation carries its votes signed with it, and a later adopter checks them
-// against the CRL. --revoke-old overrides.
+// revoke-cert accepts only a serial known to be the host's, and fences
+// nothing by accident.
 //
-// Mutation: drop the voterRevocationHold check — the voter's old certificate
-// is revoked by default.
-func TestRenewHostCert_HoldsAVotersRevocation(t *testing.T) {
-	f := newRenewFixture(t)
-	f.client.voters = []string{"node-a", "node-r"}
-	if err := f.run(t, RenewCertOptions{}, f.probe); err != nil {
-		t.Fatal(err)
-	}
-	if crlHas(t, f.op, f.prevSerial) || f.client.published != 0 {
-		t.Fatal("a voter's replaced certificate was revoked by default")
-	}
-
-	g := newRenewFixture(t)
-	g.client.voters = []string{"node-r"}
-	if err := g.run(t, RenewCertOptions{RevokeOld: true}, g.probe); err != nil {
-		t.Fatal(err)
-	}
-	if !crlHas(t, g.op, g.prevSerial) {
-		t.Fatal("--revoke-old did not revoke a voter's replaced certificate")
-	}
-}
-
-// revoke-cert refuses the serial the cluster records — that would cut the
-// host off — and revokes a replaced one.
-//
-// Mutation: drop the recorded-serial refusal — the live certificate is revoked.
-func TestHostRevokeCert_RefusesTheLiveCertificate(t *testing.T) {
+// Mutations: drop the other-host check (another host's live certificate is
+// revoked); drop the probe-failure refusal; drop the known-serial check.
+func TestHostRevokeCert_Guards(t *testing.T) {
 	f := newRenewFixture(t)
 	ctx := context.Background()
-	if err := HostRevokeCert(ctx, f.client, "node-r", f.prevSerial, 1); err == nil {
-		t.Fatal("revoked the certificate the cluster records for the host")
-	}
-	if crlHas(t, f.op, f.prevSerial) {
-		t.Fatal("the live certificate reached the CRL")
-	}
-	if err := HostRevokeCert(ctx, f.client, "node-r", "0xABCDEF", 1); err != nil {
+	if err := f.run(t, RenewCertOptions{KeepOld: true}, f.probe); err != nil {
 		t.Fatal(err)
 	}
-	if !crlHas(t, f.op, "abcdef") || f.client.published != 1 {
-		t.Fatal("a replaced certificate was not revoked and published")
+	live := f.served(t)
+	ok := f.probe
+	down := func(context.Context) (*x509.Certificate, error) { return nil, errors.New("unreachable") }
+
+	// Even a serial this machine's log (wrongly) attributes to node-r is
+	// refused while another host is recorded with it.
+	logRenewal(f.op, renewalEntry{Host: "node-r", Serial: "0ddba11", State: "issued"})
+	if err := hostRevokeCert(ctx, f.client, "node-r", "0ddba11", false, ok, 0); err == nil ||
+		!strings.Contains(err.Error(), "records for node-o") {
+		t.Errorf("another host's live certificate was not refused as node-o's: %v", err)
+	}
+	if err := hostRevokeCert(ctx, f.client, "node-r", "0ddba11", true, ok, 0); err == nil {
+		t.Error("--force revoked ANOTHER host's live certificate")
+	}
+	if err := hostRevokeCert(ctx, f.client, "node-r", live, false, ok, 0); err == nil ||
+		!strings.Contains(err.Error(), "FENCED") {
+		t.Errorf("revoked the host's live certificate without --force: %v", err)
+	}
+	if err := hostRevokeCert(ctx, f.client, "node-r", "abcdef", false, ok, 0); err == nil {
+		t.Error("revoked a serial nobody knows to be this host's")
+	}
+	if err := hostRevokeCert(ctx, f.client, "node-r", f.prevSerial, false, down, 0); err == nil {
+		t.Error("revoked without being able to read what the host presents")
+	}
+	if crlHas(t, f.op, f.prevSerial) || crlHas(t, f.op, live) {
+		t.Fatal("a refused revocation reached the CRL")
+	}
+	if err := hostRevokeCert(ctx, f.client, "node-r", f.prevSerial, false, ok, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !crlHas(t, f.op, f.prevSerial) {
+		t.Fatal("the replaced certificate was not revoked")
 	}
 }

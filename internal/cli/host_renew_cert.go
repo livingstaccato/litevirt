@@ -15,12 +15,14 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/pki"
+	"github.com/litevirt/litevirt/internal/secretfile"
 	"github.com/litevirt/litevirt/internal/ssh"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 // HostRenewCert replaces a running host's cluster (mTLS) certificate with a
@@ -29,36 +31,35 @@ import (
 //
 // Why each step is where it is:
 //
-//   - The successor names the installed certificate as its predecessor
-//     (pki.RenewHostCert). Peers pin each host's serial, and that pin is what
-//     keeps a re-admitted name's old certificate out — so it cannot just be
-//     relaxed. A peer whose record still names the predecessor accepts the
-//     successor at once, which is what makes the swap invisible to the cluster.
-//     The command refuses if the cluster's record and the installed
-//     certificate disagree: a successor of a certificate nobody recorded would
-//     be refused by every peer until replication caught up.
+//   - The host generates the new key and a certificate request
+//     (`litevirt host-pki gen-csr`, pki.GenerateRenewalCSR); this machine signs
+//     only the request (pki.SignRenewal). The private key never crosses SSH or
+//     sits in this process.
+//   - The successor names the installed certificate as its predecessor. Peers
+//     pin each host's serial, and that pin is what keeps a re-admitted name's
+//     old certificate out — so it cannot just be relaxed. A peer whose record
+//     still names the predecessor accepts the successor at once. The command
+//     refuses if the cluster's record and the installed certificate disagree.
+//   - The host installs it as ONE atomic switch (pki.InstallRenewal), so a
+//     crash or a dropped connection at any point leaves a pair the daemon can
+//     start with, and the daemon repairs an interrupted switch at start.
 //   - The daemon serves its identity from disk at handshake time and re-records
-//     its own serial within a minute (pki.KeyPairSource, daemon certWatch), so
-//     installing the files is the whole hand-over. The command then CHECKS that
-//     the host presents the new certificate before going further, and puts the
-//     old pair back if it does not.
-//   - Only then is the old certificate revoked. Revocation is what makes a
-//     renewal retire a key rather than add one: without it the old certificate
-//     stays a valid client credential for the rest of its five years. It comes
-//     last because a host still presenting a revoked certificate is refused by
-//     every peer — the one outcome this command must never produce.
+//     its own serial within a minute, so installing is the whole hand-over.
+//     The command CHECKS that the host presents the new certificate.
+//   - It rolls back only when the host demonstrably still presents the old
+//     certificate and the cluster does not record the new one. A probe that
+//     merely fails proves nothing either way, so nothing is undone on it. A
+//     successor that was issued and then abandoned is revoked.
+//   - Then the replaced certificate is revoked (RevokeReplacedCertificate):
+//     at once, or — when that would leave the newest voter generation
+//     unverifiable for a node adopting it later — as an owed revocation the
+//     cluster publishes itself once it is safe.
 //   - An audit admission record (audit-rejoin.json) is bound to the host
-//     certificate's serial and ignored for any other. A re-added host renewed
-//     before its audit history caught up would lose its hold on the next
-//     start, so the record is re-signed for the new serial in the same swap.
+//     certificate's serial; it is re-signed for the new serial.
 //
-// libvirt's TLS listener (qemu+tls:// migration) reads the same files through
-// symlinks but only when told to; the command asks it to reload, and says so if
-// it cannot. libvirt does not consult the cluster CRL, so a listener still on
-// the old certificate keeps working until its next restart.
-//
-// Migration-TLS certificates (pki_dir/migration, a separate CA) are not
-// touched; they are rotated with the migration CA.
+// libvirt's TLS listener is asked to reload; libvirt does not consult the
+// cluster CRL, so a listener still on the old certificate keeps working.
+// Migration-TLS certificates (pki_dir/migration, a separate CA) are not touched.
 type RenewCertOptions struct {
 	// SSHTarget reaches the host; default root@<host>.
 	SSHTarget string
@@ -67,28 +68,37 @@ type RenewCertOptions struct {
 	GRPCPort int
 	// KeepOld leaves the replaced certificate unrevoked.
 	KeepOld bool
-	// RevokeOld revokes the replaced certificate even when the host is a
-	// member of the adopted voter generation (see voterRevocationHold).
+	// RevokeOld revokes the replaced certificate immediately, even when the
+	// voter chain would hold it.
 	RevokeOld bool
+	// Force renews although hosts run different builds.
+	Force bool
 	// Wait bounds each confirmation (served certificate, re-recorded serial).
 	Wait time.Duration
 }
 
 const remotePKIDir = "/etc/litevirt/pki"
 
-// remotePKI is what installing key material needs from the host's machine.
-// The SSH form is sshRemotePKI; tests use a directory.
+// remotePKI is what renewal and the UI certificate need from the host's
+// machine. sshRemotePKI runs it over SSH; LocalRemotePKI on a directory.
 type remotePKI interface {
 	// ReadFile returns path's contents, or ok=false when it does not exist.
 	ReadFile(path string) (data []byte, ok bool, err error)
-	// Install puts each file in place, keeping the files it replaces so
-	// Rollback can restore them. Every file lands by rename; the private key
-	// is never readable beyond its mode.
-	Install(files []installFile) error
-	// Rollback restores what the last Install replaced.
-	Rollback(files []installFile) error
-	// Commit drops the copies Install kept.
-	Commit(files []installFile) error
+	// GenCSR has the host generate a new key and return a request for it.
+	GenCSR(hostName string) (staging string, csrPEM []byte, err error)
+	// InstallIdentity atomically switches the host to certPEM over the staged key.
+	InstallIdentity(staging string, certPEM []byte) error
+	// AbandonStaging discards a staged key that will not be installed.
+	AbandonStaging(staging string) error
+	// RollbackIdentity switches the host back to serial.
+	RollbackIdentity(serial string) error
+	// CommitIdentity deletes every identity but the current one.
+	CommitIdentity() error
+	// InstallFiles puts each file in place (each by rename), keeping the
+	// files it replaces so RollbackFiles can restore them.
+	InstallFiles(files []installFile) error
+	RollbackFiles(files []installFile) error
+	CommitFiles(files []installFile) error
 	// ReloadLibvirtTLS asks libvirt's TLS listener to re-read its certificate.
 	ReloadLibvirtTLS() error
 	// Remove deletes each path, in order; an absent path is not an error.
@@ -114,12 +124,6 @@ func HostRenewCert(ctx context.Context, c pb.LiteVirtClient, hostName string, op
 	if opts.SSHTarget == "" {
 		opts.SSHTarget = "root@" + hostName
 	}
-	if opts.GRPCPort == 0 {
-		opts.GRPCPort = 7443
-	}
-	if opts.Wait == 0 {
-		opts.Wait = 90 * time.Second
-	}
 	addr, err := hostAddress(ctx, c, hostName)
 	if err != nil {
 		return err
@@ -129,16 +133,33 @@ func HostRenewCert(ctx context.Context, c pb.LiteVirtClient, hostName string, op
 		return fmt.Errorf("SSH connect: %w", err)
 	}
 	defer sc.Close()
-	probe := func(ctx context.Context) (*x509.Certificate, error) {
-		return dialServedCert(ctx, net.JoinHostPort(addr, strconv.Itoa(opts.GRPCPort)))
-	}
-	return renewHostCert(ctx, c, &sshRemotePKI{sc: sc}, probe, hostName, opts)
+	return renewHostCert(ctx, c, &sshRemotePKI{sc: sc}, GRPCProbe(addr, opts.GRPCPort), hostName, opts)
 }
 
-// renewHostCert is HostRenewCert past the connections, so it can be driven
-// against a directory and a fake cluster.
+// RenewHostCertOn renews hostName through r — LocalRemotePKI for a host whose
+// pki directory this machine can reach directly — confirming with probe.
+func RenewHostCertOn(ctx context.Context, c pb.LiteVirtClient, r *LocalRemotePKI, probe func(context.Context) (*x509.Certificate, error),
+	hostName string, opts RenewCertOptions) error {
+	return renewHostCert(ctx, c, r, probe, hostName, opts)
+}
+
+// GRPCProbe dials addr:port with this machine's cluster credentials and
+// returns the certificate it presents.
+func GRPCProbe(addr string, port int) func(context.Context) (*x509.Certificate, error) {
+	if port == 0 {
+		port = 7443
+	}
+	return func(ctx context.Context) (*x509.Certificate, error) {
+		return dialServedCert(ctx, net.JoinHostPort(addr, strconv.Itoa(port)))
+	}
+}
+
+// renewHostCert is HostRenewCert past the connections.
 func renewHostCert(ctx context.Context, c pb.LiteVirtClient, r remotePKI, probe servedCertProbe,
 	hostName string, opts RenewCertOptions) error {
+	if opts.Wait == 0 {
+		opts.Wait = 90 * time.Second
+	}
 	pkiDir := PKIDir()
 	certPath := filepath.Join(remotePKIDir, "host.crt")
 	prevPEM, ok, err := r.ReadFile(certPath)
@@ -151,82 +172,129 @@ func renewHostCert(ctx context.Context, c pb.LiteVirtClient, r remotePKI, probe 
 	}
 	prevSerial := strings.ToLower(prev.SerialNumber.Text(16))
 
-	recorded, err := hostCertSerial(ctx, c, hostName)
+	hosts, err := c.ListHosts(ctx, &pb.ListHostsRequest{})
 	if err != nil {
-		return fmt.Errorf("read %s's recorded certificate serial: %w", hostName, err)
+		return fmt.Errorf("list hosts: %w", err)
 	}
-	if !strings.EqualFold(recorded, prevSerial) {
-		return fmt.Errorf("the cluster records certificate %s for %s, but the host holds %s. A successor "+
+	recorded := ""
+	for _, h := range hosts.Hosts {
+		if h.Name == hostName {
+			recorded = strings.ToLower(h.CertSerial)
+		}
+	}
+	if recorded != prevSerial {
+		return fmt.Errorf("the cluster records certificate %q for %s, but the host holds %s. A successor "+
 			"of a certificate the cluster does not record would be refused by every peer until "+
 			"replication catches up. The daemon re-records its own serial within a minute of starting "+
 			"(or of adopting a renewal) — wait for `lv host inspect %s` to show %s, then retry",
 			recorded, hostName, prevSerial, hostName, prevSerial)
 	}
+	if err := sameBuildEverywhere(hosts.Hosts, hostName); err != nil && !opts.Force {
+		return err
+	}
 
-	certPEM, keyPEM, err := pki.RenewHostCert(filepath.Join(pkiDir, "ca.crt"), filepath.Join(pkiDir, "ca.key"), prev, hostName)
+	staging, csr, err := r.GenCSR(hostName)
 	if err != nil {
-		return fmt.Errorf("mint the renewed certificate: %w", err)
+		return fmt.Errorf("have %s generate its new key (it needs this build of litevirt): %w", hostName, err)
+	}
+	certPEM, err := pki.SignRenewal(filepath.Join(pkiDir, "ca.crt"), filepath.Join(pkiDir, "ca.key"), prev, hostName, csr)
+	if err != nil {
+		_ = r.AbandonStaging(staging)
+		return fmt.Errorf("sign the renewal: %w", err)
 	}
 	next, err := pki.ParseCertPEM(certPEM)
 	if err != nil {
 		return err
 	}
 	nextSerial := strings.ToLower(next.SerialNumber.Text(16))
+	logRenewal(pkiDir, renewalEntry{Host: hostName, Previous: prevSerial, Serial: nextSerial, State: "issued"})
 
-	// Key first, certificate second: the daemon adopts a pair only once both
-	// match, so the order does not matter to it — but a reader of host.crt
-	// alone (the serial the daemon records at boot) should only ever see a
-	// certificate whose key is already in place.
-	files := []installFile{
-		{path: filepath.Join(remotePKIDir, "host.key"), data: keyPEM, mode: 0o600},
-		{path: certPath, data: certPEM, mode: 0o644},
-	}
 	rejoin, err := resignedRejoin(r, pkiDir, hostName, prevPEM, prevSerial, nextSerial)
 	if err != nil {
-		return err
-	}
-	if rejoin != nil {
-		files = append(files, *rejoin)
+		_ = r.AbandonStaging(staging)
+		return errors.Join(err, abandonIssued(ctx, c, hostName, nextSerial, "its audit admission record did not verify"))
 	}
 
 	slog.Info("installing renewed host certificate", "host", hostName, "serial", nextSerial, "replaces", prevSerial)
-	if err := r.Install(files); err != nil {
-		if rbErr := r.Rollback(files); rbErr != nil {
-			return fmt.Errorf("install the renewed certificate on %s: %w (and restoring the previous one "+
-				"failed: %v — check %s by hand)", hostName, err, rbErr, remotePKIDir)
+	if err := r.InstallIdentity(staging, certPEM); err != nil {
+		// Did the switch happen before the error (a dropped connection after
+		// it)? Ask the host's files rather than guess.
+		cur, ok, rerr := r.ReadFile(certPath)
+		switch {
+		case rerr == nil && ok && servedSerialOf(cur) == nextSerial:
+			slog.Warn("the install reported an error after switching; continuing", "error", err)
+		case rerr == nil && ok && servedSerialOf(cur) == prevSerial:
+			// Positively not switched: the successor will never be presented.
+			_ = r.AbandonStaging(staging)
+			return errors.Join(fmt.Errorf("install the renewed certificate on %s: %w", hostName, err),
+				abandonIssued(ctx, c, hostName, nextSerial, "it was never installed"))
+		default:
+			// Cannot tell whether the switch happened: revoking the successor
+			// could cut off a host that already presents it.
+			return fmt.Errorf("install the renewed certificate on %s: %w, and its installed certificate could not "+
+				"be read back (%v). Nothing was revoked. Check what %s/host.crt is: if it is %s the renewal took "+
+				"effect — revoke the replaced certificate with `lv host revoke-cert %s --serial %s`; if it is %s, "+
+				"revoke the unused successor with `lv host revoke-cert %s --serial %s`", hostName, err, rerr,
+				remotePKIDir, nextSerial, hostName, prevSerial, prevSerial, hostName, nextSerial)
 		}
-		return fmt.Errorf("install the renewed certificate on %s: %w (the previous one was restored)", hostName, err)
+	}
+	if rejoin != nil {
+		if err := r.InstallFiles([]installFile{*rejoin}); err != nil {
+			fmt.Printf("  WARNING: could not re-sign the audit admission record on %s (%v); a restart before "+
+				"its audit history arrives would not hold it\n", hostName, err)
+		} else {
+			_ = r.CommitFiles([]installFile{*rejoin})
+		}
 	}
 
-	served, err := waitServedSerial(ctx, probe, nextSerial, opts.Wait)
-	if err != nil {
-		rbErr := r.Rollback(files)
-		if rbErr != nil {
-			return fmt.Errorf("%s did not start presenting the renewed certificate (%v), and restoring the "+
-				"previous pair failed: %v — check %s by hand. Nothing was revoked", hostName, err, rbErr, remotePKIDir)
+	served, sawServed, perr := waitServedSerial(ctx, probe, nextSerial, opts.Wait)
+	if perr != nil {
+		recordedNow, _ := hostCertSerial(ctx, c, hostName)
+		switch {
+		case strings.EqualFold(recordedNow, nextSerial):
+			// Adopted and recorded: the probe is what failed. Rolling back now
+			// would make the host present a certificate peers no longer record.
+			fmt.Printf("  NOTE: could not confirm what %s presents (%v), but the cluster records the "+
+				"renewed serial, so the host adopted it\n", hostName, perr)
+		case sawServed && served == prevSerial:
+			// Demonstrably not adopted, not recorded: put it back, confirm, and
+			// revoke the successor nobody will ever present.
+			if rbErr := r.RollbackIdentity(prevSerial); rbErr != nil {
+				return fmt.Errorf("%s still presents %s, and switching it back failed: %v — check %s by hand. "+
+					"Nothing was revoked", hostName, prevSerial, rbErr, remotePKIDir)
+			}
+			if _, back, err := waitServedSerial(ctx, probe, prevSerial, opts.Wait); err != nil || !back {
+				return fmt.Errorf("%s was switched back to %s but its presented certificate could not be confirmed (%v); "+
+					"the unused successor %s was NOT revoked — revoke it with `lv host revoke-cert %s --serial %s` once "+
+					"the host is confirmed on %s", hostName, prevSerial, err, nextSerial, hostName, nextSerial, prevSerial)
+			}
+			return errors.Join(fmt.Errorf("%s did not start presenting the renewed certificate (%v); it is back on "+
+				"%s. Check `journalctl -u litevirt` on %s", hostName, perr, prevSerial, hostName),
+				abandonIssued(ctx, c, hostName, nextSerial, "the host never adopted it"))
+		default:
+			return fmt.Errorf("could not confirm what %s presents (%v; last: %s) and the cluster does not record "+
+				"the renewed serial yet. Nothing was rolled back or revoked: the renewal is installed on the host. "+
+				"Re-run `lv host inspect %s` until it shows %s, then revoke the replaced certificate with "+
+				"`lv host revoke-cert %s --serial %s`", hostName, perr, served, hostName, nextSerial, hostName, prevSerial)
 		}
-		return fmt.Errorf("%s did not start presenting the renewed certificate (%v, last presented %s); "+
-			"the previous pair was restored and nothing was revoked. Check `journalctl -u litevirt` on %s",
-			hostName, err, served, hostName)
 	}
-	if err := r.Commit(files); err != nil {
-		fmt.Printf("  NOTE: could not remove the previous pair's backup in %s: %v\n", remotePKIDir, err)
+	if err := r.CommitIdentity(); err != nil {
+		fmt.Printf("  NOTE: could not remove the replaced identity under %s/host.d: %v\n", remotePKIDir, err)
 	}
+	logRenewal(pkiDir, renewalEntry{Host: hostName, Previous: prevSerial, Serial: nextSerial, State: "installed"})
 
 	fmt.Printf("Host certificate renewed for %s\n", hostName)
 	fmt.Printf("  serial %s replaces %s; valid until %s\n", nextSerial, prevSerial, next.NotAfter.UTC().Format(time.RFC3339))
-	fmt.Printf("  %s presents it now — no restart; peers accept it as the recorded certificate's successor\n", hostName)
+	fmt.Printf("  %s generated the new key itself and presents the certificate now — no restart\n", hostName)
 	if rejoin != nil {
 		fmt.Println("  the host's audit admission record was re-signed for the new serial")
 	}
 	if err := r.ReloadLibvirtTLS(); err != nil {
 		fmt.Printf("  NOTE: libvirt's TLS listener did not reload (%v); it keeps serving the previous\n", err)
-		fmt.Println("  certificate for qemu+tls:// migration until it restarts. libvirt does not read the")
-		fmt.Println("  cluster CRL, so migrations keep working meanwhile")
+		fmt.Println("  certificate for qemu+tls:// migration until it restarts (libvirt does not read the CRL)")
 	} else {
 		fmt.Println("  libvirt's TLS listener reloaded the renewed certificate")
 	}
-
 	if waitRecordedSerial(ctx, c, hostName, nextSerial, opts.Wait) {
 		fmt.Println("  the cluster now records the renewed serial")
 	} else {
@@ -234,64 +302,119 @@ func renewHostCert(ctx context.Context, c pb.LiteVirtClient, r remotePKI, probe 
 		fmt.Println("  certificate's successor meanwhile, and the daemon keeps re-recording it")
 	}
 
-	if opts.KeepOld {
-		fmt.Printf("  the previous certificate %s was NOT revoked (--keep-old): peers no longer accept it as\n", prevSerial)
-		fmt.Printf("  %s once the new serial is recorded, but it stays a CA-valid credential until %s.\n",
-			hostName, prev.NotAfter.UTC().Format("2006-01-02"))
-		fmt.Printf("  Revoke it later with `lv host revoke-cert %s --serial %s`\n", hostName, prevSerial)
+	switch {
+	case opts.KeepOld:
+		fmt.Printf("  the previous certificate %s was NOT revoked (--keep-old); it stays CA-valid until %s.\n",
+			prevSerial, prev.NotAfter.UTC().Format("2006-01-02"))
+		fmt.Printf("  Revoke it with `lv host revoke-cert %s --serial %s`\n", hostName, prevSerial)
 		return nil
+	case opts.RevokeOld:
+		return revokeAndPublishSerial(ctx, c, hostName, prevSerial)
 	}
-	if hold, why := voterRevocationHold(ctx, c, hostName); hold && !opts.RevokeOld {
-		fmt.Printf("  the previous certificate %s was NOT revoked: %s.\n", prevSerial, why)
-		fmt.Println("  The newest voter generation was decided with this host's votes, signed with that")
-		fmt.Println("  certificate, and a node adopting the generation later checks those signatures against")
-		fmt.Println("  the CRL (docs/design/recovery-claims.md §4.1): revoking now could leave it unable to")
-		fmt.Println("  adopt until the voter set next changes. Its key no longer exists on the host. Revoke it")
-		fmt.Printf("  after the next `lv cluster voter` change with `lv host revoke-cert %s --serial %s`,\n", hostName, prevSerial)
-		fmt.Println("  or pass --revoke-old to revoke it now")
-		return nil
-	}
-	if err := revokeHostCert(pkiDir, hostName, prevSerial); err != nil {
-		return fmt.Errorf("the renewal is complete, but revoking the previous certificate %s failed: %w. "+
-			"It stays a valid credential until revoked", prevSerial, err)
-	}
-	version, err := publishClusterCRL(ctx, c, pkiDir)
+	return revokeReplaced(ctx, c, hostName, prevSerial)
+}
+
+// revokeReplaced hands the cluster a CRL revoking serial and lets it decide:
+// published now, or owed until the voter chain allows it. The CRL is minted
+// WITHOUT updating this machine's crl.pem, so a held serial does not ride
+// along in the next CRL minted here before it is safe.
+func revokeReplaced(ctx context.Context, c pb.LiteVirtClient, hostName, serial string) error {
+	pkiDir := PKIDir()
+	crlPath := filepath.Join(pkiDir, "crl.pem")
+	crl, err := pki.MintCRLWith(filepath.Join(pkiDir, "ca.crt"), filepath.Join(pkiDir, "ca.key"), crlPath, serial)
 	if err != nil {
-		return fmt.Errorf("the renewal is complete and %s is revoked in %s, but publishing the CRL failed: %w. "+
-			"Retry with `lv host publish-crl`", prevSerial, filepath.Join(pkiDir, "crl.pem"), err)
+		return fmt.Errorf("mint the CRL revoking %s: %w", serial, err)
 	}
-	fmt.Printf("  revoked the previous certificate %s in CRL %d\n", prevSerial, version)
+	resp, err := c.RevokeReplacedCertificate(ctx, &pb.RevokeReplacedCertificateRequest{
+		Host: hostName, Serial: serial, CrlPem: string(crl)})
+	if status.Code(err) == codes.Unimplemented {
+		// A daemon on an older build cannot judge the voter chain; revoke
+		// directly, the way `lv host rm` does.
+		return revokeAndPublishSerial(ctx, c, hostName, serial)
+	}
+	if err != nil {
+		return fmt.Errorf("the renewal is complete, but revoking the replaced certificate %s failed: %w. "+
+			"Retry with `lv host revoke-cert %s --serial %s`", serial, err, hostName, serial)
+	}
+	if resp.Revoked {
+		if err := secretfile.Write(crlPath, crl, 0o644); err != nil {
+			fmt.Printf("  NOTE: published, but could not update %s: %v\n", crlPath, err)
+		}
+		logRenewal(pkiDir, renewalEntry{Host: hostName, Serial: serial, State: "revoked"})
+		fmt.Printf("  revoked the replaced certificate %s (CRL %d)\n", serial, resp.Version)
+		return nil
+	}
+	logRenewal(pkiDir, renewalEntry{Host: hostName, Serial: serial, State: "owed"})
+	fmt.Printf("  the replaced certificate %s is OWED revocation, not revoked yet: %s.\n", serial, resp.Reason)
+	fmt.Println("  The cluster holds the signed CRL as a degraded condition (certificate/revocation_owed),")
+	fmt.Println("  publishes it by itself once the voter set has moved on, and notifies")
+	fmt.Println("  certificate.revocation_owed daily meanwhile. Accepts signed with the replaced key")
+	fmt.Println("  already do not count (the claim serial pin), and peers do not accept it as the host.")
+	fmt.Printf("  To revoke it now regardless: `lv host revoke-cert %s --serial %s`\n", hostName, serial)
 	return nil
 }
 
-// voterRevocationHold reports whether revoking hostName's replaced
-// certificate should wait: the host is a member of the adopted voter
-// generation, whose certificate carries its votes. An unreadable voter set
-// holds too — revocation can always be done later, and cannot be undone.
-func voterRevocationHold(ctx context.Context, c pb.LiteVirtClient, hostName string) (bool, string) {
-	resp, err := c.GetVoterConfig(ctx, &pb.GetVoterConfigRequest{})
-	if status.Code(err) == codes.Unimplemented {
-		return false, ""
+// abandonIssued revokes a successor that was signed but will never be
+// presented: it is a CA-valid certificate naming the host, and peers would
+// accept it as the recorded certificate's successor.
+func abandonIssued(ctx context.Context, c pb.LiteVirtClient, hostName, serial, why string) error {
+	logRenewal(PKIDir(), renewalEntry{Host: hostName, Serial: serial, State: "abandoned"})
+	if err := revokeAndPublishSerial(ctx, c, hostName, serial); err != nil {
+		return fmt.Errorf("the unused successor %s (%s) could not be revoked: %w — revoke it with "+
+			"`lv host revoke-cert %s --serial %s`", serial, why, err, hostName, serial)
 	}
-	if err != nil {
-		return true, fmt.Sprintf("the voter set could not be read (%v)", err)
-	}
-	for _, m := range resp.GetMembers() {
-		if m.GetName() == hostName {
-			return true, fmt.Sprintf("%s is a member of voter generation %d", hostName, resp.GetAdoptedGeneration())
+	return nil
+}
+
+// sameBuildEverywhere refuses a renewal while live hosts run different
+// builds: a peer on an older release does not honour the successor and
+// refuses the renewed host until the re-recorded serial reaches it by
+// anti-entropy (anti_entropy_interval_sec, 60s by default).
+func sameBuildEverywhere(hosts []*pb.Host, target string) error {
+	want := ""
+	for _, h := range hosts {
+		if h.Name == target {
+			want = h.Version
 		}
 	}
-	return false, ""
+	var differ []string
+	for _, h := range hosts {
+		if h.Version != want {
+			differ = append(differ, fmt.Sprintf("%s (%s)", h.Name, h.Version))
+		}
+	}
+	if len(differ) == 0 {
+		return nil
+	}
+	return fmt.Errorf("hosts run a different build from %s (%s): %s. Peers on an older release refuse the "+
+		"renewed host until its new serial reaches them by anti-entropy; finish the upgrade first, or pass "+
+		"--force", target, want, strings.Join(differ, ", "))
+}
+
+func servedSerialOf(certPEM []byte) string {
+	c, err := pki.ParseCertPEM(certPEM)
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(c.SerialNumber.Text(16))
 }
 
 // HostRevokeCert revokes one certificate serial issued to hostName and
-// publishes the CRL — the deferred half of a renewal (`lv host renew-cert`
-// --keep-old, or a voter whose revocation was held).
+// publishes the CRL immediately — the manual path for a serial a renewal
+// replaced or abandoned (`--keep-old`, an owed revocation, a failed renewal).
 //
-// It refuses the serial the cluster records for the host and the one the host
-// presents: revoking either cuts the host off from every peer, which is what
-// `lv host rm` is for.
-func HostRevokeCert(ctx context.Context, c pb.LiteVirtClient, hostName, serial string, grpcPort int) error {
+// It accepts only a serial known to be hostName's: one this machine's
+// renewal log records for it, or the predecessor named by the certificate the
+// host presents. A serial any host is recorded with is refused unless it is
+// hostName's own live one and force is set — that cuts the host off from every
+// peer and gets it fenced. When the host's presented certificate cannot be
+// read, it refuses unless force is set.
+func HostRevokeCert(ctx context.Context, c pb.LiteVirtClient, hostName, serial string, grpcPort int, force bool) error {
+	return hostRevokeCert(ctx, c, hostName, serial, force, nil, grpcPort)
+}
+
+func hostRevokeCert(ctx context.Context, c pb.LiteVirtClient, hostName, serial string, force bool,
+	probe servedCertProbe, grpcPort int) error {
 	serial = strings.ToLower(strings.TrimPrefix(strings.TrimSpace(serial), "0x"))
 	if serial == "" {
 		return fmt.Errorf("--serial is required")
@@ -299,23 +422,62 @@ func HostRevokeCert(ctx context.Context, c pb.LiteVirtClient, hostName, serial s
 	if err := requireCAKey(PKIDir(), "revoking a certificate"); err != nil {
 		return err
 	}
-	recorded, err := hostCertSerial(ctx, c, hostName)
+	hosts, err := c.ListHosts(ctx, &pb.ListHostsRequest{})
 	if err != nil {
-		return fmt.Errorf("read %s's recorded certificate serial: %w", hostName, err)
+		return fmt.Errorf("list hosts: %w", err)
 	}
-	if strings.EqualFold(recorded, serial) {
-		return fmt.Errorf("%s is the certificate the cluster records for %s; revoking it would cut the host off "+
-			"from every peer. Renew first (`lv host renew-cert %s`), or remove the host (`lv host rm %s`)",
-			serial, hostName, hostName, hostName)
-	}
-	if grpcPort == 0 {
-		grpcPort = 7443
-	}
-	if addr, err := hostAddress(ctx, c, hostName); err == nil {
-		if served, err := dialServedCert(ctx, net.JoinHostPort(addr, strconv.Itoa(grpcPort))); err == nil &&
-			strings.EqualFold(served.SerialNumber.Text(16), serial) {
-			return fmt.Errorf("%s is the certificate %s presents right now; revoking it would cut the host off", serial, hostName)
+	var addr string
+	found := false
+	for _, h := range hosts.Hosts {
+		if h.Name == hostName {
+			found, addr = true, h.Address
 		}
+		if strings.EqualFold(h.CertSerial, serial) {
+			if h.Name != hostName {
+				return fmt.Errorf("%s is the certificate the cluster records for %s, not %s; refusing", serial, h.Name, hostName)
+			}
+			if !force {
+				return fmt.Errorf("%s is %s's LIVE certificate. Revoking it cuts %s off from every peer and gets it "+
+					"FENCED. Renew first (`lv host renew-cert %s`); pass --force only to take the host out deliberately",
+					serial, hostName, hostName, hostName)
+			}
+			fmt.Printf("  WARNING: revoking %s's live certificate — its peers will refuse it and fence it\n", hostName)
+			return revokeAndPublishSerial(ctx, c, hostName, serial)
+		}
+	}
+	if !found {
+		return fmt.Errorf("host %s is not in the cluster", hostName)
+	}
+	if probe == nil {
+		probe = GRPCProbe(addr, grpcPort)
+	}
+	presented, perr := probe(ctx)
+	switch {
+	case perr != nil && !force:
+		return fmt.Errorf("could not read the certificate %s presents (%v), so cannot rule out that %s is it; "+
+			"refusing (pass --force when the host is known to be on another certificate)", hostName, perr, serial)
+	case perr == nil && strings.EqualFold(presented.SerialNumber.Text(16), serial):
+		if !force {
+			return fmt.Errorf("%s is the certificate %s presents right now; revoking it cuts the host off and gets it "+
+				"FENCED. Pass --force only to take the host out deliberately", serial, hostName)
+		}
+		fmt.Printf("  WARNING: revoking the certificate %s presents — its peers will refuse it and fence it\n", hostName)
+		return revokeAndPublishSerial(ctx, c, hostName, serial)
+	}
+	known := false
+	if perr == nil {
+		if prev, ok := pki.RenewedFromSerial(presented); ok && prev == serial {
+			known = true
+		}
+	}
+	for _, e := range readRenewalLog(PKIDir()) {
+		if e.Host == hostName && (e.Serial == serial || e.Previous == serial) {
+			known = true
+		}
+	}
+	if !known {
+		return fmt.Errorf("%s is not a certificate this machine renewed for %s (see %s), nor the predecessor of the "+
+			"one it presents; refusing to revoke an unknown serial", serial, hostName, filepath.Join(PKIDir(), renewalLogName))
 	}
 	return revokeAndPublishSerial(ctx, c, hostName, serial)
 }
@@ -330,8 +492,43 @@ func revokeAndPublishSerial(ctx context.Context, c pb.LiteVirtClient, hostName, 
 		return fmt.Errorf("%s is revoked in %s, but publishing the CRL failed: %w. Retry with `lv host publish-crl`",
 			serial, filepath.Join(pkiDir, "crl.pem"), err)
 	}
+	logRenewal(pkiDir, renewalEntry{Host: hostName, Serial: serial, State: "revoked"})
 	fmt.Printf("Revoked certificate %s of %s in CRL %d; every node installs it within a minute\n", serial, hostName, version)
 	return nil
+}
+
+// The renewal log: what this CA machine issued and replaced, per host — the
+// record `lv host revoke-cert` checks a serial against.
+const renewalLogName = "renewals.json"
+
+type renewalEntry struct {
+	Host     string `json:"host"`
+	Previous string `json:"previous,omitempty"`
+	Serial   string `json:"serial"`
+	State    string `json:"state"` // issued | installed | abandoned | owed | revoked
+	At       string `json:"at"`
+}
+
+func readRenewalLog(pkiDir string) []renewalEntry {
+	b, err := os.ReadFile(filepath.Join(pkiDir, renewalLogName))
+	if err != nil {
+		return nil
+	}
+	var out []renewalEntry
+	_ = json.Unmarshal(b, &out)
+	return out
+}
+
+func logRenewal(pkiDir string, e renewalEntry) {
+	e.At = time.Now().UTC().Format(time.RFC3339)
+	log := append(readRenewalLog(pkiDir), e)
+	b, err := json.MarshalIndent(log, "", "  ")
+	if err == nil {
+		err = secretfile.Write(filepath.Join(pkiDir, renewalLogName), b, 0o600)
+	}
+	if err != nil {
+		slog.Warn("could not update the renewal log", "error", err)
+	}
 }
 
 // resignedRejoin returns the host's audit admission record re-signed for
@@ -353,8 +550,6 @@ func resignedRejoin(r remotePKI, pkiDir, hostName string, prevPEM []byte, prevSe
 		// already ignores it, and so does the renewal.
 		return nil, nil
 	}
-	// Verify it the way the daemon does, against a scratch pki dir holding
-	// exactly what the host holds.
 	tmp, err := os.MkdirTemp("", "litevirt-rejoin-")
 	if err != nil {
 		return nil, err
@@ -384,25 +579,32 @@ func resignedRejoin(r remotePKI, pkiDir, hostName string, prevPEM []byte, prevSe
 	return &installFile{path: path, data: out, mode: 0o644}, nil
 }
 
-func waitServedSerial(ctx context.Context, probe servedCertProbe, want string, wait time.Duration) (string, error) {
+// waitServedSerial polls probe until it presents want. It returns the last
+// serial seen and whether any probe answered at all — a host that answered
+// with another serial is evidence; a probe that only failed is not.
+func waitServedSerial(ctx context.Context, probe servedCertProbe, want string, wait time.Duration) (string, bool, error) {
 	deadline := time.Now().Add(wait)
-	last := "nothing"
+	last, saw := "", false
+	var lastErr error
 	for {
 		c, err := probe(ctx)
 		if err == nil && c != nil {
-			last = strings.ToLower(c.SerialNumber.Text(16))
+			last, saw, lastErr = strings.ToLower(c.SerialNumber.Text(16)), true, nil
 			if last == want {
-				return last, nil
+				return last, true, nil
 			}
 		} else if err != nil {
-			last = "an error: " + err.Error()
+			lastErr = err
 		}
 		if time.Now().After(deadline) {
-			return last, fmt.Errorf("still presenting %s after %s", last, wait)
+			if lastErr != nil {
+				return last, saw, fmt.Errorf("probe failed: %w", lastErr)
+			}
+			return last, saw, fmt.Errorf("still presenting %s after %s", last, wait)
 		}
 		select {
 		case <-ctx.Done():
-			return last, ctx.Err()
+			return last, saw, ctx.Err()
 		case <-time.After(time.Second):
 		}
 	}
@@ -462,12 +664,12 @@ func dialServedCert(ctx context.Context, addr string) (*x509.Certificate, error)
 }
 
 // requireCAKey fails early, before anything on a host is touched, when this
-// machine cannot sign: there is no CSR flow.
+// machine cannot sign.
 func requireCAKey(pkiDir, what string) error {
 	caKeyPath := filepath.Join(pkiDir, "ca.key")
 	if _, err := os.Stat(caKeyPath); err != nil {
 		return fmt.Errorf("no cluster CA private key at %s: %s must be run from the machine that ran "+
-			"`lv host init`, because it signs with the CA private key and litevirt has no CSR flow", caKeyPath, what)
+			"`lv host init`, because it signs with the CA private key", caKeyPath, what)
 	}
 	return nil
 }
@@ -479,14 +681,17 @@ func orNotFound(err error) error {
 	return err
 }
 
-// sshRemotePKI is remotePKI over SSH.
+// sshRemotePKI is remotePKI over SSH. The host side of the identity operations
+// is `litevirt host-pki` on the host itself.
 type sshRemotePKI struct{ sc *ssh.Client }
+
+const hostPKICmd = "/usr/local/bin/litevirt host-pki"
 
 func (t *sshRemotePKI) ReadFile(path string) ([]byte, bool, error) {
 	q := ssh.ShellQuote(path)
 	// One command, two answers: a marker for absence, so an empty file and a
 	// missing one are not confused, and a read error is still an error.
-	out, err := t.sc.RunOutput(fmt.Sprintf("if [ -e %s ]; then cat -- %s; else printf '%s'; fi", q, q, absentMarker))
+	out, err := t.sc.RunOutput(fmt.Sprintf("if [ -e %s ]; then head -c 1048576 -- %s; else printf '%s'; fi", q, q, absentMarker))
 	if err != nil {
 		return nil, false, err
 	}
@@ -498,11 +703,37 @@ func (t *sshRemotePKI) ReadFile(path string) ([]byte, bool, error) {
 
 const absentMarker = "__litevirt_file_absent__"
 
+func (t *sshRemotePKI) GenCSR(hostName string) (string, []byte, error) {
+	out, err := t.sc.RunOutput(hostPKICmd + " gen-csr --name " + ssh.ShellQuote(hostName))
+	if err != nil {
+		return "", nil, err
+	}
+	var v struct{ Staging, CSR string }
+	if err := json.Unmarshal(out, &v); err != nil || v.Staging == "" {
+		return "", nil, fmt.Errorf("unexpected answer from host-pki gen-csr: %q", strings.TrimSpace(string(out)))
+	}
+	return v.Staging, []byte(v.CSR), nil
+}
+
+func (t *sshRemotePKI) InstallIdentity(staging string, certPEM []byte) error {
+	return t.sc.RunWithInput(hostPKICmd+" install --staging "+ssh.ShellQuote(staging), certPEM)
+}
+
+func (t *sshRemotePKI) AbandonStaging(staging string) error {
+	return t.sc.Run(hostPKICmd + " abandon --staging " + ssh.ShellQuote(staging))
+}
+
+func (t *sshRemotePKI) RollbackIdentity(serial string) error {
+	return t.sc.Run(hostPKICmd + " rollback --to " + ssh.ShellQuote(serial))
+}
+
+func (t *sshRemotePKI) CommitIdentity() error { return t.sc.Run(hostPKICmd + " commit") }
+
 const preRenewSuffix = ".pre-renew"
 
-func (t *sshRemotePKI) Install(files []installFile) error {
+func (t *sshRemotePKI) InstallFiles(files []installFile) error {
 	// Stage everything first: a dropped connection mid-transfer must leave the
-	// installed pair untouched.
+	// installed files untouched.
 	for _, f := range files {
 		if err := t.sc.WriteFile(stagedPath(f.path), f.data, f.mode); err != nil {
 			return fmt.Errorf("stage %s: %w", filepath.Base(f.path), err)
@@ -512,7 +743,7 @@ func (t *sshRemotePKI) Install(files []installFile) error {
 	cmd.WriteString("set -e; ")
 	for _, f := range files {
 		q := ssh.ShellQuote(f.path)
-		// cp -p keeps the key's 0600 on its backup.
+		// cp -p keeps a key's 0600 on its backup.
 		fmt.Fprintf(&cmd, "if [ -e %s ]; then cp -p -- %s %s; fi; ", q, q, ssh.ShellQuote(f.path+preRenewSuffix))
 	}
 	for _, f := range files {
@@ -521,7 +752,7 @@ func (t *sshRemotePKI) Install(files []installFile) error {
 	return t.sc.Run(cmd.String())
 }
 
-func (t *sshRemotePKI) Rollback(files []installFile) error {
+func (t *sshRemotePKI) RollbackFiles(files []installFile) error {
 	var cmd strings.Builder
 	for _, f := range files {
 		b := ssh.ShellQuote(f.path + preRenewSuffix)
@@ -531,7 +762,7 @@ func (t *sshRemotePKI) Rollback(files []installFile) error {
 	return t.sc.Run(cmd.String())
 }
 
-func (t *sshRemotePKI) Commit(files []installFile) error {
+func (t *sshRemotePKI) CommitFiles(files []installFile) error {
 	var cmd strings.Builder
 	cmd.WriteString("rm -f --")
 	for _, f := range files {
@@ -558,4 +789,97 @@ func (t *sshRemotePKI) Remove(paths []string) error {
 
 func stagedPath(path string) string {
 	return filepath.Join(filepath.Dir(path), "."+filepath.Base(path)+".renew")
+}
+
+// LocalRemotePKI is remotePKI over a directory this process can reach — the
+// pki directory of the node it runs on, or a test's — running the host side
+// in-process. Paths under /etc/litevirt/pki map into Dir.
+type LocalRemotePKI struct {
+	Dir string
+	// FailInstallAfterSwitch makes InstallIdentity report an error after the
+	// switch (a dropped connection, for tests).
+	FailInstallAfterSwitch bool
+	reloaded               bool
+}
+
+func (d *LocalRemotePKI) local(path string) string {
+	return filepath.Join(d.Dir, strings.TrimPrefix(path, remotePKIDir+"/"))
+}
+
+func (d *LocalRemotePKI) ReadFile(path string) ([]byte, bool, error) {
+	b, err := os.ReadFile(d.local(path))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, false, nil
+	}
+	return b, err == nil, err
+}
+
+func (d *LocalRemotePKI) GenCSR(hostName string) (string, []byte, error) {
+	return pki.GenerateRenewalCSR(d.Dir, hostName)
+}
+
+func (d *LocalRemotePKI) InstallIdentity(staging string, certPEM []byte) error {
+	if _, _, err := pki.InstallRenewal(d.Dir, staging, certPEM); err != nil {
+		return err
+	}
+	if d.FailInstallAfterSwitch {
+		return errors.New("connection lost")
+	}
+	return nil
+}
+
+func (d *LocalRemotePKI) AbandonStaging(staging string) error {
+	return pki.AbandonStaging(d.Dir, staging)
+}
+
+func (d *LocalRemotePKI) RollbackIdentity(serial string) error {
+	return pki.RollbackRenewal(d.Dir, serial)
+}
+
+func (d *LocalRemotePKI) CommitIdentity() error { return pki.CommitRenewal(d.Dir) }
+
+func (d *LocalRemotePKI) InstallFiles(files []installFile) error {
+	for _, f := range files {
+		if b, err := os.ReadFile(d.local(f.path)); err == nil {
+			if err := secretfile.Write(d.local(f.path+preRenewSuffix), b, 0o600); err != nil {
+				return err
+			}
+		}
+	}
+	for _, f := range files {
+		if err := secretfile.Write(d.local(f.path), f.data, f.mode); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (d *LocalRemotePKI) RollbackFiles(files []installFile) error {
+	for _, f := range files {
+		b := d.local(f.path + preRenewSuffix)
+		if _, err := os.Stat(b); err == nil {
+			if err := os.Rename(b, d.local(f.path)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (d *LocalRemotePKI) CommitFiles(files []installFile) error {
+	for _, f := range files {
+		os.Remove(d.local(f.path + preRenewSuffix))
+	}
+	return nil
+}
+
+func (d *LocalRemotePKI) ReloadLibvirtTLS() error { d.reloaded = true; return nil }
+
+func (d *LocalRemotePKI) Remove(paths []string) error {
+	for _, p := range paths {
+		if err := os.Remove(d.local(p)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
 }

@@ -52,6 +52,24 @@ message PublishCRLRequest  { string crl_pem = 1; }
 // shares a pki directory with its daemon, so that answer would be "no" in the
 // ordinary case and mean nothing about the cluster.
 message PublishCRLResponse { int64 version = 1; }
+// RevokeReplacedCertificateRequest carries a CRL the CA machine minted with the
+// replaced serial of host added (`lv host renew-cert`). The daemon publishes it
+// at once when that is safe for the voter chain, and otherwise records it as a
+// revocation owed and publishes it as soon as it is.
+message RevokeReplacedCertificateRequest {
+    string host    = 1;
+    string serial  = 2;   // lower-case hex
+    string crl_pem = 3;   // must verify against the cluster CA and list serial
+}
+// revoked: published now. held: recorded as owed (reason says why); the
+// cluster publishes it once the newest voter generation still verifies with
+// the serial revoked.
+message RevokeReplacedCertificateResponse {
+    bool   revoked = 1;
+    bool   held    = 2;
+    string reason  = 3;
+    int64  version = 4;
+}
 message FenceResult        { string host_name = 1; string method = 2;
     string result = 3; string detail = 4; }
 // GetClusterHealth is THE health read: the durable condition set, evaluator
@@ -3335,6 +3353,12 @@ service LiteVirt {
     // opens a peer connection, and an unverified one would let a caller un-revoke
     // themselves by publishing a CRL that simply omits their serial.
     rpc PublishCRL(PublishCRLRequest)          returns (PublishCRLResponse);
+    // RevokeReplacedCertificate revokes the certificate a renewal replaced —
+    // now, or, when revoking now would leave the newest voter generation
+    // without a quorum of unrevoked signatures for a node that adopts it later
+    // (docs/design/recovery-claims.md §4.1), as a durable revocation owed that
+    // the cluster publishes automatically once it is safe.
+    rpc RevokeReplacedCertificate(RevokeReplacedCertificateRequest) returns (RevokeReplacedCertificateResponse);
     rpc RescanHost(RescanHostRequest)          returns (RescanHostResponse);
     rpc ListHostDevices(ListHostDevicesRequest) returns (ListHostDevicesResponse);
     // SupersededDisks lists the disk copies a failover start set aside on a

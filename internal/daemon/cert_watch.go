@@ -30,6 +30,9 @@ import (
 //     start refusing it.
 const (
 	certWatchInterval = 30 * time.Second
+	// connSweepInterval bounds how long a revoked or superseded certificate
+	// keeps an established gRPC connection (pki.ConnTracker).
+	connSweepInterval = 10 * time.Second
 	certWarnBefore    = 30 * 24 * time.Hour
 	certCritBefore    = 7 * 24 * time.Hour
 	// certRenotifyEvery repeats a standing alert, so one lost delivery is not
@@ -40,6 +43,9 @@ const (
 // certNotifier delivers a certificate notification. *grpcapi.Server satisfies it.
 type certNotifier interface {
 	NotifyCertificate(kind string, sev notify.Severity, subject, detail string)
+	// ProcessOwedRevocations publishes replaced-certificate revocations that
+	// were held for the voter chain once that is safe (grpcapi/cert_revocation.go).
+	ProcessOwedRevocations(ctx context.Context)
 }
 
 // servedCert is one certificate the watch reports on.
@@ -111,6 +117,9 @@ func (w *certWatch) addUI(u *uiTLS) {
 
 func (w *certWatch) tick(ctx context.Context, now time.Time) {
 	w.recordHostSerial(ctx)
+	if w.notifier != nil {
+		w.notifier.ProcessOwedRevocations(ctx)
+	}
 	w.mu.Lock()
 	certs := append([]servedCert(nil), w.certs...)
 	w.mu.Unlock()
@@ -204,4 +213,11 @@ func (w *certWatch) alert(c servedCert, leaf *x509.Certificate, now time.Time) {
 	if w.notifier != nil {
 		w.notifier.NotifyCertificate(kind, sev, w.host+"/"+c.name, detail)
 	}
+}
+
+// CertWatchOnce runs one pass of the certificate watch for a node built
+// without a Daemon (tests/fleet): re-record a renewed serial and process owed
+// revocations.
+func CertWatchOnce(ctx context.Context, host, pkiDir string, db *corrosion.Client, n certNotifier) {
+	newCertWatch(host, pkiDir, db, n, nil).tick(ctx, time.Now())
 }

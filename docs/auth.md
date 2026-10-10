@@ -402,52 +402,86 @@ lv host renew-cert host-b --ssh root@10.0.50.11   # name isn't the address
 The host keeps running throughout — no restart, no partition, nothing a peer
 could read as a failure:
 
-1. The new certificate is a **successor**: same name and addresses, a new key, a
-   fresh five-year validity, and — signed by the CA — the serial of the
-   certificate it replaces. Peers pin each host's recorded serial (that pin is
-   what keeps a re-admitted name's old certificate out), and a peer whose record
-   still names the predecessor accepts its successor immediately. The pin is not
-   relaxed: only one hop is honoured, and an older certificate cannot name a
-   serial recorded after it was minted.
-2. The files are installed by rename (key `0600`), and the daemon serves the new
-   pair from the next handshake — its gRPC listener, its peer probes and its
-   loopback clients all read the identity at handshake time, and its recovery-claim
-   votes are signed with it too. A replacement that does not chain to the cluster
-   CA, names another host, or does not match its key is refused and the current
-   identity kept.
-3. The command dials the host and **confirms** it presents the new certificate;
-   if it does not, the previous pair is put back and nothing else happens.
-4. The daemon re-records its own serial within a minute, so the record moves on
+1. **The key is generated on the host.** The host (its own `litevirt` binary,
+   over SSH) creates the new key and sends back only a certificate request; the
+   CA machine signs the request and sends back only a certificate. The private
+   key never crosses SSH and never exists on the CA machine.
+2. The certificate is a **successor**: same name and addresses, a fresh
+   five-year validity, and — signed by the CA — the serial of the certificate it
+   replaces. Peers pin each host's recorded serial (that pin is what keeps a
+   re-admitted name's old certificate out), and a peer whose record still names
+   the predecessor accepts its successor immediately. The pin is not relaxed:
+   only one hop is honoured, and an older certificate cannot name a serial
+   recorded after it was minted.
+3. **One atomic switch.** The host keeps each identity as a complete pair under
+   `pki_dir/host.d/<serial>/`, with `host.crt` and `host.key` resolving through
+   one `host.d/current` link, and the install is a single rename of that link.
+   A crash or a dropped connection at any point leaves a pair the daemon starts
+   with, and a daemon that finds its identity unloadable at start repairs it from
+   the newest complete pair under `host.d`.
+4. The daemon serves the new pair from the next handshake — its gRPC listener,
+   its peer probes and its loopback clients read the identity at handshake time,
+   and its recovery-claim votes are signed with it too. A replacement that does
+   not chain to the cluster CA, names another host, does not match its key, or
+   whose key resolves outside the PKI directory or belongs to another user is
+   refused, and a key readable by others is tightened. **Established
+   connections** made with a certificate since revoked, or with a host
+   certificate the cluster no longer records, are closed within seconds and
+   re-handshake.
+5. The command dials the host and **confirms** it presents the new certificate.
+   It switches back only when the host demonstrably still presents the old one
+   and the cluster does not record the new one; a probe that merely fails proves
+   nothing, so nothing is undone on it. A successor that was signed but never
+   used is revoked.
+6. The daemon re-records its own serial within a minute, so the record moves on
    and the old certificate stops being accepted as that host.
-5. Only then is the old certificate **revoked** and the CRL published, as `lv host
-   rm` does — so a renewal retires the old key instead of leaving a second valid
-   one. `--keep-old` skips this step. A **voter** is the exception: the adopted
-   voter generation's certificate carries its votes signed with the old
-   certificate, and a node that adopts that generation later checks them against
-   the CRL ([recovery-claims.md §4.1](design/recovery-claims.md)), so revoking now
-   could leave such a node unable to adopt until the voter set next changes. For
-   a voter the command keeps the old certificate and prints its serial; revoke it
-   after the next `lv cluster voter` change with `lv host revoke-cert <host>
-   --serial <hex>`, or at once with `--revoke-old`. The old key itself is gone
-   from the host either way.
+7. Then the replaced certificate is **revoked**. The one thing a revocation can
+   break is the voter chain: the newest voter generation's certificate carries
+   each member's vote signed with the certificate it held, and a node that adopts
+   that generation later checks those signatures against the CRL
+   ([recovery-claims.md §4.1](design/recovery-claims.md)). The daemon checks
+   whether the newest generation still verifies with the serial revoked. If it
+   does, the CRL is published at once. If not, the revocation is **owed**: the
+   CA-signed CRL is stored in a replicated `certificate/revocation_owed` health
+   condition (a degraded reason in `lv health`), the host notifies
+   `certificate.revocation_owed` daily, and every node publishes the CRL by
+   itself as soon as the voter set has moved on — any `lv cluster voter` change,
+   which the renewed voter signs with its new certificate. `--revoke-old`
+   revokes at once regardless; `--keep-old` not at all.
 
-`lv host revoke-cert` refuses the serial the cluster records for the host and the
-one the host presents, since revoking either would cut the host off; that is what
-`lv host rm` is for.
+While a revocation is owed — or after `--keep-old` — the replaced certificate is
+still CA-valid, and its exposure is specific: peers no longer accept it as the
+host once the new serial is recorded; recovery-claim accepts signed with it do
+not count (each accept must be signed with the certificate recorded for its
+voter, or that certificate's CA-attested successor); but it still authenticates
+as a **bearerless client**, which is `admin` unless
+`auth.strict_mtls_identity` is on, and as a TLS server to anything that dials
+it. The key itself is deleted from the host by the renewal, so this matters only
+for a key copied earlier — and `lv host revoke-cert` closes it at any time.
+
+A recovery whose claim certificate was signed with the replaced key before the
+revocation lands is refused at execution (`recovery_claim_unproven`) and
+re-certified at the coordinator's next attempt with the new certificate; it is
+delayed, never run twice.
 
 The command refuses, touching nothing, when the cluster's recorded serial and the
-installed certificate disagree (a successor of an unrecorded certificate would be
-refused by every peer until replication caught up); wait a minute after a daemon
-start and retry. A re-added host's audit admission record, which is bound to its
-certificate serial, is re-signed for the new one in the same swap. libvirt's TLS
-listener (`qemu+tls://` migration) is asked to reload; if it cannot, it keeps the
-old certificate until libvirt restarts, which is harmless because libvirt does not
-read the cluster CRL.
-
-Peers on an older release do not recognise the successor and refuse the renewed
-host until its re-recorded serial reaches them by anti-entropy (about a minute) —
-renew once a rolling upgrade has finished. The migration-TLS certificates under
+installed certificate disagree, and while hosts run different builds (`--force`
+overrides): a peer on an older release does not recognise the successor and
+refuses the renewed host until its re-recorded serial reaches it by anti-entropy
+(`anti_entropy_interval_sec`, 60 s by default). A re-added host's audit admission
+record, bound to its certificate serial, is re-signed for the new one. libvirt's
+TLS listener (`qemu+tls://` migration) is asked to reload; if it cannot, it keeps
+the old certificate until libvirt restarts, which is harmless because libvirt
+does not read the cluster CRL. The migration-TLS certificates under
 `pki_dir/migration` come from a separate CA and are not renewed by this command.
+
+`lv host revoke-cert <host> --serial <hex>` is the manual path. It accepts only a
+serial known to be the host's — one the CA machine's renewal log
+(`pki/renewals.json`) records for it, or the predecessor named by the certificate
+the host presents — and refuses a serial any other host is recorded with. The
+host's own live or presented certificate needs `--force`, because revoking it
+cuts the host off and gets it fenced (that is what `lv host rm` is for); and when
+the host's presented certificate cannot be read, it refuses unless `--force`.
 
 ### Recovering the admin account (`lv user reset-admin`)
 

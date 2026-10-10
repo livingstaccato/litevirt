@@ -103,9 +103,10 @@ func ClientTLSConfig(pkiDir string) (*tls.Config, error) {
 			return nil, fmt.Errorf("load %s cert/key: %w", name, err)
 		}
 		// Certificates documents what was loaded; the getter is what a handshake
-		// uses (crypto/tls ignores Certificates once GetClientCertificate is set), so a long-lived
-		// connection — the UI's and REST gateway's loopback client — redials with
-		// a renewed certificate rather than the one it was built with.
+		// uses (crypto/tls ignores Certificates once GetClientCertificate is set).
+		// An established connection keeps the certificate it was made with; the
+		// server's ConnTracker closes one the cluster no longer accepts, and the
+		// redial here presents the renewed certificate.
 		cfg.Certificates = []tls.Certificate{*cert}
 		cfg.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) { return src.Get() }
 		break

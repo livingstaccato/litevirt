@@ -17,7 +17,7 @@ import (
 )
 
 // renewalChain mints a host certificate for name and n successive renewals of
-// it, returning them oldest first.
+// it (each over a key generated in its pki dir), returning them oldest first.
 func renewalChain(t *testing.T, name string, n int) []*x509.Certificate {
 	t.Helper()
 	dir := t.TempDir()
@@ -35,11 +35,10 @@ func renewalChain(t *testing.T, name string, n int) []*x509.Certificate {
 	}
 	chain := []*x509.Certificate{first}
 	for i := 0; i < n; i++ {
-		certPEM, _, err := pki.RenewHostCert(caCert, caKey, chain[len(chain)-1], name)
-		if err != nil {
+		if _, _, err := pki.RenewLocal(caCert, caKey, dir, name); err != nil {
 			t.Fatal(err)
 		}
-		c, err := pki.ParseCertPEM(certPEM)
+		c, err := pki.ParseCertPEM(mustRead(t, crt))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -149,26 +148,10 @@ func TestClaimSigner_FollowsARenewedHostCertificate(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := signer.Serial()
-	prev, err := pki.ServedHostCertificate(s.pkiDir)
-	if err != nil {
+	if _, _, err := pki.RenewLocal(filepath.Join(s.pkiDir, "ca.crt"), filepath.Join(s.pkiDir, "ca.key"), s.pkiDir, s.hostName); err != nil {
 		t.Fatal(err)
 	}
-	certPEM, keyPEM, err := pki.RenewHostCert(filepath.Join(s.pkiDir, "ca.crt"), filepath.Join(s.pkiDir, "ca.key"), prev, s.hostName)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, f := range []struct {
-		name string
-		data []byte
-	}{{"host.key", keyPEM}, {"host.crt", certPEM}} {
-		tmp := filepath.Join(s.pkiDir, "."+f.name)
-		if err := os.WriteFile(tmp, f.data, 0o600); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Rename(tmp, filepath.Join(s.pkiDir, f.name)); err != nil {
-			t.Fatal(err)
-		}
-	}
+	certPEM := mustRead(t, filepath.Join(s.pkiDir, "host.crt"))
 	renewed, err := pki.ParseCertPEM(certPEM)
 	if err != nil {
 		t.Fatal(err)

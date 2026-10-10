@@ -5,9 +5,11 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -118,7 +120,7 @@ func (s *KeyPairSource) Get() (*tls.Certificate, error) {
 func (s *KeyPairSource) reloadLocked() {
 	first := !s.everLoaded
 	s.everLoaded = true
-	pair, err := tls.LoadX509KeyPair(s.certPath, s.keyPath)
+	pair, err := loadPairChecked(s.certPath, s.keyPath)
 	if err == nil && pair.Leaf == nil && len(pair.Certificate) > 0 {
 		pair.Leaf, err = x509.ParseCertificate(pair.Certificate[0])
 	}
@@ -147,6 +149,76 @@ func (s *KeyPairSource) reloadLocked() {
 			"not_after", pair.Leaf.NotAfter.UTC().Format(time.RFC3339))
 	}
 	s.cur, s.loadErr = &pair, nil
+}
+
+// loadPairChecked is tls.LoadX509KeyPair with the checks a served identity
+// needs on every load, not only at boot: both files regular and bounded in
+// size, and the key resolving inside its own directory, owned by this process's
+// user, and readable by nobody else (tightened to 0600 if it is not).
+func loadPairChecked(certPath, keyPath string) (tls.Certificate, error) {
+	if err := checkKeyFile(keyPath); err != nil {
+		return tls.Certificate{}, err
+	}
+	certPEM, err := readBounded(certPath)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	keyPEM, err := readBounded(keyPath)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	return tls.X509KeyPair(certPEM, keyPEM)
+}
+
+// readBounded reads a regular file of at most maxServingChainBytes.
+func readBounded(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s is not a regular file", path)
+	}
+	b, err := io.ReadAll(io.LimitReader(f, maxServingChainBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(b) > maxServingChainBytes {
+		return nil, fmt.Errorf("%s is larger than %d bytes", path, maxServingChainBytes)
+	}
+	return b, nil
+}
+
+// checkKeyFile refuses a private key that resolves outside its own directory
+// or belongs to another user, and tightens one readable by group or others.
+func checkKeyFile(keyPath string) error {
+	real, err := filepath.EvalSymlinks(keyPath)
+	if err != nil {
+		return err
+	}
+	dir, err := filepath.EvalSymlinks(filepath.Dir(keyPath))
+	if err != nil {
+		return err
+	}
+	if rel, err := filepath.Rel(dir, real); err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("private key %s resolves outside %s", keyPath, dir)
+	}
+	fi, err := os.Lstat(real)
+	if err != nil {
+		return err
+	}
+	if !fi.Mode().IsRegular() {
+		return fmt.Errorf("private key %s is not a regular file", keyPath)
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok && int(st.Uid) != os.Geteuid() {
+		return fmt.Errorf("private key %s is owned by uid %d, not this process's user", keyPath, st.Uid)
+	}
+	return TightenKeyMode(real)
 }
 
 // Leaf returns the certificate being served, or an error while none has loaded.

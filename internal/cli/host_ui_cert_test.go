@@ -44,7 +44,7 @@ func writeLocalUICert(t *testing.T, dnsNames []string, notAfter time.Time) (cert
 // Mutation: install ui.key with mode 0644 — the mode check fails.
 func TestHostUICert_SetInstallsAndClearRemoves(t *testing.T) {
 	host := t.TempDir()
-	r := &dirTarget{dir: host}
+	r := &dirTarget{Dir: host}
 	crt, key := writeLocalUICert(t, []string{"node-b", "hv-b.corp.example"}, time.Now().Add(90*24*time.Hour))
 	if err := hostUICertSet(r, "node-b", "10.0.50.11", UICertOptions{CertPath: crt, KeyPath: key}); err != nil {
 		t.Fatal(err)
@@ -80,7 +80,7 @@ func TestHostUICert_SetInstallsAndClearRemoves(t *testing.T) {
 // Mutation: skip ValidateServingChain — the expired certificate is installed.
 func TestHostUICert_RefusedCertificateTouchesNothing(t *testing.T) {
 	host := t.TempDir()
-	r := &dirTarget{dir: host}
+	r := &dirTarget{Dir: host}
 	for name, tc := range map[string]struct {
 		dns      []string
 		notAfter time.Time

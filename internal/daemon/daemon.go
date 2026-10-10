@@ -306,6 +306,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Safe here: replication/anti-entropy start later in this method.
 	pki.SetTraceDialOptions(obs.ClientDialOptions)
 
+	// Finish or repair a host certificate renewal a crash interrupted
+	// (pki/hostswap.go), before anything reads host.crt/host.key. A pair that
+	// already loads is left alone.
+	if _, err := pki.RecoverHostIdentity(d.cfg.PKIDir, d.cfg.HostName); err != nil {
+		slog.Error("the host identity does not load and could not be recovered", "error", err)
+	}
+
 	// Pre-flight: refuse to start under a systemd unit that would kill
 	// child QEMU processes on stop. See preflight.go for the rationale.
 	if err := preflightUnitCheck(); err != nil {
@@ -1571,8 +1578,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}()
 
 	rpcMetrics := metrics.NewRPCMetrics()
+	// Established connections are re-judged every few seconds (pki.ConnTracker):
+	// one made with a certificate since revoked, or with a host certificate a
+	// renewal replaced, is closed and its client re-handshakes.
+	connTracker := pki.NewConnTracker(d.cfg.PKIDir)
+	go connTracker.Run(ctx, connSweepInterval, svc.ConnJudge(ctx))
 	grpcOpts := []grpc.ServerOption{
-		grpc.Creds(credentials.NewTLS(tlsCfg)),
+		grpc.Creds(connTracker.ServerCreds(credentials.NewTLS(tlsCfg))),
 		grpc.ChainUnaryInterceptor(rpcMetrics.UnaryInterceptor(), svc.UnaryAuthInterceptor),
 		grpc.ChainStreamInterceptor(rpcMetrics.StreamInterceptor(), svc.StreamAuthInterceptor),
 		// Defense-in-depth for the legacy unary state-dump/replication paths: the

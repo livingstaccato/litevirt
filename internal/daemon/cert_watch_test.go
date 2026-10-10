@@ -5,7 +5,6 @@ import (
 	"crypto/x509"
 	"math/big"
 	"net"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -20,31 +19,11 @@ import (
 // way `lv host renew-cert` installs it, and returns the new serial.
 func renewOnDisk(t *testing.T, pkiDir, host string) string {
 	t.Helper()
-	prev, err := pki.ServedHostCertificate(pkiDir)
+	_, next, err := pki.RenewLocal(filepath.Join(pkiDir, "ca.crt"), filepath.Join(pkiDir, "ca.key"), pkiDir, host)
 	if err != nil {
 		t.Fatal(err)
 	}
-	certPEM, keyPEM, err := pki.RenewHostCert(filepath.Join(pkiDir, "ca.crt"), filepath.Join(pkiDir, "ca.key"), prev, host)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, f := range []struct {
-		name string
-		data []byte
-	}{{"host.key", keyPEM}, {"host.crt", certPEM}} {
-		tmp := filepath.Join(pkiDir, "."+f.name)
-		if err := os.WriteFile(tmp, f.data, 0o600); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Rename(tmp, filepath.Join(pkiDir, f.name)); err != nil {
-			t.Fatal(err)
-		}
-	}
-	c, err := pki.ParseCertPEM(certPEM)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return strings.ToLower(c.SerialNumber.Text(16))
+	return next
 }
 
 func certWatchFixture(t *testing.T, host string) (*certWatch, *corrosion.Client, string) {
@@ -118,6 +97,8 @@ func TestCertWatch_DoesNotTouchATombstonedRow(t *testing.T) {
 }
 
 type recordingNotifier struct{ got []string }
+
+func (r *recordingNotifier) ProcessOwedRevocations(context.Context) {}
 
 func (r *recordingNotifier) NotifyCertificate(kind string, sev notify.Severity, subject, _ string) {
 	r.got = append(r.got, kind+"/"+string(sev)+"/"+subject)

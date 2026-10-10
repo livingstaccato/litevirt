@@ -21,17 +21,21 @@ Host certificates last five years. The daemon reports how long its certificate
 has left (litevirt_certificate_expiry_timestamp_seconds) and notifies from 30
 days out (certificate.expiring); renew any time before that.
 
-The host keeps running throughout: its daemon serves the new certificate from
-the next handshake on, with no restart, and peers accept it immediately because
-the CA-signed successor names the certificate they have on record. The command
-confirms the host presents the new certificate before it revokes the old one,
-and puts the old pair back if it does not.
+The host generates the new key itself and sends only a certificate request;
+the key never crosses SSH. It installs the certificate as one atomic switch (a
+crash at any point leaves a pair the daemon starts with), and its daemon serves
+it from the next handshake on, with no restart. Peers accept it immediately
+because the CA-signed successor names the certificate they have on record. The
+command confirms the host presents the new certificate, and puts the old one
+back only when the host demonstrably still presents it; an issued successor
+that is never used is revoked.
 
-The old certificate is revoked unless the host is a member of the adopted voter
-generation: that generation's certificate carries the host's votes signed with
-it, and revoking would stop a node that adopts the generation later from
-verifying it until the voter set next changes. Revoke it then with
-'lv host revoke-cert', or now with --revoke-old.
+The replaced certificate is then revoked. When revoking it now would leave the
+newest voter generation unverifiable for a node that adopts it later, the
+revocation is recorded as owed (a degraded condition, notified daily) and the
+cluster publishes it by itself once that is safe; --revoke-old revokes now
+regardless, --keep-old not at all ('lv host revoke-cert' later). It refuses
+while hosts run different builds unless --force.
 
 Must run from the machine that holds the cluster CA private key (the one that
 ran 'lv host init'): there is no CSR flow. Peers on an older litevirt release do
@@ -53,7 +57,8 @@ reaches them by replication — renew after an upgrade has finished.
 	cmd.Flags().BoolVar(&opts.KeepOld, "keep-old", false,
 		"do not revoke the replaced certificate (it stays CA-valid until it expires)")
 	cmd.Flags().BoolVar(&opts.RevokeOld, "revoke-old", false,
-		"revoke the replaced certificate even when the host is a voter")
+		"revoke the replaced certificate now, even when the voter chain would hold it as owed")
+	cmd.Flags().BoolVar(&opts.Force, "force", false, "renew although hosts run different builds")
 	cmd.MarkFlagsMutuallyExclusive("keep-old", "revoke-old")
 	cmd.Flags().DurationVar(&opts.Wait, "wait", 90*time.Second, "how long to wait for each confirmation")
 	return cmd
@@ -128,27 +133,34 @@ ui_tls is on, or plain HTTP under the default ui_tls: auto. No restart.
 func newHostRevokeCertCmd() *cobra.Command {
 	var serial string
 	var grpcPort int
+	var force bool
 	cmd := &cobra.Command{
 		Use:   "revoke-cert <host> --serial <hex>",
 		Short: "Revoke a host certificate a renewal replaced",
 		Long: `Revoke one certificate serial issued to a host and publish the CRL.
 
-This is the deferred half of 'lv host renew-cert': for a certificate kept with
---keep-old, or a voter's replaced certificate held until the voter set changed.
-It refuses the serial the cluster records for the host and the one the host
-presents — revoking either would cut the host off; removing a host is
-'lv host rm'. Run it where the cluster CA key is.
+The manual path after 'lv host renew-cert': a certificate kept with --keep-old,
+an owed revocation you want published now, or a successor a failed renewal
+left. It accepts only a serial known to be the host's — one this machine's
+renewal log records for it, or the predecessor named by the certificate the
+host presents — and refuses any serial another host is recorded with. The
+host's own live certificate, or the one it presents, needs --force: revoking it
+cuts the host off and gets it FENCED (removing a host is 'lv host rm'). If the
+host's presented certificate cannot be read, it refuses unless --force. Run it
+where the cluster CA key is.
 
   lv host revoke-cert host-b --serial 4f1c…`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
-				return cli.HostRevokeCert(ctx, c, args[0], serial, grpcPort)
+				return cli.HostRevokeCert(ctx, c, args[0], serial, grpcPort, force)
 			})
 		},
 	}
 	cmd.Flags().StringVar(&serial, "serial", "", "the certificate serial to revoke (hex, as renew-cert printed it)")
 	cmd.Flags().IntVar(&grpcPort, "grpc-port", 7443, "the host's gRPC port, dialled to make sure it is not presenting this serial")
+	cmd.Flags().BoolVar(&force, "force", false,
+		"revoke even the host's live or presented certificate (fences it), or when its certificate cannot be read")
 	_ = cmd.MarkFlagRequired("serial")
 	return cmd
 }

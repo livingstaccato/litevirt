@@ -149,6 +149,8 @@ func TestValidateServingChain_RefusesEachDefect(t *testing.T) {
 			func(*corpPKI) crypto.Signer { return other }, "do not form a pair"},
 		{"wrong order", ok, func(p *corpPKI) []byte { return pemOf(p.leaf, p.root, p.inter) }, nil, "in order"},
 		{"missing intermediate", ok, func(p *corpPKI) []byte { return pemOf(p.leaf, p.root) }, nil, "in order"},
+		{"CA as leaf", leafOpts{dns: []string{"node-b"}, isCA: true},
+			func(p *corpPKI) []byte { return pemOf(p.leaf, p.inter) }, nil, "CA certificate"},
 		{"leaf not first", ok, func(p *corpPKI) []byte { return pemOf(p.inter, p.leaf) },
 			func(p *corpPKI) crypto.Signer { return p.interKey }, "CA certificate"},
 		{"expired", leafOpts{dns: []string{"node-b"}, notBefore: now.Add(-48 * time.Hour), notAfter: now.Add(-time.Hour)},

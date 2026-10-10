@@ -74,9 +74,7 @@ func (l *lab) waitRelayRole(member string, want float64, within time.Duration, w
 // Needs relay_health_v1 latched on the lab (every node on this build).
 func TestRelayHealth_DegradedLinkBecomesALeafEverywhere(t *testing.T) {
 	l := newLab(t)
-	if len(l.hosts) < 5 {
-		t.Skipf("needs 5 nodes (2 of 4 observers failing is below fence quorum); the lab has %d", len(l.hosts))
-	}
+	l.requireRelayDemotionRoom()
 	victim := l.hosts[0]
 	l.waitRelayRole(victim, 1, 2*time.Minute, "precondition: "+victim+" a relay on every node (it sorts first)")
 
@@ -132,5 +130,49 @@ func TestRelayHealth_DegradedLinkBecomesALeafEverywhere(t *testing.T) {
 	l.mark("%s a relay again on every node after %s", victim, took.Round(time.Second))
 	if took < failover.RelayRestoreWindow {
 		t.Errorf("%s restored after %s, inside the %s window", victim, took, failover.RelayRestoreWindow)
+	}
+}
+
+// requireRelayDemotionRoom skips unless one demotion can take effect: at least
+// 5 hosts active (so 2 failing observers of 4 is the bar and short of fence
+// quorum), none a witness, and more active hosts than the election's relay
+// count R = min(N, 3 + ceil(N/50)), so the floor lets one host go. Otherwise
+// the evaluator correctly declines, and the test would fail after minutes as
+// if the feature were broken.
+func (l *lab) requireRelayDemotionRoom() {
+	l.t.Helper()
+	out, err := l.lv(l.hosts[0], "host", "ls")
+	if err != nil {
+		l.t.Fatalf("lv host ls: %v", err)
+	}
+	total, active := 0, 0
+	var notActive []string
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 3 || f[0] == "NAME" {
+			continue
+		}
+		total++
+		if f[2] == "active" {
+			active++
+		} else {
+			notActive = append(notActive, f[0]+"="+f[2])
+		}
+	}
+	rows, err := l.sql(l.hosts[0], "SELECT name FROM hosts WHERE deleted_at IS NULL AND role = 'witness'")
+	if err != nil {
+		l.t.Fatalf("read witnesses: %v", err)
+	}
+	r := 3 + (total+49)/50
+	if r > total {
+		r = total
+	}
+	switch {
+	case active < 5:
+		l.t.Skipf("relay demotion needs at least 5 active hosts; %d of %d are active (not active: %v)", active, total, notActive)
+	case len(rows) > 0:
+		l.t.Skipf("relay demotion needs no witness among the hosts (a witness is never a relay); witnesses: %v", rows)
+	case active <= r:
+		l.t.Skipf("relay demotion needs more active hosts (%d) than the relay count R = %d", active, r)
 	}
 }

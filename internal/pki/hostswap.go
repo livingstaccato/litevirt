@@ -114,6 +114,11 @@ func InstallRenewal(pkiDir, stagingID string, certPEM []byte) (prevSerial, newSe
 		return "", "", fmt.Errorf("invalid staging id %q", stagingID)
 	}
 	staging := filepath.Join(hostDir(pkiDir), stagingPrefix+stagingID)
+	// A renewed key is written by this build (GenerateRenewalCSR), so it is
+	// held to the strict rules — unlike the identity main installed.
+	if err := checkKeyFile(filepath.Join(staging, "host.key")); err != nil {
+		return "", "", fmt.Errorf("the staged key: %w", err)
+	}
 	keyPEM, err := readBounded(filepath.Join(staging, "host.key"))
 	if err != nil {
 		return "", "", fmt.Errorf("read the staged key: %w", err)

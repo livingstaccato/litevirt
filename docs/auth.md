@@ -422,9 +422,13 @@ could read as a failure:
 4. The daemon serves the new pair from the next handshake — its gRPC listener,
    its peer probes and its loopback clients read the identity at handshake time,
    and its recovery-claim votes are signed with it too. A replacement that does
-   not chain to the cluster CA, names another host, does not match its key, or
-   whose key resolves outside the PKI directory or belongs to another user is
-   refused, and a key readable by others is tightened. **Established
+   not chain to the cluster CA, names another host or does not match its key is
+   refused, as is a renewed key not held safely. The identity a node already
+   has is never refused over how its key file is held: a `host.key` outside the
+   PKI directory, owned by another user, or with a mode that cannot be tightened
+   is still served, logged as a WARN and raised as a degraded
+   `certificate/key_file_unsafe` condition naming the file and the fix (move,
+   `chown` or `chmod 600`); a key readable by others is tightened. **Established
    connections** made with a certificate since revoked, or with a host
    certificate the cluster no longer records, are closed within seconds and
    re-handshake.

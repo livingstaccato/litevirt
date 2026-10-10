@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"math/big"
 	"net"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -143,5 +144,48 @@ func TestCertWatch_NotifiesAheadOfExpiry(t *testing.T) {
 	w.tick(ctx, now.Add(48*time.Hour))
 	if len(n.got) != sent {
 		t.Fatalf("a healthy certificate notified: %v", n.got[sent:])
+	}
+}
+
+// A host key held unsafely is never refused (main served it) but raised as a
+// degraded condition naming the file and the fix, and resolved once fixed.
+//
+// Mutation: drop reportKeyFile from tick — no condition is raised.
+func TestCertWatch_RaisesAnUnsafeKeyFileWithoutRefusingIt(t *testing.T) {
+	ctx := context.Background()
+	w, db, pkiDir := certWatchFixture(t, "node-0")
+	key := filepath.Join(pkiDir, "host.key")
+	outside := filepath.Join(t.TempDir(), "host.key")
+	if err := os.Rename(key, outside); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, key); err != nil {
+		t.Fatal(err)
+	}
+	w.tick(ctx, time.Now())
+	if _, err := pki.ServedHostCertificate(pkiDir); err != nil {
+		t.Fatalf("the host identity was refused over its key file: %v", err)
+	}
+	cond := func() (corrosion.HealthCondition, bool) {
+		c, ok, err := corrosion.GetHealthCondition(ctx, db, "certificate", "key_file_unsafe", "host", "node-0/host.key")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c, ok
+	}
+	c, ok := cond()
+	if !ok || c.Lifecycle != corrosion.ConditionConfirmed || !strings.Contains(c.Evidence, "outside") {
+		t.Fatalf("no degraded condition names the unsafe key: %+v %v", c, ok)
+	}
+	// Fixed: the key moves back into the PKI directory.
+	if err := os.Remove(key); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(outside, key); err != nil {
+		t.Fatal(err)
+	}
+	w.tick(ctx, time.Now())
+	if c, _ := cond(); c.Lifecycle != corrosion.ConditionResolved {
+		t.Fatalf("the condition was not resolved once the key was fixed: %s", c.Lifecycle)
 	}
 }

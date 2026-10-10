@@ -49,6 +49,12 @@ type KeyPairSource struct {
 	check func(leaf *x509.Certificate) error
 	// pairCheck vets EVERY pair, the first included, and may set pair.Leaf.
 	pairCheck func(pair *tls.Certificate) error
+	// strictKeyFile refuses a key file that fails checkKeyFile. Only for keys
+	// this build introduced (the custom UI certificate): a key file main
+	// served — the host's and client's identity — is never newly refused, only
+	// reported (KeyFileProblems) and served.
+	strictKeyFile bool
+	warnedKey     string
 
 	mu         sync.Mutex
 	cur        *tls.Certificate
@@ -120,7 +126,13 @@ func (s *KeyPairSource) Get() (*tls.Certificate, error) {
 func (s *KeyPairSource) reloadLocked() {
 	first := !s.everLoaded
 	s.everLoaded = true
-	pair, err := loadPairChecked(s.certPath, s.keyPath)
+	var pair tls.Certificate
+	var err error
+	if s.strictKeyFile {
+		pair, err = loadPairChecked(s.certPath, s.keyPath)
+	} else {
+		pair, err = s.loadPairLenient()
+	}
 	if err == nil && pair.Leaf == nil && len(pair.Certificate) > 0 {
 		pair.Leaf, err = x509.ParseCertificate(pair.Certificate[0])
 	}
@@ -168,6 +180,55 @@ func loadPairChecked(certPath, keyPath string) (tls.Certificate, error) {
 		return tls.Certificate{}, err
 	}
 	return tls.X509KeyPair(certPEM, keyPEM)
+}
+
+// loadPairLenient loads a pair the way main did — whatever the key file's
+// owner, location or size — after tightening a loose mode, and warns once per
+// problem set; the daemon raises the same problems as a degraded condition.
+func (s *KeyPairSource) loadPairLenient() (tls.Certificate, error) {
+	if probs := KeyFileProblems(s.keyPath); len(probs) > 0 {
+		if key := strings.Join(probs, "; "); key != s.warnedKey {
+			s.warnedKey = key
+			slog.Warn("a private key file is not held the way it should be; still serving it",
+				"key", s.keyPath, "problems", key)
+		}
+	} else {
+		s.warnedKey = ""
+	}
+	return tls.LoadX509KeyPair(s.certPath, s.keyPath)
+}
+
+// KeyFileProblems lists what is wrong with how keyPath is held, each with its
+// fix, after tightening a mode readable by others (a repair, never a refusal).
+// Empty when the key is a regular file inside its own directory, owned by this
+// process's user, readable by nobody else.
+func KeyFileProblems(keyPath string) []string {
+	var out []string
+	real, err := filepath.EvalSymlinks(keyPath)
+	if err != nil {
+		return []string{fmt.Sprintf("%s cannot be resolved: %v", keyPath, err)}
+	}
+	if dir, err := filepath.EvalSymlinks(filepath.Dir(keyPath)); err == nil {
+		if rel, err := filepath.Rel(dir, real); err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			out = append(out, fmt.Sprintf("%s resolves outside %s (to %s): move the key into %s", keyPath, dir, real, dir))
+		}
+	}
+	fi, err := os.Lstat(real)
+	if err != nil {
+		return append(out, fmt.Sprintf("%s cannot be read: %v", real, err))
+	}
+	if !fi.Mode().IsRegular() {
+		out = append(out, fmt.Sprintf("%s is not a regular file: replace it with one", real))
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok && int(st.Uid) != os.Geteuid() {
+		out = append(out, fmt.Sprintf("%s is owned by uid %d: chown %d %s", real, st.Uid, os.Geteuid(), real))
+	}
+	if fi.Mode().Perm()&0o077 != 0 {
+		if err := TightenKeyMode(real); err != nil {
+			out = append(out, fmt.Sprintf("%s is mode %04o: chmod 600 %s", real, fi.Mode().Perm(), real))
+		}
+	}
+	return out
 }
 
 // readBounded reads a regular file of at most maxServingChainBytes.

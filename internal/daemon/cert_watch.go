@@ -3,8 +3,11 @@ package daemon
 import (
 	"context"
 	"crypto/x509"
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -66,7 +69,8 @@ type certWatch struct {
 	certs    []servedCert
 
 	mu       sync.Mutex
-	recorded string // serial last confirmed in this host's row
+	recorded string            // serial last confirmed in this host's row
+	keyState map[string]string // key file -> problems last reported ("" = none)
 	alerts   map[string]certAlert
 }
 
@@ -117,6 +121,7 @@ func (w *certWatch) addUI(u *uiTLS) {
 
 func (w *certWatch) tick(ctx context.Context, now time.Time) {
 	w.recordHostSerial(ctx)
+	w.reportKeyFile(ctx, "host.key")
 	if w.notifier != nil {
 		w.notifier.ProcessOwedRevocations(ctx)
 	}
@@ -221,3 +226,68 @@ func (w *certWatch) alert(c servedCert, leaf *x509.Certificate, now time.Time) {
 func CertWatchOnce(ctx context.Context, host, pkiDir string, db *corrosion.Client, n certNotifier) {
 	newCertWatch(host, pkiDir, db, n, nil).tick(ctx, time.Now())
 }
+
+// condKeyFileUnsafe is raised for a private key file this node SERVES although
+// it is not held the way it should be (outside the PKI directory, another
+// owner, a mode that could not be tightened). The key is never refused for it
+// — main served such files, and refusing would take the host off the network
+// — so a degraded condition naming the file and the fix is how an operator
+// hears about it.
+const condKeyFileUnsafe = "key_file_unsafe"
+
+type keyFileEvidence struct {
+	File     string   `json:"file"`
+	Problems []string `json:"problems"`
+}
+
+// reportKeyFile raises, updates or resolves key_file_unsafe for pki_dir/name.
+func (w *certWatch) reportKeyFile(ctx context.Context, name string) {
+	if w.db == nil || w.pkiDir == "" {
+		return
+	}
+	path := filepath.Join(w.pkiDir, name)
+	var probs []string
+	if _, err := os.Lstat(path); err == nil {
+		probs = pki.KeyFileProblems(path)
+	}
+	state := strings.Join(probs, "; ")
+	w.mu.Lock()
+	if w.keyState == nil {
+		w.keyState = map[string]string{}
+	}
+	last, seen := w.keyState[name]
+	w.keyState[name] = state
+	w.mu.Unlock()
+	if seen && last == state {
+		return
+	}
+	subject := w.host + "/" + name
+	ts := time.Now().UTC().Format(time.RFC3339)
+	cur, ok, err := corrosion.GetHealthCondition(ctx, w.db, certEvaluatorName, condKeyFileUnsafe, "host", subject)
+	if err != nil {
+		return
+	}
+	if state == "" {
+		if ok && cur.Lifecycle != corrosion.ConditionResolved {
+			cur.Lifecycle, cur.ResolvedAt, cur.LastSeen, cur.Reporter = corrosion.ConditionResolved, ts, ts, w.host
+			_ = corrosion.UpsertHealthCondition(ctx, w.db, cur)
+		}
+		return
+	}
+	slog.Warn("a private key this host serves is not held safely; serving it anyway (fix it as the condition says)",
+		"file", path, "problems", state)
+	ev, _ := json.Marshal(keyFileEvidence{File: path, Problems: probs})
+	first := ts
+	if ok && cur.Lifecycle != corrosion.ConditionResolved && cur.FirstSeen != "" {
+		first = cur.FirstSeen
+	}
+	_ = corrosion.UpsertHealthCondition(ctx, w.db, corrosion.HealthCondition{
+		Evaluator: certEvaluatorName, Code: condKeyFileUnsafe, SubjectKind: "host", SubjectID: subject,
+		Lifecycle: corrosion.ConditionConfirmed, Severity: corrosion.SeverityWarning, Hosts: []string{w.host},
+		Evidence: string(ev), ObserveCount: 1, FirstSeen: first, LastSeen: ts, ConfirmedAt: first, Reporter: w.host,
+	})
+}
+
+// certEvaluatorName is the health evaluator certificate conditions are filed
+// under (grpcapi uses the same name for revocation_owed).
+const certEvaluatorName = "certificate"

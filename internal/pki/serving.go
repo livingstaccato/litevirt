@@ -172,7 +172,9 @@ func ipStrings(c *x509.Certificate) []string {
 // daemon never serves a chain the installer would have refused, even one
 // written by hand.
 func UICertSource(dir string) *KeyPairSource {
-	return NewKeyPairSource(filepath.Join(dir, UICertName), filepath.Join(dir, UIKeyName), nil).withPairCheck(func(p *tls.Certificate) error {
+	src := NewKeyPairSource(filepath.Join(dir, UICertName), filepath.Join(dir, UIKeyName), nil)
+	src.strictKeyFile = true // introduced by this build: held to the strict rules
+	return src.withPairCheck(func(p *tls.Certificate) error {
 		_, err := checkServingPair(p, time.Time{})
 		return err
 	})

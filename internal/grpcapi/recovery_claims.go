@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/claims"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/pki"
 )
 
 // Recovery-claim voter RPCs and the proposer's transport
@@ -86,6 +88,7 @@ func (s *Server) claimIdentity() (*corrosion.ClaimSigner, *corrosion.ClaimVerifi
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.signer != nil && c.verifier != nil {
+		s.followRenewedIdentityLocked(c)
 		return c.signer, c.verifier, nil
 	}
 	if c.loadErr != nil && time.Since(c.loadedAt) < claimIdentityRetry {
@@ -104,6 +107,33 @@ func (s *Server) claimIdentity() (*corrosion.ClaimSigner, *corrosion.ClaimVerifi
 	}
 	c.signer, c.verifier, c.loadErr = signer, verifier, nil
 	return signer, verifier, nil
+}
+
+// followRenewedIdentityLocked moves the cached signer onto the host identity
+// the gRPC listener is serving, once that has been renewed on disk.
+//
+// The signer was loaded once and kept, and the TLS identity is reloaded at
+// handshake time (pki.KeyPairSource). Left alone, a renewed node would go on
+// signing votes with a certificate it no longer presents — and the renewal
+// revokes that certificate, which every verifier checks (ClaimVerifier.revoked),
+// so the node would lose its vote the moment the CRL landed. A replacement that
+// cannot be turned into a signer keeps the current one: it is still valid until
+// the old certificate is revoked, and the TLS source refuses a pair that is not
+// this host's anyway.
+func (s *Server) followRenewedIdentityLocked(c *claimRuntime) {
+	pair, err := pki.ServedHostKeyPair(s.pkiDir)
+	if err != nil || pair.Leaf == nil || strings.EqualFold(pair.Leaf.SerialNumber.Text(16), c.signer.Serial()) {
+		return
+	}
+	renewed, err := corrosion.ClaimSignerFromKeyPair(s.hostName, pair)
+	if err != nil {
+		slog.Warn("the host certificate was renewed but the claim signer could not follow it; "+
+			"still signing votes with the previous certificate", "error", err)
+		return
+	}
+	slog.Info("claim signer moved to the renewed host certificate",
+		"previous_serial", c.signer.Serial(), "serial", renewed.Serial())
+	c.signer = renewed
 }
 
 // claimProposer is this process's proposer. Its boot nonce is drawn once, so

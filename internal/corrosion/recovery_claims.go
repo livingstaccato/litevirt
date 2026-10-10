@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
 	"encoding/hex"
@@ -15,6 +16,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/litevirt/litevirt/internal/pki"
 )
@@ -375,6 +377,7 @@ func acceptPayload(key ClaimKey, gen int64, b Ballot, digest, voter, incarnation
 type ClaimSigner struct {
 	name    string
 	certPEM string
+	serial  string // lower-case hex, of the certificate in certPEM
 	key     *ecdsa.PrivateKey
 }
 
@@ -409,7 +412,40 @@ func LoadClaimSigner(pkiDir, hostName string) (*ClaimSigner, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse host key: %w", err)
 	}
-	return &ClaimSigner{name: hostName, certPEM: string(certPEM), key: priv}, nil
+	return &ClaimSigner{name: hostName, certPEM: string(certPEM),
+		serial: strings.ToLower(cert.SerialNumber.Text(16)), key: priv}, nil
+}
+
+// ClaimSignerFromKeyPair builds the signer from the host identity this process
+// is SERVING (pki.ServedHostKeyPair), for a signer that has to follow a renewal.
+//
+// The pair comes from the TLS identity source rather than two file reads
+// because it is already known to match: certificate and key are separate files,
+// and reading them one after the other mid-renewal can pair the new certificate
+// with the old key — a signer whose every accept fails verification.
+func ClaimSignerFromKeyPair(hostName string, pair *tls.Certificate) (*ClaimSigner, error) {
+	if pair == nil || pair.Leaf == nil || len(pair.Certificate) == 0 {
+		return nil, fmt.Errorf("no host certificate loaded")
+	}
+	if pair.Leaf.Subject.CommonName != hostName {
+		return nil, fmt.Errorf("host certificate CN is %q but this host is %q", pair.Leaf.Subject.CommonName, hostName)
+	}
+	priv, ok := pair.PrivateKey.(*ecdsa.PrivateKey)
+	if !ok {
+		return nil, fmt.Errorf("host key is %T, not an ECDSA key", pair.PrivateKey)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: pair.Certificate[0]})
+	return &ClaimSigner{name: hostName, certPEM: string(certPEM),
+		serial: strings.ToLower(pair.Leaf.SerialNumber.Text(16)), key: priv}, nil
+}
+
+// Serial is the serial of the certificate this signer's accepts carry, as
+// lower-case hex.
+func (s *ClaimSigner) Serial() string {
+	if s == nil {
+		return ""
+	}
+	return s.serial
 }
 
 // Name is the voter this signer signs as.

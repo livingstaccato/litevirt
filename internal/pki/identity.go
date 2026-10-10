@@ -1,0 +1,228 @@
+package pki
+
+import (
+	"crypto/tls"
+	"crypto/x509"
+	"errors"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"sync"
+	"syscall"
+	"time"
+)
+
+// Hot-reloadable TLS identities.
+//
+// The host's TLS identity (host.crt / host.key) used to be read once: the gRPC
+// listener's config was built at boot, the health checker cached the client
+// config it dials peers with, and the UI's loopback connection did the same. So
+// replacing the files on a running node changed nothing until a restart, and
+// renewing a certificate meant bouncing the daemon.
+//
+// A KeyPairSource serves the pair from disk instead, re-reading it when either
+// file changes (mtime, size or inode — an atomic rename always gives a new inode,
+// so a same-second, same-size replacement is still seen). Every TLS config this
+// package builds asks it for the certificate at handshake time, so a renewed
+// pair is in use from the next handshake on. Established connections keep the
+// certificate they negotiated.
+//
+// A CHANGED pair is adopted only if it passes the source's check; anything else
+// is logged and the pair being served stays. Two cases make that the right
+// direction:
+//
+//   - a torn replacement. cert and key are two files, so a reader can see the new
+//     certificate beside the old key. LoadX509KeyPair refuses the mismatch, the
+//     stamps are recorded, and the second rename changes them again — the next
+//     handshake then loads the matching pair.
+//   - a wrong certificate. A host identity that no longer chains to the cluster
+//     CA, or names another host, would cut this node off from every peer. Keeping
+//     the old identity keeps the node in the cluster, and the log says why the
+//     new one was not taken.
+type KeyPairSource struct {
+	certPath, keyPath string
+	// check vets a changed pair before it replaces the served one. nil accepts
+	// any pair LoadX509KeyPair can load.
+	check func(leaf *x509.Certificate) error
+
+	mu         sync.Mutex
+	cur        *tls.Certificate
+	certStamp  fileStamp
+	keyStamp   fileStamp
+	loadErr    error
+	everLoaded bool
+}
+
+// fileStamp identifies one version of a file on disk.
+type fileStamp struct {
+	mod  time.Time
+	size int64
+	ino  uint64
+}
+
+func stampOf(path string) (fileStamp, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return fileStamp{}, err
+	}
+	s := fileStamp{mod: fi.ModTime(), size: fi.Size()}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		s.ino = uint64(st.Ino) //nolint:unconvert // Ino is uint32 on some platforms
+	}
+	return s, nil
+}
+
+// NewKeyPairSource returns a source for certPath/keyPath. check, when non-nil,
+// is applied to every pair after the first; see KeyPairSource.
+func NewKeyPairSource(certPath, keyPath string, check func(*x509.Certificate) error) *KeyPairSource {
+	return &KeyPairSource{certPath: certPath, keyPath: keyPath, check: check}
+}
+
+// Get returns the pair to serve, re-reading the files if they changed. It errs
+// only while no pair has ever loaded.
+func (s *KeyPairSource) Get() (*tls.Certificate, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cs, cerr := stampOf(s.certPath)
+	ks, kerr := stampOf(s.keyPath)
+	switch {
+	case cerr != nil || kerr != nil:
+		// A file that vanished keeps the pair already loaded: deleting the
+		// identity of a running node must not take it off the network mid-RPC.
+		if s.cur == nil {
+			if cerr != nil {
+				return nil, fmt.Errorf("load %s: %w", filepath.Base(s.certPath), cerr)
+			}
+			return nil, fmt.Errorf("load %s: %w", filepath.Base(s.keyPath), kerr)
+		}
+	case !s.everLoaded || cs != s.certStamp || ks != s.keyStamp:
+		s.certStamp, s.keyStamp = cs, ks
+		s.reloadLocked()
+	}
+	if s.cur == nil {
+		return nil, s.loadErr
+	}
+	return s.cur, nil
+}
+
+// reloadLocked loads the pair the stamps now describe and adopts it if it passes.
+func (s *KeyPairSource) reloadLocked() {
+	first := !s.everLoaded
+	s.everLoaded = true
+	pair, err := tls.LoadX509KeyPair(s.certPath, s.keyPath)
+	if err == nil && pair.Leaf == nil && len(pair.Certificate) > 0 {
+		pair.Leaf, err = x509.ParseCertificate(pair.Certificate[0])
+	}
+	if err == nil && !first && s.check != nil {
+		err = s.check(pair.Leaf)
+	}
+	if err != nil {
+		s.loadErr = fmt.Errorf("load %s/%s: %w", filepath.Base(s.certPath), filepath.Base(s.keyPath), err)
+		if s.cur != nil {
+			// The key is never part of this message: LoadX509KeyPair's errors
+			// describe the mismatch, not the material.
+			slog.Warn("a replaced certificate was not adopted; still serving the previous one "+
+				"(a half-written pair is retried when the second file lands)",
+				"cert", s.certPath, "serving_serial", s.cur.Leaf.SerialNumber.Text(16), "error", err)
+		}
+		return
+	}
+	if s.cur != nil && !first {
+		slog.Info("certificate reloaded from disk",
+			"cert", s.certPath,
+			"previous_serial", s.cur.Leaf.SerialNumber.Text(16),
+			"serial", pair.Leaf.SerialNumber.Text(16),
+			"not_after", pair.Leaf.NotAfter.UTC().Format(time.RFC3339))
+	}
+	s.cur, s.loadErr = &pair, nil
+}
+
+// Leaf returns the certificate being served, or an error while none has loaded.
+func (s *KeyPairSource) Leaf() (*x509.Certificate, error) {
+	pair, err := s.Get()
+	if err != nil {
+		return nil, err
+	}
+	return pair.Leaf, nil
+}
+
+var (
+	sourcesMu sync.Mutex
+	sources   = map[string]*KeyPairSource{}
+)
+
+// hostIdentitySource is the process-wide source for pkiDir's host identity,
+// shared by every TLS config built for that directory, so a renewal is adopted
+// once and seen everywhere.
+func hostIdentitySource(pkiDir string) *KeyPairSource {
+	return sharedSource(pkiDir, "host", x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth)
+}
+
+// sharedSource returns the process-wide source for pkiDir/<name>.crt|.key. A
+// changed pair must chain to pkiDir/ca.crt for every usage in usages and keep
+// the Common Name of the pair first loaded — renewal replaces a certificate; it
+// never changes whose it is.
+func sharedSource(pkiDir, name string, usages ...x509.ExtKeyUsage) *KeyPairSource {
+	certPath := filepath.Join(pkiDir, name+".crt")
+	keyPath := filepath.Join(pkiDir, name+".key")
+	key := certPath + "\x00" + keyPath
+	sourcesMu.Lock()
+	defer sourcesMu.Unlock()
+	if s, ok := sources[key]; ok {
+		return s
+	}
+	s := NewKeyPairSource(certPath, keyPath, nil)
+	s.check = func(leaf *x509.Certificate) error {
+		return checkSameIdentity(pkiDir, s.firstCN(), leaf, usages)
+	}
+	sources[key] = s
+	return s
+}
+
+// firstCN is the Common Name of the pair currently served. Called from check,
+// which runs with s.mu held.
+func (s *KeyPairSource) firstCN() string {
+	if s.cur == nil || s.cur.Leaf == nil {
+		return ""
+	}
+	return s.cur.Leaf.Subject.CommonName
+}
+
+// checkSameIdentity accepts leaf as a replacement for an identity named cn: it
+// must chain to the cluster CA for each usage and carry the same Common Name.
+func checkSameIdentity(pkiDir, cn string, leaf *x509.Certificate, usages []x509.ExtKeyUsage) error {
+	if leaf == nil {
+		return errors.New("no certificate")
+	}
+	caPEM, err := os.ReadFile(filepath.Join(pkiDir, "ca.crt"))
+	if err != nil {
+		return fmt.Errorf("read CA cert: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caPEM) {
+		return errors.New("failed to parse CA cert")
+	}
+	for _, u := range usages {
+		if _, err := leaf.Verify(x509.VerifyOptions{Roots: pool, KeyUsages: []x509.ExtKeyUsage{u}}); err != nil {
+			return fmt.Errorf("the new certificate does not verify against the cluster CA: %w", err)
+		}
+	}
+	if cn != "" && leaf.Subject.CommonName != cn {
+		return fmt.Errorf("the new certificate names %q, but this identity is %q", leaf.Subject.CommonName, cn)
+	}
+	return nil
+}
+
+// ServedHostCertificate is the host certificate this process presents for
+// pkiDir right now — the one peers see, which after a renewal on disk is not
+// necessarily what a fresh read of host.crt would say if that file was refused.
+func ServedHostCertificate(pkiDir string) (*x509.Certificate, error) {
+	return hostIdentitySource(pkiDir).Leaf()
+}
+
+// ServedHostKeyPair is ServedHostCertificate with its private key, for signers
+// that must sign as the identity peers verify (recovery-claim votes).
+func ServedHostKeyPair(pkiDir string) (*tls.Certificate, error) {
+	return hostIdentitySource(pkiDir).Get()
+}

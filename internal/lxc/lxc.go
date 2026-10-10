@@ -249,6 +249,11 @@ type LxcRunner struct {
 	cgPathMu    sync.Mutex
 	cgPathCache map[string]string
 
+	// hostAccessMu guards hostAccessLocks, one lock per container name under
+	// which its host-access record, config block and hook policy change.
+	hostAccessMu    sync.Mutex
+	hostAccessLocks map[string]*sync.Mutex
+
 	// DefaultPidsMax is the pids.max a container whose config sets none gets
 	// at its next start (prepareStart). 0 adds none.
 	DefaultPidsMax int

@@ -26,14 +26,14 @@ func TestJudgeOpened(t *testing.T) {
 		t.Fatalf("openedPath = %q, %v", got, err)
 	}
 	p := hookPolicy{MountPaths: []string{allowed}}
-	if err := p.judgeOpened(allowed, got); err != nil {
+	if err := p.judgeOpened(allowed, got, 0); err != nil {
 		t.Errorf("an opened source beneath its prefix was refused: %v", err)
 	}
 	p.Deny = []string{filepath.Join(allowed, "nas")}
-	if err := p.judgeOpened(allowed, got); err == nil {
+	if err := p.judgeOpened(allowed, got, 0); err == nil {
 		t.Error("an opened source inside a protected tree passed")
 	}
-	if err := (hookPolicy{MountPaths: []string{allowed}}).judgeOpened(allowed, "/etc"); err == nil {
+	if err := (hookPolicy{MountPaths: []string{allowed}}).judgeOpened(allowed, "/etc", 0); err == nil {
 		t.Error("an opened source outside its prefix passed")
 	}
 }

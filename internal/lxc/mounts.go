@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // Host bind mounts and device nodes (Proxmox mpN / devN).
@@ -158,12 +159,14 @@ func resolveIfExists(p string) string {
 }
 
 // deniedTree reports the protected tree p touches — p inside it, or p an
-// ancestor of it — or "" when it touches none.
+// ancestor of it, by path or by filesystem identity (the same tree mounted
+// somewhere else: deniedTreeByIdentity) — or "" when it touches none.
 func deniedTree(p string, extra []string) string {
 	if p == "/" {
 		return "/"
 	}
-	for _, d := range append(append([]string(nil), hardDenyTrees...), extra...) {
+	trees := append(append([]string(nil), hardDenyTrees...), extra...)
+	for _, d := range trees {
 		if d == "" || !filepath.IsAbs(d) {
 			continue
 		}
@@ -173,7 +176,7 @@ func deniedTree(p string, extra []string) string {
 			}
 		}
 	}
-	return ""
+	return deniedTreeByIdentity(p, 0, trees)
 }
 
 // deniedDeviceName reports device nodes never passed through by name.
@@ -187,9 +190,13 @@ func deniedDeviceName(p string) bool {
 	// Host console and input: virtual terminals, the console, their screen
 	// memory, input injection and every input device, and the watchdog
 	// (which reboots the host). Serial ports (ttyS, ttyUSB, ttyACM, ...) pass.
+	// Device-mapper control (a dm target over any host disk), the CPU MSRs
+	// and the hibernation image (host RAM) are host trust too.
 	return strings.HasPrefix(p, "/dev/vhost-") || strings.HasPrefix(p, "/dev/bsg/") || strings.HasPrefix(p, "/dev/input/") ||
-		rawDiskCharRe.MatchString(p) || hostConsoleRe.MatchString(p)
+		rawDiskCharRe.MatchString(p) || hostConsoleRe.MatchString(p) || hostTrustRe.MatchString(p)
 }
+
+var hostTrustRe = regexp.MustCompile(`^/dev/(mapper/control|cpu/[0-9]+/msr|snapshot)$`)
 
 var hostConsoleRe = regexp.MustCompile(`^/dev/(tty[0-9]*|console|vcs[au]?[0-9]*|uinput|watchdog[0-9]*)$`)
 
@@ -252,6 +259,10 @@ func deniedDeviceNumber(kind byte, major, minor uint32) bool {
 	case major == 5 && (minor == 0 || minor == 1): // /dev/tty, /dev/console
 		return true
 	case major == 7, major == 13: // vcs*, input
+		return true
+	case major == 10 && (minor == 236 || minor == 231): // device-mapper control, snapshot
+		return true
+	case major == 202: // cpu/N/msr
 		return true
 	}
 	return rawDiskCharMajors()[major]
@@ -358,6 +369,8 @@ var (
 		}
 		return deviceNumbers(fi)
 	}
+	// lstatDevice reads a device node without following a symlink.
+	lstatDevice = os.Lstat
 	// exclusiveOpenBusy reports whether the kernel refuses an exclusive open
 	// of the block node (EBUSY): a claim by a mount, swap, md, dm, btrfs, ZFS
 	// or anything else that holds it.
@@ -498,8 +511,10 @@ func openDeviceNumbers() map[string]string {
 	return out
 }
 
-// resolveDevice judges one device on this host.
-func resolveDevice(d Device, a HostAccess) (resolvedDevice, error) {
+// resolveDevice judges one device on this host. live adds the checks of who
+// holds a block device NOW (blockDeviceInUse: mounts, swap, open fds, holders,
+// the exclusive-open probe); without it the device is judged on what it is.
+func resolveDevice(d Device, a HostAccess, live bool) (resolvedDevice, error) {
 	src, err := cleanAbs("device path", d.HostPath)
 	if err != nil {
 		return resolvedDevice{}, err
@@ -524,7 +539,7 @@ func resolveDevice(d Device, a HostAccess) (resolvedDevice, error) {
 	if deniedDeviceName(src) {
 		return resolvedDevice{}, fmt.Errorf("device %q is never passed through (host memory, I/O ports, KVM and vhost are host-trust devices)", src)
 	}
-	fi, err := os.Lstat(src)
+	fi, err := lstatDevice(src)
 	if err != nil {
 		return resolvedDevice{}, fmt.Errorf("device %q: %w", src, err)
 	}
@@ -539,8 +554,10 @@ func resolveDevice(d Device, a HostAccess) (resolvedDevice, error) {
 		return resolvedDevice{}, fmt.Errorf("device %q (%c %d:%d) is never passed through (host memory, I/O ports, KVM and vhost)", src, kind, major, minor)
 	}
 	if kind == 'b' {
-		if why := blockDeviceInUse(major, minor); why != "" {
-			return resolvedDevice{}, fmt.Errorf("block device %q is the host's: %s", src, why)
+		if live {
+			if why := blockDeviceInUse(major, minor); why != "" {
+				return resolvedDevice{}, fmt.Errorf("block device %q is the host's: %s", src, why)
+			}
 		}
 		if why := litevirtBlockUse(a, major, minor); why != "" {
 			return resolvedDevice{}, fmt.Errorf("block device %q is litevirt's: %s", src, why)
@@ -552,6 +569,13 @@ func resolveDevice(d Device, a HostAccess) (resolvedDevice, error) {
 // ResolveHostAccess judges a container's mounts and devices on this host,
 // returning the resolved forms its config names, or the first refusal.
 func ResolveHostAccess(mounts []Mount, devices []Device, access HostAccess) ([]resolvedMount, []resolvedDevice, error) {
+	return resolveHostAccess(mounts, devices, access, true)
+}
+
+// resolveHostAccess is ResolveHostAccess; live=false leaves out who holds a
+// block device now (resolveDevice) — the judgment of a RUNNING container's
+// grant, whose own processes may hold it.
+func resolveHostAccess(mounts []Mount, devices []Device, access HostAccess, live bool) ([]resolvedMount, []resolvedDevice, error) {
 	if len(mounts) > 0 {
 		if err := hostAccessSupported(); err != nil {
 			return nil, nil, fmt.Errorf("host bind mounts need the kernel's openat2 and new mount API (Linux 5.12+): %w", err)
@@ -573,7 +597,7 @@ func ResolveHostAccess(mounts []Mount, devices []Device, access HostAccess) ([]r
 	}
 	var rd []resolvedDevice
 	for _, d := range devices {
-		r, err := resolveDevice(d, access)
+		r, err := resolveDevice(d, access, live)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -753,6 +777,7 @@ func readAuthorizedHostAccess(dir string) (authorizedHostAccess, error) {
 // host now. Empty removes both. The caller has authorized them (the admin
 // role at create or convert, or a peer-verified source row).
 func (r *LxcRunner) SetHostAccess(name string, mounts []Mount, devices []Device) error {
+	defer r.lockHostAccess(name)()
 	dir := filepath.Join(r.lxcpath(), name)
 	cfgPath := filepath.Join(dir, "config")
 	b, err := os.ReadFile(cfgPath)
@@ -852,6 +877,7 @@ func (r *LxcRunner) hostAccess() HostAccess {
 // cannot be read, a block that is not closed, or a path the host no longer
 // allows refuses the start.
 func (r *LxcRunner) checkHostAccessForStart(name string) error {
+	defer r.lockHostAccess(name)()
 	dir := filepath.Join(r.lxcpath(), name)
 	auth, err := readAuthorizedHostAccess(dir)
 	if err != nil {
@@ -1100,20 +1126,85 @@ func (p hookPolicy) coversDevice(d hookDevice) error {
 }
 
 // judgeOpened judges the path the kernel resolved an opened source to: still
-// beneath its prefix, the prefix still allowed, and in no protected tree. It
-// is what lets a filesystem mounted beneath an allowed prefix (a NAS) be a
-// source while a store or protected tree mounted or swapped there is not.
-func (p hookPolicy) judgeOpened(prefix, opened string) error {
-	return p.judgeMount(prefix, opened)
+// beneath its prefix, the prefix still allowed, and in no protected tree —
+// by path, and by the identity of the filesystem the fd is on (mntID, its
+// mount id), so a store reached through another mount of its filesystem is
+// refused even where a later mount shadows that one. It is what lets a
+// filesystem mounted beneath an allowed prefix (a NAS) be a source while a
+// store or protected tree mounted or swapped there is not.
+func (p hookPolicy) judgeOpened(prefix, opened string, mntID uint64) error {
+	if err := p.judgeMount(prefix, opened); err != nil {
+		return err
+	}
+	if d := deniedTreeByIdentity(filepath.Clean(opened), mntID, append(append([]string(nil), hardDenyTrees...), p.Deny...)); d != "" {
+		return fmt.Errorf("%s is, lies in or contains the protected tree %s", opened, d)
+	}
+	return nil
 }
 
 // RefreshHookPolicies rewrites every container's hook policy from its record
 // and this host's policy as they are now (the daemon runs it at start and
 // periodically, so a pool or repo created, or a prefix withdrawn, reaches the
 // policy an in-container reboot judges against). A container whose record no
-// longer resolves here gets a policy that authorizes nothing.
+// longer resolves here gets a policy that authorizes nothing, and a policy
+// whose container directory is gone is removed.
+//
+// Devices are judged on what they are, never on who holds them now: the
+// container may be running, and its own processes may hold its granted block
+// device open. The live checks — holders, mounts, swap, the exclusive-open
+// probe — run in the start hook's pre-start judgment (judgeDevice), when no
+// process of the container is alive, and at every daemon-driven start.
+//
+// Each container is refreshed under its host-access lock, so a refresh that
+// read a record cannot write its policy over a newer one SetHostAccess wrote.
 func (r *LxcRunner) RefreshHookPolicies() error {
 	ents, err := os.ReadDir(r.lxcpath())
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	var errs []error
+	for _, e := range ents {
+		if !e.IsDir() {
+			continue
+		}
+		if err := r.refreshHookPolicy(e.Name()); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if err := r.sweepHookPolicies(); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
+}
+
+// refreshHookPolicy rewrites one container's policy under its lock.
+func (r *LxcRunner) refreshHookPolicy(name string) error {
+	defer r.lockHostAccess(name)()
+	auth, err := readAuthorizedHostAccess(filepath.Join(r.lxcpath(), name))
+	if err != nil {
+		// Unreadable: authorize nothing until it reads.
+		return errors.Join(fmt.Errorf("container %q: %w", name, err), r.writeHookPolicy(name, nil, nil))
+	}
+	if len(auth.Mounts) == 0 && len(auth.Devices) == 0 {
+		return r.syncHookPolicy(name, nil, nil)
+	}
+	// A record that no longer resolves here yields nothing (rm, rd nil):
+	// its policy then authorizes nothing.
+	rm, rd, rerr := resolveHostAccess(auth.Mounts, auth.Devices, r.hostAccess(), false)
+	if rerr != nil {
+		slog.Warn("container: its host access no longer resolves on this host; its start hook will refuse it", "container", name, "error", rerr)
+	}
+	if refreshPauseHook != nil {
+		refreshPauseHook(name)
+	}
+	return r.writeHookPolicy(name, rm, rd)
+}
+
+// sweepHookPolicies removes the policy of every container whose directory is
+// gone (deleted, or migrated to another host). Each is checked again under
+// the container's lock, so a container created meanwhile keeps its policy.
+func (r *LxcRunner) sweepHookPolicies() error {
+	ents, err := os.ReadDir(hookPolicyDir)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil
@@ -1122,37 +1213,43 @@ func (r *LxcRunner) RefreshHookPolicies() error {
 	}
 	var errs []error
 	for _, e := range ents {
-		if !e.IsDir() {
+		name, ok := strings.CutSuffix(e.Name(), ".json")
+		if !ok || e.IsDir() || name == "" {
 			continue
 		}
-		name := e.Name()
-		auth, err := readAuthorizedHostAccess(filepath.Join(r.lxcpath(), name))
-		if err != nil {
-			// Unreadable: authorize nothing until it reads.
-			errs = append(errs, fmt.Errorf("container %q: %w", name, err))
-			if werr := r.writeHookPolicy(name, nil, nil); werr != nil {
-				errs = append(errs, werr)
+		func() {
+			defer r.lockHostAccess(name)()
+			if _, err := os.Stat(filepath.Join(r.lxcpath(), name)); !errors.Is(err, fs.ErrNotExist) {
+				return
 			}
-			continue
-		}
-		if len(auth.Mounts) == 0 && len(auth.Devices) == 0 {
-			if err := r.syncHookPolicy(name, nil, nil); err != nil {
+			if err := os.Remove(hookPolicyFile(name)); err != nil && !errors.Is(err, fs.ErrNotExist) {
 				errs = append(errs, err)
 			}
-			continue
-		}
-		// A record that no longer resolves here yields nothing (rm, rd nil):
-		// its policy then authorizes nothing.
-		rm, rd, rerr := ResolveHostAccess(auth.Mounts, auth.Devices, r.hostAccess())
-		if rerr != nil {
-			slog.Warn("container: its host access no longer resolves on this host; its start hook will refuse it", "container", name, "error", rerr)
-		}
-		if err := r.writeHookPolicy(name, rm, rd); err != nil {
-			errs = append(errs, err)
-		}
+		}()
 	}
 	return errors.Join(errs...)
 }
+
+// lockHostAccess takes name's host-access lock (its record, config block and
+// hook policy change together under it) and returns its release.
+func (r *LxcRunner) lockHostAccess(name string) func() {
+	r.hostAccessMu.Lock()
+	if r.hostAccessLocks == nil {
+		r.hostAccessLocks = map[string]*sync.Mutex{}
+	}
+	l := r.hostAccessLocks[name]
+	if l == nil {
+		l = &sync.Mutex{}
+		r.hostAccessLocks[name] = l
+	}
+	r.hostAccessMu.Unlock()
+	l.Lock()
+	return l.Unlock
+}
+
+// refreshPauseHook, when set (tests), runs in RefreshHookPolicies between a
+// container's resolve and its policy write.
+var refreshPauseHook func(name string)
 
 // writeHookPolicy records this host's policy, as it is now, for the hook.
 func (r *LxcRunner) writeHookPolicy(name string, rm []resolvedMount, rd []resolvedDevice) error {
@@ -1238,7 +1335,7 @@ func (p hookPolicy) judgeDevice(src string, kind byte, major, minor uint32) erro
 	if deniedDeviceName(src) || deniedDeviceNumber(kind, major, minor) {
 		return fmt.Errorf("device %s is never passed through", src)
 	}
-	fi, err := os.Lstat(src)
+	fi, err := lstatDevice(src)
 	if err != nil {
 		return fmt.Errorf("device %s: %w", src, err)
 	}

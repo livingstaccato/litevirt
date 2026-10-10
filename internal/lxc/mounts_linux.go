@@ -149,13 +149,18 @@ func stageMount(m hookMount, policy hookPolicy) error {
 		return err
 	}
 	defer unix.Close(fd)
-	// Judge what was opened, by the path the kernel resolved it to: a store
-	// or protected tree mounted over the source is refused here.
+	// Judge what was opened, by the path the kernel resolved it to and the
+	// mount it is on: a store or protected tree mounted over the source, or
+	// reached through another mount of its filesystem, is refused here.
 	opened, err := openedPath(fd)
 	if err != nil {
 		return fmt.Errorf("resolve the opened %s/%s: %w", m.prefix, m.rel, err)
 	}
-	if err := policy.judgeOpened(m.prefix, opened); err != nil {
+	mntID, err := openedMountID(fd)
+	if err != nil {
+		return fmt.Errorf("the mount of the opened %s/%s: %w", m.prefix, m.rel, err)
+	}
+	if err := policy.judgeOpened(m.prefix, opened, mntID); err != nil {
 		return err
 	}
 	var st unix.Stat_t
@@ -299,6 +304,19 @@ func hookLog(format string, args ...any) {
 		_ = w.Warning(msg)
 		_ = w.Close()
 	}
+}
+
+// openedMountID is the id of the mount an fd is on (statx STATX_MNT_ID,
+// Linux 5.8), as /proc/self/mountinfo lists it.
+func openedMountID(fd int) (uint64, error) {
+	var stx unix.Statx_t
+	if err := unix.Statx(fd, "", unix.AT_EMPTY_PATH, unix.STATX_MNT_ID, &stx); err != nil {
+		return 0, err
+	}
+	if stx.Mask&unix.STATX_MNT_ID == 0 || stx.Mnt_id == 0 {
+		return 0, fmt.Errorf("the kernel reports no mount id")
+	}
+	return stx.Mnt_id, nil
 }
 
 // openedPath is the path the kernel resolved an O_PATH fd to.

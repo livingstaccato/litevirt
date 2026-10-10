@@ -1,6 +1,10 @@
 package network
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/litevirt/litevirt/internal/compose"
+)
 
 func TestFlatBridgeName(t *testing.T) {
 	// A name that fits keeps its name: existing bridges survive an upgrade.
@@ -23,5 +27,34 @@ func TestFlatBridgeName(t *testing.T) {
 	}
 	if err := validLinkName(a); err != nil {
 		t.Errorf("hashed name is not a valid link name: %v", err)
+	}
+}
+
+func TestBridgeName_FlatFallbackUsesFlatBridgeName(t *testing.T) {
+	long := "mystack_frontend_net"
+	if got := BridgeName(long, compose.NetworkDef{}); got != FlatBridgeName(long) || len(got) > maxIfaceName {
+		t.Errorf("BridgeName = %q, want %q", got, FlatBridgeName(long))
+	}
+	if got := BridgeName("web", compose.NetworkDef{}); got != "web" {
+		t.Errorf("short name changed: %q", got)
+	}
+}
+
+func TestValidateBridgeNetworkName(t *testing.T) {
+	long := "a-very-long-network-name"
+	for _, tc := range []struct {
+		typ, name, iface string
+		bad              bool
+	}{
+		{"bridge", "web", "", false},
+		{"", long, "", true},
+		{"bridge", long, "br0", false},
+		{"bridge", "web", long, true},
+		{"vxlan", long, "", false},
+		{"isolated", long, "", false},
+	} {
+		if err := ValidateBridgeNetworkName(tc.typ, tc.name, tc.iface); (err != nil) != tc.bad {
+			t.Errorf("%+v: err = %v, want error=%v", tc, err, tc.bad)
+		}
 	}
 }

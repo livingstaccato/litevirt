@@ -83,7 +83,8 @@ stable hashed form, so network names of any length work.
 A NIC on a network with no record attaches to a flat bridge named after the
 network. A name longer than 15 characters (a stack network is `<stack>_<name>`)
 uses a stable hashed `lvf-<11 hex>` bridge instead; shorter names keep their own
-name. The cleanup of leftover flat stack bridges logs a removal that keeps
+name. A `bridge` network whose bridge name (its `--iface`, or its own name)
+is over 15 characters is refused at create. The cleanup of leftover flat stack bridges logs a removal that keeps
 failing once per bridge, not on every pass.
 
 An isolated network does not span hosts. Every host gets its own copy: its own

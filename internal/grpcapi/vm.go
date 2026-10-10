@@ -2894,7 +2894,9 @@ func resolveBridge(ctx context.Context, db *corrosion.Client, networkName string
 	// (allocatorFor) read the record themselves and surface the error.
 	def, _ := lookupNetworkDef(ctx, db, networkName)
 	if def == nil {
-		return networkName
+		// The same name the create sites give the flat bridge, so a restart or
+		// reconcile finds what the create made.
+		return network.FlatBridgeName(networkName)
 	}
 	// Must match the device provisioning actually creates, otherwise a hot
 	// attach-nic plugs into a non-existent device and fails with "Cannot get

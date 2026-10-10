@@ -43,6 +43,9 @@ func (s *Server) CreateNetwork(ctx context.Context, req *pb.CreateNetworkRequest
 	if ntype == "" {
 		ntype = "bridge"
 	}
+	if err := network.ValidateBridgeNetworkName(ntype, req.Name, req.Iface); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
 
 	// Check for duplicates.
 	existing, err := corrosion.GetNetwork(ctx, s.db, req.Name)
@@ -381,6 +384,9 @@ func (s *Server) provisionAndPersistNetwork(ctx context.Context, name, stackName
 	ntype := def.Type
 	if ntype == "" {
 		ntype = "bridge"
+	}
+	if err := network.ValidateBridgeNetworkName(ntype, name, def.Interface); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 	cfgJSON, _ := json.Marshal(def)
 	if err := corrosion.UpsertNetwork(ctx, s.db, corrosion.NetworkRecord{

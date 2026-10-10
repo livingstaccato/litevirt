@@ -140,6 +140,7 @@ func TestRelayHealthV1Registered(t *testing.T) {
 		t.Fatal("relay_health_v1 must be replication-gated: every replication recipient elects relays")
 	}
 }
+
 // TestReleaseTokenRegistered pins the release token's registration. Every one
 // of these sets matters: Supported is what peers latch on, All is what the
 // checker loads markers for and what the rollback preflight treats as known,

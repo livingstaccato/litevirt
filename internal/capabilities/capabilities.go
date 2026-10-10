@@ -866,6 +866,7 @@ const ReleaseToken = Release202611V1
 //     evaluator keeps re-deriving from a fault that is not the host's. A
 //     binary rolled back below it enters WAL quarantine, as below every
 //     latched token.
+//
 //   - release_2026_11_v1 (the release token) has no flag and no stand-down of
 //     its own, and needs none: latching it changes nothing until a feature is
 //     USED, and every feature is opened through WithFeature, which records

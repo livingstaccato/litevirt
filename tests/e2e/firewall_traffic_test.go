@@ -163,9 +163,11 @@ func (l *lab) probe(host, name, family, hook string, priority int, match string)
 //   - C2: a guest whose egress is denied cannot reach a routed UDP/67 by
 //     using DHCP's ports;
 //   - C3: a tagged frame from an UNGUARDED guest is dropped (and passes once
-//     the NIC is made a trunk);
-//   - C4: a guarded guest on a DHCP network cannot use the gateway's address
-//     or a neighbour's (its exact reservation is all it may use);
+//     the NIC is allowed tags);
+//   - I2: a trunk NIC is guarded like any other new NIC and carries only the
+//     VLANs its network allows (`lv network set --allowed-vlans`);
+//   - C4: a guarded guest on a DHCP network cannot use a neighbour's address
+//     or an unassigned one (its exact reservation is all it may use);
 //   - observe mode drops nothing and counts what it would have dropped.
 //
 // Five cirros guests on one host and one bridge:
@@ -342,32 +344,43 @@ vms:
 		if !try("e", "nc --help 2>&1 | grep -q -- '-u'") {
 			t.Skip("the guest's nc cannot send UDP; C2 is proven by the kernel test instead")
 		}
+		// Port 68 is privileged: the guest's own user cannot bind it (lab 1:
+		// "bind: Permission denied"), so both sends run as root in the guest.
+		if !try("e", "sudo -n true") || !try("a", "sudo -n true") {
+			t.Skip("no passwordless sudo in the guest to bind port 68; C2 is proven by the kernel test instead")
+		}
 		const target = "192.0.2.67" // TEST-NET-1: routed out through the host
 		count := l.probe(host, "c2", "inet", "prerouting", -400, "ip daddr "+target+" udp dport 67")
-		try("e", "echo x | nc -u -w 1 -p 68 "+target+" 67; true")
+		try("e", "echo x | sudo nc -u -w 1 -p 68 "+target+" 67; true")
 		if n := count(); n != 0 {
 			t.Errorf("%d datagrams from a guest whose egress is denied reached the host through DHCP's ports", n)
 		}
-		try("a", "echo x | nc -u -w 1 -p 68 "+target+" 67; true")
+		try("a", "echo x | sudo nc -u -w 1 -p 68 "+target+" 67; true")
 		if count() == 0 {
 			t.Error("not even the unrestricted guest's datagram was counted; the zero above proves nothing")
 		}
 	})
-	t.Run("C4_GatewayAndNeighbourCannotBeClaimed", func(t *testing.T) {
+	t.Run("C4_NeighbourAndUnassignedAddressCannotBeClaimed", func(t *testing.T) {
+		// Not the gateway's address: it is the source of the harness's own
+		// `ssh -W` session into the guest, and a guest that claims it cuts
+		// that session (lab 1). Claiming the gateway is proven by the kernel
+		// test; here a neighbour's address and one no NIC holds are claimed,
+		// which the same exact guard must drop.
+		const unassigned = "10.205.0.240"
 		tap := l.guestTap(host, names["a"])
 		count := l.probe(host, "c4", "bridge", "input", 100,
-			"iifname "+tap+" ip saddr { "+gw+", "+ip["d"]+" }")
+			"iifname "+tap+" ip saddr { "+unassigned+", "+ip["d"]+" }")
 		own := l.probe(host, "c4own", "bridge", "input", 100, "iifname "+tap+" ip saddr "+ip["a"])
 		try("a", ping(gw)) // the gateway's MAC is cached from the real address first
 		if own() == 0 {
 			t.Fatal("a's own packets never reached the probe; it would count nothing either way")
 		}
-		try("a", "sudo ip addr add "+gw+"/32 dev eth0 2>/dev/null; sudo ip addr add "+ip["d"]+"/32 dev eth0 2>/dev/null; true")
-		try("a", "ping -c 2 -W 1 -I "+gw+" "+gw+"; ping -c 2 -W 1 -I "+ip["d"]+" "+gw+"; true")
+		try("a", "sudo ip addr add "+unassigned+"/32 dev eth0 2>/dev/null; sudo ip addr add "+ip["d"]+"/32 dev eth0 2>/dev/null; true")
+		try("a", "ping -c 2 -W 1 -I "+unassigned+" "+gw+"; ping -c 2 -W 1 -I "+ip["d"]+" "+gw+"; true")
 		if n := count(); n != 0 {
-			t.Errorf("%d packets claiming the gateway's or a neighbour's address got past a's guard", n)
+			t.Errorf("%d packets claiming a neighbour's or an unassigned address got past a's guard", n)
 		}
-		try("a", "sudo ip addr del "+gw+"/32 dev eth0; sudo ip addr del "+ip["d"]+"/32 dev eth0; true")
+		try("a", "sudo ip addr del "+unassigned+"/32 dev eth0; sudo ip addr del "+ip["d"]+"/32 dev eth0; true")
 	})
 	t.Run("C3_TaggedFramesFromAnUnguardedNIC", func(t *testing.T) {
 		if !try("a", "sudo ip link add link eth0 name eth0.10 type vlan id 10 && sudo ip addr add 10.215.0.1/24 dev eth0.10 && sudo ip link set eth0.10 up") {
@@ -442,26 +455,45 @@ vms:
 		l.mustLV(host, "firewall", "nic-guard", "set", names["d"], "--network", netName, "--mode", "on")
 		l.mustLV(host, "firewall", "reload")
 	})
-	t.Run("I2_TrunkNICCarriesItsVLANs", func(t *testing.T) {
-		// t's second NIC is on the trunk: feature with VLANs 100 and 101.
+	t.Run("I2_TrunkNICCarriesTheVLANsItsNetworkAllows", func(t *testing.T) {
+		// t's second NIC is on the trunk: feature with VLANs 100 and 101, on a
+		// network created after the upgrade with no allowed VLANs (re-review
+		// R2-I1, round 3 and later): the NIC is guarded like any other new NIC,
+		// its VLANs are dropped in either mode until the network allows them,
+		// and the host says so.
 		if !try("t", "sudo ip link add link eth1 name eth1.100 type vlan id 100 && sudo ip addr add 10.217.0.1/24 dev eth1.100 && "+
 			"sudo ip link set eth1 up && sudo ip link set eth1.100 up && "+
 			"sudo ip link add link eth1 name eth1.102 type vlan id 102 && sudo ip addr add 10.218.0.1/24 dev eth1.102 && sudo ip link set eth1.102 up") {
 			t.Skip("the guest kernel cannot make VLAN interfaces; I-2 is proven by the kernel test instead")
 		}
-		mac := l.mustSQL(host, "SELECT mac FROM vm_interfaces WHERE vm_name = '"+names["t"]+"' AND network_name LIKE '%fwt2' AND deleted_at IS NULL")[0][0]
-		tap := "lvt" + strings.ReplaceAll(strings.ToLower(mac), ":", "")
+		row := l.mustSQL(host, "SELECT mac, network_name FROM vm_interfaces WHERE vm_name = '"+names["t"]+"' AND network_name LIKE '%fwt2' AND deleted_at IS NULL")[0]
+		mac, trunkNet := strings.ToLower(row[0]), row[1]
+		if rows := l.mustSQL(host, "SELECT value FROM cluster_policies WHERE key = 'nic_guard/"+names["t"]+"/"+mac+"' AND deleted_at IS NULL"); len(rows) == 0 ||
+			!strings.Contains(rows[0][0], `"mode":"on"`) {
+			t.Errorf("a new trunk NIC has no default guard: %v", rows)
+		}
+		tap := "lvt" + strings.ReplaceAll(mac, ":", "")
 		in100 := l.probe(host, "i2a", "bridge", "input", 100, "iifname "+tap+" vlan id 100")
 		in102 := l.probe(host, "i2b", "bridge", "input", 100, "iifname "+tap+" vlan id 102")
-		try("t", "ping -c 3 -W 1 10.217.0.254; ping -c 3 -W 1 10.218.0.254; true")
+		send := func() { try("t", "ping -c 3 -W 1 10.217.0.254; ping -c 3 -W 1 10.218.0.254; true") }
+
+		send()
+		if n := in100(); n != 0 {
+			t.Errorf("%d frames on VLAN 100 got through before the network allowed it", n)
+		}
+		if rows := l.mustSQL(host, "SELECT evidence FROM health_conditions WHERE code = 'firewall.nic.trunk_vlans' AND subject_id = '"+host+
+			"' AND lifecycle != 'resolved' AND deleted_at IS NULL"); len(rows) == 0 || !strings.Contains(rows[0][0], "lv network set "+trunkNet) {
+			t.Errorf("no firewall.nic.trunk_vlans condition naming `lv network set %s`: %v", trunkNet, rows)
+		}
+
+		l.mustLV(host, "network", "set", trunkNet, "--allowed-vlans", "100")
+		l.mustLV(host, "firewall", "reload")
+		send()
 		if in100() == 0 {
-			t.Errorf("the trunk NIC's VLAN 100 frames were dropped; a trunk must carry its VLANs in both modes")
+			t.Errorf("the trunk NIC's VLAN 100 frames were dropped after the network allowed VLAN 100")
 		}
 		if n := in102(); n != 0 {
 			t.Errorf("%d frames on VLAN 102, which the trunk was not given, got through", n)
-		}
-		if rows := l.mustSQL(host, "SELECT COUNT(*) FROM cluster_policies WHERE key LIKE 'nic_guard/"+names["t"]+"/"+strings.ToLower(mac)+"' AND deleted_at IS NULL"); rows[0][0] != "0" {
-			t.Errorf("a trunk NIC got a default guard record")
 		}
 	})
 	t.Run("I10_GuardInForceBeforeTheGuestRuns", func(t *testing.T) {

@@ -20,7 +20,7 @@ func dnsmasqLeaseFile(bridge string) string {
 }
 
 // stopDHCPAndForgetLeases stops a network's dnsmasq for good and removes its
-// lease file. It is for TEARDOWN only — a drift restart keeps the file, so
+// lease file and its reservations (hosts) file. It is for TEARDOWN only — a drift restart keeps the file, so
 // guests keep their addresses across it.
 //
 // A file left behind outlives the network: discovery reads every lease file
@@ -39,6 +39,16 @@ func stopDHCPAndForgetLeases(pidFile, bridge string) {
 		slog.Warn("network: could not remove the lease file of a deprovisioned dnsmasq",
 			"bridge", bridge, "file", dnsmasqLeaseFile(bridge), "error", err)
 	}
+	// Its reservations go too (re-review 5, L1): the next StartDHCP on the
+	// bridge keeps a file it finds, and a re-created network's reservation
+	// of an address beside the old MAC's line makes dnsmasq refuse it and
+	// lease a dynamic address the NIC's exact guard drops.
+	hostsMu.Lock()
+	if err := os.Remove(DHCPHostsFile(bridge)); err != nil && !os.IsNotExist(err) {
+		slog.Warn("network: could not remove the hosts file of a deprovisioned dnsmasq",
+			"bridge", bridge, "file", DHCPHostsFile(bridge), "error", err)
+	}
+	hostsMu.Unlock()
 }
 
 // LeaseBridge names the bridge whose litevirt dnsmasq would lease a NIC on

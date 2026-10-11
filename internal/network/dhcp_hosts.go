@@ -79,7 +79,16 @@ func AddDHCPHost(bridge, mac, ip string) error {
 		return err
 	}
 	hosts := parseDHCPHosts(old)
-	hosts[strings.ToLower(mac)] = ip
+	mac = strings.ToLower(mac)
+	// One address, one MAC: a line another MAC still holds for ip — left by
+	// a host that was down when the network was deleted — would make dnsmasq
+	// refuse this one (re-review 5, L1).
+	for m, a := range hosts {
+		if a == ip && m != mac {
+			delete(hosts, m)
+		}
+	}
+	hosts[mac] = ip
 	hostsMu.Unlock()
 	_, err = SyncDHCPHosts(bridge, hosts)
 	return err

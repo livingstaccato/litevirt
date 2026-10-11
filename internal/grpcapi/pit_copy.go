@@ -109,7 +109,11 @@ func (s *Server) copyVMDiskConsistent(ctx context.Context, vm *corrosion.VMRecor
 		return copyResult{}, err
 	}
 	if s.sourceClosedForPlainCopy(vm) {
-		return copyResult{method: copyPlain}, s.convertVMDisk(ctx, d, dst, emit)
+		err := s.convertVMDisk(ctx, d, dst, emit)
+		if err == nil {
+			s.notPITNotified.Delete(s.notPITKey(vm, d)) // a plain copy of a shut-off disk is point-in-time
+		}
+		return copyResult{method: copyPlain}, err
 	}
 	var why []string
 	err := s.copyViaBackupSession(ctx, vm, d, dst, emit)
@@ -894,8 +898,11 @@ func (s *Server) sweepPITOverlaysOf(ctx context.Context, name string) {
 	}
 }
 
+// notPITKey names one disk of one VM incarnation: a VM re-created under the
+// same name has a new UUID, so its first not-point-in-time copy is news.
 func (s *Server) notPITKey(vm *corrosion.VMRecord, d *corrosion.DiskRecord) string {
-	return vm.Name + "\x00" + d.DiskName
+	o := pitOwner(vm, d)
+	return o.VM + "\x00" + o.VMUUID + "\x00" + o.Disk
 }
 
 // reportNotPointInTime is the event every layer-3 copy gets, and its

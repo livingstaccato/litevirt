@@ -4,12 +4,14 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
@@ -138,6 +140,14 @@ func (s *Server) PreflightUpgrade(ctx context.Context, req *pb.PreflightUpgradeR
 			add("warn", "udev-rule-foreign",
 				"an unrecognized file exists at the litevirt udev-rule path; the upgrade will leave it untouched")
 		}
+	}
+
+	// 6b. Point-in-time overlays: the swap itself refuses a binary that does
+	// not know pit_overlay while any exists (pitOverlayDowngradeRefusal).
+	if files := s.pitOverlayFiles(ctx); len(files) > 0 {
+		add("warn", "pit-overlay-present",
+			fmt.Sprintf("%d point-in-time overlay(s) on this host (%s); an upgrade to a build older than %s is refused until they are settled",
+				len(files), strings.Join(files, ", "), capabilities.ReleaseToken))
 	}
 
 	// 6. Witness role — losing the witness during a partition kills quorum.

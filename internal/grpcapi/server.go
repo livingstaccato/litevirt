@@ -861,6 +861,10 @@ type Server struct {
 	// notPITNotified is the last not-point-in-time notification per VM and
 	// disk (reportNotPointInTime).
 	notPITNotified sync.Map
+	// peerWALQ is each peer's last Ping answer on wal_quarantined
+	// (PeerReportsWALQuarantined), guarded by peerWALQMu.
+	peerWALQ   map[string]peerWALQAnswer
+	peerWALQMu sync.Mutex
 
 	// notifySeen, when set, sees every notification notify is asked to
 	// send, before any routing. Tests only.

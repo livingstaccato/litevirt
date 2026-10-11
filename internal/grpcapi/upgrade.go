@@ -65,6 +65,15 @@ func (s *Server) UpgradeHost(stream grpc.ClientStreamingServer[pb.UpgradeHostReq
 		return err
 	}
 
+	// A binary that does not know pit_overlay is never swapped in over an
+	// overlay this host holds (P2 of the #256 re-review 5).
+	if !first.Force {
+		if err := s.pitOverlayDowngradeRefusal(stream.Context(), stagingPath); err != nil {
+			os.Remove(stagingPath)
+			return err
+		}
+	}
+
 	if err := s.applyStagedBinary(stream.Context(), stagingPath); err != nil {
 		os.Remove(stagingPath)
 		return status.Errorf(codes.Internal, "apply binary: %v", err)

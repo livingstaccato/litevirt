@@ -192,13 +192,13 @@ func TestCopy_TheWindowIsWrittenInsideTheGate(t *testing.T) {
 	}
 }
 
-// P1: the in-place restore sets a held overlay aside only when it places the
-// restored image. A restore that fails before (a missing chunk, a cancel)
-// leaves the overlay under its own name and the VM held; a placement that
-// fails puts it back.
+// P1: the in-place restore sets a held overlay aside only after it has placed
+// the restored image. A restore that fails before (a missing chunk, a cancel)
+// or a placement that fails leaves the overlay under its own name and the VM
+// held.
 //
-// Mutations "set aside when the target is resolved" and "no put-back on a
-// failed placement" — red.
+// Mutations "set aside when the target is resolved" and "set aside before
+// placing" — red.
 func TestInPlaceRestore_AFailedRestoreLeavesTheOverlayAndTheHold(t *testing.T) {
 	s, live := stoppedWithStaleOverlay(t)
 	if err := s.db.Execute(context.Background(), `UPDATE vms SET state = 'stopped' WHERE name = 'web'`); err != nil {
@@ -220,7 +220,7 @@ func TestInPlaceRestore_AFailedRestoreLeavesTheOverlayAndTheHold(t *testing.T) {
 	if !pitoverlay.Present(live) || !held() {
 		t.Fatal("the overlay was set aside (or the hold cleared) before the restored image was ready")
 	}
-	// A placement that fails (the staged file vanished) puts it back.
+	// A placement that fails (the staged file vanished) moves nothing.
 	if err := dest.place(filepath.Join(filepath.Dir(live), "restore-gone.tmp")); err == nil {
 		t.Fatal("placing a missing image succeeded")
 	}
@@ -333,5 +333,52 @@ func TestNotPointInTime_NotifiesOncePerDisk(t *testing.T) {
 	}
 	if evs := pitEventDetails(t, s, "web", "disk.replica_not_point_in_time"); len(evs) != 3 {
 		t.Fatalf("events = %d, want one per run", len(evs))
+	}
+}
+
+// m1 of the switch review: a crash between the restored image's placement and
+// the overlay's set-aside leaves the VM held — the overlay is still beside
+// the disk, bound to the file the restore replaced, so it is never committed
+// into the restored disk and a start does not clear the hold.
+//
+// Mutation "set aside before placing" — red.
+func TestInPlaceRestore_ACrashMidPlacementLeavesTheVMHeld(t *testing.T) {
+	s, live := stoppedWithStaleOverlay(t)
+	if err := s.db.Execute(context.Background(), `UPDATE vms SET state = 'stopped' WHERE name = 'web'`); err != nil {
+		t.Fatal(err)
+	}
+	_ = healWeb(t, s) // held
+	dest, err := s.inPlaceRestoreLocked(context.Background(), "web", "root")
+	if err != nil {
+		t.Fatalf("in-place restore target: %v", err)
+	}
+	type crash struct{}
+	prev := restorePlaceStep
+	restorePlaceStep = func(step string) {
+		if step == "placed" {
+			panic(crash{})
+		}
+	}
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				if _, ok := r.(crash); !ok {
+					panic(r)
+				}
+			}
+		}()
+		_ = dest.place(stagedImage(t, live))
+	}()
+	restorePlaceStep = prev
+
+	// After the restart: the restored file is in place, and the VM is held.
+	if err := healWeb(t, s); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("heal after a crash mid-placement = %v; want the VM held", err)
+	}
+	if !pitoverlay.Present(live) {
+		t.Fatal("the overlay is gone from beside the disk")
+	}
+	if row, found := heldCondition(t, s, "web", "root"); !found || row.Lifecycle == "resolved" {
+		t.Fatalf("the hold cleared after a crash mid-placement: %+v", row)
 	}
 }

@@ -413,6 +413,10 @@ func (s *Server) pullAndApply(ctx context.Context, peer, expectVer string, expec
 		return fmt.Errorf("peer %s: %w", peer, err)
 	}
 
+	if err := s.pitOverlayDowngradeRefusal(ctx, stagingPath); err != nil {
+		os.Remove(stagingPath)
+		return err
+	}
 	if err := s.applyStagedBinary(ctx, stagingPath); err != nil {
 		os.Remove(stagingPath)
 		return err

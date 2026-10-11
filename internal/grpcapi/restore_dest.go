@@ -56,12 +56,16 @@ type restoreDest struct {
 	// rule, never taken from the backup's bytes.
 	disk *corrosion.DiskRecord
 	// setAside, for an in-place restore over a disk held on an overlay that
-	// cannot be verified, sets that overlay aside at place time — once the
-	// restored image is ready — and returns how to put it back if the
-	// placement then fails, and what to report once it has succeeded. A
-	// restore that fails before then leaves the overlay and the hold as they
-	// were (P1 of the #256 re-review 5).
-	setAside func() (undo func() error, done func(), err error)
+	// cannot be verified, sets that overlay aside AFTER the restored image
+	// has been placed over the disk, and returns the report to make — the
+	// hold cleared, the event, the notification. Placing first means no
+	// moment exists, crash or not, at which the overlay is gone while the
+	// old disk is still there: a restore that fails before placement, or a
+	// crash between the placement and the set-aside, leaves the overlay
+	// beside the disk, and the VM held (P1, and m1 of the switch review: the
+	// overlay was taken of another file than the restored one, so it is never
+	// committed into it; it is only set aside).
+	setAside func() (done func(), err error)
 }
 
 func (d restoreDest) release() {
@@ -192,32 +196,30 @@ func (d restoreDest) place(tmp string) error {
 	if err := refuseSymlinkTarget(d.path); err != nil {
 		return err
 	}
-	var done func()
-	if d.setAside != nil {
-		undo, report, err := d.setAside()
-		if err != nil {
-			return status.Errorf(codes.FailedPrecondition, "in_place: %v", err)
-		}
-		done = report
-		defer func() {
-			if undo != nil {
-				if uerr := undo(); uerr != nil {
-					slog.Error("restore: the overlay set aside for a restore that failed could not be put back; it stays set aside, kept", "disk", d.path, "error", uerr)
-				}
-			}
-		}()
-		if err := os.Rename(tmp, d.path); err != nil {
-			return status.Errorf(codes.Internal, "finalize restore: %v", err)
-		}
-		undo = nil
-		done()
-		return nil
-	}
 	if err := os.Rename(tmp, d.path); err != nil {
 		return status.Errorf(codes.Internal, "finalize restore: %v", err)
 	}
+	if d.setAside != nil {
+		// The placement is durable before the overlay moves: a crash can
+		// never leave the overlay moved and the old disk still in place.
+		syncDir(filepath.Dir(d.path))
+		restorePlaceStep("placed")
+		done, err := d.setAside()
+		if err != nil {
+			// The restore is in place; the overlay stays beside it, bound
+			// to the file it replaced, so the VM stays held (never
+			// committed into the restored disk) until it is set aside.
+			slog.Error("restore: the restored disk is in place, but its old point-in-time overlay could not be set aside; the VM stays held", "disk", d.path, "error", err)
+			return nil
+		}
+		done()
+	}
 	return nil
 }
+
+// restorePlaceStep marks a step of an in-place placement; a test makes it
+// crash there.
+var restorePlaceStep = func(string) {}
 
 // stagingTemp creates an empty temp file beside dst for a restore to fill. The
 // "restore-" prefix is one SweepStaleStaging collects after a crash.
@@ -352,7 +354,7 @@ func (s *Server) inPlaceRestoreLocked(ctx context.Context, vmName, diskName stri
 		if serr := s.heldOverlayCanBeSetAside(vm, disk, err); serr != nil {
 			return restoreDest{}, status.Errorf(codes.FailedPrecondition, "in_place: %v", serr)
 		}
-		dest.setAside = func() (func() error, func(), error) {
+		dest.setAside = func() (func(), error) {
 			return s.setAsideHeldOverlayForRestore(ctx, vm, disk, err)
 		}
 	}
@@ -370,36 +372,33 @@ func (s *Server) heldOverlayCanBeSetAside(vm *corrosion.VMRecord, disk *corrosio
 }
 
 // setAsideHeldOverlayForRestore sets aside disk's overlay that held the VM
-// (heal failed with held), for an in-place restore about to place its image
-// over the disk. It returns how to put the overlay back if the placement
-// fails, and the report to make — the hold cleared, the event and the
-// notification — once it has succeeded. The checks are made again here, at
-// place time (heldOverlayCanBeSetAside).
-func (s *Server) setAsideHeldOverlayForRestore(ctx context.Context, vm *corrosion.VMRecord, disk *corrosion.DiskRecord, heldErr error) (undo func() error, done func(), err error) {
+// (heal failed with held), once an in-place restore has placed its image over
+// the disk. It returns the report to make — the hold cleared, the event and
+// the notification. The checks are made again here (heldOverlayCanBeSetAside).
+func (s *Server) setAsideHeldOverlayForRestore(ctx context.Context, vm *corrosion.VMRecord, disk *corrosion.DiskRecord, heldErr error) (done func(), err error) {
 	if err := s.heldOverlayCanBeSetAside(vm, disk, heldErr); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	path := s.hostDiskFile(disk.Path)
 	to, err := pitoverlay.SetAside(path, time.Now().UTC().Format("20060102-150405"))
 	if err != nil {
 		if to != "" {
-			// The overlay moved, its binding did not: put it back.
+			// The overlay moved, its binding did not: put it back, so the
+			// pair stays together beside the disk (and the VM held).
 			if perr := pitoverlay.PutBack(path, to); perr != nil {
-				return nil, nil, fmt.Errorf("%v; and setting the overlay aside for the restore: %v; and putting it back: %w", heldErr, err, perr)
+				return nil, fmt.Errorf("%v; and setting the overlay aside for the restore: %v; and putting it back: %w", heldErr, err, perr)
 			}
 		}
-		return nil, nil, fmt.Errorf("%v; and setting the overlay aside for the restore: %w", heldErr, err)
+		return nil, fmt.Errorf("%v; and setting the overlay aside for the restore: %w", heldErr, err)
 	}
-	undo = func() error { return pitoverlay.PutBack(path, to) }
-	done = func() {
+	return func() {
 		detail := fmt.Sprintf("%s: the in-place restore replaced the disk %s; its point-in-time overlay, which could not be verified, was set aside as %s (with its binding as %s.id), kept, so it never meets the restored disk. Inspect it, then delete it",
 			disk.DiskName, path, to, to)
 		slog.Warn("restore: point-in-time overlay set aside", "vm", vm.Name, "detail", detail)
 		s.ClearPITOverlayHold(ctx, vm.Name, disk.DiskName)
 		s.recordVMEventSeverity(ctx, vm.Name, "disk.pit_overlay_set_aside", "warning", "warn", detail)
 		s.notify(ctx, notify.Notification{Kind: "replication.pit_overlay_set_aside", Severity: notify.SevWarn, Subject: vm.Name, Detail: detail})
-	}
-	return undo, done, nil
+	}, nil
 }
 
 // vmDisksClosed reports whether nothing holds vm's disks open: the record says

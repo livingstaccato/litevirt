@@ -16,6 +16,8 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/failover"
+	"github.com/litevirt/litevirt/internal/fence"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 	"github.com/litevirt/litevirt/internal/pitoverlay"
@@ -242,5 +244,65 @@ func TestFleet_PITOverlay_TheReleaseGateComesFirst(t *testing.T) {
 		if !featureUsedOn(t, n, capabilities.ReleaseToken, string(capabilities.FeaturePITOverlay)) {
 			t.Errorf("%s does not hold the pit_overlay used record", n.Name)
 		}
+	}
+}
+
+// I1 of the switch review, at recovery level: once pit_overlay is used, a
+// VM whose host died is never restarted on a peer whose own Ping says it is
+// WAL-quarantined (rolled back below the release, possibly to a build that
+// knows nothing of overlays) — even though no HA monitor has recorded it
+// isolated yet. The VM is pinned there, so with the peer filtered it stays put
+// rather than land on it (without the filter it lands there: the mutation).
+//
+// Mutation "reported quarantine ignored" (pitOverlaySafeTargets) — red.
+func TestFleet_PITOverlay_RecoveryNeverPicksAQuarantinedPeer(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 3, SharedCRDT: true})
+	latchPITOverlay(t, c)
+	target, victim, coordNode := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	if err := corrosion.RecordReleaseFeatureUse(ctx, coordNode.DB, capabilities.ReleaseToken, string(capabilities.FeaturePITOverlay), coordNode.Name, true); err != nil {
+		t.Fatalf("record pit_overlay used: %v", err)
+	}
+	shared := filepath.Join(c.tmpRoot, "nfs")
+	if err := os.MkdirAll(shared, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	disk := filepath.Join(shared, "pq-root.qcow2")
+	if err := qcow2.Create(disk, 1<<20, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertVM(ctx, coordNode.DB, corrosion.VMRecord{
+		Name: "pq", HostName: victim.Name, State: "running", CPUActual: 1, MemActual: 256,
+		Spec: `{"name":"pq","cpu":1,"memory_mib":256,"on_host_failure":"restart-any","placement":{"host":"` + target.Name + `"}}`,
+	}, nil, []corrosion.DiskRecord{{
+		VMName: "pq", DiskName: "root", HostName: victim.Name, Path: disk,
+		SizeBytes: 1 << 20, StorageType: "nfs", StorageVolume: "nfs", TargetDev: "vda",
+	}}); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	// The target was rolled back: its Ping reports the quarantine at once.
+	target.Server.SetWALQuarantined(func() bool { return true })
+	if epoch, _, _ := corrosion.HostIsolation(ctx, coordNode.DB, target.Name); epoch != 0 {
+		t.Fatal("setup: the target is already recorded isolated")
+	}
+
+	nowRFC := time.Now().UTC().Format(time.RFC3339)
+	for _, o := range []*Node{target, coordNode} {
+		if err := coordNode.DB.Execute(ctx, `INSERT OR REPLACE INTO host_health
+			 (observer, target, status, consecutive_failures, last_seen, updated_at)
+			 VALUES (?, ?, 'suspect', 5, NULL, ?)`, o.Name, victim.Name, nowRFC); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fc := failover.NewCoordinator(coordNode.Name, coordNode.DB)
+	fc.SetFencer(func(context.Context, fence.HostConfig) fence.Result {
+		return fence.Result{Method: "fleet-test", Success: true}
+	})
+	// As the daemon wires it: the coordinator's own node's cached Ping.
+	fc.PeerWALQuarantined = coordNode.Server.PeerReportsWALQuarantined
+	fc.RunOnce(ctx)
+
+	if vm, _ := corrosion.GetVM(ctx, coordNode.DB, "pq"); vm == nil || vm.HostName == target.Name {
+		t.Fatalf("pq after the failover = %+v: restarted on %s, which reports itself WAL-quarantined", vm, target.Name)
 	}
 }

@@ -743,6 +743,9 @@ func (s *Server) observeOneSelfReportedQuarantine(ctx context.Context) {
 	}
 	defer conn.Close()
 	resp, err := c.Ping(ctx, &pb.PingRequest{})
+	if err == nil {
+		s.notePeerWALQuarantined(peer, resp.GetWalQuarantined())
+	}
 	if err != nil || !resp.GetWalQuarantined() {
 		return
 	}

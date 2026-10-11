@@ -7,6 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/litevirt/litevirt/internal/grpcapi"
 	"github.com/litevirt/litevirt/internal/lxc"
 	"github.com/litevirt/litevirt/internal/obs"
 )
@@ -26,6 +27,12 @@ func main() {
 		switch os.Args[1] {
 		case "--version", "-version":
 			fmt.Printf("litevirt version=%s commit=%s\n", version, commit)
+			return
+		case grpcapi.ReleaseFeaturesFlag:
+			// The release features this binary declares: a host about to
+			// swap it in asks, so it never installs a build that does not
+			// know a feature whose data it holds (pit_overlay overlays).
+			fmt.Println(grpcapi.ReleaseFeaturesLine())
 			return
 		case lxc.HookArg:
 			// LXC's start hook for a container with host bind mounts

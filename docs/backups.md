@@ -387,10 +387,12 @@ by the strongest method the host has, tried in this order:
      still beside it is not mistaken for the disk (the end record catches it),
      but the VM stays held. `lv backup restore-from --in-place` does both: an
      overlay that holds the VM is set aside (kept, as
-     `.<disk file>.lv-pit.orphan-<time>`) when the restored image is ready to
-     be placed over the disk, and the hold clears once it is. A restore that
-     fails before then (a missing chunk, a cancel) leaves the overlay where it
-     is and the VM held; one whose placement fails puts the overlay back.
+     `.<disk file>.lv-pit.orphan-<time>`) once the restored image has been
+     placed over the disk, and the hold clears then. A restore that fails
+     before (a missing chunk, a cancel), a placement that fails, or a crash
+     between the placement and the set-aside leaves the overlay beside the
+     disk and the VM held: the overlay was taken of the file the restore
+     replaced, so it is never committed into the restored one.
 
    When a disk is deleted (`lv rm`, rebuild), its overlay and sidecar are
    deleted with it. An import that finds an overlay where its new disk goes
@@ -594,16 +596,25 @@ still decide such a hold with `lv resolve-pit-overlay` on its verdict.
 Once `pit_overlay` is used, a rollback below the release quarantines that
 host (WAL quarantine: it emits no replicated writes), and every rollback to a
 build older than `release_2026_11_v1` quarantines anyway. Peers then record
-it as isolated, and the failover coordinator does not restart a VM on an
-isolated host while `pit_overlay` is in use, so a VM whose host died mid
-window is restarted on an upgraded host, which commits the overlay first.
-That isolation is recorded within a few health cycles of the rollback, not
-at once, so before rolling a host back, settle every overlay on the disks it
-can see — every pool directory, and the data directory's `disks/` — and keep
-it drained: `find <dir> -name '.*.lv-pit'` must find none (start or replicate
-each VM on an upgraded host, or resolve it with `lv resolve-pit-overlay`),
-because such a build has no hold of its own and would start a VM it still
-owns on the bare disk. An older build shows the `pit_overlay.held`
+it as isolated, and while `pit_overlay` is in use the failover coordinator restarts
+no VM on a host that is isolated or whose own Ping reports it WAL-quarantined
+(asked afresh at recovery time, so from the rollback's first answer, before
+the isolation is recorded). A VM whose host died mid window is restarted on
+an upgraded host, which commits the overlay first.
+
+`lv host upgrade` (and a host's pull self-upgrade) refuses to install a
+binary that does not know `pit_overlay` — a build older than
+`release_2026_11_v1`, asked with `litevirt --release-features` — while any
+overlay exists on that host (in the data directory's `disks/`, a pool
+directory, or the directory of any disk recorded on it), naming the files:
+settle each (start or replicate its VM on this build, or `lv
+resolve-pit-overlay`) or drain the host first; `--force` overrides. `lv host
+preflight-upgrade` lists them as `pit-overlay-present`. Upgrades to a build
+that knows `pit_overlay` are never refused for them. A host rolled back some
+other way (a package manager, a copied binary) is not stopped, so then check
+by hand: `find <dir> -name '.*.lv-pit'` over every pool directory and
+`disks/` must find none, and keep the host drained, because such a build has
+no hold of its own and would start a VM it still owns on the bare disk. An older build shows the `pit_overlay.held`
 condition in `lv health` like any other, but never raises or resolves it, and
 an `lv` older than the daemon has none of `--force-commit`,
 `--accept-torn-disk` or `--overwrite-newer-writes`: upgrade it to resolve a

@@ -666,6 +666,11 @@ func UpdateHostVersion(ctx context.Context, c *Client, name, version string) err
 		if !ok {
 			return c.ExecuteBatch(ctx, []Statement{hostsStmt})
 		}
+		if c.hostsRuntimeRetired(live) {
+			// host_runtime_retire_v1: the report no longer moves the hosts
+			// row's clock (host_runtime_retire.go).
+			return c.ExecuteBatch(ctx, []Statement{rt})
+		}
 		return c.ExecuteBatch(ctx, []Statement{hostsStmt, rt})
 	})
 }
@@ -688,13 +693,22 @@ func UpdateHostStartup(ctx context.Context, c *Client, name, state, version stri
 	return c.withMembershipWrite(ctx, func(live bool) error {
 		return c.withRuntimeWrite(ctx, func(liveRuntime bool) error {
 			uts := c.NowTS()
-			var hostsStmt Statement
-			if hasResources {
-				hostsStmt = Statement{SQL: hostStartupResourcesSQL, Params: []interface{}{state, version, sv, cpu, mem, disk, uts, name}}
-			} else {
-				hostsStmt = Statement{SQL: hostStartupSQL, Params: []interface{}{state, version, sv, uts, name}}
+			// The hosts statement carries the runtime columns until
+			// host_runtime_retire_v1 has latched, and the boot state until
+			// host_membership_retire_v1 has. With only the runtime copy
+			// retired it is the plain state write; with both, there is none
+			// (host_runtime_retire.go).
+			runtimeRetired := c.hostsRuntimeRetired(liveRuntime)
+			var stmts []Statement
+			switch {
+			case runtimeRetired && c.hostsCopyRetired(live):
+			case runtimeRetired:
+				stmts = append(stmts, Statement{SQL: updateHostStateSQL, Params: []interface{}{state, uts, name}})
+			case hasResources:
+				stmts = append(stmts, Statement{SQL: hostStartupResourcesSQL, Params: []interface{}{state, version, sv, cpu, mem, disk, uts, name}})
+			default:
+				stmts = append(stmts, Statement{SQL: hostStartupSQL, Params: []interface{}{state, version, sv, uts, name}})
 			}
-			stmts := []Statement{hostsStmt}
 			if live {
 				// After the membership split the boot state is also written
 				// to host_membership, in the same batch under the same
@@ -738,6 +752,9 @@ func UpdateHostStartup(ctx context.Context, c *Client, name, state, version stri
 					stmts = append(stmts, rt)
 				}
 			}
+			if len(stmts) == 0 {
+				return nil // no live hosts row: nothing a previous release would have written either
+			}
 			return c.ExecuteBatch(ctx, stmts)
 		})
 	})
@@ -768,6 +785,9 @@ func UpdateHostResources(ctx context.Context, c *Client, name string, cpu, mem, 
 		}
 		if !ok {
 			return c.ExecuteBatch(ctx, []Statement{hostsStmt})
+		}
+		if c.hostsRuntimeRetired(live) {
+			return c.ExecuteBatch(ctx, []Statement{rt})
 		}
 		return c.ExecuteBatch(ctx, []Statement{hostsStmt, rt})
 	})

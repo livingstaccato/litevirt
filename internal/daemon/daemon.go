@@ -510,6 +510,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Likewise the runtime split gate: the boot report below is a runtime
 	// write, and on a node that has already split it must reach host_runtime.
 	d.wireHostRuntimeGate()
+	d.wireHostRuntimeRetireGate()
 
 	// Register this host in corrosion
 	if err := d.registerHost(ctx); err != nil {
@@ -3140,6 +3141,19 @@ func (d *Daemon) runHostMembershipSplit(ctx context.Context) {
 // behaviour.
 func (d *Daemon) wireHostRuntimeGate() {
 	d.db.SetHostRuntimeGate(HostRuntimeLatchedOnDisk(d.cfg.DataDir))
+}
+
+// wireHostRuntimeRetireGate stops the pure runtime writers writing the hosts
+// copy once host_runtime_retire_v1 has durably latched. Read from the marker
+// on disk, like wireHostRuntimeGate, because the boot report is written before
+// the checker exists. No config flag. Unwired, the gate fails closed and both
+// homes keep being written, the dual-write build's behaviour.
+func (d *Daemon) wireHostRuntimeRetireGate() {
+	path := health.ActivationMarkerPath(d.cfg.DataDir, capabilities.HostRuntimeRetireV1)
+	d.db.SetHostRuntimeRetireGate(func() bool {
+		_, err := os.Stat(path)
+		return err == nil
+	})
 }
 
 // HostRuntimeLatchedOnDisk reports whether host_runtime_split_v1 has durably

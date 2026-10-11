@@ -249,12 +249,35 @@ const (
 	//     every runtime report is written to BOTH host_runtime and the old
 	//     hosts columns, in one batch — the old columns in their
 	//     previous-release shapes, so a host rolled back one release still
-	//     reads every report.
+	//     reads every report, until host_runtime_retire_v1 stops the copy.
 	//
 	// ReplicationGated: the decode claim must hold of every host this node
 	// replicates to, a maintenance host on the previous build included. A
 	// flag would only keep the latch from forming.
 	HostRuntimeSplitV1 = "host_runtime_split_v1"
+
+	// HostRuntimeRetireV1 is the second step of the runtime move
+	// (colonelpanik/litevirt#267): once it has durably latched, the pure
+	// runtime writers — a version report, a resource report, and the boot
+	// report once host_membership_retire_v1 has also latched — stop writing
+	// the hosts copy and write host_runtime alone, so a host's own report no
+	// longer moves the hosts row's clock and cannot cost an operator's
+	// concurrent change to the host's configuration on any replica.
+	//
+	// It states a fact about the BINARY: this build never needs the hosts
+	// copy to know a host's runtime. Mandatory, for the credentials_split_v1
+	// reason: a flag would only stop the latch forming.
+	//
+	// It is advertised only once this node is live on the split
+	// (corrosion.HostRuntimeLive, grpcapi's advertisement filter), as
+	// credentials_clear_v1 waits for CredentialsLive: readiness, not a
+	// policy. ReplicationGated, so it cannot latch anywhere until every host
+	// still receiving replication — a maintenance host included — has
+	// completed a pass and reads host_runtime.
+	//
+	// The columns are never cleared. InsertHost and a re-admission keep
+	// their shapes: they write the whole row anyway.
+	HostRuntimeRetireV1 = "host_runtime_retire_v1"
 
 	// FailoverScopeV1 gates the cluster-wide failover_scope policy
 	// (cluster_policies, schema v58; docs/design/region-scoped-failover.md).
@@ -927,8 +950,20 @@ const ReleaseToken = Release202611V1
 //     enters WAL quarantine and cannot decode the host_runtime statements
 //     latched peers keep sending. Every runtime report is dual-written to
 //     host_runtime AND the old hosts columns, so the rolled-back reader still
-//     reads current versions, schema versions and resource totals, and
-//     upgrading again loses nothing.
+//     reads current versions, schema versions and resource totals until
+//     host_runtime_retire_v1 latches, and upgrading again loses nothing.
+//
+//   - host_runtime_retire_v1 has no stand-down either. Once it has latched,
+//     version and resource reports (and the boot report, once
+//     host_membership_retire_v1 has latched too) stop writing the hosts copy,
+//     which keeps the values it had at the latch. Both runtime tokens ship in
+//     ONE build, so a rollback below this one is also below
+//     host_runtime_split_v1: the rolled-back binary enters WAL quarantine
+//     (it holds two markers it does not know), emits no replicated writes, and
+//     reads every host's version, schema version and totals as they were at
+//     the latch — never older than the build that latched it, so its peers
+//     still read as newer upgrade sources. Nothing is lost: host_runtime keeps
+//     every report, and upgrading again reads it.
 //
 //   - failover_scope_v1 has no stand-down of its own: the policy it licenses
 //     does. `lv cluster failover-scope cluster` returns every coordinator to
@@ -1083,6 +1118,11 @@ var supported = []string{
 	// decodes host_runtime's statement shapes and reads the runtime columns
 	// from it", a fact about the binary.
 	HostRuntimeSplitV1,
+	// HostRuntimeRetireV1 is mandatory but advertised only once this node is
+	// live on the runtime split (grpcapi's advertisement filter,
+	// corrosion.HostRuntimeLive): readiness, not a policy. So the hosts copy
+	// is not retired anywhere before every recipient reads host_runtime.
+	HostRuntimeRetireV1,
 	// FailoverScopeV1 is advertised UNCONDITIONALLY: it says "this build
 	// decodes cluster_policies and honours failover_scope", a fact about the
 	// binary. The policy is the row, not a flag.
@@ -1136,7 +1176,7 @@ var supported = []string{
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, FenceStateV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1, RelayHealthV1, CredentialsClearV1, HostMembershipRetireV1, HostRuntimeSplitV1, Release202611V1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, FenceStateV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1, RelayHealthV1, CredentialsClearV1, HostMembershipRetireV1, HostRuntimeSplitV1, HostRuntimeRetireV1, Release202611V1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {
@@ -1198,6 +1238,10 @@ var replicationGated = map[string]bool{
 	// must be decodable by every host we stream to, a maintenance host on the
 	// previous build included.
 	HostRuntimeSplitV1: true,
+	// Confirmed against every replication recipient: once the hosts copy of
+	// the runtime columns stops being written, a host that reads them only
+	// from hosts would stop seeing reports — a maintenance host included.
+	HostRuntimeRetireV1: true,
 	// Confirmed against every replication recipient: cluster_policies' shapes
 	// must be decodable by every host we stream to.
 	FailoverScopeV1: true,
@@ -1266,6 +1310,9 @@ var mandatory = map[string]bool{
 	// A fact about the binary (it decodes and reads host_runtime), not a
 	// policy. See HostRuntimeSplitV1.
 	HostRuntimeSplitV1: true,
+	// A fact about the binary (it never needs the hosts copy of the runtime
+	// columns), not a policy. See HostRuntimeRetireV1.
+	HostRuntimeRetireV1: true,
 	// A fact about the binary (it decodes cluster_policies and honours
 	// failover_scope). The policy is the replicated row. See FailoverScopeV1.
 	FailoverScopeV1: true,

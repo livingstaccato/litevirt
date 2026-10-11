@@ -498,6 +498,11 @@ type Client struct {
 	// hostRuntimeMu serializes the runtime split pass with the runtime
 	// writers. Always taken AFTER hostMembershipMu when a writer holds both.
 	hostRuntimeMu sync.Mutex
+	// hostRuntimeRetire, when non-nil and returning true, stops the pure
+	// runtime writers writing the hosts copy (host_runtime_retire_v1). Fails
+	// CLOSED when unset: both homes are written, the dual-write build's
+	// behaviour. See host_runtime_retire.go.
+	hostRuntimeRetire atomic.Pointer[func() bool]
 
 	// canonicalIdentity, when non-nil and returning true, makes the merge paths resolve the
 	// natural-key-identity tables (tableIdentityKeys) by their natural key instead of the

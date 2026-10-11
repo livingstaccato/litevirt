@@ -83,6 +83,9 @@ type runtimeSnapshot struct {
 	// them — the epoch check simply cannot evaluate those hosts).
 	vmMarkers map[string]markerInfo
 	ctMarkers map[string]markerInfo
+	// probeErrors are the inventory's own error strings when partial, for the
+	// re-probe's "could not prove absence" log line.
+	probeErrors []string
 	// partial is true when ANY local probe errored (libvirt list/state, container
 	// list/state, LB-config read, or the `ip` dump). Positive holders are still real, but
 	// ABSENCE is unreliable: the leader must not treat a partial snapshot as absence proof
@@ -697,6 +700,17 @@ func (s *Server) reprobeMultiHolders(ctx context.Context, vmHolders, ctHolders m
 				snap, ok := again[h]
 				if !ok || snap.partial {
 					proven = false
+					// Said once, at Info: a sighting that stands for this
+					// reason is otherwise indistinguishable in the journal
+					// from a real dual run, which is how the 2026-10-10 lab
+					// false positive had to be diagnosed from timestamps.
+					why := "no answer (unreachable, or an older binary)"
+					if ok {
+						why = "partial inventory: " + strings.Join(snap.probeErrors, "; ")
+					}
+					slog.Info("dual-run detector: re-probe could not prove absence; the multi-holder sighting stands",
+						"workload", name, "kind", kind, "first_seen_on", strings.Join(hs, ", "),
+						"blind_host", h, "reason", why)
 					break
 				}
 				for _, n := range held(snap) {

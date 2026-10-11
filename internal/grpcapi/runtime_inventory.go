@@ -401,6 +401,14 @@ func classifyMarker(epoch int64, found bool, err error) (int64, string) {
 // the target (kvm003 lab, 2026-10-10, rt-vm node-3 -> node-4). Only libvirt's
 // own "no such domain" counts (lv.IsNoDomain, typed code, no text fallback):
 // any other error still marks the domain and the inventory incomplete.
+//
+// One narrowing, accepted: DomainState looks the domain up by name and then
+// asks by the handle's UUID, so a domain deleted and a DIFFERENT one (another
+// UUID) defined and started under the same name between those two calls reads
+// as absent where it used to read as partial. A migrate-back keeps the UUID
+// and is not affected. It is the same class as the pre-existing ListDomains
+// snapshot race, where a domain started just after the list is missed by a
+// complete inventory.
 func vanishedDomain(name string, err error) {
 	slog.Debug("runtime inventory: domain undefined while it was being probed; it holds nothing",
 		"domain", name, "error", err)
@@ -543,6 +551,7 @@ func snapshotFromInventory(inv runtimeInventory) runtimeSnapshot {
 		kernelVIPs:     inv.KernelVIPs,
 		unresolvedTies: inv.UnresolvedTies,
 		partial:        !inv.Complete,
+		probeErrors:    inv.Errors,
 		vmMarkers:      map[string]markerInfo{},
 		ctMarkers:      map[string]markerInfo{},
 	}

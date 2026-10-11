@@ -24,6 +24,7 @@ package fleet
 import (
 	"context"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -104,4 +105,46 @@ func TestFleet_RestartedNode_CatchesUpWithinSeconds(t *testing.T) {
 	n.DB.MarkReplicaStale("lost sight of every gossip peer (fleet: modelled partition)")
 	took = waitCaughtUp(t, n, catchUpBound, "after losing every peer")
 	t.Logf("caught up again %s after the reset", took.Round(time.Millisecond))
+}
+
+// Every peer leaves and comes back a few seconds later (a host suspend, a
+// switch flap). memberlist's last leave marks the replica stale and wakes the
+// loop, whose pass finds no peers. That empty pass must not start the 12 s
+// cooldown: once the peers are back the node catches up within about one
+// catch-up retry, not a cooldown later.
+func TestFleet_AllPeersBlip_CatchesUpSoonAfterReturn(t *testing.T) {
+	c := New(t, Options{Nodes: 3})
+	n := c.Nodes[0]
+	ctx := context.Background()
+	peers := n.DB.Members()
+	if len(peers) == 0 {
+		t.Fatal("setup: the node must see its peers")
+	}
+	var gone atomic.Bool
+	n.DB.SetMembersForTests(func() []corrosion.PeerInfo {
+		if gone.Load() {
+			return nil
+		}
+		return peers
+	})
+
+	n.DB.MarkReplicaStale("process restarted (fleet: modelled daemon restart)")
+	ae := corrosion.NewAntiEntropy(n.DB, n.PKIDir, 0)
+	lctx, stop := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() { defer close(done); ae.Start(lctx) }()
+	defer func() { stop(); <-done }()
+	waitCaughtUp(t, n, catchUpBound, "after a restart")
+
+	// Let the cooldown of that catch-up pass run out, so only the blip itself
+	// can hold the next pass back.
+	time.Sleep(13 * time.Second)
+
+	gone.Store(true)
+	n.DB.MarkReplicaStale("lost sight of every gossip peer (fleet: modelled blip)")
+	time.Sleep(time.Second) // the woken pass runs and finds nobody
+	gone.Store(false)
+
+	took := waitCaughtUp(t, n, 6*time.Second, "after every peer came back")
+	t.Logf("caught up %s after the peers returned", took.Round(time.Millisecond))
 }

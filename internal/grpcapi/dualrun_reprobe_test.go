@@ -217,3 +217,25 @@ func TestDualRun_RecordedContainerDualRunIsNotNarrowed(t *testing.T) {
 		t.Fatalf("second pass with a copy missing only at the re-probe: lifecycle %q, want confirmed", got)
 	}
 }
+
+// A re-probe that leaves a sighting standing because a host's inventory was
+// partial says so at Info, naming the host and its probe errors: otherwise the
+// journal of a false positive is indistinguishable from a real dual run.
+func TestDualRun_ReprobeBlind_LogsTheBlindHost(t *testing.T) {
+	logs := captureOpLog(t)
+	s := dualRunTestServer(t, 2)
+	seedVM(t, s, "vmA", "h1", "running")
+	gather, _ := sequencedGather(
+		map[string]runtimeSnapshot{"h1": {diskHolderVMs: []string{"vmA"}}, "h2": {diskHolderVMs: []string{"vmA"}}},
+		map[string]runtimeSnapshot{
+			"h1": {diskHolderVMs: []string{"vmA"}},
+			"h2": {partial: true, probeErrors: []string{"domain vmA xml: cannot acquire state change lock"}},
+		})
+	s.gatherRuntimeOverride = gather
+	s.detectDualRunPass(context.Background())
+	logs.must(t, "INFO", "dual-run detector: re-probe could not prove absence; the multi-holder sighting stands",
+		map[string]string{
+			"workload": "vmA", "blind_host": "h2",
+			"reason": "partial inventory: domain vmA xml: cannot acquire state change lock",
+		})
+}

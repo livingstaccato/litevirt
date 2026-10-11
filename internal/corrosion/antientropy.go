@@ -50,6 +50,12 @@ type AntiEntropy struct {
 	mu         sync.Mutex
 	inProgress bool
 	lastRan    time.Time
+	// lastCatchUp is true when the pass that set lastRan was the loop's
+	// catch-up pass (passCatchUp). The operator's RunOnce does not wait out
+	// the cooldown behind one: on a node stuck not caught up the loop takes
+	// every cooldown window, and `lv cluster converge` would otherwise answer
+	// "debounced" every time it is asked.
+	lastCatchUp bool
 
 	// sampler chooses the non-relay peers a scheduled pass contacts. Only a
 	// pass touches it, and passes never overlap (inProgress), so it needs no
@@ -135,7 +141,11 @@ func (ae *AntiEntropy) Start(ctx context.Context) {
 		// period kept them aligned indefinitely — each pass has every node
 		// pulling digests from every other, so aligned passes are an O(N²)
 		// burst on one beat.
-		ae.RunSampledOnce(ctx) // debounced; scheduled ticks share the trigger guard
+		kind := passScheduled
+		if ok, _ := ae.client.ReplicaCaughtUp(); !ok {
+			kind = passCatchUp
+		}
+		ae.runGuarded(func() bool { return ae.checkSampledPeers(ctx) }, kind) // debounced; scheduled ticks share the trigger guard
 		wait = jittered(ae.interval, loopJitter)
 		if ok, _ := ae.client.ReplicaCaughtUp(); !ok {
 			wait = min(catchUpRetry, wait)
@@ -151,18 +161,35 @@ func (ae *AntiEntropy) Start(ctx context.Context) {
 //
 // It is the operator's lever and deliberately not sampled: `lv cluster converge` asks
 // for convergence now, and a sampled pass reaches every peer only over several passes.
+//
+// It is not held back by a cooldown the loop's own catch-up pass started
+// (lastCatchUp): that is the case an operator reaches for it in.
 func (ae *AntiEntropy) RunOnce(ctx context.Context) bool {
-	return ae.runGuarded(func() { ae.checkPeers(ctx) })
+	return ae.runGuarded(func() bool { return ae.checkPeers(ctx) }, passOperator)
 }
 
 // RunSampledOnce runs one SCHEDULED pass — this node's relays plus a few other peers
 // (see checkSampledPeers) — under the same trigger guard as RunOnce. It is what the
 // loop in Start runs.
 func (ae *AntiEntropy) RunSampledOnce(ctx context.Context) bool {
-	return ae.runGuarded(func() { ae.checkSampledPeers(ctx) })
+	return ae.runGuarded(func() bool { return ae.checkSampledPeers(ctx) }, passScheduled)
 }
 
-func (ae *AntiEntropy) runGuarded(pass func()) bool {
+// passKind says who asked for a pass, for the trigger guard.
+type passKind int
+
+const (
+	passScheduled passKind = iota // the loop, replica caught up; RunSampledOnce
+	passCatchUp                   // the loop, replica not caught up
+	passOperator                  // RunOnce: converge, TriggerAntiEntropy, convergeSurvivors
+)
+
+// runGuarded runs pass under the trigger guard. pass reports whether it had
+// any peer to exchange with; one that found none does not start the cooldown,
+// because it exchanged nothing to debounce. That matters on the loop's wake at
+// the last peer's leave: stamping that empty pass made a node whose peers came
+// back seconds later wait out the full cooldown before it could catch up.
+func (ae *AntiEntropy) runGuarded(pass func() bool, kind passKind) bool {
 	// A node in release probation takes no state from any peer
 	// (ReplicationSourceAllowed), so a pass now would spend itself with every
 	// peer refused, and the replica would wait one more interval after the
@@ -173,25 +200,32 @@ func (ae *AntiEntropy) runGuarded(pass func()) bool {
 		return false
 	}
 	ae.mu.Lock()
-	if ae.inProgress || (!ae.lastRan.IsZero() && time.Since(ae.lastRan) < antiEntropyCooldown) {
+	cooling := !ae.lastRan.IsZero() && time.Since(ae.lastRan) < antiEntropyCooldown
+	if kind == passOperator && ae.lastCatchUp {
+		cooling = false
+	}
+	if ae.inProgress || cooling {
 		ae.mu.Unlock()
 		return false
 	}
 	ae.inProgress = true
 	ae.mu.Unlock()
 
-	pass()
+	contacted := pass()
 
 	ae.mu.Lock()
 	ae.inProgress = false
-	ae.lastRan = time.Now()
+	if contacted {
+		ae.lastRan = time.Now()
+		ae.lastCatchUp = kind == passCatchUp
+	}
 	ae.mu.Unlock()
 	return true
 }
 
 // checkPeers runs a pass against every member.
-func (ae *AntiEntropy) checkPeers(ctx context.Context) {
-	ae.checkPeerSet(ctx, nil)
+func (ae *AntiEntropy) checkPeers(ctx context.Context) bool {
+	return ae.checkPeerSet(ctx, nil)
 }
 
 // checkSampledPeers runs a scheduled pass: this node's relays plus
@@ -203,8 +237,8 @@ func (ae *AntiEntropy) checkPeers(ctx context.Context) {
 // replication flows through them: they are the peers most likely to hold what
 // this node is missing, and a leaf that agrees with its relays agrees with
 // what the relay mesh has carried.
-func (ae *AntiEntropy) checkSampledPeers(ctx context.Context) {
-	ae.checkPeerSet(ctx, func(peers []PeerInfo) []string {
+func (ae *AntiEntropy) checkSampledPeers(ctx context.Context) bool {
+	return ae.checkPeerSet(ctx, func(peers []PeerInfo) []string {
 		names := make([]string, 0, len(peers))
 		for _, p := range peers {
 			names = append(names, p.Name)
@@ -236,8 +270,9 @@ func (ae *AntiEntropy) relayTargets(ctx context.Context, peers []PeerInfo) []str
 // checkPeerSet runs one pass against the members choose picks (every member
 // when choose is nil). A pass against every member is the operator's RunOnce,
 // and it repairs observation tables whatever their schedule
-// (observation_tables.go).
-func (ae *AntiEntropy) checkPeerSet(ctx context.Context, choose func([]PeerInfo) []string) {
+// (observation_tables.go). It reports whether there was any peer to exchange
+// with; false only when gossip shows none.
+func (ae *AntiEntropy) checkPeerSet(ctx context.Context, choose func([]PeerInfo) []string) bool {
 	full := choose == nil
 	// Captured before ANY read, so a completed exchange marks the replica
 	// caught up only if no staleness reset happened while it ran.
@@ -245,7 +280,7 @@ func (ae *AntiEntropy) checkPeerSet(ctx context.Context, choose func([]PeerInfo)
 	peers := ae.client.Members()
 	if len(peers) == 0 {
 		ae.client.MarkReplicaStale("sees no gossip peers (anti-entropy)")
-		return
+		return false
 	}
 	var targets []string
 	if choose != nil {
@@ -265,7 +300,7 @@ func (ae *AntiEntropy) checkPeerSet(ctx context.Context, choose func([]PeerInfo)
 	localDigests, err := digest(ctx)
 	if err != nil {
 		slog.Warn("anti-entropy: local digest error", "error", err)
-		return
+		return true
 	}
 	localMap := make(map[string]TableDigest, len(localDigests))
 	for _, d := range localDigests {
@@ -293,6 +328,7 @@ func (ae *AntiEntropy) checkPeerSet(ctx context.Context, choose func([]PeerInfo)
 		}
 		cancel()
 	}
+	return true
 }
 
 // checkPeer runs one peer's exchange. It returns true only when the exchange

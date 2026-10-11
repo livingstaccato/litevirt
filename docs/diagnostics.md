@@ -847,7 +847,7 @@ runtime-owned, a `project` tie as tenancy, a `spec` tie as opaque, and any other
 column tie by content-max — applied in that order, first strict decision wins.
 `hosts` settles a tie between two live rows with different `created_at` (two
 incarnations: a host's stale database against its re-admission) by the later
-`created_at`, ahead of its control-plane columns, reported as `timestamp_max`.
+`created_at`, ahead of its control-plane columns, reported as `incarnation`.
 Anti-entropy also refuses to replace a re-admitted `hosts` row with a newer
 row of the host's previous incarnation: it is counted in
 `litevirt_merge_apply_rejected_total{table="hosts",path="ae",reason="older_incarnation"}`
@@ -865,7 +865,7 @@ converge the row, so the two paths can never disagree.
 
 - `litevirt_lww_tie_break_total{table,resolver,winner}` — ties that converged by a
   deterministic resolver (`content_max`/`numeric_max`/`timestamp_max`/
-  `non_null_wins`/`lb_generation`). A steadily climbing value means a node is
+  `non_null_wins`/`lb_generation`/`incarnation`). A steadily climbing value means a node is
   minting colliding timestamps (the upstream smell), not just a one-off split.
 - `litevirt_lww_tie_unresolved_total{table,path,category}` — **monotonic counter**
   of distinct unresolved ties *observed* (counted once per row, not per cycle).

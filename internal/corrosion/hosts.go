@@ -95,7 +95,11 @@ func (h HostRecord) IsWitness() bool { return h.Role == "witness" }
 
 // InsertHost creates a new host record.
 func InsertHost(ctx context.Context, c *Client, h HostRecord) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	// created_at is the row's incarnation, in the same fixed-width form as a
+	// re-admission's stamp (host_readmit.go, THE INCARNATION): a machine
+	// re-added on an empty database inserts its row after its admission, and
+	// a whole second of truncation would order that insert before the stamp.
+	now := time.Now().UTC().Format(nowTSLayout)
 	role := h.Role
 	if role == "" {
 		role = "worker"

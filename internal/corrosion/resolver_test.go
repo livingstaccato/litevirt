@@ -503,12 +503,12 @@ func TestResolver_HostsLaterIncarnationWins(t *testing.T) {
 	readmitted := []interface{}{"h1", "7443", nil, "2026-10-11T09:00:00.250000000Z", nil, "T"}
 
 	_, sm, keepLocal, unresolved := resolve(t, "hosts", cols, stale, readmitted)
-	if keepLocal || unresolved || len(sm.tieBreaks) != 1 || sm.tieBreaks[0] != "hosts/timestamp_max/incoming" {
+	if keepLocal || unresolved || len(sm.tieBreaks) != 1 || sm.tieBreaks[0] != "hosts/incarnation/incoming" {
 		t.Fatalf("the stale incarnation must take the re-admitted row, got keepLocal=%v unresolved=%v breaks=%v",
 			keepLocal, unresolved, sm.tieBreaks)
 	}
 	_, sm, keepLocal, unresolved = resolve(t, "hosts", cols, readmitted, stale)
-	if !keepLocal || unresolved || len(sm.tieBreaks) != 1 || sm.tieBreaks[0] != "hosts/timestamp_max/local" {
+	if !keepLocal || unresolved || len(sm.tieBreaks) != 1 || sm.tieBreaks[0] != "hosts/incarnation/local" {
 		t.Fatalf("the re-admitted row must keep itself, got keepLocal=%v unresolved=%v breaks=%v",
 			keepLocal, unresolved, sm.tieBreaks)
 	}
@@ -559,8 +559,10 @@ func TestResolver_PreviousChainPicksTheSameIncarnation(t *testing.T) {
 			t.Errorf("content-max over local created_at %v: keepLocal=%v, want %v (the stamped row)",
 				dir.local[3], d.keepLocal, dir.wantLocal)
 		}
-		if d := ruleTimestampMax("created_at")(rv); !d.decided || d.keepLocal != dir.wantLocal {
-			t.Errorf("incarnation over local created_at %v: keepLocal=%v, want %v", dir.local[3], d.keepLocal, dir.wantLocal)
+		// This build's whole chain picks the same row.
+		if _, _, keepLocal, unresolved := resolve(t, "hosts", cols, dir.local, dir.incoming); unresolved || keepLocal != dir.wantLocal {
+			t.Errorf("the hosts chain over local created_at %v: keepLocal=%v unresolved=%v, want keepLocal=%v",
+				dir.local[3], keepLocal, unresolved, dir.wantLocal)
 		}
 	}
 }

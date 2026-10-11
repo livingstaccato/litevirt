@@ -12,7 +12,8 @@ func TestOlderIncarnation(t *testing.T) {
 		want            bool
 	}{
 		{stamp, "2026-09-01T10:00:00Z", true},                   // the stale database's row
-		{stamp, "2026-10-11T09:00:00Z", true},                   // first inserted in the same second
+		{stamp, "2026-10-11T08:59:59.999999999Z", true},         // the second before
+		{stamp, "2026-10-11T09:00:00Z", false},                  // an older build's insert in the same second
 		{stamp, stamp, false},                                   // the same incarnation
 		{stamp, "2026-10-11T09:00:01Z", false},                  // a later one (an empty-database re-add)
 		{stamp, "2026-10-11T09:00:00.500000000Z", false},        // a later re-admission

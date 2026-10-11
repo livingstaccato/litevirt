@@ -47,7 +47,7 @@ type SyncMetrics interface {
 	ObserveLegacyTransformed(transformer string)
 	// ObserveTieBreak records an exact-timestamp tie that a resolver converged:
 	// resolver ∈ {content_max, numeric_max, timestamp_max, non_null_wins,
-	// lb_generation}; winner ∈ {local, incoming}. (Tombstone ties go to
+	// lb_generation, incarnation}; winner ∈ {local, incoming}. (Tombstone ties go to
 	// ObserveTombstoneTie instead.)
 	ObserveTieBreak(table, resolver, winner string)
 	// ObserveTieUnresolved records a DISTINCT unresolved tie (counted once per

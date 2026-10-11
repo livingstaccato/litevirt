@@ -195,6 +195,27 @@ func ruleTimestampMax(col string) tieRule {
 	}
 }
 
+// ruleIncarnation: two live hosts rows of different incarnations — one's
+// created_at earlier than the whole second of the other's fixed-width one
+// (olderIncarnation, host_incarnation_floor.go) — go to the later
+// incarnation. Anything else passes.
+func ruleIncarnation() tieRule {
+	return func(rv rowView) tieDecision {
+		if !rv.has("created_at") {
+			return pass
+		}
+		l, i := rv.localStr("created_at"), rv.incomingStr("created_at")
+		switch {
+		case olderIncarnation(l, i):
+			return decideKeepLocal("incarnation")
+		case olderIncarnation(i, l):
+			return decideTakeIncoming("incarnation")
+		default:
+			return pass
+		}
+	}
+}
+
 // ruleNonNullWins: a non-empty value beats an empty one (e.g. recovery_codes
 // used_at — consuming a single-use code is irreversible). Both set / both empty
 // → pass.
@@ -451,14 +472,14 @@ var capabilityMap = map[string]tableResolver{
 	// address/port, role, or schema version. Those differing → unresolved; a tie
 	// in only the benign columns still converges by content-max.
 	//
-	// Two live rows with different created_at are two incarnations of the
-	// host: the later one is the re-admission (host_readmit.go, THE
-	// INCARNATION) and wins whole, ahead of the control-plane carve-out — the
-	// earlier row is a machine's stale database, whose settings the operator's
-	// re-admission reset.
+	// Two live rows of different incarnations (ruleIncarnation): the later
+	// one is the re-admission (host_readmit.go, THE INCARNATION) and wins
+	// whole, ahead of the control-plane carve-out — the earlier row is a
+	// machine's stale database, whose settings the operator's re-admission
+	// reset.
 	"hosts": {category: "host-control-plane", chain: []tieRule{
 		ruleTombstone(),
-		ruleTimestampMax("created_at"),
+		ruleIncarnation(),
 		ruleAnyColUnresolved([]string{
 			"state", "address", "ssh_user", "ssh_port", "grpc_port", "cert_serial",
 			"ipmi_address", "ipmi_user", "ipmi_pass", "watchdog_dev", "fence_strategy",

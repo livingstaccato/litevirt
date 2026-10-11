@@ -107,6 +107,14 @@ func staleDBReadd(t *testing.T, retired, aeFirst bool, seed int64) {
 		t.Fatalf("configure %s: %v", d.Name, err)
 	}
 	c.WaitConverged(t, convergeTimeout)
+	// d joined the cluster long before it was removed, not within the second
+	// this test takes: its row's created_at says so on every node (written in
+	// place, never logged, so it replicates nowhere).
+	for _, n := range c.Nodes {
+		if _, err := n.DB.DB().Exec(`UPDATE hosts SET created_at = '2026-01-01T00:00:00Z' WHERE name = ?`, d.Name); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if got := hostsRowOf(t, d, d.Name); got["labels"] == "NULL" || got["region"] != "rack-a" {
 		t.Fatalf("fixture: %s's own row = %v, want the configured labels and region", d.Name, got)
 	}

@@ -1162,7 +1162,10 @@ pulled the re-added host's row before its writes arrived used to take the
 stale row outright — it is newer — and where every survivor did, the cluster
 settled on it with no tie to report. A host holding the re-admitted row now
 keeps it against a row with an earlier `created_at`; the re-added host's
-writes still reach it by replication.
+writes still reach it by replication. A host re-added on an empty database
+inserts its row after its admission, so its row is the later one, unless the
+clocks of the admitting host and the re-added host disagree by more than the
+time between the admission and the re-added daemon's first start.
 
 Mid-roll, this needs at least one host on this build to have applied the
 re-admission, and that is necessary rather than sufficient. A host on a build

@@ -57,6 +57,12 @@ type VMConfig struct {
 	CPUPinning []int // host CPU IDs to pin vCPUs to
 	IOThreads  int   // number of IO threads (0 = default)
 
+	// CPULimit caps the VM's total CPU time in host cores (Proxmox cpulimit);
+	// 0 = unlimited. CPUShares is the relative CPU weight (libvirt <shares>);
+	// 0 = leave at the default. Both render into <cputune> (see GlobalQuota).
+	CPULimit  float64
+	CPUShares int
+
 	// NUMA policy
 	NUMAPolicy *NUMAPolicy
 
@@ -154,6 +160,9 @@ type NetworkConfig struct {
 	// find its NIC when the spec recorded no MAC, however many NICs have been
 	// hot-plugged or detached since.
 	SpecOrdinal int
+	// RateMBps caps this NIC's bandwidth in MB/s in both directions (Proxmox
+	// rate=), rendered as <bandwidth>. 0 = unlimited.
+	RateMBps float64
 }
 
 // MachineTypeFromXML extracts the resolved <os><type machine="…"> value from a
@@ -395,6 +404,22 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 		}
 		dom.CPUTune = ct
 	}
+	// CPU limit and shares: the noisy-neighbour controls. They share <cputune>
+	// with any pinning rendered above.
+	if cfg.CPULimit > 0 || cfg.CPUShares > 0 {
+		if dom.CPUTune == nil {
+			dom.CPUTune = &cpuTune{}
+		}
+		if cfg.CPUShares > 0 {
+			sh := uint64(HostCPUShares(cfg.CPUShares))
+			dom.CPUTune.Shares = &sh
+		}
+		if cfg.CPULimit > 0 {
+			period, quota := GlobalQuota(cfg.CPULimit)
+			dom.CPUTune.GlobalPeriod = &period
+			dom.CPUTune.GlobalQuota = &quota
+		}
+	}
 
 	// NUMA tune: bind guest memory to a specific host NUMA node.
 	if cfg.NUMAPolicy != nil && cfg.NUMAPolicy.PreferredNode >= 0 {
@@ -597,6 +622,7 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 			// without /dev/vhost-net into a failed start or migration.
 			iface.Driver = &ifaceDriver{Queues: n.Queues}
 		}
+		iface.Bandwidth = bandwidthElement(n.RateMBps)
 		dev.Interfaces = append(dev.Interfaces, iface)
 	}
 
@@ -873,6 +899,10 @@ type memoryBacking struct {
 
 type cpuTune struct {
 	VCPUPin []vcpuPin `xml:"vcpupin"`
+	Shares  *uint64   `xml:"shares,omitempty"`
+	// GlobalPeriod/GlobalQuota cap the whole domain (cpu.max of its cgroup).
+	GlobalPeriod *uint64 `xml:"global_period,omitempty"`
+	GlobalQuota  *int64  `xml:"global_quota,omitempty"`
 }
 
 type vcpuPin struct {
@@ -1069,6 +1099,8 @@ type interfaceDevice struct {
 	Source  ifaceSource  `xml:"source"`
 	Model   ifaceModel   `xml:"model"`
 	Driver  *ifaceDriver `xml:"driver,omitempty"`
+	// Bandwidth is the per-NIC rate cap (<bandwidth>), nil when unlimited.
+	Bandwidth *ifaceBandwidth `xml:"bandwidth,omitempty"`
 }
 
 // ifaceDriver is the NIC's <driver>: N queues for virtio multiqueue.

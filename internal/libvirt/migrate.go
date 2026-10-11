@@ -43,6 +43,12 @@ type MigrateParams struct {
 	// CDROMSources; callers leave them empty.
 	DestXML    string
 	PersistXML string
+	// SharesWeight is the VM's cpu-shares weight (the user's scale, 0 = unset)
+	// and TargetCgroup the target's cgroup version ("v2"/"v1", "" = unknown).
+	// When the scales differ, the destination and persistent definitions carry
+	// the TARGET's <shares>, not the value this host rendered.
+	SharesWeight int
+	TargetCgroup string
 }
 
 // MigrateToTarget performs a live (or cold) P2P migration of a domain to
@@ -61,7 +67,8 @@ func (c *Client) MigrateToTarget(name, dconnuri string, p MigrateParams) error {
 		_ = c.virt.DomainMigrateSetMaxDowntime(dom, uint64(p.MaxDowntimeMS), 0)
 	}
 
-	if len(p.CDROMSources) > 0 {
+	retarget := shareRetargetNeeded(p, cgroupV2())
+	if len(p.CDROMSources) > 0 || retarget {
 		live, err := c.virt.DomainGetXMLDesc(dom, golibvirt.DomainXMLSecure|golibvirt.DomainXMLMigratable)
 		if err != nil {
 			return fmt.Errorf("get migratable XML for %q: %w", name, err)
@@ -70,9 +77,16 @@ func (c *Client) MigrateToTarget(name, dconnuri string, p MigrateParams) error {
 		if err != nil {
 			return fmt.Errorf("get persistent migratable XML for %q: %w", name, err)
 		}
-		if p.DestXML, p.PersistXML, err = MigrationCDROMXML(live, persist, p.CDROMSources); err != nil {
-			return fmt.Errorf("domain %q: %w", name, err)
+		dest, persistOut := live, persist
+		if len(p.CDROMSources) > 0 {
+			if dest, persistOut, err = MigrationCDROMXML(live, persist, p.CDROMSources); err != nil {
+				return fmt.Errorf("domain %q: %w", name, err)
+			}
 		}
+		if d, pr, ok := MigrationShareXML(dest, persistOut, p.SharesWeight, p.TargetCgroup, cgroupV2()); ok {
+			dest, persistOut = d, pr
+		}
+		p.DestXML, p.PersistXML = dest, persistOut
 	}
 
 	flags, params := migrationFlagsAndParams(p)
@@ -84,6 +98,14 @@ func (c *Client) MigrateToTarget(name, dconnuri string, p MigrateParams) error {
 		flags,
 	)
 	return err
+}
+
+// shareRetargetNeeded reports whether a migration must hand libvirt
+// definitions with <shares> on the target's scale: the VM has a weight, the
+// target reported its cgroup version, and that version differs from the
+// source's (srcV2).
+func shareRetargetNeeded(p MigrateParams, srcV2 bool) bool {
+	return p.SharesWeight > 0 && (p.TargetCgroup == "v1" || p.TargetCgroup == "v2") && (p.TargetCgroup == "v2") != srcV2
 }
 
 // MigrationCDROMXML builds the destination and persistent definitions of a

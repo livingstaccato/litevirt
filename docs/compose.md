@@ -172,6 +172,8 @@ vms:
     max-cpu: 8                # vCPU hotplug ceiling (> cpu); with live_resize, cpu grows live up to it
     cpu-mode: "host-model"    # host-passthrough | host-model | custom (default host-model)
     cpu-model: "x86-64-v3"    # required by cpu-mode: custom; invalid for any other mode
+    cpu-limit: 2.5            # Cap on the VM's TOTAL CPU, in host cores (fractions ok; 0/unset = unlimited; at most cpu). Live
+    cpu-shares: 200           # CPU weight under contention: cgroup v2 cpu.weight, Proxmox cpuunits (1-10000, default 100). Live
     memory: "4G"              # Memory: "4G", "4096M", or 4096 (MiB) — boot allocation
     min-memory: "1G"          # Ballooning floor the host may reclaim to (0 = none)
     max-memory: "8G"          # Ballooning ceiling the guest may inflate to (0 = fixed at memory)
@@ -210,6 +212,65 @@ empty: an empty mode emits no `<cpu>` element and drops the guest onto QEMU's
 bakes into the domain XML — so a deploy reconfigures and restarts the same VM
 (disks kept), and an update under `strategy: in-place` (set in the VM's `update:`
 block) refuses it: in-place never restarts a VM.
+
+### Noisy-neighbour limits
+
+Three settings keep one guest from starving its neighbours. They are the
+counterparts of Proxmox's `cpulimit`, `cpuunits` and the NIC `rate=`:
+
+- `cpu-limit` caps the VM's **total** CPU in host cores, across all its vCPUs:
+  `2.5` lets a 4-vCPU guest burn at most two and a half cores in total, so one busy
+  thread can use a full core, exactly as Proxmox's `cpulimit` behaves. It must be at
+  most `cpu` (a cap above the vCPU count could never be reached) and at least `0.01`.
+  It is applied as libvirt's whole-domain `global_period`/`global_quota` (the
+  domain cgroup's `cpu.max`), so it does not depend on the vCPU count and a vCPU
+  change leaves it alone.
+- `cpu-shares` is the VM's weight when the host is contended: Proxmox's `cpuunits`,
+  the cgroup v2 `cpu.weight` scale (1-10000, default 100), and that number is what
+  is stored and what `lv inspect` shows. `200` is twice the default, so the Proxmox
+  numbers carry over unchanged. Each host renders the value its own cgroup version
+  wants when it defines the domain: unchanged on cgroup v2, scaled by 1024/100
+  (minimum 2) on cgroup v1, whose default `cpu.shares` is 1024. A cluster that mixes
+  v1 and v2 hosts therefore renders per host, and a failover rebuild re-renders for
+  the new host. A migration does the same: a cold move defines the domain on the
+  target at the target's scale, and a live move hands libvirt a destination
+  definition rendered for the target's cgroup version, which the target reports
+  (a v1 to v2 move of a VM with weight 977 or more is not refused). litevirt owns the domain definition, so a `<shares>` it finds there, even one it did not write (set with `virsh schedinfo --config`, say), is rewritten to the stored weight, or to the default when none is stored, on every migration. Clearing it (`0`, or dropping the key) writes the default weight
+  back. It only matters under contention: an idle host lets every guest run flat out.
+- `rate` on a `network:` entry caps that NIC in MB/s (10^6 bytes), the same in
+  each direction, rendered as libvirt `<bandwidth>` (whose `average` is in kilobytes
+  of 1000 bytes, so `rate: 10` is `average='10000'`). It is set per NIC, so a
+  VM's management NIC can stay unthrottled.
+
+All three **apply to a running VM with no restart**: a deploy that changes them is
+an in-place update (`~ update`, `applied in place`), as is `lv update`'s
+`--cpu-limit`, `--cpu-shares` and `--nic-rate` — to the persistent definition as
+well as the running domain, so the value survives a reboot and a stopped VM takes
+it at its next start. They are carried through live and cold migration and rebuilt
+on failover from the stored spec. Dropping a key from the file removes that limit.
+
+`cpu-limit`, `cpu-shares` and `rate` apply to VMs only; setting one on an `lxc` or `oci` entry is an error.
+
+A capped VM is still **placed and charged for its full vCPU count**: the cap bounds
+how much CPU the guest may take, not how many cores it needs scheduled onto, and it
+can be raised or removed live, so placement and project quota never count a capped
+VM as smaller than its `cpu`. `lv inspect <vm>` shows the stored values as
+`cpuLimit`, `cpuShares` and each network's `rateMbSec`.
+
+During a rolling upgrade a limit cannot be set until every host runs a build
+that understands it: setting `cpu-limit`, `cpu-shares` or a NIC `rate` is refused
+("the cluster upgrade must finish first") until the release token
+`release_2026_11_v1` has latched, because an older host would ignore the fields, and
+an older owner that rewrites a VM's stored spec would drop them. The request is refused
+early, without recording anything, while the token has not latched (an entry node
+checks this before forwarding an update, so an older owner is never handed a limit it
+would drop). The host that performs the write (for an update, the VM's owner) runs
+the full gate after permission and validation checks, and the first use is recorded
+cluster-wide immediately before the limit's first data (the `vm_limits` feature
+in `lv cluster upgrade-status`). Files and updates without limits are not affected,
+and clearing a limit (`0`) is always allowed. Once a limit has been set, rolling back
+below the release puts each node into WAL quarantine until it is upgraded again;
+a cluster that never sets one can still roll back.
 
 With `replicas: 3`, VMs are named `web-1`, `web-2`, `web-3`. With `replicas: 1`, the base name is used directly.
 
@@ -434,6 +495,7 @@ is not bounded (libvirt's `group_name` is not supported).
         trunk: [100, 101]           # VLAN trunk mode
         security-groups: ["web"]    # Per-NIC firewall (see "Firewall" below)
         queues: 4                   # virtio-net multiqueue (1-64, or auto)
+        rate: 12.5                  # Bandwidth cap in MB/s, both directions (0/unset = unlimited). Live
 ```
 
 `queues:` gives a virtio NIC that many queue pairs (`<driver queues='N'/>`; libvirt
@@ -873,7 +935,7 @@ Control how VMs are updated when a compose file changes.
 
 **Every update is applied with the least destructive mechanism the change allows, whatever the strategy** — the plan names the mechanism on each `~ update` line:
 
-- **in place** (`applied in place, no restart`) — the running VM is changed with no restart: a cpu grow within the `max-cpu` hotplug ceiling, a memory change within the `[min-memory, max-memory]` balloon band (the new size is also the VM's next-boot size), and spec settings read when they are used: restart policy, onboot, ordering, labels, placement, migrate, `healthcheck`, `hooks`, `stop-grace-period`;
+- **in place** (`applied in place, no restart`) — the running VM is changed with no restart: a cpu grow within the `max-cpu` hotplug ceiling, a memory change within the `[min-memory, max-memory]` balloon band (the new size is also the VM's next-boot size), and spec settings read when they are used: restart policy, onboot, ordering, labels, placement, migrate, `healthcheck`, `hooks`, `stop-grace-period`; and the noisy-neighbour limits `cpu-limit`, `cpu-shares` and each NIC's `rate`, which libvirt applies to the running domain;
 - **restart** (`restart — the same VM is reconfigured and restarted, disks kept`) — a change that bakes into the domain (a cpu shrink or grow beyond the ceiling, an out-of-band memory size, `max-cpu`, memory bounds, `cpu-mode`/`cpu-model`, `machine`, `firmware`, `guest-agent`, VNC graphics, `secure-boot`, `tpm`) reconfigures and restarts the **same** VM: same disks, same MACs, same identity. A stopped VM is reconfigured and left stopped. Toggling `secure-boot` or `tpm` on a VM that already has firmware state is refused, as `lv update` refuses it without `--force`;
 - **recreate** (`recreate — disks are replaced (<why>)`) — only a change of VM identity (`image`, `iso`, disk or network topology, `cloud-init`) deletes the VM and creates it again, **which replaces its disks**. So does a change that needs only a redefine but that no reconfigure path can apply to an existing VM yet (SPICE graphics, resource tuning, passthrough devices), and a VM whose stored spec cannot be read. Disks are not carried over to the new VM. The plan says so on the VM's line, and `compose up` asks for confirmation before applying it (as it does for every plan, unless `-y`).
 

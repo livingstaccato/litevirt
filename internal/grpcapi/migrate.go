@@ -572,6 +572,8 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 	// another file there (a link, a library directory); the destination
 	// definition carries those (MigrateParams.CDROMSources).
 	var cdromSources map[string]string
+	// targetCgroup: the target's cgroup version when it reported one.
+	var targetCgroup string
 	useTLS := false
 	// route is where the migration's data goes: the cluster address, or the
 	// target's address in migration.network (migration_network.go).
@@ -584,7 +586,7 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 			// pre-created above is the only leftover, and the abort removes it.
 			return err
 		}
-		createdStubs, dstTLS, cdromSources = ens.created, ens.tlsReady, ens.remap
+		createdStubs, dstTLS, cdromSources, targetCgroup = ens.created, ens.tlsReady, ens.remap, ens.cgroupMode
 		abort.createdStubs = createdStubs
 		useTLS = srcTLS && dstTLS
 		kind := routeStorage
@@ -610,7 +612,7 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 		if eerr != nil {
 			return eerr
 		}
-		cdromSources = ens.remap
+		cdromSources, targetCgroup = ens.remap, ens.cgroupMode
 		if fwVM || coldStopped {
 			route = s.chooseMigrationRoute(ctx, vm.Name, *targetHost, ens.migAddr, routeCold, true)
 		} else {
@@ -741,6 +743,7 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 		s.noteStateWriteFail(corrosion.OpVMState, err)
 	}
 	migrationStart := time.Now()
+	sharesWeight := s.vmSharesWeight(ctx, vm.Name)
 
 	// Apply migration timeout if configured.
 	migrateCtx := ctx
@@ -775,6 +778,8 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 			TLSDestination: targetHost.Address,
 			Direct:         route.direct,
 			CDROMSources:   cdromSources,
+			SharesWeight:   sharesWeight,
+			TargetCgroup:   targetCgroup,
 		})
 	}()
 
@@ -1267,7 +1272,7 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 	if s.isoResolvedWithheld {
 		isoResolved = nil
 	}
-	resp := &pb.EnsureDisksResponse{InstallerIsoWarning: isoWarning, InstallerIsoResolved: isoResolved}
+	resp := &pb.EnsureDisksResponse{InstallerIsoWarning: isoWarning, InstallerIsoResolved: isoResolved, CgroupMode: lv.CgroupMode()}
 	var made []string // created by this call: removed again if a later one fails
 	undo := func() {
 		for _, p := range made {
@@ -1435,6 +1440,10 @@ func (s *Server) EnsureFirmwareState(ctx context.Context, req *pb.EnsureFirmware
 			}
 			domXML = rewritten
 		}
+		// The source rendered <shares> for ITS cgroup version and says which
+		// weight that was (a cleared weight arrives as the default); this host
+		// defines the domain at its own scale. No weight sent: unchanged.
+		domXML = lv.RetargetCPUShares(domXML, int(req.SharesWeight), lv.CgroupMode() == "v2")
 		if err := s.virt.DefineDomain(domXML); err != nil {
 			// Roll back the firmware we just materialized so a retry is clean.
 			wipe()
@@ -1465,7 +1474,8 @@ func (s *Server) EnsureFirmwareState(ctx context.Context, req *pb.EnsureFirmware
 // before the handoff commits (abandonFirmwareTarget). attempt names this
 // migration attempt to the target, which records the domain it defines under it.
 func (s *Server) ensureFirmwareStateOnTarget(ctx context.Context, targetHost, vmName string, fs firmwareSpec, domainXML, attempt string) (firmwareTargetOutcome, error) {
-	req := &pb.EnsureFirmwareStateRequest{VmName: vmName, DomainXml: domainXML, AttemptId: attempt}
+	req := &pb.EnsureFirmwareStateRequest{VmName: vmName, DomainXml: domainXML, AttemptId: attempt,
+		SharesWeight: int32(s.vmSharesWeight(ctx, vmName))}
 	if fs.SecureBoot || fs.Tpm {
 		// Per-component preflight: never push a PARTIAL bundle (WriteFirmwareBundle
 		// alone would accept NVRAM-only or swtpm-only) — that restores a fresh TPM.
@@ -2133,7 +2143,7 @@ func storageMigrationTargets(vmName string, disks []corrosion.DiskRecord) ([]str
 // target judges the ISO it would open; runtime says the domain moves by
 // libvirt runtime migration (ensureDisksOnTargetISO).
 func (s *Server) ensureDisksOnTarget(ctx context.Context, targetHost, vmName string, stubs []*pb.DiskStub, wantTLS, runtime bool) ([]string, bool, error) {
-	created, tls, _, err := s.ensureDisksOnTargetISO(ctx, targetHost, vmName, stubs, wantTLS, runtime)
+	created, tls, _, _, err := s.ensureDisksOnTargetISO(ctx, targetHost, vmName, stubs, wantTLS, runtime)
 	return created, tls, err
 }
 
@@ -2143,9 +2153,9 @@ func (s *Server) ensureDisksOnTarget(ctx context.Context, targetHost, vmName str
 // MigrateParams.CDROMSources. With the ISO paths it sends the sha256 of the
 // file this host judged for the VM's ISO, so a target where another project's
 // pool maps the directory admits that very content on the VM's first arrival.
-func (s *Server) ensureDisksOnTargetISO(ctx context.Context, targetHost, vmName string, stubs []*pb.DiskStub, wantTLS, runtime bool) ([]string, bool, map[string]string, error) {
+func (s *Server) ensureDisksOnTargetISO(ctx context.Context, targetHost, vmName string, stubs []*pb.DiskStub, wantTLS, runtime bool) ([]string, bool, map[string]string, string, error) {
 	o, err := s.ensureDisksOnTargetNet(ctx, targetHost, vmName, stubs, wantTLS, runtime)
-	return o.created, o.tlsReady, o.remap, err
+	return o.created, o.tlsReady, o.remap, o.cgroupMode, err
 }
 
 // ensureOutcome is what the target's EnsureDisks answered.
@@ -2156,6 +2166,9 @@ type ensureOutcome struct {
 	// migAddr is the target's address inside migration.network, "" when none
 	// was asked for or the target gave none (migration_network.go).
 	migAddr string
+	// cgroupMode is the target's cgroup version ("v2"/"v1"), "" when it did
+	// not say (an older target, or no call was made).
+	cgroupMode string
 }
 
 // ensureDisksOnTargetNet is ensureDisksOnTargetISO that also asks for the
@@ -2166,11 +2179,20 @@ func (s *Server) ensureDisksOnTargetNet(ctx context.Context, targetHost, vmName 
 	if err != nil {
 		return ensureOutcome{}, err
 	}
-	if len(stubs) == 0 && !wantTLS && len(isoPaths) == 0 && s.migrationNetwork == "" {
+	// A runtime move of a VM with a cpu-shares weight also asks the target for
+	// its cgroup version, so the destination definition carries the target's
+	// scale (MigrateParams.SharesWeight). That ask alone is best effort: an
+	// unanswered one leaves the domain as it is, as before.
+	shareOnly := runtime && s.vmSharesWeight(ctx, vmName) > 0 && len(stubs) == 0 && !wantTLS && len(isoPaths) == 0 &&
+		s.migrationNetwork == ""
+	if len(stubs) == 0 && !wantTLS && len(isoPaths) == 0 && s.migrationNetwork == "" && !shareOnly {
 		return ensureOutcome{}, nil
 	}
 	client, conn, err := s.peerClient(ctx, targetHost)
 	if err != nil {
+		if shareOnly {
+			return ensureOutcome{}, nil
+		}
 		return ensureOutcome{}, status.Errorf(codes.Unavailable,
 			"cannot reach %s to prepare the disks of VM %q for the copy: %v", targetHost, vmName, err)
 	}
@@ -2182,6 +2204,11 @@ func (s *Server) ensureDisksOnTargetNet(ctx context.Context, targetHost, vmName 
 		InstallerIsoSha256: s.judgedISOSHA256(ctx, vmName, isoPaths),
 		MigrationNetwork:   s.migrationNetwork,
 	})
+	if err != nil && shareOnly {
+		slog.Warn("migration: the target did not report its cgroup version; cpu-shares move as defined",
+			"vm", vmName, "target", targetHost, "error", err)
+		return ensureOutcome{}, nil
+	}
 	if err != nil {
 		code := status.Code(err)
 		if code == codes.Unknown {
@@ -2214,7 +2241,7 @@ func (s *Server) ensureDisksOnTargetNet(ctx context.Context, targetHost, vmName 
 			slog.Info("migration: the target opens the installer ISO at its own file", "vm", vmName, "target", targetHost, "here", from, "there", to)
 		}
 	}
-	return ensureOutcome{created: resp.GetCreatedPaths(), tlsReady: wantTLS && resp.GetMigrationTlsReady(), remap: remap, migAddr: resp.GetMigrationAddress()}, nil
+	return ensureOutcome{created: resp.GetCreatedPaths(), tlsReady: wantTLS && resp.GetMigrationTlsReady(), remap: remap, migAddr: resp.GetMigrationAddress(), cgroupMode: resp.GetCgroupMode()}, nil
 }
 
 // olderTargetISORemap points, for a move to an older target, the CD-ROM that

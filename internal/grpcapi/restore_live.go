@@ -81,6 +81,16 @@ func (s *Server) RestoreLive(req *pb.RestoreLiveRequest, stream grpc.ServerStrea
 		return err
 	}
 
+	// With --auto-start the spec is resolved later, after the NBD export and the
+	// overlay exist; judge its limits now, before either is created.
+	if req.AutoStart {
+		if spec, rerr := s.resolveRestoreSpec(ctx, req, manifest); rerr == nil {
+			if err := s.checkCopiedSpecLimits(ctx, spec); err != nil {
+				return err
+			}
+		}
+	}
+
 	reader, err := pbsstore.NewManifestReader(repo, manifest)
 	if err != nil {
 		return status.Errorf(codes.Internal, "manifest reader: %v", err)

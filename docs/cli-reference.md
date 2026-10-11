@@ -167,6 +167,8 @@ lv run --name <vm> --image <img> [flags]  # Create and start a VM
   --cpu <n>             # vCPUs (default 2)
   --cpu-mode <mode>     # host-passthrough|host-model|custom (default host-model)
   --cpu-model <model>   # CPU model for --cpu-mode custom, e.g. x86-64-v3
+  --cpu-limit <cores>   # cap total CPU at this many host cores (fractions ok, at most --cpu)
+  --cpu-shares <n>      # CPU weight under contention, 1-10000, default 100 (cgroup v2 cpu.weight = Proxmox cpuunits)
   --memory <mib>        # Memory in MiB (default 4096)
   --disk <size>         # Root disk size (default 20G)
   --storage <pool>      # Storage pool for the root disk (default: the host's local disks)
@@ -232,6 +234,8 @@ lv update <vm> --restart on-failure          # set/clear restart policy (live)
   [--restart-max-attempts N --restart-delay 5s --restart-window 1h]
   [--restart none]                           # clear the policy
 lv update <vm> [--onboot] [--startup-order N] [--start-delay N] [--stop-delay N]   # autostart/ordering (live)
+lv update <vm> [--cpu-limit CORES] [--cpu-shares N]   # noisy-neighbour limits (live; 0 clears the cap / restores the weight)
+lv update <vm> --nic-rate 0=12.5 [--nic-rate 1=0]     # per-NIC bandwidth cap in MB/s, NIC numbered from 0 (live; 0 clears it)
 lv update <vm> [--cpu N] [--memory N]        # resources — VM must be STOPPED
   [--cpu-mode host-passthrough|host-model|custom] [--cpu-model <model>]
   [--disable-vnc]

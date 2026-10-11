@@ -222,6 +222,8 @@ type Fake struct {
 	FailSetMemory func(name string, memMiB int) error
 	// FailSetVirtioMem injects a memory hot-add primitive failure.
 	FailSetVirtioMem    func(name string, requestedMiB int) error
+	FailSetCPUTune      func(name string, limit float64, shares int) error
+	FailSetNICRate      func(name, mac string, rateMBps float64) error
 	FailMigrateToTarget func(name, dconnuri string) error
 	// FailSetDiskIOTune injects a failure from the disk I/O throttle primitive.
 	FailSetDiskIOTune func(name, dev string) error
@@ -1412,6 +1414,7 @@ func (f *Fake) MigrateToTarget(name, dconnuri string, p libvirt.MigrateParams) e
 	// which ones (libvirt's migrate_disks; empty means every writable disk).
 	note := fmt.Sprintf("to=%s with_storage=%t disks=%s tls=%t tls_dest=%s addr=%s direct=%t",
 		dconnuri, p.WithStorage, strings.Join(p.DiskTargets, ","), p.TLS, p.TLSDestination, p.TargetAddress, p.Direct)
+	note += fmt.Sprintf(" shares_weight=%d target_cgroup=%s", p.SharesWeight, p.TargetCgroup)
 	if len(p.CDROMSources) > 0 {
 		// As libvirt would: the destination definition must still carry each
 		// CD-ROM being pointed elsewhere.
@@ -1723,6 +1726,78 @@ func (f *Fake) SetVCPUs(name string, count int) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record("set-vcpus", name, fmt.Sprintf("%d", count))
+	return nil
+}
+
+// SetCPUTune models the libvirt scheduler-parameter write: it patches the
+// persistent XML and, for a running domain with a live override, the live XML,
+// exactly as the real primitive's config-then-live apply does.
+func (f *Fake) SetCPUTune(name string, limit float64, shares int) error {
+	// Refuse what the real primitive refuses, so a caller cannot pass a value the
+	// fake accepts and libvirt would not.
+	if err := libvirt.ValidateCPUShares(shares); err != nil {
+		return err
+	}
+	if limit < 0 {
+		return fmt.Errorf("libvirtfake: negative cpu limit %v", limit)
+	}
+	if f.FailSetCPUTune != nil {
+		if err := f.FailSetCPUTune(name, limit, shares); err != nil {
+			return err
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.domains[name]; !ok {
+		return fmt.Errorf("libvirtfake: domain %q not found", name)
+	}
+	patch := func(x string) string {
+		out, err := libvirt.PatchInactiveCPUTune(x, limit, shares)
+		if err != nil {
+			return x
+		}
+		return out
+	}
+	if x, ok := f.xml[name]; ok {
+		f.xml[name] = patch(x)
+	}
+	if x, ok := f.activeXML[name]; ok {
+		f.activeXML[name] = patch(x)
+	}
+	f.record("set-cputune", name, fmt.Sprintf("limit=%g shares=%d", limit, shares))
+	return nil
+}
+
+// SetNICRate models the libvirt interface-parameter write (see SetCPUTune).
+func (f *Fake) SetNICRate(name, mac string, rateMBps float64) error {
+	if err := libvirt.ValidateNICRate(rateMBps); err != nil {
+		return err
+	}
+	if f.FailSetNICRate != nil {
+		if err := f.FailSetNICRate(name, mac, rateMBps); err != nil {
+			return err
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.domains[name]; !ok {
+		return fmt.Errorf("libvirtfake: domain %q not found", name)
+	}
+	found := false
+	if x, ok := f.xml[name]; ok {
+		if out, hit := libvirt.PatchInterfaceBandwidth(x, mac, rateMBps); hit {
+			f.xml[name], found = out, true
+		}
+	}
+	if x, ok := f.activeXML[name]; ok {
+		if out, hit := libvirt.PatchInterfaceBandwidth(x, mac, rateMBps); hit {
+			f.activeXML[name], found = out, true
+		}
+	}
+	if !found {
+		return fmt.Errorf("libvirtfake: domain %q has no interface %s", name, mac)
+	}
+	f.record("set-nic-rate", name, fmt.Sprintf("%s=%g", mac, rateMBps))
 	return nil
 }
 

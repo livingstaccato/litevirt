@@ -138,6 +138,14 @@ type LibvirtBackend interface {
 	// hotplug ceiling (live_resize).
 	SetVCPUs(name string, count int) error
 
+	// Noisy-neighbour limits, applied to the persistent config and, when the
+	// domain is running, live. SetCPUTune sets the CPU cap (cores; 0 clears it)
+	// and weight (0 leaves it); the cap is the whole domain's, so no vCPU count is
+	// involved. SetNICRate sets one NIC's bandwidth cap in MB/s
+	// (0 clears it).
+	SetCPUTune(name string, limit float64, shares int) error
+	SetNICRate(name, mac string, rateMBps float64) error
+
 	// Owner-epoch runtime marker, mirrored into domain metadata. The create path
 	// stamps it so a fresh VM is provable before CreateVM returns; internal/health
 	// converges it thereafter. Get returns (0,false,nil) for a domain carrying

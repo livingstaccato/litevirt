@@ -170,6 +170,17 @@ message VMSpec {
     // like usb_devices.
     int32 memory_hotplug_max_mib  = 61;
     int32 memory_hotplug_base_mib = 62;
+
+    // cpu_limit caps the VM's total CPU time in host cores (Proxmox cpulimit):
+    // 2.5 lets the guest burn at most 2.5 cores however many vCPUs it has.
+    // 0 = unlimited. Rendered as the libvirt <cputune> period/quota (a PER-vCPU
+    // quota, so the render divides by the vCPU count). Additive; an older peer
+    // ignores it, which only means the cap is not applied there.
+    double cpu_limit = 45;
+    // cpu_shares is the VM's relative CPU weight under contention (libvirt
+    // <cputune><shares>; 1024 is the kernel default, range 2..262144).
+    // 0 = leave at the default.
+    int32  cpu_shares = 46;
 }
 
 // USBDeviceSpec selects one host USB device for passthrough. Exactly one of
@@ -244,6 +255,9 @@ message NetworkAttachment {
     // virtio-net multiqueue: <driver name='vhost' queues='N'/>. 0 or 1 = off
     // (one queue). Only for the virtio model. Takes effect on the next define.
     int32           queues          = 12;
+    // rate_mb_sec caps this NIC's bandwidth in MB/s, both directions (Proxmox
+    // rate=). Rendered as the libvirt <bandwidth> average. 0 = unlimited.
+    double          rate_mb_sec     = 10;
 }
 
 message CloudInitSpec {

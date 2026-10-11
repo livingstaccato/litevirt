@@ -459,8 +459,18 @@ type VMSpec struct {
 	// like usb_devices.
 	MemoryHotplugMaxMib  int32 `protobuf:"varint,61,opt,name=memory_hotplug_max_mib,json=memoryHotplugMaxMib,proto3" json:"memory_hotplug_max_mib,omitempty"`
 	MemoryHotplugBaseMib int32 `protobuf:"varint,62,opt,name=memory_hotplug_base_mib,json=memoryHotplugBaseMib,proto3" json:"memory_hotplug_base_mib,omitempty"`
-	unknownFields        protoimpl.UnknownFields
-	sizeCache            protoimpl.SizeCache
+	// cpu_limit caps the VM's total CPU time in host cores (Proxmox cpulimit):
+	// 2.5 lets the guest burn at most 2.5 cores however many vCPUs it has.
+	// 0 = unlimited. Rendered as the libvirt <cputune> period/quota (a PER-vCPU
+	// quota, so the render divides by the vCPU count). Additive; an older peer
+	// ignores it, which only means the cap is not applied there.
+	CpuLimit float64 `protobuf:"fixed64,45,opt,name=cpu_limit,json=cpuLimit,proto3" json:"cpu_limit,omitempty"`
+	// cpu_shares is the VM's relative CPU weight under contention (libvirt
+	// <cputune><shares>; 1024 is the kernel default, range 2..262144).
+	// 0 = leave at the default.
+	CpuShares     int32 `protobuf:"varint,46,opt,name=cpu_shares,json=cpuShares,proto3" json:"cpu_shares,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *VMSpec) Reset() {
@@ -811,6 +821,20 @@ func (x *VMSpec) GetMemoryHotplugMaxMib() int32 {
 func (x *VMSpec) GetMemoryHotplugBaseMib() int32 {
 	if x != nil {
 		return x.MemoryHotplugBaseMib
+	}
+	return 0
+}
+
+func (x *VMSpec) GetCpuLimit() float64 {
+	if x != nil {
+		return x.CpuLimit
+	}
+	return 0
+}
+
+func (x *VMSpec) GetCpuShares() int32 {
+	if x != nil {
+		return x.CpuShares
 	}
 	return 0
 }
@@ -1182,7 +1206,10 @@ type NetworkAttachment struct {
 	SecurityGroups []string               `protobuf:"bytes,9,rep,name=security_groups,json=securityGroups,proto3" json:"security_groups,omitempty"` // SG names bound to this NIC (distributed firewall)
 	// virtio-net multiqueue: <driver name='vhost' queues='N'/>. 0 or 1 = off
 	// (one queue). Only for the virtio model. Takes effect on the next define.
-	Queues        int32 `protobuf:"varint,12,opt,name=queues,proto3" json:"queues,omitempty"`
+	Queues int32 `protobuf:"varint,12,opt,name=queues,proto3" json:"queues,omitempty"`
+	// rate_mb_sec caps this NIC's bandwidth in MB/s, both directions (Proxmox
+	// rate=). Rendered as the libvirt <bandwidth> average. 0 = unlimited.
+	RateMbSec     float64 `protobuf:"fixed64,10,opt,name=rate_mb_sec,json=rateMbSec,proto3" json:"rate_mb_sec,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1283,6 +1310,13 @@ func (x *NetworkAttachment) GetSecurityGroups() []string {
 func (x *NetworkAttachment) GetQueues() int32 {
 	if x != nil {
 		return x.Queues
+	}
+	return 0
+}
+
+func (x *NetworkAttachment) GetRateMbSec() float64 {
+	if x != nil {
+		return x.RateMbSec
 	}
 	return 0
 }
@@ -6185,7 +6219,7 @@ var File_litevirt_v1_types_proto protoreflect.FileDescriptor
 
 const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\n" +
-	"\x17litevirt/v1/types.proto\x12\vlitevirt.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1bgoogle/protobuf/empty.proto\"\xb3\x0e\n" +
+	"\x17litevirt/v1/types.proto\x12\vlitevirt.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1bgoogle/protobuf/empty.proto\"\xef\x0e\n" +
 	"\x06VMSpec\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1d\n" +
 	"\n" +
@@ -6240,7 +6274,10 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\vusb_devices\x18< \x03(\v2\x1a.litevirt.v1.USBDeviceSpecR\n" +
 	"usbDevices\x123\n" +
 	"\x16memory_hotplug_max_mib\x18= \x01(\x05R\x13memoryHotplugMaxMib\x125\n" +
-	"\x17memory_hotplug_base_mib\x18> \x01(\x05R\x14memoryHotplugBaseMib\x1a9\n" +
+	"\x17memory_hotplug_base_mib\x18> \x01(\x05R\x14memoryHotplugBaseMib\x12\x1b\n" +
+	"\tcpu_limit\x18- \x01(\x01R\bcpuLimit\x12\x1d\n" +
+	"\n" +
+	"cpu_shares\x18. \x01(\x05R\tcpuShares\x1a9\n" +
 	"\vLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b,\x10-R\fiso_identity\"v\n" +
@@ -6276,7 +6313,7 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	" \x01(\x03R\x0ftotalIopsSecMax\x12)\n" +
 	"\x11read_iops_sec_max\x18\v \x01(\x03R\x0ereadIopsSecMax\x12+\n" +
 	"\x12write_iops_sec_max\x18\f \x01(\x03R\x0fwriteIopsSecMax\x12#\n" +
-	"\rburst_seconds\x18\r \x01(\x03R\fburstSeconds\"\x87\x02\n" +
+	"\rburst_seconds\x18\r \x01(\x03R\fburstSeconds\"\xa7\x02\n" +
 	"\x11NetworkAttachment\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x14\n" +
 	"\x05model\x18\x02 \x01(\tR\x05model\x12\x0e\n" +
@@ -6287,7 +6324,9 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\x04ipv6\x18\a \x01(\tR\x04ipv6\x12!\n" +
 	"\fipv6_gateway\x18\b \x01(\tR\vipv6Gateway\x12'\n" +
 	"\x0fsecurity_groups\x18\t \x03(\tR\x0esecurityGroups\x12\x16\n" +
-	"\x06queues\x18\f \x01(\x05R\x06queues\"m\n" +
+	"\x06queues\x18\f \x01(\x05R\x06queues\x12\x1e\n" +
+	"\vrate_mb_sec\x18\n" +
+	" \x01(\x01R\trateMbSec\"m\n" +
 	"\rCloudInitSpec\x12\x1a\n" +
 	"\buserdata\x18\x01 \x01(\tR\buserdata\x12\x1a\n" +
 	"\bmetadata\x18\x02 \x01(\tR\bmetadata\x12$\n" +

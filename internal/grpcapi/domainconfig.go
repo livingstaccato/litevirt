@@ -41,6 +41,8 @@ func baseDomainConfig(spec *pb.VMSpec, disks []lv.DiskConfig, nets []lv.NetworkC
 		Networks:       nets,
 		Hostdevs:       hostdevs,
 		Boot:           spec.Boot,
+		CPULimit:       spec.CpuLimit,
+		CPUShares:      int(spec.CpuShares),
 	}
 	// Disk discard / detect_zeroes / I/O throttle and NIC queues ride in the
 	// stored spec, so every render of the domain carries them.

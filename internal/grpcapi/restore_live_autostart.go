@@ -84,6 +84,11 @@ func (s *Server) autoDefineRestoredVM(
 	if ioR.stripped {
 		_ = send(&pb.RestoreLiveProgress{Status: "the backup's disk/NIC tuning is not applied: " + ioR.why()})
 	}
+	// A limit in the spec — an operator's --spec or one embedded in a backup,
+	// possibly from a cluster that has latched — is judged as a create's is.
+	if err := s.checkCopiedSpecLimits(ctx, spec); err != nil {
+		return "", "", err
+	}
 
 	originalName := spec.Name
 	targetName := req.NewName
@@ -269,7 +274,7 @@ func (s *Server) autoDefineRestoredVM(
 			return "", "", status.Errorf(codes.FailedPrecondition,
 				"network bridge %q not available on host %s: %v", bridge, s.hostName, err)
 		}
-		netCfg = append(netCfg, lv.NetworkConfig{Bridge: bridge, Model: n.Model, MAC: mac})
+		netCfg = append(netCfg, lv.NetworkConfig{Bridge: bridge, Model: n.Model, MAC: mac, RateMBps: n.RateMbSec})
 		// The groups go on the legacy row as well as the vm_nics one: a peer on
 		// an older build renders this NIC's chain from vm_interfaces alone.
 		ifaceRecords = append(ifaceRecords, corrosion.InterfaceRecord{
@@ -306,6 +311,8 @@ func (s *Server) autoDefineRestoredVM(
 		// Memory hot-add, only as admitted above (admitRestoredUSBAndHotplug).
 		HotplugBaseMiB: int(spec.MemoryHotplugBaseMib),
 		HotplugMaxMiB:  int(spec.MemoryHotplugMaxMib),
+		CPULimit:       spec.CpuLimit,
+		CPUShares:      int(spec.CpuShares),
 	}
 	compose.ApplyDiskTuning(vmCfg.Disks, spec)
 	compose.ApplyNICTuningByPosition(vmCfg.Networks, spec)
@@ -324,6 +331,11 @@ func (s *Server) autoDefineRestoredVM(
 		Phase: pb.RestoreLiveProgress_DEFINING, VmName: targetName,
 		TargetPath: overlayPath, Status: "defining domain against overlay",
 	})
+	// The release gate for the limits this restore carries, immediately before
+	// the domain that holds them is defined.
+	if err := s.recordLimitedSpec(ctx, spec); err != nil {
+		return "", "", err
+	}
 	if err := s.virt.DefineDomain(domXML); err != nil {
 		return "", "", status.Errorf(codes.Internal, "define domain: %v", err)
 	}

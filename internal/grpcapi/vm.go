@@ -119,6 +119,12 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	if err := s.refuseUnlatchedDiskNICIO(ctx, spec); err != nil {
 		return nil, err
 	}
+	// A limit is refused early on a local read of the release latch, after the
+	// caller is known to be allowed and the spec valid; the use is recorded only
+	// where it is first written, just before the domain is defined.
+	if err := s.precheckLimitedSpec(ctx, spec); err != nil {
+		return nil, err
+	}
 
 	// Idempotency: a lost-response retry carrying the same key replays the original
 	// result instead of creating a second VM. The check runs before the forward
@@ -746,9 +752,10 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		// Direct (macvtap) networks return "direct:<iface>" from provisioning.
 		if strings.HasPrefix(bridge, "direct:") {
 			netConfigs = append(netConfigs, lv.NetworkConfig{
-				Direct: strings.TrimPrefix(bridge, "direct:"),
-				Model:  n.Model,
-				MAC:    mac,
+				Direct:   strings.TrimPrefix(bridge, "direct:"),
+				Model:    n.Model,
+				MAC:      mac,
+				RateMBps: n.RateMbSec,
 			})
 		} else {
 			// Bridge preflight: ensure the bridge exists on this host.
@@ -759,10 +766,11 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 					"network bridge %q not found on host %s and auto-create failed: %v", bridge, s.hostName, err)
 			}
 			netConfigs = append(netConfigs, lv.NetworkConfig{
-				Bridge: bridge,
-				Model:  n.Model,
-				MAC:    mac,
-				VLAN:   vlan,
+				Bridge:   bridge,
+				Model:    n.Model,
+				MAC:      mac,
+				VLAN:     vlan,
+				RateMBps: n.RateMbSec,
 			})
 		}
 
@@ -1036,10 +1044,6 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// hazard (two operators creating the SAME name on both sides) is an operator error
 	// caught by the vms PK + owner-assert on heal, not something a quorum gate closes.
 
-	// pre_start hook — fires before the domain is started for the first time.
-	stubVM := &pb.VM{Name: spec.Name, HostName: s.hostName, State: pb.VMState_VM_STARTING}
-	hooks.Run(ctx, hooks.PreStart, stubVM, spec.Hooks)
-
 	// The ISO was judged before admission; an image pull can run in between,
 	// and qemu opens it at this boot, so it is judged again now.
 	if again, err := s.resolveVMISO(ctx, project, spec); err != nil || again != isoPath {
@@ -1050,6 +1054,20 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		}
 		return nil, err
 	}
+
+	// The release gate for a limit, on the node that writes it, immediately
+	// before the domain carrying it is defined.
+	if err := s.recordLimitedSpec(ctx, spec); err != nil {
+		claims.releaseAll(ctx)
+		cleanupDisks()
+		return nil, err
+	}
+
+	// pre_start hook — fires before the domain is started for the first time,
+	// after the release gate, so a refused create runs no hook for a VM that is
+	// never defined.
+	stubVM := &pb.VM{Name: spec.Name, HostName: s.hostName, State: pb.VMState_VM_STARTING}
+	hooks.Run(ctx, hooks.PreStart, stubVM, spec.Hooks)
 
 	// Define and start in libvirt
 	if err := s.virt.DefineDomain(domXML); err != nil {
@@ -4218,7 +4236,8 @@ func isPureCPUGrowRequest(req *pb.UpdateVMRequest) bool {
 		req.SecureBoot == nil && req.Tpm == nil && req.MaxCpu == nil &&
 		req.Restart == nil && req.Onboot == nil && req.StartupOrder == nil &&
 		req.StartDelaySec == nil && req.StopDelaySec == nil && !req.DisableVnc &&
-		!req.SetUsbDevices && req.MemoryHotplugMaxMib == nil && !requestsHardwareTuning(req)
+		!req.SetUsbDevices && req.MemoryHotplugMaxMib == nil && !requestsHardwareTuning(req) &&
+		!limitsRequested(req)
 }
 
 // isPureMemoryRequest reports whether req changes nothing but memory — the
@@ -4231,7 +4250,8 @@ func isPureMemoryRequest(req *pb.UpdateVMRequest) bool {
 		req.SecureBoot == nil && req.Tpm == nil && req.MaxCpu == nil &&
 		req.Restart == nil && req.Onboot == nil && req.StartupOrder == nil &&
 		req.StartDelaySec == nil && req.StopDelaySec == nil && !req.DisableVnc &&
-		!req.SetUsbDevices && req.MemoryHotplugMaxMib == nil && !requestsHardwareTuning(req)
+		!req.SetUsbDevices && req.MemoryHotplugMaxMib == nil && !requestsHardwareTuning(req) &&
+		!limitsRequested(req)
 }
 
 // liveGrowVCPU hot-adds vCPUs to a RUNNING VM in place (no stop). It is the pure
@@ -4243,6 +4263,32 @@ func (s *Server) liveGrowVCPU(ctx context.Context, req *pb.UpdateVMRequest) (*pb
 		return nil, err
 	}
 	return s.vmToProto(ctx, req.Name)
+}
+
+// applyLiveMetadataFields folds an update's live-metadata fields (restart policy,
+// onboot, start/stop ordering) onto spec. A nil restart means "unchanged";
+// restart.condition "none" or "" CLEARS the policy. Run on the spec read before
+// the VM lock and again on the spec read under it.
+func applyLiveMetadataFields(spec *pb.VMSpec, req *pb.UpdateVMRequest) {
+	if req.Restart != nil {
+		if c := req.Restart.Condition; c == "" || c == "none" {
+			spec.Restart = nil
+		} else {
+			spec.Restart = req.Restart
+		}
+	}
+	if req.Onboot != nil {
+		spec.Onboot = *req.Onboot
+	}
+	if req.StartupOrder != nil {
+		spec.StartupOrder = *req.StartupOrder
+	}
+	if req.StartDelaySec != nil {
+		spec.StartDelaySec = *req.StartDelaySec
+	}
+	if req.StopDelaySec != nil {
+		spec.StopDelaySec = *req.StopDelaySec
+	}
 }
 
 func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM, error) {
@@ -4278,6 +4324,15 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		if err := s.ioFeatureGate(ctx); err != nil {
 			return nil, err
 		}
+	}
+	// A limit-bearing update is refused up front, on whichever node it reaches,
+	// when the release token has not latched: the entry node (an owner on an
+	// older build would ignore a limit and answer success; an older owner means
+	// the token has not latched) and the owner alike, before any lock is taken
+	// or any guest stopped. The latch is driven and checked without recording or
+	// granting anything; the owner runs the full gate when it writes.
+	if err := s.precheckLimitUpdate(ctx, req); err != nil {
+		return nil, err
 	}
 	// Forward to the owning host first — it has authoritative state.
 	if vm.HostName != s.hostName {
@@ -4322,24 +4377,17 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	// reconciler/vmcheck read these fresh from the spec each sweep, so no redefine
 	// is needed. A nil restart means "unchanged"; restart.condition=="none"|""
 	// CLEARS the policy. The optional scalars are nil when unchanged.
-	if req.Restart != nil {
-		if c := req.Restart.Condition; c == "" || c == "none" {
-			spec.Restart = nil
-		} else {
-			spec.Restart = req.Restart
-		}
-	}
-	if req.Onboot != nil {
-		spec.Onboot = *req.Onboot
-	}
-	if req.StartupOrder != nil {
-		spec.StartupOrder = *req.StartupOrder
-	}
-	if req.StartDelaySec != nil {
-		spec.StartDelaySec = *req.StartDelaySec
-	}
-	if req.StopDelaySec != nil {
-		spec.StopDelaySec = *req.StopDelaySec
+	applyLiveMetadataFields(spec, req)
+
+	// Noisy-neighbour limits (cpu cap/weight, per-NIC rate). Validated against
+	// the VM's final vCPU count and folded into spec here; whether they are
+	// applied live or baked into a redefine is decided below. A vCPU change
+	// with a limit already set is validated too (see mergeLimitUpdate).
+	limitsReq := limitsRequested(req)
+	var limitsUp limitsUpdate
+	var limitsErr error
+	if limitsReq || (req.Cpu > 0 && spec.CpuLimit > 0) {
+		limitsUp, limitsErr = mergeLimitUpdate(spec, req)
 	}
 
 	// This node writes the tuning, so the feature's gate runs here (the entry
@@ -4404,6 +4452,12 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	//
 	// max_cpu changes the vCPU-topology XML (<vcpu current=…>), which the value-only
 	// inactive-XML patch doesn't handle, so exclude it from the fast path.
+	// A limits-only update is judged again, on the spec read under the VM lock
+	// (below), so a refusal here is only final when a redefine is in play or
+	// no limit was named.
+	if limitsErr != nil && (redefine || !limitsReq) {
+		return nil, limitsErr
+	}
 	inPlaceEligible := redefine &&
 		req.Machine == "" && req.Firmware == "" &&
 		req.GuestAgent == nil && req.SecureBoot == nil && req.Tpm == nil &&
@@ -4412,9 +4466,17 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		// the virtio-mem device) are not what the value-only patch edits.
 		!req.SetUsbDevices && req.MemoryHotplugMaxMib == nil && spec.MemoryHotplugMaxMib == 0 &&
 		!req.RedefineHardware
+	limitsRecorded := false // the release gate already ran (before a stop)
 	restartAfter := false
 	repair := false // a VM in error or mid-transition, redefined and started (see below)
 	if redefine {
+		// Every refusal that is a pure function of the request, the stored spec
+		// and local files, in one pass BEFORE the release gate records anything
+		// and before any stop: a doomed request must not stop a guest or leave
+		// a first-use record behind.
+		if err := s.validateRedefineRequest(ctx, spec, req); err != nil {
+			return nil, err
+		}
 		if vm.State != "stopped" {
 			// UpdateVM NEVER restarts implicitly. A redefine-class change on a running
 			// VM is refused unless --restart-if-needed (allow_restart), which does a
@@ -4537,6 +4599,14 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 				defer lease.release(ctx)
 				updLease = lease
 			}
+
+			// The release gate, now that the cheap refusals above are behind us
+			// and before the guest is touched: a first-use acknowledgement wait
+			// must never keep a stopped guest down, and a refusal never stops it.
+			if err := s.recordLimitUpdate(ctx, req); err != nil {
+				return nil, err
+			}
+			limitsRecorded = true
 
 			if repair {
 				// A VM left in error or mid-transition (a create, start or
@@ -4696,6 +4766,14 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 			spec.Uuid = uuid.NewString()
 		}
 		spec.DisableVnc = req.DisableVnc
+		// Limits baked into the redefine on a VM that was already stopped: the
+		// release gate, on the owner, after every refusal above and before
+		// anything is written. (A running VM recorded before its stop.)
+		if !limitsRecorded {
+			if err := s.recordLimitUpdate(ctx, req); err != nil {
+				return nil, err
+			}
+		}
 	}
 
 	// Re-serialize spec.
@@ -4706,13 +4784,80 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	// respects the mutation barrier AND touches only the spec, never cpu_actual/
 	// mem_actual (a running VM's live actuals must survive a metadata edit).
 	if !redefine {
-		applied, _, err := corrosion.MutateDesiredSpec(ctx, s.db, req.Name, func(string) (string, error) {
-			return string(specJSON), nil
-		})
+		limitsApplied := false
+		persistSpec := func(string) (string, error) { return string(specJSON), nil }
+		if limitsReq {
+			// Applied to the domain BEFORE the spec is written, under the VM
+			// lock: a domain the spec does not yet describe is reconciled by
+			// the persist below, while a spec the domain does not follow would
+			// be a promise nothing keeps.
+			if h := s.limitsPreLockHook; h != nil {
+				h(req.Name)
+			}
+			unlock := s.lockVM(req.Name)
+			defer unlock()
+			fresh, gerr := corrosion.GetVM(ctx, s.db, req.Name)
+			if gerr != nil || fresh == nil {
+				return nil, status.Errorf(codes.NotFound, "VM %q not found", req.Name)
+			}
+			if fresh.HostName != s.hostName {
+				return nil, status.Errorf(codes.Aborted, "ownership of %q moved to %s mid-operation; retry", req.Name, fresh.HostName)
+			}
+			if fresh.ActiveOperationID != "" {
+				return nil, status.Errorf(codes.FailedPrecondition, "cannot update limits of %q: an operation is in progress", req.Name)
+			}
+			// Work from what the lock protects. The spec read before it may
+			// predate a change that completed while this waited (a live vCPU
+			// grow commits cpu and its actuals); validating and writing the old
+			// one would undo it.
+			cur := &pb.VMSpec{}
+			if fresh.Spec != "" {
+				if uerr := json.Unmarshal([]byte(fresh.Spec), cur); uerr != nil {
+					return nil, status.Errorf(codes.Internal, "parse stored spec: %v", uerr)
+				}
+			}
+			applyLiveMetadataFields(cur, req)
+			fup, lerr := mergeLimitUpdate(cur, req)
+			if lerr != nil {
+				return nil, lerr
+			}
+			limitsUp, spec = fup, cur
+			// The persisted spec is the request merged onto whatever is stored
+			// when the write lands, not a blob computed from an earlier read.
+			persistSpec = func(old string) (string, error) {
+				o := &pb.VMSpec{}
+				if old != "" {
+					if uerr := json.Unmarshal([]byte(old), o); uerr != nil {
+						return "", uerr
+					}
+				}
+				applyLiveMetadataFields(o, req)
+				limitsUp.applyTo(o)
+				b, merr := json.Marshal(o)
+				return string(b), merr
+			}
+			// The release gate, on the owner, under the lock, after the request
+			// validated against the spec read here and before the first write.
+			if gerr := s.recordLimitUpdate(ctx, req); gerr != nil {
+				return nil, gerr
+			}
+			if aerr := s.applyLimitsToDomain(ctx, req.Name, spec, limitsUp); aerr != nil {
+				s.revertLimits(ctx, req.Name, spec, limitsUp)
+				return nil, aerr
+			}
+			limitsApplied = true
+		}
+		applied, _, err := corrosion.MutateDesiredSpec(ctx, s.db, req.Name, persistSpec)
 		if err != nil {
+			if limitsApplied {
+				s.revertLimits(ctx, req.Name, spec, limitsUp)
+			}
 			return nil, status.Errorf(codes.Internal, "update VM spec: %v", err)
 		}
 		if !applied {
+			if limitsApplied {
+				s.revertLimits(ctx, req.Name, spec, limitsUp)
+			}
 			return nil, status.Errorf(codes.FailedPrecondition,
 				"cannot update VM %q: an operation is in progress", req.Name)
 		}
@@ -4805,12 +4950,14 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	var netConfigs []lv.NetworkConfig
 	for _, iface := range ifaces {
 		bridge := resolveBridge(ctx, s.db, iface.NetworkName)
+		rate := compose.NICRate(spec, iface.Ordinal, iface.NetworkName)
 		if strings.HasPrefix(bridge, "direct:") {
 			netConfigs = append(netConfigs, lv.NetworkConfig{
 				Direct:      strings.TrimPrefix(bridge, "direct:"),
 				Model:       "virtio",
 				MAC:         iface.MAC,
 				SpecOrdinal: iface.Ordinal + 1,
+				RateMBps:    rate,
 			})
 			continue
 		}
@@ -4819,6 +4966,7 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 			Model:       "virtio",
 			MAC:         iface.MAC,
 			SpecOrdinal: iface.Ordinal + 1,
+			RateMBps:    rate,
 		})
 	}
 
@@ -4851,6 +4999,21 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 				// keeps the call-site intent obvious.
 				if req.CpuMode != "" || req.CpuModel != "" {
 					patched, perr = lv.PatchInactiveCPUMode(patched, spec.CpuMode, spec.CpuModel)
+				}
+				// A changed cap or weight is rewritten in place rather than forcing
+				// the regeneration this path exists to avoid. The cap is the
+				// domain's, so a vCPU count change alone moves nothing here.
+				if perr == nil && limitsUp.cpu {
+					patched, perr = lv.PatchInactiveCPUTune(patched, spec.CpuLimit, int(spec.CpuShares))
+				}
+				if perr == nil {
+					for _, o := range limitsUp.nicOrdinals {
+						for _, iface := range ifaces {
+							if iface.Ordinal == o {
+								patched, _ = lv.PatchInterfaceBandwidth(patched, iface.MAC, spec.Network[o].RateMbSec)
+							}
+						}
+					}
 				}
 			}
 			if perr == nil && (len(req.DiskTuning) > 0 || len(req.NicQueues) > 0) {
@@ -5057,6 +5220,40 @@ func (s *Server) verifyImageBasesForStart(ctx context.Context, vm *corrosion.VMR
 		if err := s.images.AssertBase(b); err != nil {
 			slog.Error("start refused: the disk's image-store base names a file outside the store", "vm", vm.Name, "disk", d.DiskName, "base", b, "error", err)
 			return status.Errorf(codes.FailedPrecondition, "disk %q of %q is built on image %s, which the host will not open: %v", d.DiskName, vm.Name, filepath.Base(b), err)
+		}
+	}
+	return nil
+}
+
+// validateRedefineRequest runs the spec-only refusals of a redefine-class
+// UpdateVM against spec (the stored spec, not yet modified by req).
+func (s *Server) validateRedefineRequest(ctx context.Context, spec *pb.VMSpec, req *pb.UpdateVMRequest) error {
+	if _, _, cerr := mergeCPUModeUpdate(spec.CpuMode, spec.CpuModel, req.CpuMode, req.CpuModel); cerr != nil {
+		return status.Errorf(codes.InvalidArgument, "%v", cerr)
+	}
+	if req.MaxCpu != nil {
+		if !s.liveResizeActive(ctx) {
+			return status.Errorf(codes.FailedPrecondition,
+				"cannot set max_cpu for %q: live resize is not enabled and latched cluster-wide", req.Name)
+		}
+		effectiveCPU := spec.Cpu
+		if req.Cpu > 0 {
+			effectiveCPU = req.Cpu
+		}
+		if *req.MaxCpu != 0 && *req.MaxCpu < effectiveCPU {
+			return status.Errorf(codes.InvalidArgument, "max_cpu (%d) must be >= cpu (%d)", *req.MaxCpu, effectiveCPU)
+		}
+	}
+	if req.SecureBoot != nil && *req.SecureBoot != spec.SecureBoot {
+		if !req.Force && (lv.HasNvram(s.dataDir, spec.Name) || lv.HasTPMState(spec.Uuid)) {
+			return status.Errorf(codes.FailedPrecondition,
+				"changing secure_boot on %q with existing firmware state may render it unbootable; pass --force to override", req.Name)
+		}
+	}
+	if req.Tpm != nil && *req.Tpm != spec.Tpm {
+		if !req.Force && lv.HasTPMState(spec.Uuid) {
+			return status.Errorf(codes.FailedPrecondition,
+				"changing tpm on %q with existing TPM state may orphan BitLocker; pass --force to override", req.Name)
 		}
 	}
 	return nil

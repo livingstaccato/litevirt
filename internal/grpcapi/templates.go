@@ -237,6 +237,10 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 	if src.Spec != "" {
 		_ = json.Unmarshal([]byte(src.Spec), &srcSpec)
 	}
+	// The clone carries the source's limits; judge them as a create's are.
+	if err := s.checkCopiedSpecLimits(ctx, &srcSpec); err != nil {
+		return nil, err
+	}
 
 	// A clone does not claim. It rebuilds the source's NIC list with fresh MACs
 	// and persists it directly, so on a NetBox-bound network it would either
@@ -416,13 +420,13 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 			ip = req.Ip // optional static IP for the first NIC
 		}
 		if strings.HasPrefix(bridge, "direct:") {
-			netConfigs = append(netConfigs, lv.NetworkConfig{Direct: strings.TrimPrefix(bridge, "direct:"), Model: n.Model, MAC: mac})
+			netConfigs = append(netConfigs, lv.NetworkConfig{Direct: strings.TrimPrefix(bridge, "direct:"), Model: n.Model, MAC: mac, RateMBps: n.RateMbSec})
 		} else {
 			if e := s.ensureBridge(bridge); e != nil {
 				cleanup()
 				return nil, status.Errorf(codes.FailedPrecondition, "bridge %q unavailable: %v", bridge, e)
 			}
-			netConfigs = append(netConfigs, lv.NetworkConfig{Bridge: bridge, Model: n.Model, MAC: mac})
+			netConfigs = append(netConfigs, lv.NetworkConfig{Bridge: bridge, Model: n.Model, MAC: mac, RateMBps: n.RateMbSec})
 		}
 		// The groups go on the legacy row as well as the vm_nics one: a peer on
 		// an older build renders this NIC's chain from vm_interfaces alone.
@@ -514,6 +518,7 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 		Disks: diskConfigs, Networks: netConfigs, CloudInitISO: cloudInitISO, Boot: srcSpec.Boot,
 		// Memory hot-add carried: the clone's spec copies the band.
 		HotplugBaseMiB: int(srcSpec.MemoryHotplugBaseMib), HotplugMaxMiB: int(srcSpec.MemoryHotplugMaxMib),
+		CPULimit: srcSpec.CpuLimit, CPUShares: int(srcSpec.CpuShares),
 	}
 	// Thread Secure Boot + vTPM (fresh vTPM at the new UUID; fresh NVRAM from
 	// template) into the clone domain (G1).
@@ -525,6 +530,12 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 	if err != nil {
 		cleanup()
 		return nil, status.Errorf(codes.Internal, "generate domain XML: %v", err)
+	}
+	// The release gate for the limits the clone carries, immediately before
+	// the domain that holds them is defined.
+	if err := s.recordLimitedSpec(ctx, &srcSpec); err != nil {
+		cleanup()
+		return nil, err
 	}
 	if err := s.virt.DefineDomain(domXML); err != nil {
 		cleanup()

@@ -588,6 +588,9 @@ func (s *Server) RestoreBackupFiles(req *pb.RestoreBackupFilesRequest, stream gr
 	defer cancel()
 	stop := context.AfterFunc(ectx, conn.Close)
 	defer stop()
+	// A cut credential (lv user disable, a revoked token) ends the restore VM's
+	// connection at the cut, before the stream's grace (stream_watch.go m-2).
+	registerStreamCloser(ctx, conn.Close)
 	w := &chunkWriter{send: stream.Send, buf: make([]byte, 0, restoreFilesFrame)}
 	st, err = conn.Tar(w, req.Paths, lim)
 	if err != nil && !errors.Is(err, filerestore.ErrLimit) {

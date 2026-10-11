@@ -416,6 +416,8 @@ var streamHandlerAudit = map[string]string{
 		"the follow loop also checks its context",
 	"/litevirt.v1.LiteVirt/StreamEvents":       "holds an event-bus subscription only; its loop selects on the context",
 	"/litevirt.v1.LiteVirt/ListRecoveryClaims": "a bounded read; holds no device",
+	"/litevirt.v1.LiteVirt/RestoreBackupFiles": "holds a restore VM's connection for the extraction: closer registered " +
+		"(conn.Close), and the extraction's context closes it too (context.AfterFunc)",
 
 	// Operations that run to completion or observe their context: they hold
 	// no device on the caller's behalf, and their progress Sends are refused

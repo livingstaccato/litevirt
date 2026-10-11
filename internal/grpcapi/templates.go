@@ -135,6 +135,11 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 		return nil, status.Errorf(codes.Internal, "libvirt not connected on host %s", s.hostName)
 	}
 
+	// A point-in-time overlay an earlier copy left holds writes the source's
+	// disk lacks: settle it before the clone reads or backs on the disk.
+	if err := s.settlePITOverlays(ctx, src); err != nil {
+		return nil, err
+	}
 	srcDisks, err := corrosion.GetVMDisks(ctx, s.db, req.Source)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "load source disks: %v", err)

@@ -23,6 +23,8 @@ import (
 	"github.com/litevirt/litevirt/internal/image"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/network"
+	"github.com/litevirt/litevirt/internal/pitoverlay"
+	"github.com/litevirt/litevirt/internal/randid"
 )
 
 const reconcileInterval = 15 * time.Second
@@ -108,7 +110,12 @@ type Reconciler struct {
 	// settleVerify / settleProofs are Layer 3 of partition pause (settle.go):
 	// the certificate check and the proof source. nil verifier settles nothing.
 	settleVerify SettleVerifier
-	settleProofs func(ctx context.Context, c *corrosion.Client, kind, name string) ([]corrosion.ProofRecord, error)
+	pitReport    func(ctx context.Context, vm, disk, detail string)
+	pitCleared   func(ctx context.Context, vm, disk string)
+	// pitHeldReported: the holds already reported when no reporter is wired
+	// (reportPITHeld).
+	pitHeldReported sync.Map
+	settleProofs    func(ctx context.Context, c *corrosion.Client, kind, name string) ([]corrosion.ProofRecord, error)
 	// settleDeclines rate-limits the decline report (settle_declined.go).
 	settleDeclines   settleDeclineTracker
 	onVMStarted      func(ctx context.Context, stackName string)       // optional: called after VM starts (LB refresh)
@@ -1652,6 +1659,14 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		}
 	}
 
+	// After the start checkpoint (a host that abandoned the proof has
+	// returned above): settle any point-in-time overlay into the disk before
+	// the domain is defined on it.
+	if failure := r.settlePITOverlays(ctx, vm, spec, diskConfigs); failure != "" {
+		r.failPendingStart(ctx, vm.Name, proofID, true, failure)
+		return
+	}
+
 	// Define and start the domain.
 	if err := r.virt.DefineDomain(domXML); err != nil {
 		slog.Error("reconciler: define domain", "vm", vm.Name, "error", err)
@@ -1732,6 +1747,72 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	if r.onVMStarted != nil && vm.StackName != "" {
 		go r.onVMStarted(context.Background(), vm.StackName)
 	}
+}
+
+// SetPITOverlayReporter wires the report of a VM the define path holds on an
+// overlay it cannot verify, and of a disk whose hold has cleared
+// (grpcapi.Server.ReportPITOverlayHeld and ClearPITOverlayHold: a durable,
+// per-disk health condition, notified once and then at most daily).
+func (r *Reconciler) SetPITOverlayReporter(held func(ctx context.Context, vm, disk, detail string), cleared func(ctx context.Context, vm, disk string)) {
+	r.pitReport, r.pitCleared = held, cleared
+}
+
+// settlePITOverlays settles each disk's point-in-time copy overlay
+// (pitoverlay) before the domain is defined on the disk: a copy whose commit
+// failed, or whose host died mid-window, left the guest's newest writes in it
+// — on a shared pool it travels here with the disk — and the definition names
+// only the disk. An overlay bound to this VM's disk as the file is now is
+// committed offline (no -U: a qemu still holding it fails this closed); one
+// already merged is removed. Any other cannot be verified, so the VM is
+// HELD: not defined or started on the bare disk, which would drop the
+// overlay's writes; the hold says what an admin should do for its verdict
+// (lv resolve-pit-overlay). Nothing replicated records an overlay; its fixed
+// name beside the disk is what finds it. A failure is the start's failure,
+// retried; a disk settled or without an overlay clears its hold.
+func (r *Reconciler) settlePITOverlays(ctx context.Context, vm corrosion.VMRecord, spec *pb.VMSpec, diskConfigs []lv.DiskConfig) string {
+	for _, dc := range diskConfigs {
+		owner := pitoverlay.Owner{VM: vm.Name, VMUUID: spec.GetUuid(), Disk: dc.Name}
+		out, err := pitoverlay.Settle(ctx, dc.Path, owner)
+		switch {
+		case out == pitoverlay.Held:
+			detail := pitoverlay.HoldDetail(vm.Name, dc.Name, dc.Path, pitoverlay.Assess(dc.Path, owner, false))
+			r.reportPITHeld(ctx, vm.Name, dc.Name, detail)
+			return detail
+		case err != nil:
+			slog.Error("reconciler: a point-in-time overlay holds writes the disk lacks and could not be committed; not defining the VM",
+				"vm", vm.Name, "disk", dc.Name, "overlay", pitoverlay.Path(dc.Path), "error", err)
+			return fmt.Sprintf("disk %s: commit its point-in-time overlay %s: %v", dc.Name, pitoverlay.Path(dc.Path), err)
+		case out == pitoverlay.Committed:
+			slog.Warn("reconciler: committed a point-in-time overlay into the disk before defining the VM",
+				"vm", vm.Name, "disk", dc.Name, "overlay", pitoverlay.Path(dc.Path))
+		}
+		// A disk this host cannot see (a shared pool not mounted here) reads
+		// as "no overlay" too: only a disk that is here clears a hold.
+		if _, serr := os.Stat(dc.Path); serr == nil && r.pitCleared != nil {
+			r.pitCleared(ctx, vm.Name, dc.Name)
+		}
+	}
+	return ""
+}
+
+// reportPITHeld reports a hold through the wired reporter, which keeps it as
+// a durable condition and decides when to notify. Without one (a bare
+// reconciler) it records the event once per (VM, disk) for as long as this
+// process runs: the start is retried every pass.
+func (r *Reconciler) reportPITHeld(ctx context.Context, vm, disk, detail string) {
+	if r.pitReport != nil {
+		r.pitReport(ctx, vm, disk, detail)
+		return
+	}
+	key := vm + "\x00" + disk
+	if _, done := r.pitHeldReported.LoadOrStore(key, true); done {
+		return
+	}
+	slog.Error("reconciler: "+detail, "vm", vm)
+	_ = corrosion.InsertVMEvent(ctx, r.db, corrosion.VMEventRecord{
+		ID: randid.New(), VMName: vm, HostName: r.hostName, Type: "disk.pit_overlay_held",
+		Result: "error", Severity: "error", Detail: detail, Username: "reconciler",
+	})
 }
 
 // domainXMLFor builds vm's domain XML on this host from its stored spec and

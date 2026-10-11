@@ -481,6 +481,15 @@ message VM {
     // and its real data is there (condition vm_disk_stranded). Each is kept
     // while the VM exists. Set by InspectVM/GetVM; not by ListVMs.
     repeated VMStrandedDisk        stranded_disks = 17;
+    // failover_held says why automatic failover is holding this VM down
+    // rather than promoting its replica (e.g. its only replica is not
+    // point-in-time), with the command that promotes it by hand. Empty when
+    // nothing is held. Set by InspectVM/GetVM.
+    string                         failover_held = 18;
+    // pit_overlay_held says why the VM is held on a point-in-time copy
+    // overlay that could not be verified against its disk, with the admin
+    // command that resolves it (lv resolve-pit-overlay). Empty otherwise.
+    string                         pit_overlay_held = 19;
 }
 
 message VMStrandedDisk {

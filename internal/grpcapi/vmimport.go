@@ -252,7 +252,8 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 		// A file already at the name is never replaced. One that something
 		// records is refused; an orphan (a crashed import's output) is moved
 		// aside and kept.
-		if err := s.clearImportDiskName(ctx, first.TargetPool, name, importID, d.Name, dst); err != nil {
+		baseAside, err := s.clearImportDiskName(ctx, first.TargetPool, name, importID, d.Name, dst)
+		if err != nil {
 			cleanupDisks()
 			return status.Error(codes.FailedPrecondition, err.Error())
 		}
@@ -269,6 +270,12 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 		}
 		writes.converting = func(n uint64) error {
 			return space.reserve(poolDir, n, "converting disk "+diskName)
+		}
+		// An overlay left beside the new disk's path (a disk once there) can
+		// never belong to the imported contents: set it aside, never commit it.
+		if err := s.setAsideStaleOverlay(ctx, name, d.Name, dst, baseAside); err != nil {
+			cleanupDisks()
+			return status.Error(codes.FailedPrecondition, err.Error())
 		}
 		if err := convertForeignDisk(ctx, d.LocalPath, d.Format, dst, importDir, importSourceLimit(d.CapacityBytes), func(pct float32) {
 			select {

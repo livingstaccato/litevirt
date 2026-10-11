@@ -52,7 +52,7 @@ func init() {
 		"AbortVMOperation",
 		// VM placement and storage movement.
 		"MigrateVM", "MoveVolume", "ReplicateVolume", "MigrateStackVolumes",
-		"CrossRegionMigrate", "PromoteReplica",
+		"CrossRegionMigrate", "PromoteReplica", "ResolvePITOverlay",
 		// VM backup, restore and snapshots.
 		"BackupVM", "RestoreVM", "RestoreLive", "BackupSnapshot", "RestoreFromBackup",
 		"CreateSnapshot", "RestoreSnapshot", "DeleteSnapshot",

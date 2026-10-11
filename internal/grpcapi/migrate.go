@@ -193,6 +193,11 @@ func (s *Server) sourceGateRefused(ctx context.Context, vm *corrosion.VMRecord, 
 // its whole step, calls this directly for its cold moves (drainColdMove), with
 // the same lock discipline.
 func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, vm *corrosion.VMRecord, send func(pb.MigratePhase, float32, float32) error, unlock func(), adopted *bool, opts ownedMigrateOpts) error {
+	// A point-in-time overlay an earlier copy left holds writes the disk's
+	// file lacks: a migration must carry them, so settle it first.
+	if err := s.settlePITOverlays(ctx, vm); err != nil {
+		return err
+	}
 	// Secure Boot / vTPM firmware-state travel (G1). A firmware VM's NVRAM + swtpm
 	// are host-local and bind BitLocker, so they need a CONSISTENT capture:
 	//   - LIVE is refused: libvirt's native swtpm/NVRAM carry is not yet validated

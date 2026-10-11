@@ -300,6 +300,7 @@ const (
 	LiteVirt_ListReplicationSchedules_FullMethodName   = "/litevirt.v1.LiteVirt/ListReplicationSchedules"
 	LiteVirt_DeleteReplicationSchedule_FullMethodName  = "/litevirt.v1.LiteVirt/DeleteReplicationSchedule"
 	LiteVirt_PromoteReplica_FullMethodName             = "/litevirt.v1.LiteVirt/PromoteReplica"
+	LiteVirt_ResolvePITOverlay_FullMethodName          = "/litevirt.v1.LiteVirt/ResolvePITOverlay"
 	LiteVirt_VerifyAuditChain_FullMethodName           = "/litevirt.v1.LiteVirt/VerifyAuditChain"
 	LiteVirt_ExportAuditChain_FullMethodName           = "/litevirt.v1.LiteVirt/ExportAuditChain"
 	LiteVirt_RetireAuditKey_FullMethodName             = "/litevirt.v1.LiteVirt/RetireAuditKey"
@@ -853,6 +854,11 @@ type LiteVirtClient interface {
 	// against an overlay backed by the chosen replica on the host that holds
 	// it, then localizes via blockpull. Disaster recovery after host loss.
 	PromoteReplica(ctx context.Context, in *PromoteReplicaRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PromoteReplicaProgress], error)
+	// ResolvePITOverlay decides, as an admin, what happens to a point-in-time
+	// copy overlay that could not be verified against its disk and holds the
+	// VM: commit it into the disk, or discard it. Without confirm it only says
+	// what it would do. Audited. lv resolve-pit-overlay.
+	ResolvePITOverlay(ctx context.Context, in *ResolvePITOverlayRequest, opts ...grpc.CallOption) (*ResolvePITOverlayResponse, error)
 	// ── tamper-evident audit log ──
 	// VerifyAuditChain walks each host's audit sub-chain (a row's
 	// prev_hash links to the previous row from the SAME host, because
@@ -4042,6 +4048,16 @@ func (c *liteVirtClient) PromoteReplica(ctx context.Context, in *PromoteReplicaR
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type LiteVirt_PromoteReplicaClient = grpc.ServerStreamingClient[PromoteReplicaProgress]
 
+func (c *liteVirtClient) ResolvePITOverlay(ctx context.Context, in *ResolvePITOverlayRequest, opts ...grpc.CallOption) (*ResolvePITOverlayResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ResolvePITOverlayResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_ResolvePITOverlay_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) VerifyAuditChain(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*VerifyAuditChainResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(VerifyAuditChainResponse)
@@ -4746,6 +4762,11 @@ type LiteVirtServer interface {
 	// against an overlay backed by the chosen replica on the host that holds
 	// it, then localizes via blockpull. Disaster recovery after host loss.
 	PromoteReplica(*PromoteReplicaRequest, grpc.ServerStreamingServer[PromoteReplicaProgress]) error
+	// ResolvePITOverlay decides, as an admin, what happens to a point-in-time
+	// copy overlay that could not be verified against its disk and holds the
+	// VM: commit it into the disk, or discard it. Without confirm it only says
+	// what it would do. Audited. lv resolve-pit-overlay.
+	ResolvePITOverlay(context.Context, *ResolvePITOverlayRequest) (*ResolvePITOverlayResponse, error)
 	// ── tamper-evident audit log ──
 	// VerifyAuditChain walks each host's audit sub-chain (a row's
 	// prev_hash links to the previous row from the SAME host, because
@@ -5677,6 +5698,9 @@ func (UnimplementedLiteVirtServer) DeleteReplicationSchedule(context.Context, *D
 }
 func (UnimplementedLiteVirtServer) PromoteReplica(*PromoteReplicaRequest, grpc.ServerStreamingServer[PromoteReplicaProgress]) error {
 	return status.Error(codes.Unimplemented, "method PromoteReplica not implemented")
+}
+func (UnimplementedLiteVirtServer) ResolvePITOverlay(context.Context, *ResolvePITOverlayRequest) (*ResolvePITOverlayResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ResolvePITOverlay not implemented")
 }
 func (UnimplementedLiteVirtServer) VerifyAuditChain(context.Context, *emptypb.Empty) (*VerifyAuditChainResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method VerifyAuditChain not implemented")
@@ -10455,6 +10479,24 @@ func _LiteVirt_PromoteReplica_Handler(srv interface{}, stream grpc.ServerStream)
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type LiteVirt_PromoteReplicaServer = grpc.ServerStreamingServer[PromoteReplicaProgress]
 
+func _LiteVirt_ResolvePITOverlay_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ResolvePITOverlayRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ResolvePITOverlay(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ResolvePITOverlay_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ResolvePITOverlay(ctx, req.(*ResolvePITOverlayRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LiteVirt_VerifyAuditChain_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(emptypb.Empty)
 	if err := dec(in); err != nil {
@@ -11723,6 +11765,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "DeleteReplicationSchedule",
 			Handler:    _LiteVirt_DeleteReplicationSchedule_Handler,
+		},
+		{
+			MethodName: "ResolvePITOverlay",
+			Handler:    _LiteVirt_ResolvePITOverlay_Handler,
 		},
 		{
 			MethodName: "VerifyAuditChain",

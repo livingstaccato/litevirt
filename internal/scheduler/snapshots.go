@@ -47,6 +47,19 @@ type ReplicationRunner interface {
 	RunReplication(ctx context.Context, sched corrosion.BackupScheduleRecord, runAt time.Time) error
 }
 
+// PointInTimeRetrier is optionally implemented by a ReplicationRunner whose
+// copies can fall short of point-in-time. A run it says is due is dispatched
+// at this tick even when the schedule's cron does not match, so a
+// not-point-in-time replica is followed by a point-in-time attempt a minute
+// later, not a full interval later.
+type PointInTimeRetrier interface {
+	// AnyPointInTimeRetryDue is the cheap check made first.
+	AnyPointInTimeRetryDue() bool
+	// PointInTimeRetryDue reports whether sched (a fan-out row's per-VM
+	// run included) is owed a retry.
+	PointInTimeRetryDue(sched corrosion.BackupScheduleRecord) bool
+}
+
 // SnapshotScheduler is a per-host minute-tick scheduler. Each daemon
 // runs its own instance; ownership is decided at tick time by reading
 // `vms.host_name`. There is no cluster-wide lease.
@@ -125,6 +138,7 @@ func (s *SnapshotScheduler) Tick(ctx context.Context) {
 			continue
 		}
 		if !cron.Matches(now) {
+			s.dispatchPointInTimeRetries(ctx, sched, now)
 			continue
 		}
 		if alreadyRanThisMinute(sched.LastRunAt, now) {
@@ -162,6 +176,58 @@ func (s *SnapshotScheduler) Tick(ctx context.Context) {
 		}
 		s.dispatch(ctx, sched, now)
 	}
+}
+
+type pitRetryCtxKey struct{}
+
+// WithPointInTimeRetry marks ctx as a point-in-time retry's: the runner makes
+// a point-in-time copy or none.
+func WithPointInTimeRetry(ctx context.Context) context.Context {
+	return context.WithValue(ctx, pitRetryCtxKey{}, true)
+}
+
+// IsPointInTimeRetry reports whether ctx is a point-in-time retry's.
+func IsPointInTimeRetry(ctx context.Context) bool {
+	v, _ := ctx.Value(pitRetryCtxKey{}).(bool)
+	return v
+}
+
+// dispatchPointInTimeRetries runs, outside its cron, each of a replication
+// schedule's per-VM runs the runner says is owed a point-in-time retry
+// (PointInTimeRetrier). A fan-out row's last_run_at is left alone: the retry
+// is one VM's run, not the row's.
+func (s *SnapshotScheduler) dispatchPointInTimeRetries(ctx context.Context, sched corrosion.BackupScheduleRecord, now time.Time) {
+	if sched.Type != "replication" || s.ReplRunner == nil {
+		return
+	}
+	r, ok := s.ReplRunner.(PointInTimeRetrier)
+	if !ok || !r.AnyPointInTimeRetryDue() {
+		return
+	}
+	ctx = WithPointInTimeRetry(ctx)
+	if fanoutVMs, isFanout := s.expandScope(ctx, sched); isFanout {
+		for _, vmName := range fanoutVMs {
+			fanout := sched
+			fanout.Origin = sched.VMName
+			fanout.VMName = vmName
+			fanout.Scope = "vm"
+			fanout.PoolName = ""
+			fanout.ProjectName = ""
+			if r.PointInTimeRetryDue(fanout) {
+				if err := s.ReplRunner.RunReplication(ctx, fanout, now); err != nil {
+					slog.Warn("snapshot scheduler: point-in-time retry failed", "vm", vmName, "repo", sched.Repo, "error", err)
+				}
+			}
+		}
+		return
+	}
+	if !r.PointInTimeRetryDue(sched) || alreadyRanThisMinute(sched.LastRunAt, now) {
+		return
+	}
+	if owner, ok := s.vmOwner(ctx, sched.VMName); !ok || owner != s.HostName {
+		return
+	}
+	s.dispatch(ctx, sched, now)
 }
 
 // expandScope resolves a fan-out schedule to the VMs on this host it should

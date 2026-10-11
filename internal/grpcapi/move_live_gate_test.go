@@ -33,6 +33,7 @@ func liveMoveServerWithVirt(t *testing.T, pivoted bool) (s *Server, f *libvirtfa
 		active = destPath
 	}
 	f.SetDiskSource("vm-live", "vda", active)
+	f.SetState("vm-live", libvirtfake.StateRunning) // the VM the store has running is running
 	s.virt = f
 	return s, f, src, destPath
 }

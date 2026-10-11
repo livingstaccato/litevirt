@@ -70,6 +70,11 @@ func (s *Server) BackupSnapshot(req *pb.BackupSnapshotRequest, stream grpc.Serve
 
 	unlock := s.lockVM(req.VmName)
 	defer unlock()
+	// A point-in-time overlay an earlier copy left holds writes the disk's
+	// file lacks: settle it before anything reads or starts the disk.
+	if err := s.settlePITOverlays(ctx, vm); err != nil {
+		return err
+	}
 
 	disk, err := pickDisk(ctx, s.db, req.VmName, req.DiskName)
 	if err != nil {

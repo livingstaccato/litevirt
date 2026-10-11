@@ -288,7 +288,7 @@ func TestReplicateCrossHost_ProvesTheReceiverBeforeCopying(t *testing.T) {
 	unreadable := &corrosion.DiskRecord{DiskName: "1", Path: filepath.Join(t.TempDir(), "missing.qcow2"), StorageType: "local"}
 	err := f.s.replicateCrossHost(ctx, corrosion.BackupScheduleRecord{
 		VMName: "web", Repo: "dr", Type: "replication", TargetPool: "dr", KeepReplicas: 1,
-	}, vm, unreadable, "old-host", "20261012-000000")
+	}, vm, unreadable, "old-host", "20261012-000000", true)
 	if err == nil || !strings.Contains(err.Error(), "records replicas") {
 		t.Errorf("replicating to an old receiver: got %v, want the receiver refused before any local copy", err)
 	}

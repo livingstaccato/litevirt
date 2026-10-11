@@ -118,7 +118,7 @@ func TestReplicateCrossHost_ToAMainBuildSendsMainsReplica(t *testing.T) {
 	disks, _ := corrosion.GetVMDisks(ctx, f.s.db, "web")
 	if err := f.s.replicateCrossHost(ctx, corrosion.BackupScheduleRecord{
 		VMName: "web", Repo: "dr", Type: "replication", TargetPool: "dr", KeepReplicas: 1,
-	}, vm, &disks[0], "old-host", "20260910-000000"); err != nil {
+	}, vm, &disks[0], "old-host", "20260910-000000", true); err != nil {
 		t.Fatalf("replicating to a main-build host: %v", err)
 	}
 	if old.uploaded == nil || old.uploaded.GetFilename() != "web-1-20260910-000000.qcow2" || old.uploaded.GetPoolName() != "dr" || old.uploadData == 0 {

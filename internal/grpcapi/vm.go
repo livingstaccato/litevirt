@@ -1449,6 +1449,11 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 	if vm.HostName != s.hostName {
 		return nil, status.Errorf(codes.Aborted, "ownership of %q moved to %s mid-operation; retry", req.Name, vm.HostName)
 	}
+	// A point-in-time overlay an earlier copy left holds writes the disk's
+	// file lacks: settle it before anything reads or starts the disk.
+	if err := s.settlePITOverlays(ctx, vm); err != nil {
+		return nil, err
+	}
 	// A VM failover moved here still stopped has its domain (re)defined by
 	// this host's reconciler under the VM's start lease. Take that lease for
 	// the start, so the start never runs into the middle of the define.
@@ -2190,6 +2195,14 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		}
 	}
 
+	// A disk the delete keeps (--keep-disks, delete_with_vm=false, or one
+	// another VM references) must not be left without a point-in-time
+	// overlay's writes: settle it first, while the domain can still be
+	// committed live. One that cannot be verified refuses the delete.
+	if err := s.settleKeptPITOverlays(ctx, vm, req.KeepDisks); err != nil {
+		return nil, err
+	}
+
 	// Stop it. Ask libvirt, not only the row: an ACTIVE domain (running, or
 	// paused — which the row does not call "running") survives the undefine
 	// below as a transient domain that keeps running, and the disks would then be
@@ -2506,6 +2519,10 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 	if h, herr := health.EvaluateVMHealth(ctx, s.db, vm); herr == nil && h.HasHealthcheck {
 		pbVM.Health, pbVM.HealthDetail = h.Verdict, h.Detail
 	}
+	// Why automatic failover is holding the VM down, if it is.
+	pbVM.FailoverHeld = s.failoverHeldReason(ctx, vm)
+	// Why the VM is held on a point-in-time overlay, if it is.
+	pbVM.PitOverlayHeld = s.pitOverlayHeldReason(ctx, vm.Name)
 
 	// Interfaces — run IP discovery fallback if IP is unknown.
 	ifaces, _ := corrosion.GetVMInterfaces(ctx, s.db, name)
@@ -4096,6 +4113,11 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 			}
 			if fresh.ActiveOperationID != "" {
 				return nil, status.Errorf(codes.FailedPrecondition, "cannot reconfigure %q: an operation is in progress", req.Name)
+			}
+			// A point-in-time overlay an earlier copy left holds writes the
+			// disk's file lacks; the redefine below would drop it.
+			if err := s.settlePITOverlays(ctx, fresh); err != nil {
+				return nil, err
 			}
 			repair = compose.IsTransientOrErrorState(fresh.State)
 

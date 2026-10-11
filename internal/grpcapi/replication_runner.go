@@ -17,6 +17,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/notify"
+	"github.com/litevirt/litevirt/internal/scheduler"
 	"github.com/litevirt/litevirt/internal/storage"
 	"github.com/litevirt/litevirt/internal/tenancy"
 )
@@ -30,15 +31,18 @@ var errCheckpointCommit = errors.New("replication checkpoint commit failed")
 
 // RunReplication is the scheduler's replication dispatch (scheduler.Replication
 // Runner). It replicates the VM's disk to the schedule's target pool, keeping
-// the newest keep_replicas point-in-time copies. Crash-consistent (no guest
-// quiesce) — same semantics as ReplicateVolume; it's a fast-recovery layer, not
-// a backup replacement.
+// the newest keep_replicas copies. A full copy is copyVMDiskConsistent's
+// (pit_copy.go), as ReplicateVolume's: point-in-time — a plain copy of a
+// shut-off disk, else a backup session, else an external snapshot (quiesced
+// when the guest agent answers) — and, only when none of those can be made,
+// main's -U copy, recorded and reported as NOT point-in-time. It's a
+// fast-recovery layer, not a backup replacement.
 //
 // Target model: an explicit target_host or a shared pool (nfs/ceph/iscsi) makes
 // the replica usable cluster-wide; for a non-shared pool a cross-host target is
 // rejected with guidance (true cross-host transport of local-only storage is a
 // planned follow-up).
-func (s *Server) RunReplication(ctx context.Context, sched corrosion.BackupScheduleRecord, runAt time.Time) error {
+func (s *Server) RunReplication(ctx context.Context, sched corrosion.BackupScheduleRecord, runAt time.Time) (err error) {
 	if sched.TargetPool == "" {
 		return fmt.Errorf("replication schedule for %q missing target_pool", sched.VMName)
 	}
@@ -100,6 +104,21 @@ func (s *Server) RunReplication(ctx context.Context, sched corrosion.BackupSched
 
 	ts := runAt.UTC().Format("20060102-150405")
 
+	// The scheduler's point-in-time retry (the last copy was qemu-img -U,
+	// pit_retry.go) makes a point-in-time copy or none: it never takes the -U
+	// copy again. Any run settles the retry owed; a cron run that again
+	// takes the -U copy owes a new one.
+	owed := s.pitRetry.take(pitRetryKey(sched))
+	defer func() {
+		// A run that failed before its copy (a peer, a pool, a session)
+		// keeps the retry owed; a point-in-time retry that could not make
+		// one does not — the cron runs next.
+		if err != nil && owed && !errors.Is(err, errNoPointInTimeCopy) && !s.pitRetry.has(pitRetryKey(sched)) {
+			s.pitRetry.set(pitRetryKey(sched))
+		}
+	}()
+	allowForceShare := !scheduler.IsPointInTimeRetry(ctx)
+
 	// Incremental path (opt-in): transfer only dirty extents into a raw replica
 	// via the libvirt backup session. Falls back to the full qcow2 copy below
 	// when the session can't open (stopped VM / old libvirt) or the transfer
@@ -123,52 +142,39 @@ func (s *Server) RunReplication(ctx context.Context, sched corrosion.BackupSched
 				slog.Error("incremental replication: chain reset write failed",
 					"vm", sched.VMName, "pool", sched.TargetPool, "error", rerr)
 			}
-			// Refuse the downgrade while the source is RUNNING. The full copy
-			// below is qemu-img convert -U reading an image the guest still has
-			// open, with no snapshot: it is smeared across the duration of the
-			// read, so it is neither point-in-time nor crash-consistent. Falling
-			// through to it means an operator who asked for the safe mechanism
-			// silently receives the unsafe one — and the replica is then
-			// promotable, so the downgrade does not surface until a failover
-			// boots a corrupt guest.
-			//
-			// Fail closed on anything that is not definitely stopped: "running"
-			// is not the only state in which qemu holds the image open, and a
-			// state this code does not recognise is not evidence of safety.
-			if !s.sourceIsShutOff(vm) {
-				slog.Error("incremental replication failed and the full-copy fallback is unsafe for a running source; producing no replica",
-					"vm", sched.VMName, "pool", sched.TargetPool, "state", vm.State, "error", err)
-				s.recordVMEvent(ctx, sched.VMName, "disk.replicated", "error",
-					fmt.Sprintf("%s: incremental failed (%v) and the full-copy fallback is not point-in-time for a %s VM", sched.TargetPool, err, vm.State))
-				s.notify(ctx, notify.Notification{
-					Kind: "replication.failed", Severity: notify.SevError, Subject: sched.VMName,
-					Detail: fmt.Sprintf("incremental replication to %s failed and was not downgraded to a full copy: %v", sched.TargetPool, err),
-				})
-				return fmt.Errorf("incremental replication of %q failed (%v) and %w", sched.VMName, err, errUnsafeFullCopyFallback)
-			}
+			// The full copy below is point-in-time for a running source too
+			// (copyVMDiskConsistent: a backup session, else an external
+			// snapshot). Only when neither can be made is it main's -U copy,
+			// and that replica is recorded and reported as not point-in-time,
+			// so the downgrade is never silent.
 			slog.Warn("incremental replication fell back to full copy",
 				"vm", sched.VMName, "pool", sched.TargetPool, "error", err)
 		}
 	}
 
 	if targetHost == s.hostName {
-		return s.replicateLocal(ctx, sched, vm, src, ts)
+		return s.replicateLocal(ctx, sched, vm, src, ts, allowForceShare)
 	}
-	return s.replicateCrossHost(ctx, sched, vm, src, targetHost, ts)
+	return s.replicateCrossHost(ctx, sched, vm, src, targetHost, ts, allowForceShare)
 }
 
 // replicateLocal writes the replica into a file-based pool on this host (the
-// shared-storage / same-host path), then prunes locally.
-func (s *Server) replicateLocal(ctx context.Context, sched corrosion.BackupScheduleRecord, vm *corrosion.VMRecord, src *corrosion.DiskRecord, ts string) error {
-	return s.replicateLocalWith(ctx, sched, vm, src, ts, func(ctx context.Context, _, dst string, emit func(*pb.MoveVolumeProgress) error) error {
-		return s.convertVMDisk(ctx, src, dst, emit)
+// shared-storage / same-host path), then prunes locally. The copy is
+// copyVMDiskConsistent's: point-in-time unless every point-in-time layer
+// failed (then, if allowForceShare, main's -U copy, marked).
+func (s *Server) replicateLocal(ctx context.Context, sched corrosion.BackupScheduleRecord, vm *corrosion.VMRecord, src *corrosion.DiskRecord, ts string, allowForceShare bool) error {
+	noop := func(*pb.MoveVolumeProgress) error { return nil }
+	return s.replicateLocalCopy(ctx, sched, vm, src, ts, func(ctx context.Context, dst string) (copyResult, error) {
+		return s.copyVMDiskConsistent(ctx, vm, src, dst, noop, allowForceShare)
 	})
 }
 
-// errUnsafeFullCopyFallback marks a refusal to replace a failed incremental
-// replication with the full copy. Declared before it is consulted so the tests
-// that pin the refusal describe a behaviour, not a missing symbol.
-var errUnsafeFullCopyFallback = errors.New("full-copy fallback is not point-in-time for a running source")
+// notPointInTimeReplica reports a replica the -U copy made and owes the run a
+// point-in-time retry at the next scheduler tick.
+func (s *Server) notPointInTimeReplica(ctx context.Context, sched corrosion.BackupScheduleRecord, vm *corrosion.VMRecord, src *corrosion.DiskRecord, what, why string) {
+	s.reportNotPointInTime(ctx, vm, src, what, why)
+	s.pitRetry.set(pitRetryKey(sched))
+}
 
 // replicaCopier copies a disk image to dst. convertQcow2 in production; the
 // parameter exists so the publication contract around it can be tested without
@@ -176,6 +182,16 @@ var errUnsafeFullCopyFallback = errors.New("full-copy fallback is not point-in-t
 type replicaCopier func(ctx context.Context, src, dst string, emit func(*pb.MoveVolumeProgress) error) error
 
 func (s *Server) replicateLocalWith(ctx context.Context, sched corrosion.BackupScheduleRecord, vm *corrosion.VMRecord, src *corrosion.DiskRecord, ts string, convert replicaCopier) error {
+	noop := func(*pb.MoveVolumeProgress) error { return nil }
+	return s.replicateLocalCopy(ctx, sched, vm, src, ts, func(ctx context.Context, dst string) (copyResult, error) {
+		return copyResult{method: copyPlain}, convert(ctx, src.Path, dst, noop)
+	})
+}
+
+// replicateLocalCopy is replicateLocal with the copy given: it writes into
+// dst and says how it did, and a copy that is not point-in-time is recorded
+// (NotPointInTime) and reported as such.
+func (s *Server) replicateLocalCopy(ctx context.Context, sched corrosion.BackupScheduleRecord, vm *corrosion.VMRecord, src *corrosion.DiskRecord, ts string, copyTo func(ctx context.Context, dst string) (copyResult, error)) error {
 	dstPool, ok := s.resolvePool(ctx, sched.TargetPool)
 	if !ok {
 		return fmt.Errorf("target pool %q not configured on host %q", sched.TargetPool, s.hostName)
@@ -206,9 +222,12 @@ func (s *Server) replicateLocalWith(ctx context.Context, sched corrosion.BackupS
 	if filepath.Join(replicaOwnerDir(dstDir, rec.Project, rec.VM), rec.File) == src.Path {
 		return fmt.Errorf("source and destination resolve to the same path")
 	}
-	noop := func(*pb.MoveVolumeProgress) error { return nil }
-	areaPath, err := publishRecordedReplica(ctx, dstDir, rec, func(tmp string) error {
-		return convert(ctx, src.Path, tmp, noop)
+	var res copyResult
+	areaPath, err := publishRecordedReplicaRec(ctx, dstDir, &rec, func(tmp string) error {
+		r, err := copyTo(ctx, tmp)
+		res = r
+		rec.NotPointInTime = err == nil && !r.method.pointInTime()
+		return err
 	})
 	if err != nil {
 		s.recordVMEvent(ctx, sched.VMName, "disk.replicated", "error", fmt.Sprintf("%s → %s: %v", src.DiskName, sched.TargetPool, err))
@@ -231,10 +250,16 @@ func (s *Server) replicateLocalWith(ctx context.Context, sched corrosion.BackupS
 	}
 	pruned += s.pruneEarlierReplicasAnywhere(ctx, sched.TargetPool, s.hostName, vm, src.DiskName, sched.KeepReplicas)
 	detail := fmt.Sprintf("%s → %s (%s)", src.DiskName, sched.TargetPool, rec.File)
+	if res.method != "" && res.method != copyPlain {
+		detail += "; " + string(res.method)
+	}
 	if pruned > 0 {
 		detail += fmt.Sprintf(", pruned %d old", pruned)
 	}
 	s.recordVMEvent(ctx, sched.VMName, "disk.replicated", "ok", detail)
+	if rec.NotPointInTime {
+		s.notPointInTimeReplica(ctx, sched, vm, src, fmt.Sprintf("replica %s in pool %s", rec.File, sched.TargetPool), res.why)
+	}
 	return nil
 }
 
@@ -242,7 +267,7 @@ func (s *Server) replicateLocalWith(ctx context.Context, sched corrosion.BackupS
 // target host's pool as a recorded replica (UploadStoragePoolContent with a
 // replica header), removes the scratch, then prunes that schedule's old
 // replicas on the peer.
-func (s *Server) replicateCrossHost(ctx context.Context, sched corrosion.BackupScheduleRecord, vm *corrosion.VMRecord, src *corrosion.DiskRecord, targetHost, ts string) error {
+func (s *Server) replicateCrossHost(ctx context.Context, sched corrosion.BackupScheduleRecord, vm *corrosion.VMRecord, src *corrosion.DiskRecord, targetHost, ts string, allowForceShare bool) error {
 	key := replicaScheduleKey(sched)
 	rec := newReplicaRecord(vm.Project, sched.VMName, src.DiskName, key, ts, "qcow2")
 	// The receiver proves it records replicas BEFORE anything is spent on
@@ -272,19 +297,27 @@ func (s *Server) replicateCrossHost(ctx context.Context, sched corrosion.BackupS
 	defer os.Remove(scratch)
 
 	noop := func(*pb.MoveVolumeProgress) error { return nil }
-	if err := s.convertVMDisk(ctx, src, scratch, noop); err != nil {
+	res, err := s.copyVMDiskConsistent(ctx, vm, src, scratch, noop, allowForceShare)
+	if err != nil {
 		s.recordVMEvent(ctx, sched.VMName, "disk.replicated", "error", fmt.Sprintf("%s → %s@%s: local copy: %v", src.DiskName, sched.TargetPool, targetHost, err))
 		return fmt.Errorf("local scratch replicate: %w", err)
 	}
+	rec.NotPointInTime = !res.method.pointInTime()
 
 	sent := rec.File
+	markKept := true
 	if legacy {
 		// A receiver on an older build: main's upload of a runner-named file
 		// to its pool's top level, which it keeps and promotes as main did.
+		// It has no record to carry the not-point-in-time mark.
 		sent = legacyReplicaName(rec.VM, rec.Disk, rec.Taken, rec.Format)
 		err = streamLegacyReplica(ctx, client, scratch, sched.TargetPool, targetHost, replicaKeyOf(vm, src.DiskName), sent)
+		markKept = !rec.NotPointInTime
 	} else {
-		err = streamReplicaToPool(ctx, client, scratch, sched.TargetPool, targetHost, rec)
+		var resp *pb.PushReplicaResponse
+		resp, err = streamReplicaToPool(ctx, client, scratch, sched.TargetPool, targetHost, rec)
+		// A receiver that records replicas but predates the mark drops it.
+		markKept = err != nil || !rec.NotPointInTime || resp.GetNotPointInTimeRecorded()
 	}
 	if err != nil {
 		s.recordVMEvent(ctx, sched.VMName, "disk.replicated", "error", fmt.Sprintf("%s → %s@%s: upload: %v", src.DiskName, sched.TargetPool, targetHost, err))
@@ -305,45 +338,54 @@ func (s *Server) replicateCrossHost(ctx context.Context, sched corrosion.BackupS
 	}
 	pruned += s.pruneEarlierReplicasAnywhere(ctx, sched.TargetPool, targetHost, vm, src.DiskName, sched.KeepReplicas)
 	detail := fmt.Sprintf("%s → %s@%s (%s)", src.DiskName, sched.TargetPool, targetHost, sent)
+	if res.method != copyPlain {
+		detail += "; " + string(res.method)
+	}
 	if pruned > 0 {
 		detail += fmt.Sprintf(", pruned %d old", pruned)
 	}
 	s.recordVMEvent(ctx, sched.VMName, "disk.replicated", "ok", detail)
+	if rec.NotPointInTime {
+		why := res.why
+		if !markKept {
+			why += fmt.Sprintf("; host %s runs an older build that cannot record the not-point-in-time mark, so its record does not carry it", targetHost)
+		}
+		s.notPointInTimeReplica(ctx, sched, vm, src, fmt.Sprintf("replica %s in pool %s on %s", sent, sched.TargetPool, targetHost), why)
+	}
 	return nil
 }
 
 // streamReplicaToPool sends a local file to a peer's pool as the recorded
 // replica rec, over the peer-only PushReplica.
-func streamReplicaToPool(ctx context.Context, client pb.LiteVirtClient, path, pool, host string, rec replicaRecord) error {
+func streamReplicaToPool(ctx context.Context, client pb.LiteVirtClient, path, pool, host string, rec replicaRecord) (*pb.PushReplicaResponse, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer f.Close()
 	up, err := client.PushReplica(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := up.Send(&pb.PushReplicaRequest{PoolName: pool, Host: host, Replica: rec.toPB()}); err != nil {
-		return err
+		return nil, err
 	}
 	buf := make([]byte, 1<<20)
 	for {
 		n, rerr := f.Read(buf)
 		if n > 0 {
 			if err := up.Send(&pb.PushReplicaRequest{Chunk: buf[:n]}); err != nil {
-				return err
+				return nil, err
 			}
 		}
 		if rerr == io.EOF {
 			break
 		}
 		if rerr != nil {
-			return rerr
+			return nil, rerr
 		}
 	}
-	_, err = up.CloseAndRecv()
-	return err
+	return up.CloseAndRecv()
 }
 
 // streamLegacyReplica sends a local file to an older build's pool as main's

@@ -22,6 +22,9 @@ import (
 // DB (no-op). Use this from event sites (backup fail, fence, replication fail,
 // quota breach).
 func (s *Server) notify(ctx context.Context, n notify.Notification) {
+	if s.notifySeen != nil {
+		s.notifySeen(n)
+	}
 	if s.db == nil {
 		return
 	}

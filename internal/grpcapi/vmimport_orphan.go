@@ -427,40 +427,41 @@ func namedForAnotherVM(vms []corrosion.VMRecord, ln, lb string) bool {
 // dead import's leftover, unchanged since (this host's, or that of a host
 // sharing the pool, asked), or it has been quiet for importOrphanMinAge. What
 // claims a file is a record (importPathReferences), never a VM's name alone.
-// Anything else refuses the import.
-func (s *Server) clearImportDiskName(ctx context.Context, pool, importName, importID, disk, dst string) error {
+// Anything else refuses the import. It returns where a file it moved aside
+// went ("" when there was none).
+func (s *Server) clearImportDiskName(ctx context.Context, pool, importName, importID, disk, dst string) (string, error) {
 	s.removeDeadPartialCopies(dst)
 	fi, err := os.Lstat(dst)
 	if errors.Is(err, fs.ErrNotExist) {
-		return nil
+		return "", nil
 	}
 	refuse := func(why string) error {
 		return fmt.Errorf("disk %q would be written to %s, which already exists in the pool and %s; "+
 			"an import never replaces a file there — import under another --name", disk, dst, why)
 	}
 	if err != nil {
-		return refuse(fmt.Sprintf("cannot be read (%v)", err))
+		return "", refuse(fmt.Sprintf("cannot be read (%v)", err))
 	}
 	refs, err := s.importPathReferences(ctx, dst, fi)
 	if err != nil {
-		return refuse(fmt.Sprintf("what records it could not be read (%v); retry", err))
+		return "", refuse(fmt.Sprintf("what records it could not be read (%v); retry", err))
 	}
 	if refs != "" {
-		return refuse("is " + refs)
+		return "", refuse("is " + refs)
 	}
 	busy, err := s.importDiskNameInFlight(ctx, importName, dst, fi)
 	if err != nil {
-		return refuse(fmt.Sprintf("what may be creating it could not be read (%v); retry", err))
+		return "", refuse(fmt.Sprintf("what may be creating it could not be read (%v); retry", err))
 	}
 	if busy != "" {
-		return refuse("may still be being created by " + busy + "; retry once it finishes")
+		return "", refuse("may still be being created by " + busy + "; retry once it finishes")
 	}
 	// A leftover of an import that is no longer running, that nothing has
 	// written since, is nobody's now, and not still being written.
 	leftover := s.importLeftover(dst, fi)
 	sibs, err := s.freshSiblings(ctx, dst, importID)
 	if err != nil {
-		return refuse(fmt.Sprintf("what is being written beside it could not be read (%v); retry", err))
+		return "", refuse(fmt.Sprintf("what is being written beside it could not be read (%v); retry", err))
 	}
 	age := orphanNow().Sub(fi.ModTime())
 	fresh := age < importOrphanMinAge
@@ -492,25 +493,25 @@ func (s *Server) clearImportDiskName(ctx context.Context, pool, importName, impo
 		notAsked = fmt.Sprintf(" (%s, sharing the pool, could not be asked whether it is their crashed import's)", strings.Join(unasked, ", "))
 	}
 	if len(sibs) > 0 {
-		return refuse(fmt.Sprintf("%s beside it was written in the last %s, so the flow writing them may still be running%s; retry once it is quiet",
+		return "", refuse(fmt.Sprintf("%s beside it was written in the last %s, so the flow writing them may still be running%s; retry once it is quiet",
 			sibs[0].name, importOrphanMinAge, notAsked))
 	}
 	// Anything else has to have gone quiet.
 	if fresh && !leftover {
-		return refuse(fmt.Sprintf("was written %s ago, so it may still be being created%s; "+
+		return "", refuse(fmt.Sprintf("was written %s ago, so it may still be being created%s; "+
 			"a leftover nothing records is moved aside once it is %s old — retry then", age.Round(time.Second), notAsked, importOrphanMinAge))
 	}
 	// Judged on fi: it must still be that file, in that state, as it moves.
 	if now, err := os.Lstat(dst); err != nil || !sameFileState(fi, now) {
-		return refuse("changed while it was being judged; retry")
+		return "", refuse("changed while it was being judged; retry")
 	}
 	aside, err := moveOrphanAside(dst)
 	if err != nil {
-		return refuse(fmt.Sprintf("could not be moved aside (%v); remove it if it is a leftover", err))
+		return "", refuse(fmt.Sprintf("could not be moved aside (%v); remove it if it is a leftover", err))
 	}
 	slog.Warn("import: moved aside a file at a converted disk's name that no disk, image or VM records and nothing is creating",
 		"host", s.hostName, "path", dst, "kept_as", aside, "modified", fi.ModTime(), "dead_import_leftover", leftover)
-	return nil
+	return aside, nil
 }
 
 // sameFileState reports whether a and b are one file in one state.

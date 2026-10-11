@@ -23,6 +23,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/libvirtfake"
 	"github.com/litevirt/litevirt/internal/qcow2"
 )
 
@@ -95,6 +96,7 @@ func TestFleet_AMainBuildCoordinatorPromotesTheNewestReplica(t *testing.T) {
 		t.Fatal(err)
 	}
 	runAt := time.Now().Add(-5 * time.Minute)
+	vmHost.Virt.SetState("web", libvirtfake.StateRunning) // running: its copy is point-in-time (layer 2)
 	if err := vmHost.Server.RunReplication(ctx, sched, runAt); err != nil {
 		t.Fatalf("replicate web to %s: %v", replicaHost.Name, err)
 	}

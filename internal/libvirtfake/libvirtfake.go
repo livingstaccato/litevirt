@@ -66,6 +66,9 @@ type Fake struct {
 	activeXML              map[string]string              // domain → live-view override (see DumpXML)
 	snapshots              map[string]map[string]struct{} // domain → snapshot names
 	diskSources            map[string]map[string]string   // domain → target-dev → source file
+	pitOn                  map[string]string              // point-in-time overlay → domain on it (pit_snapshot.go)
+	pitSnapErr             error
+	pitCommitErr           error
 	stats                  map[string]*libvirt.DomainStats
 	reasons                map[string]string // domain → injected DomainStateReason.Reason
 	managedSave            map[string]bool   // domain → has a managed-save (suspend-to-disk) image

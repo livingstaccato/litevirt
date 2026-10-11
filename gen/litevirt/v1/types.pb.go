@@ -3337,8 +3337,17 @@ type VM struct {
 	// and its real data is there (condition vm_disk_stranded). Each is kept
 	// while the VM exists. Set by InspectVM/GetVM; not by ListVMs.
 	StrandedDisks []*VMStrandedDisk `protobuf:"bytes,17,rep,name=stranded_disks,json=strandedDisks,proto3" json:"stranded_disks,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// failover_held says why automatic failover is holding this VM down
+	// rather than promoting its replica (e.g. its only replica is not
+	// point-in-time), with the command that promotes it by hand. Empty when
+	// nothing is held. Set by InspectVM/GetVM.
+	FailoverHeld string `protobuf:"bytes,18,opt,name=failover_held,json=failoverHeld,proto3" json:"failover_held,omitempty"`
+	// pit_overlay_held says why the VM is held on a point-in-time copy
+	// overlay that could not be verified against its disk, with the admin
+	// command that resolves it (lv resolve-pit-overlay). Empty otherwise.
+	PitOverlayHeld string `protobuf:"bytes,19,opt,name=pit_overlay_held,json=pitOverlayHeld,proto3" json:"pit_overlay_held,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *VM) Reset() {
@@ -3488,6 +3497,20 @@ func (x *VM) GetStrandedDisks() []*VMStrandedDisk {
 		return x.StrandedDisks
 	}
 	return nil
+}
+
+func (x *VM) GetFailoverHeld() string {
+	if x != nil {
+		return x.FailoverHeld
+	}
+	return ""
+}
+
+func (x *VM) GetPitOverlayHeld() string {
+	if x != nil {
+		return x.PitOverlayHeld
+	}
+	return ""
 }
 
 type VMStrandedDisk struct {
@@ -6096,7 +6119,7 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\anic_mac\x18\x03 \x01(\tR\x06nicMac\x12\x1f\n" +
 	"\vpci_address\x18\x04 \x01(\tR\n" +
 	"pciAddress\x12'\n" +
-	"\x0fidempotency_key\x18\x05 \x01(\tR\x0eidempotencyKey\"\xaf\x05\n" +
+	"\x0fidempotency_key\x18\x05 \x01(\tR\x0eidempotencyKey\"\xfe\x05\n" +
 	"\x02VM\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1d\n" +
 	"\n" +
@@ -6123,7 +6146,9 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"isTemplate\x12\x16\n" +
 	"\x06health\x18\x0f \x01(\tR\x06health\x12#\n" +
 	"\rhealth_detail\x18\x10 \x01(\tR\fhealthDetail\x12B\n" +
-	"\x0estranded_disks\x18\x11 \x03(\v2\x1b.litevirt.v1.VMStrandedDiskR\rstrandedDisks\"v\n" +
+	"\x0estranded_disks\x18\x11 \x03(\v2\x1b.litevirt.v1.VMStrandedDiskR\rstrandedDisks\x12#\n" +
+	"\rfailover_held\x18\x12 \x01(\tR\ffailoverHeld\x12(\n" +
+	"\x10pit_overlay_held\x18\x13 \x01(\tR\x0epitOverlayHeld\"v\n" +
 	"\x0eVMStrandedDisk\x12\x12\n" +
 	"\x04host\x18\x01 \x01(\tR\x04host\x12\x12\n" +
 	"\x04disk\x18\x02 \x01(\tR\x04disk\x12\x12\n" +

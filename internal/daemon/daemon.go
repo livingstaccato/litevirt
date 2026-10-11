@@ -1043,6 +1043,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// copy whose row a VERIFIED recovery-claim certificate gave to another
 	// host is stopped on that proof, and only on it.
 	reconciler.SetSettleVerifier(svc.VerifySettleProof)
+	reconciler.SetPITOverlayReporter(svc.ReportPITOverlayHeld, svc.ClearPITOverlayHold)
 	svc.SetLeaseTermReady(func() bool {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -1431,6 +1432,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// nil-safe: if BeginBackup fails, BackupSnapshot falls back to a full
 	// container backup.
 	svc.SetBackupSource(grpcapi.NewLibvirtBackupSource(d.virt))
+	// Point-in-time copies fall back to an external disk-only snapshot when
+	// no backup session opens (grpcapi/pit_copy.go, layer 2).
+	svc.SetPointInTimeSnapshotter(d.virt)
+	// A daemon that died while a layer-2 copy was in its window left the VM
+	// on the overlay with no event: settle every such overlay now.
+	go svc.SweepPITOverlays(ctx, svc.PITSweepReady(ctx))
 
 	// wire the WebAuthn second-factor engine. Empty
 	// rp_id disables — the gRPC handlers then return Unimplemented

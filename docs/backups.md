@@ -235,22 +235,168 @@ target pool as a timestamped, self-contained point-in-time copy, keeping the
 newest `keep_replicas`. A fast-recovery layer, not a backup replacement, so keep
 backups too.
 
-**Consistency differs between the two replication modes, and the default is the
-weaker one.** A full replica of a RUNNING VM is `qemu-img convert -U` reading
-the image the guest still has open — no snapshot is taken, so the copy is
-smeared over however long it ran. That is neither point-in-time nor
-crash-consistent, and a guest filesystem restored from it may need repair. The
-`--incremental` path opens a real point-in-time session (the same pull-mode
-machinery backups use) and IS crash-consistent. Replicating a STOPPED VM is
-consistent either way. Prefer `--incremental` for anything you intend to
-promote, or replicate on a schedule the workload can tolerate being torn.
+**How a full replica is copied.** A full (non-incremental) replica — and the
+full copy an `--incremental` run falls back to when its session fails — is made
+by the strongest method the host has, tried in this order:
 
-An `--incremental` run whose backup session fails **does not downgrade to the
-full copy while the VM is running** — the run fails and produces no replica,
-rather than silently substituting the weaker mechanism for the one you asked
-for. A stopped source still falls back, because there is nothing writing the
-image. Watch for `replication.failed` notifications: a schedule failing this
-way keeps its previous replicas and stops making new ones.
+1. **Shut-off VM:** a plain `qemu-img convert` of the disk, *without* `-U`.
+   "Shut off" is what libvirt reports, whatever state the VM's record is in (a
+   VM in `error` whose domain is down is copied this way). If a qemu does hold
+   the image, its lock fails the copy rather than letting it read a changing
+   image. A paused or pm-suspended VM is not shut off (qemu still holds its
+   image) and takes the steps below.
+2. **Backup session:** a full pull-mode backup of the running disk (the same
+   machinery backups and `--incremental` use, with no checkpoint, so no
+   incremental chain is touched). Point-in-time and crash-consistent.
+3. **External snapshot:** only on a host that holds the `pit_overlay`
+   release feature — the cluster-wide promise that every host serving the
+   pool understands the overlay this step leaves (see "Older builds" below).
+   This build does not hold it yet: it arrives with the release token, so
+   until then this step is skipped and the copy goes on to step 4, exactly as
+   before. When no session opens (an older libvirt, a failed
+   job), and only for a VM libvirt reports running or paused, an external
+   disk-only snapshot moves the guest's writes onto an overlay — quiesced
+   through the guest agent when one answers, otherwise crash-consistent — the
+   now-frozen disk file is copied, and the overlay is committed back (active
+   block-commit and pivot; a commit job already running is resumed, and a
+   pivot that keeps failing is aborted so no job is left behind). Still
+   point-in-time. The overlay is `.<disk file>.lv-pit` beside the disk, on the
+   same pool, so a failover target on shared storage sees it too. It is never
+   placed where it would not survive: a disk that is not a regular file (a
+   `/dev` block device, whose directory is devtmpfs) or a pool directory on
+   tmpfs takes the next step instead, because a reboot or a failover would
+   lose the overlay and the guest's writes in it.
+
+   **Never delete a `.lv-pit` file.** While one exists it may hold the
+   guest's newest writes. It is bound to the exact disk file it was taken of:
+   - before the snapshot, a new random token is written into an extended
+     attribute of the disk file (`user.litevirt.pit_window`) and synced. A
+     copy or restore of the file (`cp -p`, `rsync -a` without `-X`) does not
+     carry it, and a new file at the same path does not have it;
+   - a sidecar beside the overlay (`.<disk file>.lv-pit.id`) records the VM,
+     its disk, that token, and the file's inode, size and modification time —
+     not the device number, which differs between hosts mounting one NFS
+     export and can change across a remount or reboot.
+
+   On a filesystem without user extended attributes there is no token, and
+   the size and time bounds below decide alone. Local ext4, XFS, btrfs and
+   ZFS datasets, and tmpfs, have them; NFS has them only at version 4.2 (Linux
+   5.9 or later on both ends), so an export mounted at 4.1 or 3 has none. A
+   host that cannot read a token another host recorded (it mounts the export
+   at an older version) holds the VM rather than guess. zfs zvols, lvm-thin,
+   ceph and iscsi disks are block devices, which take no overlay at all.
+
+   The sidecar is written, and synced, before anything relies on it, and it
+   follows the commit: `committing` before the commit's first write to the
+   disk (every attempt rewrites it, and a long commit rewrites it every ten
+   minutes while it runs); the disk as each attempt left it, failed or not,
+   once the attempt ends; `pivoting` just before a live commit pivots the VM
+   onto the disk; and `committed` once a recorded pivot has landed. If a
+   record cannot be written, the step it records does not happen: no commit
+   starts, no pivot is made, and the window stays open, reported, and is
+   retried. All the times compared are the filesystem's own (the disk's and
+   the sidecar's modification times), so a server clock that disagrees with
+   the hosts' does not matter. If the commit fails, the VM keeps
+   running on the overlay and a `disk.pit_overlay_stranded` event and a
+   `replication.pit_overlay_stranded` notification say so.
+
+   Every later copy (replication, `lv replicate-volume`), move
+   (`lv move-volume`, live or offline), migration, backup, clone, `lv start`,
+   reconfigure, in-place restore, `lv rm` of a disk it keeps, failover restart
+   and the daemon's start-up sweep settles the overlay first. It judges it
+   against the disk as it is now — a **verdict**:
+   - **matches**: the disk is the file the overlay was taken of, unchanged.
+     It is committed (`qemu-img commit`, without `-U`, pointing the overlay at
+     the disk by its name beside it if another host took it under another
+     mount path), the persistent definition is pointed back at the disk, and
+     only then is the overlay removed. A running VM on the overlay is
+     committed live instead;
+   - **half-written**: a commit began and the disk is the file it was writing
+     — same token, no smaller and no older than when the overlay was taken,
+     and either exactly as the last attempt left it (nothing writes the disk
+     after a failed attempt, so a restore over it in place, which keeps its
+     inode and token, is caught) or, if the daemon died mid-attempt, written
+     no later than twelve minutes after the daemon last recorded the attempt.
+     The commit is finished the same way: only that makes the disk whole;
+   - **pivoted**: the overlay is already in the disk — the commit was
+     recorded, or a pivot was recorded and the VM runs on its disk, written no
+     later than twelve minutes after that record (later, something else may
+     have started the VM there: it is marked diverged and held). It is
+     removed, never committed again over the guest's newer writes;
+   - **unknown**: anything else — the overlay is another VM's or unbound; the
+     disk was replaced, restored, re-created or written since; the token is
+     missing or another; the VM was found running on its disk without the
+     overlay (it is then marked so, and never committed automatically after);
+     or a pivot was under way and, with the VM off, it cannot be told whether
+     it landed. It is never committed (that could write stale blocks over
+     newer data) and never dropped (it may hold the guest's writes): the VM is
+     **held** — not started or defined on the bare disk, and the operation
+     refused. If libvirt cannot say whether the VM runs, nothing is touched
+     and the operation is refused until it can.
+
+   A hold is a `pit_overlay.held` health condition per disk (a warning:
+   `lv health` is degraded while it stands), and `lv inspect <vm>` shows it as
+   `pitOverlayHeld`, read from that condition. A `disk.pit_overlay_held` event
+   and a `replication.pit_overlay_held` notification name both files, the
+   verdict and what to do for it — once when the hold begins, then at most
+   daily. It resolves by itself once a later settle can commit the overlay or
+   finds it merged, or when the disk is deleted.
+
+   An admin decides with `lv resolve-pit-overlay <vm> <disk>`, which is admin
+   only and audited. Without `--confirm` it does nothing, and answers even
+   while the VM runs: it prints the verdict, the disk's and the overlay's
+   identity then and now, the overlay's backing file, and what each action
+   would do. For a pivot that was under way with the VM off, it compares the
+   two files' times: a disk written after the overlay means the pivot landed
+   (discard), an overlay written last means it did not (commit). Carrying an
+   action out (`--confirm`) needs the VM stopped.
+   - `--commit --confirm` writes the overlay into the disk, through the same
+     checks as every automatic commit, and is refused unless the verdict is
+     matches or half-written. `--force-commit` overrides the verdict, for
+     experts who have checked both files: if the disk is not what the overlay
+     was taken of, it overwrites newer data with older blocks. Even forced, an
+     overlay whose backing file is another file (another name, or a file of
+     the same name in another directory of this host) is never pointed at
+     this disk. An overlay already in the disk (verdict pivoted, or a
+     committed binding) is refused even forced: committing it again writes
+     its old blocks over everything the guest wrote since. Only
+     `--overwrite-newer-writes` overrides that; `lv` prints the consequence
+     and, without the flag, asks for a typed `yes` on a terminal before it
+     sends anything.
+   - `--discard --confirm` deletes the overlay and its writes. Of a disk a
+     commit had begun writing (half-written, or unknown after a commit began)
+     it is refused unless `--accept-torn-disk` is given: without the overlay
+     that disk is inconsistent. To start over from a backup or a replica
+     instead, discard the overlay first (`--discard --accept-torn-disk`) and
+     only then restore the disk — a restore over it in place with the overlay
+     still beside it is not mistaken for the disk (the end record catches it),
+     but the VM stays held. `lv backup restore-from --in-place` does both: an
+     overlay that holds the VM is set aside (kept, as
+     `.<disk file>.lv-pit.orphan-<time>`) before the restore writes the disk.
+
+   When a disk is deleted (`lv rm`, rebuild), its overlay and sidecar are
+   deleted with it. An import that finds an overlay where its new disk goes
+   renames it `.<disk file>.lv-pit.orphan-<time>` (never over an earlier one
+   or its sidecar), says where the file it was taken of went if the import
+   moved that aside too, and reports it (`disk.pit_overlay_set_aside`);
+   inspect both, then delete them.
+   The start-up sweep waits until the host's replica is trusted (caught up
+   with a peer, or the cluster's only host), and on a shared pool touches only
+   disks of VMs this host owns and has defined (others are left to their owner
+   and reported as `disk.pit_overlay_left`).
+4. **Last resort:** when neither 2 nor 3 can be made, the copy is what earlier
+   builds always made — `qemu-img convert -U` reading the image the guest has
+   open. That copy is **not point-in-time** (it is smeared over however long it
+   ran, and a guest restored from it may need repair). It is still made, but
+   the replica's record says `not_point_in_time`, a
+   `disk.replica_not_point_in_time` event and a `replication.not_point_in_time`
+   notification name the reason, and the scheduler retries a point-in-time copy
+   at its next tick (a minute later, not a full interval). That retry makes a
+   point-in-time copy or nothing; the schedule's own next run may make another
+   `-U` copy if the cause persists.
+
+The `disk.replicated` event names the method used. zfs, ceph and btrfs pools
+replicated natively use their own snapshots and are point-in-time.
 
 A replica is also **published by rename**. The copy lands in a dotted
 temp sibling and is renamed into its final name only once it has completed
@@ -359,6 +505,7 @@ it must be one of the VM's own recorded replicas:
 lv replication promote web-1                 # take over the name (host-loss case)
 lv replication promote web-1 --new-name web-1-dr   # bring up alongside the original
 lv replication promote web-1 --no-localize   # fast: boot off an overlay (pins the replica)
+lv replication promote web-1 --accept-not-point-in-time   # a replica recorded as not point-in-time
 ```
 
 A split-brain guard refuses to take over the name while the original is on a
@@ -368,11 +515,69 @@ healthy host (`--force` overrides). The same action is on the VM detail page
 **Automatic promotion** (`--auto-promote` on the schedule): after the failover
 coordinator **confirms a fence**, it promotes the freshest replica for opted-in
 VMs onto a healthy peer (so a VM on lost local storage resumes), falling back to
-a bare reschedule on failure. Default off. Promotion uses the newest replica,
-which is lagging by up to one schedule interval and — for a full (non-
-incremental) replica of a VM that was running — is a torn copy rather than a
-crash-consistent one, as above. Enable only where a small lag window is
-acceptable, and prefer `--incremental` on any schedule with `--auto-promote`.
+a bare reschedule on failure. Default off. Promotion uses the newest
+point-in-time replica, which is lagging by up to one schedule interval. Enable
+only where a small lag window is acceptable.
+
+**Replicas that are not point-in-time** (the last-resort copy above) are the
+last choice:
+
+- Automatic promotion never uses one while any point-in-time replica of the
+  VM exists, even an older one.
+- When a VM's only replicas are not point-in-time (or its point-in-time ones
+  are all too old and a newer one is not point-in-time), automatic promotion
+  **holds the VM down** by default: the replica is left untouched, and a
+  `vm.failover.held` event and a `replication.promote_held` notification give
+  the reason and the exact command that promotes it by hand. A VM with any
+  disk that is not on shared storage is not rescheduled either — its record
+  stays on its failed host, `lv inspect <vm>` shows the hold as `failoverHeld`,
+  and the printed command works as printed. A VM whose disks are all on shared
+  storage is restarted from its own disk by its `on_host_failure` policy, as
+  before (a `vm.failover.restart_shared` event says so).
+- A VM can opt in, one VM at a time, to automatic promotion of such a replica
+  when no point-in-time one exists: give it the label
+  `litevirt.auto_promote_not_point_in_time=true` in its spec's `labels`. There is
+  no cluster-wide switch, and a build that does not know the label ignores it
+  (default off). When it fires, a `vm.promoted_not_point_in_time` event and a
+  `replication.promoted_not_point_in_time` notification say a NOT point-in-time
+  copy was promoted.
+- A manual `lv replication promote` of one is refused with a warning unless
+  `--accept-not-point-in-time` is given, whatever the label says.
+
+During a rolling upgrade, a host on an older build does not know the mark. A
+failover it coordinates promotes the newest replica as before when the replica
+is on that host or another older one; when the replica host is upgraded, that
+host refuses the marked replica and holds the VM with the same event and
+notification, but the older coordinator then falls back to its reschedule. A
+replica sent to a receiver on an older build is recorded without the mark, and
+the `disk.replica_not_point_in_time` event says so. An `lv` older than the
+daemon has no `--accept-not-point-in-time` flag: upgrade it to promote a marked
+replica by hand. A `lv replicate-volume` copy made with `-U` is recorded as not
+point-in-time too, and promoting it by name needs the same flag. On shared
+storage that copy's mark is also kept in its host's replicated pool record.
+Each host rewrites only its own records, so no peer on an older build can drop
+a mark; a host rolled back to an older build drops the marks of the copies it
+recorded (local and replicated) the next time it rewrites those records.
+
+**Older builds and `.lv-pit` overlays.** A build older than this one knows
+nothing of overlays: one that started a VM whose window was open would start
+it on the bare disk and drop the window's writes. So no overlay is made until
+every host serving the pool holds the `pit_overlay` release feature: until
+then the external-snapshot step is skipped (this build fails that gate closed
+until the release token is wired), which refuses nothing earlier builds did.
+A host below the feature — this build included, until it holds it — settles
+no overlay it finds, not even one it could verify: it holds the VM (the
+`pit_overlay.held` condition says why) rather than start it on that disk, and
+a binding written by a newer build than itself is never settled either.
+Before rolling a host back to a build OLDER than this one, settle every
+overlay on the pools it serves: `find <pool dir> -name '.*.lv-pit'` must find
+none (start or replicate each VM on an upgraded host, or resolve it with
+`lv resolve-pit-overlay`), because such a build has no hold and would start
+the VM on the bare disk. An older build shows the `pit_overlay.held`
+condition in `lv health` like any other, but never raises or resolves it, and
+an `lv` older than the daemon has none of `--force-commit`,
+`--accept-torn-disk` or `--overwrite-newer-writes`: upgrade it to resolve a
+hold.
 
 Automatic promotion **refuses a replica older than two of the schedule's
 longest intervals plus an hour** (or one whose filename carries no readable

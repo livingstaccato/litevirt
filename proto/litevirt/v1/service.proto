@@ -1996,6 +1996,10 @@ message PushReplicaRequest {
 message PushReplicaResponse {
     string path       = 1;
     int64  size_bytes = 2;
+    // The receiver recorded the replica's not_point_in_time mark. A receiver
+    // on a build that does not know the mark leaves it false, so a sender
+    // that set it can tell the mark was dropped.
+    bool   not_point_in_time_recorded = 3;
 }
 // Delete one file from a file-based pool. filename is a base name. A file any
 // VM disk on any host uses is refused. (Replicas are pruned with the
@@ -2095,6 +2099,14 @@ message ReplicaRecord {
     string format     = 6; // qcow2 | raw
     string taken      = 7; // UTC run time, 20060102-150405
     int64  size_bytes = 8; // set by ListReplicas
+    // not_point_in_time is set on a replica copied with qemu-img convert -U
+    // after every point-in-time copy failed (a backup session, an external
+    // snapshot): it may be inconsistent. Automatic promotion does not use one
+    // while a point-in-time replica exists, and by default not at all; manual
+    // promotion asks for accept_not_point_in_time. Absent (every replica
+    // written before this field, or by a build that does not know it) reads
+    // as such replicas always read.
+    bool   not_point_in_time = 9;
 }
 // Peer only. The replica records of one VM in a pool on host.
 message ListReplicasRequest {
@@ -2559,6 +2571,47 @@ message PromoteReplicaRequest {
     // it (dest==self, target==vm, action==promote), upserts it, and claims it
     // single-use before the destructive define+start.
     RuntimeActionProof proof = 8;
+    // accept_not_point_in_time promotes a replica recorded as not
+    // point-in-time (ReplicaRecord.not_point_in_time). Without it such a
+    // promotion is refused with a warning naming this flag
+    // (--accept-not-point-in-time).
+    bool   accept_not_point_in_time = 9;
+}
+message ResolvePITOverlayRequest {
+    string vm_name   = 1;
+    string disk_name = 2;
+    string action    = 3; // "commit" | "discard" | "" (report only, without confirm)
+    bool   confirm   = 4; // false: report the verdict and what would be done, do nothing
+    // force_commit commits whatever the verdict says (an expert's override;
+    // the backing file must still be the disk's). accept_torn_disk discards
+    // the overlay of a disk a commit had begun writing, leaving it
+    // inconsistent.
+    bool   force_commit     = 5;
+    bool   accept_torn_disk = 6;
+    // overwrite_newer_writes lets force_commit go ahead on an overlay that is
+    // already in the disk (verdict pivoted, or a committed binding): the
+    // commit then writes the window's old blocks over everything the guest
+    // wrote since. Refused without it, whatever force_commit says.
+    bool   overwrite_newer_writes = 7;
+}
+message ResolvePITOverlayResponse {
+    string overlay = 1; // the overlay file
+    string disk    = 2; // the disk file
+    string binding = 3; // what its binding records, if anything
+    bool   done    = 4; // the action was carried out
+    string status  = 5;
+    // verdict: matches | half-written | pivoted | unknown (pitoverlay.Assess).
+    string verdict        = 6;
+    string verdict_reason = 7;
+    string current        = 8;  // the disk's identity now
+    string backing_file   = 9;  // the overlay's backing file
+    string if_commit      = 10; // what --commit would do, or why it is refused
+    string if_discard     = 11; // what --discard would do, or why it is refused
+    string recommendation = 12;
+    string overlay_current = 13; // the overlay's own identity now (its modification time)
+    // needs_overwrite_newer_writes: a forced commit of this overlay would
+    // overwrite the guest's newer writes, and needs overwrite_newer_writes.
+    bool   needs_overwrite_newer_writes = 14;
 }
 message PromoteReplicaProgress {
     enum Phase {
@@ -3898,6 +3951,11 @@ service LiteVirt {
     // against an overlay backed by the chosen replica on the host that holds
     // it, then localizes via blockpull. Disaster recovery after host loss.
     rpc PromoteReplica(PromoteReplicaRequest) returns (stream PromoteReplicaProgress);
+    // ResolvePITOverlay decides, as an admin, what happens to a point-in-time
+    // copy overlay that could not be verified against its disk and holds the
+    // VM: commit it into the disk, or discard it. Without confirm it only says
+    // what it would do. Audited. lv resolve-pit-overlay.
+    rpc ResolvePITOverlay(ResolvePITOverlayRequest) returns (ResolvePITOverlayResponse);
 
     // ── tamper-evident audit log ──
     // VerifyAuditChain walks each host's audit sub-chain (a row's

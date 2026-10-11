@@ -116,12 +116,15 @@ func hookStagingRoot(name string, mounts []hookMount) (string, error) {
 	return root, nil
 }
 
-// ensureStagingDir makes p a directory only its owner (root, for the hook)
-// can use, and refuses anything else found there — a symlink is never
-// followed, so one planted at a staging path cannot redirect where host
-// trees are staged.
+// ensureStagingDir makes p a directory its owner (root, for the hook) alone
+// can list, create or rename in, and refuses anything else found there — a
+// symlink is never followed, so one planted at a staging path cannot redirect
+// where host trees are staged. The mode is 0711, traverse only: LXC binds an
+// unprivileged container's entries as that container's mapped root, which
+// must reach its staged mounts through these directories. What it reaches
+// there is governed by each staged tree's own mode, as it is at the source.
 func ensureStagingDir(p string) error {
-	if err := os.Mkdir(p, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+	if err := os.Mkdir(p, stagingDirMode); err != nil && !errors.Is(err, os.ErrExist) {
 		return err
 	}
 	st, err := os.Lstat(p)
@@ -134,11 +137,14 @@ func ensureStagingDir(p string) error {
 	if sys, ok := st.Sys().(*unix.Stat_t); ok && int(sys.Uid) != os.Geteuid() {
 		return fmt.Errorf("staging path %s is owned by uid %d, not %d", p, sys.Uid, os.Geteuid())
 	}
-	return os.Chmod(p, 0o700)
+	return os.Chmod(p, stagingDirMode)
 }
 
-// ensurePrivateStagingRoot makes root a root-only directory on a mount of its
-// own with private propagation, so staged mounts neither leak into nor
+// stagingDirMode is the staging directories' mode: root's, traverse only.
+const stagingDirMode = 0o711
+
+// ensurePrivateStagingRoot makes root a root-owned, traverse-only directory
+// on a mount of its own with private propagation, so staged mounts neither leak into nor
 // arrive from other mount namespaces. The stock AppArmor profile of
 // lxc-start allows each of these mounts beneath LXC's store (stagingRoot).
 func ensurePrivateStagingRoot(root string) error {
@@ -373,6 +379,13 @@ func openedPath(fd int) (string, error) {
 // mounted there and delete its contents. An entry still mounted, or a
 // directory not empty, stays and is said.
 func clearStaging(dir string) {
+	// Never through a symlink: its target's entries are not staging entries.
+	if st, err := os.Lstat(dir); err != nil || !st.IsDir() {
+		if err == nil {
+			hookLog("%s is not a directory (%s); left in place", dir, st.Mode().Type())
+		}
+		return
+	}
 	ents, _ := os.ReadDir(dir)
 	for _, e := range ents {
 		p := filepath.Join(dir, e.Name())

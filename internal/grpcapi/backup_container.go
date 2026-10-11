@@ -1182,6 +1182,7 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	// recorded with nothing set (n2). The record always precedes the data, so
 	// it errs only toward "used", which changes nothing for this release.
 	var hostAccessG capabilities.FeatureGrant
+	var withoutHostAccessAudit string
 	{
 		authorized, stripped, g, herr := s.authorizeRestoredHostAccess(ctx, corrosion.DecodeCreateSpec(spec.CreateSpec), source, !operatorRestore, req.GetWithoutHostAccess())
 		if herr != nil {
@@ -1190,15 +1191,13 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 			}
 			s.removeRestoreMarker(req.Name)
 			s.audit(ctx, "ct.restore", req.Name, "project="+project+" (host access: release gate refused; retry)", "error")
-			// The gate's own text, then the way out when it cannot grant
-			// for a while (a host down for good, or in release probation).
-			return status.Error(status.Code(herr), status.Convert(herr).Message()+
-				"; to restore now without the backup's host mounts and devices, retry with --without-host-access "+
-				"(an admin re-applies them later with lv ct convert --mount/--device)")
+			return restoreHostAccessRefusal(ctx, herr)
 		}
 		hostAccessG = g
 		if operatorRestore && req.GetWithoutHostAccess() && stripped != "" {
-			s.audit(ctx, "ct.restore", req.Name, "project="+project+" restored --without-host-access (requested); not carried: "+stripped, "ok")
+			// Audited once the restore has landed (below), never for a
+			// restore that then fails.
+			withoutHostAccessAudit = "project=" + project + " restored --without-host-access (requested); not carried: " + stripped
 		}
 		// Privileged mode and legacy confinement are the same host-escalation
 		// class, decided the same way. Stripped, the container is moved into an
@@ -1319,6 +1318,9 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	// host-local proof marker is no longer needed (any future retry hits the "row already
 	// exists" guard above, never the resume path). Drop it best-effort.
 	s.removeRestoreMarker(req.Name)
+	if withoutHostAccessAudit != "" {
+		s.audit(ctx, "ct.restore", req.Name, withoutHostAccessAudit, "ok")
+	}
 	s.recordContainerBases(project, req.Name, placement, spec)
 	s.recordForeignNetworks(ctx, "ct.restore", req.Name, foreignNets)
 	// Mark the relocation proof terminal (single-use) so a duplicate restore of the same
@@ -1486,3 +1488,28 @@ func (s *Server) backupCapturedAfter(repoName, name, ts, replicaAt, replicaSourc
 	r, err := time.Parse(time.RFC3339Nano, replicaAt)
 	return ok && err == nil && b.After(r)
 }
+
+// restoreHostAccessRefusal is the gate's own refusal of a restore's host
+// access, unchanged, and then — only where it helps — the way out when the
+// gate cannot grant for a while: a refusal that lasts (the gate's
+// FailedPrecondition, or a first use some host has not acknowledged, which a
+// host down for good never will), on a restore whose request accepts
+// --without-host-access. A transient error (a state read that failed) gets a
+// plain retry, and a replica restore, whose request has no such option, is
+// never told to use it.
+func restoreHostAccessRefusal(ctx context.Context, herr error) error {
+	st := status.Convert(herr)
+	lasting := st.Code() == codes.FailedPrecondition ||
+		(st.Code() == codes.Unavailable && strings.Contains(st.Message(), releaseUnackedMarker))
+	if !lasting || operatorReplicaRestore(ctx) {
+		return herr
+	}
+	return status.Error(st.Code(), st.Message()+
+		"; to restore now without the backup's host mounts and devices, retry with --without-host-access "+
+		"(an admin re-applies them later with lv ct convert --mount/--device)")
+}
+
+// releaseUnackedMarker is in the release gate's refusal of a first use some
+// host has not acknowledged (health.Checker; pinned by
+// TestWithFeature_UnackedRefusalCarriesItsMarker).
+const releaseUnackedMarker = "not yet acknowledged by"

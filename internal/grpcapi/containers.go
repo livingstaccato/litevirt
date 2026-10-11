@@ -474,7 +474,7 @@ func (s *Server) StartContainer(ctx context.Context, req *pb.StartContainerReque
 	}
 	if err := s.containerRuntime.StartContainer(ctx, req.Name); err != nil {
 		s.audit(ctx, "ct.start", req.Name, "project="+project, "error")
-		return nil, status.Errorf(codes.Internal, "start: %v", err)
+		return nil, status.Errorf(hostAccessBusyCode(err, codes.Internal), "start: %v", err)
 	}
 	// Clear any prior stop intent ('operator-stop') so a later unexpected stop is
 	// judged fresh. Strict: if the row vanished mid-flight the container is now

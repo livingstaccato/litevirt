@@ -35,6 +35,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/safename"
@@ -254,6 +255,10 @@ type LxcRunner struct {
 	// which its host-access record, config block and hook policy change.
 	hostAccessMu    sync.Mutex
 	hostAccessLocks map[string]*sync.Mutex
+	// refreshStuck (under hostAccessMu) is when each container's abandoned
+	// policy refresh was given up on; it holds that container's lock until
+	// it returns.
+	refreshStuck map[string]time.Time
 
 	// DefaultPidsMax is the pids.max a container whose config sets none gets
 	// at its next start (prepareStart). 0 adds none.

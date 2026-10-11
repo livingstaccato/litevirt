@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"path/filepath"
 	"reflect"
@@ -743,4 +744,14 @@ func cloneHostAccessAllowed(ctx context.Context, src corrosion.ContainerRecord) 
 		return status.Error(codes.PermissionDenied, "the source container has host mounts or devices; "+hostAccessDenied)
 	}
 	return nil
+}
+
+// hostAccessBusyCode is Unavailable (retry) for a runtime error saying the
+// container's host-access lock stayed held — a policy refresh stuck in a
+// lookup that does not return — and otherwise code.
+func hostAccessBusyCode(err error, code codes.Code) codes.Code {
+	if errors.Is(err, lxc.ErrHostAccessBusy) {
+		return codes.Unavailable
+	}
+	return code
 }

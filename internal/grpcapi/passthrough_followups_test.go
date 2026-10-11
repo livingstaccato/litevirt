@@ -2,13 +2,20 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"slices"
 	"strings"
 	"testing"
+	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/lxc"
 )
 
 // hostAccessBackup seeds a stopped container "web" whose spec carries a host
@@ -141,5 +148,97 @@ func TestAuthorizeRestoredHostAccess_WithoutHostAccess(t *testing.T) {
 	plain := corrosion.ContainerCreateSpec{Template: "download"}
 	if _, stripped, _, err = s.authorizeRestoredHostAccess(adminCtx(), plain, nil, false, true); err != nil || stripped != "" {
 		t.Errorf("restore with nothing to strip: stripped=%q err=%v", stripped, err)
+	}
+}
+
+// I-1. A container whose host-access lock a stuck refresh holds: the start
+// and lv ct convert fail Unavailable (retryable) naming why, rather than
+// Internal or FailedPrecondition, and the container's own lock is released
+// with them, so its stop stays reachable.
+//
+// Mutation: map the runtime error as before (Internal / FailedPrecondition)
+// — red.
+func TestHostAccessBusy_IsUnavailableAndReleasesTheContainer(t *testing.T) {
+	s, rt := secServer(t)
+	enableUsbMountsMemory(s)
+	seedSecCT(t, s, rt, "a", "stopped", corrosion.ContainerCreateSpec{Template: "download"})
+	busy := fmt.Errorf("container %q: %w", "a", lxc.ErrHostAccessBusy)
+	rt.startErr = busy
+	_, err := s.StartContainer(adminCtx(), &pb.StartContainerRequest{Name: "a", HostName: "host-a"})
+	if status.Code(err) != codes.Unavailable || !strings.Contains(err.Error(), lxc.ErrHostAccessBusy.Error()) {
+		t.Errorf("start behind a stuck host-access refresh = %v; want Unavailable naming it", err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.StopContainer(adminCtx(), &pb.StopContainerRequest{Name: "a", HostName: "host-a"})
+		done <- err
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stop could not take the container's lock after a refused start")
+	}
+	rt.startErr = nil
+	rt.hostAccessErr = busy
+	_, err = s.ConvertContainer(adminCtx(), &pb.ConvertContainerRequest{Name: "a", HostName: "host-a", SetHostAccess: true,
+		Mounts: []*pb.ContainerMount{{HostPath: "/srv/data", ContainerPath: "/data"}}})
+	if status.Code(err) != codes.Unavailable {
+		t.Errorf("convert behind a stuck host-access refresh = %v; want Unavailable", err)
+	}
+}
+
+// m-1, m-2. The way out (--without-host-access) is named only where it helps:
+// on a refusal that will last (the gate's FailedPrecondition, or a first use
+// some host has not acknowledged), and only on a restore that accepts the
+// flag — never on a replica restore, whose request has no such option, and
+// never on a transient read error, where a plain retry is the answer.
+//
+// Mutation: name it on every error, or on the replica path — red.
+func TestRestoreHostAccessRefusal_HintOnlyWhereItHelps(t *testing.T) {
+	const hint = "--without-host-access"
+	gate := status.Error(codes.FailedPrecondition, "the cluster upgrade must finish first (usb_mounts_memory needs release_2026_11_v1): host-z does not advertise it")
+	unacked := status.Error(codes.Unavailable, "usb_mounts_memory's use is recorded here but not yet acknowledged by host-z; the write is refused until every host holds the record — retry")
+	transient := status.Error(codes.Unavailable, "read whether usb_mounts_memory is in use: database is locked")
+	replica := context.WithValue(adminCtx(), operatorReplicaRestoreKey{}, true)
+	for _, tc := range []struct {
+		name string
+		ctx  context.Context
+		err  error
+		want bool
+	}{
+		{"gate refusal", adminCtx(), gate, true},
+		{"unacknowledged first use", adminCtx(), unacked, true},
+		{"transient read error", adminCtx(), transient, false},
+		{"replica restore, gate refusal", replica, gate, false},
+		{"replica restore, unacknowledged", replica, unacked, false},
+	} {
+		got := restoreHostAccessRefusal(tc.ctx, tc.err)
+		if status.Code(got) != status.Code(tc.err) || !strings.HasPrefix(status.Convert(got).Message(), status.Convert(tc.err).Message()) {
+			t.Errorf("%s: %v; want the gate's own code and text first", tc.name, got)
+		}
+		if strings.Contains(got.Error(), hint) != tc.want {
+			t.Errorf("%s: %v; want hint=%v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// m-3. The "restored --without-host-access" row is written once the restore
+// has landed: a restore that fails after the strip (here, its config render)
+// leaves no "ok" row claiming a container that does not exist.
+//
+// Mutation: write the row where the strip is decided, as before — red.
+func TestRestoreContainer_WithoutHostAccessAuditedOnlyOnceLanded(t *testing.T) {
+	s, rt, repo, ts := hostAccessBackup(t)
+	s.SetReleaseFeatureGate(latchedButRefusingGate{})
+	rt.rebuildErr = errors.New("render failed")
+	rs := &progressStream[pb.RestoreContainerProgress]{ctx: adminCtx()}
+	if err := s.RestoreContainer(&pb.RestoreContainerRequest{Name: "web", HostName: "host-a", RepoPath: repo, Timestamp: ts,
+		WithoutHostAccess: true}, rs); err == nil {
+		t.Fatal("restore succeeded although its config render failed")
+	}
+	for _, a := range ctRestoreAudit(t, s, "web") {
+		if strings.HasPrefix(a, "ok: ") && strings.Contains(a, "--without-host-access") {
+			t.Errorf("a failed restore left an ok row: %q", a)
+		}
 	}
 }

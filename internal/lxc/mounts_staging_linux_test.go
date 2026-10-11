@@ -56,25 +56,29 @@ func TestHookStagingRoot(t *testing.T) {
 	}
 }
 
-// The staging root and a container's staging directory are made root-only
-// and never followed through a symlink: one planted where either goes fails
-// the start instead of staging host trees wherever it points.
+// The staging root and a container's staging directory are root's, mode
+// 0711 — traverse only: an unprivileged container's mapped root must reach
+// its staged mounts through them when LXC binds the entries (I-2), and
+// nobody but root can list, create or rename in them. They are never
+// followed through a symlink: one planted where either goes fails the start
+// instead of staging host trees wherever it points.
 //
-// Mutation: make ensureStagingDir MkdirAll without the Lstat check — red.
+// Mutation: make ensureStagingDir MkdirAll without the Lstat check, or set
+// 0700 — red.
 func TestEnsureStagingDir_RefusesASymlinkAndTightensTheMode(t *testing.T) {
 	base := t.TempDir()
 	d := filepath.Join(base, "root")
 	if err := ensureStagingDir(d); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(d, 0o755); err != nil {
+	if err := os.Chmod(d, 0o777); err != nil {
 		t.Fatal(err)
 	}
 	if err := ensureStagingDir(d); err != nil {
 		t.Fatal(err)
 	}
-	if st, _ := os.Lstat(d); st == nil || st.Mode().Perm() != 0o700 {
-		t.Errorf("staging dir mode = %v; want 0700", st.Mode())
+	if st, _ := os.Lstat(d); st == nil || st.Mode().Perm() != 0o711 {
+		t.Errorf("staging dir mode = %v; want 0711", st.Mode())
 	}
 	elsewhere := filepath.Join(base, "elsewhere")
 	_ = os.Mkdir(elsewhere, 0o755)
@@ -89,5 +93,29 @@ func TestEnsureStagingDir_RefusesASymlinkAndTightensTheMode(t *testing.T) {
 	_ = os.WriteFile(f, nil, 0o600)
 	if err := ensureStagingDir(f); err == nil {
 		t.Error("a file at the staging path was accepted")
+	}
+}
+
+// m-4. post-stop never follows a symlink at a container's staging
+// directory: the entries of whatever it points at are left alone.
+//
+// Mutation: drop the Lstat check from clearStaging — red.
+func TestClearStaging_RefusesASymlinkedDir(t *testing.T) {
+	base := t.TempDir()
+	target := filepath.Join(base, "target")
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	precious := filepath.Join(target, "precious")
+	if err := os.WriteFile(precious, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(base, "c1")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	clearStaging(link)
+	if _, err := os.Stat(precious); err != nil {
+		t.Errorf("clearStaging followed a symlinked staging dir and removed what it points at: %v", err)
 	}
 }

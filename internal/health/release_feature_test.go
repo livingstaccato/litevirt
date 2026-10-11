@@ -502,3 +502,16 @@ func TestWithFeature_RefusalTextIsExact(t *testing.T) {
 		t.Fatalf("refusal = %v\nwant FailedPrecondition %q", err, want)
 	}
 }
+
+// The refusal of a first use some host has not acknowledged carries "not yet
+// acknowledged by": grpcapi's restore refusal (restoreHostAccessRefusal)
+// recognises a lasting refusal by it and names --without-host-access there.
+// Changing this text needs that check changed too.
+func TestWithFeature_UnackedRefusalCarriesItsMarker(t *testing.T) {
+	e := newRelEnv(t)
+	e.bHolds.Store(false)
+	_, err := e.write(t, e.c, testFeature)
+	if status.Code(err) != codes.Unavailable || !strings.Contains(err.Error(), "not yet acknowledged by") {
+		t.Fatalf("unacknowledged first use = %v; want Unavailable carrying \"not yet acknowledged by\"", err)
+	}
+}

@@ -160,8 +160,14 @@ func TestLab_CephVMDisks(t *testing.T) {
 	}
 	l.mark("ceph: cloned %s → %s", vm, clone)
 
-	// Delete: every VM image goes, the base stays.
-	since0 := l.nodeNow(src)
+	// Delete: every VM image goes, the base stays. The delete runs on the
+	// node that owns the VM at that moment — after the live migration, dst,
+	// not src — so its journal is the one that shows how it deleted.
+	owner := dst
+	if rows, err := l.sql(dst, fmt.Sprintf("SELECT host_name FROM vms WHERE name = '%s' AND deleted_at IS NULL", vm)); err == nil && len(rows) == 1 && rows[0][0] != "" {
+		owner = rows[0][0]
+	}
+	since0 := l.nodeNow(owner)
 	if out, err := l.lv(dst, "rm", "--force", clone); err != nil {
 		t.Fatalf("lv rm %s: %v\n%s", clone, err, out)
 	}
@@ -224,8 +230,8 @@ func TestLab_CephVMDisks(t *testing.T) {
 		}
 	}
 	trashEmptyOf(vm+"-", clone+"-")
-	if moved := l.journalSince(src, since0, "image moved to the trash"); !strings.Contains(moved, vm+"-root") {
-		t.Fatalf("the daemon on %s did not delete %s-root through the trash", src, vm)
+	if moved := l.journalSince(owner, since0, "image moved to the trash"); !strings.Contains(moved, vm+"-root") {
+		t.Fatalf("the daemon on %s, which owned %s when it was deleted, did not delete %s-root through the trash", owner, vm, vm)
 	}
 
 	// A create that fails AFTER its ceph disk exists removes it. The second

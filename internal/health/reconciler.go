@@ -433,7 +433,9 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) {
 // safety sweeps. The sweeps deliberately take the UNBOUNDED ctx — they are what
 // the walk's budget exists to protect, not things to cut short.
 func (r *Reconciler) reconcilePass(ctx context.Context) {
-	wctx, cancel := context.WithTimeout(ctx, reconcileWalkBudget)
+	// The walk carries one probe turn (start_deferral.go): its first storage
+	// probe runs on whatever time is left.
+	wctx, cancel := context.WithTimeout(WithWalkProbeTurn(ctx), reconcileWalkBudget)
 	r.reconcile(wctx)
 	cancel()
 
@@ -569,8 +571,10 @@ func specOnboot(specJSON string) bool {
 // while it was absent. Idempotent: startPendingVM no-ops on an already-running domain.
 //
 // The only argument picks which of them this call retries: the ones whose
-// start was deferred last pass go before the walk, the rest after it.
-func (r *Reconciler) retryOnbootPending(ctx context.Context, only func(name string) bool) {
+// start was deferred for time last pass go before the walk, the rest after
+// it — those whose storage did not answer first (start_deferral.go), in
+// deferral rank order.
+func (r *Reconciler) retryOnbootPending(ctx context.Context, only func(name string) bool, deferred map[string]int) {
 	r.onbootMu.Lock()
 	names := make([]string, 0, len(r.onbootPending))
 	for name := range r.onbootPending {
@@ -580,6 +584,13 @@ func (r *Reconciler) retryOnbootPending(ctx context.Context, only func(name stri
 	}
 	r.onbootMu.Unlock()
 	sort.Strings(names)
+	rank := func(name string) int {
+		if rk, ok := deferred[name]; ok {
+			return rk
+		}
+		return rankNotDeferred
+	}
+	sort.SliceStable(names, func(i, j int) bool { return rank(names[i]) < rank(names[j]) })
 	for _, name := range names {
 		if r.virt != nil && r.virt.DomainExists(name) {
 			if st, err := r.virt.DomainState(name); err == nil && st == "running" {
@@ -623,12 +634,13 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 	r.tendStrandedDisks(ctx)
 	r.cleanupRekeyLeftovers(ctx)
 
-	// Starts deferred last pass go first — the onboot retries among them
-	// too — so the same VMs are not the ones the walk's budget runs out on
-	// every pass (start_deferral.go).
+	// Starts deferred last pass go first — the onboot retries deferred for
+	// time among them too — so the same VMs are not the ones the walk's
+	// budget runs out on every pass; a start whose storage did not answer
+	// goes after those deferred for time (start_deferral.go).
 	deferred := r.startDeferred.take()
 	vms = deferredFirst(vms, deferred)
-	r.retryOnbootPending(ctx, func(name string) bool { return deferred[name] })
+	r.retryOnbootPending(ctx, func(name string) bool { rk, ok := deferred[name]; return ok && rk == rankTime }, deferred)
 
 	for _, vm := range vms {
 		switch vm.State {
@@ -862,7 +874,7 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 
 	// Retry any onboot autostart the split-brain gate refused during warmup/quorum
 	// loss, so a latched gate can't permanently strand it after a reboot.
-	r.retryOnbootPending(ctx, func(name string) bool { return !deferred[name] })
+	r.retryOnbootPending(ctx, func(name string) bool { rk, ok := deferred[name]; return !ok || rk != rankTime }, deferred)
 }
 
 // selfFence detects split-brain: VMs running locally in libvirt that corrosion

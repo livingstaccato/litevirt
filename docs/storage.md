@@ -973,8 +973,14 @@ its monitors, an ambiguous error — is transient. A failover, onboot autostart
 or restart of a VM whose domain died is then **deferred**, never put in
 `error`: it waits in `starting` (a failover in `pending`, its proof kept) and
 the next reconcile pass starts it. A start the reconcile pass has no time
-left to probe for is deferred before anything is done for it. Deferred VMs
-are taken first on the next pass. A live migration onto a host
+left to probe for is deferred before anything is done for it — except the
+pass's first probe, which runs on whatever time is left (from 2 s), so every
+pass makes progress. A probe Ceph did not answer is remembered for 15 s
+(about one pass): the reconcile pass defers the other VMs on that pool at
+once, without a probe each (an operator's `lv start` always probes). The next
+pass takes the deferred VMs first: those deferred for time, then those whose
+pool did not answer, the VM whose own probe failed last of them. So a pool
+that is down never holds up the VMs on a healthy pool. A live migration onto a host
 whose recorded key differs from the source host's is refused before libvirt
 is asked.
 
@@ -1049,7 +1055,25 @@ every host. That is how such pools behaved before and is not recommended.
   An image a client still has open is never moved: a delete waits up to 45 s
   (a killed client's watch lapses in about 30) and then refuses it as
   **in use**, naming the watcher; a rollback of litevirt's own copy waits up
-  to a minute. An image already gone is not an error —
+  to a minute. An `rbd status` answer that cannot be read counts as in use.
+  A VM's ceph disks wait together, so a VM with several disks a client
+  still holds is refused in about 45 s, not 45 s per disk, and the wait never
+  outlasts the request's own deadline. `rbd trash mv` does not refuse an image a client
+  has open (Ceph 19.2.3), so after the move the image's watchers are listed
+  again by id (`rados -p <pool> listwatchers rbd_header.<id>`, from
+  `ceph-common` like `rbd`). An image a client opened in between is put back
+  under its name with `rbd trash restore` and the delete refused as in use.
+  If its watchers cannot be listed, the purge is the guard: `rbd trash rm`
+  refuses an image a client has open (exit 16), and such an image is
+  **held**: it is never purged automatically, and `ceph_trash_leftover` names
+  it with `rbd trash restore <pool>/<id>`. A move is recorded by the image's
+  id before it runs. A move that fails, or that a crash interrupts, is
+  settled by id: it is purged if the image went to the trash, forgotten if it
+  never moved, and held and named if it is in the trash and still under its
+  name. A queue file that cannot be read is moved aside
+  (`ceph-trash-purges.json.unreadable-<time>`) and named. The pools' trash is
+  scanned every 5 minutes for litevirt images no purge on the host tracks,
+  and those are named too. An image already gone is not an error —
   but only once the pool itself answers: a delete that cannot reach the
   cluster (a missing keyring or conf) fails instead of reporting success.
   If an interrupted `rbd rm` left the image in the trash, that leftover is

@@ -48,7 +48,14 @@ type fakeCeph struct {
 type fakeTrashed struct {
 	name, source string
 	snaps        map[string]bool
+	// watchedUntil: a client that had the image open before it was moved
+	// keeps it open in the trash (lab 2, 19.2.3: `rbd trash mv` does not
+	// refuse an open image).
+	watchedUntil time.Duration
 }
+
+// watcherLine is how rados lists a watcher of an object.
+const watcherLine = "watcher=10.78.0.13:0/3434 client.4242 cookie=1"
 
 // trashed lists the trash entries of pool as "id name".
 func (f *fakeCeph) trashed(pool string) []string {
@@ -110,6 +117,9 @@ func (f *fakeCeph) run(ctx context.Context, name string, args ...string) ([]byte
 			return []byte("qemu-img: injected"), err
 		}
 		return nil, os.WriteFile(args[len(args)-1], []byte("raw"), 0o600)
+	}
+	if name == "rados" {
+		return f.rados(args)
 	}
 	i := 0
 	for i < len(args) && strings.HasPrefix(args[i], "-") && args[i] != "--" {
@@ -202,35 +212,74 @@ func (f *fakeCeph) run(ctx context.Context, name string, args ...string) ([]byte
 		}
 		return []byte(`{"watchers":[]}`), nil
 	case "trash mv":
+		// Lab 2 (19.2.3): `rbd trash mv` does NOT refuse an image a live
+		// client has open; the client keeps it open in the trash.
 		if !f.has(pos[0]) {
 			return missing, rbdExit(2)
-		}
-		if until, ok := f.watched[pos[0]]; ok && f.now < until {
-			return []byte("rbd: deferred delete error: (16) Device or resource busy"), rbdExit(16)
 		}
 		pool, _, _ := strings.Cut(pos[0], "/")
 		if f.trash == nil {
 			f.trash = map[string]fakeTrashed{}
 		}
-		f.trash[pool+"/"+f.idOf(pos[0])] = fakeTrashed{name: pos[0][len(pool)+1:], source: "USER", snaps: f.images[pos[0]]}
+		f.trash[pool+"/"+f.idOf(pos[0])] = fakeTrashed{name: pos[0][len(pool)+1:], source: "USER", snaps: f.images[pos[0]], watchedUntil: f.watched[pos[0]]}
 		delete(f.images, pos[0])
 		delete(f.ids, pos[0])
+		delete(f.watched, pos[0])
 		return nil, nil
 	case "trash rm":
 		e, ok := f.trash[pos[0]]
 		if !ok {
 			return []byte("rbd: error: image not in trash: (2) No such file or directory"), rbdExit(2)
 		}
+		if f.now < e.watchedUntil {
+			// Lab 2, verbatim (exit 16).
+			return []byte("rbd: error: image still has watchers\nimage has watchers - not removing"), rbdExit(16)
+		}
 		if len(e.snaps) > 0 {
 			return []byte("rbd: image has snapshots - not removing"), rbdExit(39)
 		}
 		delete(f.trash, pos[0])
 		return nil, nil
+	case "trash restore":
+		e, ok := f.trash[pos[0]]
+		if !ok {
+			return []byte("rbd: restore error: (2) No such file or directory"), rbdExit(2)
+		}
+		pool, id, _ := strings.Cut(pos[0], "/")
+		ref := pool + "/" + e.name
+		if f.has(ref) {
+			return []byte("rbd: restore error: an image with the same name already exists: (17) File exists"), rbdExit(17)
+		}
+		snaps := e.snaps
+		if snaps == nil {
+			snaps = map[string]bool{}
+		}
+		f.images[ref] = snaps
+		f.idOf(ref)
+		f.ids[ref] = id
+		if e.watchedUntil > 0 {
+			if f.watched == nil {
+				f.watched = map[string]time.Duration{}
+			}
+			f.watched[ref] = e.watchedUntil
+		}
+		delete(f.trash, pos[0])
+		return nil, nil
 	case "trash ls":
+		// 19.2.3, verbatim shapes (lab2-ceph-report-2.md): `source`,
+		// `deleted_at` and `status` only with --long.
+		long := false
+		for _, w := range words {
+			long = long || w == "--long" || w == "-l"
+		}
 		var entries []string
 		for k, e := range f.trash {
 			if p, id, _ := strings.Cut(k, "/"); p == pos[0] {
-				entries = append(entries, fmt.Sprintf(`{"id":"%s","name":"%s","source":"%s"}`, id, e.name, e.source))
+				if long {
+					entries = append(entries, fmt.Sprintf(`{"id":"%s","name":"%s","source":"%s","deleted_at":"Fri Oct 10 22:56:08 2026","status":"expired at Fri Oct 10 22:56:08 2026"}`, id, e.name, e.source))
+				} else {
+					entries = append(entries, fmt.Sprintf(`{"id":"%s","name":"%s"}`, id, e.name))
+				}
 			}
 		}
 		return []byte("[" + strings.Join(entries, ",") + "]"), nil
@@ -310,6 +359,39 @@ func (f *fakeCeph) run(ctx context.Context, name string, args ...string) ([]byte
 		return nil, nil
 	}
 	return nil, nil
+}
+
+// rados answers `rados -p <pool> listwatchers rbd_header.<id>` for an image
+// in the pool or in its trash, as rados prints it: one line per watcher.
+func (f *fakeCeph) rados(args []string) ([]byte, error) {
+	f.calls = append(f.calls, "rados "+strings.Join(args, " "))
+	if err := f.fail["rados"]; err != nil {
+		return []byte("rados: injected failure"), err
+	}
+	pool, obj := "", ""
+	for i, a := range args {
+		if a == "-p" && i+1 < len(args) {
+			pool = args[i+1]
+		}
+		if strings.HasPrefix(a, "rbd_header.") {
+			obj = strings.TrimPrefix(a, "rbd_header.")
+		}
+	}
+	if e, ok := f.trash[pool+"/"+obj]; ok {
+		if f.now < e.watchedUntil {
+			return []byte(watcherLine + "\n"), nil
+		}
+		return nil, nil
+	}
+	for ref, id := range f.ids {
+		if id == obj && strings.HasPrefix(ref, pool+"/") {
+			if until, ok := f.watched[ref]; ok && f.now < until {
+				return []byte(watcherLine + "\n"), nil
+			}
+			return nil, nil
+		}
+	}
+	return []byte("error listing watchers " + pool + "/rbd_header." + obj + ": (2) No such file or directory"), rbdExit(2)
 }
 
 // labCephFiles writes a ceph.conf as cephadm writes it and a restricted

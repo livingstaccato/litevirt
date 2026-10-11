@@ -81,6 +81,22 @@ func withFeature(t *testing.T, open bool) *daemonStub {
 	return d
 }
 
+// A plain init's stdout is byte-identical to main's: the hint goes to stderr.
+func TestBackupRepoInit_DefaultStdoutIsMains(t *testing.T) {
+	withFeature(t, true)
+	dir := filepath.Join(t.TempDir(), "repo")
+	var err error
+	out := captureStdout(t, func() { err = runBackupRepoCmd(t, "init", dir) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := openRepo(t, dir)
+	want := "Repository initialised at " + r.Root() + " (compression: none)\n"
+	if out != want {
+		t.Fatalf("stdout = %q, want main's %q", out, want)
+	}
+}
+
 // I1: a plain init is the local, uncompressed repository main creates, however
 // the cluster stands: the daemon is never asked, even when backup_zstd is open,
 // so where the repo lands does not depend on credentials or connectivity.

@@ -139,7 +139,7 @@ func newBackupRepoInitCmd() *cobra.Command {
 				return err
 			}
 			if compression == pbsstore.CompressionNone {
-				fmt.Println("Compression is off by default. Once the cluster's release token has latched, `--compression zstd` creates a compressed repository (feature backup_zstd).")
+				fmt.Fprintln(os.Stderr, "Compression is off by default. Once the cluster's release token has latched, `--compression zstd` creates a compressed repository (feature backup_zstd).")
 			}
 			return printInitialised(r.Root(), r.Compression(), encrypted)
 		},

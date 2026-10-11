@@ -525,6 +525,12 @@ message VM {
     // overlay that could not be verified against its disk, with the admin
     // command that resolves it (lv resolve-pit-overlay). Empty otherwise.
     string                         pit_overlay_held = 19;
+    // promoted_partial says, when the VM's newest promotion recovered it
+    // without its whole replica set, which disks were not recovered (and
+    // where their real data is) or were recovered from an earlier run than
+    // the root disk. Empty when the newest promotion was complete, or there
+    // was none. Set by InspectVM/GetVM.
+    string                         promoted_partial = 20;
 }
 
 message VMStrandedDisk {

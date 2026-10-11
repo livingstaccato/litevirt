@@ -230,10 +230,31 @@ daemon config wins.
 ## Replication schedules
 
 The same scheduler also drives **volume replication** (`backup_schedules`
-rows with `type='replication'`). Each run copies the VM's root disk to a
-target pool as a timestamped, self-contained point-in-time copy, keeping the
-newest `keep_replicas`. A fast-recovery layer, not a backup replacement, so keep
-backups too.
+rows with `type='replication'`). Each run copies every disk of the VM to a
+target pool as timestamped, self-contained point-in-time copies, keeping the
+newest `keep_replicas` of each disk. A fast-recovery layer, not a backup
+replacement, so keep backups too.
+
+**Replica sets.** One run replicates every disk with one run time, so the
+replicas a run writes are a set: the root disk first, exactly as before (its
+`--incremental` chain, its fallback, its top-level copy for a host on an older
+build), then each other disk as a full point-in-time copy. Each disk keeps its
+own replica and record, so `keep_replicas` applies per disk and the storage
+cost is one replica per disk per kept run. A run whose copy of any disk fails
+reports the run failed (`disk.replicated` names the disk), and the disks it
+did copy stand. What a run does not copy, and a promotion therefore cannot
+recover from a replica:
+
+- a disk on storage that is not file-based (ceph, iscsi, zfs, lvm): reported
+  as `disk.replicated` with result `skipped` on every run, and not a failure;
+- a cdrom;
+- every disk but the root, when the target host runs an older build, which
+  promotes the root disk alone (`skipped`, naming the host).
+
+`--incremental` applies to the root disk; the other disks are copied in full
+on every run. Each disk's copy is point-in-time on its own; the disks of a
+running VM are copied one after another, so the set is not one instant
+across disks (a shut-off VM's set is).
 
 **How a full replica is copied.** A full (non-incremental) replica — and the
 full copy an `--incremental` run falls back to when its session fails — is made
@@ -511,6 +532,30 @@ lv replication promote web-1 --accept-not-point-in-time   # a replica recorded a
 A split-brain guard refuses to take over the name while the original is on a
 healthy host (`--force` overrides). The same action is on the VM detail page
 ("Promote replica").
+
+**Every disk with a replica is recovered**, manual or automatic: the root from
+the chosen replica, and each other disk from the replica of the same run, or,
+when that run did not copy it, its newest replica from before it (never a
+newer one: a root replica named with `--replica` sets the point in time). Each
+comes back on its own bus, controller and target device. A not point-in-time
+replica of another disk is taken only where the root's would be (with
+`--accept-not-point-in-time`, or the VM's label for automatic promotion). The
+`vm.promoted` event is the recovery manifest: every disk and the replica it
+came from, or why it was not recovered.
+
+A promotion never fails for a disk it cannot recover — automatic promotion
+recovers at least the root, as it always did. When the set is incomplete (a
+disk with no replica, one on storage replication does not copy, one whose
+replica could not be built, or one from an earlier run than the root's) the VM
+is marked **partial**: a `vm.promoted_partial` event and a
+`replication.promoted_partial` notification name each such disk, and where the
+real disk is (its record still names it, on the failed host), and
+`lv inspect <vm>` shows the newest promotion's as `promotedPartial` until a
+later promotion is complete. A disk not recovered is not attached; attach or
+restore it once its host is back.
+
+During a rolling upgrade a promotion executed by a host on an older build
+recovers the root disk alone, as that build always did.
 
 **Automatic promotion** (`--auto-promote` on the schedule): after the failover
 coordinator **confirms a fence**, it promotes the freshest replica for opted-in

@@ -3475,8 +3475,14 @@ type VM struct {
 	// overlay that could not be verified against its disk, with the admin
 	// command that resolves it (lv resolve-pit-overlay). Empty otherwise.
 	PitOverlayHeld string `protobuf:"bytes,19,opt,name=pit_overlay_held,json=pitOverlayHeld,proto3" json:"pit_overlay_held,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// promoted_partial says, when the VM's newest promotion recovered it
+	// without its whole replica set, which disks were not recovered (and
+	// where their real data is) or were recovered from an earlier run than
+	// the root disk. Empty when the newest promotion was complete, or there
+	// was none. Set by InspectVM/GetVM.
+	PromotedPartial string `protobuf:"bytes,20,opt,name=promoted_partial,json=promotedPartial,proto3" json:"promoted_partial,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *VM) Reset() {
@@ -3638,6 +3644,13 @@ func (x *VM) GetFailoverHeld() string {
 func (x *VM) GetPitOverlayHeld() string {
 	if x != nil {
 		return x.PitOverlayHeld
+	}
+	return ""
+}
+
+func (x *VM) GetPromotedPartial() string {
+	if x != nil {
+		return x.PromotedPartial
 	}
 	return ""
 }
@@ -6309,7 +6322,7 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\anic_mac\x18\x03 \x01(\tR\x06nicMac\x12\x1f\n" +
 	"\vpci_address\x18\x04 \x01(\tR\n" +
 	"pciAddress\x12'\n" +
-	"\x0fidempotency_key\x18\x05 \x01(\tR\x0eidempotencyKey\"\xfe\x05\n" +
+	"\x0fidempotency_key\x18\x05 \x01(\tR\x0eidempotencyKey\"\xa9\x06\n" +
 	"\x02VM\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1d\n" +
 	"\n" +
@@ -6338,7 +6351,8 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\rhealth_detail\x18\x10 \x01(\tR\fhealthDetail\x12B\n" +
 	"\x0estranded_disks\x18\x11 \x03(\v2\x1b.litevirt.v1.VMStrandedDiskR\rstrandedDisks\x12#\n" +
 	"\rfailover_held\x18\x12 \x01(\tR\ffailoverHeld\x12(\n" +
-	"\x10pit_overlay_held\x18\x13 \x01(\tR\x0epitOverlayHeld\"v\n" +
+	"\x10pit_overlay_held\x18\x13 \x01(\tR\x0epitOverlayHeld\x12)\n" +
+	"\x10promoted_partial\x18\x14 \x01(\tR\x0fpromotedPartial\"v\n" +
 	"\x0eVMStrandedDisk\x12\x12\n" +
 	"\x04host\x18\x01 \x01(\tR\x04host\x12\x12\n" +
 	"\x04disk\x18\x02 \x01(\tR\x04disk\x12\x12\n" +

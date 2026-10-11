@@ -34,7 +34,8 @@ import (
 // PromoteReplica brings an inert replica online for disaster recovery: it
 // locates the chosen (or newest) replica of a VM's root disk, ensures it runs
 // on the host that physically holds the replica file, builds a self-contained
-// live disk from it, then defines + starts the VM there and persists the
+// live disk from it and from the replica of each other disk of the same set
+// (replica_set.go), then defines + starts the VM there and persists the
 // record. The VM's durable record (replicated via Corrosion) supplies the spec,
 // so promotion works even after the original host is gone.
 func (s *Server) PromoteReplica(req *pb.PromoteReplicaRequest, stream grpc.ServerStreamingServer[pb.PromoteReplicaProgress]) error {
@@ -1159,82 +1160,66 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	// Skip the (re)build if a prior attempt already built the live disk (and definitely if
 	// it already STARTED the domain off it — rebuilding would overwrite a running VM's disk).
 	if !diskBuilt && !started {
-		// A file already at livePath that this proof did not build is not ours:
-		// targetName is the caller's choice, so in a shared pool the name can be
-		// another VM's disk. Refused before anything is written, and so before
-		// any of the error paths below that remove livePath.
-		if err := refuseExistingFile(livePath); err != nil {
+		if err := s.buildPromotedDisk(ctx, req, targetName, poolDir, replica, replicaPath, replicaRec.Format, livePath, send); err != nil {
 			return err
-		}
-		if req.NoLocalize {
-			backingFmt := replicaRec.Format
-			_ = send(&pb.PromoteReplicaProgress{
-				Phase: pb.PromoteReplicaProgress_LOCALIZING, VmName: targetName, Host: s.hostName, Replica: replica,
-				Status: "creating overlay backed by replica (fast; pins the replica)",
-			})
-			if err := createOverlayNoClobber(livePath, replicaPath, backingFmt); err != nil {
-				return err
-			}
-		} else if !qemuImgAvailable() && strings.HasSuffix(replica, ".raw") {
-			// Localize would convert raw→qcow2, but without qemu-img convertQcow2
-			// falls back to a verbatim byte copy — landing raw bytes in a
-			// qcow2-declared file → an unbootable/corrupt promoted VM (bug-sweep #9).
-			// Degrade to a correct qcow2 overlay backed by the raw replica
-			// (backingFmt=raw), like the NoLocalize path; it pins the replica but
-			// boots correctly. Full localization needs qemu-img on the host.
-			_ = send(&pb.PromoteReplicaProgress{
-				Phase: pb.PromoteReplicaProgress_LOCALIZING, VmName: targetName, Host: s.hostName, Replica: replica,
-				Status: "qemu-img unavailable — overlay over raw replica (pins replica; install qemu-img to localize)",
-			})
-			if err := createOverlayNoClobber(livePath, replicaPath, "raw"); err != nil {
-				return err
-			}
-			slog.Warn("promote: localized via raw-backed overlay (qemu-img absent) — replica is pinned",
-				"vm", targetName, "replica", replica)
-		} else {
-			_ = send(&pb.PromoteReplicaProgress{
-				Phase: pb.PromoteReplicaProgress_LOCALIZING, VmName: targetName, Host: s.hostName, Replica: replica,
-				Status: "copying replica into a self-contained live disk",
-			})
-			emit := func(p *pb.MoveVolumeProgress) error {
-				return send(&pb.PromoteReplicaProgress{
-					Phase: pb.PromoteReplicaProgress_LOCALIZING, VmName: targetName, Host: s.hostName, Replica: replica,
-					Status: fmt.Sprintf("copying replica… %.0f%%", p.CopyPct),
-				})
-			}
-			// Copy into a .promote-*.tmp then atomically rename, so a crash
-			// mid-copy leaves a sweepable temp (SweepStaleStaging) rather than an
-			// orphan live disk — the qemu-img child survives KillMode=process and
-			// would otherwise complete a final-named qcow2 with no domain.
-			// A fresh, unpredictable temp (O_EXCL): qemu-img convert follows a
-			// symlink at its output, so the name must not be one anything
-			// else could have planted.
-			tf, terr := storage.CreatePoolTemp(poolDir, ".promote-*.tmp")
-			if terr != nil {
-				return status.Errorf(codes.Internal, "create live-disk temp: %v", terr)
-			}
-			tmpLive := tf.Name()
-			_ = tf.Close()
-			// The replica's format comes from its record, never a probe: an
-			// incremental replica is raw GUEST content, and a probe would
-			// obey a qcow2 header the guest wrote into it. A qcow2 replica
-			// must be standalone (nil: no backing at all). convertImage
-			// pre-checks the input and requires a standalone output.
-			if err := convertImage(ctx, replicaPath, replicaRec.Format, nil, tmpLive, emit); err != nil {
-				os.Remove(tmpLive)
-				return status.Errorf(codes.Internal, "copy replica: %v", err)
-			}
-			if err := placeNoClobber(tmpLive, livePath); err != nil {
-				os.Remove(tmpLive)
-				return err
-			}
 		}
 		recordStep("disk_built")
 	}
 
+	// Every other disk of the VM that has a replica here is recovered too
+	// (replica_set.go): the replica of the root's run, else the newest from
+	// before it. One that cannot be recovered never stops the promotion — main
+	// promoted the root alone — it is named in the manifest and the VM is
+	// marked partial.
+	rootTaken := replicaRec.Taken
+	if rootTaken == "" {
+		if t, ok := replicaTimestamp(replica); ok {
+			rootTaken = t.UTC().Format("20060102-150405")
+		}
+	}
+	vmDisks, err := corrosion.GetVMDisks(ctx, s.db, vm.Name)
+	if err != nil {
+		if !started {
+			os.Remove(livePath)
+		}
+		return status.Errorf(codes.Unavailable, "list the disks of %s: %v", vm.Name, err)
+	}
+	acceptNotPIT := req.AcceptNotPointInTime || ((automated || req.Proof != nil) && vmAllowsAutoPromoteNotPIT(vm))
+	others := chooseSetReplicas(poolDir, vm.Project, vm.Name, rootTaken, replicaSetOthers(vmDisks, src), acceptNotPIT)
+	for i := range others {
+		d := &others[i]
+		if !d.recovered() {
+			continue
+		}
+		d.livePath = filepath.Join(poolDir, fmt.Sprintf("%s-promoted-%s.qcow2", targetName,
+			strings.TrimSuffix(strings.TrimSuffix(d.replica.File, ".qcow2"), ".raw")))
+		step := "disk_built:" + d.row.DiskName
+		_, statErr := os.Stat(d.livePath)
+		if started || promoteDiskBuilt(stepDone(step), statErr == nil) {
+			continue
+		}
+		if err := s.buildPromotedDisk(ctx, req, targetName, poolDir, d.replica.File, d.replicaPath, d.replica.Format, d.livePath, send); err != nil {
+			slog.Error("promote: a disk of the replica set could not be built; promoting without it",
+				"vm", vm.Name, "disk", d.row.DiskName, "replica", d.replica.File, "error", err)
+			d.missing = fmt.Sprintf("its replica %s could not be built into a live disk: %v", d.replica.File, err)
+			d.livePath = ""
+			continue
+		}
+		recordStep(step)
+	}
+	// Every live disk this promotion built, for the error paths below.
+	removeLive := func() {
+		os.Remove(livePath)
+		for _, d := range others {
+			if d.recovered() && d.livePath != "" {
+				os.Remove(d.livePath)
+			}
+		}
+	}
+	manifest, partial := promotionManifest(src.DiskName, replica, rootTaken, s.hostName, others)
 	multiDiskNote := ""
-	if len(spec.Disks) > 1 {
-		multiDiskNote = fmt.Sprintf(" (only root disk promoted; %d data disk(s) not recovered)", len(spec.Disks)-1)
+	if partial != "" {
+		multiDiskNote = " (" + partial + ")"
 	}
 
 	// Rebuild the promoted disk's bus/controller from the stored spec (not
@@ -1257,6 +1242,40 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		StorageVolume: pool, TargetDev: lv.DiskDevName(promBus, 0), Bus: promBus,
 		BackingDisk: liveDiskBacking(livePath, replicaPath),
 	}}
+	// The other recovered disks, each on its own bus and controller and at
+	// its own target device, so the guest finds each where it was — also
+	// when a disk between them was not recovered.
+	for i, d := range others {
+		if !d.recovered() {
+			continue
+		}
+		bus, ctrl := d.row.Bus, d.row.ControllerModel
+		for _, ds := range spec.Disks {
+			if ds.Name == d.row.DiskName {
+				if ds.Bus != "" {
+					bus = ds.Bus
+				}
+				if ds.ControllerModel != "" {
+					ctrl = ds.ControllerModel
+				}
+				break
+			}
+		}
+		if bus == "" {
+			bus = "virtio"
+		}
+		dev := d.row.TargetDev
+		if dev == "" {
+			dev = lv.DiskDevName(bus, i+1)
+		}
+		diskCfg = append(diskCfg, lv.DiskConfig{Name: d.row.DiskName, Path: d.livePath, Bus: bus, ControllerModel: ctrl, TargetDev: dev})
+		diskRecords = append(diskRecords, corrosion.DiskRecord{
+			VMName: targetName, DiskName: d.row.DiskName, HostName: s.hostName,
+			Path: d.livePath, SizeBytes: d.row.SizeBytes, StorageType: poolRef.Driver,
+			StorageVolume: pool, TargetDev: dev, Bus: bus, ControllerModel: ctrl,
+			BackingDisk: liveDiskBacking(d.livePath, d.replicaPath),
+		})
+	}
 
 	var netCfg []lv.NetworkConfig
 	var ifaceRecords []corrosion.InterfaceRecord
@@ -1268,7 +1287,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		}
 		bridge := network.FlatBridgeName(n.Name)
 		if err := s.ensureBridge(bridge); err != nil {
-			os.Remove(livePath)
+			removeLive()
 			return status.Errorf(codes.FailedPrecondition, "network bridge %q unavailable on %q: %v", bridge, s.hostName, err)
 		}
 		netCfg = append(netCfg, lv.NetworkConfig{Bridge: bridge, Model: n.Model, MAC: mac})
@@ -1303,7 +1322,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			HotplugBaseMiB: int(spec.MemoryHotplugBaseMib), HotplugMaxMiB: int(spec.MemoryHotplugMaxMib),
 		})
 		if err != nil {
-			os.Remove(livePath)
+			removeLive()
 			return status.Errorf(codes.Internal, "generate domain XML: %v", err)
 		}
 
@@ -1312,7 +1331,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			Replica: replica, DiskPath: livePath, Status: "defining domain" + multiDiskNote,
 		})
 		if err := s.virt.DefineDomain(domXML); err != nil {
-			os.Remove(livePath)
+			removeLive()
 			return status.Errorf(codes.Internal, "define domain: %v", err)
 		}
 		s.ensureSparePCIeRootPorts(targetName)
@@ -1329,7 +1348,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		// is what makes "abandon only what never ran" exact.
 		if proofID != "" {
 			if err := corrosion.AppendProofStepUnlessAbandoned(ctx, s.db, proofID, "start_attempted"); err != nil {
-				os.Remove(livePath)
+				removeLive()
 				_ = s.virt.UndefineDomain(targetName, false)
 				if errors.Is(err, corrosion.ErrProofAbandoned) {
 					s.noteGateRefused(corrosion.ActionPromote, health.ReasonClaimLost)
@@ -1340,12 +1359,12 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			}
 		}
 		if err := s.writePromoteMarker(targetName, proofID); err != nil {
-			os.Remove(livePath)
+			removeLive()
 			return status.Errorf(codes.Internal, "record promote marker: %v", err)
 		}
 		if err := s.virt.StartDomain(targetName); err != nil {
 			_ = s.virt.UndefineDomain(targetName, false) // wipe by design: half-built promote
-			os.Remove(livePath)
+			removeLive()
 			// Don't leak the marker: we tore the half-built domain down, so a later --force
 			// retry must not treat a same-name stranger as our adopted prior promotion.
 			s.removePromoteMarker(targetName)
@@ -1377,7 +1396,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		if err := promoteQuotaLease.allowCommit(ctx); err != nil {
 			_ = s.virt.DestroyDomain(targetName)
 			_ = s.virt.UndefineDomain(targetName, false)
-			os.Remove(livePath)
+			removeLive()
 			s.removePromoteMarker(targetName)
 			return err
 		}
@@ -1412,6 +1431,15 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			return status.Errorf(codes.Internal, "update disk record: %v", err)
 		}
 		_ = corrosion.UpdateDiskStorage(ctx, s.db, targetName, src.DiskName, poolRef.Driver, pool)
+		for _, d := range others {
+			if !d.recovered() {
+				continue
+			}
+			if err := corrosion.UpdateDiskHostAndPath(ctx, s.db, targetName, d.row.DiskName, s.hostName, d.livePath); err != nil {
+				return status.Errorf(codes.Internal, "update disk record %s: %v", d.row.DiskName, err)
+			}
+			_ = corrosion.UpdateDiskStorage(ctx, s.db, targetName, d.row.DiskName, poolRef.Driver, pool)
+		}
 		// The VM now runs on its replica target: replicate back to the host it left.
 		s.reverseReplicationAfterMove(ctx, "vm", targetName, "", vm.HostName, s.hostName)
 	}
@@ -1419,14 +1447,95 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	// a future retry would see the re-homed row and not re-promote.
 	s.removePromoteMarker(targetName)
 
-	s.recordVMEvent(ctx, targetName, "vm.promoted", "ok",
-		fmt.Sprintf("from replica %s on %s%s", replica, s.hostName, multiDiskNote))
+	// The manifest: every disk and the replica it came from, or why not.
+	s.recordVMEvent(ctx, targetName, "vm.promoted", "ok", manifest)
+	if partial != "" {
+		s.reportPromotedPartial(ctx, targetName, s.hostName, partial)
+	}
 	s.audit(ctx, "replica.promote", targetName, "replica="+replica+" host="+s.hostName, "ok")
 	s.recordForeignNetworks(ctx, "vm.promote", targetName, foreignNets)
 	_ = send(&pb.PromoteReplicaProgress{
 		Phase: pb.PromoteReplicaProgress_DONE, VmName: targetName, Host: s.hostName,
 		Replica: replica, DiskPath: livePath, Status: "promotion complete" + multiDiskNote,
 	})
+	return nil
+}
+
+// buildPromotedDisk builds the live disk at livePath from the replica at
+// replicaPath (recorded as format): a copy into a self-contained qcow2, or,
+// with --no-localize or no qemu-img for a raw replica, an overlay on it. It
+// refuses a file already at livePath, and leaves nothing there on a failure.
+func (s *Server) buildPromotedDisk(ctx context.Context, req *pb.PromoteReplicaRequest, targetName, poolDir, replica, replicaPath, format, livePath string, send func(*pb.PromoteReplicaProgress) error) error {
+	// A file already at livePath that this proof did not build is not ours:
+	// targetName is the caller's choice, so in a shared pool the name can be
+	// another VM's disk. Refused before anything is written, and so before
+	// any of the error paths below that remove livePath.
+	if err := refuseExistingFile(livePath); err != nil {
+		return err
+	}
+	if req.NoLocalize {
+		backingFmt := format
+		_ = send(&pb.PromoteReplicaProgress{
+			Phase: pb.PromoteReplicaProgress_LOCALIZING, VmName: targetName, Host: s.hostName, Replica: replica,
+			Status: "creating overlay backed by replica (fast; pins the replica)",
+		})
+		if err := createOverlayNoClobber(livePath, replicaPath, backingFmt); err != nil {
+			return err
+		}
+	} else if !qemuImgAvailable() && strings.HasSuffix(replica, ".raw") {
+		// Localize would convert raw→qcow2, but without qemu-img convertQcow2
+		// falls back to a verbatim byte copy — landing raw bytes in a
+		// qcow2-declared file → an unbootable/corrupt promoted VM (bug-sweep #9).
+		// Degrade to a correct qcow2 overlay backed by the raw replica
+		// (backingFmt=raw), like the NoLocalize path; it pins the replica but
+		// boots correctly. Full localization needs qemu-img on the host.
+		_ = send(&pb.PromoteReplicaProgress{
+			Phase: pb.PromoteReplicaProgress_LOCALIZING, VmName: targetName, Host: s.hostName, Replica: replica,
+			Status: "qemu-img unavailable — overlay over raw replica (pins replica; install qemu-img to localize)",
+		})
+		if err := createOverlayNoClobber(livePath, replicaPath, "raw"); err != nil {
+			return err
+		}
+		slog.Warn("promote: localized via raw-backed overlay (qemu-img absent) — replica is pinned",
+			"vm", targetName, "replica", replica)
+	} else {
+		_ = send(&pb.PromoteReplicaProgress{
+			Phase: pb.PromoteReplicaProgress_LOCALIZING, VmName: targetName, Host: s.hostName, Replica: replica,
+			Status: "copying replica into a self-contained live disk",
+		})
+		emit := func(p *pb.MoveVolumeProgress) error {
+			return send(&pb.PromoteReplicaProgress{
+				Phase: pb.PromoteReplicaProgress_LOCALIZING, VmName: targetName, Host: s.hostName, Replica: replica,
+				Status: fmt.Sprintf("copying replica… %.0f%%", p.CopyPct),
+			})
+		}
+		// Copy into a .promote-*.tmp then atomically rename, so a crash
+		// mid-copy leaves a sweepable temp (SweepStaleStaging) rather than an
+		// orphan live disk — the qemu-img child survives KillMode=process and
+		// would otherwise complete a final-named qcow2 with no domain.
+		// A fresh, unpredictable temp (O_EXCL): qemu-img convert follows a
+		// symlink at its output, so the name must not be one anything
+		// else could have planted.
+		tf, terr := storage.CreatePoolTemp(poolDir, ".promote-*.tmp")
+		if terr != nil {
+			return status.Errorf(codes.Internal, "create live-disk temp: %v", terr)
+		}
+		tmpLive := tf.Name()
+		_ = tf.Close()
+		// The replica's format comes from its record, never a probe: an
+		// incremental replica is raw GUEST content, and a probe would
+		// obey a qcow2 header the guest wrote into it. A qcow2 replica
+		// must be standalone (nil: no backing at all). convertImage
+		// pre-checks the input and requires a standalone output.
+		if err := convertImage(ctx, replicaPath, format, nil, tmpLive, emit); err != nil {
+			os.Remove(tmpLive)
+			return status.Errorf(codes.Internal, "copy replica: %v", err)
+		}
+		if err := placeNoClobber(tmpLive, livePath); err != nil {
+			os.Remove(tmpLive)
+			return err
+		}
+	}
 	return nil
 }
 

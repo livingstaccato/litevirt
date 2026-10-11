@@ -2681,6 +2681,8 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 	pbVM.FailoverHeld = s.failoverHeldReason(ctx, vm)
 	// Why the VM is held on a point-in-time overlay, if it is.
 	pbVM.PitOverlayHeld = s.pitOverlayHeldReason(ctx, vm.Name)
+	// Whether its newest promotion recovered it without its whole replica set.
+	pbVM.PromotedPartial = s.promotedPartialReason(ctx, vm.Name)
 
 	// Interfaces — run IP discovery fallback if IP is unknown.
 	ifaces, _ := corrosion.GetVMInterfaces(ctx, s.db, name)

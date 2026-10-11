@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"syscall"
@@ -121,48 +122,80 @@ func (s *Server) vmHasSharedDisk(ctx context.Context, disks []corrosion.DiskReco
 	return false
 }
 
+// sharedDiskOwners are the hosts a shared disk is judged by (review R3-I1):
+// the host its own row names AND the VM's owner, each unless it is this host.
+// After a partial promotion the VM is this host's while the disk's row still
+// names the old owner, so the VM's owner alone says nothing; and a row left
+// naming a host the VM has since left (a migration whose ownership commit
+// declined) leaves the VM's owner as the host that may be writing it. Every
+// host returned must pass the verdict. The disk's row naming this host, with
+// the VM's owner this host or none, returns none: the same-host rebuild. ok
+// is false when there is no one to judge it by — its row names no host and
+// the VM is already this host's (or no one's) — and the verdict refuses.
+func sharedDiskOwners(diskHost, vmHost, self string) (owners []string, ok bool) {
+	if diskHost == "" && (vmHost == "" || vmHost == self) {
+		return nil, false
+	}
+	for _, h := range []string{diskHost, vmHost} {
+		if h != "" && h != self && !slices.Contains(owners, h) {
+			owners = append(owners, h)
+		}
+	}
+	return owners, true
+}
+
 // sharedReattachVerdict decides whether a promotion may reattach a disk on
 // shared storage as-is, where main attached nothing — so every doubt leaves
-// it unattached (main's outcome), never refuses the promotion:
+// it unattached (main's outcome), never refuses the promotion. It judges one
+// owner: each of sharedDiskOwners in turn (the disk's own row's host and the
+// VM's, review R3-I1), self when there is none, "" when there is no one to
+// judge by:
 //
 //   - a renamed promotion never: the original VM owns the disk;
-//   - fenceProven — THIS executor verified a proof-grade fence of the owner
-//     for this promotion (a carried proof, the shared-storage fence
-//     enforced, requireProofGradeFence passed) — reattaches;
+//   - fenceProven — THIS executor verified a proof-grade fence of the VM's
+//     old owner fencedHost for this promotion (a carried proof, the
+//     shared-storage fence enforced, requireProofGradeFence passed) —
+//     reattaches a disk that host, or this one, owns; it proves nothing
+//     about any other host;
 //   - an automated promotion (the coordinator's, in-process or relayed with
 //     the automated mark) without that never: its old owner may have been
 //     fenced best-effort only, and may still be writing the disk;
 //   - every other promotion — an operator's, through any node or local-root
 //     lv, or an older coordinator's relay that carries neither a proof nor
-//     the mark — gets the manual rule: only when the owner is this host, is
-//     removed, is no longer a member, or is fenced AND proven off
-//     (ownerProvedOff: the newest fence on record for it is proof-grade, an
-//     IPMI power-off or `lv host fence-confirm` — corrosion.
-//     FenceRecordProvesOff). A `fenced` state over an SSH, watchdog or
-//     best-effort fence, or none, proves nothing: that host may still be
-//     writing the disk. --force never bypasses it;
-//   - an owner whose host row or fence record cannot be read: never (fail
-//     closed).
-func sharedReattachVerdict(renamed, automated, fenceProven bool, owner, self string, ownerHost *corrosion.HostRecord, ownerProvedOff bool, ownerErr error) (bool, string) {
+//     the mark — gets the manual rule: only when the disk's row names this
+//     host, or its owner is fenced, removed or no longer a member AND proven
+//     off (ownerProvedOff: the newest fence on record for it is
+//     proof-grade, an IPMI power-off or `lv host fence-confirm` —
+//     corrosion.FenceRecordProvesOff). A `fenced` state over an SSH,
+//     watchdog or best-effort fence, or none, proves nothing, and neither
+//     does a removal (review R3-I2): `lv host rm --force` asks for no fence,
+//     and a host whose daemon died may still be running its qemu. --force
+//     never bypasses it;
+//   - an owner whose host row or fence record cannot be read, or a disk with
+//     no owner to judge: never (fail closed).
+func sharedReattachVerdict(renamed, automated, fenceProven bool, fencedHost, owner, self string, ownerHost *corrosion.HostRecord, ownerProvedOff bool, ownerErr error) (bool, string) {
 	switch {
 	case renamed:
 		return false, "renamed"
-	case fenceProven:
+	case fenceProven && owner != "" && (owner == fencedHost || owner == self):
 		return true, ""
 	case automated:
 		return false, fmt.Sprintf("no proof-grade fence of %s was verified by this host for this promotion", owner)
-	case owner == "" || owner == self:
+	case owner == "":
+		return false, "its row names no host, so who may still be writing it cannot be judged"
+	case owner == self:
 		return true, ""
 	case ownerErr != nil:
 		return false, fmt.Sprintf("the state of its owner %s cannot be read: %v", owner, ownerErr)
+	case ownerProvedOff && (ownerHost == nil || ownerHost.State == "removed" || ownerHost.State == "fenced"):
+		return true, ""
 	case ownerHost == nil || ownerHost.State == "removed":
-		return true, ""
-	case ownerHost.State == "fenced" && ownerProvedOff:
-		return true, ""
+		return false, fmt.Sprintf("its owner %s is no longer a member of the cluster, but not proven powered off: removing a host "+
+			"does not power it off, and its newest fence is not an IPMI power-off or an operator's confirmation, "+
+			"so it may still be writing the disk", owner)
 	case ownerHost.State == "fenced":
 		return false, fmt.Sprintf("its owner %s is fenced, but not proven powered off: its newest fence is not an IPMI power-off or "+
-			"an operator's confirmation, so it may still be writing the disk; once it is off, `lv host fence-confirm %s`",
-			owner, owner)
+			"an operator's confirmation, so it may still be writing the disk", owner)
 	default:
 		return false, fmt.Sprintf("its owner %s is %s, not fenced (and no proof-grade fence was verified)", owner, ownerHost.State)
 	}
@@ -556,9 +589,23 @@ func assignTargetDevs(rootDev string, others []promotedSetDisk) {
 // reattached as-is, or why not. partial lists what makes the set incomplete,
 // "" when nothing does.
 func promotionManifest(rootDisk, rootReplica, rootTaken, host, origVM, newVM string, others []promotedSetDisk) (manifest, partial string) {
-	sharedAdvice := "attach it as-is once the old host is proven powered off (an IPMI power-off or `lv host fence-confirm`) or removed"
-	if newVM != "" && newVM != origVM {
-		sharedAdvice = fmt.Sprintf("it belongs to the original VM %s and must not be attached to %s", origVM, newVM)
+	// The remedy for a shared disk left unattached (review R3-m2). No command
+	// attaches an existing disk at its path, and a second promotion over this
+	// one is not a remedy: with --force it destroys the promoted domain, then
+	// rebuilds the disks from their replicas (losing what the promoted VM
+	// wrote) or refuses the root's live file, which is already there. So the
+	// proof has to come before the promotion.
+	sharedAdvice := func(owner string) string {
+		if newVM != "" && newVM != origVM {
+			return fmt.Sprintf("it belongs to the original VM %s and must not be attached to %s", origVM, newVM)
+		}
+		if owner == "" {
+			owner = "<host>"
+		}
+		return fmt.Sprintf("a promotion attaches it as-is only once its owner is proven off, so do that first next time: "+
+			"once %s is powered off, `lv host fence-confirm %s`. Do not re-run `lv replication promote %s --force` "+
+			"over this promotion to attach it: that destroys the promoted domain and rebuilds its disks from their "+
+			"replicas, or fails", owner, owner, origVM)
 	}
 	parts := []string{fmt.Sprintf("%s ← %s", rootDisk, rootReplica)}
 	var missing, earlier []string
@@ -569,7 +616,7 @@ func promotionManifest(rootDisk, rootReplica, rootTaken, host, origVM, newVM str
 		case d.shared:
 			parts = append(parts, fmt.Sprintf("%s: shared (%s) — NOT attached (%s)", d.row.DiskName, d.row.StorageType, d.missing))
 			missing = append(missing, fmt.Sprintf("%s (shared (%s) at %s, not attached: %s; %s)",
-				d.row.DiskName, d.row.StorageType, d.row.Path, d.missing, sharedAdvice))
+				d.row.DiskName, d.row.StorageType, d.row.Path, d.missing, sharedAdvice(d.row.HostName)))
 		case !d.recovered():
 			parts = append(parts, fmt.Sprintf("%s: NOT recovered (%s)", d.row.DiskName, d.missing))
 			where := ""

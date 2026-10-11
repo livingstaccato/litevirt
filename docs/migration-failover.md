@@ -641,6 +641,18 @@ records a `manual-confirmed` row in `fencing_log`. This gate prevents
 the coordinator from rescheduling a manually-fenced host's VMs before
 an operator has actually confirmed the fence.
 
+**A removed host can be confirmed too.** Removing a host does not power it
+off: `lv host rm --force` asks for no fence, and a host whose daemon died may
+still be running its qemu. So a replica promotion treats a removed owner of a
+shared disk like a fenced one, and reattaches the disk only when the newest
+fence on record for it is proof-grade (docs/backups.md).
+`lv host fence-confirm <host>` accepts a host that has been removed, and
+records only the `manual-confirmed` row in `fencing_log`: the host is not
+brought back and no membership state is written. Only the confirmation is
+accepted (`lv host fence <host>` refuses a removed host, since there is
+nothing left to fence it by), and a name the cluster holds no hosts row for
+at all is still not found.
+
 ### Shared-disk fence gating (host-fence-gated shared storage)
 
 A VM whose disk lives on **shared** storage (NFS/Ceph/RBD/iSCSI) is a special

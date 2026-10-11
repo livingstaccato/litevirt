@@ -1215,24 +1215,59 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	inAdopted := func(path string) bool {
 		return adoptedXML != "" && (strings.Contains(adoptedXML, "'"+path+"'") || strings.Contains(adoptedXML, `"`+path+`"`))
 	}
-	// Whether a shared disk may be reattached as-is (sharedReattachVerdict).
-	var ownerHost *corrosion.HostRecord
-	var ownerErr error
-	ownerProvedOff := false
-	if vm.HostName != "" && vm.HostName != s.hostName {
-		ownerHost, ownerErr = corrosion.GetHost(ctx, s.db, vm.HostName)
-		// A `fenced` state is proof only over a proof-grade fence record
-		// (corrosion.HostProvedOff's rule, colonelpanik/litevirt#253).
-		if ownerErr == nil && ownerHost != nil && ownerHost.State == "fenced" {
-			ownerProvedOff, ownerErr = corrosion.FenceRecordProvesOff(ctx, s.db, vm.HostName)
+	// Whether a shared disk may be reattached as-is (sharedReattachVerdict),
+	// judged per disk by the host ITS OWN row names (review R3-I1): after a
+	// partial promotion the VM is this host's while its shared disk's row
+	// still names the old owner, so the VM's owner says nothing about who
+	// may still be writing the disk. Each distinct owner is read once.
+	type sharedOwner struct {
+		host      *corrosion.HostRecord
+		provedOff bool
+		err       error
+	}
+	owners := map[string]sharedOwner{}
+	ownerOf := func(name string) sharedOwner {
+		if o, ok := owners[name]; ok {
+			return o
 		}
+		var o sharedOwner
+		o.host, o.err = corrosion.GetHost(ctx, s.db, name)
+		// A `fenced` state is proof only over a proof-grade fence record
+		// (corrosion.HostProvedOff's rule, colonelpanik/litevirt#253), and a
+		// removed host, or one with no row, is no proof at all (review
+		// R3-I2): `lv host rm --force` needs no fence, and a host whose
+		// daemon died may still run its qemu. fencing_log rows outlive the
+		// tombstone, and `lv host fence-confirm` records one for a removed host.
+		if o.err == nil && (o.host == nil || o.host.State == "fenced" || o.host.State == "removed") {
+			o.provedOff, o.err = corrosion.FenceRecordProvesOff(ctx, s.db, name)
+		}
+		owners[name] = o
+		return o
 	}
 	// Automated: the coordinator's own call, a carried proof, or a relay the
 	// coordinator marked. A relay without either (an operator through another
 	// node, local-root lv, an older coordinator) gets the manual rule.
 	sharedAutomated := autoPath || req.Automated
-	reattachOK, reattachWhy := sharedReattachVerdict(renamed, sharedAutomated, fenceProven,
-		vm.HostName, s.hostName, ownerHost, ownerProvedOff, ownerErr)
+	reattachVerdict := func(d corrosion.DiskRecord) (bool, string) {
+		judged, ok := sharedDiskOwners(d.HostName, vm.HostName, s.hostName)
+		switch {
+		case !ok:
+			judged = []string{""}
+		case len(judged) == 0:
+			judged = []string{s.hostName}
+		}
+		for _, owner := range judged {
+			var o sharedOwner
+			if owner != "" && owner != s.hostName {
+				o = ownerOf(owner)
+			}
+			if ok, why := sharedReattachVerdict(renamed, sharedAutomated, fenceProven, vm.HostName,
+				owner, s.hostName, o.host, o.provedOff, o.err); !ok {
+				return false, why
+			}
+		}
+		return true, ""
+	}
 	for i := range others {
 		d := &others[i]
 		if d.shared {
@@ -1246,10 +1281,10 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 				} else {
 					d.missing = "not attached by the attempt that started the domain"
 				}
-			case !reattachOK:
-				d.missing = reattachWhy
 			default:
-				if serr := statWithin(s.hostDiskFile(d.row.Path), sharedDiskStatTimeout); serr != nil {
+				if ok, why := reattachVerdict(d.row); !ok {
+					d.missing = why
+				} else if serr := statWithin(s.hostDiskFile(d.row.Path), sharedDiskStatTimeout); serr != nil {
 					d.missing = fmt.Sprintf("not reachable from %s: %v", s.hostName, serr)
 				} else {
 					d.livePath = d.row.Path

@@ -116,17 +116,60 @@ func TestPromote_AProofGradeFencedOwnerGivesTheSharedDisk(t *testing.T) {
 	}
 }
 
-// Fix round 4: an owner that is removed, or no longer a member at all, needs
-// no fence record: it can no longer run anything in the cluster.
+// Fix round 5 (review R3-I2): an owner that is removed, or no longer a member
+// at all, is no proof it is off — `lv host rm --force` asks for no fence, and
+// a host whose daemon died may still run its qemu on the disk. Without a
+// proof-grade newest fence the disk is left unattached; with one (an IPMI
+// power-off, or `lv host fence-confirm`, which a removed host accepts) it is
+// reattached. "tombstoned" is a host `lv host rm` deleted; "" has no hosts
+// row at all.
 //
-// Mutation "removed needs a proof too" — red.
-func TestPromote_ARemovedOwnerGivesTheSharedDisk(t *testing.T) {
-	for _, state := range []string{"removed", ""} { // "" = no hosts row
-		s := testServer(t)
-		nfsDisk := nfsPromoteVM(t, s, state)
-		promoteVia(t, s, true, true)
-		if xml := s.virt.(*libvirtfake.Fake).DefinedXML("db"); !strings.Contains(xml, nfsDisk) {
-			t.Errorf("owner %q: the shared disk was not reattached: %s", state, xml)
+// Mutation "removed trusted alone" (the verdict reattaches a removed or
+// rowless owner without the fence record) — red.
+func TestPromote_ARemovedOwnerNeedsAProofToo(t *testing.T) {
+	for _, state := range []string{"removed", "tombstoned", ""} {
+		for _, c := range []struct {
+			name, method, result string
+			want                 bool
+		}{
+			{"no fence record", "", "", false},
+			{"ssh", "ssh", "fenced", false},
+			{"best-effort-ssh", "best-effort-ssh", "fenced", false},
+			{"ipmi", "ipmi", "fenced", true},
+			{"fence-confirm", "manual", "manual-confirmed", true},
+		} {
+			for _, relayed := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%q/%s/relayed=%v", state, c.name, relayed), func(t *testing.T) {
+					s := testServer(t)
+					var nfsDisk string
+					if state == "tombstoned" {
+						nfsDisk = nfsPromoteVM(t, s, "active")
+						if err := corrosion.DeleteHost(context.Background(), s.db, "dead-host"); err != nil {
+							t.Fatal(err)
+						}
+					} else {
+						nfsDisk = nfsPromoteVM(t, s, state)
+					}
+					if c.method != "" {
+						recordOwnerFence(t, s, "f1", c.method, c.result, time.Minute)
+					}
+					promoteVia(t, s, relayed, true)
+					if !c.want {
+						assertSharedUnattached(t, s, nfsDisk, "dead-host is no longer a member of the cluster, but not proven powered off")
+						p := eventDetail(t, s, "db", vmEventPromotedPartial)
+						if !strings.Contains(p, "lv host fence-confirm dead-host") {
+							t.Errorf("partial = %q, want the remedy named", p)
+						}
+						if strings.Contains(p, "or removed") {
+							t.Errorf("partial = %q still steers to removal", p)
+						}
+						return
+					}
+					if xml := s.virt.(*libvirtfake.Fake).DefinedXML("db"); !strings.Contains(xml, nfsDisk) {
+						t.Errorf("a proven-off removed owner's shared disk was not reattached: %s", xml)
+					}
+				})
+			}
 		}
 	}
 }

@@ -36,18 +36,25 @@ func TestSharedReattachVerdict_EveryBranch(t *testing.T) {
 		{"automated, no fence proven, owner proven off", false, true, false, "old", host("fenced"), true, nil, false},
 		{"automated, no fence proven, owner maintenance", false, true, false, "old", host("maintenance"), false, nil, false},
 		{"unproven, owner is this host", false, false, false, "self", nil, false, nil, true},
-		{"unproven, no owner", false, false, false, "", nil, false, nil, true},
+		{"unproven, no owner to judge", false, false, false, "", nil, false, nil, false},
+		{"fence proven, no owner to judge", false, true, true, "", nil, false, nil, false},
+		{"fence proven, disk owned by this host", false, true, true, "self", nil, false, nil, true},
+		{"fence proven of old, disk owned by a third host", false, true, true, "third", host("fenced"), true, nil, false},
+		{"fence proven of old, manual, disk owned by a third active host", false, false, true, "third", host("active"), false, nil, false},
 		{"unproven, owner unreadable", false, false, false, "old", nil, false, errors.New("db down"), false},
 		{"unproven, owner fence record unreadable", false, false, false, "old", host("fenced"), false, errors.New("db down"), false},
-		{"unproven, owner no longer a member", false, false, false, "old", nil, false, nil, true},
-		{"unproven, owner removed", false, false, false, "old", host("removed"), false, nil, true},
+		{"unproven, owner no longer a member", false, false, false, "old", nil, false, nil, false},
+		{"unproven, owner no longer a member and proven off", false, false, false, "old", nil, true, nil, true},
+		{"unproven, owner removed", false, false, false, "old", host("removed"), false, nil, false},
+		{"unproven, owner removed and proven off", false, false, false, "old", host("removed"), true, nil, true},
+		{"unproven, owner maintenance, fence record proof-grade", false, false, false, "old", host("maintenance"), true, nil, false},
 		{"unproven, owner fenced and proven off", false, false, false, "old", host("fenced"), true, nil, true},
 		{"unproven, owner fenced best-effort only", false, false, false, "old", host("fenced"), false, nil, false},
 		{"unproven, owner maintenance", false, false, false, "old", host("maintenance"), false, nil, false},
 		{"unproven, owner offline", false, false, false, "old", host("offline"), false, nil, false},
 		{"unproven, owner active", false, false, false, "old", host("active"), false, nil, false},
 	} {
-		got, why := sharedReattachVerdict(c.renamed, c.auto, c.proven, c.owner, "self", c.h, c.provedOff, c.herr)
+		got, why := sharedReattachVerdict(c.renamed, c.auto, c.proven, "old", c.owner, "self", c.h, c.provedOff, c.herr)
 		if got != c.want {
 			t.Errorf("%s: reattach = %v (%s), want %v", c.name, got, why, c.want)
 		}

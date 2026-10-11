@@ -595,18 +595,35 @@ when its old owner provably no longer writes it:
   best-effort fence can leave a partitioned host's qemu writing the disk;
 - any other promotion — an operator's, whether the CLI reaches the replica
   host directly or through another node, local-root `lv`, or a relay from a
-  coordinator on an older build — only when the owner is removed, is no
-  longer a member, or is fenced **and proven powered off**: the newest fence
-  on record for it is proof-grade (a verified IPMI power-off, or
-  `lv host fence-confirm`), the same assurance the shared-storage fence and
-  recovery claims trust. A host recorded fenced by an SSH, watchdog or
-  best-effort fence, or with no fence record, may still be writing the disk,
-  so it is left unattached and the promotion reported partial, naming the
-  remedy: once the host is off, `lv host fence-confirm <host>`, then attach
-  the disk as-is. Not merely not
-  active either: maintenance, offline or active is not enough, and `--force`
-  does not change any of this;
-- an owner whose state or fence record cannot be read: never.
+  coordinator on an older build — only when the disk's own row names the
+  promoting host, or its owner is fenced, removed or no longer a member
+  **and proven powered off**: the newest fence on record for it is
+  proof-grade (a verified IPMI power-off, or `lv host fence-confirm`), the
+  same assurance the shared-storage fence and recovery claims trust. A host
+  recorded fenced by an SSH, watchdog or best-effort fence, or with no fence
+  record, may still be writing the disk, and so may a removed one:
+  `lv host rm --force` asks for no fence, and a host whose daemon died may
+  still be running its qemu. Such a disk is left unattached and the promotion reported
+  partial. Not merely not active either: maintenance, offline or active is
+  not enough, and `--force` does not change any of this;
+- an owner whose state or fence record cannot be read, or a disk whose row
+  names no host on a VM the promoting host already owns: never.
+
+The owner judged is the host the **disk's own row** names, and the VM's owner
+too when that is another host: each must pass. After a partial promotion the
+VM belongs to the promoting host while its shared disk's row still names the
+old owner, so a second promotion of the same VM is judged by that old owner,
+exactly as the first was; and a row left naming a host the VM has since left
+does not excuse the host the VM was running on.
+
+The remedy is to prove the owner off **before** promoting: once it is powered
+off, `lv host fence-confirm <host>` (a removed host is accepted, see
+docs/migration-failover.md), or an IPMI fence. A promotion made after that
+reattaches the disk. No command attaches an existing disk at its path to a VM
+already promoted, and re-running `lv replication promote <vm> --force` over a
+partial promotion is not a remedy: it destroys the promoted domain, then
+rebuilds the disks from their replicas (losing what the promoted VM wrote) or
+refuses the root's live file, which is already there.
 
 "Shared" here is one definition, used by this rule and by every shared-disk
 fence check (failover's decision, the promoting host's, the host that starts
@@ -620,10 +637,10 @@ hung NFS mount is given up on, and the root is promoted without it). A
 renamed promotion never attaches it: the disk belongs to the original VM.
 Whenever it is not attached the VM is promoted exactly as main promoted it,
 and the partial report names it as shared at its path, with why, and either
-"attach it as-is once the old host is proven powered off (an IPMI power-off
-or `lv host fence-confirm`) or removed" or, for a renamed
-promotion, that it belongs to the original and must not be attached to the
-copy.
+the remedy above (`lv host fence-confirm <host>` once it is powered off,
+before promoting, and not to re-run the promotion over this one) or, for a
+renamed promotion, that it belongs to the original and must not be attached
+to the copy.
 
 The `vm.promoted` event is the recovery manifest: every disk and the replica
 it came from, that it was reattached as-is, or why it was not recovered.

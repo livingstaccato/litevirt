@@ -64,6 +64,9 @@ func TestPromote_ASharedDiskIsReattachedAsIsNeverRebuilt(t *testing.T) {
 	run := "20260101-000000"
 	seedReplica(t, poolDir, "", "db", "root", run, "raw", 1<<20)
 	seedReplica(t, poolDir, "", "db", "data1", run, "raw", 1<<20) // a stale copy an earlier build made
+	// dead-host has no hosts row; since fix round 5 (review R3-I2) that is no
+	// proof it is off, so it is proven off by an IPMI fence on record.
+	recordOwnerFence(t, s, "ipmi1", "ipmi", "fenced", time.Minute)
 
 	promoteSet(t, s, &pb.PromoteReplicaRequest{VmName: "db", TargetPool: "dr", Force: true, NoLocalize: true})
 

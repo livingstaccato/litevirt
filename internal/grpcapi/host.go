@@ -873,8 +873,16 @@ func (s *Server) FenceHost(ctx context.Context, req *pb.FenceHostRequest) (*pb.F
 	}
 
 	h, err := corrosion.GetHost(ctx, s.db, req.Name)
-	if err != nil || h == nil {
+	if err != nil {
 		return nil, status.Errorf(codes.NotFound, "host %q not found", req.Name)
+	}
+	if h == nil || h.State == "removed" {
+		// A removed host can still be running: `lv host rm --force` asks for
+		// no fence, and a host whose daemon died may still run its qemu on a
+		// shared disk. Its confirmation is what lets a promotion reattach that
+		// disk (sharedReattachVerdict, review R3-I2), so it is accepted here.
+		// Nothing else is: there is nothing left to fence it by.
+		return s.confirmRemovedHostFence(ctx, req, h)
 	}
 
 	// confirm_manual_only path: operator has already powered the host off
@@ -968,6 +976,51 @@ func (s *Server) FenceHost(ctx context.Context, req *pb.FenceHostRequest) (*pb.F
 		Method:   method,
 		Result:   result,
 		Detail:   detail,
+	}, nil
+}
+
+// confirmRemovedHostFence is FenceHost for a host that has been removed from
+// the cluster (h is nil for a tombstoned row). Only an operator's
+// confirmation is accepted, and it writes the manual-confirmed fencing_log
+// row alone — no membership state: the host is no longer a member, and a
+// state write would bring its row back. fencing_log rows outlive the
+// tombstone, so corrosion.FenceRecordProvesOff reads it like any other
+// confirmation. A name this replica holds no row for at all is unknown, not
+// removed, and stays NotFound: a typo must not mint a proof.
+func (s *Server) confirmRemovedHostFence(ctx context.Context, req *pb.FenceHostRequest, h *corrosion.HostRecord) (*pb.FenceResult, error) {
+	if h == nil {
+		removed, err := corrosion.HostRemoved(ctx, s.db, req.Name)
+		if err != nil {
+			return nil, status.Errorf(codes.Unavailable, "read host %q: %v", req.Name, err)
+		}
+		if !removed {
+			return nil, status.Errorf(codes.NotFound, "host %q not found", req.Name)
+		}
+	}
+	if !req.ConfirmManualOnly {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"host %q has been removed, so there is nothing left to fence it by; once it is powered off, "+
+				"`lv host fence-confirm %s` records that", req.Name, req.Name)
+	}
+	if err := corrosion.InsertFenceLog(ctx, s.db, corrosion.FenceLogRecord{
+		ID:       randid.New(),
+		HostName: req.Name,
+		Method:   "manual",
+		Result:   "manual-confirmed",
+		Detail:   "operator confirmation via FenceHost(confirm_manual_only) of a removed host",
+	}); err != nil {
+		return nil, status.Errorf(codes.Internal, "record the confirmation: %v", err)
+	}
+	slog.Warn("manual fence of a removed host confirmed by operator", "host", req.Name)
+	s.publish("host.fence-confirmed", req.Name, "manual")
+	s.audit(ctx, "host.fence-confirm", req.Name,
+		"operator confirmed manual fence of a removed host", "manual-confirmed")
+	return &pb.FenceResult{
+		HostName: req.Name,
+		Method:   "manual",
+		Result:   "manual-confirmed",
+		Detail: "operator confirmation of a removed host recorded; a promotion made from now on may reattach " +
+			"a shared disk it owned",
 	}, nil
 }
 

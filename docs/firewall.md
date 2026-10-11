@@ -454,7 +454,7 @@ any other, its VLANs its network's to allow (see "VLAN tags"). A NIC that
 existed before has **no guard** and keeps working exactly as it did; set one
 with `lv firewall nic-guard set`. A clone's NICs are new NICs: each gets the
 default guard, not its source's relaxations or its source's lack of a record.
-So do the NICs of a renamed promotion (`lv promote --new-name`) and of a live
+So do the NICs of a renamed promotion (`lv replication promote --new-name`) and of a live
 restore under a new name: a second VM beside the original, with fresh MACs. A
 promotion or restore under the VM's own name is unchanged. A macvtap (`direct`) NIC bypasses
 the bridge and gets no guard; setting one is refused.

@@ -217,8 +217,7 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 	if life, lerr := s.accountLifecycle(ctx, principal.Subject); lerr != nil {
 		return nil, lerr
 	} else if life.SessionPredates(time.Now().UTC().Format(time.RFC3339)) {
-		return nil, status.Errorf(codes.Unavailable,
-			"the account was changed moments ago; log in again in %s", corrosion.SessionCutoffSkewMargin)
+		return nil, sessionCutoffRefusal(life, principal.Subject)
 	}
 
 	// Mandatory second factor. LocalRealm already demands an enrolled factor;
@@ -328,15 +327,43 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 	}, nil
 }
 
+// sessionCutoffRefusal is the refusal of a login made before the account's
+// session cut-off and its skew margin have passed: it says when a login will
+// work (re-review 4, m-2). A cut-off dated further ahead than the margin was
+// written by a node whose clock ran ahead; nothing but root's reset-admin
+// moves it back, so the refusal names that too.
+func sessionCutoffRefusal(life corrosion.UserLifecycle, username string) error {
+	at := life.SessionsRetryAt()
+	if corrosion.CutoffAhead(life.SessionsNotBefore, time.Now()) {
+		return status.Errorf(codes.Unavailable,
+			"the account was changed with a cut-off dated %s, in the future, so no login works until after %s; "+
+				"a node's clock is ahead (see the clock-skew health check). For an admin account, root corrects the "+
+				"cut-off at once with `lv user reset-admin --user %s` on a node whose litevirtd is running",
+			life.SessionsNotBefore, at, username)
+	}
+	return status.Errorf(codes.Unavailable,
+		"the account was changed moments ago; log in again after %s (in at most %s)", at, corrosion.SessionCutoffSkewMargin)
+}
+
 // lastAdminRefusal is the message of a last-admin refusal. Every way out it
 // names is one the refused caller — a logged-in admin — can take, with its
 // arguments (re-review 3, I1b): create another admin, enable or un-expire a
 // restricted one, or resolve a case-duplicate admin pair, which counts as no
-// admin until one spelling is deleted by its id.
+// admin until one spelling is deleted by its id. An admin the admin floor
+// reinstated without a credential counts as none either (re-review 4, m-1):
+// root gives it one with `lv user reset-admin --user`.
 func lastAdminRefusal(ctx context.Context, db *corrosion.Client, username, why string) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "user %q is the cluster's last admin account that is enabled with no expiry, and %s. "+
+	fmt.Fprintf(&b, "user %q is the cluster's last admin account that can log in, enabled with no expiry, and %s. "+
 		"First make another admin usable: create one (`lv user create <username> --role admin`)", username, why)
+	if rep, err := corrosion.AdminLoginState(ctx, db); err == nil {
+		for _, u := range rep.AwaitingCredential {
+			if u != username {
+				fmt.Fprintf(&b, "; or give %s, which the admin floor reinstated with no credential, one: as root on "+
+					"a node, `lv user reset-admin --user %s`", u, u)
+			}
+		}
+	}
 	users, err := corrosion.ListUsers(ctx, db)
 	if err == nil {
 		lifes, _ := corrosion.ListUserLifecycles(ctx, db)
@@ -447,8 +474,7 @@ func (s *Server) mintSession(ctx context.Context, username, realm, clientIP, use
 	// be refused on its first use (corrosion.SessionCutoffSkewMargin); say so
 	// now instead of handing out a dead bearer.
 	if life.SessionPredates(time.Now().UTC().Format(time.RFC3339)) {
-		return "", "", "", status.Errorf(codes.Unavailable,
-			"the account was changed moments ago; log in again in %s", corrosion.SessionCutoffSkewMargin)
+		return "", "", "", sessionCutoffRefusal(life, user.Username)
 	}
 	username = user.Username
 	id, ierr := newSessionID()

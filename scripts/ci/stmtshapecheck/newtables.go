@@ -180,7 +180,7 @@ var firstShapeAcks = map[string]string{
 		"memberlist recipient — and the feature's use recorded and acknowledged by every recipient first. " +
 		"release_guard_test.go checks each listed writer takes and checks the grant; the zero grant writes none of it. Their RPCs (IssueEnrollmentCode, and enrollment from an enrollment-only session) refuse without it",
 	"user_lifecycle": "every writer (corrosion.SetUserLifecycle, ResetUserLifecycle, and the statements " +
-		"DeleteUserCounted, ResetAdminPasswordFor and the admin floor append, all through the one " +
+		"DeleteUserCounted, ResetAdminPasswordFor, ClearIdentityBindingRows and the admin floor append, all through the one " +
 		"userLifecycleUpsertSQL) writes only with " +
 		"a capabilities.FeatureGrant for FeatureLoginPolicy, which only health.Checker.WithFeature mints: " +
 		"the release token release_2026_11_v1 DURABLY latched — mandatory, so advertised by every build carrying " +

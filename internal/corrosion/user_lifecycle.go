@@ -205,6 +205,57 @@ func (l UserLifecycle) TokenPredates(createdAt string) bool {
 	return ca.Before(nb.Add(SessionCutoffSkewMargin))
 }
 
+// SessionsRetryAt is when a login refused by SessionPredates(now) will be
+// accepted: the session cut-off plus SessionCutoffSkewMargin, RFC3339, or ""
+// when there is no readable cut-off.
+func (l UserLifecycle) SessionsRetryAt() string {
+	nb, err := time.Parse(time.RFC3339, l.SessionsNotBefore)
+	if err != nil {
+		return ""
+	}
+	return nb.Add(SessionCutoffSkewMargin).UTC().Format(time.RFC3339)
+}
+
+// CutoffAhead reports whether a stored cut-off (RFC3339) lies further in the
+// future than SessionCutoffSkewMargin from now: it was written by a node
+// whose clock runs ahead, and refuses every login (or token) until that time
+// (re-review 4, m-2). Every ordinary write keeps it (laterCutoff); only
+// reset-admin, root's break-glass, replaces it (resetCutoff).
+func CutoffAhead(stored string, now time.Time) bool {
+	t, err := time.Parse(time.RFC3339, stored)
+	return err == nil && t.After(now.Add(SessionCutoffSkewMargin))
+}
+
+// resetCutoff is the cut-off reset-admin stores: a set-back one, as a
+// re-enable's, unless the stored one is later — then the stored one, unless
+// it is ahead by more than the skew margin (CutoffAhead), which is clock error
+// and is replaced, so root can correct a forward-dated cut-off that would
+// otherwise refuse the admin's login for hours (re-review 4, m-2).
+func resetCutoff(stored string, now time.Time) string {
+	if CutoffAhead(stored, now) {
+		return setBackCutoff()
+	}
+	return laterCutoff(stored, setBackCutoff())
+}
+
+// TokenNearCutoff reports whether a token TokenPredates refuses was created
+// within SessionCutoffSkewMargin of the token cut-off, on either side: most
+// likely minted for the account on a node the delete or re-create had not
+// reached yet, which never works (re-review 4, m-4). Its refusal says so,
+// rather than reading like any revoked token.
+func (l UserLifecycle) TokenNearCutoff(createdAt string) bool {
+	nb, err := time.Parse(time.RFC3339, l.TokensNotBefore)
+	if err != nil {
+		return false
+	}
+	ca, err := time.Parse(time.RFC3339, createdAt)
+	if err != nil {
+		return false
+	}
+	d := ca.Sub(nb)
+	return d > -SessionCutoffSkewMargin && d < SessionCutoffSkewMargin
+}
+
 // laterCutoff is the cut-off a lifecycle write stores: proposed, unless the
 // stored one is later (re-review 3, m-5). A cut-off never moves backwards — a
 // write from a node whose clock is behind, or a reset-admin's set-back cut-off
@@ -449,9 +500,16 @@ func ResetUserLifecycle(ctx context.Context, c *Client, g capabilities.FeatureGr
 // deleting, username's own row is left out, so deleting one spelling of a pair
 // counts the spelling that survives it. A disable or expiry leaves the row,
 // and the pair, in place.
+//
+// Nor does an admin the admin floor reinstated that root has not yet given a
+// credential (ReinstatedAdminPasswordHash; re-review 4, m-1): no password
+// matches it and no directory login adopts it, so it is not an admin anyone
+// can log in as. The credential is resolved as AdminLoginState resolves it.
 func OtherUnrestrictedAdminExists(ctx context.Context, c *Client, username string, deleting bool) (bool, error) {
 	rows, err := c.Query(ctx,
-		`SELECT username FROM users WHERE role = 'admin' AND deleted_at IS NULL AND username != ?`, username)
+		`SELECT u.username, u.password_hash, k.username AS cred_key, k.password_hash AS cred_val
+		   FROM users u LEFT JOIN user_credentials k ON k.username = u.username AND k.deleted_at IS NULL
+		  WHERE u.role = 'admin' AND u.deleted_at IS NULL AND u.username != ?`, username)
 	if err != nil {
 		return false, err
 	}
@@ -465,6 +523,9 @@ func OtherUnrestrictedAdminExists(ctx context.Context, c *Client, username strin
 	}
 	for _, r := range rows {
 		if amb[NormalizeUsername(r.String("username"))] {
+			continue
+		}
+		if resolveCredential(r.String("cred_key") != "", r.String("cred_val"), r.String("password_hash")) == ReinstatedAdminPasswordHash {
 			continue
 		}
 		l, err := GetUserLifecycle(ctx, c, r.String("username"))

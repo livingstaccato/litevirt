@@ -107,6 +107,11 @@ const adminPasswordPath = "/etc/litevirt/admin-password"
 // so beats hanging a recovery command.
 const resetAdminRPCTimeout = 30 * time.Second
 
+// resetAdminUserSchema is the first schema version of a litevirtd that knows
+// ResetAdminPasswordRequest.username (--user). Every released build, and
+// main, is below it.
+const resetAdminUserSchema = 64
+
 // resetAdminEnv is everything reset-admin touches, so a test can point it at a
 // temporary data dir and a daemon of its choosing.
 type resetAdminEnv struct {
@@ -144,6 +149,10 @@ func runResetAdmin(ctx context.Context, env resetAdminEnv) error {
 	client, closeConn, err := env.connect()
 	if err != nil {
 		return fmt.Errorf("reach the local daemon: %w", err)
+	}
+	if err := refuseUserOnOlderDaemon(ctx, client, env.username); err != nil {
+		closeConn()
+		return err
 	}
 	rpcCtx, cancel := context.WithTimeout(ctx, resetAdminRPCTimeout)
 	resp, err := client.ResetAdminPassword(rpcCtx, &pb.ResetAdminPasswordRequest{
@@ -198,6 +207,30 @@ func runResetAdmin(ctx context.Context, env resetAdminEnv) error {
 	}
 	defer db.Close()
 	return resetAdminOffline(ctx, db, env.dataDir, env.pwPath, env.osUser, env.username, password, hash, env.clear2FA, env.out)
+}
+
+// refuseUserOnOlderDaemon refuses --user, before anything is reset, when the
+// local daemon's Ping shows a build from before the field (re-review 4,
+// m-7): that daemon ignores it and resets "admin" — possibly a colleague's
+// live password — whatever was named. Plain reset-admin (or --user admin) is
+// not probed. A Ping that fails says nothing about the build and refuses
+// nothing: the reset is asked as before, and the after-the-fact check in
+// runResetAdmin still stands behind it (an unreleased build at the same
+// schema version predates --user too).
+func refuseUserOnOlderDaemon(ctx context.Context, client pb.LiteVirtClient, username string) error {
+	if username == "" || corrosion.NormalizeUsername(username) == "admin" {
+		return nil
+	}
+	pingCtx, cancel := context.WithTimeout(ctx, resetAdminRPCTimeout)
+	defer cancel()
+	resp, err := client.Ping(pingCtx, &pb.PingRequest{})
+	if err != nil || resp.GetSchemaVersion() >= resetAdminUserSchema {
+		return nil
+	}
+	return fmt.Errorf("litevirtd on this node predates --user (its schema version is %d; --user needs %d): "+
+		"it would reset the password of \"admin\", not of %q, so nothing was changed. Restart litevirtd on "+
+		"this node with the installed binary, then run `lv user reset-admin --user %s` again",
+		resp.GetSchemaVersion(), resetAdminUserSchema, username, username)
 }
 
 // printEnrollmentCode tells the operator the admin's first-enrollment code, or

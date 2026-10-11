@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -119,7 +120,24 @@ func ResetAdminPasswordFor(ctx context.Context, c *Client, run FeatureRun, usern
 		return nil
 	}
 	if !clearTwoFactor && life.Unrestricted() {
-		return write(ctx, capabilities.FeatureGrant{})
+		if !cutoffsAhead(life, time.Now()) {
+			return write(ctx, capabilities.FeatureGrant{})
+		}
+		// Only the forward-dated cut-off's correction needs the release
+		// feature (re-review 4, m-2). A gate that does not open must not
+		// cost root the plain password reset it had before: reset without
+		// the correction, which the login's refusal still names.
+		wrote := false
+		err := run.run(ctx, func(ctx context.Context, g capabilities.FeatureGrant) error {
+			wrote = true
+			return write(ctx, g)
+		})
+		if err != nil && !wrote {
+			slog.Warn("reset-admin could not open the login_policy feature to correct a cut-off dated in the future; "+
+				"resetting the password only", "user", name, "error", err)
+			return write(ctx, capabilities.FeatureGrant{})
+		}
+		return err
 	}
 	return run.run(ctx, write)
 }
@@ -133,6 +151,7 @@ func resetAdminStatements(ctx context.Context, c *Client, g capabilities.Feature
 	passwordHash string, clearTwoFactor bool) ([]Statement, error) {
 	granted := g.Check(capabilities.FeatureLoginPolicy) == nil
 	now := c.NowTS()
+	nowT := time.Now()
 	var stmts []Statement
 	if clearTwoFactor {
 		if !granted {
@@ -168,11 +187,28 @@ func resetAdminStatements(ctx context.Context, c *Client, g capabilities.Feature
 		//
 		// It never moves the stored cut-off backwards (re-review 3, m-5): a
 		// disable written in the last few seconds, or by a node whose clock
-		// runs ahead, keeps its later cut-off, and the operator's login waits
-		// out that margin instead.
+		// runs a little ahead, keeps its later cut-off, and the operator's
+		// login waits out that margin instead. One dated further ahead than
+		// the margin is clock error, and is replaced (resetCutoff).
 		stmts = append(stmts, Statement{SQL: userLifecycleUpsertSQL,
-			Params: []interface{}{name, UserAttrSessionsNotBefore,
-				laterCutoff(life.SessionsNotBefore, setBackCutoff()), "user.reset-admin", now}})
+			Params: []interface{}{name, UserAttrSessionsNotBefore, resetCutoff(life.SessionsNotBefore, nowT),
+				"user.reset-admin", now}})
+	} else if granted && CutoffAhead(life.SessionsNotBefore, nowT) {
+		stmts = append(stmts, Statement{SQL: userLifecycleUpsertSQL,
+			Params: []interface{}{name, UserAttrSessionsNotBefore, setBackCutoff(), "user.reset-admin", now}})
+	}
+	// A cut-off further ahead than the skew margin was written by a node
+	// whose clock runs ahead and refuses the admin's logins (or new tokens)
+	// until that time; every other write keeps it. Root replaces it here
+	// (re-review 4, m-2). Without the grant (litevirtd down, or its gate not
+	// open) the password is still reset, as before the login rules.
+	if granted && CutoffAhead(life.TokensNotBefore, nowT) {
+		stmts = append(stmts, Statement{SQL: userLifecycleUpsertSQL,
+			Params: []interface{}{name, UserAttrTokensNotBefore, setBackCutoff(), "user.reset-admin", now}})
+	}
+	if granted && cutoffsAhead(life, nowT) {
+		slog.Warn("reset-admin replaced a cut-off dated in the future: a node's clock ran ahead when it was written",
+			"user", name, "sessions_not_before", life.SessionsNotBefore, "tokens_not_before", life.TokensNotBefore)
 	}
 	pw, err := updateUserPasswordStatements(ctx, c, name, passwordHash, now)
 	if err != nil {
@@ -180,6 +216,12 @@ func resetAdminStatements(ctx context.Context, c *Client, g capabilities.Feature
 	}
 	stmts = append(stmts, pw...)
 	return stmts, nil
+}
+
+// cutoffsAhead reports whether either of life's cut-offs is dated further
+// ahead than the skew margin (CutoffAhead).
+func cutoffsAhead(life UserLifecycle, now time.Time) bool {
+	return CutoffAhead(life.SessionsNotBefore, now) || CutoffAhead(life.TokensNotBefore, now)
 }
 
 // ResetAdminAuditDetail is the detail of a user.reset-admin row, shared with the

@@ -1101,8 +1101,8 @@ lv user expire <username> <RFC3339|never>   # Stop authenticating at that instan
 ```
 
 `lv user ls` shows each account's STATUS (`active`, `disabled`, `expired`) and
-EXPIRES. Disable and expiry are refused for the last admin that is enabled with
-no expiry, and until the cluster upgrade has finished (the release feature
+EXPIRES. Disable and expiry are refused for the last admin that can log in,
+enabled with no expiry, and until the cluster upgrade has finished (the release feature
 `login_policy`; `lv cluster upgrade-status`). See
 `docs/auth.md`, "Account lifecycle".
 

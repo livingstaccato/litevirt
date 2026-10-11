@@ -154,8 +154,12 @@ through that realm are refused, naming `lv user unbind <name> <realm>`, until
 an admin clears them. Every conflict is audited as `auth.identity_conflict`.
 One entry bound to two accounts by two nodes is decided the same way. A
 session minted through the later binding on the lagging node, before the
-first binding reached it, is not cut by the conflict; it lives until it
-expires or an admin revokes it (`lv session revoke`, or `lv user disable`).
+first binding reached it, ends when a login through the binding that holds
+clears the later ones: that login also sets the account's session cut-off,
+so every other session of the account from before it ends too (one logout
+of the legitimate user's other sessions, once per conflict). Until that
+login it lives, unless an admin revokes it (`lv session revoke`, or
+`lv user disable`).
 
 *Bindings are per realm.* An account bound in `ldap:corp` is still reachable
 by a first login of the same name through any other external realm, which
@@ -614,10 +618,20 @@ cut-off at the create, and `lv user token-create` for it in the next 5 s is
 refused with a retry message rather than minting a token that would never
 work; for a name new to the node, and for sessions, the cut-off is set back
 by the margin and a second, so a login or token right after `lv user create`
-works at once (even just after a delete, as before). No other lifecycle
+works at once (even just after a delete, as before). A token minted through
+another node within those 5 s, before the re-create reached that node, is
+refused once the cut-off arrives and never works; its refusal says so. Create
+the token through the node the name was re-created on, or wait 5 s. No other lifecycle
 write moves a cut-off backwards: a re-enable, an expiry change or
 `lv user reset-admin` just after a disable, or from a node whose clock is
-behind, keeps the later cut-off, and a login in its margin is told to retry.
+behind, keeps the later cut-off, and a login in its margin is told to retry,
+and when. The one exception is a cut-off dated more than 5 s in the future,
+written by a node whose clock ran ahead: it refuses every login (or new API
+token) of the account until that time, and the refusal names the time.
+`lv user reset-admin` (as root, with litevirtd running) replaces such a
+cut-off on the admin account it resets, `--user <name>` for another admin,
+and logs that it did; with the daemon down it resets the password and leaves
+the cut-off.
 
 **Where and when it holds.** Each node judges against its own replica and its
 own clock. A change takes effect on a node when its row arrives there: on the
@@ -651,7 +665,7 @@ ends the tunnel and the SPICE connection in it; restarting the VM also ends
 it. `lv user disable` alone stops only new `lv spice` calls.
 
 Admin only, audited as `user.account`. Refused for the cluster's last admin
-that is enabled with no expiry — `lv user delete` applies the same rule — and
+that can log in, enabled with no expiry — `lv user delete` applies the same rule — and
 until the cluster upgrade has finished (the release feature `login_policy`). Two admins restricting each
 other on two nodes at once can still race past that guard; every node then
 raises the `no_unrestricted_admin` health condition (critical), and the floor
@@ -682,7 +696,8 @@ instead, which root runs with credentials.json moved aside. A deleted
 account under a variant spelling is brought back under its own name by a
 directory login, so it keeps its disable. Every last-admin refusal names, with
 its arguments, what the refused admin can do instead: create an admin, enable
-one or lift its expiry, or resolve a pair.
+one or lift its expiry, resolve a pair, or give an admin the floor reinstated
+with no credential one (`lv user reset-admin --user <name>`, as root).
 
 **The one credential a disable cannot reach** is the distributable `lv-cli`
 client certificate: it authenticates as the cluster admin with no user behind
@@ -1050,7 +1065,13 @@ new random password, written to `/etc/litevirt/admin-password` (mode 0600). It
 never creates an admin: on a node with no live admin it refuses, because a
 joining node's credential replicates in and a deleted admin stays deleted.
 `--user <name>` resets another admin-role account instead (refused for an
-account whose role is not admin); the reset prints the account it reset. If
+account whose role is not admin); the reset prints the account it reset.
+Before sending `--user`, the CLI asks the running litevirtd its build's schema
+version (`Ping`): a daemon from before `--user` would reset `admin`
+whatever was named, so it is refused with nothing changed, and the CLI says
+to restart litevirtd with the installed binary. (A daemon that cannot be
+asked is sent the request; if it reset `admin` instead, the CLI says so and
+keeps that new password in the file.) If
 the `admin` account is disabled or has an expiry, the reset also clears both,
 so it recovers an account locked out by `lv user disable` or `lv user expire`
 too (with litevirtd running, once the cluster upgrade has finished; with the
@@ -1070,7 +1091,19 @@ admin stays external: it gets no local password, the directory bindings its
 delete cleared are restored, and it logs in through its realm as before (an
 admin deleted by an earlier release had no binding, and binds at its next
 login). Its old sessions, API tokens and second factors do not come back
-either. A previous-release host still
+either. If its directory entry is gone (people leave), it cannot log in, yet
+counts as an admin who can: give it a local password with
+`lv user reset-admin --user <name>`, as root on a node. Until root gives a
+LOCAL reinstated admin a credential it is no admin anyone can log in as, so
+the last-admin guard does not count it: the one admin who can log in is not
+allowed to delete, disable or expire itself beside it, and the refusal names
+`lv user reset-admin --user <name>`. Before the release feature `login_policy`
+has opened (mid-upgrade), the floor revokes only the sessions held by the
+node that reinstated the account; a session of a pre-upgrade delete that
+never reached that node authenticates on the node that holds it until it
+expires or an admin revokes it (`lv session revoke`), and a node does not
+re-run the floor once the reinstatement reaches it. Once the feature has
+opened, the durable cut-offs cover every node. A previous-release host still
 runs the old floor, which restores the old password: finish the roll before
 deleting admins.
 

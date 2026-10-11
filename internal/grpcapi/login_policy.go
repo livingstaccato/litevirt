@@ -142,9 +142,25 @@ func (s *Server) refuseInactiveToken(ctx context.Context, username, createdAt st
 		return err
 	}
 	if life.TokenPredates(createdAt) {
-		return status.Error(codes.Unauthenticated, "API token predates the account's last delete or re-create")
+		return status.Error(codes.Unauthenticated, tokenCutoffRefusal(life, createdAt, ""))
 	}
 	return nil
+}
+
+// tokenCutoffRefusal is the message of an API token TokenPredates refuses,
+// prefixed by prefix. A token created within the skew margin of the cut-off
+// was most likely minted on a node the account's delete or re-create had not
+// reached yet: it never works, and the message says why and what to do
+// (re-review 4, m-4).
+func tokenCutoffRefusal(life corrosion.UserLifecycle, createdAt, prefix string) string {
+	if life.TokenNearCutoff(createdAt) {
+		return fmt.Sprintf("%sAPI token was created at %s, within %s of the account's last delete or re-create "+
+			"(%s), and the cut-off that change set refuses it: a token minted for the re-created account on a node "+
+			"the change had not reached yet never works; create a new token, through the node the account was "+
+			"re-created on, or once the change has replicated", prefix, createdAt, corrosion.SessionCutoffSkewMargin,
+			life.TokensNotBefore)
+	}
+	return prefix + "API token predates the account's last delete or re-create"
 }
 
 // refuseInactiveSession is refuseInactiveAccount for a session created at

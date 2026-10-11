@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -337,7 +338,8 @@ const (
 	// known, or would not take the chown: anyone may create in it (qemu
 	// must), nobody but root may list it, and the sticky bit keeps one user
 	// from removing or renaming another's entry. It is safe only because its
-	// name is unguessable and its root is 0711: nobody else can find it.
+	// name is unguessable and it sits in a fresh, root-owned 0711 directory
+	// (makeSessionDir): nobody else can find it.
 	backupSessionFallbackMode = fs.ModeSticky | 0o733
 )
 
@@ -385,6 +387,11 @@ func checkBackupRoot(root string) error {
 // beside it, kept with everything in it, logged, and made afresh: never
 // deleted, and never a reason to refuse the backup.
 func ensureBackupRoot(root string) error {
+	// One at a time in this daemon: two sessions starting together would
+	// otherwise both make a missing root (one failing on EEXIST), or one would
+	// set aside the root the other has just made.
+	backupRootMu.Lock()
+	defer backupRootMu.Unlock()
 	if err := os.MkdirAll(filepath.Dir(root), 0o755); err != nil {
 		return fmt.Errorf("mkdir %s: %w", filepath.Dir(root), err)
 	}
@@ -416,7 +423,13 @@ func ensureBackupRoot(root string) error {
 		slog.Warn("backup session: a backup directory was not root's own 0711 directory; it is set aside, with everything in it, and made afresh",
 			"path", root, "set_aside_as", aside, "reason", bad.Error())
 	}
+	beforeRootMkdir(root)
 	if err := os.Mkdir(root, backupRootMode); err != nil {
+		if errors.Is(err, fs.ErrExist) {
+			// Made meanwhile by someone else (another process; this daemon's
+			// sessions are serialised above): validate what is there.
+			return checkBackupRoot(root)
+		}
 		return fmt.Errorf("mkdir %s: %w", root, err)
 	}
 	if err := os.Chmod(root, backupRootMode); err != nil {
@@ -424,6 +437,13 @@ func ensureBackupRoot(root string) error {
 	}
 	return checkBackupRoot(root)
 }
+
+// backupRootMu serialises ensureBackupRoot.
+var backupRootMu sync.Mutex
+
+// beforeRootMkdir runs just before ensureBackupRoot makes a root; a test makes
+// the root there, as a concurrent maker would.
+var beforeRootMkdir = func(string) {}
 
 // PrepareBackupRoots narrows the backup session roots once at daemon start,
 // as the first session would: an upgraded host that runs no backup does not
@@ -443,35 +463,67 @@ func prepareBackupRoots(roots ...string) {
 	}
 }
 
-// makeSessionDir makes a NEW directory named prefix+suffix in root — a mkdir
-// that fails if the name exists, so nothing already there is ever adopted;
-// a taken name is skipped for another suffix — and gives it to qemu's user.
-func makeSessionDir(root, prefix string, owner qemuOwner) (string, error) {
-	var dir string
+// mkdirFresh makes a NEW directory named prefix+suffix in parent with mode
+// 0700 — a mkdir that fails if the name exists, so nothing already there is
+// ever adopted; a taken name is skipped for another suffix.
+func mkdirFresh(parent, prefix string) (string, error) {
 	for attempt := 0; ; attempt++ {
-		dir = filepath.Join(root, prefix+sessionSuffix())
+		dir := filepath.Join(parent, prefix+sessionSuffix())
 		err := os.Mkdir(dir, backupSessionMode)
 		if err == nil {
-			break
+			return dir, nil
 		}
 		if !errors.Is(err, fs.ErrExist) || attempt >= 8 {
 			return "", fmt.Errorf("mkdir %s: %w", dir, err)
 		}
 	}
-	mode := backupSessionFallbackMode
+}
+
+// makeSessionDir makes a session's NEW directory in root and gives it to
+// qemu's user, 0700.
+//
+// When qemu's user is not known, or the chown is refused, the session
+// directory is 01733 (anyone may create in it; qemu must). It is then not made
+// in root itself but one level down: the fresh directory just made becomes a
+// root-owned 0711 intermediate, and the 01733 directory is made inside it,
+// also with an unguessable name. A directory fd or inotify watch someone
+// opened on root while an earlier build left it 0777 may learn the
+// intermediate's name, but cannot list or watch the intermediate — that inode
+// was never readable by anyone but root — so it learns nothing of the session
+// directory. Socket path: 29 + "/" 1 + 16 + "/" 1 + 16 + "/nbd" 4 = 67 bytes.
+func makeSessionDir(root, prefix string, owner qemuOwner) (string, error) {
+	dir, err := mkdirFresh(root, prefix)
+	if err != nil {
+		return "", err
+	}
 	if owner.Known {
-		if cerr := lchown(dir, owner.UID, owner.GID); cerr != nil {
-			slog.Warn("backup session: could not give the session directory to qemu's user; it is sticky, in an unlistable directory, instead",
-				"dir", dir, "uid", owner.UID, "gid", owner.GID, "error", cerr)
-		} else {
-			mode = backupSessionMode
+		cerr := lchown(dir, owner.UID, owner.GID)
+		if cerr == nil {
+			if err := os.Chmod(dir, backupSessionMode); err != nil {
+				_ = os.Remove(dir)
+				return "", fmt.Errorf("chmod %s: %w", dir, err)
+			}
+			return dir, nil
 		}
+		slog.Warn("backup session: could not give the session directory to qemu's user; it is sticky, in a fresh unlistable directory, instead",
+			"dir", dir, "uid", owner.UID, "gid", owner.GID, "error", cerr)
 	}
-	if err := os.Chmod(dir, mode); err != nil {
-		_ = os.Remove(dir)
-		return "", fmt.Errorf("chmod %s: %w", dir, err)
+	mid := dir
+	if err := os.Chmod(mid, backupRootMode); err != nil {
+		_ = os.Remove(mid)
+		return "", fmt.Errorf("chmod %s: %w", mid, err)
 	}
-	return dir, nil
+	inner, err := mkdirFresh(mid, "")
+	if err != nil {
+		_ = os.Remove(mid)
+		return "", err
+	}
+	if err := os.Chmod(inner, backupSessionFallbackMode); err != nil {
+		_ = os.Remove(inner)
+		_ = os.Remove(mid)
+		return "", fmt.Errorf("chmod %s: %w", inner, err)
+	}
+	return inner, nil
 }
 
 // prepareBackupSessionPaths makes the scratch and NBD socket paths of one
@@ -483,13 +535,14 @@ func makeSessionDir(root, prefix string, owner qemuOwner) (string, error) {
 // world-writable with no sticky bit, so any local user could replace the socket
 // the daemon reads the guest's disk from. Now:
 //
-//   - scratchRoot and sockRoot must be root-owned, real 0711 directories;
-//     one that is not is set aside and made afresh (ensureBackupRoot);
+//   - scratchRoot and sockRoot must be root-owned, real 0711 directories
+//     (ensureBackupRoot narrows root's own, sets anything else aside);
 //   - every session makes a NEW directory in each, never an existing one:
 //     <scratchRoot>/<tag>.<16 hex> and <sockRoot>/<16 hex>, given to qemu's
 //     uid:gid and 0700 — or, when that user is not known or the chown is
-//     refused, 01733, which is safe only because the name is unguessable and
-//     the root unlistable;
+//     refused, a 01733 directory one level further down, inside that fresh
+//     directory made a root-owned 0711 intermediate (makeSessionDir; the
+//     fallback socket path is 67 bytes);
 //   - the scratch is <dir>/scratch and the socket <dir>/nbd. The socket's
 //     directory is the suffix alone, so its path does not depend on the VM's
 //     name: len("/var/lib/litevirt/backup-sock") 29 + "/" 1 + 16 + "/nbd" 4
@@ -506,12 +559,12 @@ func prepareBackupSessionPaths(scratchRoot, sockRoot, tag string, owner qemuOwne
 		return "", "", err
 	}
 	if err := ensureBackupRoot(sockRoot); err != nil {
-		_ = os.Remove(sd)
+		removeSessionDir(sd)
 		return "", "", err
 	}
 	kd, err := makeSessionDir(sockRoot, "", owner)
 	if err != nil {
-		_ = os.Remove(sd)
+		removeSessionDir(sd)
 		return "", "", err
 	}
 	return filepath.Join(sd, "scratch"), filepath.Join(kd, "nbd"), nil
@@ -525,8 +578,30 @@ func removeBackupSessionPaths(scratch, socket string) {
 			continue
 		}
 		_ = os.Remove(p)
-		_ = os.Remove(filepath.Dir(p)) // rmdir: only when empty
+		removeSessionDir(filepath.Dir(p))
 	}
+}
+
+// removeSessionDir rmdirs a session directory, and then the fallback's
+// intermediate above it when it is one (a session name, never a root),
+// each only when empty.
+func removeSessionDir(dir string) {
+	if os.Remove(dir) != nil {
+		return
+	}
+	if parent := filepath.Dir(dir); isSessionDirName(filepath.Base(parent)) {
+		_ = os.Remove(parent)
+	}
+}
+
+// isSessionDirName reports a name makeSessionDir gives: 16 hex, or
+// <tag>.<16 hex>.
+func isSessionDirName(name string) bool {
+	if isSessionSuffix(name) {
+		return true
+	}
+	i := strings.LastIndexByte(name, '.')
+	return i > 0 && isSessionSuffix(name[i+1:])
 }
 
 // sweepStaleScratch removes what crashed sessions of tag's disk left in root:
@@ -564,6 +639,16 @@ func sweepStaleScratch(root, tag, keep string) {
 			continue
 		}
 		_ = os.Remove(filepath.Join(dir, "scratch"))
+		// A fallback session's scratch is one directory deeper.
+		if inner, err := os.ReadDir(dir); err == nil {
+			for _, ie := range inner {
+				in := filepath.Join(dir, ie.Name())
+				if fi, err := os.Lstat(in); err == nil && fi.IsDir() && isSessionSuffix(ie.Name()) {
+					_ = os.Remove(filepath.Join(in, "scratch"))
+					_ = os.Remove(in)
+				}
+			}
+		}
 		if err := os.Remove(dir); err == nil {
 			slog.Info("backup session: removed a crashed session's scratch", "dir", dir)
 		}

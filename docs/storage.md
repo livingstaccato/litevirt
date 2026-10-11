@@ -223,8 +223,11 @@ belongs to the user qemu runs as for that VM (libvirt's DAC label, resolved by
 name when it is one) and is `0700`, so no other local user can reach the socket
 or the scratch. If that user cannot be read from the domain, or the chown is
 refused, the session directory is `01733` instead: every local user may create
-entries in it, but its name is unguessable and nobody but root can list the
-directory it is in, so nobody else can find it. Both parent directories must be
+entries in it, so it is made one level further down, inside a fresh root-owned
+`0711` directory that the session makes with its own unguessable name. Nobody
+but root can list either directory, and the fresh one was never readable by
+anyone else, so nobody else can find the session directory, not even a process
+that opened the parent while an earlier release left it `0777`. Both parent directories must be
 root's own `0711` directories. Earlier releases set them to `0777` at every
 session; at daemon start and at every session, root's own directory with
 another mode is narrowed to `0711` in place (safe, because a session never uses

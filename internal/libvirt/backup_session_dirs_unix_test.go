@@ -8,8 +8,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/randid"
 )
@@ -171,7 +173,7 @@ func TestBackupSessionPaths_SocketPathFitsWhateverTheName(t *testing.T) {
 	base := t.TempDir()
 	sockRoot := filepath.Join(base, "k")
 	long := strings.Repeat("v", 80) + "-vda"
-	_, socket, err := prepareBackupSessionPaths(filepath.Join(base, "s"), sockRoot, long, qemuOwner{})
+	_, socket, err := prepareBackupSessionPaths(filepath.Join(base, "s"), sockRoot, long, qemuOwner{UID: 1, GID: 1, Known: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,6 +182,18 @@ func TestBackupSessionPaths_SocketPathFitsWhateverTheName(t *testing.T) {
 	}
 	if n := len(sessSocketDir) + 1 + 2*randid.Bytes + len("/nbd"); n != 50 || n > 107 {
 		t.Errorf("the production socket path is %d bytes, want 50 (limit 107)", n)
+	}
+	// The 01733 fallback adds one 16-hex intermediate directory:
+	// 29 + 1 + 16 + 1 + 16 + 4 = 67 bytes, still under 107.
+	_, fsock, err := prepareBackupSessionPaths(filepath.Join(base, "s"), sockRoot, long, qemuOwner{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := len(sockRoot) + 2*(1+2*randid.Bytes) + len("/nbd"); len(fsock) != want {
+		t.Errorf("fallback socket %q is %d bytes, want %d", fsock, len(fsock), want)
+	}
+	if n := len(sessSocketDir) + 2*(1+2*randid.Bytes) + len("/nbd"); n != 67 || n > 107 {
+		t.Errorf("the production fallback socket path is %d bytes, want 67 (limit 107)", n)
 	}
 }
 
@@ -606,5 +620,191 @@ func TestSweepStaleScratch_TakesTheEarlierBuildsScratchOfThisDisk(t *testing.T) 
 	}
 	if _, err := os.Stat(target); err != nil {
 		t.Errorf("a symlink's target was removed: %v", err)
+	}
+}
+
+// Fix round 3, m2: in the 01733 fallback, the session directory is not made
+// in the root itself but in a fresh, root-owned 0711 directory of its own
+// (unguessable name, exclusive mkdir) inside the root. A directory fd or an
+// inotify watch opened on the root while an earlier build left it 0777 can
+// learn the intermediate's name, but cannot list it or watch it: that inode
+// was never readable by anyone but root. The normal, qemu-owned 0700 session
+// directory needs no intermediate.
+//
+// Mutation: make the fallback session directory directly in the root — red;
+// an intermediate that is not 0711 — red.
+func TestBackupSessionPaths_FallbackSitsInAFreshUnlistableDirectory(t *testing.T) {
+	backupDirsUmask022(t)
+	recordChown(t, false)
+	asRoot(t)
+	base := t.TempDir()
+	scratchRoot, sockRoot := filepath.Join(base, "s"), filepath.Join(base, "k")
+	scratch, socket, err := prepareBackupSessionPaths(scratchRoot, sockRoot, "v-vda", qemuOwner{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for p, root := range map[string]string{scratch: scratchRoot, socket: sockRoot} {
+		session := filepath.Dir(p)
+		mid := filepath.Dir(session)
+		if mid == root {
+			t.Fatalf("the fallback session directory %s is directly in the root", session)
+		}
+		if filepath.Dir(mid) != root {
+			t.Fatalf("%s is not one directory below the root %s", mid, root)
+		}
+		if got := modeOf(t, mid); got != 0o711 {
+			t.Errorf("intermediate %s is %04o, want 0711", mid, got)
+		}
+		if uid, ok := backupOwnerOf(mid, mustLstat(t, mid)); !ok || uid != 0 {
+			t.Errorf("intermediate %s is owned by uid %d, want root", mid, uid)
+		}
+		if !isSessionSuffix(filepath.Base(session)) {
+			t.Errorf("the session directory's name %q is not an unguessable suffix", filepath.Base(session))
+		}
+	}
+	// The known-owner session needs none.
+	ks, kk, err := prepareBackupSessionPaths(scratchRoot, sockRoot, "v-vda", qemuOwner{UID: 1, GID: 1, Known: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Dir(filepath.Dir(ks)) != scratchRoot || filepath.Dir(filepath.Dir(kk)) != sockRoot {
+		t.Errorf("a qemu-owned session got an intermediate: %s %s", ks, kk)
+	}
+	// Removing the session removes the intermediate too, and never the root.
+	removeBackupSessionPaths(scratch, socket)
+	if got := entries(t, scratchRoot); len(got) != 1 {
+		t.Errorf("scratch root after removing the fallback session: %v, want only the qemu-owned session's", got)
+	}
+	if got := entries(t, sockRoot); len(got) != 1 {
+		t.Errorf("socket root after removing the fallback session: %v, want only the qemu-owned session's", got)
+	}
+	removeBackupSessionPaths(ks, kk)
+	for _, r := range []string{scratchRoot, sockRoot} {
+		if _, err := os.Stat(r); err != nil {
+			t.Errorf("removing a session removed the root %s: %v", r, err)
+		}
+	}
+}
+
+func mustLstat(t *testing.T, p string) fs.FileInfo {
+	t.Helper()
+	fi, err := os.Lstat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fi
+}
+
+// A crashed fallback session's scratch, one directory deeper, is swept too.
+func TestSweepStaleScratch_TakesACrashedFallbackSession(t *testing.T) {
+	base := t.TempDir()
+	mid := filepath.Join(base, "v-vda."+strings.Repeat("a", 16))
+	inner := filepath.Join(mid, strings.Repeat("b", 16))
+	if err := os.MkdirAll(inner, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inner, "scratch"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sweepStaleScratch(base, "v-vda", "")
+	if _, err := os.Lstat(mid); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("a crashed fallback session is left: %v", err)
+	}
+}
+
+// Fix round 3, m1: two sessions that find the root missing at the same moment
+// both go on: one makes it, the other finds it made and validates it. Nothing
+// fails, and the root is made once.
+//
+// Mutation: return the EEXIST from the root's mkdir — red. (The mutex is pinned
+// by the set-aside test below.)
+func TestEnsureBackupRoot_AConcurrentlyMadeRootIsValidatedNotFailed(t *testing.T) {
+	backupDirsUmask022(t)
+	asRoot(t)
+	base := t.TempDir()
+	root := filepath.Join(base, "backup-sock")
+	// Another maker wins between this one's check and its mkdir.
+	old := beforeRootMkdir
+	beforeRootMkdir = func(r string) {
+		if r == root {
+			_ = os.Mkdir(r, 0o711)
+			_ = os.Chmod(r, 0o711)
+		}
+	}
+	err := ensureBackupRoot(root)
+	beforeRootMkdir = old
+	if err != nil {
+		t.Fatalf("a root another session made meanwhile failed this one: %v", err)
+	}
+
+	root2 := filepath.Join(base, "backup-scratch")
+	var wg sync.WaitGroup
+	errs := make(chan error, 32)
+	start := make(chan struct{})
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			errs <- ensureBackupRoot(root2)
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Errorf("a concurrent session failed: %v", err)
+		}
+	}
+	for _, e := range entries(t, base) {
+		if strings.Contains(e, ".aside-") {
+			t.Errorf("concurrent sessions set a fresh root aside: %s", e)
+		}
+	}
+}
+
+// Fix round 3, m1: sessions that find a bad root (another user's) at the same
+// moment set it aside once: no session sets aside the fresh root another has
+// just made, and none fails.
+//
+// Mutation: drop the mutex — several set-aside copies or a failed session, red.
+func TestEnsureBackupRoot_ConcurrentSessionsSetABadRootAsideOnce(t *testing.T) {
+	backupDirsUmask022(t)
+	plant := asRoot(t)
+	base := t.TempDir()
+	root := filepath.Join(base, "backup-sock")
+	mustMkdirMode(t, root, 0o711)
+	plant(root)
+	old := beforeRootMkdir
+	beforeRootMkdir = func(string) { time.Sleep(2 * time.Millisecond) } // widen the window
+	t.Cleanup(func() { beforeRootMkdir = old })
+	var wg sync.WaitGroup
+	errs := make(chan error, 16)
+	start := make(chan struct{})
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			errs <- ensureBackupRoot(root)
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Errorf("a concurrent session failed: %v", err)
+		}
+	}
+	n := 0
+	for _, e := range entries(t, base) {
+		if strings.Contains(e, ".aside-") {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("%d set-aside copies, want 1", n)
 	}
 }

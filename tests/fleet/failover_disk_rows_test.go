@@ -151,10 +151,19 @@ func TestFleet_Failover_DiskRowsFollowTheVM(t *testing.T) {
 // CommitMigrationOwnership — the migration cuts over and returns an error, and
 // the row is left `migrating`... unless RepointMigratedVM moves it; the
 // assertion on the disk rows fails either way.
+//
+// Review I1: the row names a third host, so the commit moves it only once
+// that host is proven off — here the failed host confirmed off, as the lab's
+// was (`lv host fence-confirm`). Unproven, the commit still succeeds and the
+// row keeps naming it (TestFleet_AWithheldSharedDiskStaysWithheldThroughEveryMove).
 func TestFleet_Migrate_CommitsOverADiskRowLeftOnTheFailedHost(t *testing.T) {
 	c := New(t, Options{Nodes: 3, SharedCRDT: true})
 	owner, gone := c.Nodes[0], c.Nodes[2]
 	insertVMWithDisk(t, owner, diskRowsVM, owner.Name, gone.Name)
+	if err := corrosion.RecordFenceWithState(context.Background(), owner.DB, corrosion.FenceLogRecord{
+		ID: "confirm-" + gone.Name, HostName: gone.Name, Method: "manual", Result: "manual-confirmed"}, "fenced"); err != nil {
+		t.Fatal(err)
+	}
 	owner.Virt.SetState(diskRowsVM, "running")
 	migrateToThird(t, c, owner, gone)
 }

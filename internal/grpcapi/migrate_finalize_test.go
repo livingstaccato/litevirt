@@ -260,8 +260,23 @@ func TestCommitMigrationOwnership_ADiskRowLeftOnAnotherHostCommits(t *testing.T)
 		`UPDATE vm_disks SET host_name = 'failed-host' WHERE vm_name = ? AND disk_name = 'root'`, vmName); err != nil {
 		t.Fatal(err)
 	}
+	// Review I1: a shared row naming a third host moves only once that host
+	// is proven off; unproven, the commit still succeeds and the row stays.
 	if ok, err := corrosion.CommitMigrationOwnership(ctx, s.db, vmName, s.hostName, "target-host", "running", disks); err != nil || !ok {
 		t.Fatalf("a disk row unchanged since the snapshot: ok=%v err=%v, want a commit", ok, err)
+	}
+	if after, _ := corrosion.GetVMDisks(ctx, s.db, vmName); len(after) != 1 || after[0].HostName != "failed-host" {
+		t.Fatalf("a shared row naming unproven failed-host was moved: %+v", after)
+	}
+	// The failed host confirmed off: the next commit moves it.
+	if err := s.db.Execute(ctx, `UPDATE vms SET host_name = ?, state = 'migrating' WHERE name = ?`, s.hostName, vmName); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertFenceLog(ctx, s.db, corrosion.FenceLogRecord{ID: "c", HostName: "failed-host", Method: "manual", Result: "manual-confirmed"}); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := corrosion.CommitMigrationOwnership(ctx, s.db, vmName, s.hostName, "target-host", "running", disks); err != nil || !ok {
+		t.Fatalf("commit after the confirmation: ok=%v err=%v", ok, err)
 	}
 	if after, _ := corrosion.GetVMDisks(ctx, s.db, vmName); len(after) != 1 || after[0].HostName != "target-host" {
 		t.Fatalf("disk row not moved to the target: %+v", after)

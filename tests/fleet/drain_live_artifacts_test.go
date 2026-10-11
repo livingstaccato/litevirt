@@ -60,7 +60,7 @@ func newLiveDrainScenario(t *testing.T) *liveDrainScenario {
 	t.Cleanup(c.Stop)
 	sc := &liveDrainScenario{c: c, src: c.Nodes[0], dst: c.Nodes[1], provisioned: map[string]bool{}}
 	for _, n := range c.Nodes {
-		setHostCapacity(t, c, n.Name, 64, 65536, nil)
+		setHostCapacity(t, c, n.Name, 64, 65536)
 	}
 	sc.srcISO = filepath.Join(c.tmpRoot, sc.src.Name, "data", "cloudinit", "ci.iso")
 	sc.dstISO = filepath.Join(c.tmpRoot, sc.dst.Name, "data", "cloudinit", "ci.iso")

@@ -175,7 +175,7 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 		uctx, ucancel := detachedMigrateCleanupCtx(ctx)
 		defer ucancel()
 		if wasRunning {
-			if serr := s.containerRuntime.StartContainer(uctx, req.Name); serr != nil {
+			if serr := s.startContainerArmed(uctx, req.Name); serr != nil {
 				slog.Error("container migrate: failed to restart source after stop-intent write failure", "name", req.Name, "error", serr)
 			}
 		}
@@ -231,7 +231,7 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 		// Restore the source's PRE-migration run state — we set operator-stop only for
 		// the transfer window and must not leave it changing the source's behavior.
 		if wasRunning {
-			if serr := s.containerRuntime.StartContainer(ctx, req.Name); serr != nil {
+			if serr := s.startContainerArmed(ctx, req.Name); serr != nil {
 				slog.Error("container migrate: rollback restart failed", "name", req.Name, "error", serr)
 				// We couldn't bring it back up — CLEAR the migration stop-intent so the
 				// reconciler can recover the source per its restart policy. Leaving

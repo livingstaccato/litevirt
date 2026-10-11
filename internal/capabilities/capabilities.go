@@ -1365,6 +1365,16 @@ func MandatoryTokens() []string {
 // that would otherwise read as having latched the new contract.
 const RetiredCanonicalRegistryV1 = "canonical_registry_v1"
 
+// RetiredFirewallIPv6V1 is the token the tenant-firewall branch first gated
+// IPv6 firewall rules on (and, through it, the release of NIC guards): a
+// mandatory, replication-gated "this build renders IPv6 rules". A build of
+// that branch ran on a lab cluster and could have latched it there. It was
+// retired before release in favour of the shared release token: IPv6 rules
+// are the release feature firewall_ipv6 and NIC guards the feature
+// nic_guards of release_2026_11_v1 (release_features.go), which record a use
+// before their first data. Never reused.
+const RetiredFirewallIPv6V1 = "firewall_ipv6_v1"
+
 // retired is every token an earlier build could latch that this build neither
 // advertises, latches nor enforces. It is not in All(), so the checker does not
 // load its marker and nothing reads it as latched.
@@ -1379,6 +1389,7 @@ const RetiredCanonicalRegistryV1 = "canonical_registry_v1"
 // change. An entry is never removed: a marker outlives every binary that wrote it.
 var retired = map[string]bool{
 	RetiredCanonicalRegistryV1: true,
+	RetiredFirewallIPv6V1:      true,
 }
 
 // Retired reports whether token is a retired token: one an earlier build could

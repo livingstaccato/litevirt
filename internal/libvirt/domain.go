@@ -21,15 +21,40 @@ func (c *Client) DefineDomain(xmlConfig string) error {
 }
 
 // StartDomain boots a defined domain.
+//
+// It goes through the start guard (SetStartGuard): whatever must be in force
+// before the guest's first frame — its NIC guards — is, or the domain is not
+// started.
 func (c *Client) StartDomain(name string) error {
-	dom, err := c.virt.DomainLookupByName(name)
+	g, err := c.guard(name)
 	if err != nil {
-		return fmt.Errorf("lookup domain %s: %w", name, err)
-	}
-	if err := c.virt.DomainCreate(dom); err != nil {
 		return fmt.Errorf("start domain %s: %w", name, err)
 	}
-	return nil
+	return startDomainGuarded(c.virt, g, name)
+}
+
+// startDomainGuarded starts name through g.
+func startDomainGuarded(v snapshotAPI, g StartGuard, name string) error {
+	dom := golibvirt.Domain{Name: name}
+	return guardedStart(g, name,
+		func(paused bool) error {
+			d, err := v.DomainLookupByName(name)
+			if err != nil {
+				return fmt.Errorf("lookup domain %s: %w", name, err)
+			}
+			dom = d
+			if paused {
+				_, err = v.DomainCreateWithFlags(dom, uint32(golibvirt.DomainStartPaused))
+			} else {
+				err = v.DomainCreate(dom)
+			}
+			if err != nil {
+				return fmt.Errorf("start domain %s: %w", name, err)
+			}
+			return nil
+		},
+		func() error { return v.DomainResume(dom) },
+		func() { _ = v.DomainDestroy(dom) })
 }
 
 // ShutdownDomain sends an ACPI poweroff to a running domain.

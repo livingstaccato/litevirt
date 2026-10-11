@@ -43,6 +43,14 @@ type Client struct {
 
 	// Domain event callback registered by the daemon.
 	eventCallback DomainEventCallback
+
+	// The start guard (start_guard.go).
+	startGuard StartGuard
+	guardSet   bool
+	guardReady chan struct{} // RequireStartGuard; closed once a guard is set
+	guardWait  time.Duration
+	guardNeeds func(name string) bool // RequireStartGuard's scope; nil = every start
+	readyOnce  sync.Once
 }
 
 // NewClient connects to the local libvirtd daemon.

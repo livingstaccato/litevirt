@@ -109,6 +109,32 @@ func TestCanonicalRegistryV1Retired(t *testing.T) {
 	}
 }
 
+// TestFirewallIPv6V1Retired pins the retirement of the tenant-firewall
+// branch's own token. A build of that branch advertised it on a lab cluster,
+// so a node there may hold its marker: it must stay recognised (retired), and
+// never be advertised, loaded as a latch, or reused. IPv6 rules and NIC
+// guards are release features now (firewall_ipv6, nic_guards).
+func TestFirewallIPv6V1Retired(t *testing.T) {
+	const tok = "firewall_ipv6_v1"
+	if RetiredFirewallIPv6V1 != tok {
+		t.Fatalf("RetiredFirewallIPv6V1 = %q, want %q: the on-disk marker name is frozen", RetiredFirewallIPv6V1, tok)
+	}
+	if slices.Contains(Supported(), tok) || Mandatory(tok) || ReplicationGated(tok) {
+		t.Errorf("the retired %s is still advertised, mandatory or replication-gated", tok)
+	}
+	if slices.Contains(All(), tok) {
+		t.Errorf("All() lists the retired %s, so the checker would load its marker as a live latch", tok)
+	}
+	if !Retired(tok) || !slices.Contains(RetiredTokens(), tok) {
+		t.Errorf("%s is not retired, so its marker would WAL-quarantine an upgraded lab node", tok)
+	}
+	for _, f := range []Feature{FeatureFirewallIPv6, FeatureNICGuards} {
+		if !Honoured(ReleaseToken, f) {
+			t.Errorf("%s is not a feature of %s", f, ReleaseToken)
+		}
+	}
+}
+
 // TestRetiredTokensAreDisjointFromAll: a token is live or retired, never both.
 // One in both sets would be loaded as a latch AND reported as ignored.
 func TestRetiredTokensAreDisjointFromAll(t *testing.T) {

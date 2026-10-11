@@ -23,23 +23,23 @@ func (s *Server) ReloadFirewall(ctx context.Context, _ *emptypb.Empty) (*pb.Fire
 	if err := s.RequirePerm(ctx, "/", "network.update", "operator"); err != nil {
 		return nil, err
 	}
-	if s.fwReconciler == nil {
+	if s.fwRec() == nil {
 		return nil, status.Error(codes.Unavailable, "firewall reconciler not wired (test server?)")
 	}
 	// Forced, not the ordinary tick: `lv firewall reload` is an operator saying
 	// they believe the kernel drifted, so it must bypass the change-detection
 	// cache rather than render the same bytes and report success (#187).
-	if err := s.fwReconciler.ReconcileForce(ctx); err != nil {
+	if err := s.fwRec().ReconcileForce(ctx); err != nil {
 		return nil, status.Errorf(codes.Internal, "reconcile: %v", err)
 	}
 
 	// Build the operator-facing summary. Counts come from cluster
 	// state directly so we don't depend on the reconciler's internals.
 	statusOut := &pb.FirewallStatus{HostName: s.hostName}
-	if e := s.fwReconciler.LastError(); e != nil {
+	if e := s.fwRec().LastError(); e != nil {
 		statusOut.LastError = e.Error()
 	}
-	if t := s.fwReconciler.LastTick(); !t.IsZero() {
+	if t := s.fwRec().LastTick(); !t.IsZero() {
 		statusOut.LastAppliedAt = t.UTC().Format(time.RFC3339)
 	}
 	sgs, err := corrosion.ListSecurityGroups(ctx, s.db, "")

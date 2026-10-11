@@ -29,6 +29,7 @@ func newImportCmd() *cobra.Command {
 		preserveMAC bool
 		start       bool
 		inspect     bool
+		spoofGuard  string
 	)
 	cmd := &cobra.Command{
 		Use:   "import [file]",
@@ -77,6 +78,7 @@ Examples:
 				NetMap:       nm,
 				DiskMap:      dm,
 				PreserveMac:  preserveMAC,
+				SpoofGuard:   spoofGuard,
 				Start:        start,
 				Inspect:      inspect,
 				SourcePath:   serverPath,
@@ -143,6 +145,7 @@ Examples:
 	cmd.Flags().StringVar(&serverPath, "server-path", "", "Path to a source file/dir already staged on the target host")
 	cmd.Flags().BoolVar(&preserveMAC, "preserve-mac", false, "Keep the source MAC addresses (default: regenerate)")
 	cmd.Flags().BoolVar(&start, "start", false, "Start the VM after import")
+	cmd.Flags().StringVar(&spoofGuard, "spoof-guard", "", "off: import the NICs without a NIC guard (needs network authority); default: guard them, confined to their network's subnet")
 	cmd.Flags().BoolVar(&inspect, "inspect", false, "Parse + print the mapping and warnings without importing")
 	cmd.MarkFlagRequired("name")
 	return cmd

@@ -307,7 +307,7 @@ func (s *Server) RevertContainerSnapshot(ctx context.Context, req *pb.RevertCont
 			s.audit(ctx, "ct.snapshot.revert", req.Name, "project="+project+" (restart refused: id range overlap)", "error")
 			return nil, err
 		}
-		if err := s.containerRuntime.StartContainer(ctx, req.Name); err != nil {
+		if err := s.startContainerArmed(ctx, req.Name); err != nil {
 			s.audit(ctx, "ct.snapshot.revert", req.Name, "project="+project+" (restart failed)", "error")
 			return nil, status.Errorf(codes.Internal, "reverted but restart failed: %v", err)
 		}

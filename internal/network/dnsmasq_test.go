@@ -124,6 +124,8 @@ func TestDnsmasqArgs_ExcludesLoopback(t *testing.T) {
 		// Lease file must live in the dir the IP scanner reads, or lease-based
 		// IP discovery silently never fires (ARP-only fallback).
 		"--dhcp-leasefile=/var/lib/libvirt/dnsmasq/litevirt-br-test.leases",
+		// Host reservations: a guarded NIC's exact address.
+		"--dhcp-hostsfile=/var/lib/libvirt/dnsmasq/litevirt-br-test.hosts",
 		"--dhcp-range=10.0.0.2,10.0.0.254,255.255.255.0,12h",
 		"--server=8.8.8.8",
 		"--no-resolv",

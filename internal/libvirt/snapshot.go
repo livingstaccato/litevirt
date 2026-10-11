@@ -39,6 +39,7 @@ type snapshotAPI interface {
 	DomainUndefineFlags(dom golibvirt.Domain, flags golibvirt.DomainUndefineFlagsValues) error
 	DomainDefineXML(xml string) (golibvirt.Domain, error)
 	DomainCreate(dom golibvirt.Domain) error
+	DomainCreateWithFlags(dom golibvirt.Domain, flags uint32) (golibvirt.Domain, error)
 	DomainResume(dom golibvirt.Domain) error
 	DomainRestoreFlags(from string, dxml golibvirt.OptString, flags uint32) error
 	DomainSaveImageGetXMLDesc(file string, flags uint32) (string, error)
@@ -60,15 +61,8 @@ var (
 	revertUndefineSettle = time.Second
 )
 
-func startDomain(v snapshotAPI, name string) error {
-	dom, err := v.DomainLookupByName(name)
-	if err != nil {
-		return fmt.Errorf("lookup domain %s: %w", name, err)
-	}
-	if err := v.DomainCreate(dom); err != nil {
-		return fmt.Errorf("start domain %s: %w", name, err)
-	}
-	return nil
+func startDomain(v snapshotAPI, g StartGuard, name string) error {
+	return startDomainGuarded(v, g, name)
 }
 
 func domainExists(v snapshotAPI, name string) bool {
@@ -259,10 +253,14 @@ func (c *Client) ListSnapshots(domainName string) ([]string, error) {
 // the snapshot's sidecar right before the domain is redefined, so reverted disks
 // and firmware are a consistent set (G1).
 func (c *Client) RevertToSnapshot(domainName, snapshotName string, restorePreDefine func() error) error {
-	return revertToSnapshot(c.virt, domainName, snapshotName, restorePreDefine)
+	g, err := c.guard(domainName)
+	if err != nil {
+		return fmt.Errorf("revert %s: %w", domainName, err)
+	}
+	return revertToSnapshot(c.virt, domainName, snapshotName, restorePreDefine, g)
 }
 
-func revertToSnapshot(v snapshotAPI, domainName, snapshotName string, restorePreDefine func() error) error {
+func revertToSnapshot(v snapshotAPI, domainName, snapshotName string, restorePreDefine func() error, g StartGuard) error {
 	dom, err := v.DomainLookupByName(domainName)
 	if err != nil {
 		return fmt.Errorf("lookup domain %q: %w", domainName, err)
@@ -384,7 +382,7 @@ func revertToSnapshot(v snapshotAPI, domainName, snapshotName string, restorePre
 	// read-only now, so this should not normally trigger).
 	var startErr error
 	for i := 0; i < 10; i++ {
-		if startErr = startDomain(v, domainName); startErr == nil {
+		if startErr = startDomain(v, g, domainName); startErr == nil {
 			return notCurrent
 		}
 		if !strings.Contains(startErr.Error(), "lock") {
@@ -727,10 +725,14 @@ func (c *Client) CreateLiveSnapshot(domainName, snapshotName, vmstatePath string
 // at the files judged on this host): it is passed to the restore as its
 // replacement XML and defined persistently. An error refuses the revert.
 func (c *Client) RevertToLiveSnapshot(domainName, snapshotName, vmstatePath string, restorePreDefine func() error, rewriteSaved func(savedXML string) (string, error)) error {
-	return revertToLiveSnapshot(c.virt, domainName, snapshotName, vmstatePath, restorePreDefine, rewriteSaved)
+	g, err := c.guard(domainName)
+	if err != nil {
+		return fmt.Errorf("revert %s: %w", domainName, err)
+	}
+	return revertToLiveSnapshot(c.virt, domainName, snapshotName, vmstatePath, restorePreDefine, rewriteSaved, g)
 }
 
-func revertToLiveSnapshot(v snapshotAPI, domainName, snapshotName, vmstatePath string, restorePreDefine func() error, rewriteSaved func(savedXML string) (string, error)) error {
+func revertToLiveSnapshot(v snapshotAPI, domainName, snapshotName, vmstatePath string, restorePreDefine func() error, rewriteSaved func(savedXML string) (string, error), g StartGuard) error {
 	// Pre-flight: never start tearing the VM down if the RAM image is gone.
 	if _, err := os.Stat(vmstatePath); err != nil {
 		return fmt.Errorf("vmstate image %q missing — cannot restore memory snapshot: %w", vmstatePath, err)
@@ -892,7 +894,7 @@ func revertToLiveSnapshot(v snapshotAPI, domainName, snapshotName, vmstatePath s
 	// needed for them; the chain is overlay→base→image with no file opened
 	// twice. Its CD-ROMs are the files judged here (rewriteSaved), when they
 	// differ.
-	if err := restoreWithRetry(v, domainName, vmstatePath, restoreXML); err != nil {
+	if err := restoreWithRetry(v, g, domainName, vmstatePath, restoreXML); err != nil {
 		return fmt.Errorf("restore guest memory: %w", err)
 	}
 	if _, err := v.DomainDefineXML(savedXML); err != nil {
@@ -1388,10 +1390,17 @@ func resetOverlay(overlay, base string) error {
 // attempts we destroy any partial domain and wait for the lease to release —
 // sanlock/lockd leases can take longer than a single second.
 func (c *Client) restoreWithRetry(domainName, vmstatePath, dxml string) error {
-	return restoreWithRetry(c.virt, domainName, vmstatePath, dxml)
+	g, err := c.guard(domainName)
+	if err != nil {
+		return fmt.Errorf("restore %s: %w", domainName, err)
+	}
+	return restoreWithRetry(c.virt, g, domainName, vmstatePath, dxml)
 }
 
-func restoreWithRetry(v snapshotAPI, domainName, vmstatePath, dxml string) error {
+// restoreWithRetry restores the saved image paused; the guard (StartGuard)
+// puts the domain's NIC firewall in force under the taps it now has, and only
+// then is it resumed (re-review m5). A refusal destroys the restored domain.
+func restoreWithRetry(v snapshotAPI, g StartGuard, domainName, vmstatePath, dxml string) error {
 	var dxmlOpt golibvirt.OptString
 	if dxml != "" {
 		dxmlOpt = golibvirt.OptString{dxml}
@@ -1417,10 +1426,25 @@ func restoreWithRetry(v snapshotAPI, domainName, vmstatePath, dxml string) error
 	if err != nil {
 		return err
 	}
-	// The domain is restored and paused, holding its disk locks. Resume the CPU.
+	// The domain is restored and paused, holding its disk locks. Its NIC
+	// firewall goes in force now, under the taps it actually has, before the
+	// CPU runs; then resume.
 	dom, lerr := v.DomainLookupByName(domainName)
 	if lerr != nil {
 		return fmt.Errorf("lookup restored domain: %w", lerr)
+	}
+	pause, gerr := g.before(domainName)
+	if gerr != nil {
+		_ = v.DomainDestroy(dom)
+		return fmt.Errorf("restore %s: %w", domainName, gerr)
+	}
+	// Before armed it already when it did not ask for the paused step (its
+	// NICs name their taps); one pass is enough (re-review m3).
+	if pause {
+		if gerr := g.afterPaused(domainName); gerr != nil {
+			_ = v.DomainDestroy(dom)
+			return fmt.Errorf("restore %s: %w", domainName, gerr)
+		}
 	}
 	for i := 0; i < 6; i++ {
 		if err = v.DomainResume(dom); err == nil {

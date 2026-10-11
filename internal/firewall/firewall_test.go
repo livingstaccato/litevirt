@@ -20,7 +20,6 @@ func TestRender_EmptyPlan_BareTable(t *testing.T) {
 		"ct state invalid drop",
 		"jump cluster_default",
 		"jump host_overrides",
-		"jump nic_dispatch",
 	)
 }
 
@@ -37,7 +36,7 @@ func TestRender_DefaultDeny(t *testing.T) {
 	// Conntrack accept must still come BEFORE any drop logic, otherwise
 	// reply traffic dies under the default-deny policy.
 	idxConntrack := strings.Index(out, "ct state established,related accept")
-	idxJump := strings.Index(out, "jump nic_dispatch")
+	idxJump := strings.Index(out, "jump cluster_default")
 	if idxConntrack < 0 || idxJump < 0 || idxConntrack > idxJump {
 		t.Errorf("conntrack accept must precede chain jumps")
 	}
@@ -63,37 +62,20 @@ func TestRender_SecurityGroup_Expansion(t *testing.T) {
 	// Cloud-vendor convention: ingress = arriving at the VM, so the
 	// packet is leaving the bridge OUT through the tap → oifname.
 	mustContainAll(t, out,
-		"chain nic_tap0 {",
+		"table bridge litevirt-nic {",
+		"chain nic_in_tap0 {",
 		`# security group "web"`,
 		"oifname tap0 tcp dport 80 accept",
 		"oifname tap0 tcp dport 443 accept",
 		`comment "http"`,
-		"iifname tap0 jump nic_tap0",
-		"oifname tap0 jump nic_tap0",
+		"iifname tap0 jump nic_out_tap0",
+		"oifname tap0 jump nic_in_tap0",
 	)
 }
 
-// TestRender_RejectsIPv6 (F10): the renderer is IPv4-only, so an IPv6 CIDR or
-// ipset element must be rejected at validation — emitting `ip saddr <v6>` would
-// poison the whole atomic ruleset at apply time. Set references ("@name") and
-// IPv4 CIDRs must NOT be falsely rejected.
-func TestRender_RejectsIPv6(t *testing.T) {
-	if _, err := Render(Plan{
-		SecurityGroups: []SecurityGroup{{
-			Name:  "web",
-			Rules: []Rule{{Direction: Ingress, Proto: "tcp", PortRange: "443", CIDR: "2001:db8::/32", Action: Accept}},
-		}},
-		NICs: []NICBinding{{NICDev: "tap0", VMName: "web-1", SecurityGroups: []string{"web"}}},
-	}); err == nil {
-		t.Error("IPv6 CIDR in an SG rule should be rejected, got nil")
-	}
-
-	if _, err := Render(Plan{
-		IPSets: []IPSet{{Name: "blocked", CIDRs: []string{"10.0.0.0/8", "2001:db8::/32"}}},
-	}); err == nil {
-		t.Error("IPv6 ipset element should be rejected, got nil")
-	}
-
+// TestRender_IPv4AndSetReferencePass: IPv4 CIDRs and set references render
+// cleanly. (IPv6 used to be refused here; it renders now — see ipv6_test.go.)
+func TestRender_IPv4AndSetReferencePass(t *testing.T) {
 	// IPv4 CIDR + a set reference must pass cleanly.
 	if _, err := Render(Plan{
 		IPSets: []IPSet{{Name: "allow", CIDRs: []string{"10.0.0.0/8"}}},
@@ -125,7 +107,9 @@ func TestRender_EgressMatchesViaIifname_DPort(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
-	if !strings.Contains(out, "iifname tap0 tcp dport 53 ip daddr 10.0.0.10/32 accept") {
+	// An egress accept RETURNS, so the receiver's ingress rules still run
+	// (renderNICChain).
+	if !strings.Contains(chainBody(t, out, "nic_out_tap0"), "iifname tap0 tcp dport 53 ip daddr 10.0.0.10/32 return") {
 		t.Errorf("egress rule should match iifname/dport/daddr, got:\n%s", out)
 	}
 }
@@ -218,11 +202,11 @@ func TestRender_DeterministicOutput(t *testing.T) {
 // TestRender_ChainNameSanitisation veth names contain dashes which are
 // illegal in nftables identifiers — they must be turned into underscores.
 func TestRender_ChainNameSanitisation(t *testing.T) {
-	plan := Plan{NICs: []NICBinding{{NICDev: "veth-vm1-eth0"}}}
+	plan := Plan{DefaultDeny: true, NICs: []NICBinding{{NICDev: "veth-vm1-eth0"}}}
 	out, _ := Render(plan)
 	mustContainAll(t, out,
-		"chain nic_veth_vm1_eth0 {",
-		"iifname veth-vm1-eth0 jump nic_veth_vm1_eth0",
+		"chain nic_out_veth_vm1_eth0 {",
+		"iifname veth-vm1-eth0 jump nic_out_veth_vm1_eth0",
 	)
 }
 

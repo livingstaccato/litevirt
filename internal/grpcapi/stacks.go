@@ -18,6 +18,7 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/compose/planner"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -127,7 +128,7 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 	// groups. Re-deploy is idempotent: the stack's prior firewall rows are
 	// cleared first. A malformed block (e.g. an IPv6 CIDR) aborts the deploy.
 	if err := s.persistStackFirewall(ctx, f); err != nil {
-		return status.Errorf(codes.FailedPrecondition, "firewall config: %v", err)
+		return stackFirewallErr(err)
 	}
 
 	// Register the stack's backup repos (logical name → path), so a VM's
@@ -231,6 +232,19 @@ const (
 	stackStateDegraded = "degraded"
 )
 
+// stackFirewallErr is a stack's firewall failure as its deploy returns it: a
+// status error — the release gate's refusal — keeps its code and message
+// under "firewall config:", with no rpc error nested in it (switch review
+// m5); anything else is FailedPrecondition, as before.
+func stackFirewallErr(err error) error {
+	var se interface{ GRPCStatus() *status.Status }
+	if errors.As(err, &se) {
+		st := se.GRPCStatus()
+		return status.Errorf(st.Code(), "firewall config: %s", st.Message())
+	}
+	return status.Errorf(codes.FailedPrecondition, "firewall config: %v", err)
+}
+
 // persistStackFirewall writes a compose file's distributed-firewall config to
 // Corrosion: security groups (+ rules), ip sets, cluster-tier rules, and the
 // default-deny policy. The CorrosionPlanLoader on every host then renders these
@@ -260,7 +274,63 @@ func (s *Server) persistStackFirewall(ctx context.Context, f *compose.File) erro
 			return fmt.Errorf("security-group %q is already defined by %s (id %s); names must be unique", name, owner, held.ID)
 		}
 	}
-	if err := corrosion.DeleteStackFirewall(ctx, s.db, f.Name); err != nil {
+	// Every row is validated, and an IPv6 one's release feature taken, before
+	// the stack's rows are torn down (switch review m2, re-review N2): a
+	// refusal leaves them as they were, and a deploy refused for a malformed
+	// row records no use.
+	anyV6 := false
+	for name, sg := range f.SecurityGroups {
+		for _, r := range sg.Rules {
+			v6, err := corrosion.FirewallRuleFamily(r.CIDR, r.Proto)
+			if err != nil {
+				return fmt.Errorf("security-group %q rule: %w", name, err)
+			}
+			anyV6 = anyV6 || v6
+		}
+	}
+	for name, set := range f.IPSets {
+		v6, err := corrosion.IPSetFamily(set.CIDRs)
+		if err != nil {
+			return fmt.Errorf("ipset %q: %w", name, err)
+		}
+		anyV6 = anyV6 || v6
+	}
+	if fd := f.FirewallDefaults; fd != nil {
+		for _, r := range fd.ClusterRules {
+			v6, err := corrosion.FirewallRuleFamily(r.CIDR, r.Proto)
+			if err != nil {
+				return fmt.Errorf("cluster rule: %w", err)
+			}
+			anyV6 = anyV6 || v6
+		}
+	}
+	if anyV6 {
+		// The first use is taken — recorded and acknowledged by every
+		// recipient — before anything is torn down (switch re-review N2): a
+		// first use the gate cannot complete leaves every old row, the
+		// stack's default-deny included, as it was. The rows below then pass
+		// on the recorded use.
+		if err := s.WithReleaseFeature(ctx, capabilities.FeatureFirewallIPv6, func(context.Context, capabilities.FeatureGrant) error {
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+	// The stack's default never fails open (switch re-review 2, R1): a
+	// default-deny the new config asks for is in force before any row is torn
+	// down, and the stack's default row is not torn down with its rows — it
+	// goes only once the new config's rows are written, and only when the new
+	// config drops default-deny. A redeploy that fails part way leaves the
+	// cluster denying, with fewer accepts: fail closed.
+	wantDeny := f.FirewallDefaults != nil && f.FirewallDefaults.DefaultDeny
+	if wantDeny {
+		// Compose sets the cluster-wide default; per-host overrides live in
+		// host config (lv firewall default-deny <host>).
+		if err := corrosion.SetFirewallDefault(ctx, s.db, "cluster", true, f.Name); err != nil {
+			return fmt.Errorf("default-deny: %w", err)
+		}
+	}
+	if err := corrosion.DeleteStackFirewallRows(ctx, s.db, f.Name); err != nil {
 		return err
 	}
 
@@ -276,9 +346,13 @@ func (s *Server) persistStackFirewall(ctx context.Context, f *compose.File) erro
 			// Priority follows YAML order (10, 20, …) so an accept-then-drop
 			// sequence renders deterministically — equal priorities would sort
 			// arbitrarily and could drop traffic an earlier rule meant to allow.
-			if err := corrosion.InsertSGRule(ctx, s.db, corrosion.SGRule{
+			row := corrosion.SGRule{
 				ID: randid.New(), SGID: sgID, Direction: r.Direction, Proto: r.Proto,
 				PortRange: r.Port, CIDR: r.CIDR, Action: r.Action, Priority: (i + 1) * 10,
+			}
+			v6, invalid := corrosion.FirewallRuleFamily(row.CIDR, row.Proto)
+			if err := s.writeFirewallRow(ctx, v6, invalid, func(ctx context.Context, g capabilities.FeatureGrant) error {
+				return corrosion.InsertSGRuleWithGrant(ctx, s.db, g, row)
 			}); err != nil {
 				return fmt.Errorf("security-group %q rule: %w", name, err)
 			}
@@ -287,8 +361,10 @@ func (s *Server) persistStackFirewall(ctx context.Context, f *compose.File) erro
 
 	// IP sets.
 	for name, set := range f.IPSets {
-		if err := corrosion.InsertIPSet(ctx, s.db, corrosion.IPSet{
-			ID: randid.New(), Name: name, CIDRs: set.CIDRs, StackName: f.Name,
+		row := corrosion.IPSet{ID: randid.New(), Name: name, CIDRs: set.CIDRs, StackName: f.Name}
+		v6, invalid := corrosion.IPSetFamily(row.CIDRs)
+		if err := s.writeFirewallRow(ctx, v6, invalid, func(ctx context.Context, g capabilities.FeatureGrant) error {
+			return corrosion.InsertIPSetWithGrant(ctx, s.db, g, row)
 		}); err != nil {
 			return fmt.Errorf("ipset %q: %w", name, err)
 		}
@@ -297,19 +373,21 @@ func (s *Server) persistStackFirewall(ctx context.Context, f *compose.File) erro
 	// Cluster-tier rules + default-deny policy.
 	if fd := f.FirewallDefaults; fd != nil {
 		for i, r := range fd.ClusterRules {
-			if err := corrosion.InsertClusterFirewallRule(ctx, s.db, corrosion.FirewallRule{
+			row := corrosion.FirewallRule{
 				ID: randid.New(), Direction: r.Direction, Proto: r.Proto, PortRange: r.Port,
 				CIDR: r.CIDR, Action: r.Action, Comment: r.Comment, StackName: f.Name, Priority: (i + 1) * 10,
+			}
+			v6, invalid := corrosion.FirewallRuleFamily(row.CIDR, row.Proto)
+			if err := s.writeFirewallRow(ctx, v6, invalid, func(ctx context.Context, g capabilities.FeatureGrant) error {
+				return corrosion.InsertClusterFirewallRuleWithGrant(ctx, s.db, g, row)
 			}); err != nil {
 				return fmt.Errorf("cluster rule: %w", err)
 			}
 		}
-		if fd.DefaultDeny {
-			// Compose sets the cluster-wide default; per-host overrides live in
-			// host config (lv firewall default-deny <host>).
-			if err := corrosion.SetFirewallDefault(ctx, s.db, "cluster", true, f.Name); err != nil {
-				return fmt.Errorf("default-deny: %w", err)
-			}
+	}
+	if !wantDeny {
+		if err := corrosion.DeleteStackFirewallDefaults(ctx, s.db, f.Name); err != nil {
+			return fmt.Errorf("default-deny: %w", err)
 		}
 	}
 	return nil
@@ -545,13 +623,23 @@ func (s *Server) provisionPlannedNetworks(ctx context.Context, f *compose.File, 
 			if ntype == "" {
 				ntype = "bridge"
 			}
+			scoped := compose.ScopedNetworkName(f.Name, name)
+			// As provisionAndPersistNetwork: the trunk VLANs litevirt keeps
+			// on the row survive the verbatim write (re-review R4-I2).
+			carried, kerr := s.keepTrunkVLANs(ctx, scoped, &netDef)
+			if kerr != nil {
+				netErrs = append(netErrs, fmt.Sprintf("network %q: read its kept trunk VLANs: %v", name, kerr))
+				continue
+			}
 			cfgJSON, _ := json.Marshal(netDef)
-			_ = corrosion.UpsertNetwork(ctx, s.db, corrosion.NetworkRecord{
-				Name:      compose.ScopedNetworkName(f.Name, name),
+			if err := corrosion.UpsertNetwork(ctx, s.db, corrosion.NetworkRecord{
+				Name:      scoped,
 				StackName: f.Name,
 				Type:      ntype,
 				Config:    string(cfgJSON),
-			})
+			}); err == nil {
+				s.auditCarriedVLANs(ctx, scoped, carried)
+			}
 		}
 		if len(netErrs) > 0 {
 			detail := ""

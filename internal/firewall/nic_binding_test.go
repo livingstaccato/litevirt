@@ -70,7 +70,7 @@ func TestCorrosionPlanLoader_BindsSGsToNICs(t *testing.T) {
 		t.Fatalf("Render: %v", err)
 	}
 	mustContainAll(t, out,
-		"chain nic_tap_vm_web_0 {", // dashes sanitised to underscores
+		"chain nic_in_tap_vm_web_0 {", // dashes sanitised to underscores
 		`# security group "web"`,
 		"oifname tap-vm-web-0 tcp dport 80 accept",
 	)

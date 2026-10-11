@@ -1388,7 +1388,7 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 			return status.Errorf(codes.FailedPrecondition,
 				"restored %q but %d NIC(s) had unavailable IPs — left stopped (operator-stop) to avoid a network conflict", req.Name, unreserved)
 		}
-		if err := s.containerRuntime.StartContainer(ctx, req.Name); err != nil {
+		if err := s.startContainerArmed(ctx, req.Name); err != nil {
 			// Partial success: the container is restored AND tracked (row stays
 			// 'stopped'), so the reconciler / restart policy can start it later. We
 			// return an error but deliberately do NOT delete the row — a tracked

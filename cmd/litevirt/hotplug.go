@@ -62,8 +62,10 @@ func newDetachDiskCmd() *cobra.Command {
 
 func newAttachNicCmd() *cobra.Command {
 	var (
-		model string
-		mac   string
+		model      string
+		mac        string
+		spoofGuard string
+		allow      []string
 	)
 	cmd := &cobra.Command{
 		Use:   "attach-nic <vm> <network>",
@@ -73,7 +75,8 @@ func newAttachNicCmd() *cobra.Command {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				vm, err := c.AttachDevice(ctx, &pb.AttachDeviceRequest{
 					VmName: args[0],
-					Nic:    &pb.NetworkAttachment{Name: args[1], Model: model, Mac: mac},
+					Nic: &pb.NetworkAttachment{Name: args[1], Model: model, Mac: mac,
+						SpoofGuard: spoofGuard, AllowedAddresses: allow},
 				})
 				if err != nil {
 					return fmt.Errorf("attach NIC: %w", err)
@@ -86,6 +89,8 @@ func newAttachNicCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&model, "model", "virtio", "NIC model (virtio, e1000)")
 	cmd.Flags().StringVar(&mac, "mac", "", "MAC address (auto-generated if empty)")
+	cmd.Flags().StringVar(&spoofGuard, "spoof-guard", "", "NIC guard: on (the default for a new NIC) | off")
+	cmd.Flags().StringArrayVar(&allow, "allow-address", nil, "extra source address or prefix the guarded guest may use (repeatable)")
 	return cmd
 }
 

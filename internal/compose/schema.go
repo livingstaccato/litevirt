@@ -1,7 +1,11 @@
 // Package compose parses litevirt compose YAML files and generates execution plans.
 package compose
 
-import "fmt"
+import (
+	"fmt"
+	"net/netip"
+	"strings"
+)
 
 // File is the top-level compose document.
 type File struct {
@@ -105,6 +109,28 @@ type NetworkDef struct {
 	HostIsolation bool     `yaml:"host-isolation"` // block VM→host management traffic
 	DNS           []string `yaml:"dns"`            // DNS resolvers for isolated VMs (default: 1.1.1.1, 8.8.8.8)
 
+	// Gateway is the network's router when it is not litevirt's own: the
+	// address of the upstream router on an external or VLAN bridge. Setting it
+	// also says the subnet's first host is NOT the router (LitevirtGateway).
+	// ReservedAddresses are further infrastructure addresses on the network (a
+	// second router, a VRRP address, the IPv6 router). No guest NIC may claim
+	// either, and a NIC guard confined to the subnet excludes them.
+	Gateway           string   `yaml:"gateway"`
+	ReservedAddresses []string `yaml:"reserved-addresses"`
+
+	// AllowedVLANs are the VLANs a NIC on the `trunk:` feature may carry on
+	// this network: a trunk NIC created on this release carries only those of
+	// its trunk VLANs listed here (docs/firewall.md, "VLAN tags"). Setting it
+	// needs network.update on the network.
+	AllowedVLANs []int `yaml:"allowed-vlans"`
+	// KeptVLANs are the VLANs litevirt itself put on AllowedVLANs, never set
+	// from a compose file: the trunk VLANs in use when the cluster upgraded,
+	// and those a network row took over from the flat bridge of its name
+	// (re-review R4-I2). A VLAN here and not on AllowedVLANs is one an
+	// operator removed, and stays removed; a re-deploy of the network, which
+	// writes its definition verbatim, keeps the others (re-review m6).
+	KeptVLANs []int `yaml:"-"`
+
 	// NetBoxPrefixID binds this network to a NetBox prefix. Zero means unbound,
 	// which is every network today.
 	//
@@ -114,6 +140,40 @@ type NetworkDef struct {
 	// mixed-version cluster safe is the netbox_ipam_v1 latch, because an older
 	// node would otherwise allocate from the builtin allocator across the prefix.
 	NetBoxPrefixID int `yaml:"netbox-prefix-id"`
+}
+
+// LitevirtGateway is the address litevirt itself puts on the network's bridge
+// — the subnet's first host — on a network whose dnsmasq or router litevirt
+// runs: one it serves DHCP for (where guests send DHCP and DNS), or routes (a
+// vxlan network's anycast gateway, an isolated network, a bridge litevirt
+// manages). It is protected whatever Gateway names: a network's configured
+// gateway is its upstream router, and dnsmasq still answers on the first host
+// (re-review R2-I5). "" where litevirt runs neither: a VLAN or external bridge
+// with no DHCP, a host-isolated network. A superset of where
+// network.DHCPWouldServe starts dnsmasq (TestLitevirtGatewayCoversDHCP).
+func (n NetworkDef) LitevirtGateway() string {
+	if n.Subnet == "" || n.HostIsolation {
+		return ""
+	}
+	switch n.Type {
+	case "", "bridge":
+		if n.VLAN != 0 || (n.External && !n.DHCP) {
+			return ""
+		}
+	case "vxlan", "isolated":
+	default:
+		return ""
+	}
+	p, err := netip.ParsePrefix(strings.TrimSpace(n.Subnet))
+	if err != nil || p.Addr().Zone() != "" {
+		return ""
+	}
+	p = p.Masked()
+	gw := p.Addr().Next()
+	if !p.Contains(gw) {
+		return ""
+	}
+	return gw.String()
 }
 
 // NATEnabled returns true unless NAT is explicitly disabled.
@@ -383,6 +443,17 @@ type NetworkAttachment struct {
 	// queues='N'/>): 1 to 64, or "auto" for one per vCPU up to 8. Unset or 1
 	// is a single queue. Virtio model only; applies on the next define.
 	Queues NICQueues `yaml:"queues,omitempty"`
+
+	// NIC guard (anti-spoofing; docs/firewall.md "NIC guards"). SpoofGuard is
+	// "" (on, the default for a new NIC), "on" or "off". AllowedAddresses are
+	// extra source addresses or prefixes the guest may use beyond the ones
+	// litevirt assigns. Anything but the default needs cluster-root network
+	// authority at deploy.
+	SpoofGuard               string   `yaml:"spoof-guard,omitempty"`
+	AllowedAddresses         []string `yaml:"allowed-addresses,omitempty"`
+	AllowDHCPServer          bool     `yaml:"allow-dhcp-server,omitempty"`
+	AllowRouterAdvertisement bool     `yaml:"allow-router-advertisement,omitempty"`
+	AllowVLANTags            bool     `yaml:"allow-vlan-tags,omitempty"`
 }
 
 // CloudInitDef holds cloud-init configuration.

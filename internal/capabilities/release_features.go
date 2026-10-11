@@ -95,8 +95,10 @@ var releaseFeatures = map[Feature]FeatureInfo{
 		Writers: []string{"internal/corrosion.InsertEmailTargetWithSecret"}},
 	FeatureLoginPolicy:   {Token: Release202611V1, Description: "Account disable and expiry, the mandatory second factor and directory identity binding (used by default: the first directory or second-factor login, or user create or delete)", Writers: loginPolicyWriters},
 	FeatureDrainFailback: {Token: Release202611V1, Description: "Failback after a drain: the record every drain writes of the VMs it moved, and the cluster failback policy", Writers: []string{"internal/corrosion.PutDrainOrigin", "internal/corrosion.SetFailbackPolicy"}},
-	FeatureFirewallIPv6:  {Token: Release202611V1, Description: "IPv6 security-group and firewall rules"},
-	FeatureNICGuards:     {Token: Release202611V1, Description: "Per-NIC anti-spoofing guards (MAC and IP); on by default for new NICs"},
+	FeatureFirewallIPv6: {Token: Release202611V1, Description: "IPv6 security-group, cluster and host firewall rules, and IPv6 ip-set elements",
+		Writers: []string{"internal/corrosion.InsertSGRuleWithGrant", "internal/corrosion.InsertClusterFirewallRuleWithGrant", "internal/corrosion.InsertHostFirewallRuleWithGrant", "internal/corrosion.InsertIPSetWithGrant"}},
+	FeatureNICGuards: {Token: Release202611V1, Description: "Per-NIC guards (source MAC and IP, DHCP server, router advertisements, VLAN tags); on by default for new NICs",
+		Writers: []string{"internal/corrosion.PutNICGuard"}},
 	FeatureUSBMountsMemory: {Token: Release202611V1, Description: "VM USB devices and memory hot-add; container host mounts and devices",
 		Writers: []string{
 			"internal/corrosion.InsertVMWithPassthrough",

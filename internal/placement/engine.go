@@ -39,6 +39,11 @@ type Request struct {
 	// column (hosts.region, "default" when unset), not a label, so
 	// RequireLabels cannot express it.
 	RequireRegion string
+	// RequireNICGuards restricts candidates to hosts that enforce NIC guards
+	// (corrosion.HostEnforcesNICGuards): a guarded VM's placement until every
+	// host runs a build that knows them. The host label alone cannot express
+	// it: it counts only while the host runs the build that set it.
+	RequireNICGuards bool
 
 	// Soft preferences — violation = lower score but not excluded
 	PreferLabels map[string]string
@@ -515,6 +520,11 @@ func scoreCandidates(snap *ClusterSnapshot, req *Request, fromBatch bool) ([]hos
 		// Hard: region (region-scoped failover keeps recovery in region).
 		if req.RequireRegion != "" && hostRegion(h) != req.RequireRegion {
 			failed = append(failed, "region (host in "+hostRegion(h)+", recovery stays in "+req.RequireRegion+")")
+		}
+
+		// Hard: NIC guards (a guarded VM before the release is everywhere).
+		if req.RequireNICGuards && !corrosion.HostEnforcesNICGuards(h) {
+			failed = append(failed, "does not enforce NIC guards (an older build, or its kernel refuses the per-NIC table)")
 		}
 
 		// Hard: required labels.

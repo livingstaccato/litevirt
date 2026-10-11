@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 
 	"google.golang.org/grpc/codes"
@@ -9,6 +10,7 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/randid"
 )
@@ -31,13 +33,48 @@ func toPbIpSet(s corrosion.IPSet) *pb.IpSet {
 	return &pb.IpSet{Id: s.ID, Name: s.Name, Cidrs: s.CIDRs, StackName: s.StackName}
 }
 
+// writeFirewallRow writes one firewall row: an IPv4 one with no grant, as on
+// main, and an IPv6 one through the release feature firewall_ipv6, which
+// refuses until the release token has latched and records the use first. v6
+// and invalid are the row's corrosion.FirewallRuleFamily (or IPSetFamily): a
+// malformed row is refused as such before the gate is asked.
+func (s *Server) writeFirewallRow(ctx context.Context, v6 bool, invalid error, write func(context.Context, capabilities.FeatureGrant) error) error {
+	if invalid != nil {
+		return invalid
+	}
+	if !v6 {
+		return write(ctx, capabilities.FeatureGrant{})
+	}
+	return s.WithReleaseFeature(ctx, capabilities.FeatureFirewallIPv6, write)
+}
+
+// firewallWriteErr is a firewall-row write's error as the handler returns it:
+// the release gate's refusal unchanged, anything else as "<what>: <err>" with
+// firewallWriteCode's code.
+func firewallWriteErr(err error, def codes.Code, what string) error {
+	if st, ok := status.FromError(err); ok {
+		return st.Err()
+	}
+	return status.Errorf(firewallWriteCode(err, def), "%s: %v", what, err)
+}
+
+// firewallWriteCode maps a firewall-row write error to its gRPC code: an IPv6
+// rule refused for want of a firewall_ipv6 grant is a precondition (it will
+// succeed once every host is upgraded), anything else keeps def.
+func firewallWriteCode(err error, def codes.Code) codes.Code {
+	if errors.Is(err, corrosion.ErrFirewallIPv6GateClosed) {
+		return codes.FailedPrecondition
+	}
+	return def
+}
+
 // reconcileLocal triggers an immediate best-effort re-render on the connected
 // host so an operator's change is live without waiting for the poll tick.
 func (s *Server) reconcileLocal(ctx context.Context) {
-	if s.fwReconciler == nil {
+	if s.fwRec() == nil {
 		return
 	}
-	if err := s.fwReconciler.Reconcile(ctx); err != nil {
+	if err := s.fwRec().Reconcile(ctx); err != nil {
 		slog.Warn("firewall: immediate reconcile after change failed", "error", err)
 	}
 }
@@ -101,8 +138,11 @@ func (s *Server) CreateClusterFirewallRule(ctx context.Context, req *pb.CreateCl
 		ID: randid.New(), Direction: r.Direction, Proto: r.Proto, PortRange: r.Port,
 		CIDR: r.Cidr, Action: r.Action, Priority: int(r.Priority), Comment: r.Comment,
 	}
-	if err := corrosion.InsertClusterFirewallRule(ctx, s.db, row); err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "create cluster rule: %v", err)
+	v6, invalid := corrosion.FirewallRuleFamily(row.CIDR, row.Proto)
+	if err := s.writeFirewallRow(ctx, v6, invalid, func(ctx context.Context, g capabilities.FeatureGrant) error {
+		return corrosion.InsertClusterFirewallRuleWithGrant(ctx, s.db, g, row)
+	}); err != nil {
+		return nil, firewallWriteErr(err, codes.InvalidArgument, "create cluster rule")
 	}
 	// The "after" is read back so it is the rule as stored and enforced — the
 	// insert fills in defaults for an empty proto, action and priority.
@@ -154,8 +194,11 @@ func (s *Server) CreateHostFirewallRule(ctx context.Context, req *pb.CreateHostF
 		ID: randid.New(), HostName: r.HostName, Direction: r.Direction, Proto: r.Proto,
 		PortRange: r.Port, CIDR: r.Cidr, Action: r.Action, Priority: int(r.Priority), Comment: r.Comment,
 	}
-	if err := corrosion.InsertHostFirewallRule(ctx, s.db, row); err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "create host rule: %v", err)
+	v6, invalid := corrosion.FirewallRuleFamily(row.CIDR, row.Proto)
+	if err := s.writeFirewallRow(ctx, v6, invalid, func(ctx context.Context, g capabilities.FeatureGrant) error {
+		return corrosion.InsertHostFirewallRuleWithGrant(ctx, s.db, g, row)
+	}); err != nil {
+		return nil, firewallWriteErr(err, codes.InvalidArgument, "create host rule")
 	}
 	s.audit(ctx, "firewall.host-rule.add", row.ID,
 		corrosion.AuditChange(corrosion.AuditStateNone, ruleState(corrosion.GetHostFirewallRule(ctx, s.db, row.ID))), "ok")
@@ -201,8 +244,11 @@ func (s *Server) CreateIpSet(ctx context.Context, req *pb.CreateIpSetRequest) (*
 		return nil, status.Error(codes.InvalidArgument, "name required")
 	}
 	row := corrosion.IPSet{ID: randid.New(), Name: req.Name, CIDRs: req.Cidrs}
-	if err := corrosion.InsertIPSet(ctx, s.db, row); err != nil {
-		return nil, status.Errorf(codes.Internal, "create ipset: %v", err)
+	v6, invalid := corrosion.IPSetFamily(row.CIDRs)
+	if err := s.writeFirewallRow(ctx, v6, invalid, func(ctx context.Context, g capabilities.FeatureGrant) error {
+		return corrosion.InsertIPSetWithGrant(ctx, s.db, g, row)
+	}); err != nil {
+		return nil, firewallWriteErr(err, codes.Internal, "create ipset")
 	}
 	s.audit(ctx, "firewall.ipset.add", row.Name,
 		corrosion.AuditChange(corrosion.AuditStateNone, ipSetState(corrosion.GetIPSet(ctx, s.db, row.ID))), "ok")

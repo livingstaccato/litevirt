@@ -347,6 +347,7 @@ func (c *Coordinator) vmFitsOn(ctx context.Context, vm corrosion.VMRecord, faile
 		return "is isolated, WAL-quarantined or did not answer while point-in-time overlays are in use (it may not understand them)"
 	}
 	req := buildFailoverPlacementRequest(vm, failed, c.capacity, func(string) bool { return true })
+	c.addPlacementLabels(ctx, &req, vm.Name)
 	c.resolveUSBPlacement(ctx, &req)
 	req.RequireRegion = c.vmRecoveryRegion(failed, vm)
 	allVMs, err := corrosion.ListVMs(ctx, c.db, "", "")

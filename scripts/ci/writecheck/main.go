@@ -38,6 +38,7 @@ import (
 // internal/corrosion, add it here too.
 var guarded = map[string]bool{
 	"UpdateVMState":                 true,
+	"PutNICGuard":                   true,
 	"UpdateVMStateStrict":           true,
 	"UpdateVMHost":                  true,
 	"MutateDesiredSpec":             true,

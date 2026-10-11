@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/litevirt/litevirt/internal/libvirt"
+	"github.com/litevirt/litevirt/internal/nictap"
 )
 
 // State describes a single domain's lifecycle. Mirrors what
@@ -136,6 +137,21 @@ type Fake struct {
 	FailHostCPUXML   func() error
 	FailDefineDomain func(xml string) error
 	FailStartDomain  func(name string) error
+	// startGuard mirrors libvirt.Client.SetStartGuard; guardReady and
+	// guardWait mirror RequireStartGuard.
+	startGuard libvirt.StartGuard
+	guardSet   bool
+	guardReady chan struct{}
+	guardWait  time.Duration
+	guardNeeds func(name string) bool
+	// OnRunning, when set, is called (outside the fake's lock) each time a
+	// domain starts running: a start, a resume. A scenario samples what is in
+	// force at the moment a guest runs.
+	OnRunning func(name string)
+	// OnMigrateToTarget, when set, runs inside MigrateToTarget after it is
+	// recorded, with the parameters libvirt was given; a scenario uses it to
+	// land the domain on the target's fake.
+	OnMigrateToTarget func(name, dconnuri string, p libvirt.MigrateParams) error
 	// IgnoreShutdown makes ShutdownDomain a guest that ignores the ACPI
 	// request when it returns true: the call succeeds, the domain keeps
 	// running, and WaitForShutdown times out.
@@ -467,7 +483,97 @@ func domainUUIDFromXML(xmlConfig string) string {
 	return strings.TrimSpace(rest[:j])
 }
 
+// SetStartGuard mirrors libvirt.Client.SetStartGuard.
+func (f *Fake) SetStartGuard(g libvirt.StartGuard) {
+	f.mu.Lock()
+	f.startGuard, f.guardSet = g, true
+	ready := f.guardReady
+	f.guardReady = nil
+	f.mu.Unlock()
+	if ready != nil {
+		close(ready)
+	}
+}
+
+// RequireStartGuard mirrors libvirt.Client.RequireStartGuard: starts of a
+// domain needs reports true for (nil: every start) wait for the next
+// SetStartGuard, up to wait.
+func (f *Fake) RequireStartGuard(wait time.Duration, needs func(name string) bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.guardReady, f.guardWait, f.guardNeeds = make(chan struct{}), wait, needs
+}
+
+func (f *Fake) running(name string) {
+	if cb := f.OnRunning; cb != nil {
+		cb(name)
+	}
+}
+
+// StartDomain mirrors libvirt.Client.StartDomain, guard included: a start the
+// guard asks to pause runs AfterPaused while the domain is paused (its taps
+// already assigned), then resumes it.
 func (f *Fake) StartDomain(name string) error {
+	f.mu.Lock()
+	ready, wait, needs := f.guardReady, f.guardWait, f.guardNeeds
+	f.mu.Unlock()
+	unguarded := false
+	if ready != nil {
+		select {
+		case <-ready:
+		default:
+			if needs != nil && !needs(name) {
+				unguarded = true
+				break
+			}
+			select {
+			case <-ready:
+			case <-time.After(wait):
+				return fmt.Errorf("start domain %s: the NIC firewall is not ready yet", name)
+			}
+		}
+	}
+	f.mu.Lock()
+	g := f.startGuard
+	f.mu.Unlock()
+	if unguarded {
+		g = libvirt.StartGuard{}
+	}
+	pause := false
+	if g.Before != nil {
+		p, err := g.Before(name)
+		if err != nil {
+			return fmt.Errorf("start domain %s: %w", name, err)
+		}
+		pause = p
+	}
+	if err := f.startDomain(name, pause); err != nil {
+		return err
+	}
+	if !pause {
+		f.running(name)
+		return nil
+	}
+	if g.AfterPaused != nil {
+		if err := g.AfterPaused(name); err != nil {
+			f.mu.Lock()
+			f.domains[name] = StateShutdown
+			f.mu.Unlock()
+			return fmt.Errorf("start domain %s: %w", name, err)
+		}
+	}
+	if err := f.ResumeDomain(name); err != nil {
+		// As libvirt.Client does (re-review m5): a domain that cannot be
+		// resumed is stopped, not left paused.
+		f.mu.Lock()
+		f.domains[name] = StateShutdown
+		f.mu.Unlock()
+		return err
+	}
+	return nil
+}
+
+func (f *Fake) startDomain(name string, paused bool) error {
 	if f.FailStartDomain != nil {
 		if err := f.FailStartDomain(name); err != nil {
 			return err
@@ -487,6 +593,9 @@ func (f *Fake) StartDomain(name string) error {
 		return fmt.Errorf("libvirtfake: domain %q is already running", name)
 	}
 	f.domains[name] = StateRunning
+	if paused {
+		f.domains[name] = StatePaused
+	}
 	f.starts[name]++
 	f.record("start", name, "")
 	return nil
@@ -534,6 +643,7 @@ func (f *Fake) ResumeDomain(name string) error {
 	}
 	f.domains[name] = StateRunning
 	f.record("resume", name, "")
+	defer func() { f.mu.Unlock(); f.running(name); f.mu.Lock() }()
 	return nil
 }
 
@@ -1140,8 +1250,12 @@ func insertNICIntoDomainXML(domainXML, domainName, bridge, model, mac string) st
 	if nicMacInDomainXML(domainXML, mac) {
 		return domainXML
 	}
+	target := ""
+	if tap := nictap.Name(mac); tap != "" {
+		target = "<target dev='" + tap + "'/>" // as libvirt.Client.AttachNIC names it
+	}
 	iface := "<interface type='bridge'><source bridge='" + bridge + "'/>" +
-		"<mac address='" + mac + "'/><model type='" + model + "'/></interface>"
+		"<mac address='" + mac + "'/>" + target + "<model type='" + model + "'/></interface>"
 	if strings.Contains(domainXML, "</devices>") {
 		return strings.Replace(domainXML, "</devices>", iface+"</devices>", 1)
 	}
@@ -1434,6 +1548,9 @@ func (f *Fake) MigrateToTarget(name, dconnuri string, p libvirt.MigrateParams) e
 		sort.Strings(pairs)
 		note += " cdroms=" + strings.Join(pairs, ",")
 	}
+	if p.Paused {
+		note += " paused=true"
+	}
 	if len(p.RBDLocators) > 0 {
 		var names []string
 		for n := range p.RBDLocators {
@@ -1443,6 +1560,12 @@ func (f *Fake) MigrateToTarget(name, dconnuri string, p libvirt.MigrateParams) e
 		note += " rbd=" + strings.Join(names, ",")
 	}
 	f.record("migrate", name, note)
+	if cb := f.OnMigrateToTarget; cb != nil {
+		f.mu.Unlock()
+		err := cb(name, dconnuri, p)
+		f.mu.Lock()
+		return err
+	}
 	return nil
 }
 
@@ -2075,10 +2198,36 @@ func (f *Fake) tapLocked(domainName, mac string) string {
 	if tap, ok := f.taps[k]; ok {
 		return tap
 	}
-	tap := fmt.Sprintf("vnet%d", f.nextTap)
-	f.nextTap++
+	// A NIC whose definition names its tap (<target dev>, as litevirt's do —
+	// nictap.Name) gets that name, as libvirt gives it; any other gets the
+	// next vnetN.
+	tap := targetDevForMAC(f.liveXMLLocked(domainName), mac)
+	if tap == "" {
+		tap = fmt.Sprintf("vnet%d", f.nextTap)
+		f.nextTap++
+	}
 	f.taps[k] = tap
 	return tap
+}
+
+var (
+	reFakeIface     = regexp.MustCompile(`(?s)<interface\b.*?</interface>`)
+	reFakeTargetDev = regexp.MustCompile(`<target\b[^>]*\bdev=['"]([^'"]+)['"]`)
+)
+
+// targetDevForMAC is the <target dev> of the interface with mac in domainXML,
+// or "" when it names none.
+func targetDevForMAC(domainXML, mac string) string {
+	for _, el := range reFakeIface.FindAllString(domainXML, -1) {
+		if !nicMacInDomainXML(el, mac) {
+			continue
+		}
+		if m := reFakeTargetDev.FindStringSubmatch(el); m != nil {
+			return m[1]
+		}
+		return ""
+	}
+	return ""
 }
 
 // Lifecycle hooks — daemon-only paths. Connection management is a no-op (there

@@ -61,6 +61,11 @@ OnFailure=litevirt-rollback.service
 
 [Service]
 Type=simple
+# A binary rolled back to a release that does not know the per-NIC firewall
+# table (bridge litevirt-nic) would leave it enforcing forever, keyed by tap
+# names libvirt reuses. A binary that knows it answers this hidden command;
+# any other fails it, and the table is removed before that binary starts.
+ExecStartPre=` + NICTableCleanup + `
 ExecStart=/usr/local/bin/litevirt daemon
 KillMode=process
 Delegate=no
@@ -76,6 +81,17 @@ LimitNOFILE=65536
 [Install]
 WantedBy=multi-user.target
 `
+
+// NICTableOwnerCommand is the hidden command a binary that renders the
+// per-NIC table (bridge litevirt-nic) answers with exit 0.
+const NICTableOwnerCommand = "firewall-nic-table-owner"
+
+// NICTableCleanup is the main unit's ExecStartPre: delete the per-NIC table
+// unless the binary about to start owns it. It survives a binary-only
+// rollback, because the rollback swaps the binary and keeps the unit, and the
+// release that installs it is the first that renders the table.
+const NICTableCleanup = `-/bin/sh -c '/usr/local/bin/litevirt ` + NICTableOwnerCommand +
+	` >/dev/null 2>&1 || nft delete table bridge litevirt-nic >/dev/null 2>&1; exit 0'`
 
 // Rollback is the companion oneshot systemd fires when the main unit enters a
 // failed state (StartLimitBurst exceeded — i.e. a new binary panicking on every

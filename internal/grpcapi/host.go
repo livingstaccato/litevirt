@@ -412,6 +412,9 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 	var drainJobs []drainJob
 	for _, vm := range toMigrate {
 		placementReq := buildDrainPlacementRequest(vm, req.Name, s.capacity)
+		// A guarded VM drains only onto a host that enforces NIC guards
+		// until every host does (re-review m8).
+		s.requireGuardHost(ctx, &placementReq, vm.Name)
 
 		// Ensure the drained host is excluded via anti-affinity on itself.
 		// placement.Select() excludes non-active hosts, and we already set the host to "draining".
@@ -720,6 +723,14 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 		return progress
 	}
 	cdromSources, targetCgroup := ens.remap, ens.cgroupMode
+	// The same arming every live move goes through (re-review R2-I3): the
+	// target puts the guest's NIC guards in force before it arrives.
+	armed, aerr := s.armMigrationTarget(ctx, &target, vm.Name)
+	if aerr != nil {
+		progress.Status = "error"
+		progress.Error = "target refused: " + aerr.Error()
+		return progress
+	}
 	route := s.chooseMigrationRoute(ctx, vm.Name, target, ens.migAddr, routeMemory, srcTLS && ens.tlsReady)
 	dconnuri := fmt.Sprintf("qemu+tls://%s/system", corrosion.URIHost(target.Address))
 	// The VM's own migration policy, as `lv migrate` reads it. Its timeout is
@@ -740,6 +751,8 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 	hspec := vmHooks(fresh)
 	pbVM := &pb.VM{Name: vm.Name, HostName: fresh.HostName, State: pb.VMState_VM_RUNNING}
 	hooks.Run(ctx, hooks.PreMigrate, pbVM, hspec)
+	// The target's NIC guards are armed for the guest (armMigrationTarget).
+	armed.apply(&mp)
 	lerr := s.virt.MigrateToTarget(vm.Name, dconnuri, mp)
 	if lerr == nil {
 		// Phase 4: drain move is an ownership transition (fresh-read CAS + increment).
@@ -754,13 +767,22 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 			progress.Error = "migrated but recording new owner failed: " + err.Error()
 			// The guest runs on the target even though its row says otherwise.
 			s.runDrainPostMigrate(ctx, pbVM, hspec, target.Name, pb.VMState_VM_RUNNING)
+			if herr := armed.finish(context.WithoutCancel(ctx)); herr != nil {
+				progress.Error += "; " + herr.Error()
+			}
 			return progress
 		}
-		// What follows a cut-over for `lv migrate` follows it here: reverse
-		// replication, the NetBox mirror, GARP, DNS, LB backends, VXLAN FDB,
-		// the post_migrate hook, the target's notify, and the source's own
-		// cloud-init ISO.
-		s.finishMigrationOnTarget(ctx, fresh, migrationFinish{target: &target, pbVM: pbVM, hspec: hspec})
+		// What follows a cut-over for `lv migrate` follows it here, in its
+		// order: reverse replication first (right after the ownership commit,
+		// before the hand-over can fail), the NetBox mirror, GARP, DNS, LB
+		// backends, VXLAN FDB, the post_migrate hook, the target's notify, the
+		// source's own cloud-init ISO, and last the hand-over of a guest moved
+		// paused once the target has its guards in force (re-review R3-I2).
+		if herr := s.finishMigrationOnTarget(ctx, fresh, migrationFinish{target: &target, pbVM: pbVM, hspec: hspec, armed: armed}); herr != nil {
+			progress.Status = "error"
+			progress.Error = "migrated; " + herr.Error()
+			return progress
+		}
 		progress.Status = "done"
 		progress.ProgressPct = 100
 		return progress

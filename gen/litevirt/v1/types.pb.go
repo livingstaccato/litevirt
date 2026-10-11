@@ -1209,7 +1209,22 @@ type NetworkAttachment struct {
 	Queues int32 `protobuf:"varint,12,opt,name=queues,proto3" json:"queues,omitempty"`
 	// rate_mb_sec caps this NIC's bandwidth in MB/s, both directions (Proxmox
 	// rate=). Rendered as the libvirt <bandwidth> average. 0 = unlimited.
-	RateMbSec     float64 `protobuf:"fixed64,10,opt,name=rate_mb_sec,json=rateMbSec,proto3" json:"rate_mb_sec,omitempty"`
+	RateMbSec float64 `protobuf:"fixed64,10,opt,name=rate_mb_sec,json=rateMbSec,proto3" json:"rate_mb_sec,omitempty"`
+	// The guard fields are 13-17: 10 and 12 were taken first (rate_mb_sec,
+	// queues). 11 is unused.
+	// NIC guard (anti-spoofing, docs/firewall.md). Applied when the NIC is
+	// created or hot-attached; change it later with SetNICGuard.
+	//
+	//	spoof_guard: "" = the default for a new NIC (on), "on", or "off".
+	//	allowed_addresses: extra source addresses/prefixes the guest may use
+	//	  beyond the ones litevirt assigns (VIPs, VRRP, static secondaries).
+	SpoofGuard               string   `protobuf:"bytes,13,opt,name=spoof_guard,json=spoofGuard,proto3" json:"spoof_guard,omitempty"`
+	AllowedAddresses         []string `protobuf:"bytes,14,rep,name=allowed_addresses,json=allowedAddresses,proto3" json:"allowed_addresses,omitempty"`
+	AllowDhcpServer          bool     `protobuf:"varint,15,opt,name=allow_dhcp_server,json=allowDhcpServer,proto3" json:"allow_dhcp_server,omitempty"`
+	AllowRouterAdvertisement bool     `protobuf:"varint,16,opt,name=allow_router_advertisement,json=allowRouterAdvertisement,proto3" json:"allow_router_advertisement,omitempty"`
+	// allow_vlan_tags: let the guest send 802.1Q / 802.1ad tagged frames (a
+	// trunk). Every other NIC's tagged frames are dropped.
+	AllowVlanTags bool `protobuf:"varint,17,opt,name=allow_vlan_tags,json=allowVlanTags,proto3" json:"allow_vlan_tags,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1319,6 +1334,41 @@ func (x *NetworkAttachment) GetRateMbSec() float64 {
 		return x.RateMbSec
 	}
 	return 0
+}
+
+func (x *NetworkAttachment) GetSpoofGuard() string {
+	if x != nil {
+		return x.SpoofGuard
+	}
+	return ""
+}
+
+func (x *NetworkAttachment) GetAllowedAddresses() []string {
+	if x != nil {
+		return x.AllowedAddresses
+	}
+	return nil
+}
+
+func (x *NetworkAttachment) GetAllowDhcpServer() bool {
+	if x != nil {
+		return x.AllowDhcpServer
+	}
+	return false
+}
+
+func (x *NetworkAttachment) GetAllowRouterAdvertisement() bool {
+	if x != nil {
+		return x.AllowRouterAdvertisement
+	}
+	return false
+}
+
+func (x *NetworkAttachment) GetAllowVlanTags() bool {
+	if x != nil {
+		return x.AllowVlanTags
+	}
+	return false
 }
 
 type CloudInitSpec struct {
@@ -6313,7 +6363,7 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	" \x01(\x03R\x0ftotalIopsSecMax\x12)\n" +
 	"\x11read_iops_sec_max\x18\v \x01(\x03R\x0ereadIopsSecMax\x12+\n" +
 	"\x12write_iops_sec_max\x18\f \x01(\x03R\x0fwriteIopsSecMax\x12#\n" +
-	"\rburst_seconds\x18\r \x01(\x03R\fburstSeconds\"\xa7\x02\n" +
+	"\rburst_seconds\x18\r \x01(\x03R\fburstSeconds\"\x87\x04\n" +
 	"\x11NetworkAttachment\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x14\n" +
 	"\x05model\x18\x02 \x01(\tR\x05model\x12\x0e\n" +
@@ -6326,7 +6376,13 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\x0fsecurity_groups\x18\t \x03(\tR\x0esecurityGroups\x12\x16\n" +
 	"\x06queues\x18\f \x01(\x05R\x06queues\x12\x1e\n" +
 	"\vrate_mb_sec\x18\n" +
-	" \x01(\x01R\trateMbSec\"m\n" +
+	" \x01(\x01R\trateMbSec\x12\x1f\n" +
+	"\vspoof_guard\x18\r \x01(\tR\n" +
+	"spoofGuard\x12+\n" +
+	"\x11allowed_addresses\x18\x0e \x03(\tR\x10allowedAddresses\x12*\n" +
+	"\x11allow_dhcp_server\x18\x0f \x01(\bR\x0fallowDhcpServer\x12<\n" +
+	"\x1aallow_router_advertisement\x18\x10 \x01(\bR\x18allowRouterAdvertisement\x12&\n" +
+	"\x0fallow_vlan_tags\x18\x11 \x01(\bR\rallowVlanTags\"m\n" +
 	"\rCloudInitSpec\x12\x1a\n" +
 	"\buserdata\x18\x01 \x01(\tR\buserdata\x12\x1a\n" +
 	"\bmetadata\x18\x02 \x01(\tR\bmetadata\x12$\n" +

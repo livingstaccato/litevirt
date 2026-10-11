@@ -258,6 +258,20 @@ message NetworkAttachment {
     // rate_mb_sec caps this NIC's bandwidth in MB/s, both directions (Proxmox
     // rate=). Rendered as the libvirt <bandwidth> average. 0 = unlimited.
     double          rate_mb_sec     = 10;
+    // The guard fields are 13-17: 10 and 12 were taken first (rate_mb_sec,
+    // queues). 11 is unused.
+    // NIC guard (anti-spoofing, docs/firewall.md). Applied when the NIC is
+    // created or hot-attached; change it later with SetNICGuard.
+    //   spoof_guard: "" = the default for a new NIC (on), "on", or "off".
+    //   allowed_addresses: extra source addresses/prefixes the guest may use
+    //     beyond the ones litevirt assigns (VIPs, VRRP, static secondaries).
+    string          spoof_guard                = 13;
+    repeated string allowed_addresses          = 14;
+    bool            allow_dhcp_server          = 15;
+    bool            allow_router_advertisement = 16;
+    // allow_vlan_tags: let the guest send 802.1Q / 802.1ad tagged frames (a
+    // trunk). Every other NIC's tagged frames are dropped.
+    bool            allow_vlan_tags            = 17;
 }
 
 message CloudInitSpec {

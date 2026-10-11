@@ -420,7 +420,7 @@ func TestAttachDevice_NICMembershipReadErrorSurfaced(t *testing.T) {
 	}
 
 	_, err := s.AttachDevice(ctx, &pb.AttachDeviceRequest{
-		VmName: "vm1", Nic: &pb.NetworkAttachment{Name: "lan", Mac: "52:54:00:ee:00:02"},
+		VmName: "vm1", Nic: &pb.NetworkAttachment{Name: "lan"}, // no explicit identity: reach the membership read
 	})
 	if status.Code(err) != codes.Internal {
 		t.Fatalf("a membership-read error must surface as Internal, got: %v", err)

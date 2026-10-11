@@ -1328,6 +1328,85 @@ the lease holder from demoting the host again until the hold runs out. A
 binary rolled back below the latched token enters WAL quarantine, as below
 every latched token. Roll forward.
 
+### Firewall: per-NIC rules move to the bridge, observed until enforced
+
+This release enforces per-NIC policy — security groups, the cluster and host
+tiers applied to each NIC, the default policy, the VLAN rule and the new NIC
+guards — in a `bridge litevirt-nic` table on every bridge port, instead of in
+the `inet` forward hook, where traffic between two guests on one bridge (and
+between a guest and its host) was never filtered at all (docs/firewall.md,
+"Where the rules are enforced").
+
+An upgraded cluster starts in **observe** mode: the rules are installed with
+would-drop counters and drop nothing, so nothing that worked before the roll
+stops working, and every host with guest NICs raises `firewall.nic.observe`.
+After the roll, read `lv firewall enforce status` — per host, per workload, NIC
+and rule, what the rules would have dropped since the time it shows, totalled
+across reloads and restarts — fix rules or guests as needed, then
+`lv firewall enforce on`. A cluster founded on this release (`lv host init`)
+enforces from the start; no host that joins or rejoins ever changes the mode,
+which only `lv firewall enforce` does. A routed neighbour-discovery message (one
+a router forwarded) is dropped in either mode; bridged ones are not touched,
+with `br_netfilter` loaded or not. A NIC on the `trunk:` feature keeps carrying
+its VLANs in either mode. Each host switches tables when it restarts on the new binary; the
+per-NIC table loads first, in its own transaction. The daemon loads
+`nf_conntrack_bridge`; a host that cannot load it enforces only the guards and
+raises `firewall.nic.unavailable`.
+
+New NICs are guarded against spoofing by default (in either mode) once every
+host runs this release — a guard is the release feature `nic_guards`, so a NIC
+created during the roll is created unguarded, as before; NICs that exist before
+the roll are not, and stay unguarded through their VMs' rebuilds
+and rolling updates (docs/firewall.md, "NIC guards"). NICs this release defines
+name their taps after their MACs (`lvt<mac>`), so their guards are in force
+before their domains run; a guarded NIC an older release defined is started,
+or handed over by a live move, paused until its guard is in force — held
+paused on its target, with the critical condition `firewall.nic.held`, until
+the target can put it in force (`lv firewall nic-guard resume <vm>`;
+docs/firewall.md, "Held paused"). A trunk NIC's VLANs in use at the upgrade
+are recorded into its network's `allowed-vlans`, every 30 seconds until every
+host runs this release (so a trunk an older host creates during the roll keeps
+its VLANs too), each VLAN once; a new trunk's VLANs, and VLANs a re-create
+adds to a trunk, need `lv network set <net> --allowed-vlans` — on a flat
+bridge (a network name with no network row) too, with `network.update` at the
+cluster root. The VLANs recorded for a flat bridge go with its trunks: into a
+network row later created under its name, and onto `<name>` when a re-deploy
+moves a legacy stack's NIC off the flat `<stack>_<name>`. Until every
+host runs this release, a guarded VM is placed and moved only onto hosts that
+enforce NIC guards: hosts whose daemon set the `litevirt.nic-guards` label to
+the version they still report, which it does after every firewall pass that
+put the per-NIC table in force and clears after one that did not.
+Guards and the mode are recorded in `cluster_policies`, so a NIC created before
+`failover_scope_v1` has latched is created unguarded, and the mode stays
+observe until then.
+
+IPv6 firewall rules and ip-set elements are the release feature
+`firewall_ipv6`: refused until `release_2026_11_v1` has latched, which it does
+once every host the cluster replicates to runs this release — an older
+renderer refuses its whole plan on an IPv6 rule.
+
+**Rolling a host back below this release.** The release installs a systemd
+`ExecStartPre` that asks the binary about to start whether it owns the
+`bridge litevirt-nic` table (a hidden command only this release and later
+answer) and deletes the table when it does not. A rollback swaps the binary and
+keeps the unit, so the rolled-back daemon starts without the stale table:
+libvirt reuses `vnetN` names, and stale chains would hold the next VM to get a
+name to another VM's policy. An upgrade writes the units of the binary doing
+the upgrading — the older one — so this release, when its daemon starts on a
+host whose unit lacks the step, installs it as the drop-in
+`/etc/systemd/system/litevirt.service.d/10-nic-table-cleanup.conf` (and reloads
+systemd), leaving the main unit and any local edits to it as they are: a host
+upgraded from an older release has the step from its first start on this one. Only a host not run under the systemd unit at
+`/etc/systemd/system/litevirt.service` lacks it; delete the table by hand there
+(`nft delete table bridge litevirt-nic`). A rolled-back host keeps its
+`litevirt.nic-guards` label, which its older binary does not know, but reports
+its older version at start, so the label no longer counts: no guarded VM is
+placed or recovered onto it. Rolling back below this release follows the
+release token's rule (above): it quarantines once `nic_guards` or
+`firewall_ipv6` has been used. A lab cluster that ran a pre-release build of
+this branch may hold a marker for its own token `firewall_ipv6_v1`; that token
+is retired, so this release recognises the marker and ignores it.
+
 ### Replica matching while the roll is in progress
 
 An upgraded host matches replicas by record and, for a file with no record,

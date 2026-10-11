@@ -195,9 +195,9 @@ func TestSecurityGroupRPCs_RejectBadRequests(t *testing.T) {
 			_, err := s.AddSecurityGroupRule(ctx, &pb.AddSecurityGroupRuleRequest{Rule: &pb.SecurityGroupRule{Direction: "ingress"}})
 			return err
 		}(),
-		"rule with an IPv6 cidr": func() error {
+		"rule with a malformed IPv6 cidr": func() error {
 			_, err := s.AddSecurityGroupRule(ctx, &pb.AddSecurityGroupRuleRequest{Rule: &pb.SecurityGroupRule{
-				SgId: "sg-1", Direction: "ingress", Cidr: "2001:db8::/32",
+				SgId: "sg-1", Direction: "ingress", Cidr: "2001:db8::/129",
 			}})
 			return err
 		}(),

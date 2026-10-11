@@ -405,6 +405,18 @@ func (m *libvirt10) DomainCreate(dom golibvirt.Domain) error {
 	return nil
 }
 
+func (m *libvirt10) DomainCreateWithFlags(dom golibvirt.Domain, flags uint32) (golibvirt.Domain, error) {
+	if err := m.DomainCreate(dom); err != nil {
+		return dom, err
+	}
+	if flags&uint32(golibvirt.DomainStartPaused) != 0 {
+		m.mu.Lock()
+		m.dom.state = golibvirt.DomainPaused
+		m.mu.Unlock()
+	}
+	return dom, nil
+}
+
 func (m *libvirt10) DomainResume(dom golibvirt.Domain) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -801,7 +813,7 @@ func (m *libvirt10) stopAndStart() error {
 			return err
 		}
 	}
-	return startDomain(m, "vm")
+	return startDomain(m, StartGuard{}, "vm")
 }
 
 func (m *libvirt10) activeOf(dev string) string {

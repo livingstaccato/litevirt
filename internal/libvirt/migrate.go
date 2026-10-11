@@ -50,6 +50,10 @@ type MigrateParams struct {
 	// CDROMSources; callers leave them empty.
 	DestXML    string
 	PersistXML string
+	// Paused leaves the guest paused on the target (VIR_MIGRATE_PAUSED): its
+	// NIC firewall is put in force there under the taps it got, and the
+	// target resumes it (re-review R2-I4).
+	Paused bool
 	// SharesWeight is the VM's cpu-shares weight (the user's scale, 0 = unset)
 	// and TargetCgroup the target's cgroup version ("v2"/"v1", "" = unknown).
 	// When the scales differ, the destination and persistent definitions carry
@@ -139,6 +143,9 @@ func migrationFlagsAndParams(p MigrateParams) (golibvirt.DomainMigrateFlags, []g
 		golibvirt.MigratePersistDest |
 		golibvirt.MigrateUndefineSource
 
+	if p.Paused {
+		flags |= golibvirt.MigratePaused
+	}
 	if p.Live {
 		flags |= golibvirt.MigrateLive
 		if p.AutoConverge {

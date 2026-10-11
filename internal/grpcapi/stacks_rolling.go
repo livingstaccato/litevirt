@@ -60,10 +60,16 @@ func (o *serverOps) recreateAs(ctx context.Context, target, source string, desir
 	cur, _ := corrosion.GetVM(ctx, o.s.db, target)
 	if cur != nil {
 		host := cur.HostName
+		// A guard this host could not carry is refused before the delete
+		// (switch re-review 2, R2).
+		perr := o.s.requireGuardCarryPossible(ctx, cur)
 		// A VM on an iSCSI LUN is placed now too: its moved claim names the
 		// host it will run on, so the create must go exactly there
 		// (vm_lun_hold.go). A storage that cannot be judged refuses.
-		onLUN, perr := o.s.hasFixedDeviceDisk(ctx, spec, cur)
+		var onLUN bool
+		if perr == nil {
+			onLUN, perr = o.s.hasFixedDeviceDisk(ctx, spec, cur)
+		}
 		if perr == nil && (spec.GetIso() != "" || onLUN) {
 			if host, perr = o.s.placeRecreate(ctx, spec, cur); perr == nil {
 				decision = &resolvedCreateVMDecision{resolvedHost: host, placedHere: true}

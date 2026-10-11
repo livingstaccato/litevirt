@@ -19,6 +19,13 @@ networks:
     subnet: "10.0.100.0/24"
     host-isolation: true              # VMs can't reach the hypervisor
     dns: ["1.1.1.1", "8.8.8.8"]      # DNS for isolated VMs (optional, these are defaults)
+  lan:
+    type: "bridge"
+    interface: "br0"
+    subnet: "192.168.10.0/24"
+    gateway: "192.168.10.254"         # the upstream router, when it is not litevirt's
+    reserved-addresses: ["192.168.10.253"]   # other infrastructure no guest may claim
+    allowed-vlans: [100, 101]         # the VLANs a trunk: NIC on this network may carry
 
 vms:
   base-vm:
@@ -492,11 +499,37 @@ is not bounded (libvirt's `group_name` is not supported).
         ip: "10.0.1.10"             # Static IPv4 (optional)
         mac: "52:54:00:12:34:56"    # Fixed MAC (optional)
         gateway: "10.0.1.1"
-        trunk: [100, 101]           # VLAN trunk mode
         security-groups: ["web"]    # Per-NIC firewall (see "Firewall" below)
         queues: 4                   # virtio-net multiqueue (1-64, or auto)
         rate: 12.5                  # Bandwidth cap in MB/s, both directions (0/unset = unlimited). Live
+        # NIC guard (anti-spoofing, docs/firewall.md "NIC guards"). A new NIC
+        # is guarded by default; anything below but the default needs
+        # network.update on the network at deploy.
+        spoof-guard: "on"           # on (default) | off
+        allowed-addresses: ["10.0.1.250"]   # extra sources the guest may use (a VIP)
+        allow-dhcp-server: false
+        allow-router-advertisement: false
+        allow-vlan-tags: false      # true: the guest may send and receive any tags (a VLAN-aware guest)
+      - name: "core"
+        trunk: [100, 101]           # VLAN trunk mode: the guest carries VLANs 100 and 101 tagged
 ```
+
+A NIC with `trunk:` (two or more VLANs) carries those of its VLANs its
+network's `allowed-vlans:` lists, single tagged, and its per-NIC rules still
+judge the packet inside the tag; it is guarded like any other new NIC. A trunk
+that existed when the cluster upgraded keeps its VLANs (they are recorded into
+the network's list during the roll, and a re-deploy of the network keeps them
+there unless an operator took them off with `lv network set`). A re-create — a rolling update, a
+rebuild — that adds a VLAN to a trunk that predates guards makes it a new NIC:
+guarded, its new VLAN the network's to allow. A trunk change alone is not a
+topology change and does not re-create the VM. `allow-vlan-tags: true` is for a
+VLAN-aware guest outside the `trunk:` feature (docs/firewall.md, "VLAN tags").
+
+A network's `gateway:` names its router when the router is not litevirt's — the
+upstream router of an external or VLAN bridge, often not the subnet's first
+host — and `reserved-addresses:` its other infrastructure addresses. No guest
+NIC may claim either, and a guest whose guard is confined to the subnet may not
+use them (docs/firewall.md, "NIC guards").
 
 `queues:` gives a virtio NIC that many queue pairs (`<driver queues='N'/>`; libvirt
 uses vhost-net when the host has it and qemu's userspace backend when it does not,
@@ -1328,6 +1361,12 @@ vms:
       - name: "frontend"
         security-groups: ["web"]   # attach the SG to this NIC
 ```
+
+A redeploy replaces the stack's firewall rows, and keeps its `default-deny` in
+force throughout: a default-deny the new file asks for is set before the old
+rows go, and the stack's default is removed only once the new rows are written
+and only when the new file drops it. A redeploy that fails part way leaves the
+cluster denying, with fewer accepts, until the next one succeeds.
 
 Per-NIC security groups can also be bound at runtime with
 `lv sg bind <vm> --network <name> --sg <name>`. See

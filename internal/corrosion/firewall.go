@@ -3,6 +3,8 @@ package corrosion
 import (
 	"context"
 	"fmt"
+
+	"github.com/litevirt/litevirt/internal/capabilities"
 )
 
 // FirewallRule is a cluster- or host-tier firewall rule — the two policy
@@ -40,12 +42,8 @@ type FirewallDefault struct {
 }
 
 // normRule applies the same field defaults the renderer/security-group path
-// uses, and rejects IPv6 CIDRs (the renderer only emits ipv4_addr sets, so an
-// IPv6 rule would be silently unenforced — same guard as InsertSGRule).
+// uses.
 func normRule(r *FirewallRule) error {
-	if isIPv6CIDR(r.CIDR) {
-		return fmt.Errorf("IPv6 CIDR %q is not supported in firewall rules yet (only IPv4 is enforced); specify an IPv4 CIDR", r.CIDR)
-	}
 	if r.Proto == "" {
 		r.Proto = "all"
 	}
@@ -60,8 +58,24 @@ func normRule(r *FirewallRule) error {
 
 // ── IP sets ──────────────────────────────────────────────────────────────
 
-// InsertIPSet creates a named CIDR list.
+// InsertIPSet creates a named CIDR list of IPv4 elements; one with an IPv6
+// element needs InsertIPSetWithGrant.
 func InsertIPSet(ctx context.Context, c *Client, s IPSet) error {
+	return InsertIPSetWithGrant(ctx, c, capabilities.FeatureGrant{}, s)
+}
+
+// InsertIPSetWithGrant creates a named CIDR list. An IPv6 element is the
+// release feature firewall_ipv6: g must be its grant.
+func InsertIPSetWithGrant(ctx context.Context, c *Client, g capabilities.FeatureGrant, s IPSet) error {
+	v6, err := ipSetFamily(s.CIDRs)
+	if err != nil {
+		return err
+	}
+	if v6 {
+		if err := g.Check(capabilities.FeatureFirewallIPv6); err != nil {
+			return noIPv6Grant(err)
+		}
+	}
 	cidrs, err := encodeSGs(s.CIDRs) // reuse the []string→JSON helper
 	if err != nil {
 		return err
@@ -104,8 +118,25 @@ func DeleteIPSet(ctx context.Context, c *Client, id string) error {
 
 // ── Cluster-tier rules ─────────────────────────────────────────────────────
 
-// InsertClusterFirewallRule adds a rule to the cluster_default chain.
+// InsertClusterFirewallRule adds an IPv4 rule to the cluster_default chain;
+// an IPv6 one needs InsertClusterFirewallRuleWithGrant.
 func InsertClusterFirewallRule(ctx context.Context, c *Client, r FirewallRule) error {
+	return InsertClusterFirewallRuleWithGrant(ctx, c, capabilities.FeatureGrant{}, r)
+}
+
+// InsertClusterFirewallRuleWithGrant adds a rule to the cluster_default
+// chain. An IPv6 rule is the release feature firewall_ipv6: g must be its
+// grant.
+func InsertClusterFirewallRuleWithGrant(ctx context.Context, c *Client, g capabilities.FeatureGrant, r FirewallRule) error {
+	v6, err := firewallRuleFamily(r.CIDR, r.Proto)
+	if err != nil {
+		return err
+	}
+	if v6 {
+		if err := g.Check(capabilities.FeatureFirewallIPv6); err != nil {
+			return noIPv6Grant(err)
+		}
+	}
 	if err := normRule(&r); err != nil {
 		return err
 	}
@@ -139,10 +170,27 @@ func DeleteClusterFirewallRule(ctx context.Context, c *Client, id string) error 
 
 // ── Host-tier rules ─────────────────────────────────────────────────────────
 
-// InsertHostFirewallRule adds a rule to one host's host_overrides chain.
+// InsertHostFirewallRule adds an IPv4 rule to one host's host_overrides
+// chain; an IPv6 one needs InsertHostFirewallRuleWithGrant.
 func InsertHostFirewallRule(ctx context.Context, c *Client, r FirewallRule) error {
+	return InsertHostFirewallRuleWithGrant(ctx, c, capabilities.FeatureGrant{}, r)
+}
+
+// InsertHostFirewallRuleWithGrant adds a rule to one host's host_overrides
+// chain. An IPv6 rule is the release feature firewall_ipv6: g must be its
+// grant.
+func InsertHostFirewallRuleWithGrant(ctx context.Context, c *Client, g capabilities.FeatureGrant, r FirewallRule) error {
 	if r.HostName == "" {
 		return fmt.Errorf("host firewall rule requires a host name")
+	}
+	v6, err := firewallRuleFamily(r.CIDR, r.Proto)
+	if err != nil {
+		return err
+	}
+	if v6 {
+		if err := g.Check(capabilities.FeatureFirewallIPv6); err != nil {
+			return noIPv6Grant(err)
+		}
 	}
 	if err := normRule(&r); err != nil {
 		return err
@@ -308,6 +356,50 @@ func DeleteFirewallDefault(ctx context.Context, c *Client, scope string) error {
 // its security groups (+ their rules), ip sets, cluster/host tier rules, and
 // any default-deny policy it set. Called from `compose down`.
 func DeleteStackFirewall(ctx context.Context, c *Client, stack string) error {
+	if err := DeleteStackFirewallRows(ctx, c, stack); err != nil {
+		return err
+	}
+	return DeleteStackFirewallDefaults(ctx, c, stack)
+}
+
+// DeleteStackFirewallDefaults tombstones the firewall_defaults rows a stack
+// set (its default-deny). A redeploy calls it only once the new config's rows
+// are written, and only when the new config drops default-deny, so a
+// redeploy that fails part way never leaves the cluster default-allow
+// (switch re-review 2, R1).
+func DeleteStackFirewallDefaults(ctx context.Context, c *Client, stack string) error {
+	if stack == "" {
+		return nil
+	}
+	now := c.NowTS()
+	wall := nowRFC3339()
+	return tombStackRows(ctx, c, stack, `SELECT scope AS pk FROM firewall_defaults WHERE stack_name = ? AND deleted_at IS NULL`,
+		func(pk string) error {
+			return c.Execute(ctx, `UPDATE firewall_defaults SET deleted_at = ?, updated_at = ? WHERE scope = ? AND deleted_at IS NULL`, wall, now, pk)
+		})
+}
+
+// tombStackRows runs exec for the primary key of every row sel (one ?, the
+// stack) selects locally. Each replicating Execute carries its statement as a
+// LITERAL constant in exec, so the ledger/CI guard can resolve it; the local
+// SELECT is not replicated, so its SQL may vary.
+func tombStackRows(ctx context.Context, c *Client, stack, sel string, exec func(pk string) error) error {
+	rows, err := c.Query(ctx, sel, stack)
+	if err != nil {
+		return err
+	}
+	for _, row := range rows {
+		if err := exec(row.String("pk")); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// DeleteStackFirewallRows tombstones a stack's firewall rows but not its
+// firewall_defaults row (DeleteStackFirewallDefaults): its security groups
+// (+ their rules), ip sets, and cluster/host tier rules.
+func DeleteStackFirewallRows(ctx context.Context, c *Client, stack string) error {
 	if stack == "" {
 		return nil
 	}
@@ -362,8 +454,5 @@ func DeleteStackFirewall(ctx context.Context, c *Client, stack string) error {
 		}); err != nil {
 		return err
 	}
-	return tomb(`SELECT scope AS pk FROM firewall_defaults WHERE stack_name = ? AND deleted_at IS NULL`,
-		func(pk string) error {
-			return c.Execute(ctx, `UPDATE firewall_defaults SET deleted_at = ?, updated_at = ? WHERE scope = ? AND deleted_at IS NULL`, wall, now, pk)
-		})
+	return nil
 }

@@ -115,6 +115,21 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	if err := s.RequirePerm(ctx, vmRBACPathFor(spec.Project, spec.Name), "vm.create", "operator"); err != nil {
 		return nil, err
 	}
+	// NIC guards: well formed, recordable when explicit, and — when they
+	// weaken the default — authorized over the NIC's network. A re-create of
+	// this VM (rebuild, a stack's rolling update) passes without that only
+	// for settings the VM already had.
+	guardAdmit := admitNew
+	if _, recreate := replacedVMFor(ctx, spec.Name); recreate {
+		guardAdmit = admitRecreate
+	}
+	guardDec, err := s.admitNICGuards(ctx, spec.Name, spec.Network, guardAdmit)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.checkNICIdentities(ctx, spec.Project, spec.Network, spec.Name); err != nil {
+		return nil, err
+	}
 	// After the cheap local refusals (validation, permission): the check may drive
 	// the latch and ask peers, which only a request that could succeed should pay.
 	if err := s.refuseUnlatchedDiskNICIO(ctx, spec); err != nil {
@@ -752,6 +767,8 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	var netConfigs []lv.NetworkConfig
 	var ifaceRecords []corrosion.InterfaceRecord
 	var nicRecords []corrosion.NICRecord // v42 dual-write alongside ifaceRecords (vm_nics)
+	var guardRecords []corrosion.NICGuardRecord
+	dhcpReserved := map[int]bool{} // NIC index → address is a DHCP reservation, not a static one
 
 	// External-IPAM claims taken for this create. A NetBox claim is a synchronous
 	// REMOTE side-effect: it cannot join the local atomic write, so every failure
@@ -903,6 +920,27 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 				OwnerKind: "vm", OwnerHost: "", Name: spec.Name,
 				Identity: identity, NetBoxID: res.NetBoxIPID,
 			})
+		} else if def, _ := lookupNetworkDef(ctx, s.db, n.Name); !strings.HasPrefix(bridge, "direct:") &&
+			guardDec[i].guarded(n) && s.dhcpReservable(n, def) {
+			// A guarded NIC on a network this host alone serves DHCP for: an
+			// exact address, reserved in dnsmasq before the guest can ask, so
+			// the guard holds the guest to it rather than to the whole subnet.
+			ip, rerr := s.reserveDHCPAddress(ctx, n.Name, def.Subnet, bridge, mac)
+			switch {
+			case errors.Is(rerr, network.ErrNoLocalDHCPServer):
+				// The server went away under us: no exact address, and the
+				// guard confines the NIC to its subnet — never a reservation
+				// nobody honours (re-review I-8).
+				slog.Warn("DHCP reservation: no local DHCP server after all; the NIC's guard is confined to its subnet",
+					"vm", spec.Name, "network", n.Name, "error", rerr)
+			case rerr != nil:
+				claims.releaseAll(ctx)
+				cleanupDisks()
+				return nil, status.Errorf(codes.ResourceExhausted, "reserve a DHCP address on %q: %v", n.Name, rerr)
+			default:
+				nicIP = ip
+				dhcpReserved[i] = true
+			}
 		}
 
 		ifaceRecords = append(ifaceRecords, corrosion.InterfaceRecord{
@@ -930,6 +968,26 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			TapDevice:      "",
 			SecurityGroups: encodeSecurityGroups(n.SecurityGroups),
 		})
+		// A macvtap NIC bypasses the bridge, where guards are enforced, so it
+		// gets no record rather than one that claims a protection it lacks.
+		if !strings.HasPrefix(bridge, "direct:") {
+			if rec := guardDec[i].record(spec.Name, spec.Uuid, i, mac, n); rec != nil {
+				guardRecords = append(guardRecords, *rec)
+			}
+		}
+	}
+
+	// Record the NIC guards before the domain is defined. They take effect at
+	// the first reconcile that sees the VM's row and its running tap, which
+	// this create triggers right after the row is written; until then the
+	// guest runs unguarded, as it does for the first seconds after any start
+	// or migration. A create that fails after this leaves records behind,
+	// which is harmless: they are keyed by VM name and MAC, and a NIC created
+	// under the same pair writes its own first.
+	if err := s.writeNewNICGuards(ctx, guardRecords); err != nil {
+		claims.releaseAll(ctx)
+		cleanupDisks()
+		return nil, err
 	}
 
 	// Build cloud-init network-config for interfaces with static IPs.
@@ -940,7 +998,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	for i, n := range spec.Network {
 		netDef, _ := lookupNetworkDef(ctx, s.db, n.Name)
 		ip := n.Ip
-		if ip == "" && i < len(ifaceRecords) {
+		if ip == "" && i < len(ifaceRecords) && !dhcpReserved[i] {
 			ip = ifaceRecords[i].IP
 		}
 
@@ -1137,6 +1195,19 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	}
 	s.ensureSparePCIeRootPorts(spec.Name)
 
+	// The NIC rows are written once the domain runs; until then the firewall
+	// renders the NICs from here, so their guards are in force when the
+	// before-start hook arms the VM (nic_firewall_arming.go).
+	trunks := map[int][]int{}
+	for i, n := range spec.Network {
+		if len(n.Trunk) > 1 {
+			for _, v := range n.Trunk {
+				trunks[i] = append(trunks[i], int(v))
+			}
+		}
+	}
+	defer s.pendingNICs(spec.Name, spec.Uuid, ifaceRecords, trunks)()
+
 	if err := s.virt.StartDomain(spec.Name); err != nil {
 		s.virt.UndefineDomain(spec.Name, false)
 		claims.releaseAll(ctx)
@@ -1273,6 +1344,11 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		// graduate or publish. The invariant it maintains lives on
 		// assignOwnerEpochAtCreate; do not restate it here, or the two copies drift.
 		s.assignOwnerEpochAtCreate(ctx, spec.Name, true)
+		// The guards apply from the first reconcile that sees the VM's row;
+		// run it now rather than on the next tick.
+		if len(guardRecords) > 0 {
+			s.reconcileLocal(ctx)
+		}
 	}
 
 	slog.Info("VM created successfully", "name", spec.Name, "host", s.hostName)
@@ -2468,6 +2544,7 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 			return nil, status.Errorf(codes.Internal, "clean up stale VM record: %v", err)
 		}
 		s.reportDeletedVM(ctx, deleted)
+		s.retireNICGuards(ctx, req.Name)
 		s.clearDeviceLease(req.Name)
 		// This path returns without reaching the main cleanup below, so the
 		// marker has to be dropped here too. A ghost row whose domain is already
@@ -2744,6 +2821,7 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// The row as this delete tombstoned it, for a re-create that follows
 	// (vm_recreate_replaces.go).
 	s.reportDeletedVM(ctx, deleted)
+	s.retireNICGuards(ctx, req.Name)
 
 	slog.Info("VM deleted", "name", req.Name)
 	// The mirror's latency shortcut, AFTER the mandatory tombstone: the VM is
@@ -3616,6 +3694,12 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	// of an Admin's authority. A VM with an installer ISO is placed now, as
 	// main placed it after the teardown, and judged by the host placement
 	// chose (judgeRecreateOn); the create below goes to that host.
+	// A guard this host could not carry is refused here too, with the VM
+	// intact (switch re-review 2, R2).
+	if err := s.requireGuardCarryPossible(ctx, vm); err != nil {
+		st := status.Convert(err)
+		return nil, status.Errorf(st.Code(), "cannot rebuild %q: %s; nothing was changed", req.Name, st.Message())
+	}
 	rctx := withRecreateISOGrant(ctx, vm)
 	host, placed := s.hostName, false
 	// A VM on an iSCSI LUN is placed now too: its moved claim names the host
@@ -3694,6 +3778,7 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "rebuild: tombstone old records: %v", err)
 	}
+	s.retireNICGuards(ctx, req.Name)
 
 	// Recreate the VM using the stored spec. The create carries the identity
 	// of the VM just tombstoned: the host it lands on may not have applied

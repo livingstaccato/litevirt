@@ -144,6 +144,12 @@ func BuildVMSpec(instanceName, baseName string, vm *VMDef, f *File) (*pb.VMSpec,
 			SecurityGroups: n.SecurityGroups,
 			Queues:         nicQueues(n.Queues, vm.CPU),
 			RateMbSec:      n.Rate,
+
+			SpoofGuard:               n.SpoofGuard,
+			AllowedAddresses:         n.AllowedAddresses,
+			AllowDhcpServer:          n.AllowDHCPServer,
+			AllowRouterAdvertisement: n.AllowRouterAdvertisement,
+			AllowVlanTags:            n.AllowVLANTags,
 		})
 	}
 

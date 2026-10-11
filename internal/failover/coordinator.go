@@ -140,6 +140,8 @@ type Coordinator struct {
 	fencer   Fencer
 	// capacity is the cluster-wide capacity policy; see placement.Request.Capacity.
 	capacity corrosion.CapacityPolicy
+	// nicGuardPlacement: SetNICGuardPlacement.
+	nicGuardPlacement func(ctx context.Context, vm string) bool
 	// leaseTerm is the fencing term of the lease incarnation this coordinator
 	// currently holds, 0 when it holds none. Recorded here in Phase 1 and read by
 	// the Phase-2 enforcement path; nothing enforces on it yet.
@@ -480,6 +482,21 @@ func (c *Coordinator) upgradingTimeout() time.Duration {
 // SetFencer replaces the fence implementation. Test-only; production code
 // should not use this.
 func (c *Coordinator) SetFencer(f Fencer) { c.fencer = f }
+
+// SetNICGuardPlacement sets whether a recovery of a VM must land on a host
+// that enforces NIC guards (placement.Request.RequireNICGuards): the daemon
+// requires one for a guarded VM until every host does
+// (grpcapi.Server.GuardHostNeeded).
+func (c *Coordinator) SetNICGuardPlacement(fn func(ctx context.Context, vm string) bool) {
+	c.nicGuardPlacement = fn
+}
+
+// addPlacementLabels adds what SetNICGuardPlacement requires to req.
+func (c *Coordinator) addPlacementLabels(ctx context.Context, req *placement.Request, vm string) {
+	if c.nicGuardPlacement != nil && c.nicGuardPlacement(ctx, vm) {
+		req.RequireNICGuards = true
+	}
+}
 
 // SetCapacityPolicy wires the cluster-wide capacity policy.
 func (c *Coordinator) SetCapacityPolicy(p corrosion.CapacityPolicy) { c.capacity = p }
@@ -2940,6 +2957,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 			if corrosion.VMStoppedForFailover(vm) {
 				if c.stoppedVMRekeyable(ctx, h.Name, vm, disks, fenceEpoch) {
 					req := buildFailoverPlacementRequest(vm, h.Name, c.capacity, pinDown)
+					c.addPlacementLabels(ctx, &req, vm.Name)
 					c.resolveUSBPlacement(ctx, &req)
 					req.RequireRegion = c.vmRecoveryRegion(h.Name, vm)
 					placementReqs = append(placementReqs, req)
@@ -3119,6 +3137,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 
 		if targetName == "" {
 			req := buildFailoverPlacementRequest(vm, h.Name, c.capacity, pinDown)
+			c.addPlacementLabels(ctx, &req, vm.Name)
 			c.resolveUSBPlacement(ctx, &req)
 			if pin := vmSpecPin(vm); pin != "" && pin != h.Name && req.PinHost == "" {
 				slog.Warn("failover: the VM's pinned host is down; recovering it elsewhere for this outage, its pin unchanged",

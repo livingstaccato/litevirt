@@ -206,16 +206,20 @@ var dataDirOwned = []string{
 	"split_brain_activated",     // health/capability.go ActivationMarkerBase (markers are .<token>)
 	"ceph-trash-purges.json",    // storage/ceph_trash.go cephPurgeStateFile (ResumeCephPurges(dir): set aside as .unreadable-<time>, dataDirOwnedPrefixes)
 	"ceph-kept-images.json",     // grpcapi/ceph_kept.go cephKeptFile
+	"firewall-would-drop.json",  // daemon.go: firewall.NewWouldDropTally (its .tmp, dataDirOwnedPrefixes)
+	"firewall-initial-mode",     // daemon.go firewallInitialModeName: the founder's enforcement decision
+	"nic-guard-held",            // grpcapi/nic_guard_held.go heldGuestDir: guests held paused for their guards
 }
 
 // dataDirOwnedPrefixes are owned by name prefix, each judged within one path
 // component: state.db's WAL, SHM and journal (state.db-wal); one capability
 // latch per token (health/capability.go ActivationMarkerPrefix,
-// split_brain_activated.<token>); nowts.hwm.lock; ct-idmap-ledger.tmp; and
+// split_brain_activated.<token>); nowts.hwm.lock; ct-idmap-ledger.tmp;
+// firewall-would-drop.json.tmp (firewall/wouldrop_tally.go); and
 // every dot-name, which is how the daemon names its temp files there
 // (secretfile.Write's .<name>.tmp, storage_pool_confine.go's
 // .pool-uploads.json-*).
-var dataDirOwnedPrefixes = []string{"state.db-", "split_brain_activated.", "nowts.hwm.", "ct-idmap-ledger.", "ceph-trash-purges.json.", "."}
+var dataDirOwnedPrefixes = []string{"state.db-", "split_brain_activated.", "nowts.hwm.", "ct-idmap-ledger.", "ceph-trash-purges.json.", "firewall-would-drop.json.", "."}
 
 // DataDirOwned returns the exact names of dataDirOwned.
 func DataDirOwned() []string { return slices.Clone(dataDirOwned) }

@@ -22,11 +22,10 @@ type NetworkRecord struct {
 	UpdatedAt string
 }
 
-// UpsertNetwork inserts or updates a network record.
-func UpsertNetwork(ctx context.Context, c *Client, r NetworkRecord) error {
-	now := c.NowTS()
-	return c.Execute(ctx,
-		`INSERT INTO networks (name, stack_name, type, config, project, created_at, updated_at)
+// networkUpsertSQL is the networks table's one upsert: UpsertNetwork, and the
+// guarded write of a network's trunk VLANs (WriteNetworkVLANsCAS), which ships
+// the same statement shape.
+const networkUpsertSQL = `INSERT INTO networks (name, stack_name, type, config, project, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(name) DO UPDATE SET
 		   stack_name = excluded.stack_name,
@@ -34,7 +33,12 @@ func UpsertNetwork(ctx context.Context, c *Client, r NetworkRecord) error {
 		   config = excluded.config,
 		   project = excluded.project,
 		   updated_at = excluded.updated_at,
-		   deleted_at = NULL`,
+		   deleted_at = NULL`
+
+// UpsertNetwork inserts or updates a network record.
+func UpsertNetwork(ctx context.Context, c *Client, r NetworkRecord) error {
+	now := c.NowTS()
+	return c.Execute(ctx, networkUpsertSQL,
 		r.Name, r.StackName, r.Type, r.Config, r.Project, nowRFC3339(), now,
 	)
 }

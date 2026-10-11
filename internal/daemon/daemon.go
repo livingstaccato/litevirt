@@ -190,6 +190,13 @@ func New(cfg *Config) (*Daemon, error) {
 	if err != nil {
 		return nil, fmt.Errorf("libvirt: %w", err)
 	}
+	// No guarded VM starts before the per-NIC firewall is wired (re-review
+	// R2-I2): after a host boots its nft tables are empty, and an onboot,
+	// self-heal or restart-policy start would run its guest unguarded. Such a
+	// start waits for SetStartGuard (Run), and refuses if it never comes. A
+	// VM with no NIC guard does not wait (m3): it starts as it did before
+	// guards. One whose guards cannot be read waits.
+	virt.RequireStartGuard(5*time.Minute, startWaitNeeded(db))
 
 	// Image store
 	store := image.NewStore(cfg.DataDir)
@@ -645,13 +652,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		return d.cfg.Enforcement.CanonicalIdentity && d.checker.Latched(capabilities.CanonicalIdentityV1)
 	})
 
-	d.wireLeaseTermLedgerGate()
-	d.wireLeaseMintClearance()
-	d.wireCredentialsSplitGate()
-	d.wireCredentialsClearGate()
-	d.wireClusterPolicyGate()
-	d.wireVoterConfigGate()
-	d.wireRecoveryClaimGate()
+	d.wireCorrosionGates()
 
 	// Apply a replicated guarded VM-name replacement once vm_replace_v1 is DURABLY
 	// LATCHED. Durable, not Latched or the config flag: a replace batch already on
@@ -902,6 +903,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 
 	svc := grpcapi.NewServer(d.cfg.HostName, d.cfg.DataDir, d.cfg.PKIDir, d.db, d.virt, d.images)
+	// A guarded VM recovers only onto a host that enforces NIC guards until
+	// every host does (re-review m8).
+	fc.SetNICGuardPlacement(svc.GuardHostNeeded)
 	d.svc = svc
 	svc.SetSupersededDiskRetentionDays(d.cfg.SupersededDiskRetentionDays)
 	{
@@ -1285,6 +1289,64 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// construction — guarantees no automated runtime start (reschedule, restart
 	// policy, onboot autostart) ever runs in the window before the gate can confirm
 	// capability, closing the fail-open race for a should-enforce node.
+	// distributed firewall: poll cluster security_groups +
+	// sg_rules every 30s and atomically replace this host's nftables
+	// table. The applier short-circuits when the rendered ruleset
+	// hasn't changed, so idle clusters cost ~one corrosion query/tick.
+	fwApplier := firewall.NewApplier(firewall.NftBinary{})
+	// Observe-mode evidence outlives every table reload and daemon restart
+	// (re-review I-4): harvested before each replace, kept in data_dir.
+	fwApplier.SetTally(firewall.NewWouldDropTally(filepath.Join(d.cfg.DataDir, "firewall-would-drop.json"), time.Now()))
+	fwMetrics := metrics.NewFirewallMetrics()
+	// VMs about to start or migrate in here, and NICs whose rows are not
+	// written yet: rendered ahead of their rows (firewall.Arming).
+	fwArming := firewall.NewArming()
+	// Per-NIC rules need bridge connection tracking. Loaded once here; a host
+	// that cannot load it renders the guards only and raises a health
+	// condition (firewall.nic.unavailable), never an empty firewall.
+	bridgeCT := firewall.BridgeConntrackAvailable(ctx, true)
+	fwLoader := firewall.CorrosionPlanLoader(d.db, d.cfg.HostName, firewall.Plan{},
+		firewall.LoaderOptions{RunningTaps: d.virt.RunningDomainTaps, OnDuplicateSGs: fwMetrics.SetDuplicateSGNICs,
+			BridgeConntrack: func() bool { return bridgeCT }, Arming: fwArming})
+	d.fwReconciler = firewall.NewReconciler(fwLoader, fwApplier, 30*time.Second)
+	d.fwReconciler.SetArming(fwArming)
+	// Every domain start — an API start, a restart policy, a failover
+	// reschedule, a restore — first puts the VM's NIC firewall in force here,
+	// its guards above all, and a guarded VM whose guards cannot be is not
+	// started (re-review I-10).
+	d.virt.SetStartGuard(svc.NICStartGuard(ctx))
+	d.fwReconciler.SetStateHook(svc.RecordFirewallState)
+	// Whether this host enforces NIC guards, after every pass, the boot pass
+	// included (re-review m8, m2, m5): the label carries this build's
+	// version while the last pass put the per-NIC table in force, so a host
+	// rolled back to an older build — which reports its own version and
+	// knows nothing of the label — stops counting, and so does one whose
+	// kernel refuses the table or whose pass failed or ran out of time. Until
+	// every host enforces them, a guarded VM is placed only on such a host.
+	d.fwReconciler.SetPassHook(nicGuardLabelHook(d.db, d.cfg.HostName, d.cfg.Version))
+	// Upgrade migration: once the reconciler renders a bridge's NAT/isolation into
+	// litevirt-fw, clear the pre-consolidation out-of-band rules (old iptables
+	// masquerade + `inet litevirt` chains) a prior binary left for it.
+	d.fwReconciler.SetLegacyCleanup(network.RemoveLegacyBridgeFirewall)
+	svc.SetFirewallReconciler(d.fwReconciler)
+	// This build's units, before the first per-NIC table is loaded: the main
+	// unit's ExecStartPre removes that table when a build that does not own it
+	// starts, so a rollback leaves no stale per-NIC rules enforcing. An upgrade
+	// only ever installs the OLD binary's units.
+	grpcapi.EnsureSystemdUnits()
+	// One pass now, before any runtime start: the tables a host boots with
+	// are empty (re-review R2-I2). Bounded (m3): a hung nft must not hold the
+	// whole daemon start; a guarded start arms its own pass.
+	if err := bootFirewallPass(ctx, d.fwReconciler, bootFirewallPassBudget); err != nil {
+		slog.Warn("firewall: the first pass failed; starts arm their own", "error", err)
+	}
+	d.fwReconciler.Start(ctx)
+	go svc.RecordExistingTrunkVLANsLoop(ctx, 0)
+	// A guest handed over paused for its NIC guards runs once they are in
+	// force here, even when the source's resume never arrives (re-review
+	// R3-I2).
+	go svc.RunHeldGuestResumer(ctx, 0)
+
 	go vmChecker.Start(ctx)
 	go reconciler.Start(ctx)
 	// Finish any drain cold move a previous process died in the middle of: the
@@ -1423,22 +1485,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 	ipScanner := grpcapi.NewIPScanner(svc)
 	go ipScanner.Start(ctx)
 
-	// distributed firewall: poll cluster security_groups +
-	// sg_rules every 30s and atomically replace this host's nftables
-	// table. The applier short-circuits when the rendered ruleset
-	// hasn't changed, so idle clusters cost ~one corrosion query/tick.
-	fwApplier := firewall.NewApplier(firewall.NftBinary{})
-	fwMetrics := metrics.NewFirewallMetrics()
-	fwLoader := firewall.CorrosionPlanLoader(d.db, d.cfg.HostName, firewall.Plan{},
-		firewall.LoaderOptions{RunningTaps: d.virt.RunningDomainTaps, OnDuplicateSGs: fwMetrics.SetDuplicateSGNICs})
-	d.fwReconciler = firewall.NewReconciler(fwLoader, fwApplier, 30*time.Second)
-	// Upgrade migration: once the reconciler renders a bridge's NAT/isolation into
-	// litevirt-fw, clear the pre-consolidation out-of-band rules (old iptables
-	// masquerade + `inet litevirt` chains) a prior binary left for it.
-	d.fwReconciler.SetLegacyCleanup(network.RemoveLegacyBridgeFirewall)
-	svc.SetFirewallReconciler(d.fwReconciler)
 	svc.SetAntiEntropy(ae) // `lv cluster converge` kicks an immediate debounced pass
-	d.fwReconciler.Start(ctx)
+	// Record the founder's genesis decision of the per-NIC enforcement mode
+	// (enforce) once it can; a cluster with no mode recorded observes. And keep
+	// dnsmasq's host reservations in step with the NICs guarded on its
+	// networks.
+	go svc.SeedFirewallEnforcementLoop(ctx, 0, filepath.Join(d.cfg.DataDir, firewallInitialModeName))
+	svc.StartDHCPReservations(ctx, 0)
 
 	// Converge this host's network devices on the replicated networks table
 	// every 30s: a network created elsewhere is provisioned here, a deleted
@@ -2618,6 +2671,11 @@ const adminPasswordFile = "/etc/litevirt/admin-password"
 // while it exists, and deletes it once that credential is written.
 const genesisMarkerName = "genesis-pending"
 
+// firewallInitialModeName is the founder's genesis decision of the cluster's
+// per-NIC firewall mode, in data_dir, consumed once recorded
+// (grpcapi.SeedFirewallEnforcementLoop).
+const firewallInitialModeName = "firewall-initial-mode"
+
 // wireActivationMarker points the health checker at this node's durable
 // capability latches (health.ActivationMarkerBase), loading any already there.
 // They are written only after a daemon has run as a member and survive a
@@ -2743,6 +2801,17 @@ func (d *Daemon) seedAdminUser(ctx context.Context) error {
 	if err := d.db.MarkAuditSeeded(ctx, "founded the cluster (genesis)"); err != nil {
 		slog.Warn("could not record the founder's replica as seeded; `lv host add` through this node "+
 			"is refused until it is", "error", err)
+	}
+
+	// Genesis is also the one moment the cluster is known to be new, so it is
+	// where "a fresh cluster enforces its per-NIC firewall rules" is decided
+	// (re-review I-3, m-j): the seed loop records this once the
+	// cluster_policies gate opens. No other host ever decides; with nothing
+	// recorded a cluster observes.
+	if err := os.WriteFile(filepath.Join(d.cfg.DataDir, firewallInitialModeName),
+		[]byte(corrosion.FirewallEnforce+"\n"), 0o600); err != nil {
+		slog.Warn("could not record the new cluster's initial firewall mode; it observes until `lv firewall enforce on`",
+			"error", err)
 	}
 
 	// The marker licenses exactly one mint, and that mint has now happened: the
@@ -3345,6 +3414,20 @@ func (d *Daemon) wireClusterPolicyGate() {
 	})
 }
 
+// wireCorrosionGates wires every gate corrosion consults before emitting a
+// statement shape or a row a peer relies on. One function, so the daemon and
+// its test wire the same set: a gate left unwired fails closed and looks
+// exactly like a cluster mid-roll, so nothing else would notice it missing.
+func (d *Daemon) wireCorrosionGates() {
+	d.wireLeaseTermLedgerGate()
+	d.wireLeaseMintClearance()
+	d.wireCredentialsSplitGate()
+	d.wireCredentialsClearGate()
+	d.wireClusterPolicyGate()
+	d.wireVoterConfigGate()
+	d.wireRecoveryClaimGate()
+}
+
 // wireLeaseMintClearance makes every new lease term wait for the quorum
 // high-water read (grpcapi.Server.LeaseMintClearance): a node must not mint
 // term N+1 from its own replica while a peer already holds N+1, which is what a
@@ -3427,6 +3510,46 @@ func (d *Daemon) wireLeaseTermLedgerGate() {
 	d.db.SetLeaseTermLedgerGate(func() bool {
 		return d.checker.DurablyLatched(capabilities.LeaseTermLedgerV1)
 	})
+}
+
+// startWaitNeeded is the predicate RequireStartGuard waits on (re-review
+// m3): a start waits for the start guard only when its VM has a NIC guard
+// on, or whether it has one cannot be read. A VM with none starts as it did
+// before guards.
+func startWaitNeeded(db *corrosion.Client) func(name string) bool {
+	return func(name string) bool {
+		gctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		macs, err := corrosion.GuardedMACsOf(gctx, db, name)
+		return err != nil || len(macs) > 0
+	}
+}
+
+// nicGuardLabelHook sets host's NIC-guard label after every firewall pass
+// (firewall.Reconciler.SetPassHook): version while the pass put the per-NIC
+// table in force, "" otherwise (re-review m5). The write has its own
+// deadline, so a pass that ran out of time still clears the label.
+func nicGuardLabelHook(db *corrosion.Client, host, version string) func(context.Context, bool) {
+	return func(ctx context.Context, enforcing bool) {
+		lctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		if err := corrosion.SetHostLabel(lctx, db, host, corrosion.LabelNICGuards,
+			grpcapi.NICGuardLabelValue(version, enforcing)); err != nil {
+			slog.Warn("could not set the NIC-guard host label", "enforcing", enforcing, "error", err)
+		}
+	}
+}
+
+// bootFirewallPassBudget bounds the daemon's first firewall pass (re-review m3).
+const bootFirewallPassBudget = 60 * time.Second
+
+// bootFirewallPass runs the first firewall pass at boot under budget: it runs
+// before every start source and before the gRPC server, so a pass that hangs
+// (an nft that never returns) must not hold the daemon's start.
+func bootFirewallPass(ctx context.Context, r interface{ Reconcile(context.Context) error }, budget time.Duration) error {
+	bctx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	return r.Reconcile(bctx)
 }
 
 // checkMigrationNetwork refuses a migration.network that would send migration

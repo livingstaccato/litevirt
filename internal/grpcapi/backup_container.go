@@ -823,6 +823,10 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 			s.audit(ctx, "ct.restore", req.Name, "project="+project+" (source row: "+status.Convert(serr).Message()+")", "error")
 			return serr
 		}
+		if source == nil {
+			s.audit(ctx, "ct.restore", req.Name, "project="+project+" relocation with no source row here and none sent (an earlier-build coordinator): "+
+				"NICs admitted from the archive by their network records; host access and privilege not carried", "ok")
+		}
 	}
 
 	// Project isolation. An operator restore rebuilds the archived spec's NICs as

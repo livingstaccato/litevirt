@@ -157,7 +157,7 @@ func (s *Server) resolveContainerNICs(ctx context.Context, project, ctName strin
 			if rerr != nil {
 				// Fail closed: a bridge that may render a managed network must
 				// not take the raw-bridge path because the list was unreadable.
-				return nil, status.Errorf(codes.Internal, "read networks (does bridge %q render a managed network?): %v", n.Bridge, rerr)
+				return nil, status.Errorf(codes.Unavailable, "read networks (does bridge %q render a managed network?): %v", n.Bridge, rerr)
 			}
 			if ok {
 				netName = name

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -126,6 +127,7 @@ func TestFleet_PeerMoveWithALaggingSourceRowIsRetriedNotStripped(t *testing.T) {
 	// code the source reads as "nothing landed" (it rolls back), not
 	// "indeterminate" (it would park the container).
 	repo, ts := backupContainer(t, c, src, "ct")
+	dst.Server.SetSourceRowWait(time.Second) // it waits for the row first (P1); it never comes
 	md := metadata.AppendToOutgoingContext(ctx, "x-litevirt-migrate-from-host", src.Name)
 	st, err := c.PeerClient(src, dst).RestoreContainer(md, &pb.RestoreContainerRequest{RepoPath: repo, Name: "ct", Timestamp: ts, HostName: dst.Name})
 	if err == nil {

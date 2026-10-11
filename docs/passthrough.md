@@ -287,10 +287,15 @@ containers:
   may not use is kept and audited (`allowed-foreign-network`). A NIC the
   archive adds that the row does not record is dropped and audited, wherever
   it points. The moving host sends the row with the move (the target's own
-  replica need not have it yet); a target that has neither the row nor a copy
-  of it (a move from an earlier build, before replication catches up) refuses
-  before it writes anything, and the move is retried — never landed without
-  the container's NICs, mounts or privilege. A row from before the create
+  replica need not have it yet). A target that was sent no row (a move from
+  an earlier build) waits up to 20 s for the row to replicate. If it still
+  has none, a cold migration refuses before it writes anything — the source
+  rolls back, the container intact, and the move is retried — and a failover
+  relocation restores as earlier builds did, so its backed-up data is never
+  given up for an image re-create: each managed NIC is kept when its network
+  exists, is a container's type and is one the project may use, a raw NIC or
+  another project's is dropped, host mounts, devices and privilege are not
+  carried, and all of it is audited. A row from before the create
   spec records no NICs: a move keeps the archive's veth-on-bridge NICs and
   drops every other kind. A network record or list that cannot be read fails
   the restore, to be retried. A restore keeps the backup's mounts and devices only for an

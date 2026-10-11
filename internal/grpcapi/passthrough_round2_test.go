@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -117,14 +118,14 @@ func TestCloneContainer_NonAdminCloneLandsUnprivileged(t *testing.T) {
 func TestPeerMoveSource(t *testing.T) {
 	s := testServer(t)
 	s.hostName = "self"
+	s.sourceRowWait = 50 * time.Millisecond
 	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs(relocateTokenMDKey, "tok"))
 	req := &pb.RestoreContainerRequest{Name: "ct1"}
 	if _, err := s.peerMoveSource(ctx, req, "src"); status.Code(err) != codes.FailedPrecondition {
 		t.Errorf("a migrate whose source row is not here = %v; want FailedPrecondition", err)
 	}
-	if _, err := s.peerMoveSource(ctx, req, ""); status.Code(err) != codes.Unavailable {
-		t.Errorf("a relocation whose mark is not here = %v; want Unavailable", err)
-	}
+	// A relocation with no row and none sent is an earlier coordinator's: it
+	// restores as main did (P1, TestPeerMoveSource_OlderCoordinatorWithNoRowRestoresAsMain).
 	sent := corrosion.EncodeCreateSpec(corrosion.ContainerCreateSpec{Template: "download", Networks: []corrosion.ContainerNetwork{{Name: "eth0", Bridge: "br0"}}})
 	if src, err := s.peerMoveSource(ctx, &pb.RestoreContainerRequest{Name: "ct1", SourceCreateSpec: sent}, "src"); err != nil || src == nil || src.CreateSpec != sent {
 		t.Errorf("the row the peer sent = %+v (%v); want it as sent", src, err)
@@ -220,8 +221,9 @@ func TestAuthorizeRestoredNICs(t *testing.T) {
 	if out, _, _ = s.authorizeRestoredNICs(adminCtx(), "acme", forged, src, true); len(out.Networks) != 1 || out.Networks[0].Bridge != "br-mgmt" {
 		t.Errorf("a peer move's NICs = %+v; want only the raw NIC its source row records", out.Networks)
 	}
-	// With no source row it keeps nothing and fails, so the move is retried.
-	if out, _, err := s.authorizeRestoredNICs(adminCtx(), "acme", forged, nil, true); err == nil {
-		t.Errorf("a peer move with no source row kept %+v and did not fail", out.Networks)
+	// With no source row (an earlier coordinator, P1) it restores as main:
+	// the managed NIC on its network's bridge, the raw one dropped.
+	if out, _, err := s.authorizeRestoredNICs(adminCtx(), "acme", forged, nil, true); err != nil || len(out.Networks) != 1 || out.Networks[0].Bridge != "br-ctnet" {
+		t.Errorf("a peer move with no source row = %+v (%v); want only eth0 on br-ctnet", out.Networks, err)
 	}
 }

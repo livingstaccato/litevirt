@@ -62,20 +62,6 @@ func TestAuthorizeRestoredNICs_PeerMoveTakesTheSourceRowsNICs(t *testing.T) {
 	}
 }
 
-// R4-I1. A peer move whose source row this host cannot see fails the restore,
-// so the move is retried; it never strips the container's NICs.
-func TestAuthorizeRestoredNICs_PeerMoveWithoutASourceRowIsRetried(t *testing.T) {
-	s := testServer(t)
-	r4Networks(t, s)
-	archive := corrosion.ContainerCreateSpec{Template: "download", Networks: []corrosion.ContainerNetwork{
-		{Name: "eth0", NetworkName: "ctnet"}, {Name: "eth1", Bridge: "br-raw"},
-	}}
-	out, dropped, err := s.authorizeRestoredNICs(adminCtx(), "acme", archive, nil, true)
-	if status.Code(err) != codes.Unavailable {
-		t.Fatalf("a peer move with no source row = %v (NICs %v, dropped %v); want Unavailable", err, nicNames(out.Networks), dropped)
-	}
-}
-
 // R4-I1. A peer move whose source row predates the create spec (an empty
 // spec) keeps the network the archive configures; nothing in the row says
 // otherwise.

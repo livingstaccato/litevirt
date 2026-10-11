@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -200,43 +201,75 @@ type containerConfigNICReader interface {
 	ContainerConfigNICs(name string) ([]lxc.NetworkAttach, error)
 }
 
+// SetSourceRowWait sets how long a peer move's restore waits for the source
+// row to reach this replica (tests).
+func (s *Server) SetSourceRowWait(d time.Duration) { s.sourceRowWait = d }
+
+// defaultSourceRowWait bounds how long a peer move's restore waits for the
+// source row to reach this replica: well inside the coordinator's
+// fresh-marker window, so a relocation that waits never races the
+// coordinator's own fallback.
+const defaultSourceRowWait = 20 * time.Second
+
+// sourceRowPoll is how often that wait re-reads the replica.
+const sourceRowPoll = 250 * time.Millisecond
+
 // peerMoveSource is the row a peer move's container is authorized by: the
 // spec the moving peer read off it and sent (req.SourceCreateSpec), else the
 // row in this host's replica — the cold migrate's source row, or the row the
-// failover coordinator marked for this restore. A row that cannot be read
-// fails the restore (Unavailable, retried); one this replica does not hold
-// yet refuses before anything is written — FailedPrecondition for a cold
-// migrate, which its source reads as "nothing landed" and rolls back (it
-// would read Unavailable as indeterminate and park the container), and
-// Unavailable for a relocation, which its coordinator defers. Never "no
-// source": that would strip the container's NICs and host access.
+// failover coordinator marked for this restore — waited for up to
+// sourceRowWait, since the move can outrun replication. A row that cannot be
+// read fails the restore (Unavailable, retried). When the row still has not
+// arrived:
+//   - a cold migrate refuses before anything is written (FailedPrecondition,
+//     which its source reads as "nothing landed" and rolls back, the
+//     container intact);
+//   - a relocation that sent no row comes from an earlier-build coordinator.
+//     Refusing would end in its image-recreate fallback and lose the backed-up
+//     data main restores, so it restores as main did: the source is nil (no
+//     error), its NICs are admitted from the archive by their network records
+//     (mainRelocationNICs), and host access and privilege are not carried.
 func (s *Server) peerMoveSource(ctx context.Context, req *pb.RestoreContainerRequest, migrateSource string) (*corrosion.ContainerRecord, error) {
 	if spec := req.GetSourceCreateSpec(); spec != "" {
 		return &corrosion.ContainerRecord{Name: req.Name, CreateSpec: spec}, nil
 	}
-	var source *corrosion.ContainerRecord
-	var err error
-	if migrateSource != "" {
-		source, err = corrosion.GetContainer(ctx, s.db, migrateSource, req.Name)
-	} else {
-		token := relocateTokenFromMD(ctx)
-		if token == "" && req.Proof != nil {
-			token = req.Proof.GetRelocationToken()
+	token := relocateTokenFromMD(ctx)
+	if token == "" && req.Proof != nil {
+		token = req.Proof.GetRelocationToken()
+	}
+	lookup := func() (*corrosion.ContainerRecord, error) {
+		if migrateSource != "" {
+			return corrosion.GetContainer(ctx, s.db, migrateSource, req.Name)
 		}
-		source, err = s.relocatingContainer(ctx, req.Name, s.hostName, token)
+		return s.relocatingContainer(ctx, req.Name, s.hostName, token)
+	}
+	wait := s.sourceRowWait
+	if wait <= 0 {
+		wait = defaultSourceRowWait
+	}
+	deadline := time.Now().Add(wait)
+	source, err := lookup()
+	for err == nil && source == nil && time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return nil, status.Errorf(codes.Unavailable, "restore: waiting for container %q's source row: %v", req.Name, ctx.Err())
+		case <-time.After(sourceRowPoll):
+		}
+		source, err = lookup()
 	}
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable, "restore: read the source container's row (what authorizes its NICs, host access and privilege): %v", err)
 	}
-	if source == nil {
-		code := codes.Unavailable
-		if migrateSource != "" {
-			code = codes.FailedPrecondition
-		}
-		return nil, status.Errorf(code, "restore: this host has not seen container %q's source row yet (replication still catching up?): "+
+	if source != nil {
+		return source, nil
+	}
+	if migrateSource != "" {
+		return nil, status.Errorf(codes.FailedPrecondition, "restore: this host has not seen container %q's source row yet (replication still catching up?): "+
 			"a move takes the container's NICs, host access and privilege from that row, never from the archive; retry the move once it has replicated", req.Name)
 	}
-	return source, nil
+	slog.Warn("container relocation: no source row here and none sent (an earlier-build coordinator); restoring as before: NICs admitted from the archive by their network records, host access and privilege not carried",
+		"name", req.Name, "waited", wait)
+	return nil, nil
 }
 
 // rebuildContainerConfig renders name's config from the authorized spec cs.
@@ -489,6 +522,9 @@ func (s *Server) noteStrippedHostAccess(ctx context.Context, action, name, strip
 // network record or list that cannot be read fails the restore
 // (Unavailable): "not found" is an answer that read did not give.
 func (s *Server) authorizeRestoredNICs(ctx context.Context, project string, cs corrosion.ContainerCreateSpec, source *corrosion.ContainerRecord, peer bool) (corrosion.ContainerCreateSpec, []string, error) {
+	if peer && source == nil {
+		return s.mainRelocationNICs(ctx, project, cs)
+	}
 	if peer {
 		return s.peerMoveNICs(ctx, cs, source)
 	}
@@ -543,6 +579,48 @@ func (s *Server) authorizeRestoredNICs(ctx context.Context, project string, cs c
 	return cs, dropped, nil
 }
 
+// mainRelocationNICs are the NICs of a relocation with no source row (an
+// earlier-build coordinator whose mark never reached this replica,
+// peerMoveSource): restored as main restored them, from the archive, but
+// admitted by their network records — a managed NIC is kept when its record
+// exists, is a container's type and is one the project may use, on that
+// network's own bridge. A raw NIC (nothing here authorizes it), a missing
+// network and another project's are dropped and said. A record that cannot
+// be read fails the restore (Unavailable).
+func (s *Server) mainRelocationNICs(ctx context.Context, project string, cs corrosion.ContainerCreateSpec) (corrosion.ContainerCreateSpec, []string, error) {
+	var out []corrosion.ContainerNetwork
+	var dropped []string
+	for _, n := range cs.Networks {
+		if n.NetworkName == "" {
+			dropped = append(dropped, "raw NIC "+n.Name+" on bridge "+n.Bridge+": no source row here authorizes it")
+			continue
+		}
+		def, err := lookupNetworkDef(ctx, s.db, n.NetworkName)
+		if err != nil {
+			return cs, nil, status.Errorf(codes.Unavailable, "restore: read network %q (what decides where NIC %s attaches): %v", n.NetworkName, n.Name, err)
+		}
+		if def == nil {
+			dropped = append(dropped, "NIC "+n.Name+" on network "+n.NetworkName+", which does not exist")
+			continue
+		}
+		if def.Type == "direct" || def.Type == "sriov" {
+			dropped = append(dropped, "NIC "+n.Name+" on network "+n.NetworkName+" of type "+def.Type+", which containers cannot use")
+			continue
+		}
+		if aerr := s.admitManagedNetwork(ctx, project, n.NetworkName); aerr != nil {
+			if status.Code(aerr) != codes.PermissionDenied {
+				return cs, nil, status.Errorf(codes.Unavailable, "restore: %s", status.Convert(aerr).Message())
+			}
+			dropped = append(dropped, "NIC "+n.Name+" on network "+n.NetworkName+": "+status.Convert(aerr).Message())
+			continue
+		}
+		n.Bridge = network.BridgeName(n.NetworkName, *def)
+		out = append(out, n)
+	}
+	cs.Networks = out
+	return cs, dropped, nil
+}
+
 // peerMoveNICs are a peer-moved container's NICs: exactly those its source
 // row records, in the row's order, with the row's address and MAC (R4-I1,
 // R4-I2). As on main, a NIC the container holds is never lost to the move:
@@ -554,15 +632,10 @@ func (s *Server) authorizeRestoredNICs(ctx context.Context, project string, cs c
 //     (direct, sriov: a network re-created under the same name);
 //   - a raw NIC keeps its bridge.
 //
-// An archive NIC the row does not record is dropped and said. A nil source
-// fails (Unavailable): the caller refuses a peer move with no source row
-// before it gets here (peerMoveSource). A row with no create spec records no
+// An archive NIC the row does not record is dropped and said. A row with no create spec records no
 // NICs; its archive's network is kept (restoredNetworkMode) and its spec's
 // NICs are not claimed for the restored row.
 func (s *Server) peerMoveNICs(ctx context.Context, cs corrosion.ContainerCreateSpec, source *corrosion.ContainerRecord) (corrosion.ContainerCreateSpec, []string, error) {
-	if source == nil {
-		return cs, nil, status.Error(codes.Unavailable, "restore: a moved container's NICs come from its source row, which this host does not have yet; retry the move")
-	}
 	if source.CreateSpec == "" {
 		cs.Networks = nil
 		return cs, nil, nil

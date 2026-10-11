@@ -258,7 +258,7 @@ func TestCredentialsClear_WritersLeaveTheOldColumnEmpty(t *testing.T) {
 	if err := DeleteUser(ctx, c, "root"); err != nil {
 		t.Fatal(err)
 	}
-	if who, err := ReinstateAdminIfNoneRemain(ctx, c); err != nil || who != "root" {
+	if who, err := ReinstateAdminIfNoneRemain(ctx, c, nil); err != nil || who != "root" {
 		t.Fatalf("ReinstateAdminIfNoneRemain = %q, %v", who, err)
 	}
 	if err := InsertToken(ctx, c, TokenRecord{ID: "tok-c", Username: "carol", Name: "ci", TokenHash: "$2a$10$tok-c"}); err != nil {
@@ -270,7 +270,10 @@ func TestCredentialsClear_WritersLeaveTheOldColumnEmpty(t *testing.T) {
 			t.Errorf("%s = %q written after the clear latched; the old column must stay empty", k, v)
 		}
 	}
-	for user, want := range map[string]string{"carol": "$2a$10$carol-2", "dave": "$2a$10$dave-2", "root": "$2a$10$root"} {
+	// The admin floor reinstates root WITHOUT its old password (login-policy
+	// I1a): the sentinel, in the credential row only — the old column stays
+	// empty like every other writer's (credentials-clear x login-policy M3).
+	for user, want := range map[string]string{"carol": "$2a$10$carol-2", "dave": "$2a$10$dave-2", "root": ReinstatedAdminPasswordHash} {
 		if u, _ := GetUser(ctx, c, user); u == nil || u.PasswordHash != want {
 			t.Errorf("GetUser(%s) = %+v, want hash %q", user, u, want)
 		}

@@ -557,7 +557,14 @@ guards are on by default for every new NIC, so they are their own feature,
 security-group and firewall rules are `firewall_ipv6`, used only once someone
 writes one. `usb_mounts_memory` is one bit for VM USB devices, VM memory
 hot-add and container host mounts and devices: any one of them in use makes a
-rollback below the release quarantine.
+rollback below the release quarantine. `login_policy` is used by default too:
+account disable and expiry, the second-factor policy and enrollment codes are
+written on request, but the same feature carries what the login rules write
+on their own — a directory account's identity binding at its first login, the
+second factor a login presented, and the credential cut-offs a user create or
+delete writes — so it is used from the first such login, create or delete
+after the latch. Logins, creates and deletes are never refused for it: until
+the feature opens they run as on the previous release.
 
 **What this does not change.** A binary built before `release_2026_11_v1`
 understands no rollback rule. Rolled back below any token it does not know —
@@ -1248,6 +1255,54 @@ majority from its peers. `lv cluster voter reset` is the decided exit back to
 the derived set. It is not a rollback tool: a binary rolled back below the
 latched token enters WAL quarantine at startup, as below every latched token,
 whether or not a voter generation exists.
+
+### Account lifecycle and the second-factor policy latch after the roll
+
+Schema v64 adds `user_lifecycle`, one row per (account, attribute) holding an
+account's `disabled` flag and `expires_at`. Nothing writes it, and nothing
+writes the `login_2fa_required` second-factor policy row, until the release
+feature `login_policy` opens (the release token `release_2026_11_v1` has
+latched; see "Rolling back after a release token latched") — so `lv user
+disable`, `lv user enable`, `lv user expire`, `lv user unbind`, `lv 2fa
+enroll-code` and setting `lv 2fa policy` are refused with `FailedPrecondition`
+(`the cluster upgrade must finish first (login_policy needs
+release_2026_11_v1)`) until every host (every host in `maintenance` included)
+runs this release. A previous-release host would neither decode the rows nor
+enforce them; it has no statement that touches the table, so it cannot undo a
+disable either. Delegated administration (`perm.modify`) needs no token: it
+writes the existing `role_bindings` shape, and its rules are enforced where a
+grant is created. It needs an **explicit** `perm.modify` (or `perm.*`) grant:
+an existing `Admin` (`*`) binding on a project does **not** gain the right to
+grant or revoke roles there. To see who holds delegation:
+`lv role ls --role PermissionAdmin`.
+
+**LDAP logins this release refuses.** The typed name must now literally be
+the login value of the one entry the search finds (docs/auth.md,
+`user_login_attr`). Check the realm config before the roll; these setups that
+logged in before are refused after it:
+- a `user_filter` with `%s` inside a longer value, such as
+  `(userPrincipalName=%s@corp.example)`, and no `user_login_attr`: no
+  attribute value equals the typed name. Set `user_login_attr` (for example
+  `sAMAccountName`) or match a whole attribute (`(uid=%s)`);
+- a `user_filter` with no `%s` at all (`(objectClass=person)`): every login is
+  refused. Use `(&(objectClass=person)(uid=%s))`;
+- a service account that cannot read the matched attribute (or
+  `user_login_attr`): grant it read access;
+- a typed name that differs from the stored one by more than ASCII case and
+  surrounding spaces (non-ASCII case, NFD, width or accent variants): users
+  type their name as stored.
+A search that finds two entries for one name is refused too. Each LDAP or
+OIDC account is bound to its directory entry at its first login after the
+`login_policy` feature opens.
+
+v64 also adds `session_factors` (what each session's login presented) and
+`user_enrollment_codes` (hashed first-enrollment codes), written under the
+same feature. A host below the release does not enforce any of it: it
+accepts a disabled account's sessions and API tokens and does not confine
+password-only sessions. Keep such a host out of the client path until it is
+upgraded (docs/auth.md, "Rolling upgrade, and hosts below the latch"). From
+this release on, a host in WAL quarantine refuses every user credential and
+serves only local-root and peer mTLS.
 
 ### Recovery claims latch after the roll
 

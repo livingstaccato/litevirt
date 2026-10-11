@@ -551,6 +551,10 @@ type Client struct {
 // cannot receive could never be repaired, only rebuilt.
 func (c *Client) SetWriteQuarantine(fn func() string) { c.writeQuarantine = fn }
 
+// WriteQuarantineReason is quarantineReason for callers outside the package:
+// the auth interceptor refuses user bearers on a quarantined node.
+func (c *Client) WriteQuarantineReason() string { return c.quarantineReason() }
+
 // quarantineReason returns why replicated writes are currently refused, or "".
 func (c *Client) quarantineReason() string {
 	if c.writeQuarantine != nil {

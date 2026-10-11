@@ -58,6 +58,7 @@ func (s *Server) GetVMLogs(req *pb.GetVMLogsRequest, stream grpc.ServerStreaming
 		return status.Errorf(codes.Internal, "open log: %v", err)
 	}
 	defer f.Close()
+	registerStreamCloser(stream.Context(), func() { _ = f.Close() }) // released at a cut (m-2)
 
 	// Seek to end.
 	if _, err := f.Seek(0, io.SeekEnd); err != nil {

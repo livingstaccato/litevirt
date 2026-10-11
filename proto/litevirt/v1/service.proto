@@ -964,13 +964,84 @@ message LoginResponse      {
     string role          = 3;
     string expires_at    = 4;  // RFC3339; hard expiry of the session
     bool   requires_2fa  = 5;  // if true, token is empty; client must re-call Login with totp_code
+    // requires_2fa_enrollment: the login policy requires a second factor for
+    // this realm and the account has none. token is an ENROLLMENT-ONLY session:
+    // it can enroll a factor for its own account (EnrollTOTP, WebAuthn
+    // registration), call Whoami and Logout, and nothing else. Enrolling ends
+    // it; log in again with the new factor.
+    bool   requires_2fa_enrollment = 6;
 }
 message ListRealmsResponse { repeated string realms = 1; }
 message CreateUserRequest  { string username = 1; string password = 2; string role = 3; }
 message ListUsersResponse  { repeated User users = 1; }
-message DeleteUserRequest  { string username = 1; }
+// exact: match username as stored, byte for byte, instead of by normalized
+// name — the way to remove one of two accounts that differ only in case or
+// surrounding spaces, which every normalized lookup refuses (admin, audited).
+// exact_id: with exact, the id of the one account to delete, as
+// ListUserVariants reports it — an exact delete refuses without it.
+message DeleteUserRequest  { string username = 1; bool exact = 2; string exact_id = 3; }
 message MarkUserExternalRequest { string username = 1; }
-message WhoamiResponse     { string username = 1; string role = 2; string realm = 3; string expires_at = 4; }
+// ListUserVariants lists every live account whose name normalizes like
+// username (case and surrounding spaces), with what an operator needs to
+// choose which one an exact delete removes. Admin only.
+message ListUserVariantsRequest { string username = 1; }
+message UserVariant {
+    string id         = 1;  // stable id to pass as DeleteUserRequest.exact_id
+    string username   = 2;  // as stored, byte for byte
+    string created_at = 3;
+    string role       = 4;
+    string realm      = 5;
+    string last_login = 6;  // newest session created_at, "" if none here
+    int32  factors    = 7;
+    int32  tokens     = 8;
+}
+message ListUserVariantsResponse { repeated UserVariant variants = 1; }
+// ClearIdentityBindingRequest drops the directory identity an external-realm
+// account is bound to, so its next login binds afresh (an entry re-created in
+// the directory). Admin only, audited.
+message ClearIdentityBindingRequest { string username = 1; string realm = 2; }
+message WhoamiResponse     {
+    string username = 1; string role = 2; string realm = 3; string expires_at = 4;
+    // requires_2fa_enrollment: this is an enrollment-only session (see
+    // LoginResponse.requires_2fa_enrollment).
+    bool requires_2fa_enrollment = 5;
+}
+// SetUserAccountRequest changes an account's lifecycle. An unset field is left
+// as it is, so disabling and setting an expiry from two places cannot undo each
+// other. expires_at is RFC3339; "" clears the expiry (never expires).
+message SetUserAccountRequest {
+    string username = 1;
+    optional bool   disabled   = 2;
+    optional string expires_at = 3;
+}
+// LoginPolicy is the cluster-wide mandatory second-factor policy.
+// require_2fa is "off" (no row, the default), "all", or a comma-separated list
+// of realm names ("local,ldap:corp"). A value this build does not understand is
+// reported as stored and enforced as "all".
+message LoginPolicy {
+    string          require_2fa      = 1;
+    repeated string realms           = 2;  // the realms it covers; empty with all_realms=false = off
+    bool            all_realms       = 3;
+    string          set_by           = 4;
+    string          updated_at       = 5;
+    bool            settable         = 6;  // the login_policy release feature is available here
+    int32           sessions_revoked = 7;  // SetLoginPolicy only: sessions ended in newly covered realms
+    string          self_enroll_by   = 8;  // RFC3339; "" = enrollment needs an admin-issued code
+    repeated string warnings         = 9;  // e.g. a covered realm that is not configured on this node
+}
+// SetLoginPolicyRequest: by default an enrollment-only session can enroll its
+// first factor only with an admin-issued enrollment code (IssueEnrollmentCode).
+// allow_self_enroll with enroll_by (RFC3339, in the future) lets it enroll
+// without one until enroll_by; after it, a code is required again.
+message SetLoginPolicyRequest { string require_2fa = 1; bool allow_self_enroll = 2; string enroll_by = 3; }
+// IssueEnrollmentCode mints a single-use, short-lived code with which an
+// enrollment-only session of username may enroll its first factor. Admin only.
+// ttl_seconds 0 = one hour; at most 24 hours. The code is shown once and
+// stored hashed.
+message IssueEnrollmentCodeRequest  { string username = 1; int64 ttl_seconds = 2; }
+// issued_on: the node the code is bound to; it can be used only through that
+// node.
+message IssueEnrollmentCodeResponse { string code = 1; string expires_at = 2; string issued_on = 3; }
 // CheckPermissionsRequest names permission gates (see grpcapi permGates), not
 // raw verbs, so the question cannot drift from the one the RPC asks.
 message CheckPermissionsRequest  { repeated string gates = 1; }
@@ -985,7 +1056,18 @@ message ChangePasswordRequest { string username = 1; string old_password = 2; st
 // never leaves the process that writes the password file. os_user is the
 // invoking account as the CLI reports it (SUDO_USER when set); it is recorded
 // in the audit row as a claim, not as an authenticated identity.
-message ResetAdminPasswordRequest { string password_hash = 1; string os_user = 2; }
+// clear_two_factor also removes every second factor and recovery code of the
+// admin account (`lv user reset-admin --clear-2fa`); refused until the
+// login_policy release feature opens.
+// username names the admin-role account to reset (`lv user reset-admin
+// --user`); empty is "admin". It is how an operator gives an account the admin
+// floor reinstated its first credential: the floor never brings back a deleted
+// account's old password.
+message ResetAdminPasswordRequest { string password_hash = 1; string os_user = 2; bool clear_two_factor = 3; string username = 4; }
+// ResetAdminPasswordResponse names the account the daemon reset, as stored. A
+// daemon that predates the field answers with an empty name: it reset "admin"
+// whatever the request named, and the CLI says so.
+message ResetAdminPasswordResponse { string username = 1; }
 message CreateTokenRequest {
     string username = 1;
     string name     = 2;
@@ -1760,11 +1842,16 @@ message TwoFactor {
 }
 message ListTwoFactorsRequest  { string username = 1; }  // empty = caller's own
 message ListTwoFactorsResponse { repeated TwoFactor factors = 1; }
-message EnrollTOTPRequest      { string username = 1; string label = 2; }
+// enrollment_code: required from an enrollment-only session unless the
+// policy's self-enrollment window is open (IssueEnrollmentCode).
+message EnrollTOTPRequest      { string username = 1; string label = 2; string enrollment_code = 3; }
 message EnrollTOTPResponse {
     string otpauth_url    = 1;  // for QR code rendering
     string secret_base32  = 2;  // for manual entry
     repeated string recovery_codes = 3; // shown once; user must save them
+    // session_ended: the call came from an enrollment-only session, which the
+    // enrollment ended. Log in again with the new factor.
+    bool session_ended = 4;
 }
 message DisableTwoFactorRequest { string username = 1; string method = 2; string label = 3; }
 
@@ -1915,13 +2002,15 @@ message RestoreLiveProgress {
 // navigator.credentials.create /.get. The daemon holds the in-flight
 // session between Begin and Finish in memory; a Begin without a
 // matching Finish within 60s is garbage-collected.
-message BeginWebAuthnRegistrationRequest  { string username = 1; }
+message BeginWebAuthnRegistrationRequest  { string username = 1; string enrollment_code = 2; }
 message BeginWebAuthnRegistrationResponse { bytes options_json = 1; }
 message FinishWebAuthnRegistrationRequest {
     string username        = 1;
     bytes  attestation_json = 2;
+    string enrollment_code = 3;
 }
-message FinishWebAuthnRegistrationResponse { string credential_label = 1; }
+// session_ended: as EnrollTOTPResponse.session_ended.
+message FinishWebAuthnRegistrationResponse { string credential_label = 1; bool session_ended = 2; }
 
 message BeginWebAuthnLoginRequest  { string username = 1; }
 message BeginWebAuthnLoginResponse { bytes options_json = 1; }
@@ -3798,6 +3887,17 @@ service LiteVirt {
     // user, so an external login under that name is not refused for want of
     // evidence. Refused for an account that holds a password. Admin only.
     rpc MarkUserExternal(MarkUserExternalRequest) returns (google.protobuf.Empty);
+    // SetUserAccount disables, re-enables, or sets the expiry of an account.
+    // Admin only. Refused until the login_policy release feature opens.
+    rpc SetUserAccount(SetUserAccountRequest) returns (User);
+    // GetLoginPolicy / SetLoginPolicy read and change the cluster-wide
+    // mandatory second-factor policy (`lv 2fa policy`). Set is admin only and
+    // refused until the login_policy release feature opens.
+    rpc GetLoginPolicy(google.protobuf.Empty) returns (LoginPolicy);
+    rpc SetLoginPolicy(SetLoginPolicyRequest) returns (LoginPolicy);
+    rpc IssueEnrollmentCode(IssueEnrollmentCodeRequest) returns (IssueEnrollmentCodeResponse);
+    rpc ListUserVariants(ListUserVariantsRequest) returns (ListUserVariantsResponse);
+    rpc ClearIdentityBinding(ClearIdentityBindingRequest) returns (google.protobuf.Empty);
     rpc CreateToken(CreateTokenRequest)  returns (Token);
     rpc RevokeToken(RevokeTokenRequest)  returns (google.protobuf.Empty);
     // Whoami returns the authenticated caller's identity. Authenticated (NOT in
@@ -3816,7 +3916,7 @@ service LiteVirt {
     // ResetAdminPassword replaces the local admin's password hash and records a
     // `user.reset-admin` audit row. Local root only: loopback, this host's own
     // certificate, no bearer. It resets an existing admin and never creates one.
-    rpc ResetAdminPassword(ResetAdminPasswordRequest) returns (google.protobuf.Empty);
+    rpc ResetAdminPassword(ResetAdminPasswordRequest) returns (ResetAdminPasswordResponse);
     rpc ListTwoFactors(ListTwoFactorsRequest) returns (ListTwoFactorsResponse);
     rpc EnrollTOTP(EnrollTOTPRequest)         returns (EnrollTOTPResponse);
     rpc DisableTwoFactor(DisableTwoFactorRequest) returns (google.protobuf.Empty);

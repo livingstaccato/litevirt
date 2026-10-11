@@ -38,6 +38,7 @@ A notification has a `kind` (verb.noun), `severity` (`info` | `warn` | `error`),
 | `replication.reverse_skipped` | warn | the same move, but the host it left could not be made the target; the workload is replicating onto its own host until the schedule is replaced |
 | `host.security_updates` | warn | a host has pending OS security updates (docs/upgrades.md, "Pending OS updates"); sent when the counts change |
 | `host.updates` | info | a host has pending OS package updates, none of them security |
+| `auth.first_factor_enrolled` | warn | an account enrolled its first second factor from an enrollment-only session (mandatory second-factor policy); if it was not the account's owner, remove the factor and reset the password |
 | `ha.vip.no_holder` | error | a configured VIP is served by nobody (VIP HA enabled) — a VIP outage |
 | `ha.vip.demotion_unfenced` | error | a minority node's VIP self-demote failed with no verified self-fence; the majority holds in the safe gap (VIP outage until an operator provides a fence / intervenes) |
 | `ha.dualrun.vm` | error | a VM is an active disk-holder on more than one host — a split-brain that can corrupt the disk |

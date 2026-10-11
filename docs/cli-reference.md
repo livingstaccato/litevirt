@@ -29,7 +29,18 @@ lv session revoke <session-id>         # Revoke a session immediately
 lv 2fa enroll-totp --label <name>          # Enroll TOTP; prints otpauth URL + recovery codes
 lv 2fa disable --method totp --label <l>   # Drop a single factor
 lv 2fa ls [--user <name>]                  # List enrolled factors
+lv 2fa policy                              # Show the mandatory second-factor policy
+lv 2fa policy off|all|<realm>[,<realm>...] # Set it (admin); ends sessions in newly covered realms
+  [--allow-self-enroll --enroll-by <RFC3339>] # let a first factor be enrolled without a code until then
+lv 2fa enroll-code <username> [--ttl 1h]   # Admin: single-use first-enrollment code (max 24h), usable only through the node it names
+lv 2fa enroll-totp --code <code>           # Enroll a first factor from an enrollment-only session
 ```
+
+Under a policy that covers their realm, a login that presents no factor gets
+an enrollment-only session: if the account has no factor yet it can enroll one
+for itself (with an admin-issued code, unless self-enrollment is open) and
+nothing else, and the enrollment ends it. See `docs/auth.md`,
+"Mandatory second factor".
 
 WebAuthn enrollment is browser-only; use the `/account/2fa` page.
 
@@ -1071,26 +1082,47 @@ show the VM deleted and no domain of that name is defined there.
 ```bash
 lv user create <username> --role admin|operator|viewer
 lv user ls
-lv user delete <username>
+lv user delete <username>             # Revokes its sessions and API tokens in the same write
+lv user delete <username> --exact     # List the accounts named like <username> (case-duplicates) with ids; deletes nothing
+lv user delete <username> --exact --id <id>   # Delete the one chosen by id (admin, audited)
+lv user unbind <username> <realm>     # Clear an LDAP/OIDC account's directory bindings (all of them, a conflict too); next login binds afresh (admin)
 lv user passwd [username]           # Change your own password (or, as admin, another user's)
   [--old-password <p>] [--new-password <p>]   # prompts if unset; old not needed for an admin reset
 lv user token-create <username> <token-name> [--expires <RFC3339>]
   [--scope-path <path>] ...        # Repeatable; intersect with role bindings
 lv user token-revoke <token-id>
 lv user reset-admin                # As root on a node: reset the EXISTING admin password (does not create one); audited as user.reset-admin
+                                   # It also re-enables a disabled or expired admin account, and logs it out everywhere
+lv user reset-admin --clear-2fa    # Also remove the admin's second factors and print an enrollment code
+lv user reset-admin --user <name>  # Reset another admin-role account, e.g. the one the admin floor reinstated with no credential
+lv user disable <username>         # No login; sessions ended, sessions and API tokens refused (admin)
+lv user enable <username>          # Re-enable; API tokens work again, ended sessions stay ended (admin)
+lv user expire <username> <RFC3339|never>   # Stop authenticating at that instant; "never" clears it (admin)
 ```
+
+`lv user ls` shows each account's STATUS (`active`, `disabled`, `expired`) and
+EXPIRES. Disable and expiry are refused for the last admin that is enabled with
+no expiry, and until the cluster upgrade has finished (the release feature
+`login_policy`; `lv cluster upgrade-status`). See
+`docs/auth.md`, "Account lifecycle".
 
 ## Roles (path-based RBAC)
 
 ```bash
 lv role grant <role> <principal> --path <path> [--propagate]
 lv role revoke <binding-id>
-lv role ls [--principal user:alice]
+lv role ls [--principal user:alice] [--role <role>]
 ```
 
 Principals are `user:<name>` or `group:<name>@<realm>`. Paths are RBAC
 scopes (`/`, `/projects/acme`, `/projects/acme/vms/web-1`). See
 `docs/auth.md` for the role catalog and propagation semantics.
+
+A cluster admin may grant anything anywhere. A caller holding `perm.modify`
+at a path (the `PermissionAdmin` role) may grant and revoke there and below,
+never a role carrying a verb it does not itself hold there, never a
+principal's first binding or last. See `docs/auth.md`, "Delegated
+administration".
 
 ## Projects (tenancy)
 

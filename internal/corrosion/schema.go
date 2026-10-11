@@ -486,7 +486,28 @@ import (
 //	     local_recovery_claims, and a row here seals the legacy key of the same
 //	     (kind, name, epoch, attempt) on this voter. Nothing is written to it
 //	     until claim_incarnation_v1 latches. One new table.
-const CurrentSchemaVersion = 63
+//	v64: account lifecycle — user_lifecycle (username, attribute PK; value,
+//	     set_by): an account's `disabled` flag and `expires_at` instant, one
+//	     row per attribute so a disable and an expiry change made on two nodes
+//	     each keep their own LWW clock and never undo each other. On a row of
+//	     its own rather than new columns on users, so no previous-release
+//	     statement on users can reset it. Absent = enabled, never expires. A
+//	     previous-release node cannot decode the table's statements, and would
+//	     not enforce them, so nothing writes it without the release feature
+//	     login_policy (release_2026_11_v1, ReplicationGated). With it, two
+//	     tables the mandatory second-factor policy needs, written under the
+//	     same gate: session_factors (left out
+//	     of anti-entropy like sessions; session_id PK: the second factor
+//	     a session's login presented, so a password-only session is never
+//	     re-derived into a full one) and user_enrollment_codes (username PK:
+//	     the admin-issued, single-use, short-lived first-enrollment code,
+//	     stored as a SHA-256 and bound to the node that issued it, which alone
+//	     may spend it; repaired by anti-entropy), and user_identity_bindings
+//	     ((username, realm, external_id) PK: the directory entry's immutable
+//	     id an external-realm account is bound to at its first login after the
+//	     upgrade, refused under any other; one row per id, first binder
+//	     wins). Four new tables.
+const CurrentSchemaVersion = 64
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -2884,11 +2905,63 @@ var schemaDDL = []string{
 		updated_at        TEXT    NOT NULL,
 		PRIMARY KEY (target_kind, target_name, incarnation, owner_epoch, attempt)
 	)`,
+	// v64 account lifecycle — one row per (account, attribute): `disabled`
+	// ("true"/"false") and `expires_at` (RFC3339 UTC, "" = never). Separate
+	// rows so each attribute has its own LWW clock. Written only through the
+	// release feature login_policy; see user_lifecycle.go.
+	`CREATE TABLE IF NOT EXISTS user_lifecycle (
+		username   TEXT NOT NULL,
+		attribute  TEXT NOT NULL,
+		value      TEXT NOT NULL DEFAULT '',
+		set_by     TEXT NOT NULL DEFAULT '',
+		updated_at TEXT NOT NULL,
+		deleted_at TEXT,
+		PRIMARY KEY (username, attribute)
+	)`,
+	// v64 the second factor a session's login presented; no row = none.
+	// Written in the session's own batch; see login_factors.go.
+	`CREATE TABLE IF NOT EXISTS session_factors (
+		session_id   TEXT PRIMARY KEY,
+		method       TEXT NOT NULL,
+		presented_at TEXT NOT NULL,
+		updated_at   TEXT NOT NULL,
+		deleted_at   TEXT
+	)`,
+	// v64 an account's admin-issued first-enrollment code, hashed; see
+	// login_factors.go.
+	`CREATE TABLE IF NOT EXISTS user_enrollment_codes (
+		username   TEXT PRIMARY KEY,
+		code_hash  TEXT NOT NULL,
+		expires_at TEXT NOT NULL,
+		issued_by  TEXT NOT NULL DEFAULT '',
+		issued_on  TEXT NOT NULL DEFAULT '',
+		used_at    TEXT NOT NULL DEFAULT '',
+		updated_at TEXT NOT NULL,
+		deleted_at TEXT
+	)`,
+	// v64 the directory identity an external-realm account is bound to; see
+	// identity_binding.go. One row per bound id, so a later binding made by a
+	// lagging node is added beside the first rather than replacing it
+	// (first binder wins, re-review 3 m-1).
+	`CREATE TABLE IF NOT EXISTS user_identity_bindings (
+		username    TEXT NOT NULL,
+		realm       TEXT NOT NULL,
+		external_id TEXT NOT NULL,
+		bound_at    TEXT NOT NULL,
+		updated_at  TEXT NOT NULL,
+		deleted_at  TEXT,
+		PRIMARY KEY (username, realm, external_id)
+	)`,
 }
 
 // schemaIndexes are CREATE INDEX IF NOT EXISTS statements added after table creation.
 // These accelerate the most common query patterns (ListVMs by host, interfaces by VM, etc.).
 var schemaIndexes = []string{
+	// identity bindings by entry id: one id is never bound to two accounts.
+	`CREATE INDEX IF NOT EXISTS idx_user_identity_bindings_id ON user_identity_bindings(realm, external_id)`,
+	// users by normalized name (corrosion.NormalizeUsername / GetUser): every
+	// authenticated request looks an account up this way.
+	`CREATE INDEX IF NOT EXISTS idx_users_username_norm ON users(lower(trim(username, ' ' || char(9) || char(10) || char(13))))`,
 	// vm_events: per-VM timeline (newest-first list + per-VM prune cap) and the
 	// cross-host live-stream poll (ts cursor).
 	`CREATE INDEX IF NOT EXISTS idx_vm_events_vm_ts ON vm_events(vm_name, ts)`,
@@ -3073,6 +3146,10 @@ var tablePrimaryKeys = map[string][]string{
 	"host_membership":         {"host_name"},
 	"cluster_policies":        {"key"},
 	"voter_configs":           {"generation"},
+	"user_lifecycle":          {"username", "attribute"},
+	"session_factors":         {"session_id"},
+	"user_enrollment_codes":   {"username"},
+	"user_identity_bindings":  {"username", "realm", "external_id"},
 }
 
 // schemaMigrations contains ALTER TABLE statements for upgrading existing databases.
@@ -3447,6 +3524,8 @@ var createTableUnits = []struct {
 	{61, "local_abandoned_proofs"},
 	{62, "local_voter_seals"},
 	{63, "local_incarnation_claims"},
+	{64, "user_lifecycle"}, {64, "session_factors"}, {64, "user_enrollment_codes"},
+	{64, "user_identity_bindings"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

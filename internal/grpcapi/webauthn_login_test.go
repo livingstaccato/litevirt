@@ -23,7 +23,7 @@ func TestMintSession(t *testing.T) {
 		t.Fatalf("InsertUser: %v", err)
 	}
 
-	token, expiresAt, role, err := s.mintSession(ctx, "wakey", "local", "10.0.0.9", "webauthn")
+	token, expiresAt, role, err := s.mintSession(ctx, "wakey", "local", "10.0.0.9", "webauthn", "webauthn")
 	if err != nil {
 		t.Fatalf("mintSession: %v", err)
 	}

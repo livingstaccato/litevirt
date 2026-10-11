@@ -72,6 +72,8 @@ func (s *Server) ConsoleVM(stream grpc.BidiStreamingServer[pb.ConsoleInput, pb.C
 		return status.Errorf(codes.Internal, "open console PTY %s: %v", ptyPath, err)
 	}
 	defer ptmx.Close()
+	// Released at the cut even if this handler is blocked elsewhere (m-2).
+	registerStreamCloser(ctx, func() { _ = ptmx.Close() })
 
 	slog.Info("console session started", "vm", vmName)
 
@@ -118,8 +120,19 @@ func (s *Server) ConsoleVM(stream grpc.BidiStreamingServer[pb.ConsoleInput, pb.C
 		}
 	}()
 
-	// Wait for either direction to finish.
-	err = <-errCh
+	// Wait for either direction to finish — or for the stream's context to
+	// end, which is how a cut credential (a disable, a revoke, a delete; see
+	// stream_watch.go) reaches this handler. Neither goroutine above would
+	// notice it: they block in the PTY read and in the transport's Recv. So
+	// the PTY is closed here, which ends the read, and the handler returns,
+	// which ends the RPC and with it the Recv.
+	select {
+	case err = <-errCh:
+	case <-ctx.Done():
+		_ = ptmx.Close()
+		slog.Info("console session ended: its stream was cut", "vm", vmName)
+		return streamEndError(ctx)
+	}
 	slog.Info("console session ended", "vm", vmName)
 	if err != nil {
 		return status.Errorf(codes.Internal, "console error: %v", err)

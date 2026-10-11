@@ -670,6 +670,15 @@ message User {
     string                         username   = 1;
     string                         role       = 2;
     google.protobuf.Timestamp      created_at = 3;
+    // disabled and expires_at are the account's lifecycle (schema v64,
+    // user_lifecycle). A disabled or expired account cannot log in, and its
+    // sessions and API tokens stop authenticating. expires_at is RFC3339 UTC,
+    // empty for an account that never expires.
+    bool                           disabled   = 4;
+    string                         expires_at = 5;
+    // status is "active", "disabled" or "expired", judged by the answering
+    // daemon's clock.
+    string                         status     = 6;
 }
 
 message Token {

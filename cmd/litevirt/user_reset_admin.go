@@ -26,7 +26,9 @@ import (
 )
 
 func newUserResetAdminCmd() *cobra.Command {
-	return &cobra.Command{
+	var clear2FA bool
+	var username string
+	cmd := &cobra.Command{
 		Use:   "reset-admin",
 		Short: "Reset admin password (run as root on a cluster node)",
 		Long: `Resets the existing admin user's password to a new random value and
@@ -39,7 +41,23 @@ reset and records a user.reset-admin audit row.
 If the daemon is not running, the reset is written to the local database
 directly and the audit entry is journalled under the data directory; the
 daemon folds it into the audit log, signed and at the time it happened,
-when it next starts.`,
+when it next starts.
+
+It also re-enables the admin account if it is disabled or has an expiry.
+--clear-2fa additionally removes every second factor and recovery code of
+the admin account, for a sole admin who lost both under a mandatory
+second-factor policy, and prints an enrollment code for the first factor
+the admin enrolls at the next login, and is recorded as clear_2fa=true on
+the audit row. Both are login rules: they need the cluster upgrade to have
+finished and litevirtd running on this node, and with the daemon down
+reset-admin refuses them and changes nothing.
+
+--user resets another admin-role account instead of "admin". It is how an
+account the admin floor reinstated gets a credential: the floor brings back
+a deleted admin's account but never its old password, sessions, API tokens
+or second factors, so nobody can log in as it until root runs
+` + "`lv user reset-admin --user <name>`" + `. The no_unrestricted_admin health
+condition names the account. An account whose role is not admin is refused.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := daemon.LoadConfig()
 			if err != nil {
@@ -57,19 +75,28 @@ when it next starts.`,
 					// Write user_credentials too once this node has latched
 					// credentials_split_v1, and leave users.password_hash
 					// empty once it has latched credentials_clear_v1, as the
-					// daemon would.
+					// daemon would. The login
+					// rules are a release feature, opened only through the
+					// daemon's gate: this process writes none of their data.
 					db.SetCredentialsSplitGate(daemon.CredentialsSplitLatchedOnDisk(cfg.DataDir))
 					db.SetCredentialsClearGate(daemon.CredentialsClearLatchedOnDisk(cfg.DataDir))
 					return db, nil
 				},
-				dataDir: cfg.DataDir,
-				pwPath:  adminPasswordPath,
-				osUser:  invokingOSUser(),
-				out:     cmd.OutOrStdout(),
-				errOut:  cmd.ErrOrStderr(),
+				dataDir:  cfg.DataDir,
+				pwPath:   adminPasswordPath,
+				osUser:   invokingOSUser(),
+				clear2FA: clear2FA,
+				username: username,
+				out:      cmd.OutOrStdout(),
+				errOut:   cmd.ErrOrStderr(),
 			})
 		},
 	}
+	cmd.Flags().BoolVar(&clear2FA, "clear-2fa", false,
+		"also remove the admin account's second factors and recovery codes, and print an enrollment code")
+	cmd.Flags().StringVar(&username, "user", "",
+		"the admin-role account to reset (default admin), e.g. the one the admin floor reinstated")
+	return cmd
 }
 
 // adminPasswordPath is where reset-admin writes the new credential.
@@ -88,6 +115,8 @@ type resetAdminEnv struct {
 	dataDir     string
 	pwPath      string
 	osUser      string
+	clear2FA    bool
+	username    string // --user; "" is admin
 	out, errOut io.Writer
 }
 
@@ -117,24 +146,49 @@ func runResetAdmin(ctx context.Context, env resetAdminEnv) error {
 		return fmt.Errorf("reach the local daemon: %w", err)
 	}
 	rpcCtx, cancel := context.WithTimeout(ctx, resetAdminRPCTimeout)
-	_, err = client.ResetAdminPassword(rpcCtx, &pb.ResetAdminPasswordRequest{PasswordHash: hash, OsUser: env.osUser})
+	resp, err := client.ResetAdminPassword(rpcCtx, &pb.ResetAdminPasswordRequest{
+		PasswordHash: hash, OsUser: env.osUser, ClearTwoFactor: env.clear2FA, Username: env.username,
+	})
 	cancel()
-	closeConn()
 	switch status.Code(err) {
 	case codes.OK:
+		defer closeConn()
+		// The daemon names the account it reset. One that predates --user
+		// names none, and reset "admin" whatever was asked: that password
+		// changed, so it is written all the same, and the CLI says so.
+		reset := resp.GetUsername()
+		older := reset == ""
+		if older {
+			reset = "admin"
+		}
 		if err := secretfile.Write(env.pwPath, []byte(password+"\n"), 0600); err != nil {
-			return fmt.Errorf("the admin password was reset but the password file could not be written: %w", err)
+			return fmt.Errorf("the password of %q was reset but the password file could not be written: %w", reset, err)
 		}
 		fmt.Fprintln(env.out, "Admin password reset.")
+		fmt.Fprintf(env.out, "Account: %s\n", reset)
 		fmt.Fprintf(env.out, "New password written to %s\n", env.pwPath)
 		fmt.Fprintln(env.out, "Recorded in the audit log as user.reset-admin.")
+		if older && env.username != "" && corrosion.NormalizeUsername(env.username) != "admin" {
+			return fmt.Errorf("litevirtd on this node predates --user: it reset the password of \"admin\", "+
+				"not of %q (the new admin password is in %s). Restart litevirtd on this node with the "+
+				"installed binary, then run `lv user reset-admin --user %s` again", env.username, env.pwPath, env.username)
+		}
+		if env.clear2FA {
+			fmt.Fprintf(env.out, "Every second factor of %s was removed.\n", reset)
+			codeCtx, cancel := context.WithTimeout(ctx, resetAdminRPCTimeout)
+			code, cerr := client.IssueEnrollmentCode(codeCtx, &pb.IssueEnrollmentCodeRequest{Username: reset})
+			cancel()
+			printEnrollmentCode(env.out, reset, code.GetCode(), code.GetExpiresAt(), code.GetIssuedOn(), cerr)
+		}
 		return nil
 	case codes.Unavailable, codes.Unimplemented:
+		closeConn()
 		fmt.Fprintf(env.errOut, "litevirtd on this node could not take the reset (%s).\n"+
 			"Resetting in the local database instead. The audit entry is journalled under %s\n"+
 			"and the daemon records it, signed, once it is running.\n",
 			status.Convert(err).Message(), filepath.Join(env.dataDir, corrosion.PendingAuditDirName))
 	default:
+		closeConn()
 		return err
 	}
 
@@ -143,7 +197,22 @@ func runResetAdmin(ctx context.Context, env resetAdminEnv) error {
 		return fmt.Errorf("connect to corrosion: %w", err)
 	}
 	defer db.Close()
-	return resetAdminOffline(ctx, db, env.dataDir, env.pwPath, env.osUser, password, hash, env.out)
+	return resetAdminOffline(ctx, db, env.dataDir, env.pwPath, env.osUser, env.username, password, hash, env.clear2FA, env.out)
+}
+
+// printEnrollmentCode tells the operator the admin's first-enrollment code, or
+// how to get one when it could not be issued.
+func printEnrollmentCode(out io.Writer, user, code, expires, issuedOn string, err error) {
+	if err != nil || code == "" {
+		fmt.Fprintf(out, "No enrollment code could be issued (%v). Issue one as root on a node whose\n"+
+			"litevirtd is running, once the cluster upgrade has finished: `sudo lv 2fa enroll-code %s`.\n", err, user)
+		return
+	}
+	fmt.Fprintf(out, "Enrollment code for %s's first factor (single use, until %s):\n  %s\n", user, expires, code)
+	if issuedOn != "" {
+		fmt.Fprintf(out, "It works only through node %s: log in to that node to enroll.\n", issuedOn)
+	}
+	fmt.Fprintf(out, "Log in as %s, then `lv 2fa enroll-totp --code <code>`, then log in again.\n", user)
 }
 
 // resetAdminOffline is the daemon-down path: journal the intent, reset, then
@@ -154,7 +223,7 @@ func runResetAdmin(ctx context.Context, env resetAdminEnv) error {
 // The reset itself is corrosion.ResetAdminPassword, the same function the
 // daemon's RPC calls, so the "reset, never create" rule cannot drift between the
 // two paths.
-func resetAdminOffline(ctx context.Context, db *corrosion.Client, dataDir, pwPath, osUser, password, hash string, out io.Writer) error {
+func resetAdminOffline(ctx context.Context, db *corrosion.Client, dataDir, pwPath, osUser, username, password, hash string, clear2FA bool, out io.Writer) error {
 	j, err := corrosion.OpenPendingAuditJournal(dataDir)
 	if err != nil {
 		// No journal, no reset: an unrecorded admin reset is exactly what this
@@ -162,22 +231,31 @@ func resetAdminOffline(ctx context.Context, db *corrosion.Client, dataDir, pwPat
 		return fmt.Errorf("cannot journal the audit entry, so the reset was not made: %w", err)
 	}
 	defer j.Close()
+	name := username
+	if name == "" {
+		name = "admin"
+	}
 	entry := corrosion.PendingAuditEntry{
 		Action: "user.reset-admin",
-		Target: "admin",
-		Detail: corrosion.ResetAdminAuditDetail("journal", osUser),
+		Target: name,
+		Detail: resetAdminJournalDetail(osUser, clear2FA),
 		Result: "interrupted",
 	}
 	if err := j.Record(&entry); err != nil {
 		return fmt.Errorf("cannot journal the audit entry, so the reset was not made: %w", err)
 	}
 
-	resetErr := corrosion.ResetAdminPassword(ctx, db, hash)
+	// No release-feature gate in this process (nil): a reset that needs the
+	// login rules' data (--clear-2fa, or a restricted admin) is refused.
+	resetErr := corrosion.ResetAdminPasswordFor(ctx, db, nil, name, hash, clear2FA)
 	switch {
 	case resetErr == nil:
 		entry.Result = "ok"
 	case errors.Is(resetErr, corrosion.ErrNoLiveAdmin):
 		entry.Result = "denied: no live admin account"
+	case errors.Is(resetErr, corrosion.ErrNotAnAdmin), errors.Is(resetErr, corrosion.ErrAmbiguousUsername),
+		errors.Is(resetErr, corrosion.ErrLoginPolicyGateClosed):
+		entry.Result = "denied"
 	default:
 		entry.Result = "error"
 	}
@@ -190,9 +268,23 @@ func resetAdminOffline(ctx context.Context, db *corrosion.Client, dataDir, pwPat
 	if err := secretfile.Write(pwPath, []byte(password+"\n"), 0600); err != nil {
 		return fmt.Errorf("the admin password was reset but the password file could not be written: %w", err)
 	}
+	if u, err := corrosion.GetUser(ctx, db, name); err == nil && u != nil {
+		name = u.Username
+	}
 	fmt.Fprintln(out, "Admin password reset.")
+	fmt.Fprintf(out, "Account: %s\n", name)
 	fmt.Fprintf(out, "New password written to %s\n", pwPath)
+	// --clear-2fa never reaches here: it is a login rule, refused above
+	// without the daemon's release-feature gate.
 	return nil
+}
+
+func resetAdminJournalDetail(osUser string, clear2FA bool) string {
+	d := corrosion.ResetAdminAuditDetail("journal", osUser)
+	if clear2FA {
+		d += " clear_2fa=true"
+	}
+	return d
 }
 
 // mintAdminPassword returns a fresh random admin password and its bcrypt hash.

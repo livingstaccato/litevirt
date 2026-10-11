@@ -132,6 +132,12 @@ const (
 	LiteVirt_ListUsers_FullMethodName                  = "/litevirt.v1.LiteVirt/ListUsers"
 	LiteVirt_DeleteUser_FullMethodName                 = "/litevirt.v1.LiteVirt/DeleteUser"
 	LiteVirt_MarkUserExternal_FullMethodName           = "/litevirt.v1.LiteVirt/MarkUserExternal"
+	LiteVirt_SetUserAccount_FullMethodName             = "/litevirt.v1.LiteVirt/SetUserAccount"
+	LiteVirt_GetLoginPolicy_FullMethodName             = "/litevirt.v1.LiteVirt/GetLoginPolicy"
+	LiteVirt_SetLoginPolicy_FullMethodName             = "/litevirt.v1.LiteVirt/SetLoginPolicy"
+	LiteVirt_IssueEnrollmentCode_FullMethodName        = "/litevirt.v1.LiteVirt/IssueEnrollmentCode"
+	LiteVirt_ListUserVariants_FullMethodName           = "/litevirt.v1.LiteVirt/ListUserVariants"
+	LiteVirt_ClearIdentityBinding_FullMethodName       = "/litevirt.v1.LiteVirt/ClearIdentityBinding"
 	LiteVirt_CreateToken_FullMethodName                = "/litevirt.v1.LiteVirt/CreateToken"
 	LiteVirt_RevokeToken_FullMethodName                = "/litevirt.v1.LiteVirt/RevokeToken"
 	LiteVirt_Whoami_FullMethodName                     = "/litevirt.v1.LiteVirt/Whoami"
@@ -520,6 +526,17 @@ type LiteVirtClient interface {
 	// user, so an external login under that name is not refused for want of
 	// evidence. Refused for an account that holds a password. Admin only.
 	MarkUserExternal(ctx context.Context, in *MarkUserExternalRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// SetUserAccount disables, re-enables, or sets the expiry of an account.
+	// Admin only. Refused until the login_policy release feature opens.
+	SetUserAccount(ctx context.Context, in *SetUserAccountRequest, opts ...grpc.CallOption) (*User, error)
+	// GetLoginPolicy / SetLoginPolicy read and change the cluster-wide
+	// mandatory second-factor policy (`lv 2fa policy`). Set is admin only and
+	// refused until the login_policy release feature opens.
+	GetLoginPolicy(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*LoginPolicy, error)
+	SetLoginPolicy(ctx context.Context, in *SetLoginPolicyRequest, opts ...grpc.CallOption) (*LoginPolicy, error)
+	IssueEnrollmentCode(ctx context.Context, in *IssueEnrollmentCodeRequest, opts ...grpc.CallOption) (*IssueEnrollmentCodeResponse, error)
+	ListUserVariants(ctx context.Context, in *ListUserVariantsRequest, opts ...grpc.CallOption) (*ListUserVariantsResponse, error)
+	ClearIdentityBinding(ctx context.Context, in *ClearIdentityBindingRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	CreateToken(ctx context.Context, in *CreateTokenRequest, opts ...grpc.CallOption) (*Token, error)
 	RevokeToken(ctx context.Context, in *RevokeTokenRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// Whoami returns the authenticated caller's identity. Authenticated (NOT in
@@ -538,7 +555,7 @@ type LiteVirtClient interface {
 	// ResetAdminPassword replaces the local admin's password hash and records a
 	// `user.reset-admin` audit row. Local root only: loopback, this host's own
 	// certificate, no bearer. It resets an existing admin and never creates one.
-	ResetAdminPassword(ctx context.Context, in *ResetAdminPasswordRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	ResetAdminPassword(ctx context.Context, in *ResetAdminPasswordRequest, opts ...grpc.CallOption) (*ResetAdminPasswordResponse, error)
 	ListTwoFactors(ctx context.Context, in *ListTwoFactorsRequest, opts ...grpc.CallOption) (*ListTwoFactorsResponse, error)
 	EnrollTOTP(ctx context.Context, in *EnrollTOTPRequest, opts ...grpc.CallOption) (*EnrollTOTPResponse, error)
 	DisableTwoFactor(ctx context.Context, in *DisableTwoFactorRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
@@ -2266,6 +2283,66 @@ func (c *liteVirtClient) MarkUserExternal(ctx context.Context, in *MarkUserExter
 	return out, nil
 }
 
+func (c *liteVirtClient) SetUserAccount(ctx context.Context, in *SetUserAccountRequest, opts ...grpc.CallOption) (*User, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(User)
+	err := c.cc.Invoke(ctx, LiteVirt_SetUserAccount_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) GetLoginPolicy(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*LoginPolicy, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(LoginPolicy)
+	err := c.cc.Invoke(ctx, LiteVirt_GetLoginPolicy_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) SetLoginPolicy(ctx context.Context, in *SetLoginPolicyRequest, opts ...grpc.CallOption) (*LoginPolicy, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(LoginPolicy)
+	err := c.cc.Invoke(ctx, LiteVirt_SetLoginPolicy_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) IssueEnrollmentCode(ctx context.Context, in *IssueEnrollmentCodeRequest, opts ...grpc.CallOption) (*IssueEnrollmentCodeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(IssueEnrollmentCodeResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_IssueEnrollmentCode_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) ListUserVariants(ctx context.Context, in *ListUserVariantsRequest, opts ...grpc.CallOption) (*ListUserVariantsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListUserVariantsResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_ListUserVariants_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) ClearIdentityBinding(ctx context.Context, in *ClearIdentityBindingRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, LiteVirt_ClearIdentityBinding_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) CreateToken(ctx context.Context, in *CreateTokenRequest, opts ...grpc.CallOption) (*Token, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(Token)
@@ -2316,9 +2393,9 @@ func (c *liteVirtClient) ChangePassword(ctx context.Context, in *ChangePasswordR
 	return out, nil
 }
 
-func (c *liteVirtClient) ResetAdminPassword(ctx context.Context, in *ResetAdminPasswordRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+func (c *liteVirtClient) ResetAdminPassword(ctx context.Context, in *ResetAdminPasswordRequest, opts ...grpc.CallOption) (*ResetAdminPasswordResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(emptypb.Empty)
+	out := new(ResetAdminPasswordResponse)
 	err := c.cc.Invoke(ctx, LiteVirt_ResetAdminPassword_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
@@ -4575,6 +4652,17 @@ type LiteVirtServer interface {
 	// user, so an external login under that name is not refused for want of
 	// evidence. Refused for an account that holds a password. Admin only.
 	MarkUserExternal(context.Context, *MarkUserExternalRequest) (*emptypb.Empty, error)
+	// SetUserAccount disables, re-enables, or sets the expiry of an account.
+	// Admin only. Refused until the login_policy release feature opens.
+	SetUserAccount(context.Context, *SetUserAccountRequest) (*User, error)
+	// GetLoginPolicy / SetLoginPolicy read and change the cluster-wide
+	// mandatory second-factor policy (`lv 2fa policy`). Set is admin only and
+	// refused until the login_policy release feature opens.
+	GetLoginPolicy(context.Context, *emptypb.Empty) (*LoginPolicy, error)
+	SetLoginPolicy(context.Context, *SetLoginPolicyRequest) (*LoginPolicy, error)
+	IssueEnrollmentCode(context.Context, *IssueEnrollmentCodeRequest) (*IssueEnrollmentCodeResponse, error)
+	ListUserVariants(context.Context, *ListUserVariantsRequest) (*ListUserVariantsResponse, error)
+	ClearIdentityBinding(context.Context, *ClearIdentityBindingRequest) (*emptypb.Empty, error)
 	CreateToken(context.Context, *CreateTokenRequest) (*Token, error)
 	RevokeToken(context.Context, *RevokeTokenRequest) (*emptypb.Empty, error)
 	// Whoami returns the authenticated caller's identity. Authenticated (NOT in
@@ -4593,7 +4681,7 @@ type LiteVirtServer interface {
 	// ResetAdminPassword replaces the local admin's password hash and records a
 	// `user.reset-admin` audit row. Local root only: loopback, this host's own
 	// certificate, no bearer. It resets an existing admin and never creates one.
-	ResetAdminPassword(context.Context, *ResetAdminPasswordRequest) (*emptypb.Empty, error)
+	ResetAdminPassword(context.Context, *ResetAdminPasswordRequest) (*ResetAdminPasswordResponse, error)
 	ListTwoFactors(context.Context, *ListTwoFactorsRequest) (*ListTwoFactorsResponse, error)
 	EnrollTOTP(context.Context, *EnrollTOTPRequest) (*EnrollTOTPResponse, error)
 	DisableTwoFactor(context.Context, *DisableTwoFactorRequest) (*emptypb.Empty, error)
@@ -5390,6 +5478,24 @@ func (UnimplementedLiteVirtServer) DeleteUser(context.Context, *DeleteUserReques
 func (UnimplementedLiteVirtServer) MarkUserExternal(context.Context, *MarkUserExternalRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method MarkUserExternal not implemented")
 }
+func (UnimplementedLiteVirtServer) SetUserAccount(context.Context, *SetUserAccountRequest) (*User, error) {
+	return nil, status.Error(codes.Unimplemented, "method SetUserAccount not implemented")
+}
+func (UnimplementedLiteVirtServer) GetLoginPolicy(context.Context, *emptypb.Empty) (*LoginPolicy, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetLoginPolicy not implemented")
+}
+func (UnimplementedLiteVirtServer) SetLoginPolicy(context.Context, *SetLoginPolicyRequest) (*LoginPolicy, error) {
+	return nil, status.Error(codes.Unimplemented, "method SetLoginPolicy not implemented")
+}
+func (UnimplementedLiteVirtServer) IssueEnrollmentCode(context.Context, *IssueEnrollmentCodeRequest) (*IssueEnrollmentCodeResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method IssueEnrollmentCode not implemented")
+}
+func (UnimplementedLiteVirtServer) ListUserVariants(context.Context, *ListUserVariantsRequest) (*ListUserVariantsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListUserVariants not implemented")
+}
+func (UnimplementedLiteVirtServer) ClearIdentityBinding(context.Context, *ClearIdentityBindingRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method ClearIdentityBinding not implemented")
+}
 func (UnimplementedLiteVirtServer) CreateToken(context.Context, *CreateTokenRequest) (*Token, error) {
 	return nil, status.Error(codes.Unimplemented, "method CreateToken not implemented")
 }
@@ -5405,7 +5511,7 @@ func (UnimplementedLiteVirtServer) CheckPermissions(context.Context, *CheckPermi
 func (UnimplementedLiteVirtServer) ChangePassword(context.Context, *ChangePasswordRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method ChangePassword not implemented")
 }
-func (UnimplementedLiteVirtServer) ResetAdminPassword(context.Context, *ResetAdminPasswordRequest) (*emptypb.Empty, error) {
+func (UnimplementedLiteVirtServer) ResetAdminPassword(context.Context, *ResetAdminPasswordRequest) (*ResetAdminPasswordResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ResetAdminPassword not implemented")
 }
 func (UnimplementedLiteVirtServer) ListTwoFactors(context.Context, *ListTwoFactorsRequest) (*ListTwoFactorsResponse, error) {
@@ -7836,6 +7942,114 @@ func _LiteVirt_MarkUserExternal_Handler(srv interface{}, ctx context.Context, de
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).MarkUserExternal(ctx, req.(*MarkUserExternalRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_SetUserAccount_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetUserAccountRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).SetUserAccount(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_SetUserAccount_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).SetUserAccount(ctx, req.(*SetUserAccountRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_GetLoginPolicy_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(emptypb.Empty)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).GetLoginPolicy(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_GetLoginPolicy_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).GetLoginPolicy(ctx, req.(*emptypb.Empty))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_SetLoginPolicy_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetLoginPolicyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).SetLoginPolicy(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_SetLoginPolicy_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).SetLoginPolicy(ctx, req.(*SetLoginPolicyRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_IssueEnrollmentCode_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(IssueEnrollmentCodeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).IssueEnrollmentCode(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_IssueEnrollmentCode_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).IssueEnrollmentCode(ctx, req.(*IssueEnrollmentCodeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_ListUserVariants_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListUserVariantsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ListUserVariants(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ListUserVariants_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ListUserVariants(ctx, req.(*ListUserVariantsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_ClearIdentityBinding_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ClearIdentityBindingRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ClearIdentityBinding(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ClearIdentityBinding_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ClearIdentityBinding(ctx, req.(*ClearIdentityBindingRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -11571,6 +11785,30 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "MarkUserExternal",
 			Handler:    _LiteVirt_MarkUserExternal_Handler,
+		},
+		{
+			MethodName: "SetUserAccount",
+			Handler:    _LiteVirt_SetUserAccount_Handler,
+		},
+		{
+			MethodName: "GetLoginPolicy",
+			Handler:    _LiteVirt_GetLoginPolicy_Handler,
+		},
+		{
+			MethodName: "SetLoginPolicy",
+			Handler:    _LiteVirt_SetLoginPolicy_Handler,
+		},
+		{
+			MethodName: "IssueEnrollmentCode",
+			Handler:    _LiteVirt_IssueEnrollmentCode_Handler,
+		},
+		{
+			MethodName: "ListUserVariants",
+			Handler:    _LiteVirt_ListUserVariants_Handler,
+		},
+		{
+			MethodName: "ClearIdentityBinding",
+			Handler:    _LiteVirt_ClearIdentityBinding_Handler,
 		},
 		{
 			MethodName: "CreateToken",

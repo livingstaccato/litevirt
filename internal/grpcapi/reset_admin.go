@@ -7,7 +7,6 @@ import (
 	"golang.org/x/crypto/bcrypt"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/auth"
@@ -31,7 +30,7 @@ import (
 // process forks the chain and is unsigned (TestAudit_SecondProcessRowForksTheChain).
 // The CLI sends only a bcrypt hash; the plaintext never leaves the process that
 // writes the password file, and neither appears in the row.
-func (s *Server) ResetAdminPassword(ctx context.Context, req *pb.ResetAdminPasswordRequest) (*emptypb.Empty, error) {
+func (s *Server) ResetAdminPassword(ctx context.Context, req *pb.ResetAdminPasswordRequest) (*pb.ResetAdminPasswordResponse, error) {
 	if callerPrincipalKind(ctx) != principalKindLocalRoot {
 		return nil, status.Error(codes.PermissionDenied,
 			"reset-admin is local root only: run `lv user reset-admin` as root on the node, "+
@@ -52,14 +51,42 @@ func (s *Server) ResetAdminPassword(ctx context.Context, req *pb.ResetAdminPassw
 
 	actor := "root@" + s.hostName
 	detail := corrosion.ResetAdminAuditDetail("local-root", req.OsUser)
-	if err := corrosion.ResetAdminPassword(ctx, s.db, req.PasswordHash); err != nil {
-		if errors.Is(err, corrosion.ErrNoLiveAdmin) {
-			s.auditAs(ctx, actor, "user.reset-admin", "admin", detail, "denied: no live admin account")
+	if req.GetClearTwoFactor() {
+		detail += " clear_2fa=true"
+	}
+	// --user names another admin-role account: the one the admin floor
+	// reinstated without its old password (re-review 3, I1a).
+	target := req.GetUsername()
+	if target == "" {
+		target = "admin"
+	}
+	// --clear-2fa, and re-enabling a restricted admin, are login rules: they
+	// go through the login_policy release feature's gate. A plain reset does
+	// not ask it (corrosion.ResetAdminPasswordFor).
+	if err := corrosion.ResetAdminPasswordFor(ctx, s.db, s.withLoginPolicy, target, req.PasswordHash, req.GetClearTwoFactor()); err != nil {
+		switch {
+		case errors.Is(err, corrosion.ErrNoLiveAdmin):
+			s.auditAs(ctx, actor, "user.reset-admin", target, detail, "denied: no live admin account")
+			return nil, status.Error(codes.FailedPrecondition, err.Error())
+		case errors.Is(err, corrosion.ErrNotAnAdmin), errors.Is(err, corrosion.ErrAmbiguousUsername),
+			errors.Is(err, corrosion.ErrLoginPolicyGateClosed):
+			s.auditAs(ctx, actor, "user.reset-admin", target, detail, "denied")
 			return nil, status.Error(codes.FailedPrecondition, err.Error())
 		}
-		s.auditAs(ctx, actor, "user.reset-admin", "admin", detail, "error")
+		if st, ok := status.FromError(err); ok {
+			// The release feature gate's refusal. Answered as a refusal, never
+			// as Unavailable: the CLI would take that for a daemon it cannot
+			// reach and reset in the local database instead.
+			s.auditAs(ctx, actor, "user.reset-admin", target, detail, "denied")
+			return nil, status.Error(codes.FailedPrecondition, st.Message())
+		}
+		s.auditAs(ctx, actor, "user.reset-admin", target, detail, "error")
 		return nil, status.Errorf(codes.Internal, "reset admin password: %v", err)
 	}
-	s.auditAs(ctx, actor, "user.reset-admin", "admin", detail, "ok")
-	return &emptypb.Empty{}, nil
+	if u, err := corrosion.GetUser(ctx, s.db, target); err == nil && u != nil {
+		target = u.Username
+	}
+	s.auditAs(ctx, actor, "user.reset-admin", target, detail, "ok")
+	s.kickStreams()
+	return &pb.ResetAdminPasswordResponse{Username: target}, nil
 }

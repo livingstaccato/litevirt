@@ -320,14 +320,17 @@ func (c *Client) externalEvidence(id userIdentity) bool {
 // row with an empty old column, no credential row and no positive evidence on
 // this node: that is either an external user whose evidence has not reached
 // this node or a local account whose credential row has not, and the caller
-// must not guess.
+// must not guess. known is false too when there is no live row under exactly
+// username (credentials-clear M1): its caller holds a live row, so "none"
+// means the name was spelled differently, which says nothing about the
+// account.
 func UserLocalCredential(ctx context.Context, c *Client, username string) (local, known bool, err error) {
 	rows, err := c.Query(ctx, userLocalCredentialSQL, username)
 	if err != nil {
 		return false, false, err
 	}
 	if len(rows) == 0 {
-		return false, true, nil
+		return false, false, nil
 	}
 	r := rows[0]
 	local, known = c.judgeUserRow(rowIdentity(r), r.String("password_hash"),
@@ -460,6 +463,18 @@ func MarkUserExternal(ctx context.Context, c *Client, username string) error {
 	if !c.MayWriteCredentialTables() {
 		return ErrCredentialTablesNotLatched
 	}
+	// The name is resolved as every account lookup resolves it, normalized
+	// (credentials-clear M4): an operator types it as a refusal printed it or
+	// in another case. Two accounts that normalize alike are refused
+	// (ErrAmbiguousUsername); the one found is marked under its stored name.
+	u, err := GetUser(ctx, c, username)
+	if err != nil {
+		return err
+	}
+	if u == nil {
+		return ErrUserNotExternalCandidate
+	}
+	username = u.Username
 	rows, err := c.Query(ctx,
 		`SELECT u.password_hash, u.updated_at,
 		        k.username AS cred_key, k.password_hash AS cred_val, k.updated_at AS cred_ts,

@@ -485,8 +485,13 @@ func (s *Server) healPITOverlay(ctx context.Context, vm *corrosion.VMRecord, d *
 		// Only a disk this host sees clears a hold: on a host where the
 		// shared pool is not mounted, "no overlay" says nothing (P7).
 		if _, err := os.Stat(disk); err == nil {
-			s.repointDanglingPITDefinition(ctx, vm, d)
-			s.ClearPITOverlayHold(ctx, vm.Name, d.DiskName)
+			// A stat error on the overlay establishes nothing: the hold
+			// stays (re-review 1, m2), and the definition is not touched.
+			presence, perr := pitoverlay.PresenceOf(disk)
+			s.repointDanglingPITDefinition(ctx, vm, d, presence, perr)
+			if presence != pitoverlay.OverlayUnknown {
+				s.ClearPITOverlayHold(ctx, vm.Name, d.DiskName)
+			}
 		}
 		return nil
 	}
@@ -600,9 +605,11 @@ func (s *Server) pointPITDefinitionAtDisk(vm *corrosion.VMRecord, d *corrosion.D
 //     error (EIO, ESTALE, EACCES, an unmounted pool) proves nothing, and an
 //     overlay that may still hold the guest's newest writes must never be
 //     bypassed (C-1 of the pit-restore review);
-//   - an orphan of it lies beside the disk (pitoverlay.SetAsideEvidence): an
-//     overlay moved anywhere else — an admin's safety copy — is not a
-//     set-aside, and booting the base would fork the VM away from it;
+//   - an orphan of it lies beside the disk, of the window the disk carries
+//     now (pitoverlay.SetAsideEvidence): an overlay moved anywhere else — an
+//     admin's safety copy — is not a set-aside, nor is an older window's
+//     orphan evidence for a later one, and booting the base would fork the
+//     VM away from it;
 //   - the domain is defined here, inactive, and its definition names the
 //     overlay.
 //
@@ -610,14 +617,20 @@ func (s *Server) pointPITDefinitionAtDisk(vm *corrosion.VMRecord, d *corrosion.D
 // libvirt call. Otherwise nothing is touched and the start fails as it does
 // on main, naming the missing file. Nothing is deleted. A failure is logged
 // and never refuses what the caller does.
-func (s *Server) repointDanglingPITDefinition(ctx context.Context, vm *corrosion.VMRecord, d *corrosion.DiskRecord) {
+func (s *Server) repointDanglingPITDefinition(ctx context.Context, vm *corrosion.VMRecord, d *corrosion.DiskRecord, presence pitoverlay.Presence, perr error) {
 	disk := s.hostDiskFile(d.Path)
 	overlay := pitOverlayPath(d.Path)
-	switch p, err := pitoverlay.PresenceOf(disk); p {
+	switch presence {
 	case pitoverlay.OverlayAbsent:
 	case pitoverlay.OverlayUnknown:
-		slog.Warn("point-in-time overlay: cannot tell whether it is there; the domain's definition is left as it is",
-			"vm", vm.Name, "disk", d.DiskName, "overlay", overlay, "error", err)
+		// A binding left without its overlay (a crash inside Remove) is
+		// not a fault: logged quietly, not on every operation (m1).
+		log := slog.Warn
+		if errors.Is(perr, pitoverlay.ErrLoneBinding) {
+			log = slog.Debug
+		}
+		log("point-in-time overlay: cannot tell whether it is there; the domain's definition is left as it is",
+			"vm", vm.Name, "disk", d.DiskName, "overlay", overlay, "error", perr)
 		return
 	default:
 		return

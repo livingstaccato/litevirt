@@ -495,7 +495,11 @@ by the strongest method the host has, tried in this order:
      set-aside overlay is kept. That happens only on proof of the set-aside:
      the overlay and its binding are both gone (not merely unreadable — an
      I/O or stale-handle error proves nothing) and a
-     `.<disk file>.lv-pit.orphan-*` lies beside the disk. An overlay moved
+     `.<disk file>.lv-pit.orphan-*` of the disk's current window lies beside
+     it: when the disk carries a window token (`user.litevirt.pit_window`),
+     only an orphan whose `.id` recorded that token counts, so an older
+     window's orphan says nothing about a later one; without user xattrs
+     nothing counts. An overlay moved
      anywhere else is not taken as set aside: the definition is left naming
      it and the start fails, naming the missing file — put the overlay back,
      then resolve it. `lv resolve-pit-overlay --discard` and a forced

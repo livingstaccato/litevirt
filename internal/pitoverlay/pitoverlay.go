@@ -124,22 +124,57 @@ func PresenceOf(disk string) (Presence, error) {
 	_, err = lstat(SidecarPath(disk))
 	switch {
 	case err == nil:
-		return OverlayUnknown, fmt.Errorf("%s has no overlay beside it", SidecarPath(disk))
+		return OverlayUnknown, fmt.Errorf("%s: %w", SidecarPath(disk), ErrLoneBinding)
 	case !errors.Is(err, fs.ErrNotExist):
 		return OverlayUnknown, err
 	}
 	return OverlayAbsent, nil
 }
 
-// SetAsideEvidence reports whether an overlay of disk was set aside beside
-// it: an <overlay>.orphan-<stamp> file (SetAside), not its binding alone.
+// ErrLoneBinding is PresenceOf's reason for a binding with no overlay beside
+// it (a crash inside Remove): unknown, but not a fault worth a warning.
+var ErrLoneBinding = errors.New("a binding with no overlay beside it")
+
+// SetAsideEvidence reports whether the overlay of disk's CURRENT window was
+// set aside beside it: an <overlay>.orphan-<stamp> file (SetAside), not its
+// binding alone, bound to the window the disk carries now.
+//
+//   - The disk carries no window token: no window has opened on this file
+//     since it was placed (a restore writes a new file), so any orphan of it
+//     is evidence.
+//   - The disk carries a token: only an orphan whose binding recorded that
+//     very token is. An older window's orphan says nothing about the overlay
+//     a later window made (re-review 1 of the pit-restore branch, I-1).
+//   - The token cannot be read (no user xattrs here, or any other error):
+//     windows cannot be told apart, and nothing counts.
 func SetAsideEvidence(disk string) bool {
 	m, err := filepath.Glob(Path(disk) + ".orphan-*")
 	if err != nil {
 		return false
 	}
+	var orphans []string
 	for _, p := range m {
 		if !strings.HasSuffix(p, ".id") {
+			orphans = append(orphans, p)
+		}
+	}
+	if len(orphans) == 0 {
+		return false
+	}
+	tok, err := getXattr(disk)
+	switch {
+	case errors.Is(err, errNoAttr):
+		return true
+	case err != nil || len(tok) == 0:
+		return false
+	}
+	for _, o := range orphans {
+		data, err := os.ReadFile(o + ".id")
+		if err != nil {
+			continue
+		}
+		var b Binding
+		if json.Unmarshal(data, &b) == nil && b.Token != "" && b.Token == string(tok) {
 			return true
 		}
 	}

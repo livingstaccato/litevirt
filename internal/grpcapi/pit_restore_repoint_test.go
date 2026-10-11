@@ -265,3 +265,66 @@ func TestStart_AnUnreadableOverlayIsNotTakenAsGone(t *testing.T) {
 		t.Fatal("the definition was pointed at the base on a stat error")
 	}
 }
+
+// Re-review 1, I-1: an orphan from an OLDER window is no evidence that the
+// overlay the definition names now was set aside. Window A's overlay was set
+// aside; later window B strands on the same disk (a new token on the disk),
+// and the admin moves B's overlay out of the pool. The definition stays on
+// B's overlay and the start fails, as on main.
+//
+// Mutation "the evidence ignores the window token" — red.
+func TestStart_AnOlderWindowsOrphanIsNoEvidenceForANewWindow(t *testing.T) {
+	s, fake, live := heldOnItsOverlay(t) // window A: bound, token on the disk
+	if b, err := pitoverlay.BindingOf(live); err != nil || b.Token == "" {
+		t.Skipf("no user xattrs here (binding %+v, %v): windows cannot be told apart", b, err)
+	}
+	overlay := pitoverlay.Path(live)
+	if _, err := pitoverlay.SetAside(live, "20261001-000000"); err != nil {
+		t.Fatal(err)
+	}
+	// Window B: a new overlay, a new token on the disk, and its commit never
+	// lands — the domain stays on it — and the VM stops.
+	fake.SetState("web", libvirtfake.StateRunning)
+	if _, err := fake.SnapshotDiskExternal("web", live, overlay); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("qemu-io", "-f", "qcow2", "-c", "write -P 0x5a 65536 65536", overlay).CombinedOutput(); err != nil {
+		t.Fatalf("write into window B's overlay: %v %s", err, out)
+	}
+	if err := pitoverlay.Bind(live, pitoverlay.Owner{VM: "web", Disk: "root"}); err != nil {
+		t.Fatal(err)
+	}
+	fake.SetState("web", libvirtfake.StateShutdown)
+	kept := moveOverlayOut(t, live)
+	if err := startWeb(t, s); err == nil {
+		t.Fatal("the VM started on its base: window A's orphan was taken as evidence for window B")
+	}
+	if on, _ := fake.DomainUsesFile("web", overlay); !on {
+		t.Fatal("the definition was pointed at the base on an older window's orphan")
+	}
+	if !holdsTheWindowsWrite(t, kept) {
+		t.Fatal("window B's moved overlay lost its write")
+	}
+}
+
+// Re-review 1, m2: a heal that cannot tell whether the overlay is there
+// (a stat error) keeps the VM's hold; only an established absence clears it.
+//
+// Mutation "clear the hold on any not-Present" — red.
+func TestHeal_AnUnreadableOverlayKeepsTheHold(t *testing.T) {
+	s, _, live := heldOnItsOverlay(t)
+	overlay := pitoverlay.Path(live)
+	if _, err := pitoverlay.SetAside(live, "20261011-161109"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pitoverlay.SetLstatForTest(func(p string) (os.FileInfo, error) {
+		if p == overlay {
+			return nil, &os.PathError{Op: "lstat", Path: p, Err: syscall.ESTALE}
+		}
+		return os.Lstat(p)
+	}))
+	_ = healWeb(t, s)
+	if row, found := heldCondition(t, s, "web", "root"); !found || row.Lifecycle == "resolved" {
+		t.Fatalf("the hold was cleared while the overlay's path could not be read: %+v", row)
+	}
+}

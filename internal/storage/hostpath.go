@@ -201,8 +201,9 @@ var dataDirOwned = []string{
 	"host-updates.json",         // grpcapi/host_updates.go hostUpdateCountsPath
 	"nowts.hwm",                 // corrosion/hwm.go (and nowts.hwm.lock)
 	"split_brain_activated",     // health/capability.go ActivationMarkerBase (markers are .<token>)
-	"ceph-trash-purges.json", // storage/ceph_trash.go cephPurgeStateFile (ResumeCephPurges(dir): set aside as .unreadable-<time>, dataDirOwnedPrefixes)
-	"ceph-kept-images.json",  // grpcapi/ceph_kept.go cephKeptFile
+	"ceph-trash-purges.json",    // storage/ceph_trash.go cephPurgeStateFile (ResumeCephPurges(dir): set aside as .unreadable-<time>, dataDirOwnedPrefixes)
+	"ceph-kept-images.json",     // grpcapi/ceph_kept.go cephKeptFile
+	"file-restore",              // daemon.go fileRestoreCacheDir/fileRestoreRunDir (a non-root daemon only)
 }
 
 // dataDirOwnedPrefixes are owned by name prefix, each judged within one path

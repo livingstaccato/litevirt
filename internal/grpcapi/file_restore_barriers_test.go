@@ -10,15 +10,6 @@ import (
 	"github.com/litevirt/litevirt/internal/filerestore"
 )
 
-func auditCount(t *testing.T, s *Server, action string) int {
-	t.Helper()
-	rows, err := s.db.Query(context.Background(), `SELECT detail FROM audit_log WHERE action = ?`, action)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return len(rows)
-}
-
 // R3-M4: every extraction's audit row says what isolated its restore VM, and
 // a restore VM started without one of its barriers is audited on its own —
 // browsing included, which writes no other row.

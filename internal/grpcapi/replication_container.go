@@ -665,7 +665,7 @@ func (s *Server) replicateContainer(ctx context.Context, g capabilities.FeatureG
 	if err != nil {
 		return fmt.Errorf("archive container: %w", err)
 	}
-	if err := s.pushManifestToPeerRepo(ctx, target, containerReplicaRepo(project, repoName), staging, manifest); err != nil {
+	if err := s.pushManifestToPeerRepo(ctx, target, containerReplicaRepo(project, repoName), staging, manifest, nil); err != nil {
 		if status.Code(err) == codes.Unavailable {
 			return &replTargetDownError{host: target, err: err}
 		}

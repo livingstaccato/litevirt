@@ -52,7 +52,18 @@ type replicaFreshness struct {
 	// staleReason is why the replica is not (or no longer) trusted, for the
 	// deferral log line. Empty means "since process start".
 	staleReason string
+	// staleSince is when the replica last stopped being trusted; zero means
+	// since process start (processStart).
+	staleSince time.Time
+	// wake is signalled when a caught-up replica goes stale, so the
+	// anti-entropy loop runs a catch-up pass now instead of at the end of
+	// the interval it is sleeping in (ReplicaStaleWake).
+	wake chan struct{}
 }
+
+// processStart stands in for "when this process started" in ReplicaStaleFor:
+// a fresh process is the first reason a replica is not caught up.
+var processStart = time.Now()
 
 // ReplicaCaughtUp reports whether this node's replica has completed an
 // anti-entropy reconciliation with a peer since process start and since it
@@ -108,9 +119,46 @@ func (c *Client) MarkReplicaStale(reason string) {
 		}
 		return
 	}
-	f.caughtUp, f.staleReason = false, reason
+	f.caughtUp, f.staleReason, f.staleSince = false, reason, time.Now()
+	if f.wake != nil {
+		select {
+		case f.wake <- struct{}{}:
+		default:
+		}
+	}
 	slog.Warn("replica no longer trusted as caught up — waiting for the next anti-entropy exchange",
 		"reason", reason, "last_caught_up_peer", f.peer, "last_caught_up_at", f.at.UTC().Format(time.RFC3339))
+}
+
+// ReplicaStaleFor reports how long the replica has gone without being caught
+// up — since process start, or since it last went stale — and zero while it is
+// caught up. For the refusal text: an operator told "not caught up for 4s" can
+// tell a node that is catching up from one that cannot reach a peer.
+func (c *Client) ReplicaStaleFor() time.Duration {
+	f := &c.freshness
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.caughtUp {
+		return 0
+	}
+	since := f.staleSince
+	if since.IsZero() {
+		since = processStart
+	}
+	return time.Since(since)
+}
+
+// ReplicaStaleWake returns a channel that receives when a caught-up replica
+// goes stale (MarkReplicaStale's transition, not its repeats). One per Client;
+// the anti-entropy loop selects on it.
+func (c *Client) ReplicaStaleWake() <-chan struct{} {
+	f := &c.freshness
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.wake == nil {
+		f.wake = make(chan struct{}, 1)
+	}
+	return f.wake
 }
 
 // MarkReplicaCaughtUpForTests records a completed catch-up without running an

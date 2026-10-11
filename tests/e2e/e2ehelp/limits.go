@@ -138,7 +138,14 @@ func (l Limits) NICProblems(kb, mbit string) []string {
 // RemovedProblems lists where a cleared cap, weight and NIC rate are still in
 // effect. Clearing the weight writes the host's DEFAULT (100) back, never a
 // leftover or a hard-coded number.
-func (l Limits) RemovedProblems() []string {
+//
+// The NIC cap counts as cleared when EITHER libvirt reports 0/unset inbound and
+// outbound OR tc shows no htb class at oldMbit (the rate of the cap that was
+// removed). What libvirt leaves on the tap after a clear (no qdisc, or a root
+// htb with a default class) is its own behaviour and was never observed, so
+// only a cap that is still enforced is a problem: libvirt still reporting a
+// rate AND the old class still shaping the tap.
+func (l Limits) RemovedProblems(oldMbit string) []string {
 	var p []string
 	if q := l.Sched["global_quota"]; q != "-1" && q != "0" {
 		p = append(p, fmt.Sprintf("cap not removed: global_quota = %q", q))
@@ -153,11 +160,14 @@ func (l Limits) RemovedProblems() []string {
 	if _, _, ok := CPUQuota(l.Cgroup); ok {
 		p = append(p, fmt.Sprintf("the cgroup still carries a CPU quota: %v", l.Cgroup))
 	}
-	if in, out := l.IfLive["inbound.average"], l.IfLive["outbound.average"]; in != "0" && in != "" || out != "0" && out != "" {
-		p = append(p, fmt.Sprintf("NIC cap not removed: in %q out %q", in, out))
+	in, out := l.IfLive["inbound.average"], l.IfLive["outbound.average"]
+	reportedGone := (in == "0" || in == "") && (out == "0" || out == "")
+	classLeft := false
+	for _, r := range l.TC {
+		classLeft = classLeft || r == oldMbit
 	}
-	if len(l.TC) != 0 {
-		p = append(p, fmt.Sprintf("tap %s still has htb classes %v", l.Tap, l.TC))
+	if !reportedGone && classLeft {
+		p = append(p, fmt.Sprintf("NIC cap still enforced: domiftune in %q out %q and tap %s still has an htb class at %s", in, out, l.Tap, oldMbit))
 	}
 	return p
 }

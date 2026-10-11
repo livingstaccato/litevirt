@@ -211,7 +211,7 @@ func TestVM_NoisyNeighbourLimits_AppliedLiveAndPersisted(t *testing.T) {
 
 	// Removal.
 	lv(t, "update", name, "--cpu-limit", "0", "--cpu-shares", "0", "--nic-rate", "0=0")
-	report(t, "after removal", readLimits(t, host, name).RemovedProblems())
+	report(t, "after removal", readLimits(t, host, name).RemovedProblems("16Mbit"))
 }
 
 // A live migration carries the definition, so the destination's guest must run

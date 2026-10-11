@@ -45,6 +45,12 @@ func TestEventually(t *testing.T) {
 	if calls < 2 || time.Since(start) > 2*time.Second {
 		t.Fatalf("calls=%d elapsed=%v: must retry and stay bounded", calls, time.Since(start))
 	}
+	// The bound is hard: an attempt that never returns cannot hold the poll.
+	start = time.Now()
+	err = Eventually(50*time.Millisecond, 5*time.Millisecond, func() error { time.Sleep(3 * time.Second); return nil })
+	if err == nil || time.Since(start) > time.Second {
+		t.Fatalf("a hung attempt must end the poll at the deadline: err=%v after %v", err, time.Since(start))
+	}
 	if err := Eventually(0, time.Millisecond, func() error { return nil }); err != nil {
 		t.Fatalf("one attempt is always made, got %v", err)
 	}

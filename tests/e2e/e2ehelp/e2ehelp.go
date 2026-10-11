@@ -6,6 +6,7 @@ package e2ehelp
 
 import (
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -29,19 +30,34 @@ func SSHTarget(host string, env func(string) string, ips map[string]string) stri
 }
 
 // Eventually calls fn until it returns nil or timeout passes, sleeping
-// interval between attempts. It always makes one attempt and returns the last
-// error on a timeout, so a failure names what it was still waiting for.
+// interval between attempts. It always makes one attempt. The bound is hard: an
+// attempt that blocks past the deadline (a hung ssh) is abandoned, not waited
+// for, and its goroutine finishes on its own. A timeout returns the last error,
+// or a bare timeout error when no attempt had returned, so a failure names what
+// it was still waiting for.
 func Eventually(timeout, interval time.Duration, fn func() error) error {
-	deadline := time.Now().Add(timeout)
+	if timeout <= 0 {
+		return fn()
+	}
+	deadline := time.After(timeout)
+	last := errors.New("no attempt finished")
 	for {
-		err := fn()
-		if err == nil {
-			return nil
+		done := make(chan error, 1)
+		go func() { done <- fn() }()
+		select {
+		case err := <-done:
+			if err == nil {
+				return nil
+			}
+			last = err
+		case <-deadline:
+			return fmt.Errorf("timed out after %v (an attempt was still running): last result: %w", timeout, last)
 		}
-		if !time.Now().Add(interval).Before(deadline) {
-			return err
+		select {
+		case <-time.After(interval):
+		case <-deadline:
+			return last
 		}
-		time.Sleep(interval)
 	}
 }
 

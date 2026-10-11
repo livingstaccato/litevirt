@@ -140,8 +140,13 @@ func TestSMART_GaugeMatchesSmartctl(t *testing.T) {
 			var id struct {
 				ModelName string `json:"model_name"`
 			}
-			if json.Unmarshal(info, &id) == nil && id.ModelName != "" &&
-				!strings.Contains(body, `litevirt_disk_smart_status{device="`+f[0]+`",model="`+id.ModelName+`"`) {
+			switch {
+			case json.Unmarshal(info, &id) != nil:
+				t.Errorf("smartctl -i on %s printed no JSON (%d bytes), so the model label cannot be checked", f[0], len(info))
+			case id.ModelName == "":
+				// A virtual disk or a disk in standby reports no identity at all.
+				t.Logf("model label of %s not compared: smartctl -i reports no model_name", f[0])
+			case !strings.Contains(body, `litevirt_disk_smart_status{device="`+f[0]+`",model="`+id.ModelName+`"`):
 				t.Errorf("the series for %s lacks model=%q, which smartctl -i reports", f[0], id.ModelName)
 			}
 		}

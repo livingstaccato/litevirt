@@ -136,7 +136,8 @@ func TestLab_DelegatedAdminStaysInItsProject(t *testing.T) {
 	// The delegated grant is judged against the engine snapshot of b, which
 	// reloads on its own schedule (about 30 s; 16 s was measured): until it
 	// has, b still sees pat as a viewer and refuses. So wait for the in-project
-	// grant to WORK, bounded, and only then check what must stay refused: a
+	// grant to WORK, bounded (a hard 60 s: a hung ssh attempt is abandoned at
+	// the deadline), and only then check what must stay refused: a
 	// refusal before the snapshot loads would pass those checks for the wrong
 	// reason.
 	inProject := []string{"role", "grant", "VMOperator", "user:" + bob + "@local", "--path", proj, "--propagate"}

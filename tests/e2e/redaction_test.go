@@ -25,6 +25,13 @@ func fakeLab(t *testing.T) *lab {
 	return &lab{t: t, lvPath: "/usr/local/bin/litevirt", key: "k", cmDir: t.TempDir(), portBase: 2230, num: map[string]int{"node-2": 2}}
 }
 
+// These live in package e2e, whose TestMain exits 0 before running anything
+// unless LITEVIRT_E2E=1 and LV_BIN are set (a plain `go test ./...` must never
+// touch a cluster), so they are skipped by a plain run and need the env line
+// below; the lab type they exercise cannot move out of the package. The pure
+// redaction helpers they rely on (e2ehelp.RedactError, labsecret.Redact) are
+// unit tested under plain `go test ./...`.
+//
 // A failing delegated call must not put the user's token in the test's output.
 // Needs no lab (it fakes ssh): LITEVIRT_E2E=1 LV_BIN=/bin/true LV_HOST=x
 // go test ./tests/e2e -run TestRedaction

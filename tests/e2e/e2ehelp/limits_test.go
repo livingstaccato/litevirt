@@ -170,7 +170,7 @@ func TestLimits_Removed(t *testing.T) {
 		"outbound.average: 2000", "outbound.average: 0",
 		"class htb 1:1 root leaf 2: prio 0 rate 16Mbit ceil 16Mbit burst 1600b cburst 1600b \n", "",
 	).Replace(v2Out)
-	if p := ParseLimits("n", gone).RemovedProblems(); len(p) != 0 {
+	if p := ParseLimits("n", gone).RemovedProblems("16Mbit"); len(p) != 0 {
 		t.Fatalf("a fully cleared domain reported %v", p)
 	}
 	for _, c := range []struct{ name, from, to string }{
@@ -178,14 +178,40 @@ func TestLimits_Removed(t *testing.T) {
 		{"weight left", "cpu_shares     : 100\n", "cpu_shares     : 400\n"},
 		{"cgroup weight left", "cpu.weight=100", "cpu.weight=400"},
 		{"cgroup quota left", "libvirt/cpu.max=max 100000", "libvirt/cpu.max=150000 100000"},
-		{"NIC cap left", "##iflive\ninbound.average: 0", "##iflive\ninbound.average: 2000"},
-		{"tc class left", "##tc\n", "##tc\nclass htb 1:1 root leaf 2: prio 0 rate 16Mbit ceil 16Mbit\n"},
 	} {
 		if !strings.Contains(gone, c.from) {
 			t.Fatalf("%s: test data lacks %q", c.name, c.from)
 		}
-		if p := ParseLimits("n", strings.Replace(gone, c.from, c.to, 1)).RemovedProblems(); len(p) == 0 {
+		if p := ParseLimits("n", strings.Replace(gone, c.from, c.to, 1)).RemovedProblems("16Mbit"); len(p) == 0 {
 			t.Errorf("%s: not reported", c.name)
+		}
+	}
+}
+
+// libvirt's behaviour on the tap after a clear was never observed. The cap is
+// gone when EITHER domiftune reads 0 OR no class at the old rate remains; only
+// both still showing the old limit is a failure.
+func TestLimits_RemovedNICCap(t *testing.T) {
+	gone := strings.NewReplacer(
+		"global_quota   : 150000", "global_quota   : -1",
+		"cpu_shares     : 400", "cpu_shares     : 100",
+		"cpu.weight=400", "cpu.weight=100",
+		"libvirt/cpu.max=150000 100000", "libvirt/cpu.max=max 100000",
+	).Replace(v2Out) // CPU cleared; NIC still at 2000 and 16Mbit
+	zeroed := strings.NewReplacer("inbound.average: 2000", "inbound.average: 0", "outbound.average: 2000", "outbound.average: 0").Replace(gone)
+	noClass := strings.Replace(gone, "class htb 1:1 root leaf 2: prio 0 rate 16Mbit ceil 16Mbit burst 1600b cburst 1600b \n", "", 1)
+	otherClass := strings.Replace(gone, "rate 16Mbit", "rate 1000Mbit", 1)
+
+	if p := ParseLimits("n", gone).RemovedProblems("16Mbit"); len(p) == 0 {
+		t.Error("a clear that was never applied (domiftune 2000 and the 16Mbit class) must be reported")
+	}
+	for name, out := range map[string]string{
+		"domiftune zero, old class left (libvirt kept a root class)": zeroed,
+		"class gone, domiftune stale":                                noClass,
+		"class at a different rate":                                  otherClass,
+	} {
+		if p := ParseLimits("n", out).RemovedProblems("16Mbit"); len(p) != 0 {
+			t.Errorf("%s: the old limit is not enforced, got %v", name, p)
 		}
 	}
 }

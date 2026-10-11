@@ -151,6 +151,7 @@ drive a local `lv`).
 | `E2E_DRILL_IMAGE` / `E2E_DRILL_MEMORY` | `cirros` / `128M` | the drills' own test VMs |
 | `E2E_RELAY_NETEM` | (none) | overrides `TestRelayHealth_DegradedLinkBecomesALeafEverywhere`'s impairment with a uniform `tc netem <args>` on node-1's cluster interface. By default the test drops all of node-1's traffic to node-2 and node-3 with a per-peer `tc` filter: two of four observers fail every probe, below fence quorum. Uniform loss rarely fails every probe for 2 minutes (TCP retransmits) |
 | `LITEVIRT_E2E_DESTRUCTIVE` | (none) | `1` also runs drill 6, which destroys and rebuilds hosts |
+| `E2E_REDFISH_ENDPOINT` / `E2E_REDFISH_HOST` | (none) | both set: run `TestDrill_RedfishFenceRecordsFencedAndRecovers` against that Redfish BMC, fencing the named node. Also `E2E_REDFISH_USER`, `E2E_REDFISH_PASS`, `E2E_REDFISH_SYSTEM_ID` (the node's ComputerSystem Id when the service lists several), `E2E_REDFISH_AUTH` (`session`/`basic`) and `E2E_REDFISH_CA_FILE` (a PEM on the machine running the test). That machine must reach the endpoint: it reads the power state and powers the node back on through it |
 
 ### The drills
 
@@ -167,6 +168,7 @@ probe constants drift from them.
 | `TestDrill3_VoterRemovedAfterAFence` | a fenced host is `lv cluster voter rm`ed, then a second host fails: its workloads recover by claims decided in the reduced generation, accepted only by its members; the voter is added back | ~8 min |
 | `TestDrill4_OwnerReachableVetoesTheClaim` | the coordinator reaches its fence quorum for a host the other voters still reach: they refuse with `recovery_claim_owner_reachable`, no proof is minted, the workload never moves (owner runs `partition_pause: false`, restored after) | ~7 min |
 | `TestDrill5_LegacyRecoveryWithClaimsOff` | `recovery_claim: false` on every host (rolling restarts): a powered-off host's workloads recover once, by a proof without a claim certificate; the flag is restored | ~12 min |
+| `TestDrill_RedfishFenceRecordsFencedAndRecovers` | opt-in (`E2E_REDFISH_*`): a node set to `--fence-strategy redfish` whose daemon is frozen is powered off through the real Redfish BMC; the fence is verified (`redfish`/`fenced` row, host recorded `fenced`, the BMC reads `Off`), its workloads recover once, and it is powered back on through the BMC with no second copy. Uses the release feature `redfish_fence`, so the lab must not be rolled back below the release afterwards | ~6 min |
 | `TestDrill6_ForceReconfigureAndRebuild` | destructive: three of five hosts lost, fences confirmed, `lv cluster voter force-reconfigure` to the two survivors, recovery with no workaround, `lv host rm --dead`, the workloads still recorded on the removed hosts recovered or removed, rebuild with `lab.sh destroy/create/up`, `lv host add` (a host fenced during its join fails the drill), `lv cluster voter add` back to five, the removed lab workloads put back | ~40 min |
 
 Findings the drills used to skip or work around are fixed on main, and the

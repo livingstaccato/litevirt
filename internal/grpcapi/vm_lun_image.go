@@ -314,8 +314,7 @@ func (s *Server) preflightLUNs(ctx context.Context, spec *pb.VMSpec, cur *corros
 			"VM %q has a disk on an iSCSI LUN, and the host it is re-created on was not fixed before the "+
 				"teardown (its storage changed while the re-create was judged) — retry", spec.Name)
 	}
-	grant, err := s.iscsiLUNClaimGate(ctx)
-	if err != nil {
+	if _, err := s.lunElectorate(ctx); err != nil {
 		return ctx, noop, err
 	}
 	rep := replacedVM{name: cur.Name, snap: corrosion.VMDeleteSnapshot{CreatedAt: cur.CreatedAt}}
@@ -419,6 +418,13 @@ func (s *Server) preflightLUNs(ctx context.Context, spec *pb.VMSpec, cur *corros
 	moved := ""
 	if runHost != s.hostName {
 		moved = runHost
+	}
+	// The release gate last, just before the first claim: every local
+	// refusal above writes nothing, so it records no use either (switch
+	// review I-1).
+	grant, err := s.iscsiLUNClaimGate(ctx)
+	if err != nil {
+		return ctx, noop, err
 	}
 	claimed := map[string]string{}
 	decided := map[string]int64{}

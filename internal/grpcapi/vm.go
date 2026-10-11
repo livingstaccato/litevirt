@@ -2095,11 +2095,23 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		}
 	}
 	out, err := s.deleteVM(ctx, req)
+	if err == nil && len(luns) > 0 && !s.lunPlainDeleteRecordable(ctx) &&
+		s.ReleaseFeatureAvailable(capabilities.FeatureISCSILUNClaim) {
+		// The token has latched here but this replica holds no use: it may
+		// lag one that does, and then a kept allocation of this VM stays
+		// valid (switch review M-2).
+		slog.Warn("iSCSI LUN: a plain delete recorded nothing on its LUNs, because this host's replica holds no "+
+			"use of iscsi_lun_claim; if the feature was used while this host was away, a kept LUN of the VM is not voided",
+			"vm", req.Name, "luns", luns)
+	}
 	if err == nil && len(luns) > 0 && s.lunPlainDeleteRecordable(ctx) {
-		// The record is iscsi_lun_claim's data: written through its gate
-		// (already in use, so no peer is asked), never refusing the delete,
-		// which has happened.
-		wctx := context.WithoutCancel(ctx)
+		// The record is iscsi_lun_claim's data: written through its gate,
+		// never refusing the delete, which has happened. The gate may still
+		// ask peers (a use not yet acknowledged everywhere, a latch not yet
+		// durable here), so it gets lunPlainDeleteGateTimeout, not its own
+		// acknowledgement budget (switch review M-1).
+		wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), lunPlainDeleteGateTimeout)
+		defer cancel()
 		if gerr := s.WithReleaseFeature(wctx, capabilities.FeatureISCSILUNClaim, func(wctx context.Context, g capabilities.FeatureGrant) error {
 			for _, k := range luns {
 				if rerr := corrosion.RecordLUNPlainDelete(wctx, s.db, g, k, createdAt, s.hostName); rerr != nil {

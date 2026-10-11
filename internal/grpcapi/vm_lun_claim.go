@@ -119,6 +119,10 @@ func (s *Server) iscsiLUNClaimGate(ctx context.Context) (capabilities.FeatureGra
 	return g, err
 }
 
+// lunPlainDeleteGateTimeout bounds how long a plain delete, already done,
+// waits on iscsi_lun_claim's gate to record itself on its LUNs.
+const lunPlainDeleteGateTimeout = 3 * time.Second
+
 // lunPlainDeleteRecordable reports whether a plain delete must record itself
 // on its LUNs (corrosion.RecordLUNPlainDelete): only once iscsi_lun_claim is
 // in use. Before that no kept allocation exists anywhere for the record to
@@ -470,13 +474,12 @@ func (s *Server) claimLUNs(ctx context.Context, spec *pb.VMSpec) (*lunHold, erro
 			needClaim = true
 		}
 	}
-	var grant capabilities.FeatureGrant
 	if needClaim {
-		g, err := s.iscsiLUNClaimGate(ctx)
-		if err != nil {
+		// The electorate now; the release gate only once every local
+		// refusal below has passed (switch review I-1).
+		if _, err := s.lunElectorate(ctx); err != nil {
 			return nil, err
 		}
-		grant = g
 	}
 	byKey := make(map[string]lunUse, len(uses))
 	keys := make(map[string]bool, len(uses))
@@ -491,7 +494,7 @@ func (s *Server) claimLUNs(ctx context.Context, spec *pb.VMSpec) (*lunHold, erro
 			Lun: heldKey, VmName: held.vm, DiskName: held.disk, HostName: s.hostName, InFlight: true, VmId: held.vmID,
 		})
 	}
-	hold := &lunHold{s: s, drop: drop, own: map[string]int64{}, keep: map[string]bool{}, cfgs: cfgs, grant: grant}
+	hold := &lunHold{s: s, drop: drop, own: map[string]int64{}, keep: map[string]bool{}, cfgs: cfgs}
 	ok := false
 	defer func() {
 		if !ok {
@@ -531,6 +534,18 @@ func (s *Server) claimLUNs(ctx context.Context, spec *pb.VMSpec) (*lunHold, erro
 		if err := s.verifyLUNHold(ctx, spec.Name, rep, takenKeys); err != nil {
 			return nil, err
 		}
+	}
+	// The release gate last, just before the first claim: the refusals
+	// above (in flight, held here, a hold that no longer stands) write
+	// nothing, so they record no use either (switch review I-1).
+	var grant capabilities.FeatureGrant
+	if needClaim {
+		g, err := s.iscsiLUNClaimGate(ctx)
+		if err != nil {
+			return nil, err
+		}
+		grant = g
+		hold.grant = g
 	}
 	for _, u := range uses {
 		if taken(u) {

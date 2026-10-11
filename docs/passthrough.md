@@ -256,7 +256,11 @@ containers:
   refresh and every change of a container's host access take that
   container's lock, so a refresh never writes an older policy over a newer
   one; a container whose lock is held (a start judging it now) is skipped and
-  refreshed at the next run, so one container never holds up the others. With no policy the hook stages nothing, and it stages only what the
+  refreshed at the next run, so one container never holds up the others.
+  Nor does one whose own refresh hangs (a hard-mounted NFS source that stops
+  answering): after 10 s the refresh moves on to the next container and logs
+  the one it left, which keeps the policy it last wrote and is skipped until
+  that lookup returns. With no policy the hook stages nothing, and it stages only what the
   record authorizes. A refusal is logged
   to the system log under the tag `litevirt-lxc-hook`. A failed start takes
   down what it staged, and the stop removes each staging entry by itself.

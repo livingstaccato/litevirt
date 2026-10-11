@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 )
 
 // Host bind mounts and device nodes (Proxmox mpN / devN).
@@ -1283,7 +1284,7 @@ func (r *LxcRunner) RefreshHookPolicies() error {
 		if !e.IsDir() {
 			continue
 		}
-		if err := r.refreshHookPolicy(e.Name()); err != nil {
+		if err := r.refreshHookPolicyBounded(e.Name()); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -1291,6 +1292,32 @@ func (r *LxcRunner) RefreshHookPolicies() error {
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
+}
+
+// refreshDeadline bounds how long the refresh loop waits for one container.
+var refreshDeadline = 10 * time.Second
+
+// refreshHookPolicyBounded is refreshHookPolicy that the loop stops waiting
+// for after refreshDeadline (P5): a resolve that hangs inside a syscall — a
+// hard-mounted NFS source that does not answer — while the refresh holds the
+// container's lock would otherwise stall the refresh of every container
+// after it. The abandoned refresh keeps running and still holds that lock,
+// so it writes nothing stale (a SetHostAccess waits for it) and every later
+// run skips the container (refreshHookPolicy's TryLock) rather than stacking
+// another goroutine behind it; the container's start hook keeps the policy
+// last written and judges again at pre-start.
+func (r *LxcRunner) refreshHookPolicyBounded(name string) error {
+	done := make(chan error, 1)
+	go func() { done <- r.refreshHookPolicy(name) }()
+	t := time.NewTimer(refreshDeadline)
+	defer t.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-t.C:
+		return fmt.Errorf("container %q: its host-access policy refresh has not finished in %s (a mount source that does not answer?); "+
+			"its start hook keeps the policy last written, and the other containers are refreshed", name, refreshDeadline)
+	}
 }
 
 // refreshHookPolicy rewrites one container's policy under its lock. A

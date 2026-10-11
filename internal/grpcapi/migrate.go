@@ -194,6 +194,11 @@ func (s *Server) sourceGateRefused(ctx context.Context, vm *corrosion.VMRecord, 
 // its whole step, calls this directly for its cold moves (drainColdMove), with
 // the same lock discipline.
 func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, vm *corrosion.VMRecord, send func(pb.MigratePhase, float32, float32) error, unlock func(), adopted *bool, opts ownedMigrateOpts) error {
+	// The VM leaves this host: the next admission here reads the runtime
+	// afresh, not a cached inventory that still charges the VM's memory as
+	// runtime-only load (invalidateInventoryCache; P-3 of lab 2 run c2). An
+	// adopted migration drops it again when it finishes.
+	defer s.invalidateInventoryCache()
 	// A failback move is conditional on the VM still being where the drain left
 	// it, judged here, by its owner under its lock (failback.go).
 	if req.GetExpectDrainRecord() {
@@ -896,6 +901,7 @@ func (s *Server) adoptAbandonedMigration(
 ) {
 	go func() {
 		defer unlock()
+		defer s.invalidateInventoryCache()
 		defer func() {
 			if p := recover(); p != nil {
 				slog.Error("migrate: adopted migration panicked", "vm", vm.Name, "panic", p)

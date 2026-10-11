@@ -14,6 +14,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 	"github.com/litevirt/litevirt/internal/pitoverlay"
 )
@@ -93,7 +94,8 @@ func TestHeal_AFailedDivergedMarkStillHoldsAsUnknown(t *testing.T) {
 func TestCopy_LayerTwoWaitsForThePITOverlayFeature(t *testing.T) {
 	recordQemuImg(t)
 	s, dir, live := pitServer(t)
-	defer pitoverlay.SetFeatureForTest(false)()
+	gate := &pitFeatureGate{available: false}
+	s.SetReleaseFeatureGate(gate)
 	s.SetBackupSource(failingBackupSource{})
 	snap := &fakePITSnapshotter{}
 	s.SetPointInTimeSnapshotter(snap)
@@ -105,6 +107,17 @@ func TestCopy_LayerTwoWaitsForThePITOverlayFeature(t *testing.T) {
 	}
 	if recs := replicaRecordsOf(t, dir, "web"); len(recs) != 1 || !recs[0].NotPointInTime {
 		t.Fatalf("records %+v: want the existing last layer's marked copy", recs)
+	}
+	// The local read alone decided: the gate was never asked (its refusal
+	// pings every lagging host), so nothing was recorded either, and the
+	// copy says why with the release refusal's own text.
+	if gate.calls != 0 {
+		t.Fatalf("the release gate was asked %d time(s) below the latch", gate.calls)
+	}
+	if !slices.ContainsFunc(pitEventDetails(t, s, "web", "disk.replica_not_point_in_time"), func(d string) bool {
+		return strings.Contains(d, "external snapshot: the cluster upgrade must finish first (pit_overlay needs "+capabilities.ReleaseToken+")")
+	}) {
+		t.Fatalf("no not-point-in-time event naming the release refusal: %v", pitEventDetails(t, s, "web", "disk.replica_not_point_in_time"))
 	}
 }
 
@@ -164,8 +177,12 @@ func TestInPlaceRestore_SetsAHeldOverlayAsideThenRestores(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = healWeb(t, s) // held
-	if _, err := s.inPlaceRestoreLocked(context.Background(), "web", "root"); err != nil {
+	dest, err := s.inPlaceRestoreLocked(context.Background(), "web", "root")
+	if err != nil {
 		t.Fatalf("in-place restore over a held overlay: %v", err)
+	}
+	if err := dest.place(stagedImage(t, live)); err != nil {
+		t.Fatalf("place the restored image: %v", err)
 	}
 	if pitoverlay.Present(live) {
 		t.Fatal("the overlay is still where the restore writes")
@@ -189,7 +206,7 @@ func TestHeal_BelowThePITOverlayFeatureNothingIsCommittedLive(t *testing.T) {
 	s.SetPointInTimeSnapshotter(snap)
 	windowOverlay(t, live)
 	onOverlay(s, snap, live)
-	defer pitoverlay.SetFeatureForTest(false)()
+	s.SetReleaseFeatureGate(&pitFeatureGate{available: false})
 	err := healWeb(t, s)
 	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(status.Convert(err).Message(), "pit_overlay") {
 		t.Fatalf("heal below the feature = %v; want held, naming pit_overlay", err)

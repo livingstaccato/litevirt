@@ -132,7 +132,7 @@ func TestSettle_ARestoreThatReusesTheInodeIsHeld(t *testing.T) {
 	cpP(t, bak, disk)
 	reuseInode(t, disk, b.Ino)
 
-	out, err := Settle(context.Background(), disk, owner)
+	out, err := Settle(context.Background(), openGate, disk, owner)
 	if out != Held || !errors.Is(err, ErrNotOurs) {
 		t.Fatalf("Settle = %v, %v; a restored disk must hold the VM", out, err)
 	}
@@ -174,7 +174,7 @@ func TestSettle_ACopyWithTheWindowsTimesButNotItsTokenIsHeld(t *testing.T) {
 	cpP(t, cp, disk)
 	reuseInode(t, disk, b.Ino)
 
-	out, err := Settle(context.Background(), disk, owner)
+	out, err := Settle(context.Background(), openGate, disk, owner)
 	if out != Held || !errors.Is(err, ErrNotOurs) {
 		t.Fatalf("Settle = %v, %v; a copy without the window's token must hold", out, err)
 	}
@@ -219,7 +219,7 @@ func TestSettle_WithoutXattrsAnOlderRestoreIsHeld(t *testing.T) {
 	if fi, _ := os.Stat(disk); fi.Size() != b.Size {
 		t.Fatalf("setup: the older copy is %d bytes, the window's file %d; only the time may differ", fi.Size(), b.Size)
 	}
-	if out, err := Settle(context.Background(), disk, owner); out != Held || err == nil {
+	if out, err := Settle(context.Background(), openGate, disk, owner); out != Held || err == nil {
 		t.Fatalf("Settle = %v, %v; an older restore must hold", out, err)
 	}
 }
@@ -255,7 +255,7 @@ func TestSettle_WithoutXattrsASmallerFileIsHeld(t *testing.T) {
 		t.Fatal(err)
 	}
 	reuseInode(t, disk, b.Ino)
-	if out, err := Settle(context.Background(), disk, owner); out != Held || err == nil {
+	if out, err := Settle(context.Background(), openGate, disk, owner); out != Held || err == nil {
 		t.Fatalf("Settle = %v, %v; a smaller file must hold", out, err)
 	}
 }
@@ -271,7 +271,7 @@ func TestSettle_ACommittingBindingWithoutAStampIsHeld(t *testing.T) {
 		t.Fatal(err)
 	}
 	restamp(t, disk, func(b *Binding) { b.CommitStartedNs, b.CommitAttemptNs = 0, 0 })
-	if out, err := Settle(context.Background(), disk, owner); out != Held || err == nil {
+	if out, err := Settle(context.Background(), openGate, disk, owner); out != Held || err == nil {
 		t.Fatalf("Settle = %v, %v; an unstamped commit must hold", out, err)
 	}
 }
@@ -314,7 +314,7 @@ func TestMarkCommitting_EveryAttemptRefreshesTheBound(t *testing.T) {
 	}
 	Command = prev
 
-	if out, err := Settle(context.Background(), disk, owner); err != nil || out != Committed {
+	if out, err := Settle(context.Background(), openGate, disk, owner); err != nil || out != Committed {
 		t.Fatalf("Settle after a retry = %v, %v; want the retry finished", out, err)
 	}
 	if !windowWrite(t, disk) {
@@ -348,7 +348,7 @@ func TestCommitOffline_ALongCommitKeepsItsStampFresh(t *testing.T) {
 	// sidecar keeps the time of the last keep-alive).
 	restampKeep(t, disk, func(b *Binding) { b.State, b.EndMtimeNs, b.EndSize = StateCommitting, 0, 0 })
 
-	if out, err := Settle(context.Background(), disk, owner); err != nil || out != Committed {
+	if out, err := Settle(context.Background(), openGate, disk, owner); err != nil || out != Committed {
 		t.Fatalf("Settle after a long commit = %v, %v; want it finished, not held", out, err)
 	}
 	if !windowWrite(t, disk) {
@@ -374,7 +374,7 @@ func TestSettle_AMergedOverlayIsRemovedNeverCommittedAgain(t *testing.T) {
 		t.Fatal(err)
 	}
 	qemuIO(t, disk, "write -P 0x33 65536 65536") // the guest, after the pivot
-	if out, err := Settle(context.Background(), disk, owner); err != nil || out != Committed {
+	if out, err := Settle(context.Background(), openGate, disk, owner); err != nil || out != Committed {
 		t.Fatalf("Settle = %v, %v; want the merged overlay removed", out, err)
 	}
 	if Present(disk) {
@@ -399,7 +399,7 @@ func TestSettle_AnOverlayWrittenAfterItsCommitIsHeld(t *testing.T) {
 	}
 	time.Sleep(20 * time.Millisecond)
 	qemuIO(t, Path(disk), "write -P 0x77 0 512")
-	if out, err := Settle(context.Background(), disk, owner); out != Held || err == nil {
+	if out, err := Settle(context.Background(), openGate, disk, owner); out != Held || err == nil {
 		t.Fatalf("Settle = %v, %v; an overlay written after its commit must hold", out, err)
 	}
 	if !Present(disk) {
@@ -421,7 +421,7 @@ func TestSettle_APivotUnderWayIsHeldWithTheVMOff(t *testing.T) {
 	if err := MarkPivoting(disk); err != nil {
 		t.Fatal(err)
 	}
-	if out, err := Settle(context.Background(), disk, owner); out != Held || err == nil {
+	if out, err := Settle(context.Background(), openGate, disk, owner); out != Held || err == nil {
 		t.Fatalf("Settle = %v, %v; want held", out, err)
 	}
 	if !Present(disk) {

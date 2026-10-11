@@ -28,6 +28,10 @@ import (
 
 func TestFleet_ReplicaInADisksPoolIsPromotableAcrossHosts(t *testing.T) {
 	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	// The upgrade has finished: pit_overlay is available, so the running
+	// VM's replica is point-in-time (an external-snapshot overlay; the fleet
+	// has no backup sessions).
+	latchPITOverlay(t, c)
 	ctx := context.Background()
 	vmHost, replicaHost := c.Node("node-0"), c.Node("node-1")
 	disks := filepath.Join(c.tmpRoot, replicaHost.Name, "data", "disks")

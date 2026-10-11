@@ -433,6 +433,7 @@ func (s *Server) peerReleaseAnswer(ctx context.Context, peer string) ([]string, 
 	if err != nil {
 		return nil, false, err
 	}
+	s.notePeerWALQuarantined(peer, resp.GetWalQuarantined())
 	return resp.GetCapabilities(), resp.GetWalQuarantined(), nil
 }
 

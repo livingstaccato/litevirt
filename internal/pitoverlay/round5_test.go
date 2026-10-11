@@ -82,7 +82,7 @@ func TestSettle_AnInPlaceRestoreOverAHalfWrittenDiskIsHeld(t *testing.T) {
 		}
 	}
 	Command = exec.CommandContext
-	out, err := Settle(context.Background(), disk, owner)
+	out, err := Settle(context.Background(), openGate, disk, owner)
 	if out != Held || !errors.Is(err, ErrNotOurs) {
 		t.Fatalf("Settle = %v, %v; an in-place restore must hold", out, err)
 	}
@@ -139,7 +139,7 @@ func TestSettle_ACrashMidRetryIsBoundedByTheRetry(t *testing.T) {
 	if err := os.Chtimes(SidecarPath(disk), atStart, atStart); err != nil {
 		t.Fatal(err)
 	}
-	if out, err := Settle(context.Background(), disk, owner); err != nil || out != Committed {
+	if out, err := Settle(context.Background(), openGate, disk, owner); err != nil || out != Committed {
 		t.Fatalf("Settle after a crashed retry = %v, %v; want it finished", out, err)
 	}
 	if !windowWrite(t, disk) {
@@ -201,13 +201,16 @@ func TestMarkCommitted_OnlyFromPivoting(t *testing.T) {
 func TestSettle_BelowThePITOverlayFeatureEveryOverlayHolds(t *testing.T) {
 	needQemu(t)
 	disk := window(t)
-	defer SetFeatureForTest(false)()
-	out, err := Settle(context.Background(), disk, owner)
+	out, err := Settle(context.Background(), closedGate, disk, owner)
 	if out != Held || err == nil || !strings.Contains(err.Error(), "pit_overlay") {
 		t.Fatalf("Settle below the feature = %v, %v; want held, naming pit_overlay", out, err)
 	}
 	if windowWrite(t, disk) || !Present(disk) {
 		t.Fatal("the overlay was settled below the feature")
+	}
+	// A nil gate (unwired) is closed too.
+	if out, err := Settle(context.Background(), nil, disk, owner); out != Held || err == nil || !Present(disk) {
+		t.Fatalf("Settle with no gate wired = %v, %v; want held", out, err)
 	}
 }
 
@@ -219,7 +222,7 @@ func TestSettle_ANewerBuildsBindingHolds(t *testing.T) {
 	needQemu(t)
 	disk := window(t)
 	restamp(t, disk, func(b *Binding) { b.Format = 99 })
-	if out, err := Settle(context.Background(), disk, owner); out != Held || err == nil {
+	if out, err := Settle(context.Background(), openGate, disk, owner); out != Held || err == nil {
 		t.Fatalf("Settle of a format-99 binding = %v, %v; want held", out, err)
 	}
 }

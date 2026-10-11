@@ -584,7 +584,13 @@ on their own — a directory account's identity binding at its first login, the
 second factor a login presented, and the credential cut-offs a user create or
 delete writes — so it is used from the first such login, create or delete
 after the latch. Logins, creates and deletes are never refused for it: until
-the feature opens they run as on the previous release.
+the feature opens they run as on the previous release. `pit_overlay` is used by default
+too: the first copy of a running VM's disk after the latch for which no
+backup session can be made (a replication run or a volume move) makes an
+external-snapshot overlay and marks it used. Until the feature opens such a
+copy is made as on the previous release (`qemu-img convert -U`, marked not
+point-in-time), and a copy that could not place an overlay anyway marks
+nothing.
 
 **What this does not change.** A binary built before `release_2026_11_v1`
 understands no rollback rule. Rolled back below any token it does not know —

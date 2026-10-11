@@ -343,6 +343,9 @@ func (c *Coordinator) adoptedDestProblem(ctx context.Context, cl claimedProof, p
 // of the coordinator's own pick uses, against that host alone. A pin is not
 // applied: the destination is the one decided, not one being chosen.
 func (c *Coordinator) vmFitsOn(ctx context.Context, vm corrosion.VMRecord, failed string, h corrosion.HostRecord) string {
+	if len(c.pitOverlaySafeTargets(ctx, []corrosion.HostRecord{h})) == 0 {
+		return "is isolated, WAL-quarantined or did not answer while point-in-time overlays are in use (it may not understand them)"
+	}
 	req := buildFailoverPlacementRequest(vm, failed, c.capacity, func(string) bool { return true })
 	c.resolveUSBPlacement(ctx, &req)
 	req.RequireRegion = c.vmRecoveryRegion(failed, vm)

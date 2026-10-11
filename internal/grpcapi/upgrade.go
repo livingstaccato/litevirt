@@ -40,7 +40,7 @@ func (s *Server) UpgradeHost(stream grpc.ClientStreamingServer[pb.UpgradeHostReq
 	// Pre-flight: block on in-flight work unless --force was passed.
 	// Warn-level findings are logged but not blocking either way.
 	if !first.Force {
-		pre, err := s.PreflightUpgrade(stream.Context(), &pb.PreflightUpgradeRequest{TargetHost: s.hostName})
+		pre, err := s.preflightUpgrade(stream.Context(), &pb.PreflightUpgradeRequest{TargetHost: s.hostName}, false)
 		if err != nil {
 			slog.Warn("upgrade: preflight failed (continuing — set --force to acknowledge)", "error", err)
 		} else {
@@ -61,6 +61,13 @@ func (s *Server) UpgradeHost(stream grpc.ClientStreamingServer[pb.UpgradeHostReq
 	// Write binary to staging path + verify checksum (shared with PreStageUpgrade).
 	stagingPath := binaryPath + ".new"
 	if err := receiveBinaryToStaging(stream, first, stagingPath); err != nil {
+		os.Remove(stagingPath)
+		return err
+	}
+
+	// A binary that does not know pit_overlay is never swapped in over an
+	// overlay this host holds (P2 of the #256 re-review 5).
+	if err := s.checkPITOverlayDowngrade(stream.Context(), stagingPath, first.Force); err != nil {
 		os.Remove(stagingPath)
 		return err
 	}

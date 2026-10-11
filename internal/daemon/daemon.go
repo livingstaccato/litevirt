@@ -1103,6 +1103,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// host is stopped on that proof, and only on it.
 	reconciler.SetSettleVerifier(svc.VerifySettleProof)
 	reconciler.SetPITOverlayReporter(svc.ReportPITOverlayHeld, svc.ClearPITOverlayHold)
+	reconciler.SetPITOverlayFeature(svc.PITOverlayFeature)
 	svc.SetLeaseTermReady(func() bool {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -1662,6 +1663,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	fc.LastContact = d.checker.LastContact
 	fc.PeerPausesOnLoss = svc.PeerPausesOnLoss
+	// Once pit_overlay is used, no VM recovery onto a peer whose Ping says it
+	// is WAL-quarantined, or that does not answer (it may be a build that
+	// knows nothing of overlays).
+	fc.PeerRecoveryExclusions = svc.PeerRecoveryExclusions
 	// A coordinator that was itself cut off moments ago decides no new fence
 	// on the failure rows the cut left behind (a fleet-wide blip).
 	fc.QuorumRegain = d.checker.InQuorumRegainGraceFor

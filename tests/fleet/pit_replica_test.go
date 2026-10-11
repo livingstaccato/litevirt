@@ -162,6 +162,7 @@ func diskHoldsTheWindow(t *testing.T, disk string) bool {
 // removed — red (the target boots the disk without the window's writes).
 func TestFleet_FailoverMidWindowKeepsTheWindowsWrites(t *testing.T) {
 	c := New(t, Options{Nodes: 3, SharedCRDT: true})
+	latchPITOverlay(t, c)
 	ctx := context.Background()
 	target, victim, coord := c.Nodes[0], c.Nodes[1], c.Nodes[2]
 	shared := filepath.Join(c.tmpRoot, "nfs")
@@ -189,6 +190,9 @@ func TestFleet_FailoverMidWindowKeepsTheWindowsWrites(t *testing.T) {
 		t.Fatalf("pw1 after the failover = %+v, want it on %s", vm, target.Name)
 	}
 	rec := health.NewReconciler(target.Name, filepath.Join(c.tmpRoot, target.Name, "data"), target.DB, target.Virt)
+	// As the daemon wires it: the target's own pit_overlay gate, open once
+	// the release token has latched on every host.
+	rec.SetPITOverlayFeature(target.Server.PITOverlayFeature)
 	rec.ReconcileOnce(ctx)
 
 	if !strings.Contains(target.Virt.DefinedXML("pw1"), disk) {
@@ -338,6 +342,7 @@ func TestFleet_AHeldPromotionStaysDownAndItsCommandWorks(t *testing.T) {
 // "define ignores a hold" (the reconciler defines past a Held settle) — red.
 func TestFleet_AnOverlayIsNeverCommittedOverABaseWrittenSince(t *testing.T) {
 	c := New(t, Options{Nodes: 3, SharedCRDT: true})
+	latchPITOverlay(t, c)
 	ctx := context.Background()
 	target, victim, coord := c.Nodes[0], c.Nodes[1], c.Nodes[2]
 	shared := filepath.Join(c.tmpRoot, "nfs")
@@ -366,8 +371,10 @@ func TestFleet_AnOverlayIsNeverCommittedOverABaseWrittenSince(t *testing.T) {
 		t.Fatalf("fencer fired %d times, want 1", got)
 	}
 	rec := health.NewReconciler(target.Name, filepath.Join(c.tmpRoot, target.Name, "data"), target.DB, target.Virt)
-	// As the daemon wires it: a hold is a durable, per-disk condition.
+	// As the daemon wires it: a hold is a durable, per-disk condition, and
+	// the target's own pit_overlay gate (open: the verdict decides).
 	rec.SetPITOverlayReporter(target.Server.ReportPITOverlayHeld, target.Server.ClearPITOverlayHold)
+	rec.SetPITOverlayFeature(target.Server.PITOverlayFeature)
 	rec.ReconcileOnce(ctx)
 
 	if diskHoldsTheWindow(t, disk) {

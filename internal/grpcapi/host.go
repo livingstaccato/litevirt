@@ -316,6 +316,7 @@ func (s *Server) PeerCapabilities(ctx context.Context, host string) ([]string, t
 	if err != nil {
 		return nil, time.Time{}, err
 	}
+	s.notePeerWALQuarantined(host, resp.GetWalQuarantined())
 	peerWall := time.Time{}
 	if s := resp.GetWallClock(); s != "" {
 		if parsed, perr := time.Parse(time.RFC3339Nano, s); perr == nil {

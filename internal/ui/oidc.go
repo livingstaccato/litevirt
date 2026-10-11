@@ -1,10 +1,11 @@
 package ui
 
 import (
-	"crypto/subtle"
 	"encoding/base64"
 	"log/slog"
+	"net"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -14,34 +15,66 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 )
 
-// oidcFlowCookieName binds an OIDC login to the browser that began it. The
-// state alone proves the callback belongs to SOME flow this node began; the
-// cookie proves it belongs to THIS browser's flow, so an attacker cannot send a
-// victim through a callback for a login the attacker began (login CSRF, RFC
-// 6749 §10.12) and leave the victim signed in as the attacker.
-const oidcFlowCookieName = "lv_oidc_flow"
+// The flow cookie binds an OIDC login to the browser that began it. It
+// carries the flow's binding secret (BeginOIDCLoginResponse.binding), which
+// never appears in a URL: the daemon refuses to redeem the flow without it, so
+// an attacker cannot send a victim through a callback for a login the attacker
+// began (login CSRF, RFC 6749 §10.12), and a (code, state) pair lifted from a
+// URL redeems nothing anywhere (RFC 9700 §4.5).
+//
+// Over https it is a __Host- cookie (Secure, Path=/, no Domain), so a sibling
+// host cannot plant one (cookie tossing). Plain http (a loopback developer
+// setup) cannot carry that prefix and uses the plain name.
+const (
+	oidcFlowCookieName       = "lv_oidc_flow"
+	oidcFlowCookieNameSecure = "__Host-lv_oidc_flow"
+)
 
 // oidcCallbackPath is where the IdP returns the browser. The realm's
 // redirect_url must name this path on this node's UI.
 const oidcCallbackPath = "/oidc/callback"
 
+// Fixed messages for the login page. Nothing the IdP, a crafted link or the
+// daemon's detail (account names, IdP error bodies) says is shown: the detail
+// goes to the log and the audit log only.
+const (
+	msgOIDCChooseRealm  = "Choose one of the sign-in options below."
+	msgOIDCUnavailable  = "Sign-in through the identity provider is not available right now. Try again, or use another sign-in option."
+	msgOIDCBusy         = "Too many sign-ins are in progress from your address. Finish one, or try again in a few minutes."
+	msgOIDCIdPRefused   = "The identity provider did not sign you in."
+	msgOIDCIncomplete   = "The identity provider's answer is incomplete. Sign in again."
+	msgOIDCNotThisLogin = "This sign-in was not started from this browser on this node, or it expired. Sign in again."
+	msgOIDCRefused      = "Sign-in refused. An administrator can see why in the audit log."
+	msgOIDCFailed       = "Sign-in through the identity provider failed. Sign in again."
+	msgOIDCBadCode      = "Invalid authenticator code."
+)
+
 // handleOIDCLogin begins an OIDC login: it asks the daemon on THIS node to
 // start a flow, binds it to the browser with a short-lived HttpOnly cookie, and
 // sends the browser to the IdP. GET, so an SSO link works; it changes nothing
-// but the in-memory flow store, which the daemon bounds.
+// but the in-memory flow store, which the daemon bounds per client address
+// (passed here: the daemon sees only this UI's loopback connection).
 func (s *Server) handleOIDCLogin(w http.ResponseWriter, r *http.Request) {
 	noStore(w)
+	page := loginPageData{Realms: s.availableRealms(), OIDCRealms: s.oidcRealms()}
 	realm := r.URL.Query().Get("realm")
-	if !strings.HasPrefix(realm, "oidc:") {
-		s.renderLoginPage(w, loginPageData{Realms: s.availableRealms(), OIDCRealms: s.oidcRealms(),
-			Error: "Choose an OIDC realm to sign in with."})
+	if !slices.Contains(page.OIDCRealms, realm) {
+		page.Error = msgOIDCChooseRealm
+		page.status = http.StatusBadRequest
+		s.renderLoginPage(w, page)
 		return
 	}
-	resp, err := s.grpc.BeginOIDCLogin(r.Context(), &pb.BeginOIDCLoginRequest{Realm: realm, Client: "web"})
+	resp, err := s.grpc.BeginOIDCLogin(r.Context(), &pb.BeginOIDCLoginRequest{
+		Realm: realm, Client: "web", ClientAddress: browserAddress(r),
+	})
 	if err != nil {
 		slog.Warn("UI OIDC login could not begin", "realm", realm, "code", status.Code(err), "error", status.Convert(err).Message())
-		s.renderLoginPage(w, loginPageData{Realms: s.availableRealms(), OIDCRealms: s.oidcRealms(),
-			Error: "Sign-in through " + realm + " is not available: " + status.Convert(err).Message()})
+		page.Error = msgOIDCUnavailable
+		if status.Code(err) == codes.ResourceExhausted {
+			page.Error = msgOIDCBusy
+		}
+		page.status = httpStatusFor(err)
+		s.renderLoginPage(w, page)
 		return
 	}
 	maxAge := 600
@@ -50,69 +83,78 @@ func (s *Server) handleOIDCLogin(w http.ResponseWriter, r *http.Request) {
 			maxAge = secs
 		}
 	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     oidcFlowCookieName,
-		Value:    resp.State + "." + base64.RawURLEncoding.EncodeToString([]byte(realm)),
-		Path:     oidcCallbackPath,
-		HttpOnly: true,
-		Secure:   requestIsHTTPS(r),
-		// Lax: the IdP's redirect back is a top-level GET navigation, which
-		// carries a Lax cookie; a cross-site subrequest does not.
-		SameSite: http.SameSiteLaxMode,
-		MaxAge:   maxAge,
-	})
+	c := oidcFlowCookie(r)
+	c.Value = resp.Binding + "." + base64.RawURLEncoding.EncodeToString([]byte(realm))
+	c.MaxAge = maxAge
+	http.SetCookie(w, c)
 	http.Redirect(w, r, resp.AuthUrl, http.StatusFound)
 }
 
-// handleOIDCCallback completes an OIDC login the IdP has sent back. The code
-// and state are passed to Login on THIS node (the UI's gRPC client is the
-// local daemon), which exchanges the code with the PKCE verifier, verifies the
-// ID token, maps the principal and applies the login policy exactly as a
-// password login does. Neither the code, the state nor any token is logged or
-// put in another URL.
+// handleOIDCCallback completes an OIDC login the IdP has sent back. The code,
+// the state and the browser's binding secret are passed to Login on THIS node
+// (the UI's gRPC client is the local daemon), which consumes the flow, refuses
+// a redeemer without the binding before the code is ever presented, exchanges
+// the code with the PKCE verifier, verifies the ID token, maps the principal
+// and applies the login policy exactly as a password login does.
+//
+// A callback from a browser without the right cookie is still sent to the
+// daemon (with whatever binding it holds, possibly none), so the flow is
+// consumed — single-use — and its code can never be redeemed by anyone.
+// Neither the code, the state, the binding nor any token is logged or put in
+// another URL.
 func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 	noStore(w)
 	q := r.URL.Query()
-	cookieState, realm, ok := readOIDCFlowCookie(r)
+	binding, cookieRealm := readOIDCFlowCookie(r)
 	clearOIDCFlowCookie(w, r)
 	page := loginPageData{Realms: s.availableRealms(), OIDCRealms: s.oidcRealms()}
 
 	if idpErr := q.Get("error"); idpErr != "" {
 		// The IdP refused (the user cancelled, or policy). Its error code is
-		// shown sanitised; error_description is attacker-controllable text in
-		// a URL anyone can craft, so it is not echoed.
-		page.Error = "The identity provider did not sign you in (" + sanitizeOAuthError(idpErr) + ")."
+		// logged, never shown: error and error_description are text anyone
+		// can put in a URL.
+		slog.Info("UI OIDC callback: the identity provider refused", "error", sanitizeOAuthError(idpErr))
+		page.Error = msgOIDCIdPRefused
 		page.status = http.StatusUnauthorized
 		s.renderLoginPage(w, page)
 		return
 	}
 	code, state := q.Get("code"), q.Get("state")
 	if code == "" || state == "" {
-		page.Error = "The identity provider's answer is incomplete; sign in again."
+		page.Error = msgOIDCIncomplete
 		page.status = http.StatusBadRequest
 		s.renderLoginPage(w, page)
 		return
 	}
-	if !ok || subtle.ConstantTimeCompare([]byte(cookieState), []byte(state)) != 1 {
-		// No cookie, or another flow's: this browser did not begin this
-		// login. Refused without spending the code, so the browser that did
-		// begin it is not harmed.
-		slog.Warn("UI OIDC callback refused: not begun by this browser", "has_cookie", ok)
-		page.Error = "This sign-in was not started from this browser (or it expired). Sign in again."
-		page.status = http.StatusForbidden
-		s.renderLoginPage(w, page)
-		return
-	}
 
-	resp, err := s.grpc.Login(r.Context(), &pb.LoginRequest{
-		Realm:     realm,
-		OidcCode:  code,
-		OidcState: state,
-		UserAgent: r.UserAgent(),
-	})
+	// The realm the cookie names first; then, with no cookie or for a flow of
+	// another realm, every other OIDC realm, so whichever holds the state
+	// consumes it.
+	realms := page.OIDCRealms
+	if slices.Contains(realms, cookieRealm) {
+		realms = append([]string{cookieRealm}, slices.DeleteFunc(slices.Clone(realms), func(x string) bool { return x == cookieRealm })...)
+	}
+	var resp *pb.LoginResponse
+	var err error
+	realm := ""
+	for _, rn := range realms {
+		realm = rn
+		resp, err = s.grpc.Login(r.Context(), &pb.LoginRequest{
+			Realm:       rn,
+			OidcCode:    code,
+			OidcState:   state,
+			OidcBinding: binding,
+			UserAgent:   r.UserAgent(),
+		})
+		if !oidcStateUnknown(err) {
+			break
+		}
+	}
+	if err == nil && resp == nil {
+		err = status.Error(codes.Unauthenticated, "state unknown")
+	}
 	if err != nil {
-		slog.Warn("UI OIDC login failed", "realm", realm, "code", status.Code(err), "error", status.Convert(err).Message())
-		page.Realm = realm
+		slog.Warn("UI OIDC login failed", "realm", realm, "has_cookie", binding != "", "code", status.Code(err), "error", status.Convert(err).Message())
 		page.Error = oidcLoginFailureMessage(err)
 		page.status = httpStatusFor(err)
 		s.renderLoginPage(w, page)
@@ -130,24 +172,37 @@ func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 	s.finishLogin(w, r, resp)
 }
 
+// oidcStateUnknown reports a refusal because the realm holds no such flow.
+func oidcStateUnknown(err error) bool {
+	return status.Code(err) == codes.Unauthenticated && strings.Contains(status.Convert(err).Message(), "state unknown")
+}
+
 // handleOIDCSecondFactor resumes an OIDC login that stopped for litevirt's
 // second factor (from the login form when it carries oidc_pending).
 func (s *Server) handleOIDCSecondFactor(w http.ResponseWriter, r *http.Request, realm, pending, totp string) {
 	noStore(w)
+	page := loginPageData{Realms: s.availableRealms(), OIDCRealms: s.oidcRealms()}
+	if !slices.Contains(page.OIDCRealms, realm) {
+		// The realm is form input; only a configured one is echoed back.
+		page.Error = msgOIDCChooseRealm
+		page.status = http.StatusBadRequest
+		s.renderLoginPage(w, page)
+		return
+	}
+	page.Realm = realm
 	resp, err := s.grpc.Login(r.Context(), &pb.LoginRequest{
 		Realm:       realm,
 		OidcPending: pending,
 		TotpCode:    totp,
 		UserAgent:   r.UserAgent(),
 	})
-	page := loginPageData{Realms: s.availableRealms(), OIDCRealms: s.oidcRealms(), Realm: realm}
 	if err != nil {
-		slog.Warn("UI OIDC second factor failed", "realm", realm, "code", status.Code(err))
+		slog.Warn("UI OIDC second factor failed", "realm", realm, "code", status.Code(err), "error", status.Convert(err).Message())
 		if status.Code(err) == codes.Unauthenticated && strings.Contains(status.Convert(err).Message(), "invalid second factor") {
 			// The handle survives a wrong code (up to its attempt bound).
 			page.Requires2FA = true
 			page.OIDCPending = pending
-			page.Error = "Invalid authenticator code."
+			page.Error = msgOIDCBadCode
 		} else {
 			page.Error = oidcLoginFailureMessage(err)
 		}
@@ -164,44 +219,78 @@ func (s *Server) handleOIDCSecondFactor(w http.ResponseWriter, r *http.Request, 
 	s.finishLogin(w, r, resp)
 }
 
-// oidcLoginFailureMessage is what the login page says about a refused OIDC
-// login. The daemon's refusals for lifecycle, bindings and local-account
-// collisions are meant for the user and are shown; anything else is generic.
+// oidcLoginFailureMessage is the fixed message the login page shows for a
+// refused OIDC login; the daemon's own message (which may carry an account
+// name or the IdP's error body) is logged, never shown.
 func oidcLoginFailureMessage(err error) string {
 	switch status.Code(err) {
-	case codes.PermissionDenied, codes.FailedPrecondition, codes.Unavailable, codes.ResourceExhausted:
-		return "Sign-in refused: " + status.Convert(err).Message()
+	case codes.PermissionDenied, codes.FailedPrecondition:
+		return msgOIDCRefused
+	case codes.Unavailable:
+		return msgOIDCUnavailable
+	case codes.ResourceExhausted:
+		return msgOIDCBusy
 	case codes.Unauthenticated:
-		if m := status.Convert(err).Message(); strings.Contains(m, "state unknown") {
-			return "This sign-in is unknown or expired on this node. Sign in again (the identity provider must send you back to the node you started on)."
+		if oidcStateUnknown(err) || strings.Contains(status.Convert(err).Message(), "not begun by this client") {
+			return msgOIDCNotThisLogin
 		}
 	}
-	return "Sign-in through the identity provider failed."
+	return msgOIDCFailed
 }
 
-// readOIDCFlowCookie returns the state and realm the browser's flow cookie
-// carries.
-func readOIDCFlowCookie(r *http.Request) (state, realm string, ok bool) {
-	c, err := r.Cookie(oidcFlowCookieName)
+// browserAddress is the browser's address as this UI sees it (the TCP peer;
+// a forwarding header is not trusted).
+func browserAddress(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// oidcFlowCookie is the flow cookie's attributes for r: __Host- over https.
+func oidcFlowCookie(r *http.Request) *http.Cookie {
+	c := &http.Cookie{
+		Name:     oidcFlowCookieName,
+		Path:     "/",
+		HttpOnly: true,
+		// Lax: the IdP's redirect back is a top-level GET navigation, which
+		// carries a Lax cookie; a cross-site subrequest does not.
+		SameSite: http.SameSiteLaxMode,
+	}
+	if requestIsHTTPS(r) {
+		c.Name = oidcFlowCookieNameSecure
+		c.Secure = true
+	}
+	return c
+}
+
+// readOIDCFlowCookie returns the binding secret and realm the browser's flow
+// cookie carries ("" when there is none or it is malformed).
+func readOIDCFlowCookie(r *http.Request) (binding, realm string) {
+	name := oidcFlowCookieName
+	if requestIsHTTPS(r) {
+		name = oidcFlowCookieNameSecure
+	}
+	c, err := r.Cookie(name)
 	if err != nil || c.Value == "" {
-		return "", "", false
+		return "", ""
 	}
-	st, enc, found := strings.Cut(c.Value, ".")
-	if !found || st == "" {
-		return "", "", false
+	b, enc, found := strings.Cut(c.Value, ".")
+	if !found || b == "" {
+		return "", ""
 	}
-	b, err := base64.RawURLEncoding.DecodeString(enc)
-	if err != nil || !strings.HasPrefix(string(b), "oidc:") {
-		return "", "", false
+	rb, err := base64.RawURLEncoding.DecodeString(enc)
+	if err != nil || !strings.HasPrefix(string(rb), "oidc:") {
+		return "", ""
 	}
-	return st, string(b), true
+	return b, string(rb)
 }
 
 func clearOIDCFlowCookie(w http.ResponseWriter, r *http.Request) {
-	http.SetCookie(w, &http.Cookie{
-		Name: oidcFlowCookieName, Value: "", Path: oidcCallbackPath, MaxAge: -1,
-		HttpOnly: true, Secure: requestIsHTTPS(r), SameSite: http.SameSiteLaxMode,
-	})
+	c := oidcFlowCookie(r)
+	c.MaxAge = -1
+	http.SetCookie(w, c)
 }
 
 // noStore keeps an auth response (it carries a code in its URL or a handle in
@@ -211,7 +300,7 @@ func noStore(w http.ResponseWriter) {
 	w.Header().Set("Referrer-Policy", "no-referrer")
 }
 
-// sanitizeOAuthError keeps an RFC 6749 error code's own alphabet.
+// sanitizeOAuthError keeps an RFC 6749 error code's own alphabet, for logs.
 func sanitizeOAuthError(e string) string {
 	var b strings.Builder
 	for _, c := range e {
@@ -229,7 +318,7 @@ func sanitizeOAuthError(e string) string {
 }
 
 // oidcRealms are the OIDC realms the daemon advertises, for the login page's
-// sign-in buttons.
+// sign-in buttons and as the only realm names the page ever echoes.
 func (s *Server) oidcRealms() []string {
 	var out []string
 	for _, r := range s.allRealms() {

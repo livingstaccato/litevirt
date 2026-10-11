@@ -53,6 +53,9 @@ type Provider struct {
 	// GroupsClaim names the claim the groups go in (default "groups").
 	GroupsClaim string
 	// ExtraAudience, when set, is added to every ID token's aud (and azp is
+	// set to ClientID unless AZP overrides it). AZP alone sets azp on a
+	// single-audience token.
+	//
 	// set to ClientID unless AZP overrides it).
 	ExtraAudience string
 	AZP           string
@@ -294,6 +297,9 @@ func (p *Provider) token(w http.ResponseWriter, r *http.Request) {
 		claims["azp"] = azp
 	} else {
 		claims["aud"] = p.ClientID
+		if azp != "" {
+			claims["azp"] = azp
+		}
 	}
 	if u.PreferredUsername != "" {
 		claims["preferred_username"] = u.PreferredUsername

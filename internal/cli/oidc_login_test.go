@@ -26,7 +26,7 @@ func (s *oidcCLIStub) BeginOIDCLogin(_ context.Context, in *pb.BeginOIDCLoginReq
 	if in.Client != "cli" {
 		return nil, fmt.Errorf("client %q, want cli", in.Client)
 	}
-	return &pb.BeginOIDCLoginResponse{AuthUrl: "https://idp.example/authorize?x=1", State: "the-state", RedirectUri: s.redirect}, nil
+	return &pb.BeginOIDCLoginResponse{AuthUrl: "https://idp.example/authorize?x=1", State: "the-state", RedirectUri: s.redirect, Binding: "b-1"}, nil
 }
 
 func (s *oidcCLIStub) Login(_ context.Context, in *pb.LoginRequest, _ ...grpc.CallOption) (*pb.LoginResponse, error) {
@@ -81,8 +81,8 @@ func TestOIDCLogin_CLIAcceptsOnlyItsOwnFlowsAnswer(t *testing.T) {
 	if resp.Token != "lvs_t" || len(stub.logins) != 1 {
 		t.Fatalf("resp %+v, %d logins", resp, len(stub.logins))
 	}
-	if l := stub.logins[0]; l.OidcCode != "real" || l.OidcState != "the-state" || l.Realm != "oidc:corp" {
-		t.Fatalf("login request %+v: want the real code with the flow's state", l)
+	if l := stub.logins[0]; l.OidcCode != "real" || l.OidcState != "the-state" || l.Realm != "oidc:corp" || l.OidcBinding != "b-1" {
+		t.Fatalf("login request %+v: want the real code with the flow's state and its binding", l)
 	}
 	if s := <-statuses; !strings.HasPrefix(s, "400") {
 		t.Fatalf("a forged state answered %s, want 400", s)

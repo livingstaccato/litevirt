@@ -69,7 +69,7 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 	if oidcResume {
 		// The principal the IdP proved is held on this node under the
 		// handle; nothing about it comes from this request.
-		p, ok := s.oidcPending.get(req.OidcPending, realmName)
+		p, ok := s.oidcPending.reserve(req.OidcPending, realmName)
 		if !ok {
 			s.audit(ctx, "auth.login", "", "realm="+realmName+" unknown or expired second-factor handle", "denied")
 			return nil, status.Error(codes.Unauthenticated,
@@ -107,6 +107,7 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 		OIDCCode:        req.OidcCode,
 		OIDCState:       req.OidcState,
 		OIDCRedirectURI: req.OidcRedirectUri,
+		OIDCBinding:     req.OidcBinding,
 	}
 	var principal *auth.Principal
 	var err error
@@ -118,6 +119,14 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 	if err != nil {
 		// Login is in skipAuth, so callerUsername(ctx) is empty here — record
 		// the attempted username from the request as the audit target.
+		if errors.Is(err, auth.ErrOIDCFlowBindingMismatch) {
+			// A real state redeemed by a client that did not begin it: the
+			// flow is now spent and the code was never presented. Not counted
+			// against the shared anonymous bucket (that would let a stray
+			// callback lock out every OIDC user of this node), but audited.
+			s.audit(ctx, "auth.login", req.Username, "realm="+realmName+" OIDC login redeemed by a client that did not begin it", "denied")
+			return nil, status.Error(codes.Unauthenticated, err.Error())
+		}
 		if errors.Is(err, auth.ErrOIDCFlowUnknown) {
 			// Not a credential guess (the state is 256 random bits), so it
 			// does not count against the shared anonymous bucket — a stray
@@ -296,9 +305,6 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 		}
 		if !ok {
 			s.loginThrottle.fail(throttleKey)
-			if oidcResume {
-				s.oidcPending.failed(req.OidcPending)
-			}
 			s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" invalid second factor", "denied")
 			return nil, status.Error(codes.Unauthenticated, "invalid second factor")
 		}

@@ -2,11 +2,16 @@ package grpcapi
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/peer"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/auth"
@@ -37,7 +42,7 @@ func oidcServer(t *testing.T) (*Server, *oidctest.Provider) {
 
 // oidcCallback begins a flow on s and plays the browser at the IdP, returning
 // the code and state the IdP sent back.
-func oidcCallback(t *testing.T, s *Server, idp *oidctest.Provider) (code, state string) {
+func oidcCallback(t *testing.T, s *Server, idp *oidctest.Provider) (code, state, binding string) {
 	t.Helper()
 	begin, err := s.BeginOIDCLogin(context.Background(), &pb.BeginOIDCLoginRequest{Realm: "oidc:corp", Client: "web"})
 	if err != nil {
@@ -55,7 +60,7 @@ func oidcCallback(t *testing.T, s *Server, idp *oidctest.Provider) (code, state 
 		t.Fatalf("IdP answered %d", resp.StatusCode)
 	}
 	loc, _ := url.Parse(resp.Header.Get("Location"))
-	return loc.Query().Get("code"), loc.Query().Get("state")
+	return loc.Query().Get("code"), loc.Query().Get("state"), begin.Binding
 }
 
 // TestBeginOIDCLogin_IsPreSession: it is reachable with no bearer, through
@@ -89,8 +94,8 @@ func TestBeginOIDCLogin_Refusals(t *testing.T) {
 // realm, which the interceptor accepts.
 func TestOIDCLogin_FlowMintsASessionLikeALocalLogin(t *testing.T) {
 	s, idp := oidcServer(t)
-	code, state := oidcCallback(t, s, idp)
-	r, err := s.Login(context.Background(), &pb.LoginRequest{Realm: "oidc:corp", OidcCode: code, OidcState: state})
+	code, state, binding := oidcCallback(t, s, idp)
+	r, err := s.Login(context.Background(), &pb.LoginRequest{Realm: "oidc:corp", OidcCode: code, OidcState: state, OidcBinding: binding})
 	if err != nil || r.Token == "" {
 		t.Fatalf("OIDC login: %+v %v", r, err)
 	}
@@ -105,7 +110,7 @@ func TestOIDCLogin_FlowMintsASessionLikeALocalLogin(t *testing.T) {
 		t.Fatalf("sessions %+v %v, want one in oidc:corp", sess, err)
 	}
 	// The same code and state cannot mint a second session.
-	_, err = s.Login(context.Background(), &pb.LoginRequest{Realm: "oidc:corp", OidcCode: code, OidcState: state})
+	_, err = s.Login(context.Background(), &pb.LoginRequest{Realm: "oidc:corp", OidcCode: code, OidcState: state, OidcBinding: binding})
 	wantCode(t, "a replayed callback", err, codes.Unauthenticated)
 }
 
@@ -118,8 +123,8 @@ func TestOIDCLogin_UnknownStateDoesNotLockOthersOut(t *testing.T) {
 		_, err := s.Login(context.Background(), &pb.LoginRequest{Realm: "oidc:corp", OidcCode: "x", OidcState: "forged"})
 		wantCode(t, "an unknown state", err, codes.Unauthenticated)
 	}
-	code, state := oidcCallback(t, s, idp)
-	if r, err := s.Login(context.Background(), &pb.LoginRequest{Realm: "oidc:corp", OidcCode: code, OidcState: state}); err != nil || r.Token == "" {
+	code, state, binding := oidcCallback(t, s, idp)
+	if r, err := s.Login(context.Background(), &pb.LoginRequest{Realm: "oidc:corp", OidcCode: code, OidcState: state, OidcBinding: binding}); err != nil || r.Token == "" {
 		t.Fatalf("a real login after stray callbacks: %+v %v", r, err)
 	}
 }
@@ -140,8 +145,8 @@ func TestOIDCLogin_SecondFactorResumesWithTheHandle(t *testing.T) {
 	}
 	setPolicy(t, s, "all")
 
-	code, state := oidcCallback(t, s, idp)
-	r, err := s.Login(ctx, &pb.LoginRequest{Realm: "oidc:corp", OidcCode: code, OidcState: state})
+	code, state, binding := oidcCallback(t, s, idp)
+	r, err := s.Login(ctx, &pb.LoginRequest{Realm: "oidc:corp", OidcCode: code, OidcState: state, OidcBinding: binding})
 	if err != nil || !r.GetRequires_2Fa() || r.Token != "" || r.GetOidcPending() == "" {
 		t.Fatalf("covered OIDC login without the factor: %+v %v, want a challenge with a handle and no session", r, err)
 	}
@@ -165,7 +170,7 @@ func TestOIDCLogin_SecondFactorResumesWithTheHandle(t *testing.T) {
 	}
 	// Used once: the handle is gone (a resend of the same code would also be
 	// refused as a TOTP replay, so the store itself is asserted).
-	if _, live := s.oidcPending.get(h, "oidc:corp"); live {
+	if _, live := s.oidcPending.reserve(h, "oidc:corp"); live {
 		t.Fatal("the handle outlived the login it completed")
 	}
 	_, err = s.Login(ctx, &pb.LoginRequest{Realm: "oidc:corp", OidcPending: h, TotpCode: totpCode(t, enr.SecretBase32)})
@@ -186,8 +191,8 @@ func TestOIDCLogin_SecondFactorHandleHasAnAttemptBound(t *testing.T) {
 		t.Fatal(err)
 	}
 	setPolicy(t, s, "all")
-	code, state := oidcCallback(t, s, idp)
-	r, err := s.Login(ctx, &pb.LoginRequest{Realm: "oidc:corp", OidcCode: code, OidcState: state})
+	code, state, binding := oidcCallback(t, s, idp)
+	r, err := s.Login(ctx, &pb.LoginRequest{Realm: "oidc:corp", OidcCode: code, OidcState: state, OidcBinding: binding})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,4 +201,93 @@ func TestOIDCLogin_SecondFactorHandleHasAnAttemptBound(t *testing.T) {
 	}
 	_, err = s.Login(ctx, &pb.LoginRequest{Realm: "oidc:corp", OidcPending: r.GetOidcPending(), TotpCode: totpCode(t, enr.SecretBase32)})
 	wantCode(t, "the right factor after the attempt bound", err, codes.Unauthenticated)
+}
+
+func peerAt(ip string) context.Context {
+	return peer.NewContext(context.Background(), &peer.Peer{Addr: tcpAddr(ip)})
+}
+
+// TestBeginOIDCLogin_BoundPerClientAddress (review I1): a remote caller is
+// bounded by its own address whatever client_address it claims; this node's
+// own loopback callers (the UI, the REST gateway) pass the end client's
+// address, so one browser's flood leaves another browser able to begin.
+func TestBeginOIDCLogin_BoundPerClientAddress(t *testing.T) {
+	s, _ := oidcServer(t)
+	remote := peerAt("10.0.0.9")
+	for i := 0; ; i++ {
+		_, err := s.BeginOIDCLogin(remote, &pb.BeginOIDCLoginRequest{Realm: "oidc:corp", ClientAddress: fmt.Sprintf("192.0.2.%d", i)})
+		if err != nil {
+			wantCode(t, "a remote flood", err, codes.ResourceExhausted)
+			if i == 0 || i > 64 {
+				t.Fatalf("the remote address was refused after %d begins", i)
+			}
+			break
+		}
+		if i > 64 {
+			t.Fatal("a remote caller rotating client_address was never bounded")
+		}
+	}
+	ui := peerAt("127.0.0.1")
+	for i := 0; ; i++ {
+		_, err := s.BeginOIDCLogin(ui, &pb.BeginOIDCLoginRequest{Realm: "oidc:corp", ClientAddress: "198.51.100.66"})
+		if err != nil {
+			wantCode(t, "one browser's flood through the UI", err, codes.ResourceExhausted)
+			break
+		}
+		if i > 64 {
+			t.Fatal("one browser through the UI was never bounded")
+		}
+	}
+	if _, err := s.BeginOIDCLogin(ui, &pb.BeginOIDCLoginRequest{Realm: "oidc:corp", ClientAddress: "203.0.113.1"}); err != nil {
+		t.Fatalf("another browser through the UI after the flood: %v", err)
+	}
+}
+
+// TestOIDCLogin_RedemptionWithoutTheBindingSpendsTheFlow (review M1, M2): the
+// code and state alone (both in the callback URL) redeem nothing through the
+// RPC; the flow is spent, the code never reaches the IdP, the refusal is
+// audited and does not count against the shared throttle bucket.
+func TestOIDCLogin_RedemptionWithoutTheBindingSpendsTheFlow(t *testing.T) {
+	s, idp := oidcServer(t)
+	code, state, binding := oidcCallback(t, s, idp)
+	for i := 0; i < 2*defaultLoginMaxFailures; i++ {
+		c2, s2, _ := oidcCallback(t, s, idp)
+		_, err := s.Login(context.Background(), &pb.LoginRequest{Realm: "oidc:corp", OidcCode: c2, OidcState: s2})
+		wantCode(t, "no binding", err, codes.Unauthenticated)
+	}
+	if idp.Exchanges != 0 {
+		t.Fatalf("%d codes were exchanged without the binding", idp.Exchanges)
+	}
+	if row := lastAuditRow(t, s, "auth.login"); !strings.Contains(row.detail, "did not begin it") {
+		t.Fatalf("audit %+v", row)
+	}
+	if r, err := s.Login(context.Background(), &pb.LoginRequest{Realm: "oidc:corp", OidcCode: code, OidcState: state, OidcBinding: binding}); err != nil || r.Token == "" {
+		t.Fatalf("the beginner, after the refusals: %+v %v", r, err)
+	}
+}
+
+// TestOIDCPending_AttemptBoundIsAtomic (review M4): concurrent guesses with
+// one handle each reserve an attempt under the lock; no more than the bound
+// ever get to check a code.
+func TestOIDCPending_AttemptBoundIsAtomic(t *testing.T) {
+	var st oidcPendingStore
+	h, err := st.put("oidc:corp", &auth.Principal{Subject: "olga", Realm: "oidc:corp"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	var got atomic.Int32
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, ok := st.reserve(h, "oidc:corp"); ok {
+				got.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if n := got.Load(); n != oidcPendingMaxAttempts {
+		t.Fatalf("%d of 50 concurrent guesses got an attempt, want exactly %d", n, oidcPendingMaxAttempts)
+	}
 }

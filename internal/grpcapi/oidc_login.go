@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -43,7 +44,7 @@ func (s *Server) BeginOIDCLogin(ctx context.Context, req *pb.BeginOIDCLoginReque
 	if !ok {
 		return nil, status.Errorf(codes.InvalidArgument, "realm %q cannot begin an OIDC login", name)
 	}
-	start, err := starter.BeginFlow(req.GetClient())
+	start, err := starter.BeginFlow(req.GetClient(), oidcClientAddress(ctx, req.GetClientAddress()))
 	switch {
 	case err == nil:
 	case errors.Is(err, auth.ErrOIDCTooManyFlows):
@@ -58,7 +59,21 @@ func (s *Server) BeginOIDCLogin(ctx context.Context, req *pb.BeginOIDCLoginReque
 		State:       start.State,
 		RedirectUri: start.RedirectURI,
 		ExpiresAt:   start.ExpiresAt.UTC().Format(time.RFC3339),
+		Binding:     start.Binding,
 	}, nil
+}
+
+// oidcClientAddress is the address the per-address bound on in-progress OIDC
+// logins counts against: the gRPC peer's, unless the peer is this node's own
+// loopback caller (the web UI or the REST gateway, which reach the daemon over
+// 127.0.0.1 and pass the end client's address). A remote caller cannot name an
+// address: it is bounded by its own.
+func oidcClientAddress(ctx context.Context, claimed string) string {
+	peer := throttleClientIP(ctx)
+	if ip := net.ParseIP(peer); ip != nil && ip.IsLoopback() && claimed != "" {
+		return claimed
+	}
+	return peer
 }
 
 // oidcPendingTTL and oidcPendingMaxAttempts bound an OIDC login waiting for
@@ -118,8 +133,12 @@ func (st *oidcPendingStore) put(realm string, p *auth.Principal) (string, error)
 	return h, nil
 }
 
-// get returns a copy of the principal a live handle holds for realm.
-func (st *oidcPendingStore) get(handle, realm string) (*auth.Principal, bool) {
+// reserve takes one of a live handle's attempts for realm, atomically, and
+// returns a copy of the principal it holds. The attempt is spent whatever the
+// outcome (a success drops the handle anyway), so concurrent guesses with one
+// handle cannot exceed the bound: each one reserved its attempt under the
+// lock before any code was checked. At the bound the handle is dropped.
+func (st *oidcPendingStore) reserve(handle, realm string) (*auth.Principal, bool) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	st.pruneLocked(time.Now())
@@ -127,23 +146,15 @@ func (st *oidcPendingStore) get(handle, realm string) (*auth.Principal, bool) {
 	if !ok || p.realm != realm {
 		return nil, false
 	}
+	if p.attempts >= oidcPendingMaxAttempts {
+		delete(st.m, handle)
+		return nil, false
+	}
+	p.attempts++
 	cp := p.principal
 	cp.Groups = append([]string(nil), p.principal.Groups...)
 	cp.ExternalIDs = append([]string(nil), p.principal.ExternalIDs...)
 	return &cp, true
-}
-
-// failed counts a wrong second factor against handle; the handle is dropped
-// at the bound.
-func (st *oidcPendingStore) failed(handle string) {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	if p, ok := st.m[handle]; ok {
-		p.attempts++
-		if p.attempts >= oidcPendingMaxAttempts {
-			delete(st.m, handle)
-		}
-	}
 }
 
 // drop removes handle (used once the login completed or was refused for good).

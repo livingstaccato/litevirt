@@ -144,10 +144,11 @@ func OIDCLogin(ctx context.Context, c pb.LiteVirtClient, o OIDCLoginOptions) (*p
 	}
 
 	resp, err := c.Login(ctx, &pb.LoginRequest{
-		Realm:     o.Realm,
-		OidcCode:  r.code,
-		OidcState: begin.State,
-		UserAgent: o.UserAgent,
+		Realm:       o.Realm,
+		OidcCode:    r.code,
+		OidcState:   begin.State,
+		OidcBinding: begin.Binding,
+		UserAgent:   o.UserAgent,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("login failed: %w", err)

@@ -10181,7 +10181,10 @@ type LoginRequest struct {
 	// for litevirt's second factor (LoginResponse.oidc_pending): send it with
 	// realm and totp_code instead of the spent code. Single-use per success,
 	// node-local, valid for 5 minutes and 5 attempts.
-	OidcPending   string `protobuf:"bytes,9,opt,name=oidc_pending,json=oidcPending,proto3" json:"oidc_pending,omitempty"`
+	OidcPending string `protobuf:"bytes,9,opt,name=oidc_pending,json=oidcPending,proto3" json:"oidc_pending,omitempty"`
+	// oidc_binding: the secret BeginOIDCLoginResponse.binding returned to whoever
+	// began the flow; required with oidc_code + oidc_state. Never in a URL.
+	OidcBinding   string `protobuf:"bytes,10,opt,name=oidc_binding,json=oidcBinding,proto3" json:"oidc_binding,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -10275,6 +10278,13 @@ func (x *LoginRequest) GetOidcRedirectUri() string {
 func (x *LoginRequest) GetOidcPending() string {
 	if x != nil {
 		return x.OidcPending
+	}
+	return ""
+}
+
+func (x *LoginRequest) GetOidcBinding() string {
+	if x != nil {
+		return x.OidcBinding
 	}
 	return ""
 }
@@ -10428,9 +10438,13 @@ func (x *ListRealmsResponse) GetRealms() []string {
 // "cli" (the realm's cli_redirect_url, a loopback listener). The redirect is
 // always the realm's configured one; a caller cannot name its own.
 type BeginOIDCLoginRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Realm         string                 `protobuf:"bytes,1,opt,name=realm,proto3" json:"realm,omitempty"`   // "oidc:<name>"
-	Client        string                 `protobuf:"bytes,2,opt,name=client,proto3" json:"client,omitempty"` // "web" | "cli"
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	Realm  string                 `protobuf:"bytes,1,opt,name=realm,proto3" json:"realm,omitempty"`   // "oidc:<name>"
+	Client string                 `protobuf:"bytes,2,opt,name=client,proto3" json:"client,omitempty"` // "web" | "cli"
+	// client_address: the end client's address, for the per-address bound on
+	// in-progress logins. Honoured only from a loopback caller (this node's
+	// web UI or REST gateway); any other caller is bounded by its own address.
+	ClientAddress string `protobuf:"bytes,3,opt,name=client_address,json=clientAddress,proto3" json:"client_address,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -10479,12 +10493,22 @@ func (x *BeginOIDCLoginRequest) GetClient() string {
 	return ""
 }
 
+func (x *BeginOIDCLoginRequest) GetClientAddress() string {
+	if x != nil {
+		return x.ClientAddress
+	}
+	return ""
+}
+
 type BeginOIDCLoginResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	AuthUrl       string                 `protobuf:"bytes,1,opt,name=auth_url,json=authUrl,proto3" json:"auth_url,omitempty"`             // send the user's browser here
-	State         string                 `protobuf:"bytes,2,opt,name=state,proto3" json:"state,omitempty"`                                // single-use; the callback must carry it back
-	RedirectUri   string                 `protobuf:"bytes,3,opt,name=redirect_uri,json=redirectUri,proto3" json:"redirect_uri,omitempty"` // where the IdP will send the browser
-	ExpiresAt     string                 `protobuf:"bytes,4,opt,name=expires_at,json=expiresAt,proto3" json:"expires_at,omitempty"`       // RFC3339; the flow is refused after this
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	AuthUrl     string                 `protobuf:"bytes,1,opt,name=auth_url,json=authUrl,proto3" json:"auth_url,omitempty"`             // send the user's browser here
+	State       string                 `protobuf:"bytes,2,opt,name=state,proto3" json:"state,omitempty"`                                // single-use; the callback must carry it back
+	RedirectUri string                 `protobuf:"bytes,3,opt,name=redirect_uri,json=redirectUri,proto3" json:"redirect_uri,omitempty"` // where the IdP will send the browser
+	ExpiresAt   string                 `protobuf:"bytes,4,opt,name=expires_at,json=expiresAt,proto3" json:"expires_at,omitempty"`       // RFC3339; the flow is refused after this
+	// binding: a per-flow secret that redeeming the flow (LoginRequest.oidc_binding)
+	// must present. Keep it out of URLs and logs.
+	Binding       string `protobuf:"bytes,5,opt,name=binding,proto3" json:"binding,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -10543,6 +10567,13 @@ func (x *BeginOIDCLoginResponse) GetRedirectUri() string {
 func (x *BeginOIDCLoginResponse) GetExpiresAt() string {
 	if x != nil {
 		return x.ExpiresAt
+	}
+	return ""
+}
+
+func (x *BeginOIDCLoginResponse) GetBinding() string {
+	if x != nil {
+		return x.Binding
 	}
 	return ""
 }
@@ -39681,7 +39712,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\abackend\x18\x02 \x01(\tR\abackend\"]\n" +
 	"\x14DrainBackendResponse\x12\x16\n" +
 	"\x06status\x18\x01 \x01(\tR\x06status\x12-\n" +
-	"\x12active_connections\x18\x02 \x01(\x03R\x11activeConnections\"\xa3\x02\n" +
+	"\x12active_connections\x18\x02 \x01(\x03R\x11activeConnections\"\xc6\x02\n" +
 	"\fLoginRequest\x12\x1a\n" +
 	"\busername\x18\x01 \x01(\tR\busername\x12\x1a\n" +
 	"\bpassword\x18\x02 \x01(\tR\bpassword\x12\x14\n" +
@@ -39693,7 +39724,9 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\n" +
 	"oidc_state\x18\a \x01(\tR\toidcState\x12*\n" +
 	"\x11oidc_redirect_uri\x18\b \x01(\tR\x0foidcRedirectUri\x12!\n" +
-	"\foidc_pending\x18\t \x01(\tR\voidcPending\"\xf2\x01\n" +
+	"\foidc_pending\x18\t \x01(\tR\voidcPending\x12!\n" +
+	"\foidc_binding\x18\n" +
+	" \x01(\tR\voidcBinding\"\xf2\x01\n" +
 	"\rLoginResponse\x12\x14\n" +
 	"\x05token\x18\x01 \x01(\tR\x05token\x12\x1a\n" +
 	"\busername\x18\x02 \x01(\tR\busername\x12\x12\n" +
@@ -39704,16 +39737,18 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x17requires_2fa_enrollment\x18\x06 \x01(\bR\x15requires2faEnrollment\x12!\n" +
 	"\foidc_pending\x18\a \x01(\tR\voidcPending\",\n" +
 	"\x12ListRealmsResponse\x12\x16\n" +
-	"\x06realms\x18\x01 \x03(\tR\x06realms\"E\n" +
+	"\x06realms\x18\x01 \x03(\tR\x06realms\"l\n" +
 	"\x15BeginOIDCLoginRequest\x12\x14\n" +
 	"\x05realm\x18\x01 \x01(\tR\x05realm\x12\x16\n" +
-	"\x06client\x18\x02 \x01(\tR\x06client\"\x8b\x01\n" +
+	"\x06client\x18\x02 \x01(\tR\x06client\x12%\n" +
+	"\x0eclient_address\x18\x03 \x01(\tR\rclientAddress\"\xa5\x01\n" +
 	"\x16BeginOIDCLoginResponse\x12\x19\n" +
 	"\bauth_url\x18\x01 \x01(\tR\aauthUrl\x12\x14\n" +
 	"\x05state\x18\x02 \x01(\tR\x05state\x12!\n" +
 	"\fredirect_uri\x18\x03 \x01(\tR\vredirectUri\x12\x1d\n" +
 	"\n" +
-	"expires_at\x18\x04 \x01(\tR\texpiresAt\"_\n" +
+	"expires_at\x18\x04 \x01(\tR\texpiresAt\x12\x18\n" +
+	"\abinding\x18\x05 \x01(\tR\abinding\"_\n" +
 	"\x11CreateUserRequest\x12\x1a\n" +
 	"\busername\x18\x01 \x01(\tR\busername\x12\x1a\n" +
 	"\bpassword\x18\x02 \x01(\tR\bpassword\x12\x12\n" +

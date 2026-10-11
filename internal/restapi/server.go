@@ -73,6 +73,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -1114,6 +1115,13 @@ func (s *Server) handleOIDCBegin(w http.ResponseWriter, r *http.Request) {
 	if err := protoFromJSON(r, &req); err != nil {
 		jsonError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	// The daemon bounds in-progress logins per client address and takes this
+	// gateway's word for it (it is a loopback caller); the address is the
+	// HTTP peer's, never the body's.
+	req.ClientAddress = r.RemoteAddr
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		req.ClientAddress = host
 	}
 	resp, err := s.grpc.BeginOIDCLogin(s.grpcCtx(r), &req)
 	if err != nil {

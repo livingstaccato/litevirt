@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"math/big"
 	"net"
@@ -142,13 +143,14 @@ func TestRedfishFence_PasswordNeverInDetail(t *testing.T) {
 	b.resetStatus = http.StatusBadRequest
 	b.pass = `p"w/d&é 1`
 	b.resetBody = `{"error":"rejected for user admin password ` + b.pass + ` json \"` + strings.ReplaceAll(b.pass, `"`, `\"`) +
-		`\" query ` + url.QueryEscape(b.pass) + ` path ` + url.PathEscape(b.pass) + `"}`
+		`\" query ` + url.QueryEscape(b.pass) + ` path ` + url.PathEscape(b.pass) +
+		` html ` + htmlJSON(b.pass) + `"}`
 
 	r := Execute(context.Background(), b.host(b.config()))
 	if r.Success {
 		t.Fatalf("fence succeeded: %+v", r)
 	}
-	for _, form := range []string{b.pass, strings.ReplaceAll(b.pass, `"`, `\"`), url.QueryEscape(b.pass), url.PathEscape(b.pass)} {
+	for _, form := range []string{b.pass, strings.ReplaceAll(b.pass, `"`, `\"`), url.QueryEscape(b.pass), url.PathEscape(b.pass), htmlJSON(b.pass)} {
 		if strings.Contains(r.Detail, form) {
 			t.Errorf("detail carries the BMC password as %q: %q", form, r.Detail)
 		}
@@ -372,6 +374,49 @@ func TestRedfishFence_HonoursCancelledContext(t *testing.T) {
 	}
 }
 
+// TestRedfishFence_RefusedOffThenNotOffIsNotVerified: a refused ForceOff is
+// tolerated after an Off pre-read only as far as verification: a system that
+// then reads anything but Off is a failed fence, never a verified one.
+func TestRedfishFence_RefusedOffThenNotOffIsNotVerified(t *testing.T) {
+	shrinkVerifyKnobs(t, 300*time.Millisecond, 20*time.Millisecond)
+	b := newFakeBMC(t)
+	b.systems["node-1"] = "Off"
+	b.resetStatus = http.StatusConflict
+	b.stateAfterRefusal = "On"
+	r := Execute(context.Background(), b.host(b.config()))
+	if r.Success || r.ProvedOff() || r.LogResult() != LogPartial {
+		t.Fatalf("refused reset, then On = %+v; want a partial, unverified fence", r)
+	}
+	if !strings.Contains(r.Detail, "not confirmed") || !strings.Contains(r.Detail, `PowerState "On"`) {
+		t.Errorf("detail %q does not name the unconfirmed state", r.Detail)
+	}
+}
+
+// TestRedfishFence_DeletesOnlyItsOwnSession: the logout DELETEs only a member
+// of the BMC's Sessions collection. A login that names any other resource as
+// the session (a system, the collection itself, a path that climbs out) gets
+// no DELETE at all.
+func TestRedfishFence_DeletesOnlyItsOwnSession(t *testing.T) {
+	for _, ref := range []string{
+		"/redfish/v1/Systems/node-1",
+		"/redfish/v1/SessionService/Sessions",
+		"/redfish/v1/SessionService/Sessions/../../Systems/node-1",
+		"/redfish/v1/SessionService/SessionsX/1",
+	} {
+		shrinkVerifyKnobs(t, 2*time.Second, 20*time.Millisecond)
+		b := newFakeBMC(t)
+		b.sessionRef = ref
+		if r := Execute(context.Background(), b.host(b.config())); !r.Success {
+			t.Fatalf("%s: fence = %+v", ref, r)
+		}
+		for _, req := range b.requestLog() {
+			if strings.HasPrefix(req, "DELETE ") {
+				t.Errorf("session named %q: the fence sent %s", ref, req)
+			}
+		}
+	}
+}
+
 // TestRedfishFence_LogoutWithoutLocation: a BMC that answers the login with no
 // Location header names the session in its body; the fence logs out of it.
 func TestRedfishFence_LogoutWithoutLocation(t *testing.T) {
@@ -511,4 +556,11 @@ func selfSignedPEM(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+}
+
+// htmlJSON is s JSON-escaped the way encoding/json writes it by default:
+// `&`, `<`, `>` as \u0026, \u003c, \u003e.
+func htmlJSON(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b[1 : len(b)-1])
 }

@@ -93,7 +93,7 @@ func Execute(ctx context.Context, h HostConfig) Result {
 			return Result{
 				Method: "watchdog",
 				Detail: fmt.Sprintf("fence_strategy=watchdog is self-only and %q is not this host; "+
-					"a watchdog fence arms the CALLING node. Configure ipmi (or ssh) for a remotely "+
+					"a watchdog fence arms the CALLING node. Configure ipmi or redfish (or ssh) for a remotely "+
 					"fenceable host, or confirm manually with `lv host fence-confirm %s`", h.Name, h.Name),
 				Success: false,
 			}

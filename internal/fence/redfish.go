@@ -353,18 +353,27 @@ func (c *redfishClient) open(ctx context.Context) (string, error) {
 	if c.token == "" {
 		return "", errors.New("session login: the BMC returned no X-Auth-Token")
 	}
-	if loc := resp.Header.Get("Location"); loc != "" {
-		if p, err := c.resolve(loc); err == nil {
-			c.session = p
+	// The session to DELETE afterwards: from Location, else from the body's
+	// @odata.id. Only a member of the Sessions collection on this origin
+	// (resolve refuses other origins) — a BMC naming any other resource must
+	// not get a DELETE of it.
+	for _, ref := range []string{resp.Header.Get("Location"), session.ID} {
+		if ref == "" || c.session != "" {
+			continue
 		}
-	}
-	if c.session == "" && session.ID != "" {
-		// No Location: the session resource names itself.
-		if p, err := c.resolve(session.ID); err == nil {
+		if p, err := c.resolve(ref); err == nil && sessionMember(sessions, p) {
 			c.session = p
 		}
 	}
 	return systems, nil
+}
+
+// sessionMember reports whether p names one member of the Sessions
+// collection at coll: coll + "/" + a single non-empty segment.
+func sessionMember(coll, p string) bool {
+	rest, ok := strings.CutPrefix(p, strings.TrimSuffix(coll, "/")+"/")
+	rest = strings.TrimSuffix(rest, "/")
+	return ok && rest != "" && !strings.Contains(rest, "/") && rest != ".." && rest != "."
 }
 
 // logout deletes the session, if there is one. Best effort, but it runs even

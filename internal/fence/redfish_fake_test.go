@@ -53,6 +53,9 @@ type fakeBMC struct {
 	stateAfterRefusal string
 	// noLocation omits the session's Location header (its body still names it).
 	noLocation bool
+	// sessionRef, when set, is the Location and body @odata.id the login
+	// returns instead of the session's own path.
+	sessionRef string
 	// bodyID overrides the Id a system's body reports.
 	bodyID map[string]string
 }
@@ -161,12 +164,15 @@ func (b *fakeBMC) serve(w http.ResponseWriter, r *http.Request) {
 		b.mu.Unlock()
 		w.Header().Set("X-Auth-Token", tok)
 		b.mu.Lock()
-		noLoc := b.noLocation
+		noLoc, ref := b.noLocation, b.sessionRef
 		b.mu.Unlock()
-		if !noLoc {
-			w.Header().Set("Location", "/redfish/v1/SessionService/Sessions/"+tok)
+		if ref == "" {
+			ref = "/redfish/v1/SessionService/Sessions/" + tok
 		}
-		writeJSON(w, 201, map[string]string{"Id": tok, "@odata.id": "/redfish/v1/SessionService/Sessions/" + tok})
+		if !noLoc {
+			w.Header().Set("Location", ref)
+		}
+		writeJSON(w, 201, map[string]string{"Id": tok, "@odata.id": ref})
 		return
 	}
 	if !ok {

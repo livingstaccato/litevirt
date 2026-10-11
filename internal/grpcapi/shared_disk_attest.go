@@ -37,10 +37,12 @@ func (s *Server) AttestSharedDiskUnused(ctx context.Context, req *pb.AttestShare
 	if s.virt == nil {
 		return nil, status.Error(codes.Unavailable, "libvirt not wired on this host")
 	}
-	release := health.LockSharedDiskStarts()
-	defer release()
+	// The VM's lock first, then the start lock: the order startVMLocked takes
+	// them in (review m3).
 	unlock := s.lockVM(req.GetVmName())
 	defer unlock()
+	release := health.LockSharedDiskStarts()
+	defer release()
 	names, err := s.virt.ListDomains()
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable, "list the domains on %s: %v", s.hostName, err)
@@ -51,7 +53,8 @@ func (s *Server) AttestSharedDiskUnused(ctx context.Context, req *pb.AttestShare
 		if ierr != nil && lerr != nil {
 			return nil, status.Errorf(codes.Unavailable, "read the definition of %s on %s: %v", name, s.hostName, ierr)
 		}
-		if health.DomainXMLUsesPath(inactive, path) || health.DomainXMLUsesPath(live, path) {
+		if health.DomainXMLUsesPath(inactive, path) || health.DomainXMLUsesPath(live, path) ||
+			domainSourcesName(inactive, path) || domainSourcesName(live, path) {
 			return &pb.AttestSharedDiskUnusedResponse{Unused: false,
 				Detail: fmt.Sprintf("domain %s on %s uses %s", name, s.hostName, path)}, nil
 		}
@@ -90,4 +93,19 @@ func (s *Server) attestSharedDiskUnused(ctx context.Context, host string, vm str
 		return fmt.Errorf("%s still uses it: %s", host, resp.GetDetail())
 	}
 	return nil
+}
+
+// domainSourcesName reports whether a parsed disk source of xml (file or
+// device, backing chain included) is path once cleaned: the XML-escaped forms
+// a substring match misses (review m5). A device reached through another
+// alias (/dev/mapper against /dev/disk/by-path) is not recognised; litevirt
+// records canonical pool paths, and a network (RBD) disk has no absolute path
+// and so is never attested — its row needs fence-confirm.
+func domainSourcesName(xml, path string) bool {
+	for _, src := range domainDiskSources(xml) {
+		if filepath.Clean(src.path) == path {
+			return true
+		}
+	}
+	return false
 }

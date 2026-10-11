@@ -1242,9 +1242,9 @@ func TransferVMOwner(ctx context.Context, c *Client, name, hostName, state strin
 // migration commits its handoff through it too: its disks are on shared
 // storage, so only their host moves, together with the VM, in one transaction.
 //
-// released names disks whose rows move even though SharedRowKeepsOwner would
-// keep them: the host they name attested that no domain there uses them
-// (repair-owner, review c2b).
+// released names disks (ReleasedDiskKey) whose rows move even though
+// SharedRowKeepsOwner would keep them: the host they name attested that no
+// domain there uses them (repair-owner, review c2b).
 func TransferVMOwnerWithDisks(ctx context.Context, c *Client, name, hostName, state string, expectedEpoch int64, released ...string) error {
 	disks, err := GetVMDisks(ctx, c, name)
 	if err != nil {
@@ -1266,7 +1266,7 @@ func TransferVMOwnerWithDisks(ctx context.Context, c *Client, name, hostName, st
 		if d.HostName == hostName {
 			continue
 		}
-		if keep, _ := SharedRowKeepsOwner(ctx, c, d, source, hostName); keep && !slices.Contains(released, d.DiskName) {
+		if keep, _ := SharedRowKeepsOwner(ctx, c, d, source, hostName); keep && !slices.Contains(released, ReleasedDiskKey(d)) {
 			continue // its unproven owner keeps the row (review I1)
 		}
 		stmts = append(stmts, Statement{

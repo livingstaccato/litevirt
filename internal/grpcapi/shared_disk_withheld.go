@@ -161,7 +161,9 @@ func (s *Server) rejudgeSharedDisksForStart(ctx context.Context, vm *corrosion.V
 // definition about to start (its persistent XML when xml is "").
 func (s *Server) guardSharedDiskStart(ctx context.Context, vm, xml string) (func(), error) {
 	if xml == "" && s.virt != nil {
-		xml, _ = s.virt.DumpXMLInactive(vm)
+		if x, err := s.virt.DumpXMLInactive(vm); err == nil {
+			xml = x
+		}
 	}
 	return health.GuardSharedDiskStart(ctx, s.db, s.dataDir, s.hostName, vm, xml)
 }

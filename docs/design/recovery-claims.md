@@ -2386,6 +2386,15 @@ where it described the mechanism; this list records what changed and why.
       to the next attempt on the signature, from its reschedule site and its
       automated promotion alike; a host that started the VM refuses, and the
       value stands. An operator's promotion on another host does the same.
+    - **Rolling upgrade.** An older coordinator still stands down on an
+      operator's value (it has no operator branch), and an older node's moves
+      still re-point a withheld shared row (§ review I1); both heal once the
+      roll completes. A failed abandonment request falls through to the
+      "destination removed for good" check, so `lv host rm --dead` of a dead
+      operator host moves the claim on (review I-2). A failed `StartDomain`
+      withdraws the start fence only on libvirt's positive "not active" or
+      "no such domain" (review I-1); any other answer keeps it, and the VM
+      waits for an operator rather than risk a second start.
     - **Without claims** (the flag off, or the token not latched — what a
       rolling upgrade waits for, so an older coordinator that writes no claims
       is never on the other side of an enforced one), the operator's promotion

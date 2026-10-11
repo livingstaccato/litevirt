@@ -173,3 +173,8 @@ func WithheldBootDisk(withheld []WithheldSharedDisk) (WithheldSharedDisk, bool) 
 	}
 	return WithheldSharedDisk{}, false
 }
+
+// ReleasedDiskKey names a disk row as an attestation released it: its disk,
+// the host its row named and its path (review m4). A row changed since no
+// longer matches, so the release cannot outlive what was attested.
+func ReleasedDiskKey(d DiskRecord) string { return d.DiskName + "\x00" + d.HostName + "\x00" + d.Path }

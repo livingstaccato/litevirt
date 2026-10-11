@@ -57,3 +57,41 @@ func TestGuardSharedDiskStart(t *testing.T) {
 	}
 	release()
 }
+
+// Review m2: with a release on record, a start whose definition cannot be
+// read is refused, not run unchecked. Review m6: a release whose VM no longer
+// exists protects nothing and refuses nothing; the refusal names the record.
+//
+// Mutation "unreadable definition passes" — red on the first half; mutation
+// "a deleted VM's release still refuses" — red on the second.
+func TestGuardSharedDiskStart_UnreadableDefinitionAndDeletedVM(t *testing.T) {
+	db := testReconcilerDB(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	unlock := LockSharedDiskStarts()
+	if err := RecordSharedDiskRelease(dir, SharedDiskRelease{Path: "/nfs/gone-data1.qcow2", VM: "gone", Disk: "data1", Requester: "node-c"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := RecordSharedDiskRelease(dir, SharedDiskRelease{Path: "/nfs/db-data1.qcow2", VM: "db", Disk: "data1", Requester: "node-c"}); err != nil {
+		t.Fatal(err)
+	}
+	unlock()
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{Name: "db", HostName: "node-c", State: "running", Spec: `{}`}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := GuardSharedDiskStart(ctx, db, dir, "node-b", "x", ""); err == nil {
+		t.Error("a start whose definition cannot be read ran unchecked against the releases on record")
+	}
+	release, err := GuardSharedDiskStart(ctx, db, dir, "node-b", "x",
+		`<domain><devices><disk><source file="/nfs/gone-data1.qcow2"/></disk></devices></domain>`)
+	if err != nil {
+		t.Errorf("a release for a deleted VM refused a start: %v", err)
+	} else {
+		release()
+	}
+	_, err = GuardSharedDiskStart(ctx, db, dir, "node-b", "x",
+		`<domain><devices><disk><source file="/nfs/db-data1.qcow2"/></disk></devices></domain>`)
+	if err == nil || !strings.Contains(err.Error(), "shared-disk-released") {
+		t.Errorf("refusal = %v, want it to name the release record", err)
+	}
+}

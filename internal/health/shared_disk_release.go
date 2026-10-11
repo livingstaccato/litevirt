@@ -129,9 +129,23 @@ func GuardSharedDiskStart(ctx context.Context, db *corrosion.Client, dataDir, ho
 		sharedReleaseMu.RUnlock()
 		return nil, fmt.Errorf("read this host's released shared disks: %w", err)
 	}
+	if domXML == "" && len(rels) > 0 {
+		// The definition cannot be read (review m2): with releases on record
+		// it may use one, so the start is refused rather than run unchecked.
+		sharedReleaseMu.RUnlock()
+		return nil, fmt.Errorf("%s is not started on %s: its definition cannot be read to check it against the shared "+
+			"disks this host released", vm, host)
+	}
 	for _, rel := range rels {
 		if !DomainXMLUsesPath(domXML, rel.Path) {
 			continue
+		}
+		if db != nil {
+			// A release for a VM that no longer exists (review m6) protects
+			// nothing: that VM's row cannot name this host again.
+			if rec, gerr := corrosion.GetVM(ctx, db, rel.VM); gerr == nil && rec == nil {
+				continue
+			}
 		}
 		if rel.VM == vm && db != nil {
 			if disks, derr := corrosion.GetVMDisks(ctx, db, vm); derr == nil {
@@ -149,7 +163,8 @@ func GuardSharedDiskStart(ctx context.Context, db *corrosion.Client, dataDir, ho
 		sharedReleaseMu.RUnlock()
 		return nil, fmt.Errorf("%s is not started on %s: it uses the shared disk %s, which %s released to %s (lv doctor "+
 			"repair-owner of %s, %s) after attesting no domain here used it; it may be started here only once %s's row "+
-			"for that disk names %s again", vm, host, rel.Path, host, rel.Requester, rel.VM, rel.At, rel.VM, host)
+			"for that disk names %s again, or %s is deleted (the release is recorded in %s)", vm, host, rel.Path, host,
+			rel.Requester, rel.VM, rel.At, rel.VM, host, rel.VM, sharedReleaseFile(dataDir, rel.Path))
 	}
 	return sharedReleaseMu.RUnlock, nil
 }

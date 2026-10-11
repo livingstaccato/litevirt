@@ -136,7 +136,7 @@ func (s *Server) RepairVMOwner(ctx context.Context, req *pb.RepairVMOwnerRequest
 		if h, herr := corrosion.GetHost(ctx, s.db, d.HostName); herr == nil && h != nil && h.State == "active" {
 			aerr := s.attestSharedDiskUnused(ctx, d.HostName, req.GetName(), d)
 			if aerr == nil {
-				released = append(released, d.DiskName)
+				released = append(released, corrosion.ReleasedDiskKey(d))
 				continue
 			}
 			attest = fmt.Sprintf("; it is active, and %v", aerr)

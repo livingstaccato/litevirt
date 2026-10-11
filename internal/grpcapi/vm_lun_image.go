@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -85,21 +86,50 @@ var lunQemuImg = func(ctx context.Context, args ...string) ([]byte, error) {
 	return exec.CommandContext(ctx, "qemu-img", args...).CombinedOutput()
 }
 
-// qemuImgOptValue escapes a value for qemu's option syntax (a comma is
-// doubled).
-func qemuImgOptValue(v string) string { return strings.ReplaceAll(v, ",", ",,") }
+// qemuImgSource is the json: filename qemu-img opens image (format qcow2 or
+// raw) by: its format and its protocol named, so nothing is probed, and for
+// qcow2 "backing": null — JSON null, which disables the backing file entirely
+// (QAPI BlockdevRefOrNull, QEMU 2.10+) — so no backing chain is followed,
+// even if the file was swapped for one with a backing file after it was
+// judged standalone. Not --image-opts: its key=value syntax cannot spell
+// null, and backing=null there names a node called "null", which every
+// write then failed to find (lab 2, qemu-img 8.2.2). The path is JSON-encoded,
+// so a comma or a quote in it is only ever part of the filename.
+func qemuImgSource(image, format string) (string, error) {
+	type file struct {
+		Driver   string `json:"driver"`
+		Filename string `json:"filename"`
+	}
+	type src struct {
+		Driver  string    `json:"driver"`
+		File    file      `json:"file"`
+		Backing *struct{} `json:"backing"`
+	}
+	type rawSrc struct {
+		Driver string `json:"driver"`
+		File   file   `json:"file"`
+	}
+	var v any = rawSrc{Driver: format, File: file{Driver: "file", Filename: image}}
+	if format == "qcow2" {
+		v = src{Driver: format, File: file{Driver: "file", Filename: image}} // Backing nil: "backing":null
+	}
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return "", err
+	}
+	return "json:" + strings.TrimSuffix(buf.String(), "\n"), nil
+}
 
 // qemuImgWrite writes image (format qcow2 or raw) onto device in place (-n:
-// the device exists and is not created). The image is opened by explicit
-// options — its format named, and for qcow2 backing=null — so nothing is
-// probed and no backing chain is followed, even if the file was swapped for
-// one with a backing file after it was judged standalone.
+// the device exists and is not created), opened as qemuImgSource says.
 func qemuImgWrite(ctx context.Context, image, format, device string) error {
-	opts := "driver=" + format + ",file.driver=file,file.filename=" + qemuImgOptValue(image)
-	if format == "qcow2" {
-		opts += ",backing=null"
+	srcName, err := qemuImgSource(image, format)
+	if err != nil {
+		return fmt.Errorf("qemu-img source for %s: %w", image, err)
 	}
-	out, err := lunQemuImg(ctx, "convert", "-n", "-O", "raw", "--image-opts", opts, device)
+	out, err := lunQemuImg(ctx, "convert", "-n", "-O", "raw", srcName, device)
 	if err != nil {
 		return fmt.Errorf("qemu-img convert %s onto %s: %w: %s", image, device, err, out)
 	}
@@ -421,7 +451,10 @@ func (s *Server) preflightLUNs(ctx context.Context, spec *pb.VMSpec, cur *corros
 	}
 	// The release gate last, just before the first claim: every local
 	// refusal above writes nothing, so it records no use either (switch
-	// review I-1).
+	// review I-1). On a first use it waits with the registration and the
+	// durable hold already taken: a racing create meets "in flight" for that
+	// wait, retryable, and both are released on refusal (switch re-review
+	// N-2).
 	grant, err := s.iscsiLUNClaimGate(ctx)
 	if err != nil {
 		return ctx, noop, err

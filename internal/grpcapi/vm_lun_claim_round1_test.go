@@ -1,8 +1,12 @@
 package grpcapi
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -235,9 +239,13 @@ func TestCreateVM_ISCSI_NeedsAVoterMajority(t *testing.T) {
 
 // The image is written by qemu-img with both formats explicit, the image
 // opened with no backing chain at all (a file swapped in after the standalone
-// check cannot pull one in), in place on the device.
+// check cannot pull one in), in place on the device. The options are a json:
+// filename: "backing": null is JSON null (QAPI BlockdevRefOrNull, QEMU 2.10+),
+// which the key=value --image-opts syntax cannot spell — there backing=null
+// names a node called "null" and every write failed (lab 2, qemu-img 8.2.2).
 //
-// Mutation: drop backing=null (or -n) from the argv — this goes red.
+// Mutation: drop "backing":null (or -n), or go back to --image-opts
+// backing=null — this goes red.
 func TestQemuImgWrite_Argv(t *testing.T) {
 	var got []string
 	prev := lunQemuImg
@@ -250,16 +258,70 @@ func TestQemuImgWrite_Argv(t *testing.T) {
 		image, format string
 		want          []string
 	}{
-		{"/var/lib/litevirt/images/cirros.qcow2", "qcow2", []string{"convert", "-n", "-O", "raw", "--image-opts",
-			"driver=qcow2,file.driver=file,file.filename=/var/lib/litevirt/images/cirros.qcow2,backing=null", "/dev/lun"}},
-		{"/img/a,b.raw", "raw", []string{"convert", "-n", "-O", "raw", "--image-opts",
-			"driver=raw,file.driver=file,file.filename=/img/a,,b.raw", "/dev/lun"}},
+		{"/var/lib/litevirt/images/cirros.qcow2", "qcow2", []string{"convert", "-n", "-O", "raw",
+			`json:{"driver":"qcow2","file":{"driver":"file","filename":"/var/lib/litevirt/images/cirros.qcow2"},"backing":null}`,
+			"/dev/lun"}},
+		{`/img/a,b"<c>.raw`, "raw", []string{"convert", "-n", "-O", "raw",
+			`json:{"driver":"raw","file":{"driver":"file","filename":"/img/a,b\"<c>.raw"}}`, "/dev/lun"}},
 	} {
 		if err := qemuImgWrite(context.Background(), tc.image, tc.format, "/dev/lun"); err != nil {
 			t.Fatal(err)
 		}
 		if !slices.Equal(got, tc.want) {
 			t.Errorf("argv = %q\n want %q", got, tc.want)
+		}
+	}
+}
+
+// With the real qemu-img (skipped where there is none): a qcow2 base is
+// written onto the device, and an overlay of it is written with its backing
+// chain cut — the overlay's own (empty) contents, never the base's — so the
+// argv above does what it says on a real qemu-img.
+//
+// Mutation: drop "backing":null — the overlay write carries the base's bytes
+// and this goes red; go back to --image-opts backing=null — every write fails.
+func TestQemuImgWrite_RealQemuImgCutsTheBackingChain(t *testing.T) {
+	if _, err := exec.LookPath("qemu-img"); err != nil {
+		t.Skip("qemu-img not installed")
+	}
+	dir := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		if out, err := exec.Command("qemu-img", args...).CombinedOutput(); err != nil {
+			t.Fatalf("qemu-img %q: %v: %s", args, err, out)
+		}
+	}
+	raw := filepath.Join(dir, "base.raw")
+	if err := os.WriteFile(raw, bytes.Repeat([]byte{0xab}, 1<<20), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	base, overlay := filepath.Join(dir, "base,1.qcow2"), filepath.Join(dir, "over.qcow2")
+	run("convert", "-q", "-f", "raw", "-O", "qcow2", raw, base)
+	run("create", "-q", "-f", "qcow2", "-b", base, "-F", "qcow2", overlay)
+	dev := filepath.Join(dir, "dev.raw")
+	head := func() []byte {
+		t.Helper()
+		b, err := os.ReadFile(dev)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b[:4]
+	}
+	for _, tc := range []struct {
+		image string
+		want  []byte
+	}{
+		{base, []byte{0xab, 0xab, 0xab, 0xab}},
+		{overlay, []byte{0, 0, 0, 0}},
+	} {
+		if err := os.WriteFile(dev, bytes.Repeat([]byte{0x11}, 1<<20), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := qemuImgWrite(context.Background(), tc.image, "qcow2", dev); err != nil {
+			t.Fatalf("write %s: %v", tc.image, err)
+		}
+		if got := head(); !bytes.Equal(got, tc.want) {
+			t.Errorf("device after writing %s starts % x, want % x", filepath.Base(tc.image), got, tc.want)
 		}
 	}
 }

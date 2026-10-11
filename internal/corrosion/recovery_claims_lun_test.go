@@ -13,6 +13,20 @@ import (
 
 func lunKey(gen int64) ClaimKey { return LUNClaimKey("iscsi:iqn.x:store/lun0", gen) }
 
+// recordLUNUseForTest records iscsi_lun_claim used on each voter's replica, as
+// the first use's acknowledgement round leaves every voter: a voter takes LUN
+// keys only then (switch review M-3).
+func recordLUNUseForTest(t *testing.T, vs ...*claimTestVoter) {
+	t.Helper()
+	for _, v := range vs {
+		v.c.SetClusterPolicyGate(func() bool { return true })
+		if err := RecordReleaseFeatureUse(context.Background(), v.c, capabilities.ReleaseToken,
+			string(capabilities.FeatureISCSILUNClaim), v.name, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func lunValue(gen int64, claim, vm string) ClaimValue {
 	return ClaimValue{LUN: &LUNAllocation{LUN: "iscsi:iqn.x:store/lun0", Generation: gen, ClaimID: claim,
 		VMID: vm + "-uuid", VMName: vm, Disk: "root", Host: "a"}}
@@ -102,6 +116,7 @@ func TestLUNClaimValue_Digest(t *testing.T) {
 func TestClaimVoter_LUNKeys(t *testing.T) {
 	ctx := context.Background()
 	_, a, _, _ := threeVoters(t)
+	recordLUNUseForTest(t, a)
 	k := lunKey(0)
 	if res, err := a.c.ClaimPrepare(ctx, k, testBallot(1, "b"), 1); err != nil || !res.Promised {
 		t.Fatalf("prepare: %+v %v", res, err)
@@ -137,6 +152,7 @@ func TestClaimVoter_LUNKeys(t *testing.T) {
 func TestImportClaimsAndAdopt_CarriesLUNAllocations(t *testing.T) {
 	ctx := context.Background()
 	_, a, b, c := threeVoters(t)
+	recordLUNUseForTest(t, a, b, c)
 	k := lunKey(0)
 	v := lunValue(0, "c1", "web")
 	for _, x := range []*claimTestVoter{a, b} {
@@ -241,5 +257,43 @@ func TestLUNResolved_MovesForwardOnly(t *testing.T) {
 		if g, _ := GetLUNResolved(ctx, c, "iscsi:x/lun0"); g != step.want {
 			t.Fatalf("advance to %d: checkpoint %d, want %d", step.to, g, step.want)
 		}
+	}
+}
+
+// ── fix/iscsi-followups ─────────────────────────────────────────────────────
+
+// Switch review M-3: a voter takes a LUN key — a promise or an accept — only
+// once its own replica holds iscsi_lun_claim's used record, read in the same
+// transaction. A voter added after the first use, which has not replicated the
+// record yet, refuses (retryable), so it never holds LUN state while a rollback
+// below the release would leave it unquarantined. Workload keys are not
+// affected.
+//
+// Mutation: drop the used-record check from admit — the unrecorded stage goes
+// red.
+func TestClaimVoter_LUNKeysNeedTheUsedRecord(t *testing.T) {
+	ctx := context.Background()
+	_, a, _, _ := threeVoters(t)
+	k := lunKey(0)
+	res, err := a.c.ClaimPrepare(ctx, k, testBallot(1, "b"), 1)
+	if err != nil || res.Promised || res.Refusal != RefusalFeatureUnrecorded {
+		t.Fatalf("prepare at a LUN key with no used record: %+v %v, want refused %s", res, err, RefusalFeatureUnrecorded)
+	}
+	acc, err := a.c.ClaimAccept(ctx, k, testBallot(1, "b"), lunValue(0, "c1", "web"), 1, a.signer, unreachable)
+	if err != nil || acc.Accepted || acc.Refusal != RefusalFeatureUnrecorded {
+		t.Fatalf("accept at a LUN key with no used record: %+v %v, want refused %s", acc, err, RefusalFeatureUnrecorded)
+	}
+	if st, _, _ := a.c.ClaimState(ctx, k); st.Value != nil || !st.Promised.IsZero() {
+		t.Fatalf("a refused voter recorded state: %+v", st)
+	}
+	if res, err := a.c.ClaimPrepare(ctx, workloadKey(), testBallot(1, "b"), 1); err != nil || !res.Promised {
+		t.Fatalf("a workload key with no used record: %+v %v", res, err)
+	}
+	recordLUNUseForTest(t, a)
+	if res, err := a.c.ClaimPrepare(ctx, k, testBallot(1, "b"), 1); err != nil || !res.Promised {
+		t.Fatalf("prepare once the used record is here: %+v %v", res, err)
+	}
+	if acc, err := a.c.ClaimAccept(ctx, k, testBallot(1, "b"), lunValue(0, "c1", "web"), 1, a.signer, unreachable); err != nil || !acc.Accepted {
+		t.Fatalf("accept once the used record is here: %+v %v", acc, err)
 	}
 }

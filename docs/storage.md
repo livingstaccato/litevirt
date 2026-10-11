@@ -1333,6 +1333,11 @@ uuid), the disk and the host that ran the create. So:
 
 - two disks of one VM on the same LUN — through one pool or two pools that
   name the same target and LUN — are refused before anything is created;
+- a disk on an iscsi pool may not share its name with another disk of the VM
+  (`InvalidArgument`, before anything is created): a VM's disks are recorded
+  by name, and a LUN with no disk record of its own would be held by nothing
+  once the create is done. Two disks of one name on other storage are each
+  created on their own storage, as before;
 - two creates on two hosts at the same moment cannot both take a LUN: only one
   value is ever decided per allocation. The other is refused naming the VM —
   `Aborted` while that create is still running (retry once it has finished),
@@ -1489,7 +1494,14 @@ safer than the silent sharing older builds allowed. The first iscsi allocation
 after the upgrade records the feature as used, cluster-wide, before any LUN
 claim exists; from then on a host rolled back below the release is
 WAL-quarantined rather than allocating LUNs without claims (see
-[upgrades.md](upgrades.md)).
+[upgrades.md](upgrades.md)). That first allocation waits up to 30 seconds for
+every host to acknowledge the record, and meanwhile another create of the same
+LUN or VM is refused as in flight (`Aborted`; retry once the first has
+finished). A voter whose replica does not hold the record yet — one added
+since, not caught up — refuses every LUN allocation
+(`recovery_claim_feature_unrecorded`) until it does, so it never holds LUN
+state a rollback below the release could not see; enough such voters make an
+allocation `Unavailable` for as long as replication takes.
 
 A compose file that would put two instances of a VM on one iscsi volume or pool
 at once — `replicas` above 1, or an `update: strategy` of `blue-green` or

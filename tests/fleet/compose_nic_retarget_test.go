@@ -103,9 +103,7 @@ func TestFleet_OwnerPassFinishesANICMoveRecordedOnAnotherNode(t *testing.T) {
 	if err := writeEmptyImageFile(owner.Server.ImagePathForTests("test")); err != nil {
 		t.Fatalf("stage image: %v", err)
 	}
-	if err := owner.DB.Execute(ctx,
-		`INSERT INTO images (name, format, source_url, checksum, size_bytes, created_at, updated_at)
-		 VALUES ('test', 'qcow2', 'file:///dev/null', 'deadbeef', 1024, datetime('now'), datetime('now'))`); err != nil {
+	if err := corrosion.InsertImage(ctx, owner.DB, corrosion.ImageRecord{Name: "test", Format: "qcow2", SourceURL: "file:///dev/null", Checksum: "deadbeef", SizeBytes: 1024}); err != nil {
 		t.Fatalf("seed image: %v", err)
 	}
 	if _, err := c.SelfClient(owner).CreateNetwork(ctx, &pb.CreateNetworkRequest{

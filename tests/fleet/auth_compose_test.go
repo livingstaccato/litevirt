@@ -60,9 +60,7 @@ func TestFleet_AuthAndComposeDeploy(t *testing.T) {
 	node := c.Nodes[0]
 
 	// Seed the image so CreateVM doesn't fail on missing-image.
-	if err := node.DB.Execute(ctx,
-		`INSERT INTO images (name, format, source_url, checksum, size_bytes, created_at, updated_at)
-		 VALUES ('test', 'qcow2', 'file:///dev/null', 'deadbeef', 1024, datetime('now'), datetime('now'))`); err != nil {
+	if err := corrosion.InsertImage(ctx, node.DB, corrosion.ImageRecord{Name: "test", Format: "qcow2", SourceURL: "file:///dev/null", Checksum: "deadbeef", SizeBytes: 1024}); err != nil {
 		t.Fatalf("seed image: %v", err)
 	}
 

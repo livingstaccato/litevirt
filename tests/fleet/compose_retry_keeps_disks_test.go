@@ -30,7 +30,7 @@ func breakVM(t *testing.T, ctx context.Context, node *Node, vm string, undefine 
 			t.Fatalf("undefine %s: %v", vm, err)
 		}
 	}
-	if err := node.DB.Execute(ctx, `UPDATE vms SET state = 'error', updated_at = ? WHERE name = ?`, node.DB.NowTS(), vm); err != nil {
+	if err := localExec(ctx, node.DB, `UPDATE vms SET state = 'error', updated_at = ? WHERE name = ?`, node.DB.NowTS(), vm); err != nil {
 		t.Fatalf("mark %s error: %v", vm, err)
 	}
 }
@@ -109,7 +109,7 @@ func TestFleet_ComposeRetryOfAVMWithNothingMadeCreatesIt(t *testing.T) {
 	for _, path := range before.disks {
 		_ = os.Remove(path)
 	}
-	if err := node.DB.Execute(ctx, `UPDATE vm_disks SET deleted_at = ?, updated_at = ? WHERE vm_name = 'db'`, "2026-01-01T00:00:00Z", node.DB.NowTS()); err != nil {
+	if err := localExec(ctx, node.DB, `UPDATE vm_disks SET deleted_at = ?, updated_at = ? WHERE vm_name = 'db'`, "2026-01-01T00:00:00Z", node.DB.NowTS()); err != nil {
 		t.Fatalf("drop db's disk rows: %v", err)
 	}
 

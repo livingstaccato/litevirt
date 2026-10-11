@@ -63,7 +63,7 @@ func TestFleet_ComposeTeardownReportsFailedNetworkDeprovision(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed stack network: %v", err)
 	}
-	if err := node.DB.Execute(ctx, `CREATE TRIGGER test_hb_back_undeletable BEFORE UPDATE OF deleted_at ON networks
+	if err := localExec(ctx, node.DB, `CREATE TRIGGER test_hb_back_undeletable BEFORE UPDATE OF deleted_at ON networks
 		WHEN OLD.name = 'hb_back' AND NEW.deleted_at IS NOT NULL
 		BEGIN SELECT RAISE(ABORT, 'injected: network row locked'); END`); err != nil {
 		t.Fatalf("install trigger: %v", err)
@@ -92,11 +92,11 @@ func TestFleet_ComposeTeardownReportsFailedContainerListing(t *testing.T) {
 
 	// The containers table is unreadable, so the stack's containers cannot be
 	// enumerated — let alone deleted.
-	if err := node.DB.Execute(ctx, `ALTER TABLE containers RENAME TO containers_hidden_by_test`); err != nil {
+	if err := localExec(ctx, node.DB, `ALTER TABLE containers RENAME TO containers_hidden_by_test`); err != nil {
 		t.Fatalf("hide containers table: %v", err)
 	}
 	t.Cleanup(func() {
-		_ = node.DB.Execute(context.Background(), `ALTER TABLE containers_hidden_by_test RENAME TO containers`)
+		_ = localExec(context.Background(), node.DB, `ALTER TABLE containers_hidden_by_test RENAME TO containers`)
 	})
 
 	got := deleteStackCollect(t, ctx, client, "hb")

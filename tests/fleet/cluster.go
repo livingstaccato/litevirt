@@ -199,6 +199,11 @@ type Cluster struct {
 	// ClaimFault does (claim_faults.go).
 	claimScriptMu sync.Mutex
 	claimScript   ClaimScript
+	// shapesChecked records that Stop ran checkReplicatedShapes, and
+	// unregisteredAllowed is the reason a scenario gave for turning it off
+	// (replicated_shapes.go).
+	shapesChecked       bool
+	unregisteredAllowed string
 }
 
 // Node wraps one daemon — its DB, gRPC server, replicator, and
@@ -534,6 +539,8 @@ func New(t *testing.T, opts Options) *Cluster {
 
 // Stop tears down every daemon in the fleet. Idempotent.
 func (c *Cluster) Stop() {
+	// Before anything closes: the logged statements are read from each DB.
+	c.checkReplicatedShapes()
 	if c.cancel != nil {
 		c.cancel()
 	}
@@ -1201,14 +1208,17 @@ func NewClusterWithNetBoxNamed(t *testing.T, nodes int, nb *NetBoxFake, namePref
 //
 // The NAME is the one thing still set by hand. The heal deliberately leaves it
 // empty (nothing in litevirt takes a cluster name), and scenarios that assert
-// which NetBox cluster object the mirror wrote into need a stable one.
+// which NetBox cluster object the mirror wrote into need a stable one. It is
+// written locally, on each node as it is wired: no production statement sets
+// it, so a replicated write of it would be refused by every peer and stall
+// this node's replication behind it (replicated_shapes.go).
 func (c *Cluster) wireNetBox(n *Node) {
 	c.t.Helper()
 
 	if err := corrosion.EnsureClusterRecord(context.Background(), n.DB, n.PKIDir); err != nil {
 		c.t.Fatalf("derive cluster record for %s: %v", n.Name, err)
 	}
-	rows, err := n.DB.ExecuteRows(context.Background(),
+	rows, err := localExecRows(context.Background(), n.DB,
 		`UPDATE cluster SET name = ?, domain = ?, updated_at = ? WHERE id = 'default'`,
 		"fleet", "fleet.local", n.DB.NowTS())
 	if err != nil {
@@ -1275,14 +1285,16 @@ func (c *Cluster) wireNetBox(n *Node) {
 // is a SHA-256 of that column, so ANY different string is a different cluster
 // identity. Re-minting the PKI would additionally invalidate every node
 // certificate the harness dials with — a second, unrelated failure that would
-// stop these scenarios reaching the binding logic at all. Every node is written
-// so the fleet stays uniform, exactly as a replicated row would be.
+// stop these scenarios reaching the binding logic at all. Every node is written,
+// locally, so the fleet stays uniform, exactly as a replicated row would be: no
+// production statement rewrites the column, so a replicated write would be
+// refused by every peer (replicated_shapes.go).
 func (c *Cluster) MoveClusterFingerprint() {
 	c.t.Helper()
 	replacement := fmt.Sprintf("-----BEGIN CERTIFICATE-----\nreplacement-ca-%d\n-----END CERTIFICATE-----\n",
 		time.Now().UnixNano())
 	for _, n := range c.Nodes {
-		if err := n.DB.Execute(context.Background(),
+		if err := localExec(context.Background(), n.DB,
 			`UPDATE cluster SET ca_cert = ?, updated_at = ? WHERE id = 'default'`,
 			replacement, n.DB.NowWall()); err != nil {
 			c.t.Fatalf("move the cluster fingerprint on %s: %v", n.Name, err)
@@ -1307,13 +1319,13 @@ func (c *Cluster) MoveClusterFingerprint() {
 // scenario reaches the window between a started domain and its durable row.
 func (n *Node) FailVMRowWrites(t *testing.T) func() {
 	t.Helper()
-	if err := n.DB.Execute(context.Background(),
+	if err := localExec(context.Background(), n.DB,
 		`CREATE TRIGGER test_fail_vm_insert BEFORE INSERT ON vms
 		 BEGIN SELECT RAISE(ABORT, 'induced vm persist failure'); END`); err != nil {
 		t.Fatalf("install vm-insert failure trigger on %s: %v", n.Name, err)
 	}
 	drop := func() {
-		if err := n.DB.Execute(context.Background(),
+		if err := localExec(context.Background(), n.DB,
 			`DROP TRIGGER IF EXISTS test_fail_vm_insert`); err != nil {
 			t.Fatalf("drop vm-insert failure trigger on %s: %v", n.Name, err)
 		}
@@ -1329,13 +1341,13 @@ func (n *Node) FailVMRowWrites(t *testing.T) func() {
 // already on the ground.
 func (n *Node) FailNICRowWrites(t *testing.T) func() {
 	t.Helper()
-	if err := n.DB.Execute(context.Background(),
+	if err := localExec(context.Background(), n.DB,
 		`CREATE TRIGGER test_fail_legacy_nic_insert BEFORE INSERT ON vm_interfaces
 		 BEGIN SELECT RAISE(ABORT, 'induced legacy interface persist failure'); END`); err != nil {
 		t.Fatalf("install legacy-interface-insert failure trigger on %s: %v", n.Name, err)
 	}
 	drop := func() {
-		if err := n.DB.Execute(context.Background(),
+		if err := localExec(context.Background(), n.DB,
 			`DROP TRIGGER IF EXISTS test_fail_legacy_nic_insert`); err != nil {
 			t.Fatalf("drop legacy-interface-insert failure trigger on %s: %v", n.Name, err)
 		}
@@ -1351,14 +1363,14 @@ func (n *Node) FailNICRowWrites(t *testing.T) func() {
 // must NOT give the claimed address away.
 func (n *Node) FailNICRowDelete(t *testing.T) func() {
 	t.Helper()
-	if err := n.DB.Execute(context.Background(),
+	if err := localExec(context.Background(), n.DB,
 		`CREATE TRIGGER test_fail_nic_tombstone BEFORE UPDATE ON vm_nics
 		 WHEN NEW.deleted_at IS NOT NULL AND OLD.deleted_at IS NULL
 		 BEGIN SELECT RAISE(ABORT, 'induced nic tombstone failure'); END`); err != nil {
 		t.Fatalf("install nic-tombstone failure trigger on %s: %v", n.Name, err)
 	}
 	drop := func() {
-		if err := n.DB.Execute(context.Background(),
+		if err := localExec(context.Background(), n.DB,
 			`DROP TRIGGER IF EXISTS test_fail_nic_tombstone`); err != nil {
 			t.Fatalf("drop nic-tombstone failure trigger on %s: %v", n.Name, err)
 		}
@@ -1373,14 +1385,14 @@ func (n *Node) FailNICRowDelete(t *testing.T) func() {
 // failed while the remote IPAM object still exists.
 func (n *Node) FailLeaseTombstones(t *testing.T) func() {
 	t.Helper()
-	if err := n.DB.Execute(context.Background(),
+	if err := localExec(context.Background(), n.DB,
 		`CREATE TRIGGER test_fail_lease_tombstone BEFORE UPDATE ON ip_allocations
 		 WHEN NEW.deleted_at IS NOT NULL AND OLD.deleted_at IS NULL
 		 BEGIN SELECT RAISE(ABORT, 'induced tombstone failure'); END`); err != nil {
 		t.Fatalf("install lease-tombstone failure trigger on %s: %v", n.Name, err)
 	}
 	drop := func() {
-		if err := n.DB.Execute(context.Background(),
+		if err := localExec(context.Background(), n.DB,
 			`DROP TRIGGER IF EXISTS test_fail_lease_tombstone`); err != nil {
 			t.Fatalf("drop lease-tombstone failure trigger on %s: %v", n.Name, err)
 		}

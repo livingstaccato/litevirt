@@ -148,7 +148,7 @@ func TestFleet_DeleteVMStopsAPausedDomainBeforeUndefine(t *testing.T) {
 	deployOneVM(t, ctx, node, client)
 
 	node.Virt.SetState("hb-1", libvirtfake.StatePaused)
-	if err := node.DB.Execute(ctx, `UPDATE vms SET state = 'paused' WHERE name = 'hb-1'`); err != nil {
+	if err := localExec(ctx, node.DB, `UPDATE vms SET state = 'paused' WHERE name = 'hb-1'`); err != nil {
 		t.Fatalf("record hb-1 paused: %v", err)
 	}
 	before := len(node.Virt.EventLog())

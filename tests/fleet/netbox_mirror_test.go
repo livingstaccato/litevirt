@@ -352,7 +352,7 @@ func seedOldMirrorQueueItems(t *testing.T, n *Node, count int) {
 			t.Fatalf("enqueue mirror item %d on %s: %v", i, n.Name, err)
 		}
 	}
-	if err := n.DB.Execute(ctx,
+	if err := localExec(ctx, n.DB,
 		`UPDATE netbox_sync_queue SET created_at = '2000-01-01T00:00:00Z' WHERE kind = ?`,
 		netboxsync.QueueKind); err != nil {
 		t.Fatalf("backdate mirror queue items on %s: %v", n.Name, err)

@@ -127,7 +127,7 @@ func TestFleet_PeersRejectTheRetiredKeyAfterRotation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SignRow with the retired key: %v", err)
 	}
-	if err := a.DB.Execute(ctx,
+	if err := localExec(ctx, a.DB,
 		`INSERT INTO audit_log (id, timestamp, username, host_name, action, target, detail, result,
 		                        prev_hash, content_hash, key_id, signature, seq)
 		 VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?)`,
@@ -192,7 +192,7 @@ func TestFleet_PeerCatchesARewriteSealedByTheRotationHead(t *testing.T) {
 
 	// Rewrite the tail row and re-sign it with the retired key — a complete,
 	// internally consistent forgery.
-	if err := a.DB.Execute(ctx,
+	if err := localExec(ctx, a.DB,
 		`UPDATE audit_log SET target = 'bob', username = 'system' WHERE id = 'a2'`); err != nil {
 		t.Fatalf("tamper: %v", err)
 	}
@@ -214,7 +214,7 @@ func TestFleet_PeerCatchesARewriteSealedByTheRotationHead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SignRow with the retired key: %v", err)
 	}
-	if err := a.DB.Execute(ctx,
+	if err := localExec(ctx, a.DB,
 		`UPDATE audit_log SET content_hash = ?, signature = ?, key_id = ? WHERE id = 'a2'`,
 		rec.ContentHash, sig, oldKR.KeyID()); err != nil {
 		t.Fatalf("re-sign a2: %v", err)

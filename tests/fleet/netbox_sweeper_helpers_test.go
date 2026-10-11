@@ -90,7 +90,7 @@ func mustSweep(t *testing.T, n *Node) {
 // insertLiveLease writes the ip_allocations row a live claim leaves behind.
 func insertLiveLease(t *testing.T, n *Node, network, ip, mac string) {
 	t.Helper()
-	if err := n.DB.Execute(context.Background(),
+	if err := localExec(context.Background(), n.DB,
 		`INSERT INTO ip_allocations (network, ip, mac, vm_name, owner_kind, owner_host, allocated_at, updated_at)
 		 VALUES (?, ?, ?, ?, 'vm', '', ?, ?)`,
 		network, ip, mac, "holder", n.DB.NowWall(), n.DB.NowTS()); err != nil {
@@ -117,7 +117,7 @@ func pendingQueueItems(t *testing.T, n *Node, kind string) int {
 func stealNetBoxLease(t *testing.T, n *Node, holder string) {
 	t.Helper()
 	expires := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
-	if err := n.DB.Execute(context.Background(),
+	if err := localExec(context.Background(), n.DB,
 		`INSERT INTO leader_election (key, holder, expires_at, updated_at)
 		 VALUES ('netbox', ?, ?, ?)
 		 ON CONFLICT(key) DO UPDATE SET holder = excluded.holder,

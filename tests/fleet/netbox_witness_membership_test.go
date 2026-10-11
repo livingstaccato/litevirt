@@ -58,7 +58,7 @@ func TestFleetSweepDoesNotFreeAnAddressAStaleWitnessRoleHides(t *testing.T) {
 	ctx := context.Background()
 
 	for _, n := range c.Nodes {
-		if err := n.DB.Execute(ctx,
+		if err := localExec(ctx, n.DB,
 			"UPDATE hosts SET role = 'witness' WHERE name = ?", holder.Name); err != nil {
 			t.Fatal(err)
 		}
@@ -94,13 +94,13 @@ func TestFleetSweepDoesNotFreeAnAddressOnlyAWitnessCanName(t *testing.T) {
 	ctx := context.Background()
 
 	for _, n := range c.Nodes {
-		if err := n.DB.Execute(ctx,
+		if err := localExec(ctx, n.DB,
 			"UPDATE hosts SET role = 'witness' WHERE name = ?", witness.Name); err != nil {
 			t.Fatal(err)
 		}
 	}
 	holder.Virt.DefineStoppedDomain("ghost", orphanMAC)
-	if err := sweeper.DB.Execute(ctx,
+	if err := localExec(ctx, sweeper.DB,
 		"DELETE FROM hosts WHERE name = ?", holder.Name); err != nil {
 		t.Fatal(err)
 	}
@@ -136,13 +136,13 @@ func TestFleetSweepDoesNotFreeAnAddressOnlyAFENCEDWitnessCanName(t *testing.T) {
 	ctx := context.Background()
 
 	for _, n := range c.Nodes {
-		if err := n.DB.Execute(ctx,
+		if err := localExec(ctx, n.DB,
 			"UPDATE hosts SET role = 'witness' WHERE name = ?", witness.Name); err != nil {
 			t.Fatal(err)
 		}
 	}
 	holder.Virt.DefineStoppedDomain("ghost", orphanMAC)
-	if err := sweeper.DB.Execute(ctx,
+	if err := localExec(ctx, sweeper.DB,
 		"DELETE FROM hosts WHERE name = ?", holder.Name); err != nil {
 		t.Fatal(err)
 	}
@@ -201,12 +201,12 @@ func TestFleetBindDoesNotHandOutAnAddressOnlyAWitnessHoldsTheRowsFor(t *testing.
 		"DELETE FROM vm_interfaces WHERE vm_name = ?",
 		"DELETE FROM vms WHERE name = ?",
 	} {
-		if err := holder.DB.Execute(ctx, q, "incumbent"); err != nil {
+		if err := localExec(ctx, holder.DB, q, "incumbent"); err != nil {
 			t.Fatal(err)
 		}
 	}
 	for _, n := range c.Nodes {
-		if err := n.DB.Execute(ctx,
+		if err := localExec(ctx, n.DB,
 			"UPDATE hosts SET role = 'witness' WHERE name = ?", witness.Name); err != nil {
 			t.Fatal(err)
 		}
@@ -242,7 +242,7 @@ func TestFleetBindGoesLiveWhenTheWitnessAgrees(t *testing.T) {
 	ctx := context.Background()
 
 	for _, n := range c.Nodes {
-		if err := n.DB.Execute(ctx,
+		if err := localExec(ctx, n.DB,
 			"UPDATE hosts SET role = 'witness' WHERE name = ?", witness.Name); err != nil {
 			t.Fatal(err)
 		}

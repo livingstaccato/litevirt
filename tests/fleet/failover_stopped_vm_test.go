@@ -686,7 +686,7 @@ func TestFleet_StoppedVMReKeyNeedsAProofGradeFenceUnderTheSharedStorageFence(t *
 	sharedDiskVM(t, c, a, "sv-fence", victim.Name, "stopped", "operator-stop")
 	nowRFC := time.Now().UTC().Format(time.RFC3339)
 	for _, o := range []*Node{a, b} {
-		if err := a.DB.Execute(ctx,
+		if err := localExec(ctx, a.DB,
 			`INSERT OR REPLACE INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
 			 VALUES (?, ?, 'suspect', 5, NULL, ?)`, o.Name, victim.Name, nowRFC); err != nil {
 			t.Fatal(err)

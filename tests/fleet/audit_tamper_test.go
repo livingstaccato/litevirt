@@ -115,7 +115,7 @@ func TestFleet_TamperedAuditRowIsCaughtByEveryPeer(t *testing.T) {
 	// node-0 is compromised. Someone rewrites what an action recorded AND
 	// recomputes the hash chain, which is free — HashAuditRow is unkeyed. That
 	// alone used to be enough to pass verification everywhere.
-	if err := a.DB.Execute(ctx,
+	if err := localExec(ctx, a.DB,
 		`UPDATE audit_log SET target = 'bob', detail = 'routine' WHERE id = 'a3'`); err != nil {
 		t.Fatalf("tamper: %v", err)
 	}
@@ -204,7 +204,7 @@ func TestFleet_APeerRejectsARowSignedWithAKeyItCannotTrust(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SignRow: %v", err)
 	}
-	if err := a.DB.Execute(ctx,
+	if err := localExec(ctx, a.DB,
 		`INSERT INTO audit_log (id, timestamp, username, host_name, action, target, detail, result,
 		                        prev_hash, content_hash, key_id, signature, seq)
 		 VALUES (?, ?, ?, ?, ?, ?, '', ?, '', ?, ?, ?, ?)`,

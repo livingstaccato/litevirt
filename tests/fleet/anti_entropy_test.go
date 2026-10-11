@@ -113,7 +113,7 @@ func TestFleet_AntiEntropyLWWConflict(t *testing.T) {
 	const hlcNew = "2000000000000-0000-nb"
 
 	seed := func(n *Node, name, addr, updatedAt string) {
-		if err := n.DB.Execute(ctx,
+		if err := localExec(ctx, n.DB,
 			`INSERT OR REPLACE INTO hosts (name, address, ssh_user, cert_serial, created_at, updated_at)
 			 VALUES (?, ?, ?, ?, ?, ?)`,
 			name, addr, "root", "s", "2020-01-01T00:00:00Z", updatedAt); err != nil {

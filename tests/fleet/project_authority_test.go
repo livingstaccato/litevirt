@@ -92,7 +92,7 @@ func latchProjectAuthority(t *testing.T, c *Cluster, gates map[string]*health.Ch
 func roomyHosts(t *testing.T, c *Cluster) {
 	t.Helper()
 	for _, n := range c.Nodes {
-		setHostCapacity(t, c, n.Name, 64, 65536, nil)
+		setHostCapacity(t, c, n.Name, 64, 65536)
 	}
 }
 

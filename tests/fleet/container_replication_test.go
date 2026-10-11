@@ -352,7 +352,7 @@ func TestContainerReplication_FencedHostsContainerComesUpOnTheReplicaHost(t *tes
 	}
 	nowRFC := time.Now().UTC().Format(time.RFC3339)
 	for _, o := range []*Node{coordNode, replicaHost} {
-		if err := coordNode.DB.Execute(ctx,
+		if err := localExec(ctx, coordNode.DB,
 			`INSERT OR REPLACE INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
 			 VALUES (?, ?, 'suspect', 5, NULL, ?)`, o.Name, victim.Name, nowRFC); err != nil {
 			t.Fatal(err)

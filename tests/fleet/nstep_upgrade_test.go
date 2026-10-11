@@ -106,7 +106,7 @@ func TestFleet_NStepRollingUpgrade(t *testing.T) {
 	}
 	before := seenCount()
 	receiver.DB.SetEffectiveDBSchemaForTest(cur)
-	if err := receiver.DB.Execute(ctx, "DROP TABLE service_endpoints"); err != nil {
+	if err := localExec(ctx, receiver.DB, "DROP TABLE service_endpoints"); err != nil {
 		t.Fatalf("(D) drop table: %v", err)
 	}
 	err = push(4, "nstep-missing", cur)

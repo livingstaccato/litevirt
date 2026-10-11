@@ -363,7 +363,7 @@ func latchedRealCutoverCluster(t *testing.T, nodes int) (*Cluster, *Node) {
 	gates := gateAll(t, c)
 	owner := c.Nodes[0]
 	for _, n := range c.Nodes {
-		setHostCapacity(t, c, n.Name, 64, 65536, nil)
+		setHostCapacity(t, c, n.Name, 64, 65536)
 	}
 	for _, name := range []string{"app", "app-next"} {
 		if _, err := c.SelfClient(owner).CreateVM(context.Background(), &pb.CreateVMRequest{

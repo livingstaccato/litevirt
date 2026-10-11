@@ -322,7 +322,7 @@ func mustForceRemoveHost(t *testing.T, n *Node, name string) {
 // — only the timestamp differs.
 func fenceConfirmAged(t *testing.T, n *Node, name string, age time.Duration) {
 	t.Helper()
-	if err := n.DB.Execute(context.Background(),
+	if err := localExec(context.Background(), n.DB,
 		`INSERT INTO fencing_log (id, host_name, method, result, timestamp, detail)
 		 VALUES (?, ?, 'manual', 'manual-confirmed', ?, ?)`,
 		"fence-confirm-"+name, name,

@@ -28,7 +28,7 @@ func TestFleet_ComposeContainerIsChargedMemoryOnly(t *testing.T) {
 	ctx := context.Background()
 	// 1 vCPU / 4096 MiB → 3 allocatable vCPU and 3072 allocatable MiB under the
 	// default policy: cpu 8 fits only uncharged, 3000 MiB only without +128.
-	if err := node.DB.Execute(ctx, `UPDATE hosts SET cpu_total = 1, mem_total = 4096 WHERE name = ?`, node.Name); err != nil {
+	if err := localExec(ctx, node.DB, `UPDATE hosts SET cpu_total = 1, mem_total = 4096 WHERE name = ?`, node.Name); err != nil {
 		t.Fatalf("size host: %v", err)
 	}
 	deployClean(t, ctx, client, composeBigContainer)

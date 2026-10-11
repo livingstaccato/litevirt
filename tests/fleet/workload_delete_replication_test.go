@@ -217,7 +217,7 @@ func TestFleet_AntiEntropyMustNotResurrectAtEqualAuthority(t *testing.T) {
 			// SAME incarnation must now lose to its tombstone.
 			name: "ownership-epoch mint of the same incarnation: still terminal",
 			diverged: func(t *testing.T, ctx context.Context, db *corrosion.Client) {
-				if err := db.Execute(ctx,
+				if err := localExec(ctx, db,
 					`UPDATE containers SET state = 'pending', relocate_token = ?, updated_at = ?
 					 WHERE host_name = ? AND name = ?`,
 					"tok1", db.NowTS(), "wl", "ct1"); err != nil {
@@ -371,7 +371,7 @@ func TestFleet_DeleteVsTransferConvergesToTheTombstone(t *testing.T) {
 		if err := corrosion.DeleteContainer(ctx, deleter.DB, "wl", "ct1"); err != nil {
 			t.Fatalf("DeleteContainer: %v", err)
 		}
-		if err := transferer.DB.Execute(ctx,
+		if err := localExec(ctx, transferer.DB,
 			`UPDATE containers SET state = 'pending', relocate_token = ?, updated_at = ?
 			 WHERE host_name = ? AND name = ?`,
 			"tok1", transferer.DB.NowTS(), "wl", "ct1"); err != nil {

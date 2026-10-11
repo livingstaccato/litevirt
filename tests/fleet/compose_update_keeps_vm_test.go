@@ -299,9 +299,7 @@ func TestFleet_ComposeRestartClassChangeRestartsTheSameVM(t *testing.T) {
 // An image change needs a new root disk: the plan says the disks are replaced.
 func TestFleet_ComposeImageChangeIsPlannedAsADiskReplacingRecreate(t *testing.T) {
 	ctx, node, client, _ := setupUpdateVM(t)
-	if err := node.DB.Execute(ctx,
-		`INSERT INTO images (name, format, source_url, checksum, size_bytes, created_at, updated_at)
-		 VALUES ('test2', 'qcow2', 'file:///dev/null', 'deadbeef', 1024, datetime('now'), datetime('now'))`); err != nil {
+	if err := corrosion.InsertImage(ctx, node.DB, corrosion.ImageRecord{Name: "test2", Format: "qcow2", SourceURL: "file:///dev/null", Checksum: "deadbeef", SizeBytes: 1024}); err != nil {
 		t.Fatalf("seed image: %v", err)
 	}
 	if err := writeEmptyImageFile(node.Server.ImagePathForTests("test2")); err != nil {

@@ -77,7 +77,7 @@ func TestConvertToTemplateStillWorksOnAnUnboundNetwork(t *testing.T) {
 	n.Server.SetBridgeEnsure(func(string) error { return nil })
 	seedClusterRow(t, c)
 	seedContainerNetwork(t, c)
-	setHostCapacity(t, c, n.Name, 64, 65536, nil)
+	setHostCapacity(t, c, n.Name, 64, 65536)
 
 	mustCreateVMWithDiskOnNetwork(t, c, n, "src", ctNetName)
 	mustStopVM(t, c, n, "src")

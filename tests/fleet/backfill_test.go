@@ -85,7 +85,7 @@ func TestFleet_BindSGsPropagation(t *testing.T) {
 	}
 
 	// Seed a matching security_groups row so the bind validates.
-	if err := a.DB.Execute(ctx,
+	if err := localExec(ctx, a.DB,
 		`INSERT INTO security_groups (id, name, created_at, updated_at)
 		 VALUES ('sg-web', 'web', datetime('now'), datetime('now'))`); err != nil {
 		t.Fatalf("seed SG: %v", err)

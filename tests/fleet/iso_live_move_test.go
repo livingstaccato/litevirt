@@ -27,7 +27,7 @@ func isoLiveMoveCluster(t *testing.T) (*Cluster, *Node, *Node, map[string]string
 	c := New(t, Options{Nodes: 2, SharedCRDT: true})
 	src, dst := c.Nodes[0], c.Nodes[1]
 	for _, n := range c.Nodes {
-		setHostCapacity(t, c, n.Name, 64, 65536, nil)
+		setHostCapacity(t, c, n.Name, 64, 65536)
 	}
 	files := map[string]string{}
 	for _, n := range c.Nodes {
@@ -170,7 +170,7 @@ func TestFleet_ALiveMoveToAnOlderTargetCarriesTheLink(t *testing.T) {
 	defer c.Stop()
 	src, dst := c.Nodes[0], c.Nodes[1]
 	for _, n := range c.Nodes {
-		setHostCapacity(t, c, n.Name, 64, 65536, nil)
+		setHostCapacity(t, c, n.Name, 64, 65536)
 	}
 	dir := filepath.Join(c.tmpRoot, "virtio")
 	if err := os.MkdirAll(dir, 0o755); err != nil {

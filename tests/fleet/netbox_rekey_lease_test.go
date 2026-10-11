@@ -41,7 +41,7 @@ import (
 // while the row is live is a refusal, not a takeover.
 func lapseNetBoxLease(t *testing.T, n *Node) {
 	t.Helper()
-	if err := n.DB.Execute(context.Background(),
+	if err := localExec(context.Background(), n.DB,
 		`UPDATE leader_election SET expires_at = ?, updated_at = ? WHERE key = 'netbox'`,
 		time.Now().Add(-time.Minute).UTC().Format(time.RFC3339), n.DB.NowTS()); err != nil {
 		t.Fatalf("lapse netbox lease on %s: %v", n.Name, err)

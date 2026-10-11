@@ -176,7 +176,7 @@ func TestFleet_OpJournalRecovery_ReplicatedTakeoverSupersedes(t *testing.T) {
 	// journal entry's. (v41 is foundation-only — no production writer advances
 	// vm_owner_epoch yet — so the adoption is written directly here.)
 	converge(t, c, taker, origin)
-	if err := taker.DB.Execute(ctx,
+	if err := localExec(ctx, taker.DB,
 		`UPDATE vms SET host_name = ?, vm_owner_epoch = vm_owner_epoch + 1, updated_at = ? WHERE name = ?`,
 		taker.Name, taker.DB.NowTS(), wedgedVM); err != nil {
 		t.Fatalf("adopt %s on %s: %v", wedgedVM, taker.Name, err)

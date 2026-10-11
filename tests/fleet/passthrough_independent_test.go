@@ -158,7 +158,7 @@ func TestFleet_RestoreCarriesNoUnauthorizedHostAccess(t *testing.T) {
 	ctx := context.Background()
 	src, opDst, adminDst := c.Nodes[0], c.Nodes[1], c.Nodes[2]
 	for _, n := range c.Nodes {
-		setHostCapacity(t, c, n.Name, 64, 65536, nil)
+		setHostCapacity(t, c, n.Name, 64, 65536)
 		n.Server.SetReleaseFeatureGate(openReleaseGate{t})
 	}
 	allowed, _ := filepath.EvalSymlinks(t.TempDir())
@@ -416,7 +416,7 @@ func TestFleet_RestoreCarriesNoUnauthorizedPrivilege(t *testing.T) {
 	ctx := context.Background()
 	src, opDst, adminDst := c.Nodes[0], c.Nodes[1], c.Nodes[2]
 	for _, n := range c.Nodes {
-		setHostCapacity(t, c, n.Name, 64, 65536, nil)
+		setHostCapacity(t, c, n.Name, 64, 65536)
 		n.Server.SetReleaseFeatureGate(openReleaseGate{t})
 	}
 	if _, err := c.SelfClient(src).CreateContainer(ctx, &pb.CreateContainerRequest{
@@ -471,7 +471,7 @@ func TestFleet_DrainMovesAUSBVMCold(t *testing.T) {
 	ctx := context.Background()
 	src, dst := c.Nodes[0], c.Nodes[1]
 	for _, n := range c.Nodes {
-		setHostCapacity(t, c, n.Name, 64, 65536, nil)
+		setHostCapacity(t, c, n.Name, 64, 65536)
 	}
 	if err := corrosion.CreateResourceMapping(ctx, src.DB, "dongle", ""); err != nil {
 		t.Fatal(err)

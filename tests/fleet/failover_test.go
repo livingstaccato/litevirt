@@ -54,7 +54,7 @@ func TestFleet_Failover_LeaderContention(t *testing.T) {
 	// datetime('now') row reads as permanently stale and never reaches quorum.
 	nowRFC := time.Now().UTC().Format(time.RFC3339)
 	for _, observer := range []string{a.Name, b.Name} {
-		if err := a.DB.Execute(ctx,
+		if err := localExec(ctx, a.DB,
 			`INSERT OR REPLACE INTO host_health
 			 (observer, target, status, consecutive_failures, last_seen, updated_at)
 			 VALUES (?, ?, 'suspect', 5, NULL, ?)`,

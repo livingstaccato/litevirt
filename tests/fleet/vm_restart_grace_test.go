@@ -32,7 +32,7 @@ func TestFleet_RestartVMOpensTheHealthcheckStartGrace(t *testing.T) {
 	}
 	// Out of its creation grace, so only a start can hold the action off.
 	old := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
-	if err := n.DB.Execute(ctx, `UPDATE vms SET created_at = ? WHERE name = 'web'`, old); err != nil {
+	if err := localExec(ctx, n.DB, `UPDATE vms SET created_at = ? WHERE name = 'web'`, old); err != nil {
 		t.Fatalf("backdate created_at: %v", err)
 	}
 

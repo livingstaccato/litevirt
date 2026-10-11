@@ -99,9 +99,9 @@ func TestFleet_Clone_IsAdmittedAgainstTheSourceHostsCapacity(t *testing.T) {
 	entry, src := c.Nodes[0], c.Nodes[1]
 
 	// entry: room to spare, and never the host that executes the clone.
-	setHostCapacity(t, c, entry.Name, 64, 65536, nil)
+	setHostCapacity(t, c, entry.Name, 64, 65536)
 	// src: ~1 GiB allocatable after the default reserve — cannot hold a 4 GiB clone.
-	setHostCapacity(t, c, src.Name, 8, 2048, nil)
+	setHostCapacity(t, c, src.Name, 8, 2048)
 
 	seedCloneSource(t, c, src, "tpl", "", 2, 4096)
 
@@ -116,7 +116,7 @@ func TestFleet_Clone_IsAdmittedAgainstTheSourceHostsCapacity(t *testing.T) {
 
 	// Control: the same clone, once the source's host can hold it. Without this the
 	// test above passes for any reason at all, including a broken clone engine.
-	setHostCapacity(t, c, src.Name, 64, 65536, nil)
+	setHostCapacity(t, c, src.Name, 64, 65536)
 	vm, err := cloneAt(t, c, entry, "tpl", "fits")
 	if err != nil {
 		t.Fatalf("clone onto a host with tens of GiB free: %v", err)
@@ -138,8 +138,8 @@ func TestFleet_Clone_ChargesTheProjectsQuota(t *testing.T) {
 	ctx := context.Background()
 	entry, src := c.Nodes[0], c.Nodes[1]
 
-	setHostCapacity(t, c, entry.Name, 64, 65536, nil)
-	setHostCapacity(t, c, src.Name, 64, 65536, nil)
+	setHostCapacity(t, c, entry.Name, 64, 65536)
+	setHostCapacity(t, c, src.Name, 64, 65536)
 
 	// /acme may hold 3 GiB. Its template already accounts for 2 GiB, so a 2 GiB
 	// clone would put it at 4 GiB — over, but only by counting the clone.
@@ -193,8 +193,8 @@ func TestFleet_Clone_ReleasesItsReservation(t *testing.T) {
 	ctx := context.Background()
 	entry, src := c.Nodes[0], c.Nodes[1]
 
-	setHostCapacity(t, c, entry.Name, 64, 65536, nil)
-	setHostCapacity(t, c, src.Name, 64, 65536, nil)
+	setHostCapacity(t, c, entry.Name, 64, 65536)
+	setHostCapacity(t, c, src.Name, 64, 65536)
 	seedCloneSource(t, c, src, "rel-tpl", "", 2, 4096)
 
 	if _, err := cloneAt(t, c, entry, "rel-tpl", "rel-1"); err != nil {

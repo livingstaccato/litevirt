@@ -121,13 +121,24 @@ In-progress sign-ins are bounded, and beginning one is never refused:
   2. within it, the client address (above) holding the most;
   3. that address's oldest sign-in.
 
-  Ties go to the candidate whose newest sign-in is the newest, so a churning
-  flood evicts itself. A flood spread over many addresses of one network
-  therefore counts as one heavy network, and a user from another network
-  outlasts it. The networks are used only to choose what to drop, never to
-  refuse. A legitimate NAT that shares a /24 with an attacker is dropped
-  along with it. That costs availability only: password, LDAP and local
-  logins are unaffected.
+  A flood spread over many addresses of one network therefore counts as one
+  heavy network, and a user from another network outlasts it. Ties go to the
+  candidate whose newest sign-in is the oldest. Among equally loaded
+  networks that is first in, first out, so every sign-in, including one
+  begun during a flood, lasts at least one turnover of the table: about
+  4096/R seconds while sign-ins begin at R per second. The networks are used
+  only to choose what to drop, never to refuse.
+
+  Limits, all availability only (password, LDAP and local logins are
+  unaffected):
+  - A legitimate NAT that shares a /24 with an attacker is dropped along
+    with it.
+  - An attacker holding at least as many networks as the bound (4096 /24s
+    or /48s, for example a botnet or a large IPv6 allocation) keeps every
+    network at one sign-in and ties with everyone. It can then shorten every
+    OIDC sign-in's window to about 4096/R. At a few hundred requests per
+    second that is shorter than a round trip to the IdP, and OIDC sign-in on
+    that node fails while the flood lasts.
 
 The client address is:
 - for the web UI and the REST gateway, the TCP peer. When that peer is in
@@ -144,9 +155,11 @@ addresses, default empty). Without it, every browser arrives from the proxy's
 one address and shares its bound. Two warnings point at this:
 - the daemon warns at startup when an OIDC realm is configured, the UI is
   bound to loopback, and `trusted_proxies` is empty;
-- the UI warns, at most every 10 minutes, when a sign-in arrives with
-  `X-Forwarded-For` from a peer that is not listed. This catches a proxy on
-  another host.
+- the UI warns when a sign-in arrives with `X-Forwarded-For` from a peer
+  that is not listed. This catches a proxy on another host. It warns at most
+  every 10 minutes for each peer, and remembers the last 16 peers, so a
+  client that reaches the UI directly and sends the header cannot hide the
+  proxy's warning.
 
 Requirements on the proxy:
 - It must **append** the client's address to `X-Forwarded-For`, or overwrite

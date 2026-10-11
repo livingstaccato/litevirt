@@ -107,6 +107,9 @@ type OIDCRealm struct {
 	// maxFlowsPerAddr bounds the flows one client address holds, so a flood
 	// from one source cannot fill the store for everyone else.
 	maxFlowsPerAddr int
+	// flowSeq numbers flows in the order they were begun (putFlowLocked), so
+	// "oldest" never depends on two begins reading different clock values.
+	flowSeq uint64
 }
 
 // oidcFlow is the server-side state for one in-flight authorization-code
@@ -128,7 +131,9 @@ type OIDCRealm struct {
 //     so a (code, state) pair alone — both travel in the callback URL —
 //     redeems nothing (RFC 9700 §4.5). hasBinding is false only for the
 //     AuthURL test helper's flows.
-//   - addr is the client address that began it (the per-address bound).
+//   - addr is the client address that began it (the per-address bound), and
+//     agg its network (flowAggregate), computed once when the flow is stored.
+//   - seq orders flows by when they were begun: a larger seq is newer.
 type oidcFlow struct {
 	expiry     time.Time
 	verifier   string
@@ -137,6 +142,8 @@ type oidcFlow struct {
 	binding    [32]byte
 	hasBinding bool
 	addr       string
+	agg        string
+	seq        uint64
 }
 
 // OIDC flow clients: which configured redirect a flow returns to.
@@ -616,6 +623,9 @@ func (r *OIDCRealm) putFlowLocked(state string, f oidcFlow) time.Time {
 	now := time.Now()
 	r.pruneLocked(now)
 	f.expiry = now.Add(r.stateExpiry)
+	f.agg = flowAggregate(f.addr)
+	r.flowSeq++
+	f.seq = r.flowSeq
 	r.stateStore[state] = f
 	return f.expiry
 }
@@ -631,16 +641,20 @@ func (r *OIDCRealm) flowsFromLocked(addr string) int {
 	return n
 }
 
-// evictOldestOfLocked drops addr's flow that expires first; r.mu must be held.
+// evictOldestOfLocked drops addr's flow that was begun first; r.mu must be
+// held.
 func (r *OIDCRealm) evictOldestOfLocked(addr string) {
 	var oldest string
-	var at time.Time
+	var at uint64
+	found := false
 	for s, f := range r.stateStore {
-		if f.addr == addr && (oldest == "" || f.expiry.Before(at)) {
-			oldest, at = s, f.expiry
+		if f.addr == addr && (!found || f.seq < at) {
+			oldest, at, found = s, f.seq, true
 		}
 	}
-	delete(r.stateStore, oldest)
+	if found {
+		delete(r.stateStore, oldest)
+	}
 }
 
 // evictFairLocked chooses whom to evict when the realm is full, never whom to
@@ -653,57 +667,67 @@ func (r *OIDCRealm) evictOldestOfLocked(addr string) {
 //  2. within it, the heaviest key (the per-address bound's key);
 //  3. that key's oldest flow.
 //
-// Ties at each level go deterministically to the candidate whose newest flow
-// is the newest, so a churning flood evicts itself rather than older flows,
-// and then to the smaller key string. r.mu must be held.
+// Ties at each level go to the candidate whose NEWEST flow is the OLDEST
+// (re-review 3, I1), then to the smaller key string. Among networks of equal
+// weight that is first in, first out, so every flow — a newcomer's included —
+// survives at least one turnover of the table, about maxFlows/R seconds at R
+// begins per second. ("Newest loses" let an attacker holding maxFlows
+// networks evict every newcomer on the very next begin.) r.mu must be held.
 //
 // Cost: a legitimate NAT /24 that shares an aggregate with an attacker is
-// evicted along with it. That is availability only, and one O(n) pass.
+// evicted along with it, and an attacker holding at least maxFlows networks
+// can still shorten every sign-in's window to about maxFlows/R. Both are
+// availability only. One O(n) pass, no parsing or allocation per flow.
 func (r *OIDCRealm) evictFairLocked() {
 	type tally struct {
 		n      int
-		newest time.Time
+		newest uint64
+		agg    string
 	}
 	aggs := map[string]*tally{}
 	keys := map[string]*tally{}
-	for _, f := range r.stateStore {
-		for _, t := range []struct {
-			m map[string]*tally
-			k string
-		}{{aggs, flowAggregate(f.addr)}, {keys, f.addr}} {
-			c := t.m[t.k]
-			if c == nil {
-				c = &tally{}
-				t.m[t.k] = c
-			}
-			c.n++
-			if f.expiry.After(c.newest) {
-				c.newest = f.expiry
-			}
+	count := func(m map[string]*tally, k string, f oidcFlow) {
+		c := m[k]
+		if c == nil {
+			c = &tally{agg: f.agg}
+			m[k] = c
 		}
+		c.n++
+		if f.seq > c.newest {
+			c.newest = f.seq
+		}
+	}
+	for _, f := range r.stateStore {
+		count(aggs, f.agg, f)
+		count(keys, f.addr, f)
 	}
 	heavier := func(a string, at *tally, b string, bt *tally) bool {
 		if at.n != bt.n {
 			return at.n > bt.n
 		}
-		if !at.newest.Equal(bt.newest) {
-			return at.newest.After(bt.newest)
+		if at.newest != bt.newest {
+			return at.newest < bt.newest
 		}
 		return a < b
 	}
-	agg := ""
+	var agg string
+	found := false
 	for k, t := range aggs {
-		if agg == "" || heavier(k, t, agg, aggs[agg]) {
-			agg = k
+		if !found || heavier(k, t, agg, aggs[agg]) {
+			agg, found = k, true
 		}
 	}
-	key := ""
+	if !found {
+		return
+	}
+	var key string
+	found = false
 	for k, t := range keys {
-		if flowAggregate(k) != agg {
+		if t.agg != agg {
 			continue
 		}
-		if key == "" || heavier(k, t, key, keys[key]) {
-			key = k
+		if !found || heavier(k, t, key, keys[key]) {
+			key, found = k, true
 		}
 	}
 	r.evictOldestOfLocked(key)

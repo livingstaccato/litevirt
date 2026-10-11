@@ -17,7 +17,6 @@ import (
 	"net/url"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -85,8 +84,8 @@ type Server struct {
 	// to accept: the __Host- one for an https redirect, never a plain one.
 	oidcSecureRealms sync.Map // realm → bool
 
-	// lastUntrustedForwardWarn rate-limits warnUntrustedForwarding.
-	lastUntrustedForwardWarn atomic.Int64
+	// untrustedForwardWarns rate-limits warnUntrustedForwarding per peer.
+	untrustedForwardWarns untrustedForwardWarns
 }
 
 // SetTrustedProxies sets the reverse proxies whose X-Forwarded-For header

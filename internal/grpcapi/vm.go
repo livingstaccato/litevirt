@@ -2143,10 +2143,18 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		s.ReleaseFeatureAvailable(capabilities.FeatureISCSILUNClaim) {
 		// The token has latched here but this replica holds no use: it may
 		// lag one that does, and then a kept allocation of this VM stays
-		// valid (switch review M-2).
-		slog.Warn("iSCSI LUN: a plain delete recorded nothing on its LUNs, because this host's replica holds no "+
-			"use of iscsi_lun_claim; if the feature was used while this host was away, a kept LUN of the VM is not voided",
-			"vm", req.Name, "luns", luns)
+		// valid (switch review M-2). That is also the ordinary state of a
+		// cluster upgraded from main before its first iSCSI create, so it
+		// warns only on evidence of a use this replica lags: the feature's
+		// own data for one of the VM's LUNs (switch re-review N-1).
+		if s.lunFeatureDataHere(ctx, luns) {
+			slog.Warn("iSCSI LUN: a plain delete recorded nothing on its LUNs, because this host's replica holds no "+
+				"use of iscsi_lun_claim, yet holds the feature's data for one of them: it lags the use, and a kept "+
+				"LUN of the VM is not voided", "vm", req.Name, "luns", luns)
+		} else {
+			slog.Info("iSCSI LUN: a plain delete recorded nothing on its LUNs: this host's replica shows "+
+				"iscsi_lun_claim never used (no use, and none of its data for these LUNs)", "vm", req.Name, "luns", luns)
+		}
 	}
 	if err == nil && len(luns) > 0 && s.lunPlainDeleteRecordable(ctx) {
 		// The record is iscsi_lun_claim's data: written through its gate,

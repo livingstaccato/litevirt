@@ -421,7 +421,10 @@ func (s *Server) preflightLUNs(ctx context.Context, spec *pb.VMSpec, cur *corros
 	}
 	// The release gate last, just before the first claim: every local
 	// refusal above writes nothing, so it records no use either (switch
-	// review I-1).
+	// review I-1). On a first use it waits with the registration and the
+	// durable hold already taken: a racing create meets "in flight" for that
+	// wait, retryable, and both are released on refusal (switch re-review
+	// N-2).
 	grant, err := s.iscsiLUNClaimGate(ctx)
 	if err != nil {
 		return ctx, noop, err

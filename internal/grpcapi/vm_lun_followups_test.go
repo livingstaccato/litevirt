@@ -1,21 +1,25 @@
 package grpcapi
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
 // fix/iscsi-followups: residuals parked from the iSCSI re-reviews
-// (iscsi-lun-rereview-5.md R-2).
+// (iscsi-lun-rereview-5.md R-2; switch-rereview-iscsi.md N-1).
 
 // addLUNDirPool registers a dir pool name on s's host, at a fresh directory.
 func addLUNDirPool(t *testing.T, s *Server, name string) string {
@@ -111,5 +115,80 @@ func TestRecreateFixedDeviceUses_ADiskNameSharedWithALUNDiskIsRefused(t *testing
 	}}
 	if _, err := s.recreateFixedDeviceUses(adminCtx(), spec, nil); status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("recreate judge with a disk name shared with a LUN disk: got %v, want InvalidArgument", err)
+	}
+}
+
+// captureSlog sends the default logger to a buffer for the test.
+func captureSlog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return &buf
+}
+
+// lunSkipLine is the log line a plain delete writes when it records nothing
+// on its LUNs.
+func lunSkipLine(t *testing.T, log string) string {
+	t.Helper()
+	for _, l := range strings.Split(log, "\n") {
+		if strings.Contains(l, "a plain delete recorded nothing on its LUNs") {
+			return l
+		}
+	}
+	t.Fatalf("no plain-delete skip line logged:\n%s", log)
+	return ""
+}
+
+// N-1 (switch-rereview-iscsi.md): a plain delete of an iSCSI VM where this
+// replica shows iscsi_lun_claim never used — the ordinary state of a cluster
+// upgraded from main before its first iSCSI create — is logged at INFO, not
+// WARN. Only a replica that holds the feature's data for the VM's LUN but no
+// used record — evidence that it lags a use — warns.
+//
+// Mutation: log the never-used case at WARN again — the first stage goes red;
+// log every case at INFO — the second goes red.
+func TestDeleteVM_ISCSI_AMarkerSkipWarnsOnlyOnEvidenceOfUse(t *testing.T) {
+	ctx := adminCtx()
+	key := mustLUNKey(t, "10.0.0.1", "0")
+	for _, tc := range []struct {
+		name      string
+		evidence  bool
+		wantLevel string
+	}{
+		{"never used", false, "level=INFO"},
+		{"this replica holds the LUN's checkpoint", true, "level=WARN"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := lunTestServer(t)
+			if _, err := s.CreateVM(ctx, lunVM("a", "lun0")); err != nil {
+				t.Fatalf("create a: %v", err)
+			}
+			forgetLUNUse(t, s)
+			if _, err := s.db.DB().ExecContext(context.Background(),
+				`DELETE FROM cluster_policies WHERE key LIKE 'lun_resolved/%' OR key LIKE 'lun_plain_delete/%'`); err != nil {
+				t.Fatal(err)
+			}
+			if tc.evidence {
+				if err := corrosion.AdvanceLUNResolved(context.Background(), s.db,
+					capabilities.GrantForTest(t, capabilities.FeatureISCSILUNClaim), key, 3, "peer-host"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			calls := &atomic.Int32{}
+			s.SetReleaseFeatureGate(lunRecordingGate{t: t, db: s.db, host: s.hostName, calls: calls})
+			buf := captureSlog(t)
+			if _, err := s.DeleteVM(ctx, &pb.DeleteVMRequest{Name: "a"}); err != nil {
+				t.Fatalf("plain delete of a: %v", err)
+			}
+			requireNoVM(t, s, "a")
+			if calls.Load() != 0 {
+				t.Errorf("the gate was asked %d times with no use recorded here", calls.Load())
+			}
+			if line := lunSkipLine(t, buf.String()); !strings.Contains(line, tc.wantLevel) {
+				t.Errorf("skip line %q, want %s", line, tc.wantLevel)
+			}
+		})
 	}
 }

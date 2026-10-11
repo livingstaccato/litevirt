@@ -136,6 +136,25 @@ func (s *Server) lunPlainDeleteRecordable(ctx context.Context) bool {
 	return err == nil && used
 }
 
+// lunFeatureDataHere reports whether this replica holds iscsi_lun_claim's
+// data for any of luns — a checkpoint or a plain-delete record, both written
+// only after the feature's use was recorded — so a missing used record there
+// is replication lag, not a feature never used. A read error counts as data:
+// it never hides the lag.
+func (s *Server) lunFeatureDataHere(ctx context.Context, luns []string) bool {
+	for _, k := range luns {
+		g, err := corrosion.GetLUNResolved(ctx, s.db, k)
+		if err != nil || g > 0 {
+			return true
+		}
+		d, err := corrosion.GetLUNPlainDelete(ctx, s.db, k)
+		if err != nil || d != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // lunElectorateT is who decides a LUN allocation: the adopted voter
 // generation's members, a majority of them.
 type lunElectorateT struct {
@@ -574,7 +593,12 @@ func (s *Server) claimLUNs(ctx context.Context, spec *pb.VMSpec) (*lunHold, erro
 	}
 	// The release gate last, just before the first claim: the refusals
 	// above (in flight, held here, a hold that no longer stands) write
-	// nothing, so they record no use either (switch review I-1).
+	// nothing, so they record no use either (switch review I-1). On a first
+	// use the gate waits (up to its acknowledgement budget) with this
+	// create's registration already taken, so a racing create of the same
+	// LUN or VM is refused "in flight" for that wait rather than queuing
+	// behind it — retryable, and released on any refusal (switch re-review
+	// N-2).
 	var grant capabilities.FeatureGrant
 	if needClaim {
 		g, err := s.iscsiLUNClaimGate(ctx)

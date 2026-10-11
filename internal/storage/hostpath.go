@@ -199,6 +199,7 @@ var dataDirOwned = []string{
 	"genesis-pending",           // daemon.go genesisMarkerName; host_init.go genesisMarkerScript
 	"pool-uploads.json",         // storage_pool_confine.go poolUploadsFile
 	"host-updates.json",         // grpcapi/host_updates.go hostUpdateCountsPath
+	"file-restore",              // daemon.go fileRestoreCacheDir/fileRestoreRunDir (a non-root daemon only)
 	"nowts.hwm",                 // corrosion/hwm.go (and nowts.hwm.lock)
 	"split_brain_activated",     // health/capability.go ActivationMarkerBase (markers are .<token>)
 }

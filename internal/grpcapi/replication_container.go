@@ -661,11 +661,11 @@ func (s *Server) replicateContainer(ctx context.Context, g capabilities.FeatureG
 		Placement: corrosion.PlacementOf(rec.CreateSpec), Incarnation: rec.CreatedAt,
 		Epoch: rec.OwnerEpoch, Keep: sched.KeepReplicas, Bases: s.containerBases(rec),
 	}
-	manifest, err := s.archiveContainerAs(ctx, staging, rec, runAt.UTC().Format(time.RFC3339), mark, func(pbsstore.PushProgress) {})
+	manifest, err := s.archiveContainerAs(ctx, staging, rec, runAt.UTC().Format(time.RFC3339), mark, nil, func(pbsstore.PushProgress) {})
 	if err != nil {
 		return fmt.Errorf("archive container: %w", err)
 	}
-	if err := s.pushManifestToPeerRepo(ctx, target, containerReplicaRepo(project, repoName), staging, manifest); err != nil {
+	if err := s.pushManifestToPeerRepo(ctx, target, containerReplicaRepo(project, repoName), staging, manifest, nil); err != nil {
 		if status.Code(err) == codes.Unavailable {
 			return &replTargetDownError{host: target, err: err}
 		}

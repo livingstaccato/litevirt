@@ -13,10 +13,15 @@ package libvirt
 
 import (
 	"encoding/xml"
+	"errors"
 	"fmt"
+	"io/fs"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	golibvirt "github.com/digitalocean/go-libvirt"
@@ -53,9 +58,10 @@ func diskTargetForSource(domXML, sourcePath string) string {
 
 const (
 	// Scratch + socket live under /var/lib (traversable by the
-	// unprivileged libvirt-qemu user) and the dirs are chmod 0777 so qemu
-	// can create the fleecing image + bind the NBD socket. Learned from
-	// live testing on libvirt 10 (AppArmor-confined, qemu unprivileged).
+	// unprivileged libvirt-qemu user), each session's in a directory of its
+	// own that qemu can create the fleecing image and bind the NBD socket in
+	// (prepareBackupSessionPaths). That qemu must create there was learned
+	// from live testing on libvirt 10 (AppArmor-confined, qemu unprivileged).
 	sessScratchDir = "/var/lib/litevirt/backup-scratch"
 	sessSocketDir  = "/var/lib/litevirt/backup-sock"
 )
@@ -105,20 +111,11 @@ func (c *Client) BeginBackup(domain, diskPath, parentCheckpoint, newCheckpoint s
 	}
 	size := int64(capacity)
 
-	for _, d := range []string{sessScratchDir, sessSocketDir} {
-		if err := os.MkdirAll(d, 0o755); err != nil {
-			return nil, fmt.Errorf("mkdir %s: %w", d, err)
-		}
-		if err := os.Chmod(d, 0o777); err != nil {
-			return nil, fmt.Errorf("chmod %s: %w", d, err)
-		}
-	}
 	tag := fmt.Sprintf("%s-%s", domain, diskTarget)
-	scratch := filepath.Join(sessScratchDir, tag+".scratch")
-	socket := filepath.Join(sessSocketDir, tag+".sock")
-	// qemu creates these itself; clear stale leftovers from a crashed run.
-	_ = os.Remove(scratch)
-	_ = os.Remove(socket)
+	scratch, socket, err := prepareBackupSessionPaths(sessScratchDir, sessSocketDir, tag, domainQEMUOwner(domXML))
+	if err != nil {
+		return nil, err
+	}
 
 	backupDoc, err := buildBackupXML(diskTarget, parentCheckpoint, socket, scratch)
 	if err != nil {
@@ -133,7 +130,7 @@ func (c *Client) BeginBackup(domain, diskPath, parentCheckpoint, newCheckpoint s
 		cpXML = golibvirt.OptString{doc}
 	}
 	if err := c.virt.DomainBackupBegin(dom, backupDoc, cpXML, 0); err != nil {
-		_ = os.Remove(scratch)
+		removeBackupSessionPaths(scratch, socket)
 		return nil, fmt.Errorf("begin pull backup: %w", err)
 	}
 
@@ -233,5 +230,147 @@ func (s *BackupSession) Close() error {
 
 func (s *BackupSession) abort() {
 	_ = s.c.virt.DomainAbortJob(s.dom)
-	_ = os.Remove(s.scratch)
+	removeBackupSessionPaths(s.scratch, s.socket)
 }
+
+// qemuOwner is the uid and gid qemu runs as for a domain, when known.
+type qemuOwner struct {
+	UID, GID int
+	Known    bool
+}
+
+// domainSeclabels is the part of a live domain's XML that says which user
+// qemu runs as: libvirt's DAC security label, "+<uid>:+<gid>".
+type domainSeclabels struct {
+	Seclabels []struct {
+		Model string `xml:"model,attr"`
+		Label string `xml:"label"`
+	} `xml:"seclabel"`
+}
+
+// domainQEMUOwner reads the uid:gid qemu runs as from the live domain XML's
+// DAC label. A label it cannot read as two numbers (names, none at all) is
+// unknown, and the session falls back to a sticky directory.
+func domainQEMUOwner(domXML string) qemuOwner {
+	var d domainSeclabels
+	if err := xml.Unmarshal([]byte(domXML), &d); err != nil {
+		return qemuOwner{}
+	}
+	for _, sl := range d.Seclabels {
+		if sl.Model != "dac" {
+			continue
+		}
+		u, g, ok := strings.Cut(strings.TrimSpace(sl.Label), ":")
+		if !ok {
+			return qemuOwner{}
+		}
+		uid, uerr := strconv.Atoi(strings.TrimPrefix(u, "+"))
+		gid, gerr := strconv.Atoi(strings.TrimPrefix(g, "+"))
+		if uerr != nil || gerr != nil || uid < 0 || gid < 0 {
+			return qemuOwner{}
+		}
+		return qemuOwner{UID: uid, GID: gid, Known: true}
+	}
+	return qemuOwner{}
+}
+
+const (
+	// backupRootMode is backup-scratch/ and backup-sock/: root's, searchable
+	// by qemu, listable and writable by nobody else.
+	backupRootMode fs.FileMode = 0o711
+	// backupSessionMode is a session directory owned by qemu's uid.
+	backupSessionMode fs.FileMode = 0o700
+	// backupSessionFallbackMode is a session directory whose qemu user is not
+	// known: anyone may create in it (qemu must), nobody but root may list
+	// it, and the sticky bit keeps one user from removing or renaming
+	// another's entry. Its parent is 0711, so its name cannot be listed.
+	backupSessionFallbackMode = fs.ModeSticky | 0o733
+)
+
+// prepareBackupSessionPaths makes the scratch and NBD socket paths of one
+// pull-mode backup session of tag (<domain>-<disk target>) and returns them.
+//
+// qemu (as its own user, AppArmor-confined) creates the scratch image and
+// binds the socket; the daemon (root) dials the socket. Earlier builds put both
+// directly in scratchRoot and sockRoot and chmod-ed those 0777 every session:
+// world-writable with no sticky bit, so any local user could replace the socket
+// the daemon reads the guest's disk from. Now:
+//
+//   - scratchRoot and sockRoot are 0711, root's — narrowed from 0777 on the
+//     first session after an upgrade, as every session used to chmod them;
+//   - each holds one directory per session, named tag (so a crashed session's
+//     leftovers are found and removed, as before), owned by qemu's uid:gid
+//     and 0700; and when qemu's user is not known, or the chown is refused,
+//     01733 instead (never 0777);
+//   - the scratch is <scratchRoot>/<tag>/scratch and the socket
+//     <sockRoot>/<tag>/nbd: never longer than the old <sockRoot>/<tag>.sock,
+//     so no socket path newly exceeds the 107-byte limit.
+//
+// An entry at a session directory's name that is not a real directory (one
+// planted while the parent was 0777) is refused, never followed. The
+// earlier build's own names (<tag>.scratch, <tag>.sock), which it removed at
+// the start of every session, are removed once more; nothing else is.
+func prepareBackupSessionPaths(scratchRoot, sockRoot, tag string, owner qemuOwner) (scratch, socket string, err error) {
+	sessionDir := func(root, legacy string) (string, error) {
+		if err := os.MkdirAll(root, backupRootMode); err != nil {
+			return "", fmt.Errorf("mkdir %s: %w", root, err)
+		}
+		if err := os.Chmod(root, backupRootMode); err != nil {
+			return "", fmt.Errorf("chmod %s: %w", root, err)
+		}
+		_ = os.Remove(filepath.Join(root, legacy))
+		dir := filepath.Join(root, tag)
+		if err := os.Mkdir(dir, backupSessionMode); err != nil && !errors.Is(err, fs.ErrExist) {
+			return "", fmt.Errorf("mkdir %s: %w", dir, err)
+		}
+		fi, err := os.Lstat(dir)
+		if err != nil {
+			return "", err
+		}
+		if !fi.IsDir() {
+			return "", fmt.Errorf("backup session directory %s is not a directory (%s); remove it", dir, fi.Mode().Type())
+		}
+		mode := backupSessionFallbackMode
+		if owner.Known {
+			if cerr := lchown(dir, owner.UID, owner.GID); cerr != nil {
+				slog.Warn("backup session: could not give the session directory to qemu's user; it is sticky and unlistable instead",
+					"dir", dir, "uid", owner.UID, "gid", owner.GID, "error", cerr)
+			} else {
+				mode = backupSessionMode
+			}
+		}
+		if err := os.Chmod(dir, mode); err != nil {
+			return "", fmt.Errorf("chmod %s: %w", dir, err)
+		}
+		return dir, nil
+	}
+	sd, err := sessionDir(scratchRoot, tag+".scratch")
+	if err != nil {
+		return "", "", err
+	}
+	kd, err := sessionDir(sockRoot, tag+".sock")
+	if err != nil {
+		return "", "", err
+	}
+	scratch, socket = filepath.Join(sd, "scratch"), filepath.Join(kd, "nbd")
+	// qemu creates these itself; clear stale leftovers from a crashed run.
+	_ = os.Remove(scratch)
+	_ = os.Remove(socket)
+	return scratch, socket, nil
+}
+
+// removeBackupSessionPaths removes a session's scratch and socket and then its
+// two session directories, each only when empty.
+func removeBackupSessionPaths(scratch, socket string) {
+	for _, p := range []string{scratch, socket} {
+		if p == "" {
+			continue
+		}
+		_ = os.Remove(p)
+		_ = os.Remove(filepath.Dir(p)) // rmdir: only when empty
+	}
+}
+
+// lchown is os.Lchown; a variable so a test, which is not root, can see the
+// owner a session directory is given.
+var lchown = os.Lchown

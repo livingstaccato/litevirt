@@ -212,6 +212,18 @@ opens the database: the daemon, `lv user reset-admin`, the `lv sg ls`
 fallback, and `litevirt schema-migrate` all run as root. If the narrowing
 fails, the daemon logs a warning naming the file and starts anyway.
 
+A backup session (a backup, a replication, or a point-in-time volume copy of a
+running VM) gets its own directory, `<vm>-<disk target>`, in each of `/var/lib/litevirt/backup-scratch`
+and `/var/lib/litevirt/backup-sock`. qemu creates the fleecing scratch image
+in one and binds the NBD socket in the other, and the daemon reads the disk
+through that socket. Both parent directories are root's and `0711`; earlier
+releases set them to `0777` at every session, and the next session narrows
+them. Each session directory belongs to the user qemu runs as for that VM
+(libvirt's DAC label) and is `0700`, so no other local user can reach the
+socket or the scratch. If that user cannot be read from the domain, or the
+chown is refused, the session directory is `01733` instead: sticky and not
+listable.
+
 ### Directory pools on NFS
 
 A `local`, `dir` or `btrfs` pool may sit on an NFS mount the host makes itself

@@ -20,13 +20,61 @@ A realm is a pluggable authentication backend. Three are shipped:
 | LDAP / AD | `ldap:<short-name>` | On-prem Active Directory or OpenLDAP. Search-then-bind; group memberships pulled from `memberOf` (or a follow-up search). |
 
 Realms are configured under `auth.realms:` in `/etc/litevirt/config.yaml`
-— see `docs/configuration.md` for the YAML shape. The daemon refreshes
-group caches from external realms every 5 minutes; the last error per
-realm is exposed via the status RPC.
+— see `docs/configuration.md` for the YAML shape. Group memberships are read
+at login (the OIDC groups claim, the LDAP group search); nothing refreshes
+them in between (below).
 
 Roles map to *principal IDs*: `user:<subject>@<realm>` and
 `group:<name>@<realm>`. Bind a role to a principal in the engine and the
 caller gets the role's verbs at the binding's path.
+
+### Directory group bindings
+
+A role bound to `group:<g>@<realm>` applies to every session whose login
+through that LDAP or OIDC realm verified membership of `<g>`. For OIDC the
+groups come from `groups_claim` in the verified ID token; for LDAP they come
+from `user_group_attr` or the group search.
+
+```bash
+lv role grant Operator group:lv-operators@oidc:kanidm --path /projects/acme --propagate
+```
+
+- **Union.** A session holds every grant of its user binding, its legacy
+  role's synthetic `group:<role>@<realm>`, and each of its directory groups.
+  No binding subtracts. Holding any binding switches the caller from the legacy
+  role to the bindings, as for user bindings.
+- **Per session, fixed at login.** The groups are recorded with the session,
+  in the same replicated batch (`session_groups`, schema v65), so every node
+  evaluates the same groups for it. A group the directory removes stops
+  granting at the user's **next login**. A session minted before keeps its
+  groups until it ends: the idle timeout (default 8h), the hard expiry
+  (default 7d), logout, `lv session revoke`, or any account lifecycle change
+  (`lv user disable`). To cut a removed member off at once, revoke their
+  sessions. Shorten `session_hard_expiry` if directory changes must take effect
+  sooner. A group added at the directory applies from the next login.
+- **Audited.** Each external login with groups writes `auth.group_bindings`:
+  - the session's groups, with each group binding they hold (role, path,
+    binding id);
+  - "no role binding names any of these groups" when a group matches nothing
+    (a misspelt binding);
+  - `skipped` when the groups were not recorded (below).
+- **Visible to the user.** `lv role ls` run by a non-admin lists the bindings
+  that apply through their session's groups along with their own.
+- **Release feature.** The groups are written only once the `login_policy`
+  release feature is open (`lv cluster upgrade-status`). Before that, a login
+  records none, and group bindings apply to nobody, as on the previous release.
+  The first directory login that opens the feature may still be minted without
+  them; the next login has them.
+- **Bounds.** At most 256 groups of at most 256 bytes are recorded per session;
+  the rest are dropped and logged.
+- **Local realm.** It has no directory groups; a `group:<g>@local` binding
+  matches only the legacy role's synthetic group.
+- **Name clash.** An IdP group named like a legacy role (`admin`, `operator`,
+  `viewer`) is the same principal as that role's synthetic group in the realm.
+  Name directory groups distinctly (`lv-admins`).
+- **Unreadable groups.** If a session's recorded groups cannot be read, its
+  requests are refused (`Unavailable`), not authorized without them: dropping a
+  group can widen a caller back to its legacy role.
 
 ### External users and local accounts share one name space
 
@@ -79,7 +127,7 @@ required; prefer `client_secret_file` (checked for 0600 at load) over inlining
 | `cli_redirect_url` | The loopback address `lv login --realm oidc:<name>` listens on, `http://127.0.0.1:<port>/<path>` (RFC 8252 §7.3): IPv4 loopback, an explicit port, no query. Checked at load. Unset: the CLI sign-in is off for this realm (the web UI still works). Register it with the IdP too. |
 | `ca_file` | PEM CA bundle the IdP's certificate must chain to (discovery, JWKS and the token endpoint). Unset: the system trust store. Verification is never skipped. |
 | `scopes` | Scopes to request. Default `openid profile email groups`; `openid` is always added. |
-| `groups_claim` | Token claim carrying group membership; each value becomes a `group:<name>@<realm>` principal. |
+| `groups_claim` | Token claim carrying group membership; each value becomes a `group:<name>@<realm>` principal of the session ("Directory group bindings"). |
 | `subject_claim` | Claim used as the stable subject — the `user:<subject>@<realm>` principal. Override when `sub` is an opaque id and you want a readable, stable alternative. |
 | `email_claim` | Claim read as the user's email address. |
 | `name_claim` | Claim read as the user's display name. |
@@ -1234,7 +1282,7 @@ granted access) until rewritten. Once the capability has latched fleet-wide, run
 the one-time idempotent migration `lv role normalize` (supports `--dry-run`) to
 rewrite resolvable legacy bare rows to canonical form; a bare binding whose realm
 can't be resolved is left in place and reported as skipped. External OIDC/LDAP
-**group** bindings are not yet enforced (group claims are not session-persisted).
+**group** bindings apply per session ("Directory group bindings" above).
 
 ### Forwarded identity (`auth.forwarded_identity`)
 

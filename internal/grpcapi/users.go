@@ -356,10 +356,19 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 	if principal.Requires2FA {
 		presented = "totp"
 	}
-	token, expiresAt, role, err := s.mintSession(ctx, principal.Subject, realmName, clientIP, req.UserAgent, presented)
+	groups, dropped := corrosion.NormalizeSessionGroups(principal.Groups)
+	if realmName == "local" {
+		groups, dropped = nil, 0
+	}
+	if dropped > 0 {
+		slog.Warn("login: directory groups not recorded (empty, over-long or over the limit)",
+			"user", principal.Subject, "realm", realmName, "dropped", dropped, "limit", corrosion.MaxSessionGroups)
+	}
+	token, expiresAt, role, err := s.mintSessionWithGroups(ctx, principal.Subject, realmName, clientIP, req.UserAgent, presented, groups)
 	if err != nil {
 		return nil, err
 	}
+	s.auditGroupBindings(ctx, principal.Subject, realmName, token, groups)
 
 	enrollOnly := required && !enrolled
 	detail := "realm=" + realmName + " ip=" + clientIP
@@ -476,6 +485,15 @@ func (s *Server) auditBindingConflict(ctx context.Context, subject, realm, what 
 // recorded with the session (corrosion.InsertSessionWithFactor), and the
 // second-factor policy reads it back for the session's whole life.
 func (s *Server) mintSession(ctx context.Context, username, realm, clientIP, userAgent, factor string) (token, expiresAt, role string, err error) {
+	return s.mintSessionWithGroups(ctx, username, realm, clientIP, userAgent, factor, nil)
+}
+
+// mintSessionWithGroups is mintSession for an external-realm login that
+// verified directory groups: they are recorded in the session's own batch
+// (corrosion.InsertSessionWithLoginData) when the login_policy release feature
+// passes, so `group:<g>@<realm>` bindings apply to this session. Without it
+// the session is minted without them, as before the release.
+func (s *Server) mintSessionWithGroups(ctx context.Context, username, realm, clientIP, userAgent, factor string, groups []string) (token, expiresAt, role string, err error) {
 	// Fail closed if a reseed ran while these credentials were being checked.
 	// See refuseIfReseedMovedSinceEntry: the interceptor's gate cannot drain a
 	// request that was already inside when the reseed started.
@@ -519,13 +537,16 @@ func (s *Server) mintSession(ctx context.Context, username, realm, clientIP, use
 		LastUsedAt: now.Format(time.RFC3339),
 		ExpiresAt:  exp.Format(time.RFC3339),
 	}
-	insert := func(ctx context.Context, g capabilities.FeatureGrant) error {
-		return corrosion.InsertSessionWithFactor(ctx, s.db, g, rec, factor)
+	if realm == "local" {
+		groups = nil // the local realm has no directory
 	}
-	// Only a login that presented a factor has login-rule data to record; a
-	// password-only one never asks the release feature's gate.
+	insert := func(ctx context.Context, g capabilities.FeatureGrant) error {
+		return corrosion.InsertSessionWithLoginData(ctx, s.db, g, rec, factor, groups)
+	}
+	// Only a login that presented a factor or verified groups has login-rule
+	// data to record; any other never asks the release feature's gate.
 	var serr error
-	if factor == "" {
+	if factor == "" && len(groups) == 0 {
 		serr = insert(ctx, capabilities.FeatureGrant{})
 	} else {
 		serr = s.withLoginPolicyIfAvailable(ctx, insert)

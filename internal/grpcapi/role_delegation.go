@@ -99,7 +99,7 @@ func delegablePath(p string) (string, error) {
 
 // callerPrincipals is principalsForCaller for the request's caller.
 func callerPrincipals(ctx context.Context) []string {
-	return principalsForCaller(callerUsername(ctx), callerRole(ctx), callerRealm(ctx))
+	return principalsForCaller(callerUsername(ctx), callerRole(ctx), callerRealm(ctx), callerGroups(ctx)...)
 }
 
 // callerMayDelegate reports whether the caller holds perm.modify, by name,

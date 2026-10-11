@@ -212,7 +212,8 @@ func (s *Server) ListRoleBindings(ctx context.Context, req *pb.ListRoleBindingsR
 		// Non-admins can only filter to their own principal — or, for a
 		// delegated administrator, see that principal's bindings at the paths
 		// it administers.
-		self := isSelfPrincipal(req.Principal, caller, callerRealm(ctx))
+		self := isSelfPrincipal(req.Principal, caller, callerRealm(ctx)) ||
+			isCallerGroupPrincipal(req.Principal, callerRealm(ctx), callerGroups(ctx))
 		if !isAdmin && !self && !delegate {
 			return nil, status.Error(codes.PermissionDenied,
 				"non-admin callers may only list their own bindings")
@@ -224,7 +225,7 @@ func (s *Server) ListRoleBindings(ctx context.Context, req *pb.ListRoleBindingsR
 	} else {
 		rows, err = corrosion.ListRoleBindings(ctx, s.db)
 		if err == nil && !isAdmin {
-			own := filterBindingsForCaller(rows, caller, callerRealm(ctx))
+			own := filterBindingsForCaller(rows, caller, callerRealm(ctx), callerGroups(ctx)...)
 			seen := make(map[string]bool, len(own))
 			for _, b := range own {
 				seen[b.ID] = true
@@ -398,13 +399,13 @@ func filterBindings(all []corrosion.RoleBindingRecord, keep func(corrosion.RoleB
 	return out
 }
 
-func filterBindingsForCaller(all []corrosion.RoleBindingRecord, caller, realm string) []corrosion.RoleBindingRecord {
+func filterBindingsForCaller(all []corrosion.RoleBindingRecord, caller, realm string, groups ...string) []corrosion.RoleBindingRecord {
 	if caller == "" {
 		return nil
 	}
 	out := make([]corrosion.RoleBindingRecord, 0, len(all))
 	for _, b := range all {
-		if isSelfPrincipal(b.Principal, caller, realm) {
+		if isSelfPrincipal(b.Principal, caller, realm) || isCallerGroupPrincipal(b.Principal, realm, groups) {
 			out = append(out, b)
 		}
 	}
@@ -420,6 +421,21 @@ func isSelfPrincipal(principal, caller, realm string) bool {
 		realm = "local"
 	}
 	return principal == "user:"+caller || principal == "user:"+caller+"@"+realm
+}
+
+// isCallerGroupPrincipal reports whether principal is one of the caller's
+// session directory groups (group:<g>@<realm>), so a caller can see the
+// bindings that apply to them through a group.
+func isCallerGroupPrincipal(principal, realm string, groups []string) bool {
+	if realm == "" || realm == "local" {
+		return false
+	}
+	for _, g := range groups {
+		if principal == "group:"+g+"@"+realm {
+			return true
+		}
+	}
+	return false
 }
 
 func bindingToPB(b corrosion.RoleBindingRecord) *pb.RoleBinding {

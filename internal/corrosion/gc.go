@@ -138,6 +138,15 @@ func GCSupersededRows(ctx context.Context, c *Client, coreRetention, orphanReten
 		sessCutoff, sessCutoff); err != nil {
 		return counts, err
 	}
+	// session_groups — with their sessions, for session_factors' reasons: the
+	// row only ever widens ITS session, which can no longer authenticate.
+	if err := sweep("session_groups",
+		`DELETE FROM session_groups -- full-state-delete-ok: its session is pruned or past hard expiry, inert
+		 WHERE recorded_at < ?
+		   AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.id = session_groups.session_id AND s.expires_at >= ?)`,
+		sessCutoff, sessCutoff); err != nil {
+		return counts, err
+	}
 
 	// NOTE: runtime_action_proofs must NEVER be added to THIS local-only sweep. Unlike the
 	// inert rows above, a plain local delete of a proof is union-unsafe: a direct-RPC

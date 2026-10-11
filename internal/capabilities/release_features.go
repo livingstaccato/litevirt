@@ -123,8 +123,8 @@ var containerReplicationWriters = []string{
 }
 
 // loginPolicyWriters are the writers of login_policy's data: user_lifecycle,
-// the second-factor policy row, session_factors, user_enrollment_codes and
-// user_identity_bindings (the statement builders take the grant where a batch
+// the second-factor policy row, session_factors, session_groups,
+// user_enrollment_codes and user_identity_bindings (the statement builders take the grant where a batch
 // carries the login rules' part only when it is granted).
 var loginPolicyWriters = []string{
 	"internal/corrosion.SetUserLifecycle",
@@ -132,6 +132,7 @@ var loginPolicyWriters = []string{
 	"internal/corrosion.enableUserStatements",
 	"internal/corrosion.SetTwoFactorPolicy",
 	"internal/corrosion.InsertSessionWithFactor",
+	"internal/corrosion.InsertSessionWithLoginData",
 	"internal/corrosion.IssueEnrollmentCode",
 	"internal/corrosion.ConsumeEnrollmentCode",
 	"internal/corrosion.InvalidateEnrollmentCode",

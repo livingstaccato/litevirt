@@ -43,6 +43,7 @@ var antiEntropyExcluded = map[string]string{
 	"local_voter_seals":        "v62 the voter generations THIS node sealed as a survivor of a forced reconfiguration; a statement about this voter's own promises (§4.6). Written only through ExecuteLocal",
 	"local_incarnation_claims": "v63 a voter's promises and accepts at incarnation-scoped workload keys; LOCAL-only and in NO sync path, for local_recovery_claims' reasons (docs/design/recovery-claims.md §3.8, §10 item 37). Written only through ExecuteLocal",
 	"session_factors":          "v64 the second factor a session's login presented; as ephemeral as sessions, replicated through the WAL in the session's own batch, never full-state-merged",
+	"session_groups":           "v65 the directory groups a session's external-realm login verified; as ephemeral as sessions, replicated through the WAL in the session's own batch, never full-state-merged",
 	"netbox_sync_queue":        "work queue for the P2 NetBox inventory mirror (v51); a LATENCY optimisation only — the periodic full sweep is the correctness mechanism, so a lost/stale queue row self-heals on the next sweep (cf. vm_events/host_runtime_usage)",
 	// (user_2fa, recovery_codes, recovery_code_sets are now in sensitiveTableNames
 	//  — schema v32 made them LWW-repairable: soft-delete + active-set pointer.)

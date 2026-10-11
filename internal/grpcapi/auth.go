@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"slices"
 	"strings"
 	"time"
 
@@ -42,6 +43,10 @@ const (
 	// ctxKeyTokenID is the matched API token's id, so an open stream it
 	// authenticated can be re-checked (stream_watch.go).
 	ctxKeyTokenID
+	// ctxKeyGroups are the directory groups the session's external-realm
+	// login verified (corrosion.SessionGroups); each is a group:<g>@<realm>
+	// principal for role bindings.
+	ctxKeyGroups
 )
 
 const (
@@ -623,9 +628,14 @@ func (s *Server) authenticateForwardedBearer(ctx context.Context, val string) (c
 			role = ""
 			ctx = context.WithValue(ctx, ctxKeyEnrollOnly, true)
 		}
+		groups, err := s.sessionGroups(ctx, sid, sess.Realm)
+		if err != nil {
+			return nil, err
+		}
 		ctx = context.WithValue(ctx, ctxKeyUsername, user.Username)
 		ctx = context.WithValue(ctx, ctxKeyRole, role)
 		ctx = context.WithValue(ctx, ctxKeyRealm, sess.Realm)
+		ctx = context.WithValue(ctx, ctxKeyGroups, groups)
 		ctx = context.WithValue(ctx, ctxKeyAuthMethod, authMethodSession)
 		ctx = context.WithValue(ctx, ctxKeyPrincipalKind, principalKindPeer)
 		// The relayed session's id, so an enrollment through this peer ends
@@ -744,6 +754,10 @@ func (s *Server) authenticateSession(ctx context.Context, sid string) (context.C
 	if err != nil {
 		return nil, err
 	}
+	groups, err := s.sessionGroups(ctx, sid, sess.Realm)
+	if err != nil {
+		return nil, err
+	}
 	_ = corrosion.TouchSession(ctx, s.db, sid)
 	role := user.Role
 	if enrollOnly {
@@ -755,9 +769,34 @@ func (s *Server) authenticateSession(ctx context.Context, sid string) (context.C
 	ctx = context.WithValue(ctx, ctxKeyUsername, user.Username)
 	ctx = context.WithValue(ctx, ctxKeyRole, role)
 	ctx = context.WithValue(ctx, ctxKeyRealm, sess.Realm)
+	ctx = context.WithValue(ctx, ctxKeyGroups, groups)
 	ctx = context.WithValue(ctx, ctxKeySessionID, sid)
 	ctx = context.WithValue(ctx, ctxKeyAuthMethod, authMethodSession)
 	return ctx, nil
+}
+
+// sessionGroups reads the directory groups session sid's login verified. A
+// local-realm session has none. A read that fails refuses the request rather
+// than authorizing without them: having a binding at all switches a caller
+// from its legacy role to the bindings, so dropping a group can widen as well
+// as narrow (an account with a high legacy role and only a narrow group
+// binding).
+func (s *Server) sessionGroups(ctx context.Context, sid, realm string) ([]string, error) {
+	if realm == "" || realm == "local" {
+		return nil, nil
+	}
+	g, err := corrosion.SessionGroups(ctx, s.db, sid, realm)
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable,
+			"could not read the groups this session's login verified; refusing rather than guessing: %v", err)
+	}
+	return g, nil
+}
+
+// callerGroups returns the directory groups of the caller's session.
+func callerGroups(ctx context.Context) []string {
+	g, _ := ctx.Value(ctxKeyGroups).([]string)
+	return g
 }
 
 // callerSessionID returns the active session id when the caller authenticated
@@ -884,7 +923,7 @@ func (s *Server) RequirePerm(ctx context.Context, path, verb, fallbackRole strin
 	}
 
 	if s != nil && s.authEngine != nil {
-		principalIDs := principalsForCaller(user, role, callerRealm(ctx))
+		principalIDs := principalsForCaller(user, role, callerRealm(ctx), callerGroups(ctx)...)
 		if s.authEngine.HasAnyBinding(principalIDs) {
 			if s.authEngine.Allowed(principalIDs, verb, path) {
 				return nil
@@ -991,7 +1030,7 @@ func (s *Server) requirePermPrecheck(ctx context.Context, fallbackRole string) e
 		return status.Error(codes.Unauthenticated, "no authenticated principal")
 	}
 	if s != nil && s.authEngine != nil {
-		principalIDs := principalsForCaller(user, callerRole(ctx), callerRealm(ctx))
+		principalIDs := principalsForCaller(user, callerRole(ctx), callerRealm(ctx), callerGroups(ctx)...)
 		if s.authEngine.HasAnyBinding(principalIDs) {
 			// Binding-holder: defer to the per-path check after fetch.
 			return nil
@@ -1057,26 +1096,39 @@ func canonicalScopePath(p string) string {
 	return p
 }
 
-// principalsForCaller is the canonical mapping from (user, legacy-role, realm)
-// to the principal IDs the auth engine evaluates against. Emits the
-// realm-qualified `user:<u>@<realm>` and a synthetic `group:<role>@<realm>` so
-// legacy roles can be granted via role-bindings:
+// principalsForCaller is the canonical mapping from (user, legacy-role, realm,
+// verified groups) to the principal IDs the auth engine evaluates against.
+// Emits the realm-qualified `user:<u>@<realm>`, a synthetic
+// `group:<role>@<realm>` so legacy roles can be granted via role-bindings:
 //
 //	# Grant Admin to all admins:
 //	lv role grant Admin group:admin@local --path /
 //
+// and, for an external realm, `group:<g>@<realm>` for each directory group the
+// session's login verified (corrosion.SessionGroups). The engine grants the
+// union of every binding any of them holds.
+//
 // realm is the caller's authenticated realm (callerRealm); it defaults to
 // "local" so local users and callers without a realm in context behave exactly
-// as before. External OIDC/LDAP GROUP bindings still do not work — Principal
-// groups are not session-persisted yet (documented follow-up) — but the USER
-// principal is now realm-correct for every realm.
-func principalsForCaller(user, role, realm string) []string {
+// as before. Groups are never applied to the local realm: it has no directory.
+func principalsForCaller(user, role, realm string, groups ...string) []string {
 	if realm == "" {
 		realm = "local"
 	}
 	out := []string{"user:" + user + "@" + realm}
 	if role != "" {
 		out = append(out, "group:"+role+"@"+realm)
+	}
+	if realm != "local" {
+		for _, g := range groups {
+			if g == "" {
+				continue
+			}
+			p := "group:" + g + "@" + realm
+			if !slices.Contains(out, p) {
+				out = append(out, p)
+			}
+		}
 	}
 	return out
 }

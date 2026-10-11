@@ -1010,6 +1010,10 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		slog.Warn("promote: disk/NIC tuning is not applied to the defined domain",
 			"vm", targetName, "why", ioR.why())
 	}
+	// The limits, hot-add band and USB devices take their own gates the same
+	// way (never refusing the promotion), so the renamed copy's row below is
+	// written through the one writer that checks every grant its spec needs.
+	relR := s.restrictPromotedReleaseFeatures(ctx, &spec, renamed)
 
 	// A RENAMED promotion writes a SECOND VM row from this spec, with fresh MACs
 	// and no claim, while the original still holds its addresses — a guaranteed
@@ -1413,7 +1417,8 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		// PCI passthrough to carry (a disk replica has no hostdev record, so
 		// pciIntents is always nil here), and hardware_adoption_state stays at
 		// its schema default 'pending' for the Phase-6 backfill audit to confirm.
-		if err := s.insertVMForSpec(ctx, &spec, ioG, rec, ifaceRecords, diskRecords, nicRecords, nil, false); err != nil {
+		gs := vmSpecGrants{tuning: ioG, passthrough: relR.passthrough, limits: relR.limits}
+		if err := s.insertVMWithGrants(ctx, &spec, gs, rec, ifaceRecords, diskRecords, nicRecords, nil, false); err != nil {
 			return status.Errorf(codes.Internal, "persist promoted vm: %v", err)
 		}
 		// This branch and the transfer below are mutually EXCLUSIVE: a renamed
@@ -1447,6 +1452,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		op = "failover"
 	}
 	s.auditTuningDropped(ctx, ioR, targetName, op)
+	relR.audit(ctx, s, targetName, op)
 	s.recordForeignNetworks(ctx, "vm.promote", targetName, foreignNets)
 	_ = send(&pb.PromoteReplicaProgress{
 		Phase: pb.PromoteReplicaProgress_DONE, VmName: targetName, Host: s.hostName,

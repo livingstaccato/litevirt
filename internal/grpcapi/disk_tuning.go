@@ -441,7 +441,7 @@ type restoredTuning struct {
 	// stripped: the spec's tuning was dropped.
 	stripped bool
 	// grant is the feature's grant when the tuning is kept: the row this spec is
-	// written to must go through insertVMForSpec with it.
+	// written to must go through insertVMWithGrants with it.
 	grant capabilities.FeatureGrant
 	// refused is the gate's error when the token HAD latched but the gate still
 	// refused (a first use that could not be acknowledged, a host rolled back
@@ -500,18 +500,6 @@ func (s *Server) restrictRestoredTuning(ctx context.Context, spec *pb.VMSpec) (r
 	r.stripped = true
 	slog.Warn("restored spec: disk/NIC tuning dropped", "vm", spec.GetName(), "why", r.why())
 	return r, nil
-}
-
-// insertVMForSpec writes a new VM row. A spec that carries disk or NIC tuning
-// goes through the feature's writer with its grant; any other spec is written
-// exactly as before, so nothing main allows waits on the release token.
-func (s *Server) insertVMForSpec(ctx context.Context, spec *pb.VMSpec, g capabilities.FeatureGrant, vm corrosion.VMRecord,
-	ifaces []corrosion.InterfaceRecord, disks []corrosion.DiskRecord, nics []corrosion.NICRecord,
-	pciIntents []corrosion.PCIIntentRecord, adopt bool) error {
-	if specSetsDiskNICIO(spec) {
-		return corrosion.InsertVMWithTuning(ctx, s.db, g, vm, ifaces, disks, nics, pciIntents, adopt)
-	}
-	return corrosion.InsertVMWithHardware(ctx, s.db, vm, ifaces, disks, nics, pciIntents, adopt)
 }
 
 // requestsHardwareTuning reports whether an UpdateVM request redefines the

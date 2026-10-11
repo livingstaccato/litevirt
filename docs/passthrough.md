@@ -120,6 +120,12 @@ the virtio-win virtio-mem driver). `--memory-hotplug-max 0` on a stopped VM
 turns it off; the VM keeps its memory as fixed memory. A live restore from a
 manifest or a `--spec` restores fixed memory and no USB device (set them again
 with `lv update`); one `--from-existing` keeps them, judged as a create is.
+A promotion is never refused for them: it keeps the hot-add band once the
+release token has latched and the feature's gate grants it, and otherwise
+promotes with fixed memory (audited as `vm.release_features_dropped`). A
+renamed promotion (`--new-name`) is a second VM and, like a clone, does not
+carry the source's USB devices; CPU and NIC limits follow the same rule as the
+band.
 
 ## Container host mounts and devices
 

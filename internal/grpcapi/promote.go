@@ -1242,7 +1242,6 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			return o
 		}
 		var o sharedOwner
-		o.host, o.err = corrosion.GetHost(ctx, s.db, name)
 		// A `fenced` state is proof only over a proof-grade fence record
 		// (corrosion.HostProvedOff's rule, colonelpanik/litevirt#253), and a
 		// removed host, or one with no row, is no proof at all (review
@@ -1250,18 +1249,9 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		// daemon died may still run its qemu. fencing_log rows outlive the
 		// tombstone, and `lv host fence-confirm` records one for a removed host.
 		// For a removed host only a fence of its LAST life counts (review
-		// R4-I1): a removal writes no fence row, so the newest one can be about
-		// the machine removed under the name before it was re-added, or the
-		// same machine before it came back. A `fenced` state is written in one
-		// entry with its own row, so its newest row is always of this life.
-		if o.err == nil {
-			switch {
-			case o.host == nil || o.host.State == "removed":
-				o.provedOff, o.err = corrosion.RemovedHostProvedOff(ctx, s.db, name)
-			case o.host.State == "fenced":
-				o.provedOff, o.err = corrosion.FenceRecordProvesOff(ctx, s.db, name)
-			}
-		}
+		// R4-I1). The one reading every start built from the disk rows shares
+		// (corrosion.JudgeSharedDiskRows, review R4-I2).
+		o.host, o.provedOff, o.err = corrosion.SharedDiskOwnerProvedOff(ctx, s.db, name)
 		owners[name] = o
 		return o
 	}

@@ -619,23 +619,42 @@ old owner, so a second promotion of the same VM is judged by that old owner,
 exactly as the first was; and a row left naming a host the VM has since left
 does not excuse the host the VM was running on.
 
-The remedy is to prove the owner off **before** promoting: once it is powered
-off, `lv host fence-confirm <host>` (a removed host is accepted, see
+The remedy is to prove the owner off: once it is powered off,
+`lv host fence-confirm <host>` (a removed host is accepted, see
 docs/migration-failover.md), or an IPMI fence. A promotion made after that
-reattaches the disk. Confirming a removed host also lets the failover
+reattaches the disk, and so does the next start of a VM already promoted
+without it: `lv restart <vm>`. Confirming a removed host also lets the failover
 coordinator, with recovery claims enforced, recover every workload still
 recorded on it, possibly before your promotion runs. A node still on an older
 build answers "not found" for a removed host, so set `LV_HOST` to an upgraded
-node. No command attaches an existing disk at its path to a VM
-already promoted, and re-running `lv replication promote <vm> --force` over a
-partial promotion is not a remedy: it is refused. The promoted VM runs from
-live disks that promotion built and has written to them since, which no
-replica on that host holds, so a same-name promotion over a VM whose disk rows
-name such a live disk there is refused, `--force` or not, rather than
-rebuild them from a replica and discard those writes. To have both, promote
-the replica under another name (`--new-name`). Every refusal of a promotion
-comes before the domain already defined under the name is destroyed: a
-`--force` promotion replaces that domain only once nothing is left to refuse.
+node. Re-running `lv replication promote <vm> --force` over a partial
+promotion is not a remedy: it is refused. The promoted VM runs from live
+disks that promotion built and has written to them since, which no replica on
+that host holds, so a same-name promotion over a VM whose disk rows name such
+a live disk there is refused, `--force` or not, rather than rebuild them from
+a replica and discard those writes. To have both, promote the replica under
+another name (`--new-name`). Every refusal of a promotion comes before the
+domain already defined under the name is destroyed: a `--force` promotion
+replaces that domain only once nothing is left to refuse.
+
+A partial promotion leaves the unattached shared disk's row naming its old
+owner, and every domain built from a VM's disk rows judges such a row the
+same way: the reconciler's start (onboot, or the restart of a VM whose domain
+is gone), an operator's `lv start` or `lv restart` of a VM with a shared disk
+whose row names another host (the domain is redefined from the rows first),
+and a redefine by `lv update` or a device hot-plug. A shared disk whose row
+names another host is attached only when that host is proven powered off,
+as above; otherwise the domain is built without it, the VM starts anyway, and
+the VM records a `vm.shared_disk_withheld` event, a `vm.shared_disk_withheld`
+notification and a durable condition (`vm.shared_disk_withheld`, evaluator
+`shared_disk_start`) that `lv inspect <vm>` shows as `sharedDiskWithheld`
+until a build withholds nothing. It names each disk, why, and the remedy:
+`lv host fence-confirm <host>` once the host is powered off, then
+`lv restart <vm>`; or, when the host is up and does not run the VM (a row a
+move left behind), `lv doctor repair-owner <vm> <this host>`, which re-homes
+the VM's disk rows to the host running it, then `lv restart <vm>`. A disk
+whose row names this host or no host, or that is not on shared storage, is
+attached as before.
 
 "Shared" here is one definition, used by this rule and by every shared-disk
 fence check (failover's decision, the promoting host's, the host that starts
@@ -649,8 +668,8 @@ hung NFS mount is given up on, and the root is promoted without it). A
 renamed promotion never attaches it: the disk belongs to the original VM.
 Whenever it is not attached the VM is promoted exactly as main promoted it,
 and the partial report names it as shared at its path, with why, and either
-the remedy above (`lv host fence-confirm <host>` once it is powered off,
-before promoting, and not to re-run the promotion over this one) or, for a
+the remedy above (`lv host fence-confirm <host>` once it is powered off, then
+`lv restart <vm>`, and not to re-run the promotion over this one) or, for a
 renamed promotion, that it belongs to the original and must not be attached
 to the copy.
 

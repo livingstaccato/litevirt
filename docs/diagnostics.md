@@ -1358,6 +1358,23 @@ it with `lv resolve-pit-overlay <vm> <disk>`; `lv backup restore-from
 (a host that cannot see the disk never resolves it). Run that
 command without `--confirm` first: it prints the verdict, the disk's identity
 then and now, and what `--commit` and `--discard` would each do.
+
+### A VM started without a shared disk (`vm.shared_disk_withheld`)
+
+Evaluator `shared_disk_start`, subject kind `vm`, subject the VM's name,
+severity warning. Raised by the host that built the VM's domain from its disk
+rows — a reconciler or onboot start, an operator's start or restart that
+re-judged it, a redefine — without a shared disk whose row names another host
+that is not proven powered off (a partial promotion leaves such a row naming
+the VM's old owner; docs/backups.md). The VM was started, or defined, without
+that disk. The evidence names each disk, why, and the remedy: once that host
+is powered off, `lv host fence-confirm <host>`, then `lv restart <vm>`; or,
+when the host is up and does not run the VM, `lv doctor repair-owner <vm>
+<host running it>`, then `lv restart <vm>`. `lv inspect <vm>` shows the same
+text as `sharedDiskWithheld`. It is notified (`vm.shared_disk_withheld` event
+and notification) when raised or when its text changes, and resolves when the
+next build of the VM's domain withholds nothing.
+
 ### Deferred out-of-band stop sync after a restart or rejoin
 
 When a VM's domain is found shut off out of band (a crash, an external

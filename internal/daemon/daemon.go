@@ -1093,6 +1093,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// host is stopped on that proof, and only on it.
 	reconciler.SetSettleVerifier(svc.VerifySettleProof)
 	reconciler.SetPITOverlayReporter(svc.ReportPITOverlayHeld, svc.ClearPITOverlayHold)
+	reconciler.SetSharedDiskWithheldReporter(svc.ReportSharedDiskWithheld, svc.ClearSharedDiskWithheld)
 	svc.SetLeaseTermReady(func() bool {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()

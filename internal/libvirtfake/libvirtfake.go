@@ -19,6 +19,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -583,6 +584,16 @@ func (f *Fake) startDomain(name string, paused bool) error {
 	defer f.mu.Unlock()
 	if _, ok := f.domains[name]; !ok {
 		return fmt.Errorf("libvirtfake: domain %q not defined", name)
+	}
+	// A definition left on a point-in-time overlay (pit_snapshot.go) whose
+	// file is gone cannot start, as in libvirt: qemu cannot open the source.
+	for overlay, dom := range f.pitOn {
+		if dom != name {
+			continue
+		}
+		if _, err := os.Lstat(overlay); err != nil {
+			return fmt.Errorf("libvirtfake: start domain %q: Cannot access storage file '%s': %v", name, overlay, err)
+		}
 	}
 	if n, ok := f.lateWaits[name]; ok && n > 0 && f.domains[name] == StateRunning {
 		// A ShutdownLate guest still going down: libvirt refuses to start a

@@ -121,12 +121,7 @@ func (s *Server) ResolvePITOverlay(ctx context.Context, req *pb.ResolvePITOverla
 	if activity != activityInactive {
 		return nil, status.Errorf(codes.FailedPrecondition, "vm %q is running or its state is unknown; stop it before resolving its overlay", vm.Name)
 	}
-	repoint := func() error {
-		if s.pitSnapshotter != nil && s.virt != nil && s.virt.DomainExists(vm.Name) {
-			return s.pitSnapshotter.CommitDiskOverlay(vm.Name, d.Path, pitOverlayPath(d.Path), pitDiskFormat, nil)
-		}
-		return nil
-	}
+	repoint := func() error { return s.pointPITDefinitionAtDisk(vm, d) }
 	switch req.GetAction() {
 	case "commit":
 		safe := a.Verdict == pitoverlay.Matches || a.Verdict == pitoverlay.HalfWritten

@@ -3,10 +3,13 @@
 package diskmode
 
 import (
+	"bytes"
 	"errors"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 )
@@ -123,5 +126,31 @@ func TestNarrow_ClearsGroupAndOtherOnly(t *testing.T) {
 	}
 	if err := Narrow(dir); err == nil {
 		t.Error("Narrow of a directory succeeded")
+	}
+}
+
+// The best-effort forms never fail: a refused chmod is logged with the file
+// and the error.
+//
+// Mutation: NarrowBestEffort drops the log — this goes red.
+func TestBestEffort_ARefusedChmodWarnsNamingTheFile(t *testing.T) {
+	var buf bytes.Buffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(old) })
+	t.Cleanup(SetFchmodForTest(func(*os.File, fs.FileMode) error { return syscall.EPERM }))
+	p := filepath.Join(t.TempDir(), "disk")
+	if err := os.WriteFile(p, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(p, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	NarrowBestEffort(p)
+	if !strings.Contains(buf.String(), p) || !strings.Contains(buf.String(), "operation not permitted") {
+		t.Errorf("no warning naming %s and the error: %q", p, buf.String())
+	}
+	if err := Narrow(p); !errors.Is(err, syscall.EPERM) {
+		t.Errorf("Narrow with chmod refused = %v, want EPERM", err)
 	}
 }

@@ -17,7 +17,7 @@ import (
 //	LITEVIRT_E2E=1 LV_BIN=/usr/local/bin/litevirt E2E_LAB_DIR=~/litevirt-lab \
 //	  go test ./tests/e2e/ -run TestLab_DiskModes -v -timeout 30m
 //
-// Lab checks L1, L3, L4 of disk-modes-report.md.
+// Lab checks L1, L2 (linked clone), L3, L4 and L7 (seed) of disk-modes-report.md.
 
 // fileMode is path's permission bits, owner and group on host.
 func fileMode(l *lab, host, path string) (perm int64, owner string) {
@@ -47,11 +47,26 @@ func TestLab_DiskModes_NewDisksOwnerOnly(t *testing.T) {
 	l := newLab(t)
 	host, vm := snapTestVM(l, "dm")
 
+	// The test exists for the path where a NON-root qemu opens an owner-only
+	// disk because libvirt chowned it. With qemu as root, or libvirt not
+	// relabelling (dynamic_ownership = 0), every start below would pass
+	// without proving that, so the test says so and stops.
+	pid := strings.TrimSpace(l.mustSSH(host, 20*time.Second, "pgrep -f -- "+shellQuote("guest="+vm+",")+" | head -1"))
+	if pid == "" {
+		t.Fatalf("no qemu process for %s on %s", vm, host)
+	}
+	if user := strings.TrimSpace(l.mustSSH(host, 20*time.Second, "ps -o user= -p "+pid)); user == "root" {
+		t.Skipf("qemu runs as root on %s: an owner-only disk opens whatever libvirt does, so this proves nothing; run it on a host with a non-root qemu", host)
+	}
 	// L1: a new VM's disk, while running (libvirt's owner) and stopped.
 	disk := snapActiveDisk(l, host, vm)
-	requireOwnerOnly(l, host, disk, "running disk")
 	if _, owner := fileMode(l, host, disk); strings.HasPrefix(owner, "root:") {
-		l.mark("modes: the running disk is still root-owned (dynamic_ownership off, or qemu runs as root)")
+		t.Skipf("the running disk %s on %s is root-owned: libvirt does not relabel (dynamic_ownership = 0), so a non-root qemu could not have opened it and this proves nothing", disk, host)
+	}
+	requireOwnerOnly(l, host, disk, "running disk")
+	// L7: the VM's cloud-init seed (it carries the user-data), when it has one.
+	if seed := "/var/lib/litevirt/cloudinit/" + vm + ".iso"; l.fileExists(host, seed) {
+		requireOwnerOnly(l, host, seed, "cloud-init seed")
 	}
 
 	// L3: a disk-only and a memory snapshot; the VM keeps running, restores,
@@ -77,6 +92,26 @@ func TestLab_DiskModes_NewDisksOwnerOnly(t *testing.T) {
 	}
 	if !l.waitDomainState(host, vm, "running", 3*time.Minute) {
 		t.Fatalf("%s is not running after its start", vm)
+	}
+
+	// L2: a linked clone — an overlay on the source's owner-only disk —
+	// starts, and its overlay is owner-only. The source stays stopped while
+	// the clone runs on its disk.
+	snapStop(l, host, vm)
+	clone := vm + "-lc"
+	l.onRestore(func() {
+		l.lv(host, "rm", "--force", clone)
+		l.ssh(host, 30*time.Second, "rm -f /var/lib/litevirt/disks/"+shellQuote(clone)+"-*")
+	})
+	if out, err := l.lv(host, "clone", vm, clone, "--mode", "linked", "--start"); err != nil {
+		t.Fatalf("linked clone of %s: %v\n%s", vm, err, out)
+	}
+	if !l.waitDomainState(host, clone, "running", 3*time.Minute) {
+		t.Fatalf("the linked clone %s is not running", clone)
+	}
+	requireOwnerOnly(l, host, snapActiveDisk(l, host, clone), "linked clone overlay")
+	if out, err := l.lv(host, "rm", "--force", clone); err != nil {
+		t.Fatalf("remove the linked clone %s: %v\n%s", clone, err, out)
 	}
 
 	// L4: a cold migration writes the target's copy owner-only, and the VM

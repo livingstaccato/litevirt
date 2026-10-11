@@ -958,10 +958,9 @@ func convertImageWith(ctx context.Context, src, srcFormat string, rule chainRule
 	}
 	// Every caller hands qemu-img a 0600 file it made, whose mode qemu-img
 	// keeps; a dst qemu-img had to create itself is 0644 less the umask, and
-	// is narrowed to its owner before anything uses it (internal/diskmode).
-	if err := diskmode.Narrow(dst); err != nil {
-		return err
-	}
+	// is narrowed to its owner before anything uses it (internal/diskmode),
+	// best effort: a filesystem that refuses chmod never fails the copy.
+	diskmode.NarrowBestEffort(dst)
 	if err := qcow2.AssertStandalone(dst); err != nil {
 		return status.Errorf(codes.FailedPrecondition, "converted image is not standalone: %v", err)
 	}

@@ -146,10 +146,7 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotReque
 		if err != nil {
 			return err
 		}
-		if err := f.Chmod(diskmode.File); err != nil {
-			f.Close()
-			return err
-		}
+		diskmode.Restrict(f, diskmode.File) // best effort
 		has, werr := lv.WriteFirmwareBundle(s.dataDir, req.VmName, fwUUID, f)
 		f.Close()
 		if werr != nil {

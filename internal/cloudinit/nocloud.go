@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/diskmode"
 	"github.com/litevirt/litevirt/internal/randid"
@@ -58,6 +59,7 @@ func GenerateISO(cfg Config, outputPath string) error {
 	// attached to the guest as a disk, so it is owner-only like one
 	// (internal/diskmode): genisoimage writes into a 0600 file made for it
 	// (it keeps an existing file's mode), which then takes the seed's name.
+	sweepStaleSeedTemps(outputPath)
 	tmp := filepath.Join(filepath.Dir(outputPath), "."+filepath.Base(outputPath)+"."+randid.New()+".tmp")
 	if err := diskmode.Create(tmp); err != nil {
 		return fmt.Errorf("create seed: %w", err)
@@ -77,11 +79,28 @@ func GenerateISO(cfg Config, outputPath string) error {
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("genisoimage: %s: %w", string(output), err)
 	}
-	if err := diskmode.Narrow(tmp); err != nil {
-		return fmt.Errorf("seed: %w", err)
-	}
+	diskmode.NarrowBestEffort(tmp)
 	if err := os.Rename(tmp, outputPath); err != nil {
 		return fmt.Errorf("place seed: %w", err)
 	}
 	return nil
+}
+
+// staleSeedTempAge is how old a seed temp is before a later generation of the
+// same seed removes it as a crashed run's: no genisoimage run takes that long,
+// so a concurrent run's temp is never touched.
+const staleSeedTempAge = time.Hour
+
+// sweepStaleSeedTemps removes the temps of outputPath a run that died between
+// making its temp and renaming it left behind: they hold the user-data. Best
+// effort.
+func sweepStaleSeedTemps(outputPath string) {
+	matches, _ := filepath.Glob(filepath.Join(filepath.Dir(outputPath), "."+filepath.Base(outputPath)+".*.tmp"))
+	for _, m := range matches {
+		fi, err := os.Lstat(m)
+		if err != nil || !fi.Mode().IsRegular() || time.Since(fi.ModTime()) < staleSeedTempAge {
+			continue
+		}
+		_ = os.Remove(m)
+	}
 }

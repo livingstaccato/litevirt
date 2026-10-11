@@ -174,8 +174,10 @@ were already `0600`. Snapshot overlays and memory images libvirt makes itself
 are narrowed to their owner once the snapshot is taken.
 
 A directory litevirt makes to hold disks — the data directory's `disks`,
-`images` and `cloudinit` on a new host, a pool directory, a btrfs disk's
-subvolume, an NVRAM or snapshot directory — is `0711`: every user can reach a
+`images` and `cloudinit` on a new host, a pool directory (made for a disk, an
+import, a clone, a restore, a replica, a hotplugged disk, an upload, or the
+destination of a migration or a live move), a btrfs disk's subvolume, an NVRAM
+or snapshot directory — is `0711`: every user can reach a
 file in it by name, which qemu needs (libvirt labels files, never the
 directories above them), and nobody but root can list it.
 
@@ -189,6 +191,15 @@ not root could not open a writable `0644` disk either; it runs qemu as root, for
 which `0600` is the same. On a root-squashed NFS export, the daemon's files
 belong to the export's anonymous user, so qemu opens them as their owner only
 when that user is qemu's (`anonuid`), which a writable disk needed before too.
+Read-only files are the one change there: a cloud-init seed or a backing file
+the daemon writes onto a plain root-squashed export (anonymous user not qemu's)
+was readable by qemu as "other" and no longer is, and libvirt cannot chown it.
+Put the data directory and image-backed disks on such an export only with
+`anonuid` set to qemu's user, or with `no_root_squash`.
+
+A narrowing is never what fails an operation: on a filesystem that refuses
+chmod, the file keeps the mode it was made with — already `0600` for every disk
+litevirt makes — and the daemon logs a warning naming it.
 
 ### Directory pools on NFS
 

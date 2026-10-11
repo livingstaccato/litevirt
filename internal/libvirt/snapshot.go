@@ -172,16 +172,25 @@ func (c *Client) CreateSnapshot(domainName, snapshotName string) (int64, error) 
 	if err != nil {
 		return 0, err
 	}
-	before, _ := c.virt.DomainGetXMLDesc(dom, 0)
 	flags := uint32(golibvirt.DomainSnapshotCreateDiskOnly | golibvirt.DomainSnapshotCreateAtomic)
-	_, err = c.virt.DomainSnapshotCreateXML(dom, xml, flags)
-	if err != nil {
+	if err := snapshotDisksNarrowed(c.virt, dom, xml, flags); err != nil {
 		return 0, err
 	}
-	if after, aerr := c.virt.DomainGetXMLDesc(dom, 0); aerr == nil {
+	return int64(allocation), nil
+}
+
+// snapshotDisksNarrowed takes the disk snapshot xml describes and narrows the
+// overlays libvirt made for it to their owner (best effort; the snapshot
+// stands either way). Files the domain named before are never touched.
+func snapshotDisksNarrowed(v snapshotAPI, dom golibvirt.Domain, xml string, flags uint32) error {
+	before, _ := v.DomainGetXMLDesc(dom, 0)
+	if _, err := v.DomainSnapshotCreateXML(dom, xml, flags); err != nil {
+		return err
+	}
+	if after, aerr := v.DomainGetXMLDesc(dom, 0); aerr == nil {
 		narrowNew(newDiskSources(before, after)...)
 	}
-	return int64(allocation), nil
+	return nil
 }
 
 // newDiskSources returns the disk files afterXML names that beforeXML did
@@ -212,9 +221,7 @@ func newDiskSources(beforeXML, afterXML string) []string {
 // snapshot stands either way, and a failure is logged.
 func narrowNew(paths ...string) {
 	for _, p := range paths {
-		if err := diskmode.Narrow(p); err != nil {
-			slog.Warn("a new snapshot file could not be narrowed to its owner", "path", p, "error", err)
-		}
+		diskmode.NarrowBestEffort(p)
 	}
 }
 
@@ -668,13 +675,9 @@ func (c *Client) CreateLiveSnapshot(domainName, snapshotName, vmstatePath string
 	if err != nil {
 		return 0, 0, err
 	}
-	before, _ := c.virt.DomainGetXMLDesc(dom, 0)
 	flags := uint32(golibvirt.DomainSnapshotCreateDiskOnly | golibvirt.DomainSnapshotCreateAtomic)
-	if _, err := c.virt.DomainSnapshotCreateXML(dom, snapXML, flags); err != nil {
+	if err := snapshotDisksNarrowed(c.virt, dom, snapXML, flags); err != nil {
 		return 0, 0, fmt.Errorf("disk snapshot: %w", err)
-	}
-	if after, aerr := c.virt.DomainGetXMLDesc(dom, 0); aerr == nil {
-		narrowNew(newDiskSources(before, after)...)
 	}
 	allocation, _, _, _ := c.virt.DomainGetBlockInfo(dom, "vda", 0)
 
@@ -1371,7 +1374,8 @@ func resetOverlay(overlay, base string) error {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("qemu-img create: %w: %s", err, strings.TrimSpace(string(out)))
 	}
-	return diskmode.Narrow(overlay)
+	diskmode.NarrowBestEffort(overlay) // the revert stands whatever chmod does
+	return nil
 }
 
 // restoreWithRetry calls DomainRestoreFlags (as running) retrying on virtlockd

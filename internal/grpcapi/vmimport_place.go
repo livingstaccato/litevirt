@@ -133,10 +133,9 @@ func copyIntoPlace(ctx context.Context, src, dst string, w *importDiskWrites) er
 		dropTemp()
 		return err
 	}
-	// A disk: owner-only, whatever the mode of what is copied (internal/diskmode).
-	if err := out.Chmod(diskmode.File); err != nil {
-		return fail(err)
-	}
+	// A disk: owner-only, whatever the mode of what is copied (internal/diskmode);
+	// best effort, so a filesystem that refuses chmod never fails the import.
+	diskmode.Restrict(out, diskmode.File)
 	if err := placeCopy(ctx, out, in, math.MaxInt64); err != nil {
 		return fail(err)
 	}

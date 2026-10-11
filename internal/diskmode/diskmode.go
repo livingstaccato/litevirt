@@ -26,6 +26,7 @@ package diskmode
 import (
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
 	"syscall"
 )
@@ -78,5 +79,39 @@ func Narrow(path string) error {
 	if perm&0o077 == 0 {
 		return nil
 	}
-	return f.Chmod(perm &^ 0o077)
+	return fchmod(f, perm&^0o077)
+}
+
+// NarrowBestEffort is Narrow for a file whose operation main allowed without
+// any chmod: a narrowing that fails — a filesystem that refuses chmod — is
+// logged with the file and the error, and the operation goes on. Every caller
+// made the file owner-only already, or had a tool write into one it made; this
+// is the backstop.
+func NarrowBestEffort(path string) {
+	if err := Narrow(path); err != nil {
+		slog.Warn("a new disk file could not be narrowed to its owner; it keeps the mode it was made with",
+			"path", path, "error", err)
+	}
+}
+
+// Restrict sets f, which the caller has just made, to mode — best effort, as
+// NarrowBestEffort: a refused chmod is logged with the file and the error, and
+// never fails the operation.
+func Restrict(f *os.File, mode fs.FileMode) {
+	if err := fchmod(f, mode); err != nil {
+		slog.Warn("a new disk file or directory could not be set to its mode; it keeps the mode it was made with",
+			"path", f.Name(), "mode", fmt.Sprintf("%04o", mode), "error", err)
+	}
+}
+
+// fchmod is f.Chmod; a variable so a test can stand in a filesystem that
+// refuses chmod.
+var fchmod = func(f *os.File, mode fs.FileMode) error { return f.Chmod(mode) }
+
+// SetFchmodForTest replaces the chmod every function here uses, for a test of
+// a filesystem that refuses it, and returns the restore.
+func SetFchmodForTest(fn func(*os.File, fs.FileMode) error) (restore func()) {
+	old := fchmod
+	fchmod = fn
+	return func() { fchmod = old }
 }

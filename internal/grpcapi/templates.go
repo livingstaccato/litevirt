@@ -22,6 +22,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/cloudinit"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/diskmode"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/qcow2"
@@ -345,7 +346,7 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 		// hostFile is where this host's copy of the clone's disk file is: the
 		// recorded path itself, except under the hostDiskRoot test seam.
 		hostFile := s.hostDiskFile(clonePath)
-		if err := os.MkdirAll(filepath.Dir(hostFile), 0755); err != nil {
+		if err := diskmode.MkdirAll(filepath.Dir(hostFile)); err != nil {
 			cleanup()
 			return nil, status.Errorf(codes.Internal, "prepare disk dir: %v", err)
 		}

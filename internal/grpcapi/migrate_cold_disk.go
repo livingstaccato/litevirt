@@ -516,9 +516,8 @@ func (s *Server) ReceiveMigrationDisk(stream grpc.ClientStreamingServer[pb.Recei
 	}
 	// The copy is a new file: owner-only, whatever the source's mode was
 	// (internal/diskmode).
-	if err := tmp.Chmod(diskmode.File); err != nil {
-		return status.Errorf(codes.Internal, "chmod %s: %v", hdr.Path, err)
-	}
+	// Best effort: a filesystem that refuses chmod never fails the copy.
+	diskmode.Restrict(tmp, diskmode.File)
 	if err := tmp.Sync(); err != nil {
 		return status.Errorf(codes.Internal, "sync %s: %v", hdr.Path, err)
 	}

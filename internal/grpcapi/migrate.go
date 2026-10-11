@@ -22,6 +22,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/cloudinit"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/diskmode"
 	"github.com/litevirt/litevirt/internal/dns"
 	"github.com/litevirt/litevirt/internal/hooks"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
@@ -1300,7 +1301,7 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 			s.migrationStubs.forget(stub.Path)
 		}
 		dir := filepath.Dir(stub.Path)
-		if err := os.MkdirAll(dir, 0755); err != nil {
+		if err := diskmode.MkdirAll(dir); err != nil {
 			undo()
 			return nil, status.Errorf(codes.Internal, "create disk dir %s: %v", dir, err)
 		}

@@ -15,6 +15,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/diskmode"
 	"github.com/litevirt/litevirt/internal/safename"
 	"github.com/litevirt/litevirt/internal/storage"
 	"google.golang.org/grpc"
@@ -607,7 +608,7 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 			return err
 		}
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := diskmode.MkdirAll(dir); err != nil {
 		return status.Errorf(codes.Internal, "mkdir: %v", err)
 	}
 	hasher := sha256.New()

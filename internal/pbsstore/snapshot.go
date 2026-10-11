@@ -196,7 +196,7 @@ func RestoreToFile(ctx context.Context, repo *Repo, m *Manifest, dst string, opt
 		return fmt.Errorf("open restore temp: %w", err)
 	}
 	tmp := f.Name()
-	_ = f.Chmod(diskmode.File)
+	diskmode.Restrict(f, diskmode.File)
 	committed := false
 	defer func() {
 		if !committed {

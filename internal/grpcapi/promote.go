@@ -1168,13 +1168,18 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 
 	// Every other disk of the VM that has a replica here is recovered too
 	// (replica_set.go): the replica of the root's run, else the newest from
-	// before it. One that cannot be recovered never stops the promotion — main
-	// promoted the root alone — it is named in the manifest and the VM is
-	// marked partial.
+	// before it. A disk on shared storage is never rebuilt from a replica: it
+	// is reattached as-is. One that cannot be recovered never stops the
+	// promotion — main promoted the root alone — it is named in the manifest
+	// and the VM is marked partial.
 	rootTaken := replicaRec.Taken
 	if rootTaken == "" {
 		if t, ok := replicaTimestamp(replica); ok {
 			rootTaken = t.UTC().Format("20060102-150405")
+		} else if fi, serr := os.Stat(replicaPath); serr == nil {
+			// An admin-named file with no stamp: the time it was written,
+			// so the "never newer than the root" filter still holds.
+			rootTaken = fi.ModTime().UTC().Format("20060102-150405")
 		}
 	}
 	vmDisks, err := corrosion.GetVMDisks(ctx, s.db, vm.Name)
@@ -1184,10 +1189,53 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		}
 		return status.Errorf(codes.Unavailable, "list the disks of %s: %v", vm.Name, err)
 	}
-	acceptNotPIT := req.AcceptNotPointInTime || ((automated || req.Proof != nil) && vmAllowsAutoPromoteNotPIT(vm))
-	others := chooseSetReplicas(poolDir, vm.Project, vm.Name, rootTaken, replicaSetOthers(vmDisks, src), acceptNotPIT)
+	autoPath := automated || req.Proof != nil
+	acceptNotPIT := req.AcceptNotPointInTime || (autoPath && vmAllowsAutoPromoteNotPIT(vm))
+	var otherAgeLimit time.Duration
+	if autoPath {
+		// The bound the root's replica passed applies to every disk's.
+		sched, _ := s.replicationScheduleForVM(ctx, vm.Name)
+		otherAgeLimit = autoPromoteAgeLimit(sched.Cron)
+	}
+	others := chooseSetReplicas(poolDir, vm.Project, vm.Name, rootTaken, replicaSetOthers(vmDisks, src),
+		func(d corrosion.DiskRecord) bool { return s.diskOnSharedStorage(ctx, d) }, acceptNotPIT, otherAgeLimit, time.Now())
+	// A crash-recovery adoption attaches only what the running domain has.
+	adoptedXML := ""
+	if started {
+		adoptedXML, _ = s.virt.DumpXML(targetName)
+	}
+	inAdopted := func(path string) bool {
+		return adoptedXML != "" && (strings.Contains(adoptedXML, "'"+path+"'") || strings.Contains(adoptedXML, `"`+path+`"`))
+	}
+	// Whether a shared disk may be reattached as-is: only by a takeover (a
+	// renamed promotion would give two VMs one writable disk), and only once
+	// the old owner is not an active host (an automated promotion's shared-disk
+	// fence was verified above).
+	ownerActive := false
+	if vm.HostName != "" && vm.HostName != s.hostName {
+		if h, _ := corrosion.GetHost(ctx, s.db, vm.HostName); h != nil && h.State == "active" {
+			ownerActive = true
+		}
+	}
 	for i := range others {
 		d := &others[i]
+		if d.shared {
+			switch {
+			case renamed:
+				d.missing = "a renamed promotion never shares a writable disk with the original"
+			case ownerActive:
+				d.missing = fmt.Sprintf("its owner %s is still an active host", vm.HostName)
+			case started && !inAdopted(d.row.Path):
+				d.missing = "not attached by the attempt that started the domain"
+			default:
+				if _, serr := os.Stat(s.hostDiskFile(d.row.Path)); serr != nil {
+					d.missing = fmt.Sprintf("not reachable from %s: %v", s.hostName, serr)
+				} else {
+					d.livePath = d.row.Path
+				}
+			}
+			continue
+		}
 		if !d.recovered() {
 			continue
 		}
@@ -1195,8 +1243,26 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			strings.TrimSuffix(strings.TrimSuffix(d.replica.File, ".qcow2"), ".raw")))
 		step := "disk_built:" + d.row.DiskName
 		_, statErr := os.Stat(d.livePath)
-		if started || promoteDiskBuilt(stepDone(step), statErr == nil) {
+		if started {
+			// Adopting a domain an earlier attempt started: the disk counts
+			// only if its built file is there and the domain has it.
+			if statErr != nil || !inAdopted(d.livePath) {
+				d.missing = "not built or not attached by the attempt that started the domain"
+				d.livePath = ""
+			}
 			continue
+		}
+		if promoteDiskBuilt(stepDone(step), statErr == nil) {
+			continue
+		}
+		if statErr == nil {
+			// Something is at the name — a crashed earlier attempt's file, or
+			// anyone's. Never removed and never reused: the live disk is
+			// built beside it under a fresh name.
+			alt := strings.TrimSuffix(d.livePath, ".qcow2") + "-" + randid.New() + ".qcow2"
+			slog.Warn("promote: a file is already where the live disk would go; left alone, building beside it",
+				"vm", vm.Name, "disk", d.row.DiskName, "path", d.livePath, "instead", alt)
+			d.livePath = alt
 		}
 		if err := s.buildPromotedDisk(ctx, req, targetName, poolDir, d.replica.File, d.replicaPath, d.replica.Format, d.livePath, send); err != nil {
 			slog.Error("promote: a disk of the replica set could not be built; promoting without it",
@@ -1207,19 +1273,15 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		}
 		recordStep(step)
 	}
-	// Every live disk this promotion built, for the error paths below.
+	// Every live disk this promotion built, for the error paths below. A
+	// shared disk is never removed.
 	removeLive := func() {
 		os.Remove(livePath)
 		for _, d := range others {
-			if d.recovered() && d.livePath != "" {
+			if d.built() {
 				os.Remove(d.livePath)
 			}
 		}
-	}
-	manifest, partial := promotionManifest(src.DiskName, replica, rootTaken, s.hostName, others)
-	multiDiskNote := ""
-	if partial != "" {
-		multiDiskNote = " (" + partial + ")"
 	}
 
 	// Rebuild the promoted disk's bus/controller from the stored spec (not
@@ -1235,46 +1297,59 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			break
 		}
 	}
-	diskCfg := []lv.DiskConfig{{Name: src.DiskName, Path: livePath, Bus: promBus, ControllerModel: promCtrl}}
-	diskRecords := []corrosion.DiskRecord{{
-		VMName: targetName, DiskName: src.DiskName, HostName: s.hostName,
-		Path: livePath, SizeBytes: src.SizeBytes, StorageType: poolRef.Driver,
-		StorageVolume: pool, TargetDev: lv.DiskDevName(promBus, 0), Bus: promBus,
-		BackingDisk: liveDiskBacking(livePath, replicaPath),
-	}}
-	// The other recovered disks, each on its own bus and controller and at
-	// its own target device, so the guest finds each where it was — also
-	// when a disk between them was not recovered.
-	for i, d := range others {
-		if !d.recovered() {
-			continue
-		}
-		bus, ctrl := d.row.Bus, d.row.ControllerModel
+	rootDev := lv.DiskDevName(promBus, 0)
+	// The other attached disks, each on its own bus and controller and at
+	// its own target device — its stored one unless that collides — so the
+	// guest finds each where it was, also when a disk between them is missing.
+	for i := range others {
+		d := &others[i]
+		d.bus, d.ctrl = d.row.Bus, d.row.ControllerModel
 		for _, ds := range spec.Disks {
 			if ds.Name == d.row.DiskName {
 				if ds.Bus != "" {
-					bus = ds.Bus
+					d.bus = ds.Bus
 				}
 				if ds.ControllerModel != "" {
-					ctrl = ds.ControllerModel
+					d.ctrl = ds.ControllerModel
 				}
 				break
 			}
 		}
-		if bus == "" {
-			bus = "virtio"
+		if d.bus == "" {
+			d.bus = "virtio"
 		}
-		dev := d.row.TargetDev
-		if dev == "" {
-			dev = lv.DiskDevName(bus, i+1)
+	}
+	assignTargetDevs(rootDev, others)
+	setDisks := func() ([]lv.DiskConfig, []corrosion.DiskRecord) {
+		cfg := []lv.DiskConfig{{Name: src.DiskName, Path: livePath, Bus: promBus, ControllerModel: promCtrl, TargetDev: rootDev}}
+		recs := []corrosion.DiskRecord{{
+			VMName: targetName, DiskName: src.DiskName, HostName: s.hostName,
+			Path: livePath, SizeBytes: src.SizeBytes, StorageType: poolRef.Driver,
+			StorageVolume: pool, TargetDev: rootDev, Bus: promBus,
+			BackingDisk: liveDiskBacking(livePath, replicaPath),
+		}}
+		for _, d := range others {
+			if !d.recovered() {
+				continue
+			}
+			cfg = append(cfg, lv.DiskConfig{Name: d.row.DiskName, Path: d.livePath, Bus: d.bus, ControllerModel: d.ctrl, TargetDev: d.dev})
+			if d.shared {
+				continue // its row stays exactly as it was
+			}
+			recs = append(recs, corrosion.DiskRecord{
+				VMName: targetName, DiskName: d.row.DiskName, HostName: s.hostName,
+				Path: d.livePath, SizeBytes: d.row.SizeBytes, StorageType: poolRef.Driver,
+				StorageVolume: pool, TargetDev: d.dev, Bus: d.bus, ControllerModel: d.ctrl,
+				BackingDisk: liveDiskBacking(d.livePath, d.replicaPath),
+			})
 		}
-		diskCfg = append(diskCfg, lv.DiskConfig{Name: d.row.DiskName, Path: d.livePath, Bus: bus, ControllerModel: ctrl, TargetDev: dev})
-		diskRecords = append(diskRecords, corrosion.DiskRecord{
-			VMName: targetName, DiskName: d.row.DiskName, HostName: s.hostName,
-			Path: d.livePath, SizeBytes: d.row.SizeBytes, StorageType: poolRef.Driver,
-			StorageVolume: pool, TargetDev: dev, Bus: bus, ControllerModel: ctrl,
-			BackingDisk: liveDiskBacking(d.livePath, d.replicaPath),
-		})
+		return cfg, recs
+	}
+	diskCfg, diskRecords := setDisks()
+	_, partialNote := promotionManifest(src.DiskName, replica, rootTaken, s.hostName, others)
+	multiDiskNote := ""
+	if partialNote != "" {
+		multiDiskNote = " (" + partialNote + ")"
 	}
 
 	var netCfg []lv.NetworkConfig
@@ -1313,68 +1388,108 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	// Define + start — skipped on a resume where the domain was already started by
 	// this proof (guarded above at the destroy step); persist below is idempotent.
 	if !started {
-		domXML, err := lv.GenerateDomainXML(lv.VMConfig{
-			Name: targetName, CPU: int(spec.Cpu), CPUMode: spec.CpuMode, CPUModel: spec.CpuModel,
-			MemoryMiB: int(spec.MemoryMib), Machine: spec.Machine, Firmware: spec.Firmware,
-			GuestAgent: spec.GuestAgent, EnableVNC: !spec.DisableVnc, EnableSPICE: spec.EnableSpice,
-			Disks: diskCfg, Networks: netCfg, Boot: spec.Boot,
-			// Memory hot-add carried, as every definer does (domainconfig.go).
-			HotplugBaseMiB: int(spec.MemoryHotplugBaseMib), HotplugMaxMiB: int(spec.MemoryHotplugMaxMib),
-		})
+		// attempt defines and starts the domain on disks; stage names the
+		// step that failed.
+		attempt := func(disks []lv.DiskConfig) (string, error) {
+			domXML, err := lv.GenerateDomainXML(lv.VMConfig{
+				Name: targetName, CPU: int(spec.Cpu), CPUMode: spec.CpuMode, CPUModel: spec.CpuModel,
+				MemoryMiB: int(spec.MemoryMib), Machine: spec.Machine, Firmware: spec.Firmware,
+				GuestAgent: spec.GuestAgent, EnableVNC: !spec.DisableVnc, EnableSPICE: spec.EnableSpice,
+				Disks: disks, Networks: netCfg, Boot: spec.Boot,
+				// Memory hot-add carried, as every definer does (domainconfig.go).
+				HotplugBaseMiB: int(spec.MemoryHotplugBaseMib), HotplugMaxMiB: int(spec.MemoryHotplugMaxMib),
+			})
+			if err != nil {
+				return "generate domain XML", err
+			}
+			_ = send(&pb.PromoteReplicaProgress{
+				Phase: pb.PromoteReplicaProgress_DEFINING, VmName: targetName, Host: s.hostName,
+				Replica: replica, DiskPath: livePath, Status: "defining domain" + multiDiskNote,
+			})
+			if err := s.virt.DefineDomain(domXML); err != nil {
+				return "define domain", err
+			}
+			s.ensureSparePCIeRootPorts(targetName)
+			// Durable checkpoints BEFORE the start, so a crash between StartDomain and the
+			// "started" checkpoint still lets a retry recognize the running domain as ours
+			// (via the running-domain observation above) instead of destroying it. The
+			// proof-keyed step covers a SAME-proof retry; the host-local promote marker covers
+			// a CROSS-proof retry (each failover cycle mints a fresh proof). Written before the
+			// start (fail closed on a marker error — nothing is running yet).
+			// The start checkpoint doubles as the abandonment fence
+			// (docs/design/recovery-claims.md §3.12): a destination abandons only a
+			// proof that never started, so the checkpoint is appended only if this
+			// host has not abandoned the proof — decided in one transaction, which
+			// is what makes "abandon only what never ran" exact.
+			if proofID != "" {
+				if err := corrosion.AppendProofStepUnlessAbandoned(ctx, s.db, proofID, "start_attempted"); err != nil {
+					_ = s.virt.UndefineDomain(targetName, false)
+					return "checkpoint", err
+				}
+			}
+			if err := s.writePromoteMarker(targetName, proofID); err != nil {
+				return "marker", err
+			}
+			if err := s.virt.StartDomain(targetName); err != nil {
+				_ = s.virt.UndefineDomain(targetName, false) // wipe by design: half-built promote
+				// Don't leak the marker: we tore the half-built domain down, so a later --force
+				// retry must not treat a same-name stranger as our adopted prior promotion.
+				s.removePromoteMarker(targetName)
+				return "start domain", err
+			}
+			return "", nil
+		}
+		stage, err := attempt(diskCfg)
+		if err != nil && len(diskCfg) > 1 && (stage == "generate domain XML" || stage == "define domain" || stage == "start domain") {
+			// The other disks may be why: the root alone is what main
+			// promoted, so that is tried before giving up — never a fall back
+			// to a reschedule where main's promotion would have succeeded.
+			slog.Error("promote: the domain failed with the other disks of the set; retrying with the root disk alone",
+				"vm", vm.Name, "stage", stage, "error", err)
+			_ = s.virt.UndefineDomain(targetName, false)
+			for i := range others {
+				d := &others[i]
+				if !d.recovered() {
+					continue
+				}
+				if d.built() {
+					os.Remove(d.livePath)
+				}
+				d.missing = fmt.Sprintf("the domain failed to %s with it (%v), so it was promoted with the root disk alone", strings.TrimSuffix(stage, " domain"), err)
+				if stage == "generate domain XML" {
+					d.missing = fmt.Sprintf("the domain XML could not be generated with it (%v), so it was promoted with the root disk alone", err)
+				}
+				d.livePath = ""
+			}
+			diskCfg, diskRecords = setDisks()
+			stage, err = attempt(diskCfg)
+		}
 		if err != nil {
 			removeLive()
-			return status.Errorf(codes.Internal, "generate domain XML: %v", err)
-		}
-
-		_ = send(&pb.PromoteReplicaProgress{
-			Phase: pb.PromoteReplicaProgress_DEFINING, VmName: targetName, Host: s.hostName,
-			Replica: replica, DiskPath: livePath, Status: "defining domain" + multiDiskNote,
-		})
-		if err := s.virt.DefineDomain(domXML); err != nil {
-			removeLive()
-			return status.Errorf(codes.Internal, "define domain: %v", err)
-		}
-		s.ensureSparePCIeRootPorts(targetName)
-		// Durable checkpoints BEFORE the start, so a crash between StartDomain and the
-		// "started" checkpoint still lets a retry recognize the running domain as ours
-		// (via the running-domain observation above) instead of destroying it. The
-		// proof-keyed step covers a SAME-proof retry; the host-local promote marker covers
-		// a CROSS-proof retry (each failover cycle mints a fresh proof). Written before the
-		// start (fail closed on a marker error — nothing is running yet).
-		// The start checkpoint doubles as the abandonment fence
-		// (docs/design/recovery-claims.md §3.12): a destination abandons only a
-		// proof that never started, so the checkpoint is appended only if this
-		// host has not abandoned the proof — decided in one transaction, which
-		// is what makes "abandon only what never ran" exact.
-		if proofID != "" {
-			if err := corrosion.AppendProofStepUnlessAbandoned(ctx, s.db, proofID, "start_attempted"); err != nil {
-				removeLive()
-				_ = s.virt.UndefineDomain(targetName, false)
+			switch stage {
+			case "checkpoint":
 				if errors.Is(err, corrosion.ErrProofAbandoned) {
 					s.noteGateRefused(corrosion.ActionPromote, health.ReasonClaimLost)
 					return status.Errorf(codes.FailedPrecondition,
 						"promote of %s refused: this host abandoned proof %s and will never execute it", vm.Name, proofID)
 				}
 				return status.Errorf(codes.Unavailable, "record the start checkpoint of proof %s: %v", proofID, err)
+			case "marker":
+				return status.Errorf(codes.Internal, "record promote marker: %v", err)
+			default:
+				return status.Errorf(codes.Internal, "%s: %v", stage, err)
 			}
-		}
-		if err := s.writePromoteMarker(targetName, proofID); err != nil {
-			removeLive()
-			return status.Errorf(codes.Internal, "record promote marker: %v", err)
-		}
-		if err := s.virt.StartDomain(targetName); err != nil {
-			_ = s.virt.UndefineDomain(targetName, false) // wipe by design: half-built promote
-			removeLive()
-			// Don't leak the marker: we tore the half-built domain down, so a later --force
-			// retry must not treat a same-name stranger as our adopted prior promotion.
-			s.removePromoteMarker(targetName)
-			return status.Errorf(codes.Internal, "start domain: %v", err)
 		}
 		recordStep("started") // checkpoint: never destroy/rebuild this domain on a retry
 		_ = send(&pb.PromoteReplicaProgress{
 			Phase: pb.PromoteReplicaProgress_STARTED, VmName: targetName, Host: s.hostName,
 			Replica: replica, DiskPath: livePath, Status: "VM started off the promoted replica",
 		})
+	}
+	manifest, partial := promotionManifest(src.DiskName, replica, rootTaken, s.hostName, others)
+	multiDiskNote = ""
+	if partial != "" {
+		multiDiskNote = " (" + partial + ")"
 	}
 
 	// Persist. Takeover (same name) re-homes the existing record; a renamed
@@ -1432,8 +1547,8 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		}
 		_ = corrosion.UpdateDiskStorage(ctx, s.db, targetName, src.DiskName, poolRef.Driver, pool)
 		for _, d := range others {
-			if !d.recovered() {
-				continue
+			if !d.built() {
+				continue // a shared disk's row stays exactly as it was
 			}
 			if err := corrosion.UpdateDiskHostAndPath(ctx, s.db, targetName, d.row.DiskName, s.hostName, d.livePath); err != nil {
 				return status.Errorf(codes.Internal, "update disk record %s: %v", d.row.DiskName, err)
@@ -1451,6 +1566,8 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	s.recordVMEvent(ctx, targetName, "vm.promoted", "ok", manifest)
 	if partial != "" {
 		s.reportPromotedPartial(ctx, targetName, s.hostName, partial)
+	} else {
+		s.clearPromotedPartial(ctx, targetName)
 	}
 	s.audit(ctx, "replica.promote", targetName, "replica="+replica+" host="+s.hostName, "ok")
 	s.recordForeignNetworks(ctx, "vm.promote", targetName, foreignNets)

@@ -270,3 +270,56 @@ func TestFleet_AutoPromote_RecordsTheDisksLeftOnTheFailedHost(t *testing.T) {
 		}
 	}
 }
+
+// C1 of the review: a data disk on NFS is reachable from the replica host as
+// it is. Replication never copies it, and failover's promotion reattaches it
+// as-is — current data, its row untouched — never rebuilds it from a replica.
+//
+// Mutation "nfs copied and rebuilt": the shared classification is removed
+// from replicateOtherDisks and chooseSetReplicas — red.
+func TestFleet_AutoPromote_ReattachesASharedDiskAsIs(t *testing.T) {
+	c := New(t, Options{Nodes: 3, SharedCRDT: true})
+	ctx := context.Background()
+	victim, replicaHost, coord := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	sched := replicaSetVM(t, c, victim, replicaHost, "set4")
+	// data1 lives on NFS: one file every host reaches at one path.
+	nfs := filepath.Join(c.tmpRoot, "nfs")
+	if err := os.MkdirAll(nfs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	shared := filepath.Join(nfs, "set4-data1.qcow2")
+	if err := os.Rename(filepath.Join(c.tmpRoot, victim.Name, "set4-data1.qcow2"), shared); err != nil {
+		t.Fatal(err)
+	}
+	if err := victim.DB.Execute(ctx, `UPDATE vm_disks SET path = ?, storage_type = 'nfs', storage_volume = 'nfs'
+		WHERE vm_name = 'set4' AND disk_name = 'data1'`, shared); err != nil {
+		t.Fatal(err)
+	}
+	if err := victim.Server.RunReplication(ctx, sched, time.Now().Add(-5*time.Minute)); err != nil {
+		t.Fatalf("replicate set4: %v", err)
+	}
+	// After the run the guest writes data1 again: only the shared file has it.
+	if out, err := exec.Command("qemu-io", "-f", "qcow2", "-c", "write -P 0x55 0 65536", shared).CombinedOutput(); err != nil {
+		t.Fatalf("write data1: %v %s", err, out)
+	}
+
+	failVictim(t, coord, victim, replicaHost, coord)
+
+	promotedDisks(t, c, replicaHost, victim, "set4", []string{"root", "data2", "data3"}, nil)
+	rows, _ := corrosion.GetVMDisks(ctx, replicaHost.DB, "set4")
+	for _, r := range rows {
+		if r.DiskName == "data1" && (r.Path != shared || r.StorageType != "nfs") {
+			t.Errorf("data1 row = %+v, want it untouched on NFS", r)
+		}
+	}
+	if xml := replicaHost.Virt.DefinedXML("set4"); !strings.Contains(xml, shared) {
+		t.Errorf("data1 was not reattached as-is: %s", xml)
+	}
+	if !diskPattern(t, shared, 0x55) {
+		t.Error("the shared data1 lost the write made after the last run")
+	}
+	insp, err := c.SelfClient(coord).InspectVM(ctx, &pb.InspectVMRequest{Name: "set4"})
+	if err != nil || insp.GetPromotedPartial() != "" {
+		t.Errorf("inspect promoted_partial = %q (%v), want empty", insp.GetPromotedPartial(), err)
+	}
+}

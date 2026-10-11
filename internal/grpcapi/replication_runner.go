@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -66,7 +67,12 @@ func (s *Server) runVMReplication(ctx context.Context, sched corrosion.BackupSch
 	if err := s.mayReplicateVMAsOwner(ctx, vm); err != nil {
 		return err
 	}
-	unlock := s.lockVM(sched.VMName)
+	// The lock is held for the root disk's run, as always, and released
+	// before the other disks: each of those takes it only for its brief
+	// point-in-time step (replica_set.go).
+	var unlockOnce sync.Once
+	vmUnlock := s.lockVM(sched.VMName)
+	unlock := func() { unlockOnce.Do(vmUnlock) }
 	defer unlock()
 
 	disks, err := corrosion.GetVMDisks(ctx, s.db, sched.VMName)
@@ -187,7 +193,9 @@ func (s *Server) runVMReplication(ctx context.Context, sched corrosion.BackupSch
 	}
 	// Then every other disk, with the same run time, so the run leaves one
 	// replica set a promotion recovers whole (replica_set.go).
-	return s.replicateOtherDisks(ctx, sched, vm, replicaSetOthers(disks, src), targetHost, ts, allowForceShare)
+	unlock()
+	return s.replicateOtherDisks(ctx, sched, vm, replicaSetOthers(disks, src), targetHost, ts, allowForceShare,
+		func() func() { return s.lockVM(sched.VMName) })
 }
 
 // replicateLocal writes the replica into a file-based pool on this host (the

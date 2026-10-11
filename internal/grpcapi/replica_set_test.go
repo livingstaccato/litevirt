@@ -171,7 +171,7 @@ func TestPromote_AnIncompleteSetPromotesWhatItHasAndMarksThePartial(t *testing.T
 		}
 	}
 	partial := eventDetail(t, s, "db", vmEventPromotedPartial)
-	for _, want := range []string{"data3 (it has no replica", "dead-host at /dead/db-data3.qcow2", "data4 (its storage (ceph)", "data2 (from the run of " + earlier} {
+	for _, want := range []string{"data3 (it has no replica", "dead-host at /dead/db-data3.qcow2", "data4 (shared (ceph) at /dead/db-data4.qcow2, not attached", "data2 (from the run of " + earlier} {
 		if !strings.Contains(partial, want) {
 			t.Errorf("partial event %q lacks %q", partial, want)
 		}
@@ -210,13 +210,36 @@ func TestPromote_NeverTakesADiskReplicaNewerThanTheRoots(t *testing.T) {
 	}
 }
 
-// A disk whose live disk cannot be built — here a file already sits where it
-// would go — does not stop the promotion: the VM comes up with the rest, the
-// disk is named, and the file in the way is never touched.
+// A disk whose live disk cannot be built — here its replica is not a qcow2 it
+// claims to be — does not stop the promotion: the VM comes up with the rest
+// and the disk is named.
 //
 // Mutation "a build failure refuses": doPromoteLocal returns the data disk's
 // build error — red.
 func TestPromote_ADiskThatCannotBeBuiltIsNamedNotFatal(t *testing.T) {
+	s := testServer(t)
+	poolDir := setPromoteVM(t, s, "db", map[string]string{"data1": "local"})
+	run := "20260101-000000"
+	seedReplica(t, poolDir, "", "db", "root", run, "raw", 1<<20)
+	seedReplica(t, poolDir, "", "db", "data1", run, "qcow2", 4096) // zeros: no qcow2 header
+
+	promoteSet(t, s, &pb.PromoteReplicaRequest{VmName: "db", TargetPool: "dr", Force: true})
+
+	if rows := diskRowsOf(t, s, "db"); rows["root"].HostName != s.hostName || rows["data1"].HostName != "dead-host" {
+		t.Errorf("rows = %+v, want root recovered and data1 left naming its real disk", rows)
+	}
+	if p := eventDetail(t, s, "db", vmEventPromotedPartial); !strings.Contains(p, "data1 (its replica data1-"+run+".qcow2 could not be built") {
+		t.Errorf("partial = %q, want data1 named with the build failure", p)
+	}
+}
+
+// M7: a file already where a disk's live disk would go — a crashed earlier
+// attempt's, or anyone's — is neither removed nor reused nor fatal: the live
+// disk is built beside it and the disk is recovered.
+//
+// Mutation "debris refuses": the fresh-name fallback is removed — red (data1
+// is not recovered).
+func TestPromote_DebrisWhereALiveDiskGoesIsLeftAndBuiltBeside(t *testing.T) {
 	s := testServer(t)
 	poolDir := setPromoteVM(t, s, "db", map[string]string{"data1": "local"})
 	run := "20260101-000000"
@@ -230,11 +253,12 @@ func TestPromote_ADiskThatCannotBeBuiltIsNamedNotFatal(t *testing.T) {
 
 	promoteSet(t, s, &pb.PromoteReplicaRequest{VmName: "db", TargetPool: "dr", Force: true, NoLocalize: true})
 
-	if rows := diskRowsOf(t, s, "db"); rows["root"].HostName != s.hostName || rows["data1"].HostName != "dead-host" {
-		t.Errorf("rows = %+v, want root recovered and data1 left naming its real disk", rows)
+	r := diskRowsOf(t, s, "db")["data1"]
+	if r.HostName != s.hostName || r.Path == inTheWay || !strings.HasPrefix(r.Path, poolDir) {
+		t.Errorf("data1 = %+v, want it recovered beside the file in the way", r)
 	}
-	if p := eventDetail(t, s, "db", vmEventPromotedPartial); !strings.Contains(p, "data1 (its replica data1-"+run+".raw could not be built") {
-		t.Errorf("partial = %q, want data1 named with the build failure", p)
+	if p := eventDetail(t, s, "db", vmEventPromotedPartial); p != "" {
+		t.Errorf("partial = %q, want a complete promotion", p)
 	}
 	if b, err := os.ReadFile(inTheWay); err != nil || string(b) != "someone else's" {
 		t.Errorf("the file in the way was touched: %q, %v", b, err)

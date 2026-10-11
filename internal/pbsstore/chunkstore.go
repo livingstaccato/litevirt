@@ -176,8 +176,18 @@ type InitOptions struct {
 }
 
 // InitWithOptions creates a new repository with the given format. Refuses if
-// the directory already contains a repo.json.
+// the directory already contains a repo.json. It refuses zstd: a compressed
+// repo is the data of the release feature backup_zstd, written only through
+// InitWithGrant (the daemon's gate) or, for the operator's --force override,
+// the explicitly named InitUngated.
 func InitWithOptions(root string, opts InitOptions) (*Repo, error) {
+	if opts.Compression == CompressionZstd {
+		return nil, ErrZstdNeedsGate
+	}
+	return initRepo(root, opts)
+}
+
+func initRepo(root string, opts InitOptions) (*Repo, error) {
 	if opts.Encryption != "" && opts.Encryption != EncryptionModeAESGCM {
 		return nil, fmt.Errorf("unsupported encryption mode %q", opts.Encryption)
 	}

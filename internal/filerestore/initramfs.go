@@ -135,10 +135,18 @@ func (ms *moduleSet) resolve(want, required []string) ([]string, error) {
 	}
 	for _, n := range required {
 		if !ms.builtin[n] && ms.paths[n] == "" {
-			return nil, fmt.Errorf("kernel modules in %s have no %s (neither built in nor a module)", ms.dir, n)
+			return nil, fmt.Errorf("kernel modules in %s have no %s (neither built in nor a module)%s", ms.dir, n, modulePackageHint(n, ms.dir))
 		}
 	}
 	return order, nil
+}
+
+// modulePackageHint names where a distribution ships a module the restore
+// VM needs and the host lacks. Ubuntu's linux-modules package leaves
+// qemu_fw_cfg (and some vsock transports) to linux-modules-extra.
+func modulePackageHint(module, dir string) string {
+	rel := filepath.Base(dir)
+	return fmt.Sprintf("; install the package that ships %s for kernel %s (on Ubuntu: linux-modules-extra-%s)", module, rel, rel)
 }
 
 // readModule returns a module's bytes, decompressing zstd and gzip here so

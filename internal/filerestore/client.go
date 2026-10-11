@@ -154,6 +154,15 @@ func (c *Client) List(p string) (entries []Entry, truncated bool, skipped int, e
 	return entries, resp.Truncated, skipped, nil
 }
 
+// skipValue decodes (validates and steps over) any JSON value and keeps
+// none of it: it is zero-sized, and its UnmarshalJSON copies nothing.
+type skipValue struct{}
+
+func (*skipValue) UnmarshalJSON([]byte) error { return nil }
+
+// skippedValue is the one skipValue every skip decodes into.
+var skippedValue skipValue
+
 // decodeListResponse decodes a listing reply entry by entry, keeping at
 // most MaxListEntries: what a hostile agent packs into the (bounded) line
 // beyond that is skipped while decoding, never materialized.
@@ -191,8 +200,10 @@ func decodeListResponse(line []byte) (wire.Response, error) {
 			}
 			for dec.More() {
 				if len(resp.Entries) >= wire.MaxListEntries {
-					var skip json.RawMessage
-					if err := dec.Decode(&skip); err != nil {
+					// Skipped without keeping anything: a reply packed
+					// with millions of entries past the cap allocates
+					// nothing per entry.
+					if err := dec.Decode(&skippedValue); err != nil {
 						return resp, err
 					}
 					resp.Truncated = true
@@ -208,8 +219,7 @@ func decodeListResponse(line []byte) (wire.Response, error) {
 				return resp, err
 			}
 		default:
-			var skip json.RawMessage
-			if err := dec.Decode(&skip); err != nil {
+			if err := dec.Decode(&skippedValue); err != nil {
 				return resp, err
 			}
 		}

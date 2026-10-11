@@ -2,10 +2,13 @@ package pbsstore
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"sync"
 
 	"github.com/klauspost/compress/zstd"
+
+	"github.com/litevirt/litevirt/internal/capabilities"
 )
 
 // Chunk compression.
@@ -143,7 +146,18 @@ func (r *Repo) Compression() string {
 // it; that cannot be undone, because compressed chunks may exist from then on.
 // Turning it off only stops compressing new chunks. Existing chunks are never
 // rewritten either way.
+//
+// Turning it ON is refused here: that is the release feature backup_zstd's
+// data, written through EnableCompressionWithGrant (the daemon's gate) or the
+// operator's explicit --force override, SetCompressionUngated.
 func (r *Repo) SetCompression(mode string) error {
+	if mode == CompressionZstd {
+		return ErrZstdNeedsGate
+	}
+	return r.setCompression(mode)
+}
+
+func (r *Repo) setCompression(mode string) error {
 	norm, err := NormalizeCompression(mode)
 	if err != nil {
 		return err
@@ -158,4 +172,44 @@ func (r *Repo) SetCompression(mode string) error {
 	}
 	r.meta = meta
 	return nil
+}
+
+// InitWithGrant creates a zstd-compressed repository. It is a writer of the
+// release feature backup_zstd: a compressed repo is schema_version 2, which a
+// release without compression refuses, so the repo's creation is the data the
+// feature's used bit must precede. g comes from the release-feature gate
+// (grpcapi.Server.WithReleaseFeature). opts.Compression must be zstd; an
+// uncompressed repo needs no grant and is InitWithOptions.
+func InitWithGrant(root string, opts InitOptions, g capabilities.FeatureGrant) (*Repo, error) {
+	if err := g.Check(capabilities.FeatureBackupZstd); err != nil {
+		return nil, err
+	}
+	if opts.Compression != CompressionZstd {
+		return nil, fmt.Errorf("InitWithGrant creates a %s repository, not %q", CompressionZstd, opts.Compression)
+	}
+	return initRepo(root, opts)
+}
+
+// InitUngated creates a repository of any format with NO release-feature gate
+// and so records no use of backup_zstd. It exists for `lv backup repo init
+// --force`, the operator's override for a repository no older host reads; the
+// name is the warning. Nothing else may call it.
+func InitUngated(root string, opts InitOptions) (*Repo, error) { return initRepo(root, opts) }
+
+// SetCompressionUngated is SetCompression without the zstd refusal and with no
+// gate: the `set-compression zstd --force` override. See InitUngated.
+func (r *Repo) SetCompressionUngated(mode string) error { return r.setCompression(mode) }
+
+// ErrZstdNeedsGate is returned when zstd is requested through a function that
+// does not pass the release-feature gate.
+var ErrZstdNeedsGate = errors.New("zstd compression is the release feature backup_zstd: create it through the daemon's gate (InitWithGrant, EnableCompressionWithGrant) or the explicit --force override")
+
+// EnableCompressionWithGrant turns zstd on for an existing repository, raising
+// it to schema_version 2: the other writer of backup_zstd's data. See
+// InitWithGrant. Turning compression off is SetCompression and needs no grant.
+func (r *Repo) EnableCompressionWithGrant(g capabilities.FeatureGrant) error {
+	if err := g.Check(capabilities.FeatureBackupZstd); err != nil {
+		return err
+	}
+	return r.setCompression(CompressionZstd)
 }

@@ -59,7 +59,8 @@ type Launcher struct {
 	// logic as a non-root user without allow_unsandboxed; production never
 	// sets it. trampoline replaces the binary run as the trampoline ("" =
 	// the agent, i.e. this litevirt binary); landlockExtra adds to the
-	// restore qemu's Landlock ruleset.
+	// restore qemu's Landlock ruleset; netns says whether qemu starts in a
+	// network namespace of its own (a root daemon's).
 	skipRootCheck      bool
 	kvmPath, vhostPath string
 	checkAgent         func(path string) error
@@ -67,6 +68,7 @@ type Launcher struct {
 	landlockABI        func() int
 	trampoline         string
 	landlockExtra      landlockPolicy
+	netns              func() bool
 }
 
 // NewLauncher returns a launcher for cfg. Nothing is checked until
@@ -77,6 +79,7 @@ func NewLauncher(cfg Config) *Launcher {
 	}
 	return &Launcher{cfg: cfg, kvmPath: "/dev/kvm", vhostPath: "/dev/vhost-vsock", checkAgent: checkStaticELF,
 		appArmorState: appArmorState, landlockABI: landlockAvailable,
+		netns: func() bool { return os.Geteuid() == 0 },
 		inUse: map[string]int{}, current: map[string]bool{}, probeCache: map[string]time.Time{}}
 }
 
@@ -104,8 +107,9 @@ type host struct {
 	qemu, kernel, modules, agent string
 	// account is the restore account (its group reads the boot files);
 	// perSession means each VM runs as its own uid from the reserved range
-	// with groups {account group, kvm}. Otherwise shared is the credential
-	// qemu runs with (nil: the daemon's own).
+	// with the account's group only (sessionCredential), given /dev/kvm by
+	// an ACL entry. Otherwise shared is the credential qemu runs with (nil:
+	// the daemon's own).
 	account    *qemuUser
 	perSession bool
 	shared     *qemuUser
@@ -118,9 +122,11 @@ type host struct {
 }
 
 // EnsureRestoreUser creates DefaultRestoreUser if it does not exist: a
-// system user with its own group, no home and no shell, in the kvm group.
-// Idempotent; a no-op unless root. The daemon calls it at start when file
-// restore is enabled (docs/installation.md).
+// system user with its own group, no home, no shell and no other group (no
+// restore VM runs as it, nor with any group but its own: each runs as its
+// own uid, given /dev/kvm by an ACL entry). Idempotent; a no-op unless
+// root. The daemon calls it at start when file restore is enabled
+// (docs/installation.md).
 func EnsureRestoreUser() error {
 	if os.Geteuid() != 0 {
 		return nil
@@ -130,9 +136,6 @@ func EnsureRestoreUser() error {
 	}
 	args := []string{"--system", "--user-group", "--no-create-home", "--home-dir", "/nonexistent",
 		"--shell", "/usr/sbin/nologin", "--comment", "litevirt file-restore VMs"}
-	if _, err := user.LookupGroup("kvm"); err == nil {
-		args = append(args, "--groups", "kvm")
-	}
 	out, err := exec.Command("useradd", append(args, DefaultRestoreUser)...).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("create user %s: %v: %s", DefaultRestoreUser, err, strings.TrimSpace(string(out)))
@@ -238,12 +241,13 @@ func (l *Launcher) check() (*host, error) {
 // parser installed and from the kernel's Landlock ABI, what confines a
 // restore VM's qemu: the AppArmor profile where it can be loaded, and a
 // Landlock ruleset wherever the kernel has Landlock (both, where both are
-// there). It fails closed:
-//   - AppArmor enabled without its parser is refused (R2-I2), even with
-//     Landlock, unless the operator allowed running without a MAC barrier;
-//   - a host with neither (no AppArmor, a kernel without Landlock) is refused
-//     unless the same: the per-session uid alone does not keep an escaped
-//     qemu from world-readable VM disks or the host's network.
+// there). AppArmor enabled without its parser loads nothing, so with
+// Landlock it is the same host as one with AppArmor off, and is accepted the
+// same way (with a warning naming the parser). It fails closed: a host with
+// no MAC barrier at all — no loadable AppArmor profile, a kernel without
+// Landlock — is refused unless the operator allowed running without one; the
+// per-session uid alone does not keep an escaped qemu from world-readable VM
+// disks.
 func confinementDecision(aaEnabled, aaParser bool, llABI int, allowNoMAC bool) (appArmor bool, landlock int, err error) {
 	if llABI < 0 {
 		llABI = 0
@@ -251,14 +255,18 @@ func confinementDecision(aaEnabled, aaParser bool, llABI int, allowNoMAC bool) (
 	switch {
 	case aaEnabled && aaParser:
 		return true, llABI, nil
+	case aaEnabled && llABI >= 1:
+		slog.Warn("file restore: AppArmor is enabled but apparmor_parser is not installed; restore VMs run under Landlock without their AppArmor profile "+
+			"(install the apparmor package to add it)", "landlock_abi", llABI)
+		return false, llABI, nil
 	case aaEnabled:
 		if !allowNoMAC {
 			return false, 0, unavailable("AppArmor is enabled but apparmor_parser is not installed, so the restore VM's profile " +
-				"cannot be loaded (install the apparmor package); file_restore.allow_unsandboxed: [mac] runs it without the profile, which is dangerous")
+				"cannot be loaded, and this kernel has no Landlock either (install the apparmor package, or enable Landlock: a kernel with " +
+				"CONFIG_SECURITY_LANDLOCK and landlock in lsm=); file_restore.allow_unsandboxed: [mac] runs it without a MAC barrier, which is dangerous")
 		}
-		slog.Warn("file restore: AppArmor is enabled but apparmor_parser is missing; restore VMs run without their profile (file_restore.allow_unsandboxed: [mac])",
-			"landlock_abi", llABI)
-		return false, llABI, nil
+		slog.Warn("file restore: AppArmor is enabled but apparmor_parser is missing and there is no Landlock; restore VMs run without a MAC barrier (file_restore.allow_unsandboxed: [mac])")
+		return false, 0, nil
 	case llABI >= 1:
 		return false, llABI, nil
 	default:
@@ -282,7 +290,7 @@ func (l *Launcher) checkRootIdentity(h *host) error {
 	if err != nil {
 		if name == DefaultRestoreUser {
 			return unavailable("no user %s (the daemon creates it at start when file restore is enabled; create it with "+
-				"`useradd --system --user-group --groups kvm --no-create-home --shell /usr/sbin/nologin %s`)", name, name)
+				"`useradd --system --user-group --no-create-home --shell /usr/sbin/nologin %s`)", name, name)
 		}
 		return unavailable("file_restore.run_as %q: %v", name, err)
 	}
@@ -313,8 +321,8 @@ func (l *Launcher) checkRootIdentity(h *host) error {
 	}
 	h.account = &qemuUser{name: name, uid: uid, gid: gid}
 	h.perSession, h.gid = true, int(gid)
-	probe := &qemuUser{name: "per-session uid", uid: l.cfg.UIDBase, gid: gid, groups: []uint32{gid, kst.Gid}}
-	if err := accessibleTo(l.kvmPath, probe); err != nil {
+	// Each session's uid is given KVM by an ACL entry (never the kvm group).
+	if err := deviceACLUsable(l.kvmPath); err != nil {
 		return unavailable("no usable KVM for restore VMs: %v", err)
 	}
 	if err := l.checkRange(); err != nil {
@@ -473,9 +481,9 @@ func sharedIdentity(name, uidStr string, uid uint32) string {
 
 // validateRestoreAccount checks the restore account is what the daemon
 // would have created: a system uid, no login shell, its uid used by no other
-// account, and no supplementary group but its own and kvm. qemu only ever
-// gets {its group, kvm}, but an account that is more than that is someone
-// else's and is refused, naming what differs.
+// account, and no supplementary group but its own and kvm (which earlier
+// builds gave it). qemu only ever gets its group, but an account that is
+// more than that is someone else's and is refused, naming what differs.
 func validateRestoreAccount(u *user.User, uid, gid, kvmGid uint32) error {
 	if uid >= 1000 {
 		return fmt.Errorf("restore account %s has uid %d, not a system uid (< 1000)", u.Username, uid)
@@ -775,9 +783,11 @@ func profileEnforcedIn(b []byte) bool {
 }
 
 // allocUID takes a free per-session uid: one no session holds and no
-// process runs as. A process left with a released uid (a qemu that escaped
-// its process group and outlived its session) would otherwise share the next
-// session's identity; it is killed, and that uid skipped for now.
+// process runs as, and gives it /dev/kvm by an ACL entry; the returned func
+// takes the entry back and frees the uid. A process left with a released uid
+// (a qemu that escaped its process group and outlived its session) would
+// otherwise share the next session's identity; it is killed, and that uid
+// skipped for now.
 func (l *Launcher) allocUID() (uint32, func(), error) {
 	l.slotMu.Lock()
 	defer l.slotMu.Unlock()
@@ -794,8 +804,16 @@ func (l *Launcher) allocUID() (uint32, func(), error) {
 			}
 			continue
 		}
+		uid := l.cfg.UIDBase + uint32(i)
+		if err := grantDeviceACL(l.kvmPath, uid); err != nil {
+			return 0, nil, unavailable("give restore VM uid %d %s (POSIX ACL entry): %v", uid, l.kvmPath, err)
+		}
 		l.slots[i] = true
-		return l.cfg.UIDBase + uint32(i), func() {
+		return uid, func() {
+			if _, err := revokeDeviceACL(l.kvmPath, uid, uid+1); err != nil {
+				slog.Warn("file restore: could not take KVM back from a restore VM uid (the next daemon start retries)",
+					"uid", uid, "device", l.kvmPath, "error", err)
+			}
 			l.slotMu.Lock()
 			l.slots[i] = false
 			l.slotMu.Unlock()
@@ -960,7 +978,7 @@ func (l *Launcher) Open(ctx context.Context, dev BlockDevice, kind, format strin
 		}
 		s.releasers = append(s.releasers, release)
 		s.uid = uid
-		cred = &qemuUser{name: fmt.Sprintf("uid %d", uid), uid: uid, gid: h.account.gid, groups: []uint32{h.account.gid, h.kvmGid}}
+		cred = sessionCredential(h, uid)
 		wantUID = uid
 		recordUIDBase(l.cfg.RunDir, l.cfg.UIDBase)
 	case h.shared != nil:
@@ -1111,6 +1129,16 @@ func (l *Launcher) Open(ctx context.Context, dev BlockDevice, kind, format strin
 	return nil, unavailable("the restore VM did not come up: %v", lastErr)
 }
 
+// sessionCredential is what a per-session restore VM runs as: its own uid
+// and the restore account's group, nothing else. Not kvm: KVM is given to
+// the uid by an ACL entry (allocUID), and kvm's group-writable sockets —
+// libvirt's qemu creates them libvirt-qemu:kvm, among them the pull-mode
+// backup's NBD export of a live guest disk — are pathname unix sockets,
+// which Landlock does not mediate.
+func sessionCredential(h *host, uid uint32) *qemuUser {
+	return &qemuUser{name: fmt.Sprintf("uid %d", uid), uid: uid, gid: h.account.gid, groups: []uint32{h.account.gid}}
+}
+
 // barrierSummary is what isolates a restore VM, for its audit rows, and
 // whether one of its barriers is missing.
 func barrierSummary(sandbox bool, h *host, uid uint32) (string, bool) {
@@ -1223,11 +1251,17 @@ func newNonce() string {
 // qemuCommand builds the qemu process: started as u (when the daemon is
 // root), in its own process group, killed when the daemon dies. Go applies
 // the parent-death signal AFTER the credential change, so it survives it.
+// With netns (a root daemon) it starts in a new network namespace, created
+// as root before the credential change: no interface but a down loopback,
+// so no UDP, TCP or abstract unix socket of the host is reachable whatever
+// the Landlock ABI. Pathname unix sockets are filesystem objects and stay
+// reachable by DAC alone (sessionCredential); the vhost-vsock fd qemu
+// inherits was opened by the daemon, in the host's namespace.
 // With an AppArmor profile or a Landlock ruleset, the litevirt binary at
 // trampoline runs first, as qemu's parent in the same process group: it
 // starts qemu confined by them and kills it on the SIGTERM the daemon's
 // death sends it.
-func qemuCommand(spec VMSpec, u *qemuUser, dir string, vhost *os.File, stdout, stderr io.Writer, trampoline, profile string, ll *landlockPolicy) (*exec.Cmd, error) {
+func qemuCommand(spec VMSpec, u *qemuUser, dir string, vhost *os.File, stdout, stderr io.Writer, trampoline, profile string, ll *landlockPolicy, netns bool) (*exec.Cmd, error) {
 	args, err := qemuArgs(spec)
 	if err != nil {
 		return nil, err
@@ -1256,6 +1290,9 @@ func qemuCommand(spec VMSpec, u *qemuUser, dir string, vhost *os.File, stdout, s
 	cmd.Env = []string{"PATH=/usr/sbin:/usr/bin:/sbin:/bin"}
 	cmd.ExtraFiles = []*os.File{vhost} // fd 3 = spec.VhostFD
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGKILL}
+	if netns {
+		cmd.SysProcAttr.Cloneflags |= syscall.CLONE_NEWNET
+	}
 	if profile != "" || ll != nil {
 		// The trampoline turns the daemon's death into qemu's (RunTrampoline).
 		cmd.SysProcAttr.Pdeathsig = syscall.SIGTERM
@@ -1280,7 +1317,7 @@ func (l *Launcher) start(s *Session, spec VMSpec, h *host, cred *qemuUser, uid u
 	if l.trampoline != "" {
 		trampoline = l.trampoline
 	}
-	cmd, err := qemuCommand(spec, cred, s.dir, vhost, s.console, &limitedBuffer{b: stderr, max: 16 << 10}, trampoline, profile, l.restorePolicy(h, s.dir, spec))
+	cmd, err := qemuCommand(spec, cred, s.dir, vhost, s.console, &limitedBuffer{b: stderr, max: 16 << 10}, trampoline, profile, l.restorePolicy(h, s.dir, spec), l.netns())
 	if err != nil {
 		return err
 	}
@@ -1427,10 +1464,19 @@ func (s *Session) Close() {
 // A range is swept by uid only when it is verified exclusive
 // (reservedRangeConflict: not the containers' range, no subordinate id
 // range, no account); otherwise only processes with a restore VM's command
-// line in it are killed, and the conflict is logged. Returns the number
-// killed.
+// line in it are killed, and the conflict is logged. The range is swept only
+// when the run directory exists: it is created by the first restore VM and
+// lives under /run, so without it none ran since boot, and a start with file
+// restore never used asks no directory service anything.
+//
+// The /dev/kvm ACL entries a daemon that died left for the reserved uids are
+// removed in both ranges, always (a read of one xattr, no NSS).
+//
+// Returns the number killed.
 func SweepStale(runDir string, uidBase uint32, containers [2]uint64) int {
 	killed := 0
+	_, statErr := os.Stat(runDir)
+	ran := statErr == nil
 	if ents, err := os.ReadDir(runDir); err == nil {
 		for _, e := range ents {
 			if !e.IsDir() || !strings.HasPrefix(e.Name(), "s-") {
@@ -1450,6 +1496,15 @@ func SweepStale(runDir string, uidBase uint32, containers [2]uint64) int {
 	}
 	for _, base := range bases {
 		if base == 0 {
+			continue
+		}
+		if n, err := revokeDeviceACL(staleACLDevice, base, base+UIDSlots); err != nil {
+			slog.Warn("file restore: could not remove KVM grants a previous daemon left for restore VM uids",
+				"device", staleACLDevice, "uid_base", base, "error", err)
+		} else if n > 0 {
+			slog.Info("file restore: removed KVM grants a previous daemon left for restore VM uids", "count", n, "uid_base", base)
+		}
+		if !ran {
 			continue
 		}
 		byUID := true

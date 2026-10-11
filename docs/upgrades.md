@@ -419,6 +419,228 @@ systemctl reset-failed litevirt
 systemctl restart litevirt
 ```
 
+### Rolling back after a release token latched
+
+A rolled-back binary that finds a durable activation marker for a capability
+token it has never heard of enters **WAL quarantine**: it stays up, but emits
+no replicated writes and advertises no capabilities until it is upgraded again
+or reseeded. That is right for a token whose latch changed what the cluster
+writes. It used to apply to every token, including one whose feature nobody
+had touched.
+
+From release `release_2026_11_v1` on, the features of a release share **one
+release token** instead of one token each, and each feature carries a **used
+bit**:
+
+- The release token (`release_2026_11_v1` for this release) is mandatory and
+  replication-gated. It latches by itself once every host the cluster
+  replicates to — a host in `maintenance` included — runs this release; there
+  is nothing to run. Latching it changes nothing on its own. Every later build
+  keeps ADVERTISING it, unconditionally and for good: a host on this release
+  refuses the pushes of a sender that does not declare a release token in use.
+- **Mid-upgrade, nothing looks broken.** A feature of the release is refused,
+  with `the cluster upgrade must finish first (<feature> needs <token>): not on
+  this release yet: <host> (<its build version>), … — see lv cluster
+  upgrade-status`, until the token has latched. `lv cluster upgrade-status`
+  opens with the rollout (`Rollout: N of M hosts on <token>; K feature(s)
+  waiting for the rest`, then each lagging host and its version), and the
+  informational health condition `release_rollout_pending` (`lv health`; it does
+  not degrade the cluster's health) names the lagging hosts until they have
+  rolled. Both count the hosts the latch waits on — every voting-eligible host
+  and every host the cluster replicates to — so a powered-off host parked in
+  `maintenance` is not listed. The condition is kept from cached answers, one
+  host asked per health cycle, so it can trail a host's roll by a few cycles;
+  `lv cluster upgrade-status` asks every host afresh. No runbook step is needed. Before its
+  first write anywhere, the cluster records that it is used — a replicated row
+  — and **every voter and every host the cluster replicates to must confirm it
+  holds that record** before the write runs. A host that does not confirm in
+  time refuses the write (`Unavailable`; retry), naming the host; for a voter
+  the message adds that, if it is gone for good, `lv cluster voter rm <host>` is
+  the way out — unless the host said it is in release probation, a live host
+  that applies nothing until it lifts: the message says that instead and points
+  at `lv cluster upgrade-status`. If the record cannot be written at all, the
+  write is refused too. Every host that writes the feature's data puts its own
+  copy of the record on its own replication stream first. The record is never
+  cleared: nothing proves the feature's data has all gone.
+- A first use also re-checks, live, that every host the cluster replicates to
+  still advertises the token. A host rolled back after the latch therefore
+  holds every **first** use off for as long as it runs; features already in use
+  keep working.
+- Once a feature is in use, an upgraded host **refuses replication** from a
+  peer that cannot keep its data. A push is judged by what the sender declares
+  in it (every push carries the sender's advertised capabilities; an older
+  build carries none). A push always declares this build's release tokens — from
+  the first push after a restart, and while self-fenced — so an upgraded sender
+  is never refused. Relayed entries and anti-entropy pulls are judged by their
+  origin's last declared or answered list, which is refreshed in the background
+  (trusted 30s, a lacking or silent peer re-asked with backoff), never by a dial
+  on the push path; a newly bad origin is therefore caught up to 30s late. A
+  **self-fenced** peer advertises nothing while it is fenced, but it is not
+  WAL-quarantined and its build keeps the data: its empty answer is taken as
+  no news, so it keeps its last known list, is never refused for it and raises
+  no alarm, and a relay stream carrying its entries is never held up. Only a
+  peer that is WAL-quarantined, or advertises a list without the token, is
+  refused; an origin whose state is unknown never holds up a relay stream. The refusal is back-pressure,
+  nothing is dropped, and it raises
+  `litevirt_ha_degraded{reason="release_feature_peer_refused"}` with an event
+  naming the peers, again whenever a new peer joins them. Upgrade that host
+  again, or remove it.
+- The release token's marker carries a rollback rule, `rollback:
+  safe_if_unused`. A binary that understands the rule (this release and later)
+  rolled back below a release token quarantines **if one of that token's
+  features has been used** — or if any feature it does not declare is recorded
+  used under a token it does know. If its own replica shows no use, it does not
+  take that on trust: it starts in **release probation** — on EVERY boot below
+  that marker, whatever an earlier boot found, since every release token's
+  marker holds the same bytes and nothing on disk can say the host was not away
+  through a first use since. In probation it emits no replicated writes (they
+  fail with "this node is in release probation"), and it applies no replicated
+  state either: a peer's push is refused (back-pressure, retried, nothing
+  dropped) and anti-entropy takes nothing, because a first use's data can
+  reach it with its record pruned away. It is not quarantined: it keeps advertising, its Ping reports
+  `release_probation` and never `wal_quarantined`, and no peer isolates it. It
+  pulls the cluster's used records from the voters until it holds answers from
+  a **majority of the whole voter set, its own seat counted** when it is a
+  voter: one other voter of three, two of four or five. Its own replica is
+  never an answer, nor is a WAL-quarantined voter; a voter that is in
+  probation too does count, so hosts rolled back together lift together. A
+  three-host cluster rolled back as a whole with one host dead therefore lifts
+  on the two survivors. It then lifts (`release probation lifted` in the log),
+  or quarantines if a use is there. In a two-voter cluster the one other voter
+  is enough; a one-voter cluster lifts on its own check, since no other voter
+  could have acknowledged a use. A host whose replica holds no voter at all
+  asks a majority of its admitted members instead; with none to ask, it lifts
+  only if its replica holds no other host (a one-host cluster whose host is in
+  `maintenance`), and otherwise stays in probation. Nothing about a lift is
+  remembered: the next boot below the marker is a probation again, which costs
+  one round (5s) when the voters answer — a whole-cluster restart included,
+  since probation voters count. Anti-entropy passes are skipped while in
+  probation (they could take nothing), and one runs right after the lift, so
+  the replica catches up then rather than one interval later.
+
+  The voter set is this host's own view, which may be stale after an absence.
+  So the probation pull also merges each answering voter's voter view — the
+  voter generations, `hosts` and `host_membership`, none of which carries a
+  release feature's data — and each voter's Ping says which voter generation it
+  has adopted. When one is newer than this host's, the host adopts the newer
+  generations (each certificate verified, as always) and counts against the new
+  set; it never lifts while a voter reports a generation it cannot adopt yet.
+  A derived voter set that the merged `hosts` rows changed is recomputed too.
+  Voters that were REMOVED while down (`lv cluster voter rm`, a
+  force-reconfigure) and missed a use, then come back on this release with none
+  of the current voters reachable, can still vouch for each other from their
+  stale view and lift together with no holder of the record among them; the
+  upgraded hosts still refuse their writes, and anti-entropy brings them the
+  record, which quarantines them.
+
+  While it waits, the log line `release probation: a voter majority could not
+  be asked yet` names each voter it could not count and why (unreachable,
+  WAL-quarantined), and `lv cluster upgrade-status` shows the same list in the
+  probation's reason. A voter majority that stays unreachable keeps it in
+  probation: remove a voter that is gone for good with `lv cluster voter rm`
+  on a healthy host, or set `LITEVIRT_UNSAFE_SKIP_ROLLBACK_CHECK=1` and restart
+  this one.
+- A first use is acknowledged by every voter (one in `maintenance` included)
+  and every host the cluster replicates to, so whichever voters a probation asks
+  later, a majority of them holds it. A powered-off host that is neither does
+  not hold a first use up; a voter that is gone for good does, until it is
+  removed from the voter set (`lv cluster voter rm`). So does a host in release
+  probation, which applies nothing pushed to it until it lifts — normally one
+  5s round, well inside the 30s a first use waits; the refusal names it as in
+  probation.
+
+**Forward rolls refuse nothing.** While the cluster rolls to the NEXT release,
+the hosts still on this one see the new hosts advertise a release token they do
+not know. That token cannot latch — let alone have a used feature — while they
+do not advertise it, so they only take a look at the advertising host's used
+records, in the background, and keep writing. A use found there (one recorded
+while they were away) quarantines them, as any use arriving does.
+
+**A release token's feature set is frozen when the release ships.** A build
+that knows a token but not one of its features cannot keep that feature's
+data, yet it advertises the token, counts toward its latch and is accepted as a
+sender: the first use would not be refused, and every such host would
+acknowledge it and then quarantine itself. So a feature added after a release
+ships — in a patch release too — is declared under the next release token,
+never a shipped one, and a test pins every release token's list. All twelve
+features of `release_2026_11_v1` are declared in this release (`lv cluster
+upgrade-status` lists them): `vm_limits`, `vm_disk_nic_io`,
+`email_target_secret`, `login_policy`, `drain_failback`, `firewall_ipv6`,
+`nic_guards`, `usb_mounts_memory`, `backup_zstd`, `container_replication`,
+`iscsi_lun_claim` and `pit_overlay`.
+
+One feature is one used bit: the first write of any of its data marks it used,
+and a rollback below the release then quarantines. So a feature written by
+default is kept apart from one written only on request. Per-NIC anti-spoofing
+guards are on by default for every new NIC, so they are their own feature,
+`nic_guards`, used from the first NIC created after the latch; IPv6
+security-group and firewall rules are `firewall_ipv6`, used only once someone
+writes one. `usb_mounts_memory` is one bit for VM USB devices, VM memory
+hot-add and container host mounts and devices: any one of them in use makes a
+rollback below the release quarantine.
+
+**What this does not change.** A binary built before `release_2026_11_v1`
+understands no rollback rule. Rolled back below any token it does not know —
+this release's token included — it quarantines, used or not. Tokens other than
+release tokens carry no rule and block a rollback once latched, as before.
+
+**Quarantine stops writes, not misreads.** A quarantined host emits nothing the
+cluster could take, but it still acts on what it holds locally. A host that
+applied a feature's data it cannot interpret — before the quarantine came up,
+or on a build from before this mechanism — may still run that host's workloads
+without it (a VM defined without the limits a feature set, for example). So a
+host quarantined below a release feature in use must be **drained** of the
+workloads the feature touches (`lv host drain`), then upgraded again or reseeded;
+reseeding alone does not correct a workload already running.
+
+**Before you roll back**, ask the cluster what would block it:
+
+```bash
+lv cluster upgrade-status
+```
+
+It lists every token latched on the connected host with two answers:
+`BLOCKS ROLLBACK` for the build directly below that token, and `IF RULE-AWARE`
+for a target build that reads rollback rules. For `release_2026_11_v1`,
+`BLOCKS ROLLBACK` is always `yes`: every build below it predates rules. `IF
+RULE-AWARE: no` on a later release token means a host rolled back onto this
+release would keep running (after one probation round). Every release feature
+is listed with whether it is used and the host that last recorded it. A
+feature listed as *not known to this build* is a newer release's that has been
+used: this build is the one that would be quarantined, and is, if it is the
+binary answering.
+
+**Residuals.**
+- An origin a receiver has never heard from is not judged, so its entries
+  relayed by another host are accepted until it first answers (asked in the
+  background); a known origin that turns bad is caught up to 30s late. As an
+  anti-entropy SOURCE, a peer never heard from is asked first, and one that
+  answers with nothing while not WAL-quarantined (self-fenced) is not pulled
+  from until it declares what it keeps; the pass pulls from another peer.
+- An origin KNOWN not to carry a used release token refuses the whole relayed
+  push that carries its entries, so the other origins' entries on that relay
+  stream wait behind it — back-pressure, nothing dropped, anti-entropy
+  carrying them meanwhile — until that host is upgraded again or removed. A
+  push is acknowledged as a whole, so skipping one origin's entries would lose
+  them. `release_feature_peer_refused` names the host.
+- A host with no marker that was away through the next release's latch and
+  first use, and comes back on this release, emits replicated writes until its
+  first Ping of a newer host leads it to their used records. Upgraded hosts with
+  the use refuse those writes, so this is defence in depth only.
+- A probation asks the newest voter generation. A first use is acknowledged by
+  the voters of its time and by every replication recipient; a voter added later
+  received the record by replication before it could vote, unless it joined from
+  a reseed taken before the use — which a reseed from a current peer is not.
+
+A data directory may hold `release_probation_lifted.<token>` from a
+pre-release build of this mechanism; nothing reads it, and it can be deleted.
+
+`LITEVIRT_UNSAFE_SKIP_ROLLBACK_CHECK=1` skips the startup check, the recorded
+uses and the startup probation included, as before (see
+[configuration.md](configuration.md)). A use that arrives by replication after
+startup still quarantines the node at run time; that ends with an upgrade back
+to a build that knows the token, a reseed, or a restart with the override set.
+
 ---
 
 ## Operator playbook for cluster-wide upgrades

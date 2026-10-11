@@ -276,7 +276,8 @@ func (s *Server) openRestoreVM(ctx context.Context, fr fileRestorer, t *fileRest
 	// allow_shared_run_as) is audited when it starts — browsing included,
 	// which writes no other row.
 	if b, reduced := restoreVMBarriers(conn); reduced {
-		s.audit(ctx, "backup.file_restore_unsandboxed", t.key.name,
+		// Written even if the caller has gone by now: the VM did start.
+		s.audit(context.WithoutCancel(ctx), "backup.file_restore_unsandboxed", t.key.name,
 			fmt.Sprintf("project=%s repo=%s ts=%s disk=%s %s", t.project, t.key.repo, t.key.ts, t.key.disk, b), "ok")
 	}
 	return conn, nil
@@ -535,13 +536,17 @@ func (w *chunkWriter) flush() error {
 // (filerestore.SanitizeStream) and goes only to the caller.
 func (s *Server) RestoreBackupFiles(req *pb.RestoreBackupFilesRequest, stream grpc.ServerStreamingServer[pb.RestoreBackupFilesChunk]) (retErr error) {
 	ctx := stream.Context()
+	// The audit rows are written once the client may have gone (it closes
+	// its stream once it has the final frame): never with its context, or a
+	// successful extraction is not audited at all.
+	actx := context.WithoutCancel(ctx)
 	if _, err := filerestore.SelectionNames(req.Paths); err != nil {
 		return status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 	t, err := s.resolveFileRestoreTarget(ctx, req.RepoPath, req.Name, req.DiskName, req.Timestamp)
 	if err != nil {
 		if status.Code(err) == codes.PermissionDenied {
-			s.audit(ctx, "backup.file_restore", req.Name, fileRestoreAuditDetail(req, "", nil), "denied")
+			s.audit(actx, "backup.file_restore", req.Name, fileRestoreAuditDetail(req, "", nil), "denied")
 		}
 		return err
 	}
@@ -556,7 +561,7 @@ func (s *Server) RestoreBackupFiles(req *pb.RestoreBackupFilesRequest, stream gr
 		if barriers != "" {
 			d += " " + barriers
 		}
-		s.audit(ctx, "backup.file_restore", req.Name, d, outcome)
+		s.audit(actx, "backup.file_restore", req.Name, d, outcome)
 	}()
 	_, opts, err := s.fileRestorePreflight()
 	if err != nil {

@@ -92,17 +92,29 @@ move plain chunks — a DR copy can differ in compression from its source. A
 chunk zstd cannot shrink (already-compressed guest data) is stored as it is.
 
 ```bash
-lv backup repo init /srv/backup/main                      # the default (below)
-lv backup repo init /srv/backup/main --compression none   # uncompressed
-lv backup repo set-compression /srv/backup/main zstd      # existing repo
+lv backup repo init /srv/backup/main                      # local, uncompressed (the default)
+lv backup repo init /srv/backup/main --compression zstd   # compressed, via the daemon (below)
+lv backup repo set-compression /srv/backup/main zstd      # existing repo, via the daemon
 ```
 
-**The default follows the cluster's upgrade.** Until the cluster's release
-token has latched — every host runs a build that reads compressed repos —
-a new repo is uncompressed and `--compression zstd` or `set-compression ...
-zstd` is refused, naming the release feature `backup_zstd`. Once it has
-latched, new repos are compressed by default. `--force` allows zstd earlier,
-for a repository no older host or backup host reads (an air-gapped one).
+**zstd is explicit, and gated on the cluster's upgrade.** A plain `lv backup
+repo init <path>` is exactly what earlier releases did: a local,
+uncompressed repository, created by the CLI with your own rights and no
+daemon. Compression is asked for with `--compression zstd` on `init`, or
+`set-compression <path> zstd` on an existing repo. Until the cluster's
+release token has latched — every host runs a build that reads compressed
+repos — both are refused, naming the release feature `backup_zstd`.
+
+Creating or converting to zstd is done by the **daemon of the host the CLI
+is connected to** (`SetBackupRepoCompression`, below), not by the CLI alone:
+the daemon's release-feature gate records that `backup_zstd` is in use
+before `repo.json` changes. The path is then a path on that host, the repo is
+owned by the daemon, a custom absolute path needs the admin role, and the
+daemon refuses its own data and PKI directories. The CLI prints which host
+created or converted the repo. `--force` skips the daemon and the gate and
+writes the repo locally; nothing records that use, so it is for a repository
+no older host or backup host reads (an air-gapped one). Creating an
+uncompressed repo and turning compression off need no daemon and no feature.
 
 **Older releases refuse a compressed repo.** A compressed repo's `repo.json`
 says `"compression": "zstd"` and `"schema_version": 2`. Every release before
@@ -530,16 +542,23 @@ NBD socket), no network, vsock as its only channel, one vCPU and 512 MiB. The
 guest kernel parses the partition table and mounts each filesystem read-only
 inside the VM. Each restore VM's qemu runs as its own uid from a reserved
 range — so two sessions (possibly two tenants) cannot signal, trace or reach
-each other — with only the `litevirt-restore` group and `kvm`, its seccomp
-sandbox on and, where AppArmor is enabled, confined by the
+each other — with only the `litevirt-restore` group (never `kvm`: KVM is
+given to that uid alone by an ACL entry on `/dev/kvm`, removed when the
+session ends), in a network namespace of its own (no UDP, TCP or abstract
+sockets of the host), its seccomp sandbox on and, where AppArmor is enabled, confined by the
 `litevirt-restore-qemu` profile (its boot files, its session's export socket
 and nonce, `/dev/kvm` and vsock; no IP, no abstract sockets, nothing under
 `/var/lib/litevirt`), and — on every host whose kernel has it — inside a
 **Landlock** ruleset that allows qemu its own binary and libraries, its boot
-files, its session's directory and `/dev/kvm`, and nothing else: no VM disk
-(even a world-readable one), nothing under `/var/lib/litevirt` or
+files, its session's directory and `/dev/kvm`, and no other file: no VM
+disk (even a world-readable one), nothing under `/var/lib/litevirt` or
 `data_dir`, no writes, and, with Linux 6.7+, no TCP; with 6.12+, no abstract
-sockets and no signals out. The reserved uids are checked to be no one
+sockets and no signals out. Landlock does not cover UDP or `connect()` to a
+pathname unix socket on any kernel: the network namespace takes away the
+first, and the uid's lack of any shared group (DAC) the second. On a host
+without AppArmor and a kernel older than 6.7, TCP is held back by the
+network namespace alone; the audit row's `landlock=` (below 4) shows it,
+but such a VM is not reported as missing a barrier. The reserved uids are checked to be no one
 else's (not the containers' id-map range, `/etc/subuid`/`subgid`, or any
 account NSS knows). Its disk export accepts exactly one connection, from
 that qemu (checked by its socket credentials, process group and, under
@@ -587,8 +606,10 @@ limits and threat model are in
   partitions. Not LVM, LUKS, ZFS or md-raid inside the backup, and not a
   stopped linked clone's disk-file backup (it is only the delta over its base)
   — restore the disk for those.
-- **Requirements:** KVM (read-write for the qemu user), `/dev/vhost-vsock`
-  (the `vhost_vsock` module), a qemu with seccomp support, AppArmor or
+- **Requirements:** KVM (`/dev/kvm` on a filesystem with POSIX ACLs, as
+  devtmpfs is, or world read-write), `/dev/vhost-vsock` (the `vhost_vsock`
+  module), `qemu_fw_cfg` in the kernel's modules (on Ubuntu it is in
+  `linux-modules-extra-$(uname -r)`), a qemu with seccomp support, AppArmor or
   Landlock (`landlock` in `/sys/kernel/security/lsm`; Ubuntu, Debian 12+,
   Fedora and RHEL 9+ kernels have it), a root daemon, and a kernel the
   daemon can read (its own by default). Without them file restore is refused
@@ -597,8 +618,9 @@ limits and threat model are in
   asked of qemu itself before each restore VM starts.
 - **`file_restore.allow_unsandboxed` is dangerous.** It names the barriers a
   restore VM may run without, one at a time: `seccomp` (qemu's seccomp
-  sandbox), `mac` (the AppArmor profile when AppArmor is on but
-  `apparmor_parser` is missing, and Landlock when the host has neither), and
+  sandbox), `mac` (any MAC barrier, on a host with neither a loadable
+  AppArmor profile nor Landlock; AppArmor on without `apparmor_parser` but
+  with Landlock runs under Landlock and needs no key), and
   `root` (a non-root daemon, which runs qemu as itself, the user that owns
   `data_dir` and its keys) — for example `allow_unsandboxed: [seccomp]`.
   `true` lifts all three. Each removes a barrier between a malicious backup
@@ -836,7 +858,7 @@ A custom absolute `repo_path` also requires the **admin** role.
 ### Repo maintenance RPCs
 
 The daemon verifies, garbage-collects, prunes and syncs a repo it holds
-through four RPCs. Each is checked at `/` with its own verb. A repo holds
+through four RPCs (and a fifth for compression, below). Each is checked at `/` with its own verb. A repo holds
 every project's backups, so a project-scoped grant or token cannot reach
 it. Each RPC writes one audit row: the caller, the repo, the outcome, and
 what the operation counted.
@@ -848,7 +870,12 @@ what the operation counted.
 | `PruneBackupRepo` | `backup.prune` | `backup.repo.prune` | the `keep_*` policy, `kept`, `deleted` |
 | `SyncBackupRepo` | `backup.sync` | `backup.repo.sync` (target `src -> dst`) | `manifests_copied chunks_copied chunks_skipped bytes_copied` |
 
-All four sit in `backup.*`, which Operator and BackupOperator hold and
+A fifth RPC, `SetBackupRepoCompression` (verb `backup.compression`, audit
+action `backup.repo.compression`; detail `init compression schema`), creates a
+zstd repo or turns zstd on for one, through the release token's `backup_zstd`
+gate. It refuses until the token has latched and records the use first.
+
+All of them sit in `backup.*`, which Operator and BackupOperator hold and
 Viewer's `*.read` does not. Without RBAC bindings the floor is the
 legacy `operator` role.
 

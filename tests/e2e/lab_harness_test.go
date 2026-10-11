@@ -842,6 +842,12 @@ func (l *lab) createVMs(via, prefix string, hosts ...string) map[string]string {
 // room returns nil instead of failing the test.
 func (l *lab) createStack(via, prefix string, roomOnly bool, hosts ...string) map[string]string {
 	l.t.Helper()
+	return l.createStackOf(via, prefix, roomOnly, drillImage(), drillMemory(), hosts...)
+}
+
+// createStackOf is createStack with an image and memory of its own.
+func (l *lab) createStackOf(via, prefix string, roomOnly bool, image, memory string, hosts ...string) map[string]string {
+	l.t.Helper()
 	stack := uniqueName(prefix)
 	names := map[string]string{}
 	var b strings.Builder
@@ -849,7 +855,7 @@ func (l *lab) createStack(via, prefix string, roomOnly bool, hosts ...string) ma
 	for i, h := range hosts {
 		n := fmt.Sprintf("%s-%d", stack, i+1)
 		names[h] = n
-		fmt.Fprintf(&b, "  %s:\n    image: %s\n    cpu: 1\n    memory: %s\n    placement:\n      host: %s\n    migrate:\n      on-host-failure: restart-any\n", n, drillImage(), drillMemory(), h)
+		fmt.Fprintf(&b, "  %s:\n    image: %s\n    cpu: 1\n    memory: %s\n    placement:\n      host: %s\n    migrate:\n      on-host-failure: restart-any\n", n, image, memory, h)
 	}
 	file := "/tmp/" + stack + ".yaml"
 	enc := base64.StdEncoding.EncodeToString([]byte(b.String()))

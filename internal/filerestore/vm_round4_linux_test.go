@@ -121,7 +121,8 @@ func TestLandlock_EscapedQemuIsFenced(t *testing.T) {
 // R3-I1: a restore VM runs confined by AppArmor or Landlock (Landlock on
 // every host that has it); with neither, it is refused unless the operator
 // allowed running without a MAC barrier. AppArmor enabled without its parser
-// stays refused (R2-I2).
+// is refused only where there is no Landlock either (R4-M3: with Landlock it
+// has the barriers of an AppArmor-off host, which is accepted).
 func TestConfinementDecision(t *testing.T) {
 	for _, c := range []struct {
 		aa, parser bool
@@ -133,8 +134,11 @@ func TestConfinementDecision(t *testing.T) {
 	}{
 		{true, true, 6, false, true, 6, ""},
 		{true, true, 0, false, true, 0, ""},
-		{true, false, 6, false, false, 0, "apparmor_parser"},
+		{true, false, 6, false, false, 6, ""},
+		{true, false, 1, false, false, 1, ""},
 		{true, false, 6, true, false, 6, ""},
+		{true, false, 0, false, false, 0, "apparmor_parser"},
+		{true, false, 0, true, false, 0, ""},
 		{false, false, 6, false, false, 6, ""},
 		{false, false, 1, false, false, 1, ""},
 		{false, false, 0, false, false, 0, "Landlock"},
@@ -176,6 +180,7 @@ func TestAllocUID_SkipsUIDWithLiveProcess(t *testing.T) {
 	busy := map[uint32][]int{base: {1 << 30}}
 	uidProcs = func(lo, hi uint32) map[uint32][]int { return busy }
 	l := NewLauncher(Config{UIDBase: base})
+	l.kvmPath = aclDevice(t)
 	uid, rel, err := l.allocUID()
 	if err != nil || uid != base+1 {
 		t.Fatalf("got uid %d (%v), want %d: uid %d still has a process", uid, err, base+1, base)

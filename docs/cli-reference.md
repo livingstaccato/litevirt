@@ -51,6 +51,9 @@ lv cluster failover-scope [cluster|region]  # Show or set whether failover quoru
 lv cluster relay-restore            # List relay-health demotions and operator holds (since, until, reason)
 lv cluster relay-restore <host> [--hold 1h]  # Clear a relay-health demotion now; --hold keeps the lease
                                    #   holder from demoting it again (admin, audited; see operating-model.md → Replication)
+lv cluster upgrade-status          # Latched capability tokens on the connected host, whether each blocks a
+                                   #   rollback, and which release features are in use (see upgrades.md →
+                                   #   Rolling back after a release token latched)
 lv cluster acknowledge-lease-term --key <k> --term <n>   # Acknowledge a contested lease term on the connected host
 lv cluster voter ls                # Adopted voter generation; per member: host state, reachable, abstaining
 lv cluster voter init [--members a,b,c] [--yes]   # Start a voter generation by hand (unanimous); for a
@@ -812,10 +815,13 @@ lv acme status [host]   # show the TLS cert the UI is serving (subject/issuer/SA
 ```bash
 # Repository management (host-local)
 lv backup repo init <path> [--encrypted --key-file <file>] [--compression zstd|none] [--force]
-#   Default: none until the cluster's release token has latched (feature
-#   backup_zstd), zstd after. zstd marks the repo schema 2, which releases
+#   Default: a local, uncompressed repo, as on every release. zstd (feature
+#   backup_zstd) is explicit, and refused until the cluster's release token
+#   has latched. zstd marks the repo schema 2, which releases
 #   without backup compression refuse to open; --force allows it before the
-#   latch, for a repo no older host reads.
+#   latch, locally, for a repo no older host reads. Without --force a zstd
+#   repo is created by the connected host's daemon (release feature gate), so
+#   <path> is a path on that host, which the command prints.
 lv backup repo set-compression <path> zstd|none [--force]   # for chunks written from now on; zstd gated as above
 lv backup repo ls <path>
 lv backup repo verify <path>

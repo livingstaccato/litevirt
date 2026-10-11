@@ -78,9 +78,16 @@ guest kernel exploited by a malicious filesystem controls the agent.
   refuses it (unless `allow_unsandboxed: [root]`: qemu would run as the
   daemon's own user, which owns `data_dir` and its keys). Each restore VM runs
   as **its own uid**, taken from 64 reserved ones (`file_restore.uid_base`,
-  default 3800000000), with groups
-  `{litevirt-restore, kvm}` only — never an account's supplementary groups.
-  So concurrent sessions, which may be different tenants' backups, cannot
+  default 3800000000), with the group `litevirt-restore` only — never an
+  account's supplementary groups, and never `kvm`. KVM is given to the
+  session's uid by a POSIX ACL entry on `/dev/kvm`, set when the uid is
+  handed out and removed when it is released; a starting daemon removes any
+  a daemon that died left behind. Not `kvm`, because libvirt's qemu creates
+  group-writable sockets as `libvirt-qemu:kvm` — among them the pull-mode
+  backup's NBD export of a live guest disk (`0775` in a `0777` directory) and
+  each domain's monitor — and Landlock does not mediate `connect()` to a
+  pathname unix socket: DAC is what keeps a restore qemu out of them. So
+  concurrent sessions, which may be different tenants' backups, cannot
   signal, trace or open each other's files whatever the LSM. The reserved
   uids are checked, before sessions start, to be no one else's: not in the
   containers' id-map range (`containers.idmap_base`, `idmap_ranges`; an
@@ -92,10 +99,10 @@ guest kernel exploited by a malicious filesystem controls the agent.
   left its process group) is killed and the uid skipped. Closing a session
   kills anything still running as its uid. The
   `litevirt-restore` account exists for its group (which reads the boot files)
-  and is created at daemon start (`useradd --system --user-group --groups kvm`,
-  nologin); an existing account of that name is used only if it is a system
-  uid with a nologin shell, a uid no one else has and no group but its own and
-  kvm. `libvirt-qemu`, `qemu`, `nobody` and root as `run_as` are refused unless
+  and is created at daemon start (`useradd --system --user-group`, nologin,
+  no other group); an existing account of that name is used only if it is a
+  system uid with a nologin shell, a uid no one else has and no group but its
+  own and `kvm` (which earlier builds gave it; no restore VM gets it). `libvirt-qemu`, `qemu`, `nobody` and root as `run_as` are refused unless
   `allow_shared_run_as`, which then runs qemu as that user. The credential is
   set in the child before exec; qemu never switches users itself, so its
   seccomp sandbox (`elevateprivileges=deny`) and the drop do not conflict.
@@ -110,7 +117,10 @@ guest kernel exploited by a malicious filesystem controls the agent.
 - **AppArmor, failing closed.** Where AppArmor is enabled, the daemon loads
   the `litevirt-restore-qemu` profile from memory (`apparmor_parser -r`,
   nothing under `/etc`, verified loaded in enforce mode). Enabled but no
-  parser: refused unless `allow_unsandboxed: [mac]`. The profile grants qemu's binary,
+  parser loads nothing, so the host has exactly the barriers of one with
+  AppArmor off: with Landlock it runs under Landlock (a warning names the
+  missing parser), without Landlock it is refused unless
+  `allow_unsandboxed: [mac]`. The profile grants qemu's binary,
   libraries and firmware, `/dev/kvm`, `/dev/vhost-vsock` (needed: AppArmor
   revalidates the inherited vhost fd at exec against the new profile), the
   boot files, the sessions' sockets and nonce files (DAC narrows them to its
@@ -142,28 +152,46 @@ guest kernel exploited by a malicious filesystem controls the agent.
   read and execute of qemu's binary, `/usr`, `/lib*`, `/bin`, `/sbin`; read of
   `/etc/ld.so.cache`, the boot files and their cache, the session's own
   directory, qemu's own `/proc/<pid>`, a few `/proc/sys` and `/sys` files and
-  `/dev/urandom`; read-write of `/dev/kvm` and `/dev/null`. Nothing else: not
-  `/var/lib/litevirt` or any VM disk — which `lv` and libvirt may leave
+  `/dev/urandom`; read-write of `/dev/kvm` and `/dev/null`. No other file:
+  not `/var/lib/litevirt` or any VM disk — which `lv` and libvirt may leave
   world-readable — not `data_dir`, not another session's directory, no
   writes anywhere. With Landlock ABI 4 (Linux 6.7) every TCP bind and connect
   is refused; with ABI 6 (Linux 6.12) abstract unix sockets and signals to
   processes outside the ruleset are refused too; older ABIs give the
-  filesystem part only. (UDP is not covered by any ABI; the seccomp sandbox
-  and AppArmor's `deny network` are what remain there.) The exec stage checks
+  filesystem part only. Three things are outside every Landlock ABI:
+  - **`connect()` to a pathname unix socket.** It is a filesystem object
+    Landlock does not mediate; DAC governs it, which is why the restore
+    qemu's uid holds no group but `litevirt-restore` (above). AppArmor's
+    profile also allows unix connects only to the unconfined daemon.
+  - **UDP.** qemu's seccomp sandbox filters no socket calls. Under a root
+    daemon qemu runs in a network namespace of its own (below), which has no
+    interface but a down loopback; AppArmor's `deny network` covers it too.
+  - **The inherited vhost-vsock fd**, opened by the daemon before the
+    ruleset: the VM's one channel to the host, by design.
+
+  The exec stage checks
   the ruleset took (the root directory must be unreadable) and exits
   otherwise, so qemu never starts unrestricted. The vhost-vsock fd qemu
   inherits was opened before the ruleset and is unaffected. The
   `landlock=<abi>` in each audit row says which ABI applied.
+- **A network namespace of its own.** Under a root daemon the restore qemu
+  (with its trampoline) is started in a new network namespace, created as
+  root before the credential change. It holds only a loopback interface, which
+  is down: no UDP, TCP or abstract unix socket of the host is reachable,
+  whatever the Landlock ABI. Pathname unix sockets (the session's NBD export)
+  are filesystem objects and still connect, and the vhost-vsock fd belongs
+  to the daemon's namespace.
 - **Hosts without AppArmor** (SELinux, or no LSM): Landlock is the MAC
   barrier. What isolates a restore VM there is its own uid (DAC between
   sessions), the Landlock ruleset (against every host file outside its
-  allowlist, world-readable or not, and the network as the ABI allows), its
-  seccomp sandbox (`elevateprivileges`, `spawn`, `obsolete`,
+  allowlist, world-readable or not, and TCP as the ABI allows), its network
+  namespace (UDP and the rest of the network, on every ABI), its seccomp
+  sandbox (`elevateprivileges`, `spawn`, `obsolete`,
   `resourcecontrol` denied), the single-peer export, and the absence of any
   NIC. **With neither AppArmor nor Landlock** (a kernel without
   `CONFIG_SECURITY_LANDLOCK`, or `landlock` missing from `lsm=`), nothing but
-  DAC would stand between an escaped qemu and world-readable VM disks or the
-  host's network, so file restore is refused unless
+  DAC would stand between an escaped qemu and world-readable VM disks, so
+  file restore is refused unless
   `allow_unsandboxed: [mac]`. A restore qemu inherits the daemon's SELinux
   domain; no SELinux policy is shipped.
 - **Seccomp, asked of qemu.** Before each restore VM, the daemon starts the
@@ -325,8 +353,10 @@ custom absolute repo path. Every extraction writes one audit row,
 `backup.file_restore`, with the project, repo, timestamp, disk, selected paths
 and what was extracted (entries, bytes, refused entries, whether a limit cut
 it short), and what isolated its restore VM (`sandbox=on|off
-apparmor=on|off|absent landlock=<abi>|off uid=<n>`); a refused one is audited
-`denied`. Listing is a read and is not audited, as for
+apparmor=on|off|absent landlock=<abi>|off uid=<n>`). The row is written
+once the extraction has ended, whether or not the client is still connected
+(it usually closes its stream as soon as it has the archive). A refused one
+is audited `denied`. Listing is a read and is not audited, as for
 `ListBackupRepoSnapshots` — except that any restore VM started without one of
 its barriers (no seccomp sandbox, no MAC, or a shared or the daemon's own
 uid), for browsing or extracting, writes a `backup.file_restore_unsandboxed`
@@ -337,12 +367,15 @@ row with the same barrier summary. While `file_restore.allow_unsandboxed` or
 
 ## 7. When it cannot run
 
-Before every session the daemon checks: `/dev/kvm` read-write for the qemu
-user, `/dev/vhost-vsock` openable, the kernel readable, its `modules.dep`
-present with a virtio disk and a vsock transport (built in or as modules), a
-qemu binary, and a statically linked agent. A failure refuses file restore
-with `FailedPrecondition` naming the cause, e.g. `no usable KVM for qemu user
-libvirt-qemu: /dev/kvm (mode 600, owner 0:0) is not read-write`, or
+Before every session the daemon checks: `/dev/kvm` grantable to the
+per-session uids (it takes POSIX ACLs, or is world read-write already),
+`/dev/vhost-vsock` openable, the kernel readable, its `modules.dep` present
+with a virtio disk, a vsock transport and `qemu_fw_cfg` (built in or as
+modules; Ubuntu ships `qemu_fw_cfg` in `linux-modules-extra-<release>`, which
+the refusal names), a qemu binary, and a statically linked agent. A failure
+refuses file restore with `FailedPrecondition` naming the cause, e.g. `kernel
+modules in /lib/modules/6.8.0-139-generic have no qemu_fw_cfg … (on Ubuntu:
+linux-modules-extra-6.8.0-139-generic)`, or
 `this qemu has no seccomp sandbox … file_restore.allow_unsandboxed: [seccomp]
 permits it`.
 There is no fallback to a host mount. A full restore (`restore-from`,

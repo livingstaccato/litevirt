@@ -159,6 +159,7 @@ const (
 	LiteVirt_GarbageCollectBackupRepo_FullMethodName   = "/litevirt.v1.LiteVirt/GarbageCollectBackupRepo"
 	LiteVirt_PruneBackupRepo_FullMethodName            = "/litevirt.v1.LiteVirt/PruneBackupRepo"
 	LiteVirt_SyncBackupRepo_FullMethodName             = "/litevirt.v1.LiteVirt/SyncBackupRepo"
+	LiteVirt_SetBackupRepoCompression_FullMethodName   = "/litevirt.v1.LiteVirt/SetBackupRepoCompression"
 	LiteVirt_ListBackupRepoSnapshots_FullMethodName    = "/litevirt.v1.LiteVirt/ListBackupRepoSnapshots"
 	LiteVirt_CreateContainer_FullMethodName            = "/litevirt.v1.LiteVirt/CreateContainer"
 	LiteVirt_StartContainer_FullMethodName             = "/litevirt.v1.LiteVirt/StartContainer"
@@ -290,6 +291,8 @@ const (
 	LiteVirt_SetFailoverScope_FullMethodName           = "/litevirt.v1.LiteVirt/SetFailoverScope"
 	LiteVirt_RestoreRelay_FullMethodName               = "/litevirt.v1.LiteVirt/RestoreRelay"
 	LiteVirt_GetRelayHealth_FullMethodName             = "/litevirt.v1.LiteVirt/GetRelayHealth"
+	LiteVirt_GetUpgradeStatus_FullMethodName           = "/litevirt.v1.LiteVirt/GetUpgradeStatus"
+	LiteVirt_HoldsReleaseFeatureUse_FullMethodName     = "/litevirt.v1.LiteVirt/HoldsReleaseFeatureUse"
 	LiteVirt_UpsertServiceEndpoint_FullMethodName      = "/litevirt.v1.LiteVirt/UpsertServiceEndpoint"
 	LiteVirt_ListServiceEndpoints_FullMethodName       = "/litevirt.v1.LiteVirt/ListServiceEndpoints"
 	LiteVirt_DeleteServiceEndpoint_FullMethodName      = "/litevirt.v1.LiteVirt/DeleteServiceEndpoint"
@@ -549,10 +552,15 @@ type LiteVirtClient interface {
 	// daemon to a repo it holds, under RBAC and on the audit record. The web
 	// UI's /backups actions call these. Verbs: backup.verify, backup.gc,
 	// backup.prune, backup.sync, all at `/`, legacy floor operator.
+	// SetBackupRepoCompression (verb backup.compression, same place and floor)
+	// creates a repo with zstd chunk compression, or turns zstd on for an
+	// existing one, through the release token's backup_zstd gate: it is the
+	// daemon-side half of `lv backup repo init|set-compression`.
 	VerifyBackupRepo(ctx context.Context, in *VerifyBackupRepoRequest, opts ...grpc.CallOption) (*VerifyBackupRepoResponse, error)
 	GarbageCollectBackupRepo(ctx context.Context, in *GarbageCollectBackupRepoRequest, opts ...grpc.CallOption) (*GarbageCollectBackupRepoResponse, error)
 	PruneBackupRepo(ctx context.Context, in *PruneBackupRepoRequest, opts ...grpc.CallOption) (*PruneBackupRepoResponse, error)
 	SyncBackupRepo(ctx context.Context, in *SyncBackupRepoRequest, opts ...grpc.CallOption) (*SyncBackupRepoResponse, error)
+	SetBackupRepoCompression(ctx context.Context, in *SetBackupRepoCompressionRequest, opts ...grpc.CallOption) (*SetBackupRepoCompressionResponse, error)
 	// The /backups page's listing. Verb backup.read at `/`, legacy floor viewer;
 	// a read, so not audited.
 	ListBackupRepoSnapshots(ctx context.Context, in *ListBackupRepoSnapshotsRequest, opts ...grpc.CallOption) (*ListBackupRepoSnapshotsResponse, error)
@@ -823,6 +831,16 @@ type LiteVirtClient interface {
 	// operator hold (viewer): demoted or restored, since when and why, and
 	// any hold with its expiry.
 	GetRelayHealth(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*RelayHealthStatus, error)
+	// GetUpgradeStatus reports, as the answering host sees them, every
+	// capability token latched here, whether each blocks a rollback, and for
+	// each release token which of its features have been used cluster-wide
+	// (`lv cluster upgrade-status`, docs/upgrades.md). Viewer.
+	GetUpgradeStatus(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*UpgradeStatus, error)
+	// HoldsReleaseFeatureUse answers, for a peer, whether this replica holds the
+	// used record of one release feature. A first use waits for every
+	// replication recipient to answer yes before the feature writes anything.
+	// Peer mTLS only.
+	HoldsReleaseFeatureUse(ctx context.Context, in *ReleaseFeatureUseQuery, opts ...grpc.CallOption) (*ReleaseFeatureUseHeld, error)
 	// ── anycast services ──
 	// service_endpoints map a logical name (e.g. "api.litevirt.local")
 	// to N (ip, region) pairs. The embedded DNS server round-robins
@@ -2507,6 +2525,16 @@ func (c *liteVirtClient) SyncBackupRepo(ctx context.Context, in *SyncBackupRepoR
 	return out, nil
 }
 
+func (c *liteVirtClient) SetBackupRepoCompression(ctx context.Context, in *SetBackupRepoCompressionRequest, opts ...grpc.CallOption) (*SetBackupRepoCompressionResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SetBackupRepoCompressionResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_SetBackupRepoCompression_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) ListBackupRepoSnapshots(ctx context.Context, in *ListBackupRepoSnapshotsRequest, opts ...grpc.CallOption) (*ListBackupRepoSnapshotsResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListBackupRepoSnapshotsResponse)
@@ -3937,6 +3965,26 @@ func (c *liteVirtClient) GetRelayHealth(ctx context.Context, in *emptypb.Empty, 
 	return out, nil
 }
 
+func (c *liteVirtClient) GetUpgradeStatus(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*UpgradeStatus, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(UpgradeStatus)
+	err := c.cc.Invoke(ctx, LiteVirt_GetUpgradeStatus_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) HoldsReleaseFeatureUse(ctx context.Context, in *ReleaseFeatureUseQuery, opts ...grpc.CallOption) (*ReleaseFeatureUseHeld, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReleaseFeatureUseHeld)
+	err := c.cc.Invoke(ctx, LiteVirt_HoldsReleaseFeatureUse_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) UpsertServiceEndpoint(ctx context.Context, in *UpsertServiceEndpointRequest, opts ...grpc.CallOption) (*ServiceEndpoint, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ServiceEndpoint)
@@ -4446,10 +4494,15 @@ type LiteVirtServer interface {
 	// daemon to a repo it holds, under RBAC and on the audit record. The web
 	// UI's /backups actions call these. Verbs: backup.verify, backup.gc,
 	// backup.prune, backup.sync, all at `/`, legacy floor operator.
+	// SetBackupRepoCompression (verb backup.compression, same place and floor)
+	// creates a repo with zstd chunk compression, or turns zstd on for an
+	// existing one, through the release token's backup_zstd gate: it is the
+	// daemon-side half of `lv backup repo init|set-compression`.
 	VerifyBackupRepo(context.Context, *VerifyBackupRepoRequest) (*VerifyBackupRepoResponse, error)
 	GarbageCollectBackupRepo(context.Context, *GarbageCollectBackupRepoRequest) (*GarbageCollectBackupRepoResponse, error)
 	PruneBackupRepo(context.Context, *PruneBackupRepoRequest) (*PruneBackupRepoResponse, error)
 	SyncBackupRepo(context.Context, *SyncBackupRepoRequest) (*SyncBackupRepoResponse, error)
+	SetBackupRepoCompression(context.Context, *SetBackupRepoCompressionRequest) (*SetBackupRepoCompressionResponse, error)
 	// The /backups page's listing. Verb backup.read at `/`, legacy floor viewer;
 	// a read, so not audited.
 	ListBackupRepoSnapshots(context.Context, *ListBackupRepoSnapshotsRequest) (*ListBackupRepoSnapshotsResponse, error)
@@ -4720,6 +4773,16 @@ type LiteVirtServer interface {
 	// operator hold (viewer): demoted or restored, since when and why, and
 	// any hold with its expiry.
 	GetRelayHealth(context.Context, *emptypb.Empty) (*RelayHealthStatus, error)
+	// GetUpgradeStatus reports, as the answering host sees them, every
+	// capability token latched here, whether each blocks a rollback, and for
+	// each release token which of its features have been used cluster-wide
+	// (`lv cluster upgrade-status`, docs/upgrades.md). Viewer.
+	GetUpgradeStatus(context.Context, *emptypb.Empty) (*UpgradeStatus, error)
+	// HoldsReleaseFeatureUse answers, for a peer, whether this replica holds the
+	// used record of one release feature. A first use waits for every
+	// replication recipient to answer yes before the feature writes anything.
+	// Peer mTLS only.
+	HoldsReleaseFeatureUse(context.Context, *ReleaseFeatureUseQuery) (*ReleaseFeatureUseHeld, error)
 	// ── anycast services ──
 	// service_endpoints map a logical name (e.g. "api.litevirt.local")
 	// to N (ip, region) pairs. The embedded DNS server round-robins
@@ -5254,6 +5317,9 @@ func (UnimplementedLiteVirtServer) PruneBackupRepo(context.Context, *PruneBackup
 func (UnimplementedLiteVirtServer) SyncBackupRepo(context.Context, *SyncBackupRepoRequest) (*SyncBackupRepoResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method SyncBackupRepo not implemented")
 }
+func (UnimplementedLiteVirtServer) SetBackupRepoCompression(context.Context, *SetBackupRepoCompressionRequest) (*SetBackupRepoCompressionResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SetBackupRepoCompression not implemented")
+}
 func (UnimplementedLiteVirtServer) ListBackupRepoSnapshots(context.Context, *ListBackupRepoSnapshotsRequest) (*ListBackupRepoSnapshotsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListBackupRepoSnapshots not implemented")
 }
@@ -5646,6 +5712,12 @@ func (UnimplementedLiteVirtServer) RestoreRelay(context.Context, *RestoreRelayRe
 }
 func (UnimplementedLiteVirtServer) GetRelayHealth(context.Context, *emptypb.Empty) (*RelayHealthStatus, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetRelayHealth not implemented")
+}
+func (UnimplementedLiteVirtServer) GetUpgradeStatus(context.Context, *emptypb.Empty) (*UpgradeStatus, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetUpgradeStatus not implemented")
+}
+func (UnimplementedLiteVirtServer) HoldsReleaseFeatureUse(context.Context, *ReleaseFeatureUseQuery) (*ReleaseFeatureUseHeld, error) {
+	return nil, status.Error(codes.Unimplemented, "method HoldsReleaseFeatureUse not implemented")
 }
 func (UnimplementedLiteVirtServer) UpsertServiceEndpoint(context.Context, *UpsertServiceEndpointRequest) (*ServiceEndpoint, error) {
 	return nil, status.Error(codes.Unimplemented, "method UpsertServiceEndpoint not implemented")
@@ -8044,6 +8116,24 @@ func _LiteVirt_SyncBackupRepo_Handler(srv interface{}, ctx context.Context, dec 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_SetBackupRepoCompression_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetBackupRepoCompressionRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).SetBackupRepoCompression(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_SetBackupRepoCompression_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).SetBackupRepoCompression(ctx, req.(*SetBackupRepoCompressionRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LiteVirt_ListBackupRepoSnapshots_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ListBackupRepoSnapshotsRequest)
 	if err := dec(in); err != nil {
@@ -10274,6 +10364,42 @@ func _LiteVirt_GetRelayHealth_Handler(srv interface{}, ctx context.Context, dec 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_GetUpgradeStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(emptypb.Empty)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).GetUpgradeStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_GetUpgradeStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).GetUpgradeStatus(ctx, req.(*emptypb.Empty))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_HoldsReleaseFeatureUse_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReleaseFeatureUseQuery)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).HoldsReleaseFeatureUse(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_HoldsReleaseFeatureUse_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).HoldsReleaseFeatureUse(ctx, req.(*ReleaseFeatureUseQuery))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LiteVirt_UpsertServiceEndpoint_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(UpsertServiceEndpointRequest)
 	if err := dec(in); err != nil {
@@ -11217,6 +11343,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _LiteVirt_SyncBackupRepo_Handler,
 		},
 		{
+			MethodName: "SetBackupRepoCompression",
+			Handler:    _LiteVirt_SetBackupRepoCompression_Handler,
+		},
+		{
 			MethodName: "ListBackupRepoSnapshots",
 			Handler:    _LiteVirt_ListBackupRepoSnapshots_Handler,
 		},
@@ -11675,6 +11805,14 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetRelayHealth",
 			Handler:    _LiteVirt_GetRelayHealth_Handler,
+		},
+		{
+			MethodName: "GetUpgradeStatus",
+			Handler:    _LiteVirt_GetUpgradeStatus_Handler,
+		},
+		{
+			MethodName: "HoldsReleaseFeatureUse",
+			Handler:    _LiteVirt_HoldsReleaseFeatureUse_Handler,
 		},
 		{
 			MethodName: "UpsertServiceEndpoint",

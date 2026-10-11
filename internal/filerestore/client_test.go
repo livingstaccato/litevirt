@@ -125,7 +125,9 @@ func TestClient_ListingDecodedWithinTheCap(t *testing.T) {
 		t.Fatalf("kept %d entries truncated=%v", len(resp.Entries), resp.Truncated)
 	}
 	// ~2.8M empty objects would be ~200-400 MB as []Entry.
-	if alloc := after.TotalAlloc - before.TotalAlloc; alloc > 96<<20 {
+	alloc := after.TotalAlloc - before.TotalAlloc
+	t.Logf("decoding a capped listing allocated %d MB", alloc>>20)
+	if alloc > 96<<20 {
 		t.Fatalf("decoding a capped listing allocated %d MB", alloc>>20)
 	}
 }

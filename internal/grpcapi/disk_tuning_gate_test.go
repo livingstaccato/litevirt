@@ -166,7 +166,7 @@ func TestDiskNICIOGate_UpdateVMTuningRequestUnlatched(t *testing.T) {
 // work), and after it the values are validated.
 //
 // Mutations: skip the strip — the unlatched case goes red; skip validation — the
-// latched invalid case goes red.
+// latched invalid cases go red; refuse an invalid value (as before) — red.
 func TestRestrictRestoredTuning(t *testing.T) {
 	mk := func() *pb.VMSpec {
 		return &pb.VMSpec{Name: "r",
@@ -193,15 +193,22 @@ func TestRestrictRestoredTuning(t *testing.T) {
 	if err != nil || st || !specSetsDiskNICIO(spec) || g.Check(capabilities.FeatureVMDiskNICIO) != nil {
 		t.Errorf("latched valid: stripped=%v err=%v grant=%v", st, err, g)
 	}
+	// Invalid values after the latch: dropped, not refused (a recovery path),
+	// each named; the valid rest is kept under the grant.
 	bad := mk()
 	bad.Network[0].Queues = 4096
-	if _, err := la.restrictRestoredTuning(ctx, bad); status.Code(err) != codes.InvalidArgument {
-		t.Errorf("latched, queues 4096: %v, want InvalidArgument", err)
+	br, err := la.restrictRestoredTuning(ctx, bad)
+	if err != nil || bad.Network[0].Queues != 0 || bad.Disks[0].Discard != "unmap" || bad.Disks[0].Io == nil ||
+		br.grant.Check(capabilities.FeatureVMDiskNICIO) != nil || !strings.Contains(strings.Join(br.invalid, ";"), "network 0 queues") {
+		t.Errorf("latched, queues 4096: %+v err=%v spec=%+v; want the queues dropped and named, the disk kept", br, err, bad)
 	}
 	bad = mk()
 	bad.Disks[0].Io = &pb.DiskIOLimits{TotalBytesSec: 1, ReadBytesSec: 1}
-	if _, err := la.restrictRestoredTuning(ctx, bad); status.Code(err) != codes.InvalidArgument {
-		t.Errorf("latched, total with read: %v, want InvalidArgument", err)
+	br, err = la.restrictRestoredTuning(ctx, bad)
+	joined := strings.Join(br.invalid, ";")
+	if err != nil || bad.Disks[0].Io != nil || bad.Disks[0].Discard != "" || bad.Disks[0].DetectZeroes != "" || bad.Network[0].Queues != 4 ||
+		!strings.Contains(joined, `disk "root" io`) || !strings.Contains(joined, `disk "root" discard`) {
+		t.Errorf("latched, total with read: %+v err=%v spec=%+v; want the disk's tuning dropped and named, the NIC kept", br, err, bad)
 	}
 }
 

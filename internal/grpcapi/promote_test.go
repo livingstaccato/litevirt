@@ -6,9 +6,6 @@ import (
 	"strings"
 	"testing"
 
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
-
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -244,8 +241,21 @@ func TestPromoteReplica_TuningIsGatedAndTheNICKeepsItsQueues(t *testing.T) {
 		t.Errorf("after the promote a redefine renders queues=%d, want 4 (the spec holds the source's MAC, not this NIC's)", nets[0].Queues)
 	}
 
-	// Gate open, invalid: refused.
-	if _, _, err := promoteTuned(t, true, 4096); status.Code(err) != codes.InvalidArgument {
-		t.Errorf("queues 4096: %v, want InvalidArgument", err)
+	// Gate open, invalid: the promotion is never refused for it (a recovery
+	// path main allowed). The invalid queues are dropped with a warning naming
+	// them; the valid disk tuning is kept.
+	logs := captureSlog(t)
+	s, fake, err = promoteTuned(t, true, 4096)
+	if err != nil {
+		t.Fatalf("queues 4096: promote refused: %v", err)
+	}
+	if got := loadStoredSpec(t, s, "vm1-p"); got.Network[0].Queues != 0 || got.Disks[0].Io.GetReadIopsSec() != 321 {
+		t.Errorf("queues 4096: stored spec %+v; want the queues dropped and the disk tuning kept", got)
+	}
+	if x := fake.DefinedXML("vm1-p"); strings.Contains(x, "queues=") || !strings.Contains(x, "iotune") {
+		t.Errorf("queues 4096: domain renders the invalid queues or lost the valid tuning:\n%s", x)
+	}
+	if out := logs.String(); !strings.Contains(out, "level=WARN") || !strings.Contains(out, "network 0 queues") {
+		t.Errorf("no warning naming the dropped key:\n%s", out)
 	}
 }

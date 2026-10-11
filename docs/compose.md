@@ -466,7 +466,11 @@ or promotion of a spec that carries them still works, with the tuning dropped. O
 token has latched, the first write of any of them (an unset discard becomes the
 storage default on a new disk only once the feature is already in use, so a plain create never waits on a first use) records the feature as used; see upgrades.md, *Rolling back after a release token
 latched*, for what a rollback does. A restore whose tuning the gate refuses after the latch
-still completes, with the tuning dropped, a warning and an audit row.
+still completes, with the tuning dropped, a warning and an audit row. So does a restore
+or promotion whose spec carries a value a create would refuse (queues above the limit, a
+total throttle beside a read one): that disk's tuning, or that NIC's queues, is dropped
+with a warning naming each key and an audit row (`vm.tuning_dropped`), and the rest is
+kept.
 The gate has no config flag and, once open, stays open; to stop using the feature, clear
 the settings (`lv disk-io <vm> --clear`, or drop the keys).
 

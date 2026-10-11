@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -83,6 +84,9 @@ func (s *Server) autoDefineRestoredVM(
 	ioG := ioR.grant
 	if ioR.stripped {
 		_ = send(&pb.RestoreLiveProgress{Status: "the backup's disk/NIC tuning is not applied: " + ioR.why()})
+	}
+	if len(ioR.invalid) > 0 {
+		_ = send(&pb.RestoreLiveProgress{Status: "invalid disk/NIC tuning in the backup's spec is not applied: " + strings.Join(ioR.invalid, "; ")})
 	}
 	// A limit in the spec — an operator's --spec or one embedded in a backup,
 	// possibly from a cluster that has latched — is judged as a create's is.

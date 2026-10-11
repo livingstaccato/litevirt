@@ -68,6 +68,10 @@ func envOr(key, fallback string) string {
 // ─── Test harness ───────────────────────────────────────────────────────────
 
 func TestMain(m *testing.M) {
+	// Pure helper tests (no cluster, no lv) opt in separately.
+	if os.Getenv("LITEVIRT_E2E_UNIT") == "1" {
+		os.Exit(m.Run())
+	}
 	// Live e2e is OPT-IN. It mutates a real cluster and runs the CLI against
 	// whatever `lv` resolves, so a plain `go test ./...` must never accidentally
 	// touch a stale system `lv`. Require an explicit LITEVIRT_E2E=1, and once
@@ -1802,9 +1806,10 @@ func TestVM_AttachDetachNIC(t *testing.T) {
 		t.Fatalf("no new MAC in inspect after attaching a NIC (before %v):\n%s", before, out)
 	}
 	lv(t, "detach-nic", vmName, added)
-	if after := lv(t, "inspect", vmName); strings.Contains(after, added) {
-		t.Errorf("detached NIC %s still in inspect output:\n%s", added, after)
-	}
+	// The guest acks an unplug asynchronously, so poll rather than read once.
+	assertEventually(t, 30*time.Second, "detached NIC "+added+" gone from inspect", func() bool {
+		return !strings.Contains(lv(t, "inspect", vmName), added)
+	})
 
 	lv(t, "rm", vmName, "--force")
 	lv(t, "network", "rm", netName, "--force")
@@ -2559,13 +2564,8 @@ vms:
 		if chain == "" {
 			t.Fatalf("web SG never rendered into a nic_in_ chain of bridge litevirt-nic on %s within 2m:\n%s", host, nic)
 		}
-		a, d := strings.Index(chain, "tcp dport 8080 accept"), strings.Index(chain, "udp dport 68 accept")
-		if a < 0 || d < a {
-			t.Errorf("the SG's rules are not 8080 accept then DHCP accept:\n%s", chain)
-		} else if rest := strings.TrimSpace(chain[d+len("udp dport 68 accept"):]); !strings.HasPrefix(rest, "drop") {
-			// The SG's own `proto all drop` is the next rule: a later drop
-			// (a cluster default-deny) would not prove it rendered.
-			t.Errorf("the SG's drop does not follow its DHCP accept:\n%s", chain)
+		if err := sgChainOrdered(chain); err != nil {
+			t.Errorf("%v:\n%s", err, chain)
 		}
 		// Scoped to the bound NIC: exactly one nic_in_ chain carries the rule.
 		if n := strings.Count(nic, "tcp dport 8080 accept"); n != 1 {
@@ -2580,6 +2580,61 @@ vms:
 		}
 		t.Logf("bridge litevirt-nic on %s rendered the web SG correctly (8080 accept, DHCP accept, drop; single inet forward chain)", host)
 	})
+}
+
+// sgChainOrdered checks a nic_in_ chain of an nft listing carries the web SG as
+// three consecutive rules: tcp 8080 accept, udp 68 accept, and the SG's own
+// `proto all drop`. Rules in a NIC chain are scoped to the NIC, so they list as
+// `oifname "vnetX" tcp dport 8080 accept` and the drop as `oifname "vnetX" drop`.
+// The drop is matched by its tokens (the NIC match, then only the verdict), and
+// must be the rule right after the DHCP accept: a later drop, such as a cluster
+// default-deny, would not prove the SG's rendered.
+func sgChainOrdered(chain string) error {
+	var rules []string
+	for _, l := range strings.Split(chain, "\n") {
+		if l = strings.TrimSpace(l); l != "" && l != "}" && !strings.HasSuffix(l, "{") && !strings.HasPrefix(l, "type ") {
+			rules = append(rules, l)
+		}
+	}
+	for i, r := range rules {
+		if !strings.HasSuffix(r, "tcp dport 8080 accept") {
+			continue
+		}
+		if i+2 >= len(rules) || !strings.HasSuffix(rules[i+1], "udp dport 68 accept") {
+			return fmt.Errorf("the SG's 8080 accept is not followed by its DHCP accept")
+		}
+		f := strings.Fields(rules[i+2])
+		if len(f) < 2 || f[0] != "oifname" || f[len(f)-1] != "drop" || strings.ContainsAny(rules[i+2], "{}") ||
+			strings.Contains(rules[i+2], "dport") || strings.Contains(rules[i+2], "saddr") || strings.Contains(rules[i+2], "daddr") {
+			return fmt.Errorf("the SG's drop does not follow its DHCP accept (next rule: %q)", rules[i+2])
+		}
+		return nil
+	}
+	return fmt.Errorf("no tcp dport 8080 accept rule")
+}
+
+// TestSGChainOrdered pins sgChainOrdered against a chain as nft lists one.
+// Run it with LITEVIRT_E2E_UNIT=1 (it needs no cluster).
+func TestSGChainOrdered(t *testing.T) {
+	const good = `	chain nic_in_vnet3 {
+		oifname "vnet3" tcp dport 8080 accept
+		oifname "vnet3" udp dport 68 accept
+		oifname "vnet3" drop
+	}`
+	if err := sgChainOrdered(good); err != nil {
+		t.Errorf("a correct chain was refused: %v", err)
+	}
+	for name, bad := range map[string]string{
+		"drop missing, a later default-deny drop": "oifname \"vnet3\" tcp dport 8080 accept\noifname \"vnet3\" udp dport 68 accept\noifname \"vnet3\" tcp dport 22 accept\ndrop\n",
+		"drop missing":            "oifname \"vnet3\" tcp dport 8080 accept\noifname \"vnet3\" udp dport 68 accept\n",
+		"drop before the accepts": "oifname \"vnet3\" drop\noifname \"vnet3\" tcp dport 8080 accept\noifname \"vnet3\" udp dport 68 accept\n",
+		"accepts out of order":    "oifname \"vnet3\" udp dport 68 accept\noifname \"vnet3\" tcp dport 8080 accept\noifname \"vnet3\" drop\n",
+		"verdict is not a drop":   "oifname \"vnet3\" tcp dport 8080 accept\noifname \"vnet3\" udp dport 68 accept\noifname \"vnet3\" accept\n",
+	} {
+		if err := sgChainOrdered(bad); err == nil {
+			t.Errorf("%s: an incorrect chain was accepted", name)
+		}
+	}
 }
 
 // chainWith returns the body of the first chain of an nft table dump whose name

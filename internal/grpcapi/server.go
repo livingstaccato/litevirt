@@ -614,6 +614,9 @@ type Server struct {
 	cephSecrets cephSecretMarks
 	// cephProofs remembers, briefly, the ceph keys a start proved (ceph_probe.go).
 	cephProofs cephKeyProofs
+	// cephTrash is what the last scans of the ceph pools' trash found that no
+	// purge here tracks (ScanCephTrash).
+	cephTrash cephTrashScans
 
 	// poolUploadsMu serializes the read-modify-write of <data_dir>/pool-uploads.json
 	// (storage_pool_confine.go).

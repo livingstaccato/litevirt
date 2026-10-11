@@ -1776,13 +1776,33 @@ moved to its pool's trash, and its objects are purged in the background with
 `rbd trash rm <pool>/<id>`, retried until it succeeds and resumed after a
 daemon restart. While a purge this host owes has failed, the host raises
 `ceph_trash_leftover` (evaluator `ceph_pool`, subject `host/<host>`, warning).
-The evidence lists each leftover: its trash reference (`<pool>/<id>`), the
-image it was, when it was moved, the attempts, the last error, and the
-command that purges it by hand. The image's capacity stays used until then.
-Common causes: the cluster unreachable from the host, the image still watched
-by a client (another host's qemu), or snapshots on it. The condition resolves
-on the next reconcile (30 s) once no purge is failing. See
-[storage.md](storage.md#ceph-rbd-pools).
+The evidence lists each leftover with its trash reference (`<pool>/<id>`), the
+image it was, a `state`, why it is listed, and the command that deals with it
+by hand (`by_hand`):
+
+- `purge_failing`: the purge keeps failing and is retried. The image's
+  capacity stays used until then. Common causes: the cluster unreachable from
+  the host, or snapshots on it. By hand: `rbd trash rm <pool>/<id>`.
+- `held`: a client has the image open in the trash. It opened the image just
+  before the move, and `rbd trash mv` does not refuse an open image. It may be
+  a running VM's disk, so it is **never purged automatically**. Put it back
+  with `rbd trash restore <pool>/<id>`.
+- `half_moved`: a `rbd trash mv` that failed left the image both in the trash
+  and under its name. It is never purged. Check it with
+  `rbd trash ls --all --long <pool>` and `rbd info <pool>/<image>`, then restore
+  it.
+- `untracked`: a litevirt-named image in a ceph pool's trash that no purge on
+  this host tracks, seen by two scans in a row (every 5 minutes). Causes: an
+  interrupted `rbd rm`, a crash that lost the queue, or another host's purge
+  still running. Restore it, or remove it with `rbd trash rm`.
+
+`unreadable_queue_files` names purge queue files found unreadable and moved
+aside (`<data_dir>/ceph-trash-purges.json.unreadable-<time>`). The purges they
+held are no longer tracked; check the pools' trash, then remove the file. A
+held entry is forgotten once its trash no longer lists it.
+
+The condition resolves on the next reconcile (30 s) once nothing is listed.
+See [storage.md](storage.md#ceph-rbd-pools).
 
 ### A VM's disk is missing on its own host (`vm_disk_missing`)
 

@@ -276,6 +276,7 @@ echo "$(basename "$0") $*" >> ` + logPath + `
 for a in "$@"; do
   case "$a" in
     info) exit 1 ;;
+    status) echo '{"watchers":[]}'; exit 0 ;;
     export) echo stream; exit 0 ;;
     import) cat >/dev/null; echo "rbd: image exists" >&2; exit 1 ;;
   esac

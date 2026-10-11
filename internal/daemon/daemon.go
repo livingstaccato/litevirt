@@ -2187,16 +2187,29 @@ func (d *Daemon) refreshStoragePools(ctx context.Context) {
 const cephSecretReconcileInterval = 30 * time.Second
 
 // runCephSecretReconcile keeps the ceph pools' libvirt secrets defined and
-// current until ctx is cancelled (grpcapi.ReconcileCephSecrets).
+// current until ctx is cancelled (grpcapi.ReconcileCephSecrets), and scans
+// the pools' trash for leftovers no purge here tracks — at start, and every
+// grpcapi.CephTrashScanInterval after (grpcapi.ScanCephTrash). Here, not in
+// Run's synchronous first reconcile: a cluster that does not answer must not
+// hold the daemon's start.
 func (d *Daemon) runCephSecretReconcile(ctx context.Context) {
 	ticker := time.NewTicker(cephSecretReconcileInterval)
 	defer ticker.Stop()
+	var lastScan time.Time
+	scan := func() {
+		if d.svc != nil && time.Since(lastScan) >= grpcapi.CephTrashScanInterval {
+			lastScan = time.Now()
+			d.svc.ScanCephTrash(ctx)
+		}
+	}
+	scan()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			if d.svc != nil {
+				scan()
 				d.svc.ReconcileCephSecrets(ctx)
 			}
 		}

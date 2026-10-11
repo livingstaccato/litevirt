@@ -16,6 +16,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/storage"
 )
@@ -217,19 +218,40 @@ var errStorageNotFound = errors.New("no such storage here")
 // run concurrently under ONE storage.ProbeBound, and whether there is time for
 // them is judged once for the VM: a caller with less than that left (the
 // reconciler late in its walk) is answered transient — a deferral — before
-// any rbd runs.
+// any rbd runs. Except for a reconcile walk's FIRST probe (its probe turn,
+// health.TakeWalkProbeTurn), which runs on whatever is left, down to
+// cephProbeFloor: every pass makes progress on proving a key, however late
+// its walk starts.
+//
+// In a reconcile walk, a probe that got no answer is remembered for about a
+// pass (cephKeyFailTTL): the VMs on that storage are then deferred at once,
+// without a probe each, and behind the VMs deferred for time (the kind:
+// health.ErrStartStorageDown, or ErrStartProbeFailed for the VM whose own
+// probe failed). A probe cut short by the walk's own deadline proves nothing
+// about the storage and is a deferral for time.
 func (s *Server) ensureCephSecretsForVM(ctx context.Context, vm *corrosion.VMRecord, source string) error {
 	probes, err := s.cephStartPlan(ctx, vm, source)
 	if err != nil || len(probes) == 0 {
 		return err
 	}
-	if dl, ok := ctx.Deadline(); ok {
-		if left := time.Until(dl); left < storage.ProbeBound {
-			return transientCeph(fmt.Errorf("proving this host's ceph key for VM %s's disks on %s is deferred: it takes up to %v and the caller has %v left",
-				vm.Name, s.hostName, storage.ProbeBound, left.Round(time.Millisecond)))
+	if health.InReconcilerWalk(ctx) {
+		if failed, own := s.cephProofs.failedFor(vm.Name, probes); failed {
+			return storageDownCeph(own, fmt.Errorf("Ceph did not answer a probe of VM %s's pool on %s in the last %v; the start is retried",
+				vm.Name, s.hostName, cephKeyFailTTL))
 		}
 	}
-	pctx, cancel := context.WithTimeout(ctx, storage.ProbeBound)
+	bound, cut := storage.ProbeBound, false
+	if dl, ok := ctx.Deadline(); ok {
+		if left := time.Until(dl); left < storage.ProbeBound {
+			if left < cephProbeFloor || !health.TakeWalkProbeTurn(ctx) {
+				return transientCeph(fmt.Errorf("proving this host's ceph key for VM %s's disks on %s is deferred: it takes up to %v and the caller has %v left",
+					vm.Name, s.hostName, storage.ProbeBound, left.Round(time.Millisecond)))
+			}
+			bound, cut = left, true
+		}
+	}
+	health.TakeWalkProbeTurn(ctx) // any probe is the walk's progress
+	pctx, cancel := context.WithTimeout(ctx, bound)
 	defer cancel()
 	errs := make([]error, len(probes))
 	var wg sync.WaitGroup
@@ -253,9 +275,21 @@ func (s *Server) ensureCephSecretsForVM(ctx context.Context, vm *corrosion.VMRec
 		}
 	}
 	for i, err := range errs {
-		if err != nil {
-			return transientCeph(fmt.Errorf("disk %s on %s: %w", probes[i].disk, s.hostName, err))
+		if err == nil {
+			continue
 		}
+		err = fmt.Errorf("disk %s on %s: %w", probes[i].disk, s.hostName, err)
+		if cut && pctx.Err() != nil {
+			// Cut short by the walk's own deadline: no answer about the
+			// storage either way.
+			return transientCeph(err)
+		}
+		for j, perr := range errs {
+			if perr != nil && probes[j].key != "" {
+				s.cephProofs.fail(probes[j].key, vm.Name)
+			}
+		}
+		return storageDownCeph(true, err)
 	}
 	return nil
 }
@@ -614,6 +648,9 @@ func laterOf(a, b time.Time) time.Time {
 type cephClassed struct {
 	code codes.Code
 	err  error
+	// kind: why a transient one defers a start, for the reconciler's next
+	// walk (startDeferredError); nil for want of time.
+	kind error
 }
 
 func (e *cephClassed) Error() string { return e.err.Error() }
@@ -621,6 +658,26 @@ func (e *cephClassed) Unwrap() error { return e.err }
 
 func permanentCeph(err error) error { return &cephClassed{code: codes.FailedPrecondition, err: err} }
 func transientCeph(err error) error { return &cephClassed{code: codes.Unavailable, err: err} }
+
+// storageDownCeph is a transient failure because Ceph did not answer a probe:
+// this VM's own (own), or one of the same storage another VM's start made.
+func storageDownCeph(own bool, err error) error {
+	kind := health.ErrStartStorageDown
+	if own {
+		kind = health.ErrStartProbeFailed
+	}
+	return &cephClassed{code: codes.Unavailable, err: err, kind: kind}
+}
+
+// cephDeferKind is the deferral kind a ceph start failure carries (nil: for
+// want of time, or unclassed).
+func cephDeferKind(err error) error {
+	var c *cephClassed
+	if errors.As(err, &c) {
+		return c.kind
+	}
+	return nil
+}
 
 // classedCeph wraps err with the class its cause already carries.
 func classedCeph(cause, err error) error {

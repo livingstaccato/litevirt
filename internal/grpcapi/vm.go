@@ -1732,7 +1732,7 @@ func (s *Server) PrepareHardwareForStart(ctx context.Context, vm *corrosion.VMRe
 		// instead of parking a proof-less start in error.
 		serr := status.Errorf(cephErrCode(err), "start %q: %v", vm.Name, err)
 		if cephErrCode(err) == codes.Unavailable {
-			serr = deferStart(serr)
+			serr = deferStart(serr, cephDeferKind(err))
 		}
 		return releasePreflight, serr
 	}

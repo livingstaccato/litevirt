@@ -46,6 +46,13 @@ type cephWorld struct {
 	trash       map[string]string
 	trashRmExit int
 	ids         map[string]string
+	// down: rbd pools whose cluster does not answer — a probe of one of
+	// their images waits out its context, then fails as rbd does (110).
+	down map[string]bool
+	// watchers: images a live client has open (`rbd status` lists it).
+	watchers map[string]bool
+	// probeLeft: the time each probe's context had left when it ran.
+	probeLeft []time.Duration
 }
 
 // cephExit is a failed rbd command as exec reports it (rbd exits with the errno).
@@ -82,12 +89,37 @@ func (w *cephWorld) count(prefix string) int {
 	return n
 }
 
-func (w *cephWorld) run(_ context.Context, name string, args ...string) ([]byte, error) {
+func (w *cephWorld) run(ctx context.Context, name string, args ...string) ([]byte, error) {
+	if slices.Contains(args, "info") && slices.Contains(args, "--client_mount_timeout") {
+		w.mu.Lock()
+		if dl, ok := ctx.Deadline(); ok {
+			w.probeLeft = append(w.probeLeft, time.Until(dl))
+		}
+		down := false
+		for _, a := range args {
+			if p, _, ok := strings.Cut(a, "/"); ok && w.down[p] {
+				down = true
+			}
+		}
+		w.mu.Unlock()
+		if down {
+			<-ctx.Done()
+			w.mu.Lock()
+			w.calls = append(w.calls, "info (no answer)")
+			w.mu.Unlock()
+			return []byte("rbd: couldn't connect to the cluster!"), cephExit(110)
+		}
+	}
 	if w.infoDelay > 0 && slices.Contains(args, "info") && slices.Contains(args, "--client_mount_timeout") {
 		time.Sleep(w.infoDelay)
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if name == "rados" {
+		// listwatchers of a trashed image's header: nobody has it open.
+		w.calls = append(w.calls, "rados "+strings.Join(args, " "))
+		return nil, nil
+	}
 	if name == "qemu-img" {
 		w.calls = append(w.calls, "qemu-img convert")
 		return nil, os.WriteFile(args[len(args)-1], []byte("raw"), 0o600)
@@ -146,6 +178,9 @@ func (w *cephWorld) run(_ context.Context, name string, args ...string) ([]byte,
 		if _, ok := w.images[pos[0]]; !ok {
 			return missing, cephExit(2)
 		}
+		if w.watchers[pos[0]] {
+			return []byte(`{"watchers":[{"address":"10.78.0.11:0/719770507","client":14688,"cookie":133234583145840}]}`), nil
+		}
 		return []byte(`{"watchers":[]}`), nil
 	case "trash mv":
 		if _, ok := w.images[pos[0]]; !ok {
@@ -156,6 +191,10 @@ func (w *cephWorld) run(_ context.Context, name string, args ...string) ([]byte,
 		delete(w.images, pos[0])
 		delete(w.ids, pos[0])
 	case "trash rm":
+		if w.trashRmExit == 16 {
+			// Lab 2, verbatim: a client still has the trashed image open.
+			return []byte("rbd: error: image still has watchers\nimage has watchers - not removing"), cephExit(16)
+		}
 		if w.trashRmExit != 0 {
 			return []byte("rbd: error: (110) Connection timed out"), cephExit(w.trashRmExit)
 		}
@@ -164,7 +203,20 @@ func (w *cephWorld) run(_ context.Context, name string, args ...string) ([]byte,
 		}
 		delete(w.trash, pos[0])
 	case "trash ls":
-		return []byte("[]"), nil
+		// 19.2.3: `source` only with --long.
+		long := slices.Contains(words, "--long")
+		var entries []string
+		for k, name := range w.trash {
+			if p, id, _ := strings.Cut(k, "/"); p == pos[0] {
+				if long {
+					entries = append(entries, fmt.Sprintf(`{"id":"%s","name":"%s","source":"USER","deleted_at":"Fri Oct 10 22:56:08 2026","status":"expired at Fri Oct 10 22:56:08 2026"}`, id, name))
+				} else {
+					entries = append(entries, fmt.Sprintf(`{"id":"%s","name":"%s"}`, id, name))
+				}
+			}
+		}
+		slices.Sort(entries)
+		return []byte("[" + strings.Join(entries, ",") + "]"), nil
 	case "snap create", "snap protect":
 		ref, snap, _ := strings.Cut(pos[0], "@")
 		w.images[ref][snap] = sub == "snap protect"

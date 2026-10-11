@@ -263,5 +263,6 @@ func TestReconciler_DeferredOnbootRetryGoesFirst(t *testing.T) {
 func (r *Reconciler) startDeferredHas(name string) bool {
 	r.startDeferred.mu.Lock()
 	defer r.startDeferred.mu.Unlock()
-	return r.startDeferred.m[name]
+	_, ok := r.startDeferred.m[name]
+	return ok
 }

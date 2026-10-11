@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -515,10 +516,17 @@ func (s *Server) deleteRecordedVMDiskVolumes(ctx context.Context, vmName string)
 // records the cleanup as DONE must not do so while a volume is still there — the
 // record is what stops a restart from retrying. Skipping a path another VM still
 // references is a success, not a failure.
+//
+// The rbd disks are deleted together: each may wait for the clients still
+// watching it to go (a dead client's watch lasts about 30 s, and a live one
+// is waited for up to 45 s before the delete is refused as in use), and
+// those waits run at once within one bound, not one after another — which
+// for three or more disks outlasted the owner proxy's 2 minutes.
 func (s *Server) deleteRecordedVMDiskVolumeRecords(
 	ctx context.Context, vmName string, disks []corrosion.DiskRecord,
 ) error {
-	var firstErr error
+	errs := make([]error, len(disks))
+	var wg sync.WaitGroup
 	for i := range disks {
 		d := &disks[i]
 		if d.Path == "" {
@@ -534,16 +542,31 @@ func (s *Server) deleteRecordedVMDiskVolumeRecords(
 		if s.diskPathReferencedByOtherVM(ctx, vmName, d) {
 			continue
 		}
-		if err := s.deleteDiskAtRecordedLocation(ctx, d); err != nil {
-			slog.Warn("delete: free disk volume",
-				"vm", vmName, "disk", d.DiskName, "path", d.Path,
-				"storage_type", d.StorageType, "pool", poolLabel(d.StorageVolume), "error", err)
-			if firstErr == nil {
-				firstErr = err
+		del := func() {
+			if err := s.deleteDiskAtRecordedLocation(ctx, d); err != nil {
+				slog.Warn("delete: free disk volume",
+					"vm", vmName, "disk", d.DiskName, "path", d.Path,
+					"storage_type", d.StorageType, "pool", poolLabel(d.StorageVolume), "error", err)
+				errs[i] = err
 			}
 		}
+		if strings.HasPrefix(d.Path, "rbd:") {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				del()
+			}()
+			continue
+		}
+		del()
 	}
-	return firstErr
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // deleteDiskAtRecordedLocation resolves the storage driver for a disk's pool

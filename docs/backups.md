@@ -786,14 +786,25 @@ container, on any host, refuses the restore. So does a container of that name
 in a host's runtime with no live row of it: an orphaned runtime
 (`ct_orphan_runtime`, see [diagnostics.md](diagnostics.md)), left by a stale
 delete or an interrupted create or migrate, which may hold newer data than the
-replica. Deal with that copy first; do not discard it unread. A host that cannot
-be asked, or whose runtime cannot be read in full, cannot vouch: the refusal
-names the host, and the remedy is to bring it back or remove it from the
-cluster (`lv host rm`). That is the cost of the check: while any one member is
-unreachable, no replica restore goes through. A host this cluster has no record
-of cannot be removed either, so a replica taken on one cannot be restored until
-it rejoins. A replica no schedule settles any more (the schedule was deleted,
-re-targeted or reversed away) is listed as orphaned and may be removed too:
+replica. Deal with that copy first; do not discard it unread. Runtime names are
+per host, not per project, so a container of that name under another project's
+live row on the same host is that project's, unless the container's own owner
+record says it is this project's (then it is an orphan of ours under a stale
+row, and refuses), or the record cannot be read (then the host cannot vouch). A
+host whose lxc tooling is gone but which still holds the container's directory
+on disk holds a copy too, and refuses, and so does a host with tooling holding
+a directory of that name that `lxc-ls` does not list (no config). Each host
+answers for its containers only: it lists them and reads the one asked about,
+so a slow libvirt, an unreadable VM marker or another container's broken probe
+neither delays its answer nor stops it from proving absence. A host that cannot
+be asked, or whose container listing or reading of that container fails, cannot
+vouch: the refusal names the host, and the remedy is to bring it back or remove
+it from the cluster (`lv host rm`). That is the cost of the check: while any
+one member is unreachable, no replica restore goes through. A host this cluster
+has no record of cannot be removed either, so a replica taken on one cannot be
+restored until it rejoins. A replica no schedule settles any more (the schedule
+was deleted, re-targeted or reversed away) is listed as orphaned and may be
+removed too:
 
 ```bash
 lv replication replicas web --host hostB --target-pool dr

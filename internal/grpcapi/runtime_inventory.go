@@ -16,6 +16,8 @@ import (
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/lb"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
+	"github.com/litevirt/litevirt/internal/lxc"
+	"github.com/litevirt/litevirt/internal/tenancy"
 )
 
 // The unified runtime inventory — the ONE local-truth collector every consumer
@@ -52,7 +54,20 @@ type runtimeWorkload struct {
 	MarkerStatus     string
 	Uncapped         bool
 	ProbeError       string
+	// OwnerProject and OwnerStatus are a container's on-disk owner record
+	// (lxc.OwnerStamper), read only by collectContainerRuntime: OwnerStatus is
+	// "" (not read), OwnerMissing, OwnerValid or OwnerUnreadable.
+	OwnerProject string
+	OwnerStatus  string
+	OwnerError   string // why OwnerStatus is OwnerUnreadable
 }
+
+// Owner record statuses for runtimeWorkload.OwnerStatus.
+const (
+	OwnerMissing    = "missing"
+	OwnerValid      = "valid"
+	OwnerUnreadable = "unreadable"
+)
 
 // runtimeInventory is one host's full local runtime view.
 type runtimeInventory struct {
@@ -72,8 +87,13 @@ type runtimeInventory struct {
 	// a real answer rather than a fabricated zero.
 	OwnershipTies int
 	Complete      bool
-	Errors        []string
-	SampledAt     string
+	// ContainersComplete is set by collectContainerRuntime only: the host's
+	// container listing succeeded (or it has no lxc tooling and no directory of
+	// the name asked), so a container absent from Workloads is proven absent
+	// whatever the rest of the host would have said.
+	ContainersComplete bool
+	Errors             []string
+	SampledAt          string
 }
 
 // ownershipTieCategories are the tie CATEGORIES that can hide an ownership
@@ -340,6 +360,127 @@ func (s *Server) collectRuntimeInventory(ctx context.Context) runtimeInventory {
 	return inv
 }
 
+// collectContainerRuntime is the inventory of the one container name, for a
+// replica restore's "no live copy" ask (confirmNoLiveCopy): the container
+// listing and that container's state, owner-epoch marker and owner record.
+// It reads nothing else — no libvirt, no VIPs, no tie count, no other
+// container's limits or marker — so a slow libvirt or a broken probe elsewhere
+// on the host neither delays nor blinds it. Complete is false (the rest of the
+// host was not looked at); ContainersComplete says whether name's absence is
+// proven.
+//
+// A host whose lxc tooling probe fails can still hold the container's
+// directory on disk (tooling removed under it), and so can a host with
+// tooling whose lxc-ls does not list the name (the directory holds no
+// config). Either directory is reported as the container, defined_stopped,
+// with a probe error saying why: it is a copy of the data, which the full
+// inventory does not show. A directory that cannot be stat'd is no answer.
+func (s *Server) collectContainerRuntime(ctx context.Context, name string) runtimeInventory {
+	inv := runtimeInventory{
+		Host:      s.hostName,
+		SampledAt: time.Now().UTC().Format(time.RFC3339),
+	}
+	fail := func(f string, args ...interface{}) {
+		inv.Errors = append(inv.Errors, fmt.Sprintf(f, args...))
+	}
+	if s.containerRuntime == nil {
+		inv.ContainersComplete = true
+		return inv
+	}
+	if !s.runsContainers() {
+		exists, err := s.containerRuntime.ContainerExists(ctx, name)
+		switch {
+		case err != nil:
+			fail("container %s directory: %v", name, err)
+			return inv
+		case exists:
+			inv.Workloads = append(inv.Workloads, s.containerOwnedBy(runtimeWorkload{
+				Kind: corrosion.WorkloadContainer, Name: name, State: health.RuntimeDefinedStopped,
+				ProbeError: probeNoLXCTooling,
+			}))
+		}
+		inv.ContainersComplete = true
+		return inv
+	}
+	names, err := s.containerRuntime.ListContainers(ctx)
+	if err != nil {
+		fail("list containers: %v", err)
+		return inv
+	}
+	listed := false
+	for _, n := range names {
+		if n == name {
+			listed = true
+			break
+		}
+	}
+	if !listed {
+		// lxc-ls lists only a directory that holds a config. One without (an
+		// import that died after the rootfs, a config removed by hand) is
+		// still the container's data on this host.
+		exists, err := s.containerRuntime.ContainerExists(ctx, name)
+		switch {
+		case err != nil:
+			fail("container %s directory: %v", name, err)
+			return inv
+		case exists:
+			inv.Workloads = append(inv.Workloads, s.containerOwnedBy(runtimeWorkload{
+				Kind: corrosion.WorkloadContainer, Name: name, State: health.RuntimeDefinedStopped,
+				ProbeError: probeUnlistedDirectory,
+			}))
+		}
+		inv.ContainersComplete = true
+		return inv
+	}
+	inv.ContainersComplete = true
+	// The owner-epoch marker is not read: a found entry is decided by its
+	// state and owner record alone (runtimeCopyOn).
+	w := runtimeWorkload{Kind: corrosion.WorkloadContainer, Name: name}
+	st, err := s.containerRuntime.StateContainer(ctx, name)
+	switch {
+	case err != nil:
+		w.State = health.RuntimeUnknown
+		w.ProbeError = fmt.Sprintf("container state: %v", err)
+		fail("container %s state: %v", name, err)
+	case st == "running":
+		w.State = health.RuntimeRunning
+	case st == "stopped":
+		w.State = health.RuntimeDefinedStopped
+	default:
+		w.State = health.RuntimeUnknown
+	}
+	inv.Workloads = append(inv.Workloads, s.containerOwnedBy(w))
+	return inv
+}
+
+// probeNoLXCTooling is the probe error of a container directory found on a host
+// with no lxc tooling (collectContainerRuntime).
+const probeNoLXCTooling = "its container directory is on disk, and this host has no lxc tooling to run it"
+
+// probeUnlistedDirectory is the probe error of a container directory on disk
+// that lxc-ls does not list (it holds no config) on a host with tooling.
+const probeUnlistedDirectory = "its container directory is on disk, and lxc-ls does not list it (no config)"
+
+// containerOwnedBy fills w's owner record from the runtime's, when it keeps
+// one (lxc.OwnerStamper); a runtime that keeps none reports it missing.
+func (s *Server) containerOwnedBy(w runtimeWorkload) runtimeWorkload {
+	w.OwnerStatus = OwnerMissing
+	st, ok := s.containerRuntime.(lxc.OwnerStamper)
+	if !ok {
+		return w
+	}
+	o, err := st.ReadOwner(w.Name)
+	switch {
+	case err != nil:
+		w.OwnerStatus = OwnerUnreadable
+		w.OwnerError = fmt.Sprintf("owner record: %v", err)
+	case o != nil:
+		w.OwnerStatus = OwnerValid
+		w.OwnerProject = tenancy.NormalizeProject(o.Project)
+	}
+	return w
+}
+
 // readVMMarker reads the host-local VM owner-epoch marker and classifies the
 // outcome. Corrupt or unreadable is NEVER reported as epoch 0 — garbage read as
 // the zero generation would authorize exactly the stale actions the marker
@@ -390,6 +531,12 @@ func (s *Server) GetRuntimeInventory(ctx context.Context, req *pb.GetRuntimeInve
 	if (req.GetKind() == "") != (req.GetName() == "") {
 		return nil, status.Error(codes.InvalidArgument, "a workload filter needs both kind and name")
 	}
+	if req.GetContainersOnly() {
+		if req.GetKind() != corrosion.WorkloadContainer {
+			return nil, status.Error(codes.InvalidArgument, "containers_only needs the kind container and a name")
+		}
+		return inventoryToProto(s.collectContainerRuntime(ctx, req.GetName())), nil
+	}
 	inv := s.collectRuntimeInventory(ctx)
 	if req.GetKind() != "" {
 		filtered := inv
@@ -409,6 +556,7 @@ func inventoryToProto(inv runtimeInventory) *pb.RuntimeInventory {
 		UnresolvedTieCount: int32(inv.UnresolvedTies),
 		OwnershipTieCount:  int32(inv.OwnershipTies),
 		Complete:           inv.Complete,
+		ContainersComplete: inv.ContainersComplete,
 		Errors:             inv.Errors,
 		SampledAt:          inv.SampledAt,
 	}
@@ -418,6 +566,7 @@ func inventoryToProto(inv runtimeInventory) *pb.RuntimeInventory {
 			DiskHolder: w.DiskHolder, Cpu: int32(w.CPU), MemoryMib: int32(w.MemoryMiB),
 			OwnerEpochMarker: w.OwnerEpochMarker, MarkerStatus: w.MarkerStatus,
 			Uncapped: w.Uncapped, ProbeError: w.ProbeError,
+			OwnerProject: w.OwnerProject, OwnerStatus: w.OwnerStatus, OwnerError: w.OwnerError,
 		})
 	}
 	return out
@@ -425,13 +574,14 @@ func inventoryToProto(inv runtimeInventory) *pb.RuntimeInventory {
 
 func inventoryFromProto(p *pb.RuntimeInventory) runtimeInventory {
 	inv := runtimeInventory{
-		Host:           p.GetHost(),
-		KernelVIPs:     p.GetKernelAssignedVips(),
-		UnresolvedTies: int(p.GetUnresolvedTieCount()),
-		OwnershipTies:  int(p.GetOwnershipTieCount()),
-		Complete:       p.GetComplete(),
-		Errors:         p.GetErrors(),
-		SampledAt:      p.GetSampledAt(),
+		Host:               p.GetHost(),
+		KernelVIPs:         p.GetKernelAssignedVips(),
+		UnresolvedTies:     int(p.GetUnresolvedTieCount()),
+		OwnershipTies:      int(p.GetOwnershipTieCount()),
+		Complete:           p.GetComplete(),
+		ContainersComplete: p.GetContainersComplete(),
+		Errors:             p.GetErrors(),
+		SampledAt:          p.GetSampledAt(),
 	}
 	for _, w := range p.GetWorkloads() {
 		inv.Workloads = append(inv.Workloads, runtimeWorkload{
@@ -439,6 +589,7 @@ func inventoryFromProto(p *pb.RuntimeInventory) runtimeInventory {
 			DiskHolder: w.GetDiskHolder(), CPU: int(w.GetCpu()), MemoryMiB: int(w.GetMemoryMib()),
 			OwnerEpochMarker: w.GetOwnerEpochMarker(), MarkerStatus: w.GetMarkerStatus(),
 			Uncapped: w.GetUncapped(), ProbeError: w.GetProbeError(),
+			OwnerProject: w.GetOwnerProject(), OwnerStatus: w.GetOwnerStatus(), OwnerError: w.GetOwnerError(),
 		})
 	}
 	return inv

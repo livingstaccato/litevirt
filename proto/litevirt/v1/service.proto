@@ -370,6 +370,19 @@ message GetRuntimeInventoryRequest {
     // Both empty = full inventory.
     string kind = 1;
     string name = 2;
+    // containers_only, with kind "container" and a name, asks about that one
+    // container alone: the host lists its containers and probes only that one,
+    // and touches neither libvirt nor the VIPs nor any other container. The
+    // answer's containers_complete then says whether its absence is proven, and
+    // complete is false (the rest of the host was not looked at). On a host
+    // whose lxc tooling probe fails, a container directory left on disk under
+    // that name is reported, as a container in state defined_stopped with a
+    // probe_error saying it cannot run there; so is such a directory on a host
+    // with tooling whose lxc-ls does not list it (it holds no config). A
+    // directory that cannot be stat'd leaves containers_complete false. A
+    // previous build ignores the
+    // field and answers with its full inventory filtered to the name.
+    bool containers_only = 3;
 }
 // One workload as the local runtime actually sees it.
 message RuntimeWorkload {
@@ -396,6 +409,14 @@ message RuntimeWorkload {
     // Per-item probe failure (state read failed, config unreadable). The item is
     // still listed — presence is real — but its details are unreliable.
     string probe_error = 10;
+    // A container's on-disk owner record (the project it was stamped for), read
+    // only for a containers_only ask. owner_status: "" not read (a previous
+    // build, or not asked) | missing (no record: an earlier build made it) |
+    // valid | unreadable. owner_project is set only when valid.
+    string owner_project = 11;
+    string owner_status  = 12;
+    // owner_error is why owner_status is unreadable (the record's read error).
+    string owner_error   = 13;
 }
 message RuntimeInventory {
     string host = 1;
@@ -418,6 +439,12 @@ message RuntimeInventory {
     // which meant a peer with several ownership ties decoded as a clean one —
     // the fail-OPEN answer for a latch that never re-opens.
     int32 ownership_tie_count = 8;
+    // containers_complete is true when the host's container listing succeeded
+    // (or it runs no containers and holds no directory of the name asked), so a
+    // container name absent from workloads is proven absent whatever the VM,
+    // marker or VIP probes said. False from a previous build: complete is then
+    // all there is.
+    bool containers_complete = 9;
 }
 
 // OrphanProofRequest asks ONE host whether anything on it still claims an

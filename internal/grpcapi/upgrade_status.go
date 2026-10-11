@@ -63,6 +63,33 @@ func (s *Server) ReleaseFeatureAvailable(feature capabilities.Feature) bool {
 	return s.releaseFeatures != nil && s.releaseFeatures.FeatureAvailable(feature)
 }
 
+// releaseTokenLatcher is the token side of a release gate. *health.Checker,
+// the production gate, implements it (asserted at compile time in
+// release_token_latcher_test.go); a production gate that wraps the checker
+// must forward it, or ReleaseTokenLatched falls back to a feature's
+// availability, the coupling it exists to remove.
+type releaseTokenLatcher interface {
+	DurablyLatched(token string) bool
+}
+
+// ReleaseTokenLatched reports, without asking any peer, whether the release
+// token itself (capabilities.ReleaseToken) has durably latched here: every
+// host this one replicates to runs this release's build or later. It is the
+// readiness of a statement SHAPE this release introduced (the replication
+// switch's compare-and-set, the placement mint), which a VM's switch emits as
+// well as a container's; reading it through one feature's availability would
+// tie VM behaviour to whichever token that feature belongs to. Like
+// ReleaseFeatureAvailable it grants nothing and records no use. A gate that
+// cannot name a token's latch (a test's) answers through a feature of the
+// release token. False with no gate wired.
+func (s *Server) ReleaseTokenLatched() bool {
+	if g, ok := s.releaseFeatures.(releaseTokenLatcher); ok {
+		return g.DurablyLatched(capabilities.ReleaseToken)
+	}
+	// Only a test's fake gate gets here; see releaseTokenLatcher.
+	return s.ReleaseFeatureAvailable(capabilities.FeatureContainerReplication)
+}
+
 // SetReleaseFeatureGate injects the release-feature gate.
 func (s *Server) SetReleaseFeatureGate(g releaseFeatureGate) { s.releaseFeatures = g }
 

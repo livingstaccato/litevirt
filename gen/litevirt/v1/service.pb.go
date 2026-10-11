@@ -4021,10 +4021,23 @@ type GetRuntimeInventoryRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Optional workload filter: kind "vm" | "container" plus the workload name.
 	// Both empty = full inventory.
-	Kind          string `protobuf:"bytes,1,opt,name=kind,proto3" json:"kind,omitempty"`
-	Name          string `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Kind string `protobuf:"bytes,1,opt,name=kind,proto3" json:"kind,omitempty"`
+	Name string `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
+	// containers_only, with kind "container" and a name, asks about that one
+	// container alone: the host lists its containers and probes only that one,
+	// and touches neither libvirt nor the VIPs nor any other container. The
+	// answer's containers_complete then says whether its absence is proven, and
+	// complete is false (the rest of the host was not looked at). On a host
+	// whose lxc tooling probe fails, a container directory left on disk under
+	// that name is reported, as a container in state defined_stopped with a
+	// probe_error saying it cannot run there; so is such a directory on a host
+	// with tooling whose lxc-ls does not list it (it holds no config). A
+	// directory that cannot be stat'd leaves containers_complete false. A
+	// previous build ignores the
+	// field and answers with its full inventory filtered to the name.
+	ContainersOnly bool `protobuf:"varint,3,opt,name=containers_only,json=containersOnly,proto3" json:"containers_only,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *GetRuntimeInventoryRequest) Reset() {
@@ -4071,6 +4084,13 @@ func (x *GetRuntimeInventoryRequest) GetName() string {
 	return ""
 }
 
+func (x *GetRuntimeInventoryRequest) GetContainersOnly() bool {
+	if x != nil {
+		return x.ContainersOnly
+	}
+	return false
+}
+
 // One workload as the local runtime actually sees it.
 type RuntimeWorkload struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -4096,7 +4116,15 @@ type RuntimeWorkload struct {
 	Uncapped bool `protobuf:"varint,9,opt,name=uncapped,proto3" json:"uncapped,omitempty"`
 	// Per-item probe failure (state read failed, config unreadable). The item is
 	// still listed — presence is real — but its details are unreliable.
-	ProbeError    string `protobuf:"bytes,10,opt,name=probe_error,json=probeError,proto3" json:"probe_error,omitempty"`
+	ProbeError string `protobuf:"bytes,10,opt,name=probe_error,json=probeError,proto3" json:"probe_error,omitempty"`
+	// A container's on-disk owner record (the project it was stamped for), read
+	// only for a containers_only ask. owner_status: "" not read (a previous
+	// build, or not asked) | missing (no record: an earlier build made it) |
+	// valid | unreadable. owner_project is set only when valid.
+	OwnerProject string `protobuf:"bytes,11,opt,name=owner_project,json=ownerProject,proto3" json:"owner_project,omitempty"`
+	OwnerStatus  string `protobuf:"bytes,12,opt,name=owner_status,json=ownerStatus,proto3" json:"owner_status,omitempty"`
+	// owner_error is why owner_status is unreadable (the record's read error).
+	OwnerError    string `protobuf:"bytes,13,opt,name=owner_error,json=ownerError,proto3" json:"owner_error,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -4201,6 +4229,27 @@ func (x *RuntimeWorkload) GetProbeError() string {
 	return ""
 }
 
+func (x *RuntimeWorkload) GetOwnerProject() string {
+	if x != nil {
+		return x.OwnerProject
+	}
+	return ""
+}
+
+func (x *RuntimeWorkload) GetOwnerStatus() string {
+	if x != nil {
+		return x.OwnerStatus
+	}
+	return ""
+}
+
+func (x *RuntimeWorkload) GetOwnerError() string {
+	if x != nil {
+		return x.OwnerError
+	}
+	return ""
+}
+
 type RuntimeInventory struct {
 	state     protoimpl.MessageState `protogen:"open.v1"`
 	Host      string                 `protobuf:"bytes,1,opt,name=host,proto3" json:"host,omitempty"`
@@ -4223,8 +4272,14 @@ type RuntimeInventory struct {
 	// which meant a peer with several ownership ties decoded as a clean one —
 	// the fail-OPEN answer for a latch that never re-opens.
 	OwnershipTieCount int32 `protobuf:"varint,8,opt,name=ownership_tie_count,json=ownershipTieCount,proto3" json:"ownership_tie_count,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// containers_complete is true when the host's container listing succeeded
+	// (or it runs no containers and holds no directory of the name asked), so a
+	// container name absent from workloads is proven absent whatever the VM,
+	// marker or VIP probes said. False from a previous build: complete is then
+	// all there is.
+	ContainersComplete bool `protobuf:"varint,9,opt,name=containers_complete,json=containersComplete,proto3" json:"containers_complete,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *RuntimeInventory) Reset() {
@@ -4311,6 +4366,13 @@ func (x *RuntimeInventory) GetOwnershipTieCount() int32 {
 		return x.OwnershipTieCount
 	}
 	return 0
+}
+
+func (x *RuntimeInventory) GetContainersComplete() bool {
+	if x != nil {
+		return x.ContainersComplete
+	}
+	return false
 }
 
 // OrphanProofRequest asks ONE host whether anything on it still claims an
@@ -39567,10 +39629,11 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x15CheckLBPresentRequest\x12\x17\n" +
 	"\alb_name\x18\x01 \x01(\tR\x06lbName\"2\n" +
 	"\x16CheckLBPresentResponse\x12\x18\n" +
-	"\apresent\x18\x01 \x01(\bR\apresent\"D\n" +
+	"\apresent\x18\x01 \x01(\bR\apresent\"m\n" +
 	"\x1aGetRuntimeInventoryRequest\x12\x12\n" +
 	"\x04kind\x18\x01 \x01(\tR\x04kind\x12\x12\n" +
-	"\x04name\x18\x02 \x01(\tR\x04name\"\xb1\x02\n" +
+	"\x04name\x18\x02 \x01(\tR\x04name\x12'\n" +
+	"\x0fcontainers_only\x18\x03 \x01(\bR\x0econtainersOnly\"\x9a\x03\n" +
 	"\x0fRuntimeWorkload\x12\x12\n" +
 	"\x04kind\x18\x01 \x01(\tR\x04kind\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x14\n" +
@@ -39585,7 +39648,11 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\buncapped\x18\t \x01(\bR\buncapped\x12\x1f\n" +
 	"\vprobe_error\x18\n" +
 	" \x01(\tR\n" +
-	"probeError\"\xc9\x02\n" +
+	"probeError\x12#\n" +
+	"\rowner_project\x18\v \x01(\tR\fownerProject\x12!\n" +
+	"\fowner_status\x18\f \x01(\tR\vownerStatus\x12\x1f\n" +
+	"\vowner_error\x18\r \x01(\tR\n" +
+	"ownerError\"\xfa\x02\n" +
 	"\x10RuntimeInventory\x12\x12\n" +
 	"\x04host\x18\x01 \x01(\tR\x04host\x12:\n" +
 	"\tworkloads\x18\x02 \x03(\v2\x1c.litevirt.v1.RuntimeWorkloadR\tworkloads\x120\n" +
@@ -39595,7 +39662,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x06errors\x18\x06 \x03(\tR\x06errors\x12\x1d\n" +
 	"\n" +
 	"sampled_at\x18\a \x01(\tR\tsampledAt\x12.\n" +
-	"\x13ownership_tie_count\x18\b \x01(\x05R\x11ownershipTieCount\"Y\n" +
+	"\x13ownership_tie_count\x18\b \x01(\x05R\x11ownershipTieCount\x12/\n" +
+	"\x13containers_complete\x18\t \x01(\bR\x12containersComplete\"Y\n" +
 	"\x12OrphanProofRequest\x12\x17\n" +
 	"\avm_uuid\x18\x01 \x01(\tR\x06vmUuid\x12\x10\n" +
 	"\x03mac\x18\x02 \x01(\tR\x03mac\x12\x18\n" +

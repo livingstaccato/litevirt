@@ -27,6 +27,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/lxc"
 	"github.com/litevirt/litevirt/internal/qcow2"
 )
 
@@ -811,6 +812,80 @@ func TestReplicationIndependent_ARestoreAsksEveryHostsRuntime(t *testing.T) {
 	}
 	if _, err := c.SelfClient(tg).RestoreContainerReplica(ctx, restore); err != nil {
 		t.Fatalf("the restore once %s no longer runs it: %v", a.Name, err)
+	}
+	if got := tg.CT.Payload(name); got != "replicated" {
+		t.Fatalf("the restored container holds %q, want the replica's data", got)
+	}
+}
+
+// The follow-ups to the restore's runtime ask (t2-dr-rereview-5.md P1 and P3),
+// over real gRPC between real daemons:
+//
+//   - P3: another project's live row of the name on a host does not vouch for
+//     that host's runtime when the runtime's own owner record says it is this
+//     project's container (a ghost row over our orphan);
+//   - P1: a member whose libvirt cannot be listed still proves the container
+//     absent, from its container listing alone.
+func TestReplicationIndependent_ARestoreReadsTheRuntimesOwnerRecord(t *testing.T) {
+	c := New(t, Options{Nodes: 3, IndependentReplicas: true})
+	a, b, tg := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	ctx := context.Background()
+	probeCTRuntimes(c)
+	c.WaitConverged(t, convergeTimeout)
+	const name = "web"
+	replCT(t, c, a, name)
+	repo := drRepo(t, tg)
+	c.WaitConverged(t, convergeTimeout)
+	sched := ctSchedule(t, c, a, name, tg.Name, 2, true)
+	c.WaitConverged(t, convergeTimeout)
+	a.CT.Seed(name, "replicated")
+	if err := a.Server.RunReplication(ctx, sched, time.Now().UTC().Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	ms := replicas(t, repo, name)
+	if len(ms) != 1 {
+		t.Fatalf("premise: one replica, got %d", len(ms))
+	}
+	if o, err := a.CT.ReadOwner(name); err != nil || o == nil || o.Project != "_default" {
+		t.Fatalf("premise: %s's runtime of web is stamped _default: %+v, %v", a.Name, o, err)
+	}
+	// The stale delete, served on b; a's runtime keeps running and writing.
+	if err := corrosion.DeleteContainer(ctx, b.DB, a.Name, name); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range c.Nodes {
+		waitForRepl(t, n.Name+" to apply the tombstone", func() bool { return containerHostOn(t, n, name) == "" })
+	}
+	a.CT.Seed(name, "written after the replica")
+	// A ghost row of acme's web on a, over a's runtime of _default's web.
+	if err := corrosion.UpsertContainer(ctx, b.DB, corrosion.ContainerRecord{HostName: a.Name, Name: name, Project: "acme", State: "stopped"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range c.Nodes {
+		waitForRepl(t, n.Name+" to see acme's row", func() bool {
+			row, err := corrosion.GetContainer(ctx, n.DB, a.Name, name)
+			return err == nil && row != nil && row.Project == "acme"
+		})
+	}
+	// b's libvirt cannot be listed for the rest of the test.
+	b.Virt.FailListDomains = func() error { return errors.New("libvirtd: connection reset") }
+	defer func() { b.Virt.FailListDomains = nil }()
+
+	restore := &pb.RestoreContainerReplicaRequest{Repo: "dr", Project: "_default", Name: name, Timestamp: ms[0].Timestamp}
+	_, err := c.SelfClient(tg).RestoreContainerReplica(ctx, restore)
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), a.Name+" runs "+name+", whose owner record says it is _default's") {
+		t.Fatalf("a restore while %s runs our web under acme's row: %v, want refused naming %s", a.Name, err, a.Name)
+	}
+	if tg.CT.Exists(name) {
+		t.Fatal("a second copy was laid down")
+	}
+	// Not vacuous: once a's runtime is acme's, nothing refuses, b's broken
+	// libvirt included.
+	if err := a.CT.StampOwner(name, lxc.ContainerOwner{Project: "acme"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.SelfClient(tg).RestoreContainerReplica(ctx, restore); err != nil {
+		t.Fatalf("the restore once %s's web is acme's, with %s's libvirt down: %v", a.Name, b.Name, err)
 	}
 	if got := tg.CT.Payload(name); got != "replicated" {
 		t.Fatalf("the restored container holds %q, want the replica's data", got)

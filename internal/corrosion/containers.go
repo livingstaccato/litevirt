@@ -192,6 +192,14 @@ type ContainerCreateSpec struct {
 	// there. Container replication keys a segment of the container's history
 	// by it. Empty for a row an earlier build wrote: an unknown placement.
 	Placement string `json:"placement,omitempty"`
+
+	// Mounts and Devices are the host paths an admin passed into the
+	// container at create. They are also in its LXC config, which travels
+	// with it; these let a relocation recreate them (judged again by the
+	// recreating host) and let any node report them. Setting them is gated
+	// on the release gate, so no older peer rewrites a spec holding them.
+	Mounts  []ContainerHostMount  `json:"mounts,omitempty"`
+	Devices []ContainerHostDevice `json:"devices,omitempty"`
 }
 
 // WithNewPlacement returns createSpec carrying a freshly minted placement id,
@@ -251,6 +259,19 @@ func MintContainerPlacementSpec(ctx context.Context, c *Client, host, name, curr
 		return "", false, err
 	}
 	return next, true, nil
+}
+
+// ContainerHostMount is one host bind mount of a ContainerCreateSpec.
+type ContainerHostMount struct {
+	HostPath      string `json:"host_path"`
+	ContainerPath string `json:"container_path"`
+	ReadWrite     bool   `json:"read_write,omitempty"`
+}
+
+// ContainerHostDevice is one host device node of a ContainerCreateSpec.
+type ContainerHostDevice struct {
+	HostPath      string `json:"host_path"`
+	ContainerPath string `json:"container_path,omitempty"`
 }
 
 // ContainerNetwork is one NIC of a ContainerCreateSpec. It carries the create-
@@ -1454,4 +1475,52 @@ func decodeContainerLabels(raw string) map[string]string {
 // said so. Every decision about whether a host can run a container uses it.
 func HostRunsContainers(h HostRecord) bool {
 	return h.Labels[LabelLXCCapable] == "true"
+}
+
+// VMDiskPaths maps each absolute disk path of every VM in the cluster to the
+// VM's name — what a container must never be handed as a device. Every host's
+// rows, not only this one's: on shared storage a LUN backing a VM on another
+// host is visible here too.
+func VMDiskPaths(ctx context.Context, c *Client) (map[string]string, error) {
+	rows, err := c.Query(ctx,
+		`SELECT vm_name, path FROM vm_disks WHERE deleted_at IS NULL`)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]string{}
+	for _, r := range rows {
+		if p := r.String("path"); strings.HasPrefix(p, "/") {
+			out[p] = r.String("vm_name")
+		}
+	}
+	return out, nil
+}
+
+// HostPathInUse reports what of litevirt's on host already uses path — a VM
+// disk, or a storage pool's source or target — so it is never also handed to
+// a container as a host mount or device. "" when nothing does.
+func HostPathInUse(ctx context.Context, c *Client, host, path string) (string, error) {
+	rows, err := c.Query(ctx,
+		`SELECT vm_name FROM vm_disks WHERE host_name = ? AND path = ? AND deleted_at IS NULL LIMIT 1`, host, path)
+	if err != nil {
+		return "", err
+	}
+	if len(rows) > 0 {
+		return "the disk of VM " + rows[0].String("vm_name"), nil
+	}
+	pools, err := ListStoragePoolsForHost(ctx, c, host)
+	if err != nil {
+		return "", err
+	}
+	for _, p := range pools {
+		for _, pp := range []string{p.Source, p.Target} {
+			if pp == "" || !strings.HasPrefix(pp, "/") {
+				continue
+			}
+			if path == pp || strings.HasPrefix(path, strings.TrimSuffix(pp, "/")+"/") || strings.HasPrefix(pp, strings.TrimSuffix(path, "/")+"/") {
+				return "storage pool " + p.Name, nil
+			}
+		}
+	}
+	return "", nil
 }

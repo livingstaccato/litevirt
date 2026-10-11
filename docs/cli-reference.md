@@ -229,6 +229,11 @@ lv update <vm> [--cpu N] [--memory N]        # resources — VM must be STOPPED
   [--max-cpu N]                              # vCPU hotplug ceiling (needs live_resize);
                                              # with it set, --cpu grows a RUNNING VM's
                                              # vCPUs live up to the ceiling
+  [--memory-hotplug-max N]                   # virtio-mem hot-add ceiling (0 = off); with
+                                             # it set, --memory changes a RUNNING VM live
+  [--usb <vendor>:<product>] [--usb-port <bus>-<port>] [--usb-mapping <name>]
+                                             # REPLACE the USB passthrough list (repeatable)
+  [--clear-usb]                              # remove every USB device
   [--secure-boot] [--tpm] [--force]          # toggle Secure Boot / vTPM (stopped).
                                              # Once firmware state exists, --force is
                                              # required to change them (enabling SB can
@@ -340,9 +345,14 @@ lv ct clone <source> <new-name> [--project p] [--start] # full-copy clone with a
 lv ct pull <image> --dest <name> [--project p]       # stage an OCI image; with --project only p (and Admin) may use it
 lv ct convert <name> --unprivileged [--confinement default]  # stopped ct → an id range of its own
 lv ct convert <name> --confinement default|legacy      # change confinement (legacy: Admin only)
+lv ct convert <name> --mount <host>:<ct>[:rw] --device <host>  # replace host mounts/devices (Admin only)
+lv ct convert <name> --clear-host-access               # remove them
 lv ct convert <name>                                  # finish an interrupted convert (the start refusal names it)
 lv ct create <name> --privileged                       # no user namespace, as earlier releases (Admin only)
 lv ct create <name> --confinement legacy               # AppArmor nesting, template seccomp/caps (Admin only)
+lv ct create <name> --mount /srv/data:/data[:rw]       # host bind mount, read-only unless :rw (Admin only;
+                                                       # under the host's containers.bind_mount_paths)
+lv ct create <name> --device /dev/ttyUSB0[:/dev/ttyS0] # host device node (Admin only; containers.device_paths)
 ```
 
 `--local` runs against the local lxc-* binaries instead of the gRPC service
@@ -772,12 +782,31 @@ lv run --name web --image ubuntu --memory 2048 --min-mem 1024 --max-mem 4096
 lv set-memory <vm> <MiB>                   # live balloon target, within [min, max]
 ```
 
+## Memory hot-add and USB passthrough
+
+```bash
+# virtio-mem: boot with 2 GiB, raise live up to 16 GiB
+lv run --name db --image ubuntu --memory 2048 --memory-hotplug-max 16384
+lv set-memory db 8192                      # plug 6 GiB into the running guest
+lv update db --memory 4096                 # the same, through update
+
+# USB: raw devices bind the VM to its host (pin it); a mapping follows the VM
+lv run --name pos --image ubuntu --host node-1 --usb 046d:c52b --usb-port 1-2
+lv mapping create dongle && lv mapping add-device dongle usb:096e:0006 --host node-1
+lv run --name lic --image ubuntu --usb-mapping dongle
+lv update lic --clear-usb                  # stopped, or --restart-if-needed
+```
+
+See docs/passthrough.md.
+
 ## Resource mappings (cluster-wide passthrough device aliases)
 
 ```bash
 lv mapping create <name> [--description <text>]
-lv mapping add-device <name> <pci-address> [--host <h>] [--vendor <v>] [--device <d>]
-lv mapping rm-device <name> <pci-address> [--host <h>]
+lv mapping add-device <name> <address> [--host <h>] [--vendor <v>] [--device <d>]
+                                           # address: a PCI address, or usb:<vendor>:<product>
+                                           # / usb:<bus>-<port> (a mapping is PCI or USB)
+lv mapping rm-device <name> <address> [--host <h>]
 lv mapping ls
 lv mapping rm <name>
 # Reference from a VM: `lv run … ` device spec / compose `devices: [{mapping: <name>}]`

@@ -362,6 +362,15 @@ func (c *ContainerChecker) recreateRelocated(ctx context.Context, ct corrosion.C
 	// unique, so it is still this container's) and profile. Neither recorded
 	// is a container an earlier build created, recreated as it was.
 	opts.Confinement = spec.Confinement
+	// Its host mounts and devices, judged by THIS host's allowed prefixes when
+	// the runtime creates it: a host that does not allow them refuses the
+	// recreate (the row stays pending) rather than recreating it without them.
+	for _, m := range spec.Mounts {
+		opts.Mounts = append(opts.Mounts, lxc.Mount{HostPath: m.HostPath, ContainerPath: m.ContainerPath, ReadWrite: m.ReadWrite})
+	}
+	for _, d := range spec.Devices {
+		opts.Devices = append(opts.Devices, lxc.Device{HostPath: d.HostPath, ContainerPath: d.ContainerPath})
+	}
 	if spec.IDMapBase != 0 {
 		opts.IDMap = &lxc.IDMap{Base: spec.IDMapBase, Size: lxc.IDMapSize}
 	}

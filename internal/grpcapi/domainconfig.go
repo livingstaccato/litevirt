@@ -28,15 +28,18 @@ func baseDomainConfig(spec *pb.VMSpec, disks []lv.DiskConfig, nets []lv.NetworkC
 		MemoryMiB:    int(spec.MemoryMib),
 		MinMemoryMiB: int(spec.MinMemoryMib),
 		MaxMemoryMiB: int(spec.MaxMemoryMib),
-		Machine:      spec.Machine,
-		Firmware:     spec.Firmware,
-		GuestAgent:   spec.GuestAgent,
-		EnableVNC:    !spec.DisableVnc,
-		EnableSPICE:  spec.EnableSpice,
-		Disks:        disks,
-		Networks:     nets,
-		Hostdevs:     hostdevs,
-		Boot:         spec.Boot,
+		// Memory hot-add (virtio-mem): the boot cell and the ceiling.
+		HotplugBaseMiB: int(spec.MemoryHotplugBaseMib),
+		HotplugMaxMiB:  int(spec.MemoryHotplugMaxMib),
+		Machine:        spec.Machine,
+		Firmware:       spec.Firmware,
+		GuestAgent:     spec.GuestAgent,
+		EnableVNC:      !spec.DisableVnc,
+		EnableSPICE:    spec.EnableSpice,
+		Disks:          disks,
+		Networks:       nets,
+		Hostdevs:       hostdevs,
+		Boot:           spec.Boot,
 	}
 	if r := spec.Resources; r != nil {
 		cfg.HugePages = r.Hugepages

@@ -1906,6 +1906,15 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 	if vmCfg.Firmware == "" {
 		vmCfg.Firmware = "uefi"
 	}
+	// Memory hot-add: the same NUMA cell and virtio-mem region the VM was
+	// created with, plugged to its desired memory, so a set-memory after the
+	// recovery plugs instead of finding no region. (USB devices are added by
+	// the start hook every start path runs, PrepareHardwareForStart.)
+	if spec.MemoryHotplugMaxMib > 0 {
+		vmCfg.HotplugBaseMiB = int(spec.MemoryHotplugBaseMib)
+		vmCfg.HotplugMaxMiB = int(spec.MemoryHotplugMaxMib)
+		vmCfg.MemoryMiB = int(spec.MemoryMib)
+	}
 	// Secure Boot + vTPM (G1): stable UUID makes the swtpm state path
 	// (/var/lib/libvirt/swtpm/<uuid>/) deterministic; render the same firmware
 	// CreateVM did. A vTPM VM whose state isn't present on this host can't be

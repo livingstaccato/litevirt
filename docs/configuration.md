@@ -702,6 +702,21 @@ containers:
   # on Linux 5.19+, LXC 5+ and an ext4/xfs/btrfs container store, otherwise
   # its files are shifted into the range at create), on, or off.
   idmapped_rootfs: auto
+  # Host paths an ADMIN may pass into a container on THIS host (lv ct create
+  # --mount / --device; docs/passthrough.md). A mount's host path is resolved
+  # here, symlinks followed, and must land under one of these prefixes; LXC's
+  # start hook mounts it from an fd on every start, never by path. A prefix
+  # whose path is, lies in or contains a protected tree (/, /etc, /run, the
+  # LXC store, litevirt's data and PKI directories, ...) is refused at load;
+  # one that reaches a protected tree only through another mount of the same
+  # filesystem still loads, with a warning and the condition
+  # container_mount_prefix_overlap, and sources in that tree are refused.
+  # Devices are listed EXACTLY, one node each (never a directory such as /dev;
+  # /dev/mem, /dev/kvm and /dev/vhost-* are refused). Mounts are read-only
+  # unless --mount asks for :rw, and always nosuid,nodev. Empty (the default)
+  # allows nothing. Allow only trees untrusted users cannot write.
+  bind_mount_paths: []                # e.g. ["/srv/shared", "/mnt/media"]
+  device_paths: []                    # exact nodes, e.g. ["/dev/ttyUSB0", "/dev/dri/renderD128"]
 
 # ACME for the web UI cert (#13). When set, the daemon TERMINATES UI TLS itself
 # (port 7445) using a cert from the configured ACME directory, with the cluster

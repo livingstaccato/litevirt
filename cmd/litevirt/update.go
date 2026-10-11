@@ -37,6 +37,9 @@ func newUpdateCmd() *cobra.Command {
 		force           bool
 		restartIfNeeded bool
 		allowOvercommit bool
+		memHotplugMax   int32
+		clearUSB        bool
+		usb             usbFlags
 	)
 	cmd := &cobra.Command{
 		Use:   "update <vm>",
@@ -50,7 +53,14 @@ VM must be stopped for those.
 
 With live_resize enabled cluster-wide, --cpu GROWS a running VM's vCPUs LIVE up to
 its --max-cpu hotplug ceiling (a CPU shrink or exceeding the ceiling still needs a
-stop), and 'lv set-memory' balloons memory live within the min/max bounds.`,
+stop), and 'lv set-memory' balloons memory live within the min/max bounds.
+
+A VM with memory hot-add (--memory-hotplug-max) takes --memory LIVE: memory above
+its boot size is a virtio-mem region, plugged or unplugged in the running guest.
+
+--usb, --usb-port and --usb-mapping REPLACE the VM's USB passthrough list
+(--clear-usb empties it). Like the other definition changes, they need the VM
+stopped or --restart-if-needed; USB devices are not hot-plugged.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			f := cmd.Flags()
@@ -59,7 +69,7 @@ stop), and 'lv set-memory' balloons memory live within the min/max bounds.`,
 				"restart", "restart-max-attempts", "restart-delay", "restart-window",
 				"onboot", "startup-order", "start-delay", "stop-delay",
 				"machine", "firmware", "guest-agent", "min-mem", "max-mem", "max-cpu",
-				"secure-boot", "tpm"} {
+				"secure-boot", "tpm", "memory-hotplug-max", "clear-usb", "usb", "usb-port", "usb-mapping"} {
 				if f.Changed(n) {
 					any = true
 					break
@@ -111,6 +121,19 @@ stop), and 'lv set-memory' balloons memory live within the min/max bounds.`,
 			}
 			if f.Changed("tpm") {
 				req.Tpm = &tpm
+			}
+			if f.Changed("memory-hotplug-max") {
+				req.MemoryHotplugMaxMib = &memHotplugMax
+			}
+			if usb.changed(cmd) || clearUSB {
+				if clearUSB && usb.changed(cmd) {
+					return fmt.Errorf("--clear-usb and --usb/--usb-port/--usb-mapping are exclusive: the USB flags already replace the whole list")
+				}
+				devs, err := usb.devices()
+				if err != nil {
+					return err
+				}
+				req.SetUsbDevices, req.UsbDevices = true, devs
 			}
 			req.Force = force
 			// Live metadata: only send what changed (presence-detected).
@@ -173,5 +196,9 @@ stop), and 'lv set-memory' balloons memory live within the min/max bounds.`,
 	cmd.Flags().BoolVar(&restartIfNeeded, "restart-if-needed", false, "Permit a stop→redefine→start for a change that can't apply live (cpu shrink, machine/firmware, beyond the vCPU ceiling)")
 	cmd.Flags().BoolVar(&allowOvercommit, "allow-overcommit", false,
 		"Skip the host capacity check when --restart-if-needed grows the VM (project quota still applies). The bypass is audited.")
+	cmd.Flags().Int32Var(&memHotplugMax, "memory-hotplug-max", 0,
+		"Memory hot-add ceiling in MiB (virtio-mem; 0 turns it off). Set while stopped; then --memory or lv set-memory changes memory live up to it")
+	cmd.Flags().BoolVar(&clearUSB, "clear-usb", false, "Remove every USB passthrough device (VM must be stopped)")
+	usb.register(cmd)
 	return cmd
 }

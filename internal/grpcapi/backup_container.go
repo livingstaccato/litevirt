@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/network"
@@ -885,6 +887,24 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	peerRelocation := s.isPeerRelocation(ctx, req.Proof != nil)
 	migrateSource := s.migrateSourceFromPeer(ctx)
 
+	// A peer move (a cold migrate, a failover relocation) re-homes an existing
+	// container: what it may hold — its NICs, host mounts and devices,
+	// privilege — is what its SOURCE ROW records, never the archive. Read
+	// before anything is laid down; with no row the restore refuses, so the
+	// move is retried rather than landing the container stripped.
+	var source *corrosion.ContainerRecord
+	if peerRelocation || migrateSource != "" {
+		var serr error
+		if source, serr = s.peerMoveSource(ctx, req, migrateSource); serr != nil {
+			s.audit(ctx, "ct.restore", req.Name, "project="+project+" (source row: "+status.Convert(serr).Message()+")", "error")
+			return serr
+		}
+		if source == nil {
+			s.audit(ctx, "ct.restore", req.Name, "project="+project+" relocation with no source row here and none sent (an earlier-build coordinator): "+
+				"NICs admitted from the archive by their network records; host access and privilege not carried", "ok")
+		}
+	}
+
 	// Project isolation. An operator restore rebuilds the archived spec's NICs as
 	// a new workload in the authorized project, so each managed network must be
 	// one that project may use (same project as the backup: a raw bridge is
@@ -892,13 +912,18 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	// and a cold migrate (a peer-verified migrate-from) RE-HOME the existing
 	// container instead: refusing would leave it down without removing the
 	// attachment, so they warn and audit, as a takeover promote does.
+	//
+	// The archive's names are judged here, ahead of any I/O; the NICs the
+	// restore actually keeps are admitted again once classified
+	// (authorizeRestoredNICs), and a re-home's foreign networks are taken
+	// from those.
 	ctNets := containerSpecNetworkNames(corrosion.DecodeCreateSpec(spec.CreateSpec))
 	var foreignNets []string // recorded only once the restored row has landed
-	if peerRelocation || migrateSource != "" {
-		foreignNets = s.foreignNetworks(ctx, "ct.restore", req.Name, project, ctNets)
-	} else if err := s.admitCopiedNetworks(ctx, "restore", project, project, ctNets); err != nil {
-		s.audit(ctx, "ct.restore", req.Name, "project="+project, "denied")
-		return err
+	if !peerRelocation && migrateSource == "" {
+		if err := s.admitCopiedNetworks(ctx, "restore", project, project, ctNets); err != nil {
+			s.audit(ctx, "ct.restore", req.Name, "project="+project, "denied")
+			return err
+		}
 	}
 
 	// Capacity + quota admission, the SAME two-scope split as CreateContainer.
@@ -1143,6 +1168,83 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 		}
 		spec.CreateSpec = remapped
 	}
+	// Host mounts and devices come from the backup's create spec, which grants
+	// nothing: kept only for an admin's operator restore, or for a peer-driven
+	// move whose SOURCE ROW authorized exactly them; stripped otherwise, and
+	// said so. Then the config is rendered from the authorized spec — nothing
+	// in the archive's config is trusted (the import already dropped every line
+	// that grants host access or overrides confinement).
+	//
+	// Host access an operator restore keeps is written with the feature's grant
+	// (hostAccessG), taken here on the node that writes the row.
+	var hostAccessG capabilities.FeatureGrant
+	{
+		authorized, stripped, g, herr := s.authorizeRestoredHostAccess(ctx, corrosion.DecodeCreateSpec(spec.CreateSpec), source, !operatorRestore)
+		if herr != nil {
+			if delErr := s.containerRuntime.DeleteContainer(ctx, req.Name); delErr != nil {
+				slog.Warn("container restore: cleanup after a refused host-access grant also failed", "name", req.Name, "error", delErr)
+			}
+			s.removeRestoreMarker(req.Name)
+			s.audit(ctx, "ct.restore", req.Name, "project="+project+" (host access: release gate refused; retry)", "error")
+			return herr
+		}
+		hostAccessG = g
+		// Privileged mode and legacy confinement are the same host-escalation
+		// class, decided the same way. Stripped, the container is moved into an
+		// id range of its own (its files shifted) before its config is rendered.
+		authorized, strippedSec, unprivilege := s.authorizeRestoredSecurity(ctx, authorized, source, !operatorRestore)
+		if unprivilege {
+			sc, ok := s.containerRuntime.(containerSecurer)
+			if !ok {
+				if delErr := s.containerRuntime.DeleteContainer(ctx, req.Name); delErr != nil {
+					slog.Warn("container restore: cleanup after a refused privileged restore also failed", "name", req.Name, "error", delErr)
+				}
+				s.removeRestoreMarker(req.Name)
+				return status.Error(codes.PermissionDenied, "restoring a privileged container needs the admin role (this host cannot convert it to unprivileged)")
+			}
+			base, aerr := s.unprivilegeContainer(ctx, sc, req.Name)
+			if aerr != nil {
+				if delErr := s.containerRuntime.DeleteContainer(ctx, req.Name); delErr != nil {
+					slog.Warn("container restore: cleanup after the unprivileged move failed also failed", "name", req.Name, "error", delErr)
+				}
+				s.removeRestoreMarker(req.Name)
+				return status.Errorf(codes.Internal, "move the restored container into an id range of its own: %v", aerr)
+			}
+			authorized.IDMapBase = base
+		}
+		if strippedSec != "" {
+			stripped = strings.TrimSpace(stripped + " " + strippedSec)
+		}
+		// Where its NICs attach: never a bridge the archive names.
+		authorized, droppedNICs, nerr := s.authorizeRestoredNICs(ctx, project, authorized, source, !operatorRestore)
+		if nerr != nil {
+			if delErr := s.containerRuntime.DeleteContainer(ctx, req.Name); delErr != nil {
+				slog.Warn("container restore: cleanup after the NIC admission failed also failed", "name", req.Name, "error", delErr)
+			}
+			s.removeRestoreMarker(req.Name)
+			s.audit(ctx, "ct.restore", req.Name, "project="+project+" (network records unreadable)", "error")
+			return nerr
+		}
+		if !operatorRestore {
+			foreignNets = s.foreignNetworks(ctx, "ct.restore", req.Name, project, containerSpecNetworkNames(authorized))
+		}
+		if stripped != "" || !reflect.DeepEqual(authorized.Networks, corrosion.DecodeCreateSpec(spec.CreateSpec).Networks) {
+			spec.CreateSpec = corrosion.EncodeCreateSpec(authorized)
+		}
+		// The network as well: lxc.net.* comes from the authorized spec's
+		// NICs alone, never the archive's (a phys, macvlan or router-mode NIC,
+		// or another tenant's bridge, is host access too).
+		droppedCfg, err := s.renderContainerConfig(ctx, req.Name, authorized, restoredNetworkMode(operatorRestore, source))
+		if err != nil {
+			if delErr := s.containerRuntime.DeleteContainer(ctx, req.Name); delErr != nil {
+				slog.Warn("container restore: cleanup after the config rebuild failed also failed", "name", req.Name, "error", delErr)
+			}
+			s.removeRestoreMarker(req.Name)
+			return err
+		}
+		s.noteStrippedHostAccess(ctx, "ct.restore", req.Name, stripped)
+		s.noteDroppedArchiveConfig(ctx, "ct.restore", req.Name, append(droppedNICs, droppedCfg...))
+	}
 	stateDetail := ""
 	if !req.Start {
 		stateDetail = spec.StateDetail
@@ -1193,7 +1295,7 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	// landed"). On failure, delete the just-imported runtime container so nothing
 	// untracked is left, then error out (before signalling "landed").
 	ifs := corrosion.BuildContainerInterfacesFromSpec(s.hostName, req.Name, corrosion.DecodeCreateSpec(rec.CreateSpec))
-	if err := corrosion.CreateContainerAtomic(ctx, s.db, rec, ifs); err != nil {
+	if err := s.createRestoredContainerRow(ctx, hostAccessG, !operatorRestore, rec, ifs); err != nil {
 		if delErr := s.containerRuntime.DeleteContainer(ctx, req.Name); delErr != nil {
 			slog.Warn("container restore: failed to clean up imported container after cluster-state-write failure",
 				"name", req.Name, "error", delErr)

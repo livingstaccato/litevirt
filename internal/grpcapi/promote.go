@@ -1299,6 +1299,8 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			MemoryMiB: int(spec.MemoryMib), Machine: spec.Machine, Firmware: spec.Firmware,
 			GuestAgent: spec.GuestAgent, EnableVNC: !spec.DisableVnc, EnableSPICE: spec.EnableSpice,
 			Disks: diskCfg, Networks: netCfg, Boot: spec.Boot,
+			// Memory hot-add carried, as every definer does (domainconfig.go).
+			HotplugBaseMiB: int(spec.MemoryHotplugBaseMib), HotplugMaxMiB: int(spec.MemoryHotplugMaxMib),
 		})
 		if err != nil {
 			os.Remove(livePath)

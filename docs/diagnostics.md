@@ -1558,6 +1558,22 @@ with the `assert_nonce` in the node's marker, which neither this condition, the
 log, nor any RPC shows, and which a marker with `problem` set does not have. The
 condition row is rewritten only when what it says changes.
 
+### Container mount prefix shares a protected filesystem (`container_mount_prefix_overlap`)
+
+A node raises `container_mount_prefix_overlap` (warning) about **itself** when
+one of its `containers.bind_mount_paths` prefixes reaches a protected tree by
+filesystem identity but not by path — the prefix is on a filesystem that also
+holds `data_dir`, a pool or a backup repo, mounted somewhere else
+([passthrough.md](passthrough.md)). The daemon still starts: such a config
+loaded before identity was checked. Mount sources beneath the prefix that lie
+in the protected tree are refused when they are resolved; the rest of the
+prefix keeps working. The evidence carries `overlaps`, one line per prefix,
+naming the prefix and the tree; the daemon log says the same at start.
+
+| Raised when | Clears when |
+|---|---|
+| The daemon starts with such a prefix configured. | The daemon starts with no such prefix (the prefix moved to a filesystem of its own, or removed). |
+
 ### Observer stalled (`observer_stalled`)
 
 A node that was itself not running — its VM suspended, swapped out, or starved

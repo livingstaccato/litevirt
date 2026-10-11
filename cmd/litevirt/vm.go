@@ -40,6 +40,8 @@ func newRunCmd() *cobra.Command {
 		allowOvercommit bool
 		storagePool     string
 		overwrite       bool
+		memHotplugMax   int32
+		usb             usbFlags
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -65,7 +67,14 @@ func newRunCmd() *cobra.Command {
 					Tpm:           tpm,
 					CpuMode:       cpuMode,
 					CpuModel:      cpuModel,
+
+					MemoryHotplugMaxMib: memHotplugMax,
 				}
+				usbDevs, err := usb.devices()
+				if err != nil {
+					return err
+				}
+				spec.UsbDevices = usbDevs
 				// Validate here too, so a typo costs a round trip and not a
 				// half-understood server error.
 				if err := lvpkg.ValidateCPUMode(cpuMode, cpuModel); err != nil {
@@ -127,6 +136,9 @@ func newRunCmd() *cobra.Command {
 	cmd.Flags().StringVar(&storagePool, "storage", "", "Storage pool for the root disk (default: the host's local disk directory)")
 	cmd.Flags().BoolVar(&overwrite, "overwrite", false,
 		"With --storage on an iscsi pool and --image: write the image over a LUN that is not blank (destroys what it holds). A LUN another VM uses is never written.")
+	cmd.Flags().Int32Var(&memHotplugMax, "memory-hotplug-max", 0,
+		"Memory hot-add ceiling in MiB (virtio-mem; > --memory): memory can then be raised live up to it with lv set-memory or lv update --memory")
+	usb.register(cmd)
 	cmd.MarkFlagRequired("name")
 	return cmd
 }

@@ -103,6 +103,14 @@ func (s *Server) autoDefineRestoredVM(
 	// of a VM in spec.Project and admitted as one. Refused before admission and
 	// DefineDomain.
 	fromExisting := req.Spec == nil && manifest.VMSpecJSON == ""
+	// USB devices and memory hot-add come only from server-side state that
+	// passed create's gates: a client --spec and a manifest's embedded spec
+	// grant neither (stripped, and said so); the cluster's own row keeps them,
+	// re-judged as a create would judge them, on this host.
+	passthroughG, err := s.admitRestoredUSBAndHotplug(ctx, spec, targetName, fromExisting)
+	if err != nil {
+		return "", "", err
+	}
 	if fromExisting {
 		if err := s.admitCopiedNetworks(ctx, "restore", project, spec.Project, specNetworkNames(spec.Network)); err != nil {
 			return "", "", err
@@ -281,6 +289,9 @@ func (s *Server) autoDefineRestoredVM(
 		Disks:       diskCfg,
 		Networks:    netCfg,
 		Boot:        spec.Boot,
+		// Memory hot-add, only as admitted above (admitRestoredUSBAndHotplug).
+		HotplugBaseMiB: int(spec.MemoryHotplugBaseMib),
+		HotplugMaxMiB:  int(spec.MemoryHotplugMaxMib),
 	}
 	// Firmware fields (G1): point the domain at the just-materialized NVRAM
 	// (name-keyed) + the fresh UUID whose swtpm dir we re-homed the state into.
@@ -378,7 +389,7 @@ func (s *Server) autoDefineRestoredVM(
 	// it from the (device-less) inactive definition, which correctly imports nothing.
 	// adopt=false: best-effort-populate vm_nics, but don't self-certify adoption —
 	// the backfill audit confirms/reconciles.
-	if err := corrosion.InsertVMWithHardware(ctx, s.db, vmRecord, ifaceRecords, diskRecords, nicRecords, nil, false); err != nil {
+	if err := s.insertVMForPassthrough(ctx, spec, passthroughG, vmRecord, ifaceRecords, diskRecords, nicRecords, nil, false); err != nil {
 		if fwVM {
 			// A running firmware domain with no DB row is unmanageable — lifecycle
 			// code wouldn't know to preserve/wipe its state — so fail hard; the

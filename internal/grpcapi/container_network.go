@@ -79,10 +79,13 @@ func containerVethName(ctName string, ordinal int) string {
 
 // resolveBridgeToNetwork returns the single managed network whose rendered
 // bridge equals bridge; ok=false if zero or many match (⇒ legacy-unmanaged).
-func (s *Server) resolveBridgeToNetwork(ctx context.Context, bridge string) (string, bool) {
+// A network list that cannot be read is an error, never "raw" (m-3): a raw
+// bridge is admitted on raw-bridge authority alone, which another project's
+// rendered bridge must not be.
+func (s *Server) resolveBridgeToNetwork(ctx context.Context, bridge string) (string, bool, error) {
 	nets, err := corrosion.ListNetworks(ctx, s.db)
 	if err != nil {
-		return "", false
+		return "", false, err
 	}
 	match, n := "", 0
 	for _, nr := range nets {
@@ -90,7 +93,31 @@ func (s *Server) resolveBridgeToNetwork(ctx context.Context, bridge string) (str
 			match, n = nr.Name, n+1
 		}
 	}
-	return match, n == 1
+	return match, n == 1, nil
+}
+
+// classifiedNetworkNames is containerSpecNetworkNames with each raw bridge
+// that renders a managed network named as that network: what admission
+// judges for a path that copies a container's NICs (m-7). A raw bridge that
+// has since become another project's network is that project's NIC.
+func (s *Server) classifiedNetworkNames(ctx context.Context, spec corrosion.ContainerCreateSpec) ([]string, error) {
+	out := make([]string, 0, len(spec.Networks))
+	for _, n := range spec.Networks {
+		if n.NetworkName != "" {
+			out = append(out, n.NetworkName)
+			continue
+		}
+		name, ok, err := s.resolveBridgeToNetwork(ctx, n.Bridge)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			out = append(out, name)
+		} else {
+			out = append(out, n.Bridge)
+		}
+	}
+	return out, nil
 }
 
 // containerNICPlan is the resolved per-create network wiring.
@@ -126,7 +153,13 @@ func (s *Server) resolveContainerNICs(ctx context.Context, project, ctName strin
 				return nil, status.Errorf(codes.InvalidArgument, "network %q not found", netName)
 			}
 		case n.Bridge != "":
-			if name, ok := s.resolveBridgeToNetwork(ctx, n.Bridge); ok {
+			name, ok, rerr := s.resolveBridgeToNetwork(ctx, n.Bridge)
+			if rerr != nil {
+				// Fail closed: a bridge that may render a managed network must
+				// not take the raw-bridge path because the list was unreadable.
+				return nil, status.Errorf(codes.Unavailable, "read networks (does bridge %q render a managed network?): %v", n.Bridge, rerr)
+			}
+			if ok {
 				netName = name
 				var derr error
 				// Same reason: a bridge that RESOLVES to a managed network must

@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/litevirt/litevirt/internal/grpcapi"
 	"github.com/litevirt/litevirt/internal/image"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
+	"github.com/litevirt/litevirt/internal/lxc"
 	"github.com/litevirt/litevirt/internal/obs"
 )
 
@@ -283,6 +285,14 @@ type ContainersConfig struct {
 	// "auto" (an idmapped mount where this host supports one, otherwise its
 	// files are shifted into the range), "on" or "off". Default "auto".
 	IDMappedRootfs string `yaml:"idmapped_rootfs"`
+	// BindMountPaths and DevicePaths are the host path prefixes an admin may
+	// bind-mount into a container, and the device nodes they may pass through.
+	// A path is resolved on this host (symlinks followed) and must land under
+	// one, at create and again at every start. Empty (the default) allows
+	// none. Per host: a container moved to a host that does not allow its
+	// paths does not start there.
+	BindMountPaths []string `yaml:"bind_mount_paths,omitempty"`
+	DevicePaths    []string `yaml:"device_paths,omitempty"`
 }
 
 // validate refuses container defaults that cannot work.
@@ -297,6 +307,17 @@ func (c ContainersConfig) validate() error {
 	}
 	if c.IDMapRanges <= 0 {
 		return fmt.Errorf("config containers.idmap_ranges: %d, want at least 1", c.IDMapRanges)
+	}
+	return nil
+}
+
+// validateHostAccess refuses allowed host paths a host must not run with: a
+// bind-mount prefix that is, lies in, or contains a protected tree (so never
+// "/"; litevirt's own data and PKI directories among them), and a device entry
+// that is not an exact, permitted node under /dev.
+func (c ContainersConfig) validateHostAccess(dataDir, pkiDir string) error {
+	if err := lxc.ValidateHostAccess(c.hostAccess(dataDir, pkiDir)); err != nil {
+		return fmt.Errorf("config %w", err)
 	}
 	// The ranges must leave the host's own ids (0-65535) alone and fit in 32
 	// bits (4294967295 is the kernel's invalid id).
@@ -937,6 +958,9 @@ func LoadConfig() (*Config, error) {
 	if err := cfg.Containers.validate(); err != nil {
 		return nil, err
 	}
+	if err := cfg.Containers.validateHostAccess(cfg.DataDir, cfg.PKIDir); err != nil {
+		return nil, err
+	}
 
 	if cfg.Migration.Network != "" {
 		n, err := grpcapi.ParseMigrationNetwork(cfg.Migration.Network)
@@ -1304,4 +1328,19 @@ func orDefault[T interface{ ~int | ~float64 }](v, d T) T {
 		return d
 	}
 	return v
+}
+
+// hostAccess is what this host lets containers reach, with litevirt's own
+// directories protected.
+func (c ContainersConfig) hostAccess(dataDir, pkiDir string) lxc.HostAccess {
+	exe, _ := os.Executable()
+	if r, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = r
+	}
+	return lxc.HostAccess{
+		MountPaths:  c.BindMountPaths,
+		DevicePaths: c.DevicePaths,
+		Deny:        []string{dataDir, pkiDir},
+		HookBinary:  exe,
+	}
 }

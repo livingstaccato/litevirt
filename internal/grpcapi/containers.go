@@ -16,6 +16,7 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/lxc"
 	"github.com/litevirt/litevirt/internal/randid"
@@ -85,6 +86,10 @@ func (s *Server) authorizeContainerCreate(ctx context.Context, req *pb.CreateCon
 	}
 	if err := containerSecurityRequest(ctx, req.Privileged, req.Confinement); err != nil {
 		s.audit(ctx, "ct.create", req.Name, fmt.Sprintf("privileged=%v confinement=%s", req.Privileged, req.Confinement), "denied")
+		return err
+	}
+	if err := s.containerHostAccessRequest(ctx, req.HostName, req.Mounts, req.Devices); err != nil {
+		s.audit(ctx, "ct.create", req.Name, hostAccessAudit(req.Mounts, req.Devices), "denied")
 		return err
 	}
 	return nil
@@ -183,6 +188,19 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	}
 	if existing != nil {
 		return nil, status.Errorf(codes.AlreadyExists, "container %q already exists on host %q", req.Name, s.hostName)
+	}
+	// Host mounts and devices are written by THIS node, so the feature's gate
+	// runs here, after the cheap local refusals (template, image ownership, a
+	// duplicate name) and before anything is admitted or created: the entry
+	// check (containerHostAccessRequest) only fails fast, and a forwarded
+	// create is gated on the owner. A create without them takes no grant.
+	var hostAccessG capabilities.FeatureGrant
+	if len(req.Mounts) > 0 || len(req.Devices) > 0 {
+		g, gerr := s.passthroughGrant(ctx)
+		if gerr != nil {
+			return nil, gerr
+		}
+		hostAccessG = g
 	}
 
 	// Tenancy admission — containers draw down the SAME project vCPU/Mem budget
@@ -284,12 +302,15 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		}
 		idmapBase = b
 	}
+	specMounts, specDevices := hostAccessSpec(req.Mounts, req.Devices)
+	optMounts, optDevices := hostAccessOpts(corrosion.ContainerCreateSpec{Mounts: specMounts, Devices: specDevices})
 	info, err := s.containerRuntime.CreateContainer(ctx, CreateContainerOpts{
 		Name: req.Name, Template: req.Template,
 		Distro: req.Distro, Release: req.Release, Arch: req.Arch,
 		CPULimit: int(req.Cpu), MemoryMiB: int(req.MemoryMib),
 		Networks: plan.lxcNics, Labels: req.Labels,
 		Confinement: confinement, IDMapBase: idmapBase,
+		Mounts: optMounts, Devices: optDevices,
 	})
 	if err != nil {
 		_ = s.releaseContainerNICs(ctx, req.Name)
@@ -306,6 +327,8 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		OwnerID:     randid.New(),
 		IDMapBase:   idmapBase,
 		Confinement: confinement,
+		Mounts:      specMounts,
+		Devices:     specDevices,
 	}
 	s.stampContainerOwner(info.Name, req.Project, corrosion.EncodeCreateSpec(createSpec))
 
@@ -342,7 +365,13 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	// closed: the runtime container exists but the DB write failed → delete the
 	// just-created container and release its leases, so no partial tracked state
 	// and no leaked lease.
-	if err := corrosion.CreateContainerAtomic(ctx, s.db, rec, plan.ifaces); err != nil {
+	writeRow := corrosion.CreateContainerAtomic
+	if len(createSpec.Mounts) > 0 || len(createSpec.Devices) > 0 {
+		writeRow = func(ctx context.Context, c *corrosion.Client, rec corrosion.ContainerRecord, ifaces []corrosion.ContainerInterfaceRecord) error {
+			return corrosion.CreateContainerAtomicWithHostAccess(ctx, c, hostAccessG, rec, ifaces)
+		}
+	}
+	if err := writeRow(ctx, s.db, rec, plan.ifaces); err != nil {
 		_ = s.releaseContainerNICs(ctx, info.Name)
 		if delErr := s.containerRuntime.DeleteContainer(ctx, info.Name); delErr != nil {
 			slog.Warn("container create: cleanup after cluster-state-write failure also failed",
@@ -351,7 +380,11 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		s.audit(ctx, "ct.create", info.Name, "image="+rec.Image, "error")
 		return nil, status.Errorf(codes.Internal, "create: record cluster state: %v", err)
 	}
-	s.audit(ctx, "ct.create", info.Name, "project="+tenancy.NormalizeProject(req.Project)+" image="+rec.Image, "ok")
+	auditDetail := "project=" + tenancy.NormalizeProject(req.Project) + " image=" + rec.Image
+	if ha := hostAccessAudit(req.Mounts, req.Devices); ha != "" {
+		auditDetail += " " + ha
+	}
+	s.audit(ctx, "ct.create", info.Name, auditDetail, "ok")
 	slog.Info("container created", "name", info.Name, "host", s.hostName)
 	return toPbContainer(rec), nil
 }
@@ -903,7 +936,9 @@ func (s *Server) forwardSimpleCT(
 
 func toPbContainer(r corrosion.ContainerRecord) *pb.Container {
 	privileged, confinement, base := containerSecurityOf(r)
+	mounts, devices := pbHostAccess(corrosion.DecodeCreateSpec(r.CreateSpec))
 	return &pb.Container{
+		Mounts: mounts, Devices: devices,
 		Privileged: privileged, Confinement: confinement, IdmapBase: base,
 		HostName: r.HostName, Name: r.Name, State: r.State,
 		Image: r.Image, CpuLimit: int32(r.CPULimit), MemoryMib: int32(r.MemMiB),

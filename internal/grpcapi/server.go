@@ -544,6 +544,11 @@ type Server struct {
 	// pre-row failure, or an indeterminate stream break. Production leaves it nil.
 	migrateRestoreOverride func(ctx context.Context, target, repoPath, name, timestamp string, start bool) (corrosion.RestoreOutcome, error)
 
+	// sourceRowWait is how long a peer move's restore polls this replica for
+	// the source row before deciding without it (peerMoveSource); 0 is
+	// defaultSourceRowWait. Tests shorten it.
+	sourceRowWait time.Duration
+
 	// leaseBarrierCache holds the last quorum-observed lease-term threshold per
 	// key. Read ONLY to serve refusals — see leaseTermBarrier for why accepting
 	// from it would be unsound. leaseBarrierFlight collapses concurrent callers
@@ -1958,6 +1963,20 @@ type CreateContainerOpts struct {
 	// IDMapBase makes the container unprivileged in the range starting there;
 	// 0 is privileged.
 	IDMapBase int64
+	// Mounts and Devices are host paths passed into the container (admin
+	// only); the runtime judges them against this host's allowed prefixes.
+	Mounts  []ContainerMountOpt
+	Devices []ContainerDeviceOpt
+}
+
+// ContainerMountOpt mirrors lxc.Mount; ContainerDeviceOpt mirrors lxc.Device.
+type ContainerMountOpt struct {
+	HostPath, ContainerPath string
+	ReadWrite               bool
+}
+
+type ContainerDeviceOpt struct {
+	HostPath, ContainerPath string
 }
 
 // ContainerNICOpt mirrors lxc.NetworkAttach.

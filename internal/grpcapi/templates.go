@@ -474,6 +474,7 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 	srcSpec.Name = req.Target
 	srcSpec.Project = project
 	srcSpec.Devices = nil           // v1: don't clone PCI passthrough (device may be in use)
+	srcSpec.UsbDevices = nil        // nor USB: a device passes to one guest, and a raw one is the source host's
 	srcSpec.Uuid = uuid.NewString() // fresh identity ⇒ fresh vTPM (never copy the source TPM secret) (G1)
 	for i := range srcSpec.Network {
 		if i < len(ifaceRecords) {
@@ -506,6 +507,8 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 		Machine: machine, Firmware: firmware, GuestAgent: srcSpec.GuestAgent,
 		EnableVNC: !srcSpec.DisableVnc, EnableSPICE: srcSpec.EnableSpice,
 		Disks: diskConfigs, Networks: netConfigs, CloudInitISO: cloudInitISO, Boot: srcSpec.Boot,
+		// Memory hot-add carried: the clone's spec copies the band.
+		HotplugBaseMiB: int(srcSpec.MemoryHotplugBaseMib), HotplugMaxMiB: int(srcSpec.MemoryHotplugMaxMib),
 	}
 	// Thread Secure Boot + vTPM (fresh vTPM at the new UUID; fresh NVRAM from
 	// template) into the clone domain (G1).

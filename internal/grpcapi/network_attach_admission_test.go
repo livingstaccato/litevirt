@@ -486,6 +486,7 @@ func TestRestoreContainer_RelocationOnForeignNetworkProceedsAndAudits(t *testing
 
 	if err := s.RestoreContainer(&pb.RestoreContainerRequest{
 		Name: "ct1", RepoPath: repo, Timestamp: ts, Proof: relocProof(proofID, token),
+		SourceCreateSpec: foreignCTSpec("beta-net"),
 	}, &progressStream[pb.RestoreContainerProgress]{ctx: proofRestoreCtx(token)}); err != nil {
 		t.Fatalf("a relocation must not be blocked by network admission: %v", err)
 	}
@@ -589,6 +590,15 @@ func TestAdmitCopiedNetworks_RawBridge(t *testing.T) {
 	}
 }
 
+// foreignCTSpec is the create spec of a container whose only NIC is on
+// network: what its row records, and what a coordinator relocating it sends.
+func foreignCTSpec(network string) string {
+	return corrosion.EncodeCreateSpec(corrosion.ContainerCreateSpec{
+		Template: "download", Distro: "alpine",
+		Networks: []corrosion.ContainerNetwork{{Name: "eth0", NetworkName: network}},
+	})
+}
+
 // seedForeignCTBackup backs up container ct1 (project acme, CPU 1 / 256 MiB) whose
 // only NIC is on network, on a peer-aware server ("self", knows "peer-1"), then
 // drops its row so a restore must rebuild it.
@@ -604,10 +614,7 @@ func seedForeignCTBackup(t *testing.T, network string) (s *Server, repo, ts stri
 	if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{
 		HostName: "self", Name: "ct1", State: "stopped", Image: "alpine:3.19", Project: "acme",
 		CPULimit: 1, MemMiB: 256,
-		CreateSpec: corrosion.EncodeCreateSpec(corrosion.ContainerCreateSpec{
-			Template: "download", Distro: "alpine",
-			Networks: []corrosion.ContainerNetwork{{Name: "eth0", NetworkName: network}},
-		}),
+		CreateSpec: foreignCTSpec(network),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -625,7 +632,7 @@ func seedForeignCTBackup(t *testing.T, network string) (s *Server, repo, ts stri
 // refused and falling back to a fresh image-recreate.
 func TestRestoreContainer_ProoflessPeerRelocationOnForeignNetworkProceeds(t *testing.T) {
 	s, repo, ts := seedForeignCTBackup(t, "beta-net")
-	if err := s.RestoreContainer(&pb.RestoreContainerRequest{Name: "ct1", RepoPath: repo, Timestamp: ts},
+	if err := s.RestoreContainer(&pb.RestoreContainerRequest{Name: "ct1", RepoPath: repo, Timestamp: ts, SourceCreateSpec: foreignCTSpec("beta-net")},
 		&progressStream[pb.RestoreContainerProgress]{ctx: proofRestoreCtx("reloc-token-2")}); err != nil {
 		t.Fatalf("a proofless peer relocation must not be blocked by network admission: %v", err)
 	}
@@ -656,7 +663,7 @@ func TestRestoreContainer_ForgedRelocationTokenRefused(t *testing.T) {
 // A peer relocation still stamps the coordinator's token on the restored row.
 func TestRestoreContainer_PeerRelocationStampsToken(t *testing.T) {
 	s, repo, ts := seedForeignCTBackup(t, "shared-net")
-	if err := s.RestoreContainer(&pb.RestoreContainerRequest{Name: "ct1", RepoPath: repo, Timestamp: ts},
+	if err := s.RestoreContainer(&pb.RestoreContainerRequest{Name: "ct1", RepoPath: repo, Timestamp: ts, SourceCreateSpec: foreignCTSpec("shared-net")},
 		&progressStream[pb.RestoreContainerProgress]{ctx: proofRestoreCtx("reloc-token-3")}); err != nil {
 		t.Fatalf("peer relocation: %v", err)
 	}

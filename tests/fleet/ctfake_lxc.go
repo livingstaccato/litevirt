@@ -20,8 +20,15 @@ type ctLXC struct {
 }
 
 func (r ctLXC) Create(ctx context.Context, opts lxc.CreateOpts) (*lxc.Container, error) {
-	info, err := r.f.CreateContainer(ctx, grpcapi.CreateContainerOpts{Name: opts.Name,
-		CPULimit: opts.CPULimit, MemoryMiB: opts.MemoryMiB})
+	co := grpcapi.CreateContainerOpts{Name: opts.Name,
+		CPULimit: opts.CPULimit, MemoryMiB: opts.MemoryMiB}
+	for _, m := range opts.Mounts {
+		co.Mounts = append(co.Mounts, grpcapi.ContainerMountOpt{HostPath: m.HostPath, ContainerPath: m.ContainerPath, ReadWrite: m.ReadWrite})
+	}
+	for _, d := range opts.Devices {
+		co.Devices = append(co.Devices, grpcapi.ContainerDeviceOpt{HostPath: d.HostPath, ContainerPath: d.ContainerPath})
+	}
+	info, err := r.f.CreateContainer(ctx, co)
 	if err != nil {
 		return nil, err
 	}

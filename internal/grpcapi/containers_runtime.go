@@ -35,6 +35,7 @@ func (a *LXCRuntimeAdapter) CreateContainer(ctx context.Context, opts CreateCont
 		CPULimit: opts.CPULimit, MemoryMiB: opts.MemoryMiB,
 		Network: nics, Labels: opts.Labels,
 		Confinement: opts.Confinement, IDMap: idmap,
+		Mounts: lxcMounts(opts.Mounts), Devices: lxcDevices(opts.Devices),
 	})
 	if err != nil {
 		return nil, err
@@ -140,8 +141,12 @@ func (a *LXCRuntimeAdapter) ContainerSecurity(name string) (lxc.Security, error)
 	if sc, ok := a.Inner.(lxc.Securer); ok {
 		return sc.Security(name)
 	}
-	return lxc.Security{}, errors.New("this container runtime keeps no security settings")
+	return lxc.Security{}, errRuntimeKeepsNoSecurity
 }
+
+// errRuntimeKeepsNoSecurity is ContainerSecurity's answer from a runtime that
+// keeps no security settings: no conversion can be pending there.
+var errRuntimeKeepsNoSecurity = errors.New("this container runtime keeps no security settings")
 
 func (a *LXCRuntimeAdapter) ConvertContainerSecurity(ctx context.Context, name string, to lxc.ConvertOpts) error {
 	if sc, ok := a.Inner.(lxc.Securer); ok {
@@ -185,4 +190,69 @@ func (a *LXCRuntimeAdapter) RevertContainerConverting(ctx context.Context, name 
 func (a *LXCRuntimeAdapter) SubIDConflict(base, size int64) (string, bool) {
 	owner, hit := lxc.SubIDConflict(&lxc.IDMap{Base: base, Size: size})
 	return owner, hit
+}
+
+func lxcMounts(in []ContainerMountOpt) []lxc.Mount {
+	out := make([]lxc.Mount, 0, len(in))
+	for _, m := range in {
+		out = append(out, lxc.Mount{HostPath: m.HostPath, ContainerPath: m.ContainerPath, ReadWrite: m.ReadWrite})
+	}
+	return out
+}
+
+func lxcDevices(in []ContainerDeviceOpt) []lxc.Device {
+	out := make([]lxc.Device, 0, len(in))
+	for _, d := range in {
+		out = append(out, lxc.Device{HostPath: d.HostPath, ContainerPath: d.ContainerPath})
+	}
+	return out
+}
+
+// RebuildContainerConfig renders a container's config from what was
+// authorized (lxc.LxcRunner.RebuildConfig).
+func (a *LXCRuntimeAdapter) RebuildContainerConfig(_ context.Context, name string, cfg AuthorizedContainerConfig) ([]string, error) {
+	rb, ok := a.Inner.(interface {
+		RebuildConfig(name, confinement string, idmapBase int64, nics []lxc.NetworkAttach, mounts []lxc.Mount, devices []lxc.Device) ([]string, error)
+	})
+	if !ok {
+		return nil, errors.New("this container runtime cannot render a container's config")
+	}
+	return rb.RebuildConfig(name, cfg.Confinement, cfg.IDMapBase, LXCNICs(cfg), lxcMounts(cfg.Mounts), lxcDevices(cfg.Devices))
+}
+
+// ContainerConfigNICs are the bridge NICs name's config holds
+// (lxc.LxcRunner.ConfigNICs).
+func (a *LXCRuntimeAdapter) ContainerConfigNICs(name string) ([]lxc.NetworkAttach, error) {
+	rd, ok := a.Inner.(interface {
+		ConfigNICs(name string) ([]lxc.NetworkAttach, error)
+	})
+	if !ok {
+		return nil, errors.New("this container runtime cannot read a container's NICs from its config")
+	}
+	return rd.ConfigNICs(name)
+}
+
+// LXCNICs are the NICs a rebuild renders: nil (keep the config's network)
+// unless cfg.RenderNetwork, then exactly cfg.Networks (possibly none).
+func LXCNICs(cfg AuthorizedContainerConfig) []lxc.NetworkAttach {
+	if !cfg.RenderNetwork {
+		return nil
+	}
+	out := make([]lxc.NetworkAttach, 0, len(cfg.Networks))
+	for _, n := range cfg.Networks {
+		out = append(out, lxc.NetworkAttach{Name: n.Name, Bridge: n.Bridge, IP: n.IP, MAC: n.MAC, Veth: n.Veth, Gateway: n.Gateway})
+	}
+	return out
+}
+
+// SetContainerHostAccess records and renders a container's authorized host
+// access (lxc.LxcRunner.SetHostAccess).
+func (a *LXCRuntimeAdapter) SetContainerHostAccess(_ context.Context, name string, mounts []ContainerMountOpt, devices []ContainerDeviceOpt) error {
+	sh, ok := a.Inner.(interface {
+		SetHostAccess(name string, mounts []lxc.Mount, devices []lxc.Device) error
+	})
+	if !ok {
+		return errors.New("this container runtime cannot render host mounts")
+	}
+	return sh.SetHostAccess(name, lxcMounts(mounts), lxcDevices(devices))
 }

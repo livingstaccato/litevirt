@@ -46,7 +46,11 @@ func (s *Server) SetVMMemory(ctx context.Context, req *pb.SetVMMemoryRequest) (*
 	// (BeginVMOperation commits the desired memory_mib + claims the barrier), so a
 	// balloon and a coordinated resize can't race and the change is crash-recoverable.
 	// The coordinator owns the VM lock, re-reads under it, and enforces the band.
-	if s.operationProtocolActive(ctx) {
+	//
+	// A memory hot-add VM goes there too, latched or not: its memory above the
+	// boot cell is virtio-mem, which only the coordinator's apply plugs, and
+	// the direct path below would balloon instead.
+	if s.operationProtocolActive(ctx) || parseSpecOrNil(vm.Spec).GetMemoryHotplugMaxMib() > 0 {
 		if err := s.resizeVMLive(ctx, req.Name, &pb.VMSpec{MemoryMib: req.TargetMib}, req.IdempotencyKey); err != nil {
 			return nil, err
 		}

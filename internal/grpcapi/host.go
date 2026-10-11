@@ -534,6 +534,9 @@ func buildDrainPlacementRequest(vm corrosion.VMRecord, drainHost string, capacit
 	if err := json.Unmarshal([]byte(vm.Spec), spec); err != nil {
 		return placementReq
 	}
+	// A raw USB device binds the VM to the host being drained, so it has no
+	// target; a mapped one restricts it to the mapping's hosts.
+	applyUSBPlacement(&placementReq, spec, vm.HostName)
 	if p := spec.Placement; p != nil {
 		// Override PinHost — cannot pin to the host being drained.
 		if p.Host != "" && p.Host != drainHost {
@@ -660,7 +663,10 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 			break
 		}
 	}
-	if hostLocal {
+	// A VM with USB passthrough is never moved live (as on Proxmox VE): a
+	// mapped device is re-resolved on the target by the cold move, and a raw
+	// one has no target at all (placement keeps it on its host).
+	if hostLocal || len(parseSpecOrNil(fresh.Spec).GetUsbDevices()) > 0 {
 		return s.drainRunningVMCold(ctx, fresh, target, unlock, &adopted)
 	}
 

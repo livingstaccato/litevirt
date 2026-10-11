@@ -497,7 +497,19 @@ func buildFailoverPlacementRequest(vm corrosion.VMRecord, failedHost string, cap
 		return req
 	}
 	spec := &pb.VMSpec{}
-	if json.Unmarshal([]byte(vm.Spec), spec) != nil || spec.Placement == nil {
+	if json.Unmarshal([]byte(vm.Spec), spec) != nil {
+		return req
+	}
+	// USB passthrough: a mapped device restricts recovery to the hosts its
+	// mapping lists; a raw one is plugged into the failed host and no other,
+	// so the VM stays there (no candidate) rather than starting without it.
+	if mappings, raw := corrosion.USBMappingNames(spec); len(mappings) > 0 || raw {
+		req.USBMappings = mappings
+		if raw {
+			req.USBHost = vm.HostName
+		}
+	}
+	if spec.Placement == nil {
 		return req
 	}
 	p := spec.Placement
@@ -513,6 +525,16 @@ func buildFailoverPlacementRequest(vm corrosion.VMRecord, failedHost string, cap
 		req.MaxPerNode = int(p.MaxPerNode)
 	}
 	return req
+}
+
+// resolveUSBPlacement loads the hosts a recovering VM's USB mappings have a
+// device on, which SelectBatch cannot read itself. A read error leaves them
+// unresolved, and an unresolved mapping qualifies no host: the VM is not
+// recovered this pass rather than started where its device is not.
+func (c *Coordinator) resolveUSBPlacement(ctx context.Context, req *placement.Request) {
+	if err := placement.ResolveUSBMappingHosts(ctx, c.db, req); err != nil {
+		slog.Warn("failover: cannot read a VM's USB mappings; leaving it this pass (fail closed)", "vm", req.VMName, "error", err)
+	}
 }
 
 // now is the coordinator's clock — defaults to time.Now, overridable
@@ -2865,6 +2887,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 			if corrosion.VMStoppedForFailover(vm) {
 				if c.stoppedVMRekeyable(ctx, h.Name, vm, disks, fenceEpoch) {
 					req := buildFailoverPlacementRequest(vm, h.Name, c.capacity, pinDown)
+					c.resolveUSBPlacement(ctx, &req)
 					req.RequireRegion = c.vmRecoveryRegion(h.Name, vm)
 					placementReqs = append(placementReqs, req)
 					plans = append(plans, failoverPlan{vm: vm, needsPlacement: true, rekeyStopped: true})
@@ -3043,6 +3066,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 
 		if targetName == "" {
 			req := buildFailoverPlacementRequest(vm, h.Name, c.capacity, pinDown)
+			c.resolveUSBPlacement(ctx, &req)
 			if pin := vmSpecPin(vm); pin != "" && pin != h.Name && req.PinHost == "" {
 				slog.Warn("failover: the VM's pinned host is down; recovering it elsewhere for this outage, its pin unchanged",
 					"vm", vm.Name, "pinned_host", pin, "pinned_host_state", hostState[pin], "from", h.Name)

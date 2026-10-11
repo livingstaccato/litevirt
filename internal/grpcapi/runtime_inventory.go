@@ -242,7 +242,9 @@ func (s *Server) collectRuntimeInventory(ctx context.Context) runtimeInventory {
 				fail("domain %s xml: %v", n, err)
 			} else {
 				w.CPU = lv.CurrentVCPUFromXML(xmlDef)
-				w.MemoryMiB = lv.CurrentMemoryMiBFromXML(xmlDef)
+				// A hot-add domain holds its boot cell plus what is plugged
+				// (the larger of requested and actual), not its whole region.
+				w.MemoryMiB = lv.HeldMemoryMiBFromXML(xmlDef)
 			}
 			w.OwnerEpochMarker, w.MarkerStatus = s.readVMMarker(n)
 			if w.MarkerStatus == MarkerUnreadable {

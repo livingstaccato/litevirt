@@ -655,3 +655,26 @@ func TestCheckMigrationNetworkAtStart(t *testing.T) {
 		}
 	}
 }
+
+// A host must not start with a bind-mount prefix that is, lies in or
+// contains a protected tree, nor a device entry that is a directory.
+func TestLoadConfig_RefusesUnsafeContainerHostAccess(t *testing.T) {
+	for _, extra := range []string{
+		"containers:\n  bind_mount_paths: [\"/\"]\n",
+		"containers:\n  bind_mount_paths: [\"/var\"]\n",
+		"containers:\n  bind_mount_paths: [\"/tmp/data/x\"]\n", // inside data_dir
+		"containers:\n  device_paths: [\"/dev\"]\n",
+		"containers:\n  device_paths: [\"/dev/mem\"]\n",
+	} {
+		dir := t.TempDir()
+		configPath := filepath.Join(dir, "config.yaml")
+		yaml := "host_name: \"test-host\"\npki_dir: /tmp/pki\ndata_dir: /tmp/data\n" + extra
+		if err := os.WriteFile(configPath, []byte(yaml), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("LITEVIRT_CONFIG", configPath)
+		if _, err := LoadConfig(); err == nil {
+			t.Errorf("LoadConfig accepted %q", extra)
+		}
+	}
+}

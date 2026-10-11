@@ -572,6 +572,15 @@ message UpdateVMRequest    { string name = 1; int32 cpu = 2;
     // allow_overcommit skips HOST capacity admission for a --restart-if-needed
     // reconfigure that GROWS the VM (project quota still applies). Audited.
     bool allow_overcommit = 22;
+
+    // usb_devices replaces the VM's USB passthrough list when set_usb_devices is
+    // true (an empty list with set_usb_devices clears it). A redefine-class
+    // change: the VM must be stopped, or pass allow_restart.
+    repeated USBDeviceSpec usb_devices = 40;
+    bool set_usb_devices = 41;
+    // memory_hotplug_max_mib sets the virtio-mem hot-add ceiling (0 turns
+    // hot-add off). Redefine-class, like usb_devices.
+    optional int32 memory_hotplug_max_mib = 42;
 }
 // SetVMMemory (#4) sets the running balloon target (and persists it). target_mib
 // must be within [min_memory_mib, max_memory_mib] of the VM's spec; a live VM is
@@ -1230,6 +1239,8 @@ message Container {
     bool privileged     = 12;
     string confinement  = 13;    // "default" | "legacy"
     int64 idmap_base    = 14;    // first host id of its range (unprivileged only)
+    repeated ContainerMount  mounts  = 30;  // host bind mounts recorded at create
+    repeated ContainerDevice devices = 31;  // host devices recorded at create
 }
 
 message ContainerNetwork {
@@ -1270,6 +1281,30 @@ message CreateContainerRequest {
     // list) or "legacy" (the generated profile with nesting, as earlier
     // builds wrote; admin only). Empty means "default".
     string confinement = 17;
+    // mounts bind-mounts host paths into the container and devices passes host
+    // device nodes through (Proxmox mpN / devN). Both require the admin role,
+    // and each host path must resolve, on the host, under a prefix that host's
+    // containers.bind_mount_paths / containers.device_paths allows. Refused
+    // until release_2026_11_v1 has latched (feature usb_mounts_memory).
+    repeated ContainerMount  mounts  = 30;
+    repeated ContainerDevice devices = 31;
+}
+
+// ContainerMount bind-mounts a host path into a container. Read-only unless
+// read_write is set; nosuid and nodev always. The host path is resolved on the
+// host (symlinks followed) and must stay under an allowed prefix, and it is
+// checked again at every start.
+message ContainerMount {
+    string host_path      = 1;
+    string container_path = 2;  // absolute path inside the container
+    bool   read_write     = 3;
+}
+
+// ContainerDevice passes one host device node (character or block) into a
+// container: the node is bind-mounted and the cgroup allows its major:minor.
+message ContainerDevice {
+    string host_path      = 1;  // e.g. /dev/ttyUSB0
+    string container_path = 2;  // "" = the same path inside the container
 }
 
 // PrepareContainerTargetRequest is a migrate's preflight on the TARGET (peer
@@ -1293,6 +1328,12 @@ message ConvertContainerRequest {
     string name = 2;
     bool unprivileged = 3;
     string confinement = 4;
+    // set_host_access replaces the container's host bind mounts and device
+    // nodes with mounts/devices (empty clears them): how an admin re-applies
+    // what a restore did not carry. Adding any needs the admin role.
+    bool set_host_access = 5;
+    repeated ContainerMount  mounts  = 6;
+    repeated ContainerDevice devices = 7;
 }
 
 message StartContainerRequest  { string host_name = 1; string name = 2; }
@@ -1402,6 +1443,16 @@ message RestoreContainerRequest {
     string owner_id               = 8;
     string restored_from_owner_id = 9;
     string restored_from_ts       = 10;
+    // source_create_spec is the moving container's create spec as the peer
+    // that drives a move read it off the container's row: the cold migrate's
+    // source (its own row) or the failover coordinator (the row it marked).
+    // A peer move takes the container's NICs, host mounts and devices and
+    // privilege from that row, never from the archive, and the target's own
+    // replica need not have the row yet. Honoured only on a peer move (a
+    // verified migrate-from, or a peer relocation); any other restore
+    // ignores it. Empty (an earlier build, or a row with no spec) = the
+    // target reads the row from its own replica.
+    string source_create_spec = 11;
 }
 
 message RestoreContainerProgress {
@@ -1660,6 +1711,13 @@ message CloneContainerRequest {
     string host_name = 3;  // source's host; empty = resolve by name
     string project   = 4;  // clone's tenancy project; empty = source's
     bool   start     = 5;  // start the clone after creation
+    // The entry node's ruling that the caller may not hold a privileged mode
+    // or legacy confinement (not an admin): the clone lands unprivileged, in
+    // an id range of its own with its files shifted, with default
+    // confinement, and is audited. Set by the node the caller reached before
+    // it forwards, since the source's host sees only the peer. Setting it
+    // can only lower what the clone holds.
+    bool   unprivileged = 6;
 }
 
 // FirewallStatus is the post-Reconcile snapshot the daemon hands back
@@ -1938,7 +1996,9 @@ message ListResourceMappingsRequest  {}
 message ListResourceMappingsResponse { repeated ResourceMapping mappings = 1; }
 message DeleteResourceMappingRequest { string name = 1; }
 // AddMappingDevice registers one host's concrete device under a mapping.
-// host empty = caller's host. address is the PCI address on that host.
+// host empty = caller's host. address is the PCI address on that host, or a
+// USB device as "usb:<vendor>:<product>" or "usb:<bus>-<port>[.<port>...]".
+// A mapping holds PCI devices or USB devices, never both.
 message AddMappingDeviceRequest {
     string mapping = 1;
     string host    = 2;

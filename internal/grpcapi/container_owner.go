@@ -158,30 +158,38 @@ func timestampAtOrBefore(a, b string) bool {
 	return !ta.After(tb)
 }
 
-// relocationLineage is a relocating container's lineage as its failover
-// coordinator read it off the row it marked: its owner_id and any
-// restored-from parent. The coordinator sends it in the restore request,
-// because the target's own replica need not have seen the mark yet.
+// relocationLineage is a moving container's lineage as the peer that drives
+// the move read it off the container's row: its owner_id and any
+// restored-from parent, and the row's whole create spec (sourceSpec), which
+// is what authorizes the moved container's NICs, host access and privilege.
+// The peer sends them in the restore request, because the target's own
+// replica need not have seen the row (or the coordinator's mark) yet. A cold
+// migrate sends only the spec: the backup it restores is the container's
+// own, just taken.
 type relocationLineage struct {
 	ownerID, restoredFromOwnerID, restoredFromTS string
+	sourceSpec                                   string
 }
 
-// relocationLineageOf is row's lineage; none for a nil row (the backup was
-// picked by name) or a row that records no owner_id.
+// relocationLineageOf is row's lineage and spec; none for a nil row (the
+// backup was picked by name), and no lineage for a row that records no
+// owner_id.
 func relocationLineageOf(row *corrosion.ContainerRecord) relocationLineage {
 	if row == nil {
 		return relocationLineage{}
 	}
 	cs := corrosion.DecodeCreateSpec(row.CreateSpec)
 	if cs.OwnerID == "" {
-		return relocationLineage{}
+		return relocationLineage{sourceSpec: row.CreateSpec}
 	}
-	return relocationLineage{cs.OwnerID, cs.RestoredFromOwnerID, cs.RestoredFromTS}
+	return relocationLineage{ownerID: cs.OwnerID, restoredFromOwnerID: cs.RestoredFromOwnerID, restoredFromTS: cs.RestoredFromTS, sourceSpec: row.CreateSpec}
 }
 
-// on sets the lineage on a restore request, and returns it.
+// on sets the lineage and the source spec on a restore request, and returns
+// it.
 func (l relocationLineage) on(req *pb.RestoreContainerRequest) *pb.RestoreContainerRequest {
 	req.OwnerId, req.RestoredFromOwnerId, req.RestoredFromTs = l.ownerID, l.restoredFromOwnerID, l.restoredFromTS
+	req.SourceCreateSpec = l.sourceSpec
 	return req
 }
 
@@ -208,7 +216,7 @@ func (l relocationLineage) withLineage(createSpec string) string {
 //   - the manifest, as before owner records, when neither is there (WARN).
 func (s *Server) relocatedLineage(ctx context.Context, req *pb.RestoreContainerRequest, createSpec string) string {
 	if req.GetOwnerId() != "" {
-		return relocationLineage{req.GetOwnerId(), req.GetRestoredFromOwnerId(), req.GetRestoredFromTs()}.withLineage(createSpec)
+		return relocationLineage{ownerID: req.GetOwnerId(), restoredFromOwnerID: req.GetRestoredFromOwnerId(), restoredFromTS: req.GetRestoredFromTs()}.withLineage(createSpec)
 	}
 	token := relocateTokenFromMD(ctx)
 	if token == "" && req.Proof != nil {

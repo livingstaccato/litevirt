@@ -1205,10 +1205,17 @@ func (s *Server) deleteVMWithFanout(ctx context.Context, m stackMember, keepDisk
 
 		// NotFound — fan out to peers (replication lag).
 		if code == codes.NotFound {
-			if peerErr := s.fanoutDeleteVM(ctx, vmName, stackName, keepDisks); peerErr == nil {
+			peerErr := s.fanoutDeleteVM(ctx, vmName, stackName, keepDisks)
+			switch {
+			case peerErr == nil:
 				return nil
-			} else if errors.Is(peerErr, errNotStackMember) {
+			case errors.Is(peerErr, errNotStackMember):
 				return peerErr
+			case errors.Is(peerErr, errNoPeerHasVM) && s.vmAlreadyDeleted(ctx, vmName):
+				// Deleted before the teardown reached it (lv rm --force): it
+				// is removed, and the stack's teardown goes on.
+				slog.Info("stack delete: member was already deleted", "stack", stackName, "vm", vmName)
+				return nil
 			}
 			return err
 		}
@@ -1235,6 +1242,20 @@ func (s *Server) deleteVMWithFanout(ctx context.Context, m stackMember, keepDisk
 	}
 
 	return err
+}
+
+// vmAlreadyDeleted reports a VM that was deleted: this host has no live row
+// of the name and does have its tombstone. With every active peer answering
+// that it has no such VM (errNoPeerHasVM), that is the proof a stack teardown
+// takes it as removed. A name with no row at all — one never made, or one a
+// peer made that has not replicated — is not proven gone, and is left to the
+// reconciler as before.
+func (s *Server) vmAlreadyDeleted(ctx context.Context, vmName string) bool {
+	if live, err := corrosion.GetVM(ctx, s.db, vmName); err != nil || live != nil {
+		return false
+	}
+	dead, err := corrosion.GetDeletedVM(ctx, s.db, vmName)
+	return err == nil && dead != nil
 }
 
 // stackMember is a stack's VM as the teardown saw it: its name, the stack
@@ -1305,6 +1326,11 @@ func (s *Server) stackNetworkUsers(ctx context.Context, network, stack string, k
 // create. The stack leaves it alone.
 var errNotStackMember = errors.New("not created by this stack; left alone")
 
+// errNoPeerHasVM: every active peer was asked and answered that it has no VM
+// of that name. A peer that could not be reached was not, and leaves the
+// plain not-found error instead.
+var errNoPeerHasVM = errors.New("not found on any peer")
+
 // fanoutDeleteVM tries to delete a VM on all peer hosts (for replication-lag
 // cases). A peer's VM of that name is deleted only when the peer's record of
 // it names stackName: the name alone is not the stack's VM.
@@ -1315,12 +1341,14 @@ func (s *Server) fanoutDeleteVM(ctx context.Context, vmName, stackName string, k
 		return listErr
 	}
 
+	unasked := 0
 	for _, h := range hosts {
 		if h.Name == s.hostName || h.State != "active" {
 			continue
 		}
 		client, conn, peerErr := s.peerClient(ctx, h.Name)
 		if peerErr != nil {
+			unasked++
 			continue
 		}
 		peerVM, peerErr := client.InspectVM(ctx, &pb.InspectVMRequest{Name: vmName})
@@ -1358,6 +1386,9 @@ func (s *Server) fanoutDeleteVM(ctx context.Context, vmName, stackName string, k
 		}
 	}
 
+	if unasked == 0 {
+		return fmt.Errorf("VM %q: %w", vmName, errNoPeerHasVM)
+	}
 	return fmt.Errorf("VM %q not found on any peer", vmName)
 }
 

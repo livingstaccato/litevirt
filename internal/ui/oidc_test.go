@@ -3,12 +3,14 @@ package ui
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -399,16 +401,25 @@ func TestOIDCUI_APlainCookieUnlocksOnlyItsOwnRealm(t *testing.T) {
 	m.redirects = map[string]string{"oidc:dev": "http://127.0.0.1:7445/oidc/callback", "oidc:corp": "https://node-1:7445/oidc/callback"}
 	m.flowRealm = "oidc:corp"
 	m.loginResp = &pb.LoginResponse{Token: "lvs_attacker", Username: "mallory", ExpiresAt: "2099-01-01T00:00:00Z"}
-	serve(s, httptest.NewRequest("GET", "/oidc/login?realm=oidc:dev", nil)) // the node learns oidc:dev is plain http
+	// The node learns oidc:dev is plain http. Unless this begin succeeds, the
+	// planted plain cookie is dropped and the test proves nothing (re-review
+	// 3, m1).
+	w := serve(s, httptest.NewRequest("GET", "/oidc/login?realm=oidc:dev", nil))
+	if c := cookieNamed(w, oidcFlowCookieName); w.Code != http.StatusFound || c == nil || c.Secure {
+		t.Fatalf("setup: begin oidc:dev answered %d with flow cookie %+v, want 302 and a plain cookie", w.Code, c)
+	}
 	r := httptest.NewRequest("GET", "/oidc/callback?code=c&state=st-1", nil)
 	r.AddCookie(&http.Cookie{Name: oidcFlowCookieName, Value: mockBinding + ".b2lkYzpkZXY"}) // "oidc:dev"
 	m.logins = nil
-	w := serve(s, r)
+	w = serve(s, r)
 	if cookieNamed(w, sessionCookieName) != nil {
 		t.Fatal("a plain cookie naming the http realm unlocked the https realm's flow")
 	}
-	sawCorp := false
+	sawCorp, devGotBinding := false, false
 	for _, l := range m.logins {
+		if l.Realm == "oidc:dev" && l.OidcBinding == mockBinding {
+			devGotBinding = true // the plain cookie was accepted, for its own realm
+		}
 		if l.Realm == "oidc:corp" {
 			sawCorp = true
 			if l.OidcBinding != "" {
@@ -419,11 +430,16 @@ func TestOIDCUI_APlainCookieUnlocksOnlyItsOwnRealm(t *testing.T) {
 	if !sawCorp {
 		t.Fatal("the https realm's flow was not handed to the daemon to be burned")
 	}
+	if !devGotBinding {
+		t.Fatalf("setup: the plain cookie's binding never reached its own realm (logins %+v), so the test proves nothing", m.logins)
+	}
 }
 
-// TestOIDCUI_WarnsOnForwardingFromAnUnlistedPeer (re-review 2, M2): a sign-in
-// with X-Forwarded-For from a peer not in trusted_proxies is logged, at most
-// once per interval; a listed proxy is not.
+// TestOIDCUI_WarnsOnForwardingFromAnUnlistedPeer (re-review 2, M2; re-review
+// 3, m2): a sign-in with X-Forwarded-For from a peer not in trusted_proxies is
+// logged, at most once per interval PER PEER; a listed proxy is not. The
+// limiter is per peer, so a client that reaches the UI directly and sends the
+// header cannot spend the warning a misconfigured proxy would raise.
 func TestOIDCUI_WarnsOnForwardingFromAnUnlistedPeer(t *testing.T) {
 	s, _ := newOIDCUI(t)
 	var logs bytes.Buffer
@@ -436,17 +452,73 @@ func TestOIDCUI_WarnsOnForwardingFromAnUnlistedPeer(t *testing.T) {
 		r.Header.Set("X-Forwarded-For", "198.51.100.7")
 		serve(s, r)
 	}
-	begin("10.0.0.5:4000")
-	begin("10.0.0.5:4000")
-	if n := strings.Count(logs.String(), "not in trusted_proxies"); n != 1 {
-		t.Fatalf("%d warnings for two sign-ins from an unlisted proxy, want 1 (rate-limited)", n)
+	warned := func(peer string) int {
+		return strings.Count(logs.String(), "peer="+peer+"\n")
 	}
+	begin("10.0.0.5:4000")
+	begin("10.0.0.5:4001")
+	if n := warned("10.0.0.5"); n != 1 {
+		t.Fatalf("%d warnings for two sign-ins from an unlisted proxy, want 1 (rate-limited)\n%s", n, logs.String())
+	}
+
+	// An attacker reaching the UI directly takes its own warning, as often
+	// as it likes, and from as many addresses as it likes; the proxy is
+	// still named.
+	for i := 0; i < 3*untrustedForwardWarnPeers; i++ {
+		begin(fmt.Sprintf("192.0.2.%d:5555", i%(2*untrustedForwardWarnPeers)+1))
+	}
+	begin("10.0.0.6:4000")
+	if warned("192.0.2.1") == 0 || warned("10.0.0.6") != 1 {
+		t.Fatalf("a direct client's forwarding hid a misconfigured proxy's warning:\n%s", logs.String())
+	}
+	if n := s.untrustedForwardWarns.len(); n > untrustedForwardWarnPeers {
+		t.Fatalf("the warning limiter holds %d peers, want at most %d", n, untrustedForwardWarnPeers)
+	}
+
 	logs.Reset()
 	p, _ := auth.ParseTrustedProxies([]string{"10.0.0.0/8"})
 	s.SetTrustedProxies(p)
-	s.lastUntrustedForwardWarn.Store(0)
-	begin("10.0.0.5:4000")
+	begin("10.0.0.77:4000") // never warned about, so only the listing silences it
 	if strings.Contains(logs.String(), "not in trusted_proxies") {
 		t.Fatal("warned about a listed proxy")
+	}
+}
+
+// TestUntrustedForwardWarns_PerPeerWindowAndLRU: one warning per peer per
+// window, measured on the monotonic clock; the set is bounded, and a full
+// set forgets the least recently seen peer.
+func TestUntrustedForwardWarns_PerPeerWindowAndLRU(t *testing.T) {
+	var l untrustedForwardWarns
+	t0 := time.Now()
+	if !l.allow("a", t0) || l.allow("a", t0.Add(untrustedForwardWarnEvery-time.Second)) {
+		t.Fatal("a peer was warned about twice inside one window")
+	}
+	if !l.allow("a", t0.Add(untrustedForwardWarnEvery)) {
+		t.Fatal("a peer was not warned about again after the window")
+	}
+	if !l.allow("b", t0) {
+		t.Fatal("another peer's warning was suppressed by the first peer's")
+	}
+	// Fill the set from scratch, oldest first; p0 is then seen again, so p1
+	// is the least recently seen and a new peer evicts it, not p0.
+	var l2 untrustedForwardWarns
+	t1 := t0.Add(time.Hour)
+	for i := 0; i < untrustedForwardWarnPeers; i++ {
+		l2.allow(fmt.Sprintf("p%d", i), t1.Add(time.Duration(i)*time.Millisecond))
+	}
+	if l2.allow("p0", t1.Add(time.Second)) {
+		t.Fatal("a peer still in the set was warned about again inside its window")
+	}
+	if !l2.allow("new", t1.Add(2*time.Second)) {
+		t.Fatal("a new peer was not warned about when the set was full")
+	}
+	if n := l2.len(); n != untrustedForwardWarnPeers {
+		t.Fatalf("the set holds %d peers, want its bound %d", n, untrustedForwardWarnPeers)
+	}
+	if l2.allow("p0", t1.Add(3*time.Second)) {
+		t.Fatal("the most recently seen peer was evicted instead of the least recently seen")
+	}
+	if !l2.allow("p1", t1.Add(3*time.Second)) {
+		t.Fatal("the least recently seen peer was kept when the set was full")
 	}
 }

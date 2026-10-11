@@ -398,25 +398,41 @@ func TestOIDCBeginFlow_ASpreadFloodCannotTargetASharedAddress(t *testing.T) {
 	}
 }
 
-// TestOIDCBeginFlow_TiesEvictTheNewest (re-review 2, R1): when the networks
-// tie, the one whose newest flow is the newest loses its oldest flow — a
-// flood hopping across networks one flow at a time evicts itself, not the
-// victim who began first.
-func TestOIDCBeginFlow_TiesEvictTheNewest(t *testing.T) {
-	r, idp := newFlowRealm(t, nil)
-	r.maxFlows = 2
-	victim, err := r.BeginFlow(OIDCClientWeb, "203.0.113.1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for i := 0; i < 50; i++ {
-		time.Sleep(time.Millisecond)
-		if _, err := r.BeginFlow(OIDCClientWeb, fmt.Sprintf("10.%d.0.1", i)); err != nil {
+// TestOIDCBeginFlow_ANewcomerSurvivesATableTurnover (re-review 3, I1): an
+// attacker holding at least maxFlows networks keeps every network at one
+// flow, so every choice is a tie. Ties go to the network whose newest flow is
+// the OLDEST, so a newcomer begun into such a full realm is evicted only after
+// the whole table has turned over — it survives the next maxFlows-1 begins
+// from other new networks. ("Newest loses" evicted it on the very next begin.)
+func TestOIDCBeginFlow_ANewcomerSurvivesATableTurnover(t *testing.T) {
+	for name, addr := range map[string]func(int) string{
+		"ipv4 /24s": func(i int) string { return fmt.Sprintf("10.%d.%d.1", i/250, i%250) },
+		"ipv6 /48s": func(i int) string { return fmt.Sprintf("2001:db8:%x::1", i) },
+	} {
+		r, idp := newFlowRealm(t, nil)
+		r.maxFlows = 64
+		next := 0
+		for ; next < r.maxFlows; next++ { // the realm is full of single-flow networks
+			if _, err := r.BeginFlow(OIDCClientWeb, addr(next)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		victim, err := r.BeginFlow(OIDCClientWeb, "203.0.113.1")
+		if err != nil {
 			t.Fatal(err)
 		}
-	}
-	if !redeemable(t, r, idp, victim) {
-		t.Fatal("a tie was broken against the oldest flow")
+		for i := 0; i < r.maxFlows-1; i++ {
+			if _, err := r.BeginFlow(OIDCClientWeb, addr(next)); err != nil {
+				t.Fatalf("%s: begin %d: %v", name, i, err)
+			}
+			next++
+		}
+		if n := len(r.stateStore); n != r.maxFlows {
+			t.Fatalf("%s: the realm holds %d flows, want its bound %d", name, n, r.maxFlows)
+		}
+		if !redeemable(t, r, idp, victim) {
+			t.Fatalf("%s: a newcomer's sign-in did not survive one turnover of a realm full of tied networks", name)
+		}
 	}
 	if a, b := flowAggregate("192.0.2.77"), flowAggregate("2001:db8:abcd:12::/64"); a != "192.0.2.0/24" || b != "2001:db8:abcd::/48" {
 		t.Fatalf("aggregates %q %q", a, b)

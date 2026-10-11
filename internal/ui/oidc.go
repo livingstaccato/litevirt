@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -187,29 +188,84 @@ func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 	s.finishLogin(w, r, resp)
 }
 
-// untrustedForwardWarnEvery rate-limits warnUntrustedForwarding.
-const untrustedForwardWarnEvery = 10 * time.Minute
+// untrustedForwardWarnEvery is how often warnUntrustedForwarding names one
+// peer; untrustedForwardWarnPeers is how many peers it remembers.
+const (
+	untrustedForwardWarnEvery = 10 * time.Minute
+	untrustedForwardWarnPeers = 16
+)
 
-// warnUntrustedForwarding logs, at most once per untrustedForwardWarnEvery,
-// that a sign-in arrived with X-Forwarded-For from a peer not listed in
-// trusted_proxies (re-review 2, M2): a proxy in front of the UI that is not
-// listed makes every browser share the proxy's per-address bound. The
+// untrustedForwardWarns rate-limits warnUntrustedForwarding per peer (re-review
+// 3, m2): one window per peer, so a client reaching the UI directly that sends
+// X-Forwarded-For spends only its own warning, never a misconfigured proxy's.
+// It remembers at most untrustedForwardWarnPeers peers and, when full, forgets
+// the least recently seen. A forgotten peer is warned about again, so the
+// worst a flood of peers does is log more, never hide a peer. Windows are
+// measured on the monotonic clock, so a wall-clock step neither extends nor
+// shortens them. The zero value is ready to use.
+type untrustedForwardWarns struct {
+	mu    sync.Mutex
+	peers map[string]*forwardWarnPeer
+}
+
+type forwardWarnPeer struct {
+	warned time.Time // when this peer was last warned about
+	seen   time.Time // when this peer was last seen (LRU order)
+}
+
+// allow reports whether peer should be warned about at now, and records it.
+func (l *untrustedForwardWarns) allow(peer string, now time.Time) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if p, ok := l.peers[peer]; ok {
+		p.seen = now
+		if now.Sub(p.warned) < untrustedForwardWarnEvery {
+			return false
+		}
+		p.warned = now
+		return true
+	}
+	if l.peers == nil {
+		l.peers = map[string]*forwardWarnPeer{}
+	}
+	if len(l.peers) >= untrustedForwardWarnPeers {
+		var lru string
+		var at time.Time
+		found := false
+		for k, p := range l.peers {
+			if !found || p.seen.Before(at) {
+				lru, at, found = k, p.seen, true
+			}
+		}
+		delete(l.peers, lru)
+	}
+	l.peers[peer] = &forwardWarnPeer{warned: now, seen: now}
+	return true
+}
+
+// len is how many peers are remembered.
+func (l *untrustedForwardWarns) len() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.peers)
+}
+
+// warnUntrustedForwarding logs, at most once per untrustedForwardWarnEvery for
+// each peer, that a sign-in arrived with X-Forwarded-For from a peer not
+// listed in trusted_proxies (re-review 2, M2): a proxy in front of the UI that
+// is not listed makes every browser share the proxy's per-address bound. The
 // header itself is never believed from such a peer.
 func (s *Server) warnUntrustedForwarding(r *http.Request) {
 	if r.Header.Get("X-Forwarded-For") == "" || auth.PeerTrusted(r, s.trustedProxies) {
 		return
 	}
-	now := time.Now().UnixNano()
-	last := s.lastUntrustedForwardWarn.Load()
-	if last != 0 && now-last < int64(untrustedForwardWarnEvery) {
-		return
-	}
-	if !s.lastUntrustedForwardWarn.CompareAndSwap(last, now) {
+	peer := auth.ClientAddress(r, nil)
+	if !s.untrustedForwardWarns.allow(peer, time.Now()) {
 		return
 	}
 	slog.Warn("an OIDC sign-in arrived with X-Forwarded-For from a peer not in trusted_proxies: the header is "+
 		"ignored, so every browser behind that proxy shares its address's bound of in-progress sign-ins. If the "+
-		"peer is your reverse proxy, list it in trusted_proxies", "peer", auth.ClientAddress(r, nil))
+		"peer is your reverse proxy, list it in trusted_proxies (see docs/auth.md)", "peer", peer)
 }
 
 // oidcStateUnknown reports a refusal because the realm holds no such flow.

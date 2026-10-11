@@ -126,6 +126,7 @@ const (
 	LiteVirt_LBKeepalivedRunning_FullMethodName        = "/litevirt.v1.LiteVirt/LBKeepalivedRunning"
 	LiteVirt_Login_FullMethodName                      = "/litevirt.v1.LiteVirt/Login"
 	LiteVirt_ListRealms_FullMethodName                 = "/litevirt.v1.LiteVirt/ListRealms"
+	LiteVirt_BeginOIDCLogin_FullMethodName             = "/litevirt.v1.LiteVirt/BeginOIDCLogin"
 	LiteVirt_Logout_FullMethodName                     = "/litevirt.v1.LiteVirt/Logout"
 	LiteVirt_ListSessions_FullMethodName               = "/litevirt.v1.LiteVirt/ListSessions"
 	LiteVirt_RevokeSession_FullMethodName              = "/litevirt.v1.LiteVirt/RevokeSession"
@@ -518,6 +519,9 @@ type LiteVirtClient interface {
 	// ── Users & Auth ──
 	Login(ctx context.Context, in *LoginRequest, opts ...grpc.CallOption) (*LoginResponse, error)
 	ListRealms(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*ListRealmsResponse, error)
+	// BeginOIDCLogin is pre-session (no bearer): it only starts a flow; Login
+	// completes it on the same node.
+	BeginOIDCLogin(ctx context.Context, in *BeginOIDCLoginRequest, opts ...grpc.CallOption) (*BeginOIDCLoginResponse, error)
 	Logout(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	ListSessions(ctx context.Context, in *ListSessionsRequest, opts ...grpc.CallOption) (*ListSessionsResponse, error)
 	RevokeSession(ctx context.Context, in *RevokeSessionRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
@@ -2220,6 +2224,16 @@ func (c *liteVirtClient) ListRealms(ctx context.Context, in *emptypb.Empty, opts
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListRealmsResponse)
 	err := c.cc.Invoke(ctx, LiteVirt_ListRealms_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) BeginOIDCLogin(ctx context.Context, in *BeginOIDCLoginRequest, opts ...grpc.CallOption) (*BeginOIDCLoginResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(BeginOIDCLoginResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_BeginOIDCLogin_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -4656,6 +4670,9 @@ type LiteVirtServer interface {
 	// ── Users & Auth ──
 	Login(context.Context, *LoginRequest) (*LoginResponse, error)
 	ListRealms(context.Context, *emptypb.Empty) (*ListRealmsResponse, error)
+	// BeginOIDCLogin is pre-session (no bearer): it only starts a flow; Login
+	// completes it on the same node.
+	BeginOIDCLogin(context.Context, *BeginOIDCLoginRequest) (*BeginOIDCLoginResponse, error)
 	Logout(context.Context, *emptypb.Empty) (*emptypb.Empty, error)
 	ListSessions(context.Context, *ListSessionsRequest) (*ListSessionsResponse, error)
 	RevokeSession(context.Context, *RevokeSessionRequest) (*emptypb.Empty, error)
@@ -5474,6 +5491,9 @@ func (UnimplementedLiteVirtServer) Login(context.Context, *LoginRequest) (*Login
 }
 func (UnimplementedLiteVirtServer) ListRealms(context.Context, *emptypb.Empty) (*ListRealmsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListRealms not implemented")
+}
+func (UnimplementedLiteVirtServer) BeginOIDCLogin(context.Context, *BeginOIDCLoginRequest) (*BeginOIDCLoginResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method BeginOIDCLogin not implemented")
 }
 func (UnimplementedLiteVirtServer) Logout(context.Context, *emptypb.Empty) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method Logout not implemented")
@@ -7852,6 +7872,24 @@ func _LiteVirt_ListRealms_Handler(srv interface{}, ctx context.Context, dec func
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).ListRealms(ctx, req.(*emptypb.Empty))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_BeginOIDCLogin_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(BeginOIDCLoginRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).BeginOIDCLogin(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_BeginOIDCLogin_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).BeginOIDCLogin(ctx, req.(*BeginOIDCLoginRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -11797,6 +11835,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ListRealms",
 			Handler:    _LiteVirt_ListRealms_Handler,
+		},
+		{
+			MethodName: "BeginOIDCLogin",
+			Handler:    _LiteVirt_BeginOIDCLogin_Handler,
 		},
 		{
 			MethodName: "Logout",

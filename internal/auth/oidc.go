@@ -2,8 +2,17 @@ package auth
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"slices"
 	"sync"
 	"time"
 
@@ -27,8 +36,19 @@ type OIDCConfig struct {
 	ClientID     string
 	ClientSecret string
 
-	// RedirectURL is litevirt's UI callback URL the IdP must whitelist.
+	// RedirectURL is litevirt's UI callback URL the IdP must whitelist. It
+	// is per node: the callback must reach the node that began the login,
+	// because that node alone holds the flow's state, verifier and nonce.
 	RedirectURL string
+
+	// CLIRedirectURL is the loopback URL `lv login --realm oidc:<name>`
+	// listens on (RFC 8252 §7.3), e.g. http://127.0.0.1:18765/oidc/callback.
+	// Empty: the CLI flow is off for this realm. The IdP must list it too.
+	CLIRedirectURL string
+
+	// CAFile is a PEM bundle the IdP's certificate must chain to. Empty:
+	// the system trust store. Never "skip verification".
+	CAFile string
 
 	// Scopes always includes "openid"; "profile email groups" are added so
 	// SyncGroups can populate Principal.Groups.
@@ -73,9 +93,14 @@ type OIDCRealm struct {
 	nameClaim    string
 	subjectClaim string
 
+	// httpClient talks to the IdP (discovery, JWKS, token endpoint). Nil:
+	// the default client and the system trust store.
+	httpClient *http.Client
+
 	mu          sync.Mutex
 	stateStore  map[string]oidcFlow // in-flight auth-code flows; cleaned on use or expiry
 	stateExpiry time.Duration
+	maxFlows    int
 }
 
 // oidcFlow is the server-side state for one in-flight authorization-code
@@ -89,10 +114,50 @@ type OIDCRealm struct {
 //     intercepted authorization code is useless without it (RFC 7636).
 //   - nonce must echo back in the ID token's `nonce` claim, binding the token
 //     to this login and defeating ID-token replay/injection (OIDC core §3.1.2).
+//   - redirect is the redirect_uri the flow was begun with; the token
+//     exchange replays exactly that one (RFC 6749 §4.1.3), and a callback
+//     naming another is refused.
 type oidcFlow struct {
 	expiry   time.Time
 	verifier string
 	nonce    string
+	redirect string
+}
+
+// OIDC flow clients: which configured redirect a flow returns to.
+const (
+	// OIDCClientWeb returns to RedirectURL, the node's web UI callback.
+	OIDCClientWeb = "web"
+	// OIDCClientCLI returns to CLIRedirectURL, the CLI's loopback listener.
+	OIDCClientCLI = "cli"
+)
+
+// defaultMaxOIDCFlows bounds the in-flight flows one realm holds. Beginning a
+// flow needs no credential, so without a bound anyone who can reach the node
+// could grow this map for the length of the state expiry.
+const defaultMaxOIDCFlows = 4096
+
+// ErrOIDCFlowUnknown: the callback's state names no flow this node holds — it
+// was never begun here, it expired, or it was already used. It wraps
+// ErrInvalidCredentials, so callers that only know that error still refuse.
+var ErrOIDCFlowUnknown = fmt.Errorf("%w: OIDC login state unknown, expired or already used on this node "+
+	"(a login must finish on the node it began on, within 10 minutes, once)", ErrInvalidCredentials)
+
+// ErrOIDCTooManyFlows: the realm already holds its bound of in-flight flows.
+var ErrOIDCTooManyFlows = errors.New("too many OIDC logins in progress on this node; retry shortly")
+
+// ErrOIDCClientNotConfigured: the realm has no redirect for the requested
+// client (no cli_redirect_url for the CLI), or the configured one is unsafe.
+var ErrOIDCClientNotConfigured = errors.New("OIDC login for this client is not configured")
+
+// OIDCFlowStart is what BeginFlow hands the caller: the URL to send the user
+// to, the state the callback will carry, the redirect it will arrive on, and
+// when the flow stops being accepted.
+type OIDCFlowStart struct {
+	AuthURL     string
+	State       string
+	RedirectURI string
+	ExpiresAt   time.Time
 }
 
 // NewOIDCRealm initialises a realm by fetching the provider's discovery
@@ -105,6 +170,20 @@ func NewOIDCRealm(ctx context.Context, cfg OIDCConfig) (*OIDCRealm, error) {
 	if cfg.IssuerURL == "" || cfg.ClientID == "" {
 		return nil, fmt.Errorf("oidc: IssuerURL and ClientID required")
 	}
+	if cfg.CLIRedirectURL != "" {
+		if err := validateLoopbackRedirect(cfg.CLIRedirectURL); err != nil {
+			return nil, fmt.Errorf("oidc: cli_redirect_url: %w", err)
+		}
+	}
+	var httpClient *http.Client
+	if cfg.CAFile != "" {
+		c, err := httpClientForCA(cfg.CAFile)
+		if err != nil {
+			return nil, fmt.Errorf("oidc: ca_file: %w", err)
+		}
+		httpClient = c
+		ctx = oidc.ClientContext(ctx, c)
+	}
 	if cfg.HTTPClient != nil {
 		ctx = cfg.HTTPClient.WithContext(ctx)
 	}
@@ -115,6 +194,10 @@ func NewOIDCRealm(ctx context.Context, cfg OIDCConfig) (*OIDCRealm, error) {
 	scopes := cfg.Scopes
 	if len(scopes) == 0 {
 		scopes = []string{oidc.ScopeOpenID, "profile", "email", "groups"}
+	} else if !slices.Contains(scopes, oidc.ScopeOpenID) {
+		// Without openid the IdP issues no ID token, and nothing else
+		// identifies the user.
+		scopes = append([]string{oidc.ScopeOpenID}, scopes...)
 	}
 	r := &OIDCRealm{
 		cfg:          cfg,
@@ -124,8 +207,10 @@ func NewOIDCRealm(ctx context.Context, cfg OIDCConfig) (*OIDCRealm, error) {
 		emailClaim:   defaultStr(cfg.EmailClaim, "email"),
 		nameClaim:    defaultStr(cfg.NameClaim, "name"),
 		subjectClaim: defaultStr(cfg.SubjectClaim, "sub"),
+		httpClient:   httpClient,
 		stateStore:   map[string]oidcFlow{},
 		stateExpiry:  10 * time.Minute,
+		maxFlows:     defaultMaxOIDCFlows,
 		oauthCfg: &oauth2.Config{
 			ClientID:     cfg.ClientID,
 			ClientSecret: cfg.ClientSecret,
@@ -145,21 +230,92 @@ func (r *OIDCRealm) Name() string { return "oidc:" + r.cfg.ShortName }
 // a PKCE code_verifier and a nonce, stashes both alongside the state, and
 // sends the S256 challenge + nonce to the IdP so Authenticate can later prove
 // the code wasn't intercepted and the ID token isn't a replay.
+//
+// It uses the configured RedirectURL and a caller-chosen state; BeginFlow is
+// what the login routes use (it mints the state itself and bounds the store).
 func (r *OIDCRealm) AuthURL(state string) string {
 	verifier := oauth2.GenerateVerifier()
 	nonce := oauth2.GenerateVerifier() // reused as a high-entropy random nonce
-	r.rememberFlow(state, verifier, nonce)
-	return r.oauthCfg.AuthCodeURL(state,
+	r.mu.Lock()
+	r.putFlowLocked(state, verifier, nonce, r.cfg.RedirectURL)
+	r.mu.Unlock()
+	return r.authCodeURL(state, verifier, nonce, r.cfg.RedirectURL)
+}
+
+// BeginFlow starts one authorization-code + PKCE login for client (OIDCClientWeb
+// or OIDCClientCLI). The state is 256 random bits minted here, single-use, and
+// held only on this node for stateExpiry along with the PKCE verifier, the
+// nonce and the redirect the IdP will send the browser to.
+//
+// The redirect is never the caller's: it is the realm's configured one for that
+// client, so the allow-list is exactly the configuration. A web redirect must be
+// https, or http to a loopback address; a CLI redirect is http to 127.0.0.1
+// (checked at load).
+func (r *OIDCRealm) BeginFlow(client string) (OIDCFlowStart, error) {
+	var redirect string
+	switch client {
+	case "", OIDCClientWeb:
+		redirect = r.cfg.RedirectURL
+		if redirect == "" {
+			return OIDCFlowStart{}, fmt.Errorf("%w: realm %s has no redirect_url", ErrOIDCClientNotConfigured, r.Name())
+		}
+		if err := validateWebRedirect(redirect); err != nil {
+			return OIDCFlowStart{}, fmt.Errorf("%w: realm %s redirect_url: %v", ErrOIDCClientNotConfigured, r.Name(), err)
+		}
+	case OIDCClientCLI:
+		redirect = r.cfg.CLIRedirectURL
+		if redirect == "" {
+			return OIDCFlowStart{}, fmt.Errorf("%w: realm %s has no cli_redirect_url, so `lv login` cannot "+
+				"receive the IdP's answer; set it (and register it with the IdP) or log in through the web UI",
+				ErrOIDCClientNotConfigured, r.Name())
+		}
+	default:
+		return OIDCFlowStart{}, fmt.Errorf("%w: unknown OIDC client %q (want web or cli)", ErrOIDCClientNotConfigured, client)
+	}
+	state, err := randomToken()
+	if err != nil {
+		return OIDCFlowStart{}, err
+	}
+	verifier := oauth2.GenerateVerifier()
+	nonce := oauth2.GenerateVerifier()
+	r.mu.Lock()
+	r.pruneLocked(time.Now())
+	if len(r.stateStore) >= r.maxFlows {
+		r.mu.Unlock()
+		return OIDCFlowStart{}, ErrOIDCTooManyFlows
+	}
+	exp := r.putFlowLocked(state, verifier, nonce, redirect)
+	r.mu.Unlock()
+	return OIDCFlowStart{
+		AuthURL:     r.authCodeURL(state, verifier, nonce, redirect),
+		State:       state,
+		RedirectURI: redirect,
+		ExpiresAt:   exp,
+	}, nil
+}
+
+// authCodeURL is the IdP authorization URL for one flow: PKCE S256 only (the
+// plain method is never offered), the flow's nonce, and its redirect.
+func (r *OIDCRealm) authCodeURL(state, verifier, nonce, redirect string) string {
+	cfg := *r.oauthCfg
+	cfg.RedirectURL = redirect
+	return cfg.AuthCodeURL(state,
 		oauth2.S256ChallengeOption(verifier),
 		oidc.Nonce(nonce),
 	)
 }
 
 // Authenticate consumes an OIDC code-flow callback. Credentials must carry
-// OIDCCode and OIDCState; OIDCRedirectURI may override the configured
-// RedirectURL when the UI is served behind a different ingress path.
+// OIDCCode and OIDCState. The state is single-use: it is removed before the
+// exchange whatever the outcome. The exchange replays the flow's own redirect;
+// OIDCRedirectURI, when set, must equal it.
 //
-// Returns ErrInvalidCredentials when state or ID-token verification fails;
+// The ID token is verified by go-oidc against the discovery document's JWKS
+// (signature, issuer, audience = client_id, expiry), then here for the flow's
+// nonce and, with several audiences, azp.
+//
+// Returns ErrOIDCFlowUnknown (an ErrInvalidCredentials) for a state this node
+// does not hold; ErrInvalidCredentials when ID-token verification fails;
 // ErrRealmUnavailable on transient IdP errors (token endpoint down).
 func (r *OIDCRealm) Authenticate(ctx context.Context, creds Credentials) (*Principal, error) {
 	if creds.OIDCCode == "" || creds.OIDCState == "" {
@@ -167,16 +323,23 @@ func (r *OIDCRealm) Authenticate(ctx context.Context, creds Credentials) (*Princ
 	}
 	flow, ok := r.consumeFlow(creds.OIDCState)
 	if !ok {
-		return nil, ErrInvalidCredentials
+		return nil, ErrOIDCFlowUnknown
+	}
+	// The exchange replays the redirect the flow began with. A caller naming
+	// another one is refused rather than obeyed: the redirect is not the
+	// caller's to choose (the allow-list is the realm's configuration).
+	if creds.OIDCRedirectURI != "" && creds.OIDCRedirectURI != flow.redirect {
+		return nil, fmt.Errorf("%w: redirect_uri is not the one this login began with", ErrInvalidCredentials)
+	}
+	if r.httpClient != nil {
+		ctx = oidc.ClientContext(ctx, r.httpClient)
 	}
 	if r.cfg.HTTPClient != nil {
 		ctx = r.cfg.HTTPClient.WithContext(ctx)
 	}
 
 	cfg := *r.oauthCfg
-	if creds.OIDCRedirectURI != "" {
-		cfg.RedirectURL = creds.OIDCRedirectURI
-	}
+	cfg.RedirectURL = flow.redirect
 	// Replay the PKCE verifier so the IdP can confirm this caller is the same
 	// one that initiated the flow — an intercepted code alone won't exchange.
 	tok, err := cfg.Exchange(ctx, creds.OIDCCode, oauth2.VerifierOption(flow.verifier))
@@ -201,6 +364,14 @@ func (r *OIDCRealm) Authenticate(ctx context.Context, creds Credentials) (*Princ
 	var claims map[string]interface{}
 	if err := idTok.Claims(&claims); err != nil {
 		return nil, fmt.Errorf("decode claims: %w", err)
+	}
+	// A token for several audiences must name this client as the party it was
+	// issued to (OIDC Core §3.1.3.7, items 4 and 5); the verifier above only
+	// checked that this client is among the audiences.
+	if len(idTok.Audience) > 1 {
+		if azp := stringClaim(claims, "azp"); azp != r.cfg.ClientID {
+			return nil, fmt.Errorf("%w: id-token has several audiences and azp %q is not this client", ErrInvalidCredentials, azp)
+		}
 	}
 	subject := stringClaim(claims, r.subjectClaim)
 	if subject == "" {
@@ -371,16 +542,28 @@ func EnsureUserShadow(ctx context.Context, db *corrosion.Client, p *Principal, d
 func (r *OIDCRealm) rememberFlow(state, verifier, nonce string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.putFlowLocked(state, verifier, nonce, r.cfg.RedirectURL)
+}
+
+// putFlowLocked prunes expired flows and stores one; r.mu must be held.
+func (r *OIDCRealm) putFlowLocked(state, verifier, nonce, redirect string) time.Time {
 	now := time.Now()
+	r.pruneLocked(now)
+	exp := now.Add(r.stateExpiry)
+	r.stateStore[state] = oidcFlow{
+		expiry:   exp,
+		verifier: verifier,
+		nonce:    nonce,
+		redirect: redirect,
+	}
+	return exp
+}
+
+func (r *OIDCRealm) pruneLocked(now time.Time) {
 	for s, f := range r.stateStore {
 		if now.After(f.expiry) {
 			delete(r.stateStore, s)
 		}
-	}
-	r.stateStore[state] = oidcFlow{
-		expiry:   now.Add(r.stateExpiry),
-		verifier: verifier,
-		nonce:    nonce,
 	}
 }
 
@@ -452,3 +635,73 @@ func flattenClaims(c map[string]interface{}) map[string]string {
 	}
 	return out
 }
+
+// randomToken is 256 random bits, base64url without padding.
+func randomToken() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("random state: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+// validateWebRedirect: the web callback carries the authorization code, so it
+// must travel over TLS — https, or http only to a loopback address (a
+// developer's own machine). No fragment (RFC 6749 §3.1.2).
+func validateWebRedirect(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return err
+	}
+	if u.Fragment != "" || u.Host == "" {
+		return fmt.Errorf("%q must be an absolute URL with no fragment", raw)
+	}
+	switch u.Scheme {
+	case "https":
+		return nil
+	case "http":
+		if ip := net.ParseIP(u.Hostname()); ip != nil && ip.IsLoopback() {
+			return nil
+		}
+	}
+	return fmt.Errorf("%q must be https (http only to a loopback address): the authorization code travels on it", raw)
+}
+
+// validateLoopbackRedirect: the CLI's redirect is a listener on the user's own
+// machine (RFC 8252 §7.3): http to the IPv4 loopback literal, an explicit port
+// (the IdP matches it exactly), and no query or fragment.
+func validateLoopbackRedirect(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return err
+	}
+	if u.Scheme != "http" || u.Hostname() != "127.0.0.1" || u.Port() == "" || u.Port() == "0" ||
+		u.RawQuery != "" || u.Fragment != "" || u.User != nil {
+		return fmt.Errorf("%q must be http://127.0.0.1:<port>/<path> with no query or fragment", raw)
+	}
+	return nil
+}
+
+// httpClientForCA is a client that trusts only the CAs in path (PEM). TLS 1.2
+// at least; certificate and host-name verification always on.
+func httpClientForCA(path string) (*http.Client, error) {
+	pemBytes, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pemBytes) {
+		return nil, fmt.Errorf("%s holds no PEM certificate", path)
+	}
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+	return &http.Client{Transport: tr, Timeout: 30 * time.Second}, nil
+}
+
+// OIDCFlowStarter is the realm side of beginning an OIDC login, so callers can
+// find it on a registered Realm without depending on *OIDCRealm.
+type OIDCFlowStarter interface {
+	BeginFlow(client string) (OIDCFlowStart, error)
+}
+
+var _ OIDCFlowStarter = (*OIDCRealm)(nil)

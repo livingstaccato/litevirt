@@ -57,6 +57,7 @@
 //	GET    /api/v1/images                              → ListImages
 //	DELETE /api/v1/images/{name}                       → DeleteImage
 //	POST   /api/v1/auth/login                          → Login
+//	POST   /api/v1/auth/oidc/begin                     → BeginOIDCLogin
 //	GET    /api/v1/users                               → ListUsers
 //	POST   /api/v1/users                               → CreateUser
 //	DELETE /api/v1/users/{name}                        → DeleteUser
@@ -138,6 +139,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/images", s.wrap(s.handleImages))
 	s.mux.HandleFunc("/api/v1/images/", s.wrap(s.handleImage))
 	s.mux.HandleFunc("/api/v1/auth/login", s.noAuth(s.handleLogin))
+	s.mux.HandleFunc("/api/v1/auth/oidc/begin", s.noAuth(s.handleOIDCBegin))
 	s.mux.HandleFunc("/api/v1/users", s.wrap(s.handleUsers))
 	s.mux.HandleFunc("/api/v1/users/", s.wrap(s.handleUser))
 	s.mux.HandleFunc("/api/v1/tokens", s.wrap(s.handleTokens))
@@ -1093,6 +1095,27 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp, err := s.grpc.Login(s.grpcCtx(r), &req)
+	if err != nil {
+		grpcHTTPError(w, http.StatusInternalServerError, err)
+		return
+	}
+	jsonProto(w, resp)
+}
+
+// handleOIDCBegin starts an OIDC login on this node (BeginOIDCLogin). The
+// caller sends the user to auth_url and completes the login with
+// /api/v1/auth/login on the same node, carrying the code and state.
+func (s *Server) handleOIDCBegin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonError(w, http.StatusMethodNotAllowed, "POST only")
+		return
+	}
+	var req pb.BeginOIDCLoginRequest
+	if err := protoFromJSON(r, &req); err != nil {
+		jsonError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	resp, err := s.grpc.BeginOIDCLogin(s.grpcCtx(r), &req)
 	if err != nil {
 		grpcHTTPError(w, http.StatusInternalServerError, err)
 		return

@@ -25,6 +25,20 @@
       <div class="logo">&#x2B21; litevirt</div>
       <h1>Sign in</h1>
       {{if .Error}}<div class="login-error">{{.Error}}</div>{{end}}
+      {{if .OIDCPending}}
+      <form method="POST" action="/login">
+        <input type="hidden" name="realm" value="{{.Realm}}">
+        <input type="hidden" name="oidc_pending" value="{{.OIDCPending}}">
+        <p style="font-size:12px;margin-bottom:12px">Signed in through {{.Realm}}. This account also needs its litevirt second factor.</p>
+        <div class="form-row">
+          <label>Authenticator code</label>
+          <input type="text" name="totp_code" inputmode="numeric" autocomplete="one-time-code" autofocus pattern="[0-9a-zA-Z\-]{6,9}" required>
+        </div>
+        <div class="form-actions" style="justify-content:stretch">
+          <button type="submit" class="btn btn-primary" style="width:100%;justify-content:center">Verify</button>
+        </div>
+      </form>
+      {{else}}
       <form method="POST" action="/login">
         <div class="form-row">
           <label>Username</label>
@@ -52,6 +66,14 @@
           <button type="submit" class="btn btn-primary" style="width:100%;justify-content:center">{{if .Requires2FA}}Verify{{else}}Sign in{{end}}</button>
         </div>
       </form>
+      {{if and .OIDCRealms (not .Requires2FA)}}
+      <div class="oidc-signin" style="margin-top:16px">
+        {{range .OIDCRealms}}
+        <a class="btn" style="width:100%;justify-content:center;margin-top:8px" href="/oidc/login?realm={{.}}">Sign in with {{.}}</a>
+        {{end}}
+      </div>
+      {{end}}
+      {{end}}
     </div>
   </div>
 </body>

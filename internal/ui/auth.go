@@ -272,7 +272,7 @@ func (s *Server) handleLoginPage(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
-	s.renderLoginPage(w, loginPageData{})
+	s.renderLoginPage(w, loginPageData{Realms: s.availableRealms(), OIDCRealms: s.oidcRealms()})
 }
 
 func (s *Server) handleLoginSubmit(w http.ResponseWriter, r *http.Request) {
@@ -284,6 +284,10 @@ func (s *Server) handleLoginSubmit(w http.ResponseWriter, r *http.Request) {
 	password := r.FormValue("password")
 	realm := r.FormValue("realm")
 	totp := r.FormValue("totp_code")
+	if pending := r.PostFormValue("oidc_pending"); pending != "" {
+		s.handleOIDCSecondFactor(w, r, realm, pending, totp)
+		return
+	}
 
 	resp, err := s.grpc.Login(r.Context(), &pb.LoginRequest{
 		Username: username,
@@ -295,8 +299,9 @@ func (s *Server) handleLoginSubmit(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("UI login failed", "username", username, "realm", realm, "error", err)
 		s.renderLoginPage(w, loginPageData{
 			Username: username, Realm: realm,
-			Realms: s.availableRealms(),
-			Error:  "Invalid username or password",
+			Realms:     s.availableRealms(),
+			OIDCRealms: s.oidcRealms(),
+			Error:      "Invalid username or password",
 		})
 		return
 	}
@@ -307,11 +312,19 @@ func (s *Server) handleLoginSubmit(w http.ResponseWriter, r *http.Request) {
 		s.renderLoginPage(w, loginPageData{
 			Username: username, Realm: realm,
 			Realms:      s.availableRealms(),
+			OIDCRealms:  s.oidcRealms(),
 			Requires2FA: true,
 		})
 		return
 	}
+	s.finishLogin(w, r, resp)
+}
 
+// finishLogin stores a minted session in the browser and sends it on: to the
+// enrollment page for an enrollment-only session, else the dashboard. Every
+// login path ends here (password, and OIDC through the callback or its second
+// factor), so a session cookie is set one way.
+func (s *Server) finishLogin(w http.ResponseWriter, r *http.Request, resp *pb.LoginResponse) {
 	// MaxAge bounds the browser-side cookie to the session's hard expiry, so a
 	// dead session doesn't linger as a usable-looking cookie. Secure is set when
 	// the request arrived over TLS (directly or via a terminating proxy) so the
@@ -371,18 +384,38 @@ type loginPageData struct {
 	Realms      []string
 	Error       string
 	Requires2FA bool
+	// OIDCRealms get a "Sign in with" button each (GET /oidc/login).
+	OIDCRealms []string
+	// OIDCPending is set when an OIDC login stopped for the second factor:
+	// the form then asks only for the code and posts this handle back.
+	OIDCPending string
+	// status is the HTTP status the page is served with (0 = 200).
+	status int
 }
 
-// availableRealms returns the realm names the daemon advertises via
-// ListRealms. Hidden when the cluster has only "local" — the dropdown
-// would be a single-option no-op. Errors degrade silently to nil so a
-// transient daemon hiccup doesn't strand users at the login page.
+// availableRealms returns the PASSWORD realm names (local, ldap:*) the daemon
+// advertises via ListRealms, for the login form's dropdown. Hidden when only
+// "local" remains — the dropdown would be a single-option no-op. OIDC realms
+// take no password; they get their own buttons (oidcRealms). Errors degrade
+// silently to nil so a transient daemon hiccup doesn't strand users at the
+// login page.
 func (s *Server) availableRealms() []string {
-	resp, err := s.grpc.ListRealms(context.Background(), &emptypb.Empty{})
-	if err != nil || resp == nil {
+	var out []string
+	for _, r := range s.allRealms() {
+		if !strings.HasPrefix(r, "oidc:") {
+			out = append(out, r)
+		}
+	}
+	if len(out) <= 1 {
 		return nil
 	}
-	if len(resp.Realms) <= 1 {
+	return out
+}
+
+// allRealms is every realm the daemon advertises, nil on error.
+func (s *Server) allRealms() []string {
+	resp, err := s.grpc.ListRealms(context.Background(), &emptypb.Empty{})
+	if err != nil || resp == nil {
 		return nil
 	}
 	return resp.Realms
@@ -396,5 +429,8 @@ func (s *Server) renderLoginPage(w http.ResponseWriter, data loginPageData) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if data.status != 0 {
+		w.WriteHeader(data.status)
+	}
 	t.ExecuteTemplate(w, "login.html", data)
 }

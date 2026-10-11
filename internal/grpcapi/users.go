@@ -38,14 +38,19 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 	}
 
 	// At least one credential family must be supplied. OIDC code-flow
-	// uses oidc_code + oidc_state; password realms use username +
+	// uses oidc_code + oidc_state (or oidc_pending + totp_code, resuming one
+	// that stopped for the second factor); password realms use username +
 	// password. Mixed inputs are tolerated — the realm picks what it
 	// needs from Credentials.
 	hasPassword := req.Username != "" && req.Password != ""
 	hasOIDCCode := req.OidcCode != "" && req.OidcState != ""
-	if !hasPassword && !hasOIDCCode {
+	oidcResume := req.OidcPending != "" && !hasPassword && !hasOIDCCode
+	if !hasPassword && !hasOIDCCode && !oidcResume {
 		return nil, status.Error(codes.InvalidArgument,
-			"login requires either username+password or oidc_code+oidc_state")
+			"login requires either username+password, oidc_code+oidc_state, or oidc_pending+totp_code")
+	}
+	if oidcResume && !strings.HasPrefix(realmName, "oidc:") {
+		return nil, status.Errorf(codes.InvalidArgument, "oidc_pending is only for an OIDC realm, not %q", realmName)
 	}
 
 	clientIP := throttleClientIP(ctx)
@@ -60,6 +65,21 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 	// username so a correct password can't be ground out, and on IP so one
 	// attacker can't lock a victim's account from afar.
 	throttleKey := loginThrottleKey(req.Username, clientIP)
+	var pending *auth.Principal
+	if oidcResume {
+		// The principal the IdP proved is held on this node under the
+		// handle; nothing about it comes from this request.
+		p, ok := s.oidcPending.get(req.OidcPending, realmName)
+		if !ok {
+			s.audit(ctx, "auth.login", "", "realm="+realmName+" unknown or expired second-factor handle", "denied")
+			return nil, status.Error(codes.Unauthenticated,
+				"this OIDC login is unknown or expired on this node (or used up its attempts); log in again")
+		}
+		pending = p
+		// A second factor is ground out per ACCOUNT, as the password realms'
+		// is, not in the anonymous bucket every OIDC login shares.
+		throttleKey = loginThrottleKey(p.Subject, clientIP)
+	}
 	if wait := s.loginThrottle.retryAfter(throttleKey); wait > 0 {
 		s.audit(ctx, "auth.login", req.Username, "realm="+realmName+" locked out ip="+clientIP, "denied")
 		return nil, status.Errorf(codes.ResourceExhausted,
@@ -88,10 +108,24 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 		OIDCState:       req.OidcState,
 		OIDCRedirectURI: req.OidcRedirectUri,
 	}
-	principal, err := realm.Authenticate(ctx, creds)
+	var principal *auth.Principal
+	var err error
+	if pending != nil {
+		principal = pending
+	} else {
+		principal, err = realm.Authenticate(ctx, creds)
+	}
 	if err != nil {
 		// Login is in skipAuth, so callerUsername(ctx) is empty here — record
 		// the attempted username from the request as the audit target.
+		if errors.Is(err, auth.ErrOIDCFlowUnknown) {
+			// Not a credential guess (the state is 256 random bits), so it
+			// does not count against the shared anonymous bucket — a stray
+			// or replayed callback must not lock every OIDC user of this
+			// node out.
+			s.audit(ctx, "auth.login", req.Username, "realm="+realmName+" unknown OIDC state", "denied")
+			return nil, status.Error(codes.Unauthenticated, err.Error())
+		}
 		if errors.Is(err, auth.ErrInvalidCredentials) {
 			s.loginThrottle.fail(throttleKey)
 			s.audit(ctx, "auth.login", req.Username, "realm="+realmName+" invalid credentials", "denied")
@@ -229,19 +263,30 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 		s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" second-factor policy unreadable", "denied")
 		return nil, status.Errorf(codes.Unavailable, "evaluate the second-factor policy: %v", perr)
 	}
+	oidcLogin := (hasOIDCCode || oidcResume) && !hasPassword
 	if required && enrolled {
 		principal.Requires2FA = true
-		// An OIDC code is single-use, so there is no second round in which to
-		// ask for the factor: it has to arrive with the code. Answering
-		// Requires_2Fa would send the client back with a spent code.
-		if hasOIDCCode && !hasPassword && req.TotpCode == "" {
-			s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" second factor missing", "denied")
-			return nil, status.Errorf(codes.Unauthenticated,
-				"realm %q requires a second factor: send totp_code together with the OIDC code", realmName)
-		}
 	}
+	// litevirt's own policy decides the second factor for an OIDC login too:
+	// what the IdP did (its amr/acr claims) is not read, because nothing in
+	// litevirt's design makes an IdP's MFA stand in for the account's factor.
 
 	if principal.Requires2FA && req.TotpCode == "" {
+		if oidcLogin {
+			// The OIDC code is spent, so there is no second round that could
+			// resend it. Hold what the IdP proved under a short-lived handle
+			// on this node; the client sends the factor with it.
+			handle := req.OidcPending
+			if !oidcResume {
+				h, perr := s.oidcPending.put(realmName, principal)
+				if perr != nil {
+					return nil, status.Error(codes.ResourceExhausted, perr.Error())
+				}
+				handle = h
+			}
+			s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" second factor required", "pending")
+			return &pb.LoginResponse{Requires_2Fa: true, OidcPending: handle}, nil
+		}
 		return &pb.LoginResponse{Requires_2Fa: true}, nil
 	}
 	if principal.Requires2FA {
@@ -251,9 +296,16 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 		}
 		if !ok {
 			s.loginThrottle.fail(throttleKey)
+			if oidcResume {
+				s.oidcPending.failed(req.OidcPending)
+			}
 			s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" invalid second factor", "denied")
 			return nil, status.Error(codes.Unauthenticated, "invalid second factor")
 		}
+	}
+	if oidcResume {
+		// Single use: whatever happens from here, this handle is done.
+		defer s.oidcPending.drop(req.OidcPending)
 	}
 
 	// Successful credential + (if required) second-factor verification —

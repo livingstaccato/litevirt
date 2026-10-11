@@ -246,6 +246,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /login", s.handleLoginPage)
 	mux.HandleFunc("POST /login", s.handleLoginSubmit)
 	mux.HandleFunc("POST /logout", s.handleLogout)
+	// OIDC sign-in: begin (sends the browser to the IdP) and the callback the
+	// realm's redirect_url names. Public, like /login.
+	mux.HandleFunc("GET /oidc/login", s.handleOIDCLogin)
+	mux.HandleFunc("GET "+oidcCallbackPath, s.handleOIDCCallback)
 
 	// Pages (require auth)
 	mux.HandleFunc("GET /", s.requireAuthFunc(s.handleCluster))

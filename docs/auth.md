@@ -75,7 +75,10 @@ required; prefer `client_secret_file` (checked for 0600 at load) over inlining
 
 | Key | Purpose |
 |---|---|
-| `scopes` | Extra scopes to request beyond the defaults. |
+| `redirect_url` | This node's web UI callback, `https://<this node's UI>/oidc/callback`. **Per node**: the login must come back to the node that began it (below). Must be `https` (plain `http` only to a loopback address); a login is refused to begin otherwise. Register every node's URL with the IdP. |
+| `cli_redirect_url` | The loopback address `lv login --realm oidc:<name>` listens on, `http://127.0.0.1:<port>/<path>` (RFC 8252 §7.3): IPv4 loopback, an explicit port, no query. Checked at load. Unset: the CLI sign-in is off for this realm (the web UI still works). Register it with the IdP too. |
+| `ca_file` | PEM CA bundle the IdP's certificate must chain to (discovery, JWKS and the token endpoint). Unset: the system trust store. Verification is never skipped. |
+| `scopes` | Scopes to request. Default `openid profile email groups`; `openid` is always added. |
 | `groups_claim` | Token claim carrying group membership; each value becomes a `group:<name>@<realm>` principal. |
 | `subject_claim` | Claim used as the stable subject — the `user:<subject>@<realm>` principal. Override when `sub` is an opaque id and you want a readable, stable alternative. |
 | `email_claim` | Claim read as the user's email address. |
@@ -84,6 +87,74 @@ required; prefer `client_secret_file` (checked for 0600 at load) over inlining
 The claim overrides exist because IdPs disagree on claim names. Changing
 `subject_claim` on a live realm re-keys every principal id, so existing role
 bindings stop matching — rebind before switching it.
+
+### OIDC sign-in
+
+The flow is the authorization code flow with PKCE (S256 only) and a nonce.
+
+**Web UI.** The login page shows a *Sign in with oidc:&lt;name&gt;* button for
+each OIDC realm (`GET /oidc/login?realm=oidc:<name>`). The node:
+
+1. begins a flow (`BeginOIDCLogin`): 256 random bits of state, a PKCE verifier
+   and a nonce, held in memory **on that node only**, single-use, for 10
+   minutes (at most 4096 in flight per realm);
+2. binds the flow to the browser with a short-lived `HttpOnly`, `SameSite=Lax`
+   cookie scoped to `/oidc/callback`;
+3. sends the browser to the IdP.
+
+The IdP returns the browser to `redirect_url`. `GET /oidc/callback` then:
+
+- refuses a callback whose state is not the one this browser's cookie names,
+  without spending the code. This stops login CSRF: an attacker cannot sign a
+  victim in as the attacker.
+- calls `Login` with the code and state on the same node. The node exchanges
+  the code with the verifier and the client secret. It verifies the ID token
+  against the discovery document's JWKS: signature, issuer, audience
+  (`client_id`, and `azp` when there are several audiences), expiry, and the
+  flow's nonce.
+- maps the principal (`subject_claim`) and creates the session exactly as a
+  password login does: the external shadow user, the directory identity
+  binding, the account lifecycle, and the login policy below.
+
+The callback answers with `Cache-Control: no-store` and
+`Referrer-Policy: no-referrer`. The code, the state and the session token are
+never logged and never put in another URL.
+
+**The login must finish on the node that began it.** A callback that reaches
+another node finds no flow and is refused (`Unauthenticated`, "state unknown
+... on this node"); the code is not presented to the IdP. Give each node its
+own `redirect_url` naming itself. Behind a load balancer, pin `/oidc/` to one
+node (sticky sessions).
+
+**CLI.** `lv login --realm oidc:<name>` asks the node it is connected to for a
+CLI flow. The node returns the IdP URL and the realm's `cli_redirect_url`. lv
+then:
+
+- listens on that loopback address;
+- opens the URL in a browser on the same machine (`--no-browser` prints it
+  instead);
+- accepts only the flow's own state on the configured path.
+
+It completes the login on the same node. The code goes only to the user's
+loopback and to the node; the client secret stays on the node. A remote shell
+needs the loopback forwarded, e.g. `ssh -L 18765:127.0.0.1:18765`. The IdP must
+list `cli_redirect_url` as a redirect URI for the client.
+
+**API.** `BeginOIDCLogin` (REST `POST /api/v1/auth/oidc/begin`,
+`{realm, client}`) and then `Login` with `oidc_code` and `oidc_state` on the
+same node. `client` is `web` (the default) or `cli`. The redirect is always the
+realm's configured one for that client; a caller cannot choose it. An
+`oidc_redirect_uri` sent to `Login` must equal it.
+
+**Second factor.** The login policy (below) applies to an OIDC login exactly as
+it does to a password login. litevirt does not read the IdP's `amr`/`acr`
+claims: an IdP that did its own MFA does not stand in for the account's
+litevirt factor. The OIDC code is single-use, so when a covered user with a
+factor signs in without one, `Login` answers `requires_2fa` with an
+`oidc_pending` handle and mints no session. The handle is node-local, lasts 5
+minutes and allows 5 wrong codes. Send it back with `realm` and `totp_code` (the
+web UI asks for the code; `lv login` prompts). A client may still send
+`totp_code` together with the code in one call.
 
 ### LDAP / AD realm keys
 
@@ -480,9 +551,9 @@ as `ldap:crop` covers nothing).
 - **A covered user with a factor** must present it at every login, through
   every covered realm. The local realm always did this; the policy extends
   it to LDAP and OIDC. An OIDC code is single-use, so through an OIDC realm
-  the TOTP code has to arrive in the same `Login` call as the OIDC code. No
-  shipped client (CLI or web UI) drives an OIDC login today, so an OIDC client
-  under a covering policy must send both itself. WebAuthn login is itself a
+  the factor is sent either with the code or, after a `requires_2fa` answer,
+  with the `oidc_pending` handle it carries ("OIDC sign-in" above); the web UI
+  and `lv login --realm oidc:<name>` do the second. WebAuthn login is itself a
   second factor.
 - **A login that presents no factor** gets an enrollment-only session
   (`requires_2fa_enrollment`, no role): it can call `Whoami`, `Logout` and

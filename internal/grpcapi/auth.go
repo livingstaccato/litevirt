@@ -147,6 +147,10 @@ var skipAuth = map[string]bool{
 	"/litevirt.v1.LiteVirt/Ready":      true,
 	"/litevirt.v1.LiteVirt/Login":      true,
 	"/litevirt.v1.LiteVirt/ListRealms": true,
+	// BeginOIDCLogin only starts a flow (state, PKCE verifier, nonce held on
+	// this node); it takes no credential and mints nothing. Login completes
+	// it. It is gated with the pre-session methods (preSessionAuthMethods).
+	"/litevirt.v1.LiteVirt/BeginOIDCLogin": true,
 	// WebAuthn login is pre-session (passwordless): the caller has no bearer
 	// yet and supplies its own username. The assertion IS the credential, so
 	// these bypass the interceptor like Login does. Registration RPCs are NOT

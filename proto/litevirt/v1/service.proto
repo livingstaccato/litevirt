@@ -981,12 +981,20 @@ message LoginRequest       {
     string user_agent= 5;  // captured for ListSessions display
 
     // OIDC code-flow callback fields. When `realm` names an OIDC realm,
-    // the UI/CLI redirects the browser to AuthURL(state), receives a
-    // `code` on the configured RedirectURL, and re-calls Login with
-    // these fields set. Username/Password are unused for OIDC.
+    // the UI/CLI begins the flow with BeginOIDCLogin on THIS node, sends the
+    // browser to its auth_url, receives a `code` on the flow's redirect, and
+    // calls Login on the same node with these fields set. Username/Password
+    // are unused for OIDC.
     string oidc_code         = 6;
     string oidc_state        = 7;
-    string oidc_redirect_uri = 8;  // optional override of the configured RedirectURL
+    // Optional; when set it must equal the redirect the flow began with (the
+    // exchange always replays that one, never a caller-chosen URL).
+    string oidc_redirect_uri = 8;
+    // oidc_pending resumes an OIDC login that verified at the IdP and stopped
+    // for litevirt's second factor (LoginResponse.oidc_pending): send it with
+    // realm and totp_code instead of the spent code. Single-use per success,
+    // node-local, valid for 5 minutes and 5 attempts.
+    string oidc_pending      = 9;
 }
 message LoginResponse      {
     string token         = 1;  // bearer; opaque session id (prefix "lvs_") on success
@@ -1000,8 +1008,27 @@ message LoginResponse      {
     // registration), call Whoami and Logout, and nothing else. Enrolling ends
     // it; log in again with the new factor.
     bool   requires_2fa_enrollment = 6;
+    // oidc_pending: set with requires_2fa on an OIDC login. The code is spent,
+    // so the second factor is sent with this handle (LoginRequest.oidc_pending)
+    // to the same node. It authenticates nothing on its own.
+    string oidc_pending = 7;
 }
 message ListRealmsResponse { repeated string realms = 1; }
+
+// BeginOIDCLogin starts an authorization-code + PKCE login on this node.
+// client: "web" (default; the realm's redirect_url, the node's UI callback) or
+// "cli" (the realm's cli_redirect_url, a loopback listener). The redirect is
+// always the realm's configured one; a caller cannot name its own.
+message BeginOIDCLoginRequest {
+    string realm  = 1;  // "oidc:<name>"
+    string client = 2;  // "web" | "cli"
+}
+message BeginOIDCLoginResponse {
+    string auth_url     = 1;  // send the user's browser here
+    string state        = 2;  // single-use; the callback must carry it back
+    string redirect_uri = 3;  // where the IdP will send the browser
+    string expires_at   = 4;  // RFC3339; the flow is refused after this
+}
 message CreateUserRequest  { string username = 1; string password = 2; string role = 3; }
 message ListUsersResponse  { repeated User users = 1; }
 // exact: match username as stored, byte for byte, instead of by normalized
@@ -3920,6 +3947,9 @@ service LiteVirt {
     // ── Users & Auth ──
     rpc Login(LoginRequest)              returns (LoginResponse);
     rpc ListRealms(google.protobuf.Empty) returns (ListRealmsResponse);
+    // BeginOIDCLogin is pre-session (no bearer): it only starts a flow; Login
+    // completes it on the same node.
+    rpc BeginOIDCLogin(BeginOIDCLoginRequest) returns (BeginOIDCLoginResponse);
     rpc Logout(google.protobuf.Empty)    returns (google.protobuf.Empty);
     rpc ListSessions(ListSessionsRequest)   returns (ListSessionsResponse);
     rpc RevokeSession(RevokeSessionRequest) returns (google.protobuf.Empty);

@@ -54,6 +54,8 @@ type OIDCRealmConfig struct {
 	ClientSecret     string   `yaml:"client_secret,omitempty"`
 	ClientSecretFile string   `yaml:"client_secret_file,omitempty"`
 	RedirectURL      string   `yaml:"redirect_url"`
+	CLIRedirectURL   string   `yaml:"cli_redirect_url,omitempty"`
+	CAFile           string   `yaml:"ca_file,omitempty"`
 	Scopes           []string `yaml:"scopes,omitempty"`
 	GroupsClaim      string   `yaml:"groups_claim,omitempty"`
 	EmailClaim       string   `yaml:"email_claim,omitempty"`
@@ -100,16 +102,18 @@ func BuildRegistry(ctx context.Context, db *corrosion.Client, configs []RealmCon
 				return nil, fmt.Errorf("realms[%d] %q: kind=oidc requires an oidc: block", i, rc.Name)
 			}
 			cfg := OIDCConfig{
-				ShortName:    rc.Name,
-				IssuerURL:    rc.OIDC.IssuerURL,
-				ClientID:     rc.OIDC.ClientID,
-				ClientSecret: rc.OIDC.ClientSecret,
-				RedirectURL:  rc.OIDC.RedirectURL,
-				Scopes:       rc.OIDC.Scopes,
-				GroupsClaim:  rc.OIDC.GroupsClaim,
-				EmailClaim:   rc.OIDC.EmailClaim,
-				NameClaim:    rc.OIDC.NameClaim,
-				SubjectClaim: rc.OIDC.SubjectClaim,
+				ShortName:      rc.Name,
+				IssuerURL:      rc.OIDC.IssuerURL,
+				ClientID:       rc.OIDC.ClientID,
+				ClientSecret:   rc.OIDC.ClientSecret,
+				RedirectURL:    rc.OIDC.RedirectURL,
+				CLIRedirectURL: rc.OIDC.CLIRedirectURL,
+				CAFile:         rc.OIDC.CAFile,
+				Scopes:         rc.OIDC.Scopes,
+				GroupsClaim:    rc.OIDC.GroupsClaim,
+				EmailClaim:     rc.OIDC.EmailClaim,
+				NameClaim:      rc.OIDC.NameClaim,
+				SubjectClaim:   rc.OIDC.SubjectClaim,
 			}
 			if rc.OIDC.ClientSecretFile != "" {
 				secret, err := readSecretFile(rc.OIDC.ClientSecretFile)

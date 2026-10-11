@@ -319,18 +319,18 @@ func retireHostOwnedRows(ctx context.Context, tx *sql.Tx, host, updatedAt string
 // written by whichever node first inserted it, the stamp is the admitting
 // node's. A skew larger than the old machine's whole membership would hand the
 // tie to the stale row, which is the state before this rule.
-func stampReadmitIncarnation(ctx context.Context, tx *sql.Tx, s Statement, host, ts string) error {
+func stampReadmitIncarnation(ctx context.Context, tx *sql.Tx, s Statement, host, updatedAt string) error {
 	serial, ok := s.Params[5].(string)
 	if !ok || serial == "" {
 		return nil
 	}
-	at, ok := tsInstant(ts)
+	at, ok := tsInstant(updatedAt)
 	if !ok {
 		return nil
 	}
 	_, err := tx.ExecContext(ctx,
 		`UPDATE hosts SET created_at = ? WHERE name = ? AND updated_at = ? AND deleted_at IS NULL
 			AND lower(cert_serial) = lower(?)`,
-		at.UTC().Format(nowTSLayout), host, ts, serial)
+		at.UTC().Format(nowTSLayout), host, updatedAt, serial)
 	return err
 }

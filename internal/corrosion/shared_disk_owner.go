@@ -119,11 +119,57 @@ func WithheldSharedDiskDetail(vm, self string, withheld []WithheldSharedDisk) st
 	for _, o := range order {
 		remedies = append(remedies, fmt.Sprintf("once %s is powered off, `lv host fence-confirm %s` (with recovery claims "+
 			"enforced, a confirmation may also let the failover coordinator recover every workload still recorded on %s), "+
-			"then `lv restart %s`; or, if %s is up and does not run %s (a row a move left behind), "+
-			"`lv doctor repair-owner %s %s` re-homes its disk rows here, then `lv restart %s`",
-			o, o, o, vm, o, vm, vm, self, vm))
+			"then `lv restart %s`. Until %s is proven off no move of %s re-homes the disk's row, and "+
+			"`lv doctor repair-owner` refuses to",
+			o, o, o, vm, o, vm))
 	}
 	return fmt.Sprintf("the domain of VM %s on %s was built without its shared disk(s) %s. A domain built from the disk rows "+
 		"attaches a shared disk whose row names another host only once that host is proven powered off. To attach it: %s",
 		vm, self, strings.Join(parts, "; "), strings.Join(remedies, "; "))
+}
+
+// SharedRowKeepsOwner reports whether a move of a VM from source to dest must
+// leave disk d's row naming its own host (review I1): d is on shared storage
+// and its row names a THIRD host — neither the host the VM leaves nor the one
+// it goes to, as a partial promotion leaves a disk it did not attach — that
+// is not proven powered off (SharedDiskOwnerVerdict). Re-pointing that row at
+// dest would make it "this host's" there, and the next domain built from the
+// rows would attach it without judging the host that may still be writing
+// it. Kept, the row is judged at every build (JudgeSharedDiskRows) and the
+// disk stays withheld until that host is proven off. A row naming the source
+// moves as before: the source is the host the move itself is judged by (its
+// fence, a live migration's own handoff). why says why it is kept.
+func SharedRowKeepsOwner(ctx context.Context, c *Client, d DiskRecord, source, dest string) (keep bool, why string) {
+	if d.HostName == "" || d.HostName == source || d.HostName == dest {
+		return false, ""
+	}
+	if !DiskOnSharedStorage(ctx, c, d, source, dest) {
+		return false, ""
+	}
+	h, proved, err := SharedDiskOwnerProvedOff(ctx, c, d.HostName)
+	ok, why := SharedDiskOwnerVerdict(d.HostName, h, proved, err)
+	return !ok, why
+}
+
+// vmHostOf is the host vm's live row names, "" when there is none.
+func vmHostOf(ctx context.Context, c *Client, vm string) (string, error) {
+	rows, err := c.Query(ctx, `SELECT host_name FROM vms WHERE name = ? AND deleted_at IS NULL`, vm)
+	if err != nil || len(rows) == 0 {
+		return "", err
+	}
+	return rows[0].String("host_name"), nil
+}
+
+// WithheldBootDisk returns the withheld disk that is the VM's boot disk, if
+// one is (review m1): the disk named "root", or the one at the first target
+// of its bus (vda, sda, hda). A domain built without it boots nothing, which
+// is worse than not starting, so the start is deferred instead.
+func WithheldBootDisk(withheld []WithheldSharedDisk) (WithheldSharedDisk, bool) {
+	for _, w := range withheld {
+		switch {
+		case w.Disk.DiskName == "root", w.Disk.TargetDev == "vda", w.Disk.TargetDev == "sda", w.Disk.TargetDev == "hda":
+			return w, true
+		}
+	}
+	return WithheldSharedDisk{}, false
 }

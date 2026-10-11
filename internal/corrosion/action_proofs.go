@@ -122,6 +122,10 @@ func WriteVMRescheduleProof(ctx context.Context, c *Client, p ActionProof, vmNam
 	if err != nil {
 		return err
 	}
+	source, err := vmHostOf(ctx, c, vmName)
+	if err != nil {
+		return err
+	}
 	now := c.NowTS()
 	stmts := []Statement{
 		proofInsertStmt(c, p, now),
@@ -132,6 +136,9 @@ func WriteVMRescheduleProof(ctx context.Context, c *Client, p ActionProof, vmNam
 	for _, d := range disks {
 		if d.HostName == destHost {
 			continue
+		}
+		if keep, _ := SharedRowKeepsOwner(ctx, c, d, source, destHost); keep {
+			continue // its unproven owner is judged at the destination's start (review I1)
 		}
 		stmts = append(stmts, Statement{
 			SQL:    vmDiskHostMoveSQL,

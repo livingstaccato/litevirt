@@ -113,6 +113,23 @@ func (s *Server) RepairVMOwner(ctx context.Context, req *pb.RepairVMOwnerRequest
 	}
 
 	prev := vm.HostName
+	// A shared disk whose row names a third host not proven off — a partial
+	// promotion's, or one a move left behind — is not re-homed here (review
+	// I1): this host running the VM says nothing about whether that host is
+	// still writing the disk, and a row naming this host is attached unjudged
+	// at the next start.
+	disks, derr := corrosion.GetVMDisks(ctx, s.db, req.GetName())
+	if derr != nil {
+		return nil, status.Errorf(codes.Unavailable, "read the disks of %q: %v", req.GetName(), derr)
+	}
+	for _, d := range disks {
+		if keep, why := corrosion.SharedRowKeepsOwner(ctx, s.db, d, prev, s.hostName); keep {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"vm %q's shared disk %s (at %s) has a row naming %s, which is not proven powered off (%s); repair-owner "+
+					"re-homes it only once it is: once %s is powered off, `lv host fence-confirm %s`, then re-run",
+				req.GetName(), d.DiskName, d.Path, d.HostName, why, d.HostName, d.HostName)
+		}
+	}
 	// Phase 4: repair is an ownership transition, so it advances the owner
 	// epoch through the CAS primitive — closing the "repair-owner writes
 	// ownership without a generation bump" gap. The expected epoch is the row

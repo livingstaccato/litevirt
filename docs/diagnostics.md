@@ -963,6 +963,9 @@ local (never picks an owner by value) and defers to runtime repair.
 - **Manual.** `lv doctor repair-owner <vm> <host>` forwards to `<host>`, which
   re-stamps ownership only if it confirms the VM runs there locally. Use it for
   the segmented case, or to force a specific owner the operator knows is correct.
+  It refuses while a shared disk's row names a third host that is not proven
+  powered off (`vm.shared_disk_withheld`, docs/backups.md), and names
+  `lv host fence-confirm <host>`.
 
 Either way the fresh timestamp wins everywhere by ordinary LWW and clears the
 unresolved tracking. Both also move the VM's `vm_disks` rows to the host that
@@ -1368,9 +1371,9 @@ re-judged it, a redefine — without a shared disk whose row names another host
 that is not proven powered off (a partial promotion leaves such a row naming
 the VM's old owner; docs/backups.md). The VM was started, or defined, without
 that disk. The evidence names each disk, why, and the remedy: once that host
-is powered off, `lv host fence-confirm <host>`, then `lv restart <vm>`; or,
-when the host is up and does not run the VM, `lv doctor repair-owner <vm>
-<host running it>`, then `lv restart <vm>`. `lv inspect <vm>` shows the same
+is powered off, `lv host fence-confirm <host>`, then `lv restart <vm>`. Until
+then no move of the VM re-points that disk's row, and `lv doctor repair-owner`
+refuses to (docs/backups.md). `lv inspect <vm>` shows the same
 text as `sharedDiskWithheld`. It is notified (`vm.shared_disk_withheld` event
 and notification) when raised or when its text changes, and resolves when the
 next build of the VM's domain withholds nothing.

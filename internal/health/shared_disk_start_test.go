@@ -123,12 +123,44 @@ func TestReconcilerStart_ASharedDiskWhoseOwnerIsNotProvenOffIsLeftOut(t *testing
 				}
 				for _, want := range []string{"data1", data1, c.why,
 					"once old-owner is powered off, `lv host fence-confirm old-owner`", "then `lv restart vm1`",
-					"`lv doctor repair-owner vm1 node-a`"} {
+					"no move of vm1 re-homes the disk's row"} {
 					if !strings.Contains(reported[0], want) {
 						t.Errorf("report = %q, want %q", reported[0], want)
 					}
 				}
 			})
 		}
+	}
+}
+
+// Review m1: a withheld BOOT disk does not start a VM with no root: the start
+// waits for the proof. A local start leaves the VM in error with the remedy.
+//
+// Mutation "boot disk like any other" (WithheldBootDisk never finds one) — red.
+func TestReconcilerStart_AWithheldBootDiskDoesNotStartTheVM(t *testing.T) {
+	db := testReconcilerDB(t)
+	ctx := context.Background()
+	data1 := sharedRowVM(t, db, "stopped", `{"onboot":true}`, "node-a")
+	_ = data1
+	if err := db.Execute(ctx, `UPDATE vm_disks SET host_name = 'old-owner', storage_type = 'nfs' WHERE vm_name = 'vm1' AND disk_name = 'root'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{Name: "old-owner", Address: "10.0.0.9", State: "offline"}); err != nil {
+		t.Fatal(err)
+	}
+	fake := libvirtfake.New()
+	r := NewReconciler("node-a", t.TempDir(), db, fake)
+	var reported []string
+	r.SetSharedDiskWithheldReporter(func(_ context.Context, _, d string) { reported = append(reported, d) }, func(context.Context, string) {})
+	r.StartOnbootVMs(ctx)
+	if st, _ := fake.DomainState("vm1"); st == "running" {
+		t.Fatal("vm1 was started without its boot disk")
+	}
+	vm, _ := corrosion.GetVM(ctx, db, "vm1")
+	if vm == nil || vm.State != "error" || !strings.Contains(vm.StateDetail, "boot disk root is withheld") {
+		t.Fatalf("vm1 = %+v, want error naming the withheld boot disk", vm)
+	}
+	if len(reported) != 1 || !strings.Contains(reported[0], "`lv host fence-confirm old-owner`") {
+		t.Errorf("reported %v, want the remedy", reported)
 	}
 }

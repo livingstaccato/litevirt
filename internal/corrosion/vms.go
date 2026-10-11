@@ -1245,6 +1245,10 @@ func TransferVMOwnerWithDisks(ctx context.Context, c *Client, name, hostName, st
 	if err != nil {
 		return err
 	}
+	source, err := vmHostOf(ctx, c, name)
+	if err != nil {
+		return err
+	}
 	now := c.NowTS()
 	stmts := []Statement{{
 		SQL: `UPDATE vms
@@ -1256,6 +1260,9 @@ func TransferVMOwnerWithDisks(ctx context.Context, c *Client, name, hostName, st
 	for _, d := range disks {
 		if d.HostName == hostName {
 			continue
+		}
+		if keep, _ := SharedRowKeepsOwner(ctx, c, d, source, hostName); keep {
+			continue // its unproven owner keeps the row (review I1)
 		}
 		stmts = append(stmts, Statement{
 			SQL:    vmDiskHostMoveSQL,
@@ -1940,6 +1947,9 @@ func CommitMigrationOwnership(ctx context.Context, c *Client, vmName, sourceHost
 		Params: []interface{}{targetHost, finalState, now, vmName},
 	}}
 	for _, d := range expected {
+		if keep, _ := SharedRowKeepsOwner(ctx, c, d, sourceHost, targetHost); keep {
+			continue // its unproven owner keeps the row (review I1); the guard accepts it unchanged
+		}
 		stmts = append(stmts, Statement{
 			SQL:    vmDiskHostMoveSQL,
 			Params: []interface{}{targetHost, now, vmName, d.DiskName},
@@ -2058,11 +2068,18 @@ func RescheduleVMHost(ctx context.Context, c *Client, name, hostName, state stri
 	if err != nil {
 		return err
 	}
+	source, err := vmHostOf(ctx, c, name)
+	if err != nil {
+		return err
+	}
 	now := c.NowTS()
 	stmts := []Statement{{SQL: vmHostStateSQL, Params: []interface{}{hostName, state, now, name}}}
 	for _, d := range disks {
 		if d.HostName == hostName {
 			continue
+		}
+		if keep, _ := SharedRowKeepsOwner(ctx, c, d, source, hostName); keep {
+			continue // its unproven owner keeps the row (review I1)
 		}
 		stmts = append(stmts, Statement{
 			SQL:    vmDiskHostMoveSQL,

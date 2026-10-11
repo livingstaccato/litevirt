@@ -1817,7 +1817,9 @@ func (s *Server) startVMLocked(ctx context.Context, vm *corrosion.VMRecord) (*pb
 	// host is proven off (`lv host fence-confirm`, then `lv restart`), and one
 	// a definition has without that proof is left out. A redefine that fails
 	// leaves the definition as it was, and the VM starts on it, as on main.
-	s.rejudgeSharedDisksForStart(ctx, vm)
+	if err := s.rejudgeSharedDisksForStart(ctx, vm); err != nil {
+		return nil, err
+	}
 	// Adoption gate + PCI start-preflight (shared with the automated restart paths).
 	// No-op pre-latch, so every start behaves byte-for-behavior as before until
 	// hardware_v2 latches.

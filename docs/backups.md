@@ -650,11 +650,29 @@ notification and a durable condition (`vm.shared_disk_withheld`, evaluator
 `shared_disk_start`) that `lv inspect <vm>` shows as `sharedDiskWithheld`
 until a build withholds nothing. It names each disk, why, and the remedy:
 `lv host fence-confirm <host>` once the host is powered off, then
-`lv restart <vm>`; or, when the host is up and does not run the VM (a row a
-move left behind), `lv doctor repair-owner <vm> <this host>`, which re-homes
-the VM's disk rows to the host running it, then `lv restart <vm>`. A disk
-whose row names this host or no host, or that is not on shared storage, is
-attached as before.
+`lv restart <vm>`. A disk whose row names this host or no host, or that is
+not on shared storage, is attached as before. A withheld boot disk (the disk
+named `root`, or the one at `vda`, `sda` or `hda`) is different: a domain
+without it boots nothing, so the VM is not started at all until its host is
+proven off (a recovery retries; a local start records the VM in error with
+the same text, and `lv start` after the confirmation builds it again). An
+operator's `lv start` of a VM that is already running leaves its definition
+alone. Leaving a disk out can change how the guest numbers the disks after it
+(a domain built from the rows gives them consecutive devices), so a guest
+that mounts by `/dev/vdX` rather than by label or UUID may find a different
+filesystem there until the disk is attached again.
+
+Such a row keeps naming its host through every move of the VM until that
+host is proven off: a failover reschedule, a migration's ownership commit,
+failover's move of a stopped VM, and an owner repair re-point every other
+disk row to the VM's new host, but not a shared disk's row that names a
+third host — neither the one the VM leaves nor the one it goes to — that is
+not proven off. Re-pointed, it would read as the new host's own at the next
+start and be attached unjudged. `lv doctor repair-owner` refuses outright
+while the VM has such a row, and names `lv host fence-confirm <host>`. That
+host may be up and not running the VM at all, for example the source of a
+migration whose ownership commit declined; it still has to be proven off,
+which for a host in service means taking it out of service first.
 
 "Shared" here is one definition, used by this rule and by every shared-disk
 fence check (failover's decision, the promoting host's, the host that starts

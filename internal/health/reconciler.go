@@ -1574,6 +1574,17 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	for _, w := range withheld {
 		withheldDisk[w.Disk.DiskName] = true
 	}
+	// A withheld boot disk (review m1): the VM would boot nothing, so the
+	// start waits for the proof instead (a pending transfer retries; a local
+	// start is left in error with the remedy, and `lv start` after the proof
+	// builds it again).
+	if boot, ok := corrosion.WithheldBootDisk(withheld); ok {
+		detail := corrosion.WithheldSharedDiskDetail(vm.Name, r.hostName, withheld)
+		r.reportSharedWithheld(ctx, vm.Name, detail)
+		r.failPendingStart(ctx, vm.Name, proofID, true, fmt.Sprintf("not started: its boot disk %s is withheld; %s",
+			boot.Disk.DiskName, detail))
+		return
+	}
 
 	var diskConfigs []lv.DiskConfig
 	for _, d := range diskRecords {

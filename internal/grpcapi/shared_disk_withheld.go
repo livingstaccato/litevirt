@@ -6,6 +6,9 @@ import (
 	"log/slog"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/notify"
 )
@@ -124,13 +127,31 @@ func (s *Server) hasSharedRowElsewhere(ctx context.Context, disks []corrosion.Di
 // start when one of its shared disks' rows names another host
 // (reconcileDomainDefinition judges each such host). Nothing else is
 // redefined: every other VM starts on its definition exactly as before.
-func (s *Server) rejudgeSharedDisksForStart(ctx context.Context, vm *corrosion.VMRecord) {
+//
+// A running domain is left alone (review m2): a start of a VM that already
+// runs only records it running, and redefining its persistent definition
+// then would drop a disk the running guest has from its next cold start.
+// A withheld boot disk refuses the start (review m1): the domain would boot
+// nothing.
+func (s *Server) rejudgeSharedDisksForStart(ctx context.Context, vm *corrosion.VMRecord) error {
+	if st, err := s.virt.DomainState(vm.Name); err == nil && st == "running" {
+		return nil
+	}
 	disks, err := corrosion.GetVMDisks(ctx, s.db, vm.Name)
 	if err != nil || !s.hasSharedRowElsewhere(ctx, disks) {
-		return
+		return nil
+	}
+	if _, withheld := s.judgeSharedDiskRows(ctx, disks); len(withheld) > 0 {
+		if boot, ok := corrosion.WithheldBootDisk(withheld); ok {
+			detail := corrosion.WithheldSharedDiskDetail(vm.Name, s.hostName, withheld)
+			s.ReportSharedDiskWithheld(ctx, vm.Name, detail)
+			return status.Errorf(codes.FailedPrecondition, "%s is not started: its boot disk %s is withheld; %s",
+				vm.Name, boot.Disk.DiskName, detail)
+		}
 	}
 	if err := s.reconcileDomainDefinition(ctx, vm, nil); err != nil {
 		slog.Warn("start: could not redefine the domain to judge its shared disks again; starting it as defined",
 			"vm", vm.Name, "error", err)
 	}
+	return nil
 }

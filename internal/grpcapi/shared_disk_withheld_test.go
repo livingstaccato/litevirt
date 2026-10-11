@@ -6,6 +6,9 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
@@ -109,8 +112,8 @@ func TestStart_ADefinitionWithAnUnprovenSharedDiskIsRedefinedWithoutIt(t *testin
 		t.Errorf("db state = %q, want running", st)
 	}
 	if got := eventDetail(t, s, "db", vmEventSharedWithheld); !strings.Contains(got, "its owner dead-host is active, not fenced") ||
-		!strings.Contains(got, "`lv doctor repair-owner db test-host`") {
-		t.Errorf("withheld event = %q, want the reason and the repair-owner remedy", got)
+		!strings.Contains(got, "`lv host fence-confirm dead-host`") {
+		t.Errorf("withheld event = %q, want the reason and the fence-confirm remedy", got)
 	}
 }
 
@@ -188,5 +191,52 @@ func TestPromote_AnOwnerWhoseRowsCannotBeReadIsNotProvenOff(t *testing.T) {
 				t.Errorf("a restart attached data1 while its owner's rows cannot be read:\n%s", xml)
 			}
 		})
+	}
+}
+
+// Review m2: `lv start` of a VM that is already running leaves its
+// definition alone, even with a shared row naming an unproven host: it only
+// records the VM running. Review m1: a withheld boot disk refuses a start.
+//
+// Mutation "re-judge a running domain" — red on the first half. Mutation
+// "boot disk like any other" — red on the second.
+func TestStart_ARunningDomainIsLeftAloneAndABootDiskIsNotWithheldSilently(t *testing.T) {
+	s := testServer(t)
+	nfsDisk := nfsPromoteVM(t, s, "active")
+	alreadyPromotedHere(t, s)
+	fake := s.virt.(*libvirtfake.Fake)
+	_ = fake.UndefineDomain("db", false)
+	xml, err := lv.GenerateDomainXML(lv.VMConfig{Name: "db", CPU: 1, MemoryMiB: 256, Disks: []lv.DiskConfig{
+		{Name: "root", Path: "/dead/db-root.qcow2", Bus: "virtio", TargetDev: "vda"},
+		{Name: "data1", Path: nfsDisk, Bus: "virtio", TargetDev: "vdb"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fake.DefineDomain(xml); err != nil {
+		t.Fatal(err)
+	}
+	if err := fake.StartDomain("db"); err != nil {
+		t.Fatal(err)
+	}
+	before := fake.DefinedXML("db")
+	if _, err := s.StartVM(adminCtx(), &pb.StartVMRequest{Name: "db"}); err != nil {
+		t.Logf("StartVM of a running VM: %v", err)
+	}
+	if got := fake.DefinedXML("db"); got != before {
+		t.Errorf("a start of the running db rewrote its definition:\n%s", got)
+	}
+
+	// Its root shared too, on the unproven host: the start is refused.
+	_ = fake.DestroyDomain("db")
+	if err := s.db.Execute(context.Background(), `UPDATE vm_disks SET host_name = 'dead-host', storage_type = 'nfs' WHERE vm_name = 'db' AND disk_name = 'root'`); err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.StartVM(adminCtx(), &pb.StartVMRequest{Name: "db"})
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "boot disk root is withheld") {
+		t.Fatalf("StartVM with its boot disk withheld = %v, want FailedPrecondition naming it", err)
+	}
+	if st, _ := fake.DomainState("db"); st == "running" {
+		t.Error("db started without its boot disk")
 	}
 }

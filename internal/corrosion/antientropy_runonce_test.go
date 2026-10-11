@@ -8,7 +8,8 @@ import (
 
 // TestAntiEntropyRunOnce_Debounce: RunOnce runs a pass, then no-ops within the cooldown or
 // while a pass is in progress — so `lv cluster converge --all` in a loop can't hammer a node.
-// (checkPeers is a no-op here: a test client has no peers.)
+// A test client has no peers, and a pass that finds none starts no cooldown (it exchanged
+// nothing — see runGuarded), so the pass that must start one is stubbed as having had peers.
 func TestAntiEntropyRunOnce_Debounce(t *testing.T) {
 	c, err := NewTestClient()
 	if err != nil {
@@ -21,8 +22,8 @@ func TestAntiEntropyRunOnce_Debounce(t *testing.T) {
 	ae := NewAntiEntropy(c, "", time.Minute)
 	ctx := context.Background()
 
-	if !ae.RunOnce(ctx) {
-		t.Fatal("first RunOnce should run")
+	if !ae.runGuarded(func() bool { return true }, passOperator) {
+		t.Fatal("first operator pass should run")
 	}
 	if ae.RunOnce(ctx) {
 		t.Fatal("RunOnce within cooldown should debounce")

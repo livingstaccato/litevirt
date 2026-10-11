@@ -95,6 +95,10 @@ type NICGuardRecord struct {
 	// incarnation it replaces: the guard a NIC had, which a create must
 	// never drop (switch review I2). Not stored.
 	Carried bool `json:"-"`
+	// Explicit marks, in memory only, a record whose guard settings the
+	// request named (spoof_guard and the rest), even with the default's
+	// shape: what was asked for is never dropped (switch re-review N3).
+	Explicit bool `json:"-"`
 }
 
 // Guarded reports whether the record turns the guard on.

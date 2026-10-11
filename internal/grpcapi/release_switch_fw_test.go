@@ -255,8 +255,10 @@ firewall:
 	if err := s.persistStackFirewall(ctx, parse("2001:db8::/32")); err != nil {
 		t.Fatalf("an IPv6 stack firewall after the latch: %v", err)
 	}
-	if len(g.used) != 3 {
-		t.Errorf("uses recorded = %v, want firewall_ipv6 ahead of each of the three IPv6 rows", g.used)
+	// One up front, before the stack's old rows are torn down (re-review
+	// N2), then one ahead of each of the three IPv6 rows.
+	if len(g.used) != 4 {
+		t.Errorf("uses recorded = %v, want firewall_ipv6 before the teardown and ahead of each of the three IPv6 rows", g.used)
 	}
 }
 
@@ -463,5 +465,123 @@ func TestSwitchFix_GateFailureKeepsItsCode(t *testing.T) {
 	}
 	if code, _ := gateFailure(errors.New("disk full")); code != codes.Internal {
 		t.Errorf("a plain error: %v, want Internal", code)
+	}
+}
+
+// policyLatchGate is a server gate whose failover_scope_v1 latch forms when
+// it is driven (Enforced), as a host that just joined forms it.
+type policyLatchGate struct {
+	fakeServerGate
+	latched *bool
+	driven  int
+}
+
+func (g *policyLatchGate) Enforced(_ context.Context, token string) bool {
+	if token == capabilities.FailoverScopeV1 {
+		g.driven++
+		*g.latched = true
+		return true
+	}
+	return false
+}
+
+// TestSwitchFix2_CarriedNeverDroppedBeforeThePolicyLatch (switch re-review
+// N1): on a host whose own failover_scope_v1 latch has not formed (one that
+// just joined), a carried guard is not dropped: the latch is driven here, and
+// if it still cannot form the re-create is refused. A default guard is left
+// out, as before.
+func TestSwitchFix2_CarriedNeverDroppedBeforeThePolicyLatch(t *testing.T) {
+	ctx := context.Background()
+	s := guardServer(t, true)
+	latched := false
+	s.db.SetClusterPolicyGate(func() bool { return latched })
+
+	carried := r6VM(t, s, "rebuilt", "52:54:00:00:0d:01")
+	d := guardDecision{carry: &carried[0]}
+	rec := d.record("rebuilt", "u-rebuilt", 0, "52:54:00:00:0d:01", &pb.NetworkAttachment{Name: "lan"})
+	if err := s.writeNewNICGuards(ctx, []corrosion.NICGuardRecord{*rec}); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("a carried guard before this host's policy latch, latch not formable: %v, want FailedPrecondition", err)
+	}
+	def := r6VM(t, s, "fresh", "52:54:00:00:0d:02")
+	if err := s.writeNewNICGuards(ctx, def); err != nil {
+		t.Errorf("a default guard before the policy latch failed the create: %v", err)
+	}
+
+	g := &policyLatchGate{latched: &latched}
+	s.SetGate(g)
+	if err := s.writeNewNICGuards(ctx, []corrosion.NICGuardRecord{*rec}); err != nil {
+		t.Fatalf("a carried guard once the policy latch can form here: %v", err)
+	}
+	if got, _ := corrosion.GetNICGuard(ctx, s.db, "rebuilt", "52:54:00:00:0d:01"); got == nil || g.driven == 0 {
+		t.Errorf("the carried guard was not written after driving the latch (driven %d): %+v", g.driven, got)
+	}
+}
+
+// TestSwitchFix2_ExplicitNeverDropped (switch re-review N3): a guard the
+// request asked for — `spoof_guard: on`, even with no relaxation, so with the
+// default's shape — is never dropped: a gate that fails its first use fails
+// the create. Only an implicit default falls back.
+func TestSwitchFix2_ExplicitNeverDropped(t *testing.T) {
+	ctx := context.Background()
+	s := guardServer(t, true)
+	g := guardRelease(s)
+	g.refuseFirstUse, g.refuseCode = true, codes.Unavailable
+	r6VM(t, s, "asked", "52:54:00:00:0d:03")
+	var d guardDecision
+	rec := d.record("asked", "u-asked", 0, "52:54:00:00:0d:03", &pb.NetworkAttachment{Name: "lan", SpoofGuard: "on"})
+	if err := s.writeNewNICGuards(ctx, []corrosion.NICGuardRecord{*rec}); err == nil {
+		t.Error("an explicit `spoof_guard: on` the gate refused was dropped silently; the create must fail")
+	}
+	implicit := d.record("asked", "u-asked", 0, "52:54:00:00:0d:03", &pb.NetworkAttachment{Name: "lan"})
+	if err := s.writeNewNICGuards(ctx, []corrosion.NICGuardRecord{*implicit}); err != nil {
+		t.Errorf("an implicit default the gate refused failed the create: %v", err)
+	}
+}
+
+// TestSwitchFix2_StackFirstUseBeforeTeardown (switch re-review N2): a stack
+// redeploy holding an IPv6 row takes the firewall_ipv6 first use before it
+// tears anything down: a first use the gate cannot complete (a recipient that
+// never acks) leaves every old row, default-deny included, as it was.
+func TestSwitchFix2_StackFirstUseBeforeTeardown(t *testing.T) {
+	ctx := context.Background()
+	s := testServer(t)
+	g := &relGate{t: t, open: true}
+	s.SetReleaseFeatureGate(g)
+	parse := func(cidr string) *compose.File {
+		t.Helper()
+		f, err := compose.ParseBytes([]byte(`
+name: dd
+security-groups:
+  web:
+    rules:
+      - {direction: ingress, proto: tcp, port: "80", cidr: "10.0.0.0/8", action: accept}
+      - {direction: ingress, proto: tcp, port: "443", cidr: "` + cidr + `", action: accept}
+firewall:
+  default-deny: true
+  cluster-rules:
+    - {direction: ingress, proto: tcp, port: "22", cidr: "10.0.0.0/8", action: accept}
+`))
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		return f
+	}
+	if err := s.persistStackFirewall(ctx, parse("10.1.0.0/16")); err != nil {
+		t.Fatal(err)
+	}
+	g.refuseFirstUse, g.refuseCode = true, codes.Unavailable
+	if err := s.persistStackFirewall(ctx, parse("2001:db8::/32")); err == nil {
+		t.Fatal("a redeploy whose IPv6 first use was refused reported success")
+	}
+	def, err := corrosion.GetFirewallDefault(ctx, s.db, "cluster")
+	if err != nil || def == nil || !def.DefaultDeny {
+		t.Errorf("the stack's default-deny was torn down by a refused redeploy: %+v %v", def, err)
+	}
+	sgs, _ := corrosion.ListSecurityGroups(ctx, s.db, "dd")
+	rules, _ := corrosion.ListClusterFirewallRules(ctx, s.db)
+	if len(sgs) != 1 || len(rules) != 1 {
+		t.Errorf("a refused redeploy changed the stack's rows: groups %+v, cluster rules %+v", sgs, rules)
+	} else if r, _ := corrosion.ListSGRules(ctx, s.db, sgs[0].ID); len(r) != 2 {
+		t.Errorf("a refused redeploy changed the stack's rules: %+v", r)
 	}
 }

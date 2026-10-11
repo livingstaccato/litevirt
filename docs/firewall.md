@@ -338,8 +338,8 @@ lv firewall ipset add admins --cidr 10.0.0.0/8 --cidr 2001:db8:1::/48
 
 - An IPv6 CIDR renders as `ip6 saddr` / `ip6 daddr`. `icmp` is ICMP for IPv4;
   `icmp` with an IPv6 CIDR is refused, since it could match nothing.
-- `icmpv6` (or `ipv6-icmp`) is ICMPv6 with an IPv6 CIDR or a set reference —
-  `--cidr ::/0` for any source. With no CIDR, or an IPv4 one, it is the shape
+- `icmpv6` (or `ipv6-icmp`) is ICMPv6 with an IPv6 CIDR, or with a reference
+  to a set holding IPv6 elements — `--cidr ::/0` for any source. With no CIDR, or an IPv4 one, it is the shape
   earlier releases accepted, and it keeps their meaning: it renders as
   `ip protocol icmpv6`, matching IPv4 packets of protocol 58, which is to say
   nothing a guest sends.
@@ -616,12 +616,18 @@ with a warning, as before guards; a request that sets guard options, and
 first (nic_guards needs release_2026_11_v1)", naming the hosts that hold the
 release back, rather than silently unguarded. Once a guard exists anywhere, a
 host whose own latch has not formed yet (one that just joined) asks the gate,
-which forms it there. A NIC's default guard never fails or slows a create,
-clone, import or hot-attach: its gate call is bounded at three seconds, and if
-the gate refuses it or does not answer in time (a host that does not
-acknowledge the first use), the NIC is created unguarded, as before guards,
-with a warning. A guard a re-create carries from the incarnation it replaces is
-never dropped: if the gate refuses it, the re-create fails. A
+which forms it there. A NIC's implicit default guard — the one it gets when
+the request names no guard setting — never fails a create, clone, import or
+hot-attach: its gate call is bounded at three seconds, and if the gate refuses
+it or does not answer in time, the NIC is created unguarded, as before guards,
+with a warning. While a host does not acknowledge the first use of `nic_guards`
+(one in maintenance and powered off, or in release probation), every such
+operation waits those three seconds again and creates its NICs unguarded:
+`lv cluster upgrade-status` names the host, and bringing it back, or removing
+it with `lv cluster voter rm`, ends it. A guard the request names (`spoof_guard`
+and the other guard settings, `on` included), and one a re-create carries from
+the incarnation it replaces, are never dropped: if the gate refuses them, or
+this host's own `failover_scope_v1` latch cannot form, the create fails. A
 container whose guards cannot be written for any other reason is not created. A record is retired (tombstoned) when its
 VM or container is deleted, and a record written for another incarnation of the
 same VM name guards nothing; a re-create carries only the guard state of the

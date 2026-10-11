@@ -169,6 +169,7 @@ func (d guardDecision) record(vm, uuid string, ordinal int, mac string, att *pb.
 	// and the addresses of its native VLAN; which VLANs it carries is its
 	// network's to allow (re-review R2-I1).
 	r := newNICGuardRecord(vm, uuid, ordinal, mac, att)
+	r.Explicit = nicGuardExplicit(att)
 	return &r
 }
 
@@ -430,34 +431,49 @@ var defaultGuardGateBudget = 3 * time.Second
 // writeNewNICGuards records the guards of NICs being created, through the
 // release feature nic_guards (merge checklist M8).
 //
-// A record a re-create carries, or one the request set explicitly
-// (admitNICGuards has passed it), is written through the gate unbounded, and
-// a refusal fails the create: a carried guard is never dropped (switch review
-// I2).
+// Records are classed by origin, not shape (switch re-review N3). A record a
+// re-create carries, or one whose settings the request named (Explicit), is
+// never dropped: it is written through the gate unbounded, and a refusal
+// fails the create (switch review I2). On a host whose own
+// failover_scope_v1 latch has not formed (one that just joined), the latch
+// is driven here first, and the create is refused if it still cannot form
+// (N1).
 //
-// A NIC's default guard never fails or slows a create (I1). Until the release
-// token has latched here and nic_guards is unused, it is left out without
-// asking the gate (a mid-roll create: the NIC is unguarded, as on main). Once
-// either holds — the feature already used counts, so a node whose own latch
-// lags goes through the gate, which forms the latch there (I2) — it goes
-// through the gate within defaultGuardGateBudget, and any refusal or timeout
-// leaves it out the same way, with a warning. A failure to write a granted
-// record fails the create.
+// Only an implicit default — the guard a new NIC gets when nothing asked —
+// never fails or slows a create (I1). Before the cluster_policies gate is
+// open it is left out. Until the release token has latched here and
+// nic_guards is unused, it is left out without asking the gate (a mid-roll
+// create: the NIC is unguarded, as on main). Once either holds — the feature
+// already used counts, so a node whose own latch lags goes through the gate,
+// which forms the latch there (I2) — it goes through the gate within
+// defaultGuardGateBudget, and any refusal or timeout leaves it out the same
+// way, with a warning. A failure to write a granted record fails the create.
 func (s *Server) writeNewNICGuards(ctx context.Context, recs []corrosion.NICGuardRecord) error {
 	if len(recs) == 0 {
 		return nil
 	}
-	if !s.db.MayWriteClusterPolicy() {
-		slog.Warn("NIC guard: creating NICs unguarded; guards cannot be recorded until failover_scope_v1 has latched",
-			"vm", recs[0].VMName, "nics", len(recs))
-		return nil
-	}
 	var must, defaults []corrosion.NICGuardRecord
 	for _, r := range recs {
-		if r.Carried || !isDefaultGuard(r) {
+		if r.Carried || r.Explicit || !isDefaultGuard(r) {
 			must = append(must, r)
 		} else {
 			defaults = append(defaults, r)
+		}
+	}
+	if !s.db.MayWriteClusterPolicy() {
+		if len(must) == 0 {
+			slog.Warn("NIC guard: creating NICs unguarded; guards cannot be recorded until failover_scope_v1 has latched",
+				"vm", recs[0].VMName, "nics", len(recs))
+			return nil
+		}
+		if s.gate != nil {
+			s.gate.Enforced(ctx, capabilities.FailoverScopeV1) // form this host's latch, as a joiner's lags
+		}
+		if !s.db.MayWriteClusterPolicy() {
+			return status.Errorf(codes.FailedPrecondition,
+				"the guard of NIC %s cannot be recorded on %s until failover_scope_v1 has latched here; a guard the request "+
+					"asked for, or one a re-create carries, is never dropped: retry once it has (`lv cluster upgrade-status`)",
+				must[0].MAC, s.hostName)
 		}
 	}
 	if len(must) > 0 {

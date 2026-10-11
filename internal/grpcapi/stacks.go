@@ -261,10 +261,10 @@ func (s *Server) persistStackFirewall(ctx context.Context, f *compose.File) erro
 			return fmt.Errorf("security-group %q is already defined by %s (id %s); names must be unique", name, owner, held.ID)
 		}
 	}
-	// Every row is validated, and an IPv6 one cleared with the release gate's
-	// non-recording check, before the stack's rows are torn down (switch
-	// review m2): a refusal leaves them as they were, and a deploy refused for
-	// a malformed row records no use.
+	// Every row is validated, and an IPv6 one's release feature taken, before
+	// the stack's rows are torn down (switch review m2, re-review N2): a
+	// refusal leaves them as they were, and a deploy refused for a malformed
+	// row records no use.
 	anyV6 := false
 	for name, sg := range f.SecurityGroups {
 		for _, r := range sg.Rules {
@@ -292,7 +292,14 @@ func (s *Server) persistStackFirewall(ctx context.Context, f *compose.File) erro
 		}
 	}
 	if anyV6 {
-		if err := s.ReleaseFeatureRefusal(ctx, capabilities.FeatureFirewallIPv6); err != nil {
+		// The first use is taken — recorded and acknowledged by every
+		// recipient — before anything is torn down (switch re-review N2): a
+		// first use the gate cannot complete leaves every old row, the
+		// stack's default-deny included, as it was. The rows below then pass
+		// on the recorded use.
+		if err := s.WithReleaseFeature(ctx, capabilities.FeatureFirewallIPv6, func(context.Context, capabilities.FeatureGrant) error {
+			return nil
+		}); err != nil {
 			return err
 		}
 	}

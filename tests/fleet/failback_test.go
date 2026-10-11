@@ -894,6 +894,114 @@ func TestFleet_Failback_AnUnacknowledgingRecipientNeverSlowsADrain(t *testing.T)
 	}
 }
 
+// freshQuorum beats every node's checker once and seeds a fresh peer view: the
+// view enforceGate seeded predates any gap since the checker's last beat, which
+// it reads as a stall (the HA monitor beats and probes in production). A slow
+// run (-race) opens such gaps between steps.
+func freshQuorum(f *fbScenario, gates map[string]*health.Checker) {
+	for _, n := range f.c.Nodes {
+		gates[n.Name].QuorumProof(context.Background())
+		peers := map[string]bool{}
+		for _, o := range f.c.Nodes {
+			if o != n {
+				peers[o.Name] = true
+			}
+		}
+		gates[n.Name].SeedPeersForTests(peers)
+	}
+}
+
+// A drain's record describes the drain's move, not whatever placement the VM
+// has by the time the record is written. Records are written after the drain's
+// frames, behind a first use that can wait seconds for acknowledgements; in
+// that window an operator moves the VMs out and back by hand (b -> x -> b).
+// The records, when they land, must not describe the operator's placement, or
+// a failback would take back VMs an operator placed.
+//
+// Mutation: build the record from the VM's row at write time (drop the
+// placement the worker read when the move finished) - v2, whose record is
+// written after the hand moves, is moved back to a.
+func TestFleet_Failback_ARecordDescribesTheDrainsMoveNotALaterOne(t *testing.T) {
+	ctx := context.Background()
+	f, gates := startFB(t, 3)
+	latchFailoverScope(t, f.c, gates)
+	latchReleaseToken(t, f.c, gates)
+	f.xOut(t)
+	t.Cleanup(grpcapi.SetDrainRecordTimingForTest(30*time.Second, time.Second))
+
+	// x holds back its acknowledgement of the first use until released, so the
+	// records wait behind it.
+	held := make(chan struct{})
+	gates[f.a.Name].SetReleaseUseConfirmer(func(cctx context.Context, host, tok, feature string) (bool, error) {
+		if host == f.x.Name {
+			select {
+			case <-held:
+			default:
+				return false, nil
+			}
+		}
+		return f.a.Server.PeerHoldsReleaseFeatureUse(cctx, host, tok, feature)
+	})
+
+	f.addVM(t, "v1", f.a, nil)
+	f.addVM(t, "v2", f.a, nil)
+	freshQuorum(f, gates)
+	emulateLibvirtMove(f.a, f.b)
+	st, err := f.c.SelfClient(f.a).DrainHost(ctx, &pb.DrainHostRequest{Name: f.a.Name})
+	if err != nil {
+		t.Fatalf("DrainHost: %v", err)
+	}
+	for {
+		p, rerr := st.Recv()
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			t.Fatalf("drain: %v", rerr)
+		}
+		if p.Error != "" {
+			t.Fatalf("drain of %s: %s", p.VmName, p.Error)
+		}
+	}
+	f.c.WaitConverged(t, convergeTimeout, f.a, f.b)
+
+	// The operator moves both out and back while the records wait.
+	f.xIn(t)
+	for _, vm := range []string{"v1", "v2"} {
+		freshQuorum(f, gates)
+		emulateLibvirtMove(f.b, f.x)
+		if err := migrateAt(t, f.c, f.b, vm, f.x.Name); err != nil {
+			t.Fatalf("operator migrate %s: %v", vm, err)
+		}
+		f.c.WaitConverged(t, convergeTimeout)
+		freshQuorum(f, gates)
+		emulateLibvirtMove(f.x, f.b)
+		if err := migrateAt(t, f.c, f.x, vm, f.b.Name); err != nil {
+			t.Fatalf("operator migrate %s back: %v", vm, err)
+		}
+		f.c.WaitConverged(t, convergeTimeout)
+	}
+	close(held)
+	f.a.Server.WaitDrainRecordsForTest()
+	f.c.WaitConverged(t, convergeTimeout)
+
+	freshQuorum(f, gates)
+	f.undrainSettled(t, f.a)
+	emulateLibvirtMove(f.b, f.a)
+	got, err := f.failback(t, f.x, &pb.FailbackHostRequest{All: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, vm := range []string{"v1", "v2"} {
+		if p := got[vm]; p != nil && p.Status == "moved" {
+			t.Errorf("%s was moved back although an operator placed it by hand after the drain: %+v", vm, p)
+		}
+		if h := f.vmAt(t, f.a, vm).HostName; h != f.b.Name {
+			t.Errorf("%s is on %s, want it left on %s", vm, h, f.b.Name)
+		}
+	}
+}
+
 // The drained host's record is the last thing a drain writes and the first to be
 // lost when the host goes away: it powers off for maintenance before the record
 // has reached anyone. The VM, meanwhile, is moved by an operator out and back

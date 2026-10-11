@@ -399,8 +399,17 @@ line, bounded to 3 seconds; one that is refused or times out (the first use
 waits for every host to acknowledge the feature, and a host that is down cannot)
 is skipped, put on the VM's events (`vm.failback`) and audited, and further
 records are skipped without asking again for a backoff of 5 seconds doubling
-to 5 minutes. A VM whose record was skipped is not failed back; `lv migrate`
-moves it by hand.
+to 5 minutes. The backoff is lifted as soon as this host holds an acknowledged
+use of the feature (another host completed the first use), since the record is
+then a plain local write. A VM whose record was skipped is not failed back;
+`lv migrate` moves it by hand.
+
+The records may land a moment after the drain returns, so stopping the daemon
+at once can lose them: a stopping daemon waits up to 3 seconds for the records
+still queued, then gives up on the rest, logs each VM whose record it
+abandoned at Warn and puts it on the VM's events (`vm.failback`). Those VMs are
+not failed back. A record describes the drain's own move: a VM moved again
+(say out and back by hand) before its record was written gets none.
 
 A VM returns only while its record still describes it exactly. One that an
 operator has since moved by hand, that a failover recovered, that was deleted

@@ -194,24 +194,41 @@ func (s *Server) failbackFeatureGate(_ context.Context) error {
 		capabilities.FeatureDrainFailback, featureToken(capabilities.FeatureDrainFailback))
 }
 
-// recordDrainOrigin notes that a drain of from moved vmName to to. It records
-// only a VM the drain really left on to, and only through the drain_failback
-// release feature's gate; when that refuses, failback is unavailable for that
-// VM, the safe direction, and the drain itself is never refused. attempted is
-// false when nothing went to the gate: the release token has not latched (a
-// local read), or the VM is no longer where the drain put it.
-func (s *Server) recordDrainOrigin(ctx context.Context, vmName, from, to string) (attempted bool, err error) {
+// drainOriginOf is the record a drain of j.from that moved j.vm to j.to
+// writes, and whether it writes one at all. It writes one only for a VM the
+// drain really left on j.to, and only once the drain_failback release feature
+// is available (a local read): until then failback is unavailable for that VM,
+// the safe direction, and the drain itself is never refused.
+//
+// The record describes the drain's move: j.at, read when the move finished,
+// when the worker could read it. A VM that has moved again since (out and back
+// by hand, say) no longer has that placement, and gets no record: one built
+// from its current row would describe the operator's placement, and a failback
+// would take it back.
+func (s *Server) drainOriginOf(ctx context.Context, j drainRecordJob) (corrosion.DrainOrigin, bool) {
 	if s.failbackFeatureGate(ctx) != nil {
-		slog.Info("drain: not recorded for failback: the upgrade has not finished on every host", "vm", vmName)
-		return false, nil
+		slog.Info("drain: not recorded for failback: the upgrade has not finished on every host", "vm", j.vm)
+		return corrosion.DrainOrigin{}, false
 	}
-	vm, gerr := corrosion.GetVM(ctx, s.db, vmName)
-	if gerr != nil || vm == nil || vm.HostName != to {
-		return false, nil
+	vm, gerr := corrosion.GetVM(ctx, s.db, j.vm)
+	if gerr != nil || vm == nil || vm.HostName != j.to {
+		return corrosion.DrainOrigin{}, false
 	}
-	gen, _ := corrosion.GetPlacementGen(ctx, s.db, vmName)
-	o := corrosion.DrainOrigin{VM: vmName, From: from, To: to, Epoch: vm.OwnerEpoch, CreatedAt: vm.CreatedAt, Gen: gen}
-	return true, s.WithReleaseFeature(ctx, capabilities.FeatureDrainFailback, func(ctx context.Context, g capabilities.FeatureGrant) error {
+	gen, gerr := corrosion.GetPlacementGen(ctx, s.db, j.vm)
+	if gerr != nil {
+		return corrosion.DrainOrigin{}, false
+	}
+	now := drainPlacement{epoch: vm.OwnerEpoch, createdAt: vm.CreatedAt, gen: gen}
+	if j.at != nil && *j.at != now {
+		slog.Info("drain: not recorded for failback: the VM has moved again since the drain moved it", "vm", j.vm, "to", j.to)
+		return corrosion.DrainOrigin{}, false
+	}
+	return corrosion.DrainOrigin{VM: j.vm, From: j.from, To: j.to, Epoch: now.epoch, CreatedAt: now.createdAt, Gen: now.gen}, true
+}
+
+// recordDrainOrigin writes o through the drain_failback release feature's gate.
+func (s *Server) recordDrainOrigin(ctx context.Context, o corrosion.DrainOrigin) error {
+	return s.WithReleaseFeature(ctx, capabilities.FeatureDrainFailback, func(ctx context.Context, g capabilities.FeatureGrant) error {
 		return corrosion.PutDrainOrigin(ctx, s.db, g, o, "drain")
 	})
 }
@@ -229,6 +246,11 @@ var (
 	drainRecordBackoffMax = 5 * time.Minute
 )
 
+// DrainRecordStopWait is how long a stopping daemon waits for the drain
+// records still queued before it abandons them (FinishDrainRecords): one
+// record's budget.
+const DrainRecordStopWait = 3 * time.Second
+
 // drainRecorder writes drain records after each VM's progress frame has been
 // sent, one at a time, on its own goroutine per drain, so the drain's result
 // collector never waits on the release gate (secure, don't remove: a drain is a
@@ -239,66 +261,195 @@ type drainRecorder struct {
 	until time.Time     // no attempt before this
 	delay time.Duration // the next backoff
 	wg    sync.WaitGroup
+	// pending is every record queued and not yet written or skipped, by a
+	// sequence number; stop, once called, abandons them (FinishDrainRecords).
+	pending map[uint64]drainRecordJob
+	seq     uint64
+	stopCtx context.Context
+	stop    context.CancelFunc
 }
 
-type drainRecordJob struct{ vm, from, to string }
+// drainPlacement is a VM's ownership epoch, creation time and placement
+// generation: what a drain record says the drain left it with.
+type drainPlacement struct {
+	epoch     int64
+	createdAt string
+	gen       int64
+}
+
+type drainRecordJob struct {
+	vm, from, to string
+	// at is the VM's placement read when its move finished; nil when that read
+	// did not find it on to, and the record is then built from its row when
+	// it is written.
+	at *drainPlacement
+	id uint64
+}
+
+// stopping is the context a stop cancels. Callers hold r.mu.
+func (r *drainRecorder) stopping() context.Context {
+	if r.stopCtx == nil {
+		r.stopCtx, r.stop = context.WithCancel(context.Background())
+	}
+	return r.stopCtx
+}
+
+// refused starts the backoff after a refused or timed-out record and returns
+// how long it runs. A refusal that finds a backoff already running (two drains'
+// attempts in flight at once) keeps that one rather than doubling again.
+func (r *drainRecorder) refused(now time.Time) time.Duration {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if now.Before(r.until) {
+		return r.until.Sub(now)
+	}
+	if r.delay == 0 {
+		r.delay = drainRecordBackoffMin
+	}
+	r.until = now.Add(r.delay)
+	backoff := r.delay
+	r.delay = min(2*r.delay, drainRecordBackoffMax)
+	return backoff
+}
+
+// drainPlacementOf reads the placement a finished drain move left vm with on
+// to, for its record; nil when the move did not leave it there.
+func (s *Server) drainPlacementOf(ctx context.Context, vmName, to string) *drainPlacement {
+	vm, err := corrosion.GetVM(ctx, s.db, vmName)
+	if err != nil || vm == nil || vm.HostName != to {
+		return nil
+	}
+	gen, err := corrosion.GetPlacementGen(ctx, s.db, vmName)
+	if err != nil {
+		return nil
+	}
+	return &drainPlacement{epoch: vm.OwnerEpoch, createdAt: vm.CreatedAt, gen: gen}
+}
 
 // startDrainRecords starts the recorder of one drain and returns the function
 // that queues a record (never blocking: the queue holds every VM of the drain)
 // and the one that closes the queue. The records outlive the drain's RPC: they
-// run under ctx without its cancellation.
-func (s *Server) startDrainRecords(ctx context.Context, n int) (add func(vm, from, to string), done func()) {
+// run under ctx without its cancellation, until the daemon stops
+// (FinishDrainRecords).
+func (s *Server) startDrainRecords(ctx context.Context, n int) (add func(drainRecordJob), done func()) {
+	r := &s.drainRecords
 	q := make(chan drainRecordJob, n)
-	base := context.WithoutCancel(ctx)
-	s.drainRecords.wg.Add(1)
+	base, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	r.mu.Lock()
+	unhook := context.AfterFunc(r.stopping(), cancel)
+	r.mu.Unlock()
+	r.wg.Add(1)
 	go func() {
-		defer s.drainRecords.wg.Done()
+		defer r.wg.Done()
+		defer cancel()
+		defer unhook()
 		for j := range q {
-			s.recordDrainOriginBounded(base, j)
+			if base.Err() == nil { // else the daemon stopped and named it
+				s.recordDrainOriginBounded(base, j)
+			}
+			r.mu.Lock()
+			delete(r.pending, j.id)
+			r.mu.Unlock()
 		}
 	}()
 	var once sync.Once
-	return func(vm, from, to string) {
+	return func(j drainRecordJob) {
+			r.mu.Lock()
+			r.seq++
+			j.id = r.seq
+			if r.pending == nil {
+				r.pending = map[uint64]drainRecordJob{}
+			}
+			r.pending[j.id] = j
+			r.mu.Unlock()
 			select {
-			case q <- drainRecordJob{vm, from, to}:
+			case q <- j:
 			default: // cannot happen (sized for the drain); never block the drain
-				slog.Warn("drain: record queue full; not recorded for failback", "vm", vm)
+				r.mu.Lock()
+				delete(r.pending, j.id)
+				r.mu.Unlock()
+				slog.Warn("drain: record queue full; not recorded for failback", "vm", j.vm)
 			}
 		}, func() {
 			once.Do(func() { close(q) })
 		}
 }
 
+// FinishDrainRecords is the daemon's graceful stop for drain records. A drain
+// returns before its records are written, and the host it drained is the one
+// about to go down (`lv host drain a && systemctl stop litevirt`), so the stop
+// waits up to wait for the records still queued. Then it abandons the rest: the
+// attempt in flight is cancelled, nothing queued behind it is tried, and every
+// VM whose record was abandoned is logged at Warn and put on its events (a
+// local event, which replicates when the host returns). It returns those VMs.
+// A VM without its record is not failed back; `lv migrate` moves it by hand.
+// An attempt that completes in the instant of the stop may still land: it is
+// then an ordinary record.
+func (s *Server) FinishDrainRecords(wait time.Duration) []string {
+	r := &s.drainRecords
+	finished := make(chan struct{})
+	go func() { r.wg.Wait(); close(finished) }()
+	select {
+	case <-finished:
+		return nil
+	case <-time.After(wait):
+	}
+	r.mu.Lock()
+	r.stopping()
+	r.stop()
+	ids := make([]uint64, 0, len(r.pending))
+	for id := range r.pending {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, k int) bool { return ids[i] < ids[k] })
+	jobs := make([]drainRecordJob, 0, len(ids))
+	for _, id := range ids {
+		jobs = append(jobs, r.pending[id])
+	}
+	r.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	var vms []string
+	for _, j := range jobs {
+		vms = append(vms, j.vm)
+		slog.Warn("daemon stopping: drain record abandoned; the VM is not failed back",
+			"vm", j.vm, "from", j.from, "to", j.to, "waited", wait)
+		s.drainRecordSkipped(ctx, j, "the daemon stopped before it was written")
+	}
+	return vms
+}
+
 // recordDrainOriginBounded is one record, bounded by drainRecordBudget and
-// skipped during a backoff. A skip is audited and put on the VM's events.
+// skipped during a backoff. A skip is audited and put on the VM's events. A VM
+// that would get no record anyway gets no skip either. The backoff stands in
+// for the gate's answer, so it is lifted when this replica holds an
+// acknowledged use of the feature: the gate then passes on its local path.
 func (s *Server) recordDrainOriginBounded(ctx context.Context, j drainRecordJob) {
+	o, ok := s.drainOriginOf(ctx, j)
+	if !ok {
+		return
+	}
 	r := &s.drainRecords
 	r.mu.Lock()
 	until := r.until
 	r.mu.Unlock()
-	if time.Now().Before(until) {
+	if time.Now().Before(until) && !releaseFeatureAckedHere(ctx, s.db, capabilities.FeatureDrainFailback) {
 		s.drainRecordSkipped(ctx, j, fmt.Sprintf("an earlier record was refused; not retried before %s", until.UTC().Format(time.RFC3339)))
 		return
 	}
 	rctx, cancel := context.WithTimeout(ctx, drainRecordBudget)
-	attempted, err := s.recordDrainOrigin(rctx, j.vm, j.from, j.to)
+	err := s.recordDrainOrigin(rctx, o)
 	cancel()
-	if !attempted {
-		return
-	}
-	r.mu.Lock()
 	if err == nil {
+		r.mu.Lock()
 		r.until, r.delay = time.Time{}, 0
 		r.mu.Unlock()
 		return
 	}
-	if r.delay == 0 {
-		r.delay = drainRecordBackoffMin
+	if ctx.Err() != nil {
+		return // the daemon stopped; FinishDrainRecords names it
 	}
-	r.until = time.Now().Add(r.delay)
-	backoff := r.delay
-	r.delay = min(2*r.delay, drainRecordBackoffMax)
-	r.mu.Unlock()
+	backoff := r.refused(time.Now())
 	reason := status.Convert(err).Message()
 	if rctx.Err() != nil && status.Code(err) != codes.FailedPrecondition {
 		reason = fmt.Sprintf("the release gate did not answer within %s: %s", drainRecordBudget, reason)

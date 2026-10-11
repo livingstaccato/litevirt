@@ -206,6 +206,15 @@ var firstShapeAcks = map[string]string{
 		"previous-release shapes, in the same batch — so no new hosts shape exists at all. The apply path's " +
 		"absorbUnlatchedMembershipWrite updates host_membership inside the WAL apply transaction and never " +
 		"logs a statement for it",
+	"host_runtime": "every writer (InsertHost, UpdateHostStartup, UpdateHostVersion, UpdateHostResources and " +
+		"corrosion.SplitHostRuntime) goes through Client.withRuntimeWrite or checks Client.MayWriteHostRuntime, " +
+		"and writes only the hosts columns, in their previous-release shapes, while it is false. The gate is " +
+		"the durable host_runtime_split_v1 marker — mandatory, so advertised by every build carrying this " +
+		"table and by none that does not, and in capabilities.replicationGated, so it is confirmed against " +
+		"every memberlist recipient rather than the voting members only. It fails CLOSED when unwired, so the " +
+		"latch cannot form while a previous-release peer is listening. After the latch the hosts columns are " +
+		"still written, in their previous-release shapes, in the same batch. absorbUnlatchedRuntimeWrite and " +
+		"the re-admission reset write host_runtime inside the apply transaction and never log a statement",
 }
 
 // tableShape is one builder statement reduced to what this guard decides on.

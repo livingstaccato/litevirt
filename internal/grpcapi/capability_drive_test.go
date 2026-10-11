@@ -86,6 +86,12 @@ func TestDriveCapabilityActivation_FlagAwareBoundedDriver(t *testing.T) {
 		// host_membership_retire_v1 likewise: "this build never needs the
 		// hosts copy of state and isolation".
 		capabilities.HostMembershipRetireV1: true,
+		// host_runtime_split_v1 likewise: "this build decodes host_runtime
+		// and reads the runtime columns from it".
+		capabilities.HostRuntimeSplitV1: true,
+		// host_runtime_retire_v1 likewise: "this build never needs the
+		// hosts copy of the runtime columns".
+		capabilities.HostRuntimeRetireV1: true,
 		// failover_scope_v1 likewise: "this build decodes cluster_policies
 		// and honours failover_scope".
 		capabilities.FailoverScopeV1: true,

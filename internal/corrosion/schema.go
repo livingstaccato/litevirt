@@ -507,7 +507,22 @@ import (
 //	     id an external-realm account is bound to at its first login after the
 //	     upgrade, refused under any other; one row per id, first binder
 //	     wins). Four new tables.
-const CurrentSchemaVersion = 64
+//	v65: host runtime gets its own clock — host_runtime (host_name PK,
+//	     version, schema_version, cpu_total, mem_total, disk_total,
+//	     capacity_policy_hash): what a host's own daemon reports about itself.
+//	     Those columns shared the `hosts` row, and its one updated_at, with the
+//	     operator's configuration (address, role, region, fencing, overrides,
+//	     labels), so a replica could refuse one of two concurrent writes to
+//	     different columns as older and lose it (colonelpanik/litevirt#267,
+//	     the runtime half; v57 moved the membership half). A previous-release
+//	     node cannot decode the new table's statements and reads those values
+//	     only from hosts, so nothing touches host_runtime until
+//	     host_runtime_split_v1 latches (ReplicationGated). From then on every
+//	     runtime report is written to BOTH, in one batch, and read from
+//	     host_runtime; the hosts columns stay current for a node rolled back
+//	     one release until host_runtime_retire_v1 latches, and are never
+//	     cleared. No created_at, for the v56 reason. One new table.
+const CurrentSchemaVersion = 65
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -2952,6 +2967,25 @@ var schemaDDL = []string{
 		deleted_at  TEXT,
 		PRIMARY KEY (username, realm, external_id)
 	)`,
+	// v65 host runtime — what a host's own daemon reports about itself, on a
+	// row with its own LWW clock so it no longer shares one with the
+	// operator-configured columns on `hosts` (which keep a dual-written copy).
+	// Written only once host_runtime_split_v1 latches; see host_runtime.go. A
+	// row the pass copied carries a floor timestamp derived from the hosts
+	// row's, so every node that copies the same host writes the same row. No
+	// created_at, for the v56 reason. Nullable totals, as on hosts: a host
+	// whose resource probe failed has never reported them.
+	`CREATE TABLE IF NOT EXISTS host_runtime (
+		host_name            TEXT PRIMARY KEY,
+		version              TEXT NOT NULL DEFAULT '',
+		schema_version       INTEGER NOT NULL DEFAULT 0,
+		cpu_total            INTEGER,
+		mem_total            INTEGER,
+		disk_total           INTEGER,
+		capacity_policy_hash TEXT NOT NULL DEFAULT '',
+		updated_at           TEXT NOT NULL,
+		deleted_at           TEXT
+	)`,
 }
 
 // schemaIndexes are CREATE INDEX IF NOT EXISTS statements added after table creation.
@@ -3150,6 +3184,7 @@ var tablePrimaryKeys = map[string][]string{
 	"session_factors":         {"session_id"},
 	"user_enrollment_codes":   {"username"},
 	"user_identity_bindings":  {"username", "realm", "external_id"},
+	"host_runtime":            {"host_name"},
 }
 
 // schemaMigrations contains ALTER TABLE statements for upgrading existing databases.
@@ -3526,6 +3561,7 @@ var createTableUnits = []struct {
 	{63, "local_incarnation_claims"},
 	{64, "user_lifecycle"}, {64, "session_factors"}, {64, "user_enrollment_codes"},
 	{64, "user_identity_bindings"},
+	{65, "host_runtime"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

@@ -122,11 +122,23 @@ of acting — it says nothing about whether the resulting rows have replicated.
   into it by every host that applies that change, the writer included, and
   reaches any host that missed it by anti-entropy. State and isolation share their row
   with each other, and a host's operator-set configuration (fence strategy,
-  role, region) shares the `hosts` row with its self-reports. On a cluster that
+  role, region) shares the `hosts` row with its self-reports until those move
+  to `host_runtime` (below). On a cluster that
   has not finished rolling to a build carrying `host_membership_split_v1`,
   state is read from `hosts.state` and a state change can lose to a concurrent
   report — see
   [upgrades.md](upgrades.md#host-state-moves-to-its-own-row-after-the-roll).
+- **A host's own reports have their own clock too.** The version, schema
+  version, resource totals and capacity policy hash a host's daemon reports
+  are read from `host_runtime`, one row per host with its own `updated_at`,
+  apart from the configuration an operator sets on `hosts`. Once
+  `host_runtime_split_v1` has latched every report is written to both, so a
+  report survives a concurrent `lv host` change; once
+  `host_runtime_retire_v1` has latched too, a report no longer writes `hosts`
+  at all, so it cannot cost that change either. A report made through a host
+  that is not yet writing `host_runtime` is absorbed into it by every host
+  that applies it. See
+  [upgrades.md](upgrades.md#a-hosts-own-reports-move-to-their-own-row-after-the-roll).
 
 ### HA / Failover
 - **Quorum-gated fencing.** A host is fenced only after `floor(N/2)+1` fresh

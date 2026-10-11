@@ -101,23 +101,34 @@ func InsertHost(ctx context.Context, c *Client, h HostRecord) error {
 		role = "worker"
 	}
 	return c.withMembershipWrite(ctx, func(live bool) error {
-		uts := c.NowTS()
-		params := []interface{}{
-			h.Name, h.Address, h.SSHUser, h.SSHPort, h.GRPCPort, h.State, h.CertSerial,
-			h.CPUTotal, h.MemTotal, h.DiskTotal, h.FenceStrategy, h.Version, role,
-			h.CPUOvercommit, h.MemOvercommit, optIntValue(h.CPUReserve), optIntValue(h.MemReserveMiB),
-			h.CapacityPolicyHash,
-			now, uts,
-		}
-		if !live {
-			return c.Execute(ctx, insertHostSQL, params...)
-		}
-		// After the split the new host's membership row is written with it,
-		// under the same updated_at. The hosts row still carries the initial
-		// state: it is created whole, so there is no other column to lose.
-		return c.ExecuteBatch(ctx, []Statement{
-			{SQL: insertHostSQL, Params: params},
-			{SQL: hostMembershipUpsertSQL, Params: []interface{}{h.Name, h.State, int64(0), "", uts}},
+		return c.withRuntimeWrite(ctx, func(liveRuntime bool) error {
+			uts := c.NowTS()
+			params := []interface{}{
+				h.Name, h.Address, h.SSHUser, h.SSHPort, h.GRPCPort, h.State, h.CertSerial,
+				h.CPUTotal, h.MemTotal, h.DiskTotal, h.FenceStrategy, h.Version, role,
+				h.CPUOvercommit, h.MemOvercommit, optIntValue(h.CPUReserve), optIntValue(h.MemReserveMiB),
+				h.CapacityPolicyHash,
+				now, uts,
+			}
+			if !live && !liveRuntime {
+				return c.Execute(ctx, insertHostSQL, params...)
+			}
+			// After a split the new host's membership and runtime rows are
+			// written with it, under the same updated_at. The hosts row
+			// still carries the initial values: it is created whole, so there
+			// is no other column to lose. Its schema_version is the column
+			// default, so the runtime row's is too.
+			stmts := []Statement{{SQL: insertHostSQL, Params: params}}
+			if live {
+				stmts = append(stmts, Statement{SQL: hostMembershipUpsertSQL, Params: []interface{}{h.Name, h.State, int64(0), "", uts}})
+			}
+			if liveRuntime {
+				stmts = append(stmts, Statement{SQL: hostRuntimeUpsertSQL, Params: runtimeParams(h.Name, runtimeVals{
+					Version: h.Version, CPU: someInt(h.CPUTotal), Mem: someInt(h.MemTotal), Disk: someInt(h.DiskTotal),
+					PolicyHash: h.CapacityPolicyHash,
+				}, uts)})
+			}
+			return c.ExecuteBatch(ctx, stmts)
 		})
 	})
 }
@@ -429,8 +440,9 @@ func GetHost(ctx context.Context, c *Client, name string) (*HostRecord, error) {
 }
 
 // hostSelectSQL is the column list scanHost reads, joined to the host's fence
-// credential so IPMIPass is resolved new-first (credentials_split.go), and to
-// its membership row so State is too (host_membership.go). Columns the tables
+// credential so IPMIPass is resolved new-first (credentials_split.go), to its
+// membership row so State is too (host_membership.go), and to its runtime row
+// so the self-reported columns are (host_runtime.go). Columns the tables
 // share are qualified; SQLite names a qualified result column by its bare name,
 // which is what scanHost looks up.
 const hostSelectSQL = `SELECT h.name, h.address, h.ssh_user, h.ssh_port, h.grpc_port, h.state, h.cert_serial,
@@ -441,11 +453,14 @@ const hostSelectSQL = `SELECT h.name, h.address, h.ssh_user, h.ssh_port, h.grpc_
 			h.capacity_policy_hash,
 			h.created_at, h.updated_at,
 			c.host_name AS cred_key, c.ipmi_pass AS cred_val, c.updated_at AS cred_ts,
-			` + membershipCols + `
-		 FROM hosts h LEFT JOIN host_fence_credentials c ON c.host_name = h.name AND c.deleted_at IS NULL` + membershipJoins
+			` + membershipCols + `,
+			` + runtimeCols + `
+		 FROM hosts h LEFT JOIN host_fence_credentials c ON c.host_name = h.name AND c.deleted_at IS NULL` +
+	membershipJoins + runtimeJoins
 
 func scanHost(r Row, hostsCopyFrozen bool) HostRecord {
 	name := r.String("name")
+	rt := runtimeRowFrom(r, name).resolve()
 	return HostRecord{
 		Name:               name,
 		Address:            r.String("address"),
@@ -454,24 +469,24 @@ func scanHost(r Row, hostsCopyFrozen bool) HostRecord {
 		GRPCPort:           r.Int("grpc_port"),
 		State:              membershipRowFrom(r, name).resolve(hostsCopyFrozen).State,
 		CertSerial:         r.String("cert_serial"),
-		CPUTotal:           r.Int("cpu_total"),
-		MemTotal:           r.Int("mem_total"),
-		DiskTotal:          r.Int("disk_total"),
+		CPUTotal:           int(rt.CPU.Int64),
+		MemTotal:           int(rt.Mem.Int64),
+		DiskTotal:          int(rt.Disk.Int64),
 		FenceStrategy:      r.String("fence_strategy"),
 		IPMIAddress:        r.String("ipmi_address"),
 		IPMIUser:           r.String("ipmi_user"),
 		IPMIPass:           resolveCredential(r.String("cred_key") != "", r.String("cred_val"), r.String("ipmi_pass")),
 		WatchdogDev:        r.String("watchdog_dev"),
 		Labels:             decodeLabels(r.String("labels")),
-		Version:            r.String("version"),
-		SchemaVersion:      r.Int("schema_version"),
+		Version:            rt.Version,
+		SchemaVersion:      int(rt.SchemaVersion),
 		Role:               roleOrDefault(r.String("role")),
 		Region:             regionOrDefault(r.String("region")),
 		CPUOvercommit:      r.Float("cpu_overcommit"),
 		MemOvercommit:      r.Float("mem_overcommit"),
 		CPUReserve:         optInt(r, "cpu_reserve"),
 		MemReserveMiB:      optInt(r, "mem_reserve_mib"),
-		CapacityPolicyHash: r.String("capacity_policy_hash"),
+		CapacityPolicyHash: rt.PolicyHash,
 		CreatedAt:          r.String("created_at"),
 		UpdatedAt:          r.String("updated_at"),
 	}
@@ -634,13 +649,33 @@ func DeleteHost(ctx context.Context, c *Client, name string) error {
 // included, also retires the host's fence credential row (host_readmit.go).
 const deleteHostSQL = `UPDATE hosts SET deleted_at = ?, updated_at = ? WHERE name = ?`
 
-// UpdateHostVersion updates a host's reported version.
+// UpdateHostVersion updates a host's reported version: hosts.version, and
+// after the runtime split host_runtime.version too, in one batch under one
+// updated_at (host_runtime.go).
 func UpdateHostVersion(ctx context.Context, c *Client, name, version string) error {
-	return c.Execute(ctx,
-		`UPDATE hosts SET version = ?, updated_at = ? WHERE name = ?`,
-		version, c.NowTS(), name,
-	)
+	return c.withRuntimeWrite(ctx, func(live bool) error {
+		uts := c.NowTS()
+		hostsStmt := Statement{SQL: updateHostVersionSQL, Params: []interface{}{version, uts, name}}
+		if !live {
+			return c.ExecuteBatch(ctx, []Statement{hostsStmt})
+		}
+		rt, ok, err := runtimeStatement(ctx, c, name, reportVersion, func(v *runtimeVals) { v.Version = version }, uts)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return c.ExecuteBatch(ctx, []Statement{hostsStmt})
+		}
+		if c.hostsRuntimeRetired(live) {
+			// host_runtime_retire_v1: the report no longer moves the hosts
+			// row's clock (host_runtime_retire.go).
+			return c.ExecuteBatch(ctx, []Statement{rt})
+		}
+		return c.ExecuteBatch(ctx, []Statement{hostsStmt, rt})
+	})
 }
+
+const updateHostVersionSQL = `UPDATE hosts SET version = ?, updated_at = ? WHERE name = ?`
 
 // UpdateHostStartup writes a host's boot-time state in a SINGLE batched mutation:
 // always state + version + updated_at (one HLC, one NowTS), and the resource
@@ -650,55 +685,109 @@ func UpdateHostVersion(ctx context.Context, c *Client, name, version string) err
 // whenever available, including the fresh-insert case, so startup state is
 // single-source rather than relying on a later write.
 func UpdateHostStartup(ctx context.Context, c *Client, name, state, version string, cpu, mem, disk int, hasResources bool) error {
-	uts := c.NowTS()
 	// COALESCE(NULLIF(?, ''), version) keeps the existing version when the daemon
 	// reports an empty one (dev builds), so a blank version can't clobber a good one.
 	// schema_version is this running binary's supported schema (CurrentSchemaVersion),
 	// matching what Ping advertises — the self-upgrade watcher reads it from here.
 	sv := CurrentSchemaVersion
 	return c.withMembershipWrite(ctx, func(live bool) error {
-		var hostsStmt Statement
-		if hasResources {
-			hostsStmt = Statement{SQL: `UPDATE hosts SET state = ?, version = COALESCE(NULLIF(?, ''), version), schema_version = ?,
-				cpu_total = ?, mem_total = ?, disk_total = ?, updated_at = ? WHERE name = ?`,
-				Params: []interface{}{state, version, sv, cpu, mem, disk, uts, name}}
-		} else {
-			hostsStmt = Statement{SQL: `UPDATE hosts SET state = ?, version = COALESCE(NULLIF(?, ''), version), schema_version = ?, updated_at = ? WHERE name = ?`,
-				Params: []interface{}{state, version, sv, uts, name}}
-		}
-		if !live {
-			return c.ExecuteBatch(ctx, []Statement{hostsStmt})
-		}
-		// After the split the boot state is also written to host_membership,
-		// in the same batch under the same updated_at: the hosts statement is
-		// the previous release's, unchanged, so a node rolled back one release
-		// still reads it.
-		missing, err := membershipRowMissingFrozen(ctx, c, name)
-		if err != nil {
-			return err
-		}
-		if missing {
-			return c.ExecuteBatch(ctx, []Statement{
-				hostsStmt,
-				{SQL: hostMembershipStateOnlySQL, Params: []interface{}{state, uts, name}},
-			})
-		}
-		epoch, reason, err := currentIsolation(ctx, c, name)
-		if err != nil {
-			return err
-		}
-		return c.ExecuteBatch(ctx, []Statement{
-			hostsStmt,
-			{SQL: hostMembershipStateSQL, Params: []interface{}{name, state, epoch, reason, uts}},
+		return c.withRuntimeWrite(ctx, func(liveRuntime bool) error {
+			uts := c.NowTS()
+			// The hosts statement carries the runtime columns until
+			// host_runtime_retire_v1 has latched, and the boot state until
+			// host_membership_retire_v1 has. With only the runtime copy
+			// retired it is the plain state write; with both, there is none
+			// (host_runtime_retire.go).
+			runtimeRetired := c.hostsRuntimeRetired(liveRuntime)
+			var stmts []Statement
+			switch {
+			case runtimeRetired && c.hostsCopyRetired(live):
+			case runtimeRetired:
+				stmts = append(stmts, Statement{SQL: updateHostStateSQL, Params: []interface{}{state, uts, name}})
+			case hasResources:
+				stmts = append(stmts, Statement{SQL: hostStartupResourcesSQL, Params: []interface{}{state, version, sv, cpu, mem, disk, uts, name}})
+			default:
+				stmts = append(stmts, Statement{SQL: hostStartupSQL, Params: []interface{}{state, version, sv, uts, name}})
+			}
+			if live {
+				// After the membership split the boot state is also written
+				// to host_membership, in the same batch under the same
+				// updated_at: the hosts statement is the previous release's,
+				// unchanged, so a node rolled back one release still reads it.
+				missing, err := membershipRowMissingFrozen(ctx, c, name)
+				if err != nil {
+					return err
+				}
+				if missing {
+					stmts = append(stmts, Statement{SQL: hostMembershipStateOnlySQL, Params: []interface{}{state, uts, name}})
+				} else {
+					epoch, reason, err := currentIsolation(ctx, c, name)
+					if err != nil {
+						return err
+					}
+					stmts = append(stmts, Statement{SQL: hostMembershipStateSQL, Params: []interface{}{name, state, epoch, reason, uts}})
+				}
+			}
+			if liveRuntime {
+				// And after the runtime split the report goes to host_runtime
+				// too (host_runtime.go). An empty version keeps the one the
+				// host already has, as the hosts statement's COALESCE does.
+				rt, ok, err := runtimeStatement(ctx, c, name, reportBoot, func(v *runtimeVals) {
+					if version != "" {
+						v.Version = version
+					}
+					v.SchemaVersion = int64(sv)
+					if hasResources {
+						v.CPU, v.Mem, v.Disk = someInt(cpu), someInt(mem), someInt(disk)
+					}
+				}, uts)
+				if err != nil {
+					return err
+				}
+				if ok {
+					stmts = append(stmts, rt)
+				}
+			}
+			if len(stmts) == 0 {
+				return nil // no live hosts row: nothing a previous release would have written either
+			}
+			return c.ExecuteBatch(ctx, stmts)
 		})
 	})
 }
 
-// UpdateHostResources updates a host's resource counts.
+// The boot report's hosts statements, in their previous-release shapes.
+const (
+	hostStartupResourcesSQL = `UPDATE hosts SET state = ?, version = COALESCE(NULLIF(?, ''), version), schema_version = ?,
+				cpu_total = ?, mem_total = ?, disk_total = ?, updated_at = ? WHERE name = ?`
+	hostStartupSQL = `UPDATE hosts SET state = ?, version = COALESCE(NULLIF(?, ''), version), schema_version = ?, updated_at = ? WHERE name = ?`
+)
+
+// UpdateHostResources updates a host's resource counts: the hosts columns,
+// and after the runtime split host_runtime's too, in one batch under one
+// updated_at (host_runtime.go).
 func UpdateHostResources(ctx context.Context, c *Client, name string, cpu, mem, disk int) error {
-	return c.Execute(ctx,
-		`UPDATE hosts SET cpu_total = ?, mem_total = ?, disk_total = ?, updated_at = ?
-		 WHERE name = ?`,
-		cpu, mem, disk, c.NowTS(), name,
-	)
+	return c.withRuntimeWrite(ctx, func(live bool) error {
+		uts := c.NowTS()
+		hostsStmt := Statement{SQL: updateHostResourcesSQL, Params: []interface{}{cpu, mem, disk, uts, name}}
+		if !live {
+			return c.ExecuteBatch(ctx, []Statement{hostsStmt})
+		}
+		rt, ok, err := runtimeStatement(ctx, c, name, reportResources, func(v *runtimeVals) {
+			v.CPU, v.Mem, v.Disk = someInt(cpu), someInt(mem), someInt(disk)
+		}, uts)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return c.ExecuteBatch(ctx, []Statement{hostsStmt})
+		}
+		if c.hostsRuntimeRetired(live) {
+			return c.ExecuteBatch(ctx, []Statement{rt})
+		}
+		return c.ExecuteBatch(ctx, []Statement{hostsStmt, rt})
+	})
 }
+
+const updateHostResourcesSQL = `UPDATE hosts SET cpu_total = ?, mem_total = ?, disk_total = ?, updated_at = ?
+		 WHERE name = ?`

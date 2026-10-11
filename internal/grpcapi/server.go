@@ -1195,6 +1195,14 @@ func (s *Server) advertisedCapabilities() []string {
 	if s.db == nil || !s.db.CredentialsLive() {
 		caps = withoutCapability(caps, capabilities.CredentialsClearV1)
 	}
+	// host_runtime_retire_v1 likewise waits for this node's first complete
+	// runtime split pass (corrosion.HostRuntimeLive): the hosts copy of the
+	// runtime columns is then retired nowhere until every recipient writes
+	// and reads host_runtime, so no neighbour is still reporting to hosts
+	// alone, or reading only hosts, when the copy stops following.
+	if s.db == nil || !s.db.HostRuntimeLive() {
+		caps = withoutCapability(caps, capabilities.HostRuntimeRetireV1)
+	}
 	// recovery_claim_v1 is withheld while enforcement.recovery_claim is off,
 	// and the reason is the question CLAUDE.md asks of every token: where is
 	// the guarantee enforced? At EXECUTION. A coordinator cannot stop another

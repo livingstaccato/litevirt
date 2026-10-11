@@ -1103,6 +1103,90 @@ longer follows: it can count a fenced host as active. Upgrade such a host to
 at least the dual-write build before you power it on again. See
 [design/host-membership-retire-old-columns.md](design/host-membership-retire-old-columns.md).
 
+### A host's own reports move to their own row after the roll
+
+With state and isolation gone to `host_membership`, the `hosts` row still
+held two kinds of value under one `updated_at`: the configuration an operator
+sets (address, role, region, fencing, capacity overrides, labels) and what the
+host's own daemon reports about itself (version, schema version, CPU, memory
+and disk totals, capacity policy hash). A host's boot report and an
+operator's concurrent `lv host` change could therefore lose each other, the
+same way a fence and a version report used to. Schema v65 adds
+`host_runtime`, one row per host with its own `updated_at`, and two mandatory,
+replication-gated capability tokens move the reports into it **on their own,
+after the last host has upgraded**. No flag starts either.
+
+**`host_runtime_split_v1`.** While any host the cluster replicates to —
+including one parked in `maintenance` — runs the previous release, nothing is
+written to `host_runtime` and every report goes to `hosts`, exactly as before.
+Once the token has latched on a host, that host:
+
+- runs a pass at start and every 10 seconds that gives every host a
+  `host_runtime` row copied from `hosts`, stamped decades before the `hosts`
+  row's `updated_at`, so a copy only fills an absence and never replaces a
+  real report;
+- after its first complete pass, writes every report to **both**
+  `host_runtime` and the `hosts` columns, in one batch with one `updated_at`.
+  The `hosts` half uses the previous release's statements;
+- reads the version, schema version and totals — for `lv host ls`, placement,
+  the upgrade gates and the self-upgrade watcher, the UI and MCP views alike —
+  from a host's `host_runtime` row whenever it has one, whatever the `hosts`
+  copy says, and from `hosts` only for a host with no row.
+
+A report written to `hosts` alone, by a host whose own latch has not formed
+yet, is recognised by its batch, which carries no `host_runtime` statement,
+and every host that applies the batch — the writer included — takes it into
+the `host_runtime` row it holds, with the write's own `updated_at`, if that is
+newer. A host re-admitted with `lv host add` after `lv host rm` is a new
+machine: every host retires the old machine's `host_runtime` row as it applies
+the re-admission, and the new machine's first report brings the row back.
+
+**`host_runtime_retire_v1`.** The dual write keeps a report from being lost,
+but its `hosts` half still moves the `hosts` row's clock, so a newer report can
+still make a replica refuse an operator's older, concurrent region or role
+change. The second token stops that. A host advertises it only once it has
+completed a `host_runtime_split_v1` pass, so it latches only once every
+replication recipient writes and reads `host_runtime`. From then on a version
+or resource report writes `host_runtime` alone, and so does the boot report
+once `host_membership_retire_v1` has latched as well (until then it still
+writes the boot state to `hosts.state`, and nothing else there). An operator's
+change and a host's report then never share a clock. The `hosts` columns are
+never cleared; they keep the values they had at the latch. Adding a host and
+re-admitting one still write the whole `hosts` row, as before.
+
+The retire latch repairs nothing that diverged before it. A region or role
+change that a replica refused during the dual-write window, because a newer
+report had moved the `hosts` row's clock, stays refused there: that replica
+holds the old value under the same `updated_at` as one that applied the
+change, and nothing settles the tie until the operator's next write to that
+host. Re-apply such a change once the retire token has latched.
+
+A host's boot report always writes its whole `host_runtime` row, so a host
+that was removed while it was down and re-added with its data directory
+intact brings its row back on every node with its first boot, even though
+every other node retired the old one when it applied the re-admission.
+
+**Rollback.** Both tokens ship in the same build, so a binary rolled back
+below them is below both. It enters WAL quarantine at startup, as below every
+latched token, emits no replicated writes, and cannot decode the
+`host_runtime` statements its peers keep sending. Before the retire latch it
+still reads current reports from the `hosts` columns; after it, it reads every
+host's version, schema version and totals as they were at the latch — never
+older than the build that latched it, so a newer peer still reads as newer.
+Nothing is lost: `host_runtime` keeps every report, and upgrading the host
+again reads it. Roll forward.
+
+**A host that was switched off across either latch.** Each latch is confirmed
+against the hosts in the cluster's membership at the time; a host that was
+off throughout is not asked. If it runs a build before
+`host_runtime_split_v1`, it holds no marker for either token, the rollback
+preflight does not stop it, and back online it reads every peer's version,
+schema version and totals from the `hosts` columns — current only up to the
+retire latch, frozen after it — and places workloads and gates upgrades on
+them. Its own reports, written to `hosts` alone, are still absorbed by the
+upgraded hosts. Upgrade such a host to this build before you power it on
+again.
+
 ### An unverified fence records `offline` after the roll
 
 A host recorded `fenced` used to mean "a fence succeeded", whatever the fence

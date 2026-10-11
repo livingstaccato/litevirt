@@ -432,6 +432,13 @@ var tableNames = []string{
 	// v64 directory identity bindings: every node enforces them at login, so
 	// a node that missed one must be repaired. Nothing secret.
 	"user_identity_bindings",
+	// v65 host runtime — the version, schema version, resource totals and
+	// capacity policy hash a host's daemon reports, on a row of their own so
+	// they stop sharing the hosts row's clock. Placement and the upgrade gates
+	// read it, so a node that missed a report must be repaired here like any
+	// other cluster fact. Nothing secret. Written only once
+	// host_runtime_split_v1 has latched (host_runtime.go).
+	"host_runtime",
 }
 
 // sensitiveTableNames are secret-bearing tables repaired only by the peer-mTLS

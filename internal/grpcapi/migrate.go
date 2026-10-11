@@ -547,22 +547,9 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 		}
 	}()
 
-	// Pre-provision networks on target host. This ensures bridges, DHCP, NAT,
-	// VXLAN tunnels, and IRB gateways exist before the VM arrives — critical for
-	// both live and cold migrations (#38).
-	{
-		preIfaces, _ := corrosion.GetVMInterfaces(ctx, s.db, req.VmName)
-		for _, iface := range preIfaces {
-			if iface.NetworkName == "" {
-				continue
-			}
-			s.provisionNetworkOnRemote(ctx, req.TargetHost, iface.NetworkName)
-		}
-	}
-
-	// Ensure cloud-init ISO exists on target before migration — libvirt will
-	// reject the domain if the CDROM file path doesn't exist (#62).
-	s.ensureCloudInitOnTarget(ctx, req.TargetHost, vm)
+	// The VM's networks and its cloud-init ISO on the target, before anything
+	// else is asked of it (prepareMigrationTarget).
+	s.prepareMigrationTarget(ctx, vm, req.TargetHost)
 
 	// Ensure disk files exist on target before --with-storage migration.
 	// libvirt validates all file paths in the domain XML before block copy starts.
@@ -656,31 +643,9 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 		strategyLabel = "cold"
 	}
 
-	// Read migration policy from stored VM spec for tuning parameters.
-	// Keep it as a pointer (nil = no policy) and use the nil-safe generated
-	// getters — copying the proto message by value would drag its embedded
-	// mutex/MessageState along (go vet: "copies lock value").
-	var migratePolicy *pb.MigrationPolicy
-	if vm.Spec != "" {
-		var storedSpec pb.VMSpec
-		if json.Unmarshal([]byte(vm.Spec), &storedSpec) == nil {
-			migratePolicy = storedSpec.Migrate
-		}
-	}
-
-	bandwidthMiB := int(migratePolicy.GetBandwidthMibSec())
-	autoConverge := migratePolicy.GetAutoConverge()
-	// Default auto-converge to true for live migrations when no policy is set,
-	// preserving previous behaviour.
-	if migratePolicy == nil || migratePolicy.GetBandwidthMibSec() == 0 && !migratePolicy.GetAutoConverge() && migratePolicy.GetStrategy() == 0 {
-		autoConverge = live
-	}
-	var maxDowntimeMS int64
-	if migratePolicy.GetMaxDowntime() != "" {
-		if d, err := time.ParseDuration(migratePolicy.GetMaxDowntime()); err == nil {
-			maxDowntimeMS = d.Milliseconds()
-		}
-	}
+	// The VM's migration policy: its tuning, and its timeout below.
+	tuning := migrationTuningFor(vm, live)
+	migratePolicy := tuning.policy
 
 	// Build destination URI: use TLS transport with our existing PKI certs.
 	// Combined with MigrateTunnelled, all data flows over the single libvirt
@@ -762,9 +727,9 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 		done <- s.virt.MigrateToTarget(vm.Name, dconnuri, lv.MigrateParams{
 			Live:          live,
 			WithStorage:   withStorage,
-			BandwidthMiB:  bandwidthMiB,
-			AutoConverge:  autoConverge,
-			MaxDowntimeMS: maxDowntimeMS,
+			BandwidthMiB:  tuning.bandwidthMiB,
+			AutoConverge:  tuning.autoConverge,
+			MaxDowntimeMS: tuning.maxDowntimeMS,
 			// Bracketed here, not in internal/libvirt: that package renders it
 			// into a tcp:// migrate_uri authority but must not import corrosion.
 			// The data channel's address: the cluster address, or the target's
@@ -2378,6 +2343,69 @@ func (s *Server) judgedISOSHA256(ctx context.Context, vmName string, isoPaths []
 		return map[string]string{p: sum}
 	}
 	return nil
+}
+
+// prepareMigrationTarget puts on the target what libvirt checks for on the
+// destination before it moves a domain there: the bridges, DHCP, NAT, VXLAN
+// tunnels and IRB gateways of the VM's networks (#38), and its cloud-init ISO,
+// whose CD-ROM path libvirt refuses to find missing (#62). Both are
+// best-effort, as they always were for `lv migrate`: a target that cannot
+// make one fails the migration itself, with libvirt's reason.
+//
+// Shared by every move that hands libvirt a domain for the target —
+// migrateOwnedVM (`lv migrate`, live or cold, and a drain's cold move through
+// it) and a drain's live move (drainOneVM), which had neither and so never
+// moved a cloud-init VM live (lab2c-report.md, bug 2). A failed attempt takes
+// back the ISO with cleanupFailedMigrationTarget.
+func (s *Server) prepareMigrationTarget(ctx context.Context, vm *corrosion.VMRecord, target string) {
+	ifaces, _ := corrosion.GetVMInterfaces(ctx, s.db, vm.Name)
+	for _, iface := range ifaces {
+		if iface.NetworkName == "" {
+			continue
+		}
+		s.provisionNetworkOnRemote(ctx, target, iface.NetworkName)
+	}
+	s.ensureCloudInitOnTarget(ctx, target, vm)
+}
+
+// migrationTuning is what a VM's stored migration policy asks of a runtime
+// migration.
+type migrationTuning struct {
+	// policy is the stored policy, nil when there is none. A pointer, read
+	// with the nil-safe generated getters: copying the proto message by value
+	// would drag its embedded mutex/MessageState along (go vet: "copies lock
+	// value").
+	policy        *pb.MigrationPolicy
+	bandwidthMiB  int
+	autoConverge  bool
+	maxDowntimeMS int64
+}
+
+// migrationTuningFor reads vm's migration policy for a live (or cold runtime)
+// migration. Shared by migrateOwnedVM and a drain's live move, so both hand
+// libvirt the same parameters for the same VM.
+func migrationTuningFor(vm *corrosion.VMRecord, live bool) migrationTuning {
+	var t migrationTuning
+	if vm.Spec != "" {
+		var storedSpec pb.VMSpec
+		if json.Unmarshal([]byte(vm.Spec), &storedSpec) == nil {
+			t.policy = storedSpec.Migrate
+		}
+	}
+	p := t.policy
+	t.bandwidthMiB = int(p.GetBandwidthMibSec())
+	t.autoConverge = p.GetAutoConverge()
+	// Default auto-converge to true for live migrations when no policy is set,
+	// preserving previous behaviour.
+	if p == nil || p.GetBandwidthMibSec() == 0 && !p.GetAutoConverge() && p.GetStrategy() == 0 {
+		t.autoConverge = live
+	}
+	if p.GetMaxDowntime() != "" {
+		if d, err := time.ParseDuration(p.GetMaxDowntime()); err == nil {
+			t.maxDowntimeMS = d.Milliseconds()
+		}
+	}
+	return t
 }
 
 // ensureCloudInitOnTarget calls the target host to generate the cloud-init ISO

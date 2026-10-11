@@ -19,6 +19,7 @@ import (
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/fence"
+	"github.com/litevirt/litevirt/internal/hooks"
 	"github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/placement"
 	"github.com/litevirt/litevirt/internal/randid"
@@ -699,6 +700,11 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 
 	// Live migrate — every disk is on shared storage. (Ownership confirmed above.)
 	progress := &pb.DrainProgress{VmName: vm.Name, TargetHost: target.Name, Strategy: pb.MigrateStrategy_MIGRATE_LIVE}
+	// What `lv migrate` puts on the target first, through the same helper:
+	// the VM's networks and its cloud-init ISO. libvirt checks both on the
+	// destination, and without them every cloud-init VM's live drain failed
+	// and fell back to a cold move that waits for the guest to shut down.
+	s.prepareMigrationTarget(ctx, fresh, target.Name)
 	// The target's qemu opens the installer ISO from its own filesystem: the
 	// target judges that file first (EnsureDisks with no stubs does only that).
 	// Where it resolves the ISO to another file (a link, a library
@@ -706,6 +712,8 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 	srcTLS := s.migrationNetwork != "" && s.migrationTLSReady()
 	ens, ierr := s.ensureDisksOnTargetNet(ctx, target.Name, vm.Name, nil, srcTLS, true)
 	if ierr != nil {
+		// The guest never left: take back the ISO this attempt put there.
+		s.cleanupFailedMigrationTarget(ctx, vm.Name, target.Name, nil)
 		progress.Status = "error"
 		progress.Error = "target refused the installer ISO: " + ierr.Error()
 		return progress
@@ -713,14 +721,24 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 	cdromSources, targetCgroup := ens.remap, ens.cgroupMode
 	route := s.chooseMigrationRoute(ctx, vm.Name, target, ens.migAddr, routeMemory, srcTLS && ens.tlsReady)
 	dconnuri := fmt.Sprintf("qemu+tls://%s/system", corrosion.URIHost(target.Address))
-	mp := libvirt.MigrateParams{Live: true, CDROMSources: cdromSources,
+	// The VM's own migration policy, as `lv migrate` reads it. Its timeout is
+	// not applied: MigrateToTarget ignores contexts, and a drain has no
+	// adoption of a migration it stopped waiting for (migrateOwnedVM's).
+	tuning := migrationTuningFor(fresh, true)
+	mp := libvirt.MigrateParams{
+		Live: true, CDROMSources: cdromSources,
+		BandwidthMiB: tuning.bandwidthMiB, AutoConverge: tuning.autoConverge, MaxDowntimeMS: tuning.maxDowntimeMS,
 		SharesWeight: s.vmSharesWeight(ctx, vm.Name), TargetCgroup: targetCgroup,
-		RBDLocators: s.rbdLocatorsOf(ctx, vm.Name)}
+		RBDLocators: s.rbdLocatorsOf(ctx, vm.Name),
+	}
 	if route.direct {
 		mp.Direct, mp.TLS = true, true
 		mp.TargetAddress = corrosion.URIHost(route.addr)
 		mp.TLSDestination = target.Address
 	}
+	hspec := vmHooks(fresh)
+	pbVM := &pb.VM{Name: vm.Name, HostName: fresh.HostName, State: pb.VMState_VM_RUNNING}
+	hooks.Run(ctx, hooks.PreMigrate, pbVM, hspec)
 	lerr := s.virt.MigrateToTarget(vm.Name, dconnuri, mp)
 	if lerr == nil {
 		// Phase 4: drain move is an ownership transition (fresh-read CAS + increment).
@@ -733,15 +751,26 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 			s.noteStateWriteFail(corrosion.OpVMHost, err)
 			progress.Status = "error"
 			progress.Error = "migrated but recording new owner failed: " + err.Error()
+			// The guest runs on the target even though its row says otherwise.
+			s.runDrainPostMigrate(ctx, pbVM, hspec, target.Name, pb.VMState_VM_RUNNING)
 			return progress
 		}
-		s.reverseReplicationAfterMove(ctx, "vm", vm.Name, "", s.hostName, target.Name)
+		// What follows a cut-over for `lv migrate` follows it here: reverse
+		// replication, the NetBox mirror, GARP, DNS, LB backends, VXLAN FDB,
+		// the post_migrate hook, the target's notify, and the source's own
+		// cloud-init ISO.
+		s.finishMigrationOnTarget(ctx, fresh, migrationFinish{target: &target, pbVM: pbVM, hspec: hspec})
 		progress.Status = "done"
 		progress.ProgressPct = 100
 		return progress
 	}
 	slog.Warn("live migration failed during drain, falling back to a cold move",
 		"vm", vm.Name, "error", lerr)
+	// The guest stayed here: take back the ISO this attempt put on the target,
+	// which only the attempt that made it may remove. The cold move puts its
+	// own there, and one that fails before it does would otherwise leave this
+	// one behind for a VM the target does not run.
+	s.cleanupFailedMigrationTarget(ctx, vm.Name, target.Name, nil)
 	// One lease per move: the cold move takes the destination's lease itself.
 	migLease.release(ctx)
 
@@ -752,12 +781,44 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 	// (live migration failure leaves the source domain up).
 	if reason, refused := s.drainGateRefused(ctx); refused {
 		s.noteGateRefused(corrosion.ActionReschedule, reason)
+		s.runDrainPostMigrate(ctx, pbVM, hspec, s.hostName, s.drainVMStateHere(ctx, vm.Name))
 		return &pb.DrainProgress{
 			VmName: vm.Name, TargetHost: target.Name, Status: "skipped", Strategy: pb.MigrateStrategy_MIGRATE_LIVE,
 			Error: "drain refused: " + reason,
 		}
 	}
-	return s.drainRunningVMCold(ctx, fresh, target, unlock, &adopted)
+	cold := s.drainRunningVMCold(ctx, fresh, target, unlock, &adopted)
+	// pre_migrate ran before the live attempt, so post_migrate runs once, with
+	// where the VM ended: on the target after a cold move (stopped there if it
+	// did not start), or here when the cold move failed too.
+	switch {
+	case cold.Status == "done" && cold.Error == "":
+		s.runDrainPostMigrate(ctx, pbVM, hspec, target.Name, pb.VMState_VM_RUNNING)
+	case cold.Status == "done":
+		s.runDrainPostMigrate(ctx, pbVM, hspec, target.Name, pb.VMState_VM_STOPPED)
+	default:
+		s.runDrainPostMigrate(ctx, pbVM, hspec, s.hostName, s.drainVMStateHere(ctx, vm.Name))
+	}
+	return cold
+}
+
+// runDrainPostMigrate runs the post_migrate hook of a drain whose live attempt
+// ran pre_migrate but did not end in a live cut-over (finishMigrationOnTarget
+// runs it for that one), so every pre_migrate is followed by exactly one
+// post_migrate naming the VM's final host and state. Detached: the drain's
+// request going away must not skip it.
+func (s *Server) runDrainPostMigrate(ctx context.Context, pbVM *pb.VM, hspec *pb.HooksSpec, host string, state pb.VMState) {
+	pbVM.HostName, pbVM.State = host, state
+	hooks.Run(context.WithoutCancel(ctx), hooks.PostMigrate, pbVM, hspec)
+}
+
+// drainVMStateHere is the state of a VM a drain left on this host, from its
+// row (running when it cannot be read: the drain found it running).
+func (s *Server) drainVMStateHere(ctx context.Context, name string) pb.VMState {
+	if cur, err := corrosion.GetVM(context.WithoutCancel(ctx), s.db, name); err == nil && cur != nil {
+		return vmStateToPB(cur.State)
+	}
+	return pb.VMState_VM_RUNNING
 }
 
 // UndrainHost returns a host from draining/maintenance to active.

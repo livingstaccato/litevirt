@@ -421,6 +421,7 @@ var streamHandlerAudit = map[string]string{
 	// no device on the caller's behalf, and their progress Sends are refused
 	// once the stream is cut.
 	"/litevirt.v1.LiteVirt/DrainHost":             "operation; holds no device for the caller",
+	"/litevirt.v1.LiteVirt/FailbackHost":          "operation (a failback run it follows); holds no device for the caller",
 	"/litevirt.v1.LiteVirt/ShutdownHostWorkloads": "operation; holds no device for the caller",
 	"/litevirt.v1.LiteVirt/UpgradeHost":           "operation; holds no device for the caller",
 	"/litevirt.v1.LiteVirt/PreStageUpgrade":       "operation; holds no device for the caller",

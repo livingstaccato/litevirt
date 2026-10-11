@@ -253,7 +253,7 @@ func TestFleet_M9_AnUpdateCarryingThreeFeaturesTakesEveryGrant(t *testing.T) {
 func TestFleet_M9_ACloneOfAThreeFeatureVMTakesEveryGrant(t *testing.T) {
 	c := New(t, Options{Nodes: 2, SharedCRDT: true})
 	entry, src := c.Nodes[0], c.Nodes[1]
-	setHostCapacity(t, c, src.Name, 64, 65536, nil)
+	setHostCapacity(t, c, src.Name, 64, 65536)
 	src.Server.SetBridgeEnsure(src.Net.EnsureBridge)
 	latchRelease(t, c)
 	spec := tunedSpec("tpl")

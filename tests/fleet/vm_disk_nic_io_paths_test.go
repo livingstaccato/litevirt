@@ -41,7 +41,7 @@ func renderedTuning(t *testing.T, x string) (iops int64, discard, queues bool) {
 func TestFleet_CloneOfATunedVMKeepsItsTuning(t *testing.T) {
 	c := New(t, Options{Nodes: 2, SharedCRDT: true})
 	entry, src := c.Nodes[0], c.Nodes[1]
-	setHostCapacity(t, c, src.Name, 64, 65536, nil)
+	setHostCapacity(t, c, src.Name, 64, 65536)
 	src.Server.SetBridgeEnsure(src.Net.EnsureBridge)
 	seedCloneSourceSpec(t, c, src, tunedSpec("tpl"))
 
@@ -87,7 +87,7 @@ func TestFleet_RestoreLiveTreatsAManifestsTuningAsUntrusted(t *testing.T) {
 	c := New(t, Options{Nodes: 1})
 	n := c.Nodes[0]
 	ctx := context.Background()
-	setHostCapacity(t, c, n.Name, 64, 65536, nil)
+	setHostCapacity(t, c, n.Name, 64, 65536)
 	n.Server.SetBridgeEnsure(n.Net.EnsureBridge)
 
 	// Not latched: the restore works and carries no tuning.
@@ -138,7 +138,7 @@ func TestFleet_RenamedRestoreKeepsTheNICsQueuesAcrossARedefine(t *testing.T) {
 	c := New(t, Options{Nodes: 1})
 	n := c.Nodes[0]
 	ctx := context.Background()
-	setHostCapacity(t, c, n.Name, 64, 65536, nil)
+	setHostCapacity(t, c, n.Name, 64, 65536)
 	n.Server.SetBridgeEnsure(n.Net.EnsureBridge)
 	latchIOFeature(t, c)
 	src := tunedSpec("bk")

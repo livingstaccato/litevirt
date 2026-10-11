@@ -1575,10 +1575,10 @@ func runtimeCopyOn(host, project, name string, inv runtimeInventory, otherHere b
 	switch {
 	case found && otherHere && w.OwnerStatus == OwnerUnreadable:
 		return "", fmt.Errorf("its runtime %s sits under another project's live row of that name, and its owner record cannot be read (%s), so whose it is is unproven",
-			name, w.ProbeError)
+			name, w.OwnerError)
 	case found && otherHere && !(w.OwnerStatus == OwnerValid && w.OwnerProject == project):
 		return "", nil
-	case found && w.ProbeError == probeNoLXCTooling:
+	case found && (w.ProbeError == probeNoLXCTooling || w.ProbeError == probeUnlistedDirectory):
 		return fmt.Sprintf("%s holds %s with no live row of it (%s), a copy that may hold newer data than the replica",
 			host, name, w.ProbeError), nil
 	case found && otherHere:

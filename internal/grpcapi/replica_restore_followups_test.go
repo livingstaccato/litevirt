@@ -47,6 +47,14 @@ type restoreCT struct {
 	ownerErr error
 	dirs     map[string]bool
 	dirErr   error
+	stateErr error
+}
+
+func (r *restoreCT) StateContainer(ctx context.Context, name string) (string, error) {
+	if r.stateErr != nil {
+		return "", r.stateErr
+	}
+	return r.fakeCT.StateContainer(ctx, name)
 }
 
 func (r *restoreCT) ReadOwner(name string) (*lxc.ContainerOwner, error) {
@@ -302,4 +310,73 @@ func TestConfirmNoLiveCopy_NoToolingStillChecksTheDirectory(t *testing.T) {
 			t.Fatalf("this host holds web's directory with no tooling: %v, want refused", err)
 		}
 	})
+}
+
+// Review m-1: on a host WITH tooling, a container directory that lxc-ls does
+// not list (no config: an import that died after the rootfs, a hand-removed
+// config) is still a copy of the data, so it is named, and a directory that
+// cannot be stat'd is no answer. Two data directories must never be possible.
+func TestConfirmNoLiveCopy_UnlistedDirectoryIsACopy(t *testing.T) {
+	ctx := context.Background()
+	t.Run("a peer", func(t *testing.T) {
+		ct := newRestoreCT("other")
+		ct.dirs["web"] = true // on disk, not listed
+		h2 := restorePeerHost(t, "h2", ct, nil)
+		s := followupCluster(t, h2, nil)
+		if err := s.confirmNoLiveCopy(ctx, "_default", "web", "src"); !refusedNaming(err, "h2 holds web") {
+			t.Fatalf("h2 holds web's directory that lxc-ls does not list: %v, want refused naming h2", err)
+		}
+		ct.dirs["web"] = false
+		if err := s.confirmNoLiveCopy(ctx, "_default", "web", "src"); err != nil {
+			t.Fatalf("h2 neither lists nor holds web: %v", err)
+		}
+		ct.dirErr = errors.New("stat: input/output error")
+		if err := s.confirmNoLiveCopy(ctx, "_default", "web", "src"); !refusedNaming(err, "cannot confirm with h2") {
+			t.Fatalf("h2 cannot stat web's directory: %v, want refused naming h2", err)
+		}
+	})
+	t.Run("this host", func(t *testing.T) {
+		h2 := restorePeerHost(t, "h2", newRestoreCT(), nil)
+		s := followupCluster(t, h2, nil)
+		ct := newRestoreCT()
+		ct.dirs["web"] = true
+		s.containersRoot = t.TempDir()
+		s.SetLXCCapableForTest(true)
+		s.SetContainerRuntime(ct)
+		if err := s.confirmNoLiveCopy(ctx, "_default", "web", "src"); !refusedNaming(err, "self holds web") {
+			t.Fatalf("this host holds web's unlisted directory: %v, want refused", err)
+		}
+	})
+}
+
+// Review m-3: a peer of the previous build sends no owner record status ("").
+// Under another project's live row on that host its runtime of the name is
+// that project's, as before the record existed: skipped, not refused.
+func TestConfirmNoLiveCopy_OldPeerOwnerStatusUnderOtherProjectIsSkipped(t *testing.T) {
+	ctx := context.Background()
+	old := &pb.RuntimeInventory{Complete: true, Workloads: []*pb.RuntimeWorkload{
+		{Kind: corrosion.WorkloadContainer, Name: "web", State: "running", OwnerStatus: ""},
+	}}
+	s := absenceServer(t, map[string]*absencePeer{
+		"src": {}, "h3": {},
+		"h2": {liveOn: "h2", project: "acme", runtime: old},
+	})
+	if err := s.confirmNoLiveCopy(ctx, "_default", "web", "src"); err != nil {
+		t.Fatalf("an old peer's web under acme's row on h2: %v, want allowed as before", err)
+	}
+}
+
+// Review m-2: the refusal for an unreadable owner record names that probe,
+// even when another probe of the same container failed too.
+func TestConfirmNoLiveCopy_UnreadableOwnerRecordIsNamed(t *testing.T) {
+	ctx := context.Background()
+	ct := newRestoreCT("web")
+	ct.ownerErr = errors.New("owner file: permission denied")
+	ct.stateErr = errors.New("lxc-info: timed out")
+	h2 := restorePeerHost(t, "h2", ct, nil)
+	s := followupCluster(t, h2, []*pb.Container{{Name: "web", Project: "acme", HostName: "h2"}})
+	err := s.confirmNoLiveCopy(ctx, "_default", "web", "src")
+	if !refusedNaming(err, "cannot confirm with h2") || !strings.Contains(err.Error(), "owner file: permission denied") {
+		t.Fatalf("h2's owner record and state both fail: %v, want refused naming the owner record's error", err)
+	}
 }

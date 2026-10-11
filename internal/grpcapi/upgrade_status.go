@@ -63,8 +63,11 @@ func (s *Server) ReleaseFeatureAvailable(feature capabilities.Feature) bool {
 	return s.releaseFeatures != nil && s.releaseFeatures.FeatureAvailable(feature)
 }
 
-// releaseTokenLatcher is the optional token side of a release gate:
-// *health.Checker implements it.
+// releaseTokenLatcher is the token side of a release gate. *health.Checker,
+// the production gate, implements it (asserted at compile time in
+// release_token_latcher_test.go); a production gate that wraps the checker
+// must forward it, or ReleaseTokenLatched falls back to a feature's
+// availability, the coupling it exists to remove.
 type releaseTokenLatcher interface {
 	DurablyLatched(token string) bool
 }
@@ -83,6 +86,7 @@ func (s *Server) ReleaseTokenLatched() bool {
 	if g, ok := s.releaseFeatures.(releaseTokenLatcher); ok {
 		return g.DurablyLatched(capabilities.ReleaseToken)
 	}
+	// Only a test's fake gate gets here; see releaseTokenLatcher.
 	return s.ReleaseFeatureAvailable(capabilities.FeatureContainerReplication)
 }
 

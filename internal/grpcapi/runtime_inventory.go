@@ -59,6 +59,7 @@ type runtimeWorkload struct {
 	// "" (not read), OwnerMissing, OwnerValid or OwnerUnreadable.
 	OwnerProject string
 	OwnerStatus  string
+	OwnerError   string // why OwnerStatus is OwnerUnreadable
 }
 
 // Owner record statuses for runtimeWorkload.OwnerStatus.
@@ -369,9 +370,11 @@ func (s *Server) collectRuntimeInventory(ctx context.Context) runtimeInventory {
 // proven.
 //
 // A host whose lxc tooling probe fails can still hold the container's
-// directory on disk (tooling removed under it). That directory is reported as
-// the container, defined_stopped, with a probe error saying it cannot run
-// here: it is a copy of the data, which the full inventory does not show.
+// directory on disk (tooling removed under it), and so can a host with
+// tooling whose lxc-ls does not list the name (the directory holds no
+// config). Either directory is reported as the container, defined_stopped,
+// with a probe error saying why: it is a copy of the data, which the full
+// inventory does not show. A directory that cannot be stat'd is no answer.
 func (s *Server) collectContainerRuntime(ctx context.Context, name string) runtimeInventory {
 	inv := runtimeInventory{
 		Host:      s.hostName,
@@ -404,35 +407,59 @@ func (s *Server) collectContainerRuntime(ctx context.Context, name string) runti
 		fail("list containers: %v", err)
 		return inv
 	}
-	inv.ContainersComplete = true
+	listed := false
 	for _, n := range names {
-		if n != name {
-			continue
+		if n == name {
+			listed = true
+			break
 		}
-		w := runtimeWorkload{Kind: corrosion.WorkloadContainer, Name: n}
-		st, err := s.containerRuntime.StateContainer(ctx, n)
+	}
+	if !listed {
+		// lxc-ls lists only a directory that holds a config. One without (an
+		// import that died after the rootfs, a config removed by hand) is
+		// still the container's data on this host.
+		exists, err := s.containerRuntime.ContainerExists(ctx, name)
 		switch {
 		case err != nil:
-			w.State = health.RuntimeUnknown
-			w.ProbeError = fmt.Sprintf("container state: %v", err)
-			fail("container %s state: %v", n, err)
-		case st == "running":
-			w.State = health.RuntimeRunning
-		case st == "stopped":
-			w.State = health.RuntimeDefinedStopped
-		default:
-			w.State = health.RuntimeUnknown
+			fail("container %s directory: %v", name, err)
+			return inv
+		case exists:
+			inv.Workloads = append(inv.Workloads, s.containerOwnedBy(runtimeWorkload{
+				Kind: corrosion.WorkloadContainer, Name: name, State: health.RuntimeDefinedStopped,
+				ProbeError: probeUnlistedDirectory,
+			}))
 		}
-		w.OwnerEpochMarker, w.MarkerStatus = s.readContainerMarker(n)
-		inv.Workloads = append(inv.Workloads, s.containerOwnedBy(w))
-		break
+		inv.ContainersComplete = true
+		return inv
 	}
+	inv.ContainersComplete = true
+	// The owner-epoch marker is not read: a found entry is decided by its
+	// state and owner record alone (runtimeCopyOn).
+	w := runtimeWorkload{Kind: corrosion.WorkloadContainer, Name: name}
+	st, err := s.containerRuntime.StateContainer(ctx, name)
+	switch {
+	case err != nil:
+		w.State = health.RuntimeUnknown
+		w.ProbeError = fmt.Sprintf("container state: %v", err)
+		fail("container %s state: %v", name, err)
+	case st == "running":
+		w.State = health.RuntimeRunning
+	case st == "stopped":
+		w.State = health.RuntimeDefinedStopped
+	default:
+		w.State = health.RuntimeUnknown
+	}
+	inv.Workloads = append(inv.Workloads, s.containerOwnedBy(w))
 	return inv
 }
 
 // probeNoLXCTooling is the probe error of a container directory found on a host
 // with no lxc tooling (collectContainerRuntime).
 const probeNoLXCTooling = "its container directory is on disk, and this host has no lxc tooling to run it"
+
+// probeUnlistedDirectory is the probe error of a container directory on disk
+// that lxc-ls does not list (it holds no config) on a host with tooling.
+const probeUnlistedDirectory = "its container directory is on disk, and lxc-ls does not list it (no config)"
 
 // containerOwnedBy fills w's owner record from the runtime's, when it keeps
 // one (lxc.OwnerStamper); a runtime that keeps none reports it missing.
@@ -446,9 +473,7 @@ func (s *Server) containerOwnedBy(w runtimeWorkload) runtimeWorkload {
 	switch {
 	case err != nil:
 		w.OwnerStatus = OwnerUnreadable
-		if w.ProbeError == "" {
-			w.ProbeError = fmt.Sprintf("owner record: %v", err)
-		}
+		w.OwnerError = fmt.Sprintf("owner record: %v", err)
 	case o != nil:
 		w.OwnerStatus = OwnerValid
 		w.OwnerProject = tenancy.NormalizeProject(o.Project)
@@ -541,7 +566,7 @@ func inventoryToProto(inv runtimeInventory) *pb.RuntimeInventory {
 			DiskHolder: w.DiskHolder, Cpu: int32(w.CPU), MemoryMib: int32(w.MemoryMiB),
 			OwnerEpochMarker: w.OwnerEpochMarker, MarkerStatus: w.MarkerStatus,
 			Uncapped: w.Uncapped, ProbeError: w.ProbeError,
-			OwnerProject: w.OwnerProject, OwnerStatus: w.OwnerStatus,
+			OwnerProject: w.OwnerProject, OwnerStatus: w.OwnerStatus, OwnerError: w.OwnerError,
 		})
 	}
 	return out
@@ -564,7 +589,7 @@ func inventoryFromProto(p *pb.RuntimeInventory) runtimeInventory {
 			DiskHolder: w.GetDiskHolder(), CPU: int(w.GetCpu()), MemoryMiB: int(w.GetMemoryMib()),
 			OwnerEpochMarker: w.GetOwnerEpochMarker(), MarkerStatus: w.GetMarkerStatus(),
 			Uncapped: w.GetUncapped(), ProbeError: w.GetProbeError(),
-			OwnerProject: w.GetOwnerProject(), OwnerStatus: w.GetOwnerStatus(),
+			OwnerProject: w.GetOwnerProject(), OwnerStatus: w.GetOwnerStatus(), OwnerError: w.GetOwnerError(),
 		})
 	}
 	return inv

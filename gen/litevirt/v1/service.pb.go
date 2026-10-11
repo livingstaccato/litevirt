@@ -4030,7 +4030,10 @@ type GetRuntimeInventoryRequest struct {
 	// complete is false (the rest of the host was not looked at). On a host
 	// whose lxc tooling probe fails, a container directory left on disk under
 	// that name is reported, as a container in state defined_stopped with a
-	// probe_error saying it cannot run there. A previous build ignores the
+	// probe_error saying it cannot run there; so is such a directory on a host
+	// with tooling whose lxc-ls does not list it (it holds no config). A
+	// directory that cannot be stat'd leaves containers_complete false. A
+	// previous build ignores the
 	// field and answers with its full inventory filtered to the name.
 	ContainersOnly bool `protobuf:"varint,3,opt,name=containers_only,json=containersOnly,proto3" json:"containers_only,omitempty"`
 	unknownFields  protoimpl.UnknownFields
@@ -4118,8 +4121,10 @@ type RuntimeWorkload struct {
 	// only for a containers_only ask. owner_status: "" not read (a previous
 	// build, or not asked) | missing (no record: an earlier build made it) |
 	// valid | unreadable. owner_project is set only when valid.
-	OwnerProject  string `protobuf:"bytes,11,opt,name=owner_project,json=ownerProject,proto3" json:"owner_project,omitempty"`
-	OwnerStatus   string `protobuf:"bytes,12,opt,name=owner_status,json=ownerStatus,proto3" json:"owner_status,omitempty"`
+	OwnerProject string `protobuf:"bytes,11,opt,name=owner_project,json=ownerProject,proto3" json:"owner_project,omitempty"`
+	OwnerStatus  string `protobuf:"bytes,12,opt,name=owner_status,json=ownerStatus,proto3" json:"owner_status,omitempty"`
+	// owner_error is why owner_status is unreadable (the record's read error).
+	OwnerError    string `protobuf:"bytes,13,opt,name=owner_error,json=ownerError,proto3" json:"owner_error,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -4234,6 +4239,13 @@ func (x *RuntimeWorkload) GetOwnerProject() string {
 func (x *RuntimeWorkload) GetOwnerStatus() string {
 	if x != nil {
 		return x.OwnerStatus
+	}
+	return ""
+}
+
+func (x *RuntimeWorkload) GetOwnerError() string {
+	if x != nil {
+		return x.OwnerError
 	}
 	return ""
 }
@@ -38725,7 +38737,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x1aGetRuntimeInventoryRequest\x12\x12\n" +
 	"\x04kind\x18\x01 \x01(\tR\x04kind\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12'\n" +
-	"\x0fcontainers_only\x18\x03 \x01(\bR\x0econtainersOnly\"\xf9\x02\n" +
+	"\x0fcontainers_only\x18\x03 \x01(\bR\x0econtainersOnly\"\x9a\x03\n" +
 	"\x0fRuntimeWorkload\x12\x12\n" +
 	"\x04kind\x18\x01 \x01(\tR\x04kind\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x14\n" +
@@ -38742,7 +38754,9 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	" \x01(\tR\n" +
 	"probeError\x12#\n" +
 	"\rowner_project\x18\v \x01(\tR\fownerProject\x12!\n" +
-	"\fowner_status\x18\f \x01(\tR\vownerStatus\"\xfa\x02\n" +
+	"\fowner_status\x18\f \x01(\tR\vownerStatus\x12\x1f\n" +
+	"\vowner_error\x18\r \x01(\tR\n" +
+	"ownerError\"\xfa\x02\n" +
 	"\x10RuntimeInventory\x12\x12\n" +
 	"\x04host\x18\x01 \x01(\tR\x04host\x12:\n" +
 	"\tworkloads\x18\x02 \x03(\v2\x1c.litevirt.v1.RuntimeWorkloadR\tworkloads\x120\n" +

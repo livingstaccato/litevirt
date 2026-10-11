@@ -92,29 +92,29 @@ move plain chunks — a DR copy can differ in compression from its source. A
 chunk zstd cannot shrink (already-compressed guest data) is stored as it is.
 
 ```bash
-lv backup repo init /srv/backup/main                      # the default (below)
-lv backup repo init /srv/backup/main --compression none   # uncompressed
-lv backup repo set-compression /srv/backup/main zstd      # existing repo
+lv backup repo init /srv/backup/main                      # local, uncompressed (the default)
+lv backup repo init /srv/backup/main --compression zstd   # compressed, via the daemon (below)
+lv backup repo set-compression /srv/backup/main zstd      # existing repo, via the daemon
 ```
 
-**The default follows the cluster's upgrade.** Until the cluster's release
-token has latched — every host runs a build that reads compressed repos —
-a new repo is uncompressed and `--compression zstd` or `set-compression ...
-zstd` is refused, naming the release feature `backup_zstd`. Once it has
-latched, new repos are compressed by default. `--force` allows zstd earlier,
-for a repository no older host or backup host reads (an air-gapped one).
+**zstd is explicit, and gated on the cluster's upgrade.** A plain `lv backup
+repo init <path>` is exactly what earlier releases did: a local,
+uncompressed repository, created by the CLI with your own rights and no
+daemon. Compression is asked for with `--compression zstd` on `init`, or
+`set-compression <path> zstd` on an existing repo. Until the cluster's
+release token has latched — every host runs a build that reads compressed
+repos — both are refused, naming the release feature `backup_zstd`.
 
-Creating a compressed repo, or turning zstd on for one, is done by the
-**daemon of the host the CLI is connected to**
-(`SetBackupRepoCompression`, below), not by the CLI alone: the daemon's
-release-feature gate records that `backup_zstd` is in use before
-`repo.json` changes, and the path is then a path on that host. When no
-daemon can be asked, or the feature is not open, the default falls back to
-an uncompressed repo and says so; an explicit `--compression zstd` fails
-with the reason. `--force` skips the daemon and the gate and writes the
-repo locally; nothing records that use, so it is for a repository no host
-of this cluster's rollback story depends on. Creating an uncompressed
-repo and turning compression off need no daemon and no feature.
+Creating or converting to zstd is done by the **daemon of the host the CLI
+is connected to** (`SetBackupRepoCompression`, below), not by the CLI alone:
+the daemon's release-feature gate records that `backup_zstd` is in use
+before `repo.json` changes. The path is then a path on that host, the repo is
+owned by the daemon, a custom absolute path needs the admin role, and the
+daemon refuses its own data and PKI directories. The CLI prints which host
+created or converted the repo. `--force` skips the daemon and the gate and
+writes the repo locally; nothing records that use, so it is for a repository
+no older host or backup host reads (an air-gapped one). Creating an
+uncompressed repo and turning compression off need no daemon and no feature.
 
 **Older releases refuse a compressed repo.** A compressed repo's `repo.json`
 says `"compression": "zstd"` and `"schema_version": 2`. Every release before

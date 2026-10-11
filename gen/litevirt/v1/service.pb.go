@@ -11515,16 +11515,13 @@ func (x *VerifyBackupRepoResponse) GetMissing() []string {
 // SetBackupRepoCompression: only zstd is gated, so only zstd is asked for;
 // turning compression off, or creating an uncompressed repo, needs no daemon.
 type SetBackupRepoCompressionRequest struct {
-	state       protoimpl.MessageState `protogen:"open.v1"`
-	Repo        string                 `protobuf:"bytes,1,opt,name=repo,proto3" json:"repo,omitempty"`               // a registered repo name, or an absolute path (admin)
-	Compression string                 `protobuf:"bytes,2,opt,name=compression,proto3" json:"compression,omitempty"` // "zstd"
-	Init        bool                   `protobuf:"varint,3,opt,name=init,proto3" json:"init,omitempty"`              // create the repo (it must not exist) instead of converting one
-	Encrypted   bool                   `protobuf:"varint,4,opt,name=encrypted,proto3" json:"encrypted,omitempty"`    // with init: mark the new repo AES-256-GCM encrypted
-	// only_if_available: do nothing, and say so, when backup_zstd cannot be used
-	// yet, instead of failing. For a default that falls back to no compression.
-	OnlyIfAvailable bool `protobuf:"varint,5,opt,name=only_if_available,json=onlyIfAvailable,proto3" json:"only_if_available,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Repo          string                 `protobuf:"bytes,1,opt,name=repo,proto3" json:"repo,omitempty"`               // a registered repo name, or an absolute path (admin)
+	Compression   string                 `protobuf:"bytes,2,opt,name=compression,proto3" json:"compression,omitempty"` // "zstd"
+	Init          bool                   `protobuf:"varint,3,opt,name=init,proto3" json:"init,omitempty"`              // create the repo (it must not exist) instead of converting one
+	Encrypted     bool                   `protobuf:"varint,4,opt,name=encrypted,proto3" json:"encrypted,omitempty"`    // with init: mark the new repo AES-256-GCM encrypted
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *SetBackupRepoCompressionRequest) Reset() {
@@ -11585,22 +11582,14 @@ func (x *SetBackupRepoCompressionRequest) GetEncrypted() bool {
 	return false
 }
 
-func (x *SetBackupRepoCompressionRequest) GetOnlyIfAvailable() bool {
-	if x != nil {
-		return x.OnlyIfAvailable
-	}
-	return false
-}
-
 type SetBackupRepoCompressionResponse struct {
-	state            protoimpl.MessageState `protogen:"open.v1"`
-	Applied          bool                   `protobuf:"varint,1,opt,name=applied,proto3" json:"applied,omitempty"` // false only with only_if_available, when the feature is not open
-	NotAppliedReason string                 `protobuf:"bytes,2,opt,name=not_applied_reason,json=notAppliedReason,proto3" json:"not_applied_reason,omitempty"`
-	Path             string                 `protobuf:"bytes,3,opt,name=path,proto3" json:"path,omitempty"`
-	Compression      string                 `protobuf:"bytes,4,opt,name=compression,proto3" json:"compression,omitempty"`
-	SchemaVersion    int32                  `protobuf:"varint,5,opt,name=schema_version,json=schemaVersion,proto3" json:"schema_version,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Path          string                 `protobuf:"bytes,1,opt,name=path,proto3" json:"path,omitempty"`
+	Compression   string                 `protobuf:"bytes,2,opt,name=compression,proto3" json:"compression,omitempty"`
+	SchemaVersion int32                  `protobuf:"varint,3,opt,name=schema_version,json=schemaVersion,proto3" json:"schema_version,omitempty"`
+	Host          string                 `protobuf:"bytes,4,opt,name=host,proto3" json:"host,omitempty"` // the host whose disk now holds the repo
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *SetBackupRepoCompressionResponse) Reset() {
@@ -11633,20 +11622,6 @@ func (*SetBackupRepoCompressionResponse) Descriptor() ([]byte, []int) {
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{162}
 }
 
-func (x *SetBackupRepoCompressionResponse) GetApplied() bool {
-	if x != nil {
-		return x.Applied
-	}
-	return false
-}
-
-func (x *SetBackupRepoCompressionResponse) GetNotAppliedReason() string {
-	if x != nil {
-		return x.NotAppliedReason
-	}
-	return ""
-}
-
 func (x *SetBackupRepoCompressionResponse) GetPath() string {
 	if x != nil {
 		return x.Path
@@ -11666,6 +11641,13 @@ func (x *SetBackupRepoCompressionResponse) GetSchemaVersion() int32 {
 		return x.SchemaVersion
 	}
 	return 0
+}
+
+func (x *SetBackupRepoCompressionResponse) GetHost() string {
+	if x != nil {
+		return x.Host
+	}
+	return ""
 }
 
 type GarbageCollectBackupRepoRequest struct {
@@ -36567,19 +36549,17 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\n" +
 	"mismatched\x18\x02 \x03(\tR\n" +
 	"mismatched\x12\x18\n" +
-	"\amissing\x18\x03 \x03(\tR\amissing\"\xb5\x01\n" +
+	"\amissing\x18\x03 \x03(\tR\amissing\"\x89\x01\n" +
 	"\x1fSetBackupRepoCompressionRequest\x12\x12\n" +
 	"\x04repo\x18\x01 \x01(\tR\x04repo\x12 \n" +
 	"\vcompression\x18\x02 \x01(\tR\vcompression\x12\x12\n" +
 	"\x04init\x18\x03 \x01(\bR\x04init\x12\x1c\n" +
-	"\tencrypted\x18\x04 \x01(\bR\tencrypted\x12*\n" +
-	"\x11only_if_available\x18\x05 \x01(\bR\x0fonlyIfAvailable\"\xc7\x01\n" +
-	" SetBackupRepoCompressionResponse\x12\x18\n" +
-	"\aapplied\x18\x01 \x01(\bR\aapplied\x12,\n" +
-	"\x12not_applied_reason\x18\x02 \x01(\tR\x10notAppliedReason\x12\x12\n" +
-	"\x04path\x18\x03 \x01(\tR\x04path\x12 \n" +
-	"\vcompression\x18\x04 \x01(\tR\vcompression\x12%\n" +
-	"\x0eschema_version\x18\x05 \x01(\x05R\rschemaVersion\"5\n" +
+	"\tencrypted\x18\x04 \x01(\bR\tencrypted\"\x93\x01\n" +
+	" SetBackupRepoCompressionResponse\x12\x12\n" +
+	"\x04path\x18\x01 \x01(\tR\x04path\x12 \n" +
+	"\vcompression\x18\x02 \x01(\tR\vcompression\x12%\n" +
+	"\x0eschema_version\x18\x03 \x01(\x05R\rschemaVersion\x12\x12\n" +
+	"\x04host\x18\x04 \x01(\tR\x04host\"5\n" +
 	"\x1fGarbageCollectBackupRepoRequest\x12\x12\n" +
 	"\x04repo\x18\x01 \x01(\tR\x04repo\"\xd3\x02\n" +
 	" GarbageCollectBackupRepoResponse\x12+\n" +

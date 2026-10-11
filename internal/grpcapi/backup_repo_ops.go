@@ -10,6 +10,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/pbsstore"
+	"github.com/litevirt/litevirt/internal/storage"
 )
 
 // Backup repository maintenance: verify, garbage-collect, prune and sync a repo
@@ -298,12 +299,13 @@ func (s *Server) SetBackupRepoCompression(ctx context.Context, req *pb.SetBackup
 		s.audit(ctx, action, repoName, fmt.Sprintf("repo %q: %v", repoName, err), result)
 		return nil, err
 	}
-	if req.GetOnlyIfAvailable() && !s.ReleaseFeatureAvailable(capabilities.FeatureBackupZstd) {
-		return &pb.SetBackupRepoCompressionResponse{
-			NotAppliedReason: "the cluster's release token has not latched yet",
-		}, nil
+	// Never the daemon's own state or PKI, for an admin too: the sibling
+	// restore-target create refuses them (resolveRestoreTarget), and this
+	// creates a directory tree.
+	if err := storage.CheckDaemonStatePath(path, s.dataDir, s.pkiDir); err != nil {
+		s.audit(ctx, action, repoName, fmt.Sprintf("repo %q: %v", repoName, err), "denied")
+		return nil, status.Errorf(codes.InvalidArgument, "repo: %v", err)
 	}
-
 	var repo *pbsstore.Repo
 	if !req.GetInit() {
 		// Read first, so a bad path costs no used record.
@@ -325,9 +327,6 @@ func (s *Server) SetBackupRepoCompression(ctx context.Context, req *pb.SetBackup
 		return repo.EnableCompressionWithGrant(g)
 	})
 	if err != nil {
-		if req.GetOnlyIfAvailable() && status.Code(err) == codes.FailedPrecondition {
-			return &pb.SetBackupRepoCompressionResponse{NotAppliedReason: status.Convert(err).Message()}, nil
-		}
 		s.audit(ctx, action, repoName, err.Error(), "error")
 		if _, ok := status.FromError(err); ok {
 			return nil, err
@@ -337,9 +336,9 @@ func (s *Server) SetBackupRepoCompression(ctx context.Context, req *pb.SetBackup
 	s.audit(ctx, action, repoName, fmt.Sprintf("init=%t compression=%s schema=%d",
 		req.GetInit(), repo.Compression(), repo.Meta().SchemaVersion), "ok")
 	return &pb.SetBackupRepoCompressionResponse{
-		Applied:       true,
 		Path:          path,
 		Compression:   repo.Compression(),
 		SchemaVersion: int32(repo.Meta().SchemaVersion),
+		Host:          s.hostName,
 	}, nil
 }

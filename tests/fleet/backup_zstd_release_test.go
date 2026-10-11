@@ -43,20 +43,14 @@ func TestFleet_BackupZstd_GatedOnTheReleaseToken(t *testing.T) {
 			t.Fatalf("%s holds a backup_zstd use that nothing wrote", n.Name)
 		}
 	}
-	// The default init asks only_if_available and falls back instead of failing.
-	resp, err := cli.SetBackupRepoCompression(ctx, &pb.SetBackupRepoCompressionRequest{
-		Repo: repo, Compression: "zstd", Init: true, OnlyIfAvailable: true})
-	if err != nil || resp.GetApplied() {
-		t.Fatalf("only_if_available before the latch: resp=%+v err=%v, want not applied", resp, err)
-	}
-
 	old.Server.SetWALQuarantined(old.DB.WALQuarantined)
+	var resp *pb.SetBackupRepoCompressionResponse
 	eventually(t, 15*time.Second, "the zstd repository to be created on a uniform fleet", func() bool {
 		resp, err = cli.SetBackupRepoCompression(ctx, req)
 		return err == nil
 	})
-	if !resp.GetApplied() || resp.GetCompression() != "zstd" || resp.GetSchemaVersion() != 2 {
-		t.Fatalf("response %+v, want applied zstd schema 2", resp)
+	if resp.GetCompression() != "zstd" || resp.GetSchemaVersion() != 2 || resp.GetHost() != a.Name {
+		t.Fatalf("response %+v, want zstd schema 2 on %s", resp, a.Name)
 	}
 	for _, n := range c.Nodes {
 		if !featureUsedOn(t, n, capabilities.ReleaseToken, "backup_zstd") {

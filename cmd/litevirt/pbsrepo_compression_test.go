@@ -51,9 +51,6 @@ func (d *daemonStub) call(_ context.Context, req *pb.SetBackupRepoCompressionReq
 		return nil, errors.New("connect: no daemon")
 	}
 	if !d.open {
-		if req.GetOnlyIfAvailable() {
-			return &pb.SetBackupRepoCompressionResponse{NotAppliedReason: "the cluster's release token has not latched yet"}, nil
-		}
 		return nil, status.Error(codes.FailedPrecondition, stubRefusal)
 	}
 	var r *pbsstore.Repo
@@ -63,14 +60,14 @@ func (d *daemonStub) call(_ context.Context, req *pb.SetBackupRepoCompressionReq
 		if req.GetEncrypted() {
 			opts.Encryption = pbsstore.EncryptionModeAESGCM
 		}
-		r, err = pbsstore.InitWithOptions(req.GetRepo(), opts)
+		r, err = pbsstore.InitUngated(req.GetRepo(), opts)
 	} else if r, err = pbsstore.Open(req.GetRepo()); err == nil {
-		err = r.SetCompression(pbsstore.CompressionZstd)
+		err = r.SetCompressionUngated(pbsstore.CompressionZstd)
 	}
 	if err != nil {
 		return nil, err
 	}
-	return &pb.SetBackupRepoCompressionResponse{Applied: true, Path: r.Root(), Compression: r.Compression(),
+	return &pb.SetBackupRepoCompressionResponse{Host: "node-x", Path: r.Root(), Compression: r.Compression(),
 		SchemaVersion: int32(r.Meta().SchemaVersion)}, nil
 }
 
@@ -84,36 +81,22 @@ func withFeature(t *testing.T, open bool) *daemonStub {
 	return d
 }
 
-// Before the release token latches (backup_zstd closed), a new repo is
-// uncompressed: older peers refuse a schema-2 repo.
-func TestBackupRepoInit_DefaultFollowsTheReleaseToken(t *testing.T) {
-	d := withFeature(t, false)
-	dir := filepath.Join(t.TempDir(), "repo")
-	if err := runBackupRepoCmd(t, "init", dir); err != nil {
-		t.Fatal(err)
-	}
-	if r := openRepo(t, dir); r.Compression() != pbsstore.CompressionNone || r.Meta().SchemaVersion != 1 {
-		t.Fatalf("closed gate: compression=%q schema=%d, want none and 1", r.Compression(), r.Meta().SchemaVersion)
-	}
-	if len(d.reqs) != 1 || !d.reqs[0].GetOnlyIfAvailable() || !d.reqs[0].GetInit() || d.reqs[0].GetRepo() != dir {
-		t.Fatalf("the default asked the daemon %+v, want one init with only_if_available for %s", d.reqs, dir)
-	}
-	// With no daemon to ask, the default is still an uncompressed repo.
-	d.down = true
-	dirDown := filepath.Join(t.TempDir(), "repo")
-	if err := runBackupRepoCmd(t, "init", dirDown); err != nil {
-		t.Fatalf("default init with no daemon: %v", err)
-	}
-	if r := openRepo(t, dirDown); r.Compression() != pbsstore.CompressionNone {
-		t.Fatalf("no daemon: compression=%q, want none", r.Compression())
-	}
-	withFeature(t, true)
-	dir2 := filepath.Join(t.TempDir(), "repo")
-	if err := runBackupRepoCmd(t, "init", dir2); err != nil {
-		t.Fatal(err)
-	}
-	if r := openRepo(t, dir2); r.Compression() != pbsstore.CompressionZstd {
-		t.Fatalf("open gate: compression=%q, want zstd", r.Compression())
+// I1: a plain init is the local, uncompressed repository main creates, however
+// the cluster stands: the daemon is never asked, even when backup_zstd is open,
+// so where the repo lands does not depend on credentials or connectivity.
+func TestBackupRepoInit_DefaultIsLocalAndUncompressed(t *testing.T) {
+	for _, open := range []bool{false, true} {
+		d := withFeature(t, open)
+		dir := filepath.Join(t.TempDir(), "repo")
+		if err := runBackupRepoCmd(t, "init", dir); err != nil {
+			t.Fatal(err)
+		}
+		if r := openRepo(t, dir); r.Compression() != pbsstore.CompressionNone || r.Meta().SchemaVersion != 1 {
+			t.Fatalf("open=%v: compression=%q schema=%d, want none and 1", open, r.Compression(), r.Meta().SchemaVersion)
+		}
+		if len(d.reqs) != 0 {
+			t.Fatalf("open=%v: a plain init asked the daemon: %+v", open, d.reqs)
+		}
 	}
 }
 
@@ -130,7 +113,7 @@ func TestBackupRepoInit_ExplicitZstdIsGated(t *testing.T) {
 	if _, serr := os.Stat(filepath.Join(dir, "repo.json")); serr == nil {
 		t.Fatal("a refused zstd init created the repository")
 	}
-	if len(d.reqs) != 1 || d.reqs[0].GetOnlyIfAvailable() {
+	if len(d.reqs) != 1 {
 		t.Fatalf("explicit zstd asked the daemon %+v, want one request that fails when closed", d.reqs)
 	}
 	if err := runBackupRepoCmd(t, "init", dir, "--compression", "zstd", "--force"); err != nil {
@@ -158,8 +141,15 @@ func TestBackupRepoInit_ExplicitZstdThroughTheDaemon(t *testing.T) {
 	if err := os.WriteFile(key, []byte(strings.Repeat("ab", 32)), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := runBackupRepoCmd(t, "init", dir, "--compression", "zstd", "--encrypted", "--key-file", key); err != nil {
+	var err error
+	out := captureStdout(t, func() {
+		err = runBackupRepoCmd(t, "init", dir, "--compression", "zstd", "--encrypted", "--key-file", key)
+	})
+	if err != nil {
 		t.Fatal(err)
+	}
+	if !strings.Contains(out, "Created on host node-x") {
+		t.Fatalf("the CLI did not say which host created the repo:\n%s", out)
 	}
 	if len(d.reqs) != 1 || !d.reqs[0].GetEncrypted() || !d.reqs[0].GetInit() {
 		t.Fatalf("daemon request %+v, want an encrypted init", d.reqs)
@@ -207,8 +197,13 @@ func TestBackupRepoSetCompression_ThroughTheDaemon(t *testing.T) {
 	if _, err := pbsstore.Init(dir); err != nil {
 		t.Fatal(err)
 	}
-	if err := runBackupRepoCmd(t, "set-compression", dir, "zstd"); err != nil {
+	var err error
+	out := captureStdout(t, func() { err = runBackupRepoCmd(t, "set-compression", dir, "zstd") })
+	if err != nil {
 		t.Fatal(err)
+	}
+	if !strings.Contains(out, "Converted on host node-x") {
+		t.Fatalf("the CLI did not say which host converted the repo:\n%s", out)
 	}
 	if len(d.reqs) != 1 || d.reqs[0].GetInit() || d.reqs[0].GetRepo() != dir {
 		t.Fatalf("daemon request %+v, want a conversion of %s", d.reqs, dir)

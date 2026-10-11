@@ -52,7 +52,7 @@ func onDiskChunk(t *testing.T, r *Repo, id string) []byte {
 // compression supports schema_version 1 only.
 func TestCompressedRepo_MarkedForOlderReaders(t *testing.T) {
 	dir := t.TempDir()
-	if _, err := InitWithOptions(dir, InitOptions{Compression: CompressionZstd}); err != nil {
+	if _, err := InitUngated(dir, InitOptions{Compression: CompressionZstd}); err != nil {
 		t.Fatalf("InitWithOptions: %v", err)
 	}
 	meta := readRepoMeta(t, dir)
@@ -94,7 +94,7 @@ func TestUncompressedRepo_StaysReadableByOlderReaders(t *testing.T) {
 }
 
 func TestCompressedRepo_ChunkIsSmallerOnDiskAndRoundTrips(t *testing.T) {
-	r, err := InitWithOptions(t.TempDir(), InitOptions{Compression: CompressionZstd})
+	r, err := InitUngated(t.TempDir(), InitOptions{Compression: CompressionZstd})
 	if err != nil {
 		t.Fatalf("InitWithOptions: %v", err)
 	}
@@ -122,7 +122,7 @@ func TestCompressedRepo_ChunkIsSmallerOnDiskAndRoundTrips(t *testing.T) {
 // Data zstd cannot shrink is stored raw — no expansion on already-compressed
 // guest data.
 func TestCompressedRepo_IncompressibleStoredRaw(t *testing.T) {
-	r, err := InitWithOptions(t.TempDir(), InitOptions{Compression: CompressionZstd})
+	r, err := InitUngated(t.TempDir(), InitOptions{Compression: CompressionZstd})
 	if err != nil {
 		t.Fatalf("InitWithOptions: %v", err)
 	}
@@ -150,7 +150,7 @@ func TestCompressedRepo_RawChunkThatLooksCompressed(t *testing.T) {
 		init func(string) (*Repo, error)
 	}{
 		{"uncompressed", Init},
-		{"compressed", func(d string) (*Repo, error) { return InitWithOptions(d, InitOptions{Compression: CompressionZstd}) }},
+		{"compressed", func(d string) (*Repo, error) { return InitUngated(d, InitOptions{Compression: CompressionZstd}) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r, err := tc.init(t.TempDir())
@@ -193,7 +193,7 @@ func TestCompressedRepo_RawChunkThatLooksCompressed(t *testing.T) {
 // A stored frame that decodes past ChunkSize is refused without allocating
 // its claimed size — chunk files are untrusted (a shared or synced repo).
 func TestCompressedRepo_DecompressionBounded(t *testing.T) {
-	r, err := InitWithOptions(t.TempDir(), InitOptions{Compression: CompressionZstd})
+	r, err := InitUngated(t.TempDir(), InitOptions{Compression: CompressionZstd})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -227,7 +227,7 @@ func TestCompressedRepo_DecompressionBounded(t *testing.T) {
 // Compression sits under encryption: the plaintext is compressed, then sealed.
 func TestCompressedEncryptedRepo_RoundTrip(t *testing.T) {
 	dir := t.TempDir()
-	r, err := InitWithOptions(dir, InitOptions{Encryption: EncryptionModeAESGCM, Compression: CompressionZstd})
+	r, err := InitUngated(dir, InitOptions{Encryption: EncryptionModeAESGCM, Compression: CompressionZstd})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -282,7 +282,7 @@ func TestSetCompression_UpgradesExistingRepo(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := r.SetCompression(CompressionZstd); err != nil {
+	if err := r.SetCompressionUngated(CompressionZstd); err != nil {
 		t.Fatalf("SetCompression: %v", err)
 	}
 	meta := readRepoMeta(t, dir)
@@ -370,7 +370,7 @@ func TestOpen_RefusesNewerSchema(t *testing.T) {
 // Sync between a compressed and an uncompressed repo moves plaintext, so a
 // DR copy can differ in compression from its source.
 func TestSyncRepo_AcrossCompressionModes(t *testing.T) {
-	src, err := InitWithOptions(t.TempDir(), InitOptions{Compression: CompressionZstd})
+	src, err := InitUngated(t.TempDir(), InitOptions{Compression: CompressionZstd})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -390,5 +390,28 @@ func TestSyncRepo_AcrossCompressionModes(t *testing.T) {
 	}
 	if !bytes.Equal(onDiskChunk(t, dst, m.Chunks[0].ID), data[:ChunkSize]) {
 		t.Fatal("the uncompressed destination stored a compressed chunk; its older readers could not read it")
+	}
+}
+
+// zstd is the release feature backup_zstd's data: the ungated entry points
+// refuse it, so only the grant-taking writers (and the explicitly named
+// override) can make a repo compressed.
+func TestUngatedWritersRefuseZstd(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := InitWithOptions(filepath.Join(dir, "a"), InitOptions{Compression: CompressionZstd}); !errors.Is(err, ErrZstdNeedsGate) {
+		t.Fatalf("InitWithOptions(zstd) = %v, want ErrZstdNeedsGate", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "a", "repo.json")); err == nil {
+		t.Fatal("a refused init created repo.json")
+	}
+	r, err := Init(filepath.Join(dir, "b"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.SetCompression(CompressionZstd); !errors.Is(err, ErrZstdNeedsGate) {
+		t.Fatalf("SetCompression(zstd) = %v, want ErrZstdNeedsGate", err)
+	}
+	if r.Compression() != CompressionNone || r.Meta().SchemaVersion != 1 {
+		t.Fatal("a refused SetCompression changed the repo")
 	}
 }

@@ -77,8 +77,8 @@ func TestSetBackupRepoCompression_Init_GatedAndUsedBeforeData(t *testing.T) {
 	if err != nil {
 		t.Fatalf("after the latch: %v", err)
 	}
-	if !resp.GetApplied() || resp.GetCompression() != "zstd" || resp.GetSchemaVersion() != 2 {
-		t.Fatalf("response = %+v, want applied zstd schema 2", resp)
+	if resp.GetCompression() != "zstd" || resp.GetSchemaVersion() != 2 || resp.GetHost() != "test-host" {
+		t.Fatalf("response = %+v, want zstd schema 2 on test-host", resp)
 	}
 	if g.used != 1 || g.repoAtUse {
 		t.Fatalf("used=%d repoExistedAtUse=%v, want one use recorded before the repository existed", g.used, g.repoAtUse)
@@ -120,22 +120,25 @@ func TestSetBackupRepoCompression_Convert_Gated(t *testing.T) {
 	}
 }
 
-// only_if_available is the default init's fallback: not open means "not
-// applied", not an error, and nothing is created or recorded.
-func TestSetBackupRepoCompression_OnlyIfAvailable(t *testing.T) {
-	g := &orderGate{}
-	s, dir := compressionServer(t, g)
-	req := &pb.SetBackupRepoCompressionRequest{Repo: dir, Compression: "zstd", Init: true, OnlyIfAvailable: true}
-	resp, err := s.SetBackupRepoCompression(adminCtx(), req)
-	if err != nil || resp.GetApplied() || resp.GetNotAppliedReason() == "" {
-		t.Fatalf("closed: resp=%+v err=%v, want not applied with a reason", resp, err)
+// The daemon never creates its repository scaffolding inside its own state or
+// PKI directories, for an admin too (as the restore-target create refuses),
+// and nothing is recorded or created for it.
+func TestSetBackupRepoCompression_RefusesDaemonState(t *testing.T) {
+	g := &orderGate{open: true}
+	s, _ := compressionServer(t, g)
+	s.dataDir = t.TempDir()
+	s.pkiDir = t.TempDir()
+	for _, p := range []string{filepath.Join(s.dataDir, "images", "repo"), filepath.Join(s.pkiDir, "repo"), s.dataDir} {
+		_, err := s.SetBackupRepoCompression(adminCtx(), &pb.SetBackupRepoCompressionRequest{Repo: p, Compression: "zstd", Init: true})
+		if status.Code(err) != codes.InvalidArgument {
+			t.Fatalf("%s: %v, want InvalidArgument", p, err)
+		}
+		if _, serr := os.Stat(filepath.Join(p, "repo.json")); serr == nil {
+			t.Fatalf("%s: repo.json created", p)
+		}
 	}
-	if len(g.featuresAsked) != 0 {
-		t.Fatalf("the availability check ran the gate: %v", g.featuresAsked)
-	}
-	g.open = true
-	if resp, err := s.SetBackupRepoCompression(adminCtx(), req); err != nil || !resp.GetApplied() {
-		t.Fatalf("open: resp=%+v err=%v", resp, err)
+	if g.used != 0 {
+		t.Fatal("a refused path recorded a use")
 	}
 }
 

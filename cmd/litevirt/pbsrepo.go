@@ -105,21 +105,11 @@ func newBackupRepoInitCmd() *cobra.Command {
 			}
 			switch compression {
 			case "":
-				// The default: zstd once backup_zstd is open, none until then
-				// (or when no daemon can be asked).
+				// The default is the local, uncompressed repository main
+				// creates, whatever the cluster's state: where a repo lands must
+				// not depend on credentials or connectivity. zstd is asked for
+				// explicitly (--compression zstd), which goes through the daemon.
 				compression = pbsstore.CompressionNone
-				resp, err := repoZstdViaDaemon(cmd.Context(), &pb.SetBackupRepoCompressionRequest{
-					Repo: absRepoPath(args[0]), Compression: pbsstore.CompressionZstd,
-					Init: true, Encrypted: encrypted, OnlyIfAvailable: true,
-				})
-				switch {
-				case err == nil && resp.GetApplied():
-					return printInitialised(resp.GetPath(), resp.GetCompression(), encrypted)
-				case err != nil:
-					fmt.Fprintf(os.Stderr, "Not using zstd compression: %s\n", status.Convert(err).Message())
-				default:
-					fmt.Fprintf(os.Stderr, "Not using zstd compression yet: %s\n", resp.GetNotAppliedReason())
-				}
 			case pbsstore.CompressionZstd:
 				if !force {
 					resp, err := repoZstdViaDaemon(cmd.Context(), &pb.SetBackupRepoCompressionRequest{
@@ -129,16 +119,27 @@ func newBackupRepoInitCmd() *cobra.Command {
 					if err != nil {
 						return zstdRefusal(err)
 					}
-					return printInitialised(resp.GetPath(), resp.GetCompression(), encrypted)
+					err = printInitialised(resp.GetPath(), resp.GetCompression(), encrypted)
+					fmt.Printf("Created on host %s, the host this command is connected to (not necessarily this machine).\n", resp.GetHost())
+					return err
 				}
 			}
 			opts := pbsstore.InitOptions{Compression: compression}
 			if encrypted {
 				opts.Encryption = pbsstore.EncryptionModeAESGCM
 			}
-			r, err := pbsstore.InitWithOptions(args[0], opts)
+			var r *pbsstore.Repo
+			var err error
+			if compression == pbsstore.CompressionZstd {
+				r, err = pbsstore.InitUngated(args[0], opts) // --force: no gate, no recorded use
+			} else {
+				r, err = pbsstore.InitWithOptions(args[0], opts)
+			}
 			if err != nil {
 				return err
+			}
+			if compression == pbsstore.CompressionNone {
+				fmt.Println("Compression is off by default. Once the cluster's release token has latched, `--compression zstd` creates a compressed repository (feature backup_zstd).")
 			}
 			return printInitialised(r.Root(), r.Compression(), encrypted)
 		},
@@ -146,7 +147,7 @@ func newBackupRepoInitCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&encrypted, "encrypted", false, "Mark the repo as AES-256-GCM encrypted")
 	cmd.Flags().StringVar(&keyPath, "key-file", "", "Path to a hex-encoded 32-byte key (only with --encrypted)")
 	cmd.Flags().StringVar(&compression, "compression", "",
-		"Chunk compression: zstd or none. Default: zstd once the cluster's release token has latched (feature backup_zstd) and the connected daemon can create it, none until then")
+		"Chunk compression: zstd or none. Default: none, locally. zstd (release feature backup_zstd) is created by the daemon of the connected host once the cluster's release token has latched")
 	cmd.Flags().BoolVar(&force, "force", false, "Allow --compression zstd before the release token has latched (for a repo no older host reads)")
 	return cmd
 }
@@ -182,13 +183,19 @@ no older host reads. Turning it off needs neither.`,
 					return zstdRefusal(err)
 				}
 				fmt.Printf("Repository %s: compression %s for new chunks\n", resp.GetPath(), resp.GetCompression())
+				fmt.Printf("Converted on host %s, the host this command is connected to (not necessarily this machine).\n", resp.GetHost())
 				return nil
 			}
 			r, err := pbsstore.Open(args[0])
 			if err != nil {
 				return err
 			}
-			if err := r.SetCompression(args[1]); err != nil {
+			if args[1] == pbsstore.CompressionZstd {
+				err = r.SetCompressionUngated(args[1]) // --force: no gate, no recorded use
+			} else {
+				err = r.SetCompression(args[1])
+			}
+			if err != nil {
 				return err
 			}
 			fmt.Printf("Repository %s: compression %s for new chunks\n", r.Root(), r.Compression())

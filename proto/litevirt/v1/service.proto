@@ -1119,16 +1119,12 @@ message SetBackupRepoCompressionRequest {
     string compression = 2;  // "zstd"
     bool   init        = 3;  // create the repo (it must not exist) instead of converting one
     bool   encrypted   = 4;  // with init: mark the new repo AES-256-GCM encrypted
-    // only_if_available: do nothing, and say so, when backup_zstd cannot be used
-    // yet, instead of failing. For a default that falls back to no compression.
-    bool   only_if_available = 5;
 }
 message SetBackupRepoCompressionResponse {
-    bool   applied            = 1;  // false only with only_if_available, when the feature is not open
-    string not_applied_reason = 2;
-    string path               = 3;
-    string compression        = 4;
-    int32  schema_version     = 5;
+    string path           = 1;
+    string compression    = 2;
+    int32  schema_version = 3;
+    string host           = 4;  // the host whose disk now holds the repo
 }
 message GarbageCollectBackupRepoRequest {
     string repo = 1;

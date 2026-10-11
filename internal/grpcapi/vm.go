@@ -1179,6 +1179,17 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		cleanupDisks()
 		return nil, err
 	}
+	// Every grant the row's writer will check, checked now, before the domain
+	// is defined and started: the row is written only after the start, and a
+	// refusal there would leave a running domain with no row. One writer for
+	// every release feature the spec carries, each grant checked (M9).
+	gs := vmSpecGrants{tuning: ioG, passthrough: passthroughG, limits: limitsG}
+	if err := gs.refusal(spec); err != nil {
+		claims.releaseAll(ctx)
+		cleanupDisks()
+		lv.WipeFirmwareState(s.dataDir, spec.Name, spec.Uuid)
+		return nil, status.Errorf(codes.Internal, "vm create: %v", err)
+	}
 
 	// pre_start hook — fires before the domain is started for the first time,
 	// after the release gate, so a refused create runs no hook for a VM that is
@@ -1309,9 +1320,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		lv.WipeFirmwareState(s.dataDir, spec.Name, spec.Uuid)
 		return nil, ferr
 	}
-	// One writer for every release feature the spec carries, each grant
-	// checked (M9).
-	gs := vmSpecGrants{tuning: ioG, passthrough: passthroughG, limits: limitsG}
+	// The grants were checked before the define (gs.refusal above).
 	if err := s.insertVMWithGrants(ctx, spec, gs, vmRecord, ifaceRecords, diskRecords, nicRecords, pciIntents, true); err != nil {
 		// Scoped to creates that took an EXTERNAL-IPAM claim, so every existing
 		// deployment keeps today's behaviour exactly. With a claim in play, a
@@ -1322,9 +1331,12 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		// fail-closed answer is to undo the create — teardown, disks, firmware
 		// state, and the claims themselves, matching the admission fence above.
 		// The same for a create that took an iSCSI LUN: a guest left running on
-		// the LUN with no row is one no claim can see (review N-2).
-		if !claims.empty() || len(keepLUNs) > 0 || len(lunHold.own) > 0 {
-			slog.Error("vm create: row persistence failed after an address or LUN claim — aborting",
+		// the LUN with no row is one no claim can see (review N-2). And for a
+		// grant the writer refused: it refuses before writing anything, so no
+		// row can exist, and the check before the define makes it unreachable
+		// unless the spec's needs changed since.
+		if !claims.empty() || len(keepLUNs) > 0 || len(lunHold.own) > 0 || errors.Is(err, capabilities.ErrNoFeatureGrant) {
+			slog.Error("vm create: row persistence failed after an address or LUN claim, or for a refused grant — aborting",
 				"name", spec.Name, "error", err)
 			if derr := s.virt.DestroyDomain(spec.Name); derr != nil {
 				slog.Warn("vm create: teardown after failed persistence also failed",

@@ -37,3 +37,10 @@ func (s *Server) insertVMWithGrants(ctx context.Context, spec *pb.VMSpec, gs vmS
 	return corrosion.InsertVMWithReleaseFeatures(ctx, s.db, gs.tuning, gs.passthrough, gs.limits, vmSpecNeeds(spec),
 		vm, ifaces, disks, nics, pciIntents, adopt)
 }
+
+// refusal is the combined writer's grant check for spec, writing nothing
+// (corrosion.CheckVMSpecGrants): nil exactly when insertVMWithGrants would
+// accept the grants.
+func (gs vmSpecGrants) refusal(spec *pb.VMSpec) error {
+	return corrosion.CheckVMSpecGrants(gs.tuning, gs.passthrough, gs.limits, vmSpecNeeds(spec))
+}

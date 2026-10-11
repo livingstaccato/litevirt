@@ -467,6 +467,15 @@ var capabilityMap = map[string]tableResolver{
 		ruleAnyColUnresolved([]string{"state", "isolation_epoch", "isolation_reason"}, TieCategoryControlPlane),
 		ruleContentMax(),
 	}},
+	// v65 host runtime: the columns moved out of hosts keep their place in its
+	// chain — schema_version and capacity_policy_hash are never coin-flipped
+	// (an upgrade gate and an admission policy read them); the version string
+	// and the resource totals are benign telemetry and converge by content-max.
+	"host_runtime": {category: "host-control-plane", chain: []tieRule{
+		ruleTombstone(),
+		ruleAnyColUnresolved([]string{"schema_version", "capacity_policy_hash"}, TieCategoryControlPlane),
+		ruleContentMax(),
+	}},
 	"host_labels": {category: "content", chain: contentDefaultChain()},
 	"host_health": {category: "content", chain: contentDefaultChain()},
 	// v50 durable health: condition/status rows are written by one evaluator

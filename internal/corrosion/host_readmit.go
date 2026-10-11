@@ -204,7 +204,7 @@ func retireFenceCredential(ctx context.Context, tx *sql.Tx, host, updatedAt stri
 	return err
 }
 
-// THE HOST'S OTHER ROWS. Three more tables are keyed by the host's name, and a
+// THE HOST'S OTHER ROWS. Four more tables are keyed by the host's name, and a
 // re-admission decides each one, as it decides each hosts column:
 //
 //   - host_networks is RESET. Its rows are wiring confirmed on the old
@@ -223,6 +223,11 @@ func retireFenceCredential(ctx context.Context, tx *sql.Tx, host, updatedAt stri
 //     publishes (NetBox disabled there), which is exactly the host that check
 //     exists to catch. A new machine that does publish writes after its
 //     admission, so its row is newer and stands.
+//   - host_runtime is RESET. It is the old machine's own report of its
+//     version, schema version and resource totals (host_runtime.go), and
+//     readers take it ahead of the hosts columns this re-admission resets.
+//     Retired, readers fall back to those reset columns until the new
+//     machine's first report, which brings the row back whole.
 //   - host_firewall_rules is KEPT. They are the host_overrides tier of the
 //     FORWARD chain: the operator's policy for guest traffic through the
 //     host of that name, not a fact about its hardware, and never the host's
@@ -236,6 +241,7 @@ func retireFenceCredential(ctx context.Context, tx *sql.Tx, host, updatedAt stri
 var readmitResetTables = []struct{ table, key string }{
 	{"host_networks", "host_name"},
 	{"netbox_host_config", "host_name"},
+	{"host_runtime", "host_name"},
 }
 
 func retireHostOwnedRows(ctx context.Context, tx *sql.Tx, host, updatedAt string) error {

@@ -483,6 +483,22 @@ type Client struct {
 	// so a writer's read-modify-write sees what the pass just absorbed.
 	hostMembershipMu sync.Mutex
 
+	// hostRuntimeGate, when non-nil and returning true, permits WRITING
+	// host_runtime. Injected via SetHostRuntimeGate, wired to the durable
+	// host_runtime_split_v1 latch. Fails CLOSED when unset: the table's shapes
+	// back-pressure a previous-release peer. Atomic because the WAL apply
+	// path reads it (absorbUnlatchedRuntimeWrite). See host_runtime.go.
+	hostRuntimeGate atomic.Pointer[func() bool]
+	// hostRuntimeLive is set once a SplitHostRuntime pass has completed with
+	// the gate open (also persisted under dataDir); from then on the runtime
+	// writers write host_runtime.
+	hostRuntimeLive atomic.Bool
+	// hostRuntimeLiveChecked records that the persisted marker was read.
+	hostRuntimeLiveChecked atomic.Bool
+	// hostRuntimeMu serializes the runtime split pass with the runtime
+	// writers. Always taken AFTER hostMembershipMu when a writer holds both.
+	hostRuntimeMu sync.Mutex
+
 	// canonicalIdentity, when non-nil and returning true, makes the merge paths resolve the
 	// natural-key-identity tables (tableIdentityKeys) by their natural key instead of the
 	// minted random id. Gated on `enforcement.canonical_identity && CanonicalIdentityV1
@@ -1454,6 +1470,13 @@ func (c *Client) ExecuteEntriesGuarded(ctx context.Context, guard func(tx *sql.T
 		c.mu.Unlock()
 		return false, err
 	}
+	// And a runtime report this node makes to hosts alone updates the
+	// host_runtime row it holds (host_runtime.go).
+	if err := absorbUnlatchedRuntimeWrite(ctx, tx, mutated, c.MayWriteHostRuntime()); err != nil {
+		tx.Rollback()
+		c.mu.Unlock()
+		return false, err
+	}
 	// A host this node re-admits takes no fence credential from the machine
 	// removed under its name; every receiver retires it too (host_readmit.go).
 	if err := retireReadmittedCredentials(ctx, tx, mutated); err != nil {
@@ -1618,6 +1641,13 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 	// Likewise a state or isolation write this node makes to hosts alone
 	// updates the membership row it holds (host_membership.go).
 	if err := absorbUnlatchedMembershipWrite(ctx, tx, mutated, c.MayWriteHostMembership(), c.hostsCopyFrozen()); err != nil {
+		tx.Rollback()
+		c.mu.Unlock()
+		return 0, err
+	}
+	// And a runtime report this node makes to hosts alone updates the
+	// host_runtime row it holds (host_runtime.go).
+	if err := absorbUnlatchedRuntimeWrite(ctx, tx, mutated, c.MayWriteHostRuntime()); err != nil {
 		tx.Rollback()
 		c.mu.Unlock()
 		return 0, err

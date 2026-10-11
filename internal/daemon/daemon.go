@@ -507,6 +507,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// node's own host_membership row would miss it until anti-entropy.
 	d.wireHostMembershipGate()
 	d.wireHostMembershipRetireGate()
+	// Likewise the runtime split gate: the boot report below is a runtime
+	// write, and on a node that has already split it must reach host_runtime.
+	d.wireHostRuntimeGate()
 
 	// Register this host in corrosion
 	if err := d.registerHost(ctx); err != nil {
@@ -667,6 +670,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Give host state and isolation their own row once host_membership_split_v1
 	// has durably latched. Inert until then; see corrosion.SplitHostMembership.
 	go d.runHostMembershipSplit(ctx)
+
+	// Give the host's own reports (version, schema version, resource totals)
+	// their own row once host_runtime_split_v1 has durably latched. Inert
+	// until then; see corrosion.SplitHostRuntime.
+	go d.runHostRuntimeSplit(ctx)
 
 	// Restore "at least one live admin" after racing deletes on two nodes
 	// (corrosion/admin_floor.go).
@@ -3114,6 +3122,46 @@ func (d *Daemon) runHostMembershipSplit(ctx context.Context) {
 			slog.Warn("host membership split: pass failed", "error", err)
 		} else if rep.Copied > 0 {
 			slog.Info("host membership split: moved host state onto its own row",
+				"copied", rep.Copied)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+}
+
+// wireHostRuntimeGate lets corrosion write host_runtime only once
+// host_runtime_split_v1 is DURABLY latched. Read from the marker on disk, like
+// wireHostMembershipGate, because the boot report is written before the
+// checker exists. No config flag. Unwired, the gate fails closed and every
+// runtime report goes to the hosts columns alone, the previous release's
+// behaviour.
+func (d *Daemon) wireHostRuntimeGate() {
+	d.db.SetHostRuntimeGate(HostRuntimeLatchedOnDisk(d.cfg.DataDir))
+}
+
+// HostRuntimeLatchedOnDisk reports whether host_runtime_split_v1 has durably
+// latched on the node whose data directory is dataDir.
+func HostRuntimeLatchedOnDisk(dataDir string) func() bool {
+	path := health.ActivationMarkerPath(dataDir, capabilities.HostRuntimeSplitV1)
+	return func() bool {
+		_, err := os.Stat(path)
+		return err == nil
+	}
+}
+
+// runHostRuntimeSplit runs corrosion.SplitHostRuntime at start and then every
+// hostMembershipSplitInterval. A no-op until the gate opens, idempotent after.
+func (d *Daemon) runHostRuntimeSplit(ctx context.Context) {
+	t := time.NewTicker(hostMembershipSplitInterval)
+	defer t.Stop()
+	for {
+		if rep, err := d.db.SplitHostRuntime(ctx); err != nil {
+			slog.Warn("host runtime split: pass failed", "error", err)
+		} else if rep.Copied > 0 {
+			slog.Info("host runtime split: moved host runtime reports onto their own row",
 				"copied", rep.Copied)
 		}
 		select {
